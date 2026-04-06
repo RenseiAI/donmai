@@ -35,9 +35,6 @@ builds:
 
 archives:
   - id: default
-    builds:
-      - af-tui
-      - af-status
     formats:
       - tar.gz
     format_overrides:
@@ -46,7 +43,7 @@ archives:
           - zip
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
-brews:
+homebrew_casks:
   - name: af-tui
     repository:
       owner: RenseiAI
