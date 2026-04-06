@@ -51,10 +51,9 @@ homebrew_casks:
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://github.com/RenseiAI/agentfactory-tui"
     description: "AgentFactory TUI — terminal dashboard for AI agent fleets"
-    license: "MIT"
-    install: |
-      bin.install "af-tui"
-      bin.install "af-status"
+    binaries:
+      - af-tui
+      - af-status
 
 checksum:
   name_template: "checksums.txt"
