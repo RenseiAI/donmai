@@ -46,6 +46,19 @@ archives:
           - zip
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
+brews:
+  - name: af-tui
+    repository:
+      owner: RenseiAI
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/RenseiAI/agentfactory-tui"
+    description: "AgentFactory TUI — terminal dashboard for AI agent fleets"
+    license: "MIT"
+    install: |
+      bin.install "af-tui"
+      bin.install "af-status"
+
 checksum:
   name_template: "checksums.txt"
 
