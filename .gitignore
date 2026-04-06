@@ -1,1 +1,6 @@
 bin/
+
+# env files
+.env
+.env.*
+!.env.example
