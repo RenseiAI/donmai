@@ -21,21 +21,29 @@
     "terminals.autorun": true,
     "terminals.terminals": [
       {
-        "name": "AF TUI Dev",
+        "name": "Agent Fleet",
         "color": "terminal.ansiWhite",
         "icon": "robot",
         "commands": [
-          "make run-mock"
+          "tmux kill-session -t af-tui-fleet 2>/dev/null; tmux new-session -s af-tui-fleet 'source .env.local && af-worker-fleet -p AgentFactoryTUI; exec zsh'"
         ]
       },
       {
-        "name": "AF Status Dev",
+        "name": "Agent Log Watch",
         "color": "terminal.ansiWhite",
         "icon": "search",
         "commands": [
-          "make run-status-mock"
+          "tmux new-session -A -s af-tui-logs 'source .env.local && af-analyze-logs --follow; exec zsh'"
         ],
-        "split": "AF TUI Dev"
+        "split": "Agent Fleet"
+      },
+      {
+        "name": "AF TUI Dev",
+        "color": "terminal.ansiYellow",
+        "icon": "sparkle",
+        "commands": [
+          "make run-mock"
+        ]
       },
       {
         "name": "Claude AF-TUI #1",
