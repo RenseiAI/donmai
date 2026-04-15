@@ -4,14 +4,20 @@ OSS terminal dashboard and CLI for AgentFactory AI agent fleets.
 
 **Module**: `github.com/RenseiAI/agentfactory-tui`
 
+## Boundary
+
+This is an open-source project. It must never contain or reference proprietary platform features, endpoints, or concepts. All functionality here is generic AgentFactory core. Downstream closed-source consumers may extend this — but this repo must remain self-contained and platform-agnostic.
+
 ## Architecture
 
 Single unified `af` binary covering all use cases:
+
 - `af` (bare) or `af dashboard` — Full Bubble Tea TUI dashboard
 - `af status` — Inline status reporter (TTY-aware, watch mode, JSON output)
 - `af agent|governor|worker|fleet|queue|...` — CLI subcommands (Cobra)
 
 ### TUI Architecture (Bubble Tea v2)
+
 - **Root model** (`internal/app/app.go`) routes between views via messages
 - **Views** (`internal/views/`) are Bubble Tea models implementing `Component` interface
   - `dashboard/` — Fleet overview with stats bar and sortable session table
@@ -22,6 +28,7 @@ Single unified `af` binary covering all use cases:
   - `MockClient` — Deterministic mock data for offline development
 
 ### Key Patterns
+
 - **Mock-first development**: Use `--mock` flag for offline dev. Mock implements full DataSource interface.
 - **View routing**: Root app model dispatches messages to active view. Views communicate via typed messages.
 - **Theme/format from tui-components**: Import `github.com/RenseiAI/tui-components/theme` and `format` packages.
@@ -51,16 +58,19 @@ make run-status-mock # Run status with mock data
 
 ## API Endpoints
 
+The AgentFactory coordinator exposes these endpoints:
+
 **Public (read-only):**
+
 - `GET /api/public/stats` — Fleet statistics
 - `GET /api/public/sessions` — Session list
 - `GET /api/public/sessions/:id` — Session detail
 - `GET /api/public/sessions/:id/activities` — Activity stream
 
 **Authenticated (Bearer token):**
+
 - `POST /api/mcp/submit-task` — Queue new task
 - `POST /api/mcp/stop-agent` — Stop running agent
 - `POST /api/mcp/forward-prompt` — Send prompt to agent
 - `GET /api/mcp/cost-report` — Cost analytics
 - `GET /api/mcp/list-fleet` — Fleet snapshot
-- `GET /api/cli/whoami` — Auth check
