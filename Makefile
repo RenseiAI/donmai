@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test lint fmt coverage clean
+.PHONY: build run run-mock run-status run-status-mock test lint fmt vuln coverage clean
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -20,16 +20,19 @@ run-status-mock: build
 	./$(BUILD_DIR)/af-status --mock
 
 test:
-	go test ./...
+	go test -race ./...
 
 lint:
-	go vet ./...
+	golangci-lint run
 
 fmt:
 	gofumpt -w .
 
+vuln:
+	govulncheck ./...
+
 coverage:
-	go test -coverprofile=coverage.out ./...
+	go test -race -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out
 
 clean:

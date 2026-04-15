@@ -20,11 +20,16 @@ jobs:
       - name: Build
         run: make build
 
-      - name: Vet
-        run: go vet ./...
-
       - name: Test
         run: go test -race -coverprofile=coverage.out ./...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: Vulnerability check
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...

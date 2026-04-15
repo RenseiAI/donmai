@@ -1,0 +1,31 @@
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - gofumpt
+    - errcheck
+    - ineffassign
+    - unused
+    - gosec
+    - misspell
+    - gocritic
+    - revive
+
+linters-settings:
+  gofumpt:
+    extra-rules: true
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+  revive:
+    rules:
+      - name: exported
+        arguments:
+          - "checkPrivateReceivers"
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
