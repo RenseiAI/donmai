@@ -25,7 +25,7 @@
         "color": "terminal.ansiWhite",
         "icon": "robot",
         "commands": [
-          "source .env.local && af-worker-fleet -p AgentFactoryTUI"
+          "source .env.local && af-worker-fleet -p agentfactory-tui"
         ]
       },
       {
@@ -50,7 +50,7 @@
         "color": "terminal.ansiBrightGreen",
         "icon": "squirrel",
         "commands": [
-          "WT=$(git worktree add --detach ../.wt/af-tui-1 2>/dev/null && echo ../.wt/af-tui-1 || echo ../.wt/af-tui-1) && cd $WT && claude --dangerously-skip-permissions"
+          "WT=$(./scripts/create-worktree.sh af-tui-1) && cd $WT && claude --dangerously-skip-permissions --remote-control"
         ]
       },
       {
@@ -58,7 +58,7 @@
         "color": "terminal.ansiBrightCyan",
         "icon": "squirrel",
         "commands": [
-          "WT=$(git worktree add --detach ../.wt/af-tui-2 2>/dev/null && echo ../.wt/af-tui-2 || echo ../.wt/af-tui-2) && cd $WT && claude --dangerously-skip-permissions"
+          "WT=$(./scripts/create-worktree.sh af-tui-2) && cd $WT && claude --dangerously-skip-permissions --remote-control"
         ]
       }
     ]
