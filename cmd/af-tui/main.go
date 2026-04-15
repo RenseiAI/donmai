@@ -6,12 +6,20 @@ import (
 	"os"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/joho/godotenv"
+
 	"github.com/RenseiAI/agentfactory-tui/internal/api"
 	"github.com/RenseiAI/agentfactory-tui/internal/app"
 )
 
 func main() {
-	baseURL := flag.String("url", "http://localhost:3000", "AgentFactory server URL")
+	_ = godotenv.Load(".env.local", ".env")
+
+	defaultURL := "http://localhost:3000"
+	if u := os.Getenv("WORKER_API_URL"); u != "" {
+		defaultURL = u
+	}
+	baseURL := flag.String("url", defaultURL, "AgentFactory server URL")
 	mock := flag.Bool("mock", false, "Use mock data instead of live API")
 	flag.Parse()
 
