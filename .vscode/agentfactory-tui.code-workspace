@@ -25,7 +25,7 @@
         "color": "terminal.ansiWhite",
         "icon": "robot",
         "commands": [
-          "tmux kill-session -t af-tui-fleet 2>/dev/null; tmux new-session -s af-tui-fleet 'source .env.local && af-worker-fleet -p AgentFactoryTUI; exec zsh'"
+          "source .env.local && af-worker-fleet -p AgentFactoryTUI"
         ]
       },
       {
@@ -33,7 +33,7 @@
         "color": "terminal.ansiWhite",
         "icon": "search",
         "commands": [
-          "tmux new-session -A -s af-tui-logs 'source .env.local && af-analyze-logs --follow; exec zsh'"
+          "source .env.local && af-analyze-logs --follow"
         ],
         "split": "Agent Fleet"
       },
