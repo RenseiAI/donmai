@@ -1,0 +1,64 @@
+{
+  "folders": [
+    {
+      "path": ".."
+    }
+  ],
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Open Terminals",
+        "command": "${command:terminals.runTerminals}",
+        "type": "process",
+        "runOptions": {
+          "runOn": "folderOpen"
+        }
+      }
+    ]
+  },
+  "settings": {
+    "terminals.autorun": true,
+    "terminals.terminals": [
+      {
+        "name": "AF TUI Dev",
+        "color": "terminal.ansiWhite",
+        "icon": "robot",
+        "commands": [
+          "make run-mock"
+        ]
+      },
+      {
+        "name": "AF Status Dev",
+        "color": "terminal.ansiWhite",
+        "icon": "search",
+        "commands": [
+          "make run-status-mock"
+        ],
+        "split": "AF TUI Dev"
+      },
+      {
+        "name": "Claude AF-TUI #1",
+        "color": "terminal.ansiBrightGreen",
+        "icon": "squirrel",
+        "commands": [
+          "WT=$(git worktree add --detach ../.wt/af-tui-1 2>/dev/null && echo ../.wt/af-tui-1 || echo ../.wt/af-tui-1) && cd $WT && claude --dangerously-skip-permissions"
+        ]
+      },
+      {
+        "name": "Claude AF-TUI #2",
+        "color": "terminal.ansiBrightCyan",
+        "icon": "squirrel",
+        "commands": [
+          "WT=$(git worktree add --detach ../.wt/af-tui-2 2>/dev/null && echo ../.wt/af-tui-2 || echo ../.wt/af-tui-2) && cd $WT && claude --dangerously-skip-permissions"
+        ]
+      }
+    ]
+  },
+  "extensions": {
+    "recommendations": [
+      "golang.go",
+      "fabiospampinato.vscode-terminals"
+    ]
+  }
+}
