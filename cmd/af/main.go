@@ -97,6 +97,8 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 	cmd.PersistentFlags().BoolVar(&flags.mock, "mock", false, "Use mock data instead of live API")
 	cmd.PersistentFlags().StringVar(&flags.url, "url", resolveDefaultURL(), "AgentFactory server URL")
 
+	cmd.AddCommand(newStatusCmd(flags))
+
 	return cmd, flags
 }
 
