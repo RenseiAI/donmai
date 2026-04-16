@@ -14,7 +14,7 @@ Charm v2 ecosystem + Cobra:
 - `charm.land/bubbletea/v2` — TUI framework (Elm architecture)
 - `charm.land/lipgloss/v2` — Terminal styling
 - `charm.land/bubbles/v2` — Reusable UI components
-- `github.com/charmbracelet/log` — Structured logging
+- `log/slog` — Structured logging (stdlib)
 - `github.com/spf13/cobra` — CLI framework (unified `af` binary)
 - `github.com/sahilm/fuzzy` — Fuzzy search (command palette)
 - `github.com/joho/godotenv` — .env.local loading
@@ -65,7 +65,7 @@ make run-status-mock # Run status with mock data
 
 - **Project layout**: `cmd/af/` entry point, `internal/{api,app,views,config}/` packages
 - **Errors**: `fmt.Errorf("context: %w", err)`. Sentinel errors for expected failures. Never panic. Never `log.Fatal`.
-- **Logging**: `charmbracelet/log` to stderr. Disabled in TUI mode. `--debug`/`--quiet` flags for CLI.
+- **Logging**: `log/slog` to stderr. Disabled in TUI mode. `--debug`/`--quiet` flags for CLI.
 - **Testing**: stdlib `testing` + table-driven tests. No testify. `teatest` for TUI snapshot tests. `cupaloy` for golden files. `httptest` for API mocks. Coverage: 80% target, 70% minimum.
 - **Linting**: `golangci-lint` with govet, staticcheck, gofumpt, errcheck, gosec, gocritic, revive.
 - **Naming**: Lowercase single-word packages, PascalCase exports

@@ -192,7 +192,7 @@ func TestHelpOutputContainsFlags(t *testing.T) {
 	}
 
 	out := buf.String()
-	for _, want := range []string{"--mock", "--url"} {
+	for _, want := range []string{"--mock", "--url", "--debug", "--quiet"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing %q; got:\n%s", want, out)
 		}

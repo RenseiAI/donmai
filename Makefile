@@ -5,13 +5,12 @@ LDFLAGS := -ldflags="-s -w"
 
 build:
 	go build $(LDFLAGS) -o $(BUILD_DIR)/af ./cmd/af
-	go build $(LDFLAGS) -o $(BUILD_DIR)/af-tui ./cmd/af-tui
 
 run: build
-	./$(BUILD_DIR)/af
+	./$(BUILD_DIR)/af dashboard
 
 run-mock: build
-	./$(BUILD_DIR)/af --mock
+	./$(BUILD_DIR)/af dashboard --mock
 
 run-status: build
 	./$(BUILD_DIR)/af status
