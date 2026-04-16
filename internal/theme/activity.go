@@ -1,3 +1,4 @@
+// Package theme defines the color palette and styles for the TUI.
 package theme
 
 import (

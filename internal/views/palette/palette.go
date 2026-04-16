@@ -2,6 +2,7 @@ package palette
 
 import (
 	"image/color"
+	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -66,8 +67,7 @@ func (m *Model) Init() tea.Cmd { return nil }
 
 // Update handles messages for the command palette.
 func (m *Model) Update(msg tea.Msg) tea.Cmd {
-	switch msg := msg.(type) {
-	case tea.KeyPressMsg:
+	if msg, ok := msg.(tea.KeyPressMsg); ok {
 		if m.prompting {
 			return m.updatePrompt(msg)
 		}
@@ -286,9 +286,9 @@ func (m *Model) renderPrompt(paletteWidth int) string {
 	if len(m.promptAction.Prompts) > 1 {
 		stepInfo = lipgloss.NewStyle().
 			Foreground(theme.TextSecondary).
-			Render(" (step " + strings.Repeat("", 0) +
-				string(rune('1'+m.promptStep)) + "/" +
-				string(rune('0'+len(m.promptAction.Prompts))) + ")")
+			Render(" (step " +
+				strconv.Itoa(m.promptStep+1) + "/" +
+				strconv.Itoa(len(m.promptAction.Prompts)) + ")")
 	}
 
 	// Label
@@ -363,7 +363,7 @@ func (m *Model) renderActionName(name string, idx int, baseColor color.Color, se
 }
 
 // Overlay renders the palette centered over the background content.
-func Overlay(background string, paletteContent string, width, height int) string {
+func Overlay(_ string, paletteContent string, width, height int) string {
 	return lipgloss.Place(
 		width, height,
 		lipgloss.Center, lipgloss.Center,

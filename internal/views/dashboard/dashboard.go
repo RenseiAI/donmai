@@ -1,3 +1,4 @@
+// Package dashboard implements the fleet overview TUI view.
 package dashboard
 
 import (
@@ -73,7 +74,7 @@ func (m *Model) fetchData() tea.Cmd {
 }
 
 func (m *Model) tickCmd() tea.Cmd {
-	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(3*time.Second, func(_ time.Time) tea.Msg {
 		return tickMsg{}
 	})
 }
@@ -204,11 +205,12 @@ func (m *Model) Render() string {
 	}
 
 	if len(filtered) == 0 {
-		if m.loading {
+		switch {
+		case m.loading:
 			sections = append(sections, theme.Muted().Padding(1, 2).Render("Loading sessions..."))
-		} else if m.filterText != "" {
+		case m.filterText != "":
 			sections = append(sections, theme.Muted().Padding(1, 2).Render("No sessions match filter"))
-		} else {
+		default:
 			sections = append(sections, theme.Muted().Padding(1, 2).Render("No active sessions"))
 		}
 	} else {

@@ -1,3 +1,4 @@
+// Package detail implements the session detail TUI view.
 package detail
 
 import (

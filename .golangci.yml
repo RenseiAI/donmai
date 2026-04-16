@@ -1,8 +1,6 @@
 version: "2"
 
-# Baseline linter set — catches real bugs without blocking on style or
-# legacy patterns. Additional linters (gocritic, gosec, revive)
-# will be enabled incrementally via dedicated cleanup tickets.
+# Linter configuration for agentfactory-tui.
 
 linters:
   default: none
@@ -13,12 +11,20 @@ linters:
     - ineffassign
     - unused
     - misspell
+    - gocritic
+    - revive
+    - gosec
   exclusions:
     rules:
       # Quickfix suggestions (QF*) are style hints, not bug indicators.
       - linters:
           - staticcheck
         text: "^QF[0-9]+"
+      # G304 (file inclusion via variable) in tests: paths come from t.TempDir().
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G304"
 
 formatters:
   enable:

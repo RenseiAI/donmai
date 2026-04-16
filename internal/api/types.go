@@ -3,6 +3,7 @@ package api
 // SessionStatus matches the public API status union type.
 type SessionStatus string
 
+// Session status values matching the public API status union type.
 const (
 	StatusQueued    SessionStatus = "queued"
 	StatusParked    SessionStatus = "parked"
@@ -78,6 +79,7 @@ type SessionDetailResponse struct {
 // ActivityType represents the type of an agent activity event.
 type ActivityType string
 
+// Activity type values for agent activity events.
 const (
 	ActivityThought  ActivityType = "thought"
 	ActivityAction   ActivityType = "action"

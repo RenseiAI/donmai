@@ -85,13 +85,15 @@ func buildTimeline(s api.SessionDetail) []timelineEvent {
 	}
 
 	// Terminal event or active indicator
-	if s.Timeline.Completed != nil {
+	switch {
+	case s.Timeline.Completed != nil:
 		label := "Completed"
 		color := greenStyle
-		if s.Status == api.StatusFailed {
+		switch s.Status {
+		case api.StatusFailed:
 			label = "Failed"
 			color = redStyle
-		} else if s.Status == api.StatusStopped {
+		case api.StatusStopped:
 			label = "Stopped"
 			color = lipgloss.NewStyle().Foreground(theme.TextTertiary)
 		}
@@ -100,14 +102,14 @@ func buildTimeline(s api.SessionDetail) []timelineEvent {
 			timestamp: format.Timestamp(*s.Timeline.Completed),
 			color:     color,
 		})
-	} else if s.Status == api.StatusWorking {
+	case s.Status == api.StatusWorking:
 		events = append(events, timelineEvent{
 			label:     "Running...",
 			timestamp: format.Duration(s.Duration) + " elapsed",
 			color:     greenStyle,
 			active:    true,
 		})
-	} else if s.Status == api.StatusQueued {
+	case s.Status == api.StatusQueued:
 		events = append(events, timelineEvent{
 			label:     "Waiting...",
 			timestamp: "in queue",

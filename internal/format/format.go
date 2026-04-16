@@ -1,3 +1,4 @@
+// Package format provides display formatting for timestamps, durations, and costs.
 package format
 
 import (

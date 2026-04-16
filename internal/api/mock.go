@@ -166,12 +166,12 @@ func (m *MockClient) GetSessionDetail(id string) (*SessionDetailResponse, error)
 }
 
 // StopSession is a no-op in the mock client.
-func (m *MockClient) StopSession(id string) error {
+func (m *MockClient) StopSession(_ string) error {
 	return nil
 }
 
 // SendPrompt is a no-op in the mock client.
-func (m *MockClient) SendPrompt(id string, prompt string) error {
+func (m *MockClient) SendPrompt(_ string, _ string) error {
 	return nil
 }
 
@@ -234,22 +234,27 @@ func (m *MockClient) GetActivities(sessionID string, afterCursor *string) (*Acti
 	}, nil
 }
 
+// SubmitTask returns a mock task submission response.
 func (m *MockClient) SubmitTask(req SubmitTaskRequest) (*SubmitTaskResponse, error) {
 	return &SubmitTaskResponse{Submitted: true, TaskID: "mock-task", IssueID: req.IssueID, Status: "pending", Priority: 3, WorkType: "development"}, nil
 }
 
+// StopAgent returns a mock stop-agent response.
 func (m *MockClient) StopAgent(req StopAgentRequest) (*StopAgentResponse, error) {
 	return &StopAgentResponse{Stopped: true, TaskID: req.TaskID, PreviousStatus: "running", NewStatus: "stopped"}, nil
 }
 
+// ForwardPrompt returns a mock prompt-forwarding response.
 func (m *MockClient) ForwardPrompt(req ForwardPromptRequest) (*ForwardPromptResponse, error) {
 	return &ForwardPromptResponse{Forwarded: true, PromptID: "mock-prompt", TaskID: req.TaskID, SessionStatus: "running"}, nil
 }
 
+// GetCostReport returns a mock cost report.
 func (m *MockClient) GetCostReport() (*CostReportResponse, error) {
 	return &CostReportResponse{TotalSessions: 5, SessionsWithCostData: 3, TotalCostUsd: 12.50, TotalInputTokens: 50000, TotalOutputTokens: 25000}, nil
 }
 
+// ListFleet returns a mock fleet listing.
 func (m *MockClient) ListFleet() (*ListFleetResponse, error) {
 	sessions, _ := m.GetSessions()
 	return &ListFleetResponse{Total: len(sessions.Sessions), Returned: len(sessions.Sessions), Sessions: sessions.Sessions}, nil

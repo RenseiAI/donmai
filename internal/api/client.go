@@ -1,3 +1,4 @@
+// Package api provides the AgentFactory coordinator API client and types.
 package api
 
 import (

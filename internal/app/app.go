@@ -1,3 +1,4 @@
+// Package app implements the root Bubble Tea model and view routing.
 package app
 
 import (
