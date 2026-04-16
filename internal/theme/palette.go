@@ -15,9 +15,9 @@ var (
 
 // Surface hierarchy — from tailwind.config.ts af-surface-*
 var (
-	Surface            color.Color = lipgloss.Color("#141B2D")
-	SurfaceRaised      color.Color = lipgloss.Color("#1A2236")
-	SurfaceBorder      color.Color = lipgloss.Color("#1E2740")
+	Surface             color.Color = lipgloss.Color("#141B2D")
+	SurfaceRaised       color.Color = lipgloss.Color("#1A2236")
+	SurfaceBorder       color.Color = lipgloss.Color("#1E2740")
 	SurfaceBorderBright color.Color = lipgloss.Color("#283350")
 )
 

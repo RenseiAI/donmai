@@ -102,10 +102,10 @@ func buildTimeline(s api.SessionDetail) []timelineEvent {
 		})
 	} else if s.Status == api.StatusWorking {
 		events = append(events, timelineEvent{
-			label:  "Running...",
+			label:     "Running...",
 			timestamp: format.Duration(s.Duration) + " elapsed",
-			color:  greenStyle,
-			active: true,
+			color:     greenStyle,
+			active:    true,
 		})
 	} else if s.Status == api.StatusQueued {
 		events = append(events, timelineEvent{

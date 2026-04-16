@@ -4,8 +4,8 @@ import (
 	"image/color"
 	"strings"
 
-	"charm.land/lipgloss/v2"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/agentfactory-tui/internal/theme"
 	"github.com/sahilm/fuzzy"
 )
@@ -209,7 +209,7 @@ func (m *Model) Render() string {
 	searchLine := prompt + " " + lipgloss.NewStyle().Foreground(theme.TextPrimary).Render(inputText)
 
 	inputBox := lipgloss.NewStyle().
-		Width(paletteWidth - 4).
+		Width(paletteWidth-4).
 		Background(theme.SurfaceRaised).
 		Padding(0, 1).
 		Render(searchLine)
@@ -305,7 +305,7 @@ func (m *Model) renderPrompt(paletteWidth int) string {
 	searchLine := prompt + " " + lipgloss.NewStyle().Foreground(theme.TextPrimary).Render(inputText)
 
 	inputBox := lipgloss.NewStyle().
-		Width(paletteWidth - 4).
+		Width(paletteWidth-4).
 		Background(theme.SurfaceRaised).
 		Padding(0, 1).
 		Render(searchLine)

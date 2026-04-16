@@ -172,7 +172,7 @@ type ListFleetRequest struct {
 // ListFleetResponse matches the list-fleet response.
 type ListFleetResponse struct {
 	Total    int               `json:"total"`
-	Returned int              `json:"returned"`
+	Returned int               `json:"returned"`
 	Sessions []SessionResponse `json:"sessions"`
 }
 

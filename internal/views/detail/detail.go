@@ -4,8 +4,8 @@ import (
 	"strings"
 	"time"
 
-	"charm.land/lipgloss/v2"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/agentfactory-tui/internal/api"
 	"github.com/RenseiAI/agentfactory-tui/internal/theme"
 )
@@ -15,23 +15,23 @@ type NavigateBackMsg struct{}
 
 // Model is the Agent Detail view model.
 type Model struct {
-	dataSource     api.DataSource
-	session        *api.SessionDetail
-	sessionID      string
-	width          int
-	height         int
-	focused        bool
-	loading        bool
-	err            error
-	frame          int
+	dataSource api.DataSource
+	session    *api.SessionDetail
+	sessionID  string
+	width      int
+	height     int
+	focused    bool
+	loading    bool
+	err        error
+	frame      int
 	// Activity streaming
 	activityView   *ActivityViewport
 	activityCursor *string
 	// UI state
-	showHelp       bool
-	confirmStop    bool
-	promptMode     bool
-	promptText     string
+	showHelp    bool
+	confirmStop bool
+	promptMode  bool
+	promptText  string
 }
 
 // New creates a new detail model.
