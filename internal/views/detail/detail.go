@@ -155,21 +155,14 @@ func (m *Model) Update(msg tea.Msg) tea.Cmd {
 
 	case stopAgentMsg:
 		if msg.err != nil {
-			// Show error inline
-			m.activityView.AppendActivities([]api.ActivityEvent{
-				{ID: "err", Type: api.ActivityError, Content: "Failed to stop agent: " + msg.err.Error(), Timestamp: time.Now().Format(time.RFC3339)},
-			})
+			m.addInlineActivity(api.ActivityError, "Failed to stop agent: "+msg.err.Error())
 		}
 
 	case sendPromptMsg:
 		if msg.err != nil {
-			m.activityView.AppendActivities([]api.ActivityEvent{
-				{ID: "err", Type: api.ActivityError, Content: "Failed to send prompt: " + msg.err.Error(), Timestamp: time.Now().Format(time.RFC3339)},
-			})
+			m.addInlineActivity(api.ActivityError, "Failed to send prompt: "+msg.err.Error())
 		} else {
-			m.activityView.AppendActivities([]api.ActivityEvent{
-				{ID: "prompt", Type: api.ActivityResponse, Content: "Prompt sent: " + msg.text, Timestamp: time.Now().Format(time.RFC3339)},
-			})
+			m.addInlineActivity(api.ActivityResponse, "Prompt sent: "+msg.text)
 		}
 
 	case tea.KeyPressMsg:
@@ -281,6 +274,9 @@ func (m *Model) Render() string {
 
 	// Metadata header
 	sections = append(sections, renderMetadata(s, m.width))
+
+	// Timeline
+	sections = append(sections, renderTimeline(s, m.width, m.frame))
 
 	// Activity section header
 	activityTitle := lipgloss.NewStyle().

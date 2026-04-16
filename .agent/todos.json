@@ -1,40 +1,35 @@
 {
-  "updatedAt": 1776375451541,
+  "updatedAt": 1776375551183,
   "items": [
     {
-      "content": "Read current files and assess errcheck violations",
+      "content": "Wire timeline into detail Render() between metadata and activity",
       "status": "completed",
-      "activeForm": "Reading current files and assessing errcheck violations"
+      "activeForm": "Wiring timeline into detail Render()"
     },
     {
-      "content": "Fix unchecked errors in internal/api/client.go",
+      "content": "Wire addInlineActivity into Update() replacing inline AppendActivities calls",
       "status": "completed",
-      "activeForm": "Fixing unchecked errors in internal/api/client.go"
+      "activeForm": "Wiring addInlineActivity into Update()"
     },
     {
-      "content": "Fix unchecked errors in internal/api/mock.go",
+      "content": "Delete unused `focused` field from ActivityViewport",
       "status": "completed",
-      "activeForm": "Fixing unchecked errors in internal/api/mock.go"
+      "activeForm": "Deleting unused focused field"
     },
     {
-      "content": "Fix unchecked errors in internal/inline/output.go",
+      "content": "Delete unused columnLayout.total() from dashboard/table.go",
       "status": "completed",
-      "activeForm": "Fixing unchecked errors in internal/inline/output.go"
+      "activeForm": "Deleting unused columnLayout.total()"
     },
     {
-      "content": "Fix unchecked errors in internal/inline/watch.go",
+      "content": "Remove unused linter exclusions from .golangci.yml",
       "status": "completed",
-      "activeForm": "Fixing unchecked errors in internal/inline/watch.go"
+      "activeForm": "Removing unused linter exclusions"
     },
     {
-      "content": "Re-enable errcheck in .golangci.yml",
+      "content": "Verify golangci-lint passes with no exclusions",
       "status": "completed",
-      "activeForm": "Re-enabling errcheck in .golangci.yml"
-    },
-    {
-      "content": "Run golangci-lint to verify all fixes",
-      "status": "completed",
-      "activeForm": "Running golangci-lint to verify all fixes"
+      "activeForm": "Running golangci-lint to verify"
     }
   ]
 }

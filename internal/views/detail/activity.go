@@ -52,7 +52,6 @@ type ActivityViewport struct {
 	viewportHeight int
 	width          int
 	autoFollow     bool
-	focused        bool
 }
 
 // NewActivityViewport creates a new activity viewport.
