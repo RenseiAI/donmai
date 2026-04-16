@@ -2,6 +2,7 @@ package palette
 
 import (
 	"image/color"
+	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -285,9 +286,9 @@ func (m *Model) renderPrompt(paletteWidth int) string {
 	if len(m.promptAction.Prompts) > 1 {
 		stepInfo = lipgloss.NewStyle().
 			Foreground(theme.TextSecondary).
-			Render(" (step " + strings.Repeat("", 0) +
-				string(rune('1'+m.promptStep)) + "/" +
-				string(rune('0'+len(m.promptAction.Prompts))) + ")")
+			Render(" (step " +
+				strconv.Itoa(m.promptStep+1) + "/" +
+				strconv.Itoa(len(m.promptAction.Prompts)) + ")")
 	}
 
 	// Label
