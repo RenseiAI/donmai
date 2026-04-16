@@ -19,7 +19,7 @@ func Chrome(format string, args ...any) {
 	if !isTerminal(ChromeWriter) {
 		return
 	}
-	fmt.Fprintf(ChromeWriter, format, args...)
+	_, _ = fmt.Fprintf(ChromeWriter, format, args...)
 }
 
 // ChromeLn prints decorative output to stderr with a newline, if stderr is a TTY.
@@ -27,15 +27,15 @@ func ChromeLn(format string, args ...any) {
 	if !isTerminal(ChromeWriter) {
 		return
 	}
-	fmt.Fprintf(ChromeWriter, format+"\n", args...)
+	_, _ = fmt.Fprintf(ChromeWriter, format+"\n", args...)
 }
 
 // Data prints machine-parseable output to stdout.
 func Data(format string, args ...any) {
-	fmt.Fprintf(DataWriter, format, args...)
+	_, _ = fmt.Fprintf(DataWriter, format, args...)
 }
 
 // DataLn prints machine-parseable output to stdout with a newline.
 func DataLn(format string, args ...any) {
-	fmt.Fprintf(DataWriter, format+"\n", args...)
+	_, _ = fmt.Fprintf(DataWriter, format+"\n", args...)
 }

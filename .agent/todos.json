@@ -1,0 +1,40 @@
+{
+  "updatedAt": 1776375451541,
+  "items": [
+    {
+      "content": "Read current files and assess errcheck violations",
+      "status": "completed",
+      "activeForm": "Reading current files and assessing errcheck violations"
+    },
+    {
+      "content": "Fix unchecked errors in internal/api/client.go",
+      "status": "completed",
+      "activeForm": "Fixing unchecked errors in internal/api/client.go"
+    },
+    {
+      "content": "Fix unchecked errors in internal/api/mock.go",
+      "status": "completed",
+      "activeForm": "Fixing unchecked errors in internal/api/mock.go"
+    },
+    {
+      "content": "Fix unchecked errors in internal/inline/output.go",
+      "status": "completed",
+      "activeForm": "Fixing unchecked errors in internal/inline/output.go"
+    },
+    {
+      "content": "Fix unchecked errors in internal/inline/watch.go",
+      "status": "completed",
+      "activeForm": "Fixing unchecked errors in internal/inline/watch.go"
+    },
+    {
+      "content": "Re-enable errcheck in .golangci.yml",
+      "status": "completed",
+      "activeForm": "Re-enabling errcheck in .golangci.yml"
+    },
+    {
+      "content": "Run golangci-lint to verify all fixes",
+      "status": "completed",
+      "activeForm": "Running golangci-lint to verify all fixes"
+    }
+  ]
+}
