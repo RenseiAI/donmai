@@ -51,10 +51,6 @@ func computeColumns(width int) columnLayout {
 	}
 }
 
-func (c columnLayout) total() int {
-	return c.status + c.identifier + c.workType + c.duration + c.cost + c.provider
-}
-
 // renderTableHeader renders the table column headers.
 func renderTableHeader(width int) string {
 	cols := computeColumns(width)
