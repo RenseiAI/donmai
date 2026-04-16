@@ -210,11 +210,11 @@ func (m *MockClient) GetActivities(sessionID string, afterCursor *string) (*Acti
 	activities := allActivities
 	if afterCursor != nil {
 		cursorNum := 0
-		fmt.Sscanf(*afterCursor, "%d", &cursorNum)
+		_, _ = fmt.Sscanf(*afterCursor, "%d", &cursorNum)
 		filtered := make([]ActivityEvent, 0)
 		for _, a := range allActivities {
 			aNum := 0
-			fmt.Sscanf(a.ID, "%d", &aNum)
+			_, _ = fmt.Sscanf(a.ID, "%d", &aNum)
 			if aNum > cursorNum {
 				filtered = append(filtered, a)
 			}

@@ -41,13 +41,13 @@ func RunWatch(ds api.DataSource, cfg WatchConfig) error {
 		case <-sigCh:
 			// Graceful exit on Ctrl+C
 			if isTTY && !cfg.JSON {
-				fmt.Fprint(os.Stdout, "\n")
+				_, _ = fmt.Fprint(os.Stdout, "\n")
 			}
 			return nil
 		case <-ticker.C:
 			if err := printWatchLine(ds, cfg.JSON, isTTY); err != nil {
 				// Print error to stderr but keep watching
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				_, _ = fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			}
 		}
 	}
@@ -65,7 +65,7 @@ func printWatchLine(ds api.DataSource, jsonMode bool, isTTY bool) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(os.Stdout, string(data))
+		_, _ = fmt.Fprintln(os.Stdout, string(data))
 		return nil
 	}
 
@@ -74,10 +74,10 @@ func printWatchLine(ds api.DataSource, jsonMode bool, isTTY bool) error {
 
 	if isTTY {
 		// Overwrite in place: carriage return + clear to end of line
-		fmt.Fprintf(os.Stdout, "\r\033[K%s", line)
+		_, _ = fmt.Fprintf(os.Stdout, "\r\033[K%s", line)
 	} else {
 		// Piped: new line each time
-		fmt.Fprintln(os.Stdout, line)
+		_, _ = fmt.Fprintln(os.Stdout, line)
 	}
 
 	return nil

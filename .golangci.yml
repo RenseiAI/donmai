@@ -1,12 +1,13 @@
 version: "2"
 
 # Baseline linter set — catches real bugs without blocking on style or
-# legacy patterns. Additional linters (errcheck, gocritic, gosec, revive)
+# legacy patterns. Additional linters (gocritic, gosec, revive)
 # will be enabled incrementally via dedicated cleanup tickets.
 
 linters:
   default: none
   enable:
+    - errcheck
     - govet
     - staticcheck
     - ineffassign
