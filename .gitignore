@@ -1,6 +1,10 @@
 bin/
+/af
 
 # env files
 .env
 .env.*
 !.env.example
+
+# agent state
+.agent/

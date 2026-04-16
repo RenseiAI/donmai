@@ -1,15 +1,15 @@
 // Package main is the unified AgentFactory CLI/TUI entry point.
 //
-// The bare `af` command launches the Bubble Tea dashboard. Subcommands
-// (status, agent, governor, worker, fleet, queue, ...) will be attached
-// via Cobra in follow-up issues.
+// The bare `af` command launches the Bubble Tea dashboard when stdin is
+// a TTY, or prints help otherwise. Subcommands (dashboard, status, ...)
+// are attached via Cobra.
 package main
 
 import (
-	"fmt"
+	"io"
+	"log/slog"
 	"os"
 
-	tea "charm.land/bubbletea/v2"
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
@@ -45,12 +45,42 @@ func buildContext(mock bool, url string) *app.Context {
 	}
 }
 
+// stdinIsTerminal reports whether stdin is connected to a terminal.
+// It is a variable so tests can override it.
+var stdinIsTerminal = func() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 // rootFlags holds the persistent flag values bound to the root command.
 // Returned alongside the command so tests can inspect resolved values
 // after PersistentPreRunE runs.
 type rootFlags struct {
-	mock bool
-	url  string
+	mock  bool
+	url   string
+	debug bool
+	quiet bool
+}
+
+// configureLogging sets the default slog logger based on --debug/--quiet flags.
+func configureLogging(flags *rootFlags) {
+	var level slog.Level
+	var w io.Writer = os.Stderr
+
+	switch {
+	case flags.quiet:
+		w = io.Discard
+		level = slog.LevelError + 4 // effectively silent
+	case flags.debug:
+		level = slog.LevelDebug
+	default:
+		level = slog.LevelWarn
+	}
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})))
 }
 
 // newRootCmd constructs the root `af` Cobra command with persistent
@@ -81,22 +111,25 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 					flags.url = u
 				}
 			}
+
+			configureLogging(flags)
 			return nil
 		},
-		RunE: func(_ *cobra.Command, _ []string) error {
-			ctx := buildContext(flags.mock, flags.url)
-			model := app.New(ctx)
-			p := tea.NewProgram(model)
-			if _, err := p.Run(); err != nil {
-				return fmt.Errorf("run tui: %w", err)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Bare `af` in a TTY launches the dashboard; non-TTY shows help.
+			if !stdinIsTerminal() {
+				return cmd.Help()
 			}
-			return nil
+			return runDashboard(flags)
 		},
 	}
 
 	cmd.PersistentFlags().BoolVar(&flags.mock, "mock", false, "Use mock data instead of live API")
 	cmd.PersistentFlags().StringVar(&flags.url, "url", resolveDefaultURL(), "AgentFactory server URL")
+	cmd.PersistentFlags().BoolVar(&flags.debug, "debug", false, "Enable debug logging")
+	cmd.PersistentFlags().BoolVar(&flags.quiet, "quiet", false, "Suppress all log output")
 
+	cmd.AddCommand(newDashboardCmd(flags))
 	cmd.AddCommand(newStatusCmd(flags))
 
 	return cmd, flags
