@@ -1,3 +1,4 @@
+// Package component defines shared interfaces for TUI view components.
 package component
 
 import tea "charm.land/bubbletea/v2"

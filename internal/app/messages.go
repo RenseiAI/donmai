@@ -3,6 +3,7 @@ package app
 // ViewState represents which view is currently active.
 type ViewState int
 
+// View state values for routing between TUI views.
 const (
 	ViewDashboard ViewState = iota
 	ViewDetail

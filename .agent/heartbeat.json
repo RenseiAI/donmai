@@ -1,10 +1,10 @@
 {
-  "timestamp": 1776375561437,
-  "pid": 5700,
-  "memoryUsageMB": 42,
-  "uptime": 170,
+  "timestamp": 1776378552812,
+  "pid": 5352,
+  "memoryUsageMB": 40,
+  "uptime": 60,
   "lastActivityType": "tool_use",
-  "lastActivityTimestamp": 1776375551183,
-  "toolCallsCount": 32,
-  "currentOperation": "TodoWrite"
+  "lastActivityTimestamp": 1776378551250,
+  "toolCallsCount": 16,
+  "currentOperation": "Bash"
 }

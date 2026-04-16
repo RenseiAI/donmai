@@ -14,6 +14,7 @@ linters:
     - unused
     - misspell
     - gocritic
+    - revive
   exclusions:
     rules:
       # Quickfix suggestions (QF*) are style hints, not bug indicators.

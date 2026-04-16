@@ -362,7 +362,7 @@ func (m *Model) renderActionName(name string, idx int, baseColor color.Color, se
 }
 
 // Overlay renders the palette centered over the background content.
-func Overlay(background string, paletteContent string, width, height int) string {
+func Overlay(_ string, paletteContent string, width, height int) string {
 	return lipgloss.Place(
 		width, height,
 		lipgloss.Center, lipgloss.Center,

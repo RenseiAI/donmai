@@ -1,3 +1,4 @@
+// Package palette implements the fuzzy-search command palette overlay.
 package palette
 
 import tea "charm.land/bubbletea/v2"

@@ -1,3 +1,4 @@
+// Package inline implements the non-TUI inline status reporter.
 package inline
 
 import (

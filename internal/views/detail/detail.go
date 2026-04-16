@@ -86,7 +86,7 @@ func (m *Model) fetchDetail() tea.Cmd {
 }
 
 func (m *Model) tickCmd() tea.Cmd {
-	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(3*time.Second, func(_ time.Time) tea.Msg {
 		return detailTickMsg{}
 	})
 }
@@ -107,7 +107,7 @@ func (m *Model) fetchActivitiesCmd() tea.Cmd {
 }
 
 func (m *Model) activityTickCmd() tea.Cmd {
-	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(1*time.Second, func(_ time.Time) tea.Msg {
 		return activityTickMsg{}
 	})
 }

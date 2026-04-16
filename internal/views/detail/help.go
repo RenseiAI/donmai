@@ -7,7 +7,7 @@ import (
 	"github.com/RenseiAI/agentfactory-tui/internal/theme"
 )
 
-func renderHelpOverlay(content string, width, height int) string {
+func renderHelpOverlay(_ string, width, height int) string {
 	helpLines := []struct{ key, desc string }{
 		{"esc", "Back to fleet dashboard"},
 		{"j/k or \u2191/\u2193", "Scroll activity stream"},
