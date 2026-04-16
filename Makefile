@@ -4,14 +4,15 @@ BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
 
 build:
+	go build $(LDFLAGS) -o $(BUILD_DIR)/af ./cmd/af
 	go build $(LDFLAGS) -o $(BUILD_DIR)/af-tui ./cmd/af-tui
 	go build $(LDFLAGS) -o $(BUILD_DIR)/af-status ./cmd/af-status
 
 run: build
-	./$(BUILD_DIR)/af-tui
+	./$(BUILD_DIR)/af
 
 run-mock: build
-	./$(BUILD_DIR)/af-tui --mock
+	./$(BUILD_DIR)/af --mock
 
 run-status: build
 	./$(BUILD_DIR)/af-status
