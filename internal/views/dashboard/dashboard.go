@@ -204,11 +204,12 @@ func (m *Model) Render() string {
 	}
 
 	if len(filtered) == 0 {
-		if m.loading {
+		switch {
+		case m.loading:
 			sections = append(sections, theme.Muted().Padding(1, 2).Render("Loading sessions..."))
-		} else if m.filterText != "" {
+		case m.filterText != "":
 			sections = append(sections, theme.Muted().Padding(1, 2).Render("No sessions match filter"))
-		} else {
+		default:
 			sections = append(sections, theme.Muted().Padding(1, 2).Render("No active sessions"))
 		}
 	} else {

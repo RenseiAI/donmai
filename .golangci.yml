@@ -13,6 +13,7 @@ linters:
     - ineffassign
     - unused
     - misspell
+    - gocritic
   exclusions:
     rules:
       # Quickfix suggestions (QF*) are style hints, not bug indicators.

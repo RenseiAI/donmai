@@ -66,8 +66,7 @@ func (m *Model) Init() tea.Cmd { return nil }
 
 // Update handles messages for the command palette.
 func (m *Model) Update(msg tea.Msg) tea.Cmd {
-	switch msg := msg.(type) {
-	case tea.KeyPressMsg:
+	if msg, ok := msg.(tea.KeyPressMsg); ok {
 		if m.prompting {
 			return m.updatePrompt(msg)
 		}

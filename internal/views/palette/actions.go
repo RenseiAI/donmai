@@ -114,7 +114,7 @@ func DefaultActions() []Action {
 		{
 			Name:     "Quit",
 			Shortcut: "q",
-			Handler:  func() tea.Msg { return tea.Quit() },
+			Handler:  tea.Quit,
 		},
 	}
 }
