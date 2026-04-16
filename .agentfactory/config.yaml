@@ -13,6 +13,23 @@ testCommand: "go test ./..."
 validateCommand: "go vet ./..."
 allowedProjects:
   - agentfactory-tui
+codeIntelligence:
+  enforceUsage: true
+mergeDriver: mergiraf
+mergeQueue:
+  enabled: true
+  provider: local
+  strategy: rebase
+  mergiraf: true
+  lockFileRegenerate: false
+  autoEnqueue: true
+  testCommand: "go test ./..."
+  testTimeout: 300000
+  pollInterval: 10000
+  maxRetries: 2
+  escalation:
+    onConflict: reassign
+    onTestFailure: notify
 quality:
   baselineEnabled: true
   ratchetEnabled: true

@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: AgentDefinition
+name: dashboard-dev
+description: Agent for developing the TUI dashboard views and inline status reporter
+focus:
+  paths:
+    - internal/views/
+    - internal/app/
+    - internal/inline/
+    - internal/component/
+    - internal/theme/
+    - internal/format/
+context:
+  - CLAUDE.md
+preCheck:
+  - go vet ./...
+  - go test ./...
+postCheck:
+  - make build
+instructions: |
+  This is the OSS AgentFactory terminal dashboard built on Charm v2
+  (bubbletea, lipgloss, bubbles) with Cobra CLI.
+  Views are in internal/views/ (dashboard, detail, command palette).
+  The root Bubble Tea model in internal/app/ routes between views.
+  internal/inline/ provides non-TUI watch mode (JSON, TTY-aware).
+  internal/api/ has Client (HTTP) and MockClient for offline dev.
+  Uses tui-components for shared theme/format utilities.
+  Use af_code_get_repo_map to orient before starting work, af_code_search_symbols
+  to find type definitions and interface implementations.
+  Before editing files, use af_code_reserve_files to claim them and prevent
+  merge conflicts with other agents. After completing work on files, use
+  af_code_release_files to free them. If reserve reports conflicts, choose
+  alternative files or wait.

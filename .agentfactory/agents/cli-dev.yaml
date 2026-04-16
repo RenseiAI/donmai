@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: AgentDefinition
+name: cli-dev
+description: Agent for developing af CLI commands and API client
+focus:
+  paths:
+    - cmd/af/
+    - internal/api/
+context:
+  - CLAUDE.md
+preCheck:
+  - go vet ./...
+  - go test ./...
+postCheck:
+  - make build
+instructions: |
+  The unified af CLI is in cmd/af/ using Cobra.
+  internal/api/ provides the HTTP client (Client) and MockClient
+  with types, sentinel errors, and datasource interface.
+  API calls use the coordinator URL from config or WORKER_API_URL env.
+  Use af_code_get_repo_map to orient before starting work, af_code_search_symbols
+  to find function and type definitions.
+  Before editing files, use af_code_reserve_files to claim them and prevent
+  merge conflicts with other agents. After completing work on files, use
+  af_code_release_files to free them. If reserve reports conflicts, choose
+  alternative files or wait.
