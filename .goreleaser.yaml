@@ -3,9 +3,9 @@ version: 2
 project_name: agentfactory-tui
 
 builds:
-  - id: af-tui
-    main: ./cmd/af-tui
-    binary: af-tui
+  - id: af
+    main: ./cmd/af
+    binary: af
     ldflags:
       - -s -w
     env:
@@ -26,18 +26,18 @@ archives:
       - goos: windows
         formats:
           - zip
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    name_template: "af_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 homebrew_casks:
-  - name: af-tui
+  - name: af
     repository:
       owner: RenseiAI
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://github.com/RenseiAI/agentfactory-tui"
-    description: "AgentFactory TUI — terminal dashboard for AI agent fleets"
+    description: "AgentFactory CLI — terminal dashboard and CLI for AI agent fleets"
     binaries:
-      - af-tui
+      - af
 
 checksum:
   name_template: "checksums.txt"
