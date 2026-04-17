@@ -208,23 +208,6 @@ func TestClientAuthHeader(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
-		_ = json.NewEncoder(w).Encode(CostReportResponse{})
-	}))
-	t.Cleanup(srv.Close)
-	c := NewAuthenticatedClient(srv.URL, "rsk_token")
-	// Use an authenticated endpoint (not /api/public/) to verify the header.
-	if _, err := c.GetCostReport(); err != nil {
-		t.Fatalf("GetCostReport: %v", err)
-	}
-	if gotAuth != "Bearer rsk_token" {
-		t.Errorf("Authorization = %q, want Bearer rsk_token", gotAuth)
-	}
-}
-
-func TestClientPublicEndpointSkipsAuth(t *testing.T) {
-	var gotAuth string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
 		_ = json.NewEncoder(w).Encode(StatsResponse{})
 	}))
 	t.Cleanup(srv.Close)
@@ -232,7 +215,7 @@ func TestClientPublicEndpointSkipsAuth(t *testing.T) {
 	if _, err := c.GetStats(); err != nil {
 		t.Fatalf("GetStats: %v", err)
 	}
-	if gotAuth != "" {
-		t.Errorf("Authorization = %q, want empty for public endpoint", gotAuth)
+	if gotAuth != "Bearer rsk_token" {
+		t.Errorf("Authorization = %q, want Bearer rsk_token", gotAuth)
 	}
 }

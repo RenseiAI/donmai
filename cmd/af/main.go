@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
@@ -59,6 +60,24 @@ func buildDataSource(flags *rootFlags) api.DataSource {
 	default:
 		return api.NewClient(flags.url)
 	}
+}
+
+// resolveAPIKey returns the first valid API token found in the environment.
+// It checks WORKER_API_KEY and RENSEI_API_TOKEN, preferring tokens with the
+// rsk_ prefix (API auth tokens) over registration tokens (rsp_).
+func resolveAPIKey() string {
+	for _, env := range []string{"WORKER_API_KEY", "RENSEI_API_TOKEN"} {
+		if v := os.Getenv(env); v != "" && strings.HasPrefix(v, "rsk_") {
+			return v
+		}
+	}
+	// Fall back to any non-empty value if no rsk_ token was found.
+	for _, env := range []string{"WORKER_API_KEY", "RENSEI_API_TOKEN"} {
+		if v := os.Getenv(env); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // stdinIsTerminal reports whether stdin is connected to a terminal.
@@ -130,9 +149,7 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 			}
 
 			if !cmd.Flags().Changed("api-key") {
-				if k := os.Getenv("WORKER_API_KEY"); k != "" {
-					flags.apiKey = k
-				}
+				flags.apiKey = resolveAPIKey()
 			}
 
 			configureLogging(flags)
