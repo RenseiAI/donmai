@@ -72,6 +72,7 @@ make run-status-mock # Run status with mock data
 - **New commands**: Each Cobra subcommand gets its own file in `cmd/af/`. Follow existing patterns.
 - **New views**: Create directory in `internal/views/<name>/`, implement Component interface. Use Bubbles v2 components as foundations.
 - **API types**: All request/response types in `internal/api/types.go`. Client methods in `client.go`. Sentinel errors in `errors.go`.
+- **Worktrees**: `.claude/settings.json` registers a `SessionStart` hook running `scripts/refresh-worktree.sh`, which auto-rebases and refreshes deps in linked worktrees only.
 
 ## Hooks
 

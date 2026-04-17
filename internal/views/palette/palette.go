@@ -7,7 +7,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/theme"
+	"github.com/RenseiAI/tui-components/theme"
 	"github.com/sahilm/fuzzy"
 )
 

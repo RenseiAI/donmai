@@ -9,7 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/RenseiAI/agentfactory-tui/internal/api"
-	"github.com/RenseiAI/agentfactory-tui/internal/theme"
+	"github.com/RenseiAI/tui-components/theme"
 )
 
 // Messages for dashboard data flow.

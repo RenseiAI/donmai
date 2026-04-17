@@ -24,14 +24,13 @@ func (m *Model) sendPromptCmd(text string) tea.Cmd {
 	}
 }
 
-// addInlineActivity appends a synthetic activity to the viewport.
+// addInlineActivity appends a synthetic activity to the log viewer.
 func (m *Model) addInlineActivity(actType api.ActivityType, content string) {
-	m.activityView.AppendActivities([]api.ActivityEvent{
-		{
-			ID:        "local",
-			Type:      actType,
-			Content:   content,
-			Timestamp: time.Now().Format(time.RFC3339),
-		},
-	})
+	a := api.ActivityEvent{
+		ID:        "local",
+		Type:      actType,
+		Content:   content,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	m.logViewer.Append(renderActivityLine(a, m.width))
 }

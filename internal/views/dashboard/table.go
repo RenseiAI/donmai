@@ -6,8 +6,8 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/agentfactory-tui/internal/api"
-	format "github.com/RenseiAI/agentfactory-tui/internal/format"
-	"github.com/RenseiAI/agentfactory-tui/internal/theme"
+	"github.com/RenseiAI/tui-components/format"
+	"github.com/RenseiAI/tui-components/theme"
 )
 
 // column widths as fractions of total width
@@ -83,7 +83,7 @@ func renderTableHeader(width int) string {
 // renderTableRow renders a single session row.
 func renderTableRow(s api.SessionResponse, width int, selected bool, frame int) string {
 	cols := computeColumns(width)
-	ss := theme.GetStatusStyle(s.Status)
+	ss := theme.GetStatusStyle(string(s.Status))
 
 	var rowStyle lipgloss.Style
 	if selected {

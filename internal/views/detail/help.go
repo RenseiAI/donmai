@@ -4,7 +4,7 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/theme"
+	"github.com/RenseiAI/tui-components/theme"
 )
 
 func renderHelpOverlay(_ string, width, height int) string {

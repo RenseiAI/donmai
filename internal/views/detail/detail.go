@@ -7,7 +7,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/agentfactory-tui/internal/api"
-	"github.com/RenseiAI/agentfactory-tui/internal/theme"
+	"github.com/RenseiAI/tui-components/theme"
+	"github.com/RenseiAI/tui-components/widget"
+	"github.com/RenseiAI/tui-components/widget/notification"
 )
 
 // NavigateBackMsg is sent when the user wants to go back to the dashboard.
@@ -25,20 +27,21 @@ type Model struct {
 	err        error
 	frame      int
 	// Activity streaming
-	activityView   *ActivityViewport
+	logViewer      *widget.LogViewer
 	activityCursor *string
 	// UI state
 	showHelp    bool
-	confirmStop bool
-	promptMode  bool
-	promptText  string
+	stopDialog  *widget.Dialog
+	promptInput *widget.TextInput
+	notifStack  notification.Stack
 }
 
 // New creates a new detail model.
 func New(ds api.DataSource) *Model {
 	return &Model{
-		dataSource:   ds,
-		activityView: NewActivityViewport(),
+		dataSource: ds,
+		logViewer:  newActivityLogViewer(),
+		notifStack: notification.NewStack(notification.WithMax(3), notification.WithNewestFirst()),
 	}
 }
 
@@ -48,11 +51,10 @@ func (m *Model) SetSession(id string) {
 	m.loading = true
 	m.session = nil
 	m.activityCursor = nil
-	m.activityView = NewActivityViewport()
+	m.logViewer = newActivityLogViewer()
 	m.showHelp = false
-	m.confirmStop = false
-	m.promptMode = false
-	m.promptText = ""
+	m.stopDialog = nil
+	m.promptInput = nil
 }
 
 // SetSize updates the available render size.
@@ -62,10 +64,16 @@ func (m *Model) SetSize(width, height int) {
 }
 
 // Focus marks the detail view as focused.
-func (m *Model) Focus() { m.focused = true }
+func (m *Model) Focus() {
+	m.focused = true
+	m.logViewer.Focus()
+}
 
 // Blur marks the detail view as unfocused.
-func (m *Model) Blur() { m.focused = false }
+func (m *Model) Blur() {
+	m.focused = false
+	m.logViewer.Blur()
+}
 
 // Init starts the data fetch and activity streaming.
 func (m *Model) Init() tea.Cmd {
@@ -142,7 +150,11 @@ func (m *Model) Update(msg tea.Msg) tea.Cmd {
 
 	case activityMsg:
 		if msg.err == nil && len(msg.activities) > 0 {
-			m.activityView.AppendActivities(msg.activities)
+			lines := make([]string, 0, len(msg.activities))
+			for _, a := range msg.activities {
+				lines = append(lines, renderActivityLine(a, m.width))
+			}
+			m.logViewer.Append(lines...)
 			m.activityCursor = msg.cursor
 		}
 
@@ -156,19 +168,43 @@ func (m *Model) Update(msg tea.Msg) tea.Cmd {
 	case stopAgentMsg:
 		if msg.err != nil {
 			m.addInlineActivity(api.ActivityError, "Failed to stop agent: "+msg.err.Error())
+			return m.pushNotification(notification.VariantError, "Failed to stop agent")
 		}
+		return m.pushNotification(notification.VariantSuccess, "Agent stop requested")
 
 	case sendPromptMsg:
 		if msg.err != nil {
 			m.addInlineActivity(api.ActivityError, "Failed to send prompt: "+msg.err.Error())
-		} else {
-			m.addInlineActivity(api.ActivityResponse, "Prompt sent: "+msg.text)
+			return m.pushNotification(notification.VariantError, "Failed to send prompt")
 		}
+		m.addInlineActivity(api.ActivityResponse, "Prompt sent: "+msg.text)
+		return m.pushNotification(notification.VariantSuccess, "Prompt sent")
+
+	case widget.DialogDoneMsg:
+		m.logViewer.Focus()
+		if msg.Result == widget.ResultYes {
+			m.stopDialog = nil
+			return m.stopAgentCmd()
+		}
+		m.stopDialog = nil
+		return nil
 
 	case tea.KeyPressMsg:
 		return m.handleKeyPress(msg)
 	}
-	return nil
+
+	// Fan remaining messages to children.
+	var cmds []tea.Cmd
+	_, cmd := m.logViewer.Update(msg)
+	if cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	next, cmd := m.notifStack.Update(msg)
+	m.notifStack = next.(notification.Stack)
+	if cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m *Model) handleKeyPress(msg tea.KeyPressMsg) tea.Cmd {
@@ -182,39 +218,30 @@ func (m *Model) handleKeyPress(msg tea.KeyPressMsg) tea.Cmd {
 		return nil
 	}
 
-	// Stop confirmation mode
-	if m.confirmStop {
-		switch key {
-		case "y", "Y":
-			m.confirmStop = false
-			return m.stopAgentCmd()
-		default:
-			m.confirmStop = false
-		}
-		return nil
+	// Stop dialog active — delegate keys to it
+	if m.stopDialog != nil {
+		_, cmd := m.stopDialog.Update(msg)
+		return cmd
 	}
 
 	// Prompt input mode
-	if m.promptMode {
+	if m.promptInput != nil {
 		switch key {
 		case "esc":
-			m.promptMode = false
-			m.promptText = ""
+			m.promptInput = nil
+			m.logViewer.Focus()
 		case "enter":
-			if m.promptText != "" {
-				text := m.promptText
-				m.promptMode = false
-				m.promptText = ""
+			if text := m.promptInput.Value(); text != "" {
+				m.promptInput = nil
+				m.logViewer.Focus()
 				return m.sendPromptCmd(text)
 			}
-		case "backspace":
-			if len(m.promptText) > 0 {
-				m.promptText = m.promptText[:len(m.promptText)-1]
-			}
 		default:
-			if len(key) == 1 || key == " " {
-				m.promptText += key
+			next, cmd := m.promptInput.Update(msg)
+			if ti, ok := next.(widget.TextInput); ok {
+				m.promptInput = &ti
 			}
+			return cmd
 		}
 		return nil
 	}
@@ -225,31 +252,36 @@ func (m *Model) handleKeyPress(msg tea.KeyPressMsg) tea.Cmd {
 		return func() tea.Msg { return NavigateBackMsg{} }
 	case "r":
 		return m.fetchDetail()
-	case "j", "down":
-		m.activityView.ScrollDown(1)
-	case "k", "up":
-		m.activityView.ScrollUp(1)
-	case "g":
-		m.activityView.ScrollToTop()
-	case "G":
-		m.activityView.ScrollToBottom()
-	case "f":
-		m.activityView.ToggleAutoFollow()
-	case "ctrl+d":
-		m.activityView.ScrollDown(10)
-	case "ctrl+u":
-		m.activityView.ScrollUp(10)
 	case "s":
 		if !m.isTerminal() {
-			m.confirmStop = true
+			m.stopDialog = widget.New(
+				widget.WithTitle("Stop Agent"),
+				widget.WithBody("Stop agent "+m.sessionID+"? This cannot be undone."),
+				widget.WithButtons(
+					widget.Button{Label: "Stop", Result: widget.ResultYes},
+					widget.Button{Label: "Cancel", Result: widget.ResultCancel},
+				),
+			)
+			m.stopDialog.SetSize(m.width, m.height)
+			m.stopDialog.Focus()
+			m.logViewer.Blur()
 		}
 	case "p":
 		if !m.isTerminal() {
-			m.promptMode = true
-			m.promptText = ""
+			ti := widget.NewTextInput(
+				widget.WithPlaceholder("Send prompt to agent..."),
+			)
+			ti.SetSize(m.width-4, 0)
+			ti.Focus()
+			m.promptInput = &ti
+			m.logViewer.Blur()
 		}
 	case "?":
 		m.showHelp = true
+	default:
+		// Delegate scroll/follow keys to the log viewer.
+		_, cmd := m.logViewer.Update(msg)
+		return cmd
 	}
 	return nil
 }
@@ -295,23 +327,46 @@ func (m *Model) Render() string {
 	// Calculate viewport height
 	headerHeight := strings.Count(header, "\n") + 1
 	helpHeight := 1
+	if m.promptInput != nil {
+		helpHeight = 3 // TextInput with border takes 3 rows
+	}
 	viewportHeight := m.height - headerHeight - helpHeight
 	if viewportHeight < 3 {
 		viewportHeight = 3
 	}
-	m.activityView.SetSize(m.width, viewportHeight)
+	m.logViewer.SetSize(m.width, viewportHeight)
 
 	// Activity viewport
-	activityContent := m.activityView.Render()
+	activityContent := m.logViewer.View().Content
 
 	// Help bar (or prompt input or confirm stop)
 	help := m.renderBottomBar()
 
 	content := header + "\n" + activityContent + "\n" + help
 
+	// Stop dialog overlay
+	if m.stopDialog != nil {
+		content = m.stopDialog.Overlay(content)
+	}
+
 	// Help overlay
 	if m.showHelp {
 		content = renderHelpOverlay(content, m.width, m.height)
+	}
+
+	// Notification toasts (top-right corner)
+	if m.notifStack.Len() > 0 {
+		toasts := m.notifStack.View().Content
+		placed := lipgloss.Place(m.width, 0, lipgloss.Right, lipgloss.Top, toasts)
+		// Overlay on first few lines of content
+		contentLines := strings.Split(content, "\n")
+		toastLines := strings.Split(placed, "\n")
+		for i, tl := range toastLines {
+			if i+1 < len(contentLines) {
+				contentLines[i+1] = tl
+			}
+		}
+		content = strings.Join(contentLines, "\n")
 	}
 
 	return content
@@ -328,7 +383,7 @@ func (m *Model) renderTitleBar() string {
 	}
 
 	s := *m.session
-	ss := theme.GetStatusStyle(s.Status)
+	ss := theme.GetStatusStyle(string(s.Status))
 
 	symbol := lipgloss.NewStyle().Foreground(ss.Color).Render(ss.Symbol)
 	identifier := lipgloss.NewStyle().Foreground(theme.TextPrimary).Bold(true).Render(s.Identifier)
@@ -347,7 +402,7 @@ func (m *Model) renderTitleBar() string {
 
 	// Auto-follow indicator
 	followIndicator := ""
-	if m.activityView.AutoFollow() {
+	if m.logViewer.Following() {
 		followIndicator = lipgloss.NewStyle().Foreground(theme.Teal).Bold(true).Render(" \u27f1")
 	}
 
@@ -361,17 +416,8 @@ func (m *Model) renderTitleBar() string {
 }
 
 func (m *Model) renderBottomBar() string {
-	if m.confirmStop {
-		prompt := theme.HelpKey().Render("Stop agent "+m.sessionID+"? ") +
-			theme.HelpDesc().Render("(y/n)")
-		return theme.HelpBar().Width(m.width).Render(prompt)
-	}
-
-	if m.promptMode {
-		prompt := theme.HelpKey().Render("> ") +
-			lipgloss.NewStyle().Foreground(theme.TextPrimary).Render(m.promptText) +
-			theme.Dimmed().Render("\u2588") // cursor block
-		return theme.HelpBar().Width(m.width).Render(prompt)
+	if m.promptInput != nil {
+		return m.promptInput.View().Content
 	}
 
 	pairs := []struct{ key, desc string }{
@@ -391,4 +437,13 @@ func (m *Model) renderBottomBar() string {
 	}
 
 	return theme.HelpBar().Width(m.width).Render(strings.Join(parts, "  "))
+}
+
+// pushNotification adds a toast to the notification stack and returns its
+// auto-dismiss command.
+func (m *Model) pushNotification(variant notification.Variant, message string) tea.Cmd {
+	n := notification.New(variant, message, notification.WithWidth(30))
+	var cmd tea.Cmd
+	m.notifStack, cmd = m.notifStack.Push(n)
+	return cmd
 }

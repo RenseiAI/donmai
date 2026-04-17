@@ -6,7 +6,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/agentfactory-tui/internal/api"
-	"github.com/RenseiAI/agentfactory-tui/internal/theme"
+	"github.com/RenseiAI/tui-components/theme"
 )
 
 // renderStatsBar renders the horizontal stats bar showing fleet metrics.

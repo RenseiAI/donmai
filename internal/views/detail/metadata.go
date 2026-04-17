@@ -3,8 +3,8 @@ package detail
 import (
 	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/agentfactory-tui/internal/api"
-	"github.com/RenseiAI/agentfactory-tui/internal/format"
-	"github.com/RenseiAI/agentfactory-tui/internal/theme"
+	"github.com/RenseiAI/tui-components/format"
+	"github.com/RenseiAI/tui-components/theme"
 )
 
 // renderMetadata renders the metadata grid for a session.
