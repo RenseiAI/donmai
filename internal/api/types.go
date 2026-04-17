@@ -104,6 +104,43 @@ type ActivityListResponse struct {
 	SessionStatus SessionStatus   `json:"sessionStatus"`
 }
 
+// StopSessionResponse matches POST /api/public/sessions/:id/stop.
+type StopSessionResponse struct {
+	Stopped        bool          `json:"stopped"`
+	SessionID      string        `json:"sessionId"`
+	PreviousStatus SessionStatus `json:"previousStatus"`
+	NewStatus      SessionStatus `json:"newStatus"`
+}
+
+// ChatSessionRequest is the body of POST /api/public/sessions/:id/prompt.
+type ChatSessionRequest struct {
+	Prompt string `json:"prompt"`
+}
+
+// ChatSessionResponse matches POST /api/public/sessions/:id/prompt.
+type ChatSessionResponse struct {
+	Delivered     bool          `json:"delivered"`
+	PromptID      string        `json:"promptId"`
+	SessionID     string        `json:"sessionId"`
+	SessionStatus SessionStatus `json:"sessionStatus"`
+}
+
+// ReconnectSessionRequest is the body of POST /api/public/sessions/:id/reconnect.
+// Cursor and LastEventID are both optional resume hints for the activity stream;
+// callers may send either, neither, or both depending on what they have cached.
+type ReconnectSessionRequest struct {
+	Cursor      *string `json:"cursor,omitempty"`
+	LastEventID *string `json:"lastEventId,omitempty"`
+}
+
+// ReconnectSessionResponse matches POST /api/public/sessions/:id/reconnect.
+type ReconnectSessionResponse struct {
+	Reconnected   bool          `json:"reconnected"`
+	SessionID     string        `json:"sessionId"`
+	SessionStatus SessionStatus `json:"sessionStatus"`
+	MissedEvents  int           `json:"missedEvents"`
+}
+
 // SubmitTaskRequest matches POST /api/mcp/submit-task.
 type SubmitTaskRequest struct {
 	IssueID     string `json:"issueId"`

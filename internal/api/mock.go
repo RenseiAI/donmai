@@ -7,6 +7,9 @@ import (
 
 func ptr[T any](v T) *T { return &v }
 
+// Compile-time check that MockClient satisfies DataSource.
+var _ DataSource = (*MockClient)(nil)
+
 // MockClient returns realistic mock data matching the public API shapes.
 type MockClient struct {
 	sessions []SessionResponse
@@ -165,14 +168,51 @@ func (m *MockClient) GetSessionDetail(id string) (*SessionDetailResponse, error)
 	return nil, fmt.Errorf("session not found: %s", id)
 }
 
-// StopSession is a no-op in the mock client.
-func (m *MockClient) StopSession(_ string) error {
-	return nil
+// StopSession returns a mock stop response for a known session, or ErrNotFound.
+func (m *MockClient) StopSession(id string) (*StopSessionResponse, error) {
+	for i, s := range m.sessions {
+		if s.ID == id {
+			prev := s.Status
+			m.sessions[i].Status = StatusStopped
+			return &StopSessionResponse{
+				Stopped:        true,
+				SessionID:      id,
+				PreviousStatus: prev,
+				NewStatus:      StatusStopped,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("session %s: %w", id, ErrNotFound)
 }
 
-// SendPrompt is a no-op in the mock client.
-func (m *MockClient) SendPrompt(_ string, _ string) error {
-	return nil
+// ChatSession returns a mock chat delivery response for a known session.
+func (m *MockClient) ChatSession(id string, _ ChatSessionRequest) (*ChatSessionResponse, error) {
+	for _, s := range m.sessions {
+		if s.ID == id {
+			return &ChatSessionResponse{
+				Delivered:     true,
+				PromptID:      "mock-prompt-" + id,
+				SessionID:     id,
+				SessionStatus: s.Status,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("session %s: %w", id, ErrNotFound)
+}
+
+// ReconnectSession returns a mock reconnect response for a known session.
+func (m *MockClient) ReconnectSession(id string, _ ReconnectSessionRequest) (*ReconnectSessionResponse, error) {
+	for _, s := range m.sessions {
+		if s.ID == id {
+			return &ReconnectSessionResponse{
+				Reconnected:   true,
+				SessionID:     id,
+				SessionStatus: s.Status,
+				MissedEvents:  0,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("session %s: %w", id, ErrNotFound)
 }
 
 // GetActivities returns mock activity events for a session.

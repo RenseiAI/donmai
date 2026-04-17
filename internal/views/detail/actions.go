@@ -11,7 +11,7 @@ import (
 func (m *Model) stopAgentCmd() tea.Cmd {
 	id := m.sessionID
 	return func() tea.Msg {
-		err := m.dataSource.StopSession(id)
+		_, err := m.dataSource.StopSession(id)
 		return stopAgentMsg{err: err}
 	}
 }
@@ -19,7 +19,7 @@ func (m *Model) stopAgentCmd() tea.Cmd {
 func (m *Model) sendPromptCmd(text string) tea.Cmd {
 	id := m.sessionID
 	return func() tea.Msg {
-		err := m.dataSource.SendPrompt(id, text)
+		_, err := m.dataSource.ChatSession(id, api.ChatSessionRequest{Prompt: text})
 		return sendPromptMsg{text: text, err: err}
 	}
 }

@@ -16,8 +16,9 @@ type DataSource interface {
 	GetSessions() (*SessionsListResponse, error)
 	GetSessionDetail(id string) (*SessionDetailResponse, error)
 	GetActivities(sessionID string, afterCursor *string) (*ActivityListResponse, error)
-	StopSession(id string) error
-	SendPrompt(id string, prompt string) error
+	StopSession(id string) (*StopSessionResponse, error)
+	ChatSession(id string, req ChatSessionRequest) (*ChatSessionResponse, error)
+	ReconnectSession(id string, req ReconnectSessionRequest) (*ReconnectSessionResponse, error)
 	SubmitTask(req SubmitTaskRequest) (*SubmitTaskResponse, error)
 	StopAgent(req StopAgentRequest) (*StopAgentResponse, error)
 	ForwardPrompt(req ForwardPromptRequest) (*ForwardPromptResponse, error)
@@ -49,6 +50,27 @@ func NewAuthenticatedClient(baseURL, apiToken string) *Client {
 	}
 }
 
+// statusToError maps an HTTP status code to a sentinel error for expected
+// failure modes, or a generic error for unexpected codes. Returns nil for 2xx.
+func statusToError(status int, path string) error {
+	switch {
+	case status >= 200 && status < 300:
+		return nil
+	case status == http.StatusUnauthorized:
+		return fmt.Errorf("%s: %w", path, ErrNotAuthenticated)
+	case status == http.StatusForbidden:
+		return fmt.Errorf("%s: %w", path, ErrUnauthorized)
+	case status == http.StatusNotFound:
+		return fmt.Errorf("%s: %w", path, ErrNotFound)
+	case status == http.StatusTooManyRequests:
+		return fmt.Errorf("%s: %w", path, ErrRateLimited)
+	case status >= 500:
+		return fmt.Errorf("%s: %w", path, ErrServerError)
+	default:
+		return fmt.Errorf("unexpected status %d for %s", status, path)
+	}
+}
+
 func (c *Client) get(path string, target any) error {
 	req, err := http.NewRequest("GET", c.BaseURL+path, nil)
 	if err != nil {
@@ -64,8 +86,8 @@ func (c *Client) get(path string, target any) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %d for %s", resp.StatusCode, path)
+	if err := statusToError(resp.StatusCode, path); err != nil {
+		return err
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
@@ -133,8 +155,8 @@ func (c *Client) post(path string, body any, target any) error {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %d for %s", resp.StatusCode, path)
+	if err := statusToError(resp.StatusCode, path); err != nil {
+		return err
 	}
 	if target != nil {
 		if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
@@ -144,15 +166,33 @@ func (c *Client) post(path string, body any, target any) error {
 	return nil
 }
 
-// StopSession sends a stop request for the given session.
-func (c *Client) StopSession(id string) error {
-	return c.post("/api/public/sessions/"+id+"/stop", nil, nil)
+// StopSession sends a stop request for the given session and returns the
+// coordinator's response describing the status transition.
+func (c *Client) StopSession(id string) (*StopSessionResponse, error) {
+	var resp StopSessionResponse
+	if err := c.post("/api/public/sessions/"+id+"/stop", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
-// SendPrompt forwards a prompt to the given session's agent.
-func (c *Client) SendPrompt(id string, prompt string) error {
-	body := map[string]string{"prompt": prompt}
-	return c.post("/api/public/sessions/"+id+"/prompt", body, nil)
+// ChatSession forwards a prompt to the given session's agent and returns the
+// delivery confirmation.
+func (c *Client) ChatSession(id string, req ChatSessionRequest) (*ChatSessionResponse, error) {
+	var resp ChatSessionResponse
+	if err := c.post("/api/public/sessions/"+id+"/prompt", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// ReconnectSession resumes an activity stream for the given session.
+func (c *Client) ReconnectSession(id string, req ReconnectSessionRequest) (*ReconnectSessionResponse, error) {
+	var resp ReconnectSessionResponse
+	if err := c.post("/api/public/sessions/"+id+"/reconnect", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 // SubmitTask submits a new task to the fleet work queue.
