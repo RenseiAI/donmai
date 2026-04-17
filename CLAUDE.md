@@ -73,6 +73,10 @@ make run-status-mock # Run status with mock data
 - **New views**: Create directory in `internal/views/<name>/`, implement Component interface. Use Bubbles v2 components as foundations.
 - **API types**: All request/response types in `internal/api/types.go`. Client methods in `client.go`. Sentinel errors in `errors.go`.
 
+## Hooks
+
+- `.claude/settings.json` registers a `SessionStart` hook running `scripts/refresh-worktree.sh` to auto-rebase and refresh deps; active only on linked worktrees.
+
 ## API Endpoints
 
 The AgentFactory coordinator exposes these endpoints:
