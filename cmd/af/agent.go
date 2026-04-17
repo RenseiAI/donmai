@@ -27,6 +27,7 @@ func newAgentCmd(flags *rootFlags) *cobra.Command {
 	cmd.AddCommand(newAgentListCmd(flags))
 	cmd.AddCommand(newAgentStatusCmd(flags))
 	cmd.AddCommand(newAgentStopCmd(flags))
+	cmd.AddCommand(newAgentChatCmd(flags))
 
 	return cmd
 }

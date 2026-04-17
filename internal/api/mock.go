@@ -286,7 +286,7 @@ func (m *MockClient) StopAgent(req StopAgentRequest) (*StopAgentResponse, error)
 
 // ForwardPrompt returns a mock prompt-forwarding response.
 func (m *MockClient) ForwardPrompt(req ForwardPromptRequest) (*ForwardPromptResponse, error) {
-	return &ForwardPromptResponse{Forwarded: true, PromptID: "mock-prompt", TaskID: req.TaskID, SessionStatus: "running"}, nil
+	return &ForwardPromptResponse{Forwarded: true, PromptID: "mock-prm-1", TaskID: req.TaskID, IssueID: req.TaskID, SessionStatus: "running"}, nil
 }
 
 // GetCostReport returns a mock cost report.
