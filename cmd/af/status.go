@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
 	"github.com/RenseiAI/agentfactory-tui/internal/inline"
 )
 
@@ -29,12 +28,7 @@ func newStatusCmd(flags *rootFlags) *cobra.Command {
 		Long:         "Print a concise fleet status summary. Use --json for raw stats, --watch for auto-refresh.",
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			var ds api.DataSource
-			if flags.mock {
-				ds = api.NewMockClient()
-			} else {
-				ds = api.NewClient(flags.url)
-			}
+			ds := buildDataSource(flags)
 
 			// JSON mode (non-watch): fetch and print stats as indented JSON.
 			if jsonMode && !watch {

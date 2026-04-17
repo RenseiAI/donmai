@@ -31,17 +31,33 @@ func resolveDefaultURL() string {
 // buildContext constructs an *app.Context with the appropriate DataSource
 // based on the mock flag. Extracted from RunE so tests can exercise it
 // without launching Bubble Tea.
-func buildContext(mock bool, url string) *app.Context {
+func buildContext(mock bool, url, apiKey string) *app.Context {
 	var ds api.DataSource
-	if mock {
+	switch {
+	case mock:
 		ds = api.NewMockClient()
-	} else {
+	case apiKey != "":
+		ds = api.NewAuthenticatedClient(url, apiKey)
+	default:
 		ds = api.NewClient(url)
 	}
 	return &app.Context{
 		DataSource: ds,
 		BaseURL:    url,
 		UseMock:    mock,
+	}
+}
+
+// buildDataSource constructs the appropriate DataSource from root flags.
+// Used by subcommands that don't need the full app.Context.
+func buildDataSource(flags *rootFlags) api.DataSource {
+	switch {
+	case flags.mock:
+		return api.NewMockClient()
+	case flags.apiKey != "":
+		return api.NewAuthenticatedClient(flags.url, flags.apiKey)
+	default:
+		return api.NewClient(flags.url)
 	}
 }
 
@@ -59,10 +75,11 @@ var stdinIsTerminal = func() bool {
 // Returned alongside the command so tests can inspect resolved values
 // after PersistentPreRunE runs.
 type rootFlags struct {
-	mock  bool
-	url   string
-	debug bool
-	quiet bool
+	mock   bool
+	url    string
+	apiKey string
+	debug  bool
+	quiet  bool
 }
 
 // configureLogging sets the default slog logger based on --debug/--quiet flags.
@@ -112,6 +129,12 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 				}
 			}
 
+			if !cmd.Flags().Changed("api-key") {
+				if k := os.Getenv("WORKER_API_KEY"); k != "" {
+					flags.apiKey = k
+				}
+			}
+
 			configureLogging(flags)
 			return nil
 		},
@@ -126,6 +149,7 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 
 	cmd.PersistentFlags().BoolVar(&flags.mock, "mock", false, "Use mock data instead of live API")
 	cmd.PersistentFlags().StringVar(&flags.url, "url", resolveDefaultURL(), "AgentFactory server URL")
+	cmd.PersistentFlags().StringVar(&flags.apiKey, "api-key", "", "API key for authenticated requests (env: WORKER_API_KEY)")
 	cmd.PersistentFlags().BoolVar(&flags.debug, "debug", false, "Enable debug logging")
 	cmd.PersistentFlags().BoolVar(&flags.quiet, "quiet", false, "Suppress all log output")
 

@@ -29,7 +29,7 @@ func newDashboardCmd(flags *rootFlags) *cobra.Command {
 // runDashboard launches the Bubble Tea TUI. Logging is suppressed while
 // the TUI is running to avoid corrupting the terminal display.
 func runDashboard(flags *rootFlags) error {
-	ctx := buildContext(flags.mock, flags.url)
+	ctx := buildContext(flags.mock, flags.url, flags.apiKey)
 
 	// Suppress logging while Bubble Tea owns the terminal.
 	prev := slog.Default()

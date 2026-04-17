@@ -147,16 +147,18 @@ func TestBuildContext(t *testing.T) {
 		name     string
 		mock     bool
 		url      string
+		apiKey   string
 		wantMock bool
-		wantType string // "mock" or "real"
+		wantType string // "mock", "real", or "auth"
 	}{
-		{"mock true yields MockClient", true, "http://ignored", true, "mock"},
-		{"mock false yields real Client", false, "http://live:8080", false, "real"},
+		{"mock true yields MockClient", true, "http://ignored", "", true, "mock"},
+		{"mock false yields real Client", false, "http://live:8080", "", false, "real"},
+		{"api key yields authenticated Client", false, "http://live:8080", "rsk_test", false, "auth"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := buildContext(tt.mock, tt.url)
+			ctx := buildContext(tt.mock, tt.url, tt.apiKey)
 			if ctx == nil {
 				t.Fatal("buildContext returned nil")
 			}
@@ -172,8 +174,18 @@ func TestBuildContext(t *testing.T) {
 					t.Errorf("DataSource type = %T, want *api.MockClient", ctx.DataSource)
 				}
 			case "real":
-				if _, ok := ctx.DataSource.(*api.Client); !ok {
+				c, ok := ctx.DataSource.(*api.Client)
+				if !ok {
 					t.Errorf("DataSource type = %T, want *api.Client", ctx.DataSource)
+				} else if c.APIToken != "" {
+					t.Errorf("APIToken = %q, want empty", c.APIToken)
+				}
+			case "auth":
+				c, ok := ctx.DataSource.(*api.Client)
+				if !ok {
+					t.Errorf("DataSource type = %T, want *api.Client", ctx.DataSource)
+				} else if c.APIToken != tt.apiKey {
+					t.Errorf("APIToken = %q, want %q", c.APIToken, tt.apiKey)
 				}
 			}
 		})

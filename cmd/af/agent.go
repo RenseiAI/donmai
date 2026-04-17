@@ -48,12 +48,7 @@ func newAgentListCmd(flags *rootFlags) *cobra.Command {
 		Long:         "List agent sessions. Defaults to active (queued, parked, working); use --all to include completed, failed, and stopped.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			var ds api.DataSource
-			if flags.mock {
-				ds = api.NewMockClient()
-			} else {
-				ds = api.NewClient(flags.url)
-			}
+			ds := buildDataSource(flags)
 
 			resp, err := ds.GetSessions()
 			if err != nil {

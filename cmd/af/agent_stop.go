@@ -25,12 +25,7 @@ func newAgentStopCmd(flags *rootFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id := args[0]
 
-			var ds api.DataSource
-			if flags.mock {
-				ds = api.NewMockClient()
-			} else {
-				ds = api.NewClient(flags.url)
-			}
+			ds := buildDataSource(flags)
 
 			resp, err := ds.StopSession(id)
 			if err != nil {

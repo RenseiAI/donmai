@@ -31,12 +31,7 @@ func newAgentChatCmd(flags *rootFlags) *cobra.Command {
 				return errors.New("message must not be empty")
 			}
 
-			var ds api.DataSource
-			if flags.mock {
-				ds = api.NewMockClient()
-			} else {
-				ds = api.NewClient(flags.url)
-			}
+			ds := buildDataSource(flags)
 
 			resp, err := ds.ForwardPrompt(api.ForwardPromptRequest{
 				TaskID:  taskID,
