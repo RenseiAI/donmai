@@ -76,7 +76,7 @@ func (c *Client) get(path string, target any) error {
 	if err != nil {
 		return fmt.Errorf("create request failed: %w", err)
 	}
-	if c.APIToken != "" {
+	if c.APIToken != "" && !strings.HasPrefix(path, "/api/public/") {
 		req.Header.Set("Authorization", "Bearer "+c.APIToken)
 	}
 
@@ -146,7 +146,7 @@ func (c *Client) post(path string, body any, target any) error {
 		return fmt.Errorf("create request failed: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.APIToken != "" {
+	if c.APIToken != "" && !strings.HasPrefix(path, "/api/public/") {
 		req.Header.Set("Authorization", "Bearer "+c.APIToken)
 	}
 
