@@ -1,35 +1,30 @@
 {
-  "updatedAt": 1776375551183,
+  "updatedAt": 1776434140351,
   "items": [
     {
-      "content": "Wire timeline into detail Render() between metadata and activity",
-      "status": "completed",
-      "activeForm": "Wiring timeline into detail Render()"
+      "content": "Explore codebase structure and existing patterns",
+      "activeForm": "Exploring codebase",
+      "status": "completed"
     },
     {
-      "content": "Wire addInlineActivity into Update() replacing inline AppendActivities calls",
-      "status": "completed",
-      "activeForm": "Wiring addInlineActivity into Update()"
+      "content": "Check REN-955 status and session types availability",
+      "activeForm": "Checking session types",
+      "status": "completed"
     },
     {
-      "content": "Delete unused `focused` field from ActivityViewport",
-      "status": "completed",
-      "activeForm": "Deleting unused focused field"
+      "content": "Implement cmd/af/agent.go (REN-1022)",
+      "activeForm": "Implementing agent.go",
+      "status": "completed"
     },
     {
-      "content": "Delete unused columnLayout.total() from dashboard/table.go",
-      "status": "completed",
-      "activeForm": "Deleting unused columnLayout.total()"
+      "content": "Add tests for af agent list (REN-1023)",
+      "activeForm": "Adding tests",
+      "status": "completed"
     },
     {
-      "content": "Remove unused linter exclusions from .golangci.yml",
-      "status": "completed",
-      "activeForm": "Removing unused linter exclusions"
-    },
-    {
-      "content": "Verify golangci-lint passes with no exclusions",
-      "status": "completed",
-      "activeForm": "Running golangci-lint to verify"
+      "content": "Run build, tests, and lint checks",
+      "activeForm": "Running checks",
+      "status": "completed"
     }
   ]
 }

@@ -131,6 +131,7 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 
 	cmd.AddCommand(newDashboardCmd(flags))
 	cmd.AddCommand(newStatusCmd(flags))
+	cmd.AddCommand(newAgentCmd(flags))
 
 	return cmd, flags
 }
