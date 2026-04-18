@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/tui-components/format"
 	"github.com/RenseiAI/tui-components/theme"
 )
@@ -81,7 +81,7 @@ func renderTableHeader(width int) string {
 }
 
 // renderTableRow renders a single session row.
-func renderTableRow(s api.SessionResponse, width int, selected bool, frame int) string {
+func renderTableRow(s afclient.SessionResponse, width int, selected bool, frame int) string {
 	cols := computeColumns(width)
 	ss := theme.GetStatusStyle(string(s.Status))
 
@@ -122,12 +122,12 @@ func renderTableRow(s api.SessionResponse, width int, selected bool, frame int) 
 }
 
 // filterSessions returns sessions matching the filter text (case-insensitive).
-func filterSessions(sessions []api.SessionResponse, filterText string) []api.SessionResponse {
+func filterSessions(sessions []afclient.SessionResponse, filterText string) []afclient.SessionResponse {
 	if filterText == "" {
 		return sessions
 	}
 	filter := strings.ToLower(filterText)
-	var result []api.SessionResponse
+	var result []afclient.SessionResponse
 	for _, s := range sessions {
 		if strings.Contains(strings.ToLower(s.Identifier), filter) ||
 			strings.Contains(strings.ToLower(s.WorkType), filter) ||

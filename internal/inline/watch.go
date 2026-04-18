@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // WatchConfig holds configuration for the watch loop.
@@ -22,7 +22,7 @@ type WatchConfig struct {
 // For non-TTY stdout (piped): prints a new line each interval.
 // For JSON mode: emits newline-delimited JSON (NDJSON).
 // Handles SIGINT/SIGTERM gracefully, exiting with code 0.
-func RunWatch(ds api.DataSource, cfg WatchConfig) error {
+func RunWatch(ds afclient.DataSource, cfg WatchConfig) error {
 	// Set up signal handling for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -53,7 +53,7 @@ func RunWatch(ds api.DataSource, cfg WatchConfig) error {
 	}
 }
 
-func printWatchLine(ds api.DataSource, jsonMode bool, isTTY bool) error {
+func printWatchLine(ds afclient.DataSource, jsonMode bool, isTTY bool) error {
 	stats, err := ds.GetStats()
 	if err != nil {
 		return err

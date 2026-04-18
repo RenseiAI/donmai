@@ -2,13 +2,13 @@ package detail
 
 import (
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/tui-components/format"
 	"github.com/RenseiAI/tui-components/theme"
 )
 
 // renderMetadata renders the metadata grid for a session.
-func renderMetadata(s api.SessionDetail, width int) string {
+func renderMetadata(s afclient.SessionDetail, width int) string {
 	labelStyle := theme.StatLabel()
 	valueStyle := theme.StatValue()
 

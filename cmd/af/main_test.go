@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // executeRoot builds a fresh root command with its RunE swapped for a
@@ -170,20 +170,20 @@ func TestBuildContext(t *testing.T) {
 			}
 			switch tt.wantType {
 			case "mock":
-				if _, ok := ctx.DataSource.(*api.MockClient); !ok {
-					t.Errorf("DataSource type = %T, want *api.MockClient", ctx.DataSource)
+				if _, ok := ctx.DataSource.(*afclient.MockClient); !ok {
+					t.Errorf("DataSource type = %T, want *afclient.MockClient", ctx.DataSource)
 				}
 			case "real":
-				c, ok := ctx.DataSource.(*api.Client)
+				c, ok := ctx.DataSource.(*afclient.Client)
 				if !ok {
-					t.Errorf("DataSource type = %T, want *api.Client", ctx.DataSource)
+					t.Errorf("DataSource type = %T, want *afclient.Client", ctx.DataSource)
 				} else if c.APIToken != "" {
 					t.Errorf("APIToken = %q, want empty", c.APIToken)
 				}
 			case "auth":
-				c, ok := ctx.DataSource.(*api.Client)
+				c, ok := ctx.DataSource.(*afclient.Client)
 				if !ok {
-					t.Errorf("DataSource type = %T, want *api.Client", ctx.DataSource)
+					t.Errorf("DataSource type = %T, want *afclient.Client", ctx.DataSource)
 				} else if c.APIToken != tt.apiKey {
 					t.Errorf("APIToken = %q, want %q", c.APIToken, tt.apiKey)
 				}

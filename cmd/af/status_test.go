@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/agentfactory-tui/internal/inline"
 )
 
@@ -109,7 +109,7 @@ func TestStatusCommand(t *testing.T) {
 			t.Fatalf("status --mock --json: %v", err)
 		}
 
-		var stats api.StatsResponse
+		var stats afclient.StatsResponse
 		if err := json.Unmarshal([]byte(out), &stats); err != nil {
 			t.Fatalf("stdout is not valid JSON: %v\nstdout: %q", err, out)
 		}

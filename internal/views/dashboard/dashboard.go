@@ -8,7 +8,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/tui-components/theme"
 )
 
@@ -16,8 +16,8 @@ import (
 type tickMsg struct{}
 
 type dataMsg struct {
-	stats    *api.StatsResponse
-	sessions *api.SessionsListResponse
+	stats    *afclient.StatsResponse
+	sessions *afclient.SessionsListResponse
 	err      error
 }
 
@@ -26,9 +26,9 @@ type SelectSessionMsg struct{ SessionID string }
 
 // Model is the Fleet Dashboard view model.
 type Model struct {
-	dataSource api.DataSource
-	stats      *api.StatsResponse
-	sessions   []api.SessionResponse
+	dataSource afclient.DataSource
+	stats      *afclient.StatsResponse
+	sessions   []afclient.SessionResponse
 	cursor     int
 	width      int
 	height     int
@@ -41,7 +41,7 @@ type Model struct {
 }
 
 // New creates a new dashboard model.
-func New(ds api.DataSource) *Model {
+func New(ds afclient.DataSource) *Model {
 	return &Model{
 		dataSource: ds,
 		loading:    true,

@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/agentfactory-tui/internal/views/dashboard"
 	"github.com/RenseiAI/agentfactory-tui/internal/views/detail"
 	"github.com/RenseiAI/agentfactory-tui/internal/views/palette"
@@ -175,7 +175,7 @@ func (a *App) mcpCostReport() tea.Cmd {
 func (a *App) mcpSubmitTask(issueID string) tea.Cmd {
 	ds := a.ctx.DataSource
 	return func() tea.Msg {
-		resp, err := ds.SubmitTask(api.SubmitTaskRequest{IssueID: issueID})
+		resp, err := ds.SubmitTask(afclient.SubmitTaskRequest{IssueID: issueID})
 		if err != nil {
 			return MCPResultMsg{Action: "submit-task", Success: false, Message: err.Error()}
 		}
@@ -190,7 +190,7 @@ func (a *App) mcpSubmitTask(issueID string) tea.Cmd {
 func (a *App) mcpStopAgent(taskID string) tea.Cmd {
 	ds := a.ctx.DataSource
 	return func() tea.Msg {
-		resp, err := ds.StopAgent(api.StopAgentRequest{TaskID: taskID})
+		resp, err := ds.StopAgent(afclient.StopAgentRequest{TaskID: taskID})
 		if err != nil {
 			return MCPResultMsg{Action: "stop-agent", Success: false, Message: err.Error()}
 		}
@@ -205,7 +205,7 @@ func (a *App) mcpStopAgent(taskID string) tea.Cmd {
 func (a *App) mcpForwardPrompt(taskID, message string) tea.Cmd {
 	ds := a.ctx.DataSource
 	return func() tea.Msg {
-		resp, err := ds.ForwardPrompt(api.ForwardPromptRequest{TaskID: taskID, Message: message})
+		resp, err := ds.ForwardPrompt(afclient.ForwardPromptRequest{TaskID: taskID, Message: message})
 		if err != nil {
 			return MCPResultMsg{Action: "forward-prompt", Success: false, Message: err.Error()}
 		}

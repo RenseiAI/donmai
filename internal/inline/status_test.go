@@ -7,23 +7,23 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 func TestFormatStatusLine(t *testing.T) {
 	tests := []struct {
 		name  string
-		stats *api.StatsResponse
+		stats *afclient.StatsResponse
 		want  string
 	}{
 		{
 			name:  "zero values",
-			stats: &api.StatsResponse{},
+			stats: &afclient.StatsResponse{},
 			want:  "0 workers | 0 agents | 0 queued | 0 completed | $0.00 today",
 		},
 		{
 			name: "typical values",
-			stats: &api.StatsResponse{
+			stats: &afclient.StatsResponse{
 				WorkersOnline:  3,
 				AgentsWorking:  5,
 				QueueDepth:     2,
@@ -34,7 +34,7 @@ func TestFormatStatusLine(t *testing.T) {
 		},
 		{
 			name: "large numbers",
-			stats: &api.StatsResponse{
+			stats: &afclient.StatsResponse{
 				WorkersOnline:  999999,
 				AgentsWorking:  999999,
 				QueueDepth:     999999,
@@ -45,14 +45,14 @@ func TestFormatStatusLine(t *testing.T) {
 		},
 		{
 			name: "cost rounds down at 0.1",
-			stats: &api.StatsResponse{
+			stats: &afclient.StatsResponse{
 				TotalCostToday: 0.1,
 			},
 			want: "0 workers | 0 agents | 0 queued | 0 completed | $0.10 today",
 		},
 		{
 			name: "cost half-even rounds 0.125 to 0.12",
-			stats: &api.StatsResponse{
+			stats: &afclient.StatsResponse{
 				TotalCostToday: 0.125,
 			},
 			// Go's fmt package uses "round half to even" for %.2f
@@ -62,7 +62,7 @@ func TestFormatStatusLine(t *testing.T) {
 		},
 		{
 			name: "cost rounds up 99.999 to 100.00",
-			stats: &api.StatsResponse{
+			stats: &afclient.StatsResponse{
 				TotalCostToday: 99.999,
 			},
 			want: "0 workers | 0 agents | 0 queued | 0 completed | $100.00 today",
@@ -82,11 +82,11 @@ func TestFormatStatusLine(t *testing.T) {
 // errDataSource is a DataSource that returns a fixed error from GetStats.
 // All other methods panic — they must not be called by PrintStatus.
 type errDataSource struct {
-	api.DataSource
+	afclient.DataSource
 	err error
 }
 
-func (e *errDataSource) GetStats() (*api.StatsResponse, error) {
+func (e *errDataSource) GetStats() (*afclient.StatsResponse, error) {
 	return nil, e.err
 }
 
@@ -111,7 +111,7 @@ func TestPrintStatus(t *testing.T) {
 	t.Run("writes formatted line to DataWriter", func(t *testing.T) {
 		f := swapDataWriter(t, "status.txt")
 
-		if err := PrintStatus(api.NewMockClient()); err != nil {
+		if err := PrintStatus(afclient.NewMockClient()); err != nil {
 			t.Fatalf("PrintStatus: %v", err)
 		}
 		if err := f.Sync(); err != nil {

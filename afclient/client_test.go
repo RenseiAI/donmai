@@ -1,4 +1,4 @@
-package api
+package afclient
 
 import (
 	"encoding/json"

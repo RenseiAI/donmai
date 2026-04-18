@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // newAgentStopCmd constructs the `af agent stop <session-id>` subcommand.
@@ -29,7 +29,7 @@ func newAgentStopCmd(flags *rootFlags) *cobra.Command {
 
 			resp, err := ds.StopSession(id)
 			if err != nil {
-				if errors.Is(err, api.ErrNotFound) {
+				if errors.Is(err, afclient.ErrNotFound) {
 					return fmt.Errorf("stop agent %s: session not found: %w", id, err)
 				}
 				return fmt.Errorf("stop agent %s: %w", id, err)

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // ANSI codes for chrome styling
@@ -18,7 +18,7 @@ const (
 
 // PrintStatus fetches fleet stats and prints a one-line summary to stdout.
 // Chrome (header, timestamp) goes to stderr for pipe compatibility.
-func PrintStatus(ds api.DataSource) error {
+func PrintStatus(ds afclient.DataSource) error {
 	// Chrome: show fetching indicator
 	Chrome("\r%s\u2819 Fetching...%s%s", ansiGray, ansiReset, ansiClear)
 
@@ -43,7 +43,7 @@ func PrintStatus(ds api.DataSource) error {
 }
 
 // FormatStatusLine renders a one-line fleet summary from stats.
-func FormatStatusLine(stats *api.StatsResponse) string {
+func FormatStatusLine(stats *afclient.StatsResponse) string {
 	return fmt.Sprintf("%d workers | %d agents | %d queued | %d completed | $%.2f today",
 		stats.WorkersOnline,
 		stats.AgentsWorking,

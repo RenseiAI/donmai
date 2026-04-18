@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 func TestAgentStatusMockHumanOutput(t *testing.T) {
@@ -92,8 +92,8 @@ func TestAgentStatusHTTPNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from 404, got nil")
 	}
-	if !errors.Is(err, api.ErrNotFound) {
-		t.Errorf("expected errors.Is(err, api.ErrNotFound); got: %v", err)
+	if !errors.Is(err, afclient.ErrNotFound) {
+		t.Errorf("expected errors.Is(err, afclient.ErrNotFound); got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "sess-unknown") {
 		t.Errorf("expected session id in error message; got: %v", err)
@@ -107,16 +107,16 @@ func TestAgentStatusNilPointerFields(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/activities"):
-			_ = json.NewEncoder(w).Encode(api.ActivityListResponse{
-				Activities:    []api.ActivityEvent{},
-				SessionStatus: api.StatusQueued,
+			_ = json.NewEncoder(w).Encode(afclient.ActivityListResponse{
+				Activities:    []afclient.ActivityEvent{},
+				SessionStatus: afclient.StatusQueued,
 			})
 		default:
-			_ = json.NewEncoder(w).Encode(api.SessionDetailResponse{
-				Session: api.SessionDetail{
+			_ = json.NewEncoder(w).Encode(afclient.SessionDetailResponse{
+				Session: afclient.SessionDetail{
 					ID:         "sess-nils",
 					Identifier: "ISSUE-1",
-					Status:     api.StatusQueued,
+					Status:     afclient.StatusQueued,
 					WorkType:   "development",
 					Duration:   90,
 					// CostUsd, InputTokens, OutputTokens intentionally nil.
@@ -181,19 +181,19 @@ func TestAgentStatusNilPointerFields(t *testing.T) {
 func TestLatestActivity(t *testing.T) {
 	t.Parallel()
 
-	first := api.ActivityEvent{ID: "1", Type: api.ActivityThought, Content: "first"}
-	second := api.ActivityEvent{ID: "2", Type: api.ActivityAction, Content: "second"}
-	third := api.ActivityEvent{ID: "3", Type: api.ActivityResponse, Content: "third"}
+	first := afclient.ActivityEvent{ID: "1", Type: afclient.ActivityThought, Content: "first"}
+	second := afclient.ActivityEvent{ID: "2", Type: afclient.ActivityAction, Content: "second"}
+	third := afclient.ActivityEvent{ID: "3", Type: afclient.ActivityResponse, Content: "third"}
 
 	cases := []struct {
 		name   string
-		events []api.ActivityEvent
-		want   *api.ActivityEvent
+		events []afclient.ActivityEvent
+		want   *afclient.ActivityEvent
 	}{
 		{name: "nil", events: nil, want: nil},
-		{name: "empty", events: []api.ActivityEvent{}, want: nil},
-		{name: "single", events: []api.ActivityEvent{first}, want: &first},
-		{name: "multiple", events: []api.ActivityEvent{first, second, third}, want: &third},
+		{name: "empty", events: []afclient.ActivityEvent{}, want: nil},
+		{name: "single", events: []afclient.ActivityEvent{first}, want: &first},
+		{name: "multiple", events: []afclient.ActivityEvent{first, second, third}, want: &third},
 	}
 
 	for _, tc := range cases {

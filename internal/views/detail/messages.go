@@ -1,9 +1,9 @@
 package detail
 
-import "github.com/RenseiAI/agentfactory-tui/internal/api"
+import "github.com/RenseiAI/agentfactory-tui/afclient"
 
 type detailDataMsg struct {
-	detail *api.SessionDetailResponse
+	detail *afclient.SessionDetailResponse
 	err    error
 }
 
@@ -11,7 +11,7 @@ type detailTickMsg struct{}
 
 // Activity streaming messages
 type activityMsg struct {
-	activities []api.ActivityEvent
+	activities []afclient.ActivityEvent
 	cursor     *string
 	err        error
 }

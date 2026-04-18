@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 func TestAgentStopHelp(t *testing.T) {
@@ -64,7 +64,7 @@ func TestAgentStopMockJSONMode(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 
-	var resp api.StopSessionResponse
+	var resp afclient.StopSessionResponse
 	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
 		t.Fatalf("output not valid JSON: %v\n%s", err, buf.String())
 	}
@@ -74,7 +74,7 @@ func TestAgentStopMockJSONMode(t *testing.T) {
 	if resp.SessionID != "mock-001" {
 		t.Errorf("expected SessionID 'mock-001'; got %q", resp.SessionID)
 	}
-	if resp.NewStatus != api.StatusStopped {
+	if resp.NewStatus != afclient.StatusStopped {
 		t.Errorf("expected NewStatus 'stopped'; got %q", resp.NewStatus)
 	}
 	// Indented output check: the encoder emits a leading "{\n" then a
@@ -93,8 +93,8 @@ func TestAgentStopMockNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unknown session, got nil")
 	}
-	if !errors.Is(err, api.ErrNotFound) {
-		t.Errorf("expected errors.Is(err, api.ErrNotFound); got: %v", err)
+	if !errors.Is(err, afclient.ErrNotFound) {
+		t.Errorf("expected errors.Is(err, afclient.ErrNotFound); got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "session not found") {
 		t.Errorf("expected 'session not found' in error; got: %v", err)
@@ -121,8 +121,8 @@ func TestAgentStopHTTPServerError(t *testing.T) {
 	if !strings.Contains(err.Error(), "stop agent sess-1") {
 		t.Errorf("expected wrapped 'stop agent sess-1'; got: %v", err)
 	}
-	if !errors.Is(err, api.ErrServerError) {
-		t.Errorf("expected errors.Is(err, api.ErrServerError); got: %v", err)
+	if !errors.Is(err, afclient.ErrServerError) {
+		t.Errorf("expected errors.Is(err, afclient.ErrServerError); got: %v", err)
 	}
 }
 
@@ -139,8 +139,8 @@ func TestAgentStopHTTPNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from 404, got nil")
 	}
-	if !errors.Is(err, api.ErrNotFound) {
-		t.Errorf("expected errors.Is(err, api.ErrNotFound); got: %v", err)
+	if !errors.Is(err, afclient.ErrNotFound) {
+		t.Errorf("expected errors.Is(err, afclient.ErrNotFound); got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "session not found") {
 		t.Errorf("expected 'session not found' messaging; got: %v", err)

@@ -1,4 +1,4 @@
-package api
+package afclient
 
 // SessionStatus matches the public API status union type.
 type SessionStatus string

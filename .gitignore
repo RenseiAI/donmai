@@ -8,3 +8,4 @@ bin/
 
 # agent state
 .agent/
+coverage.out

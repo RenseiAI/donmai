@@ -14,7 +14,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/agentfactory-tui/internal/app"
 )
 
@@ -33,14 +33,14 @@ func resolveDefaultURL() string {
 // based on the mock flag. Extracted from RunE so tests can exercise it
 // without launching Bubble Tea.
 func buildContext(mock bool, url, apiKey string) *app.Context {
-	var ds api.DataSource
+	var ds afclient.DataSource
 	switch {
 	case mock:
-		ds = api.NewMockClient()
+		ds = afclient.NewMockClient()
 	case apiKey != "":
-		ds = api.NewAuthenticatedClient(url, apiKey)
+		ds = afclient.NewAuthenticatedClient(url, apiKey)
 	default:
-		ds = api.NewClient(url)
+		ds = afclient.NewClient(url)
 	}
 	return &app.Context{
 		DataSource: ds,
@@ -51,14 +51,14 @@ func buildContext(mock bool, url, apiKey string) *app.Context {
 
 // buildDataSource constructs the appropriate DataSource from root flags.
 // Used by subcommands that don't need the full app.Context.
-func buildDataSource(flags *rootFlags) api.DataSource {
+func buildDataSource(flags *rootFlags) afclient.DataSource {
 	switch {
 	case flags.mock:
-		return api.NewMockClient()
+		return afclient.NewMockClient()
 	case flags.apiKey != "":
-		return api.NewAuthenticatedClient(flags.url, flags.apiKey)
+		return afclient.NewAuthenticatedClient(flags.url, flags.apiKey)
 	default:
-		return api.NewClient(flags.url)
+		return afclient.NewClient(flags.url)
 	}
 }
 

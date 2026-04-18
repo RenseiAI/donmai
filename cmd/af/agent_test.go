@@ -10,7 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // newAgentTestCmd builds a fresh `af agent ...` command tree wired to
@@ -26,65 +26,68 @@ func newAgentTestCmd(args []string) (*cobra.Command, *bytes.Buffer) {
 	return cmd, buf
 }
 
-// stubDataSource is a local api.DataSource stub for tests that need to
+// stubDataSource is a local afclient.DataSource stub for tests that need to
 // control the GetSessions result (e.g., injecting errors, empty lists,
 // or custom fixtures). All other methods are no-ops returning zero
-// values. We do not modify api.MockClient for these cases.
+// values. We do not modify afclient.MockClient for these cases.
 type stubDataSource struct {
-	sessions []api.SessionResponse
+	sessions []afclient.SessionResponse
 	err      error
 }
 
-func (s *stubDataSource) GetStats() (*api.StatsResponse, error) { return &api.StatsResponse{}, nil }
-func (s *stubDataSource) GetSessions() (*api.SessionsListResponse, error) {
+func (s *stubDataSource) GetStats() (*afclient.StatsResponse, error) {
+	return &afclient.StatsResponse{}, nil
+}
+
+func (s *stubDataSource) GetSessions() (*afclient.SessionsListResponse, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &api.SessionsListResponse{
+	return &afclient.SessionsListResponse{
 		Sessions:  s.sessions,
 		Count:     len(s.sessions),
 		Timestamp: "2026-04-17T00:00:00Z",
 	}, nil
 }
 
-func (s *stubDataSource) GetSessionDetail(_ string) (*api.SessionDetailResponse, error) {
-	return nil, api.ErrNotFound
+func (s *stubDataSource) GetSessionDetail(_ string) (*afclient.SessionDetailResponse, error) {
+	return nil, afclient.ErrNotFound
 }
 
-func (s *stubDataSource) GetActivities(_ string, _ *string) (*api.ActivityListResponse, error) {
-	return &api.ActivityListResponse{}, nil
+func (s *stubDataSource) GetActivities(_ string, _ *string) (*afclient.ActivityListResponse, error) {
+	return &afclient.ActivityListResponse{}, nil
 }
 
-func (s *stubDataSource) StopSession(_ string) (*api.StopSessionResponse, error) {
+func (s *stubDataSource) StopSession(_ string) (*afclient.StopSessionResponse, error) {
 	return nil, nil
 }
 
-func (s *stubDataSource) ChatSession(_ string, _ api.ChatSessionRequest) (*api.ChatSessionResponse, error) {
+func (s *stubDataSource) ChatSession(_ string, _ afclient.ChatSessionRequest) (*afclient.ChatSessionResponse, error) {
 	return nil, nil
 }
 
-func (s *stubDataSource) ReconnectSession(_ string, _ api.ReconnectSessionRequest) (*api.ReconnectSessionResponse, error) {
+func (s *stubDataSource) ReconnectSession(_ string, _ afclient.ReconnectSessionRequest) (*afclient.ReconnectSessionResponse, error) {
 	return nil, nil
 }
 
-func (s *stubDataSource) GetCostReport() (*api.CostReportResponse, error) {
-	return &api.CostReportResponse{}, nil
+func (s *stubDataSource) GetCostReport() (*afclient.CostReportResponse, error) {
+	return &afclient.CostReportResponse{}, nil
 }
 
-func (s *stubDataSource) ListFleet() (*api.ListFleetResponse, error) {
-	return &api.ListFleetResponse{}, nil
+func (s *stubDataSource) ListFleet() (*afclient.ListFleetResponse, error) {
+	return &afclient.ListFleetResponse{}, nil
 }
 
-func (s *stubDataSource) SubmitTask(_ api.SubmitTaskRequest) (*api.SubmitTaskResponse, error) {
-	return &api.SubmitTaskResponse{}, nil
+func (s *stubDataSource) SubmitTask(_ afclient.SubmitTaskRequest) (*afclient.SubmitTaskResponse, error) {
+	return &afclient.SubmitTaskResponse{}, nil
 }
 
-func (s *stubDataSource) StopAgent(_ api.StopAgentRequest) (*api.StopAgentResponse, error) {
-	return &api.StopAgentResponse{}, nil
+func (s *stubDataSource) StopAgent(_ afclient.StopAgentRequest) (*afclient.StopAgentResponse, error) {
+	return &afclient.StopAgentResponse{}, nil
 }
 
-func (s *stubDataSource) ForwardPrompt(_ api.ForwardPromptRequest) (*api.ForwardPromptResponse, error) {
-	return &api.ForwardPromptResponse{}, nil
+func (s *stubDataSource) ForwardPrompt(_ afclient.ForwardPromptRequest) (*afclient.ForwardPromptResponse, error) {
+	return &afclient.ForwardPromptResponse{}, nil
 }
 
 // runListWithStub builds the list subcommand with a custom DataSource
@@ -92,7 +95,7 @@ func (s *stubDataSource) ForwardPrompt(_ api.ForwardPromptRequest) (*api.Forward
 // touching MockClient. It bypasses the factory's mock/url branching by
 // constructing the RunE's effective behavior via a thin wrapper command
 // that shares the same output formatting code paths.
-func runListWithStub(t *testing.T, ds api.DataSource, args []string) (string, error) {
+func runListWithStub(t *testing.T, ds afclient.DataSource, args []string) (string, error) {
 	t.Helper()
 
 	// Mirror newAgentListCmd's flag surface + logic, substituting the
@@ -115,7 +118,7 @@ func runListWithStub(t *testing.T, ds api.DataSource, args []string) (string, er
 			if jsonMode {
 				enc := json.NewEncoder(out)
 				enc.SetIndent("", "  ")
-				payload := api.SessionsListResponse{
+				payload := afclient.SessionsListResponse{
 					Sessions:  filtered,
 					Count:     len(filtered),
 					Timestamp: resp.Timestamp,
@@ -200,7 +203,7 @@ func TestAgentListJSONDefault(t *testing.T) {
 	}
 	out := buf.String()
 
-	var resp api.SessionsListResponse
+	var resp afclient.SessionsListResponse
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
 		t.Fatalf("output not valid JSON: %v\n%s", err, out)
 	}
@@ -230,16 +233,16 @@ func TestAgentListJSONAll(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 
-	var resp api.SessionsListResponse
+	var resp afclient.SessionsListResponse
 	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
 		t.Fatalf("output not valid JSON: %v", err)
 	}
-	seen := map[api.SessionStatus]bool{}
+	seen := map[afclient.SessionStatus]bool{}
 	for _, s := range resp.Sessions {
 		seen[s.Status] = true
 	}
 	// --all should include at least one terminal status from mock data.
-	if !seen[api.StatusCompleted] && !seen[api.StatusFailed] && !seen[api.StatusStopped] {
+	if !seen[afclient.StatusCompleted] && !seen[afclient.StatusFailed] && !seen[afclient.StatusStopped] {
 		t.Errorf("--all JSON missing terminal statuses; seen: %v", seen)
 	}
 }
@@ -247,9 +250,9 @@ func TestAgentListJSONAll(t *testing.T) {
 func TestAgentListEmptyActive(t *testing.T) {
 	t.Parallel()
 
-	ds := &stubDataSource{sessions: []api.SessionResponse{
-		{ID: "a", Identifier: "X-1", Status: api.StatusCompleted, WorkType: "dev", Duration: 10},
-		{ID: "b", Identifier: "X-2", Status: api.StatusFailed, WorkType: "qa", Duration: 20},
+	ds := &stubDataSource{sessions: []afclient.SessionResponse{
+		{ID: "a", Identifier: "X-1", Status: afclient.StatusCompleted, WorkType: "dev", Duration: 10},
+		{ID: "b", Identifier: "X-2", Status: afclient.StatusFailed, WorkType: "qa", Duration: 20},
 	}}
 
 	out, err := runListWithStub(t, ds, nil)
@@ -264,7 +267,7 @@ func TestAgentListEmptyActive(t *testing.T) {
 func TestAgentListErrorPropagation(t *testing.T) {
 	t.Parallel()
 
-	sentinel := api.ErrServerError
+	sentinel := afclient.ErrServerError
 	ds := &stubDataSource{err: fmt.Errorf("api call: %w", sentinel)}
 
 	_, err := runListWithStub(t, ds, nil)
@@ -283,16 +286,16 @@ func TestIsActive(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		status api.SessionStatus
+		status afclient.SessionStatus
 		want   bool
 	}{
-		{api.StatusQueued, true},
-		{api.StatusParked, true},
-		{api.StatusWorking, true},
-		{api.StatusCompleted, false},
-		{api.StatusFailed, false},
-		{api.StatusStopped, false},
-		{api.SessionStatus("unknown"), false},
+		{afclient.StatusQueued, true},
+		{afclient.StatusParked, true},
+		{afclient.StatusWorking, true},
+		{afclient.StatusCompleted, false},
+		{afclient.StatusFailed, false},
+		{afclient.StatusStopped, false},
+		{afclient.SessionStatus("unknown"), false},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.status), func(t *testing.T) {

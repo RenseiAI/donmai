@@ -1,5 +1,5 @@
-// Package api provides the AgentFactory coordinator API client and types.
-package api
+// Package afclient provides the AgentFactory coordinator API client and types.
+package afclient
 
 import (
 	"bytes"

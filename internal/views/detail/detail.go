@@ -6,7 +6,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/tui-components/theme"
 	"github.com/RenseiAI/tui-components/widget"
 	"github.com/RenseiAI/tui-components/widget/notification"
@@ -17,8 +17,8 @@ type NavigateBackMsg struct{}
 
 // Model is the Agent Detail view model.
 type Model struct {
-	dataSource api.DataSource
-	session    *api.SessionDetail
+	dataSource afclient.DataSource
+	session    *afclient.SessionDetail
 	sessionID  string
 	width      int
 	height     int
@@ -37,7 +37,7 @@ type Model struct {
 }
 
 // New creates a new detail model.
-func New(ds api.DataSource) *Model {
+func New(ds afclient.DataSource) *Model {
 	return &Model{
 		dataSource: ds,
 		logViewer:  newActivityLogViewer(),
@@ -126,7 +126,7 @@ func (m *Model) isTerminal() bool {
 		return false
 	}
 	switch m.session.Status {
-	case api.StatusCompleted, api.StatusFailed, api.StatusStopped:
+	case afclient.StatusCompleted, afclient.StatusFailed, afclient.StatusStopped:
 		return true
 	}
 	return false
@@ -167,17 +167,17 @@ func (m *Model) Update(msg tea.Msg) tea.Cmd {
 
 	case stopAgentMsg:
 		if msg.err != nil {
-			m.addInlineActivity(api.ActivityError, "Failed to stop agent: "+msg.err.Error())
+			m.addInlineActivity(afclient.ActivityError, "Failed to stop agent: "+msg.err.Error())
 			return m.pushNotification(notification.VariantError, "Failed to stop agent")
 		}
 		return m.pushNotification(notification.VariantSuccess, "Agent stop requested")
 
 	case sendPromptMsg:
 		if msg.err != nil {
-			m.addInlineActivity(api.ActivityError, "Failed to send prompt: "+msg.err.Error())
+			m.addInlineActivity(afclient.ActivityError, "Failed to send prompt: "+msg.err.Error())
 			return m.pushNotification(notification.VariantError, "Failed to send prompt")
 		}
-		m.addInlineActivity(api.ActivityResponse, "Prompt sent: "+msg.text)
+		m.addInlineActivity(afclient.ActivityResponse, "Prompt sent: "+msg.text)
 		return m.pushNotification(notification.VariantSuccess, "Prompt sent")
 
 	case widget.DialogDoneMsg:

@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // newAgentCmd constructs the `af agent` parent command. It holds no
@@ -60,7 +60,7 @@ func newAgentListCmd(flags *rootFlags) *cobra.Command {
 			out := cmd.OutOrStdout()
 
 			if jsonMode {
-				payload := api.SessionsListResponse{
+				payload := afclient.SessionsListResponse{
 					Sessions:  filtered,
 					Count:     len(filtered),
 					Timestamp: resp.Timestamp,
@@ -95,11 +95,11 @@ func newAgentListCmd(flags *rootFlags) *cobra.Command {
 // isActive reports whether a session status is considered active —
 // i.e., queued, parked, or working. Terminal states (completed, failed,
 // stopped) are not active.
-func isActive(status api.SessionStatus) bool {
+func isActive(status afclient.SessionStatus) bool {
 	switch status {
-	case api.StatusQueued, api.StatusParked, api.StatusWorking:
+	case afclient.StatusQueued, afclient.StatusParked, afclient.StatusWorking:
 		return true
-	case api.StatusCompleted, api.StatusFailed, api.StatusStopped:
+	case afclient.StatusCompleted, afclient.StatusFailed, afclient.StatusStopped:
 		return false
 	}
 	return false
@@ -107,11 +107,11 @@ func isActive(status api.SessionStatus) bool {
 
 // filterSessions returns sessions filtered by the active predicate
 // unless all is true, in which case the slice is returned unchanged.
-func filterSessions(sessions []api.SessionResponse, all bool) []api.SessionResponse {
+func filterSessions(sessions []afclient.SessionResponse, all bool) []afclient.SessionResponse {
 	if all {
 		return sessions
 	}
-	out := make([]api.SessionResponse, 0, len(sessions))
+	out := make([]afclient.SessionResponse, 0, len(sessions))
 	for _, s := range sessions {
 		if isActive(s.Status) {
 			out = append(out, s)
@@ -122,7 +122,7 @@ func filterSessions(sessions []api.SessionResponse, all bool) []api.SessionRespo
 
 // writeSessionTable renders a tab-aligned session table to w with the
 // columns: SESSION ID, IDENTIFIER, STATUS, DURATION, WORK TYPE.
-func writeSessionTable(w io.Writer, sessions []api.SessionResponse) error {
+func writeSessionTable(w io.Writer, sessions []afclient.SessionResponse) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	if _, err := fmt.Fprintln(tw, "SESSION ID\tIDENTIFIER\tSTATUS\tDURATION\tWORK TYPE"); err != nil {
 		return fmt.Errorf("write header: %w", err)

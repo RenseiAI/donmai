@@ -12,7 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // chatStubDataSource is a DataSource stub specialized for agent chat
@@ -22,13 +22,13 @@ import (
 // zero-value behaviour to satisfy the interface.
 type chatStubDataSource struct {
 	stubDataSource
-	forwardResp   *api.ForwardPromptResponse
+	forwardResp   *afclient.ForwardPromptResponse
 	forwardErr    error
 	forwardCalls  int
 	failIfInvoked *testing.T
 }
 
-func (c *chatStubDataSource) ForwardPrompt(_ api.ForwardPromptRequest) (*api.ForwardPromptResponse, error) {
+func (c *chatStubDataSource) ForwardPrompt(_ afclient.ForwardPromptRequest) (*afclient.ForwardPromptResponse, error) {
 	c.forwardCalls++
 	if c.failIfInvoked != nil {
 		c.failIfInvoked.Fatal("ForwardPrompt must not be called; empty-message guard should have rejected the request first")
@@ -39,7 +39,7 @@ func (c *chatStubDataSource) ForwardPrompt(_ api.ForwardPromptRequest) (*api.For
 	if c.forwardResp != nil {
 		return c.forwardResp, nil
 	}
-	return &api.ForwardPromptResponse{}, nil
+	return &afclient.ForwardPromptResponse{}, nil
 }
 
 // runChatWithStub mirrors newAgentChatCmd's flag surface and logic with
@@ -47,7 +47,7 @@ func (c *chatStubDataSource) ForwardPrompt(_ api.ForwardPromptRequest) (*api.For
 // RPC-avoidance guarantees without touching MockClient. It reuses the
 // same validation and output-shaping code as the real command so
 // behavioural drift between production and test paths stays minimal.
-func runChatWithStub(t *testing.T, ds api.DataSource, args []string) (string, error) {
+func runChatWithStub(t *testing.T, ds afclient.DataSource, args []string) (string, error) {
 	t.Helper()
 
 	var jsonMode bool
@@ -62,7 +62,7 @@ func runChatWithStub(t *testing.T, ds api.DataSource, args []string) (string, er
 			if strings.TrimSpace(message) == "" {
 				return errors.New("message must not be empty")
 			}
-			resp, err := ds.ForwardPrompt(api.ForwardPromptRequest{TaskID: taskID, Message: message})
+			resp, err := ds.ForwardPrompt(afclient.ForwardPromptRequest{TaskID: taskID, Message: message})
 			if err != nil {
 				return fmt.Errorf("forward prompt: %w", err)
 			}
@@ -198,7 +198,7 @@ func TestAgentChatMockJSONMode(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 
-	var resp api.ForwardPromptResponse
+	var resp afclient.ForwardPromptResponse
 	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
 		t.Fatalf("output not valid JSON: %v\n%s", err, buf.String())
 	}
@@ -226,13 +226,13 @@ func TestAgentChatMockJSONMode(t *testing.T) {
 func TestAgentChatSentinelPropagation(t *testing.T) {
 	t.Parallel()
 
-	ds := &chatStubDataSource{forwardErr: api.ErrNotFound}
+	ds := &chatStubDataSource{forwardErr: afclient.ErrNotFound}
 	_, err := runChatWithStub(t, ds, []string{"SUP-674", "hello"})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !errors.Is(err, api.ErrNotFound) {
-		t.Errorf("errors.Is(err, api.ErrNotFound) = false; err = %v", err)
+	if !errors.Is(err, afclient.ErrNotFound) {
+		t.Errorf("errors.Is(err, afclient.ErrNotFound) = false; err = %v", err)
 	}
 	if !strings.Contains(err.Error(), "forward prompt") {
 		t.Errorf("expected 'forward prompt' prefix; got: %v", err)
@@ -252,8 +252,8 @@ func TestAgentChatHTTPNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for 404, got nil")
 	}
-	if !errors.Is(err, api.ErrNotFound) {
-		t.Errorf("expected errors.Is(err, api.ErrNotFound); got: %v", err)
+	if !errors.Is(err, afclient.ErrNotFound) {
+		t.Errorf("expected errors.Is(err, afclient.ErrNotFound); got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "forward prompt") {
 		t.Errorf("expected 'forward prompt' wrap in error; got: %v", err)

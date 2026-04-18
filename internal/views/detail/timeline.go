@@ -2,7 +2,7 @@ package detail
 
 import (
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/tui-components/format"
 	"github.com/RenseiAI/tui-components/theme"
 )
@@ -16,7 +16,7 @@ type timelineEvent struct {
 }
 
 // renderTimeline renders a vertical timeline of session events.
-func renderTimeline(s api.SessionDetail, width int, frame int) string {
+func renderTimeline(s afclient.SessionDetail, width int, frame int) string {
 	events := buildTimeline(s)
 
 	titleStyle := theme.SectionTitle()
@@ -54,7 +54,7 @@ func renderTimeline(s api.SessionDetail, width int, frame int) string {
 	)
 }
 
-func buildTimeline(s api.SessionDetail) []timelineEvent {
+func buildTimeline(s afclient.SessionDetail) []timelineEvent {
 	blueStyle := lipgloss.NewStyle().Foreground(theme.Blue)
 	greenStyle := lipgloss.NewStyle().Foreground(theme.StatusSuccess)
 	yellowStyle := lipgloss.NewStyle().Foreground(theme.StatusWarning)
@@ -90,10 +90,10 @@ func buildTimeline(s api.SessionDetail) []timelineEvent {
 		label := "Completed"
 		color := greenStyle
 		switch s.Status {
-		case api.StatusFailed:
+		case afclient.StatusFailed:
 			label = "Failed"
 			color = redStyle
-		case api.StatusStopped:
+		case afclient.StatusStopped:
 			label = "Stopped"
 			color = lipgloss.NewStyle().Foreground(theme.TextTertiary)
 		}
@@ -102,14 +102,14 @@ func buildTimeline(s api.SessionDetail) []timelineEvent {
 			timestamp: format.Timestamp(*s.Timeline.Completed),
 			color:     color,
 		})
-	case s.Status == api.StatusWorking:
+	case s.Status == afclient.StatusWorking:
 		events = append(events, timelineEvent{
 			label:     "Running...",
 			timestamp: format.Duration(s.Duration) + " elapsed",
 			color:     greenStyle,
 			active:    true,
 		})
-	case s.Status == api.StatusQueued:
+	case s.Status == afclient.StatusQueued:
 		events = append(events, timelineEvent{
 			label:     "Waiting...",
 			timestamp: "in queue",

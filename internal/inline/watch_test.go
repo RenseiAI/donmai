@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // captureStdout swaps os.Stdout with a pipe, returning the reader and a
@@ -50,7 +50,7 @@ func TestRunWatch(t *testing.T) {
 		r, w := captureStdout(t)
 		bufCh, _ := drainPipe(r)
 
-		ds := api.NewMockClient()
+		ds := afclient.NewMockClient()
 		done := make(chan error, 1)
 		go func() {
 			done <- RunWatch(ds, WatchConfig{Interval: 15 * time.Millisecond, JSON: false})
@@ -91,7 +91,7 @@ func TestRunWatch(t *testing.T) {
 		r, w := captureStdout(t)
 		bufCh, _ := drainPipe(r)
 
-		ds := api.NewMockClient()
+		ds := afclient.NewMockClient()
 		done := make(chan error, 1)
 		go func() {
 			done <- RunWatch(ds, WatchConfig{Interval: 15 * time.Millisecond, JSON: true})
@@ -126,7 +126,7 @@ func TestRunWatch(t *testing.T) {
 			t.Fatalf("expected at least one NDJSON line; got:\n%s", out)
 		}
 
-		var stats api.StatsResponse
+		var stats afclient.StatsResponse
 		if err := json.Unmarshal([]byte(lines[0]), &stats); err != nil {
 			t.Fatalf("first line is not valid JSON: %v\nline: %q", err, lines[0])
 		}

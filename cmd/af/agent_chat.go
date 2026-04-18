@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // newAgentChatCmd constructs `af agent chat <session-id> <message>`. It
@@ -33,7 +33,7 @@ func newAgentChatCmd(flags *rootFlags) *cobra.Command {
 
 			ds := buildDataSource(flags)
 
-			resp, err := ds.ForwardPrompt(api.ForwardPromptRequest{
+			resp, err := ds.ForwardPrompt(afclient.ForwardPromptRequest{
 				TaskID:  taskID,
 				Message: message,
 			})

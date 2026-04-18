@@ -5,12 +5,12 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/tui-components/theme"
 )
 
 // renderStatsBar renders the horizontal stats bar showing fleet metrics.
-func renderStatsBar(stats *api.StatsResponse, width int) string {
+func renderStatsBar(stats *afclient.StatsResponse, width int) string {
 	if stats == nil {
 		return theme.Muted().Width(width).Render("  Loading fleet stats...")
 	}

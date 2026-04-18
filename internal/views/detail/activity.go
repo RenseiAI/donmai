@@ -5,23 +5,23 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/tui-components/theme"
 	"github.com/RenseiAI/tui-components/widget"
 )
 
 // activityIcon returns the icon for an activity type.
-func activityIcon(t api.ActivityType) string {
+func activityIcon(t afclient.ActivityType) string {
 	switch t {
-	case api.ActivityThought:
+	case afclient.ActivityThought:
 		return "\U0001f4ad"
-	case api.ActivityAction:
+	case afclient.ActivityAction:
 		return "\u26a1"
-	case api.ActivityResponse:
+	case afclient.ActivityResponse:
 		return "\U0001f4ac"
-	case api.ActivityError:
+	case afclient.ActivityError:
 		return "\u2717"
-	case api.ActivityProgress:
+	case afclient.ActivityProgress:
 		return "\u2713"
 	default:
 		return "\u00b7"
@@ -29,17 +29,17 @@ func activityIcon(t api.ActivityType) string {
 }
 
 // activityColor returns the lipgloss style for an activity type.
-func activityColor(t api.ActivityType) lipgloss.Style {
+func activityColor(t afclient.ActivityType) lipgloss.Style {
 	switch t {
-	case api.ActivityThought:
+	case afclient.ActivityThought:
 		return lipgloss.NewStyle().Foreground(theme.TextSecondary)
-	case api.ActivityAction:
+	case afclient.ActivityAction:
 		return lipgloss.NewStyle().Foreground(theme.Teal)
-	case api.ActivityResponse:
+	case afclient.ActivityResponse:
 		return lipgloss.NewStyle().Foreground(theme.TextPrimary)
-	case api.ActivityError:
+	case afclient.ActivityError:
 		return lipgloss.NewStyle().Foreground(theme.StatusError)
-	case api.ActivityProgress:
+	case afclient.ActivityProgress:
 		return lipgloss.NewStyle().Foreground(theme.StatusSuccess)
 	default:
 		return lipgloss.NewStyle().Foreground(theme.TextTertiary)
@@ -65,7 +65,7 @@ func newActivityLogViewer() *widget.LogViewer {
 
 // renderActivityLine formats a single activity event as a styled string
 // suitable for LogViewer.Append.
-func renderActivityLine(a api.ActivityEvent, width int) string {
+func renderActivityLine(a afclient.ActivityEvent, width int) string {
 	ts := formatActivityTimestamp(a.Timestamp)
 	tsRendered := theme.Dimmed().Render("[" + ts + "]")
 
@@ -73,7 +73,7 @@ func renderActivityLine(a api.ActivityEvent, width int) string {
 	colorStyle := activityColor(a.Type)
 
 	content := a.Content
-	if a.ToolName != nil && a.Type == api.ActivityAction {
+	if a.ToolName != nil && a.Type == afclient.ActivityAction {
 		badge := lipgloss.NewStyle().
 			Foreground(theme.BgPrimary).
 			Background(theme.Teal).

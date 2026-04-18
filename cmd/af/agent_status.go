@@ -10,7 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/api"
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
 // emDash is the placeholder rendered for nil pointer fields in human output.
@@ -20,8 +20,8 @@ const emDash = "—"
 // Activity is a pointer so it is omitted entirely when the session has no
 // activity events, matching the spec's `omitempty` requirement.
 type agentStatusJSON struct {
-	Session  api.SessionDetail  `json:"session"`
-	Activity *api.ActivityEvent `json:"currentActivity,omitempty"`
+	Session  afclient.SessionDetail  `json:"session"`
+	Activity *afclient.ActivityEvent `json:"currentActivity,omitempty"`
 }
 
 // newAgentStatusCmd constructs the `af agent status <session-id>` subcommand.
@@ -43,8 +43,8 @@ func newAgentStatusCmd(flags *rootFlags) *cobra.Command {
 
 			detail, err := ds.GetSessionDetail(id)
 			if err != nil {
-				if errors.Is(err, api.ErrNotFound) {
-					return fmt.Errorf("session %s: %w", id, api.ErrNotFound)
+				if errors.Is(err, afclient.ErrNotFound) {
+					return fmt.Errorf("session %s: %w", id, afclient.ErrNotFound)
 				}
 				return fmt.Errorf("get session detail: %w", err)
 			}
@@ -81,7 +81,7 @@ func newAgentStatusCmd(flags *rootFlags) *cobra.Command {
 // latestActivity returns a pointer to the last element of events, or nil when
 // the slice is empty. Mock.GetActivities yields events in chronological order,
 // so the last element is the most recent.
-func latestActivity(events []api.ActivityEvent) *api.ActivityEvent {
+func latestActivity(events []afclient.ActivityEvent) *afclient.ActivityEvent {
 	if len(events) == 0 {
 		return nil
 	}
@@ -90,7 +90,7 @@ func latestActivity(events []api.ActivityEvent) *api.ActivityEvent {
 
 // writeSessionDetail renders the eight-row detail block to w using tabwriter
 // for column alignment. Nil pointer fields on SessionDetail render as em-dash.
-func writeSessionDetail(w io.Writer, s api.SessionDetail, current *api.ActivityEvent) error {
+func writeSessionDetail(w io.Writer, s afclient.SessionDetail, current *afclient.ActivityEvent) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
 	rows := [][2]string{
@@ -132,7 +132,7 @@ func costValue(v *float64) string {
 }
 
 // activityValue renders an activity as "Type — Content", or em-dash when nil.
-func activityValue(a *api.ActivityEvent) string {
+func activityValue(a *afclient.ActivityEvent) string {
 	if a == nil {
 		return emDash
 	}
