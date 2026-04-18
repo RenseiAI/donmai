@@ -6,7 +6,49 @@ OSS terminal dashboard and CLI for AgentFactory AI agent fleets.
 
 ## Boundary
 
-This is an open-source project. It must never contain or reference proprietary platform features, endpoints, or concepts. All functionality here is generic AgentFactory core. Downstream closed-source consumers may extend this — but this repo must remain self-contained and platform-agnostic.
+This is an open-source project. It must never contain or reference proprietary platform features, endpoints, or concepts. All functionality here is generic AgentFactory core. The closed-source `rensei-tui` imports this as a Go library dependency via `afcli.RegisterCommands` — so all generic commands built here automatically appear in the `rensei` binary too.
+
+## Package Architecture
+
+```
+agentfactory-tui/
+├── afclient/        # PUBLIC — API client, types, mock, errors
+├── afcli/           # PUBLIC — Cobra command factories (RegisterCommands pattern)
+├── worker/          # PUBLIC — Worker protocol (register, poll, heartbeat, fleet)
+├── cmd/af/          # Binary entry point (thin wrapper over afcli)
+└── internal/        # MODULE-PRIVATE — TUI views, app routing, inline output
+    ├── app/         #   Root Bubble Tea model, view routing
+    ├── views/       #   Dashboard, detail, palette views
+    └── inline/      #   TTY-aware inline output helpers
+```
+
+### Public Packages (importable by rensei-tui and other consumers)
+
+- **`afclient/`** — `DataSource` interface, `Client`, `MockClient`, all request/response types, sentinel errors. This is the API contract.
+- **`afcli/`** — Command factories registered via `RegisterCommands(root *cobra.Command, cfg Config)`. The `Config.ClientFactory` provides the `DataSource`. All command factories are unexported — only `RegisterCommands`, `RunDashboard`, and `Config` are exported.
+- **`worker/`** — Worker protocol client: registration (rsp_live_ tokens), polling, heartbeat, fleet process management.
+
+### Adding New Commands
+
+New commands go in `afcli/` as unexported factory functions, then wire into `RegisterCommands`:
+
+```go
+// afcli/mycommand.go
+func newMyCmd(ds func() afclient.DataSource) *cobra.Command {
+    return &cobra.Command{
+        Use: "mycommand",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            client := ds()
+            // ... use client ...
+        },
+    }
+}
+
+// afcli/commands.go — add to RegisterCommands:
+root.AddCommand(newMyCmd(ds))
+```
+
+Follow existing patterns in `afcli/agent.go` and `afcli/status.go`.
 
 ## Dependency Stack
 
@@ -14,39 +56,13 @@ Charm v2 ecosystem + Cobra:
 - `charm.land/bubbletea/v2` — TUI framework (Elm architecture)
 - `charm.land/lipgloss/v2` — Terminal styling
 - `charm.land/bubbles/v2` — Reusable UI components
+- `github.com/RenseiAI/tui-components` — Shared theme, format, widgets
 - `log/slog` — Structured logging (stdlib)
-- `github.com/spf13/cobra` — CLI framework (unified `af` binary)
+- `github.com/spf13/cobra` — CLI framework
 - `github.com/sahilm/fuzzy` — Fuzzy search (command palette)
 - `github.com/joho/godotenv` — .env.local loading
 
 No other direct dependencies without compelling justification.
-
-## Architecture
-
-Single unified `af` binary covering all use cases:
-
-- `af` (bare) or `af dashboard` — Full Bubble Tea TUI dashboard
-- `af status` — Inline status reporter (TTY-aware, watch mode, JSON output)
-- `af agent|governor|worker|fleet|queue|...` — CLI subcommands (Cobra)
-
-### TUI Architecture (Bubble Tea v2)
-
-- **Root model** (`internal/app/app.go`) routes between views via messages
-- **Views** (`internal/views/`) are Bubble Tea models implementing `Component` interface
-  - `dashboard/` — Fleet overview with stats bar and sortable session table
-  - `detail/` — Session detail with timeline, metadata, activity stream
-  - `palette/` — Fuzzy-search command palette (Ctrl+K)
-- **DataSource** interface (`internal/api/client.go`) abstracts data fetching
-  - `Client` — Real HTTP client with Bearer token auth, retry, logging
-  - `MockClient` — Deterministic mock data for offline development
-
-### Key Patterns
-
-- **Mock-first development**: Use `--mock` flag for offline dev. Mock implements full DataSource interface.
-- **View routing**: Root app model dispatches messages to active view. Views communicate via typed messages.
-- **Theme/format from tui-components**: Import `github.com/RenseiAI/tui-components/theme` and `format` packages.
-- **Cobra + Bubble Tea**: Bare `af` detects TTY and launches TUI. Subcommands are CLI-only. `PersistentPreRunE` initializes shared DataSource and config.
-- **Sentinel errors**: Use `internal/api/errors.go` sentinel errors (ErrNotAuthenticated, ErrNotFound, etc.) for expected failure modes. Wrap with context.
 
 ## Commands
 
@@ -63,16 +79,12 @@ make run-status-mock # Run status with mock data
 
 ## Conventions
 
-- **Project layout**: `cmd/af/` entry point, `internal/{api,app,views,config}/` packages
-- **Errors**: `fmt.Errorf("context: %w", err)`. Sentinel errors for expected failures. Never panic. Never `log.Fatal`.
+- **Errors**: `fmt.Errorf("context: %w", err)`. Sentinel errors in `afclient/errors.go` for expected failures. Never panic. Never `log.Fatal`.
 - **Logging**: `log/slog` to stderr. Disabled in TUI mode. `--debug`/`--quiet` flags for CLI.
-- **Testing**: stdlib `testing` + table-driven tests. No testify. `teatest` for TUI snapshot tests. `cupaloy` for golden files. `httptest` for API mocks. Coverage: 80% target, 70% minimum.
+- **Testing**: stdlib `testing` + table-driven tests. No testify. `afclient.NewMockClient()` for data. `httptest` for API mocks. Coverage: 80% target, 70% minimum.
 - **Linting**: `golangci-lint` with govet, staticcheck, gofumpt, errcheck, gosec, gocritic, revive.
-- **Naming**: Lowercase single-word packages, PascalCase exports
-- **New commands**: Each Cobra subcommand gets its own file in `cmd/af/`. Follow existing patterns.
-- **New views**: Create directory in `internal/views/<name>/`, implement Component interface. Use Bubbles v2 components as foundations.
-- **API types**: All request/response types in `internal/api/types.go`. Client methods in `client.go`. Sentinel errors in `errors.go`.
-- **Worktrees**: `.claude/settings.json` registers a `SessionStart` hook running `scripts/refresh-worktree.sh`, which auto-rebases and refreshes deps in linked worktrees only.
+- **Naming**: Lowercase single-word packages, PascalCase exports.
+- **API types**: All request/response types in `afclient/types.go`. Client methods in `afclient/client.go`. Sentinel errors in `afclient/errors.go`.
 
 ## Hooks
 
@@ -96,3 +108,7 @@ The AgentFactory coordinator exposes these endpoints:
 - `POST /api/mcp/forward-prompt` — Send prompt to agent
 - `GET /api/mcp/cost-report` — Cost analytics
 - `GET /api/mcp/list-fleet` — Fleet snapshot
+
+**CLI auth:**
+
+- `GET /api/cli/whoami` — Verify API key, return org/project context
