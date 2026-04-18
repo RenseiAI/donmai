@@ -14,7 +14,9 @@ import (
 
 // newAgentCmd constructs the `agent` parent command. It holds no
 // logic of its own; it dispatches to subcommands such as `list`.
-func newAgentCmd(ds func() afclient.DataSource) *cobra.Command {
+// projectFunc is optional; when non-nil and returning a non-empty
+// value, `list` scopes results to that project.
+func newAgentCmd(ds func() afclient.DataSource, projectFunc func() string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "agent",
 		Short:        "Inspect and control agent sessions",
@@ -22,7 +24,7 @@ func newAgentCmd(ds func() afclient.DataSource) *cobra.Command {
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newAgentListCmd(ds))
+	cmd.AddCommand(newAgentListCmd(ds, projectFunc))
 	cmd.AddCommand(newAgentStatusCmd(ds))
 	cmd.AddCommand(newAgentStopCmd(ds))
 	cmd.AddCommand(newAgentChatCmd(ds))
@@ -33,8 +35,10 @@ func newAgentCmd(ds func() afclient.DataSource) *cobra.Command {
 // newAgentListCmd constructs the `agent list` subcommand. It filters
 // sessions from DataSource.GetSessions() and renders them as either a
 // human-readable table (default) or indented JSON (--json). The --all
-// flag disables the active-only filter.
-func newAgentListCmd(ds func() afclient.DataSource) *cobra.Command {
+// flag disables the active-only filter. When projectFunc is non-nil and
+// returns a non-empty value, the list is scoped to that project via
+// GetSessionsFiltered; otherwise the fleet-wide GetSessions is used.
+func newAgentListCmd(ds func() afclient.DataSource, projectFunc func() string) *cobra.Command {
 	var (
 		allMode  bool
 		jsonMode bool
@@ -48,7 +52,20 @@ func newAgentListCmd(ds func() afclient.DataSource) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			client := ds()
 
-			resp, err := client.GetSessions()
+			project := ""
+			if projectFunc != nil {
+				project = projectFunc()
+			}
+
+			var (
+				resp *afclient.SessionsListResponse
+				err  error
+			)
+			if project != "" {
+				resp, err = client.GetSessionsFiltered(project)
+			} else {
+				resp, err = client.GetSessions()
+			}
 			if err != nil {
 				return fmt.Errorf("get sessions: %w", err)
 			}

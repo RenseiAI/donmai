@@ -18,8 +18,10 @@ import (
 // or custom fixtures). All other methods are no-ops returning zero
 // values. We do not modify afclient.MockClient for these cases.
 type stubDataSource struct {
-	sessions []afclient.SessionResponse
-	err      error
+	sessions         []afclient.SessionResponse
+	err              error
+	filteredProjects []string // records each project passed to GetSessionsFiltered
+	plainCalls       int      // records calls to GetSessions (no project)
 }
 
 func (s *stubDataSource) GetStats() (*afclient.StatsResponse, error) {
@@ -27,6 +29,19 @@ func (s *stubDataSource) GetStats() (*afclient.StatsResponse, error) {
 }
 
 func (s *stubDataSource) GetSessions() (*afclient.SessionsListResponse, error) {
+	s.plainCalls++
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &afclient.SessionsListResponse{
+		Sessions:  s.sessions,
+		Count:     len(s.sessions),
+		Timestamp: "2026-04-17T00:00:00Z",
+	}, nil
+}
+
+func (s *stubDataSource) GetSessionsFiltered(project string) (*afclient.SessionsListResponse, error) {
+	s.filteredProjects = append(s.filteredProjects, project)
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -79,8 +94,15 @@ func (s *stubDataSource) ForwardPrompt(_ afclient.ForwardPromptRequest) (*afclie
 
 // newTestAgentCmd builds a fresh agent command tree wired to the given
 // DataSource factory. Output/err are captured in the returned buffer.
+// No project scoping is applied.
 func newTestAgentCmd(ds func() afclient.DataSource, args []string) (*cobra.Command, *bytes.Buffer) {
-	cmd := newAgentCmd(ds)
+	return newTestAgentCmdWithProject(ds, nil, args)
+}
+
+// newTestAgentCmdWithProject is like newTestAgentCmd but lets the caller
+// inject a ProjectFunc to exercise project-scoping paths.
+func newTestAgentCmdWithProject(ds func() afclient.DataSource, projectFunc func() string, args []string) (*cobra.Command, *bytes.Buffer) {
+	cmd := newAgentCmd(ds, projectFunc)
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -326,6 +348,67 @@ func TestAgentParentHelp(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "list") {
 		t.Errorf("agent --help missing 'list' subcommand; got:\n%s", buf.String())
+	}
+}
+
+func TestAgentListProjectScoping(t *testing.T) {
+	t.Parallel()
+
+	sessions := []afclient.SessionResponse{
+		{ID: "a", Identifier: "X-1", Status: afclient.StatusWorking, WorkType: "dev", Duration: 10},
+	}
+
+	tests := []struct {
+		name             string
+		projectFunc      func() string
+		wantFilteredArgs []string
+		wantPlainCalls   int
+	}{
+		{
+			name:             "nil_project_func_uses_plain_get_sessions",
+			projectFunc:      nil,
+			wantFilteredArgs: nil,
+			wantPlainCalls:   1,
+		},
+		{
+			name:             "empty_project_uses_plain_get_sessions",
+			projectFunc:      func() string { return "" },
+			wantFilteredArgs: nil,
+			wantPlainCalls:   1,
+		},
+		{
+			name:             "non_empty_project_uses_filtered_get_sessions",
+			projectFunc:      func() string { return "my-project" },
+			wantFilteredArgs: []string{"my-project"},
+			wantPlainCalls:   0,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			stub := &stubDataSource{sessions: sessions}
+			ds := func() afclient.DataSource { return stub }
+
+			cmd, _ := newTestAgentCmdWithProject(ds, tc.projectFunc, []string{"list"})
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+
+			if got, want := stub.plainCalls, tc.wantPlainCalls; got != want {
+				t.Errorf("GetSessions calls = %d, want %d", got, want)
+			}
+			if got, want := len(stub.filteredProjects), len(tc.wantFilteredArgs); got != want {
+				t.Fatalf("GetSessionsFiltered call count = %d, want %d (args=%v)", got, want, stub.filteredProjects)
+			}
+			for i, want := range tc.wantFilteredArgs {
+				if stub.filteredProjects[i] != want {
+					t.Errorf("GetSessionsFiltered call %d arg = %q, want %q", i, stub.filteredProjects[i], want)
+				}
+			}
+		})
 	}
 }
 

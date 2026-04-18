@@ -23,6 +23,12 @@ type Config struct {
 
 	// EnableDashboard registers the dashboard command when true.
 	EnableDashboard bool
+
+	// ProjectFunc returns the active project slug (or ID) used to scope
+	// list endpoints that support filtering. Returning an empty string
+	// means fleet-wide (no scope), preserving the default behavior.
+	// Optional. When nil, all commands behave fleet-wide.
+	ProjectFunc func() string
 }
 
 // resolveURL returns the base URL to use, checking DefaultURLFunc first,
@@ -48,7 +54,7 @@ func (c Config) resolveURL() string {
 func RegisterCommands(root *cobra.Command, cfg Config) {
 	ds := cfg.ClientFactory
 	root.AddCommand(newStatusCmd(ds))
-	root.AddCommand(newAgentCmd(ds))
+	root.AddCommand(newAgentCmd(ds, cfg.ProjectFunc))
 	root.AddCommand(newGovernorCmd(ds))
 	if cfg.EnableDashboard {
 		root.AddCommand(newDashboardCmd(cfg))

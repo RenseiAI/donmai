@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -14,6 +15,7 @@ import (
 type DataSource interface {
 	GetStats() (*StatsResponse, error)
 	GetSessions() (*SessionsListResponse, error)
+	GetSessionsFiltered(project string) (*SessionsListResponse, error)
 	GetSessionDetail(id string) (*SessionDetailResponse, error)
 	GetActivities(sessionID string, afterCursor *string) (*ActivityListResponse, error)
 	StopSession(id string) (*StopSessionResponse, error)
@@ -105,10 +107,22 @@ func (c *Client) GetStats() (*StatsResponse, error) {
 	return &resp, nil
 }
 
-// GetSessions fetches the list of all sessions.
+// GetSessions fetches the list of all sessions (fleet-wide).
 func (c *Client) GetSessions() (*SessionsListResponse, error) {
+	return c.GetSessionsFiltered("")
+}
+
+// GetSessionsFiltered fetches sessions optionally scoped to a project.
+// An empty project returns fleet-wide sessions (same as GetSessions).
+// Non-empty project values are passed as the `project` query parameter;
+// the platform accepts either a project slug or ID.
+func (c *Client) GetSessionsFiltered(project string) (*SessionsListResponse, error) {
+	path := "/api/public/sessions"
+	if project != "" {
+		path += "?project=" + url.QueryEscape(project)
+	}
 	var resp SessionsListResponse
-	if err := c.get("/api/public/sessions", &resp); err != nil {
+	if err := c.get(path, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

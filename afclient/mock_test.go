@@ -51,6 +51,21 @@ func TestMockClientGetSessions(t *testing.T) {
 	}
 }
 
+func TestMockClientGetSessionsFiltered(t *testing.T) {
+	m := NewMockClient()
+	// Mock ignores project scope; both empty and non-empty should return the full list.
+	cases := []string{"", "my-project", "team-a"}
+	for _, project := range cases {
+		resp, err := m.GetSessionsFiltered(project)
+		if err != nil {
+			t.Fatalf("GetSessionsFiltered(%q) error: %v", project, err)
+		}
+		if resp.Count != 12 {
+			t.Errorf("project %q: Count = %d, want 12", project, resp.Count)
+		}
+	}
+}
+
 func TestMockClientGetSessionDetail(t *testing.T) {
 	m := NewMockClient()
 	detail, err := m.GetSessionDetail("mock-001")

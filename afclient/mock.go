@@ -117,8 +117,15 @@ func (m *MockClient) GetStats() (*StatsResponse, error) {
 	}, nil
 }
 
-// GetSessions returns the mock session list.
+// GetSessions returns the mock session list (fleet-wide).
 func (m *MockClient) GetSessions() (*SessionsListResponse, error) {
+	return m.GetSessionsFiltered("")
+}
+
+// GetSessionsFiltered returns the mock session list. The project argument is
+// accepted for interface compatibility but has no effect on mock data — all
+// sessions are returned regardless of scope.
+func (m *MockClient) GetSessionsFiltered(_ string) (*SessionsListResponse, error) {
 	return &SessionsListResponse{
 		Sessions:  m.sessions,
 		Count:     len(m.sessions),

@@ -204,6 +204,59 @@ func TestNewAuthenticatedClient(t *testing.T) {
 	}
 }
 
+func TestClientGetSessionsFiltered(t *testing.T) {
+	tests := []struct {
+		name      string
+		project   string
+		wantQuery string
+	}{
+		{name: "empty_project_no_query_param", project: "", wantQuery: ""},
+		{name: "slug_project_is_query_escaped", project: "my-project", wantQuery: "my-project"},
+		{name: "project_with_special_chars_is_escaped", project: "team a/b", wantQuery: "team a/b"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath, gotQuery string
+			_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotQuery = r.URL.Query().Get("project")
+				_ = json.NewEncoder(w).Encode(SessionsListResponse{Count: 1})
+			})
+
+			if _, err := c.GetSessionsFiltered(tc.project); err != nil {
+				t.Fatalf("GetSessionsFiltered: %v", err)
+			}
+			if gotPath != "/api/public/sessions" {
+				t.Errorf("path = %q, want /api/public/sessions", gotPath)
+			}
+			if gotQuery != tc.wantQuery {
+				t.Errorf("project query = %q, want %q", gotQuery, tc.wantQuery)
+			}
+		})
+	}
+}
+
+func TestClientGetSessionsFallsThroughToFiltered(t *testing.T) {
+	// GetSessions should delegate to GetSessionsFiltered("") and hit the bare endpoint.
+	var gotPath string
+	var gotRawQuery string
+	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotRawQuery = r.URL.RawQuery
+		_ = json.NewEncoder(w).Encode(SessionsListResponse{Count: 0})
+	})
+	if _, err := c.GetSessions(); err != nil {
+		t.Fatalf("GetSessions: %v", err)
+	}
+	if gotPath != "/api/public/sessions" {
+		t.Errorf("path = %q, want /api/public/sessions", gotPath)
+	}
+	if gotRawQuery != "" {
+		t.Errorf("raw query = %q, want empty", gotRawQuery)
+	}
+}
+
 func TestClientAuthHeader(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
