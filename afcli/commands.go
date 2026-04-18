@@ -11,12 +11,32 @@ import (
 // Config controls how af commands are wired into a parent CLI.
 type Config struct {
 	// ClientFactory returns an afclient.DataSource for API calls.
-	// If nil, commands will build their own client from flags/env.
+	// Required.
 	ClientFactory func() afclient.DataSource
 
-	// DefaultURL is the default API base URL. If empty, uses
-	// http://localhost:3000 or WORKER_API_URL env var.
+	// DefaultURLFunc is a lazy URL resolution function (for flag-based callers).
+	// Optional. Checked before DefaultURL.
+	DefaultURLFunc func() string
+
+	// DefaultURL is the fallback API base URL if DefaultURLFunc is nil.
 	DefaultURL string
+
+	// EnableDashboard registers the dashboard command when true.
+	EnableDashboard bool
+}
+
+// resolveURL returns the base URL to use, checking DefaultURLFunc first,
+// then DefaultURL, then "http://localhost:3000".
+func (c Config) resolveURL() string {
+	if c.DefaultURLFunc != nil {
+		if u := c.DefaultURLFunc(); u != "" {
+			return u
+		}
+	}
+	if c.DefaultURL != "" {
+		return c.DefaultURL
+	}
+	return "http://localhost:3000"
 }
 
 // RegisterCommands adds all AgentFactory subcommands to the given root
@@ -26,9 +46,11 @@ type Config struct {
 // to embed AgentFactory functionality (e.g. `rensei dashboard`,
 // `rensei agent list`, etc.).
 func RegisterCommands(root *cobra.Command, cfg Config) {
-	// TODO: Wire command factories here as they are extracted from cmd/af/.
-	// For now this is a stub that will be populated incrementally as
-	// commands are refactored from cmd/af/ main package into afcli/.
-	_ = root
-	_ = cfg
+	ds := cfg.ClientFactory
+	root.AddCommand(newStatusCmd(ds))
+	root.AddCommand(newAgentCmd(ds))
+	root.AddCommand(newGovernorCmd(ds))
+	if cfg.EnableDashboard {
+		root.AddCommand(newDashboardCmd(cfg))
+	}
 }
