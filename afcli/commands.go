@@ -1,5 +1,5 @@
 // Package afcli provides Cobra command factories for the AgentFactory CLI.
-// Downstream projects (e.g. rensei-tui) can import this package and call
+// Downstream projects can import this package and call
 // RegisterCommands to add all af subcommands to their own root command.
 package afcli
 

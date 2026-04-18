@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create a git worktree at ../rensei-tui.wt/<name> for isolated Claude sessions.
+# Create a git worktree at ../agentfactory-tui.wt/<name> for isolated Claude sessions.
 #
 # Usage:
 #   ./scripts/create-worktree.sh <name>

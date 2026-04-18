@@ -6,7 +6,15 @@ OSS terminal dashboard and CLI for AgentFactory AI agent fleets.
 
 ## Boundary
 
-This is an open-source project. It must never contain or reference proprietary platform features, endpoints, or concepts. All functionality here is generic AgentFactory core. The closed-source `rensei-tui` imports this as a Go library dependency via `afcli.RegisterCommands` — so all generic commands built here automatically appear in the `rensei` binary too.
+**This is an open-source project.** Every commit, PR description, code comment, and branch name is publicly visible. The following rules are non-negotiable:
+
+1. **No proprietary references.** Never mention closed-source project names, proprietary product names, or internal platform details in code, comments, commit messages, PR titles, or PR bodies. Use generic language like "downstream consumers" or "importing CLIs" instead.
+2. **No closed-source issue IDs.** Never reference issue identifiers from closed-source trackers in commits or PRs. Use this project's own issue references only.
+3. **No platform-specific concepts.** No `rsk_` token references, no platform API routes, no SaaS feature names. All functionality must be generic AgentFactory core.
+4. **Generic hooks, not named consumers.** When adding extension points (e.g. `Config.ProjectFunc`), describe them in terms of what they do, not who uses them. Say "allows importing CLIs to scope by project" not naming specific consumers.
+5. **Branch names** must use this project's own issue IDs or descriptive names — never IDs from other projects.
+
+Downstream closed-source consumers import this as a Go library via `afcli.RegisterCommands` — all generic commands built here automatically appear in those binaries too.
 
 ## Package Architecture
 
@@ -22,7 +30,7 @@ agentfactory-tui/
     └── inline/      #   TTY-aware inline output helpers
 ```
 
-### Public Packages (importable by rensei-tui and other consumers)
+### Public Packages (importable by downstream consumers)
 
 - **`afclient/`** — `DataSource` interface, `Client`, `MockClient`, all request/response types, sentinel errors. This is the API contract.
 - **`afcli/`** — Command factories registered via `RegisterCommands(root *cobra.Command, cfg Config)`. The `Config.ClientFactory` provides the `DataSource`. All command factories are unexported — only `RegisterCommands`, `RunDashboard`, and `Config` are exported.
