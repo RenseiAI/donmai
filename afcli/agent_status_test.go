@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"encoding/json"
@@ -14,7 +14,9 @@ import (
 func TestAgentStatusMockHumanOutput(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"status", "mock-001", "--mock"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"status", "mock-001"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -52,7 +54,9 @@ func TestAgentStatusMockHumanOutput(t *testing.T) {
 func TestAgentStatusMockJSONOutput(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"status", "mock-001", "--mock", "--json"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"status", "mock-001", "--json"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -73,7 +77,6 @@ func TestAgentStatusMockJSONOutput(t *testing.T) {
 		t.Errorf("expected top-level 'currentActivity' key; got: %v", payload)
 	}
 
-	// Indented encoder leaves a "\n  " before the first field of each object.
 	if !strings.Contains(buf.String(), "\n  \"session\"") {
 		t.Errorf("expected indented JSON output; got:\n%s", buf.String())
 	}
@@ -87,7 +90,9 @@ func TestAgentStatusHTTPNotFound(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	cmd, _ := newAgentTestCmd([]string{"status", "sess-unknown", "--url", srv.URL})
+	client := afclient.NewClient(srv.URL)
+	ds := func() afclient.DataSource { return client }
+	cmd, _ := newTestAgentCmd(ds, []string{"status", "sess-unknown"})
 	err := cmd.Execute()
 	if err == nil {
 		t.Fatal("expected error from 404, got nil")
@@ -119,7 +124,6 @@ func TestAgentStatusNilPointerFields(t *testing.T) {
 					Status:     afclient.StatusQueued,
 					WorkType:   "development",
 					Duration:   90,
-					// CostUsd, InputTokens, OutputTokens intentionally nil.
 				},
 				Timestamp: "2026-04-17T00:00:00Z",
 			})
@@ -129,7 +133,9 @@ func TestAgentStatusNilPointerFields(t *testing.T) {
 
 	t.Run("human", func(t *testing.T) {
 		t.Parallel()
-		cmd, buf := newAgentTestCmd([]string{"status", "sess-nils", "--url", srv.URL})
+		client := afclient.NewClient(srv.URL)
+		ds := func() afclient.DataSource { return client }
+		cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-nils"})
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("execute: %v", err)
 		}
@@ -140,20 +146,20 @@ func TestAgentStatusNilPointerFields(t *testing.T) {
 			"Cost (USD):",
 			"Current Activity:",
 		} {
-			// The label must be present and paired with the em-dash.
 			if !strings.Contains(out, line) {
 				t.Errorf("missing row %q; got:\n%s", line, out)
 			}
 		}
-		// Em-dash appears four times (three nil fields + empty activity).
 		if got := strings.Count(out, "—"); got < 4 {
-			t.Errorf("expected em-dash on ≥4 rows, got %d; out:\n%s", got, out)
+			t.Errorf("expected em-dash on >= 4 rows, got %d; out:\n%s", got, out)
 		}
 	})
 
 	t.Run("json", func(t *testing.T) {
 		t.Parallel()
-		cmd, buf := newAgentTestCmd([]string{"status", "sess-nils", "--url", srv.URL, "--json"})
+		client := afclient.NewClient(srv.URL)
+		ds := func() afclient.DataSource { return client }
+		cmd, buf := newTestAgentCmd(ds, []string{"status", "sess-nils", "--json"})
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("execute: %v", err)
 		}
@@ -210,8 +216,6 @@ func TestLatestActivity(t *testing.T) {
 				if got.ID != tc.want.ID {
 					t.Errorf("want id=%q, got id=%q", tc.want.ID, got.ID)
 				}
-				// For non-empty cases the returned pointer must address an
-				// element inside the input slice (not a copy).
 				if len(tc.events) > 0 && got != &tc.events[len(tc.events)-1] {
 					t.Errorf("expected pointer to last slice element, got a different address")
 				}

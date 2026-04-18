@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"encoding/json"
@@ -16,7 +16,7 @@ import (
 // emDash is the placeholder rendered for nil pointer fields in human output.
 const emDash = "—"
 
-// agentStatusJSON is the combined payload emitted by `af agent status --json`.
+// agentStatusJSON is the combined payload emitted by `agent status --json`.
 // Activity is a pointer so it is omitted entirely when the session has no
 // activity events, matching the spec's `omitempty` requirement.
 type agentStatusJSON struct {
@@ -24,10 +24,10 @@ type agentStatusJSON struct {
 	Activity *afclient.ActivityEvent `json:"currentActivity,omitempty"`
 }
 
-// newAgentStatusCmd constructs the `af agent status <session-id>` subcommand.
+// newAgentStatusCmd constructs the `agent status <session-id>` subcommand.
 // It fetches the session detail and latest activity via DataSource and renders
 // either an aligned eight-row block (default) or indented JSON (--json).
-func newAgentStatusCmd(flags *rootFlags) *cobra.Command {
+func newAgentStatusCmd(ds func() afclient.DataSource) *cobra.Command {
 	var jsonMode bool
 
 	cmd := &cobra.Command{
@@ -39,9 +39,9 @@ func newAgentStatusCmd(flags *rootFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id := args[0]
 
-			ds := buildDataSource(flags)
+			client := ds()
 
-			detail, err := ds.GetSessionDetail(id)
+			detail, err := client.GetSessionDetail(id)
 			if err != nil {
 				if errors.Is(err, afclient.ErrNotFound) {
 					return fmt.Errorf("session %s: %w", id, afclient.ErrNotFound)
@@ -49,7 +49,7 @@ func newAgentStatusCmd(flags *rootFlags) *cobra.Command {
 				return fmt.Errorf("get session detail: %w", err)
 			}
 
-			activities, err := ds.GetActivities(id, nil)
+			activities, err := client.GetActivities(id, nil)
 			if err != nil {
 				return fmt.Errorf("get activities: %w", err)
 			}

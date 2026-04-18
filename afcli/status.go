@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"encoding/json"
@@ -8,14 +8,13 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/agentfactory-tui/internal/inline"
 )
 
-// newStatusCmd constructs the `af status` subcommand. It reads the
-// persistent `--mock`/`--url` values from the parent rootFlags struct
-// rather than consulting the environment or flag lookup, so tests can
-// build fresh commands without global state.
-func newStatusCmd(flags *rootFlags) *cobra.Command {
+// newStatusCmd constructs the `status` subcommand. The ds function
+// returns the DataSource to use for API calls.
+func newStatusCmd(ds func() afclient.DataSource) *cobra.Command {
 	var (
 		jsonMode bool
 		watch    bool
@@ -28,11 +27,11 @@ func newStatusCmd(flags *rootFlags) *cobra.Command {
 		Long:         "Print a concise fleet status summary. Use --json for raw stats, --watch for auto-refresh.",
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			ds := buildDataSource(flags)
+			client := ds()
 
 			// JSON mode (non-watch): fetch and print stats as indented JSON.
 			if jsonMode && !watch {
-				stats, err := ds.GetStats()
+				stats, err := client.GetStats()
 				if err != nil {
 					return fmt.Errorf("get stats: %w", err)
 				}
@@ -50,7 +49,7 @@ func newStatusCmd(flags *rootFlags) *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("invalid interval %q: %w", interval, err)
 				}
-				if err := inline.RunWatch(ds, inline.WatchConfig{
+				if err := inline.RunWatch(client, inline.WatchConfig{
 					Interval: dur,
 					JSON:     jsonMode,
 				}); err != nil {
@@ -60,7 +59,7 @@ func newStatusCmd(flags *rootFlags) *cobra.Command {
 			}
 
 			// Default: one-line human-readable summary.
-			if err := inline.PrintStatus(ds); err != nil {
+			if err := inline.PrintStatus(client); err != nil {
 				return fmt.Errorf("print status: %w", err)
 			}
 			return nil

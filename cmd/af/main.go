@@ -14,6 +14,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/agentfactory-tui/afcli"
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/agentfactory-tui/internal/app"
 )
@@ -160,7 +161,8 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 			if !stdinIsTerminal() {
 				return cmd.Help()
 			}
-			return runDashboard(flags)
+			ctx := buildContext(flags.mock, flags.url, flags.apiKey)
+			return afcli.RunDashboard(ctx)
 		},
 	}
 
@@ -170,9 +172,11 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 	cmd.PersistentFlags().BoolVar(&flags.debug, "debug", false, "Enable debug logging")
 	cmd.PersistentFlags().BoolVar(&flags.quiet, "quiet", false, "Suppress all log output")
 
-	cmd.AddCommand(newDashboardCmd(flags))
-	cmd.AddCommand(newStatusCmd(flags))
-	cmd.AddCommand(newAgentCmd(flags))
+	afcli.RegisterCommands(cmd, afcli.Config{
+		ClientFactory:   func() afclient.DataSource { return buildDataSource(flags) },
+		DefaultURLFunc:  func() string { return flags.url },
+		EnableDashboard: true,
+	})
 
 	return cmd, flags
 }

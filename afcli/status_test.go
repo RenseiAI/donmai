@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"bytes"
@@ -11,19 +11,6 @@ import (
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/agentfactory-tui/internal/inline"
 )
-
-// executeStatus builds a fresh root command, invokes Cobra with
-// "status <args...>", and returns the resulting error. Cobra's own
-// SetOut/SetErr buffers are assigned to discard help/error output
-// unless the caller needs them.
-func executeStatus(t *testing.T, args []string) error {
-	t.Helper()
-	cmd, _ := newRootCmd()
-	cmd.SetArgs(append([]string{"status"}, args...))
-	cmd.SetOut(&bytes.Buffer{})
-	cmd.SetErr(&bytes.Buffer{})
-	return cmd.Execute()
-}
 
 // captureOSStdout swaps os.Stdout (and inline.DataWriter, which is
 // captured at package init from os.Stdout) with a pipe. Returns a
@@ -67,11 +54,13 @@ func captureOSStdout(t *testing.T) (stop func() string) {
 
 func TestStatusCommand(t *testing.T) {
 	t.Run("defaults_from_help", func(t *testing.T) {
-		cmd, _ := newRootCmd()
+		mock := afclient.NewMockClient()
+		ds := func() afclient.DataSource { return mock }
+		cmd := newStatusCmd(ds)
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		cmd.SetErr(&buf)
-		cmd.SetArgs([]string{"status", "--help"})
+		cmd.SetArgs([]string{"--help"})
 
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("status --help should exit 0, got: %v", err)
@@ -88,7 +77,14 @@ func TestStatusCommand(t *testing.T) {
 	t.Run("mock_default_mode", func(t *testing.T) {
 		stop := captureOSStdout(t)
 
-		err := executeStatus(t, []string{"--mock"})
+		mock := afclient.NewMockClient()
+		ds := func() afclient.DataSource { return mock }
+		cmd := newStatusCmd(ds)
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs([]string{})
+
+		err := cmd.Execute()
 		out := stop()
 
 		if err != nil {
@@ -102,7 +98,14 @@ func TestStatusCommand(t *testing.T) {
 	t.Run("mock_json_mode", func(t *testing.T) {
 		stop := captureOSStdout(t)
 
-		err := executeStatus(t, []string{"--mock", "--json"})
+		mock := afclient.NewMockClient()
+		ds := func() afclient.DataSource { return mock }
+		cmd := newStatusCmd(ds)
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs([]string{"--json"})
+
+		err := cmd.Execute()
 		out := stop()
 
 		if err != nil {
@@ -122,11 +125,16 @@ func TestStatusCommand(t *testing.T) {
 	})
 
 	t.Run("invalid_interval_returns_error", func(t *testing.T) {
-		// Capture stdout so the initial watch iteration (if it somehow
-		// runs) doesn't pollute the test log.
 		_ = captureOSStdout(t)
 
-		err := executeStatus(t, []string{"--mock", "--watch", "--interval", "notaduration"})
+		mock := afclient.NewMockClient()
+		ds := func() afclient.DataSource { return mock }
+		cmd := newStatusCmd(ds)
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs([]string{"--watch", "--interval", "notaduration"})
+
+		err := cmd.Execute()
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}

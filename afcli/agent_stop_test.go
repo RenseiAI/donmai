@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"encoding/json"
@@ -14,7 +14,9 @@ import (
 func TestAgentStopHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"stop", "--help"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"stop", "--help"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -27,7 +29,9 @@ func TestAgentStopHelp(t *testing.T) {
 func TestAgentStopMissingArg(t *testing.T) {
 	t.Parallel()
 
-	cmd, _ := newAgentTestCmd([]string{"stop"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, _ := newTestAgentCmd(ds, []string{"stop"})
 	err := cmd.Execute()
 	if err == nil {
 		t.Fatal("expected error for missing session-id, got nil")
@@ -40,26 +44,28 @@ func TestAgentStopMissingArg(t *testing.T) {
 func TestAgentStopMockHumanMode(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"stop", "mock-001", "--mock"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"stop", "mock-001"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	out := buf.String()
 
-	// Single concise line with the transition.
 	if !strings.Contains(out, "Stopped mock-001") {
 		t.Errorf("expected 'Stopped mock-001' in output; got:\n%s", out)
 	}
-	// Previous status for mock-001 is "working"; new status is "stopped".
 	if !strings.Contains(out, "working") || !strings.Contains(out, "stopped") {
-		t.Errorf("expected 'working → stopped' transition; got:\n%s", out)
+		t.Errorf("expected 'working -> stopped' transition; got:\n%s", out)
 	}
 }
 
 func TestAgentStopMockJSONMode(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"stop", "mock-001", "--mock", "--json"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"stop", "mock-001", "--json"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -77,8 +83,6 @@ func TestAgentStopMockJSONMode(t *testing.T) {
 	if resp.NewStatus != afclient.StatusStopped {
 		t.Errorf("expected NewStatus 'stopped'; got %q", resp.NewStatus)
 	}
-	// Indented output check: the encoder emits a leading "{\n" then a
-	// 2-space indented field on the next line.
 	if !strings.Contains(buf.String(), "\n  \"stopped\"") &&
 		!strings.Contains(buf.String(), "\n  \"sessionId\"") {
 		t.Errorf("expected indented JSON output; got:\n%s", buf.String())
@@ -88,7 +92,9 @@ func TestAgentStopMockJSONMode(t *testing.T) {
 func TestAgentStopMockNotFound(t *testing.T) {
 	t.Parallel()
 
-	cmd, _ := newAgentTestCmd([]string{"stop", "nope", "--mock"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, _ := newTestAgentCmd(ds, []string{"stop", "nope"})
 	err := cmd.Execute()
 	if err == nil {
 		t.Fatal("expected error for unknown session, got nil")
@@ -113,7 +119,9 @@ func TestAgentStopHTTPServerError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	cmd, _ := newAgentTestCmd([]string{"stop", "sess-1", "--url", srv.URL})
+	client := afclient.NewClient(srv.URL)
+	ds := func() afclient.DataSource { return client }
+	cmd, _ := newTestAgentCmd(ds, []string{"stop", "sess-1"})
 	err := cmd.Execute()
 	if err == nil {
 		t.Fatal("expected error from 500, got nil")
@@ -134,7 +142,9 @@ func TestAgentStopHTTPNotFound(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	cmd, _ := newAgentTestCmd([]string{"stop", "sess-2", "--url", srv.URL})
+	client := afclient.NewClient(srv.URL)
+	ds := func() afclient.DataSource { return client }
+	cmd, _ := newTestAgentCmd(ds, []string{"stop", "sess-2"})
 	err := cmd.Execute()
 	if err == nil {
 		t.Fatal("expected error from 404, got nil")

@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"bytes"
@@ -44,9 +44,7 @@ func (c *chatStubDataSource) ForwardPrompt(_ afclient.ForwardPromptRequest) (*af
 
 // runChatWithStub mirrors newAgentChatCmd's flag surface and logic with
 // an injected DataSource so tests can exercise error propagation and
-// RPC-avoidance guarantees without touching MockClient. It reuses the
-// same validation and output-shaping code as the real command so
-// behavioural drift between production and test paths stays minimal.
+// RPC-avoidance guarantees without touching MockClient.
 func runChatWithStub(t *testing.T, ds afclient.DataSource, args []string) (string, error) {
 	t.Helper()
 
@@ -90,7 +88,9 @@ func runChatWithStub(t *testing.T, ds afclient.DataSource, args []string) (strin
 func TestAgentChatHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"chat", "--help"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"chat", "--help"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -106,7 +106,9 @@ func TestAgentChatHelp(t *testing.T) {
 func TestAgentParentHelpListsChat(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"--help"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"--help"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -121,6 +123,9 @@ func TestAgentParentHelpListsChat(t *testing.T) {
 func TestAgentChatArgValidation(t *testing.T) {
 	t.Parallel()
 
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+
 	tests := []struct {
 		name string
 		args []string
@@ -133,7 +138,7 @@ func TestAgentChatArgValidation(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			cmd, _ := newAgentTestCmd(tt.args)
+			cmd, _ := newTestAgentCmd(ds, tt.args)
 			err := cmd.Execute()
 			if err == nil {
 				t.Fatal("expected error for wrong arg count, got nil")
@@ -148,8 +153,6 @@ func TestAgentChatArgValidation(t *testing.T) {
 func TestAgentChatEmptyMessageSkipsRPC(t *testing.T) {
 	t.Parallel()
 
-	// chatStubDataSource.ForwardPrompt will t.Fatal if invoked, proving
-	// the empty-message guard short-circuits before any RPC.
 	messages := []struct {
 		name    string
 		message string
@@ -180,7 +183,9 @@ func TestAgentChatEmptyMessageSkipsRPC(t *testing.T) {
 func TestAgentChatMockHumanMode(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"chat", "--mock", "SUP-674", "hello"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"chat", "SUP-674", "hello"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -193,7 +198,9 @@ func TestAgentChatMockHumanMode(t *testing.T) {
 func TestAgentChatMockJSONMode(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"chat", "--mock", "--json", "SUP-674", "hello"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"chat", "--json", "SUP-674", "hello"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -217,7 +224,6 @@ func TestAgentChatMockJSONMode(t *testing.T) {
 	if resp.SessionStatus != "running" {
 		t.Errorf("SessionStatus = %q, want %q", resp.SessionStatus, "running")
 	}
-	// Expect indented output: "{\n  \"forwarded\"": ..."
 	if !strings.Contains(buf.String(), "\n  \"promptId\"") {
 		t.Errorf("expected indented JSON output; got:\n%s", buf.String())
 	}
@@ -247,7 +253,9 @@ func TestAgentChatHTTPNotFound(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	cmd, _ := newAgentTestCmd([]string{"chat", "--url", srv.URL, "SUP-674", "hello"})
+	client := afclient.NewClient(srv.URL)
+	ds := func() afclient.DataSource { return client }
+	cmd, _ := newTestAgentCmd(ds, []string{"chat", "SUP-674", "hello"})
 	err := cmd.Execute()
 	if err == nil {
 		t.Fatal("expected error for 404, got nil")

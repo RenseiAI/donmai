@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"encoding/json"
@@ -10,10 +10,10 @@ import (
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
-// newAgentStopCmd constructs the `af agent stop <session-id>` subcommand.
+// newAgentStopCmd constructs the `agent stop <session-id>` subcommand.
 // It posts to /api/public/sessions/:id/stop via DataSource.StopSession and
 // renders either a one-line confirmation (default) or indented JSON (--json).
-func newAgentStopCmd(flags *rootFlags) *cobra.Command {
+func newAgentStopCmd(ds func() afclient.DataSource) *cobra.Command {
 	var jsonMode bool
 
 	cmd := &cobra.Command{
@@ -25,9 +25,9 @@ func newAgentStopCmd(flags *rootFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id := args[0]
 
-			ds := buildDataSource(flags)
+			client := ds()
 
-			resp, err := ds.StopSession(id)
+			resp, err := client.StopSession(id)
 			if err != nil {
 				if errors.Is(err, afclient.ErrNotFound) {
 					return fmt.Errorf("stop agent %s: session not found: %w", id, err)

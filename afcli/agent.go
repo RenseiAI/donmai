@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"encoding/json"
@@ -12,11 +12,9 @@ import (
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
-// newAgentCmd constructs the `af agent` parent command. It holds no
+// newAgentCmd constructs the `agent` parent command. It holds no
 // logic of its own; it dispatches to subcommands such as `list`.
-// Follows the same factory pattern as newStatusCmd so tests can build
-// fresh instances without global state.
-func newAgentCmd(flags *rootFlags) *cobra.Command {
+func newAgentCmd(ds func() afclient.DataSource) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "agent",
 		Short:        "Inspect and control agent sessions",
@@ -24,19 +22,19 @@ func newAgentCmd(flags *rootFlags) *cobra.Command {
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newAgentListCmd(flags))
-	cmd.AddCommand(newAgentStatusCmd(flags))
-	cmd.AddCommand(newAgentStopCmd(flags))
-	cmd.AddCommand(newAgentChatCmd(flags))
+	cmd.AddCommand(newAgentListCmd(ds))
+	cmd.AddCommand(newAgentStatusCmd(ds))
+	cmd.AddCommand(newAgentStopCmd(ds))
+	cmd.AddCommand(newAgentChatCmd(ds))
 
 	return cmd
 }
 
-// newAgentListCmd constructs the `af agent list` subcommand. It filters
+// newAgentListCmd constructs the `agent list` subcommand. It filters
 // sessions from DataSource.GetSessions() and renders them as either a
 // human-readable table (default) or indented JSON (--json). The --all
 // flag disables the active-only filter.
-func newAgentListCmd(flags *rootFlags) *cobra.Command {
+func newAgentListCmd(ds func() afclient.DataSource) *cobra.Command {
 	var (
 		allMode  bool
 		jsonMode bool
@@ -48,9 +46,9 @@ func newAgentListCmd(flags *rootFlags) *cobra.Command {
 		Long:         "List agent sessions. Defaults to active (queued, parked, working); use --all to include completed, failed, and stopped.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ds := buildDataSource(flags)
+			client := ds()
 
-			resp, err := ds.GetSessions()
+			resp, err := client.GetSessions()
 			if err != nil {
 				return fmt.Errorf("get sessions: %w", err)
 			}

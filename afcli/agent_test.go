@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"bytes"
@@ -12,19 +12,6 @@ import (
 
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
-
-// newAgentTestCmd builds a fresh `af agent ...` command tree wired to
-// MockClient. Output/err are captured in the returned buffer via Cobra's
-// SetOut/SetErr (no global stdout redirection). The caller passes args
-// beginning with the subcommand, e.g. []string{"list", "--mock"}.
-func newAgentTestCmd(args []string) (*cobra.Command, *bytes.Buffer) {
-	cmd, _ := newRootCmd()
-	buf := &bytes.Buffer{}
-	cmd.SetOut(buf)
-	cmd.SetErr(buf)
-	cmd.SetArgs(append([]string{"agent"}, args...))
-	return cmd, buf
-}
 
 // stubDataSource is a local afclient.DataSource stub for tests that need to
 // control the GetSessions result (e.g., injecting errors, empty lists,
@@ -90,18 +77,23 @@ func (s *stubDataSource) ForwardPrompt(_ afclient.ForwardPromptRequest) (*afclie
 	return &afclient.ForwardPromptResponse{}, nil
 }
 
+// newTestAgentCmd builds a fresh agent command tree wired to the given
+// DataSource factory. Output/err are captured in the returned buffer.
+func newTestAgentCmd(ds func() afclient.DataSource, args []string) (*cobra.Command, *bytes.Buffer) {
+	cmd := newAgentCmd(ds)
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs(args)
+	return cmd, buf
+}
+
 // runListWithStub builds the list subcommand with a custom DataSource
 // stub so we can exercise error paths and empty-result paths without
-// touching MockClient. It bypasses the factory's mock/url branching by
-// constructing the RunE's effective behavior via a thin wrapper command
-// that shares the same output formatting code paths.
+// touching MockClient.
 func runListWithStub(t *testing.T, ds afclient.DataSource, args []string) (string, error) {
 	t.Helper()
 
-	// Mirror newAgentListCmd's flag surface + logic, substituting the
-	// injected DataSource. We call the same helpers (filterSessions,
-	// writeSessionTable) to keep coverage flowing through the real
-	// formatting code.
 	var (
 		allMode  bool
 		jsonMode bool
@@ -152,25 +144,24 @@ func runListWithStub(t *testing.T, ds afclient.DataSource, args []string) (strin
 func TestAgentListActiveOnlyDefault(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"list", "--mock"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"list"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	out := buf.String()
 
-	// Active statuses should be present.
 	for _, want := range []string{"working", "queued", "parked"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("active output missing status %q; got:\n%s", want, out)
 		}
 	}
-	// Terminal statuses must NOT be present in default output.
 	for _, reject := range []string{"completed", "failed", "stopped"} {
 		if strings.Contains(out, reject) {
 			t.Errorf("active-only output should not contain %q; got:\n%s", reject, out)
 		}
 	}
-	// Header columns.
 	for _, want := range []string{"SESSION ID", "IDENTIFIER", "STATUS", "DURATION", "WORK TYPE"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("header missing %q; got:\n%s", want, out)
@@ -181,7 +172,9 @@ func TestAgentListActiveOnlyDefault(t *testing.T) {
 func TestAgentListAllFlag(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"list", "--mock", "--all"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"list", "--all"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -197,7 +190,9 @@ func TestAgentListAllFlag(t *testing.T) {
 func TestAgentListJSONDefault(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"list", "--mock", "--json"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"list", "--json"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -218,8 +213,6 @@ func TestAgentListJSONDefault(t *testing.T) {
 			t.Errorf("json default included non-active session %q with status %q", s.ID, s.Status)
 		}
 	}
-	// Indented JSON: the encoder emits a leading "{\n" then a 2-space
-	// indented field on the next line.
 	if !strings.Contains(out, "\n  \"sessions\"") && !strings.Contains(out, "\n  \"count\"") {
 		t.Errorf("expected indented JSON output, got:\n%s", out)
 	}
@@ -228,7 +221,9 @@ func TestAgentListJSONDefault(t *testing.T) {
 func TestAgentListJSONAll(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"list", "--mock", "--json", "--all"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"list", "--json", "--all"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -241,7 +236,6 @@ func TestAgentListJSONAll(t *testing.T) {
 	for _, s := range resp.Sessions {
 		seen[s.Status] = true
 	}
-	// --all should include at least one terminal status from mock data.
 	if !seen[afclient.StatusCompleted] && !seen[afclient.StatusFailed] && !seen[afclient.StatusStopped] {
 		t.Errorf("--all JSON missing terminal statuses; seen: %v", seen)
 	}
@@ -324,7 +318,9 @@ func TestAgentListEmptyAll(t *testing.T) {
 func TestAgentParentHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd, buf := newAgentTestCmd([]string{"--help"})
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, buf := newTestAgentCmd(ds, []string{"--help"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}

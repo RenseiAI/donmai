@@ -1,4 +1,4 @@
-package main
+package afcli
 
 import (
 	"encoding/json"
@@ -11,11 +11,11 @@ import (
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
-// newAgentChatCmd constructs `af agent chat <session-id> <message>`. It
+// newAgentChatCmd constructs `agent chat <session-id> <message>`. It
 // forwards the message to the coordinator's forward-prompt API and
 // prints a one-line confirmation, or the raw response as indented JSON
 // when --json is set.
-func newAgentChatCmd(flags *rootFlags) *cobra.Command {
+func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 	var jsonMode bool
 
 	cmd := &cobra.Command{
@@ -31,9 +31,9 @@ func newAgentChatCmd(flags *rootFlags) *cobra.Command {
 				return errors.New("message must not be empty")
 			}
 
-			ds := buildDataSource(flags)
+			client := ds()
 
-			resp, err := ds.ForwardPrompt(afclient.ForwardPromptRequest{
+			resp, err := client.ForwardPrompt(afclient.ForwardPromptRequest{
 				TaskID:  taskID,
 				Message: message,
 			})
