@@ -49,8 +49,8 @@ func (c Config) resolveURL() string {
 // command. The commands use cfg to resolve API clients and defaults.
 //
 // This is the primary integration point for downstream CLIs that want
-// to embed AgentFactory functionality (e.g. `rensei dashboard`,
-// `rensei agent list`, etc.).
+// to embed AgentFactory functionality under their own root command
+// (e.g. `mycli dashboard`, `mycli agent list`, etc.).
 func RegisterCommands(root *cobra.Command, cfg Config) {
 	ds := cfg.ClientFactory
 	root.AddCommand(newStatusCmd(ds))
