@@ -23,14 +23,18 @@ func newDashboardCmd(cfg Config) *cobra.Command {
 				DataSource: cfg.ClientFactory(),
 				BaseURL:    cfg.resolveURL(),
 			}
-			return RunDashboard(ctx)
+			return runDashboard(ctx)
 		},
 	}
 }
 
-// RunDashboard launches the Bubble Tea TUI. Logging is suppressed while
+// runDashboard launches the Bubble Tea TUI. Logging is suppressed while
 // the TUI is running to avoid corrupting the terminal display.
-func RunDashboard(ctx *app.Context) error {
+//
+// It is unexported because its parameter references an internal type.
+// External callers launch the dashboard via the Cobra subcommand
+// registered by RegisterCommands with Config{EnableDashboard: true}.
+func runDashboard(ctx *app.Context) error {
 	// Suppress logging while Bubble Tea owns the terminal.
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))

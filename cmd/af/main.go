@@ -16,7 +16,6 @@ import (
 
 	"github.com/RenseiAI/agentfactory-tui/afcli"
 	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/internal/app"
 )
 
 const defaultBaseURL = "http://localhost:3000"
@@ -30,28 +29,8 @@ func resolveDefaultURL() string {
 	return defaultBaseURL
 }
 
-// buildContext constructs an *app.Context with the appropriate DataSource
-// based on the mock flag. Extracted from RunE so tests can exercise it
-// without launching Bubble Tea.
-func buildContext(mock bool, url, apiKey string) *app.Context {
-	var ds afclient.DataSource
-	switch {
-	case mock:
-		ds = afclient.NewMockClient()
-	case apiKey != "":
-		ds = afclient.NewAuthenticatedClient(url, apiKey)
-	default:
-		ds = afclient.NewClient(url)
-	}
-	return &app.Context{
-		DataSource: ds,
-		BaseURL:    url,
-		UseMock:    mock,
-	}
-}
-
 // buildDataSource constructs the appropriate DataSource from root flags.
-// Used by subcommands that don't need the full app.Context.
+// Used by the ClientFactory passed to afcli.RegisterCommands.
 func buildDataSource(flags *rootFlags) afclient.DataSource {
 	switch {
 	case flags.mock:
@@ -156,13 +135,21 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 			configureLogging(flags)
 			return nil
 		},
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare `af` in a TTY launches the dashboard; non-TTY shows help.
 			if !stdinIsTerminal() {
 				return cmd.Help()
 			}
-			ctx := buildContext(flags.mock, flags.url, flags.apiKey)
-			return afcli.RunDashboard(ctx)
+			// Delegate to the registered dashboard subcommand so the bare
+			// `af` path and `af dashboard` share identical wiring. The
+			// dashboard subcommand is registered below via
+			// afcli.RegisterCommands with EnableDashboard: true.
+			for _, sub := range cmd.Commands() {
+				if sub.Name() == "dashboard" {
+					return sub.RunE(sub, args)
+				}
+			}
+			return cmd.Help()
 		},
 	}
 

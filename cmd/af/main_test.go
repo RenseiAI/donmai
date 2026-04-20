@@ -142,48 +142,41 @@ func TestDotenvLoadMissingFileIsNonFatal(t *testing.T) {
 	}
 }
 
-func TestBuildContext(t *testing.T) {
+func TestBuildDataSource(t *testing.T) {
 	tests := []struct {
 		name     string
 		mock     bool
 		url      string
 		apiKey   string
-		wantMock bool
 		wantType string // "mock", "real", or "auth"
 	}{
-		{"mock true yields MockClient", true, "http://ignored", "", true, "mock"},
-		{"mock false yields real Client", false, "http://live:8080", "", false, "real"},
-		{"api key yields authenticated Client", false, "http://live:8080", "rsk_test", false, "auth"},
+		{"mock true yields MockClient", true, "http://ignored", "", "mock"},
+		{"mock false yields real Client", false, "http://live:8080", "", "real"},
+		{"api key yields authenticated Client", false, "http://live:8080", "rsk_test", "auth"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := buildContext(tt.mock, tt.url, tt.apiKey)
-			if ctx == nil {
-				t.Fatal("buildContext returned nil")
-			}
-			if ctx.UseMock != tt.wantMock {
-				t.Errorf("UseMock = %v, want %v", ctx.UseMock, tt.wantMock)
-			}
-			if ctx.BaseURL != tt.url {
-				t.Errorf("BaseURL = %q, want %q", ctx.BaseURL, tt.url)
+			ds := buildDataSource(&rootFlags{mock: tt.mock, url: tt.url, apiKey: tt.apiKey})
+			if ds == nil {
+				t.Fatal("buildDataSource returned nil")
 			}
 			switch tt.wantType {
 			case "mock":
-				if _, ok := ctx.DataSource.(*afclient.MockClient); !ok {
-					t.Errorf("DataSource type = %T, want *afclient.MockClient", ctx.DataSource)
+				if _, ok := ds.(*afclient.MockClient); !ok {
+					t.Errorf("DataSource type = %T, want *afclient.MockClient", ds)
 				}
 			case "real":
-				c, ok := ctx.DataSource.(*afclient.Client)
+				c, ok := ds.(*afclient.Client)
 				if !ok {
-					t.Errorf("DataSource type = %T, want *afclient.Client", ctx.DataSource)
+					t.Errorf("DataSource type = %T, want *afclient.Client", ds)
 				} else if c.APIToken != "" {
 					t.Errorf("APIToken = %q, want empty", c.APIToken)
 				}
 			case "auth":
-				c, ok := ctx.DataSource.(*afclient.Client)
+				c, ok := ds.(*afclient.Client)
 				if !ok {
-					t.Errorf("DataSource type = %T, want *afclient.Client", ctx.DataSource)
+					t.Errorf("DataSource type = %T, want *afclient.Client", ds)
 				} else if c.APIToken != tt.apiKey {
 					t.Errorf("APIToken = %q, want %q", c.APIToken, tt.apiKey)
 				}

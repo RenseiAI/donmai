@@ -33,7 +33,7 @@ agentfactory-tui/
 ### Public Packages (importable by downstream consumers)
 
 - **`afclient/`** — `DataSource` interface, `Client`, `MockClient`, all request/response types, sentinel errors. This is the API contract.
-- **`afcli/`** — Command factories registered via `RegisterCommands(root *cobra.Command, cfg Config)`. The `Config.ClientFactory` provides the `DataSource`. All command factories are unexported — only `RegisterCommands`, `RunDashboard`, and `Config` are exported.
+- **`afcli/`** — Command factories registered via `RegisterCommands(root *cobra.Command, cfg Config)`. The `Config.ClientFactory` provides the `DataSource`. All command factories are unexported — only `RegisterCommands` and `Config` are exported. The dashboard is exposed as the `dashboard` subcommand when `Config.EnableDashboard` is true.
 - **`worker/`** — Worker protocol client: registration (rsp_live_ tokens), polling, heartbeat, fleet process management.
 
 ### Adding New Commands
