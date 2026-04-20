@@ -7,6 +7,11 @@ providers:
     research: claude
     qa: claude
     acceptance: claude
+models:
+    default: claude-opus-4-7
+    byWorkType:
+      coordination: claude-opus-4-7
+    subAgent: claude-sonnet-4-6
 packageManager: none
 buildCommand: "make build"
 testCommand: "go test ./..."
