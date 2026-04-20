@@ -60,7 +60,19 @@
         "commands": [
           "WT=$(./scripts/create-worktree.sh af-tui-2) && cd $WT && claude --dangerously-skip-permissions --remote-control"
         ]
-      }
+      },
+      {
+        "name": "Codex AF-TUI #3",
+        "color": "terminal.ansiBrightCyan",
+        "icon": "squirrel",
+        "commands": ["WT=$(./scripts/create-worktree.sh af-tui-3) && cd $WT && codex --dangerously-bypass-approvals-and-sandbox"],
+      },
+      {
+        "name": "Codex AF-TUI #4",
+        "color": "terminal.ansiBrightCyan",
+        "icon": "squirrel",
+        "commands": ["WT=$(./scripts/create-worktree.sh af-tui-4) && cd $WT && codex --dangerously-bypass-approvals-and-sandbox"],
+      },
     ]
   },
   "extensions": {
