@@ -55,6 +55,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	ds := cfg.ClientFactory
 	root.AddCommand(newStatusCmd(ds))
 	root.AddCommand(newAgentCmd(ds, cfg.ProjectFunc))
+	root.AddCommand(newSessionCmd(ds, cfg.ProjectFunc))
 	root.AddCommand(newGovernorCmd(ds))
 	root.AddCommand(newWorkerCmd(ds))
 	root.AddCommand(newFleetCmd(ds))
