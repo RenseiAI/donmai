@@ -2,16 +2,10 @@ apiVersion: v1
 kind: RepositoryConfig
 repository: github.com/RenseiAI/agentfactory-tui
 providers:
-  default: claude
-  byWorkType:
-    research: claude
-    qa: claude
-    acceptance: claude
+  default: codex
 models:
-    default: claude-opus-4-7
-    byWorkType:
-      coordination: claude-opus-4-7
-    subAgent: claude-sonnet-4-6
+    default: gpt-5.4
+    subAgent: gpt-5.4-mini
 packageManager: none
 buildCommand: "make build"
 testCommand: "go test ./..."
