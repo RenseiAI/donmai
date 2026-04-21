@@ -4,15 +4,15 @@ OSS terminal dashboard and CLI for AgentFactory AI agent fleets.
 
 **Module**: `github.com/RenseiAI/agentfactory-tui`
 
-## Boundary
+## Boundary — OSS / Proprietary Separation
 
-**This is an open-source project.** Every commit, PR description, code comment, and branch name is publicly visible. The following rules are non-negotiable:
+**This is an open-source project.** A closed-source proprietary platform imports this module as its open core. The rules below exist to prevent leaking proprietary platform details into this public repo. They do **not** restrict using well-known third-party tools and services (Linear, Redis, GitHub, etc.) — those are fine.
 
-1. **No proprietary references.** Never mention closed-source project names, proprietary product names, or internal platform details in code, comments, commit messages, PR titles, or PR bodies. Use generic language like "downstream consumers" or "importing CLIs" instead.
-2. **No closed-source issue IDs.** Never reference issue identifiers from closed-source trackers in commits or PRs. Use this project's own issue references only.
-3. **No platform-specific concepts.** No `rsk_` token references, no platform API routes, no SaaS feature names. All functionality must be generic AgentFactory core.
-4. **Generic hooks, not named consumers.** When adding extension points (e.g. `Config.ProjectFunc`), describe them in terms of what they do, not who uses them. Say "allows importing CLIs to scope by project" not naming specific consumers.
-5. **Branch names** must use this project's own issue IDs or descriptive names — never IDs from other projects.
+1. **No proprietary platform references.** Never mention the closed-source platform's product name, internal service names, or internal details in code, comments, commits, PR titles, or PR bodies. Refer to it generically as "downstream consumers" or "importing CLIs."
+2. **No closed-source issue IDs in commits/PRs.** Commits and PR descriptions must only reference this project's own issue tracker. (You may still *read* issues from other trackers like Linear for context — just don't put their IDs in public git history.)
+3. **No proprietary platform concepts.** No `rsk_` token references, no proprietary platform API routes, no proprietary SaaS feature names. All functionality in this repo must be generic AgentFactory core.
+4. **Generic hooks, not named consumers.** When adding extension points (e.g. `Config.ProjectFunc`), describe them in terms of what they do, not who uses them.
+5. **Branch names** must use this project's own issue IDs or descriptive names — never IDs from the proprietary platform's tracker.
 
 Downstream closed-source consumers import this as a Go library via `afcli.RegisterCommands` — all generic commands built here automatically appear in those binaries too.
 
