@@ -9,3 +9,8 @@ bin/
 # agent state
 .agent/
 coverage.out
+
+# go cache
+**/.gocache/
+**/go-build/
+**/.golangci-lint-cache/
