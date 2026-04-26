@@ -1,38 +1,73 @@
 package afcli
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
-	"os/exec"
-	"os/signal"
 	"strings"
-	"syscall"
+	"time"
 
+	"github.com/RenseiAI/agentfactory-tui/internal/governor"
+	"github.com/RenseiAI/agentfactory-tui/internal/linear"
+	"github.com/RenseiAI/agentfactory-tui/internal/process"
+	"github.com/RenseiAI/agentfactory-tui/internal/queue"
 	"github.com/spf13/cobra"
 )
 
 // governorPIDName is the PID file name used for the governor process.
+// Referenced by governor_stop.go and governor_status.go.
 const governorPIDName = "governor"
 
-// governorBinaryFinder finds the child binary; tests override it.
-var governorBinaryFinder = findGovernorBinary
+// governorRunnable is the minimal interface used by governor start so tests can
+// substitute a fake without importing internal/governor.
+type governorRunnable interface {
+	Run(ctx context.Context) error
+}
 
-// governorForegroundRunner is the foreground runner; tests override it.
-var governorForegroundRunner = runGovernorForeground
+// governorRunnerFactory is the package-level hook; tests override it.
+var governorRunnerFactory = defaultGovernorRunnerFactory
 
-// governorBackgroundRunner is the background runner; tests override it.
-var governorBackgroundRunner = runGovernorBackground
+// governorDaemonize is the package-level hook for daemonization; tests override it.
+var governorDaemonize = process.Daemonize
 
-// findGovernorBinary searches PATH for the governor binary, preferring
-// "agentfactory-governor" over the shorter "af-governor" alias.
-func findGovernorBinary() (string, error) {
-	for _, name := range []string{"agentfactory-governor", "af-governor"} {
-		path, err := exec.LookPath(name)
-		if err == nil {
-			return path, nil
-		}
+// defaultGovernorRunnerFactory wires the real linear/queue/governor clients.
+// It returns the runnable, a closer for the queue client, and any setup error.
+func defaultGovernorRunnerFactory(
+	cfg governor.Config,
+	apiKey string,
+	redisURL string,
+	logger *slog.Logger,
+) (governorRunnable, func() error, error) {
+	linClient, err := linear.NewClient(apiKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("governor start: %w", err)
 	}
-	return "", fmt.Errorf("governor binary not found: install agentfactory-governor or af-governor")
+
+	if redisURL == "" {
+		return nil, nil, fmt.Errorf("governor start: REDIS_URL is not set")
+	}
+
+	qClient, err := queue.NewClient(redisURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("governor start: %w", err)
+	}
+
+	closer := func() error { return qClient.Close() }
+
+	ctx := context.Background()
+	if err := qClient.Ping(ctx); err != nil {
+		_ = closer()
+		return nil, nil, fmt.Errorf("governor start: %w", err)
+	}
+
+	runner, err := governor.NewRunner(cfg, linClient, qClient, logger)
+	if err != nil {
+		_ = closer()
+		return nil, nil, fmt.Errorf("governor start: %w", err)
+	}
+
+	return runner, closer, nil
 }
 
 // validModes is the set of accepted --mode values.
@@ -42,8 +77,8 @@ var validModes = map[string]bool{
 }
 
 // newGovernorStartCmd constructs the `governor start` subcommand.
-// It finds and launches the governor binary as a subprocess, either
-// in foreground mode (streaming logs) or background mode (PID tracking).
+// It builds and launches the in-process governor runner, either in foreground
+// mode (streaming logs via stderr) or background/daemon mode (PID tracking).
 func newGovernorStartCmd() *cobra.Command {
 	var (
 		projects              []string
@@ -66,7 +101,8 @@ func newGovernorStartCmd() *cobra.Command {
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			// LINEAR_API_KEY preflight.
-			if os.Getenv("LINEAR_API_KEY") == "" {
+			apiKey := os.Getenv("LINEAR_API_KEY")
+			if apiKey == "" {
 				return fmt.Errorf("governor start: LINEAR_API_KEY is not set")
 			}
 
@@ -91,45 +127,66 @@ func newGovernorStartCmd() *cobra.Command {
 				return fmt.Errorf("invalid --mode %q: must be \"event-driven\" or \"poll-only\"", mode)
 			}
 
-			binPath, err := governorBinaryFinder()
+			// Parse scan interval.
+			interval, err := time.ParseDuration(scanInterval)
+			if err != nil {
+				return fmt.Errorf("governor start: invalid --scan-interval: %w", err)
+			}
+
+			// Build governor.Config from flags.
+			cfg := governor.Config{
+				Projects:            resolved,
+				ScanInterval:        interval,
+				MaxDispatches:       maxDispatches,
+				Once:                once,
+				Mode:                governor.Mode(mode),
+				AutoResearch:        !noAutoResearch,
+				AutoBacklogCreation: !noAutoBacklogCreation,
+				AutoDevelopment:     !noAutoDevelopment,
+				AutoQA:              !noAutoQA,
+				AutoAcceptance:      !noAutoAcceptance,
+			}
+
+			logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+			redisURL := os.Getenv("REDIS_URL")
+
+			runner, closer, err := governorRunnerFactory(cfg, apiKey, redisURL, logger)
 			if err != nil {
 				return err
 			}
+			defer func() { _ = closer() }()
 
-			// Build the child arg slice.
-			args := []string{"governor"}
-
-			for _, p := range resolved {
-				args = append(args, "--project", p)
-			}
-
-			args = append(args, "--scan-interval", scanInterval)
-			args = append(args, "--max-dispatches", fmt.Sprintf("%d", maxDispatches))
-			args = append(args, "--mode", mode)
-
-			if once {
-				args = append(args, "--once")
-			}
-			if noAutoResearch {
-				args = append(args, "--no-auto-research")
-			}
-			if noAutoBacklogCreation {
-				args = append(args, "--no-auto-backlog-creation")
-			}
-			if noAutoDevelopment {
-				args = append(args, "--no-auto-development")
-			}
-			if noAutoQA {
-				args = append(args, "--no-auto-qa")
-			}
-			if noAutoAcceptance {
-				args = append(args, "--no-auto-acceptance")
-			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
 			if foreground {
-				return governorForegroundRunner(binPath, args)
+				fmt.Fprintln(os.Stderr, "Governor starting in foreground...")
+				process.InstallSignalHandlers(ctx, cancel)
+				return runner.Run(ctx)
 			}
-			return governorBackgroundRunner(binPath, args)
+
+			// Background / daemon path.
+			isChild, childPID, err := governorDaemonize()
+			if err != nil {
+				return fmt.Errorf("governor start: %w", err)
+			}
+
+			if !isChild {
+				// Parent: write PID file and exit.
+				pf, err := process.NewPIDFile("governor")
+				if err != nil {
+					return fmt.Errorf("governor start: %w", err)
+				}
+				if err := pf.Write(childPID); err != nil {
+					return fmt.Errorf("governor start: %w", err)
+				}
+				fmt.Printf("Governor started (PID %d)\n", childPID)
+				return nil
+			}
+
+			// Child (daemon): run the loop.
+			process.InstallSignalHandlers(ctx, cancel)
+			return runner.Run(ctx)
 		},
 	}
 
@@ -146,69 +203,4 @@ func newGovernorStartCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noAutoAcceptance, "no-auto-acceptance", false, "Disable automatic acceptance dispatch")
 
 	return cmd
-}
-
-// runGovernorForeground runs the governor binary in the foreground,
-// piping stdout/stderr to the terminal. It waits for Ctrl+C (SIGINT)
-// and then sends SIGTERM to the child process.
-func runGovernorForeground(binPath string, args []string) error {
-	cmd := exec.Command(binPath, args...) //nolint:gosec // binPath comes from exec.LookPath
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start governor: %w", err)
-	}
-
-	// Trap SIGINT/SIGTERM and forward to child.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	doneCh := make(chan error, 1)
-	go func() {
-		doneCh <- cmd.Wait()
-	}()
-
-	select {
-	case sig := <-sigCh:
-		// Forward signal to the child process.
-		_ = cmd.Process.Signal(sig)
-		return <-doneCh
-	case err := <-doneCh:
-		signal.Stop(sigCh)
-		if err != nil {
-			return fmt.Errorf("governor exited: %w", err)
-		}
-		return nil
-	}
-}
-
-// runGovernorBackground starts the governor binary as a background
-// process and saves its PID for later management via stop/status.
-func runGovernorBackground(binPath string, args []string) error {
-	cmd := exec.Command(binPath, args...) //nolint:gosec // binPath comes from exec.LookPath
-	// Detach stdout/stderr so the process runs silently in background.
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.Stdin = nil
-	// Start in a new process group so it survives the parent exiting.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start governor: %w", err)
-	}
-
-	pid := cmd.Process.Pid
-	if err := savePID(governorPIDName, pid); err != nil {
-		// Kill the process if we can't track it.
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("save pid: %w", err)
-	}
-
-	// Release the process so it isn't waited on by this parent.
-	_ = cmd.Process.Release()
-
-	fmt.Printf("Governor started (PID %d)\n", pid)
-	return nil
 }
