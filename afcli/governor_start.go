@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -12,6 +13,15 @@ import (
 
 // governorPIDName is the PID file name used for the governor process.
 const governorPIDName = "governor"
+
+// governorBinaryFinder finds the child binary; tests override it.
+var governorBinaryFinder = findGovernorBinary
+
+// governorForegroundRunner is the foreground runner; tests override it.
+var governorForegroundRunner = runGovernorForeground
+
+// governorBackgroundRunner is the background runner; tests override it.
+var governorBackgroundRunner = runGovernorBackground
 
 // findGovernorBinary searches PATH for the governor binary, preferring
 // "agentfactory-governor" over the shorter "af-governor" alias.
@@ -25,15 +35,28 @@ func findGovernorBinary() (string, error) {
 	return "", fmt.Errorf("governor binary not found: install agentfactory-governor or af-governor")
 }
 
+// validModes is the set of accepted --mode values.
+var validModes = map[string]bool{
+	"event-driven": true,
+	"poll-only":    true,
+}
+
 // newGovernorStartCmd constructs the `governor start` subcommand.
 // It finds and launches the governor binary as a subprocess, either
 // in foreground mode (streaming logs) or background mode (PID tracking).
 func newGovernorStartCmd() *cobra.Command {
 	var (
-		project       string
-		foreground    bool
-		scanInterval  string
-		maxDispatches int
+		projects              []string
+		foreground            bool
+		scanInterval          string
+		maxDispatches         int
+		once                  bool
+		mode                  string
+		noAutoResearch        bool
+		noAutoBacklogCreation bool
+		noAutoDevelopment     bool
+		noAutoQA              bool
+		noAutoAcceptance      bool
 	)
 
 	cmd := &cobra.Command{
@@ -42,31 +65,85 @@ func newGovernorStartCmd() *cobra.Command {
 		Long:         "Launch the governor process that scans Linear issues and dispatches work. Runs in background by default; use --foreground to stream logs.",
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			binPath, err := findGovernorBinary()
+			// LINEAR_API_KEY preflight.
+			if os.Getenv("LINEAR_API_KEY") == "" {
+				return fmt.Errorf("governor start: LINEAR_API_KEY is not set")
+			}
+
+			// Resolve project list: flag takes precedence, fall back to env.
+			resolved := projects
+			if len(resolved) == 0 {
+				if env := os.Getenv("GOVERNOR_PROJECTS"); env != "" {
+					for _, p := range strings.Split(env, ",") {
+						p = strings.TrimSpace(p)
+						if p != "" {
+							resolved = append(resolved, p)
+						}
+					}
+				}
+			}
+			if len(resolved) == 0 {
+				return fmt.Errorf("governor start: at least one --project is required (or set GOVERNOR_PROJECTS env)")
+			}
+
+			// Mode enum validation.
+			if !validModes[mode] {
+				return fmt.Errorf("invalid --mode %q: must be \"event-driven\" or \"poll-only\"", mode)
+			}
+
+			binPath, err := governorBinaryFinder()
 			if err != nil {
 				return err
 			}
 
-			args := []string{"governor", "--project", project}
-			if scanInterval != "" {
-				args = append(args, "--scan-interval", scanInterval)
+			// Build the child arg slice.
+			args := []string{"governor"}
+
+			for _, p := range resolved {
+				args = append(args, "--project", p)
 			}
-			if maxDispatches > 0 {
-				args = append(args, "--max-dispatches", fmt.Sprintf("%d", maxDispatches))
+
+			args = append(args, "--scan-interval", scanInterval)
+			args = append(args, "--max-dispatches", fmt.Sprintf("%d", maxDispatches))
+			args = append(args, "--mode", mode)
+
+			if once {
+				args = append(args, "--once")
+			}
+			if noAutoResearch {
+				args = append(args, "--no-auto-research")
+			}
+			if noAutoBacklogCreation {
+				args = append(args, "--no-auto-backlog-creation")
+			}
+			if noAutoDevelopment {
+				args = append(args, "--no-auto-development")
+			}
+			if noAutoQA {
+				args = append(args, "--no-auto-qa")
+			}
+			if noAutoAcceptance {
+				args = append(args, "--no-auto-acceptance")
 			}
 
 			if foreground {
-				return runGovernorForeground(binPath, args)
+				return governorForegroundRunner(binPath, args)
 			}
-			return runGovernorBackground(binPath, args)
+			return governorBackgroundRunner(binPath, args)
 		},
 	}
 
-	cmd.Flags().StringVar(&project, "project", "", "Project slug (required)")
+	cmd.Flags().StringSliceVar(&projects, "project", nil, "Project slug (repeatable; falls back to GOVERNOR_PROJECTS env if empty)")
 	cmd.Flags().BoolVarP(&foreground, "foreground", "f", false, "Run in foreground with log streaming")
-	cmd.Flags().StringVar(&scanInterval, "scan-interval", "", "Scan loop interval (e.g. 30s, 1m)")
-	cmd.Flags().IntVar(&maxDispatches, "max-dispatches", 0, "Maximum concurrent dispatches")
-	_ = cmd.MarkFlagRequired("project")
+	cmd.Flags().StringVar(&scanInterval, "scan-interval", "60s", "Scan loop interval (e.g. 30s, 1m)")
+	cmd.Flags().IntVar(&maxDispatches, "max-dispatches", 3, "Maximum concurrent dispatches")
+	cmd.Flags().BoolVar(&once, "once", false, "Run a single scan then exit")
+	cmd.Flags().StringVar(&mode, "mode", "poll-only", "Scan mode: event-driven | poll-only")
+	cmd.Flags().BoolVar(&noAutoResearch, "no-auto-research", false, "Disable automatic research dispatch")
+	cmd.Flags().BoolVar(&noAutoBacklogCreation, "no-auto-backlog-creation", false, "Disable automatic backlog creation dispatch")
+	cmd.Flags().BoolVar(&noAutoDevelopment, "no-auto-development", false, "Disable automatic development dispatch")
+	cmd.Flags().BoolVar(&noAutoQA, "no-auto-qa", false, "Disable automatic QA dispatch")
+	cmd.Flags().BoolVar(&noAutoAcceptance, "no-auto-acceptance", false, "Disable automatic acceptance dispatch")
 
 	return cmd
 }
