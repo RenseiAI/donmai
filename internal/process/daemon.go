@@ -1,5 +1,8 @@
 //go:build !windows
 
+// Package process provides PID-file management, daemonize re-exec, and
+// signal-handler installation primitives shared by the af governor
+// start/stop/status subcommands.
 package process
 
 import (
@@ -27,7 +30,7 @@ func Daemonize() (isChild bool, childPID int, err error) {
 	if err != nil {
 		return false, 0, fmt.Errorf("process: open /dev/null: %w", err)
 	}
-	defer devNull.Close()
+	defer func() { _ = devNull.Close() }()
 
 	attr := &os.ProcAttr{
 		Env:   append(os.Environ(), "AF_DAEMON=1"),
@@ -37,7 +40,7 @@ func Daemonize() (isChild bool, childPID int, err error) {
 		},
 	}
 
-	proc, err := os.StartProcess(os.Args[0], os.Args, attr)
+	proc, err := os.StartProcess(os.Args[0], os.Args, attr) //nolint:gosec // re-exec self with AF_DAEMON sentinel; os.Args[0] is the trusted parent binary
 	if err != nil {
 		return false, 0, fmt.Errorf("process: start daemon: %w", err)
 	}

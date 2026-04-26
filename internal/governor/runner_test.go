@@ -99,8 +99,12 @@ func makeIssue(id, state, project string) linear.Issue {
 	return linear.Issue{
 		ID:         id,
 		Identifier: id,
-		State:      struct{ Name string `json:"name"` }{Name: state},
-		Project:    struct{ Name string `json:"name"` }{Name: project},
+		State: struct {
+			Name string `json:"name"`
+		}{Name: state},
+		Project: struct {
+			Name string `json:"name"`
+		}{Name: project},
 	}
 }
 

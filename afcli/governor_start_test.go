@@ -24,7 +24,7 @@ func (f *fakeRunnable) Run(_ context.Context) error { return f.runErr }
 func fakeFactory(runnable governorRunnable, capturedCfg *governor.Config) func(
 	cfg governor.Config, apiKey, redisURL string, logger *slog.Logger,
 ) (governorRunnable, func() error, error) {
-	return func(cfg governor.Config, apiKey, redisURL string, logger *slog.Logger) (governorRunnable, func() error, error) {
+	return func(cfg governor.Config, _, _ string, _ *slog.Logger) (governorRunnable, func() error, error) {
 		if capturedCfg != nil {
 			*capturedCfg = cfg
 		}

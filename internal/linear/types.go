@@ -23,12 +23,6 @@ type graphqlRequest struct {
 	Variables map[string]any `json:"variables,omitempty"`
 }
 
-// graphqlResponse is the top-level envelope returned by Linear's GraphQL API.
-type graphqlResponse[T any] struct {
-	Data   T               `json:"data"`
-	Errors []graphqlError  `json:"errors,omitempty"`
-}
-
 // graphqlError is a single error entry in a GraphQL response.
 type graphqlError struct {
 	Message string `json:"message"`
@@ -36,12 +30,18 @@ type graphqlError struct {
 
 // issueNode is the JSON structure for a single issue node inside a connection.
 type issueNode struct {
-	ID         string          `json:"id"`
-	Identifier string          `json:"identifier"`
-	Title      string          `json:"title"`
-	State      struct{ Name string `json:"name"` } `json:"state"`
-	Project    struct{ Name string `json:"name"` } `json:"project"`
-	Parent     *struct{ ID string `json:"id"` }    `json:"parent,omitempty"`
+	ID         string `json:"id"`
+	Identifier string `json:"identifier"`
+	Title      string `json:"title"`
+	State      struct {
+		Name string `json:"name"`
+	} `json:"state"`
+	Project struct {
+		Name string `json:"name"`
+	} `json:"project"`
+	Parent *struct {
+		ID string `json:"id"`
+	} `json:"parent,omitempty"`
 }
 
 // listIssuesData is the "data" field for list-issues queries.

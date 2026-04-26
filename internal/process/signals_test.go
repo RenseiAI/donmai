@@ -49,7 +49,7 @@ func TestInstallSignalHandlers_CancelsOnSIGINT(t *testing.T) {
 	}
 }
 
-func TestInstallSignalHandlers_StopsOnContextDone(t *testing.T) {
+func TestInstallSignalHandlers_StopsOnContextDone(_ *testing.T) {
 	// Verify that when the context is already canceled, the goroutine
 	// exits cleanly without blocking.
 	ctx, cancel := context.WithCancel(context.Background())

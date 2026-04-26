@@ -1,3 +1,7 @@
+// Package governor implements the in-process scan/dispatch loop that backs
+// the `af governor start` command. The Runner accepts injected
+// linear.Linear and queue.Queue dependencies so it can be unit-tested
+// without real I/O.
 package governor
 
 import (

@@ -15,9 +15,10 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.S
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
+	const dummyAPIKey = "test-fixture-key-not-a-secret" //nolint:gosec // dummy fixture value used only by httptest server
 	c := &Client{
 		BaseURL:    srv.URL,
-		APIKey:     "lin_api_testkey",
+		APIKey:     dummyAPIKey,
 		HTTPClient: srv.Client(),
 	}
 	return c, srv
@@ -90,7 +91,7 @@ func TestClientSendsRawAPIKeyHeader(t *testing.T) {
 		writeGQLData(w, `{"issues":{"nodes":[]}}`)
 	})
 	_, _ = c.ListIssuesByProject(context.Background(), "proj", nil)
-	if gotAuth != "lin_api_testkey" {
+	if gotAuth != "test-fixture-key-not-a-secret" {
 		t.Errorf("Authorization = %q, want raw API key without Bearer prefix", gotAuth)
 	}
 }
@@ -117,7 +118,7 @@ func TestListIssuesByProjectSuccess(t *testing.T) {
 			"parent":     map[string]any{"id": "issue-0"},
 		},
 	}
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeGQLData(w, `{"issues":{"nodes":`+issueNodesJSON(nodes)+`}}`)
 	})
 
@@ -159,7 +160,7 @@ func TestListIssuesByProjectNoStates(t *testing.T) {
 
 func TestGetIssueSuccess(t *testing.T) {
 	t.Parallel()
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeGQLData(w, `{"issue":{"id":"issue-1","identifier":"REN-1","title":"Some issue","state":{"name":"Done"},"project":{"name":"MyProj"},"parent":null}}`)
 	})
 

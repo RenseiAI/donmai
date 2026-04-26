@@ -21,14 +21,20 @@ func TestDecide(t *testing.T) {
 	issueWithProject := func(state string) linear.Issue {
 		return linear.Issue{
 			Identifier: "TEST-1",
-			State:      struct{ Name string `json:"name"` }{Name: state},
-			Project:    struct{ Name string `json:"name"` }{Name: "SomeProject"},
+			State: struct {
+				Name string `json:"name"`
+			}{Name: state},
+			Project: struct {
+				Name string `json:"name"`
+			}{Name: "SomeProject"},
 		}
 	}
 	issueWithoutProject := func(state string) linear.Issue {
 		return linear.Issue{
 			Identifier: "TEST-2",
-			State:      struct{ Name string `json:"name"` }{Name: state},
+			State: struct {
+				Name string `json:"name"`
+			}{Name: state},
 		}
 	}
 
