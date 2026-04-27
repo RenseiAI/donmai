@@ -120,6 +120,9 @@ func (m *Model) Update(msg tea.Msg) tea.Cmd {
 		case "/":
 			m.filtering = true
 			m.filterText = ""
+		case "p":
+			m.filtering = true
+			m.filterText = ""
 		case "r":
 			return m.fetchData()
 		case "home", "g":
@@ -242,6 +245,7 @@ func (m *Model) renderHelp() string {
 		{"\u2191\u2193", "navigate"},
 		{"enter", "select"},
 		{"/", "filter"},
+		{"p", "by provider"},
 		{":", "commands"},
 		{"q", "quit"},
 	}

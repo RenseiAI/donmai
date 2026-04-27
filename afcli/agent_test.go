@@ -439,3 +439,97 @@ func TestFormatDuration(t *testing.T) {
 		})
 	}
 }
+
+func TestFilterSessionsBySandbox(t *testing.T) {
+	t.Parallel()
+
+	e2b := "e2b"
+	docker := "docker"
+
+	sessions := []afclient.SessionResponse{
+		{ID: "s1", Identifier: "test-1", Status: afclient.StatusQueued, WorkType: "agent", Duration: 60, Provider: &e2b},
+		{ID: "s2", Identifier: "test-2", Status: afclient.StatusWorking, WorkType: "task", Duration: 120, Provider: &docker},
+		{ID: "s3", Identifier: "test-3", Status: afclient.StatusCompleted, WorkType: "agent", Duration: 300, Provider: nil},
+		{ID: "s4", Identifier: "test-4", Status: afclient.StatusQueued, WorkType: "task", Duration: 45, Provider: &e2b},
+	}
+
+	tests := []struct {
+		name        string
+		providerID  string
+		wantLen     int
+		wantIDs     []string
+	}{
+		{
+			name:       "filter by e2b",
+			providerID: "e2b",
+			wantLen:    2,
+			wantIDs:    []string{"s1", "s4"},
+		},
+		{
+			name:       "filter by docker",
+			providerID: "docker",
+			wantLen:    1,
+			wantIDs:    []string{"s2"},
+		},
+		{
+			name:       "filter by nonexistent provider",
+			providerID: "local",
+			wantLen:    0,
+			wantIDs:    []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := filterSessionsBySandbox(sessions, tc.providerID)
+			if len(got) != tc.wantLen {
+				t.Errorf("filterSessionsBySandbox() returned %d results, want %d", len(got), tc.wantLen)
+			}
+			for i, session := range got {
+				if i < len(tc.wantIDs) && session.ID != tc.wantIDs[i] {
+					t.Errorf("filterSessionsBySandbox() result[%d].ID = %q, want %q", i, session.ID, tc.wantIDs[i])
+				}
+			}
+		})
+	}
+}
+
+func TestAgentListSandboxFlag(t *testing.T) {
+	t.Parallel()
+
+	e2b := "e2b"
+	docker := "docker"
+
+	stub := &stubDataSource{
+		sessions: []afclient.SessionResponse{
+			{ID: "s1", Identifier: "test-1", Status: afclient.StatusQueued, WorkType: "agent", Duration: 60, Provider: &e2b},
+			{ID: "s2", Identifier: "test-2", Status: afclient.StatusWorking, WorkType: "task", Duration: 120, Provider: &docker},
+			{ID: "s3", Identifier: "test-3", Status: afclient.StatusCompleted, WorkType: "agent", Duration: 300, Provider: nil},
+		},
+	}
+
+	ds := func() afclient.DataSource { return stub }
+	cmd, buf := newTestAgentCmd(ds, []string{"list", "--sandbox", "e2b"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	out := buf.String()
+
+	// Should contain e2b session
+	if !strings.Contains(out, "test-1") {
+		t.Errorf("output should contain 'test-1' (e2b session); got:\n%s", out)
+	}
+
+	// Should not contain docker session
+	if strings.Contains(out, "test-2") {
+		t.Errorf("output should not contain 'test-2' (docker session); got:\n%s", out)
+	}
+
+	// Should not contain nil provider session
+	if strings.Contains(out, "test-3") {
+		t.Errorf("output should not contain 'test-3' (no provider session); got:\n%s", out)
+	}
+}

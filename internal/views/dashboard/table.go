@@ -113,7 +113,8 @@ func renderTableRow(s afclient.SessionResponse, width int, selected bool, frame 
 		parts = append(parts, rowStyle.Width(cols.cost).Render(format.Cost(s.CostUsd)))
 	}
 	if cols.provider > 0 {
-		parts = append(parts, theme.Muted().Width(cols.provider).Render(format.ProviderName(s.Provider)))
+		providerDisplay := formatProviderDisplay(s.Provider)
+		parts = append(parts, theme.Muted().Width(cols.provider).Render(providerDisplay))
 	}
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, parts...)
@@ -121,7 +122,16 @@ func renderTableRow(s afclient.SessionResponse, width int, selected bool, frame 
 	return lipgloss.NewStyle().Padding(0, 1).Width(width).Render(row)
 }
 
+// formatProviderDisplay returns a display string for a provider, handling nil and empty cases.
+func formatProviderDisplay(provider *string) string {
+	if provider == nil || *provider == "" {
+		return "(default)"
+	}
+	return *provider
+}
+
 // filterSessions returns sessions matching the filter text (case-insensitive).
+// Supports filtering by identifier, work type, status, and provider.
 func filterSessions(sessions []afclient.SessionResponse, filterText string) []afclient.SessionResponse {
 	if filterText == "" {
 		return sessions
@@ -131,7 +141,8 @@ func filterSessions(sessions []afclient.SessionResponse, filterText string) []af
 	for _, s := range sessions {
 		if strings.Contains(strings.ToLower(s.Identifier), filter) ||
 			strings.Contains(strings.ToLower(s.WorkType), filter) ||
-			strings.Contains(strings.ToLower(string(s.Status)), filter) {
+			strings.Contains(strings.ToLower(string(s.Status)), filter) ||
+			(s.Provider != nil && strings.Contains(strings.ToLower(*s.Provider), filter)) {
 			result = append(result, s)
 		}
 	}
