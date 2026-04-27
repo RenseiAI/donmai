@@ -32,8 +32,29 @@ profiles:
 dispatch:
   default: codex-dev
   byWorkType:
+    # Single-issue dev work (code edits, PR creation)
+    development: codex-dev
+    inflight: codex-dev
+
+    # Coordination (parent issues that fan out to sub-agents — need big context)
     coordination: claude-coord
+    inflight-coordination: claude-coord
+    qa-coordination: claude-coord
+    acceptance-coordination: claude-coord
+    refinement-coordination: claude-coord
+
+    # Review / verdict work (read code + render judgment)
     qa: claude-qa
+    acceptance: claude-qa
+    refinement: claude-qa
+
+    # Authoring / planning (Linear issue editing, no code edits)
+    research: claude-coord
+    backlog-creation: claude-coord
+
+    # Specialized
+    merge: codex-dev          # mechanical: rebase, run tests, push
+    security: claude-coord    # SAST/audit; favor careful reasoning over speed
 packageManager: none
 buildCommand: "make build"
 testCommand: "go test ./..."
