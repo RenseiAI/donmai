@@ -28,6 +28,16 @@ Key packages there:
 
 Treat the legacy repo as **read-only reference**. Don't modify it from work in this project.
 
+## Architecture
+
+Authoritative architecture lives in `../rensei-architecture/`. Read in this order:
+
+1. `001-layered-execution-model.md` — canonical synthesis. Always first.
+2. The reference doc(s) for whichever layer you are working on (`002`–`008`, `011`, `013`–`016`).
+3. Any open ADRs that touch your work (`ADR-*.md`).
+
+If this project's docs conflict with `../rensei-architecture/`, the corpus wins. Either update this project's docs to align, or open an ADR to amend the corpus.
+
 ## Package Architecture
 
 ```
