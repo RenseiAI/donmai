@@ -92,6 +92,37 @@ func (s *stubDataSource) ForwardPrompt(_ afclient.ForwardPromptRequest) (*afclie
 	return &afclient.ForwardPromptResponse{}, nil
 }
 
+// Architecture-aware stub methods (REN-1333). Return empty-but-non-nil values
+// so callers can safely introspect length and structure in tests.
+
+func (s *stubDataSource) GetStatsV2() (*afclient.StatsResponseV2, error) {
+	return &afclient.StatsResponseV2{}, nil
+}
+
+func (s *stubDataSource) GetMachineStats() ([]afclient.MachineStats, error) {
+	return []afclient.MachineStats{}, nil
+}
+
+func (s *stubDataSource) GetWorkareaPoolStats(_ afclient.MachineID) (*afclient.WorkareaPoolStats, error) {
+	return &afclient.WorkareaPoolStats{Members: []afclient.WorkareaPoolMember{}}, nil
+}
+
+func (s *stubDataSource) GetSandboxProviderStats() ([]afclient.SandboxProviderStats, error) {
+	return []afclient.SandboxProviderStats{}, nil
+}
+
+func (s *stubDataSource) GetKitDetections(_ string) ([]afclient.KitDetection, error) {
+	return []afclient.KitDetection{}, nil
+}
+
+func (s *stubDataSource) GetKitContributions(_ string) ([]afclient.KitContribution, error) {
+	return []afclient.KitContribution{}, nil
+}
+
+func (s *stubDataSource) GetAuditChain(_ string) ([]afclient.AuditChainEntry, error) {
+	return []afclient.AuditChainEntry{}, nil
+}
+
 // newTestAgentCmd builds a fresh agent command tree wired to the given
 // DataSource factory. Output/err are captured in the returned buffer.
 // No project scoping is applied.
