@@ -39,10 +39,12 @@ func newAgentCmd(ds func() afclient.DataSource, projectFunc func() string) *cobr
 // flag disables the active-only filter. When projectFunc is non-nil and
 // returns a non-empty value, the list is scoped to that project via
 // GetSessionsFiltered; otherwise the fleet-wide GetSessions is used.
+// The --sandbox flag filters results to a specific sandbox provider ID.
 func newAgentListCmd(ds func() afclient.DataSource, projectFunc func() string) *cobra.Command {
 	var (
-		allMode  bool
-		jsonMode bool
+		allMode   bool
+		jsonMode  bool
+		sandboxID string
 	)
 
 	cmd := &cobra.Command{
@@ -72,6 +74,9 @@ func newAgentListCmd(ds func() afclient.DataSource, projectFunc func() string) *
 			}
 
 			filtered := filterSessions(resp.Sessions, allMode)
+			if sandboxID != "" {
+				filtered = filterSessionsBySandbox(filtered, sandboxID)
+			}
 
 			out := cmd.OutOrStdout()
 
@@ -104,6 +109,7 @@ func newAgentListCmd(ds func() afclient.DataSource, projectFunc func() string) *
 
 	cmd.Flags().BoolVar(&allMode, "all", false, "Include completed, failed, and stopped sessions")
 	cmd.Flags().BoolVar(&jsonMode, "json", false, "Output raw JSON (indented)")
+	cmd.Flags().StringVar(&sandboxID, "sandbox", "", "Filter by sandbox provider ID")
 
 	return cmd
 }
@@ -130,6 +136,18 @@ func filterSessions(sessions []afclient.SessionResponse, all bool) []afclient.Se
 	out := make([]afclient.SessionResponse, 0, len(sessions))
 	for _, s := range sessions {
 		if isActive(s.Status) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// filterSessionsBySandbox returns sessions with a matching sandbox provider ID.
+// Sessions with nil provider are skipped.
+func filterSessionsBySandbox(sessions []afclient.SessionResponse, providerID string) []afclient.SessionResponse {
+	out := make([]afclient.SessionResponse, 0, len(sessions))
+	for _, s := range sessions {
+		if s.Provider != nil && *s.Provider == providerID {
 			out = append(out, s)
 		}
 	}
