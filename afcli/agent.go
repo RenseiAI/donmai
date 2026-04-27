@@ -42,9 +42,9 @@ func newAgentCmd(ds func() afclient.DataSource, projectFunc func() string) *cobr
 // The --sandbox flag filters results to a specific sandbox provider ID.
 func newAgentListCmd(ds func() afclient.DataSource, projectFunc func() string) *cobra.Command {
 	var (
-		allMode    bool
-		jsonMode   bool
-		sandboxID  string
+		allMode   bool
+		jsonMode  bool
+		sandboxID string
 	)
 
 	cmd := &cobra.Command{

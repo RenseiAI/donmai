@@ -454,10 +454,10 @@ func TestFilterSessionsBySandbox(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		providerID  string
-		wantLen     int
-		wantIDs     []string
+		name       string
+		providerID string
+		wantLen    int
+		wantIDs    []string
 	}{
 		{
 			name:       "filter by e2b",
