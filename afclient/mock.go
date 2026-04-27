@@ -306,3 +306,274 @@ func (m *MockClient) ListFleet() (*ListFleetResponse, error) {
 	sessions, _ := m.GetSessions()
 	return &ListFleetResponse{Total: len(sessions.Sessions), Returned: len(sessions.Sessions), Sessions: sessions.Sessions}, nil
 }
+
+// ── Architecture-aware mock methods (REN-1333) ────────────────────────────────
+
+// GetStatsV2 returns mock fleet statistics extended with per-machine and
+// per-provider breakdowns. Returns realistic-but-empty slices so callers can
+// safely introspect length and field structure without nil-pointer panics.
+func (m *MockClient) GetStatsV2() (*StatsResponseV2, error) {
+	base, err := m.GetStats()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	return &StatsResponseV2{
+		StatsResponse: *base,
+		Machines: []MachineStats{
+			{
+				ID:             "mac-studio-marks-office",
+				Region:         "home-network",
+				Status:         DaemonReady,
+				Version:        "0.8.60",
+				ActiveSessions: 3,
+				Capacity: MachineCapacity{
+					MaxConcurrentSessions: 8,
+					MaxVCpuPerSession:     4,
+					MaxMemoryMbPerSession: 8192,
+					ReservedVCpu:          4,
+					ReservedMemoryMb:      16384,
+				},
+				UptimeSeconds: 7860,
+				LastSeenAt:    now.Add(-15 * time.Second).Format(time.RFC3339),
+			},
+			{
+				ID:             "macbook-travel",
+				Region:         "home-network",
+				Status:         DaemonPaused,
+				Version:        "0.8.60",
+				ActiveSessions: 0,
+				Capacity: MachineCapacity{
+					MaxConcurrentSessions: 4,
+					MaxVCpuPerSession:     2,
+					MaxMemoryMbPerSession: 4096,
+					ReservedVCpu:          2,
+					ReservedMemoryMb:      8192,
+				},
+				UptimeSeconds: 3600,
+				LastSeenAt:    now.Add(-2 * time.Minute).Format(time.RFC3339),
+			},
+		},
+		Providers: []ProviderCost{
+			{Provider: "anthropic", CostUsd: 24.31, Sessions: 7},
+			{Provider: "openai", CostUsd: 8.27, Sessions: 3},
+		},
+	}, nil
+}
+
+// GetMachineStats returns mock per-machine capacity and status snapshots.
+func (m *MockClient) GetMachineStats() ([]MachineStats, error) {
+	v2, err := m.GetStatsV2()
+	if err != nil {
+		return nil, err
+	}
+	return v2.Machines, nil
+}
+
+// GetWorkareaPoolStats returns a mock workarea pool snapshot. The machineID
+// argument is accepted for interface compatibility but has no effect on mock
+// data — the same pool is returned regardless.
+func (m *MockClient) GetWorkareaPoolStats(_ MachineID) (*WorkareaPoolStats, error) {
+	now := time.Now()
+	members := []WorkareaPoolMember{
+		{
+			ID:                 "pool-001",
+			Repository:         "github.com/renseiai/agentfactory",
+			Ref:                "main",
+			ToolchainKey:       "node-20",
+			Status:             PoolMemberReady,
+			CleanStateChecksum: "sha256:a3f1b2c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2",
+			CreatedAt:          now.Add(-6 * time.Hour).Format(time.RFC3339),
+			LastAcquiredAt:     now.Add(-45 * time.Minute).Format(time.RFC3339),
+			DiskUsageMb:        1240,
+		},
+		{
+			ID:                 "pool-002",
+			Repository:         "github.com/renseiai/agentfactory",
+			Ref:                "main",
+			ToolchainKey:       "node-20",
+			Status:             PoolMemberAcquired,
+			CleanStateChecksum: "sha256:a3f1b2c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2",
+			AcquiredBy:         "mock-001",
+			CreatedAt:          now.Add(-5 * time.Hour).Format(time.RFC3339),
+			LastAcquiredAt:     now.Add(-47 * time.Minute).Format(time.RFC3339),
+			DiskUsageMb:        1238,
+		},
+		{
+			ID:           "pool-003",
+			Repository:   "github.com/renseiai/platform",
+			Ref:          "main",
+			ToolchainKey: "node-20+java-17",
+			Status:       PoolMemberWarming,
+			CreatedAt:    now.Add(-3 * time.Minute).Format(time.RFC3339),
+			DiskUsageMb:  320,
+		},
+		{
+			ID:                 "pool-004",
+			Repository:         "github.com/renseiai/platform",
+			Ref:                "main",
+			ToolchainKey:       "node-20+java-17",
+			Status:             PoolMemberInvalid,
+			CleanStateChecksum: "sha256:b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5",
+			CreatedAt:          now.Add(-8 * time.Hour).Format(time.RFC3339),
+			LastAcquiredAt:     now.Add(-2 * time.Hour).Format(time.RFC3339),
+			DiskUsageMb:        2100,
+		},
+	}
+
+	totalDisk := int64(0)
+	readyCount, acquiredCount, warmingCount, invalidCount := 0, 0, 0, 0
+	for _, mem := range members {
+		totalDisk += mem.DiskUsageMb
+		switch mem.Status {
+		case PoolMemberReady:
+			readyCount++
+		case PoolMemberAcquired:
+			acquiredCount++
+		case PoolMemberWarming:
+			warmingCount++
+		case PoolMemberInvalid:
+			invalidCount++
+		}
+	}
+	return &WorkareaPoolStats{
+		Members:          members,
+		TotalMembers:     len(members),
+		ReadyMembers:     readyCount,
+		AcquiredMembers:  acquiredCount,
+		WarmingMembers:   warmingCount,
+		InvalidMembers:   invalidCount,
+		TotalDiskUsageMb: totalDisk,
+		Timestamp:        now.Format(time.RFC3339),
+	}, nil
+}
+
+// GetSandboxProviderStats returns mock runtime snapshots for registered SandboxProviders.
+func (m *MockClient) GetSandboxProviderStats() ([]SandboxProviderStats, error) {
+	now := time.Now()
+	return []SandboxProviderStats{
+		{
+			ID:                  "local",
+			DisplayName:         "Local Daemon (mac-studio-marks-office)",
+			TransportModel:      TransportEither,
+			BillingModel:        BillingFixed,
+			ProvisionedActive:   3,
+			ProvisionedPaused:   0,
+			MaxConcurrent:       8,
+			Regions:             []string{"home-network"},
+			SupportsPauseResume: false,
+			SupportsFsSnapshot:  false,
+			IsA2ARemote:         false,
+			Healthy:             true,
+			CapturedAt:          now.Format(time.RFC3339),
+		},
+		{
+			ID:                  "e2b",
+			DisplayName:         "E2B Cloud Sandbox",
+			TransportModel:      TransportDialIn,
+			BillingModel:        BillingWallClock,
+			ProvisionedActive:   2,
+			ProvisionedPaused:   4,
+			MaxConcurrent:       -1,
+			Regions:             []string{"us-east-1", "eu-west-1"},
+			SupportsPauseResume: true,
+			SupportsFsSnapshot:  true,
+			IsA2ARemote:         false,
+			Healthy:             true,
+			CapturedAt:          now.Format(time.RFC3339),
+		},
+	}, nil
+}
+
+// GetKitDetections returns mock kit detection results for a session.
+func (m *MockClient) GetKitDetections(_ string) ([]KitDetection, error) {
+	return []KitDetection{
+		{
+			KitID:      "ts/nextjs",
+			KitVersion: "1.2.0",
+			Applies:    true,
+			Confidence: 0.97,
+			Reason:     "Detected next.config.ts and package.json with next dependency",
+			ToolchainDemand: map[string]string{
+				"node": ">=20",
+			},
+			DetectPhase: "declarative",
+		},
+		{
+			KitID:       "spring/java",
+			KitVersion:  "1.0.0",
+			Applies:     false,
+			Confidence:  0.0,
+			Reason:      "No pom.xml or build.gradle found",
+			DetectPhase: "declarative",
+		},
+	}, nil
+}
+
+// GetKitContributions returns mock kit contribution summaries for a session.
+func (m *MockClient) GetKitContributions(_ string) ([]KitContribution, error) {
+	return []KitContribution{
+		{
+			KitID:      "ts/nextjs",
+			KitVersion: "1.2.0",
+			Commands: map[string]string{
+				"build":    "pnpm build",
+				"test":     "pnpm test",
+				"validate": "pnpm typecheck",
+			},
+			PromptFragmentCount: 2,
+			ToolPermissionCount: 3,
+			MCPServerNames:      []string{"nextjs-context"},
+			SkillRefs:           []string{"skills/nextjs-debugging/SKILL.md"},
+			WorkareaCleanDirs:   []string{".next", ".turbo", "node_modules/.cache"},
+			AppliedAt:           time.Now().Add(-50 * time.Minute).Format(time.RFC3339),
+		},
+	}, nil
+}
+
+// GetAuditChain returns mock Layer 6 audit chain entries for a session.
+func (m *MockClient) GetAuditChain(sessionID string) ([]AuditChainEntry, error) {
+	now := time.Now()
+	fingerprint := "abc1234…d4f2"
+	attest := &Attestation{
+		KeyAlgorithm:   AttestationEd25519,
+		KeyFingerprint: fingerprint,
+		Signature:      "base64encodedmocksignature==",
+		SignedAt:       now.Add(-50 * time.Minute).Format(time.RFC3339),
+		Verified:       true,
+	}
+	return []AuditChainEntry{
+		{
+			Sequence:     1,
+			EventKind:    "session-accepted",
+			SessionID:    sessionID,
+			ActorID:      "orchestrator",
+			Payload:      map[string]any{"project": "renseiai/agentfactory", "workType": "development"},
+			PreviousHash: "0000000000000000000000000000000000000000000000000000000000000000",
+			EntryHash:    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+			Attestation:  attest,
+			OccurredAt:   now.Add(-50 * time.Minute).Format(time.RFC3339),
+		},
+		{
+			Sequence:     2,
+			EventKind:    "workarea-acquired",
+			SessionID:    sessionID,
+			ActorID:      "daemon:mac-studio-marks-office",
+			Payload:      map[string]any{"workareaId": "pool-002", "acquirePath": "pool-warm", "durationMs": 4200},
+			PreviousHash: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+			EntryHash:    "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3",
+			OccurredAt:   now.Add(-49 * time.Minute).Format(time.RFC3339),
+		},
+		{
+			Sequence:     3,
+			EventKind:    "session-completed",
+			SessionID:    sessionID,
+			ActorID:      "worker",
+			Payload:      map[string]any{"result": "delivered", "wallClockS": 2820, "activeCpuS": 1440},
+			PreviousHash: "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3",
+			EntryHash:    "c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4",
+			Attestation:  attest,
+			OccurredAt:   now.Add(-3 * time.Minute).Format(time.RFC3339),
+		},
+	}, nil
+}

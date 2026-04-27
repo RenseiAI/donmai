@@ -26,6 +26,39 @@ type DataSource interface {
 	ForwardPrompt(req ForwardPromptRequest) (*ForwardPromptResponse, error)
 	GetCostReport() (*CostReportResponse, error)
 	ListFleet() (*ListFleetResponse, error)
+
+	// Architecture-aware fetch methods added in REN-1333.
+	// These surface the new Machine/Daemon/Pool/Workarea/SandboxProvider/Kit
+	// concepts for TUI Phase 2/3 panels per 009-linear-realignment §issues 56-59.
+
+	// GetStatsV2 fetches fleet statistics extended with per-machine and
+	// per-provider breakdowns.
+	GetStatsV2() (*StatsResponseV2, error)
+
+	// GetMachineStats fetches the per-machine capacity and status snapshot for
+	// the registered daemon fleet (014 FleetGrid + MachinePivot primitives).
+	GetMachineStats() ([]MachineStats, error)
+
+	// GetWorkareaPoolStats fetches the local workarea pool snapshot for a given
+	// machine. An empty machineID returns the aggregate across all machines.
+	// Corresponds to `af daemon stats --pool` (011-local-daemon-fleet §Observability).
+	GetWorkareaPoolStats(machineID MachineID) (*WorkareaPoolStats, error)
+
+	// GetSandboxProviderStats fetches the runtime snapshot for all registered
+	// SandboxProviders (004-sandbox-capability-matrix §Capacity snapshots).
+	GetSandboxProviderStats() ([]SandboxProviderStats, error)
+
+	// GetKitDetections fetches the kit detection results for a session.
+	// Corresponds to the KitDetectResult TUI primitive in 014.
+	GetKitDetections(sessionID string) ([]KitDetection, error)
+
+	// GetKitContributions fetches the kit contribution summary for a session.
+	// Corresponds to the KitContributionDiff TUI primitive in 014.
+	GetKitContributions(sessionID string) ([]KitContribution, error)
+
+	// GetAuditChain fetches the Layer 6 audit chain for a session.
+	// Corresponds to the AuditChain TUI primitive in 014.
+	GetAuditChain(sessionID string) ([]AuditChainEntry, error)
 }
 
 // Client is the HTTP implementation of DataSource.
@@ -261,4 +294,75 @@ func (c *Client) WhoAmI() (*WhoAmIResponse, error) {
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// ── Architecture-aware methods (REN-1333) ─────────────────────────────────────
+
+// GetStatsV2 fetches fleet statistics extended with per-machine and per-provider
+// breakdowns from the /api/public/stats/v2 endpoint.
+func (c *Client) GetStatsV2() (*StatsResponseV2, error) {
+	var resp StatsResponseV2
+	if err := c.get("/api/public/stats/v2", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetMachineStats fetches per-machine capacity and status snapshots.
+func (c *Client) GetMachineStats() ([]MachineStats, error) {
+	var resp []MachineStats
+	if err := c.get("/api/public/machines", &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetWorkareaPoolStats fetches the local workarea pool snapshot.
+// An empty machineID returns the aggregate across all machines.
+func (c *Client) GetWorkareaPoolStats(machineID MachineID) (*WorkareaPoolStats, error) {
+	path := "/api/public/workarea-pool"
+	if machineID != "" {
+		path += "?machine=" + machineID
+	}
+	var resp WorkareaPoolStats
+	if err := c.get(path, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetSandboxProviderStats fetches runtime snapshots for all registered SandboxProviders.
+func (c *Client) GetSandboxProviderStats() ([]SandboxProviderStats, error) {
+	var resp []SandboxProviderStats
+	if err := c.get("/api/public/sandbox-providers", &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetKitDetections fetches kit detection results for a session.
+func (c *Client) GetKitDetections(sessionID string) ([]KitDetection, error) {
+	var resp []KitDetection
+	if err := c.get("/api/public/sessions/"+sessionID+"/kit-detections", &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetKitContributions fetches kit contribution summaries for a session.
+func (c *Client) GetKitContributions(sessionID string) ([]KitContribution, error) {
+	var resp []KitContribution
+	if err := c.get("/api/public/sessions/"+sessionID+"/kit-contributions", &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// GetAuditChain fetches the Layer 6 audit chain for a session.
+func (c *Client) GetAuditChain(sessionID string) ([]AuditChainEntry, error) {
+	var resp []AuditChainEntry
+	if err := c.get("/api/public/sessions/"+sessionID+"/audit-chain", &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
