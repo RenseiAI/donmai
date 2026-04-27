@@ -22,10 +22,10 @@ import (
 
 func TestMachineStatsJSONRoundTrip(t *testing.T) {
 	in := MachineStats{
-		ID:     "mac-studio-office",
-		Region: "home-network",
-		Status: DaemonReady,
-		Version: "0.8.60",
+		ID:             "mac-studio-office",
+		Region:         "home-network",
+		Status:         DaemonReady,
+		Version:        "0.8.60",
 		ActiveSessions: 3,
 		Capacity: MachineCapacity{
 			MaxConcurrentSessions: 8,
@@ -274,9 +274,11 @@ func TestSandboxProviderStatsJSONRoundTrip(t *testing.T) {
 	if len(out.Regions) != 2 {
 		t.Errorf("Regions: got %v, want 2 elements", out.Regions)
 	}
-	for _, field := range []string{"id", "displayName", "transportModel", "billingModel", "provisionedActive",
+	for _, field := range []string{
+		"id", "displayName", "transportModel", "billingModel", "provisionedActive",
 		"provisionedPaused", "maxConcurrent", "regions", "supportsPauseResume",
-		"supportsFsSnapshot", "isA2ARemote", "healthy", "capturedAt"} {
+		"supportsFsSnapshot", "isA2ARemote", "healthy", "capturedAt",
+	} {
 		if !strings.Contains(string(data), `"`+field+`"`) {
 			t.Errorf("missing field %q: %s", field, data)
 		}
@@ -376,8 +378,10 @@ func TestKitContributionJSONRoundTrip(t *testing.T) {
 	if out.Commands["build"] != "pnpm build" {
 		t.Errorf("Commands[build]: got %q, want pnpm build", out.Commands["build"])
 	}
-	for _, field := range []string{"kitId", "kitVersion", "commands", "promptFragmentCount",
-		"toolPermissionCount", "mcpServerNames", "skillRefs", "workareaCleanDirs", "appliedAt"} {
+	for _, field := range []string{
+		"kitId", "kitVersion", "commands", "promptFragmentCount",
+		"toolPermissionCount", "mcpServerNames", "skillRefs", "workareaCleanDirs", "appliedAt",
+	} {
 		if !strings.Contains(string(data), `"`+field+`"`) {
 			t.Errorf("missing field %q: %s", field, data)
 		}

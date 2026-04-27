@@ -322,10 +322,10 @@ func (m *MockClient) GetStatsV2() (*StatsResponseV2, error) {
 		StatsResponse: *base,
 		Machines: []MachineStats{
 			{
-				ID:            "mac-studio-marks-office",
-				Region:        "home-network",
-				Status:        DaemonReady,
-				Version:       "0.8.60",
+				ID:             "mac-studio-marks-office",
+				Region:         "home-network",
+				Status:         DaemonReady,
+				Version:        "0.8.60",
 				ActiveSessions: 3,
 				Capacity: MachineCapacity{
 					MaxConcurrentSessions: 8,
@@ -338,10 +338,10 @@ func (m *MockClient) GetStatsV2() (*StatsResponseV2, error) {
 				LastSeenAt:    now.Add(-15 * time.Second).Format(time.RFC3339),
 			},
 			{
-				ID:            "macbook-travel",
-				Region:        "home-network",
-				Status:        DaemonPaused,
-				Version:       "0.8.60",
+				ID:             "macbook-travel",
+				Region:         "home-network",
+				Status:         DaemonPaused,
+				Version:        "0.8.60",
 				ActiveSessions: 0,
 				Capacity: MachineCapacity{
 					MaxConcurrentSessions: 4,
@@ -489,22 +489,22 @@ func (m *MockClient) GetSandboxProviderStats() ([]SandboxProviderStats, error) {
 func (m *MockClient) GetKitDetections(_ string) ([]KitDetection, error) {
 	return []KitDetection{
 		{
-			KitID:       "ts/nextjs",
-			KitVersion:  "1.2.0",
-			Applies:     true,
-			Confidence:  0.97,
-			Reason:      "Detected next.config.ts and package.json with next dependency",
+			KitID:      "ts/nextjs",
+			KitVersion: "1.2.0",
+			Applies:    true,
+			Confidence: 0.97,
+			Reason:     "Detected next.config.ts and package.json with next dependency",
 			ToolchainDemand: map[string]string{
 				"node": ">=20",
 			},
 			DetectPhase: "declarative",
 		},
 		{
-			KitID:      "spring/java",
-			KitVersion: "1.0.0",
-			Applies:    false,
-			Confidence: 0.0,
-			Reason:     "No pom.xml or build.gradle found",
+			KitID:       "spring/java",
+			KitVersion:  "1.0.0",
+			Applies:     false,
+			Confidence:  0.0,
+			Reason:      "No pom.xml or build.gradle found",
 			DetectPhase: "declarative",
 		},
 	}, nil
