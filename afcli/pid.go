@@ -31,7 +31,7 @@ func savePID(name string, pid int) error {
 	}
 	path := filepath.Join(dir, name+".pid")
 	data := []byte(strconv.Itoa(pid) + "\n")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil { //nolint:gosec // path is constructed from config dir + known name + ".pid"
 		return fmt.Errorf("write pid file: %w", err)
 	}
 	return nil
