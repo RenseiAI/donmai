@@ -72,6 +72,6 @@ func renderMetadata(s afclient.SessionDetail, width int) string {
 		Width(width).
 		BorderBottom(true).
 		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(theme.SurfaceBorder).
+		BorderForeground(theme.Default().SurfaceBorder).
 		Render(content)
 }

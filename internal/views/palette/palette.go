@@ -201,16 +201,16 @@ func (m *Model) Render() string {
 	}
 
 	// Search input
-	prompt := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render(">")
+	prompt := lipgloss.NewStyle().Foreground(theme.Default().Accent).Bold(true).Render(">")
 	inputText := m.input
 	if m.focused {
 		inputText += "_"
 	}
-	searchLine := prompt + " " + lipgloss.NewStyle().Foreground(theme.TextPrimary).Render(inputText)
+	searchLine := prompt + " " + lipgloss.NewStyle().Foreground(theme.Default().TextPrimary).Render(inputText)
 
 	inputBox := lipgloss.NewStyle().
 		Width(paletteWidth-4).
-		Background(theme.SurfaceRaised).
+		Background(theme.Default().SurfaceRaised).
 		Padding(0, 1).
 		Render(searchLine)
 
@@ -226,12 +226,12 @@ func (m *Model) Render() string {
 		selected := i == m.cursor
 
 		indicator := "  "
-		baseColor := theme.TextSecondary
+		baseColor := theme.Default().TextSecondary
 		shortcutStyle := theme.Dimmed()
 
 		if selected {
-			indicator = lipgloss.NewStyle().Foreground(theme.Accent).Render("\u25b8 ") // ▸
-			baseColor = theme.TextPrimary
+			indicator = lipgloss.NewStyle().Foreground(theme.Default().Accent).Render("\u25b8 ") // ▸
+			baseColor = theme.Default().TextPrimary
 		}
 
 		// Render name with fuzzy match highlighting
@@ -264,8 +264,8 @@ func (m *Model) Render() string {
 	box := lipgloss.NewStyle().
 		Width(paletteWidth).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(theme.SurfaceBorderBright).
-		Background(theme.Surface).
+		BorderForeground(theme.Default().SurfaceBorderBright).
+		Background(theme.Default().Surface).
 		Padding(1, 1).
 		Render(content)
 
@@ -278,14 +278,14 @@ func (m *Model) renderPrompt(paletteWidth int) string {
 
 	// Title
 	title := lipgloss.NewStyle().
-		Foreground(theme.Accent).Bold(true).
+		Foreground(theme.Default().Accent).Bold(true).
 		Render(m.promptAction.Name)
 
 	// Step indicator
 	stepInfo := ""
 	if len(m.promptAction.Prompts) > 1 {
 		stepInfo = lipgloss.NewStyle().
-			Foreground(theme.TextSecondary).
+			Foreground(theme.Default().TextSecondary).
 			Render(" (step " +
 				strconv.Itoa(m.promptStep+1) + "/" +
 				strconv.Itoa(len(m.promptAction.Prompts)) + ")")
@@ -293,26 +293,26 @@ func (m *Model) renderPrompt(paletteWidth int) string {
 
 	// Label
 	label := lipgloss.NewStyle().
-		Foreground(theme.TextSecondary).
+		Foreground(theme.Default().TextSecondary).
 		Render(step.Label + ":")
 
 	// Input
-	prompt := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render(">")
+	prompt := lipgloss.NewStyle().Foreground(theme.Default().Accent).Bold(true).Render(">")
 	inputText := m.input
 	if m.focused {
 		inputText += "_"
 	}
-	searchLine := prompt + " " + lipgloss.NewStyle().Foreground(theme.TextPrimary).Render(inputText)
+	searchLine := prompt + " " + lipgloss.NewStyle().Foreground(theme.Default().TextPrimary).Render(inputText)
 
 	inputBox := lipgloss.NewStyle().
 		Width(paletteWidth-4).
-		Background(theme.SurfaceRaised).
+		Background(theme.Default().SurfaceRaised).
 		Padding(0, 1).
 		Render(searchLine)
 
 	// Help
 	help := lipgloss.NewStyle().
-		Foreground(theme.TextSecondary).
+		Foreground(theme.Default().TextSecondary).
 		Render("enter: confirm  esc: cancel")
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
@@ -321,8 +321,8 @@ func (m *Model) renderPrompt(paletteWidth int) string {
 	box := lipgloss.NewStyle().
 		Width(paletteWidth).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(theme.SurfaceBorderBright).
-		Background(theme.Surface).
+		BorderForeground(theme.Default().SurfaceBorderBright).
+		Background(theme.Default().Surface).
 		Padding(1, 1).
 		Render(content)
 
@@ -346,7 +346,7 @@ func (m *Model) renderActionName(name string, idx int, baseColor color.Color, se
 	}
 
 	normalStyle := lipgloss.NewStyle().Foreground(baseColor)
-	highlightStyle := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true)
+	highlightStyle := lipgloss.NewStyle().Foreground(theme.Default().Accent).Bold(true)
 	if selected {
 		normalStyle = normalStyle.Bold(true)
 	}
@@ -368,6 +368,6 @@ func Overlay(_ string, paletteContent string, width, height int) string {
 		width, height,
 		lipgloss.Center, lipgloss.Center,
 		paletteContent,
-		lipgloss.WithWhitespaceStyle(lipgloss.NewStyle().Foreground(theme.BgPrimary)),
+		lipgloss.WithWhitespaceStyle(lipgloss.NewStyle().Foreground(theme.Default().BgPrimary)),
 	)
 }

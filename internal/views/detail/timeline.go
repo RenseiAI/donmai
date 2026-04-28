@@ -33,7 +33,7 @@ func renderTimeline(s afclient.SessionDetail, width int, frame int) string {
 			dot = e.color.Render(dot)
 		}
 
-		label := lipgloss.NewStyle().Foreground(theme.TextPrimary).Width(14).Render(e.label)
+		label := lipgloss.NewStyle().Foreground(theme.Default().TextPrimary).Width(14).Render(e.label)
 		ts := theme.Muted().Render(e.timestamp)
 
 		row := "  " + dot + " " + label + ts
@@ -44,7 +44,7 @@ func renderTimeline(s afclient.SessionDetail, width int, frame int) string {
 
 		// Connector line between events
 		if i < len(events)-1 {
-			connector := lipgloss.NewStyle().Foreground(theme.SurfaceBorder).Render("  \u2502") // │
+			connector := lipgloss.NewStyle().Foreground(theme.Default().SurfaceBorder).Render("  \u2502") // │
 			rows = append(rows, connector)
 		}
 	}
@@ -55,10 +55,10 @@ func renderTimeline(s afclient.SessionDetail, width int, frame int) string {
 }
 
 func buildTimeline(s afclient.SessionDetail) []timelineEvent {
-	blueStyle := lipgloss.NewStyle().Foreground(theme.Blue)
-	greenStyle := lipgloss.NewStyle().Foreground(theme.StatusSuccess)
-	yellowStyle := lipgloss.NewStyle().Foreground(theme.StatusWarning)
-	redStyle := lipgloss.NewStyle().Foreground(theme.StatusError)
+	blueStyle := lipgloss.NewStyle().Foreground(theme.Default().Blue)
+	greenStyle := lipgloss.NewStyle().Foreground(theme.Default().StatusSuccess)
+	yellowStyle := lipgloss.NewStyle().Foreground(theme.Default().StatusWarning)
+	redStyle := lipgloss.NewStyle().Foreground(theme.Default().StatusError)
 
 	events := []timelineEvent{
 		{
@@ -95,7 +95,7 @@ func buildTimeline(s afclient.SessionDetail) []timelineEvent {
 			color = redStyle
 		case afclient.StatusStopped:
 			label = "Stopped"
-			color = lipgloss.NewStyle().Foreground(theme.TextTertiary)
+			color = lipgloss.NewStyle().Foreground(theme.Default().TextTertiary)
 		}
 		events = append(events, timelineEvent{
 			label:     label,

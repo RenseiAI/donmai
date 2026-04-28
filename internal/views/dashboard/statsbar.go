@@ -57,7 +57,7 @@ func renderStatsBar(stats *afclient.StatsResponse, width int) string {
 	borderStyle := lipgloss.NewStyle().
 		BorderBottom(true).
 		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(theme.SurfaceBorder).
+		BorderForeground(theme.Default().SurfaceBorder).
 		Padding(0, 1).
 		Width(width)
 

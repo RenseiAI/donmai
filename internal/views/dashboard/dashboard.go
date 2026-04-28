@@ -169,8 +169,8 @@ func (m *Model) Render() string {
 	// Header
 	title := theme.Header().Width(m.width).Render(
 		lipgloss.JoinHorizontal(lipgloss.Top,
-			lipgloss.NewStyle().Bold(true).Foreground(theme.Accent).Render("AGENTFACTORY"),
-			lipgloss.NewStyle().Foreground(theme.TextSecondary).Render(" FLEET"),
+			lipgloss.NewStyle().Bold(true).Foreground(theme.Default().Accent).Render("AGENTFACTORY"),
+			lipgloss.NewStyle().Foreground(theme.Default().TextSecondary).Render(" FLEET"),
 		),
 	)
 	sections = append(sections, title)

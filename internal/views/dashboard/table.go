@@ -76,7 +76,7 @@ func renderTableHeader(width int) string {
 		Width(width).
 		BorderBottom(true).
 		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(theme.SurfaceBorder).
+		BorderForeground(theme.Default().SurfaceBorder).
 		Render(row)
 }
 
@@ -151,13 +151,13 @@ func filterSessions(sessions []afclient.SessionResponse, filterText string) []af
 
 // renderFilterBar renders the active filter input.
 func renderFilterBar(filterText string, width int) string {
-	prompt := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render("/")
-	text := lipgloss.NewStyle().Foreground(theme.TextPrimary).Render(filterText)
-	cursor := lipgloss.NewStyle().Foreground(theme.Accent).Render("_")
+	prompt := lipgloss.NewStyle().Foreground(theme.Default().Accent).Bold(true).Render("/")
+	text := lipgloss.NewStyle().Foreground(theme.Default().TextPrimary).Render(filterText)
+	cursor := lipgloss.NewStyle().Foreground(theme.Default().Accent).Render("_")
 
 	return lipgloss.NewStyle().
 		Padding(0, 1).
 		Width(width).
-		Background(theme.SurfaceRaised).
+		Background(theme.Default().SurfaceRaised).
 		Render(fmt.Sprintf(" %s %s%s", prompt, text, cursor))
 }

@@ -5,7 +5,7 @@ go 1.25.9
 require (
 	charm.land/bubbletea/v2 v2.0.2
 	charm.land/lipgloss/v2 v2.0.2
-	github.com/RenseiAI/tui-components v0.1.1-0.20260417221638-2fa405243e02
+	github.com/RenseiAI/tui-components v0.1.1-0.20260428152024-0cca2f796b38
 	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/joho/godotenv v1.5.1
 	github.com/redis/go-redis/v9 v9.18.0

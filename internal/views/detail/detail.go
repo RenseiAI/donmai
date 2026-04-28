@@ -312,13 +312,13 @@ func (m *Model) Render() string {
 
 	// Activity section header
 	activityTitle := lipgloss.NewStyle().
-		Foreground(theme.TextPrimary).
+		Foreground(theme.Default().TextPrimary).
 		Bold(true).
 		Padding(0, 1).
 		Width(m.width).
 		BorderBottom(true).
 		BorderStyle(lipgloss.NormalBorder()).
-		BorderForeground(theme.SurfaceBorder).
+		BorderForeground(theme.Default().SurfaceBorder).
 		Render("ACTIVITY")
 	sections = append(sections, activityTitle)
 
@@ -375,8 +375,8 @@ func (m *Model) Render() string {
 func (m *Model) renderTitleBar() string {
 	if m.session == nil {
 		return lipgloss.NewStyle().
-			Foreground(theme.TextSecondary).
-			Background(theme.Surface).
+			Foreground(theme.Default().TextSecondary).
+			Background(theme.Default().Surface).
 			Padding(0, 1).
 			Width(m.width).
 			Render("\u2190 Back (esc)")
@@ -386,7 +386,7 @@ func (m *Model) renderTitleBar() string {
 	ss := theme.GetStatusStyle(string(s.Status))
 
 	symbol := lipgloss.NewStyle().Foreground(ss.Color).Render(ss.Symbol)
-	identifier := lipgloss.NewStyle().Foreground(theme.TextPrimary).Bold(true).Render(s.Identifier)
+	identifier := lipgloss.NewStyle().Foreground(theme.Default().TextPrimary).Bold(true).Render(s.Identifier)
 
 	wtColor := theme.GetWorkTypeColor(s.WorkType)
 	wtLabel := theme.GetWorkTypeLabel(s.WorkType)
@@ -403,13 +403,13 @@ func (m *Model) renderTitleBar() string {
 	// Auto-follow indicator
 	followIndicator := ""
 	if m.logViewer.Following() {
-		followIndicator = lipgloss.NewStyle().Foreground(theme.Teal).Bold(true).Render(" \u27f1")
+		followIndicator = lipgloss.NewStyle().Foreground(theme.Default().Teal).Bold(true).Render(" \u27f1")
 	}
 
 	titleContent := symbol + " " + identifier + "  " + workType + "  " + provider + "  " + statusLabel + followIndicator
 
 	return lipgloss.NewStyle().
-		Background(theme.Surface).
+		Background(theme.Default().Surface).
 		Padding(0, 1).
 		Width(m.width).
 		Render(titleContent)

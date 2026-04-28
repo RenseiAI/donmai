@@ -23,7 +23,7 @@ func renderHelpOverlay(_ string, width, height int) string {
 	}
 
 	title := lipgloss.NewStyle().
-		Foreground(theme.TextPrimary).
+		Foreground(theme.Default().TextPrimary).
 		Bold(true).
 		Render("KEYBINDINGS")
 
@@ -33,12 +33,12 @@ func renderHelpOverlay(_ string, width, height int) string {
 
 	for _, h := range helpLines {
 		key := lipgloss.NewStyle().
-			Foreground(theme.Teal).
+			Foreground(theme.Default().Teal).
 			Bold(true).
 			Width(18).
 			Render(h.key)
 		desc := lipgloss.NewStyle().
-			Foreground(theme.TextSecondary).
+			Foreground(theme.Default().TextSecondary).
 			Render(h.desc)
 		rows = append(rows, "  "+key+desc)
 	}
@@ -56,12 +56,12 @@ func renderHelpOverlay(_ string, width, height int) string {
 	overlay := lipgloss.NewStyle().
 		Width(overlayWidth).
 		Padding(1, 2).
-		Background(theme.Surface).
+		Background(theme.Default().Surface).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(theme.SurfaceBorderBright).
+		BorderForeground(theme.Default().SurfaceBorderBright).
 		Render(helpContent)
 
 	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, overlay,
-		lipgloss.WithWhitespaceStyle(lipgloss.NewStyle().Foreground(theme.BgPrimary)),
+		lipgloss.WithWhitespaceStyle(lipgloss.NewStyle().Foreground(theme.Default().BgPrimary)),
 	)
 }

@@ -32,17 +32,17 @@ func activityIcon(t afclient.ActivityType) string {
 func activityColor(t afclient.ActivityType) lipgloss.Style {
 	switch t {
 	case afclient.ActivityThought:
-		return lipgloss.NewStyle().Foreground(theme.TextSecondary)
+		return lipgloss.NewStyle().Foreground(theme.Default().TextSecondary)
 	case afclient.ActivityAction:
-		return lipgloss.NewStyle().Foreground(theme.Teal)
+		return lipgloss.NewStyle().Foreground(theme.Default().Teal)
 	case afclient.ActivityResponse:
-		return lipgloss.NewStyle().Foreground(theme.TextPrimary)
+		return lipgloss.NewStyle().Foreground(theme.Default().TextPrimary)
 	case afclient.ActivityError:
-		return lipgloss.NewStyle().Foreground(theme.StatusError)
+		return lipgloss.NewStyle().Foreground(theme.Default().StatusError)
 	case afclient.ActivityProgress:
-		return lipgloss.NewStyle().Foreground(theme.StatusSuccess)
+		return lipgloss.NewStyle().Foreground(theme.Default().StatusSuccess)
 	default:
-		return lipgloss.NewStyle().Foreground(theme.TextTertiary)
+		return lipgloss.NewStyle().Foreground(theme.Default().TextTertiary)
 	}
 }
 
@@ -75,8 +75,8 @@ func renderActivityLine(a afclient.ActivityEvent, width int) string {
 	content := a.Content
 	if a.ToolName != nil && a.Type == afclient.ActivityAction {
 		badge := lipgloss.NewStyle().
-			Foreground(theme.BgPrimary).
-			Background(theme.Teal).
+			Foreground(theme.Default().BgPrimary).
+			Background(theme.Default().Teal).
 			Padding(0, 1).
 			Render(*a.ToolName)
 		content = badge + " " + content
