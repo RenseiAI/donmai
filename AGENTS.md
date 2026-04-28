@@ -30,7 +30,7 @@ Treat the legacy repo as **read-only reference**. Don't modify it from work in t
 
 ## Architecture
 
-Authoritative architecture lives in `../rensei-architecture/`. Read in this order:
+Authoritative architecture lives in `../rensei-architecture/` (remote: https://github.com/RenseiAI/rensei-architecture, private). Read in this order:
 
 1. `001-layered-execution-model.md` — canonical synthesis. Always first.
 2. The reference doc(s) for whichever layer you are working on (`002`–`008`, `011`, `013`–`016`).
