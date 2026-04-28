@@ -58,6 +58,7 @@ type RegisterRequest struct {
 	Version string `json:"version"`
 	// Capabilities is the list of capability tags this worker advertises
 	// (e.g. "claude", "codex"). Empty when the worker has no special tags.
+	//
 	// Deprecated: prefer CapabilitiesTyped when available; this field is
 	// retained for backward compatibility with older coordinators.
 	Capabilities []string `json:"capabilities,omitempty"`
@@ -95,9 +96,7 @@ func (r *RegisterRequest) ResolveCapabilities() (*AgentRuntimeProviderCapabiliti
 			tags = append(tags, r.CapabilitiesTyped.HumanLabel)
 		}
 		// Merge any explicit legacy tags the caller may have set.
-		for _, t := range r.Capabilities {
-			tags = append(tags, t)
-		}
+		tags = append(tags, r.Capabilities...)
 		return r.CapabilitiesTyped, tags
 	}
 	return nil, r.Capabilities
