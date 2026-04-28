@@ -60,6 +60,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newWorkerCmd(ds))
 	root.AddCommand(newFleetCmd(ds))
 	root.AddCommand(newDaemonCmd())
+	root.AddCommand(newProjectCmd())
 	if cfg.EnableDashboard {
 		root.AddCommand(newDashboardCmd(cfg))
 	}
