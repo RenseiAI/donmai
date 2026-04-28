@@ -108,10 +108,11 @@ func newProjectAllowCmd(rw configReaderWriter) *cobra.Command {
 				CloneStrategy: strategy,
 			}
 
-			if noCredentials {
+			switch {
+			case noCredentials:
 				// Explicit opt-out: leave CredentialHelper nil.
 				entry.CredentialHelper = nil
-			} else if nonInteractive {
+			case nonInteractive:
 				// Non-interactive with no --no-credentials: use nil (warn user).
 				_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
 					"warning: --non-interactive set without --no-credentials; "+
@@ -119,7 +120,7 @@ func newProjectAllowCmd(rw configReaderWriter) *cobra.Command {
 						"Run `af project credentials "+repoURL+"` to configure.",
 				)
 				entry.CredentialHelper = nil
-			} else {
+			default:
 				helper, promptErr := promptCredentialHelper(cmd.InOrStdin(), cmd.OutOrStdout(), repoURL)
 				if promptErr != nil {
 					return fmt.Errorf("credential helper prompt: %w", promptErr)
