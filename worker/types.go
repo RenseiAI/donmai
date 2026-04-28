@@ -5,6 +5,47 @@ import (
 	"time"
 )
 
+// AgentRuntimeProviderCapabilities mirrors the TypeScript AgentProviderCapabilities
+// struct (packages/core/src/providers/types.ts) and is used for typed capability
+// advertisement during worker registration (REN-1282).
+//
+// The orchestrator prefers CapabilitiesTyped over the legacy Capabilities []string
+// field when both are present; the string slice is retained for backward
+// compatibility with coordinators that have not yet been updated.
+//
+// Field names use JSON camelCase to match the TypeScript wire format.
+type AgentRuntimeProviderCapabilities struct {
+	// SupportsMessageInjection indicates whether injectMessage() works for
+	// this provider (stateful providers: Claude, A2A).
+	SupportsMessageInjection bool `json:"supportsMessageInjection"`
+	// SupportsSessionResume indicates whether resume() can continue a prior
+	// session.
+	SupportsSessionResume bool `json:"supportsSessionResume"`
+	// SupportsToolPlugins indicates whether the provider can use MCP tool
+	// plugins delivered via stdio servers (af_linear_*, af_code_*).
+	SupportsToolPlugins bool `json:"supportsToolPlugins,omitempty"`
+	// NeedsBaseInstructions indicates that the provider requires persistent
+	// base instructions via AgentSpawnConfig.baseInstructions.
+	NeedsBaseInstructions bool `json:"needsBaseInstructions,omitempty"`
+	// NeedsPermissionConfig indicates that the provider requires structured
+	// permission config via AgentSpawnConfig.permissionConfig.
+	NeedsPermissionConfig bool `json:"needsPermissionConfig,omitempty"`
+	// SupportsCodeIntelligenceEnforcement indicates that the provider supports
+	// canUseTool-style code intelligence enforcement.
+	SupportsCodeIntelligenceEnforcement bool `json:"supportsCodeIntelligenceEnforcement,omitempty"`
+	// ToolPermissionFormat is the tool permission format used by this provider
+	// (one of "claude", "codex", "spring-ai"). Empty string means default.
+	ToolPermissionFormat string `json:"toolPermissionFormat,omitempty"`
+	// EmitsSubagentEvents indicates whether the provider emits Anthropic-style
+	// subagent events (e.g. Task tool progress). Used by the Topology view.
+	// Only true for the Claude provider; Codex and Spring AI have no equivalent
+	// emission today.
+	EmitsSubagentEvents bool `json:"emitsSubagentEvents"`
+	// HumanLabel is the human-readable display name for this provider family
+	// (e.g. "Claude", "Codex", "Spring AI"). Used in UI and log messages.
+	HumanLabel string `json:"humanLabel,omitempty"`
+}
+
 // RegisterRequest is the body of POST /api/workers/register. It is sent with
 // the provisioning token (rsp_live_...) in the Authorization header and
 // describes the worker that is coming online.
@@ -17,10 +58,48 @@ type RegisterRequest struct {
 	Version string `json:"version"`
 	// Capabilities is the list of capability tags this worker advertises
 	// (e.g. "claude", "codex"). Empty when the worker has no special tags.
+	//
+	// Deprecated: prefer CapabilitiesTyped when available; this field is
+	// retained for backward compatibility with older coordinators.
 	Capabilities []string `json:"capabilities,omitempty"`
+	// CapabilitiesTyped carries a fully-typed capability struct for this
+	// worker's agent runtime provider. When present the orchestrator uses this
+	// in preference to the untyped Capabilities slice. Nil when the worker
+	// has not been updated to advertise typed capabilities.
+	CapabilitiesTyped *AgentRuntimeProviderCapabilities `json:"capabilities_typed,omitempty"`
 	// MaxAgents is the maximum number of concurrent agent sessions this
 	// worker will run. Zero means unspecified/default.
 	MaxAgents int `json:"max_agents,omitempty"`
+}
+
+// ResolveCapabilities returns a summary of the effective capability tags for
+// this registration request, implementing the "prefer typed when present"
+// migration path (REN-1282 / ADR-002).
+//
+// If CapabilitiesTyped is non-nil the orchestrator should use it as the
+// authoritative source. The legacy Capabilities slice is still returned for
+// logging and backward-compatible coordinator behaviour.
+//
+// Returns the typed struct (or nil) and the effective string tags to use.
+// When CapabilitiesTyped is present the string tags are derived from the
+// typed struct; otherwise the original Capabilities slice is returned
+// unchanged.
+func (r *RegisterRequest) ResolveCapabilities() (*AgentRuntimeProviderCapabilities, []string) {
+	if r.CapabilitiesTyped != nil {
+		// Derive a minimal string tag set from the typed struct for coordinators
+		// that still read the string slice.
+		var tags []string
+		if r.CapabilitiesTyped.HumanLabel != "" {
+			// Normalise to lower-case for the tag (e.g. "Spring AI" → "spring-ai"
+			// would require package-level mapping; use the raw label here and let
+			// the coordinator normalise if needed).
+			tags = append(tags, r.CapabilitiesTyped.HumanLabel)
+		}
+		// Merge any explicit legacy tags the caller may have set.
+		tags = append(tags, r.Capabilities...)
+		return r.CapabilitiesTyped, tags
+	}
+	return nil, r.Capabilities
 }
 
 // RegisterResponse is the response body from POST /api/workers/register.
