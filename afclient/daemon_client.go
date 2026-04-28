@@ -232,3 +232,37 @@ func (c *DaemonClient) Update() (*DaemonActionResponse, error) {
 	}
 	return &resp, nil
 }
+
+// GetPoolStats fetches the full workarea pool state, including per-member
+// detail and aggregate counts.  The daemon response includes Layer 6
+// correlation IDs so observability subscribers (REN-1313) can correlate events.
+func (c *DaemonClient) GetPoolStats() (*WorkareaPoolStats, error) {
+	var resp WorkareaPoolStats
+	if err := c.get("/api/daemon/pool/stats", &resp); err != nil {
+		return nil, fmt.Errorf("daemon pool stats: %w", err)
+	}
+	return &resp, nil
+}
+
+// EvictPool posts an eviction request to the daemon.  Pool members matching
+// repoURL and older than the threshold in req are scheduled for destruction.
+// The daemon emits a Layer 6 hook event whose correlation ID is echoed back.
+func (c *DaemonClient) EvictPool(req EvictPoolRequest) (*EvictPoolResponse, error) {
+	var resp EvictPoolResponse
+	if err := c.post("/api/daemon/pool/evict", req, &resp); err != nil {
+		return nil, fmt.Errorf("daemon pool evict: %w", err)
+	}
+	return &resp, nil
+}
+
+// SetCapacityConfig posts a capacity key-value update to the daemon.  The
+// daemon writes the change to ~/.rensei/daemon.yaml atomically and reloads the
+// affected subsystem (e.g. the LRU eviction trigger for poolMaxDiskGb).
+func (c *DaemonClient) SetCapacityConfig(key, value string) (*SetCapacityResponse, error) {
+	body := map[string]string{"key": key, "value": value}
+	var resp SetCapacityResponse
+	if err := c.post("/api/daemon/capacity", body, &resp); err != nil {
+		return nil, fmt.Errorf("daemon set capacity: %w", err)
+	}
+	return &resp, nil
+}
