@@ -17,14 +17,23 @@ import (
 
 // mockDaemon implements daemonDoer with configurable responses for testing.
 type mockDaemon struct {
-	statusResp *afclient.DaemonStatusResponse
-	statusErr  error
-	statsResp  *afclient.DaemonStatsResponse
-	statsErr   error
-	actionResp *afclient.DaemonActionResponse
-	actionErr  error
-	drainCalls int
-	drainSecs  int
+	statusResp    *afclient.DaemonStatusResponse
+	statusErr     error
+	statsResp     *afclient.DaemonStatsResponse
+	statsErr      error
+	actionResp    *afclient.DaemonActionResponse
+	actionErr     error
+	drainCalls    int
+	drainSecs     int
+	poolStatsResp *afclient.WorkareaPoolStats
+	poolStatsErr  error
+	evictResp     *afclient.EvictPoolResponse
+	evictErr      error
+	evictReq      *afclient.EvictPoolRequest
+	setCapResp    *afclient.SetCapacityResponse
+	setCapErr     error
+	setCapKey     string
+	setCapValue   string
 }
 
 func (m *mockDaemon) GetStatus() (*afclient.DaemonStatusResponse, error) {
@@ -55,6 +64,21 @@ func (m *mockDaemon) Drain(secs int) (*afclient.DaemonActionResponse, error) {
 
 func (m *mockDaemon) Update() (*afclient.DaemonActionResponse, error) {
 	return m.actionResp, m.actionErr
+}
+
+func (m *mockDaemon) GetPoolStats() (*afclient.WorkareaPoolStats, error) {
+	return m.poolStatsResp, m.poolStatsErr
+}
+
+func (m *mockDaemon) EvictPool(req afclient.EvictPoolRequest) (*afclient.EvictPoolResponse, error) {
+	m.evictReq = &req
+	return m.evictResp, m.evictErr
+}
+
+func (m *mockDaemon) SetCapacityConfig(key, value string) (*afclient.SetCapacityResponse, error) {
+	m.setCapKey = key
+	m.setCapValue = value
+	return m.setCapResp, m.setCapErr
 }
 
 // newTestDaemonCmd builds the daemon command tree with mock daemon injected.
@@ -159,6 +183,7 @@ func TestDaemonParentHelp(t *testing.T) {
 	for _, want := range []string{
 		"install", "uninstall", "setup", "status", "logs",
 		"doctor", "pause", "resume", "update", "drain", "stop", "stats",
+		"evict", "set",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("daemon --help missing subcommand %q; got:\n%s", want, out)
@@ -809,5 +834,491 @@ func TestWriteDaemonStatsTable(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "3 / 8") {
 		t.Errorf("stats table missing session count; got:\n%s", out)
+	}
+}
+
+// ── evict ─────────────────────────────────────────────────────────────────────
+
+func TestDaemonEvictSuccess(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{
+		evictResp: &afclient.EvictPoolResponse{
+			Evicted:       2,
+			Message:       "2 members scheduled for eviction",
+			CorrelationID: "corr-abc-123",
+		},
+	}
+	buf, err := newTestDaemonCmd(mock, []string{
+		"evict", "--repo", "github.com/foo/bar", "--older-than", "24h",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "evicted 2") {
+		t.Errorf("output missing eviction count; got:\n%s", out)
+	}
+	if !strings.Contains(out, "corr-abc-123") {
+		t.Errorf("output missing correlation ID; got:\n%s", out)
+	}
+	if mock.evictReq == nil {
+		t.Fatal("EvictPool not called")
+	}
+	if mock.evictReq.RepoURL != "github.com/foo/bar" {
+		t.Errorf("repoUrl = %q, want %q", mock.evictReq.RepoURL, "github.com/foo/bar")
+	}
+	wantSecs := int64(24 * 3600)
+	if mock.evictReq.OlderThanSeconds != wantSecs {
+		t.Errorf("olderThanSeconds = %d, want %d", mock.evictReq.OlderThanSeconds, wantSecs)
+	}
+}
+
+func TestDaemonEvictJSONOutput(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{
+		evictResp: &afclient.EvictPoolResponse{
+			Evicted:       1,
+			Message:       "done",
+			CorrelationID: "corr-xyz",
+		},
+	}
+	buf, err := newTestDaemonCmd(mock, []string{
+		"evict", "--repo", "github.com/foo/bar", "--older-than", "1h", "--json",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var resp afclient.EvictPoolResponse
+	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+		t.Fatalf("output not valid JSON: %v\n%s", err, buf.String())
+	}
+	if resp.Evicted != 1 {
+		t.Errorf("evicted = %d, want 1", resp.Evicted)
+	}
+}
+
+func TestDaemonEvictMissingRepo(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{}
+	_, err := newTestDaemonCmd(mock, []string{"evict", "--older-than", "1h"})
+	if err == nil {
+		t.Fatal("expected error when --repo is missing")
+	}
+	if !strings.Contains(err.Error(), "--repo") {
+		t.Errorf("error should mention --repo; got: %v", err)
+	}
+}
+
+func TestDaemonEvictMissingOlderThan(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{}
+	_, err := newTestDaemonCmd(mock, []string{"evict", "--repo", "github.com/foo/bar"})
+	if err == nil {
+		t.Fatal("expected error when --older-than is missing")
+	}
+	if !strings.Contains(err.Error(), "--older-than") {
+		t.Errorf("error should mention --older-than; got: %v", err)
+	}
+}
+
+func TestDaemonEvictNegativeDuration(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{}
+	_, err := newTestDaemonCmd(mock, []string{
+		"evict", "--repo", "github.com/foo/bar", "--older-than", "-1h",
+	})
+	if err == nil {
+		t.Fatal("expected error for negative duration")
+	}
+}
+
+func TestDaemonEvictInvalidDuration(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{}
+	_, err := newTestDaemonCmd(mock, []string{
+		"evict", "--repo", "github.com/foo/bar", "--older-than", "notaduration",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid duration")
+	}
+}
+
+func TestDaemonEvictError(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{evictErr: fmt.Errorf("pool not available")}
+	_, err := newTestDaemonCmd(mock, []string{
+		"evict", "--repo", "github.com/foo/bar", "--older-than", "24h",
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "pool not available") {
+		t.Errorf("error should mention 'pool not available'; got: %v", err)
+	}
+}
+
+// ── evict HTTP mock ───────────────────────────────────────────────────────────
+
+func TestDaemonEvictHTTPMock(t *testing.T) {
+	t.Parallel()
+
+	fixture := afclient.EvictPoolResponse{
+		Evicted:       3,
+		Message:       "3 pool members scheduled for eviction",
+		CorrelationID: "corr-http-test",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/daemon/pool/evict" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(fixture)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := afclient.NewDaemonClientFromURL(srv.URL)
+	resp, err := client.EvictPool(afclient.EvictPoolRequest{
+		RepoURL:          "github.com/foo/bar",
+		OlderThanSeconds: 3600,
+	})
+	if err != nil {
+		t.Fatalf("EvictPool: %v", err)
+	}
+	if resp.Evicted != fixture.Evicted {
+		t.Errorf("evicted = %d, want %d", resp.Evicted, fixture.Evicted)
+	}
+	if resp.CorrelationID != fixture.CorrelationID {
+		t.Errorf("correlationId = %q, want %q", resp.CorrelationID, fixture.CorrelationID)
+	}
+}
+
+// ── set ───────────────────────────────────────────────────────────────────────
+
+func TestDaemonSetCapacitySuccess(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{
+		setCapResp: &afclient.SetCapacityResponse{
+			OK:      true,
+			Key:     "capacity.poolMaxDiskGb",
+			Value:   "50",
+			Message: "updated",
+		},
+	}
+	// Use a temp config path to avoid touching real ~/.rensei/daemon.yaml.
+	tmpDir := t.TempDir()
+	buf, err := newTestDaemonCmd(mock, []string{
+		"set", "capacity.poolMaxDiskGb", "50",
+		"--config", tmpDir + "/daemon.yaml",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "capacity.poolMaxDiskGb") {
+		t.Errorf("output missing key; got:\n%s", out)
+	}
+	if mock.setCapKey != "capacity.poolMaxDiskGb" {
+		t.Errorf("SetCapacityConfig key = %q, want %q", mock.setCapKey, "capacity.poolMaxDiskGb")
+	}
+	if mock.setCapValue != "50" {
+		t.Errorf("SetCapacityConfig value = %q, want %q", mock.setCapValue, "50")
+	}
+}
+
+func TestDaemonSetCapacityJSONOutput(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{
+		setCapResp: &afclient.SetCapacityResponse{
+			OK:      true,
+			Key:     "capacity.poolMaxDiskGb",
+			Value:   "100",
+			Message: "updated",
+		},
+	}
+	tmpDir := t.TempDir()
+	buf, err := newTestDaemonCmd(mock, []string{
+		"set", "capacity.poolMaxDiskGb", "100",
+		"--config", tmpDir + "/daemon.yaml",
+		"--json",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var resp afclient.SetCapacityResponse
+	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+		t.Fatalf("output not valid JSON: %v\n%s", err, buf.String())
+	}
+	if !resp.OK {
+		t.Errorf("OK = false, want true")
+	}
+}
+
+func TestDaemonSetCapacityUnknownKey(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{}
+	_, err := newTestDaemonCmd(mock, []string{"set", "capacity.unknownField", "42"})
+	if err == nil {
+		t.Fatal("expected error for unknown key")
+	}
+	if !strings.Contains(err.Error(), "unknown config key") {
+		t.Errorf("error should mention 'unknown config key'; got: %v", err)
+	}
+}
+
+func TestDaemonSetCapacityNegativeValue(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{}
+	_, err := newTestDaemonCmd(mock, []string{"set", "capacity.poolMaxDiskGb", "-5"})
+	if err == nil {
+		t.Fatal("expected error for negative value")
+	}
+}
+
+func TestDaemonSetCapacityNonIntegerValue(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{}
+	_, err := newTestDaemonCmd(mock, []string{"set", "capacity.poolMaxDiskGb", "notanumber"})
+	if err == nil {
+		t.Fatal("expected error for non-integer value")
+	}
+}
+
+func TestDaemonSetCapacityDaemonNotReachable(t *testing.T) {
+	t.Parallel()
+
+	// When the daemon is not running, SetCapacityConfig returns an error but
+	// the command should succeed (YAML was already written).
+	mock := &mockDaemon{setCapErr: fmt.Errorf("connection refused")}
+	tmpDir := t.TempDir()
+	buf, err := newTestDaemonCmd(mock, []string{
+		"set", "capacity.poolMaxDiskGb", "20",
+		"--config", tmpDir + "/daemon.yaml",
+	})
+	if err != nil {
+		t.Fatalf("expected success when daemon unreachable; got: %v", err)
+	}
+	if !strings.Contains(buf.String(), "daemon not reachable") {
+		t.Errorf("output should note daemon not reachable; got:\n%s", buf.String())
+	}
+}
+
+func TestDaemonSetCapacityRejected(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{
+		setCapResp: &afclient.SetCapacityResponse{
+			OK:      false,
+			Key:     "capacity.poolMaxDiskGb",
+			Value:   "999",
+			Message: "value exceeds hardware limit",
+		},
+	}
+	tmpDir := t.TempDir()
+	_, err := newTestDaemonCmd(mock, []string{
+		"set", "capacity.poolMaxDiskGb", "999",
+		"--config", tmpDir + "/daemon.yaml",
+	})
+	if err == nil {
+		t.Fatal("expected error when daemon rejects set")
+	}
+	if !strings.Contains(err.Error(), "value exceeds hardware limit") {
+		t.Errorf("error should mention rejection reason; got: %v", err)
+	}
+}
+
+// ── set HTTP mock ─────────────────────────────────────────────────────────────
+
+func TestDaemonSetCapacityHTTPMock(t *testing.T) {
+	t.Parallel()
+
+	fixture := afclient.SetCapacityResponse{
+		OK:      true,
+		Key:     "capacity.poolMaxDiskGb",
+		Value:   "75",
+		Message: "updated and reloaded",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/daemon/capacity" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(fixture)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := afclient.NewDaemonClientFromURL(srv.URL)
+	resp, err := client.SetCapacityConfig("capacity.poolMaxDiskGb", "75")
+	if err != nil {
+		t.Fatalf("SetCapacityConfig: %v", err)
+	}
+	if !resp.OK {
+		t.Errorf("OK = false, want true")
+	}
+	if resp.Key != fixture.Key {
+		t.Errorf("key = %q, want %q", resp.Key, fixture.Key)
+	}
+}
+
+// ── pool stats (detailed) ─────────────────────────────────────────────────────
+
+func TestDaemonStatsPoolPerKeyBreakdown(t *testing.T) {
+	t.Parallel()
+
+	resp := fixtureStatsResp()
+	resp.Pool = &afclient.WorkareaPoolStats{
+		TotalMembers:     4,
+		ReadyMembers:     2,
+		AcquiredMembers:  1,
+		WarmingMembers:   1,
+		InvalidMembers:   0,
+		TotalDiskUsageMb: 2048,
+		Members: []afclient.WorkareaPoolMember{
+			{
+				ID:           "wk-1",
+				Repository:   "github.com/acme/api",
+				ToolchainKey: "node-20",
+				Status:       afclient.PoolMemberReady,
+				DiskUsageMb:  512,
+			},
+			{
+				ID:           "wk-2",
+				Repository:   "github.com/acme/api",
+				ToolchainKey: "node-20",
+				Status:       afclient.PoolMemberAcquired,
+				DiskUsageMb:  512,
+			},
+			{
+				ID:           "wk-3",
+				Repository:   "github.com/acme/web",
+				ToolchainKey: "node-20+java-17",
+				Status:       afclient.PoolMemberReady,
+				DiskUsageMb:  512,
+			},
+			{
+				ID:           "wk-4",
+				Repository:   "github.com/acme/web",
+				ToolchainKey: "node-20+java-17",
+				Status:       afclient.PoolMemberWarming,
+				DiskUsageMb:  512,
+			},
+		},
+	}
+	mock := &mockDaemon{statsResp: resp}
+	buf, err := newTestDaemonCmd(mock, []string{"stats", "--pool"})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+
+	// Aggregate section.
+	if !strings.Contains(out, "Workarea pool:") {
+		t.Errorf("missing 'Workarea pool:' header; got:\n%s", out)
+	}
+	if !strings.Contains(out, "2048") {
+		t.Errorf("missing total disk usage; got:\n%s", out)
+	}
+	// Per-key breakdown.
+	if !strings.Contains(out, "By (repo, toolchain):") {
+		t.Errorf("missing per-key breakdown header; got:\n%s", out)
+	}
+	if !strings.Contains(out, "github.com/acme/api") {
+		t.Errorf("missing repo github.com/acme/api; got:\n%s", out)
+	}
+	if !strings.Contains(out, "github.com/acme/web") {
+		t.Errorf("missing repo github.com/acme/web; got:\n%s", out)
+	}
+	if !strings.Contains(out, "node-20+java-17") {
+		t.Errorf("missing toolchain key node-20+java-17; got:\n%s", out)
+	}
+}
+
+func TestWritePoolStatsSectionNoMembers(t *testing.T) {
+	t.Parallel()
+
+	p := &afclient.WorkareaPoolStats{
+		TotalMembers:     2,
+		ReadyMembers:     2,
+		TotalDiskUsageMb: 256,
+	}
+	var buf bytes.Buffer
+	if err := writePoolStatsSection(&buf, p); err != nil {
+		t.Fatalf("writePoolStatsSection: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Workarea pool:") {
+		t.Errorf("missing header; got:\n%s", out)
+	}
+	// No members → no per-key table.
+	if strings.Contains(out, "By (repo, toolchain):") {
+		t.Errorf("unexpected per-key section with no members; got:\n%s", out)
+	}
+}
+
+// TestGetPoolStatsHTTPMock exercises GetPoolStats via a real HTTP client.
+func TestGetPoolStatsHTTPMock(t *testing.T) {
+	t.Parallel()
+
+	fixture := afclient.WorkareaPoolStats{
+		TotalMembers:     3,
+		ReadyMembers:     2,
+		AcquiredMembers:  1,
+		TotalDiskUsageMb: 768,
+		Timestamp:        "2026-04-27T12:00:00Z",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/daemon/pool/stats" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(fixture)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := afclient.NewDaemonClientFromURL(srv.URL)
+	resp, err := client.GetPoolStats()
+	if err != nil {
+		t.Fatalf("GetPoolStats: %v", err)
+	}
+	if resp.TotalMembers != fixture.TotalMembers {
+		t.Errorf("totalMembers = %d, want %d", resp.TotalMembers, fixture.TotalMembers)
+	}
+	if resp.TotalDiskUsageMb != fixture.TotalDiskUsageMb {
+		t.Errorf("totalDiskUsageMb = %d, want %d", resp.TotalDiskUsageMb, fixture.TotalDiskUsageMb)
+	}
+}
+
+// ── daemon.yaml capacity persistence ─────────────────────────────────────────
+
+func TestWriteDaemonYAMLCapacityRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir() + "/daemon.yaml"
+	cfg := &afclient.DaemonYAML{
+		Capacity: afclient.CapacityConfig{PoolMaxDiskGb: 42},
+	}
+	if err := afclient.WriteDaemonYAML(tmp, cfg); err != nil {
+		t.Fatalf("WriteDaemonYAML: %v", err)
+	}
+	read, err := afclient.ReadDaemonYAML(tmp)
+	if err != nil {
+		t.Fatalf("ReadDaemonYAML: %v", err)
+	}
+	if read.Capacity.PoolMaxDiskGb != 42 {
+		t.Errorf("poolMaxDiskGb = %d, want 42", read.Capacity.PoolMaxDiskGb)
 	}
 }

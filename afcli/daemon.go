@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -29,6 +31,9 @@ type daemonDoer interface {
 	Stop() (*afclient.DaemonActionResponse, error)
 	Drain(timeoutSeconds int) (*afclient.DaemonActionResponse, error)
 	Update() (*afclient.DaemonActionResponse, error)
+	GetPoolStats() (*afclient.WorkareaPoolStats, error)
+	EvictPool(req afclient.EvictPoolRequest) (*afclient.EvictPoolResponse, error)
+	SetCapacityConfig(key, value string) (*afclient.SetCapacityResponse, error)
 }
 
 // daemonClientFactory is the type for a constructor that builds a daemonDoer
@@ -89,6 +94,8 @@ func newDaemonCmdWithFactory(factory daemonClientFactory) *cobra.Command {
 	cmd.AddCommand(newDaemonDrainCmd(factory))
 	cmd.AddCommand(newDaemonStopCmd(factory))
 	cmd.AddCommand(newDaemonStatsCmd(factory))
+	cmd.AddCommand(newDaemonEvictCmd(factory))
+	cmd.AddCommand(newDaemonSetCmd(factory))
 
 	return cmd
 }
@@ -785,25 +792,8 @@ func writeDaemonStatsTable(w io.Writer, r *afclient.DaemonStatsResponse) error {
 
 	// Pool section.
 	if r.Pool != nil {
-		if _, err := fmt.Fprintln(w, "\n  Workarea pool:"); err != nil {
-			return fmt.Errorf("write pool header: %w", err)
-		}
-		ptw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		prows := []struct{ label, value string }{
-			{"    Total:", fmt.Sprintf("%d", r.Pool.TotalMembers)},
-			{"    Ready:", fmt.Sprintf("%d", r.Pool.ReadyMembers)},
-			{"    Acquired:", fmt.Sprintf("%d", r.Pool.AcquiredMembers)},
-			{"    Warming:", fmt.Sprintf("%d", r.Pool.WarmingMembers)},
-			{"    Invalid:", fmt.Sprintf("%d", r.Pool.InvalidMembers)},
-			{"    Disk usage:", fmt.Sprintf("%d MB", r.Pool.TotalDiskUsageMb)},
-		}
-		for _, row := range prows {
-			if _, err := fmt.Fprintf(ptw, "%s\t%s\n", row.label, row.value); err != nil {
-				return fmt.Errorf("write pool row: %w", err)
-			}
-		}
-		if err := ptw.Flush(); err != nil {
-			return fmt.Errorf("flush pool table: %w", err)
+		if err := writePoolStatsSection(w, r.Pool); err != nil {
+			return err
 		}
 	}
 
@@ -833,6 +823,293 @@ func writeDaemonStatsTable(w io.Writer, r *afclient.DaemonStatsResponse) error {
 	}
 
 	return nil
+}
+
+// ── pool rendering ────────────────────────────────────────────────────────────
+
+// poolKey is the (repository, toolchainKey) grouping key used for the
+// per-(repo, toolchain) pool table.
+type poolKey struct {
+	repo      string
+	toolchain string
+}
+
+// writePoolStatsSection renders the workarea pool stats block.
+// It emits:
+//  1. Aggregate totals.
+//  2. Per-(repo, toolchain) breakdown table sorted by repo+toolchain.
+//
+// Simple ANSI rendering only — WorkareaPoolPanel from tui-components v0.2.0
+// is deferred to REN-1331.
+func writePoolStatsSection(w io.Writer, p *afclient.WorkareaPoolStats) error {
+	if _, err := fmt.Fprintln(w, "\n  Workarea pool:"); err != nil {
+		return fmt.Errorf("write pool header: %w", err)
+	}
+
+	// Aggregate summary.
+	ptw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	prows := []struct{ label, value string }{
+		{"    Total:", fmt.Sprintf("%d", p.TotalMembers)},
+		{"    Ready:", fmt.Sprintf("%d", p.ReadyMembers)},
+		{"    Acquired:", fmt.Sprintf("%d", p.AcquiredMembers)},
+		{"    Warming:", fmt.Sprintf("%d", p.WarmingMembers)},
+		{"    Invalid:", fmt.Sprintf("%d", p.InvalidMembers)},
+		{"    Disk usage:", fmt.Sprintf("%d MB", p.TotalDiskUsageMb)},
+	}
+	for _, row := range prows {
+		if _, err := fmt.Fprintf(ptw, "%s\t%s\n", row.label, row.value); err != nil {
+			return fmt.Errorf("write pool row: %w", err)
+		}
+	}
+	if err := ptw.Flush(); err != nil {
+		return fmt.Errorf("flush pool table: %w", err)
+	}
+
+	// Per-(repo, toolchain) breakdown.
+	if len(p.Members) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(w, "\n    By (repo, toolchain):"); err != nil {
+		return fmt.Errorf("write pool key header: %w", err)
+	}
+	// Aggregate members into per-key buckets.
+	type bucketStats struct {
+		total    int
+		ready    int
+		acquired int
+		warming  int
+		invalid  int
+		diskMb   int64
+	}
+	buckets := map[poolKey]*bucketStats{}
+	for i := range p.Members {
+		m := &p.Members[i]
+		k := poolKey{repo: m.Repository, toolchain: m.ToolchainKey}
+		b := buckets[k]
+		if b == nil {
+			b = &bucketStats{}
+			buckets[k] = b
+		}
+		b.total++
+		b.diskMb += m.DiskUsageMb
+		switch m.Status {
+		case afclient.PoolMemberReady:
+			b.ready++
+		case afclient.PoolMemberAcquired:
+			b.acquired++
+		case afclient.PoolMemberWarming:
+			b.warming++
+		case afclient.PoolMemberInvalid:
+			b.invalid++
+		}
+	}
+	// Sort keys for deterministic output.
+	keys := make([]poolKey, 0, len(buckets))
+	for k := range buckets {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].repo != keys[j].repo {
+			return keys[i].repo < keys[j].repo
+		}
+		return keys[i].toolchain < keys[j].toolchain
+	})
+	ktw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(ktw, "    REPO\tTOOLCHAIN\tTOTAL\tREADY\tACQUIRED\tWARMING\tINVALID\tDISK MB"); err != nil {
+		return fmt.Errorf("write pool key header row: %w", err)
+	}
+	for _, k := range keys {
+		b := buckets[k]
+		if _, err := fmt.Fprintf(ktw, "    %s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\n",
+			k.repo, k.toolchain,
+			b.total, b.ready, b.acquired, b.warming, b.invalid, b.diskMb,
+		); err != nil {
+			return fmt.Errorf("write pool key row: %w", err)
+		}
+	}
+	if err := ktw.Flush(); err != nil {
+		return fmt.Errorf("flush pool key table: %w", err)
+	}
+	return nil
+}
+
+// ── evict ─────────────────────────────────────────────────────────────────────
+
+// newDaemonEvictCmd returns the `af daemon evict` command.
+// Usage: af daemon evict --repo <url> --older-than <duration>
+func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
+	var (
+		port      int
+		host      string
+		repoURL   string
+		olderThan string
+		jsonOut   bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "evict",
+		Short: "Manually evict workarea pool members",
+		Long: "Schedule pool members for destruction based on age and repository.\n\n" +
+			"All ready (cold) pool members for --repo that were last acquired (or\n" +
+			"created, if never acquired) more than --older-than ago are retired.\n" +
+			"In-use (acquired) members are not evicted.\n\n" +
+			"The daemon emits a Layer 6 hook event for each eviction; the correlation\n" +
+			"ID is printed so observability dashboards (REN-1313) can join it.",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if repoURL == "" {
+				return errors.New("--repo is required")
+			}
+			if olderThan == "" {
+				return errors.New("--older-than is required")
+			}
+			d, err := time.ParseDuration(olderThan)
+			if err != nil {
+				return fmt.Errorf("--older-than: invalid duration %q: %w", olderThan, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("--older-than: duration must be positive, got %s", olderThan)
+			}
+
+			cfg := afclient.DefaultDaemonConfig()
+			if host != "" {
+				cfg.Host = host
+			}
+			if port != 0 {
+				cfg.Port = port
+			}
+			client := factory(cfg)
+
+			req := afclient.EvictPoolRequest{
+				RepoURL:          repoURL,
+				OlderThanSeconds: int64(d.Seconds()),
+			}
+			resp, err := client.EvictPool(req)
+			if err != nil {
+				return fmt.Errorf("daemon evict: %w", err)
+			}
+
+			out := cmd.OutOrStdout()
+			if jsonOut {
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(resp)
+			}
+			_, _ = fmt.Fprintf(out, "evicted %d pool member(s): %s\n", resp.Evicted, resp.Message)
+			if resp.CorrelationID != "" {
+				_, _ = fmt.Fprintf(out, "correlation-id: %s\n", resp.CorrelationID)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().IntVar(&port, "port", 0, "Daemon HTTP port (default from daemon.yaml: 7734)")
+	cmd.Flags().StringVar(&host, "host", "", "Daemon HTTP host (default: 127.0.0.1)")
+	cmd.Flags().StringVar(&repoURL, "repo", "", "Repository URL to evict (required)")
+	cmd.Flags().StringVar(&olderThan, "older-than", "", "Evict members older than this duration, e.g. 24h (required)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output raw JSON (indented)")
+
+	return cmd
+}
+
+// ── set ───────────────────────────────────────────────────────────────────────
+
+// allowedCapacityKeys is the set of dotted config keys accepted by `af daemon set`.
+// Currently only capacity.poolMaxDiskGb is supported (REN-1334).
+var allowedCapacityKeys = map[string]struct{}{
+	"capacity.poolMaxDiskGb": {},
+}
+
+// newDaemonSetCmd returns the `af daemon set` command.
+// Usage: af daemon set capacity.poolMaxDiskGb <N>
+func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
+	var (
+		port    int
+		host    string
+		jsonOut bool
+		cfgPath string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "set <key> <value>",
+		Short: "Set a daemon configuration value",
+		Long: "Set a daemon configuration key to a new value.\n\n" +
+			"Supported keys:\n" +
+			"  capacity.poolMaxDiskGb  Maximum total pool disk usage in GiB before\n" +
+			"                          LRU eviction triggers (0 = no limit).\n\n" +
+			"The change is written atomically to ~/.rensei/daemon.yaml and the daemon\n" +
+			"reloads the affected subsystem without a restart.",
+		Args:         cobra.ExactArgs(2),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key := args[0]
+			value := args[1]
+
+			if _, ok := allowedCapacityKeys[key]; !ok {
+				return fmt.Errorf("unknown config key %q — supported keys: capacity.poolMaxDiskGb", key)
+			}
+
+			// Validate capacity.poolMaxDiskGb locally so we give a clear error
+			// before hitting the daemon.
+			if key == "capacity.poolMaxDiskGb" {
+				n, err := strconv.Atoi(value)
+				if err != nil || n < 0 {
+					return fmt.Errorf("capacity.poolMaxDiskGb must be a non-negative integer, got %q", value)
+				}
+				// Write the value to daemon.yaml atomically via WriteDaemonYAML.
+				// The daemon also accepts it via HTTP; we do the local write so
+				// the config persists even if the daemon is not running.
+				yamlPath := cfgPath
+				if yamlPath == "" {
+					yamlPath = afclient.DefaultDaemonYAMLPath()
+				}
+				cfg, readErr := afclient.ReadDaemonYAML(yamlPath)
+				if readErr != nil {
+					return fmt.Errorf("read daemon config: %w", readErr)
+				}
+				cfg.Capacity.PoolMaxDiskGb = n
+				if writeErr := afclient.WriteDaemonYAML(yamlPath, cfg); writeErr != nil {
+					return fmt.Errorf("write daemon config: %w", writeErr)
+				}
+			}
+
+			// Also notify the running daemon (best-effort; ignore if not reachable).
+			httpCfg := afclient.DefaultDaemonConfig()
+			if host != "" {
+				httpCfg.Host = host
+			}
+			if port != 0 {
+				httpCfg.Port = port
+			}
+			client := factory(httpCfg)
+			resp, err := client.SetCapacityConfig(key, value)
+			if err != nil {
+				// Daemon is not running — the local YAML write is sufficient.
+				out := cmd.OutOrStdout()
+				_, _ = fmt.Fprintf(out, "set %s=%s (daemon not reachable; config written to disk)\n", key, value)
+				return nil
+			}
+
+			out := cmd.OutOrStdout()
+			if jsonOut {
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(resp)
+			}
+			if !resp.OK {
+				return fmt.Errorf("daemon rejected set %s: %s", key, resp.Message)
+			}
+			_, _ = fmt.Fprintf(out, "set %s=%s: %s\n", resp.Key, resp.Value, resp.Message)
+			return nil
+		},
+	}
+
+	cmd.Flags().IntVar(&port, "port", 0, "Daemon HTTP port (default from daemon.yaml: 7734)")
+	cmd.Flags().StringVar(&host, "host", "", "Daemon HTTP host (default: 127.0.0.1)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output raw JSON (indented)")
+	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to daemon.yaml (default: ~/.rensei/daemon.yaml)")
+
+	return cmd
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

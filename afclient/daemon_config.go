@@ -71,12 +71,23 @@ type ProjectEntry struct {
 	CredentialHelper *CredentialHelper `yaml:"credentialHelper,omitempty" json:"credentialHelper,omitempty"`
 }
 
+// CapacityConfig holds the configurable capacity limits written into
+// daemon.yaml under the `capacity` key. REN-1334 adds `poolMaxDiskGb` for
+// automatic LRU eviction of the workarea pool once the disk threshold is hit.
+type CapacityConfig struct {
+	// PoolMaxDiskGb is the maximum total disk usage (in GiB) for the workarea
+	// pool before the daemon starts LRU-evicting cold members.  0 means no limit.
+	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
+}
+
 // DaemonYAML is the in-memory representation of ~/.rensei/daemon.yaml.
 // Only the fields relevant to the project command tree are modelled here;
 // unknown top-level keys are preserved via the yaml decoder's pass-through.
 type DaemonYAML struct {
 	// Projects is the allowlist of repos the daemon will accept work for.
 	Projects []ProjectEntry `yaml:"projects,omitempty"`
+	// Capacity holds the configurable resource limits for the daemon.
+	Capacity CapacityConfig `yaml:"capacity,omitempty"`
 }
 
 // ── default path ─────────────────────────────────────────────────────────────

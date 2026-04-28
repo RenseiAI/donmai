@@ -378,6 +378,43 @@ type WorkareaPoolStats struct {
 	Timestamp string `json:"timestamp"`
 }
 
+// ── Pool eviction / capacity config ──────────────────────────────────────────
+
+// EvictPoolRequest is the body for POST /api/daemon/pool/evict.
+// Exactly one eviction selector must be set.
+type EvictPoolRequest struct {
+	// RepoURL restricts eviction to pool members cloned from this repository.
+	// Required — the daemon refuses a request that omits it.
+	RepoURL string `json:"repoUrl"`
+	// OlderThanSeconds evicts members whose LastAcquiredAt (or CreatedAt when
+	// never acquired) is older than this duration.  Must be > 0.
+	OlderThanSeconds int64 `json:"olderThanSeconds"`
+}
+
+// EvictPoolResponse is the response from POST /api/daemon/pool/evict.
+type EvictPoolResponse struct {
+	// Evicted is the count of pool members scheduled for destruction.
+	Evicted int `json:"evicted"`
+	// Message is a human-readable summary.
+	Message string `json:"message"`
+	// CorrelationID is the Layer 6 hook event correlation ID emitted by the
+	// daemon's observability subscriber (REN-1313). Consumers can match this
+	// against the pool-stats-evict hook stream.
+	CorrelationID string `json:"correlationId,omitempty"`
+}
+
+// SetCapacityResponse is the response from POST /api/daemon/capacity.
+type SetCapacityResponse struct {
+	// OK is true when the config key was accepted and written to daemon.yaml.
+	OK bool `json:"ok"`
+	// Key is the dotted config key that was set (e.g. "capacity.poolMaxDiskGb").
+	Key string `json:"key"`
+	// Value is the string representation of the new value.
+	Value string `json:"value"`
+	// Message is a human-readable description of the outcome.
+	Message string `json:"message"`
+}
+
 // ── SandboxProvider ───────────────────────────────────────────────────────────
 // Types derived from 004-sandbox-capability-matrix.md.
 
