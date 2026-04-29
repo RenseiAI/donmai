@@ -1,6 +1,6 @@
 # agentfactory-tui
 
-> **Status: alpha** — APIs and command flags are stabilising. See [CHANGELOG.md](./CHANGELOG.md) (REN-1366 in flight) for the change log and [RELEASING.md](./RELEASING.md) (REN-1366 in flight) for the release process.
+> **Status: alpha** — APIs and command flags are stabilising. See [CHANGELOG.md](./CHANGELOG.md) for the change log and [RELEASING.md](./RELEASING.md) for the release process.
 
 `af` is the open-source CLI and terminal dashboard for AgentFactory AI agent fleets. It is the single binary for every OSS operator task: running the three-process stack locally, managing agents and sessions, querying Linear, and inspecting fleet health.
 
@@ -497,4 +497,4 @@ Contributions welcome. Please open an issue or PR; follow the conventions in
 `AGENTS.md`. The project uses the MIT license — see `LICENSE`.
 
 See [CHANGELOG.md](./CHANGELOG.md) and [RELEASING.md](./RELEASING.md)
-(REN-1366 in flight) for the change history and release process.
+for the change history and release process.
