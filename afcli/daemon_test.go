@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -132,8 +133,10 @@ func fixtureActionResp() *afclient.DaemonActionResponse {
 
 // ── install / uninstall ───────────────────────────────────────────────────────
 
-func TestDaemonInstallNotYetAvailable(t *testing.T) {
-	t.Parallel()
+// TestDaemonInstallBinaryNotFound verifies install returns a clear error when
+// rensei-daemon is not on PATH. Cannot be parallel because t.Setenv requires it.
+func TestDaemonInstallBinaryNotFound(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 
 	cmd := newDaemonInstallCmd()
 	buf := &bytes.Buffer{}
@@ -142,10 +145,112 @@ func TestDaemonInstallNotYetAvailable(t *testing.T) {
 	cmd.SetArgs(nil)
 	err := cmd.Execute()
 	if err == nil {
-		t.Fatal("expected error from install stub, got nil")
+		t.Fatal("expected error when daemon binary not on PATH, got nil")
 	}
-	if !strings.Contains(err.Error(), "rensei-daemon install") {
-		t.Errorf("error should mention 'rensei-daemon install'; got: %v", err)
+	if !strings.Contains(err.Error(), "rensei-daemon") {
+		t.Errorf("error should mention 'rensei-daemon'; got: %v", err)
+	}
+}
+
+// TestDaemonInstallHelp verifies the install command exposes the expected
+// passthrough flags in its help output.
+func TestDaemonInstallHelp(t *testing.T) {
+	t.Parallel()
+
+	cmd := newDaemonInstallCmd()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"--bin-path", "--user", "--system"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("install --help missing flag %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// TestDaemonInstallSubprocessInvocation places a fake rensei-daemon script on
+// PATH, runs `af daemon install` with each platform flag, and asserts that the
+// subprocess receives the expected arguments.
+func TestDaemonInstallSubprocessInvocation(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		wantArgs []string
+	}{
+		{
+			name:     "bare install",
+			args:     nil,
+			wantArgs: []string{"install"},
+		},
+		{
+			name:     "with --bin-path (macOS launchd)",
+			args:     []string{"--bin-path", "/opt/homebrew/bin/rensei-daemon"},
+			wantArgs: []string{"install", "--bin-path", "/opt/homebrew/bin/rensei-daemon"},
+		},
+		{
+			name:     "with --user (Linux systemd)",
+			args:     []string{"--user"},
+			wantArgs: []string{"install", "--user"},
+		},
+		{
+			name:     "with --system (Linux systemd)",
+			args:     []string{"--system"},
+			wantArgs: []string{"install", "--system"},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Cannot be parallel because t.Setenv modifies PATH.
+			// Write a minimal shell script that writes its args to a temp file.
+			tmpDir := t.TempDir()
+			argsFile := tmpDir + "/args.txt"
+
+			fakeBin := tmpDir + "/rensei-daemon"
+			// Write each argument on its own line. Quote argsFile in case the
+			// t.TempDir() path contains special shell characters (e.g. parentheses
+			// from the subtest name).
+			script := "#!/bin/sh\n" +
+				"for arg in \"$@\"; do echo \"$arg\"; done > '" + argsFile + "'\n" +
+				"exit 0\n"
+			// #nosec G306 -- test fake binary; needs owner exec bit
+			if err := os.WriteFile(fakeBin, []byte(script), 0o500); err != nil {
+				t.Fatalf("write fake binary: %v", err)
+			}
+
+			t.Setenv("PATH", tmpDir)
+
+			cmd := newDaemonInstallCmd()
+			outBuf := &bytes.Buffer{}
+			errBuf := &bytes.Buffer{}
+			cmd.SetOut(outBuf)
+			cmd.SetErr(errBuf)
+			cmd.SetArgs(tc.args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("execute: %v (stdout=%q stderr=%q)", err, outBuf.String(), errBuf.String())
+			}
+
+			got, err := os.ReadFile(argsFile)
+			if err != nil {
+				t.Fatalf("read args file: %v (argsFile=%s)", err, argsFile)
+			}
+			// args.txt contains one arg per line.
+			gotArgs := strings.Split(strings.TrimRight(string(got), "\n"), "\n")
+			if len(gotArgs) != len(tc.wantArgs) {
+				t.Fatalf("subprocess args = %v, want %v", gotArgs, tc.wantArgs)
+			}
+			for i, want := range tc.wantArgs {
+				if gotArgs[i] != want {
+					t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+				}
+			}
+		})
 	}
 }
 

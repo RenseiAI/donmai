@@ -103,21 +103,64 @@ func newDaemonCmdWithFactory(factory daemonClientFactory) *cobra.Command {
 // ── install / uninstall ───────────────────────────────────────────────────────
 
 func newDaemonInstallCmd() *cobra.Command {
-	return &cobra.Command{
+	var (
+		binPath     string // macOS launchd: --bin-path overrides the daemon binary location
+		scopeUser   bool   // Linux systemd: --user  (user-scoped unit, default)
+		scopeSystem bool   // Linux systemd: --system (system-scoped unit, requires root)
+	)
+
+	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install the daemon as a system service",
 		Long: "Register rensei-daemon as a launchd (macOS) or systemd (Linux) service so it\n" +
 			"starts automatically at login and survives reboots.\n\n" +
-			"Platform-specific installers are not yet shipped. Use the rensei-daemon CLI directly:\n" +
-			"  rensei-daemon install",
+			"This delegates to `rensei-daemon install` with stdin/stdout/stderr forwarded so\n" +
+			"interactive launchctl/systemctl prompts surface correctly.\n\n" +
+			"macOS:\n" +
+			"  af daemon install [--bin-path /path/to/rensei-daemon]\n\n" +
+			"Linux:\n" +
+			"  af daemon install --user    (user-scoped systemd unit, default)\n" +
+			"  af daemon install --system  (system-scoped systemd unit, requires sudo)",
 		SilenceUsage: true,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return errors.New(
-				"platform installers not yet available in af — " +
-					"use `rensei-daemon install` directly until REN-1292 (launchd) / REN-1293 (systemd) ship",
-			)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			bin, err := exec.LookPath(defaultDaemonBinary)
+			if err != nil {
+				return fmt.Errorf(
+					"rensei-daemon not found on PATH — install it first with `brew install rensei` or equivalent: %w",
+					err,
+				)
+			}
+
+			// Build the subprocess argument list: "install" + any passthrough flags.
+			subArgs := []string{"install"}
+			if binPath != "" {
+				subArgs = append(subArgs, "--bin-path", binPath)
+			}
+			if scopeUser {
+				subArgs = append(subArgs, "--user")
+			}
+			if scopeSystem {
+				subArgs = append(subArgs, "--system")
+			}
+			// Forward any remaining positional args (future-proofing).
+			subArgs = append(subArgs, args...)
+
+			proc := exec.Command(bin, subArgs...) //nolint:gosec // intentional subprocess
+			proc.Stdin = os.Stdin
+			proc.Stdout = cmd.OutOrStdout()
+			proc.Stderr = cmd.ErrOrStderr()
+			if err := proc.Run(); err != nil {
+				return fmt.Errorf("rensei-daemon install: %w", err)
+			}
+			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&binPath, "bin-path", "", "Path to rensei-daemon binary (macOS launchd)")
+	cmd.Flags().BoolVar(&scopeUser, "user", false, "Install as user-scoped systemd unit (Linux)")
+	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Install as system-scoped systemd unit, requires sudo (Linux)")
+
+	return cmd
 }
 
 func newDaemonUninstallCmd() *cobra.Command {
