@@ -53,7 +53,7 @@ func TestRegisterCommandsWiring(t *testing.T) {
 			cfg: Config{
 				ClientFactory: func() afclient.DataSource { return afclient.NewMockClient() },
 			},
-			wantPresent: []string{"agent", "fleet", "governor", "session", "status", "worker"},
+			wantPresent: []string{"admin", "agent", "fleet", "governor", "logs", "session", "status", "worker"},
 			wantAbsent:  []string{"dashboard"},
 		},
 		{
@@ -62,7 +62,7 @@ func TestRegisterCommandsWiring(t *testing.T) {
 				ClientFactory:   func() afclient.DataSource { return afclient.NewMockClient() },
 				EnableDashboard: true,
 			},
-			wantPresent: []string{"agent", "dashboard", "fleet", "governor", "session", "status", "worker"},
+			wantPresent: []string{"admin", "agent", "dashboard", "fleet", "governor", "logs", "session", "status", "worker"},
 			wantAbsent:  nil,
 		},
 	}
