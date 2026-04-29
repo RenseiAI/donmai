@@ -254,8 +254,10 @@ func TestDaemonInstallSubprocessInvocation(t *testing.T) {
 	}
 }
 
-func TestDaemonUninstallNotYetAvailable(t *testing.T) {
-	t.Parallel()
+// TestDaemonUninstallBinaryNotFound verifies uninstall returns a clear error when
+// rensei-daemon is not on PATH. Cannot be parallel because t.Setenv requires it.
+func TestDaemonUninstallBinaryNotFound(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 
 	cmd := newDaemonUninstallCmd()
 	buf := &bytes.Buffer{}
@@ -264,10 +266,125 @@ func TestDaemonUninstallNotYetAvailable(t *testing.T) {
 	cmd.SetArgs(nil)
 	err := cmd.Execute()
 	if err == nil {
-		t.Fatal("expected error from uninstall stub, got nil")
+		t.Fatal("expected error when daemon binary not on PATH, got nil")
 	}
-	if !strings.Contains(err.Error(), "rensei-daemon uninstall") {
-		t.Errorf("error should mention 'rensei-daemon uninstall'; got: %v", err)
+	if !strings.Contains(err.Error(), "rensei-daemon") {
+		t.Errorf("error should mention 'rensei-daemon'; got: %v", err)
+	}
+}
+
+// TestDaemonUninstallHelp verifies the uninstall command exposes the expected
+// passthrough flags in its help output.
+func TestDaemonUninstallHelp(t *testing.T) {
+	t.Parallel()
+
+	cmd := newDaemonUninstallCmd()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"--user", "--system"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("uninstall --help missing flag %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// TestDaemonUninstallSubprocessInvocation places a fake rensei-daemon script on
+// PATH, runs `af daemon uninstall` with each platform flag, and asserts that the
+// subprocess receives the expected arguments.
+func TestDaemonUninstallSubprocessInvocation(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		wantArgs []string
+	}{
+		{
+			name:     "bare uninstall",
+			args:     nil,
+			wantArgs: []string{"uninstall"},
+		},
+		{
+			name:     "with --user (Linux systemd)",
+			args:     []string{"--user"},
+			wantArgs: []string{"uninstall", "--user"},
+		},
+		{
+			name:     "with --system (Linux systemd)",
+			args:     []string{"--system"},
+			wantArgs: []string{"uninstall", "--system"},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Cannot be parallel because t.Setenv modifies PATH.
+			tmpDir := t.TempDir()
+			argsFile := tmpDir + "/args.txt"
+
+			fakeBin := tmpDir + "/rensei-daemon"
+			script := "#!/bin/sh\n" +
+				"for arg in \"$@\"; do echo \"$arg\"; done > '" + argsFile + "'\n" +
+				"exit 0\n"
+			// #nosec G306 -- test fake binary needs owner exec bit
+			if err := os.WriteFile(fakeBin, []byte(script), 0o500); err != nil {
+				t.Fatalf("write fake binary: %v", err)
+			}
+
+			t.Setenv("PATH", tmpDir)
+
+			cmd := newDaemonUninstallCmd()
+			outBuf := &bytes.Buffer{}
+			errBuf := &bytes.Buffer{}
+			cmd.SetOut(outBuf)
+			cmd.SetErr(errBuf)
+			cmd.SetArgs(tc.args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("execute: %v (stdout=%q stderr=%q)", err, outBuf.String(), errBuf.String())
+			}
+
+			got, err := os.ReadFile(argsFile)
+			if err != nil {
+				t.Fatalf("read args file: %v (argsFile=%s)", err, argsFile)
+			}
+			gotArgs := strings.Split(strings.TrimRight(string(got), "\n"), "\n")
+			if len(gotArgs) != len(tc.wantArgs) {
+				t.Fatalf("subprocess args = %v, want %v", gotArgs, tc.wantArgs)
+			}
+			for i, want := range tc.wantArgs {
+				if gotArgs[i] != want {
+					t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+				}
+			}
+		})
+	}
+}
+
+// TestDaemonUninstallExitCodePropagation verifies that a non-zero exit code from
+// the subprocess propagates as a non-zero exit from the CLI.
+func TestDaemonUninstallExitCodePropagation(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeBin := tmpDir + "/rensei-daemon"
+	script := "#!/bin/sh\nexit 2\n"
+	// #nosec G306 -- test fake binary needs owner exec bit
+	if err := os.WriteFile(fakeBin, []byte(script), 0o500); err != nil {
+		t.Fatalf("write fake binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir)
+
+	cmd := newDaemonUninstallCmd()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs(nil)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected non-zero exit code to propagate as error, got nil")
 	}
 }
 
@@ -714,35 +831,163 @@ func TestDaemonActionHTTPMock(t *testing.T) {
 
 // ── doctor ────────────────────────────────────────────────────────────────────
 
-// TestDaemonDoctorBinaryMissing verifies that when the daemon binary is not
-// on PATH, the doctor check emits a fail result for "Daemon binary".
-func TestDaemonDoctorBinaryMissing(t *testing.T) {
-	t.Parallel()
+// TestDaemonDoctorBinaryNotFound verifies that when the daemon binary is not
+// on PATH, doctor returns a clear error. Cannot be parallel because t.Setenv requires it.
+func TestDaemonDoctorBinaryNotFound(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 
-	// Use a port with no listener so the process check also fails (expected).
-	// The doctor should still run all checks.
 	cmd := newDaemonDoctorCmd()
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	// Point at a port with no listener so daemon check also fails.
-	cmd.SetArgs([]string{"--port", "1"})
-	// Execute will return error (any check failed).
-	_ = cmd.Execute()
-	out := buf.String()
+	cmd.SetArgs(nil)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when daemon binary not on PATH, got nil")
+	}
+	if !strings.Contains(err.Error(), "rensei-daemon") {
+		t.Errorf("error should mention 'rensei-daemon'; got: %v", err)
+	}
+}
 
-	// Verify all 6 check labels appear.
-	for _, label := range []string{
-		"Daemon binary",
-		"Daemon process",
-		"Config file",
-		"API token",
-		"Project allowlist",
-		"Orchestrator network",
-	} {
-		if !strings.Contains(out, label) {
-			t.Errorf("doctor output missing check %q; got:\n%s", label, out)
-		}
+// TestDaemonDoctorHelp verifies the doctor command exposes the --json flag.
+func TestDaemonDoctorHelp(t *testing.T) {
+	t.Parallel()
+
+	cmd := newDaemonDoctorCmd()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "--json") {
+		t.Errorf("doctor --help missing --json flag; got:\n%s", out)
+	}
+}
+
+// TestDaemonDoctorSubprocessInvocation places a fake rensei-daemon script on
+// PATH, runs `af daemon doctor` with and without --json, and asserts the
+// subprocess receives the expected arguments.
+func TestDaemonDoctorSubprocessInvocation(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     []string
+		wantArgs []string
+	}{
+		{
+			name:     "bare doctor",
+			args:     nil,
+			wantArgs: []string{"doctor"},
+		},
+		{
+			name:     "with --json flag",
+			args:     []string{"--json"},
+			wantArgs: []string{"doctor", "--json"},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Cannot be parallel because t.Setenv modifies PATH.
+			tmpDir := t.TempDir()
+			argsFile := tmpDir + "/args.txt"
+
+			fakeBin := tmpDir + "/rensei-daemon"
+			script := "#!/bin/sh\n" +
+				"for arg in \"$@\"; do echo \"$arg\"; done > '" + argsFile + "'\n" +
+				"exit 0\n"
+			// #nosec G306 -- test fake binary needs owner exec bit
+			if err := os.WriteFile(fakeBin, []byte(script), 0o500); err != nil {
+				t.Fatalf("write fake binary: %v", err)
+			}
+
+			t.Setenv("PATH", tmpDir)
+
+			cmd := newDaemonDoctorCmd()
+			outBuf := &bytes.Buffer{}
+			errBuf := &bytes.Buffer{}
+			cmd.SetOut(outBuf)
+			cmd.SetErr(errBuf)
+			cmd.SetArgs(tc.args)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("execute: %v (stdout=%q stderr=%q)", err, outBuf.String(), errBuf.String())
+			}
+
+			got, err := os.ReadFile(argsFile)
+			if err != nil {
+				t.Fatalf("read args file: %v (argsFile=%s)", err, argsFile)
+			}
+			gotArgs := strings.Split(strings.TrimRight(string(got), "\n"), "\n")
+			if len(gotArgs) != len(tc.wantArgs) {
+				t.Fatalf("subprocess args = %v, want %v", gotArgs, tc.wantArgs)
+			}
+			for i, want := range tc.wantArgs {
+				if gotArgs[i] != want {
+					t.Errorf("arg[%d] = %q, want %q", i, gotArgs[i], want)
+				}
+			}
+		})
+	}
+}
+
+// TestDaemonDoctorJSONPassthrough verifies that when the subprocess emits JSON
+// and --json is passed, the JSON is forwarded verbatim without reshaping.
+func TestDaemonDoctorJSONPassthrough(t *testing.T) {
+	// Write a fake rensei-daemon that emits a canonical JSON payload.
+	wantJSON := `{"checks":[{"name":"binary","status":"pass"}],"ok":true}`
+
+	tmpDir := t.TempDir()
+	fakeBin := tmpDir + "/rensei-daemon"
+	// Single-quote wantJSON to prevent shell interpretation of braces/brackets.
+	script := "#!/bin/sh\n" +
+		"printf '" + wantJSON + "'\n" +
+		"exit 0\n"
+	// #nosec G306 -- test fake binary needs owner exec bit
+	if err := os.WriteFile(fakeBin, []byte(script), 0o500); err != nil {
+		t.Fatalf("write fake binary: %v", err)
+	}
+
+	t.Setenv("PATH", tmpDir)
+
+	cmd := newDaemonDoctorCmd()
+	outBuf := &bytes.Buffer{}
+	cmd.SetOut(outBuf)
+	cmd.SetErr(outBuf)
+	cmd.SetArgs([]string{"--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	// Verify JSON is passed through verbatim (no reshaping by the CLI).
+	got := outBuf.String()
+	if !strings.Contains(got, wantJSON) {
+		t.Errorf("doctor --json output should contain verbatim JSON from subprocess\ngot:  %q\nwant: %q", got, wantJSON)
+	}
+}
+
+// TestDaemonDoctorExitCodePropagation verifies that a non-zero exit from the
+// subprocess (e.g., failing health checks) propagates as a non-zero CLI exit.
+func TestDaemonDoctorExitCodePropagation(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeBin := tmpDir + "/rensei-daemon"
+	script := "#!/bin/sh\nexit 1\n"
+	// #nosec G306 -- test fake binary needs owner exec bit
+	if err := os.WriteFile(fakeBin, []byte(script), 0o500); err != nil {
+		t.Fatalf("write fake binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir)
+
+	cmd := newDaemonDoctorCmd()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs(nil)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected non-zero exit code to propagate as error, got nil")
 	}
 }
 

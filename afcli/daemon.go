@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -164,20 +163,58 @@ func newDaemonInstallCmd() *cobra.Command {
 }
 
 func newDaemonUninstallCmd() *cobra.Command {
-	return &cobra.Command{
+	var (
+		scopeUser   bool // Linux systemd: --user  (user-scoped unit, default)
+		scopeSystem bool // Linux systemd: --system (system-scoped unit, requires root)
+	)
+
+	cmd := &cobra.Command{
 		Use:   "uninstall",
 		Short: "Uninstall the daemon system service",
 		Long: "Remove the launchd (macOS) or systemd (Linux) service registration for rensei-daemon.\n\n" +
-			"Platform-specific installers are not yet shipped. Use the rensei-daemon CLI directly:\n" +
-			"  rensei-daemon uninstall",
+			"This delegates to `rensei-daemon uninstall` with stdin/stdout/stderr forwarded so\n" +
+			"interactive launchctl/systemctl prompts surface correctly.\n\n" +
+			"macOS:\n" +
+			"  af daemon uninstall\n\n" +
+			"Linux:\n" +
+			"  af daemon uninstall --user    (user-scoped systemd unit, default)\n" +
+			"  af daemon uninstall --system  (system-scoped systemd unit, requires sudo)",
 		SilenceUsage: true,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return errors.New(
-				"platform uninstallers not yet available in af — " +
-					"use `rensei-daemon uninstall` directly until REN-1292 (launchd) / REN-1293 (systemd) ship",
-			)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			bin, err := exec.LookPath(defaultDaemonBinary)
+			if err != nil {
+				return fmt.Errorf(
+					"rensei-daemon not found on PATH — install it first with `brew install rensei` or equivalent: %w",
+					err,
+				)
+			}
+
+			// Build the subprocess argument list: "uninstall" + any passthrough flags.
+			subArgs := []string{"uninstall"}
+			if scopeUser {
+				subArgs = append(subArgs, "--user")
+			}
+			if scopeSystem {
+				subArgs = append(subArgs, "--system")
+			}
+			// Forward any remaining positional args (future-proofing).
+			subArgs = append(subArgs, args...)
+
+			proc := exec.Command(bin, subArgs...) //nolint:gosec // intentional subprocess
+			proc.Stdin = os.Stdin
+			proc.Stdout = cmd.OutOrStdout()
+			proc.Stderr = cmd.ErrOrStderr()
+			if err := proc.Run(); err != nil {
+				return fmt.Errorf("rensei-daemon uninstall: %w", err)
+			}
+			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&scopeUser, "user", false, "Uninstall user-scoped systemd unit (Linux)")
+	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Uninstall system-scoped systemd unit, requires sudo (Linux)")
+
+	return cmd
 }
 
 // ── setup ─────────────────────────────────────────────────────────────────────
@@ -405,220 +442,51 @@ func printLogLine(w io.Writer, line string, parseJSON bool) {
 
 // ── doctor ────────────────────────────────────────────────────────────────────
 
-// doctorCheck represents a single health check.
-type doctorCheck struct {
-	name   string
-	result doctorResult
-	detail string
-}
-
-type doctorResult int
-
-const (
-	doctorPass doctorResult = iota
-	doctorWarn
-	doctorFail
-)
-
 func newDaemonDoctorCmd() *cobra.Command {
-	var (
-		port int
-		host string
-	)
+	var jsonOut bool
 
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Run health checks on the local daemon setup",
-		Long: "Run a suite of health checks and report pass/warn/fail for each:\n" +
-			"  - Daemon binary present on PATH\n" +
-			"  - Daemon process reachable via HTTP\n" +
-			"  - Daemon config file valid\n" +
-			"  - JWT / API token cached\n" +
-			"  - Project allowlist non-empty\n" +
-			"  - Network reachable (orchestrator ping)\n\n" +
-			"Exits 0 when all checks pass, 1 if any fail.",
+		Long: "Run a suite of health checks and report pass/warn/fail for each.\n\n" +
+			"This delegates to `rensei-daemon doctor` with stdin/stdout/stderr forwarded.\n" +
+			"Use --json to receive machine-readable output; the JSON is passed through\n" +
+			"verbatim without reshaping (caller contract preserved).\n\n" +
+			"On a fresh machine, expect: binary present, everything else fail.\n" +
+			"This is the expected starting state for the Stream 2 E2E smoke test (Phase F).\n\n" +
+			"Exits 0 when all checks pass, non-zero if any fail.",
 		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg := afclient.DefaultDaemonConfig()
-			if host != "" {
-				cfg.Host = host
-			}
-			if port != 0 {
-				cfg.Port = port
-			}
-
-			checks := runDoctorChecks(cfg)
-			out := cmd.OutOrStdout()
-			anyFail := false
-
-			for _, c := range checks {
-				icon, color := doctorIcon(c.result)
-				if c.result == doctorFail {
-					anyFail = true
-				}
-				_, _ = fmt.Fprintf(out, "  %s%s%s  %s",
-					color, icon, ansiReset, c.name)
-				if c.detail != "" {
-					_, _ = fmt.Fprintf(out, " — %s", c.detail)
-				}
-				_, _ = fmt.Fprintln(out)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			bin, err := exec.LookPath(defaultDaemonBinary)
+			if err != nil {
+				return fmt.Errorf(
+					"rensei-daemon not found on PATH — install it first with `brew install rensei` or equivalent: %w",
+					err,
+				)
 			}
 
-			if anyFail {
-				return errors.New("one or more daemon health checks failed")
+			// Build the subprocess argument list: "doctor" + optional --json flag.
+			subArgs := []string{"doctor"}
+			if jsonOut {
+				subArgs = append(subArgs, "--json")
+			}
+			// Forward any remaining positional args (future-proofing).
+			subArgs = append(subArgs, args...)
+
+			proc := exec.Command(bin, subArgs...) //nolint:gosec // intentional subprocess
+			proc.Stdin = os.Stdin
+			proc.Stdout = cmd.OutOrStdout()
+			proc.Stderr = cmd.ErrOrStderr()
+			if err := proc.Run(); err != nil {
+				return fmt.Errorf("rensei-daemon doctor: %w", err)
 			}
 			return nil
 		},
 	}
 
-	cmd.Flags().IntVar(&port, "port", 0, "Daemon HTTP port (default from daemon.yaml: 7734)")
-	cmd.Flags().StringVar(&host, "host", "", "Daemon HTTP host (default: 127.0.0.1)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output raw JSON from rensei-daemon doctor (passed through verbatim)")
 
 	return cmd
-}
-
-// runDoctorChecks executes all daemon health checks and returns results.
-func runDoctorChecks(cfg afclient.DaemonConfig) []doctorCheck {
-	checks := []doctorCheck{}
-
-	// 1. Daemon binary present.
-	binPath, err := exec.LookPath(defaultDaemonBinary)
-	if err != nil {
-		checks = append(checks, doctorCheck{
-			name:   "Daemon binary",
-			result: doctorFail,
-			detail: fmt.Sprintf("%q not found on PATH", defaultDaemonBinary),
-		})
-	} else {
-		checks = append(checks, doctorCheck{
-			name:   "Daemon binary",
-			result: doctorPass,
-			detail: binPath,
-		})
-	}
-
-	// 2. Daemon process reachable via HTTP.
-	client := afclient.NewDaemonClient(cfg)
-	status, statusErr := client.GetStatus()
-	if statusErr != nil {
-		checks = append(checks, doctorCheck{
-			name:   "Daemon process",
-			result: doctorFail,
-			detail: fmt.Sprintf("not reachable at %s: %v", cfg.BaseURL(), statusErr),
-		})
-	} else {
-		checks = append(checks, doctorCheck{
-			name:   "Daemon process",
-			result: doctorPass,
-			detail: fmt.Sprintf("running (pid %d, uptime %s)", status.PID, formatUptimeSeconds(status.UptimeSeconds)),
-		})
-	}
-
-	// 3. Daemon config file valid.
-	cfgPath := expandHomePath("~/.rensei/daemon.yaml")
-	if _, statErr := os.Stat(cfgPath); statErr != nil {
-		checks = append(checks, doctorCheck{
-			name:   "Config file",
-			result: doctorWarn,
-			detail: fmt.Sprintf("%s not found", cfgPath),
-		})
-	} else {
-		checks = append(checks, doctorCheck{
-			name:   "Config file",
-			result: doctorPass,
-			detail: cfgPath,
-		})
-	}
-
-	// 4. JWT / API token cached (check env vars as a proxy).
-	token := os.Getenv("RENSEI_API_TOKEN")
-	if token == "" {
-		token = os.Getenv("WORKER_API_KEY")
-	}
-	if token == "" {
-		checks = append(checks, doctorCheck{
-			name:   "API token",
-			result: doctorWarn,
-			detail: "RENSEI_API_TOKEN / WORKER_API_KEY not set",
-		})
-	} else {
-		checks = append(checks, doctorCheck{
-			name:   "API token",
-			result: doctorPass,
-			detail: fmt.Sprintf("found (%s…)", token[:minInt(8, len(token))]),
-		})
-	}
-
-	// 5. Project allowlist non-empty (derive from daemon status if reachable).
-	if statusErr == nil {
-		if status.ProjectsAllowed == 0 {
-			checks = append(checks, doctorCheck{
-				name:   "Project allowlist",
-				result: doctorWarn,
-				detail: "no projects in allowlist — add one with `rensei project allow <repo>`",
-			})
-		} else {
-			checks = append(checks, doctorCheck{
-				name:   "Project allowlist",
-				result: doctorPass,
-				detail: fmt.Sprintf("%d project(s) allowed", status.ProjectsAllowed),
-			})
-		}
-	} else {
-		checks = append(checks, doctorCheck{
-			name:   "Project allowlist",
-			result: doctorWarn,
-			detail: "unable to check — daemon not reachable",
-		})
-	}
-
-	// 6. Network reachability: ping the orchestrator.
-	orchestratorURL := resolveOrchestratorURL()
-	if pingErr := pingHTTP(orchestratorURL); pingErr != nil {
-		checks = append(checks, doctorCheck{
-			name:   "Orchestrator network",
-			result: doctorWarn,
-			detail: fmt.Sprintf("cannot reach %s: %v", orchestratorURL, pingErr),
-		})
-	} else {
-		checks = append(checks, doctorCheck{
-			name:   "Orchestrator network",
-			result: doctorPass,
-			detail: orchestratorURL,
-		})
-	}
-
-	return checks
-}
-
-// resolveOrchestratorURL returns the orchestrator URL from env or a default.
-func resolveOrchestratorURL() string {
-	if u := os.Getenv("WORKER_API_URL"); u != "" {
-		return u
-	}
-	return "https://platform.rensei.dev"
-}
-
-// pingHTTP performs a lightweight HEAD request to check network reachability.
-func pingHTTP(rawURL string) error {
-	c := &http.Client{Timeout: 5 * time.Second}
-	resp, err := c.Head(rawURL)
-	if err != nil {
-		return err
-	}
-	_ = resp.Body.Close()
-	return nil
-}
-
-func doctorIcon(r doctorResult) (icon, color string) {
-	switch r {
-	case doctorPass:
-		return "✓", "\033[32m" // green
-	case doctorWarn:
-		return "!", "\033[33m" // yellow
-	default:
-		return "✗", "\033[31m" // red
-	}
 }
 
 // ── pause ─────────────────────────────────────────────────────────────────────
@@ -1253,12 +1121,4 @@ func padRight(s string, w int) string {
 		s += " "
 	}
 	return s
-}
-
-// minInt returns the smaller of a and b.
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
