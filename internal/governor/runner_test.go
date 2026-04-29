@@ -96,16 +96,13 @@ func (q *mockQueue) EnqueuedCount() int {
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 func makeIssue(id, state, project string) linear.Issue {
-	return linear.Issue{
+	iss := linear.Issue{
 		ID:         id,
 		Identifier: id,
-		State: struct {
-			Name string `json:"name"`
-		}{Name: state},
-		Project: struct {
-			Name string `json:"name"`
-		}{Name: project},
 	}
+	iss.State.Name = state
+	iss.Project.Name = project
+	return iss
 }
 
 func baseConfig() Config {

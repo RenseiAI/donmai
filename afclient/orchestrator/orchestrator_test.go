@@ -51,6 +51,66 @@ func (m *mockLinear) ListSubIssues(_ context.Context, _ string) ([]linear.Issue,
 	return nil, nil
 }
 
+func (m *mockLinear) ListIssues(_ context.Context, _ map[string]any, _ int, _ string) ([]linear.Issue, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) ListBacklogIssues(_ context.Context, _ string) ([]linear.Issue, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) GetIssueComments(_ context.Context, _ string) ([]linear.Comment, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) GetIssueRelations(_ context.Context, _ string) (*linear.RelationsResult, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) ListWorkflowStates(_ context.Context, _ string) (map[string]string, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) ListLabels(_ context.Context) (map[string]string, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) GetTeamByName(_ context.Context, _ string) (*linear.Team, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) GetProjectByName(_ context.Context, _ string) (*linear.Project, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) GetUserByNameOrEmail(_ context.Context, _ string) (*linear.User, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) GetViewer(_ context.Context) (*linear.User, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) CreateIssue(_ context.Context, _ linear.CreateIssueInput) (*linear.Issue, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) UpdateIssue(_ context.Context, _ string, _ linear.UpdateIssueInput) (*linear.Issue, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) CreateComment(_ context.Context, _, _ string) (*linear.Comment, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) CreateRelation(_ context.Context, _, _, _ string) (string, bool, error) {
+	return "", false, nil
+}
+
+func (m *mockLinear) DeleteRelation(_ context.Context, _ string) error {
+	return nil
+}
+
 // mockDispatcher records dispatches and returns a canned result.
 type mockDispatcher struct {
 	dispatched []*orchestrator.AgentDispatch

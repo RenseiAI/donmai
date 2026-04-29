@@ -19,17 +19,26 @@ type issuePayload struct {
 	Phase      string `json:"phase"`
 }
 
+// linearScanner is the narrow Linear interface used by the governor.
+// It only requires the three methods the scan loop actually calls,
+// so test mocks and the full *linear.Client both satisfy it.
+type linearScanner interface {
+	ListIssuesByProject(ctx context.Context, projectName string, states []string) ([]linear.Issue, error)
+	GetIssue(ctx context.Context, id string) (*linear.Issue, error)
+	ListSubIssues(ctx context.Context, parentID string) ([]linear.Issue, error)
+}
+
 // Runner polls Linear projects and enqueues issues for automated processing.
 type Runner struct {
 	cfg    Config
-	linear linear.Linear
+	linear linearScanner
 	queue  queue.Queue
 	logger *slog.Logger
 }
 
 // NewRunner constructs a Runner, validates cfg, and defaults logger to
 // slog.Default() when nil.
-func NewRunner(cfg Config, lin linear.Linear, q queue.Queue, logger *slog.Logger) (*Runner, error) {
+func NewRunner(cfg Config, lin linearScanner, q queue.Queue, logger *slog.Logger) (*Runner, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
