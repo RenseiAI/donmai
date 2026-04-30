@@ -354,10 +354,22 @@ func Install(opts InstallOptions) (InstallResult, error) {
 
 	r := runner(opts.Runner)
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
+
+	// Defensive bootout: launchd refuses to bootstrap a label that's already
+	// registered, even if the previous registration is stale (e.g. from a
+	// failed earlier install attempt that didn't clean up). The exact error
+	// shape varies — older macOS prints "service already loaded", current
+	// versions print "Bootstrap failed: 5: Input/output error" with no
+	// recognizable substring. Rather than match-and-retry, just bootout
+	// up front and ignore any error (the call is idempotent — it's a no-op
+	// if the label isn't loaded).
+	target := fmt.Sprintf("%s/%s", domain, LaunchdLabel)
+	_, _ = r.Run("launchctl", "bootout", target)
+
 	if out, runErr := r.Run("launchctl", "bootstrap", domain, plistPath); runErr != nil {
-		// Translate a "service already loaded" error into a benign success
-		// (launchctl bootstrap returns nonzero when the label is already
-		// registered; treat that the same as a successful load).
+		// Belt-and-suspenders: also accept an "already loaded" stdout
+		// message in case the bootout above silently failed and the label
+		// is still registered. Anything else is a real failure.
 		txt := strings.ToLower(strings.TrimSpace(string(out)))
 		if !strings.Contains(txt, "already") {
 			return res, fmt.Errorf("launchd: bootstrap: %w (%s)", runErr, strings.TrimSpace(string(out)))
