@@ -44,6 +44,15 @@ case "$archive" in
   *_darwin_*) ;;
   *)
     echo "sign-and-notarize: skipping non-darwin archive: $archive"
+    # GoReleaser's signs[] block expects a ${artifact}.sig file to publish
+    # alongside the archive. Codesign embeds the signature inside the
+    # binary so there's no separate detached sig — write a placeholder
+    # noting that linux/non-darwin archives are unsigned (REN-1412 v0.3.6).
+    {
+      echo "Signature: none"
+      echo "Reason: non-darwin archive — no codesigning required"
+      echo "Archive: $(basename "$archive")"
+    } > "$archive.sig"
     exit 0
     ;;
 esac
@@ -153,5 +162,18 @@ while IFS= read -r -d '' bin; do
 done < <(find "$verify_dir" -type f -perm -111 -print0)
 rm -f "$verify_log"
 rm -rf "$verify_dir"
+
+# Write a sidecar .sig file describing the embedded signature.
+# GoReleaser's signs[] block expects ${artifact}.sig to exist (it uploads
+# it as a release asset). Codesign signatures are embedded in each Mach-O
+# binary inside the .tar.gz, so there's no detached signature artifact —
+# this file provides human-readable provenance.
+{
+  echo "Signature: embedded (codesign + notarytool)"
+  echo "Identity: $IDENTITY"
+  echo "Notarization: Accepted"
+  echo "Archive: $(basename "$archive")"
+  echo "Verify: tar -xzf <archive>; codesign -dvvv <binary>"
+} > "$archive.sig"
 
 echo "sign-and-notarize: done — $archive"
