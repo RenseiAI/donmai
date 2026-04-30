@@ -24,6 +24,24 @@ _Placeholder for v0.3.0 work. Move items here as they merge._
 
 ---
 
+## v0.2.2 — 2026-04-30
+
+### Features
+
+- **`af daemon install / uninstall / doctor` wiring** — OSS mirror of the daemon shell-out work: `exec.Command` calls into the underlying `rensei-daemon` (or equivalent) binary, forwarding stdin/stdout/stderr and passthrough flags (REN-1347, REN-1348).
+- **`af logs analyze`** — `af-analyze-logs` ported to Go; full pattern catalog parity with the legacy TS implementation (REN-1359).
+- **`af linear`** — `af-linear` CLI ported to Go; covers issue CRUD, comments, sub-issues, relations, and deployment checks (REN-1360).
+- **`af orchestrator`** — `af-orchestrator` ported to Go (REN-1361).
+- **`af admin {cleanup, queue, merge-queue}`** — Admin commands ported to Go from the legacy TS CLI (REN-1362).
+- **`af code` and `af arch`** — Shell-out bridges that compose with the existing `pnpm af-code` / `pnpm af-arch` toolchains, completing Phase D parity (REN-1363).
+
+### Chores
+
+- **README authored** — Full README with command surface map (REN-1364).
+- **RELEASING.md and CHANGELOG.md established** — Tag-driven GoReleaser release flow documented; this changelog established (REN-1366).
+
+---
+
 ## v0.2.1 — 2026-04-29
 
 ### Chores
