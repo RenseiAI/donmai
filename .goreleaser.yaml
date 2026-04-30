@@ -54,8 +54,10 @@ archives:
 signs:
   - id: macos-codesign-and-notarize
     artifacts: archive
-    ids:
-      - af
+    # No `ids:` filter — apply to all archives. The script's case statement
+    # filters by *_darwin_* and skips Linux archives. Previously this was
+    # `ids: [af]` but archive id is `default` (see archives block above), so
+    # the signs block silently skipped every artifact in v0.3.2 (REN-1412).
     cmd: ./scripts/sign-and-notarize.sh
     args:
       - "${artifact}"
