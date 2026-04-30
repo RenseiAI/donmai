@@ -61,10 +61,6 @@ signs:
     cmd: ./scripts/sign-and-notarize.sh
     args:
       - "${artifact}"
-    env:
-      - APPLE_DEVELOPER_ID={{ .Env.APPLE_DEVELOPER_ID }}
-      - APPLE_PASSWORD={{ .Env.APPLE_PASSWORD }}
-      - APPLE_TEAM_ID={{ .Env.APPLE_TEAM_ID }}
     output: true
 
 homebrew_casks:
