@@ -15,7 +15,10 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # macOS runner is required for codesign + xcrun notarytool (REN-1412).
+    # Cross-compile to linux/amd64 + linux/arm64 still works from darwin via
+    # CGO_ENABLED=0 (set in .goreleaser.yaml).
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,3 +35,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          # Apple code signing + notarization — REN-1412.
+          # Org-level secrets sourced from the Yuisei-iOS Apple Developer ID
+          # Application certificate. See RELEASING.md § macOS signing for
+          # configuration details and renewal cadence.
+          APPLE_DEVELOPER_ID_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_BASE64 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}

@@ -17,6 +17,7 @@ This document covers the full release process for the `af` binary: version bump,
   - [7. Verify the Homebrew tap](#7-verify-the-homebrew-tap)
   - [8. Smoke-test checklist](#8-smoke-test-checklist)
 - [Homebrew tap details](#homebrew-tap-details)
+- [macOS signing](#macos-signing)
 - [Rollback procedure](#rollback-procedure)
 - [Hotfix releases](#hotfix-releases)
 
@@ -58,6 +59,7 @@ goreleaser builds the following targets (see `.goreleaser.yaml`):
 - GitHub CLI (`gh auth status`)
 - `GITHUB_TOKEN` env var with `repo` + `write:packages` scopes (goreleaser uses this automatically)
 - `HOMEBREW_TAP_GITHUB_TOKEN` env var with write access to `RenseiAI/homebrew-tap`
+- For darwin signing (REN-1412): `APPLE_DEVELOPER_ID_CERT_BASE64`, `APPLE_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_DEVELOPER_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` configured as org-level GitHub Actions secrets — see [macOS signing](#macos-signing). Local dry-runs (`goreleaser release --snapshot`) skip signing per goreleaser convention.
 - All tests passing locally: `make test && make lint`
 
 ---
@@ -194,6 +196,80 @@ The tap formula lives at:
 
 ---
 
+## macOS signing
+
+Per REN-1412, all darwin builds of `af` are **signed** with the Apple Developer ID Application certificate (Yuisei-iOS enrollment) and **notarized** via Apple's `notarytool` service. The notarization ticket is **stapled** to each archive so binaries are Gatekeeper-clean offline (a fresh Mac with no network can launch `af` without a callback to Apple's servers).
+
+This eliminates the Gatekeeper popup that previously required users to approve `af` in System Settings → Privacy & Security after `brew install RenseiAI/tap/af`.
+
+### How it works
+
+The release pipeline runs on `macos-latest` (required for `codesign` + `xcrun notarytool`). The `notarize.macos` block in `.goreleaser.yaml` drives signing + notarization in one pass:
+
+1. The base64 `.p12` cert is decoded into an ephemeral keychain on the runner.
+2. `codesign --options runtime --timestamp --force` signs each darwin binary with the Developer ID Application identity (hardened runtime is mandatory for notarization).
+3. The signed archive is submitted to `notarytool submit --wait`. Apple typically returns a verdict in 5–15 min.
+4. On success, `xcrun stapler staple` attaches the notarization ticket to the archive.
+
+Cross-compiled linux binaries skip signing entirely (the `notarize.macos` block is darwin-only).
+
+### Required GitHub Actions secrets
+
+These are configured at the **org level** so both `agentfactory-tui` and `rensei-tui` pick them up. Per the AC, each has a fine-grained PAT scope where applicable.
+
+| Secret | Description | How to derive |
+|--------|-------------|---------------|
+| `APPLE_DEVELOPER_ID_CERT_BASE64` | The Developer ID Application `.p12` cert, base64-encoded | Export the cert from Keychain Access as a `.p12`, then `base64 -i developer-id.p12 \| pbcopy` |
+| `APPLE_DEVELOPER_ID_CERT_PASSWORD` | The export password set when generating the `.p12` | Set during the Keychain export dialog |
+| `APPLE_DEVELOPER_ID` | The Apple ID email used for the certificate | The Apple ID that owns the Yuisei-iOS Developer enrollment |
+| `APPLE_PASSWORD` | An **app-specific password** for `notarytool` (NOT the regular Apple ID password) | Generate at https://appleid.apple.com → Sign-In and Security → App-Specific Passwords |
+| `APPLE_TEAM_ID` | The 10-character Apple Developer Team ID | Apple Developer portal → Membership → Team ID |
+
+### Verifying a signed/notarized release
+
+After a release ships, on a fresh Mac:
+
+```bash
+brew install RenseiAI/tap/af
+
+# 1. Confirm Gatekeeper accepts it without popup intervention.
+spctl --assess --verbose /opt/homebrew/bin/af
+# Expected output:
+#   /opt/homebrew/bin/af: accepted
+#   source=Notarized Developer ID
+
+# 2. Confirm the binary is signed with the right identity.
+codesign -dvv /opt/homebrew/bin/af 2>&1 | grep "Authority="
+# Expected:
+#   Authority=Developer ID Application: <Yuisei-iOS team name>
+#   Authority=Developer ID Certification Authority
+#   Authority=Apple Root CA
+
+# 3. Confirm the notarization ticket is stapled.
+stapler validate /opt/homebrew/bin/af
+# Expected: "The validate action worked!"
+
+# 4. Confirm hardened runtime is enabled.
+codesign -d --entitlements - /opt/homebrew/bin/af
+# Expected: hardened runtime flag visible in code-signing flags
+```
+
+If any check fails, the release was **not** correctly notarized — file a regression issue and roll back.
+
+### Certificate renewal cadence
+
+Apple Developer ID Application certificates are valid for **5 years**. Track the expiry date in REN's calendar (the original Yuisei-iOS cert was issued at enrollment time — check the cert in Keychain Access for the exact `Not Valid After` date). Set a reminder ~3 months before expiry to:
+
+1. Generate a new `.p12` from the same Apple Developer enrollment.
+2. Update the `APPLE_DEVELOPER_ID_CERT_BASE64` and `APPLE_DEVELOPER_ID_CERT_PASSWORD` org secrets.
+3. Cut a small patch release to verify the new cert works end-to-end (run all four `verify` steps above).
+
+### Local dry-run convention
+
+`goreleaser release --snapshot --clean` skips the `signs` and `notarize` blocks entirely (per goreleaser convention). Local snapshot builds produce **unsigned** binaries — useful for testing the build matrix, but they will trigger Gatekeeper popups on macOS. Real signing only fires on tag-pushed CI runs that have all five `APPLE_*` secrets set.
+
+---
+
 ## Smoke-test checklist
 
 Run these checks after installing the new binary from Homebrew or a direct download:
@@ -211,6 +287,10 @@ Run these checks after installing the new binary from Homebrew or a direct downl
 [ ] Binary runs on linux/amd64            tested in Docker: docker run --rm -v $(pwd)/dist:/dist ubuntu /dist/af_vX.Y.Z_linux_amd64/af --version
 [ ] Binary runs on linux/arm64            tested in Docker or ARM VM
 [ ] checksums.txt SHA-256 verified        sha256sum -c checksums.txt (from release page)
+[ ] spctl --assess --verbose /opt/homebrew/bin/af  → accepted, source=Notarized Developer ID
+[ ] stapler validate /opt/homebrew/bin/af  → ticket stapled (Gatekeeper-offline-clean)
+[ ] codesign -dvv /opt/homebrew/bin/af  → Authority=Developer ID Application
+[ ] No System Settings → Privacy & Security popup on first launch (REN-1412 regression check)
 ```
 
 ---

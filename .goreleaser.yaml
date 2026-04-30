@@ -23,6 +23,34 @@ archives:
       - tar.gz
     name_template: "af_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
+# macOS code signing + notarization — REN-1412.
+#
+# Sign darwin binaries with the Apple Developer ID Application certificate
+# (Yuisei-iOS enrollment, reused per REN-1412 AC). Hardened runtime is enabled
+# (--options runtime) which is mandatory for notarization. After signing,
+# the binary is submitted to Apple's notarytool service; on success the
+# notarization ticket is stapled to the archive so the binary is
+# Gatekeeper-clean offline.
+#
+# Local dry-run note: `goreleaser release --snapshot --clean` skips the
+# `signs` and `notarize` blocks entirely (per goreleaser convention; snapshot
+# implies `--skip=sign,notarize`). Real signing only fires on tag-pushed
+# CI runs that have the APPLE_* secrets set.
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "APPLE_DEVELOPER_ID_CERT_BASE64" }}'
+      ids:
+        - af
+      sign:
+        certificate: "{{ .Env.APPLE_DEVELOPER_ID_CERT_BASE64 }}"
+        password: "{{ .Env.APPLE_DEVELOPER_ID_CERT_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.APPLE_TEAM_ID }}"
+        key_id: "{{ .Env.APPLE_DEVELOPER_ID }}"
+        key: "{{ .Env.APPLE_PASSWORD }}"
+        wait: true
+        timeout: 20m
+
 homebrew_casks:
   - name: af
     repository:
