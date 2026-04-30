@@ -119,28 +119,39 @@ while IFS= read -r -d '' bin; do
 done < <(find "$tmpdir" -type f -perm -111 -print0)
 
 # Repack with the original name now that the binaries are signed + notarized.
-(cd "$tmpdir" && tar -czf "$archive.signed" .)
-mv "$archive.signed" "$archive"
+# Capture absolute path before `cd "$tmpdir"` because $archive is relative
+# to goreleaser's cwd, not to $tmpdir (REN-1412 v0.3.5 bug fix).
+archive_abs="$(cd "$(dirname "$archive")" && pwd)/$(basename "$archive")"
+(cd "$tmpdir" && tar -czf "$archive_abs.signed" .)
+mv "$archive_abs.signed" "$archive_abs"
 
 # Final verification: re-extract the repacked archive and confirm the
 # binaries carry a Developer ID Application signature (NOT linker-signed).
 verify_dir="$(mktemp -d)"
 tar -xzf "$archive" -C "$verify_dir"
+verify_log="$(mktemp)"
 while IFS= read -r -d '' bin; do
   echo "sign-and-notarize: verifying $bin"
-  if ! codesign -dvvv "$bin" 2>&1 | tee /tmp/codesign-verify.txt | grep -qE '^Authority=Developer ID Application:'; then
+  # Write codesign output to a file first; piping `... | tee | grep -q`
+  # combined with `set -o pipefail` triggers a spurious failure because
+  # grep -q sends SIGPIPE to tee on first match (REN-1412 v0.3.5 bug fix).
+  codesign -dvvv "$bin" > "$verify_log" 2>&1
+  if ! grep -qE '^Authority=Developer ID Application:' "$verify_log"; then
     echo "::error::repacked archive binary $bin is missing Developer ID Application signature"
-    cat /tmp/codesign-verify.txt
+    cat "$verify_log"
+    rm -f "$verify_log"
     rm -rf "$verify_dir"
     exit 1
   fi
-  if grep -q 'linker-signed' /tmp/codesign-verify.txt; then
+  if grep -q 'linker-signed' "$verify_log"; then
     echo "::error::repacked archive binary $bin is still linker-signed"
-    cat /tmp/codesign-verify.txt
+    cat "$verify_log"
+    rm -f "$verify_log"
     rm -rf "$verify_dir"
     exit 1
   fi
 done < <(find "$verify_dir" -type f -perm -111 -print0)
+rm -f "$verify_log"
 rm -rf "$verify_dir"
 
 echo "sign-and-notarize: done — $archive"
