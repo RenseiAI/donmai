@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/agentfactory-tui/installer"
 )
 
 // daemonDoer is the interface used by daemon subcommands. It is satisfied by
@@ -103,7 +104,7 @@ func newDaemonCmdWithFactory(factory daemonClientFactory) *cobra.Command {
 
 func newDaemonInstallCmd() *cobra.Command {
 	var (
-		binPath     string // macOS launchd: --bin-path overrides the daemon binary location
+		binPath     string // --bin-path overrides the host binary path resolved via os.Executable()
 		scopeUser   bool   // Linux systemd: --user  (user-scoped unit, default)
 		scopeSystem bool   // Linux systemd: --system (system-scoped unit, requires root)
 	)
@@ -111,51 +112,46 @@ func newDaemonInstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install the daemon as a system service",
-		Long: "Register rensei-daemon as a launchd (macOS) or systemd (Linux) service so it\n" +
-			"starts automatically at login and survives reboots.\n\n" +
-			"This delegates to `rensei-daemon install` with stdin/stdout/stderr forwarded so\n" +
-			"interactive launchctl/systemctl prompts surface correctly.\n\n" +
+		Long: "Register the af binary's `daemon run` subcommand as a launchd (macOS) or\n" +
+			"systemd (Linux) service so it starts automatically at login and survives\n" +
+			"reboots.\n\n" +
+			"This is implemented in-process — no subprocess shell-out (REN-1406).\n\n" +
 			"macOS:\n" +
-			"  af daemon install [--bin-path /path/to/rensei-daemon]\n\n" +
+			"  af daemon install [--bin-path /path/to/af]\n\n" +
 			"Linux:\n" +
 			"  af daemon install --user    (user-scoped systemd unit, default)\n" +
 			"  af daemon install --system  (system-scoped systemd unit, requires sudo)",
 		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := exec.LookPath(defaultDaemonBinary)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			scope := installer.ScopeUser
+			switch {
+			case scopeSystem && scopeUser:
+				return errors.New("cannot specify both --user and --system")
+			case scopeSystem:
+				scope = installer.ScopeSystem
+			}
+
+			res, err := installer.Install(installer.InstallOptions{
+				HostBinPath: binPath,
+				Scope:       scope,
+			})
 			if err != nil {
-				return fmt.Errorf(
-					"rensei-daemon not found on PATH — install it first with `brew install rensei` or equivalent: %w",
-					err,
-				)
+				return fmt.Errorf("daemon install: %w", err)
 			}
 
-			// Build the subprocess argument list: "install" + any passthrough flags.
-			subArgs := []string{"install"}
-			if binPath != "" {
-				subArgs = append(subArgs, "--bin-path", binPath)
-			}
-			if scopeUser {
-				subArgs = append(subArgs, "--user")
-			}
-			if scopeSystem {
-				subArgs = append(subArgs, "--system")
-			}
-			// Forward any remaining positional args (future-proofing).
-			subArgs = append(subArgs, args...)
-
-			proc := exec.Command(bin, subArgs...) //nolint:gosec // intentional subprocess
-			proc.Stdin = os.Stdin
-			proc.Stdout = cmd.OutOrStdout()
-			proc.Stderr = cmd.ErrOrStderr()
-			if err := proc.Run(); err != nil {
-				return fmt.Errorf("rensei-daemon install: %w", err)
-			}
+			out := cmd.OutOrStdout()
+			_, _ = fmt.Fprintf(out, "Service registered: %s\n", res.ServicePath)
+			_, _ = fmt.Fprintf(out, "Service command: %s\n", res.ServiceCommand)
+			_, _ = fmt.Fprintln(out)
+			_, _ = fmt.Fprintln(out,
+				"Note: until the Go daemon runtime ships (REN-1408), the registered\n"+
+					"service will fail to start because `daemon run` is not yet\n"+
+					"implemented. The installer surface is correct; the runtime is not.")
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&binPath, "bin-path", "", "Path to rensei-daemon binary (macOS launchd)")
+	cmd.Flags().StringVar(&binPath, "bin-path", "", "Path to the host binary (default: current executable)")
 	cmd.Flags().BoolVar(&scopeUser, "user", false, "Install as user-scoped systemd unit (Linux)")
 	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Install as system-scoped systemd unit, requires sudo (Linux)")
 
@@ -171,41 +167,32 @@ func newDaemonUninstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "uninstall",
 		Short: "Uninstall the daemon system service",
-		Long: "Remove the launchd (macOS) or systemd (Linux) service registration for rensei-daemon.\n\n" +
-			"This delegates to `rensei-daemon uninstall` with stdin/stdout/stderr forwarded so\n" +
-			"interactive launchctl/systemctl prompts surface correctly.\n\n" +
+		Long: "Remove the launchd (macOS) or systemd (Linux) service registration.\n\n" +
+			"This is implemented in-process — no subprocess shell-out (REN-1406).\n\n" +
 			"macOS:\n" +
 			"  af daemon uninstall\n\n" +
 			"Linux:\n" +
 			"  af daemon uninstall --user    (user-scoped systemd unit, default)\n" +
 			"  af daemon uninstall --system  (system-scoped systemd unit, requires sudo)",
 		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := exec.LookPath(defaultDaemonBinary)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			scope := installer.ScopeUser
+			switch {
+			case scopeSystem && scopeUser:
+				return errors.New("cannot specify both --user and --system")
+			case scopeSystem:
+				scope = installer.ScopeSystem
+			}
+
+			res, err := installer.Uninstall(installer.UninstallOptions{Scope: scope})
 			if err != nil {
-				return fmt.Errorf(
-					"rensei-daemon not found on PATH — install it first with `brew install rensei` or equivalent: %w",
-					err,
-				)
+				return fmt.Errorf("daemon uninstall: %w", err)
 			}
-
-			// Build the subprocess argument list: "uninstall" + any passthrough flags.
-			subArgs := []string{"uninstall"}
-			if scopeUser {
-				subArgs = append(subArgs, "--user")
-			}
-			if scopeSystem {
-				subArgs = append(subArgs, "--system")
-			}
-			// Forward any remaining positional args (future-proofing).
-			subArgs = append(subArgs, args...)
-
-			proc := exec.Command(bin, subArgs...) //nolint:gosec // intentional subprocess
-			proc.Stdin = os.Stdin
-			proc.Stdout = cmd.OutOrStdout()
-			proc.Stderr = cmd.ErrOrStderr()
-			if err := proc.Run(); err != nil {
-				return fmt.Errorf("rensei-daemon uninstall: %w", err)
+			out := cmd.OutOrStdout()
+			if res.Removed {
+				_, _ = fmt.Fprintf(out, "Service uninstalled: %s\n", res.ServicePath)
+			} else {
+				_, _ = fmt.Fprintf(out, "No service was registered at %s\n", res.ServicePath)
 			}
 			return nil
 		},
@@ -231,10 +218,9 @@ func newDaemonSetupCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			bin, err := exec.LookPath(defaultDaemonBinary)
 			if err != nil {
-				return fmt.Errorf(
-					"rensei-daemon not found on PATH — install it first with `brew install rensei` or equivalent: %w",
-					err,
-				)
+				return fmt.Errorf("daemon setup wizard is not yet ported to the Go binary — "+
+					"the runtime port is tracked in REN-1408. "+
+					"Until that lands you can configure ~/.rensei/daemon.yaml manually. (PATH lookup err: %w)", err)
 			}
 			proc := exec.Command(bin, "setup") //nolint:gosec // intentional subprocess
 			proc.Stdin = os.Stdin
@@ -443,50 +429,90 @@ func printLogLine(w io.Writer, line string, parseJSON bool) {
 // ── doctor ────────────────────────────────────────────────────────────────────
 
 func newDaemonDoctorCmd() *cobra.Command {
-	var jsonOut bool
+	var (
+		jsonOut     bool
+		scopeUser   bool
+		scopeSystem bool
+	)
 
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Run health checks on the local daemon setup",
 		Long: "Run a suite of health checks and report pass/warn/fail for each.\n\n" +
-			"This delegates to `rensei-daemon doctor` with stdin/stdout/stderr forwarded.\n" +
-			"Use --json to receive machine-readable output; the JSON is passed through\n" +
-			"verbatim without reshaping (caller contract preserved).\n\n" +
-			"On a fresh machine, expect: binary present, everything else fail.\n" +
-			"This is the expected starting state for the Stream 2 E2E smoke test (Phase F).\n\n" +
-			"Exits 0 when all checks pass, non-zero if any fail.",
+			"This is implemented in-process (REN-1406): the command inspects the\n" +
+			"installed launchd plist (macOS) or systemd unit (Linux) directly and\n" +
+			"reports whether the service is registered, active, and pointing at the\n" +
+			"current host binary.\n\n" +
+			"Exits 0 when the unit is installed and healthy, non-zero otherwise.",
 		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := exec.LookPath(defaultDaemonBinary)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			scope := installer.ScopeUser
+			switch {
+			case scopeSystem && scopeUser:
+				return errors.New("cannot specify both --user and --system")
+			case scopeSystem:
+				scope = installer.ScopeSystem
+			}
+
+			report, err := installer.Doctor(installer.DoctorOptions{Scope: scope})
 			if err != nil {
-				return fmt.Errorf(
-					"rensei-daemon not found on PATH — install it first with `brew install rensei` or equivalent: %w",
-					err,
-				)
+				return fmt.Errorf("daemon doctor: %w", err)
 			}
 
-			// Build the subprocess argument list: "doctor" + optional --json flag.
-			subArgs := []string{"doctor"}
+			out := cmd.OutOrStdout()
 			if jsonOut {
-				subArgs = append(subArgs, "--json")
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(report)
 			}
-			// Forward any remaining positional args (future-proofing).
-			subArgs = append(subArgs, args...)
 
-			proc := exec.Command(bin, subArgs...) //nolint:gosec // intentional subprocess
-			proc.Stdin = os.Stdin
-			proc.Stdout = cmd.OutOrStdout()
-			proc.Stderr = cmd.ErrOrStderr()
-			if err := proc.Run(); err != nil {
-				return fmt.Errorf("rensei-daemon doctor: %w", err)
+			binPath := resolveCurrentBinPath()
+			binPresent := binPath != ""
+
+			_, _ = fmt.Fprintf(out, "OS:               %s\n", report.OS)
+			_, _ = fmt.Fprintf(out, "Service path:     %s\n", report.ServicePath)
+			_, _ = fmt.Fprintf(out, "Service installed: %v\n", report.Installed)
+			if report.Active != nil {
+				_, _ = fmt.Fprintf(out, "Service active:   %v\n", *report.Active)
+			} else {
+				_, _ = fmt.Fprintf(out, "Service active:   (unknown)\n")
+			}
+			_, _ = fmt.Fprintf(out, "Host binary:      %s\n", binPath)
+			_, _ = fmt.Fprintf(out, "Binary present:   %v\n", binPresent)
+			if report.Detail != "" {
+				_, _ = fmt.Fprintln(out)
+				_, _ = fmt.Fprintln(out, report.Detail)
+			}
+			if !report.Installed {
+				return errors.New("service is not installed — run `daemon install`")
 			}
 			return nil
 		},
 	}
 
-	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output raw JSON from rensei-daemon doctor (passed through verbatim)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output the doctor report as JSON")
+	cmd.Flags().BoolVar(&scopeUser, "user", false, "Inspect user-scoped systemd unit (Linux, default)")
+	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Inspect system-scoped systemd unit (Linux)")
 
 	return cmd
+}
+
+// resolveCurrentBinPath returns the absolute path of the currently running
+// executable, or "" if it cannot be resolved. Used by `daemon doctor` to
+// report binary-presence based on the actual Go binary the installer
+// would register (acceptance criterion REN-1406).
+func resolveCurrentBinPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	if _, err := os.Stat(exe); err != nil {
+		return ""
+	}
+	return exe
 }
 
 // ── pause ─────────────────────────────────────────────────────────────────────
