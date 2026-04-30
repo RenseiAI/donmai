@@ -19,6 +19,21 @@ jobs:
     # Cross-compile to linux/amd64 + linux/arm64 still works from darwin via
     # CGO_ENABLED=0 (set in .goreleaser.yaml).
     runs-on: macos-latest
+    # Job-level env block: REN-1412. Step-level env: blocks on
+    # goreleaser/goreleaser-action@v6 (node24 action) did not propagate
+    # APPLE_DEVELOPER_ID/APPLE_PASSWORD/APPLE_TEAM_ID to the goreleaser
+    # subprocess, causing `signs[].env: APPLE_DEVELOPER_ID={{ .Env.APPLE_DEVELOPER_ID }}`
+    # template eval to fail with `map has no entry for key
+    # "APPLE_DEVELOPER_ID"`. Job-level env is always merged into the env
+    # of every step subprocess, regardless of action runtime quirks.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+      APPLE_DEVELOPER_ID_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_BASE64 }}
+      APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+      APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,9 +55,6 @@ jobs:
       # 1.2.840.113635.100.6.1.13). See REN-1412 for the v0.3.1 failure.
       - name: Import Apple Developer ID cert to keychain
         if: env.APPLE_DEVELOPER_ID_CERT_BASE64 != ''
-        env:
-          APPLE_DEVELOPER_ID_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_BASE64 }}
-          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
         run: |
           set -euo pipefail
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
@@ -71,15 +83,3 @@ jobs:
         with:
           version: "~> v2"
           args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
-          # Apple code signing + notarization — REN-1412.
-          # Org-level secrets sourced from the Yuisei-iOS Apple Developer ID
-          # Application certificate. See RELEASING.md § macOS signing for
-          # configuration details and renewal cadence.
-          APPLE_DEVELOPER_ID_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_BASE64 }}
-          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
-          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
