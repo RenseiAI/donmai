@@ -28,28 +28,42 @@ archives:
 # Sign darwin binaries with the Apple Developer ID Application certificate
 # (Yuisei-iOS enrollment, reused per REN-1412 AC). Hardened runtime is enabled
 # (--options runtime) which is mandatory for notarization. After signing,
-# the binary is submitted to Apple's notarytool service; on success the
-# notarization ticket is stapled to the archive so the binary is
-# Gatekeeper-clean offline.
+# the archive is submitted to Apple's notarytool service for stapler-less
+# online notarization (.tar.gz can't be stapled; binaries get notarization
+# tickets via online check).
+#
+# Why we shell out to native `codesign` + `xcrun notarytool` instead of
+# GoReleaser's built-in `notarize:` block:
+#   - Built-in signer uses Go's x509 library, which rejects Apple Developer ID
+#     certs with `failed to verify certificate chain: x509: unhandled critical
+#     extension` (Apple's critical extension 1.2.840.113635.100.6.1.13 is not
+#     recognized by Go's strict x509 parser). v0.3.1 release failed at this
+#     step.
+#   - Built-in notarize uses App Store Connect API key shape
+#     (issuer_id/key_id/key); our secrets are Apple ID + app-specific password.
+#   - The native macOS toolchain handles both cases correctly.
+#
+# The keychain is set up by the `Import Apple Developer ID cert to keychain`
+# step in .github/workflows/release.yml (RUNNER_TEMP keychain — ephemeral,
+# auto-cleanup).
 #
 # Local dry-run note: `goreleaser release --snapshot --clean` skips the
-# `signs` and `notarize` blocks entirely (per goreleaser convention; snapshot
-# implies `--skip=sign,notarize`). Real signing only fires on tag-pushed
-# CI runs that have the APPLE_* secrets set.
-notarize:
-  macos:
-    - enabled: '{{ isEnvSet "APPLE_DEVELOPER_ID_CERT_BASE64" }}'
-      ids:
-        - af
-      sign:
-        certificate: "{{ .Env.APPLE_DEVELOPER_ID_CERT_BASE64 }}"
-        password: "{{ .Env.APPLE_DEVELOPER_ID_CERT_PASSWORD }}"
-      notarize:
-        issuer_id: "{{ .Env.APPLE_TEAM_ID }}"
-        key_id: "{{ .Env.APPLE_DEVELOPER_ID }}"
-        key: "{{ .Env.APPLE_PASSWORD }}"
-        wait: true
-        timeout: 20m
+# `signs` block entirely (per goreleaser convention; snapshot implies
+# `--skip=sign`). Real signing only fires on tag-pushed CI runs that have
+# the APPLE_* secrets set.
+signs:
+  - id: macos-codesign-and-notarize
+    artifacts: archive
+    ids:
+      - af
+    cmd: ./scripts/sign-and-notarize.sh
+    args:
+      - "${artifact}"
+    env:
+      - APPLE_DEVELOPER_ID={{ .Env.APPLE_DEVELOPER_ID }}
+      - APPLE_PASSWORD={{ .Env.APPLE_PASSWORD }}
+      - APPLE_TEAM_ID={{ .Env.APPLE_TEAM_ID }}
+    output: true
 
 homebrew_casks:
   - name: af
