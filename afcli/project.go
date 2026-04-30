@@ -209,9 +209,19 @@ func newProjectCredentialsCmd(rw configReaderWriter) *cobra.Command {
 				return fmt.Errorf("write daemon config: %w", err)
 			}
 
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"credentials updated for %s: %s\n", repoURL, helper.Kind,
-			)
+			// helper is nil when the user selects "None (configure later)";
+			// the entry persists with no credential helper and the daemon
+			// will refuse to clone until credentials are added.
+			if helper == nil {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"credentials cleared for %s — daemon will refuse work until credentials are added\n",
+					repoURL,
+				)
+			} else {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"credentials updated for %s: %s\n", repoURL, helper.Kind,
+				)
+			}
 			return nil
 		},
 	}
