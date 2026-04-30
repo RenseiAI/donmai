@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -927,23 +928,25 @@ func TestDaemonConfigBaseURL(t *testing.T) {
 	}
 }
 
-// TestDaemonSetupBinaryNotFound verifies setup returns a clear error when
-// rensei-daemon is not on PATH. Cannot be parallel because t.Setenv requires it.
-func TestDaemonSetupBinaryNotFound(t *testing.T) {
-	// Override PATH to guarantee the binary is absent.
-	t.Setenv("PATH", t.TempDir())
+// TestDaemonSetupWritesDefaultConfig verifies that `daemon setup` runs the
+// in-process Go wizard (REN-1408) and, in non-TTY environments, writes the
+// default config to the path provided via --config.
+func TestDaemonSetupWritesDefaultConfig(t *testing.T) {
+	// Force the non-TTY path via the wizard skip env (mirrors
+	// RENSEI_DAEMON_SKIP_WIZARD).
+	t.Setenv("RENSEI_DAEMON_SKIP_WIZARD", "1")
 
+	cfgPath := filepath.Join(t.TempDir(), "daemon.yaml")
 	cmd := newDaemonSetupCmd()
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	cmd.SetArgs(nil)
-	err := cmd.Execute()
-	if err == nil {
-		t.Fatal("expected error when daemon binary not on PATH, got nil")
+	cmd.SetArgs([]string{"--config", cfgPath})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("daemon setup: %v", err)
 	}
-	if !strings.Contains(err.Error(), "rensei-daemon") {
-		t.Errorf("error should mention 'rensei-daemon'; got: %v", err)
+	if _, err := os.Stat(cfgPath); err != nil {
+		t.Fatalf("expected config file at %s: %v", cfgPath, err)
 	}
 }
 

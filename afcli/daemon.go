@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -18,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/RenseiAI/agentfactory-tui/afclient"
+	daemonRuntime "github.com/RenseiAI/agentfactory-tui/daemon"
 	"github.com/RenseiAI/agentfactory-tui/installer"
 )
 
@@ -47,9 +47,6 @@ func defaultDaemonFactory(cfg afclient.DaemonConfig) daemonDoer {
 
 // defaultDaemonLogFile is the default path for the daemon log file per 011.
 const defaultDaemonLogFile = "~/.rensei/daemon.log"
-
-// defaultDaemonBinary is the expected daemon binary name on PATH.
-const defaultDaemonBinary = "rensei-daemon"
 
 // expandHomePath replaces a leading ~ with the user's home directory.
 func expandHomePath(path string) string {
@@ -85,6 +82,7 @@ func newDaemonCmdWithFactory(factory daemonClientFactory) *cobra.Command {
 	cmd.AddCommand(newDaemonInstallCmd())
 	cmd.AddCommand(newDaemonUninstallCmd())
 	cmd.AddCommand(newDaemonSetupCmd())
+	cmd.AddCommand(newDaemonRunCmd())
 	cmd.AddCommand(newDaemonStatusCmd(factory))
 	cmd.AddCommand(newDaemonLogsCmd())
 	cmd.AddCommand(newDaemonDoctorCmd())
@@ -144,9 +142,9 @@ func newDaemonInstallCmd() *cobra.Command {
 			_, _ = fmt.Fprintf(out, "Service command: %s\n", res.ServiceCommand)
 			_, _ = fmt.Fprintln(out)
 			_, _ = fmt.Fprintln(out,
-				"Note: until the Go daemon runtime ships (REN-1408), the registered\n"+
-					"service will fail to start because `daemon run` is not yet\n"+
-					"implemented. The installer surface is correct; the runtime is not.")
+				"The Go daemon runtime is now in-binary (REN-1408): the registered\n"+
+					"service launches `daemon run` directly. Run `daemon status` to\n"+
+					"verify the HTTP control API once the service has started.")
 			return nil
 		},
 	}
@@ -207,31 +205,39 @@ func newDaemonUninstallCmd() *cobra.Command {
 // ── setup ─────────────────────────────────────────────────────────────────────
 
 func newDaemonSetupCmd() *cobra.Command {
-	return &cobra.Command{
+	var configPath string
+	cmd := &cobra.Command{
 		Use:   "setup",
 		Short: "Interactive first-run wizard",
 		Long: "Run the interactive first-run setup wizard that captures machine identity, capacity,\n" +
 			"orchestrator config, project allowlist, and auto-update preferences.\n\n" +
-			"This invokes `rensei-daemon setup` as a subprocess so the wizard's\n" +
-			"interactive prompts work correctly when stdin is a TTY.",
+			"In-process Go implementation (REN-1408): the wizard reads stdin/stdout\n" +
+			"directly so prompts work correctly when stdin is a TTY.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			bin, err := exec.LookPath(defaultDaemonBinary)
+			path := configPath
+			if path == "" {
+				path = daemonRuntime.DefaultConfigPath()
+			}
+			existing, err := daemonRuntime.LoadConfig(path)
 			if err != nil {
-				return fmt.Errorf("daemon setup wizard is not yet ported to the Go binary — "+
-					"the runtime port is tracked in REN-1408. "+
-					"Until that lands you can configure ~/.rensei/daemon.yaml manually. (PATH lookup err: %w)", err)
+				return fmt.Errorf("read existing config: %w", err)
 			}
-			proc := exec.Command(bin, "setup") //nolint:gosec // intentional subprocess
-			proc.Stdin = os.Stdin
-			proc.Stdout = cmd.OutOrStdout()
-			proc.Stderr = cmd.ErrOrStderr()
-			if err := proc.Run(); err != nil {
-				return fmt.Errorf("rensei-daemon setup: %w", err)
+			cfg, err := daemonRuntime.RunSetupWizard(daemonRuntime.WizardOptions{
+				Existing:   existing,
+				ConfigPath: path,
+				Stdin:      os.Stdin,
+				Stdout:     cmd.OutOrStdout(),
+			})
+			if err != nil {
+				return fmt.Errorf("daemon setup: %w", err)
 			}
+			_ = cfg
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.rensei/daemon.yaml)")
+	return cmd
 }
 
 // ── status ────────────────────────────────────────────────────────────────────

@@ -1,0 +1,115 @@
+package daemon
+
+import (
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestSpawner_AcceptWork_ProjectAllowlist(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "agentfactory", Repository: "github.com/foo/bar"}},
+		MaxConcurrentSessions: 4,
+	})
+	_, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "github.com/foo/bar", Ref: "main"})
+	if err != nil {
+		t.Fatalf("expected accept, got %v", err)
+	}
+	// Wait for the session to exit (stub exits quickly).
+	deadline := time.Now().Add(2 * time.Second)
+	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if s.ActiveCount() != 0 {
+		t.Fatalf("expected sessions to drain, still %d active", s.ActiveCount())
+	}
+}
+
+func TestSpawner_RejectsUnknownProject(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/allowed/repo"}},
+		MaxConcurrentSessions: 1,
+	})
+	_, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "github.com/disallowed/repo"})
+	if err == nil {
+		t.Fatal("expected rejection for non-allowlisted repo")
+	}
+}
+
+func TestSpawner_CapacityEnforced(t *testing.T) {
+	// Use a longer-running stub so we can exceed capacity deterministically.
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 1"},
+	})
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "1", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("first accept: %v", err)
+	}
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "2", Repository: "github.com/a/b"}); err == nil {
+		t.Fatal("expected capacity rejection")
+	}
+}
+
+func TestSpawner_Drain_RespectsTimeout(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+	})
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "long", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	start := time.Now()
+	err := s.Drain(150 * time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error from Drain")
+	}
+	if time.Since(start) > time.Second {
+		t.Errorf("Drain blocked too long: %s", time.Since(start))
+	}
+}
+
+func TestSpawner_PauseResume(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+	})
+	s.Pause()
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "github.com/a/b"}); err == nil {
+		t.Fatal("expected reject while paused")
+	}
+	s.Resume()
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "github.com/a/b"}); err != nil {
+		t.Errorf("expected accept after resume, got %v", err)
+	}
+}
+
+func TestSpawner_EmitsLifecycleEvents(t *testing.T) {
+	var started, ended int32
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+	})
+	s.On(func(ev SessionEvent) {
+		switch ev.Kind {
+		case SessionEventStarted:
+			atomic.AddInt32(&started, 1)
+		case SessionEventEnded:
+			atomic.AddInt32(&ended, 1)
+		}
+	})
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "github.com/a/b"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&ended) == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&started) == 0 {
+		t.Error("expected start event")
+	}
+	if atomic.LoadInt32(&ended) == 0 {
+		t.Error("expected end event")
+	}
+}
