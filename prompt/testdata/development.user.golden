@@ -1,0 +1,23 @@
+Start work on REN2-1.
+
+# Issue context
+
+<issue identifier="REN2-1">
+<title>Wave 6 smoke test — daemon E2E verification</title>
+<description>
+rensei please create a file `hello-from-wave6.md` at the repo root containing a single line with the current ISO-8601 UTC timestamp, then commit and open a PR.
+</description>
+<team name="Rensei Smokes"/>
+<project name="smoke-alpha"/>
+</issue>
+
+# What to do
+
+1. Implement the change described in the issue.
+2. Run the project's test/typecheck/lint commands and fix any regressions you introduce.
+3. Commit on the worktree's branch.
+4. Push the branch (`git push -u origin <branch>`).
+5. Open a pull request (`gh pr create --base main --head <branch>`) targeting the repository at github.com/RenseiAI/rensei-smokes-alpha.
+6. Post the PR link as a comment on REN2-1 via `pnpm af-linear create-comment`.
+
+When finished, exit with a short summary of what you did. Do not delete the worktree.
