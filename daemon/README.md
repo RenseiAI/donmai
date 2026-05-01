@@ -98,8 +98,11 @@ When a session appears wedged in the dashboard:
 
 1. **Daemon log** — `af daemon logs --follow` (default
    `~/.rensei/daemon.log`). Look for the `worker spawner` lines
-   showing `pid=…` and the matching `[worker:<sessionId>]` prefixed
-   stdout/stderr from the spawned child.
+   showing `pid=…` and the matching `[child stdout sessionID=<id>]`
+   (INFO) and `[child stderr sessionID=<id>]` (WARN) records from
+   the spawned `af agent run` worker. Spawn output is wired to slog
+   by default as of v0.5.1 (REN-1463) — earlier daemons drained
+   child stdio silently.
 2. **Session detail** —
    `curl http://127.0.0.1:7734/api/daemon/sessions/<id>` to confirm
    the detail is recorded. A 404 here means the daemon never
@@ -107,9 +110,9 @@ When a session appears wedged in the dashboard:
    the session has already terminated and been cleaned up.
 3. **`af agent run` log** — the worker child writes its own slog
    output to stderr. The daemon's spawner captures both streams
-   under the `[worker:<sessionId>]` prefix; the same lines appear
-   inline in `af daemon logs` and in the platform's session-activity
-   stream.
+   under `[child stdout|stderr sessionID=<id>]`; the same lines
+   appear inline in `af daemon logs` and in the platform's
+   session-activity stream.
 4. **Provider logs** — when the runner reaches step 8 (`spawn
    provider`), the per-provider subprocess is the next layer
    (`claude` JSONL on stdout, `codex` JSON-RPC over stdio). The
