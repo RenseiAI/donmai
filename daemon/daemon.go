@@ -73,6 +73,11 @@ type Daemon struct {
 	poller    *PollService
 	spawner   *WorkerSpawner
 
+	// sessionDetails stores the per-session payload the spawner
+	// hands out to `af agent run` workers via the local control
+	// HTTP API at /api/daemon/sessions/<id>. (REN-1461 / F.2.8.)
+	sessionDetails *sessionDetailStore
+
 	stopOnce sync.Once
 	doneCh   chan struct{}
 }
@@ -92,8 +97,9 @@ func New(opts Options) *Daemon {
 		opts.HTTPPort = DefaultHTTPPort
 	}
 	d := &Daemon{
-		opts:   opts,
-		doneCh: make(chan struct{}),
+		opts:           opts,
+		doneCh:         make(chan struct{}),
+		sessionDetails: newSessionDetailStore(),
 	}
 	d.state.Store(StateStopped)
 	return d
@@ -125,6 +131,14 @@ func (d *Daemon) WorkerID() string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.workerID
+}
+
+// runtimeJWT returns the cached runtime JWT (empty when registration
+// was skipped). Internal helper for poll wiring.
+func (d *Daemon) runtimeJWT() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.jwt
 }
 
 // ActiveSessions returns a snapshot of in-flight session handles.
@@ -209,7 +223,23 @@ func (d *Daemon) Start(ctx context.Context) error {
 		spawnerOpts.BaseEnv["RENSEI_WORKER_ID"] = d.workerID
 	}
 	spawnerOpts.BaseEnv["RENSEI_ORCHESTRATOR_URL"] = cfg.Orchestrator.URL
+	// Default WorkerCommand: spawn `af agent run` from the same
+	// binary as the running daemon process so session lifecycle is
+	// owned in-tree. Operators can override via SpawnerOptions.
+	// (REN-1461 / F.2.8 — daemon wire-up.)
+	if len(spawnerOpts.WorkerCommand) == 0 {
+		if cmd := defaultWorkerCommand(); cmd != nil {
+			spawnerOpts.WorkerCommand = cmd
+		}
+	}
 	d.spawner = NewWorkerSpawner(spawnerOpts)
+	// Cleanup the per-session detail store when sessions end so
+	// stale auth tokens do not linger.
+	d.spawner.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded && d.sessionDetails != nil {
+			d.sessionDetails.Delete(ev.Spec.SessionID)
+		}
+	})
 
 	if regResp != nil {
 		// Heartbeat + poll share an OnReregister implementation so a 401 on
@@ -272,7 +302,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 				},
 				OnWork: func(item PollWorkItem) error {
 					spec := pollItemToSessionSpec(item)
-					if _, err := d.AcceptWork(spec); err != nil {
+					detail := pollItemToSessionDetail(
+						item,
+						cfg.Orchestrator.URL,
+						d.runtimeJWT(),
+						d.WorkerID(),
+					)
+					if _, err := d.AcceptWorkWithDetail(spec, detail); err != nil {
 						return fmt.Errorf("accept work %s: %w", item.SessionID, err)
 					}
 					return nil
@@ -338,13 +374,41 @@ func (d *Daemon) Resume() {
 
 // AcceptWork dispatches a session spec to the spawner.
 func (d *Daemon) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
+	return d.AcceptWorkWithDetail(spec, nil)
+}
+
+// AcceptWorkWithDetail dispatches a session spec to the spawner and
+// records the per-session detail used by the spawned `af agent run`
+// process. Pass nil detail when the caller does not have one (legacy
+// tests); the spawner falls through to env-only inputs.
+//
+// Detail is stored before spawning and removed when the spawner emits
+// the corresponding SessionEventEnded event so stale credentials do
+// not linger in memory.
+func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (*SessionHandle, error) {
 	if d.State() != StateRunning {
 		return nil, fmt.Errorf("daemon is not running (state %q)", d.State())
 	}
 	if d.spawner == nil {
 		return nil, errors.New("spawner not initialised")
 	}
+	if detail != nil && detail.SessionID == "" {
+		detail.SessionID = spec.SessionID
+	}
+	if detail != nil && d.sessionDetails != nil {
+		d.sessionDetails.Set(detail)
+	}
 	return d.spawner.AcceptWork(spec)
+}
+
+// SessionDetail returns the stored per-session detail for the given
+// session id, or (nil, false) if no detail is recorded. Used by the
+// HTTP server's /api/daemon/sessions/<id> handler.
+func (d *Daemon) SessionDetail(sessionID string) (*SessionDetail, bool) {
+	if d.sessionDetails == nil {
+		return nil, false
+	}
+	return d.sessionDetails.Get(sessionID)
 }
 
 // Update triggers a manual auto-update check.

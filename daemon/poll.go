@@ -45,6 +45,25 @@ type PollWorkItem struct {
 	Resources    *SessionResources `json:"resources,omitempty"`
 	QueuedAt     int64             `json:"queuedAt,omitempty"`
 	ProjectScope string            `json:"projectScope,omitempty"`
+
+	// REN-1461 / F.2.8 — enriched fields the platform may send so the
+	// `af agent run` worker has the runner context it needs without
+	// requiring a separate platform fetch. Optional during the rollout
+	// window; absent fields fall through to the default render path.
+	IssueID           string                  `json:"issueId,omitempty"`
+	IssueIdentifier   string                  `json:"issueIdentifier,omitempty"`
+	LinearSessionID   string                  `json:"linearSessionId,omitempty"`
+	ProviderSessionID string                  `json:"providerSessionId,omitempty"`
+	OrganizationID    string                  `json:"organizationId,omitempty"`
+	WorkType          string                  `json:"workType,omitempty"`
+	PromptContext     string                  `json:"promptContext,omitempty"`
+	Body              string                  `json:"body,omitempty"`
+	Title             string                  `json:"title,omitempty"`
+	MentionContext    string                  `json:"mentionContext,omitempty"`
+	ParentContext     string                  `json:"parentContext,omitempty"`
+	Branch            string                  `json:"branch,omitempty"`
+	IssueLockID       string                  `json:"issueLockId,omitempty"`
+	ResolvedProfile   *SessionResolvedProfile `json:"resolvedProfile,omitempty"`
 }
 
 // PollResponse is the body of GET /api/workers/<id>/poll. Only the fields the
@@ -274,5 +293,41 @@ func pollItemToSessionSpec(item PollWorkItem) SessionSpec {
 		Resources:          item.Resources,
 		Env:                item.Env,
 		MaxDurationSeconds: item.MaxDuration,
+	}
+}
+
+// pollItemToSessionDetail constructs the SessionDetail payload `af agent
+// run` will fetch from the daemon's HTTP API for the given poll item.
+// platformURL + authToken + workerID come from the daemon's
+// registration state; the issue-context fields come from the platform-
+// supplied poll item (or are empty when absent during the rollout
+// window).
+func pollItemToSessionDetail(item PollWorkItem, platformURL, authToken, workerID string) *SessionDetail {
+	repo := item.Repository
+	if repo == "" {
+		repo = item.ProjectName
+	}
+	return &SessionDetail{
+		SessionID:         item.SessionID,
+		IssueID:           item.IssueID,
+		IssueIdentifier:   item.IssueIdentifier,
+		LinearSessionID:   item.LinearSessionID,
+		ProviderSessionID: item.ProviderSessionID,
+		ProjectName:       item.ProjectName,
+		OrganizationID:    item.OrganizationID,
+		Repository:        repo,
+		Ref:               item.Ref,
+		WorkType:          item.WorkType,
+		PromptContext:     item.PromptContext,
+		Body:              item.Body,
+		Title:             item.Title,
+		MentionContext:    item.MentionContext,
+		ParentContext:     item.ParentContext,
+		Branch:            item.Branch,
+		ResolvedProfile:   item.ResolvedProfile,
+		WorkerID:          workerID,
+		AuthToken:         authToken,
+		PlatformURL:       platformURL,
+		IssueLockID:       item.IssueLockID,
 	}
 }
