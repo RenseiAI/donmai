@@ -14,3 +14,5 @@ coverage.out
 **/.gocache/
 **/go-build/
 **/.golangci-lint-cache/
+
+dist/
