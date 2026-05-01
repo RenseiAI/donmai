@@ -131,6 +131,83 @@ func TestWriteDaemonYAML_StableYAMLShape(t *testing.T) {
 	}
 }
 
+// TestWriteDaemonYAML_PopulatesProjectID confirms that a project entry written
+// without an explicit ID gets a derived id, satisfying the daemon reader's
+// `projects[i].id is required` validation (REN-1443).
+func TestWriteDaemonYAML_PopulatesProjectID(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	cfg := &DaemonYAML{
+		Projects: []ProjectEntry{
+			{RepoURL: "github.com/foo/bar"},
+			{RepoURL: "https://github.com/foo/baz.git"},
+			{RepoURL: "git@github.com:foo/qux.git"},
+		},
+	}
+	if err := WriteDaemonYAML(path, cfg); err != nil {
+		t.Fatalf("WriteDaemonYAML: %v", err)
+	}
+	loaded, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	wants := []string{"foo-bar", "foo-baz", "foo-qux"}
+	if len(loaded.Projects) != len(wants) {
+		t.Fatalf("Projects = %d, want %d", len(loaded.Projects), len(wants))
+	}
+	for i, want := range wants {
+		if loaded.Projects[i].ID != want {
+			t.Errorf("Projects[%d].ID = %q, want %q", i, loaded.Projects[i].ID, want)
+		}
+	}
+}
+
+// TestWriteDaemonYAML_PreservesExistingProjectID covers the upsert path
+// with an explicit id: the existing id must not be overwritten by the
+// derive-default path.
+func TestWriteDaemonYAML_PreservesExistingProjectID(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	cfg := &DaemonYAML{
+		Projects: []ProjectEntry{
+			{ID: "explicit-id", RepoURL: "github.com/foo/bar"},
+		},
+	}
+	if err := WriteDaemonYAML(path, cfg); err != nil {
+		t.Fatalf("WriteDaemonYAML: %v", err)
+	}
+	loaded, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := loaded.Projects[0].ID; got != "explicit-id" {
+		t.Errorf("Projects[0].ID = %q, want explicit-id", got)
+	}
+}
+
+// TestDeriveProjectID covers the URL-shape heuristic.
+func TestDeriveProjectID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in, want string
+	}{
+		{"github.com/foo/bar", "foo-bar"},
+		{"https://github.com/foo/bar", "foo-bar"},
+		{"https://github.com/foo/bar.git", "foo-bar"},
+		{"git@github.com:foo/bar.git", "foo-bar"},
+		{"BAR", "bar"},
+		{"", "project"},
+		{"https://example.com/My_Repo.Name", "example-com-my-repo-name"},
+	}
+	for _, c := range cases {
+		if got := DeriveProjectID(c.in); got != c.want {
+			t.Errorf("DeriveProjectID(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // TestWriteDaemonYAML_DoesNotDuplicateProjects confirms upserting an existing
 // project rewrites in-place rather than appending.
 func TestWriteDaemonYAML_DoesNotDuplicateProjects(t *testing.T) {

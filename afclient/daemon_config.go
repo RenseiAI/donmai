@@ -12,6 +12,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -73,6 +75,11 @@ type CredentialHelper struct {
 // On read, ProjectEntry tolerates the legacy `repoUrl` key for one cycle
 // (see UnmarshalYAML below) so pre-fix files in the wild still load.
 type ProjectEntry struct {
+	// ID is the daemon-side project identifier. The daemon reader requires
+	// projects[i].id (see daemon/config.go validateConfig); REN-1443
+	// derives it automatically from the repo URL when the caller does not
+	// set one (DeriveProjectID).
+	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// RepoURL is the canonical remote URL, e.g. "github.com/foo/bar".
 	RepoURL string `yaml:"repository" json:"repository"`
 	// CloneStrategy controls how the daemon clones the repo. Default: shallow.
@@ -88,6 +95,7 @@ type ProjectEntry struct {
 // (the next write will use the canonical key automatically).
 func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 	var raw struct {
+		ID               string            `yaml:"id"`
 		Repository       string            `yaml:"repository"`
 		RepoURL          string            `yaml:"repoUrl"`
 		CloneStrategy    CloneStrategy     `yaml:"cloneStrategy,omitempty"`
@@ -96,6 +104,7 @@ func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 	if err := node.Decode(&raw); err != nil {
 		return err
 	}
+	p.ID = raw.ID
 	p.CloneStrategy = raw.CloneStrategy
 	p.CredentialHelper = raw.CredentialHelper
 	switch {
@@ -181,6 +190,16 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config dir %q: %w", dir, err)
+	}
+
+	// Auto-derive ID for any project entry that does not have one. The
+	// daemon reader treats projects[i].id as required; CLI callers (e.g.
+	// `rensei project allow <repo>`) historically left it unset, so the
+	// daemon rejected the resulting file at next read. (REN-1443.)
+	for i := range cfg.Projects {
+		if cfg.Projects[i].ID == "" {
+			cfg.Projects[i].ID = DeriveProjectID(cfg.Projects[i].RepoURL)
+		}
 	}
 
 	data, err := mergeDaemonYAML(path, cfg)
@@ -354,4 +373,56 @@ func (d *DaemonYAML) RemoveProject(repoURL string) bool {
 	}
 	d.Projects = append(d.Projects[:i], d.Projects[i+1:]...)
 	return true
+}
+
+// derivedIDCleanRE matches any character outside [a-z0-9-] for sanitisation.
+var derivedIDCleanRE = regexp.MustCompile(`[^a-z0-9-]`)
+
+// derivedIDRepeatRE collapses runs of "-" produced by the cleanup pass.
+var derivedIDRepeatRE = regexp.MustCompile(`-+`)
+
+// DeriveProjectID returns a stable, daemon-acceptable id derived from a
+// repo URL. The daemon validates that projects[i].id is non-empty; the CLI
+// did not historically write this field, so daemon.yaml files written by
+// `rensei project allow` were rejected at next read with
+// "projects[0].id is required" (REN-1443).
+//
+// Heuristics:
+//   - github.com/foo/bar  → "foo-bar"
+//   - https://github.com/foo/bar.git → "foo-bar"
+//   - git@github.com:foo/bar.git → "foo-bar"
+//   - bare path "bar" → "bar"
+//
+// Output is lowercased, ASCII-safe (a-z0-9-) and trimmed of leading/trailing
+// hyphens. An empty input yields "project".
+func DeriveProjectID(repoURL string) string {
+	s := strings.ToLower(strings.TrimSpace(repoURL))
+	if s == "" {
+		return "project"
+	}
+	// Strip trailing .git
+	s = strings.TrimSuffix(s, ".git")
+	// Convert SSH-style git@host:owner/repo to host/owner/repo.
+	if i := strings.Index(s, "@"); i >= 0 && strings.Contains(s, ":") && !strings.Contains(s, "://") {
+		s = strings.Replace(s[i+1:], ":", "/", 1)
+	}
+	// Strip protocol.
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	// Take the last two path segments (owner/repo) when present.
+	parts := strings.Split(s, "/")
+	if len(parts) >= 2 {
+		s = parts[len(parts)-2] + "-" + parts[len(parts)-1]
+	} else {
+		s = parts[len(parts)-1]
+	}
+	// Sanitise to a-z0-9-
+	s = derivedIDCleanRE.ReplaceAllString(s, "-")
+	s = derivedIDRepeatRE.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if s == "" {
+		return "project"
+	}
+	return s
 }
