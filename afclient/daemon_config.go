@@ -163,15 +163,29 @@ func ReadDaemonYAML(path string) (*DaemonYAML, error) {
 
 // WriteDaemonYAML atomically writes cfg to path (tmp file + rename).
 // The parent directory is created with 0o700 if it does not exist.
+//
+// The writer preserves any unknown top-level keys present in the existing
+// file (e.g. apiVersion, kind, machine, orchestrator, autoUpdate,
+// observability) by parsing the on-disk file as a yaml.Node tree, replacing
+// only the `projects` and `capacity` mappings, and re-marshalling. This is
+// the v0.4.1 follow-up to REN-1419: the previous writer marshalled the
+// minimal DaemonYAML struct directly, which clobbered every key the project
+// command tree did not model. After a single `rensei project allow` the
+// daemon would refuse to load the resulting file (machine.id missing,
+// orchestrator.url missing).
+//
+// If the file does not exist a fresh document is written from cfg. Callers
+// that want a fully-populated daemon.yaml should run the wizard first or
+// hand-author the file before calling this writer.
 func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config dir %q: %w", dir, err)
 	}
 
-	data, err := yaml.Marshal(cfg)
+	data, err := mergeDaemonYAML(path, cfg)
 	if err != nil {
-		return fmt.Errorf("marshal daemon config: %w", err)
+		return fmt.Errorf("merge daemon config: %w", err)
 	}
 
 	// Atomic write: write to a sibling temp file then rename.
@@ -184,6 +198,128 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 		return fmt.Errorf("rename temp config: %w", err)
 	}
 	return nil
+}
+
+// mergeDaemonYAML loads the existing daemon.yaml at path (if present) as a
+// yaml.Node tree, replaces the `projects` and `capacity` keys with the
+// values from cfg, and returns the marshalled result. When the file does
+// not exist the cfg struct is marshalled directly.
+func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
+	existing, readErr := os.ReadFile(path) //nolint:gosec // operator-supplied path
+	if readErr != nil {
+		if !errors.Is(readErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("read existing config %q: %w", path, readErr)
+		}
+		// Fresh file — emit the cfg struct directly. The daemon reader
+		// will reject this if it lacks machine.id / orchestrator.url; the
+		// CLI does not own those fields, so we leave the wizard /
+		// installer to populate them.
+		return yaml.Marshal(cfg)
+	}
+
+	var root yaml.Node
+	if err := yaml.Unmarshal(existing, &root); err != nil {
+		return nil, fmt.Errorf("parse existing config: %w", err)
+	}
+
+	// A document node wraps the top-level mapping; descend to the mapping.
+	doc := &root
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = doc.Content[0]
+	}
+	if doc.Kind != yaml.MappingNode {
+		// File is empty / not a mapping — fall back to fresh emission.
+		return yaml.Marshal(cfg)
+	}
+
+	// Encode the cfg-side keys we own as nodes for splicing.
+	projectsNode, err := encodeYAMLNode(cfg.Projects)
+	if err != nil {
+		return nil, fmt.Errorf("encode projects: %w", err)
+	}
+	capacityNode, err := encodeYAMLNode(cfg.Capacity)
+	if err != nil {
+		return nil, fmt.Errorf("encode capacity: %w", err)
+	}
+
+	upsertMappingKey(doc, "projects", projectsNode)
+	// Capacity is preserved as a partial overlay — only the cfg-modelled
+	// fields (e.g. poolMaxDiskGb) are merged into the existing capacity
+	// mapping. If no capacity key exists yet a new one is added.
+	mergeMappingKey(doc, "capacity", capacityNode)
+
+	out, err := yaml.Marshal(&root)
+	if err != nil {
+		return nil, fmt.Errorf("marshal merged config: %w", err)
+	}
+	return out, nil
+}
+
+// encodeYAMLNode marshals v through yaml.v3 and returns the resulting node
+// tree for splicing into a parent document.
+func encodeYAMLNode(v any) (*yaml.Node, error) {
+	data, err := yaml.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var n yaml.Node
+	if err := yaml.Unmarshal(data, &n); err != nil {
+		return nil, err
+	}
+	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
+		return n.Content[0], nil
+	}
+	return &n, nil
+}
+
+// upsertMappingKey replaces (or appends) the given key in the mapping node
+// with the given value node.
+func upsertMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1] = value
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
+		value,
+	)
+}
+
+// mergeMappingKey merges fields from value into the existing mapping at key.
+// If the key does not exist it is added. If value is empty (no scalar
+// fields) the existing mapping is preserved as-is.
+func mergeMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode || value == nil {
+		return
+	}
+	if value.Kind != yaml.MappingNode || len(value.Content) == 0 {
+		return
+	}
+	// Find existing key.
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			existing := mapping.Content[i+1]
+			if existing.Kind != yaml.MappingNode {
+				mapping.Content[i+1] = value
+				return
+			}
+			// Splice each {k, v} pair from value into existing, replacing on
+			// match.
+			for j := 0; j+1 < len(value.Content); j += 2 {
+				upsertMappingKey(existing, value.Content[j].Value, value.Content[j+1])
+			}
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
+		value,
+	)
 }
 
 // ── project-list helpers ──────────────────────────────────────────────────────
