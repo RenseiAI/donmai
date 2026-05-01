@@ -169,7 +169,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		if token == "" {
 			token = "local-stub-no-token"
 		}
-		regResp, err := Register(ctx, RegistrationOptions{
+		regOpts := RegistrationOptions{
 			OrchestratorURL:   cfg.Orchestrator.URL,
 			RegistrationToken: token,
 			Hostname:          cfg.Machine.ID,
@@ -178,26 +178,44 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Capabilities:      []string{"local", "sandbox", "workarea"},
 			Region:            cfg.Machine.Region,
 			JWTPath:           d.opts.JWTPath,
-		})
+		}
+		regResp, err := Register(ctx, regOpts)
 		if err != nil {
 			return fmt.Errorf("register: %w", err)
 		}
 		d.mu.Lock()
 		d.workerID = regResp.WorkerID
-		d.jwt = regResp.RuntimeJWT
+		d.jwt = regResp.RuntimeToken
 		d.mu.Unlock()
 
-		// Heartbeat
+		// Heartbeat. OnReregister handles runtime-token expiry: the platform
+		// runtime JWT TTL is 1h with no refresh endpoint, so on a 401 (or
+		// the worker falling out of Redis after the 5-min heartbeat TTL —
+		// returned as 404) we re-mint by calling Register() with
+		// ForceReregister=true.
 		d.heartbeat = NewHeartbeatService(HeartbeatOptions{
 			WorkerID:        regResp.WorkerID,
 			Hostname:        cfg.Machine.ID,
 			OrchestratorURL: cfg.Orchestrator.URL,
-			RuntimeJWT:      regResp.RuntimeJWT,
-			IntervalSeconds: regResp.HeartbeatIntervalSeconds,
+			RuntimeJWT:      regResp.RuntimeToken,
+			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
 			GetActiveCount:  func() int { return d.spawnerActiveCount() },
 			GetMaxCount:     func() int { return cfg.Capacity.MaxConcurrentSessions },
 			GetStatus:       d.registrationStatus,
 			Region:          cfg.Machine.Region,
+			OnReregister: func(rctx context.Context) (string, string, error) {
+				ropts := regOpts
+				ropts.ForceReregister = true
+				rr, rerr := Register(rctx, ropts)
+				if rerr != nil {
+					return "", "", rerr
+				}
+				d.mu.Lock()
+				d.workerID = rr.WorkerID
+				d.jwt = rr.RuntimeToken
+				d.mu.Unlock()
+				return rr.WorkerID, rr.RuntimeToken, nil
+			},
 		})
 		d.heartbeat.Start()
 	}

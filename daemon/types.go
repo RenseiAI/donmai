@@ -26,7 +26,12 @@ import "time"
 
 // Version is the daemon binary version. Kept in sync with agentfactory-tui's
 // release tags. Reported in DaemonStatus and in the registration payload.
-const Version = "0.1.0"
+//
+// 0.4.0-dev: in-tree daemon now talks to the real platform endpoints
+// (REN-1422 — POST /api/workers/register + POST /api/workers/<id>/heartbeat
+// with runtime JWT). Replaces the 0.3.10-sidecar bash heartbeat shim that
+// shipped for the 2026-05-01 demo.
+const Version = "0.4.0-dev"
 
 // DefaultHTTPPort is the port the daemon's control HTTP server binds to.
 // Keep in sync with afclient.DefaultDaemonConfig (port 7734).
