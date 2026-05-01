@@ -106,6 +106,39 @@ provider still works, sessions just run without tool plugins.
   `agent.SystemEvent{Subtype: "unhandled_server_request"}` for
   observability.
 
+## Event-channel close protocol (REN-1460)
+
+The events channel on `Handle` has multiple potential closers — the
+forwarder goroutine's defer (terminal event reached), `Stop` (caller-
+initiated teardown), and `failNow` (Provider's onClientClose hook fires
+when the shared app-server stream dies). Closes can race in either
+direction with sends from `emit`, the synthetic `app_server_crashed`
+ErrorEvent, and the forwarder's `context_cancelled` ErrorEvent.
+
+The close protocol enforces:
+
+1. `eventsClosed atomic.Bool` is the single source of truth for "events
+   has been closed".
+2. `closeEvents()` takes `eventsMu.Lock()`, flips `eventsClosed`, then
+   `close(h.events)`. Idempotent under the flag check.
+3. `emit()` takes `eventsMu.RLock()`, returns early when `eventsClosed`
+   is set, otherwise selects on send vs `h.closed` so a slow consumer
+   does not pin shutdown.
+4. `signalClosed()` closes `h.closed` exactly once via a dedicated
+   `closedOnce` (separated from the prior shared `closeOnce` so each
+   path runs its own RPC-side cleanup independently of who wins the
+   close race).
+
+Both `Stop` and `failNow` are safe to call concurrently with each
+other and with the forwarder; whichever runs first owns the user-
+visible close, the others are silent no-ops via the idempotent helpers.
+
+Additionally, `Client.Request` re-checks `pending.ch` before returning
+on its `<-ctx.Done` / `<-timeoutCh` / `<-c.doneCh` cases. Without that
+re-check, a response delivered in the same instant as a client-stop
+broadcast was lost ~50% of the time to Go's random-select tie-break,
+surfacing as a spurious `client stopped` Spawn failure.
+
 ## File layout
 
 | File                  | Responsibility                                    |

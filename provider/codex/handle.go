@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/agentfactory-tui/agent"
@@ -37,11 +38,39 @@ type Handle struct {
 	idMu     sync.RWMutex
 	threadID string
 
-	events    chan agent.Event
-	notifyCh  chan notification
-	closeOnce sync.Once
-	closed    chan struct{}
-	state     *mapperState
+	events   chan agent.Event
+	notifyCh chan notification
+
+	// Close-protocol invariant (REN-1460):
+	//
+	// The events channel has multiple potential senders (the forwarder
+	// goroutine running emit, the failNow path posting an
+	// app_server_crashed ErrorEvent) and multiple potential closers
+	// (forward's defer, Stop, failNow). To avoid "send on closed
+	// channel" panics under concurrent shutdown, every events-channel
+	// access is gated by eventsMu + eventsClosed:
+	//
+	//   - Senders take eventsMu.RLock(), check eventsClosed.Load() and
+	//     drop if true, otherwise select on send vs h.closed so a
+	//     racing closer that has not yet flipped the flag still
+	//     unblocks them.
+	//   - The single closeEvents() helper takes eventsMu.Lock(),
+	//     flips eventsClosed atomically, and closes the channel. It is
+	//     idempotent under the flag check; callers may invoke it from
+	//     forward's defer, Stop, or failNow without coordination.
+	//
+	// h.closed is the lifecycle broadcast: closed exactly once via
+	// closedOnce. It signals "the handle is being torn down" to any
+	// goroutine that might block on a slow send. closeOnce remains for
+	// the per-path cleanup work (RPC unsubscribe, Stop's best-effort
+	// turn/interrupt) that must run exactly once.
+	closeOnce    sync.Once
+	closedOnce   sync.Once
+	closed       chan struct{}
+	eventsMu     sync.RWMutex
+	eventsClosed atomic.Bool
+
+	state *mapperState
 }
 
 // HandleOptions tweaks handle behavior. Used by tests; production code
@@ -112,30 +141,54 @@ func (h *Handle) Stop(ctx context.Context) error {
 			}, h.rpcTimeout)
 			h.client.Unsubscribe(threadID)
 		}
-		close(h.closed)
 	})
+	// Broadcast shutdown + close events; both are idempotent guards
+	// (closedOnce / eventsClosed) so the call is safe even if the
+	// forwarder defer or failNow has already run.
+	h.signalClosed()
+	h.closeEvents()
 	return nil
 }
 
 // failNow marks the handle terminal with an ErrorEvent and closes the
 // events channel. Used by the Provider when the shared app-server
-// crashes.
+// crashes. Safe to call concurrently with Stop / forward; close
+// ordering is enforced by the eventsClosed flag (see emit / closeEvents).
 func (h *Handle) failNow(err error) {
-	h.closeOnce.Do(func() {
-		select {
-		case h.events <- agent.ErrorEvent{
-			Message: fmt.Sprintf("codex provider failure: %s", err.Error()),
-			Code:    "app_server_crashed",
-		}:
-		default:
-		}
-		threadID := h.SessionID()
-		if h.client != nil && threadID != "" {
-			h.client.Unsubscribe(threadID)
-		}
-		close(h.closed)
-		close(h.events)
+	// emit is safe under concurrent close: it short-circuits when
+	// eventsClosed is already set. Posting BEFORE we close lets the
+	// runner observe the failure rather than racing with closure.
+	h.emit(agent.ErrorEvent{
+		Message: fmt.Sprintf("codex provider failure: %s", err.Error()),
+		Code:    "app_server_crashed",
 	})
+	threadID := h.SessionID()
+	if h.client != nil && threadID != "" {
+		h.client.Unsubscribe(threadID)
+	}
+	h.signalClosed()
+	h.closeEvents()
+}
+
+// signalClosed closes h.closed exactly once. h.closed is the
+// "session being torn down" broadcast that unblocks producers stuck on
+// a slow consumer.
+func (h *Handle) signalClosed() {
+	h.closedOnce.Do(func() { close(h.closed) })
+}
+
+// closeEvents closes h.events exactly once. The flag is set FIRST
+// under the write lock so concurrent emit() callers (which hold the
+// read lock + check the flag) cannot race past the check and send to
+// the closed channel.
+func (h *Handle) closeEvents() {
+	h.eventsMu.Lock()
+	defer h.eventsMu.Unlock()
+	if h.eventsClosed.Load() {
+		return
+	}
+	h.eventsClosed.Store(true)
+	close(h.events)
 }
 
 // start performs the JSON-RPC bring-up: optional MCP config push,
@@ -202,15 +255,24 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 //   - ctx is cancelled (we send turn/interrupt + close)
 //   - h.closed is signalled by Stop / failNow
 //   - a terminal ResultEvent / ErrorEvent has been emitted
+//
+// Close protocol (REN-1460): the defer here always runs the cleanup
+// helpers, but each helper is internally idempotent — it is safe for
+// failNow to have already closed events from a parallel goroutine.
+// Without this, a Stop call from inside ctx.Done could leave events
+// open while a concurrent failNow racing through onClientClose would
+// close events under our feet, panicking the next emit.
 func (h *Handle) forward(ctx context.Context) {
-	defer h.closeOnce.Do(func() {
-		threadID := h.SessionID()
-		if h.client != nil && threadID != "" {
-			h.client.Unsubscribe(threadID)
-		}
-		close(h.closed)
-		close(h.events)
-	})
+	defer func() {
+		h.closeOnce.Do(func() {
+			threadID := h.SessionID()
+			if h.client != nil && threadID != "" {
+				h.client.Unsubscribe(threadID)
+			}
+		})
+		h.signalClosed()
+		h.closeEvents()
+	}()
 
 	for {
 		select {
@@ -351,7 +413,20 @@ func (h *Handle) handleServerRequest(n notification) {
 // the channel is full, the event is dropped silently — the runner is
 // expected to keep up; emitting backpressure into the JSON-RPC stream
 // would deadlock the codex side.
+//
+// Close-protocol invariant (REN-1460): emit holds eventsMu.RLock for
+// the duration of the send and aborts early when eventsClosed is set.
+// The matching writer (closeEvents) takes the write lock before
+// flipping the flag and closing the channel, so emit can never observe
+// a closed channel via the send path. The h.closed broadcast is also
+// selected against so a slow send unblocks promptly when shutdown
+// begins, even if the closer has not yet acquired the write lock.
 func (h *Handle) emit(ev agent.Event) {
+	h.eventsMu.RLock()
+	defer h.eventsMu.RUnlock()
+	if h.eventsClosed.Load() {
+		return
+	}
 	select {
 	case h.events <- ev:
 	case <-h.closed:
