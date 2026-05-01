@@ -138,6 +138,26 @@ func TestGenerateUnitFile_RequiresBinPath(t *testing.T) {
 	}
 }
 
+// TestGenerateUnitFile_PathIncludesUserLocalBin asserts the v0.5.1
+// fix: the unit file's Environment=PATH must prepend ~/.local/bin so
+// user-local installs of provider CLIs like `claude` are visible to
+// the daemon. (REN-1462.)
+func TestGenerateUnitFile_PathIncludesUserLocalBin(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	out, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{})
+	if err != nil {
+		t.Fatalf("GenerateUnitFile: %v", err)
+	}
+
+	want := filepath.Join(tmp, ".local", "bin")
+	wantLinePrefix := "Environment=PATH=" + want + ":"
+	if !strings.Contains(out, wantLinePrefix) {
+		t.Errorf("unit file Environment=PATH must start with %q. Got:\n%s", wantLinePrefix, out)
+	}
+}
+
 func TestInstall_WritesUnitFileToTempDir(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)

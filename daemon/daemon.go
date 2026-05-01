@@ -232,6 +232,20 @@ func (d *Daemon) Start(ctx context.Context) error {
 			spawnerOpts.WorkerCommand = cmd
 		}
 	}
+	// Default child stdout/stderr → slog so operators can see what the
+	// spawned `af agent run` is doing without manually attaching a
+	// debugger or rerunning under foreground. v0.5.0 had StdoutPrefixWriter
+	// / StderrPrefixWriter nil by default, which the spawner translated to
+	// drain-and-discard — leaving operators flying blind between
+	// runner.Run() start and a `status=failed` post. Callers that already
+	// supply their own writers via SpawnerOptions retain priority.
+	// (REN-1463 / v0.5.1.)
+	if spawnerOpts.StdoutPrefixWriter == nil {
+		spawnerOpts.StdoutPrefixWriter = newStdoutSlogWriter()
+	}
+	if spawnerOpts.StderrPrefixWriter == nil {
+		spawnerOpts.StderrPrefixWriter = newStderrSlogWriter()
+	}
 	d.spawner = NewWorkerSpawner(spawnerOpts)
 	// Cleanup the per-session detail store when sessions end so
 	// stale auth tokens do not linger.

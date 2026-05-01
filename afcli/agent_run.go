@@ -297,6 +297,15 @@ func fetchSessionDetailOnce(ctx context.Context, client *http.Client, endpoint s
 	return &detail, nil
 }
 
+// providerCtor is a (name, constructor) tuple consumed by
+// [buildRegistryFromCtors]. Pulled out so unit tests can drive the
+// failure-aggregation + zero-providers branches without depending on
+// the real claude / codex / stub probe behaviour.
+type providerCtor struct {
+	name string
+	new  func() (agent.Provider, error)
+}
+
 // buildAgentRunRegistry constructs the runner.Registry for one
 // `af agent run` invocation. Stub is always registered; claude + codex
 // register on best-effort (their probes return errors when the
@@ -310,24 +319,42 @@ func fetchSessionDetailOnce(ctx context.Context, client *http.Client, endpoint s
 // a single registry across daemon-life sessions would force lifecycle
 // coupling we explicitly want to avoid (per F.1.1 §7 + the F.2.8 task
 // guidance).
+//
+// Probe-failure visibility (REN-1462 / v0.5.1): every provider
+// construction or registration failure logs at WARN with the provider
+// name and underlying error so operators can see at a glance which
+// providers are available on this host. If the resulting registry has
+// zero providers, an ERROR-level log fires — that is a fatal
+// misconfiguration and any subsequent runner.Run will fail because
+// no provider can resolve.
 func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
+	return buildRegistryFromCtors(logger, []providerCtor{
+		{name: "stub", new: func() (agent.Provider, error) { return providerstub.New() }},
+		{name: "claude", new: func() (agent.Provider, error) { return providerclaude.New(providerclaude.Options{}) }},
+		{name: "codex", new: func() (agent.Provider, error) { return providercodex.New(providercodex.Options{}) }},
+	})
+}
+
+// buildRegistryFromCtors is the testable core of [buildAgentRunRegistry].
+// It walks the provided ctors, logs WARN per-provider failure, and
+// emits an ERROR record when the resulting registry has zero
+// successful registrations. Returns the (possibly-empty) Registry.
+func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor) *runner.Registry {
 	reg := runner.NewRegistry()
-	if p, err := providerstub.New(); err != nil {
-		logger.Error("af agent run: stub provider construction failed", "err", err)
-	} else if regErr := reg.Register(p); regErr != nil {
-		logger.Error("af agent run: stub provider register failed", "err", regErr)
+	for _, c := range ctors {
+		p, err := c.new()
+		if err != nil {
+			logger.Warn("af agent run: provider probe failed",
+				"provider", c.name, "err", err)
+			continue
+		}
+		if regErr := reg.Register(p); regErr != nil {
+			logger.Warn("af agent run: provider register failed",
+				"provider", c.name, "err", regErr)
+		}
 	}
-	if p, err := providerclaude.New(providerclaude.Options{}); err != nil {
-		logger.Warn("af agent run: claude provider unavailable; skipping registration",
-			"err", err)
-	} else if regErr := reg.Register(p); regErr != nil {
-		logger.Warn("af agent run: claude provider register failed", "err", regErr)
-	}
-	if p, err := providercodex.New(providercodex.Options{}); err != nil {
-		logger.Warn("af agent run: codex provider unavailable; skipping registration",
-			"err", err)
-	} else if regErr := reg.Register(p); regErr != nil {
-		logger.Warn("af agent run: codex provider register failed", "err", regErr)
+	if len(reg.Names()) == 0 {
+		logger.Error("af agent run: no providers available — every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `af doctor`. (REN-1462)")
 	}
 	return reg
 }

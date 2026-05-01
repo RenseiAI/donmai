@@ -242,6 +242,22 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 		lines = append(lines, "Environment=RENSEI_DAEMON_CONFIG="+opts.ConfigPath)
 	}
 
+	// PATH override (REN-1462 / v0.5.1): prepend ~/.local/bin so
+	// user-local installs of provider CLIs like `claude` (default
+	// install location for the upstream curl|sh script) win over any
+	// stale system-scope copy. The home directory resolves at install
+	// time from the invoking user (or SUDO_USER for system scope).
+	if homeDir, herr := installHomeDir(scope); herr == nil && homeDir != "" {
+		lines = append(lines, "Environment=PATH="+strings.Join([]string{
+			filepath.Join(homeDir, ".local", "bin"),
+			"/usr/local/bin",
+			"/usr/bin",
+			"/bin",
+			"/usr/sbin",
+			"/sbin",
+		}, ":"))
+	}
+
 	lines = append(lines,
 		"StandardOutput=journal",
 		"StandardError=journal",
@@ -288,6 +304,23 @@ func currentUsername() (string, error) {
 		return "", fmt.Errorf("systemd: current user: %w", err)
 	}
 	return u.Username, nil
+}
+
+// installHomeDir returns the home directory the unit's PATH should
+// reference. For user scope we use os.UserHomeDir(). For system scope
+// we resolve the SUDO_USER's home (fallback: current user's home) so
+// the unit ends up referencing the invoking user's ~/.local/bin, not
+// /root/.local/bin.
+func installHomeDir(scope Scope) (string, error) {
+	if scope == ScopeUser {
+		return os.UserHomeDir()
+	}
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		if u, err := user.Lookup(sudoUser); err == nil {
+			return u.HomeDir, nil
+		}
+	}
+	return os.UserHomeDir()
 }
 
 // ── Install ──────────────────────────────────────────────────────────────────

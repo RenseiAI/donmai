@@ -218,6 +218,127 @@ func TestBuildAgentRunRegistry_AlwaysHasStub(t *testing.T) {
 	}
 }
 
+// TestBuildRegistryFromCtors_LogsProbeFailures covers REN-1462's
+// per-provider WARN line: a registry built with one of three
+// providers failing must emit exactly one WARN with provider=<name>
+// + err, plus two happy registrations.
+func TestBuildRegistryFromCtors_LogsProbeFailures(t *testing.T) {
+	buf, restoreLogger := captureSlogJSON(t)
+	defer restoreLogger()
+	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	good1 := &fakeProvider{name: agent.ProviderName("alpha")}
+	good2 := &fakeProvider{name: agent.ProviderName("beta")}
+	failErr := errors.New("probe failed: not on PATH")
+
+	reg := buildRegistryFromCtors(logger, []providerCtor{
+		{name: "alpha", new: func() (agent.Provider, error) { return good1, nil }},
+		{name: "broken", new: func() (agent.Provider, error) { return nil, failErr }},
+		{name: "beta", new: func() (agent.Provider, error) { return good2, nil }},
+	})
+
+	if got := len(reg.Names()); got != 2 {
+		t.Errorf("registry size = %d, want 2", got)
+	}
+
+	records := decodeJSONLogs(t, buf)
+	var warns int
+	for _, r := range records {
+		if r.Level == "WARN" && r.Provider == "broken" && strings.Contains(r.Err, "not on PATH") {
+			warns++
+		}
+		if r.Level == "ERROR" {
+			t.Errorf("unexpected ERROR record when 2/3 providers registered: %+v", r)
+		}
+	}
+	if warns != 1 {
+		t.Errorf("WARN count for 'broken' = %d, want 1; records=%+v", warns, records)
+	}
+}
+
+// TestBuildRegistryFromCtors_ZeroProvidersErrors covers the
+// fatal-misconfig path: when every provider fails, an ERROR record
+// must fire so operators see the problem in production logs.
+func TestBuildRegistryFromCtors_ZeroProvidersErrors(t *testing.T) {
+	buf, restoreLogger := captureSlogJSON(t)
+	defer restoreLogger()
+	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	bad := errors.New("probe failed: not on PATH")
+	reg := buildRegistryFromCtors(logger, []providerCtor{
+		{name: "p1", new: func() (agent.Provider, error) { return nil, bad }},
+		{name: "p2", new: func() (agent.Provider, error) { return nil, bad }},
+		{name: "p3", new: func() (agent.Provider, error) { return nil, bad }},
+	})
+
+	if got := len(reg.Names()); got != 0 {
+		t.Errorf("registry size = %d, want 0", got)
+	}
+
+	records := decodeJSONLogs(t, buf)
+	var errors int
+	for _, r := range records {
+		if r.Level == "ERROR" && strings.Contains(r.Msg, "no providers available") {
+			errors++
+		}
+	}
+	if errors != 1 {
+		t.Errorf("ERROR record count = %d, want 1; records=%+v", errors, records)
+	}
+}
+
+// captureSlogJSON returns a buffer and restore func; tests build
+// their own slog.Logger over it so the captured records include the
+// per-provider attributes we want to assert on.
+func captureSlogJSON(t *testing.T) (*bytes.Buffer, func()) {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	prev := slog.Default()
+	return buf, func() { slog.SetDefault(prev) }
+}
+
+type registryLogRecord struct {
+	Level    string `json:"level"`
+	Msg      string `json:"msg"`
+	Provider string `json:"provider"`
+	Err      string `json:"err"`
+}
+
+func decodeJSONLogs(t *testing.T, buf *bytes.Buffer) []registryLogRecord {
+	t.Helper()
+	dec := json.NewDecoder(buf)
+	var out []registryLogRecord
+	for dec.More() {
+		var r registryLogRecord
+		if err := dec.Decode(&r); err != nil {
+			t.Fatalf("decode log: %v", err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// fakeProvider is the smallest agent.Provider implementation needed
+// by the registry tests. None of its non-Name methods are exercised.
+type fakeProvider struct {
+	name agent.ProviderName
+}
+
+func (f *fakeProvider) Name() agent.ProviderName { return f.name }
+func (f *fakeProvider) Capabilities() agent.Capabilities {
+	return agent.Capabilities{}
+}
+
+func (f *fakeProvider) Spawn(_ context.Context, _ agent.Spec) (agent.Handle, error) {
+	return nil, errors.New("fakeProvider.Spawn not implemented")
+}
+
+func (f *fakeProvider) Resume(_ context.Context, _ string, _ agent.Spec) (agent.Handle, error) {
+	return nil, errors.New("fakeProvider.Resume not implemented")
+}
+
+func (f *fakeProvider) Shutdown(_ context.Context) error { return nil }
+
 // TestRunAgentRun_PreflightMissingSessionID asserts a clear preflight
 // error when no session id is passed and RENSEI_SESSION_ID is unset.
 func TestRunAgentRun_PreflightMissingSessionID(t *testing.T) {
