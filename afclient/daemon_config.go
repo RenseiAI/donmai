@@ -12,6 +12,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -73,6 +75,11 @@ type CredentialHelper struct {
 // On read, ProjectEntry tolerates the legacy `repoUrl` key for one cycle
 // (see UnmarshalYAML below) so pre-fix files in the wild still load.
 type ProjectEntry struct {
+	// ID is the daemon-side project identifier. The daemon reader requires
+	// projects[i].id (see daemon/config.go validateConfig); REN-1443
+	// derives it automatically from the repo URL when the caller does not
+	// set one (DeriveProjectID).
+	ID string `yaml:"id,omitempty" json:"id,omitempty"`
 	// RepoURL is the canonical remote URL, e.g. "github.com/foo/bar".
 	RepoURL string `yaml:"repository" json:"repository"`
 	// CloneStrategy controls how the daemon clones the repo. Default: shallow.
@@ -88,6 +95,7 @@ type ProjectEntry struct {
 // (the next write will use the canonical key automatically).
 func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 	var raw struct {
+		ID               string            `yaml:"id"`
 		Repository       string            `yaml:"repository"`
 		RepoURL          string            `yaml:"repoUrl"`
 		CloneStrategy    CloneStrategy     `yaml:"cloneStrategy,omitempty"`
@@ -96,6 +104,7 @@ func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 	if err := node.Decode(&raw); err != nil {
 		return err
 	}
+	p.ID = raw.ID
 	p.CloneStrategy = raw.CloneStrategy
 	p.CredentialHelper = raw.CredentialHelper
 	switch {
@@ -163,15 +172,39 @@ func ReadDaemonYAML(path string) (*DaemonYAML, error) {
 
 // WriteDaemonYAML atomically writes cfg to path (tmp file + rename).
 // The parent directory is created with 0o700 if it does not exist.
+//
+// The writer preserves any unknown top-level keys present in the existing
+// file (e.g. apiVersion, kind, machine, orchestrator, autoUpdate,
+// observability) by parsing the on-disk file as a yaml.Node tree, replacing
+// only the `projects` and `capacity` mappings, and re-marshalling. This is
+// the v0.4.1 follow-up to REN-1419: the previous writer marshalled the
+// minimal DaemonYAML struct directly, which clobbered every key the project
+// command tree did not model. After a single `rensei project allow` the
+// daemon would refuse to load the resulting file (machine.id missing,
+// orchestrator.url missing).
+//
+// If the file does not exist a fresh document is written from cfg. Callers
+// that want a fully-populated daemon.yaml should run the wizard first or
+// hand-author the file before calling this writer.
 func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config dir %q: %w", dir, err)
 	}
 
-	data, err := yaml.Marshal(cfg)
+	// Auto-derive ID for any project entry that does not have one. The
+	// daemon reader treats projects[i].id as required; CLI callers (e.g.
+	// `rensei project allow <repo>`) historically left it unset, so the
+	// daemon rejected the resulting file at next read. (REN-1443.)
+	for i := range cfg.Projects {
+		if cfg.Projects[i].ID == "" {
+			cfg.Projects[i].ID = DeriveProjectID(cfg.Projects[i].RepoURL)
+		}
+	}
+
+	data, err := mergeDaemonYAML(path, cfg)
 	if err != nil {
-		return fmt.Errorf("marshal daemon config: %w", err)
+		return fmt.Errorf("merge daemon config: %w", err)
 	}
 
 	// Atomic write: write to a sibling temp file then rename.
@@ -184,6 +217,128 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 		return fmt.Errorf("rename temp config: %w", err)
 	}
 	return nil
+}
+
+// mergeDaemonYAML loads the existing daemon.yaml at path (if present) as a
+// yaml.Node tree, replaces the `projects` and `capacity` keys with the
+// values from cfg, and returns the marshalled result. When the file does
+// not exist the cfg struct is marshalled directly.
+func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
+	existing, readErr := os.ReadFile(path) //nolint:gosec // operator-supplied path
+	if readErr != nil {
+		if !errors.Is(readErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("read existing config %q: %w", path, readErr)
+		}
+		// Fresh file — emit the cfg struct directly. The daemon reader
+		// will reject this if it lacks machine.id / orchestrator.url; the
+		// CLI does not own those fields, so we leave the wizard /
+		// installer to populate them.
+		return yaml.Marshal(cfg)
+	}
+
+	var root yaml.Node
+	if err := yaml.Unmarshal(existing, &root); err != nil {
+		return nil, fmt.Errorf("parse existing config: %w", err)
+	}
+
+	// A document node wraps the top-level mapping; descend to the mapping.
+	doc := &root
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		doc = doc.Content[0]
+	}
+	if doc.Kind != yaml.MappingNode {
+		// File is empty / not a mapping — fall back to fresh emission.
+		return yaml.Marshal(cfg)
+	}
+
+	// Encode the cfg-side keys we own as nodes for splicing.
+	projectsNode, err := encodeYAMLNode(cfg.Projects)
+	if err != nil {
+		return nil, fmt.Errorf("encode projects: %w", err)
+	}
+	capacityNode, err := encodeYAMLNode(cfg.Capacity)
+	if err != nil {
+		return nil, fmt.Errorf("encode capacity: %w", err)
+	}
+
+	upsertMappingKey(doc, "projects", projectsNode)
+	// Capacity is preserved as a partial overlay — only the cfg-modelled
+	// fields (e.g. poolMaxDiskGb) are merged into the existing capacity
+	// mapping. If no capacity key exists yet a new one is added.
+	mergeMappingKey(doc, "capacity", capacityNode)
+
+	out, err := yaml.Marshal(&root)
+	if err != nil {
+		return nil, fmt.Errorf("marshal merged config: %w", err)
+	}
+	return out, nil
+}
+
+// encodeYAMLNode marshals v through yaml.v3 and returns the resulting node
+// tree for splicing into a parent document.
+func encodeYAMLNode(v any) (*yaml.Node, error) {
+	data, err := yaml.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var n yaml.Node
+	if err := yaml.Unmarshal(data, &n); err != nil {
+		return nil, err
+	}
+	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
+		return n.Content[0], nil
+	}
+	return &n, nil
+}
+
+// upsertMappingKey replaces (or appends) the given key in the mapping node
+// with the given value node.
+func upsertMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1] = value
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
+		value,
+	)
+}
+
+// mergeMappingKey merges fields from value into the existing mapping at key.
+// If the key does not exist it is added. If value is empty (no scalar
+// fields) the existing mapping is preserved as-is.
+func mergeMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode || value == nil {
+		return
+	}
+	if value.Kind != yaml.MappingNode || len(value.Content) == 0 {
+		return
+	}
+	// Find existing key.
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			existing := mapping.Content[i+1]
+			if existing.Kind != yaml.MappingNode {
+				mapping.Content[i+1] = value
+				return
+			}
+			// Splice each {k, v} pair from value into existing, replacing on
+			// match.
+			for j := 0; j+1 < len(value.Content); j += 2 {
+				upsertMappingKey(existing, value.Content[j].Value, value.Content[j+1])
+			}
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
+		value,
+	)
 }
 
 // ── project-list helpers ──────────────────────────────────────────────────────
@@ -218,4 +373,56 @@ func (d *DaemonYAML) RemoveProject(repoURL string) bool {
 	}
 	d.Projects = append(d.Projects[:i], d.Projects[i+1:]...)
 	return true
+}
+
+// derivedIDCleanRE matches any character outside [a-z0-9-] for sanitisation.
+var derivedIDCleanRE = regexp.MustCompile(`[^a-z0-9-]`)
+
+// derivedIDRepeatRE collapses runs of "-" produced by the cleanup pass.
+var derivedIDRepeatRE = regexp.MustCompile(`-+`)
+
+// DeriveProjectID returns a stable, daemon-acceptable id derived from a
+// repo URL. The daemon validates that projects[i].id is non-empty; the CLI
+// did not historically write this field, so daemon.yaml files written by
+// `rensei project allow` were rejected at next read with
+// "projects[0].id is required" (REN-1443).
+//
+// Heuristics:
+//   - github.com/foo/bar  → "foo-bar"
+//   - https://github.com/foo/bar.git → "foo-bar"
+//   - git@github.com:foo/bar.git → "foo-bar"
+//   - bare path "bar" → "bar"
+//
+// Output is lowercased, ASCII-safe (a-z0-9-) and trimmed of leading/trailing
+// hyphens. An empty input yields "project".
+func DeriveProjectID(repoURL string) string {
+	s := strings.ToLower(strings.TrimSpace(repoURL))
+	if s == "" {
+		return "project"
+	}
+	// Strip trailing .git
+	s = strings.TrimSuffix(s, ".git")
+	// Convert SSH-style git@host:owner/repo to host/owner/repo.
+	if i := strings.Index(s, "@"); i >= 0 && strings.Contains(s, ":") && !strings.Contains(s, "://") {
+		s = strings.Replace(s[i+1:], ":", "/", 1)
+	}
+	// Strip protocol.
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	// Take the last two path segments (owner/repo) when present.
+	parts := strings.Split(s, "/")
+	if len(parts) >= 2 {
+		s = parts[len(parts)-2] + "-" + parts[len(parts)-1]
+	} else {
+		s = parts[len(parts)-1]
+	}
+	// Sanitise to a-z0-9-
+	s = derivedIDCleanRE.ReplaceAllString(s, "-")
+	s = derivedIDRepeatRE.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if s == "" {
+		return "project"
+	}
+	return s
 }

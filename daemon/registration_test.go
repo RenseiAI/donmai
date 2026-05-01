@@ -40,6 +40,93 @@ func TestRegister_StubPath_NoToken(t *testing.T) {
 	}
 }
 
+// TestRegister_DefaultsToRealPath covers REN-1444: with NO env var set and a
+// valid rsk_live_* token and an http:// URL, the daemon must take the real
+// path. Previously useStub defaulted to true unless
+// RENSEI_DAEMON_REAL_REGISTRATION was explicitly set; that gate broke
+// daemons that did not source the env in their launchd plist.
+func TestRegister_DefaultsToRealPath(t *testing.T) {
+	t.Setenv("RENSEI_DAEMON_FORCE_STUB", "")
+	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "")
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workerId":          "wkr_default",
+			"runtimeToken":      "tok-default",
+			"heartbeatInterval": 30000,
+			"pollInterval":      5000,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	tok := "rsk_live_" + "abc" //nolint:gosec // synthetic
+	resp, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		Hostname:          "default-host",
+		Version:           "0.4.1-dev",
+		MaxAgents:         2,
+		JWTPath:           jwtPath,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if !called {
+		t.Fatal("expected real endpoint to be hit by default")
+	}
+	if resp.WorkerID != "wkr_default" {
+		t.Errorf("WorkerID = %q", resp.WorkerID)
+	}
+}
+
+// TestRegister_ForceStubOptIn confirms RENSEI_DAEMON_FORCE_STUB still routes
+// to the stub path when explicitly set, even with a real-shaped token.
+func TestRegister_ForceStubOptIn(t *testing.T) {
+	t.Setenv("RENSEI_DAEMON_FORCE_STUB", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("real endpoint should NOT be hit when FORCE_STUB=1")
+	}))
+	t.Cleanup(srv.Close)
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	tok := "rsk_live_" + "abc" //nolint:gosec // synthetic
+	resp, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		Hostname:          "h", Version: "0.4.1-dev", MaxAgents: 1,
+		JWTPath: jwtPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(resp.RuntimeToken, "stub.") {
+		t.Errorf("expected stub token under FORCE_STUB=1, got %q", resp.RuntimeToken)
+	}
+}
+
+// TestRegister_LegacyRealRegistrationZeroForcesStub confirms that the legacy
+// RENSEI_DAEMON_REAL_REGISTRATION=0 still routes to stub for back-compat
+// with any existing test harness that explicitly disabled the real path.
+func TestRegister_LegacyRealRegistrationZeroForcesStub(t *testing.T) {
+	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "0")
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("real endpoint should NOT be hit when REAL_REGISTRATION=0")
+	}))
+	t.Cleanup(srv.Close)
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	tok := "rsk_live_" + "abc" //nolint:gosec // synthetic
+	_, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		Hostname:          "h", Version: "0.4.1-dev", MaxAgents: 1,
+		JWTPath: jwtPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRegister_FileURLForcesStub(t *testing.T) {
 	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
 	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")

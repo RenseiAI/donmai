@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +70,7 @@ type Daemon struct {
 	startedAt time.Time
 
 	heartbeat *HeartbeatService
+	poller    *PollService
 	spawner   *WorkerSpawner
 
 	stopOnce sync.Once
@@ -161,6 +164,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.startedAt = time.Now().UTC()
 	d.mu.Unlock()
 
+	var (
+		regResp *RegisterResponse
+		regOpts RegistrationOptions
+	)
 	if !d.opts.SkipRegistration {
 		token := cfg.Orchestrator.AuthToken
 		if token == "" {
@@ -169,7 +176,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		if token == "" {
 			token = "local-stub-no-token"
 		}
-		regOpts := RegistrationOptions{
+		regOpts = RegistrationOptions{
 			OrchestratorURL:   cfg.Orchestrator.URL,
 			RegistrationToken: token,
 			Hostname:          cfg.Machine.ID,
@@ -179,7 +186,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Region:            cfg.Machine.Region,
 			JWTPath:           d.opts.JWTPath,
 		}
-		regResp, err := Register(ctx, regOpts)
+		var err error
+		regResp, err = Register(ctx, regOpts)
 		if err != nil {
 			return fmt.Errorf("register: %w", err)
 		}
@@ -187,40 +195,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.workerID = regResp.WorkerID
 		d.jwt = regResp.RuntimeToken
 		d.mu.Unlock()
-
-		// Heartbeat. OnReregister handles runtime-token expiry: the platform
-		// runtime JWT TTL is 1h with no refresh endpoint, so on a 401 (or
-		// the worker falling out of Redis after the 5-min heartbeat TTL —
-		// returned as 404) we re-mint by calling Register() with
-		// ForceReregister=true.
-		d.heartbeat = NewHeartbeatService(HeartbeatOptions{
-			WorkerID:        regResp.WorkerID,
-			Hostname:        cfg.Machine.ID,
-			OrchestratorURL: cfg.Orchestrator.URL,
-			RuntimeJWT:      regResp.RuntimeToken,
-			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
-			GetActiveCount:  func() int { return d.spawnerActiveCount() },
-			GetMaxCount:     func() int { return cfg.Capacity.MaxConcurrentSessions },
-			GetStatus:       d.registrationStatus,
-			Region:          cfg.Machine.Region,
-			OnReregister: func(rctx context.Context) (string, string, error) {
-				ropts := regOpts
-				ropts.ForceReregister = true
-				rr, rerr := Register(rctx, ropts)
-				if rerr != nil {
-					return "", "", rerr
-				}
-				d.mu.Lock()
-				d.workerID = rr.WorkerID
-				d.jwt = rr.RuntimeToken
-				d.mu.Unlock()
-				return rr.WorkerID, rr.RuntimeToken, nil
-			},
-		})
-		d.heartbeat.Start()
 	}
 
-	// Spawner
+	// Spawner — built before heartbeat/poll so the poll loop has a target for
+	// AcceptWork dispatch on its very first tick.
 	spawnerOpts := d.opts.SpawnerOptions
 	spawnerOpts.Projects = cfg.Projects
 	spawnerOpts.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
@@ -232,6 +210,78 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 	spawnerOpts.BaseEnv["RENSEI_ORCHESTRATOR_URL"] = cfg.Orchestrator.URL
 	d.spawner = NewWorkerSpawner(spawnerOpts)
+
+	if regResp != nil {
+		// Heartbeat + poll share an OnReregister implementation so a 401 on
+		// either path re-mints the runtime JWT once and refreshes both
+		// services with the new credentials.
+		reregister := func(rctx context.Context) (string, string, error) {
+			ropts := regOpts
+			ropts.ForceReregister = true
+			rr, rerr := Register(rctx, ropts)
+			if rerr != nil {
+				return "", "", rerr
+			}
+			d.mu.Lock()
+			d.workerID = rr.WorkerID
+			d.jwt = rr.RuntimeToken
+			d.mu.Unlock()
+			return rr.WorkerID, rr.RuntimeToken, nil
+		}
+
+		// Heartbeat. OnReregister handles runtime-token expiry: the platform
+		// runtime JWT TTL is 1h with no refresh endpoint, so on a 401 (or the
+		// worker falling out of Redis after the 5-min heartbeat TTL — returned
+		// as 404) we re-mint by calling Register() with ForceReregister=true.
+		d.heartbeat = NewHeartbeatService(HeartbeatOptions{
+			WorkerID:        regResp.WorkerID,
+			Hostname:        cfg.Machine.ID,
+			OrchestratorURL: cfg.Orchestrator.URL,
+			RuntimeJWT:      regResp.RuntimeToken,
+			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
+			GetActiveCount:  func() int { return d.spawnerActiveCount() },
+			GetMaxCount:     func() int { return cfg.Capacity.MaxConcurrentSessions },
+			GetStatus:       d.registrationStatus,
+			Region:          cfg.Machine.Region,
+			OnReregister:    reregister,
+		})
+		d.heartbeat.Start()
+
+		// Poll loop — the binding constraint that makes the daemon actually
+		// receive work. Without this the platform's heartbeat-only sidecar
+		// behaviour holds: the worker shows "active" but never picks up
+		// queued sessions. (REN-v0.4.1.)
+		//
+		// Gated on real registration. Stub registrations have no platform poll
+		// endpoint to call; starting the loop just floods logs with HTTP errors.
+		if !strings.HasPrefix(regResp.RuntimeToken, "stub.") {
+			interval := regResp.PollIntervalSeconds()
+			if interval <= 0 {
+				interval = 5
+			}
+			d.poller = NewPollService(PollOptions{
+				WorkerID:        regResp.WorkerID,
+				OrchestratorURL: cfg.Orchestrator.URL,
+				RuntimeJWT:      regResp.RuntimeToken,
+				IntervalSeconds: interval,
+				LogWarn: func(format string, args ...any) {
+					slog.Warn(fmt.Sprintf(format, args...))
+				},
+				LogInfo: func(format string, args ...any) {
+					slog.Info(fmt.Sprintf(format, args...))
+				},
+				OnWork: func(item PollWorkItem) error {
+					spec := pollItemToSessionSpec(item)
+					if _, err := d.AcceptWork(spec); err != nil {
+						return fmt.Errorf("accept work %s: %w", item.SessionID, err)
+					}
+					return nil
+				},
+				OnReregister: reregister,
+			})
+			d.poller.Start()
+		}
+	}
 
 	d.setState(StateRunning)
 	return nil
@@ -256,6 +306,9 @@ func (d *Daemon) Stop(_ context.Context) error {
 	}
 	if d.heartbeat != nil {
 		d.heartbeat.Stop()
+	}
+	if d.poller != nil {
+		d.poller.Stop()
 	}
 	d.stopOnce.Do(func() { close(d.doneCh) })
 	d.setState(StateStopped)

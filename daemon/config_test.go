@@ -292,6 +292,95 @@ func TestProjectAllowWriter_DaemonReader_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestProjectAllowWriter_PreservesFullConfig_ThenLoadConfigSucceeds is the
+// regression test for the v0.4.1 follow-up to REN-1419 (REN-1442 + REN-1443).
+// Sequence:
+//
+//  1. Wizard / installer writes a full daemon.yaml via daemon.WriteConfig.
+//  2. `rensei project allow <repo>` mutates only the projects[] array via
+//     afclient.WriteDaemonYAML.
+//  3. Daemon restarts and calls daemon.LoadConfig — must succeed (no
+//     "machine.id is required" / "orchestrator.url is required" /
+//     "projects[N].id is required" errors) and the new project must be
+//     present alongside the original one.
+func TestProjectAllowWriter_PreservesFullConfig_ThenLoadConfigSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+
+	// 1. Initial wizard-style write.
+	original := &Config{
+		Machine: MachineConfig{ID: "wizard-host", Region: "lab"},
+		Capacity: CapacityConfig{
+			MaxConcurrentSessions: 4,
+			MaxVCpuPerSession:     2,
+			MaxMemoryMbPerSession: 4096,
+			ReservedForSystem:     ReservedSystemSpec{VCpu: 2, MemoryMb: 4096},
+		},
+		Orchestrator: OrchestratorConfig{ //nolint:gosec // synthetic test token
+			URL:       "https://platform.rensei.dev",
+			AuthToken: "rsk_live_test",
+		},
+		AutoUpdate: AutoUpdateConfig{
+			Channel:             ChannelStable,
+			Schedule:            ScheduleNightly,
+			DrainTimeoutSeconds: 600,
+		},
+		Projects: []ProjectConfig{{
+			ID:         "existing",
+			Repository: "github.com/old/proj",
+		}},
+	}
+	if err := WriteConfig(path, original); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+
+	// 2. CLI-side mutation: `rensei project allow github.com/foo/bar`.
+	cliCfg, err := afclient.ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("ReadDaemonYAML: %v", err)
+	}
+	cliCfg.AddOrUpdateProject(afclient.ProjectEntry{
+		RepoURL:       "github.com/foo/bar",
+		CloneStrategy: afclient.CloneShallow,
+	})
+	if err := afclient.WriteDaemonYAML(path, cliCfg); err != nil {
+		t.Fatalf("WriteDaemonYAML: %v", err)
+	}
+
+	// 3. Daemon reader must still load the full config.
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig after CLI mutation: %v", err)
+	}
+	if loaded.Machine.ID != "wizard-host" {
+		t.Errorf("machine.id = %q (clobbered)", loaded.Machine.ID)
+	}
+	if loaded.Orchestrator.URL != "https://platform.rensei.dev" {
+		t.Errorf("orchestrator.url = %q (clobbered)", loaded.Orchestrator.URL)
+	}
+	if loaded.Orchestrator.AuthToken == "" {
+		t.Error("orchestrator.authToken clobbered")
+	}
+	if loaded.AutoUpdate.DrainTimeoutSeconds != 600 {
+		t.Errorf("autoUpdate.drainTimeoutSeconds = %d", loaded.AutoUpdate.DrainTimeoutSeconds)
+	}
+	if loaded.Capacity.MaxConcurrentSessions != 4 {
+		t.Errorf("capacity.maxConcurrentSessions = %d", loaded.Capacity.MaxConcurrentSessions)
+	}
+	if len(loaded.Projects) != 2 {
+		t.Fatalf("Projects = %d, want 2", len(loaded.Projects))
+	}
+	// Project IDs must be non-empty (writer auto-derives).
+	for i, p := range loaded.Projects {
+		if p.ID == "" {
+			t.Errorf("Projects[%d].ID empty", i)
+		}
+		if p.Repository == "" {
+			t.Errorf("Projects[%d].Repository empty", i)
+		}
+	}
+}
+
 // containsKey reports whether the YAML byte stream contains a top-level
 // mapping key with the given name (it scans the parsed node tree, not raw
 // bytes, so commented-out keys do not count).

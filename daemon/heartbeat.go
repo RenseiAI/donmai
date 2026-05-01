@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -176,9 +175,16 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		h.opts.OnHeartbeat(payload)
 	}
 
-	// Real-endpoint call is gated on the same env switch as registration so
-	// tests / dev runs against file:// or stub paths don't reach prod.
-	if os.Getenv("RENSEI_DAEMON_REAL_REGISTRATION") == "" {
+	// Real-endpoint call is gated on (a) operator-requested stub mode and
+	// (b) whether the runtime JWT is a stub (the stub path returns a token
+	// with the "stub." prefix). REN-1444 inverted the default to real
+	// registration; the JWT-prefix check ensures a daemon configured with
+	// a non-rs[pk]_live token still does not try to call prod with a
+	// stub token.
+	h.mu.Lock()
+	jwt := h.jwt
+	h.mu.Unlock()
+	if stubModeRequested() || strings.HasPrefix(jwt, "stub.") {
 		return
 	}
 	err := h.callEndpoint(ctx, payload)

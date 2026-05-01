@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -56,8 +57,14 @@ func newDaemonRunCmd() *cobra.Command {
 				return fmt.Errorf("daemon start: %w", err)
 			}
 			_, _ = fmt.Fprintf(out, "[daemon] state -> %s\n", d.State())
-			if w := d.WorkerID(); w != "" {
-				_, _ = fmt.Fprintf(out, "[daemon] worker-id %s\n", w)
+			// Print the worker id only after Start() completes registration so
+			// the value is the live, platform-assigned id (or a clearly-marked
+			// stub fallback). REN-1445 — previously the log fired with a stub
+			// WorkerID like "worker-<host>-stub" before any real registration
+			// had a chance to run, misleading operators into thinking the
+			// daemon was registered when it was not.
+			if line := formatStartupWorkerLine(d.WorkerID()); line != "" {
+				_, _ = fmt.Fprintln(out, line)
 			}
 
 			srv := daemon.NewServer(d)
@@ -98,4 +105,18 @@ func newDaemonRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&skipWizard, "skip-wizard", false, "Skip the first-run setup wizard")
 
 	return cmd
+}
+
+// formatStartupWorkerLine returns the post-Start `[daemon] worker-id ...`
+// line, or "" when no worker id has been assigned yet. Stub registrations
+// (worker id ending in `-stub`) are annotated so operators do not mistake
+// them for a successful platform registration. (REN-1445.)
+func formatStartupWorkerLine(workerID string) string {
+	if workerID == "" {
+		return ""
+	}
+	if strings.HasSuffix(workerID, "-stub") {
+		return fmt.Sprintf("[daemon] worker-id %s (stub registration — not registered with platform)", workerID)
+	}
+	return fmt.Sprintf("[daemon] worker-id %s", workerID)
 }

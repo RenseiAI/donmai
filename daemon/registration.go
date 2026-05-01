@@ -187,10 +187,16 @@ func looksLikeRegistrationToken(token string) bool {
 // RegisterResponse. The cache at jwtPath is consulted first unless
 // opts.ForceReregister is set.
 //
-// Stub path is taken when:
-//   - RENSEI_DAEMON_REAL_REGISTRATION env is unset, OR
+// Real-platform registration is the default. The stub path is taken when:
+//   - RENSEI_DAEMON_FORCE_STUB env is set (e.g. =1), OR
 //   - the orchestrator URL is "file://...", OR
 //   - the registration token does not start with rsp_live_ or rsk_live_.
+//
+// REN-1444 (v0.4.1) inverted the env-gate from opt-in to opt-out. The
+// previous default required RENSEI_DAEMON_REAL_REGISTRATION=1 in the
+// launchd plist; with that env unset, a daemon configured with a real
+// rsk_live_* token would silently fall back to stub mode and never
+// register against the platform.
 func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse, error) {
 	if opts.JWTPath == "" {
 		opts.JWTPath = DefaultJWTPath()
@@ -222,7 +228,7 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		Version:  opts.Version,
 	}
 
-	useStub := os.Getenv("RENSEI_DAEMON_REAL_REGISTRATION") == "" ||
+	useStub := stubModeRequested() ||
 		strings.HasPrefix(opts.OrchestratorURL, "file://") ||
 		!looksLikeRegistrationToken(opts.RegistrationToken)
 
@@ -302,6 +308,36 @@ func buildStubResponse(hostname string) *RegisterResponse {
 		HeartbeatInterval: 30000, // ms — same wire shape as platform
 		PollInterval:      10000,
 	}
+}
+
+// stubModeRequested returns true when the operator has explicitly opted into
+// stub registration via RENSEI_DAEMON_FORCE_STUB. The legacy
+// RENSEI_DAEMON_REAL_REGISTRATION env (REN-1422) is also honoured: setting
+// it to "0" / "false" / "off" / "no" forces stub mode for back-compat with
+// existing test harnesses; any other non-empty value is treated as a no-op
+// (real path, the new default).
+//
+// REN-1444 (v0.4.1): real registration is now the default. Previously the
+// daemon required RENSEI_DAEMON_REAL_REGISTRATION=1 in the launchd plist;
+// without it, a fully-configured daemon silently fell back to stub mode.
+func stubModeRequested() bool {
+	if v := os.Getenv("RENSEI_DAEMON_FORCE_STUB"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "off", "no", "":
+			// Explicit opt-out of stub mode; fall through.
+		default:
+			return true
+		}
+	}
+	if v := os.Getenv("RENSEI_DAEMON_REAL_REGISTRATION"); v != "" {
+		// Honour explicit "0" / "false" so the legacy plist export of
+		// =0 still forces stub mode.
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "off", "no":
+			return true
+		}
+	}
+	return false
 }
 
 func makeStubJWT(workerID, hostname string) string {
