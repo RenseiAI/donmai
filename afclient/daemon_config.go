@@ -9,6 +9,7 @@ package afclient
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -61,14 +62,53 @@ type CredentialHelper struct {
 }
 
 // ProjectEntry is one entry in the daemon.yaml `projects` list.
+//
+// The yaml key for the repo URL is `repository`, matching the daemon-side
+// reader (daemon.ProjectConfig). REN-1419 renamed this from `repoUrl` to
+// align writer + reader after a schema-drift bug where the writer emitted
+// `repoUrl` but the reader looked for `repository`, causing
+// `rensei daemon stats` to report `Projects: 0 allowed` after a successful
+// `rensei project allow`. The Go field is still RepoURL for source-compat.
+//
+// On read, ProjectEntry tolerates the legacy `repoUrl` key for one cycle
+// (see UnmarshalYAML below) so pre-fix files in the wild still load.
 type ProjectEntry struct {
 	// RepoURL is the canonical remote URL, e.g. "github.com/foo/bar".
-	RepoURL string `yaml:"repoUrl" json:"repoUrl"`
+	RepoURL string `yaml:"repository" json:"repository"`
 	// CloneStrategy controls how the daemon clones the repo. Default: shallow.
 	CloneStrategy CloneStrategy `yaml:"cloneStrategy,omitempty" json:"cloneStrategy,omitempty"`
 	// CredentialHelper is the credential source for this project.
 	// A nil pointer means no credentials are configured (--no-credentials).
 	CredentialHelper *CredentialHelper `yaml:"credentialHelper,omitempty" json:"credentialHelper,omitempty"`
+}
+
+// UnmarshalYAML accepts either the canonical `repository` key (post-REN-1419)
+// or the legacy `repoUrl` key (pre-REN-1419). When the legacy key is found a
+// one-line warning is logged via slog so operators know to rewrite the file
+// (the next write will use the canonical key automatically).
+func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
+	var raw struct {
+		Repository       string            `yaml:"repository"`
+		RepoURL          string            `yaml:"repoUrl"`
+		CloneStrategy    CloneStrategy     `yaml:"cloneStrategy,omitempty"`
+		CredentialHelper *CredentialHelper `yaml:"credentialHelper,omitempty"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	p.CloneStrategy = raw.CloneStrategy
+	p.CredentialHelper = raw.CredentialHelper
+	switch {
+	case raw.Repository != "":
+		p.RepoURL = raw.Repository
+	case raw.RepoURL != "":
+		p.RepoURL = raw.RepoURL
+		slog.Warn(
+			"daemon.yaml: legacy 'repoUrl' key on project entry; will be rewritten as 'repository' on next write (REN-1419)",
+			"repoUrl", raw.RepoURL,
+		)
+	}
+	return nil
 }
 
 // CapacityConfig holds the configurable capacity limits written into
