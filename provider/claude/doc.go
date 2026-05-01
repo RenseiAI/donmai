@@ -25,18 +25,24 @@
 //
 // # Capability matrix (v0.5.0)
 //
-// Per coordinator decision #1 in F.1.1 §10, this provider ships with
-// SupportsMessageInjection=false and SupportsSessionResume=false.
+// Per coordinator decision #1 in F.1.1 §10 (with F.2.3-cap-flip
+// follow-up REN-1455), this provider ships with
+// SupportsMessageInjection=true (between-turn) and
+// SupportsSessionResume=false.
 //
-//   - SupportsMessageInjection=false: the Claude CLI does not expose
-//     mid-session user-message injection in JSON-stream mode today.
-//     Steering reduces to stop+resume (which is also unavailable in
-//     v0.5.0; see below). Re-enable when a wrapper sidecar lands in F.5.
+//   - SupportsMessageInjection=true: between-turn injection via
+//     `claude --resume <session-id> -p <text>`. Each Inject() call
+//     spawns a fresh resume subprocess and forwards its JSONL stream
+//     onto the parent Handle's events channel. Same semantic level
+//     as the legacy TS Agent SDK. Sequential (one --resume at a
+//     time); see ErrInjectInFlight. Option C upgrade (REN-1451)
+//     replaces the subprocess shell-out with the Anthropic Go SDK
+//     for true mid-turn injection without subprocess overhead.
 //
 //   - SupportsSessionResume=false: while the CLI exposes `--resume
 //     <session-id>`, the v0.5.0 runner does not yet exercise the
-//     resume code path. Flip to true in v0.5.+ once F.5's option C
-//     lands (REN-1451).
+//     resume code path on Provider.Resume. Flip to true in v0.5.+
+//     once F.5's option C lands (REN-1451).
 //
 // All other capabilities follow F.1.1 §3.1: tool plugins (true), no
 // base instructions (false), no permission config (false), code-intel

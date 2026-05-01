@@ -46,22 +46,51 @@ func newProviderForFake(t *testing.T, fakePath string) *Provider {
 	return p
 }
 
+// collect drains events from h until the channel closes OR a brief
+// idle deadline elapses after observing a terminal ResultEvent /
+// ErrorEvent. Post F.2.3-cap-flip the events channel stays open after
+// the parent subprocess EOFs (so Inject() can stream a follow-up
+// turn's events onto it); tests that previously relied on close-on-
+// EOF use this helper to bound their drain.
 func collect(t *testing.T, h agent.Handle) []agent.Event {
 	t.Helper()
 	var got []agent.Event
-	timeout := time.NewTimer(5 * time.Second)
-	defer timeout.Stop()
+	hardTimeout := time.NewTimer(5 * time.Second)
+	defer hardTimeout.Stop()
 	for {
+		var idle <-chan time.Time
+		if seenTerminal(got) {
+			t := time.NewTimer(200 * time.Millisecond)
+			defer t.Stop()
+			idle = t.C
+		}
 		select {
 		case ev, ok := <-h.Events():
 			if !ok {
 				return got
 			}
 			got = append(got, ev)
-		case <-timeout.C:
+		case <-idle:
+			return got
+		case <-hardTimeout.C:
 			t.Fatalf("timed out waiting for events; got %d so far", len(got))
 		}
 	}
+}
+
+// seenTerminal reports whether events ends in a ResultEvent or an
+// ErrorEvent with one of the synthetic terminal codes.
+func seenTerminal(events []agent.Event) bool {
+	if len(events) == 0 {
+		return false
+	}
+	switch ev := events[len(events)-1].(type) {
+	case agent.ResultEvent:
+		return true
+	case agent.ErrorEvent:
+		return ev.Code == "spawn_no_result" || ev.Code == "stdout_scan"
+	}
+	return false
 }
 
 func TestHandle_HappyPath_FakeCLI(t *testing.T) {
@@ -100,27 +129,6 @@ func TestHandle_HappyPath_FakeCLI(t *testing.T) {
 	if h.SessionID() != "sess-fake-1" {
 		t.Errorf("SessionID = %q, want sess-fake-1", h.SessionID())
 	}
-}
-
-func TestHandle_InjectUnsupported(t *testing.T) {
-	t.Parallel()
-
-	cli := fakeCLI(t, `{"type":"system","subtype":"init","session_id":"sx"}
-{"type":"result","subtype":"success","is_error":false,"num_turns":0,"usage":{}}`)
-	p := newProviderForFake(t, cli)
-
-	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "x"})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-	defer func() { _ = h.Stop(t.Context()) }()
-
-	if err := h.Inject(t.Context(), "more please"); err == nil {
-		t.Fatal("Inject should fail with ErrUnsupported")
-	}
-
-	// Drain to allow clean shutdown.
-	_ = collect(t, h)
 }
 
 func TestHandle_StopIdempotent(t *testing.T) {
@@ -195,9 +203,11 @@ func TestHandle_CtxCancel_Stops(t *testing.T) {
 	}
 
 	// Wait for the init event so we know the subprocess started.
+	// Generous deadline because coverage instrumentation + -race
+	// scheduler load can stretch shell-fork startup well beyond 3s.
 	select {
 	case <-h.Events():
-	case <-time.After(3 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("init event never arrived")
 	}
 

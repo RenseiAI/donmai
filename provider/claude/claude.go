@@ -71,19 +71,26 @@ func (*Provider) Name() agent.ProviderName { return agent.ProviderClaude }
 
 // Capabilities returns the v0.5.0 capability matrix.
 //
-// Per F.1.1 §3.1 and locked coordinator decision #1:
+// Per F.1.1 §3.1 and the F.2.3-cap-flip coordinator decision (REN-1455):
 //
-//   - SupportsMessageInjection=false (CLI does not expose mid-session
-//     injection in JSON-stream mode).
-//   - SupportsSessionResume=false (v0.5.0 runner does not exercise
-//     resume; flips to true when option C lands per REN-1451).
+//   - SupportsMessageInjection=true. Implemented by spawning a fresh
+//     `claude --resume <session-id> -p <text>` subprocess between turns
+//     and forwarding its JSONL stream to the parent Handle's events
+//     channel. This is between-turn injection — same semantic level as
+//     the legacy TS Agent SDK and the future Go-native option C upgrade
+//     in REN-1451 (which replaces the subprocess shell-out with the
+//     Anthropic Go SDK + a Go-native agent loop for true mid-turn
+//     injection without subprocess overhead).
+//   - SupportsSessionResume=false. The Provider.Resume entrypoint is
+//     wired but not exercised by the v0.5.0 runner; flips to true when
+//     the resume code path lands (also tracked under REN-1451).
 //
 // All other flags follow the legacy claude-provider.ts capability
 // table verbatim, except SupportsCodeIntelligenceEnforcement which is
 // gated on the canUseTool callback the CLI does not yet expose.
 func (*Provider) Capabilities() agent.Capabilities {
 	return agent.Capabilities{
-		SupportsMessageInjection:            false, // v0.5.0 CLI limitation
+		SupportsMessageInjection:            true,  // between-turn injection via --resume
 		SupportsSessionResume:               false, // v0.5.0 runner limitation
 		SupportsToolPlugins:                 true,
 		NeedsBaseInstructions:               false,

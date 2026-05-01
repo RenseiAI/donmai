@@ -76,9 +76,10 @@ func TestProvider_Capabilities_v0_5_0(t *testing.T) {
 	}
 	caps := p.Capabilities()
 
-	// Locked v0.5.0 capability matrix per F.1.1 §3.1.
-	if caps.SupportsMessageInjection {
-		t.Error("SupportsMessageInjection should be false in v0.5.0 (CLI limitation)")
+	// Locked v0.5.0 capability matrix per F.1.1 §3.1
+	// (post-F.2.3-cap-flip: SupportsMessageInjection flipped to true).
+	if !caps.SupportsMessageInjection {
+		t.Error("SupportsMessageInjection should be true in v0.5.0 (between-turn injection via --resume)")
 	}
 	if caps.SupportsSessionResume {
 		t.Error("SupportsSessionResume should be false in v0.5.0 (option C lands in v0.5.+)")
