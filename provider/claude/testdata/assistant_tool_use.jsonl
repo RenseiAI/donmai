@@ -1,0 +1,1 @@
+{"type":"assistant","message":{"model":"claude-opus-4-7","id":"msg_020","role":"assistant","content":[{"type":"tool_use","id":"toolu_abc","name":"Bash","input":{"command":"ls /tmp"}}]},"session_id":"568bf4dd-3dc8-4750-b7d8-b3b24919c6d2"}

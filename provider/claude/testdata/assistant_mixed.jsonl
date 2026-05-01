@@ -1,0 +1,1 @@
+{"type":"assistant","message":{"model":"claude-opus-4-7","id":"msg_021","role":"assistant","content":[{"type":"text","text":"Running ls."},{"type":"tool_use","id":"toolu_xyz","name":"Bash","input":{"command":"ls"}}]},"session_id":"sess1"}
