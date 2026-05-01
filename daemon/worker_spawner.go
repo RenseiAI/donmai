@@ -173,7 +173,13 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 func (s *WorkerSpawner) findProjectLocked(repository string) *ProjectConfig {
 	for i := range s.opts.Projects {
 		p := &s.opts.Projects[i]
+		// The platform sends spec.Repository as the Linear project slug
+		// (e.g. "smoke-alpha"), which doesn't match the GitHub repo name
+		// in p.Repository (e.g. ".../rensei-smokes-alpha"). Match by p.ID
+		// as well so operators can express the link via the allowlist
+		// entry's id. (REN-NEW)
 		if p.Repository == repository ||
+			p.ID == repository ||
 			strings.HasSuffix(repository, "/"+p.Repository) ||
 			strings.HasSuffix(p.Repository, "/"+repository) {
 			return p

@@ -25,6 +25,32 @@ func TestSpawner_AcceptWork_ProjectAllowlist(t *testing.T) {
 	}
 }
 
+// TestSpawner_AcceptWork_MatchesByProjectID covers the case where the
+// platform passes the Linear project slug as spec.Repository (e.g.
+// "smoke-alpha") and the daemon allowlist entry has the GitHub repo URL
+// in repository (e.g. ".../rensei-smokes-alpha") with the slug in id.
+// The matcher must accept work by p.ID as well as p.Repository. (REN-NEW)
+func TestSpawner_AcceptWork_MatchesByProjectID(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects: []ProjectConfig{{
+			ID:         "smoke-alpha",
+			Repository: "https://github.com/foo/rensei-smokes-alpha",
+		}},
+		MaxConcurrentSessions: 1,
+	})
+	_, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "smoke-alpha", Ref: "main"})
+	if err != nil {
+		t.Fatalf("expected accept by project id (slug), got %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if s.ActiveCount() != 0 {
+		t.Fatalf("expected sessions to drain, still %d active", s.ActiveCount())
+	}
+}
+
 func TestSpawner_RejectsUnknownProject(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/allowed/repo"}},
