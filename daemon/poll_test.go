@@ -98,7 +98,7 @@ func TestPollService_EmptyWorkNoDispatch(t *testing.T) {
 		OrchestratorURL: srv.URL,
 		RuntimeJWT:      "rt",
 		IntervalSeconds: 1,
-		OnWork: func(item PollWorkItem) error {
+		OnWork: func(_ PollWorkItem) error {
 			calls.Add(1)
 			return nil
 		},
@@ -140,7 +140,7 @@ func TestPollService_401TriggersReregister(t *testing.T) {
 		OrchestratorURL: srv.URL,
 		RuntimeJWT:      "stale-jwt",
 		IntervalSeconds: 1,
-		OnWork:          func(item PollWorkItem) error { return nil },
+		OnWork:          func(_ PollWorkItem) error { return nil },
 		OnReregister: func(_ context.Context) (string, string, error) {
 			reregistered.Add(1)
 			doneOnce.Do(func() { close(done) })
@@ -173,7 +173,8 @@ func TestPollService_DaemonIntegration(t *testing.T) {
 		registerHit atomic.Int32
 	)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/workers/register", func(w http.ResponseWriter, r *http.Request) {
+	//nolint:gosec // synthetic test response
+	mux.HandleFunc("/api/workers/register", func(w http.ResponseWriter, _ *http.Request) {
 		registerHit.Add(1)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"workerId":          "wkr_int",
@@ -182,7 +183,7 @@ func TestPollService_DaemonIntegration(t *testing.T) {
 			"pollInterval":      1000,
 		})
 	})
-	mux.HandleFunc("/api/workers/wkr_int/poll", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/workers/wkr_int/poll", func(w http.ResponseWriter, _ *http.Request) {
 		count := hits.Add(1)
 		if count == 1 {
 			_ = json.NewEncoder(w).Encode(PollResponse{Work: []PollWorkItem{{

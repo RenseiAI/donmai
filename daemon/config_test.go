@@ -316,9 +316,9 @@ func TestProjectAllowWriter_PreservesFullConfig_ThenLoadConfigSucceeds(t *testin
 			MaxMemoryMbPerSession: 4096,
 			ReservedForSystem:     ReservedSystemSpec{VCpu: 2, MemoryMb: 4096},
 		},
-		Orchestrator: OrchestratorConfig{
+		Orchestrator: OrchestratorConfig{ //nolint:gosec // synthetic test token
 			URL:       "https://platform.rensei.dev",
-			AuthToken: "rsk_live_test", //nolint:gosec // synthetic
+			AuthToken: "rsk_live_test",
 		},
 		AutoUpdate: AutoUpdateConfig{
 			Channel:             ChannelStable,
