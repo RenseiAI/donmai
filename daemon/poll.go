@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -277,14 +278,69 @@ func isPollAuthFailure(err error) bool {
 	return false
 }
 
-// pollItemToSessionSpec maps a PollWorkItem to a SessionSpec the WorkerSpawner
-// can dispatch. The repository fallback exists because some platform-emitted
-// QueuedWork rows carry projectName as the canonical repo identifier rather
-// than a separate repository field.
-func pollItemToSessionSpec(item PollWorkItem) SessionSpec {
+// resolveProjectFromAllowlist looks up a daemon ProjectConfig by the value
+// the platform sent as the poll-item project identifier (a Linear project
+// slug, the GitHub URL, or a suffix-equivalent of either).
+//
+// The match logic mirrors WorkerSpawner.findProjectLocked (REN-1448) so
+// the SessionDetail.repository the runner sees is the SAME entry the
+// spawner will later validate the SessionSpec against:
+//
+//   - exact match on p.ID (the slug, e.g. "smoke-alpha")
+//   - exact match on p.Repository (the URL)
+//   - URL-suffixes ".../<id>" or ".../<repository>"
+//
+// Returns (nil, false) when the value is empty or no entry matches.
+// (REN-1464 / v0.5.2.)
+func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*ProjectConfig, bool) {
+	if value == "" {
+		return nil, false
+	}
+	for i := range projects {
+		p := &projects[i]
+		if p.ID == value ||
+			p.Repository == value ||
+			strings.HasSuffix(value, "/"+p.Repository) ||
+			strings.HasSuffix(p.Repository, "/"+value) {
+			return p, true
+		}
+	}
+	return nil, false
+}
+
+// pollItemToSessionSpec maps a PollWorkItem to a SessionSpec the
+// WorkerSpawner can dispatch.
+//
+// The platform's QueuedWork wire shape historically carried a
+// projectName slug (e.g. "smoke-alpha") with no separate repository
+// URL. The runner needs a clone target — a slug is not one. When the
+// daemon's project allowlist matches the slug we substitute the URL
+// from p.Repository so `git clone <repo>` actually targets a real URL
+// instead of failing with "fatal: repository 'smoke-alpha' does not
+// exist" (the v0.5.1 failure mode this v0.5.2 hotfix is for —
+// REN-1463 / REN-1464).
+//
+// When no allowlist match exists we fall through to whatever the
+// platform sent (preserving prior behaviour) and emit a Warn log so
+// operators can see the misconfiguration. The downstream
+// WorkerSpawner.findProjectLocked check will reject the spec at
+// AcceptWork time, but the explicit log makes the resolution failure
+// observable immediately at poll dispatch.
+func pollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
 	repo := item.Repository
 	if repo == "" {
 		repo = item.ProjectName
+	}
+	if proj, ok := resolveProjectFromAllowlist(repo, projects); ok {
+		repo = proj.Repository
+	} else if repo != "" {
+		slog.Warn(
+			"daemon poll: no allowlist match for projectName, falling back to as-given repo string (worker will fail clone unless this is a real URL)",
+			"sessionId", item.SessionID,
+			"projectName", item.ProjectName,
+			"repository", item.Repository,
+			"fallback", repo,
+		)
 	}
 	return SessionSpec{
 		SessionID:          item.SessionID,
@@ -302,10 +358,37 @@ func pollItemToSessionSpec(item PollWorkItem) SessionSpec {
 // registration state; the issue-context fields come from the platform-
 // supplied poll item (or are empty when absent during the rollout
 // window).
-func pollItemToSessionDetail(item PollWorkItem, platformURL, authToken, workerID string) *SessionDetail {
+//
+// SessionDetail.Repository is resolved against the daemon's project
+// allowlist using the SAME matcher as the WorkerSpawner (slug, URL, or
+// URL-suffix). The runner uses this URL for `git clone` — a slug
+// passed through unchanged would fail with "fatal: repository '<slug>'
+// does not exist" (REN-1463 / REN-1464). When no match is found we
+// fall back to whatever the platform sent and emit a Warn log so the
+// fallback is visible in operator logs.
+//
+// SessionDetail.ProjectName is also normalised to the canonical
+// allowlist `id` when a match is found, so downstream code that uses
+// the project id (env vars, dashboards) sees a stable value.
+func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string) *SessionDetail {
 	repo := item.Repository
 	if repo == "" {
 		repo = item.ProjectName
+	}
+	projectName := item.ProjectName
+	if proj, ok := resolveProjectFromAllowlist(firstNonEmptyStr(item.ProjectName, item.Repository), projects); ok {
+		repo = proj.Repository
+		if proj.ID != "" {
+			projectName = proj.ID
+		}
+	} else if repo != "" {
+		slog.Warn(
+			"daemon poll: no allowlist match for projectName, falling back to as-given repo string (worker will fail clone unless this is a real URL)",
+			"sessionId", item.SessionID,
+			"projectName", item.ProjectName,
+			"repository", item.Repository,
+			"fallback", repo,
+		)
 	}
 	return &SessionDetail{
 		SessionID:         item.SessionID,
@@ -313,7 +396,7 @@ func pollItemToSessionDetail(item PollWorkItem, platformURL, authToken, workerID
 		IssueIdentifier:   item.IssueIdentifier,
 		LinearSessionID:   item.LinearSessionID,
 		ProviderSessionID: item.ProviderSessionID,
-		ProjectName:       item.ProjectName,
+		ProjectName:       projectName,
 		OrganizationID:    item.OrganizationID,
 		Repository:        repo,
 		Ref:               item.Ref,
@@ -330,4 +413,17 @@ func pollItemToSessionDetail(item PollWorkItem, platformURL, authToken, workerID
 		PlatformURL:       platformURL,
 		IssueLockID:       item.IssueLockID,
 	}
+}
+
+// firstNonEmptyStr returns the first non-empty string from values.
+// Used by the allowlist resolver to prefer projectName (the slug) over
+// the repository field when both are present, matching the platform's
+// canonical wire shape.
+func firstNonEmptyStr(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
