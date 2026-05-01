@@ -161,6 +161,65 @@ func TestPollService_401TriggersReregister(t *testing.T) {
 	}
 }
 
+// TestPollResponse_DecodesLiveWireShape is the regression for the v0.4.1
+// poll-decode bug: the platform's QueuedWork serialises `queuedAt` as a
+// Unix-millisecond NUMBER, not a string. Before the fix this exact body
+// failed with:
+//
+//	json: cannot unmarshal number into Go struct field
+//	PollWorkItem.work.queuedAt of type string
+//
+// The body below mirrors the live payload pulled from the prod Redis key
+// `agent:session:0b5e88d9-32d0-4aca-9f8c-caf82f2b399c` (smoke-alpha,
+// workflow wf_cd531d2bc7b3, daemon wkr_4db299d9483948cf), trimmed to the
+// platform's QueuedWork wire shape (work-queue.ts -> QueuedWork interface).
+// Unknown fields (issueId, issueIdentifier, organizationId, etc.) must be
+// silently ignored by the decoder.
+func TestPollResponse_DecodesLiveWireShape(t *testing.T) {
+	body := []byte(`{
+		"work": [{
+			"sessionId": "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c",
+			"issueId": "08f26531-f5d2-49dc-b412-b42cef0cbffa",
+			"issueIdentifier": "REN2-1",
+			"priority": 4,
+			"queuedAt": 1777658441780,
+			"workType": "research",
+			"projectName": "smoke-alpha",
+			"providerSessionId": "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c"
+		}],
+		"hasInboxMessages": false,
+		"preClaimed": true,
+		"claimedSessionIds": ["0b5e88d9-32d0-4aca-9f8c-caf82f2b399c"]
+	}`)
+
+	var resp PollResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode live wire shape: %v", err)
+	}
+	if len(resp.Work) != 1 {
+		t.Fatalf("Work len = %d, want 1", len(resp.Work))
+	}
+	got := resp.Work[0]
+	if got.SessionID != "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c" {
+		t.Errorf("SessionID = %q", got.SessionID)
+	}
+	if got.QueuedAt != 1777658441780 {
+		t.Errorf("QueuedAt = %d, want 1777658441780", got.QueuedAt)
+	}
+	if got.Priority != 4 {
+		t.Errorf("Priority = %d, want 4", got.Priority)
+	}
+	if got.ProjectName != "smoke-alpha" {
+		t.Errorf("ProjectName = %q", got.ProjectName)
+	}
+	if !resp.PreClaimed {
+		t.Error("PreClaimed = false, want true")
+	}
+	if len(resp.ClaimedSessionIDs) != 1 {
+		t.Fatalf("ClaimedSessionIDs len = %d, want 1", len(resp.ClaimedSessionIDs))
+	}
+}
+
 // TestPollService_DaemonIntegration covers the end-to-end wiring through
 // daemon.Start: a poll-loop tick that returns a work item lands in the
 // spawner's AcceptWork path. Uses a stub spawner command so the spawned

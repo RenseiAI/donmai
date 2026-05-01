@@ -26,6 +26,14 @@ import (
 //
 // QueuedWork carries the session-spec fields the daemon needs to dispatch a
 // session to the spawner. Field names follow the platform wire shape (camelCase).
+//
+// QueuedAt is a Unix-millisecond epoch number on the wire — the platform's
+// QueuedWork interface (packages/agentfactory-server work-queue.ts) defines it
+// as `queuedAt: number`, and the Redis-stored session payload confirms a
+// numeric value (e.g. 1777658441780). v0.4.1 mistakenly typed it as `string`,
+// which caused the daemon's poll loop to fail decoding ("cannot unmarshal
+// number into Go struct field PollWorkItem.work.queuedAt of type string") and
+// silently drop pre-claimed sessions.
 type PollWorkItem struct {
 	SessionID    string            `json:"sessionId"`
 	ProjectName  string            `json:"projectName,omitempty"`
@@ -35,7 +43,7 @@ type PollWorkItem struct {
 	Env          map[string]string `json:"env,omitempty"`
 	MaxDuration  int               `json:"maxDurationSeconds,omitempty"`
 	Resources    *SessionResources `json:"resources,omitempty"`
-	QueuedAt     string            `json:"queuedAt,omitempty"`
+	QueuedAt     int64             `json:"queuedAt,omitempty"`
 	ProjectScope string            `json:"projectScope,omitempty"`
 }
 
