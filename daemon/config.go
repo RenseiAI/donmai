@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,6 +56,39 @@ type ProjectConfig struct {
 	Repository    string        `yaml:"repository"               json:"repository"`
 	CloneStrategy CloneStrategy `yaml:"cloneStrategy,omitempty"  json:"cloneStrategy,omitempty"`
 	Git           *ProjectGit   `yaml:"git,omitempty"            json:"git,omitempty"`
+}
+
+// UnmarshalYAML accepts either the canonical `repository` key or the legacy
+// `repoUrl` key (pre-REN-1419 daemon.yaml files written by older versions of
+// `rensei project allow`). When the legacy key is found a one-line warning
+// is logged so operators know to rewrite the file; this back-compat shim is
+// scheduled for removal one release after the canonical writer ships.
+func (p *ProjectConfig) UnmarshalYAML(node *yaml.Node) error {
+	var raw struct {
+		ID            string        `yaml:"id"`
+		Repository    string        `yaml:"repository"`
+		RepoURL       string        `yaml:"repoUrl"`
+		CloneStrategy CloneStrategy `yaml:"cloneStrategy,omitempty"`
+		Git           *ProjectGit   `yaml:"git,omitempty"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	p.ID = raw.ID
+	p.CloneStrategy = raw.CloneStrategy
+	p.Git = raw.Git
+	switch {
+	case raw.Repository != "":
+		p.Repository = raw.Repository
+	case raw.RepoURL != "":
+		p.Repository = raw.RepoURL
+		slog.Warn(
+			"daemon.yaml: legacy 'repoUrl' key on project entry; will be rewritten as 'repository' on next write (REN-1419)",
+			"id", raw.ID,
+			"repoUrl", raw.RepoURL,
+		)
+	}
+	return nil
 }
 
 // ProjectGit captures per-project credential helper / SSH key hints.
