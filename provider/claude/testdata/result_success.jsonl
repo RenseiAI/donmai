@@ -1,0 +1,1 @@
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1599,"num_turns":1,"result":"Done.","session_id":"sess1","total_cost_usd":0.117,"usage":{"input_tokens":5,"output_tokens":8,"cache_read_input_tokens":16526}}

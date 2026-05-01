@@ -1,0 +1,127 @@
+package claude
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+
+	"github.com/RenseiAI/agentfactory-tui/agent"
+)
+
+// DefaultBinary is the executable name probed on $PATH at construction.
+// Override via Options.Binary for tests or non-standard installs.
+const DefaultBinary = "claude"
+
+// Options configure a Provider. The zero value is valid and probes the
+// system $PATH for the `claude` binary.
+type Options struct {
+	// Binary names the claude CLI executable to invoke. When empty,
+	// DefaultBinary is used. Tests inject a fake-CLI script path here
+	// to drive deterministic JSONL fixtures.
+	Binary string
+
+	// LookPath overrides the binary-resolution function. Defaults to
+	// exec.LookPath. Tests inject a fake to assert probe behavior
+	// without touching the host's PATH.
+	LookPath func(name string) (string, error)
+}
+
+// Provider is the v0.5.0 agent.Provider implementation that shells out
+// to the Claude Code CLI.
+//
+// Constructed via New, which probes for the `claude` binary on PATH
+// and returns agent.ErrProviderUnavailable if missing. Once
+// constructed, the Provider is safe for concurrent use; each Spawn
+// returns an independent Handle backed by its own subprocess.
+type Provider struct {
+	binary string
+}
+
+// New constructs a Provider after probing for the `claude` binary on
+// $PATH (or at the configured Options.Binary path).
+//
+// Returns a non-nil error wrapping agent.ErrProviderUnavailable when
+// the binary is not on PATH; the runner is expected to short-circuit
+// and surface the failure before any worktree provisioning runs.
+//
+// Per F.1.1 §3.1: fail-fast at construction is the contract.
+func New(opts Options) (*Provider, error) {
+	binary := opts.Binary
+	if binary == "" {
+		binary = DefaultBinary
+	}
+	lookup := opts.LookPath
+	if lookup == nil {
+		lookup = exec.LookPath
+	}
+
+	resolved, err := lookup(binary)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"%w: claude CLI %q not on PATH (install: https://docs.claude.com/en/docs/agents/claude-code/cli or `npm i -g @anthropic-ai/claude-code`): %v",
+			agent.ErrProviderUnavailable, binary, err,
+		)
+	}
+
+	return &Provider{binary: resolved}, nil
+}
+
+// Name returns ProviderClaude. Stable for the lifetime of the Provider.
+func (*Provider) Name() agent.ProviderName { return agent.ProviderClaude }
+
+// Capabilities returns the v0.5.0 capability matrix.
+//
+// Per F.1.1 §3.1 and locked coordinator decision #1:
+//
+//   - SupportsMessageInjection=false (CLI does not expose mid-session
+//     injection in JSON-stream mode).
+//   - SupportsSessionResume=false (v0.5.0 runner does not exercise
+//     resume; flips to true when option C lands per REN-1451).
+//
+// All other flags follow the legacy claude-provider.ts capability
+// table verbatim, except SupportsCodeIntelligenceEnforcement which is
+// gated on the canUseTool callback the CLI does not yet expose.
+func (*Provider) Capabilities() agent.Capabilities {
+	return agent.Capabilities{
+		SupportsMessageInjection:            false, // v0.5.0 CLI limitation
+		SupportsSessionResume:               false, // v0.5.0 runner limitation
+		SupportsToolPlugins:                 true,
+		NeedsBaseInstructions:               false,
+		NeedsPermissionConfig:               false,
+		SupportsCodeIntelligenceEnforcement: false, // v0.5.0; flips in F.5 wrapper
+		EmitsSubagentEvents:                 true,
+		SupportsReasoningEffort:             true,
+		ToolPermissionFormat:                "claude",
+		HumanLabel:                          "Claude",
+	}
+}
+
+// Spawn starts a new Claude session.
+//
+// Steps (per F.1.1 §3.1):
+//
+//  1. Write Spec.MCPServers to a per-session JSON tmpfile.
+//  2. Translate Spec into CLI args via buildArgs.
+//  3. exec.CommandContext the resolved claude binary with stream-json
+//     output. Stdin receives the prompt; stdout is parsed as JSONL.
+//  4. Return a Handle whose Events channel emits agent.Event values
+//     mapped from each JSONL line.
+//
+// On any pre-spawn failure (tmpfile write, exec start) the provider
+// returns an error wrapping agent.ErrSpawnFailed and cleans up any
+// half-allocated resources.
+func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	return p.spawn(ctx, spec, "")
+}
+
+// Resume returns agent.ErrUnsupported on v0.5.0 per the locked
+// capability matrix. When the runner gains resume support this method
+// will dispatch to spawn(ctx, spec, sessionID).
+func (*Provider) Resume(_ context.Context, _ string, _ agent.Spec) (agent.Handle, error) {
+	return nil, fmt.Errorf("provider/claude: Resume: %w (SupportsSessionResume=false in v0.5.0; tracked in REN-1451)", agent.ErrUnsupported)
+}
+
+// Shutdown is a no-op for the CLI shell-out provider. Each session is
+// backed by its own subprocess that terminates with the Handle, so
+// the provider holds no long-lived resources to release.
+func (*Provider) Shutdown(_ context.Context) error { return nil }

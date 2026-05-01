@@ -1,0 +1,1 @@
+{"type":"result","subtype":"error_max_turns","is_error":true,"duration_ms":3001,"num_turns":50,"session_id":"sess1","total_cost_usd":1.234,"errors":[{"message":"max turns exceeded"}],"usage":{"input_tokens":1000,"output_tokens":500}}
