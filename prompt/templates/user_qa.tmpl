@@ -1,0 +1,27 @@
+Validate the implementation referenced by {{or .IssueIdentifier "<unidentified issue>"}}.
+
+# Issue context
+
+{{.Context}}
+{{if .ParentContext}}
+# Parent issue context
+
+{{.ParentContext}}
+{{end}}{{if .MentionContext}}
+# Mention context
+
+{{.MentionContext}}
+{{end}}
+# What to do
+
+1. Read the acceptance criteria from the issue description.
+2. Inspect the implementing branch (or open PR) for {{or .IssueIdentifier "the issue"}}.
+3. Run the project's test, typecheck, and lint commands. Capture any failures.
+4. Decide pass or fail strictly against the acceptance criteria.
+5. Post a comment on {{or .IssueIdentifier "the issue"}} via `pnpm af-linear create-comment` summarising what you checked and the verdict.
+6. End your final assistant message with exactly one marker:
+
+   - `WORK_RESULT:passed` when every acceptance criterion is met and tests are green.
+   - `WORK_RESULT:failed` when any criterion is missed or tests regress.
+
+Do not implement code yourself. Do not delete the worktree.

@@ -1,0 +1,18 @@
+Start work on REN-9999.
+
+# Issue context
+
+Issue REN-9999 — Fallback path
+
+No prompt context, just a body.
+
+# What to do
+
+1. Implement the change described in the issue.
+2. Run the project's test/typecheck/lint commands and fix any regressions you introduce.
+3. Commit on the worktree's branch.
+4. Push the branch (`git push -u origin <branch>`).
+5. Open a pull request (`gh pr create --base main --head <branch>`) targeting the repository at github.com/RenseiAI/agentfactory-tui.
+6. Post the PR link as a comment on REN-9999 via `pnpm af-linear create-comment`.
+
+When finished, exit with a short summary of what you did. Do not delete the worktree.

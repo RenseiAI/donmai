@@ -1,0 +1,26 @@
+Research and flesh out story REN2-1.
+
+# Issue context
+
+<issue identifier="REN2-1">
+<title>Wave 6 smoke test — daemon E2E verification</title>
+<description>
+rensei please create a file `hello-from-wave6.md` at the repo root containing a single line with the current ISO-8601 UTC timestamp, then commit and open a PR.
+</description>
+<team name="Rensei Smokes"/>
+<project name="smoke-alpha"/>
+</issue>
+
+# Parent issue context
+
+Tracked under PHASE_F_HANDOFF.md.
+
+# What to do
+
+1. Analyse the requirements; identify the technical approach and scope.
+2. Estimate complexity. Document blast-radius (type/union changes, cross-package imports, API endpoints touched).
+3. Update the issue description via `pnpm af-linear update-issue REN2-1 --description-file <tmp>` with detailed acceptance criteria, a "Technical Context" section, and an "Affected Files" section when applicable.
+4. Do NOT implement code. Focus on story refinement only.
+5. When the description is updated, exit with a short summary.
+
+Do not delete the worktree. Do not push branches or open PRs from a research session.

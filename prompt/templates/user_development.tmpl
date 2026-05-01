@@ -1,0 +1,24 @@
+Start work on {{or .IssueIdentifier "<unidentified issue>"}}.
+
+# Issue context
+
+{{.Context}}
+{{if .ParentContext}}
+# Parent issue context
+
+{{.ParentContext}}
+{{end}}{{if .MentionContext}}
+# Mention context
+
+{{.MentionContext}}
+{{end}}
+# What to do
+
+1. Implement the change described in the issue.
+2. Run the project's test/typecheck/lint commands and fix any regressions you introduce.
+3. Commit on the worktree's branch.
+4. Push the branch (`git push -u origin <branch>`).
+5. Open a pull request (`gh pr create --base {{or .Ref "main"}} --head <branch>`) targeting the repository at {{or .Repository "the configured remote"}}.
+6. Post the PR link as a comment on {{or .IssueIdentifier "the issue"}} via `pnpm af-linear create-comment`.
+
+When finished, exit with a short summary of what you did. Do not delete the worktree.
