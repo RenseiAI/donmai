@@ -29,6 +29,7 @@ func newAgentCmd(ds func() afclient.DataSource, projectFunc func() string) *cobr
 	cmd.AddCommand(newAgentStopCmd(ds))
 	cmd.AddCommand(newAgentChatCmd(ds))
 	cmd.AddCommand(newAgentReconnectCmd(ds))
+	cmd.AddCommand(newAgentRunCmd())
 
 	return cmd
 }

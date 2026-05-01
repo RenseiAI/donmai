@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -191,7 +192,14 @@ func (s *WorkerSpawner) findProjectLocked(repository string) *ProjectConfig {
 func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*SessionHandle, error) {
 	command := s.opts.WorkerCommand
 	if len(command) == 0 {
-		// Stub worker — exits 0 immediately.
+		// Stub worker — exits 0 immediately. Production code paths
+		// should always have WorkerCommand set (see daemon.go's
+		// defaultWorkerCommand). Surfacing this at warn level so
+		// operators notice when the daemon has fallen back to the
+		// test stub. (REN-1461.)
+		slog.Warn("worker spawner: WorkerCommand not set; using /bin/sh test stub (sessions exit immediately — set WorkerCommand or deploy a binary that resolves via os.Executable)",
+			"sessionId", spec.SessionID,
+		)
 		command = []string{"/bin/sh", "-c", `printf 'session-started:%s\n' "$RENSEI_SESSION_ID"; exit 0`}
 	}
 

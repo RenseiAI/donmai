@@ -142,3 +142,23 @@ The AgentFactory coordinator exposes these endpoints:
 **CLI auth:**
 
 - `GET /api/cli/whoami` — Verify API key, return org/project context
+
+## Local daemon control API (127.0.0.1:7734)
+
+The locally-installed `rensei-daemon` exposes an HTTP control API consumed
+by the `af daemon …` CLI surface and by per-session worker children. See
+`daemon/README.md` for the full endpoint reference. Notable post-F.2.8
+endpoints:
+
+- `GET /api/daemon/sessions` — list active session handles
+- `GET /api/daemon/sessions/:id` — per-session detail (issued to spawned
+  `af agent run` workers; localhost-only)
+
+## `af agent run` (F.2.8)
+
+The daemon spawns `af agent run` for every claimed session. The subcommand
+reads its session id from `RENSEI_SESSION_ID` (set by the spawner), fetches
+the full QueuedWork payload from the daemon's local control API, builds a
+runner.Registry with stub + claude + codex (best-effort), and invokes
+`runner.Runner`. Operators rarely invoke this manually; see
+`daemon/README.md`'s operator runbook for debugging tips.

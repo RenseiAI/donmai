@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,6 +104,11 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet, s.handlePoolStats))
 	mux.HandleFunc("/api/daemon/pool/evict", s.method(http.MethodPost, s.handlePoolEvict))
 	mux.HandleFunc("/api/daemon/sessions", s.handleSessions) // GET=list, POST=accept
+	// Per-session detail (REN-1461 / F.2.8). Spawned `af agent run`
+	// processes fetch their full QueuedWork shape from this endpoint.
+	// The path-pattern dispatch is custom because the stdlib mux only
+	// supports prefix matching pre-Go 1.22 in this codebase.
+	mux.HandleFunc("/api/daemon/sessions/", s.handleSessionDetail)
 	mux.HandleFunc("/api/daemon/heartbeat", s.method(http.MethodGet, s.handleHeartbeat))
 	mux.HandleFunc("/api/daemon/doctor", s.method(http.MethodGet, s.handleDoctor))
 	mux.HandleFunc("/healthz", s.method(http.MethodGet, s.handleHealthz))
@@ -297,6 +303,34 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleSessionDetail handles GET /api/daemon/sessions/<id> — the
+// detail endpoint a spawned `af agent run` process reads on startup
+// to recover its full QueuedWork shape. Localhost-only (the daemon
+// binds to 127.0.0.1); 404s on unknown ids; 405s on non-GET methods.
+//
+// (REN-1461 / F.2.8 — daemon wire-up.)
+func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	const prefix = "/api/daemon/sessions/"
+	id := strings.TrimPrefix(r.URL.Path, prefix)
+	if id == "" || strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	detail, ok := s.daemon.SessionDetail(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":     "session not found",
+			"sessionId": id,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 // handleSessions multiplexes GET (list active sessions) and POST (accept work).

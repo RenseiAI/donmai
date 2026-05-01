@@ -408,6 +408,105 @@ func TestServer_PoolStats_UsesProvider(t *testing.T) {
 	}
 }
 
+// TestServer_SessionDetail_HappyPath verifies the
+// /api/daemon/sessions/<id> endpoint returns the SessionDetail
+// recorded by AcceptWorkWithDetail. (REN-1461 / F.2.8.)
+func TestServer_SessionDetail_HappyPath(t *testing.T) {
+	d, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	want := &SessionDetail{
+		SessionID:       "sess-detail-1",
+		IssueIdentifier: "REN-9001",
+		Repository:      "github.com/foo/bar",
+		Ref:             "main",
+		WorkType:        "development",
+		WorkerID:        "wkr_1",
+		AuthToken:       "tok",
+		PlatformURL:     "https://app.example.com",
+		ResolvedProfile: &SessionResolvedProfile{Provider: "stub"},
+	}
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{
+		SessionID:  want.SessionID,
+		Repository: want.Repository,
+		Ref:        want.Ref,
+	}, want); err != nil {
+		t.Fatalf("AcceptWorkWithDetail: %v", err)
+	}
+
+	res, err := http.Get("http://" + srv.Addr() + "/api/daemon/sessions/" + want.SessionID) //nolint:gosec
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("status = %d, body = %s", res.StatusCode, body)
+	}
+	var got SessionDetail
+	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.SessionID != want.SessionID {
+		t.Errorf("SessionID = %q, want %q", got.SessionID, want.SessionID)
+	}
+	if got.IssueIdentifier != want.IssueIdentifier {
+		t.Errorf("IssueIdentifier = %q, want %q", got.IssueIdentifier, want.IssueIdentifier)
+	}
+	if got.AuthToken != want.AuthToken {
+		t.Errorf("AuthToken not threaded through")
+	}
+	if got.ResolvedProfile == nil || got.ResolvedProfile.Provider != "stub" {
+		t.Errorf("ResolvedProfile.Provider = %+v, want stub", got.ResolvedProfile)
+	}
+}
+
+// TestServer_SessionDetail_NotFound verifies the endpoint returns
+// 404 with a JSON body for unknown session ids.
+func TestServer_SessionDetail_NotFound(t *testing.T) {
+	_, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	res, err := http.Get("http://" + srv.Addr() + "/api/daemon/sessions/missing-id") //nolint:gosec
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", res.StatusCode)
+	}
+}
+
+// TestServer_SessionDetail_MethodNotAllowed verifies non-GET requests
+// produce 405.
+func TestServer_SessionDetail_MethodNotAllowed(t *testing.T) {
+	_, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	req, _ := http.NewRequest(http.MethodPost, "http://"+srv.Addr()+"/api/daemon/sessions/x", strings.NewReader("{}"))
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", res.StatusCode)
+	}
+}
+
+// TestServer_SessionDetail_BindsLocalhostOnly is an explicit guard
+// that the daemon's HTTP server has bound 127.0.0.1 (the localhost-
+// only auth model the F.2.8 wire-up depends on). Failing this test
+// means the SessionDetail endpoint exposes worker auth tokens to
+// the network.
+func TestServer_SessionDetail_BindsLocalhostOnly(t *testing.T) {
+	_, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+	if !strings.HasPrefix(srv.Addr(), "127.0.0.1:") {
+		t.Errorf("Addr = %q; expected 127.0.0.1 bind for security", srv.Addr())
+	}
+}
+
 // quick sanity: the server hands back a meaningful 405 for unknown methods.
 func TestServer_HTTPTestServerWrapper(t *testing.T) {
 	d, srv, cleanup := mustStartDaemon(t)
