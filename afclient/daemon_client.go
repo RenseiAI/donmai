@@ -80,6 +80,32 @@ type DaemonStatsResponse struct {
 	ByMachine []MachineStats `json:"byMachine,omitempty"`
 	// Timestamp is the RFC3339 time of this snapshot.
 	Timestamp string `json:"timestamp"`
+
+	// WorkerID is the platform-assigned worker id (or stub fallback). Empty
+	// if registration has not yet completed. (REN-1446.)
+	WorkerID string `json:"workerId,omitempty"`
+	// Registration carries the human-readable registration status and the
+	// timestamp of the most recent successful heartbeat. (REN-1446.)
+	Registration *DaemonRegistrationStats `json:"registration,omitempty"`
+	// AllowedProjects is the list of repositories in the daemon's allowlist
+	// (from daemon.yaml). May be empty when no projects have been
+	// configured. (REN-1446.)
+	AllowedProjects []string `json:"allowedProjects,omitempty"`
+}
+
+// DaemonRegistrationStats summarises the daemon's connection to the platform
+// for `daemon stats` consumers. (REN-1446.)
+type DaemonRegistrationStats struct {
+	// Status is the registration status reported in the most recent
+	// heartbeat: idle / busy / draining / stub / unregistered.
+	Status string `json:"status,omitempty"`
+	// LastHeartbeatAt is the RFC3339 timestamp of the last heartbeat
+	// payload composed by the daemon. Empty when no heartbeat has run.
+	LastHeartbeatAt string `json:"lastHeartbeatAt,omitempty"`
+	// HeartbeatRunning reports whether the heartbeat goroutine is active.
+	HeartbeatRunning bool `json:"heartbeatRunning,omitempty"`
+	// PollRunning reports whether the poll goroutine is active. (REN-1441.)
+	PollRunning bool `json:"pollRunning,omitempty"`
 }
 
 // DaemonActionResponse is the response from action endpoints (pause, resume,

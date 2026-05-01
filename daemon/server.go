@@ -151,9 +151,12 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			ReservedVCpu:          safeReservedVCPU(cfg),
 			ReservedMemoryMb:      safeReservedMem(cfg),
 		},
-		ActiveSessions: countActive(s.daemon),
-		QueueDepth:     0,
-		Timestamp:      time.Now().UTC().Format(time.RFC3339),
+		ActiveSessions:  countActive(s.daemon),
+		QueueDepth:      0,
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		WorkerID:        s.daemon.WorkerID(),
+		Registration:    buildRegistrationStats(s.daemon),
+		AllowedProjects: safeProjectRepos(cfg),
 	}
 	if withPool {
 		stats, err := s.poolStats(r.Context())
@@ -446,4 +449,56 @@ func safeOrchestratorURL(c *Config) string {
 		return ""
 	}
 	return c.Orchestrator.URL
+}
+
+// safeProjectRepos returns the list of repository URLs in the project
+// allowlist for inclusion in DaemonStatsResponse.AllowedProjects. (REN-1446.)
+func safeProjectRepos(c *Config) []string {
+	if c == nil || len(c.Projects) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.Projects))
+	for _, p := range c.Projects {
+		out = append(out, p.Repository)
+	}
+	return out
+}
+
+// buildRegistrationStats summarises the daemon's registration / heartbeat /
+// poll subsystem state for DaemonStatsResponse. Returns nil when no
+// heartbeat has been started (e.g. SkipRegistration mode). (REN-1446.)
+func buildRegistrationStats(d *Daemon) *afclient.DaemonRegistrationStats {
+	stats := &afclient.DaemonRegistrationStats{}
+	if d == nil {
+		return stats
+	}
+	if d.heartbeat != nil {
+		stats.HeartbeatRunning = d.heartbeat.IsRunning()
+		last := d.heartbeat.LastPayload()
+		stats.LastHeartbeatAt = last.SentAt
+		if last.Status != "" {
+			stats.Status = string(last.Status)
+		}
+	}
+	if d.poller != nil {
+		stats.PollRunning = d.poller.IsRunning()
+	}
+	if stats.Status == "" {
+		// Derive a reasonable fallback so consumers always see something.
+		switch d.State() {
+		case StateRunning:
+			if d.WorkerID() == "" {
+				stats.Status = "unregistered"
+			} else {
+				stats.Status = "idle"
+			}
+		case StateDraining:
+			stats.Status = "draining"
+		case StatePaused:
+			stats.Status = "paused"
+		default:
+			stats.Status = string(d.State())
+		}
+	}
+	return stats
 }

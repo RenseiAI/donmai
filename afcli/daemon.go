@@ -715,6 +715,9 @@ func writeDaemonStatsTable(w io.Writer, r *afclient.DaemonStatsResponse) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
 	rows := []struct{ label, value string }{
+		{"Worker:", formatWorkerStat(r)},
+		{"Registration:", formatRegistrationStat(r)},
+		{"Allowed projects:", formatAllowedProjectsStat(r)},
 		{"Active sessions:", fmt.Sprintf("%d / %d", r.ActiveSessions, r.Capacity.MaxConcurrentSessions)},
 		{"Queue depth:", fmt.Sprintf("%d", r.QueueDepth)},
 		{"Max vCPU/session:", fmt.Sprintf("%d", r.Capacity.MaxVCpuPerSession)},
@@ -1153,4 +1156,60 @@ func padRight(s string, w int) string {
 		s += " "
 	}
 	return s
+}
+
+// formatWorkerStat renders the "Worker:" row of `daemon stats`. Returns a
+// short description of the worker id with stub annotation when applicable.
+// (REN-1446.)
+func formatWorkerStat(r *afclient.DaemonStatsResponse) string {
+	if r == nil || r.WorkerID == "" {
+		return "(unregistered)"
+	}
+	if strings.HasSuffix(r.WorkerID, "-stub") {
+		return r.WorkerID + " (stub)"
+	}
+	return r.WorkerID
+}
+
+// formatRegistrationStat renders the "Registration:" row of `daemon stats`.
+// (REN-1446.)
+func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
+	if r == nil || r.Registration == nil {
+		return "(unknown)"
+	}
+	reg := r.Registration
+	parts := []string{}
+	if reg.Status != "" {
+		parts = append(parts, reg.Status)
+	}
+	if reg.HeartbeatRunning {
+		parts = append(parts, "heartbeat=running")
+	} else {
+		parts = append(parts, "heartbeat=stopped")
+	}
+	if reg.PollRunning {
+		parts = append(parts, "poll=running")
+	} else {
+		parts = append(parts, "poll=stopped")
+	}
+	if reg.LastHeartbeatAt != "" {
+		parts = append(parts, "last-heartbeat="+reg.LastHeartbeatAt)
+	}
+	return strings.Join(parts, " · ")
+}
+
+// formatAllowedProjectsStat renders the "Allowed projects:" row of
+// `daemon stats`. The output is the count followed by a comma-separated
+// list of repo URLs (truncated for very long lists). (REN-1446.)
+func formatAllowedProjectsStat(r *afclient.DaemonStatsResponse) string {
+	if r == nil || len(r.AllowedProjects) == 0 {
+		return "0 (none allowed — run `af project allow <repo-url>`)"
+	}
+	const maxShown = 6
+	count := len(r.AllowedProjects)
+	if count <= maxShown {
+		return fmt.Sprintf("%d — %s", count, strings.Join(r.AllowedProjects, ", "))
+	}
+	shown := strings.Join(r.AllowedProjects[:maxShown], ", ")
+	return fmt.Sprintf("%d — %s, … (+%d more)", count, shown, count-maxShown)
 }
