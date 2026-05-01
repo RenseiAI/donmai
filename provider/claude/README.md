@@ -55,7 +55,7 @@ MCP children that inherit stdout.
 
 | Capability | v0.5.0 | Notes |
 |---|---|---|
-| `SupportsMessageInjection` | **false** | CLI does not expose mid-session injection in JSON-stream mode. Steering reduces to stop+resume. |
+| `SupportsMessageInjection` | **true** | Between-turn injection via `--resume`. `Handle.Inject(text)` spawns a fresh `claude --resume <session-id> -p <text>` subprocess and forwards its JSONL stream onto the parent events channel. Same semantic level as the legacy TS Agent SDK. |
 | `SupportsSessionResume` | **false** | Runner doesn't yet exercise resume. CLI flag (`--resume`) is wired in `cli_args.go` for v0.5.+ flip. |
 | `SupportsToolPlugins` | true | MCP stdio servers via `--mcp-config`. |
 | `NeedsBaseInstructions` | false | Codex-only contract field. |
@@ -65,8 +65,42 @@ MCP children that inherit stdout.
 | `SupportsReasoningEffort` | true | `--effort` flag. |
 | `ToolPermissionFormat` | `claude` | `Bash(prefix:glob)` grammar. |
 
-The bolded flags reflect the v0.5.0 CLI shell-out approach. They flip
-to `true` in v0.5.+ once option C lands per **REN-1451**.
+The remaining bolded flags reflect the v0.5.0 CLI shell-out approach.
+They flip to `true` in v0.5.+ once option C lands per **REN-1451**.
+
+### Between-turn injection (`Inject` semantics)
+
+`v0.5.0` ships `SupportsMessageInjection=true` via `--resume`-based
+injection (REN-1455 / F.2.3-cap-flip). Each `Inject(ctx, text)` call:
+
+1. Reads the session id captured from the parent's `system.init`
+   event. Pre-init calls error with `ErrSessionNotReady`.
+2. Acquires the per-Handle inject mutex. Concurrent injects error
+   immediately with `ErrInjectInFlight` — callers must consume events
+   from `Events()` until they observe a terminal `ResultEvent` for
+   the prior inject before calling again.
+3. Spawns `claude --resume <session-id> --output-format stream-json
+   --verbose --dangerously-skip-permissions -p <text>` and streams
+   its JSONL output onto the same `Events()` channel.
+4. Returns when the resume subprocess exits cleanly, or with
+   `ctx.Err` on cancellation.
+
+The events channel close ownership shifted with this flip: the parent
+reader no longer closes on EOF (Inject would have nowhere to send).
+`Stop()` is the sole closer; the spawn ctx's cancellation triggers an
+internal Stop via a watcher goroutine.
+
+### Path to the option C upgrade (REN-1451)
+
+The `--resume` mechanism is between-turn — same level as the legacy
+TS Agent SDK in v0.5.0. Option C replaces the subprocess shell-out
+with the Anthropic Go SDK + a Go-native agent loop, enabling true
+mid-turn injection and lower per-turn overhead. When option C lands:
+
+- Replace `Inject`'s subprocess spawn with the Go SDK's stream-input
+  channel.
+- Flip `SupportsSessionResume` to `true` and wire `Provider.Resume`.
+- Capability semantics stay the same; observable behavior improves.
 
 ## MCP server attachment
 
@@ -176,16 +210,6 @@ Test inventory (per cardinal rule 10):
 - `integration_test.go` — gated on `-tags=integration` AND `claude`
   binary on PATH; runs a no-op `--max-turns 1` smoke against the
   real CLI. Skipped in CI by default to avoid token spend.
-
-## Path to the option C upgrade (REN-1451)
-
-When option C lands (Anthropic CLI grows mid-session injection +
-runner exercises resume), flip the two capability flags to `true` in
-`claude.go::Provider.Capabilities`, replace `Inject`'s
-`ErrUnsupported` with the real CLI write path, and replace
-`Resume`'s `ErrUnsupported` with `return p.spawn(ctx, spec,
-sessionID)`. The `--resume <id>` flag wiring in `cli_args.go` is
-already in place. No other code path changes.
 
 ## Legacy TS reference
 
