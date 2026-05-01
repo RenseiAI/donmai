@@ -238,6 +238,25 @@ func (c *Client) Request(ctx context.Context, method string, params map[string]a
 		timeoutCh = t.C
 	}
 
+	// On termination paths (ctx cancel, timeout, client close) we still
+	// re-check pending.ch before returning the failure. dispatchResponse
+	// races readLoop's exit: a response can be delivered to pending.ch
+	// in the same instant that c.doneCh closes, and an unguarded select
+	// would pick the doneCh case 50% of the time and lose a perfectly
+	// good reply, surfacing as a spurious "client stopped" error
+	// (REN-1460 follow-up).
+	checkResp := func() (json.RawMessage, error, bool) {
+		select {
+		case resp := <-pending.ch:
+			if resp.Error != nil {
+				return nil, &RPCError{Method: method, Code: resp.Error.Code, Message: resp.Error.Message}, true
+			}
+			return resp.Result, nil, true
+		default:
+			return nil, nil, false
+		}
+	}
+
 	select {
 	case resp := <-pending.ch:
 		if resp.Error != nil {
@@ -245,10 +264,19 @@ func (c *Client) Request(ctx context.Context, method string, params map[string]a
 		}
 		return resp.Result, nil
 	case <-ctx.Done():
+		if res, err, ok := checkResp(); ok {
+			return res, err
+		}
 		return nil, ctx.Err()
 	case <-timeoutCh:
+		if res, err, ok := checkResp(); ok {
+			return res, err
+		}
 		return nil, fmt.Errorf("codex jsonrpc: request %s timed out after %s", method, timeout)
 	case <-c.doneCh:
+		if res, err, ok := checkResp(); ok {
+			return res, err
+		}
 		err := c.closeErr
 		if err == nil {
 			err = errors.New("codex jsonrpc: client closed")
@@ -379,8 +407,15 @@ func (c *Client) CloseErr() error {
 
 // readLoop reads JSON-RPC messages from r line-by-line and dispatches
 // them. Exits when r returns EOF or a hard error.
+//
+// Termination protocol (REN-1460): the scanner error is captured into
+// a local and passed to Stop as the cause, NOT written to c.closeErr
+// directly. Stop's closeOnce serializes the closeErr write with
+// CloseErr / Request readers via doneCh's happens-before, so this is
+// the only safe path to set the field.
 func (c *Client) readLoop() {
-	defer c.Stop(nil)
+	var loopErr error
+	defer func() { c.Stop(loopErr) }()
 
 	scanner := bufio.NewScanner(c.r)
 	// Codex notifications can be large (full diff payloads, MCP tool
@@ -411,7 +446,7 @@ func (c *Client) readLoop() {
 	}
 
 	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
-		c.closeErr = fmt.Errorf("codex jsonrpc: read loop: %w", err)
+		loopErr = fmt.Errorf("codex jsonrpc: read loop: %w", err)
 	}
 }
 

@@ -421,6 +421,195 @@ func TestHandle_StopIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestHandle_EventChannelCloseRace_REN1460 is the regression test for
+// REN-1460: prior to the close-protocol fix, the events channel had
+// multiple potential closers (failNow via onClientClose, forward's
+// defer, Stop) and multiple senders (emit / forward) with no shared
+// guard. Under -race -count=N, a forward goroutine could be in the
+// middle of emit() at line 223 (the ctx.Done error event) while a
+// concurrent failNow had already closed h.events, panicking with
+// "send on closed channel".
+//
+// This test reproduces the exact race shape: spawn a handle that is
+// actively forwarding notifications, then concurrently fire ctx
+// cancellation and Provider.Shutdown so emit() and failNow() race on
+// the same Handle. With the fix in place, eventsClosed + eventsMu
+// serialize the close vs send and the test passes cleanly under
+// -race -count=10.
+func TestHandle_EventChannelCloseRace_REN1460(t *testing.T) {
+	t.Parallel()
+	const handleCount = 8
+
+	for i := 0; i < handleCount; i++ {
+		fs, stdinW, stdoutR := newFakeServer()
+		threadID := "thread-RACE"
+
+		// Server: drive a slow trickle of notifications so the
+		// forwarder is reliably mid-emit when shutdown fires.
+		go func() {
+			defer fs.close()
+			dec := json.NewDecoder(fs.stdin)
+			emitted := false
+			for {
+				var msg map[string]any
+				if err := dec.Decode(&msg); err != nil {
+					return
+				}
+				method, _ := msg["method"].(string)
+				idRaw, hasID := msg["id"]
+				switch {
+				case method == "initialize" && hasID:
+					fs.replyOK(t, idRaw)
+				case method == "thread/start" && hasID:
+					fs.write(t, map[string]any{
+						"jsonrpc": "2.0", "id": idRaw,
+						"result": map[string]any{"thread": map[string]any{"id": threadID}},
+					})
+				case method == "turn/start" && hasID:
+					fs.replyOK(t, idRaw)
+					if !emitted {
+						emitted = true
+						// Stream a burst of small notifications so
+						// the forwarder is reliably executing emit
+						// when Provider.Shutdown lands.
+						for n := 0; n < 32; n++ {
+							fs.write(t, map[string]any{
+								"jsonrpc": "2.0",
+								"method":  "item/agentMessage/delta",
+								"params":  map[string]any{"threadId": threadID, "delta": "x"},
+							})
+						}
+					}
+				case hasID:
+					fs.replyOK(t, idRaw)
+				}
+			}
+		}()
+
+		p, err := New(Options{
+			skipProcess:    true,
+			stdinOverride:  stdinW,
+			stdoutOverride: stdoutR,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		h, err := p.Spawn(ctx, agent.Spec{Prompt: "stress", Cwd: "/tmp/wt", Autonomous: true})
+		if err != nil {
+			cancel()
+			_ = p.Shutdown(context.Background())
+			t.Fatalf("Spawn: %v", err)
+		}
+
+		// Drain a few events to ensure the forwarder is up and
+		// running, then race ctx cancel against Provider.Shutdown.
+		// Both paths attempt to close the events channel; without
+		// the fix, one would panic emit() in the other.
+		var drained int
+	drainLoop:
+		for drained < 4 {
+			select {
+			case _, ok := <-h.Events():
+				if !ok {
+					break drainLoop
+				}
+				drained++
+			case <-time.After(2 * time.Second):
+				break drainLoop
+			}
+		}
+
+		// Fire ctx cancel and Shutdown concurrently. Per REN-1460
+		// these are the two close paths (forward's ctx.Done emit +
+		// failNow via onClientClose) that previously raced.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			cancel()
+		}()
+		go func() {
+			defer wg.Done()
+			_ = p.Shutdown(context.Background())
+		}()
+		wg.Wait()
+
+		// Drain remaining events to completion. The events channel
+		// MUST close (ok=false). If it does not, forward leaked.
+		closed := false
+		for !closed {
+			select {
+			case _, ok := <-h.Events():
+				if !ok {
+					closed = true
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("iteration %d: events channel did not close after Shutdown+cancel", i)
+			}
+		}
+	}
+}
+
+// TestHandle_FailNowAndStopRaceClosingEvents stresses the failNow vs
+// Stop race directly without the fakeServer overhead. Both paths used
+// to share closeOnce and could leave the events channel half-closed
+// (h.closed closed but h.events not, or vice versa) depending on which
+// goroutine won the closeOnce. After REN-1460 they share the
+// idempotent closeEvents + signalClosed helpers and converge cleanly.
+func TestHandle_FailNowAndStopRaceClosingEvents(t *testing.T) {
+	t.Parallel()
+	for i := 0; i < 256; i++ {
+		// Construct a Handle directly — no Provider, no client. The
+		// race is purely between Stop() and failNow() over the same
+		// events / closed channels.
+		h := newHandle(nil, nil, agent.Spec{}, HandleOptions{})
+
+		var wg sync.WaitGroup
+		wg.Add(3)
+		// Goroutine 1: spam emit() to hit the closed-channel send
+		// window.
+		go func() {
+			defer wg.Done()
+			for k := 0; k < 64; k++ {
+				h.emit(agent.SystemEvent{Subtype: "stress", Message: "x"})
+			}
+		}()
+		// Goroutine 2: Stop the handle.
+		go func() {
+			defer wg.Done()
+			_ = h.Stop(context.Background())
+		}()
+		// Goroutine 3: failNow the handle.
+		go func() {
+			defer wg.Done()
+			h.failNow(errors.New("synthetic crash"))
+		}()
+		wg.Wait()
+
+		// Both close paths must converge on the same terminal state:
+		// h.closed is closed, h.events is closed. Reading from a
+		// closed buffered channel drains values then returns ok=false.
+		drainCount := 0
+		for {
+			_, ok := <-h.events
+			if !ok {
+				break
+			}
+			drainCount++
+			if drainCount > 1024 {
+				t.Fatalf("iteration %d: events channel did not close after Stop+failNow", i)
+			}
+		}
+		select {
+		case <-h.closed:
+		default:
+			t.Fatalf("iteration %d: h.closed was not closed after Stop+failNow", i)
+		}
+	}
+}
+
 func drainEvents(t *testing.T, ch <-chan agent.Event, timeout time.Duration) []agent.Event {
 	t.Helper()
 	timer := time.NewTimer(timeout)
