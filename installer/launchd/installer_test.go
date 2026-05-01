@@ -341,6 +341,42 @@ func TestResolveHostBinPath_ExplicitOverride(t *testing.T) {
 	}
 }
 
+// TestGeneratePlist_PathIncludesUserLocalBin asserts the v0.5.1 fix:
+// the plist's EnvironmentVariables.PATH must prepend ~/.local/bin so
+// user-local installs of provider CLIs like `claude` are visible to
+// the daemon. (REN-1462.)
+func TestGeneratePlist_PathIncludesUserLocalBin(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	out, err := GeneratePlist("/usr/local/bin/af", "/tmp/o.log", "/tmp/e.log")
+	if err != nil {
+		t.Fatalf("GeneratePlist: %v", err)
+	}
+
+	wantSegment := filepath.Join(tmp, ".local", "bin")
+	if !strings.Contains(out, wantSegment) {
+		t.Errorf("plist PATH missing %q\n--- plist ---\n%s", wantSegment, out)
+	}
+	// Order matters: ~/.local/bin must come first so a user-scope
+	// install wins over a stale system-scope copy.
+	pathLineIdx := strings.Index(out, "<key>PATH</key>")
+	if pathLineIdx < 0 {
+		t.Fatalf("plist missing <key>PATH</key>\n%s", out)
+	}
+	rest := out[pathLineIdx:]
+	stringStart := strings.Index(rest, "<string>")
+	stringEnd := strings.Index(rest, "</string>")
+	if stringStart < 0 || stringEnd < 0 || stringStart >= stringEnd {
+		t.Fatalf("plist PATH value missing or malformed:\n%s", rest[:200])
+	}
+	pathVal := rest[stringStart+len("<string>") : stringEnd]
+	parts := strings.Split(pathVal, ":")
+	if len(parts) == 0 || parts[0] != wantSegment {
+		t.Errorf("first PATH segment = %q, want %q (full=%q)", parts[0], wantSegment, pathVal)
+	}
+}
+
 func TestPlistPath_HomeDependence(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)

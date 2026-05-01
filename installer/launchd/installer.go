@@ -201,8 +201,15 @@ func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
 		return "", fmt.Errorf("launchd: resolve home dir: %w", err)
 	}
 
-	// Build a sensible PATH covering Homebrew on Apple Silicon and Intel.
+	// Build a sensible PATH covering ~/.local/bin (REN-1462: user-local
+	// installs of provider CLIs like `claude` land here when installed
+	// via the upstream curl|sh script), Homebrew on Apple Silicon and
+	// Intel, then the system bins. Prepending ~/.local/bin keeps the
+	// user-scope install winning over a stale system-scope copy, which
+	// matters because `claude` self-updates only the path it was
+	// invoked from.
 	pathEnv := strings.Join([]string{
+		filepath.Join(home, ".local", "bin"),
 		"/opt/homebrew/bin",
 		"/usr/local/bin",
 		"/usr/bin",
