@@ -315,9 +315,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 					slog.Info(fmt.Sprintf(format, args...))
 				},
 				OnWork: func(item PollWorkItem) error {
-					spec := pollItemToSessionSpec(item)
+					spec := pollItemToSessionSpec(item, cfg.Projects)
 					detail := pollItemToSessionDetail(
 						item,
+						cfg.Projects,
 						cfg.Orchestrator.URL,
 						d.runtimeJWT(),
 						d.WorkerID(),

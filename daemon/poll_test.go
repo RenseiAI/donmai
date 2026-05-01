@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -304,5 +306,208 @@ func TestPollService_DaemonIntegration(t *testing.T) {
 	}
 	if registerHit.Load() < 1 {
 		t.Errorf("register endpoint never hit; got %d", registerHit.Load())
+	}
+}
+
+// withCapturedSlog redirects slog's default logger to an in-memory buffer
+// for the duration of the test, returning the buffer and a restore func.
+func withCapturedSlog(t *testing.T) (*bytes.Buffer, func()) {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return buf, func() { slog.SetDefault(prev) }
+}
+
+// TestPollItemToSessionDetail_ResolvesProjectNameToRepoURL is the v0.5.2
+// regression test: when the platform sends projectName="smoke-alpha"
+// (the Linear project slug, with no repository field on the wire — see
+// the live Redis payload in TestPollResponse_DecodesLiveWireShape) and
+// the daemon's allowlist has a matching entry, SessionDetail.repository
+// MUST be the entry's GitHub URL so `git clone` succeeds. Before this
+// fix the runner received "smoke-alpha" and failed with
+// "fatal: repository 'smoke-alpha' does not exist" (REN-1463 / REN-1464).
+func TestPollItemToSessionDetail_ResolvesProjectNameToRepoURL(t *testing.T) {
+	projects := []ProjectConfig{{
+		ID:         "smoke-alpha",
+		Repository: "https://github.com/RenseiAI/rensei-smokes-alpha",
+	}}
+	item := PollWorkItem{
+		SessionID:   "sess-1",
+		ProjectName: "smoke-alpha",
+	}
+
+	detail := pollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
+
+	if got, want := detail.Repository, "https://github.com/RenseiAI/rensei-smokes-alpha"; got != want {
+		t.Errorf("Repository = %q, want %q", got, want)
+	}
+	if got, want := detail.ProjectName, "smoke-alpha"; got != want {
+		t.Errorf("ProjectName = %q, want %q", got, want)
+	}
+	if detail.SessionID != "sess-1" {
+		t.Errorf("SessionID = %q", detail.SessionID)
+	}
+	if detail.PlatformURL != "https://platform.example" {
+		t.Errorf("PlatformURL = %q", detail.PlatformURL)
+	}
+	if detail.AuthToken != "tok" {
+		t.Errorf("AuthToken = %q", detail.AuthToken)
+	}
+	if detail.WorkerID != "wkr-1" {
+		t.Errorf("WorkerID = %q", detail.WorkerID)
+	}
+}
+
+// TestPollItemToSessionDetail_FallsBackOnNoAllowlistMatch verifies the
+// non-match path: the SessionDetail.repository is whatever was on the
+// wire, and a Warn log is emitted so operators see the fallback.
+func TestPollItemToSessionDetail_FallsBackOnNoAllowlistMatch(t *testing.T) {
+	buf, restore := withCapturedSlog(t)
+	defer restore()
+
+	projects := []ProjectConfig{{
+		ID:         "smoke-alpha",
+		Repository: "https://github.com/RenseiAI/rensei-smokes-alpha",
+	}}
+	item := PollWorkItem{
+		SessionID:   "sess-2",
+		ProjectName: "smoke-charlie", // not in allowlist
+	}
+
+	detail := pollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
+
+	if got, want := detail.Repository, "smoke-charlie"; got != want {
+		t.Errorf("Repository = %q, want %q (fallback to projectName)", got, want)
+	}
+	if got, want := detail.ProjectName, "smoke-charlie"; got != want {
+		t.Errorf("ProjectName = %q, want %q", got, want)
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "no allowlist match") {
+		t.Errorf("expected Warn log containing 'no allowlist match'; got: %s", logs)
+	}
+	if !strings.Contains(logs, "smoke-charlie") {
+		t.Errorf("expected log to mention the unmatched projectName; got: %s", logs)
+	}
+}
+
+// TestPollItemToSessionDetail_EmptyProjectName confirms that when no
+// project context is on the wire the helper returns an empty
+// repository field (no resolve attempted, no log emitted).
+func TestPollItemToSessionDetail_EmptyProjectName(t *testing.T) {
+	buf, restore := withCapturedSlog(t)
+	defer restore()
+
+	projects := []ProjectConfig{{
+		ID:         "smoke-alpha",
+		Repository: "https://github.com/RenseiAI/rensei-smokes-alpha",
+	}}
+	item := PollWorkItem{SessionID: "sess-3"}
+
+	detail := pollItemToSessionDetail(item, projects, "", "", "")
+
+	if detail.Repository != "" {
+		t.Errorf("Repository = %q, want empty", detail.Repository)
+	}
+	if detail.ProjectName != "" {
+		t.Errorf("ProjectName = %q, want empty", detail.ProjectName)
+	}
+	if got := buf.String(); strings.Contains(got, "no allowlist match") {
+		t.Errorf("Warn log should not fire on empty projectName; got: %s", got)
+	}
+}
+
+// TestPollItemToSessionDetail_RepositoryURLOnWireMatchesAllowlist
+// covers the rare case where the platform already sent the canonical
+// URL on the wire (forward-compat). The allowlist match still
+// succeeds and the canonical URL is preserved.
+func TestPollItemToSessionDetail_RepositoryURLOnWireMatchesAllowlist(t *testing.T) {
+	projects := []ProjectConfig{{
+		ID:         "smoke-alpha",
+		Repository: "https://github.com/RenseiAI/rensei-smokes-alpha",
+	}}
+	item := PollWorkItem{
+		SessionID:   "sess-4",
+		ProjectName: "smoke-alpha",
+		Repository:  "https://github.com/RenseiAI/rensei-smokes-alpha",
+	}
+
+	detail := pollItemToSessionDetail(item, projects, "", "", "")
+
+	if got, want := detail.Repository, "https://github.com/RenseiAI/rensei-smokes-alpha"; got != want {
+		t.Errorf("Repository = %q, want %q", got, want)
+	}
+	if got, want := detail.ProjectName, "smoke-alpha"; got != want {
+		t.Errorf("ProjectName = %q, want %q", got, want)
+	}
+}
+
+// TestPollItemToSessionSpec_ResolvesProjectName mirrors the
+// SessionDetail test for the SessionSpec path so the spawner sees the
+// resolved URL too. (Spec is what the WorkerSpawner.findProjectLocked
+// matcher consumes.)
+func TestPollItemToSessionSpec_ResolvesProjectName(t *testing.T) {
+	projects := []ProjectConfig{{
+		ID:         "smoke-alpha",
+		Repository: "https://github.com/RenseiAI/rensei-smokes-alpha",
+	}}
+	item := PollWorkItem{
+		SessionID:   "sess-5",
+		ProjectName: "smoke-alpha",
+		Ref:         "main",
+	}
+
+	spec := pollItemToSessionSpec(item, projects)
+
+	if got, want := spec.Repository, "https://github.com/RenseiAI/rensei-smokes-alpha"; got != want {
+		t.Errorf("Repository = %q, want %q", got, want)
+	}
+	if spec.SessionID != "sess-5" {
+		t.Errorf("SessionID = %q", spec.SessionID)
+	}
+	if spec.Ref != "main" {
+		t.Errorf("Ref = %q", spec.Ref)
+	}
+}
+
+// TestResolveProjectFromAllowlist exercises the matcher's four match
+// modes (slug, URL, URL-suffix-of-id, URL-suffix-of-repo) directly so
+// future regressions in the lookup logic are caught with a small,
+// readable failure rather than via the larger pollItemToSession*
+// integration tests.
+func TestResolveProjectFromAllowlist(t *testing.T) {
+	projects := []ProjectConfig{
+		{ID: "smoke-alpha", Repository: "https://github.com/RenseiAI/rensei-smokes-alpha"},
+		{ID: "smoke-beta", Repository: "git@github.com:RenseiAI/rensei-smokes-beta.git"},
+	}
+
+	cases := []struct {
+		name   string
+		value  string
+		wantID string
+	}{
+		{"match by slug", "smoke-alpha", "smoke-alpha"},
+		{"match by URL", "https://github.com/RenseiAI/rensei-smokes-alpha", "smoke-alpha"},
+		{"second entry by slug", "smoke-beta", "smoke-beta"},
+		{"empty value", "", ""},
+		{"unknown slug", "smoke-zeta", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ok := resolveProjectFromAllowlist(tc.value, projects)
+			if tc.wantID == "" {
+				if ok {
+					t.Errorf("expected no match; got %+v", p)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("expected match for %q", tc.value)
+			}
+			if p.ID != tc.wantID {
+				t.Errorf("matched id = %q, want %q", p.ID, tc.wantID)
+			}
+		})
 	}
 }
