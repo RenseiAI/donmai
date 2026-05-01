@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -33,37 +34,78 @@ type RegistrationOptions struct {
 	Now func() time.Time
 }
 
-// RegisterRequest is the body sent on POST /v1/daemon/register.
+// RegisterRequest is the JSON body sent on POST /api/workers/register.
+//
+// The platform contract (see platform/src/app/api/workers/register/route.ts):
+//
+//	{ hostname: string, capacity: number, version?: string, projects?: string[] }
+//
+// The registration token is sent in the Authorization: Bearer header, NOT in
+// the body. Status / region / capabilities / activeAgentCount are not part of
+// the platform contract — they live in the heartbeat payload, or are inferred
+// from the project's Linear tracker bindings on the server side.
 type RegisterRequest struct {
-	Hostname          string             `json:"hostname"`
-	Version           string             `json:"version"`
-	MaxAgents         int                `json:"maxAgents"`
-	Capabilities      []string           `json:"capabilities"`
-	ActiveAgentCount  int                `json:"activeAgentCount"`
-	Status            RegistrationStatus `json:"status"`
-	Region            string             `json:"region,omitempty"`
-	RegistrationToken string             `json:"registrationToken,omitempty"`
+	Hostname string   `json:"hostname"`
+	Capacity int      `json:"capacity"`
+	Version  string   `json:"version,omitempty"`
+	Projects []string `json:"projects,omitempty"`
 }
 
-// RegisterResponse is the response from POST /v1/daemon/register.
+// RegisterResponse is the JSON response from POST /api/workers/register.
+//
+// Platform contract:
+//
+//	{ workerId, heartbeatInterval (ms), pollInterval (ms),
+//	  runtimeToken, runtimeTokenExpiresAt }
+//
+// Field names mirror the wire shape; helper methods provide seconds-based
+// accessors used by the heartbeat scheduler.
 type RegisterResponse struct {
-	WorkerID                 string `json:"workerId"`
-	RuntimeJWT               string `json:"runtimeJwt"`
-	HeartbeatIntervalSeconds int    `json:"heartbeatIntervalSeconds"`
-	PollIntervalSeconds      int    `json:"pollIntervalSeconds"`
+	WorkerID              string `json:"workerId"`
+	HeartbeatInterval     int    `json:"heartbeatInterval"` // ms
+	PollInterval          int    `json:"pollInterval"`      // ms
+	RuntimeToken          string `json:"runtimeToken"`
+	RuntimeTokenExpiresAt string `json:"runtimeTokenExpiresAt,omitempty"`
 }
 
-// RegisterEndpoint is the relative path on the orchestrator.
-const RegisterEndpoint = "/v1/daemon/register"
+// HeartbeatIntervalSeconds returns the heartbeat cadence in seconds (rounded
+// up). The platform reports the cadence in milliseconds; daemon code that
+// schedules tickers historically worked in seconds.
+func (r *RegisterResponse) HeartbeatIntervalSeconds() int {
+	if r.HeartbeatInterval <= 0 {
+		return 0
+	}
+	// Round up so 30000 ms doesn't truncate to 29s.
+	return (r.HeartbeatInterval + 999) / 1000
+}
+
+// PollIntervalSeconds returns the poll cadence in seconds (rounded up).
+func (r *RegisterResponse) PollIntervalSeconds() int {
+	if r.PollInterval <= 0 {
+		return 0
+	}
+	return (r.PollInterval + 999) / 1000
+}
+
+// RegisterEndpoint is the relative path on the platform.
+const RegisterEndpoint = "/api/workers/register"
 
 // CachedJWT is the on-disk cache entry. We persist this between daemon runs
-// so re-registration is skipped while the JWT is fresh.
+// so re-registration is skipped while the runtime token is fresh.
 type CachedJWT struct {
-	WorkerID                 string `json:"workerId"`
-	RuntimeJWT               string `json:"runtimeJwt"`
-	HeartbeatIntervalSeconds int    `json:"heartbeatIntervalSeconds"`
-	PollIntervalSeconds      int    `json:"pollIntervalSeconds"`
-	CachedAt                 string `json:"cachedAt"`
+	WorkerID              string `json:"workerId"`
+	RuntimeToken          string `json:"runtimeToken"`
+	HeartbeatInterval     int    `json:"heartbeatInterval"` // ms
+	PollInterval          int    `json:"pollInterval"`      // ms
+	RuntimeTokenExpiresAt string `json:"runtimeTokenExpiresAt,omitempty"`
+	CachedAt              string `json:"cachedAt"`
+
+	// Legacy fields retained so old cache files written before REN-1422
+	// still load successfully. Newer writes only populate the canonical
+	// platform-named fields above.
+	LegacyRuntimeJWT               string `json:"runtimeJwt,omitempty"`
+	LegacyHeartbeatIntervalSeconds int    `json:"heartbeatIntervalSeconds,omitempty"`
+	LegacyPollIntervalSeconds      int    `json:"pollIntervalSeconds,omitempty"`
 }
 
 // LoadCachedJWT reads ~/.rensei/daemon.jwt. Returns (nil, nil) when the file
@@ -80,7 +122,17 @@ func LoadCachedJWT(jwtPath string) (*CachedJWT, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, nil //nolint:nilerr // corrupt cache → re-register
 	}
-	if c.RuntimeJWT == "" || c.WorkerID == "" {
+	// Migrate legacy fields written by daemons pre-REN-1422.
+	if c.RuntimeToken == "" && c.LegacyRuntimeJWT != "" {
+		c.RuntimeToken = c.LegacyRuntimeJWT
+	}
+	if c.HeartbeatInterval == 0 && c.LegacyHeartbeatIntervalSeconds > 0 {
+		c.HeartbeatInterval = c.LegacyHeartbeatIntervalSeconds * 1000
+	}
+	if c.PollInterval == 0 && c.LegacyPollIntervalSeconds > 0 {
+		c.PollInterval = c.LegacyPollIntervalSeconds * 1000
+	}
+	if c.RuntimeToken == "" || c.WorkerID == "" {
 		return nil, nil
 	}
 	return &c, nil
@@ -93,11 +145,12 @@ func SaveCachedJWT(jwtPath string, resp *RegisterResponse, now time.Time) error 
 		return fmt.Errorf("create jwt dir: %w", err)
 	}
 	entry := CachedJWT{
-		WorkerID:                 resp.WorkerID,
-		RuntimeJWT:               resp.RuntimeJWT,
-		HeartbeatIntervalSeconds: resp.HeartbeatIntervalSeconds,
-		PollIntervalSeconds:      resp.PollIntervalSeconds,
-		CachedAt:                 now.UTC().Format(time.RFC3339),
+		WorkerID:              resp.WorkerID,
+		RuntimeToken:          resp.RuntimeToken,
+		HeartbeatInterval:     resp.HeartbeatInterval,
+		PollInterval:          resp.PollInterval,
+		RuntimeTokenExpiresAt: resp.RuntimeTokenExpiresAt,
+		CachedAt:              now.UTC().Format(time.RFC3339),
 	}
 	data, err := json.MarshalIndent(entry, "", "  ")
 	if err != nil {
@@ -114,14 +167,30 @@ func SaveCachedJWT(jwtPath string, resp *RegisterResponse, now time.Time) error 
 	return nil
 }
 
-// Register dials the orchestrator (or the stub path) and returns a
+// looksLikeRegistrationToken returns true if the input has one of the
+// platform's accepted registration-token prefixes.
+//
+// The platform's worker-protocol/auth.ts (via the unified validateApiKey hot
+// path landed in REN-1351 / REN-1353) accepts both:
+//   - rsp_live_*   — legacy worker_registration tokens
+//   - rsk_live_*   — the unified API-key prefix that REN-1351 made the new
+//     mint format. Tokens minted via /api/projects/<id>/runtime-tokens or
+//     /api/org/<id>/keys today come back as rsk_live_*.
+//
+// Anything else falls through to the stub path so local dev / tests don't
+// accidentally reach prod.
+func looksLikeRegistrationToken(token string) bool {
+	return strings.HasPrefix(token, "rsp_live_") || strings.HasPrefix(token, "rsk_live_")
+}
+
+// Register dials the platform (or the stub path) and returns a
 // RegisterResponse. The cache at jwtPath is consulted first unless
 // opts.ForceReregister is set.
 //
 // Stub path is taken when:
 //   - RENSEI_DAEMON_REAL_REGISTRATION env is unset, OR
 //   - the orchestrator URL is "file://...", OR
-//   - the registration token does not have an rsp_live_ prefix.
+//   - the registration token does not start with rsp_live_ or rsk_live_.
 func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse, error) {
 	if opts.JWTPath == "" {
 		opts.JWTPath = DefaultJWTPath()
@@ -133,36 +202,33 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 	if !opts.ForceReregister {
 		if cached, _ := LoadCachedJWT(opts.JWTPath); cached != nil {
 			return &RegisterResponse{
-				WorkerID:                 cached.WorkerID,
-				RuntimeJWT:               cached.RuntimeJWT,
-				HeartbeatIntervalSeconds: cached.HeartbeatIntervalSeconds,
-				PollIntervalSeconds:      cached.PollIntervalSeconds,
+				WorkerID:              cached.WorkerID,
+				RuntimeToken:          cached.RuntimeToken,
+				HeartbeatInterval:     cached.HeartbeatInterval,
+				PollInterval:          cached.PollInterval,
+				RuntimeTokenExpiresAt: cached.RuntimeTokenExpiresAt,
 			}, nil
 		}
 	}
 
-	caps := opts.Capabilities
-	if len(caps) == 0 {
-		caps = []string{"local", "sandbox", "workarea"}
+	// Capacity is derived from MaxAgents. Platform requires capacity > 0.
+	capacity := opts.MaxAgents
+	if capacity <= 0 {
+		capacity = 1
 	}
 	req := RegisterRequest{
-		Hostname:          opts.Hostname,
-		Version:           opts.Version,
-		MaxAgents:         opts.MaxAgents,
-		Capabilities:      caps,
-		ActiveAgentCount:  0,
-		Status:            RegistrationIdle,
-		Region:            opts.Region,
-		RegistrationToken: opts.RegistrationToken,
+		Hostname: opts.Hostname,
+		Capacity: capacity,
+		Version:  opts.Version,
 	}
 
 	useStub := os.Getenv("RENSEI_DAEMON_REAL_REGISTRATION") == "" ||
 		strings.HasPrefix(opts.OrchestratorURL, "file://") ||
-		!strings.HasPrefix(opts.RegistrationToken, "rsp_live_")
+		!looksLikeRegistrationToken(opts.RegistrationToken)
 
 	var resp *RegisterResponse
 	if useStub {
-		resp = buildStubResponse(&req)
+		resp = buildStubResponse(opts.Hostname)
 	} else {
 		var err error
 		resp, err = callRegisterEndpoint(ctx, opts, &req)
@@ -179,7 +245,10 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 	return resp, nil
 }
 
-// callRegisterEndpoint calls the real orchestrator endpoint.
+// callRegisterEndpoint calls the real platform endpoint.
+//
+// The registration token is sent in the Authorization: Bearer header (per
+// platform contract — the token is NOT in the request body).
 func callRegisterEndpoint(ctx context.Context, opts RegistrationOptions, body *RegisterRequest) (*RegisterResponse, error) {
 	client := opts.HTTPClient
 	if client == nil {
@@ -195,6 +264,7 @@ func callRegisterEndpoint(ctx context.Context, opts RegistrationOptions, body *R
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+opts.RegistrationToken)
 	req.Header.Set("User-Agent", "rensei-daemon/"+Version)
 
 	res, err := client.Do(req)
@@ -203,24 +273,34 @@ func callRegisterEndpoint(ctx context.Context, opts RegistrationOptions, body *R
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode >= 400 {
+		// Read up to 2 KiB of the error body so failures are diagnosable.
+		errBuf, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
+		snippet := strings.TrimSpace(string(errBuf))
+		if snippet != "" {
+			return nil, fmt.Errorf("registration failed: HTTP %d: %s", res.StatusCode, snippet)
+		}
 		return nil, fmt.Errorf("registration failed: HTTP %d", res.StatusCode)
 	}
 	var resp RegisterResponse
 	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
+	if resp.WorkerID == "" {
+		return nil, fmt.Errorf("registration response missing workerId")
+	}
 	return &resp, nil
 }
 
-// buildStubResponse mirrors the TS stub path. The JWT is intentionally not a
-// real JWT — the `stub.` prefix lets servers reject it if accidentally used.
-func buildStubResponse(req *RegisterRequest) *RegisterResponse {
-	workerID := fmt.Sprintf("worker-%s-stub", req.Hostname)
+// buildStubResponse returns a deterministic local-only response. The runtime
+// token is intentionally not a real JWT — the `stub.` prefix lets servers
+// reject it if accidentally used.
+func buildStubResponse(hostname string) *RegisterResponse {
+	workerID := fmt.Sprintf("worker-%s-stub", hostname)
 	return &RegisterResponse{
-		WorkerID:                 workerID,
-		RuntimeJWT:               makeStubJWT(workerID, req.Hostname),
-		HeartbeatIntervalSeconds: 30,
-		PollIntervalSeconds:      10,
+		WorkerID:          workerID,
+		RuntimeToken:      makeStubJWT(workerID, hostname),
+		HeartbeatInterval: 30000, // ms — same wire shape as platform
+		PollInterval:      10000,
 	}
 }
 
