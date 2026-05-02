@@ -177,9 +177,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// the first tick synchronously then runs the loop in its own
 	// goroutine).
 	pulser, err := heartbeat.New(heartbeat.Config{
-		SessionID:  qw.SessionID,
-		WorkerID:   qw.WorkerID,
-		IssueID:    qw.IssueLockID,
+		SessionID: qw.SessionID,
+		WorkerID:  qw.WorkerID,
+		// IssueID is the Linear issue UUID — the platform's
+		// /lock-refresh handler keys the lock on issue:lock:{id}
+		// and rejects the request with 400 when this is empty.
+		// Sourced from prompt.QueuedWork.IssueID (camelCase
+		// "issueId" on the wire).
+		IssueID:    qw.IssueID,
 		BaseURL:    qw.PlatformURL,
 		AuthToken:  qw.AuthToken,
 		Interval:   r.hbInterval,

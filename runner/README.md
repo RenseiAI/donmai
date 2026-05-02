@@ -55,7 +55,7 @@
 | `Runner` | Long-lived per-daemon orchestrator. Build once via `New(opts)`. |
 | `Options` | DI seam: registry, worktree manager, poster, env composer, MCP builder, state store, prompt builder, http client, logger, timeouts. Required: Registry, WorktreeManager, Poster. |
 | `Registry` | `agent.ProviderName → agent.Provider` lookup. Built at daemon startup. |
-| `QueuedWork` | Embeds `prompt.QueuedWork` plus `ResolvedProfile`, `Branch`, `WorkerID`, `AuthToken`, `PlatformURL`, `IssueLockID`. Wire shape mirrors the platform Redis session payload. |
+| `QueuedWork` | Embeds `prompt.QueuedWork` plus `ResolvedProfile`, `Branch`, `WorkerID`, `AuthToken`, `PlatformURL`. Wire shape mirrors the platform Redis session payload. |
 | `ResolvedProfile` | Provider, Model, Effort, CredentialID, ProviderConfig, plus the legacy `Runner` field for transitional wire shapes. |
 | `Result` | Embeds `agent.Result` plus `SessionID`, `IssueIdentifier`, `StartedAt`, `FinishedAt`, `SteeringTriggered`. |
 

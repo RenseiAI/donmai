@@ -63,7 +63,6 @@ type PollWorkItem struct {
 	MentionContext    string                  `json:"mentionContext,omitempty"`
 	ParentContext     string                  `json:"parentContext,omitempty"`
 	Branch            string                  `json:"branch,omitempty"`
-	IssueLockID       string                  `json:"issueLockId,omitempty"`
 	ResolvedProfile   *SessionResolvedProfile `json:"resolvedProfile,omitempty"`
 }
 
@@ -411,7 +410,6 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		WorkerID:          workerID,
 		AuthToken:         authToken,
 		PlatformURL:       platformURL,
-		IssueLockID:       item.IssueLockID,
 	}
 }
 

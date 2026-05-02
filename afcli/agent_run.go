@@ -384,7 +384,6 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 		WorkerID:    d.WorkerID,
 		AuthToken:   d.AuthToken,
 		PlatformURL: d.PlatformURL,
-		IssueLockID: d.IssueLockID,
 	}
 	if d.ResolvedProfile != nil {
 		qw.ResolvedProfile = runner.ResolvedProfile{
