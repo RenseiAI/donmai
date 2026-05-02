@@ -103,6 +103,13 @@ type Options struct {
 	// Used by tests that need a deterministic recovery flow.
 	SkipSteering bool
 
+	// SkipPostSession disables the post-session Linear state-transition
+	// block (REN-1467 / loop.go step 11b). Tests that don't have a
+	// platform mock with /api/issue-tracker-proxy support, or that
+	// want to assert on the pre-transition Result envelope, set this
+	// to skip the block entirely. Production daemons leave it false.
+	SkipPostSession bool
+
 	// HeartbeatInterval overrides the per-session heartbeat cadence.
 	// Zero falls back to runtime/heartbeat.DefaultInterval.
 	HeartbeatInterval time.Duration
@@ -117,22 +124,23 @@ type Options struct {
 // WorktreeManager, etc.) are documented as concurrency-safe by their
 // own packages.
 type Runner struct {
-	registry       *Registry
-	wt             *worktree.Manager
-	poster         *result.Poster
-	envc           *env.Composer
-	mcpb           *mcp.Builder
-	store          *state.Store
-	promptBuilder  *prompt.Builder
-	httpClient     *http.Client
-	logger         *slog.Logger
-	now            func() time.Time
-	maxDuration    time.Duration
-	preserveOnFail bool
-	preserveAlways bool
-	skipBackstop   bool
-	skipSteering   bool
-	hbInterval     time.Duration
+	registry        *Registry
+	wt              *worktree.Manager
+	poster          *result.Poster
+	envc            *env.Composer
+	mcpb            *mcp.Builder
+	store           *state.Store
+	promptBuilder   *prompt.Builder
+	httpClient      *http.Client
+	logger          *slog.Logger
+	now             func() time.Time
+	maxDuration     time.Duration
+	preserveOnFail  bool
+	preserveAlways  bool
+	skipBackstop    bool
+	skipSteering    bool
+	skipPostSession bool
+	hbInterval      time.Duration
 }
 
 // New constructs a Runner from opts. Returns an error when any
@@ -148,22 +156,23 @@ func New(opts Options) (*Runner, error) {
 		return nil, errors.New("runner: Poster is required")
 	}
 	r := &Runner{
-		registry:       opts.Registry,
-		wt:             opts.WorktreeManager,
-		poster:         opts.Poster,
-		envc:           opts.EnvComposer,
-		mcpb:           opts.MCPBuilder,
-		store:          opts.StateStore,
-		promptBuilder:  opts.PromptBuilder,
-		httpClient:     opts.HTTPClient,
-		logger:         opts.Logger,
-		now:            opts.Now,
-		maxDuration:    opts.MaxSessionDuration,
-		preserveOnFail: opts.PreserveWorktreeOnFailure,
-		preserveAlways: opts.PreserveWorktreeAlways,
-		skipBackstop:   opts.SkipBackstop,
-		skipSteering:   opts.SkipSteering,
-		hbInterval:     opts.HeartbeatInterval,
+		registry:        opts.Registry,
+		wt:              opts.WorktreeManager,
+		poster:          opts.Poster,
+		envc:            opts.EnvComposer,
+		mcpb:            opts.MCPBuilder,
+		store:           opts.StateStore,
+		promptBuilder:   opts.PromptBuilder,
+		httpClient:      opts.HTTPClient,
+		logger:          opts.Logger,
+		now:             opts.Now,
+		maxDuration:     opts.MaxSessionDuration,
+		preserveOnFail:  opts.PreserveWorktreeOnFailure,
+		preserveAlways:  opts.PreserveWorktreeAlways,
+		skipBackstop:    opts.SkipBackstop,
+		skipSteering:    opts.SkipSteering,
+		skipPostSession: opts.SkipPostSession,
+		hbInterval:      opts.HeartbeatInterval,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

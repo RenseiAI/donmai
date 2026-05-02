@@ -37,6 +37,10 @@ import (
 //  9. Stream events
 //  10. Wait for terminal event
 //  11. Tail recovery (steering → backstop)
+//     11b. Linear state transition (REN-1467) — parse WORK_RESULT,
+//     resolve target status from sdlc.go, post update via the
+//     issue-tracker proxy. Failures recorded as PostSessionWarnings;
+//     never fatal.
 //  12. Build Result envelope
 //
 // The orchestration loop is long by design — splitting it further hides
@@ -286,6 +290,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 				res.FailureMode = FailureSilentExit
 			}
 		}
+	}
+
+	// 11b. Post-session Linear state transition (REN-1467). Runs after
+	// the Result.Status has been finalised so resolveTargetStatus sees
+	// the same "completed"/"failed" classification the platform will
+	// receive. Skipped when SkipPostSession is set, or when the runner
+	// has no IssueID to address (e.g. governor work types without a
+	// Linear-side row).
+	if !r.skipPostSession && qw.IssueID != "" {
+		r.runPostSession(ctx, qw, res)
 	}
 
 	// Update state.json terminal snapshot (best-effort).

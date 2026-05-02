@@ -121,4 +121,56 @@ type Result struct {
 
 	// SteeringTriggered reports whether tail-recovery stage 1 fired.
 	SteeringTriggered bool `json:"steeringTriggered,omitempty"`
+
+	// PostSessionWarnings collects non-fatal warnings raised by the
+	// post-session block (REN-1467) — e.g. "Linear updateIssueStatus
+	// failed: …" or "diagnostic comment post failed: …". These are
+	// strictly observability — they do NOT change the session's
+	// terminal Status. Surface them in operator dashboards so a
+	// silently-failed transition is visible.
+	PostSessionWarnings []string `json:"postSessionWarnings,omitempty"`
+
+	// LinearStatusTransition records the result of the post-session
+	// Linear status-update attempt (REN-1467). Empty when no
+	// transition was attempted (non-result-sensitive type with no
+	// mapping, or marker was unknown). Non-nil even on failure so the
+	// caller can correlate dashboard signals to runner logs.
+	LinearStatusTransition *LinearStatusTransition `json:"linearStatusTransition,omitempty"`
+}
+
+// LinearStatusTransition records the runner's post-session attempt to
+// transition the Linear issue's workflow state. Built from
+// resolveTargetStatus and the UpdateIssueStatus call result.
+type LinearStatusTransition struct {
+	// WorkType is the agent work type the decision was made for.
+	WorkType string `json:"workType,omitempty"`
+
+	// WorkResult is the parsed marker driving the transition
+	// ("passed" | "failed" | "unknown" | "").
+	WorkResult string `json:"workResult,omitempty"`
+
+	// TargetStatus is the Linear workflow-state name the runner
+	// attempted to transition to. Empty when no transition was
+	// attempted.
+	TargetStatus string `json:"targetStatus,omitempty"`
+
+	// Attempted is true when the runner called UpdateIssueStatus.
+	Attempted bool `json:"attempted,omitempty"`
+
+	// Succeeded is true when UpdateIssueStatus returned nil.
+	Succeeded bool `json:"succeeded,omitempty"`
+
+	// Reason is a short identifier from PostSessionDecision.Reason
+	// ("passed", "failed", "unknown", "completed-non-sensitive",
+	// "deferred-merge-queue", "no-mapping", ...).
+	Reason string `json:"reason,omitempty"`
+
+	// Error is the human-readable error message when the transition
+	// failed. Empty on success.
+	Error string `json:"error,omitempty"`
+
+	// DiagnosticPosted is true when the runner posted the
+	// "missing WORK_RESULT" diagnostic comment to Linear (i.e. the
+	// Reason was "unknown" and the comment post succeeded).
+	DiagnosticPosted bool `json:"diagnosticPosted,omitempty"`
 }
