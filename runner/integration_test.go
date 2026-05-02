@@ -92,6 +92,7 @@ func TestIntegration_StubProvider_FullRun(t *testing.T) {
 		HeartbeatInterval:      100 * time.Millisecond,
 		SkipBackstop:           true,
 		SkipSteering:           true,
+		SkipPostSession:        true,
 		PreserveWorktreeAlways: false,
 	})
 	if err != nil {

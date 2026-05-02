@@ -66,6 +66,7 @@ func newRunnerHarness(t *testing.T) *runnerHarness {
 		HTTPClient:             srv.Client(),
 		SkipBackstop:           true,
 		SkipSteering:           true,
+		SkipPostSession:        true,
 		PreserveWorktreeAlways: true,
 	})
 	if err != nil {
@@ -219,6 +220,7 @@ func TestRun_PostsToPlatform(t *testing.T) {
 		HTTPClient:      srv.Client(),
 		SkipBackstop:    true,
 		SkipSteering:    true,
+		SkipPostSession: true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

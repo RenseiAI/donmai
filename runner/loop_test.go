@@ -205,6 +205,7 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 		HeartbeatInterval: 50 * time.Millisecond,
 		SkipBackstop:      true,
 		SkipSteering:      true,
+		SkipPostSession:   true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -314,6 +315,7 @@ func TestRunLoop_HeartbeatBodyIncludesIssueID(t *testing.T) {
 		HeartbeatInterval: 24 * time.Hour, // suppress further ticks; first tick fires synchronously
 		SkipBackstop:      true,
 		SkipSteering:      true,
+		SkipPostSession:   true,
 	})
 	if err != nil {
 		t.Fatal(err)

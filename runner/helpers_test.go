@@ -51,6 +51,7 @@ func minimalRunner(t *testing.T) *Runner {
 		MaxSessionDuration: -1,
 		SkipBackstop:       true,
 		SkipSteering:       true,
+		SkipPostSession:    true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

@@ -14,5 +14,11 @@ No prompt context, just a body.
 4. Push the branch (`git push -u origin <branch>`).
 5. Open a pull request (`gh pr create --base main --head <branch>`) targeting the repository at github.com/RenseiAI/agentfactory-tui.
 6. Post the PR link as a comment on REN-9999 via `pnpm af-linear create-comment`.
+7. End your final assistant message with exactly one marker so the orchestrator can transition the issue:
+
+   - `WORK_RESULT:passed` when the implementation is complete, all checks pass, and the PR is open.
+   - `WORK_RESULT:failed` when implementation is blocked, regressed, or could not finish.
+
+   Without this marker the orchestrator posts a diagnostic comment and leaves the issue in its current status.
 
 When finished, exit with a short summary of what you did. Do not delete the worktree.
