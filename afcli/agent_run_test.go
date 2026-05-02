@@ -176,7 +176,6 @@ func TestDetailToQueuedWork(t *testing.T) {
 		WorkerID:        "wkr_1",
 		AuthToken:       "tok",
 		PlatformURL:     "https://app.example.com",
-		IssueLockID:     "lock-1",
 		ResolvedProfile: &daemon.SessionResolvedProfile{
 			Provider: "stub",
 			Model:    "claude-sonnet-4-5",

@@ -85,10 +85,6 @@ type SessionDetail struct {
 
 	// PlatformURL is the base URL of the platform.
 	PlatformURL string `json:"platformUrl,omitempty"`
-
-	// IssueLockID is the platform-side issue UUID the heartbeat
-	// pulser sends in the lock-refresh body.
-	IssueLockID string `json:"issueLockId,omitempty"`
 }
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in

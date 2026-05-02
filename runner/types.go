@@ -41,11 +41,6 @@ type QueuedWork struct {
 	// "https://app.rensei.ai" or "http://127.0.0.1:3010"). The runner
 	// forwards this to result.Poster + heartbeat.Pulser. Required.
 	PlatformURL string `json:"-"`
-
-	// IssueLockID is the platform-side issue UUID the heartbeat
-	// pulser sends in the lock-refresh body. When empty the pulser
-	// omits it.
-	IssueLockID string `json:"issueLockId,omitempty"`
 }
 
 // ResolvedProfile names the profile knobs the platform resolved for

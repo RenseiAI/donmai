@@ -3,12 +3,15 @@ package runner
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -230,6 +233,138 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 	// timeout to keep the test stable on slow CI.
 	if res.FailureMode != FailureLostOwnership && res.FailureMode != FailureTimeout {
 		t.Errorf("FailureMode = %q; want lost-ownership or timeout", res.FailureMode)
+	}
+}
+
+// TestRunLoop_HeartbeatBodyIncludesIssueID is the REN-1465 regression:
+// the runner must source heartbeat IssueID from prompt.QueuedWork.IssueID
+// (populated by the daemon's poll handler) so the platform's
+// /api/sessions/<id>/lock-refresh handler accepts the request. Before
+// REN-1465 the runner sourced IssueID from a never-populated
+// IssueLockID field, producing {"workerId":"...","issueId":""} on the
+// wire and a 400 from the platform on every tick.
+//
+// The test stands up an httptest.Server that captures the JSON body
+// posted to /lock-refresh, drives one Run() with a fully-populated qw,
+// and asserts the captured body has both workerId and issueId
+// non-empty (and that issueId equals the qw.IssueID we passed in).
+func TestRunLoop_HeartbeatBodyIncludesIssueID(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+
+	const wantWorkerID = "wkr_test_1"
+	const wantIssueID = "08f26531-f5d2-49dc-b412-b42cef0cbffa"
+
+	type capturedBody struct {
+		WorkerID string `json:"workerId"`
+		IssueID  string `json:"issueId"`
+	}
+	var (
+		mu         sync.Mutex
+		bodies     []capturedBody
+		refreshHit atomic.Int64
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/lock-refresh") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		refreshHit.Add(1)
+		raw, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		var body capturedBody
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Errorf("decode lock-refresh body: %v (raw=%q)", err, raw)
+		}
+		mu.Lock()
+		bodies = append(bodies, body)
+		mu.Unlock()
+		// Mirror the platform's success response.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"refreshed":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	bareRepo := makeBareRepo(t)
+	wtParent := t.TempDir()
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL,
+		WorkerID:    wantWorkerID,
+		AuthToken:   "tok",
+		HTTPClient:  srv.Client(),
+		BaseDelay:   1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry()
+	p, _ := stub.New()
+	_ = reg.Register(p)
+	r, err := New(Options{
+		Registry:          reg,
+		WorktreeManager:   wtm,
+		Poster:            poster,
+		HTTPClient:        srv.Client(),
+		HeartbeatInterval: 24 * time.Hour, // suppress further ticks; first tick fires synchronously
+		SkipBackstop:      true,
+		SkipSteering:      true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use queuedWorkBase + override IssueID so we can pin the expected
+	// value. The base helper sets IssueID to "issue-uuid-<identifier>",
+	// but we want a stable UUID-shaped value that mirrors the live wire.
+	base := queuedWorkBase("REN-1465")
+	base.IssueID = wantIssueID
+	qw := QueuedWork{
+		QueuedWork:  base,
+		WorkerID:    wantWorkerID,
+		AuthToken:   "tok",
+		PlatformURL: srv.URL,
+		ResolvedProfile: ResolvedProfile{
+			Provider: agent.ProviderStub,
+		},
+	}
+	qw.Repository = bareRepo
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, runErr := r.Run(ctx, qw); runErr != nil {
+		// Run may surface a non-nil err if the stub provider exits
+		// non-cleanly under the test fixture; the regression check is
+		// strictly on the heartbeat body capture.
+		t.Logf("Run returned err (non-fatal for this regression): %v", runErr)
+	}
+
+	if refreshHit.Load() == 0 {
+		t.Fatalf("no /lock-refresh requests captured (heartbeat never fired)")
+	}
+
+	mu.Lock()
+	captured := append([]capturedBody{}, bodies...)
+	mu.Unlock()
+
+	for i, b := range captured {
+		if b.WorkerID == "" {
+			t.Errorf("body[%d]: workerId empty (full=%+v)", i, b)
+		}
+		if b.IssueID == "" {
+			t.Errorf("body[%d]: issueId empty — REN-1465 regression (full=%+v)", i, b)
+		}
+		if b.IssueID != wantIssueID {
+			t.Errorf("body[%d]: issueId = %q; want %q", i, b.IssueID, wantIssueID)
+		}
+		if b.WorkerID != wantWorkerID {
+			t.Errorf("body[%d]: workerId = %q; want %q", i, b.WorkerID, wantWorkerID)
+		}
 	}
 }
 
