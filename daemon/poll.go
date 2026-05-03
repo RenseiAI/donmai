@@ -64,6 +64,28 @@ type PollWorkItem struct {
 	ParentContext     string                  `json:"parentContext,omitempty"`
 	Branch            string                  `json:"branch,omitempty"`
 	ResolvedProfile   *SessionResolvedProfile `json:"resolvedProfile,omitempty"`
+
+	// REN-1485 / REN-1487 Phase 2 stage-driven SDLC fields. Populated
+	// by the platform's `agent.dispatch_stage` action; absent when the
+	// work was queued by the legacy `agent.dispatch_to_queue` action.
+	// Round-trip opaquely on the QueuedWork JSON; the daemon forwards
+	// them onto SessionDetail without interpreting them.
+	StagePrompt        string           `json:"stagePrompt,omitempty"`
+	StageID            string           `json:"stageId,omitempty"`
+	StageBudget        *PollStageBudget `json:"stageBudget,omitempty"`
+	StageLifecycle     map[string]any   `json:"stageLifecycle,omitempty"`
+	StageSourceEventID string           `json:"stageSourceEventId,omitempty"`
+}
+
+// PollStageBudget mirrors the platform's StageBudget shape so the
+// daemon can decode + forward it without depending on the runner
+// package (cardinal package-architecture rule: daemon does not import
+// runner). The runner re-types this into prompt.StageBudget when it
+// constructs the QueuedWork. (REN-1485 / REN-1487.)
+type PollStageBudget struct {
+	MaxDurationSeconds int   `json:"maxDurationSeconds,omitempty"`
+	MaxSubAgents       int   `json:"maxSubAgents,omitempty"`
+	MaxTokens          int64 `json:"maxTokens,omitempty"`
 }
 
 // PollResponse is the body of GET /api/workers/<id>/poll. Only the fields the
@@ -218,10 +240,19 @@ func (p *PollService) pollOnce(ctx context.Context) {
 		return
 	}
 	if isPollAuthFailure(err) && p.opts.OnReregister != nil {
-		p.opts.LogWarn("daemon poll rejected (%v) — re-registering", err)
+		// Surface the structured [runtime-token] event mirroring the
+		// heartbeat path — REN-1481 observers see one log line per
+		// cycle on either path.
+		reason := pollAuthFailureReason(err)
+		slog.Info("[runtime-token]",
+			"event", "auth-failure-detected",
+			"path", "poll",
+			"reason", reason,
+		)
+		p.opts.LogWarn("daemon poll rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
 		newWorkerID, newJWT, regErr := p.opts.OnReregister(ctx)
 		if regErr != nil {
-			p.opts.LogWarn("daemon poll re-register failed: %v", regErr)
+			p.opts.LogWarn("daemon poll runtime-token refresh failed: %v", regErr)
 			return
 		}
 		p.mu.Lock()
@@ -275,6 +306,27 @@ func isPollAuthFailure(err error) bool {
 		return hErr.Status == http.StatusUnauthorized || hErr.Status == http.StatusNotFound
 	}
 	return false
+}
+
+// pollAuthFailureReason mirrors heartbeat.authFailureReason for the
+// poll path: classifies a 401/404 into a short structured reason for
+// the [runtime-token] log line. Uses the platform's specific
+// "Runtime token expired" message as the smoking-gun signal for the
+// REN-1481 refresh path.
+func pollAuthFailureReason(err error) string {
+	var hErr *PollHTTPError
+	if errors.As(err, &hErr) {
+		switch hErr.Status {
+		case http.StatusUnauthorized:
+			if strings.Contains(hErr.Body, "Runtime token expired") {
+				return "runtime-token-expired"
+			}
+			return "unauthorized"
+		case http.StatusNotFound:
+			return "worker-not-found"
+		}
+	}
+	return "auth-failure"
 }
 
 // resolveProjectFromAllowlist looks up a daemon ProjectConfig by the value
@@ -390,26 +442,31 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		)
 	}
 	return &SessionDetail{
-		SessionID:         item.SessionID,
-		IssueID:           item.IssueID,
-		IssueIdentifier:   item.IssueIdentifier,
-		LinearSessionID:   item.LinearSessionID,
-		ProviderSessionID: item.ProviderSessionID,
-		ProjectName:       projectName,
-		OrganizationID:    item.OrganizationID,
-		Repository:        repo,
-		Ref:               item.Ref,
-		WorkType:          item.WorkType,
-		PromptContext:     item.PromptContext,
-		Body:              item.Body,
-		Title:             item.Title,
-		MentionContext:    item.MentionContext,
-		ParentContext:     item.ParentContext,
-		Branch:            item.Branch,
-		ResolvedProfile:   item.ResolvedProfile,
-		WorkerID:          workerID,
-		AuthToken:         authToken,
-		PlatformURL:       platformURL,
+		SessionID:          item.SessionID,
+		IssueID:            item.IssueID,
+		IssueIdentifier:    item.IssueIdentifier,
+		LinearSessionID:    item.LinearSessionID,
+		ProviderSessionID:  item.ProviderSessionID,
+		ProjectName:        projectName,
+		OrganizationID:     item.OrganizationID,
+		Repository:         repo,
+		Ref:                item.Ref,
+		WorkType:           item.WorkType,
+		PromptContext:      item.PromptContext,
+		Body:               item.Body,
+		Title:              item.Title,
+		MentionContext:     item.MentionContext,
+		ParentContext:      item.ParentContext,
+		Branch:             item.Branch,
+		ResolvedProfile:    item.ResolvedProfile,
+		WorkerID:           workerID,
+		AuthToken:          authToken,
+		PlatformURL:        platformURL,
+		StagePrompt:        item.StagePrompt,
+		StageID:            item.StageID,
+		StageBudget:        item.StageBudget,
+		StageLifecycle:     item.StageLifecycle,
+		StageSourceEventID: item.StageSourceEventID,
 	}
 }
 

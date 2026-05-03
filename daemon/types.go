@@ -31,7 +31,17 @@ import "time"
 // (REN-1422 — POST /api/workers/register + POST /api/workers/<id>/heartbeat
 // with runtime JWT). Replaces the 0.3.10-sidecar bash heartbeat shim that
 // shipped for the 2026-05-01 demo.
-const Version = "0.4.0-dev"
+//
+// 0.5.5: stage-driven SDLC Phase 2 daemon side (REN-1485 / REN-1487):
+// new QueuedWork stage fields (StagePrompt, StageID, StageBudget,
+// StageLifecycle, StageSourceEventID) decoded + forwarded onto
+// SessionDetail; sub-agent budget enforcement via runner.BudgetEnforcer
+// (max-duration / max-sub-agents / max-tokens with WORK_RESULT
+// budget-exceeded surfacing); REN-1481 runtime-token refresh probe
+// (probes /api/workers/<id>/refresh-token before falling back to a
+// full re-register so the workerId stays stable when the platform
+// side ships the companion handler).
+const Version = "0.5.5"
 
 // DefaultHTTPPort is the port the daemon's control HTTP server binds to.
 // Keep in sync with afclient.DefaultDaemonConfig (port 7734).

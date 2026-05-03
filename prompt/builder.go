@@ -85,8 +85,21 @@ func NewBuilder() *Builder {
 // Build is deterministic: given the same inputs (including the same
 // [Builder] state) it produces byte-identical output. The
 // golden-file tests in builder_test.go assert this property.
+//
+// Stage-prompt mode (REN-1485 / REN-1487): when qw.StagePrompt is
+// non-empty the runner is being dispatched by the new
+// `agent.dispatch_stage` action. The user prompt body is taken from
+// StagePrompt verbatim — pre-rendered platform-side from the stage
+// prompt template + issue context — and the embedded user template is
+// skipped. The system prompt is still rendered (carries the runner
+// identity + operating rules) and a stage-context preamble is
+// prepended so the agent can self-identify which stage it is running
+// (`stageId=… budget.maxSubAgents=… budget.maxTokens=… budget.maxDurationSeconds=…`).
+// The legacy template path is preserved when StagePrompt is empty
+// (cardinal rule 1 — additive, no break).
 func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
-	if !hasIssueContext(qw) {
+	hasStagePrompt := strings.TrimSpace(qw.StagePrompt) != ""
+	if !hasStagePrompt && !hasIssueContext(qw) {
 		return "", "", fmt.Errorf("%w: sessionId=%q identifier=%q",
 			ErrEmptyWork, qw.SessionID, qw.IssueIdentifier)
 	}
@@ -101,6 +114,14 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 		return "", "", fmt.Errorf("render system prompt: %w", err)
 	}
 
+	if hasStagePrompt {
+		// Stage-prompt mode — use platform-rendered prompt verbatim
+		// with a stage-context preamble so the agent can self-identify
+		// the stage + budget.
+		userBuf := renderStagePromptUser(qw)
+		return systemBuf, userBuf, nil
+	}
+
 	userTmpl := userTemplateName(WorkType(qw.WorkType))
 	userBuf, err := renderTemplate(tmpls, userTmpl, userTemplateData(qw))
 	if err != nil {
@@ -108,6 +129,46 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 	}
 
 	return systemBuf, userBuf, nil
+}
+
+// renderStagePromptUser composes the user-prompt body for stage-prompt
+// dispatch. The platform-rendered StagePrompt is prepended with a
+// short context block identifying the stage id + the budget the
+// runner is enforcing — surfaces what the agent should know about the
+// limits it operates under without forcing it to scrape the env.
+func renderStagePromptUser(qw QueuedWork) string {
+	preamble := stagePreamble(qw)
+	body := strings.TrimRight(qw.StagePrompt, "\n")
+	if preamble == "" {
+		return body
+	}
+	return preamble + "\n\n" + body
+}
+
+// stagePreamble returns the "Stage: X — Budget: Y" block prepended to
+// the stage prompt body. Returns the empty string when no stage
+// metadata is available (defensive — the dispatcher always sets at
+// least StageID).
+func stagePreamble(qw QueuedWork) string {
+	if qw.StageID == "" && qw.StageBudget == nil {
+		return ""
+	}
+	var lines []string
+	if qw.StageID != "" {
+		lines = append(lines, fmt.Sprintf("<stage>%s</stage>", qw.StageID))
+	}
+	if b := qw.StageBudget; b != nil {
+		lines = append(lines, fmt.Sprintf(
+			"<stageBudget maxDurationSeconds=%q maxSubAgents=%q maxTokens=%q />",
+			fmt.Sprintf("%d", b.MaxDurationSeconds),
+			fmt.Sprintf("%d", b.MaxSubAgents),
+			fmt.Sprintf("%d", b.MaxTokens),
+		))
+	}
+	if qw.StageSourceEventID != "" {
+		lines = append(lines, fmt.Sprintf("<stageSourceEventId>%s</stageSourceEventId>", qw.StageSourceEventID))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // set returns the parsed template set, parsing it on first use. It is

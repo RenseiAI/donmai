@@ -259,18 +259,25 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// Heartbeat + poll share an OnReregister implementation so a 401 on
 		// either path re-mints the runtime JWT once and refreshes both
 		// services with the new credentials.
+		//
+		// REN-1481 fix: route through RefreshRuntimeToken which probes a
+		// real refresh endpoint first (preserving the workerId) and only
+		// falls back to a full Register() — minting a fresh workerId — if
+		// the platform side has not yet shipped the refresh handler. The
+		// `[runtime-token]` log line attests which path was taken.
 		reregister := func(rctx context.Context) (string, string, error) {
-			ropts := regOpts
-			ropts.ForceReregister = true
-			rr, rerr := Register(rctx, ropts)
-			if rerr != nil {
-				return "", "", rerr
+			d.mu.RLock()
+			currentWorker := d.workerID
+			d.mu.RUnlock()
+			result, err := RefreshRuntimeToken(rctx, regOpts, currentWorker, "auth-failure")
+			if err != nil {
+				return "", "", err
 			}
 			d.mu.Lock()
-			d.workerID = rr.WorkerID
-			d.jwt = rr.RuntimeToken
+			d.workerID = result.WorkerID
+			d.jwt = result.RuntimeToken
 			d.mu.Unlock()
-			return rr.WorkerID, rr.RuntimeToken, nil
+			return result.WorkerID, result.RuntimeToken, nil
 		}
 
 		// Heartbeat. OnReregister handles runtime-token expiry: the platform

@@ -85,6 +85,33 @@ type SessionDetail struct {
 
 	// PlatformURL is the base URL of the platform.
 	PlatformURL string `json:"platformUrl,omitempty"`
+
+	// ── Phase 2 stage-driven SDLC fields (REN-1485 / REN-1487) ───────
+	//
+	// Forwarded opaquely from PollWorkItem; the daemon does not parse
+	// them. The runner consumes them via the prompt.QueuedWork stage
+	// fields (cardinal package-architecture rule: daemon does not
+	// import runner).
+
+	// StagePrompt is the pre-rendered user-prompt body the platform
+	// dispatcher built from the stage prompt template. When present
+	// the runner uses it verbatim and skips the embedded user template.
+	StagePrompt string `json:"stagePrompt,omitempty"`
+
+	// StageID is the canonical stage id (e.g. "research",
+	// "development", "qa"). Used for log correlation + env injection.
+	StageID string `json:"stageId,omitempty"`
+
+	// StageBudget is the per-stage runtime budget the runner enforces.
+	StageBudget *PollStageBudget `json:"stageBudget,omitempty"`
+
+	// StageLifecycle is the lifecycle config for the workflow this
+	// stage instance belongs to. Forwarded opaquely on WORK_RESULT.
+	StageLifecycle map[string]any `json:"stageLifecycle,omitempty"`
+
+	// StageSourceEventID is the source CloudEvent id the stage trigger
+	// normaliser emitted. Carried for end-to-end audit correlation.
+	StageSourceEventID string `json:"stageSourceEventId,omitempty"`
 }
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in

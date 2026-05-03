@@ -85,4 +85,74 @@ type QueuedWork struct {
 	// the coordinator when this session is a sub-agent. Surfaced in the
 	// user prompt when present.
 	ParentContext string `json:"parentContext,omitempty"`
+
+	// ── Phase 2 stage-driven SDLC fields (REN-1485 / REN-1487) ────────
+	//
+	// These fields are populated when the platform's
+	// `agent.dispatch_stage` action queues the work (the new
+	// thinking-agent dispatcher). When `StagePrompt` is non-empty the
+	// runner SHORT-CIRCUITS the embedded user-template renderer and
+	// uses StagePrompt verbatim as the agent's directive. Stage prompts
+	// are pre-rendered platform-side so the runner does not duplicate
+	// per-stage Markdown.
+	//
+	// Cardinal rule 1: legacy `prompt`/`workType` paths stay working —
+	// when StagePrompt is empty the runner falls back to the
+	// PromptContext / Body / IssueIdentifier path it has always used.
+	//
+	// Wire shape: matches the platform's `QueuedStageWork` extension on
+	// `QueuedWork` (see platform's
+	// src/lib/nodes/action/agent.dispatch_stage/backend.ts). All five
+	// fields round-trip opaquely through Redis JSON.
+
+	// StagePrompt is the pre-rendered user-prompt body the
+	// platform-side dispatcher built from the stage prompt template +
+	// the issue context. When non-empty it replaces the template-driven
+	// user prompt the legacy renderer produces.
+	StagePrompt string `json:"stagePrompt,omitempty"`
+
+	// StageID is the canonical stage id (e.g. "research",
+	// "development", "qa", "acceptance"). Used for log correlation and
+	// surfaced into the agent's env via AGENTFACTORY_STAGE_ID.
+	StageID string `json:"stageId,omitempty"`
+
+	// StageBudget is the per-stage runtime budget the runner enforces
+	// when non-nil. See runner.BudgetEnforcer for cap-breach semantics.
+	// All caps default to 0 (= unlimited / not enforced) when absent
+	// per-field; a fully-zero budget on a non-nil pointer means
+	// "no caps set, proceed unbounded" — same as legacy work.
+	StageBudget *StageBudget `json:"stageBudget,omitempty"`
+
+	// StageLifecycle is the lifecycle config for the workflow this
+	// stage instance belongs to. The runner forwards it opaquely on the
+	// WORK_RESULT envelope so the platform can resolve which native
+	// state to drive the issue to on success / failure. The runner does
+	// not parse it.
+	StageLifecycle map[string]any `json:"stageLifecycle,omitempty"`
+
+	// StageSourceEventID is the source CloudEvent id the stage trigger
+	// normaliser emitted. Carried through for end-to-end audit
+	// correlation.
+	StageSourceEventID string `json:"stageSourceEventId,omitempty"`
+}
+
+// StageBudget mirrors the platform's StageBudget type from
+// src/lib/workflow/stages/index.ts. The runner enforces these caps via
+// runner.BudgetEnforcer; see runner/budget.go for the cap-breach
+// semantics. A field with value 0 is treated as "no cap" so partial
+// budgets degrade gracefully.
+type StageBudget struct {
+	// MaxDurationSeconds is the wall-clock cap on the stage instance.
+	// 0 = no cap.
+	MaxDurationSeconds int `json:"maxDurationSeconds,omitempty"`
+
+	// MaxSubAgents is the cap on Task tool invocations the agent may
+	// spawn over the life of the stage. 0 = no cap. Sub-agents
+	// counted: every ToolUseEvent whose ToolName is "Task".
+	MaxSubAgents int `json:"maxSubAgents,omitempty"`
+
+	// MaxTokens is the cap on total token consumption (input + output
+	// across all turns, summed from per-turn ResultEvent.Cost or the
+	// roll-up CostData on terminal). 0 = no cap.
+	MaxTokens int64 `json:"maxTokens,omitempty"`
 }
