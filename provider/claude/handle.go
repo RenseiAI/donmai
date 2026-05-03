@@ -416,12 +416,15 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 	// Drain stdin (the prompt) and stderr asynchronously, mirroring
 	// the parent spawn pattern.
 	go writePromptStdin(stdin, stdinPrompt, h.logger)
-	// Resume stderr is dropped — bounded-buffer diagnostics are kept
-	// only for the parent spawn. If a resume subprocess fails, the
-	// non-zero exit / scan error path surfaces a wrapped error.
+	// Capture resume stderr into a bounded buffer so non-zero exits
+	// surface the tail in the wrapped error (parent spawn does the
+	// same via h.stderrBuf — that one belongs to the parent's
+	// lifetime, so resume gets its own per-call buffer here).
+	resumeStderrBuf := newBoundedBuffer(stderrBufferSize)
+	stderrDone := make(chan struct{})
 	go func() {
-		defer func() { _ = stderr.Close() }()
-		_, _ = io.Copy(io.Discard, stderr)
+		defer close(stderrDone)
+		drainStderr(stderr, resumeStderrBuf, h.logger)
 	}()
 
 	// Stream the resume subprocess's JSONL onto the parent events
@@ -459,16 +462,29 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 	}()
 
 	// Wait for the resume subprocess to exit, honoring ctx.Done().
+	// Block on stderrDone too so the bounded buffer is fully populated
+	// before we read its tail for the error wrap.
 	waitErrCh := make(chan error, 1)
 	go func() {
 		<-scanDone
+		<-stderrDone
 		waitErrCh <- cmd.Wait()
 	}()
 
 	select {
 	case err := <-waitErrCh:
 		if err != nil {
-			return fmt.Errorf("provider/claude: Inject: cmd wait: %w", err)
+			tail := resumeStderrBuf.String()
+			exitCode := -1
+			if cmd.ProcessState != nil {
+				exitCode = cmd.ProcessState.ExitCode()
+			}
+			h.logger.Warn("provider/claude: Inject resume subprocess exited non-zero",
+				"sessionID", sid,
+				"exitCode", exitCode,
+				"stderrTail", tail,
+			)
+			return fmt.Errorf("provider/claude: Inject: cmd wait: %w (stderr tail: %s)", err, tail)
 		}
 		return nil
 	case <-ctx.Done():
