@@ -364,26 +364,37 @@ func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor) *runner.R
 func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 	qw := runner.QueuedWork{
 		QueuedWork: prompt.QueuedWork{
-			SessionID:         d.SessionID,
-			IssueID:           d.IssueID,
-			IssueIdentifier:   d.IssueIdentifier,
-			LinearSessionID:   d.LinearSessionID,
-			ProviderSessionID: d.ProviderSessionID,
-			ProjectName:       d.ProjectName,
-			OrganizationID:    d.OrganizationID,
-			Repository:        d.Repository,
-			Ref:               d.Ref,
-			WorkType:          d.WorkType,
-			PromptContext:     d.PromptContext,
-			Body:              d.Body,
-			Title:             d.Title,
-			MentionContext:    d.MentionContext,
-			ParentContext:     d.ParentContext,
+			SessionID:          d.SessionID,
+			IssueID:            d.IssueID,
+			IssueIdentifier:    d.IssueIdentifier,
+			LinearSessionID:    d.LinearSessionID,
+			ProviderSessionID:  d.ProviderSessionID,
+			ProjectName:        d.ProjectName,
+			OrganizationID:     d.OrganizationID,
+			Repository:         d.Repository,
+			Ref:                d.Ref,
+			WorkType:           d.WorkType,
+			PromptContext:      d.PromptContext,
+			Body:               d.Body,
+			Title:              d.Title,
+			MentionContext:     d.MentionContext,
+			ParentContext:      d.ParentContext,
+			StagePrompt:        d.StagePrompt,
+			StageID:            d.StageID,
+			StageLifecycle:     d.StageLifecycle,
+			StageSourceEventID: d.StageSourceEventID,
 		},
 		Branch:      d.Branch,
 		WorkerID:    d.WorkerID,
 		AuthToken:   d.AuthToken,
 		PlatformURL: d.PlatformURL,
+	}
+	if d.StageBudget != nil {
+		qw.StageBudget = &prompt.StageBudget{
+			MaxDurationSeconds: d.StageBudget.MaxDurationSeconds,
+			MaxSubAgents:       d.StageBudget.MaxSubAgents,
+			MaxTokens:          d.StageBudget.MaxTokens,
+		}
 	}
 	if d.ResolvedProfile != nil {
 		qw.ResolvedProfile = runner.ResolvedProfile{

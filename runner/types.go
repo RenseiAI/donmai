@@ -136,6 +136,15 @@ type Result struct {
 	// mapping, or marker was unknown). Non-nil even on failure so the
 	// caller can correlate dashboard signals to runner logs.
 	LinearStatusTransition *LinearStatusTransition `json:"linearStatusTransition,omitempty"`
+
+	// BudgetReport captures the per-stage budget enforcement record
+	// (REN-1485 / REN-1487 Phase 2 acceptance criterion #4). Non-nil
+	// for every Run; the .Enforced flag distinguishes
+	// stage-dispatched work (caps configured) from legacy work
+	// (caps absent). When a cap was breached .CapBreached + .BreachDetail
+	// surface the reason; the session's Status is "failed" with
+	// FailureMode=FailureBudgetExceeded.
+	BudgetReport *BudgetReport `json:"budgetReport,omitempty"`
 }
 
 // LinearStatusTransition records the runner's post-session attempt to

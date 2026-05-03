@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -195,10 +196,21 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 	// re-register and retry once with fresh credentials. Any other error
 	// is logged and left for the platform to detect via missed heartbeats.
 	if isAuthFailure(err) && h.opts.OnReregister != nil {
-		h.opts.LogWarn("daemon heartbeat rejected (%v) — re-registering", err)
+		// Surface the structured [runtime-token] event so REN-1481
+		// observers can grep one line per cycle rather than parsing
+		// the LogWarn body. The OnReregister implementation is also
+		// expected to log the resolution event ("refresh" or
+		// "reregister") via RefreshRuntimeToken.
+		reason := authFailureReason(err)
+		slog.Info("[runtime-token]",
+			"event", "auth-failure-detected",
+			"path", "heartbeat",
+			"reason", reason,
+		)
+		h.opts.LogWarn("daemon heartbeat rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
 		newWorkerID, newJWT, regErr := h.opts.OnReregister(ctx)
 		if regErr != nil {
-			h.opts.LogWarn("daemon re-register failed: %v", regErr)
+			h.opts.LogWarn("daemon runtime-token refresh failed: %v", regErr)
 			return
 		}
 		h.mu.Lock()
@@ -210,7 +222,7 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		retryPayload := payload
 		retryPayload.WorkerID = newWorkerID
 		if retryErr := h.callEndpoint(ctx, retryPayload); retryErr != nil {
-			h.opts.LogWarn("daemon heartbeat post-reregister also failed: %v", retryErr)
+			h.opts.LogWarn("daemon heartbeat post-refresh also failed: %v", retryErr)
 		}
 		return
 	}
@@ -298,4 +310,25 @@ func isAuthFailure(err error) bool {
 		return hErr.status == http.StatusUnauthorized || hErr.status == http.StatusNotFound
 	}
 	return false
+}
+
+// authFailureReason classifies the auth-failure error into a stable
+// short string for the [runtime-token] log line. Distinguishes
+// runtime-token-expired (the canonical REN-1481 trigger) from
+// worker-not-found and generic-unauthorized so operators can tell
+// which path the daemon entered without scraping the response body.
+func authFailureReason(err error) string {
+	var hErr *heartbeatHTTPError
+	if errors.As(err, &hErr) {
+		switch hErr.status {
+		case http.StatusUnauthorized:
+			if strings.Contains(hErr.body, "Runtime token expired") {
+				return "runtime-token-expired"
+			}
+			return "unauthorized"
+		case http.StatusNotFound:
+			return "worker-not-found"
+		}
+	}
+	return "auth-failure"
 }

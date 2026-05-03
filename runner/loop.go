@@ -55,6 +55,39 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	}
 	res.ProviderName = qw.resolvedProvider()
 
+	// REN-1485 / REN-1487 Phase 2: log which dispatch path is in use
+	// so operators can grep one session end-to-end through the
+	// stage-vs-legacy fork. `mode=stage` means the platform's new
+	// `agent.dispatch_stage` action queued this work and the runner is
+	// using qw.StagePrompt verbatim; `mode=legacy` means the work came
+	// in via `agent.dispatch_to_queue` and the embedded
+	// per-work-type template is rendering the user prompt.
+	stageMode := "legacy"
+	if strings.TrimSpace(qw.StagePrompt) != "" {
+		stageMode = "stage"
+	}
+	r.logger.Info("[runner-stage]",
+		"sid", qw.SessionID,
+		"stageId", qw.StageID,
+		"mode", stageMode,
+	)
+
+	// REN-1485 / REN-1487 acceptance criterion #4 — sub-agent budget
+	// enforcement. The enforcer is always constructed; when qw.StageBudget
+	// is nil (legacy path) it is a disabled no-op so the runner can
+	// observe events through it unconditionally.
+	enforcer := NewBudgetEnforcer(qw.StageBudget, time.UnixMilli(startedAt))
+	if enforcer.Enabled() {
+		r.logger.Info("[runner-stage]",
+			"sid", qw.SessionID,
+			"stageId", qw.StageID,
+			"event", "budget.enforce",
+			"maxDurationSeconds", qw.StageBudget.MaxDurationSeconds,
+			"maxSubAgents", qw.StageBudget.MaxSubAgents,
+			"maxTokens", qw.StageBudget.MaxTokens,
+		)
+	}
+
 	// 1. Resolve provider.
 	provider, err := r.registry.Resolve(qw.resolvedProvider())
 	if err != nil {
@@ -206,7 +239,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	}
 
 	// 10. Stream events; wait for terminal.
-	streamCtx, streamCancel := context.WithCancel(ctx)
+	// Budget duration cap rides on top of the stream ctx — when it
+	// fires the consumer sees ctx.Err() == context.DeadlineExceeded
+	// and we classify as FailureBudgetExceeded (CapDuration) below.
+	budgetCtx, budgetCancel := enforcer.WithDurationCap(ctx)
+	defer budgetCancel()
+	streamCtx, streamCancel := context.WithCancel(budgetCtx)
 	defer streamCancel()
 
 	// Heartbeat lost-ownership shortcut: cancel streamCtx and
@@ -224,7 +262,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}()
 	}
 
-	streamRes, streamErr := r.consumeEvents(streamCtx, handle, wpath, qw, res)
+	streamRes, streamErr := r.consumeEvents(streamCtx, handle, wpath, qw, res, enforcer)
 
 	// Disambiguate between ctx-cancelled and lost-ownership before
 	// classifying the failure mode.
@@ -242,6 +280,43 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		stopCancel()
 		return res, heartbeat.ErrLostOwnership
 	default:
+	}
+
+	// Budget-exceeded short-circuit (REN-1485 / REN-1487 acceptance #4).
+	// Either the enforcer surfaced *BudgetExceededError directly via
+	// streamErr, or the wall-clock deadline tripped streamCtx and we
+	// detect the breach now via CheckDuration. Either way the failure
+	// is classified as FailureBudgetExceeded — distinct from generic
+	// FailureTimeout so dashboards can group them.
+	var budgetErr *BudgetExceededError
+	if errors.As(streamErr, &budgetErr) { //nolint:revive // intentional: ObserveEvent already produced WORK_RESULT
+		// no-op: budget breach was already surfaced via ObserveEvent's WORK_RESULT emission
+	} else if errors.Is(streamErr, context.DeadlineExceeded) {
+		// May or may not be a duration cap. CheckDuration tells us.
+		if dErr := enforcer.CheckDuration(r.now()); dErr != nil {
+			budgetErr = dErr
+		}
+	}
+	if budgetErr != nil {
+		res.Status = "failed"
+		res.FailureMode = FailureBudgetExceeded
+		if res.Error == "" {
+			res.Error = budgetErr.Error()
+		}
+		// Best-effort stop the provider so it doesn't keep tokens
+		// running past the cap.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = handle.Stop(stopCtx)
+		stopCancel()
+		res.BudgetReport = enforcer.Report(r.now())
+		r.logger.Warn("[runner-stage]",
+			"sid", qw.SessionID,
+			"stageId", qw.StageID,
+			"event", "budget.breach",
+			"cap", string(budgetErr.Cap),
+			"detail", budgetErr.Detail,
+		)
+		return res, budgetErr
 	}
 
 	if streamErr != nil && errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
@@ -263,7 +338,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 			r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
 		} else {
 			// Re-consume any events the steering inject produced.
-			tailRes, _ := r.consumeEvents(ctx, handle, wpath, qw, res)
+			tailRes, _ := r.consumeEvents(ctx, handle, wpath, qw, res, enforcer)
 			tailRes.applyTo(res, provider.Name())
 		}
 	}
@@ -290,6 +365,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 				res.FailureMode = FailureSilentExit
 			}
 		}
+	}
+
+	// Attach the budget enforcement report on the success path
+	// (REN-1485 / REN-1487 acceptance #4). Always non-nil; when
+	// .Enforced is false (legacy work, no StageBudget) it serves as a
+	// "no budget enforced" observation record. Breach paths attach the
+	// report on the failure short-circuit above.
+	if res.BudgetReport == nil {
+		res.BudgetReport = enforcer.Report(r.now())
 	}
 
 	// 11b. Post-session Linear state transition (REN-1467). Runs after
@@ -331,6 +415,11 @@ type streamObservation struct {
 	workResult      string
 	cost            *agent.CostData
 	providerID      string
+	// budgetBreach is set when the in-flight enforcer tripped a cap
+	// during ObserveEvent. The runner reads this in the post-stream
+	// classification path to fork to FailureBudgetExceeded instead of
+	// the generic FailureProviderError / FailureSilentExit branches.
+	budgetBreach *BudgetExceededError
 }
 
 // applyTo merges the observation into a Result envelope. Idempotent
@@ -376,6 +465,7 @@ func (r *Runner) consumeEvents(
 	worktreePath string,
 	qw QueuedWork,
 	_ *Result,
+	enforcer *BudgetEnforcer,
 ) (streamObservation, error) {
 	obs := streamObservation{}
 
@@ -415,6 +505,16 @@ func (r *Runner) consumeEvents(
 			}
 			appendJSONL(ev)
 			r.observeEvent(ev, &obs, worktreePath, qw)
+			// Budget enforcement (REN-1485 / REN-1487 acceptance #4):
+			// every event flows through the enforcer; on a cap breach
+			// we surface the *BudgetExceededError so runLoop can
+			// classify the failure as FailureBudgetExceeded.
+			if enforcer != nil {
+				if berr := enforcer.ObserveEvent(ev); berr != nil {
+					obs.budgetBreach = berr
+					return obs, berr
+				}
+			}
 			if _, terminal := ev.(agent.ResultEvent); terminal {
 				return obs, nil
 			}
@@ -535,6 +635,24 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	}
 	if qw.AuthToken != "" {
 		envMap["WORKER_AUTH_TOKEN"] = qw.AuthToken
+	}
+	// REN-1485 / REN-1487 Phase 2 — surface the stage id + budget into
+	// the agent's env so sub-agents spawned via Task can self-identify
+	// which stage instance they belong to without re-fetching the
+	// session detail.
+	if qw.StageID != "" {
+		envMap["AGENTFACTORY_STAGE_ID"] = qw.StageID
+	}
+	if b := qw.StageBudget; b != nil {
+		if b.MaxDurationSeconds > 0 {
+			envMap["AGENTFACTORY_STAGE_MAX_DURATION_SECONDS"] = fmt.Sprintf("%d", b.MaxDurationSeconds)
+		}
+		if b.MaxSubAgents > 0 {
+			envMap["AGENTFACTORY_STAGE_MAX_SUB_AGENTS"] = fmt.Sprintf("%d", b.MaxSubAgents)
+		}
+		if b.MaxTokens > 0 {
+			envMap["AGENTFACTORY_STAGE_MAX_TOKENS"] = fmt.Sprintf("%d", b.MaxTokens)
+		}
 	}
 	return envMap
 }
