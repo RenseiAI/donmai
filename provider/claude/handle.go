@@ -80,9 +80,17 @@ const stderrBufferSize = 8 * 1024
 type Handle struct {
 	binary        string
 	mcpConfigPath string
-	cmd           *exec.Cmd
-	events        chan agent.Event
-	logger        *slog.Logger
+	// cwd is the working directory the parent claude subprocess was
+	// spawned in (spec.Cwd). Inject's --resume subprocess MUST run in
+	// the same cwd: claude segments its conversation storage by project
+	// (cwd-based), so a `claude --resume <id>` from a different cwd
+	// surfaces "No conversation found with session ID: <id>" and exits
+	// non-zero. REN-1485 wave 7 e2e on REN2-21 surfaced this — captured
+	// via the inject stderr ring buffer added in PR #76.
+	cwd    string
+	cmd    *exec.Cmd
+	events chan agent.Event
+	logger *slog.Logger
 
 	stdoutPipe io.ReadCloser
 	stderrPipe io.ReadCloser
@@ -241,6 +249,7 @@ func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID s
 	h := &Handle{
 		binary:        p.binary,
 		mcpConfigPath: mcpPath,
+		cwd:           spec.Cwd,
 		cmd:           cmd,
 		events:        make(chan agent.Event, eventBufferSize),
 		logger:        slog.With("provider", "claude", "pid", cmd.Process.Pid),
@@ -384,6 +393,16 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 	// provider construction; argv values come from buildArgs and a
 	// closed set of CLI flags. Same trust model as parent spawn.
 	cmd := exec.CommandContext(ctx, h.binary, argv...)
+	// Run the resume subprocess in the same working directory as the
+	// parent spawn. Claude segments its on-disk conversation storage by
+	// project (cwd-based); resuming from a different cwd looks under a
+	// different project's session pool and reports "No conversation
+	// found with session ID: ...". Surfaced by REN2-21 wave 7 e2e
+	// (REN-1485) once PR #76's inject stderr capture made the failure
+	// visible.
+	if h.cwd != "" {
+		cmd.Dir = h.cwd
+	}
 	configureProcessGroup(cmd)
 	cmd.Cancel = func() error {
 		signalProcessGroup(cmd, syscall.SIGKILL)
