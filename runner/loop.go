@@ -289,8 +289,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// is classified as FailureBudgetExceeded — distinct from generic
 	// FailureTimeout so dashboards can group them.
 	var budgetErr *BudgetExceededError
-	if errors.As(streamErr, &budgetErr) {
-		// Surfaced from ObserveEvent.
+	if errors.As(streamErr, &budgetErr) { //nolint:revive // intentional: ObserveEvent already produced WORK_RESULT
+		// no-op: budget breach was already surfaced via ObserveEvent's WORK_RESULT emission
 	} else if errors.Is(streamErr, context.DeadlineExceeded) {
 		// May or may not be a duration cap. CheckDuration tells us.
 		if dErr := enforcer.CheckDuration(r.now()); dErr != nil {

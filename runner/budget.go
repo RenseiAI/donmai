@@ -153,9 +153,9 @@ func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
 		// task tools (e.g. `mcp__af__Task`) still count.
 		if isTaskTool(v.ToolName) {
 			n := e.subAgents.Add(1)
-			if cap := e.limits.MaxSubAgents; cap > 0 && n > int64(cap) {
+			if limit := e.limits.MaxSubAgents; limit > 0 && n > int64(limit) {
 				return e.recordBreach(CapSubAgents,
-					fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, cap))
+					fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, limit))
 			}
 		}
 	case agent.ResultEvent:
@@ -167,9 +167,9 @@ func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
 			delta := v.Cost.InputTokens + v.Cost.OutputTokens
 			if delta > 0 {
 				n := e.tokens.Add(delta)
-				if cap := e.limits.MaxTokens; cap > 0 && n > cap {
+				if limit := e.limits.MaxTokens; limit > 0 && n > limit {
 					return e.recordBreach(CapTokens,
-						fmt.Sprintf("max-tokens exceeded: observed=%d limit=%d", n, cap))
+						fmt.Sprintf("max-tokens exceeded: observed=%d limit=%d", n, limit))
 				}
 			}
 		}
@@ -224,13 +224,13 @@ func (e *BudgetEnforcer) Report(now time.Time) *BudgetReport {
 // Subsequent breach attempts are no-ops on the recorded state but
 // still return the BudgetExceededError so the caller can see the
 // signal regardless of order.
-func (e *BudgetEnforcer) recordBreach(cap BudgetCap, detail string) *BudgetExceededError {
+func (e *BudgetEnforcer) recordBreach(breached BudgetCap, detail string) *BudgetExceededError {
 	e.mu.Lock()
 	if e.breach == nil {
-		e.breach = &budgetBreach{cap: cap, detail: detail}
+		e.breach = &budgetBreach{cap: breached, detail: detail}
 	}
 	e.mu.Unlock()
-	return &BudgetExceededError{Cap: cap, Detail: detail}
+	return &BudgetExceededError{Cap: breached, Detail: detail}
 }
 
 // BudgetExceededError is returned by ObserveEvent / CheckDuration when

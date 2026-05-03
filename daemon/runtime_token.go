@@ -27,6 +27,7 @@ import (
 // mints a new workerId, the bug REN-1481 originally documented). When
 // the platform side ships the endpoint the daemon picks it up
 // automatically with no further changes.
+// #nosec G101 -- URL endpoint path, not a credential
 const RuntimeTokenRefreshEndpoint = "/api/workers/refresh-token"
 
 // RefreshTokenResult is the outcome of an attempted runtime-token

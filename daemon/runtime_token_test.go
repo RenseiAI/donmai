@@ -23,6 +23,7 @@ import (
 func TestRefreshRuntimeToken_RefreshPathHonoured(t *testing.T) {
 	t.Parallel()
 	const wantWorker = "wkr_existing123"
+	// #nosec G101 -- test fixture token
 	const wantRegToken = "rsp_live_test_registration"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,6 +32,7 @@ func TestRefreshRuntimeToken_RefreshPathHonoured(t *testing.T) {
 			if got := r.Header.Get("Authorization"); got != "Bearer "+wantRegToken {
 				t.Errorf("refresh: wrong auth: %q", got)
 			}
+			// #nosec G101 -- test fixture response
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"runtimeToken":          "fresh.runtime.jwt",
 				"runtimeTokenExpiresAt": "2026-05-03T12:00:00Z",
@@ -84,6 +86,7 @@ func TestRefreshRuntimeToken_FallsBackToReregisterOn404(t *testing.T) {
 	t.Parallel()
 	const oldWorker = "wkr_oldworker"
 	const newWorker = "wkr_freshlyminted"
+	// #nosec G101 -- test fixture token
 	const wantRegToken = "rsp_live_test_registration"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +101,7 @@ func TestRefreshRuntimeToken_FallsBackToReregisterOn404(t *testing.T) {
 				t.Errorf("register: wrong auth: %q", got)
 			}
 			w.WriteHeader(http.StatusCreated)
+			// #nosec G101 -- test fixture response
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"workerId":          newWorker,
 				"runtimeToken":      "newly.minted.jwt",
@@ -167,7 +171,8 @@ func TestRefreshRuntimeToken_ProbedBeforeReregister(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	regOpts := RegistrationOptions{
-		OrchestratorURL:   srv.URL,
+		OrchestratorURL: srv.URL,
+		// #nosec G101 -- test fixture
 		RegistrationToken: "rsp_live_x",
 		Hostname:          "h",
 		Version:           Version,
@@ -270,6 +275,7 @@ func TestHeartbeatService_RefreshOn401Probe(t *testing.T) {
 			_, _ = w.Write([]byte(`{"ok":true}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/workers/"+workerID+"/refresh-token":
 			refreshHits++
+			// #nosec G101 -- test fixture response
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"runtimeToken": "fresh.runtime.jwt",
 			})
@@ -287,7 +293,8 @@ func TestHeartbeatService_RefreshOn401Probe(t *testing.T) {
 	defer srv.Close()
 
 	regOpts := RegistrationOptions{
-		OrchestratorURL:   srv.URL,
+		OrchestratorURL: srv.URL,
+		// #nosec G101 -- test fixture
 		RegistrationToken: "rsp_live_x",
 		Hostname:          "h",
 		Version:           Version,
@@ -372,7 +379,8 @@ func TestRefreshRuntimeToken_NetworkErrorReturnsErr(t *testing.T) {
 	defer srv.Close()
 
 	regOpts := RegistrationOptions{
-		OrchestratorURL:   srv.URL,
+		OrchestratorURL: srv.URL,
+		// #nosec G101 -- test fixture
 		RegistrationToken: "rsp_live_x",
 		Hostname:          "h",
 		Version:           Version,
