@@ -51,6 +51,11 @@ type Options struct {
 	// Required.
 	Poster *result.Poster
 
+	// CredentialProvider supplies the freshest platform worker credentials
+	// for long-running child sessions. Heartbeats call it before every tick so
+	// they can pick up daemon-side runtime-token refreshes.
+	CredentialProvider CredentialProvider
+
 	// EnvComposer builds the agent subprocess env. Defaults to
 	// env.NewComposer().
 	EnvComposer *env.Composer
@@ -124,24 +129,36 @@ type Options struct {
 // WorktreeManager, etc.) are documented as concurrency-safe by their
 // own packages.
 type Runner struct {
-	registry        *Registry
-	wt              *worktree.Manager
-	poster          *result.Poster
-	envc            *env.Composer
-	mcpb            *mcp.Builder
-	store           *state.Store
-	promptBuilder   *prompt.Builder
-	httpClient      *http.Client
-	logger          *slog.Logger
-	now             func() time.Time
-	maxDuration     time.Duration
-	preserveOnFail  bool
-	preserveAlways  bool
-	skipBackstop    bool
-	skipSteering    bool
-	skipPostSession bool
-	hbInterval      time.Duration
+	registry           *Registry
+	wt                 *worktree.Manager
+	poster             *result.Poster
+	credentialProvider CredentialProvider
+	envc               *env.Composer
+	mcpb               *mcp.Builder
+	store              *state.Store
+	promptBuilder      *prompt.Builder
+	httpClient         *http.Client
+	logger             *slog.Logger
+	now                func() time.Time
+	maxDuration        time.Duration
+	preserveOnFail     bool
+	preserveAlways     bool
+	skipBackstop       bool
+	skipSteering       bool
+	skipPostSession    bool
+	hbInterval         time.Duration
 }
+
+// RuntimeCredentials are the bearer-token credentials needed for session
+// heartbeats and status posts.
+type RuntimeCredentials struct {
+	WorkerID  string
+	AuthToken string
+}
+
+// CredentialProvider returns the freshest worker runtime credentials available
+// to the caller. Implementations should be cheap and concurrency-safe.
+type CredentialProvider func(context.Context) (RuntimeCredentials, error)
 
 // New constructs a Runner from opts. Returns an error when any
 // required collaborator is missing.
@@ -156,23 +173,24 @@ func New(opts Options) (*Runner, error) {
 		return nil, errors.New("runner: Poster is required")
 	}
 	r := &Runner{
-		registry:        opts.Registry,
-		wt:              opts.WorktreeManager,
-		poster:          opts.Poster,
-		envc:            opts.EnvComposer,
-		mcpb:            opts.MCPBuilder,
-		store:           opts.StateStore,
-		promptBuilder:   opts.PromptBuilder,
-		httpClient:      opts.HTTPClient,
-		logger:          opts.Logger,
-		now:             opts.Now,
-		maxDuration:     opts.MaxSessionDuration,
-		preserveOnFail:  opts.PreserveWorktreeOnFailure,
-		preserveAlways:  opts.PreserveWorktreeAlways,
-		skipBackstop:    opts.SkipBackstop,
-		skipSteering:    opts.SkipSteering,
-		skipPostSession: opts.SkipPostSession,
-		hbInterval:      opts.HeartbeatInterval,
+		registry:           opts.Registry,
+		wt:                 opts.WorktreeManager,
+		poster:             opts.Poster,
+		credentialProvider: opts.CredentialProvider,
+		envc:               opts.EnvComposer,
+		mcpb:               opts.MCPBuilder,
+		store:              opts.StateStore,
+		promptBuilder:      opts.PromptBuilder,
+		httpClient:         opts.HTTPClient,
+		logger:             opts.Logger,
+		now:                opts.Now,
+		maxDuration:        opts.MaxSessionDuration,
+		preserveOnFail:     opts.PreserveWorktreeOnFailure,
+		preserveAlways:     opts.PreserveWorktreeAlways,
+		skipBackstop:       opts.SkipBackstop,
+		skipSteering:       opts.SkipSteering,
+		skipPostSession:    opts.SkipPostSession,
+		hbInterval:         opts.HeartbeatInterval,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

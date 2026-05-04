@@ -44,6 +44,11 @@ type Poster struct {
 	// endpoint requires it in the request body for ownership checks.
 	workerID string
 
+	// credentialProvider supplies fresh worker credentials before post calls.
+	// This lets long-running child processes pick up daemon-side runtime-token
+	// refreshes instead of posting with the expired JWT they started with.
+	credentialProvider CredentialProvider
+
 	// httpClient is the HTTP client used for both calls. Defaults to
 	// &http.Client{Timeout: 30s}.
 	httpClient *http.Client
@@ -73,6 +78,10 @@ type Options struct {
 	// owner before accepting transitions.
 	WorkerID string
 
+	// CredentialProvider returns the latest worker id + auth token. Empty
+	// fields fall back to WorkerID/AuthToken.
+	CredentialProvider CredentialProvider
+
 	// HTTPClient overrides the default 30s-timeout client. Optional.
 	HTTPClient *http.Client
 
@@ -88,6 +97,17 @@ type Options struct {
 	// Now overrides time.Now for deterministic tests. Optional.
 	Now func() time.Time
 }
+
+// RuntimeCredentials are the bearer-token credentials needed for platform
+// result-post requests. Empty fields fall back to the Poster defaults.
+type RuntimeCredentials struct {
+	WorkerID  string
+	AuthToken string
+}
+
+// CredentialProvider returns the freshest worker runtime credentials available
+// to the caller. Implementations should be cheap and concurrency-safe.
+type CredentialProvider func(context.Context) (RuntimeCredentials, error)
 
 // NewPoster constructs a Poster from opts. Returns an error when the
 // required PlatformURL is missing or unparseable. Optional fields fall
@@ -120,13 +140,14 @@ func NewPoster(opts Options) (*Poster, error) {
 		now = time.Now
 	}
 	return &Poster{
-		platformURL: u,
-		authToken:   opts.AuthToken,
-		workerID:    opts.WorkerID,
-		httpClient:  hc,
-		maxAttempts: maxAttempts,
-		baseDelay:   delay,
-		now:         now,
+		platformURL:        u,
+		authToken:          opts.AuthToken,
+		workerID:           opts.WorkerID,
+		credentialProvider: opts.CredentialProvider,
+		httpClient:         hc,
+		maxAttempts:        maxAttempts,
+		baseDelay:          delay,
+		now:                now,
 	}, nil
 }
 
@@ -207,6 +228,27 @@ func (p *Poster) Post(ctx context.Context, sessionID string, r agent.Result) err
 	}
 }
 
+func (p *Poster) credentials(ctx context.Context) RuntimeCredentials {
+	creds := RuntimeCredentials{
+		WorkerID:  p.workerID,
+		AuthToken: p.authToken,
+	}
+	if p.credentialProvider == nil {
+		return creds
+	}
+	fresh, err := p.credentialProvider(ctx)
+	if err != nil {
+		return creds
+	}
+	if fresh.WorkerID != "" {
+		creds.WorkerID = fresh.WorkerID
+	}
+	if fresh.AuthToken != "" {
+		creds.AuthToken = fresh.AuthToken
+	}
+	return creds
+}
+
 func (p *Poster) postCompletion(ctx context.Context, sessionID string, r agent.Result) error {
 	summary := strings.TrimSpace(r.Summary)
 	if summary == "" {
@@ -214,17 +256,19 @@ func (p *Poster) postCompletion(ctx context.Context, sessionID string, r agent.R
 		// comment is never empty (the handler 400s on missing summary).
 		summary = synthSummary(r)
 	}
+	creds := p.credentials(ctx)
 	body := completionRequest{
-		WorkerID: p.workerID,
+		WorkerID: creds.WorkerID,
 		Summary:  summary,
 	}
 	path := fmt.Sprintf("/api/sessions/%s/completion", sessionID)
-	return p.doRetried(ctx, path, body)
+	return p.doRetried(ctx, path, body, creds.AuthToken)
 }
 
 func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Result) error {
+	creds := p.credentials(ctx)
 	body := statusRequest{
-		WorkerID:          p.workerID,
+		WorkerID:          creds.WorkerID,
 		Status:            r.Status,
 		ProviderSessionID: r.ProviderSessionID,
 		WorktreePath:      r.WorktreePath,
@@ -238,14 +282,14 @@ func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Resul
 		body.Error = &errorEnvelope{Message: r.Error}
 	}
 	path := fmt.Sprintf("/api/sessions/%s/status", sessionID)
-	return p.doRetried(ctx, path, body)
+	return p.doRetried(ctx, path, body, creds.AuthToken)
 }
 
 // doRetried executes a POST against path with body, retrying transient
 // failures up to p.maxAttempts. Permanent (4xx) responses short-circuit
 // the loop so we don't waste time pretending a misconfigured request
 // will succeed on the next try.
-func (p *Poster) doRetried(ctx context.Context, path string, body any) error {
+func (p *Poster) doRetried(ctx context.Context, path string, body any, authToken string) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshal body: %w", err)
@@ -254,7 +298,7 @@ func (p *Poster) doRetried(ctx context.Context, path string, body any) error {
 
 	var lastErr error
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
-		err := p.doOnce(ctx, endpoint, payload)
+		err := p.doOnce(ctx, endpoint, payload, authToken)
 		if err == nil {
 			return nil
 		}
@@ -286,14 +330,14 @@ func (p *Poster) doRetried(ctx context.Context, path string, body any) error {
 // doOnce performs a single POST against endpoint with payload. Returns
 // a [PermanentError] for 4xx responses and a transient error for 5xx /
 // network failures.
-func (p *Poster) doOnce(ctx context.Context, endpoint string, payload []byte) error {
+func (p *Poster) doOnce(ctx context.Context, endpoint string, payload []byte, authToken string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if p.authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+p.authToken)
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
 	resp, err := p.httpClient.Do(req)
 	if err != nil {

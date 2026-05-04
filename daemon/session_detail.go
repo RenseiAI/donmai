@@ -160,6 +160,29 @@ func (s *sessionDetailStore) Get(id string) (*SessionDetail, bool) {
 	return d, ok
 }
 
+// UpdateRuntimeCredentials refreshes the worker credentials exposed to every
+// active child process via /api/daemon/sessions/<id>. The daemon calls this
+// after preserving workerId through a runtime-token refresh so long-running
+// children do not keep using an expired bearer token.
+func (s *sessionDetailStore) UpdateRuntimeCredentials(workerID, authToken string) {
+	if workerID == "" && authToken == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range s.details {
+		if d == nil {
+			continue
+		}
+		if workerID != "" {
+			d.WorkerID = workerID
+		}
+		if authToken != "" {
+			d.AuthToken = authToken
+		}
+	}
+}
+
 // Delete removes the detail for the given session id (idempotent).
 // Called by the daemon when a session terminates so stale auth tokens
 // don't linger in memory.

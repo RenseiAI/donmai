@@ -60,6 +60,10 @@ type Config struct {
 	// Optional — when empty no auth header is set (test paths use
 	// httptest.Server without auth).
 	AuthToken string
+	// CredentialProvider returns the latest worker id + runtime token.
+	// When set, every heartbeat tick calls it before posting so child
+	// runners can pick up daemon-side runtime-token refreshes mid-session.
+	CredentialProvider CredentialProvider
 
 	// Interval overrides DefaultInterval. Zero falls back to default.
 	Interval time.Duration
@@ -81,6 +85,17 @@ type Config struct {
 	// Sleep overrides time.Sleep for inner-retry backoff in tests.
 	Sleep func(time.Duration)
 }
+
+// RuntimeCredentials are the bearer-token credentials needed for a heartbeat
+// request. Empty fields fall back to Config.WorkerID / Config.AuthToken.
+type RuntimeCredentials struct {
+	WorkerID  string
+	AuthToken string
+}
+
+// CredentialProvider returns the freshest worker runtime credentials available
+// to the caller. Implementations should be cheap and concurrency-safe.
+type CredentialProvider func(context.Context) (RuntimeCredentials, error)
 
 func (c Config) interval() time.Duration {
 	if c.Interval > 0 {
@@ -122,6 +137,28 @@ func (c Config) now() time.Time {
 		return c.Now()
 	}
 	return time.Now()
+}
+
+func (c Config) credentials(ctx context.Context) RuntimeCredentials {
+	creds := RuntimeCredentials{
+		WorkerID:  c.WorkerID,
+		AuthToken: c.AuthToken,
+	}
+	if c.CredentialProvider == nil {
+		return creds
+	}
+	fresh, err := c.CredentialProvider(ctx)
+	if err != nil {
+		c.logger().Warn("heartbeat credential refresh failed; using cached credentials", "err", err)
+		return creds
+	}
+	if fresh.WorkerID != "" {
+		creds.WorkerID = fresh.WorkerID
+	}
+	if fresh.AuthToken != "" {
+		creds.AuthToken = fresh.AuthToken
+	}
+	return creds
 }
 
 // Pulser drives the heartbeat loop for one session. Construct via New
@@ -341,8 +378,9 @@ type refreshResponse struct {
 // doRefresh issues one POST to /api/sessions/<id>/lock-refresh and
 // returns nil only when the platform reports the lock was extended.
 func (p *Pulser) doRefresh(ctx context.Context) error {
+	creds := p.cfg.credentials(ctx)
 	body, err := json.Marshal(refreshRequest{
-		WorkerID: p.cfg.WorkerID,
+		WorkerID: creds.WorkerID,
 		IssueID:  p.cfg.IssueID,
 	})
 	if err != nil {
@@ -354,8 +392,8 @@ func (p *Pulser) doRefresh(ctx context.Context) error {
 		return fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if p.cfg.AuthToken != "" {
-		req.Header.Set("Authorization", "Bearer "+p.cfg.AuthToken)
+	if creds.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+creds.AuthToken)
 	}
 	resp, err := p.cfg.client().Do(req)
 	if err != nil {

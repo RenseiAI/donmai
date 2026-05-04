@@ -42,6 +42,24 @@ func TestSessionDetailStore_IgnoresEmpty(t *testing.T) {
 	}
 }
 
+func TestSessionDetailStore_UpdateRuntimeCredentials(t *testing.T) {
+	s := newSessionDetailStore()
+	s.Set(&SessionDetail{SessionID: "sess-1", WorkerID: "wkr_old", AuthToken: "old-token"})
+	s.Set(&SessionDetail{SessionID: "sess-2", WorkerID: "wkr_old", AuthToken: "old-token"})
+
+	s.UpdateRuntimeCredentials("wkr_new", "fresh-token")
+
+	for _, id := range []string{"sess-1", "sess-2"} {
+		got, ok := s.Get(id)
+		if !ok {
+			t.Fatalf("missing %s", id)
+		}
+		if got.WorkerID != "wkr_new" || got.AuthToken != "fresh-token" {
+			t.Fatalf("%s credentials = (%q, %q), want (wkr_new, fresh-token)", id, got.WorkerID, got.AuthToken)
+		}
+	}
+}
+
 // TestSessionDetailStore_ConcurrentAccess sanity-checks the mutex
 // against concurrent readers and writers. Run with -race to surface
 // data races.

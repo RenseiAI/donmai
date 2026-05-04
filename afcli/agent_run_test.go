@@ -151,6 +151,38 @@ func TestFetchSessionDetail_TransientThenSucceeds(t *testing.T) {
 	}
 }
 
+func TestAgentRunCredentialCacheRefreshesFromDaemon(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/daemon/sessions/") {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(&daemon.SessionDetail{ // nolint:gosec // G117: test fixture
+			SessionID: "sess-cred",
+			WorkerID:  "wkr_fresh",
+			AuthToken: "fresh-token",
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	cache := newAgentRunCredentialCache(
+		srv.Client(),
+		srv.URL,
+		"sess-cred",
+		&daemon.SessionDetail{SessionID: "sess-cred", WorkerID: "wkr_old", AuthToken: "old-token"},
+	)
+
+	got, err := cache.runnerCredentials(context.Background())
+	if err != nil {
+		t.Fatalf("runnerCredentials: %v", err)
+	}
+	if got.WorkerID != "wkr_fresh" || got.AuthToken != "fresh-token" {
+		t.Fatalf("credentials = (%q, %q), want (wkr_fresh, fresh-token)", got.WorkerID, got.AuthToken)
+	}
+}
+
 // TestFetchSessionDetail_DaemonUnreachable verifies a connection
 // failure returns an error after exhausting retries.
 func TestFetchSessionDetail_DaemonUnreachable(t *testing.T) {

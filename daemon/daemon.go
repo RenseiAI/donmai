@@ -277,6 +277,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 			d.workerID = result.WorkerID
 			d.jwt = result.RuntimeToken
 			d.mu.Unlock()
+			if d.sessionDetails != nil {
+				d.sessionDetails.UpdateRuntimeCredentials(result.WorkerID, result.RuntimeToken)
+			}
 			return result.WorkerID, result.RuntimeToken, nil
 		}
 

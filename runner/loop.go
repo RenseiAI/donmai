@@ -213,6 +213,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// 9. Start heartbeat pulser (in a goroutine — Pulser.Start fires
 	// the first tick synchronously then runs the loop in its own
 	// goroutine).
+	var hbCredentialProvider heartbeat.CredentialProvider
+	if r.credentialProvider != nil {
+		hbCredentialProvider = func(ctx context.Context) (heartbeat.RuntimeCredentials, error) {
+			creds, err := r.credentialProvider(ctx)
+			return heartbeat.RuntimeCredentials{
+				WorkerID:  creds.WorkerID,
+				AuthToken: creds.AuthToken,
+			}, err
+		}
+	}
 	pulser, err := heartbeat.New(heartbeat.Config{
 		SessionID: qw.SessionID,
 		WorkerID:  qw.WorkerID,
@@ -221,12 +231,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		// and rejects the request with 400 when this is empty.
 		// Sourced from prompt.QueuedWork.IssueID (camelCase
 		// "issueId" on the wire).
-		IssueID:    qw.IssueID,
-		BaseURL:    qw.PlatformURL,
-		AuthToken:  qw.AuthToken,
-		Interval:   r.hbInterval,
-		HTTPClient: r.httpClient,
-		Logger:     r.logger,
+		IssueID:            qw.IssueID,
+		BaseURL:            qw.PlatformURL,
+		AuthToken:          qw.AuthToken,
+		CredentialProvider: hbCredentialProvider,
+		Interval:           r.hbInterval,
+		HTTPClient:         r.httpClient,
+		Logger:             r.logger,
 	})
 	if err != nil {
 		// Heartbeat is non-fatal at construction time only when

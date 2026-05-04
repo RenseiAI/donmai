@@ -324,3 +324,48 @@ func TestRequestBodyShape(t *testing.T) {
 		t.Fatalf("body missing workerId/issueId: %s", *got)
 	}
 }
+
+func TestCredentialProviderOverridesCachedCredentials(t *testing.T) {
+	t.Parallel()
+
+	var capturedAuth atomic.Pointer[string]
+	var capturedBody atomic.Pointer[string]
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		capturedAuth.Store(&auth)
+		body, _ := io.ReadAll(r.Body)
+		bodyText := string(body)
+		capturedBody.Store(&bodyText)
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+	})
+
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID: "s1",
+		WorkerID:  "wkr_old",
+		IssueID:   "issue-1",
+		AuthToken: "old-token",
+		BaseURL:   srv.URL,
+		CredentialProvider: func(context.Context) (heartbeat.RuntimeCredentials, error) {
+			return heartbeat.RuntimeCredentials{
+				WorkerID:  "wkr_fresh",
+				AuthToken: "fresh-token",
+			}, nil
+		},
+		HTTPClient: srv.Client(),
+		Interval:   24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	if got := capturedAuth.Load(); got == nil || *got != "Bearer fresh-token" {
+		t.Fatalf("Authorization = %v, want Bearer fresh-token", got)
+	}
+	if got := capturedBody.Load(); got == nil || !strings.Contains(*got, `"workerId":"wkr_fresh"`) {
+		t.Fatalf("body = %v, want fresh worker id", got)
+	}
+}

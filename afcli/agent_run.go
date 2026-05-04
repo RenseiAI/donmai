@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -147,6 +148,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		"provider", providerNameFromDetail(detail),
 		"workType", detail.WorkType,
 	)
+	credentialCache := newAgentRunCredentialCache(
+		&http.Client{Timeout: 5 * time.Second},
+		daemonURL,
+		sessionID,
+		detail,
+	)
 
 	// 5. Construct registry, runner, and run.
 	reg := buildAgentRunRegistry(logger)
@@ -166,9 +173,10 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	}
 
 	poster, err := result.NewPoster(result.Options{
-		PlatformURL: detail.PlatformURL,
-		AuthToken:   detail.AuthToken,
-		WorkerID:    detail.WorkerID,
+		PlatformURL:        detail.PlatformURL,
+		AuthToken:          detail.AuthToken,
+		WorkerID:           detail.WorkerID,
+		CredentialProvider: credentialCache.resultCredentials,
 	})
 	if err != nil {
 		// PlatformURL missing is a soft pre-flight failure; surface a
@@ -180,6 +188,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		Registry:                  reg,
 		WorktreeManager:           wm,
 		Poster:                    poster,
+		CredentialProvider:        credentialCache.runnerCredentials,
 		Logger:                    logger,
 		PreserveWorktreeOnFailure: opts.preserveWT,
 		// Backstop runs by default — the daemon-spawned worker is
@@ -295,6 +304,54 @@ func fetchSessionDetailOnce(ctx context.Context, client *http.Client, endpoint s
 		return nil, fmt.Errorf("decode body: %w", err)
 	}
 	return &detail, nil
+}
+
+type agentRunCredentialCache struct {
+	mu        sync.Mutex
+	client    *http.Client
+	daemonURL string
+	sessionID string
+	workerID  string
+	authToken string
+}
+
+func newAgentRunCredentialCache(client *http.Client, daemonURL, sessionID string, initial *daemon.SessionDetail) *agentRunCredentialCache {
+	c := &agentRunCredentialCache{
+		client:    client,
+		daemonURL: daemonURL,
+		sessionID: sessionID,
+	}
+	if initial != nil {
+		c.workerID = initial.WorkerID
+		c.authToken = initial.AuthToken
+	}
+	return c
+}
+
+func (c *agentRunCredentialCache) current(ctx context.Context) (workerID, authToken string, err error) {
+	detail, fetchErr := fetchSessionDetail(ctx, c.client, c.daemonURL, c.sessionID)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fetchErr == nil && detail != nil {
+		if detail.WorkerID != "" {
+			c.workerID = detail.WorkerID
+		}
+		if detail.AuthToken != "" {
+			c.authToken = detail.AuthToken
+		}
+	}
+	return c.workerID, c.authToken, fetchErr
+}
+
+func (c *agentRunCredentialCache) runnerCredentials(ctx context.Context) (runner.RuntimeCredentials, error) {
+	workerID, authToken, err := c.current(ctx)
+	return runner.RuntimeCredentials{WorkerID: workerID, AuthToken: authToken}, err
+}
+
+func (c *agentRunCredentialCache) resultCredentials(ctx context.Context) (result.RuntimeCredentials, error) {
+	workerID, authToken, err := c.current(ctx)
+	return result.RuntimeCredentials{WorkerID: workerID, AuthToken: authToken}, err
 }
 
 // providerCtor is a (name, constructor) tuple consumed by

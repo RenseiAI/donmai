@@ -246,6 +246,54 @@ func TestPosterPost_NetworkTimeout(t *testing.T) {
 	}
 }
 
+func TestPosterPost_UsesCredentialProvider(t *testing.T) {
+	t.Parallel()
+
+	var auths []string
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL,
+		AuthToken:   "old-token",
+		WorkerID:    "wkr_old",
+		CredentialProvider: func(context.Context) (result.RuntimeCredentials, error) {
+			return result.RuntimeCredentials{
+				WorkerID:  "wkr_fresh",
+				AuthToken: "fresh-token",
+			}, nil
+		},
+		BaseDelay: 0,
+	})
+	if err != nil {
+		t.Fatalf("NewPoster: %v", err)
+	}
+
+	if err := p.Post(context.Background(), "sess-cred", goodResult()); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+
+	if len(auths) != 2 {
+		t.Fatalf("requests = %d, want 2", len(auths))
+	}
+	for _, auth := range auths {
+		if auth != "Bearer fresh-token" {
+			t.Fatalf("Authorization = %q, want Bearer fresh-token", auth)
+		}
+	}
+	for _, body := range bodies {
+		if !strings.Contains(body, `"workerId":"wkr_fresh"`) {
+			t.Fatalf("body %q missing fresh worker id", body)
+		}
+	}
+}
+
 func TestPosterPost_MissingFieldsValidation(t *testing.T) {
 	t.Parallel()
 	p := newPoster(t, "http://example.invalid", 0)
