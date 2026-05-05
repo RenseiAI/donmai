@@ -18,10 +18,9 @@
   - [af status](#af-status)
   - [af agent](#af-agent)
   - [af session](#af-session)
-  - [af fleet](#af-fleet)
-  - [af governor](#af-governor)
-  - [af worker](#af-worker)
   - [af daemon](#af-daemon)
+  - [af governor](#af-governor)
+  - [af worker and af fleet](#af-worker-and-af-fleet)
   - [af orchestrator](#af-orchestrator)
   - [af logs](#af-logs)
   - [af linear](#af-linear)
@@ -182,36 +181,6 @@ af session stream <session-id>      # tail activity stream
 af session restore-workarea <session-id> --to <dir>
 ```
 
-### `af fleet`
-
-Manage the entire agent fleet as a unit.
-
-```bash
-af fleet status
-af fleet start [--workers <n>]
-af fleet stop [--yes]
-af fleet scale --workers <n>
-```
-
-### `af governor`
-
-Start, stop, and query the governor scan loop.
-
-```bash
-af governor start [--max <n>] [--interval <seconds>]
-af governor stop
-af governor status
-```
-
-### `af worker`
-
-Start and manage fleet workers.
-
-```bash
-af worker start [--register-url <url>] [--token <token>]
-af worker list
-```
-
 ### `af daemon`
 
 Start and manage the local daemon. The daemon installs as a launchd agent
@@ -239,6 +208,31 @@ af daemon evict --repo <repo> [--older-than <duration>]
 
 Environment: `RENSEI_DAEMON_TOKEN` (optional — `af daemon install` provisions
 this automatically when `~/.config/rensei/config.json` contains a platform key).
+
+### `af governor`
+
+Start, stop, and query the governor scan loop.
+
+```bash
+af governor start [--max <n>] [--interval <seconds>]
+af governor stop
+af governor status
+```
+
+### `af worker` and `af fleet`
+
+Legacy local process-manager commands for standalone OSS debugging. `af daemon`
+is the primary host lifecycle surface for normal operation, while these commands
+remain available in the `af` binary for users who need the older foreground
+worker host or PID-file fleet flow.
+
+```bash
+af worker start [--base-url <url>] [--provisioning-token <token>]
+af fleet start --count <n>
+af fleet status
+af fleet stop
+af fleet scale --count <n>
+```
 
 ### `af orchestrator`
 
@@ -477,8 +471,10 @@ make run-status-mock # Run status with mock data
 ## Architecture
 
 The public library surface (`afclient`, `afcli`, `worker`) is designed to be
-imported by downstream consumers. `rensei-tui` imports all `af` commands via
-`afcli.RegisterCommands` and extends them with platform-specific subcommands.
+imported by downstream consumers. Embedders use `afcli.RegisterCommands` and
+extend the generic OSS command set with their own subcommands. The standalone
+`af` binary opts into legacy worker/fleet process-manager commands; embedders
+that want the daemon-only lifecycle surface can leave those commands disabled.
 
 See `AGENTS.md` for the full package layout and contributor guide. The
 authoritative architecture corpus lives in

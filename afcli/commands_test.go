@@ -49,21 +49,30 @@ func TestRegisterCommandsWiring(t *testing.T) {
 		wantAbsent  []string
 	}{
 		{
-			name: "default_config_omits_dashboard",
+			name: "default_config_omits_dashboard_and_legacy_worker_fleet",
 			cfg: Config{
 				ClientFactory: func() afclient.DataSource { return afclient.NewMockClient() },
 			},
-			wantPresent: []string{"admin", "agent", "fleet", "governor", "logs", "session", "status", "worker"},
-			wantAbsent:  []string{"dashboard"},
+			wantPresent: []string{"admin", "agent", "daemon", "governor", "logs", "session", "status"},
+			wantAbsent:  []string{"dashboard", "fleet", "worker"},
 		},
 		{
-			name: "enable_dashboard_registers_dashboard",
+			name: "enable_dashboard_registers_dashboard_without_legacy_worker_fleet",
 			cfg: Config{
 				ClientFactory:   func() afclient.DataSource { return afclient.NewMockClient() },
 				EnableDashboard: true,
 			},
-			wantPresent: []string{"admin", "agent", "dashboard", "fleet", "governor", "logs", "session", "status", "worker"},
-			wantAbsent:  nil,
+			wantPresent: []string{"admin", "agent", "daemon", "dashboard", "governor", "logs", "session", "status"},
+			wantAbsent:  []string{"fleet", "worker"},
+		},
+		{
+			name: "enable_legacy_worker_fleet_registers_standalone_process_commands",
+			cfg: Config{
+				ClientFactory:           func() afclient.DataSource { return afclient.NewMockClient() },
+				EnableLegacyWorkerFleet: true,
+			},
+			wantPresent: []string{"admin", "agent", "daemon", "fleet", "governor", "logs", "session", "status", "worker"},
+			wantAbsent:  []string{"dashboard"},
 		},
 	}
 

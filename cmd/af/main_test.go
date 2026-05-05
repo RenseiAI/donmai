@@ -203,3 +203,20 @@ func TestHelpOutputContainsFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestStandaloneAfRegistersLegacyWorkerFleetCommands(t *testing.T) {
+	cmd, _ := newRootCmd()
+
+	for _, want := range []string{"daemon", "fleet", "worker"} {
+		found := false
+		for _, child := range cmd.Commands() {
+			if child.Name() == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("standalone af missing %q command", want)
+		}
+	}
+}

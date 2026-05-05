@@ -160,9 +160,10 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 	cmd.PersistentFlags().BoolVar(&flags.quiet, "quiet", false, "Suppress all log output")
 
 	afcli.RegisterCommands(cmd, afcli.Config{
-		ClientFactory:   func() afclient.DataSource { return buildDataSource(flags) },
-		DefaultURLFunc:  func() string { return flags.url },
-		EnableDashboard: true,
+		ClientFactory:           func() afclient.DataSource { return buildDataSource(flags) },
+		DefaultURLFunc:          func() string { return flags.url },
+		EnableDashboard:         true,
+		EnableLegacyWorkerFleet: true,
 	})
 
 	return cmd, flags

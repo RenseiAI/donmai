@@ -1,6 +1,6 @@
 // Package afcli provides Cobra command factories for the AgentFactory CLI.
 // Downstream projects can import this package and call
-// RegisterCommands to add all af subcommands to their own root command.
+// RegisterCommands to add the shared af subcommands to their own root command.
 package afcli
 
 import (
@@ -24,6 +24,12 @@ type Config struct {
 	// EnableDashboard registers the dashboard command when true.
 	EnableDashboard bool
 
+	// EnableLegacyWorkerFleet registers the legacy worker/fleet process
+	// commands when true. These commands remain available to the standalone
+	// OSS af binary for local debugging, but embedders should usually expose
+	// daemon as the host lifecycle surface instead.
+	EnableLegacyWorkerFleet bool
+
 	// ProjectFunc returns the active project slug (or ID) used to scope
 	// list endpoints that support filtering. Returning an empty string
 	// means fleet-wide (no scope), preserving the default behavior.
@@ -45,20 +51,23 @@ func (c Config) resolveURL() string {
 	return "http://localhost:3000"
 }
 
-// RegisterCommands adds all AgentFactory subcommands to the given root
-// command. The commands use cfg to resolve API clients and defaults.
+// RegisterCommands adds the shared AgentFactory subcommands to the given root
+// command. Optional local/debug surfaces are controlled by Config. The commands
+// use cfg to resolve API clients and defaults.
 //
 // This is the primary integration point for downstream CLIs that want
 // to embed AgentFactory functionality under their own root command
-// (e.g. `mycli dashboard`, `mycli agent list`, etc.).
+// (e.g. `mycli agent list`, `mycli daemon status`, etc.).
 func RegisterCommands(root *cobra.Command, cfg Config) {
 	ds := cfg.ClientFactory
 	root.AddCommand(newStatusCmd(ds))
 	root.AddCommand(newAgentCmd(ds, cfg.ProjectFunc))
 	root.AddCommand(newSessionCmd(ds, cfg.ProjectFunc))
 	root.AddCommand(newGovernorCmd(ds))
-	root.AddCommand(newWorkerCmd(ds))
-	root.AddCommand(newFleetCmd(ds))
+	if cfg.EnableLegacyWorkerFleet {
+		root.AddCommand(newWorkerCmd(ds))
+		root.AddCommand(newFleetCmd(ds))
+	}
 	root.AddCommand(newDaemonCmd())
 	root.AddCommand(newProjectCmd())
 	root.AddCommand(newOrchestratorCmd())
