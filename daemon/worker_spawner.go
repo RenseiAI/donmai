@@ -150,6 +150,18 @@ func (s *WorkerSpawner) Resume() {
 	s.accepting = true
 }
 
+// SetMaxConcurrentSessions updates the local session capacity used for future
+// AcceptWork decisions. Existing sessions are never interrupted.
+func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
+	if n < 0 {
+		return errors.New("max concurrent sessions must be >= 0")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opts.MaxConcurrentSessions = n
+	return nil
+}
+
 // AcceptWork validates the spec, spawns a worker, and returns its handle.
 func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	s.mu.Lock()

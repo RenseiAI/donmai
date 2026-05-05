@@ -206,6 +206,13 @@ af daemon set <key> <value>            # mutate a single config key
 af daemon evict --repo <repo> [--older-than <duration>]
 ```
 
+Supported capacity keys:
+
+```bash
+af daemon set capacity.maxConcurrentSessions <sessions>
+af daemon set capacity.poolMaxDiskGb <gb>
+```
+
 Environment: `RENSEI_DAEMON_TOKEN` (optional — `af daemon install` provisions
 this automatically when `~/.config/rensei/config.json` contains a platform key).
 

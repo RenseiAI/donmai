@@ -961,13 +961,13 @@ func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 // ── set ───────────────────────────────────────────────────────────────────────
 
 // allowedCapacityKeys is the set of dotted config keys accepted by `af daemon set`.
-// Currently only capacity.poolMaxDiskGb is supported (REN-1334).
 var allowedCapacityKeys = map[string]struct{}{
-	"capacity.poolMaxDiskGb": {},
+	"capacity.maxConcurrentSessions": {},
+	"capacity.poolMaxDiskGb":         {},
 }
 
 // newDaemonSetCmd returns the `af daemon set` command.
-// Usage: af daemon set capacity.poolMaxDiskGb <N>
+// Usage: af daemon set <capacity key> <N>
 func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	var (
 		port    int
@@ -981,8 +981,10 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 		Short: "Set a daemon configuration value",
 		Long: "Set a daemon configuration key to a new value.\n\n" +
 			"Supported keys:\n" +
-			"  capacity.poolMaxDiskGb  Maximum total pool disk usage in GiB before\n" +
-			"                          LRU eviction triggers (0 = no limit).\n\n" +
+			"  capacity.maxConcurrentSessions  Maximum concurrently accepted sessions\n" +
+			"                                  for this local daemon (0 = accept none).\n" +
+			"  capacity.poolMaxDiskGb          Maximum total pool disk usage in GiB before\n" +
+			"                                  LRU eviction triggers (0 = no limit).\n\n" +
 			"The change is written atomically to ~/.rensei/daemon.yaml and the daemon\n" +
 			"reloads the affected subsystem without a restart.",
 		Args:         cobra.ExactArgs(2),
@@ -992,15 +994,15 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			value := args[1]
 
 			if _, ok := allowedCapacityKeys[key]; !ok {
-				return fmt.Errorf("unknown config key %q — supported keys: capacity.poolMaxDiskGb", key)
+				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb", key)
 			}
 
-			// Validate capacity.poolMaxDiskGb locally so we give a clear error
+			// Validate integer capacity keys locally so we give a clear error
 			// before hitting the daemon.
-			if key == "capacity.poolMaxDiskGb" {
+			if key == "capacity.poolMaxDiskGb" || key == "capacity.maxConcurrentSessions" {
 				n, err := strconv.Atoi(value)
 				if err != nil || n < 0 {
-					return fmt.Errorf("capacity.poolMaxDiskGb must be a non-negative integer, got %q", value)
+					return fmt.Errorf("%s must be a non-negative integer, got %q", key, value)
 				}
 				// Write the value to daemon.yaml atomically via WriteDaemonYAML.
 				// The daemon also accepts it via HTTP; we do the local write so
@@ -1013,7 +1015,12 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 				if readErr != nil {
 					return fmt.Errorf("read daemon config: %w", readErr)
 				}
-				cfg.Capacity.PoolMaxDiskGb = n
+				switch key {
+				case "capacity.maxConcurrentSessions":
+					cfg.Capacity.MaxConcurrentSessions = n
+				case "capacity.poolMaxDiskGb":
+					cfg.Capacity.PoolMaxDiskGb = n
+				}
 				if writeErr := afclient.WriteDaemonYAML(yamlPath, cfg); writeErr != nil {
 					return fmt.Errorf("write daemon config: %w", writeErr)
 				}

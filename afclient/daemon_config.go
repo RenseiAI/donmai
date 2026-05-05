@@ -124,6 +124,9 @@ func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 // daemon.yaml under the `capacity` key. REN-1334 adds `poolMaxDiskGb` for
 // automatic LRU eviction of the workarea pool once the disk threshold is hit.
 type CapacityConfig struct {
+	// MaxConcurrentSessions is the maximum number of sessions the local
+	// daemon accepts concurrently. 0 means do not accept new sessions.
+	MaxConcurrentSessions int `yaml:"maxConcurrentSessions,omitempty" json:"maxConcurrentSessions,omitempty"`
 	// PoolMaxDiskGb is the maximum total disk usage (in GiB) for the workarea
 	// pool before the daemon starts LRU-evicting cold members.  0 means no limit.
 	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`

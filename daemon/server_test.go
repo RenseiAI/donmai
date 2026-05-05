@@ -224,6 +224,22 @@ func TestServer_SetCapacity(t *testing.T) {
 	}
 }
 
+func TestServer_SetMaxConcurrentSessions(t *testing.T) {
+	d, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+	var resp afclient.SetCapacityResponse
+	requirePost(t, srv.Addr(), "/api/daemon/capacity", map[string]string{
+		"key":   "capacity.maxConcurrentSessions",
+		"value": "2",
+	}, &resp)
+	if !resp.OK {
+		t.Fatalf("expected OK, got %+v", resp)
+	}
+	if got := d.config.Capacity.MaxConcurrentSessions; got != 2 {
+		t.Errorf("MaxConcurrentSessions = %d, want 2", got)
+	}
+}
+
 func TestServer_SetCapacity_RejectsUnknownKey(t *testing.T) {
 	_, srv, cleanup := mustStartDaemon(t)
 	defer cleanup()

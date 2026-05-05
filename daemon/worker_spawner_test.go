@@ -77,6 +77,26 @@ func TestSpawner_CapacityEnforced(t *testing.T) {
 	}
 }
 
+func TestSpawner_SetMaxConcurrentSessions(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 1"},
+	})
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "1", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("first accept: %v", err)
+	}
+	if err := s.SetMaxConcurrentSessions(2); err != nil {
+		t.Fatalf("SetMaxConcurrentSessions: %v", err)
+	}
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "2", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("second accept after scale up: %v", err)
+	}
+	if err := s.SetMaxConcurrentSessions(-1); err == nil {
+		t.Fatal("expected negative capacity to fail")
+	}
+}
+
 func TestSpawner_Drain_RespectsTimeout(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},

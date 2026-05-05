@@ -244,12 +244,6 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if body.Key != "capacity.poolMaxDiskGb" {
-		writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
-			OK: false, Key: body.Key, Value: body.Value, Message: "unknown key",
-		})
-		return
-	}
 	n, err := strconv.Atoi(body.Value)
 	if err != nil || n < 0 {
 		writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
@@ -257,12 +251,37 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// Persist to in-memory config; the CLI also writes daemon.yaml directly.
-	s.daemon.mu.Lock()
-	if s.daemon.config != nil {
-		s.daemon.config.Capacity.PoolMaxDiskGb = n
+
+	switch body.Key {
+	case "capacity.poolMaxDiskGb":
+		// Persist to in-memory config; the CLI also writes daemon.yaml directly.
+		s.daemon.mu.Lock()
+		if s.daemon.config != nil {
+			s.daemon.config.Capacity.PoolMaxDiskGb = n
+		}
+		s.daemon.mu.Unlock()
+	case "capacity.maxConcurrentSessions":
+		s.daemon.mu.Lock()
+		if s.daemon.config != nil {
+			s.daemon.config.Capacity.MaxConcurrentSessions = n
+		}
+		spawner := s.daemon.spawner
+		s.daemon.mu.Unlock()
+		if spawner != nil {
+			if err := spawner.SetMaxConcurrentSessions(n); err != nil {
+				writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+					OK: false, Key: body.Key, Value: body.Value, Message: err.Error(),
+				})
+				return
+			}
+		}
+	default:
+		writeJSON(w, http.StatusBadRequest, &afclient.SetCapacityResponse{
+			OK: false, Key: body.Key, Value: body.Value, Message: "unknown key",
+		})
+		return
 	}
-	s.daemon.mu.Unlock()
+
 	writeJSON(w, http.StatusOK, &afclient.SetCapacityResponse{
 		OK: true, Key: body.Key, Value: body.Value, Message: "applied",
 	})

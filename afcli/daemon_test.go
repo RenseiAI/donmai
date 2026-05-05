@@ -1202,6 +1202,40 @@ func TestDaemonSetCapacitySuccess(t *testing.T) {
 	}
 }
 
+func TestDaemonSetMaxConcurrentSessionsSuccess(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockDaemon{
+		setCapResp: &afclient.SetCapacityResponse{
+			OK:      true,
+			Key:     "capacity.maxConcurrentSessions",
+			Value:   "6",
+			Message: "updated",
+		},
+	}
+	tmpDir := t.TempDir()
+	buf, err := newTestDaemonCmd(mock, []string{
+		"set", "capacity.maxConcurrentSessions", "6",
+		"--config", tmpDir + "/daemon.yaml",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !strings.Contains(buf.String(), "capacity.maxConcurrentSessions") {
+		t.Errorf("output missing key; got:\n%s", buf.String())
+	}
+	if mock.setCapKey != "capacity.maxConcurrentSessions" {
+		t.Errorf("SetCapacityConfig key = %q, want %q", mock.setCapKey, "capacity.maxConcurrentSessions")
+	}
+	cfg, readErr := afclient.ReadDaemonYAML(tmpDir + "/daemon.yaml")
+	if readErr != nil {
+		t.Fatalf("ReadDaemonYAML: %v", readErr)
+	}
+	if cfg.Capacity.MaxConcurrentSessions != 6 {
+		t.Errorf("maxConcurrentSessions = %d, want 6", cfg.Capacity.MaxConcurrentSessions)
+	}
+}
+
 func TestDaemonSetCapacityJSONOutput(t *testing.T) {
 	t.Parallel()
 
