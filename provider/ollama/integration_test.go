@@ -131,6 +131,12 @@ func TestNew_probeSucceeds(t *testing.T) {
 	if caps.SupportsMessageInjection || caps.SupportsSessionResume || caps.SupportsToolPlugins {
 		t.Errorf("Capabilities: ollama should not advertise injection/resume/tools; got %+v", caps)
 	}
+	// Tool-use surface (002 v2): false/false — /api/chat does not expose
+	// `tools` or MCP shape, so Spec.AllowedTools / Spec.MCPServers are
+	// silently dropped by the runner before reaching this provider.
+	if caps.AcceptsAllowedToolsList || caps.AcceptsMcpServerSpec {
+		t.Errorf("Capabilities: ollama should not advertise tool-use accept flags; got %+v", caps)
+	}
 	if caps.HumanLabel != "Ollama" {
 		t.Errorf("Capabilities.HumanLabel: got %q want Ollama", caps.HumanLabel)
 	}

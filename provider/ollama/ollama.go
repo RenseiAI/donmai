@@ -122,7 +122,14 @@ func (*Provider) Capabilities() agent.Capabilities {
 		EmitsSubagentEvents:                 false,
 		SupportsReasoningEffort:             false,
 		ToolPermissionFormat:                "claude",
-		HumanLabel:                          "Ollama",
+		// Tool-use surface (002 v2): /api/chat does not expose `tools`
+		// or MCP shape today. Some Ollama models (llama3.1, gemma3)
+		// support OpenAI-compat function calling, but this provider
+		// targets the bare /api/chat surface — declare false until
+		// wired.
+		AcceptsAllowedToolsList: false,
+		AcceptsMcpServerSpec:    false,
+		HumanLabel:              "Ollama",
 	}
 }
 

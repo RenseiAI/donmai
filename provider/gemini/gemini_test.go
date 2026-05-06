@@ -75,6 +75,12 @@ func TestProvider_Capabilities_Conservative(t *testing.T) {
 	if caps.SupportsToolPlugins {
 		t.Error("SupportsToolPlugins: want false in v0.1")
 	}
+	if caps.AcceptsAllowedToolsList {
+		t.Error("AcceptsAllowedToolsList: want false (function-calling not wired in v0.1)")
+	}
+	if caps.AcceptsMcpServerSpec {
+		t.Error("AcceptsMcpServerSpec: want false (MCP not wired in v0.1)")
+	}
 	if caps.HumanLabel != "Gemini" {
 		t.Errorf("HumanLabel: want %q, got %q", "Gemini", caps.HumanLabel)
 	}

@@ -138,6 +138,16 @@ func TestProvider_Capabilities_Conservative(t *testing.T) {
 	if caps.SupportsSessionResume {
 		t.Error("SupportsSessionResume: want false (registration-only)")
 	}
+	if caps.SupportsToolPlugins {
+		t.Error("SupportsToolPlugins: want false (registration-only)")
+	}
+	// Tool-use surface (002 v2): false/false — registration-only.
+	if caps.AcceptsAllowedToolsList {
+		t.Error("AcceptsAllowedToolsList: want false (registration-only)")
+	}
+	if caps.AcceptsMcpServerSpec {
+		t.Error("AcceptsMcpServerSpec: want false (registration-only)")
+	}
 	if caps.HumanLabel != "OpenCode" {
 		t.Errorf("HumanLabel: want %q, got %q", "OpenCode", caps.HumanLabel)
 	}

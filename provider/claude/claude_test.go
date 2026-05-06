@@ -105,6 +105,13 @@ func TestProvider_Capabilities_v0_5_0(t *testing.T) {
 	if caps.ToolPermissionFormat != "claude" {
 		t.Errorf("ToolPermissionFormat = %q, want %q", caps.ToolPermissionFormat, "claude")
 	}
+	// Tool-use surface (002 v2): both wired through the CLI.
+	if !caps.AcceptsAllowedToolsList {
+		t.Error("AcceptsAllowedToolsList should be true (Spec.AllowedTools → --allowedTools)")
+	}
+	if !caps.AcceptsMcpServerSpec {
+		t.Error("AcceptsMcpServerSpec should be true (Spec.MCPServers → --mcp-config tmpfile)")
+	}
 	if caps.HumanLabel != "Claude" {
 		t.Errorf("HumanLabel = %q, want %q", caps.HumanLabel, "Claude")
 	}

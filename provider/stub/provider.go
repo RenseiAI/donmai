@@ -24,7 +24,15 @@ func defaultCapabilities() agent.Capabilities {
 		EmitsSubagentEvents:                 true,
 		SupportsReasoningEffort:             true,
 		ToolPermissionFormat:                "claude",
-		HumanLabel:                          "Test Stub",
+		// Tool-use surface (002 v2): the stub honours the same wire
+		// shape as Claude so the runner exercises every gating branch
+		// when wired against the stub. The scripted handler does not
+		// consume the values — but the contract is "the field is
+		// observed, not silently dropped" which the stub satisfies by
+		// virtue of being all-on for tests.
+		AcceptsAllowedToolsList: true,
+		AcceptsMcpServerSpec:    true,
+		HumanLabel:              "Test Stub",
 	}
 }
 

@@ -95,6 +95,15 @@ func TestProvider_NameAndCapabilities(t *testing.T) {
 	if caps.ToolPermissionFormat != "codex" {
 		t.Fatalf("expected ToolPermissionFormat=codex, got %q", caps.ToolPermissionFormat)
 	}
+	// Tool-use surface (002 v2): MCPServers wired via config/batchWrite;
+	// AllowedTools NOT wired (codex routes per-tool permission via the
+	// approval bridge, Spec.PermissionConfig). Declared honestly.
+	if !caps.AcceptsMcpServerSpec {
+		t.Errorf("AcceptsMcpServerSpec: want true (config/batchWrite mcpServers wired); got false")
+	}
+	if caps.AcceptsAllowedToolsList {
+		t.Errorf("AcceptsAllowedToolsList: want false (codex uses approval bridge); got true")
+	}
 }
 
 func TestProvider_ResumeRejectsEmptySessionID(t *testing.T) {

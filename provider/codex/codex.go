@@ -190,7 +190,16 @@ func (p *Provider) Capabilities() agent.Capabilities {
 		EmitsSubagentEvents:                 false,
 		SupportsReasoningEffort:             true,
 		ToolPermissionFormat:                "codex",
-		HumanLabel:                          "Codex",
+		// Tool-use surface (002 v2):
+		//   - MCPServers IS wired via `config/batchWrite` mcpServers
+		//     keyPath (see spec_translation.go::mcpServersConfig).
+		//   - AllowedTools is NOT wired: codex routes per-tool
+		//     permission through the approval-bridge grammar
+		//     (Spec.PermissionConfig). Flat allow/deny lists are
+		//     dropped with a SpecFieldNote in NewSpawnPlan.
+		AcceptsAllowedToolsList: false,
+		AcceptsMcpServerSpec:    true,
+		HumanLabel:              "Codex",
 	}
 }
 
