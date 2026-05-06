@@ -239,9 +239,10 @@ func (h *HeartbeatService) workerIDLocked() string {
 // heartbeatRequestBody is the JSON body sent on POST
 // /api/workers/<id>/heartbeat. Matches the platform contract:
 //
-//	{ activeCount: number, load?: { cpu, memory } }
+//	{ activeCount: number, maxSessions?: number, load?: { cpu, memory } }
 type heartbeatRequestBody struct {
 	ActiveCount int                  `json:"activeCount"`
+	MaxSessions int                  `json:"maxSessions,omitempty"`
 	Load        *heartbeatLoadFields `json:"load,omitempty"`
 }
 
@@ -262,6 +263,7 @@ func (h *HeartbeatService) callEndpoint(ctx context.Context, payload HeartbeatPa
 
 	body := heartbeatRequestBody{
 		ActiveCount: payload.ActiveSessions,
+		MaxSessions: payload.MaxSessions,
 	}
 	buf, err := json.Marshal(body)
 	if err != nil {

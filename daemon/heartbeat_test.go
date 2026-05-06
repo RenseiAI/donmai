@@ -58,8 +58,7 @@ func TestHeartbeatService_IdempotentStart(_ *testing.T) {
 
 // TestHeartbeatService_HitsPlatformEndpoint verifies the heartbeat HTTP call
 // targets /api/workers/<id>/heartbeat with the runtime JWT in the
-// Authorization header and { activeCount } in the body — the real platform
-// contract (REN-1422 wire fix).
+// Authorization header and { activeCount, maxSessions } in the body.
 func TestHeartbeatService_HitsPlatformEndpoint(t *testing.T) {
 	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
 
@@ -124,6 +123,9 @@ func TestHeartbeatService_HitsPlatformEndpoint(t *testing.T) {
 	}
 	if got, _ := body["activeCount"].(float64); got != 3 {
 		t.Errorf("body.activeCount = %v, want 3", body["activeCount"])
+	}
+	if got, _ := body["maxSessions"].(float64); got != 8 {
+		t.Errorf("body.maxSessions = %v, want 8", body["maxSessions"])
 	}
 }
 

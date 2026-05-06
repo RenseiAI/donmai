@@ -19,6 +19,7 @@ import (
 type RegistrationOptions struct {
 	OrchestratorURL   string
 	RegistrationToken string
+	MachineID         string
 	Hostname          string
 	Version           string
 	MaxAgents         int
@@ -38,17 +39,18 @@ type RegistrationOptions struct {
 //
 // The platform contract (see platform/src/app/api/workers/register/route.ts):
 //
-//	{ hostname: string, capacity: number, version?: string, projects?: string[] }
+//	{ machineId?: string, hostname: string, capacity: number, version?: string, projects?: string[] }
 //
 // The registration token is sent in the Authorization: Bearer header, NOT in
 // the body. Status / region / capabilities / activeAgentCount are not part of
 // the platform contract — they live in the heartbeat payload, or are inferred
 // from the project's Linear tracker bindings on the server side.
 type RegisterRequest struct {
-	Hostname string   `json:"hostname"`
-	Capacity int      `json:"capacity"`
-	Version  string   `json:"version,omitempty"`
-	Projects []string `json:"projects,omitempty"`
+	MachineID string   `json:"machineId,omitempty"`
+	Hostname  string   `json:"hostname"`
+	Capacity  int      `json:"capacity"`
+	Version   string   `json:"version,omitempty"`
+	Projects  []string `json:"projects,omitempty"`
 }
 
 // RegisterResponse is the JSON response from POST /api/workers/register.
@@ -223,9 +225,13 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		capacity = 1
 	}
 	req := RegisterRequest{
-		Hostname: opts.Hostname,
-		Capacity: capacity,
-		Version:  opts.Version,
+		MachineID: opts.MachineID,
+		Hostname:  opts.Hostname,
+		Capacity:  capacity,
+		Version:   opts.Version,
+	}
+	if req.MachineID == "" {
+		req.MachineID = opts.Hostname
 	}
 
 	useStub := stubModeRequested() ||

@@ -134,6 +134,7 @@ func TestRegister_FileURLForcesStub(t *testing.T) {
 	resp, err := Register(context.Background(), RegistrationOptions{
 		OrchestratorURL:   "file:///tmp/queue",
 		RegistrationToken: tok,
+		MachineID:         "machine-test-host",
 		Hostname:          "test-host",
 		Version:           "0.4.0-dev",
 		MaxAgents:         4,
@@ -184,6 +185,7 @@ func TestRegister_RealEndpoint(t *testing.T) {
 	resp, err := Register(context.Background(), RegistrationOptions{
 		OrchestratorURL:   srv.URL,
 		RegistrationToken: tok,
+		MachineID:         "machine-test-host",
 		Hostname:          "test-host",
 		Version:           "0.4.0-dev",
 		MaxAgents:         4,
@@ -211,7 +213,10 @@ func TestRegister_RealEndpoint(t *testing.T) {
 	if got, want := capturedAuth, "Bearer "+tok; got != want {
 		t.Errorf("Authorization header = %q, want %q", got, want)
 	}
-	// Wire contract: body is { hostname, capacity, version }.
+	// Wire contract: body is { machineId, hostname, capacity, version }.
+	if capturedBody.MachineID != "machine-test-host" {
+		t.Errorf("body.machineId = %q", capturedBody.MachineID)
+	}
 	if capturedBody.Hostname != "test-host" {
 		t.Errorf("body.hostname = %q", capturedBody.Hostname)
 	}

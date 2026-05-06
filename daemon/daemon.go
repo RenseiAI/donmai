@@ -193,6 +193,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		regOpts = RegistrationOptions{
 			OrchestratorURL:   cfg.Orchestrator.URL,
 			RegistrationToken: token,
+			MachineID:         cfg.Machine.ID,
 			Hostname:          cfg.Machine.ID,
 			Version:           Version,
 			MaxAgents:         cfg.Capacity.MaxConcurrentSessions,
