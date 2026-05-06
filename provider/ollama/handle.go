@@ -42,8 +42,8 @@ type Handle struct {
 	resp      *http.Response
 	cancel    context.CancelFunc
 
-	events  chan agent.Event
-	logger  *slog.Logger
+	events chan agent.Event
+	logger *slog.Logger
 
 	// shutdown is closed by Stop to broadcast termination to the body
 	// reader (which selects on it before each channel send).
