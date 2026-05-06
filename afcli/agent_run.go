@@ -23,6 +23,7 @@ import (
 	"github.com/RenseiAI/agentfactory-tui/prompt"
 	providerclaude "github.com/RenseiAI/agentfactory-tui/provider/claude"
 	providercodex "github.com/RenseiAI/agentfactory-tui/provider/codex"
+	providerollama "github.com/RenseiAI/agentfactory-tui/provider/ollama"
 	providerstub "github.com/RenseiAI/agentfactory-tui/provider/stub"
 	"github.com/RenseiAI/agentfactory-tui/result"
 	"github.com/RenseiAI/agentfactory-tui/runner"
@@ -389,6 +390,14 @@ func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
 		{name: "stub", new: func() (agent.Provider, error) { return providerstub.New() }},
 		{name: "claude", new: func() (agent.Provider, error) { return providerclaude.New(providerclaude.Options{}) }},
 		{name: "codex", new: func() (agent.Provider, error) { return providercodex.New(providercodex.Options{}) }},
+		// Ollama is local-first: probe is a quick GET /api/tags against
+		// http://localhost:11434. If `ollama serve` is not running on
+		// this host the probe wraps agent.ErrProviderUnavailable and
+		// the registry skips it (operator-visible WARN log). Sessions
+		// that resolved to provider="ollama" then fail at
+		// runner.Resolve with agent.ErrNoProvider — which is the
+		// correct loud failure when the local runtime is missing.
+		{name: "ollama", new: func() (agent.Provider, error) { return providerollama.New(providerollama.Options{}) }},
 	})
 }
 
