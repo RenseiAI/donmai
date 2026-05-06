@@ -8,7 +8,23 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-_Placeholder for v0.4.0 work. Move items here as they merge._
+_No work staged for the next release._
+
+---
+
+## v0.6.0 — 2026-05-06
+
+### Features
+
+- **Ollama agent-runtime provider (full real impl)** — Local-first provider against `http://localhost:11434/api/chat` with `stream=true`. Stateless: `Resume` and `Inject` return `ErrUnsupported`; `Stop` cancels the in-flight request via context. Probe is `GET /api/tags`; missing daemon → registry warn-and-skip. 25 unit/integration tests via httptest fake. Capabilities conservative (no tool plugins, no resume, no MCP).
+- **Gemini native agent-runtime provider (full real impl)** — Against Google's `generativelanguage.googleapis.com/v1beta/models/<model>:streamGenerateContent?alt=sse`. Spec translation builds `Contents` + `systemInstruction` + `GenerationConfig`; event mapping handles text parts, finishReason/usageMetadata terminals, promptFeedback.blockReason errors. Auth via `GEMINI_API_KEY` or `GOOGLE_API_KEY`. 26 tests.
+- **Amp + OpenCode providers (registration-only)** — Both upstream APIs lack the stability today for a real runner. Constructors probe their env/endpoint and register cleanly; `Spawn` returns `ErrSpawnFailed` with a clear "runner not yet shipped" message. The contract has the architectural hooks so real impls drop in without contract change once Sourcegraph/SST stabilize. 20 tests across the two.
+- **Daemon protocol: `machineId` on register, `maxSessions` on heartbeat** — Aligns with the platform's `worker_hosts` schema. `RegisterRequest.MachineID` populated from daemon config; `HeartbeatPayload.MaxSessions` populated via new `Daemon.maxConcurrentSessions()` getter that reads `Config.Capacity.MaxConcurrentSessions` under `d.mu.RLock()`.
+- **Tool-use capability surface declared on every provider** — Adds `AcceptsAllowedToolsList` and `AcceptsMcpServerSpec` to `agent.Capabilities`. Each provider declares the flags honestly: claude (true/true), codex (false/true — MCP via `config/batchWrite`), stub (true/true — exercises gating), ollama / gemini / amp / opencode (false/false). Runner `spec_translation` strips `Spec.MCPServers` and `Spec.AllowedTools` for providers that declare false (warn-and-ignore). New `runner/spec_translation_test.go` and `afcli/tooluse_matrix_test.go`.
+
+### Fixes
+
+- **Data race: `handleSetCapacity` vs heartbeat read of `Capacity.MaxConcurrentSessions`** — The local control API's `POST /api/daemon/capacity` writes the field under `d.mu.Lock()`, but the heartbeat closure captured the underlying pointer and read it without the lock. Routed through new `Daemon.maxConcurrentSessions()` getter. Caught by CI's `-race` detector — the race was real (operator-driven capacity change racing with the next heartbeat tick).
 
 ### Features (foundation-tool-use)
 
