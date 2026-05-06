@@ -149,6 +149,20 @@ func (d *Daemon) ActiveSessions() []SessionHandle {
 	return d.spawner.ActiveSessions()
 }
 
+// maxConcurrentSessions returns the current per-host capacity envelope under
+// the read lock. Capacity can be mutated at runtime via the local control
+// API (POST /api/daemon/capacity → handleSetCapacity), and the heartbeat
+// loop reads it concurrently — without this lock the race detector flags
+// the read in heartbeat.go vs the write in server.go.
+func (d *Daemon) maxConcurrentSessions() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.config == nil {
+		return 0
+	}
+	return d.config.Capacity.MaxConcurrentSessions
+}
+
 // Start brings the daemon online: load config (or wizard), register, start
 // heartbeat, and start the spawner. The HTTP server is NOT started here;
 // callers do that explicitly via Server.Start so they can pick the bind.
@@ -295,7 +309,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			RuntimeJWT:      regResp.RuntimeToken,
 			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
 			GetActiveCount:  func() int { return d.spawnerActiveCount() },
-			GetMaxCount:     func() int { return cfg.Capacity.MaxConcurrentSessions },
+			GetMaxCount:     func() int { return d.maxConcurrentSessions() },
 			GetStatus:       d.registrationStatus,
 			Region:          cfg.Machine.Region,
 			OnReregister:    reregister,
