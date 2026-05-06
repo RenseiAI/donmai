@@ -21,8 +21,11 @@ import (
 	"github.com/RenseiAI/agentfactory-tui/agent"
 	"github.com/RenseiAI/agentfactory-tui/daemon"
 	"github.com/RenseiAI/agentfactory-tui/prompt"
+	provideramp "github.com/RenseiAI/agentfactory-tui/provider/amp"
 	providerclaude "github.com/RenseiAI/agentfactory-tui/provider/claude"
 	providercodex "github.com/RenseiAI/agentfactory-tui/provider/codex"
+	providergemini "github.com/RenseiAI/agentfactory-tui/provider/gemini"
+	provideropencode "github.com/RenseiAI/agentfactory-tui/provider/opencode"
 	providerstub "github.com/RenseiAI/agentfactory-tui/provider/stub"
 	"github.com/RenseiAI/agentfactory-tui/result"
 	"github.com/RenseiAI/agentfactory-tui/runner"
@@ -384,11 +387,21 @@ type providerCtor struct {
 // zero providers, an ERROR-level log fires — that is a fatal
 // misconfiguration and any subsequent runner.Run will fail because
 // no provider can resolve.
+//
+// Foundation-runtime-stubs adds three more probe-and-skip entries
+// (REN-1499 amp, REN-1500 gemini, REN-1501 opencode). Each follows
+// the same warn-and-skip contract as claude / codex: if the
+// constructor returns ErrProviderUnavailable (no API key, server
+// unreachable) the registry build logs WARN and proceeds without
+// that provider, identical to the existing probe-failure path.
 func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
 	return buildRegistryFromCtors(logger, []providerCtor{
 		{name: "stub", new: func() (agent.Provider, error) { return providerstub.New() }},
 		{name: "claude", new: func() (agent.Provider, error) { return providerclaude.New(providerclaude.Options{}) }},
 		{name: "codex", new: func() (agent.Provider, error) { return providercodex.New(providercodex.Options{}) }},
+		{name: "amp", new: func() (agent.Provider, error) { return provideramp.New(provideramp.Options{}) }},
+		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
+		{name: "opencode", new: func() (agent.Provider, error) { return provideropencode.New(provideropencode.Options{}) }},
 	})
 }
 
