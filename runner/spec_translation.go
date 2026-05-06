@@ -68,11 +68,23 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	}
 
 	// MCP tool plugins: only forward MCPServers when the provider
-	// declares SupportsToolPlugins. Other providers ignore the field
-	// anyway, but zeroing it keeps the on-the-wire Spec faithful to
-	// what the provider will actually consume.
-	if !caps.SupportsToolPlugins {
+	// declares SupportsToolPlugins AND honours the Spec field shape
+	// (AcceptsMcpServerSpec). Other providers ignore the field anyway,
+	// but zeroing it keeps the on-the-wire Spec faithful to what the
+	// provider will actually consume. Per 002 v2 §"Tool-use surface".
+	if !caps.SupportsToolPlugins || !caps.AcceptsMcpServerSpec {
 		spec.MCPServers = nil
+	}
+
+	// AllowedTools: only forward when the provider honours the Spec
+	// field shape (AcceptsAllowedToolsList). Codex routes per-tool
+	// permission through the approval bridge (Spec.PermissionConfig)
+	// and ignores AllowedTools; zero the field to match what the
+	// provider actually consumes. Behaviour is warn-and-ignore in the
+	// loop's spec-prep path: stripped values surface as a Debug log
+	// (see loop.go) so operators can detect silently dropped knobs.
+	if !caps.AcceptsAllowedToolsList {
+		spec.AllowedTools = nil
 	}
 
 	// MCPToolNames is derived from MCPServers — every server we ship

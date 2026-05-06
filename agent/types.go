@@ -56,6 +56,16 @@ const (
 	CapSubagentEvents             Capability = "subagent_events"
 	CapReasoningEffort            Capability = "reasoning_effort"
 	CapToolPermissionFormatClaude Capability = "tool_perm_format_claude"
+	// CapAcceptsAllowedToolsList reports whether the provider honors
+	// Spec.AllowedTools end-to-end (translation into upstream API).
+	// Tracks the v2 contract's `acceptsAllowedToolsList` flag from
+	// 002-provider-base-contract.md §"Tool-use surface — forward declaration".
+	CapAcceptsAllowedToolsList Capability = "accepts_allowed_tools_list"
+	// CapAcceptsMcpServerSpec reports whether the provider honors
+	// Spec.MCPServers end-to-end (translation into upstream API or a
+	// session-local MCP bridge). Tracks the v2 contract's
+	// `acceptsMcpServerSpec` flag.
+	CapAcceptsMcpServerSpec Capability = "accepts_mcp_server_spec"
 )
 
 // Capabilities is the typed capability matrix every provider declares.
@@ -119,6 +129,26 @@ type Capabilities struct {
 	// callers should default to "claude".
 	ToolPermissionFormat string `json:"toolPermissionFormat,omitempty"`
 
+	// AcceptsAllowedToolsList reports whether the provider honors
+	// Spec.AllowedTools end-to-end at Spawn time — translating it into
+	// the upstream API's allow/permission grammar. Providers that ship
+	// SupportsToolPlugins=true but cannot pass through AllowedTools
+	// (e.g. codex routes permissions through the approval bridge) MUST
+	// declare false here so the runner knows the field is silently
+	// dropped. Tracks the v2 contract's acceptsAllowedToolsList flag
+	// from 002-provider-base-contract.md §"Tool-use surface — forward
+	// declaration".
+	AcceptsAllowedToolsList bool `json:"acceptsAllowedToolsList,omitempty"`
+
+	// AcceptsMcpServerSpec reports whether the provider honors
+	// Spec.MCPServers end-to-end at Spawn time — either passing the
+	// stdio configs through to the upstream API or spawning a local
+	// MCP bridge that the upstream session can call. Distinct from
+	// SupportsToolPlugins which only states whether tools are usable
+	// at all; this flag specifies whether the Spec field shape is
+	// honored.
+	AcceptsMcpServerSpec bool `json:"acceptsMcpServerSpec,omitempty"`
+
 	// HumanLabel is a human-readable provider-family display name
 	// (e.g. "Claude", "Codex"). Used in TUI/dashboard surfaces and
 	// log messages where the raw name is not user-friendly.
@@ -149,6 +179,10 @@ func IsSupported(caps Capabilities, c Capability) bool {
 		return caps.SupportsReasoningEffort
 	case CapToolPermissionFormatClaude:
 		return caps.ToolPermissionFormat == "" || caps.ToolPermissionFormat == "claude"
+	case CapAcceptsAllowedToolsList:
+		return caps.AcceptsAllowedToolsList
+	case CapAcceptsMcpServerSpec:
+		return caps.AcceptsMcpServerSpec
 	default:
 		return false
 	}

@@ -78,7 +78,11 @@ func (*Provider) Capabilities() agent.Capabilities {
 		EmitsSubagentEvents:                 false,
 		SupportsReasoningEffort:             false,
 		ToolPermissionFormat:                "claude",
-		HumanLabel:                          "Amp",
+		// Tool-use surface (002 v2): registration-only — Spawn always
+		// fails. No wire surface to honour, so both flags are false.
+		AcceptsAllowedToolsList: false,
+		AcceptsMcpServerSpec:    false,
+		HumanLabel:              "Amp",
 	}
 }
 

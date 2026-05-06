@@ -77,6 +77,13 @@ func TestProvider_Capabilities_AllConservative(t *testing.T) {
 	if caps.SupportsReasoningEffort {
 		t.Error("SupportsReasoningEffort: want false (registration-only)")
 	}
+	// Tool-use surface (002 v2): false/false — registration-only.
+	if caps.AcceptsAllowedToolsList {
+		t.Error("AcceptsAllowedToolsList: want false (registration-only)")
+	}
+	if caps.AcceptsMcpServerSpec {
+		t.Error("AcceptsMcpServerSpec: want false (registration-only)")
+	}
 	if caps.HumanLabel != "Amp" {
 		t.Errorf("HumanLabel: want %q, got %q", "Amp", caps.HumanLabel)
 	}

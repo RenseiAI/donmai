@@ -255,6 +255,14 @@ func Test_NameAndCapabilities(t *testing.T) {
 	if !caps.EmitsSubagentEvents {
 		t.Errorf("default Caps.EmitsSubagentEvents should be true")
 	}
+	// Tool-use surface (002 v2): all-on by default so the runner
+	// exercises every gating branch when wired against the stub.
+	if !caps.AcceptsAllowedToolsList {
+		t.Errorf("default Caps.AcceptsAllowedToolsList should be true")
+	}
+	if !caps.AcceptsMcpServerSpec {
+		t.Errorf("default Caps.AcceptsMcpServerSpec should be true")
+	}
 	if caps.HumanLabel != "Test Stub" {
 		t.Errorf("Caps.HumanLabel = %q want \"Test Stub\"", caps.HumanLabel)
 	}

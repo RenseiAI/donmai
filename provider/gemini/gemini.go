@@ -139,7 +139,13 @@ func (*Provider) Capabilities() agent.Capabilities {
 		EmitsSubagentEvents:                 false,
 		SupportsReasoningEffort:             false,
 		ToolPermissionFormat:                "claude",
-		HumanLabel:                          "Gemini",
+		// Tool-use surface (002 v2): generateContent supports a `tools`
+		// array (function declarations), but the v0.1 spec_translation
+		// builds Contents only — function-calling is not wired. Declare
+		// false until the round-trip lands.
+		AcceptsAllowedToolsList: false,
+		AcceptsMcpServerSpec:    false,
+		HumanLabel:              "Gemini",
 	}
 }
 

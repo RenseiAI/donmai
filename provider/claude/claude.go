@@ -99,7 +99,12 @@ func (*Provider) Capabilities() agent.Capabilities {
 		EmitsSubagentEvents:                 true,
 		SupportsReasoningEffort:             true,
 		ToolPermissionFormat:                "claude",
-		HumanLabel:                          "Claude",
+		// Tool-use surface (002 v2): both wired through the CLI.
+		// Spec.AllowedTools → --allowedTools; Spec.MCPServers →
+		// --mcp-config <tmpfile>. See cli_args.go and mcp.go.
+		AcceptsAllowedToolsList: true,
+		AcceptsMcpServerSpec:    true,
+		HumanLabel:              "Claude",
 	}
 }
 
