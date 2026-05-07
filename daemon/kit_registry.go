@@ -91,16 +91,16 @@ type kitManifestTOML struct {
 	API string `toml:"api"`
 
 	Kit struct {
-		ID              string `toml:"id"`
-		Version         string `toml:"version"`
-		Name            string `toml:"name"`
-		Description     string `toml:"description"`
-		Author          string `toml:"author"`
-		AuthorIdentity  string `toml:"authorIdentity"`
-		License         string `toml:"license"`
-		Homepage        string `toml:"homepage"`
-		Repository      string `toml:"repository"`
-		Priority        int    `toml:"priority"`
+		ID             string `toml:"id"`
+		Version        string `toml:"version"`
+		Name           string `toml:"name"`
+		Description    string `toml:"description"`
+		Author         string `toml:"author"`
+		AuthorIdentity string `toml:"authorIdentity"`
+		License        string `toml:"license"`
+		Homepage       string `toml:"homepage"`
+		Repository     string `toml:"repository"`
+		Priority       int    `toml:"priority"`
 	} `toml:"kit"`
 
 	Supports struct {
@@ -407,7 +407,7 @@ func (r *KitRegistry) scan() []kitManifestTOML {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			slog.Warn("kit registry: read scan path",
+			slog.Warn("kit registry: read scan path", //nolint:gosec // structured slog handler escapes values
 				"path", dir,
 				"err", err.Error(),
 			)
@@ -424,14 +424,14 @@ func (r *KitRegistry) scan() []kitManifestTOML {
 			full := filepath.Join(dir, name)
 			m, err := loadKitManifestFile(full)
 			if err != nil {
-				slog.Warn("kit registry: malformed manifest",
+				slog.Warn("kit registry: malformed manifest", //nolint:gosec // structured slog handler escapes values
 					"path", full,
 					"err", err.Error(),
 				)
 				continue
 			}
 			if m.Kit.ID == "" {
-				slog.Warn("kit registry: manifest missing kit.id",
+				slog.Warn("kit registry: manifest missing kit.id", //nolint:gosec // structured slog handler escapes values
 					"path", full,
 				)
 				continue
@@ -496,7 +496,7 @@ func (r *KitRegistry) saveStateLocked(st kitState) error {
 		return errors.New("no scan paths configured")
 	}
 	dir := r.scanPaths[0]
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec // operator-controlled scan path
 		return fmt.Errorf("create state dir %q: %w", dir, err)
 	}
 	path := kitStatePath(dir)
@@ -505,7 +505,7 @@ func (r *KitRegistry) saveStateLocked(st kitState) error {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil { //nolint:gosec // operator-controlled scan path
 		return fmt.Errorf("write temp state: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {

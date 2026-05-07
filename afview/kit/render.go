@@ -139,7 +139,7 @@ func trustLabel(trust afclient.KitTrustState, noColor bool) string {
 }
 
 func label(out io.Writer, key, value string, noColor bool) {
-	fmt.Fprintf(out, "%s %s\n", muted(key, noColor), bold(value, noColor))
+	_, _ = fmt.Fprintf(out, "%s %s\n", muted(key, noColor), bold(value, noColor))
 }
 
 // ---- RenderList -------------------------------------------------------------
@@ -154,7 +154,7 @@ func RenderList(out io.Writer, kits []afclient.Kit, noColor bool) error {
 	}
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n",
+	_, _ = fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n",
 		colHeader("ID", noColor),
 		colHeader("VERSION", noColor),
 		colHeader("SCOPE", noColor),
@@ -162,7 +162,7 @@ func RenderList(out io.Writer, kits []afclient.Kit, noColor bool) error {
 		colHeader("SOURCE", noColor),
 	)
 	for _, k := range kits {
-		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n",
 			bold(k.ID, noColor),
 			k.Version,
 			muted(string(k.Scope), noColor),
@@ -221,8 +221,8 @@ func RenderShow(out io.Writer, m *afclient.KitManifest, noColor bool) error {
 
 	// Detect rules
 	if len(m.DetectFiles) > 0 || m.DetectExec != "" || len(m.DetectToolchain) > 0 {
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, sectionHeader("Detect", noColor))
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, sectionHeader("Detect", noColor))
 		if len(m.DetectFiles) > 0 {
 			label(out, "  Files:  ", strings.Join(m.DetectFiles, ", "), noColor)
 		}
@@ -230,7 +230,7 @@ func RenderShow(out io.Writer, m *afclient.KitManifest, noColor bool) error {
 			label(out, "  Exec:   ", m.DetectExec, noColor)
 		}
 		if len(m.DetectToolchain) > 0 {
-			fmt.Fprintln(out, muted("  Toolchain:", noColor))
+			_, _ = fmt.Fprintln(out, muted("  Toolchain:", noColor))
 			// Sort keys for deterministic output (map iteration order is
 			// random; smoke tests pin the stable order).
 			keys := make([]string, 0, len(m.DetectToolchain))
@@ -239,7 +239,7 @@ func RenderShow(out io.Writer, m *afclient.KitManifest, noColor bool) error {
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				fmt.Fprintf(out, "    %s%s\n",
+				_, _ = fmt.Fprintf(out, "    %s%s\n",
 					muted(k+": ", noColor),
 					bold(m.DetectToolchain[k], noColor),
 				)
@@ -249,15 +249,15 @@ func RenderShow(out io.Writer, m *afclient.KitManifest, noColor bool) error {
 
 	// Commands
 	if len(m.Commands) > 0 {
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, sectionHeader("Commands", noColor))
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, sectionHeader("Commands", noColor))
 		keys := make([]string, 0, len(m.Commands))
 		for k := range m.Commands {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			fmt.Fprintf(out, "  %s%s\n",
+			_, _ = fmt.Fprintf(out, "  %s%s\n",
 				muted(k+": ", noColor),
 				bold(m.Commands[k], noColor),
 			)
@@ -267,17 +267,17 @@ func RenderShow(out io.Writer, m *afclient.KitManifest, noColor bool) error {
 	// Provide summary
 	provides := buildProvidesSummary(m, noColor)
 	if len(provides) > 0 {
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, sectionHeader("Provides", noColor))
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, sectionHeader("Provides", noColor))
 		for _, line := range provides {
-			fmt.Fprintln(out, "  "+line)
+			_, _ = fmt.Fprintln(out, "  "+line)
 		}
 	}
 
 	// Composition
 	if len(m.ConflictsWith) > 0 || len(m.ComposesWith) > 0 || m.Order != "" {
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, sectionHeader("Composition", noColor))
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, sectionHeader("Composition", noColor))
 		if m.Order != "" {
 			label(out, "  Order:          ", m.Order, noColor)
 		}
@@ -285,7 +285,7 @@ func RenderShow(out io.Writer, m *afclient.KitManifest, noColor bool) error {
 			label(out, "  Composes with:  ", strings.Join(m.ComposesWith, ", "), noColor)
 		}
 		if len(m.ConflictsWith) > 0 {
-			fmt.Fprintf(out, "  %s %s\n",
+			_, _ = fmt.Fprintf(out, "  %s %s\n",
 				muted("Conflicts with:", noColor),
 				colored(strings.Join(m.ConflictsWith, ", "), ansiYellow, noColor),
 			)
@@ -402,8 +402,8 @@ func RenderVerifySignature(out io.Writer, res *afclient.KitSignatureResult, noCo
 		label(out, "Signed: ", res.SignedAt, noColor)
 	}
 	if res.Details != "" {
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, muted(res.Details, noColor))
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, muted(res.Details, noColor))
 	}
 	return nil
 }
@@ -418,7 +418,7 @@ func RenderSources(out io.Writer, sources []afclient.KitRegistrySource, noColor 
 	}
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
+	_, _ = fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
 		colHeader("NAME", noColor),
 		colHeader("KIND", noColor),
 		colHeader("STATUS", noColor),
@@ -431,7 +431,7 @@ func RenderSources(out io.Writer, sources []afclient.KitRegistrySource, noColor 
 		} else {
 			statusFmt = muted("disabled", noColor)
 		}
-		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
 			bold(s.Name, noColor),
 			muted(s.Kind, noColor),
 			statusFmt,
