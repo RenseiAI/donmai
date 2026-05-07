@@ -155,52 +155,65 @@ func TestKitVerifier_TrustGateAllowsByMode(t *testing.T) {
 	}
 }
 
+// These tests cover the install-time trust gate end-to-end through the
+// git-source install path (Phase 4 / S3): they build a local git repo
+// containing the manifest, point Install at file://<repo>, and assert
+// the gate behaviour. The Phase 3 ancestors of these tests gated on
+// EXISTING manifests in scanPaths; Phase 4's "fetch then verify then
+// persist" flow is the canonical exercise vector going forward.
+
 func TestKitRegistry_InstallTrustGateRejectsUnsigned(t *testing.T) {
-	// Stage a real on-disk manifest with no sibling .sigstore.
-	dir := t.TempDir()
-	writeManifest(t, dir, "rensei-example", minimalKitTOML)
+	repoURL := newLocalGitFixture(t, fixtureFile{name: "rensei-example.kit.toml", body: minimalKitTOML})
+	scan := t.TempDir()
 
-	r := NewKitRegistryWithTrust([]string{dir}, TrustConfig{Mode: TrustModeSignedByAllowlist})
+	r := NewKitRegistryWithTrust([]string{scan}, TrustConfig{Mode: TrustModeSignedByAllowlist})
 
-	_, err := r.Install("rensei/example", afclient.KitInstallRequest{})
+	_, err := r.Install("rensei/example", afclient.KitInstallRequest{
+		Source: &afclient.KitInstallSource{Kind: "git", URL: repoURL},
+	})
 	if !errors.Is(err, ErrKitTrustGateRejected) {
 		t.Fatalf("Install: want ErrKitTrustGateRejected for unsigned + allowlist, got %v", err)
 	}
 }
 
 func TestKitRegistry_InstallTrustGatePassesPermissive(t *testing.T) {
-	dir := t.TempDir()
-	writeManifest(t, dir, "rensei-example", minimalKitTOML)
+	repoURL := newLocalGitFixture(t, fixtureFile{name: "rensei-example.kit.toml", body: minimalKitTOML})
+	scan := t.TempDir()
 
-	r := NewKitRegistryWithTrust([]string{dir}, TrustConfig{Mode: TrustModePermissive})
+	r := NewKitRegistryWithTrust([]string{scan}, TrustConfig{Mode: TrustModePermissive})
 
-	_, err := r.Install("rensei/example", afclient.KitInstallRequest{})
-	// The gate passes; Phase 4 will own the actual install body so the
-	// post-gate stub still returns ErrKitInstallUnimplemented.
-	if !errors.Is(err, ErrKitInstallUnimplemented) {
-		t.Fatalf("Install: want ErrKitInstallUnimplemented after gate passes, got %v", err)
+	res, err := r.Install("rensei/example", afclient.KitInstallRequest{
+		Source: &afclient.KitInstallSource{Kind: "git", URL: repoURL},
+	})
+	if err != nil {
+		t.Fatalf("Install: want success under permissive mode for unsigned manifest, got %v", err)
+	}
+	if res.Kit.ID != "rensei/example" {
+		t.Errorf("Result.Kit.ID: want rensei/example, got %q", res.Kit.ID)
+	}
+	if res.Kit.Trust != afclient.KitTrustUnsigned {
+		t.Errorf("Result.Kit.Trust: want unsigned, got %q", res.Kit.Trust)
 	}
 }
 
 func TestKitRegistry_InstallTrustOverrideAuditLogs(t *testing.T) {
-	dir := t.TempDir()
-	writeManifest(t, dir, "rensei-example", minimalKitTOML)
+	repoURL := newLocalGitFixture(t, fixtureFile{name: "rensei-example.kit.toml", body: minimalKitTOML})
+	scan := t.TempDir()
 
 	// Capture slog output via JSON handler over an in-memory buffer.
 	buf := captureSlogTrust(t)
 
-	r := NewKitRegistryWithTrust([]string{dir}, TrustConfig{
+	r := NewKitRegistryWithTrust([]string{scan}, TrustConfig{
 		Mode:  TrustModeSignedByAllowlist,
 		Actor: "operator@rensei.dev",
 	})
 
 	_, err := r.Install("rensei/example", afclient.KitInstallRequest{
+		Source:        &afclient.KitInstallSource{Kind: "git", URL: repoURL},
 		TrustOverride: afclient.TrustOverrideAllowedThisOnce,
 	})
-	// Override bypasses the gate; post-gate stub returns
-	// ErrKitInstallUnimplemented (Phase 4 owns the install body).
-	if !errors.Is(err, ErrKitInstallUnimplemented) {
-		t.Fatalf("Install with override: want ErrKitInstallUnimplemented, got %v", err)
+	if err != nil {
+		t.Fatalf("Install with override: want success after gate bypass, got %v", err)
 	}
 
 	// Decode the audit-log line — last record in the buffer.
@@ -221,7 +234,7 @@ func TestKitRegistry_InstallTrustOverrideAuditLogs(t *testing.T) {
 			t.Errorf("audit kitId: want rensei/example, got %v", got)
 		}
 		// SignerID for an unsigned manifest comes from the manifest's
-		// authorIdentity backfill in Install.
+		// authorIdentity backfill in installFromGit.
 		if got := rec["signerId"]; got != "did:web:rensei.dev" {
 			t.Errorf("audit signerId: want did:web:rensei.dev, got %v", got)
 		}
