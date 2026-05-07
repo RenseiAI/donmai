@@ -282,5 +282,7 @@ func sessionIDFor(i int) string {
 
 // Compile-time check that the recorded decision shape stays compatible
 // with the wire types used in the explain handler.
-var _ = afclient.RoutingDecision{}
-var _ = afclient.RoutingTraceStep{}
+var (
+	_ = afclient.RoutingDecision{}
+	_ = afclient.RoutingTraceStep{}
+)
