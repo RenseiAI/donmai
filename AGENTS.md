@@ -39,6 +39,7 @@ Read in this order:
 1. `agentfactory-architecture/001-layered-execution-model.md` — canonical synthesis (OSS). Always first.
 2. The reference doc(s) for whichever layer you are working on — `agentfactory-architecture/002`–`008`, `011`, `013`–`016`. All OSS-canonical for the contract; if a platform-extensions sibling exists in `rensei-architecture/<doc>-platform-extensions.md` and your work touches platform behavior, read it second.
 3. Any open ADRs that touch your work (`ADR-*.md`) — start in `agentfactory-architecture` for cross-cutting/OSS ADRs; cross-check `rensei-architecture` for platform-extension ADRs and the dual-publish stubs.
+4. `agentfactory-architecture/BOUNDARY.md` — boundary-tagging convention. Read before authoring a new ADR or moving doc content between corpora; it determines which corpus a new doc belongs in (`OSS-only` / `platform-only` / `shared` / `mirrored`) and the split mechanism for shared docs.
 
 If this project's docs conflict with `agentfactory-architecture/`, the OSS corpus wins. Either update this project's docs to align, or open an ADR to amend the corpus.
 
