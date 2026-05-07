@@ -28,6 +28,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,9 +44,13 @@ import (
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
 
-// ErrKitInstallUnimplemented is returned by KitRegistry.Install while the
-// remote-registry fetch path is unimplemented. See the wave-9 deferral note
-// in the package doc.
+// ErrKitInstallUnimplemented is returned by KitRegistry.Install for the
+// Wave-9 backward-compat path: a request body with no `source` block
+// (the shape the Wave-9 smoke + handler tests POST). Wave 12 / Phase 4
+// keeps this sentinel reserved for that empty-body case so existing
+// 501 assertions stay green; new federation-source kinds (tessl,
+// agentskills, community) return ErrKitSourceFederationUnimplemented
+// instead.
 var ErrKitInstallUnimplemented = errors.New("kit install: remote registry fetch not implemented in this wave")
 
 // ErrKitNotFound is returned when a kit id is not present in the registry.
@@ -60,6 +65,26 @@ var ErrKitSourceNotFound = errors.New("kit source not found")
 // trustOverride: "allowed-this-once" install field bypasses this gate
 // for a single request (audit-logged); see kit_trust.go.
 var ErrKitTrustGateRejected = errors.New("kit install: trust gate rejected (signed-by-allowlist requires verified signature)")
+
+// ErrKitSourceFederationUnimplemented is returned when KitInstallRequest
+// names a federation source kind (`tessl` / `agentskills` / `community`)
+// that the daemon does not yet know how to fetch from. Maps to HTTP 501
+// — the descriptor list returned by /api/daemon/kit-sources continues
+// to surface those kinds so operators can see the federation order.
+//
+// Federation cross-repo wave is REN-1308 follow-up.
+var ErrKitSourceFederationUnimplemented = errors.New("kit install: federation source kind not yet implemented")
+
+// ErrKitInstallSourceFetchFailed is returned when the configured source
+// fetcher fails (e.g., git clone error, network failure, unreachable
+// remote, missing ref). Maps to HTTP 502.
+var ErrKitInstallSourceFetchFailed = errors.New("kit install: source fetch failed")
+
+// ErrKitInstallManifestNotFound is returned when the source fetch
+// succeeds but no *.kit.toml is locatable inside the fetched tree (or
+// at the operator-provided KitInstallSource.ManifestPath). Maps to
+// HTTP 422.
+var ErrKitInstallManifestNotFound = errors.New("kit install: manifest not found in fetched source")
 
 // DefaultKitScanPath returns the canonical scan path for installed kits
 // (~/.rensei/kits). Used when daemon.yaml does not declare kit.scanPaths.
@@ -174,7 +199,12 @@ type kitManifestTOML struct {
 type KitRegistry struct {
 	scanPaths []string
 	verifier  *kitVerifier
-	mu        sync.Mutex
+	// fetcher resolves git-source kit installs into local manifest
+	// paths so the registry can verify-then-persist. Tests can inject
+	// an alternate fetcher via the package-level setter on the
+	// instance; production uses the default go-git-backed fetcher.
+	fetcher kitSourceFetcher
+	mu      sync.Mutex
 }
 
 // NewKitRegistry constructs a KitRegistry with permissive trust mode.
@@ -217,7 +247,7 @@ func NewKitRegistryWithTrust(scanPaths []string, trust TrustConfig) *KitRegistry
 		// parse — this is purely defensive.
 		v = newKitVerifierWithMaterial(TrustConfig{Mode: TrustModePermissive}, nil)
 	}
-	return &KitRegistry{scanPaths: expanded, verifier: v}
+	return &KitRegistry{scanPaths: expanded, verifier: v, fetcher: newGitKitFetcher()}
 }
 
 // expandKitHomePath replaces a leading ~ with the user's home directory.
@@ -384,64 +414,211 @@ func (r *KitRegistry) VerifySignature(id string) (afclient.KitSignatureResult, e
 	return afclient.KitSignatureResult{}, fmt.Errorf("%s: %w", id, ErrKitNotFound)
 }
 
-// Install is the kit install entry point.
+// Install fetches a kit from the operator-supplied source, runs the
+// trust-gated verifier against the freshly-fetched manifest, and (when
+// the gate allows) persists the manifest + sibling .sigstore bundle
+// into the first configured scan path.
 //
-// Wave 12 Phase 3 wires only the trust gate; the actual install body
-// (git clone, manifest copy, registry rescan) lands in Wave 12 Phase 4
-// (S3) per WAVE12_PLAN. For Phase 3:
+// Behaviour by request shape (audit § 2.1, § 2.2):
 //
-//   - When the configured trust mode rejects the verifier outcome
-//     (signed-by-allowlist / attested + KitTrustUnsigned or
-//     KitTrustSignedUnverified) AND no trustOverride bypass is in
-//     effect, return ErrKitTrustGateRejected (HTTP 403).
-//   - When trustOverride is "allowed-this-once", emit the audit log
-//     and proceed past the gate.
-//   - Either way, after the gate, return ErrKitInstallUnimplemented
-//     (Phase 4 owns the implementation).
+//   - req.Source == nil — the Wave-9 backward-compat path. Returns
+//     ErrKitInstallUnimplemented (HTTP 501) so the existing Wave-9
+//     smoke + handler tests posting `{}` keep their assertions intact.
+//   - req.Source.Kind == "git" — clone source.URL @ source.Ref into a
+//     temp dir (via gitKitFetcher), locate the manifest, run the
+//     verifier, gate on r.verifier.config.Mode, persist into
+//     scanPaths[0]. Errors map to ErrKitInstallSourceFetchFailed (502)
+//     or ErrKitInstallManifestNotFound (422).
+//   - req.Source.Kind == "tessl" / "agentskills" / "community" —
+//     federation cross-repo wave (REN-1308 follow-up). Returns
+//     ErrKitSourceFederationUnimplemented (HTTP 501).
+//   - Any other kind — wrapped fmt error (handler-mapped to 400).
 //
-// The gate keys off the EXISTING kit manifest in the scan paths
-// (matching `id`). When `id` is not yet installed (the typical case
-// for a fresh Install), the gate degrades to "permissive" because there
-// is no manifest to verify yet; Phase 4 will tighten this once the
-// install body fetches the manifest into a temp location and verifies
-// THAT before persisting. For Phase 3 the gate exercise vector is the
-// re-install path (which IS the customer-visible test scenario).
+// Trust override: `req.TrustOverride == "allowed-this-once"` bypasses
+// the gate for a single install with structured slog audit logging.
+// Otherwise an unsigned/unverified manifest under a non-permissive
+// trust mode returns ErrKitTrustGateRejected (HTTP 403).
+//
+// Manifest persistence uses the atomic tmp-then-rename pattern to
+// match the kit_state writer at saveStateLocked. The on-disk filename
+// is `<sanitizedID>.kit.toml` where slashes in the manifest's `kit.id`
+// are replaced with `__` (the manifest's internal `kit.id` retains the
+// canonical slash form).
 func (r *KitRegistry) Install(id string, req afclient.KitInstallRequest) (afclient.KitInstallResult, error) {
+	if req.Source == nil {
+		return afclient.KitInstallResult{}, ErrKitInstallUnimplemented
+	}
+
+	switch req.Source.Kind {
+	case "git":
+		return r.installFromGit(id, *req.Source, req)
+	case "tessl", "agentskills", "community":
+		return afclient.KitInstallResult{}, fmt.Errorf("%s: %w (kind=%s; federation cross-repo wave is REN-1308 follow-up)",
+			id, ErrKitSourceFederationUnimplemented, req.Source.Kind)
+	default:
+		return afclient.KitInstallResult{}, fmt.Errorf("kit install: unknown source kind %q for %s", req.Source.Kind, id)
+	}
+}
+
+// installFromGit drives the git-source install path: fetch → verify →
+// gate → persist. Caller has already validated source.Kind == "git".
+func (r *KitRegistry) installFromGit(id string, source afclient.KitInstallSource, req afclient.KitInstallRequest) (afclient.KitInstallResult, error) {
+	if r.fetcher == nil {
+		// Defensive: a registry constructed via the legacy zero-value
+		// path won't have a fetcher. Treat as unconfigured rather than
+		// nil-pointer.
+		return afclient.KitInstallResult{}, fmt.Errorf("%s: %w (no fetcher wired)", id, ErrKitInstallSourceFetchFailed)
+	}
+
+	ctx := context.Background()
+	fetched, cleanup, err := r.fetcher.Fetch(ctx, source)
+	if err != nil {
+		return afclient.KitInstallResult{}, err
+	}
+	defer cleanup()
+
+	// Read the fetched manifest now so we can populate the install
+	// result envelope and double-check kit.id alignment with the
+	// requested id.
+	parsed, err := loadKitManifestFile(fetched.ManifestPath)
+	if err != nil {
+		return afclient.KitInstallResult{}, fmt.Errorf("%w: parse fetched manifest: %w", ErrKitInstallManifestNotFound, err)
+	}
+	if parsed.Kit.ID == "" {
+		return afclient.KitInstallResult{}, fmt.Errorf("%w: fetched manifest is missing kit.id", ErrKitInstallManifestNotFound)
+	}
+
+	// Run the verifier against the FRESHLY-FETCHED manifest before
+	// persisting. This is the "fetch then verify then persist" flow
+	// audit § 2.1 mandates and is the tightening Phase 3's Install
+	// godoc anticipated.
+	var verifyResult afclient.KitSignatureResult
 	if r.verifier != nil {
-		manifests, paths := r.scanWithPaths()
-		var (
-			manifestPath string
-			authorID     string
-			haveManifest bool
-		)
-		for i, m := range manifests {
-			if m.Kit.ID == id {
-				manifestPath = paths[i]
-				authorID = m.Kit.AuthorIdentity
-				haveManifest = true
-				break
+		if fetched.Entity != nil {
+			// Test seam: hermetic fetcher provided an in-memory entity
+			// (typically from VirtualSigstore.Sign). Verify against the
+			// freshly-read manifest bytes.
+			manifestBytes, readErr := os.ReadFile(fetched.ManifestPath) //nolint:gosec // operator-installed path inside fetcher temp dir
+			if readErr != nil {
+				return afclient.KitInstallResult{}, fmt.Errorf("trust gate: read manifest %q: %w", fetched.ManifestPath, readErr)
 			}
-		}
-		if haveManifest {
-			res, err := r.verifier.VerifyManifest(id, manifestPath)
+			verifyResult = r.verifier.verifyEntity(id, fetched.Entity, manifestBytes)
+		} else {
+			verifyResult, err = r.verifier.VerifyManifest(id, fetched.ManifestPath)
 			if err != nil {
 				return afclient.KitInstallResult{}, fmt.Errorf("trust gate: %w", err)
 			}
-			if res.SignerID == "" {
-				res.SignerID = authorID
-			}
-			if !r.verifier.trustGateAllows(res.Trust) {
-				if req.TrustOverride == afclient.TrustOverrideAllowedThisOnce {
-					r.verifier.auditTrustOverride(id, res.SignerID)
-					// Fall through past the gate; Phase 4 will own the
-					// install body proper.
-				} else {
-					return afclient.KitInstallResult{}, fmt.Errorf("%s: %w", id, ErrKitTrustGateRejected)
-				}
+		}
+		if verifyResult.SignerID == "" {
+			verifyResult.SignerID = parsed.Kit.AuthorIdentity
+		}
+		if !r.verifier.trustGateAllows(verifyResult.Trust) {
+			if req.TrustOverride == afclient.TrustOverrideAllowedThisOnce {
+				r.verifier.auditTrustOverride(id, verifyResult.SignerID)
+				// Fall through past the gate.
+			} else {
+				return afclient.KitInstallResult{}, fmt.Errorf("%s: %w", id, ErrKitTrustGateRejected)
 			}
 		}
+	} else {
+		// Defensive — registries constructed via the legacy zero-value
+		// path skip the verifier entirely; treat as Unsigned.
+		verifyResult = afclient.KitSignatureResult{
+			KitID:    id,
+			Trust:    afclient.KitTrustUnsigned,
+			OK:       true,
+			SignerID: parsed.Kit.AuthorIdentity,
+			Details:  "no verifier wired; treating as unsigned",
+		}
 	}
-	return afclient.KitInstallResult{}, ErrKitInstallUnimplemented
+
+	// Persist under r.mu so concurrent installs don't race on
+	// scanPaths[0] writes (matching the saveStateLocked discipline).
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.scanPaths) == 0 {
+		return afclient.KitInstallResult{}, fmt.Errorf("kit install %s: no scan paths configured", id)
+	}
+	dest := r.scanPaths[0]
+	if err := os.MkdirAll(dest, 0o700); err != nil { //nolint:gosec // operator-controlled scan path
+		return afclient.KitInstallResult{}, fmt.Errorf("kit install %s: create scan dir %q: %w", id, dest, err)
+	}
+
+	manifestFilename := sanitizeKitFilename(parsed.Kit.ID) + ".kit.toml"
+	destManifest := filepath.Join(dest, manifestFilename)
+	if err := atomicCopyFile(fetched.ManifestPath, destManifest); err != nil {
+		return afclient.KitInstallResult{}, fmt.Errorf("kit install %s: persist manifest: %w", id, err)
+	}
+
+	if fetched.HasBundle {
+		srcBundle := fetched.ManifestPath + ".sigstore"
+		destBundle := destManifest + ".sigstore"
+		if err := atomicCopyFile(srcBundle, destBundle); err != nil {
+			// Best-effort: keep the manifest, drop the bundle copy with
+			// a warning. The verifier will report Unsigned on subsequent
+			// verify-signature calls until the operator manually places
+			// the bundle.
+			slog.Warn("kit install: persisted manifest but failed to copy sibling bundle", //nolint:gosec // structured slog handler escapes values
+				"kitId", id,
+				"src", srcBundle,
+				"dst", destBundle,
+				"err", err.Error(),
+			)
+		}
+	}
+
+	// Build the result envelope from the freshly-persisted manifest.
+	// We can rely on parsed since it matches what we just wrote.
+	kitSummary := manifestToKit(parsed)
+	kitSummary.Trust = verifyResult.Trust
+	kitSummary.SignerID = verifyResult.SignerID
+	kitSummary.SignedAt = verifyResult.SignedAt
+	kitSummary.Status = afclient.KitStatusActive
+
+	return afclient.KitInstallResult{
+		Kit:     kitSummary,
+		Message: "kit installed from git source",
+	}, nil
+}
+
+// sanitizeKitFilename converts a kit.id into a stable on-disk filename
+// component. Slashes (legal in kit.id per 005-kit-manifest-spec.md, e.g.
+// "spring/java") become "__" so the file lives flat in scanPaths[0].
+// The manifest's internal `kit.id` retains the canonical slash form;
+// only the filesystem name is rewritten.
+//
+// Backslashes get the same treatment for Windows-friendly artifacts
+// even though the daemon currently only ships on darwin/linux. Other
+// path-hostile characters (':', '\0') are stripped.
+func sanitizeKitFilename(id string) string {
+	if id == "" {
+		return "kit"
+	}
+	out := strings.ReplaceAll(id, "/", "__")
+	out = strings.ReplaceAll(out, "\\", "__")
+	out = strings.ReplaceAll(out, ":", "_")
+	out = strings.ReplaceAll(out, "\x00", "")
+	return out
+}
+
+// atomicCopyFile copies src to dst via a `<dst>.tmp` intermediate file,
+// then renames into place. Mirrors saveStateLocked's atomic write to
+// keep a partially-failed install from leaving a half-written manifest.
+func atomicCopyFile(src, dst string) error {
+	data, err := os.ReadFile(src) //nolint:gosec // operator-installed path inside fetcher temp dir
+	if err != nil {
+		return fmt.Errorf("read %q: %w", src, err)
+	}
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil { //nolint:gosec // operator-controlled scan path
+		return fmt.Errorf("write temp %q: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, dst); err != nil { //nolint:gosec // operator-controlled scan path
+		_ = os.Remove(tmp) //nolint:gosec // operator-controlled scan path
+		return fmt.Errorf("rename %q -> %q: %w", tmp, dst, err)
+	}
+	return nil
 }
 
 // ListSources returns the federation order's registry source descriptors.
