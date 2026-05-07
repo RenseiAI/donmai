@@ -450,6 +450,125 @@ autoUpdate:
 	}
 }
 
+// TestLoadConfig_TrustMode_DefaultsToPermissive asserts the Wave 12
+// default trust mode (Q2 of WAVE12_PLAN) — daemon.yaml with no `trust:`
+// block lands `trust.mode: permissive` after applyDefaults.
+func TestLoadConfig_TrustMode_DefaultsToPermissive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: rensei.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+orchestrator:
+  url: https://platform.rensei.dev
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Trust.Mode != TrustModePermissive {
+		t.Errorf("Trust.Mode default: want %q, got %q", TrustModePermissive, cfg.Trust.Mode)
+	}
+}
+
+// TestLoadConfig_TrustMode_ExplicitAllowlist asserts the
+// signed-by-allowlist mode round-trips and the issuer set is preserved.
+func TestLoadConfig_TrustMode_ExplicitAllowlist(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: rensei.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+orchestrator:
+  url: https://platform.rensei.dev
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+trust:
+  mode: signed-by-allowlist
+  issuerSet:
+    - did:web:rensei.dev
+    - did:web:partner.example
+  actor: ops@rensei.dev
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Trust.Mode != TrustModeSignedByAllowlist {
+		t.Errorf("Trust.Mode: want %q, got %q", TrustModeSignedByAllowlist, cfg.Trust.Mode)
+	}
+	if len(cfg.Trust.IssuerSet) != 2 {
+		t.Fatalf("Trust.IssuerSet len: want 2, got %d (%v)", len(cfg.Trust.IssuerSet), cfg.Trust.IssuerSet)
+	}
+	if cfg.Trust.IssuerSet[0] != "did:web:rensei.dev" {
+		t.Errorf("IssuerSet[0]: got %q", cfg.Trust.IssuerSet[0])
+	}
+	if cfg.Trust.Actor != "ops@rensei.dev" {
+		t.Errorf("Trust.Actor: got %q", cfg.Trust.Actor)
+	}
+}
+
+// TestLoadConfig_TrustMode_InvalidRejected asserts validateConfig
+// rejects unknown trust mode values.
+func TestLoadConfig_TrustMode_InvalidRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: rensei.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+orchestrator:
+  url: https://platform.rensei.dev
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+trust:
+  mode: bogus-mode
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatalf("LoadConfig: want validation error for unknown trust mode, got nil")
+	}
+}
+
 // TestLoadConfig_KitScanPaths_ExplicitOverride asserts that an explicit
 // `kit.scanPaths` block round-trips through YAML in declaration order
 // (no reordering, no de-duping, no default merge).

@@ -33,6 +33,14 @@ type Config struct {
 	// applyDefaults seeds ScanPaths to [DefaultKitScanPath()] when
 	// absent. Per ADR-2026-05-07 § D4.
 	Kit KitConfig `yaml:"kit,omitempty"          json:"kit,omitempty"`
+	// Trust holds the daemon-wide signature-verification policy
+	// (sigstore bundle-mode verifier mode + issuer allowlist + audit
+	// actor). Optional; applyDefaults seeds Mode to
+	// TrustModePermissive when absent. Per WAVE12_PLAN Q2 and
+	// 002-provider-base-contract.md § "Signing and trust". Lives on
+	// Config (not on KitConfig) because the trust mode applies across
+	// all plugin families per 015-plugin-spec.md § "Auth + trust".
+	Trust TrustConfig `yaml:"trust,omitempty"        json:"trust,omitempty"`
 }
 
 // MachineConfig captures the machine identity block from daemon.yaml.
@@ -261,6 +269,9 @@ func applyDefaults(c *Config) {
 	if len(c.Kit.ScanPaths) == 0 {
 		c.Kit.ScanPaths = []string{DefaultKitScanPath()}
 	}
+	if c.Trust.Mode == "" {
+		c.Trust.Mode = TrustModePermissive
+	}
 	for i := range c.Projects {
 		if c.Projects[i].CloneStrategy == "" {
 			c.Projects[i].CloneStrategy = CloneShallow
@@ -301,6 +312,11 @@ func validateConfig(c *Config) error {
 	case "", ScheduleNightly, ScheduleOnRelease, ScheduleManual:
 	default:
 		return fmt.Errorf("autoUpdate.schedule invalid: %q", c.AutoUpdate.Schedule)
+	}
+	switch c.Trust.Mode {
+	case "", TrustModePermissive, TrustModeSignedByAllowlist, TrustModeAttested:
+	default:
+		return fmt.Errorf("trust.mode invalid: %q (want permissive | signed-by-allowlist | attested)", c.Trust.Mode)
 	}
 	return nil
 }
