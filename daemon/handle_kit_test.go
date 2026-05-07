@@ -256,6 +256,69 @@ func TestHandleKits_InstallStub501(t *testing.T) {
 	}
 }
 
+func TestHandleKits_InstallFederationUnimplemented501(t *testing.T) {
+	fake := &fakeKitRegistry{installErr: ErrKitSourceFederationUnimplemented}
+	srv := kitTestServer(t, fake)
+	resp, _ := http.Post(srv.URL+"/api/daemon/kits/spring/java/install", "application/json",
+		strings.NewReader(`{"source":{"kind":"tessl","url":"https://registry.tessl.io/spring"}}`))
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status: want 501, got %d", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["kitId"] != "spring/java" {
+		t.Errorf("body.kitId: want spring/java, got %q", body["kitId"])
+	}
+	if body["kind"] != "tessl" {
+		t.Errorf("body.kind: want tessl, got %q", body["kind"])
+	}
+	if body["details"] == "" {
+		t.Errorf("body.details: want non-empty, got empty")
+	}
+}
+
+func TestHandleKits_InstallSourceFetchFailed502(t *testing.T) {
+	fake := &fakeKitRegistry{installErr: ErrKitInstallSourceFetchFailed}
+	srv := kitTestServer(t, fake)
+	resp, _ := http.Post(srv.URL+"/api/daemon/kits/spring/java/install", "application/json",
+		strings.NewReader(`{"source":{"kind":"git","url":"file:///nope"}}`))
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status: want 502, got %d", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["kitId"] != "spring/java" {
+		t.Errorf("body.kitId: want spring/java, got %q", body["kitId"])
+	}
+	if body["source"] != "file:///nope" {
+		t.Errorf("body.source: want file:///nope, got %q", body["source"])
+	}
+}
+
+func TestHandleKits_InstallManifestNotFound422(t *testing.T) {
+	fake := &fakeKitRegistry{installErr: ErrKitInstallManifestNotFound}
+	srv := kitTestServer(t, fake)
+	resp, _ := http.Post(srv.URL+"/api/daemon/kits/spring/java/install", "application/json",
+		strings.NewReader(`{"source":{"kind":"git","url":"file:///empty"}}`))
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status: want 422, got %d", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["kitId"] != "spring/java" {
+		t.Errorf("body.kitId: want spring/java, got %q", body["kitId"])
+	}
+}
+
 func TestHandleKits_InstallTrustGateRejected403(t *testing.T) {
 	fake := &fakeKitRegistry{installErr: ErrKitTrustGateRejected}
 	srv := kitTestServer(t, fake)

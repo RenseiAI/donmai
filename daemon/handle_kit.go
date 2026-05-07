@@ -117,11 +117,41 @@ func (s *Server) handleKitDetail(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		if errors.Is(err, ErrKitSourceFederationUnimplemented) {
+			body := map[string]string{
+				"error":   err.Error(),
+				"kitId":   id,
+				"details": "Federation cross-repo wave is REN-1308 follow-up.",
+			}
+			if req.Source != nil {
+				body["kind"] = req.Source.Kind
+			}
+			writeJSON(w, http.StatusNotImplemented, body)
+			return
+		}
+		if errors.Is(err, ErrKitInstallSourceFetchFailed) {
+			body := map[string]string{
+				"error": err.Error(),
+				"kitId": id,
+			}
+			if req.Source != nil {
+				body["source"] = req.Source.URL
+			}
+			writeJSON(w, http.StatusBadGateway, body)
+			return
+		}
+		if errors.Is(err, ErrKitInstallManifestNotFound) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+				"error": err.Error(),
+				"kitId": id,
+			})
+			return
+		}
 		if errors.Is(err, ErrKitInstallUnimplemented) {
 			writeJSON(w, http.StatusNotImplemented, map[string]string{
 				"error":   err.Error(),
 				"kitId":   id,
-				"details": "Remote-registry fetch lands in a follow-up wave (see ADR-2026-05-07 § D4 caveat).",
+				"details": "Empty install request — pass `source.kind: \"git\"` with a URL to install (see ADR-2026-05-07 § D6).",
 			})
 			return
 		}
