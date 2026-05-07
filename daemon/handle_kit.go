@@ -109,6 +109,14 @@ func (s *Server) handleKitDetail(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		res, err := reg.Install(id, req)
+		if errors.Is(err, ErrKitTrustGateRejected) {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error": err.Error(),
+				"kitId": id,
+				"trust": string(afclient.KitTrustSignedUnverified),
+			})
+			return
+		}
 		if errors.Is(err, ErrKitInstallUnimplemented) {
 			writeJSON(w, http.StatusNotImplemented, map[string]string{
 				"error":   err.Error(),
@@ -263,31 +271,37 @@ func writeKitNotFound(w http.ResponseWriter, err error) bool {
 }
 
 // kitRegistryOrEmpty returns the daemon's kit registry, lazily
-// constructing one with the configured scan paths if needed. Defining
-// the registry on Server (rather than Daemon) keeps the registry's
-// lifecycle bound to the HTTP surface — the registry has no background
-// goroutines, so there's nothing to start/stop.
+// constructing one with the configured scan paths and trust config if
+// needed. Defining the registry on Server (rather than Daemon) keeps
+// the registry's lifecycle bound to the HTTP surface — the registry
+// has no background goroutines, so there's nothing to start/stop.
 //
-// ScanPaths come from daemon.yaml's `kit.scanPaths` (Wave 11 / S4); the
-// fallback is [DefaultKitScanPath()] when the daemon has no Config
-// loaded yet OR when the operator left the block empty. NewKitRegistry
-// also accepts the empty slice as "use the default" — the explicit
-// fallback here keeps the wiring readable and matches the test plan.
+// ScanPaths come from daemon.yaml's `kit.scanPaths` (Wave 11 / S4);
+// trust mode + issuer set come from `trust.*` (Wave 12 / S2). Both
+// fall back to permissive defaults when the daemon has no Config
+// loaded yet.
 func (s *Server) kitRegistryOrEmpty() kitRegistryDoer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.kitReg != nil {
 		return s.kitReg
 	}
-	var scanPaths []string
+	var (
+		scanPaths []string
+		trust     TrustConfig
+	)
 	if s.daemon != nil {
 		if cfg := s.daemon.Config(); cfg != nil {
 			scanPaths = cfg.Kit.ScanPaths
+			trust = cfg.Trust
 		}
 	}
 	if len(scanPaths) == 0 {
 		scanPaths = []string{DefaultKitScanPath()}
 	}
-	s.kitReg = NewKitRegistry(scanPaths)
+	if trust.Mode == "" {
+		trust.Mode = TrustModePermissive
+	}
+	s.kitReg = NewKitRegistryWithTrust(scanPaths, trust)
 	return s.kitReg
 }

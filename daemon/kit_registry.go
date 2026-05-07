@@ -54,6 +54,13 @@ var ErrKitNotFound = errors.New("kit not found")
 // ErrKitSourceNotFound is returned when a kit-source name is not known.
 var ErrKitSourceNotFound = errors.New("kit source not found")
 
+// ErrKitTrustGateRejected is returned by KitRegistry.Install when the
+// configured trust mode (signed-by-allowlist or attested) refuses an
+// unsigned or signed-but-unverified kit. Maps to HTTP 403. The
+// trustOverride: "allowed-this-once" install field bypasses this gate
+// for a single request (audit-logged); see kit_trust.go.
+var ErrKitTrustGateRejected = errors.New("kit install: trust gate rejected (signed-by-allowlist requires verified signature)")
+
 // DefaultKitScanPath returns the canonical scan path for installed kits
 // (~/.rensei/kits). Used when daemon.yaml does not declare kit.scanPaths.
 func DefaultKitScanPath() string {
@@ -166,14 +173,33 @@ type kitManifestTOML struct {
 // is acceptable for an operator-facing surface where call volume is low.
 type KitRegistry struct {
 	scanPaths []string
+	verifier  *kitVerifier
 	mu        sync.Mutex
 }
 
-// NewKitRegistry constructs a KitRegistry.
+// NewKitRegistry constructs a KitRegistry with permissive trust mode.
 //
 // scanPaths defaults to []string{DefaultKitScanPath()} when nil or empty.
 // The first scan path is also where the .state.json sidecar lives.
+//
+// Equivalent to NewKitRegistryWithTrust(scanPaths, TrustConfig{Mode:
+// TrustModePermissive}). Callers wiring trust modes (or an issuer
+// allowlist) from daemon.yaml should use NewKitRegistryWithTrust.
 func NewKitRegistry(scanPaths []string) *KitRegistry {
+	return NewKitRegistryWithTrust(scanPaths, TrustConfig{Mode: TrustModePermissive})
+}
+
+// NewKitRegistryWithTrust constructs a KitRegistry with the given trust
+// configuration. Used by Server.kitRegistryOrEmpty to thread the
+// daemon.Config().Trust block into the registry.
+//
+// If the verifier fails to construct (e.g., the embedded trust root
+// JSON fails to parse), a permissive verifier with no trusted material
+// is installed instead — every signed manifest reports
+// SignedUnverified, every unsigned reports Unsigned, and the install
+// gate behaves as if Mode=Permissive. The construction error is logged
+// via slog.Warn so operators can diagnose.
+func NewKitRegistryWithTrust(scanPaths []string, trust TrustConfig) *KitRegistry {
 	if len(scanPaths) == 0 {
 		scanPaths = []string{DefaultKitScanPath()}
 	}
@@ -181,7 +207,17 @@ func NewKitRegistry(scanPaths []string) *KitRegistry {
 	for _, p := range scanPaths {
 		expanded = append(expanded, expandKitHomePath(p))
 	}
-	return &KitRegistry{scanPaths: expanded}
+	v, err := newKitVerifier(trust)
+	if err != nil {
+		slog.Warn("kit registry: trust verifier construction failed; falling back to permissive verifier", //nolint:gosec // structured slog handler escapes values
+			"err", err.Error(),
+		)
+		// Construct an empty-material verifier so the registry stays
+		// functional. The embedded trust root really shouldn't fail to
+		// parse — this is purely defensive.
+		v = newKitVerifierWithMaterial(TrustConfig{Mode: TrustModePermissive}, nil)
+	}
+	return &KitRegistry{scanPaths: expanded, verifier: v}
 }
 
 // expandKitHomePath replaces a leading ~ with the user's home directory.
@@ -309,31 +345,102 @@ func (r *KitRegistry) Disable(id string) (afclient.Kit, error) {
 	return k, nil
 }
 
-// VerifySignature returns a KitSignatureResult for the kit. In this wave
-// the signing model is partially implemented: signed-verified is never
-// returned even for manifests carrying authorIdentity. See
-// 005-kit-manifest-spec.md § "Trust verification".
+// VerifySignature returns a KitSignatureResult for the kit, driven by
+// the sigstore bundle-mode verifier (Wave 12 / S2). The verifier reads
+// the sibling `<manifest>.sigstore` file alongside the kit manifest;
+// missing-bundle returns KitTrustUnsigned with OK: true. Verification
+// outcomes map to KitTrustSignedVerified / KitTrustSignedUnverified;
+// see kit_trust.go for the full state machine.
 func (r *KitRegistry) VerifySignature(id string) (afclient.KitSignatureResult, error) {
-	manifests := r.scan()
-	for _, m := range manifests {
+	manifests, paths := r.scanWithPaths()
+	for i, m := range manifests {
 		if m.Kit.ID != id {
 			continue
 		}
-		return afclient.KitSignatureResult{
-			KitID:    id,
-			Trust:    afclient.KitTrustUnsigned,
-			SignerID: m.Kit.AuthorIdentity,
-			OK:       true,
-			Details:  "Signature verification is partially implemented (Wave 9 caveat); manifest reported as unsigned. See 005-kit-manifest-spec.md § Trust verification.",
-		}, nil
+		if r.verifier == nil {
+			// Defensive: a registry constructed via the legacy zero-value
+			// path won't have a verifier. Fall back to the Wave-9
+			// "always unsigned" reporting so callers don't crash.
+			return afclient.KitSignatureResult{
+				KitID:    id,
+				Trust:    afclient.KitTrustUnsigned,
+				SignerID: m.Kit.AuthorIdentity,
+				OK:       true,
+				Details:  "no verifier wired; treating as unsigned",
+			}, nil
+		}
+		res, err := r.verifier.VerifyManifest(id, paths[i])
+		if err != nil {
+			return res, err
+		}
+		// Backfill SignerID from manifest's authorIdentity when the
+		// bundle didn't surface one (e.g., unsigned path) so the wire
+		// shape continues to expose the operator-declared identity.
+		if res.SignerID == "" {
+			res.SignerID = m.Kit.AuthorIdentity
+		}
+		return res, nil
 	}
 	return afclient.KitSignatureResult{}, fmt.Errorf("%s: %w", id, ErrKitNotFound)
 }
 
-// Install is currently a no-op stub. The remote-registry fetch path is
-// scheduled for a follow-up wave; this method exists so the HTTP route
-// has a wired call site.
-func (r *KitRegistry) Install(_ string, _ afclient.KitInstallRequest) (afclient.KitInstallResult, error) {
+// Install is the kit install entry point.
+//
+// Wave 12 Phase 3 wires only the trust gate; the actual install body
+// (git clone, manifest copy, registry rescan) lands in Wave 12 Phase 4
+// (S3) per WAVE12_PLAN. For Phase 3:
+//
+//   - When the configured trust mode rejects the verifier outcome
+//     (signed-by-allowlist / attested + KitTrustUnsigned or
+//     KitTrustSignedUnverified) AND no trustOverride bypass is in
+//     effect, return ErrKitTrustGateRejected (HTTP 403).
+//   - When trustOverride is "allowed-this-once", emit the audit log
+//     and proceed past the gate.
+//   - Either way, after the gate, return ErrKitInstallUnimplemented
+//     (Phase 4 owns the implementation).
+//
+// The gate keys off the EXISTING kit manifest in the scan paths
+// (matching `id`). When `id` is not yet installed (the typical case
+// for a fresh Install), the gate degrades to "permissive" because there
+// is no manifest to verify yet; Phase 4 will tighten this once the
+// install body fetches the manifest into a temp location and verifies
+// THAT before persisting. For Phase 3 the gate exercise vector is the
+// re-install path (which IS the customer-visible test scenario).
+func (r *KitRegistry) Install(id string, req afclient.KitInstallRequest) (afclient.KitInstallResult, error) {
+	if r.verifier != nil {
+		manifests, paths := r.scanWithPaths()
+		var (
+			manifestPath string
+			authorID     string
+			haveManifest bool
+		)
+		for i, m := range manifests {
+			if m.Kit.ID == id {
+				manifestPath = paths[i]
+				authorID = m.Kit.AuthorIdentity
+				haveManifest = true
+				break
+			}
+		}
+		if haveManifest {
+			res, err := r.verifier.VerifyManifest(id, manifestPath)
+			if err != nil {
+				return afclient.KitInstallResult{}, fmt.Errorf("trust gate: %w", err)
+			}
+			if res.SignerID == "" {
+				res.SignerID = authorID
+			}
+			if !r.verifier.trustGateAllows(res.Trust) {
+				if req.TrustOverride == afclient.TrustOverrideAllowedThisOnce {
+					r.verifier.auditTrustOverride(id, res.SignerID)
+					// Fall through past the gate; Phase 4 will own the
+					// install body proper.
+				} else {
+					return afclient.KitInstallResult{}, fmt.Errorf("%s: %w", id, ErrKitTrustGateRejected)
+				}
+			}
+		}
+	}
 	return afclient.KitInstallResult{}, ErrKitInstallUnimplemented
 }
 
@@ -397,9 +504,18 @@ func (r *KitRegistry) DisableSource(name string) (afclient.KitRegistrySource, er
 // are scanned in declaration order; later paths override earlier ones on
 // kit.id collision."
 func (r *KitRegistry) scan() []kitManifestTOML {
+	manifests, _ := r.scanWithPaths()
+	return manifests
+}
+
+// scanWithPaths is the same as scan but also returns each manifest's
+// on-disk file path (parallel-indexed). Used by VerifySignature /
+// Install to find the sibling `.sigstore` bundle file.
+func (r *KitRegistry) scanWithPaths() ([]kitManifestTOML, []string) {
 	var (
-		seen = map[string]int{}
-		out  []kitManifestTOML
+		seen      = map[string]int{}
+		manifests []kitManifestTOML
+		paths     []string
 	)
 	for _, dir := range r.scanPaths {
 		entries, err := os.ReadDir(dir)
@@ -437,14 +553,16 @@ func (r *KitRegistry) scan() []kitManifestTOML {
 				continue
 			}
 			if idx, ok := seen[m.Kit.ID]; ok {
-				out[idx] = m
+				manifests[idx] = m
+				paths[idx] = full
 				continue
 			}
-			seen[m.Kit.ID] = len(out)
-			out = append(out, m)
+			seen[m.Kit.ID] = len(manifests)
+			manifests = append(manifests, m)
+			paths = append(paths, full)
 		}
 	}
-	return out
+	return manifests, paths
 }
 
 // loadKitManifestFile decodes a single .kit.toml file.

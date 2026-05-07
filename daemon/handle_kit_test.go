@@ -256,6 +256,29 @@ func TestHandleKits_InstallStub501(t *testing.T) {
 	}
 }
 
+func TestHandleKits_InstallTrustGateRejected403(t *testing.T) {
+	fake := &fakeKitRegistry{installErr: ErrKitTrustGateRejected}
+	srv := kitTestServer(t, fake)
+	resp, _ := http.Post(srv.URL+"/api/daemon/kits/spring/java/install", "application/json", strings.NewReader(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: want 403, got %d", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["kitId"] != "spring/java" {
+		t.Errorf("body.kitId: want spring/java, got %q", body["kitId"])
+	}
+	if body["trust"] != string(afclient.KitTrustSignedUnverified) {
+		t.Errorf("body.trust: want %q, got %q", afclient.KitTrustSignedUnverified, body["trust"])
+	}
+	if body["error"] == "" {
+		t.Errorf("body.error: want non-empty, got empty")
+	}
+}
+
 func TestHandleKits_InstallEmptyBody(t *testing.T) {
 	fake := &fakeKitRegistry{}
 	srv := kitTestServer(t, fake)
