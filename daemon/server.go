@@ -25,6 +25,12 @@ type Server struct {
 	mu      sync.Mutex
 	started bool
 	addr    string
+
+	// kitReg is the in-process Kit registry serving /api/daemon/kits*
+	// (Wave 9 A2). Lazily constructed via kitRegistryOrEmpty so test
+	// servers built with NewServer get a default scan path automatically.
+	// Tests inject a fake by assigning the field directly before serving.
+	kitReg kitRegistryDoer
 }
 
 // NewServer builds an HTTP server for d. The handler is registered but the
@@ -114,6 +120,14 @@ func (s *Server) register(mux *http.ServeMux) {
 	// providers (Wave 9)
 	mux.HandleFunc("/api/daemon/providers", s.method(http.MethodGet, s.handleListProviders))
 	mux.HandleFunc("/api/daemon/providers/", s.handleGetProvider) // trailing slash → prefix matcher
+	// routing (Wave 9)
+	mux.HandleFunc("/api/daemon/routing/config", s.method(http.MethodGet, s.handleGetRoutingConfig))
+	mux.HandleFunc("/api/daemon/routing/explain/", s.handleExplainRouting) // trailing slash → prefix matcher
+	// kits (Wave 9)
+	mux.HandleFunc("/api/daemon/kits", s.handleKitsCollection)
+	mux.HandleFunc(kitRoutePrefix, s.handleKitDetail)
+	mux.HandleFunc("/api/daemon/kit-sources", s.handleKitSourcesCollection)
+	mux.HandleFunc(kitSourceRoutePrefix, s.handleKitSourceDetail)
 	mux.HandleFunc("/healthz", s.method(http.MethodGet, s.handleHealthz))
 }
 
