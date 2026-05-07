@@ -45,6 +45,13 @@ type Options struct {
 	// EvictHandler handles pool eviction requests. May be nil; the endpoint
 	// returns 501 in that case.
 	EvictHandler EvictHandler
+	// ProviderRegistry exposes the daemon's locally-registered AgentRuntime
+	// providers (claude/codex/ollama/opencode/gemini/amp/stub) to the
+	// /api/daemon/providers* surface. May be nil — the endpoint will then
+	// return an empty list with PartialCoverage=true, which is the correct
+	// behaviour for a daemon that has not yet wired its runtime registry.
+	// Wave 9 / ADR-2026-05-07-daemon-http-control-api.md §D4.
+	ProviderRegistry ProviderRegistry
 }
 
 // PoolStatsProvider returns a workarea pool snapshot.
@@ -55,6 +62,23 @@ type PoolStatsProvider interface {
 // EvictHandler executes a pool eviction request and returns the response.
 type EvictHandler interface {
 	Evict(ctx context.Context, req afclient.EvictPoolRequest) (*afclient.EvictPoolResponse, error)
+}
+
+// ProviderRegistry is the minimal read-only view of the runner's in-process
+// AgentRuntime registry the /api/daemon/providers handler consumes. The
+// daemon imports a satisfying type from runner.Registry — the interface
+// keeps this package free of a runner import cycle. (Wave 9 / A1.)
+type ProviderRegistry interface {
+	// Names returns the sorted list of registered provider name strings.
+	// Each name is the canonical agent.ProviderName string (e.g. "claude",
+	// "codex"). Order is stable across calls.
+	Names() []string
+	// Capabilities returns the typed capability struct serialised to a
+	// flat map[string]any for the named provider. ok is false when the
+	// provider is not registered. The map shape matches the JSON encoding
+	// of agent.Capabilities so the wire shape on /api/daemon/providers
+	// matches the contract.
+	Capabilities(name string) (caps map[string]any, ok bool)
 }
 
 // Daemon is the top-level supervisor. It owns the loaded Config, the

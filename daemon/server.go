@@ -111,6 +111,9 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/sessions/", s.handleSessionDetail)
 	mux.HandleFunc("/api/daemon/heartbeat", s.method(http.MethodGet, s.handleHeartbeat))
 	mux.HandleFunc("/api/daemon/doctor", s.method(http.MethodGet, s.handleDoctor))
+	// providers (Wave 9)
+	mux.HandleFunc("/api/daemon/providers", s.method(http.MethodGet, s.handleListProviders))
+	mux.HandleFunc("/api/daemon/providers/", s.handleGetProvider) // trailing slash → prefix matcher
 	mux.HandleFunc("/healthz", s.method(http.MethodGet, s.handleHealthz))
 }
 
