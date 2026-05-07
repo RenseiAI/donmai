@@ -76,6 +76,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newLinearCmd())
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newAdminCmd())
+	root.AddCommand(newProviderCmd(ds))
 	if cfg.EnableDashboard {
 		root.AddCommand(newDashboardCmd(cfg))
 	}

@@ -102,6 +102,19 @@ type Daemon struct {
 	// HTTP API at /api/daemon/sessions/<id>. (REN-1461 / F.2.8.)
 	sessionDetails *sessionDetailStore
 
+	// routingTraces is the in-process record of cross-provider
+	// scheduler decisions. The /api/daemon/routing/* surface reads
+	// this; future wave wires the scheduler's RecordDecision hook
+	// into it. (Wave 9 / A4 — ADR-2026-05-07-daemon-http-control-api.md
+	// §D4.)
+	routingTraces *RoutingTraceStore
+
+	// workareaArchive is the on-disk archive registry powering the
+	// /api/daemon/workareas* surface. Lazily constructed on first
+	// access; tests inject directly via SetWorkareaArchiveRegistry.
+	// Wave 9 / Track A3.
+	workareaArchive *WorkareaArchiveRegistry
+
 	stopOnce sync.Once
 	doneCh   chan struct{}
 }
@@ -124,9 +137,20 @@ func New(opts Options) *Daemon {
 		opts:           opts,
 		doneCh:         make(chan struct{}),
 		sessionDetails: newSessionDetailStore(),
+		routingTraces:  NewRoutingTraceStore(DefaultRoutingRingBufferSize),
 	}
 	d.state.Store(StateStopped)
 	return d
+}
+
+// RoutingTraces returns the daemon's in-process routing trace store.
+// The eventual cross-provider scheduler records its decisions here via
+// store.RecordDecision; the /api/daemon/routing/* HTTP surface reads
+// from it. Exposed so test harnesses (and a future scheduler wire-up)
+// can drive recordings without reaching through internal fields.
+// (Wave 9 / A4.)
+func (d *Daemon) RoutingTraces() *RoutingTraceStore {
+	return d.routingTraces
 }
 
 // State returns the current lifecycle state.
