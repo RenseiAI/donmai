@@ -2,13 +2,16 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
@@ -514,6 +517,81 @@ func TestKitRegistryOrEmpty_LazyConstruct(t *testing.T) {
 	// Calling again returns the same registry (cache hit).
 	if s.kitRegistryOrEmpty() != reg {
 		t.Error("registry: want cached instance on second call")
+	}
+}
+
+// TestKitRegistryOrEmpty_HonorsConfigScanPaths is the Wave 11 / S4
+// wire-up regression: a daemon constructed with daemon.yaml's
+// `kit.scanPaths` populated must surface those paths through the
+// lazy-constructed KitRegistry. Before this wave, kitRegistryOrEmpty
+// hardcoded [DefaultKitScanPath()] regardless of operator config.
+func TestKitRegistryOrEmpty_HonorsConfigScanPaths(t *testing.T) {
+	tmp := t.TempDir()
+	kitsA := filepath.Join(tmp, "kits-a")
+	kitsB := filepath.Join(tmp, "kits-b")
+
+	cfg := DefaultConfig()
+	cfg.Machine.ID = "test-machine"
+	cfg.Capacity.MaxConcurrentSessions = 1
+	cfg.Orchestrator.URL = "file:///tmp/queue"
+	cfg.Kit = KitConfig{ScanPaths: []string{kitsA, kitsB}}
+	cfgPath := filepath.Join(tmp, "daemon.yaml")
+	if err := WriteConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+	d := New(Options{
+		ConfigPath: cfgPath,
+		JWTPath:    filepath.Join(tmp, "daemon.jwt"),
+		HTTPHost:   "127.0.0.1",
+		HTTPPort:   0,
+		SkipWizard: true,
+	})
+	if err := d.Start(context.Background()); err != nil {
+		t.Fatalf("daemon Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = d.Stop(ctx)
+	})
+
+	s := &Server{daemon: d}
+	reg := s.kitRegistryOrEmpty()
+	concrete, ok := reg.(*KitRegistry)
+	if !ok {
+		t.Fatalf("registry type = %T, want *KitRegistry", reg)
+	}
+	got := concrete.ScanPaths()
+	want := []string{kitsA, kitsB}
+	if len(got) != len(want) {
+		t.Fatalf("ScanPaths len = %d (%v), want %d (%v)", len(got), got, len(want), want)
+	}
+	for i, p := range want {
+		if got[i] != p {
+			t.Errorf("ScanPaths[%d] = %q, want %q", i, got[i], p)
+		}
+	}
+}
+
+// TestKitRegistryOrEmpty_FallsBackWhenConfigEmpty pins the back-compat
+// fallback: when the daemon's loaded config has no kit.scanPaths set
+// AND has not been through applyDefaults (e.g., set directly on a test
+// daemon), kitRegistryOrEmpty still produces a usable registry pointed
+// at DefaultKitScanPath().
+func TestKitRegistryOrEmpty_FallsBackWhenConfigEmpty(t *testing.T) {
+	// Build a daemon whose Config() returns a Config with empty Kit.
+	d := &Daemon{}
+	d.config = &Config{Kit: KitConfig{ScanPaths: nil}}
+	s := &Server{daemon: d}
+
+	reg := s.kitRegistryOrEmpty()
+	concrete, ok := reg.(*KitRegistry)
+	if !ok {
+		t.Fatalf("registry type = %T, want *KitRegistry", reg)
+	}
+	got := concrete.ScanPaths()
+	if len(got) != 1 || got[0] != DefaultKitScanPath() {
+		t.Errorf("ScanPaths = %v, want [%s]", got, DefaultKitScanPath())
 	}
 }
 

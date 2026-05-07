@@ -267,17 +267,27 @@ func writeKitNotFound(w http.ResponseWriter, err error) bool {
 // the registry on Server (rather than Daemon) keeps the registry's
 // lifecycle bound to the HTTP surface — the registry has no background
 // goroutines, so there's nothing to start/stop.
+//
+// ScanPaths come from daemon.yaml's `kit.scanPaths` (Wave 11 / S4); the
+// fallback is [DefaultKitScanPath()] when the daemon has no Config
+// loaded yet OR when the operator left the block empty. NewKitRegistry
+// also accepts the empty slice as "use the default" — the explicit
+// fallback here keeps the wiring readable and matches the test plan.
 func (s *Server) kitRegistryOrEmpty() kitRegistryDoer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.kitReg != nil {
 		return s.kitReg
 	}
-	scanPaths := []string{DefaultKitScanPath()}
-	// Future: read scanPaths from daemon.yaml's `kit.scanPaths`. The
-	// Config struct does not yet declare that field; once it does,
-	// passing cfg.Kit.ScanPaths through here keeps the registry pluggable
-	// without a server change.
+	var scanPaths []string
+	if s.daemon != nil {
+		if cfg := s.daemon.Config(); cfg != nil {
+			scanPaths = cfg.Kit.ScanPaths
+		}
+	}
+	if len(scanPaths) == 0 {
+		scanPaths = []string{DefaultKitScanPath()}
+	}
 	s.kitReg = NewKitRegistry(scanPaths)
 	return s.kitReg
 }
