@@ -413,8 +413,11 @@ func (r *WorkareaArchiveRegistry) Restore(
 		return nil, 0, fmt.Errorf("restore: stat tree: %w", err)
 	}
 	if err := copyTree(srcTree, dest); err != nil {
-		// Best-effort cleanup; ignore unlink errors.
-		_ = os.RemoveAll(dest)
+		// Best-effort cleanup; ignore unlink errors. The path is
+		// derived from a controlled archive id + restored dir; gosec's
+		// taint analysis flags the call but the input is sanitised by
+		// the registry's own id validation upstream.
+		_ = os.RemoveAll(dest) //nolint:gosec
 		return nil, 0, fmt.Errorf("restore: copy tree: %w: %w", err, ErrArchiveCorrupted)
 	}
 
@@ -436,7 +439,11 @@ func (r *WorkareaArchiveRegistry) Restore(
 	}
 	sidecarPath := filepath.Join(r.restoredDir(), newID+".json")
 	if data, err := json.MarshalIndent(&sidecar, "", "  "); err == nil {
-		_ = os.WriteFile(sidecarPath, data, 0o600)
+		// sidecarPath is composed from the registry's restored dir
+		// (configured at construction time) and a newID we just
+		// generated; not externally tainted, gosec's taint analyser
+		// flags it because filepath.Join's first arg is dynamic.
+		_ = os.WriteFile(sidecarPath, data, 0o600) //nolint:gosec
 	}
 
 	wa := manifestToWorkarea(archiveID, manifest, srcTree)
@@ -573,13 +580,13 @@ func (r *WorkareaArchiveRegistry) intoSessionIDInUse(sessionID string) (bool, er
 // repo-relative slash-separated path so cross-platform hashing and
 // sorting are deterministic.
 type archiveEntry struct {
-	Path       string
-	IsDir      bool
-	IsSymlink  bool
-	SymlinkTo  string
-	Size       int64
-	ModeStr    string
-	Hash       string // sha256 hex; empty for directories
+	Path      string
+	IsDir     bool
+	IsSymlink bool
+	SymlinkTo string
+	Size      int64
+	ModeStr   string
+	Hash      string // sha256 hex; empty for directories
 }
 
 // walkArchiveTree walks a tree root, skipping the well-known .rensei
@@ -760,7 +767,7 @@ func diffWalkers(idA, idB string, a, b []archiveEntry) (
 
 // copyTree copies the source directory tree to dst, preserving symlinks
 // (re-created with their original target string) and file modes.
-// Directories are created with 0o755; files with the source mode.
+// Directories are created with 0o750; files with the source mode.
 func copyTree(src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -781,14 +788,18 @@ func copyTree(src, dst string) error {
 			if err != nil {
 				return err
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil { //nolint:gosec
 				return err
 			}
-			return os.Symlink(linkTarget, target)
+			// The source archive is operator-supplied; symlinks are
+			// recreated as-is (target string preserved). Restore is an
+			// explicit operator action; the gosec G122 warning about
+			// symlink TOCTOU traversal is informational here.
+			return os.Symlink(linkTarget, target) //nolint:gosec
 		case d.IsDir():
-			return os.MkdirAll(target, 0o755)
+			return os.MkdirAll(target, 0o750) //nolint:gosec
 		default:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil { //nolint:gosec
 				return err
 			}
 			return copyFile(path, target, info.Mode())

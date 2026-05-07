@@ -16,23 +16,23 @@ import (
 // workareaDaemonClient. Per AGENTS.md: no testify, no httptest
 // reach-throughs.
 type fakeWorkareaClient struct {
-	listResp    *afclient.ListWorkareasResponse
-	listErr     error
-	getResp     *afclient.WorkareaEnvelope
-	getErr      error
-	gotID       string
-	restoreResp *afclient.WorkareaRestoreResult
-	restoreErr  error
-	gotArchive  string
-	gotRestore  afclient.WorkareaRestoreRequest
-	diffResp    *afclient.WorkareaDiffResult
-	diffErr     error
-	gotIdA      string
-	gotIdB      string
-	listCalls   int
-	getCalls    int
+	listResp     *afclient.ListWorkareasResponse
+	listErr      error
+	getResp      *afclient.WorkareaEnvelope
+	getErr       error
+	gotID        string
+	restoreResp  *afclient.WorkareaRestoreResult
+	restoreErr   error
+	gotArchive   string
+	gotRestore   afclient.WorkareaRestoreRequest
+	diffResp     *afclient.WorkareaDiffResult
+	diffErr      error
+	gotIDA       string
+	gotIDB       string
+	listCalls    int
+	getCalls     int
 	restoreCalls int
-	diffCalls   int
+	diffCalls    int
 }
 
 func (f *fakeWorkareaClient) ListWorkareas() (*afclient.ListWorkareasResponse, error) {
@@ -55,8 +55,8 @@ func (f *fakeWorkareaClient) RestoreWorkarea(archiveID string, req afclient.Work
 
 func (f *fakeWorkareaClient) DiffWorkareas(idA, idB string) (*afclient.WorkareaDiffResult, error) {
 	f.diffCalls++
-	f.gotIdA = idA
-	f.gotIdB = idB
+	f.gotIDA = idA
+	f.gotIDB = idB
 	return f.diffResp, f.diffErr
 }
 
@@ -131,8 +131,10 @@ func TestWorkareaCmd_List_PropagatesError(t *testing.T) {
 
 func TestWorkareaCmd_Show_RendersDetail(t *testing.T) {
 	client := &fakeWorkareaClient{getResp: &afclient.WorkareaEnvelope{
-		Workarea: afclient.Workarea{ID: "wa-detail", Kind: afclient.WorkareaKindArchived,
-			Status: afclient.WorkareaStatusArchived, Repository: "github.com/acme/x"},
+		Workarea: afclient.Workarea{
+			ID: "wa-detail", Kind: afclient.WorkareaKindArchived,
+			Status: afclient.WorkareaStatusArchived, Repository: "github.com/acme/x",
+		},
 	}}
 	root := newWorkareaRootForTest(client)
 	out, err := runRootCmd(t, root, "workarea", "show", "wa-detail")
@@ -192,8 +194,10 @@ func TestWorkareaCmd_Show_RequiresExactlyOneArg(t *testing.T) {
 
 func TestWorkareaCmd_Restore_HappyPath(t *testing.T) {
 	client := &fakeWorkareaClient{restoreResp: &afclient.WorkareaRestoreResult{
-		Workarea: afclient.Workarea{ID: "wa-new", Kind: afclient.WorkareaKindActive,
-			Status: afclient.WorkareaStatusReady},
+		Workarea: afclient.Workarea{
+			ID: "wa-new", Kind: afclient.WorkareaKindActive,
+			Status: afclient.WorkareaStatusReady,
+		},
 	}}
 	root := newWorkareaRootForTest(client)
 	out, err := runRootCmd(t, root, "workarea", "restore", "wa-archive",
@@ -235,8 +239,8 @@ func TestWorkareaCmd_Restore_JSON(t *testing.T) {
 
 func TestWorkareaCmd_Restore_ErrorMessages(t *testing.T) {
 	cases := []struct {
-		name      string
-		serverErr error
+		name       string
+		serverErr  error
 		wantSubstr string
 	}{
 		{"not-found", fmt.Errorf("x: %w", afclient.ErrNotFound), "archive not found"},
@@ -285,8 +289,8 @@ func TestWorkareaCmd_Diff_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("diff: %v", err)
 	}
-	if client.gotIdA != "a" || client.gotIdB != "b" {
-		t.Errorf("ids = %q vs %q", client.gotIdA, client.gotIdB)
+	if client.gotIDA != "a" || client.gotIDB != "b" {
+		t.Errorf("ids = %q vs %q", client.gotIDA, client.gotIDB)
 	}
 	if !strings.Contains(out, "new.txt") {
 		t.Errorf("output missing entry:\n%s", out)

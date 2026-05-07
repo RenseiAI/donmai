@@ -29,7 +29,7 @@ type fixtureArchive struct {
 func writeFixtureArchive(t *testing.T, root string, fa fixtureArchive) {
 	t.Helper()
 	dir := filepath.Join(root, fa.id)
-	if err := os.MkdirAll(filepath.Join(dir, "tree"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "tree"), 0o750); err != nil {
 		t.Fatalf("mkdir tree: %v", err)
 	}
 	if fa.manifest.ID == "" {
@@ -49,7 +49,7 @@ func writeFixtureArchive(t *testing.T, root string, fa fixtureArchive) {
 		full := filepath.Join(dir, "tree", relPath)
 		if strings.HasPrefix(content, "symlink:") {
 			target := strings.TrimPrefix(content, "symlink:")
-			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
 				t.Fatalf("mkdir parent: %v", err)
 			}
 			if err := os.Symlink(target, full); err != nil {
@@ -57,7 +57,7 @@ func writeFixtureArchive(t *testing.T, root string, fa fixtureArchive) {
 			}
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
 			t.Fatalf("mkdir parent: %v", err)
 		}
 		if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
@@ -113,7 +113,7 @@ func TestWorkareaArchiveRegistry_List_SkipsCorruptedManifestSilentlyAsRow(t *tes
 
 	// Drop a directory with invalid manifest JSON.
 	corrupt := filepath.Join(root, "broken")
-	if err := os.MkdirAll(filepath.Join(corrupt, "tree"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(corrupt, "tree"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(corrupt, "manifest.json"), []byte("{invalid"), 0o600); err != nil {
@@ -208,7 +208,7 @@ func TestWorkareaArchiveRegistry_Get_NotFound(t *testing.T) {
 func TestWorkareaArchiveRegistry_Get_CorruptedManifest(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "wa-bad")
-	if err := os.MkdirAll(filepath.Join(dir, "tree"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "tree"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("{bad"), 0o600); err != nil {
@@ -555,7 +555,7 @@ func TestWorkareaArchiveRegistry_Restore_NotFound(t *testing.T) {
 func TestWorkareaArchiveRegistry_Restore_CorruptedArchive(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "wa-rotten")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("{bad"), 0o600); err != nil {
@@ -612,7 +612,7 @@ func TestWalkArchiveTree_OrderingAndExclusion(t *testing.T) {
 		"z/zz.txt", "a/aa.txt", "m/mm.txt", ".rensei/private.txt", ".rensei/sub/x.txt",
 	} {
 		full := filepath.Join(tree, p)
-		_ = os.MkdirAll(filepath.Dir(full), 0o755)
+		_ = os.MkdirAll(filepath.Dir(full), 0o750)
 		_ = os.WriteFile(full, []byte("hello"), 0o600)
 	}
 	entries, err := walkArchiveTree(tree)

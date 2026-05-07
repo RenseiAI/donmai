@@ -54,7 +54,7 @@ func TestDaemonClient_ListWorkareas_HappyPath(t *testing.T) {
 }
 
 func TestDaemonClient_ListWorkareas_ServerError(t *testing.T) {
-	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
 	if _, err := client.ListWorkareas(); !errors.Is(err, afclient.ErrServerError) {
@@ -101,7 +101,7 @@ func TestDaemonClient_GetWorkarea_NotFound(t *testing.T) {
 }
 
 func TestDaemonClient_GetWorkarea_RequiresID(t *testing.T) {
-	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	client, _ := newWorkareaTestServer(t, func(_ http.ResponseWriter, r *http.Request) {
 		t.Errorf("server should not have been called: %s", r.URL.Path)
 	})
 	if _, err := client.GetWorkarea(""); err == nil {
@@ -145,7 +145,7 @@ func TestDaemonClient_RestoreWorkarea_HappyPath(t *testing.T) {
 }
 
 func TestDaemonClient_RestoreWorkarea_Conflict(t *testing.T) {
-	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusConflict)
 		_, _ = w.Write([]byte(`{"error":"intoSessionId in use"}`))
 	})
@@ -156,7 +156,7 @@ func TestDaemonClient_RestoreWorkarea_Conflict(t *testing.T) {
 }
 
 func TestDaemonClient_RestoreWorkarea_Unavailable(t *testing.T) {
-	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "30")
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
@@ -167,7 +167,7 @@ func TestDaemonClient_RestoreWorkarea_Unavailable(t *testing.T) {
 }
 
 func TestDaemonClient_RestoreWorkarea_BadRequest(t *testing.T) {
-	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "archive corrupted", http.StatusBadRequest)
 	})
 	_, err := client.RestoreWorkarea("wa-1", afclient.WorkareaRestoreRequest{})
@@ -177,7 +177,7 @@ func TestDaemonClient_RestoreWorkarea_BadRequest(t *testing.T) {
 }
 
 func TestDaemonClient_RestoreWorkarea_RequiresID(t *testing.T) {
-	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	client, _ := newWorkareaTestServer(t, func(_ http.ResponseWriter, _ *http.Request) {
 		t.Errorf("server should not have been called")
 	})
 	if _, err := client.RestoreWorkarea("", afclient.WorkareaRestoreRequest{}); err == nil {
@@ -258,7 +258,7 @@ func TestDaemonClient_DiffWorkareas_NDJSONPath(t *testing.T) {
 }
 
 func TestDaemonClient_DiffWorkareas_NDJSON_ServerError(t *testing.T) {
-	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"path":"x.txt","status":"added"}` + "\n"))
@@ -281,7 +281,7 @@ func TestDaemonClient_DiffWorkareas_NotFound(t *testing.T) {
 }
 
 func TestDaemonClient_DiffWorkareas_RequiresIDs(t *testing.T) {
-	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	client, _ := newWorkareaTestServer(t, func(_ http.ResponseWriter, _ *http.Request) {
 		t.Errorf("server should not be called")
 	})
 	if _, err := client.DiffWorkareas("", "b"); err == nil {
@@ -296,7 +296,7 @@ func TestDaemonClient_DiffWorkareas_UnknownContentType(t *testing.T) {
 	// Best-effort fall-through: server forgot to set the content-type;
 	// the client treats it as JSON. Verify no error when the body is
 	// indeed JSON.
-	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "")
 		_ = json.NewEncoder(w).Encode(&afclient.WorkareaDiffEnvelope{Diff: afclient.WorkareaDiffResult{}})
 	})

@@ -253,7 +253,7 @@ func TestRenderDiff_NilResult(t *testing.T) {
 	}
 }
 
-func TestNoColorEnv(t *testing.T) {
+func TestNoColorEnv(_ *testing.T) {
 	// Just verify it doesn't panic; the actual env varies in CI.
 	_ = workarea.NoColorEnv()
 }

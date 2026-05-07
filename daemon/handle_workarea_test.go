@@ -121,7 +121,7 @@ func TestHandleWorkareas_Inspect_NotFound(t *testing.T) {
 func TestHandleWorkareas_Inspect_BadRequestOnCorrupted(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "wa-broken")
-	_ = os.MkdirAll(dir, 0o755)
+	_ = os.MkdirAll(dir, 0o750)
 	_ = os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("{bad"), 0o600)
 	hsrv := newServerForWorkareaTest(t, root, 0)
 	resp, _ := http.Get(hsrv.URL + "/api/daemon/workareas/wa-broken")
@@ -261,7 +261,7 @@ func TestHandleWorkareas_Restore_503OnSaturation(t *testing.T) {
 func TestHandleWorkareas_Restore_400OnCorrupted(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "wa-rotten")
-	_ = os.MkdirAll(dir, 0o755)
+	_ = os.MkdirAll(dir, 0o750)
 	_ = os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("{bad"), 0o600)
 	hsrv := newServerForWorkareaTest(t, root, 0)
 	resp, _ := http.Post(hsrv.URL+"/api/daemon/workareas/wa-rotten/restore",

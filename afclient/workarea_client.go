@@ -171,5 +171,7 @@ func decodeNDJSONDiff(body io.Reader, idA, idB string) (*WorkareaDiffResult, err
 
 // Compile-time checks that the DaemonClient implements the
 // workarea-related contracts. Pure assertions — no runtime cost.
-var _ = (*DaemonClient)(nil)
-var _ = http.MethodGet // ensures the http import remains tied to a real symbol
+var (
+	_ = (*DaemonClient)(nil)
+	_ = http.MethodGet // ensures the http import remains tied to a real symbol
+)

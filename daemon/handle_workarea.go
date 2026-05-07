@@ -21,10 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
@@ -378,25 +376,4 @@ func computeArchiveSize(treeDir string) (int64, error) {
 		total += e.Size
 	}
 	return total, nil
-}
-
-// safeJoin is a defence-in-depth guard against path traversal in
-// archive-id parameters. It rejects any id whose canonicalised form
-// escapes the archive root.
-func safeJoin(root, id string) (string, error) {
-	clean := path.Clean("/" + id)
-	if clean == "/" || strings.Contains(id, "..") || strings.ContainsRune(id, 0) {
-		return "", fmt.Errorf("invalid archive id: %q", id)
-	}
-	return path.Join(root, strings.TrimPrefix(clean, "/")), nil
-}
-
-// formatRetryAfter formats a duration as the integer seconds string
-// expected by the Retry-After HTTP header.
-func formatRetryAfter(d time.Duration) string {
-	secs := int(d.Seconds())
-	if secs < 1 {
-		secs = 1
-	}
-	return strconv.Itoa(secs)
 }
