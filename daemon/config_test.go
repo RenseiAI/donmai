@@ -411,6 +411,91 @@ func scanForKey(n *yaml.Node, name string) bool {
 	return false
 }
 
+// TestLoadConfig_KitScanPaths_DefaultsToDefaultKitScanPath asserts that a
+// daemon.yaml with no `kit:` block lands ScanPaths == [DefaultKitScanPath()]
+// after applyDefaults runs. This is the bare minimum back-compat property:
+// pre-Wave-11 daemon.yaml files (which never wrote a kit block) keep
+// scanning ~/.rensei/kits without operator action.
+func TestLoadConfig_KitScanPaths_DefaultsToDefaultKitScanPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: rensei.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+orchestrator:
+  url: https://platform.rensei.dev
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	want := []string{DefaultKitScanPath()}
+	if len(cfg.Kit.ScanPaths) != 1 || cfg.Kit.ScanPaths[0] != want[0] {
+		t.Errorf("Kit.ScanPaths = %v, want %v", cfg.Kit.ScanPaths, want)
+	}
+}
+
+// TestLoadConfig_KitScanPaths_ExplicitOverride asserts that an explicit
+// `kit.scanPaths` block round-trips through YAML in declaration order
+// (no reordering, no de-duping, no default merge).
+func TestLoadConfig_KitScanPaths_ExplicitOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: rensei.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+orchestrator:
+  url: https://platform.rensei.dev
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+kit:
+  scanPaths:
+    - /tmp/kits-a
+    - /tmp/kits-b
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	want := []string{"/tmp/kits-a", "/tmp/kits-b"}
+	if len(cfg.Kit.ScanPaths) != len(want) {
+		t.Fatalf("Kit.ScanPaths len = %d, want %d (%v)", len(cfg.Kit.ScanPaths), len(want), cfg.Kit.ScanPaths)
+	}
+	for i, p := range want {
+		if cfg.Kit.ScanPaths[i] != p {
+			t.Errorf("Kit.ScanPaths[%d] = %q, want %q", i, cfg.Kit.ScanPaths[i], p)
+		}
+	}
+}
+
 // TestLoadConfig_CanonicalKeyWinsOverLegacy asserts that when both keys are
 // present (pathological config) the canonical `repository` key wins, so a
 // half-migrated file does not silently revert to the legacy URL.

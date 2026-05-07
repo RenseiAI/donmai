@@ -29,6 +29,10 @@ type Config struct {
 	// diff streaming threshold). Optional; populated with defaults if
 	// absent.
 	Workarea WorkareaConfig `yaml:"workarea,omitempty"     json:"workarea,omitempty"`
+	// Kit holds Layer-4 kit-surface tunables (scan paths). Optional;
+	// applyDefaults seeds ScanPaths to [DefaultKitScanPath()] when
+	// absent. Per ADR-2026-05-07 § D4.
+	Kit KitConfig `yaml:"kit,omitempty"          json:"kit,omitempty"`
 }
 
 // MachineConfig captures the machine identity block from daemon.yaml.
@@ -132,6 +136,19 @@ type WorkareaConfig struct {
 	// endpoint switches from a single JSON envelope to NDJSON streaming.
 	// Default 1000 per ADR D4a.
 	DiffStreamingThreshold int `yaml:"diffStreamingThreshold,omitempty" json:"diffStreamingThreshold,omitempty"`
+}
+
+// KitConfig configures the Layer-4 kit operator surface — the scan paths
+// the daemon walks to discover installed kits. Wave 11 / ADR-2026-05-07
+// § D4. ScanPaths are evaluated in declaration order; the first entry is
+// also where the .state.json sidecar (enable/disable toggles) lives.
+// A leading `~/` is expanded to the user's home directory by
+// NewKitRegistry.
+type KitConfig struct {
+	// ScanPaths is the ordered list of directories the kit registry walks
+	// to find installed kits. Empty / absent means [DefaultKitScanPath()]
+	// (resolved by applyDefaults).
+	ScanPaths []string `yaml:"scanPaths,omitempty" json:"scanPaths,omitempty"`
 }
 
 // DefaultConfigPath returns the canonical path to ~/.rensei/daemon.yaml.
@@ -240,6 +257,9 @@ func applyDefaults(c *Config) {
 	}
 	if c.Workarea.DiffStreamingThreshold == 0 {
 		c.Workarea.DiffStreamingThreshold = 1000
+	}
+	if len(c.Kit.ScanPaths) == 0 {
+		c.Kit.ScanPaths = []string{DefaultKitScanPath()}
 	}
 	for i := range c.Projects {
 		if c.Projects[i].CloneStrategy == "" {
