@@ -16,6 +16,7 @@ require (
 
 require (
 	charm.land/bubbles/v2 v2.1.0 // indirect
+	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
