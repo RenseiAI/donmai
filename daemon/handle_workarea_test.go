@@ -468,6 +468,106 @@ func TestHandleWorkareas_ConcurrentDiffAndRestore(t *testing.T) {
 	wg.Wait()
 }
 
+// ── Active provider wire-up (Wave 11 / S5) ────────────────────────────────
+
+// TestHandleWorkareas_List_IncludesSpawnerLivePool covers the runtime
+// wire-up: when the daemon has a WorkerSpawner present and a session
+// in flight, GET /api/daemon/workareas returns the live-pool member
+// in Active[] (in addition to any on-disk archives).
+func TestHandleWorkareas_List_IncludesSpawnerLivePool(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureArchive(t, root, fixtureArchive{id: "wa-archived"})
+
+	d := New(Options{HTTPHost: "127.0.0.1", HTTPPort: 0})
+	d.mu.Lock()
+	d.config = &Config{Workarea: WorkareaConfig{ArchiveRoot: root}}
+	d.mu.Unlock()
+	d.state.Store(StateRunning)
+
+	// Inject a spawner directly. We don't call Start() — that would
+	// require a real registration RPC; the spawner is the only piece
+	// the workarea handler reaches into for the live-pool projection.
+	spawner := NewWorkerSpawner(SpawnerOptions{
+		Projects: []ProjectConfig{{
+			ID:         "smoke-alpha",
+			Repository: "https://github.com/foo/rensei-smokes-alpha",
+		}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+	})
+	d.spawner = spawner
+	t.Cleanup(func() { _ = spawner.Drain(time.Second) })
+
+	if _, err := spawner.AcceptWork(SessionSpec{
+		SessionID:  "sess-live-1",
+		Repository: "smoke-alpha",
+		Ref:        "feat/y",
+	}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+
+	srv := &Server{daemon: d}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/daemon/workareas", srv.handleWorkareasRoot)
+	mux.HandleFunc("/api/daemon/workareas/", srv.handleWorkareaItem)
+	hsrv := httptest.NewServer(mux)
+	t.Cleanup(hsrv.Close)
+
+	resp, err := http.Get(hsrv.URL + "/api/daemon/workareas")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", resp.StatusCode)
+	}
+	var body afclient.ListWorkareasResponse
+	decodeBody(t, resp, &body)
+
+	if len(body.Active) != 1 {
+		t.Fatalf("Active[]: want 1 entry from live spawner, got %d (%+v)", len(body.Active), body.Active)
+	}
+	live := body.Active[0]
+	if live.Kind != afclient.WorkareaKindActive {
+		t.Errorf("Kind: want active, got %q", live.Kind)
+	}
+	if live.SessionID != "sess-live-1" {
+		t.Errorf("SessionID: want %q, got %q", "sess-live-1", live.SessionID)
+	}
+	if live.Repository != "smoke-alpha" {
+		t.Errorf("Repository: want %q, got %q", "smoke-alpha", live.Repository)
+	}
+	if live.Ref != "feat/y" {
+		t.Errorf("Ref: want %q, got %q", "feat/y", live.Ref)
+	}
+	if live.ProjectID != "smoke-alpha" {
+		t.Errorf("ProjectID: want %q, got %q", "smoke-alpha", live.ProjectID)
+	}
+
+	// On-disk archive must still surface in Archived[].
+	if len(body.Archived) != 1 || body.Archived[0].ID != "wa-archived" {
+		t.Errorf("Archived[]: want one entry id=wa-archived, got %+v", body.Archived)
+	}
+
+	// The live-pool entry's id should be addressable via the per-id
+	// inspect endpoint — the lookupActiveByID short-circuit in
+	// handle_workarea.go consults the same active provider.
+	resp2, err := http.Get(hsrv.URL + "/api/daemon/workareas/" + live.ID)
+	if err != nil {
+		t.Fatalf("inspect get: %v", err)
+	}
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("inspect status: want 200, got %d", resp2.StatusCode)
+	}
+	var env afclient.WorkareaEnvelope
+	decodeBody(t, resp2, &env)
+	if env.Workarea.Kind != afclient.WorkareaKindActive {
+		t.Errorf("inspect kind: want active, got %q", env.Workarea.Kind)
+	}
+	if env.Workarea.SessionID != "sess-live-1" {
+		t.Errorf("inspect SessionID: want %q, got %q", "sess-live-1", env.Workarea.SessionID)
+	}
+}
+
 // ── helper plumbing for tests that need to reach into the daemon  ────────
 
 // serverByURL is a test-only lookup table mapping the httptest server's
