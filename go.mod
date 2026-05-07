@@ -5,6 +5,7 @@ go 1.25.9
 require (
 	charm.land/bubbletea/v2 v2.0.2
 	charm.land/lipgloss/v2 v2.0.2
+	github.com/BurntSushi/toml v1.6.0
 	github.com/RenseiAI/tui-components v0.1.1-0.20260428152024-0cca2f796b38
 	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/joho/godotenv v1.5.1
@@ -16,7 +17,6 @@ require (
 
 require (
 	charm.land/bubbles/v2 v2.1.0 // indirect
-	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
