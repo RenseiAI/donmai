@@ -3,6 +3,7 @@ package afcli
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/RenseiAI/agentfactory-tui/daemon"
+	"github.com/RenseiAI/agentfactory-tui/runner"
 )
 
 // newDaemonRunCmd constructs the `daemon run` subcommand. This is the
@@ -41,12 +43,21 @@ func newDaemonRunCmd() *cobra.Command {
 			"the first-run setup. SIGTERM / SIGINT triggers a graceful drain.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Build the in-process AgentRuntime registry once at daemon
+			// startup so the local /api/daemon/providers* HTTP surface
+			// can introspect it. The same registry shape is rebuilt
+			// per-session by `af agent run`; here we surface it for
+			// operator queries. Probes that fail (e.g. ollama not
+			// running) emit WARN logs but do not block daemon start.
+			// Wave 9 / A1.
+			providerReg := buildAgentRunRegistry(slog.Default())
 			d := daemon.New(daemon.Options{
-				ConfigPath: configPath,
-				JWTPath:    jwtPath,
-				HTTPHost:   host,
-				HTTPPort:   port,
-				SkipWizard: skipWizard,
+				ConfigPath:       configPath,
+				JWTPath:          jwtPath,
+				HTTPHost:         host,
+				HTTPPort:         port,
+				SkipWizard:       skipWizard,
+				ProviderRegistry: runner.NewProviderView(providerReg),
 			})
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
