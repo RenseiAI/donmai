@@ -332,6 +332,13 @@ func (s *Server) diffStreamingThreshold() int {
 // constructing one on first use from the configured archive root.
 // A daemon with no Workarea config gets a registry pointed at the
 // default ~/.rensei/workareas.
+//
+// The runtime wires WorkerSpawner as the ActiveWorkareaProvider when a
+// spawner is present (Wave 11 / S5), so /api/daemon/workareas reflects
+// live-pool members in addition to on-disk archives. Tests that need a
+// hand-rolled provider (or a pool guard) inject a fully-formed registry
+// via SetWorkareaArchiveRegistry — that path bypasses this lazy
+// constructor entirely.
 func (d *Daemon) workareaArchiveRegistry() *WorkareaArchiveRegistry {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -342,11 +349,11 @@ func (d *Daemon) workareaArchiveRegistry() *WorkareaArchiveRegistry {
 	if d.config != nil {
 		root = d.config.Workarea.ArchiveRoot
 	}
-	d.workareaArchive = NewWorkareaArchiveRegistry(WorkareaArchiveOptions{
-		Root: root,
-		// Active provider/pool guard wiring is the responsibility of
-		// the runtime; tests inject directly via SetWorkareaArchiveRegistry.
-	})
+	opts := WorkareaArchiveOptions{Root: root}
+	if d.spawner != nil {
+		opts.ActiveProvider = d.spawner
+	}
+	d.workareaArchive = NewWorkareaArchiveRegistry(opts)
 	return d.workareaArchive
 }
 
