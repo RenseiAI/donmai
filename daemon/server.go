@@ -128,6 +128,10 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc(kitRoutePrefix, s.handleKitDetail)
 	mux.HandleFunc("/api/daemon/kit-sources", s.handleKitSourcesCollection)
 	mux.HandleFunc(kitSourceRoutePrefix, s.handleKitSourceDetail)
+	// workareas (Wave 9) — list, inspect, restore, and diff over the
+	// on-disk archive registry plus active pool members.
+	mux.HandleFunc("/api/daemon/workareas", s.handleWorkareasRoot)
+	mux.HandleFunc("/api/daemon/workareas/", s.handleWorkareaItem)
 	mux.HandleFunc("/healthz", s.method(http.MethodGet, s.handleHealthz))
 }
 
