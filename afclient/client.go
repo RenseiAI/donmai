@@ -99,6 +99,12 @@ func statusToError(status int, path string) error {
 		return fmt.Errorf("%s: %w", path, ErrNotFound)
 	case status == http.StatusTooManyRequests:
 		return fmt.Errorf("%s: %w", path, ErrRateLimited)
+	case status == http.StatusConflict:
+		return fmt.Errorf("%s: %w", path, ErrConflict)
+	case status == http.StatusServiceUnavailable:
+		return fmt.Errorf("%s: %w", path, ErrUnavailable)
+	case status == http.StatusBadRequest:
+		return fmt.Errorf("%s: %w", path, ErrBadRequest)
 	case status >= 500:
 		return fmt.Errorf("%s: %w", path, ErrServerError)
 	default:

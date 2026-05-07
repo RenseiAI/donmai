@@ -25,6 +25,10 @@ type Config struct {
 	Orchestrator  OrchestratorConfig   `yaml:"orchestrator"           json:"orchestrator"`
 	AutoUpdate    AutoUpdateConfig     `yaml:"autoUpdate"             json:"autoUpdate"`
 	Observability *ObservabilityConfig `yaml:"observability,omitempty" json:"observability,omitempty"`
+	// Workarea holds Layer-3 workarea-surface tunables (archive root,
+	// diff streaming threshold). Optional; populated with defaults if
+	// absent.
+	Workarea WorkareaConfig `yaml:"workarea,omitempty"     json:"workarea,omitempty"`
 }
 
 // MachineConfig captures the machine identity block from daemon.yaml.
@@ -115,6 +119,19 @@ type ObservabilityConfig struct {
 	LogFormat   string `yaml:"logFormat,omitempty"   json:"logFormat,omitempty"`
 	LogPath     string `yaml:"logPath,omitempty"     json:"logPath,omitempty"`
 	MetricsPort int    `yaml:"metricsPort,omitempty" json:"metricsPort,omitempty"`
+}
+
+// WorkareaConfig configures the Layer-3 workarea operator surface — archive
+// root scan path, diff streaming threshold. Wave 9 / ADR-2026-05-07.
+type WorkareaConfig struct {
+	// ArchiveRoot is the directory the daemon scans for archived workareas.
+	// Default ~/.rensei/workareas (resolved at runtime by the handler if
+	// empty).
+	ArchiveRoot string `yaml:"archiveRoot,omitempty" json:"archiveRoot,omitempty"`
+	// DiffStreamingThreshold is the entry count above which the diff
+	// endpoint switches from a single JSON envelope to NDJSON streaming.
+	// Default 1000 per ADR D4a.
+	DiffStreamingThreshold int `yaml:"diffStreamingThreshold,omitempty" json:"diffStreamingThreshold,omitempty"`
 }
 
 // DefaultConfigPath returns the canonical path to ~/.rensei/daemon.yaml.
@@ -220,6 +237,9 @@ func applyDefaults(c *Config) {
 	}
 	if c.AutoUpdate.DrainTimeoutSeconds == 0 {
 		c.AutoUpdate.DrainTimeoutSeconds = 600
+	}
+	if c.Workarea.DiffStreamingThreshold == 0 {
+		c.Workarea.DiffStreamingThreshold = 1000
 	}
 	for i := range c.Projects {
 		if c.Projects[i].CloneStrategy == "" {
