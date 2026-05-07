@@ -317,6 +317,19 @@ func (d *Daemon) Start(ctx context.Context) error {
 			d.sessionDetails.Delete(ev.Spec.SessionID)
 		}
 	})
+	// Record a routing decision for every session-start so the
+	// /api/daemon/routing/explain/<sessionID> surface returns real
+	// data for live sessions instead of always-404. The OSS daemon
+	// ships a single sandbox provider (local), so the decision is
+	// degenerate by construction; the recording exists primarily so
+	// the operator surface is honest end-to-end. (Wave 11 / S6a;
+	// ADR-2026-05-07-daemon-http-control-api.md §D4.)
+	d.spawner.On(func(ev SessionEvent) {
+		if ev.Kind != SessionEventStarted || d.routingTraces == nil {
+			return
+		}
+		d.recordOSSRoutingDecision(ev.Spec.SessionID)
+	})
 
 	if regResp != nil {
 		// Heartbeat + poll share an OnReregister implementation so a 401 on
@@ -530,6 +543,47 @@ func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
 		SkipExit:       true, // HTTP-driven update: caller decides to exit.
 	})
 	return updater.RunUpdate(ctx)
+}
+
+// recordOSSRoutingDecision feeds the routing trace store with the
+// degenerate decision that fits the OSS daemon's single-sandbox shape.
+// Called from the spawner SessionEventStarted listener; the call site
+// is a no-op when routingTraces is nil.
+//
+// The decision shape is locked by afclient.RoutingDecision (no free-form
+// "reason" field exists on the wire); the human-readable rationale is
+// surfaced via the trace step's Note instead. ChosenLLM resolves to the
+// first registered AgentRuntime provider name when a registry is wired,
+// or "stub" as a fallback for test/no-orchestrator paths where the
+// registry is nil.
+//
+// Wave 11 / S6a — once a real cross-provider scheduler ships, this
+// function gets retired in favour of scheduler.RecordDecision wired
+// directly into the dispatch path.
+func (d *Daemon) recordOSSRoutingDecision(sessionID string) {
+	if d.routingTraces == nil {
+		return
+	}
+	chosenLLM := "stub"
+	if d.opts.ProviderRegistry != nil {
+		if names := d.opts.ProviderRegistry.Names(); len(names) > 0 {
+			chosenLLM = names[0]
+		}
+	}
+	decision := afclient.RoutingDecision{
+		SessionID:     sessionID,
+		ChosenSandbox: "local",
+		ChosenLLM:     chosenLLM,
+		DecidedAt:     time.Now().UTC(),
+	}
+	trace := []afclient.RoutingTraceStep{{
+		Step:      1,
+		Phase:     "capability-filter",
+		Dimension: "sandbox",
+		Remaining: []string{"local"},
+		Note:      "OSS daemon — only candidate is local",
+	}}
+	d.routingTraces.RecordDecision(decision, trace)
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────
