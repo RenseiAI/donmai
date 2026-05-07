@@ -224,9 +224,13 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 		s.mu.Unlock()
 		return nil, errors.New("not accepting new work (paused or draining)")
 	}
-	if len(s.sessions) >= s.opts.MaxConcurrentSessions {
+	if active, capacity := len(s.sessions), s.opts.MaxConcurrentSessions; active >= capacity {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("at capacity (%d/%d sessions)", len(s.sessions), s.opts.MaxConcurrentSessions)
+		// Snapshot the counts BEFORE unlocking — formatting them after
+		// release races with spawn.func1's delete on s.sessions when an
+		// in-flight session exits. (Caught under -race during Wave 11
+		// S5 work; pre-existing.)
+		return nil, fmt.Errorf("at capacity (%d/%d sessions)", active, capacity)
 	}
 	project := s.findProjectLocked(spec.Repository)
 	if project == nil {
