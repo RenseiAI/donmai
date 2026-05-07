@@ -135,10 +135,45 @@ type KitManifestEnvelope struct {
 	Kit KitManifest `json:"kit"`
 }
 
+// KitInstallSource identifies where the daemon should fetch a kit from
+// at install time. The wire shape is anchored in
+// ADR-2026-05-07-daemon-http-control-api.md § D6 (Wave 12 amendment).
+//
+// Wave 12 ships only `kind: "git"`; the remaining federation kinds
+// (`tessl`, `agentskills`) return ErrKitSourceFederationUnimplemented
+// in the registry. The descriptor list returned by
+// /api/daemon/kit-sources continues to surface them so operators can
+// see the federation order, but Install against them is unimplemented.
+type KitInstallSource struct {
+	// Kind selects the fetcher. Wave 12: "git" only.
+	Kind string `json:"kind"`
+	// URL is the fetcher-specific source URL (e.g., a git remote).
+	URL string `json:"url"`
+	// Ref is the optional git ref (branch/tag/commit). Default: HEAD.
+	Ref string `json:"ref,omitempty"`
+	// ManifestPath is the optional path inside the source to the kit
+	// manifest. Default: registry walks the source root for *.kit.toml.
+	ManifestPath string `json:"manifestPath,omitempty"`
+}
+
 // KitInstallRequest is the request body for POST /api/daemon/kits/<id>/install.
 type KitInstallRequest struct {
-	Version string `json:"version,omitempty"`
+	Version string            `json:"version,omitempty"`
+	Source  *KitInstallSource `json:"source,omitempty"`
+	// TrustOverride bypasses the configured trust gate for this single
+	// install. The only accepted value is "allowed-this-once" (per
+	// REN-1314 / 002-provider-base-contract.md § "Signing and trust").
+	// When set the daemon emits a structured slog audit log with the
+	// kitId, signerId, actor, and timestamp. The override is single-shot:
+	// not persisted; subsequent re-installs re-evaluate the gate. Empty
+	// string = no override.
+	TrustOverride string `json:"trustOverride,omitempty"`
 }
+
+// TrustOverrideAllowedThisOnce is the only accepted value of
+// KitInstallRequest.TrustOverride. Mirrors the
+// 'trustOverride: "allowed-this-once"' contract from REN-1314.
+const TrustOverrideAllowedThisOnce = "allowed-this-once"
 
 // KitInstallResult is returned by POST /api/daemon/kits/<id>/install.
 type KitInstallResult struct {
