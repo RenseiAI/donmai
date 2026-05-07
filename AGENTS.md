@@ -30,13 +30,17 @@ Treat the legacy repo as **read-only reference**. Don't modify it from work in t
 
 ## Architecture
 
-Authoritative architecture lives in `../rensei-architecture/` (remote: https://github.com/RenseiAI/rensei-architecture, private). Read in this order:
+The OSS-canonical architecture corpus is `agentfactory-architecture` (remote: https://github.com/RenseiAI/agentfactory-architecture, public). Read it first; it is the source of truth for everything OSS-execution-layer (`af` binary, daemon, runner, the eight Provider Families, kits, workflow engine).
 
-1. `001-layered-execution-model.md` — canonical synthesis. Always first.
-2. The reference doc(s) for whichever layer you are working on (`002`–`008`, `011`, `013`–`016`).
-3. Any open ADRs that touch your work (`ADR-*.md`).
+Its sibling, `rensei-architecture` (remote: https://github.com/RenseiAI/rensei-architecture, private), extends with platform-only docs (Linear realignment, PM agents tied to the Rensei team's backlog, multi-tenant control-plane policy, the SaaS dashboard parity discipline) and the `<doc>-platform-extensions.md` deltas that extend shared docs in the OSS corpus. Locally both repos sit alongside this one (`../agentfactory-architecture/`, `../rensei-architecture/`).
 
-If this project's docs conflict with `../rensei-architecture/`, the corpus wins. Either update this project's docs to align, or open an ADR to amend the corpus.
+Read in this order:
+
+1. `agentfactory-architecture/001-layered-execution-model.md` — canonical synthesis (OSS). Always first.
+2. The reference doc(s) for whichever layer you are working on — `agentfactory-architecture/002`–`008`, `011`, `013`–`016`. All OSS-canonical for the contract; if a platform-extensions sibling exists in `rensei-architecture/<doc>-platform-extensions.md` and your work touches platform behavior, read it second.
+3. Any open ADRs that touch your work (`ADR-*.md`) — start in `agentfactory-architecture` for cross-cutting/OSS ADRs; cross-check `rensei-architecture` for platform-extension ADRs and the dual-publish stubs.
+
+If this project's docs conflict with `agentfactory-architecture/`, the OSS corpus wins. Either update this project's docs to align, or open an ADR to amend the corpus.
 
 ## Package Architecture
 
