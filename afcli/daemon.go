@@ -102,9 +102,10 @@ func newDaemonCmdWithFactory(factory daemonClientFactory) *cobra.Command {
 
 func newDaemonInstallCmd() *cobra.Command {
 	var (
-		binPath     string // --bin-path overrides the host binary path resolved via os.Executable()
-		scopeUser   bool   // Linux systemd: --user  (user-scoped unit, default)
-		scopeSystem bool   // Linux systemd: --system (system-scoped unit, requires root)
+		binPath            string // --bin-path overrides the host binary path resolved via os.Executable()
+		scopeUser          bool   // Linux systemd: --user  (user-scoped unit, default)
+		scopeSystem        bool   // Linux systemd: --system (system-scoped unit, requires root)
+		skipServiceManager bool   // hidden: --skip-service-manager (test/internal hermetic install)
 	)
 
 	cmd := &cobra.Command{
@@ -130,8 +131,9 @@ func newDaemonInstallCmd() *cobra.Command {
 			}
 
 			res, err := installer.Install(installer.InstallOptions{
-				HostBinPath: binPath,
-				Scope:       scope,
+				HostBinPath:        binPath,
+				Scope:              scope,
+				SkipServiceManager: skipServiceManager,
 			})
 			if err != nil {
 				return fmt.Errorf("daemon install: %w", err)
@@ -152,14 +154,18 @@ func newDaemonInstallCmd() *cobra.Command {
 	cmd.Flags().StringVar(&binPath, "bin-path", "", "Path to the host binary (default: current executable)")
 	cmd.Flags().BoolVar(&scopeUser, "user", false, "Install as user-scoped systemd unit (Linux)")
 	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Install as system-scoped systemd unit, requires sudo (Linux)")
+	cmd.Flags().BoolVar(&skipServiceManager, "skip-service-manager", false,
+		"(internal/test) skip launchctl/systemctl invocation; write the unit file only")
+	_ = cmd.Flags().MarkHidden("skip-service-manager")
 
 	return cmd
 }
 
 func newDaemonUninstallCmd() *cobra.Command {
 	var (
-		scopeUser   bool // Linux systemd: --user  (user-scoped unit, default)
-		scopeSystem bool // Linux systemd: --system (system-scoped unit, requires root)
+		scopeUser          bool // Linux systemd: --user  (user-scoped unit, default)
+		scopeSystem        bool // Linux systemd: --system (system-scoped unit, requires root)
+		skipServiceManager bool // hidden: --skip-service-manager (test/internal hermetic uninstall)
 	)
 
 	cmd := &cobra.Command{
@@ -182,7 +188,10 @@ func newDaemonUninstallCmd() *cobra.Command {
 				scope = installer.ScopeSystem
 			}
 
-			res, err := installer.Uninstall(installer.UninstallOptions{Scope: scope})
+			res, err := installer.Uninstall(installer.UninstallOptions{
+				Scope:              scope,
+				SkipServiceManager: skipServiceManager,
+			})
 			if err != nil {
 				return fmt.Errorf("daemon uninstall: %w", err)
 			}
@@ -198,6 +207,9 @@ func newDaemonUninstallCmd() *cobra.Command {
 
 	cmd.Flags().BoolVar(&scopeUser, "user", false, "Uninstall user-scoped systemd unit (Linux)")
 	cmd.Flags().BoolVar(&scopeSystem, "system", false, "Uninstall system-scoped systemd unit, requires sudo (Linux)")
+	cmd.Flags().BoolVar(&skipServiceManager, "skip-service-manager", false,
+		"(internal/test) skip launchctl/systemctl invocation; remove the unit file only")
+	_ = cmd.Flags().MarkHidden("skip-service-manager")
 
 	return cmd
 }
