@@ -238,6 +238,110 @@ func TestHandleExplainRouting_NilStoreSafe(t *testing.T) {
 	}
 }
 
+// TestHandleExplainRouting_LiveSessionEndToEnd covers the Wave 11 / S6a
+// wire-up at the HTTP layer: a real WorkerSpawner accepts a session →
+// the daemon's Started listener records a routing decision → GET
+// /api/daemon/routing/explain/<id> returns 200 with the recorded
+// decision JSON.
+//
+// Constructed without calling Daemon.Start() to sidestep the known
+// port-7734 bind flake when -race tests share the default daemon HTTP
+// port; the spawner is wired directly and the same Started listener
+// Daemon.Start would install is registered manually. Mirrors the
+// pattern Phase 4's TestHandleWorkareas_List_IncludesSpawnerLivePool
+// uses for the same reason.
+func TestHandleExplainRouting_LiveSessionEndToEnd(t *testing.T) {
+	t.Parallel()
+	d := New(Options{
+		ConfigPath:       "/dev/null",
+		HTTPHost:         "127.0.0.1",
+		HTTPPort:         0,
+		ProviderRegistry: &fakeProviderRegistry{names: []string{"claude", "codex"}},
+	})
+	d.state.Store(StateRunning)
+
+	spawner := NewWorkerSpawner(SpawnerOptions{
+		Projects: []ProjectConfig{{
+			ID:         "smoke-alpha",
+			Repository: "https://github.com/foo/rensei-smokes-alpha",
+		}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+	})
+	d.spawner = spawner
+	t.Cleanup(func() { _ = spawner.Drain(time.Second) })
+
+	// Same listener body Daemon.Start installs.
+	spawner.On(func(ev SessionEvent) {
+		if ev.Kind != SessionEventStarted || d.routingTraces == nil {
+			return
+		}
+		d.recordOSSRoutingDecision(ev.Spec.SessionID)
+	})
+
+	if _, err := spawner.AcceptWork(SessionSpec{
+		SessionID:  "sess-e2e-routing",
+		Repository: "smoke-alpha",
+		Ref:        "feat/routing",
+	}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+
+	// Listener fires synchronously from the spawn goroutine before
+	// AcceptWork returns the handle, so the recording is visible
+	// immediately. Brief poll for resilience against future ordering
+	// tweaks.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, ok := d.RoutingTraces().Explain("sess-e2e-routing"); ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	srv := &Server{daemon: d}
+	mux := http.NewServeMux()
+	srv.register(mux)
+	hsrv := httptest.NewServer(mux)
+	t.Cleanup(hsrv.Close)
+
+	resp, err := http.Get(hsrv.URL + "/api/daemon/routing/explain/sess-e2e-routing")
+	if err != nil {
+		t.Fatalf("GET explain: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body=%s, want 200", resp.StatusCode, body)
+	}
+	var explain afclient.RoutingExplainResponse
+	if err := json.NewDecoder(resp.Body).Decode(&explain); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if explain.SessionID != "sess-e2e-routing" {
+		t.Errorf("SessionID = %q, want sess-e2e-routing", explain.SessionID)
+	}
+	if explain.Decision.ChosenSandbox != "local" {
+		t.Errorf("Decision.ChosenSandbox = %q, want local", explain.Decision.ChosenSandbox)
+	}
+	if explain.Decision.ChosenLLM != "claude" {
+		t.Errorf("Decision.ChosenLLM = %q, want claude (first registry name)", explain.Decision.ChosenLLM)
+	}
+	if explain.Decision.DecidedAt.IsZero() {
+		t.Error("Decision.DecidedAt is zero, want now()")
+	}
+	if len(explain.Trace) != 1 {
+		t.Fatalf("len(Trace) = %d, want 1", len(explain.Trace))
+	}
+	if explain.Trace[0].Phase != "capability-filter" {
+		t.Errorf("Trace[0].Phase = %q, want capability-filter", explain.Trace[0].Phase)
+	}
+	if explain.Trace[0].Note == "" {
+		t.Error("Trace[0].Note empty, want OSS-only rationale string")
+	}
+}
+
 // TestRoutingRoutes_RegisteredOnRealServer pins that the new routes are
 // wired into register() — sanity check against drift.
 func TestRoutingRoutes_RegisteredOnRealServer(t *testing.T) {
