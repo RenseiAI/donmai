@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -121,8 +122,8 @@ func TestRoutingTraceStore_RingEviction_PreservesNewerSessionEntry(t *testing.T)
 	// not be dropped just because the older one ages out of the ring.
 	s := NewRoutingTraceStore(2)
 	base := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
-	s.RecordDecision(makeDecision("sess-x", "local", "claude", base), nil)             // ring[0]
-	s.RecordDecision(makeDecision("sess-y", "local", "claude", base.Add(time.Minute)), nil) // ring[1]
+	s.RecordDecision(makeDecision("sess-x", "local", "claude", base), nil)                   // ring[0]
+	s.RecordDecision(makeDecision("sess-y", "local", "claude", base.Add(time.Minute)), nil)  // ring[1]
 	s.RecordDecision(makeDecision("sess-x", "local", "codex", base.Add(2*time.Minute)), nil) // evicts ring[0] (old sess-x)
 
 	// sess-x should still be retrievable — the newer record overwrites
@@ -240,9 +241,9 @@ func TestRoutingTraceStore_ConcurrentRecordExplain(t *testing.T) {
 			defer wg.Done()
 			base := time.Now()
 			for i := 0; i < writes; i++ {
+				id := fmt.Sprintf("sess-g%d-%d", g, i%10)
 				s.RecordDecision(
-					makeDecision("sess-g"+string(rune('a'+g))+"-"+string(rune('0'+i%10)),
-						"local", "claude", base.Add(time.Duration(i)*time.Microsecond)),
+					makeDecision(id, "local", "claude", base.Add(time.Duration(i)*time.Microsecond)),
 					nil,
 				)
 				_ = s.Len()

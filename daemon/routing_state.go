@@ -48,7 +48,7 @@ type recordedDecision struct {
 type RoutingTraceStore struct {
 	mu        sync.RWMutex
 	ringSize  int
-	ring      []recordedDecision  // chronological, oldest first; len ≤ ringSize
+	ring      []recordedDecision // chronological, oldest first; len ≤ ringSize
 	bySession map[string]recordedDecision
 }
 
