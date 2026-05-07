@@ -131,8 +131,7 @@ func TestRecordOSSRoutingDecision_EmptyRegistryNamesFallsBack(t *testing.T) {
 // RPCs and a real config. We mirror the pattern used by
 // TestHandleWorkareas_List_IncludesSpawnerLivePool: build the spawner
 // directly, register the same listener Start would have, then exercise.
-// This avoids the known port-7734 bind flake under -race when Start is
-// invoked from multiple parallel tests.
+// HTTPPort: 0 is ephemeral (Wave 12 / C3).
 func TestDaemon_SpawnerStartedListener_RecordsDecision(t *testing.T) {
 	t.Parallel()
 	d := New(Options{

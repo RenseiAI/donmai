@@ -36,6 +36,15 @@ type Options struct {
 	// HTTPHost overrides the default control server bind address.
 	HTTPHost string
 	// HTTPPort overrides the default control server port.
+	//
+	// Zero means "ephemeral port": the listener binds 127.0.0.1:0 and
+	// the kernel picks a free port. The effective bound port is then
+	// available via Server.Addr() after Server.Start succeeds.
+	// Production callers (afcli/daemon_run.go) substitute the
+	// well-known DefaultHTTPPort (7734) themselves before constructing
+	// Options so operator behaviour is preserved; the daemon library
+	// itself does NOT auto-fill — leaving zero-as-ephemeral makes
+	// parallel tests collision-free under -race.
 	HTTPPort int
 	// PoolStatsProvider returns the current workarea pool snapshot. May be
 	// nil — the /api/daemon/pool/stats endpoint will return an empty
@@ -130,9 +139,13 @@ func New(opts Options) *Daemon {
 	if opts.HTTPHost == "" {
 		opts.HTTPHost = DefaultHTTPHost
 	}
-	if opts.HTTPPort == 0 {
-		opts.HTTPPort = DefaultHTTPPort
-	}
+	// Note: HTTPPort=0 is intentionally NOT auto-filled to
+	// DefaultHTTPPort here — callers that want the well-known 7734
+	// port (the cobra `af daemon run` entry point) substitute it
+	// themselves before constructing Options. Leaving zero-as-
+	// ephemeral here lets parallel tests bind 127.0.0.1:0 and have
+	// the kernel pick free ports, eliminating the port-7734 bind
+	// flake observed under -race when many tests share the default.
 	d := &Daemon{
 		opts:           opts,
 		doneCh:         make(chan struct{}),

@@ -51,6 +51,18 @@ func newDaemonRunCmd() *cobra.Command {
 			// running) emit WARN logs but do not block daemon start.
 			// Wave 9 / A1.
 			providerReg := buildAgentRunRegistry(slog.Default())
+			// Substitute the well-known DefaultHTTPPort here when the
+			// operator did not pass `--port`. Leaving zero through to
+			// daemon.New would bind an ephemeral port — correct for
+			// tests but wrong for the service-managed `af daemon run`
+			// entry point operators reach via launchd / systemd, which
+			// must bind 7734 so the `af daemon …` CLI surface (and the
+			// installed plist health checks) can find the daemon.
+			// (Wave 12 / C3 — port-7734 default lives in the cobra
+			// layer, not the runtime.)
+			if port == 0 {
+				port = daemon.DefaultHTTPPort
+			}
 			d := daemon.New(daemon.Options{
 				ConfigPath:       configPath,
 				JWTPath:          jwtPath,

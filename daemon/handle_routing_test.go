@@ -244,12 +244,10 @@ func TestHandleExplainRouting_NilStoreSafe(t *testing.T) {
 // /api/daemon/routing/explain/<id> returns 200 with the recorded
 // decision JSON.
 //
-// Constructed without calling Daemon.Start() to sidestep the known
-// port-7734 bind flake when -race tests share the default daemon HTTP
-// port; the spawner is wired directly and the same Started listener
-// Daemon.Start would install is registered manually. Mirrors the
-// pattern Phase 4's TestHandleWorkareas_List_IncludesSpawnerLivePool
-// uses for the same reason.
+// Constructed without calling Daemon.Start() — Start would require
+// real registration RPCs and a loaded config. The spawner is wired
+// directly and the same Started listener Daemon.Start would install
+// is registered manually. HTTPPort: 0 is ephemeral (Wave 12 / C3).
 func TestHandleExplainRouting_LiveSessionEndToEnd(t *testing.T) {
 	t.Parallel()
 	d := New(Options{
