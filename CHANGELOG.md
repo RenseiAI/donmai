@@ -12,6 +12,32 @@ _No work staged for the next release._
 
 ---
 
+## v0.7.0 — 2026-05-07
+
+### Features
+
+- **Daemon HTTP control API for the four operator surfaces (Wave 9)** — Provider, Kit, Workarea, and Routing surfaces now ship as canonical OSS endpoints under `/api/daemon/*`, joining the pre-existing seven daemon lifecycle routes. New endpoints: `GET /api/daemon/providers`, `GET /api/daemon/providers/<id>`, `GET /api/daemon/kits`, `GET /api/daemon/kits/<id>`, `GET /api/daemon/kits/<id>/verify-signature`, `POST /api/daemon/kits/<id>/{install,enable,disable}`, `GET /api/daemon/kit-sources`, `POST /api/daemon/kit-sources/<name>/{enable,disable}`, `GET /api/daemon/workareas`, `GET /api/daemon/workareas/<id>`, `POST /api/daemon/workareas/<archiveID>/restore`, `GET /api/daemon/workareas/<idA>/diff/<idB>`, `GET /api/daemon/routing/config`, `GET /api/daemon/routing/explain/<sessionID>`. Localhost-only auth model (no bearer). Contract locked in `rensei-architecture/ADR-2026-05-07-daemon-http-control-api.md`.
+- **`af provider` / `af kit` / `af workarea` / `af routing` Cobra command trees** — First-class top-level commands on the `af` binary, sourced from the new daemon HTTP surface. `provider list/show`, `kit list/show/install/enable/disable/verify/sources`, `workarea list/show/restore/diff`, `routing show/explain`. Each delegates to the local daemon at `127.0.0.1:7734` (overridable via `RENSEI_DAEMON_URL`) and renders through the new `afview/` package.
+- **New public package `afview/`** — Houses surface-specific composed renderers (`afview/provider`, `afview/kit`, `afview/workarea`, `afview/routing`). Joins `afclient`/`afcli`/`worker` as the fourth public package. Both binaries (af and rensei) import the same renderers; no forks. Plain-text fallbacks for each surface's list/detail views are what `rensei-smokes` pins against.
+- **21 new `afclient` types** — Provider/Kit/Workarea/Routing wire types live in `afclient/{provider,kit,workarea,routing}_types.go` matching the daemon's `/api/daemon/*` namespace. Notable shapes: `ListProvidersResponse.PartialCoverage` flag (honest about agent-runtime-only coverage in this wave), `WorkareaSummary.Kind` discriminating active pool members vs on-disk archives, structured `WorkareaDiffEntry` with per-path SHA-256 hashes + size + mode + symlink target, `RoutingDecision` + `RoutingTraceStep` for per-session decision explain.
+- **8 new exported `afcli` factories** — `NewProviderCmd`, `NewKitCmd`, `NewWorkareaCmd`, `NewRoutingCmd` and their backing private helpers, exported via `afcli/exports.go` so downstream binaries can graft the canonical command trees under their own parent commands. The rensei binary uses these to expose `rensei host {provider,kit,workarea}` and `rensei routing` without forking.
+- **Workarea diff streaming** — `GET /api/daemon/workareas/<idA>/diff/<idB>` switches between a single JSON envelope and NDJSON streaming based on entry count vs the daemon's configured threshold (default 1000, `daemon.yaml` key `workarea.diffStreamingThreshold`). Both shapes carry the same `WorkareaDiffEntry` per-path payload; consumers discriminate via `Content-Type`. The afclient method consumes both into a unified `WorkareaDiffResult`.
+- **Workarea archive restore** — `POST /api/daemon/workareas/<archiveID>/restore` materialises an archive into a fresh active pool member with a NEW id (archives are immutable). Conflicts on `IntoSessionID` → 409; pool saturation → 503 with Retry-After; corrupted archive → 400.
+- **Daemon-side Kit registry** — Minimal in-process Kit registry that scans `~/.rensei/kits/*.kit.toml` per `005-kit-manifest-spec.md`'s § Daemon kit registry. Multi-path support via `daemon.yaml` `kit.scanPaths` override. Malformed manifests log warnings and are excluded; empty registry returns `{kits: []}` with HTTP 200. Enable/disable state persisted to `<scanPath>/.state.json`.
+- **Daemon-side routing trace store** — In-memory ring buffer (default 50) of recent routing decisions plus per-session lookup keyed on `SessionID` for `routing explain`. Hookable `RecordDecision` seam for the future cross-provider scheduler. Default Thompson-Sampling weights `{Cost: 0.7, Latency: 0.3}` per `004-sandbox-capability-matrix.md`.
+- **`runner.ProviderView` adapter** — Widens `runner.Registry` for HTTP surface use. Surfaces the in-process AgentRuntime registry as the `agent-runtime` Provider Family entries; documented `partialCoverage: true` flag honestly reports the other seven Provider Families return empty until per-family registries land.
+
+### Fixes
+
+- **None specific to this release.** Wave 9 was a structural refactor; earlier observability bug (`auditClientFromConfig` delegating to the daemon-targeted client) was caught in rensei-tui's parallel cleanup and is fixed there.
+
+### Chores
+
+- **`daemon.Version` bumped to `0.7.0`** — reported in registration and status payloads; was last bumped to `0.5.5` and drifted out of sync with the git tag during v0.6.0.
+- **New error sentinels** — `ErrConflict`, `ErrUnavailable`, `ErrBadRequest`, `ErrUnimplemented` in `afclient/errors.go` for HTTP 409 / 503 / 400 / staged-implementation cases.
+
+---
+
 ## v0.6.0 — 2026-05-06
 
 ### Features

@@ -41,7 +41,7 @@ import "time"
 // (probes /api/workers/<id>/refresh-token before falling back to a
 // full re-register so the workerId stays stable when the platform
 // side ships the companion handler).
-const Version = "0.5.5"
+const Version = "0.7.0"
 
 // DefaultHTTPPort is the port the daemon's control HTTP server binds to.
 // Keep in sync with afclient.DefaultDaemonConfig (port 7734).
