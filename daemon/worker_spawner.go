@@ -7,10 +7,21 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 )
+
+// Compile-time assertion that WorkerSpawner satisfies the
+// ActiveWorkareaProvider contract consumed by WorkareaArchiveRegistry.
+// The runtime wires the spawner in via NewWorkareaArchiveRegistry's
+// ActiveProvider option (see Daemon.workareaArchiveRegistry()), so the
+// /api/daemon/workareas list and inspect endpoints return live-pool
+// members rather than archives only.
+var _ ActiveWorkareaProvider = (*WorkerSpawner)(nil)
 
 // SpawnerOptions configure a WorkerSpawner.
 type SpawnerOptions struct {
@@ -133,6 +144,50 @@ func (s *WorkerSpawner) ActiveSessions() []SessionHandle {
 	for _, ss := range s.sessions {
 		out = append(out, ss.handle)
 	}
+	return out
+}
+
+// ActiveWorkareas projects the spawner's in-flight sessions onto the
+// canonical afclient.WorkareaSummary wire shape so the WorkareaArchiveRegistry
+// can union live-pool members with on-disk archives in the GET
+// /api/daemon/workareas response (Wave 11 / S5; ADR-2026-05-07-daemon-
+// http-control-api.md §D4a).
+//
+// The projection is pull-based — the spawner holds no separate workarea
+// map; each call materialises summaries from the live `sessions` map under
+// the same `mu` lock that ActiveSessions uses. ProjectID is resolved via
+// the project allowlist using the same matcher AcceptWork applies. The
+// summary's ID is the spawner's session id so /api/daemon/workareas/<id>
+// reaches the live entry.
+//
+// Output is sorted by SessionID for deterministic test assertions.
+func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]afclient.WorkareaSummary, 0, len(s.sessions))
+	for _, ss := range s.sessions {
+		summary := afclient.WorkareaSummary{
+			ID:         ss.spec.SessionID,
+			Kind:       afclient.WorkareaKindActive,
+			Status:     afclient.WorkareaStatusReady,
+			Repository: ss.spec.Repository,
+			Ref:        ss.spec.Ref,
+			SessionID:  ss.spec.SessionID,
+		}
+		if project := s.findProjectLocked(ss.spec.Repository); project != nil {
+			summary.ProjectID = project.ID
+		}
+		// handle.AcceptedAt is RFC3339 today; surface it on the wire as
+		// AcquiredAt (the active-only "session admitted to pool" stamp).
+		// Parse failures yield nil — better than a zero-time pointer
+		// that JSON-encodes as "0001-01-01T00:00:00Z".
+		if ts, err := time.Parse(time.RFC3339, ss.handle.AcceptedAt); err == nil {
+			t := ts
+			summary.AcquiredAt = &t
+		}
+		out = append(out, summary)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SessionID < out[j].SessionID })
 	return out
 }
 
