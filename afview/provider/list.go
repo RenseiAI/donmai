@@ -46,21 +46,21 @@ func RenderList(out io.Writer, providers []afclient.Provider, noColor bool) erro
 		}
 
 		if !first {
-			fmt.Fprintln(out)
+			_, _ = fmt.Fprintln(out)
 		}
 		first = false
 
-		fmt.Fprintln(out, sectionHeader(string(family), noColor))
+		_, _ = fmt.Fprintln(out, sectionHeader(string(family), noColor))
 
 		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
 			colHeader("NAME", noColor),
 			colHeader("VERSION", noColor),
 			colHeader("SCOPE", noColor),
 			colHeader("STATUS", noColor),
 		)
 		for _, p := range entries {
-			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
+			_, _ = fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n",
 				bold(p.Name, noColor),
 				p.Version,
 				muted(string(p.Scope), noColor),
@@ -73,7 +73,7 @@ func RenderList(out io.Writer, providers []afclient.Provider, noColor bool) erro
 	}
 
 	if len(providers) == 0 {
-		fmt.Fprintln(out, muted("No providers registered.", noColor))
+		_, _ = fmt.Fprintln(out, muted("No providers registered.", noColor))
 	}
 
 	return nil

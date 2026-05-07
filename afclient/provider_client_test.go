@@ -86,7 +86,7 @@ func TestDaemonClientListProviders_ServerError(t *testing.T) {
 func TestDaemonClientListProviders_NetworkError(t *testing.T) {
 	// Construct a client pointed at a closed server to force a transport
 	// error.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 	c := NewDaemonClientFromURL(srv.URL)
 	srv.Close()
 	_, err := c.ListProviders()
@@ -151,7 +151,7 @@ func TestDaemonClientGetProvider_NotFound(t *testing.T) {
 }
 
 func TestDaemonClientGetProvider_NetworkError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 	c := NewDaemonClientFromURL(srv.URL)
 	srv.Close()
 	_, err := c.GetProvider("claude")

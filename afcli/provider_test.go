@@ -16,11 +16,11 @@ import (
 // fakeProviderClient is a hand-rolled mock that satisfies
 // providerDaemonClient. Per AGENTS.md, no testify.
 type fakeProviderClient struct {
-	listResp *afclient.ListProvidersResponse
-	listErr  error
-	showResp *afclient.ProviderEnvelope
-	showErr  error
-	gotID    string
+	listResp  *afclient.ListProvidersResponse
+	listErr   error
+	showResp  *afclient.ProviderEnvelope
+	showErr   error
+	gotID     string
 	listCalls int
 	showCalls int
 }

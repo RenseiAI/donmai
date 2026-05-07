@@ -38,15 +38,15 @@ func RenderShow(out io.Writer, p *afclient.Provider, noColor bool) error {
 	// deterministic key order so the output is stable across Go map
 	// iteration shuffles. The smoke harness pins this rendering.
 	if len(p.Capabilities) > 0 {
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, bold("Capabilities:", noColor))
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, bold("Capabilities:", noColor))
 		keys := make([]string, 0, len(p.Capabilities))
 		for k := range p.Capabilities {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			fmt.Fprintf(out, "  %s%s\n",
+			_, _ = fmt.Fprintf(out, "  %s%s\n",
 				muted(k+": ", noColor),
 				bold(fmt.Sprintf("%v", p.Capabilities[k]), noColor),
 			)
@@ -63,7 +63,7 @@ func PlainShow(out io.Writer, p *afclient.Provider) error {
 }
 
 func label(out io.Writer, key, value string, noColor bool) {
-	fmt.Fprintf(out, "%s %s\n", muted(key, noColor), bold(value, noColor))
+	_, _ = fmt.Fprintf(out, "%s %s\n", muted(key, noColor), bold(value, noColor))
 }
 
 func trustLabel(p *afclient.Provider, noColor bool) string {
