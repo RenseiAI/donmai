@@ -12,6 +12,55 @@ _No work staged for the next release._
 
 ---
 
+## v0.7.2 — 2026-05-08
+
+Bug-fix roll-up after v0.7.1: three afclient corrections for the platform's
+`/api/public/session-activities` endpoint (so unauthenticated CLI calls reach
+the public branch and authenticated ones don't double-feed `sessionHash`),
+plus daemon hardening — install/uninstall now wipes `~/.rensei/daemon.jwt`
+to break re-register loops on stale tokens, and rejected work is NACK'd
+instead of silently dropped.
+
+### Fixes
+
+- **`afclient.GetActivities` targets `/api/public/session-activities`** — the
+  previous path was `/api/sessions/<id>/activities`, which routes through the
+  authenticated tree and 404s for the public CLI flow.
+- **`sessionHash` only on unauthenticated GetActivities** — when the caller
+  has a `rsk_` token, omitting `sessionHash` lets the platform take the
+  `rsk_`-scoped read path. Authenticated callers were sending both, so the
+  server applied the public-hash filter inside the rsk_ branch and silently
+  returned empty.
+- **Unauthenticated GetActivities passes `sessionHash`** — the inverse of
+  the above for the no-`rsk_` branch. Public CLI calls without a token now
+  carry the hash so the platform's public hash-keyed lookup succeeds.
+- **Daemon NACKs rejected work + silences misleading allowlist WARN** —
+  when the daemon refuses a session for allowlist reasons it now NACKs the
+  work back to the queue (instead of leaving it claimed-but-unrun) and the
+  WARN that read like a fatal error has been clarified.
+- **Daemon wipes cached JWT on install/uninstall** — removes
+  `~/.rensei/daemon.jwt` so a re-install on a stale machine doesn't loop on
+  a JWT minted for a worker_id the platform no longer knows. rensei-tui's
+  `host install` already had this behaviour; the upstream `af daemon
+  install` now matches.
+
+### Tests
+
+- **`test(afcli): stop tests from clobbering the developer's launchd
+  domain`** — `go test ./...` on macOS could previously `bootout` the
+  developer's real `dev.rensei.daemon` LaunchAgent because install/uninstall
+  tests took the ServiceManager path. Tests now pass
+  `--skip-service-manager` (the v0.7.1 hidden flag) explicitly and only the
+  ServiceManager-specific suite exercises the real launchd domain.
+
+### Docs
+
+- **`af provider --help` no longer leaks roadmap commentary** — the Long
+  help text was carrying a "TODO: per-Provider-Family registries" note that
+  surfaced in user-visible CLI output.
+
+---
+
 ## v0.7.0 — 2026-05-07
 
 ### Features
