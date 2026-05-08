@@ -177,11 +177,21 @@ func (c *Client) GetSessionDetail(id string) (*SessionDetailResponse, error) {
 }
 
 // GetActivities fetches activity events for a session, optionally after a cursor.
+//
+// The endpoint changed from a path-segment shape
+// (`/api/public/sessions/<id>/activities`) to a query-parameter shape
+// (`/api/public/session-activities?sessionId=<id>`) when the activity
+// reader was ported into the platform's app-router REST surface. Older
+// servers that still expose the legacy path-segment route will respond
+// with a 404 to the query-param URL — clients targeting those need to
+// pin a version of this package that pre-dates this commit.
 func (c *Client) GetActivities(sessionID string, afterCursor *string) (*ActivityListResponse, error) {
-	path := "/api/public/sessions/" + sessionID + "/activities"
+	q := url.Values{}
+	q.Set("sessionId", sessionID)
 	if afterCursor != nil {
-		path += "?after=" + *afterCursor
+		q.Set("after", *afterCursor)
 	}
+	path := "/api/public/session-activities?" + q.Encode()
 	var resp ActivityListResponse
 	if err := c.get(path, &resp); err != nil {
 		return nil, err

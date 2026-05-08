@@ -125,7 +125,7 @@ func TestClientGetEndpoints(t *testing.T) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/api/public/stats"):
 			_ = json.NewEncoder(w).Encode(StatsResponse{WorkersOnline: 2})
-		case strings.HasPrefix(r.URL.Path, "/api/public/sessions/") && strings.Contains(r.URL.Path, "/activities"):
+		case r.URL.Path == "/api/public/session-activities":
 			_ = json.NewEncoder(w).Encode(ActivityListResponse{SessionStatus: StatusWorking})
 		case r.URL.Path == "/api/public/sessions":
 			_ = json.NewEncoder(w).Encode(SessionsListResponse{Count: 1})
@@ -166,6 +166,44 @@ func TestClientGetEndpoints(t *testing.T) {
 	}
 	if _, err := c.WhoAmI(); err != nil {
 		t.Errorf("WhoAmI: %v", err)
+	}
+}
+
+// TestClientGetActivitiesURLContract pins the wire contract for
+// GetActivities: query-param shape against /api/public/session-activities,
+// not the legacy path-segment shape under /api/public/sessions/<id>/.
+// Pre-port servers responded to the path-segment URL; current platform
+// servers serve the query-param URL exclusively. Without this guard a
+// future regression to the legacy form silently 404s every CLI
+// `session show` / `session stream` invocation against the production
+// surface.
+func TestClientGetActivitiesURLContract(t *testing.T) {
+	var seenPath, seenQuery string
+	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenQuery = r.URL.RawQuery
+		_ = json.NewEncoder(w).Encode(ActivityListResponse{SessionStatus: StatusWorking})
+	})
+
+	if _, err := c.GetActivities("sess-9", nil); err != nil {
+		t.Fatalf("GetActivities: %v", err)
+	}
+	if seenPath != "/api/public/session-activities" {
+		t.Errorf("path = %q, want /api/public/session-activities", seenPath)
+	}
+	if !strings.Contains(seenQuery, "sessionId=sess-9") {
+		t.Errorf("query missing sessionId=sess-9; got %q", seenQuery)
+	}
+	if strings.Contains(seenQuery, "after=") {
+		t.Errorf("nil cursor must not add after= param; got %q", seenQuery)
+	}
+
+	cursor := "cur-42"
+	if _, err := c.GetActivities("sess-9", &cursor); err != nil {
+		t.Fatalf("GetActivities with cursor: %v", err)
+	}
+	if !strings.Contains(seenQuery, "after=cur-42") {
+		t.Errorf("cursor must round-trip as after=...; got query %q", seenQuery)
 	}
 }
 
