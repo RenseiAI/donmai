@@ -169,6 +169,30 @@ func SaveCachedJWT(jwtPath string, resp *RegisterResponse, now time.Time) error 
 	return nil
 }
 
+// WipeCachedJWT removes the cached JWT file at jwtPath. Returns wiped=true
+// when the file existed and was removed, wiped=false when there was no
+// cache to remove (idempotent — safe to call from uninstall paths on
+// systems that never had the daemon installed).
+//
+// Why this exists: Register() short-circuits with the cached JWT
+// whenever the file is present, even when the workerId in it has been
+// invalidated by the orchestrator (worker row deleted, registration
+// token rotated, org migrated, manual cleanup, …). Without an explicit
+// wipe, the daemon polls the dead workerId every poll interval forever
+// — the token-refresh fallback re-mints credentials for the same dead
+// id rather than triggering a true re-registration. Install / uninstall
+// paths should call this so a fresh registration handshake happens on
+// the next daemon boot.
+func WipeCachedJWT(jwtPath string) (bool, error) {
+	if err := os.Remove(jwtPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("wipe jwt cache: %w", err)
+	}
+	return true, nil
+}
+
 // looksLikeRegistrationToken returns true if the input has one of the
 // platform's accepted registration-token prefixes.
 //

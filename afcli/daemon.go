@@ -142,6 +142,23 @@ func newDaemonInstallCmd() *cobra.Command {
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintf(out, "Service registered: %s\n", res.ServicePath)
 			_, _ = fmt.Fprintf(out, "Service command: %s\n", res.ServiceCommand)
+
+			// Wipe any cached JWT so the daemon's first boot performs a
+			// fresh registration handshake with the orchestrator. Without
+			// this, install on a machine that previously ran the daemon
+			// would short-circuit Register() on the stale cache and
+			// poll a workerId the orchestrator no longer recognizes —
+			// producing a "Worker not found" 404 loop forever. The wipe
+			// is non-fatal: a write-permission failure prints a warning
+			// but doesn't abort install.
+			wiped, wipeErr := daemonRuntime.WipeCachedJWT(daemonRuntime.DefaultJWTPath())
+			if wipeErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"warning: failed to wipe cached daemon JWT: %v\n", wipeErr)
+			} else if wiped {
+				_, _ = fmt.Fprintf(out, "Cleared cached JWT at %s.\n", daemonRuntime.DefaultJWTPath())
+			}
+
 			_, _ = fmt.Fprintln(out)
 			_, _ = fmt.Fprintln(out,
 				"The Go daemon runtime is now in-binary (REN-1408): the registered\n"+
@@ -200,6 +217,20 @@ func newDaemonUninstallCmd() *cobra.Command {
 				_, _ = fmt.Fprintf(out, "Service uninstalled: %s\n", res.ServicePath)
 			} else {
 				_, _ = fmt.Fprintf(out, "No service was registered at %s\n", res.ServicePath)
+			}
+
+			// Wipe the cached JWT so a subsequent install starts clean,
+			// even when the install reuses an existing daemon.yaml. The
+			// JWT cache is only meaningful while paired with a live
+			// orchestrator-side worker registration; once the service is
+			// gone, the cache is dead weight that re-triggers the
+			// "Worker not found" 404 loop on the next install.
+			wiped, wipeErr := daemonRuntime.WipeCachedJWT(daemonRuntime.DefaultJWTPath())
+			if wipeErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"warning: failed to wipe cached daemon JWT: %v\n", wipeErr)
+			} else if wiped {
+				_, _ = fmt.Fprintf(out, "Cleared cached JWT at %s.\n", daemonRuntime.DefaultJWTPath())
 			}
 			return nil
 		},

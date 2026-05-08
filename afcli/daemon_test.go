@@ -3,6 +3,7 @@ package afcli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -209,6 +210,80 @@ func TestDaemonInstallInProcessRegistersDaemonRun(t *testing.T) {
 	}
 	if strings.Contains(out, "rensei-daemon install") || strings.Contains(out, "brew install rensei") {
 		t.Errorf("install output should NOT reference the legacy rensei-daemon shell-out, got:\n%s", out)
+	}
+}
+
+// TestDaemonInstallWipesCachedJWT verifies the install command removes
+// any pre-existing daemon.jwt so the daemon's first boot performs a
+// fresh registration handshake with the orchestrator. Without this,
+// re-installing on a machine that previously ran the daemon would
+// short-circuit Register() on the stale cache and poll a workerId
+// the orchestrator no longer recognizes — the "Worker not found" 404
+// loop. Uses --skip-service-manager so the test stays hermetic.
+func TestDaemonInstallWipesCachedJWT(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	// Pre-seed a stale cache. Place it at the canonical location the
+	// runtime helper consults so the wipe logic finds it the same way
+	// production code will.
+	jwtPath := filepath.Join(tmp, ".rensei", "daemon.jwt")
+	if err := os.MkdirAll(filepath.Dir(jwtPath), 0o755); err != nil {
+		t.Fatalf("mkdir .rensei: %v", err)
+	}
+	if err := os.WriteFile(jwtPath, []byte(`{"workerId":"wkr_dead"}`), 0o600); err != nil {
+		t.Fatalf("seed stale JWT: %v", err)
+	}
+
+	hostBin := tmp + "/af-fake"
+	if err := os.WriteFile(hostBin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec
+		t.Fatalf("seed fake host binary: %v", err)
+	}
+
+	cmd := newDaemonInstallCmd()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--bin-path", hostBin, "--skip-service-manager"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	if _, err := os.Stat(jwtPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("cache file at %s should be wiped after install (err=%v); install must remove stale cache so the daemon re-registers cleanly", jwtPath, err)
+	}
+	if !strings.Contains(buf.String(), "Cleared cached JWT") {
+		t.Errorf("install output should announce the wipe so operators see what happened; got:\n%s", buf.String())
+	}
+}
+
+// TestDaemonUninstallWipesCachedJWT mirrors the install-side test for
+// the uninstall path. Wiping at uninstall ensures a subsequent install
+// — even one that reuses an existing daemon.yaml without re-minting —
+// starts clean.
+func TestDaemonUninstallWipesCachedJWT(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+
+	jwtPath := filepath.Join(tmp, ".rensei", "daemon.jwt")
+	if err := os.MkdirAll(filepath.Dir(jwtPath), 0o755); err != nil {
+		t.Fatalf("mkdir .rensei: %v", err)
+	}
+	if err := os.WriteFile(jwtPath, []byte(`{"workerId":"wkr_dead"}`), 0o600); err != nil {
+		t.Fatalf("seed stale JWT: %v", err)
+	}
+
+	cmd := newDaemonUninstallCmd()
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--skip-service-manager"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+
+	if _, err := os.Stat(jwtPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("cache file at %s should be wiped after uninstall (err=%v)", jwtPath, err)
 	}
 }
 

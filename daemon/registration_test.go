@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -431,5 +432,89 @@ func TestLoadCachedJWT_Missing(t *testing.T) {
 	}
 	if c != nil {
 		t.Errorf("expected nil for missing, got %+v", c)
+	}
+}
+
+// TestWipeCachedJWT_Removes covers the happy path: a present cache file
+// is removed and wiped=true is returned.
+func TestWipeCachedJWT_Removes(t *testing.T) {
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	if err := os.WriteFile(jwtPath, []byte(`{"workerId":"wid","runtimeToken":"t"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wiped, err := WipeCachedJWT(jwtPath)
+	if err != nil {
+		t.Fatalf("wipe: %v", err)
+	}
+	if !wiped {
+		t.Errorf("wiped = false, want true (cache existed)")
+	}
+	if _, statErr := os.Stat(jwtPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("cache file should be gone, stat err = %v", statErr)
+	}
+}
+
+// TestWipeCachedJWT_AbsentIsNoOp confirms the helper is safe on systems
+// that never had a cache file (uninstall on a never-installed host).
+func TestWipeCachedJWT_AbsentIsNoOp(t *testing.T) {
+	jwtPath := filepath.Join(t.TempDir(), "missing.jwt")
+	wiped, err := WipeCachedJWT(jwtPath)
+	if err != nil {
+		t.Fatalf("wipe missing: %v", err)
+	}
+	if wiped {
+		t.Errorf("wiped = true on missing cache; want false (idempotent)")
+	}
+}
+
+// TestRegister_AfterWipeReregisters proves the integration: a cached
+// JWT short-circuits Register(), but wiping the cache forces the next
+// Register() call to walk the registration path again and write a
+// fresh cache. Without this guarantee, install/uninstall paths that
+// wipe the cache would not actually trigger a fresh registration
+// handshake.
+//
+// We verify the wipe-then-rewrite semantics rather than comparing
+// WorkerIDs because the stub registration path is deterministic by
+// hostname (the live platform path returns fresh ids; the stub path
+// returning a stable id makes the test value-based assertion
+// inappropriate).
+func TestRegister_AfterWipeReregisters(t *testing.T) {
+	t.Setenv("RENSEI_DAEMON_FORCE_STUB", "1")
+
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+
+	// First register seeds the cache.
+	if _, err := Register(context.Background(), RegistrationOptions{
+		Hostname: "h", JWTPath: jwtPath,
+	}); err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	if _, err := os.Stat(jwtPath); err != nil {
+		t.Fatalf("expected cache file present after first register: %v", err)
+	}
+
+	// Wipe — cache must be gone.
+	wiped, err := WipeCachedJWT(jwtPath)
+	if err != nil {
+		t.Fatalf("wipe: %v", err)
+	}
+	if !wiped {
+		t.Fatalf("wipe reported false despite cache existing")
+	}
+	if _, statErr := os.Stat(jwtPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("cache file should be gone after wipe; stat err = %v", statErr)
+	}
+
+	// Re-register — cache must be re-created (proves the wipe forces
+	// Register() to walk the registration path again rather than
+	// short-circuiting on the now-missing cache).
+	if _, err := Register(context.Background(), RegistrationOptions{
+		Hostname: "h", JWTPath: jwtPath,
+	}); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	if _, err := os.Stat(jwtPath); err != nil {
+		t.Errorf("expected cache file recreated after wipe + register; stat err = %v", err)
 	}
 }
