@@ -41,7 +41,15 @@ import "time"
 // (probes /api/workers/<id>/refresh-token before falling back to a
 // full re-register so the workerId stays stable when the platform
 // side ships the companion handler).
-const Version = "0.7.0"
+//
+// 0.7.1: Wave 12 — kit lifecycle honest end-to-end. Sigstore bundle-
+// mode verifier (sigstore-go) on /api/daemon/kits/<id>/verify-signature
+// replaces the always-KitTrustUnsigned stub. Git-source kit install
+// (go-git/v5) on /api/daemon/kits/<id>/install replaces the 501 stub.
+// Trust modes (permissive / signed-by-allowlist / attested) configurable
+// via daemon.yaml; trustOverride: "allowed-this-once" audit-logged
+// per REN-1314.
+const Version = "0.7.1"
 
 // DefaultHTTPPort is the port the daemon's control HTTP server binds to.
 // Keep in sync with afclient.DefaultDaemonConfig (port 7734).
