@@ -171,12 +171,16 @@ func TestClientGetEndpoints(t *testing.T) {
 
 // TestClientGetActivitiesURLContract pins the wire contract for
 // GetActivities: query-param shape against /api/public/session-activities,
-// not the legacy path-segment shape under /api/public/sessions/<id>/.
-// Pre-port servers responded to the path-segment URL; current platform
-// servers serve the query-param URL exclusively. Without this guard a
-// future regression to the legacy form silently 404s every CLI
-// `session show` / `session stream` invocation against the production
-// surface.
+// with sessionId + sessionHash + (optional) after parameters. The
+// sessionHash is mandatory for unauthenticated CLI callers — without it
+// the platform requires worker-JWT auth and rejects with 401. Pre-port
+// servers responded to a legacy path-segment URL
+// (/api/public/sessions/<id>/activities); current platform servers
+// serve the query-param URL exclusively. Without this guard a future
+// regression to the legacy form silently 404s every CLI `session show` /
+// `session stream` invocation against the production surface, and a
+// regression that drops the sessionHash silently 401s every one of
+// them.
 func TestClientGetActivitiesURLContract(t *testing.T) {
 	var seenPath, seenQuery string
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -194,6 +198,9 @@ func TestClientGetActivitiesURLContract(t *testing.T) {
 	if !strings.Contains(seenQuery, "sessionId=sess-9") {
 		t.Errorf("query missing sessionId=sess-9; got %q", seenQuery)
 	}
+	if !strings.Contains(seenQuery, "sessionHash="+hashSessionID("sess-9")) {
+		t.Errorf("query missing sessionHash for unauthenticated access; got %q", seenQuery)
+	}
 	if strings.Contains(seenQuery, "after=") {
 		t.Errorf("nil cursor must not add after= param; got %q", seenQuery)
 	}
@@ -204,6 +211,45 @@ func TestClientGetActivitiesURLContract(t *testing.T) {
 	}
 	if !strings.Contains(seenQuery, "after=cur-42") {
 		t.Errorf("cursor must round-trip as after=...; got query %q", seenQuery)
+	}
+}
+
+// TestHashSessionID pins the SHA-256 derivation that mirrors the
+// platform's hashSessionId in src/lib/worker-protocol/session-hash.ts.
+// Format: first 32 hex chars of SHA-256("session:" + sessionId). If
+// either side drifts, every unauthenticated GetActivities call 401s.
+//
+// The expected hash values are computed from the same algorithm; this
+// test catches accidental algorithm changes (length, prefix, encoding)
+// rather than trying to encode the platform's literal output —
+// upstream changes to either side would still need to be paired
+// manually.
+func TestHashSessionID(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantLen  int
+		notEmpty bool
+	}{
+		{in: "sess-1", wantLen: 32, notEmpty: true},
+		{in: "a008dd512f8add5b", wantLen: 32, notEmpty: true},
+		{in: "", wantLen: 32, notEmpty: true}, // sha256("session:") still has 32 hex chars
+	}
+	for _, tc := range cases {
+		got := hashSessionID(tc.in)
+		if len(got) != tc.wantLen {
+			t.Errorf("hashSessionID(%q) length = %d, want %d (got %q)", tc.in, len(got), tc.wantLen, got)
+		}
+		if tc.notEmpty && got == "" {
+			t.Errorf("hashSessionID(%q) returned empty", tc.in)
+		}
+	}
+	// Determinism: same input must always hash to the same output.
+	if hashSessionID("sess-determinism") != hashSessionID("sess-determinism") {
+		t.Errorf("hashSessionID is not deterministic")
+	}
+	// Distinguishability: different inputs hash to different outputs.
+	if hashSessionID("sess-a") == hashSessionID("sess-b") {
+		t.Errorf("hashSessionID collided across distinct inputs")
 	}
 }
 

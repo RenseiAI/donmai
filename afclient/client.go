@@ -3,6 +3,8 @@ package afclient
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -180,14 +182,20 @@ func (c *Client) GetSessionDetail(id string) (*SessionDetailResponse, error) {
 //
 // The endpoint changed from a path-segment shape
 // (`/api/public/sessions/<id>/activities`) to a query-parameter shape
-// (`/api/public/session-activities?sessionId=<id>`) when the activity
-// reader was ported into the platform's app-router REST surface. Older
-// servers that still expose the legacy path-segment route will respond
-// with a 404 to the query-param URL — clients targeting those need to
-// pin a version of this package that pre-dates this commit.
+// (`/api/public/session-activities?sessionId=<id>&sessionHash=<hash>`)
+// when the activity reader was ported into the platform's app-router
+// REST surface. The new endpoint requires either worker-JWT auth or a
+// valid sessionHash; CLI viewers (which do not carry a worker JWT)
+// take the sessionHash path. The hash is the first 32 hex chars of
+// SHA-256("session:" + sessionID) — see
+// platform/src/lib/worker-protocol/session-hash.ts. Older servers that
+// still expose the legacy path-segment route will respond with a 404
+// to the query-param URL — clients targeting those need to pin a
+// version of this package that pre-dates this commit.
 func (c *Client) GetActivities(sessionID string, afterCursor *string) (*ActivityListResponse, error) {
 	q := url.Values{}
 	q.Set("sessionId", sessionID)
+	q.Set("sessionHash", hashSessionID(sessionID))
 	if afterCursor != nil {
 		q.Set("after", *afterCursor)
 	}
@@ -197,6 +205,16 @@ func (c *Client) GetActivities(sessionID string, afterCursor *string) (*Activity
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// hashSessionID computes the public session hash that
+// /api/public/session-activities accepts in lieu of worker auth.
+// Mirrors the platform's hashSessionId implementation in
+// src/lib/worker-protocol/session-hash.ts: first 32 hex chars of
+// SHA-256("session:" + sessionID).
+func hashSessionID(sessionID string) string {
+	sum := sha256.Sum256([]byte("session:" + sessionID))
+	return hex.EncodeToString(sum[:])[:32]
 }
 
 func (c *Client) post(path string, body any, target any) error {
