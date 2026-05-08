@@ -107,11 +107,12 @@ func newProviderCmdWithFactory(factory providerClientFactory) *cobra.Command {
 Providers are queried from the daemon's HTTP control API at
 http://127.0.0.1:7734 by default. Set ` + providerEnvDaemonURL + ` to override.
 
-The local daemon currently surfaces only the AgentRuntime family
-(claude/codex/ollama/opencode/gemini/amp/stub). The seven other
-Provider Families return as empty until per-family registries land
-in a future wave; the response carries a partialCoverage flag so
-this is honest rather than silent.`,
+Provider families currently enumerated by the daemon:
+  AgentRuntime (claude/codex/ollama/opencode/gemini/amp/stub).
+
+Families whose registry is not yet wired locally list as empty.
+Clients distinguishing "no providers" from "registry absent" can
+inspect the partialCoverage flag on the JSON response.`,
 		SilenceUsage: true,
 	}
 	cmd.AddCommand(newProviderListCmd(factory))
