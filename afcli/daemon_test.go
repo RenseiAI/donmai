@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -166,6 +168,19 @@ func TestDaemonInstallHelp(t *testing.T) {
 // dispatches to the Go installer in-process — writing a unit/plist that
 // registers `<host-binary> daemon run` (the locked REN-1406 decision) and
 // emitting the REN-1408 follow-up note in the success message.
+//
+// IMPORTANT: this test passes --skip-service-manager so it never invokes
+// launchctl/systemctl. Without that flag, the underlying installer
+// bootstraps the unit into the developer's user-level launchd domain
+// (gui/<uid>) using a plist path inside t.TempDir(). The temp dir is
+// deleted when the test ends, but the registration in launchd's domain
+// survives — leaving launchd trying to spawn a deleted binary every
+// 30 seconds (KeepAlive=true), which on a developer machine clobbers
+// any real `dev.rensei.daemon` registration and produces a silent
+// re-spawn loop that's only visible via `launchctl print` /
+// `~/Library/Logs/rensei/daemon.log`. The launchctl-bootstrap path
+// itself is exercised in installer/launchd/launchd_test.go with a
+// stubbed runner.
 func TestDaemonInstallInProcessRegistersDaemonRun(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
@@ -179,26 +194,16 @@ func TestDaemonInstallInProcessRegistersDaemonRun(t *testing.T) {
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	// On Linux, --user is the default (no systemctl runs because the
-	// installer would shell out, but we cannot replace it from here);
-	// on darwin, launchctl bootstrap also runs. Skip if running on a
-	// platform where the underlying service manager would be invoked
-	// for real — instead, run the unit-level installer tests above
-	// which use the runner injection.
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("unsupported OS for in-process installer test")
 	}
-	// Use --bin-path so the unit/plist content is deterministic.
-	args := []string{"--bin-path", hostBin}
-	cmd.SetArgs(args)
+	// --skip-service-manager makes the install hermetic: writes the
+	// unit/plist into HOME/$LaunchAgents only, never calls launchctl
+	// bootstrap or systemctl enable. See doc above for why.
+	cmd.SetArgs([]string{"--bin-path", hostBin, "--skip-service-manager"})
 
-	// Best-effort: if the underlying service manager (launchctl/systemctl)
-	// is unavailable in the test environment, the install will write the
-	// unit/plist file and then fail when trying to bootstrap/enable. Skip
-	// in that case — we already cover the file-content assertion in the
-	// installer/{launchd,systemd} unit tests with SkipServiceManager.
 	if err := cmd.Execute(); err != nil {
-		t.Skipf("service manager not available in test env: %v", err)
+		t.Fatalf("install (skip-service-manager): %v", err)
 	}
 
 	out := buf.String()
@@ -211,6 +216,88 @@ func TestDaemonInstallInProcessRegistersDaemonRun(t *testing.T) {
 	if strings.Contains(out, "rensei-daemon install") || strings.Contains(out, "brew install rensei") {
 		t.Errorf("install output should NOT reference the legacy rensei-daemon shell-out, got:\n%s", out)
 	}
+
+	// Defense-in-depth: if a future change to the install path makes
+	// --skip-service-manager a no-op or otherwise lets launchctl run,
+	// boot the registration out of the user's launchd domain so the
+	// developer's machine doesn't enter a respawn loop pointing at a
+	// soon-to-be-deleted t.TempDir() plist. Best-effort — if there's
+	// nothing registered, bootout exits non-zero and we ignore it.
+	t.Cleanup(func() { _ = launchctlBootoutTestUnit() })
+}
+
+// launchctlBootoutTestUnit removes a dev.rensei.daemon registration
+// from the developer's user-level launchd domain ONLY when the
+// registered plist path lives inside a temp directory — i.e. when the
+// registration was created by a test whose t.TempDir() is about to be
+// deleted. If the registered path is the developer's real plist
+// (~/Library/LaunchAgents/dev.rensei.daemon.plist or similar), this is
+// a no-op. That asymmetry is deliberate: we want defensive cleanup of
+// test pollution but never destructive cleanup of a legitimate
+// developer install.
+//
+// The path-inspection step uses `launchctl print` and parses the
+// `path = ...` line from its output. If parsing fails (e.g. launchd
+// changes the print format), we err on the side of NOT booting out.
+func launchctlBootoutTestUnit() error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	uid := strconv.Itoa(os.Geteuid())
+	target := "gui/" + uid + "/dev.rensei.daemon"
+
+	out, err := exec.Command("launchctl", "print", target).CombinedOutput()
+	if err != nil {
+		// Most likely "service not found" — nothing to clean up.
+		return nil
+	}
+	plistPath := parseLaunchctlPath(string(out))
+	if plistPath == "" {
+		// Couldn't parse the plist path — refuse to bootout to avoid
+		// clobbering a real registration we can't identify.
+		return nil
+	}
+	if !looksLikeTestTempPath(plistPath) {
+		// Registered path is the developer's real plist. Leave it alone.
+		return nil
+	}
+	_ = exec.Command("launchctl", "bootout", target).Run()
+	return nil
+}
+
+// parseLaunchctlPath extracts the value of the `path = ...` line from
+// `launchctl print` output. Returns "" when the line is absent or
+// malformed so the caller can treat parse failure as "do not act".
+func parseLaunchctlPath(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "path = ") {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, "path = "))
+		}
+	}
+	return ""
+}
+
+// looksLikeTestTempPath returns true when the given plist path is
+// inside a directory tree commonly used for test temp dirs:
+// macOS's `/private/var/folders/.../T/...` and `/var/folders/.../T/...`,
+// `$TMPDIR`, and `/tmp`. Anything else (notably
+// `~/Library/LaunchAgents/...`) returns false so cleanup leaves real
+// developer installs intact.
+func looksLikeTestTempPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	if strings.HasPrefix(p, "/private/var/folders/") || strings.HasPrefix(p, "/var/folders/") {
+		return true
+	}
+	if strings.HasPrefix(p, "/tmp/") {
+		return true
+	}
+	if tmp := os.Getenv("TMPDIR"); tmp != "" && strings.HasPrefix(p, tmp) {
+		return true
+	}
+	return false
 }
 
 // TestDaemonInstallWipesCachedJWT verifies the install command removes
@@ -291,6 +378,15 @@ func TestDaemonUninstallWipesCachedJWT(t *testing.T) {
 // fail with the old `rensei-daemon: command not found` error when the
 // legacy binary is absent — the new in-process implementation never looks
 // it up on PATH.
+//
+// Uses --skip-service-manager for the same reason as
+// TestDaemonInstallInProcessRegistersDaemonRun (see that test's
+// IMPORTANT note): without it, a developer-machine run of this test
+// bootstraps a unit pointing at a t.TempDir() plist that gets deleted
+// when the test ends, leaving launchd with a 30-second respawn loop
+// against a missing file. Defensive launchctl bootout in t.Cleanup
+// guards against future install-path changes that demote
+// --skip-service-manager.
 func TestDaemonInstallNoLegacyShellOut(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
@@ -300,18 +396,14 @@ func TestDaemonInstallNoLegacyShellOut(t *testing.T) {
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	// Use --user with SkipSystemctl-style behaviour by running on a fake
-	// host binary; if the service manager isn't available we'll skip the
-	// success assertion but the error must NOT mention `rensei-daemon`.
-	cmd.SetArgs(nil)
+	cmd.SetArgs([]string{"--skip-service-manager"})
 	err := cmd.Execute()
 	if err != nil {
 		if strings.Contains(err.Error(), "rensei-daemon") || strings.Contains(err.Error(), "brew install rensei") {
 			t.Errorf("error must NOT reference legacy rensei-daemon binary; got: %v", err)
 		}
-		// Real service-manager failure is expected in CI; that's fine.
-		return
 	}
+	t.Cleanup(func() { _ = launchctlBootoutTestUnit() })
 }
 
 // TestDaemonUninstallHelp verifies the uninstall command exposes the
@@ -338,6 +430,16 @@ func TestDaemonUninstallHelp(t *testing.T) {
 // TestDaemonUninstallNoServiceInstalled verifies the uninstall command
 // returns gracefully (no error) when no unit/plist is currently installed,
 // rather than the legacy "rensei-daemon: command not found" failure.
+//
+// IMPORTANT: passes --skip-service-manager. Without it, this test calls
+// `launchctl bootout gui/<uid>/dev.rensei.daemon` against the developer's
+// real launchd domain — which boots out any properly-installed daemon
+// and leaves the plist on disk but unregistered. HOME being a temp dir
+// does NOT sandbox the launchctl call (the bootout is against the
+// running launchd domain, not a HOME-relative path). Defensive
+// bootout-on-cleanup guards against future regressions. The
+// "real launchctl bootout returns service-not-found" code path is
+// covered in installer/launchd/launchd_test.go with stubbed runners.
 func TestDaemonUninstallNoServiceInstalled(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
@@ -347,7 +449,7 @@ func TestDaemonUninstallNoServiceInstalled(t *testing.T) {
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	cmd.SetArgs(nil)
+	cmd.SetArgs([]string{"--skip-service-manager"})
 	if err := cmd.Execute(); err != nil {
 		// Only "service manager not available" is acceptable — never the
 		// legacy shell-out error.
@@ -355,6 +457,7 @@ func TestDaemonUninstallNoServiceInstalled(t *testing.T) {
 			t.Errorf("error must NOT reference legacy rensei-daemon binary; got: %v", err)
 		}
 	}
+	t.Cleanup(func() { _ = launchctlBootoutTestUnit() })
 }
 
 // ── parent help ───────────────────────────────────────────────────────────────
