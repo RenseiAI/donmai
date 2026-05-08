@@ -17,6 +17,17 @@ func newTestServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *C
 	return srv, NewClient(srv.URL)
 }
 
+// newTestServerWithToken returns a Client preloaded with an APIToken,
+// so tests can exercise the authenticated branches that gate request
+// shape on the token's presence (e.g. GetActivities omitting
+// sessionHash for authenticated callers).
+func newTestServerWithToken(t *testing.T, token string, handler http.HandlerFunc) (*httptest.Server, *Client) {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv, NewAuthenticatedClient(srv.URL, token)
+}
+
 func TestClientStopSessionSuccess(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -169,18 +180,45 @@ func TestClientGetEndpoints(t *testing.T) {
 	}
 }
 
+// TestClientGetActivitiesAuthenticatedOmitsHash pins the contract for
+// authenticated CLI callers: when the client carries an APIToken
+// (rsk_ key) the request must NOT include sessionHash. The platform's
+// public-hash branch is tautological (anyone can hash any string) and
+// short-circuits before the authenticated branch's reverse-lookup
+// runs; sending sessionHash anyway makes hashed-id sessionIds 404
+// instead of resolving correctly. Authenticated callers belong on the
+// rsk_/cookie auth path, which accepts both raw and hashed forms.
+func TestClientGetActivitiesAuthenticatedOmitsHash(t *testing.T) {
+	var seenQuery string
+	_, c := newTestServerWithToken(t, "rsk_live_test", func(w http.ResponseWriter, r *http.Request) {
+		seenQuery = r.URL.RawQuery
+		_ = json.NewEncoder(w).Encode(ActivityListResponse{SessionStatus: StatusWorking})
+	})
+	if _, err := c.GetActivities("sess-9", nil); err != nil {
+		t.Fatalf("GetActivities: %v", err)
+	}
+	if !strings.Contains(seenQuery, "sessionId=sess-9") {
+		t.Errorf("missing sessionId=sess-9; got %q", seenQuery)
+	}
+	if strings.Contains(seenQuery, "sessionHash=") {
+		t.Errorf("authenticated client must NOT include sessionHash; got %q", seenQuery)
+	}
+}
+
 // TestClientGetActivitiesURLContract pins the wire contract for
-// GetActivities: query-param shape against /api/public/session-activities,
-// with sessionId + sessionHash + (optional) after parameters. The
-// sessionHash is mandatory for unauthenticated CLI callers — without it
+// unauthenticated GetActivities callers (no APIToken — typically a
+// TUI viewer with the raw linearSessionId from a shared link):
+// query-param shape against /api/public/session-activities, with
+// sessionId + sessionHash + (optional) after parameters. The
+// sessionHash is mandatory for unauthenticated callers — without it
 // the platform requires worker-JWT auth and rejects with 401. Pre-port
 // servers responded to a legacy path-segment URL
 // (/api/public/sessions/<id>/activities); current platform servers
 // serve the query-param URL exclusively. Without this guard a future
 // regression to the legacy form silently 404s every CLI `session show` /
 // `session stream` invocation against the production surface, and a
-// regression that drops the sessionHash silently 401s every one of
-// them.
+// regression that drops the sessionHash silently 401s every
+// unauthenticated one of them.
 func TestClientGetActivitiesURLContract(t *testing.T) {
 	var seenPath, seenQuery string
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {

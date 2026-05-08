@@ -182,20 +182,28 @@ func (c *Client) GetSessionDetail(id string) (*SessionDetailResponse, error) {
 //
 // The endpoint changed from a path-segment shape
 // (`/api/public/sessions/<id>/activities`) to a query-parameter shape
-// (`/api/public/session-activities?sessionId=<id>&sessionHash=<hash>`)
+// (`/api/public/session-activities?sessionId=<id>[&sessionHash=<hash>]`)
 // when the activity reader was ported into the platform's app-router
-// REST surface. The new endpoint requires either worker-JWT auth or a
-// valid sessionHash; CLI viewers (which do not carry a worker JWT)
-// take the sessionHash path. The hash is the first 32 hex chars of
-// SHA-256("session:" + sessionID) — see
-// platform/src/lib/worker-protocol/session-hash.ts. Older servers that
-// still expose the legacy path-segment route will respond with a 404
-// to the query-param URL — clients targeting those need to pin a
-// version of this package that pre-dates this commit.
+// REST surface. Older servers that still expose the legacy path-
+// segment route will respond with a 404 to the query-param URL —
+// clients targeting those need to pin a version of this package that
+// pre-dates this commit.
+//
+// Auth model: when the client carries an APIToken (rsk_ key) it sends
+// the token in the Authorization header and omits sessionHash, so the
+// server takes its rsk_/cookie auth branch. That branch accepts both
+// the raw linearSessionId and the hashed id form returned by
+// /api/public/sessions list/detail, doing a reverse-lookup if needed.
+// When the client is unauthenticated (no APIToken — typically a TUI
+// viewer with the raw linearSessionId from a shared link) it sends
+// sessionHash so the server's public-hash branch admits it; that
+// branch only accepts the raw linearSessionId.
 func (c *Client) GetActivities(sessionID string, afterCursor *string) (*ActivityListResponse, error) {
 	q := url.Values{}
 	q.Set("sessionId", sessionID)
-	q.Set("sessionHash", hashSessionID(sessionID))
+	if c.APIToken == "" {
+		q.Set("sessionHash", hashSessionID(sessionID))
+	}
 	if afterCursor != nil {
 		q.Set("after", *afterCursor)
 	}
