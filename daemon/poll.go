@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -297,6 +298,77 @@ func callPollEndpoint(ctx context.Context, client *http.Client, orchestratorURL,
 	return &resp, nil
 }
 
+// callNackEndpoint POSTs to /api/sessions/<id>/nack so the orchestrator
+// releases the claim and re-queues the work item when the daemon decides
+// locally that it cannot execute a session it just claimed (allowlist
+// mismatch, spawn failure, drain in flight, …). Without this NACK, a
+// rejected session sits in `claimed` state until the orchestrator's
+// stale-claim sweep eventually reclaims it — minutes of latency, and
+// the session looks healthy to operators in the meantime.
+//
+// The body shape mirrors the orchestrator's NackRequestBody:
+//
+//	{ "workerId": "wkr_…", "reason": "<short>", "work": <queued work> }
+//
+// `work` must carry the five fields the orchestrator validates as
+// `QueuedWork` (sessionId, issueId, issueIdentifier, priority,
+// queuedAt). PollWorkItem already JSON-marshals to a superset of that
+// shape, so we can pass it through verbatim.
+//
+// NACK errors are best-effort: returning an error here lets the caller
+// log it, but the local rejection has already happened so a NACK
+// failure is not fatal.
+func callNackEndpoint(
+	ctx context.Context,
+	client *http.Client,
+	orchestratorURL, sessionID, workerID, runtimeJWT, reason string,
+	work *PollWorkItem,
+) error {
+	if sessionID == "" {
+		return errors.New("nack: session id required")
+	}
+	if workerID == "" {
+		return errors.New("nack: worker id required")
+	}
+	if work == nil {
+		return errors.New("nack: original work item required")
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	body := struct {
+		WorkerID string        `json:"workerId"`
+		Reason   string        `json:"reason,omitempty"`
+		Work     *PollWorkItem `json:"work"`
+	}{
+		WorkerID: workerID,
+		Reason:   reason,
+		Work:     work,
+	}
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal nack body: %w", err)
+	}
+	url := strings.TrimRight(orchestratorURL, "/") + "/api/sessions/" + sessionID + "/nack"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
+	if err != nil {
+		return fmt.Errorf("build nack request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+runtimeJWT)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "rensei-daemon/"+Version)
+	res, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("nack: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode >= 400 {
+		errBuf, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
+		return fmt.Errorf("nack rejected: HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(errBuf)))
+	}
+	return nil
+}
+
 // isPollAuthFailure returns true for HTTP statuses that indicate the runtime
 // token must be refreshed via re-register: 401 (Unauthorized) and 404 (Worker
 // not found — fell out of Redis after TTL).
@@ -378,21 +450,7 @@ func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*Proje
 // AcceptWork time, but the explicit log makes the resolution failure
 // observable immediately at poll dispatch.
 func pollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
-	repo := item.Repository
-	if repo == "" {
-		repo = item.ProjectName
-	}
-	if proj, ok := resolveProjectFromAllowlist(repo, projects); ok {
-		repo = proj.Repository
-	} else if repo != "" {
-		slog.Warn(
-			"daemon poll: no allowlist match for projectName, falling back to as-given repo string (worker will fail clone unless this is a real URL)",
-			"sessionId", item.SessionID,
-			"projectName", item.ProjectName,
-			"repository", item.Repository,
-			"fallback", repo,
-		)
-	}
+	repo, _ := resolveAllowlistedRepo(item, projects)
 	return SessionSpec{
 		SessionID:          item.SessionID,
 		Repository:         repo,
@@ -401,6 +459,47 @@ func pollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		Env:                item.Env,
 		MaxDurationSeconds: item.MaxDuration,
 	}
+}
+
+// resolveAllowlistedRepo returns the canonical clone URL for a poll
+// work item by consulting the daemon's project allowlist, plus the
+// matched ProjectConfig pointer (nil on miss) so callers can read
+// the canonical id. Silent — callers decide whether and where to
+// warn so the same poll item being resolved by both
+// pollItemToSessionSpec and pollItemToSessionDetail doesn't emit
+// the same warn twice.
+//
+// Lookup order (most-specific first):
+//  1. item.Repository — when the orchestrator dispatch sent the
+//     canonical URL (post-2026-05-08 enrichment). This is the strong
+//     signal: a URL match means the daemon is configured to clone
+//     this repo.
+//  2. item.ProjectName — falls back to the slug for orchestrators
+//     that haven't shipped repository enrichment yet, or for entries
+//     whose allowlist key is the slug not the URL.
+//
+// On no-match, returns whatever identifier the item carried so the
+// runner has something to attempt; the caller surfaces the broken
+// state. The pre-2026-05-08 implementation warned whenever the
+// projectName-keyed lookup missed even when the URL lookup was
+// about to succeed, which produced a daily flood of false-alarm
+// warnings on healthy operator setups.
+func resolveAllowlistedRepo(item PollWorkItem, projects []ProjectConfig) (repo string, matched *ProjectConfig) {
+	if item.Repository != "" {
+		if proj, ok := resolveProjectFromAllowlist(item.Repository, projects); ok {
+			return proj.Repository, proj
+		}
+	}
+	if item.ProjectName != "" {
+		if proj, ok := resolveProjectFromAllowlist(item.ProjectName, projects); ok {
+			return proj.Repository, proj
+		}
+	}
+	repo = item.Repository
+	if repo == "" {
+		repo = item.ProjectName
+	}
+	return repo, nil
 }
 
 // pollItemToSessionDetail constructs the SessionDetail payload `af agent
@@ -422,19 +521,20 @@ func pollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 // allowlist `id` when a match is found, so downstream code that uses
 // the project id (env vars, dashboards) sees a stable value.
 func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string) *SessionDetail {
-	repo := item.Repository
-	if repo == "" {
-		repo = item.ProjectName
-	}
+	repo, matched := resolveAllowlistedRepo(item, projects)
 	projectName := item.ProjectName
-	if proj, ok := resolveProjectFromAllowlist(firstNonEmptyStr(item.ProjectName, item.Repository), projects); ok {
-		repo = proj.Repository
-		if proj.ID != "" {
-			projectName = proj.ID
-		}
-	} else if repo != "" {
+	if matched != nil && matched.ID != "" {
+		projectName = matched.ID
+	}
+	// Warn surfaces here (the SessionDetail builder runs once per work
+	// item, immediately after pollItemToSessionSpec) rather than inside
+	// resolveAllowlistedRepo so the same poll item doesn't produce two
+	// identical warns. Fires only when NEITHER repo nor projectName
+	// match the allowlist — a genuine config error the runner won't
+	// recover from.
+	if matched == nil && repo != "" {
 		slog.Warn(
-			"daemon poll: no allowlist match for projectName, falling back to as-given repo string (worker will fail clone unless this is a real URL)",
+			"daemon poll: no allowlist match for repository or projectName; clone will fail unless the platform-supplied string is a real URL",
 			"sessionId", item.SessionID,
 			"projectName", item.ProjectName,
 			"repository", item.Repository,

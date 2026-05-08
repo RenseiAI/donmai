@@ -423,6 +423,43 @@ func (d *Daemon) Start(ctx context.Context) error {
 						d.WorkerID(),
 					)
 					if _, err := d.AcceptWorkWithDetail(spec, detail); err != nil {
+						// Local accept-work failure means the orchestrator's
+						// claim of this session is stale on first contact —
+						// the session is in `claimed` state with this worker,
+						// but no `af agent run` subprocess will ever execute
+						// for it. NACK so the orchestrator releases the
+						// claim and re-queues immediately, instead of waiting
+						// for the stale-claim sweep (15min default) to
+						// reclaim. NACK is best-effort: failure to deliver it
+						// only adds latency; the original AcceptWork error
+						// is what the caller logs.
+						item := item
+						nackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+						nackErr := callNackEndpoint(
+							nackCtx,
+							nil, // default 10s-timeout client
+							cfg.Orchestrator.URL,
+							item.SessionID,
+							d.WorkerID(),
+							d.runtimeJWT(),
+							fmt.Sprintf("accept work failed: %v", err),
+							&item,
+						)
+						if nackErr != nil {
+							slog.Warn(
+								"daemon poll: nack failed; orchestrator will reclaim via stale-claim sweep",
+								"sessionId", item.SessionID,
+								"acceptErr", err.Error(),
+								"nackErr", nackErr.Error(),
+							)
+						} else {
+							slog.Info(
+								"daemon poll: nacked rejected session",
+								"sessionId", item.SessionID,
+								"reason", err.Error(),
+							)
+						}
 						return fmt.Errorf("accept work %s: %w", item.SessionID, err)
 					}
 					return nil

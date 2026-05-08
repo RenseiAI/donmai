@@ -511,3 +511,191 @@ func TestResolveProjectFromAllowlist(t *testing.T) {
 		})
 	}
 }
+
+// TestPollItemToSessionDetail_URLMatchSilencesProjectNameMiss covers
+// the case the orchestrator's enriched dispatch produces in
+// production: item.Repository carries the canonical clone URL (which
+// matches an allowlist entry), but item.ProjectName carries the
+// human-display name ("Yuisei") rather than the slug ("yuisei").
+// The pre-fix implementation warned because it tried projectName
+// first, missed (case mismatch), and emitted "no allowlist match"
+// even though the URL match was about to succeed. Resolution-by-URL
+// must silence the warn.
+func TestPollItemToSessionDetail_URLMatchSilencesProjectNameMiss(t *testing.T) {
+	buf, restore := withCapturedSlog(t)
+	defer restore()
+
+	projects := []ProjectConfig{{
+		ID:         "yuisei",
+		Repository: "https://github.com/supaku/supaku.git",
+	}}
+	item := PollWorkItem{
+		SessionID:   "sess-display-name",
+		ProjectName: "Yuisei", // display name — does NOT match slug "yuisei"
+		Repository:  "https://github.com/supaku/supaku.git",
+	}
+
+	detail := pollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
+
+	if detail.Repository != "https://github.com/supaku/supaku.git" {
+		t.Errorf("Repository = %q, want canonical URL", detail.Repository)
+	}
+	// projectName resolves to the canonical id from the allowlist.
+	if detail.ProjectName != "yuisei" {
+		t.Errorf("ProjectName = %q, want canonical id 'yuisei'", detail.ProjectName)
+	}
+	if logs := buf.String(); strings.Contains(logs, "no allowlist match") {
+		t.Errorf("URL-match path must NOT emit 'no allowlist match' warn; got logs:\n%s", logs)
+	}
+}
+
+// TestPollItemToSessionSpec_DoesNotWarn confirms that the spec
+// builder runs silently — the warn surfaces from the SessionDetail
+// builder so the same poll item can't produce two identical warns
+// per dispatch.
+func TestPollItemToSessionSpec_DoesNotWarn(t *testing.T) {
+	buf, restore := withCapturedSlog(t)
+	defer restore()
+
+	projects := []ProjectConfig{{ID: "alpha", Repository: "https://github.com/x/alpha"}}
+	item := PollWorkItem{SessionID: "s", ProjectName: "unmatched"} // misses
+
+	_ = pollItemToSessionSpec(item, projects)
+
+	if logs := buf.String(); strings.Contains(logs, "no allowlist match") {
+		t.Errorf("pollItemToSessionSpec must not warn (warn fires from pollItemToSessionDetail); got:\n%s", logs)
+	}
+}
+
+// TestCallNackEndpoint_PostsExpectedShape pins the daemon's NACK
+// wire contract against the orchestrator's nack route validation:
+// POST /api/sessions/<id>/nack with `{ workerId, reason, work }`
+// where work carries sessionId/issueId/issueIdentifier/priority/
+// queuedAt. Catches a future regression that drops the NACK or
+// reshapes the body.
+func TestCallNackEndpoint_PostsExpectedShape(t *testing.T) {
+	var (
+		seenURL    string
+		seenAuth   string
+		seenMethod string
+		seenBody   map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenURL = r.URL.Path
+		seenAuth = r.Header.Get("Authorization")
+		seenMethod = r.Method
+		_ = json.NewDecoder(r.Body).Decode(&seenBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"nacked":true,"sessionId":"s1","requeued":true}`))
+	}))
+	defer srv.Close()
+
+	item := &PollWorkItem{
+		SessionID:       "s1",
+		IssueID:         "iss-1",
+		IssueIdentifier: "SUP-1",
+		Priority:        3,
+		QueuedAt:        1700000000000,
+	}
+	err := callNackEndpoint(
+		context.Background(),
+		nil, // default client
+		srv.URL,
+		"s1",
+		"wkr-1",
+		"jwt-token",
+		"accept work failed: allowlist mismatch",
+		item,
+	)
+	if err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+	if seenMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", seenMethod)
+	}
+	if seenURL != "/api/sessions/s1/nack" {
+		t.Errorf("URL path = %q, want /api/sessions/s1/nack", seenURL)
+	}
+	if seenAuth != "Bearer jwt-token" {
+		t.Errorf("Authorization = %q, want Bearer jwt-token", seenAuth)
+	}
+	// Validate body shape against the orchestrator's NackRequestBody contract.
+	if seenBody["workerId"] != "wkr-1" {
+		t.Errorf("workerId = %v, want wkr-1", seenBody["workerId"])
+	}
+	if seenBody["reason"] == "" {
+		t.Errorf("reason missing from body")
+	}
+	work, ok := seenBody["work"].(map[string]any)
+	if !ok {
+		t.Fatalf("work field missing or wrong type: %v", seenBody["work"])
+	}
+	for _, want := range []string{"sessionId", "issueId", "issueIdentifier", "priority", "queuedAt"} {
+		if _, ok := work[want]; !ok {
+			t.Errorf("work missing required field %q (orchestrator validation will reject)", want)
+		}
+	}
+	if work["sessionId"] != "s1" {
+		t.Errorf("work.sessionId = %v, want s1", work["sessionId"])
+	}
+}
+
+// TestCallNackEndpoint_PropagatesServerError confirms a non-2xx
+// response surfaces as an error so the daemon can log the NACK
+// failure (without aborting the local rejection that already
+// happened).
+func TestCallNackEndpoint_PropagatesServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"workerId mismatch"}`))
+	}))
+	defer srv.Close()
+
+	err := callNackEndpoint(
+		context.Background(),
+		nil,
+		srv.URL,
+		"s1",
+		"wkr-1",
+		"jwt",
+		"reason",
+		&PollWorkItem{SessionID: "s1", IssueID: "i", IssueIdentifier: "SUP-1", Priority: 1, QueuedAt: 1},
+	)
+	if err == nil {
+		t.Fatalf("expected error on HTTP 400")
+	}
+	if !strings.Contains(err.Error(), "HTTP 400") {
+		t.Errorf("error should mention HTTP 400; got: %v", err)
+	}
+}
+
+// TestCallNackEndpoint_RejectsMissingArgs guards against caller
+// mistakes that would silently no-op (and leave a session in stale
+// claimed state) instead of surfacing the bug.
+func TestCallNackEndpoint_RejectsMissingArgs(t *testing.T) {
+	cases := []struct {
+		name       string
+		sessionID  string
+		workerID   string
+		work       *PollWorkItem
+		wantSubstr string
+	}{
+		{name: "missing-session", sessionID: "", workerID: "w", work: &PollWorkItem{}, wantSubstr: "session id"},
+		{name: "missing-worker", sessionID: "s", workerID: "", work: &PollWorkItem{}, wantSubstr: "worker id"},
+		{name: "missing-work", sessionID: "s", workerID: "w", work: nil, wantSubstr: "work item"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := callNackEndpoint(
+				context.Background(),
+				nil, "http://x", tc.sessionID, tc.workerID, "j", "r", tc.work,
+			)
+			if err == nil {
+				t.Fatalf("expected error")
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("error %q should mention %q", err.Error(), tc.wantSubstr)
+			}
+		})
+	}
+}
