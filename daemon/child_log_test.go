@@ -92,19 +92,34 @@ func TestSpawner_DefaultsChildOutputToSlog(t *testing.T) {
 		t.Fatalf("session did not exit in time")
 	}
 
-	// Drain a beat for the pumpLines goroutines to finish writing
-	// after Wait returned.
-	time.Sleep(50 * time.Millisecond)
-
-	records := decodeAll(t, buf)
+	// cmd.Wait() returning + ActiveCount==0 does NOT mean the
+	// pumpLines goroutines have flushed yet. They scan child
+	// stdout/stderr asynchronously via bufio.Scanner; when the child
+	// closes its pipe end, Scan returns false on the next read and
+	// the goroutine exits — but only AFTER any buffered bytes have
+	// been delivered. Under CI's -race overhead this can lag the
+	// process exit by tens of milliseconds. Previously this
+	// synchronised on a fixed 50ms sleep that proved unreliable on
+	// Linux runners; poll the buffer for both expected records (or
+	// an upper-bound timeout) so the test is timing-independent.
+	pumpDeadline := time.Now().Add(3 * time.Second)
 	var sawStdout, sawStderr bool
-	for _, r := range records {
-		if r.Stream == "stdout" && r.Level == "INFO" && strings.Contains(r.Msg, "hello-stdout") && r.SessionID == "sess-1" {
-			sawStdout = true
+	var records []slogRecord
+	for time.Now().Before(pumpDeadline) {
+		records = decodeAll(t, bytes.NewBuffer(buf.Bytes()))
+		sawStdout, sawStderr = false, false
+		for _, r := range records {
+			if r.Stream == "stdout" && r.Level == "INFO" && strings.Contains(r.Msg, "hello-stdout") && r.SessionID == "sess-1" {
+				sawStdout = true
+			}
+			if r.Stream == "stderr" && r.Level == "WARN" && strings.Contains(r.Msg, "hello-stderr") && r.SessionID == "sess-1" {
+				sawStderr = true
+			}
 		}
-		if r.Stream == "stderr" && r.Level == "WARN" && strings.Contains(r.Msg, "hello-stderr") && r.SessionID == "sess-1" {
-			sawStderr = true
+		if sawStdout && sawStderr {
+			break
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if !sawStdout {
 		t.Errorf("missing INFO stdout record; records=%v", records)
