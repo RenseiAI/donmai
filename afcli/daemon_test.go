@@ -246,7 +246,7 @@ func launchctlBootoutTestUnit() error {
 	uid := strconv.Itoa(os.Geteuid())
 	target := "gui/" + uid + "/dev.rensei.daemon"
 
-	out, err := exec.Command("launchctl", "print", target).CombinedOutput()
+	out, err := exec.Command("launchctl", "print", target).CombinedOutput() //nolint:gosec // G204: target = "gui/<uid>/<hardcoded service>"
 	if err != nil {
 		// Most likely "service not found" — nothing to clean up.
 		return nil
@@ -261,7 +261,7 @@ func launchctlBootoutTestUnit() error {
 		// Registered path is the developer's real plist. Leave it alone.
 		return nil
 	}
-	_ = exec.Command("launchctl", "bootout", target).Run()
+	_ = exec.Command("launchctl", "bootout", target).Run() //nolint:gosec // G204: target = "gui/<uid>/<hardcoded service>"
 	return nil
 }
 
@@ -315,7 +315,7 @@ func TestDaemonInstallWipesCachedJWT(t *testing.T) {
 	// runtime helper consults so the wipe logic finds it the same way
 	// production code will.
 	jwtPath := filepath.Join(tmp, ".rensei", "daemon.jwt")
-	if err := os.MkdirAll(filepath.Dir(jwtPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(jwtPath), 0o750); err != nil {
 		t.Fatalf("mkdir .rensei: %v", err)
 	}
 	if err := os.WriteFile(jwtPath, []byte(`{"workerId":"wkr_dead"}`), 0o600); err != nil {
@@ -353,7 +353,7 @@ func TestDaemonUninstallWipesCachedJWT(t *testing.T) {
 	t.Setenv("HOME", tmp)
 
 	jwtPath := filepath.Join(tmp, ".rensei", "daemon.jwt")
-	if err := os.MkdirAll(filepath.Dir(jwtPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(jwtPath), 0o750); err != nil {
 		t.Fatalf("mkdir .rensei: %v", err)
 	}
 	if err := os.WriteFile(jwtPath, []byte(`{"workerId":"wkr_dead"}`), 0o600); err != nil {

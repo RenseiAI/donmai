@@ -282,7 +282,12 @@ func TestHashSessionID(t *testing.T) {
 		}
 	}
 	// Determinism: same input must always hash to the same output.
-	if hashSessionID("sess-determinism") != hashSessionID("sess-determinism") {
+	// Use intermediates so staticcheck doesn't flag the comparison as
+	// a self-equality (SA4000) — the call sites are intentionally
+	// independent invocations.
+	first := hashSessionID("sess-determinism")
+	second := hashSessionID("sess-determinism")
+	if first != second {
 		t.Errorf("hashSessionID is not deterministic")
 	}
 	// Distinguishability: different inputs hash to different outputs.
