@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/agentfactory-tui/runtime/activity"
 	"github.com/RenseiAI/agentfactory-tui/runtime/heartbeat"
 	"github.com/RenseiAI/agentfactory-tui/runtime/state"
 	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
@@ -249,6 +250,41 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		defer func() { _ = pulser.Stop() }()
 	}
 
+	// 9b. Start the activity poster (mirrors the heartbeat pulser's
+	// per-session lifecycle). Pushes every runner-observed agent.Event
+	// to /api/sessions/<id>/activity asynchronously so the platform
+	// activity buffer + topology view stay populated. Best-effort: a
+	// construction or start error is logged and the loop falls back to
+	// the noop sink so the rest of the run is unaffected.
+	var sink activitySink = noopSink{}
+	var actCredentialProvider activity.CredentialProvider
+	if r.credentialProvider != nil {
+		actCredentialProvider = func(ctx context.Context) (activity.RuntimeCredentials, error) {
+			creds, err := r.credentialProvider(ctx)
+			return activity.RuntimeCredentials{
+				WorkerID:  creds.WorkerID,
+				AuthToken: creds.AuthToken,
+			}, err
+		}
+	}
+	actPoster, actErr := activity.New(activity.Config{
+		SessionID:          qw.SessionID,
+		WorkerID:           qw.WorkerID,
+		BaseURL:            qw.PlatformURL,
+		AuthToken:          qw.AuthToken,
+		CredentialProvider: actCredentialProvider,
+		HTTPClient:         r.httpClient,
+		Logger:             r.logger,
+	})
+	if actErr != nil {
+		r.logger.Warn("activity poster construct failed", "err", actErr)
+	} else if startErr := actPoster.Start(ctx); startErr != nil {
+		r.logger.Warn("activity poster start failed", "err", startErr)
+	} else {
+		sink = actPoster
+		defer func() { _ = actPoster.Stop() }()
+	}
+
 	// 10. Stream events; wait for terminal.
 	// Budget duration cap rides on top of the stream ctx — when it
 	// fires the consumer sees ctx.Err() == context.DeadlineExceeded
@@ -273,7 +309,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}()
 	}
 
-	streamRes, streamErr := r.consumeEvents(streamCtx, handle, wpath, qw, res, enforcer)
+	streamRes, streamErr := r.consumeEvents(streamCtx, handle, wpath, qw, res, enforcer, sink)
 
 	// Disambiguate between ctx-cancelled and lost-ownership before
 	// classifying the failure mode.
@@ -349,7 +385,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 			r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
 		} else {
 			// Re-consume any events the steering inject produced.
-			tailRes, _ := r.consumeEvents(ctx, handle, wpath, qw, res, enforcer)
+			tailRes, _ := r.consumeEvents(ctx, handle, wpath, qw, res, enforcer, sink)
 			tailRes.applyTo(res, provider.Name())
 		}
 	}
@@ -477,7 +513,11 @@ func (r *Runner) consumeEvents(
 	qw QueuedWork,
 	_ *Result,
 	enforcer *BudgetEnforcer,
+	sink activitySink,
 ) (streamObservation, error) {
+	if sink == nil {
+		sink = noopSink{}
+	}
 	obs := streamObservation{}
 
 	// Open the events.jsonl audit file under <worktree>/.agent/.
@@ -516,6 +556,11 @@ func (r *Runner) consumeEvents(
 			}
 			appendJSONL(ev)
 			r.observeEvent(ev, &obs, worktreePath, qw)
+			// Push the event to the platform's activity buffer (best-
+			// effort, non-blocking — the sink drops on overflow / HTTP
+			// failure rather than stalling the runner). Lives next to
+			// observeEvent so steering's tail consume picks it up too.
+			sink.Send(ctx, ev)
 			// Budget enforcement (REN-1485 / REN-1487 acceptance #4):
 			// every event flows through the enforcer; on a cap breach
 			// we surface the *BudgetExceededError so runLoop can

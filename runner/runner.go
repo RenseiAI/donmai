@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/RenseiAI/agentfactory-tui/agent"
 	"github.com/RenseiAI/agentfactory-tui/prompt"
 	"github.com/RenseiAI/agentfactory-tui/result"
 	"github.com/RenseiAI/agentfactory-tui/runtime/env"
@@ -16,6 +17,27 @@ import (
 	"github.com/RenseiAI/agentfactory-tui/runtime/state"
 	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
 )
+
+// activitySink is the per-session seam that pushes runner-observed
+// events to the platform's /api/sessions/<id>/activity buffer. The
+// runner builds one [activitySink] per [Runner.Run] (today via
+// [activitySinkFromConfig], which constructs a
+// [github.com/RenseiAI/agentfactory-tui/runtime/activity.Poster]).
+//
+// Defined as an interface so the runner test suite can substitute a
+// recording fake without spinning up an HTTP server. Send is
+// non-blocking and best-effort; implementations must drop events
+// rather than block the runner on platform I/O.
+type activitySink interface {
+	Send(ctx context.Context, ev agent.Event)
+}
+
+// noopSink is the default sink used when no real poster has been
+// constructed (e.g. unit tests, or a runner running offline). All
+// methods are no-ops.
+type noopSink struct{}
+
+func (noopSink) Send(context.Context, agent.Event) {}
 
 // Default values for [Options]. Exposed for tests and operator
 // debugging; production daemons override via [Options].
