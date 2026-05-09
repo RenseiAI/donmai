@@ -34,6 +34,18 @@ func mustStartDaemon(t *testing.T) (*Daemon, *Server, func()) {
 		HTTPHost:   "127.0.0.1",
 		HTTPPort:   0, // ephemeral; effective addr exposed via Server.Addr
 		SkipWizard: true,
+		// Long-but-finite WorkerCommand so AcceptWork-driven sessions
+		// stay resident for the duration of the test. The default falls
+		// through to a stub that exits immediately (binary lookup fails
+		// in test env), which races the spawner's SessionEventEnded
+		// into sessionDetails.Delete before the test's HTTP read —
+		// surfacing as a flaky 404 on session-detail endpoints. Use a
+		// flat `sleep N` so SIGTERM during cleanup propagates and Drain
+		// returns promptly; sh -c with a busy loop swallows the signal
+		// and burns the full Drain timeout.
+		SpawnerOptions: SpawnerOptions{
+			WorkerCommand: []string{"sleep", "10"},
+		},
 	})
 	if err := d.Start(context.Background()); err != nil {
 		t.Fatalf("daemon Start: %v", err)

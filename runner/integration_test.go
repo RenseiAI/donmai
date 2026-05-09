@@ -355,9 +355,11 @@ func (taskSpammingProvider) Capabilities() agent.Capabilities {
 		EmitsSubagentEvents: true,
 	}
 }
+
 func (p *taskSpammingProvider) Spawn(ctx context.Context, _ agent.Spec) (agent.Handle, error) {
 	return p.spawnHandle(ctx), nil
 }
+
 func (p *taskSpammingProvider) Resume(ctx context.Context, _ string, _ agent.Spec) (agent.Handle, error) {
 	return p.spawnHandle(ctx), nil
 }

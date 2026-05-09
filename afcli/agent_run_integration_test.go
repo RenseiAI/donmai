@@ -23,14 +23,14 @@ import (
 
 // TestF28_DaemonSpawnsAgentRun exercises the wire path. It drives:
 //
-//   1. A fake platform server that stubs /api/workers/register +
-//      /api/workers/<id>/heartbeat + /api/workers/<id>/poll.
-//   2. A real daemon.Daemon with a stub WorkerCommand pointing at
-//      `/bin/sh -c` (so we don't recursively run the test binary).
-//   3. A poll item that triggers AcceptWorkWithDetail, recording a
-//      SessionDetail.
-//   4. A direct HTTP fetch of /api/daemon/sessions/<id> against the
-//      live daemon, asserting the SessionDetail round-trips.
+//  1. A fake platform server that stubs /api/workers/register +
+//     /api/workers/<id>/heartbeat + /api/workers/<id>/poll.
+//  2. A real daemon.Daemon with a stub WorkerCommand pointing at
+//     `/bin/sh -c` (so we don't recursively run the test binary).
+//  3. A poll item that triggers AcceptWorkWithDetail, recording a
+//     SessionDetail.
+//  4. A direct HTTP fetch of /api/daemon/sessions/<id> against the
+//     live daemon, asserting the SessionDetail round-trips.
 //
 // The test does not invoke runner.Run end-to-end — that path needs a
 // real git remote which we don't have in CI; the unit test in
