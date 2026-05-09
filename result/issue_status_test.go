@@ -218,6 +218,79 @@ func TestCreateIssueComment_HappyPath(t *testing.T) {
 	}
 }
 
+// TestUpdateIssueStatus_RefreshCredentialsOn401 confirms the SUP-1823
+// fix for /api/issue-tracker-proxy: when the runtime JWT has expired
+// mid-session and the platform returns 401, the next retry attempt
+// re-invokes the CredentialProvider and posts with the fresh bearer
+// token. The post-session backstop's UpdateIssueStatus call goes
+// through this path, so a 1-hour-plus session must not silently fail
+// the Linear status transition.
+func TestUpdateIssueStatus_RefreshCredentialsOn401(t *testing.T) {
+	var (
+		auths    atomic.Value // []string
+		attempts atomic.Int32
+	)
+	auths.Store([]string{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		auths.Store(append(auths.Load().([]string), r.Header.Get("Authorization")))
+		if n == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"Authentication required (user session or worker token)"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"data":{"id":"issue-1"}}`))
+	}))
+	defer srv.Close()
+
+	var providerCalls atomic.Int32
+	p, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL,
+		AuthToken:   "stale-token",
+		WorkerID:    "w",
+		HTTPClient:  srv.Client(),
+		BaseDelay:   1,
+		CredentialProvider: func(context.Context) (result.RuntimeCredentials, error) {
+			n := providerCalls.Add(1)
+			if n == 1 {
+				return result.RuntimeCredentials{
+					WorkerID:  "w",
+					AuthToken: "stale-token",
+				}, nil
+			}
+			return result.RuntimeCredentials{
+				WorkerID:  "w",
+				AuthToken: "fresh-token",
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPoster: %v", err)
+	}
+	if err := p.UpdateIssueStatus(context.Background(), "id", "Finished"); err != nil {
+		t.Fatalf("UpdateIssueStatus: %v", err)
+	}
+
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d; want 2 (401 then OK)", got)
+	}
+	if got := providerCalls.Load(); got < 2 {
+		t.Errorf("CredentialProvider calls = %d; want >= 2", got)
+	}
+	captured := auths.Load().([]string)
+	if len(captured) != 2 {
+		t.Fatalf("captured auth headers = %d; want 2", len(captured))
+	}
+	if captured[0] != "Bearer stale-token" {
+		t.Errorf("attempt 1 auth = %q; want Bearer stale-token", captured[0])
+	}
+	if captured[1] != "Bearer fresh-token" {
+		t.Errorf("attempt 2 auth = %q; want Bearer fresh-token", captured[1])
+	}
+}
+
 // TestUpdateIssueStatus_AuthHeaderSet asserts the bearer token is sent
 // in the Authorization header — the worker's session bearer is the
 // path the proxy auths against.

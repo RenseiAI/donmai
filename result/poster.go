@@ -256,49 +256,60 @@ func (p *Poster) postCompletion(ctx context.Context, sessionID string, r agent.R
 		// comment is never empty (the handler 400s on missing summary).
 		summary = synthSummary(r)
 	}
-	creds := p.credentials(ctx)
-	body := completionRequest{
-		WorkerID: creds.WorkerID,
-		Summary:  summary,
-	}
 	path := fmt.Sprintf("/api/sessions/%s/completion", sessionID)
-	return p.doRetried(ctx, path, body, creds.AuthToken)
+	return p.doRetried(ctx, path, func(creds RuntimeCredentials) any {
+		return completionRequest{
+			WorkerID: creds.WorkerID,
+			Summary:  summary,
+		}
+	})
 }
 
 func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Result) error {
-	creds := p.credentials(ctx)
-	body := statusRequest{
-		WorkerID:          creds.WorkerID,
-		Status:            r.Status,
-		ProviderSessionID: r.ProviderSessionID,
-		WorktreePath:      r.WorktreePath,
-	}
-	if r.Cost != nil {
-		body.TotalCostUsd = r.Cost.TotalCostUsd
-		body.InputTokens = r.Cost.InputTokens
-		body.OutputTokens = r.Cost.OutputTokens
-	}
-	if r.Error != "" {
-		body.Error = &errorEnvelope{Message: r.Error}
-	}
 	path := fmt.Sprintf("/api/sessions/%s/status", sessionID)
-	return p.doRetried(ctx, path, body, creds.AuthToken)
+	return p.doRetried(ctx, path, func(creds RuntimeCredentials) any {
+		body := statusRequest{
+			WorkerID:          creds.WorkerID,
+			Status:            r.Status,
+			ProviderSessionID: r.ProviderSessionID,
+			WorktreePath:      r.WorktreePath,
+		}
+		if r.Cost != nil {
+			body.TotalCostUsd = r.Cost.TotalCostUsd
+			body.InputTokens = r.Cost.InputTokens
+			body.OutputTokens = r.Cost.OutputTokens
+		}
+		if r.Error != "" {
+			body.Error = &errorEnvelope{Message: r.Error}
+		}
+		return body
+	})
 }
 
-// doRetried executes a POST against path with body, retrying transient
-// failures up to p.maxAttempts. Permanent (4xx) responses short-circuit
-// the loop so we don't waste time pretending a misconfigured request
-// will succeed on the next try.
-func (p *Poster) doRetried(ctx context.Context, path string, body any, authToken string) error {
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("marshal body: %w", err)
-	}
+// doRetried executes a POST against path with a per-attempt body, retrying
+// transient failures up to p.maxAttempts. The buildBody callback is
+// invoked once per attempt with the freshest [RuntimeCredentials] so a
+// runtime-JWT refresh between attempts (e.g. after a 401 from an expired
+// token) propagates into both the Authorization header and the request
+// body's workerId field. Permanent (4xx) responses short-circuit the loop
+// so we don't waste time pretending a misconfigured request will succeed
+// on the next try.
+func (p *Poster) doRetried(ctx context.Context, path string, buildBody func(RuntimeCredentials) any) error {
 	endpoint := p.urlFor(path)
 
 	var lastErr error
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
-		err := p.doOnce(ctx, endpoint, payload, authToken)
+		// Re-resolve credentials before every attempt so a daemon-side
+		// runtime-token refresh between retries propagates here. This is
+		// the fix for SUP-1823: long-running sessions whose initial JWT
+		// expires mid-run would otherwise loop on a cached, dead token.
+		creds := p.credentials(ctx)
+		body := buildBody(creds)
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("marshal body: %w", err)
+		}
+		err = p.doOnce(ctx, endpoint, payload, creds.AuthToken)
 		if err == nil {
 			return nil
 		}
@@ -356,6 +367,13 @@ func (p *Poster) doOnce(ctx context.Context, endpoint string, payload []byte, au
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	bodyText := strings.TrimSpace(string(bodyBytes))
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		// Retryable — the credential provider may have a fresher token
+		// than the one we just sent. The next attempt re-resolves
+		// credentials before the request, so a daemon-side runtime-JWT
+		// refresh mid-session is picked up automatically.
+		return fmt.Errorf("http 401 unauthorized: %s", bodyText)
+	}
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 		return &PermanentError{
 			StatusCode: resp.StatusCode,

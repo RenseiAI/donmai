@@ -123,7 +123,10 @@ func (p *Poster) CreateIssueComment(ctx context.Context, issueID, body string) e
 
 // proxyCall sends one issue-tracker-proxy request with retry/backoff
 // matching Poster.doRetried. Decodes the wire envelope and surfaces
-// success=false as the appropriate error type.
+// success=false as the appropriate error type. Credentials are
+// re-resolved before every attempt so a daemon-side runtime-JWT refresh
+// between retries (e.g. after a 401 from an expired token) propagates
+// here — see SUP-1823.
 func (p *Poster) proxyCall(ctx context.Context, body proxyRequest) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -133,7 +136,8 @@ func (p *Poster) proxyCall(ctx context.Context, body proxyRequest) error {
 
 	var lastErr error
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
-		err := p.proxyOnce(ctx, endpoint, payload)
+		creds := p.credentials(ctx)
+		err := p.proxyOnce(ctx, endpoint, payload, creds.AuthToken)
 		if err == nil {
 			return nil
 		}
@@ -155,17 +159,19 @@ func (p *Poster) proxyCall(ctx context.Context, body proxyRequest) error {
 	return &TransientError{Attempts: p.maxAttempts, Last: lastErr}
 }
 
-// proxyOnce performs a single POST against the proxy endpoint. Returns
-// PermanentError for 4xx or success=false retryable=false; transient
-// error otherwise.
-func (p *Poster) proxyOnce(ctx context.Context, endpoint string, payload []byte) error {
+// proxyOnce performs a single POST against the proxy endpoint with the
+// supplied bearer token. Returns PermanentError for non-401 4xx or
+// success=false retryable=false; transient error otherwise. 401 is
+// treated as retryable so the next iteration of [Poster.proxyCall] can
+// re-resolve credentials and retry with a fresh token.
+func (p *Poster) proxyOnce(ctx context.Context, endpoint string, payload []byte, authToken string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if p.authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+p.authToken)
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -179,6 +185,12 @@ func (p *Poster) proxyOnce(ctx context.Context, endpoint string, payload []byte)
 	// 5xx — transient
 	if resp.StatusCode >= 500 {
 		return fmt.Errorf("http %d: %s", resp.StatusCode, bodyText)
+	}
+
+	// 401 — retryable so the credential provider can supply a fresher
+	// token on the next attempt. Mirrors the result-poster's doOnce.
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("http 401 unauthorized: %s", bodyText)
 	}
 
 	// 4xx — permanent

@@ -294,6 +294,133 @@ func TestPosterPost_UsesCredentialProvider(t *testing.T) {
 	}
 }
 
+// TestPosterPost_RefreshCredentialsOn401 confirms the SUP-1823 fix:
+// when the platform returns 401 (cached runtime JWT expired mid-session),
+// the next retry attempt re-invokes the CredentialProvider and posts
+// with the fresh bearer token. Mirrors
+// runtime/activity.TestUnauthorizedTriggersCredentialRefresh.
+func TestPosterPost_RefreshCredentialsOn401(t *testing.T) {
+	t.Parallel()
+
+	var (
+		completionAuths atomic.Value // []string
+		statusAuths     atomic.Value // []string
+		completionBody  atomic.Value // []string
+		completionN     atomic.Int32
+		statusN         atomic.Int32
+	)
+	completionAuths.Store([]string{})
+	statusAuths.Store([]string{})
+	completionBody.Store([]string{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/completion"):
+			n := completionN.Add(1)
+			completionAuths.Store(append(completionAuths.Load().([]string), auth))
+			completionBody.Store(append(completionBody.Load().([]string), string(body)))
+			if n == 1 {
+				// First attempt — simulate expired JWT.
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"Authentication required (user session or worker token)"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			n := statusN.Add(1)
+			statusAuths.Store(append(statusAuths.Load().([]string), auth))
+			if n == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	var providerCalls atomic.Int32
+	p, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL,
+		AuthToken:   "stale-token",
+		WorkerID:    "wkr_stale",
+		CredentialProvider: func(context.Context) (result.RuntimeCredentials, error) {
+			n := providerCalls.Add(1)
+			// First call returns the same stale token (so the first
+			// attempt 401s); subsequent calls return a refreshed token
+			// — modelling the daemon-side rotation that lands between
+			// the failed attempt and the retry.
+			if n == 1 {
+				return result.RuntimeCredentials{
+					WorkerID:  "wkr_stale",
+					AuthToken: "stale-token",
+				}, nil
+			}
+			return result.RuntimeCredentials{
+				WorkerID:  "wkr_fresh",
+				AuthToken: "fresh-token",
+			}, nil
+		},
+		BaseDelay: 0,
+	})
+	if err != nil {
+		t.Fatalf("NewPoster: %v", err)
+	}
+
+	if err := p.Post(context.Background(), "sess-401", goodResult()); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+
+	// Each endpoint should see exactly 2 attempts: 1st 401, 2nd OK.
+	if got := completionN.Load(); got != 2 {
+		t.Errorf("completion attempts = %d, want 2", got)
+	}
+	if got := statusN.Load(); got != 2 {
+		t.Errorf("status attempts = %d, want 2", got)
+	}
+
+	// Provider must be invoked at least once per attempt (4 total).
+	if got := providerCalls.Load(); got < 4 {
+		t.Errorf("CredentialProvider calls = %d, want >= 4", got)
+	}
+
+	// Verify the second attempt of each endpoint used the fresh token.
+	cAuths := completionAuths.Load().([]string)
+	if len(cAuths) != 2 {
+		t.Fatalf("completion auth captures = %d, want 2", len(cAuths))
+	}
+	if cAuths[0] != "Bearer stale-token" {
+		t.Errorf("completion attempt 1 auth = %q, want Bearer stale-token", cAuths[0])
+	}
+	if cAuths[1] != "Bearer fresh-token" {
+		t.Errorf("completion attempt 2 auth = %q, want Bearer fresh-token", cAuths[1])
+	}
+	sAuths := statusAuths.Load().([]string)
+	if len(sAuths) != 2 {
+		t.Fatalf("status auth captures = %d, want 2", len(sAuths))
+	}
+	if sAuths[1] != "Bearer fresh-token" {
+		t.Errorf("status attempt 2 auth = %q, want Bearer fresh-token", sAuths[1])
+	}
+
+	// The body's workerId must also reflect the refreshed credentials —
+	// proves the per-attempt body builder is being called per retry,
+	// not just the Authorization header.
+	cBodies := completionBody.Load().([]string)
+	if len(cBodies) != 2 {
+		t.Fatalf("completion body captures = %d, want 2", len(cBodies))
+	}
+	if !strings.Contains(cBodies[0], `"workerId":"wkr_stale"`) {
+		t.Errorf("completion attempt 1 body missing stale workerId: %q", cBodies[0])
+	}
+	if !strings.Contains(cBodies[1], `"workerId":"wkr_fresh"`) {
+		t.Errorf("completion attempt 2 body missing fresh workerId: %q", cBodies[1])
+	}
+}
+
 func TestPosterPost_MissingFieldsValidation(t *testing.T) {
 	t.Parallel()
 	p := newPoster(t, "http://example.invalid", 0)
