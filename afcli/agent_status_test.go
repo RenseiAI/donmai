@@ -223,3 +223,54 @@ func TestLatestActivity(t *testing.T) {
 		})
 	}
 }
+
+// TestAgentStatusBareCommandHintsAtAgentList pins the friendly error
+// emitted when an operator runs `agent status` with no arguments. The
+// default cobra.ExactArgs(1) message ("accepts 1 arg(s), received 0")
+// is opaque to anyone who doesn't already know about `agent list`; the
+// custom Args validator must point them at the discovery command and
+// show the expected shape.
+func TestAgentStatusBareCommandHintsAtAgentList(t *testing.T) {
+	t.Parallel()
+
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, _ := newTestAgentCmd(ds, []string{"status"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error from `agent status` with no args, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"agent status needs a session id",
+		"agent list",
+		"agent status <session-id>",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected error to contain %q; got: %q", want, msg)
+		}
+	}
+	// Belt-and-suspenders: the bare cobra default must not be the only
+	// message the operator sees.
+	if strings.TrimSpace(msg) == "accepts 1 arg(s), received 0" {
+		t.Errorf("regressed to bare cobra ExactArgs error: %q", msg)
+	}
+}
+
+// TestAgentStatusTooManyArgsKeepsExactArgsParity confirms the >1-arg
+// path still produces cobra's standard error so callers piping into
+// scripts that string-match on it are not broken.
+func TestAgentStatusTooManyArgsKeepsExactArgsParity(t *testing.T) {
+	t.Parallel()
+
+	mock := afclient.NewMockClient()
+	ds := func() afclient.DataSource { return mock }
+	cmd, _ := newTestAgentCmd(ds, []string{"status", "sess-a", "sess-b"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error from `agent status` with two args, got nil")
+	}
+	if !strings.Contains(err.Error(), "accepts 1 arg") {
+		t.Errorf("expected cobra ExactArgs(1) too-many error; got: %v", err)
+	}
+}

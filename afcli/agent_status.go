@@ -31,10 +31,26 @@ func newAgentStatusCmd(ds func() afclient.DataSource) *cobra.Command {
 	var jsonMode bool
 
 	cmd := &cobra.Command{
-		Use:          "status <session-id>",
-		Short:        "Show detailed status for an agent session",
-		Long:         "Show detailed status for a single agent session, including duration, token usage, cost, and current activity.",
-		Args:         cobra.ExactArgs(1),
+		Use:   "status <session-id>",
+		Short: "Show detailed status for an agent session",
+		Long:  "Show detailed status for a single agent session, including duration, token usage, cost, and current activity.",
+		// Custom Args validator instead of cobra.ExactArgs(1) so the bare-
+		// command error tells operators where to find a session id rather
+		// than the default "accepts 1 arg(s), received 0" which is opaque
+		// to anyone who doesn't already know about `agent list`. Keep the
+		// "too many args" path delegating to ExactArgs(1) for parity.
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return fmt.Errorf(
+					"agent status needs a session id\n\n" +
+						"List active sessions to find one:\n" +
+						"  agent list\n\n" +
+						"Then re-run with the id as the first argument:\n" +
+						"  agent status <session-id>",
+				)
+			}
+			return cobra.ExactArgs(1)(cmd, args)
+		},
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id := args[0]
