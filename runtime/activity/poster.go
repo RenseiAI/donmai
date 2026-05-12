@@ -108,6 +108,13 @@ type Config struct {
 	// Sleep overrides time.Sleep for retry backoff in tests.
 	Sleep func(time.Duration)
 
+	// ProviderName identifies the AgentRuntime provider that emitted the
+	// events ("claude", "codex", "stub", …). The platform-side hook bridge
+	// uses it to build a ProviderRef for Layer 6 hook events when
+	// translating activities into pre-tool-use / post-tool-use payloads.
+	// Empty is permitted; the bridge falls back to "unknown".
+	ProviderName string
+
 	// QueueSize overrides DefaultQueueSize.
 	QueueSize int
 	// MaxRetries overrides DefaultMaxRetries.
@@ -214,6 +221,13 @@ func (c Config) credentials(ctx context.Context) RuntimeCredentials {
 type job struct {
 	event      agent.Event
 	enqueuedAt time.Time
+	// durationMs is the elapsed wall-clock time between a ToolUseEvent and
+	// the matching ToolResultEvent (paired by ToolUseID). Zero for events
+	// that aren't ToolResultEvent, or for ToolResultEvent without a paired
+	// start time on the in-process timing map (e.g. when the result arrives
+	// after a poster restart). Stamped in Send so deliver doesn't have to
+	// re-look up the start time in the (possibly evicted) timing map.
+	durationMs int64
 }
 
 // Poster pushes [agent.Event] values to the platform's
@@ -236,6 +250,15 @@ type Poster struct {
 	// the first successful activity POST. atomic.Bool keeps Send paths
 	// lock-free.
 	runningPosted atomic.Bool
+
+	// toolUseStartTimes tracks the wall-clock at which each ToolUseEvent
+	// was enqueued, keyed by ToolUseID. The matching ToolResultEvent
+	// computes durationMs by subtracting the recorded start (after which
+	// the entry is deleted). sync.Map fits the read-mostly-then-delete
+	// access pattern and keeps Send lock-free. Memory is bounded by the
+	// in-flight tool-call count; orphan entries (no matching result event)
+	// are tolerated — they leak only for the lifetime of the Poster.
+	toolUseStartTimes sync.Map
 }
 
 // New validates cfg and returns a non-started Poster. Returns an error
@@ -302,12 +325,35 @@ func (p *Poster) Send(_ context.Context, ev agent.Event) {
 	if p.stopped.Load() {
 		return
 	}
-	if _, ok := mapEvent(ev, p.cfg.now()); !ok {
+	now := p.cfg.now()
+	if _, ok := mapEvent(ev, now, p.cfg.ProviderName, 0); !ok {
 		// Skip events that don't map to a platform activity shape —
 		// no point enqueuing only to drop them in the worker.
 		return
 	}
-	j := job{event: ev, enqueuedAt: p.cfg.now()}
+
+	// Track tool-use timings for downstream durationMs calculation.
+	// On a tool-use: record start time.
+	// On a tool-result: look up start, compute delta, delete the entry.
+	// Both branches are no-ops when ToolUseID is empty (some providers
+	// don't expose it; downstream consumers tolerate zero durationMs).
+	var durationMs int64
+	switch e := ev.(type) {
+	case agent.ToolUseEvent:
+		if e.ToolUseID != "" {
+			p.toolUseStartTimes.Store(e.ToolUseID, now)
+		}
+	case agent.ToolResultEvent:
+		if e.ToolUseID != "" {
+			if startAny, ok := p.toolUseStartTimes.LoadAndDelete(e.ToolUseID); ok {
+				if start, ok := startAny.(time.Time); ok {
+					durationMs = now.Sub(start).Milliseconds()
+				}
+			}
+		}
+	}
+
+	j := job{event: ev, enqueuedAt: now, durationMs: durationMs}
 	select {
 	case p.queue <- j:
 	default:
@@ -334,7 +380,7 @@ func (p *Poster) run(ctx context.Context) {
 // deliver runs the retry loop for one event. After the first
 // successful POST it best-effort fires the running-status nudge.
 func (p *Poster) deliver(ctx context.Context, j job) {
-	body, ok := mapEvent(j.event, j.enqueuedAt)
+	body, ok := mapEvent(j.event, j.enqueuedAt, p.cfg.ProviderName, j.durationMs)
 	if !ok {
 		// Defense in depth — Send already filtered these out. Reachable
 		// only if the mapping table changes mid-run.
@@ -404,6 +450,12 @@ type activityPayload struct {
 
 // payload is the inner activity object — see platform's
 // AgentActivity interface in src/app/api/sessions/[id]/activity/route.ts.
+//
+// The platform reconstructs Layer 6 hook events (pre-tool-use,
+// post-tool-use, tool-use-error) from this payload per
+// ADR-2026-05-12-cross-process-hook-bus-bridge; the additional fields
+// ToolUseID / IsError / DurationMs / ProviderName below are what the
+// bridge needs to do that translation faithfully.
 type payload struct {
 	Type         string         `json:"type"`
 	Content      string         `json:"content"`
@@ -411,7 +463,22 @@ type payload struct {
 	ToolInput    map[string]any `json:"toolInput,omitempty"`
 	ToolCategory string         `json:"toolCategory,omitempty"`
 	ToolOutput   string         `json:"toolOutput,omitempty"`
-	Timestamp    string         `json:"timestamp,omitempty"`
+	// ToolUseID pairs ToolUseEvent and ToolResultEvent on the platform
+	// bridge side; omitted when the source agent.Event didn't carry one.
+	ToolUseID string `json:"toolUseId,omitempty"`
+	// IsError is true for tool results that failed. Drives the platform's
+	// translation rule between post-tool-use and tool-use-error.
+	IsError bool `json:"isError,omitempty"`
+	// DurationMs is the elapsed wall-clock time between the matching
+	// ToolUseEvent and ToolResultEvent (paired by ToolUseID). Populated
+	// only on ToolResultEvent payloads. Zero when no start timestamp
+	// was found (orphan result, poster-restart edge case).
+	DurationMs int64 `json:"durationMs,omitempty"`
+	// ProviderName identifies the AgentRuntime provider that produced
+	// the event. The platform-side hook bridge maps this onto the
+	// ProviderRef.id for the Layer 6 event.
+	ProviderName string `json:"providerName,omitempty"`
+	Timestamp    string `json:"timestamp,omitempty"`
 }
 
 // postActivity issues one POST to /api/sessions/<id>/activity. Returns:
@@ -515,8 +582,19 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // timestamp is the wall-clock time at which the event was observed; the
 // platform server defaults to "now" when omitted, but emitting it here
 // preserves causal ordering when the runner buffers under backpressure.
-func mapEvent(ev agent.Event, ts time.Time) (payload, bool) {
-	out := payload{Timestamp: ts.UTC().Format(time.RFC3339Nano)}
+//
+// providerName is stamped on every payload that doesn't already carry one
+// so the platform-side hook-bus bridge can build a ProviderRef for the
+// reconstructed pre/post-tool-use events. Empty is permitted.
+//
+// durationMs is meaningful only for ToolResultEvent payloads (the elapsed
+// wall-clock time between the paired ToolUseEvent and this result, computed
+// by the caller). Ignored for all other event kinds.
+func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int64) (payload, bool) {
+	out := payload{
+		Timestamp:    ts.UTC().Format(time.RFC3339Nano),
+		ProviderName: providerName,
+	}
 	switch e := ev.(type) {
 	case agent.AssistantTextEvent:
 		text := strings.TrimSpace(e.Text)
@@ -531,6 +609,7 @@ func mapEvent(ev agent.Event, ts time.Time) (payload, bool) {
 		out.Type = "action"
 		out.Content = summarizeToolUse(e)
 		out.ToolName = e.ToolName
+		out.ToolUseID = e.ToolUseID
 		if e.ToolCategory != "" {
 			out.ToolCategory = e.ToolCategory
 		}
@@ -557,6 +636,9 @@ func mapEvent(ev agent.Event, ts time.Time) (payload, bool) {
 			out.Content = name + " result (error)"
 		}
 		out.ToolName = e.ToolName
+		out.ToolUseID = e.ToolUseID
+		out.IsError = e.IsError
+		out.DurationMs = durationMs
 		out.ToolOutput = truncate(e.Content, MaxToolOutputChars)
 		return out, true
 

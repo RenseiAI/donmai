@@ -275,6 +275,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		CredentialProvider: actCredentialProvider,
 		HTTPClient:         r.httpClient,
 		Logger:             r.logger,
+		// ProviderName flows onto the wire payload so the platform's
+		// hook-bus bridge can build a faithful ProviderRef for the
+		// reconstructed Layer 6 hook events. Resolved earlier (the
+		// registry.Resolve call at line 93 used the same value).
+		ProviderName: string(qw.resolvedProvider()),
 	})
 	if actErr != nil {
 		r.logger.Warn("activity poster construct failed", "err", actErr)

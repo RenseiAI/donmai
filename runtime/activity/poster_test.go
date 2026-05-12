@@ -690,3 +690,186 @@ func TestToolOutputTruncation(t *testing.T) {
 		t.Fatalf("toolOutput length %d exceeds cap %d", got, activity.MaxToolOutputChars)
 	}
 }
+
+// TestProviderNameAndToolUseFieldsRoundTrip pins the wire-format extension
+// from ADR-2026-05-12-cross-process-hook-bus-bridge: a paired ToolUseEvent
+// + ToolResultEvent must carry providerName, toolUseId, isError, and a
+// non-zero durationMs through the wire payload. The platform-side hook
+// bridge depends on this contract; a regression here breaks Layer 6 for
+// every daemon-driven session.
+func TestProviderNameAndToolUseFieldsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	type wirePayload struct {
+		Activity struct {
+			Type         string `json:"type"`
+			ToolName     string `json:"toolName"`
+			ToolUseID    string `json:"toolUseId"`
+			IsError      bool   `json:"isError"`
+			DurationMs   int64  `json:"durationMs"`
+			ProviderName string `json:"providerName"`
+			ToolOutput   string `json:"toolOutput"`
+		} `json:"activity"`
+	}
+
+	var mu sync.Mutex
+	var bodies []wirePayload
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/activity") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		var wire wirePayload
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			t.Errorf("unmarshal: %v", err)
+		}
+		mu.Lock()
+		bodies = append(bodies, wire)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Make time deterministic so we can assert exact durationMs.
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 5, 12, 0, 0, 0, 0, time.UTC).UnixMilli())
+	nowFn := func() time.Time {
+		return time.UnixMilli(clock.Load()).UTC()
+	}
+
+	p, err := activity.New(activity.Config{
+		SessionID:    "s1",
+		WorkerID:     "w1",
+		BaseURL:      srv.URL,
+		HTTPClient:   srv.Client(),
+		ProviderName: "claude",
+		Now:          nowFn,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	// Send a ToolUseEvent at t0, then advance 75ms and send the matching
+	// ToolResultEvent.
+	p.Send(context.Background(), agent.ToolUseEvent{
+		ToolName:  "Bash",
+		ToolUseID: "tu_abc",
+		Input:     map[string]any{"command": "ls -la"},
+	})
+	clock.Add(75)
+	p.Send(context.Background(), agent.ToolResultEvent{
+		ToolName:  "Bash",
+		ToolUseID: "tu_abc",
+		Content:   "total 0\n",
+		IsError:   false,
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(bodies)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("expected 2 activity posts; got %d", len(bodies))
+	}
+
+	use := bodies[0].Activity
+	if use.ProviderName != "claude" {
+		t.Errorf("ToolUse providerName: want claude, got %q", use.ProviderName)
+	}
+	if use.ToolUseID != "tu_abc" {
+		t.Errorf("ToolUse toolUseId: want tu_abc, got %q", use.ToolUseID)
+	}
+	if use.IsError {
+		t.Errorf("ToolUse isError: want false, got true")
+	}
+	if use.DurationMs != 0 {
+		t.Errorf("ToolUse durationMs: want 0 (only ToolResult carries it), got %d", use.DurationMs)
+	}
+
+	res := bodies[1].Activity
+	if res.ProviderName != "claude" {
+		t.Errorf("ToolResult providerName: want claude, got %q", res.ProviderName)
+	}
+	if res.ToolUseID != "tu_abc" {
+		t.Errorf("ToolResult toolUseId: want tu_abc, got %q", res.ToolUseID)
+	}
+	if res.IsError {
+		t.Errorf("ToolResult isError: want false, got true")
+	}
+	if res.DurationMs != 75 {
+		t.Errorf("ToolResult durationMs: want 75, got %d", res.DurationMs)
+	}
+	if res.ToolOutput != "total 0\n" {
+		t.Errorf("ToolResult toolOutput: want %q, got %q", "total 0\n", res.ToolOutput)
+	}
+}
+
+// TestToolResultWithoutPairedUseHasZeroDuration confirms an orphan
+// ToolResultEvent (no preceding ToolUseEvent in this Poster's lifetime)
+// emits with durationMs=0 rather than crashing or fabricating a duration.
+func TestToolResultWithoutPairedUseHasZeroDuration(t *testing.T) {
+	t.Parallel()
+
+	var captured atomic.Pointer[int64]
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/activity") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var wire struct {
+			Activity struct {
+				DurationMs int64 `json:"durationMs"`
+			} `json:"activity"`
+		}
+		_ = json.Unmarshal(body, &wire)
+		captured.Store(&wire.Activity.DurationMs)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	p, err := activity.New(activity.Config{
+		SessionID:    "s1",
+		WorkerID:     "w1",
+		BaseURL:      srv.URL,
+		HTTPClient:   srv.Client(),
+		ProviderName: "claude",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	p.Send(context.Background(), agent.ToolResultEvent{
+		ToolName:  "Bash",
+		ToolUseID: "tu_orphan",
+		Content:   "oops",
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && captured.Load() == nil {
+		time.Sleep(5 * time.Millisecond)
+	}
+	got := captured.Load()
+	if got == nil {
+		t.Fatal("no body captured")
+	}
+	if *got != 0 {
+		t.Fatalf("orphan ToolResult durationMs: want 0, got %d", *got)
+	}
+}
