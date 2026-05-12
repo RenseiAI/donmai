@@ -399,3 +399,73 @@ func TestClientAuthHeader(t *testing.T) {
 		t.Errorf("Authorization = %q, want Bearer rsk_token", gotAuth)
 	}
 }
+
+// TestClientScopeHeaders pins that OrgScope / ProjectScope on the
+// Client struct become `X-Rensei-Org` / `X-Rensei-Project` headers on
+// every request — including the secondary POST path. This is the
+// wire-level half of the multi-org misroute fix; without it the
+// platform's CLI auth would fall back to the WorkOS token's frozen
+// org_id claim. Empty-scope variants confirm the headers are omitted
+// (not sent as empty strings) so single-org users see no behavior change.
+func TestClientScopeHeaders(t *testing.T) {
+	t.Parallel()
+
+	type seen struct {
+		auth, org, project string
+		hadOrg, hadProject bool
+	}
+	var got seen
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.auth = r.Header.Get("Authorization")
+		got.org = r.Header.Get("X-Rensei-Org")
+		got.project = r.Header.Get("X-Rensei-Project")
+		_, got.hadOrg = r.Header["X-Rensei-Org"]
+		_, got.hadProject = r.Header["X-Rensei-Project"]
+		_ = json.NewEncoder(w).Encode(StatsResponse{})
+	}))
+	t.Cleanup(srv.Close)
+
+	t.Run("scope-set sends both headers", func(t *testing.T) {
+		got = seen{}
+		c := NewAuthenticatedClient(srv.URL, "rsk_token")
+		c.OrgScope = "org_supaku"
+		c.ProjectScope = "yuisei"
+		if _, err := c.GetStats(); err != nil {
+			t.Fatalf("GetStats: %v", err)
+		}
+		if got.org != "org_supaku" {
+			t.Errorf("X-Rensei-Org = %q, want org_supaku", got.org)
+		}
+		if got.project != "yuisei" {
+			t.Errorf("X-Rensei-Project = %q, want yuisei", got.project)
+		}
+	})
+
+	t.Run("empty scope omits headers entirely", func(t *testing.T) {
+		got = seen{}
+		c := NewAuthenticatedClient(srv.URL, "rsk_token")
+		// Leave OrgScope / ProjectScope at their zero values.
+		if _, err := c.GetStats(); err != nil {
+			t.Fatalf("GetStats: %v", err)
+		}
+		if got.hadOrg {
+			t.Errorf("X-Rensei-Org should not be set when OrgScope is empty; got %q", got.org)
+		}
+		if got.hadProject {
+			t.Errorf("X-Rensei-Project should not be set when ProjectScope is empty; got %q", got.project)
+		}
+	})
+
+	t.Run("post path also carries scope", func(t *testing.T) {
+		got = seen{}
+		c := NewAuthenticatedClient(srv.URL, "rsk_token")
+		c.OrgScope = "org_supaku"
+		// Trigger the post path. StopSession returns an error because the
+		// stub server doesn't return the expected JSON shape — that's fine,
+		// we only need the request to be made so the header capture fires.
+		_, _ = c.StopSession("sess-x")
+		if got.org != "org_supaku" {
+			t.Errorf("post X-Rensei-Org = %q, want org_supaku", got.org)
+		}
+	})
+}

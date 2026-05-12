@@ -64,10 +64,46 @@ type DataSource interface {
 }
 
 // Client is the HTTP implementation of DataSource.
+//
+// Scope fields (OrgScope, ProjectScope) carry per-invocation routing
+// context. When non-empty they are sent on EVERY request as
+// `X-Rensei-Org` and `X-Rensei-Project`. The platform's CLI auth path
+// treats `X-Rensei-Org` as authoritative (after membership check), so
+// these headers eliminate the org-resolution drift that bites when
+// multiple humans + agents on a host share a WorkOS access token whose
+// `org_id` claim is frozen to whichever org the user happened to be in
+// at token-mint time. Empty = don't send the header (server falls back
+// to its own resolution).
 type Client struct {
 	BaseURL    string
 	APIToken   string // Bearer token for authenticated requests (rsk_...)
 	HTTPClient *http.Client
+
+	// OrgScope, when non-empty, is sent as `X-Rensei-Org` on every
+	// request. Accepts the platform org id (`org_…`), org slug, or
+	// the WorkOS org id — the server resolves whichever is supplied.
+	OrgScope string
+	// ProjectScope, when non-empty, is sent as `X-Rensei-Project` on
+	// every request. Accepts the project slug or platform project id.
+	// Server-side honoring is route-by-route (not all routes are
+	// project-scoped).
+	ProjectScope string
+}
+
+// setRequestHeaders applies the standard auth + scope headers to req.
+// Empty values are skipped so callers that haven't configured a token
+// or a scope still produce minimal-header requests (matches pre-scope
+// behaviour for unauthenticated public endpoints).
+func (c *Client) setRequestHeaders(req *http.Request) {
+	if c.APIToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.APIToken)
+	}
+	if c.OrgScope != "" {
+		req.Header.Set("X-Rensei-Org", c.OrgScope)
+	}
+	if c.ProjectScope != "" {
+		req.Header.Set("X-Rensei-Project", c.ProjectScope)
+	}
 }
 
 // CredentialsFromDataSource attempts to recover the platform base URL and
@@ -147,9 +183,7 @@ func (c *Client) get(path string, target any) error {
 	if err != nil {
 		return fmt.Errorf("create request failed: %w", err)
 	}
-	if c.APIToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.APIToken)
-	}
+	c.setRequestHeaders(req)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -263,9 +297,7 @@ func (c *Client) post(path string, body any, target any) error {
 		return fmt.Errorf("create request failed: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.APIToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.APIToken)
-	}
+	c.setRequestHeaders(req)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {

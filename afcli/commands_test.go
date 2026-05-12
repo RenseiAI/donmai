@@ -141,3 +141,109 @@ func TestRegisterCommandsClientFactoryLazy(t *testing.T) {
 		t.Errorf("ClientFactory called %d times after executing `agent list`; want >= 1", got)
 	}
 }
+
+// TestScopedClientFactoryAppliesOrgAndProject pins the per-invocation
+// scope wiring: when OrgFunc / ProjectFunc are configured, the wrapped
+// factory must set the matching fields on each produced *Client. This
+// is the seam that fixes the multi-org misroute (afcli-imported
+// commands inheriting whatever WorkOS org_id the access token was
+// minted with) — without it, every release of rensei-tui that pulled
+// afcli would silently send commands to the wrong org for any operator
+// holding a stale token.
+func TestScopedClientFactoryAppliesOrgAndProject(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		ClientFactory: func() afclient.DataSource {
+			return afclient.NewAuthenticatedClient("https://example.test", "rsk_test")
+		},
+		OrgFunc:     func() string { return "org_supaku" },
+		ProjectFunc: func() string { return "yuisei" },
+	}
+	ds := scopedClientFactory(cfg)()
+	c, ok := ds.(*afclient.Client)
+	if !ok {
+		t.Fatalf("scoped factory did not return *afclient.Client; got %T", ds)
+	}
+	if c.OrgScope != "org_supaku" {
+		t.Errorf("OrgScope = %q, want org_supaku", c.OrgScope)
+	}
+	if c.ProjectScope != "yuisei" {
+		t.Errorf("ProjectScope = %q, want yuisei", c.ProjectScope)
+	}
+}
+
+// TestScopedClientFactoryReevaluatesPerCall confirms that each call to
+// the wrapped factory re-runs OrgFunc / ProjectFunc, so per-invocation
+// `--org` / `--project` flag overrides take effect without the embedder
+// rebuilding the command tree. Multi-agent / multi-shell concurrency on
+// a single host depends on this — each agent process passes its own
+// scope per command without mutating shared state.
+func TestScopedClientFactoryReevaluatesPerCall(t *testing.T) {
+	t.Parallel()
+
+	var orgCallNum int
+	cfg := Config{
+		ClientFactory: func() afclient.DataSource {
+			return afclient.NewAuthenticatedClient("https://example.test", "rsk_test")
+		},
+		OrgFunc: func() string {
+			orgCallNum++
+			if orgCallNum == 1 {
+				return "org_a"
+			}
+			return "org_b"
+		},
+	}
+	factory := scopedClientFactory(cfg)
+	first := factory().(*afclient.Client)
+	second := factory().(*afclient.Client)
+	if first.OrgScope != "org_a" {
+		t.Errorf("first OrgScope = %q, want org_a", first.OrgScope)
+	}
+	if second.OrgScope != "org_b" {
+		t.Errorf("second OrgScope = %q, want org_b", second.OrgScope)
+	}
+}
+
+// TestScopedClientFactoryEmptyScopeNoHeader confirms that returning an
+// empty string from OrgFunc / ProjectFunc leaves the scope field empty
+// (and therefore omits the header on the wire — the Client.set headers
+// helper is the unit-tested half of that contract). Single-org users
+// who don't configure scope keep the pre-change behaviour.
+func TestScopedClientFactoryEmptyScopeNoHeader(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		ClientFactory: func() afclient.DataSource {
+			return afclient.NewAuthenticatedClient("https://example.test", "rsk_test")
+		},
+		OrgFunc:     func() string { return "" },
+		ProjectFunc: func() string { return "" },
+	}
+	c := scopedClientFactory(cfg)().(*afclient.Client)
+	if c.OrgScope != "" {
+		t.Errorf("OrgScope = %q, want empty", c.OrgScope)
+	}
+	if c.ProjectScope != "" {
+		t.Errorf("ProjectScope = %q, want empty", c.ProjectScope)
+	}
+}
+
+// TestScopedClientFactoryNonClientPassthrough confirms that the wrapper
+// does not try to set scope on a DataSource that isn't an *afclient.Client
+// — e.g. MockClient in tests. The test harness should keep working
+// unchanged after the wrapping change.
+func TestScopedClientFactoryNonClientPassthrough(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		ClientFactory: func() afclient.DataSource { return afclient.NewMockClient() },
+		OrgFunc:       func() string { return "org_supaku" },
+	}
+	// Should not panic and should return whatever ClientFactory produced.
+	ds := scopedClientFactory(cfg)()
+	if _, ok := ds.(*afclient.MockClient); !ok {
+		t.Errorf("expected MockClient passthrough, got %T", ds)
+	}
+}
