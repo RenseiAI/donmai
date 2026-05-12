@@ -76,7 +76,13 @@ const (
   }
 }`
 
-	queryListWorkflowStates = `query ListWorkflowStates($teamId: String!) {
+	// $teamId must be ID! — Linear's schema rejects String! at this filter
+	// position with "Variable $teamId of type String! used in position
+	// expecting type ID." Sibling queries (queryListSubIssues,
+	// queryListBacklogIssues) already type their filter-id variables as
+	// ID!; this one was the outlier (REN — caught by the CLI Linear proxy
+	// 2026-05-12 once normalized errors surfaced).
+	queryListWorkflowStates = `query ListWorkflowStates($teamId: ID!) {
   workflowStates(filter: { team: { id: { eq: $teamId } } }) {
     nodes { id name type }
   }

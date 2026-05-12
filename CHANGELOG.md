@@ -12,6 +12,25 @@ _No work staged for the next release._
 
 ---
 
+## v0.7.7 — 2026-05-12
+
+Patch — schema fix for `ListWorkflowStates`.
+
+### Fixes
+
+- **`queryListWorkflowStates` $teamId — `String!` → `ID!`.** Linear's
+  schema rejects `String!` at the `filter: { team: { id: { eq: $teamId } } }`
+  position with `Variable $teamId of type String! used in position
+  expecting type ID.`. The error surfaced for the first time once
+  v0.7.6's CLI Linear proxy started normalizing Linear-side GraphQL
+  errors back to the caller — every `rensei linear update-issue --state`
+  (which resolves a state name → ID via this query) was failing as
+  "server error" before the normalization. Sibling queries
+  (`queryListSubIssues`, `queryListBacklogIssues`) already used `ID!`;
+  this one was the outlier.
+
+---
+
 ## v0.7.6 — 2026-05-12
 
 CLI Linear proxy support — `linear` subcommands can now authenticate via
