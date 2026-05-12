@@ -19,8 +19,10 @@
 //
 // Restart contract:
 //
-//	The plist sets KeepAlive=true so launchd restarts on any exit, with a
-//	30s ThrottleInterval to prevent rapid-restart storms on crashes.
+//	The plist sets KeepAlive=<dict><SuccessfulExit><false/></dict>: launchd
+//	restarts on a non-zero exit (crash, OOM, panic) but NOT after a clean
+//	`daemon run` returning 0 (operator-initiated stops stick). A 30s
+//	ThrottleInterval prevents rapid-restart storms on crash loops.
 package launchd
 
 import (
@@ -187,11 +189,12 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 //
 // Key behaviours encoded in the plist:
 //
-//   - RunAtLoad = true        — daemon starts when the user logs in.
-//   - KeepAlive = true        — launchd restarts the daemon if it exits.
-//   - ThrottleInterval = 30   — crash restart throttle (prevents storms).
-//   - StandardOutPath / Err   — routes stdio to ~/Library/Logs/rensei/.
-//   - EnvironmentVariables    — sets HOME and PATH.
+//   - RunAtLoad = true       — daemon starts when the user logs in.
+//   - KeepAlive (dict)       — SuccessfulExit=false. See restart-contract
+//     note at the top of the file.
+//   - ThrottleInterval = 30  — crash restart throttle (prevents storms).
+//   - StandardOutPath / Err  — routes stdio to ~/Library/Logs/rensei/.
+//   - EnvironmentVariables   — sets HOME and PATH.
 func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
 	if hostBinPath == "" {
 		return "", fmt.Errorf("launchd: GeneratePlist: hostBinPath is required")
@@ -247,8 +250,18 @@ func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
   <key>RunAtLoad</key>
   <true/>
 
+  <!--
+    Restart on crash; do NOT restart after a clean stop. The boolean form
+    (<true/>) respawned on any exit and turned a clean host stop into a
+    no-op against the running process. SuccessfulExit=false means respawn
+    only when the program exited unsuccessfully (crashes recover,
+    operator-initiated stops stick).
+  -->
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
 
   <!-- Throttle crash-restarts to once per 30 seconds. -->
   <key>ThrottleInterval</key>

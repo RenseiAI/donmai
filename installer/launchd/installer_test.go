@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -87,6 +88,39 @@ func TestGeneratePlist_EncodesKeyBehaviours(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected plist to contain %q", want)
 		}
+	}
+}
+
+// TestGeneratePlist_KeepAliveOnlyOnFailure pins the SuccessfulExit=false
+// shape of the KeepAlive dict. The May-2026 incident saw the boolean form
+// (`<key>KeepAlive</key><true/>`) respawn the daemon within 30s of every
+// `rensei host stop`, because launchd treats the boolean true as "always
+// restart on exit". The dict form below restarts only on a non-zero exit
+// (crash recovery preserved) while leaving operator-initiated stops to
+// stick. Asserts the dict markup specifically so a regression to the
+// boolean form is caught by the test, not by an angry operator.
+func TestGeneratePlist_KeepAliveOnlyOnFailure(t *testing.T) {
+	out, err := GeneratePlist("/opt/af", "/tmp/o.log", "/tmp/e.log")
+	if err != nil {
+		t.Fatalf("GeneratePlist: %v", err)
+	}
+
+	// The KeepAlive value must be a dict carrying SuccessfulExit=false,
+	// not the bare <true/> boolean form. We match the rendered substring
+	// including whitespace between the open tag and the dict body so a
+	// future refactor that splits these across lines still passes.
+	keepAliveDictRe := regexp.MustCompile(
+		`<key>KeepAlive</key>\s*<dict>\s*<key>SuccessfulExit</key>\s*<false/>\s*</dict>`,
+	)
+	if !keepAliveDictRe.MatchString(out) {
+		t.Errorf("expected KeepAlive dict with SuccessfulExit=false, got:\n%s", out)
+	}
+
+	// Belt-and-suspenders: the bare boolean form (`<key>KeepAlive</key>\s*<true/>`)
+	// must not be present anywhere in the plist.
+	keepAliveTrueRe := regexp.MustCompile(`<key>KeepAlive</key>\s*<true/>`)
+	if keepAliveTrueRe.MatchString(out) {
+		t.Errorf("regressed to boolean KeepAlive=true (respawns on clean stop):\n%s", out)
 	}
 }
 
