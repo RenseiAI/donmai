@@ -552,3 +552,55 @@ func TestServer_HTTPTestServerWrapper(t *testing.T) {
 		t.Fatal("expected non-empty addr")
 	}
 }
+
+// TestServer_Status_ReportsPaused_WhenSpawnerDrainedButStateRunning pins the
+// status divergence the May-2026 prod incident exposed: spawner.Drain()
+// flips spawner.accepting=false directly, so a Drain → restore-to-Running
+// path that forgets to re-Resume the spawner used to leave the daemon
+// reporting "ready" while NACKing every claim with "not accepting new
+// work (paused or draining)". `daemonStatus()` and `buildRegistrationStats()`
+// must both surface "paused" in this divergent state.
+func TestServer_Status_ReportsPaused_WhenSpawnerDrainedButStateRunning(t *testing.T) {
+	d, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	// Sanity: clean status reports ready.
+	var pre afclient.DaemonStatusResponse
+	requireGet(t, srv.Addr(), "/api/daemon/status", &pre)
+	if pre.Status != afclient.DaemonReady {
+		t.Fatalf("pre-drain status = %q, want ready", pre.Status)
+	}
+
+	// Force the divergent state: drain the spawner directly, leaving
+	// d.state == StateRunning. This is the post-Update / post-failed-Stop
+	// shape that produced the prod incident.
+	if d.spawner == nil {
+		t.Fatal("spawner is nil; mustStartDaemon contract changed")
+	}
+	if err := d.spawner.Drain(50 * time.Millisecond); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if d.State() != StateRunning {
+		t.Fatalf("State = %q, want StateRunning (divergent shape)", d.State())
+	}
+	if d.spawner.IsAccepting() {
+		t.Fatal("spawner.IsAccepting() = true, want false after Drain")
+	}
+
+	// /api/daemon/status must surface the truth.
+	var status afclient.DaemonStatusResponse
+	requireGet(t, srv.Addr(), "/api/daemon/status", &status)
+	if status.Status != afclient.DaemonPaused {
+		t.Errorf("status = %q, want paused (drained spawner)", status.Status)
+	}
+
+	// /api/daemon/stats registration block must mirror the divergence too.
+	var stats afclient.DaemonStatsResponse
+	requireGet(t, srv.Addr(), "/api/daemon/stats", &stats)
+	if stats.Registration == nil {
+		t.Fatal("Registration stats nil")
+	}
+	if stats.Registration.Status != "paused" {
+		t.Errorf("registration status = %q, want paused", stats.Registration.Status)
+	}
+}

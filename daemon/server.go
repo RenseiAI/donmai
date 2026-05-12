@@ -150,7 +150,7 @@ func (s *Server) method(want string, fn http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	cfg := s.daemon.Config()
-	statusName := mapState(s.daemon.State())
+	statusName := daemonStatus(s.daemon)
 	resp := afclient.DaemonStatusResponse{
 		Status:          statusName,
 		Version:         Version,
@@ -196,7 +196,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		resp.ByMachine = []afclient.MachineStats{{
 			ID:             safeMachineID(cfg),
 			Region:         safeRegion(cfg),
-			Status:         mapState(s.daemon.State()),
+			Status:         daemonStatus(s.daemon),
 			Version:        Version,
 			ActiveSessions: countActive(s.daemon),
 			Capacity:       resp.Capacity,
@@ -460,6 +460,30 @@ func mapState(s State) afclient.DaemonStatus {
 	}
 }
 
+// daemonStatus is the source of truth for status reporting. It composes
+// `mapState(d.State())` with the spawner's `IsAccepting()` flag so the
+// reported status can never claim `ready` while the spawner is silently
+// NACKing every claim with "not accepting new work (paused or draining)".
+//
+// The two sources can diverge because Drain() flips spawner.accepting
+// directly without going through Daemon.Pause(); a paused-then-resumed
+// state restoration that forgets to resume the spawner used to leave
+// `d.state == Running` and `spawner.accepting == false` indefinitely
+// (precedent: post-auto-update on a 24h-uptime daemon, May 2026).
+func daemonStatus(d *Daemon) afclient.DaemonStatus {
+	state := mapState(d.State())
+	if state != afclient.DaemonReady {
+		return state
+	}
+	if d != nil && d.spawner != nil && !d.spawner.IsAccepting() {
+		// Spawner won't take work — the closest honest state is "paused".
+		// Don't synthesise a new status code; reuse the existing one
+		// callers already know how to render.
+		return afclient.DaemonPaused
+	}
+	return state
+}
+
 func countActive(d *Daemon) int { return d.spawnerActiveCount() }
 
 func safeMachineID(c *Config) string {
@@ -572,6 +596,22 @@ func buildRegistrationStats(d *Daemon) *afclient.DaemonRegistrationStats {
 			stats.Status = "paused"
 		default:
 			stats.Status = string(d.State())
+		}
+	}
+	// Mirror `daemonStatus()`: when the spawner won't accept work, surface
+	// "paused" regardless of where the upstream status came from
+	// (heartbeat-reported `idle` or `running`, or the fallback above).
+	// Same divergence root cause — Drain() flips spawner.accepting
+	// directly without going through Daemon.Pause(), and a forgotten
+	// Resume after restore-to-Running used to leave operators staring at
+	// `idle` while every claim NACKed.
+	if d.spawner != nil && !d.spawner.IsAccepting() {
+		switch stats.Status {
+		case "idle", "busy", "running", string(RegistrationDraining):
+			// keep "draining" — it's a more specific true statement.
+			if stats.Status != string(RegistrationDraining) {
+				stats.Status = "paused"
+			}
 		}
 	}
 	return stats

@@ -576,8 +576,17 @@ func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
 	}
 	d.setState(StateUpdating)
 	defer func() {
-		// Restore running state if we did not actually exit.
+		// Restore running state if we did not actually exit. The
+		// spawner.Drain() below flips `accepting=false` directly without
+		// going through Daemon.Pause(), so resuming the state alone leaves
+		// the spawner stuck NACKing every claim with "not accepting new
+		// work" while status reports `ready`. Re-resume the spawner so the
+		// two stay in lockstep. Symptom (pre-fix): daemon uptime > drain
+		// timeout, status=ready, every claim NACKs.
 		if d.State() == StateUpdating {
+			if d.spawner != nil {
+				d.spawner.Resume()
+			}
 			d.setState(StateRunning)
 		}
 	}()
