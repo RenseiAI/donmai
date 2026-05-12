@@ -12,6 +12,40 @@ _No work staged for the next release._
 
 ---
 
+## v0.7.5 — 2026-05-12
+
+Activity-poster wire-format extension that lets the platform reconstruct
+Layer 6 hook events from daemon-emitted tool calls (per
+agentfactory-architecture/ADR-2026-05-12-cross-process-hook-bus-bridge),
+plus a daemon-readiness fix and a launchd KeepAlive change.
+
+### Features
+
+- **`runtime/activity` carries toolUseId / isError / durationMs / providerName** —
+  the wire payload to `POST /api/sessions/<id>/activity` now includes the
+  four fields the platform-side bridge needs to reconstruct
+  `pre-tool-use` / `post-tool-use` / `tool-use-error` hook events. The
+  daemon-internal `agent.ToolUseEvent` / `agent.ToolResultEvent` already
+  carried `ToolUseID` and `IsError` — `mapEvent` was stripping them. The
+  poster tracks per-tool-use start times in a `sync.Map` keyed on
+  `ToolUseID` so paired result events get a real wall-clock `DurationMs`.
+  `ProviderName` is threaded from `qw.resolvedProvider()` at poster
+  construction.
+
+### Fixes
+
+- **Daemon: never report ready while the spawner is silently NACKing** —
+  fixes a window where a host install would report `af daemon stats` as
+  healthy/idle even though every claimed session was being NACK'd
+  immediately because of an allowlist mismatch. The readiness probe now
+  observes the spawner's NACK rate and surfaces a degraded status.
+- **Installer: KeepAlive only on failure** — launchd was respawning the
+  daemon on user-initiated `af host stop`. The plist now sets
+  `KeepAlive: { SuccessfulExit: false }` so a clean stop sticks; a crash
+  still relaunches.
+
+---
+
 ## v0.7.2 — 2026-05-08
 
 Bug-fix roll-up after v0.7.1: three afclient corrections for the platform's
