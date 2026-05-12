@@ -110,7 +110,8 @@ func TestProxyModeSendsBearerAuthHeader(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := &Client{
-		BaseURL:    srv.URL,
+		BaseURL: srv.URL,
+		// #nosec G101 -- test fixture; not a real credential
 		APIKey:     "rsk_test_token",
 		HTTPClient: srv.Client(),
 		ProxyMode:  true,

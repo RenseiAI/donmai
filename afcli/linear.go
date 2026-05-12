@@ -135,9 +135,9 @@ func newLinearClient(ds func() afclient.DataSource) (linear.Linear, error) {
 
 	// Path 3: neither — actionable error.
 	return nil, fmt.Errorf(
-		"Linear access requires either a `LINEAR_API_KEY` env var or a " +
-			"logged-in platform session. Set the env var, or run `rensei login` " +
-			"+ `rensei project trackers connect-linear`.",
+		"linear access requires either a LINEAR_API_KEY env var or a " +
+			"logged-in platform session: set the env var, or run `rensei login` " +
+			"then `rensei project trackers connect-linear`",
 	)
 }
 
