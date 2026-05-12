@@ -20,6 +20,15 @@ import (
 
 const defaultBaseURL = "http://localhost:3000"
 
+// version is the binary's release version, injected at build time via:
+//
+//	-ldflags "-X main.version=$VERSION"
+//
+// Default "dev" makes an unreleased local build obvious in `--version`
+// output AND in the daemon HTTP /api/daemon/status payload (the daemon
+// inherits this value via afcli.Config.HostBinaryVersion).
+var version = "dev"
+
 // resolveDefaultURL returns the value of WORKER_API_URL when set,
 // otherwise the hard-coded default base URL.
 func resolveDefaultURL() string {
@@ -110,6 +119,9 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 		Short: "AgentFactory terminal dashboard and CLI",
 		Long: "af is the unified entry point for the AgentFactory TUI and CLI.\n\n" +
 			"Running `af` with no subcommand launches the Bubble Tea dashboard.",
+		// Setting Version makes cobra auto-wire `--version` and `-v` so
+		// `af --version` works without us writing a separate command.
+		Version:      version,
 		SilenceUsage: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			// Load dotenv files; failure is non-fatal (files are optional).
@@ -164,6 +176,7 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 		DefaultURLFunc:          func() string { return flags.url },
 		EnableDashboard:         true,
 		EnableLegacyWorkerFleet: true,
+		HostBinaryVersion:       version,
 	})
 
 	return cmd, flags

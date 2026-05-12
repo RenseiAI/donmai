@@ -220,3 +220,27 @@ func TestStandaloneAfRegistersLegacyWorkerFleetCommands(t *testing.T) {
 		}
 	}
 }
+
+// TestVersionFlag pins the cobra-auto-wired `--version` flag the user
+// noticed was missing (`af --version` errored "unknown flag" while
+// `rensei --version` worked). Setting `cobra.Command.Version` on the
+// root makes cobra register both --version and -v automatically; the
+// rendered string carries the same `version` package var that the
+// daemon now also reports via Options.Version, so operator output
+// across all surfaces stays consistent.
+func TestVersionFlag(t *testing.T) {
+	cmd, _ := newRootCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"--version"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("--version should exit 0, got error: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, version) {
+		t.Errorf("--version output missing version %q; got:\n%s", version, out)
+	}
+}

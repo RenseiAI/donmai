@@ -33,6 +33,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -375,28 +376,67 @@ func Install(opts InstallOptions) (InstallResult, error) {
 	r := runner(opts.Runner)
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
 
-	// Defensive bootout: launchd refuses to bootstrap a label that's already
-	// registered, even if the previous registration is stale (e.g. from a
-	// failed earlier install attempt that didn't clean up). The exact error
-	// shape varies — older macOS prints "service already loaded", current
-	// versions print "Bootstrap failed: 5: Input/output error" with no
-	// recognizable substring. Rather than match-and-retry, just bootout
-	// up front and ignore any error (the call is idempotent — it's a no-op
-	// if the label isn't loaded).
+	// Defensive bootout: launchd refuses to bootstrap a label that's
+	// already registered, even if the previous registration is stale
+	// (e.g. from a failed earlier install attempt or a binary upgrade
+	// that left the prior plist path bound). The exact bootstrap error
+	// shape varies — older macOS prints "service already loaded",
+	// current versions print "Bootstrap failed: 5: Input/output error"
+	// with no recognizable substring. Try BOTH bootout forms up front:
+	// the label form succeeds against most registrations, the plist-
+	// path form succeeds when launchd has the service bound to a
+	// specific file path that no longer matches. Both calls are
+	// idempotent — no-ops when the label isn't loaded.
 	target := fmt.Sprintf("%s/%s", domain, LaunchdLabel)
 	_, _ = r.Run("launchctl", "bootout", target)
+	_, _ = r.Run("launchctl", "bootout", domain, plistPath)
 
-	if out, runErr := r.Run("launchctl", "bootstrap", domain, plistPath); runErr != nil {
-		// Belt-and-suspenders: also accept an "already loaded" stdout
-		// message in case the bootout above silently failed and the label
-		// is still registered. Anything else is a real failure.
+	out, runErr := r.Run("launchctl", "bootstrap", domain, plistPath)
+	if runErr != nil && bootstrapNeedsRetry(out) {
+		// Async tear-down race: bootout returned before launchd
+		// finished unbootstrapping (active children draining, signal
+		// propagation, etc.). One bounded retry covers the common case
+		// without burning operator time on permanent failures.
+		time.Sleep(500 * time.Millisecond)
+		_, _ = r.Run("launchctl", "bootout", target)
+		_, _ = r.Run("launchctl", "bootout", domain, plistPath)
+		out, runErr = r.Run("launchctl", "bootstrap", domain, plistPath)
+	}
+	if runErr != nil {
+		// Already-loaded after our pre-bootout means the label is bound
+		// to the same plist we just wrote — semantically a no-op for
+		// the install caller. Other errors are real.
 		txt := strings.ToLower(strings.TrimSpace(string(out)))
 		if !strings.Contains(txt, "already") {
-			return res, fmt.Errorf("launchd: bootstrap: %w (%s)", runErr, strings.TrimSpace(string(out)))
+			return res, fmt.Errorf(
+				"launchd: bootstrap: %w (%s)\n"+
+					"hint: if this persists, run `launchctl bootout %s` then re-try `host install`",
+				runErr, strings.TrimSpace(string(out)), target,
+			)
 		}
 	}
 	res.Loaded = true
 	return res, nil
+}
+
+// bootstrapNeedsRetry returns true when the launchctl bootstrap stderr
+// matches the async tear-down race pattern: the pre-bootout call
+// returned before launchd actually cleared the prior registration, so
+// bootstrap saw a phantom-still-loaded label and emitted exit 5 / I/O
+// error. Idempotent retry after a brief settle is the right reflex;
+// other failure shapes (permission, malformed plist, etc.) should
+// propagate immediately.
+func bootstrapNeedsRetry(out []byte) bool {
+	txt := strings.ToLower(strings.TrimSpace(string(out)))
+	// Modern macOS (>=12) signature.
+	if strings.Contains(txt, "5: input/output error") {
+		return true
+	}
+	// Pre-Sequoia variants saw "operation already in progress".
+	if strings.Contains(txt, "operation already in progress") {
+		return true
+	}
+	return false
 }
 
 // ── Uninstall ────────────────────────────────────────────────────────────────

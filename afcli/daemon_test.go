@@ -91,7 +91,7 @@ func (m *mockDaemon) SetCapacityConfig(key, value string) (*afclient.SetCapacity
 // Each call creates an independent command tree — safe for parallel tests.
 func newTestDaemonCmd(mock daemonDoer, args []string) (*bytes.Buffer, error) {
 	factory := func(_ afclient.DaemonConfig) daemonDoer { return mock }
-	cmd := newDaemonCmdWithFactory(factory)
+	cmd := newDaemonCmdWithFactory(factory, "test")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -465,7 +465,7 @@ func TestDaemonUninstallNoServiceInstalled(t *testing.T) {
 func TestDaemonParentHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd := newDaemonCmd()
+	cmd := newDaemonCmd("")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)

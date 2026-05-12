@@ -251,6 +251,110 @@ func TestInstall_PropagatesBootstrapError(t *testing.T) {
 	}
 }
 
+// retryRunner is a CommandRunner stub that returns different responses on
+// successive `launchctl bootstrap` calls. Used by the exit-5 retry test
+// where the first bootstrap must fail with the async-tear-down race
+// signature and the second must succeed.
+type retryRunner struct {
+	bootstrapResponses []struct {
+		out string
+		err error
+	}
+	bootstrapCalls int
+	calls          []string
+}
+
+func (r *retryRunner) Run(name string, args ...string) ([]byte, error) {
+	key := name + " " + strings.Join(args, " ")
+	r.calls = append(r.calls, key)
+	if name == "launchctl" && len(args) > 0 && args[0] == "bootstrap" {
+		i := r.bootstrapCalls
+		r.bootstrapCalls++
+		if i >= len(r.bootstrapResponses) {
+			return nil, nil
+		}
+		resp := r.bootstrapResponses[i]
+		return []byte(resp.out), resp.err
+	}
+	// All other commands (bootout) are no-ops.
+	return nil, nil
+}
+
+// TestInstall_RetriesOnAsyncTeardownRace pins the bootstrap-retry path
+// the May-2026 incident exposed: `rensei host install` after a binary
+// upgrade saw `Bootstrap failed: 5: Input/output error` because the
+// pre-bootout returned before launchd had finished tearing down the
+// prior service. Without retry, operators saw a hard error and had to
+// manually run `rensei host uninstall` then re-install. With retry,
+// one 500ms settle + retry covers the race transparently.
+func TestInstall_RetriesOnAsyncTeardownRace(t *testing.T) {
+	tmp := t.TempDir()
+	plistPath := filepath.Join(tmp, "test.plist")
+
+	rr := &retryRunner{
+		bootstrapResponses: []struct {
+			out string
+			err error
+		}{
+			{out: "Bootstrap failed: 5: Input/output error", err: errors.New("exit status 5")},
+			{out: "", err: nil}, // retry succeeds
+		},
+	}
+
+	res, err := Install(InstallOptions{
+		HostBinPath:  "/usr/local/bin/af",
+		PlistPath:    plistPath,
+		LogPath:      filepath.Join(tmp, "o.log"),
+		ErrorLogPath: filepath.Join(tmp, "e.log"),
+		Runner:       rr,
+	})
+	if err != nil {
+		t.Fatalf("Install must transparently retry on exit-5; got: %v", err)
+	}
+	if !res.Loaded {
+		t.Errorf("expected Loaded=true after successful retry")
+	}
+	if rr.bootstrapCalls != 2 {
+		t.Errorf("expected 2 bootstrap calls (1 fail + 1 retry), got %d", rr.bootstrapCalls)
+	}
+}
+
+// TestInstall_RetriesOnceThenSurfacesError pins that the retry is
+// bounded — a persistent exit-5 surfaces with an actionable hint
+// (pointing at the manual `launchctl bootout` recovery), not a silent
+// retry storm.
+func TestInstall_RetriesOnceThenSurfacesError(t *testing.T) {
+	tmp := t.TempDir()
+	plistPath := filepath.Join(tmp, "test.plist")
+
+	rr := &retryRunner{
+		bootstrapResponses: []struct {
+			out string
+			err error
+		}{
+			{out: "Bootstrap failed: 5: Input/output error", err: errors.New("exit status 5")},
+			{out: "Bootstrap failed: 5: Input/output error", err: errors.New("exit status 5")},
+		},
+	}
+
+	_, err := Install(InstallOptions{
+		HostBinPath:  "/usr/local/bin/af",
+		PlistPath:    plistPath,
+		LogPath:      filepath.Join(tmp, "o.log"),
+		ErrorLogPath: filepath.Join(tmp, "e.log"),
+		Runner:       rr,
+	})
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if !strings.Contains(err.Error(), "launchctl bootout") {
+		t.Errorf("expected actionable hint pointing at manual bootout; got: %v", err)
+	}
+	if rr.bootstrapCalls != 2 {
+		t.Errorf("expected exactly 2 bootstrap calls (no infinite retry), got %d", rr.bootstrapCalls)
+	}
+}
+
 func TestUninstall_RemovesPlist(t *testing.T) {
 	tmp := t.TempDir()
 	plistPath := filepath.Join(tmp, "test.plist")

@@ -35,6 +35,14 @@ type Config struct {
 	// means fleet-wide (no scope), preserving the default behavior.
 	// Optional. When nil, all commands behave fleet-wide.
 	ProjectFunc func() string
+
+	// HostBinaryVersion is the version string the embedding binary
+	// reports (typically injected via -ldflags into the main package).
+	// When non-empty, `daemon run` passes it to daemon.Options.Version
+	// so /api/daemon/status reports the running binary's version
+	// instead of agentfactory-tui's vendored package default. Empty
+	// falls back to the daemon package's own Version var.
+	HostBinaryVersion string
 }
 
 // resolveURL returns the base URL to use, checking DefaultURLFunc first,
@@ -68,7 +76,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 		root.AddCommand(newWorkerCmd(ds))
 		root.AddCommand(newFleetCmd(ds))
 	}
-	root.AddCommand(newDaemonCmd())
+	root.AddCommand(newDaemonCmd(cfg.HostBinaryVersion))
 	root.AddCommand(newProjectCmd())
 	root.AddCommand(newOrchestratorCmd())
 	root.AddCommand(newCodeCmd())

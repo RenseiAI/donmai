@@ -115,11 +115,68 @@ func TestServer_Status(t *testing.T) {
 	if resp.MaxSessions != 4 {
 		t.Errorf("MaxSessions = %d, want 4", resp.MaxSessions)
 	}
+	// mustStartDaemon does not set Options.Version, so EffectiveVersion
+	// falls back to the package var (currently "dev" unless overridden
+	// at build time via ldflags).
 	if resp.Version != Version {
-		t.Errorf("Version = %q, want %q", resp.Version, Version)
+		t.Errorf("Version = %q, want package default %q", resp.Version, Version)
 	}
 	if resp.Status != afclient.DaemonReady {
 		t.Errorf("Status = %q, want ready", resp.Status)
+	}
+}
+
+// TestServer_Status_HostVersionOverride pins the Options.Version override
+// path: a downstream embedder (e.g. rensei-tui) that sets its own
+// version string MUST see that string in /api/daemon/status, NOT the
+// agentfactory-tui package's Version var. This is the wire that fixes
+// the May-2026 incident where `rensei host status` reported the
+// vendored "0.7.1" forever.
+func TestServer_Status_HostVersionOverride(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.Machine.ID = "test-machine"
+	cfg.Capacity.MaxConcurrentSessions = 4
+	cfg.Projects = []ProjectConfig{{ID: "demo", Repository: "github.com/foo/bar"}}
+	cfg.Orchestrator.URL = "file:///tmp/queue"
+	cfgPath := filepath.Join(tmp, "daemon.yaml")
+	if err := WriteConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	d := New(Options{
+		ConfigPath: cfgPath,
+		JWTPath:    filepath.Join(tmp, "daemon.jwt"),
+		HTTPHost:   "127.0.0.1",
+		HTTPPort:   0,
+		SkipWizard: true,
+		Version:    "rensei-1.2.3-test",
+		SpawnerOptions: SpawnerOptions{
+			WorkerCommand: []string{"sleep", "10"},
+		},
+	})
+	if err := d.Start(context.Background()); err != nil {
+		t.Fatalf("daemon Start: %v", err)
+	}
+	srv := NewServer(d)
+	if _, err := srv.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		_ = d.Stop(ctx)
+	})
+
+	var resp afclient.DaemonStatusResponse
+	requireGet(t, srv.Addr(), "/api/daemon/status", &resp)
+	if resp.Version != "rensei-1.2.3-test" {
+		t.Errorf("Version = %q, want rensei-1.2.3-test (Options.Version)", resp.Version)
+	}
+
+	// EffectiveVersion accessor must agree with the wire shape.
+	if got := d.EffectiveVersion(); got != "rensei-1.2.3-test" {
+		t.Errorf("EffectiveVersion() = %q, want rensei-1.2.3-test", got)
 	}
 }
 

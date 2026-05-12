@@ -153,7 +153,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	statusName := daemonStatus(s.daemon)
 	resp := afclient.DaemonStatusResponse{
 		Status:          statusName,
-		Version:         Version,
+		Version:         s.daemon.EffectiveVersion(),
 		MachineID:       safeMachineID(cfg),
 		PID:             os.Getpid(),
 		UptimeSeconds:   int64(time.Since(s.daemon.StartedAt()).Seconds()),
@@ -197,7 +197,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			ID:             safeMachineID(cfg),
 			Region:         safeRegion(cfg),
 			Status:         daemonStatus(s.daemon),
-			Version:        Version,
+			Version:        s.daemon.EffectiveVersion(),
 			ActiveSessions: countActive(s.daemon),
 			Capacity:       resp.Capacity,
 			UptimeSeconds:  int64(time.Since(s.daemon.StartedAt()).Seconds()),

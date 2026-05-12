@@ -61,6 +61,15 @@ type Options struct {
 	// behaviour for a daemon that has not yet wired its runtime registry.
 	// Wave 9 / ADR-2026-05-07-daemon-http-control-api.md §D4.
 	ProviderRegistry ProviderRegistry
+
+	// Version overrides the package-level `Version` for status reporting.
+	// Empty falls back to the package var (which itself defaults to "dev"
+	// unless the build injected via -ldflags). Downstream embedders that
+	// ship their own binary (e.g. the rensei daemon) should set this to
+	// their own version string so /api/daemon/status reports the
+	// running binary, not whatever string agentfactory-tui's vendored
+	// source had at the time.
+	Version string
 }
 
 // PoolStatsProvider returns a workarea pool snapshot.
@@ -172,6 +181,18 @@ func (d *Daemon) State() State {
 	return v
 }
 
+// EffectiveVersion returns the version string the daemon should report
+// in HTTP status / heartbeat / registration payloads. Resolution order:
+// `Options.Version` (downstream embedder override) → package `Version`
+// (which itself is "dev" unless overridden via `-ldflags
+// -X .../daemon.Version=…`). Empty option = fall through.
+func (d *Daemon) EffectiveVersion() string {
+	if d.opts.Version != "" {
+		return d.opts.Version
+	}
+	return Version
+}
+
 func (d *Daemon) setState(s State) {
 	d.state.Store(s)
 }
@@ -270,7 +291,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			RegistrationToken: token,
 			MachineID:         cfg.Machine.ID,
 			Hostname:          cfg.Machine.ID,
-			Version:           Version,
+			Version:           d.EffectiveVersion(),
 			MaxAgents:         cfg.Capacity.MaxConcurrentSessions,
 			Capabilities:      []string{"local", "sandbox", "workarea"},
 			Region:            cfg.Machine.Region,
@@ -597,7 +618,7 @@ func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
 	}
 
 	updater := NewUpdater(UpdaterOptions{
-		CurrentVersion: Version,
+		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,
 		SkipExit:       true, // HTTP-driven update: caller decides to exit.
 	})

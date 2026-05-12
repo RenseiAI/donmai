@@ -64,12 +64,17 @@ func expandHomePath(path string) string {
 // its own; it dispatches to subcommands that manage the local rensei-daemon.
 // The factory parameter is the DaemonClient constructor; passing nil selects
 // the production default.
-func newDaemonCmd() *cobra.Command {
-	return newDaemonCmdWithFactory(defaultDaemonFactory)
+//
+// hostVersion is the embedding binary's version string; passed through to
+// `daemon run` so the daemon's HTTP /api/daemon/status reports the running
+// binary's version (not the agentfactory-tui daemon package's vendored
+// default). Empty falls back to the daemon package's own Version var.
+func newDaemonCmd(hostVersion string) *cobra.Command {
+	return newDaemonCmdWithFactory(defaultDaemonFactory, hostVersion)
 }
 
 // newDaemonCmdWithFactory is the injectable variant used in tests.
-func newDaemonCmdWithFactory(factory daemonClientFactory) *cobra.Command {
+func newDaemonCmdWithFactory(factory daemonClientFactory, hostVersion string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Manage the local rensei-daemon",
@@ -82,7 +87,7 @@ func newDaemonCmdWithFactory(factory daemonClientFactory) *cobra.Command {
 	cmd.AddCommand(newDaemonInstallCmd())
 	cmd.AddCommand(newDaemonUninstallCmd())
 	cmd.AddCommand(newDaemonSetupCmd())
-	cmd.AddCommand(newDaemonRunCmd())
+	cmd.AddCommand(newDaemonRunCmd(hostVersion))
 	cmd.AddCommand(newDaemonStatusCmd(factory))
 	cmd.AddCommand(newDaemonLogsCmd())
 	cmd.AddCommand(newDaemonDoctorCmd())

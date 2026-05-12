@@ -7,7 +7,13 @@ builds:
     main: ./cmd/af
     binary: af
     ldflags:
-      - -s -w
+      # -X main.version powers `af --version` AND the daemon's
+      # /api/daemon/status `Version` field (via Config.HostBinaryVersion).
+      # Without the -X injection the binary reports "dev" forever, which
+      # made `rensei host status` (which reads the daemon HTTP endpoint)
+      # display agentfactory-tui's vendored package default instead of
+      # the running release tag.
+      - -s -w -X main.version={{.Version}}
     env:
       - CGO_ENABLED=0
     goos:

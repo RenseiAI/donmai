@@ -21,7 +21,7 @@ import (
 //
 // REN-1406 wired the installer to register `<host-binary> daemon run`; this
 // command is what runs on those service managers.
-func newDaemonRunCmd() *cobra.Command {
+func newDaemonRunCmd(hostVersion string) *cobra.Command {
 	var (
 		configPath string
 		jwtPath    string
@@ -70,6 +70,7 @@ func newDaemonRunCmd() *cobra.Command {
 				HTTPPort:         port,
 				SkipWizard:       skipWizard,
 				ProviderRegistry: runner.NewProviderView(providerReg),
+				Version:          hostVersion,
 			})
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()

@@ -24,32 +24,22 @@ package daemon
 
 import "time"
 
-// Version is the daemon binary version. Kept in sync with agentfactory-tui's
-// release tags. Reported in DaemonStatus and in the registration payload.
+// Version is the daemon binary version reported in DaemonStatus and in
+// the registration payload.
 //
-// 0.4.0-dev: in-tree daemon now talks to the real platform endpoints
-// (REN-1422 — POST /api/workers/register + POST /api/workers/<id>/heartbeat
-// with runtime JWT). Replaces the 0.3.10-sidecar bash heartbeat shim that
-// shipped for the 2026-05-01 demo.
+// Now a `var` (was `const`) so the binary's main can override it via
+// `-ldflags "-X github.com/RenseiAI/agentfactory-tui/daemon.Version=$VERSION"`
+// at build time, OR a downstream embedder (e.g. rensei-tui's daemon
+// run command) can pass its own version via `Options.Version` at
+// daemon construction. The const form pinned the value to whatever
+// agentfactory-tui's source had at vendor time, which left the
+// `rensei-daemon-run` HTTP /api/daemon/status endpoint reporting an
+// outdated string forever — confusing operators who saw e.g. `0.7.1`
+// even after upgrading both binaries past it.
 //
-// 0.5.5: stage-driven SDLC Phase 2 daemon side (REN-1485 / REN-1487):
-// new QueuedWork stage fields (StagePrompt, StageID, StageBudget,
-// StageLifecycle, StageSourceEventID) decoded + forwarded onto
-// SessionDetail; sub-agent budget enforcement via runner.BudgetEnforcer
-// (max-duration / max-sub-agents / max-tokens with WORK_RESULT
-// budget-exceeded surfacing); REN-1481 runtime-token refresh probe
-// (probes /api/workers/<id>/refresh-token before falling back to a
-// full re-register so the workerId stays stable when the platform
-// side ships the companion handler).
-//
-// 0.7.1: Wave 12 — kit lifecycle honest end-to-end. Sigstore bundle-
-// mode verifier (sigstore-go) on /api/daemon/kits/<id>/verify-signature
-// replaces the always-KitTrustUnsigned stub. Git-source kit install
-// (go-git/v5) on /api/daemon/kits/<id>/install replaces the 501 stub.
-// Trust modes (permissive / signed-by-allowlist / attested) configurable
-// via daemon.yaml; trustOverride: "allowed-this-once" audit-logged
-// per REN-1314.
-const Version = "0.7.1"
+// Default is `"dev"` so an unreleased build (or a vendored copy that
+// forgot to inject) is obvious in status output.
+var Version = "dev"
 
 // DefaultHTTPPort is the port the daemon's control HTTP server binds to.
 // Keep in sync with afclient.DefaultDaemonConfig (port 7734).
