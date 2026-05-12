@@ -12,6 +12,42 @@ _No work staged for the next release._
 
 ---
 
+## v0.7.6 — 2026-05-12
+
+CLI Linear proxy support — `linear` subcommands can now authenticate via
+a downstream-embedder's platform login session instead of requiring a
+`LINEAR_API_KEY` env var. Per
+agentfactory-architecture/ADR-2026-05-12-cli-linear-proxy.
+
+### Features
+
+- **`linear.Client.ProxyMode` + `linear.NewProxiedClient(baseURL, rskToken)`** —
+  the Linear GraphQL client gains a proxy-mode toggle. When `ProxyMode`
+  is true the `Authorization` header switches from raw `<APIKey>` (Linear-
+  direct semantics) to `Bearer <APIKey>` (platform proxy semantics), and
+  `NewProxiedClient` composes a `BaseURL` that targets the embedder's
+  `/api/cli/linear/graphql` proxy route. All query/mutation strings and
+  response decoders are unchanged — `linear.Linear` callers don't care
+  which mode they got.
+- **`afcli.newLinearCmd(ds)` accepts a DataSource factory.** Matches every
+  other afcli command that touches an embedder's API. Resolution order
+  inside `newLinearClient`:
+    1. `LINEAR_API_KEY` / `LINEAR_ACCESS_TOKEN` env → direct path.
+    2. Authenticated `*afclient.Client` from `ds()` (rsk_ token + base URL)
+       → `linear.NewProxiedClient`.
+    3. Neither → actionable error pointing the user at the env var or
+       `rensei login` + `rensei project trackers connect-linear`.
+- **`afclient.CredentialsFromDataSource(ds)`** — pure helper that recovers
+  `(baseURL, token, ok)` from a DataSource. Returns ok=false for
+  unauthenticated or non-Client DataSources; callers degrade gracefully.
+
+### Chores
+
+- `afcli/commands.go:76` now passes `ds` to `newLinearCmd`. This is the
+  one-line closure of the structural bypass that motivated the ADR.
+
+---
+
 ## v0.7.5 — 2026-05-12
 
 Activity-poster wire-format extension that lets the platform reconstruct
