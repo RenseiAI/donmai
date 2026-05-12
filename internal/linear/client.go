@@ -167,9 +167,22 @@ type Client struct {
 	BaseURL    string
 	APIKey     string
 	HTTPClient *http.Client
+
+	// ProxyMode toggles the Authorization header shape (per
+	// ADR-2026-05-12-cli-linear-proxy):
+	//   - false (default): `Authorization: <APIKey>` — direct Linear API
+	//     calls where APIKey holds a Linear-issued lin_api_* / OAuth token.
+	//   - true: `Authorization: Bearer <APIKey>` — calls go through the
+	//     platform's /api/cli/linear/graphql proxy where APIKey holds the
+	//     user's platform rsk_ token. The platform unwraps the rsk_, looks
+	//     up the org's stored Linear OAuth credential, and forwards the
+	//     GraphQL under that credential.
+	// BaseURL is the only other thing that changes between the two modes;
+	// every query/mutation string and response decoder is identical.
+	ProxyMode bool
 }
 
-// NewClient constructs a Client for the given apiKey.
+// NewClient constructs a Client for direct Linear API calls.
 // Returns ErrInvalidAPIKey if apiKey is empty.
 func NewClient(apiKey string) (*Client, error) {
 	if strings.TrimSpace(apiKey) == "" {
@@ -179,6 +192,31 @@ func NewClient(apiKey string) (*Client, error) {
 		BaseURL:    defaultBaseURL,
 		APIKey:     apiKey,
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+	}, nil
+}
+
+// NewProxiedClient constructs a Client that routes GraphQL through the
+// platform's /api/cli/linear/graphql proxy under the caller's rsk_ token.
+// platformBaseURL is the platform root (e.g. "https://app.rensei.ai");
+// rskToken is the user's platform API key (Bearer-style). Returns
+// ErrInvalidAPIKey when either is empty.
+//
+// The returned client speaks the exact same GraphQL queries as a direct
+// Linear client — the proxy mirrors api.linear.app/graphql's envelope.
+func NewProxiedClient(platformBaseURL, rskToken string) (*Client, error) {
+	if strings.TrimSpace(rskToken) == "" {
+		return nil, ErrInvalidAPIKey
+	}
+	if strings.TrimSpace(platformBaseURL) == "" {
+		return nil, fmt.Errorf("linear: platform base URL is required")
+	}
+	// Strip trailing slash for clean URL composition.
+	base := strings.TrimRight(platformBaseURL, "/")
+	return &Client{
+		BaseURL:    base + "/api/cli/linear/graphql",
+		APIKey:     rskToken,
+		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		ProxyMode:  true,
 	}, nil
 }
 
@@ -195,7 +233,15 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 		return fmt.Errorf("linear: create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", c.APIKey)
+	if c.ProxyMode {
+		// Platform proxy expects an rsk_ token in Bearer-style.
+		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	} else {
+		// Linear's own GraphQL API expects the token as the raw header
+		// value (no Bearer prefix). This is per Linear's docs and has
+		// been stable since their public API launched.
+		req.Header.Set("Authorization", c.APIKey)
+	}
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {

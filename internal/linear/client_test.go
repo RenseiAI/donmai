@@ -96,6 +96,63 @@ func TestClientSendsRawAPIKeyHeader(t *testing.T) {
 	}
 }
 
+// TestProxyModeSendsBearerAuthHeader pins the auth-header branch added by
+// ADR-2026-05-12-cli-linear-proxy. ProxyMode=true must produce
+// `Authorization: Bearer <token>` (platform proxy semantics), whereas
+// direct mode keeps the raw header value (Linear API semantics).
+func TestProxyModeSendsBearerAuthHeader(t *testing.T) {
+	t.Parallel()
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		writeGQLData(w, `{"issues":{"nodes":[]}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &Client{
+		BaseURL:    srv.URL,
+		APIKey:     "rsk_test_token",
+		HTTPClient: srv.Client(),
+		ProxyMode:  true,
+	}
+	_, _ = c.ListIssuesByProject(context.Background(), "proj", nil)
+	const want = "Bearer rsk_test_token"
+	if gotAuth != want {
+		t.Errorf("Authorization = %q, want %q", gotAuth, want)
+	}
+}
+
+// TestNewProxiedClient pins the constructor — base URL composition, the
+// proxy mode flag, the input validation, and that the resulting client
+// produces a Bearer-style auth header when used.
+func TestNewProxiedClient(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewProxiedClient("", "rsk_x"); err == nil {
+		t.Fatal("empty platform base URL: want error, got nil")
+	}
+	if _, err := NewProxiedClient("https://app.rensei.ai", ""); err == nil {
+		t.Fatal("empty rsk token: want error, got nil")
+	}
+	if _, err := NewProxiedClient("   ", "rsk_x"); err == nil {
+		t.Fatal("whitespace platform base URL: want error, got nil")
+	}
+
+	c, err := NewProxiedClient("https://app.rensei.ai/", "rsk_abc")
+	if err != nil {
+		t.Fatalf("constructor: unexpected error: %v", err)
+	}
+	if c.BaseURL != "https://app.rensei.ai/api/cli/linear/graphql" {
+		t.Errorf("BaseURL = %q, want trailing slash stripped + path appended", c.BaseURL)
+	}
+	if !c.ProxyMode {
+		t.Error("ProxyMode = false, want true")
+	}
+	if c.APIKey != "rsk_abc" {
+		t.Errorf("APIKey = %q, want %q", c.APIKey, "rsk_abc")
+	}
+}
+
 // --- ListIssuesByProject ---
 
 func TestListIssuesByProjectSuccess(t *testing.T) {

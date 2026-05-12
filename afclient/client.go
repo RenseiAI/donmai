@@ -70,6 +70,34 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+// CredentialsFromDataSource attempts to recover the platform base URL and
+// rsk_ Bearer token from a DataSource. Returns ok=false when the
+// underlying value isn't an *afclient.Client (e.g. MockClient in tests),
+// when the token is empty, or when the base URL is empty.
+//
+// Used by callers that need to dispatch through a sibling platform surface
+// — for example the linear subcommand tree at
+// `afcli/linear.go` routes GraphQL through `/api/cli/linear/graphql` when
+// an authenticated platform client is available (per
+// ADR-2026-05-12-cli-linear-proxy). Callers that get ok=false should fall
+// back to their direct-API auth path.
+//
+// Pure read-only access — no copies made; the strings live on the same
+// `*Client` the DataSource wraps.
+func CredentialsFromDataSource(ds DataSource) (baseURL, token string, ok bool) {
+	if ds == nil {
+		return "", "", false
+	}
+	c, isClient := ds.(*Client)
+	if !isClient {
+		return "", "", false
+	}
+	if c.BaseURL == "" || c.APIToken == "" {
+		return "", "", false
+	}
+	return c.BaseURL, c.APIToken, true
+}
+
 // NewClient creates a new API client pointing at the given server URL.
 func NewClient(baseURL string) *Client {
 	return &Client{

@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/agentfactory-tui/internal/linear"
 )
 
@@ -62,8 +63,10 @@ func setupLinearTest(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 func runLinearCmd(t *testing.T, _ string, args ...string) (string, error) {
 	t.Helper()
 
-	// Build a fresh linear command tree.
-	root := newLinearCmd()
+	// Build a fresh linear command tree. The DataSource factory is nil for
+	// these tests — they exercise the env-var path (setTestBaseURL +
+	// LINEAR_API_KEY) which short-circuits before the DataSource branch.
+	root := newLinearCmd(nil)
 	root.SilenceErrors = true
 
 	// Capture stdout.
@@ -820,6 +823,93 @@ func TestLinearListUnblockedBacklog(t *testing.T) {
 
 // ─── no API key ───────────────────────────────────────────────────────────────
 
+// TestLinearProxyModeViaDataSource pins the platform-proxy path added by
+// ADR-2026-05-12-cli-linear-proxy: when no LINEAR_API_KEY is set and the
+// DataSource factory returns an authenticated *afclient.Client, the linear
+// subcommand routes its GraphQL through `/api/cli/linear/graphql` with a
+// `Bearer <rsk_*>` auth header.
+func TestLinearProxyModeViaDataSource(t *testing.T) {
+	// No env vars — force the proxy path.
+	t.Setenv("LINEAR_API_KEY", "")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	setTestBaseURL("")
+	t.Cleanup(func() { setTestBaseURL("") })
+
+	var gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		// Mimic Linear's GraphQL envelope for a successful get-issue.
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"REN-1","title":"Hello","state":{"name":"Backlog"},"team":{"name":"Rensei"},"project":null,"labels":{"nodes":[]}}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	// The DataSource factory returns an *afclient.Client pointed at our
+	// test server with an rsk_-style token. CredentialsFromDataSource()
+	// extracts (BaseURL, APIToken) and feeds them to linear.NewProxiedClient.
+	ds := func() afclient.DataSource {
+		return afclient.NewAuthenticatedClient(srv.URL, "rsk_test_token")
+	}
+
+	root := newLinearCmd(ds)
+	root.SilenceErrors = true
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"get-issue", "REN-1"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("proxy-mode get-issue failed: %v\nout: %s", err, buf.String())
+	}
+
+	if gotPath != "/api/cli/linear/graphql" {
+		t.Errorf("path = %q, want %q", gotPath, "/api/cli/linear/graphql")
+	}
+	if gotAuth != "Bearer rsk_test_token" {
+		t.Errorf("Authorization = %q, want Bearer rsk_test_token", gotAuth)
+	}
+}
+
+// TestLinearEnvWinsOverDataSource pins the precedence rule from the ADR:
+// when both `LINEAR_API_KEY` env AND an authenticated DataSource are
+// available, the env var wins. Preserves the worker-fleet path semantics.
+func TestLinearEnvWinsOverDataSource(t *testing.T) {
+	// Set the env var.
+	t.Setenv("LINEAR_API_KEY", "lin_api_envvar")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"REN-1","title":"X","state":{"name":"Backlog"},"team":{"name":"Rensei"},"project":null,"labels":{"nodes":[]}}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	// Direct-path uses the package-level baseURL hook.
+	setTestBaseURL(srv.URL)
+	t.Cleanup(func() { setTestBaseURL("") })
+
+	// DataSource is non-nil + authenticated, but should be ignored because
+	// the env var takes precedence.
+	ds := func() afclient.DataSource {
+		return afclient.NewAuthenticatedClient("https://app.rensei.ai", "rsk_should_not_be_used")
+	}
+
+	root := newLinearCmd(ds)
+	root.SilenceErrors = true
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"get-issue", "REN-1"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("env-precedence get-issue failed: %v\nout: %s", err, buf.String())
+	}
+
+	// Direct mode → raw header value (no Bearer prefix) per Linear's API.
+	if gotAuth != "lin_api_envvar" {
+		t.Errorf("Authorization = %q, want env-var raw value (no Bearer prefix)", gotAuth)
+	}
+}
+
 func TestLinearNoAPIKey(t *testing.T) {
 	// Remove both key env vars.
 	t.Setenv("LINEAR_API_KEY", "")
@@ -829,7 +919,9 @@ func TestLinearNoAPIKey(t *testing.T) {
 	setTestBaseURL("")
 	t.Cleanup(func() { setTestBaseURL("") })
 
-	root := newLinearCmd()
+	// Pass a nil DataSource factory — exercises path 3 (no env, no
+	// authenticated DataSource → friendly error).
+	root := newLinearCmd(nil)
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -837,7 +929,7 @@ func TestLinearNoAPIKey(t *testing.T) {
 	root.SetArgs([]string{"get-issue", "REN-1"})
 	err := root.Execute()
 	if err == nil {
-		t.Fatal("expected error when LINEAR_API_KEY is not set")
+		t.Fatal("expected error when neither env key nor authenticated DataSource is available")
 	}
 	if !strings.Contains(err.Error(), "LINEAR_API_KEY") {
 		t.Errorf("error should mention LINEAR_API_KEY, got: %v", err)

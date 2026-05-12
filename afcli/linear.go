@@ -6,10 +6,21 @@ package afcli
 // mirrors the TS implementation in packages/linear/src/tools/linear-runner.ts.
 // JSON output shapes are intentionally preserved for automation compatibility.
 //
-// Auth strategy (mirrors TS):
-//   1. LINEAR_API_KEY env var → direct GraphQL calls to api.linear.app.
-//   2. No key + AGENTFACTORY_API_URL + WORKER_AUTH_TOKEN → proxy mode (future).
-//   3. Neither → hard error for commands that require auth.
+// Auth strategy (per ADR-2026-05-12-cli-linear-proxy):
+//   1. LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) env var → direct GraphQL calls
+//      to api.linear.app. Preserves the standalone `af` path AND the
+//      worker-fleet path where `af agent run` injects the env var into the
+//      in-session shell.
+//   2. No env key + ds() returns an authenticated *afclient.Client (rsk_ token
+//      + base URL) → platform proxy mode via `linear.NewProxiedClient`. The
+//      platform unwraps the rsk_, looks up the org's stored Linear OAuth
+//      credential, and forwards the GraphQL under that credential. This is
+//      the rensei case.
+//   3. Neither → hard error with an actionable message.
+//
+// Env wins precedence is deliberate: it preserves the worker-fleet behavior
+// without conditional logic and matches the explicit-env-overrides-default
+// posture every other afcli command uses.
 //
 // check-deployment is NOT ported here: it depends on Vercel/GitHub APIs and
 // lives conceptually outside the Linear package. Callers needing it should
@@ -26,14 +37,20 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/RenseiAI/agentfactory-tui/internal/linear"
 )
 
 // ─── top-level command factory ────────────────────────────────────────────────
 
 // newLinearCmd constructs the `linear` parent command with all sub-commands.
-// It is wired into RegisterCommands so that `af linear <sub>` works.
-func newLinearCmd() *cobra.Command {
+// It is wired into RegisterCommands so that `<binary> linear <sub>` works.
+//
+// `ds` is the platform-DataSource factory; subcommands call it lazily to
+// pick up rsk_ credentials when running embedded under rensei. The factory
+// may be nil (e.g. minimal test embedders) — subcommands degrade to the
+// LINEAR_API_KEY env path.
+func newLinearCmd(ds func() afclient.DataSource) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "linear",
 		Short: "Linear issue-tracker operations",
@@ -41,29 +58,33 @@ func newLinearCmd() *cobra.Command {
 
 Mirrors the TypeScript 'pnpm af-linear' surface. Outputs JSON to stdout.
 
-Authentication:
-  Set LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) to authenticate directly.
+Authentication (in order):
+  1. LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) env var → direct calls to api.linear.app.
+  2. Otherwise, when running under rensei with a stored login session (rsk_
+     token), GraphQL is proxied through the platform's /api/cli/linear/graphql
+     route under the org's connected Linear OAuth credential.
+  3. Neither set → hard error.
 
 LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newLinearGetIssueCmd())
-	cmd.AddCommand(newLinearCreateIssueCmd())
-	cmd.AddCommand(newLinearUpdateIssueCmd())
-	cmd.AddCommand(newLinearListCommentsCmd())
-	cmd.AddCommand(newLinearCreateCommentCmd())
-	cmd.AddCommand(newLinearAddRelationCmd())
-	cmd.AddCommand(newLinearListRelationsCmd())
-	cmd.AddCommand(newLinearRemoveRelationCmd())
-	cmd.AddCommand(newLinearListSubIssuesCmd())
-	cmd.AddCommand(newLinearListSubIssueStatusesCmd())
-	cmd.AddCommand(newLinearUpdateSubIssueCmd())
-	cmd.AddCommand(newLinearListIssuesCmd())
-	cmd.AddCommand(newLinearCheckBlockedCmd())
-	cmd.AddCommand(newLinearListBacklogIssuesCmd())
-	cmd.AddCommand(newLinearListUnblockedBacklogCmd())
-	cmd.AddCommand(newLinearCreateBlockerCmd())
+	cmd.AddCommand(newLinearGetIssueCmd(ds))
+	cmd.AddCommand(newLinearCreateIssueCmd(ds))
+	cmd.AddCommand(newLinearUpdateIssueCmd(ds))
+	cmd.AddCommand(newLinearListCommentsCmd(ds))
+	cmd.AddCommand(newLinearCreateCommentCmd(ds))
+	cmd.AddCommand(newLinearAddRelationCmd(ds))
+	cmd.AddCommand(newLinearListRelationsCmd(ds))
+	cmd.AddCommand(newLinearRemoveRelationCmd(ds))
+	cmd.AddCommand(newLinearListSubIssuesCmd(ds))
+	cmd.AddCommand(newLinearListSubIssueStatusesCmd(ds))
+	cmd.AddCommand(newLinearUpdateSubIssueCmd(ds))
+	cmd.AddCommand(newLinearListIssuesCmd(ds))
+	cmd.AddCommand(newLinearCheckBlockedCmd(ds))
+	cmd.AddCommand(newLinearListBacklogIssuesCmd(ds))
+	cmd.AddCommand(newLinearListUnblockedBacklogCmd(ds))
+	cmd.AddCommand(newLinearCreateBlockerCmd(ds))
 
 	return cmd
 }
@@ -79,27 +100,45 @@ func apiKey() string {
 	return os.Getenv("LINEAR_ACCESS_TOKEN")
 }
 
-// newLinearClient creates a Linear client from the environment.
-// Returns an error if no API key is set.
+// newLinearClient resolves a Linear client following the auth strategy in
+// the package header doc-comment:
+//
+//  1. LINEAR_API_KEY / LINEAR_ACCESS_TOKEN env → direct path.
+//  2. Authenticated DataSource (rsk_ token + platform base URL) → proxy
+//     mode via `linear.NewProxiedClient`.
+//  3. Neither → friendly error.
 //
 // When linearTestBaseURL is non-empty (set by tests via setTestBaseURL),
-// the client's BaseURL is overridden to point at the test HTTP server.
-func newLinearClient() (linear.Linear, error) {
-	key := apiKey()
-	if key == "" {
-		return nil, fmt.Errorf(
-			"LINEAR_API_KEY environment variable is required. " +
-				"Set it to your Linear API key (or LINEAR_ACCESS_TOKEN)",
-		)
+// the direct-path client's BaseURL is overridden to point at the test
+// HTTP server. The proxy path is exercised by tests via injecting a
+// MockClient-equivalent DataSource that returns an *afclient.Client whose
+// BaseURL points at the test server.
+func newLinearClient(ds func() afclient.DataSource) (linear.Linear, error) {
+	// Path 1: env-var direct.
+	if key := apiKey(); key != "" {
+		c, err := linear.NewClient(key)
+		if err != nil {
+			return nil, err
+		}
+		if linearTestBaseURL != "" {
+			c.BaseURL = linearTestBaseURL
+		}
+		return c, nil
 	}
-	c, err := linear.NewClient(key)
-	if err != nil {
-		return nil, err
+
+	// Path 2: platform proxy (rensei login session).
+	if ds != nil {
+		if baseURL, token, ok := afclient.CredentialsFromDataSource(ds()); ok {
+			return linear.NewProxiedClient(baseURL, token)
+		}
 	}
-	if linearTestBaseURL != "" {
-		c.BaseURL = linearTestBaseURL
-	}
-	return c, nil
+
+	// Path 3: neither — actionable error.
+	return nil, fmt.Errorf(
+		"Linear access requires either a `LINEAR_API_KEY` env var or a " +
+			"logged-in platform session. Set the env var, or run `rensei login` " +
+			"+ `rensei project trackers connect-linear`.",
+	)
 }
 
 // writeJSON writes v as indented JSON to w.
@@ -225,14 +264,14 @@ func labelNames(labels []linear.Label) []string {
 
 // ─── get-issue ────────────────────────────────────────────────────────────────
 
-func newLinearGetIssueCmd() *cobra.Command {
+func newLinearGetIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 	return &cobra.Command{
 		Use:          "get-issue <id>",
 		Short:        "Get issue details",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -267,7 +306,7 @@ func newLinearGetIssueCmd() *cobra.Command {
 
 // ─── create-issue ─────────────────────────────────────────────────────────────
 
-func newLinearCreateIssueCmd() *cobra.Command {
+func newLinearCreateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 	var (
 		title           string
 		team            string
@@ -298,7 +337,7 @@ func newLinearCreateIssueCmd() *cobra.Command {
 				)
 			}
 
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -386,7 +425,7 @@ func newLinearCreateIssueCmd() *cobra.Command {
 
 // ─── update-issue ─────────────────────────────────────────────────────────────
 
-func newLinearUpdateIssueCmd() *cobra.Command {
+func newLinearUpdateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 	var (
 		title           string
 		description     string
@@ -402,7 +441,7 @@ func newLinearUpdateIssueCmd() *cobra.Command {
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -485,14 +524,14 @@ func newLinearUpdateIssueCmd() *cobra.Command {
 
 // ─── list-comments ────────────────────────────────────────────────────────────
 
-func newLinearListCommentsCmd() *cobra.Command {
+func newLinearListCommentsCmd(ds func() afclient.DataSource) *cobra.Command {
 	return &cobra.Command{
 		Use:          "list-comments <issue-id>",
 		Short:        "List comments on an issue",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -516,7 +555,7 @@ func newLinearListCommentsCmd() *cobra.Command {
 
 // ─── create-comment ───────────────────────────────────────────────────────────
 
-func newLinearCreateCommentCmd() *cobra.Command {
+func newLinearCreateCommentCmd(ds func() afclient.DataSource) *cobra.Command {
 	var (
 		body     string
 		bodyFile string
@@ -536,7 +575,7 @@ func newLinearCreateCommentCmd() *cobra.Command {
 				return fmt.Errorf("usage: af linear create-comment <issue-id> --body \"Comment text\" or --body-file /path/to/file")
 			}
 
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -561,7 +600,7 @@ func newLinearCreateCommentCmd() *cobra.Command {
 
 // ─── add-relation ─────────────────────────────────────────────────────────────
 
-func newLinearAddRelationCmd() *cobra.Command {
+func newLinearAddRelationCmd(ds func() afclient.DataSource) *cobra.Command {
 	var relType string
 
 	cmd := &cobra.Command{
@@ -574,7 +613,7 @@ func newLinearAddRelationCmd() *cobra.Command {
 				return fmt.Errorf("usage: af linear add-relation <issue-id> <related-issue-id> --type <related|blocks|duplicate>")
 			}
 
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -618,14 +657,14 @@ func isValidRelationType(t string) bool {
 
 // ─── list-relations ───────────────────────────────────────────────────────────
 
-func newLinearListRelationsCmd() *cobra.Command {
+func newLinearListRelationsCmd(ds func() afclient.DataSource) *cobra.Command {
 	return &cobra.Command{
 		Use:          "list-relations <issue-id>",
 		Short:        "List relations for an issue",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -673,14 +712,14 @@ func newLinearListRelationsCmd() *cobra.Command {
 
 // ─── remove-relation ──────────────────────────────────────────────────────────
 
-func newLinearRemoveRelationCmd() *cobra.Command {
+func newLinearRemoveRelationCmd(ds func() afclient.DataSource) *cobra.Command {
 	return &cobra.Command{
 		Use:          "remove-relation <relation-id>",
 		Short:        "Remove a relation by ID",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -698,14 +737,14 @@ func newLinearRemoveRelationCmd() *cobra.Command {
 
 // ─── list-sub-issues ──────────────────────────────────────────────────────────
 
-func newLinearListSubIssuesCmd() *cobra.Command {
+func newLinearListSubIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
 	return &cobra.Command{
 		Use:          "list-sub-issues <parent-issue-id>",
 		Short:        "List sub-issues of a parent issue",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -756,14 +795,14 @@ var terminalStatuses = map[string]bool{
 	"Canceled":  true,
 }
 
-func newLinearListSubIssueStatusesCmd() *cobra.Command {
+func newLinearListSubIssueStatusesCmd(ds func() afclient.DataSource) *cobra.Command {
 	return &cobra.Command{
 		Use:          "list-sub-issue-statuses <parent-issue-id>",
 		Short:        "List sub-issue statuses (lightweight)",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -815,7 +854,7 @@ func newLinearListSubIssueStatusesCmd() *cobra.Command {
 
 // ─── update-sub-issue ─────────────────────────────────────────────────────────
 
-func newLinearUpdateSubIssueCmd() *cobra.Command {
+func newLinearUpdateSubIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 	var (
 		state   string
 		comment string
@@ -831,7 +870,7 @@ func newLinearUpdateSubIssueCmd() *cobra.Command {
 				return fmt.Errorf("usage: af linear update-sub-issue <issue-id> --state \"Finished\" [--comment \"...\"]")
 			}
 
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -882,7 +921,7 @@ func newLinearUpdateSubIssueCmd() *cobra.Command {
 
 // ─── list-issues ──────────────────────────────────────────────────────────────
 
-func newLinearListIssuesCmd() *cobra.Command {
+func newLinearListIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
 	var (
 		project  string
 		status   string
@@ -900,7 +939,7 @@ func newLinearListIssuesCmd() *cobra.Command {
 		Short:        "List issues with flexible filters",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -1039,14 +1078,14 @@ func newLinearListIssuesCmd() *cobra.Command {
 
 // ─── check-blocked ────────────────────────────────────────────────────────────
 
-func newLinearCheckBlockedCmd() *cobra.Command {
+func newLinearCheckBlockedCmd(ds func() afclient.DataSource) *cobra.Command {
 	return &cobra.Command{
 		Use:          "check-blocked <issue-id>",
 		Short:        "Check if an issue is blocked",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -1076,7 +1115,7 @@ func newLinearCheckBlockedCmd() *cobra.Command {
 
 // ─── list-backlog-issues ──────────────────────────────────────────────────────
 
-func newLinearListBacklogIssuesCmd() *cobra.Command {
+func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
 	var project string
 
 	cmd := &cobra.Command{
@@ -1088,7 +1127,7 @@ func newLinearListBacklogIssuesCmd() *cobra.Command {
 				return fmt.Errorf("usage: af linear list-backlog-issues --project \"ProjectName\"")
 			}
 
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -1142,7 +1181,7 @@ func newLinearListBacklogIssuesCmd() *cobra.Command {
 
 // ─── list-unblocked-backlog ───────────────────────────────────────────────────
 
-func newLinearListUnblockedBacklogCmd() *cobra.Command {
+func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource) *cobra.Command {
 	var project string
 
 	cmd := &cobra.Command{
@@ -1154,7 +1193,7 @@ func newLinearListUnblockedBacklogCmd() *cobra.Command {
 				return fmt.Errorf("usage: af linear list-unblocked-backlog --project \"ProjectName\"")
 			}
 
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}
@@ -1229,7 +1268,7 @@ func newLinearListUnblockedBacklogCmd() *cobra.Command {
 
 // ─── create-blocker ───────────────────────────────────────────────────────────
 
-func newLinearCreateBlockerCmd() *cobra.Command {
+func newLinearCreateBlockerCmd(ds func() afclient.DataSource) *cobra.Command {
 	var (
 		title       string
 		description string
@@ -1251,7 +1290,7 @@ func newLinearCreateBlockerCmd() *cobra.Command {
 				)
 			}
 
-			client, err := newLinearClient()
+			client, err := newLinearClient(ds)
 			if err != nil {
 				return err
 			}

@@ -73,7 +73,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newOrchestratorCmd())
 	root.AddCommand(newCodeCmd())
 	root.AddCommand(newArchCmd())
-	root.AddCommand(newLinearCmd())
+	root.AddCommand(newLinearCmd(ds))
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newAdminCmd())
 	root.AddCommand(newProviderCmd(ds))
