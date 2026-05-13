@@ -123,6 +123,16 @@ func (s *stubDataSource) GetAuditChain(_ string) ([]afclient.AuditChainEntry, er
 	return []afclient.AuditChainEntry{}, nil
 }
 
+// AgentCard stub methods (H — workType lane). Return empty-but-non-nil values.
+
+func (s *stubDataSource) ListAgents(_ afclient.AgentScopeQuery) ([]afclient.AgentCard, error) {
+	return []afclient.AgentCard{}, nil
+}
+
+func (s *stubDataSource) GetAgent(_ string) (*afclient.AgentCard, error) {
+	return nil, nil
+}
+
 // newTestAgentCmd builds a fresh agent command tree wired to the given
 // DataSource factory. Output/err are captured in the returned buffer.
 // No project scoping is applied.
