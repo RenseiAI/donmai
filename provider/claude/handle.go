@@ -189,20 +189,40 @@ func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID s
 	}
 
 	argv, stdinPrompt := buildArgs(spec, mcpPath, resumeSessionID)
+	return spawnRaw(ctx, p.binary, argv, stdinPrompt, mcpPath, spec.Cwd, spec.Env, spec.OnProcessSpawned)
+}
 
-	// nolint:gosec // p.binary is resolved at provider construction
+// spawnRaw is the low-level subprocess spawn shared by spawn (via
+// Provider.Spawn) and SpawnBinary (used by the amp provider). It
+// creates the exec.Command, wires up stdin/stdout/stderr pipes, starts
+// the subprocess, and returns a fully-wired Handle whose stdout reader
+// goroutine decodes Claude Code-compatible JSONL.
+//
+// On any failure prior to the subprocess being started, spawnRaw cleans
+// up mcpConfigPath and returns an error wrapping agent.ErrSpawnFailed.
+func spawnRaw(
+	ctx context.Context,
+	binary string,
+	argv []string,
+	stdinPrompt string,
+	mcpConfigPath string,
+	cwd string,
+	env map[string]string,
+	onProcessSpawned func(pid int),
+) (*Handle, error) {
+	// nolint:gosec // binary is resolved at provider construction
 	// from exec.LookPath; argv values come from a typed agent.Spec
 	// and a closed set of CLI flags. The shell-out target is the
-	// trusted claude binary.
-	cmd := exec.CommandContext(ctx, p.binary, argv...)
-	if spec.Cwd != "" {
-		cmd.Dir = spec.Cwd
+	// trusted binary (claude or amp).
+	cmd := exec.CommandContext(ctx, binary, argv...)
+	if cwd != "" {
+		cmd.Dir = cwd
 	}
-	cmd.Env = composeEnv(os.Environ(), spec.Env)
+	cmd.Env = composeEnv(os.Environ(), env)
 	// Place the child in its own process group so we can signal the
-	// whole group atomically (the claude binary may fork shell
-	// helpers; sending SIGTERM to the leader alone leaves
-	// stdout-inheriting orphans that keep the pipe open).
+	// whole group atomically (the binary may fork shell helpers;
+	// sending SIGTERM to the leader alone leaves stdout-inheriting
+	// orphans that keep the pipe open).
 	configureProcessGroup(cmd)
 	// Override exec.CommandContext's default leader-only kill with
 	// a process-group SIGKILL on ctx cancellation. Without this,
@@ -215,41 +235,41 @@ func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID s
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		_ = removeMCPConfig(mcpPath)
+		_ = removeMCPConfig(mcpConfigPath)
 		return nil, fmt.Errorf("%w: stdin pipe: %v", agent.ErrSpawnFailed, err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		_ = removeMCPConfig(mcpPath)
+		_ = removeMCPConfig(mcpConfigPath)
 		_ = stdin.Close()
 		return nil, fmt.Errorf("%w: stdout pipe: %v", agent.ErrSpawnFailed, err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		_ = removeMCPConfig(mcpPath)
+		_ = removeMCPConfig(mcpConfigPath)
 		_ = stdin.Close()
 		_ = stdout.Close()
 		return nil, fmt.Errorf("%w: stderr pipe: %v", agent.ErrSpawnFailed, err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		_ = removeMCPConfig(mcpPath)
+		_ = removeMCPConfig(mcpConfigPath)
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()
 		return nil, fmt.Errorf("%w: cmd start: %v", agent.ErrSpawnFailed, err)
 	}
 
-	if spec.OnProcessSpawned != nil && cmd.Process != nil {
-		spec.OnProcessSpawned(cmd.Process.Pid)
+	if onProcessSpawned != nil && cmd.Process != nil {
+		onProcessSpawned(cmd.Process.Pid)
 	}
 
 	stderrBuf := newBoundedBuffer(stderrBufferSize)
 
 	h := &Handle{
-		binary:        p.binary,
-		mcpConfigPath: mcpPath,
-		cwd:           spec.Cwd,
+		binary:        binary,
+		mcpConfigPath: mcpConfigPath,
+		cwd:           cwd,
 		cmd:           cmd,
 		events:        make(chan agent.Event, eventBufferSize),
 		logger:        slog.With("provider", "claude", "pid", cmd.Process.Pid),

@@ -126,6 +126,45 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	return p.spawn(ctx, spec, "")
 }
 
+// SpawnBinary is the exported entry point for providers that share the
+// Claude Code JSONL execution machinery but supply a different binary
+// and their own pre-built argv.
+//
+// Amp uses this: amp's --stream-json mode emits Claude Code-compatible
+// JSONL, so the same Handle + JSONL mapper work with the `amp` binary;
+// only the argv differs (amp uses -x --stream-json instead of
+// -p --output-format stream-json --verbose).
+//
+// Parameters:
+//   - ctx: cancellation context for the subprocess lifetime.
+//   - binary: absolute path to the CLI executable (pre-validated by the
+//     caller via exec.LookPath).
+//   - argv: the pre-built argument slice (NOT including the binary
+//     itself). The caller is responsible for all flag translation.
+//   - stdinPrompt: text written to the subprocess's stdin before close.
+//   - mcpConfigPath: absolute path to an MCP config tmpfile written by
+//     the caller, or "" if no MCP servers are configured. The Handle's
+//     Stop() method removes this file.
+//   - cwd: working directory for the subprocess; sets cmd.Dir when
+//     non-empty.
+//   - env: spec.Env passed to composeEnv (merged onto os.Environ()).
+//   - onProcessSpawned: optional PID callback fired after cmd.Start().
+//
+// On any pre-spawn failure (pipe creation, exec start) the function
+// returns an error wrapping agent.ErrSpawnFailed.
+func SpawnBinary(
+	ctx context.Context,
+	binary string,
+	argv []string,
+	stdinPrompt string,
+	mcpConfigPath string,
+	cwd string,
+	env map[string]string,
+	onProcessSpawned func(pid int),
+) (*Handle, error) {
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, cwd, env, onProcessSpawned)
+}
+
 // Resume returns agent.ErrUnsupported on v0.5.0 per the locked
 // capability matrix. When the runner gains resume support this method
 // will dispatch to spawn(ctx, spec, sessionID).

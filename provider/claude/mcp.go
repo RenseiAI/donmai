@@ -117,3 +117,18 @@ func removeMCPConfig(path string) error {
 	}
 	return nil
 }
+
+// WriteMCPConfig is the exported wrapper for writeMCPConfig, allowing
+// other providers (amp, opencode) that share the same --mcp-config flag
+// format to reuse the tmpfile serialization. Returns the absolute path
+// of the written file, or "" with nil error when servers is empty.
+func WriteMCPConfig(servers []agent.MCPServerConfig) (string, error) {
+	return writeMCPConfig(servers)
+}
+
+// RemoveMCPConfig is the exported wrapper for removeMCPConfig.
+// Callers that received a path from WriteMCPConfig should call this
+// when they are done with the session (typically in Handle.Stop).
+func RemoveMCPConfig(path string) error {
+	return removeMCPConfig(path)
+}
