@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"text/template"
+
+	"github.com/RenseiAI/agentfactory-tui/templates"
 )
 
 // Embedded default templates baked into the binary at build time. The
@@ -47,6 +49,14 @@ var ErrEmptyWork = errors.New("prompt: queued work carries no issue context")
 //
 // Builders are safe for concurrent use; all internal state is the
 // parsed template set, which is read-only after construction.
+//
+// # Backward-compat shim (H+1)
+//
+// When [Builder.Registry] is non-nil, Build uses the raymond-based
+// YAML template system. When it is nil (the default / zero value), the
+// legacy embedded text/template path is used unchanged. This preserves
+// all existing callers while enabling opt-in use of the raymond path
+// in new callers and tests.
 type Builder struct {
 	// SystemAppend is the optional repository-specific instruction
 	// block appended to the system prompt. Mirrors
@@ -62,6 +72,11 @@ type Builder struct {
 	// concatenated in priority order and injected into the agent's role
 	// prompt at dispatch time.
 	SkillAppend string
+
+	// Registry is the optional raymond-based template registry (H+1).
+	// When non-nil, Build routes through raymond instead of text/template.
+	// Callers that do not set this field get the existing behavior.
+	Registry *templates.Registry
 
 	// templates is lazily parsed on first use to keep the zero value
 	// useful. Accessed only via [Builder.set] under tmplOnce.
@@ -114,6 +129,13 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 			ErrEmptyWork, qw.SessionID, qw.IssueIdentifier)
 	}
 
+	// H+1 backward-compat shim: route through raymond when a Registry is
+	// configured; fall back to the legacy text/template path otherwise.
+	// No callers set Registry today, so this branch is additive-only.
+	if b.Registry != nil {
+		return b.buildRaymond(qw, hasStagePrompt)
+	}
+
 	tmpls, err := b.set()
 	if err != nil {
 		return "", "", err
@@ -139,6 +161,63 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 	}
 
 	return systemBuf, userBuf, nil
+}
+
+// buildRaymond is the H+1 raymond-backed rendering path, invoked when
+// [Builder.Registry] is non-nil. It mirrors the contract of Build exactly
+// (same inputs, same stage-prompt shortcircuit, same fallback for unknown
+// work types) while delegating template execution to raymond.
+func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user string, err error) {
+	sysCTX := map[string]interface{}{
+		"sessionID":      strings.TrimSpace(qw.SessionID),
+		"organizationID": strings.TrimSpace(qw.OrganizationID),
+		"projectName":    strings.TrimSpace(qw.ProjectName),
+		"repository":     strings.TrimSpace(qw.Repository),
+		"ref":            strings.TrimSpace(qw.Ref),
+		"append":         strings.TrimSpace(b.SystemAppend),
+		"skillAppend":    strings.TrimSpace(b.SkillAppend),
+	}
+	systemBuf, err := b.Registry.Render("system_base", sysCTX)
+	if err != nil {
+		return "", "", fmt.Errorf("raymond: render system prompt: %w", err)
+	}
+
+	if hasStagePrompt {
+		userBuf := renderStagePromptUser(qw)
+		return systemBuf, userBuf, nil
+	}
+
+	userTmplName := userTemplateNameRaymond(WorkType(qw.WorkType))
+	userCTX := map[string]interface{}{
+		"issueIdentifier": strings.TrimSpace(qw.IssueIdentifier),
+		"repository":      strings.TrimSpace(qw.Repository),
+		"ref":             strings.TrimSpace(qw.Ref),
+		"context":         strings.TrimSpace(resolveContext(qw)),
+		"mentionContext":  strings.TrimSpace(qw.MentionContext),
+		"parentContext":   strings.TrimSpace(qw.ParentContext),
+	}
+	userBuf, err := b.Registry.Render(userTmplName, userCTX)
+	if err != nil {
+		return "", "", fmt.Errorf("raymond: render user prompt %q: %w", userTmplName, err)
+	}
+
+	return systemBuf, userBuf, nil
+}
+
+// userTemplateNameRaymond maps a WorkType to the raymond registry template
+// name. Unknown work types fall through to user_development, matching the
+// legacy behavior in [userTemplateName].
+func userTemplateNameRaymond(w WorkType) string {
+	switch w {
+	case WorkTypeQA:
+		return "user_qa"
+	case WorkTypeResearch:
+		return "user_research"
+	case WorkTypeDevelopment, "":
+		return "user_development"
+	default:
+		return "user_development"
+	}
 }
 
 // renderStagePromptUser composes the user-prompt body for stage-prompt

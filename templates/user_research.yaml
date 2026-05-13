@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: WorkflowTemplate
+metadata:
+  name: user_research
+  description: Research/story-refinement directive — analyse, document, no code
+  workType: research
+prompt: |
+  Research and flesh out story {{#if issueIdentifier}}{{issueIdentifier}}{{else}}<unidentified issue>{{/if}}.
+
+  # Issue context
+
+  {{context}}
+  {{#if parentContext}}
+  # Parent issue context
+
+  {{parentContext}}
+  {{/if}}{{#if mentionContext}}
+  # Mention context
+
+  {{mentionContext}}
+  {{/if}}
+  # What to do
+
+  1. Analyse the requirements; identify the technical approach and scope.
+  2. Estimate complexity. Document blast-radius (type/union changes, cross-package imports, API endpoints touched).
+  3. Update the issue description via `pnpm af-linear update-issue {{#if issueIdentifier}}{{issueIdentifier}}{{else}}<id>{{/if}} --description-file <tmp>` with detailed acceptance criteria, a "Technical Context" section, and an "Affected Files" section when applicable.
+  4. Do NOT implement code. Focus on story refinement only.
+  5. When the description is updated, exit with a short summary.
+
+  Do not delete the worktree. Do not push branches or open PRs from a research session.

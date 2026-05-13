@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: WorkflowTemplate
+metadata:
+  name: helpers-hasflag-test
+  description: Test fixture for the hasFlag helper
+  workType: development
+prompt: |
+  {{#if (hasFlag flags "debug")}}debug enabled{{/if}}

@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: WorkflowTemplate
+metadata:
+  name: helpers-neq-test
+  description: Test fixture for the neq helper
+  workType: development
+prompt: |
+  {{#if (neq packageManager "pnpm")}}not pnpm{{/if}}

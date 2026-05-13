@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/agentfactory-tui/prompt"
+	"github.com/RenseiAI/agentfactory-tui/templates"
 )
 
 // updateGolden controls whether table tests rewrite their golden
@@ -165,6 +166,74 @@ func TestBuilderBuild_ConcurrentSafe(t *testing.T) {
 		if err := <-errCh; err != nil {
 			t.Errorf("concurrent Build #%d error: %v", i, err)
 		}
+	}
+}
+
+// TestBuilderBuild_RaymondShim verifies that setting Builder.Registry routes
+// rendering through the raymond path and produces output containing the same
+// structural elements as the legacy text/template path.
+func TestBuilderBuild_RaymondShim(t *testing.T) {
+	t.Parallel()
+	reg, err := templates.New()
+	if err != nil {
+		t.Fatalf("templates.New() error: %v", err)
+	}
+
+	work := fixtureSession()
+	work.WorkType = string(prompt.WorkTypeDevelopment)
+
+	// Legacy path.
+	legacySystem, legacyUser, err := prompt.NewBuilder().Build(work)
+	if err != nil {
+		t.Fatalf("legacy Build error: %v", err)
+	}
+
+	// Raymond path via shim.
+	b := &prompt.Builder{Registry: reg}
+	raymondSystem, raymondUser, err := b.Build(work)
+	if err != nil {
+		t.Fatalf("raymond Build error: %v", err)
+	}
+
+	// Both paths must contain the canonical identity section.
+	for _, s := range []string{"# Identity", "# Operating rules", work.SessionID} {
+		if !strings.Contains(legacySystem, s) {
+			t.Errorf("legacy system missing %q", s)
+		}
+		if !strings.Contains(raymondSystem, s) {
+			t.Errorf("raymond system missing %q", s)
+		}
+	}
+
+	// Both paths must contain the development prompt contract markers.
+	for _, s := range []string{"WORK_RESULT:passed", "WORK_RESULT:failed", "gh pr create"} {
+		if !strings.Contains(legacyUser, s) {
+			t.Errorf("legacy user missing %q", s)
+		}
+		if !strings.Contains(raymondUser, s) {
+			t.Errorf("raymond user missing %q", s)
+		}
+	}
+}
+
+// TestBuilderBuild_RaymondShim_NilRegistryPreservesLegacy verifies that
+// when Registry is nil the legacy text/template path is taken (no panic,
+// no error). This is the cardinal invariant of the H+1 shim.
+func TestBuilderBuild_RaymondShim_NilRegistryPreservesLegacy(t *testing.T) {
+	t.Parallel()
+	work := fixtureSession()
+	work.WorkType = string(prompt.WorkTypeQA)
+
+	b := &prompt.Builder{} // nil Registry
+	system, user, err := b.Build(work)
+	if err != nil {
+		t.Fatalf("Build with nil Registry error: %v", err)
+	}
+	if !strings.Contains(system, "# Identity") {
+		t.Error("system prompt missing '# Identity' on legacy path")
+	}
+	if !strings.Contains(user, "WORK_RESULT:passed") {
+		t.Error("user prompt missing 'WORK_RESULT:passed' on legacy path")
 	}
 }
 

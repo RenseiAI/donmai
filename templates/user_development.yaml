@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: WorkflowTemplate
+metadata:
+  name: user_development
+  description: Development work directive — implement, test, commit, open PR
+  workType: development
+prompt: |
+  Start work on {{#if issueIdentifier}}{{issueIdentifier}}{{else}}<unidentified issue>{{/if}}.
+
+  # Issue context
+
+  {{context}}
+  {{#if parentContext}}
+  # Parent issue context
+
+  {{parentContext}}
+  {{/if}}{{#if mentionContext}}
+  # Mention context
+
+  {{mentionContext}}
+  {{/if}}
+  # What to do
+
+  1. Implement the change described in the issue.
+  2. Run the project's test/typecheck/lint commands and fix any regressions you introduce.
+  3. Commit on the worktree's branch.
+  4. Push the branch (`git push -u origin <branch>`).
+  5. Open a pull request (`gh pr create --base {{#if ref}}{{ref}}{{else}}main{{/if}} --head <branch>`) targeting the repository at {{#if repository}}{{repository}}{{else}}the configured remote{{/if}}.
+  6. Post the PR link as a comment on {{#if issueIdentifier}}{{issueIdentifier}}{{else}}the issue{{/if}} via `pnpm af-linear create-comment`.
+  7. End your final assistant message with exactly one marker so the orchestrator can transition the issue:
+
+     - `WORK_RESULT:passed` when the implementation is complete, all checks pass, and the PR is open.
+     - `WORK_RESULT:failed` when implementation is blocked, regressed, or could not finish.
+
+     Without this marker the orchestrator posts a diagnostic comment and leaves the issue in its current status.
+
+  When finished, exit with a short summary of what you did. Do not delete the worktree.

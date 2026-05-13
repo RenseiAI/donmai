@@ -151,3 +151,9 @@ func Load(path string) (Template, error) {
 
 	return t, nil
 }
+
+// unmarshalYAML is an internal helper shared with registry.go.
+// It decodes raw YAML bytes into a Template without reading from disk.
+func unmarshalYAML(data []byte, t *Template) error {
+	return yaml.Unmarshal(data, t)
+}

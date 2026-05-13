@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: WorkflowTemplate
+metadata:
+  name: helpers-eq-test
+  description: Test fixture for the eq helper
+  workType: development
+prompt: |
+  {{#if (eq packageManager "pnpm")}}using pnpm{{/if}}
