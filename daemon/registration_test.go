@@ -518,3 +518,102 @@ func TestRegister_AfterWipeReregisters(t *testing.T) {
 		t.Errorf("expected cache file recreated after wipe + register; stat err = %v", err)
 	}
 }
+
+// TestRegister_ProvidesArraySentInBody verifies that the RegisterRequest body
+// sent to POST /api/workers/register includes the provides[] array when
+// RegistrationOptions.Provides is populated. This covers Stream H
+// (pool-aware daemon) — the wire contract for substrate capability advertisement.
+func TestRegister_ProvidesArraySentInBody(t *testing.T) {
+	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+
+	var capturedBody RegisterRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(buf, &capturedBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workerId":          "wkr_h",
+			"runtimeToken":      "tok",
+			"heartbeatInterval": 30000,
+			"pollInterval":      5000,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	provides := []ProvideCapability{
+		{Kind: "native"},
+		{Kind: "npm"},
+		{Kind: "http"},
+		{Kind: "mcp-server"},
+		{Kind: "host-binary"},
+		{Kind: "workarea"},
+	}
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	tok := "rsk_live_" + "abc" //nolint:gosec // synthetic test token
+	_, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		Hostname:          "cap-host",
+		Version:           "0.6.0-dev",
+		MaxAgents:         2,
+		JWTPath:           jwtPath,
+		Provides:          provides,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if len(capturedBody.Provides) != len(provides) {
+		t.Fatalf("body.provides count = %d, want %d; got %+v",
+			len(capturedBody.Provides), len(provides), capturedBody.Provides)
+	}
+	kinds := make(map[string]bool, len(capturedBody.Provides))
+	for _, p := range capturedBody.Provides {
+		kinds[p.Kind] = true
+	}
+	for _, want := range []string{"native", "npm", "http", "mcp-server", "host-binary", "workarea"} {
+		if !kinds[want] {
+			t.Errorf("provides[] missing %q; got %v", want, capturedBody.Provides)
+		}
+	}
+}
+
+// TestRegister_NilProvidesOmitsField verifies that a nil Provides slice does
+// NOT add a "provides" key to the JSON body (omitempty). Older platform
+// versions that don't recognise the field should still accept the request.
+func TestRegister_NilProvidesOmitsField(t *testing.T) {
+	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+
+	var rawBody json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf, _ := io.ReadAll(r.Body)
+		rawBody = buf
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workerId":          "wkr_nil",
+			"runtimeToken":      "tok",
+			"heartbeatInterval": 30000,
+			"pollInterval":      5000,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	tok := "rsk_live_" + "abc" //nolint:gosec // synthetic
+	_, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		Hostname:          "nil-host",
+		Version:           "0.6.0-dev",
+		MaxAgents:         2,
+		JWTPath:           jwtPath,
+		// Provides deliberately omitted / nil.
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(rawBody, &decoded); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if _, exists := decoded["provides"]; exists {
+		t.Errorf("provides key should be absent from body when nil; body: %s", rawBody)
+	}
+}

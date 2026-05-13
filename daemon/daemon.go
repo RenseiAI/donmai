@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/agentfactory-tui/afclient"
+	internaldaemon "github.com/RenseiAI/agentfactory-tui/internal/daemon"
 )
 
 // Options configure a Daemon.
@@ -110,6 +111,12 @@ type Daemon struct {
 	workerID  string
 	jwt       string
 	startedAt time.Time
+
+	// capabilitySet holds the substrate capabilities detected at startup.
+	// It is populated before registration so the provides[] array can be
+	// sent to the platform. Exposed via GET /api/daemon/capabilities.
+	// (ADR-2026-05-12-capacity-pools-and-substrate-resolution.md §H.)
+	capabilitySet *internaldaemon.CapabilitySet
 
 	heartbeat *HeartbeatService
 	poller    *PollService
@@ -274,6 +281,16 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.startedAt = time.Now().UTC()
 	d.mu.Unlock()
 
+	// Detect substrate capabilities before registration so they can be
+	// included in the provides[] array on POST /api/workers/register.
+	// The result is cached for the worker lifetime and served via
+	// GET /api/daemon/capabilities. (Stream H — pool awareness.)
+	cs := internaldaemon.NewCapabilitySet()
+	cs.Detect(internaldaemon.DefaultLookup)
+	d.capabilitySet = cs
+	slog.Info("daemon: detected substrate capabilities",
+		"count", len(cs.Capabilities()))
+
 	var (
 		regResp *RegisterResponse
 		regOpts RegistrationOptions
@@ -286,6 +303,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 		if token == "" {
 			token = "local-stub-no-token"
 		}
+		// Convert internal SubstrateCapability to wire ProvideCapability.
+		detected := cs.Capabilities()
+		provides := make([]ProvideCapability, len(detected))
+		for i, c := range detected {
+			provides[i] = ProvideCapability{Kind: string(c.Kind)}
+		}
 		regOpts = RegistrationOptions{
 			OrchestratorURL:   cfg.Orchestrator.URL,
 			RegistrationToken: token,
@@ -296,6 +319,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Capabilities:      []string{"local", "sandbox", "workarea"},
 			Region:            cfg.Machine.Region,
 			JWTPath:           d.opts.JWTPath,
+			Provides:          provides,
 		}
 		var err error
 		regResp, err = Register(ctx, regOpts)
@@ -699,4 +723,16 @@ func (d *Daemon) StartedAt() time.Time {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.startedAt
+}
+
+// SubstrateCapabilities returns the substrate capabilities detected at daemon
+// startup. The slice is nil before Start() is called and non-nil afterwards
+// (even when no optional toolchains were found — the always-present set is
+// returned). The returned slice is a copy; callers may mutate it freely.
+// (ADR-2026-05-12-capacity-pools-and-substrate-resolution.md §H.)
+func (d *Daemon) SubstrateCapabilities() []internaldaemon.SubstrateCapability {
+	if d.capabilitySet == nil {
+		return nil
+	}
+	return d.capabilitySet.Capabilities()
 }

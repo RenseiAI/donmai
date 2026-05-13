@@ -28,6 +28,14 @@ type RegistrationOptions struct {
 	JWTPath           string
 	ForceReregister   bool
 
+	// Provides is the substrate capability set the daemon advertises to the
+	// platform at registration time. Each entry corresponds to a
+	// SubstrateCapabilityDeclaration.runtimeKinds value (e.g. "native",
+	// "npm", "python-pip"). When nil the field is omitted from the wire
+	// payload and the platform falls back to provider-class defaults.
+	// (ADR-2026-05-12-capacity-pools-and-substrate-resolution.md §2, Stream H.)
+	Provides []ProvideCapability
+
 	// HTTPClient is the client used when the real (non-stub) path is taken.
 	// Defaults to http.DefaultClient with a 10s timeout.
 	HTTPClient *http.Client
@@ -39,18 +47,36 @@ type RegistrationOptions struct {
 //
 // The platform contract (see platform/src/app/api/workers/register/route.ts):
 //
-//	{ machineId?: string, hostname: string, capacity: number, version?: string, projects?: string[] }
+//	{ machineId?: string, hostname: string, capacity: number, version?: string,
+//	  projects?: string[], provides?: []{ kind: string } }
 //
 // The registration token is sent in the Authorization: Bearer header, NOT in
-// the body. Status / region / capabilities / activeAgentCount are not part of
-// the platform contract — they live in the heartbeat payload, or are inferred
-// from the project's Linear tracker bindings on the server side.
+// the body. Status / region / activeAgentCount are not part of the platform
+// contract — they live in the heartbeat payload, or are inferred from the
+// project's Linear tracker bindings on the server side.
+//
+// provides[] carries the substrate capabilities detected by the daemon at
+// startup. Each entry has a `kind` field matching the platform v1
+// SubstrateCapabilityDeclaration.runtimeKinds enum
+// (ADR-2026-05-12-capacity-pools-and-substrate-resolution.md §2). The
+// platform stamps pool-level capability on worker_hosts.capabilities when
+// this field is present. Omitted on older daemon versions; the platform
+// falls back to provider-class defaults in that case.
 type RegisterRequest struct {
-	MachineID string   `json:"machineId,omitempty"`
-	Hostname  string   `json:"hostname"`
-	Capacity  int      `json:"capacity"`
-	Version   string   `json:"version,omitempty"`
-	Projects  []string `json:"projects,omitempty"`
+	MachineID string              `json:"machineId,omitempty"`
+	Hostname  string              `json:"hostname"`
+	Capacity  int                 `json:"capacity"`
+	Version   string              `json:"version,omitempty"`
+	Projects  []string            `json:"projects,omitempty"`
+	Provides  []ProvideCapability `json:"provides,omitempty"`
+}
+
+// ProvideCapability is a single entry in the RegisterRequest.Provides array.
+// It mirrors the SubstrateCapability wire shape used by the internal capability
+// detector but is kept in the daemon package (public API surface) to avoid a
+// cross-package import cycle between daemon and internal/daemon.
+type ProvideCapability struct {
+	Kind string `json:"kind"`
 }
 
 // RegisterResponse is the JSON response from POST /api/workers/register.
@@ -253,6 +279,7 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		Hostname:  opts.Hostname,
 		Capacity:  capacity,
 		Version:   opts.Version,
+		Provides:  opts.Provides,
 	}
 	if req.MachineID == "" {
 		req.MachineID = opts.Hostname

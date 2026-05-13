@@ -132,6 +132,10 @@ func (s *Server) register(mux *http.ServeMux) {
 	// on-disk archive registry plus active pool members.
 	mux.HandleFunc("/api/daemon/workareas", s.handleWorkareasRoot)
 	mux.HandleFunc("/api/daemon/workareas/", s.handleWorkareaItem)
+	// capabilities (Stream H — pool-aware daemon advertises substrate).
+	// GET /api/daemon/capabilities returns the provides[] set detected
+	// at startup and sent to POST /api/workers/register.
+	mux.HandleFunc("/api/daemon/capabilities", s.method(http.MethodGet, s.handleCapabilities))
 	mux.HandleFunc("/healthz", s.method(http.MethodGet, s.handleHealthz))
 }
 
