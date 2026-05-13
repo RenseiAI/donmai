@@ -531,6 +531,117 @@ func (m *MockClient) GetKitContributions(_ string) ([]KitContribution, error) {
 	}, nil
 }
 
+// ── AgentCard mock methods (H — workType lane) ───────────────────────────────
+
+// ListAgents returns a small set of mock AgentCards covering the system-seeded
+// workType taxonomy. The scope argument is accepted for interface compatibility
+// but has no effect — all cards are returned regardless of scope.
+func (m *MockClient) ListAgents(_ AgentScopeQuery) ([]AgentCard, error) {
+	cards := mockAgentCards()
+	return cards, nil
+}
+
+// GetAgent returns the mock AgentCard for the given ID, or ErrNotFound.
+func (m *MockClient) GetAgent(id string) (*AgentCard, error) {
+	for _, c := range mockAgentCards() {
+		if c.ID == id {
+			card := c
+			return &card, nil
+		}
+	}
+	return nil, fmt.Errorf("agent %s: %w", id, ErrNotFound)
+}
+
+// mockAgentCards returns the canonical mock card set used by ListAgents and
+// GetAgent. Defined as a function (not a package-level var) so tests that call
+// both methods receive independent copies.
+func mockAgentCards() []AgentCard {
+	ownerID := "org_mock"
+	return []AgentCard{
+		{
+			ID:               "ag_mock_research",
+			MetadataID:       "research-agent",
+			Name:             "Research Agent",
+			Description:      "Investigates issues, reads docs, and surfaces findings.",
+			Version:          1,
+			Scope:            AgentCardScopeSystem,
+			ScopeOwnerID:     nil,
+			SourceProviderID: "db:internal",
+			Runtimes: []RuntimePath{
+				{Kind: RuntimeKindNative, Config: map[string]any{"providerId": "claude"}},
+			},
+			Auth:     []AuthRequirement{{Kind: "none"}},
+			Requires: []SubstrateRequirement{},
+			Trust: TrustClaims{
+				Tier: "system",
+				Provenance: TrustProvenanceInfo{
+					ImportedBy: "platform",
+					ImportedAt: "2026-05-12T00:00:00Z",
+				},
+			},
+			WorkType: WorkTypeResearch,
+			Tools:    AgentCardToolSurface{Allow: []string{"Read", "WebSearch"}, Disallow: []string{}},
+			Tags:     []string{"system", "research"},
+		},
+		{
+			ID:               "ag_mock_backlog",
+			MetadataID:       "backlog-writer",
+			Name:             "Backlog Writer",
+			Description:      "Drafts Linear issues from research findings.",
+			Version:          2,
+			Scope:            AgentCardScopeOrg,
+			ScopeOwnerID:     &ownerID,
+			SourceProviderID: "db:internal",
+			Runtimes: []RuntimePath{
+				{Kind: RuntimeKindNative, Config: map[string]any{"providerId": "claude"}},
+			},
+			Auth:     []AuthRequirement{{Kind: "oauth", OAuthProvider: ptr("linear")}},
+			Requires: []SubstrateRequirement{},
+			Trust: TrustClaims{
+				Tier: "partner",
+				Provenance: TrustProvenanceInfo{
+					ImportedBy: "org_mock",
+					ImportedAt: "2026-05-12T00:00:00Z",
+				},
+			},
+			WorkType: WorkTypeBacklogWriting,
+			Tools:    AgentCardToolSurface{Allow: []string{"Read", "Write"}, Disallow: []string{}},
+			Capabilities: map[string]bool{
+				"linearWrite": true,
+			},
+			Tags: []string{"org", "backlog"},
+		},
+		{
+			ID:               "ag_mock_dev",
+			MetadataID:       "dev-agent",
+			Name:             "Development Agent",
+			Description:      "Implements code changes across multiple runtimes.",
+			Version:          1,
+			Scope:            AgentCardScopeSystem,
+			ScopeOwnerID:     nil,
+			SourceProviderID: "db:internal",
+			Runtimes: []RuntimePath{
+				{Kind: RuntimeKindNative, Config: map[string]any{"providerId": "claude"}, Preference: ptr(0)},
+				{Kind: RuntimeKindNPM, Config: map[string]any{"package": "@rensei/dev-agent"}, Preference: ptr(1)},
+			},
+			Auth: []AuthRequirement{{Kind: "host-session"}},
+			Requires: []SubstrateRequirement{
+				{Kind: "workarea", Config: map[string]any{"mode": "persistent", "sizeMB": 2048}},
+			},
+			Trust: TrustClaims{
+				Tier: "system",
+				Provenance: TrustProvenanceInfo{
+					ImportedBy: "platform",
+					ImportedAt: "2026-05-12T00:00:00Z",
+				},
+			},
+			WorkType: WorkTypeDevelopment,
+			Tools:    AgentCardToolSurface{Allow: []string{"Read", "Write", "Edit", "Bash"}, Disallow: []string{}},
+			Tags:     []string{"system", "development"},
+		},
+	}
+}
+
 // GetAuditChain returns mock Layer 6 audit chain entries for a session.
 func (m *MockClient) GetAuditChain(sessionID string) ([]AuditChainEntry, error) {
 	now := time.Now()

@@ -61,6 +61,20 @@ type DataSource interface {
 	// GetAuditChain fetches the Layer 6 audit chain for a session.
 	// Corresponds to the AuditChain TUI primitive in 014.
 	GetAuditChain(sessionID string) ([]AuditChainEntry, error)
+
+	// ── AgentCard methods (H — workType lane) ─────────────────────────────
+
+	// ListAgents fetches the AgentCards visible under the given scope query.
+	// Empty ScopeQuery returns all cards visible to the caller's (org, project).
+	// TODO: platform /api/agents endpoint is not yet implemented; this client
+	// method is wired but returns ErrUnimplemented until the server-side
+	// Lane A1 lands on main.
+	ListAgents(scope AgentScopeQuery) ([]AgentCard, error)
+
+	// GetAgent fetches a single AgentCard by its platform-generated ID ("ag_…").
+	// TODO: platform /api/agents/<id> endpoint is not yet implemented; returns
+	// ErrUnimplemented until Lane A1 lands.
+	GetAgent(id string) (*AgentCard, error)
 }
 
 // Client is the HTTP implementation of DataSource.
@@ -467,4 +481,51 @@ func (c *Client) GetAuditChain(sessionID string) ([]AuditChainEntry, error) {
 		return nil, err
 	}
 	return resp, nil
+}
+
+// ── AgentCard methods (H — workType lane) ────────────────────────────────────
+
+// ListAgents fetches the AgentCards visible under the given scope query.
+// Empty ScopeQuery returns all cards visible to the caller's (org, project).
+//
+// TODO(lane-H): /api/agents is not yet implemented server-side (pending Lane A1
+// in rensei-architecture/ADR-2026-05-12-agentcard-schema-and-scope.md §3).
+// Wire shape is canonical; the method returns ErrUnimplemented until the
+// endpoint lands on main.
+func (c *Client) ListAgents(scope AgentScopeQuery) ([]AgentCard, error) {
+	q := url.Values{}
+	if scope.Scope != "" {
+		q.Set("scope", scope.Scope)
+	}
+	if scope.OrgID != "" {
+		q.Set("orgId", scope.OrgID)
+	}
+	if scope.ProjectID != "" {
+		q.Set("projectId", scope.ProjectID)
+	}
+	if scope.WorkType != "" {
+		q.Set("workType", scope.WorkType)
+	}
+	path := "/api/agents"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var resp AgentListResponse
+	if err := c.get(path, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Agents, nil
+}
+
+// GetAgent fetches a single AgentCard by its platform-generated ID ("ag_…").
+//
+// TODO(lane-H): /api/agents/<id> is not yet implemented server-side (pending
+// Lane A1 in rensei-architecture/ADR-2026-05-12-agentcard-schema-and-scope.md).
+// Returns ErrUnimplemented until the endpoint lands on main.
+func (c *Client) GetAgent(id string) (*AgentCard, error) {
+	var resp AgentCard
+	if err := c.get("/api/agents/"+id, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
