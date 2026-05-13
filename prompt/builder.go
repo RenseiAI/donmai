@@ -53,6 +53,16 @@ type Builder struct {
 	// RepositoryConfig.systemPrompt.append from the legacy TS.
 	SystemAppend string
 
+	// SkillAppend is the optional skill-body text collected from active
+	// Kit [provide.skills] entries by the runner's skill loader.  When
+	// non-empty it is appended to the system prompt after SystemAppend
+	// (if any), separated by a blank line, under a "# Kit Skills"
+	// heading.  This implements the materialization rule from
+	// 005-kit-manifest-spec.md §"Composition" — skill bodies are
+	// concatenated in priority order and injected into the agent's role
+	// prompt at dispatch time.
+	SkillAppend string
+
 	// templates is lazily parsed on first use to keep the zero value
 	// useful. Accessed only via [Builder.set] under tmplOnce.
 	templates *template.Template
@@ -109,7 +119,7 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 		return "", "", err
 	}
 
-	systemBuf, err := renderTemplate(tmpls, "system_base.tmpl", systemTemplateData(qw, b.SystemAppend))
+	systemBuf, err := renderTemplate(tmpls, "system_base.tmpl", systemTemplateData(qw, b.SystemAppend, b.SkillAppend))
 	if err != nil {
 		return "", "", fmt.Errorf("render system prompt: %w", err)
 	}
@@ -188,7 +198,8 @@ func (b *Builder) set() (*template.Template, error) {
 
 // systemTmplData carries the variable set the system_base.tmpl
 // references. Kept unexported because it is internal renderer plumbing;
-// callers shape the Builder via [QueuedWork] and [Builder.SystemAppend].
+// callers shape the Builder via [QueuedWork], [Builder.SystemAppend],
+// and [Builder.SkillAppend].
 type systemTmplData struct {
 	SessionID      string
 	OrganizationID string
@@ -196,9 +207,13 @@ type systemTmplData struct {
 	Repository     string
 	Ref            string
 	Append         string
+	// SkillAppend carries the kit-provided skill bodies joined by blank
+	// lines (in kit-priority order). Rendered under a "# Kit Skills"
+	// heading when non-empty.
+	SkillAppend string
 }
 
-func systemTemplateData(qw QueuedWork, appendBlock string) systemTmplData {
+func systemTemplateData(qw QueuedWork, appendBlock, skillAppend string) systemTmplData {
 	return systemTmplData{
 		SessionID:      strings.TrimSpace(qw.SessionID),
 		OrganizationID: strings.TrimSpace(qw.OrganizationID),
@@ -206,6 +221,7 @@ func systemTemplateData(qw QueuedWork, appendBlock string) systemTmplData {
 		Repository:     strings.TrimSpace(qw.Repository),
 		Ref:            strings.TrimSpace(qw.Ref),
 		Append:         strings.TrimSpace(appendBlock),
+		SkillAppend:    strings.TrimSpace(skillAppend),
 	}
 }
 

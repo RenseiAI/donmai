@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/agentfactory-tui/internal/kit"
 	"github.com/RenseiAI/agentfactory-tui/prompt"
 	"github.com/RenseiAI/agentfactory-tui/result"
 	"github.com/RenseiAI/agentfactory-tui/runtime/env"
@@ -140,6 +141,18 @@ type Options struct {
 	// HeartbeatInterval overrides the per-session heartbeat cadence.
 	// Zero falls back to runtime/heartbeat.DefaultInterval.
 	HeartbeatInterval time.Duration
+
+	// KitSkillSources is the optional slice of Kit skill contributions to
+	// inject into each dispatched agent's system prompt and tool surface.
+	// Populated by the daemon at runner construction time from the active
+	// Kits in the KitRegistry (via internal/kit.LoadSkills). When nil or
+	// empty no Kit skill injection occurs — the runner behaves as before
+	// this feature was added (additive/cardinal rule 1 compliant).
+	//
+	// Each element describes one active Kit's skill file list (paths
+	// relative to the Kit's manifest directory) and priority for
+	// ordering the merged system-prompt append block.
+	KitSkillSources []kit.KitSkillSource
 }
 
 // Runner is the long-lived per-daemon orchestrator. Build one via
@@ -169,6 +182,7 @@ type Runner struct {
 	skipSteering       bool
 	skipPostSession    bool
 	hbInterval         time.Duration
+	kitSkillSources    []kit.KitSkillSource
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session
@@ -213,6 +227,7 @@ func New(opts Options) (*Runner, error) {
 		skipSteering:       opts.SkipSteering,
 		skipPostSession:    opts.SkipPostSession,
 		hbInterval:         opts.HeartbeatInterval,
+		kitSkillSources:    opts.KitSkillSources,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

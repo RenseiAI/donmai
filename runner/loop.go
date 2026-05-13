@@ -13,11 +13,17 @@ import (
 	"time"
 
 	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/agentfactory-tui/internal/kit"
 	"github.com/RenseiAI/agentfactory-tui/runtime/activity"
 	"github.com/RenseiAI/agentfactory-tui/runtime/heartbeat"
 	"github.com/RenseiAI/agentfactory-tui/runtime/state"
 	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
 )
+
+// kitLoadSkills is the seam used for Kit skill loading in the runner
+// loop. It delegates to internal/kit.LoadSkills; isolated here so tests
+// can verify integration without a real KitRegistry on disk.
+var kitLoadSkills = kit.LoadSkills
 
 // runLoop drives the per-session orchestration steps in F.1.1 §4
 // order. Returns the in-progress Result (always non-nil) plus a
@@ -157,6 +163,33 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	defer mcpResult.Cleanup()
 
 	// 5. Render prompt.
+	//
+	// 5a. Collect Kit [provide.skills] contributions and inject them into
+	// the prompt builder before rendering. Skills are loaded in kit-priority
+	// order (higher priority → earlier position); unreadable files are
+	// skipped with a warning so a broken kit does not abort the session.
+	// Tool disallow rules scraped from SKILL.md frontmatter are carried
+	// forward to step 6 for application to the agent.Spec.
+	var kitDisallowedTools []string
+	if len(r.kitSkillSources) > 0 {
+		loaded, skillErr := kitLoadSkills(r.kitSkillSources)
+		if skillErr != nil {
+			r.logger.Warn("kit skill loader: partial load (some skill files skipped)",
+				"sessionId", qw.SessionID,
+				"err", skillErr,
+			)
+		}
+		r.promptBuilder.SkillAppend = loaded.SystemAppend
+		kitDisallowedTools = loaded.DisallowedTools
+		if loaded.SystemAppend != "" {
+			r.logger.Info("kit skills injected into system prompt",
+				"sessionId", qw.SessionID,
+				"skillBytes", len(loaded.SystemAppend),
+				"disallowCount", len(kitDisallowedTools),
+			)
+		}
+	}
+
 	systemPrompt, userPrompt, err := r.promptBuilder.Build(qw.QueuedWork)
 	if err != nil {
 		res.Status = "failed"
@@ -175,6 +208,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		Env:                composedEnv,
 		Autonomous:         true,
 	})
+	// Apply Kit skill tool disallow rules (subtractive: Kit skills may
+	// only narrow the tool surface, never widen it). Appended after the
+	// defaults produced by translateSpec so the Kit-declared restrictions
+	// are visible and auditable in the Spec.
+	if len(kitDisallowedTools) > 0 {
+		spec.DisallowedTools = append(spec.DisallowedTools, kitDisallowedTools...)
+	}
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.
