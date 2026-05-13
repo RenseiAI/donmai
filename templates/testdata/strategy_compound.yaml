@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: WorkflowTemplate
+metadata:
+  name: refinement-context-enriched
+  description: Refinement with enriched context for escalation cycle 2+
+  workType: refinement
+tools:
+  allow:
+    - shell: "rensei linear *"
+  disallow:
+    - user-input
+prompt: |
+  Re-examine {{identifier}} after {{cycleCount}} failed attempt(s).
+  {{#if failureSummary}}
+  Previous failures: {{failureSummary}}
+  {{/if}}

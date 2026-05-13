@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: WorkflowTemplate
+metadata:
+  name: development
+  description: Implement the feature/fix as specified
+  workType: development
+tools:
+  allow:
+    - shell: "pnpm *"
+    - shell: "git commit *"
+  disallow:
+    - user-input
+prompt: |
+  Start work on {{identifier}}.
+  {{#if mentionContext}}
+  Additional context: {{mentionContext}}
+  {{/if}}
