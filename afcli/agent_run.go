@@ -479,7 +479,31 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			MaxTokens:          d.StageBudget.MaxTokens,
 		}
 	}
-	if d.ResolvedProfile != nil {
+	// Honor dispatch.modelProfile (richer platform-resolved profile per
+	// ADR-2026-05-12-worktype-and-model-profile-routing) when present.
+	// It supersedes ResolvedProfile.Provider / Model / Effort so the
+	// runner uses the exact model the platform chose rather than the
+	// local-config fallback. Falls back to ResolvedProfile → default
+	// provider chain for backwards compat.
+	if d.ModelProfile != nil {
+		mp := runner.ResolvedModelProfile{
+			ID:              d.ModelProfile.ID,
+			ProviderID:      d.ModelProfile.ProviderID,
+			Model:           d.ModelProfile.Model,
+			Mode:            d.ModelProfile.Mode,
+			Context:         d.ModelProfile.Context,
+			MaxOutputTokens: d.ModelProfile.MaxOutputTokens,
+		}
+		// ToResolvedProfile bridges into the legacy QueuedWork shape so
+		// the runner loop's existing resolvedProvider() + translateSpec()
+		// paths consume it without change.
+		qw.ResolvedProfile = mp.ToResolvedProfile()
+		// Preserve CredentialID from ResolvedProfile when present — the
+		// platform may send it alongside ModelProfile.
+		if d.ResolvedProfile != nil && d.ResolvedProfile.CredentialID != "" {
+			qw.ResolvedProfile.CredentialID = d.ResolvedProfile.CredentialID
+		}
+	} else if d.ResolvedProfile != nil {
 		qw.ResolvedProfile = runner.ResolvedProfile{
 			Provider:       agent.ProviderName(d.ResolvedProfile.Provider),
 			Runner:         d.ResolvedProfile.Runner,
@@ -496,7 +520,13 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 // resolve for this detail, falling back through the same chain
 // runner.QueuedWork.resolvedProvider uses. Only used for log lines —
 // the runner does the authoritative resolution itself.
+//
+// Lookup order: ModelProfile.ProviderID → ResolvedProfile.Provider →
+// ResolvedProfile.Runner → default claude.
 func providerNameFromDetail(d *daemon.SessionDetail) string {
+	if d.ModelProfile != nil && d.ModelProfile.ProviderID != "" {
+		return d.ModelProfile.ProviderID
+	}
 	if d.ResolvedProfile == nil {
 		return string(agent.ProviderClaude)
 	}

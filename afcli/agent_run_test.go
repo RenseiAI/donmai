@@ -229,6 +229,129 @@ func TestDetailToQueuedWork(t *testing.T) {
 	}
 }
 
+// TestDetailToQueuedWork_ModelProfileSupersedesResolvedProfile verifies
+// that when dispatch.modelProfile is present it takes precedence over
+// the legacy resolvedProfile for provider selection.
+// This covers the H-lane dispatch wiring acceptance criterion.
+func TestDetailToQueuedWork_ModelProfileSupersedesResolvedProfile(t *testing.T) {
+	d := &daemon.SessionDetail{
+		SessionID:       "sess-mp-1",
+		IssueIdentifier: "REN-MP-1",
+		Body:            "test body",
+		WorkerID:        "wkr_mp",
+		AuthToken:       "tok_mp",
+		PlatformURL:     "https://app.example.com",
+		// Legacy profile says "claude" — should be overridden by ModelProfile.
+		ResolvedProfile: &daemon.SessionResolvedProfile{
+			Provider:     "claude",
+			Model:        "claude-sonnet-4-5",
+			CredentialID: "cred-abc",
+		},
+		// ModelProfile says "stub" with richer knobs — this wins.
+		ModelProfile: &daemon.SessionModelProfile{
+			ID:              "mp_test_h_lane",
+			ProviderID:      string(agent.ProviderStub),
+			Model:           "stub-v1",
+			Mode:            "xhigh",
+			Context:         1_000_000,
+			MaxOutputTokens: 32_000,
+		},
+	}
+	qw := detailToQueuedWork(d)
+
+	if qw.ResolvedProfile.Provider != agent.ProviderStub {
+		t.Errorf("Provider = %q; want %q (ModelProfile should supersede ResolvedProfile)", qw.ResolvedProfile.Provider, agent.ProviderStub)
+	}
+	if qw.ResolvedProfile.Model != "stub-v1" {
+		t.Errorf("Model = %q; want %q", qw.ResolvedProfile.Model, "stub-v1")
+	}
+	if qw.ResolvedProfile.Effort != agent.EffortXHigh {
+		t.Errorf("Effort = %q; want xhigh", qw.ResolvedProfile.Effort)
+	}
+	// CredentialID must be preserved from ResolvedProfile even when ModelProfile is present.
+	if qw.ResolvedProfile.CredentialID != "cred-abc" {
+		t.Errorf("CredentialID = %q; want %q", qw.ResolvedProfile.CredentialID, "cred-abc")
+	}
+	// ProviderConfig should carry context + maxOutputTokens from ModelProfile.
+	if qw.ResolvedProfile.ProviderConfig == nil {
+		t.Fatal("ProviderConfig is nil; expected context window knobs")
+	}
+	if v, ok := qw.ResolvedProfile.ProviderConfig["contextWindow"]; !ok || v != 1_000_000 {
+		t.Errorf("ProviderConfig[contextWindow] = %v; want 1000000", v)
+	}
+}
+
+// TestDetailToQueuedWork_FallsBackToResolvedProfileWhenNoModelProfile
+// verifies the legacy path is intact: when ModelProfile is absent,
+// ResolvedProfile is used as-is (backwards compat).
+func TestDetailToQueuedWork_FallsBackToResolvedProfileWhenNoModelProfile(t *testing.T) {
+	d := &daemon.SessionDetail{
+		SessionID:       "sess-mp-2",
+		IssueIdentifier: "REN-MP-2",
+		Body:            "test body",
+		WorkerID:        "wkr_mp",
+		AuthToken:       "tok_mp",
+		PlatformURL:     "https://app.example.com",
+		ResolvedProfile: &daemon.SessionResolvedProfile{
+			Provider: string(agent.ProviderStub),
+			Model:    "stub-legacy",
+			Effort:   "medium",
+		},
+		// ModelProfile intentionally absent.
+	}
+	qw := detailToQueuedWork(d)
+
+	if qw.ResolvedProfile.Provider != agent.ProviderStub {
+		t.Errorf("Provider = %q; want stub", qw.ResolvedProfile.Provider)
+	}
+	if qw.ResolvedProfile.Model != "stub-legacy" {
+		t.Errorf("Model = %q; want stub-legacy", qw.ResolvedProfile.Model)
+	}
+	if qw.ResolvedProfile.Effort != agent.EffortMedium {
+		t.Errorf("Effort = %q; want medium", qw.ResolvedProfile.Effort)
+	}
+}
+
+// TestDetailToQueuedWork_ModelProfileEmptyProviderIDFallback verifies
+// that an empty ProviderID in ModelProfile falls through to claude (same
+// fallback as ResolvedModelProfile.SelectProvider).
+func TestDetailToQueuedWork_ModelProfileEmptyProviderIDFallback(t *testing.T) {
+	d := &daemon.SessionDetail{
+		SessionID:       "sess-mp-3",
+		IssueIdentifier: "REN-MP-3",
+		Body:            "test body",
+		WorkerID:        "wkr_mp",
+		AuthToken:       "tok_mp",
+		PlatformURL:     "https://app.example.com",
+		ModelProfile: &daemon.SessionModelProfile{
+			ID:    "mp_no_provider",
+			Model: "some-model",
+			// ProviderID intentionally empty.
+		},
+	}
+	qw := detailToQueuedWork(d)
+
+	// Empty ProviderID in ModelProfile → ToResolvedProfile → Provider=""
+	// → resolvedProvider() falls back to claude in the runner.
+	// We just assert the conversion did not panic and the profile is set.
+	if qw.ResolvedProfile.Model != "some-model" {
+		t.Errorf("Model = %q; want some-model", qw.ResolvedProfile.Model)
+	}
+}
+
+// TestProviderNameFromDetail_PrefersModelProfile verifies the log-line
+// helper reads ModelProfile.ProviderID first.
+func TestProviderNameFromDetail_PrefersModelProfile(t *testing.T) {
+	d := &daemon.SessionDetail{
+		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "claude"},
+		ModelProfile:    &daemon.SessionModelProfile{ProviderID: "gemini"},
+	}
+	got := providerNameFromDetail(d)
+	if got != "gemini" {
+		t.Errorf("providerNameFromDetail = %q; want gemini (ModelProfile takes priority)", got)
+	}
+}
+
 // TestBuildAgentRunRegistry_AlwaysHasStub asserts that the stub
 // provider is always present, regardless of whether the host has
 // claude / codex installed.

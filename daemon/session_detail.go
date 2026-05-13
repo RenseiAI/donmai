@@ -76,6 +76,13 @@ type SessionDetail struct {
 	// resolved before queueing this work. Daemon stores opaquely.
 	ResolvedProfile *SessionResolvedProfile `json:"resolvedProfile,omitempty"`
 
+	// ModelProfile is the richer, fully-rendered model-profile the
+	// platform passes with each dispatch when workType+model-profile
+	// routing is active (ADR-2026-05-12-worktype-and-model-profile-
+	// routing). When present it supersedes ResolvedProfile.Provider /
+	// Model / Effort in the runner. Forwarded opaquely by the daemon.
+	ModelProfile *SessionModelProfile `json:"modelProfile,omitempty"`
+
 	// WorkerID is the daemon worker id that claimed this session.
 	WorkerID string `json:"workerId,omitempty"`
 
@@ -125,6 +132,36 @@ type SessionResolvedProfile struct {
 	Effort         string         `json:"effort,omitempty"`
 	CredentialID   string         `json:"credentialId,omitempty"`
 	ProviderConfig map[string]any `json:"providerConfig,omitempty"`
+}
+
+// SessionModelProfile mirrors runner.ResolvedModelProfile but lives in
+// the daemon package to avoid an import cycle. It carries the richer
+// fully-rendered model-profile the platform resolves via the three-axis
+// workType + model-profile routing algorithm
+// (ADR-2026-05-12-worktype-and-model-profile-routing). The daemon
+// forwards it opaquely; `af agent run` bridges it into
+// runner.ResolvedModelProfile via detailToQueuedWork.
+type SessionModelProfile struct {
+	// ID is the model_profile row UUID (e.g. "mp_01jt5...").
+	ID string `json:"id"`
+
+	// ProviderID is the canonical provider family (e.g. "claude", "codex",
+	// "gemini", "ollama").
+	ProviderID string `json:"providerId"`
+
+	// Model is the model variant within the provider family.
+	Model string `json:"model"`
+
+	// Mode is the reasoning-effort/speed tier (e.g. "xhigh").
+	Mode string `json:"mode,omitempty"`
+
+	// Context is the context-window size in tokens required for this
+	// dispatch. Zero means "use the model default".
+	Context int `json:"context,omitempty"`
+
+	// MaxOutputTokens is the per-response output-token budget. Zero
+	// means "use the model default".
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
 }
 
 // sessionDetailStore holds the per-session payloads the daemon hands

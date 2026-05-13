@@ -65,6 +65,7 @@ type PollWorkItem struct {
 	ParentContext     string                  `json:"parentContext,omitempty"`
 	Branch            string                  `json:"branch,omitempty"`
 	ResolvedProfile   *SessionResolvedProfile `json:"resolvedProfile,omitempty"`
+	ModelProfile      *SessionModelProfile    `json:"modelProfile,omitempty"`
 
 	// REN-1485 / REN-1487 Phase 2 stage-driven SDLC fields. Populated
 	// by the platform's `agent.dispatch_stage` action; absent when the
@@ -559,6 +560,7 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		ParentContext:      item.ParentContext,
 		Branch:             item.Branch,
 		ResolvedProfile:    item.ResolvedProfile,
+		ModelProfile:       item.ModelProfile,
 		WorkerID:           workerID,
 		AuthToken:          authToken,
 		PlatformURL:        platformURL,
