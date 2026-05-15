@@ -2,7 +2,7 @@
 
 > **Status: alpha** — APIs and command flags are stabilising. See [CHANGELOG.md](./CHANGELOG.md) for the change log and [RELEASING.md](./RELEASING.md) for the release process.
 
-`af` is the open-source CLI and terminal dashboard for AgentFactory AI agent fleets. It is the single binary for every OSS operator task: running the three-process stack locally, managing agents and sessions, querying Linear, and inspecting fleet health.
+`af` is the open-source CLI and terminal dashboard for AgentFactory AI agent fleets. It is the single binary for every OSS operator task: running the three-process stack locally, managing agents and sessions, querying issue trackers, and inspecting fleet health.
 
 **Binary**: `af`
 **Module**: `github.com/RenseiAI/agentfactory-tui`
@@ -24,6 +24,7 @@
   - [af orchestrator](#af-orchestrator)
   - [af logs](#af-logs)
   - [af linear](#af-linear)
+  - [af github](#af-github)
   - [af code](#af-code)
   - [af arch](#af-arch)
   - [af admin](#af-admin)
@@ -301,6 +302,34 @@ af linear create-blocker <source-issue-id> --title "..."
 ```
 
 **Authentication**: set `LINEAR_API_KEY` (or `LINEAR_ACCESS_TOKEN`).
+
+### `af github`
+
+GitHub Issues operations. Mirrors the `af linear` surface adapted to GitHub
+Issues vocabulary. All subcommands output JSON.
+
+```bash
+af github get-issue     --repo owner/repo --number 42
+af github create-issue  --repo owner/repo --title "Bug: ..." [--body "..."] [--labels "bug,enhancement"] [--assignees "alice"]
+af github update-issue  --repo owner/repo --number 42 [--title "..."] [--state open|closed]
+af github list-issues   --repo owner/repo [--state open|closed|all] [--labels "..."] [--assignee "alice"] [--limit 50]
+af github list-comments --repo owner/repo --number 42
+af github create-comment --repo owner/repo --number 42 --body "..." [--body-file /path]
+af github add-labels    --repo owner/repo --number 42 --labels "bug,priority:high"
+af github set-assignees --repo owner/repo --number 42 --assignees "alice,bob"
+af github close-issue   --repo owner/repo --number 42 [--comment "Resolved in v2.0"]
+af github reopen-issue  --repo owner/repo --number 42 [--comment "Reopening for follow-up"]
+af github list-labels   --repo owner/repo
+af github get-repo      --repo owner/repo
+```
+
+**Owner/repo shorthand**: `--repo owner/repo` sets both owner and repo.
+`--owner` and `--repo` also read `GITHUB_OWNER` / `GITHUB_REPO` env vars.
+
+**Authentication**: set `GITHUB_TOKEN` (personal access token, fine-grained
+token, or GitHub App installation token). When running under a platform login
+session, GitHub calls are proxied through the platform's connected GitHub App
+installation credential instead.
 
 ### `af code`
 

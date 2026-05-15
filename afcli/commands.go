@@ -136,6 +136,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newCodeCmd())
 	root.AddCommand(newArchCmd())
 	root.AddCommand(newLinearCmd(ds))
+	root.AddCommand(newGitHubCmd(ds))
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newAdminCmd())
 	root.AddCommand(newProviderCmd(ds))
