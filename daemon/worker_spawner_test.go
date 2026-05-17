@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -244,6 +246,280 @@ func TestSpawner_ActiveWorkareas_DeterministicOrdering(t *testing.T) {
 		if got[i].SessionID != w {
 			t.Errorf("entry %d: want %q, got %q", i, w, got[i].SessionID)
 		}
+	}
+}
+
+// captureWriter is a PrefixedWriter that accumulates child stdout lines
+// for assertion. Tests use it together with a /bin/sh worker that prints
+// env entries so we can verify the env actually exec'd by the child.
+type captureWriter struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (c *captureWriter) WriteWorkerLine(_, line string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lines = append(c.lines, line)
+}
+
+func (c *captureWriter) snapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.lines))
+	copy(out, c.lines)
+	return out
+}
+
+// waitForLine polls the captured stdout buffer until `substr` appears or
+// the deadline expires. Returns the captured snapshot for further checks.
+func waitForLine(t *testing.T, cap *captureWriter, substr string, timeout time.Duration) []string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		snap := cap.snapshot()
+		for _, l := range snap {
+			if strings.Contains(l, substr) {
+				return snap
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cap.snapshot()
+}
+
+// TestSpawner_OnPreSpawn_Invoked verifies the hook fires exactly once per
+// spawn and receives the SessionSpec the daemon was asked to spawn.
+func TestSpawner_OnPreSpawn_Invoked(t *testing.T) {
+	var (
+		calls    int32
+		gotSpec  SessionSpec
+		gotEnv   []string
+		recordMu sync.Mutex
+	)
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn: func(spec SessionSpec, env []string) []string {
+			atomic.AddInt32(&calls, 1)
+			recordMu.Lock()
+			gotSpec = spec
+			gotEnv = append([]string(nil), env...)
+			recordMu.Unlock()
+			return nil
+		},
+	})
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-pre-1",
+		Repository: "github.com/a/b",
+		Ref:        "main",
+	}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("OnPreSpawn call count: want 1, got %d", got)
+	}
+	recordMu.Lock()
+	defer recordMu.Unlock()
+	if gotSpec.SessionID != "sess-pre-1" {
+		t.Errorf("OnPreSpawn spec.SessionID: want %q, got %q", "sess-pre-1", gotSpec.SessionID)
+	}
+	// The hook must run AFTER composeEnv so it sees the daemon's own
+	// per-session injections (RENSEI_SESSION_ID etc).
+	found := false
+	for _, kv := range gotEnv {
+		if kv == "RENSEI_SESSION_ID=sess-pre-1" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("OnPreSpawn env: missing post-composeEnv RENSEI_SESSION_ID; got %v", gotEnv)
+	}
+}
+
+// TestSpawner_OnPreSpawn_SeesBaseEnv proves the hook receives the
+// post-merge env — i.e., BaseEnv entries are visible before the hook
+// runs, so callers can selectively override them.
+func TestSpawner_OnPreSpawn_SeesBaseEnv(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		gotEnv []string
+	)
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		BaseEnv:               map[string]string{"BASE_KEY": "base-value"},
+		OnPreSpawn: func(_ SessionSpec, env []string) []string {
+			mu.Lock()
+			gotEnv = append([]string(nil), env...)
+			mu.Unlock()
+			return nil
+		},
+	})
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-base-1",
+		Repository: "github.com/a/b",
+	}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, kv := range gotEnv {
+		if kv == "BASE_KEY=base-value" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("OnPreSpawn did not see BaseEnv entry; got %v", gotEnv)
+	}
+}
+
+// TestSpawner_OnPreSpawn_ReturnedEnvIsExeced verifies that the slice the
+// hook returns is what reaches the child process. A sentinel key inserted
+// by the hook is echoed by the worker stub and surfaces via the prefix
+// writer.
+func TestSpawner_OnPreSpawn_ReturnedEnvIsExeced(t *testing.T) {
+	cap := &captureWriter{}
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'sentinel=%s\n' "$ONPRESPAWN_SENTINEL"; exit 0`},
+		StdoutPrefixWriter:    cap,
+		OnPreSpawn: func(_ SessionSpec, env []string) []string {
+			return append(env, "ONPRESPAWN_SENTINEL=hello-from-hook")
+		},
+	})
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-exec-1",
+		Repository: "github.com/a/b",
+	}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	lines := waitForLine(t, cap, "sentinel=", 2*time.Second)
+	want := "sentinel=hello-from-hook"
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, want) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("child env did not include hook-supplied sentinel; got lines %v", lines)
+	}
+}
+
+// TestSpawner_OnPreSpawn_OverridesBaseEnv proves the hook can override an
+// existing BaseEnv key. The exec'd env contains the LAST occurrence of a
+// given key per Go's exec semantics, so appending an override after the
+// input slice is the documented way for callers to win against BaseEnv.
+func TestSpawner_OnPreSpawn_OverridesBaseEnv(t *testing.T) {
+	cap := &captureWriter{}
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		BaseEnv:               map[string]string{"OVERRIDE_ME": "base-value"},
+		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'override=%s\n' "$OVERRIDE_ME"; exit 0`},
+		StdoutPrefixWriter:    cap,
+		OnPreSpawn: func(_ SessionSpec, env []string) []string {
+			return append(env, "OVERRIDE_ME=hook-wins")
+		},
+	})
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-override-1",
+		Repository: "github.com/a/b",
+	}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	lines := waitForLine(t, cap, "override=", 2*time.Second)
+	want := "override=hook-wins"
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, want) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("hook did not override BaseEnv key; got lines %v", lines)
+	}
+}
+
+// TestSpawner_OnPreSpawn_NilReturnUsesInput verifies that a hook returning
+// nil is a no-op — the env composeEnv produced is what reaches the child.
+func TestSpawner_OnPreSpawn_NilReturnUsesInput(t *testing.T) {
+	cap := &captureWriter{}
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		BaseEnv:               map[string]string{"BASE_KEY": "base-value"},
+		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'base=%s\n' "$BASE_KEY"; exit 0`},
+		StdoutPrefixWriter:    cap,
+		OnPreSpawn: func(_ SessionSpec, _ []string) []string {
+			return nil
+		},
+	})
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-nilret-1",
+		Repository: "github.com/a/b",
+	}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	lines := waitForLine(t, cap, "base=", 2*time.Second)
+	want := "base=base-value"
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, want) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("nil-return hook should leave env unchanged; got lines %v", lines)
+	}
+}
+
+// TestSpawner_OnPreSpawn_NilHookNoPanic exercises the zero-value path:
+// SpawnerOptions with OnPreSpawn unset must spawn normally without
+// panicking and without altering the env contract.
+func TestSpawner_OnPreSpawn_NilHookNoPanic(t *testing.T) {
+	cap := &captureWriter{}
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		BaseEnv:               map[string]string{"BASE_KEY": "base-value"},
+		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'nohook=%s\n' "$BASE_KEY"; exit 0`},
+		StdoutPrefixWriter:    cap,
+		// OnPreSpawn intentionally left nil.
+	})
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-nohook-1",
+		Repository: "github.com/a/b",
+	}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	lines := waitForLine(t, cap, "nohook=", 2*time.Second)
+	want := "nohook=base-value"
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, want) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("nil hook should preserve BaseEnv; got lines %v", lines)
 	}
 }
 
