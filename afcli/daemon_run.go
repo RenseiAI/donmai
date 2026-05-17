@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	afcreds "github.com/RenseiAI/agentfactory-tui/afcli/credentials"
 	"github.com/RenseiAI/agentfactory-tui/daemon"
 	"github.com/RenseiAI/agentfactory-tui/runner"
 )
@@ -23,11 +24,12 @@ import (
 // command is what runs on those service managers.
 func newDaemonRunCmd(hostVersion string) *cobra.Command {
 	var (
-		configPath string
-		jwtPath    string
-		host       string
-		port       int
-		skipWizard bool
+		configPath      string
+		jwtPath         string
+		host            string
+		port            int
+		skipWizard      bool
+		standaloneCreds string
 	)
 
 	cmd := &cobra.Command{
@@ -63,6 +65,42 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			if port == 0 {
 				port = daemon.DefaultHTTPPort
 			}
+
+			// Standalone-creds wiring (Lane K). When `af` is running
+			// outside of rensei-tui (no daemon credential pipeline,
+			// no platform session), agents inherit credentials from
+			// the af process per the precedence:
+			//   1. existing process env
+			//   2. ${gitRoot}/.env.local (parsed once at startup)
+			//
+			// Auto-detect mode: absence of RENSEI_DAEMON_JWT means we
+			// are NOT being driven by rensei-tui's credential socket
+			// and should seed env from the local source. Operators
+			// can pin the mode via --standalone-creds=on|off.
+			errOut := cmd.ErrOrStderr()
+			localSource, lsErr := afcreds.LoadLocalSource(resolveStandaloneGitRoot())
+			if lsErr != nil {
+				_, _ = fmt.Fprintf(errOut, "[creds] LoadLocalSource: %v (continuing with process env only)\n", lsErr)
+				localSource = nil
+			}
+			mode := resolveStandaloneCredsMode(standaloneCreds, os.Getenv("RENSEI_DAEMON_JWT") != "")
+			spawnerOpts := daemon.SpawnerOptions{}
+			if mode && localSource != nil {
+				spawnerOpts.BaseEnv = localSource.MergeIntoBaseEnv(nil)
+				_, _ = fmt.Fprintf(errOut,
+					"[creds] standalone mode active — merging process env + %s into spawner BaseEnv\n",
+					displayEnvLocalPath(localSource),
+				)
+			} else if localSource != nil {
+				// Diagnostic-only: load but don't seed. The daemon's
+				// own credential pipeline (rensei-tui driven) owns
+				// agent env in this mode.
+				slog.Debug("standalone creds disabled — LocalSource loaded read-only",
+					"envLocalPath", localSource.EnvLocalPath(),
+					"fileEnvKeyCount", len(localSource.FileEnvKeys()),
+				)
+			}
+
 			d := daemon.New(daemon.Options{
 				ConfigPath:       configPath,
 				JWTPath:          jwtPath,
@@ -70,13 +108,13 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 				HTTPPort:         port,
 				SkipWizard:       skipWizard,
 				ProviderRegistry: runner.NewProviderView(providerReg),
+				SpawnerOptions:   spawnerOpts,
 				Version:          hostVersion,
 			})
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 
 			out := cmd.OutOrStdout()
-			errOut := cmd.ErrOrStderr()
 			if err := d.Start(ctx); err != nil {
 				return fmt.Errorf("daemon start: %w", err)
 			}
@@ -127,8 +165,66 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 	cmd.Flags().StringVar(&host, "host", "", "HTTP bind host (default: 127.0.0.1)")
 	cmd.Flags().IntVar(&port, "port", 0, "HTTP bind port (default: 7734)")
 	cmd.Flags().BoolVar(&skipWizard, "skip-wizard", false, "Skip the first-run setup wizard")
+	cmd.Flags().StringVar(&standaloneCreds, "standalone-creds", "auto",
+		"Standalone credential mode (on|off|auto). When on, AF-TUI seeds child agent env from process env + ${gitRoot}/.env.local. When auto, on is selected when RENSEI_DAEMON_JWT is unset (i.e. not running under rensei-tui).")
 
 	return cmd
+}
+
+// resolveStandaloneCredsMode returns true when AF-TUI should seed agent
+// env from the LocalSource. Behaviour by flag value:
+//
+//   - "on"   → always seed.
+//   - "off"  → never seed (rensei-tui or other credential pipeline owns env).
+//   - "auto" → seed iff !daemonJWTPresent (no RENSEI_DAEMON_JWT in env).
+//
+// Unknown values fall back to "auto" with a slog.Warn — operators get a
+// surfaced misconfiguration but the daemon does not refuse to start.
+func resolveStandaloneCredsMode(flagValue string, daemonJWTPresent bool) bool {
+	switch strings.ToLower(strings.TrimSpace(flagValue)) {
+	case "on", "true", "yes", "1":
+		return true
+	case "off", "false", "no", "0":
+		return false
+	case "", "auto":
+		return !daemonJWTPresent
+	default:
+		slog.Warn("--standalone-creds: unknown value, falling back to auto", "value", flagValue)
+		return !daemonJWTPresent
+	}
+}
+
+// resolveStandaloneGitRoot returns the gitRoot used to locate the
+// daemon's .env.local. Falls back to the current working directory when
+// `git rev-parse` is unavailable (which is the common case for the
+// launchd / systemd entry point — they run from `/` and have no git
+// state). Returning "" makes LocalSource skip the file lookup entirely,
+// which is the desired behaviour.
+func resolveStandaloneGitRoot() string {
+	if root, err := gitRoot(); err == nil && root != "" {
+		return root
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	// Only return the cwd when an .env.local actually exists there;
+	// otherwise leave it empty so we don't spuriously stat a file in
+	// `/` or similar.
+	if _, err := os.Stat(cwd + "/.env.local"); err == nil {
+		return cwd
+	}
+	return ""
+}
+
+// displayEnvLocalPath returns a human-readable path label for the
+// startup [creds] log line — falls back to "(no .env.local)" when the
+// local source did not parse a file.
+func displayEnvLocalPath(s *afcreds.LocalSource) string {
+	if s == nil || s.EnvLocalPath() == "" {
+		return "(no .env.local)"
+	}
+	return s.EnvLocalPath()
 }
 
 // formatStartupWorkerLine returns the post-Start `[daemon] worker-id ...`
