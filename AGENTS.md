@@ -167,3 +167,48 @@ the full QueuedWork payload from the daemon's local control API, builds a
 runner.Registry with stub + claude + codex (best-effort), and invokes
 `runner.Runner`. Operators rarely invoke this manually; see
 `daemon/README.md`'s operator runbook for debugging tips.
+
+## Credentials in standalone mode (no daemon, no platform)
+
+When `af` runs OUTSIDE of rensei-tui (no daemon credential pipeline, no
+platform session), agents inherit credentials from the af process per a
+fixed two-tier precedence:
+
+| Precedence | Source                                | Notes                                                                 |
+| ---------- | ------------------------------------- | --------------------------------------------------------------------- |
+| 1          | AF-TUI process env (`os.Environ()`)   | Anything the operator `export`'d before launching `af`.               |
+| 2          | `${gitRoot}/.env.local`               | Parsed once at af startup; never copied into spawned worktrees.       |
+| Fail-open  | Redacted stderr warning               | `[creds] no source for KEY — agent may fail` per missing variable.    |
+
+Sources are merged at `daemon run` time into `SpawnerOptions.BaseEnv` so
+the standard child-spawn path picks them up. The merge order respects
+the precedence above: process env wins over `.env.local`, and any
+caller-supplied `BaseEnv` entry (set by daemon code, not the operator)
+wins over both.
+
+`AGENT_ENV_BLOCKLIST` is the single source of truth in
+`internal/credentials/blocklist.go`. It captures the daemon's own auth
+surface — `RENSEI_DAEMON_JWT`, `WORKER_API_KEY`, `M2M_JWT_SECRET`, …
+— that must never bleed into a child agent regardless of source. The
+rensei-tui daemon hardcodes the same list in
+`daemon/credentials/socket.go`; the two stay in sync manually until
+the OSS boundary permits a shared import.
+
+Operators can pin the mode via `af daemon run --standalone-creds=<on|off|auto>`.
+The default is `auto`, which selects `on` when `RENSEI_DAEMON_JWT` is
+unset (i.e. AF-TUI is NOT being driven by rensei-tui's credential
+socket) and `off` otherwise.
+
+Security guardrails:
+
+- AF-TUI never copies `.env.local` into the worktree — the file stays
+  at `${gitRoot}`; only the parsed values live in the AF-TUI process
+  memory and are forwarded through child env.
+- `.env.local` paths are resolved from `gitRoot` only; AF-TUI does NOT
+  walk parent directories looking for one.
+- World-readable `.env.local` triggers a one-time stderr warning
+  recommending `chmod 600`; the file is still parsed.
+- Values are never echoed to stdout/stderr/logs — log lines reference
+  variable names only.
+- Malformed `.env.local` lines are non-fatal: the variable name is
+  logged with line number; the value side is dropped.

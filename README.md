@@ -13,6 +13,7 @@
 
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Credentials in standalone mode (no daemon, no platform)](#credentials-in-standalone-mode-no-daemon-no-platform)
 - [Three-process model](#three-process-model)
 - [Command catalog](#command-catalog)
   - [af status](#af-status)
@@ -91,6 +92,27 @@ af agent list
 # 5. Tail logs from the log analyzer
 af logs analyze --input ~/.rensei/logs/agent.log
 ```
+
+---
+
+## Credentials in standalone mode (no daemon, no platform)
+
+When you run `af` outside of rensei-tui (standalone OSS mode), agents
+inherit credentials from the af process. There are two sources, in
+this order:
+
+  1. Existing environment variables in the af process
+  2. .env.local at the root of the working directory
+
+The first source that defines a variable wins. .env.local is read once
+at af startup and never copied into worktrees.
+
+Some variables (the daemon's own auth tokens) are blocked from forwarding
+regardless of source; see internal/credentials/blocklist.go.
+
+If you want secrets sourced from 1Password instead of a flat file, see
+the optional `op` CLI integration (run `af creds setup` for the
+walkthrough).
 
 ---
 
