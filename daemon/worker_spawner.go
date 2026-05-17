@@ -38,6 +38,26 @@ type SpawnerOptions struct {
 	// BaseEnv is the environment injected into every worker process.
 	BaseEnv map[string]string
 
+	// OnPreSpawn is an optional hook invoked once per spawn, immediately
+	// before the child process is exec'd. It receives the final SessionSpec
+	// and the env slice that would otherwise be exec'd, and returns the env
+	// slice that will actually be exec'd. Returning nil is equivalent to
+	// returning the input unchanged.
+	//
+	// Callers may use this to layer per-session env entries (e.g.,
+	// credentials resolved at spawn time) over the spawner's BaseEnv.
+	// BaseEnv is set once at spawner construction and cannot express
+	// per-session values; this hook is the extension point for callers
+	// that need to compute env entries from the inbound SessionSpec.
+	//
+	// The hook runs AFTER the BaseEnv + SessionSpec.Env composition, so
+	// returned entries can both add new keys and override BaseEnv keys.
+	//
+	// The hook MUST NOT block on I/O paths that can hang indefinitely.
+	// Spawn latency budget is on the order of 250ms; if the hook needs
+	// to do I/O, it should have its own timeout.
+	OnPreSpawn func(spec SessionSpec, env []string) []string
+
 	// Now lets tests deterministically clock acceptedAt timestamps.
 	Now func() time.Time
 	// Stdout is where worker stdout is forwarded with a "[worker:<id>]"
@@ -282,6 +302,17 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		"RENSEI_REF":        spec.Ref,
 		"RENSEI_PROJECT_ID": project.ID,
 	})
+
+	// OnPreSpawn is the extension point for callers that need to compute
+	// per-session env entries (e.g., credentials resolved at spawn time)
+	// the static BaseEnv map cannot express. It runs after composeEnv so
+	// the returned slice can add or override anything BaseEnv + spec.Env
+	// produced. A nil return is a no-op.
+	if s.opts.OnPreSpawn != nil {
+		if next := s.opts.OnPreSpawn(spec, cmd.Env); next != nil {
+			cmd.Env = next
+		}
+	}
 
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
