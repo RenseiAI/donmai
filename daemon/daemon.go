@@ -128,6 +128,11 @@ type Daemon struct {
 	// re-register against pool X" without parsing daemon.log. Phase 2e.
 	lastHostStatus *HostStatusDetail
 
+	// yamlWatcherStop is the cancel function for the fsnotify goroutine
+	// that hot-reloads daemon.yaml on direct edits. Phase 3b — nil when
+	// either ConfigPath is empty or the watcher failed to start.
+	yamlWatcherStop func()
+
 	// sessionDetails stores the per-session payload the spawner
 	// hands out to `af agent run` workers via the local control
 	// HTTP API at /api/daemon/sessions/<id>. (REN-1461 / F.2.8.)
@@ -563,8 +568,60 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
+	// Phase 3b: hot-reload daemon.yaml on direct edits. Without this,
+	// `vim ~/.rensei/daemon.yaml` then :w leaves the running daemon with
+	// stale in-memory state until restart — a real silent-staleness gap
+	// the design doc flagged. fsnotify-driven reload makes operator edits
+	// take effect within a coalesce window and pushes the new allowlist
+	// into the spawner. The platform sees the changed hash on the next
+	// heartbeat and emits daemon.allowlist.reported automatically.
+	if d.opts.ConfigPath != "" {
+		stop, err := startYamlWatcher(ctx, d.opts.ConfigPath, d.onYamlChanged)
+		if err != nil {
+			slog.Warn("daemon: yaml watcher disabled",
+				"path", d.opts.ConfigPath, "err", err.Error())
+		} else {
+			d.yamlWatcherStop = stop
+		}
+	}
+
 	d.setState(StateRunning)
 	return nil
+}
+
+// onYamlChanged is the fsnotify callback wired in Start(). Called whenever
+// daemon.yaml is rewritten on disk (operator edit or our own mutation-apply
+// path). Replaces the in-memory project list and pushes it into the
+// spawner; the heartbeat goroutine's next beat will detect the new hash
+// and report up to the platform.
+//
+// Defensive: only mutates state when projects[] actually differs from the
+// in-memory copy. Other fields (capacity, orchestrator URL) are NOT
+// hot-reloaded — those touch listeners we don't currently support
+// re-binding live.
+func (d *Daemon) onYamlChanged(cfg *Config) {
+	d.mu.Lock()
+	if d.config == nil {
+		d.mu.Unlock()
+		return
+	}
+	// Cheap equality check on the structured allowlist projection — same
+	// shape the heartbeat reports, so this exactly matches "what the
+	// platform would see change".
+	before := allowlistEntriesFromConfig(d.config.Projects)
+	after := allowlistEntriesFromConfig(cfg.Projects)
+	if allowlistHash(before) == allowlistHash(after) {
+		d.mu.Unlock()
+		return
+	}
+	d.config.Projects = cfg.Projects
+	d.mu.Unlock()
+
+	slog.Info("[yaml-watcher] reloaded projects",
+		"beforeCount", len(before), "afterCount", len(after))
+	if d.spawner != nil {
+		d.spawner.SetProjects(cfg.Projects)
+	}
 }
 
 // Stop performs a graceful shutdown: drain in-flight sessions, stop loops,
@@ -589,6 +646,10 @@ func (d *Daemon) Stop(_ context.Context) error {
 	}
 	if d.poller != nil {
 		d.poller.Stop()
+	}
+	if d.yamlWatcherStop != nil {
+		d.yamlWatcherStop()
+		d.yamlWatcherStop = nil
 	}
 	d.stopOnce.Do(func() { close(d.doneCh) })
 	d.setState(StateStopped)
