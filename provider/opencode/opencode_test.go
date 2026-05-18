@@ -274,7 +274,12 @@ func TestProvider_Spawn_FakeCLI_NDJSON(t *testing.T) {
 	scriptPath := writeFakeOpenCodeScript(t)
 	p := &Provider{binary: scriptPath}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	// 30s ceiling: in normal conditions the fixture completes in <50ms
+	// (collectUntilResult returns immediately on ResultEvent). The
+	// generous timeout exists only as a -race + full-suite-load safety
+	// net so fork/exec + scanner setup latency under contention doesn't
+	// time-bomb a deterministic NDJSON fixture.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	h, err := p.Spawn(ctx, agent.Spec{Prompt: "list files"})
@@ -286,8 +291,18 @@ func TestProvider_Spawn_FakeCLI_NDJSON(t *testing.T) {
 	}
 	defer func() { _ = h.Stop(context.Background()) }()
 
-	// Drain events until terminal ResultEvent + idle, or hard deadline.
-	events := collectUntilResult(t, h, 5*time.Second)
+	// Drain events until we observe a terminal ResultEvent OR the
+	// spawn ctx fires. The opencode Handle keeps the events channel
+	// open after the subprocess exits (mirroring claude's Inject
+	// support), so we cannot range-until-close here — but ResultEvent
+	// (from step_finish reason=stop) is the terminal sentinel from
+	// the NDJSON stream and the parent reader emits no further events
+	// after it. Tying the deadline to the spawn ctx (channel-based)
+	// instead of a wall-clock hardDeadline keeps the test resilient
+	// under -race + full-suite load where fork/exec + bufio.Scanner
+	// can take >5s before the first line reaches the consumer
+	// goroutine.
+	events := collectUntilResult(ctx, t, h)
 
 	var gotInit, gotAssistant, gotResult bool
 	for _, ev := range events {
@@ -312,32 +327,30 @@ func TestProvider_Spawn_FakeCLI_NDJSON(t *testing.T) {
 }
 
 // collectUntilResult drains events from h until a terminal ResultEvent
-// is seen and a 300 ms idle elapses, or until the hard deadline fires.
-func collectUntilResult(t *testing.T, h agent.Handle, hardDeadline time.Duration) []agent.Event {
+// is observed, the events channel closes, or ctx fires. The fixture
+// NDJSON stream is deterministic — step_start, text, step_finish — and
+// the parent reader emits no events after the terminal step_finish
+// reason=stop (which maps to ResultEvent), so we can return the moment
+// we see it without an extra idle wait. ctx (the same one passed to
+// Spawn) is the cancellation signal: tying the test deadline to the
+// spawn lifetime instead of a hard-coded wall-clock value avoids the
+// -race + full-suite-load flake where fork/exec + bufio.Scanner could
+// take longer than a fixed deadline.
+func collectUntilResult(ctx context.Context, t *testing.T, h agent.Handle) []agent.Event {
 	t.Helper()
 	var got []agent.Event
-	timer := time.NewTimer(hardDeadline)
-	defer timer.Stop()
 	for {
-		var idleCh <-chan time.Time
-		for _, ev := range got {
-			if _, ok := ev.(agent.ResultEvent); ok {
-				idle := time.NewTimer(300 * time.Millisecond)
-				defer idle.Stop()
-				idleCh = idle.C
-				break
-			}
-		}
 		select {
 		case ev, ok := <-h.Events():
 			if !ok {
 				return got
 			}
 			got = append(got, ev)
-		case <-idleCh:
-			return got
-		case <-timer.C:
-			t.Logf("collectUntilResult: hard deadline after %d events", len(got))
+			if _, ok := ev.(agent.ResultEvent); ok {
+				return got
+			}
+		case <-ctx.Done():
+			t.Logf("collectUntilResult: ctx cancelled after %d events: %v", len(got), ctx.Err())
 			return got
 		}
 	}
