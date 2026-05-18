@@ -4,6 +4,7 @@
 package afcli
 
 import (
+	"github.com/RenseiAI/agentfactory-tui/afcli/credentials"
 	"github.com/RenseiAI/agentfactory-tui/afclient"
 	"github.com/spf13/cobra"
 )
@@ -139,6 +140,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newGitHubCmd(ds))
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newAdminCmd())
+	root.AddCommand(credentials.NewCmd())
 	root.AddCommand(newProviderCmd(ds))
 	root.AddCommand(newKitCmd(ds))
 	root.AddCommand(newRoutingCmd(ds))
