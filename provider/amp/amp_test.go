@@ -205,7 +205,12 @@ func TestProvider_Spawn_FakeCLI_StreamJSON(t *testing.T) {
 	scriptPath := writeFakeAmpScript(t)
 
 	p := &Provider{binary: scriptPath, apiKey: "test-key"}
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	// 30s ceiling: in normal conditions the fixture completes in <50ms
+	// (collectUntilResult returns immediately on ResultEvent). The
+	// generous timeout exists only as a -race + full-suite-load safety
+	// net so fork/exec + scanner setup latency under contention doesn't
+	// time-bomb a deterministic JSONL fixture.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	h, err := p.Spawn(ctx, agent.Spec{Prompt: "say hello"})
@@ -217,11 +222,17 @@ func TestProvider_Spawn_FakeCLI_StreamJSON(t *testing.T) {
 	}
 	defer func() { _ = h.Stop(context.Background()) }()
 
-	// Drain events with a terminal-idle deadline: after observing a
-	// ResultEvent, wait 200 ms for any stragglers then stop. The
-	// claude Handle keeps the events channel open after the subprocess
-	// exits (to allow Inject), so we cannot range until close here.
-	events := collectUntilResult(t, h, 5*time.Second)
+	// Drain events until we observe a terminal ResultEvent OR the
+	// spawn ctx fires. The claude Handle keeps the events channel
+	// open after the subprocess exits (to allow Inject), so we
+	// cannot range-until-close here — but ResultEvent is the
+	// terminal sentinel from the JSONL stream and the parent reader
+	// emits no further events after it. Tying the deadline to the
+	// spawn ctx (channel-based) instead of a wall-clock hardDeadline
+	// keeps the test resilient under -race + full-suite load where
+	// fork/exec + bufio.Scanner can take >5s before the first line
+	// reaches the consumer goroutine.
+	events := collectUntilResult(ctx, t, h)
 
 	var gotInit, gotAssistant, gotResult bool
 	for _, ev := range events {
@@ -246,32 +257,29 @@ func TestProvider_Spawn_FakeCLI_StreamJSON(t *testing.T) {
 }
 
 // collectUntilResult drains events from h until a terminal ResultEvent
-// is seen and an idle period elapses, or until the hard deadline fires.
-func collectUntilResult(t *testing.T, h agent.Handle, hardDeadline time.Duration) []agent.Event {
+// is observed, the events channel closes, or ctx fires. The fixture
+// JSONL stream is deterministic — init, assistant, result — and the
+// parent reader emits no events after ResultEvent, so we can return
+// the moment we see it without an extra idle wait. ctx (the same one
+// passed to Spawn) is the cancellation signal: tying the test deadline
+// to the spawn lifetime instead of a hard-coded wall-clock value
+// avoids the historical -race + full-suite-load flake where
+// fork/exec + bufio.Scanner could take longer than a fixed deadline.
+func collectUntilResult(ctx context.Context, t *testing.T, h agent.Handle) []agent.Event {
 	t.Helper()
 	var got []agent.Event
-	timer := time.NewTimer(hardDeadline)
-	defer timer.Stop()
 	for {
-		var idleCh <-chan time.Time
-		for _, ev := range got {
-			if _, ok := ev.(agent.ResultEvent); ok {
-				idle := time.NewTimer(300 * time.Millisecond)
-				defer idle.Stop()
-				idleCh = idle.C
-				break
-			}
-		}
 		select {
 		case ev, ok := <-h.Events():
 			if !ok {
 				return got
 			}
 			got = append(got, ev)
-		case <-idleCh:
-			return got
-		case <-timer.C:
-			t.Logf("collectUntilResult: hard deadline after %d events", len(got))
+			if _, ok := ev.(agent.ResultEvent); ok {
+				return got
+			}
+		case <-ctx.Done():
+			t.Logf("collectUntilResult: ctx cancelled after %d events: %v", len(got), ctx.Err())
 			return got
 		}
 	}
