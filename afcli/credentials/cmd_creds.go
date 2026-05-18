@@ -25,5 +25,6 @@ func NewCmd() *cobra.Command {
 		SilenceUsage: true,
 	}
 	cmd.AddCommand(newSetupCmd())
+	cmd.AddCommand(newRotateCmd())
 	return cmd
 }
