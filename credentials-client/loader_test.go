@@ -125,7 +125,7 @@ func (s *fakeServer) acceptLoop() {
 
 func (s *fakeServer) handle(conn net.Conn) {
 	defer s.wg.Done()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadBytes('\n')
@@ -313,7 +313,7 @@ func TestStandaloneSubscribeNoOp(t *testing.T) {
 	t.Cleanup(func() { _ = loader.Close() })
 
 	called := false
-	unsubscribe := loader.Subscribe(func(delta map[string]string) {
+	unsubscribe := loader.Subscribe(func(_ map[string]string) {
 		called = true
 	})
 	// Unsubscribe should be safe and idempotent.
@@ -510,12 +510,12 @@ func TestDaemonSubscribeUpdateAndUnsubscribe(t *testing.T) {
 		mu     sync.Mutex
 		deltas []map[string]string
 	}
-	cap := &capture{}
+	capability := &capture{}
 	got := make(chan struct{}, 4)
 	unsubscribe := loader.Subscribe(func(delta map[string]string) {
-		cap.mu.Lock()
-		cap.deltas = append(cap.deltas, delta)
-		cap.mu.Unlock()
+		capability.mu.Lock()
+		capability.deltas = append(capability.deltas, delta)
+		capability.mu.Unlock()
 		got <- struct{}{}
 	})
 	// Subscribers registered — now let the server emit UPDATEs.
@@ -527,13 +527,13 @@ func TestDaemonSubscribeUpdateAndUnsubscribe(t *testing.T) {
 		t.Fatalf("subscriber did not receive UPDATE within 2s")
 	}
 
-	cap.mu.Lock()
-	if len(cap.deltas) != 1 {
-		cap.mu.Unlock()
-		t.Fatalf("expected 1 delta, got %d", len(cap.deltas))
+	capability.mu.Lock()
+	if len(capability.deltas) != 1 {
+		capability.mu.Unlock()
+		t.Fatalf("expected 1 delta, got %d", len(capability.deltas))
 	}
-	d := cap.deltas[0]
-	cap.mu.Unlock()
+	d := capability.deltas[0]
+	capability.mu.Unlock()
 	if d["A"] != "2" || d["NEW"] != "value" {
 		t.Fatalf("delta = %v; want A=2,NEW=value", d)
 	}
@@ -575,7 +575,7 @@ func TestDaemonMultipleSubscribers(t *testing.T) {
 	)
 	for i := range 2 {
 		idx := i
-		loader.Subscribe(func(delta map[string]string) {
+		loader.Subscribe(func(_ map[string]string) {
 			mu.Lock()
 			hits[idx]++
 			mu.Unlock()

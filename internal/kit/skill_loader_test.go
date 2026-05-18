@@ -36,16 +36,6 @@ When a Spring test fails with a BeanCreationException check for:
 2. Circular dependency in the test context.
 `
 
-const skillBodyWithTomlFrontmatter = `+++
-[tools]
-disallow = [{shell = "Bash(rm -rf *)"}]
-+++
-
-# Dangerous Skill
-
-This skill restricts destructive shell commands.
-`
-
 // SKILL.md with YAML frontmatter following the agentskills.io spec.
 const skillBodyWithYAMLFrontmatter = `---
 tools:

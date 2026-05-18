@@ -220,7 +220,7 @@ func runRotate(ctx context.Context, env *rotateEnv, flags rotateFlags) error {
 		return fmt.Errorf("decode 2xx response: %w (body=%q)", err, string(body))
 	}
 
-	fmt.Fprintf(env.Out,
+	_, _ = fmt.Fprintf(env.Out,
 		"rotated kind=%s  notified sessions=%d  at=%s\n",
 		success.Kind, success.SessionCount, success.RotatedAt)
 	return nil

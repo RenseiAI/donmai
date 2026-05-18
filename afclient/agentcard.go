@@ -27,6 +27,7 @@ const (
 // System-seeded values; per-org extension via org_work_types table.
 type AgentWorkType = string
 
+// AgentWorkType enum values; see D21/D22.
 const (
 	WorkTypeResearch       AgentWorkType = "research"
 	WorkTypeBacklogWriting AgentWorkType = "backlog-writing"
@@ -40,6 +41,7 @@ const (
 // RuntimeKind is the §2 enum of eight runtime path types.
 type RuntimeKind = string
 
+// RuntimeKind enum values; the eight runtime path types.
 const (
 	RuntimeKindNative            RuntimeKind = "native"
 	RuntimeKindNPM               RuntimeKind = "npm"

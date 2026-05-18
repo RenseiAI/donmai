@@ -18,7 +18,7 @@ func newCapabilitiesTestServer(t *testing.T, caps []internaldaemon.SubstrateCapa
 	d := &Daemon{}
 	if caps != nil {
 		cs := internaldaemon.NewCapabilitySet()
-		cs.Detect(func(name string) (string, error) {
+		cs.Detect(func(_ string) (string, error) {
 			// Unused — we set capabilitySet directly below.
 			return "", nil
 		})

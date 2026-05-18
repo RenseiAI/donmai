@@ -642,7 +642,7 @@ func writeFakeOpenCodeScript(t *testing.T) string {
 	if err := f.Close(); err != nil {
 		t.Fatalf("close fake opencode script: %v", err)
 	}
-	if err := os.Chmod(f.Name(), 0o700); err != nil {
+	if err := os.Chmod(f.Name(), 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("chmod fake opencode script: %v", err)
 	}
 	return f.Name()
@@ -658,7 +658,7 @@ func shellQuote(s string) string {
 func TestFakeOpenCodeScript_ProducesExpectedLines(t *testing.T) {
 	t.Parallel()
 	scriptPath := writeFakeOpenCodeScript(t)
-	cmd := exec.Command(scriptPath)
+	cmd := exec.Command(scriptPath) //nolint:gosec // test fixture: subprocess path is t.TempDir()-scoped
 	cmd.Stdin = strings.NewReader("test prompt")
 	out, err := cmd.Output()
 	if err != nil {

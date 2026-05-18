@@ -40,7 +40,7 @@ import (
 
 // KitSkillSource is the minimal kit descriptor the skill loader needs.
 // Callers (typically the daemon's KitRegistry) supply these.
-type KitSkillSource struct {
+type KitSkillSource struct { //nolint:revive // name accepted as-is; rename tracked separately to avoid churn
 	// ID is the kit's canonical id (e.g. "spring/java").
 	ID string
 	// Priority is the kit's declared priority used to order skill bodies

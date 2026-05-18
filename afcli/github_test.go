@@ -101,7 +101,7 @@ func TestGitHubGetIssue(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, issueResponseJSON(42, "Test Issue", "open"))
+		_, _ = fmt.Fprint(w, issueResponseJSON(42, "Test Issue", "open"))
 	})
 
 	out, err := runGitHubCmd(t, "get-issue", "--number", "42")
@@ -137,7 +137,7 @@ func TestGitHubGetIssueNotFound(t *testing.T) {
 	setupGitHubTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprint(w, `{"message":"Not Found","documentation_url":"https://docs.github.com"}`)
+		_, _ = fmt.Fprint(w, `{"message":"Not Found","documentation_url":"https://docs.github.com"}`)
 	})
 
 	_, err := runGitHubCmd(t, "get-issue", "--number", "9999")
@@ -161,7 +161,7 @@ func TestGitHubCreateIssue(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		fmt.Fprint(w, issueResponseJSON(101, "New Issue", "open"))
+		_, _ = fmt.Fprint(w, issueResponseJSON(101, "New Issue", "open"))
 	})
 
 	out, err := runGitHubCmd(t, "create-issue",
@@ -200,10 +200,10 @@ func TestGitHubCreateIssueBodyFile(t *testing.T) {
 	}
 	_ = tmpFile.Close()
 
-	setupGitHubTest(t, func(w http.ResponseWriter, r *http.Request) {
+	setupGitHubTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		fmt.Fprint(w, issueResponseJSON(102, "File Body Issue", "open"))
+		_, _ = fmt.Fprint(w, issueResponseJSON(102, "File Body Issue", "open"))
 	})
 
 	out, err := runGitHubCmd(t, "create-issue",
@@ -228,7 +228,7 @@ func TestGitHubUpdateIssue(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, issueResponseJSON(42, "Updated Title", "open"))
+		_, _ = fmt.Fprint(w, issueResponseJSON(42, "Updated Title", "open"))
 	})
 
 	out, err := runGitHubCmd(t, "update-issue",
@@ -262,7 +262,7 @@ func TestGitHubListIssues(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, "[%s,%s]",
+		_, _ = fmt.Fprintf(w, "[%s,%s]",
 			issueResponseJSON(1, "First", "open"),
 			issueResponseJSON(2, "Second", "open"),
 		)
@@ -302,7 +302,7 @@ func TestGitHubListIssuesMissingOwner(t *testing.T) {
 func TestGitHubListComments(t *testing.T) {
 	setupGitHubTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, "[%s,%s]",
+		_, _ = fmt.Fprintf(w, "[%s,%s]",
 			commentResponseJSON(1001, "First comment"),
 			commentResponseJSON(1002, "Second comment"),
 		)
@@ -344,7 +344,7 @@ func TestGitHubCreateComment(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		fmt.Fprint(w, commentResponseJSON(2001, "My comment"))
+		_, _ = fmt.Fprint(w, commentResponseJSON(2001, "My comment"))
 	})
 
 	out, err := runGitHubCmd(t, "create-comment",
@@ -393,7 +393,7 @@ func TestGitHubCreateCommentBodyFile(t *testing.T) {
 	setupGitHubTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		fmt.Fprint(w, commentResponseJSON(2002, "Comment from file"))
+		_, _ = fmt.Fprint(w, commentResponseJSON(2002, "Comment from file"))
 	})
 
 	out, err := runGitHubCmd(t, "create-comment",
@@ -419,7 +419,7 @@ func TestGitHubAddLabels(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `[{"id":1,"name":"bug","color":"d73a4a","description":""},{"id":2,"name":"enhancement","color":"a2eeef","description":""}]`)
+		_, _ = fmt.Fprint(w, `[{"id":1,"name":"bug","color":"d73a4a","description":""},{"id":2,"name":"enhancement","color":"a2eeef","description":""}]`)
 	})
 
 	out, err := runGitHubCmd(t, "add-labels",
@@ -465,7 +465,7 @@ func TestGitHubSetAssignees(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, issueResponseJSON(42, "Issue", "open"))
+		_, _ = fmt.Fprint(w, issueResponseJSON(42, "Issue", "open"))
 	})
 
 	out, err := runGitHubCmd(t, "set-assignees",
@@ -499,10 +499,10 @@ func TestGitHubCloseIssue(t *testing.T) {
 		switch r.Method {
 		case http.MethodPost:
 			w.WriteHeader(http.StatusCreated)
-			fmt.Fprint(w, commentResponseJSON(3001, "closing"))
+			_, _ = fmt.Fprint(w, commentResponseJSON(3001, "closing"))
 		case http.MethodPatch:
 			patchCount++
-			fmt.Fprint(w, issueResponseJSON(42, "Closed Issue", "closed"))
+			_, _ = fmt.Fprint(w, issueResponseJSON(42, "Closed Issue", "closed"))
 		default:
 			http.Error(w, "unexpected", http.StatusMethodNotAllowed)
 		}
@@ -539,7 +539,7 @@ func TestGitHubReopenIssue(t *testing.T) {
 	setupGitHubTest(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodPatch {
-			fmt.Fprint(w, issueResponseJSON(42, "Reopened Issue", "open"))
+			_, _ = fmt.Fprint(w, issueResponseJSON(42, "Reopened Issue", "open"))
 			return
 		}
 		http.Error(w, "unexpected", http.StatusMethodNotAllowed)
@@ -561,7 +561,7 @@ func TestGitHubReopenIssue(t *testing.T) {
 func TestGitHubListLabels(t *testing.T) {
 	setupGitHubTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `[
+		_, _ = fmt.Fprint(w, `[
 			{"id":1,"name":"bug","color":"d73a4a","description":"Something is broken"},
 			{"id":2,"name":"enhancement","color":"a2eeef","description":"New feature"},
 			{"id":3,"name":"documentation","color":"0075ca","description":"Docs only"}
@@ -591,7 +591,7 @@ func TestGitHubListLabels(t *testing.T) {
 func TestGitHubGetRepo(t *testing.T) {
 	setupGitHubTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{
+		_, _ = fmt.Fprint(w, `{
 "full_name":"test-owner/test-repo",
 "name":"test-repo",
 "description":"A test repository",
@@ -648,7 +648,7 @@ func TestGitHubOwnerRepoCombinedFlag(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, issueResponseJSON(5, "Org Issue", "open"))
+		_, _ = fmt.Fprint(w, issueResponseJSON(5, "Org Issue", "open"))
 	})
 
 	// Override env owner/repo so they don't interfere.
@@ -677,7 +677,7 @@ func TestGitHubProxyModeViaDataSource(t *testing.T) {
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, issueResponseJSON(1, "Proxied Issue", "open"))
+		_, _ = fmt.Fprint(w, issueResponseJSON(1, "Proxied Issue", "open"))
 	}))
 	t.Cleanup(srv.Close)
 

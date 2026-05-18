@@ -76,8 +76,8 @@ func TestAgentCardRoundTrip_AllFields(t *testing.T) {
 			},
 		},
 		Trust: TrustClaims{
-			Tier:        "partner",
-			Signature:   &sig,
+			Tier:         "partner",
+			Signature:    &sig,
 			SigningKeyID: &sigKey,
 			Provenance: TrustProvenanceInfo{
 				SourceURL:    ptr("https://github.com/renseiai/agents/tree/main/backlog-writer"),
@@ -331,8 +331,8 @@ func TestTrustClaimsRoundTrip(t *testing.T) {
 	key := "key-fp"
 	score := 0.85
 	in := TrustClaims{
-		Tier:        "partner",
-		Signature:   &sig,
+		Tier:         "partner",
+		Signature:    &sig,
 		SigningKeyID: &key,
 		Provenance: TrustProvenanceInfo{
 			SourceURL:    &src,

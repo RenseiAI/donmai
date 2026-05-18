@@ -1,3 +1,4 @@
+// Package github is a minimal GitHub REST client used by `af github` commands.
 package github
 
 import (

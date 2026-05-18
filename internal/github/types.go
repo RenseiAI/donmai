@@ -4,18 +4,18 @@ import "time"
 
 // Issue represents a GitHub issue.
 type Issue struct {
-	Number    int       `json:"number"`
-	Title     string    `json:"title"`
-	Body      string    `json:"body"`
-	State     string    `json:"state"`
-	HTMLURL   string    `json:"html_url"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Labels    []Label   `json:"labels"`
-	Assignees []User    `json:"assignees"`
-	User      *User     `json:"user"`
+	Number    int        `json:"number"`
+	Title     string     `json:"title"`
+	Body      string     `json:"body"`
+	State     string     `json:"state"`
+	HTMLURL   string     `json:"html_url"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	Labels    []Label    `json:"labels"`
+	Assignees []User     `json:"assignees"`
+	User      *User      `json:"user"`
 	Milestone *Milestone `json:"milestone"`
-	Comments  int       `json:"comments"`
+	Comments  int        `json:"comments"`
 }
 
 // Comment represents a GitHub issue comment.

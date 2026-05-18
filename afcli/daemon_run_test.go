@@ -128,7 +128,7 @@ func TestStandaloneCredsMergeIntoSpawnerBaseEnv(t *testing.T) {
 	// proxy, assert that no .env.local file is materialised under a
 	// fake "worktree" subdirectory the test pre-creates.
 	worktree := filepath.Join(root, "worktrees", "sess-x")
-	if err := os.MkdirAll(worktree, 0o755); err != nil {
+	if err := os.MkdirAll(worktree, 0o750); err != nil {
 		t.Fatalf("mkdir worktree: %v", err)
 	}
 	// The LocalSource API has no surface that writes anywhere; this

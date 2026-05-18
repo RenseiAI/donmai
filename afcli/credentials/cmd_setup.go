@@ -102,15 +102,15 @@ func runSetup(ctx context.Context, env *wizardEnv) error {
 	reader := bufio.NewReader(env.In)
 
 	// ── Step 1: welcome ────────────────────────────────────────────
-	fmt.Fprintln(env.Out, "af creds setup — standalone credentials wizard")
-	fmt.Fprintln(env.Out, "")
-	fmt.Fprintln(env.Out,
+	_, _ = fmt.Fprintln(env.Out, "af creds setup — standalone credentials wizard")
+	_, _ = fmt.Fprintln(env.Out, "")
+	_, _ = fmt.Fprintln(env.Out,
 		"Sets up the credentials af forwards to spawned agents when running outside")
-	fmt.Fprintln(env.Out,
+	_, _ = fmt.Fprintln(env.Out,
 		"of rensei-tui. Precedence: process environment wins over .env.local;")
-	fmt.Fprintln(env.Out,
+	_, _ = fmt.Fprintln(env.Out,
 		"missing keys fail open with a redacted warning at spawn time.")
-	fmt.Fprintln(env.Out, "")
+	_, _ = fmt.Fprintln(env.Out, "")
 
 	// ── Step 2: detect `op` ───────────────────────────────────────
 	opPath, lookErr := env.LookPath("op")
@@ -122,20 +122,20 @@ func runSetup(ctx context.Context, env *wizardEnv) error {
 		if err != nil {
 			// op resolved on PATH but exits non-zero — treat as absent
 			// for the rest of the flow, but surface the diagnostic.
-			fmt.Fprintf(env.Err,
+			_, _ = fmt.Fprintf(env.Err,
 				"warning: `op --version` failed (%v); skipping 1Password integration\n",
 				err)
 			opPresent = false
 		} else {
 			opVersion = strings.TrimSpace(string(out))
-			fmt.Fprintf(env.Out, "Detected 1Password CLI: %s (%s)\n", opVersion, opPath)
+			_, _ = fmt.Fprintf(env.Out, "Detected 1Password CLI: %s (%s)\n", opVersion, opPath)
 		}
 	} else {
-		fmt.Fprintln(env.Out,
+		_, _ = fmt.Fprintln(env.Out,
 			"1Password CLI (`op`) not found in PATH.")
-		fmt.Fprintln(env.Out,
+		_, _ = fmt.Fprintln(env.Out,
 			"Install instructions: https://1password.com/downloads/command-line/")
-		fmt.Fprintln(env.Out,
+		_, _ = fmt.Fprintln(env.Out,
 			"Skipping 1Password setup; you can re-run `af creds setup` later.")
 	}
 
@@ -145,27 +145,27 @@ func runSetup(ctx context.Context, env *wizardEnv) error {
 		signedIn, accountLabel := opWhoami(ctx, env)
 		switch {
 		case signedIn:
-			fmt.Fprintf(env.Out, "Signed in to 1Password as %s\n", accountLabel)
+			_, _ = fmt.Fprintf(env.Out, "Signed in to 1Password as %s\n", accountLabel)
 			if !promptYesNo(reader, env.Out,
 				"Use this account for af credentials?", true) {
-				fmt.Fprintln(env.Out,
+				_, _ = fmt.Fprintln(env.Out,
 					"Skipping 1Password setup; proceeding to .env.local.")
 				opPresent = false
 			}
 		default:
-			fmt.Fprintln(env.Out, "1Password CLI present but no active session.")
+			_, _ = fmt.Fprintln(env.Out, "1Password CLI present but no active session.")
 			if promptYesNo(reader, env.Out,
 				"Sign in to 1Password now?", true) {
 				if _, err := env.RunOp(ctx, "signin", "--raw"); err != nil {
-					fmt.Fprintf(env.Err,
+					_, _ = fmt.Fprintf(env.Err,
 						"warning: `op signin` failed (%v); skipping 1Password integration\n",
 						err)
 					opPresent = false
 				} else {
-					fmt.Fprintln(env.Out, "Signed in.")
+					_, _ = fmt.Fprintln(env.Out, "Signed in.")
 				}
 			} else {
-				fmt.Fprintln(env.Out,
+				_, _ = fmt.Fprintln(env.Out,
 					"Skipping 1Password setup; proceeding to .env.local.")
 				opPresent = false
 			}
@@ -174,7 +174,7 @@ func runSetup(ctx context.Context, env *wizardEnv) error {
 		if opPresent {
 			vaultName = promptVault(ctx, reader, env)
 			if vaultName == "" {
-				fmt.Fprintln(env.Out,
+				_, _ = fmt.Fprintln(env.Out,
 					"No vault selected; falling back to op://Private/... placeholders.")
 				vaultName = "Private"
 			}
@@ -189,15 +189,15 @@ func runSetup(ctx context.Context, env *wizardEnv) error {
 	envLocalPath := filepath.Join(gitRoot, ".env.local")
 
 	if _, statErr := os.Stat(envLocalPath); statErr == nil {
-		fmt.Fprintf(env.Out,
+		_, _ = fmt.Fprintf(env.Out,
 			".env.local already exists at %s\n", envLocalPath)
 		if !promptYesNo(reader, env.Out,
 			"Overwrite?", false) {
-			fmt.Fprintln(env.Out,
+			_, _ = fmt.Fprintln(env.Out,
 				"Existing .env.local preserved. To add 1Password references, edit it")
-			fmt.Fprintln(env.Out,
+			_, _ = fmt.Fprintln(env.Out,
 				"manually using `op://vault/item/field` syntax.")
-			fmt.Fprintln(env.Out, "")
+			_, _ = fmt.Fprintln(env.Out, "")
 			printFinalMessage(env.Out, envLocalPath, false)
 			return nil
 		}
@@ -210,8 +210,8 @@ func runSetup(ctx context.Context, env *wizardEnv) error {
 		return fmt.Errorf("write .env.local: %w", err)
 	}
 
-	fmt.Fprintf(env.Out, "Wrote %s (mode 0600)\n", envLocalPath)
-	fmt.Fprintln(env.Out, "")
+	_, _ = fmt.Fprintf(env.Out, "Wrote %s (mode 0600)\n", envLocalPath)
+	_, _ = fmt.Fprintln(env.Out, "")
 	printFinalMessage(env.Out, envLocalPath, true)
 	return nil
 }
@@ -258,7 +258,7 @@ func promptVault(ctx context.Context, reader *bufio.Reader, env *wizardEnv) stri
 			return ""
 		}
 		if _, err := env.RunOp(ctx, "vault", "get", answer); err != nil {
-			fmt.Fprintf(env.Out,
+			_, _ = fmt.Fprintf(env.Out,
 				"Vault %q not found (op vault get exited non-zero). Try another.\n",
 				answer)
 			continue
@@ -275,7 +275,7 @@ func promptYesNo(reader *bufio.Reader, out io.Writer, question string, defaultYe
 	if defaultYes {
 		suffix = "[Y/n]"
 	}
-	fmt.Fprintf(out, "%s %s ", question, suffix)
+	_, _ = fmt.Fprintf(out, "%s %s ", question, suffix)
 	line, _ := reader.ReadString('\n')
 	answer := strings.ToLower(strings.TrimSpace(line))
 	if answer == "" {
@@ -287,7 +287,7 @@ func promptYesNo(reader *bufio.Reader, out io.Writer, question string, defaultYe
 // promptString prompts for free-form input. Empty input returns
 // defaultValue.
 func promptString(reader *bufio.Reader, out io.Writer, prompt, defaultValue string) string {
-	fmt.Fprintf(out, "%s ", prompt)
+	_, _ = fmt.Fprintf(out, "%s ", prompt)
 	line, _ := reader.ReadString('\n')
 	answer := strings.TrimSpace(line)
 	if answer == "" {
@@ -363,7 +363,7 @@ func renderEnvLocal(vaultName string, opPresent bool) string {
 		{"OPENAI_API_KEY", "OpenAI"},
 	}
 	for _, s := range samples {
-		fmt.Fprintf(&b, "# %s=op://%s/%s/credential\n", s.key, vaultName, s.item)
+		_, _ = fmt.Fprintf(&b, "# %s=op://%s/%s/credential\n", s.key, vaultName, s.item)
 	}
 	return b.String()
 }
@@ -386,15 +386,15 @@ func writeEnvLocalFile(path, content string) error {
 // naturally either way.
 func printFinalMessage(out io.Writer, path string, wrote bool) {
 	if wrote {
-		fmt.Fprintf(out, "Sample placeholders written to %s\n", path)
+		_, _ = fmt.Fprintf(out, "Sample placeholders written to %s\n", path)
 	} else {
-		fmt.Fprintf(out, "Existing file kept at %s\n", path)
+		_, _ = fmt.Fprintf(out, "Existing file kept at %s\n", path)
 	}
-	fmt.Fprintln(out, "")
-	fmt.Fprintln(out,
+	_, _ = fmt.Fprintln(out, "")
+	_, _ = fmt.Fprintln(out,
 		"Reminder: af reads this file ONCE at startup; credentials are never")
-	fmt.Fprintln(out,
+	_, _ = fmt.Fprintln(out,
 		"copied into spawned worktrees. Blocked variable names (see")
-	fmt.Fprintln(out,
+	_, _ = fmt.Fprintln(out,
 		"internal/credentials/blocklist.go) are never forwarded regardless of source.")
 }

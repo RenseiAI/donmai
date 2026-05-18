@@ -69,7 +69,7 @@ func TestRunRotate_Happy_200(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	env, out, _ := fakeEnv(t, map[string]string{
+	env, out, _ := fakeEnv(t, map[string]string{ //nolint:gosec // G101 false positive (test fixture)
 		"RENSEI_PLATFORM_URL": srv.URL,
 		"RENSEI_RSK_TOKEN":    "rsk_test_token",
 		"RENSEI_ORG_ID":       "org_test",
