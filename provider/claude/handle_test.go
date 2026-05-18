@@ -56,32 +56,37 @@ func newProviderForFake(t *testing.T, fakePath string) *Provider {
 	return p
 }
 
-// collect drains events from h until the channel closes OR a brief
-// idle deadline elapses after observing a terminal ResultEvent /
-// ErrorEvent. Post F.2.3-cap-flip the events channel stays open after
-// the parent subprocess EOFs (so Inject() can stream a follow-up
-// turn's events onto it); tests that previously relied on close-on-
-// EOF use this helper to bound their drain.
+// collect drains events from h until the channel closes OR a
+// terminal ResultEvent / synthetic ErrorEvent is observed. Post
+// F.2.3-cap-flip the events channel stays open after the parent
+// subprocess EOFs (so Inject() can stream a follow-up turn's events
+// onto it); tests that previously relied on close-on-EOF use this
+// helper to bound their drain.
+//
+// Synchronization is channel-based (not wall-clock): we return the
+// moment we observe a terminal event or the channel closes. The 30s
+// ceiling exists only as a -race + full-suite-load safety net so
+// fork/exec + bufio.Scanner setup latency under contention doesn't
+// time-bomb a deterministic JSONL fixture. In healthy conditions
+// these helpers return in <50 ms via the terminal-event path. This
+// mirrors the F3 fix in provider/amp (commit d7df186), replacing the
+// historical 5s hard timeout + 200ms post-terminal idle wait that
+// flaked under -race + full-suite load.
 func collect(t *testing.T, h agent.Handle) []agent.Event {
 	t.Helper()
 	var got []agent.Event
-	hardTimeout := time.NewTimer(5 * time.Second)
+	hardTimeout := time.NewTimer(30 * time.Second)
 	defer hardTimeout.Stop()
 	for {
-		var idle <-chan time.Time
-		if seenTerminal(got) {
-			t := time.NewTimer(200 * time.Millisecond)
-			defer t.Stop()
-			idle = t.C
-		}
 		select {
 		case ev, ok := <-h.Events():
 			if !ok {
 				return got
 			}
 			got = append(got, ev)
-		case <-idle:
-			return got
+			if seenTerminal(got) {
+				return got
+			}
 		case <-hardTimeout.C:
 			t.Fatalf("timed out waiting for events; got %d so far", len(got))
 		}
