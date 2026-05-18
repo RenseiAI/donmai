@@ -25,7 +25,7 @@
         "color": "terminal.ansiWhite",
         "icon": "robot",
         "commands": [
-          "source .env.local && af-worker-fleet -p agentfactory-tui"
+          "source .env.local && echo af-worker-fleet -p agentfactory-tui"
         ]
       },
       {
@@ -33,7 +33,7 @@
         "color": "terminal.ansiWhite",
         "icon": "search",
         "commands": [
-          "source .env.local && af-analyze-logs --follow"
+          "source .env.local && echo af-analyze-logs --follow"
         ],
         "split": "Agent Fleet"
       },
