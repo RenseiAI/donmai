@@ -96,10 +96,14 @@ func TestNew_HTTPMode_404IsLive(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
+	// Inject the server's own client so the probe doesn't race against the
+	// shared http.DefaultTransport's CloseIdleConnections — observed flaking
+	// under parallel httptest load on Go 1.25 CI runners.
 	if _, err := New(Options{
-		Endpoint: srv.URL,
-		Getenv:   fakeEnv(nil),
-		LookPath: fakeLookPath(nil),
+		Endpoint:   srv.URL,
+		Getenv:     fakeEnv(nil),
+		LookPath:   fakeLookPath(nil),
+		HTTPClient: srv.Client(),
 	}); err != nil {
 		t.Fatalf("New: want nil for 404, got %v", err)
 	}
@@ -112,9 +116,10 @@ func TestNew_HTTPMode_5xxFailsAsUnavailable(t *testing.T) {
 	}))
 	defer srv.Close()
 	_, err := New(Options{
-		Endpoint: srv.URL,
-		Getenv:   fakeEnv(nil),
-		LookPath: fakeLookPath(nil),
+		Endpoint:   srv.URL,
+		Getenv:     fakeEnv(nil),
+		LookPath:   fakeLookPath(nil),
+		HTTPClient: srv.Client(),
 	})
 	if !errors.Is(err, agent.ErrProviderUnavailable) {
 		t.Fatalf("err: want ErrProviderUnavailable, got %v", err)

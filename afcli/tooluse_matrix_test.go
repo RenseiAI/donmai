@@ -87,7 +87,12 @@ func TestToolUseCapabilityMatrix(t *testing.T) {
 		{
 			name: "amp",
 			new: func(t *testing.T) agent.Provider {
-				p, err := provideramp.New(provideramp.Options{APIKey: "test-key"})
+				// Inject a fake LookPath so the test doesn't depend on whether
+				// `amp` is installed on the CI runner.
+				p, err := provideramp.New(provideramp.Options{
+					APIKey:   "test-key",
+					LookPath: func(string) (string, error) { return "/usr/bin/amp", nil },
+				})
 				if err != nil {
 					t.Fatalf("amp.New: %v", err)
 				}
