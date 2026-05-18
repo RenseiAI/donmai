@@ -140,6 +140,21 @@ type HeartbeatPayload struct {
 	MaxSessions    int                `json:"maxSessions"`
 	Region         string             `json:"region,omitempty"`
 	SentAt         string             `json:"sentAt"`
+
+	// AllowlistHash is the SHA-256 of the daemon's current project
+	// allowlist (see allowlist_report.go). Sent on every beat so the
+	// platform can detect drift cheaply. Empty string when the daemon
+	// has no projects configured.
+	//
+	// Phase 1d of 2026-05-18-daemon-config-sync-DESIGN.md.
+	AllowlistHash string `json:"allowlistHash,omitempty"`
+
+	// Allowlist is the full structured allowlist payload. Included only
+	// when AllowlistHash changes from the platform's last-known value
+	// (the daemon caches its previously-reported hash and includes the
+	// list only on first beat or on change). Steady-state overhead per
+	// beat is the 64-byte hash + ~8 bytes of JSON framing.
+	Allowlist []ProjectAllowlistEntry `json:"allowlist,omitempty"`
 }
 
 // ── Auto-update channel/schedule ───────────────────────────────────────────

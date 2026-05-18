@@ -28,6 +28,16 @@ type HeartbeatOptions struct {
 	GetStatus       func() RegistrationStatus
 	Region          string
 
+	// GetAllowlist returns the daemon's current project allowlist entries
+	// (derived from cfg.Projects). Called every beat so a hot yaml reload
+	// (when that lands) or in-process mutation reflects in the next
+	// heartbeat. Returning nil is the canonical "no projects configured"
+	// signal and triggers an empty AllowlistHash. Optional — callers that
+	// don't care about allowlist sync can leave it nil.
+	//
+	// Phase 1d of 2026-05-18-daemon-config-sync-DESIGN.md.
+	GetAllowlist func() []ProjectAllowlistEntry
+
 	// HTTPClient is the client used for the real-endpoint call.
 	HTTPClient *http.Client
 	// LogWarn is called when the real-endpoint call fails (transient
@@ -64,6 +74,12 @@ type HeartbeatService struct {
 	last     HeartbeatPayload
 	workerID string // mutable: refreshed by OnReregister
 	jwt      string // mutable: refreshed by OnReregister
+
+	// lastAllowlistHash tracks the most recently transmitted allowlist
+	// hash so we only re-send the full entry list when it changes. Empty
+	// string forces the next beat to include the list (covers the boot
+	// case and the "previously empty, now populated" transition).
+	lastAllowlistHash string
 }
 
 // NewHeartbeatService constructs a HeartbeatService from opts. Required
@@ -166,6 +182,19 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		MaxSessions:    h.opts.GetMaxCount(),
 		Region:         h.opts.Region,
 		SentAt:         h.opts.Now().UTC().Format(time.RFC3339),
+	}
+
+	// Phase 1d: attach allowlist hash every beat, full list only on change.
+	if h.opts.GetAllowlist != nil {
+		entries := h.opts.GetAllowlist()
+		hash := allowlistHash(entries)
+		payload.AllowlistHash = hash
+		h.mu.Lock()
+		if hash != h.lastAllowlistHash {
+			payload.Allowlist = entries
+			h.lastAllowlistHash = hash
+		}
+		h.mu.Unlock()
 	}
 
 	h.mu.Lock()

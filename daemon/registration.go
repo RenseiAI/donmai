@@ -36,6 +36,11 @@ type RegistrationOptions struct {
 	// (ADR-2026-05-12-capacity-pools-and-substrate-resolution.md §2, Stream H.)
 	Provides []ProvideCapability
 
+	// DaemonProjects is the structured allowlist reported to the platform
+	// for read-only mirroring (Phase 1c of daemon-config-sync DESIGN).
+	// Populate from cfg.Projects at the call site.
+	DaemonProjects []ProjectAllowlistEntry
+
 	// HTTPClient is the client used when the real (non-stub) path is taken.
 	// Defaults to http.DefaultClient with a 10s timeout.
 	HTTPClient *http.Client
@@ -69,6 +74,30 @@ type RegisterRequest struct {
 	Version   string              `json:"version,omitempty"`
 	Projects  []string            `json:"projects,omitempty"`
 	Provides  []ProvideCapability `json:"provides,omitempty"`
+
+	// DaemonProjects is the structured project allowlist read from the
+	// daemon's local config (daemon.yaml's projects[]). Each entry carries
+	// the project id and resolved repository URL the daemon enforces at
+	// WorkerSpawner.AcceptWork time. Distinct from the legacy `Projects`
+	// []string above, which the platform overwrites with Linear-resolved
+	// names for registration-token auth (see platform/src/app/api/workers/
+	// register/route.ts:265).
+	//
+	// Phase 1c of 2026-05-18-daemon-config-sync-DESIGN.md — read-only mirror;
+	// platform persists into worker_hosts.allowed_projects jsonb so the
+	// capacity UI can surface "this host serves projects X, Y, Z" without
+	// SSH-ing to the host. Omitted when the daemon yaml has no projects[]
+	// entries; the platform falls back to "unknown / unrestricted" semantics.
+	DaemonProjects []ProjectAllowlistEntry `json:"daemonProjects,omitempty"`
+}
+
+// ProjectAllowlistEntry is the wire shape for a single allowlisted project
+// reported by the daemon. Mirrors the on-disk daemon.yaml `projects[]`
+// shape (daemon/config.go ProjectConfig) but trimmed to the fields the
+// platform needs for display + routing-decision visibility.
+type ProjectAllowlistEntry struct {
+	ID         string `json:"id"`
+	Repository string `json:"repository"`
 }
 
 // ProvideCapability is a single entry in the RegisterRequest.Provides array.
@@ -275,11 +304,12 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		capacity = 1
 	}
 	req := RegisterRequest{
-		MachineID: opts.MachineID,
-		Hostname:  opts.Hostname,
-		Capacity:  capacity,
-		Version:   opts.Version,
-		Provides:  opts.Provides,
+		MachineID:      opts.MachineID,
+		Hostname:       opts.Hostname,
+		Capacity:       capacity,
+		Version:        opts.Version,
+		Provides:       opts.Provides,
+		DaemonProjects: opts.DaemonProjects,
 	}
 	if req.MachineID == "" {
 		req.MachineID = opts.Hostname
