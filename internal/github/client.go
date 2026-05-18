@@ -71,7 +71,7 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body any) 
 }
 
 func (c *Client) do(req *http.Request, out any) error {
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req) //nolint:gosec // G107/G704: req.URL is GitHub-domain-scoped via newRequest's base; not user-supplied
 	if err != nil {
 		return fmt.Errorf("http request: %w", err)
 	}
