@@ -320,6 +320,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Region:            cfg.Machine.Region,
 			JWTPath:           d.opts.JWTPath,
 			Provides:          provides,
+			DaemonProjects:    allowlistEntriesFromConfig(cfg.Projects),
 		}
 		var err error
 		regResp, err = Register(ctx, regOpts)
@@ -432,6 +433,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 			GetStatus:       d.registrationStatus,
 			Region:          cfg.Machine.Region,
 			OnReregister:    reregister,
+			GetAllowlist: func() []ProjectAllowlistEntry {
+				d.mu.RLock()
+				defer d.mu.RUnlock()
+				if d.config == nil {
+					return nil
+				}
+				return allowlistEntriesFromConfig(d.config.Projects)
+			},
 		})
 		d.heartbeat.Start()
 

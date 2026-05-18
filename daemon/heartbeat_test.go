@@ -295,3 +295,116 @@ func TestHeartbeatService_ReregisterFailure_NoCredSwap(t *testing.T) {
 type reregisterErr struct{}
 
 func (*reregisterErr) Error() string { return "no platform" }
+
+// TestHeartbeatService_AllowlistHashOnly_OnUnchangedBeats verifies the
+// Phase 1d optimisation: first beat carries the full Allowlist payload;
+// subsequent beats with an unchanged hash include only AllowlistHash;
+// the full payload reappears when the allowlist mutates.
+func TestHeartbeatService_AllowlistHashOnly_OnUnchangedBeats(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu       sync.Mutex
+		payloads []HeartbeatPayload
+		current  = []ProjectAllowlistEntry{{ID: "alpha", Repository: "github.com/x/alpha"}}
+	)
+
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "w1", Hostname: "h", IntervalSeconds: 1,
+		GetActiveCount: func() int { return 0 },
+		GetMaxCount:    func() int { return 1 },
+		GetStatus:      func() RegistrationStatus { return RegistrationIdle },
+		GetAllowlist: func() []ProjectAllowlistEntry {
+			mu.Lock()
+			defer mu.Unlock()
+			out := make([]ProjectAllowlistEntry, len(current))
+			copy(out, current)
+			return out
+		},
+		OnHeartbeat: func(p HeartbeatPayload) {
+			mu.Lock()
+			payloads = append(payloads, p)
+			mu.Unlock()
+		},
+	})
+
+	hs.sendOne(context.Background())
+	hs.sendOne(context.Background())
+	hs.sendOne(context.Background())
+
+	mu.Lock()
+	if len(payloads) != 3 {
+		mu.Unlock()
+		t.Fatalf("got %d payloads, want 3", len(payloads))
+	}
+	p0, p1, p2 := payloads[0], payloads[1], payloads[2]
+	mu.Unlock()
+
+	if p0.AllowlistHash == "" {
+		t.Error("first beat: AllowlistHash empty")
+	}
+	if len(p0.Allowlist) != 1 || p0.Allowlist[0].ID != "alpha" {
+		t.Errorf("first beat: Allowlist = %v, want [{alpha, ...}]", p0.Allowlist)
+	}
+	if p1.AllowlistHash != p0.AllowlistHash {
+		t.Errorf("second beat hash %q != first %q", p1.AllowlistHash, p0.AllowlistHash)
+	}
+	if p1.Allowlist != nil {
+		t.Errorf("second beat: Allowlist should be nil (hash unchanged), got %v", p1.Allowlist)
+	}
+	if p2.Allowlist != nil {
+		t.Errorf("third beat: Allowlist should be nil (hash unchanged), got %v", p2.Allowlist)
+	}
+
+	// Mutate; next beat re-includes full payload.
+	mu.Lock()
+	current = []ProjectAllowlistEntry{
+		{ID: "alpha", Repository: "github.com/x/alpha"},
+		{ID: "beta", Repository: "github.com/x/beta"},
+	}
+	mu.Unlock()
+	hs.sendOne(context.Background())
+
+	mu.Lock()
+	p3 := payloads[3]
+	mu.Unlock()
+	if p3.AllowlistHash == p0.AllowlistHash {
+		t.Error("fourth beat: hash should differ after mutation")
+	}
+	if len(p3.Allowlist) != 2 {
+		t.Errorf("fourth beat: Allowlist len = %d, want 2", len(p3.Allowlist))
+	}
+}
+
+// TestHeartbeatService_AllowlistOmittedWhenUnconfigured verifies that a
+// daemon with no GetAllowlist callback emits payloads with empty
+// AllowlistHash and nil Allowlist (pre-Phase-1d wire shape preserved).
+func TestHeartbeatService_AllowlistOmittedWhenUnconfigured(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu       sync.Mutex
+		captured HeartbeatPayload
+	)
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "w1", Hostname: "h", IntervalSeconds: 1,
+		GetActiveCount: func() int { return 0 },
+		GetMaxCount:    func() int { return 1 },
+		GetStatus:      func() RegistrationStatus { return RegistrationIdle },
+		OnHeartbeat: func(p HeartbeatPayload) {
+			mu.Lock()
+			captured = p
+			mu.Unlock()
+		},
+	})
+	hs.sendOne(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if captured.AllowlistHash != "" {
+		t.Errorf("AllowlistHash = %q, want empty", captured.AllowlistHash)
+	}
+	if captured.Allowlist != nil {
+		t.Errorf("Allowlist = %v, want nil", captured.Allowlist)
+	}
+}
