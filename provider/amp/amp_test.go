@@ -149,8 +149,13 @@ func TestProvider_Capabilities(t *testing.T) {
 	if caps.SupportsSessionResume {
 		t.Error("SupportsSessionResume: want false")
 	}
-	if caps.SupportsToolPlugins {
-		t.Error("SupportsToolPlugins: want false (amp manages tools via settings.json)")
+	// Post-REN-1499 (commit 3c6b6c6): amp Spawn writes a per-session
+	// MCP tmpfile and passes --mcp-config, so SupportsToolPlugins is
+	// honestly true. This also satisfies the invariant that
+	// AcceptsMcpServerSpec=true requires SupportsToolPlugins=true
+	// (see afcli/tooluse_matrix_test.go).
+	if !caps.SupportsToolPlugins {
+		t.Error("SupportsToolPlugins: want true (amp accepts --mcp-config end-to-end)")
 	}
 	if caps.EmitsSubagentEvents {
 		t.Error("EmitsSubagentEvents: want false")
