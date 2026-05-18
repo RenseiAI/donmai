@@ -122,6 +122,12 @@ type Daemon struct {
 	poller    *PollService
 	spawner   *WorkerSpawner
 
+	// lastHostStatus stores the most recent hostStatus the platform sent
+	// in a heartbeat response. The pool-deleted / pool-disabled signals
+	// surface here so af daemon stats can show "your pool was deleted —
+	// re-register against pool X" without parsing daemon.log. Phase 2e.
+	lastHostStatus *HostStatusDetail
+
 	// sessionDetails stores the per-session payload the spawner
 	// hands out to `af agent run` workers via the local control
 	// HTTP API at /api/daemon/sessions/<id>. (REN-1461 / F.2.8.)
@@ -220,6 +226,33 @@ func (d *Daemon) WorkerID() string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.workerID
+}
+
+// HostStatus returns the most recent hostStatus reported by the platform
+// in a heartbeat response. nil until at least one beat has been ACK'd
+// (or the platform predates Phase 2e). Phase 2e of
+// 2026-05-18-daemon-config-sync-DESIGN.md.
+//
+// af daemon stats can surface this so an operator sees "your pool was
+// deleted — re-register against pool X" without parsing daemon.log.
+func (d *Daemon) HostStatus() *HostStatusDetail {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.lastHostStatus == nil {
+		return nil
+	}
+	cp := *d.lastHostStatus
+	return &cp
+}
+
+// setLastHostStatus is the OnHostStatus callback wired into HeartbeatService.
+// Called on every beat that carries a hostStatus payload (including
+// status='ok', so we always reflect the platform's latest view).
+func (d *Daemon) setLastHostStatus(detail HostStatusDetail) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cp := detail
+	d.lastHostStatus = &cp
 }
 
 // runtimeJWT returns the cached runtime JWT (empty when registration
@@ -441,6 +474,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 				}
 				return allowlistEntriesFromConfig(d.config.Projects)
 			},
+			// Phase 2c: handle platform-queued mutations.
+			OnPendingMutations: d.applyPendingMutations,
+			// Phase 2e: surface hostStatus signals (pool_deleted etc.)
+			// to af daemon stats. The latest observed status is stored
+			// in d.hostStatus; callers read via Daemon.HostStatus().
+			OnHostStatus: d.setLastHostStatus,
 		})
 		d.heartbeat.Start()
 

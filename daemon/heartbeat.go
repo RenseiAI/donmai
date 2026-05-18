@@ -38,6 +38,28 @@ type HeartbeatOptions struct {
 	// Phase 1d of 2026-05-18-daemon-config-sync-DESIGN.md.
 	GetAllowlist func() []ProjectAllowlistEntry
 
+	// OnPendingMutations is invoked when the platform attaches one or more
+	// queued daemon-config mutations to a heartbeat response. The callback
+	// is expected to apply each mutation against daemon.yaml and return
+	// which ones succeeded (appliedIDs) and which failed
+	// (failures). The HeartbeatService buffers these and includes them in
+	// the NEXT beat's appliedMutations[] / mutationFailures[] fields so
+	// the platform can ACK and emit audit events.
+	//
+	// Optional — leave nil to ignore platform-initiated mutations (the
+	// daemon will keep working off its yaml as-edited locally). Phase 2c.
+	OnPendingMutations func(ctx context.Context, mutations []PendingMutation) (appliedIDs []string, failures []HeartbeatMutationFailure)
+
+	// OnHostStatus is invoked when the platform's heartbeat response
+	// reports a non-ok hostStatus (e.g. pool_deleted). The daemon can
+	// use this to surface re-register guidance in `af daemon stats` or
+	// to enter a non-claiming state. Called with the latest status on
+	// every beat that includes one, so callers can rely on it to clear
+	// (status='ok') as well.
+	//
+	// Optional — leave nil to ignore. Phase 2e.
+	OnHostStatus func(detail HostStatusDetail)
+
 	// HTTPClient is the client used for the real-endpoint call.
 	HTTPClient *http.Client
 	// LogWarn is called when the real-endpoint call fails (transient
@@ -80,6 +102,14 @@ type HeartbeatService struct {
 	// string forces the next beat to include the list (covers the boot
 	// case and the "previously empty, now populated" transition).
 	lastAllowlistHash string
+
+	// pendingApplied / pendingFailures buffer mutation ACKs that arrived
+	// in the previous heartbeat response, were applied locally, and are
+	// waiting to be reported on the next outbound beat. Cleared only on a
+	// successful heartbeat call — a network failure leaves them buffered
+	// so they re-ride the next attempt.
+	pendingApplied   []string
+	pendingFailures  []HeartbeatMutationFailure
 }
 
 // NewHeartbeatService constructs a HeartbeatService from opts. Required
@@ -197,6 +227,14 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		h.mu.Unlock()
 	}
 
+	// Phase 2c: pull any ACKs we owe the platform from the buffer. Cleared
+	// only on a SUCCESSFUL POST below; a network failure leaves them
+	// queued for the next attempt.
+	h.mu.Lock()
+	ackApplied := append([]string(nil), h.pendingApplied...)
+	ackFailures := append([]HeartbeatMutationFailure(nil), h.pendingFailures...)
+	h.mu.Unlock()
+
 	h.mu.Lock()
 	h.last = payload
 	h.mu.Unlock()
@@ -217,8 +255,12 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 	if stubModeRequested() || strings.HasPrefix(jwt, "stub.") {
 		return
 	}
-	err := h.callEndpoint(ctx, payload)
+	resp, err := h.callEndpoint(ctx, payload, ackApplied, ackFailures)
 	if err == nil {
+		// Successful POST — drop the ACKs we just confirmed, then process
+		// the platform's response (hostStatus + pendingMutations).
+		h.dropConfirmedAcks(ackApplied, ackFailures)
+		h.handleHeartbeatResponse(ctx, resp)
 		return
 	}
 	// On 401 (token expired/invalid) or 404 (worker fell out of Redis),
@@ -250,8 +292,12 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		// move on — the next tick will try again.
 		retryPayload := payload
 		retryPayload.WorkerID = newWorkerID
-		if retryErr := h.callEndpoint(ctx, retryPayload); retryErr != nil {
+		retryResp, retryErr := h.callEndpoint(ctx, retryPayload, ackApplied, ackFailures)
+		if retryErr != nil {
 			h.opts.LogWarn("daemon heartbeat post-refresh also failed: %v", retryErr)
+		} else {
+			h.dropConfirmedAcks(ackApplied, ackFailures)
+			h.handleHeartbeatResponse(ctx, retryResp)
 		}
 		return
 	}
@@ -268,11 +314,19 @@ func (h *HeartbeatService) workerIDLocked() string {
 // heartbeatRequestBody is the JSON body sent on POST
 // /api/workers/<id>/heartbeat. Matches the platform contract:
 //
-//	{ activeCount: number, maxSessions?: number, load?: { cpu, memory } }
+//	{ activeCount, maxSessions?, load?, allowlistHash?, allowlist?,
+//	  appliedMutations?, mutationFailures? }
+//
+// allowlistHash + allowlist are Phase 1d fields; appliedMutations +
+// mutationFailures are Phase 2c ACK fields.
 type heartbeatRequestBody struct {
-	ActiveCount int                  `json:"activeCount"`
-	MaxSessions int                  `json:"maxSessions,omitempty"`
-	Load        *heartbeatLoadFields `json:"load,omitempty"`
+	ActiveCount      int                          `json:"activeCount"`
+	MaxSessions      int                          `json:"maxSessions,omitempty"`
+	Load             *heartbeatLoadFields         `json:"load,omitempty"`
+	AllowlistHash    string                       `json:"allowlistHash,omitempty"`
+	Allowlist        []ProjectAllowlistEntry      `json:"allowlist,omitempty"`
+	AppliedMutations []string                     `json:"appliedMutations,omitempty"`
+	MutationFailures []HeartbeatMutationFailure   `json:"mutationFailures,omitempty"`
 }
 
 type heartbeatLoadFields struct {
@@ -280,42 +334,156 @@ type heartbeatLoadFields struct {
 	Memory float64 `json:"memory"`
 }
 
-func (h *HeartbeatService) callEndpoint(ctx context.Context, payload HeartbeatPayload) error {
+// HeartbeatMutationFailure is sent in the request body's mutationFailures[]
+// to ACK a queued daemon-config mutation that failed locally.
+type HeartbeatMutationFailure struct {
+	ID    string `json:"id"`
+	Error string `json:"error"`
+}
+
+// PendingMutation mirrors the platform's serializePendingMutation wire shape
+// — included in the heartbeat response so the daemon can apply queued
+// proposals and ACK on the next beat. Phase 2 of
+// 2026-05-18-daemon-config-sync-DESIGN.md.
+type PendingMutation struct {
+	ID          string          `json:"id"`
+	Op          string          `json:"op"` // project.add | project.remove
+	Params      json.RawMessage `json:"params"`
+	RequestedAt string          `json:"requestedAt"`
+	RequestedBy string          `json:"requestedBy"`
+}
+
+// HostStatusDetail mirrors the platform's wire shape for hostStatus in the
+// heartbeat response. The daemon uses this to decide whether to keep
+// claiming work or surface a re-register recommendation.
+type HostStatusDetail struct {
+	Status            string   `json:"status"` // ok | pool_deleted | pool_draining | pool_disabled | unauthorized
+	RecommendedAction string   `json:"recommendedAction,omitempty"`
+	CandidatePoolIds  []string `json:"candidatePoolIds,omitempty"`
+}
+
+// heartbeatResponseBody is the JSON the platform sends back from the
+// heartbeat endpoint. The pre-Phase-2 platform returned just
+// {acknowledged, serverTime, pendingWorkCount}; Phase 2 adds hostStatus
+// and pendingMutations. Both are optional — a daemon talking to a
+// pre-Phase-2 platform unmarshals the missing fields to zero values.
+type heartbeatResponseBody struct {
+	Acknowledged     bool              `json:"acknowledged"`
+	ServerTime       string            `json:"serverTime"`
+	PendingWorkCount int               `json:"pendingWorkCount"`
+	HostStatus       *HostStatusDetail `json:"hostStatus,omitempty"`
+	PendingMutations []PendingMutation `json:"pendingMutations,omitempty"`
+}
+
+func (h *HeartbeatService) callEndpoint(
+	ctx context.Context,
+	payload HeartbeatPayload,
+	ackApplied []string,
+	ackFailures []HeartbeatMutationFailure,
+) (*heartbeatResponseBody, error) {
 	h.mu.Lock()
 	workerID := h.workerID
 	jwt := h.jwt
 	h.mu.Unlock()
 	if workerID == "" {
-		return fmt.Errorf("no worker id")
+		return nil, fmt.Errorf("no worker id")
 	}
 	url := strings.TrimRight(h.opts.OrchestratorURL, "/") + "/api/workers/" + workerID + "/heartbeat"
 
 	body := heartbeatRequestBody{
-		ActiveCount: payload.ActiveSessions,
-		MaxSessions: payload.MaxSessions,
+		ActiveCount:      payload.ActiveSessions,
+		MaxSessions:      payload.MaxSessions,
+		AllowlistHash:    payload.AllowlistHash,
+		Allowlist:        payload.Allowlist,
+		AppliedMutations: ackApplied,
+		MutationFailures: ackFailures,
 	}
 	buf, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("marshal payload: %w", err)
+		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("User-Agent", "rensei-daemon/"+Version)
 	res, err := h.opts.HTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("post: %w", err)
+		return nil, fmt.Errorf("post: %w", err)
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode >= 400 {
 		errBuf, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
 		snippet := strings.TrimSpace(string(errBuf))
-		return &heartbeatHTTPError{status: res.StatusCode, body: snippet}
+		return nil, &heartbeatHTTPError{status: res.StatusCode, body: snippet}
 	}
-	return nil
+	// Parse response body (Phase 2). Pre-Phase-2 platforms send only
+	// {acknowledged, serverTime, pendingWorkCount} — the additional
+	// fields unmarshal as zero values.
+	var resp heartbeatResponseBody
+	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
+		// Unparseable response body — log and fall back to "ACK accepted,
+		// no mutations to apply". The next beat will re-try the round trip.
+		h.opts.LogWarn("daemon heartbeat response unparseable: %v", err)
+		return &heartbeatResponseBody{Acknowledged: true}, nil
+	}
+	return &resp, nil
+}
+
+// dropConfirmedAcks removes the ACK entries the platform just accepted
+// from the pending buffer. Compares by mutation id so concurrent applies
+// landing during the in-flight beat don't get lost.
+func (h *HeartbeatService) dropConfirmedAcks(applied []string, failures []HeartbeatMutationFailure) {
+	if len(applied) == 0 && len(failures) == 0 {
+		return
+	}
+	confirmedApplied := make(map[string]bool, len(applied))
+	for _, id := range applied {
+		confirmedApplied[id] = true
+	}
+	confirmedFailed := make(map[string]bool, len(failures))
+	for _, f := range failures {
+		confirmedFailed[f.ID] = true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	next := h.pendingApplied[:0]
+	for _, id := range h.pendingApplied {
+		if !confirmedApplied[id] {
+			next = append(next, id)
+		}
+	}
+	h.pendingApplied = append([]string(nil), next...)
+	nextF := h.pendingFailures[:0]
+	for _, f := range h.pendingFailures {
+		if !confirmedFailed[f.ID] {
+			nextF = append(nextF, f)
+		}
+	}
+	h.pendingFailures = append([]HeartbeatMutationFailure(nil), nextF...)
+}
+
+// handleHeartbeatResponse invokes the response-side callbacks: hostStatus
+// surfacing and pending-mutation application. Applied/failed mutation ids
+// returned by OnPendingMutations are buffered for ACK on the next beat.
+func (h *HeartbeatService) handleHeartbeatResponse(ctx context.Context, resp *heartbeatResponseBody) {
+	if resp == nil {
+		return
+	}
+	if resp.HostStatus != nil && h.opts.OnHostStatus != nil {
+		h.opts.OnHostStatus(*resp.HostStatus)
+	}
+	if len(resp.PendingMutations) > 0 && h.opts.OnPendingMutations != nil {
+		applied, failures := h.opts.OnPendingMutations(ctx, resp.PendingMutations)
+		if len(applied) > 0 || len(failures) > 0 {
+			h.mu.Lock()
+			h.pendingApplied = append(h.pendingApplied, applied...)
+			h.pendingFailures = append(h.pendingFailures, failures...)
+			h.mu.Unlock()
+		}
+	}
 }
 
 // heartbeatHTTPError carries the HTTP status so callers can branch on 401

@@ -237,6 +237,25 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 	return nil
 }
 
+// SetProjects atomically swaps the spawner's project allowlist used by
+// AcceptWork's findProjectLocked check. Existing in-flight sessions
+// continue against whichever project they were dispatched under — the
+// new list governs only future AcceptWork calls.
+//
+// Phase 2c of 2026-05-18-daemon-config-sync-DESIGN.md — wired by the
+// mutation-applier so platform-driven project.add / project.remove
+// proposals take effect on the very next claim without a daemon restart.
+//
+// A defensive copy is taken so subsequent mutations to the caller's
+// slice (e.g. daemon.go reusing a single buffer) don't race the spawner.
+func (s *WorkerSpawner) SetProjects(projects []ProjectConfig) {
+	cp := make([]ProjectConfig, len(projects))
+	copy(cp, projects)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opts.Projects = cp
+}
+
 // AcceptWork validates the spec, spawns a worker, and returns its handle.
 func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	s.mu.Lock()
