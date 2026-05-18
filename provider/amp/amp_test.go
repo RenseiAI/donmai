@@ -427,7 +427,7 @@ func writeFakeAmpScript(t *testing.T) string {
 	if err := f.Close(); err != nil {
 		t.Fatalf("close fake amp script: %v", err)
 	}
-	if err := os.Chmod(f.Name(), 0o700); err != nil {
+	if err := os.Chmod(f.Name(), 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("chmod fake amp script: %v", err)
 	}
 	return f.Name()
@@ -447,7 +447,7 @@ func TestFakeAmpScript_ProducesExpectedLines(t *testing.T) {
 	t.Parallel()
 
 	scriptPath := writeFakeAmpScript(t)
-	cmd := exec.Command(scriptPath)
+	cmd := exec.Command(scriptPath) //nolint:gosec // test fixture: subprocess path is t.TempDir()-scoped
 	// Provide a dummy stdin so the script's cat can drain it.
 	cmd.Stdin = strings.NewReader("test prompt")
 	out, err := cmd.Output()

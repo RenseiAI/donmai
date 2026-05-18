@@ -51,7 +51,7 @@ func (s *stubOp) run(_ context.Context, args ...string) ([]byte, error) {
 func newFakeGitRoot(t *testing.T) string {
 	t.Helper()
 	proj := filepath.Join(t.TempDir(), "proj")
-	if err := os.MkdirAll(filepath.Join(proj, ".git"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(proj, ".git"), 0o750); err != nil {
 		t.Fatalf("mkdir .git: %v", err)
 	}
 	return proj
@@ -209,7 +209,7 @@ func TestRunSetup_VaultMissingRetriesUntilFound(t *testing.T) {
 		},
 	}
 	// Override RunOp via a closure that handles the vault loop.
-	runOp := func(ctx context.Context, args ...string) ([]byte, error) {
+	runOp := func(_ context.Context, args ...string) ([]byte, error) {
 		op.calls = append(op.calls, strings.Join(args, " "))
 		if len(args) > 0 && args[0] == "vault" {
 			vaultAttempts++

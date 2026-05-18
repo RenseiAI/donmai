@@ -273,11 +273,11 @@ func (c *captureWriter) snapshot() []string {
 
 // waitForLine polls the captured stdout buffer until `substr` appears or
 // the deadline expires. Returns the captured snapshot for further checks.
-func waitForLine(t *testing.T, cap *captureWriter, substr string, timeout time.Duration) []string {
+func waitForLine(t *testing.T, capability *captureWriter, substr string, timeout time.Duration) []string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		snap := cap.snapshot()
+		snap := capability.snapshot()
 		for _, l := range snap {
 			if strings.Contains(l, substr) {
 				return snap
@@ -285,7 +285,7 @@ func waitForLine(t *testing.T, cap *captureWriter, substr string, timeout time.D
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return cap.snapshot()
+	return capability.snapshot()
 }
 
 // TestSpawner_OnPreSpawn_Invoked verifies the hook fires exactly once per
@@ -390,12 +390,12 @@ func TestSpawner_OnPreSpawn_SeesBaseEnv(t *testing.T) {
 // by the hook is echoed by the worker stub and surfaces via the prefix
 // writer.
 func TestSpawner_OnPreSpawn_ReturnedEnvIsExeced(t *testing.T) {
-	cap := &captureWriter{}
+	capability := &captureWriter{}
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'sentinel=%s\n' "$ONPRESPAWN_SENTINEL"; exit 0`},
-		StdoutPrefixWriter:    cap,
+		StdoutPrefixWriter:    capability,
 		OnPreSpawn: func(_ SessionSpec, env []string) []string {
 			return append(env, "ONPRESPAWN_SENTINEL=hello-from-hook")
 		},
@@ -406,7 +406,7 @@ func TestSpawner_OnPreSpawn_ReturnedEnvIsExeced(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	lines := waitForLine(t, cap, "sentinel=", 2*time.Second)
+	lines := waitForLine(t, capability, "sentinel=", 2*time.Second)
 	want := "sentinel=hello-from-hook"
 	found := false
 	for _, l := range lines {
@@ -425,13 +425,13 @@ func TestSpawner_OnPreSpawn_ReturnedEnvIsExeced(t *testing.T) {
 // given key per Go's exec semantics, so appending an override after the
 // input slice is the documented way for callers to win against BaseEnv.
 func TestSpawner_OnPreSpawn_OverridesBaseEnv(t *testing.T) {
-	cap := &captureWriter{}
+	capability := &captureWriter{}
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		BaseEnv:               map[string]string{"OVERRIDE_ME": "base-value"},
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'override=%s\n' "$OVERRIDE_ME"; exit 0`},
-		StdoutPrefixWriter:    cap,
+		StdoutPrefixWriter:    capability,
 		OnPreSpawn: func(_ SessionSpec, env []string) []string {
 			return append(env, "OVERRIDE_ME=hook-wins")
 		},
@@ -442,7 +442,7 @@ func TestSpawner_OnPreSpawn_OverridesBaseEnv(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	lines := waitForLine(t, cap, "override=", 2*time.Second)
+	lines := waitForLine(t, capability, "override=", 2*time.Second)
 	want := "override=hook-wins"
 	found := false
 	for _, l := range lines {
@@ -459,13 +459,13 @@ func TestSpawner_OnPreSpawn_OverridesBaseEnv(t *testing.T) {
 // TestSpawner_OnPreSpawn_NilReturnUsesInput verifies that a hook returning
 // nil is a no-op — the env composeEnv produced is what reaches the child.
 func TestSpawner_OnPreSpawn_NilReturnUsesInput(t *testing.T) {
-	cap := &captureWriter{}
+	capability := &captureWriter{}
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		BaseEnv:               map[string]string{"BASE_KEY": "base-value"},
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'base=%s\n' "$BASE_KEY"; exit 0`},
-		StdoutPrefixWriter:    cap,
+		StdoutPrefixWriter:    capability,
 		OnPreSpawn: func(_ SessionSpec, _ []string) []string {
 			return nil
 		},
@@ -476,7 +476,7 @@ func TestSpawner_OnPreSpawn_NilReturnUsesInput(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	lines := waitForLine(t, cap, "base=", 2*time.Second)
+	lines := waitForLine(t, capability, "base=", 2*time.Second)
 	want := "base=base-value"
 	found := false
 	for _, l := range lines {
@@ -494,13 +494,13 @@ func TestSpawner_OnPreSpawn_NilReturnUsesInput(t *testing.T) {
 // SpawnerOptions with OnPreSpawn unset must spawn normally without
 // panicking and without altering the env contract.
 func TestSpawner_OnPreSpawn_NilHookNoPanic(t *testing.T) {
-	cap := &captureWriter{}
+	capability := &captureWriter{}
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		BaseEnv:               map[string]string{"BASE_KEY": "base-value"},
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'nohook=%s\n' "$BASE_KEY"; exit 0`},
-		StdoutPrefixWriter:    cap,
+		StdoutPrefixWriter:    capability,
 		// OnPreSpawn intentionally left nil.
 	})
 	if _, err := s.AcceptWork(SessionSpec{
@@ -509,7 +509,7 @@ func TestSpawner_OnPreSpawn_NilHookNoPanic(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	lines := waitForLine(t, cap, "nohook=", 2*time.Second)
+	lines := waitForLine(t, capability, "nohook=", 2*time.Second)
 	want := "nohook=base-value"
 	found := false
 	for _, l := range lines {

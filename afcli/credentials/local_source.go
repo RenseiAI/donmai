@@ -135,7 +135,7 @@ func (s *LocalSource) loadEnvLocal(path string) error {
 
 	// World-readable bits — warn but don't refuse.
 	if info.Mode().Perm()&0o044 != 0 {
-		fmt.Fprintf(s.stderr,
+		_, _ = fmt.Fprintf(s.stderr,
 			"AF-TUI: %s is world-readable. Recommend `chmod 600`. Continuing.\n",
 			path,
 		)
@@ -145,7 +145,7 @@ func (s *LocalSource) loadEnvLocal(path string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	lineNo := 0
@@ -155,7 +155,7 @@ func (s *LocalSource) loadEnvLocal(path string) error {
 		k, v, ok := parseDotenvLine(line)
 		if !ok {
 			// Strip the value side so a redacted assignment doesn't leak.
-			fmt.Fprintf(s.stderr,
+			_, _ = fmt.Fprintf(s.stderr,
 				"AF-TUI: %s line %d malformed, skipping\n",
 				path, lineNo,
 			)
@@ -326,7 +326,7 @@ func (s *LocalSource) WarnMissing(names []string) {
 		if _, _, ok := s.Resolve(n); ok {
 			continue
 		}
-		fmt.Fprintf(s.stderr, "[creds] no source for %s — agent may fail\n", n)
+		_, _ = fmt.Fprintf(s.stderr, "[creds] no source for %s — agent may fail\n", n)
 	}
 }
 

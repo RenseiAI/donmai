@@ -266,12 +266,12 @@ Example:
 
 func newGitHubCreateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 	var (
-		ownerF, repoF   string
-		title           string
-		body            string
-		bodyFile        string
-		labels          string
-		assignees       string
+		ownerF, repoF string
+		title         string
+		body          string
+		bodyFile      string
+		labels        string
+		assignees     string
 	)
 
 	cmd := &cobra.Command{
@@ -285,7 +285,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if title == "" {
-				return fmt.Errorf("usage: af github create-issue --repo owner/repo --title \"Title\" [--body \"...\"] ...")
+				return fmt.Errorf("usage: af github create-issue --repo owner/repo --title \"Title\" [--body \"text\"]")
 			}
 			client, err := newGitHubClient(ds)
 			if err != nil {

@@ -29,18 +29,18 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func issueFixture(number int, title, state string) map[string]any {
 	return map[string]any{
-		"number":    number,
-		"title":     title,
-		"body":      "body text",
-		"state":     state,
-		"html_url":  fmt.Sprintf("https://github.com/owner/repo/issues/%d", number),
+		"number":     number,
+		"title":      title,
+		"body":       "body text",
+		"state":      state,
+		"html_url":   fmt.Sprintf("https://github.com/owner/repo/issues/%d", number),
 		"created_at": time.Now().UTC().Format(time.RFC3339),
 		"updated_at": time.Now().UTC().Format(time.RFC3339),
-		"labels":    []map[string]any{{"id": 1, "name": "bug", "color": "d73a4a", "description": ""}},
-		"assignees": []map[string]any{},
-		"user":      map[string]any{"login": "alice", "name": "Alice", "email": "", "html_url": "", "avatar_url": ""},
-		"milestone": nil,
-		"comments":  0,
+		"labels":     []map[string]any{{"id": 1, "name": "bug", "color": "d73a4a", "description": ""}},
+		"assignees":  []map[string]any{},
+		"user":       map[string]any{"login": "alice", "name": "Alice", "email": "", "html_url": "", "avatar_url": ""},
+		"milestone":  nil,
+		"comments":   0,
 	}
 }
 
@@ -174,8 +174,10 @@ func TestListIssueComments(t *testing.T) {
 			return
 		}
 		writeJSON(w, http.StatusOK, []map[string]any{
-			{"id": 1001, "body": "hello", "html_url": "https://x", "created_at": now, "updated_at": now,
-				"user": map[string]any{"login": "bob", "name": "Bob", "email": "", "html_url": "", "avatar_url": ""}},
+			{
+				"id": 1001, "body": "hello", "html_url": "https://x", "created_at": now, "updated_at": now,
+				"user": map[string]any{"login": "bob", "name": "Bob", "email": "", "html_url": "", "avatar_url": ""},
+			},
 		})
 	})
 
@@ -384,7 +386,7 @@ func TestAPIError(t *testing.T) {
 	t.Parallel()
 	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-			"message": "Validation Failed",
+			"message":           "Validation Failed",
 			"documentation_url": "https://docs.github.com/rest",
 		})
 	})

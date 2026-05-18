@@ -213,7 +213,7 @@ func TestBinaryOnPath_NotFound(t *testing.T) {
 }
 
 func TestBinaryOnPath_ErrorTreatedAsAbsent(t *testing.T) {
-	lookup := func(name string) (string, error) {
+	lookup := func(_ string) (string, error) {
 		return "", errors.New("lookup error")
 	}
 	if binaryOnPath(lookup, "anything") {
@@ -223,7 +223,7 @@ func TestBinaryOnPath_ErrorTreatedAsAbsent(t *testing.T) {
 
 func TestBinaryOnPath_EmptyPathTreatedAsAbsent(t *testing.T) {
 	// Some systems return ("", nil) instead of ("", err) for not-found.
-	lookup := func(name string) (string, error) {
+	lookup := func(_ string) (string, error) {
 		return "", nil
 	}
 	if binaryOnPath(lookup, "node") {

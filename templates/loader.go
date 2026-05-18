@@ -20,6 +20,7 @@ import (
 // constant for exhaustive switch safety.
 type Kind string
 
+// Kind values for the template envelope.
 const (
 	KindWorkflowTemplate Kind = "WorkflowTemplate"
 	KindPartialTemplate  Kind = "PartialTemplate"
@@ -135,7 +136,7 @@ func (t *Template) validate() error {
 // Load is the single entry point for the templates package in Phase H.
 // Rendering (Handlebars) and registry management are deferred to H+1.
 func Load(path string) (Template, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is operator-supplied by design
 	if err != nil {
 		return Template{}, fmt.Errorf("templates: read %q: %w", path, err)
 	}

@@ -307,7 +307,7 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 	go writePromptStdin(stdin, spec.Prompt, h.logger)
 	go drainStderr(stderr, stderrBuf, h.logger)
 	go h.readStdout()
-	go h.watchCtx(ctx)
+	go h.watchCtx(ctx) //nolint:gosec // G118: watchCtx intentionally uses context.Background for shutdown (see body)
 
 	return h, nil
 }
@@ -383,8 +383,6 @@ type openCodeHandle struct {
 
 	done    chan struct{}
 	waitErr atomic.Pointer[error]
-
-	terminal atomic.Bool
 }
 
 // SessionID returns the provider-native session id captured from the
@@ -473,7 +471,10 @@ func (h *openCodeHandle) closeEvents() {
 func (h *openCodeHandle) watchCtx(ctx context.Context) {
 	select {
 	case <-ctx.Done():
-		stopCtx, cancel := context.WithTimeout(context.Background(), stopGracePeriod+2*time.Second)
+		// Intentional context.Background(): parent ctx is already canceled at
+		// this branch, so deriving from it would yield an already-canceled
+		// context unfit for the grace-period Stop.
+		stopCtx, cancel := context.WithTimeout(context.Background(), stopGracePeriod+2*time.Second) //nolint:gosec // G118: see comment above
 		defer cancel()
 		_ = h.Stop(stopCtx)
 	case <-h.shutdown:
@@ -518,17 +519,10 @@ func (h *openCodeHandle) readStdout() {
 			if ev == nil {
 				continue
 			}
-			// Capture session ID from the first event that carries it.
-			type sessionCarrier interface{ getSessionID() string }
-			switch typed := ev.(type) {
-			case agent.InitEvent:
-				if typed.SessionID != "" {
-					id := typed.SessionID
-					h.sessionID.Store(&id)
-				}
-			case agent.ResultEvent:
-				terminal = true
-				_ = typed
+			// Capture session ID from the first InitEvent that carries it.
+			if typed, ok := ev.(agent.InitEvent); ok && typed.SessionID != "" {
+				id := typed.SessionID
+				h.sessionID.Store(&id)
 			}
 			h.sendEvent(ev)
 		}
@@ -578,14 +572,14 @@ type rawOpenCodeEnvelope struct {
 
 // rawOpenCodePart decodes the nested "part" object.
 type rawOpenCodePart struct {
-	Type    string  `json:"type"`
-	Text    string  `json:"text,omitempty"`
-	Reason  string  `json:"reason,omitempty"`
-	Tokens  *tokens `json:"tokens,omitempty"`
-	Cost    float64 `json:"cost"`
+	Type   string  `json:"type"`
+	Text   string  `json:"text,omitempty"`
+	Reason string  `json:"reason,omitempty"`
+	Tokens *tokens `json:"tokens,omitempty"`
+	Cost   float64 `json:"cost"`
 	// Tool-use part fields.
-	Tool   string               `json:"tool,omitempty"`
-	CallID string               `json:"callID,omitempty"`
+	Tool   string                `json:"tool,omitempty"`
+	CallID string                `json:"callID,omitempty"`
 	State  *rawOpenCodeToolState `json:"state,omitempty"`
 }
 
