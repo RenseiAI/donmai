@@ -44,8 +44,11 @@ func fakeMultiCLI(t *testing.T, parentBody, resumeBody, traceFile string) string
 		"CLAUDE_PARENT_EOF\n" +
 		"    ;;\n" +
 		"esac\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("write fake cli: %v", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+		t.Fatalf("chmod fake cli: %v", err)
 	}
 	return path
 }
@@ -111,8 +114,11 @@ func TestHandle_Inject_BeforeInit_Errors(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "slow-init-claude.sh")
 	script := "#!/bin/sh\nsleep 5\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("write: %v", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+		t.Fatalf("chmod fake cli: %v", err)
 	}
 	p := newProviderForFake(t, path)
 	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "x"})
@@ -155,8 +161,11 @@ func TestHandle_Inject_InFlightConflict_Errors(t *testing.T) {
 		"PARENT_EOF\n" +
 		"    ;;\n" +
 		"esac\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("write: %v", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+		t.Fatalf("chmod fake cli: %v", err)
 	}
 	p := newProviderForFake(t, path)
 
@@ -232,8 +241,11 @@ func TestHandle_Inject_CtxCancel_KillsSubprocess(t *testing.T) {
 		"PARENT_EOF\n" +
 		"    ;;\n" +
 		"esac\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("write: %v", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+		t.Fatalf("chmod fake cli: %v", err)
 	}
 	p := newProviderForFake(t, path)
 
