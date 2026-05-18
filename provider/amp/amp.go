@@ -109,9 +109,15 @@ func (*Provider) Name() agent.ProviderName { return agent.ProviderAmp }
 // and is deferred to a follow-up.
 func (*Provider) Capabilities() agent.Capabilities {
 	return agent.Capabilities{
-		SupportsMessageInjection:            false, // future: amp threads continue <threadId> -x --stream-json
-		SupportsSessionResume:               false, // future: same mechanism
-		SupportsToolPlugins:                 false, // amp manages its own tools via settings.json
+		SupportsMessageInjection: false, // future: amp threads continue <threadId> -x --stream-json
+		SupportsSessionResume:    false, // future: same mechanism
+		// SupportsToolPlugins: amp accepts --mcp-config and the Spawn
+		// path writes the per-session MCP tmpfile (see Spawn above),
+		// so MCP stdio servers are wired end-to-end. This is the
+		// honest declaration; the invariant
+		// "AcceptsMcpServerSpec=true requires SupportsToolPlugins=true"
+		// (afcli/tooluse_matrix_test.go) holds with this pair true.
+		SupportsToolPlugins:                 true,
 		NeedsBaseInstructions:               false,
 		NeedsPermissionConfig:               false,
 		SupportsCodeIntelligenceEnforcement: false,
