@@ -191,6 +191,79 @@ func TestBuildConfigFilePreservesOrderInKeys(t *testing.T) {
 	}
 }
 
+func TestBuildHTTPRoundtrip(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	in := []agent.MCPServerConfig{{
+		Name: "rensei-platform",
+		Type: "http",
+		URL:  "https://app.rensei.ai/api/mcp/sess_X",
+		Headers: map[string]string{
+			"Authorization": "Bearer rsk_test_token",
+		},
+	}}
+
+	b := &mcp.Builder{TempDir: dir}
+	path, cleanup, err := b.Build(in)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer cleanup()
+
+	cfg, err := mcp.LoadConfigFile(path)
+	if err != nil {
+		t.Fatalf("LoadConfigFile: %v", err)
+	}
+	got, ok := cfg.MCPServers["rensei-platform"]
+	if !ok {
+		t.Fatal("missing rensei-platform entry")
+	}
+	if got.Type != "http" {
+		t.Fatalf("type=%q, want http", got.Type)
+	}
+	if got.URL != "https://app.rensei.ai/api/mcp/sess_X" {
+		t.Fatalf("url=%q", got.URL)
+	}
+	if got.Headers["Authorization"] != "Bearer rsk_test_token" {
+		t.Fatalf("auth header=%q", got.Headers["Authorization"])
+	}
+	// stdio-side fields should be absent (omitempty drops them).
+	if got.Command != "" || len(got.Args) != 0 {
+		t.Fatalf("stdio fields leaked into http entry: command=%q args=%v", got.Command, got.Args)
+	}
+}
+
+func TestBuildHTTPRejectsEmptyURL(t *testing.T) {
+	t.Parallel()
+	b := mcp.NewBuilder()
+	_, _, err := b.Build([]agent.MCPServerConfig{{
+		Name: "broken",
+		Type: "http",
+	}})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty URL") {
+		t.Fatalf("error %q missing %q", err.Error(), "empty URL")
+	}
+}
+
+func TestBuildRejectsUnknownType(t *testing.T) {
+	t.Parallel()
+	b := mcp.NewBuilder()
+	_, _, err := b.Build([]agent.MCPServerConfig{{
+		Name: "broken",
+		Type: "sse",
+	}})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown type") {
+		t.Fatalf("error %q missing %q", err.Error(), "unknown type")
+	}
+}
+
 func TestBuildDefensivelyCopiesArgsAndEnv(t *testing.T) {
 	t.Parallel()
 

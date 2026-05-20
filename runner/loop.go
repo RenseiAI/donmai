@@ -758,12 +758,35 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	return envMap
 }
 
-// defaultMCPServers returns the list of MCP stdio servers every
-// session ships with by default. Today empty — F.5 wires
-// af_linear / af_code MCP entries through the daemon's installed
-// plugin set. Kept here so the runner has a single point to extend.
-func defaultMCPServers(_ QueuedWork) []agent.MCPServerConfig {
-	return nil
+// defaultMCPServers returns the list of MCP servers every session ships
+// with by default.
+//
+// Currently emits one HTTP entry per session pointing at the platform's
+// per-session MCP endpoint (/api/mcp/<sessionId>). The platform applies
+// the A2A capability bundle filter at list-tools time and the
+// defense-in-depth allow-list check at tool-call time — see the A2A ADR
+// at runs/2026-05-20-adr-a2a-per-session-mcp.md.
+//
+// When PlatformURL or AuthToken are missing (standalone-mode sessions
+// without a platform), the entry is omitted: the agent runs without any
+// MCP gate, which matches the legacy back-compat path.
+//
+// F.5 will layer additional entries (af_linear / af_code stdio plugins)
+// once the daemon's installed-plugin set is wired through. This function
+// is the single place the runner extends MCP defaults.
+func defaultMCPServers(qw QueuedWork) []agent.MCPServerConfig {
+	if qw.PlatformURL == "" || qw.AuthToken == "" || qw.SessionID == "" {
+		return nil
+	}
+	url := strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID
+	return []agent.MCPServerConfig{{
+		Name: "rensei-platform",
+		Type: "http",
+		URL:  url,
+		Headers: map[string]string{
+			"Authorization": "Bearer " + qw.AuthToken,
+		},
+	}}
 }
 
 // scanWorkResult scans the assistant text for the WORK_RESULT marker

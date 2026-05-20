@@ -390,6 +390,92 @@ func TestObserveEvent_ScansWorkResultMarker(t *testing.T) {
 	}
 }
 
+// TestDefaultMCPServers_EmitsHTTPEntryPerSession pins the A2A per-session
+// MCP wire-up: when QueuedWork has PlatformURL + AuthToken + SessionID,
+// defaultMCPServers emits a single HTTP entry pointing at the platform's
+// /api/mcp/<sessionId> route with the worker bearer in Authorization.
+func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
+	t.Parallel()
+
+	qw := QueuedWork{}
+	qw.SessionID = "sess_abc"
+	qw.PlatformURL = "https://app.rensei.ai"
+	qw.AuthToken = "rsk_test"
+
+	servers := defaultMCPServers(qw)
+	if len(servers) != 1 {
+		t.Fatalf("len(servers)=%d, want 1", len(servers))
+	}
+	got := servers[0]
+	if got.Name != "rensei-platform" {
+		t.Errorf("name=%q, want rensei-platform", got.Name)
+	}
+	if got.Type != "http" {
+		t.Errorf("type=%q, want http", got.Type)
+	}
+	if got.URL != "https://app.rensei.ai/api/mcp/sess_abc" {
+		t.Errorf("url=%q", got.URL)
+	}
+	if got.Headers["Authorization"] != "Bearer rsk_test" {
+		t.Errorf("auth header=%q", got.Headers["Authorization"])
+	}
+}
+
+// TestDefaultMCPServers_TrimsTrailingSlash makes sure the URL composer
+// doesn't emit a double-slash when PlatformURL has a trailing slash.
+func TestDefaultMCPServers_TrimsTrailingSlash(t *testing.T) {
+	t.Parallel()
+
+	qw := QueuedWork{}
+	qw.SessionID = "sess_xyz"
+	qw.PlatformURL = "https://app.rensei.ai/"
+	qw.AuthToken = "rsk_test"
+
+	servers := defaultMCPServers(qw)
+	if len(servers) != 1 {
+		t.Fatalf("len(servers)=%d, want 1", len(servers))
+	}
+	if servers[0].URL != "https://app.rensei.ai/api/mcp/sess_xyz" {
+		t.Errorf("url=%q (double-slash leak?)", servers[0].URL)
+	}
+}
+
+// TestDefaultMCPServers_OmitsWhenStandalone pins the back-compat path:
+// in standalone mode (no PlatformURL or no AuthToken), no MCP entry is
+// emitted at all and the agent runs without the per-session gate.
+func TestDefaultMCPServers_OmitsWhenStandalone(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		qw   QueuedWork
+	}{
+		{"no PlatformURL", func() QueuedWork {
+			qw := QueuedWork{AuthToken: "rsk_test"}
+			qw.SessionID = "sess_1"
+			return qw
+		}()},
+		{"no AuthToken", func() QueuedWork {
+			qw := QueuedWork{PlatformURL: "https://app.rensei.ai"}
+			qw.SessionID = "sess_1"
+			return qw
+		}()},
+		{"no SessionID", QueuedWork{
+			PlatformURL: "https://app.rensei.ai",
+			AuthToken:   "rsk_test",
+		}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := defaultMCPServers(tc.qw); got != nil {
+				t.Errorf("got %+v; want nil", got)
+			}
+		})
+	}
+}
+
 // TestScanPRURL_ExtractsURL confirms the regex captures a github PR
 // URL out of arbitrary tool output.
 func TestScanPRURL_ExtractsURL(t *testing.T) {
