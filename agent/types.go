@@ -219,17 +219,31 @@ const (
 	EffortXHigh  EffortLevel = "xhigh"
 )
 
-// MCPServerConfig is one stdio-transport MCP server the provider should
-// configure on session start. Providers that support MCP tool plugins
-// inject these on session init (Claude: via --mcp-config; Codex: via
-// config/batchWrite mcpStdioServers).
+// MCPServerConfig is one MCP server the provider should configure on
+// session start. Providers that support MCP tool plugins inject these on
+// session init (Claude: via --mcp-config; Codex: via config/batchWrite
+// mcpStdioServers).
 //
-// Verbatim port of the legacy TS AgentSpawnConfig.mcpStdioServers element.
+// Two transports are supported:
+//   - stdio  — Command + Args + Env (the original / legacy shape)
+//   - http   — URL + Headers (Streamable HTTP, used by the platform's
+//     per-session MCP endpoint at /api/mcp/<sessionId> — see the A2A
+//     per-session MCP ADR)
+//
+// Type is the discriminator. When empty it defaults to "stdio" so existing
+// callers that only set Command/Args/Env keep working unchanged.
 type MCPServerConfig struct {
-	Name    string            `json:"name"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args"`
+	Name string `json:"name"`
+	// Type is the transport shape. Either "stdio" (default) or "http".
+	Type    string            `json:"type,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
+	// URL is the HTTP MCP endpoint when Type == "http".
+	URL string `json:"url,omitempty"`
+	// Headers are HTTP headers to send on every MCP request. Typically
+	// holds the Authorization bearer for the platform's MCP route.
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // PermissionConfig is the runtime permission policy for the codex

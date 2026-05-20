@@ -14,50 +14,90 @@ import (
 // provider sends over JSON-RPC.
 //
 // It mirrors the legacy TS SDK's McpStdioServerConfig record-of-records
-// (Object.fromEntries(specs.map(s => [s.name, {type:'stdio', ...}]))).
+// (Object.fromEntries(specs.map(s => [s.name, {type:'stdio', ...}]))) and
+// extends it with the modern HTTP transport shape (type:'http' with url +
+// headers). Type discriminates which fields are populated.
 type ConfigFile struct {
-	MCPServers map[string]StdioServer `json:"mcpServers"`
+	MCPServers map[string]Server `json:"mcpServers"`
 }
 
-// StdioServer is one stdio-transport MCP server entry inside ConfigFile.
+// Server is one MCP server entry inside ConfigFile. The Type field
+// discriminates between stdio and http transports; only the fields for
+// that transport are emitted (the others stay at their zero value and
+// `omitempty` drops them from the JSON output).
 //
-// Type is always "stdio" today; declared so the shape matches the legacy
-// TS SDK exactly and so the JSON unmarshaler can validate it.
-type StdioServer struct {
+// stdio shape: { "type": "stdio", "command": "...", "args": [...], "env": {...} }
+// http shape:  { "type": "http", "url": "...", "headers": {...} }
+type Server struct {
 	Type    string            `json:"type"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
+
+// StdioServer is the legacy name of Server; kept as a type alias so
+// callers that reference it during the HTTP-transport rollout still
+// compile. New code should reference Server directly.
+//
+// Deprecated: use Server.
+type StdioServer = Server
 
 // BuildConfigFile transforms the agent.MCPServerConfig slice into the
 // on-disk ConfigFile shape. Pure: no I/O.
 //
-// Returns an error when any entry has an empty Name or Command. Args
-// and Env are defensively copied to prevent later mutation through the
-// JSON encoder.
+// Returns an error when any entry has an empty Name, or when transport
+// fields are missing for the resolved Type (stdio → empty Command; http
+// → empty URL). Args/Env/Headers are defensively copied to prevent later
+// mutation through the JSON encoder.
 func BuildConfigFile(servers []agent.MCPServerConfig) (ConfigFile, error) {
-	cfg := ConfigFile{MCPServers: make(map[string]StdioServer, len(servers))}
+	cfg := ConfigFile{MCPServers: make(map[string]Server, len(servers))}
 	for i, s := range servers {
 		if s.Name == "" {
 			return ConfigFile{}, fmt.Errorf("runtime/mcp: server[%d] has empty Name", i)
 		}
-		if s.Command == "" {
-			return ConfigFile{}, fmt.Errorf("runtime/mcp: server %q has empty Command", s.Name)
+		typ := s.Type
+		if typ == "" {
+			typ = "stdio"
 		}
-		args := append([]string(nil), s.Args...)
-		var env map[string]string
-		if len(s.Env) > 0 {
-			env = make(map[string]string, len(s.Env))
-			for k, v := range s.Env {
-				env[k] = v
+		switch typ {
+		case "stdio":
+			if s.Command == "" {
+				return ConfigFile{}, fmt.Errorf("runtime/mcp: server %q (stdio) has empty Command", s.Name)
 			}
-		}
-		cfg.MCPServers[s.Name] = StdioServer{
-			Type:    "stdio",
-			Command: s.Command,
-			Args:    args,
-			Env:     env,
+			args := append([]string(nil), s.Args...)
+			var env map[string]string
+			if len(s.Env) > 0 {
+				env = make(map[string]string, len(s.Env))
+				for k, v := range s.Env {
+					env[k] = v
+				}
+			}
+			cfg.MCPServers[s.Name] = Server{
+				Type:    "stdio",
+				Command: s.Command,
+				Args:    args,
+				Env:     env,
+			}
+		case "http":
+			if s.URL == "" {
+				return ConfigFile{}, fmt.Errorf("runtime/mcp: server %q (http) has empty URL", s.Name)
+			}
+			var headers map[string]string
+			if len(s.Headers) > 0 {
+				headers = make(map[string]string, len(s.Headers))
+				for k, v := range s.Headers {
+					headers[k] = v
+				}
+			}
+			cfg.MCPServers[s.Name] = Server{
+				Type:    "http",
+				URL:     s.URL,
+				Headers: headers,
+			}
+		default:
+			return ConfigFile{}, fmt.Errorf("runtime/mcp: server %q has unknown type %q (want \"stdio\" or \"http\")", s.Name, typ)
 		}
 	}
 	return cfg, nil

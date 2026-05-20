@@ -10,27 +10,31 @@ import (
 )
 
 // mcpConfigFile is the JSON shape Claude CLI's `--mcp-config` flag
-// consumes. It mirrors the SDK's McpStdioServerConfig record:
+// consumes. It mirrors the SDK's McpStdioServerConfig record and extends
+// it with the Streamable HTTP transport shape used by the platform's
+// per-session MCP endpoint:
 //
 //	{
 //	  "mcpServers": {
 //	    "<name>": { "type": "stdio", "command": "...", "args": [...], "env": {...} }
+//	    "<name>": { "type": "http",  "url": "...",     "headers": {...} }
 //	  }
 //	}
 //
 // Source: ../agentfactory/packages/core/src/providers/claude-provider.ts
 // (the `mcpServers` Object.fromEntries block) and the Claude CLI
-// `--mcp-config` documentation. The legacy TS serializes the same
-// shape (modulo TS Record vs Go map encoding).
+// `--mcp-config` documentation.
 type mcpConfigFile struct {
-	MCPServers map[string]mcpStdioServer `json:"mcpServers"`
+	MCPServers map[string]mcpServerEntry `json:"mcpServers"`
 }
 
-type mcpStdioServer struct {
+type mcpServerEntry struct {
 	Type    string            `json:"type"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // writeMCPConfig serializes Spec.MCPServers to a JSON tmpfile and
@@ -40,34 +44,61 @@ type mcpStdioServer struct {
 // Per coordinator decision #10 in F.1.1 §10, the file is per-session
 // — written under os.TempDir() with a session-stable prefix and
 // deleted by the Handle's Stop method (see handle.go cleanup).
+//
+// Supports both stdio (Command/Args/Env) and http (URL/Headers)
+// transports; the entry's Type field discriminates. Empty Type defaults
+// to "stdio" for back-compat with the legacy shape.
 func writeMCPConfig(servers []agent.MCPServerConfig) (path string, err error) {
 	if len(servers) == 0 {
 		return "", nil
 	}
 
-	cfg := mcpConfigFile{MCPServers: make(map[string]mcpStdioServer, len(servers))}
+	cfg := mcpConfigFile{MCPServers: make(map[string]mcpServerEntry, len(servers))}
 	for _, s := range servers {
 		if s.Name == "" {
 			return "", fmt.Errorf("provider/claude: MCP server with empty Name in spec")
 		}
-		if s.Command == "" {
-			return "", fmt.Errorf("provider/claude: MCP server %q has empty Command", s.Name)
+		typ := s.Type
+		if typ == "" {
+			typ = "stdio"
 		}
-		// Defensive copy of slice/map to avoid aliasing the caller's
-		// data through the JSON encoder.
-		args := append([]string(nil), s.Args...)
-		var env map[string]string
-		if len(s.Env) > 0 {
-			env = make(map[string]string, len(s.Env))
-			for k, v := range s.Env {
-				env[k] = v
+		switch typ {
+		case "stdio":
+			if s.Command == "" {
+				return "", fmt.Errorf("provider/claude: MCP server %q (stdio) has empty Command", s.Name)
 			}
-		}
-		cfg.MCPServers[s.Name] = mcpStdioServer{
-			Type:    "stdio",
-			Command: s.Command,
-			Args:    args,
-			Env:     env,
+			args := append([]string(nil), s.Args...)
+			var env map[string]string
+			if len(s.Env) > 0 {
+				env = make(map[string]string, len(s.Env))
+				for k, v := range s.Env {
+					env[k] = v
+				}
+			}
+			cfg.MCPServers[s.Name] = mcpServerEntry{
+				Type:    "stdio",
+				Command: s.Command,
+				Args:    args,
+				Env:     env,
+			}
+		case "http":
+			if s.URL == "" {
+				return "", fmt.Errorf("provider/claude: MCP server %q (http) has empty URL", s.Name)
+			}
+			var headers map[string]string
+			if len(s.Headers) > 0 {
+				headers = make(map[string]string, len(s.Headers))
+				for k, v := range s.Headers {
+					headers[k] = v
+				}
+			}
+			cfg.MCPServers[s.Name] = mcpServerEntry{
+				Type:    "http",
+				URL:     s.URL,
+				Headers: headers,
+			}
+		default:
+			return "", fmt.Errorf("provider/claude: MCP server %q has unknown type %q (want \"stdio\" or \"http\")", s.Name, typ)
 		}
 	}
 
