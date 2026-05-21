@@ -23,19 +23,21 @@ import "strings"
 // into a child agent subprocess.
 //
 // Entries:
-//   - RENSEI_DAEMON_JWT       — daemon's platform JWT
-//   - RENSEI_DAEMON_API_KEY   — daemon's platform API key
-//   - M2M_JWT_SECRET          — machine-to-machine JWT signing secret
-//   - AUDIT_HMAC_KEY          — audit-log HMAC signing key
-//   - WORKOS_API_KEY          — WorkOS server key (control plane)
-//   - WORKOS_COOKIE_PASSWORD  — WorkOS session cookie password
-//   - RENSEI_RUNTIME_JWT      — runtime JWT minted on registration
-//   - WORKER_API_KEY          — worker-protocol bearer (rsk_*)
+//   - RENSEI_DAEMON_JWT            — daemon's platform JWT
+//   - RENSEI_DAEMON_API_KEY        — daemon's platform API key
+//   - M2M_JWT_SECRET               — machine-to-machine JWT signing secret
+//   - AUDIT_SIGNING_KEY_PRIVATE    — audit-chain Ed25519 signing key (private)
+//   - AUDIT_SIGNING_KEY_PUBLIC     — audit-chain Ed25519 signing key (public)
+//   - WORKOS_API_KEY               — WorkOS server key (control plane)
+//   - WORKOS_COOKIE_PASSWORD       — WorkOS session cookie password
+//   - RENSEI_RUNTIME_JWT           — runtime JWT minted on registration
+//   - WORKER_API_KEY               — worker-protocol bearer (rsk_*)
 var AgentEnvBlocklist = []string{
 	"RENSEI_DAEMON_JWT",
 	"RENSEI_DAEMON_API_KEY",
 	"M2M_JWT_SECRET",
-	"AUDIT_HMAC_KEY",
+	"AUDIT_SIGNING_KEY_PRIVATE",
+	"AUDIT_SIGNING_KEY_PUBLIC",
 	"WORKOS_API_KEY",
 	"WORKOS_COOKIE_PASSWORD",
 	"RENSEI_RUNTIME_JWT",
