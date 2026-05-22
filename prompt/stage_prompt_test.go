@@ -148,3 +148,110 @@ func TestBuilderBuild_StagePromptOverridesIssueContext(t *testing.T) {
 		t.Fatalf("legacy PromptContext should be suppressed when StagePrompt is set: %q", user)
 	}
 }
+
+// TestBuilderBuild_SystemPromptOverride covers the upstream-supplied system
+// prompt override path. When QueuedWork.SystemPromptOverride is non-empty,
+// Build uses it verbatim as the system prompt instead of rendering
+// system_base.tmpl. The user prompt is unaffected by the override.
+func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
+	t.Parallel()
+
+	const overrideText = "You are the upstream-supplied override agent. Custom identity active."
+
+	t.Run("override_replaces_system_base_tmpl", func(t *testing.T) {
+		t.Parallel()
+		b := prompt.NewBuilder()
+		work := prompt.QueuedWork{
+			SessionID:            "sess-override-1",
+			IssueIdentifier:      "REN-9001",
+			StagePrompt:          "Implement the feature described in the issue.",
+			StageID:              "development",
+			SystemPromptOverride: overrideText,
+		}
+		system, user, err := b.Build(work)
+		if err != nil {
+			t.Fatalf("Build returned err: %v", err)
+		}
+		// System prompt must be the override verbatim.
+		if system != overrideText {
+			t.Errorf("expected system=%q, got %q", overrideText, system)
+		}
+		// User prompt must still contain the stage prompt body.
+		if !strings.Contains(user, "Implement the feature described in the issue.") {
+			t.Errorf("user prompt missing stage body: %q", user)
+		}
+		// system_base.tmpl sentinel text must NOT appear when overridden.
+		if strings.Contains(system, "autonomous Rensei agent") {
+			t.Errorf("system_base.tmpl content leaked into overridden system prompt: %q", system)
+		}
+	})
+
+	t.Run("override_with_legacy_user_path", func(t *testing.T) {
+		// Override also applies when StagePrompt is absent (legacy user-prompt path).
+		t.Parallel()
+		b := prompt.NewBuilder()
+		work := prompt.QueuedWork{
+			SessionID:            "sess-override-2",
+			IssueIdentifier:      "REN-9002",
+			WorkType:             string(prompt.WorkTypeDevelopment),
+			PromptContext:        "<issue><title>Legacy dispatch</title></issue>",
+			SystemPromptOverride: overrideText,
+		}
+		system, user, err := b.Build(work)
+		if err != nil {
+			t.Fatalf("Build returned err: %v", err)
+		}
+		if system != overrideText {
+			t.Errorf("expected system=%q, got %q", overrideText, system)
+		}
+		// User prompt comes from the legacy template and must contain the identifier.
+		if !strings.Contains(user, "REN-9002") {
+			t.Errorf("user prompt missing issue identifier: %q", user)
+		}
+	})
+
+	t.Run("empty_override_falls_back_to_system_base_tmpl", func(t *testing.T) {
+		// When SystemPromptOverride is empty the runner uses system_base.tmpl.
+		t.Parallel()
+		b := prompt.NewBuilder()
+		work := prompt.QueuedWork{
+			SessionID:            "sess-override-3",
+			IssueIdentifier:      "REN-9003",
+			StagePrompt:          "Do the thing.",
+			StageID:              "qa",
+			SystemPromptOverride: "", // explicitly empty
+		}
+		system, _, err := b.Build(work)
+		if err != nil {
+			t.Fatalf("Build returned err: %v", err)
+		}
+		// Baseline system_base.tmpl must be present.
+		if !strings.Contains(system, "autonomous") {
+			t.Errorf("expected system_base.tmpl fallback, got: %q", system)
+		}
+		// Override text must not be present.
+		if strings.Contains(system, overrideText) {
+			t.Errorf("override should not appear when field is empty: %q", system)
+		}
+	})
+
+	t.Run("whitespace_only_override_falls_back_to_system_base_tmpl", func(t *testing.T) {
+		// Whitespace-only SystemPromptOverride is treated as absent.
+		t.Parallel()
+		b := prompt.NewBuilder()
+		work := prompt.QueuedWork{
+			SessionID:            "sess-override-4",
+			IssueIdentifier:      "REN-9004",
+			StagePrompt:          "Do the thing.",
+			StageID:              "qa",
+			SystemPromptOverride: "   \t\n  ",
+		}
+		system, _, err := b.Build(work)
+		if err != nil {
+			t.Fatalf("Build returned err: %v", err)
+		}
+		if !strings.Contains(system, "autonomous") {
+			t.Errorf("expected system_base.tmpl fallback for whitespace-only override, got: %q", system)
+		}
+	})
+}
