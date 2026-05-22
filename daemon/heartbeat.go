@@ -80,9 +80,17 @@ type HeartbeatOptions struct {
 	// the next tick retries the heartbeat with the stale token (which will
 	// fail again and re-trigger this path).
 	//
+	// reason is the structured failure reason ("worker-not-found",
+	// "runtime-token-expired", "unauthorized", "auth-failure"). Callers
+	// should pass it through to RefreshRuntimeToken so the correct
+	// recovery path is taken — in particular, "worker-not-found" skips
+	// the JWT refresh probe and goes directly to full re-registration
+	// (creating a new Redis entry), while "runtime-token-expired" tries
+	// the refresh probe first to preserve the workerId.
+	//
 	// Required when the daemon runs against a real platform; tests that
 	// only exercise the local stub path can leave it nil.
-	OnReregister func(ctx context.Context) (workerID, runtimeJWT string, err error)
+	OnReregister func(ctx context.Context, reason string) (workerID, runtimeJWT string, err error)
 }
 
 // HeartbeatService manages the periodic heartbeat goroutine. It is safe to
@@ -279,7 +287,7 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 			"reason", reason,
 		)
 		h.opts.LogWarn("daemon heartbeat rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
-		newWorkerID, newJWT, regErr := h.opts.OnReregister(ctx)
+		newWorkerID, newJWT, regErr := h.opts.OnReregister(ctx, reason)
 		if regErr != nil {
 			h.opts.LogWarn("daemon runtime-token refresh failed: %v", regErr)
 			return

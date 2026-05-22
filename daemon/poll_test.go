@@ -143,7 +143,7 @@ func TestPollService_401TriggersReregister(t *testing.T) {
 		RuntimeJWT:      "stale-jwt",
 		IntervalSeconds: 1,
 		OnWork:          func(_ PollWorkItem) error { return nil },
-		OnReregister: func(_ context.Context) (string, string, error) {
+		OnReregister: func(_ context.Context, _ string) (string, string, error) {
 			reregistered.Add(1)
 			doneOnce.Do(func() { close(done) })
 			return "wkr_test", "fresh-jwt", nil
@@ -160,6 +160,112 @@ func TestPollService_401TriggersReregister(t *testing.T) {
 
 	if got := reregistered.Load(); got < 1 {
 		t.Errorf("OnReregister called %d times; want >= 1", got)
+	}
+}
+
+// TestPollService_404TriggersReregisterWithWorkerNotFoundReason confirms
+// that an HTTP 404 "Worker not found" from the poll endpoint triggers
+// OnReregister and passes reason="worker-not-found" so the caller can
+// skip the JWT-refresh probe and go directly to full re-registration.
+// This is the regression test for the Redis-TTL loop documented in the
+// bug report: previously, 404 also called OnReregister, but the reason
+// was passed as "auth-failure", causing RefreshRuntimeToken to probe the
+// refresh endpoint first — which returned a fresh JWT for the SAME
+// workerId, sending the daemon into an infinite 404 loop.
+func TestPollService_404TriggersReregisterWithWorkerNotFoundReason(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		count := hits.Add(1)
+		if count == 1 {
+			http.Error(w, `{"error":"Worker not found"}`, http.StatusNotFound)
+			return
+		}
+		// Subsequent calls succeed (new worker registered).
+		_ = json.NewEncoder(w).Encode(PollResponse{Work: []PollWorkItem{}})
+	}))
+	t.Cleanup(srv.Close)
+
+	var gotReason string
+	var reasonMu sync.Mutex
+	done := make(chan struct{})
+	var doneOnce sync.Once
+	p := NewPollService(PollOptions{
+		WorkerID:        "wkr_gone",
+		OrchestratorURL: srv.URL,
+		RuntimeJWT:      "valid-jwt",
+		IntervalSeconds: 1,
+		OnWork:          func(_ PollWorkItem) error { return nil },
+		OnReregister: func(_ context.Context, reason string) (string, string, error) {
+			reasonMu.Lock()
+			gotReason = reason
+			reasonMu.Unlock()
+			doneOnce.Do(func() { close(done) })
+			return "wkr_new", "new-jwt", nil
+		},
+	})
+	p.Start()
+	defer p.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnReregister never fired within 3s")
+	}
+
+	reasonMu.Lock()
+	defer reasonMu.Unlock()
+	if gotReason != "worker-not-found" {
+		t.Errorf("OnReregister reason = %q, want %q (must be worker-not-found so RefreshRuntimeToken skips the JWT-refresh probe)", gotReason, "worker-not-found")
+	}
+}
+
+// TestPollService_401PassesCorrectReason confirms that an HTTP 401 from the
+// poll endpoint passes reason="runtime-token-expired" (or "unauthorized")
+// so RefreshRuntimeToken can try the JWT-refresh probe before falling back
+// to full re-registration.
+func TestPollService_401PassesCorrectReason(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		count := hits.Add(1)
+		if count == 1 {
+			http.Error(w, `{"error":"Runtime token expired; re-present registration token to refresh"}`, http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(PollResponse{Work: []PollWorkItem{}})
+	}))
+	t.Cleanup(srv.Close)
+
+	var gotReason string
+	var reasonMu sync.Mutex
+	done := make(chan struct{})
+	var doneOnce sync.Once
+	p := NewPollService(PollOptions{
+		WorkerID:        "wkr_expired",
+		OrchestratorURL: srv.URL,
+		RuntimeJWT:      "expired-jwt",
+		IntervalSeconds: 1,
+		OnWork:          func(_ PollWorkItem) error { return nil },
+		OnReregister: func(_ context.Context, reason string) (string, string, error) {
+			reasonMu.Lock()
+			gotReason = reason
+			reasonMu.Unlock()
+			doneOnce.Do(func() { close(done) })
+			return "wkr_expired", "fresh-jwt", nil
+		},
+	})
+	p.Start()
+	defer p.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnReregister never fired within 3s")
+	}
+
+	reasonMu.Lock()
+	defer reasonMu.Unlock()
+	if gotReason != "runtime-token-expired" {
+		t.Errorf("OnReregister reason = %q, want %q", gotReason, "runtime-token-expired")
 	}
 }
 
