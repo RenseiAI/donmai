@@ -627,32 +627,37 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 // Stop performs a graceful shutdown: drain in-flight sessions, stop loops,
 // and transition to stopped. The context is currently unused but is retained
 // for future use (e.g. cancelling drain via ctx.Done).
+// Stop drains spawned work, halts the heartbeat/poller loops, closes the
+// yaml watcher, and transitions to StateStopped. Safe to call concurrently
+// or repeatedly — the whole body is gated by stopOnce so a deferred
+// Stop() in a test fixture racing with an HTTP /stop handler is benign.
 func (d *Daemon) Stop(_ context.Context) error {
-	current := d.State()
-	if current == StateStopped {
-		return nil
-	}
-	d.setState(StateDraining)
+	d.stopOnce.Do(func() {
+		if d.State() == StateStopped {
+			return
+		}
+		d.setState(StateDraining)
 
-	timeout := 30 * time.Second
-	if cfg := d.Config(); cfg != nil && cfg.AutoUpdate.DrainTimeoutSeconds > 0 {
-		timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
-	}
-	if d.spawner != nil {
-		_ = d.spawner.Drain(timeout)
-	}
-	if d.heartbeat != nil {
-		d.heartbeat.Stop()
-	}
-	if d.poller != nil {
-		d.poller.Stop()
-	}
-	if d.yamlWatcherStop != nil {
-		d.yamlWatcherStop()
-		d.yamlWatcherStop = nil
-	}
-	d.stopOnce.Do(func() { close(d.doneCh) })
-	d.setState(StateStopped)
+		timeout := 30 * time.Second
+		if cfg := d.Config(); cfg != nil && cfg.AutoUpdate.DrainTimeoutSeconds > 0 {
+			timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
+		}
+		if d.spawner != nil {
+			_ = d.spawner.Drain(timeout)
+		}
+		if d.heartbeat != nil {
+			d.heartbeat.Stop()
+		}
+		if d.poller != nil {
+			d.poller.Stop()
+		}
+		if d.yamlWatcherStop != nil {
+			d.yamlWatcherStop()
+			d.yamlWatcherStop = nil
+		}
+		close(d.doneCh)
+		d.setState(StateStopped)
+	})
 	return nil
 }
 
