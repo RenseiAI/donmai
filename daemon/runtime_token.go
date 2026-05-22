@@ -67,14 +67,20 @@ type RefreshTokenResult struct {
 // without re-registering — i.e. preserving the workerId. This is the
 // REN-1481 fix path. Behaviour:
 //
-//  1. Probe POST /api/workers/<id>/refresh-token with the registration
-//     token in the Authorization: Bearer header. On 200, the platform
-//     has minted a fresh JWT bound to the same workerId — best case.
-//  2. On 404 (endpoint missing — current platform-side state) or 405
-//     (method not allowed), fall through to FULL re-register via
-//     Register(ForceReregister=true). The runtime token gets refreshed
-//     but at the cost of a new workerId.
-//  3. On any other failure (5xx, network, 401-on-registration-token),
+//  1. When reason is "worker-not-found" (HTTP 404 on poll or heartbeat),
+//     the worker's Redis registration entry has expired — the runtime
+//     token itself is still valid, but the platform has no record of this
+//     worker. Probing the refresh endpoint would return a fresh JWT for
+//     the SAME workerId, which would loop forever. Skip the probe and go
+//     directly to full re-register to create a new Redis entry.
+//  2. Otherwise, probe POST /api/workers/<id>/refresh-token with the
+//     registration token in the Authorization: Bearer header. On 200, the
+//     platform mints a fresh JWT bound to the same workerId — best case.
+//  3. On 404 (endpoint missing — current platform-side state) or 405
+//     (method not allowed) from the refresh probe, fall through to FULL
+//     re-register via Register(ForceReregister=true). The runtime token
+//     gets refreshed but at the cost of a new workerId.
+//  4. On any other failure (5xx, network, 401-on-registration-token),
 //     return an error. Caller logs + retries on next tick.
 //
 // This is the only path that should call Register() with
@@ -96,8 +102,15 @@ func RefreshRuntimeToken(
 		"reason", reason,
 	)
 
-	// 1. Probe the refresh endpoint.
-	if currentWorkerID != "" && looksLikeRegistrationToken(regOpts.RegistrationToken) {
+	// 1. Probe the refresh endpoint — but ONLY when the runtime token
+	// itself may still be valid (401 path). A 404 "worker-not-found"
+	// means the worker's Redis registration has expired; the refresh
+	// endpoint would return a fresh JWT for the SAME workerId, which
+	// the platform would then reject again on the next poll/heartbeat
+	// (the Redis entry is still gone). Skip straight to full
+	// re-registration so the platform creates a new Redis entry.
+	workerNotFound := reason == "worker-not-found"
+	if !workerNotFound && currentWorkerID != "" && looksLikeRegistrationToken(regOpts.RegistrationToken) {
 		fresh, err := callRefreshEndpoint(ctx, regOpts, currentWorkerID)
 		if err == nil {
 			logger.Info("[runtime-token]",
@@ -131,6 +144,13 @@ func RefreshRuntimeToken(
 			"workerId", currentWorkerID,
 			"reason", reason,
 			"detail", "platform refresh endpoint not deployed; falling back to full re-register (workerId will change — REN-1481 platform-side companion fix)",
+		)
+	} else if workerNotFound {
+		logger.Info("[runtime-token]",
+			"event", "reregister.worker-not-found",
+			"workerId", currentWorkerID,
+			"reason", reason,
+			"detail", "worker Redis entry expired — skipping refresh probe, going directly to full re-register to create a new registration entry",
 		)
 	}
 

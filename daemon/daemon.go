@@ -438,11 +438,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// falls back to a full Register() — minting a fresh workerId — if
 		// the platform side has not yet shipped the refresh handler. The
 		// `[runtime-token]` log line attests which path was taken.
-		reregister := func(rctx context.Context) (string, string, error) {
+		reregister := func(rctx context.Context, reason string) (string, string, error) {
 			d.mu.RLock()
 			currentWorker := d.workerID
 			d.mu.RUnlock()
-			result, err := RefreshRuntimeToken(rctx, regOpts, currentWorker, "auth-failure")
+			result, err := RefreshRuntimeToken(rctx, regOpts, currentWorker, reason)
 			if err != nil {
 				return "", "", err
 			}

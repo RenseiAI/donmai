@@ -170,7 +170,7 @@ func TestHeartbeatService_ReregisterOn401(t *testing.T) {
 		GetActiveCount:  func() int { return 0 },
 		GetMaxCount:     func() int { return 4 },
 		GetStatus:       func() RegistrationStatus { return RegistrationIdle },
-		OnReregister: func(_ context.Context) (string, string, error) {
+		OnReregister: func(_ context.Context, _ string) (string, string, error) {
 			reregister.Add(1)
 			return "wkr_new", "fresh.jwt", nil
 		},
@@ -232,7 +232,7 @@ func TestHeartbeatService_ReregisterOn404(t *testing.T) {
 		GetActiveCount:  func() int { return 0 },
 		GetMaxCount:     func() int { return 4 },
 		GetStatus:       func() RegistrationStatus { return RegistrationIdle },
-		OnReregister: func(_ context.Context) (string, string, error) {
+		OnReregister: func(_ context.Context, _ string) (string, string, error) {
 			regs.Add(1)
 			return "wkr_back", "back.jwt", nil
 		},
@@ -275,7 +275,7 @@ func TestHeartbeatService_ReregisterFailure_NoCredSwap(t *testing.T) {
 		GetMaxCount:     func() int { return 4 },
 		GetStatus:       func() RegistrationStatus { return RegistrationIdle },
 		LogWarn:         func(string, ...any) { warns.Add(1) },
-		OnReregister: func(_ context.Context) (string, string, error) {
+		OnReregister: func(_ context.Context, _ string) (string, string, error) {
 			return "", "", &reregisterErr{}
 		},
 	})

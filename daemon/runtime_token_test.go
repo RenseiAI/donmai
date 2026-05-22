@@ -143,6 +143,73 @@ func TestRefreshRuntimeToken_FallsBackToReregisterOn404(t *testing.T) {
 	}
 }
 
+// TestRefreshRuntimeToken_WorkerNotFound_SkipsRefreshProbe asserts that
+// when the reason is "worker-not-found" (HTTP 404 on poll/heartbeat),
+// RefreshRuntimeToken skips the JWT-refresh probe entirely and goes
+// directly to full re-registration. This prevents the infinite 404 loop
+// where the refresh probe returns a fresh JWT for the same (Redis-expired)
+// workerId, causing the next poll to 404 again immediately.
+func TestRefreshRuntimeToken_WorkerNotFound_SkipsRefreshProbe(t *testing.T) {
+	t.Parallel()
+	const oldWorker = "wkr_redis_expired"
+	var refreshHits, registerHits int
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/workers/"+oldWorker+"/refresh-token":
+			refreshHits++
+			// This endpoint would return 200 with a fresh JWT for the same
+			// workerId — but we must never be called for worker-not-found.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"runtimeToken": "fresh-but-useless.jwt",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == RegisterEndpoint:
+			registerHits++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workerId":     "wkr_new_redis_entry",
+				"runtimeToken": "new.registration.jwt",
+			})
+		}
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	regOpts := RegistrationOptions{
+		OrchestratorURL: srv.URL,
+		// #nosec G101 -- test fixture
+		RegistrationToken: "rsp_live_x",
+		Hostname:          "h",
+		Version:           Version,
+		MaxAgents:         1,
+		JWTPath:           tmpDir + "/jwt.json",
+		ForceReregister:   true,
+		HTTPClient:        &http.Client{Timeout: 5 * time.Second},
+	}
+	result, err := RefreshRuntimeToken(context.Background(), regOpts, oldWorker, "worker-not-found")
+	if err != nil {
+		t.Fatalf("RefreshRuntimeToken err: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if refreshHits != 0 {
+		t.Errorf("refresh probe must NOT be called for worker-not-found; got %d calls (would produce infinite 404 loop)", refreshHits)
+	}
+	if registerHits != 1 {
+		t.Errorf("expected register to be called exactly once; got %d", registerHits)
+	}
+	if result.Mode != "reregister" {
+		t.Errorf("expected Mode=reregister, got %q", result.Mode)
+	}
+	if result.WorkerID != "wkr_new_redis_entry" {
+		t.Errorf("expected new workerId from registration, got %q", result.WorkerID)
+	}
+}
+
 // TestRefreshRuntimeToken_ProbedBeforeReregister asserts that on every
 // auth-failure the daemon HITS the refresh endpoint FIRST. This is
 // the REN-1481 acceptance check: "assert refresh path is hit BEFORE
@@ -306,8 +373,8 @@ func TestHeartbeatService_RefreshOn401Probe(t *testing.T) {
 	// reregister callback — same shape as daemon.go uses.
 	currentWorkerID := workerID
 	currentJWT := "stale.runtime.jwt"
-	reregister := func(rctx context.Context) (string, string, error) {
-		result, err := RefreshRuntimeToken(rctx, regOpts, currentWorkerID, "test")
+	reregister := func(rctx context.Context, reason string) (string, string, error) {
+		result, err := RefreshRuntimeToken(rctx, regOpts, currentWorkerID, reason)
 		if err != nil {
 			return "", "", err
 		}
