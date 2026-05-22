@@ -134,6 +134,20 @@ type QueuedWork struct {
 	// normaliser emitted. Carried through for end-to-end audit
 	// correlation.
 	StageSourceEventID string `json:"stageSourceEventId,omitempty"`
+
+	// SystemPromptOverride is an upstream-supplied system prompt that
+	// replaces the runner's default system_base.tmpl content when
+	// non-empty. The override arrives opaquely from the platform's
+	// dispatch layer and is not interpreted by the runner beyond
+	// substituting the system prompt string. When empty or absent the
+	// runner falls back to the baseline system_base.tmpl rendering
+	// (backward-compatible; all existing dispatches without this field
+	// are unaffected).
+	//
+	// Wire shape: "systemPromptOverride" (camelCase, omitempty). Populated
+	// by the platform's agent.dispatch_stage action when the resolved
+	// agent card carries a non-empty systemPrompt in its card jsonb.
+	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
 }
 
 // StageBudget mirrors the platform's StageBudget type from

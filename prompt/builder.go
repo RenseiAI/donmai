@@ -122,6 +122,13 @@ func NewBuilder() *Builder {
 // (`stageId=… budget.maxSubAgents=… budget.maxTokens=… budget.maxDurationSeconds=…`).
 // The legacy template path is preserved when StagePrompt is empty
 // (cardinal rule 1 — additive, no break).
+//
+// System-prompt override: when qw.SystemPromptOverride is non-empty it
+// replaces the system_base.tmpl rendering entirely. The override is
+// used verbatim; [Builder.SystemAppend] and [Builder.SkillAppend] are
+// NOT appended (the upstream-supplied override is assumed to be
+// self-contained). When SystemPromptOverride is empty the builder falls
+// back to the standard system_base.tmpl path unchanged.
 func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 	hasStagePrompt := strings.TrimSpace(qw.StagePrompt) != ""
 	if !hasStagePrompt && !hasIssueContext(qw) {
@@ -136,14 +143,26 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 		return b.buildRaymond(qw, hasStagePrompt)
 	}
 
+	// Load the embedded template set. Always needed for the user-prompt
+	// path; also needed for the system prompt when SystemPromptOverride
+	// is absent. The set() call is idempotent and uses sync.Once
+	// internally, so calling it here unconditionally is cheap.
 	tmpls, err := b.set()
 	if err != nil {
 		return "", "", err
 	}
 
-	systemBuf, err := renderTemplate(tmpls, "system_base.tmpl", systemTemplateData(qw, b.SystemAppend, b.SkillAppend))
-	if err != nil {
-		return "", "", fmt.Errorf("render system prompt: %w", err)
+	// Resolve the system prompt. When SystemPromptOverride is set by the
+	// upstream dispatch layer, use it verbatim. Otherwise fall through to
+	// the embedded system_base.tmpl render (standard path).
+	var systemBuf string
+	if override := strings.TrimSpace(qw.SystemPromptOverride); override != "" {
+		systemBuf = override
+	} else {
+		systemBuf, err = renderTemplate(tmpls, "system_base.tmpl", systemTemplateData(qw, b.SystemAppend, b.SkillAppend))
+		if err != nil {
+			return "", "", fmt.Errorf("render system prompt: %w", err)
+		}
 	}
 
 	if hasStagePrompt {
@@ -168,18 +187,24 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 // (same inputs, same stage-prompt shortcircuit, same fallback for unknown
 // work types) while delegating template execution to raymond.
 func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user string, err error) {
-	sysCTX := map[string]interface{}{
-		"sessionID":      strings.TrimSpace(qw.SessionID),
-		"organizationID": strings.TrimSpace(qw.OrganizationID),
-		"projectName":    strings.TrimSpace(qw.ProjectName),
-		"repository":     strings.TrimSpace(qw.Repository),
-		"ref":            strings.TrimSpace(qw.Ref),
-		"append":         strings.TrimSpace(b.SystemAppend),
-		"skillAppend":    strings.TrimSpace(b.SkillAppend),
-	}
-	systemBuf, err := b.Registry.Render("system_base", sysCTX)
-	if err != nil {
-		return "", "", fmt.Errorf("raymond: render system prompt: %w", err)
+	// Honour SystemPromptOverride on the raymond path as well.
+	var systemBuf string
+	if override := strings.TrimSpace(qw.SystemPromptOverride); override != "" {
+		systemBuf = override
+	} else {
+		sysCTX := map[string]interface{}{
+			"sessionID":      strings.TrimSpace(qw.SessionID),
+			"organizationID": strings.TrimSpace(qw.OrganizationID),
+			"projectName":    strings.TrimSpace(qw.ProjectName),
+			"repository":     strings.TrimSpace(qw.Repository),
+			"ref":            strings.TrimSpace(qw.Ref),
+			"append":         strings.TrimSpace(b.SystemAppend),
+			"skillAppend":    strings.TrimSpace(b.SkillAppend),
+		}
+		systemBuf, err = b.Registry.Render("system_base", sysCTX)
+		if err != nil {
+			return "", "", fmt.Errorf("raymond: render system prompt: %w", err)
+		}
 	}
 
 	if hasStagePrompt {
