@@ -134,7 +134,13 @@ type PollOptions struct {
 	// fell out of Redis). Implementations re-issue Register() and return the
 	// fresh worker id + runtime token. The poll loop swaps credentials and
 	// continues. Returning an error logs and the loop retries on the next tick.
-	OnReregister func(ctx context.Context) (workerID, runtimeJWT string, err error)
+	//
+	// reason is the structured failure reason ("worker-not-found",
+	// "runtime-token-expired", "unauthorized", "auth-failure"). Pass it
+	// through to RefreshRuntimeToken so the correct recovery path is taken
+	// — "worker-not-found" skips the JWT refresh probe and goes directly to
+	// full re-registration to create a new Redis entry.
+	OnReregister func(ctx context.Context, reason string) (workerID, runtimeJWT string, err error)
 }
 
 // PollService manages the periodic poll goroutine. Like HeartbeatService it is
@@ -252,7 +258,7 @@ func (p *PollService) pollOnce(ctx context.Context) {
 			"reason", reason,
 		)
 		p.opts.LogWarn("daemon poll rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
-		newWorkerID, newJWT, regErr := p.opts.OnReregister(ctx)
+		newWorkerID, newJWT, regErr := p.opts.OnReregister(ctx, reason)
 		if regErr != nil {
 			p.opts.LogWarn("daemon poll runtime-token refresh failed: %v", regErr)
 			return

@@ -80,9 +80,17 @@ type HeartbeatOptions struct {
 	// the next tick retries the heartbeat with the stale token (which will
 	// fail again and re-trigger this path).
 	//
+	// reason is the structured failure reason ("worker-not-found",
+	// "runtime-token-expired", "unauthorized", "auth-failure"). Callers
+	// should pass it through to RefreshRuntimeToken so the correct
+	// recovery path is taken — in particular, "worker-not-found" skips
+	// the JWT refresh probe and goes directly to full re-registration
+	// (creating a new Redis entry), while "runtime-token-expired" tries
+	// the refresh probe first to preserve the workerId.
+	//
 	// Required when the daemon runs against a real platform; tests that
 	// only exercise the local stub path can leave it nil.
-	OnReregister func(ctx context.Context) (workerID, runtimeJWT string, err error)
+	OnReregister func(ctx context.Context, reason string) (workerID, runtimeJWT string, err error)
 }
 
 // HeartbeatService manages the periodic heartbeat goroutine. It is safe to
@@ -108,8 +116,8 @@ type HeartbeatService struct {
 	// waiting to be reported on the next outbound beat. Cleared only on a
 	// successful heartbeat call — a network failure leaves them buffered
 	// so they re-ride the next attempt.
-	pendingApplied   []string
-	pendingFailures  []HeartbeatMutationFailure
+	pendingApplied  []string
+	pendingFailures []HeartbeatMutationFailure
 }
 
 // NewHeartbeatService constructs a HeartbeatService from opts. Required
@@ -279,7 +287,7 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 			"reason", reason,
 		)
 		h.opts.LogWarn("daemon heartbeat rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
-		newWorkerID, newJWT, regErr := h.opts.OnReregister(ctx)
+		newWorkerID, newJWT, regErr := h.opts.OnReregister(ctx, reason)
 		if regErr != nil {
 			h.opts.LogWarn("daemon runtime-token refresh failed: %v", regErr)
 			return
@@ -320,13 +328,13 @@ func (h *HeartbeatService) workerIDLocked() string {
 // allowlistHash + allowlist are Phase 1d fields; appliedMutations +
 // mutationFailures are Phase 2c ACK fields.
 type heartbeatRequestBody struct {
-	ActiveCount      int                          `json:"activeCount"`
-	MaxSessions      int                          `json:"maxSessions,omitempty"`
-	Load             *heartbeatLoadFields         `json:"load,omitempty"`
-	AllowlistHash    string                       `json:"allowlistHash,omitempty"`
-	Allowlist        []ProjectAllowlistEntry      `json:"allowlist,omitempty"`
-	AppliedMutations []string                     `json:"appliedMutations,omitempty"`
-	MutationFailures []HeartbeatMutationFailure   `json:"mutationFailures,omitempty"`
+	ActiveCount      int                        `json:"activeCount"`
+	MaxSessions      int                        `json:"maxSessions,omitempty"`
+	Load             *heartbeatLoadFields       `json:"load,omitempty"`
+	AllowlistHash    string                     `json:"allowlistHash,omitempty"`
+	Allowlist        []ProjectAllowlistEntry    `json:"allowlist,omitempty"`
+	AppliedMutations []string                   `json:"appliedMutations,omitempty"`
+	MutationFailures []HeartbeatMutationFailure `json:"mutationFailures,omitempty"`
 }
 
 type heartbeatLoadFields struct {
@@ -359,7 +367,7 @@ type PendingMutation struct {
 type HostStatusDetail struct {
 	Status            string   `json:"status"` // ok | pool_deleted | pool_draining | pool_disabled | unauthorized
 	RecommendedAction string   `json:"recommendedAction,omitempty"`
-	CandidatePoolIds  []string `json:"candidatePoolIds,omitempty"`
+	CandidatePoolIDs  []string `json:"candidatePoolIds,omitempty"`
 }
 
 // heartbeatResponseBody is the JSON the platform sends back from the
