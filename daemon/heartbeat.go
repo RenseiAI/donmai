@@ -116,8 +116,8 @@ type HeartbeatService struct {
 	// waiting to be reported on the next outbound beat. Cleared only on a
 	// successful heartbeat call — a network failure leaves them buffered
 	// so they re-ride the next attempt.
-	pendingApplied   []string
-	pendingFailures  []HeartbeatMutationFailure
+	pendingApplied  []string
+	pendingFailures []HeartbeatMutationFailure
 }
 
 // NewHeartbeatService constructs a HeartbeatService from opts. Required
@@ -328,13 +328,13 @@ func (h *HeartbeatService) workerIDLocked() string {
 // allowlistHash + allowlist are Phase 1d fields; appliedMutations +
 // mutationFailures are Phase 2c ACK fields.
 type heartbeatRequestBody struct {
-	ActiveCount      int                          `json:"activeCount"`
-	MaxSessions      int                          `json:"maxSessions,omitempty"`
-	Load             *heartbeatLoadFields         `json:"load,omitempty"`
-	AllowlistHash    string                       `json:"allowlistHash,omitempty"`
-	Allowlist        []ProjectAllowlistEntry      `json:"allowlist,omitempty"`
-	AppliedMutations []string                     `json:"appliedMutations,omitempty"`
-	MutationFailures []HeartbeatMutationFailure   `json:"mutationFailures,omitempty"`
+	ActiveCount      int                        `json:"activeCount"`
+	MaxSessions      int                        `json:"maxSessions,omitempty"`
+	Load             *heartbeatLoadFields       `json:"load,omitempty"`
+	AllowlistHash    string                     `json:"allowlistHash,omitempty"`
+	Allowlist        []ProjectAllowlistEntry    `json:"allowlist,omitempty"`
+	AppliedMutations []string                   `json:"appliedMutations,omitempty"`
+	MutationFailures []HeartbeatMutationFailure `json:"mutationFailures,omitempty"`
 }
 
 type heartbeatLoadFields struct {
@@ -367,7 +367,7 @@ type PendingMutation struct {
 type HostStatusDetail struct {
 	Status            string   `json:"status"` // ok | pool_deleted | pool_draining | pool_disabled | unauthorized
 	RecommendedAction string   `json:"recommendedAction,omitempty"`
-	CandidatePoolIds  []string `json:"candidatePoolIds,omitempty"`
+	CandidatePoolIDs  []string `json:"candidatePoolIds,omitempty"`
 }
 
 // heartbeatResponseBody is the JSON the platform sends back from the
