@@ -1484,12 +1484,7 @@ exits with the same exit code.`,
 			// Locate af-linear on PATH.
 			afLinear, err := exec.LookPath("af-linear")
 			if err != nil {
-				return fmt.Errorf(
-					"af-linear binary not found on PATH: %w\n\n" +
-						"Install it with: npm install -g @renseiai/agentfactory-cli\n" +
-						"A native Go implementation of check-deployment is planned for v1.0.x.",
-					err,
-				)
+				return fmt.Errorf("af-linear binary not found on PATH (install with: npm install -g @renseiai/agentfactory-cli; a native Go implementation is planned for v1.0.x): %w", err)
 			}
 
 			// Build argv: af-linear check-deployment <pr-number> [--format <fmt>] [extra args...]
@@ -1520,4 +1515,3 @@ exits with the same exit code.`,
 	cmd.Flags().StringVar(&format, "format", "json", "Output format: json or markdown")
 	return cmd
 }
-

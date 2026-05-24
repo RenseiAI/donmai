@@ -527,18 +527,15 @@ func (c *AdminClient) ClearWorkQueue(ctx context.Context) (int, error) {
 	zCount, _ := c.rdb.ZCard(ctx, workQueueKey).Result()
 	hCount, _ := c.rdb.HLen(ctx, workItemsKey).Result()
 
-	cleared := 0
 	if zCount > 0 {
 		if err := c.rdb.Del(ctx, workQueueKey).Err(); err != nil {
 			return 0, fmt.Errorf("del %s: %w", workQueueKey, err)
 		}
-		cleared++
 	}
 	if hCount > 0 {
 		if err := c.rdb.Del(ctx, workItemsKey).Err(); err != nil {
 			return 0, fmt.Errorf("del %s: %w", workItemsKey, err)
 		}
-		cleared++
 	}
 
 	count := int(zCount)
@@ -668,12 +665,12 @@ const mergePausedPrefix = "merge:paused:" // mirrors TS: `merge:paused:${repoId}
 
 // MergeQueueStatus is the shape returned by GetMergeQueueStatus.
 type MergeQueueStatus struct {
-	RepoID      string      `json:"repoId"`
-	Depth       int         `json:"depth"`
-	Processing  *MergeEntry `json:"processing"`
-	FailedCount int         `json:"failedCount"`
-	BlockedCount int        `json:"blockedCount"`
-	Paused      bool        `json:"paused"`
+	RepoID       string      `json:"repoId"`
+	Depth        int         `json:"depth"`
+	Processing   *MergeEntry `json:"processing"`
+	FailedCount  int         `json:"failedCount"`
+	BlockedCount int         `json:"blockedCount"`
+	Paused       bool        `json:"paused"`
 }
 
 // GetMergeQueueStatus returns a summary overview of the merge queue for repoID.
@@ -777,7 +774,7 @@ func (c *AdminClient) SetMergeQueuePriority(ctx context.Context, repoID string, 
 	} {
 		// ZAddXX only updates if the member already exists (no INSERT).
 		_ = c.rdb.ZAddArgs(ctx, key, redis.ZAddArgs{
-			XX: true,
+			XX:      true,
 			Members: []redis.Z{{Score: priority, Member: prStr}},
 		})
 	}
