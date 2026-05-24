@@ -13,7 +13,7 @@ No prompt context, just a body.
 3. Commit on the worktree's branch.
 4. Push the branch (`git push -u origin <branch>`).
 5. Open a pull request (`gh pr create --base main --head <branch>`) targeting the repository at github.com/RenseiAI/donmai.
-6. Post the PR link as a comment on REN-9999 via `pnpm af-linear create-comment`.
+6. Post the PR link as a comment on REN-9999 via `rensei linear create-comment`.
 7. End your final assistant message with exactly one marker so the orchestrator can transition the issue:
 
    - `WORK_RESULT:passed` when the implementation is complete, all checks pass, and the PR is open.
