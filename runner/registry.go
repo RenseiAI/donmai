@@ -66,7 +66,7 @@ func (r *Registry) Resolve(name agent.ProviderName) (agent.Provider, error) {
 }
 
 // Names returns the sorted list of registered provider names. Useful
-// for daemon-startup logging and the `af agent providers` admin
+// for daemon-startup logging and the `donmai agent providers` admin
 // command.
 func (r *Registry) Names() []agent.ProviderName {
 	r.mu.RLock()

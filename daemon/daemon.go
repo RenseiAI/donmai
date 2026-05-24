@@ -134,7 +134,7 @@ type Daemon struct {
 	yamlWatcherStop func()
 
 	// sessionDetails stores the per-session payload the spawner
-	// hands out to `af agent run` workers via the local control
+	// hands out to `donmai agent run` workers via the local control
 	// HTTP API at /api/daemon/sessions/<id>. (REN-1461 / F.2.8.)
 	sessionDetails *sessionDetailStore
 
@@ -168,7 +168,7 @@ func New(opts Options) *Daemon {
 	}
 	// Note: HTTPPort=0 is intentionally NOT auto-filled to
 	// DefaultHTTPPort here — callers that want the well-known 7734
-	// port (the cobra `af daemon run` entry point) substitute it
+	// port (the cobra `donmai daemon run` entry point) substitute it
 	// themselves before constructing Options. Leaving zero-as-
 	// ephemeral here lets parallel tests bind 127.0.0.1:0 and have
 	// the kernel pick free ports, eliminating the port-7734 bind
@@ -383,7 +383,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		spawnerOpts.BaseEnv["RENSEI_WORKER_ID"] = d.workerID
 	}
 	spawnerOpts.BaseEnv["RENSEI_ORCHESTRATOR_URL"] = cfg.Orchestrator.URL
-	// Default WorkerCommand: spawn `af agent run` from the same
+	// Default WorkerCommand: spawn `donmai agent run` from the same
 	// binary as the running daemon process so session lifecycle is
 	// owned in-tree. Operators can override via SpawnerOptions.
 	// (REN-1461 / F.2.8 — daemon wire-up.)
@@ -393,7 +393,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 	// Default child stdout/stderr → slog so operators can see what the
-	// spawned `af agent run` is doing without manually attaching a
+	// spawned `donmai agent run` is doing without manually attaching a
 	// debugger or rerunning under foreground. v0.5.0 had StdoutPrefixWriter
 	// / StderrPrefixWriter nil by default, which the spawner translated to
 	// drain-and-discard — leaving operators flying blind between
@@ -524,7 +524,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 						// Local accept-work failure means the orchestrator's
 						// claim of this session is stale on first contact —
 						// the session is in `claimed` state with this worker,
-						// but no `af agent run` subprocess will ever execute
+						// but no `donmai agent run` subprocess will ever execute
 						// for it. NACK so the orchestrator releases the
 						// claim and re-queues immediately, instead of waiting
 						// for the stale-claim sweep (15min default) to
@@ -688,7 +688,7 @@ func (d *Daemon) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 }
 
 // AcceptWorkWithDetail dispatches a session spec to the spawner and
-// records the per-session detail used by the spawned `af agent run`
+// records the per-session detail used by the spawned `donmai agent run`
 // process. Pass nil detail when the caller does not have one (legacy
 // tests); the spawner falls through to env-only inputs.
 //

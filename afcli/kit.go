@@ -1,4 +1,4 @@
-// Package afcli kit.go — `af kit …` Cobra commands. The commands target
+// Package afcli kit.go — `donmai kit …` Cobra commands. The commands target
 // the local daemon's HTTP control API at /api/daemon/kits* and
 // /api/daemon/kit-sources* per
 // ADR-2026-05-07-daemon-http-control-api.md § D1; they NEVER hit the
@@ -59,7 +59,7 @@ func resolveKitDaemonConfig() afclient.DaemonConfig {
 	return cfg
 }
 
-// newKitCmd returns the `af kit` subcommand tree. The ds argument is
+// newKitCmd returns the `donmai kit` subcommand tree. The ds argument is
 // accepted for signature consistency with the rest of afcli's command
 // factories but is not used — kit commands target the local daemon, not
 // the platform.

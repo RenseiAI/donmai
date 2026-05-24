@@ -38,10 +38,10 @@ func codexOnPath() bool {
 	return err == nil
 }
 
-// TestNewAgentRunCmd_Help verifies the `af agent run` command is
+// TestNewAgentRunCmd_Help verifies the `donmai agent run` command is
 // registered under `agent run` and produces the expected help text.
 func TestNewAgentRunCmd_Help(t *testing.T) {
-	root := &cobra.Command{Use: "af"}
+	root := &cobra.Command{Use: "donmai"}
 	root.AddCommand(newAgentCmd(nil, nil))
 
 	var buf bytes.Buffer

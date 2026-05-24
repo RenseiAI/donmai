@@ -216,13 +216,13 @@ func TestStandaloneAfRegistersLegacyWorkerFleetCommands(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Errorf("standalone af missing %q command", want)
+			t.Errorf("standalone donmai missing %q command", want)
 		}
 	}
 }
 
 // TestVersionFlag pins the cobra-auto-wired `--version` flag the user
-// noticed was missing (`af --version` errored "unknown flag" while
+// noticed was missing (`donmai --version` errored "unknown flag" while
 // `rensei --version` worked). Setting `cobra.Command.Version` on the
 // root makes cobra register both --version and -v automatically; the
 // rendered string carries the same `version` package var that the

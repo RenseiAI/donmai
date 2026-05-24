@@ -21,7 +21,7 @@ import (
 // set. Mirrors the fallback used by cmd/af/main.go.
 const defaultWorkerBaseURL = "http://localhost:3000"
 
-// workerStartFlags holds the parsed flag values for `af worker start`.
+// workerStartFlags holds the parsed flag values for `donmai worker start`.
 // Factored out so tests can inspect defaults without executing RunE.
 type workerStartFlags struct {
 	provisioningToken string
@@ -61,7 +61,7 @@ func resolveWorkerBaseURL(flagVal string) string {
 
 // configureWorkerLogging sets the default slog logger based on the local
 // --debug/--quiet flags. The root command also has persistent --debug/--quiet
-// flags that pre-configure slog; this helper lets `af worker start` stand
+// flags that pre-configure slog; this helper lets `donmai worker start` stand
 // alone when invoked directly (e.g. by a fleet-spawned child).
 func configureWorkerLogging(debug, quiet bool) {
 	var level slog.Level

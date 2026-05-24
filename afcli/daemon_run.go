@@ -48,7 +48,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// Build the in-process AgentRuntime registry once at daemon
 			// startup so the local /api/daemon/providers* HTTP surface
 			// can introspect it. The same registry shape is rebuilt
-			// per-session by `af agent run`; here we surface it for
+			// per-session by `donmai agent run`; here we surface it for
 			// operator queries. Probes that fail (e.g. ollama not
 			// running) emit WARN logs but do not block daemon start.
 			// Wave 9 / A1.
@@ -56,9 +56,9 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// Substitute the well-known DefaultHTTPPort here when the
 			// operator did not pass `--port`. Leaving zero through to
 			// daemon.New would bind an ephemeral port — correct for
-			// tests but wrong for the service-managed `af daemon run`
+			// tests but wrong for the service-managed `donmai daemon run`
 			// entry point operators reach via launchd / systemd, which
-			// must bind 7734 so the `af daemon …` CLI surface (and the
+			// must bind 7734 so the `donmai daemon …` CLI surface (and the
 			// installed plist health checks) can find the daemon.
 			// (Wave 12 / C3 — port-7734 default lives in the cobra
 			// layer, not the runtime.)

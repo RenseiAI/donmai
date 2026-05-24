@@ -7,7 +7,7 @@ import (
 
 // newFleetCmd constructs the `fleet` parent command group. It holds no
 // logic of its own; it dispatches to start/stop/status/scale subcommands
-// that spawn and supervise multiple `af worker` child processes.
+// that spawn and supervise multiple `donmai worker` child processes.
 //
 // The ds parameter is accepted for signature consistency with newAgentCmd
 // but is unused because fleet subcommands work by spawning and signaling

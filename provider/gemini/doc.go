@@ -10,7 +10,7 @@
 //
 // Auth: the constructor probes for GEMINI_API_KEY (preferred) or
 // GOOGLE_API_KEY in the environment. Missing key → wrapped
-// agent.ErrProviderUnavailable; the daemon's `af agent run` registry
+// agent.ErrProviderUnavailable; the daemon's `donmai agent run` registry
 // build logs WARN and skips registration, identical to the existing
 // claude / codex probes.
 //

@@ -17,7 +17,7 @@ import (
 )
 
 // Server is the daemon's HTTP control API. It wraps a Daemon and exposes
-// the endpoints consumed by `af daemon …` and `rensei daemon …`.
+// the endpoints consumed by `donmai daemon …` and `rensei daemon …`.
 type Server struct {
 	daemon *Daemon
 	httpd  *http.Server
@@ -110,7 +110,7 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet, s.handlePoolStats))
 	mux.HandleFunc("/api/daemon/pool/evict", s.method(http.MethodPost, s.handlePoolEvict))
 	mux.HandleFunc("/api/daemon/sessions", s.handleSessions) // GET=list, POST=accept
-	// Per-session detail (REN-1461 / F.2.8). Spawned `af agent run`
+	// Per-session detail (REN-1461 / F.2.8). Spawned `donmai agent run`
 	// processes fetch their full QueuedWork shape from this endpoint.
 	// The path-pattern dispatch is custom because the stdlib mux only
 	// supports prefix matching pre-Go 1.22 in this codebase.
@@ -350,7 +350,7 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSessionDetail handles GET /api/daemon/sessions/<id> — the
-// detail endpoint a spawned `af agent run` process reads on startup
+// detail endpoint a spawned `donmai agent run` process reads on startup
 // to recover its full QueuedWork shape. Localhost-only (the daemon
 // binds to 127.0.0.1); 404s on unknown ids; 405s on non-GET methods.
 //

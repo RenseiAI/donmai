@@ -12,7 +12,7 @@ import (
 	"github.com/RenseiAI/donmai/worker"
 )
 
-// fleetStartFlags holds the parsed flag values for `af fleet start`.
+// fleetStartFlags holds the parsed flag values for `donmai fleet start`.
 type fleetStartFlags struct {
 	count             int
 	provisioningToken string
@@ -58,7 +58,7 @@ func newFleetStartCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "start",
 		Short:        "Start a fleet of worker processes",
-		Long:         "Spawn --count `af worker start` processes and supervise them. The PID of each child is recorded in the fleet PID file so `fleet stop` and `fleet status` can find them.",
+		Long:         "Spawn --count `donmai worker start` processes and supervise them. The PID of each child is recorded in the fleet PID file so `fleet stop` and `fleet status` can find them.",
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if flags.count <= 0 {

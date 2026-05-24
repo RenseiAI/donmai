@@ -1,12 +1,12 @@
-# agentfactory-tui
+# donmai
 
-Unified CLI and terminal dashboard for AgentFactory AI agent fleets.
+Unified CLI and terminal dashboard for Donmai AI agent fleets.
 
 **Module**: `github.com/RenseiAI/donmai`
 
 ## Purpose
 
-`af` is the single binary for operating AgentFactory. The goal is for every AgentFactory capability — running fleets, managing agents, scanning Linear for work, dispatching via Redis, inspecting status — to be available through this one binary. The only operations outside scope are ones that are inherently server-side (e.g., the coordinator's own HTTP service).
+`donmai` is the single binary for operating Donmai. The goal is for every AgentFactory capability — running fleets, managing agents, scanning Linear for work, dispatching via Redis, inspecting status — to be available through this one binary. The only operations outside scope are ones that are inherently server-side (e.g., the coordinator's own HTTP service).
 
 This project is taking over the CLI surface from the older TypeScript AgentFactory project. Functionality is being ported into Go in this repo: governor scan loop, Linear client, Redis queue, fleet workers, etc. Use Linear, Redis, GitHub, and other well-known services directly — there is no boundary preventing it.
 
@@ -30,7 +30,7 @@ Treat the legacy repo as **read-only reference**. Don't modify it from work in t
 
 ## Architecture
 
-The OSS-canonical architecture corpus is `agentfactory-architecture` (remote: https://github.com/RenseiAI/agentfactory-architecture, public). Read it first; it is the source of truth for everything OSS-execution-layer (`af` binary, daemon, runner, the eight Provider Families, kits, workflow engine).
+The OSS-canonical architecture corpus is `agentfactory-architecture` (remote: https://github.com/RenseiAI/agentfactory-architecture, public). Read it first; it is the source of truth for everything OSS-execution-layer (`donmai` binary, daemon, runner, the eight Provider Families, kits, workflow engine).
 
 Its sibling, `rensei-architecture` (remote: https://github.com/RenseiAI/rensei-architecture, private), extends with platform-only docs (Linear realignment, PM agents tied to the Rensei team's backlog, multi-tenant control-plane policy, the SaaS dashboard parity discipline) and the `<doc>-platform-extensions.md` deltas that extend shared docs in the OSS corpus. Locally both repos sit alongside this one (`../agentfactory-architecture/`, `../rensei-architecture/`).
 
@@ -50,7 +50,7 @@ agentfactory-tui/
 ├── afclient/        # PUBLIC — API client, types, mock, errors
 ├── afcli/           # PUBLIC — Cobra command factories (RegisterCommands pattern)
 ├── worker/          # PUBLIC — Worker protocol (register, poll, heartbeat, fleet)
-├── cmd/af/          # Binary entry point (thin wrapper over afcli)
+├── cmd/donmai/      # Binary entry point (thin wrapper over afcli)
 └── internal/        # MODULE-PRIVATE — TUI views, app routing, inline output
     ├── app/         #   Root Bubble Tea model, view routing
     ├── views/       #   Dashboard, detail, palette views
@@ -102,7 +102,7 @@ No other direct dependencies without compelling justification.
 ## Commands
 
 ```bash
-make build           # Build af binary
+make build           # Build donmai binary
 make test            # go test -race ./...
 make lint            # golangci-lint run
 make fmt             # gofumpt -w .
@@ -151,17 +151,17 @@ The AgentFactory coordinator exposes these endpoints:
 ## Local daemon control API (127.0.0.1:7734)
 
 The locally-installed `rensei-daemon` exposes an HTTP control API consumed
-by the `af daemon …` CLI surface and by per-session worker children. See
+by the `donmai daemon …` CLI surface and by per-session worker children. See
 `daemon/README.md` for the full endpoint reference. Notable post-F.2.8
 endpoints:
 
 - `GET /api/daemon/sessions` — list active session handles
 - `GET /api/daemon/sessions/:id` — per-session detail (issued to spawned
-  `af agent run` workers; localhost-only)
+  `donmai agent run` workers; localhost-only)
 
-## `af agent run` (F.2.8)
+## `donmai agent run` (F.2.8)
 
-The daemon spawns `af agent run` for every claimed session. The subcommand
+The daemon spawns `donmai agent run` for every claimed session. The subcommand
 reads its session id from `RENSEI_SESSION_ID` (set by the spawner), fetches
 the full QueuedWork payload from the daemon's local control API, builds a
 runner.Registry with stub + claude + codex (best-effort), and invokes
@@ -171,13 +171,13 @@ runner.Registry with stub + claude + codex (best-effort), and invokes
 ## Credentials in standalone mode (no daemon, no platform)
 
 When `af` runs OUTSIDE of rensei-tui (no daemon credential pipeline, no
-platform session), agents inherit credentials from the af process per a
+platform session), agents inherit credentials from the donmai process per a
 fixed two-tier precedence:
 
 | Precedence | Source                                | Notes                                                                 |
 | ---------- | ------------------------------------- | --------------------------------------------------------------------- |
 | 1          | AF-TUI process env (`os.Environ()`)   | Anything the operator `export`'d before launching `af`.               |
-| 2          | `${gitRoot}/.env.local`               | Parsed once at af startup; never copied into spawned worktrees.       |
+| 2          | `${gitRoot}/.env.local`               | Parsed once at donmai startup; never copied into spawned worktrees.       |
 | Fail-open  | Redacted stderr warning               | `[creds] no source for KEY — agent may fail` per missing variable.    |
 
 Sources are merged at `daemon run` time into `SpawnerOptions.BaseEnv` so
@@ -194,7 +194,7 @@ rensei-tui daemon hardcodes the same list in
 `daemon/credentials/socket.go`; the two stay in sync manually until
 the OSS boundary permits a shared import.
 
-Operators can pin the mode via `af daemon run --standalone-creds=<on|off|auto>`.
+Operators can pin the mode via `donmai daemon run --standalone-creds=<on|off|auto>`.
 The default is `auto`, which selects `on` when `RENSEI_DAEMON_JWT` is
 unset (i.e. AF-TUI is NOT being driven by rensei-tui's credential
 socket) and `off` otherwise.

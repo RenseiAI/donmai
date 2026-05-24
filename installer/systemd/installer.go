@@ -184,7 +184,7 @@ func runner(r CommandRunner) CommandRunner {
 //
 //  1. Explicit binPath argument.
 //  2. os.Executable() — the currently-running binary, which is the most
-//     reliable answer when invoked from `af daemon install` or
+//     reliable answer when invoked from `donmai daemon install` or
 //     `rensei daemon install`.
 func ResolveHostBinPath(binPath string) (string, error) {
 	if binPath != "" {

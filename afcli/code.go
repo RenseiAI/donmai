@@ -11,7 +11,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient/codeintel"
 )
 
-// newCodeCmd constructs the `af code` command tree.
+// newCodeCmd constructs the `donmai code` command tree.
 //
 // Architecture: shell-out bridge to `pnpm af-code` (TS implementation).
 // See afclient/codeintel/runner.go for the full rationale.
@@ -52,7 +52,7 @@ func printJSON(v any) error {
 	return enc.Encode(v)
 }
 
-// newCodeGetRepoMapCmd constructs `af code get-repo-map`.
+// newCodeGetRepoMapCmd constructs `donmai code get-repo-map`.
 func newCodeGetRepoMapCmd() *cobra.Command {
 	var (
 		maxFiles     int
@@ -101,7 +101,7 @@ Examples:
 	return cmd
 }
 
-// newCodeSearchSymbolsCmd constructs `af code search-symbols <query>`.
+// newCodeSearchSymbolsCmd constructs `donmai code search-symbols <query>`.
 func newCodeSearchSymbolsCmd() *cobra.Command {
 	var (
 		maxResults  int
@@ -154,7 +154,7 @@ Examples:
 	return cmd
 }
 
-// newCodeSearchCodeCmd constructs `af code search-code <query>`.
+// newCodeSearchCodeCmd constructs `donmai code search-code <query>`.
 func newCodeSearchCodeCmd() *cobra.Command {
 	var (
 		maxResults int
@@ -200,7 +200,7 @@ Examples:
 	return cmd
 }
 
-// newCodeCheckDuplicateCmd constructs `af code check-duplicate`.
+// newCodeCheckDuplicateCmd constructs `donmai code check-duplicate`.
 func newCodeCheckDuplicateCmd() *cobra.Command {
 	var (
 		content     string
@@ -243,7 +243,7 @@ Examples:
 	return cmd
 }
 
-// newCodeFindTypeUsagesCmd constructs `af code find-type-usages <TypeName>`.
+// newCodeFindTypeUsagesCmd constructs `donmai code find-type-usages <TypeName>`.
 func newCodeFindTypeUsagesCmd() *cobra.Command {
 	var maxResults int
 
@@ -286,7 +286,7 @@ Examples:
 	return cmd
 }
 
-// newCodeValidateCrossDepsCmd constructs `af code validate-cross-deps [path]`.
+// newCodeValidateCrossDepsCmd constructs `donmai code validate-cross-deps [path]`.
 func newCodeValidateCrossDepsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "validate-cross-deps [path]",

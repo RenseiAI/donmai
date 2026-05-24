@@ -15,7 +15,7 @@ import (
 // the launchd / systemd install case where `daemon run` and `agent
 // run` ship as a single binary).
 //
-// Falls back to `af agent run` on PATH when os.Executable cannot
+// Falls back to `donmai agent run` on PATH when os.Executable cannot
 // resolve. Returns nil when no resolution path succeeds OR when we
 // detect a `go test` binary — the spawner then keeps its `/bin/sh -c
 // "exit 0"` fallback. We log a warning at runtime when the stub fires
@@ -47,7 +47,7 @@ func defaultWorkerCommand() []string {
 	return []string{exe, "agent", "run"}
 }
 
-// lookPathFallback returns `af agent run` resolved via PATH, or nil
+// lookPathFallback returns `donmai agent run` resolved via PATH, or nil
 // when `af` is not installed.
 func lookPathFallback() []string {
 	if af, err := exec.LookPath("af"); err == nil && af != "" {

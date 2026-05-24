@@ -220,7 +220,7 @@ func TestRoutingExplain_RequiresOneArg(t *testing.T) {
 // this test, the wiring line in commands.go could be silently dropped.
 func TestRoutingCmd_RegisteredViaRegisterCommands(t *testing.T) {
 	t.Parallel()
-	root := &cobra.Command{Use: "af"}
+	root := &cobra.Command{Use: "donmai"}
 	RegisterCommands(root, Config{
 		ClientFactory: func() afclient.DataSource { return afclient.NewMockClient() },
 	})

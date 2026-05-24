@@ -4,7 +4,7 @@
 // This is the v0.5.0 production provider for the agent-runner subsystem.
 // It satisfies the agent.Provider contract defined in
 // github.com/RenseiAI/donmai/agent and is wired into the
-// daemon's WorkerCommand path via afcli's `af agent run` subcommand
+// daemon's WorkerCommand path via afcli's `donmai agent run` subcommand
 // (delivered separately in F.2.4).
 //
 // # Implementation strategy

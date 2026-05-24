@@ -79,7 +79,7 @@ func newDaemonCmdWithFactory(factory daemonClientFactory, hostVersion string) *c
 		Use:   "daemon",
 		Short: "Manage the local rensei-daemon",
 		Long: "Manage the local rensei-daemon process that supervises agent session pools.\n\n" +
-			"The daemon replaces the per-workspace `af worker` / `af fleet` approach.\n" +
+			"The daemon replaces the per-workspace `donmai worker` / `donmai fleet` approach.\n" +
 			"Install once, configure once, and sessions run automatically for allowed projects.",
 		SilenceUsage: true,
 	}
@@ -334,7 +334,7 @@ func newDaemonStatusCmd(factory daemonClientFactory) *cobra.Command {
 	return cmd
 }
 
-// writeDaemonStatusTable renders a simple ANSI status block for `af daemon status`.
+// writeDaemonStatusTable renders a simple ANSI status block for `donmai daemon status`.
 // Uses plain ANSI (not tui-components primitives per issue note — those are REN-1331).
 func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error {
 	statusColor := ansiColor(r.Status)
@@ -581,7 +581,7 @@ func newDaemonPauseCmd(factory daemonClientFactory) *cobra.Command {
 		Use:   "pause",
 		Short: "Pause the daemon (stop accepting new sessions)",
 		Long: "Signal the daemon to stop accepting new session assignments while keeping\n" +
-			"currently running sessions alive. Use `af daemon resume` to re-enable.",
+			"currently running sessions alive. Use `donmai daemon resume` to re-enable.",
 		SilenceUsage: true,
 		RunE: daemonActionRunE("pause", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
 			return c.Pause()
@@ -695,7 +695,7 @@ func newDaemonStopCmd(factory daemonClientFactory) *cobra.Command {
 		Use:   "stop",
 		Short: "Stop the daemon process",
 		Long: "Signal the daemon to stop immediately. In-flight sessions are interrupted.\n" +
-			"Use `af daemon drain` first for a graceful shutdown.",
+			"Use `donmai daemon drain` first for a graceful shutdown.",
 		SilenceUsage: true,
 		RunE: daemonActionRunE("stop", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
 			return c.Stop()
@@ -929,7 +929,7 @@ func writePoolStatsSection(w io.Writer, p *afclient.WorkareaPoolStats) error {
 
 // ── evict ─────────────────────────────────────────────────────────────────────
 
-// newDaemonEvictCmd returns the `af daemon evict` command.
+// newDaemonEvictCmd returns the `donmai daemon evict` command.
 // Usage: af daemon evict --repo <url> --older-than <duration>
 func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 	var (
@@ -1008,13 +1008,13 @@ func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 
 // ── set ───────────────────────────────────────────────────────────────────────
 
-// allowedCapacityKeys is the set of dotted config keys accepted by `af daemon set`.
+// allowedCapacityKeys is the set of dotted config keys accepted by `donmai daemon set`.
 var allowedCapacityKeys = map[string]struct{}{
 	"capacity.maxConcurrentSessions": {},
 	"capacity.poolMaxDiskGb":         {},
 }
 
-// newDaemonSetCmd returns the `af daemon set` command.
+// newDaemonSetCmd returns the `donmai daemon set` command.
 // Usage: af daemon set <capacity key> <N>
 func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	var (
@@ -1258,7 +1258,7 @@ func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 // list of repo URLs (truncated for very long lists). (REN-1446.)
 func formatAllowedProjectsStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || len(r.AllowedProjects) == 0 {
-		return "0 (none allowed — run `af project allow <repo-url>`)"
+		return "0 (none allowed — run `donmai project allow <repo-url>`)"
 	}
 	const maxShown = 6
 	count := len(r.AllowedProjects)

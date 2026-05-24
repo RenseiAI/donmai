@@ -1,4 +1,4 @@
-// Package afcli workarea.go — `af workarea …` Cobra commands. The
+// Package afcli workarea.go — `donmai workarea …` Cobra commands. The
 // commands target the local daemon's HTTP control API at
 // /api/daemon/workareas* per ADR-2026-05-07-daemon-http-control-api.md
 // §D1 + §D4a; they NEVER hit the SaaS platform and never attach an
@@ -39,7 +39,7 @@ func defaultWorkareaClientFactory(cfg afclient.DaemonConfig) workareaDaemonClien
 }
 
 // workareaEnvDaemonURL — env var that overrides the daemon address for
-// `af workarea …` invocations. Mirrors `RENSEI_DAEMON_URL` everywhere
+// `donmai workarea …` invocations. Mirrors `RENSEI_DAEMON_URL` everywhere
 // else.
 const workareaEnvDaemonURL = "RENSEI_DAEMON_URL"
 
@@ -56,7 +56,7 @@ func resolveWorkareaDaemonConfig() afclient.DaemonConfig {
 	return cfg
 }
 
-// newWorkareaCmd returns the `af workarea` subcommand tree. The ds
+// newWorkareaCmd returns the `donmai workarea` subcommand tree. The ds
 // argument is accepted for signature consistency with the rest of
 // afcli's command factories but is not used — workarea commands target
 // the local daemon, not the platform.

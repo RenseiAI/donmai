@@ -34,7 +34,7 @@ import (
 )
 
 // DefaultAgentRunDaemonURL is the local control HTTP address the
-// daemon binds to (127.0.0.1:7734). The `af agent run` subcommand
+// daemon binds to (127.0.0.1:7734). The `donmai agent run` subcommand
 // fetches its session detail from <DefaultAgentRunDaemonURL>/api/daemon/sessions/<id>.
 const DefaultAgentRunDaemonURL = "http://127.0.0.1:7734"
 
@@ -86,7 +86,7 @@ func newAgentRunCmd() *cobra.Command {
 			"The session id is read from --session-id or the\n" +
 			"RENSEI_SESSION_ID environment variable (set automatically by\n" +
 			"the daemon spawner).\n\n" +
-			"Operators rarely invoke this directly — `af daemon run` spawns it\n" +
+			"Operators rarely invoke this directly — `donmai daemon run` spawns it\n" +
 			"on every accepted session. To debug a session locally, set\n" +
 			"RENSEI_SESSION_ID and invoke this command against a running\n" +
 			"daemon.",
@@ -136,7 +136,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	defer cancel()
 
 	logger := slog.Default()
-	logger.Info("af agent run: starting",
+	logger.Info("donmai agent run: starting",
 		"sessionId", sessionID,
 		"daemonUrl", daemonURL,
 	)
@@ -146,7 +146,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if err != nil {
 		return preflightErr(fmt.Sprintf("fetch session detail: %v", err))
 	}
-	logger.Info("af agent run: session detail fetched",
+	logger.Info("donmai agent run: session detail fetched",
 		"sessionId", detail.SessionID,
 		"identifier", detail.IssueIdentifier,
 		"provider", providerNameFromDetail(detail),
@@ -161,7 +161,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 	// 5. Construct registry, runner, and run.
 	reg := buildAgentRunRegistry(logger)
-	logger.Info("af agent run: registry built", "providers", reg.Names())
+	logger.Info("donmai agent run: registry built", "providers", reg.Names())
 
 	wtParent := opts.worktree
 	if wtParent == "" {
@@ -204,13 +204,13 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 	qw := detailToQueuedWork(detail)
 
-	logger.Info("af agent run: invoking runner.Run", "sessionId", qw.SessionID)
+	logger.Info("donmai agent run: invoking runner.Run", "sessionId", qw.SessionID)
 	res, runErr := r.Run(runCtx, qw)
 
 	out := cmd.OutOrStdout()
 	if opts.jsonOut && res != nil {
 		if err := emitResultJSON(out, res); err != nil {
-			logger.Warn("af agent run: emit result json failed", "err", err)
+			logger.Warn("donmai agent run: emit result json failed", "err", err)
 		}
 	}
 
@@ -219,7 +219,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
 	if shutErr := reg.Shutdown(shutCtx); shutErr != nil {
-		logger.Warn("af agent run: registry shutdown returned errors", "err", shutErr)
+		logger.Warn("donmai agent run: registry shutdown returned errors", "err", shutErr)
 	}
 
 	if runErr != nil {
@@ -368,13 +368,13 @@ type providerCtor struct {
 }
 
 // buildAgentRunRegistry constructs the runner.Registry for one
-// `af agent run` invocation. Stub is always registered; claude + codex
+// `donmai agent run` invocation. Stub is always registered; claude + codex
 // register on best-effort (their probes return errors when the
 // underlying CLI / app-server is missing — we log + skip rather than
 // fail the whole worker so a misconfigured host does not silently lose
 // stub-mode smoke runs).
 //
-// Each spawned `af agent run` builds its own Registry — providers are
+// Each spawned `donmai agent run` builds its own Registry — providers are
 // stateless modulo codex's app-server, and that app-server is a
 // per-process singleton that gets a fresh start on every spawn. Sharing
 // a single registry across daemon-life sessions would force lifecycle
@@ -427,17 +427,17 @@ func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor) *runner.R
 	for _, c := range ctors {
 		p, err := c.new()
 		if err != nil {
-			logger.Warn("af agent run: provider probe failed",
+			logger.Warn("donmai agent run: provider probe failed",
 				"provider", c.name, "err", err)
 			continue
 		}
 		if regErr := reg.Register(p); regErr != nil {
-			logger.Warn("af agent run: provider register failed",
+			logger.Warn("donmai agent run: provider register failed",
 				"provider", c.name, "err", regErr)
 		}
 	}
 	if len(reg.Names()) == 0 {
-		logger.Error("af agent run: no providers available — every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `af doctor`. (REN-1462)")
+		logger.Error("donmai agent run: no providers available — every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `donmai doctor`. (REN-1462)")
 	}
 	return reg
 }

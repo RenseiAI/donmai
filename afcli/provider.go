@@ -1,4 +1,4 @@
-// Package afcli provider.go — `af provider …` Cobra commands. The
+// Package afcli provider.go — `donmai provider …` Cobra commands. The
 // commands target the local daemon's HTTP control API at
 // /api/daemon/providers* per ADR-2026-05-07-daemon-http-control-api.md
 // §D1; they NEVER hit the SaaS platform and never attach an
@@ -39,7 +39,7 @@ func defaultProviderClientFactory(cfg afclient.DaemonConfig) providerDaemonClien
 }
 
 // providerEnvDaemonURL names the env var that overrides the daemon
-// address for `af provider …` invocations. Mirrors `af agent run`'s
+// address for `donmai provider …` invocations. Mirrors `donmai agent run`'s
 // RENSEI_DAEMON_URL convention.
 const providerEnvDaemonURL = "RENSEI_DAEMON_URL"
 
@@ -89,7 +89,7 @@ func splitHTTPHostPort(rawURL string) (host string, port int, ok bool) {
 	return h, p, true
 }
 
-// newProviderCmd returns the `af provider` subcommand tree. The ds
+// newProviderCmd returns the `donmai provider` subcommand tree. The ds
 // argument is accepted for signature consistency with the rest of
 // afcli's command factories but is not used — provider commands
 // target the local daemon, not the platform.
@@ -120,7 +120,7 @@ inspect the partialCoverage flag on the JSON response.`,
 	return cmd
 }
 
-// newProviderListCmd builds the `af provider list` subcommand.
+// newProviderListCmd builds the `donmai provider list` subcommand.
 func newProviderListCmd(factory providerClientFactory) *cobra.Command {
 	var jsonOut bool
 	cmd := &cobra.Command{
@@ -155,7 +155,7 @@ func runProviderList(out io.Writer, client providerDaemonClient, jsonOut bool) e
 	return provider.RenderList(out, resp.Providers, noColor)
 }
 
-// newProviderShowCmd builds the `af provider show <id>` subcommand.
+// newProviderShowCmd builds the `donmai provider show <id>` subcommand.
 func newProviderShowCmd(factory providerClientFactory) *cobra.Command {
 	var jsonOut bool
 	cmd := &cobra.Command{

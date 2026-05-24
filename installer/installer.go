@@ -5,7 +5,7 @@
 // what gets registered as the service entrypoint (locked REN-1406
 // decision — no separate rensei-daemon binary).
 //
-// This package is the single import surface for `af daemon install`,
+// This package is the single import surface for `donmai daemon install`,
 // `rensei daemon install`, etc. It is exported so downstream binaries
 // (rensei-tui, etc.) can drive the same in-process install flow without
 // reimplementing it.

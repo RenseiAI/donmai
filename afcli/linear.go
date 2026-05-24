@@ -9,7 +9,7 @@ package afcli
 // Auth strategy (per ADR-2026-05-12-cli-linear-proxy):
 //   1. LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) env var → direct GraphQL calls
 //      to api.linear.app. Preserves the standalone `af` path AND the
-//      worker-fleet path where `af agent run` injects the env var into the
+//      worker-fleet path where `donmai agent run` injects the env var into the
 //      in-session shell.
 //   2. No env key + ds() returns an authenticated *afclient.Client (rsk_ token
 //      + base URL) → platform proxy mode via `linear.NewProxiedClient`. The

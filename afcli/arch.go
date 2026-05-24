@@ -9,7 +9,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient/codeintel"
 )
 
-// newArchCmd constructs the `af arch` command tree.
+// newArchCmd constructs the `donmai arch` command tree.
 //
 // Architecture: shell-out bridge to `pnpm af-arch` (TS implementation).
 // See afclient/codeintel/runner.go for the full rationale.
@@ -44,7 +44,7 @@ Binary resolution (in order):
 	return cmd
 }
 
-// newArchAssessCmd constructs `af arch assess`.
+// newArchAssessCmd constructs `donmai arch assess`.
 func newArchAssessCmd() *cobra.Command {
 	var (
 		repository string

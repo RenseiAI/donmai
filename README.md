@@ -16,19 +16,19 @@
 - [Credentials in standalone mode (no daemon, no platform)](#credentials-in-standalone-mode-no-daemon-no-platform)
 - [Three-process model](#three-process-model)
 - [Command catalog](#command-catalog)
-  - [af status](#af-status)
-  - [af agent](#af-agent)
-  - [af session](#af-session)
-  - [af daemon](#af-daemon)
-  - [af governor](#af-governor)
-  - [af worker and af fleet](#af-worker-and-af-fleet)
-  - [af orchestrator](#af-orchestrator)
-  - [af logs](#af-logs)
-  - [af linear](#af-linear)
-  - [af github](#af-github)
-  - [af code](#af-code)
-  - [af arch](#af-arch)
-  - [af admin](#af-admin)
+  - [donmai status](#donmai-status)
+  - [donmai agent](#donmai-agent)
+  - [donmai session](#donmai-session)
+  - [donmai daemon](#donmai-daemon)
+  - [donmai governor](#donmai-governor)
+  - [donmai worker and donmai fleet](#donmai-worker-and-donmai-fleet)
+  - [donmai orchestrator](#donmai-orchestrator)
+  - [donmai logs](#donmai-logs)
+  - [donmai linear](#donmai-linear)
+  - [donmai github](#donmai-github)
+  - [donmai code](#donmai-code)
+  - [donmai arch](#donmai-arch)
+  - [donmai admin](#donmai-admin)
 - [Migration from the legacy TypeScript CLI](#migration-from-the-legacy-typescript-cli)
 - [Development](#development)
 - [Architecture](#architecture)
@@ -41,7 +41,7 @@
 ### Homebrew (macOS / Linux, recommended)
 
 ```bash
-brew install RenseiAI/tap/af
+brew install donmai
 ```
 
 ### go install (requires Go 1.22+)
@@ -79,39 +79,39 @@ make build        # produces bin/af
 export LINEAR_API_KEY=lin_api_...
 
 # 2. Start the local daemon (persists across reboots via launchd / systemd)
-af daemon install
-af daemon status
+donmai daemon install
+donmai daemon status
 
 # 3. Pick up Linear backlog issues and dispatch agents
-af orchestrator --project MyProject
+donmai orchestrator --project MyProject
 
 # 4. Watch fleet activity
-af status
-af agent list
+donmai status
+donmai agent list
 
 # 5. Tail logs from the log analyzer
-af logs analyze --input ~/.rensei/logs/agent.log
+donmai logs analyze --input ~/.rensei/logs/agent.log
 ```
 
 ---
 
 ## Credentials in standalone mode (no daemon, no platform)
 
-When you run `af` outside of rensei-tui (standalone OSS mode), agents
-inherit credentials from the af process. There are two sources, in
+When you run `donmai` outside of rensei-tui (standalone OSS mode), agents
+inherit credentials from the donmai process. There are two sources, in
 this order:
 
-  1. Existing environment variables in the af process
+  1. Existing environment variables in the donmai process
   2. .env.local at the root of the working directory
 
 The first source that defines a variable wins. .env.local is read once
-at af startup and never copied into worktrees.
+at donmai startup and never copied into worktrees.
 
 Some variables (the daemon's own auth tokens) are blocked from forwarding
 regardless of source; see internal/credentials/blocklist.go.
 
 If you want secrets sourced from 1Password instead of a flat file, see
-the optional `op` CLI integration (run `af creds setup` for the
+the optional `op` CLI integration (run `donmai creds setup` for the
 walkthrough).
 
 ---
@@ -127,7 +127,7 @@ distinct role; together they form the complete OSS execution pipeline.
 │                                                                  │
 │  ┌─────────────────┐    ┌─────────────────┐   ┌──────────────┐  │
 │  │   orchestrator  │───▶│    governor     │──▶│   worker(s)  │  │
-│  │  (af orchestr-  │    │  (af governor)  │   │ (af worker)  │  │
+│  │  (donmai orche- │    │  (donmai govr.) │   │ (donmai wkr) │  │
 │  │   ator)         │    │                 │   │              │  │
 │  └─────────────────┘    └─────────────────┘   └──────────────┘  │
 │           │                      │                    │          │
@@ -135,7 +135,7 @@ distinct role; together they form the complete OSS execution pipeline.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Orchestrator (`af orchestrator`)
+### Orchestrator (`donmai orchestrator`)
 
 Queries the Linear backlog, selects issues that satisfy the configured
 project/work-type filters, and dispatches agent tasks into the Redis work queue.
@@ -143,21 +143,21 @@ It does not run agents itself — it schedules them. OSS users run the orchestra
 on demand or via a cron job. SaaS users replace it with the platform's webhook-
 driven control plane.
 
-### Governor (`af governor`)
+### Governor (`donmai governor`)
 
 Long-running scan loop. Watches the Redis queue for pending work, enforces
 concurrency limits, and starts workers to consume each item. The governor is
 the process that keeps workers running; it is the OSS equivalent of the SaaS
 coordinator service.
 
-### Worker (`af worker`)
+### Worker (`donmai worker`)
 
 An agent process. Registers with the coordinator over HTTP, polls for work,
 executes the assigned session (calling the LLM runtime: Claude, Codex, etc.),
 and reports results back. Multiple workers can run in parallel; the governor
 controls the ceiling.
 
-### Daemon (`af daemon`)
+### Daemon (`donmai daemon`)
 
 The local daemon (`rensei-daemon` subprocess) is the persistent service that
 ties the three processes together. It installs as a system service (launchd on
@@ -172,125 +172,125 @@ see [011-local-daemon-fleet.md](https://github.com/RenseiAI/rensei-architecture/
 All commands output JSON when `--json` is passed. Destructive commands require
 interactive confirmation unless `--yes` is provided.
 
-### `af status`
+### `donmai status`
 
 Print a fleet-wide status snapshot.
 
 ```bash
-af status
-af status --json
+donmai status
+donmai status --json
 ```
 
-### `af agent`
+### `donmai agent`
 
 Inspect and control individual agent sessions.
 
 ```bash
-af agent list [--all] [--json] [--sandbox <id>]
-af agent status <session-id>
-af agent stop <session-id>
-af agent chat <session-id>          # forward a prompt to a running agent
-af agent reconnect <session-id>     # re-attach to a detached session
+donmai agent list [--all] [--json] [--sandbox <id>]
+donmai agent status <session-id>
+donmai agent stop <session-id>
+donmai agent chat <session-id>          # forward a prompt to a running agent
+donmai agent reconnect <session-id>     # re-attach to a detached session
 ```
 
-### `af session`
+### `donmai session`
 
 Low-level session management (lifecycle, streaming output).
 
 ```bash
-af session list [--status <status>] [--limit <n>]
-af session inspect <session-id>
-af session stream <session-id>      # tail activity stream
-af session restore-workarea <session-id> --to <dir>
+donmai session list [--status <status>] [--limit <n>]
+donmai session inspect <session-id>
+donmai session stream <session-id>      # tail activity stream
+donmai session restore-workarea <session-id> --to <dir>
 ```
 
-### `af daemon`
+### `donmai daemon`
 
 Start and manage the local daemon. The daemon installs as a launchd agent
 (macOS) or systemd user unit (Linux) and manages the workarea pool, auto-
 updates, and session lifecycle.
 
 ```bash
-af daemon install [--user | --system]   # write and load the system service
-af daemon uninstall                     # remove the system service
-af daemon status                        # running / stopped / draining
-af daemon start
-af daemon stop
-af daemon restart
-af daemon pause                         # stop accepting new work
-af daemon resume
-af daemon drain                         # wait for in-flight sessions, then stop
-af daemon update                        # force-pull latest release
-af daemon doctor                        # health check: config, credentials, disk
-af daemon logs [--follow]              # tail daemon log (NDJSON / pretty)
-af daemon stats [--pool]               # capacity, sessions, pool state
-af daemon setup                        # first-run interactive wizard
-af daemon set <key> <value>            # mutate a single config key
-af daemon evict --repo <repo> [--older-than <duration>]
+donmai daemon install [--user | --system]   # write and load the system service
+donmai daemon uninstall                     # remove the system service
+donmai daemon status                        # running / stopped / draining
+donmai daemon start
+donmai daemon stop
+donmai daemon restart
+donmai daemon pause                         # stop accepting new work
+donmai daemon resume
+donmai daemon drain                         # wait for in-flight sessions, then stop
+donmai daemon update                        # force-pull latest release
+donmai daemon doctor                        # health check: config, credentials, disk
+donmai daemon logs [--follow]              # tail daemon log (NDJSON / pretty)
+donmai daemon stats [--pool]               # capacity, sessions, pool state
+donmai daemon setup                        # first-run interactive wizard
+donmai daemon set <key> <value>            # mutate a single config key
+donmai daemon evict --repo <repo> [--older-than <duration>]
 ```
 
 Supported capacity keys:
 
 ```bash
-af daemon set capacity.maxConcurrentSessions <sessions>
-af daemon set capacity.poolMaxDiskGb <gb>
+donmai daemon set capacity.maxConcurrentSessions <sessions>
+donmai daemon set capacity.poolMaxDiskGb <gb>
 ```
 
-Environment: `RENSEI_DAEMON_TOKEN` (optional — `af daemon install` provisions
+Environment: `RENSEI_DAEMON_TOKEN` (optional — `donmai daemon install` provisions
 this automatically when `~/.config/rensei/config.json` contains a platform key).
 
-### `af governor`
+### `donmai governor`
 
 Start, stop, and query the governor scan loop.
 
 ```bash
-af governor start [--max <n>] [--interval <seconds>]
-af governor stop
-af governor status
+donmai governor start [--max <n>] [--interval <seconds>]
+donmai governor stop
+donmai governor status
 ```
 
-### `af worker` and `af fleet`
+### `donmai worker` and `donmai fleet`
 
-Legacy local process-manager commands for standalone OSS debugging. `af daemon`
+Legacy local process-manager commands for standalone OSS debugging. `donmai daemon`
 is the primary host lifecycle surface for normal operation, while these commands
 remain available in the `af` binary for users who need the older foreground
 worker host or PID-file fleet flow.
 
 ```bash
-af worker start [--base-url <url>] [--provisioning-token <token>]
-af fleet start --count <n>
-af fleet status
-af fleet stop
-af fleet scale --count <n>
+donmai worker start [--base-url <url>] [--provisioning-token <token>]
+donmai fleet start --count <n>
+donmai fleet status
+donmai fleet stop
+donmai fleet scale --count <n>
 ```
 
-### `af orchestrator`
+### `donmai orchestrator`
 
 Local orchestrator for OSS users. Queries the Linear backlog and dispatches
 agent tasks.
 
 ```bash
-af orchestrator --project <name>            # dispatch from a Linear project
-af orchestrator --single <issue-id>         # process one specific issue
-af orchestrator --project <name> --dry-run  # preview without dispatching
-af orchestrator --project <name> --max 5    # cap concurrent dispatches
-af orchestrator --project <name> --repo github.com/org/repo
-af orchestrator --project <name> --templates .agentfactory/templates
+donmai orchestrator --project <name>            # dispatch from a Linear project
+donmai orchestrator --single <issue-id>         # process one specific issue
+donmai orchestrator --project <name> --dry-run  # preview without dispatching
+donmai orchestrator --project <name> --max 5    # cap concurrent dispatches
+donmai orchestrator --project <name> --repo github.com/org/repo
+donmai orchestrator --project <name> --templates .agentfactory/templates
 ```
 
 **Environment**: `LINEAR_API_KEY` required.
 
-### `af logs`
+### `donmai logs`
 
 Agent log analysis — detect failure patterns and optionally file Linear issues.
 
 ```bash
-af logs analyze --input /path/to/agent.log
-cat agent.log | af logs analyze
-af logs analyze --input agent.log --dry-run
-af logs analyze --input agent.log --json
-af logs analyze --input agent.log --team Engineering --project Agent
-af logs analyze --input agent.log --config ~/.config/af/log-signatures.yaml
+donmai logs analyze --input /path/to/agent.log
+cat agent.log | donmai logs analyze
+donmai logs analyze --input agent.log --dry-run
+donmai logs analyze --input agent.log --json
+donmai logs analyze --input agent.log --team Engineering --project Agent
+donmai logs analyze --input agent.log --config ~/.config/af/log-signatures.yaml
 ```
 
 The built-in signature catalog covers: tool misuse, sandbox permission errors,
@@ -299,50 +299,50 @@ extend via a YAML catalog at `~/.config/af/log-signatures.yaml`.
 
 **Environment**: `LINEAR_API_KEY` required for issue creation (omit with `--dry-run`).
 
-### `af linear`
+### `donmai linear`
 
 Linear issue-tracker operations (mirrors the legacy `pnpm af-linear` scripts).
 All subcommands output JSON.
 
 ```bash
-af linear get-issue <id>
-af linear create-issue --title "..." --team "..."
-af linear update-issue <id> [--state "..."]
-af linear list-issues [--project "..."] [--status "..."]
-af linear create-comment <issue-id> --body "..."
-af linear list-comments <issue-id>
-af linear add-relation <issue-id> <related-id> --type <related|blocks|duplicate>
-af linear list-relations <issue-id>
-af linear remove-relation <relation-id>
-af linear list-sub-issues <parent-id>
-af linear list-sub-issue-statuses <parent-id>
-af linear update-sub-issue <id> [--state "..."] [--comment "..."]
-af linear check-blocked <issue-id>
-af linear list-backlog-issues --project "..."
-af linear list-unblocked-backlog --project "..."
-af linear create-blocker <source-issue-id> --title "..."
+donmai linear get-issue <id>
+donmai linear create-issue --title "..." --team "..."
+donmai linear update-issue <id> [--state "..."]
+donmai linear list-issues [--project "..."] [--status "..."]
+donmai linear create-comment <issue-id> --body "..."
+donmai linear list-comments <issue-id>
+donmai linear add-relation <issue-id> <related-id> --type <related|blocks|duplicate>
+donmai linear list-relations <issue-id>
+donmai linear remove-relation <relation-id>
+donmai linear list-sub-issues <parent-id>
+donmai linear list-sub-issue-statuses <parent-id>
+donmai linear update-sub-issue <id> [--state "..."] [--comment "..."]
+donmai linear check-blocked <issue-id>
+donmai linear list-backlog-issues --project "..."
+donmai linear list-unblocked-backlog --project "..."
+donmai linear create-blocker <source-issue-id> --title "..."
 ```
 
 **Authentication**: set `LINEAR_API_KEY` (or `LINEAR_ACCESS_TOKEN`).
 
-### `af github`
+### `donmai github`
 
-GitHub Issues operations. Mirrors the `af linear` surface adapted to GitHub
+GitHub Issues operations. Mirrors the `donmai linear` surface adapted to GitHub
 Issues vocabulary. All subcommands output JSON.
 
 ```bash
-af github get-issue     --repo owner/repo --number 42
-af github create-issue  --repo owner/repo --title "Bug: ..." [--body "..."] [--labels "bug,enhancement"] [--assignees "alice"]
-af github update-issue  --repo owner/repo --number 42 [--title "..."] [--state open|closed]
-af github list-issues   --repo owner/repo [--state open|closed|all] [--labels "..."] [--assignee "alice"] [--limit 50]
-af github list-comments --repo owner/repo --number 42
-af github create-comment --repo owner/repo --number 42 --body "..." [--body-file /path]
-af github add-labels    --repo owner/repo --number 42 --labels "bug,priority:high"
-af github set-assignees --repo owner/repo --number 42 --assignees "alice,bob"
-af github close-issue   --repo owner/repo --number 42 [--comment "Resolved in v2.0"]
-af github reopen-issue  --repo owner/repo --number 42 [--comment "Reopening for follow-up"]
-af github list-labels   --repo owner/repo
-af github get-repo      --repo owner/repo
+donmai github get-issue     --repo owner/repo --number 42
+donmai github create-issue  --repo owner/repo --title "Bug: ..." [--body "..."] [--labels "bug,enhancement"] [--assignees "alice"]
+donmai github update-issue  --repo owner/repo --number 42 [--title "..."] [--state open|closed]
+donmai github list-issues   --repo owner/repo [--state open|closed|all] [--labels "..."] [--assignee "alice"] [--limit 50]
+donmai github list-comments --repo owner/repo --number 42
+donmai github create-comment --repo owner/repo --number 42 --body "..." [--body-file /path]
+donmai github add-labels    --repo owner/repo --number 42 --labels "bug,priority:high"
+donmai github set-assignees --repo owner/repo --number 42 --assignees "alice,bob"
+donmai github close-issue   --repo owner/repo --number 42 [--comment "Resolved in v2.0"]
+donmai github reopen-issue  --repo owner/repo --number 42 [--comment "Reopening for follow-up"]
+donmai github list-labels   --repo owner/repo
+donmai github get-repo      --repo owner/repo
 ```
 
 **Owner/repo shorthand**: `--repo owner/repo` sets both owner and repo.
@@ -353,31 +353,31 @@ token, or GitHub App installation token). When running under a platform login
 session, GitHub calls are proxied through the platform's connected GitHub App
 installation credential instead.
 
-### `af code`
+### `donmai code`
 
 Code intelligence commands (repo map, symbol search, BM25 + vector hybrid
 search).
 
 ```bash
-af code search <query>
-af code map [--depth <n>]
-af code symbols <file>
+donmai code search <query>
+donmai code map [--depth <n>]
+donmai code symbols <file>
 ```
 
-### `af arch`
+### `donmai arch`
 
 Architecture reference commands. Browse, show, and synthesize the
 `rensei-architecture` corpus.
 
 ```bash
-af arch list
-af arch show <doc-id>                    # e.g. af arch show 001
-af arch browse                           # interactive TUI browser
-af arch synthesize --topic <topic>
-af arch assess --topic <topic>           # gap/consistency assessment
+donmai arch list
+donmai arch show <doc-id>                    # e.g. donmai arch show 001
+donmai arch browse                           # interactive TUI browser
+donmai arch synthesize --topic <topic>
+donmai arch assess --topic <topic>           # gap/consistency assessment
 ```
 
-### `af admin`
+### `donmai admin`
 
 Operational admin commands for cleanup, queue inspection, and merge-queue
 management. All subcommands output JSON. Destructive operations require
@@ -387,13 +387,13 @@ interactive confirmation unless `--yes` is passed.
 
 ---
 
-#### `af admin cleanup`
+#### `donmai admin cleanup`
 
 Prune orphaned git worktrees and stale local branches. Mirrors the TypeScript
 `af-cleanup` + `af-cleanup-sub-issues` scripts.
 
 ```bash
-af admin cleanup [flags]
+donmai admin cleanup [flags]
 
 Flags:
   --dry-run          Show what would be cleaned without removing
@@ -425,15 +425,15 @@ Example output:
 
 ---
 
-#### `af admin queue`
+#### `donmai admin queue`
 
 Inspect and mutate the Redis work queue.
 
 ```bash
-af admin queue list
-af admin queue peek
-af admin queue requeue <session-id> [--yes]
-af admin queue drop <session-id> [--yes]
+donmai admin queue list
+donmai admin queue peek
+donmai admin queue requeue <session-id> [--yes]
+donmai admin queue drop <session-id> [--yes]
 ```
 
 - **list** — returns all work items, sessions, and registered workers as JSON
@@ -441,7 +441,7 @@ af admin queue drop <session-id> [--yes]
 - **requeue** — resets a session from `running`/`claimed` back to `pending` (destructive)
 - **drop** — permanently removes a session and its queue/claim entries (destructive)
 
-Example: `af admin queue list`:
+Example: `donmai admin queue list`:
 ```json
 {
   "items": [
@@ -460,14 +460,14 @@ Example: `af admin queue list`:
 
 ---
 
-#### `af admin merge-queue`
+#### `donmai admin merge-queue`
 
 Inspect and mutate the Redis merge queue.
 
 ```bash
-af admin merge-queue list [--repo <repoId>]
-af admin merge-queue dequeue <pr-number> [--repo <repoId>] [--yes]
-af admin merge-queue force-merge <pr-number> [--repo <repoId>] [--yes]
+donmai admin merge-queue list [--repo <repoId>]
+donmai admin merge-queue dequeue <pr-number> [--repo <repoId>] [--yes]
+donmai admin merge-queue force-merge <pr-number> [--repo <repoId>] [--yes]
 ```
 
 - **list** — returns all queued, failed, and blocked PRs for the repo
@@ -476,7 +476,7 @@ af admin merge-queue force-merge <pr-number> [--repo <repoId>] [--yes]
 
 The `--repo` flag defaults to `"default"`.
 
-Example: `af admin merge-queue list --repo my-org/my-repo`:
+Example: `donmai admin merge-queue list --repo my-org/my-repo`:
 ```json
 {
   "repoId": "my-org/my-repo",
@@ -514,7 +514,7 @@ If you are moving from the previous TypeScript-based `pnpm af-*` scripts, see
 ## Development
 
 ```bash
-make build      # Build af binary  →  bin/af
+make build      # Build donmai binary  →  bin/donmai
 make test       # go test -race ./...
 make lint       # golangci-lint run
 make fmt        # gofumpt -w .
