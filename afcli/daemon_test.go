@@ -314,9 +314,9 @@ func TestDaemonInstallWipesCachedJWT(t *testing.T) {
 	// Pre-seed a stale cache. Place it at the canonical location the
 	// runtime helper consults so the wipe logic finds it the same way
 	// production code will.
-	jwtPath := filepath.Join(tmp, ".rensei", "daemon.jwt")
+	jwtPath := filepath.Join(tmp, ".donmai", "daemon.jwt")
 	if err := os.MkdirAll(filepath.Dir(jwtPath), 0o750); err != nil {
-		t.Fatalf("mkdir .rensei: %v", err)
+		t.Fatalf("mkdir .donmai: %v", err)
 	}
 	if err := os.WriteFile(jwtPath, []byte(`{"workerId":"wkr_dead"}`), 0o600); err != nil {
 		t.Fatalf("seed stale JWT: %v", err)
@@ -352,9 +352,9 @@ func TestDaemonUninstallWipesCachedJWT(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 
-	jwtPath := filepath.Join(tmp, ".rensei", "daemon.jwt")
+	jwtPath := filepath.Join(tmp, ".donmai", "daemon.jwt")
 	if err := os.MkdirAll(filepath.Dir(jwtPath), 0o750); err != nil {
-		t.Fatalf("mkdir .rensei: %v", err)
+		t.Fatalf("mkdir .donmai: %v", err)
 	}
 	if err := os.WriteFile(jwtPath, []byte(`{"workerId":"wkr_dead"}`), 0o600); err != nil {
 		t.Fatalf("seed stale JWT: %v", err)
@@ -1064,7 +1064,7 @@ func TestExpandHomePath(t *testing.T) {
 		in      string
 		hasHome bool
 	}{
-		{"~/.rensei/daemon.log", true},
+		{"~/.donmai/daemon.log", true},
 		{"/absolute/path", false},
 		{"relative/path", false},
 	}
@@ -1359,7 +1359,7 @@ func TestDaemonSetCapacitySuccess(t *testing.T) {
 			Message: "updated",
 		},
 	}
-	// Use a temp config path to avoid touching real ~/.rensei/daemon.yaml.
+	// Use a temp config path to avoid touching real ~/.donmai/daemon.yaml.
 	tmpDir := t.TempDir()
 	buf, err := newTestDaemonCmd(mock, []string{
 		"set", "capacity.poolMaxDiskGb", "50",

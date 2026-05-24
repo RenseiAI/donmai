@@ -46,7 +46,7 @@ func defaultDaemonFactory(cfg afclient.DaemonConfig) daemonDoer {
 }
 
 // defaultDaemonLogFile is the default path for the daemon log file per 011.
-const defaultDaemonLogFile = "~/.rensei/daemon.log"
+const defaultDaemonLogFile = "~/.donmai/daemon.log"
 
 // expandHomePath replaces a leading ~ with the user's home directory.
 func expandHomePath(path string) string {
@@ -284,7 +284,7 @@ func newDaemonSetupCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.rensei/daemon.yaml)")
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
 	return cmd
 }
 
@@ -373,7 +373,7 @@ func newDaemonLogsCmd() *cobra.Command {
 		Use:   "logs",
 		Short: "Tail the daemon log file",
 		Long: "Stream the daemon log file. NDJSON lines are pretty-printed unless --raw is set.\n" +
-			"Uses the file at ~/.rensei/daemon.log by default (configurable with --file).\n" +
+			"Uses the file at ~/.donmai/daemon.log by default (configurable with --file).\n" +
 			"With --follow (-F) the output streams continuously like `tail -f`.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -428,7 +428,7 @@ func newDaemonLogsCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVarP(&logFile, "file", "f", "", "Log file path (default: ~/.rensei/daemon.log)")
+	cmd.Flags().StringVarP(&logFile, "file", "f", "", "Log file path (default: ~/.donmai/daemon.log)")
 	cmd.Flags().BoolVarP(&follow, "follow", "F", false, "Stream new log lines as they arrive")
 	cmd.Flags().IntVarP(&lines, "lines", "n", 50, "Number of lines to show (0 = all)")
 	cmd.Flags().BoolVar(&raw, "raw", false, "Print raw NDJSON without pretty-printing")
@@ -1033,7 +1033,7 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			"                                  for this local daemon (0 = accept none).\n" +
 			"  capacity.poolMaxDiskGb          Maximum total pool disk usage in GiB before\n" +
 			"                                  LRU eviction triggers (0 = no limit).\n\n" +
-			"The change is written atomically to ~/.rensei/daemon.yaml and the daemon\n" +
+			"The change is written atomically to ~/.donmai/daemon.yaml and the daemon\n" +
 			"reloads the affected subsystem without a restart.",
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
@@ -1108,7 +1108,7 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	cmd.Flags().IntVar(&port, "port", 0, "Daemon HTTP port (default from daemon.yaml: 7734)")
 	cmd.Flags().StringVar(&host, "host", "", "Daemon HTTP host (default: 127.0.0.1)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output raw JSON (indented)")
-	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to daemon.yaml (default: ~/.rensei/daemon.yaml)")
+	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
 
 	return cmd
 }

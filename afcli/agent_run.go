@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/prompt"
 	provideramp "github.com/RenseiAI/donmai/provider/amp"
 	providerclaude "github.com/RenseiAI/donmai/provider/claude"
@@ -100,7 +100,7 @@ func newAgentRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&opts.daemonURL, "daemon-url", "",
 		"Daemon control URL (default: $RENSEI_DAEMON_URL or http://127.0.0.1:7734)")
 	cmd.Flags().StringVar(&opts.worktree, "worktree-dir", "",
-		"Per-session worktree parent directory (default: ~/.rensei/worktrees)")
+		"Per-session worktree parent directory (default: ~/.donmai/worktrees)")
 	cmd.Flags().BoolVar(&opts.preserveWT, "preserve-worktree", true,
 		"Preserve the worktree on disk after the session ends (debugging)")
 	cmd.Flags().BoolVar(&opts.jsonOut, "json", true,
@@ -165,11 +165,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 	wtParent := opts.worktree
 	if wtParent == "" {
-		home, herr := os.UserHomeDir()
-		if herr != nil {
-			return preflightErr(fmt.Sprintf("resolve home dir for worktree parent: %v", herr))
-		}
-		wtParent = filepath.Join(home, ".rensei", "worktrees")
+		wtParent = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 	}
 	wm, err := worktree.NewManager(worktree.Options{ParentDir: wtParent, Logger: logger})
 	if err != nil {

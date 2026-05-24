@@ -41,7 +41,7 @@ func defaultConfigRW() configReaderWriter {
 
 // newProjectCmd constructs the `project` parent command. It holds no logic of
 // its own; it dispatches to subcommands that manage the daemon's project
-// allowlist and per-project credentials in ~/.rensei/daemon.yaml.
+// allowlist and per-project credentials in ~/.donmai/daemon.yaml.
 func newProjectCmd() *cobra.Command {
 	return newProjectCmdWithRW(defaultConfigRW())
 }
@@ -55,7 +55,7 @@ func newProjectCmdWithRW(rw configReaderWriter) *cobra.Command {
 			"Projects must be explicitly allowed before the daemon will accept work\n" +
 			"for them. Credentials can be configured interactively or later via\n" +
 			"`donmai project credentials`.\n\n" +
-			"Config is written to ~/.rensei/daemon.yaml atomically.\n" +
+			"Config is written to ~/.donmai/daemon.yaml atomically.\n" +
 			"The daemon reloads on SIGHUP or restart.",
 		SilenceUsage: true,
 	}
@@ -80,7 +80,7 @@ func newProjectAllowCmd(rw configReaderWriter) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "allow <repo-url>",
 		Short: "Add a project to the daemon allowlist",
-		Long: "Add a project to the daemon's project allowlist in ~/.rensei/daemon.yaml.\n\n" +
+		Long: "Add a project to the daemon's project allowlist in ~/.donmai/daemon.yaml.\n\n" +
 			"By default, an interactive prompt selects the credential helper.\n" +
 			"Pass --no-credentials to skip credential configuration; the daemon will\n" +
 			"refuse work for this project until `donmai project credentials` is run.\n" +
@@ -239,7 +239,7 @@ func newProjectListCmd(rw configReaderWriter) *cobra.Command {
 		Use:   "list",
 		Short: "List all allowed projects",
 		Long: "List the projects in the daemon's allowlist with repo URL, clone strategy,\n" +
-			"and credential helper. Data is read from ~/.rensei/daemon.yaml.",
+			"and credential helper. Data is read from ~/.donmai/daemon.yaml.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := rw.ReadConfig()
@@ -313,7 +313,7 @@ func newProjectRemoveCmd(rw configReaderWriter) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "remove <repo-url>",
 		Short: "Remove a project from the daemon allowlist",
-		Long: "Remove a project from the daemon's project allowlist in ~/.rensei/daemon.yaml.\n\n" +
+		Long: "Remove a project from the daemon's project allowlist in ~/.donmai/daemon.yaml.\n\n" +
 			"By default, a confirmation prompt is shown. Pass --yes to skip the prompt.\n" +
 			"The daemon will refuse new work for this project after the next reload.",
 		Args:         cobra.ExactArgs(1),

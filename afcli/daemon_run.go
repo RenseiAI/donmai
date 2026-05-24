@@ -38,7 +38,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 		Long: "Start the long-running rensei daemon process.\n\n" +
 			"This is the service entry point registered by `daemon install` —\n" +
 			"the launchd plist (macOS) and systemd unit (Linux) call this\n" +
-			"subcommand. It loads ~/.rensei/daemon.yaml, registers with the\n" +
+			"subcommand. It loads ~/.donmai/daemon.yaml, registers with the\n" +
 			"orchestrator, starts the heartbeat loop, and serves the local\n" +
 			"control HTTP API on 127.0.0.1:7734.\n\n" +
 			"Run interactively for development with `--skip-wizard` to bypass\n" +
@@ -160,8 +160,8 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.rensei/daemon.yaml)")
-	cmd.Flags().StringVar(&jwtPath, "jwt-path", "", "Path to cached JWT (default: ~/.rensei/daemon.jwt)")
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
+	cmd.Flags().StringVar(&jwtPath, "jwt-path", "", "Path to cached JWT (default: ~/.donmai/daemon.jwt)")
 	cmd.Flags().StringVar(&host, "host", "", "HTTP bind host (default: 127.0.0.1)")
 	cmd.Flags().IntVar(&port, "port", 0, "HTTP bind port (default: 7734)")
 	cmd.Flags().BoolVar(&skipWizard, "skip-wizard", false, "Skip the first-run setup wizard")

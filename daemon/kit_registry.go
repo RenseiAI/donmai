@@ -42,6 +42,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/statepath"
 )
 
 // ErrKitInstallUnimplemented is returned by KitRegistry.Install for the
@@ -86,14 +87,11 @@ var ErrKitInstallSourceFetchFailed = errors.New("kit install: source fetch faile
 // HTTP 422.
 var ErrKitInstallManifestNotFound = errors.New("kit install: manifest not found in fetched source")
 
-// DefaultKitScanPath returns the canonical scan path for installed kits
-// (~/.rensei/kits). Used when daemon.yaml does not declare kit.scanPaths.
+// DefaultKitScanPath returns the path to the installed-kits directory,
+// resolving to ~/.donmai/kits for new installs with a one-release fallback
+// to ~/.rensei/kits when the legacy directory still exists.
 func DefaultKitScanPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "/tmp/.rensei/kits"
-	}
-	return filepath.Join(home, ".rensei", "kits")
+	return statepath.Resolve("kits", "/tmp/.donmai/kits")
 }
 
 // kitStatePath returns the path to the sidecar state file used to persist

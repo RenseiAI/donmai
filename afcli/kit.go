@@ -79,7 +79,7 @@ Kits are queried from the local af daemon at http://127.0.0.1:7734 by
 default. Set RENSEI_DAEMON_URL to override the daemon address.
 
 Federation order for registry sources (lowest priority number = consulted first):
-  1. local         — ~/.rensei/kits/*.kit.toml
+  1. local         — ~/.donmai/kits/*.kit.toml
   2. bundled       — shipped with the OSS execution layer
   3. rensei        — registry.rensei.dev
   4. tessl         — registry.tessl.io (Tessl tiles as kits)
@@ -240,7 +240,7 @@ func newKitInstallCmd(factory kitClientFactory) *cobra.Command {
 		Long: `Install a kit by id from one of the configured registry sources.
 
 Wave 9 caveat: only locally-installed kits are supported (.kit.toml under
-~/.rensei/kits). Remote-registry fetch is deferred and currently returns
+~/.donmai/kits). Remote-registry fetch is deferred and currently returns
 HTTP 501. The command surface is finalised so the call is stable as the
 backend lands.`,
 		Args:         cobra.ExactArgs(1),
