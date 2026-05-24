@@ -29,7 +29,7 @@ Optional env vars for enhanced search:
   COHERE_API_KEY      Enables cross-encoder reranking for more precise result ordering
 
 Binary resolution (in order):
-  1. AGENTFACTORY_CODE_BIN env var (explicit override)
+  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override
   2. af-code on PATH (npm install -g @renseiai/agentfactory-cli)
   3. pnpm af-code (monorepo dev)`,
 		SilenceUsage: true,

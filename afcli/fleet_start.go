@@ -73,7 +73,7 @@ func newFleetStartCmd() *cobra.Command {
 			args := buildWorkerChildArgs(flags)
 			f := worker.NewFleet(binaryPath, args)
 			// Children inherit the parent environment unchanged so that
-			// $AF_PROVISIONING_TOKEN / $AF_BASE_URL still work when the
+			// $DONMAI_PROVISIONING_TOKEN / $DONMAI_BASE_URL still work when the
 			// operator didn't pass --provisioning-token on the command line.
 			f.Env = os.Environ()
 
@@ -91,7 +91,7 @@ func newFleetStartCmd() *cobra.Command {
 	}
 
 	cmd.Flags().IntVar(&flags.count, "count", 0, "Number of worker processes to spawn (required, > 0)")
-	cmd.Flags().StringVar(&flags.provisioningToken, "provisioning-token", "", "Worker provisioning token (passed to each child; defaults to $AF_PROVISIONING_TOKEN in the child)")
+	cmd.Flags().StringVar(&flags.provisioningToken, "provisioning-token", "", "Worker provisioning token (passed to each child; defaults to $DONMAI_PROVISIONING_TOKEN in the child)")
 	cmd.Flags().StringVar(&flags.baseURL, "base-url", "", "Coordinator base URL (passed to each child)")
 	cmd.Flags().IntVar(&flags.maxAgents, "max-agents", 1, "Maximum concurrent agent sessions per worker")
 	cmd.Flags().DurationVar(&flags.pollInterval, "poll-interval", 5*time.Second, "Poll interval passed to each child")

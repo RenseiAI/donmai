@@ -511,8 +511,9 @@ func TestEnvToMap_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestBuildSessionEnv_PopulatesStandardKeys confirms LINEAR_* +
-// AGENTFACTORY_* keys land on the per-session env.
+// TestBuildSessionEnv_PopulatesStandardKeys confirms DONMAI_* + LINEAR_* +
+// legacy AGENTFACTORY_* keys all land on the per-session env during the
+// one-release backward-compat window.
 func TestBuildSessionEnv_PopulatesStandardKeys(t *testing.T) {
 	qw := QueuedWork{
 		QueuedWork:  queuedWorkBase("REN-ENV-1"),
@@ -522,6 +523,12 @@ func TestBuildSessionEnv_PopulatesStandardKeys(t *testing.T) {
 	}
 	envOut := buildSessionEnv(qw)
 	for _, key := range []string{
+		// New canonical names.
+		"DONMAI_SESSION_ID",
+		"DONMAI_PROJECT",
+		"DONMAI_ORG_ID",
+		"DONMAI_API_URL",
+		// Legacy aliases retained for one-release compat.
 		"AGENTFACTORY_SESSION_ID",
 		"LINEAR_SESSION_ID",
 		"LINEAR_ISSUE_ID",
