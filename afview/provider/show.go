@@ -5,7 +5,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // RenderShow writes the detail view for a single provider. Capability

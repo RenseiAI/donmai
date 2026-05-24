@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // ============================================================================

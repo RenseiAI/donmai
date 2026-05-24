@@ -12,9 +12,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	afcreds "github.com/RenseiAI/agentfactory-tui/afcli/credentials"
-	"github.com/RenseiAI/agentfactory-tui/daemon"
-	"github.com/RenseiAI/agentfactory-tui/runner"
+	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
+	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/runner"
 )
 
 // newDaemonRunCmd constructs the `daemon run` subcommand. This is the
@@ -38,7 +38,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 		Long: "Start the long-running rensei daemon process.\n\n" +
 			"This is the service entry point registered by `daemon install` —\n" +
 			"the launchd plist (macOS) and systemd unit (Linux) call this\n" +
-			"subcommand. It loads ~/.rensei/daemon.yaml, registers with the\n" +
+			"subcommand. It loads ~/.donmai/daemon.yaml, registers with the\n" +
 			"orchestrator, starts the heartbeat loop, and serves the local\n" +
 			"control HTTP API on 127.0.0.1:7734.\n\n" +
 			"Run interactively for development with `--skip-wizard` to bypass\n" +
@@ -48,7 +48,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// Build the in-process AgentRuntime registry once at daemon
 			// startup so the local /api/daemon/providers* HTTP surface
 			// can introspect it. The same registry shape is rebuilt
-			// per-session by `af agent run`; here we surface it for
+			// per-session by `donmai agent run`; here we surface it for
 			// operator queries. Probes that fail (e.g. ollama not
 			// running) emit WARN logs but do not block daemon start.
 			// Wave 9 / A1.
@@ -56,9 +56,9 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// Substitute the well-known DefaultHTTPPort here when the
 			// operator did not pass `--port`. Leaving zero through to
 			// daemon.New would bind an ephemeral port — correct for
-			// tests but wrong for the service-managed `af daemon run`
+			// tests but wrong for the service-managed `donmai daemon run`
 			// entry point operators reach via launchd / systemd, which
-			// must bind 7734 so the `af daemon …` CLI surface (and the
+			// must bind 7734 so the `donmai daemon …` CLI surface (and the
 			// installed plist health checks) can find the daemon.
 			// (Wave 12 / C3 — port-7734 default lives in the cobra
 			// layer, not the runtime.)
@@ -160,8 +160,8 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.rensei/daemon.yaml)")
-	cmd.Flags().StringVar(&jwtPath, "jwt-path", "", "Path to cached JWT (default: ~/.rensei/daemon.jwt)")
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
+	cmd.Flags().StringVar(&jwtPath, "jwt-path", "", "Path to cached JWT (default: ~/.donmai/daemon.jwt)")
 	cmd.Flags().StringVar(&host, "host", "", "HTTP bind host (default: 127.0.0.1)")
 	cmd.Flags().IntVar(&port, "port", 0, "HTTP bind port (default: 7734)")
 	cmd.Flags().BoolVar(&skipWizard, "skip-wizard", false, "Skip the first-run setup wizard")

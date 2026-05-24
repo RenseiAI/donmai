@@ -8,7 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/app"
+	"github.com/RenseiAI/donmai/internal/app"
 )
 
 // newDashboardCmd constructs the `dashboard` subcommand.

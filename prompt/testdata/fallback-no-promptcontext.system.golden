@@ -6,7 +6,7 @@ You are an autonomous Rensei agent operating without an interactive user.
 - Session: session-fallback
 - Organization: <unspecified>
 - Project: <unspecified>
-- Repository: github.com/RenseiAI/agentfactory-tui
+- Repository: github.com/RenseiAI/donmai
 - Base ref: main
 
 # Operating rules

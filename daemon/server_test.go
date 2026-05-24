@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 func mustStartDaemon(t *testing.T) (*Daemon, *Server, func()) {

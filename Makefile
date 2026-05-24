@@ -4,19 +4,19 @@ BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
 
 build:
-	go build $(LDFLAGS) -o $(BUILD_DIR)/af ./cmd/af
+	go build $(LDFLAGS) -o $(BUILD_DIR)/donmai ./cmd/donmai
 
 run: build
-	./$(BUILD_DIR)/af dashboard
+	./$(BUILD_DIR)/donmai dashboard
 
 run-mock: build
-	./$(BUILD_DIR)/af dashboard --mock
+	./$(BUILD_DIR)/donmai dashboard --mock
 
 run-status: build
-	./$(BUILD_DIR)/af status
+	./$(BUILD_DIR)/donmai status
 
 run-status-mock: build
-	./$(BUILD_DIR)/af status --mock
+	./$(BUILD_DIR)/donmai status --mock
 
 test:
 	go test -race ./...

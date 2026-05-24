@@ -52,7 +52,7 @@ type HeartbeatOptions struct {
 
 	// OnHostStatus is invoked when the platform's heartbeat response
 	// reports a non-ok hostStatus (e.g. pool_deleted). The daemon can
-	// use this to surface re-register guidance in `af daemon stats` or
+	// use this to surface re-register guidance in `donmai daemon stats` or
 	// to enter a non-claiming state. Called with the latest status on
 	// every beat that includes one, so callers can rely on it to clear
 	// (status='ok') as well.

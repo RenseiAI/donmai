@@ -12,12 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/internal/kit"
-	"github.com/RenseiAI/agentfactory-tui/runtime/activity"
-	"github.com/RenseiAI/agentfactory-tui/runtime/heartbeat"
-	"github.com/RenseiAI/agentfactory-tui/runtime/state"
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/runtime/activity"
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
+	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // kitLoadSkills is the seam used for Kit skill loading in the runner
@@ -709,11 +709,14 @@ func envToMap(in []string) map[string]string {
 }
 
 // buildSessionEnv collects the per-session env entries every agent
-// session needs. Mirrors the legacy TS LINEAR_* + AGENTFACTORY_*
-// keys. Operators add more via repository config.
+// session needs. Mirrors the legacy TS LINEAR_* + DONMAI_* keys.
+// During the one-release transition both DONMAI_* and legacy AGENTFACTORY_*
+// names are set so any agent still reading the old name continues to work.
+// The AGENTFACTORY_* aliases will be removed in the next release.
 func buildSessionEnv(qw QueuedWork) map[string]string {
 	envMap := map[string]string{
-		"AGENTFACTORY_SESSION_ID": qw.SessionID,
+		"DONMAI_SESSION_ID":       qw.SessionID,
+		"AGENTFACTORY_SESSION_ID": qw.SessionID, // deprecated: remove after v1 transition
 		"LINEAR_SESSION_ID":       qw.SessionID,
 	}
 	if qw.IssueID != "" {
@@ -726,13 +729,16 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 		envMap["LINEAR_WORK_TYPE"] = qw.WorkType
 	}
 	if qw.ProjectName != "" {
-		envMap["AGENTFACTORY_PROJECT"] = qw.ProjectName
+		envMap["DONMAI_PROJECT"] = qw.ProjectName
+		envMap["AGENTFACTORY_PROJECT"] = qw.ProjectName // deprecated: remove after v1 transition
 	}
 	if qw.OrganizationID != "" {
-		envMap["AGENTFACTORY_ORG_ID"] = qw.OrganizationID
+		envMap["DONMAI_ORG_ID"] = qw.OrganizationID
+		envMap["AGENTFACTORY_ORG_ID"] = qw.OrganizationID // deprecated: remove after v1 transition
 	}
 	if qw.PlatformURL != "" {
-		envMap["AGENTFACTORY_API_URL"] = qw.PlatformURL
+		envMap["DONMAI_API_URL"] = qw.PlatformURL
+		envMap["AGENTFACTORY_API_URL"] = qw.PlatformURL // deprecated: remove after v1 transition
 	}
 	if qw.AuthToken != "" {
 		envMap["WORKER_AUTH_TOKEN"] = qw.AuthToken
@@ -742,17 +748,24 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	// which stage instance they belong to without re-fetching the
 	// session detail.
 	if qw.StageID != "" {
-		envMap["AGENTFACTORY_STAGE_ID"] = qw.StageID
+		envMap["DONMAI_STAGE_ID"] = qw.StageID
+		envMap["AGENTFACTORY_STAGE_ID"] = qw.StageID // deprecated: remove after v1 transition
 	}
 	if b := qw.StageBudget; b != nil {
 		if b.MaxDurationSeconds > 0 {
-			envMap["AGENTFACTORY_STAGE_MAX_DURATION_SECONDS"] = fmt.Sprintf("%d", b.MaxDurationSeconds)
+			v := fmt.Sprintf("%d", b.MaxDurationSeconds)
+			envMap["DONMAI_STAGE_MAX_DURATION_SECONDS"] = v
+			envMap["AGENTFACTORY_STAGE_MAX_DURATION_SECONDS"] = v // deprecated
 		}
 		if b.MaxSubAgents > 0 {
-			envMap["AGENTFACTORY_STAGE_MAX_SUB_AGENTS"] = fmt.Sprintf("%d", b.MaxSubAgents)
+			v := fmt.Sprintf("%d", b.MaxSubAgents)
+			envMap["DONMAI_STAGE_MAX_SUB_AGENTS"] = v
+			envMap["AGENTFACTORY_STAGE_MAX_SUB_AGENTS"] = v // deprecated
 		}
 		if b.MaxTokens > 0 {
-			envMap["AGENTFACTORY_STAGE_MAX_TOKENS"] = fmt.Sprintf("%d", b.MaxTokens)
+			v := fmt.Sprintf("%d", b.MaxTokens)
+			envMap["DONMAI_STAGE_MAX_TOKENS"] = v
+			envMap["AGENTFACTORY_STAGE_MAX_TOKENS"] = v // deprecated
 		}
 	}
 	return envMap

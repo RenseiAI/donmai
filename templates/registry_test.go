@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/templates"
+	"github.com/RenseiAI/donmai/templates"
 )
 
 // TestNew_LoadsBuiltins verifies that New() successfully loads the embedded

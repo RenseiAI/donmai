@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/runtime/mcp"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/mcp"
 )
 
 func TestBuildEmptyReturnsEmptyPath(t *testing.T) {

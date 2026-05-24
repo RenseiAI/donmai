@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 func TestSpawner_AcceptWork_ProjectAllowlist(t *testing.T) {

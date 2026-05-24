@@ -28,7 +28,7 @@ import "time"
 // the registration payload.
 //
 // Now a `var` (was `const`) so the binary's main can override it via
-// `-ldflags "-X github.com/RenseiAI/agentfactory-tui/daemon.Version=$VERSION"`
+// `-ldflags "-X github.com/RenseiAI/donmai/daemon.Version=$VERSION"`
 // at build time, OR a downstream embedder (e.g. rensei-tui's daemon
 // run command) can pass its own version via `Options.Version` at
 // daemon construction. The const form pinned the value to whatever

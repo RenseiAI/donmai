@@ -14,12 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/runtime/env"
-	"github.com/RenseiAI/agentfactory-tui/runtime/heartbeat"
-	"github.com/RenseiAI/agentfactory-tui/runtime/mcp"
-	"github.com/RenseiAI/agentfactory-tui/runtime/state"
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
+	"github.com/RenseiAI/donmai/runtime/mcp"
+	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // TestEndToEndRuntimeFlow exercises Provision → Compose → Build →

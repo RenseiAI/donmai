@@ -1,7 +1,7 @@
 package afcli
 
 import (
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/spf13/cobra"
 )
 
@@ -14,7 +14,7 @@ func newWorkerCmd(_ func() afclient.DataSource) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "worker",
 		Short:        "Run an AgentFactory worker process",
-		Long:         "Register with the coordinator, poll for work, and heartbeat. Intended as a single foreground worker process; use `af fleet` for multi-process supervision.",
+		Long:         "Register with the coordinator, poll for work, and heartbeat. Intended as a single foreground worker process; use `donmai fleet` for multi-process supervision.",
 		SilenceUsage: true,
 	}
 

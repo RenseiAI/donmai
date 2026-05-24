@@ -5,7 +5,7 @@
 // what gets registered as the service entrypoint (locked REN-1406
 // decision — no separate rensei-daemon binary).
 //
-// This package is the single import surface for `af daemon install`,
+// This package is the single import surface for `donmai daemon install`,
 // `rensei daemon install`, etc. It is exported so downstream binaries
 // (rensei-tui, etc.) can drive the same in-process install flow without
 // reimplementing it.
@@ -15,8 +15,8 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/RenseiAI/agentfactory-tui/installer/launchd"
-	"github.com/RenseiAI/agentfactory-tui/installer/systemd"
+	"github.com/RenseiAI/donmai/installer/launchd"
+	"github.com/RenseiAI/donmai/installer/systemd"
 )
 
 // Scope mirrors systemd.Scope for callers that want to set the systemd

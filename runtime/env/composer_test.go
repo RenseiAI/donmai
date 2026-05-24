@@ -4,8 +4,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/runtime/env"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/env"
 )
 
 func TestComposeSpecOverridesBaseAndDeterministic(t *testing.T) {

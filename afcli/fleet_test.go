@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/worker"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/worker"
 )
 
 // TestFleetParentHelp verifies the fleet parent command exposes all four

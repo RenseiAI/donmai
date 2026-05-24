@@ -3,7 +3,7 @@ package governor
 import (
 	"fmt"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/linear"
+	"github.com/RenseiAI/donmai/internal/linear"
 )
 
 // DispatchDecision is the outcome of evaluating whether a Linear issue should

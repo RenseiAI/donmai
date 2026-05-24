@@ -357,7 +357,7 @@ type WorkareaPoolMember struct {
 }
 
 // WorkareaPoolStats is the aggregate view of the local workarea pool returned
-// by `af daemon stats --pool`. Matches the "WorkareaPoolPanel" TUI primitive in
+// by `donmai daemon stats --pool`. Matches the "WorkareaPoolPanel" TUI primitive in
 // 014-tui-operator-surfaces.md.
 type WorkareaPoolStats struct {
 	// Members is the full list of pool members across all (repo, toolchain) keys.

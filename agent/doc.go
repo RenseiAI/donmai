@@ -16,7 +16,7 @@
 //
 // This package is exported at the top level of the module:
 //
-//	github.com/RenseiAI/agentfactory-tui/agent
+//	github.com/RenseiAI/donmai/agent
 //
 // It is importable by downstream consumers including rensei-tui without
 // requiring an agentfactory-tui dependency cascade. F.1.1 §1 ratifies this

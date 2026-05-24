@@ -1,8 +1,8 @@
 package runner
 
 import (
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/prompt"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
 )
 
 // QueuedWork is the runner's input contract — the per-session payload

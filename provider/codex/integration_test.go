@@ -28,7 +28,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func TestIntegration_RealCodexAppServer_SmokeLifecycle(t *testing.T) {

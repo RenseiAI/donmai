@@ -3,7 +3,7 @@ package dashboard
 import (
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // TestFormatProviderDisplay tests the provider display formatter.

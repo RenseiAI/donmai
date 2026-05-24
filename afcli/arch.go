@@ -6,10 +6,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient/codeintel"
+	"github.com/RenseiAI/donmai/afclient/codeintel"
 )
 
-// newArchCmd constructs the `af arch` command tree.
+// newArchCmd constructs the `donmai arch` command tree.
 //
 // Architecture: shell-out bridge to `pnpm af-arch` (TS implementation).
 // See afclient/codeintel/runner.go for the full rationale.
@@ -33,7 +33,7 @@ Environment:
   RENSEI_ARCH_DB        SQLite DB path (default: .agentfactory/arch-intelligence/db.sqlite)
 
 Binary resolution (in order):
-  1. AGENTFACTORY_ARCH_BIN env var (explicit override)
+  1. DONMAI_ARCH_BIN env var (legacy: AGENTFACTORY_ARCH_BIN) — explicit override
   2. af-arch on PATH (npm install -g @renseiai/agentfactory-cli)
   3. pnpm af-arch (monorepo dev)`,
 		SilenceUsage: true,
@@ -44,7 +44,7 @@ Binary resolution (in order):
 	return cmd
 }
 
-// newArchAssessCmd constructs `af arch assess`.
+// newArchAssessCmd constructs `donmai arch assess`.
 func newArchAssessCmd() *cobra.Command {
 	var (
 		repository string

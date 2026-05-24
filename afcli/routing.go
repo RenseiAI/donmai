@@ -1,4 +1,4 @@
-// Package afcli routing.go — `af routing …` Cobra commands. The
+// Package afcli routing.go — `donmai routing …` Cobra commands. The
 // commands target the local daemon's HTTP control API at
 // /api/daemon/routing/* per
 // ADR-2026-05-07-daemon-http-control-api.md §D1; they NEVER hit the
@@ -15,8 +15,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/afview/routing"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/afview/routing"
 )
 
 // routingDaemonClient is the subset of *afclient.DaemonClient used by
@@ -38,7 +38,7 @@ func defaultRoutingClientFactory(cfg afclient.DaemonConfig) routingDaemonClient 
 	return afclient.NewDaemonClient(cfg)
 }
 
-// newRoutingCmd returns the `af routing` subcommand tree. The ds
+// newRoutingCmd returns the `donmai routing` subcommand tree. The ds
 // argument is accepted for signature consistency with the rest of
 // afcli's command factories but is not used — routing commands target
 // the local daemon, not the platform.
@@ -72,7 +72,7 @@ decisions have aged out return "not found".`,
 
 // ─── show ─────────────────────────────────────────────────────────────────────
 
-// newRoutingShowCmd builds the `af routing show` subcommand.
+// newRoutingShowCmd builds the `donmai routing show` subcommand.
 func newRoutingShowCmd(factory routingClientFactory) *cobra.Command {
 	var (
 		jsonOut  bool
@@ -122,7 +122,7 @@ func runRoutingShow(out io.Writer, client routingDaemonClient, jsonOut, plainOut
 
 // ─── explain ──────────────────────────────────────────────────────────────────
 
-// newRoutingExplainCmd builds the `af routing explain <session-id>`
+// newRoutingExplainCmd builds the `donmai routing explain <session-id>`
 // subcommand.
 func newRoutingExplainCmd(factory routingClientFactory) *cobra.Command {
 	var (

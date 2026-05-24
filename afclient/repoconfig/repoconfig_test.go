@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient/repoconfig"
+	"github.com/RenseiAI/donmai/afclient/repoconfig"
 )
 
 // writeConfig writes content to .agentfactory/config.yaml under dir.

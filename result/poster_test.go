@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/result"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/result"
 )
 
 // goodResult returns a populated agent.Result mirroring a typical

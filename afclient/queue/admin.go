@@ -503,6 +503,284 @@ func (c *AdminClient) DequeueEntry(ctx context.Context, repoID string, prNumber 
 	return nil
 }
 
+// ClearClaims deletes all work:claim:* keys from Redis.
+// Returns the number of claim keys deleted.
+func (c *AdminClient) ClearClaims(ctx context.Context) (int, error) {
+	keys, err := c.rdb.Keys(ctx, workClaimPrefix+"*").Result()
+	if err != nil {
+		return 0, fmt.Errorf("keys %s*: %w", workClaimPrefix, err)
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	n, err := c.rdb.Del(ctx, keys...).Result()
+	if err != nil {
+		return 0, fmt.Errorf("del claims: %w", err)
+	}
+	return int(n), nil
+}
+
+// ClearWorkQueue deletes the work queue sorted set and work items hash.
+// Returns the number of logical queue items cleared.
+func (c *AdminClient) ClearWorkQueue(ctx context.Context) (int, error) {
+	// Count items before deletion for reporting.
+	zCount, _ := c.rdb.ZCard(ctx, workQueueKey).Result()
+	hCount, _ := c.rdb.HLen(ctx, workItemsKey).Result()
+
+	if zCount > 0 {
+		if err := c.rdb.Del(ctx, workQueueKey).Err(); err != nil {
+			return 0, fmt.Errorf("del %s: %w", workQueueKey, err)
+		}
+	}
+	if hCount > 0 {
+		if err := c.rdb.Del(ctx, workItemsKey).Err(); err != nil {
+			return 0, fmt.Errorf("del %s: %w", workItemsKey, err)
+		}
+	}
+
+	count := int(zCount)
+	if int(hCount) > count {
+		count = int(hCount)
+	}
+	return count, nil
+}
+
+// BulkClearResult summarises the result of ClearAll or Reset.
+type BulkClearResult struct {
+	QueueItemsCleared int `json:"queueItemsCleared"`
+	SessionsCleared   int `json:"sessionsCleared"`
+	ClaimsCleared     int `json:"claimsCleared"`
+	WorkersCleared    int `json:"workersCleared"`
+	SessionsReset     int `json:"sessionsReset,omitempty"`
+}
+
+// ClearAll wipes queue, sessions, claims, and workers — the nuclear-reset option.
+func (c *AdminClient) ClearAll(ctx context.Context) (BulkClearResult, error) {
+	result := BulkClearResult{}
+
+	// Queue
+	n, err := c.ClearWorkQueue(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.QueueItemsCleared = n
+
+	// Sessions
+	sessionKeys, err := c.rdb.Keys(ctx, sessionKeyPrefix+"*").Result()
+	if err != nil {
+		return result, fmt.Errorf("keys %s*: %w", sessionKeyPrefix, err)
+	}
+	if len(sessionKeys) > 0 {
+		if _, err := c.rdb.Del(ctx, sessionKeys...).Result(); err != nil {
+			return result, fmt.Errorf("del sessions: %w", err)
+		}
+		result.SessionsCleared = len(sessionKeys)
+	}
+
+	// Claims
+	claimsN, err := c.ClearClaims(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.ClaimsCleared = claimsN
+
+	// Workers
+	workerKeys, err := c.rdb.Keys(ctx, workerPrefix+"*").Result()
+	if err != nil {
+		return result, fmt.Errorf("keys %s*: %w", workerPrefix, err)
+	}
+	if len(workerKeys) > 0 {
+		if _, err := c.rdb.Del(ctx, workerKeys...).Result(); err != nil {
+			return result, fmt.Errorf("del workers: %w", err)
+		}
+		result.WorkersCleared = len(workerKeys)
+	}
+
+	return result, nil
+}
+
+// ResetWorkState clears claims, clears the queue, and resets stuck
+// (running/claimed) sessions back to pending. Mirrors `af-queue-admin reset`.
+func (c *AdminClient) ResetWorkState(ctx context.Context) (BulkClearResult, error) {
+	result := BulkClearResult{}
+
+	// 1. Clear claims.
+	claimsN, err := c.ClearClaims(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.ClaimsCleared = claimsN
+
+	// 2. Clear queue.
+	queueN, err := c.ClearWorkQueue(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.QueueItemsCleared = queueN
+
+	// 3. Reset stuck sessions.
+	sessionKeys, err := c.rdb.Keys(ctx, sessionKeyPrefix+"*").Result()
+	if err != nil {
+		return result, fmt.Errorf("keys %s*: %w", sessionKeyPrefix, err)
+	}
+	for _, key := range sessionKeys {
+		jsonStr, err := c.rdb.Get(ctx, key).Result()
+		if errors.Is(err, redis.Nil) {
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(jsonStr), &entry); err != nil {
+			continue
+		}
+		status, _ := entry["status"].(string)
+		if status != "running" && status != "claimed" {
+			continue
+		}
+		entry["status"] = "pending"
+		delete(entry, "workerId")
+		delete(entry, "claimedAt")
+		delete(entry, "providerSessionId")
+		entry["updatedAt"] = time.Now().Unix()
+		updated, err := json.Marshal(entry)
+		if err != nil {
+			continue
+		}
+		if err := c.rdb.Set(ctx, key, updated, 24*time.Hour).Err(); err != nil {
+			continue
+		}
+		result.SessionsReset++
+	}
+
+	return result, nil
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Merge-queue status + pause/resume/priority ops
+// ──────────────────────────────────────────────────────────────────────────────
+
+const mergePausedPrefix = "merge:paused:" // mirrors TS: `merge:paused:${repoId}`
+
+// MergeQueueStatus is the shape returned by GetMergeQueueStatus.
+type MergeQueueStatus struct {
+	RepoID       string      `json:"repoId"`
+	Depth        int         `json:"depth"`
+	Processing   *MergeEntry `json:"processing"`
+	FailedCount  int         `json:"failedCount"`
+	BlockedCount int         `json:"blockedCount"`
+	Paused       bool        `json:"paused"`
+}
+
+// GetMergeQueueStatus returns a summary overview of the merge queue for repoID.
+func (c *AdminClient) GetMergeQueueStatus(ctx context.Context, repoID string) (MergeQueueStatus, error) {
+	status := MergeQueueStatus{RepoID: repoID}
+
+	// Queue depth (queued set only, not failed/blocked).
+	depth, err := c.rdb.ZCard(ctx, mergeQueuePrefix+repoID).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return status, fmt.Errorf("zcard %s: %w", mergeQueuePrefix+repoID, err)
+	}
+	status.Depth = int(depth)
+
+	// Currently processing: lowest-score entry in the queue set.
+	if depth > 0 {
+		members, err := c.rdb.ZRangeByScoreWithScores(ctx, mergeQueuePrefix+repoID, &redis.ZRangeBy{
+			Min: "-inf", Max: "+inf", Offset: 0, Count: 1,
+		}).Result()
+		if err == nil && len(members) > 0 {
+			prStr, _ := members[0].Member.(string)
+			raw, err := c.rdb.HGet(ctx, mergeEntryPrefix+repoID, prStr).Result()
+			if err == nil {
+				var entry MergeEntry
+				if json.Unmarshal([]byte(raw), &entry) == nil {
+					entry.Status = "processing"
+					status.Processing = &entry
+				}
+			}
+		}
+	}
+
+	// Failed count.
+	failedCount, err := c.rdb.ZCard(ctx, mergeFailedPrefix+repoID).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return status, fmt.Errorf("zcard %s: %w", mergeFailedPrefix+repoID, err)
+	}
+	status.FailedCount = int(failedCount)
+
+	// Blocked count.
+	blockedCount, err := c.rdb.ZCard(ctx, mergeBlockedPrefix+repoID).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return status, fmt.Errorf("zcard %s: %w", mergeBlockedPrefix+repoID, err)
+	}
+	status.BlockedCount = int(blockedCount)
+
+	// Paused flag.
+	val, err := c.rdb.Get(ctx, mergePausedPrefix+repoID).Result()
+	if err == nil {
+		status.Paused = val == "true" || val == "1"
+	}
+
+	return status, nil
+}
+
+// PauseMergeQueue sets the paused flag for repoID's merge queue.
+func (c *AdminClient) PauseMergeQueue(ctx context.Context, repoID string) error {
+	// No expiry — persists until explicitly resumed.
+	if err := c.rdb.Set(ctx, mergePausedPrefix+repoID, "true", 0).Err(); err != nil {
+		return fmt.Errorf("set paused flag: %w", err)
+	}
+	return nil
+}
+
+// ResumeMergeQueue removes the paused flag for repoID's merge queue.
+func (c *AdminClient) ResumeMergeQueue(ctx context.Context, repoID string) error {
+	if err := c.rdb.Del(ctx, mergePausedPrefix+repoID).Err(); err != nil {
+		return fmt.Errorf("del paused flag: %w", err)
+	}
+	return nil
+}
+
+// SetMergeQueuePriority updates the priority (ZSET score) for a PR.
+// Priority 1 = highest (processed first). Uses priority as the score so
+// lower priority values float to the top.
+func (c *AdminClient) SetMergeQueuePriority(ctx context.Context, repoID string, prNumber int, priority float64) error {
+	prStr := fmt.Sprintf("%d", prNumber)
+
+	// Verify the entry exists.
+	raw, err := c.rdb.HGet(ctx, mergeEntryPrefix+repoID, prStr).Result()
+	if errors.Is(err, redis.Nil) {
+		return fmt.Errorf("%w: PR #%d in repo %q", ErrMergeEntryNotFound, prNumber, repoID)
+	}
+	if err != nil {
+		return fmt.Errorf("hget merge entry: %w", err)
+	}
+
+	// Update priority in the hash entry.
+	var entry MergeEntry
+	if err := json.Unmarshal([]byte(raw), &entry); err != nil {
+		return fmt.Errorf("unmarshal merge entry: %w", err)
+	}
+	entry.Priority = priority
+	updated, _ := json.Marshal(entry)
+	_ = c.rdb.HSet(ctx, mergeEntryPrefix+repoID, prStr, updated)
+
+	// Update the sorted-set score. Try queued, failed, blocked sets.
+	for _, key := range []string{
+		mergeQueuePrefix + repoID,
+		mergeFailedPrefix + repoID,
+		mergeBlockedPrefix + repoID,
+	} {
+		// ZAddXX only updates if the member already exists (no INSERT).
+		_ = c.rdb.ZAddArgs(ctx, key, redis.ZAddArgs{
+			XX:      true,
+			Members: []redis.Z{{Score: priority, Member: prStr}},
+		})
+	}
+	return nil
+}
+
 // ForceRetry moves a failed/blocked PR back to the queued set.
 func (c *AdminClient) ForceRetry(ctx context.Context, repoID string, prNumber int) error {
 	prStr := fmt.Sprintf("%d", prNumber)

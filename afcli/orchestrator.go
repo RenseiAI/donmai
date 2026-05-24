@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient/orchestrator"
-	"github.com/RenseiAI/agentfactory-tui/afclient/repoconfig"
+	"github.com/RenseiAI/donmai/afclient/orchestrator"
+	"github.com/RenseiAI/donmai/afclient/repoconfig"
 )
 
 // orchestratorFlags holds the parsed flag values for `af orchestrator`.

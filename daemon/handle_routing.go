@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // handleGetRoutingConfig implements GET /api/daemon/routing/config. It

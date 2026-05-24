@@ -9,20 +9,22 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+
+	"github.com/RenseiAI/donmai/internal/envcompat"
 )
 
 // Daemonize re-execs the current process as a background daemon.
 //
-// If the environment variable AF_DAEMON=1 is set, Daemonize returns
-// (true, 0, nil) — the current process is already the daemon child and the
-// caller should continue its work.
+// If the environment variable DONMAI_DAEMON=1 (legacy: AF_DAEMON=1) is set,
+// Daemonize returns (true, 0, nil) — the current process is already the
+// daemon child and the caller should continue its work.
 //
 // Otherwise Daemonize re-execs os.Args[0] with os.Args[1:], appending
-// AF_DAEMON=1 to the environment, with Setsid set and stdin/stdout/stderr
+// DONMAI_DAEMON=1 to the environment, with Setsid set and stdin/stdout/stderr
 // redirected to /dev/null. It returns (false, childPID, nil) — the caller
 // should print a "started PID <childPID>" message and then call os.Exit(0).
 func Daemonize() (isChild bool, childPID int, err error) {
-	if os.Getenv("AF_DAEMON") == "1" {
+	if envcompat.GetDaemonSentinel() == "1" {
 		return true, 0, nil
 	}
 
@@ -33,7 +35,7 @@ func Daemonize() (isChild bool, childPID int, err error) {
 	defer func() { _ = devNull.Close() }()
 
 	attr := &os.ProcAttr{
-		Env:   append(os.Environ(), "AF_DAEMON=1"),
+		Env:   append(os.Environ(), "DONMAI_DAEMON=1"),
 		Files: []*os.File{devNull, devNull, devNull},
 		Sys: &syscall.SysProcAttr{
 			Setsid: true,

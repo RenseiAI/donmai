@@ -38,19 +38,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/statepath"
 )
 
-// defaultArchiveDir resolves the default archive root, ~/.rensei/workareas.
-// When the home dir lookup fails we fall through to /tmp so the daemon
-// boots in unusual environments rather than crashing on first archive
-// scan.
+// defaultArchiveDir resolves the default archive root, ~/.donmai/workareas
+// (with one-release fallback to ~/.rensei/workareas for existing installs).
 func defaultArchiveDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return "/tmp/.rensei/workareas"
-	}
-	return filepath.Join(home, ".rensei", "workareas")
+	return statepath.Resolve("workareas", "/tmp/.donmai/workareas")
 }
 
 // WorkareaArchiveErrCode is the sentinel set used by the registry for

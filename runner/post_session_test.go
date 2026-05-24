@@ -11,8 +11,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/result"
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // proxyCall captures a single POST to /api/issue-tracker-proxy so

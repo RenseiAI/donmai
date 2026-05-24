@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/prompt"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
 )
 
 // TestBudgetEnforcer_DisabledWhenBudgetNil asserts that a nil

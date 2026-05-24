@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // fakeMultiCLIResumeStderrFail builds a /bin/sh fake claude that:

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/linear"
+	"github.com/RenseiAI/donmai/internal/linear"
 )
 
 // ─── mock Linear ──────────────────────────────────────────────────────────────

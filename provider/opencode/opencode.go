@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // DefaultBinary is the executable name probed on $PATH at construction.

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/templates"
+	"github.com/RenseiAI/donmai/templates"
 )
 
 // testdata returns the absolute path to the testdata directory next to

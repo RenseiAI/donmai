@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/process"
+	"github.com/RenseiAI/donmai/internal/process"
 )
 
 func TestInstallSignalHandlers_CancelsOnSIGTERM(t *testing.T) {

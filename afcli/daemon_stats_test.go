@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // TestFormatWorkerStat covers REN-1446's worker-id row formatting.

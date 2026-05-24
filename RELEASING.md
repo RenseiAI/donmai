@@ -25,7 +25,7 @@ This document covers the full release process for the `af` binary: version bump,
 
 ## Overview
 
-`agentfactory-tui` ships a single binary, `af`, as an open-source release under `github.com/RenseiAI/agentfactory-tui`. Releases are fully automated via [goreleaser](https://goreleaser.com) triggered by a `v*` tag push. The goreleaser config is `.goreleaser.yaml` at the repo root.
+`agentfactory-tui` ships a single binary, `af`, as an open-source release under `github.com/RenseiAI/donmai`. Releases are fully automated via [goreleaser](https://goreleaser.com) triggered by a `v*` tag push. The goreleaser config is `.goreleaser.yaml` at the repo root.
 
 Consumers install via Homebrew:
 
@@ -33,7 +33,7 @@ Consumers install via Homebrew:
 brew install RenseiAI/tap/af
 ```
 
-Or by downloading a tarball directly from the [GitHub Releases page](https://github.com/RenseiAI/agentfactory-tui/releases).
+Or by downloading a tarball directly from the [GitHub Releases page](https://github.com/RenseiAI/donmai/releases).
 
 ---
 

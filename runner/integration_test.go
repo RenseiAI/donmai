@@ -15,12 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/prompt"
-	"github.com/RenseiAI/agentfactory-tui/provider/stub"
-	"github.com/RenseiAI/agentfactory-tui/result"
-	"github.com/RenseiAI/agentfactory-tui/runner"
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // TestIntegration_StubProvider_FullRun exercises a full Run() against

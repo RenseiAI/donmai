@@ -29,13 +29,13 @@ printf '{"command":"%s","argv":"%s","gated":false}' "$1" "$*"
 	return script
 }
 
-// execArchCmd builds a fresh `af arch <subArgs>` command tree with a fake
+// execArchCmd builds a fresh `donmai arch <subArgs>` command tree with a fake
 // binary and runs it, capturing stdout as a decoded JSON map.
 func execArchCmd(t *testing.T, subArgs ...string) (map[string]any, error) {
 	t.Helper()
 	fakeArchBin(t)
 
-	root := &cobra.Command{Use: "af", SilenceUsage: true, SilenceErrors: true}
+	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
 	root.AddCommand(newArchCmd())
 
 	oldOut := os.Stdout
@@ -180,7 +180,7 @@ func TestArchCmd_UnavailableBinary(t *testing.T) {
 		t.Skip("pnpm found in PATH; cannot test unavailable binary path")
 	}
 
-	root := &cobra.Command{Use: "af", SilenceUsage: true, SilenceErrors: true}
+	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
 	root.AddCommand(newArchCmd())
 	root.SetArgs([]string{"arch", "assess", "https://github.com/org/repo/pull/1"})
 	err := root.Execute()

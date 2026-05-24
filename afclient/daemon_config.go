@@ -56,7 +56,7 @@ const (
 //   - gh:          no extra fields needed; `gh auth` is invoked.
 //
 // When Kind is empty the helper is unconfigured; the daemon will refuse work
-// for this project until credentials are added via `af project credentials`.
+// for this project until credentials are added via `donmai project credentials`.
 type CredentialHelper struct {
 	Kind       CredentialHelperKind `yaml:"kind,omitempty"       json:"kind,omitempty"`
 	SSHKeyPath string               `yaml:"sshKeyPath,omitempty" json:"sshKeyPath,omitempty"`

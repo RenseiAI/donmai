@@ -24,7 +24,7 @@
 //	}
 //
 // Auth: Bearer runtime token (refreshed via [Config.CredentialProvider]
-// — same model as [github.com/RenseiAI/agentfactory-tui/runtime/heartbeat]).
+// — same model as [github.com/RenseiAI/donmai/runtime/heartbeat]).
 //
 // Side effect: on the first successful activity POST the poster also
 // fires a single best-effort POST /api/sessions/<id>/status with

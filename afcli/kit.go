@@ -1,4 +1,4 @@
-// Package afcli kit.go — `af kit …` Cobra commands. The commands target
+// Package afcli kit.go — `donmai kit …` Cobra commands. The commands target
 // the local daemon's HTTP control API at /api/daemon/kits* and
 // /api/daemon/kit-sources* per
 // ADR-2026-05-07-daemon-http-control-api.md § D1; they NEVER hit the
@@ -16,8 +16,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/afview/kit"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/afview/kit"
 )
 
 // kitDaemonClient is the subset of *afclient.DaemonClient used by the
@@ -59,7 +59,7 @@ func resolveKitDaemonConfig() afclient.DaemonConfig {
 	return cfg
 }
 
-// newKitCmd returns the `af kit` subcommand tree. The ds argument is
+// newKitCmd returns the `donmai kit` subcommand tree. The ds argument is
 // accepted for signature consistency with the rest of afcli's command
 // factories but is not used — kit commands target the local daemon, not
 // the platform.
@@ -79,7 +79,7 @@ Kits are queried from the local af daemon at http://127.0.0.1:7734 by
 default. Set RENSEI_DAEMON_URL to override the daemon address.
 
 Federation order for registry sources (lowest priority number = consulted first):
-  1. local         — ~/.rensei/kits/*.kit.toml
+  1. local         — ~/.donmai/kits/*.kit.toml
   2. bundled       — shipped with the OSS execution layer
   3. rensei        — registry.rensei.dev
   4. tessl         — registry.tessl.io (Tessl tiles as kits)
@@ -240,7 +240,7 @@ func newKitInstallCmd(factory kitClientFactory) *cobra.Command {
 		Long: `Install a kit by id from one of the configured registry sources.
 
 Wave 9 caveat: only locally-installed kits are supported (.kit.toml under
-~/.rensei/kits). Remote-registry fetch is deferred and currently returns
+~/.donmai/kits). Remote-registry fetch is deferred and currently returns
 HTTP 501. The command surface is finalised so the call is stable as the
 backend lands.`,
 		Args:         cobra.ExactArgs(1),

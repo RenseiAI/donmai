@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // fixtureArchive lays out a minimal archive directory under root/<id>/

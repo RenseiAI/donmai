@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/prompt"
+	"github.com/RenseiAI/donmai/prompt"
 )
 
 // TestBuilderBuild_StagePromptMode covers the REN-1485 / REN-1487

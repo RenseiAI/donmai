@@ -65,7 +65,7 @@ func setFleetPIDTempFile(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "fleet.pids")
-	t.Setenv(fleetPIDEnv, path)
+	t.Setenv(fleetPIDEnvNew, path)
 	return path
 }
 
@@ -388,14 +388,15 @@ func TestFleet_PIDHelpers_Errors(t *testing.T) {
 }
 
 func TestFleet_PIDPathDefault(t *testing.T) {
-	// With the override unset, FleetPIDPath should derive from the
-	// user config dir and end with agentfactory/fleet.pids.
-	t.Setenv(fleetPIDEnv, "")
+	// With both overrides unset, FleetPIDPath should derive from the
+	// user config dir and end with donmai/fleet.pids.
+	t.Setenv(fleetPIDEnvNew, "")
+	t.Setenv(fleetPIDEnvLegacy, "")
 	got, err := FleetPIDPath()
 	if err != nil {
 		t.Fatalf("FleetPIDPath: %v", err)
 	}
-	want := filepath.Join("agentfactory", "fleet.pids")
+	want := filepath.Join("donmai", "fleet.pids")
 	if len(got) < len(want) || got[len(got)-len(want):] != want {
 		t.Errorf("FleetPIDPath = %q, want suffix %q", got, want)
 	}
@@ -432,7 +433,7 @@ func TestFleet_WritePIDs_MkdirFailure(t *testing.T) {
 	if err := os.WriteFile(blockerFile, []byte("x"), 0o600); err != nil {
 		t.Fatalf("seed blocker: %v", err)
 	}
-	t.Setenv(fleetPIDEnv, filepath.Join(blockerFile, "child", "fleet.pids"))
+	t.Setenv(fleetPIDEnvNew, filepath.Join(blockerFile, "child", "fleet.pids"))
 
 	if err := WriteFleetPIDs([]int{1, 2}); err == nil {
 		t.Error("WriteFleetPIDs returned nil, want mkdir error")
@@ -451,7 +452,7 @@ func TestFleet_ReadPIDs_OpenError(t *testing.T) {
 	if err := os.Mkdir(pidPath, 0o750); err != nil {
 		t.Fatalf("mkdir pid dir: %v", err)
 	}
-	t.Setenv(fleetPIDEnv, pidPath)
+	t.Setenv(fleetPIDEnvNew, pidPath)
 
 	if _, err := ReadFleetPIDs(); err == nil {
 		t.Error("ReadFleetPIDs on directory path returned nil, want error")
@@ -467,7 +468,7 @@ func TestFleet_RemovePIDs_NonNotExistError(t *testing.T) {
 	if err := os.WriteFile(blockerFile, []byte("x"), 0o600); err != nil {
 		t.Fatalf("seed blocker: %v", err)
 	}
-	t.Setenv(fleetPIDEnv, filepath.Join(blockerFile, "child.pids"))
+	t.Setenv(fleetPIDEnvNew, filepath.Join(blockerFile, "child.pids"))
 
 	err := RemoveFleetPIDFile()
 	// Accept either outcome: some platforms map "parent is not dir"

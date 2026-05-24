@@ -3,7 +3,7 @@ package stub
 import (
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // Test_InterfaceCompliance is a compile-time assertion that the

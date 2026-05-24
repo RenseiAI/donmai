@@ -27,7 +27,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // ─── ANSI helpers ────────────────────────────────────────────────────────────
