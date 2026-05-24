@@ -91,6 +91,10 @@ func newAdminQueueCmd() *cobra.Command {
 	cmd.AddCommand(newAdminQueuePeekCmd())
 	cmd.AddCommand(newAdminQueueRequeueCmd())
 	cmd.AddCommand(newAdminQueueDropCmd())
+	cmd.AddCommand(newAdminQueueClearClaimsCmd())
+	cmd.AddCommand(newAdminQueueClearQueueCmd())
+	cmd.AddCommand(newAdminQueueClearAllCmd())
+	cmd.AddCommand(newAdminQueueResetCmd())
 	return cmd
 }
 
@@ -232,6 +236,162 @@ func newAdminQueueDropCmd() *cobra.Command {
 	return cmd
 }
 
+func newAdminQueueClearClaimsCmd() *cobra.Command {
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:   "clear-claims",
+		Short: "Clear all stale work claims (work:claim:* keys)",
+		Long: `Clear all stale work claims.
+
+Removes all work:claim:* keys from Redis. Use after a worker crash to
+unblock sessions that were claimed but never completed.`,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !confirm(cmd, "Delete all work claim keys?", yes) {
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "aborted")
+				return nil
+			}
+
+			client, err := redisAdminClient()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = client.Close() }()
+
+			n, err := client.ClearClaims(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("clear claims: %w", err)
+			}
+
+			return writeJSON(cmd.OutOrStdout(), map[string]any{
+				"cleared": n,
+				"type":    "claims",
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
+	return cmd
+}
+
+func newAdminQueueClearQueueCmd() *cobra.Command {
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:   "clear-queue",
+		Short: "Clear the work queue (sorted set + items hash)",
+		Long: `Clear the work queue.
+
+Removes the work:queue sorted set and the work:items hash from Redis.
+Sessions remain; only the pending work is removed.`,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !confirm(cmd, "Clear the entire work queue?", yes) {
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "aborted")
+				return nil
+			}
+
+			client, err := redisAdminClient()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = client.Close() }()
+
+			n, err := client.ClearWorkQueue(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("clear queue: %w", err)
+			}
+
+			return writeJSON(cmd.OutOrStdout(), map[string]any{
+				"cleared": n,
+				"type":    "queue",
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
+	return cmd
+}
+
+func newAdminQueueClearAllCmd() *cobra.Command {
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:   "clear-all",
+		Short: "Clear queue, sessions, claims, and workers (nuclear reset)",
+		Long: `Clear ALL Redis state for the work queue.
+
+Removes:
+  - work:queue (sorted set)
+  - work:items (hash)
+  - agent:session:* (all sessions)
+  - work:claim:* (all claims)
+  - work:worker:* (all worker registrations)
+
+This is a nuclear reset — use in dev/test environments only.`,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !confirm(cmd, "Clear ALL queue state (sessions, claims, workers, queue)?", yes) {
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "aborted")
+				return nil
+			}
+
+			client, err := redisAdminClient()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = client.Close() }()
+
+			result, err := client.ClearAll(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("clear all: %w", err)
+			}
+
+			return writeJSON(cmd.OutOrStdout(), result)
+		},
+	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
+	return cmd
+}
+
+func newAdminQueueResetCmd() *cobra.Command {
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:   "reset",
+		Short: "Full state reset: clear claims + queue + reset stuck sessions to pending",
+		Long: `Full work-state reset.
+
+1. Clears all work:claim:* keys.
+2. Clears the work queue (sorted set + items hash).
+3. Resets sessions with status 'running' or 'claimed' back to 'pending'.
+
+Less destructive than clear-all: sessions are preserved and can be
+re-processed once a worker picks them up again.`,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !confirm(cmd, "Reset work state (clear claims + queue + reset stuck sessions)?", yes) {
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "aborted")
+				return nil
+			}
+
+			client, err := redisAdminClient()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = client.Close() }()
+
+			result, err := client.ResetWorkState(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("reset work state: %w", err)
+			}
+
+			return writeJSON(cmd.OutOrStdout(), result)
+		},
+	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
+	return cmd
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // newAdminMergeQueueCmd — merge queue inspection + mutation
 // ──────────────────────────────────────────────────────────────────────────────
@@ -242,9 +402,13 @@ func newAdminMergeQueueCmd() *cobra.Command {
 		Short:        "Inspect and mutate the Redis merge queue",
 		SilenceUsage: true,
 	}
+	cmd.AddCommand(newAdminMergeQueueStatusCmd())
 	cmd.AddCommand(newAdminMergeQueueListCmd())
 	cmd.AddCommand(newAdminMergeQueueDequeueCmd())
 	cmd.AddCommand(newAdminMergeQueueForceMergeCmd())
+	cmd.AddCommand(newAdminMergeQueuePauseCmd())
+	cmd.AddCommand(newAdminMergeQueueResumeCmd())
+	cmd.AddCommand(newAdminMergeQueuePriorityCmd())
 	return cmd
 }
 
@@ -368,6 +532,158 @@ func newAdminMergeQueueForceMergeCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&repoID, "repo", "default", "Repository ID")
 	cmd.Flags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
+	return cmd
+}
+
+func newAdminMergeQueueStatusCmd() *cobra.Command {
+	var repoID string
+
+	cmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show merge queue overview (depth, processing PR, failed/blocked counts)",
+		Long: `Show merge queue status for a repository.
+
+Outputs a JSON summary with:
+  - depth        number of PRs waiting to merge
+  - processing   the PR currently at the head of the queue (if any)
+  - failedCount  number of failed entries
+  - blockedCount number of blocked entries
+  - paused       whether queue processing is paused`,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if repoID == "" {
+				repoID = "default"
+			}
+
+			client, err := redisAdminClient()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = client.Close() }()
+
+			status, err := client.GetMergeQueueStatus(cmd.Context(), repoID)
+			if err != nil {
+				return fmt.Errorf("merge-queue status: %w", err)
+			}
+			return writeJSON(cmd.OutOrStdout(), status)
+		},
+	}
+	cmd.Flags().StringVar(&repoID, "repo", "default", "Repository ID (e.g. my-org/my-repo)")
+	return cmd
+}
+
+func newAdminMergeQueuePauseCmd() *cobra.Command {
+	var repoID string
+
+	cmd := &cobra.Command{
+		Use:   "pause",
+		Short: "Pause merge queue processing for a repository",
+		Long: `Pause the merge queue for a repository.
+
+Sets the merge:paused:<repoId> Redis key which signals the merge worker
+to stop processing new PRs. Existing in-flight work continues.`,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if repoID == "" {
+				repoID = "default"
+			}
+
+			client, err := redisAdminClient()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = client.Close() }()
+
+			if err := client.PauseMergeQueue(cmd.Context(), repoID); err != nil {
+				return fmt.Errorf("pause merge queue: %w", err)
+			}
+			return writeJSON(cmd.OutOrStdout(), map[string]any{
+				"paused": true,
+				"repoId": repoID,
+			})
+		},
+	}
+	cmd.Flags().StringVar(&repoID, "repo", "default", "Repository ID")
+	return cmd
+}
+
+func newAdminMergeQueueResumeCmd() *cobra.Command {
+	var repoID string
+
+	cmd := &cobra.Command{
+		Use:   "resume",
+		Short: "Resume merge queue processing for a repository",
+		Long: `Resume the merge queue for a repository.
+
+Removes the merge:paused:<repoId> Redis key, allowing the merge worker
+to resume processing PRs.`,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if repoID == "" {
+				repoID = "default"
+			}
+
+			client, err := redisAdminClient()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = client.Close() }()
+
+			if err := client.ResumeMergeQueue(cmd.Context(), repoID); err != nil {
+				return fmt.Errorf("resume merge queue: %w", err)
+			}
+			return writeJSON(cmd.OutOrStdout(), map[string]any{
+				"paused": false,
+				"repoId": repoID,
+			})
+		},
+	}
+	cmd.Flags().StringVar(&repoID, "repo", "default", "Repository ID")
+	return cmd
+}
+
+func newAdminMergeQueuePriorityCmd() *cobra.Command {
+	var repoID string
+
+	cmd := &cobra.Command{
+		Use:   "priority <pr-number> <priority>",
+		Short: "Change the priority of a PR in the merge queue",
+		Args:  cobra.ExactArgs(2),
+		Long: `Change the priority of a queued PR.
+
+Lower priority values are processed first (priority 1 = highest).
+Updates both the sorted-set score and the stored entry.`,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			prNum, err := parsePRNumber(args[0])
+			if err != nil {
+				return err
+			}
+			var priority float64
+			if _, err := fmt.Sscanf(args[1], "%f", &priority); err != nil || priority <= 0 {
+				return fmt.Errorf("invalid priority %q: must be a positive number", args[1])
+			}
+			if repoID == "" {
+				repoID = "default"
+			}
+
+			client, err := redisAdminClient()
+			if err != nil {
+				return err
+			}
+			defer func() { _ = client.Close() }()
+
+			if err := client.SetMergeQueuePriority(cmd.Context(), repoID, prNum, priority); err != nil {
+				return fmt.Errorf("set priority: %w", err)
+			}
+			return writeJSON(cmd.OutOrStdout(), map[string]any{
+				"prNumber": prNum,
+				"priority": priority,
+				"repoId":   repoID,
+			})
+		},
+	}
+	cmd.Flags().StringVar(&repoID, "repo", "default", "Repository ID")
 	return cmd
 }
 
