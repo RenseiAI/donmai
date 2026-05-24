@@ -13,7 +13,7 @@
 //
 //	rensei-architecture/011-local-daemon-fleet.md §macOS (launchd)
 //
-// Plist path:    ~/Library/LaunchAgents/dev.rensei.daemon.plist
+// Plist path:    ~/Library/LaunchAgents/dev.donmai.daemon.plist
 // Log path:      ~/Library/Logs/rensei/daemon.log
 // Error log:     ~/Library/Logs/rensei/daemon-error.log
 //
@@ -38,8 +38,19 @@ import (
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-// LaunchdLabel is the label used in the plist and as the launchctl service ID.
-const LaunchdLabel = "dev.rensei.daemon"
+// LaunchdLabel is the OSS daemon's launchd label — used in the plist and as
+// the launchctl service ID for the `donmai` binary.
+//
+// Closed-source rensei-tui keeps its own label (dev.rensei.daemon) so that
+// `donmai daemon install` and `rensei daemon install` never clobber each
+// other's service registrations.
+const LaunchdLabel = "dev.donmai.daemon"
+
+// RenseiDaemonLabel is the launchd label used by the closed-source `rensei`
+// binary (rensei-tui). Exported so rensei-tui can reference the canonical
+// value without duplicating the string literal. Must never be used by the
+// OSS donmai installer — keep the two registrations disjoint.
+const RenseiDaemonLabel = "dev.rensei.daemon"
 
 // DaemonSubcommand is the subcommand the host binary registers for the
 // LaunchAgent entrypoint. The locked decision (REN-1406) is to register
@@ -47,7 +58,7 @@ const LaunchdLabel = "dev.rensei.daemon"
 const DaemonSubcommand = "daemon run"
 
 // PlistPath returns the absolute path to the LaunchAgent plist:
-// ~/Library/LaunchAgents/dev.rensei.daemon.plist.
+// ~/Library/LaunchAgents/dev.donmai.daemon.plist.
 func PlistPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -507,7 +518,7 @@ func Doctor(opts DoctorOptions) (DoctorResult, error) {
 			if plistExists {
 				return "Found at " + plistPath
 			}
-			return "Not found at " + plistPath + " — run 'rensei daemon install'"
+			return "Not found at " + plistPath + " — run 'donmai daemon install'"
 		}(),
 	})
 

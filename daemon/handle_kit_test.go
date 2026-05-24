@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // fakeKitRegistry is a programmable kitRegistryDoer used by handler tests.

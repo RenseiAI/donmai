@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient/logsignatures"
+	"github.com/RenseiAI/donmai/afclient/logsignatures"
 )
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

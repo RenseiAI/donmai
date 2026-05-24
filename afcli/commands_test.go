@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // subcommandNames returns the Use names of root's immediate children,
@@ -81,7 +81,7 @@ func TestRegisterCommandsWiring(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			root := &cobra.Command{Use: "af"}
+			root := &cobra.Command{Use: "donmai"}
 			RegisterCommands(root, tc.cfg)
 
 			for _, want := range tc.wantPresent {
@@ -114,7 +114,7 @@ func TestRegisterCommandsClientFactoryLazy(t *testing.T) {
 		return afclient.NewMockClient()
 	}
 
-	root := &cobra.Command{Use: "af"}
+	root := &cobra.Command{Use: "donmai"}
 	RegisterCommands(root, Config{
 		ClientFactory:   factory,
 		EnableDashboard: true,

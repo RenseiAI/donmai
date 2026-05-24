@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // ErrInjectInFlight is returned by Handle.Inject when a previous Inject

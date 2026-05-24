@@ -24,7 +24,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // defaultDiffStreamingThreshold is the cutoff used when no daemon.yaml

@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // readFixture loads a JSONL fixture from testdata/. The trailing

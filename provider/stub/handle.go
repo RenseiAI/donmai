@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // stubPullRequestURL is the synthetic PR URL the canonical

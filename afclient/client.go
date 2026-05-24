@@ -43,7 +43,7 @@ type DataSource interface {
 
 	// GetWorkareaPoolStats fetches the local workarea pool snapshot for a given
 	// machine. An empty machineID returns the aggregate across all machines.
-	// Corresponds to `af daemon stats --pool` (011-local-daemon-fleet §Observability).
+	// Corresponds to `donmai daemon stats --pool` (011-local-daemon-fleet §Observability).
 	GetWorkareaPoolStats(machineID MachineID) (*WorkareaPoolStats, error)
 
 	// GetSandboxProviderStats fetches the runtime snapshot for all registered

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // captureStdout swaps os.Stdout with a pipe, returning the reader and a

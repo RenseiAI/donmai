@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // TestWorkerParentHelp verifies the worker parent command exposes the

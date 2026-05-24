@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/afview/workarea"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/afview/workarea"
 )
 
 var (

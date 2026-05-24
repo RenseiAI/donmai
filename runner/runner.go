@@ -9,21 +9,21 @@ import (
 	"os"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/internal/kit"
-	"github.com/RenseiAI/agentfactory-tui/prompt"
-	"github.com/RenseiAI/agentfactory-tui/result"
-	"github.com/RenseiAI/agentfactory-tui/runtime/env"
-	"github.com/RenseiAI/agentfactory-tui/runtime/mcp"
-	"github.com/RenseiAI/agentfactory-tui/runtime/state"
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/mcp"
+	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // activitySink is the per-session seam that pushes runner-observed
 // events to the platform's /api/sessions/<id>/activity buffer. The
 // runner builds one [activitySink] per [Runner.Run] (today via
 // [activitySinkFromConfig], which constructs a
-// [github.com/RenseiAI/agentfactory-tui/runtime/activity.Poster]).
+// [github.com/RenseiAI/donmai/runtime/activity.Poster]).
 //
 // Defined as an interface so the runner test suite can substitute a
 // recording fake without spinning up an HTTP server. Send is

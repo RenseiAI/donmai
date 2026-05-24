@@ -11,22 +11,28 @@ import (
 	"strings"
 )
 
-// fleetPIDEnv overrides the fleet PID file location. Primarily used in
-// tests so they do not touch the user's real config directory.
-const fleetPIDEnv = "AGENTFACTORY_FLEET_PID_FILE"
+// fleetPIDEnvNew is the canonical env var override (Donmai era).
+const fleetPIDEnvNew = "DONMAI_FLEET_PID_FILE"
+
+// fleetPIDEnvLegacy is the legacy override retained for one-release compat.
+const fleetPIDEnvLegacy = "AGENTFACTORY_FLEET_PID_FILE"
 
 // FleetPIDPath returns the path to the fleet PID file. It honors
-// $AGENTFACTORY_FLEET_PID_FILE when set; otherwise it derives the path
-// from os.UserConfigDir as <config>/agentfactory/fleet.pids.
+// $DONMAI_FLEET_PID_FILE (legacy: $AGENTFACTORY_FLEET_PID_FILE) when set;
+// otherwise it derives the path from os.UserConfigDir as
+// <config>/donmai/fleet.pids.
 func FleetPIDPath() (string, error) {
-	if override := strings.TrimSpace(os.Getenv(fleetPIDEnv)); override != "" {
+	if override := strings.TrimSpace(os.Getenv(fleetPIDEnvNew)); override != "" {
+		return override, nil
+	}
+	if override := strings.TrimSpace(os.Getenv(fleetPIDEnvLegacy)); override != "" {
 		return override, nil
 	}
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("fleet: resolve user config dir: %w", err)
 	}
-	return filepath.Join(dir, "agentfactory", "fleet.pids"), nil
+	return filepath.Join(dir, "donmai", "fleet.pids"), nil
 }
 
 // WriteFleetPIDs writes the given PIDs, one per line, to the fleet PID

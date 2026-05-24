@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/worker"
+	"github.com/RenseiAI/donmai/worker"
 )
 
 // newFleetStopCmd constructs the `fleet stop` subcommand. It reads the

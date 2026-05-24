@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // fakeServer is a goroutine-driven fake codex app-server that runs

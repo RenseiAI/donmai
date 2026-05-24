@@ -9,7 +9,7 @@ import (
 	"sync"
 	"text/template"
 
-	"github.com/RenseiAI/agentfactory-tui/templates"
+	"github.com/RenseiAI/donmai/templates"
 )
 
 // Embedded default templates baked into the binary at build time. The

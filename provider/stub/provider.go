@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // defaultCapabilities is the all-on capability matrix the stub

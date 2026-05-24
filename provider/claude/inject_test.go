@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // fakeMultiCLI returns a /bin/sh script that emits one body for the

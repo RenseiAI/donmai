@@ -49,7 +49,7 @@ type PollWorkItem struct {
 	ProjectScope string            `json:"projectScope,omitempty"`
 
 	// REN-1461 / F.2.8 — enriched fields the platform may send so the
-	// `af agent run` worker has the runner context it needs without
+	// `donmai agent run` worker has the runner context it needs without
 	// requiring a separate platform fetch. Optional during the rollout
 	// window; absent fields fall through to the default render path.
 	IssueID           string                  `json:"issueId,omitempty"`
@@ -509,7 +509,7 @@ func resolveAllowlistedRepo(item PollWorkItem, projects []ProjectConfig) (repo s
 	return repo, nil
 }
 
-// pollItemToSessionDetail constructs the SessionDetail payload `af agent
+// pollItemToSessionDetail constructs the SessionDetail payload `donmai agent
 // run` will fetch from the daemon's HTTP API for the given poll item.
 // platformURL + authToken + workerID come from the daemon's
 // registration state; the issue-context fields come from the platform-

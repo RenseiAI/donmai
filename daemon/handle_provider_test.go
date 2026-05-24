@@ -8,7 +8,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // stubProviderRegistry is a minimal in-memory ProviderRegistry for handler

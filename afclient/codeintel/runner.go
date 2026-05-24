@@ -12,7 +12,7 @@
 //  3. Phase D goal is parity, not re-implementation.
 //
 // This package shells out to `pnpm af-code` (resolving via PATH or
-// AGENTFACTORY_CODE_BIN env var) and returns the parsed JSON output.
+// DONMAI_CODE_BIN env var) and returns the parsed JSON output.
 //
 // A future issue (post-Wave 4) can replace the shell-out with native Go
 // tree-sitter after parity is verified end-to-end.
@@ -20,7 +20,7 @@
 // # Binary resolution (PATH portability)
 //
 // The binary is resolved in this order:
-//  1. AGENTFACTORY_CODE_BIN env var (explicit override for non-monorepo users)
+//  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override for non-monorepo users
 //  2. `af-code` on PATH (installed via `npm install -g @renseiai/agentfactory-cli`)
 //  3. `pnpm af-code` via pnpm run in the current working directory (monorepo dev)
 //
@@ -34,9 +34,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/RenseiAI/donmai/internal/envcompat"
 )
 
 // ErrNotAvailable is returned when the af-code binary cannot be found.
@@ -44,13 +45,13 @@ import (
 // fatal error.
 var ErrNotAvailable = errors.New(
 	"af-code binary not found — install @renseiai/agentfactory-cli globally " +
-		"(`npm install -g @renseiai/agentfactory-cli`) or set AGENTFACTORY_CODE_BIN",
+		"(`npm install -g @renseiai/agentfactory-cli`) or set DONMAI_CODE_BIN",
 )
 
 // ErrArchNotAvailable is returned when the af-arch binary cannot be found.
 var ErrArchNotAvailable = errors.New(
 	"af-arch binary not found — install @renseiai/agentfactory-cli globally " +
-		"(`npm install -g @renseiai/agentfactory-cli`) or set AGENTFACTORY_ARCH_BIN",
+		"(`npm install -g @renseiai/agentfactory-cli`) or set DONMAI_ARCH_BIN",
 )
 
 // Runner wraps the af-code / af-arch CLI binaries and exposes each command as
@@ -76,8 +77,8 @@ func (r *Runner) resolveCodeBin() ([]string, error) {
 		return strings.Fields(r.codeBinCache), nil
 	}
 
-	// 1. Explicit env override.
-	if v := os.Getenv("AGENTFACTORY_CODE_BIN"); v != "" {
+	// 1. Explicit env override (DONMAI_CODE_BIN; legacy AGENTFACTORY_CODE_BIN via shim).
+	if v := envcompat.GetCodeBin(); v != "" {
 		r.codeBinCache = v
 		return strings.Fields(v), nil
 	}
@@ -103,8 +104,8 @@ func (r *Runner) resolveArchBin() ([]string, error) {
 		return strings.Fields(r.archBinCache), nil
 	}
 
-	// 1. Explicit env override.
-	if v := os.Getenv("AGENTFACTORY_ARCH_BIN"); v != "" {
+	// 1. Explicit env override (DONMAI_ARCH_BIN; legacy AGENTFACTORY_ARCH_BIN via shim).
+	if v := envcompat.GetArchBin(); v != "" {
 		r.archBinCache = v
 		return strings.Fields(v), nil
 	}

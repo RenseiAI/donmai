@@ -30,7 +30,7 @@ import (
 // capturing stdout.
 func runAdminCmd(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	root := &cobra.Command{Use: "af"}
+	root := &cobra.Command{Use: "donmai"}
 	root.AddCommand(newAdminCmd())
 
 	buf := &bytes.Buffer{}

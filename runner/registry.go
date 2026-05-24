@@ -7,7 +7,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // Registry resolves [agent.ProviderName] values to their corresponding
@@ -66,7 +66,7 @@ func (r *Registry) Resolve(name agent.ProviderName) (agent.Provider, error) {
 }
 
 // Names returns the sorted list of registered provider names. Useful
-// for daemon-startup logging and the `af agent providers` admin
+// for daemon-startup logging and the `donmai agent providers` admin
 // command.
 func (r *Registry) Names() []agent.ProviderName {
 	r.mu.RLock()

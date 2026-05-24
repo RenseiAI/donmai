@@ -23,7 +23,7 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // RenderList writes a human-readable table of providers grouped by

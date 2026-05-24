@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/worker"
+	"github.com/RenseiAI/donmai/worker"
 )
 
 // newFleetStatusCmd constructs the `fleet status` subcommand. It reads

@@ -14,14 +14,15 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/worker"
+	"github.com/RenseiAI/donmai/internal/envcompat"
+	"github.com/RenseiAI/donmai/worker"
 )
 
-// defaultWorkerBaseURL is used when neither --base-url nor $AF_BASE_URL is
-// set. Mirrors the fallback used by cmd/af/main.go.
+// defaultWorkerBaseURL is used when neither --base-url nor $DONMAI_BASE_URL
+// (legacy: $AF_BASE_URL) is set.
 const defaultWorkerBaseURL = "http://localhost:3000"
 
-// workerStartFlags holds the parsed flag values for `af worker start`.
+// workerStartFlags holds the parsed flag values for `donmai worker start`.
 // Factored out so tests can inspect defaults without executing RunE.
 type workerStartFlags struct {
 	provisioningToken string
@@ -35,25 +36,25 @@ type workerStartFlags struct {
 }
 
 // resolveWorkerToken picks the provisioning token from the --provisioning-token
-// flag with a fallback to $AF_PROVISIONING_TOKEN. Returns an error when both
-// are empty so the caller can surface a clear message.
+// flag with a fallback to $DONMAI_PROVISIONING_TOKEN (legacy: $AF_PROVISIONING_TOKEN).
+// Returns an error when both are empty so the caller can surface a clear message.
 func resolveWorkerToken(flagVal string) (string, error) {
 	if flagVal != "" {
 		return flagVal, nil
 	}
-	if env := os.Getenv("AF_PROVISIONING_TOKEN"); env != "" {
+	if env := envcompat.GetProvisioningToken(); env != "" {
 		return env, nil
 	}
-	return "", fmt.Errorf("worker start: provisioning token required (--provisioning-token or $AF_PROVISIONING_TOKEN)")
+	return "", fmt.Errorf("worker start: provisioning token required (--provisioning-token or $DONMAI_PROVISIONING_TOKEN)")
 }
 
 // resolveWorkerBaseURL picks the base URL from the --base-url flag with
-// fallback to $AF_BASE_URL and finally to defaultWorkerBaseURL.
+// fallback to $DONMAI_BASE_URL (legacy: $AF_BASE_URL) and finally to defaultWorkerBaseURL.
 func resolveWorkerBaseURL(flagVal string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	if env := os.Getenv("AF_BASE_URL"); env != "" {
+	if env := envcompat.GetBaseURL(); env != "" {
 		return env
 	}
 	return defaultWorkerBaseURL
@@ -61,7 +62,7 @@ func resolveWorkerBaseURL(flagVal string) string {
 
 // configureWorkerLogging sets the default slog logger based on the local
 // --debug/--quiet flags. The root command also has persistent --debug/--quiet
-// flags that pre-configure slog; this helper lets `af worker start` stand
+// flags that pre-configure slog; this helper lets `donmai worker start` stand
 // alone when invoked directly (e.g. by a fleet-spawned child).
 func configureWorkerLogging(debug, quiet bool) {
 	var level slog.Level
@@ -94,8 +95,8 @@ func newWorkerStartCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&flags.provisioningToken, "provisioning-token", "", "Worker provisioning token (default: $AF_PROVISIONING_TOKEN)")
-	cmd.Flags().StringVar(&flags.baseURL, "base-url", "", "Coordinator base URL (default: $AF_BASE_URL or http://localhost:3000)")
+	cmd.Flags().StringVar(&flags.provisioningToken, "provisioning-token", "", "Worker provisioning token (default: $DONMAI_PROVISIONING_TOKEN)")
+	cmd.Flags().StringVar(&flags.baseURL, "base-url", "", "Coordinator base URL (default: $DONMAI_BASE_URL or http://localhost:3000)")
 	cmd.Flags().IntVar(&flags.maxAgents, "max-agents", 1, "Maximum concurrent agent sessions this worker will run")
 	cmd.Flags().DurationVar(&flags.pollInterval, "poll-interval", 5*time.Second, "Interval between poll requests")
 	cmd.Flags().DurationVar(&flags.heartbeatInterval, "heartbeat-interval", 30*time.Second, "Interval between heartbeats (overridden by server if register response carries a non-zero cadence)")

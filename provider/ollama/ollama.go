@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // DefaultEndpoint is the address Ollama binds to by default when an

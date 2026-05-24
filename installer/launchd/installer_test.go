@@ -213,7 +213,7 @@ func TestInstall_AlreadyLoadedNotError(t *testing.T) {
 	fr := newFakeRunner()
 	// Simulate launchctl returning "already loaded".
 	fr.set("launchctl bootstrap gui/"+itoa(os.Getuid())+" "+plistPath,
-		"service already bootstrapped: dev.rensei.daemon",
+		"service already bootstrapped: dev.donmai.daemon",
 		errors.New("exit status 17"))
 
 	res, err := Install(InstallOptions{

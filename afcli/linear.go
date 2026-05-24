@@ -9,7 +9,7 @@ package afcli
 // Auth strategy (per ADR-2026-05-12-cli-linear-proxy):
 //   1. LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) env var → direct GraphQL calls
 //      to api.linear.app. Preserves the standalone `af` path AND the
-//      worker-fleet path where `af agent run` injects the env var into the
+//      worker-fleet path where `donmai agent run` injects the env var into the
 //      in-session shell.
 //   2. No env key + ds() returns an authenticated *afclient.Client (rsk_ token
 //      + base URL) → platform proxy mode via `linear.NewProxiedClient`. The
@@ -22,23 +22,26 @@ package afcli
 // without conditional logic and matches the explicit-env-overrides-default
 // posture every other afcli command uses.
 //
-// check-deployment is NOT ported here: it depends on Vercel/GitHub APIs and
-// lives conceptually outside the Linear package. Callers needing it should
-// continue using `pnpm af-linear check-deployment`.
+// check-deployment is implemented as an exec-shim for v1.0.0: the Go command
+// delegates to the `af-linear` JS binary on PATH when available. A full Go
+// port (requiring Vercel + GitHub API clients) is deferred to v1.0.x. The
+// shim is explicitly marked deprecated in its help text.
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/internal/linear"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/linear"
 )
 
 // ─── top-level command factory ────────────────────────────────────────────────
@@ -85,6 +88,7 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 	cmd.AddCommand(newLinearListBacklogIssuesCmd(ds))
 	cmd.AddCommand(newLinearListUnblockedBacklogCmd(ds))
 	cmd.AddCommand(newLinearCreateBlockerCmd(ds))
+	cmd.AddCommand(newLinearCheckDeploymentCmd())
 
 	return cmd
 }
@@ -1440,5 +1444,74 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource) *cobra.Command {
 	cmd.Flags().StringVar(&project, "project", "", "Project name (defaults to source issue's project)")
 	cmd.Flags().StringVar(&assignee, "assignee", "", "Assignee name or email")
 
+	return cmd
+}
+
+// ─── check-deployment (exec-shim) ────────────────────────────────────────────
+
+// newLinearCheckDeploymentCmd returns a check-deployment subcommand that
+// delegates to the `af-linear` JS binary via exec.Command.
+//
+// Rationale for exec-shim: check-deployment requires Vercel + GitHub API
+// clients not yet ported to Go. The shim preserves full feature parity for
+// v1.0.0 without coupling this binary to those HTTP surfaces. A proper Go port
+// is tracked for v1.0.x.
+//
+// Deprecated: this shim will be replaced by a native Go implementation in a
+// future release.
+func newLinearCheckDeploymentCmd() *cobra.Command {
+	var format string
+
+	cmd := &cobra.Command{
+		Use:   "check-deployment <pr-number>",
+		Short: "Check Vercel deployment status for a PR (exec-shim: delegates to af-linear)",
+		Long: `Check Vercel deployment status for a pull request.
+
+DEPRECATED SHIM: This command delegates to the 'af-linear' JS binary found
+on PATH. A native Go implementation will replace it in a future release.
+
+To use this command, ensure af-linear is available:
+  npm install -g @renseiai/agentfactory-cli
+  # or: pnpm install (in an agentfactory project)
+
+The shim passes all arguments and flags through to af-linear unchanged and
+exits with the same exit code.`,
+		SilenceUsage:          true,
+		DisableFlagParsing:    false,
+		Args:                  cobra.MinimumNArgs(1),
+		DisableFlagsInUseLine: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Locate af-linear on PATH.
+			afLinear, err := exec.LookPath("af-linear")
+			if err != nil {
+				return fmt.Errorf("af-linear binary not found on PATH (install with: npm install -g @renseiai/agentfactory-cli; a native Go implementation is planned for v1.0.x): %w", err)
+			}
+
+			// Build argv: af-linear check-deployment <pr-number> [--format <fmt>] [extra args...]
+			argv := []string{"check-deployment"}
+			argv = append(argv, args...)
+			if cmd.Flags().Changed("format") {
+				argv = append(argv, "--format", format)
+			}
+
+			c := exec.CommandContext(cmd.Context(), afLinear, argv...) //nolint:gosec // G204: afLinear is from exec.LookPath; args are user-supplied CLI flags
+			c.Stdout = cmd.OutOrStdout()
+			c.Stderr = cmd.ErrOrStderr()
+			c.Env = os.Environ()
+
+			if err := c.Run(); err != nil {
+				// Propagate non-zero exit codes (e.g. anyFailed=true) transparently.
+				// The subprocess already wrote its output, so exit directly.
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
+					os.Exit(exitErr.ExitCode())
+				}
+				return fmt.Errorf("af-linear check-deployment: %w", err)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&format, "format", "json", "Output format: json or markdown")
 	return cmd
 }

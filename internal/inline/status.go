@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // ANSI codes for chrome styling

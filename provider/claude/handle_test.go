@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // fakeCLI returns a path to a /bin/sh script that simulates the

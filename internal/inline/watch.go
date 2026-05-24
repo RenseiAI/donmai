@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // WatchConfig holds configuration for the watch loop.

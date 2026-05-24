@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/governor"
-	"github.com/RenseiAI/agentfactory-tui/internal/linear"
-	"github.com/RenseiAI/agentfactory-tui/internal/process"
-	"github.com/RenseiAI/agentfactory-tui/internal/queue"
+	"github.com/RenseiAI/donmai/internal/governor"
+	"github.com/RenseiAI/donmai/internal/linear"
+	"github.com/RenseiAI/donmai/internal/process"
+	"github.com/RenseiAI/donmai/internal/queue"
 	"github.com/spf13/cobra"
 )
 

@@ -7,10 +7,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/RenseiAI/donmai/internal/statepath"
 )
 
 // WizardOptions configure the interactive setup wizard.
@@ -181,8 +182,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 			return nil, err
 		}
 	case 3:
-		home, _ := os.UserHomeDir()
-		queue := filepath.Join(home, ".rensei", "queue")
+		queue := statepath.Resolve("queue", "/tmp/.donmai/queue")
 		orchestratorURL = "file://" + queue
 		wf("  Using local file queue at %s\n", queue)
 	default:

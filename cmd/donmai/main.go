@@ -1,6 +1,6 @@
-// Package main is the unified AgentFactory CLI/TUI entry point.
+// Package main is the unified Donmai CLI/TUI entry point.
 //
-// The bare `af` command launches the Bubble Tea dashboard when stdin is
+// The bare `donmai` command launches the Bubble Tea dashboard when stdin is
 // a TTY, or prints help otherwise. Subcommands (dashboard, status, ...)
 // are attached via Cobra.
 package main
@@ -14,8 +14,8 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afcli"
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afcli"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 const defaultBaseURL = "http://localhost:3000"
@@ -108,19 +108,19 @@ func configureLogging(flags *rootFlags) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})))
 }
 
-// newRootCmd constructs the root `af` Cobra command with persistent
+// newRootCmd constructs the root `donmai` Cobra command with persistent
 // flags and dotenv-loading PersistentPreRunE. It is a factory so tests
 // can build fresh commands without global state.
 func newRootCmd() (*cobra.Command, *rootFlags) {
 	flags := &rootFlags{}
 
 	cmd := &cobra.Command{
-		Use:   "af",
-		Short: "AgentFactory terminal dashboard and CLI",
-		Long: "af is the unified entry point for the AgentFactory TUI and CLI.\n\n" +
-			"Running `af` with no subcommand launches the Bubble Tea dashboard.",
+		Use:   "donmai",
+		Short: "Donmai terminal dashboard and CLI",
+		Long: "donmai is the unified entry point for the Donmai TUI and CLI.\n\n" +
+			"Running `donmai` with no subcommand launches the Bubble Tea dashboard.",
 		// Setting Version makes cobra auto-wire `--version` and `-v` so
-		// `af --version` works without us writing a separate command.
+		// `donmai --version` works without us writing a separate command.
 		Version:      version,
 		SilenceUsage: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
@@ -148,12 +148,12 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Bare `af` in a TTY launches the dashboard; non-TTY shows help.
+			// Bare `donmai` in a TTY launches the dashboard; non-TTY shows help.
 			if !stdinIsTerminal() {
 				return cmd.Help()
 			}
 			// Delegate to the registered dashboard subcommand so the bare
-			// `af` path and `af dashboard` share identical wiring. The
+			// `donmai` path and `donmai dashboard` share identical wiring. The
 			// dashboard subcommand is registered below via
 			// afcli.RegisterCommands with EnableDashboard: true.
 			for _, sub := range cmd.Commands() {

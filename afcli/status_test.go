@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/internal/inline"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/inline"
 )
 
 // captureOSStdout swaps os.Stdout (and inline.DataWriter, which is

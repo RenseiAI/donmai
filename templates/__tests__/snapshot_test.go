@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/prompt"
-	"github.com/RenseiAI/agentfactory-tui/templates"
+	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/templates"
 )
 
 // fixtureWork mirrors the canonical session fixture used in prompt/builder_test.go

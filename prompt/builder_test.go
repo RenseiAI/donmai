@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/prompt"
-	"github.com/RenseiAI/agentfactory-tui/templates"
+	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/templates"
 )
 
 // updateGolden controls whether table tests rewrite their golden
@@ -87,7 +87,7 @@ func TestBuilderBuild_GoldenSnapshots(t *testing.T) {
 				Title:           "Fallback path",
 				Body:            "No prompt context, just a body.",
 				WorkType:        string(prompt.WorkTypeDevelopment),
-				Repository:      "github.com/RenseiAI/agentfactory-tui",
+				Repository:      "github.com/RenseiAI/donmai",
 				Ref:             "main",
 			},
 		},

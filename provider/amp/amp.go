@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os/exec"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/provider/claude"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/claude"
 )
 
 // DefaultBinary is the executable name probed on $PATH at construction.

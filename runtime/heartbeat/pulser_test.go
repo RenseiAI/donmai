@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/runtime/heartbeat"
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
 )
 
 // newServer returns an httptest.Server whose handler is provided by

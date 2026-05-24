@@ -4,14 +4,14 @@ import (
 	"sync"
 )
 
-// SessionDetail is the per-session payload `af agent run` reads from
+// SessionDetail is the per-session payload `donmai agent run` reads from
 // the daemon's local control HTTP API on spawn. It carries the full
 // runner-side QueuedWork shape (issue context, resolved profile,
 // branch) plus the platform-side credentials the runner needs to talk
 // back (auth token, platform URL, worker id, lock id).
 //
 // The daemon stores one SessionDetail per accepted session in an
-// in-memory map. A spawned `af agent run` process fetches its detail
+// in-memory map. A spawned `donmai agent run` process fetches its detail
 // via GET /api/daemon/sessions/<id> at start-up.
 //
 // Wire shape: JSON, camelCase tags. Forward-compat — new fields can be
@@ -123,7 +123,7 @@ type SessionDetail struct {
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in
 // the daemon package to avoid an import cycle (the daemon package must
-// stay independent of the runner package — `af agent run` constructs
+// stay independent of the runner package — `donmai agent run` constructs
 // its own runner from this opaque payload).
 type SessionResolvedProfile struct {
 	Provider       string         `json:"provider,omitempty"`
@@ -139,7 +139,7 @@ type SessionResolvedProfile struct {
 // fully-rendered model-profile the platform resolves via the three-axis
 // workType + model-profile routing algorithm
 // (ADR-2026-05-12-worktype-and-model-profile-routing). The daemon
-// forwards it opaquely; `af agent run` bridges it into
+// forwards it opaquely; `donmai agent run` bridges it into
 // runner.ResolvedModelProfile via detailToQueuedWork.
 type SessionModelProfile struct {
 	// ID is the model_profile row UUID (e.g. "mp_01jt5...").
@@ -165,7 +165,7 @@ type SessionModelProfile struct {
 }
 
 // sessionDetailStore holds the per-session payloads the daemon hands
-// to spawned `af agent run` processes. Concurrent-safe; the spawner
+// to spawned `donmai agent run` processes. Concurrent-safe; the spawner
 // writes on AcceptWork and the HTTP server reads on
 // /api/daemon/sessions/<id>.
 type sessionDetailStore struct {

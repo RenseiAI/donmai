@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // Test_Stop_EmitsStoppedResultAndClosesChannel verifies that Stop on

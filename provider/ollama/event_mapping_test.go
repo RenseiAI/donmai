@@ -3,7 +3,7 @@ package ollama
 import (
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func TestMapLine_incrementalContent(t *testing.T) {

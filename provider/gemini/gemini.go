@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // DefaultEndpoint is the public Gemini API base URL. Override via
@@ -78,7 +78,7 @@ type Provider struct {
 // New constructs a Provider after probing for an API key.
 //
 // Returns an error wrapping agent.ErrProviderUnavailable when no key
-// is set. The daemon `af agent run` registry build logs WARN and skips
+// is set. The daemon `donmai agent run` registry build logs WARN and skips
 // registration in that case, identical to claude / codex.
 func New(opts Options) (*Provider, error) {
 	getenv := opts.Getenv

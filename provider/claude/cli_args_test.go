@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func TestBuildArgs_RequiredFlags(t *testing.T) {

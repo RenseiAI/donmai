@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // fakeOllama is a lightweight httptest server that mimics the subset

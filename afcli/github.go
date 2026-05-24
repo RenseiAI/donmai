@@ -37,8 +37,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	gh "github.com/RenseiAI/agentfactory-tui/internal/github"
+	"github.com/RenseiAI/donmai/afclient"
+	gh "github.com/RenseiAI/donmai/internal/github"
 )
 
 // ─── top-level command factory ────────────────────────────────────────────────

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // stubRunner returns a CommandRunner that records invocations and

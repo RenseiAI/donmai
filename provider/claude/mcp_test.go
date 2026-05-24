@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func TestWriteMCPConfig_NoServers(t *testing.T) {

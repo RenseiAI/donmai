@@ -22,7 +22,7 @@
 package afcli
 
 import (
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/spf13/cobra"
 )
 

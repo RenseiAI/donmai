@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/internal/kit"
-	"github.com/RenseiAI/agentfactory-tui/prompt"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/prompt"
 )
 
 // writeSkillMD writes a SKILL.md at dir/<relPath> for the test.

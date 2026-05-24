@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // AgentEnvBlocklist is the set of environment variable names that must

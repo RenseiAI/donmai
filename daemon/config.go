@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/RenseiAI/donmai/internal/statepath"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -159,22 +161,18 @@ type KitConfig struct {
 	ScanPaths []string `yaml:"scanPaths,omitempty" json:"scanPaths,omitempty"`
 }
 
-// DefaultConfigPath returns the canonical path to ~/.rensei/daemon.yaml.
+// DefaultConfigPath returns the path to daemon.yaml, resolving to
+// ~/.donmai/daemon.yaml for new installs with a one-release fallback to
+// ~/.rensei/daemon.yaml when the legacy directory still exists.
 func DefaultConfigPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "/tmp/.rensei/daemon.yaml"
-	}
-	return filepath.Join(home, ".rensei", "daemon.yaml")
+	return statepath.Resolve("daemon.yaml", "/tmp/.donmai/daemon.yaml")
 }
 
-// DefaultJWTPath returns the canonical path to the cached JWT.
+// DefaultJWTPath returns the path to the cached JWT, resolving to
+// ~/.donmai/daemon.jwt for new installs with a one-release fallback to
+// ~/.rensei/daemon.jwt when the legacy directory still exists.
 func DefaultJWTPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "/tmp/.rensei/daemon.jwt"
-	}
-	return filepath.Join(home, ".rensei", "daemon.jwt")
+	return statepath.Resolve("daemon.jwt", "/tmp/.donmai/daemon.jwt")
 }
 
 // LoadConfig reads daemon.yaml from path. Returns (nil, nil) when the file

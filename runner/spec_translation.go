@@ -3,8 +3,8 @@ package runner
 import (
 	"strings"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/runtime/mcp"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/mcp"
 )
 
 // SpecInputs are the per-session inputs the [translateSpec] helper

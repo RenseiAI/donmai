@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient/orchestrator"
-	"github.com/RenseiAI/agentfactory-tui/internal/linear"
+	"github.com/RenseiAI/donmai/afclient/orchestrator"
+	"github.com/RenseiAI/donmai/internal/linear"
 )
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────

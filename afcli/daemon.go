@@ -16,9 +16,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	daemonRuntime "github.com/RenseiAI/agentfactory-tui/daemon"
-	"github.com/RenseiAI/agentfactory-tui/installer"
+	"github.com/RenseiAI/donmai/afclient"
+	daemonRuntime "github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/installer"
 )
 
 // daemonDoer is the interface used by daemon subcommands. It is satisfied by
@@ -46,7 +46,7 @@ func defaultDaemonFactory(cfg afclient.DaemonConfig) daemonDoer {
 }
 
 // defaultDaemonLogFile is the default path for the daemon log file per 011.
-const defaultDaemonLogFile = "~/.rensei/daemon.log"
+const defaultDaemonLogFile = "~/.donmai/daemon.log"
 
 // expandHomePath replaces a leading ~ with the user's home directory.
 func expandHomePath(path string) string {
@@ -79,7 +79,7 @@ func newDaemonCmdWithFactory(factory daemonClientFactory, hostVersion string) *c
 		Use:   "daemon",
 		Short: "Manage the local rensei-daemon",
 		Long: "Manage the local rensei-daemon process that supervises agent session pools.\n\n" +
-			"The daemon replaces the per-workspace `af worker` / `af fleet` approach.\n" +
+			"The daemon replaces the per-workspace `donmai worker` / `donmai fleet` approach.\n" +
 			"Install once, configure once, and sessions run automatically for allowed projects.",
 		SilenceUsage: true,
 	}
@@ -284,7 +284,7 @@ func newDaemonSetupCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.rensei/daemon.yaml)")
+	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
 	return cmd
 }
 
@@ -334,7 +334,7 @@ func newDaemonStatusCmd(factory daemonClientFactory) *cobra.Command {
 	return cmd
 }
 
-// writeDaemonStatusTable renders a simple ANSI status block for `af daemon status`.
+// writeDaemonStatusTable renders a simple ANSI status block for `donmai daemon status`.
 // Uses plain ANSI (not tui-components primitives per issue note — those are REN-1331).
 func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error {
 	statusColor := ansiColor(r.Status)
@@ -373,7 +373,7 @@ func newDaemonLogsCmd() *cobra.Command {
 		Use:   "logs",
 		Short: "Tail the daemon log file",
 		Long: "Stream the daemon log file. NDJSON lines are pretty-printed unless --raw is set.\n" +
-			"Uses the file at ~/.rensei/daemon.log by default (configurable with --file).\n" +
+			"Uses the file at ~/.donmai/daemon.log by default (configurable with --file).\n" +
 			"With --follow (-F) the output streams continuously like `tail -f`.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -428,7 +428,7 @@ func newDaemonLogsCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVarP(&logFile, "file", "f", "", "Log file path (default: ~/.rensei/daemon.log)")
+	cmd.Flags().StringVarP(&logFile, "file", "f", "", "Log file path (default: ~/.donmai/daemon.log)")
 	cmd.Flags().BoolVarP(&follow, "follow", "F", false, "Stream new log lines as they arrive")
 	cmd.Flags().IntVarP(&lines, "lines", "n", 50, "Number of lines to show (0 = all)")
 	cmd.Flags().BoolVar(&raw, "raw", false, "Print raw NDJSON without pretty-printing")
@@ -581,7 +581,7 @@ func newDaemonPauseCmd(factory daemonClientFactory) *cobra.Command {
 		Use:   "pause",
 		Short: "Pause the daemon (stop accepting new sessions)",
 		Long: "Signal the daemon to stop accepting new session assignments while keeping\n" +
-			"currently running sessions alive. Use `af daemon resume` to re-enable.",
+			"currently running sessions alive. Use `donmai daemon resume` to re-enable.",
 		SilenceUsage: true,
 		RunE: daemonActionRunE("pause", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
 			return c.Pause()
@@ -695,7 +695,7 @@ func newDaemonStopCmd(factory daemonClientFactory) *cobra.Command {
 		Use:   "stop",
 		Short: "Stop the daemon process",
 		Long: "Signal the daemon to stop immediately. In-flight sessions are interrupted.\n" +
-			"Use `af daemon drain` first for a graceful shutdown.",
+			"Use `donmai daemon drain` first for a graceful shutdown.",
 		SilenceUsage: true,
 		RunE: daemonActionRunE("stop", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
 			return c.Stop()
@@ -929,7 +929,7 @@ func writePoolStatsSection(w io.Writer, p *afclient.WorkareaPoolStats) error {
 
 // ── evict ─────────────────────────────────────────────────────────────────────
 
-// newDaemonEvictCmd returns the `af daemon evict` command.
+// newDaemonEvictCmd returns the `donmai daemon evict` command.
 // Usage: af daemon evict --repo <url> --older-than <duration>
 func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 	var (
@@ -1008,13 +1008,13 @@ func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 
 // ── set ───────────────────────────────────────────────────────────────────────
 
-// allowedCapacityKeys is the set of dotted config keys accepted by `af daemon set`.
+// allowedCapacityKeys is the set of dotted config keys accepted by `donmai daemon set`.
 var allowedCapacityKeys = map[string]struct{}{
 	"capacity.maxConcurrentSessions": {},
 	"capacity.poolMaxDiskGb":         {},
 }
 
-// newDaemonSetCmd returns the `af daemon set` command.
+// newDaemonSetCmd returns the `donmai daemon set` command.
 // Usage: af daemon set <capacity key> <N>
 func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	var (
@@ -1033,7 +1033,7 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			"                                  for this local daemon (0 = accept none).\n" +
 			"  capacity.poolMaxDiskGb          Maximum total pool disk usage in GiB before\n" +
 			"                                  LRU eviction triggers (0 = no limit).\n\n" +
-			"The change is written atomically to ~/.rensei/daemon.yaml and the daemon\n" +
+			"The change is written atomically to ~/.donmai/daemon.yaml and the daemon\n" +
 			"reloads the affected subsystem without a restart.",
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
@@ -1108,7 +1108,7 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	cmd.Flags().IntVar(&port, "port", 0, "Daemon HTTP port (default from daemon.yaml: 7734)")
 	cmd.Flags().StringVar(&host, "host", "", "Daemon HTTP host (default: 127.0.0.1)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output raw JSON (indented)")
-	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to daemon.yaml (default: ~/.rensei/daemon.yaml)")
+	cmd.Flags().StringVar(&cfgPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
 
 	return cmd
 }
@@ -1258,7 +1258,7 @@ func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 // list of repo URLs (truncated for very long lists). (REN-1446.)
 func formatAllowedProjectsStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || len(r.AllowedProjects) == 0 {
-		return "0 (none allowed — run `af project allow <repo-url>`)"
+		return "0 (none allowed — run `donmai project allow <repo-url>`)"
 	}
 	const maxShown = 6
 	count := len(r.AllowedProjects)

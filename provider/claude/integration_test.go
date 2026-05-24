@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func skipIfNoCLAUDE(t *testing.T) {

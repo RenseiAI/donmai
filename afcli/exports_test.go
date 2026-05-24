@@ -3,7 +3,7 @@ package afcli
 import (
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // TestPublicFactoriesReturnFreshTrees pins the contract that each

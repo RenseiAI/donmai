@@ -27,7 +27,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // NoColorEnv returns true when NO_COLOR is set in the environment (per

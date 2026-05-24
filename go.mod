@@ -1,4 +1,4 @@
-module github.com/RenseiAI/agentfactory-tui
+module github.com/RenseiAI/donmai
 
 go 1.25.10
 

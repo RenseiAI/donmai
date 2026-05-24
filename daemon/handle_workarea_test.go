@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // newServerForWorkareaTest constructs a Server suitable for httptest
