@@ -94,8 +94,8 @@ func TestKitRegistry_DefaultScanPath(t *testing.T) {
 	if len(paths) != 1 {
 		t.Fatalf("want 1 default scan path, got %d: %v", len(paths), paths)
 	}
-	if !strings.HasSuffix(paths[0], "/.rensei/kits") {
-		t.Errorf("default scan path %q does not end in /.rensei/kits", paths[0])
+	if !strings.HasSuffix(paths[0], "/.donmai/kits") && !strings.HasSuffix(paths[0], "/.rensei/kits") {
+		t.Errorf("default scan path %q does not end in /.donmai/kits or /.rensei/kits (legacy fallback)", paths[0])
 	}
 }
 
