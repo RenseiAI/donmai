@@ -100,7 +100,7 @@ func buildSteeringPrompt(qw QueuedWork, obs streamObservation) string {
 	b.WriteString("  gh pr create --fill\n\n")
 	if !obs.commentPosted {
 		b.WriteString("Also post a brief progress comment on the Linear issue ")
-		b.WriteString("via `pnpm af-linear create-comment`.\n\n")
+		b.WriteString("via `rensei linear create-comment`.\n\n")
 	}
 	b.WriteString("After the PR is open, output the PR URL on a single line ")
 	b.WriteString("and stop.\n")

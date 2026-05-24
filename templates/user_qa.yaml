@@ -25,7 +25,7 @@ prompt: |
   2. Inspect the implementing branch (or open PR) for {{#if issueIdentifier}}{{issueIdentifier}}{{else}}the issue{{/if}}.
   3. Run the project's test, typecheck, and lint commands. Capture any failures.
   4. Decide pass or fail strictly against the acceptance criteria.
-  5. Post a comment on {{#if issueIdentifier}}{{issueIdentifier}}{{else}}the issue{{/if}} via `pnpm af-linear create-comment` summarising what you checked and the verdict.
+  5. Post a comment on {{#if issueIdentifier}}{{issueIdentifier}}{{else}}the issue{{/if}} via `rensei linear create-comment` summarising what you checked and the verdict.
   6. End your final assistant message with exactly one marker:
 
      - `WORK_RESULT:passed` when every acceptance criterion is met and tests are green.
