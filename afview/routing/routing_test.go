@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/afview/routing"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/afview/routing"
 )
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

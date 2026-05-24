@@ -3,8 +3,8 @@ package runner
 import (
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/prompt"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
 )
 
 // TestTranslateSpec_ToolUse_Honored verifies that AllowedTools and

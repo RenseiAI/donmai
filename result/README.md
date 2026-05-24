@@ -22,8 +22,8 @@ legacy `WORKER_API_KEY`). The Bearer token is sent unmodified.
 import (
     "context"
 
-    "github.com/RenseiAI/agentfactory-tui/agent"
-    "github.com/RenseiAI/agentfactory-tui/result"
+    "github.com/RenseiAI/donmai/agent"
+    "github.com/RenseiAI/donmai/result"
 )
 
 p, err := result.NewPoster(result.Options{

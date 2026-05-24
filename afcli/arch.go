@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient/codeintel"
+	"github.com/RenseiAI/donmai/afclient/codeintel"
 )
 
 // newArchCmd constructs the `af arch` command tree.

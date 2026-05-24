@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/runtime/activity"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/activity"
 )
 
 // captureLogger returns an slog.Logger writing JSON lines to buf for

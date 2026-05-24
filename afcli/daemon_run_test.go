@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	afcreds "github.com/RenseiAI/agentfactory-tui/afcli/credentials"
+	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
 )
 
 // TestFormatStartupWorkerLine covers REN-1445: the daemon startup log used to

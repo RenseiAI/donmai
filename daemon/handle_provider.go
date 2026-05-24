@@ -15,7 +15,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // handleListProviders implements GET /api/daemon/providers. It walks the

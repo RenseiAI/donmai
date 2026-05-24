@@ -14,7 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/worker"
+	"github.com/RenseiAI/donmai/worker"
 )
 
 // defaultWorkerBaseURL is used when neither --base-url nor $AF_BASE_URL is

@@ -38,7 +38,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // defaultArchiveDir resolves the default archive root, ~/.rensei/workareas.

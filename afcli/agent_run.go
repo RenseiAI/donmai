@@ -18,19 +18,19 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/daemon"
-	"github.com/RenseiAI/agentfactory-tui/prompt"
-	provideramp "github.com/RenseiAI/agentfactory-tui/provider/amp"
-	providerclaude "github.com/RenseiAI/agentfactory-tui/provider/claude"
-	providercodex "github.com/RenseiAI/agentfactory-tui/provider/codex"
-	providergemini "github.com/RenseiAI/agentfactory-tui/provider/gemini"
-	providerollama "github.com/RenseiAI/agentfactory-tui/provider/ollama"
-	provideropencode "github.com/RenseiAI/agentfactory-tui/provider/opencode"
-	providerstub "github.com/RenseiAI/agentfactory-tui/provider/stub"
-	"github.com/RenseiAI/agentfactory-tui/result"
-	"github.com/RenseiAI/agentfactory-tui/runner"
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/prompt"
+	provideramp "github.com/RenseiAI/donmai/provider/amp"
+	providerclaude "github.com/RenseiAI/donmai/provider/claude"
+	providercodex "github.com/RenseiAI/donmai/provider/codex"
+	providergemini "github.com/RenseiAI/donmai/provider/gemini"
+	providerollama "github.com/RenseiAI/donmai/provider/ollama"
+	provideropencode "github.com/RenseiAI/donmai/provider/opencode"
+	providerstub "github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // DefaultAgentRunDaemonURL is the local control HTTP address the

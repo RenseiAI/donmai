@@ -6,7 +6,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/tui-components/theme"
 	"github.com/RenseiAI/tui-components/widget"
 	"github.com/RenseiAI/tui-components/widget/notification"

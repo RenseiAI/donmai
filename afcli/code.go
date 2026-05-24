@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient/codeintel"
+	"github.com/RenseiAI/donmai/afclient/codeintel"
 )
 
 // newCodeCmd constructs the `af code` command tree.

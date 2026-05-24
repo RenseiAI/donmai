@@ -7,7 +7,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/queue"
+	"github.com/RenseiAI/donmai/internal/queue"
 )
 
 // newTestClient starts a miniredis server and returns a connected Client plus

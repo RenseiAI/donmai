@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/process"
+	"github.com/RenseiAI/donmai/internal/process"
 )
 
 func TestDaemonize_ChildDetection(t *testing.T) {

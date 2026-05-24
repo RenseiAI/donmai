@@ -16,8 +16,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/afview/kit"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/afview/kit"
 )
 
 // kitDaemonClient is the subset of *afclient.DaemonClient used by the

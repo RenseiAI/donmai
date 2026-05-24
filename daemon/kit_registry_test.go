@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 const validKitTOML = `api = "rensei.dev/v1"

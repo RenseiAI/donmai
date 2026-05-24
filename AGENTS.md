@@ -2,7 +2,7 @@
 
 Unified CLI and terminal dashboard for AgentFactory AI agent fleets.
 
-**Module**: `github.com/RenseiAI/agentfactory-tui`
+**Module**: `github.com/RenseiAI/donmai`
 
 ## Purpose
 

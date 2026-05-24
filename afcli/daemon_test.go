@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // ── mock daemon ───────────────────────────────────────────────────────────────

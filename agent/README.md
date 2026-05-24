@@ -41,7 +41,7 @@ verbatim. Readers of `QueuedWork.resolvedProfile` JSON across the fleet
 ## Public package boundary
 
 This package is exported at the top level of the module
-(`github.com/RenseiAI/agentfactory-tui/agent`). Downstream consumers
+(`github.com/RenseiAI/donmai/agent`). Downstream consumers
 including `rensei-tui` import it directly without depending on the rest
 of `agentfactory-tui`. F.1.1 §1 ratifies this boundary. Do not move or
 rename without an ADR.

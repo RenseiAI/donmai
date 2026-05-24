@@ -75,7 +75,7 @@ homebrew_casks:
       owner: RenseiAI
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: "https://github.com/RenseiAI/agentfactory-tui"
+    homepage: "https://github.com/RenseiAI/donmai"
     description: "AgentFactory CLI — terminal dashboard and CLI for AI agent fleets"
     binaries:
       - af

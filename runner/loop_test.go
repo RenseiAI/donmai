@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/provider/stub"
-	"github.com/RenseiAI/agentfactory-tui/result"
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // TestLoop_EventsMirroredToJSONL confirms every event the provider
@@ -483,7 +483,7 @@ func TestScanPRURL_ExtractsURL(t *testing.T) {
 		text string
 		want string
 	}{
-		{"opened https://github.com/RenseiAI/agentfactory-tui/pull/123", "https://github.com/RenseiAI/agentfactory-tui/pull/123"},
+		{"opened https://github.com/RenseiAI/donmai/pull/123", "https://github.com/RenseiAI/donmai/pull/123"},
 		{"https://github.com/foo-bar/baz_qux/pull/9", "https://github.com/foo-bar/baz_qux/pull/9"},
 		{"no url", ""},
 	}

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // fakeProviderRegistry is a minimal ProviderRegistry used to assert the

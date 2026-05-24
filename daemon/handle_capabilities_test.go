@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	internaldaemon "github.com/RenseiAI/agentfactory-tui/internal/daemon"
+	internaldaemon "github.com/RenseiAI/donmai/internal/daemon"
 )
 
 // newCapabilitiesTestServer builds a minimal test Server backed by a Daemon

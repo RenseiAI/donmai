@@ -1,6 +1,6 @@
 package detail
 
-import "github.com/RenseiAI/agentfactory-tui/afclient"
+import "github.com/RenseiAI/donmai/afclient"
 
 type detailDataMsg struct {
 	detail *afclient.SessionDetailResponse

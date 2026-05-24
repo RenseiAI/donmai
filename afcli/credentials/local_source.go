@@ -9,7 +9,7 @@
 //
 // AGENT_ENV_BLOCKLIST is enforced before any value is forwarded into a
 // child process; the canonical list lives in
-// github.com/RenseiAI/agentfactory-tui/internal/credentials. The blocklist
+// github.com/RenseiAI/donmai/internal/credentials. The blocklist
 // keeps the daemon's own auth tokens (RENSEI_DAEMON_JWT, M2M_JWT_SECRET,
 // WORKER_API_KEY, …) from leaking through to agents even when they appear
 // in process env or a developer's .env.local.
@@ -27,7 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	creds "github.com/RenseiAI/agentfactory-tui/internal/credentials"
+	creds "github.com/RenseiAI/donmai/internal/credentials"
 )
 
 // sourceLabel is the provenance tag returned by LocalSource.Resolve.

@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/result"
+	"github.com/RenseiAI/donmai/result"
 )
 
 // TestUpdateIssueStatus_HappyPath asserts the wire shape: POST to

@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"charm.land/lipgloss/v2"
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/tui-components/theme"
 	"github.com/RenseiAI/tui-components/widget"
 )

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func TestNew_BinaryMissingReturnsProviderUnavailable(t *testing.T) {

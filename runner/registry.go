@@ -7,7 +7,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // Registry resolves [agent.ProviderName] values to their corresponding

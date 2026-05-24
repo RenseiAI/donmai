@@ -5,12 +5,12 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	provideramp "github.com/RenseiAI/agentfactory-tui/provider/amp"
-	providerclaude "github.com/RenseiAI/agentfactory-tui/provider/claude"
-	providergemini "github.com/RenseiAI/agentfactory-tui/provider/gemini"
-	provideropencode "github.com/RenseiAI/agentfactory-tui/provider/opencode"
-	providerstub "github.com/RenseiAI/agentfactory-tui/provider/stub"
+	"github.com/RenseiAI/donmai/agent"
+	provideramp "github.com/RenseiAI/donmai/provider/amp"
+	providerclaude "github.com/RenseiAI/donmai/provider/claude"
+	providergemini "github.com/RenseiAI/donmai/provider/gemini"
+	provideropencode "github.com/RenseiAI/donmai/provider/opencode"
+	providerstub "github.com/RenseiAI/donmai/provider/stub"
 )
 
 // TestToolUseCapabilityMatrix asserts the v2 tool-use surface flags

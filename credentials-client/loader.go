@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	internalcreds "github.com/RenseiAI/agentfactory-tui/internal/credentials"
+	internalcreds "github.com/RenseiAI/donmai/internal/credentials"
 )
 
 // SocketEnvVar is the name of the environment variable the loader reads

@@ -5,7 +5,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // TestSpecFieldCoverage asserts that every field on agent.Spec is

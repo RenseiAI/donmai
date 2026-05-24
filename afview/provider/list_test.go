@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/afview/provider"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/afview/provider"
 )
 
 func sampleProviders() []afclient.Provider {

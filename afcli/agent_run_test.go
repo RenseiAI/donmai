@@ -19,8 +19,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/daemon"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/daemon"
 )
 
 // quietLogger returns a slog.Logger that drops all output. Used by

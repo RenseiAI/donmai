@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // requireGit skips the test when no git binary is on PATH. The build

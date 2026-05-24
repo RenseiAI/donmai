@@ -5,8 +5,8 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/runner"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runner"
 )
 
 // fakeProvider is a minimal agent.Provider implementation for testing

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // fakeEnv returns a Getenv stub that reads from the supplied map.

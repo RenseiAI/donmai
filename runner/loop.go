@@ -12,12 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/internal/kit"
-	"github.com/RenseiAI/agentfactory-tui/runtime/activity"
-	"github.com/RenseiAI/agentfactory-tui/runtime/heartbeat"
-	"github.com/RenseiAI/agentfactory-tui/runtime/state"
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/runtime/activity"
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
+	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // kitLoadSkills is the seam used for Kit skill loading in the runner

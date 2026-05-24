@@ -29,7 +29,7 @@ import (
 
 	"github.com/sigstore/sigstore-go/pkg/testing/ca"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 const minimalKitTOML = `api = "rensei.dev/v1"

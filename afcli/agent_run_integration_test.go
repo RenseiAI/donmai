@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/daemon"
+	"github.com/RenseiAI/donmai/daemon"
 )
 
 // TestF28_DaemonSpawnsAgentRun exercises the wire path. It drives:

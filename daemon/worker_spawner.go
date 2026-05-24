@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // Compile-time assertion that WorkerSpawner satisfies the

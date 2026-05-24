@@ -26,8 +26,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient/repoconfig"
-	"github.com/RenseiAI/agentfactory-tui/internal/linear"
+	"github.com/RenseiAI/donmai/afclient/repoconfig"
+	"github.com/RenseiAI/donmai/internal/linear"
 )
 
 // DispatchStatus is the lifecycle status of a dispatched agent.

@@ -12,7 +12,7 @@ return two strings.
 ## Usage
 
 ```go
-import "github.com/RenseiAI/agentfactory-tui/prompt"
+import "github.com/RenseiAI/donmai/prompt"
 
 var b prompt.Builder
 system, user, err := b.Build(prompt.QueuedWork{

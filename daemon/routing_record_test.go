@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // TestRecordOSSRoutingDecision_NilStoreSafe pins the contract that the

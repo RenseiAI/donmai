@@ -1,7 +1,7 @@
 package codex
 
 import (
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // DefaultCodexModel is the model identifier used when Spec.Model is

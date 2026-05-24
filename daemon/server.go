@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // Server is the daemon's HTTP control API. It wraps a Daemon and exposes

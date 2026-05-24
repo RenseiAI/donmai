@@ -15,8 +15,8 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/RenseiAI/agentfactory-tui/installer/launchd"
-	"github.com/RenseiAI/agentfactory-tui/installer/systemd"
+	"github.com/RenseiAI/donmai/installer/launchd"
+	"github.com/RenseiAI/donmai/installer/systemd"
 )
 
 // Scope mirrors systemd.Scope for callers that want to set the systemd

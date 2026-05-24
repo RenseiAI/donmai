@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func Test_InjectAppearsAsAssistantText(t *testing.T) {

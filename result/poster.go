@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // DefaultMaxAttempts is the legacy 3-attempt pattern from

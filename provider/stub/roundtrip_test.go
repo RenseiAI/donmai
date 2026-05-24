@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // Test_Roundtrip_SucceedWithPR drives a full Spawn → drain → assert

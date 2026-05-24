@@ -15,8 +15,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	workareaview "github.com/RenseiAI/agentfactory-tui/afview/workarea"
+	"github.com/RenseiAI/donmai/afclient"
+	workareaview "github.com/RenseiAI/donmai/afview/workarea"
 )
 
 // workareaDaemonClient is the subset of *afclient.DaemonClient used by

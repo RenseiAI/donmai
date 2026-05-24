@@ -5,7 +5,7 @@
 `af` is the open-source CLI and terminal dashboard for AgentFactory AI agent fleets. It is the single binary for every OSS operator task: running the three-process stack locally, managing agents and sessions, querying issue trackers, and inspecting fleet health.
 
 **Binary**: `af`
-**Module**: `github.com/RenseiAI/agentfactory-tui`
+**Module**: `github.com/RenseiAI/donmai`
 
 ---
 
@@ -47,25 +47,25 @@ brew install RenseiAI/tap/af
 ### go install (requires Go 1.22+)
 
 ```bash
-go install github.com/RenseiAI/agentfactory-tui/cmd/af@latest
+go install github.com/RenseiAI/donmai/cmd/af@latest
 ```
 
 ### GitHub release download
 
 Pre-built binaries for macOS (arm64, amd64) and Linux (arm64, amd64) are
 attached to every release on the
-[releases page](https://github.com/RenseiAI/agentfactory-tui/releases).
+[releases page](https://github.com/RenseiAI/donmai/releases).
 
 ```bash
 # Example — macOS arm64
-curl -fsSL https://github.com/RenseiAI/agentfactory-tui/releases/latest/download/af_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/RenseiAI/donmai/releases/latest/download/af_darwin_arm64.tar.gz \
   | tar -xz -C /usr/local/bin af
 ```
 
 ### Build from source
 
 ```bash
-git clone https://github.com/RenseiAI/agentfactory-tui
+git clone https://github.com/RenseiAI/donmai
 cd agentfactory-tui
 make build        # produces bin/af
 ```

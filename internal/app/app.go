@@ -5,10 +5,10 @@ import (
 	"fmt"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/internal/views/dashboard"
-	"github.com/RenseiAI/agentfactory-tui/internal/views/detail"
-	"github.com/RenseiAI/agentfactory-tui/internal/views/palette"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/views/dashboard"
+	"github.com/RenseiAI/donmai/internal/views/detail"
+	"github.com/RenseiAI/donmai/internal/views/palette"
 )
 
 // App is the root Bubble Tea model that routes between views.

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/process"
+	"github.com/RenseiAI/donmai/internal/process"
 )
 
 func TestPIDFile_WriteReadRoundtrip(t *testing.T) {

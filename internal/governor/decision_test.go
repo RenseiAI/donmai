@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/linear"
+	"github.com/RenseiAI/donmai/internal/linear"
 )
 
 func TestDecide(t *testing.T) {

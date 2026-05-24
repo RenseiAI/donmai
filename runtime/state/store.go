@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // AgentDirName is the conventional sub-directory name inside a worktree

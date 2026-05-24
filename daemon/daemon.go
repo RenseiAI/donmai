@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	internaldaemon "github.com/RenseiAI/agentfactory-tui/internal/daemon"
+	"github.com/RenseiAI/donmai/afclient"
+	internaldaemon "github.com/RenseiAI/donmai/internal/daemon"
 )
 
 // Options configure a Daemon.

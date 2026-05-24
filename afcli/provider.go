@@ -15,8 +15,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/afview/provider"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/afview/provider"
 )
 
 // providerDaemonClient is the subset of *afclient.DaemonClient used by

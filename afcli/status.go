@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
-	"github.com/RenseiAI/agentfactory-tui/internal/inline"
+	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/inline"
 )
 
 // newStatusCmd constructs the `status` subcommand. The ds function

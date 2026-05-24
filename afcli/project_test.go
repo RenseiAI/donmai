@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // ── mock configReaderWriter ───────────────────────────────────────────────────

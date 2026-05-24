@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // DefaultRoutingRingBufferSize is the maximum number of recent routing

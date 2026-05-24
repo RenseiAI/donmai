@@ -3,7 +3,7 @@ package afcli
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // newSessionCmd constructs the `session` parent command, a sibling

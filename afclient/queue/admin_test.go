@@ -9,7 +9,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient/queue"
+	"github.com/RenseiAI/donmai/afclient/queue"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────

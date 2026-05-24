@@ -14,8 +14,8 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/agentfactory-tui/afcli"
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afcli"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 const defaultBaseURL = "http://localhost:3000"

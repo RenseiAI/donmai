@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/prompt"
-	"github.com/RenseiAI/agentfactory-tui/result"
-	"github.com/RenseiAI/agentfactory-tui/runtime/worktree"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // minimalRunner returns a Runner wired to a no-op platform mock, an

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 func newWorkareaTestServer(t *testing.T, handler http.HandlerFunc) (*afclient.DaemonClient, *httptest.Server) {

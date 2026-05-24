@@ -7,7 +7,7 @@ import "context"
 // Verbatim port of the legacy TS AgentProvider interface from
 // ../agentfactory/packages/core/src/providers/types.ts.
 //
-// Implementations live in github.com/RenseiAI/agentfactory-tui/provider/
+// Implementations live in github.com/RenseiAI/donmai/provider/
 // subpackages (claude, codex, stub for v0.5.0). Each implementation is
 // independent and only depends on this package + its provider-native
 // CLI/SDK + the standard library.

@@ -10,7 +10,7 @@ package runner
 import (
 	"encoding/json"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // ProviderView wraps a *Registry and satisfies daemon.ProviderRegistry.

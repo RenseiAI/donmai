@@ -25,7 +25,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/credentials"
+	"github.com/RenseiAI/donmai/internal/credentials"
 )
 
 // tsBlocklistPath returns the absolute path to the TS blocklist file,

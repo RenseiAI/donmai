@@ -41,7 +41,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // ErrKitInstallUnimplemented is returned by KitRegistry.Install for the

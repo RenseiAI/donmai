@@ -3,7 +3,7 @@ package codex
 import (
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func TestApprovalBridge_NoConfigDefaultsToAcceptForSession(t *testing.T) {

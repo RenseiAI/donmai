@@ -12,9 +12,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	afcreds "github.com/RenseiAI/agentfactory-tui/afcli/credentials"
-	"github.com/RenseiAI/agentfactory-tui/daemon"
-	"github.com/RenseiAI/agentfactory-tui/runner"
+	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
+	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/runner"
 )
 
 // newDaemonRunCmd constructs the `daemon run` subcommand. This is the

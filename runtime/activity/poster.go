@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // Default values for [Config]. Exposed so callers can tune individual
@@ -64,7 +64,7 @@ const (
 // RuntimeCredentials are the bearer-token credentials needed for an
 // activity post. Empty fields fall back to the corresponding [Config]
 // fields. Mirrored on
-// [github.com/RenseiAI/agentfactory-tui/runtime/heartbeat.RuntimeCredentials]
+// [github.com/RenseiAI/donmai/runtime/heartbeat.RuntimeCredentials]
 // for symmetry — the runner builds one provider for both seams.
 type RuntimeCredentials struct {
 	WorkerID  string

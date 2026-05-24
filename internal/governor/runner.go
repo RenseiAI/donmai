@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/linear"
-	"github.com/RenseiAI/agentfactory-tui/internal/queue"
+	"github.com/RenseiAI/donmai/internal/linear"
+	"github.com/RenseiAI/donmai/internal/queue"
 )
 
 // issuePayload is the JSON envelope sent to the work queue.

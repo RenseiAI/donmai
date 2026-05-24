@@ -29,7 +29,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	adminqueue "github.com/RenseiAI/agentfactory-tui/afclient/queue"
+	adminqueue "github.com/RenseiAI/donmai/afclient/queue"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────

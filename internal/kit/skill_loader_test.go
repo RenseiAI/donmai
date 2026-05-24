@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/kit"
+	"github.com/RenseiAI/donmai/internal/kit"
 )
 
 // writeSkillFile writes content to dir/<name> for the test, creating

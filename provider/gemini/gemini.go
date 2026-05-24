@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // DefaultEndpoint is the public Gemini API base URL. Override via

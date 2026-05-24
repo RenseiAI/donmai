@@ -31,7 +31,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // RenderList writes a unified table of workareas covering both active

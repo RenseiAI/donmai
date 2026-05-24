@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/RenseiAI/agentfactory-tui/agent"
-	"github.com/RenseiAI/agentfactory-tui/provider/stub"
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/stub"
 )
 
 // TestShouldSteer_Table covers the decision matrix in steering.go.

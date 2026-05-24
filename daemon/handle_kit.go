@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/RenseiAI/agentfactory-tui/afclient"
+	"github.com/RenseiAI/donmai/afclient"
 )
 
 // kitRegistry is the subset of *KitRegistry the handlers need.

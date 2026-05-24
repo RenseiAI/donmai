@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RenseiAI/agentfactory-tui/internal/governor"
+	"github.com/RenseiAI/donmai/internal/governor"
 )
 
 // fakeRunnable is a no-op governorRunnable used in tests.
