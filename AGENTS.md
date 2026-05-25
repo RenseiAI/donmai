@@ -30,23 +30,21 @@ Treat the legacy repo as **read-only reference**. Don't modify it from work in t
 
 ## Architecture
 
-The OSS-canonical architecture corpus is `agentfactory-architecture` (remote: https://github.com/RenseiAI/agentfactory-architecture, public). Read it first; it is the source of truth for everything OSS-execution-layer (`donmai` binary, daemon, runner, the eight Provider Families, kits, workflow engine).
-
-Its sibling, `rensei-architecture` (remote: https://github.com/RenseiAI/rensei-architecture, private), extends with platform-only docs (Linear realignment, PM agents tied to the Rensei team's backlog, multi-tenant control-plane policy, the SaaS dashboard parity discipline) and the `<doc>-platform-extensions.md` deltas that extend shared docs in the OSS corpus. Locally both repos sit alongside this one (`../agentfactory-architecture/`, `../rensei-architecture/`).
+The canonical architecture corpus is [`donmai-architecture`](https://github.com/RenseiAI/donmai-architecture) (public). Read it first; it is the source of truth for everything in the execution layer — the `donmai` binary, daemon, runner, the eight Provider Families, kits, the workflow engine. Locally it sits alongside this repo at `../donmai-architecture/`.
 
 Read in this order:
 
-1. `agentfactory-architecture/001-layered-execution-model.md` — canonical synthesis (OSS). Always first.
-2. The reference doc(s) for whichever layer you are working on — `agentfactory-architecture/002`–`008`, `011`, `013`–`016`. All OSS-canonical for the contract; if a platform-extensions sibling exists in `rensei-architecture/<doc>-platform-extensions.md` and your work touches platform behavior, read it second.
-3. Any open ADRs that touch your work (`ADR-*.md`) — start in `agentfactory-architecture` for cross-cutting/OSS ADRs; cross-check `rensei-architecture` for platform-extension ADRs and the dual-publish stubs.
-4. `agentfactory-architecture/BOUNDARY.md` — boundary-tagging convention. Read before authoring a new ADR or moving doc content between corpora; it determines which corpus a new doc belongs in (`OSS-only` / `platform-only` / `shared` / `mirrored`) and the split mechanism for shared docs.
+1. `donmai-architecture/001-layered-execution-model.md` — canonical synthesis. Always first.
+2. The reference doc(s) for whichever layer you are working on — `donmai-architecture/002`–`008`, `011`, `013`–`016`.
+3. Any open ADRs that touch your work (`donmai-architecture/ADR-*.md`).
+4. `donmai-architecture/BOUNDARY.md` — boundary-tagging convention. Read before authoring a new ADR or moving doc content; it determines what kind of doc you're writing and where new ADRs live.
 
-If this project's docs conflict with `agentfactory-architecture/`, the OSS corpus wins. Either update this project's docs to align, or open an ADR to amend the corpus.
+If this project's docs conflict with `donmai-architecture/`, the corpus wins. Either update this project's docs to align, or open an ADR to amend the corpus.
 
 ## Package Architecture
 
 ```
-agentfactory-tui/
+donmai/
 ├── afclient/        # PUBLIC — API client, types, mock, errors
 ├── afcli/           # PUBLIC — Cobra command factories (RegisterCommands pattern)
 ├── worker/          # PUBLIC — Worker protocol (register, poll, heartbeat, fleet)

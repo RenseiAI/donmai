@@ -163,7 +163,7 @@ The local daemon (`rensei-daemon` subprocess) is the persistent service that
 ties the three processes together. It installs as a system service (launchd on
 macOS, systemd on Linux), survives reboots, manages the workarea pool, and
 handles auto-updates with drain semantics. For the full daemon operations manual
-see [011-local-daemon-fleet.md](https://github.com/RenseiAI/rensei-architecture/blob/main/011-local-daemon-fleet.md).
+see [011-local-daemon-fleet.md](https://github.com/RenseiAI/donmai-architecture/blob/main/011-local-daemon-fleet.md).
 
 ---
 
@@ -367,7 +367,7 @@ donmai code symbols <file>
 ### `donmai arch`
 
 Architecture reference commands. Browse, show, and synthesize the
-`rensei-architecture` corpus.
+`donmai-architecture` corpus.
 
 ```bash
 donmai arch list
@@ -536,9 +536,9 @@ that want the daemon-only lifecycle surface can leave those commands disabled.
 
 See `AGENTS.md` for the full package layout and contributor guide. The
 authoritative architecture corpus lives in
-[rensei-architecture](https://github.com/RenseiAI/rensei-architecture) —
+[donmai-architecture](https://github.com/RenseiAI/donmai-architecture) —
 particularly:
-- `001-layered-execution-model.md` — OSS / SaaS boundary and the `af` ↔ `rensei` contract
+- `001-layered-execution-model.md` — layered execution model and OSS contracts
 - `011-local-daemon-fleet.md` — local daemon operations manual
 - `013-orchestrator-and-governor.md` — orchestrator, governor, worker, dispatch loop
 - `014-tui-operator-surfaces.md` — TUI display primitives and dual-surface discipline
