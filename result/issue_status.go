@@ -170,9 +170,17 @@ func (p *Poster) proxyOnce(ctx context.Context, endpoint string, payload []byte,
 		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
+	if authToken == "" {
+		// Fail loudly rather than send a doomed unauthenticated request that
+		// the proxy will 401 and the caller will then retry, wasting attempts
+		// and obscuring the real fault (worker credential resolution failed).
+		// Treat as permanent: retrying won't conjure a missing token.
+		return &PermanentError{
+			StatusCode: 401,
+			Body:       "missing worker auth token (credential resolution failed before issue-tracker-proxy call)",
+		}
 	}
+	req.Header.Set("Authorization", "Bearer "+authToken)
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("http: %w", err)
