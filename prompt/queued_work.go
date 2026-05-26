@@ -148,6 +148,20 @@ type QueuedWork struct {
 	// by the platform's agent.dispatch_stage action when the resolved
 	// agent card carries a non-empty systemPrompt in its card jsonb.
 	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
+
+	// DisallowedTools is the platform-supplied set of additional tool
+	// patterns to block for this session. The runner APPENDS these to
+	// its own defaultDisallowedTools() baseline — it never replaces the
+	// baseline — so the runner's static policy remains the floor.
+	//
+	// This is the Option B wire field for SUP-1840 Layer 3 (cred-surface
+	// restriction). The platform stamps it via stampDisallowedTools() in
+	// credential-injection.ts. Round-trips opaquely through Redis JSON;
+	// absent/null/empty is safe and backward-compatible (omitempty).
+	//
+	// Wire shape: "disallowedTools" (camelCase, omitempty). Pairs with
+	// platform PR #196.
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
 }
 
 // StageBudget mirrors the platform's StageBudget type from
