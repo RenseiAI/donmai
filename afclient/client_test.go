@@ -28,6 +28,15 @@ func newTestServerWithToken(t *testing.T, token string, handler http.HandlerFunc
 	return srv, NewAuthenticatedClient(srv.URL, token)
 }
 
+// writeJSON sets Content-Type: application/json and encodes v as JSON.
+// httptest servers default to text/plain when headers are not set explicitly;
+// without this helper every handler would trigger the non-JSON error guard
+// added in decodeJSONResponse.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
 func TestClientStopSessionSuccess(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -36,7 +45,7 @@ func TestClientStopSessionSuccess(t *testing.T) {
 		if r.URL.Path != "/api/public/sessions/sess-1/stop" {
 			t.Errorf("path = %s", r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode(StopSessionResponse{
+		writeJSON(w, StopSessionResponse{
 			Stopped: true, SessionID: "sess-1",
 			PreviousStatus: StatusWorking, NewStatus: StatusStopped,
 		})
@@ -59,7 +68,7 @@ func TestClientChatSessionSuccess(t *testing.T) {
 		if !strings.Contains(string(body), `"prompt":"hi"`) {
 			t.Errorf("body missing prompt: %s", body)
 		}
-		_ = json.NewEncoder(w).Encode(ChatSessionResponse{
+		writeJSON(w, ChatSessionResponse{
 			Delivered: true, PromptID: "p-1", SessionID: "sess-1", SessionStatus: StatusWorking,
 		})
 	})
@@ -82,7 +91,7 @@ func TestClientReconnectSessionSuccess(t *testing.T) {
 		if !strings.Contains(string(body), `"cursor":"c-1"`) {
 			t.Errorf("body missing cursor: %s", body)
 		}
-		_ = json.NewEncoder(w).Encode(ReconnectSessionResponse{
+		writeJSON(w, ReconnectSessionResponse{
 			Reconnected: true, SessionID: "sess-1", SessionStatus: StatusWorking, MissedEvents: 3,
 		})
 	})
@@ -135,19 +144,19 @@ func TestClientGetEndpoints(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/api/public/stats"):
-			_ = json.NewEncoder(w).Encode(StatsResponse{WorkersOnline: 2})
+			writeJSON(w, StatsResponse{WorkersOnline: 2})
 		case r.URL.Path == "/api/public/session-activities":
-			_ = json.NewEncoder(w).Encode(ActivityListResponse{SessionStatus: StatusWorking})
+			writeJSON(w, ActivityListResponse{SessionStatus: StatusWorking})
 		case r.URL.Path == "/api/public/sessions":
-			_ = json.NewEncoder(w).Encode(SessionsListResponse{Count: 1})
+			writeJSON(w, SessionsListResponse{Count: 1})
 		case strings.HasPrefix(r.URL.Path, "/api/public/sessions/"):
-			_ = json.NewEncoder(w).Encode(SessionDetailResponse{Session: SessionDetail{ID: "sess-1"}})
+			writeJSON(w, SessionDetailResponse{Session: SessionDetail{ID: "sess-1"}})
 		case r.URL.Path == "/api/mcp/cost-report":
-			_ = json.NewEncoder(w).Encode(CostReportResponse{TotalSessions: 1})
+			writeJSON(w, CostReportResponse{TotalSessions: 1})
 		case r.URL.Path == "/api/mcp/list-fleet":
-			_ = json.NewEncoder(w).Encode(ListFleetResponse{Total: 1})
+			writeJSON(w, ListFleetResponse{Total: 1})
 		case r.URL.Path == "/api/cli/whoami":
-			_ = json.NewEncoder(w).Encode(WhoAmIResponse{Org: WhoAmIOrg{ID: "org-1"}})
+			writeJSON(w, WhoAmIResponse{Org: WhoAmIOrg{ID: "org-1"}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -192,7 +201,7 @@ func TestClientGetActivitiesAuthenticatedOmitsHash(t *testing.T) {
 	var seenQuery string
 	_, c := newTestServerWithToken(t, "rsk_live_test", func(w http.ResponseWriter, r *http.Request) {
 		seenQuery = r.URL.RawQuery
-		_ = json.NewEncoder(w).Encode(ActivityListResponse{SessionStatus: StatusWorking})
+		writeJSON(w, ActivityListResponse{SessionStatus: StatusWorking})
 	})
 	if _, err := c.GetActivities("sess-9", nil); err != nil {
 		t.Fatalf("GetActivities: %v", err)
@@ -224,7 +233,7 @@ func TestClientGetActivitiesURLContract(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		seenPath = r.URL.Path
 		seenQuery = r.URL.RawQuery
-		_ = json.NewEncoder(w).Encode(ActivityListResponse{SessionStatus: StatusWorking})
+		writeJSON(w, ActivityListResponse{SessionStatus: StatusWorking})
 	})
 
 	if _, err := c.GetActivities("sess-9", nil); err != nil {
@@ -300,11 +309,11 @@ func TestClientPostEndpoints(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/mcp/submit-task":
-			_ = json.NewEncoder(w).Encode(SubmitTaskResponse{Submitted: true, TaskID: "t-1"})
+			writeJSON(w, SubmitTaskResponse{Submitted: true, TaskID: "t-1"})
 		case "/api/mcp/stop-agent":
-			_ = json.NewEncoder(w).Encode(StopAgentResponse{Stopped: true, TaskID: "t-1"})
+			writeJSON(w, StopAgentResponse{Stopped: true, TaskID: "t-1"})
 		case "/api/mcp/forward-prompt":
-			_ = json.NewEncoder(w).Encode(ForwardPromptResponse{Forwarded: true, PromptID: "p-1"})
+			writeJSON(w, ForwardPromptResponse{Forwarded: true, PromptID: "p-1"})
 		default:
 			http.NotFound(w, r)
 		}
@@ -348,7 +357,7 @@ func TestClientGetSessionsFiltered(t *testing.T) {
 			_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 				gotPath = r.URL.Path
 				gotQuery = r.URL.Query().Get("project")
-				_ = json.NewEncoder(w).Encode(SessionsListResponse{Count: 1})
+				writeJSON(w, SessionsListResponse{Count: 1})
 			})
 
 			if _, err := c.GetSessionsFiltered(tc.project); err != nil {
@@ -371,7 +380,7 @@ func TestClientGetSessionsFallsThroughToFiltered(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotRawQuery = r.URL.RawQuery
-		_ = json.NewEncoder(w).Encode(SessionsListResponse{Count: 0})
+		writeJSON(w, SessionsListResponse{Count: 0})
 	})
 	if _, err := c.GetSessions(); err != nil {
 		t.Fatalf("GetSessions: %v", err)
@@ -388,7 +397,7 @@ func TestClientAuthHeader(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
-		_ = json.NewEncoder(w).Encode(StatsResponse{})
+		writeJSON(w, StatsResponse{})
 	}))
 	t.Cleanup(srv.Close)
 	c := NewAuthenticatedClient(srv.URL, "rsk_token")
@@ -421,7 +430,7 @@ func TestClientScopeHeaders(t *testing.T) {
 		got.project = r.Header.Get("X-Rensei-Project")
 		_, got.hadOrg = r.Header["X-Rensei-Org"]
 		_, got.hadProject = r.Header["X-Rensei-Project"]
-		_ = json.NewEncoder(w).Encode(StatsResponse{})
+		writeJSON(w, StatsResponse{})
 	}))
 	t.Cleanup(srv.Close)
 
@@ -468,4 +477,112 @@ func TestClientScopeHeaders(t *testing.T) {
 			t.Errorf("post X-Rensei-Org = %q, want org_supaku", got.org)
 		}
 	})
+}
+
+// TestDecodeJSONResponseHTMLGET verifies that a GET endpoint returning an HTML
+// body (e.g. a Vercel auth-protection page or Next.js error boundary) surfaces
+// a useful error containing the HTTP status code, content-type, and a body
+// preview -- rather than the cryptic `decode failed: invalid character '<'`
+// message that the old json.NewDecoder call produced.
+//
+// This is the regression guard for the "session prompt HTML-response decode
+// failure" bug: `rensei session prompt <id> <msg>` (which calls
+// ForwardPrompt -> POST /api/mcp/forward-prompt) failed with an opaque JSON
+// error when the platform returned an HTML error page.
+func TestDecodeJSONResponseHTMLGET(t *testing.T) {
+	t.Parallel()
+	const htmlBody = "<html><body>Authentication required</body></html>"
+
+	// 401 responses are intercepted by statusToError before the decode path,
+	// so verify sentinel error still works correctly.
+	_, cAuth := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(htmlBody))
+	})
+	_, err := cAuth.GetStats()
+	if !errors.Is(err, ErrNotAuthenticated) {
+		t.Errorf("401 should still map to ErrNotAuthenticated; got: %v", err)
+	}
+
+	// Use a 200 response with a text/html body to exercise the decode path
+	// directly -- this is the "Vercel auth gate returns 200 + HTML" scenario.
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(htmlBody))
+	})
+	_, err = c.GetStats()
+	if err == nil {
+		t.Fatal("expected error for HTML 200 response, got nil")
+	}
+	if !strings.Contains(err.Error(), "non-JSON response") {
+		t.Errorf("error should mention non-JSON response; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "text/html") {
+		t.Errorf("error should include content-type; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "200") {
+		t.Errorf("error should include HTTP status 200; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Authentication required") {
+		t.Errorf("error should include body preview; got: %v", err)
+	}
+}
+
+// TestDecodeJSONResponseHTMLPOST verifies that the POST path (used by
+// ForwardPrompt / session prompt) also surfaces a useful error when the
+// platform returns an HTML body with a 2xx status. This is the exact
+// scenario reported as "rensei session prompt CLI: HTML-response decode
+// failure".
+func TestDecodeJSONResponseHTMLPOST(t *testing.T) {
+	t.Parallel()
+	const htmlBody = "<html><body>Authentication required</body></html>"
+
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(htmlBody))
+	})
+
+	_, err := c.ForwardPrompt(ForwardPromptRequest{TaskID: "t-1", Message: "hi"})
+	if err == nil {
+		t.Fatal("expected error for HTML 200 response on ForwardPrompt, got nil")
+	}
+	if !strings.Contains(err.Error(), "non-JSON response") {
+		t.Errorf("error should mention non-JSON response; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "text/html") {
+		t.Errorf("error should include content-type; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "200") {
+		t.Errorf("error should include HTTP status 200; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Authentication required") {
+		t.Errorf("error should include body preview; got: %v", err)
+	}
+}
+
+// TestDecodeJSONResponseHTMLBodyTruncated verifies that very long HTML bodies
+// are truncated in the error message so a full Next.js error page (which can
+// be hundreds of KB) does not flood the terminal.
+func TestDecodeJSONResponseHTMLBodyTruncated(t *testing.T) {
+	t.Parallel()
+	longBody := "<html>" + strings.Repeat("a", 500) + "</html>"
+
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(longBody))
+	})
+
+	_, err := c.GetStats()
+	if err == nil {
+		t.Fatal("expected error for HTML response, got nil")
+	}
+	// Error message must not exceed a reasonable length (~300 chars) even
+	// though the body is 500+ bytes.
+	if len(err.Error()) > 350 {
+		t.Errorf("error message too long (%d chars); body preview should be truncated: %v", len(err.Error()), err)
+	}
 }

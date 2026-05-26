@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -165,6 +166,31 @@ func NewAuthenticatedClient(baseURL, apiToken string) *Client {
 	}
 }
 
+// decodeJSONResponse reads the response body into target. If the response
+// Content-Type is not application/json it returns a human-readable error
+// that includes the HTTP status code and a preview of the raw body (first 200
+// bytes, newlines collapsed). This catches cases where the platform — or a
+// Vercel auth-protection page, a Next.js error boundary, or a reverse-proxy
+// error page — returns HTML/text with a 2xx status, which would otherwise
+// surface as the cryptic `decode failed: invalid character '<'` message.
+func decodeJSONResponse(resp *http.Response, target any) error {
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "application/json") {
+		// Read up to 200 bytes for the body preview; ignore read errors since we
+		// are already on the error path.
+		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		// Collapse whitespace so the one-line error message stays readable in
+		// terminal output even when the body is a multi-line HTML page.
+		body := strings.Join(strings.Fields(string(preview)), " ")
+		return fmt.Errorf("HTTP %d returned non-JSON response (content-type=%s): %s",
+			resp.StatusCode, ct, body)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
+		return fmt.Errorf("decode failed: %w", err)
+	}
+	return nil
+}
+
 // statusToError maps an HTTP status code to a sentinel error for expected
 // failure modes, or a generic error for unexpected codes. Returns nil for 2xx.
 func statusToError(status int, path string) error {
@@ -209,10 +235,7 @@ func (c *Client) get(path string, target any) error {
 		return err
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
-		return fmt.Errorf("decode failed: %w", err)
-	}
-	return nil
+	return decodeJSONResponse(resp, target)
 }
 
 // GetStats fetches fleet-wide statistics.
@@ -322,9 +345,7 @@ func (c *Client) post(path string, body any, target any) error {
 		return err
 	}
 	if target != nil {
-		if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
-			return fmt.Errorf("decode failed: %w", err)
-		}
+		return decodeJSONResponse(resp, target)
 	}
 	return nil
 }
