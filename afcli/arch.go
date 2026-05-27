@@ -30,7 +30,7 @@ Exit codes (assess subcommand):
 Environment:
   ANTHROPIC_API_KEY     Enables live LLM drift assessment (required for real detection)
   RENSEI_DRIFT_GATE     Gate policy: none | no-severity-high | zero-deviations | max:N
-  RENSEI_ARCH_DB        SQLite DB path (default: .agentfactory/arch-intelligence/db.sqlite)
+  RENSEI_ARCH_DB        SQLite DB path (default: .donmai/arch-intelligence/db.sqlite)
 
 Binary resolution (in order):
   1. DONMAI_ARCH_BIN env var (legacy: AGENTFACTORY_ARCH_BIN) — explicit override

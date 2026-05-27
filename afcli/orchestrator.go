@@ -43,7 +43,7 @@ func newOrchestratorCmd() *cobra.Command {
 		Use:   "orchestrator",
 		Short: "Local orchestrator — pick Linear backlog issues and dispatch agents",
 		Long: `orchestrator is the local entrypoint for OSS users without a coordinator
-daemon.  It loads .agentfactory/config.yaml, validates the git remote, picks
+daemon.  It loads .donmai/config.yaml, validates the git remote, picks
 Linear backlog issues from the configured project(s), and dispatches agents
 (Claude / Codex) to work on them.
 
@@ -64,7 +64,7 @@ Examples:
   af orchestrator --project MyProject --repo github.com/org/repo
 
   # Use custom workflow templates
-  af orchestrator --project MyProject --templates .agentfactory/templates`,
+  af orchestrator --project MyProject --templates .donmai/templates`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runOrchestrator(cmd, flags)

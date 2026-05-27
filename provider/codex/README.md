@@ -177,7 +177,7 @@ go test -tags codex_integration -timeout 120s ./provider/codex/
   text streams to avoid char-by-char log spam. Out of scope for the
   provider; the runner can coalesce its own log output.
 - **PID-file orphan-killing** — the legacy TS writes
-  `~/.agentfactory/codex-app-server.pid` to detect stranded processes
+  `~/.donmai/codex-app-server.pid` to detect stranded processes
   on restart. Wave 6 daemon owns subprocess lifecycle (REN-1408+); the
   provider does not duplicate.
 

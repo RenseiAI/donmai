@@ -131,12 +131,12 @@ func (d *mockDispatcher) Dispatch(_ context.Context, issue linear.Issue, _ orche
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// writeConfig creates .agentfactory/config.yaml under dir.
+// writeConfig creates .donmai/config.yaml under dir.
 func writeConfig(t *testing.T, dir, content string) {
 	t.Helper()
-	afDir := filepath.Join(dir, ".agentfactory")
+	afDir := filepath.Join(dir, ".donmai")
 	if err := os.MkdirAll(afDir, 0o750); err != nil { //nolint:gosec
-		t.Fatalf("mkdir .agentfactory: %v", err)
+		t.Fatalf("mkdir .donmai: %v", err)
 	}
 	path := filepath.Join(afDir, "config.yaml")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil { // #nosec G306

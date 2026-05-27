@@ -13,7 +13,7 @@ import (
 )
 
 // Embedded default templates baked into the binary at build time. The
-// .agentfactory/templates/ override path is reserved for F.5; today's
+// .donmai/templates/ override path is reserved for F.5; today's
 // builder always renders the embedded set.
 //
 //go:embed templates/*.tmpl

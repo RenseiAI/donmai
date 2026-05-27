@@ -4,7 +4,7 @@
 // packages/cli/src/lib/orchestrator-runner.ts).
 //
 // The orchestrator:
-//  1. Loads .agentfactory/config.yaml and enforces allowedProjects /
+//  1. Loads .donmai/config.yaml and enforces allowedProjects /
 //     projectPaths.
 //  2. Validates git remote get-url origin against the repository: field at
 //     startup and before each agent spawn.
@@ -207,7 +207,7 @@ func buildProviderArgs(issue linear.Issue, cfg Config) []string {
 }
 
 // New creates an Orchestrator with a real Linear client and provider dispatcher.
-// It validates and loads .agentfactory/config.yaml when present.
+// It validates and loads .donmai/config.yaml when present.
 func New(cfg Config) (*Orchestrator, error) {
 	if cfg.LinearAPIKey == "" {
 		cfg.LinearAPIKey = os.Getenv("LINEAR_API_KEY")
@@ -242,7 +242,7 @@ func New(cfg Config) (*Orchestrator, error) {
 		o.cfg.GitRoot = root
 	}
 
-	// Load .agentfactory/config.yaml (optional — not an error when absent).
+	// Load .donmai/config.yaml (optional — not an error when absent).
 	rc, rcErr := repoconfig.Load(o.cfg.GitRoot)
 	if rcErr != nil && !errors.Is(rcErr, repoconfig.ErrConfigNotFound) {
 		return nil, fmt.Errorf("orchestrator: load config: %w", rcErr)
@@ -500,7 +500,7 @@ func (o *Orchestrator) resolveProjects() ([]string, error) {
 		}
 	}
 
-	return nil, errors.New("orchestrator: no project specified (use --project or set allowedProjects in .agentfactory/config.yaml)")
+	return nil, errors.New("orchestrator: no project specified (use --project or set allowedProjects in .donmai/config.yaml)")
 }
 
 // ValidateGitRemote validates that the git remote origin URL matches the

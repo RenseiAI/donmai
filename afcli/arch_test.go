@@ -148,7 +148,7 @@ func TestArchAssess_AllFlags(t *testing.T) {
 		"--gate-policy", "max:5",
 		"--scope-level", "tenant",
 		"--project-id", "proj-123",
-		"--db", ".agentfactory/arch-intelligence/db.sqlite",
+		"--db", ".donmai/arch-intelligence/db.sqlite",
 	)
 	if err != nil {
 		t.Fatalf("arch assess all flags: %v", err)

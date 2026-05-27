@@ -19,7 +19,7 @@
 //
 //   - Does NOT shell out, make network calls, or touch the filesystem.
 //   - Does NOT know about MCP, providers, worktrees, or platform APIs.
-//   - Does NOT load .agentfactory/templates/ overrides — that is
+//   - Does NOT load .donmai/templates/ overrides — that is
 //     deferred to F.5 once a worktree-aware loader is wired (see
 //     [Builder.WithOverrides] reservation).
 //

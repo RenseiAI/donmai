@@ -64,7 +64,7 @@ type Runner struct {
 }
 
 // New creates a Runner that invokes commands relative to cwd.
-// cwd should be the repository root (the directory where .agentfactory/
+// cwd should be the repository root (the directory where .donmai/
 // resides or will reside).
 func New(cwd string) *Runner {
 	return &Runner{cwd: cwd}
