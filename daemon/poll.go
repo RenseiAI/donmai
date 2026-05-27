@@ -87,6 +87,15 @@ type PollWorkItem struct {
 	// sessions fell through to system_base.tmpl and produced developer-
 	// style behavior (`pnpm af-linear`, Bash/Write/Edit churn).
 	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
+
+	// DisallowedTools is the platform-supplied set of tool-name patterns
+	// the credential-injection layer stamps onto QueuedWork via
+	// stampCredSurfaceDisallowedTools(). Without this field Go's strict
+	// JSON decoder silently drops the platform's emit; the runner's
+	// spec_translation.go then never appends the per-workType restrictions
+	// to Spec.DisallowedTools. Mirror of the v0.9.3 SystemPromptOverride
+	// fix — opaque forwarder only, no new logic.
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
 }
 
 // PollStageBudget mirrors the platform's StageBudget shape so the
@@ -586,6 +595,7 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		StageLifecycle:       item.StageLifecycle,
 		StageSourceEventID:   item.StageSourceEventID,
 		SystemPromptOverride: item.SystemPromptOverride,
+		DisallowedTools:      item.DisallowedTools,
 	}
 }
 

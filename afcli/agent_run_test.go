@@ -339,6 +339,40 @@ func TestDetailToQueuedWork_ModelProfileEmptyProviderIDFallback(t *testing.T) {
 	}
 }
 
+// TestDetailToQueuedWork_DisallowedToolsForwarded verifies that
+// DisallowedTools stamped by the platform's credential-injection layer
+// is forwarded from SessionDetail into the runner's QueuedWork.
+// Mirrors the v0.9.3 SystemPromptOverride precedent.
+func TestDetailToQueuedWork_DisallowedToolsForwarded(t *testing.T) {
+	cases := []struct {
+		name            string
+		disallowedTools []string
+		wantLen         int
+	}{
+		{"nil — omitted", nil, 0},
+		{"single pattern", []string{"WebSearch"}, 1},
+		{"multiple patterns", []string{"WebSearch", "WebFetch", "Bash(curl:*)"}, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &daemon.SessionDetail{
+				SessionID:       "sess-dt",
+				DisallowedTools: tc.disallowedTools,
+				ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+			}
+			qw := detailToQueuedWork(d)
+			if got := len(qw.DisallowedTools); got != tc.wantLen {
+				t.Errorf("DisallowedTools len = %d, want %d; got %v", got, tc.wantLen, qw.DisallowedTools)
+			}
+			for i, pattern := range tc.disallowedTools {
+				if i < len(qw.DisallowedTools) && qw.DisallowedTools[i] != pattern {
+					t.Errorf("DisallowedTools[%d] = %q, want %q", i, qw.DisallowedTools[i], pattern)
+				}
+			}
+		})
+	}
+}
+
 // TestProviderNameFromDetail_PrefersModelProfile verifies the log-line
 // helper reads ModelProfile.ProviderID first.
 func TestProviderNameFromDetail_PrefersModelProfile(t *testing.T) {
