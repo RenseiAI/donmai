@@ -463,6 +463,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			StageLifecycle:       d.StageLifecycle,
 			StageSourceEventID:   d.StageSourceEventID,
 			SystemPromptOverride: d.SystemPromptOverride,
+			DisallowedTools:      d.DisallowedTools,
 		},
 		Branch:      d.Branch,
 		WorkerID:    d.WorkerID,
