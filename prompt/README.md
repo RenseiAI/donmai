@@ -57,7 +57,7 @@ go test ./prompt -update
 - Pure: no shell-outs, no HTTP, no filesystem reads.
 - Knows nothing about MCP servers, providers, worktrees, or the
   platform API.
-- Does NOT load `.agentfactory/templates/` overrides — that is deferred
+- Does NOT load `.donmai/templates/` overrides — that is deferred
   to F.5 once a worktree-aware loader is wired.
 
 ## References

@@ -22,7 +22,7 @@ func newCodeCmd() *cobra.Command {
 		Long: `Code intelligence commands powered by @renseiai/agentfactory-code-intelligence.
 
 All commands output JSON to stdout. The first invocation builds the index
-(~5-10s); subsequent calls reuse the persisted index from .agentfactory/code-index/.
+(~5-10s); subsequent calls reuse the persisted index from .donmai/code-index/.
 
 Optional env vars for enhanced search:
   VOYAGE_AI_API_KEY   Enables semantic vector embeddings (hybrid BM25+vector mode)

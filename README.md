@@ -275,7 +275,7 @@ donmai orchestrator --single <issue-id>         # process one specific issue
 donmai orchestrator --project <name> --dry-run  # preview without dispatching
 donmai orchestrator --project <name> --max 5    # cap concurrent dispatches
 donmai orchestrator --project <name> --repo github.com/org/repo
-donmai orchestrator --project <name> --templates .agentfactory/templates
+donmai orchestrator --project <name> --templates .donmai/templates
 ```
 
 **Environment**: `LINEAR_API_KEY` required.

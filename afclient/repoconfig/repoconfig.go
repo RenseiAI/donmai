@@ -1,4 +1,4 @@
-// Package repoconfig loads and validates the .agentfactory/config.yaml file
+// Package repoconfig loads and validates the .donmai/config.yaml file
 // (RepositoryConfig kind).  It is the Go port of
 // packages/core/src/config/repository-config.ts.
 package repoconfig
@@ -48,7 +48,7 @@ func (p *projectPathValue) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-// RepositoryConfig is the top-level schema for .agentfactory/config.yaml.
+// RepositoryConfig is the top-level schema for .donmai/config.yaml.
 // Mirrors the TS RepositoryConfigSchema (minus complex sections not needed by
 // the Go orchestrator: mergeQueue, routing, quality, etc. — those are parsed
 // as raw YAML so existing config files continue to load without error).
@@ -94,13 +94,13 @@ type rawRepositoryConfig struct {
 	LinearCli       string                       `yaml:"linearCli,omitempty"`
 }
 
-// ErrConfigNotFound is returned when .agentfactory/config.yaml does not exist.
-var ErrConfigNotFound = errors.New("repoconfig: .agentfactory/config.yaml not found")
+// ErrConfigNotFound is returned when .donmai/config.yaml does not exist.
+var ErrConfigNotFound = errors.New("repoconfig: .donmai/config.yaml not found")
 
-// Load reads and validates .agentfactory/config.yaml from gitRoot.
+// Load reads and validates .donmai/config.yaml from gitRoot.
 // Returns ErrConfigNotFound when the file does not exist.
 func Load(gitRoot string) (*RepositoryConfig, error) {
-	path := filepath.Join(gitRoot, ".agentfactory", "config.yaml")
+	path := filepath.Join(gitRoot, ".donmai", "config.yaml")
 	data, err := os.ReadFile(path) //nolint:gosec
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

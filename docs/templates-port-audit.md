@@ -183,7 +183,7 @@ with raymond by registering string helpers that return `raymond.SafeString(v)`.
 - Wire into `runner/` permission gating
 
 ### Phase H+4 — Layered override + frontend discriminator
-- `Load` scans `.agentfactory/templates/` at repo root (override layer)
+- `Load` scans `.donmai/templates/` at repo root (override layer)
 - `frontend` param filters partial loading (Linear vs generic)
 - Schema validation for loaded YAMLs
 
