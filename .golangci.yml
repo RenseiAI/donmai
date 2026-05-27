@@ -1,6 +1,6 @@
 version: "2"
 
-# Linter configuration for agentfactory-tui.
+# Linter configuration for donmai.
 
 linters:
   default: none

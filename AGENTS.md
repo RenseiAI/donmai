@@ -16,7 +16,7 @@ The library surface (`afclient`, `afcli`, `worker`) is exposed so other Go binar
 
 ## Legacy AgentFactory reference
 
-The legacy TypeScript AgentFactory project lives in a sibling directory: `../agentfactory/` (worktrees: `../agentfactory.wt/`). Issue descriptions in this project reference paths like `packages/cli/src/governor.ts` — those resolve relative to that legacy repo, e.g. `../agentfactory/packages/cli/src/governor.ts`.
+The legacy TypeScript AgentFactory project lives in a sibling directory: `../donmai-libraries/`. Issue descriptions in this project reference paths like `packages/cli/src/governor.ts` — those resolve relative to that legacy repo, e.g. `../donmai-libraries/packages/cli/src/governor.ts`.
 
 Key packages there:
 
