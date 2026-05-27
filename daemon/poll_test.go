@@ -655,6 +655,40 @@ func TestPollItemToSessionDetail_URLMatchSilencesProjectNameMiss(t *testing.T) {
 	}
 }
 
+// TestPollItemToSessionDetail_DisallowedToolsForwarded verifies that
+// DisallowedTools stamped by the platform's credential-injection layer
+// survives the PollWorkItem → SessionDetail forwarding step.
+// Mirrors the v0.9.3 SystemPromptOverride precedent.
+func TestPollItemToSessionDetail_DisallowedToolsForwarded(t *testing.T) {
+	cases := []struct {
+		name            string
+		disallowedTools []string
+		wantLen         int
+	}{
+		{"nil — omitted", nil, 0},
+		{"empty slice", []string{}, 0},
+		{"single pattern", []string{"WebSearch"}, 1},
+		{"multiple patterns", []string{"WebSearch", "WebFetch", "Bash(curl:*)"}, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item := PollWorkItem{
+				SessionID:       "sess-dt",
+				DisallowedTools: tc.disallowedTools,
+			}
+			detail := pollItemToSessionDetail(item, nil, "", "", "")
+			if got := len(detail.DisallowedTools); got != tc.wantLen {
+				t.Errorf("DisallowedTools len = %d, want %d; got %v", got, tc.wantLen, detail.DisallowedTools)
+			}
+			for i, pattern := range tc.disallowedTools {
+				if i < len(detail.DisallowedTools) && detail.DisallowedTools[i] != pattern {
+					t.Errorf("DisallowedTools[%d] = %q, want %q", i, detail.DisallowedTools[i], pattern)
+				}
+			}
+		})
+	}
+}
+
 // TestPollItemToSessionSpec_DoesNotWarn confirms that the spec
 // builder runs silently — the warn surfaces from the SessionDetail
 // builder so the same poll item can't produce two identical warns

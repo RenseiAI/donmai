@@ -125,6 +125,13 @@ type SessionDetail struct {
 	// Read by `prompt/builder.go` (already wired) — this field closes
 	// the daemon→runner wire-shape gap. SUP-1840 precedent.
 	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
+
+	// DisallowedTools forwards the platform-stamped credential-surface
+	// tool restrictions from PollWorkItem onto the runner's QueuedWork.
+	// Consumed by runner/spec_translation.go (already wired via 70bf4c0)
+	// — this field closes the daemon→runner wire-shape gap.
+	// Mirror of the v0.9.3 SystemPromptOverride fix.
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
 }
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in
