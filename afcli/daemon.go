@@ -19,6 +19,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	daemonRuntime "github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/installer"
+	"github.com/RenseiAI/donmai/internal/anontoken"
 )
 
 // daemonDoer is the interface used by daemon subcommands. It is satisfied by
@@ -162,6 +163,22 @@ func newDaemonInstallCmd() *cobra.Command {
 					"warning: failed to wipe cached daemon JWT: %v\n", wipeErr)
 			} else if wiped {
 				_, _ = fmt.Fprintf(out, "Cleared cached JWT at %s.\n", daemonRuntime.DefaultJWTPath())
+			}
+
+			// Mint (or read) the machine's anon token so the user can
+			// connect this machine to the donmai dashboard on first install.
+			dashBaseURL := os.Getenv("DONMAI_API_URL")
+			if dashBaseURL == "" {
+				dashBaseURL = "https://donmai.dev/dashboard"
+			}
+			tok, justMinted, tokErr := anontoken.EnsureToken()
+			if tokErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"warning: failed to ensure machine token: %v\n", tokErr)
+			} else if justMinted {
+				_, _ = fmt.Fprintln(out)
+				_, _ = fmt.Fprintln(out, "First run: connect this machine to the donmai dashboard:")
+				_, _ = fmt.Fprintf(out, "  %s\n", anontoken.ClaimURL(tok, dashBaseURL))
 			}
 
 			_, _ = fmt.Fprintln(out)
