@@ -119,6 +119,12 @@ type SessionDetail struct {
 	// StageSourceEventID is the source CloudEvent id the stage trigger
 	// normaliser emitted. Carried for end-to-end audit correlation.
 	StageSourceEventID string `json:"stageSourceEventId,omitempty"`
+
+	// SystemPromptOverride forwards the per-session platform-supplied
+	// system prompt from PollWorkItem onto the runner's QueuedWork.
+	// Read by `prompt/builder.go` (already wired) — this field closes
+	// the daemon→runner wire-shape gap. SUP-1840 precedent.
+	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
 }
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in

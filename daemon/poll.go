@@ -77,6 +77,16 @@ type PollWorkItem struct {
 	StageBudget        *PollStageBudget `json:"stageBudget,omitempty"`
 	StageLifecycle     map[string]any   `json:"stageLifecycle,omitempty"`
 	StageSourceEventID string           `json:"stageSourceEventId,omitempty"`
+
+	// SystemPromptOverride is the per-session platform-supplied system
+	// prompt that replaces the runner's default system_base.tmpl render
+	// when non-empty. The leaf consumer at `prompt/builder.go` already
+	// reads `qw.SystemPromptOverride`; this struct field is the wire-
+	// shape forwarder. Without it Go's strict JSON decoder drops the
+	// platform's emit (unknown-field discard) — SUP-1840 backlog-writer
+	// sessions fell through to system_base.tmpl and produced developer-
+	// style behavior (`pnpm af-linear`, Bash/Write/Edit churn).
+	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
 }
 
 // PollStageBudget mirrors the platform's StageBudget shape so the
@@ -570,11 +580,12 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		WorkerID:           workerID,
 		AuthToken:          authToken,
 		PlatformURL:        platformURL,
-		StagePrompt:        item.StagePrompt,
-		StageID:            item.StageID,
-		StageBudget:        item.StageBudget,
-		StageLifecycle:     item.StageLifecycle,
-		StageSourceEventID: item.StageSourceEventID,
+		StagePrompt:          item.StagePrompt,
+		StageID:              item.StageID,
+		StageBudget:          item.StageBudget,
+		StageLifecycle:       item.StageLifecycle,
+		StageSourceEventID:   item.StageSourceEventID,
+		SystemPromptOverride: item.SystemPromptOverride,
 	}
 }
 
