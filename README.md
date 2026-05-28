@@ -1,10 +1,10 @@
-# agentfactory-tui
+# donmai
 
-> **Status: alpha** — APIs and command flags are stabilising. See [CHANGELOG.md](./CHANGELOG.md) for the change log and [RELEASING.md](./RELEASING.md) for the release process.
+> **Status: alpha.** APIs and command flags are stabilising. See [CHANGELOG.md](./CHANGELOG.md) for the change log and [RELEASING.md](./RELEASING.md) for the release process.
 
-`af` is the open-source CLI and terminal dashboard for AgentFactory AI agent fleets. It is the single binary for every OSS operator task: running the three-process stack locally, managing agents and sessions, querying issue trackers, and inspecting fleet health.
+`donmai` is the open-source CLI and terminal dashboard for Rensei agent fleets. It is the single binary for every OSS operator task: running the three-process stack locally, managing agents and sessions, querying issue trackers, and inspecting fleet health.
 
-**Binary**: `af`
+**Binary**: `donmai`
 **Module**: `github.com/RenseiAI/donmai`
 
 ---
@@ -41,13 +41,13 @@
 ### Homebrew (macOS / Linux, recommended)
 
 ```bash
-brew install donmai
+brew install RenseiAI/homebrew-tap/donmai
 ```
 
-### go install (requires Go 1.22+)
+### go install (requires Go 1.25+)
 
 ```bash
-go install github.com/RenseiAI/donmai/cmd/af@latest
+go install github.com/RenseiAI/donmai/cmd/donmai@latest
 ```
 
 ### GitHub release download
@@ -56,18 +56,19 @@ Pre-built binaries for macOS (arm64, amd64) and Linux (arm64, amd64) are
 attached to every release on the
 [releases page](https://github.com/RenseiAI/donmai/releases).
 
+Example for macOS arm64 (replace `0.9.4` with the version you want):
+
 ```bash
-# Example — macOS arm64
-curl -fsSL https://github.com/RenseiAI/donmai/releases/latest/download/af_darwin_arm64.tar.gz \
-  | tar -xz -C /usr/local/bin af
+curl -fsSL https://github.com/RenseiAI/donmai/releases/download/v0.9.4/donmai_0.9.4_darwin_arm64.tar.gz \
+  | tar -xz -C /usr/local/bin donmai
 ```
 
 ### Build from source
 
 ```bash
 git clone https://github.com/RenseiAI/donmai
-cd agentfactory-tui
-make build        # produces bin/af
+cd donmai
+make build        # produces bin/donmai
 ```
 
 ---
@@ -118,7 +119,7 @@ walkthrough).
 
 ## Three-process model
 
-`af` manages three cooperating processes on your local machine. Each has a
+`donmai` manages three cooperating processes on your local machine. Each has a
 distinct role; together they form the complete OSS execution pipeline.
 
 ```
@@ -253,7 +254,7 @@ donmai governor status
 
 Legacy local process-manager commands for standalone OSS debugging. `donmai daemon`
 is the primary host lifecycle surface for normal operation, while these commands
-remain available in the `af` binary for users who need the older foreground
+remain available in the `donmai` binary for users who need the older foreground
 worker host or PID-file fleet flow.
 
 ```bash
@@ -506,7 +507,7 @@ Example: `donmai admin merge-queue list --repo my-org/my-repo`:
 ## Migration from the legacy TypeScript CLI
 
 If you are moving from the previous TypeScript-based `pnpm af-*` scripts, see
-[migration-from-legacy-cli.md](https://github.com/RenseiAI/agentfactory/blob/main/docs/migration-from-legacy-cli.md)
+[migration-from-legacy-cli.md](https://github.com/RenseiAI/donmai-libraries/blob/main/docs/migration-from-legacy-cli.md)
 (REN-1365 in flight).
 
 ---
@@ -531,7 +532,7 @@ make run-status-mock # Run status with mock data
 The public library surface (`afclient`, `afcli`, `worker`) is designed to be
 imported by downstream consumers. Embedders use `afcli.RegisterCommands` and
 extend the generic OSS command set with their own subcommands. The standalone
-`af` binary opts into legacy worker/fleet process-manager commands; embedders
+`donmai` binary opts into legacy worker/fleet process-manager commands; embedders
 that want the daemon-only lifecycle surface can leave those commands disabled.
 
 See `AGENTS.md` for the full package layout and contributor guide. The
