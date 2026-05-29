@@ -146,12 +146,35 @@ type kitManifestTOML struct {
 	Detect struct {
 		Files     []string          `toml:"files"`
 		FilesAll  []string          `toml:"files_all"`
+		NotFiles  []string          `toml:"not_files"`
 		Exec      string            `toml:"exec"`
 		Toolchain map[string]string `toml:"toolchain"`
 	} `toml:"detect"`
 
 	Provide struct {
-		Commands        map[string]string `toml:"commands"`
+		Commands map[string]string `toml:"commands"`
+		// CommandsOverride is OS-keyed command overlays:
+		// [provide.commands_override.<os>] → {name: cmd} (005:209-214).
+		// Most-specific (OS-keyed) wins over [provide.commands].
+		CommandsOverride map[string]map[string]string `toml:"commands_override"`
+		// ToolchainInstall is OS-keyed base-toolchain install scripts:
+		// [provide.toolchain_install.<os>] → {key: cmd} (005:196-208).
+		// Keys are arbitrary (e.g. "java_17", "maven"); values are shell
+		// commands the workarea/sandbox provider runs to install the base
+		// toolchain. Parsed here so K1's Compose + KitProvisioner can
+		// execute them; previously dropped by the permissive decoder.
+		ToolchainInstall map[string]map[string]string `toml:"toolchain_install"`
+		// Hooks are the post_acquire / pre_release lifecycle scripts
+		// (005:216-223). Generic single-string commands plus an optional
+		// OS-keyed overlay ([provide.hooks.os.<os>]); most-specific wins.
+		Hooks struct {
+			PostAcquire string `toml:"post_acquire"`
+			PreRelease  string `toml:"pre_release"`
+			OS          map[string]struct {
+				PostAcquire string `toml:"post_acquire"`
+				PreRelease  string `toml:"pre_release"`
+			} `toml:"os"`
+		} `toml:"hooks"`
 		ToolPermissions []struct {
 			Shell string `toml:"shell"`
 		} `toml:"tool_permissions"`
@@ -850,6 +873,24 @@ func manifestToKitManifest(m kitManifestTOML, k afclient.Kit) afclient.KitManife
 		Order:                m.Composition.Order,
 		DetectToolchain:      copyStringMap(m.Detect.Toolchain),
 		Commands:             copyStringMap(m.Provide.Commands),
+		CommandsOverride:     copyStringMapMap(m.Provide.CommandsOverride),
+		ToolchainInstall:     copyStringMapMap(m.Provide.ToolchainInstall),
+	}
+	if h := m.Provide.Hooks; h.PostAcquire != "" || h.PreRelease != "" || len(h.OS) > 0 {
+		hooks := &afclient.KitHooks{
+			PostAcquire: h.PostAcquire,
+			PreRelease:  h.PreRelease,
+		}
+		if len(h.OS) > 0 {
+			hooks.OS = make(map[string]afclient.KitHookEntry, len(h.OS))
+			for osKey, e := range h.OS {
+				hooks.OS[osKey] = afclient.KitHookEntry{
+					PostAcquire: e.PostAcquire,
+					PreRelease:  e.PreRelease,
+				}
+			}
+		}
+		out.Hooks = hooks
 	}
 	for _, s := range m.Provide.MCPServers {
 		out.MCPServerNames = append(out.MCPServerNames, s.Name)
@@ -919,6 +960,19 @@ func copyStringMap(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
 	for k, v := range in {
 		out[k] = v
+	}
+	return out
+}
+
+// copyStringMapMap deep-copies an OS-keyed map-of-string-maps (the shape
+// of [provide.toolchain_install.<os>] and [provide.commands_override.<os>]).
+func copyStringMapMap(in map[string]map[string]string) map[string]map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]string, len(in))
+	for k, v := range in {
+		out[k] = copyStringMap(v)
 	}
 	return out
 }

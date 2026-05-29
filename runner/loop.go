@@ -145,6 +145,59 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 			"branch", branch, "err", gerr)
 	}
 
+	// 2b. Provision kit toolchain into the worktree (Seam 2 / 006).
+	//
+	// Cloud sandboxes boot bare; the kit's [provide.toolchain_install.<os>]
+	// scripts + the post_acquire hook must run against the acquired
+	// worktree BEFORE the agent spawns ("Kit provide() runs against
+	// acquired workarea; toolchain is pre-set"). A non-zero exit aborts the
+	// session here — the agent never starts (005:357 "failure of any
+	// aborts"). pre_release runs best-effort on teardown via defer.
+	//
+	// Guarded: only runs when a KitDetector is wired AND the repo's
+	// detected kits compose a non-empty demand. Zero-kit sessions skip this
+	// entirely (additive — pre-K1 behaviour preserved). Mirrors the
+	// opt-in shape of step 5a's kit-skills load.
+	if r.kitDetector != nil {
+		targetOS := r.kitTargetOS
+		if targetOS == "" {
+			targetOS = kit.MustResolveOS()
+		}
+		views, detErr := r.kitDetector(wpath, targetOS)
+		if detErr != nil {
+			res.Status = "failed"
+			res.FailureMode = FailureKitProvision
+			res.Error = fmt.Sprintf("kit detect: %v", detErr)
+			return res, detErr
+		}
+		demand, cmpErr := kit.Compose(views, targetOS)
+		if cmpErr != nil {
+			res.Status = "failed"
+			res.FailureMode = FailureKitProvision
+			res.Error = fmt.Sprintf("kit compose: %v", cmpErr)
+			return res, cmpErr
+		}
+		if !demand.IsEmpty() {
+			r.logger.Info("kit toolchain provision starting",
+				"sessionId", qw.SessionID,
+				"os", demand.OS,
+				"kits", demand.Kits,
+				"installSteps", len(demand.ToolchainInstall),
+				"postAcquireSteps", len(demand.PostAcquire),
+			)
+			execer := shellExecer{baseEnv: buildSessionEnv(qw)}
+			provisioner := kit.NewKitProvisioner(r.logger)
+			if provErr := provisioner.Provision(ctx, execer, wpath, demand); provErr != nil {
+				res.Status = "failed"
+				res.FailureMode = FailureKitProvision
+				res.Error = provErr.Error()
+				return res, provErr // Seam 2: agent never spawns
+			}
+			// pre_release on teardown — best-effort, never fatal (005:218).
+			defer provisioner.Release(context.Background(), execer, wpath, demand)
+		}
+	}
+
 	// 3. Compose env. Daemon is expected to inject the resolved
 	// credential into qw.AuthToken's matching env var via Spec.Env;
 	// we forward whatever the caller set plus the standard session

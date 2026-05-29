@@ -153,7 +153,27 @@ type Options struct {
 	// relative to the Kit's manifest directory) and priority for
 	// ordering the merged system-prompt append block.
 	KitSkillSources []kit.KitSkillSource
+
+	// KitDetector resolves the kit manifests that apply to a provisioned
+	// worktree, ordered foundation → framework → project. The daemon
+	// wires this to KitRegistry.DetectForRepo over its active kits; nil
+	// disables kit toolchain provisioning entirely (the runner behaves
+	// exactly as before K1). Computed inside the runner because the runner
+	// owns the worktree path (K1.4); mirrors how KitSkillSources is
+	// daemon-populated.
+	KitDetector KitDetector
+
+	// KitTargetOS overrides the OS the kit toolchain demand is composed
+	// for. Empty falls back to the host OS (kit.MustResolveOS). The daemon
+	// sets this to the SANDBOX OS ("linux") for cloud-targeted sessions so
+	// install scripts match the sandbox, not the dispatching host (OD-2).
+	KitTargetOS string
 }
+
+// KitDetector resolves the ordered kit manifests that apply to a worktree
+// at repoRoot for targetOS (foundation → framework → project). Returns an
+// empty slice when no kit applies. Implemented by KitRegistry.DetectForRepo.
+type KitDetector func(repoRoot, targetOS string) ([]kit.ManifestView, error)
 
 // Runner is the long-lived per-daemon orchestrator. Build one via
 // [New] at daemon startup and call [Runner.Run] for every claimed
@@ -183,6 +203,8 @@ type Runner struct {
 	skipPostSession    bool
 	hbInterval         time.Duration
 	kitSkillSources    []kit.KitSkillSource
+	kitDetector        KitDetector
+	kitTargetOS        string
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session
@@ -228,6 +250,8 @@ func New(opts Options) (*Runner, error) {
 		skipPostSession:    opts.SkipPostSession,
 		hbInterval:         opts.HeartbeatInterval,
 		kitSkillSources:    opts.KitSkillSources,
+		kitDetector:        opts.KitDetector,
+		kitTargetOS:        opts.KitTargetOS,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
