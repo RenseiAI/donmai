@@ -64,7 +64,7 @@ func demandFixture() *ToolchainDemand {
 
 func TestProvisionRunsInOrder(t *testing.T) {
 	x := &recordingExecer{}
-	p := NewKitProvisioner(nil)
+	p := NewProvisioner(nil)
 	if err := p.Provision(context.Background(), x, "/work", demandFixture()); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestProvisionRunsInOrder(t *testing.T) {
 
 func TestProvisionAbortsOnNonZeroExit(t *testing.T) {
 	x := &recordingExecer{failOn: "install-pnpm", failCode: 3}
-	p := NewKitProvisioner(nil)
+	p := NewProvisioner(nil)
 	err := p.Provision(context.Background(), x, "/work", demandFixture())
 	if err == nil {
 		t.Fatal("expected abort on non-zero exit")
@@ -106,7 +106,7 @@ func TestProvisionAbortsOnNonZeroExit(t *testing.T) {
 
 func TestProvisionAbortsOnExecError(t *testing.T) {
 	x := &recordingExecer{errOn: "install-node"}
-	p := NewKitProvisioner(nil)
+	p := NewProvisioner(nil)
 	err := p.Provision(context.Background(), x, "/work", demandFixture())
 	if err == nil {
 		t.Fatal("expected abort on exec error")
@@ -121,7 +121,7 @@ func TestProvisionAbortsOnExecError(t *testing.T) {
 
 func TestProvisionTimeout(t *testing.T) {
 	x := &recordingExecer{block: "install-node"}
-	p := NewKitProvisioner(nil)
+	p := NewProvisioner(nil)
 	p.Timeout = 50 * time.Millisecond
 	start := time.Now()
 	err := p.Provision(context.Background(), x, "/work", demandFixture())
@@ -135,7 +135,7 @@ func TestProvisionTimeout(t *testing.T) {
 
 func TestProvisionEmptyDemandNoop(t *testing.T) {
 	x := &recordingExecer{}
-	p := NewKitProvisioner(nil)
+	p := NewProvisioner(nil)
 	if err := p.Provision(context.Background(), x, "/work", &ToolchainDemand{}); err != nil {
 		t.Fatalf("empty demand should be a no-op, got %v", err)
 	}
@@ -145,7 +145,7 @@ func TestProvisionEmptyDemandNoop(t *testing.T) {
 }
 
 func TestProvisionNilExecer(t *testing.T) {
-	p := NewKitProvisioner(nil)
+	p := NewProvisioner(nil)
 	if err := p.Provision(context.Background(), nil, "/work", demandFixture()); err == nil {
 		t.Error("expected error when Execer is nil and demand non-empty")
 	}
@@ -153,7 +153,7 @@ func TestProvisionNilExecer(t *testing.T) {
 
 func TestReleaseRunsPreRelease(t *testing.T) {
 	x := &recordingExecer{}
-	p := NewKitProvisioner(nil)
+	p := NewProvisioner(nil)
 	p.Release(context.Background(), x, "/work", demandFixture())
 	got := x.recorded()
 	if len(got) != 1 || got[0] != "cleanup" {
@@ -164,7 +164,7 @@ func TestReleaseRunsPreRelease(t *testing.T) {
 func TestReleaseBestEffortOnFailure(t *testing.T) {
 	// A failing pre_release must not panic / must be swallowed.
 	x := &recordingExecer{failOn: "cleanup", failCode: 1}
-	p := NewKitProvisioner(nil)
+	p := NewProvisioner(nil)
 	p.Release(context.Background(), x, "/work", demandFixture()) // returns nothing; must not panic
 	if len(x.recorded()) != 1 {
 		t.Errorf("pre_release should still be attempted, ran %v", x.recorded())
@@ -173,7 +173,7 @@ func TestReleaseBestEffortOnFailure(t *testing.T) {
 
 func TestReleaseNoPreReleaseNoop(t *testing.T) {
 	x := &recordingExecer{}
-	p := NewKitProvisioner(nil)
+	p := NewProvisioner(nil)
 	p.Release(context.Background(), x, "/work", &ToolchainDemand{OS: OSLinux})
 	if len(x.recorded()) != 0 {
 		t.Errorf("Release with no pre_release should be a no-op, ran %v", x.recorded())

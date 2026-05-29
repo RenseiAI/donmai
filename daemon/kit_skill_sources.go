@@ -1,5 +1,5 @@
-// kit_skill_sources.go — surfaces the per-kit skill sources the runner needs
-// to activate kit-provided SKILLS at runtime.
+// Package daemon — kit_skill_sources.go: surfaces the per-kit skill sources the
+// runner needs to activate kit-provided SKILLS at runtime.
 //
 // The kits pivot (commit e5c5aee4) wired KitDetector + KitTargetOS into the
 // runner-construction site but explicitly left runner.Options.KitSkillSources

@@ -1,4 +1,4 @@
-// compose.go — Kit toolchain-demand composition (K1.1 / K1.2).
+// Package kit — compose.go: Kit toolchain-demand composition (K1.1 / K1.2).
 //
 // This is the Go port of the canonical TS reference
 // donmai-libraries/packages/core/src/kits/compose.ts
