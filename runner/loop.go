@@ -154,28 +154,20 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// session here — the agent never starts (005:357 "failure of any
 	// aborts"). pre_release runs best-effort on teardown via defer.
 	//
-	// Guarded: only runs when a KitDetector is wired AND the repo's
-	// detected kits compose a non-empty demand. Zero-kit sessions skip this
-	// entirely (additive — pre-K1 behaviour preserved). Mirrors the
-	// opt-in shape of step 5a's kit-skills load.
-	if r.kitDetector != nil {
-		targetOS := r.kitTargetOS
-		if targetOS == "" {
-			targetOS = kit.MustResolveOS()
-		}
-		views, detErr := r.kitDetector(wpath, targetOS)
-		if detErr != nil {
-			res.Status = "failed"
-			res.FailureMode = FailureKitProvision
-			res.Error = fmt.Sprintf("kit detect: %v", detErr)
-			return res, detErr
-		}
-		demand, cmpErr := kit.Compose(views, targetOS)
-		if cmpErr != nil {
-			res.Status = "failed"
-			res.FailureMode = FailureKitProvision
-			res.Error = fmt.Sprintf("kit compose: %v", cmpErr)
-			return res, cmpErr
+	// Demand resolution (OD-1: explicit-overrides-detection, KITS PIVOT #3):
+	//   1. qw.Kits — the platform-resolved kit toolchain demand threaded on
+	//      the work item (composed from the agent composition's KitRef[]).
+	//      When non-nil and non-empty it is authoritative and detection is
+	//      skipped — the platform already chose the kits for this session.
+	//   2. r.kitDetector — fallback: detect kits from the cloned worktree's
+	//      files when the platform sent no demand. Requires KitDetector to
+	//      be wired (set at runner construction in afcli/agent_run.go).
+	// Zero-kit sessions (no platform demand AND no detector / no match) skip
+	// this entirely (additive — pre-K1 behaviour preserved).
+	if demand := r.resolveKitDemand(qw, wpath, res); demand != nil {
+		if res.Status == "failed" {
+			// resolveKitDemand classified a detect/compose error onto res.
+			return res, fmt.Errorf("kit demand: %s", res.Error)
 		}
 		if !demand.IsEmpty() {
 			r.logger.Info("kit toolchain provision starting",
@@ -732,6 +724,61 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 	case agent.ErrorEvent:
 		obs.errorEvent = &e
 	}
+}
+
+// resolveKitDemand returns the kit toolchain demand to provision for this
+// session, applying the explicit-overrides-detection precedence (OD-1,
+// KITS PIVOT #3):
+//
+//  1. qw.Kits — the platform-resolved demand threaded on the work item.
+//     When non-nil and non-empty it is authoritative; detection is skipped.
+//  2. r.kitDetector — fallback: detect kits from the cloned worktree at
+//     wpath and compose a demand for r.kitTargetOS (sandbox OS for cloud,
+//     host OS for local). Requires KitDetector to be wired at runner
+//     construction; nil disables the fallback entirely.
+//
+// Returns nil when there is nothing to provision (no platform demand AND no
+// detector / no detected kits) — the caller skips step 2b. On a detect or
+// compose error it stamps res.Status="failed" + FailureKitProvision and
+// returns a non-nil (non-empty) demand so the caller short-circuits Run.
+func (r *Runner) resolveKitDemand(qw QueuedWork, wpath string, res *Result) *kit.ToolchainDemand {
+	// 1. Platform-supplied demand wins (explicit overrides detection).
+	if qw.Kits != nil && !qw.Kits.IsEmpty() {
+		r.logger.Info("kit toolchain: using platform-supplied demand",
+			"sessionId", qw.SessionID,
+			"os", qw.Kits.OS,
+			"kits", qw.Kits.Kits,
+		)
+		return qw.Kits
+	}
+
+	// 2. Detection fallback — only when a detector is wired.
+	if r.kitDetector == nil {
+		return nil
+	}
+	targetOS := r.kitTargetOS
+	if targetOS == "" {
+		targetOS = kit.MustResolveOS()
+	}
+	views, detErr := r.kitDetector(wpath, targetOS)
+	if detErr != nil {
+		res.Status = "failed"
+		res.FailureMode = FailureKitProvision
+		res.Error = fmt.Sprintf("kit detect: %v", detErr)
+		// Non-nil sentinel so the caller's res.Status=="failed" branch fires.
+		return &kit.ToolchainDemand{OS: targetOS}
+	}
+	demand, cmpErr := kit.Compose(views, targetOS)
+	if cmpErr != nil {
+		res.Status = "failed"
+		res.FailureMode = FailureKitProvision
+		res.Error = fmt.Sprintf("kit compose: %v", cmpErr)
+		return &kit.ToolchainDemand{OS: targetOS}
+	}
+	if demand.IsEmpty() {
+		return nil
+	}
+	return demand
 }
 
 // classifyWorktreeErr maps a worktree.Provision error to the

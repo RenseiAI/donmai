@@ -1,5 +1,7 @@
 package prompt
 
+import "github.com/RenseiAI/donmai/internal/kit"
+
 // QueuedWork is the input contract for prompt rendering. It mirrors the
 // session payload the platform stores in Redis under
 // "agent:session:<sessionId>" and serves to the daemon via
@@ -148,6 +150,24 @@ type QueuedWork struct {
 	// by the platform's agent.dispatch_stage action when the resolved
 	// agent card carries a non-empty systemPrompt in its card jsonb.
 	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
+
+	// Kits is the platform-resolved kit toolchain demand for this session
+	// (KITS PIVOT #3). The platform composes the agent composition's
+	// KitRef[] into a kit.ToolchainDemand and threads it here so the runner
+	// runs toolchain_install + post_acquire AFTER the repo is cloned
+	// (runner/loop.go step 2b). When non-nil and non-empty it is the
+	// authoritative demand for this session and OVERRIDES the runner's
+	// repo-detection fallback (OD-1: explicit-overrides-detection). When
+	// nil/empty the runner falls back to detecting kits from the cloned
+	// worktree via its KitDetector — backward-compatible.
+	//
+	// Wire shape: "kits" (camelCase, omitempty). Opaque to the prompt
+	// renderer — consumed only by the runner loop. Mirrors the
+	// SystemPromptOverride threading: every wire hop (PollWorkItem,
+	// SessionDetail, detailToQueuedWork) carries it so Go's strict JSON
+	// decoder never drops the platform's emit (the v0.9.3
+	// SystemPromptOverride wire-gap precedent).
+	Kits *kit.ToolchainDemand `json:"kits,omitempty"`
 
 	// DisallowedTools is the platform-supplied set of additional tool
 	// patterns to block for this session. The runner APPENDS these to
