@@ -116,12 +116,43 @@ type KitManifest struct {
 	// [provide.commands]
 	Commands map[string]string `json:"commands,omitempty"`
 
+	// [provide.commands_override.<os>] — OS-keyed command overlays.
+	CommandsOverride map[string]map[string]string `json:"commandsOverride,omitempty"`
+
+	// [provide.toolchain_install.<os>] — OS-keyed base-toolchain install
+	// scripts (005:196-208). os → {key: shell command}. Surfaced so the
+	// daemon HTTP detail (GET /api/daemon/kits/<id>) exposes the demand a
+	// platform KitManifestSource can resolve into a ToolchainDemand.
+	ToolchainInstall map[string]map[string]string `json:"toolchainInstall,omitempty"`
+
+	// [provide.hooks] — post_acquire / pre_release lifecycle scripts
+	// (005:216-223), with an optional OS-keyed overlay. Single command
+	// string per hook.
+	Hooks *KitHooks `json:"hooks,omitempty"`
+
 	// Provide arrays — names/ids only for summary.
 	MCPServerNames []string `json:"mcpServerNames,omitempty"`
 	SkillFiles     []string `json:"skillFiles,omitempty"`
 	AgentIDs       []string `json:"agentIds,omitempty"`
 	A2ASkillIDs    []string `json:"a2aSkillIds,omitempty"`
 	ExtractorNames []string `json:"extractorNames,omitempty"`
+}
+
+// KitHooks carries the [provide.hooks] lifecycle scripts from a kit
+// manifest (005:216-223). PostAcquire/PreRelease are the generic
+// single-command forms; OS holds the OS-keyed overlay
+// ([provide.hooks.os.<os>]). Most-specific (OS-keyed) wins at compose
+// time.
+type KitHooks struct {
+	PostAcquire string                  `json:"postAcquire,omitempty"`
+	PreRelease  string                  `json:"preRelease,omitempty"`
+	OS          map[string]KitHookEntry `json:"os,omitempty"`
+}
+
+// KitHookEntry is one OS-keyed hook overlay inside KitHooks.OS.
+type KitHookEntry struct {
+	PostAcquire string `json:"postAcquire,omitempty"`
+	PreRelease  string `json:"preRelease,omitempty"`
 }
 
 // ListKitsResponse matches GET /api/daemon/kits.

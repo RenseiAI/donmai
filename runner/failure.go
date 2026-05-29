@@ -53,4 +53,10 @@ const (
 	// but failed to push or open a PR; diagnostics live on
 	// Result.BackstopReport.Diagnostics.
 	FailureBackstop = "backstop-failed"
+
+	// FailureKitProvision indicates a kit toolchain-install command or a
+	// post_acquire hook exited non-zero before the agent spawned (Seam 2:
+	// "no partial toolchain"). The session aborts; the agent never starts.
+	// The failing command + exit code surface via Result.Error.
+	FailureKitProvision = "kit-provision"
 )
