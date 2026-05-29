@@ -1,5 +1,5 @@
-// kit_detect.go — declarative kit detection + foundation-first ordering
-// (K1.2). Bridges the daemon's KitRegistry into the runner's compose layer
+// Package daemon — kit_detect.go: declarative kit detection + foundation-first
+// ordering (K1.2). Bridges the daemon's KitRegistry into the runner's compose layer
 // by producing []kit.ManifestView from the kits whose [detect] matchers
 // pass against a repo root.
 //
@@ -126,14 +126,14 @@ func detectMatches(m kitManifestTOML, repoRoot string) bool {
 	}
 
 	if len(m.Detect.Files) > 0 {
-		any := false
+		anyMatch := false
 		for _, f := range m.Detect.Files {
 			if exists(f) {
-				any = true
+				anyMatch = true
 				break
 			}
 		}
-		if !any {
+		if !anyMatch {
 			return false
 		}
 	}

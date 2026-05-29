@@ -59,14 +59,14 @@ func mergeExecEnv(parts ...map[string]string) []string {
 			}
 		}
 	}
-	any := false
+	overlaid := false
 	for _, p := range parts {
 		for k, v := range p {
 			merged[k] = v
-			any = true
+			overlaid = true
 		}
 	}
-	if !any && len(merged) == 0 {
+	if !overlaid && len(merged) == 0 {
 		return nil
 	}
 	out := make([]string, 0, len(merged))

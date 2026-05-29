@@ -36,7 +36,7 @@ func writeSkillKit(t *testing.T, scanDir, id string, priority int, detectFile st
 	// contract (paths relative to the manifest dir) is honored if exercised.
 	for _, sf := range skillFiles {
 		p := filepath.Join(scanDir, sf)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
 			t.Fatalf("mkdir for skill %s: %v", sf, err)
 		}
 		if err := os.WriteFile(p, []byte("# skill "+sf+"\nbody\n"), 0o600); err != nil {
@@ -55,7 +55,7 @@ func TestKitRegistry_SkillSourcesForRepo(t *testing.T) {
 	reg := NewKitRegistry([]string{scanDir})
 
 	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module x\n"), 0o600); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
 
@@ -105,7 +105,7 @@ func TestKitRegistry_SkillSourcesForRepo_DisabledOmitted(t *testing.T) {
 	reg := NewKitRegistry([]string{scanDir})
 
 	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module x\n"), 0o600); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
 
@@ -137,7 +137,7 @@ func TestKitRegistry_SkillSourcesForRepo_FlowsIntoRunnerOptions(t *testing.T) {
 	reg := NewKitRegistry([]string{scanDir})
 
 	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module x\n"), 0o600); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
 

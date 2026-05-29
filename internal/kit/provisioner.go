@@ -1,4 +1,4 @@
-// provisioner.go — KitProvisioner (K1.3): executes a composed
+// Package kit — provisioner.go: Provisioner (K1.3) executes a composed
 // ToolchainDemand against an acquired workarea before the agent spawns.
 //
 // Seam 2 contract (006 § "Seam 2"; 005:357):
@@ -27,7 +27,7 @@ import (
 // DefaultInstallTimeout bounds a full Provision run (all install commands +
 // post_acquire hooks). Toolchain installs hit the network (apt, brew,
 // curl|sh) and can be slow on a cold sandbox; 10 minutes matches the K1
-// user-approved default. Override via KitProvisioner.Timeout.
+// user-approved default. Override via Provisioner.Timeout.
 const DefaultInstallTimeout = 10 * time.Minute
 
 // Execer runs a single shell command against a workarea directory. The
@@ -42,27 +42,27 @@ type Execer interface {
 	Exec(ctx context.Context, dir, command string, env map[string]string) (exitCode int, err error)
 }
 
-// KitProvisioner executes a ToolchainDemand against a workarea. The zero
+// Provisioner executes a ToolchainDemand against a workarea. The zero
 // value is usable (nil logger → slog.Default(), zero Timeout →
-// DefaultInstallTimeout); prefer NewKitProvisioner.
-type KitProvisioner struct {
+// DefaultInstallTimeout); prefer NewProvisioner.
+type Provisioner struct {
 	log *slog.Logger
 	// Timeout bounds a single Provision call. Zero → DefaultInstallTimeout.
 	// Negative disables the provisioner-side timeout (caller owns ctx).
 	Timeout time.Duration
 }
 
-// NewKitProvisioner constructs a KitProvisioner. A nil logger falls back to
+// NewProvisioner constructs a Provisioner. A nil logger falls back to
 // slog.Default(); Timeout defaults to DefaultInstallTimeout.
-func NewKitProvisioner(log *slog.Logger) *KitProvisioner {
+func NewProvisioner(log *slog.Logger) *Provisioner {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &KitProvisioner{log: log, Timeout: DefaultInstallTimeout}
+	return &Provisioner{log: log, Timeout: DefaultInstallTimeout}
 }
 
 // logger returns the configured logger or the package default.
-func (p *KitProvisioner) logger() *slog.Logger {
+func (p *Provisioner) logger() *slog.Logger {
 	if p.log != nil {
 		return p.log
 	}
@@ -74,7 +74,7 @@ func (p *KitProvisioner) logger() *slog.Logger {
 // wrapped; remaining commands do NOT run (Seam 2: no partial toolchain).
 // A nil/empty demand is a no-op (returns nil) so zero-kit sessions skip
 // provisioning entirely.
-func (p *KitProvisioner) Provision(ctx context.Context, x Execer, dir string, d *ToolchainDemand) error {
+func (p *Provisioner) Provision(ctx context.Context, x Execer, dir string, d *ToolchainDemand) error {
 	if d.IsEmpty() {
 		return nil
 	}
@@ -135,7 +135,7 @@ func (p *KitProvisioner) Provision(ctx context.Context, x Execer, dir string, d 
 // exec error is logged under "kit.provision" but never returned, so
 // teardown is never blocked by a flaky pre_release hook (005:218). A
 // nil/empty pre_release list is a no-op.
-func (p *KitProvisioner) Release(ctx context.Context, x Execer, dir string, d *ToolchainDemand) {
+func (p *Provisioner) Release(ctx context.Context, x Execer, dir string, d *ToolchainDemand) {
 	if d == nil || len(d.PreRelease) == 0 || x == nil {
 		return
 	}

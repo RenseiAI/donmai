@@ -178,7 +178,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 				"postAcquireSteps", len(demand.PostAcquire),
 			)
 			execer := shellExecer{baseEnv: buildSessionEnv(qw)}
-			provisioner := kit.NewKitProvisioner(r.logger)
+			provisioner := kit.NewProvisioner(r.logger)
 			if provErr := provisioner.Provision(ctx, execer, wpath, demand); provErr != nil {
 				res.Status = "failed"
 				res.FailureMode = FailureKitProvision
