@@ -206,6 +206,26 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		kitTargetOS = kit.OSLinux
 	}
 
+	// Surface the active kits' [provide.skills] contributions so the runner
+	// activates kit skills at loop step 5a. This closes the follow-up the
+	// kits pivot (e5c5aee4) flagged: K1 added runner.Options.KitSkillSources
+	// and step 5a consumes it, but until now the daemon never populated it,
+	// so kit skills were inert. SkillSourcesForRepo mirrors DetectForRepo's
+	// applicability rules over the same active kits, so detection (toolchain)
+	// and skill sourcing stay consistent. The repo isn't cloned yet at this
+	// construction site, so we resolve against the daemon's current working
+	// directory; SkillSourcesForRepo returns nil (→ no kit skills) when
+	// nothing applies, which is additive/cardinal-rule-1 safe. A detection
+	// error (e.g. foundation conflict) is logged and treated as "no kit
+	// skills" rather than failing the session.
+	repoRootForKits, _ := os.Getwd()
+	kitSkillSources, kitSkillErr := kitReg.SkillSourcesForRepo(repoRootForKits, kitTargetOS)
+	if kitSkillErr != nil {
+		logger.Warn("donmai agent run: kit skill sourcing failed; proceeding without kit skills",
+			"err", kitSkillErr)
+		kitSkillSources = nil
+	}
+
 	r, err := runner.New(runner.Options{
 		Registry:                  reg,
 		WorktreeManager:           wm,
@@ -216,10 +236,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// KITS PIVOT #3 — arm runner/loop.go step 2b so kit toolchain
 		// (toolchain_install + post_acquire) runs AFTER the repo is cloned.
 		// The platform-supplied demand on the work item (qw.Kits) overrides
-		// detection; KitDetector is the fallback. KitSkillSources is NOT
-		// wired here yet — see the follow-up note below.
+		// detection; KitDetector is the fallback.
 		KitDetector: kitReg.DetectForRepo,
 		KitTargetOS: kitTargetOS,
+		// Kit skills (loop step 5a) — populated from the active kits'
+		// [provide.skills] via KitRegistry.SkillSourcesForRepo. nil = none.
+		KitSkillSources: kitSkillSources,
 		// Backstop runs by default — the daemon-spawned worker is
 		// the production code path; tests use the in-process entry.
 	})
