@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/prompt"
 	provideramp "github.com/RenseiAI/donmai/provider/amp"
@@ -184,6 +186,26 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		return preflightErr(fmt.Sprintf("result poster: %v", err))
 	}
 
+	// Activate kit toolchain provisioning (KITS PIVOT #3). This is the
+	// production runner-construction site (`donmai agent run` is what the
+	// daemon spawns per session), so it is where runner.Options' kit knobs
+	// must be set — K1 added the knobs but left them unset, so step 2b was
+	// inert. We arm:
+	//   - KitDetector: the registry's repo-detection fallback. When the
+	//     platform threads no explicit demand on the work item, the runner
+	//     detects kits from the cloned worktree (OD-1 fallback).
+	//   - KitTargetOS: "linux" for cloud sandboxes (a cloud sandbox is Linux
+	//     even when this binary runs on a macOS host, OD-2); the host GOOS
+	//     for local execution. The daemon-spawned worker for a cloud
+	//     sandbox runs INSIDE that Linux sandbox, so runtime.GOOS is already
+	//     "linux" there; for the local path runtime.GOOS is the host. Using
+	//     runtime.GOOS therefore yields the correct target in both modes.
+	kitReg := daemon.NewKitRegistry(kitScanPaths())
+	kitTargetOS, _ := kit.ResolveOS(runtime.GOOS)
+	if kitTargetOS == "" {
+		kitTargetOS = kit.OSLinux
+	}
+
 	r, err := runner.New(runner.Options{
 		Registry:                  reg,
 		WorktreeManager:           wm,
@@ -191,6 +213,13 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		CredentialProvider:        credentialCache.runnerCredentials,
 		Logger:                    logger,
 		PreserveWorktreeOnFailure: opts.preserveWT,
+		// KITS PIVOT #3 — arm runner/loop.go step 2b so kit toolchain
+		// (toolchain_install + post_acquire) runs AFTER the repo is cloned.
+		// The platform-supplied demand on the work item (qw.Kits) overrides
+		// detection; KitDetector is the fallback. KitSkillSources is NOT
+		// wired here yet — see the follow-up note below.
+		KitDetector: kitReg.DetectForRepo,
+		KitTargetOS: kitTargetOS,
 		// Backstop runs by default — the daemon-spawned worker is
 		// the production code path; tests use the in-process entry.
 	})
@@ -438,6 +467,21 @@ func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor) *runner.R
 	return reg
 }
 
+// kitScanPaths returns the kit registry scan paths the runner should use,
+// read from the daemon config's optional `kit.scanPaths` block. Falls back
+// to the default scan path when the config is absent or unreadable — the
+// runner is spawned per session and must never fail to construct just
+// because daemon.yaml is missing (a standalone-mode invocation). The
+// resolved paths feed daemon.NewKitRegistry so the runner's KitDetector
+// fallback sees the same installed kits the daemon's operator surface does.
+func kitScanPaths() []string {
+	cfg, err := daemon.LoadConfig(daemon.DefaultConfigPath())
+	if err == nil && cfg != nil && len(cfg.Kit.ScanPaths) > 0 {
+		return cfg.Kit.ScanPaths
+	}
+	return []string{daemon.DefaultKitScanPath()}
+}
+
 // detailToQueuedWork translates the daemon's SessionDetail wire shape
 // into the runner's QueuedWork. Pure function; no I/O.
 func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
@@ -463,6 +507,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			StageLifecycle:       d.StageLifecycle,
 			StageSourceEventID:   d.StageSourceEventID,
 			SystemPromptOverride: d.SystemPromptOverride,
+			Kits:                 d.Kits,
 			DisallowedTools:      d.DisallowedTools,
 		},
 		Branch:      d.Branch,

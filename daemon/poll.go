@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/RenseiAI/donmai/internal/kit"
 )
 
 // PollWorkItem mirrors one element of the platform's poll response `work[]`
@@ -87,6 +89,16 @@ type PollWorkItem struct {
 	// sessions fell through to system_base.tmpl and produced developer-
 	// style behavior (`pnpm af-linear`, Bash/Write/Edit churn).
 	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
+
+	// Kits is the platform-resolved kit toolchain demand (KITS PIVOT #3).
+	// The platform composes the agent composition's KitRef[] into a
+	// kit.ToolchainDemand and threads it on the poll payload so the daemon
+	// can forward it onto SessionDetail without interpreting it. The runner
+	// runs the demand's toolchain_install + post_acquire AFTER repo clone
+	// (runner/loop.go step 2b). Without this field Go's strict JSON decoder
+	// would silently drop the platform's emit — the same wire-gap that bit
+	// SystemPromptOverride (v0.9.3). Opaque forwarder only.
+	Kits *kit.ToolchainDemand `json:"kits,omitempty"`
 
 	// DisallowedTools is the platform-supplied set of tool-name patterns
 	// the credential-injection layer stamps onto QueuedWork via
@@ -595,6 +607,7 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		StageLifecycle:       item.StageLifecycle,
 		StageSourceEventID:   item.StageSourceEventID,
 		SystemPromptOverride: item.SystemPromptOverride,
+		Kits:                 item.Kits,
 		DisallowedTools:      item.DisallowedTools,
 	}
 }

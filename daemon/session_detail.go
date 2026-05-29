@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"sync"
+
+	"github.com/RenseiAI/donmai/internal/kit"
 )
 
 // SessionDetail is the per-session payload `donmai agent run` reads from
@@ -125,6 +127,15 @@ type SessionDetail struct {
 	// Read by `prompt/builder.go` (already wired) — this field closes
 	// the daemon→runner wire-shape gap. SUP-1840 precedent.
 	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
+
+	// Kits forwards the platform-resolved kit toolchain demand from
+	// PollWorkItem onto the runner's QueuedWork (KITS PIVOT #3). The
+	// daemon does not interpret it; the runner runs the demand's
+	// toolchain_install + post_acquire AFTER repo clone (loop.go step 2b).
+	// Mirror of the SystemPromptOverride / DisallowedTools wire-shape
+	// forwarders — closes the daemon→runner gap so the platform's emit is
+	// not dropped by the strict JSON decoder.
+	Kits *kit.ToolchainDemand `json:"kits,omitempty"`
 
 	// DisallowedTools forwards the platform-stamped credential-surface
 	// tool restrictions from PollWorkItem onto the runner's QueuedWork.
