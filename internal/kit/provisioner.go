@@ -11,10 +11,11 @@
 //     agent ("no partial toolchain"). 005:357 "failure of any aborts".
 //   - PreRelease runs on teardown, best-effort (logged, never fatal).
 //
-// Execution is abstracted behind Execer so the local worktree path
-// (exec.CommandContext "sh -c") and a future cloud-sandbox path
-// (sbx.exec()) share one provisioner, and so tests can assert ordering /
-// abort behaviour with a fake.
+// Execution is abstracted behind Execer so tests can assert ordering / abort
+// behaviour with a fake. In production only the local worktree path
+// (exec.CommandContext "sh -c", shellExecer) is used — and it is correct
+// everywhere, because the runner runs in-box (the box entrypoint is
+// `donmai agent run`). There is no separate cloud-sandbox Execer over sbx.exec().
 package kit
 
 import (
@@ -31,8 +32,13 @@ import (
 const DefaultInstallTimeout = 10 * time.Minute
 
 // Execer runs a single shell command against a workarea directory. The
-// local implementation is execCommandExecer (exec.CommandContext with
-// cmd.Dir = dir); cloud providers can implement this over sbx.exec().
+// interface is transport-agnostic, but today only shellExecer (a local
+// exec.CommandContext with cmd.Dir = dir) exists — and it is correct for both
+// local and in-sandbox execution, because the donmai runner always runs INSIDE
+// the box it installs kits for (the box's entrypoint is `donmai agent run`).
+// There is no per-provider remote Execer backed by sbx.exec(); the runner
+// installs kits in-box against the cloned worktree.
+// See runs/2026-05-28-kits-delivery/01-cloud-execer-research.md.
 //
 // Exec returns the command's exit code and a non-nil error when the
 // command could not be run at all (binary missing, ctx cancelled). A

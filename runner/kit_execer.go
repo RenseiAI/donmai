@@ -9,11 +9,20 @@ import (
 	"github.com/RenseiAI/donmai/internal/kit"
 )
 
-// shellExecer is the local-worktree implementation of kit.Execer: it runs
-// each kit-provision command via `sh -c` with cmd.Dir set to the worktree
-// and a composed env. It is the Execer used for the local runner path
-// (K1.3); cloud-sandbox providers supply their own kit.Execer backed by
-// sbx.exec() in K2.
+// shellExecer is the kit.Execer used by the donmai runner: it runs each
+// kit-provision command via `sh -c` with cmd.Dir set to the worktree and a
+// composed env.
+//
+// The runner ALWAYS executes inside the box it provisions work for: on `local`
+// it runs on the daemon host; on every cloud sandbox provider (e2b/modal/
+// daytona/docker/kubernetes) the box's entrypoint is `donmai agent run`, so the
+// runner — and therefore this shellExecer — runs in-box, against the cloned
+// worktree on the box's own filesystem. clone -> kit install -> agent spawn all
+// share one local filesystem, so shellExecer is correct everywhere the runner
+// runs. There is NO per-provider remote kit.Execer backed by sbx.exec().
+// (vercel is build-time/serverless and cannot host the runner, so kits are N/A
+// there; the platform gates vercel out of runner-bearing pools.)
+// See runs/2026-05-28-kits-delivery/01-cloud-execer-research.md.
 type shellExecer struct {
 	// baseEnv is the session env merged into every command's environment
 	// (worktree-relative install scripts read PATH / HOME / proxy vars).
