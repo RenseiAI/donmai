@@ -1,0 +1,108 @@
+name: e2b-template
+
+# Builds the `donmai-worker` E2B sandbox template in CI.
+#
+# GitHub-hosted runners provide Docker, so this avoids requiring local Docker
+# or interactive `e2b auth login`. The e2b CLI authenticates non-interactively
+# via the E2B_ACCESS_TOKEN env var (a personal/CD access token from
+# https://e2b.dev/dashboard?tab=personal, NOT the runtime E2B_API_KEY).
+#
+# This workflow is manual-only (workflow_dispatch). Add the E2B_ACCESS_TOKEN
+# repo secret before running it (Settings -> Secrets and variables -> Actions).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version stamped into the donmai binary (e.g. v0.10.0)"
+        required: false
+        default: "v0.10.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-template:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard - require E2B_ACCESS_TOKEN secret
+        env:
+          E2B_ACCESS_TOKEN: ${{ secrets.E2B_ACCESS_TOKEN }}
+        run: |
+          if [ -z "${E2B_ACCESS_TOKEN}" ]; then
+            echo "::error::E2B_ACCESS_TOKEN secret is not set."
+            echo "::error::Add it at: donmai repo Settings -> Secrets and variables -> Actions."
+            echo "::error::Get the token from https://e2b.dev/dashboard?tab=personal (a personal access token, NOT the runtime E2B_API_KEY)."
+            exit 1
+          fi
+          echo "E2B_ACCESS_TOKEN is present."
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.10"
+          check-latest: true
+
+      - name: Install e2b CLI
+        run: |
+          npm install -g @e2b/cli
+          e2b --version
+
+      - name: Cross-compile donmai binary (linux/amd64)
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+            -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o worker/e2b/donmai \
+            ./cmd/donmai
+          chmod +x worker/e2b/donmai
+          ls -lh worker/e2b/donmai
+
+      - name: Build E2B template (donmai-worker)
+        working-directory: worker/e2b
+        env:
+          E2B_ACCESS_TOKEN: ${{ secrets.E2B_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          # e2b CLI v2.10.x: `template create <name>` reads the Dockerfile from the
+          # cwd, builds it locally (Docker), and pushes it. This mirrors the proven
+          # invocation in worker/e2b/build.sh. `-c` sets the keep-alive start command
+          # (the platform e2b provider execs `donmai agent run` itself inline).
+          e2b template create donmai-worker -d e2b.Dockerfile -c "sleep infinity"
+
+      - name: Surface template ID
+        working-directory: worker/e2b
+        run: |
+          set -euo pipefail
+          echo "===================================================="
+          echo "e2b.toml after build:"
+          cat e2b.toml
+          echo "===================================================="
+          TEMPLATE_ID="$(grep -E '^[[:space:]]*template_id[[:space:]]*=' e2b.toml | head -1 | sed -E 's/.*=[[:space:]]*"?([^"]*)"?.*/\1/' || true)"
+          if [ -n "${TEMPLATE_ID}" ]; then
+            echo "::notice::donmai-worker template_id = ${TEMPLATE_ID}"
+            echo "## donmai-worker template_id: \`${TEMPLATE_ID}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Could not parse template_id from e2b.toml; check the build log above."
+          fi
+
+      - name: Commit updated e2b.toml (template_id)
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- worker/e2b/e2b.toml; then
+            echo "No changes to worker/e2b/e2b.toml; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add worker/e2b/e2b.toml
+          git commit -m "chore(e2b): record donmai-worker template id
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+          git push origin HEAD:main
