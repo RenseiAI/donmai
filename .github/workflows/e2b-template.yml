@@ -70,11 +70,17 @@ jobs:
           E2B_ACCESS_TOKEN: ${{ secrets.E2B_ACCESS_TOKEN }}
         run: |
           set -euo pipefail
-          # e2b CLI v2.10.x: `template create <name>` reads the Dockerfile from the
-          # cwd, builds it locally (Docker), and pushes it. This mirrors the proven
-          # invocation in worker/e2b/build.sh. `-c` sets the keep-alive start command
-          # (the platform e2b provider execs `donmai agent run` itself inline).
-          e2b template create donmai-worker -d e2b.Dockerfile -c "sleep infinity"
+          # e2b CLI v2.10.2: `template create` builds e2b.Dockerfile from the cwd
+          # and pushes it. The template name is passed via `-n` (a bare positional
+          # is ignored). When a start command (`-c`) is set, the CLI *requires* a
+          # matching ready command (`-r`) — for a keep-alive sandbox `true` (always
+          # ready) is sufficient. The platform e2b provider execs `donmai agent run`
+          # inline, so the start command is just a keep-alive (`sleep infinity`).
+          e2b template create \
+            -n donmai-worker \
+            -d e2b.Dockerfile \
+            -c "sleep infinity" \
+            -r "true"
 
       - name: Surface template ID
         working-directory: worker/e2b
