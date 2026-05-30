@@ -5,11 +5,10 @@
 # template definition so the image can be rebuilt deterministically. After a
 # successful `./build.sh`, the CLI will fill in / update `template_id` below.
 #
-# template_id recorded after the first successful CI build of the donmai-worker
-# e2b template (.github/workflows/e2b-template.yml). The e2b CLI prints the ID
-# to stdout but does not write it back into this file, so it is recorded here
-# manually. Re-running the workflow reuses this same template name/ID.
-template_id = "6cu5lh5gj3z2hp7s14vp"
+# NOTE: template_id is intentionally left empty — the image has not been pushed
+# to e2b yet (no E2B_ACCESS_TOKEN / Docker daemon available at authoring time).
+# See README.md "Status" section.
+template_id = ""
 template_name = "donmai-worker"
 dockerfile = "e2b.Dockerfile"
 
