@@ -11,6 +11,10 @@ package afcli
 //      to api.linear.app. Preserves the standalone `af` path AND the
 //      worker-fleet path where `donmai agent run` injects the env var into the
 //      in-session shell.
+//   1.5. No env key + WORKER_AUTH_TOKEN + DONMAI_API_URL set → in-box cloud
+//      agent. The runner exports the short-lived worker runtime JWT and the
+//      platform URL; proxy GraphQL through /api/cli/linear/graphql under that
+//      JWT (the route accepts it as an additive auth fall-through). REN-1554.
 //   2. No env key + ds() returns an authenticated *afclient.Client (rsk_ token
 //      + base URL) → platform proxy mode via `linear.NewProxiedClient`. The
 //      platform unwraps the rsk_, looks up the org's stored Linear OAuth
@@ -104,6 +108,27 @@ func apiKey() string {
 	return os.Getenv("LINEAR_ACCESS_TOKEN")
 }
 
+// workerAuthProxyCredentials resolves the in-box worker proxy credentials from
+// the environment the runner exports for cloud agents: the worker runtime JWT
+// (WORKER_AUTH_TOKEN) plus the platform base URL (DONMAI_API_URL, with the
+// deprecated AGENTFACTORY_API_URL accepted during the v1 transition). Returns
+// ok=false when either is absent, so the caller falls through to the rsk_
+// DataSource path. Mirrors the env names set in runner/loop.go buildSessionEnv.
+func workerAuthProxyCredentials() (baseURL, token string, ok bool) {
+	token = strings.TrimSpace(os.Getenv("WORKER_AUTH_TOKEN"))
+	if token == "" {
+		return "", "", false
+	}
+	baseURL = strings.TrimSpace(os.Getenv("DONMAI_API_URL"))
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(os.Getenv("AGENTFACTORY_API_URL"))
+	}
+	if baseURL == "" {
+		return "", "", false
+	}
+	return baseURL, token, true
+}
+
 // newLinearClient resolves a Linear client following the auth strategy in
 // the package header doc-comment:
 //
@@ -128,6 +153,19 @@ func newLinearClient(ds func() afclient.DataSource) (linear.Linear, error) {
 			c.BaseURL = linearTestBaseURL
 		}
 		return c, nil
+	}
+
+	// Path 1.5: in-box worker runtime JWT (REN-1554 / GAP 1). Cloud agents
+	// running under `donmai agent run` have neither a LINEAR_API_KEY nor an
+	// rsk_-authenticated DataSource — the runner exports the short-lived worker
+	// runtime JWT as WORKER_AUTH_TOKEN and the platform base URL as
+	// DONMAI_API_URL (see donmai/runner/loop.go buildSessionEnv). The platform's
+	// /api/cli/linear/graphql proxy accepts this JWT as an additive auth
+	// fall-through and resolves the org's Linear OAuth credential from it, so
+	// the same proxied-GraphQL path works in-box. NewProxiedClient sends the
+	// token as `Authorization: Bearer <token>`, which the JWT satisfies.
+	if baseURL, token, ok := workerAuthProxyCredentials(); ok {
+		return linear.NewProxiedClient(baseURL, token)
 	}
 
 	// Path 2: platform proxy (rensei login session).
