@@ -869,6 +869,67 @@ func TestLinearProxyModeViaDataSource(t *testing.T) {
 	}
 }
 
+// TestLinearWorkerAuthTokenProxyMode verifies the in-box cloud path (REN-1554 /
+// GAP 1): with no LINEAR_API_KEY and no authenticated DataSource, but with the
+// runner-exported WORKER_AUTH_TOKEN (runtime JWT) + DONMAI_API_URL, the linear
+// subcommand proxies GraphQL through /api/cli/linear/graphql with a
+// `Bearer <jwt>` auth header.
+func TestLinearWorkerAuthTokenProxyMode(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	setTestBaseURL("")
+	t.Cleanup(func() { setTestBaseURL("") })
+
+	var gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"REN-1","title":"Hello","state":{"name":"Backlog"},"team":{"name":"Rensei"},"project":null,"labels":{"nodes":[]}}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	// Runner-exported env: worker runtime JWT + platform base URL. No
+	// DataSource (nil) — exercises Path 1.5 ahead of the rsk_ DataSource path.
+	const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ3b3JrZXIifQ.sig"
+	t.Setenv("WORKER_AUTH_TOKEN", jwt)
+	t.Setenv("DONMAI_API_URL", srv.URL)
+
+	root := newLinearCmd(nil)
+	root.SilenceErrors = true
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"get-issue", "REN-1"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("worker-auth get-issue failed: %v\nout: %s", err, buf.String())
+	}
+
+	if gotPath != "/api/cli/linear/graphql" {
+		t.Errorf("path = %q, want %q", gotPath, "/api/cli/linear/graphql")
+	}
+	if gotAuth != "Bearer "+jwt {
+		t.Errorf("Authorization = %q, want Bearer <jwt>", gotAuth)
+	}
+}
+
+// TestLinearWorkerAuthTokenRequiresBaseURL pins that WORKER_AUTH_TOKEN alone
+// (no DONMAI_API_URL / AGENTFACTORY_API_URL) does NOT activate the in-box tier
+// — it falls through to the no-credentials error rather than building a client
+// with an empty base URL.
+func TestLinearWorkerAuthTokenRequiresBaseURL(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	t.Setenv("WORKER_AUTH_TOKEN", "eyJhbGciOiJIUzI1NiJ9.e30.sig")
+	t.Setenv("DONMAI_API_URL", "")
+	t.Setenv("AGENTFACTORY_API_URL", "")
+	setTestBaseURL("")
+	t.Cleanup(func() { setTestBaseURL("") })
+
+	if _, err := newLinearClient(nil); err == nil {
+		t.Fatal("expected error when WORKER_AUTH_TOKEN is set but no platform URL, got nil")
+	}
+}
+
 // TestLinearEnvWinsOverDataSource pins the precedence rule from the ADR:
 // when both `LINEAR_API_KEY` env AND an authenticated DataSource are
 // available, the env var wins. Preserves the worker-fleet path semantics.
