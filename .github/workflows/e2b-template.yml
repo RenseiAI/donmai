@@ -3,12 +3,18 @@ name: e2b-template
 # Builds the `donmai-worker` E2B sandbox template in CI.
 #
 # GitHub-hosted runners provide Docker, so this avoids requiring local Docker
-# or interactive `e2b auth login`. The e2b CLI authenticates non-interactively
-# via the E2B_ACCESS_TOKEN env var (a personal/CD access token from
-# https://e2b.dev/dashboard?tab=personal, NOT the runtime E2B_API_KEY).
+# or interactive `e2b auth login`. The e2b CLI (v2.10.x) authenticates the
+# `template create` build path non-interactively via the E2B_API_KEY env var
+# (the org/team API key from https://e2b.dev/dashboard?tab=keys). NOTE: despite
+# what an earlier version of this file claimed, `template create` does NOT use
+# E2B_ACCESS_TOKEN — that var only authenticates account-management commands.
+# Verified against @e2b/cli 2.10.2: the build path calls
+# `apiKey = process.env.E2B_API_KEY` and errors "You must be logged in ... set
+# the E2B_API_KEY environment variable" when it is missing.
 #
-# This workflow is manual-only (workflow_dispatch). Add the E2B_ACCESS_TOKEN
-# repo secret before running it (Settings -> Secrets and variables -> Actions).
+# This workflow is manual-only (workflow_dispatch). Add the E2B_API_KEY repo
+# secret before running it (Settings -> Secrets and variables -> Actions).
+# E2B_ACCESS_TOKEN is also passed through when present, for any management call.
 
 on:
   workflow_dispatch:
@@ -25,17 +31,18 @@ jobs:
   build-template:
     runs-on: ubuntu-latest
     steps:
-      - name: Guard - require E2B_ACCESS_TOKEN secret
+      - name: Guard - require E2B_API_KEY secret
         env:
-          E2B_ACCESS_TOKEN: ${{ secrets.E2B_ACCESS_TOKEN }}
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
         run: |
-          if [ -z "${E2B_ACCESS_TOKEN}" ]; then
-            echo "::error::E2B_ACCESS_TOKEN secret is not set."
+          if [ -z "${E2B_API_KEY}" ]; then
+            echo "::error::E2B_API_KEY secret is not set."
+            echo "::error::The e2b CLI 'template create' build path authenticates via E2B_API_KEY (NOT E2B_ACCESS_TOKEN)."
             echo "::error::Add it at: donmai repo Settings -> Secrets and variables -> Actions."
-            echo "::error::Get the token from https://e2b.dev/dashboard?tab=personal (a personal access token, NOT the runtime E2B_API_KEY)."
+            echo "::error::Get the key from https://e2b.dev/dashboard?tab=keys (the org/team API key)."
             exit 1
           fi
-          echo "E2B_ACCESS_TOKEN is present."
+          echo "E2B_API_KEY is present."
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,6 +74,10 @@ jobs:
       - name: Build E2B template (donmai-worker)
         working-directory: worker/e2b
         env:
+          # `template create` authenticates via E2B_API_KEY (verified against
+          # @e2b/cli 2.10.2). E2B_ACCESS_TOKEN is passed through too for any
+          # management call, but the build path requires E2B_API_KEY.
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
           E2B_ACCESS_TOKEN: ${{ secrets.E2B_ACCESS_TOKEN }}
         run: |
           set -euo pipefail
