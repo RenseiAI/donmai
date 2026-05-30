@@ -14,8 +14,20 @@
 # (both present in debian:bookworm-slim) must remain available at runtime.
 FROM debian:bookworm-slim
 
+# Base tools + GitHub CLI (`gh`). `gh` is not in Debian's default repos, so we
+# add the official GitHub CLI apt repo (REN-1554 / GAP 3). Development work
+# types open PRs via `gh pr create`; `gh` auto-authenticates from the GH_TOKEN
+# the platform threads in-box (the short-lived git clone token). arch=amd64
+# matches the e2b sandbox arch and the prebuilt linux/amd64 donmai binary.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates git curl \
+    && mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Node 20 + the Claude Code CLI. The in-box agent-runtime provider 'claude' (the
