@@ -26,7 +26,7 @@
 # (imagePullSecrets if the package is private).
 
 # --- build stage: compile donmai from source (matches .goreleaser build) ---
-FROM golang:1.24-bookworm AS build
+FROM golang:1.25-bookworm AS build
 ARG DONMAI_VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
