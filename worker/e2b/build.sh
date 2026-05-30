@@ -40,11 +40,16 @@ echo ">> building donmai $VERSION (linux/amd64) -> $HERE/donmai"
 chmod +x "$HERE/donmai"
 
 echo ">> building e2b template 'donmai-worker'"
-# e2b CLI 2.10.2: `template create <name>` reads e2b.Dockerfile from the cwd and
-# builds + pushes it. `-c` sets the sandbox start command (keep-alive, since the
-# platform provider launches `donmai agent run` itself via launchRunnerInline).
+# e2b CLI 2.10.2: `template create` reads e2b.Dockerfile from the cwd and
+# builds + pushes it. The name is passed via `-n` (a bare positional is ignored).
+# A start command (`-c`, keep-alive — the platform provider launches
+# `donmai agent run` itself via launchRunnerInline) REQUIRES a matching ready
+# command (`-r`); `true` (always ready) suffices for a keep-alive sandbox.
 # Older CLIs used `template build --name <name>`; swap if your CLI differs.
-( cd "$HERE" && e2b template create donmai-worker \
-    -d e2b.Dockerfile -c "sleep infinity" "$@" )
+( cd "$HERE" && e2b template create \
+    -n donmai-worker \
+    -d e2b.Dockerfile \
+    -c "sleep infinity" \
+    -r "true" "$@" )
 
 echo ">> done. See e2b.toml for the resulting template_id."
