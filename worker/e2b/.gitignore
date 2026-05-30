@@ -1,0 +1,3 @@
+# Compiled linux/amd64 donmai binary used as the e2b build context blob.
+# Rebuild with ./build.sh before running `e2b template build`.
+donmai
