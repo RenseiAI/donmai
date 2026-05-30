@@ -523,6 +523,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		r.runPostSession(ctx, qw, res)
 	}
 
+	// 11c. Router-learning A2 (write side). POST a routing observation so the
+	// platform updates the donmai provider×workType posterior store. Self-gates
+	// on ROUTING_RECORDER_ENABLED + required fields; best-effort, never fatal.
+	r.recordRoutingFeedback(ctx, qw, res)
+
 	// Update state.json terminal snapshot (best-effort).
 	if _, err := r.store.Update(wpath, func(s *state.State) error {
 		s.CurrentStep = "completed"
