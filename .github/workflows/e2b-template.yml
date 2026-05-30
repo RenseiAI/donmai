@@ -102,7 +102,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add worker/e2b/e2b.toml
-          git commit -m "chore(e2b): record donmai-worker template id
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+          git commit -m "chore(e2b): record donmai-worker template id" \
+            -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
           git push origin HEAD:main
