@@ -18,6 +18,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates git curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Node 20 + the Claude Code CLI. The in-box agent-runtime provider 'claude' (the
+# resolved model is Claude Opus 4.8) must be on PATH, else `donmai agent run`'s
+# registry can't register it and the runner fails "no provider registered for
+# name claude" BEFORE the clone. This is only the agent CLI — repo language
+# toolchains are still installed in-box by the kit after clone (the runner's
+# shellExecer). The org's ANTHROPIC_API_KEY arrives at runtime via the
+# credential snapshot (byok).
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm i -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # Prebuilt linux/amd64 donmai v0.10.0 binary (see worker/e2b/README.md).
 COPY donmai /usr/local/bin/donmai
 RUN chmod +x /usr/local/bin/donmai
