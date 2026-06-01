@@ -1,7 +1,7 @@
 # prompt
 
 Renders work-type-specific (system, user) prompt pairs for the
-agentfactory-tui Go agent runner.
+donmai Go agent runner.
 
 This is the v0.5.0 port of the legacy TS template subsystem
 (`../agentfactory/packages/core/src/templates/{registry,renderer}.ts`)

@@ -129,7 +129,7 @@ func TestServer_Status(t *testing.T) {
 // TestServer_Status_HostVersionOverride pins the Options.Version override
 // path: a downstream embedder (e.g. rensei-tui) that sets its own
 // version string MUST see that string in /api/daemon/status, NOT the
-// agentfactory-tui package's Version var. This is the wire that fixes
+// donmai package's Version var. This is the wire that fixes
 // the May-2026 incident where `rensei host status` reported the
 // vendored "0.7.1" forever.
 func TestServer_Status_HostVersionOverride(t *testing.T) {

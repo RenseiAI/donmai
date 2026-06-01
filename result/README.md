@@ -83,4 +83,4 @@ combines them so downstream logs see the full picture.
 - F.0.1 §5 — legacy result shape
 - Live platform routes verified at
   `platform/src/app/api/sessions/[id]/{completion,status}/route.ts`
-  (Phase 2a port of the legacy agentfactory-nextjs handlers).
+  (Phase 2a port of the legacy donmai-platform handlers).

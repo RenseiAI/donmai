@@ -7,7 +7,7 @@
  * control-plane auth surface and must not leak into agent subprocesses.
  *
  * CANONICAL SOURCE: this list is duplicated from the Go reference at
- *   agentfactory-tui/internal/credentials/blocklist.go (AgentEnvBlocklist).
+ *   donmai/internal/credentials/blocklist.go (AgentEnvBlocklist).
  * The Go file is the single source of truth; this TypeScript copy exists
  * because the OSS boundary blocks a shared import today.
  *

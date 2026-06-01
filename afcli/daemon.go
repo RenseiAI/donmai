@@ -68,7 +68,7 @@ func expandHomePath(path string) string {
 //
 // hostVersion is the embedding binary's version string; passed through to
 // `daemon run` so the daemon's HTTP /api/daemon/status reports the running
-// binary's version (not the agentfactory-tui daemon package's vendored
+// binary's version (not the donmai daemon package's vendored
 // default). Empty falls back to the daemon package's own Version var.
 func newDaemonCmd(hostVersion string) *cobra.Command {
 	return newDaemonCmdWithFactory(defaultDaemonFactory, hostVersion)

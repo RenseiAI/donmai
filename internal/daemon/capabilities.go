@@ -1,5 +1,5 @@
 // Package daemon (internal) provides substrate capability detection for the
-// local agentfactory-tui daemon.
+// local donmai daemon.
 //
 // At startup the daemon probes the host for runtimes that are actually
 // available on PATH and caches the result for the worker lifetime. The

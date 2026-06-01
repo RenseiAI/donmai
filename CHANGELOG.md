@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `agentfactory-tui` (`af` binary) are documented here.
+All notable changes to `donmai` (`af` binary) are documented here.
 
 Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores`. Unreleased work goes under `## [Unreleased]`.
 
@@ -36,7 +36,7 @@ Patch — schema fix for `ListWorkflowStates`.
 CLI Linear proxy support — `linear` subcommands can now authenticate via
 a downstream-embedder's platform login session instead of requiring a
 `LINEAR_API_KEY` env var. Per
-agentfactory-architecture/ADR-2026-05-12-cli-linear-proxy.
+donmai-architecture/ADR-2026-05-12-cli-linear-proxy.
 
 ### Features
 
@@ -71,7 +71,7 @@ agentfactory-architecture/ADR-2026-05-12-cli-linear-proxy.
 
 Activity-poster wire-format extension that lets the platform reconstruct
 Layer 6 hook events from daemon-emitted tool calls (per
-agentfactory-architecture/ADR-2026-05-12-cross-process-hook-bus-bridge),
+donmai-architecture/ADR-2026-05-12-cross-process-hook-bus-bridge),
 plus a daemon-readiness fix and a launchd KeepAlive change.
 
 ### Features

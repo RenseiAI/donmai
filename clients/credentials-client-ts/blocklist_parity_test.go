@@ -38,7 +38,7 @@ func tsBlocklistPath(t *testing.T) string {
 	if !ok {
 		t.Fatal("runtime.Caller(0) failed")
 	}
-	// thisFile == .../agentfactory-tui/clients/credentials-client-ts/blocklist_parity_test.go
+	// thisFile == .../donmai/clients/credentials-client-ts/blocklist_parity_test.go
 	dir := filepath.Dir(thisFile)
 	return filepath.Join(dir, "src", "blocklist.ts")
 }

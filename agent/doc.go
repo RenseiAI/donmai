@@ -1,5 +1,5 @@
 // Package agent declares the provider-agnostic contract for the
-// agentfactory-tui multi-provider agent-runner subsystem.
+// donmai multi-provider agent-runner subsystem.
 //
 // This package is the verbatim Go translation of the legacy TypeScript
 // type contract at:
@@ -19,7 +19,7 @@
 //	github.com/RenseiAI/donmai/agent
 //
 // It is importable by downstream consumers including rensei-tui without
-// requiring an agentfactory-tui dependency cascade. F.1.1 §1 ratifies this
+// requiring an donmai dependency cascade. F.1.1 §1 ratifies this
 // boundary.
 //
 // # Wire Format Compatibility

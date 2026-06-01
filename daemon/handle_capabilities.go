@@ -9,7 +9,7 @@
 // Architecture reference:
 //
 //	rensei-architecture/ADR-2026-05-12-capacity-pools-and-substrate-resolution.md
-//	§ Stream H sub-lane — agentfactory-tui daemon pool awareness
+//	§ Stream H sub-lane — donmai daemon pool awareness
 package daemon
 
 import (

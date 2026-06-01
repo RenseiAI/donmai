@@ -68,7 +68,7 @@ type Options struct {
 	// unless the build injected via -ldflags). Downstream embedders that
 	// ship their own binary (e.g. the rensei daemon) should set this to
 	// their own version string so /api/daemon/status reports the
-	// running binary, not whatever string agentfactory-tui's vendored
+	// running binary, not whatever string donmai's vendored
 	// source had at the time.
 	Version string
 }

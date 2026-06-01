@@ -63,7 +63,7 @@ type Config struct {
 	// reports (typically injected via -ldflags into the main package).
 	// When non-empty, `daemon run` passes it to daemon.Options.Version
 	// so /api/daemon/status reports the running binary's version
-	// instead of agentfactory-tui's vendored package default. Empty
+	// instead of donmai's vendored package default. Empty
 	// falls back to the daemon package's own Version var.
 	HostBinaryVersion string
 }

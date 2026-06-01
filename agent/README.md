@@ -43,7 +43,7 @@ verbatim. Readers of `QueuedWork.resolvedProfile` JSON across the fleet
 This package is exported at the top level of the module
 (`github.com/RenseiAI/donmai/agent`). Downstream consumers
 including `rensei-tui` import it directly without depending on the rest
-of `agentfactory-tui`. F.1.1 §1 ratifies this boundary. Do not move or
+of `donmai`. F.1.1 §1 ratifies this boundary. Do not move or
 rename without an ADR.
 
 ## The 9 capabilities

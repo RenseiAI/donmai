@@ -1,6 +1,6 @@
 # `runner/` — per-session orchestration loop
 
-> **Status:** Wave 6 / Phase F.2.6 (REN-1459). Public package; importable by `rensei-tui` without depending on the rest of `agentfactory-tui` daemon plumbing.
+> **Status:** Wave 6 / Phase F.2.6 (REN-1459). Public package; importable by `rensei-tui` without depending on the rest of `donmai` daemon plumbing.
 > **Spec:** `../../../runs/2026-05-01-wave-6-fleet-iteration/F1.1-runner-contract.md` §1 (layout) + §4 (orchestration) + §5 (failure modes).
 > **Legacy reference:** `../../../agentfactory/packages/core/src/orchestrator/{agent-spawner,event-processor,session-backstop}.ts`.
 
