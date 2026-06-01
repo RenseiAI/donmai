@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/donmai/codesurvival"
 	"github.com/RenseiAI/donmai/internal/envcompat"
 	"github.com/RenseiAI/donmai/worker"
 )
@@ -33,6 +34,26 @@ type workerStartFlags struct {
 	capabilities      []string
 	debug             bool
 	quiet             bool
+}
+
+// mergeCapabilities returns the operator-supplied capability tags with the
+// required tags appended, preserving order and removing duplicates. Used to
+// guarantee `af worker start` always advertises the code-survival-scan
+// capability regardless of operator --capabilities flags.
+func mergeCapabilities(operator []string, required ...string) []string {
+	seen := make(map[string]struct{}, len(operator)+len(required))
+	out := make([]string, 0, len(operator)+len(required))
+	for _, c := range append(append([]string{}, operator...), required...) {
+		if c == "" {
+			continue
+		}
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		out = append(out, c)
+	}
+	return out
 }
 
 // resolveWorkerToken picks the provisioning token from the --provisioning-token
@@ -135,11 +156,20 @@ func runWorkerStart(flags *workerStartFlags) error {
 
 	c := worker.NewClient(baseURL, token)
 
+	// `af worker start` ALWAYS runs the in-process code-survival-scan executor
+	// (the batch lane below), so it must advertise that capability at
+	// registration. The platform poll route gates the batchWork[] CLAIM on this
+	// capability: only a worker advertising it is handed (and can decode) a
+	// staged scan. The in-box daemon does NOT run this binary and does NOT
+	// advertise the capability, so the platform never hands it a scan it would
+	// silently drop. Merge with any operator-supplied --capabilities, deduped.
+	capabilities := mergeCapabilities(flags.capabilities, codesurvival.WorkTypeCodeSurvivalScan)
+
 	resp, err := c.Register(ctx, worker.RegisterRequest{
 		Hostname:     hostname,
 		PID:          os.Getpid(),
 		Version:      version,
-		Capabilities: flags.capabilities,
+		Capabilities: capabilities,
 		MaxAgents:    flags.maxAgents,
 	})
 	if err != nil {
@@ -165,16 +195,25 @@ func runWorkerStart(flags *workerStartFlags) error {
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
 
+	// Non-agent batch lane (RW3): the code-survival-scan executor runs IN this
+	// worker process, fully separate from the agent path. It clones a merged
+	// PR, measures line survival, and POSTs the result to the platform. A batch
+	// failure is best-effort and never touches the agent handler below.
+	survivalExec := codesurvival.NewExecutor(codesurvival.Options{
+		WorkerVersion: version,
+	})
+	batchHandler := codesurvival.BatchHandler(survivalExec)
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		perr := c.PollLoop(loopCtx, flags.pollInterval, func(item worker.WorkItem) error {
+		perr := c.PollLoopWithBatch(loopCtx, flags.pollInterval, func(item worker.WorkItem) error {
 			slog.Info("worker start: work item received", "item_id", item.ID, "type", item.Type)
 			// No actual work dispatch here — that lives in the agent
 			// runner. We simply acknowledge receipt so the fleet knows
 			// polling is alive.
 			return nil
-		})
+		}, batchHandler)
 		if perr != nil {
 			errCh <- fmt.Errorf("poll loop: %w", perr)
 			cancel()

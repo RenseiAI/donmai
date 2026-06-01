@@ -136,9 +136,53 @@ type PollRequest struct {
 // the batch of work items the coordinator has assigned to this worker
 // since the last poll (possibly empty).
 type PollResponse struct {
-	// WorkItems is the batch of work items assigned to the worker. May be
-	// empty when the coordinator has no pending work.
+	// WorkItems is the batch of agent-session work items assigned to the
+	// worker. May be empty when the coordinator has no pending work. This is
+	// the LIVE agent-dispatch lane and is handled byte-for-byte unchanged.
 	WorkItems []WorkItem `json:"work_items"`
+
+	// BatchWork is a SEPARATE lane for non-agent batch work-types (e.g.
+	// "code-survival-scan"). It is fully isolated from WorkItems: batch items
+	// are NEVER routed into the agent-session path (runner.Run /
+	// AgentRuntimeProvider), never counted toward agent quota, and never added
+	// to activeSessions. An old worker simply ignores this field (unknown JSON
+	// key) — zero impact on existing dispatch. See
+	// runs/2026-06-01-code-survival-runtime-research/03-SEAM-DESIGN.md.
+	BatchWork []BatchWorkItem `json:"batchWork,omitempty"`
+}
+
+// BatchWorkItem is the worker-package envelope for one batchWork[] item. The
+// worker package stays agnostic of any single batch work-type: it reads only
+// the WorkType discriminant and keeps the full item as Raw json so the batch
+// router can decode it into the work-type-specific struct (e.g.
+// codesurvival.BatchWorkItem). This mirrors the WorkItem.Payload json.RawMessage
+// pattern for the agent lane.
+type BatchWorkItem struct {
+	// BatchJobID is the claim key (e.g. "batch:due_checkpoint:<id>"); namespaced,
+	// never a session UUID. Used for log correlation.
+	BatchJobID string `json:"batchJobId"`
+	// WorkType discriminates the batch handler (e.g. "code-survival-scan").
+	// Unknown work-types are logged + skipped (graceful degradation).
+	WorkType string `json:"workType"`
+	// Raw is the full, undecoded batch item. The router decodes it into the
+	// work-type-specific struct once WorkType is matched.
+	Raw json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON captures the full item into Raw while also surfacing the
+// BatchJobID/WorkType discriminants for routing without a second decode.
+func (b *BatchWorkItem) UnmarshalJSON(data []byte) error {
+	b.Raw = append(b.Raw[:0], data...)
+	var head struct {
+		BatchJobID string `json:"batchJobId"`
+		WorkType   string `json:"workType"`
+	}
+	if err := json.Unmarshal(data, &head); err != nil {
+		return err
+	}
+	b.BatchJobID = head.BatchJobID
+	b.WorkType = head.WorkType
+	return nil
 }
 
 // HeartbeatRequest is the body of POST /api/workers/{id}/heartbeat. It reports

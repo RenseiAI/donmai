@@ -1,0 +1,4 @@
+# Installed at image-build time (worker/Dockerfile ts-deps stage) and for local
+# `npm test`. Never committed — package.json pins the deps.
+node_modules/
+package-lock.json
