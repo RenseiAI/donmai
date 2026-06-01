@@ -1,0 +1,16 @@
+{
+  "name": "code-survival-ts-reachability",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ts-morph reachability subprocess for the donmai code-survival scan executor (RW4). Baked into the worker image; invoked via os/exec from codesurvival/reachability_ts.go.",
+  "main": "reachability.js",
+  "bin": {
+    "code-survival-ts-reachability": "reachability.js"
+  },
+  "scripts": {
+    "test": "node reachability.test.js"
+  },
+  "dependencies": {
+    "ts-morph": "^24.0.0"
+  }
+}

@@ -154,3 +154,28 @@ func TestConfigureWorkerLogging(t *testing.T) {
 		})
 	}
 }
+
+// TestMergeCapabilities verifies `af worker start` always advertises the
+// code-survival-scan capability (BLOCKER 3) and dedupes operator-supplied tags.
+func TestMergeCapabilities(t *testing.T) {
+	cases := []struct {
+		name     string
+		operator []string
+		required []string
+		want     []string
+	}{
+		{"empty_operator_gets_required", nil, []string{"code-survival-scan"}, []string{"code-survival-scan"}},
+		{"operator_preserved_required_appended", []string{"gpu"}, []string{"code-survival-scan"}, []string{"gpu", "code-survival-scan"}},
+		{"dedupe_when_operator_already_has_it", []string{"code-survival-scan"}, []string{"code-survival-scan"}, []string{"code-survival-scan"}},
+		{"drops_empty_tags", []string{"", "gpu", ""}, []string{"code-survival-scan"}, []string{"gpu", "code-survival-scan"}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := mergeCapabilities(tc.operator, tc.required...)
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("mergeCapabilities(%v, %v) = %v, want %v", tc.operator, tc.required, got, tc.want)
+			}
+		})
+	}
+}

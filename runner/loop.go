@@ -96,7 +96,26 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	}
 
 	// 1. Resolve provider.
-	provider, err := r.registry.Resolve(qw.resolvedProvider())
+	//
+	// Router-learning A5b (read side). BEFORE resolving, consult the platform's
+	// posterior selector for the best provider for this work type. Self-gates on
+	// ROUTING_SELECTOR_ENABLED (default OFF) + required coordinates; the platform
+	// flag is the authoritative kill-switch and OWNS the explicit-choice guard.
+	// Hard static fallback (= qw.resolvedProvider()) on flag-off / proxy fail /
+	// provider-not-in-candidates — so flag-off is byte-for-byte today's behaviour.
+	selectedName := qw.resolvedProvider()
+	if name, ok := r.selectProviderByPosterior(ctx, qw); ok {
+		r.logger.Info("provider overridden by posterior selection",
+			"sessionId", qw.SessionID,
+			"static", string(qw.resolvedProvider()),
+			"selected", name,
+		)
+		selectedName = agent.ProviderName(name)
+	}
+	// Reflect the provider actually run so the A2-Go reward write attributes the
+	// observation to it (not the pre-selection static choice).
+	res.ProviderName = selectedName
+	provider, err := r.registry.Resolve(selectedName)
 	if err != nil {
 		res.Status = "failed"
 		res.FailureMode = FailureProviderResolve
