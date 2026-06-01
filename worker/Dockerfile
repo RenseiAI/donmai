@@ -7,7 +7,7 @@
 # See runs/2026-05-28-kits-delivery/01-cloud-execer-research.md.
 #
 # The platform references this image as
-#   ghcr.io/renseiai/agentfactory-worker:latest
+#   ghcr.io/renseiai/donmai-worker:latest
 # from src/lib/providers/sandbox/{docker,kubernetes,modal,daytona}/index.ts.
 #
 # BUILD CONTEXT: the donmai repo ROOT (this file lives in worker/ but builds
@@ -17,8 +17,8 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     -f worker/Dockerfile \
 #     --build-arg DONMAI_VERSION=v0.11.0 \
-#     -t ghcr.io/renseiai/agentfactory-worker:v0.11.0 \
-#     -t ghcr.io/renseiai/agentfactory-worker:latest \
+#     -t ghcr.io/renseiai/donmai-worker:v0.11.0 \
+#     -t ghcr.io/renseiai/donmai-worker:latest \
 #     --push .
 #
 # Requires ghcr.io push creds (a PAT / GITHUB_TOKEN with write:packages on the

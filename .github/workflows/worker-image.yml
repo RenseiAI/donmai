@@ -45,5 +45,5 @@ jobs:
           build-args: |
             DONMAI_VERSION=${{ inputs.version || github.ref_name }}
           tags: |
-            ghcr.io/renseiai/agentfactory-worker:${{ inputs.version || github.ref_name }}
-            ghcr.io/renseiai/agentfactory-worker:latest
+            ghcr.io/renseiai/donmai-worker:${{ inputs.version || github.ref_name }}
+            ghcr.io/renseiai/donmai-worker:latest
