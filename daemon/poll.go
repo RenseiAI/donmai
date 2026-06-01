@@ -32,7 +32,7 @@ import (
 // session to the spawner. Field names follow the platform wire shape (camelCase).
 //
 // QueuedAt is a Unix-millisecond epoch number on the wire — the platform's
-// QueuedWork interface (packages/agentfactory-server work-queue.ts) defines it
+// QueuedWork interface (@donmai/server work-queue.ts) defines it
 // as `queuedAt: number`, and the Redis-stored session payload confirms a
 // numeric value (e.g. 1777658441780). v0.4.1 mistakenly typed it as `string`,
 // which caused the daemon's poll loop to fail decoding ("cannot unmarshal

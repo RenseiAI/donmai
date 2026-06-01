@@ -1,6 +1,6 @@
 # `runtime/` — cross-cutting machinery for the agent runner
 
-> **Status:** Wave 6 / Phase F.2.5 (REN-1456). Public package; importable by `rensei-tui` without depending on the rest of `agentfactory-tui`.
+> **Status:** Wave 6 / Phase F.2.5 (REN-1456). Public package; importable by `rensei-tui` without depending on the rest of `donmai`.
 > **Spec:** `../../../runs/2026-05-01-wave-6-fleet-iteration/F1.1-runner-contract.md` §1 (layout) + §5 (failure modes).
 > **Legacy reference:** `../../../agentfactory/packages/core/src/orchestrator/{state-recovery,heartbeat-writer}.ts`, `../../../agentfactory/packages/core/src/workarea/git-worktree.ts`, `../../../agentfactory/packages/cli/src/lib/worker-runner.ts`.
 

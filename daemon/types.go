@@ -32,7 +32,7 @@ import "time"
 // at build time, OR a downstream embedder (e.g. rensei-tui's daemon
 // run command) can pass its own version via `Options.Version` at
 // daemon construction. The const form pinned the value to whatever
-// agentfactory-tui's source had at vendor time, which left the
+// donmai's source had at vendor time, which left the
 // `rensei-daemon-run` HTTP /api/daemon/status endpoint reporting an
 // outdated string forever — confusing operators who saw e.g. `0.7.1`
 // even after upgrading both binaries past it.

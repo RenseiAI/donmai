@@ -1,4 +1,4 @@
-# Releasing agentfactory-tui
+# Releasing donmai
 
 This document covers the full release process for the `af` binary: version bump, changelog, goreleaser, GitHub release creation, Homebrew tap update, smoke-test checklist, and rollback.
 
@@ -25,7 +25,7 @@ This document covers the full release process for the `af` binary: version bump,
 
 ## Overview
 
-`agentfactory-tui` ships a single binary, `af`, as an open-source release under `github.com/RenseiAI/donmai`. Releases are fully automated via [goreleaser](https://goreleaser.com) triggered by a `v*` tag push. The goreleaser config is `.goreleaser.yaml` at the repo root.
+`donmai` ships a single binary, `af`, as an open-source release under `github.com/RenseiAI/donmai`. Releases are fully automated via [goreleaser](https://goreleaser.com) triggered by a `v*` tag push. The goreleaser config is `.goreleaser.yaml` at the repo root.
 
 Consumers install via Homebrew:
 
@@ -152,7 +152,7 @@ Artifacts appear in `dist/`.
 ### 6. Verify the GitHub release
 
 ```bash
-gh release view vX.Y.Z --repo RenseiAI/agentfactory-tui
+gh release view vX.Y.Z --repo RenseiAI/donmai
 ```
 
 Confirm:
@@ -215,7 +215,7 @@ Cross-compiled linux binaries skip signing entirely (the `notarize.macos` block 
 
 ### Required GitHub Actions secrets
 
-These are configured at the **org level** so both `agentfactory-tui` and `rensei-tui` pick them up. Per the AC, each has a fine-grained PAT scope where applicable.
+These are configured at the **org level** so both `donmai` and `rensei-tui` pick them up. Per the AC, each has a fine-grained PAT scope where applicable.
 
 | Secret | Description | How to derive |
 |--------|-------------|---------------|
@@ -301,7 +301,7 @@ Run these checks after installing the new binary from Homebrew or a direct downl
 
 1. Delete the GitHub release (keeps the tag):
    ```bash
-   gh release delete vX.Y.Z --repo RenseiAI/agentfactory-tui --yes
+   gh release delete vX.Y.Z --repo RenseiAI/donmai --yes
    ```
 2. Delete the tag remotely and locally:
    ```bash
