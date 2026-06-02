@@ -4,7 +4,7 @@
  * Agent-side credential loader. Exposes the same API surface in two
  * runtime modes:
  *
- *   - daemon mode: the host process sets RENSEI_CREDENTIAL_SOCKET to a
+ *   - daemon mode: the host process sets DONMAI_CREDENTIAL_SOCKET to a
  *     unix-socket path. The loader dials the socket, sends a HELLO
  *     identifying its session, and receives an INITIAL snapshot followed
  *     by zero or more UPDATE messages.
@@ -33,7 +33,7 @@ export interface Options {
    * Session identifier sent in the HELLO message.
    *
    * Required in daemon mode. If omitted, the loader checks
-   * `process.env.RENSEI_CREDENTIAL_SESSION_ID` (the convention used by
+   * `process.env.DONMAI_CREDENTIAL_SESSION_ID` (the convention used by
    * the daemon spawner). If still missing, daemon mode is skipped and
    * the loader falls back to standalone.
    *
@@ -100,17 +100,17 @@ function defaultLogger(): Logger {
  */
 export async function createLoader(options?: Options): Promise<Loader> {
   const logger = options?.logger ?? defaultLogger();
-  const socketPath = process.env.RENSEI_CREDENTIAL_SOCKET;
+  const socketPath = process.env.DONMAI_CREDENTIAL_SOCKET;
 
   if (!socketPath) {
     return makeStandaloneLoader(logger);
   }
 
   const sessionId =
-    options?.sessionId ?? process.env.RENSEI_CREDENTIAL_SESSION_ID ?? '';
+    options?.sessionId ?? process.env.DONMAI_CREDENTIAL_SESSION_ID ?? '';
   if (!sessionId) {
     logger.info(
-      'credentials-client: RENSEI_CREDENTIAL_SOCKET set but no sessionId provided; falling back to standalone mode',
+      'credentials-client: DONMAI_CREDENTIAL_SOCKET set but no sessionId provided; falling back to standalone mode',
     );
     return makeStandaloneLoader(logger);
   }

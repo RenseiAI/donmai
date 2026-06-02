@@ -8,8 +8,8 @@ import { createLoader, AGENT_ENV_BLOCKLIST, isBlocked, filterBlocklist } from '.
 
 const envSnapshot: NodeJS.ProcessEnv = {};
 const TRACKED_ENV_KEYS = [
-  'RENSEI_CREDENTIAL_SOCKET',
-  'RENSEI_CREDENTIAL_SESSION_ID',
+  'DONMAI_CREDENTIAL_SOCKET',
+  'DONMAI_CREDENTIAL_SESSION_ID',
   'FOO',
   'BAR',
   ...AGENT_ENV_BLOCKLIST,
@@ -164,8 +164,8 @@ function silentLogger(): { info: ReturnType<typeof vi.fn>; warn: ReturnType<type
 beforeEach(() => {
   saveEnv();
   // Clean slate for each test.
-  delete process.env.RENSEI_CREDENTIAL_SOCKET;
-  delete process.env.RENSEI_CREDENTIAL_SESSION_ID;
+  delete process.env.DONMAI_CREDENTIAL_SOCKET;
+  delete process.env.DONMAI_CREDENTIAL_SESSION_ID;
 });
 
 afterEach(() => {
@@ -174,7 +174,7 @@ afterEach(() => {
 
 describe('blocklist helpers', () => {
   it('isBlocked returns true for blocklisted names', () => {
-    expect(isBlocked('RENSEI_DAEMON_JWT')).toBe(true);
+    expect(isBlocked('DONMAI_DAEMON_JWT')).toBe(true);
     expect(isBlocked('WORKER_API_KEY')).toBe(true);
     expect(isBlocked('FOO')).toBe(false);
   });
@@ -182,7 +182,7 @@ describe('blocklist helpers', () => {
   it('filterBlocklist removes blocked entries and copies others', () => {
     const out = filterBlocklist({
       FOO: 'bar',
-      RENSEI_DAEMON_JWT: 'secret',
+      DONMAI_DAEMON_JWT: 'secret',
       BAR: 'baz',
     });
     expect(out).toEqual({ FOO: 'bar', BAR: 'baz' });
@@ -206,14 +206,14 @@ describe('createLoader — standalone mode', () => {
   });
 
   it('blocks blocklisted names even in standalone mode', async () => {
-    process.env.RENSEI_DAEMON_JWT = 'secret';
+    process.env.DONMAI_DAEMON_JWT = 'secret';
     process.env.FOO = 'visible';
     const loader = await createLoader({ logger: silentLogger() });
     try {
-      expect(loader.get('RENSEI_DAEMON_JWT')).toBeUndefined();
+      expect(loader.get('DONMAI_DAEMON_JWT')).toBeUndefined();
       expect(loader.get('FOO')).toBe('visible');
       const all = loader.all();
-      expect(all.RENSEI_DAEMON_JWT).toBeUndefined();
+      expect(all.DONMAI_DAEMON_JWT).toBeUndefined();
       expect(all.FOO).toBe('visible');
     } finally {
       await loader.close();
@@ -242,9 +242,9 @@ describe('createLoader — standalone mode', () => {
 describe('createLoader — daemon mode', () => {
   it('happy path: HELLO/INITIAL populates snapshot', async () => {
     const server = await startFakeServer({
-      initial: { FOO: 'from-daemon', RENSEI_DAEMON_JWT: 'blocked' },
+      initial: { FOO: 'from-daemon', DONMAI_DAEMON_JWT: 'blocked' },
     });
-    process.env.RENSEI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
     const loader = await createLoader({
       sessionId: 'test-session-1',
       logger: silentLogger(),
@@ -253,7 +253,7 @@ describe('createLoader — daemon mode', () => {
       expect(loader.mode).toBe('daemon');
       expect(loader.get('FOO')).toBe('from-daemon');
       // Blocklist applied on the daemon's INITIAL.
-      expect(loader.get('RENSEI_DAEMON_JWT')).toBeUndefined();
+      expect(loader.get('DONMAI_DAEMON_JWT')).toBeUndefined();
       const hello = await server.helloReceived();
       expect(hello.sessionId).toBe('test-session-1');
     } finally {
@@ -264,7 +264,7 @@ describe('createLoader — daemon mode', () => {
 
   it('falls back to standalone when handshake times out', async () => {
     const server = await startFakeServer({ withholdInitial: true });
-    process.env.RENSEI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
     process.env.STANDALONE_FALLBACK_FOO = 'standalone-value';
     const logger = silentLogger();
     const loader = await createLoader({
@@ -286,7 +286,7 @@ describe('createLoader — daemon mode', () => {
 
   it('falls back to standalone on malformed INITIAL', async () => {
     const server = await startFakeServer({ malformedInitial: true });
-    process.env.RENSEI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
     const logger = silentLogger();
     const loader = await createLoader({
       sessionId: 'malformed-session',
@@ -304,7 +304,7 @@ describe('createLoader — daemon mode', () => {
 
   it('subscribe delivers UPDATE deltas (blocklist applied)', async () => {
     const server = await startFakeServer({ initial: { FOO: 'v1' } });
-    process.env.RENSEI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
     const loader = await createLoader({
       sessionId: 'subscribe-session',
       logger: silentLogger(),
@@ -315,13 +315,13 @@ describe('createLoader — daemon mode', () => {
         received.push(delta);
       });
 
-      server.pushUpdate({ FOO: 'v2', RENSEI_DAEMON_JWT: 'blocked' });
+      server.pushUpdate({ FOO: 'v2', DONMAI_DAEMON_JWT: 'blocked' });
       // Give the event loop a couple of ticks to flush the socket.
       await new Promise((r) => setTimeout(r, 50));
       expect(received).toHaveLength(1);
       expect(received[0]).toEqual({ FOO: 'v2' });
       expect(loader.get('FOO')).toBe('v2');
-      expect(loader.get('RENSEI_DAEMON_JWT')).toBeUndefined();
+      expect(loader.get('DONMAI_DAEMON_JWT')).toBeUndefined();
       unsub();
     } finally {
       await loader.close();
@@ -331,7 +331,7 @@ describe('createLoader — daemon mode', () => {
 
   it('unsubscribe stops delivery', async () => {
     const server = await startFakeServer({ initial: { FOO: 'v1' } });
-    process.env.RENSEI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
     const loader = await createLoader({
       sessionId: 'unsub-session',
       logger: silentLogger(),
@@ -353,7 +353,7 @@ describe('createLoader — daemon mode', () => {
 
   it('close() sends BYE then ends the socket', async () => {
     const server = await startFakeServer({ initial: { FOO: 'v1' } });
-    process.env.RENSEI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
     const loader = await createLoader({
       sessionId: 'bye-session',
       logger: silentLogger(),
@@ -371,9 +371,9 @@ describe('createLoader — daemon mode', () => {
 
   it('falls back to standalone when sessionId is missing in daemon mode', async () => {
     const server = await startFakeServer();
-    process.env.RENSEI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
     const logger = silentLogger();
-    // No sessionId option, no RENSEI_CREDENTIAL_SESSION_ID env.
+    // No sessionId option, no DONMAI_CREDENTIAL_SESSION_ID env.
     const loader = await createLoader({ logger });
     try {
       expect(loader.mode).toBe('standalone');
@@ -384,10 +384,10 @@ describe('createLoader — daemon mode', () => {
     }
   });
 
-  it('picks up sessionId from RENSEI_CREDENTIAL_SESSION_ID when option absent', async () => {
+  it('picks up sessionId from DONMAI_CREDENTIAL_SESSION_ID when option absent', async () => {
     const server = await startFakeServer({ initial: { FOO: 'env-sid' } });
-    process.env.RENSEI_CREDENTIAL_SOCKET = server.path;
-    process.env.RENSEI_CREDENTIAL_SESSION_ID = 'env-derived';
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_SESSION_ID = 'env-derived';
     const loader = await createLoader({ logger: silentLogger() });
     try {
       expect(loader.mode).toBe('daemon');
@@ -413,7 +413,7 @@ describe('Loader.mode', () => {
 
   it('returns "daemon" after a successful handshake', async () => {
     const server = await startFakeServer({ initial: {} });
-    process.env.RENSEI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
     const loader = await createLoader({
       sessionId: 'mode-session',
       logger: silentLogger(),

@@ -117,7 +117,7 @@ type InstallOptions struct {
 	Description string
 
 	// ConfigPath is the path to the daemon config file. When non-empty, it
-	// is exported as RENSEI_DAEMON_CONFIG via Environment= in the unit.
+	// is exported as DONMAI_DAEMON_CONFIG via Environment= in the unit.
 	ConfigPath string
 
 	// SkipSystemctl skips running systemctl daemon-reload / enable --now after
@@ -239,7 +239,7 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 	)
 
 	if opts.ConfigPath != "" {
-		lines = append(lines, "Environment=RENSEI_DAEMON_CONFIG="+opts.ConfigPath)
+		lines = append(lines, "Environment=DONMAI_DAEMON_CONFIG="+opts.ConfigPath)
 	}
 
 	// PATH override (REN-1462 / v0.5.1): prepend ~/.local/bin so

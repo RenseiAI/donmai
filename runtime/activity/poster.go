@@ -86,7 +86,7 @@ type Config struct {
 	// WorkerID is the daemon worker that owns the session. Sent in the
 	// request body so the platform can verify ownership.
 	WorkerID string
-	// BaseURL is the platform API base, e.g. "https://app.rensei.ai".
+	// BaseURL is the platform API base, e.g. "https://platform.example.com".
 	// Required.
 	BaseURL string
 	// AuthToken is sent as Bearer in the Authorization header. Empty

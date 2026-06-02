@@ -30,7 +30,7 @@ type WizardOptions struct {
 	// prompting.
 	IsTTY *bool
 	// SkipWizard, when true, returns DefaultConfig (or Existing) without
-	// prompting. Mirrors the RENSEI_DAEMON_SKIP_WIZARD env var.
+	// prompting. Mirrors the DONMAI_DAEMON_SKIP_WIZARD env var.
 	SkipWizard bool
 	// CPUCount overrides runtime.NumCPU() (test injection).
 	CPUCount int
@@ -44,9 +44,9 @@ type WizardOptions struct {
 
 // ShouldSkipWizard returns true when the wizard should be bypassed:
 //   - stdin is not a TTY, OR
-//   - RENSEI_DAEMON_SKIP_WIZARD is set.
+//   - DONMAI_DAEMON_SKIP_WIZARD is set.
 func ShouldSkipWizard() bool {
-	if os.Getenv("RENSEI_DAEMON_SKIP_WIZARD") != "" {
+	if os.Getenv("DONMAI_DAEMON_SKIP_WIZARD") != "" {
 		return true
 	}
 	// We treat non-TTY stdin as "skip the wizard". We use a coarse fallback
@@ -158,9 +158,8 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	// [3/5] Orchestrator
 	wln("\n[3/5] Orchestrator")
 	wln("  Where do work assignments come from?")
-	wln("  > 1. Rensei Platform (SaaS)        — register with platform.rensei.dev")
-	wln("    2. Self-hosted (OSS only)         — point at your own webhook target")
-	wln("    3. Local file queue (single-user) — for solo dev, no network")
+	wln("  > 1. Remote orchestrator           — register with a platform you configure")
+	wln("    2. Local file queue (single-user) — for solo dev, no network")
 	choiceStr, err := promptDefault(r, out, "Choice", "1")
 	if err != nil {
 		return nil, err
@@ -173,7 +172,12 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	}
 	switch choice {
 	case 2:
-		def := "https://your-rensei-instance.example.com"
+		queue := statepath.Resolve("queue", "/tmp/.donmai/queue")
+		orchestratorURL = "file://" + queue
+		wf("  Using local file queue at %s\n", queue)
+	default:
+		// No vendor default — the operator supplies the orchestrator URL.
+		def := ""
 		if opts.Existing != nil && opts.Existing.Orchestrator.URL != "" {
 			def = opts.Existing.Orchestrator.URL
 		}
@@ -181,13 +185,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
-	case 3:
-		queue := statepath.Resolve("queue", "/tmp/.donmai/queue")
-		orchestratorURL = "file://" + queue
-		wf("  Using local file queue at %s\n", queue)
-	default:
-		orchestratorURL = "https://platform.rensei.dev"
-		envTok := os.Getenv("RENSEI_DAEMON_TOKEN")
+		envTok := os.Getenv("DONMAI_DAEMON_TOKEN")
 		switch {
 		case envTok == "" && authToken == "":
 			tok, err := promptDefault(r, out, "Registration token (rsp_live_...)", "")
@@ -199,7 +197,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 			}
 		case envTok != "":
 			authToken = envTok
-			wln("  Using registration token from RENSEI_DAEMON_TOKEN env var")
+			wln("  Using registration token from DONMAI_DAEMON_TOKEN env var")
 		default:
 			wln("  Using registration token from existing config")
 		}
@@ -297,7 +295,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	}
 
 	cfg := &Config{
-		APIVersion: "rensei.dev/v1",
+		APIVersion: "donmai.dev/v1",
 		Kind:       "LocalDaemon",
 		Machine:    MachineConfig{ID: machineID, Region: region},
 		Capacity: CapacityConfig{

@@ -70,9 +70,9 @@ func TestRunRotate_Happy_200(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env, out, _ := fakeEnv(t, map[string]string{ //nolint:gosec // G101 false positive (test fixture)
-		"RENSEI_PLATFORM_URL": srv.URL,
-		"RENSEI_RSK_TOKEN":    "rsk_test_token",
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_PLATFORM_URL": srv.URL,
+		"DONMAI_RSK_TOKEN":    "rsk_test_token",
+		"DONMAI_ORG_ID":       "org_test",
 	}, nil)
 	env.HTTPClient = srv.Client()
 
@@ -102,9 +102,9 @@ func TestRunRotate_404_KindNotFound(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": srv.URL,
-		"RENSEI_RSK_TOKEN":    "rsk_test",
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_PLATFORM_URL": srv.URL,
+		"DONMAI_RSK_TOKEN":    "rsk_test",
+		"DONMAI_ORG_ID":       "org_test",
 	}, nil)
 	env.HTTPClient = srv.Client()
 
@@ -131,9 +131,9 @@ func TestRunRotate_403_OrgMismatch(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": srv.URL,
-		"RENSEI_RSK_TOKEN":    "rsk_test",
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_PLATFORM_URL": srv.URL,
+		"DONMAI_RSK_TOKEN":    "rsk_test",
+		"DONMAI_ORG_ID":       "org_test",
 	}, nil)
 	env.HTTPClient = srv.Client()
 
@@ -160,9 +160,9 @@ func TestRunRotate_401_Unauthorized(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": srv.URL,
-		"RENSEI_RSK_TOKEN":    "rsk_test",
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_PLATFORM_URL": srv.URL,
+		"DONMAI_RSK_TOKEN":    "rsk_test",
+		"DONMAI_ORG_ID":       "org_test",
 	}, nil)
 	env.HTTPClient = srv.Client()
 
@@ -173,7 +173,7 @@ func TestRunRotate_401_Unauthorized(t *testing.T) {
 	if !strings.Contains(err.Error(), "401") {
 		t.Errorf("error does not mention 401: %v", err)
 	}
-	if !strings.Contains(err.Error(), "RENSEI_RSK_TOKEN") {
+	if !strings.Contains(err.Error(), "DONMAI_RSK_TOKEN") {
 		t.Errorf("error does not hint at the token: %v", err)
 	}
 }
@@ -189,9 +189,9 @@ func (e *errClient) RoundTrip(_ *http.Request) (*http.Response, error) {
 
 func TestRunRotate_NetworkError(t *testing.T) {
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": "http://127.0.0.1:1",
-		"RENSEI_RSK_TOKEN":    "rsk_test",
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_PLATFORM_URL": "http://127.0.0.1:1",
+		"DONMAI_RSK_TOKEN":    "rsk_test",
+		"DONMAI_ORG_ID":       "org_test",
 	}, nil)
 	env.HTTPClient = &http.Client{
 		Transport: &errClient{err: errors.New("connection refused (test)")},
@@ -211,8 +211,8 @@ func TestRunRotate_NetworkError(t *testing.T) {
 
 func TestRunRotate_MissingPlatformURL(t *testing.T) {
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_RSK_TOKEN": "rsk_test",
-		"RENSEI_ORG_ID":    "org_test",
+		"DONMAI_RSK_TOKEN": "rsk_test",
+		"DONMAI_ORG_ID":    "org_test",
 	}, nil)
 
 	err := runRotate(context.Background(), env, rotateFlags{kind: "anthropic"})
@@ -226,8 +226,8 @@ func TestRunRotate_MissingPlatformURL(t *testing.T) {
 
 func TestRunRotate_MissingToken(t *testing.T) {
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": "https://example.test",
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_PLATFORM_URL": "https://example.test",
+		"DONMAI_ORG_ID":       "org_test",
 	}, nil)
 
 	err := runRotate(context.Background(), env, rotateFlags{kind: "anthropic"})
@@ -241,8 +241,8 @@ func TestRunRotate_MissingToken(t *testing.T) {
 
 func TestRunRotate_MissingOrgID(t *testing.T) {
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": "https://example.test",
-		"RENSEI_RSK_TOKEN":    "rsk_test",
+		"DONMAI_PLATFORM_URL": "https://example.test",
+		"DONMAI_RSK_TOKEN":    "rsk_test",
 	}, nil)
 
 	err := runRotate(context.Background(), env, rotateFlags{kind: "anthropic"})
@@ -270,10 +270,10 @@ func TestRunRotate_TokenFromFile_Fallback(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": srv.URL,
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_PLATFORM_URL": srv.URL,
+		"DONMAI_ORG_ID":       "org_test",
 	}, map[string][]byte{
-		"/fake/home/.rensei/cli.token": []byte("rsk_from_file\n"),
+		"/fake/home/.donmai/cli.token": []byte("rsk_from_file\n"),
 	})
 	env.HTTPClient = srv.Client()
 
@@ -303,10 +303,10 @@ func TestRunRotate_OrgIDFromConfig_Fallback(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": srv.URL,
-		"RENSEI_RSK_TOKEN":    "rsk_test",
+		"DONMAI_PLATFORM_URL": srv.URL,
+		"DONMAI_RSK_TOKEN":    "rsk_test",
 	}, map[string][]byte{
-		"/fake/home/.rensei/cli-config.yaml": []byte(
+		"/fake/home/.donmai/cli-config.yaml": []byte(
 			"# rensei cli config\n" +
 				"orgId: \"org_from_yaml\"\n" +
 				"projectId: proj_X\n",
@@ -336,9 +336,9 @@ func TestRunRotate_FlagWinsOverEnv(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": srv.URL,
-		"RENSEI_RSK_TOKEN":    "rsk_env",
-		"RENSEI_ORG_ID":       "org_env",
+		"DONMAI_PLATFORM_URL": srv.URL,
+		"DONMAI_RSK_TOKEN":    "rsk_env",
+		"DONMAI_ORG_ID":       "org_env",
 	}, nil)
 	env.HTTPClient = srv.Client()
 
@@ -365,9 +365,9 @@ func TestRunRotate_PlatformURLWithTrailingSlash(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": srv.URL + "/",
-		"RENSEI_RSK_TOKEN":    "rsk_test",
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_PLATFORM_URL": srv.URL + "/",
+		"DONMAI_RSK_TOKEN":    "rsk_test",
+		"DONMAI_ORG_ID":       "org_test",
 	}, nil)
 	env.HTTPClient = srv.Client()
 
@@ -389,13 +389,13 @@ func TestRunRotate_TokenPrecedence_RskTokenEnvOverWorker(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	// All three are set — RENSEI_RSK_TOKEN must win.
+	// All three are set — DONMAI_RSK_TOKEN must win.
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": srv.URL,
-		"RENSEI_RSK_TOKEN":    "rsk_primary",
+		"DONMAI_PLATFORM_URL": srv.URL,
+		"DONMAI_RSK_TOKEN":    "rsk_primary",
 		"WORKER_API_KEY":      "rsk_worker",
-		"RENSEI_API_TOKEN":    "rsk_legacy",
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_API_TOKEN":    "rsk_legacy",
+		"DONMAI_ORG_ID":       "org_test",
 	}, nil)
 	env.HTTPClient = srv.Client()
 
@@ -412,9 +412,9 @@ func TestRunRotate_500_FallsBackToRawBody(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env, _, _ := fakeEnv(t, map[string]string{
-		"RENSEI_PLATFORM_URL": srv.URL,
-		"RENSEI_RSK_TOKEN":    "rsk_test",
-		"RENSEI_ORG_ID":       "org_test",
+		"DONMAI_PLATFORM_URL": srv.URL,
+		"DONMAI_RSK_TOKEN":    "rsk_test",
+		"DONMAI_ORG_ID":       "org_test",
 	}, nil)
 	env.HTTPClient = srv.Client()
 

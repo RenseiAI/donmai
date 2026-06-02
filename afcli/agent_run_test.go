@@ -56,7 +56,7 @@ func TestNewAgentRunCmd_Help(t *testing.T) {
 		"Run a single agent session",
 		"--session-id",
 		"--daemon-url",
-		"RENSEI_SESSION_ID",
+		"DONMAI_SESSION_ID",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing %q\n--- output ---\n%s", want, out)
@@ -555,9 +555,9 @@ func (f *fakeProvider) Resume(_ context.Context, _ string, _ agent.Spec) (agent.
 func (f *fakeProvider) Shutdown(_ context.Context) error { return nil }
 
 // TestRunAgentRun_PreflightMissingSessionID asserts a clear preflight
-// error when no session id is passed and RENSEI_SESSION_ID is unset.
+// error when no session id is passed and DONMAI_SESSION_ID is unset.
 func TestRunAgentRun_PreflightMissingSessionID(t *testing.T) {
-	t.Setenv("RENSEI_SESSION_ID", "")
+	t.Setenv("DONMAI_SESSION_ID", "")
 	cmd := &cobra.Command{}
 	err := runAgentRun(context.Background(), cmd, &agentRunOpts{})
 	if err == nil {

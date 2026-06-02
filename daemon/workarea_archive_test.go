@@ -333,16 +333,16 @@ func TestWorkareaArchiveRegistry_Diff_BinaryFile(t *testing.T) {
 	}
 }
 
-func TestWorkareaArchiveRegistry_Diff_ExcludesRenseiSubtree(t *testing.T) {
+func TestWorkareaArchiveRegistry_Diff_ExcludesDonmaiSubtree(t *testing.T) {
 	root := t.TempDir()
 	writeFixtureArchive(t, root, fixtureArchive{id: "wa-x", tree: map[string]string{
-		".rensei/state.json":  "private-a",
-		".rensei/sub/log.txt": "private-a",
+		".donmai/state.json":  "private-a",
+		".donmai/sub/log.txt": "private-a",
 		"hello.txt":           "shared",
 	}})
 	writeFixtureArchive(t, root, fixtureArchive{id: "wa-y", tree: map[string]string{
-		".rensei/state.json":  "private-b",
-		".rensei/sub/log.txt": "private-b",
+		".donmai/state.json":  "private-b",
+		".donmai/sub/log.txt": "private-b",
 		"hello.txt":           "shared",
 	}})
 	reg := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
@@ -351,7 +351,7 @@ func TestWorkareaArchiveRegistry_Diff_ExcludesRenseiSubtree(t *testing.T) {
 		t.Fatalf("diff: %v", err)
 	}
 	if len(res.Entries) != 0 {
-		t.Errorf(".rensei subtree must be excluded; got entries: %+v", res.Entries)
+		t.Errorf(".donmai subtree must be excluded; got entries: %+v", res.Entries)
 	}
 }
 
@@ -609,7 +609,7 @@ func TestWorkareaArchiveRegistry_ConcurrentRestoreAndDiff(t *testing.T) {
 func TestWalkArchiveTree_OrderingAndExclusion(t *testing.T) {
 	tree := t.TempDir()
 	for _, p := range []string{
-		"z/zz.txt", "a/aa.txt", "m/mm.txt", ".rensei/private.txt", ".rensei/sub/x.txt",
+		"z/zz.txt", "a/aa.txt", "m/mm.txt", ".donmai/private.txt", ".donmai/sub/x.txt",
 	} {
 		full := filepath.Join(tree, p)
 		_ = os.MkdirAll(filepath.Dir(full), 0o750)
@@ -631,8 +631,8 @@ func TestWalkArchiveTree_OrderingAndExclusion(t *testing.T) {
 		}
 	}
 	for _, p := range paths {
-		if strings.HasPrefix(p, ".rensei") {
-			t.Errorf("walk should exclude .rensei: %q", p)
+		if strings.HasPrefix(p, ".donmai") {
+			t.Errorf("walk should exclude .donmai: %q", p)
 		}
 	}
 }

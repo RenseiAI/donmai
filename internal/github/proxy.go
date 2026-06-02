@@ -7,7 +7,7 @@ import "net/http"
 // request via the rsk_ token and forwards it under the org's GitHub App
 // installation credential.
 //
-// baseURL is the platform's base URL (e.g. "https://app.rensei.ai").
+// baseURL is the platform's base URL (e.g. "https://platform.example.com").
 // token is the rsk_* session token from afclient.CredentialsFromDataSource.
 func NewProxiedClient(baseURL, token string) *Client {
 	c := NewClient(token)

@@ -17,7 +17,7 @@
 // platform and never attach an Authorization header (D2 —
 // localhost-only). The ds argument is accepted for signature
 // consistency with the rest of afcli but is unused — daemon-targeted
-// commands resolve their client via RENSEI_DAEMON_URL or the
+// commands resolve their client via DONMAI_DAEMON_URL or the
 // 127.0.0.1:7734 default.
 package afcli
 

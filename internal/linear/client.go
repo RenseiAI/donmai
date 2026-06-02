@@ -203,7 +203,7 @@ func NewClient(apiKey string) (*Client, error) {
 
 // NewProxiedClient constructs a Client that routes GraphQL through the
 // platform's /api/cli/linear/graphql proxy under the caller's rsk_ token.
-// platformBaseURL is the platform root (e.g. "https://app.rensei.ai");
+// platformBaseURL is the platform root (e.g. "https://platform.example.com");
 // rskToken is the user's platform API key (Bearer-style). Returns
 // ErrInvalidAPIKey when either is empty.
 //

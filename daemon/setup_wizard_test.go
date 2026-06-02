@@ -35,7 +35,7 @@ func TestRunSetupWizard_Interactive_HappyPath(t *testing.T) {
 		"1024",       // Reserve memory
 		"4",          // Max sessions
 		"y",          // Continue?
-		"3",          // Choice 3 — local file queue
+		"2",          // Choice 2 — local file queue
 		"y",          // Continue?
 		"n",          // Add another project? (no detected remote in test)
 		"y",          // Continue?

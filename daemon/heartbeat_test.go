@@ -60,7 +60,7 @@ func TestHeartbeatService_IdempotentStart(_ *testing.T) {
 // targets /api/workers/<id>/heartbeat with the runtime JWT in the
 // Authorization header and { activeCount, maxSessions } in the body.
 func TestHeartbeatService_HitsPlatformEndpoint(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
 	var (
 		mu    sync.Mutex
@@ -134,7 +134,7 @@ func TestHeartbeatService_HitsPlatformEndpoint(t *testing.T) {
 // OnReregister, swaps in the fresh credentials, and retries the heartbeat
 // without losing the tick.
 func TestHeartbeatService_ReregisterOn401(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
 	var (
 		callsBefore atomic.Int32
@@ -207,7 +207,7 @@ func TestHeartbeatService_ReregisterOn401(t *testing.T) {
 // itself fell out of Redis (5-min TTL): the platform returns 404 and the
 // daemon must re-register. Same recovery path as 401.
 func TestHeartbeatService_ReregisterOn404(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
 	var (
 		gotFresh atomic.Bool
@@ -258,7 +258,7 @@ func TestHeartbeatService_ReregisterOn404(t *testing.T) {
 // loop into the same recovery branch. This mirrors the bash sidecar's
 // behaviour and avoids dropping into an unrecoverable state.
 func TestHeartbeatService_ReregisterFailure_NoCredSwap(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))

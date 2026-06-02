@@ -21,9 +21,8 @@ type KitSource string
 
 // Kit registry sources from the federation order in 005-kit-manifest-spec.md.
 const (
-	KitSourceLocal       KitSource = "local"       // .rensei/kits/*.kit.toml
+	KitSourceLocal       KitSource = "local"       // .donmai/kits/*.kit.toml
 	KitSourceBundled     KitSource = "bundled"     // shipped with OSS execution layer
-	KitSourceRensei      KitSource = "rensei"      // registry.rensei.dev
 	KitSourceTessl       KitSource = "tessl"       // registry.tessl.io
 	KitSourceAgentSkills KitSource = "agentskills" // agentskills.io
 	KitSourceCommunity   KitSource = "community"   // tenant-declared community/enterprise registries
@@ -228,7 +227,7 @@ type KitRegistrySource struct {
 	URL      string `json:"url"`
 	Enabled  bool   `json:"enabled"`
 	Priority int    `json:"priority"` // federation order — lower = higher priority
-	Kind     string `json:"kind"`     // "bundled" | "rensei" | "tessl" | "agentskills" | "community"
+	Kind     string `json:"kind"`     // "bundled" | "tessl" | "agentskills" | "community"
 }
 
 // ListKitSourcesResponse matches GET /api/daemon/kit-sources.

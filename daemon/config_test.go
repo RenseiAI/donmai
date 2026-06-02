@@ -35,7 +35,7 @@ func TestLoadConfig_RoundTrip(t *testing.T) {
 			ID: "agentfactory", Repository: "github.com/foo/bar",
 		}},
 		Orchestrator: OrchestratorConfig{
-			URL:       "https://platform.rensei.dev",
+			URL:       "https://platform.example.com",
 			AuthToken: "rsp_live_test123",
 		},
 		AutoUpdate: AutoUpdateConfig{
@@ -69,7 +69,7 @@ func TestLoadConfig_EnvSubstitution(t *testing.T) {
 	t.Setenv("MY_TEST_TOKEN", "rsp_live_substituted")
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	body := []byte(`apiVersion: rensei.dev/v1
+	body := []byte(`apiVersion: donmai.dev/v1
 kind: LocalDaemon
 machine:
   id: test
@@ -81,7 +81,7 @@ capacity:
     vCpu: 1
     memoryMb: 1024
 orchestrator:
-  url: https://platform.rensei.dev
+  url: https://platform.example.com
   authToken: ${MY_TEST_TOKEN}
 autoUpdate:
   channel: stable
@@ -101,13 +101,13 @@ autoUpdate:
 }
 
 func TestLoadConfig_EnvOverride(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_TOKEN", "rsp_live_env_override")
+	t.Setenv("DONMAI_DAEMON_TOKEN", "rsp_live_env_override")
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
 	cfg := &Config{
 		Machine:      MachineConfig{ID: "test"},
 		Capacity:     CapacityConfig{MaxConcurrentSessions: 1, MaxVCpuPerSession: 1, MaxMemoryMbPerSession: 1024, ReservedForSystem: ReservedSystemSpec{VCpu: 1, MemoryMb: 1024}},
-		Orchestrator: OrchestratorConfig{URL: "https://platform.rensei.dev", AuthToken: "old"},
+		Orchestrator: OrchestratorConfig{URL: "https://platform.example.com", AuthToken: "old"},
 		AutoUpdate:   AutoUpdateConfig{Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 600},
 	}
 	if err := WriteConfig(path, cfg); err != nil {
@@ -125,7 +125,7 @@ func TestLoadConfig_EnvOverride(t *testing.T) {
 func TestLoadConfig_InvalidMissingMachineID(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	body := []byte(`apiVersion: rensei.dev/v1
+	body := []byte(`apiVersion: donmai.dev/v1
 machine: {}
 orchestrator:
   url: https://example.com
@@ -179,7 +179,7 @@ func TestDefaultConfig_HasSaneDefaults(t *testing.T) {
 func TestLoadConfig_LegacyRepoURLKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	body := []byte(`apiVersion: rensei.dev/v1
+	body := []byte(`apiVersion: donmai.dev/v1
 kind: LocalDaemon
 machine:
   id: test-machine
@@ -195,7 +195,7 @@ projects:
     repoUrl: github.com/foo/legacy
     cloneStrategy: shallow
 orchestrator:
-  url: https://platform.rensei.dev
+  url: https://platform.example.com
 autoUpdate:
   channel: stable
   schedule: nightly
@@ -267,7 +267,7 @@ func TestProjectAllowWriter_DaemonReader_RoundTrip(t *testing.T) {
 			MaxConcurrentSessions: 1, MaxVCpuPerSession: 1, MaxMemoryMbPerSession: 1024,
 			ReservedForSystem: ReservedSystemSpec{VCpu: 1, MemoryMb: 1024},
 		},
-		Orchestrator: OrchestratorConfig{URL: "https://platform.rensei.dev"},
+		Orchestrator: OrchestratorConfig{URL: "https://platform.example.com"},
 		AutoUpdate: AutoUpdateConfig{
 			Channel: ChannelStable, Schedule: ScheduleNightly, DrainTimeoutSeconds: 600,
 		},
@@ -317,7 +317,7 @@ func TestProjectAllowWriter_PreservesFullConfig_ThenLoadConfigSucceeds(t *testin
 			ReservedForSystem:     ReservedSystemSpec{VCpu: 2, MemoryMb: 4096},
 		},
 		Orchestrator: OrchestratorConfig{ //nolint:gosec // synthetic test token
-			URL:       "https://platform.rensei.dev",
+			URL:       "https://platform.example.com",
 			AuthToken: "rsk_live_test",
 		},
 		AutoUpdate: AutoUpdateConfig{
@@ -355,7 +355,7 @@ func TestProjectAllowWriter_PreservesFullConfig_ThenLoadConfigSucceeds(t *testin
 	if loaded.Machine.ID != "wizard-host" {
 		t.Errorf("machine.id = %q (clobbered)", loaded.Machine.ID)
 	}
-	if loaded.Orchestrator.URL != "https://platform.rensei.dev" {
+	if loaded.Orchestrator.URL != "https://platform.example.com" {
 		t.Errorf("orchestrator.url = %q (clobbered)", loaded.Orchestrator.URL)
 	}
 	if loaded.Orchestrator.AuthToken == "" {
@@ -415,11 +415,11 @@ func scanForKey(n *yaml.Node, name string) bool {
 // daemon.yaml with no `kit:` block lands ScanPaths == [DefaultKitScanPath()]
 // after applyDefaults runs. This is the bare minimum back-compat property:
 // pre-Wave-11 daemon.yaml files (which never wrote a kit block) keep
-// scanning ~/.rensei/kits without operator action.
+// scanning ~/.donmai/kits without operator action.
 func TestLoadConfig_KitScanPaths_DefaultsToDefaultKitScanPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	body := []byte(`apiVersion: rensei.dev/v1
+	body := []byte(`apiVersion: donmai.dev/v1
 kind: LocalDaemon
 machine:
   id: test-machine
@@ -431,7 +431,7 @@ capacity:
     vCpu: 1
     memoryMb: 1024
 orchestrator:
-  url: https://platform.rensei.dev
+  url: https://platform.example.com
 autoUpdate:
   channel: stable
   schedule: nightly
@@ -456,7 +456,7 @@ autoUpdate:
 func TestLoadConfig_TrustMode_DefaultsToPermissive(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	body := []byte(`apiVersion: rensei.dev/v1
+	body := []byte(`apiVersion: donmai.dev/v1
 kind: LocalDaemon
 machine:
   id: test-machine
@@ -468,7 +468,7 @@ capacity:
     vCpu: 1
     memoryMb: 1024
 orchestrator:
-  url: https://platform.rensei.dev
+  url: https://platform.example.com
 autoUpdate:
   channel: stable
   schedule: nightly
@@ -491,7 +491,7 @@ autoUpdate:
 func TestLoadConfig_TrustMode_ExplicitAllowlist(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	body := []byte(`apiVersion: rensei.dev/v1
+	body := []byte(`apiVersion: donmai.dev/v1
 kind: LocalDaemon
 machine:
   id: test-machine
@@ -503,7 +503,7 @@ capacity:
     vCpu: 1
     memoryMb: 1024
 orchestrator:
-  url: https://platform.rensei.dev
+  url: https://platform.example.com
 autoUpdate:
   channel: stable
   schedule: nightly
@@ -511,9 +511,9 @@ autoUpdate:
 trust:
   mode: signed-by-allowlist
   issuerSet:
-    - did:web:rensei.dev
+    - did:web:example.com
     - did:web:partner.example
-  actor: ops@rensei.dev
+  actor: ops@example.com
 `)
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatalf("write: %v", err)
@@ -528,10 +528,10 @@ trust:
 	if len(cfg.Trust.IssuerSet) != 2 {
 		t.Fatalf("Trust.IssuerSet len: want 2, got %d (%v)", len(cfg.Trust.IssuerSet), cfg.Trust.IssuerSet)
 	}
-	if cfg.Trust.IssuerSet[0] != "did:web:rensei.dev" {
+	if cfg.Trust.IssuerSet[0] != "did:web:example.com" {
 		t.Errorf("IssuerSet[0]: got %q", cfg.Trust.IssuerSet[0])
 	}
-	if cfg.Trust.Actor != "ops@rensei.dev" {
+	if cfg.Trust.Actor != "ops@example.com" {
 		t.Errorf("Trust.Actor: got %q", cfg.Trust.Actor)
 	}
 }
@@ -541,7 +541,7 @@ trust:
 func TestLoadConfig_TrustMode_InvalidRejected(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	body := []byte(`apiVersion: rensei.dev/v1
+	body := []byte(`apiVersion: donmai.dev/v1
 kind: LocalDaemon
 machine:
   id: test-machine
@@ -553,7 +553,7 @@ capacity:
     vCpu: 1
     memoryMb: 1024
 orchestrator:
-  url: https://platform.rensei.dev
+  url: https://platform.example.com
 autoUpdate:
   channel: stable
   schedule: nightly
@@ -575,7 +575,7 @@ trust:
 func TestLoadConfig_KitScanPaths_ExplicitOverride(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	body := []byte(`apiVersion: rensei.dev/v1
+	body := []byte(`apiVersion: donmai.dev/v1
 kind: LocalDaemon
 machine:
   id: test-machine
@@ -587,7 +587,7 @@ capacity:
     vCpu: 1
     memoryMb: 1024
 orchestrator:
-  url: https://platform.rensei.dev
+  url: https://platform.example.com
 autoUpdate:
   channel: stable
   schedule: nightly
@@ -621,7 +621,7 @@ kit:
 func TestLoadConfig_CanonicalKeyWinsOverLegacy(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	body := []byte(`apiVersion: rensei.dev/v1
+	body := []byte(`apiVersion: donmai.dev/v1
 kind: LocalDaemon
 machine:
   id: test-machine
@@ -638,7 +638,7 @@ projects:
     repoUrl: github.com/foo/legacy
     cloneStrategy: shallow
 orchestrator:
-  url: https://platform.rensei.dev
+  url: https://platform.example.com
 autoUpdate:
   channel: stable
   schedule: nightly
