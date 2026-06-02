@@ -40,17 +40,17 @@ func defaultProviderClientFactory(cfg afclient.DaemonConfig) providerDaemonClien
 
 // providerEnvDaemonURL names the env var that overrides the daemon
 // address for `donmai provider …` invocations. Mirrors `donmai agent run`'s
-// RENSEI_DAEMON_URL convention.
-const providerEnvDaemonURL = "RENSEI_DAEMON_URL"
+// DONMAI_DAEMON_URL convention.
+const providerEnvDaemonURL = "DONMAI_DAEMON_URL"
 
 // resolveProviderDaemonConfig builds a DaemonConfig honouring the
-// RENSEI_DAEMON_URL env override. Empty => default (127.0.0.1:7734).
+// DONMAI_DAEMON_URL env override. Empty => default (127.0.0.1:7734).
 // We keep this in the same shape as the rest of the daemon-targeted
 // surface so the four Wave-9 commands feel uniform.
 func resolveProviderDaemonConfig() afclient.DaemonConfig {
 	cfg := afclient.DefaultDaemonConfig()
 	if override := strings.TrimSpace(os.Getenv(providerEnvDaemonURL)); override != "" {
-		// RENSEI_DAEMON_URL is a full URL; parse host:port out of it
+		// DONMAI_DAEMON_URL is a full URL; parse host:port out of it
 		// best-effort. The full URL form ("http://host:port") is the
 		// public contract — fall back to defaults if parsing fails.
 		if h, p, ok := splitHTTPHostPort(override); ok {

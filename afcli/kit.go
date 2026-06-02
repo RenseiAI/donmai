@@ -45,7 +45,7 @@ func defaultKitClientFactory(cfg afclient.DaemonConfig) kitDaemonClient {
 	return afclient.NewDaemonClient(cfg)
 }
 
-// resolveKitDaemonConfig honours the RENSEI_DAEMON_URL env override
+// resolveKitDaemonConfig honours the DONMAI_DAEMON_URL env override
 // in the same shape as the provider command. Empty => default
 // (127.0.0.1:7734).
 func resolveKitDaemonConfig() afclient.DaemonConfig {
@@ -76,15 +76,14 @@ func newKitCmdWithFactory(factory kitClientFactory) *cobra.Command {
 language, framework, and domain support (see 005-kit-manifest-spec.md).
 
 Kits are queried from the local af daemon at http://127.0.0.1:7734 by
-default. Set RENSEI_DAEMON_URL to override the daemon address.
+default. Set DONMAI_DAEMON_URL to override the daemon address.
 
 Federation order for registry sources (lowest priority number = consulted first):
   1. local         — ~/.donmai/kits/*.kit.toml
   2. bundled       — shipped with the OSS execution layer
-  3. rensei        — registry.rensei.dev
-  4. tessl         — registry.tessl.io (Tessl tiles as kits)
-  5. agentskills   — agentskills.io (SKILL.md wrapped as kits)
-  6. community     — tenant-declared registries
+  3. tessl         — registry.tessl.io (Tessl tiles as kits)
+  4. agentskills   — agentskills.io (SKILL.md wrapped as kits)
+  5. community     — tenant-declared registries
 
 Only the ` + "`local`" + ` source has a working backend in this wave;
 ` + "`install`" + ` against remote sources currently returns 501.`,

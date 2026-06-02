@@ -85,7 +85,7 @@ func newLocalGitFixture(t *testing.T, files ...fixtureFile) string {
 	if _, err := wt.Commit("seed: initial fixture commit", &gogit.CommitOptions{
 		Author: &object.Signature{
 			Name:  "Test Fixture",
-			Email: "fixture@rensei.dev",
+			Email: "fixture@example.com",
 			When:  time.Date(2026, 5, 7, 0, 0, 0, 0, time.UTC),
 		},
 	}); err != nil {
@@ -213,7 +213,7 @@ func TestKitRegistry_InstallFromGit_SignedByAllowlistAccepts(t *testing.T) {
 		t.Fatalf("NewVirtualSigstore: %v", err)
 	}
 	manifestBytes := []byte(minimalKitTOML)
-	entity, err := vs.Sign("kit-publisher@rensei.dev", "https://issuer.example", manifestBytes)
+	entity, err := vs.Sign("kit-publisher@example.com", "https://issuer.example", manifestBytes)
 	if err != nil {
 		t.Fatalf("vs.Sign: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestKitRegistry_InstallFromGit_TamperedBundleAllowlistRejected(t *testing.T
 	tamperedBytes := []byte(strings.Replace(minimalKitTOML, "0.1.0", "9.9.9", 1))
 	// Sign one body, deliver a different body to the verifier — bundle
 	// digest mismatch → signed-unverified → allowlist rejects.
-	entity, err := vs.Sign("kit-publisher@rensei.dev", "https://issuer.example", signedBytes)
+	entity, err := vs.Sign("kit-publisher@example.com", "https://issuer.example", signedBytes)
 	if err != nil {
 		t.Fatalf("vs.Sign: %v", err)
 	}
@@ -401,7 +401,7 @@ func TestKitRegistry_InstallFromGit_TrustOverrideBypassesGate(t *testing.T) {
 
 	r := NewKitRegistryWithTrust([]string{scan}, TrustConfig{
 		Mode:  TrustModeSignedByAllowlist,
-		Actor: "operator@rensei.dev",
+		Actor: "operator@example.com",
 	})
 
 	res, err := r.Install("rensei/example", afclient.KitInstallRequest{
@@ -419,8 +419,8 @@ func TestKitRegistry_InstallFromGit_TrustOverrideBypassesGate(t *testing.T) {
 	if !strings.Contains(buf.String(), "trust gate bypassed") {
 		t.Errorf("audit log: want 'trust gate bypassed' line, got %s", buf.String())
 	}
-	if !strings.Contains(buf.String(), "operator@rensei.dev") {
-		t.Errorf("audit log: want actor 'operator@rensei.dev', got %s", buf.String())
+	if !strings.Contains(buf.String(), "operator@example.com") {
+		t.Errorf("audit log: want actor 'operator@example.com', got %s", buf.String())
 	}
 
 	// Manifest persisted despite the gate having rejected it under

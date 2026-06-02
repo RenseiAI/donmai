@@ -18,9 +18,12 @@ import (
 	"time"
 )
 
-// UpdateCDNBase is the base URL for the rensei CDN that hosts release
-// manifests and binaries.
-const UpdateCDNBase = "https://updates.rensei.dev"
+// UpdateCDNBase is the default base URL for the CDN that hosts release
+// manifests and binaries. The OSS donmai binary ships with NO default CDN —
+// auto-update is opt-in and only runs when the operator configures a CDN base
+// (via UpdaterOptions.CDNBase). When unset, auto-update is disabled rather than
+// pointing at any vendor's infrastructure.
+const UpdateCDNBase = ""
 
 // VersionManifest is the schema of <channel>/latest.json.
 type VersionManifest struct {
@@ -95,7 +98,7 @@ func NewUpdater(opts UpdaterOptions) *Updater {
 		opts.ExitFn = os.Exit
 	}
 	if opts.CDNBase == "" {
-		opts.CDNBase = UpdateCDNBase
+		opts.CDNBase = UpdateCDNBase // empty by default → auto-update disabled (see CheckForUpdate)
 	}
 	if opts.PlatformSuffix == "" {
 		opts.PlatformSuffix = ResolvePlatformSuffix()
@@ -131,7 +134,7 @@ func (u *Updater) BuildManifestURL(channel UpdateChannel) string {
 
 // BuildBinaryURL returns the binary URL for a channel/version.
 func (u *Updater) BuildBinaryURL(channel UpdateChannel, version string) string {
-	return fmt.Sprintf("%s/%s/%s/rensei-daemon-%s",
+	return fmt.Sprintf("%s/%s/%s/donmai-daemon-%s",
 		strings.TrimRight(u.opts.CDNBase, "/"), channel, version, u.opts.PlatformSuffix)
 }
 
@@ -143,6 +146,11 @@ func (u *Updater) BuildSignatureURL(binURL string) string {
 // CheckForUpdate fetches the version manifest and returns it iff a strictly
 // newer version is available. Returns (nil, nil) when up-to-date.
 func (u *Updater) CheckForUpdate(ctx context.Context) (*VersionManifest, error) {
+	if strings.TrimSpace(u.opts.CDNBase) == "" {
+		// No CDN configured — auto-update is opt-in and disabled. The OSS
+		// binary must not dial any vendor default; return up-to-date.
+		return nil, nil
+	}
 	url := u.BuildManifestURL(u.opts.Config.Channel)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

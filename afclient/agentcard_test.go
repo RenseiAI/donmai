@@ -82,7 +82,7 @@ func TestAgentCardRoundTrip_AllFields(t *testing.T) {
 			Provenance: TrustProvenanceInfo{
 				SourceURL:    ptr("https://github.com/renseiai/agents/tree/main/backlog-writer"),
 				SourceCommit: ptr("abc123def456"),
-				ImportedBy:   "operator@rensei.ai",
+				ImportedBy:   "operator@example.com",
 				ImportedAt:   "2026-05-01T00:00:00Z",
 			},
 			EvaluatedQualityScore: &quality,
@@ -337,7 +337,7 @@ func TestTrustClaimsRoundTrip(t *testing.T) {
 		Provenance: TrustProvenanceInfo{
 			SourceURL:    &src,
 			SourceCommit: &commit,
-			ImportedBy:   "ops@rensei.ai",
+			ImportedBy:   "ops@example.com",
 			ImportedAt:   "2026-05-12T00:00:00Z",
 		},
 		EvaluatedQualityScore: &score,

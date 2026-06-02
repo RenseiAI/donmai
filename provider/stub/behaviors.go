@@ -2,7 +2,7 @@ package stub
 
 // Behavior names a pre-scripted event sequence the stub Handle emits.
 //
-// Behavior values are read from Spec.Env["RENSEI_STUB_MODE"] (the
+// Behavior values are read from Spec.Env["DONMAI_STUB_MODE"] (the
 // F.1.1 §3.3 knob) or Spec.ProviderConfig["stub.behavior"] (the typed
 // v0.5.0 knob). When neither is set the provider falls back to
 // BehaviorSucceedWithPR.
@@ -57,7 +57,7 @@ const (
 )
 
 // behaviorEnvKey is the legacy F.1.1 §3.3 environment knob.
-const behaviorEnvKey = "RENSEI_STUB_MODE"
+const behaviorEnvKey = "DONMAI_STUB_MODE"
 
 // behaviorConfigKey is the typed v0.5.0 ProviderConfig knob.
 const behaviorConfigKey = "stub.behavior"

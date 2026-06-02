@@ -1,4 +1,4 @@
-// Package afclient daemon_config.go — read/write ~/.rensei/daemon.yaml.
+// Package afclient daemon_config.go — read/write ~/.donmai/daemon.yaml.
 //
 // The file is the source-of-truth for the daemon's project allowlist and
 // credential configuration. The running daemon reloads on SIGHUP or restart;
@@ -132,7 +132,7 @@ type CapacityConfig struct {
 	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
 }
 
-// DaemonYAML is the in-memory representation of ~/.rensei/daemon.yaml.
+// DaemonYAML is the in-memory representation of ~/.donmai/daemon.yaml.
 // Only the fields relevant to the project command tree are modelled here;
 // unknown top-level keys are preserved via the yaml decoder's pass-through.
 type DaemonYAML struct {
@@ -148,9 +148,9 @@ type DaemonYAML struct {
 func DefaultDaemonYAMLPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "~/.rensei/daemon.yaml"
+		return "~/.donmai/daemon.yaml"
 	}
-	return filepath.Join(home, ".rensei", "daemon.yaml")
+	return filepath.Join(home, ".donmai", "daemon.yaml")
 }
 
 // ── read / write ─────────────────────────────────────────────────────────────

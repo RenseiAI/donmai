@@ -21,7 +21,7 @@ import (
 // SocketEnvVar is the name of the environment variable the loader reads
 // to discover the credential unix socket. When unset, the loader runs
 // in standalone mode.
-const SocketEnvVar = "RENSEI_CREDENTIAL_SOCKET"
+const SocketEnvVar = "DONMAI_CREDENTIAL_SOCKET"
 
 // defaultHandshakeTimeout is used when [Options.HandshakeTimeout] is
 // zero. Five seconds is generous for a local unix-socket round trip

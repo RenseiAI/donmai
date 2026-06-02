@@ -2,6 +2,7 @@ package runner
 
 import (
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/prompt"
 )
 
@@ -38,7 +39,7 @@ type QueuedWork struct {
 	AuthToken string `json:"-"`
 
 	// PlatformURL is the base URL of the platform (e.g.
-	// "https://app.rensei.ai" or "http://127.0.0.1:3010"). The runner
+	// "https://platform.example.com" or "http://127.0.0.1:3010"). The runner
 	// forwards this to result.Poster + heartbeat.Pulser. Required.
 	PlatformURL string `json:"-"`
 }
@@ -78,6 +79,15 @@ type ResolvedProfile struct {
 	// ProviderConfig carries provider-specific knobs from the matched
 	// model profile. Forwarded into agent.Spec.ProviderConfig.
 	ProviderConfig map[string]any `json:"providerConfig,omitempty"`
+}
+
+// isInterview reports whether this QueuedWork runs the interactive
+// interview loop (REN-1563) rather than the one-shot headless path. The
+// discriminant is the platform-frozen Mode value (CONTRACT-FREEZE §4 /
+// internal/interview.InterviewRunMode). Anything else (including the empty
+// string) is a normal headless run.
+func (q *QueuedWork) isInterview() bool {
+	return q.Mode == interview.InterviewRunMode
 }
 
 // resolvedProvider returns the effective provider name for this

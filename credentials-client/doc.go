@@ -4,7 +4,7 @@
 // [Loader] that abstracts over two delivery modes:
 //
 //   - Daemon mode: the parent process (a local daemon, a CI shim, a test
-//     harness) has set the RENSEI_CREDENTIAL_SOCKET environment variable
+//     harness) has set the DONMAI_CREDENTIAL_SOCKET environment variable
 //     to the path of a unix socket speaking the HELLO/INITIAL/UPDATE/BYE
 //     line-delimited JSON protocol. The loader connects, sends a HELLO
 //     frame naming the session id, receives an INITIAL snapshot, and

@@ -191,7 +191,7 @@ func TestDaemonClient_EnableKit_NotFound(t *testing.T) {
 }
 
 func TestDaemonClient_ListKitSources(t *testing.T) {
-	body := `{"sources":[{"name":"local","url":"~/.rensei/kits","enabled":true,"priority":1,"kind":"local"},{"name":"tessl","url":"https://registry.tessl.io","enabled":false,"priority":4,"kind":"tessl"}]}`
+	body := `{"sources":[{"name":"local","url":"~/.donmai/kits","enabled":true,"priority":1,"kind":"local"},{"name":"tessl","url":"https://registry.tessl.io","enabled":false,"priority":4,"kind":"tessl"}]}`
 	srv := newKitMockServer(t, []kitMockEntry{
 		{http.MethodGet, "/api/daemon/kit-sources", http.StatusOK, body},
 	}, nil)

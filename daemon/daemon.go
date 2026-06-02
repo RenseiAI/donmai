@@ -336,7 +336,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if !d.opts.SkipRegistration {
 		token := cfg.Orchestrator.AuthToken
 		if token == "" {
-			token = os.Getenv("RENSEI_DAEMON_TOKEN")
+			token = os.Getenv("DONMAI_DAEMON_TOKEN")
 		}
 		if token == "" {
 			token = "local-stub-no-token"
@@ -380,9 +380,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 		spawnerOpts.BaseEnv = map[string]string{}
 	}
 	if d.workerID != "" {
-		spawnerOpts.BaseEnv["RENSEI_WORKER_ID"] = d.workerID
+		spawnerOpts.BaseEnv["DONMAI_WORKER_ID"] = d.workerID
 	}
-	spawnerOpts.BaseEnv["RENSEI_ORCHESTRATOR_URL"] = cfg.Orchestrator.URL
+	spawnerOpts.BaseEnv["DONMAI_ORCHESTRATOR_URL"] = cfg.Orchestrator.URL
 	// Default WorkerCommand: spawn `donmai agent run` from the same
 	// binary as the running daemon process so session lifecycle is
 	// owned in-tree. Operators can override via SpawnerOptions.
@@ -569,7 +569,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	// Phase 3b: hot-reload daemon.yaml on direct edits. Without this,
-	// `vim ~/.rensei/daemon.yaml` then :w leaves the running daemon with
+	// `vim ~/.donmai/daemon.yaml` then :w leaves the running daemon with
 	// stale in-memory state until restart — a real silent-staleness gap
 	// the design doc flagged. fsnotify-driven reload makes operator edits
 	// take effect within a coalesce window and pushes the new allowlist

@@ -132,18 +132,18 @@ func TestNewProxiedClient(t *testing.T) {
 	if _, err := NewProxiedClient("", "rsk_x"); err == nil {
 		t.Fatal("empty platform base URL: want error, got nil")
 	}
-	if _, err := NewProxiedClient("https://app.rensei.ai", ""); err == nil {
+	if _, err := NewProxiedClient("https://platform.example.com", ""); err == nil {
 		t.Fatal("empty rsk token: want error, got nil")
 	}
 	if _, err := NewProxiedClient("   ", "rsk_x"); err == nil {
 		t.Fatal("whitespace platform base URL: want error, got nil")
 	}
 
-	c, err := NewProxiedClient("https://app.rensei.ai/", "rsk_abc")
+	c, err := NewProxiedClient("https://platform.example.com/", "rsk_abc")
 	if err != nil {
 		t.Fatalf("constructor: unexpected error: %v", err)
 	}
-	if c.BaseURL != "https://app.rensei.ai/api/cli/linear/graphql" {
+	if c.BaseURL != "https://platform.example.com/api/cli/linear/graphql" {
 		t.Errorf("BaseURL = %q, want trailing slash stripped + path appended", c.BaseURL)
 	}
 	if !c.ProxyMode {

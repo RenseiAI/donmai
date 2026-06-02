@@ -39,12 +39,12 @@ func defaultWorkareaClientFactory(cfg afclient.DaemonConfig) workareaDaemonClien
 }
 
 // workareaEnvDaemonURL — env var that overrides the daemon address for
-// `donmai workarea …` invocations. Mirrors `RENSEI_DAEMON_URL` everywhere
+// `donmai workarea …` invocations. Mirrors `DONMAI_DAEMON_URL` everywhere
 // else.
-const workareaEnvDaemonURL = "RENSEI_DAEMON_URL"
+const workareaEnvDaemonURL = "DONMAI_DAEMON_URL"
 
 // resolveWorkareaDaemonConfig builds a DaemonConfig honouring the
-// RENSEI_DAEMON_URL env override. Empty => default (127.0.0.1:7734).
+// DONMAI_DAEMON_URL env override. Empty => default (127.0.0.1:7734).
 func resolveWorkareaDaemonConfig() afclient.DaemonConfig {
 	cfg := afclient.DefaultDaemonConfig()
 	if override := strings.TrimSpace(os.Getenv(workareaEnvDaemonURL)); override != "" {

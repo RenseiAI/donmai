@@ -331,7 +331,7 @@ func (s *Server) diffStreamingThreshold() int {
 // workareaArchiveRegistry returns the daemon's archive registry,
 // constructing one on first use from the configured archive root.
 // A daemon with no Workarea config gets a registry pointed at the
-// default ~/.rensei/workareas.
+// default ~/.donmai/workareas.
 //
 // The runtime wires WorkerSpawner as the ActiveWorkareaProvider when a
 // spawner is present (Wave 11 / S5), so /api/daemon/workareas reflects

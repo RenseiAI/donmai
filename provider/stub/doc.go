@@ -5,7 +5,7 @@
 // The stub provider does not call out to any binary, network endpoint,
 // or filesystem. Each Spawn returns a Handle that emits a pre-scripted
 // sequence of agent.Event values driven by a behavior name read from
-// either Spec.Env["RENSEI_STUB_MODE"] (the legacy F.1.1 §3.3 knob) or
+// either Spec.Env["DONMAI_STUB_MODE"] (the legacy F.1.1 §3.3 knob) or
 // Spec.ProviderConfig["stub.behavior"] (the v0.5.0 typed-config knob).
 // When neither is set the provider runs in BehaviorSucceedWithPR mode.
 //

@@ -4,12 +4,12 @@
 //
 // This is the OSS-execution-layer's "Local manifests" registry source
 // from the federation list in 005-kit-manifest-spec.md § "Registry
-// sources" (item 1). Other registry sources (bundled, rensei, tessl,
+// sources" (item 1). Other registry sources (bundled, tessl,
 // agentskills, community) are not implemented in this wave; the
 // /api/daemon/kit-sources endpoint returns a static descriptor list
 // surfacing the federation order.
 //
-// Scan path defaults to ~/.rensei/kits/*.kit.toml. Multiple paths may be
+// Scan path defaults to ~/.donmai/kits/*.kit.toml. Multiple paths may be
 // declared via daemon.yaml's optional `kit.scanPaths` override.
 //
 // Behaviour:
@@ -18,7 +18,7 @@
 //   - Malformed manifests log a warning via slog and are excluded from the
 //     listing rather than failing the whole request.
 //   - Enable/disable state is persisted to a sidecar file at
-//     ~/.rensei/kits/.state.json so toggle outcomes survive daemon
+//     ~/.donmai/kits/.state.json so toggle outcomes survive daemon
 //     restarts. The file is created on first toggle.
 //   - Install is currently a stub returning ErrKitInstallUnimplemented;
 //     fetching kits from a remote registry is deferred until the
@@ -87,9 +87,8 @@ var ErrKitInstallSourceFetchFailed = errors.New("kit install: source fetch faile
 // HTTP 422.
 var ErrKitInstallManifestNotFound = errors.New("kit install: manifest not found in fetched source")
 
-// DefaultKitScanPath returns the path to the installed-kits directory,
-// resolving to ~/.donmai/kits for new installs with a one-release fallback
-// to ~/.rensei/kits when the legacy directory still exists.
+// DefaultKitScanPath returns the path to the installed-kits directory under
+// ~/.donmai/.
 func DefaultKitScanPath() string {
 	return statepath.Resolve("kits", "/tmp/.donmai/kits")
 }
@@ -919,10 +918,11 @@ func defaultKitSources() []afclient.KitRegistrySource {
 	return []afclient.KitRegistrySource{
 		{Name: "local", Kind: "local", URL: DefaultKitScanPath(), Enabled: true, Priority: 1},
 		{Name: "bundled", Kind: "bundled", URL: "", Enabled: true, Priority: 2},
-		{Name: "rensei", Kind: "rensei", URL: "https://registry.rensei.dev", Enabled: true, Priority: 3},
-		{Name: "tessl", Kind: "tessl", URL: "https://registry.tessl.io", Enabled: true, Priority: 4},
-		{Name: "agentskills", Kind: "agentskills", URL: "https://agentskills.io", Enabled: true, Priority: 5},
-		{Name: "community", Kind: "community", URL: "", Enabled: true, Priority: 6},
+		// No vendor-hosted registry default — operators configure their own
+		// kit registries. The OSS binary ships with no pointer to vendor infra.
+		{Name: "tessl", Kind: "tessl", URL: "https://registry.tessl.io", Enabled: true, Priority: 3},
+		{Name: "agentskills", Kind: "agentskills", URL: "https://agentskills.io", Enabled: true, Priority: 4},
+		{Name: "community", Kind: "community", URL: "", Enabled: true, Priority: 5},
 	}
 }
 

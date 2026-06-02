@@ -310,16 +310,16 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		slog.Warn("worker spawner: WorkerCommand not set; using /bin/sh test stub (sessions exit immediately — set WorkerCommand or deploy a binary that resolves via os.Executable)",
 			"sessionId", spec.SessionID,
 		)
-		command = []string{"/bin/sh", "-c", `printf 'session-started:%s\n' "$RENSEI_SESSION_ID"; exit 0`}
+		command = []string{"/bin/sh", "-c", `printf 'session-started:%s\n' "$DONMAI_SESSION_ID"; exit 0`}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, command[0], command[1:]...) //nolint:gosec
 	cmd.Env = composeEnv(s.opts.BaseEnv, spec.Env, map[string]string{
-		"RENSEI_SESSION_ID": spec.SessionID,
-		"RENSEI_REPOSITORY": spec.Repository,
-		"RENSEI_REF":        spec.Ref,
-		"RENSEI_PROJECT_ID": project.ID,
+		"DONMAI_SESSION_ID": spec.SessionID,
+		"DONMAI_REPOSITORY": spec.Repository,
+		"DONMAI_REF":        spec.Ref,
+		"DONMAI_PROJECT_ID": project.ID,
 	})
 
 	// OnPreSpawn is the extension point for callers that need to compute

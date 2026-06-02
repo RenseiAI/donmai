@@ -44,7 +44,7 @@ func TestFilter_RemovesBlockedKeys(t *testing.T) {
 	t.Parallel()
 	in := []string{
 		"PATH=/usr/bin",
-		"RENSEI_DAEMON_JWT=secret-jwt-value",
+		"DONMAI_DAEMON_JWT=secret-jwt-value",
 		"HOME=/Users/x",
 		"WORKER_API_KEY=rsk_abc",
 		"FOO=bar",
@@ -117,14 +117,14 @@ func TestFilter_PreservesValueEqualsSign(t *testing.T) {
 func TestBlocklistContents(t *testing.T) {
 	t.Parallel()
 	want := []string{
-		"RENSEI_DAEMON_JWT",
-		"RENSEI_DAEMON_API_KEY",
+		"DONMAI_DAEMON_JWT",
+		"DONMAI_DAEMON_API_KEY",
 		"M2M_JWT_SECRET",
 		"AUDIT_SIGNING_KEY_PRIVATE",
 		"AUDIT_SIGNING_KEY_PUBLIC",
 		"WORKOS_API_KEY",
 		"WORKOS_COOKIE_PASSWORD",
-		"RENSEI_RUNTIME_JWT",
+		"DONMAI_RUNTIME_JWT",
 		"WORKER_API_KEY",
 	}
 	got := append([]string{}, AgentEnvBlocklist...)

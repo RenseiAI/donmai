@@ -32,7 +32,7 @@ const DefaultBaseDelay = time.Second
 // construction.
 type Poster struct {
 	// platformURL is the base URL of the platform (e.g.
-	// "https://app.rensei.ai" or "http://127.0.0.1:3010"). Path joining
+	// "https://platform.example.com" or "http://127.0.0.1:3010"). Path joining
 	// uses the URL package to avoid double-slash bugs.
 	platformURL *url.URL
 

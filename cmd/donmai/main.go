@@ -52,16 +52,16 @@ func buildDataSource(flags *rootFlags) afclient.DataSource {
 }
 
 // resolveAPIKey returns the first valid API token found in the environment.
-// It checks WORKER_API_KEY and RENSEI_API_TOKEN, preferring tokens with the
+// It checks WORKER_API_KEY and DONMAI_API_TOKEN, preferring tokens with the
 // rsk_ prefix (API auth tokens) over registration tokens (rsp_).
 func resolveAPIKey() string {
-	for _, env := range []string{"WORKER_API_KEY", "RENSEI_API_TOKEN"} {
+	for _, env := range []string{"WORKER_API_KEY", "DONMAI_API_TOKEN"} {
 		if v := os.Getenv(env); v != "" && strings.HasPrefix(v, "rsk_") {
 			return v
 		}
 	}
 	// Fall back to any non-empty value if no rsk_ token was found.
-	for _, env := range []string{"WORKER_API_KEY", "RENSEI_API_TOKEN"} {
+	for _, env := range []string{"WORKER_API_KEY", "DONMAI_API_TOKEN"} {
 		if v := os.Getenv(env); v != "" {
 			return v
 		}

@@ -20,7 +20,7 @@ func TestWriteDaemonYAML_PreservesFullShape(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
 
-	original := `apiVersion: rensei.dev/v1
+	original := `apiVersion: donmai.dev/v1
 kind: LocalDaemon
 machine:
   id: my-machine
@@ -33,7 +33,7 @@ capacity:
     vCpu: 2
     memoryMb: 8192
 orchestrator:
-  url: https://app.rensei.ai
+  url: https://platform.example.com
   authToken: rsk_live_xxx
 autoUpdate:
   channel: stable
@@ -65,13 +65,13 @@ projects:
 	}
 	got := string(out)
 	for _, want := range []string{
-		"apiVersion: rensei.dev/v1",
+		"apiVersion: donmai.dev/v1",
 		"kind: LocalDaemon",
 		"id: my-machine",
 		"region: local",
 		"maxVCpuPerSession: 2",
 		"reservedForSystem:",
-		"url: https://app.rensei.ai",
+		"url: https://platform.example.com",
 		"authToken: rsk_live_xxx",
 		"channel: stable",
 		"schedule: nightly",
@@ -218,7 +218,7 @@ func TestWriteDaemonYAML_DoesNotDuplicateProjects(t *testing.T) {
 	original := `machine:
   id: m
 orchestrator:
-  url: https://app.rensei.ai
+  url: https://platform.example.com
 projects:
   - id: bar
     repository: github.com/foo/bar
