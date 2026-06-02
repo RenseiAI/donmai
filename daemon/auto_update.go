@@ -210,6 +210,19 @@ func (u *Updater) RunUpdate(ctx context.Context) (*UpdateResult, error) {
 		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "hash-failed: " + err.Error()}, err
 	}
 
+	// Integrity check: verify the downloaded binary matches the SHA256
+	// declared in the manifest before proceeding to any swap. This is
+	// defense-in-depth independent of signature verification and guards
+	// against a corrupted or tampered download even when a real verifier
+	// is not yet wired in. An empty manifest SHA256 is also rejected so
+	// that a manifest that omits the field cannot bypass this check.
+	if manifest.SHA256 == "" {
+		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "checksum-missing: manifest SHA256 is empty; refusing swap"}, errors.New("manifest SHA256 is empty")
+	}
+	if hash != manifest.SHA256 {
+		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "checksum-mismatch: downloaded binary SHA256 does not match manifest"}, fmt.Errorf("SHA256 mismatch: got %s, manifest declared %s", hash, manifest.SHA256)
+	}
+
 	valid, reason := u.opts.Verifier.Verify(ctx, hash, signature)
 	if !valid {
 		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "sig-rejected: " + reason}, nil

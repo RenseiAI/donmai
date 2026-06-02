@@ -32,6 +32,8 @@ import "strings"
 //   - WORKOS_COOKIE_PASSWORD       — WorkOS session cookie password
 //   - DONMAI_RUNTIME_JWT           — runtime JWT minted on registration
 //   - WORKER_API_KEY               — worker-protocol bearer (rsk_*)
+//   - DONMAI_DAEMON_TOKEN          — orchestrator auth token (daemon registration / re-auth)
+//   - DONMAI_ORCHESTRATOR_URL      — orchestrator base URL (internal routing surface)
 var AgentEnvBlocklist = []string{
 	"DONMAI_DAEMON_JWT",
 	"DONMAI_DAEMON_API_KEY",
@@ -42,6 +44,8 @@ var AgentEnvBlocklist = []string{
 	"WORKOS_COOKIE_PASSWORD",
 	"DONMAI_RUNTIME_JWT",
 	"WORKER_API_KEY",
+	"DONMAI_DAEMON_TOKEN",
+	"DONMAI_ORCHESTRATOR_URL",
 }
 
 // IsBlocked reports whether name is in AgentEnvBlocklist.
