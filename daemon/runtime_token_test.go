@@ -313,7 +313,7 @@ func TestPollAuthFailureReason(t *testing.T) {
 // to a full re-register. The heartbeat resumes with the refreshed
 // JWT against the SAME workerId.
 func TestHeartbeatService_RefreshOn401Probe(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 	const workerID = "wkr_persistent"
 
 	var (

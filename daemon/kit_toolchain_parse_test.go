@@ -9,7 +9,7 @@ import (
 )
 
 const toolchainManifestTOML = `
-api = "rensei.dev/v1"
+api = "donmai.dev/v1"
 [kit]
 id = "typescript"
 version = "1.0.0"
@@ -101,7 +101,7 @@ func TestDetectForRepoMatchesAndOrders(t *testing.T) {
 
 	// A framework kit that detects on next.config.ts.
 	const nextManifest = `
-api = "rensei.dev/v1"
+api = "donmai.dev/v1"
 [kit]
 id = "nextjs"
 version = "1.0.0"
@@ -185,7 +185,7 @@ func TestDetectForRepoFoundationConflict(t *testing.T) {
 	writeManifest(t, scanDir, "typescript.kit.toml", toolchainManifestTOML)
 	// Second foundation kit that also matches package.json.
 	const otherFoundation = `
-api = "rensei.dev/v1"
+api = "donmai.dev/v1"
 [kit]
 id = "other-foundation"
 version = "1.0.0"

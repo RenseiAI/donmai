@@ -333,7 +333,7 @@ func TestPollResponse_DecodesLiveWireShape(t *testing.T) {
 // spawner's AcceptWork path. Uses a stub spawner command so the spawned
 // "session" exits immediately.
 func TestPollService_DaemonIntegration(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
 	var (
 		hits        atomic.Int32

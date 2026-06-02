@@ -32,13 +32,13 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 )
 
-const minimalKitTOML = `api = "rensei.dev/v1"
+const minimalKitTOML = `api = "donmai.dev/v1"
 
 [kit]
 id = "rensei/example"
 version = "0.1.0"
 name = "Rensei Example"
-authorIdentity = "did:web:rensei.dev"
+authorIdentity = "did:web:example.com"
 `
 
 func newHermeticVerifier(t *testing.T, mode TrustMode) (*kitVerifier, *ca.VirtualSigstore) {
@@ -57,7 +57,7 @@ func TestKitVerifier_BundleVerifiesOK(t *testing.T) {
 
 	// The hermetic CA signs the manifest, returning a SignedEntity that
 	// the verifier accepts because vs is also our trusted material.
-	entity, err := vs.Sign("kit-publisher@rensei.dev", "https://issuer.example", manifestBytes)
+	entity, err := vs.Sign("kit-publisher@example.com", "https://issuer.example", manifestBytes)
 	if err != nil {
 		t.Fatalf("vs.Sign: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestKitVerifier_BundleVerifiesOK(t *testing.T) {
 	if res.SignerID == "" {
 		t.Errorf("SignerID: want populated from cert SAN, got empty")
 	}
-	if !strings.Contains(res.SignerID, "kit-publisher@rensei.dev") {
+	if !strings.Contains(res.SignerID, "kit-publisher@example.com") {
 		t.Errorf("SignerID: want to contain SAN, got %q", res.SignerID)
 	}
 	if res.SignedAt == "" {
@@ -86,7 +86,7 @@ func TestKitVerifier_TamperedBundleRejected(t *testing.T) {
 	signedBytes := []byte(minimalKitTOML)
 	tamperedBytes := []byte(strings.Replace(minimalKitTOML, "0.1.0", "9.9.9", 1))
 
-	entity, err := vs.Sign("kit-publisher@rensei.dev", "https://issuer.example", signedBytes)
+	entity, err := vs.Sign("kit-publisher@example.com", "https://issuer.example", signedBytes)
 	if err != nil {
 		t.Fatalf("vs.Sign: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestKitRegistry_InstallTrustOverrideAuditLogs(t *testing.T) {
 
 	r := NewKitRegistryWithTrust([]string{scan}, TrustConfig{
 		Mode:  TrustModeSignedByAllowlist,
-		Actor: "operator@rensei.dev",
+		Actor: "operator@example.com",
 	})
 
 	_, err := r.Install("rensei/example", afclient.KitInstallRequest{
@@ -235,11 +235,11 @@ func TestKitRegistry_InstallTrustOverrideAuditLogs(t *testing.T) {
 		}
 		// SignerID for an unsigned manifest comes from the manifest's
 		// authorIdentity backfill in installFromGit.
-		if got := rec["signerId"]; got != "did:web:rensei.dev" {
-			t.Errorf("audit signerId: want did:web:rensei.dev, got %v", got)
+		if got := rec["signerId"]; got != "did:web:example.com" {
+			t.Errorf("audit signerId: want did:web:example.com, got %v", got)
 		}
-		if got := rec["actor"]; got != "operator@rensei.dev" {
-			t.Errorf("audit actor: want operator@rensei.dev, got %v", got)
+		if got := rec["actor"]; got != "operator@example.com" {
+			t.Errorf("audit actor: want operator@example.com, got %v", got)
 		}
 		if got, _ := rec["at"].(string); got == "" {
 			t.Errorf("audit at: want RFC3339 timestamp, got empty")
@@ -277,8 +277,8 @@ func TestKitRegistry_VerifySignatureMissingBundle(t *testing.T) {
 	}
 	// Backfilled from manifest authorIdentity since the bundle path
 	// returned no SignerID.
-	if res.SignerID != "did:web:rensei.dev" {
-		t.Errorf("SignerID: want did:web:rensei.dev backfill, got %q", res.SignerID)
+	if res.SignerID != "did:web:example.com" {
+		t.Errorf("SignerID: want did:web:example.com backfill, got %q", res.SignerID)
 	}
 }
 

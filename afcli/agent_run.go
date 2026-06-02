@@ -57,7 +57,7 @@ type agentRunOpts struct {
 // API, builds a runner.Registry with the providers compiled into the
 // binary, and invokes runner.Run.
 //
-// The subcommand is intentionally headless — it expects RENSEI_SESSION_ID
+// The subcommand is intentionally headless — it expects DONMAI_SESSION_ID
 // in env (set by the spawner) or --session-id on the command line.
 // Stdout receives a single line of machine-readable JSON describing
 // the terminal Result; stderr receives slog output.
@@ -86,11 +86,11 @@ func newAgentRunCmd() *cobra.Command {
 			"loop in runner.Runner, and posts the terminal Result back to the\n" +
 			"platform.\n\n" +
 			"The session id is read from --session-id or the\n" +
-			"RENSEI_SESSION_ID environment variable (set automatically by\n" +
+			"DONMAI_SESSION_ID environment variable (set automatically by\n" +
 			"the daemon spawner).\n\n" +
 			"Operators rarely invoke this directly — `donmai daemon run` spawns it\n" +
 			"on every accepted session. To debug a session locally, set\n" +
-			"RENSEI_SESSION_ID and invoke this command against a running\n" +
+			"DONMAI_SESSION_ID and invoke this command against a running\n" +
 			"daemon.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -98,9 +98,9 @@ func newAgentRunCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&opts.sessionID, "session-id", "",
-		"Session ID to run (default: $RENSEI_SESSION_ID)")
+		"Session ID to run (default: $DONMAI_SESSION_ID)")
 	cmd.Flags().StringVar(&opts.daemonURL, "daemon-url", "",
-		"Daemon control URL (default: $RENSEI_DAEMON_URL or http://127.0.0.1:7734)")
+		"Daemon control URL (default: $DONMAI_DAEMON_URL or http://127.0.0.1:7734)")
 	cmd.Flags().StringVar(&opts.worktree, "worktree-dir", "",
 		"Per-session worktree parent directory (default: ~/.donmai/worktrees)")
 	cmd.Flags().BoolVar(&opts.preserveWT, "preserve-worktree", true,
@@ -117,16 +117,16 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// 1. Resolve the session id.
 	sessionID := strings.TrimSpace(opts.sessionID)
 	if sessionID == "" {
-		sessionID = strings.TrimSpace(os.Getenv("RENSEI_SESSION_ID"))
+		sessionID = strings.TrimSpace(os.Getenv("DONMAI_SESSION_ID"))
 	}
 	if sessionID == "" {
-		return preflightErr("missing session id: pass --session-id or set RENSEI_SESSION_ID (the daemon spawner sets this automatically)")
+		return preflightErr("missing session id: pass --session-id or set DONMAI_SESSION_ID (the daemon spawner sets this automatically)")
 	}
 
 	// 2. Resolve the daemon URL.
 	daemonURL := strings.TrimSpace(opts.daemonURL)
 	if daemonURL == "" {
-		daemonURL = strings.TrimSpace(os.Getenv("RENSEI_DAEMON_URL"))
+		daemonURL = strings.TrimSpace(os.Getenv("DONMAI_DAEMON_URL"))
 	}
 	if daemonURL == "" {
 		daemonURL = DefaultAgentRunDaemonURL

@@ -192,7 +192,7 @@ func TestLoadLocalSource_WorldReadableWarning(t *testing.T) {
 }
 
 func TestLoadLocalSource_BlocklistEnforced_ProcessSource(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_JWT", "must-not-forward")
+	t.Setenv("DONMAI_DAEMON_JWT", "must-not-forward")
 
 	root := newTempGitRoot(t)
 	s, err := LoadLocalSource(root)
@@ -201,17 +201,17 @@ func TestLoadLocalSource_BlocklistEnforced_ProcessSource(t *testing.T) {
 	}
 	// Resolve still sees it (it IS present in process env — we just
 	// refuse to forward it to children).
-	if _, _, ok := s.Resolve("RENSEI_DAEMON_JWT"); !ok {
-		t.Errorf("Resolve(RENSEI_DAEMON_JWT) ok=false, want true")
+	if _, _, ok := s.Resolve("DONMAI_DAEMON_JWT"); !ok {
+		t.Errorf("Resolve(DONMAI_DAEMON_JWT) ok=false, want true")
 	}
 	out := s.ApplyToChildEnv(nil)
 	for _, e := range out {
-		if strings.HasPrefix(e, "RENSEI_DAEMON_JWT=") {
+		if strings.HasPrefix(e, "DONMAI_DAEMON_JWT=") {
 			t.Errorf("ApplyToChildEnv forwarded blocked key: %s", e)
 		}
 	}
 	merged := s.MergeIntoBaseEnv(map[string]string{})
-	if _, ok := merged["RENSEI_DAEMON_JWT"]; ok {
+	if _, ok := merged["DONMAI_DAEMON_JWT"]; ok {
 		t.Errorf("MergeIntoBaseEnv forwarded blocked key")
 	}
 }

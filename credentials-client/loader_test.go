@@ -280,7 +280,7 @@ func TestStandaloneBlocklist(t *testing.T) {
 	t.Setenv(SocketEnvVar, "")
 	opts := withEnvironOverride([]string{
 		"FOO=visible",
-		"RENSEI_DAEMON_JWT=should-be-blocked",
+		"DONMAI_DAEMON_JWT=should-be-blocked",
 		"WORKER_API_KEY=also-blocked",
 	})
 	loader, err := New(t.Context(), opts)
@@ -289,8 +289,8 @@ func TestStandaloneBlocklist(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = loader.Close() })
 
-	if v, ok := loader.Get("RENSEI_DAEMON_JWT"); ok || v != "" {
-		t.Fatalf("Get(RENSEI_DAEMON_JWT) = (%q, %v); want (\"\", false)", v, ok)
+	if v, ok := loader.Get("DONMAI_DAEMON_JWT"); ok || v != "" {
+		t.Fatalf("Get(DONMAI_DAEMON_JWT) = (%q, %v); want (\"\", false)", v, ok)
 	}
 	if v, ok := loader.Get("WORKER_API_KEY"); ok || v != "" {
 		t.Fatalf("Get(WORKER_API_KEY) = (%q, %v); want (\"\", false)", v, ok)
@@ -299,8 +299,8 @@ func TestStandaloneBlocklist(t *testing.T) {
 		t.Fatalf("Get(FOO) = (%q, %v); want (visible, true)", v, ok)
 	}
 	all := loader.All()
-	if _, present := all["RENSEI_DAEMON_JWT"]; present {
-		t.Fatalf("All() leaked RENSEI_DAEMON_JWT: %v", all)
+	if _, present := all["DONMAI_DAEMON_JWT"]; present {
+		t.Fatalf("All() leaked DONMAI_DAEMON_JWT: %v", all)
 	}
 }
 
@@ -373,7 +373,7 @@ func TestDaemonHappyPath(t *testing.T) {
 func TestDaemonBlocklistFromINITIAL(t *testing.T) {
 	fs := newFakeServer(t, map[string]string{
 		"API_KEY":           "good",
-		"RENSEI_DAEMON_JWT": "leaked-via-bad-daemon",
+		"DONMAI_DAEMON_JWT": "leaked-via-bad-daemon",
 	})
 	fs.start()
 
@@ -386,11 +386,11 @@ func TestDaemonBlocklistFromINITIAL(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = loader.Close() })
 
-	if v, ok := loader.Get("RENSEI_DAEMON_JWT"); ok || v != "" {
-		t.Fatalf("Get(RENSEI_DAEMON_JWT) leaked: (%q, %v)", v, ok)
+	if v, ok := loader.Get("DONMAI_DAEMON_JWT"); ok || v != "" {
+		t.Fatalf("Get(DONMAI_DAEMON_JWT) leaked: (%q, %v)", v, ok)
 	}
-	if _, present := loader.All()["RENSEI_DAEMON_JWT"]; present {
-		t.Fatalf("All() leaked RENSEI_DAEMON_JWT")
+	if _, present := loader.All()["DONMAI_DAEMON_JWT"]; present {
+		t.Fatalf("All() leaked DONMAI_DAEMON_JWT")
 	}
 }
 
@@ -604,7 +604,7 @@ func TestDaemonUpdateAppliesBlocklist(t *testing.T) {
 	fs := newFakeServer(t, map[string]string{})
 	fs.pushUpdate(map[string]string{
 		"GOOD":              "ok",
-		"RENSEI_DAEMON_JWT": "leak",
+		"DONMAI_DAEMON_JWT": "leak",
 	})
 	fs.releaseUpdates = make(chan struct{})
 	fs.start()
@@ -626,7 +626,7 @@ func TestDaemonUpdateAppliesBlocklist(t *testing.T) {
 
 	select {
 	case d := <-received:
-		if _, leaked := d["RENSEI_DAEMON_JWT"]; leaked {
+		if _, leaked := d["DONMAI_DAEMON_JWT"]; leaked {
 			t.Fatalf("subscriber received blocked key: %v", d)
 		}
 		if d["GOOD"] != "ok" {
@@ -636,7 +636,7 @@ func TestDaemonUpdateAppliesBlocklist(t *testing.T) {
 		t.Fatalf("subscriber did not receive UPDATE")
 	}
 
-	if v, _ := loader.Get("RENSEI_DAEMON_JWT"); v != "" {
+	if v, _ := loader.Get("DONMAI_DAEMON_JWT"); v != "" {
 		t.Fatalf("Get leaked blocked key from UPDATE")
 	}
 }

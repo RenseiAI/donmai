@@ -4,7 +4,7 @@
 // Wave 9 / Track A3 / ADR-2026-05-07-daemon-http-control-api.md §D4a.
 //
 // Archive layout. Each archive is a directory under the daemon's archive
-// root (default ~/.rensei/workareas/<archiveID>/) containing:
+// root (default ~/.donmai/workareas/<archiveID>/) containing:
 //
 //	manifest.json   — metadata sidecar (id, sessionId, createdAt,
 //	                  sizeBytes, sourceProvider, capabilities,
@@ -12,14 +12,14 @@
 //	tree/           — the workarea filesystem snapshot. Diffs and
 //	                  restores walk this subtree only; everything outside
 //	                  it (manifest.json, daemon-private bookkeeping) is
-//	                  ignored. The well-known .rensei/ directory under
+//	                  ignored. The well-known .donmai/ directory under
 //	                  tree/ is also excluded from diff walks per ADR D4a.
 //
 // The registry is stateless w.r.t. process lifecycle — every call hits
 // disk. That's fine: archive directories are small in count (operator
 // scale), the OS dentry cache absorbs repeated listings, and avoiding
 // in-memory state means the daemon never serves a stale view after an
-// out-of-band write to ~/.rensei/workareas/.
+// out-of-band write to ~/.donmai/workareas/.
 package daemon
 
 import (
@@ -42,8 +42,7 @@ import (
 	"github.com/RenseiAI/donmai/internal/statepath"
 )
 
-// defaultArchiveDir resolves the default archive root, ~/.donmai/workareas
-// (with one-release fallback to ~/.rensei/workareas for existing installs).
+// defaultArchiveDir resolves the default archive root, ~/.donmai/workareas.
 func defaultArchiveDir() string {
 	return statepath.Resolve("workareas", "/tmp/.donmai/workareas")
 }
@@ -123,7 +122,7 @@ type PoolCapacityGuard interface {
 // WorkareaArchiveOptions configures a registry.
 type WorkareaArchiveOptions struct {
 	// Root is the directory the registry scans. Empty selects the
-	// default ~/.rensei/workareas.
+	// default ~/.donmai/workareas.
 	Root string
 	// ActiveProvider is the live pool view; may be nil (archives-only
 	// list, see ActiveWorkareaProvider).
@@ -225,7 +224,7 @@ func (r *WorkareaArchiveRegistry) Get(id string) (*afclient.Workarea, error) {
 // Diff returns the structured per-path delta between two archives.
 // Both ids MUST resolve to archives (live diffs are out of scope per ADR
 // D4a). Walks are deterministic — entries are sorted by path. The
-// well-known .rensei/ subtree under each archive's tree/ root is
+// well-known .donmai/ subtree under each archive's tree/ root is
 // excluded.
 func (r *WorkareaArchiveRegistry) Diff(idA, idB string) (*afclient.WorkareaDiffResult, error) {
 	for _, id := range []string{idA, idB} {
@@ -584,7 +583,7 @@ type archiveEntry struct {
 	Hash      string // sha256 hex; empty for directories
 }
 
-// walkArchiveTree walks a tree root, skipping the well-known .rensei
+// walkArchiveTree walks a tree root, skipping the well-known .donmai
 // daemon-private subtree. The result is sorted by Path so subsequent
 // merge-walks are deterministic.
 func walkArchiveTree(root string) ([]archiveEntry, error) {
@@ -602,7 +601,7 @@ func walkArchiveTree(root string) ([]archiveEntry, error) {
 		}
 		rel = filepath.ToSlash(rel)
 		// Skip the well-known daemon-private subtree per ADR D4a.
-		if rel == ".rensei" || strings.HasPrefix(rel, ".rensei/") {
+		if rel == ".donmai" || strings.HasPrefix(rel, ".donmai/") {
 			if d.IsDir() {
 				return fs.SkipDir
 			}

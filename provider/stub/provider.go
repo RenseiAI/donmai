@@ -46,7 +46,7 @@ func WithCapabilities(caps agent.Capabilities) Option {
 }
 
 // WithDefaultBehavior overrides the behavior used when neither
-// Spec.Env[RENSEI_STUB_MODE] nor Spec.ProviderConfig["stub.behavior"]
+// Spec.Env[DONMAI_STUB_MODE] nor Spec.ProviderConfig["stub.behavior"]
 // is set on a Spec.
 func WithDefaultBehavior(b Behavior) Option {
 	return func(p *provider) { p.defaultBehavior = b }
@@ -135,7 +135,7 @@ func (p *provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 func (p *provider) Shutdown(_ context.Context) error { return nil }
 
 // resolveBehavior reads Spec.ProviderConfig["stub.behavior"] (typed
-// knob) or Spec.Env["RENSEI_STUB_MODE"] (legacy knob) and falls back
+// knob) or Spec.Env["DONMAI_STUB_MODE"] (legacy knob) and falls back
 // to the provider's default behavior. Unknown names also fall back.
 func (p *provider) resolveBehavior(spec agent.Spec) Behavior {
 	// Typed ProviderConfig wins if present and a string.

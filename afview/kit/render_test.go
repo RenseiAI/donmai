@@ -70,7 +70,7 @@ func sampleManifest() *afclient.KitManifest {
 
 func sampleSources() []afclient.KitRegistrySource {
 	return []afclient.KitRegistrySource{
-		{Name: "local", Kind: "local", URL: "~/.rensei/kits", Enabled: true, Priority: 1},
+		{Name: "local", Kind: "local", URL: "~/.donmai/kits", Enabled: true, Priority: 1},
 		{Name: "tessl", Kind: "tessl", URL: "https://registry.tessl.io", Enabled: false, Priority: 4},
 	}
 }

@@ -399,7 +399,7 @@ func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
 
 	qw := QueuedWork{}
 	qw.SessionID = "sess_abc"
-	qw.PlatformURL = "https://app.rensei.ai"
+	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
 
 	servers := defaultMCPServers(qw)
@@ -413,7 +413,7 @@ func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
 	if got.Type != "http" {
 		t.Errorf("type=%q, want http", got.Type)
 	}
-	if got.URL != "https://app.rensei.ai/api/mcp/sess_abc" {
+	if got.URL != "https://platform.example.com/api/mcp/sess_abc" {
 		t.Errorf("url=%q", got.URL)
 	}
 	if got.Headers["Authorization"] != "Bearer rsk_test" {
@@ -428,14 +428,14 @@ func TestDefaultMCPServers_TrimsTrailingSlash(t *testing.T) {
 
 	qw := QueuedWork{}
 	qw.SessionID = "sess_xyz"
-	qw.PlatformURL = "https://app.rensei.ai/"
+	qw.PlatformURL = "https://platform.example.com/"
 	qw.AuthToken = "rsk_test"
 
 	servers := defaultMCPServers(qw)
 	if len(servers) != 1 {
 		t.Fatalf("len(servers)=%d, want 1", len(servers))
 	}
-	if servers[0].URL != "https://app.rensei.ai/api/mcp/sess_xyz" {
+	if servers[0].URL != "https://platform.example.com/api/mcp/sess_xyz" {
 		t.Errorf("url=%q (double-slash leak?)", servers[0].URL)
 	}
 }
@@ -456,12 +456,12 @@ func TestDefaultMCPServers_OmitsWhenStandalone(t *testing.T) {
 			return qw
 		}()},
 		{"no AuthToken", func() QueuedWork {
-			qw := QueuedWork{PlatformURL: "https://app.rensei.ai"}
+			qw := QueuedWork{PlatformURL: "https://platform.example.com"}
 			qw.SessionID = "sess_1"
 			return qw
 		}()},
 		{"no SessionID", QueuedWork{
-			PlatformURL: "https://app.rensei.ai",
+			PlatformURL: "https://platform.example.com",
 			AuthToken:   "rsk_test",
 		}},
 	}

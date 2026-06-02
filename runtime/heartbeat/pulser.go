@@ -53,7 +53,7 @@ type Config struct {
 	// this is empty — so callers must populate it (REN-1465). Sourced
 	// from prompt.QueuedWork.IssueID (camelCase "issueId" on the wire).
 	IssueID string
-	// BaseURL is the platform API base, e.g. "https://app.rensei.ai".
+	// BaseURL is the platform API base, e.g. "https://platform.example.com".
 	// Required.
 	BaseURL string
 	// AuthToken is sent as Bearer in the Authorization header.

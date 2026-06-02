@@ -32,8 +32,8 @@ type rotateEnv struct {
 	// Err receives warnings/errors that aren't returned via the run error.
 	Err io.Writer
 
-	// HomeDir is the home directory used to resolve ~/.rensei/cli.token
-	// and ~/.rensei/cli-config.yaml. Production wiring passes
+	// HomeDir is the home directory used to resolve ~/.donmai/cli.token
+	// and ~/.donmai/cli-config.yaml. Production wiring passes
 	// os.UserHomeDir()'s result.
 	HomeDir string
 
@@ -91,10 +91,10 @@ func newRotateCmd() *cobra.Command {
 			"emits a rotate event to every live session for the org. This command\n" +
 			"does NOT mutate the credential itself; it triggers the fan-out only.\n" +
 			"\n" +
-			"Reads --platform-url from RENSEI_PLATFORM_URL, --rsk-token from\n" +
-			"RENSEI_RSK_TOKEN / WORKER_API_KEY / RENSEI_API_TOKEN /\n" +
-			"~/.rensei/cli.token (in that order), and --org-id from\n" +
-			"RENSEI_ORG_ID / ~/.rensei/cli-config.yaml.",
+			"Reads --platform-url from DONMAI_PLATFORM_URL, --rsk-token from\n" +
+			"DONMAI_RSK_TOKEN / WORKER_API_KEY / DONMAI_API_TOKEN /\n" +
+			"~/.donmai/cli.token (in that order), and --org-id from\n" +
+			"DONMAI_ORG_ID / ~/.donmai/cli-config.yaml.",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -118,12 +118,12 @@ func newRotateCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&orgID, "org-id", "",
-		"Target org id (overrides RENSEI_ORG_ID / cli-config.yaml)")
+		"Target org id (overrides DONMAI_ORG_ID / cli-config.yaml)")
 	cmd.Flags().StringVar(&platformURL, "platform-url", "",
-		"Platform base URL (overrides RENSEI_PLATFORM_URL)")
+		"Platform base URL (overrides DONMAI_PLATFORM_URL)")
 	cmd.Flags().StringVar(&rskToken, "rsk-token", "",
-		"rsk_* token (overrides RENSEI_RSK_TOKEN / WORKER_API_KEY / "+
-			"RENSEI_API_TOKEN / ~/.rensei/cli.token)")
+		"rsk_* token (overrides DONMAI_RSK_TOKEN / WORKER_API_KEY / "+
+			"DONMAI_API_TOKEN / ~/.donmai/cli.token)")
 
 	return cmd
 }
@@ -141,15 +141,15 @@ func runRotate(ctx context.Context, env *rotateEnv, flags rotateFlags) error {
 
 	// Resolve --platform-url. Flag wins; else env.
 	if flags.platformURL == "" {
-		flags.platformURL = env.Getenv("RENSEI_PLATFORM_URL")
+		flags.platformURL = env.Getenv("DONMAI_PLATFORM_URL")
 	}
 	if flags.platformURL == "" {
-		return errors.New("--platform-url required (or set RENSEI_PLATFORM_URL)")
+		return errors.New("--platform-url required (or set DONMAI_PLATFORM_URL)")
 	}
 
 	// Resolve --rsk-token. Flag wins; else env precedence; else token file.
 	if flags.rskToken == "" {
-		for _, name := range []string{"RENSEI_RSK_TOKEN", "WORKER_API_KEY", "RENSEI_API_TOKEN"} {
+		for _, name := range []string{"DONMAI_RSK_TOKEN", "WORKER_API_KEY", "DONMAI_API_TOKEN"} {
 			if v := env.Getenv(name); v != "" {
 				flags.rskToken = v
 				break
@@ -157,29 +157,29 @@ func runRotate(ctx context.Context, env *rotateEnv, flags rotateFlags) error {
 		}
 	}
 	if flags.rskToken == "" && env.HomeDir != "" {
-		tokenPath := filepath.Join(env.HomeDir, ".rensei", "cli.token")
+		tokenPath := filepath.Join(env.HomeDir, ".donmai", "cli.token")
 		if data, err := env.ReadFile(tokenPath); err == nil {
 			flags.rskToken = strings.TrimSpace(string(data))
 		}
 	}
 	if flags.rskToken == "" {
-		return errors.New("--rsk-token required (or set RENSEI_RSK_TOKEN / " +
-			"WORKER_API_KEY / RENSEI_API_TOKEN, or write to ~/.rensei/cli.token)")
+		return errors.New("--rsk-token required (or set DONMAI_RSK_TOKEN / " +
+			"WORKER_API_KEY / DONMAI_API_TOKEN, or write to ~/.donmai/cli.token)")
 	}
 
 	// Resolve --org-id. Flag wins; else env; else cli-config.yaml.
 	if flags.orgID == "" {
-		flags.orgID = env.Getenv("RENSEI_ORG_ID")
+		flags.orgID = env.Getenv("DONMAI_ORG_ID")
 	}
 	if flags.orgID == "" && env.HomeDir != "" {
-		configPath := filepath.Join(env.HomeDir, ".rensei", "cli-config.yaml")
+		configPath := filepath.Join(env.HomeDir, ".donmai", "cli-config.yaml")
 		if data, err := env.ReadFile(configPath); err == nil {
 			flags.orgID = parseOrgIDFromConfig(data)
 		}
 	}
 	if flags.orgID == "" {
-		return errors.New("--org-id required (or set RENSEI_ORG_ID, " +
-			"or add an `orgId:` line to ~/.rensei/cli-config.yaml)")
+		return errors.New("--org-id required (or set DONMAI_ORG_ID, " +
+			"or add an `orgId:` line to ~/.donmai/cli-config.yaml)")
 	}
 
 	// Build POST body.
@@ -245,7 +245,7 @@ func decodeAndFormatError(status int, body []byte) error {
 	// them without parsing the platform's message verbatim.
 	switch status {
 	case http.StatusUnauthorized:
-		return fmt.Errorf("rotate failed: 401 unauthorized — check RENSEI_RSK_TOKEN: %s", msg)
+		return fmt.Errorf("rotate failed: 401 unauthorized — check DONMAI_RSK_TOKEN: %s", msg)
 	case http.StatusForbidden:
 		return fmt.Errorf("rotate failed: 403 auth orgId mismatch (or missing admin role): %s", msg)
 	case http.StatusNotFound:

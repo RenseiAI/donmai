@@ -73,7 +73,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			//   1. existing process env
 			//   2. ${gitRoot}/.env.local (parsed once at startup)
 			//
-			// Auto-detect mode: absence of RENSEI_DAEMON_JWT means we
+			// Auto-detect mode: absence of DONMAI_DAEMON_JWT means we
 			// are NOT being driven by rensei-tui's credential socket
 			// and should seed env from the local source. Operators
 			// can pin the mode via --standalone-creds=on|off.
@@ -83,7 +83,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 				_, _ = fmt.Fprintf(errOut, "[creds] LoadLocalSource: %v (continuing with process env only)\n", lsErr)
 				localSource = nil
 			}
-			mode := resolveStandaloneCredsMode(standaloneCreds, os.Getenv("RENSEI_DAEMON_JWT") != "")
+			mode := resolveStandaloneCredsMode(standaloneCreds, os.Getenv("DONMAI_DAEMON_JWT") != "")
 			spawnerOpts := daemon.SpawnerOptions{}
 			if mode && localSource != nil {
 				spawnerOpts.BaseEnv = localSource.MergeIntoBaseEnv(nil)
@@ -166,7 +166,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 	cmd.Flags().IntVar(&port, "port", 0, "HTTP bind port (default: 7734)")
 	cmd.Flags().BoolVar(&skipWizard, "skip-wizard", false, "Skip the first-run setup wizard")
 	cmd.Flags().StringVar(&standaloneCreds, "standalone-creds", "auto",
-		"Standalone credential mode (on|off|auto). When on, AF-TUI seeds child agent env from process env + ${gitRoot}/.env.local. When auto, on is selected when RENSEI_DAEMON_JWT is unset (i.e. not running under rensei-tui).")
+		"Standalone credential mode (on|off|auto). When on, AF-TUI seeds child agent env from process env + ${gitRoot}/.env.local. When auto, on is selected when DONMAI_DAEMON_JWT is unset (i.e. not running under rensei-tui).")
 
 	return cmd
 }
@@ -176,7 +176,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 //
 //   - "on"   → always seed.
 //   - "off"  → never seed (rensei-tui or other credential pipeline owns env).
-//   - "auto" → seed iff !daemonJWTPresent (no RENSEI_DAEMON_JWT in env).
+//   - "auto" → seed iff !daemonJWTPresent (no DONMAI_DAEMON_JWT in env).
 //
 // Unknown values fall back to "auto" with a slog.Warn — operators get a
 // surfaced misconfiguration but the daemon does not refuse to start.

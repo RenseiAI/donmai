@@ -952,7 +952,7 @@ func TestLinearEnvWinsOverDataSource(t *testing.T) {
 	// DataSource is non-nil + authenticated, but should be ignored because
 	// the env var takes precedence.
 	ds := func() afclient.DataSource {
-		return afclient.NewAuthenticatedClient("https://app.rensei.ai", "rsk_should_not_be_used")
+		return afclient.NewAuthenticatedClient("https://platform.example.com", "rsk_should_not_be_used")
 	}
 
 	root := newLinearCmd(ds)
