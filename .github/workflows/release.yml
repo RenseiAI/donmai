@@ -20,7 +20,7 @@ jobs:
     # CGO_ENABLED=0 (set in .goreleaser.yaml).
     runs-on: macos-latest
     # Job-level env block: REN-1412. Step-level env: blocks on
-    # goreleaser/goreleaser-action@v6 (node24 action) did not propagate
+    # goreleaser/goreleaser-action@v7 (node24 action) did not propagate
     # APPLE_DEVELOPER_ID/APPLE_PASSWORD/APPLE_TEAM_ID to the goreleaser
     # subprocess, causing `signs[].env: APPLE_DEVELOPER_ID={{ .Env.APPLE_DEVELOPER_ID }}`
     # template eval to fail with `map has no entry for key
@@ -79,7 +79,7 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
           rm -f "$RUNNER_TEMP/cert.p12"
 
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: release --clean
