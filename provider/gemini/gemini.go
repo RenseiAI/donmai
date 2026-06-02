@@ -17,7 +17,9 @@ import (
 const DefaultEndpoint = "https://generativelanguage.googleapis.com"
 
 // DefaultModel is the model identifier used when Spec.Model is empty.
-// gemini-3.5-flash is the current GA flagship agentic/coding model (1M ctx).
+// gemini-3.5-flash is the GA flagship agentic/coding model (1M context,
+// native function-calling, thinking_level knob). It is the donmai-wide
+// default per the Gemini-first-class program.
 const DefaultModel = "gemini-3.5-flash"
 
 // DefaultRequestTimeout caps a single Spawn HTTP request. Streaming
@@ -126,33 +128,69 @@ func New(opts Options) (*Provider, error) {
 // Name returns ProviderGemini. Stable for the lifetime of the Provider.
 func (*Provider) Name() agent.ProviderName { return agent.ProviderGemini }
 
-// Capabilities returns the conservative v0.1 matrix. Tool use and
-// reasoning effort flip on as we wire each round-trip.
+// Capabilities returns the agentic matrix for the Gemini native runner.
+// The runner drives a multi-turn generateContent conversation with
+// function-calling, executes the model's functionCalls via a
+// session-local executor (native Bash/Read/Edit/Write), maps
+// reasoning-effort onto thinkingConfig, and supports post-completion
+// steering by appending a user turn and re-driving the loop.
 func (*Provider) Capabilities() agent.Capabilities {
 	return agent.Capabilities{
-		SupportsMessageInjection:            false,
-		SupportsSessionResume:               false,
-		SupportsToolPlugins:                 false,
+		// Message injection appends a user turn to the maintained
+		// contents history and re-drives the conversation loop (no
+		// subprocess, no resume). This also unblocks runner steering
+		// so Gemini sessions are no longer skipped.
+		SupportsMessageInjection: true,
+		// Resume folds prior contents into a fresh Spawn; the REST
+		// endpoint is stateless so resume is best-effort prompt-fold.
+		SupportsSessionResume: false,
+		// SupportsToolPlugins covers the native tool surface: the
+		// session-local executor runs Bash/Read/Edit/Write functionCalls
+		// in-box. (It does NOT cover stdio MCP plugins — see
+		// AcceptsMcpServerSpec below.)
+		SupportsToolPlugins:                 true,
 		NeedsBaseInstructions:               false,
 		NeedsPermissionConfig:               false,
 		SupportsCodeIntelligenceEnforcement: false,
 		EmitsSubagentEvents:                 false,
-		SupportsReasoningEffort:             false,
-		ToolPermissionFormat:                "claude",
-		// Tool-use surface (002 v2): generateContent supports a `tools`
-		// array (function declarations), but the v0.1 spec_translation
-		// builds Contents only — function-calling is not wired. Declare
-		// false until the round-trip lands.
-		AcceptsAllowedToolsList: false,
-		AcceptsMcpServerSpec:    false,
-		HumanLabel:              "Gemini",
+		// Reasoning effort maps to thinkingConfig: thinking_level for
+		// 3.x model IDs, thinkingBudget for 2.5 model IDs.
+		SupportsReasoningEffort: true,
+		// Gemini has no Claude permission grammar; tool gating happens
+		// via toolConfig.functionCallingConfig.mode, not a pattern list.
+		ToolPermissionFormat: ToolPermissionFormatGemini,
+		// AcceptsAllowedToolsList: Spec.AllowedTools is honored
+		// end-to-end — each pattern's verb becomes a functionDeclaration
+		// AND the session-local executor runs the resulting native
+		// functionCall (Bash/Read/Edit/Write), so the field shape is not
+		// silently dropped.
+		AcceptsAllowedToolsList: true,
+		// AcceptsMcpServerSpec: FALSE. There is no in-box MCP client in
+		// this repo — Spec.MCPServers entries are surfaced to the model
+		// as catch-all functionDeclarations, but no code routes the
+		// resulting mcp__* functionCall to a live MCP server (the
+		// executor returns a structured "not executable" error). Per the
+		// v2 contract a provider MUST declare false when the field is
+		// silently dropped end-to-end. Flip to true only once a real MCP
+		// bridge lands.
+		AcceptsMcpServerSpec: false,
+		HumanLabel:           "Gemini",
 	}
 }
 
-// Spawn opens a streaming generateContent call and returns a Handle
-// whose Events channel emits exactly one InitEvent, zero or more
-// AssistantTextEvents, and exactly one terminal ResultEvent (or
-// ErrorEvent on transport failure).
+// Spawn drives a multi-turn generateContent conversation and returns a
+// Handle whose Events channel emits exactly one InitEvent, zero or more
+// AssistantText / ToolUse events, and exactly one terminal ResultEvent
+// (or ErrorEvent on transport failure).
+//
+// The conversation history (contents array) is maintained inside the
+// Handle across turns because the REST endpoint is stateless: a
+// functionCall from the model surfaces a ToolUse event, the provider
+// runs the tool via the session-local executor, surfaces a ToolResult
+// event, and folds the functionResponse back into the loop as a
+// user-role turn (the live API rejects role "function"). Post-completion
+// steering arrives via Handle.Inject, which appends a user turn and
+// re-drives.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
@@ -163,27 +201,57 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		model = p.defaultModel
 	}
 
-	body, err := buildRequestBody(spec)
+	plan, err := buildSpawnPlan(spec, model)
 	if err != nil {
 		return nil, fmt.Errorf("%w: build request: %w", agent.ErrSpawnFailed, err)
 	}
 
-	url := fmt.Sprintf(
-		"%s/v1beta/models/%s:streamGenerateContent?alt=sse",
-		p.endpoint, model,
-	)
+	// Per-Spawn credential resolution (per-session BYOK + rotation):
+	// Spec.Env[GEMINI_API_KEY] → Spec.Env[GOOGLE_API_KEY] → the
+	// construction-time fallback captured in New().
+	apiKey := resolveSpawnKey(spec, p.apiKey)
+	if apiKey == "" {
+		return nil, fmt.Errorf(
+			"%w: gemini provider has no API key (Spec.Env[%s|%s] empty and no construction fallback)",
+			agent.ErrSpawnFailed, EnvAPIKeyPrimary, EnvAPIKeyFallback,
+		)
+	}
 
 	return startSession(ctx, sessionParams{
-		apiKey:    p.apiKey,
-		url:       url,
-		body:      body,
+		apiKey:    apiKey,
+		endpoint:  p.endpoint,
+		model:     model,
+		plan:      plan,
 		client:    p.httpClient,
 		sessionID: p.sessionIDFn(),
+		// cwd / env drive the session-local tool executor: native
+		// functionCalls (Bash/Read/Edit/Write) run in the session's
+		// working directory with the session env.
+		cwd: spec.Cwd,
+		env: spec.Env,
 	})
 }
 
-// Resume always returns ErrUnsupported. Gemini's REST endpoint is
-// stateless; the runner is expected to gate on Capabilities.
+// resolveSpawnKey resolves the API key for a single Spawn. The
+// precedence is Spec.Env[GEMINI_API_KEY] → Spec.Env[GOOGLE_API_KEY] →
+// the construction-time fallback. This supports per-session BYOK and
+// key rotation without reconstructing the Provider.
+func resolveSpawnKey(spec agent.Spec, fallback string) string {
+	if spec.Env != nil {
+		if k := strings.TrimSpace(spec.Env[EnvAPIKeyPrimary]); k != "" {
+			return k
+		}
+		if k := strings.TrimSpace(spec.Env[EnvAPIKeyFallback]); k != "" {
+			return k
+		}
+	}
+	return fallback
+}
+
+// Resume folds prior conversation history into a fresh Spawn. Gemini's
+// REST endpoint is stateless, so true server-side resume is impossible;
+// SupportsSessionResume is false and the runner gates on it. The method
+// returns ErrUnsupported to keep the contract explicit.
 func (*Provider) Resume(_ context.Context, _ string, _ agent.Spec) (agent.Handle, error) {
 	return nil, fmt.Errorf("provider/gemini: Resume: %w (stateless REST endpoint)", agent.ErrUnsupported)
 }
