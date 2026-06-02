@@ -197,7 +197,10 @@ func TestAgentEnvBlocklistMatchesLegacyTS(t *testing.T) {
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
 		"ANTHROPIC_BASE_URL",
+		"GEMINI_API_KEY",
+		"GOOGLE_API_KEY",
 		"OPENCLAW_GATEWAY_TOKEN",
+		"OPENAI_API_KEY",
 	}
 	if !reflect.DeepEqual(env.AgentEnvBlocklist, want) {
 		t.Fatalf("AgentEnvBlocklist drifted from legacy TS port:\n got: %v\nwant: %v",

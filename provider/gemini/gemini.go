@@ -17,8 +17,8 @@ import (
 const DefaultEndpoint = "https://generativelanguage.googleapis.com"
 
 // DefaultModel is the model identifier used when Spec.Model is empty.
-// 2.0-flash is the cheapest GA model that supports streaming today.
-const DefaultModel = "gemini-2.0-flash"
+// gemini-3.5-flash is the current GA flagship agentic/coding model (1M ctx).
+const DefaultModel = "gemini-3.5-flash"
 
 // DefaultRequestTimeout caps a single Spawn HTTP request. Streaming
 // responses can run for many minutes, so this is generous; the runner

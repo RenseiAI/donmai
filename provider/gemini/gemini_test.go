@@ -109,7 +109,7 @@ func TestProvider_Spawn_HappyPath(t *testing.T) {
 		if got, want := r.Header.Get("x-goog-api-key"), "test-key"; got != want {
 			t.Errorf("x-goog-api-key: want %q, got %q", want, got)
 		}
-		if !strings.Contains(r.URL.Path, "gemini-2.0-flash:streamGenerateContent") {
+		if !strings.Contains(r.URL.Path, "gemini-3.5-flash:streamGenerateContent") {
 			t.Errorf("path: want default model in URL, got %q", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
