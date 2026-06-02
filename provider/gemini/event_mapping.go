@@ -184,10 +184,16 @@ func accumulateUsage(u *usageMetadata, state *turnState) {
 }
 
 // buildResultEvent constructs the terminal ResultEvent from the finish
-// reason + accumulated cost. STOP / MAX_TOKENS are successes; SAFETY /
-// RECITATION / other reasons are failures.
+// reason + accumulated cost.
+//
+// STOP (or empty finish reason on an intermediate tool-call turn) is a
+// clean success. MAX_TOKENS is a truncation signal, NOT a success: the
+// response was cut short mid-generation and the runner's acceptance gate
+// must not treat it as a complete result. SAFETY / RECITATION / OTHER
+// are explicit content-policy failures. Every other non-empty reason is
+// also treated as failure to be conservative.
 func buildResultEvent(finishReason string, state *turnState, raw any) agent.ResultEvent {
-	success := finishReason == "" || finishReason == "STOP" || finishReason == "MAX_TOKENS"
+	success := finishReason == "" || finishReason == "STOP"
 	ev := agent.ResultEvent{
 		Success: success,
 		Message: "finish_reason=" + finishReason,

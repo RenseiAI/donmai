@@ -110,6 +110,40 @@ func TestMapResponse_MalformedJSON_Error(t *testing.T) {
 	}
 }
 
+// TestMapResponse_MaxTokens_IsNonSuccess verifies that a MAX_TOKENS
+// finish reason is classified as a truncation (Success=false), NOT a
+// success. A truncated response misleads the runner's acceptance gate if
+// Success is true — the caller cannot distinguish a clean finish from one
+// where the model ran out of budget mid-response.
+func TestMapResponse_MaxTokens_IsNonSuccess(t *testing.T) {
+	t.Parallel()
+	in := []byte(`{"candidates":[{"content":{"parts":[{"text":"partial output..."}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":100}}`)
+	turn := mapResponse(in, &turnState{model: "gemini-3.5-flash"})
+	if turn.outcome != outcomeFinal {
+		t.Fatalf("outcome: want outcomeFinal, got %v", turn.outcome)
+	}
+	res, ok := turn.result.(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("result: want ResultEvent, got %T", turn.result)
+	}
+	if res.Success {
+		t.Error("Result.Success: want false for MAX_TOKENS (truncation, not clean finish)")
+	}
+	if res.ErrorSubtype != "finish_MAX_TOKENS" {
+		t.Errorf("ErrorSubtype: want finish_MAX_TOKENS, got %q", res.ErrorSubtype)
+	}
+	if len(res.Errors) == 0 || res.Errors[0] != "MAX_TOKENS" {
+		t.Errorf("Errors: want [MAX_TOKENS], got %v", res.Errors)
+	}
+	// Text events must still be emitted even though the result is non-success.
+	if len(turn.events) != 1 {
+		t.Fatalf("events: want 1 (partial text), got %d", len(turn.events))
+	}
+	if _, ok := turn.events[0].(agent.AssistantTextEvent); !ok {
+		t.Fatalf("events[0]: want AssistantTextEvent, got %T", turn.events[0])
+	}
+}
+
 // TestMapResponse_CostAccumulatesAcrossTurns verifies the running totals
 // fold across multiple turns (function-call round-trip then final).
 func TestMapResponse_CostAccumulatesAcrossTurns(t *testing.T) {

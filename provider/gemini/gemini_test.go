@@ -488,6 +488,104 @@ func TestHandle_Inject_Steering(t *testing.T) {
 	}
 }
 
+// TestProvider_Spawn_MaxTurnsCap verifies that the driver terminates with
+// a non-success ResultEvent (ErrorSubtype "error_max_turns") when the model
+// keeps emitting functionCalls beyond the MaxTurns ceiling. Without the
+// cap a model that loops on tool calls would run unbounded with unbounded
+// API spend.
+func TestProvider_Spawn_MaxTurnsCap(t *testing.T) {
+	t.Parallel()
+
+	// The fake server always responds with a functionCall so the driver
+	// would loop forever without a MaxTurns cap.
+	var turnNum int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		turnNum++
+		mu.Unlock()
+		// Every response is a functionCall (Bash echo) so the loop
+		// never reaches outcomeFinal on its own.
+		writeJSON(w, `{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-1","name":"Bash","args":{"command":"echo loop"}}}]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":5}}`)
+	}))
+	defer srv.Close()
+
+	cap := 2
+	p := mustNew(t, srv.URL)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:       "loop forever",
+		MaxTurns:     &cap,
+		AllowedTools: []string{"Bash"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+
+	events := drainUntilResult(t, h)
+
+	// The last event must be a ResultEvent with Success=false and the
+	// "error_max_turns" subtype. It must NOT be an ErrorEvent (which
+	// would indicate a driver panic/bug rather than a clean cap).
+	last := events[len(events)-1]
+	res, ok := last.(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("last event: want ResultEvent (clean cap), got %T: %#v", last, last)
+	}
+	if res.Success {
+		t.Error("Result.Success: want false when MaxTurns exceeded")
+	}
+	if res.ErrorSubtype != "error_max_turns" {
+		t.Errorf("ErrorSubtype: want error_max_turns, got %q", res.ErrorSubtype)
+	}
+	if res.Cost == nil {
+		t.Fatal("Result.Cost: want non-nil (cost must be reported even on cap)")
+	}
+	// The driver must have executed exactly cap turns before stopping.
+	if res.Cost.NumTurns != cap {
+		t.Errorf("Cost.NumTurns: want %d (cap hit), got %d", cap, res.Cost.NumTurns)
+	}
+
+	mu.Lock()
+	gotTurns := turnNum
+	mu.Unlock()
+	if gotTurns != cap {
+		t.Errorf("server received %d requests, want exactly %d (cap=%d)", gotTurns, cap, cap)
+	}
+}
+
+// TestProvider_Spawn_MaxTurnsZeroUncapped verifies that MaxTurns=0 (or
+// absent) does NOT cap the session (the session finishes normally).
+func TestProvider_Spawn_MaxTurnsZeroUncapped(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Single clean STOP response — no tool calls.
+		writeJSON(w, `{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3}}`)
+	}))
+	defer srv.Close()
+
+	zero := 0
+	p := mustNew(t, srv.URL)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:   "simple task",
+		MaxTurns: &zero,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+
+	events := drainUntilResult(t, h)
+	last := events[len(events)-1]
+	res, ok := last.(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("last event: want ResultEvent, got %T", last)
+	}
+	if !res.Success {
+		t.Errorf("Result.Success: want true for STOP with MaxTurns=0 (uncapped), got %#v", res)
+	}
+}
+
 func mustNew(t *testing.T, endpoint string) *Provider {
 	t.Helper()
 	opts := Options{APIKey: "test-key"}

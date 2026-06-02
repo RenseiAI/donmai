@@ -185,6 +185,13 @@ func thinkingConfigFor(spec agent.Spec, model string) *thinkingConfig {
 }
 
 // thinkingLevelForEffort maps an EffortLevel onto a 3.x thinking_level.
+//
+// Casing note: the Gemini REST API (generativelanguage.googleapis.com)
+// accepts lowercase values for thinkingConfig.thinkingLevel. The canonical
+// examples in the Google AI for Developers documentation
+// (https://ai.google.dev/gemini-api/docs/thinking) use lowercase
+// ("low", "medium", "high"), and the API rejects uppercase variants.
+// Lowercase is intentional here — do NOT change to uppercase.
 func thinkingLevelForEffort(e agent.EffortLevel) string {
 	switch e {
 	case agent.EffortLow:
