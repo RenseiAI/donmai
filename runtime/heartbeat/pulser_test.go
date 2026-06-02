@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -322,6 +323,171 @@ func TestRequestBodyShape(t *testing.T) {
 	}
 	if !strings.Contains(*got, `"workerId":"w1"`) || !strings.Contains(*got, `"issueId":"i1"`) {
 		t.Fatalf("body missing workerId/issueId: %s", *got)
+	}
+}
+
+// TestInjectPayloadFiresOnInjectAndAcks covers the Wave 3 runtime
+// memory-inject transport: a successful lock-refresh that piggybacks an
+// `inject` object must (a) decode the payload and fire Config.OnInject,
+// and (b) cause the NEXT request body to carry ackedInject == the prior
+// DeliveryID so the platform stops re-sending it.
+func TestInjectPayloadFiresOnInjectAndAcks(t *testing.T) {
+	t.Parallel()
+
+	var (
+		hits          atomic.Int64
+		capturedAcked atomic.Pointer[string]
+	)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			AckedInject string `json:"ackedInject"`
+		}
+		_ = json.Unmarshal(body, &req)
+		n := hits.Add(1)
+		if n == 1 {
+			// First tick: extend the lock + piggyback an inject.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"refreshed": true,
+				"inject": map[string]any{
+					"deliveryId": "dlv-1",
+					"text":       "remember: prefer the existing helper",
+				},
+			})
+			return
+		}
+		// Subsequent ticks: record the ack the worker echoed back; no
+		// further inject.
+		acked := req.AckedInject
+		capturedAcked.Store(&acked)
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+	})
+
+	var (
+		mu       sync.Mutex
+		received []heartbeat.InjectPayload
+	)
+	cfg := heartbeat.Config{
+		SessionID:  "s1",
+		WorkerID:   "w1",
+		IssueID:    "i1",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		Interval:   5 * time.Millisecond, // drive a 2nd tick promptly
+		OnInject: func(p heartbeat.InjectPayload) {
+			mu.Lock()
+			received = append(received, p)
+			mu.Unlock()
+		},
+	}
+	p, err := heartbeat.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	// (a) OnInject fired with the decoded payload.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := len(received)
+		mu.Unlock()
+		if got > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	mu.Lock()
+	gotCount := len(received)
+	var first heartbeat.InjectPayload
+	if gotCount > 0 {
+		first = received[0]
+	}
+	mu.Unlock()
+	if gotCount == 0 {
+		t.Fatal("OnInject never fired for the piggybacked inject")
+	}
+	if first.DeliveryID != "dlv-1" || first.Text != "remember: prefer the existing helper" {
+		t.Fatalf("OnInject payload = %+v; want {dlv-1, remember...}", first)
+	}
+
+	// (b) the NEXT request carries ackedInject == the prior DeliveryID.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := capturedAcked.Load(); got != nil && *got != "" {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := capturedAcked.Load(); got == nil || *got != "dlv-1" {
+		t.Fatalf("subsequent request ackedInject = %v; want dlv-1", got)
+	}
+
+	// OnInject must fire exactly once — the inject is only sent on tick 1
+	// and not re-delivered after the ack.
+	mu.Lock()
+	finalCount := len(received)
+	mu.Unlock()
+	if finalCount != 1 {
+		t.Fatalf("OnInject fired %d times; want exactly 1 (no re-delivery)", finalCount)
+	}
+}
+
+// TestInjectNotAppliedOnRefreshedFalse verifies the ownership-lost guard:
+// when the platform refuses the refresh (refreshed=false) any piggybacked
+// inject is ignored — OnInject must NOT fire (the platform only routes
+// injects to the current lock holder, and a refused refresh means we no
+// longer are it).
+func TestInjectNotAppliedOnRefreshedFalse(t *testing.T) {
+	t.Parallel()
+
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		// Refuse the lock but (perversely) include an inject — the pulser
+		// must not apply it.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"refreshed": false,
+			"inject": map[string]any{
+				"deliveryId": "dlv-x",
+				"text":       "this must never be delivered",
+			},
+		})
+	})
+
+	var injectFired atomic.Bool
+	cfg := heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           5 * time.Millisecond,
+		MaxAttemptsPerTick: 1,
+		StrikesUntilLost:   2,
+		Sleep:              func(time.Duration) {},
+		OnInject: func(heartbeat.InjectPayload) {
+			injectFired.Store(true)
+		},
+	}
+	p, err := heartbeat.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	// Wait for ownership-lost (refreshed=false counts as a strike). Once
+	// it trips we know at least two refresh attempts ran — ample chance
+	// for a buggy implementation to have fired OnInject.
+	select {
+	case <-p.LostOwnership():
+	case <-time.After(2 * time.Second):
+		t.Fatal("LostOwnership did not fire on refreshed=false")
+	}
+	if injectFired.Load() {
+		t.Fatal("OnInject fired on refreshed=false; inject must be ignored when ownership is refused")
 	}
 }
 

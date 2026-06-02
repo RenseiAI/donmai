@@ -65,6 +65,18 @@ type Config struct {
 	// runners can pick up daemon-side runtime-token refreshes mid-session.
 	CredentialProvider CredentialProvider
 
+	// OnInject is invoked when the platform piggybacks an agent-memory
+	// inject onto a successful lock-refresh response (refreshed=true AND
+	// inject != nil). The pulser delivers the payload on the heartbeat
+	// goroutine; implementations must be cheap + non-blocking (the runner
+	// wires this to a non-blocking send onto its inject channel). Nil-safe:
+	// when OnInject is nil the inject is decoded and acked but otherwise
+	// dropped (no consumer). Wave 3 runtime memory-inject transport — the
+	// pulser already runs inside the worker process that owns the live
+	// agent.Handle, so it is the only authenticated channel that can reach
+	// Handle.Inject (the daemon poll path is in the wrong process).
+	OnInject func(InjectPayload)
+
 	// Interval overrides DefaultInterval. Zero falls back to default.
 	Interval time.Duration
 	// StrikesUntilLost overrides DefaultStrikesUntilLost. Zero falls
@@ -96,6 +108,21 @@ type RuntimeCredentials struct {
 // CredentialProvider returns the freshest worker runtime credentials available
 // to the caller. Implementations should be cheap and concurrency-safe.
 type CredentialProvider func(context.Context) (RuntimeCredentials, error)
+
+// InjectPayload is one agent-memory inject the platform piggybacks onto a
+// lock-refresh response. DeliveryID is the platform-side queue row id the
+// worker echoes back via [refreshRequest.AckedInject] on the next tick so
+// the platform stops re-sending it. Text is the rendered memory block the
+// runner injects into the live session as a follow-up user message.
+//
+// Wire shape (platform → worker, nested under the lock-refresh response's
+// optional "inject" object):
+//
+//	{"deliveryId": "...", "text": "..."}
+type InjectPayload struct {
+	DeliveryID string `json:"deliveryId"`
+	Text       string `json:"text"`
+}
 
 func (c Config) interval() time.Duration {
 	if c.Interval > 0 {
@@ -173,6 +200,14 @@ type Pulser struct {
 	lostCh   chan struct{}
 	strikes  atomic.Int64
 	lastTick atomic.Int64 // unix-millis
+
+	// lastAckedInject is the DeliveryID of the most recent inject the
+	// pulser delivered to OnInject. It is echoed back to the platform on
+	// every subsequent request via [refreshRequest.AckedInject] so the
+	// platform can mark the inject delivered and stop re-sending it. Only
+	// ever read/written on the single heartbeat goroutine (tick →
+	// doRefresh), so it needs no synchronisation.
+	lastAckedInject string
 }
 
 // New returns a Pulser configured for the given session. Returns an
@@ -361,10 +396,14 @@ func (p *Pulser) tick(ctx context.Context) {
 }
 
 // refreshRequest is the body shape sent to /api/sessions/<id>/lock-refresh.
-// Matches the legacy TS body verbatim.
+// Matches the legacy TS body plus the Wave 3 AckedInject echo.
 type refreshRequest struct {
 	WorkerID string `json:"workerId,omitempty"`
 	IssueID  string `json:"issueId,omitempty"`
+	// AckedInject echoes the DeliveryID of the inject the worker last
+	// applied so the platform can mark it delivered and stop re-sending it.
+	// Empty until the first inject is received. Wave 3 runtime memory-inject.
+	AckedInject string `json:"ackedInject,omitempty"`
 }
 
 // refreshResponse is the body shape returned by lock-refresh. The
@@ -373,6 +412,11 @@ type refreshRequest struct {
 // has likely already been handed off.
 type refreshResponse struct {
 	Refreshed bool `json:"refreshed"`
+	// Inject is an optional agent-memory inject the platform piggybacks
+	// onto a successful refresh. Only honoured when Refreshed is true (an
+	// inject on a refused refresh is ignored — ownership was lost). Wave 3
+	// runtime memory-inject.
+	Inject *InjectPayload `json:"inject,omitempty"`
 }
 
 // doRefresh issues one POST to /api/sessions/<id>/lock-refresh and
@@ -380,8 +424,9 @@ type refreshResponse struct {
 func (p *Pulser) doRefresh(ctx context.Context) error {
 	creds := p.cfg.credentials(ctx)
 	body, err := json.Marshal(refreshRequest{
-		WorkerID: creds.WorkerID,
-		IssueID:  p.cfg.IssueID,
+		WorkerID:    creds.WorkerID,
+		IssueID:     p.cfg.IssueID,
+		AckedInject: p.lastAckedInject,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -414,7 +459,20 @@ func (p *Pulser) doRefresh(ctx context.Context) error {
 		return fmt.Errorf("decode: %w", err)
 	}
 	if !out.Refreshed {
+		// Ownership refused — do NOT apply any piggybacked inject. The
+		// platform only routes injects to the current lock holder; a
+		// refused refresh means we are no longer it.
 		return errors.New("lock-refresh: platform refused (refreshed=false)")
+	}
+	// Wave 3 runtime memory-inject: the platform piggybacks at most one
+	// pending inject per successful refresh. Deliver it to OnInject (the
+	// runner's non-blocking channel send) and record its DeliveryID so the
+	// next request acks it and the platform stops re-sending.
+	if out.Inject != nil {
+		if p.cfg.OnInject != nil {
+			p.cfg.OnInject(*out.Inject)
+		}
+		p.lastAckedInject = out.Inject.DeliveryID
 	}
 	return nil
 }

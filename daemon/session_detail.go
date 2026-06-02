@@ -143,6 +143,14 @@ type SessionDetail struct {
 	// — this field closes the daemon→runner wire-shape gap.
 	// Mirror of the v0.9.3 SystemPromptOverride fix.
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
+
+	// MemoryBlock forwards the dispatch-time agent-memory context from
+	// PollWorkItem onto the runner's QueuedWork (Wave 3 memory-inject v1).
+	// Consumed by prompt/builder.go, which appends it to the system prompt.
+	// Mirror of the SystemPromptOverride / DisallowedTools wire-shape
+	// forwarders — closes the daemon→runner gap so the platform's emit is
+	// not dropped by the strict JSON decoder.
+	MemoryBlock string `json:"memoryBlock,omitempty"`
 }
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in

@@ -242,6 +242,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// Kit skills (loop step 5a) — populated from the active kits'
 		// [provide.skills] via KitRegistry.SkillSourcesForRepo. nil = none.
 		KitSkillSources: kitSkillSources,
+		// Wave 3 runtime memory-inject (v2). DARK by default; armed only
+		// when MEMORY_INJECT_ENABLED=true (mirrors the ROUTING_*_ENABLED
+		// env-gate convention). When off, sessions still receive the
+		// dispatch-time memory fold (v1) — the runtime path is the
+		// claude-only mid-session top-up.
+		MemoryInjectEnabled: os.Getenv("MEMORY_INJECT_ENABLED") == "true",
 		// Backstop runs by default — the daemon-spawned worker is
 		// the production code path; tests use the in-process entry.
 	})
@@ -531,6 +537,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			SystemPromptOverride: d.SystemPromptOverride,
 			Kits:                 d.Kits,
 			DisallowedTools:      d.DisallowedTools,
+			MemoryBlock:          d.MemoryBlock,
 		},
 		Branch:      d.Branch,
 		WorkerID:    d.WorkerID,
