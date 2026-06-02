@@ -188,28 +188,27 @@ func TestMemoryInjectOnInject_DropsWhenChannelFull(t *testing.T) {
 	}
 }
 
-// TestRuntimeInjectGate_CapGate confirms the capability gate: when the
-// provider does not advertise SupportsMessageInjection the runner never
-// wires OnInject (runtime inject is a no-op; the session relies on the
-// dispatch-time fold). We assert the gate condition directly since it is
-// the single source of truth wired in runLoop.
+// TestRuntimeInjectGate_CapGate confirms the gate is the provider capability
+// ALONE: the runner wires OnInject whenever SupportsMessageInjection is true,
+// otherwise never. There is no worker-side enable flag — the PLATFORM is the
+// sole authority over whether a block is actually delivered (it only returns an
+// inject on the lock-refresh response when the project's memory config has
+// runtime-inject on). We assert the gate condition directly since it is the
+// single source of truth wired in runLoop.
 func TestRuntimeInjectGate_CapGate(t *testing.T) {
 	cases := []struct {
 		name        string
-		enabled     bool
 		supportsInj bool
 		want        bool
 	}{
-		{"disabled + no cap", false, false, false},
-		{"disabled + cap", false, true, false},
-		{"enabled + no cap", true, false, false},
-		{"enabled + cap", true, true, true},
+		{"no cap", false, false},
+		{"cap", true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := &Runner{memoryInject: tc.enabled}
 			caps := agent.Capabilities{SupportsMessageInjection: tc.supportsInj}
-			got := r.memoryInject && caps.SupportsMessageInjection
+			// Mirrors runLoop: runtimeInjectEnabled := caps.SupportsMessageInjection
+			got := caps.SupportsMessageInjection
 			if got != tc.want {
 				t.Fatalf("runtimeInjectEnabled = %v; want %v", got, tc.want)
 			}
