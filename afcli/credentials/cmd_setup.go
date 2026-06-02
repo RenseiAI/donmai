@@ -359,6 +359,8 @@ func renderEnvLocal(vaultName string, opPresent bool) string {
 		item string
 	}{
 		{"ANTHROPIC_API_KEY", "Anthropic"},
+		// Gemini / Google AI Studio key — used when the gemini provider is selected.
+		{"GEMINI_API_KEY", "Google"},
 		{"LINEAR_API_KEY", "Linear"},
 		{"OPENAI_API_KEY", "OpenAI"},
 	}
