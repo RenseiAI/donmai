@@ -198,7 +198,7 @@ func TestBuildHTTPRoundtrip(t *testing.T) {
 	in := []agent.MCPServerConfig{{
 		Name: "rensei-platform",
 		Type: "http",
-		URL:  "https://app.rensei.ai/api/mcp/sess_X",
+		URL:  "https://platform.example.com/api/mcp/sess_X",
 		Headers: map[string]string{
 			"Authorization": "Bearer rsk_test_token",
 		},
@@ -222,7 +222,7 @@ func TestBuildHTTPRoundtrip(t *testing.T) {
 	if got.Type != "http" {
 		t.Fatalf("type=%q, want http", got.Type)
 	}
-	if got.URL != "https://app.rensei.ai/api/mcp/sess_X" {
+	if got.URL != "https://platform.example.com/api/mcp/sess_X" {
 		t.Fatalf("url=%q", got.URL)
 	}
 	if got.Headers["Authorization"] != "Bearer rsk_test_token" {

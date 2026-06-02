@@ -1111,8 +1111,8 @@ func TestDaemonConfigBaseURL(t *testing.T) {
 // default config to the path provided via --config.
 func TestDaemonSetupWritesDefaultConfig(t *testing.T) {
 	// Force the non-TTY path via the wizard skip env (mirrors
-	// RENSEI_DAEMON_SKIP_WIZARD).
-	t.Setenv("RENSEI_DAEMON_SKIP_WIZARD", "1")
+	// DONMAI_DAEMON_SKIP_WIZARD).
+	t.Setenv("DONMAI_DAEMON_SKIP_WIZARD", "1")
 
 	cfgPath := filepath.Join(t.TempDir(), "daemon.yaml")
 	cmd := newDaemonSetupCmd()

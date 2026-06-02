@@ -43,7 +43,7 @@ type InstallOptions struct {
 	// Scope is the systemd unit scope (Linux only). Ignored on macOS.
 	Scope Scope
 
-	// ConfigPath is the daemon config path; sets RENSEI_DAEMON_CONFIG on
+	// ConfigPath is the daemon config path; sets DONMAI_DAEMON_CONFIG on
 	// Linux. Currently unused on macOS.
 	ConfigPath string
 

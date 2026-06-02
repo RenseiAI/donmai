@@ -53,7 +53,7 @@ type Config struct {
 	// this is empty — so callers must populate it (REN-1465). Sourced
 	// from prompt.QueuedWork.IssueID (camelCase "issueId" on the wire).
 	IssueID string
-	// BaseURL is the platform API base, e.g. "https://app.rensei.ai".
+	// BaseURL is the platform API base, e.g. "https://platform.example.com".
 	// Required.
 	BaseURL string
 	// AuthToken is sent as Bearer in the Authorization header.
@@ -115,13 +115,30 @@ type CredentialProvider func(context.Context) (RuntimeCredentials, error)
 // the platform stops re-sending it. Text is the rendered memory block the
 // runner injects into the live session as a follow-up user message.
 //
+// Kind discriminates the inject type:
+//   - "" or "memory" — standard agent-memory block (existing behaviour; back-compat)
+//   - "user"         — a user-turn message from an interactive interview session
+//
+// TurnID is present only for kind="user" injects and carries the turn
+// correlation id the platform stamped when it enqueued the user turn
+// (enqueueUserTurnInject). Absent for kind="memory" injects.
+//
 // Wire shape (platform → worker, nested under the lock-refresh response's
 // optional "inject" object):
 //
-//	{"deliveryId": "...", "text": "..."}
+//	{"deliveryId": "...", "text": "...", "kind": "memory"|"user", "turnId": "..."}
+//
+// CONTRACT: defined in CONTRACT-FREEZE §3 and
+// platform/src/lib/interview/wire-types.ts (INJECT_KIND_USER / INJECT_KIND_MEMORY).
 type InjectPayload struct {
 	DeliveryID string `json:"deliveryId"`
 	Text       string `json:"text"`
+	// Kind is "memory" (default, back-compat) or "user" (interview turn).
+	// Empty string is treated as "memory" by all consumers.
+	Kind string `json:"kind,omitempty"`
+	// TurnID is the turn correlation id for kind="user" injects.
+	// Empty for kind="memory".
+	TurnID string `json:"turnId,omitempty"`
 }
 
 func (c Config) interval() time.Duration {

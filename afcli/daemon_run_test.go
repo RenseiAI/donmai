@@ -86,7 +86,7 @@ func TestStandaloneCredsMergeIntoSpawnerBaseEnv(t *testing.T) {
 	envLocal := filepath.Join(root, ".env.local")
 	content := strings.Join([]string{
 		"AF_TEST_FORWARDED=hello",
-		"RENSEI_DAEMON_JWT=must-not-forward",
+		"DONMAI_DAEMON_JWT=must-not-forward",
 		"WORKER_API_KEY=rsk_must_not_forward",
 		"# a comment",
 		`AF_TEST_QUOTED="quoted value"`,
@@ -116,8 +116,8 @@ func TestStandaloneCredsMergeIntoSpawnerBaseEnv(t *testing.T) {
 	}
 
 	// Blocked keys must NOT be present.
-	if v, ok := baseEnv["RENSEI_DAEMON_JWT"]; ok {
-		t.Errorf("RENSEI_DAEMON_JWT leaked through merge: %q", v)
+	if v, ok := baseEnv["DONMAI_DAEMON_JWT"]; ok {
+		t.Errorf("DONMAI_DAEMON_JWT leaked through merge: %q", v)
 	}
 	if v, ok := baseEnv["WORKER_API_KEY"]; ok {
 		t.Errorf("WORKER_API_KEY leaked through merge: %q", v)

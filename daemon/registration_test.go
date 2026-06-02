@@ -17,7 +17,7 @@ import (
 func TestRegister_StubPath_NoToken(t *testing.T) {
 	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
 	resp, err := Register(context.Background(), RegistrationOptions{
-		OrchestratorURL:   "https://platform.rensei.dev",
+		OrchestratorURL:   "https://platform.example.com",
 		RegistrationToken: "local-stub-no-token",
 		Hostname:          "test-host",
 		Version:           "0.4.0-dev",
@@ -44,11 +44,11 @@ func TestRegister_StubPath_NoToken(t *testing.T) {
 // TestRegister_DefaultsToRealPath covers REN-1444: with NO env var set and a
 // valid rsk_live_* token and an http:// URL, the daemon must take the real
 // path. Previously useStub defaulted to true unless
-// RENSEI_DAEMON_REAL_REGISTRATION was explicitly set; that gate broke
+// DONMAI_DAEMON_REAL_REGISTRATION was explicitly set; that gate broke
 // daemons that did not source the env in their launchd plist.
 func TestRegister_DefaultsToRealPath(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_FORCE_STUB", "")
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "")
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "")
 	called := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		called = true
@@ -82,10 +82,10 @@ func TestRegister_DefaultsToRealPath(t *testing.T) {
 	}
 }
 
-// TestRegister_ForceStubOptIn confirms RENSEI_DAEMON_FORCE_STUB still routes
+// TestRegister_ForceStubOptIn confirms DONMAI_DAEMON_FORCE_STUB still routes
 // to the stub path when explicitly set, even with a real-shaped token.
 func TestRegister_ForceStubOptIn(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_FORCE_STUB", "1")
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "1")
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("real endpoint should NOT be hit when FORCE_STUB=1")
 	}))
@@ -107,10 +107,10 @@ func TestRegister_ForceStubOptIn(t *testing.T) {
 }
 
 // TestRegister_LegacyRealRegistrationZeroForcesStub confirms that the legacy
-// RENSEI_DAEMON_REAL_REGISTRATION=0 still routes to stub for back-compat
+// DONMAI_DAEMON_REAL_REGISTRATION=0 still routes to stub for back-compat
 // with any existing test harness that explicitly disabled the real path.
 func TestRegister_LegacyRealRegistrationZeroForcesStub(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "0")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "0")
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("real endpoint should NOT be hit when REAL_REGISTRATION=0")
 	}))
@@ -129,7 +129,7 @@ func TestRegister_LegacyRealRegistrationZeroForcesStub(t *testing.T) {
 }
 
 func TestRegister_FileURLForcesStub(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
 	tok := "rsp_live_" + "xxx" //nolint:gosec // synthetic test token, not a real credential
 	resp, err := Register(context.Background(), RegistrationOptions{
@@ -153,7 +153,7 @@ func TestRegister_FileURLForcesStub(t *testing.T) {
 // server playing the role of /api/workers/register: token in Authorization
 // header, request body shape, response field names.
 func TestRegister_RealEndpoint(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
 	var capturedAuth string
 	var capturedBody RegisterRequest
@@ -233,7 +233,7 @@ func TestRegister_RealEndpoint(t *testing.T) {
 // the new rsk_live_* prefix that REN-1351's unified mint endpoint produces,
 // not just the legacy rsp_live_* shape.
 func TestRegister_AcceptsRskLivePrefix(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 	called := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		called = true
@@ -271,7 +271,7 @@ func TestRegister_AcceptsRskLivePrefix(t *testing.T) {
 // through to the stub path even when REAL_REGISTRATION is set, so e.g. a
 // laptop dev with a junk token can't accidentally hit prod.
 func TestRegister_PlainTokenForcesStub(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("real endpoint should not be reached for plain token")
 	}))
@@ -292,7 +292,7 @@ func TestRegister_PlainTokenForcesStub(t *testing.T) {
 }
 
 func TestRegister_RealEndpointError_IncludesBody(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{"error":"capacity must be a positive number"}`))
@@ -480,7 +480,7 @@ func TestWipeCachedJWT_AbsentIsNoOp(t *testing.T) {
 // returning a stable id makes the test value-based assertion
 // inappropriate).
 func TestRegister_AfterWipeReregisters(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_FORCE_STUB", "1")
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "1")
 
 	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
 
@@ -524,7 +524,7 @@ func TestRegister_AfterWipeReregisters(t *testing.T) {
 // RegistrationOptions.Provides is populated. This covers Stream H
 // (pool-aware daemon) — the wire contract for substrate capability advertisement.
 func TestRegister_ProvidesArraySentInBody(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
 	var capturedBody RegisterRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -580,7 +580,7 @@ func TestRegister_ProvidesArraySentInBody(t *testing.T) {
 // NOT add a "provides" key to the JSON body (omitempty). Older platform
 // versions that don't recognise the field should still accept the request.
 func TestRegister_NilProvidesOmitsField(t *testing.T) {
-	t.Setenv("RENSEI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
 	var rawBody json.RawMessage
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

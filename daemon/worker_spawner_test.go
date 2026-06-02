@@ -329,16 +329,16 @@ func TestSpawner_OnPreSpawn_Invoked(t *testing.T) {
 		t.Errorf("OnPreSpawn spec.SessionID: want %q, got %q", "sess-pre-1", gotSpec.SessionID)
 	}
 	// The hook must run AFTER composeEnv so it sees the daemon's own
-	// per-session injections (RENSEI_SESSION_ID etc).
+	// per-session injections (DONMAI_SESSION_ID etc).
 	found := false
 	for _, kv := range gotEnv {
-		if kv == "RENSEI_SESSION_ID=sess-pre-1" {
+		if kv == "DONMAI_SESSION_ID=sess-pre-1" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("OnPreSpawn env: missing post-composeEnv RENSEI_SESSION_ID; got %v", gotEnv)
+		t.Errorf("OnPreSpawn env: missing post-composeEnv DONMAI_SESSION_ID; got %v", gotEnv)
 	}
 }
 

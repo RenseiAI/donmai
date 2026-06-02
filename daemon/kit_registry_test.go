@@ -10,7 +10,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 )
 
-const validKitTOML = `api = "rensei.dev/v1"
+const validKitTOML = `api = "donmai.dev/v1"
 
 [kit]
 id = "spring/java"
@@ -70,7 +70,7 @@ order = "framework"
 const malformedKitTOML = `this is not valid TOML at all = = = [
 `
 
-const emptyIDKitTOML = `api = "rensei.dev/v1"
+const emptyIDKitTOML = `api = "donmai.dev/v1"
 [kit]
 version = "1.0.0"
 name = "no id"
@@ -94,8 +94,8 @@ func TestKitRegistry_DefaultScanPath(t *testing.T) {
 	if len(paths) != 1 {
 		t.Fatalf("want 1 default scan path, got %d: %v", len(paths), paths)
 	}
-	if !strings.HasSuffix(paths[0], "/.donmai/kits") && !strings.HasSuffix(paths[0], "/.rensei/kits") {
-		t.Errorf("default scan path %q does not end in /.donmai/kits or /.rensei/kits (legacy fallback)", paths[0])
+	if !strings.HasSuffix(paths[0], "/.donmai/kits") {
+		t.Errorf("default scan path %q does not end in /.donmai/kits", paths[0])
 	}
 }
 
@@ -327,8 +327,8 @@ func TestKitRegistry_ListSourcesAndToggle(t *testing.T) {
 	dir := t.TempDir()
 	r := NewKitRegistry([]string{dir})
 	sources := r.ListSources()
-	if len(sources) != 6 {
-		t.Fatalf("want 6 sources (federation order), got %d", len(sources))
+	if len(sources) != 5 {
+		t.Fatalf("want 5 sources (federation order), got %d", len(sources))
 	}
 	if sources[0].Name != "local" {
 		t.Errorf("first source: want local, got %q", sources[0].Name)

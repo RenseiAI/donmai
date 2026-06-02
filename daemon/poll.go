@@ -116,6 +116,36 @@ type PollWorkItem struct {
 	// drops the platform's emit — the same wire-gap that bit
 	// SystemPromptOverride (v0.9.3). Opaque forwarder only.
 	MemoryBlock string `json:"memoryBlock,omitempty"`
+
+	// ── Interactive run-mode fields (REN-1563 / Wave 2 donmai wire-plumbing) ─
+	//
+	// Mode is the run-mode discriminant ("" = headless, "interview" =
+	// interactive). Forwarded opaquely onto SessionDetail so the runner
+	// can branch on it. Opaque forwarder only — same pattern as
+	// SystemPromptOverride / Kits / DisallowedTools.
+	Mode string `json:"mode,omitempty"`
+
+	// InterviewBudget is the per-interview wall-clock + idle-grace cap.
+	// Forwarded opaquely onto SessionDetail. Nil/absent is safe and
+	// backward-compatible. Opaque forwarder only.
+	InterviewBudget *PollInterviewBudget `json:"interviewBudget,omitempty"`
+
+	// InterviewDefinition is the compiled interview definition JSON. The
+	// daemon does not parse it; the runner's interview loop consumes it.
+	// Forwarded opaquely as json.RawMessage so the strict decoder never
+	// drops it. Opaque forwarder only.
+	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
+}
+
+// PollInterviewBudget mirrors prompt.InterviewBudget for the daemon
+// package. The daemon does not import the runner or prompt packages
+// (cardinal package-architecture rule); this struct carries the budget
+// opaquely so the daemon can forward it onto SessionDetail without
+// depending on the prompt package. The runner re-types it into
+// prompt.InterviewBudget via detailToQueuedWork.
+type PollInterviewBudget struct {
+	MaxWallClockSeconds int `json:"maxWallClockSeconds,omitempty"`
+	IdleGraceSeconds    int `json:"idleGraceSeconds,omitempty"`
 }
 
 // PollStageBudget mirrors the platform's StageBudget shape so the
@@ -132,10 +162,39 @@ type PollStageBudget struct {
 // PollResponse is the body of GET /api/workers/<id>/poll. Only the fields the
 // daemon currently consumes are decoded; unknown fields are ignored.
 type PollResponse struct {
-	Work              []PollWorkItem `json:"work"`
-	HasInboxMessages  bool           `json:"hasInboxMessages,omitempty"`
-	PreClaimed        bool           `json:"preClaimed,omitempty"`
-	ClaimedSessionIDs []string       `json:"claimedSessionIds,omitempty"`
+	Work             []PollWorkItem `json:"work"`
+	HasInboxMessages bool           `json:"hasInboxMessages,omitempty"`
+	// InboxMessages is the per-session inbox the platform piggybacks on the
+	// poll response: a map of sessionId → queued messages for that running
+	// session. Interactive-interview user turns (kind="user") arrive here as
+	// well as on the heartbeat lock-refresh piggyback; the daemon routes a
+	// kind="user" inbox message to the running session via OnInbox so the
+	// runner can inject it (REN-1563 / CONTRACT-FREEZE §3). Without this
+	// field Go's strict JSON decoder silently drops the platform's emit —
+	// the messages were decoded into nothing and never routed.
+	InboxMessages     map[string][]InboxMessage `json:"inboxMessages,omitempty"`
+	PreClaimed        bool                      `json:"preClaimed,omitempty"`
+	ClaimedSessionIDs []string                  `json:"claimedSessionIds,omitempty"`
+}
+
+// InboxMessage is one queued message for a running session, delivered in
+// the poll response's inboxMessages map. The shape mirrors the heartbeat
+// InjectPayload's interview fields so the same kind/turnId discriminants
+// drive routing on both transports (CONTRACT-FREEZE §3).
+//
+// Kind discriminates the message type:
+//   - "" or "memory" — agent-memory block (existing behaviour)
+//   - "user"         — a user-turn message from an interactive interview
+//
+// TurnID carries the turn correlation id for kind="user" messages
+// (stamped by the platform's enqueueUserTurnInject). DeliveryID is the
+// platform-side queue row id the daemon/runner echoes back to stop
+// re-delivery.
+type InboxMessage struct {
+	DeliveryID string `json:"deliveryId,omitempty"`
+	Text       string `json:"text"`
+	Kind       string `json:"kind,omitempty"`
+	TurnID     string `json:"turnId,omitempty"`
 }
 
 // PollHTTPError is returned by callPollEndpoint for non-2xx responses so the
@@ -169,6 +228,16 @@ type PollOptions struct {
 	// OnWork is invoked for each item returned in the work[] slice. Errors are
 	// logged at warn and do not stop the loop. Required.
 	OnWork func(item PollWorkItem) error
+	// OnInbox is invoked for each inbox message routed to a running session
+	// (REN-1563). The poll loop decodes the inboxMessages map and calls
+	// OnInbox(sessionID, msg) for every message; the daemon wires this to
+	// forward the message into the running session — for a kind="user"
+	// interview turn, into the runner's live agent.Handle.Inject path. Optional:
+	// when nil the messages are decoded but not routed (back-compat — the
+	// heartbeat lock-refresh piggyback remains the primary user-turn transport
+	// per CONTRACT-FREEZE §3, so a nil OnInbox is not a hard drop). Errors are
+	// logged at warn and do not stop the loop.
+	OnInbox func(sessionID string, msg InboxMessage) error
 	// OnReregister is called on HTTP 401 (runtime JWT expired) or 404 (worker
 	// fell out of Redis). Implementations re-issue Register() and return the
 	// fresh worker id + runtime token. The poll loop swaps credentials and
@@ -284,6 +353,13 @@ func (p *PollService) pollOnce(ctx context.Context) {
 				p.opts.LogWarn("poll handler error for session %s: %v", item.SessionID, herr)
 			}
 		}
+		// Route any inbox messages (interactive-interview user turns +
+		// memory blocks) to the running sessions. REN-1563: previously the
+		// inboxMessages map was not even decoded, so a kind="user" turn
+		// delivered on the poll transport was silently discarded. We now
+		// decode it and forward each message via OnInbox so the daemon can
+		// inject it into the live session's agent.Handle.
+		p.routeInbox(resp.InboxMessages)
 		return
 	}
 	if isPollAuthFailure(err) && p.opts.OnReregister != nil {
@@ -309,6 +385,38 @@ func (p *PollService) pollOnce(ctx context.Context) {
 		return
 	}
 	p.opts.LogWarn("daemon poll failed: %v", err)
+}
+
+// routeInbox forwards every decoded inbox message to OnInbox, keyed by the
+// running session id. A nil OnInbox or empty map is a no-op (the heartbeat
+// lock-refresh piggyback remains the primary user-turn transport — a nil
+// OnInbox is back-compat, not a hard drop). Whitespace-only messages are
+// skipped. Errors from OnInbox are logged at warn and never stop the loop.
+//
+// REN-1563 / CONTRACT-FREEZE §3: the kind="user" inbox message is the
+// interactive-interview user turn; the daemon's OnInbox implementation
+// routes it into the running session's runner so handle.Inject (claude
+// --resume) delivers it as the next turn.
+func (p *PollService) routeInbox(inbox map[string][]InboxMessage) {
+	if len(inbox) == 0 || p.opts.OnInbox == nil {
+		return
+	}
+	for sessionID, msgs := range inbox {
+		for _, msg := range msgs {
+			if strings.TrimSpace(msg.Text) == "" {
+				continue
+			}
+			kind := msg.Kind
+			if kind == "" {
+				kind = "memory"
+			}
+			p.opts.LogInfo("daemon poll: routing inbox message to session %s (kind=%s, turnId=%s)",
+				sessionID, kind, msg.TurnID)
+			if herr := p.opts.OnInbox(sessionID, msg); herr != nil {
+				p.opts.LogWarn("inbox route error for session %s (kind=%s): %v", sessionID, kind, herr)
+			}
+		}
+	}
 }
 
 // callPollEndpoint issues a GET against /api/workers/<id>/poll with the given
@@ -618,6 +726,9 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		Kits:                 item.Kits,
 		DisallowedTools:      item.DisallowedTools,
 		MemoryBlock:          item.MemoryBlock,
+		Mode:                 item.Mode,
+		InterviewBudget:      item.InterviewBudget,
+		InterviewDefinition:  item.InterviewDefinition,
 	}
 }
 

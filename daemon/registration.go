@@ -165,7 +165,7 @@ type CachedJWT struct {
 	LegacyPollIntervalSeconds      int    `json:"pollIntervalSeconds,omitempty"`
 }
 
-// LoadCachedJWT reads ~/.rensei/daemon.jwt. Returns (nil, nil) when the file
+// LoadCachedJWT reads ~/.donmai/daemon.jwt. Returns (nil, nil) when the file
 // does not exist or cannot be parsed.
 func LoadCachedJWT(jwtPath string) (*CachedJWT, error) {
 	data, err := os.ReadFile(jwtPath) //nolint:gosec
@@ -269,12 +269,12 @@ func looksLikeRegistrationToken(token string) bool {
 // opts.ForceReregister is set.
 //
 // Real-platform registration is the default. The stub path is taken when:
-//   - RENSEI_DAEMON_FORCE_STUB env is set (e.g. =1), OR
+//   - DONMAI_DAEMON_FORCE_STUB env is set (e.g. =1), OR
 //   - the orchestrator URL is "file://...", OR
 //   - the registration token does not start with rsp_live_ or rsk_live_.
 //
 // REN-1444 (v0.4.1) inverted the env-gate from opt-in to opt-out. The
-// previous default required RENSEI_DAEMON_REAL_REGISTRATION=1 in the
+// previous default required DONMAI_DAEMON_REAL_REGISTRATION=1 in the
 // launchd plist; with that env unset, a daemon configured with a real
 // rsk_live_* token would silently fall back to stub mode and never
 // register against the platform.
@@ -398,17 +398,17 @@ func buildStubResponse(hostname string) *RegisterResponse {
 }
 
 // stubModeRequested returns true when the operator has explicitly opted into
-// stub registration via RENSEI_DAEMON_FORCE_STUB. The legacy
-// RENSEI_DAEMON_REAL_REGISTRATION env (REN-1422) is also honoured: setting
+// stub registration via DONMAI_DAEMON_FORCE_STUB. The legacy
+// DONMAI_DAEMON_REAL_REGISTRATION env (REN-1422) is also honoured: setting
 // it to "0" / "false" / "off" / "no" forces stub mode for back-compat with
 // existing test harnesses; any other non-empty value is treated as a no-op
 // (real path, the new default).
 //
 // REN-1444 (v0.4.1): real registration is now the default. Previously the
-// daemon required RENSEI_DAEMON_REAL_REGISTRATION=1 in the launchd plist;
+// daemon required DONMAI_DAEMON_REAL_REGISTRATION=1 in the launchd plist;
 // without it, a fully-configured daemon silently fell back to stub mode.
 func stubModeRequested() bool {
-	if v := os.Getenv("RENSEI_DAEMON_FORCE_STUB"); v != "" {
+	if v := os.Getenv("DONMAI_DAEMON_FORCE_STUB"); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "0", "false", "off", "no", "":
 			// Explicit opt-out of stub mode; fall through.
@@ -416,7 +416,7 @@ func stubModeRequested() bool {
 			return true
 		}
 	}
-	if v := os.Getenv("RENSEI_DAEMON_REAL_REGISTRATION"); v != "" {
+	if v := os.Getenv("DONMAI_DAEMON_REAL_REGISTRATION"); v != "" {
 		// Honour explicit "0" / "false" so the legacy plist export of
 		// =0 still forces stub mode.
 		switch strings.ToLower(strings.TrimSpace(v)) {

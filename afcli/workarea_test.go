@@ -354,7 +354,7 @@ func TestWorkareaCmd_RegisteredViaRegisterCommands(t *testing.T) {
 	t.Errorf("RegisterCommands did not register `workarea`; got: %v", commandNames(root))
 }
 
-// ── env override: RENSEI_DAEMON_URL ───────────────────────────────────────
+// ── env override: DONMAI_DAEMON_URL ───────────────────────────────────────
 
 func TestResolveWorkareaDaemonConfig(t *testing.T) {
 	t.Setenv(workareaEnvDaemonURL, "")

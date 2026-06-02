@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/runtime/activity"
 	"github.com/RenseiAI/donmai/runtime/heartbeat"
@@ -254,6 +255,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}
 	}
 
+	// Interview mode (REN-1563): prepend the hardened interview persona to
+	// the upstream-supplied system-prompt override BEFORE rendering so the
+	// prompt builder emits persona-first (the builder uses
+	// SystemPromptOverride verbatim as the entire system prompt). The
+	// persona pins the agent into one-question-per-turn / thinking-only
+	// behaviour and survives a cloned-repo CLAUDE.md (REN-1570 proves the
+	// hostile-CLAUDE.md case in a live sandbox). Headless runs are
+	// untouched — this only fires when qw.Mode == interview.
+	if qw.isInterview() {
+		qw.SystemPromptOverride = buildInterviewSystemPrompt(
+			qw.SystemPromptOverride, interview.InterviewCompleteSentinel)
+	}
+
 	systemPrompt, userPrompt, err := r.promptBuilder.Build(qw.QueuedWork)
 	if err != nil {
 		res.Status = "failed"
@@ -278,6 +292,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// are visible and auditable in the Spec.
 	if len(kitDisallowedTools) > 0 {
 		spec.DisallowedTools = append(spec.DisallowedTools, kitDisallowedTools...)
+	}
+
+	// Interview mode (REN-1563): disallow AskUserQuestion at the Spec level.
+	// Turn-taking happens via claude --resume (the runner injects the user's
+	// reply between turns), NOT via the AskUserQuestion tool — leaving it
+	// enabled would let the agent block on its own tool prompt inside a
+	// single turn instead of ending its turn and parking for the next
+	// inject. Appended subtractively alongside the persona's reinforcement.
+	if qw.isInterview() {
+		spec.DisallowedTools = append(spec.DisallowedTools, "AskUserQuestion")
 	}
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn
@@ -440,6 +464,22 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	} else {
 		sink = actPoster
 		defer func() { _ = actPoster.Stop() }()
+	}
+
+	// ── Interview run-mode branch (REN-1563) ─────────────────────────────
+	//
+	// When qw.Mode == "interview" the runner drives the non-terminating
+	// park-and-inject loop instead of the one-shot consumeEvents → drain →
+	// steering → backstop → runPostSession path below. Everything above
+	// this point (spawn, env, worktree, kit, state.json, heartbeat,
+	// activity) is shared and has already run; the interview loop owns its
+	// own event consumption + token-delta production + turn-taking and
+	// returns the terminal Result directly. Steering / backstop /
+	// post-session are intentionally SKIPPED — an interview produces no PR
+	// and drives no Linear state transition (the SDLC handoff happens via
+	// the platform's /complete CloudEvent gate, not here).
+	if qw.isInterview() {
+		return r.dispatchInterview(ctx, handle, wpath, qw, res, sink, injectCh)
 	}
 
 	// 10. Stream events; wait for terminal.

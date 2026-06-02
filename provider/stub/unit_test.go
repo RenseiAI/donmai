@@ -206,7 +206,7 @@ func Test_BehaviorFromEnv(t *testing.T) {
 	kinds := drain(t, h, 2*time.Second)
 	want := []agent.EventKind{agent.EventInit, agent.EventError}
 	if len(kinds) != len(want) {
-		t.Fatalf("RENSEI_STUB_MODE not honored: got %v want %v", kinds, want)
+		t.Fatalf("DONMAI_STUB_MODE not honored: got %v want %v", kinds, want)
 	}
 	for i := range want {
 		if kinds[i] != want[i] {

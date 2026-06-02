@@ -59,7 +59,7 @@ func TestF28_DaemonSpawnsAgentRun(t *testing.T) {
 		SkipWizard:       true,
 		SkipRegistration: true,
 		SpawnerOptions: daemon.SpawnerOptions{
-			WorkerCommand: []string{"/bin/sh", "-c", `printf 'integration-stub:%s\n' "$RENSEI_SESSION_ID"; exit 0`},
+			WorkerCommand: []string{"/bin/sh", "-c", `printf 'integration-stub:%s\n' "$DONMAI_SESSION_ID"; exit 0`},
 		},
 	})
 	if err := d.Start(context.Background()); err != nil {

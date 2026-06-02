@@ -1,6 +1,6 @@
 // Package afclient daemon_client.go — thin HTTP client for the local daemon's
 // status/control API. The daemon listens on HTTP at 127.0.0.1:<port> from
-// ~/.rensei/daemon.yaml. All paths are relative to that base URL.
+// ~/.donmai/daemon.yaml. All paths are relative to that base URL.
 package afclient
 
 import (
@@ -13,7 +13,7 @@ import (
 )
 
 // DaemonConfig holds the minimal daemon connection config read from
-// ~/.rensei/daemon.yaml (or overridden by env/flag).
+// ~/.donmai/daemon.yaml (or overridden by env/flag).
 type DaemonConfig struct {
 	// Port is the HTTP port the daemon is listening on (default 7734).
 	Port int `json:"port" yaml:"port"`
@@ -282,7 +282,7 @@ func (c *DaemonClient) EvictPool(req EvictPoolRequest) (*EvictPoolResponse, erro
 }
 
 // SetCapacityConfig posts a capacity key-value update to the daemon.  The
-// daemon writes the change to ~/.rensei/daemon.yaml atomically and reloads the
+// daemon writes the change to ~/.donmai/daemon.yaml atomically and reloads the
 // affected subsystem (e.g. the LRU eviction trigger for poolMaxDiskGb).
 func (c *DaemonClient) SetCapacityConfig(key, value string) (*SetCapacityResponse, error) {
 	body := map[string]string{"key": key, "value": value}

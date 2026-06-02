@@ -290,7 +290,7 @@ type ArchAssessOptions struct {
 	// PrNumber is the PR number within the repository.
 	PrNumber int
 
-	// GatePolicy overrides RENSEI_DRIFT_GATE: none | no-severity-high | zero-deviations | max:N
+	// GatePolicy overrides DONMAI_DRIFT_GATE: none | no-severity-high | zero-deviations | max:N
 	GatePolicy string
 
 	// ScopeLevel is the scope level for the baseline query.
@@ -300,7 +300,7 @@ type ArchAssessOptions struct {
 	// ProjectID is the project ID for scope.
 	ProjectID string
 
-	// DB is the SQLite DB path (overrides RENSEI_ARCH_DB).
+	// DB is the SQLite DB path (overrides DONMAI_ARCH_DB).
 	DB string
 
 	// Summary outputs human-readable text instead of JSON.

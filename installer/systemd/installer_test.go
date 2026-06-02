@@ -110,12 +110,12 @@ func TestGenerateUnitFile_RegistersDaemonRunNotRenseiDaemon(t *testing.T) {
 
 func TestGenerateUnitFile_ConfigPath(t *testing.T) {
 	out, err := GenerateUnitFile(ScopeUser, "/usr/local/bin/af", InstallOptions{
-		ConfigPath: "/etc/rensei/daemon.yaml",
+		ConfigPath: "/etc/donmai/daemon.yaml",
 	})
 	if err != nil {
 		t.Fatalf("GenerateUnitFile: %v", err)
 	}
-	if !strings.Contains(out, "Environment=RENSEI_DAEMON_CONFIG=/etc/rensei/daemon.yaml") {
+	if !strings.Contains(out, "Environment=DONMAI_DAEMON_CONFIG=/etc/donmai/daemon.yaml") {
 		t.Errorf("expected Environment= line for config path")
 	}
 }

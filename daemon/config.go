@@ -15,8 +15,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the in-memory representation of ~/.rensei/daemon.yaml. The wire
-// schema mirrors the TS DaemonConfig (rensei-architecture/004 §Configuration
+// Config is the in-memory representation of ~/.donmai/daemon.yaml. The wire
+// schema mirrors the TS DaemonConfig (donmai-architecture/004 §Configuration
 // shape).
 type Config struct {
 	APIVersion    string               `yaml:"apiVersion"             json:"apiVersion"`
@@ -139,7 +139,7 @@ type ObservabilityConfig struct {
 // root scan path, diff streaming threshold. Wave 9 / ADR-2026-05-07.
 type WorkareaConfig struct {
 	// ArchiveRoot is the directory the daemon scans for archived workareas.
-	// Default ~/.rensei/workareas (resolved at runtime by the handler if
+	// Default ~/.donmai/workareas (resolved at runtime by the handler if
 	// empty).
 	ArchiveRoot string `yaml:"archiveRoot,omitempty" json:"archiveRoot,omitempty"`
 	// DiffStreamingThreshold is the entry count above which the diff
@@ -161,16 +161,12 @@ type KitConfig struct {
 	ScanPaths []string `yaml:"scanPaths,omitempty" json:"scanPaths,omitempty"`
 }
 
-// DefaultConfigPath returns the path to daemon.yaml, resolving to
-// ~/.donmai/daemon.yaml for new installs with a one-release fallback to
-// ~/.rensei/daemon.yaml when the legacy directory still exists.
+// DefaultConfigPath returns the path to daemon.yaml under ~/.donmai/.
 func DefaultConfigPath() string {
 	return statepath.Resolve("daemon.yaml", "/tmp/.donmai/daemon.yaml")
 }
 
-// DefaultJWTPath returns the path to the cached JWT, resolving to
-// ~/.donmai/daemon.jwt for new installs with a one-release fallback to
-// ~/.rensei/daemon.jwt when the legacy directory still exists.
+// DefaultJWTPath returns the path to the cached JWT under ~/.donmai/.
 func DefaultJWTPath() string {
 	return statepath.Resolve("daemon.jwt", "/tmp/.donmai/daemon.jwt")
 }
@@ -195,7 +191,7 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Orchestrator.AuthToken != "" {
 		cfg.Orchestrator.AuthToken = substituteEnvVars(cfg.Orchestrator.AuthToken)
 	}
-	if envTok := os.Getenv("RENSEI_DAEMON_TOKEN"); envTok != "" {
+	if envTok := os.Getenv("DONMAI_DAEMON_TOKEN"); envTok != "" {
 		cfg.Orchestrator.AuthToken = envTok
 	}
 
@@ -232,7 +228,7 @@ func WriteConfig(path string, cfg *Config) error {
 // applyDefaults fills in zero-valued fields with their schema defaults.
 func applyDefaults(c *Config) {
 	if c.APIVersion == "" {
-		c.APIVersion = "rensei.dev/v1"
+		c.APIVersion = "donmai.dev/v1"
 	}
 	if c.Kind == "" {
 		c.Kind = "LocalDaemon"
@@ -357,7 +353,7 @@ func DeriveDefaultMachineID() string {
 // the wizard is skipped. Capacity defaults are derived from runtime info.
 func DefaultConfig() *Config {
 	cfg := &Config{
-		APIVersion: "rensei.dev/v1",
+		APIVersion: "donmai.dev/v1",
 		Kind:       "LocalDaemon",
 		Machine: MachineConfig{
 			ID:     DeriveDefaultMachineID(),
@@ -373,8 +369,12 @@ func DefaultConfig() *Config {
 			},
 		},
 		Orchestrator: OrchestratorConfig{
-			URL:       firstNonEmpty(os.Getenv("RENSEI_ORCHESTRATOR_URL"), "https://platform.rensei.dev"),
-			AuthToken: os.Getenv("RENSEI_DAEMON_TOKEN"),
+			// No vendor default — the OSS binary requires the operator to
+			// configure the orchestrator URL explicitly (flag/env/config-file).
+			// When unset, registration/poll fail clearly rather than dialing
+			// any vendor's platform.
+			URL:       os.Getenv("DONMAI_ORCHESTRATOR_URL"),
+			AuthToken: os.Getenv("DONMAI_DAEMON_TOKEN"),
 		},
 		AutoUpdate: AutoUpdateConfig{
 			Channel:             ChannelStable,
@@ -396,13 +396,4 @@ func defaultMaxSessions(cpuCount int) int {
 		n = 8
 	}
 	return n
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }

@@ -239,7 +239,7 @@ func commandNames(root *cobra.Command) []string {
 }
 
 // TestSplitHTTPHostPort covers the small URL parser used to honour
-// RENSEI_DAEMON_URL overrides.
+// DONMAI_DAEMON_URL overrides.
 func TestSplitHTTPHostPort(t *testing.T) {
 	tests := []struct {
 		raw      string
@@ -274,7 +274,7 @@ func TestSplitHTTPHostPort(t *testing.T) {
 }
 
 // TestResolveProviderDaemonConfig verifies the env-override path picks
-// up RENSEI_DAEMON_URL and falls back to defaults when unset.
+// up DONMAI_DAEMON_URL and falls back to defaults when unset.
 func TestResolveProviderDaemonConfig(t *testing.T) {
 	t.Setenv(providerEnvDaemonURL, "")
 	cfg := resolveProviderDaemonConfig()
