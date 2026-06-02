@@ -537,6 +537,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			Kits:                 d.Kits,
 			DisallowedTools:      d.DisallowedTools,
 			MemoryBlock:          d.MemoryBlock,
+			Mode:                 d.Mode,
+			InterviewDefinition:  d.InterviewDefinition,
 		},
 		Branch:      d.Branch,
 		WorkerID:    d.WorkerID,
@@ -548,6 +550,12 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			MaxDurationSeconds: d.StageBudget.MaxDurationSeconds,
 			MaxSubAgents:       d.StageBudget.MaxSubAgents,
 			MaxTokens:          d.StageBudget.MaxTokens,
+		}
+	}
+	if d.InterviewBudget != nil {
+		qw.InterviewBudget = &prompt.InterviewBudget{
+			MaxWallClockSeconds: d.InterviewBudget.MaxWallClockSeconds,
+			IdleGraceSeconds:    d.InterviewBudget.IdleGraceSeconds,
 		}
 	}
 	// Honor dispatch.modelProfile (richer platform-resolved profile per

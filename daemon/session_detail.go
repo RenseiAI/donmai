@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/json"
 	"sync"
 
 	"github.com/RenseiAI/donmai/internal/kit"
@@ -151,6 +152,25 @@ type SessionDetail struct {
 	// forwarders — closes the daemon→runner gap so the platform's emit is
 	// not dropped by the strict JSON decoder.
 	MemoryBlock string `json:"memoryBlock,omitempty"`
+
+	// ── Interactive run-mode fields (REN-1563 / Wave 2 donmai wire-plumbing) ─
+	//
+	// Mode forwards the run-mode discriminant from PollWorkItem onto the
+	// runner's QueuedWork. "" / absent = headless (unchanged behaviour).
+	// "interview" = non-terminating interactive loop. The daemon does not
+	// interpret this value — opaque forwarder only (same pattern as
+	// SystemPromptOverride / Kits / DisallowedTools).
+	Mode string `json:"mode,omitempty"`
+
+	// InterviewBudget forwards the per-interview wall-clock + idle-grace
+	// budget from PollWorkItem onto the runner's QueuedWork. nil/absent
+	// is safe and backward-compatible. Opaque forwarder only.
+	InterviewBudget *PollInterviewBudget `json:"interviewBudget,omitempty"`
+
+	// InterviewDefinition forwards the compiled interview definition JSON
+	// from PollWorkItem onto the runner's QueuedWork. The daemon does not
+	// parse it — opaque forwarder only.
+	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
 }
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in
