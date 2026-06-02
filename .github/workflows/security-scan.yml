@@ -1,0 +1,40 @@
+name: Security Scan
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+  schedule: [{ cron: "0 7 * * 1" }]
+permissions:
+  contents: read
+jobs:
+  secret-scan:
+    name: Secret scan (trufflehog)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --only-verified
+  govulncheck:
+    name: Go vuln scan (report-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25.x" }
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./... || echo "::warning::govulncheck reported vulnerabilities (report-only)"
+  semgrep:
+    name: SAST (semgrep, report-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Run semgrep
+        run: |
+          pip install semgrep==1.97.0
+          semgrep scan --config p/security-audit --config p/secrets --error || echo "::warning::semgrep reported findings (report-only)"
