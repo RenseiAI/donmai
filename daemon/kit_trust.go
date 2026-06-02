@@ -20,9 +20,11 @@
 // Trust modes (§ "Signing and trust" in 002-provider-base-contract.md):
 //
 //   - permissive            — verifier still runs and reports state, but
-//     never blocks Install. OSS default per Q2 of WAVE12_PLAN.
+//     never blocks Install. Was the OSS default per Q2 of WAVE12_PLAN;
+//     replaced by signed-by-allowlist as the compiled-in default (secfix).
+//     Opt in via DONMAI_KIT_TRUST_MODE=permissive or daemon.yaml trust.mode.
 //   - signed-by-allowlist   — Install rejects KitTrustUnsigned and
-//     KitTrustSignedUnverified.
+//     KitTrustSignedUnverified. Compiled-in default (resolveDefaultTrustMode).
 //   - attested              — same as allowlist for Wave 12 (the SLSA
 //     attestation graph hookup lands in Wave 13+).
 //
@@ -78,11 +80,23 @@ const (
 	// TrustModePermissive allows install regardless of verifier outcome.
 	// The verifier still runs and the trust state is reported; this
 	// matches OSS-execution-layer expectations vs the npm/pip/cargo
-	// precedent. Default per Q2 of WAVE12_PLAN.
+	// precedent.
+	//
+	// NOTE: permissive is no longer the compiled-in default. The daemon
+	// now defaults to TrustModeSignedByAllowlist. Operators who knowingly
+	// accept unsigned-kit risk can opt back to permissive by setting
+	// DONMAI_KIT_TRUST_MODE=permissive or by setting trust.mode in
+	// daemon.yaml explicitly.
 	TrustModePermissive TrustMode = "permissive"
 	// TrustModeSignedByAllowlist rejects unsigned and unverified kits at
 	// install time; verified-signed kits whose signer matches the
 	// configured issuer set install normally.
+	//
+	// This is the compiled-in default trust mode (enforced by
+	// resolveDefaultTrustMode and kitRegistryOrEmpty). An empty IssuerSet
+	// under this mode is treated as a misconfiguration: the daemon refuses
+	// to install any kit until the operator either populates trust.issuerSet
+	// or explicitly sets DONMAI_KIT_TRUST_MODE=permissive.
 	TrustModeSignedByAllowlist TrustMode = "signed-by-allowlist"
 	// TrustModeAttested is allowlist + (future) SLSA attestation-graph
 	// requirement. Wave 12 treats it as an alias for allowlist; the
@@ -91,18 +105,55 @@ const (
 	TrustModeAttested TrustMode = "attested"
 )
 
+// envKitTrustMode is the environment-variable name operators can set to
+// opt out of the secure default trust mode. Setting it to "permissive"
+// re-enables unsigned-kit installs; any other recognised TrustMode value
+// overrides the compiled-in default. This mirrors the
+// DONMAI_ORCHESTRATOR_URL / DONMAI_DAEMON_TOKEN env-override pattern
+// used by config.go.
+const envKitTrustMode = "DONMAI_KIT_TRUST_MODE"
+
+// resolveDefaultTrustMode returns the effective default TrustMode when
+// daemon.yaml has no explicit trust.mode set. The compiled-in default is
+// TrustModeSignedByAllowlist; operators may override it via the
+// DONMAI_KIT_TRUST_MODE environment variable.
+//
+// This function is used by kitRegistryOrEmpty (handle_kit.go) and by
+// applyDefaults (config.go) so that all code paths that fill in a missing
+// trust.mode agree on the safe default.
+func resolveDefaultTrustMode() TrustMode {
+	if v := os.Getenv(envKitTrustMode); v != "" {
+		switch TrustMode(v) {
+		case TrustModePermissive, TrustModeSignedByAllowlist, TrustModeAttested:
+			return TrustMode(v)
+		default:
+			slog.Warn("kit trust: DONMAI_KIT_TRUST_MODE value unrecognised; falling back to signed-by-allowlist",
+				"value", v,
+				"recognised", []string{string(TrustModePermissive), string(TrustModeSignedByAllowlist), string(TrustModeAttested)},
+			)
+		}
+	}
+	return TrustModeSignedByAllowlist
+}
+
 // TrustConfig is the daemon-wide trust policy. Lives on Config (NOT on
 // KitConfig) per audit § 1.2: the trust mode applies across plugin
 // families per 015-plugin-spec.md § "Auth + trust", not just kits.
 type TrustConfig struct {
 	// Mode is one of permissive | signed-by-allowlist | attested.
-	// Empty defaults to permissive (set by applyDefaults).
+	// Empty defaults to signed-by-allowlist (via resolveDefaultTrustMode).
+	// Operators who need unsigned-kit installs can set mode: permissive
+	// in daemon.yaml or export DONMAI_KIT_TRUST_MODE=permissive.
 	Mode TrustMode `yaml:"mode,omitempty" json:"mode,omitempty"`
 
-	// IssuerSet is an OPTIONAL allowlist of OIDC subject identities
-	// (Fulcio SAN) the operator considers trusted. Empty = trust any
-	// signer the embedded trust root can validate (the bundle's chain
-	// must still verify; this just skips the SAN allowlist filter).
+	// IssuerSet is the allowlist of OIDC subject identities (Fulcio SAN)
+	// the operator considers trusted. Under signed-by-allowlist / attested
+	// mode an EMPTY IssuerSet is treated as a misconfiguration: the trust
+	// gate fails closed with ErrKitTrustGateRejected and a clear message
+	// until the operator populates this list or switches to permissive.
+	// In permissive mode an empty IssuerSet means "trust any signer the
+	// embedded trust root can validate" (the bundle chain must still
+	// verify; only the SAN-pattern filter is skipped).
 	IssuerSet []string `yaml:"issuerSet,omitempty" json:"issuerSet,omitempty"`
 
 	// Actor is the operator-declared identity used in the trustOverride
@@ -130,6 +181,14 @@ type kitVerifier struct {
 // with Rensei-signed material in Wave 13+ once REN-1344 productionizes
 // the signing CI. Callers that want a different trust root (e.g.,
 // hermetic tests) construct via newKitVerifierWithMaterial.
+//
+// NOTE: this function does NOT call validateTrustConfig — callers that
+// need fail-closed behaviour on misconfigured trust (e.g.,
+// kitRegistryOrEmpty) must call validateTrustConfig themselves before
+// calling NewKitRegistryWithTrust. newKitVerifier's error return is
+// reserved for trust-root parse failures; mixing misconfiguration errors
+// here would trigger the permissive-fallback in NewKitRegistryWithTrust,
+// which is the opposite of fail-closed.
 func newKitVerifier(cfg TrustConfig) (*kitVerifier, error) {
 	tr, err := root.NewTrustedRootFromJSON(embeddedTrustRoot)
 	if err != nil {
@@ -140,6 +199,35 @@ func newKitVerifier(cfg TrustConfig) (*kitVerifier, error) {
 		trustedRoot: tr,
 		rootSource:  "embedded",
 	}, nil
+}
+
+// validateTrustConfig returns a descriptive error when the trust
+// configuration would produce an insecure outcome.
+//
+// Specifically: signed-by-allowlist / attested mode with an empty
+// IssuerSet would fall through to WithoutIdentitiesUnsafe and accept any
+// validly-signed bundle regardless of issuer. Callers must check this
+// BEFORE constructing the registry so they can surface a clear operator
+// action item rather than silently accepting over-permissive behaviour.
+//
+// This function is intentionally NOT called inside newKitVerifier because
+// newKitVerifier's error triggers a permissive fallback inside
+// NewKitRegistryWithTrust (kit_registry.go), which would be worse than
+// the misconfiguration it is trying to prevent.
+func validateTrustConfig(cfg TrustConfig) error {
+	switch cfg.Mode {
+	case TrustModeSignedByAllowlist, TrustModeAttested:
+		if len(cfg.IssuerSet) == 0 {
+			return fmt.Errorf(
+				"kit trust: mode %q requires a non-empty trust.issuerSet "+
+					"(an empty allowlist would accept any OIDC-signed kit); "+
+					"populate trust.issuerSet in daemon.yaml or set %s=permissive "+
+					"to explicitly opt in to permissive mode",
+				cfg.Mode, envKitTrustMode,
+			)
+		}
+	}
+	return nil
 }
 
 // newKitVerifierWithMaterial constructs a verifier with caller-supplied
@@ -268,9 +356,20 @@ func verifierOptions() []verify.VerifierOption {
 }
 
 // buildIdentityPolicies returns sigstore-go PolicyOptions for the
-// configured issuer allowlist. Empty allowlist → WithoutIdentitiesUnsafe
-// (the embedded trust root still gates which CAs are trusted; this
-// simply skips the SAN-pattern filter).
+// configured issuer allowlist.
+//
+// Empty allowlist is only accepted in permissive mode; the caller
+// (newKitVerifier / validateTrustConfig) already enforces that allowlist
+// and attested modes require a non-empty IssuerSet. When called with an
+// empty slice here we still defend by returning WithoutIdentitiesUnsafe,
+// which skips the SAN-pattern filter but still requires the bundle chain
+// to verify against the embedded trust root.
+//
+// All-malformed-entries: if every entry in a non-empty IssuerSet fails to
+// parse we return a no-op policy that will cause all identity checks to
+// fail (no WithCertificateIdentity option matched = rejection). We do NOT
+// fall back to WithoutIdentitiesUnsafe in this case, which would
+// incorrectly accept any signer.
 func buildIdentityPolicies(issuerSet []string) []verify.PolicyOption {
 	if len(issuerSet) == 0 {
 		return []verify.PolicyOption{verify.WithoutIdentitiesUnsafe()}
@@ -290,9 +389,13 @@ func buildIdentityPolicies(issuerSet []string) []verify.PolicyOption {
 		out = append(out, verify.WithCertificateIdentity(ident))
 	}
 	if len(out) == 0 {
-		// Configured allowlist but every entry was malformed; refuse to
-		// trust anything rather than silently fall back to permissive.
-		return []verify.PolicyOption{verify.WithoutIdentitiesUnsafe()}
+		// Every configured issuer entry was malformed. Return an empty
+		// options slice so that sigstore-go's policy has no
+		// WithCertificateIdentity option to match against — verification
+		// will fail closed rather than silently accepting any signer.
+		// The operator must fix their trust.issuerSet entries.
+		slog.Warn("kit verifier: all trust.issuerSet entries were malformed; no certificate identities will be trusted")
+		return []verify.PolicyOption{}
 	}
 	return out
 }
@@ -321,13 +424,25 @@ func signerIDFromVerifyError(entity verify.SignedEntity) string {
 // trustGateAllows returns true when the given verifier outcome should
 // be allowed to install under the configured trust mode.
 //
-// Permissive mode: always allow.
+// Permissive mode: always allow; emits a prominent slog.Warn so
+// operators are aware that unsigned / any-issuer kits will execute
+// shell commands.
+//
 // Allowlist / attested: only signed-verified outcomes pass.
+//
+// Empty mode: treated as signed-by-allowlist (the safe default). The
+// empty-string case should not arise in production because both
+// applyDefaults (config.go) and kitRegistryOrEmpty (handle_kit.go) call
+// resolveDefaultTrustMode; it is handled here as a belt-and-suspenders
+// guard.
 func (v *kitVerifier) trustGateAllows(trust afclient.KitTrustState) bool {
 	switch v.config.Mode {
-	case "", TrustModePermissive:
+	case TrustModePermissive:
+		slog.Warn("kit trust: PERMISSIVE mode is active — unsigned kits and kits from any OIDC issuer will be allowed to execute shell commands; set trust.mode: signed-by-allowlist or remove DONMAI_KIT_TRUST_MODE=permissive to enforce signature verification",
+			"trustState", string(trust),
+		)
 		return true
-	case TrustModeSignedByAllowlist, TrustModeAttested:
+	case "", TrustModeSignedByAllowlist, TrustModeAttested:
 		return trust == afclient.KitTrustSignedVerified
 	default:
 		// Unknown mode — fail-safe to allowlist semantics. validateConfig
