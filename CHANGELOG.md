@@ -12,6 +12,21 @@ _No work staged for the next release._
 
 ---
 
+## v0.13.0 — 2026-06-02
+
+### Changes
+
+- **Memory inject is now platform-gated per project — no worker config.**
+  Removed the `MEMORY_INJECT_ENABLED` env gate. The runner wires the heartbeat
+  `OnInject` hook whenever the provider supports message injection (claude);
+  whether a block is delivered is decided entirely by the platform (it only
+  returns an `inject` on the lock-refresh response when the project's memory
+  config has runtime-inject enabled). Daemons/TUIs need zero local config —
+  a tenant toggles memory in project settings on the platform. Pairs with
+  platform PR #203.
+
+---
+
 ## v0.12.0 — 2026-06-02
 
 ### Features
