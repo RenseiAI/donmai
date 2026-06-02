@@ -165,6 +165,12 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 		}
 	}
 
+	// Dispatch-time agent-memory fold (Wave 3 v1). Appended after the
+	// resolved system prompt (override OR system_base.tmpl) so it lands on
+	// every dispatch path uniformly. Additive — empty/whitespace memory is
+	// a no-op.
+	systemBuf = appendMemoryBlock(systemBuf, qw.MemoryBlock)
+
 	if hasStagePrompt {
 		// Stage-prompt mode — use platform-rendered prompt verbatim
 		// with a stage-context preamble so the agent can self-identify
@@ -206,6 +212,9 @@ func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user
 			return "", "", fmt.Errorf("raymond: render system prompt: %w", err)
 		}
 	}
+
+	// Dispatch-time agent-memory fold (Wave 3 v1) — mirror the legacy path.
+	systemBuf = appendMemoryBlock(systemBuf, qw.MemoryBlock)
 
 	if hasStagePrompt {
 		userBuf := renderStagePromptUser(qw)
@@ -315,6 +324,23 @@ type systemTmplData struct {
 	// lines (in kit-priority order). Rendered under a "# Kit Skills"
 	// heading when non-empty.
 	SkillAppend string
+}
+
+// appendMemoryBlock folds the dispatch-time agent-memory context onto the
+// resolved system prompt (Wave 3 v1). Empty/whitespace memory is a no-op
+// and returns systemBuf unchanged. Otherwise the block is appended under a
+// "# Agent Memory" heading so the agent can distinguish recalled memory
+// from its base identity/operating rules. The fold is additive — it never
+// replaces the base or override system prompt.
+func appendMemoryBlock(systemBuf, memoryBlock string) string {
+	mem := strings.TrimSpace(memoryBlock)
+	if mem == "" {
+		return systemBuf
+	}
+	if strings.TrimSpace(systemBuf) == "" {
+		return "# Agent Memory\n\n" + mem
+	}
+	return systemBuf + "\n\n# Agent Memory\n\n" + mem
 }
 
 func systemTemplateData(qw QueuedWork, appendBlock, skillAppend string) systemTmplData {

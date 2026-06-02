@@ -373,6 +373,33 @@ func TestDetailToQueuedWork_DisallowedToolsForwarded(t *testing.T) {
 	}
 }
 
+// TestDetailToQueuedWork_MemoryBlockForwarded verifies the Wave 3
+// dispatch-time agent-memory context survives the SessionDetail →
+// runner.QueuedWork translation (the third + final wire hop). Mirrors the
+// DisallowedTools / v0.9.3 SystemPromptOverride precedent.
+func TestDetailToQueuedWork_MemoryBlockForwarded(t *testing.T) {
+	cases := []struct {
+		name        string
+		memoryBlock string
+	}{
+		{"empty — omitted", ""},
+		{"non-empty block", "recall: prefer the existing helper over a new one"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &daemon.SessionDetail{
+				SessionID:       "sess-mem",
+				MemoryBlock:     tc.memoryBlock,
+				ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+			}
+			qw := detailToQueuedWork(d)
+			if qw.MemoryBlock != tc.memoryBlock {
+				t.Errorf("MemoryBlock = %q, want %q", qw.MemoryBlock, tc.memoryBlock)
+			}
+		})
+	}
+}
+
 // TestProviderNameFromDetail_PrefersModelProfile verifies the log-line
 // helper reads ModelProfile.ProviderID first.
 func TestProviderNameFromDetail_PrefersModelProfile(t *testing.T) {

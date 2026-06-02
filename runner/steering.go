@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/claude"
 )
 
 // shouldSteer reports whether stage 1 of tail recovery (steering)
@@ -66,16 +67,47 @@ func (r *Runner) attemptSteering(ctx context.Context, handle agent.Handle, qw Qu
 		"sessionId", qw.SessionID,
 		"len", len(prompt),
 	)
-	if err := handle.Inject(ctx, prompt); err != nil {
-		if errors.Is(err, agent.ErrUnsupported) {
-			// Provider doesn't support injection — runner could fall
-			// back to a stop-and-resume here. v0.5.0 keeps that path
-			// closed because none of the shipping providers expose
-			// resume on Spawned handles; runners surface the
-			// unsupported and fall through to backstop.
-			return fmt.Errorf("steering: provider does not support injection: %w", err)
-		}
+	if err := r.injectDirective(ctx, handle, prompt); err != nil {
 		return fmt.Errorf("steering: inject failed: %w", err)
+	}
+	return nil
+}
+
+// injectDirective delivers text into a live session as a follow-up user
+// message via [agent.Handle.Inject], framing it the same way steering
+// frames its directive (the agent treats it as a prompt). It is shared by
+// [Runner.attemptSteering] and the Wave 3 runtime memory drain so both
+// honour the same "soft-fail" contract.
+//
+// Returns nil (NON-fatal) when the provider cannot accept the inject right
+// now for a benign reason:
+//
+//   - [agent.ErrUnsupported]      — provider has no injection capability;
+//     the caller relies on the dispatch-time fold / backstop instead.
+//   - [claude.ErrSessionNotReady] — no InitEvent observed yet; injecting
+//     before the session id is captured is a transient race, not an error.
+//   - [claude.ErrInjectInFlight]  — a previous inject's --resume subprocess
+//     is still running; claude is single-in-flight, so the caller skips
+//     this one rather than failing the run.
+//
+// Any other error is returned to the caller (fatal-ish; the caller decides
+// whether to log-and-continue or abort). All Inject calls flow through here
+// on the single runner goroutine — never call Inject concurrently.
+func (r *Runner) injectDirective(ctx context.Context, handle agent.Handle, text string) error {
+	if err := handle.Inject(ctx, text); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrUnsupported):
+			r.logger.Debug("inject skipped: provider does not support injection")
+			return nil
+		case errors.Is(err, claude.ErrSessionNotReady):
+			r.logger.Debug("inject skipped: session not ready (no InitEvent yet)")
+			return nil
+		case errors.Is(err, claude.ErrInjectInFlight):
+			r.logger.Debug("inject skipped: a previous inject is still in flight")
+			return nil
+		default:
+			return fmt.Errorf("inject: %w", err)
+		}
 	}
 	return nil
 }

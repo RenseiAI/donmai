@@ -315,6 +315,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		_ = handle.Stop(stopCtx)
 	}()
 
+	// 8b. Wave 3 runtime memory-inject (v2) channel + per-Run dedup.
+	//
+	// injectCh carries platform-queued memory blocks delivered via the
+	// heartbeat lock-refresh transport (see step 9 OnInject wiring). It is
+	// drained between turns at the post-terminal seam (step 11) so claude's
+	// single-in-flight Inject contract is respected on the single runner
+	// goroutine. seenInject dedupes by DeliveryID within this Run (the
+	// platform also acks to stop re-sending, but a re-delivery in the
+	// heartbeat-interval window before the ack lands must not double-inject).
+	//
+	// The channel is wired to OnInject ONLY when the feature is enabled AND
+	// the provider supports message injection; otherwise it stays unused
+	// and the session relies on the dispatch-time fold (v1).
+	injectCh := make(chan heartbeat.InjectPayload, 8)
+	seenInject := map[string]struct{}{}
+	runtimeInjectEnabled := r.memoryInject && caps.SupportsMessageInjection
+
 	// 9. Start heartbeat pulser (in a goroutine — Pulser.Start fires
 	// the first tick synchronously then runs the loop in its own
 	// goroutine).
@@ -326,6 +343,33 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 				WorkerID:  creds.WorkerID,
 				AuthToken: creds.AuthToken,
 			}, err
+		}
+	}
+	// Wave 3 runtime memory-inject: wire OnInject only when the feature is
+	// enabled AND the provider can accept injects. The closure runs on the
+	// heartbeat goroutine; it owns seenInject (dedup-by-DeliveryID lives
+	// here exclusively so the map is never touched off this goroutine) and
+	// performs a non-blocking send onto injectCh — a full buffer drops the
+	// inject with a log rather than stalling the heartbeat loop. The runner
+	// goroutine drains injectCh at the post-terminal seam and is the only
+	// caller of handle.Inject (claude's single-in-flight contract).
+	var onInject func(heartbeat.InjectPayload)
+	if runtimeInjectEnabled {
+		onInject = func(p heartbeat.InjectPayload) {
+			if p.DeliveryID != "" {
+				if _, ok := seenInject[p.DeliveryID]; ok {
+					r.logger.Debug("memory inject: skipping already-seen delivery",
+						"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
+					return
+				}
+				seenInject[p.DeliveryID] = struct{}{}
+			}
+			select {
+			case injectCh <- p:
+			default:
+				r.logger.Warn("memory inject: channel full, dropping inject",
+					"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
+			}
 		}
 	}
 	pulser, err := heartbeat.New(heartbeat.Config{
@@ -343,6 +387,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		Interval:           r.hbInterval,
 		HTTPClient:         r.httpClient,
 		Logger:             r.logger,
+		OnInject:           onInject,
 	})
 	if err != nil {
 		// Heartbeat is non-fatal at construction time only when
@@ -487,6 +532,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// Apply event-stream observations onto the result envelope.
 	streamRes.applyTo(res, provider.Name())
 
+	// 10b. Wave 3 runtime memory-inject drain (v2). At the post-terminal
+	// seam — the turn has drained to a ResultEvent — deliver any memory
+	// blocks the heartbeat transport buffered during the turn, then
+	// re-consume the resume turn's events. Gated on the feature flag +
+	// provider capability; a no-op when nothing was buffered. Runs BEFORE
+	// steering so a memory-driven follow-up turn can itself produce the PR
+	// that makes steering unnecessary.
+	if runtimeInjectEnabled {
+		injRes := r.drainMemoryInjects(ctx, handle, wpath, qw, res, enforcer, sink, injectCh)
+		injRes.applyTo(res, provider.Name())
+	}
+
 	// 11. Tail recovery.
 	if !r.skipSteering && shouldSteer(streamRes, caps) {
 		res.SteeringTriggered = true
@@ -559,6 +616,70 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	}
 
 	return res, nil
+}
+
+// drainMemoryInjects delivers every memory block the heartbeat transport
+// buffered onto injectCh during the just-completed turn, then re-consumes
+// the resume turn's events. It is invoked at the post-terminal seam (the
+// turn has reached a ResultEvent) on the single runner goroutine, so all
+// handle.Inject calls remain serialised (claude is single-in-flight).
+//
+// For each buffered block: inject via the shared injectDirective helper
+// (non-fatal on ErrUnsupported / ErrSessionNotReady / ErrInjectInFlight),
+// then drain the events the inject produced via consumeEvents. The returned
+// observation merges all resume turns; the caller applies it onto the
+// Result so a memory-driven follow-up turn's PR/cost/summary lands.
+//
+// Liveness guard: a cancelled ctx aborts the drain (the events emitted
+// after Stop / ctx-cancel are silently dropped by the provider, so there is
+// no point injecting into a dead handle). Empty-text blocks are skipped.
+func (r *Runner) drainMemoryInjects(
+	ctx context.Context,
+	handle agent.Handle,
+	worktreePath string,
+	qw QueuedWork,
+	res *Result,
+	enforcer *BudgetEnforcer,
+	sink activitySink,
+	injectCh <-chan heartbeat.InjectPayload,
+) streamObservation {
+	var merged streamObservation
+	for {
+		select {
+		case <-ctx.Done():
+			// Handle is being torn down — do not inject into a dead session.
+			return merged
+		case p := <-injectCh:
+			if strings.TrimSpace(p.Text) == "" {
+				r.logger.Debug("memory inject: skipping empty block",
+					"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
+				continue
+			}
+			r.logger.Info("memory inject: delivering block",
+				"sessionId", qw.SessionID,
+				"deliveryId", p.DeliveryID,
+				"len", len(p.Text),
+			)
+			if err := r.injectDirective(ctx, handle, p.Text); err != nil {
+				// Non-benign inject failure — log and stop draining; the
+				// remaining blocks ride the next heartbeat re-delivery.
+				r.logger.Warn("memory inject: delivery failed",
+					"sessionId", qw.SessionID,
+					"deliveryId", p.DeliveryID,
+					"err", err,
+				)
+				return merged
+			}
+			// Re-consume the resume turn's events so the follow-up work
+			// (commit/PR/cost) is observed + mirrored.
+			injRes, _ := r.consumeEvents(ctx, handle, worktreePath, qw, res, enforcer, sink)
+			injRes.applyTo(res, qw.resolvedProvider())
+			merged = injRes
+		default:
+			// No more buffered injects.
+			return merged
+		}
+	}
 }
 
 // streamObservation captures the per-event-stream observations

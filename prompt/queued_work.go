@@ -182,6 +182,19 @@ type QueuedWork struct {
 	// Wire shape: "disallowedTools" (camelCase, omitempty). Pairs with
 	// platform PR #196.
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
+
+	// MemoryBlock is the dispatch-time agent-memory context the platform
+	// folds into the system prompt for this session (Wave 3 memory-inject
+	// v1). When non-empty the prompt builder APPENDS it to the resolved
+	// system prompt under a "# Agent Memory" heading — it never replaces
+	// the base/override system prompt (additive). Blocks known only mid-
+	// session arrive via the runtime lock-refresh inject path instead.
+	//
+	// Wire shape: "memoryBlock" (camelCase, omitempty). Threaded through
+	// every wire hop (PollWorkItem, SessionDetail, detailToQueuedWork) so
+	// Go's strict JSON decoder never drops the platform's emit — the v0.9.3
+	// SystemPromptOverride wire-gap precedent (SUP-1840 silent-drop hazard).
+	MemoryBlock string `json:"memoryBlock,omitempty"`
 }
 
 // StageBudget mirrors the platform's StageBudget type from

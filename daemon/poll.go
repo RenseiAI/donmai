@@ -108,6 +108,14 @@ type PollWorkItem struct {
 	// to Spec.DisallowedTools. Mirror of the v0.9.3 SystemPromptOverride
 	// fix — opaque forwarder only, no new logic.
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
+
+	// MemoryBlock is the dispatch-time agent-memory context the platform
+	// folds into the system prompt (Wave 3 memory-inject v1). The daemon
+	// forwards it opaquely onto SessionDetail; the runner's prompt builder
+	// appends it. Without this field Go's strict JSON decoder silently
+	// drops the platform's emit — the same wire-gap that bit
+	// SystemPromptOverride (v0.9.3). Opaque forwarder only.
+	MemoryBlock string `json:"memoryBlock,omitempty"`
 }
 
 // PollStageBudget mirrors the platform's StageBudget shape so the
@@ -609,6 +617,7 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		SystemPromptOverride: item.SystemPromptOverride,
 		Kits:                 item.Kits,
 		DisallowedTools:      item.DisallowedTools,
+		MemoryBlock:          item.MemoryBlock,
 	}
 }
 
