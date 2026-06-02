@@ -12,6 +12,22 @@ _No work staged for the next release._
 
 ---
 
+## v0.12.0 — 2026-06-02
+
+### Features
+
+- **Agent memory runtime inject (Wave 3).** Deliver platform-computed memory
+  blocks into a running session via the per-session lock-refresh heartbeat →
+  `handle.Inject` (claude `--resume`, between-turn). Adds `refreshResponse.inject`
+  + `refreshRequest.ackedInject` echo to the pulser; the runner drains injects at
+  the post-terminal seam through a shared `injectDirective` helper. Env-gated by
+  `MEMORY_INJECT_ENABLED` (default off). Pairs with platform PR #202.
+- **Dispatch-time memory fold.** New `memoryBlock` field threaded through
+  PollWorkItem → SessionDetail → QueuedWork → prompt builder, folded under an
+  `# Agent Memory` heading. Works for all providers (not just claude).
+
+---
+
 ## v0.7.7 — 2026-05-12
 
 Patch — schema fix for `ListWorkflowStates`.
