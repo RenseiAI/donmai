@@ -294,14 +294,33 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		spec.DisallowedTools = append(spec.DisallowedTools, kitDisallowedTools...)
 	}
 
-	// Interview mode (REN-1563): disallow AskUserQuestion at the Spec level.
-	// Turn-taking happens via claude --resume (the runner injects the user's
-	// reply between turns), NOT via the AskUserQuestion tool — leaving it
-	// enabled would let the agent block on its own tool prompt inside a
-	// single turn instead of ending its turn and parking for the next
-	// inject. Appended subtractively alongside the persona's reinforcement.
+	// Interview mode (REN-1563 / REN-1570): lock down the tool surface at
+	// the Spec level for interview sessions. Two categories:
+	//
+	//   1. AskUserQuestion — turn-taking happens via claude --resume (the
+	//      runner injects the user's reply between turns), NOT via the tool.
+	//      Leaving it enabled would let the agent block on its own tool prompt
+	//      inside a single turn instead of ending its turn and parking for the
+	//      next inject.
+	//
+	//   2. Code-authoring tools (Write, Edit, Task, Bash) — an interview
+	//      session is thinking-only.  The hardened persona already instructs
+	//      the agent to avoid these, but a hostile cloned-repo .claude/CLAUDE.md
+	//      can drag the agent back into developer behaviour via worked examples
+	//      (feedback_claudemd_overrides_system_prompt_directive precedent).
+	//      Belt-and-suspenders: disallow them structurally at the Spec level so
+	//      the provider rejects any attempt to invoke them regardless of what
+	//      the persona or CLAUDE.md says.  The structural proof is in
+	//      runner/interview_persona_hostile_test.go (REN-1570); the behavioural
+	//      proof against a live hostile-repo sandbox is REN-1572 (W5).
 	if qw.isInterview() {
-		spec.DisallowedTools = append(spec.DisallowedTools, "AskUserQuestion")
+		spec.DisallowedTools = append(spec.DisallowedTools,
+			"AskUserQuestion",
+			"Write",
+			"Edit",
+			"Task",
+			"Bash",
+		)
 	}
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn
