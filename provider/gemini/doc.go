@@ -14,19 +14,43 @@
 // build logs WARN and skips registration, identical to the existing
 // claude / codex probes.
 //
-// Capabilities: this v0.1 ships text-only spawn — no tool use, no
-// session resume, no reasoning-effort knob (Gemini does expose a
-// `thinkingBudget` parameter on 2.5 / 2.6 thinking models, but we
-// don't honour it yet). When tool use lands, flip SupportsToolPlugins
-// after wiring the function-calling round-trip.
+// Capabilities: agentic parity for the native tool surface. The provider
+// drives a multi-turn generateContent conversation with native
+// function-calling, reasoning-effort via thinkingConfig (thinkingLevel
+// on the 3.x family, thinkingBudget on the 2.5 family), and post-
+// completion steering by appending a turn and re-driving the loop.
+// Per-Spawn credentials resolve from Spec.Env[GEMINI_API_KEY] then
+// Spec.Env[GOOGLE_API_KEY] then the construction-time fallback,
+// supporting per-session BYOK + rotation. TotalCostUsd is computed from a
+// per-model USD pricing table.
+//
+// Conversation model: Gemini's REST endpoint is stateless AND does not
+// execute tools — it returns functionCall parts and expects the caller
+// to run the tool and POST a matching functionResponse. The Handle
+// therefore owns the contents history across turns AND runs the model's
+// functionCalls itself via a session-local executor (provider/gemini/
+// executor.go): native Bash/Read/Edit/Write run in the session's working
+// directory, the result surfaces as a ToolResult event, and the
+// functionResponse is folded back into the loop as a USER-role turn (the
+// public generateContent API rejects the legacy "function" role).
+// Post-completion steering arrives via Handle.Inject (a user turn).
+//
+// MCP: there is NO native MCP and NO in-box MCP client. Spec.MCPServers
+// entries are surfaced to the model as catch-all functionDeclarations
+// for forward-compatibility, but no code routes an mcp__* functionCall
+// to a live server — the executor returns a structured "not executable"
+// error and Capabilities.AcceptsMcpServerSpec is false. A real MCP
+// bridge is future work; until it lands, MCP tools are not honored
+// end-to-end.
 //
 // File layout (parallels provider/codex):
 //
 //   - gemini.go            — Provider impl: New / Spawn / Resume / Shutdown
 //   - probe.go             — env-var probe at construction
-//   - spec_translation.go  — agent.Spec → Gemini request body
-//   - event_mapping.go     — Gemini SSE chunk → agent.Event
-//   - handle.go            — Handle impl + body-reader goroutine + Stop
+//   - spec_translation.go  — agent.Spec → Gemini request scaffold
+//   - tools.go             — functionDeclarations, thinkingConfig, pricing
+//   - event_mapping.go     — generateContent response → agent.Event
+//   - handle.go            — Handle impl + multi-turn driver goroutine
 //
 // Tracked in REN-1500 (Gemini native runner) on the Rensei Linear team.
 package gemini

@@ -81,8 +81,12 @@ func TestToolUseCapabilityMatrix(t *testing.T) {
 				}
 				return p
 			},
-			// Function-calling / MCP not wired in v0.1.
-			want: want{supportsToolPlugins: false, acceptsAllowedToolsList: false, acceptsMcpServerSpec: false},
+			// Full agentic parity (Gemini-first-class program): the
+			// native runner builds requestBody.Tools[].functionDeclarations
+			// from both Spec.AllowedTools and Spec.MCPServers (each MCP
+			// tool bridged into a functionDeclaration), so all three flags
+			// are ON.
+			want: want{supportsToolPlugins: true, acceptsAllowedToolsList: true, acceptsMcpServerSpec: true},
 		},
 		{
 			name: "amp",
