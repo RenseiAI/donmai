@@ -255,3 +255,86 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 		}
 	})
 }
+
+// TestBuilderBuild_MemoryBlock covers the Wave 3 dispatch-time agent-memory
+// fold. When QueuedWork.MemoryBlock is non-empty Build APPENDS it under an
+// "# Agent Memory" heading after the resolved system prompt — additive on
+// every path (base template, override). Empty/whitespace is a no-op.
+func TestBuilderBuild_MemoryBlock(t *testing.T) {
+	t.Parallel()
+
+	const memText = "recall: this repo pins gofumpt; never run plain gofmt"
+
+	t.Run("appends_after_system_base_tmpl", func(t *testing.T) {
+		t.Parallel()
+		b := prompt.NewBuilder()
+		work := prompt.QueuedWork{
+			SessionID:       "sess-mem-1",
+			IssueIdentifier: "REN-9101",
+			WorkType:        string(prompt.WorkTypeDevelopment),
+			PromptContext:   "<issue><title>Mem dispatch</title></issue>",
+			MemoryBlock:     memText,
+		}
+		system, _, err := b.Build(work)
+		if err != nil {
+			t.Fatalf("Build returned err: %v", err)
+		}
+		// Base template content must still be present (additive — not replaced).
+		if !strings.Contains(system, "autonomous") {
+			t.Errorf("system_base.tmpl content missing; memory fold must be additive: %q", system)
+		}
+		if !strings.Contains(system, "# Agent Memory") {
+			t.Errorf("missing '# Agent Memory' heading: %q", system)
+		}
+		if !strings.Contains(system, memText) {
+			t.Errorf("memory block text missing: %q", system)
+		}
+	})
+
+	t.Run("appends_after_override", func(t *testing.T) {
+		t.Parallel()
+		b := prompt.NewBuilder()
+		const overrideText = "You are the upstream override agent."
+		work := prompt.QueuedWork{
+			SessionID:            "sess-mem-2",
+			IssueIdentifier:      "REN-9102",
+			StagePrompt:          "Do the thing.",
+			StageID:              "development",
+			SystemPromptOverride: overrideText,
+			MemoryBlock:          memText,
+		}
+		system, _, err := b.Build(work)
+		if err != nil {
+			t.Fatalf("Build returned err: %v", err)
+		}
+		if !strings.Contains(system, overrideText) {
+			t.Errorf("override text missing; memory fold must be additive on override path: %q", system)
+		}
+		if !strings.Contains(system, memText) {
+			t.Errorf("memory block text missing on override path: %q", system)
+		}
+		// Order: override first, memory appended after.
+		if strings.Index(system, overrideText) > strings.Index(system, memText) {
+			t.Errorf("memory block should be appended AFTER the override: %q", system)
+		}
+	})
+
+	t.Run("empty_memory_is_noop", func(t *testing.T) {
+		t.Parallel()
+		b := prompt.NewBuilder()
+		work := prompt.QueuedWork{
+			SessionID:       "sess-mem-3",
+			IssueIdentifier: "REN-9103",
+			StagePrompt:     "Do the thing.",
+			StageID:         "qa",
+			MemoryBlock:     "   \t\n ",
+		}
+		system, _, err := b.Build(work)
+		if err != nil {
+			t.Fatalf("Build returned err: %v", err)
+		}
+		if strings.Contains(system, "# Agent Memory") {
+			t.Errorf("whitespace-only memory must be a no-op; got heading: %q", system)
+		}
+	})
+}

@@ -689,6 +689,57 @@ func TestPollItemToSessionDetail_DisallowedToolsForwarded(t *testing.T) {
 	}
 }
 
+// TestPollResponse_DecodesMemoryBlock proves the Wave 3 dispatch-time
+// agent-memory field survives the strict JSON decode of the poll wire
+// shape — the SUP-1840 silent-drop regression guard (a field on only one
+// struct is dropped by Go's decoder). Mirrors TestPollResponse_DecodesLiveWireShape.
+func TestPollResponse_DecodesMemoryBlock(t *testing.T) {
+	body := []byte(`{
+		"work": [{
+			"sessionId": "mem-sess-1",
+			"workType": "development",
+			"memoryBlock": "prefer the existing retry helper in afclient/retry.go"
+		}]
+	}`)
+
+	var resp PollResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode wire shape: %v", err)
+	}
+	if len(resp.Work) != 1 {
+		t.Fatalf("Work len = %d, want 1", len(resp.Work))
+	}
+	if got := resp.Work[0].MemoryBlock; got != "prefer the existing retry helper in afclient/retry.go" {
+		t.Errorf("MemoryBlock = %q; want the platform-supplied block", got)
+	}
+}
+
+// TestPollItemToSessionDetail_MemoryBlockForwarded verifies the Wave 3
+// dispatch-time agent-memory context survives the PollWorkItem →
+// SessionDetail forwarding step. Mirrors the DisallowedTools / v0.9.3
+// SystemPromptOverride precedent.
+func TestPollItemToSessionDetail_MemoryBlockForwarded(t *testing.T) {
+	cases := []struct {
+		name        string
+		memoryBlock string
+	}{
+		{"empty — omitted", ""},
+		{"non-empty block", "recall: this repo uses gofumpt; never reformat with gofmt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item := PollWorkItem{
+				SessionID:   "sess-mem",
+				MemoryBlock: tc.memoryBlock,
+			}
+			detail := pollItemToSessionDetail(item, nil, "", "", "")
+			if detail.MemoryBlock != tc.memoryBlock {
+				t.Errorf("MemoryBlock = %q, want %q", detail.MemoryBlock, tc.memoryBlock)
+			}
+		})
+	}
+}
+
 // TestPollItemToSessionSpec_DoesNotWarn confirms that the spec
 // builder runs silently — the warn surfaces from the SessionDetail
 // builder so the same poll item can't produce two identical warns

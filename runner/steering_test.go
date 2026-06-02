@@ -126,10 +126,12 @@ func TestAttemptSteering_InjectStub(t *testing.T) {
 	_ = context.Background()
 }
 
-// TestAttemptSteering_RejectsUnsupported confirms the runner returns
-// a wrapped agent.ErrUnsupported when the provider does not support
-// injection.
-func TestAttemptSteering_RejectsUnsupported(t *testing.T) {
+// TestAttemptSteering_UnsupportedIsSoftFail confirms the runner treats an
+// ErrUnsupported inject as NON-fatal (returns nil) — the Wave 3 contract
+// for the shared injectDirective helper. The caller falls through to the
+// deterministic backstop on its own (shouldBackstop is independent of the
+// steering return), so a soft-fail here changes no downstream behavior.
+func TestAttemptSteering_UnsupportedIsSoftFail(t *testing.T) {
 	r := minimalRunner(t)
 
 	p, err := stub.New(stub.WithCapabilities(agent.Capabilities{}))
@@ -151,7 +153,35 @@ func TestAttemptSteering_RejectsUnsupported(t *testing.T) {
 	defer func() { _ = handle.Stop(context.Background()) }()
 
 	err = r.attemptSteering(ctx, handle, QueuedWork{QueuedWork: queuedWorkBase("REN-S-2")}, streamObservation{terminalSuccess: true})
-	if err == nil {
-		t.Fatal("expected error from attemptSteering with unsupported provider")
+	if err != nil {
+		t.Fatalf("expected nil (soft-fail) from attemptSteering with unsupported provider, got %v", err)
+	}
+}
+
+// TestInjectDirective_SoftFails verifies the shared injectDirective helper
+// returns nil on the benign provider-can't-accept-now errors
+// (agent.ErrUnsupported via the stub) so both steering and the memory
+// drain treat them as non-fatal.
+func TestInjectDirective_SoftFails(t *testing.T) {
+	r := minimalRunner(t)
+
+	p, err := stub.New(stub.WithCapabilities(agent.Capabilities{}))
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	_ = r.registry.Register(p)
+
+	ctx, cancel := withCtx(t)
+	defer cancel()
+	handle, err := p.Spawn(ctx, agent.Spec{
+		ProviderConfig: map[string]any{"stub.injectUnsupported": true},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = handle.Stop(context.Background()) }()
+
+	if err := r.injectDirective(ctx, handle, "remember this"); err != nil {
+		t.Fatalf("injectDirective should soft-fail on ErrUnsupported, got %v", err)
 	}
 }
