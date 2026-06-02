@@ -1,6 +1,10 @@
 package prompt
 
-import "github.com/RenseiAI/donmai/internal/kit"
+import (
+	"encoding/json"
+
+	"github.com/RenseiAI/donmai/internal/kit"
+)
 
 // QueuedWork is the input contract for prompt rendering. It mirrors the
 // session payload the platform stores in Redis under
@@ -195,6 +199,50 @@ type QueuedWork struct {
 	// Go's strict JSON decoder never drops the platform's emit — the v0.9.3
 	// SystemPromptOverride wire-gap precedent (SUP-1840 silent-drop hazard).
 	MemoryBlock string `json:"memoryBlock,omitempty"`
+
+	// ── Interactive run-mode fields (REN-1563 / Wave 2 donmai wire-plumbing) ─
+	//
+	// Mode is the run-mode discriminant. "" or absent = normal headless
+	// run. "interview" = interactive interview loop (non-terminating;
+	// parks on injectCh between user turns). The runner branches on this
+	// value; the prompt renderer does not interpret it.
+	//
+	// Wire shape: "mode" (camelCase, omitempty). Canonical value:
+	// internal/interview/wiretypes.go InterviewRunMode.
+	Mode string `json:"mode,omitempty"`
+
+	// InterviewBudget is the per-interview runtime budget the runner
+	// enforces when Mode="interview". nil = no caps. Carried through
+	// every wire hop so the strict JSON decoder never drops it.
+	//
+	// Wire shape: "interviewBudget" (camelCase, omitempty).
+	InterviewBudget *InterviewBudget `json:"interviewBudget,omitempty"`
+
+	// InterviewDefinition is the compiled interview definition JSON the
+	// platform emits from the interview.config node's publish-time
+	// compiler. The runner reads it to assemble the agent's system prompt
+	// for interview mode. Carried opaquely — the prompt package does not
+	// parse it; only the interview loop consumer does.
+	//
+	// Wire shape: "interviewDefinition" (camelCase, omitempty).
+	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
+}
+
+// InterviewBudget is the per-interview wall-clock and idle-grace cap the
+// runner enforces when QueuedWork.Mode == "interview". A field with
+// value 0 means "no cap" for that dimension (same convention as
+// StageBudget). The struct is a flat value type; a nil pointer on
+// InterviewBudget in QueuedWork means "no budget, proceed unbounded".
+//
+// Source of truth: CONTRACT-FREEZE §4 (runs/2026-06-02-interactive-interviews/01-CONTRACT-FREEZE.md).
+type InterviewBudget struct {
+	// MaxWallClockSeconds is the absolute wall-clock cap for the
+	// entire interview session. 0 = no cap.
+	MaxWallClockSeconds int `json:"maxWallClockSeconds,omitempty"`
+
+	// IdleGraceSeconds is how long the runner waits for the next
+	// user inject before tearing down the session. 0 = no cap.
+	IdleGraceSeconds int `json:"idleGraceSeconds,omitempty"`
 }
 
 // StageBudget mirrors the platform's StageBudget type from

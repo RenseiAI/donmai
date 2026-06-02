@@ -116,6 +116,36 @@ type PollWorkItem struct {
 	// drops the platform's emit — the same wire-gap that bit
 	// SystemPromptOverride (v0.9.3). Opaque forwarder only.
 	MemoryBlock string `json:"memoryBlock,omitempty"`
+
+	// ── Interactive run-mode fields (REN-1563 / Wave 2 donmai wire-plumbing) ─
+	//
+	// Mode is the run-mode discriminant ("" = headless, "interview" =
+	// interactive). Forwarded opaquely onto SessionDetail so the runner
+	// can branch on it. Opaque forwarder only — same pattern as
+	// SystemPromptOverride / Kits / DisallowedTools.
+	Mode string `json:"mode,omitempty"`
+
+	// InterviewBudget is the per-interview wall-clock + idle-grace cap.
+	// Forwarded opaquely onto SessionDetail. Nil/absent is safe and
+	// backward-compatible. Opaque forwarder only.
+	InterviewBudget *PollInterviewBudget `json:"interviewBudget,omitempty"`
+
+	// InterviewDefinition is the compiled interview definition JSON. The
+	// daemon does not parse it; the runner's interview loop consumes it.
+	// Forwarded opaquely as json.RawMessage so the strict decoder never
+	// drops it. Opaque forwarder only.
+	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
+}
+
+// PollInterviewBudget mirrors prompt.InterviewBudget for the daemon
+// package. The daemon does not import the runner or prompt packages
+// (cardinal package-architecture rule); this struct carries the budget
+// opaquely so the daemon can forward it onto SessionDetail without
+// depending on the prompt package. The runner re-types it into
+// prompt.InterviewBudget via detailToQueuedWork.
+type PollInterviewBudget struct {
+	MaxWallClockSeconds int `json:"maxWallClockSeconds,omitempty"`
+	IdleGraceSeconds    int `json:"idleGraceSeconds,omitempty"`
 }
 
 // PollStageBudget mirrors the platform's StageBudget shape so the
@@ -618,6 +648,9 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		Kits:                 item.Kits,
 		DisallowedTools:      item.DisallowedTools,
 		MemoryBlock:          item.MemoryBlock,
+		Mode:                 item.Mode,
+		InterviewBudget:      item.InterviewBudget,
+		InterviewDefinition:  item.InterviewDefinition,
 	}
 }
 
