@@ -325,12 +325,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// platform also acks to stop re-sending, but a re-delivery in the
 	// heartbeat-interval window before the ack lands must not double-inject).
 	//
-	// The channel is wired to OnInject ONLY when the feature is enabled AND
-	// the provider supports message injection; otherwise it stays unused
-	// and the session relies on the dispatch-time fold (v1).
+	// The channel is wired to OnInject whenever the provider supports message
+	// injection. Whether any block is actually delivered is decided ENTIRELY by
+	// the platform (it only returns an `inject` on the lock-refresh response
+	// when the project's memory config has runtime-inject enabled) — so the
+	// worker needs no env var or local config. Providers without injection
+	// support rely on the dispatch-time fold (v1).
 	injectCh := make(chan heartbeat.InjectPayload, 8)
 	seenInject := map[string]struct{}{}
-	runtimeInjectEnabled := r.memoryInject && caps.SupportsMessageInjection
+	runtimeInjectEnabled := caps.SupportsMessageInjection
 
 	// 9. Start heartbeat pulser (in a goroutine — Pulser.Start fires
 	// the first tick synchronously then runs the loop in its own

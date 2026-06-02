@@ -168,17 +168,6 @@ type Options struct {
 	// sets this to the SANDBOX OS ("linux") for cloud-targeted sessions so
 	// install scripts match the sandbox, not the dispatching host (OD-2).
 	KitTargetOS string
-
-	// MemoryInjectEnabled gates the Wave 3 runtime mid-session memory
-	// inject feature (v2). When false (the default) the runner never wires
-	// the heartbeat pulser's OnInject hook and never drains the inject
-	// channel — sessions rely solely on the dispatch-time memory fold (v1,
-	// prompt/builder.go), so behaviour is byte-for-byte unchanged. When
-	// true AND the provider advertises SupportsMessageInjection, the runner
-	// delivers platform-queued memory blocks into the live session between
-	// turns via the lock-refresh transport. Providers without injection
-	// support ignore this flag (runtime inject is a no-op for them).
-	MemoryInjectEnabled bool
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -216,7 +205,6 @@ type Runner struct {
 	kitSkillSources    []kit.KitSkillSource
 	kitDetector        KitDetector
 	kitTargetOS        string
-	memoryInject       bool
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session
@@ -264,7 +252,6 @@ func New(opts Options) (*Runner, error) {
 		kitSkillSources:    opts.KitSkillSources,
 		kitDetector:        opts.KitDetector,
 		kitTargetOS:        opts.KitTargetOS,
-		memoryInject:       opts.MemoryInjectEnabled,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
