@@ -81,8 +81,12 @@ func TestToolUseCapabilityMatrix(t *testing.T) {
 				}
 				return p
 			},
-			// Function-calling / MCP not wired in v0.1.
-			want: want{supportsToolPlugins: false, acceptsAllowedToolsList: false, acceptsMcpServerSpec: false},
+			// Gemini-first-class program: native function-calling +
+			// in-provider tool executor (Bash/Read/Edit/Write) → tool
+			// plugins + AllowedTools honoured. MCP-server spec is NOT yet
+			// honored (no in-box MCP stdio client; acceptsMcpServerSpec=false,
+			// MCP→functionDeclaration bridge is a follow-up).
+			want: want{supportsToolPlugins: true, acceptsAllowedToolsList: true, acceptsMcpServerSpec: false},
 		},
 		{
 			name: "amp",

@@ -30,19 +30,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Node 20 + the Claude Code CLI. The in-box agent-runtime provider 'claude' (the
-# resolved model is Claude Opus 4.8) must be on PATH, else `donmai agent run`'s
-# registry can't register it and the runner fails "no provider registered for
-# name claude" BEFORE the clone. This is only the agent CLI — repo language
-# toolchains are still installed in-box by the kit after clone (the runner's
-# shellExecer). The org's ANTHROPIC_API_KEY arrives at runtime via the
-# credential snapshot (byok).
+# Node 20 + provider CLIs.
+#
+# Claude Code CLI: the 'claude' provider shells out to `claude` on PATH.
+# Without it donmai agent run fails "no provider registered for name claude"
+# before the clone even starts. The org's ANTHROPIC_API_KEY arrives at runtime
+# via the credential snapshot (byok).
+#
+# Codex CLI (@openai/codex): the 'codex' provider spawns `codex app-server`
+# on PATH. Without it the codex probe returns ErrProviderUnavailable and any
+# session dispatched to this sandbox with providerId='codex' fails the probe.
+# The org's OPENAI_API_KEY arrives at runtime via the credential snapshot.
+#
+# Gemini: NO CLI install needed. The donmai binary ships a native HTTP provider
+# (provider/gemini) that calls the Gemini REST API directly — no external
+# subprocess. The org's GEMINI_API_KEY / GOOGLE_API_KEY arrives at runtime via
+# the credential snapshot.
+#
+# This is only the agent CLI layer — repo language toolchains are still
+# installed in-box by the kit after clone (the runner's shellExecer).
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm i -g @anthropic-ai/claude-code \
+    && npm i -g @anthropic-ai/claude-code @openai/codex \
     && npm cache clean --force \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Prebuilt linux/amd64 donmai v0.10.0 binary (see worker/e2b/README.md).
+# Prebuilt linux/amd64 donmai binary (see worker/e2b/README.md and build.sh).
+# The binary is cross-compiled outside this Dockerfile (GOOS=linux GOARCH=amd64
+# CGO_ENABLED=0 go build ./cmd/donmai) and placed at worker/e2b/donmai before
+# `e2b template create` runs. The CI workflow (e2b-template.yml) does this in
+# the "Cross-compile donmai binary" step. The compiled binary INCLUDES the
+# native Gemini provider (provider/gemini) — no gemini CLI is required.
 COPY donmai /usr/local/bin/donmai
 RUN chmod +x /usr/local/bin/donmai
