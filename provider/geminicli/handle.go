@@ -222,7 +222,7 @@ func spawnRaw(
 
 	// Watch the spawn ctx: when cancelled, trigger a soft shutdown so
 	// the events channel closes regardless of subprocess state.
-	go h.watchCtx(ctx)
+	go h.watchCtx(ctx) //nolint:gosec // G118: graceful-stop ctx must outlive request ctx
 
 	return h, nil
 }

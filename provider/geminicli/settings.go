@@ -47,10 +47,6 @@ type geminiMCPServerEntry struct {
 	Trust bool `json:"trust"`
 }
 
-// settingsFilePath is the relative path within the worktree where the
-// Gemini CLI looks for project-scoped settings.
-const settingsFilePath = ".gemini/settings.json"
-
 // writeGeminiSettings writes a .gemini/settings.json file into cwd
 // configuring the MCP servers from the spec. Returns the absolute path
 // of the written file (for cleanup in Stop), or "" when servers is empty.

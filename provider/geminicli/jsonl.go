@@ -49,9 +49,9 @@ type rawInitEvent struct {
 type rawMessageEvent struct {
 	Type      string `json:"type"`
 	Timestamp string `json:"timestamp,omitempty"`
-	Role      string `json:"role"`      // "user" | "assistant"
-	Content   string `json:"content"`   // text content (may be a delta chunk)
-	Delta     bool   `json:"delta"`     // true when this is an incremental chunk
+	Role      string `json:"role"`    // "user" | "assistant"
+	Content   string `json:"content"` // text content (may be a delta chunk)
+	Delta     bool   `json:"delta"`   // true when this is an incremental chunk
 }
 
 // rawToolUseEvent is the line emitted when the agent invokes a tool.
@@ -69,11 +69,11 @@ type rawToolUseEvent struct {
 //
 //	{"type":"tool_result","timestamp":"...","tool_id":"<id>","status":"success"|"error","output":"...","error":{...}}
 type rawToolResultEvent struct {
-	Type      string  `json:"type"`
-	Timestamp string  `json:"timestamp,omitempty"`
-	ToolID    string  `json:"tool_id"`
-	Status    string  `json:"status"` // "success" | "error"
-	Output    string  `json:"output,omitempty"`
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp,omitempty"`
+	ToolID    string `json:"tool_id"`
+	Status    string `json:"status"` // "success" | "error"
+	Output    string `json:"output,omitempty"`
 	Error     *struct {
 		Type    string `json:"type,omitempty"`
 		Message string `json:"message,omitempty"`
