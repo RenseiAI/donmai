@@ -183,7 +183,9 @@ type KGExtractionResult struct {
 // only carries the json.RawMessage envelope and the workType discriminant.
 //
 // Field names mirror the platform KgExtractWorkItem EXACTLY — do not rename.
-type KgExtractWorkItem struct {
+// The type name intentionally mirrors the platform contract type, so the
+// revive "stutter" lint is suppressed rather than renamed away.
+type KgExtractWorkItem struct { //nolint:revive // name mirrors the platform KgExtractWorkItem contract type
 	// BatchJobID is the claim key (e.g. "batch:kg_extract:<uuid>"); namespaced,
 	// never a session UUID.
 	BatchJobID string `json:"batchJobId"`

@@ -73,11 +73,7 @@ func parseGraph(raw string) (ExtractedGraph, error) {
 		if e.SourceNodeID == "" || e.TargetNodeID == "" || e.RelationshipName == "" {
 			continue // drop invalid edge (defense-in-depth)
 		}
-		out.Edges = append(out.Edges, ExtractedEdge{
-			SourceNodeID:     e.SourceNodeID,
-			TargetNodeID:     e.TargetNodeID,
-			RelationshipName: e.RelationshipName,
-		})
+		out.Edges = append(out.Edges, ExtractedEdge(e))
 	}
 	return out, nil
 }
