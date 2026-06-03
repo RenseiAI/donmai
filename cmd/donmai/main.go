@@ -16,6 +16,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afcli"
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 const defaultBaseURL = "http://localhost:3000"
@@ -67,6 +68,24 @@ func resolveAPIKey() string {
 		}
 	}
 	return ""
+}
+
+// configureStateHome wires the optional DONMAI_STATE_HOME override into the
+// runtime/statehome seam. It is the ONLY place an environment variable feeds
+// the seam — library packages take the brand/base via the seam's API, never
+// via os.Getenv. DONMAI_STATE_HOME, when set, is an explicit absolute base
+// directory under which the state (.donmai/) and log (Library/Logs/donmai/)
+// trees are anchored, replacing os.UserHomeDir(). Absent it, the default
+// "donmai" brand under the real home directory applies. Called once at
+// process init, before any daemon/runner construction.
+func configureStateHome() {
+	if dir := os.Getenv("DONMAI_STATE_HOME"); dir != "" {
+		statehome.SetBaseHome(dir)
+	} else {
+		// Mark the seam as explicitly configured (default brand) so that
+		// later path resolutions do not emit the resolve-before-set warning.
+		statehome.SetBrand(statehome.DefaultBrand)
+	}
 }
 
 // stdinIsTerminal reports whether stdin is connected to a terminal.
@@ -183,6 +202,12 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 }
 
 func main() {
+	// Configure the host-state seam before constructing any command so the
+	// daemon/runner resolve brand-correct state and log paths. Note that
+	// dotenv files load in PersistentPreRunE (after this), so DONMAI_STATE_HOME
+	// must be a real process env var to take effect here.
+	configureStateHome()
+
 	cmd, _ := newRootCmd()
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
