@@ -149,6 +149,18 @@ type PollResponse struct {
 	// key) — zero impact on existing dispatch. See
 	// runs/2026-06-01-code-survival-runtime-research/03-SEAM-DESIGN.md.
 	BatchWork []BatchWorkItem `json:"batchWork,omitempty"`
+
+	// KgExtractWork is a SEPARATE non-agent batch lane for the "kg-extraction"
+	// work-type, emitted by the platform poll route as a top-level sibling to
+	// batchWork (NOT nested inside it). Each item is a non-interactive,
+	// constrained LLM emit handled by the kgextract package. It shares the
+	// BatchWorkItem envelope (workType discriminant + Raw payload) and the same
+	// isolation guarantees as BatchWork: never routed to the agent path, never
+	// counted toward quota, never added to activeSessions. An old worker ignores
+	// this field. The poll loop dispatches it through the SAME batchHandler as
+	// BatchWork (a workType mux fans both lanes out to their executors); see
+	// PollLoopWithBatch and afcli/worker_start.go.
+	KgExtractWork []BatchWorkItem `json:"kgExtractWork,omitempty"`
 }
 
 // BatchWorkItem is the worker-package envelope for one batchWork[] item. The
