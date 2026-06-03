@@ -27,6 +27,7 @@ import (
 	providerclaude "github.com/RenseiAI/donmai/provider/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/codex"
 	providergemini "github.com/RenseiAI/donmai/provider/gemini"
+	providergeminicli "github.com/RenseiAI/donmai/provider/geminicli"
 	providerollama "github.com/RenseiAI/donmai/provider/ollama"
 	provideropencode "github.com/RenseiAI/donmai/provider/opencode"
 	providerstub "github.com/RenseiAI/donmai/provider/stub"
@@ -466,6 +467,11 @@ func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
 		// generativelanguage.googleapis.com.
 		{name: "amp", new: func() (agent.Provider, error) { return provideramp.New(provideramp.Options{}) }},
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
+		// gemini-cli is a LOCAL/HOST-SESSION-ONLY provider wrapping the `gemini` CLI binary.
+		// It is distinct from the API-direct "gemini" provider above. Auth mode: host-session;
+		// requires the gemini CLI installed on the host PATH. Do NOT use for cloud sandboxes
+		// (e2b) without a custom image that bakes in the gemini CLI binary.
+		{name: "gemini-cli", new: func() (agent.Provider, error) { return providergeminicli.New(providergeminicli.Options{}) }},
 		{name: "opencode", new: func() (agent.Provider, error) { return provideropencode.New(provideropencode.Options{}) }},
 	})
 }
