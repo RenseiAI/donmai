@@ -93,10 +93,20 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 				"method":  "turn/started",
 				"params":  map[string]any{"threadId": threadID, "turn": map[string]any{"id": "t1"}},
 			})
+			// Streamed delta is dropped by the mapper; the full text is
+			// carried by the matching item/completed below.
 			fs.write(t, map[string]any{
 				"jsonrpc": "2.0",
 				"method":  "item/agentMessage/delta",
 				"params":  map[string]any{"threadId": threadID, "delta": "hello world"},
+			})
+			fs.write(t, map[string]any{
+				"jsonrpc": "2.0",
+				"method":  "item/completed",
+				"params": map[string]any{
+					"threadId": threadID,
+					"item":     map[string]any{"id": "m1", "type": "agentMessage", "text": "hello world"},
+				},
 			})
 			fs.write(t, map[string]any{
 				"jsonrpc": "2.0",
@@ -471,12 +481,17 @@ func TestHandle_EventChannelCloseRace_REN1460(t *testing.T) {
 						emitted = true
 						// Stream a burst of small notifications so
 						// the forwarder is reliably executing emit
-						// when Provider.Shutdown lands.
+						// when Provider.Shutdown lands. Use completed
+						// agentMessage items (each maps to one event);
+						// streamed deltas are dropped by the mapper.
 						for n := 0; n < 32; n++ {
 							fs.write(t, map[string]any{
 								"jsonrpc": "2.0",
-								"method":  "item/agentMessage/delta",
-								"params":  map[string]any{"threadId": threadID, "delta": "x"},
+								"method":  "item/completed",
+								"params": map[string]any{
+									"threadId": threadID,
+									"item":     map[string]any{"id": "m", "type": "agentMessage", "text": "x"},
+								},
 							})
 						}
 					}
