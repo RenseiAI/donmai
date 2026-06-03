@@ -173,9 +173,17 @@ go test -tags codex_integration -timeout 120s ./provider/codex/
   v0.5.0 fails fast instead.
 - **`turn/steer` mid-turn injection** — `Handle.Inject` returns
   `agent.ErrUnsupported`. F.5 may revisit if the runner needs it.
-- **Reasoning-delta coalescing** — the legacy TS buffers reasoning
-  text streams to avoid char-by-char log spam. Out of scope for the
-  provider; the runner can coalesce its own log output.
+- **Streaming text/reasoning deltas** — the partial-message
+  notifications (`item/agentMessage/delta`, `item/reasoning/textDelta`,
+  `item/reasoning/summaryTextDelta`) are dropped outright, mirroring the
+  Claude provider's `stream_event` drop. The full text arrives on the
+  matching `item/completed`, so no content is lost. (The legacy TS
+  instead buffered reasoning streams to avoid char-by-char log spam; an
+  earlier Go port forwarded each delta as its own event, which surfaced
+  as one-token-per-line "thought" activities on the platform topology
+  view — see `runtime/activity`. Dropping the deltas removes that spam.
+  Live incremental rendering is served by the separate
+  `runtime/tokendelta` transport, not the activity-event stream.)
 - **PID-file orphan-killing** — the legacy TS writes
   `~/.donmai/codex-app-server.pid` to detect stranded processes
   on restart. Wave 6 daemon owns subprocess lifecycle (REN-1408+); the
