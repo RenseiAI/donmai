@@ -1,28 +1,28 @@
 // Package statepath provides helpers for resolving OSS state directory paths
-// under the ~/.donmai/ directory.
+// under the brand state directory (~/.donmai/ by default).
 //
 // Policy:
-//   - Canonical path is ~/.donmai/<file>
-//   - New writes always go to ~/.donmai/.
-//   - ~/Library/Logs/rensei/ is shared with the closed-source rensei binary
-//     and is NOT resolved here.
+//   - Canonical path is ~/.<brand>/<file>, where <brand> defaults to "donmai".
+//   - The brand is configured once at process init via the
+//     github.com/RenseiAI/donmai/runtime/statehome seam; library code never
+//     reads the environment to discover it.
+//   - New writes always go to the brand state dir.
 package statepath
 
 import (
-	"os"
-	"path/filepath"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
-// Resolve returns the path to use for a state file under the ~/.donmai/
+// Resolve returns the path to use for a state file under the brand state
 // directory.
 //
 // suffix is the path suffix under the state dir, e.g. "daemon.yaml".
 //
-// tmpFallback is used when os.UserHomeDir() fails (e.g. in some test envs).
+// tmpFallback is used when the home directory cannot be resolved (e.g. in
+// some test envs), matching the historical os.UserHomeDir() failure path.
 func Resolve(suffix, tmpFallback string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return tmpFallback
+	if dir := statehome.StateDir(suffix); dir != "" {
+		return dir
 	}
-	return filepath.Join(home, ".donmai", suffix)
+	return tmpFallback
 }
