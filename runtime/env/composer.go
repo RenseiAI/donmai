@@ -25,7 +25,10 @@ var AgentEnvBlocklist = []string{
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_BASE_URL",
+	"GEMINI_API_KEY",
+	"GOOGLE_API_KEY",
 	"OPENCLAW_GATEWAY_TOKEN",
+	"OPENAI_API_KEY",
 }
 
 // Composer builds the KEY=VALUE slice handed to exec.Cmd.Env for an

@@ -365,12 +365,12 @@ func TestRunSetup_HeaderAndSamplesPresent(t *testing.T) {
 		}
 	}
 
-	// Three commented sample entries.
+	// Four commented sample entries (Gemini added for first-class support).
 	count := strings.Count(content, "=op://Private/")
-	if count != 3 {
-		t.Errorf("expected 3 op:// samples, got %d:\n%s", count, content)
+	if count != 4 {
+		t.Errorf("expected 4 op:// samples, got %d:\n%s", count, content)
 	}
-	for _, key := range []string{"ANTHROPIC_API_KEY", "LINEAR_API_KEY", "OPENAI_API_KEY"} {
+	for _, key := range []string{"ANTHROPIC_API_KEY", "GEMINI_API_KEY", "LINEAR_API_KEY", "OPENAI_API_KEY"} {
 		want := "# " + key + "=op://Private/"
 		if !strings.Contains(content, want) {
 			t.Errorf("missing commented sample %q", want)

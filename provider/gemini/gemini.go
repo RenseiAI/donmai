@@ -217,6 +217,15 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		)
 	}
 
+	// Resolve the MaxTurns cap. 0 = uncapped (no MaxTurns set or
+	// explicitly zero). MaxTurns > 0 is a hard agentic round-trip ceiling
+	// enforced inside the driver loop (distinct from MaxOutputTokens which
+	// caps per-response token count).
+	maxTurns := 0
+	if spec.MaxTurns != nil && *spec.MaxTurns > 0 {
+		maxTurns = *spec.MaxTurns
+	}
+
 	return startSession(ctx, sessionParams{
 		apiKey:    apiKey,
 		endpoint:  p.endpoint,
@@ -227,8 +236,9 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		// cwd / env drive the session-local tool executor: native
 		// functionCalls (Bash/Read/Edit/Write) run in the session's
 		// working directory with the session env.
-		cwd: spec.Cwd,
-		env: spec.Env,
+		cwd:      spec.Cwd,
+		env:      spec.Env,
+		maxTurns: maxTurns,
 	})
 }
 
