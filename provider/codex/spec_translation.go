@@ -1,7 +1,11 @@
 package codex
 
 import (
+	"encoding/json"
+	"log/slog"
+
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/mcp"
 )
 
 // DefaultCodexModel is the model identifier used when Spec.Model is
@@ -156,20 +160,50 @@ func promptInput(spec agent.Spec) []map[string]any {
 // the `mcpServers` keyPath. Codex expects a map keyed by server name,
 // not the flat array we hold in Spec.MCPServers. The mapping mirrors
 // configureMcpServers in the legacy TS.
+//
+// It delegates to mcp.BuildConfigFile so the stdio/http transport logic
+// and omitempty field rules live in exactly one place. Servers that
+// fail validation (empty Name, missing Command/URL) are skipped with a
+// warning rather than aborting the whole map — a single bad entry must
+// not silence all MCP servers.
 func mcpServersConfig(servers []agent.MCPServerConfig) map[string]any {
 	if len(servers) == 0 {
 		return nil
 	}
+
+	// Build one-at-a-time so a bad entry is skipped, not fatal.
 	out := make(map[string]any, len(servers))
 	for _, s := range servers {
-		entry := map[string]any{
-			"command": s.Command,
-			"args":    s.Args,
+		cfg, err := mcp.BuildConfigFile([]agent.MCPServerConfig{s})
+		if err != nil {
+			slog.Warn("codex: skipping invalid MCP server entry",
+				"server", s.Name, "err", err)
+			continue
 		}
-		if len(s.Env) > 0 {
-			entry["env"] = s.Env
+		// Marshal the typed Server struct (with omitempty tags) then
+		// unmarshal into map[string]any to get exactly the right JSON
+		// shape without null fields.
+		srv, ok := cfg.MCPServers[s.Name]
+		if !ok {
+			// Shouldn't happen — BuildConfigFile uses s.Name as key.
+			continue
+		}
+		b, err := json.Marshal(srv)
+		if err != nil {
+			slog.Warn("codex: failed to marshal MCP server entry",
+				"server", s.Name, "err", err)
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(b, &entry); err != nil {
+			slog.Warn("codex: failed to unmarshal MCP server entry",
+				"server", s.Name, "err", err)
+			continue
 		}
 		out[s.Name] = entry
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
