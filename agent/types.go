@@ -22,18 +22,17 @@ type ProviderName string
 // providers per F.1.1 §1; declaring them now keeps the wire enum stable
 // across waves so platform-side dispatch routing does not regress.
 const (
-	ProviderClaude    ProviderName = "claude"
-	ProviderCodex     ProviderName = "codex"
-	ProviderStub      ProviderName = "stub" // test-only; deterministic
-	ProviderSpringAI  ProviderName = "spring-ai"
-	ProviderA2A       ProviderName = "a2a"
-	ProviderAmp       ProviderName = "amp"
-	ProviderGemini    ProviderName = "gemini"
-	ProviderGeminiCLI ProviderName = "gemini-cli" // EOL gemini-CLI wrap; API-key, host-session. Retired after 2026-06-18.
-	ProviderAGYCLI    ProviderName = "agy-cli"    // Antigravity `agy` CLI-wrap; OAuth/local/host-session, pty, no key
-	ProviderOllama    ProviderName = "ollama"
-	ProviderOpenCode  ProviderName = "opencode"
-	ProviderJules     ProviderName = "jules"
+	ProviderClaude   ProviderName = "claude"
+	ProviderCodex    ProviderName = "codex"
+	ProviderStub     ProviderName = "stub" // test-only; deterministic
+	ProviderSpringAI ProviderName = "spring-ai"
+	ProviderA2A      ProviderName = "a2a"
+	ProviderAmp      ProviderName = "amp"
+	ProviderGemini   ProviderName = "gemini"
+	ProviderAGYCLI   ProviderName = "agy-cli" // Antigravity `agy` CLI-wrap; OAuth/local/host-session, pty, no key. Successor to the removed gemini-cli wrap (gemini CLI EOL 2026-06-18).
+	ProviderOllama   ProviderName = "ollama"
+	ProviderOpenCode ProviderName = "opencode"
+	ProviderJules    ProviderName = "jules"
 )
 
 // Capability names a single optional behavior a provider may support.
