@@ -7,117 +7,137 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-func TestMapChunk_TextOnly(t *testing.T) {
+func TestMapResponse_TextOnly_Final(t *testing.T) {
 	t.Parallel()
-	in := []byte(`{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}`)
-	got, terminal := mapChunk(in)
-	if terminal {
-		t.Error("terminal: want false on text-only chunk")
+	in := []byte(`{"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4}}`)
+	turn := mapResponse(in, &turnState{model: "gemini-3.5-flash"})
+	if turn.outcome != outcomeFinal {
+		t.Fatalf("outcome: want outcomeFinal, got %v", turn.outcome)
 	}
-	if len(got) != 1 {
-		t.Fatalf("events: want 1, got %d", len(got))
+	if len(turn.events) != 1 {
+		t.Fatalf("events: want 1 (text), got %d", len(turn.events))
 	}
-	ev, ok := got[0].(agent.AssistantTextEvent)
+	if ev, ok := turn.events[0].(agent.AssistantTextEvent); !ok || ev.Text != "hello" {
+		t.Fatalf("events[0]: want AssistantTextEvent(hello), got %#v", turn.events[0])
+	}
+	res, ok := turn.result.(agent.ResultEvent)
 	if !ok {
-		t.Fatalf("event[0]: want AssistantTextEvent, got %T", got[0])
-	}
-	if ev.Text != "hello" {
-		t.Errorf("Text: want %q, got %q", "hello", ev.Text)
-	}
-}
-
-func TestMapChunk_FinishReasonStop(t *testing.T) {
-	t.Parallel()
-	in := []byte(`{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4}}`)
-	got, terminal := mapChunk(in)
-	if !terminal {
-		t.Fatal("terminal: want true on finishReason chunk")
-	}
-	if len(got) != 1 {
-		t.Fatalf("events: want 1, got %d", len(got))
-	}
-	res, ok := got[0].(agent.ResultEvent)
-	if !ok {
-		t.Fatalf("event[0]: want ResultEvent, got %T", got[0])
+		t.Fatalf("result: want ResultEvent, got %T", turn.result)
 	}
 	if !res.Success {
-		t.Error("ResultEvent.Success: want true for STOP")
+		t.Error("Result.Success: want true for STOP")
 	}
 	if res.Cost == nil {
-		t.Fatal("ResultEvent.Cost: want non-nil with usageMetadata")
+		t.Fatal("Result.Cost: want non-nil")
 	}
-	if res.Cost.InputTokens != 10 {
-		t.Errorf("InputTokens: want %d, got %d", 10, res.Cost.InputTokens)
-	}
-	if res.Cost.OutputTokens != 4 {
-		t.Errorf("OutputTokens: want %d, got %d", 4, res.Cost.OutputTokens)
+	if res.Cost.InputTokens != 10 || res.Cost.OutputTokens != 4 {
+		t.Errorf("Cost tokens: want in=10 out=4, got in=%d out=%d", res.Cost.InputTokens, res.Cost.OutputTokens)
 	}
 }
 
-func TestMapChunk_FinishReasonSafety(t *testing.T) {
+func TestMapResponse_FunctionCall_Continue(t *testing.T) {
+	t.Parallel()
+	in := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-1","name":"Bash","args":{"command":"ls"}}}]}}]}`)
+	turn := mapResponse(in, &turnState{model: "gemini-3.5-flash"})
+	if turn.outcome != outcomeContinue {
+		t.Fatalf("outcome: want outcomeContinue, got %v", turn.outcome)
+	}
+	if len(turn.funcCalls) != 1 {
+		t.Fatalf("funcCalls: want 1, got %d", len(turn.funcCalls))
+	}
+	if turn.funcCalls[0].ID != "call-1" || turn.funcCalls[0].Name != "Bash" {
+		t.Errorf("funcCall: want id=call-1 name=Bash, got %#v", turn.funcCalls[0])
+	}
+	tu, ok := turn.events[0].(agent.ToolUseEvent)
+	if !ok {
+		t.Fatalf("events[0]: want ToolUseEvent, got %T", turn.events[0])
+	}
+	if tu.ToolName != "Bash" || tu.ToolUseID != "call-1" {
+		t.Errorf("ToolUse: want Bash/call-1, got %s/%s", tu.ToolName, tu.ToolUseID)
+	}
+	if tu.Input["command"] != "ls" {
+		t.Errorf("ToolUse.Input[command]: want ls, got %v", tu.Input["command"])
+	}
+	// The model turn must be recorded so the next turn carries the call.
+	if len(turn.modelParts) != 1 || turn.modelParts[0].FunctionCall == nil {
+		t.Fatalf("modelParts: want 1 functionCall part, got %#v", turn.modelParts)
+	}
+}
+
+func TestMapResponse_FinishReasonSafety_Failure(t *testing.T) {
 	t.Parallel()
 	in := []byte(`{"candidates":[{"finishReason":"SAFETY"}]}`)
-	got, terminal := mapChunk(in)
-	if !terminal {
-		t.Fatal("terminal: want true")
+	turn := mapResponse(in, &turnState{model: "gemini-3.5-flash"})
+	if turn.outcome != outcomeFinal {
+		t.Fatalf("outcome: want outcomeFinal, got %v", turn.outcome)
 	}
-	res, ok := got[0].(agent.ResultEvent)
+	res, ok := turn.result.(agent.ResultEvent)
 	if !ok {
-		t.Fatalf("event[0]: want ResultEvent, got %T", got[0])
+		t.Fatalf("result: want ResultEvent, got %T", turn.result)
 	}
 	if res.Success {
-		t.Error("ResultEvent.Success: want false for SAFETY")
+		t.Error("Result.Success: want false for SAFETY")
 	}
 	if !strings.Contains(res.ErrorSubtype, "SAFETY") {
 		t.Errorf("ErrorSubtype: want SAFETY mention, got %q", res.ErrorSubtype)
 	}
 }
 
-func TestMapChunk_PromptBlocked(t *testing.T) {
+func TestMapResponse_PromptBlocked_Error(t *testing.T) {
 	t.Parallel()
 	in := []byte(`{"promptFeedback":{"blockReason":"OTHER"}}`)
-	got, terminal := mapChunk(in)
-	if !terminal {
-		t.Fatal("terminal: want true on blockReason")
+	turn := mapResponse(in, &turnState{model: "gemini-3.5-flash"})
+	if turn.outcome != outcomeError {
+		t.Fatalf("outcome: want outcomeError, got %v", turn.outcome)
 	}
-	if len(got) != 1 {
-		t.Fatalf("events: want 1, got %d", len(got))
-	}
-	errEv, ok := got[0].(agent.ErrorEvent)
+	errEv, ok := turn.result.(agent.ErrorEvent)
 	if !ok {
-		t.Fatalf("event[0]: want ErrorEvent, got %T", got[0])
+		t.Fatalf("result: want ErrorEvent, got %T", turn.result)
 	}
 	if errEv.Code != "prompt_blocked" {
-		t.Errorf("Code: want %q, got %q", "prompt_blocked", errEv.Code)
+		t.Errorf("Code: want prompt_blocked, got %q", errEv.Code)
 	}
 }
 
-func TestMapChunk_MalformedJSONReturnsError(t *testing.T) {
+func TestMapResponse_MalformedJSON_Error(t *testing.T) {
 	t.Parallel()
-	in := []byte(`{not-json`)
-	got, terminal := mapChunk(in)
-	if !terminal {
-		t.Fatal("terminal: want true for parse error")
+	turn := mapResponse([]byte(`{not-json`), &turnState{model: "gemini-3.5-flash"})
+	if turn.outcome != outcomeError {
+		t.Fatalf("outcome: want outcomeError, got %v", turn.outcome)
 	}
-	if _, ok := got[0].(agent.ErrorEvent); !ok {
-		t.Fatalf("event[0]: want ErrorEvent on bad JSON, got %T", got[0])
+	if _, ok := turn.result.(agent.ErrorEvent); !ok {
+		t.Fatalf("result: want ErrorEvent on bad JSON, got %T", turn.result)
 	}
 }
 
-func TestMapChunk_TextThenFinish(t *testing.T) {
+// TestMapResponse_CostAccumulatesAcrossTurns verifies the running totals
+// fold across multiple turns (function-call round-trip then final).
+func TestMapResponse_CostAccumulatesAcrossTurns(t *testing.T) {
 	t.Parallel()
-	in := []byte(`{"candidates":[{"content":{"parts":[{"text":"chunk"}]},"finishReason":"STOP"}]}`)
-	got, terminal := mapChunk(in)
-	if !terminal {
-		t.Fatal("terminal: want true")
+	state := &turnState{model: "gemini-3.5-flash"}
+
+	turn1 := mapResponse([]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"id":"c1","name":"Read"}}]}}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20}}`), state)
+	if turn1.outcome != outcomeContinue {
+		t.Fatalf("turn1 outcome: want outcomeContinue, got %v", turn1.outcome)
 	}
-	if len(got) != 2 {
-		t.Fatalf("events: want 2 (text+result), got %d", len(got))
+
+	turn2 := mapResponse([]byte(`{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":150,"candidatesTokenCount":30}}`), state)
+	res, ok := turn2.result.(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("turn2 result: want ResultEvent, got %T", turn2.result)
 	}
-	if _, ok := got[0].(agent.AssistantTextEvent); !ok {
-		t.Errorf("event[0]: want AssistantTextEvent, got %T", got[0])
+	if res.Cost.InputTokens != 250 {
+		t.Errorf("Cost.InputTokens: want 250 (100+150), got %d", res.Cost.InputTokens)
 	}
-	if _, ok := got[1].(agent.ResultEvent); !ok {
-		t.Errorf("event[1]: want ResultEvent, got %T", got[1])
+	if res.Cost.OutputTokens != 50 {
+		t.Errorf("Cost.OutputTokens: want 50 (20+30), got %d", res.Cost.OutputTokens)
+	}
+	if res.Cost.NumTurns != 2 {
+		t.Errorf("Cost.NumTurns: want 2, got %d", res.Cost.NumTurns)
+	}
+	// 250 in @ 1.50/M + 50 out @ 9.00/M = 0.000375 + 0.00045 = 0.000825.
+	want := (250.0/1_000_000)*1.50 + (50.0/1_000_000)*9.00
+	if diff := res.Cost.TotalCostUsd - want; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("Cost.TotalCostUsd: want %g, got %g", want, res.Cost.TotalCostUsd)
 	}
 }
