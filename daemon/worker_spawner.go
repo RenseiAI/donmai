@@ -41,8 +41,7 @@ type SpawnerOptions struct {
 	// OnPreSpawn is an optional hook invoked once per spawn, immediately
 	// before the child process is exec'd. It receives the final SessionSpec
 	// and the env slice that would otherwise be exec'd, and returns the env
-	// slice that will actually be exec'd. Returning nil is equivalent to
-	// returning the input unchanged.
+	// slice that will actually be exec'd plus an optional error.
 	//
 	// Callers may use this to layer per-session env entries (e.g.,
 	// credentials resolved at spawn time) over the spawner's BaseEnv.
@@ -56,7 +55,19 @@ type SpawnerOptions struct {
 	// The hook MUST NOT block on I/O paths that can hang indefinitely.
 	// Spawn latency budget is on the order of 250ms; if the hook needs
 	// to do I/O, it should have its own timeout.
-	OnPreSpawn func(spec SessionSpec, env []string) []string
+	//
+	// Returning a non-nil error aborts the spawn: AcceptWork returns the
+	// error to the caller without starting the child process. This is the
+	// fail-closed path for callers that must deny a spawn when a required
+	// credential is unavailable (e.g. byok/metered/shared sessions where
+	// the credential snapshot gate returns 403). For transient failures
+	// that should not block the spawn, callers should return (env, nil)
+	// with a sentinel env var (e.g. DONMAI_CREDENTIAL_SNAPSHOT_FAILED=1)
+	// so the agent can retry via its own fallback.
+	//
+	// A nil env slice return with a nil error is equivalent to returning
+	// the input env unchanged (no-op, same as the nil hook case).
+	OnPreSpawn func(spec SessionSpec, env []string) ([]string, error)
 
 	// Now lets tests deterministically clock acceptedAt timestamps.
 	Now func() time.Time
@@ -326,9 +337,18 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// per-session env entries (e.g., credentials resolved at spawn time)
 	// the static BaseEnv map cannot express. It runs after composeEnv so
 	// the returned slice can add or override anything BaseEnv + spec.Env
-	// produced. A nil return is a no-op.
+	// produced. A nil env return with nil error is a no-op.
+	//
+	// A non-nil error aborts the spawn (fail-closed). The child process is
+	// never started and AcceptWork surfaces the error to the caller so the
+	// daemon's poll loop can NACK the session.
 	if s.opts.OnPreSpawn != nil {
-		if next := s.opts.OnPreSpawn(spec, cmd.Env); next != nil {
+		next, hookErr := s.opts.OnPreSpawn(spec, cmd.Env)
+		if hookErr != nil {
+			cancel()
+			return nil, fmt.Errorf("pre-spawn hook: %w", hookErr)
+		}
+		if next != nil {
 			cmd.Env = next
 		}
 	}

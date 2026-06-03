@@ -109,6 +109,18 @@ type PollWorkItem struct {
 	// fix — opaque forwarder only, no new logic.
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
 
+	// InjectedPoolId is the non-secret pool accounting sentinel the
+	// platform stamps for metered and shared auth modes:
+	// "metered_pool_<provider>" or "shared_pool_<provider>". Safe at
+	// rest — this is a billing tag, not a credential. Absent for
+	// byok/host-session/local sessions.
+	//
+	// Model credential keys are NOT on the wire payload (Option C of the
+	// credential-injection design); they reach the agent child exclusively
+	// via the daemon's OnPreSpawn → credential-snapshot secure path. Only
+	// the accounting sentinel rides the queue.
+	InjectedPoolId string `json:"injectedPoolId,omitempty"`
+
 	// MemoryBlock is the dispatch-time agent-memory context the platform
 	// folds into the system prompt (Wave 3 memory-inject v1). The daemon
 	// forwards it opaquely onto SessionDetail; the runner's prompt builder
@@ -639,6 +651,7 @@ func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		WorkerID:             workerID,
 		AuthToken:            authToken,
 		PlatformURL:          platformURL,
+		CredentialPoolID:     item.InjectedPoolId,
 		StagePrompt:          item.StagePrompt,
 		StageID:              item.StageID,
 		StageBudget:          item.StageBudget,
