@@ -1,1 +1,0 @@
-{"type":"tool_use","timestamp":"2026-06-03T14:37:19.456Z","tool_name":"shell","tool_id":"call_abc123","parameters":{"command":"ls /tmp","description":"List files in /tmp"}}
