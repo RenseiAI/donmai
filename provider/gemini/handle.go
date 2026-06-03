@@ -115,7 +115,7 @@ type Handle struct {
 // launches the driver goroutine. The InitEvent is enqueued before the
 // goroutine launches so callers always observe it first.
 func startSession(ctx context.Context, p sessionParams) (*Handle, error) {
-	driverCtx, cancel := context.WithCancel(ctx)
+	driverCtx, cancel := context.WithCancel(ctx) //nolint:gosec // cancel is retained on Handle.cancel and invoked by Stop()/driver exit (h.cancel())
 
 	client := p.client
 	if client == nil {

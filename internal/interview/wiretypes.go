@@ -49,11 +49,11 @@ const InterviewCompletedEvent = "com.rensei.interview.completed"
 // Matches INTERVIEW_SIGNAL_FILTER_KEY in wire-types.ts.
 const InterviewSignalFilterKey = "interviewId"
 
-// InterviewTokenChannel returns the Redis pub/sub channel name for
+// TokenChannel returns the Redis pub/sub channel name for
 // token-delta frames for the given interview id.
 // Matches interviewTokenChannel(id) in wire-types.ts.
 //
 // Channel format: "interview:{interviewId}:token-deltas"
-func InterviewTokenChannel(id string) string {
+func TokenChannel(id string) string {
 	return fmt.Sprintf("interview:%s:token-deltas", id)
 }
