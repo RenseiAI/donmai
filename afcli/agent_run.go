@@ -23,6 +23,7 @@ import (
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/prompt"
+	provideragycli "github.com/RenseiAI/donmai/provider/agycli"
 	provideramp "github.com/RenseiAI/donmai/provider/amp"
 	providerclaude "github.com/RenseiAI/donmai/provider/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/codex"
@@ -472,6 +473,11 @@ func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
 		// requires the gemini CLI installed on the host PATH. Do NOT use for cloud sandboxes
 		// (e2b) without a custom image that bakes in the gemini CLI binary.
 		{name: "gemini-cli", new: func() (agent.Provider, error) { return providergeminicli.New(providergeminicli.Options{}) }},
+		// agy-cli is a LOCAL/HOST-SESSION/OAUTH provider wrapping the Antigravity `agy` CLI under a pty.
+		// It is the successor to the EOL gemini-cli wrap for SUBSCRIPTION/no-key dispatch (the user's own
+		// OAuth-authed agy on the user's own machine). Distinct from both the API-direct "gemini" and the
+		// "gemini-cli" wrap. Requires `agy` installed AND logged in on the host PATH. NOT for cloud sandboxes.
+		{name: "agy-cli", new: func() (agent.Provider, error) { return provideragycli.New(provideragycli.Options{}) }},
 		{name: "opencode", new: func() (agent.Provider, error) { return provideropencode.New(provideropencode.Options{}) }},
 	})
 }

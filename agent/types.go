@@ -29,7 +29,8 @@ const (
 	ProviderA2A       ProviderName = "a2a"
 	ProviderAmp       ProviderName = "amp"
 	ProviderGemini    ProviderName = "gemini"
-	ProviderGeminiCLI ProviderName = "gemini-cli" // CLI-wrap; local/host-session only
+	ProviderGeminiCLI ProviderName = "gemini-cli" // EOL gemini-CLI wrap; API-key, host-session. Retired after 2026-06-18.
+	ProviderAGYCLI    ProviderName = "agy-cli"    // Antigravity `agy` CLI-wrap; OAuth/local/host-session, pty, no key
 	ProviderOllama    ProviderName = "ollama"
 	ProviderOpenCode  ProviderName = "opencode"
 	ProviderJules     ProviderName = "jules"
