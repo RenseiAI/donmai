@@ -126,6 +126,8 @@ func TestBlocklistContents(t *testing.T) {
 		"WORKOS_COOKIE_PASSWORD",
 		"DONMAI_RUNTIME_JWT",
 		"WORKER_API_KEY",
+		"DONMAI_DAEMON_TOKEN",
+		"DONMAI_ORCHESTRATOR_URL",
 	}
 	got := append([]string{}, AgentEnvBlocklist...)
 	sort.Strings(got)

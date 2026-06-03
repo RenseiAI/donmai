@@ -74,10 +74,28 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # box is network-restricted to the clone remote); use the baked one as-is.
 ENV GOTOOLCHAIN=local GOFLAGS=-mod=mod
 
-# Node runtime for RW4 TS reachability (copied from the node base image).
+# Node runtime for RW4 TS reachability AND the provider CLIs.
+# Copying from the node base image gives us node + npm; after the copy we
+# install the provider CLIs:
+#
+#   @anthropic-ai/claude-code  — the 'claude' provider shells out to `claude`
+#                                on PATH; without it the claude probe fails
+#                                ErrProviderUnavailable before any clone starts.
+#
+#   @openai/codex              — the 'codex' provider spawns `codex app-server`
+#                                on PATH; without it any session dispatched with
+#                                providerId='codex' fails the probe.
+#
+# Gemini: NO CLI install needed. The donmai binary (built above in the 'build'
+# stage) ships a native HTTP provider (provider/gemini) compiled in — it calls
+# the Gemini REST API directly with no external subprocess. The build stage
+# always compiles from source, so the latest provider/gemini code ships with
+# every image rebuild triggered by a release tag.
 COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:22-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
-RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && npm i -g @anthropic-ai/claude-code @openai/codex \
+    && npm cache clean --force
 
 # Baked code-survival TS reachability script + its pre-installed node_modules.
 # reachability_ts.go resolves this default path relative to the donmai binary

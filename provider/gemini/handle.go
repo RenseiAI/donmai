@@ -41,6 +41,10 @@ type sessionParams struct {
 	// directory native tools run in + per-session environment for Bash).
 	cwd string
 	env map[string]string
+	// maxTurns is the maximum number of generateContent round-trips
+	// (agentic turns) allowed before the driver terminates with an
+	// error_max_turns result. 0 means uncapped.
+	maxTurns int
 }
 
 // injectMsg carries an injected steering message into the driver loop.
@@ -74,6 +78,13 @@ type Handle struct {
 	// Gemini REST endpoint does not execute tools itself.
 	executor *toolExecutor
 
+	// maxTurns caps the number of generateContent round-trips (agentic
+	// turns). 0 means uncapped. When the cap is hit the driver emits a
+	// terminal ResultEvent with Success=false / ErrorSubtype
+	// "error_max_turns" so the runner acceptance gate can distinguish a
+	// deliberate cap from a model-side truncation.
+	maxTurns int
+
 	events chan agent.Event
 	cancel context.CancelFunc
 
@@ -104,7 +115,7 @@ type Handle struct {
 // launches the driver goroutine. The InitEvent is enqueued before the
 // goroutine launches so callers always observe it first.
 func startSession(ctx context.Context, p sessionParams) (*Handle, error) {
-	driverCtx, cancel := context.WithCancel(ctx)
+	driverCtx, cancel := context.WithCancel(ctx) //nolint:gosec // cancel is retained on Handle.cancel and invoked by Stop()/driver exit (h.cancel())
 
 	client := p.client
 	if client == nil {
@@ -119,6 +130,7 @@ func startSession(ctx context.Context, p sessionParams) (*Handle, error) {
 		plan:      p.plan,
 		client:    client,
 		executor:  newToolExecutor(p.cwd, p.env),
+		maxTurns:  p.maxTurns,
 		events:    make(chan agent.Event, eventBufferSize),
 		cancel:    cancel,
 		inject:    make(chan injectMsg, 4),
@@ -228,6 +240,22 @@ func (h *Handle) drive(ctx context.Context) {
 			if !h.sendEvent(ev) {
 				return
 			}
+		}
+
+		// MaxTurns cap: if the caller set a turn ceiling and we have
+		// reached it, terminate regardless of outcome. This prevents
+		// unbounded API spend when a model loops on functionCalls. The
+		// cap applies after the turn's events are emitted so the caller
+		// always sees the model output that consumed the final turn.
+		if h.maxTurns > 0 && h.state.turnCount >= h.maxTurns {
+			h.sendEvent(agent.ResultEvent{
+				Success:      false,
+				Message:      fmt.Sprintf("provider/gemini: max turns reached (%d)", h.maxTurns),
+				Errors:       []string{fmt.Sprintf("max turns exceeded: limit %d", h.maxTurns)},
+				ErrorSubtype: "error_max_turns",
+				Cost:         buildCost(h.state),
+			})
+			return
 		}
 
 		switch turn.outcome {

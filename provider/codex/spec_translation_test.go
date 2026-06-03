@@ -1,8 +1,10 @@
 package codex
 
 import (
+	"encoding/json"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -176,8 +178,97 @@ func TestNewSpawnPlan_MCPServers(t *testing.T) {
 	if linear["command"] != "node" {
 		t.Fatalf("expected command=node, got %v", linear["command"])
 	}
-	if envMap, ok := linear["env"].(map[string]string); !ok || envMap["FOO"] != "bar" {
+	// After JSON marshal/unmarshal roundtrip, env is map[string]interface{}.
+	envMap, ok := linear["env"].(map[string]interface{})
+	if !ok || envMap["FOO"] != "bar" {
 		t.Fatalf("expected env FOO=bar, got %v", linear["env"])
+	}
+	// type field should always be present and set to "stdio".
+	if linear["type"] != "stdio" {
+		t.Fatalf("expected type=stdio, got %v", linear["type"])
+	}
+}
+
+// TestMCPServersConfig_NoArgsStdio verifies that a stdio server with no
+// args produces an entry without an "args" key (and certainly not null).
+func TestMCPServersConfig_NoArgsStdio(t *testing.T) {
+	t.Parallel()
+	servers := []agent.MCPServerConfig{
+		{Name: "no-args", Command: "mybinary"},
+	}
+	cfg := mcpServersConfig(servers)
+	entry, ok := cfg["no-args"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected map entry for no-args, got %T: %v", cfg["no-args"], cfg["no-args"])
+	}
+	if _, hasArgs := entry["args"]; hasArgs {
+		t.Fatalf("expected no 'args' key for a server with no args, got entry=%v", entry)
+	}
+	if entry["command"] != "mybinary" {
+		t.Fatalf("expected command=mybinary, got %v", entry["command"])
+	}
+	if entry["type"] != "stdio" {
+		t.Fatalf("expected type=stdio, got %v", entry["type"])
+	}
+}
+
+// TestMCPServersConfig_HTTPTransport verifies that an http-type server
+// produces an entry with type/url/headers and no command/args fields.
+func TestMCPServersConfig_HTTPTransport(t *testing.T) {
+	t.Parallel()
+	servers := []agent.MCPServerConfig{
+		{
+			Name:    "af-linear-proxy",
+			Type:    "http",
+			URL:     "https://example.com/mcp",
+			Headers: map[string]string{"Authorization": "Bearer tok"},
+		},
+	}
+	cfg := mcpServersConfig(servers)
+	entry, ok := cfg["af-linear-proxy"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected map entry for af-linear-proxy, got %T: %v", cfg["af-linear-proxy"], cfg["af-linear-proxy"])
+	}
+	if entry["type"] != "http" {
+		t.Fatalf("expected type=http, got %v", entry["type"])
+	}
+	if entry["url"] != "https://example.com/mcp" {
+		t.Fatalf("expected url=https://example.com/mcp, got %v", entry["url"])
+	}
+	headers, ok := entry["headers"].(map[string]interface{})
+	if !ok || headers["Authorization"] != "Bearer tok" {
+		t.Fatalf("expected Authorization header, got %v", entry["headers"])
+	}
+	if _, hasCmd := entry["command"]; hasCmd {
+		t.Fatalf("http entry must not contain 'command', got entry=%v", entry)
+	}
+	if _, hasArgs := entry["args"]; hasArgs {
+		t.Fatalf("http entry must not contain 'args', got entry=%v", entry)
+	}
+}
+
+// TestMCPServersConfig_NoNullValues verifies that a mixed config (a
+// no-args stdio server plus an http server) marshals to JSON with no
+// null values anywhere — this is the direct guard against the codex
+// config/batchWrite rejection.
+func TestMCPServersConfig_NoNullValues(t *testing.T) {
+	t.Parallel()
+	servers := []agent.MCPServerConfig{
+		{Name: "stdio-noargs", Command: "runner"},
+		{
+			Name:    "http-proxy",
+			Type:    "http",
+			URL:     "https://proxy.example.com/mcp",
+			Headers: map[string]string{"X-Token": "abc"},
+		},
+	}
+	cfg := mcpServersConfig(servers)
+	j, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	if strings.Contains(string(j), "null") {
+		t.Fatalf("marshaled MCP config contains null — codex will reject it:\n%s", string(j))
 	}
 }
 

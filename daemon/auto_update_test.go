@@ -67,12 +67,14 @@ func TestUpdater_CheckForUpdate_NewerAvailable(t *testing.T) {
 }
 
 func TestUpdater_RunUpdate_RejectsByDefaultVerifier(t *testing.T) {
-	// Manifest reports a newer version, the binary path is downloaded, but
-	// the default verifier refuses — the swap MUST be aborted.
+	// Manifest reports a newer version with a CORRECT sha256 of the served
+	// binary, so the new checksum-integrity gate passes and the request still
+	// reaches (and is rejected by) the default verifier — the swap MUST be
+	// aborted at the signature stage. (sha256("fakebinary") below.)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/latest.json"):
-			_ = json.NewEncoder(w).Encode(VersionManifest{Version: "9.9.9"})
+			_ = json.NewEncoder(w).Encode(VersionManifest{Version: "9.9.9", SHA256: "035d560c0302d4caedadfc31e1b9d76dfad27622b64282576c34244a4fed6458"})
 		case strings.HasSuffix(r.URL.Path, ".sig"):
 			_, _ = w.Write([]byte("fakesig"))
 		default:
