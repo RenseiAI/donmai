@@ -126,10 +126,41 @@ func TestMapNotification_TurnCompleted_Interrupted(t *testing.T) {
 	}
 }
 
-func TestMapNotification_AssistantMessageDelta(t *testing.T) {
+// Partial-message deltas are dropped (mirroring the Claude provider's
+// stream_event drop) so each streamed token does not become its own
+// "thought" activity. The full text arrives on item/completed.
+func TestMapNotification_AssistantMessageDelta_Dropped(t *testing.T) {
 	t.Parallel()
 	state := &mapperState{}
 	got := mapNotification("item/agentMessage/delta", mustJSON(t, map[string]any{"delta": "hello"}), state, nil)
+	if len(got) != 0 {
+		t.Fatalf("expected delta to be dropped, got %d event(s): %+v", len(got), got)
+	}
+}
+
+func TestMapNotification_ReasoningDelta_Dropped(t *testing.T) {
+	t.Parallel()
+	state := &mapperState{}
+	for _, method := range []string{"item/reasoning/textDelta", "item/reasoning/summaryTextDelta"} {
+		got := mapNotification(method, mustJSON(t, map[string]any{"text": "thinking..."}), state, nil)
+		if len(got) != 0 {
+			t.Fatalf("%s: expected delta to be dropped, got %d event(s): %+v", method, len(got), got)
+		}
+	}
+}
+
+// The complete assistant message (item/completed) still emits a single
+// AssistantTextEvent carrying the full text.
+func TestMapNotification_AgentMessageCompleted_EmitsFullText(t *testing.T) {
+	t.Parallel()
+	params := mustJSON(t, map[string]any{
+		"item": map[string]any{
+			"id":   "msg-1",
+			"type": "agentMessage",
+			"text": "the full message",
+		},
+	})
+	got := mapNotification("item/completed", params, &mapperState{}, nil)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(got))
 	}
@@ -137,18 +168,8 @@ func TestMapNotification_AssistantMessageDelta(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected AssistantTextEvent, got %T", got[0])
 	}
-	if at.Text != "hello" {
-		t.Fatalf("expected hello, got %q", at.Text)
-	}
-}
-
-func TestMapNotification_ReasoningDelta(t *testing.T) {
-	t.Parallel()
-	state := &mapperState{}
-	got := mapNotification("item/reasoning/textDelta", mustJSON(t, map[string]any{"text": "thinking..."}), state, nil)
-	se := got[0].(agent.SystemEvent)
-	if se.Subtype != "reasoning" || se.Message != "thinking..." {
-		t.Fatalf("unexpected reasoning event: %+v", se)
+	if at.Text != "the full message" {
+		t.Fatalf("expected full text, got %q", at.Text)
 	}
 }
 
