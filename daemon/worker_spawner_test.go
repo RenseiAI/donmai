@@ -536,7 +536,7 @@ func TestSpawner_OnPreSpawn_ErrorAbortSpawn(t *testing.T) {
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 10"},
-		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+		OnPreSpawn: func(_ SessionSpec, _ []string) ([]string, error) {
 			return nil, spawnErr
 		},
 	})
@@ -615,7 +615,7 @@ func TestSpawner_OnPreSpawn_EnvMergeAndFailClosed(t *testing.T) {
 		sessionFail = "sess-merge-fail"
 	)
 	type call struct {
-		sessionID string
+		sessionID  string
 		shouldFail bool
 	}
 	calls := []call{

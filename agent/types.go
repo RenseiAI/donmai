@@ -22,17 +22,17 @@ type ProviderName string
 // providers per F.1.1 §1; declaring them now keeps the wire enum stable
 // across waves so platform-side dispatch routing does not regress.
 const (
-	ProviderClaude     ProviderName = "claude"
-	ProviderCodex      ProviderName = "codex"
-	ProviderStub       ProviderName = "stub" // test-only; deterministic
-	ProviderSpringAI   ProviderName = "spring-ai"
-	ProviderA2A        ProviderName = "a2a"
-	ProviderAmp        ProviderName = "amp"
-	ProviderGemini     ProviderName = "gemini"
-	ProviderGeminiCLI  ProviderName = "gemini-cli" // CLI-wrap; local/host-session only
-	ProviderOllama     ProviderName = "ollama"
-	ProviderOpenCode   ProviderName = "opencode"
-	ProviderJules      ProviderName = "jules"
+	ProviderClaude    ProviderName = "claude"
+	ProviderCodex     ProviderName = "codex"
+	ProviderStub      ProviderName = "stub" // test-only; deterministic
+	ProviderSpringAI  ProviderName = "spring-ai"
+	ProviderA2A       ProviderName = "a2a"
+	ProviderAmp       ProviderName = "amp"
+	ProviderGemini    ProviderName = "gemini"
+	ProviderGeminiCLI ProviderName = "gemini-cli" // CLI-wrap; local/host-session only
+	ProviderOllama    ProviderName = "ollama"
+	ProviderOpenCode  ProviderName = "opencode"
+	ProviderJules     ProviderName = "jules"
 )
 
 // Capability names a single optional behavior a provider may support.

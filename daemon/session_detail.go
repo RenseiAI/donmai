@@ -99,7 +99,7 @@ type SessionDetail struct {
 	// CredentialPoolID is the non-secret pool accounting sentinel for
 	// metered and shared auth modes: "metered_pool_<provider>" or
 	// "shared_pool_<provider>". Absent for byok/host-session/local.
-	// Forwarded from PollWorkItem.InjectedPoolId (safe at rest — not a
+	// Forwarded from PollWorkItem.InjectedPoolID (safe at rest — not a
 	// credential, just a billing tag). The runner should echo it in the
 	// session cost-event metadata at completion so the platform can
 	// attribute usage to the correct metered/shared pool.
