@@ -24,6 +24,11 @@ package runner
 // "Finished", "Rejected", "Backlog"). The runtime/result layer resolves
 // the name to a Linear stateId via the platform's issue-tracker proxy.
 
+import (
+	"fmt"
+	"strings"
+)
+
 // Known agent work-type names. Verbatim mirror of AgentWorkType from
 // agentfactory/packages/core/src/orchestrator/work-types.ts so any
 // new work type the platform adds shows up here as a missing entry on
@@ -279,7 +284,20 @@ func resolveTargetStatus(workType, sessionStatus, workResult string, hasMergeQue
 		case "failed":
 			target := workTypeFailStatus[workType]
 			if target == "" {
-				d.Reason = "no-mapping"
+				// Result-sensitive types with no fail-status mapping
+				// (development / inflight / coordination /
+				// inflight-coordination) previously returned "no-mapping"
+				// here and did NOTHING — the issue did not transition and
+				// no comment was posted, so a deliberate "I can't do this"
+				// (e.g. WORK_RESULT:failed on an ambiguous spec) was
+				// invisible in Linear. Post the agent's blocker/final
+				// message as a diagnostic comment instead of silently
+				// dropping it. We intentionally do NOT invent a target
+				// status to transition to — the blocked/"needs
+				// clarification" workflow state is team-specific and not
+				// known to the runner.
+				d.PostDiagnostic = true
+				d.Reason = "failed-no-status-mapping"
 				return d
 			}
 			d.TargetStatus = target
@@ -319,6 +337,38 @@ func resolveTargetStatus(workType, sessionStatus, workResult string, hasMergeQue
 	// session status only, not Linear state).
 	d.Reason = "non-sensitive-failed"
 	return d
+}
+
+// failedNoMappingCommentBody builds the comment posted to Linear when a
+// result-sensitive work type (development / inflight / coordination /
+// inflight-coordination) reports failure but has no configured
+// fail-status transition. The agent deliberately declined to produce
+// output (e.g. it judged the spec ambiguous and emitted
+// WORK_RESULT:failed). Rather than silently no-opping, surface the
+// agent's final message so the operator can act.
+//
+// finalMessage is the agent's terminal summary (Result.Summary); when
+// empty we fall back to a generic note. We do NOT transition the issue —
+// the appropriate "blocked"/"needs clarification" workflow state is
+// team-specific and not known to the runner.
+func failedNoMappingCommentBody(workType, finalMessage string) string {
+	var b strings.Builder
+	b.WriteString("WARNING: The agent reported a FAILED work result without producing changes.\n\n")
+	b.WriteString(fmt.Sprintf("**Work type:** `%s`\n\n", workType))
+	b.WriteString("**Issue status was NOT updated automatically** — this work type has no ")
+	b.WriteString("failure transition, so the issue stays in its current state for a human to triage.\n\n")
+	if msg := strings.TrimSpace(finalMessage); msg != "" {
+		b.WriteString("**Agent's final message:**\n\n")
+		b.WriteString("> ")
+		b.WriteString(strings.ReplaceAll(msg, "\n", "\n> "))
+		b.WriteString("\n\n")
+	} else {
+		b.WriteString("The agent emitted `WORK_RESULT:failed` but left no final message. ")
+		b.WriteString("Check the agent logs for the blocker.\n\n")
+	}
+	b.WriteString("Review the blocker above, then either clarify the issue and re-trigger ")
+	b.WriteString("the agent, or move the issue to the appropriate state manually.")
+	return b.String()
 }
 
 // diagnosticCommentBody builds the comment posted to Linear when a

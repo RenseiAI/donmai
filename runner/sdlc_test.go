@@ -205,19 +205,26 @@ func TestResolveTargetStatus_Passed(t *testing.T) {
 }
 
 // TestResolveTargetStatus_Failed asserts the failed branch transitions
-// QA + acceptance to Rejected and no-ops the others.
+// QA + acceptance to Rejected and, for result-sensitive types with no
+// fail-status mapping (development / inflight / coordination), posts a
+// diagnostic comment instead of silently no-opping.
 func TestResolveTargetStatus_Failed(t *testing.T) {
 	cases := []struct {
 		workType        string
 		wantTarget      string
 		wantShouldTrans bool
+		wantDiagnostic  bool
+		wantReason      string
 	}{
-		{WorkTypeQAStr, "Rejected", true},
-		{WorkTypeAcceptance, "Rejected", true},
-		// Development/inflight have no fail target — no transition.
-		{WorkTypeDevelopmentStr, "", false},
-		{WorkTypeInflight, "", false},
-		{WorkTypeCoordination, "", false},
+		{WorkTypeQAStr, "Rejected", true, false, "failed"},
+		{WorkTypeAcceptance, "Rejected", true, false, "failed"},
+		// Development/inflight/coordination have no fail target — they no
+		// longer silently no-op; they surface a diagnostic comment so the
+		// blocker is visible in Linear (the SUP-1840 codex regression).
+		{WorkTypeDevelopmentStr, "", false, true, "failed-no-status-mapping"},
+		{WorkTypeInflight, "", false, true, "failed-no-status-mapping"},
+		{WorkTypeCoordination, "", false, true, "failed-no-status-mapping"},
+		{WorkTypeInflightCoordination, "", false, true, "failed-no-status-mapping"},
 	}
 	for _, c := range cases {
 		d := resolveTargetStatus(c.workType, "completed", "failed", false)
@@ -229,6 +236,31 @@ func TestResolveTargetStatus_Failed(t *testing.T) {
 			t.Errorf("[%s/failed] TargetStatus = %q; want %q",
 				c.workType, d.TargetStatus, c.wantTarget)
 		}
+		if d.PostDiagnostic != c.wantDiagnostic {
+			t.Errorf("[%s/failed] PostDiagnostic = %v; want %v",
+				c.workType, d.PostDiagnostic, c.wantDiagnostic)
+		}
+		if d.Reason != c.wantReason {
+			t.Errorf("[%s/failed] Reason = %q; want %q",
+				c.workType, d.Reason, c.wantReason)
+		}
+	}
+}
+
+// TestResolveTargetStatus_AgentFailedNoMappingPostsDiagnostic confirms a
+// session-level failure (crash/timeout treated as a fail marker) on a
+// no-fail-status work type ALSO surfaces a diagnostic comment rather
+// than silently dropping the blocker.
+func TestResolveTargetStatus_AgentFailedNoMappingPostsDiagnostic(t *testing.T) {
+	d := resolveTargetStatus(WorkTypeDevelopmentStr, "failed", "", false)
+	if d.ShouldTransition {
+		t.Errorf("ShouldTransition = true; want false")
+	}
+	if !d.PostDiagnostic {
+		t.Errorf("PostDiagnostic = false; want true")
+	}
+	if d.Reason != "failed-no-status-mapping" {
+		t.Errorf("Reason = %q; want failed-no-status-mapping", d.Reason)
 	}
 }
 
@@ -385,5 +417,34 @@ func TestDiagnosticCommentBody(t *testing.T) {
 	}
 	if !strings.Contains(body, "Issue status was NOT updated") {
 		t.Errorf("body missing 'NOT updated' callout")
+	}
+}
+
+// TestFailedNoMappingCommentBody asserts the failed-no-mapping diagnostic
+// carries the agent's final message and the work type so an operator can
+// triage the blocker directly from Linear.
+func TestFailedNoMappingCommentBody(t *testing.T) {
+	body := failedNoMappingCommentBody(WorkTypeDevelopmentStr,
+		"Spec is ambiguous: the issue does not say which endpoint to modify.")
+	for _, want := range []string{
+		"FAILED work result",
+		"development",
+		"Issue status was NOT updated",
+		"Spec is ambiguous",
+		"Agent's final message",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\nfull:\n%s", want, body)
+		}
+	}
+
+	// Empty final message → generic fallback note, no "final message"
+	// header.
+	empty := failedNoMappingCommentBody(WorkTypeCoordination, "")
+	if strings.Contains(empty, "Agent's final message") {
+		t.Errorf("empty-message body should not include the final-message header; got:\n%s", empty)
+	}
+	if !strings.Contains(empty, "no final message") {
+		t.Errorf("empty-message body missing fallback note; got:\n%s", empty)
 	}
 }

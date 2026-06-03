@@ -148,6 +148,80 @@ func TestRunBackstop_FiltersBuildArtifacts(t *testing.T) {
 	}
 }
 
+// TestRunBackstop_CleanTreeShortCircuits is the regression test for the
+// SUP-1840 blocked-outcome bug: an agent that deliberately produced no
+// changes (clean worktree, no commits ahead of base) must NOT trigger a
+// futile push / `gh pr create` — that emitted the misleading "No commits
+// between main and agent/<sid>" error. The backstop must short-circuit
+// with an honest "agent produced no commits" diagnostic and Pushed=false.
+//
+// We point gh at a non-existent binary path to prove the short-circuit
+// happens BEFORE any gh invocation: if the code tried to push/PR the
+// test would still pass on diagnostics, so we assert specifically on the
+// honest diagnostic string and Pushed=false.
+func TestRunBackstop_CleanTreeShortCircuits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	repo := t.TempDir()
+	gitInit(t, repo)
+	// Feature branch off main, no new commits, clean working tree —
+	// exactly the "agent wrote no code" shape.
+	checkout(t, repo, "agent/blocked-sid")
+
+	r := minimalRunner(t)
+	res := &Result{}
+	res.WorktreePath = repo
+
+	report := r.runBackstop(context.Background(), QueuedWork{
+		QueuedWork: queuedWorkBase("REN-T-CLEAN"),
+	}, "agent/blocked-sid", res)
+
+	if report.Pushed {
+		t.Errorf("Pushed = true; want false (nothing to push)")
+	}
+	if report.PRCreated {
+		t.Errorf("PRCreated = true; want false")
+	}
+	if !strings.Contains(report.Diagnostics, "no commits") {
+		t.Errorf("Diagnostics = %q; want it to mention 'no commits'", report.Diagnostics)
+	}
+	if strings.Contains(report.Diagnostics, "No commits between") {
+		t.Errorf("Diagnostics leaked the misleading gh error: %q", report.Diagnostics)
+	}
+	// And no commit should have been fabricated on the branch.
+	logOut, _ := runGit(context.Background(), repo, "rev-list", "--count", "main..HEAD")
+	if strings.TrimSpace(logOut) != "0" {
+		t.Errorf("expected 0 commits ahead of main; got %q", logOut)
+	}
+}
+
+// TestBranchHasCommitsAhead exercises the helper directly: a fresh
+// feature branch has none, and one with a commit has some.
+func TestBranchHasCommitsAhead(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	repo := t.TempDir()
+	gitInit(t, repo)
+	checkout(t, repo, "feature/ahead-test")
+
+	if branchHasCommitsAhead(context.Background(), repo) {
+		t.Errorf("fresh feature branch: branchHasCommitsAhead = true; want false")
+	}
+
+	// Add a commit; now it's ahead.
+	writeFile(t, repo, "new.go", "package main\n")
+	for _, args := range [][]string{{"add", "new.go"}, {"commit", "-m", "work"}} {
+		if _, err := runGit(context.Background(), repo, args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+	if !branchHasCommitsAhead(context.Background(), repo) {
+		t.Errorf("branch with a commit: branchHasCommitsAhead = false; want true")
+	}
+}
+
 // TestRunBackstop_RefusesMain ensures the backstop refuses to push
 // from main/master.
 func TestRunBackstop_RefusesMain(t *testing.T) {

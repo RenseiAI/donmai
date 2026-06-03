@@ -16,18 +16,27 @@ import (
 //  1. The session ended with terminalSuccess but did not produce a PR
 //     URL (or did not produce a comment / issue update for non-code
 //     work types).
-//  2. The provider supports either message injection
-//     (Capabilities.SupportsMessageInjection — preferred, no
-//     subprocess overhead) or session resume
-//     (Capabilities.SupportsSessionResume — falls back to
-//     stop-and-resume).
+//  2. The provider supports message injection
+//     (Capabilities.SupportsMessageInjection).
 //
-// When neither precondition holds the runner skips steering and goes
+// NOTE: steering deliberately does NOT gate on
+// Capabilities.SupportsSessionResume. attemptSteering only ever calls
+// handle.Inject (see [Runner.injectDirective]); the documented
+// resume-based steering fallback ("stop the handle and resume with a
+// fresh Spec") is unimplemented. Greenlighting steering for a
+// resume-only provider — e.g. codex, whose Inject is a hard
+// agent.ErrUnsupported — logged "steering: injecting follow-up prompt"
+// then silently no-opped on every session, masking the real outcome.
+// Until resume-steering lands, message injection is the only capability
+// that makes steering productive.
+//
+// When the precondition doesn't hold the runner skips steering and goes
 // straight to the deterministic backstop. The decision is encoded
 // here so backstop.go and the loop don't have to re-derive it.
 func shouldSteer(obs streamObservation, caps agent.Capabilities) bool {
-	// Provider must support some form of post-completion steering.
-	if !caps.SupportsMessageInjection && !caps.SupportsSessionResume {
+	// Provider must support mid-session message injection — the only
+	// post-completion steering mechanism the runner implements today.
+	if !caps.SupportsMessageInjection {
 		return false
 	}
 	// If the session didn't finish successfully, steering can't help —
@@ -43,12 +52,13 @@ func shouldSteer(obs streamObservation, caps agent.Capabilities) bool {
 }
 
 // attemptSteering injects a per-provider templated steering prompt
-// asking the agent to commit, push, and open a PR. The injection
-// path is preferred (no subprocess overhead); when only Resume is
-// available the runner stops the current handle and resumes (today
-// the runner does not exercise that path — providers must implement
-// Resume separately, and v0.5.0 ships with all three providers
-// returning ErrUnsupported on Resume by design — see F.1.1 §3).
+// asking the agent to commit, push, and open a PR. The ONLY mechanism
+// is message injection via [agent.Handle.Inject]; shouldSteer gates on
+// Capabilities.SupportsMessageInjection so this path is never reached
+// for a provider that cannot accept an inject. The resume-based
+// steering fallback ("stop the handle and resume with a fresh Spec")
+// described in F.1.1 §3 is NOT implemented — a resume-only provider is
+// handled by the deterministic backstop instead, not by steering.
 //
 // Returns nil when the steering inject was accepted by the provider;
 // the caller is responsible for re-consuming events to capture any

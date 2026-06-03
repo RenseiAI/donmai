@@ -42,9 +42,22 @@ func TestShouldSteer_Table(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "should steer (resume only)",
+			// Resume-only providers (e.g. codex) must NOT steer: the
+			// runner only implements inject-based steering, and codex's
+			// Inject is a hard ErrUnsupported. Greenlighting here logged
+			// a misleading "injecting follow-up prompt" line and silently
+			// no-opped on every session.
+			name: "resume only — no inject, do not steer",
 			obs:  streamObservation{terminalSuccess: true},
 			caps: agent.Capabilities{SupportsSessionResume: true},
+			want: false,
+		},
+		{
+			// Injection + resume both present → still steer (injection
+			// is what makes it productive).
+			name: "injection and resume",
+			obs:  streamObservation{terminalSuccess: true},
+			caps: agent.Capabilities{SupportsMessageInjection: true, SupportsSessionResume: true},
 			want: true,
 		},
 	}

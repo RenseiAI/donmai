@@ -207,6 +207,20 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	}
 	hasUncommitted := strings.TrimSpace(statusOut) != ""
 
+	// 1b. Clean-result short-circuit. When the agent deliberately
+	// produced no work — the working tree is clean AND the work branch
+	// has no commits ahead of its base — there is nothing to push and
+	// `gh pr create` would fail with the misleading "No commits between
+	// main and agent/<sid>" diagnostic. Detect that here and record an
+	// honest report instead of attempting a futile push/PR. This is the
+	// common shape for an agent that judged the spec ambiguous and
+	// emitted WORK_RESULT:failed without writing code.
+	if !hasUncommitted && !branchHasCommitsAhead(ctx, worktreePath) {
+		report.Pushed = false
+		report.Diagnostics = "agent produced no commits; nothing to push (clean worktree, no commits ahead of base)"
+		return report
+	}
+
 	// 2. Stage everything.
 	if hasUncommitted {
 		if _, err := runGit(ctx, worktreePath, "add", "-A"); err != nil {
@@ -329,6 +343,41 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		report.PRCreated = true
 	}
 	return report
+}
+
+// branchHasCommitsAhead reports whether HEAD has any commits not
+// reachable from the repository's base branch — i.e. whether the agent
+// actually committed work on the per-session branch.
+//
+// The worktree is cloned at the remote default branch and the work
+// branch is created on top of it (loop.go), so the base is one of
+// origin/HEAD, origin/main, main, or master (tried in that order). We
+// count commits in `base..HEAD`; a positive count means there is
+// something to push.
+//
+// Best-effort: when no base ref resolves (e.g. a bare TempDir repo with
+// no main branch) we fall back to checking whether HEAD has more than
+// the initial commit relative to the root, returning false only when we
+// are confident the branch is empty of agent work. A resolution failure
+// returns true (assume there may be commits) so the short-circuit never
+// hides real work — the existing push/PR steps then run as before.
+func branchHasCommitsAhead(ctx context.Context, worktreePath string) bool {
+	for _, base := range []string{"origin/HEAD", "origin/main", "main", "master"} {
+		// Verify the ref exists before diffing against it.
+		if _, err := runGit(ctx, worktreePath, "rev-parse", "--verify", "--quiet", base); err != nil {
+			continue
+		}
+		out, err := runGit(ctx, worktreePath, "rev-list", "--count", base+"..HEAD")
+		if err != nil {
+			// Ref resolved but the count failed (e.g. unrelated
+			// histories) — don't claim the branch is empty.
+			return true
+		}
+		return strings.TrimSpace(out) != "0"
+	}
+	// No base ref resolved — we cannot prove the branch is empty, so
+	// assume there may be commits and let the normal path proceed.
+	return true
 }
 
 // runGit invokes the git binary in cwd with the supplied args and

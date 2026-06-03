@@ -232,6 +232,62 @@ func TestRunPostSession_UnknownPostsDiagnosticComment(t *testing.T) {
 	}
 }
 
+// TestRunPostSession_FailedDevelopmentPostsBlockerComment is the
+// regression test for the SUP-1840 codex blocked-outcome bug: a
+// development session that reported WORK_RESULT:failed (e.g. the agent
+// judged the spec ambiguous and wrote no code) used to no-op silently
+// (reason "no-mapping"). It must now post a diagnostic comment carrying
+// the agent's final message — NOT a status transition.
+func TestRunPostSession_FailedDevelopmentPostsBlockerComment(t *testing.T) {
+	srv, calls, mu := stubProxyServer(t)
+	r := makePostSessionRunner(t, srv)
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("REN-PS-FAILDEV"),
+		WorkerID:    "wkr-post",
+		AuthToken:   "tok-post",
+		PlatformURL: srv.URL,
+	}
+	qw.WorkType = WorkTypeDevelopmentStr
+	qw.IssueID = "issue-uuid-faildev"
+
+	res := &Result{}
+	res.Status = "completed"
+	res.WorkResult = "failed"
+	res.Summary = "Spec is ambiguous: unclear which API route to change."
+
+	r.runPostSession(context.Background(), qw, res)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 proxy call (a comment); got %d (%v)", len(*calls), *calls)
+	}
+	c := (*calls)[0]
+	if c.Method != "createComment" {
+		t.Errorf("Method = %q; want createComment (must NOT transition status)", c.Method)
+	}
+	if len(c.Args) != 2 || c.Args[0] != "issue-uuid-faildev" {
+		t.Errorf("Args = %v; want [issue-uuid-faildev <body>]", c.Args)
+	}
+	body, _ := c.Args[1].(string)
+	if !strings.Contains(body, "Spec is ambiguous") {
+		t.Errorf("comment body missing the agent's final message; got %q", body)
+	}
+	if res.LinearStatusTransition == nil {
+		t.Fatal("LinearStatusTransition not set")
+	}
+	if res.LinearStatusTransition.Reason != "failed-no-status-mapping" {
+		t.Errorf("Reason = %q; want failed-no-status-mapping", res.LinearStatusTransition.Reason)
+	}
+	if !res.LinearStatusTransition.DiagnosticPosted {
+		t.Errorf("DiagnosticPosted = false; want true")
+	}
+	if res.LinearStatusTransition.TargetStatus != "" {
+		t.Errorf("TargetStatus = %q; want empty (no fabricated status)", res.LinearStatusTransition.TargetStatus)
+	}
+}
+
 // TestRunPostSession_AcceptancePassedNoMQTransitions covers the
 // non-deferred acceptance path: with no merge-queue adapter, a passing
 // acceptance immediately transitions Delivered → Accepted.

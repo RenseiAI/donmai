@@ -114,9 +114,21 @@ func (r *Runner) runPostSession(parentCtx context.Context, qw QueuedWork, res *R
 		return
 	}
 
-	// --- Branch 2: diagnostic comment for unknown WORK_RESULT ---------
+	// --- Branch 2: diagnostic comment -------------------------------
+	// Two shapes feed this branch:
+	//   - reason "unknown": the agent exited without a parseable
+	//     WORK_RESULT marker (missing-marker diagnostic).
+	//   - reason "failed-no-status-mapping": a result-sensitive work type
+	//     (development / inflight / coordination) reported failure but has
+	//     no fail-status transition. Surface the agent's blocker/final
+	//     message so the operator sees WHY no code was produced instead of
+	//     a silent no-op.
 	if decision.PostDiagnostic {
-		err := r.poster.CreateIssueComment(ctx, qw.IssueID, diagnosticCommentBody())
+		body := diagnosticCommentBody()
+		if decision.Reason == "failed-no-status-mapping" {
+			body = failedNoMappingCommentBody(decision.WorkType, res.Summary)
+		}
+		err := r.poster.CreateIssueComment(ctx, qw.IssueID, body)
 		if err != nil {
 			warning := fmt.Sprintf(
 				"linear createComment (diagnostic) failed (workType=%s): %v",
