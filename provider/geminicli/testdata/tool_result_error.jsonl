@@ -1,1 +1,0 @@
-{"type":"tool_result","timestamp":"2026-06-03T14:37:20.000Z","tool_id":"call_def456","status":"error","output":"","error":{"type":"TOOL_EXECUTION_ERROR","message":"command not found: badcmd"}}
