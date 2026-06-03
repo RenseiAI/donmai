@@ -96,6 +96,15 @@ type SessionDetail struct {
 	// PlatformURL is the base URL of the platform.
 	PlatformURL string `json:"platformUrl,omitempty"`
 
+	// CredentialPoolID is the non-secret pool accounting sentinel for
+	// metered and shared auth modes: "metered_pool_<provider>" or
+	// "shared_pool_<provider>". Absent for byok/host-session/local.
+	// Forwarded from PollWorkItem.InjectedPoolId (safe at rest — not a
+	// credential, just a billing tag). The runner should echo it in the
+	// session cost-event metadata at completion so the platform can
+	// attribute usage to the correct metered/shared pool.
+	CredentialPoolID string `json:"credentialPoolId,omitempty"`
+
 	// ── Phase 2 stage-driven SDLC fields (REN-1485 / REN-1487) ───────
 	//
 	// Forwarded opaquely from PollWorkItem; the daemon does not parse
@@ -184,6 +193,15 @@ type SessionResolvedProfile struct {
 	Effort         string         `json:"effort,omitempty"`
 	CredentialID   string         `json:"credentialId,omitempty"`
 	ProviderConfig map[string]any `json:"providerConfig,omitempty"`
+
+	// AuthMode is the credential auth mode the platform resolved for this
+	// session: "byok" | "metered" | "shared" | "host-session" | "local".
+	// Used by the daemon's credential injection hook to decide whether a
+	// missing snapshot is a fail-closed condition (byok/metered/shared) or
+	// a safe fail-open (host-session/local). Absent on legacy dispatches
+	// that predate the Phase-1 snapshot enrichment; the hook treats absence
+	// as fail-open for backward compatibility.
+	AuthMode string `json:"authMode,omitempty"`
 }
 
 // SessionModelProfile mirrors runner.ResolvedModelProfile but lives in
