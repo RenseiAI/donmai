@@ -510,11 +510,11 @@ func TestProvider_Spawn_MaxTurnsCap(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cap := 2
+	maxTurns := 2
 	p := mustNew(t, srv.URL)
 	h, err := p.Spawn(context.Background(), agent.Spec{
 		Prompt:       "loop forever",
-		MaxTurns:     &cap,
+		MaxTurns:     &maxTurns,
 		AllowedTools: []string{"Bash"},
 	})
 	if err != nil {
@@ -542,15 +542,15 @@ func TestProvider_Spawn_MaxTurnsCap(t *testing.T) {
 		t.Fatal("Result.Cost: want non-nil (cost must be reported even on cap)")
 	}
 	// The driver must have executed exactly cap turns before stopping.
-	if res.Cost.NumTurns != cap {
-		t.Errorf("Cost.NumTurns: want %d (cap hit), got %d", cap, res.Cost.NumTurns)
+	if res.Cost.NumTurns != maxTurns {
+		t.Errorf("Cost.NumTurns: want %d (cap hit), got %d", maxTurns, res.Cost.NumTurns)
 	}
 
 	mu.Lock()
 	gotTurns := turnNum
 	mu.Unlock()
-	if gotTurns != cap {
-		t.Errorf("server received %d requests, want exactly %d (cap=%d)", gotTurns, cap, cap)
+	if gotTurns != maxTurns {
+		t.Errorf("server received %d requests, want exactly %d (cap=%d)", gotTurns, maxTurns, maxTurns)
 	}
 }
 
