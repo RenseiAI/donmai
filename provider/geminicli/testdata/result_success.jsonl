@@ -1,0 +1,1 @@
+{"type":"result","timestamp":"2026-06-03T14:37:22.000Z","status":"success","stats":{"total_tokens":1250,"input_tokens":1100,"output_tokens":150,"cached":800,"duration_ms":5432,"models":{"gemini-2.5-pro":{"total_tokens":1250,"input_tokens":1100,"output_tokens":150}}}}

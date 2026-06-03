@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -300,13 +301,13 @@ func TestSpawner_OnPreSpawn_Invoked(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
-		OnPreSpawn: func(spec SessionSpec, env []string) []string {
+		OnPreSpawn: func(spec SessionSpec, env []string) ([]string, error) {
 			atomic.AddInt32(&calls, 1)
 			recordMu.Lock()
 			gotSpec = spec
 			gotEnv = append([]string(nil), env...)
 			recordMu.Unlock()
-			return nil
+			return nil, nil
 		},
 	})
 	if _, err := s.AcceptWork(SessionSpec{
@@ -354,11 +355,11 @@ func TestSpawner_OnPreSpawn_SeesBaseEnv(t *testing.T) {
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		BaseEnv:               map[string]string{"BASE_KEY": "base-value"},
-		OnPreSpawn: func(_ SessionSpec, env []string) []string {
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
 			mu.Lock()
 			gotEnv = append([]string(nil), env...)
 			mu.Unlock()
-			return nil
+			return nil, nil
 		},
 	})
 	if _, err := s.AcceptWork(SessionSpec{
@@ -396,8 +397,8 @@ func TestSpawner_OnPreSpawn_ReturnedEnvIsExeced(t *testing.T) {
 		MaxConcurrentSessions: 1,
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'sentinel=%s\n' "$ONPRESPAWN_SENTINEL"; exit 0`},
 		StdoutPrefixWriter:    capability,
-		OnPreSpawn: func(_ SessionSpec, env []string) []string {
-			return append(env, "ONPRESPAWN_SENTINEL=hello-from-hook")
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			return append(env, "ONPRESPAWN_SENTINEL=hello-from-hook"), nil
 		},
 	})
 	if _, err := s.AcceptWork(SessionSpec{
@@ -432,8 +433,8 @@ func TestSpawner_OnPreSpawn_OverridesBaseEnv(t *testing.T) {
 		BaseEnv:               map[string]string{"OVERRIDE_ME": "base-value"},
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'override=%s\n' "$OVERRIDE_ME"; exit 0`},
 		StdoutPrefixWriter:    capability,
-		OnPreSpawn: func(_ SessionSpec, env []string) []string {
-			return append(env, "OVERRIDE_ME=hook-wins")
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			return append(env, "OVERRIDE_ME=hook-wins"), nil
 		},
 	})
 	if _, err := s.AcceptWork(SessionSpec{
@@ -457,7 +458,7 @@ func TestSpawner_OnPreSpawn_OverridesBaseEnv(t *testing.T) {
 }
 
 // TestSpawner_OnPreSpawn_NilReturnUsesInput verifies that a hook returning
-// nil is a no-op — the env composeEnv produced is what reaches the child.
+// (nil, nil) is a no-op — the env composeEnv produced is what reaches the child.
 func TestSpawner_OnPreSpawn_NilReturnUsesInput(t *testing.T) {
 	capability := &captureWriter{}
 	s := NewWorkerSpawner(SpawnerOptions{
@@ -466,8 +467,8 @@ func TestSpawner_OnPreSpawn_NilReturnUsesInput(t *testing.T) {
 		BaseEnv:               map[string]string{"BASE_KEY": "base-value"},
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'base=%s\n' "$BASE_KEY"; exit 0`},
 		StdoutPrefixWriter:    capability,
-		OnPreSpawn: func(_ SessionSpec, _ []string) []string {
-			return nil
+		OnPreSpawn: func(_ SessionSpec, _ []string) ([]string, error) {
+			return nil, nil
 		},
 	})
 	if _, err := s.AcceptWork(SessionSpec{
@@ -520,6 +521,151 @@ func TestSpawner_OnPreSpawn_NilHookNoPanic(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("nil hook should preserve BaseEnv; got lines %v", lines)
+	}
+}
+
+// TestSpawner_OnPreSpawn_ErrorAbortSpawn verifies the fail-closed path: when
+// the hook returns a non-nil error, AcceptWork must fail with that error and
+// the child process must never be started (no lifecycle events, active count
+// stays at zero). This is the credential-injection gate-failure path for
+// byok/metered/shared sessions where the platform snapshot returns 403.
+func TestSpawner_OnPreSpawn_ErrorAbortSpawn(t *testing.T) {
+	var started int32
+	spawnErr := errors.New("credential gate failed: METERED_NOT_ENTITLED")
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 10"},
+		OnPreSpawn: func(_ SessionSpec, _ []string) ([]string, error) {
+			return nil, spawnErr
+		},
+	})
+	s.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventStarted {
+			atomic.AddInt32(&started, 1)
+		}
+	})
+
+	_, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-gate-fail",
+		Repository: "github.com/a/b",
+	})
+	if err == nil {
+		t.Fatal("AcceptWork: expected error from failing OnPreSpawn hook, got nil")
+	}
+	if !strings.Contains(err.Error(), "METERED_NOT_ENTITLED") {
+		t.Errorf("AcceptWork error: want to contain 'METERED_NOT_ENTITLED', got %q", err.Error())
+	}
+	// Allow a brief window for any async spawn that should NOT have happened.
+	time.Sleep(50 * time.Millisecond)
+	if n := atomic.LoadInt32(&started); n != 0 {
+		t.Errorf("started count: want 0 (no child process), got %d", n)
+	}
+	if n := s.ActiveCount(); n != 0 {
+		t.Errorf("active count: want 0 after fail-closed spawn, got %d", n)
+	}
+}
+
+// TestSpawner_OnPreSpawn_ErrorDoesNotConsumeCapacity verifies that a hook
+// error releases the session slot: after a fail-closed abort, a subsequent
+// AcceptWork on a max-1 spawner must succeed.
+func TestSpawner_OnPreSpawn_ErrorDoesNotConsumeCapacity(t *testing.T) {
+	firstCall := true
+	capability := &captureWriter{}
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'ok\n'; exit 0`},
+		StdoutPrefixWriter:    capability,
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			if firstCall {
+				firstCall = false
+				return nil, errors.New("transient gate failure")
+			}
+			return env, nil
+		},
+	})
+
+	// First spawn must fail-closed.
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-fail",
+		Repository: "github.com/a/b",
+	}); err == nil {
+		t.Fatal("first AcceptWork: expected error, got nil")
+	}
+
+	// Second spawn on the same spawner (same max-1 capacity) must succeed
+	// because the first never consumed a slot.
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-ok",
+		Repository: "github.com/a/b",
+	}); err != nil {
+		t.Fatalf("second AcceptWork after fail-closed: %v", err)
+	}
+	waitForLine(t, capability, "ok", 2*time.Second)
+}
+
+// TestSpawner_OnPreSpawn_EnvMergeAndFailClosed exercises the composite path:
+// a hook that merges credential env entries on success and fails-closed on
+// a gate error. Asserts (a) merged env reaches the child on success and
+// (b) AcceptWork errors without spawning on gate failure.
+func TestSpawner_OnPreSpawn_EnvMergeAndFailClosed(t *testing.T) {
+	const (
+		sessionOK   = "sess-merge-ok"
+		sessionFail = "sess-merge-fail"
+	)
+	type call struct {
+		sessionID  string
+		shouldFail bool
+	}
+	calls := []call{
+		{sessionID: sessionOK, shouldFail: false},
+		{sessionID: sessionFail, shouldFail: true},
+	}
+	capability := &captureWriter{}
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'apikey=%s\n' "$ANTHROPIC_API_KEY"; exit 0`},
+		StdoutPrefixWriter:    capability,
+		OnPreSpawn: func(spec SessionSpec, env []string) ([]string, error) {
+			// Fail-closed for the designated failure session.
+			if spec.SessionID == sessionFail {
+				return nil, errors.New("credential gate failed: SHARED_QUOTA_EXCEEDED")
+			}
+			// Merge the model key for the success session.
+			return append(env, "ANTHROPIC_API_KEY=sk-ant-mock"), nil
+		},
+	})
+
+	for _, c := range calls {
+		_, err := s.AcceptWork(SessionSpec{
+			SessionID:  c.sessionID,
+			Repository: "github.com/a/b",
+		})
+		if c.shouldFail {
+			if err == nil {
+				t.Errorf("%s: expected fail-closed error, got nil", c.sessionID)
+			} else if !strings.Contains(err.Error(), "SHARED_QUOTA_EXCEEDED") {
+				t.Errorf("%s: expected gate error, got %v", c.sessionID, err)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("%s: expected success, got %v", c.sessionID, err)
+			}
+		}
+	}
+	// Assert the model key reached the child for the success session.
+	lines := waitForLine(t, capability, "apikey=", 2*time.Second)
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, "apikey=sk-ant-mock") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("ANTHROPIC_API_KEY not merged into child env; got lines %v", lines)
 	}
 }
 
