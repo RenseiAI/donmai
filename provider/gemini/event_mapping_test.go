@@ -110,6 +110,38 @@ func TestMapResponse_MalformedJSON_Error(t *testing.T) {
 	}
 }
 
+// TestMapResponse_CostAccumulatesAcrossTurns verifies the running totals
+// fold across multiple turns (function-call round-trip then final).
+func TestMapResponse_CostAccumulatesAcrossTurns(t *testing.T) {
+	t.Parallel()
+	state := &turnState{model: "gemini-3.5-flash"}
+
+	turn1 := mapResponse([]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"id":"c1","name":"Read"}}]}}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20}}`), state)
+	if turn1.outcome != outcomeContinue {
+		t.Fatalf("turn1 outcome: want outcomeContinue, got %v", turn1.outcome)
+	}
+
+	turn2 := mapResponse([]byte(`{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":150,"candidatesTokenCount":30}}`), state)
+	res, ok := turn2.result.(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("turn2 result: want ResultEvent, got %T", turn2.result)
+	}
+	if res.Cost.InputTokens != 250 {
+		t.Errorf("Cost.InputTokens: want 250 (100+150), got %d", res.Cost.InputTokens)
+	}
+	if res.Cost.OutputTokens != 50 {
+		t.Errorf("Cost.OutputTokens: want 50 (20+30), got %d", res.Cost.OutputTokens)
+	}
+	if res.Cost.NumTurns != 2 {
+		t.Errorf("Cost.NumTurns: want 2, got %d", res.Cost.NumTurns)
+	}
+	// 250 in @ 1.50/M + 50 out @ 9.00/M = 0.000375 + 0.00045 = 0.000825.
+	want := (250.0/1_000_000)*1.50 + (50.0/1_000_000)*9.00
+	if diff := res.Cost.TotalCostUsd - want; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("Cost.TotalCostUsd: want %g, got %g", want, res.Cost.TotalCostUsd)
+	}
+}
+
 // TestMapResponse_MaxTokens_IsNonSuccess verifies that a MAX_TOKENS
 // finish reason is classified as a truncation (Success=false), NOT a
 // success. A truncated response misleads the runner's acceptance gate if
@@ -141,37 +173,5 @@ func TestMapResponse_MaxTokens_IsNonSuccess(t *testing.T) {
 	}
 	if _, ok := turn.events[0].(agent.AssistantTextEvent); !ok {
 		t.Fatalf("events[0]: want AssistantTextEvent, got %T", turn.events[0])
-	}
-}
-
-// TestMapResponse_CostAccumulatesAcrossTurns verifies the running totals
-// fold across multiple turns (function-call round-trip then final).
-func TestMapResponse_CostAccumulatesAcrossTurns(t *testing.T) {
-	t.Parallel()
-	state := &turnState{model: "gemini-3.5-flash"}
-
-	turn1 := mapResponse([]byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"id":"c1","name":"Read"}}]}}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20}}`), state)
-	if turn1.outcome != outcomeContinue {
-		t.Fatalf("turn1 outcome: want outcomeContinue, got %v", turn1.outcome)
-	}
-
-	turn2 := mapResponse([]byte(`{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":150,"candidatesTokenCount":30}}`), state)
-	res, ok := turn2.result.(agent.ResultEvent)
-	if !ok {
-		t.Fatalf("turn2 result: want ResultEvent, got %T", turn2.result)
-	}
-	if res.Cost.InputTokens != 250 {
-		t.Errorf("Cost.InputTokens: want 250 (100+150), got %d", res.Cost.InputTokens)
-	}
-	if res.Cost.OutputTokens != 50 {
-		t.Errorf("Cost.OutputTokens: want 50 (20+30), got %d", res.Cost.OutputTokens)
-	}
-	if res.Cost.NumTurns != 2 {
-		t.Errorf("Cost.NumTurns: want 2, got %d", res.Cost.NumTurns)
-	}
-	// 250 in @ 1.50/M + 50 out @ 9.00/M = 0.000375 + 0.00045 = 0.000825.
-	want := (250.0/1_000_000)*1.50 + (50.0/1_000_000)*9.00
-	if diff := res.Cost.TotalCostUsd - want; diff > 1e-12 || diff < -1e-12 {
-		t.Errorf("Cost.TotalCostUsd: want %g, got %g", want, res.Cost.TotalCostUsd)
 	}
 }
