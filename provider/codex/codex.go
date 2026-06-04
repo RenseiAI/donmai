@@ -200,6 +200,14 @@ func (p *Provider) Capabilities() agent.Capabilities {
 		AcceptsAllowedToolsList: false,
 		AcceptsMcpServerSpec:    true,
 		HumanLabel:              "Codex",
+		// Codex re-includes baseInstructions (thread/start) in the model
+		// system prompt on every internal turn; turn/start input is sent
+		// once and then lives in cached conversation history. Declaring
+		// SupportsTurnInputContext lets the runner route large, volatile
+		// context (recalled agent memory) through Spec.InitialContext so
+		// it rides the first turn's input instead of inflating the
+		// re-sent baseInstructions prefix.
+		SupportsTurnInputContext: true,
 	}
 }
 

@@ -59,4 +59,21 @@ const (
 	// "no partial toolchain"). The session aborts; the agent never starts.
 	// The failing command + exit code surface via Result.Error.
 	FailureKitProvision = "kit-provision"
+
+	// FailureAgentBlocked indicates the agent terminated normally but
+	// DELIBERATELY declined to do the work — it judged the spec ambiguous,
+	// the preconditions unmet, or the task outside its remit, and said so
+	// instead of producing code. This is distinct from a crash
+	// (FailureProviderError), a silent exit (FailureSilentExit), or a
+	// budget/timeout cut-off: the agent made a reasoned decision to stop.
+	//
+	// The signal is structural — the agent emits an explicit decline
+	// marker ("WORK_RESULT:blocked" or "AGENT_BLOCKED: <reason>") which
+	// the runner scans for. A blocked result MUST NOT trigger the empty-
+	// branch backstop or steering (there is nothing to recover), and the
+	// platform side should surface it as a needs-clarification outcome
+	// rather than re-dispatching the identical context — re-dispatch only
+	// re-runs the agent into the same wall while re-billing the full
+	// context-assembly prefix.
+	FailureAgentBlocked = "agent-blocked"
 )

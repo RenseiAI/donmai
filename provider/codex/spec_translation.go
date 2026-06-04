@@ -3,6 +3,7 @@ package codex
 import (
 	"encoding/json"
 	"log/slog"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/mcp"
@@ -141,18 +142,30 @@ func turnStartParams(threadID string, spec agent.Spec, input []map[string]any) m
 	return params
 }
 
-// promptInput translates Spec.Prompt + optional SystemPromptAppend into
-// the codex turn/start input array.
+// promptInput translates Spec.Prompt (+ optional Spec.InitialContext)
+// into the codex turn/start input array.
 //
 // Codex models a turn input as an array of typed parts. v0.5.0 only
 // emits text parts; image / attachment support belongs to F.5.
+//
+// Spec.InitialContext (e.g. recalled agent memory) is prepended as its
+// own text part so it is delivered ONCE with the first turn and then
+// lives in cached conversation history — it is deliberately kept OUT of
+// thread/start.baseInstructions, which codex re-includes in the model
+// system prompt on EVERY turn. Folding large/volatile context into
+// baseInstructions produces O(turns × prefix) token amplification on
+// long sessions; routing it here avoids that while preserving multi-turn
+// coherence (the model still has the context for the whole session).
+//
+// SystemPromptAppend is intentionally NOT emitted on the per-turn input
+// — it carries the session-constant agent identity, which legitimately
+// belongs in baseInstructions on thread/start (see NewSpawnPlan).
 func promptInput(spec agent.Spec) []map[string]any {
-	parts := []map[string]any{
-		{"type": "text", "text": spec.Prompt},
+	parts := make([]map[string]any, 0, 2)
+	if ctxText := strings.TrimSpace(spec.InitialContext); ctxText != "" {
+		parts = append(parts, map[string]any{"type": "text", "text": ctxText})
 	}
-	// SystemPromptAppend is intentionally NOT emitted on the per-turn
-	// input — the legacy TS folds it into baseInstructions on
-	// thread/start. We do the same in NewSpawnPlan.
+	parts = append(parts, map[string]any{"type": "text", "text": spec.Prompt})
 	return parts
 }
 
@@ -253,6 +266,19 @@ func NewSpawnPlan(spec agent.Spec) SpawnPlan {
 	// Carry SystemPromptAppend through baseInstructions so
 	// per-template additions (e.g. CLAUDE.md content) survive without
 	// a separate codex parameter — codex has only baseInstructions.
+	//
+	// De-amplification note: routing Spec.InitialContext (recalled
+	// agent memory) to the per-turn input (see promptInput) removes ONLY
+	// the memory block from the per-turn system-prompt prefix. The rest
+	// of baseInstructions — base identity, kit/skill appends, and any
+	// cloned-repo CLAUDE.md surfaced via SystemPromptAppend — is still
+	// folded here and re-included by codex on every internal model turn.
+	// That residual prefix is intentionally session-constant (it must be
+	// present on every turn for the agent to keep its identity/rules), so
+	// it is not a missed amplification target: the O(turns × prefix) cost
+	// is reduced by the MemoryBlock size, not eliminated. A future pass
+	// that wants to shrink the constant prefix should target the identity
+	// / append payloads, not move them off thread/start.
 	if spec.SystemPromptAppend != "" {
 		if existing, ok := threadStart["baseInstructions"].(string); ok && existing != "" {
 			threadStart["baseInstructions"] = existing + "\n\n" + spec.SystemPromptAppend

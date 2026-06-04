@@ -181,7 +181,9 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 			t.Errorf("user prompt missing stage body: %q", user)
 		}
 		// system_base.tmpl sentinel text must NOT appear when overridden.
-		if strings.Contains(system, "autonomous Rensei agent") {
+		// Brand-agnostic substring (the brand token varies by binary via the
+		// statehome seam — "Donmai"/"Rensei"); the trailing clause is fixed.
+		if strings.Contains(system, "agent operating without an interactive user") {
 			t.Errorf("system_base.tmpl content leaked into overridden system prompt: %q", system)
 		}
 	})

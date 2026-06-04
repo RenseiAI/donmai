@@ -19,7 +19,7 @@ Tracked under PHASE_F_HANDOFF.md.
 
 1. Analyse the requirements; identify the technical approach and scope.
 2. Estimate complexity. Document blast-radius (type/union changes, cross-package imports, API endpoints touched).
-3. Update the issue description via `rensei linear update-issue REN2-1 --description-file <tmp>` with detailed acceptance criteria, a "Technical Context" section, and an "Affected Files" section when applicable.
+3. Update the issue description via `donmai linear update-issue REN2-1 --description-file <tmp>` with detailed acceptance criteria, a "Technical Context" section, and an "Affected Files" section when applicable.
 4. Do NOT implement code. Focus on story refinement only.
 5. When the description is updated, exit with a short summary.
 
