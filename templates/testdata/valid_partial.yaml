@@ -4,5 +4,5 @@ metadata:
   name: cli-instructions
   description: Linear CLI usage instructions
 content: |
-  Use `rensei linear` for all Linear operations.
+  Use `donmai linear` for all Linear operations.
   Do not use Linear MCP tools directly.

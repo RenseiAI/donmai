@@ -390,6 +390,165 @@ func TestObserveEvent_ScansWorkResultMarker(t *testing.T) {
 	}
 }
 
+// TestScanBlocked_DetectsDeclineMarkers verifies the structural
+// blocked-agent signal: scanBlocked recognises both the
+// "WORK_RESULT:blocked" verdict form and the "AGENT_BLOCKED: <reason>"
+// reason form (on a line of their own, as agents are instructed to emit
+// them), captures the reason, and does NOT false-positive on ordinary
+// text, a passing verdict, or a mid-sentence quote of the marker.
+func TestScanBlocked_DetectsDeclineMarkers(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		text       string
+		wantOK     bool
+		wantReason string
+	}{
+		{"work-result-blocked", "WORK_RESULT:blocked", true, ""},
+		{"work-result-blocked-final-line", "Here is my summary.\nWORK_RESULT:blocked", true, ""},
+		{"work-result-blocked-indented", "  WORK_RESULT:blocked", true, ""},
+		{"work-result-blocked-comment", "<!-- WORK_RESULT:blocked -->", true, ""},
+		{"agent-blocked-reason", "AGENT_BLOCKED: spec is ambiguous, no acceptance criteria", true, "spec is ambiguous, no acceptance criteria"},
+		{"agent-blocked-reason-final-line", "Some narrative.\nAGENT_BLOCKED: spec ambiguous", true, "spec ambiguous"},
+		{"agent-blocked-reason-trailing-newline", "AGENT_BLOCKED: missing repo access\nmore output", true, "missing repo access"},
+		{"agent-blocked-reason-comment", "<!-- AGENT_BLOCKED: missing repo access -->", true, "missing repo access"},
+		{"passed-not-blocked", "WORK_RESULT:passed", false, ""},
+		{"failed-not-blocked", "WORK_RESULT:failed", false, ""},
+		{"no-marker", "I am working on the task now", false, ""},
+		// False-positive guards: the markers must NOT fire when merely
+		// quoted/discussed mid-sentence in a narrative turn. These two
+		// strings come from the adversarial probe and previously matched.
+		{"agent-blocked-quoted-midsentence", "I would print AGENT_BLOCKED: <reason> if I could not proceed, but I can.", false, ""},
+		{"work-result-blocked-quoted-midsentence", "I'd emit WORK_RESULT: blocked. It isn't, so here is the code.", false, ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reason, ok := scanBlocked(tc.text)
+			if ok != tc.wantOK {
+				t.Fatalf("scanBlocked(%q) ok = %v; want %v", tc.text, ok, tc.wantOK)
+			}
+			if reason != tc.wantReason {
+				t.Errorf("scanBlocked(%q) reason = %q; want %q", tc.text, reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestScanBlocked_DoesNotShadowWorkResult guards the regex split: a
+// "WORK_RESULT:blocked" line is a blocked signal but must NOT be parsed as
+// a passed/failed/unknown QA verdict by scanWorkResult (which drives the
+// Linear status transition). Keeping them separate prevents a deliberate
+// decline from accidentally transitioning the issue.
+func TestScanBlocked_DoesNotShadowWorkResult(t *testing.T) {
+	t.Parallel()
+	if got := scanWorkResult("WORK_RESULT:blocked"); got != "" {
+		t.Errorf("scanWorkResult(blocked) = %q; want \"\" (blocked is not a QA verdict)", got)
+	}
+	if _, ok := scanBlocked("WORK_RESULT:blocked"); !ok {
+		t.Error("scanBlocked(blocked) = false; want true")
+	}
+}
+
+// TestClassifyBlocked_ForksOutcome exercises the classification fork: a
+// blocked observation with no PR becomes FailureAgentBlocked; a blocked
+// observation that nonetheless produced a PR is NOT blocked (the work
+// landed); a non-blocked observation is untouched.
+func TestClassifyBlocked_ForksOutcome(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		obs         streamObservation
+		startPR     string
+		wantBlocked bool
+		wantMode    string
+		wantErrSub  string
+	}{
+		{
+			name:        "blocked-no-pr-with-reason",
+			obs:         streamObservation{blocked: true, blockedReason: "spec ambiguous"},
+			wantBlocked: true,
+			wantMode:    FailureAgentBlocked,
+			wantErrSub:  "spec ambiguous",
+		},
+		{
+			name:        "blocked-no-pr-no-reason",
+			obs:         streamObservation{blocked: true},
+			wantBlocked: true,
+			wantMode:    FailureAgentBlocked,
+			wantErrSub:  "blocked",
+		},
+		{
+			name:        "blocked-but-pr-produced-not-blocked",
+			obs:         streamObservation{blocked: true, blockedReason: "x"},
+			startPR:     "https://github.com/o/r/pull/1",
+			wantBlocked: false,
+			wantMode:    "",
+		},
+		{
+			name:        "not-blocked-untouched",
+			obs:         streamObservation{blocked: false},
+			wantBlocked: false,
+			wantMode:    "",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			res := &Result{}
+			res.PullRequestURL = tt.startPR
+			got := classifyBlocked(res, tt.obs)
+			if got != tt.wantBlocked {
+				t.Fatalf("classifyBlocked = %v; want %v", got, tt.wantBlocked)
+			}
+			if res.FailureMode != tt.wantMode {
+				t.Errorf("FailureMode = %q; want %q", res.FailureMode, tt.wantMode)
+			}
+			if tt.wantBlocked {
+				if res.Status != "failed" {
+					t.Errorf("Status = %q; want failed", res.Status)
+				}
+				if tt.wantErrSub != "" && !strings.Contains(res.Error, tt.wantErrSub) {
+					t.Errorf("Error = %q; want substring %q", res.Error, tt.wantErrSub)
+				}
+			}
+		})
+	}
+}
+
+// TestObserveEvent_SetsBlockedFlag confirms the AssistantTextEvent branch
+// of observeEvent records the blocked flag + reason on the observation so
+// the post-stream classifier can fork to FailureAgentBlocked.
+func TestObserveEvent_SetsBlockedFlag(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	h.runner.observeEvent(
+		agent.AssistantTextEvent{Text: "AGENT_BLOCKED: no acceptance criteria on the issue"},
+		obs, t.TempDir(), QueuedWork{},
+	)
+	if !obs.blocked {
+		t.Fatal("observeEvent did not set obs.blocked")
+	}
+	if obs.blockedReason != "no acceptance criteria on the issue" {
+		t.Errorf("obs.blockedReason = %q; want captured reason", obs.blockedReason)
+	}
+}
+
+// TestShouldBackstop_SkipsBlocked verifies a blocked outcome never
+// triggers the empty-branch backstop — a deliberate decline has no work
+// to commit and an auto-PR would misrepresent the refusal.
+func TestShouldBackstop_SkipsBlocked(t *testing.T) {
+	t.Parallel()
+	res := &Result{}
+	res.FailureMode = FailureAgentBlocked
+	if shouldBackstop(res) {
+		t.Error("shouldBackstop(FailureAgentBlocked) = true; want false")
+	}
+}
+
 // TestDefaultMCPServers_EmitsHTTPEntryPerSession pins the A2A per-session
 // MCP wire-up: when QueuedWork has PlatformURL + AuthToken + SessionID,
 // defaultMCPServers emits a single HTTP entry pointing at the platform's
@@ -407,8 +566,11 @@ func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
 		t.Fatalf("len(servers)=%d, want 1", len(servers))
 	}
 	got := servers[0]
-	if got.Name != "rensei-platform" {
-		t.Errorf("name=%q, want rensei-platform", got.Name)
+	// Name is brand-derived (statehome.Brand()+"-platform"): OSS default brand
+	// "donmai" -> "donmai-platform"; the closed rensei binary (brand "rensei")
+	// renders "rensei-platform". This parallel test uses the default brand.
+	if got.Name != "donmai-platform" {
+		t.Errorf("name=%q, want donmai-platform", got.Name)
 	}
 	if got.Type != "http" {
 		t.Errorf("type=%q, want http", got.Type)

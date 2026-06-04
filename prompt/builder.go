@@ -198,7 +198,10 @@ func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user
 	if override := strings.TrimSpace(qw.SystemPromptOverride); override != "" {
 		systemBuf = override
 	} else {
+		brand := ResolveBrand()
 		sysCTX := map[string]interface{}{
+			"brandDisplay":   brand.BrandDisplay,
+			"brandCLI":       brand.BrandCLI,
 			"sessionID":      strings.TrimSpace(qw.SessionID),
 			"organizationID": strings.TrimSpace(qw.OrganizationID),
 			"projectName":    strings.TrimSpace(qw.ProjectName),
@@ -222,7 +225,10 @@ func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user
 	}
 
 	userTmplName := userTemplateNameRaymond(WorkType(qw.WorkType))
+	userBrand := ResolveBrand()
 	userCTX := map[string]interface{}{
+		"brandDisplay":    userBrand.BrandDisplay,
+		"brandCLI":        userBrand.BrandCLI,
 		"issueIdentifier": strings.TrimSpace(qw.IssueIdentifier),
 		"repository":      strings.TrimSpace(qw.Repository),
 		"ref":             strings.TrimSpace(qw.Ref),
@@ -314,6 +320,11 @@ func (b *Builder) set() (*template.Template, error) {
 // callers shape the Builder via [QueuedWork], [Builder.SystemAppend],
 // and [Builder.SkillAppend].
 type systemTmplData struct {
+	// Brand is embedded so system_base.tmpl can interpolate
+	// {{.BrandDisplay}} / {{.BrandCLI}} — the active binary's brand,
+	// resolved from the statehome seam (OSS "donmai", platform "rensei").
+	Brand
+
 	SessionID      string
 	OrganizationID string
 	ProjectName    string
@@ -345,6 +356,7 @@ func appendMemoryBlock(systemBuf, memoryBlock string) string {
 
 func systemTemplateData(qw QueuedWork, appendBlock, skillAppend string) systemTmplData {
 	return systemTmplData{
+		Brand:          ResolveBrand(),
 		SessionID:      strings.TrimSpace(qw.SessionID),
 		OrganizationID: strings.TrimSpace(qw.OrganizationID),
 		ProjectName:    strings.TrimSpace(qw.ProjectName),
@@ -357,6 +369,10 @@ func systemTemplateData(qw QueuedWork, appendBlock, skillAppend string) systemTm
 
 // userTmplData carries the variable set every user_*.tmpl references.
 type userTmplData struct {
+	// Brand is embedded so the user_*.tmpl files can interpolate
+	// {{.BrandCLI}} in their `<cli> linear …` command examples.
+	Brand
+
 	IssueIdentifier string
 	Repository      string
 	Ref             string
@@ -367,6 +383,7 @@ type userTmplData struct {
 
 func userTemplateData(qw QueuedWork) userTmplData {
 	return userTmplData{
+		Brand:           ResolveBrand(),
 		IssueIdentifier: strings.TrimSpace(qw.IssueIdentifier),
 		Repository:      strings.TrimSpace(qw.Repository),
 		Ref:             strings.TrimSpace(qw.Ref),

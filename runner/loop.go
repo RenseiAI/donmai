@@ -18,6 +18,7 @@ import (
 	"github.com/RenseiAI/donmai/runtime/activity"
 	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -268,7 +269,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 			qw.SystemPromptOverride, interview.InterviewCompleteSentinel)
 	}
 
-	systemPrompt, userPrompt, err := r.promptBuilder.Build(qw.QueuedWork)
+	// Token-amplification guard: when the provider can deliver session
+	// context via the first turn's input (codex re-sends baseInstructions
+	// on every model turn), keep the large/volatile agent-memory block
+	// OUT of the system-prompt prefix. We render the prompt with an empty
+	// MemoryBlock so the builder does not fold it into the system prompt,
+	// then thread the memory through Spec.InitialContext instead — it is
+	// delivered once and then lives in cached conversation history. For
+	// providers without that split the memory stays folded into the system
+	// prompt exactly as before (additive — no behaviour change).
+	buildQW := qw.QueuedWork
+	var initialContext string
+	if caps.SupportsTurnInputContext && strings.TrimSpace(buildQW.MemoryBlock) != "" {
+		initialContext = buildQW.MemoryBlock
+		buildQW.MemoryBlock = ""
+	}
+
+	systemPrompt, userPrompt, err := r.promptBuilder.Build(buildQW)
 	if err != nil {
 		res.Status = "failed"
 		res.FailureMode = FailurePromptRender
@@ -282,6 +299,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		Cwd:                wpath,
 		Prompt:             userPrompt,
 		SystemPromptAppend: systemPrompt,
+		InitialContext:     initialContext,
 		MCPServers:         mcpServers,
 		Env:                composedEnv,
 		Autonomous:         true,
@@ -594,6 +612,22 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// Apply event-stream observations onto the result envelope.
 	streamRes.applyTo(res, provider.Name())
 
+	// 10a. Structural blocked-agent classification. When the agent
+	// announced a deliberate decline (scanBlocked picked up a
+	// "WORK_RESULT:blocked" / "AGENT_BLOCKED: …" marker) and did not also
+	// produce a PR, fork to FailureAgentBlocked. This is a reasoned
+	// refusal, not a crash — so we suppress steering + backstop below
+	// (there is nothing to recover) and surface a distinct outcome the
+	// platform can route to a needs-clarification path instead of
+	// re-dispatching the identical context. A PR-producing session is
+	// never treated as blocked even if the text mentions a blocker.
+	if classifyBlocked(res, streamRes) {
+		r.logger.Info("agent blocked: deliberate decline detected",
+			"sessionId", qw.SessionID,
+			"reason", streamRes.blockedReason,
+		)
+	}
+
 	// 10b. Wave 3 runtime memory-inject drain (v2). At the post-terminal
 	// seam — the turn has drained to a ResultEvent — deliver any memory
 	// blocks the heartbeat transport buffered during the turn, then
@@ -601,13 +635,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// provider capability; a no-op when nothing was buffered. Runs BEFORE
 	// steering so a memory-driven follow-up turn can itself produce the PR
 	// that makes steering unnecessary.
-	if runtimeInjectEnabled {
+	if runtimeInjectEnabled && !streamRes.blocked {
 		injRes := r.drainMemoryInjects(ctx, handle, wpath, qw, res, enforcer, sink, injectCh)
 		injRes.applyTo(res, provider.Name())
 	}
 
-	// 11. Tail recovery.
-	if !r.skipSteering && shouldSteer(streamRes, caps) {
+	// 11. Tail recovery. Skipped entirely when the agent deliberately
+	// declined (FailureAgentBlocked): there is nothing to steer toward and
+	// no work to backstop into an empty branch.
+	if !r.skipSteering && !streamRes.blocked && shouldSteer(streamRes, caps) {
 		res.SteeringTriggered = true
 		if err := r.attemptSteering(ctx, handle, qw, streamRes); err != nil {
 			r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
@@ -759,6 +795,16 @@ type streamObservation struct {
 	workResult      string
 	cost            *agent.CostData
 	providerID      string
+	// blocked is set when the agent emitted an explicit decline marker
+	// ("WORK_RESULT:blocked" or "AGENT_BLOCKED: …") — a deliberate,
+	// reasoned refusal to proceed (ambiguous spec, unmet preconditions)
+	// rather than a crash or silent exit. The runner reads it in the
+	// post-stream classification to fork to FailureAgentBlocked and to
+	// suppress steering/backstop (nothing to recover).
+	blocked bool
+	// blockedReason is the human-readable reason captured from an
+	// "AGENT_BLOCKED: <reason>" marker, surfaced on Result.Error.
+	blockedReason string
 	// budgetBreach is set when the in-flight enforcer tripped a cap
 	// during ObserveEvent. The runner reads this in the post-stream
 	// classification path to fork to FailureBudgetExceeded instead of
@@ -897,6 +943,17 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 	case agent.AssistantTextEvent:
 		if marker := scanWorkResult(e.Text); marker != "" {
 			obs.workResult = marker
+		}
+		// Structural blocked-agent signal: a deliberate decline the agent
+		// announced via "WORK_RESULT:blocked" or "AGENT_BLOCKED: <reason>".
+		// Captured here so the post-stream classifier can fork to
+		// FailureAgentBlocked instead of funneling a reasoned refusal as a
+		// crash/silent-exit (which would trigger backstop + re-dispatch).
+		if reason, ok := scanBlocked(e.Text); ok {
+			obs.blocked = true
+			if reason != "" && obs.blockedReason == "" {
+				obs.blockedReason = reason
+			}
 		}
 		if u := scanPRURL(e.Text); u != "" {
 			obs.pullRequestURL = u
@@ -1100,7 +1157,11 @@ func defaultMCPServers(qw QueuedWork) []agent.MCPServerConfig {
 	}
 	url := strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID
 	return []agent.MCPServerConfig{{
-		Name: "rensei-platform",
+		// Brand-derived so OSS renders "donmai-platform" while the closed
+		// rensei binary (statehome brand "rensei") renders "rensei-platform"
+		// byte-identically. The platform reports its own serverInfo.name
+		// independently; this is the client-side label only.
+		Name: statehome.Brand() + "-platform",
 		Type: "http",
 		URL:  url,
 		Headers: map[string]string{
@@ -1128,9 +1189,78 @@ func scanPRURL(text string) string {
 	return prURLRE.FindString(text)
 }
 
+// classifyBlocked stamps FailureAgentBlocked onto res when the agent
+// deliberately declined (obs.blocked) and produced no PR. Returns true
+// when it classified the result as blocked so the caller can log + skip
+// steering/backstop. Pure aside from mutating res — no I/O — so the
+// classification fork is unit-testable in isolation.
+//
+// A PR-producing session is never treated as blocked even if the agent's
+// narrative mentioned a blocker; the work landed.
+func classifyBlocked(res *Result, obs streamObservation) bool {
+	if !obs.blocked || res.PullRequestURL != "" {
+		return false
+	}
+	res.Status = "failed"
+	res.FailureMode = FailureAgentBlocked
+	if res.Error == "" {
+		if obs.blockedReason != "" {
+			res.Error = "agent declined to proceed: " + obs.blockedReason
+		} else {
+			res.Error = "agent declined to proceed (blocked)"
+		}
+	}
+	return true
+}
+
+// scanBlocked detects a deliberate agent decline in assistant text and
+// returns (reason, true) when found. Two marker forms are recognised,
+// both provider-generic (the agent prints them as plain text):
+//
+//   - "WORK_RESULT:blocked"          — the verdict-marker form, no reason.
+//   - "AGENT_BLOCKED: <reason text>" — captures the reason up to EOL.
+//
+// A blocked signal is a reasoned refusal (ambiguous spec, unmet
+// preconditions), NOT a crash. The runner forks to FailureAgentBlocked so
+// the deliberate decline is not funneled as a failure that triggers the
+// empty-branch backstop or a re-dispatch into the same wall.
+//
+// Both markers MUST appear at the start of a line (modulo leading
+// whitespace and an optional opening HTML-comment fence) to count. This
+// mirrors the verdict convention agents are instructed to emit on their
+// final line and prevents a false positive when a narrative turn merely
+// quotes or discusses the marker mid-sentence (e.g. "I'd emit
+// AGENT_BLOCKED if I were stuck, but I'm not"). Without the anchor a
+// successful NO-PR-by-design session (research, qa, acceptance, …) whose
+// prose mentioned the marker would be reclassified as a decline.
+func scanBlocked(text string) (string, bool) {
+	if m := agentBlockedRE.FindStringSubmatch(text); m != nil {
+		reason := strings.TrimSpace(m[1])
+		// Drop a trailing HTML-comment fence so a marker emitted as
+		// "<!-- AGENT_BLOCKED: reason -->" yields just the reason.
+		reason = strings.TrimSpace(strings.TrimSuffix(reason, "-->"))
+		return reason, true
+	}
+	if workResultBlockedRE.MatchString(text) {
+		return "", true
+	}
+	return "", false
+}
+
 var (
 	workResultRE = regexp.MustCompile(`(?i)WORK_RESULT[:\s]+(passed|failed|unknown)`)
 	prURLRE      = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+`)
+	// workResultBlockedRE matches the verdict-marker decline form. Kept
+	// separate from workResultRE so the existing passed/failed/unknown
+	// transition mapping is untouched (blocked is an outcome, not a QA
+	// verdict the Linear status mapper should consume). Anchored to
+	// line-start (with an optional HTML-comment fence) so it fires only on
+	// a deliberate verdict line, not on a quote of the marker in prose.
+	workResultBlockedRE = regexp.MustCompile(`(?im)^\s*(?:<!--\s*)?WORK_RESULT[:\s]+blocked`)
+	// agentBlockedRE captures the reason from "AGENT_BLOCKED: <reason>"
+	// up to the end of the line. Anchored the same way as
+	// workResultBlockedRE to avoid mid-sentence false positives.
+	agentBlockedRE = regexp.MustCompile(`(?im)^\s*(?:<!--\s*)?AGENT_BLOCKED[:\s]+([^\r\n]+)`)
 )
 
 // _ silences unused-import warnings for json when the package only

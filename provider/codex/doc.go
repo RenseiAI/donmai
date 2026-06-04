@@ -35,6 +35,14 @@
 //   - EmitsSubagentEvents      : false (Codex has no Anthropic Task tool)
 //   - SupportsReasoningEffort  : true (turn/start.reasoningEffort)
 //   - ToolPermissionFormat     : "codex"
+//   - SupportsTurnInputContext : true. Codex re-includes
+//     thread/start.baseInstructions in the model system prompt on every
+//     turn, while turn/start.input is sent once and then cached in
+//     conversation history. The runner therefore routes large, volatile
+//     context (recalled agent memory) through Spec.InitialContext so it
+//     rides the first turn's input instead of inflating the re-sent
+//     baseInstructions prefix — avoiding O(turns × prefix) input-token
+//     amplification on long sessions.
 //
 // # Approval bridge
 //

@@ -18,10 +18,11 @@ Validate the implementation referenced by {{or .IssueIdentifier "<unidentified i
 2. Inspect the implementing branch (or open PR) for {{or .IssueIdentifier "the issue"}}.
 3. Run the project's test, typecheck, and lint commands. Capture any failures.
 4. Decide pass or fail strictly against the acceptance criteria.
-5. Post a comment on {{or .IssueIdentifier "the issue"}} via `rensei linear create-comment` summarising what you checked and the verdict.
+5. Post a comment on {{or .IssueIdentifier "the issue"}} via `{{.BrandCLI}} linear create-comment` summarising what you checked and the verdict.
 6. End your final assistant message with exactly one marker:
 
    - `WORK_RESULT:passed` when every acceptance criterion is met and tests are green.
    - `WORK_RESULT:failed` when any criterion is missed or tests regress.
+   - `WORK_RESULT:blocked` when you cannot validate at all because the work is not actionable as specified — no acceptance criteria to check against, no implementing branch/PR to inspect, or a contradictory spec. Prefer this over `WORK_RESULT:failed` when there is nothing to validate without more input; put the reason on the same line as `AGENT_BLOCKED: <reason>`. The orchestrator routes a blocked verdict for clarification instead of retrying.
 
 Do not implement code yourself. Do not delete the worktree.

@@ -67,6 +67,14 @@ const (
 	// session-local MCP bridge). Tracks the v2 contract's
 	// `acceptsMcpServerSpec` flag.
 	CapAcceptsMcpServerSpec Capability = "accepts_mcp_server_spec"
+	// CapTurnInputContext reports whether the provider can deliver
+	// session context (Spec.InitialContext) once via the first turn's
+	// user input rather than folding it into the persistent system
+	// prompt. Providers with a turn-input/system-prompt split (codex's
+	// thread/start baseInstructions vs. turn/start input) declare true so
+	// the runner can keep large, volatile context (e.g. recalled agent
+	// memory) out of the re-sent system-prompt prefix.
+	CapTurnInputContext Capability = "turn_input_context"
 )
 
 // Capabilities is the typed capability matrix every provider declares.
@@ -154,6 +162,18 @@ type Capabilities struct {
 	// (e.g. "Claude", "Codex"). Used in TUI/dashboard surfaces and
 	// log messages where the raw name is not user-friendly.
 	HumanLabel string `json:"humanLabel,omitempty"`
+
+	// SupportsTurnInputContext reports whether the provider can deliver
+	// Spec.InitialContext once via the first turn's user input rather
+	// than folding it into the persistent system prompt. Providers whose
+	// wire protocol re-includes the system prompt on every model turn
+	// (codex's baseInstructions) declare true so the runner can keep
+	// large, volatile context (recalled agent memory, session history)
+	// out of the per-turn re-sent prefix. Providers that have no such
+	// split (or that already fold everything into one prompt) leave this
+	// false; the runner then folds InitialContext into the system prompt
+	// as before.
+	SupportsTurnInputContext bool `json:"supportsTurnInputContext,omitempty"`
 }
 
 // IsSupported reports whether a Capabilities matrix has the named
@@ -184,6 +204,8 @@ func IsSupported(caps Capabilities, c Capability) bool {
 		return caps.AcceptsAllowedToolsList
 	case CapAcceptsMcpServerSpec:
 		return caps.AcceptsMcpServerSpec
+	case CapTurnInputContext:
+		return caps.SupportsTurnInputContext
 	default:
 		return false
 	}
@@ -354,6 +376,22 @@ type Spec struct {
 	// standard instruction sections (sourced from
 	// RepositoryConfig.systemPrompt).
 	SystemPromptAppend string `json:"systemPromptAppend,omitempty"`
+
+	// InitialContext is session context delivered ONCE with the first
+	// turn's user input rather than via the persistent system prompt.
+	// Use it for large, volatile, reference-style context (e.g. recalled
+	// agent memory) that the model needs available but that must NOT be
+	// re-sent on every model turn.
+	//
+	// Honored only by providers that declare
+	// Capabilities.SupportsTurnInputContext — i.e. those whose wire
+	// protocol re-includes the system prompt on every turn (codex's
+	// baseInstructions). For providers without that split the runner
+	// folds the same content into the system prompt instead, so callers
+	// never have to branch on provider identity. Keeping this content out
+	// of the system-prompt prefix avoids O(turns × prefix) token
+	// amplification on long codex sessions.
+	InitialContext string `json:"initialContext,omitempty"`
 
 	// PermissionConfig is the structured permission policy for
 	// providers that consume one (Codex approval bridge).
