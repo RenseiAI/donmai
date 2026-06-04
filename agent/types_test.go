@@ -245,6 +245,8 @@ func TestIsSupported(t *testing.T) {
 		{"tool-perm-claude-explicit", CapToolPermissionFormatClaude, caps, true},
 		{"tool-perm-claude-empty-default", CapToolPermissionFormatClaude, Capabilities{}, true},
 		{"tool-perm-claude-codex", CapToolPermissionFormatClaude, Capabilities{ToolPermissionFormat: "codex"}, false},
+		{"turn-input-context-true", CapTurnInputContext, Capabilities{SupportsTurnInputContext: true}, true},
+		{"turn-input-context-false", CapTurnInputContext, Capabilities{}, false},
 		{"unknown-capability", Capability("nonexistent"), caps, false},
 	}
 	for _, tt := range tests {

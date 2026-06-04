@@ -205,8 +205,10 @@ func TestBuilderBuild_RaymondShim(t *testing.T) {
 		}
 	}
 
-	// Both paths must contain the development prompt contract markers.
-	for _, s := range []string{"WORK_RESULT:passed", "WORK_RESULT:failed", "gh pr create"} {
+	// Both paths must contain the development prompt contract markers,
+	// including the blocked-decline marker the runner's scanBlocked
+	// detector keys off (the detector and the instruction ship together).
+	for _, s := range []string{"WORK_RESULT:passed", "WORK_RESULT:failed", "WORK_RESULT:blocked", "gh pr create"} {
 		if !strings.Contains(legacyUser, s) {
 			t.Errorf("legacy user missing %q", s)
 		}

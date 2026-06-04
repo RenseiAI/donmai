@@ -40,6 +40,7 @@ func TestSpecFieldCoverage(t *testing.T) {
 		"Effort",
 		"BaseInstructions",
 		"SystemPromptAppend",
+		"InitialContext",
 	}
 
 	// All fields ignoredSpecFields can return — independent of
@@ -95,6 +96,60 @@ func TestNewSpawnPlan_Defaults(t *testing.T) {
 	in, _ := plan.TurnStart["input"].([]map[string]any)
 	if len(in) != 1 || in[0]["text"] != "do work" {
 		t.Fatalf("unexpected turn input: %v", plan.TurnStart["input"])
+	}
+}
+
+// TestNewSpawnPlan_InitialContextRidesTurnInput is the token-amplification
+// guard: Spec.InitialContext (e.g. recalled agent memory) must be
+// delivered ONCE via the first turn's input array and must NOT appear in
+// thread/start.baseInstructions — which codex re-includes in the model
+// system prompt on every turn. Folding it into baseInstructions would
+// produce O(turns × prefix) input-token blowup on long sessions.
+func TestNewSpawnPlan_InitialContextRidesTurnInput(t *testing.T) {
+	t.Parallel()
+	spec := agent.Spec{
+		Cwd:                "/tmp",
+		Prompt:             "do work",
+		InitialContext:     "MEMORY: prior decisions about X",
+		SystemPromptAppend: "AGENT IDENTITY",
+	}
+	plan := NewSpawnPlan(spec)
+
+	// baseInstructions carries ONLY the session-constant identity, never
+	// the volatile InitialContext.
+	base, _ := plan.ThreadStart["baseInstructions"].(string)
+	if !strings.Contains(base, "AGENT IDENTITY") {
+		t.Fatalf("baseInstructions should carry identity, got %q", base)
+	}
+	if strings.Contains(base, "MEMORY: prior decisions about X") {
+		t.Fatalf("baseInstructions must NOT carry InitialContext (per-turn re-send), got %q", base)
+	}
+
+	// turn/start input carries InitialContext as the FIRST part, then the
+	// prompt — delivered once, then cached in conversation history.
+	in, ok := plan.TurnStart["input"].([]map[string]any)
+	if !ok || len(in) != 2 {
+		t.Fatalf("expected 2 turn input parts (context + prompt), got %v", plan.TurnStart["input"])
+	}
+	if in[0]["text"] != "MEMORY: prior decisions about X" {
+		t.Fatalf("expected first input part = InitialContext, got %v", in[0]["text"])
+	}
+	if in[1]["text"] != "do work" {
+		t.Fatalf("expected second input part = prompt, got %v", in[1]["text"])
+	}
+}
+
+// TestNewSpawnPlan_NoInitialContextEmitsPromptOnly verifies the additive
+// guarantee: when InitialContext is empty the turn input is exactly the
+// prompt, byte-for-byte the pre-change shape (no empty leading part).
+func TestNewSpawnPlan_NoInitialContextEmitsPromptOnly(t *testing.T) {
+	t.Parallel()
+	for _, ctxVal := range []string{"", "   \n\t "} {
+		plan := NewSpawnPlan(agent.Spec{Cwd: "/tmp", Prompt: "do work", InitialContext: ctxVal})
+		in, _ := plan.TurnStart["input"].([]map[string]any)
+		if len(in) != 1 || in[0]["text"] != "do work" {
+			t.Fatalf("InitialContext=%q: expected single prompt part, got %v", ctxVal, plan.TurnStart["input"])
+		}
 	}
 }
 

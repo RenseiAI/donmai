@@ -92,6 +92,39 @@ func TestTranslateSpec_EmptyPlatformDisallowedTools_IsNoop(t *testing.T) {
 	}
 }
 
+// TestTranslateSpec_InitialContext_GatedByCapability verifies that
+// Spec.InitialContext only flows through when the resolved provider
+// declares Capabilities.SupportsTurnInputContext. Providers without that
+// split receive the same context folded into the system prompt by the
+// loop, so the field must be zeroed here to avoid duplication.
+func TestTranslateSpec_InitialContext_GatedByCapability(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		supports  bool
+		wantValue string
+	}{
+		{name: "supported-flows-through", supports: true, wantValue: "MEMORY BLOCK"},
+		{name: "unsupported-zeroed", supports: false, wantValue: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			caps := agent.Capabilities{SupportsTurnInputContext: tt.supports}
+			in := SpecInputs{
+				Cwd:            "/tmp/wt",
+				Prompt:         "do",
+				InitialContext: "MEMORY BLOCK",
+			}
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{}}
+			spec := translateSpec(qw, caps, in)
+			if spec.InitialContext != tt.wantValue {
+				t.Fatalf("InitialContext: want %q, got %q", tt.wantValue, spec.InitialContext)
+			}
+		})
+	}
+}
+
 // TestTranslateSpec_ToolUse_Honored verifies that AllowedTools and
 // MCPServers flow through to the produced agent.Spec when the resolved
 // provider declares the matching v2 tool-use accept flags.
