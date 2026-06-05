@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,18 +13,18 @@ import (
 )
 
 // fakeArchBin writes a shell script that echoes JSON describing the invocation,
-// installs it as AGENTFACTORY_ARCH_BIN, and returns the path.
+// installs it as DONMAI_ARCH_BIN, and returns the path.
 func fakeArchBin(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	script := filepath.Join(dir, "af-arch")
+	script := filepath.Join(dir, "donmai-arch")
 	content := `#!/bin/sh
 printf '{"command":"%s","argv":"%s","gated":false}' "$1" "$*"
 `
 	if err := os.WriteFile(script, []byte(content), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
-		t.Fatalf("write fake af-arch: %v", err)
+		t.Fatalf("write fake donmai-arch: %v", err)
 	}
-	t.Setenv("AGENTFACTORY_ARCH_BIN", script)
+	t.Setenv("DONMAI_ARCH_BIN", script)
 	return script
 }
 
@@ -168,27 +167,61 @@ func TestArchAssess_AllFlags(t *testing.T) {
 	}
 }
 
-// ── Unavailable binary ────────────────────────────────────────────────────────
+// ── Native fallback (no binary) ───────────────────────────────────────────────
 
-func TestArchCmd_UnavailableBinary(t *testing.T) {
-	t.Setenv("AGENTFACTORY_ARCH_BIN", "")
+// TestArchAssess_NativeFallback verifies that `donmai arch assess` works even
+// without DONMAI_ARCH_BIN or donmai-arch on PATH, using the native diff/gate path.
+func TestArchAssess_NativeFallback(t *testing.T) {
+	t.Setenv("DONMAI_ARCH_BIN", "")
 	origPath := os.Getenv("PATH")
-	t.Setenv("PATH", t.TempDir())
+	t.Setenv("PATH", t.TempDir()) // empty PATH — no donmai-arch found
 	defer func() { _ = os.Setenv("PATH", origPath) }()
-
-	if _, err := exec.LookPath("pnpm"); err == nil {
-		t.Skip("pnpm found in PATH; cannot test unavailable binary path")
-	}
 
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
 	root.AddCommand(newArchCmd(Config{}))
-	root.SetArgs([]string{"arch", "assess", "https://github.com/org/repo/pull/1"})
+
+	oldOut := os.Stdout
+	oldErr := os.Stderr
+	r, w, _ := os.Pipe()
+	rErr, wErr, _ := os.Pipe()
+	os.Stdout = w
+	os.Stderr = wErr
+
+	root.SetArgs([]string{"arch", "assess", "https://github.com/org/repo/pull/5"})
 	err := root.Execute()
-	if err == nil {
-		t.Fatal("expected error when af-arch binary is not available")
+
+	_ = w.Close()
+	_ = wErr.Close()
+	os.Stdout = oldOut
+	os.Stderr = oldErr
+
+	var outBuf, errBuf bytes.Buffer
+	_, _ = outBuf.ReadFrom(r)
+	_, _ = errBuf.ReadFrom(rErr)
+
+	if err != nil {
+		t.Fatalf("native fallback should not error; got %v\nstdout: %s\nstderr: %s",
+			err, outBuf.String(), errBuf.String())
 	}
-	if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "af-arch") {
-		t.Errorf("expected 'not found' or 'af-arch' in error, got: %v", err)
+
+	var m map[string]any
+	if jsonErr := json.Unmarshal(outBuf.Bytes(), &m); jsonErr != nil {
+		t.Fatalf("native fallback output not JSON: %v (raw: %q)", jsonErr, outBuf.String())
+	}
+
+	// Must have mode = "native-diff-only"
+	if mode, _ := m["mode"].(string); mode != "native-diff-only" {
+		t.Errorf("expected mode 'native-diff-only', got %q", mode)
+	}
+
+	// Must have "gated" field (bool).
+	if _, ok := m["gated"]; !ok {
+		t.Error("native fallback output missing 'gated' field")
+	}
+
+	// stderr must contain the "notice:" informational message.
+	if !strings.Contains(errBuf.String(), "notice:") {
+		t.Errorf("expected notice in stderr; got: %q", errBuf.String())
 	}
 }
 
