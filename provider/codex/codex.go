@@ -156,8 +156,8 @@ func New(opts Options) (*Provider, error) {
 	defer cancel()
 	if _, err := p.client.Request(hctx, "initialize", map[string]any{
 		"clientInfo": map[string]any{
-			"name":    "agentfactory",
-			"title":   "AgentFactory Orchestrator",
+			"name":    "donmai",
+			"title":   "Donmai Orchestrator",
 			"version": "0.5.0",
 		},
 		"capabilities": map[string]any{
