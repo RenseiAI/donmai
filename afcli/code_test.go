@@ -289,26 +289,47 @@ func TestCodeValidateCrossDeps_WithPath(t *testing.T) {
 
 // ── Unavailable binary ────────────────────────────────────────────────────────
 
-func TestCodeCmd_UnavailableBinary(t *testing.T) {
-	// Clear any binary resolution env and shadow PATH.
+// TestCodeCmd_NativeNoExecRequired verifies that get-repo-map and
+// search-symbols succeed without any external binary because they use the
+// native Go implementation. Only exec-shim commands (search-code, etc.)
+// require the donmai-code binary.
+func TestCodeCmd_NativeNoExecRequired(t *testing.T) {
+	// Clear any binary resolution env and shadow PATH so donmai-code / pnpm
+	// cannot be found.
 	t.Setenv("AGENTFACTORY_CODE_BIN", "")
+	t.Setenv("DONMAI_CODE_BIN", "")
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", t.TempDir()) // dir with no binaries
 	defer func() { _ = os.Setenv("PATH", origPath) }()
 
-	// Verify pnpm really can't be found (skip if it unexpectedly can).
+	// get-repo-map must succeed without a binary (native implementation).
+	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
+	root.AddCommand(newCodeCmd(Config{}))
+	root.SetArgs([]string{"code", "get-repo-map"})
+	if err := root.Execute(); err != nil {
+		t.Errorf("get-repo-map should not error without exec binary: %v", err)
+	}
+}
+
+// TestCodeCmd_ExecShimFallbackRequired verifies that search-code (not yet
+// natively ported) returns ErrNotAvailable when DONMAI_CODE_BIN is unset and
+// no donmai-code binary is on PATH.
+func TestCodeCmd_ExecShimFallbackRequired(t *testing.T) {
+	t.Setenv("AGENTFACTORY_CODE_BIN", "")
+	t.Setenv("DONMAI_CODE_BIN", "")
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", t.TempDir())
+	defer func() { _ = os.Setenv("PATH", origPath) }()
+
 	if _, err := exec.LookPath("pnpm"); err == nil {
 		t.Skip("pnpm found in PATH; cannot test unavailable binary path")
 	}
 
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
 	root.AddCommand(newCodeCmd(Config{}))
-	root.SetArgs([]string{"code", "get-repo-map"})
+	root.SetArgs([]string{"code", "search-code", "something"})
 	err := root.Execute()
 	if err == nil {
-		t.Fatal("expected error when af-code binary is not available")
-	}
-	if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "af-code") {
-		t.Errorf("expected 'not found' or 'af-code' in error, got: %v", err)
+		t.Fatal("search-code should error when exec binary is not available")
 	}
 }

@@ -20,19 +20,22 @@ func newCodeCmd(cfg Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "code",
 		Short: "Code intelligence — repo maps, symbol search, BM25, dedup, type usages, cross-dep validation",
-		Long: `Code intelligence commands powered by @donmai/code-intelligence.
+		Long: `Code intelligence commands for navigating and searching code.
 
-All commands output JSON to stdout. The first invocation builds the index
-(~5-10s); subsequent calls reuse the persisted index from .donmai/code-index/.
+get-repo-map and search-symbols use the native Go implementation — no external
+binary required. The first invocation builds the index (~5-10s for a large repo);
+subsequent calls reuse the persisted index from .donmai/code-index/.
 
-Optional env vars for enhanced search:
+search-code, check-duplicate, find-type-usages, and validate-cross-deps require
+the donmai-code binary (npm install -g @donmai/cli) or the DONMAI_CODE_BIN env
+var override.
+
+Override: set DONMAI_CODE_BIN to force the exec-shim path for ALL subcommands
+(useful for testing against the TypeScript reference implementation).
+
+Optional env vars for enhanced search (exec-shim path only):
   VOYAGE_AI_API_KEY   Enables semantic vector embeddings (hybrid BM25+vector mode)
-  COHERE_API_KEY      Enables cross-encoder reranking for more precise result ordering
-
-Binary resolution (in order):
-  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override
-  2. donmai-code on PATH (npm install -g @donmai/cli)
-  3. pnpm donmai-code (monorepo dev)`,
+  COHERE_API_KEY      Enables cross-encoder reranking for more precise result ordering`,
 		SilenceUsage: true,
 	}
 
@@ -74,11 +77,6 @@ Examples:
   ` + bin + ` code get-repo-map --file-patterns "*.go,src/**"`,
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			r := codeintel.New(cwd())
-			if !r.IsCodeAvailable() {
-				return fmt.Errorf("%w", codeintel.ErrNotAvailable)
-			}
-
 			opts := codeintel.GetRepoMapOptions{MaxFiles: maxFiles}
 			if filePatterns != "" {
 				for _, p := range strings.Split(filePatterns, ",") {
@@ -87,8 +85,7 @@ Examples:
 					}
 				}
 			}
-
-			out, err := r.GetRepoMap(opts)
+			out, err := codeintel.New(cwd()).GetRepoMap(opts)
 			if err != nil {
 				return fmt.Errorf("get-repo-map: %w", err)
 			}
@@ -122,11 +119,6 @@ Examples:
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {
-			r := codeintel.New(cwd())
-			if !r.IsCodeAvailable() {
-				return fmt.Errorf("%w", codeintel.ErrNotAvailable)
-			}
-
 			opts := codeintel.SearchSymbolsOptions{
 				Query:       args[0],
 				MaxResults:  maxResults,
@@ -139,8 +131,7 @@ Examples:
 					}
 				}
 			}
-
-			out, err := r.SearchSymbols(opts)
+			out, err := codeintel.New(cwd()).SearchSymbols(opts)
 			if err != nil {
 				return fmt.Errorf("search-symbols: %w", err)
 			}
