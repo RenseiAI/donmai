@@ -26,10 +26,9 @@ package afcli
 // without conditional logic and matches the explicit-env-overrides-default
 // posture every other afcli command uses.
 //
-// check-deployment is implemented as an exec-shim for v1.0.0: the Go command
-// delegates to the `donmai-linear` JS binary on PATH when available. A full Go
-// port (requiring Vercel + GitHub API clients) is deferred to v1.0.x. The
-// shim is explicitly marked deprecated in its help text.
+// check-deployment is implemented natively in Go (GO-3): it uses the gh CLI
+// to query the GitHub Commit Status API, filters Vercel contexts, and outputs
+// JSON or Markdown. No external JS binary is required.
 
 import (
 	"context"
