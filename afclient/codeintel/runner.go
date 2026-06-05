@@ -1,20 +1,22 @@
 // Package codeintel provides code intelligence for the donmai CLI.
 //
-// # Native implementation (S0 + S1)
+// # Native implementation (S0–S3)
 //
-// get-repo-map and search-symbols are now implemented natively in Go via
-// pure-regex extractors (TypeScriptExtractor, GoExtractor) and a JSON-serialised
-// index persisted to .donmai/code-index/index.json.
+// All six code-intel subcommands are now implemented natively in Go:
+//   - get-repo-map (S0/S1): TypeScript/JS + Go + Python + Rust regex extractors
+//   - search-symbols (S1): BM25-style symbol name search
+//   - search-code (S2): Okapi BM25 full-text search over symbol corpus
+//   - check-duplicate (S3): xxHash64 exact + SimHash near-dup detection
+//   - find-type-usages (S3): regex scan for type reference sites
+//   - validate-cross-deps (S3): cross-package import validator
 //
-// The native path is the PRIMARY implementation for those two subcommands.
+// The native path is the PRIMARY implementation for all subcommands.
 // The exec-shim (DONMAI_CODE_BIN env override) is kept as a FALLBACK for
-// operators who need to force the TypeScript implementation — e.g., to test
-// against a known-good TS-generated index.
+// operators who need to force the TypeScript implementation.
 //
 // # Exec-shim fallback
 //
-// For subcommands not yet natively ported (search-code, check-duplicate,
-// find-type-usages, validate-cross-deps) the shim path is used:
+// When DONMAI_CODE_BIN is set the shim path is used:
 //
 //  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override
 //  2. `donmai-code` on PATH (installed via `npm install -g @donmai/cli`)
@@ -234,19 +236,27 @@ type SearchCodeOptions struct {
 	Language   string
 }
 
-// SearchCode runs `donmai-code search-code <query>`.
+// SearchCode performs BM25 full-text code search.
+//
+// When DONMAI_CODE_BIN is set the exec-shim is used. Otherwise the native Go
+// BM25 implementation (S2) is used — no external binary required.
 func (r *Runner) SearchCode(opts SearchCodeOptions) (any, error) {
 	if opts.Query == "" {
 		return nil, fmt.Errorf("query is required for search-code")
 	}
-	args := []string{"search-code", opts.Query}
-	if opts.MaxResults > 0 {
-		args = append(args, "--max-results", fmt.Sprintf("%d", opts.MaxResults))
+	// Exec-shim override.
+	if r.isExecOverride() {
+		args := []string{"search-code", opts.Query}
+		if opts.MaxResults > 0 {
+			args = append(args, "--max-results", fmt.Sprintf("%d", opts.MaxResults))
+		}
+		if opts.Language != "" {
+			args = append(args, "--language", opts.Language)
+		}
+		return r.runCode(args...)
 	}
-	if opts.Language != "" {
-		args = append(args, "--language", opts.Language)
-	}
-	return r.runCode(args...)
+	// Native primary path (S2).
+	return NewNativeRunner(r.cwd).SearchCodeNative(opts)
 }
 
 // CheckDuplicateOptions holds the flags for check-duplicate.
@@ -255,18 +265,26 @@ type CheckDuplicateOptions struct {
 	ContentFile string
 }
 
-// CheckDuplicate runs `donmai-code check-duplicate`.
+// CheckDuplicate detects exact and near-duplicate content against the index.
+//
+// When DONMAI_CODE_BIN is set the exec-shim is used. Otherwise the native
+// xxHash64 + SimHash implementation (S3) is used.
 func (r *Runner) CheckDuplicate(opts CheckDuplicateOptions) (any, error) {
 	if opts.Content == "" && opts.ContentFile == "" {
 		return nil, fmt.Errorf("either --content or --content-file is required for check-duplicate")
 	}
-	args := []string{"check-duplicate"}
-	if opts.ContentFile != "" {
-		args = append(args, "--content-file", opts.ContentFile)
-	} else {
-		args = append(args, "--content", opts.Content)
+	// Exec-shim override.
+	if r.isExecOverride() {
+		args := []string{"check-duplicate"}
+		if opts.ContentFile != "" {
+			args = append(args, "--content-file", opts.ContentFile)
+		} else {
+			args = append(args, "--content", opts.Content)
+		}
+		return r.runCode(args...)
 	}
-	return r.runCode(args...)
+	// Native primary path (S3).
+	return NewNativeRunner(r.cwd).CheckDuplicateNative(opts)
 }
 
 // FindTypeUsagesOptions holds the flags for find-type-usages.
@@ -275,16 +293,24 @@ type FindTypeUsagesOptions struct {
 	MaxResults int
 }
 
-// FindTypeUsages runs `donmai-code find-type-usages <TypeName>`.
+// FindTypeUsages finds all switch/case, mapping objects, and usage sites for a type.
+//
+// When DONMAI_CODE_BIN is set the exec-shim is used. Otherwise the native
+// regex-scan implementation (S3) is used.
 func (r *Runner) FindTypeUsages(opts FindTypeUsagesOptions) (any, error) {
 	if opts.TypeName == "" {
 		return nil, fmt.Errorf("type name is required for find-type-usages")
 	}
-	args := []string{"find-type-usages", opts.TypeName}
-	if opts.MaxResults > 0 {
-		args = append(args, "--max-results", fmt.Sprintf("%d", opts.MaxResults))
+	// Exec-shim override.
+	if r.isExecOverride() {
+		args := []string{"find-type-usages", opts.TypeName}
+		if opts.MaxResults > 0 {
+			args = append(args, "--max-results", fmt.Sprintf("%d", opts.MaxResults))
+		}
+		return r.runCode(args...)
 	}
-	return r.runCode(args...)
+	// Native primary path (S3).
+	return NewNativeRunner(r.cwd).FindTypeUsagesNative(opts)
 }
 
 // ValidateCrossDepsOptions holds the flags for validate-cross-deps.
@@ -292,13 +318,21 @@ type ValidateCrossDepsOptions struct {
 	Path string // Optional scoping path
 }
 
-// ValidateCrossDeps runs `donmai-code validate-cross-deps [path]`.
+// ValidateCrossDeps checks cross-package imports have package.json declarations.
+//
+// When DONMAI_CODE_BIN is set the exec-shim is used. Otherwise the native
+// implementation (S3) is used.
 func (r *Runner) ValidateCrossDeps(opts ValidateCrossDepsOptions) (any, error) {
-	args := []string{"validate-cross-deps"}
-	if opts.Path != "" {
-		args = append(args, opts.Path)
+	// Exec-shim override.
+	if r.isExecOverride() {
+		args := []string{"validate-cross-deps"}
+		if opts.Path != "" {
+			args = append(args, opts.Path)
+		}
+		return r.runCode(args...)
 	}
-	return r.runCode(args...)
+	// Native primary path (S3).
+	return NewNativeRunner(r.cwd).ValidateCrossDepsNative(opts)
 }
 
 // ── af arch commands ──────────────────────────────────────────────────────────
