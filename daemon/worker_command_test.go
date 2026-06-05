@@ -84,7 +84,7 @@ func TestLookPathFallback(t *testing.T) {
 		},
 		{
 			name: "neither on PATH — returns nil + warns",
-			setupDir: func(t *testing.T, dir string) {
+			setupDir: func(_ *testing.T, _ string) {
 				// nothing placed; empty dir on PATH
 			},
 			wantNil:     true,
