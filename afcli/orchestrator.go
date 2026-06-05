@@ -56,7 +56,7 @@ Examples:
   ` + bin + ` orchestrator --project MyProject
 
   # Process a specific issue
-  ` + bin + ` orchestrator --single REN-42
+  ` + bin + ` orchestrator --single ENG-42
 
   # Preview what would be dispatched without running
   ` + bin + ` orchestrator --project MyProject --dry-run

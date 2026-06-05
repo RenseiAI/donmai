@@ -496,7 +496,7 @@ func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor) *runner.R
 		}
 	}
 	if len(reg.Names()) == 0 {
-		logger.Error("donmai agent run: no providers available — every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `donmai doctor`. (REN-1462)")
+		logger.Error("donmai agent run: no providers available — every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `donmai doctor`.")
 	}
 	return reg
 }
