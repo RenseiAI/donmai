@@ -1593,7 +1593,7 @@ func checkDeployment(ctx context.Context, owner, repo string, prNumber int) (*de
 	statusEndpoint := fmt.Sprintf("repos/%s/%s/commits/%s/status", owner, repo, sha)
 	statusRaw, err := runGhAPI(ctx, statusEndpoint)
 	if err != nil {
-		return nil, fmt.Errorf("get commit statuses for %s: %w", sha[:8], err)
+		return nil, fmt.Errorf("get commit statuses for %s: %w", sha[:min(len(sha), 8)], err)
 	}
 	var cs ghCommitStatus
 	if err := json.Unmarshal(statusRaw, &cs); err != nil {
