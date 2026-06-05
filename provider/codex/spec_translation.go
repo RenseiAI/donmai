@@ -106,7 +106,7 @@ func threadStartParams(spec agent.Spec) map[string]any {
 	params := map[string]any{
 		"cwd":            spec.Cwd,
 		"approvalPolicy": resolveApprovalPolicy(spec),
-		"serviceName":    "agentfactory",
+		"serviceName":    "donmai",
 		"model":          resolveModel(spec),
 	}
 	if spec.BaseInstructions != "" {
