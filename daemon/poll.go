@@ -617,7 +617,7 @@ func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*Proje
 // observable immediately at poll dispatch.
 //
 // Exported so embedders can drive multi-identity poll loops (e.g. a
-// closed-source satellite that builds a SessionSpec from its own poll
+// downstream embedder that builds a SessionSpec from its own poll
 // loop before calling a shared daemon's AcceptWorkWithDetail).
 func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
 	repo, matched := resolveAllowlistedRepo(item, projects)
@@ -696,7 +696,7 @@ func resolveAllowlistedRepo(item PollWorkItem, projects []ProjectConfig) (repo s
 // the project id (env vars, dashboards) sees a stable value.
 //
 // Exported so embedders can drive multi-identity poll loops (e.g. a
-// closed-source satellite that builds a SessionDetail from its own poll
+// downstream embedder that builds a SessionDetail from its own poll
 // loop before calling a shared daemon's AcceptWorkWithDetail).
 func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string) *SessionDetail {
 	repo, matched := resolveAllowlistedRepo(item, projects)

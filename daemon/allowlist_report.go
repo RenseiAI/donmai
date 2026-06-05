@@ -20,7 +20,7 @@ import (
 // Entries are sorted by id so the hash is stable regardless of yaml order.
 //
 // Exported so embedders can drive multi-identity poll loops (e.g. a
-// closed-source satellite that registers separate per-org worker identities
+// downstream embedder that registers separate per-org worker identities
 // against the same shared spawner).
 //
 // Returns nil (omitted on the wire) when the daemon has no projects
