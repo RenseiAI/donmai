@@ -58,7 +58,10 @@ var ErrNotAvailable = errors.New(
 		"(`npm install -g @donmai/cli`) or set DONMAI_CODE_BIN",
 )
 
-// ErrArchNotAvailable is returned when the donmai-arch binary cannot be found.
+// ErrArchNotAvailable is returned by resolveArchBin when the donmai-arch binary
+// cannot be found. Note: ArchAssess does NOT surface this sentinel to callers —
+// it falls back to the native diff/gate path instead. IsArchBinAvailable uses it
+// to decide whether to show the informational notice.
 var ErrArchNotAvailable = errors.New(
 	"donmai-arch binary not found — install @donmai/cli globally " +
 		"(`npm install -g @donmai/cli`) or set DONMAI_ARCH_BIN",
@@ -476,10 +479,11 @@ func (r *Runner) archAssessNative(opts ArchAssessOptions) (any, error) {
 
 	// We don't have diff content without a VCS call — emit a stub report with
 	// the PR metadata we have so the JSON shape is valid and the gate can fire.
+	// Title is intentionally empty: we only know the URL, not the PR title, and
+	// passing the raw URL as a Title could cause spurious decision-signal matches.
 	diff := PrDiff{
 		Repository: repo,
 		PrNumber:   prNum,
-		Title:      opts.PrURL,
 	}
 
 	scope := opts.ScopeLevel

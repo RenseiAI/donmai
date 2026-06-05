@@ -125,7 +125,7 @@ type ChangeRefJSON struct {
 // ReadDiffObservations extracts ArchObservation candidates from a PR diff.
 // All extraction is pure regex — no external binary, LLM, or DB is required.
 //
-// Three signal classes are emitted (matching the TS diff-reader.ts behaviour):
+// Four signal classes are emitted (matching the TS diff-reader.ts behaviour):
 //
 //  1. File-path zone patterns → "pattern" observations
 //  2. Convention signals from diff patches → "convention" observations
