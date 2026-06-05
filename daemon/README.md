@@ -72,7 +72,7 @@ WorkerCommand defaults to `[<self-exe>, "agent", "run"]` resolved via
 ### Repository URL resolution (REN-1464 / v0.5.2)
 
 `SessionDetail.repository` is **resolved from the `daemon.yaml`
-project allowlist** by `pollItemToSessionDetail` (in `poll.go`). The
+project allowlist** by `PollItemToSessionDetail` (in `poll.go`). The
 runner uses this URL for `git clone`.
 
 The platform's QueuedWork wire shape historically carries a

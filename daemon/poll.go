@@ -597,7 +597,7 @@ func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*Proje
 	return nil, false
 }
 
-// pollItemToSessionSpec maps a PollWorkItem to a SessionSpec the
+// PollItemToSessionSpec maps a PollWorkItem to a SessionSpec the
 // WorkerSpawner can dispatch.
 //
 // The platform's QueuedWork wire shape historically carried a
@@ -615,7 +615,11 @@ func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*Proje
 // WorkerSpawner.findProjectLocked check will reject the spec at
 // AcceptWork time, but the explicit log makes the resolution failure
 // observable immediately at poll dispatch.
-func pollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
+//
+// Exported so embedders can drive multi-identity poll loops (e.g. a
+// downstream embedder that builds a SessionSpec from its own poll
+// loop before calling a shared daemon's AcceptWorkWithDetail).
+func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
 	repo, matched := resolveAllowlistedRepo(item, projects)
 	spec := SessionSpec{
 		SessionID:          item.SessionID,
@@ -636,7 +640,7 @@ func pollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 // matched ProjectConfig pointer (nil on miss) so callers can read
 // the canonical id. Silent — callers decide whether and where to
 // warn so the same poll item being resolved by both
-// pollItemToSessionSpec and pollItemToSessionDetail doesn't emit
+// PollItemToSessionSpec and PollItemToSessionDetail doesn't emit
 // the same warn twice.
 //
 // Lookup order (most-specific first):
@@ -672,7 +676,7 @@ func resolveAllowlistedRepo(item PollWorkItem, projects []ProjectConfig) (repo s
 	return repo, nil
 }
 
-// pollItemToSessionDetail constructs the SessionDetail payload `donmai agent
+// PollItemToSessionDetail constructs the SessionDetail payload `donmai agent
 // run` will fetch from the daemon's HTTP API for the given poll item.
 // platformURL + authToken + workerID come from the daemon's
 // registration state; the issue-context fields come from the platform-
@@ -690,14 +694,18 @@ func resolveAllowlistedRepo(item PollWorkItem, projects []ProjectConfig) (repo s
 // SessionDetail.ProjectName is also normalised to the canonical
 // allowlist `id` when a match is found, so downstream code that uses
 // the project id (env vars, dashboards) sees a stable value.
-func pollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string) *SessionDetail {
+//
+// Exported so embedders can drive multi-identity poll loops (e.g. a
+// downstream embedder that builds a SessionDetail from its own poll
+// loop before calling a shared daemon's AcceptWorkWithDetail).
+func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string) *SessionDetail {
 	repo, matched := resolveAllowlistedRepo(item, projects)
 	projectName := item.ProjectName
 	if matched != nil && matched.ID != "" {
 		projectName = matched.ID
 	}
 	// Warn surfaces here (the SessionDetail builder runs once per work
-	// item, immediately after pollItemToSessionSpec) rather than inside
+	// item, immediately after PollItemToSessionSpec) rather than inside
 	// resolveAllowlistedRepo so the same poll item doesn't produce two
 	// identical warns. Fires only when NEITHER repo nor projectName
 	// match the allowlist — a genuine config error the runner won't

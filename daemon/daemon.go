@@ -366,7 +366,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Region:            cfg.Machine.Region,
 			JWTPath:           d.opts.JWTPath,
 			Provides:          provides,
-			DaemonProjects:    allowlistEntriesFromConfig(cfg.Projects),
+			DaemonProjects:    AllowlistEntriesFromConfig(cfg.Projects),
 		}
 		var err error
 		regResp, err = Register(ctx, regOpts)
@@ -476,7 +476,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
 			GetActiveCount:  func() int { return d.spawnerActiveCount() },
 			GetMaxCount:     func() int { return d.maxConcurrentSessions() },
-			GetStatus:       d.registrationStatus,
+			GetStatus:       d.RegistrationStatus,
 			Region:          cfg.Machine.Region,
 			OnReregister:    reregister,
 			GetAllowlist: func() []ProjectAllowlistEntry {
@@ -485,7 +485,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 				if d.config == nil {
 					return nil
 				}
-				return allowlistEntriesFromConfig(d.config.Projects)
+				return AllowlistEntriesFromConfig(d.config.Projects)
 			},
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
@@ -520,8 +520,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 					slog.Info(fmt.Sprintf(format, args...))
 				},
 				OnWork: func(item PollWorkItem) error {
-					spec := pollItemToSessionSpec(item, cfg.Projects)
-					detail := pollItemToSessionDetail(
+					spec := PollItemToSessionSpec(item, cfg.Projects)
+					detail := PollItemToSessionDetail(
 						item,
 						cfg.Projects,
 						cfg.Orchestrator.URL,
@@ -616,8 +616,8 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	// Cheap equality check on the structured allowlist projection — same
 	// shape the heartbeat reports, so this exactly matches "what the
 	// platform would see change".
-	before := allowlistEntriesFromConfig(d.config.Projects)
-	after := allowlistEntriesFromConfig(cfg.Projects)
+	before := AllowlistEntriesFromConfig(d.config.Projects)
+	after := AllowlistEntriesFromConfig(cfg.Projects)
 	if allowlistHash(before) == allowlistHash(after) {
 		d.mu.Unlock()
 		return
@@ -821,7 +821,26 @@ func (d *Daemon) spawnerActiveCount() int {
 	return d.spawner.ActiveCount()
 }
 
-func (d *Daemon) registrationStatus() RegistrationStatus {
+// ActiveSessionCount returns the number of agent sessions currently running
+// under the daemon's shared WorkerSpawner. Exported so embedders can wire this
+// into a satellite heartbeat's GetActiveCount callback for a shared-spawner
+// multi-identity configuration.
+func (d *Daemon) ActiveSessionCount() int {
+	return d.spawnerActiveCount()
+}
+
+// MaxConcurrentSessions returns the per-host capacity ceiling configured for
+// this daemon. Exported so embedders can wire this into a satellite heartbeat's
+// GetMaxCount callback for a shared-spawner multi-identity configuration.
+func (d *Daemon) MaxConcurrentSessions() int {
+	return d.maxConcurrentSessions()
+}
+
+// RegistrationStatus returns the current registration state of the daemon
+// (idle, busy, or draining). Exported so embedders can wire this into a
+// satellite heartbeat's GetStatus callback for a shared-spawner multi-identity
+// configuration.
+func (d *Daemon) RegistrationStatus() RegistrationStatus {
 	switch d.State() {
 	case StateDraining, StateUpdating:
 		return RegistrationDraining

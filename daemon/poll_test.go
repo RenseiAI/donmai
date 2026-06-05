@@ -443,7 +443,7 @@ func TestPollItemToSessionDetail_ResolvesProjectNameToRepoURL(t *testing.T) {
 		ProjectName: "smoke-alpha",
 	}
 
-	detail := pollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
+	detail := PollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
 
 	if got, want := detail.Repository, "https://github.com/RenseiAI/rensei-smokes-alpha"; got != want {
 		t.Errorf("Repository = %q, want %q", got, want)
@@ -481,7 +481,7 @@ func TestPollItemToSessionDetail_FallsBackOnNoAllowlistMatch(t *testing.T) {
 		ProjectName: "smoke-charlie", // not in allowlist
 	}
 
-	detail := pollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
+	detail := PollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
 
 	if got, want := detail.Repository, "smoke-charlie"; got != want {
 		t.Errorf("Repository = %q, want %q (fallback to projectName)", got, want)
@@ -511,7 +511,7 @@ func TestPollItemToSessionDetail_EmptyProjectName(t *testing.T) {
 	}}
 	item := PollWorkItem{SessionID: "sess-3"}
 
-	detail := pollItemToSessionDetail(item, projects, "", "", "")
+	detail := PollItemToSessionDetail(item, projects, "", "", "")
 
 	if detail.Repository != "" {
 		t.Errorf("Repository = %q, want empty", detail.Repository)
@@ -539,7 +539,7 @@ func TestPollItemToSessionDetail_RepositoryURLOnWireMatchesAllowlist(t *testing.
 		Repository:  "https://github.com/RenseiAI/rensei-smokes-alpha",
 	}
 
-	detail := pollItemToSessionDetail(item, projects, "", "", "")
+	detail := PollItemToSessionDetail(item, projects, "", "", "")
 
 	if got, want := detail.Repository, "https://github.com/RenseiAI/rensei-smokes-alpha"; got != want {
 		t.Errorf("Repository = %q, want %q", got, want)
@@ -564,7 +564,7 @@ func TestPollItemToSessionSpec_ResolvesProjectName(t *testing.T) {
 		Ref:         "main",
 	}
 
-	spec := pollItemToSessionSpec(item, projects)
+	spec := PollItemToSessionSpec(item, projects)
 
 	if got, want := spec.Repository, "https://github.com/RenseiAI/rensei-smokes-alpha"; got != want {
 		t.Errorf("Repository = %q, want %q", got, want)
@@ -578,7 +578,7 @@ func TestPollItemToSessionSpec_ResolvesProjectName(t *testing.T) {
 }
 
 // TestPollItemToSessionSpec_ProjectNameFromAllowlist asserts that
-// pollItemToSessionSpec populates spec.ProjectName with the matched
+// PollItemToSessionSpec populates spec.ProjectName with the matched
 // ProjectConfig.ID when an allowlist entry is found, and leaves it
 // empty when no entry matches. This is a table-driven extension of the
 // existing TestPollItemToSessionSpec_ResolvesProjectName to cover the
@@ -638,7 +638,7 @@ func TestPollItemToSessionSpec_ProjectNameFromAllowlist(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			spec := pollItemToSessionSpec(tc.item, projects)
+			spec := PollItemToSessionSpec(tc.item, projects)
 			if spec.ProjectName != tc.wantProjectName {
 				t.Errorf("ProjectName = %q, want %q", spec.ProjectName, tc.wantProjectName)
 			}
@@ -716,7 +716,7 @@ func TestPollItemToSessionDetail_URLMatchSilencesProjectNameMiss(t *testing.T) {
 		Repository:  "https://github.com/supaku/supaku.git",
 	}
 
-	detail := pollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
+	detail := PollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
 
 	if detail.Repository != "https://github.com/supaku/supaku.git" {
 		t.Errorf("Repository = %q, want canonical URL", detail.Repository)
@@ -751,7 +751,7 @@ func TestPollItemToSessionDetail_DisallowedToolsForwarded(t *testing.T) {
 				SessionID:       "sess-dt",
 				DisallowedTools: tc.disallowedTools,
 			}
-			detail := pollItemToSessionDetail(item, nil, "", "", "")
+			detail := PollItemToSessionDetail(item, nil, "", "", "")
 			if got := len(detail.DisallowedTools); got != tc.wantLen {
 				t.Errorf("DisallowedTools len = %d, want %d; got %v", got, tc.wantLen, detail.DisallowedTools)
 			}
@@ -807,7 +807,7 @@ func TestPollItemToSessionDetail_MemoryBlockForwarded(t *testing.T) {
 				SessionID:   "sess-mem",
 				MemoryBlock: tc.memoryBlock,
 			}
-			detail := pollItemToSessionDetail(item, nil, "", "", "")
+			detail := PollItemToSessionDetail(item, nil, "", "", "")
 			if detail.MemoryBlock != tc.memoryBlock {
 				t.Errorf("MemoryBlock = %q, want %q", detail.MemoryBlock, tc.memoryBlock)
 			}
@@ -826,10 +826,10 @@ func TestPollItemToSessionSpec_DoesNotWarn(t *testing.T) {
 	projects := []ProjectConfig{{ID: "alpha", Repository: "https://github.com/x/alpha"}}
 	item := PollWorkItem{SessionID: "s", ProjectName: "unmatched"} // misses
 
-	_ = pollItemToSessionSpec(item, projects)
+	_ = PollItemToSessionSpec(item, projects)
 
 	if logs := buf.String(); strings.Contains(logs, "no allowlist match") {
-		t.Errorf("pollItemToSessionSpec must not warn (warn fires from pollItemToSessionDetail); got:\n%s", logs)
+		t.Errorf("PollItemToSessionSpec must not warn (warn fires from PollItemToSessionDetail); got:\n%s", logs)
 	}
 }
 
