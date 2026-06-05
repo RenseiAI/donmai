@@ -85,8 +85,8 @@ func TestNewSpawnPlan_Defaults(t *testing.T) {
 	if plan.ThreadStart["model"] != DefaultCodexModel {
 		t.Fatalf("expected default model %q, got %v", DefaultCodexModel, plan.ThreadStart["model"])
 	}
-	if plan.ThreadStart["serviceName"] != "agentfactory" {
-		t.Fatalf("expected serviceName=agentfactory, got %v", plan.ThreadStart["serviceName"])
+	if plan.ThreadStart["serviceName"] != "donmai" {
+		t.Fatalf("expected serviceName=donmai, got %v", plan.ThreadStart["serviceName"])
 	}
 	if _, ok := plan.ThreadStart["sandbox"]; ok {
 		t.Fatalf("expected no sandbox by default, got %v", plan.ThreadStart["sandbox"])
