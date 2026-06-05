@@ -51,7 +51,7 @@ func newRoutingCmdWithFactory(factory routingClientFactory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "routing",
 		Short: "Inspect 2D routing decisions (LLM × sandbox)",
-		Long: `Commands for inspecting the cross-provider scheduler on the local af daemon.
+		Long: `Commands for inspecting the cross-provider scheduler on the local donmai daemon.
 
 Routing decisions are queried from the daemon's HTTP control API at
 http://127.0.0.1:7734 by default. Set ` + providerEnvDaemonURL + ` to override.

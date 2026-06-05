@@ -15,7 +15,7 @@ func TestGovernorStatusCommand(t *testing.T) {
 
 		stop := captureOSStdout(t)
 
-		cmd := newGovernorStatusCmd()
+		cmd := newGovernorStatusCmd("donmai")
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		cmd.SetErr(&buf)
@@ -51,7 +51,7 @@ func TestGovernorStatusCommand(t *testing.T) {
 
 		stop := captureOSStdout(t)
 
-		cmd := newGovernorStatusCmd()
+		cmd := newGovernorStatusCmd("donmai")
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		cmd.SetErr(&buf)
@@ -83,7 +83,7 @@ func TestGovernorStatusCommand(t *testing.T) {
 
 		stop := captureOSStdout(t)
 
-		cmd := newGovernorStatusCmd()
+		cmd := newGovernorStatusCmd("donmai")
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		cmd.SetErr(&buf)

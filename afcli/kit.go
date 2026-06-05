@@ -75,7 +75,7 @@ func newKitCmdWithFactory(factory kitClientFactory) *cobra.Command {
 		Long: `Commands for managing kits — the buildpacks-style packaging unit for
 language, framework, and domain support (see 005-kit-manifest-spec.md).
 
-Kits are queried from the local af daemon at http://127.0.0.1:7734 by
+Kits are queried from the local donmai daemon at http://127.0.0.1:7734 by
 default. Set DONMAI_DAEMON_URL to override the daemon address.
 
 Federation order for registry sources (lowest priority number = consulted first):

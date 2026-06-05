@@ -13,11 +13,12 @@ import (
 //
 // Architecture: shell-out bridge to `pnpm af-arch` (TS implementation).
 // See afclient/codeintel/runner.go for the full rationale.
-func newArchCmd() *cobra.Command {
+func newArchCmd(cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "arch",
 		Short: "Architectural intelligence — drift detection for PRs and commits",
-		Long: `Architectural intelligence commands powered by @renseiai/architectural-intelligence.
+		Long: `Architectural intelligence commands powered by @donmai/architectural-intelligence.
 
 Detects deviations between a PR/commit and the stored architectural baseline.
 All commands output JSON to stdout by default.
@@ -34,18 +35,18 @@ Environment:
 
 Binary resolution (in order):
   1. DONMAI_ARCH_BIN env var (legacy: AGENTFACTORY_ARCH_BIN) — explicit override
-  2. af-arch on PATH (npm install -g @renseiai/agentfactory-cli)
-  3. pnpm af-arch (monorepo dev)`,
+  2. donmai-arch on PATH (npm install -g @donmai/cli)
+  3. pnpm donmai-arch (monorepo dev)`,
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newArchAssessCmd())
+	cmd.AddCommand(newArchAssessCmd(bin))
 
 	return cmd
 }
 
 // newArchAssessCmd constructs `donmai arch assess`.
-func newArchAssessCmd() *cobra.Command {
+func newArchAssessCmd(bin string) *cobra.Command {
 	var (
 		repository string
 		prNumber   int
@@ -74,10 +75,10 @@ Without ANTHROPIC_API_KEY, the CLI uses a stub adapter that returns an empty
 DriftReport with a notice — useful for testing the pipeline without API credits.
 
 Examples:
-  af arch assess https://github.com/org/repo/pull/123
-  af arch assess --repository github.com/org/repo --pr 123
-  af arch assess https://github.com/org/repo/pull/123 --gate-policy zero-deviations
-  af arch assess https://github.com/org/repo/pull/123 --summary`,
+  ` + bin + ` arch assess https://github.com/org/repo/pull/123
+  ` + bin + ` arch assess --repository github.com/org/repo --pr 123
+  ` + bin + ` arch assess https://github.com/org/repo/pull/123 --gate-policy zero-deviations
+  ` + bin + ` arch assess https://github.com/org/repo/pull/123 --summary`,
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {

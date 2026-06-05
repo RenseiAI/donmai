@@ -15,7 +15,7 @@ import (
 // newFleetStatusCmd constructs the `fleet status` subcommand. It reads
 // the fleet PID file and reports a simple running/dead table by probing
 // each recorded PID with Signal(0).
-func newFleetStatusCmd() *cobra.Command {
+func newFleetStatusCmd(bin string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "status",
 		Short:        "Report the liveness of each fleet worker",
@@ -28,7 +28,7 @@ func newFleetStatusCmd() *cobra.Command {
 			}
 			out := cmd.OutOrStdout()
 			if len(pids) == 0 {
-				_, _ = fmt.Fprintln(out, "Fleet is not running")
+				_, _ = fmt.Fprintf(out, "Fleet is not running — start with `%s fleet start`\n", bin)
 				return nil
 			}
 			return writeFleetStatusTable(out, pids)

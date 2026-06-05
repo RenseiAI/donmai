@@ -12,7 +12,7 @@ func TestGovernorStopCommand(t *testing.T) {
 		tmp := t.TempDir()
 		t.Setenv("HOME", tmp)
 
-		cmd := newGovernorStopCmd()
+		cmd := newGovernorStopCmd("donmai")
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		cmd.SetErr(&buf)
@@ -36,7 +36,7 @@ func TestGovernorStopCommand(t *testing.T) {
 			t.Fatalf("savePID: %v", err)
 		}
 
-		cmd := newGovernorStopCmd()
+		cmd := newGovernorStopCmd("donmai")
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		cmd.SetErr(&buf)
@@ -73,7 +73,7 @@ func TestGovernorStopCommand(t *testing.T) {
 			t.Fatalf("save pid: %v", err)
 		}
 
-		cmd := newGovernorStopCmd()
+		cmd := newGovernorStopCmd("donmai")
 		var buf bytes.Buffer
 		cmd.SetOut(&buf)
 		cmd.SetErr(&buf)

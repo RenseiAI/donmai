@@ -169,7 +169,7 @@ func (m *Model) Render() string {
 	// Header
 	title := theme.Header().Width(m.width).Render(
 		lipgloss.JoinHorizontal(lipgloss.Top,
-			lipgloss.NewStyle().Bold(true).Foreground(theme.Default().Accent).Render("AGENTFACTORY"),
+			lipgloss.NewStyle().Bold(true).Foreground(theme.Default().Accent).Render("DONMAI"),
 			lipgloss.NewStyle().Foreground(theme.Default().TextSecondary).Render(" FLEET"),
 		),
 	)

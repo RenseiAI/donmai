@@ -20,7 +20,7 @@ func newAgentCmd(ds func() afclient.DataSource, projectFunc func() string) *cobr
 	cmd := &cobra.Command{
 		Use:          "agent",
 		Short:        "Inspect and control agent sessions",
-		Long:         "Inspect and control AgentFactory agent sessions. Use subcommands like `list` to query sessions.",
+		Long:         "Inspect and control Donmai agent sessions. Use subcommands like `list` to query sessions.",
 		SilenceUsage: true,
 	}
 

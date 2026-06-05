@@ -1,8 +1,8 @@
 package afcli
 
-// af github — GitHub Issues operations.
+// donmai github — GitHub Issues operations.
 //
-// This file mirrors the `af linear` surface for GitHub Issues. Each subcommand
+// This file mirrors the `donmai linear` surface for GitHub Issues. Each subcommand
 // has a direct conceptual equivalent; JSON output shapes are intentionally
 // stable for automation compatibility.
 //
@@ -49,13 +49,14 @@ import (
 // `ds` is the platform-DataSource factory; subcommands call it lazily to
 // pick up rsk_ credentials when running embedded under rensei. The factory
 // may be nil — subcommands degrade to the GITHUB_TOKEN env path.
-func newGitHubCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubCmd(ds func() afclient.DataSource, cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "github",
 		Short: "GitHub Issues operations",
 		Long: `GitHub Issues operations.
 
-Mirrors the 'af linear' surface adapted to GitHub Issues vocabulary.
+Mirrors the 'donmai linear' surface adapted to GitHub Issues vocabulary.
 Outputs JSON to stdout.
 
 Authentication (in order):
@@ -73,18 +74,18 @@ Owner/repo resolution (applied to all repo-scoped subcommands):
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newGitHubGetIssueCmd(ds))
-	cmd.AddCommand(newGitHubCreateIssueCmd(ds))
-	cmd.AddCommand(newGitHubUpdateIssueCmd(ds))
-	cmd.AddCommand(newGitHubListIssuesCmd(ds))
-	cmd.AddCommand(newGitHubListCommentsCmd(ds))
-	cmd.AddCommand(newGitHubCreateCommentCmd(ds))
-	cmd.AddCommand(newGitHubAddLabelsCmd(ds))
-	cmd.AddCommand(newGitHubSetAssigneesCmd(ds))
-	cmd.AddCommand(newGitHubCloseIssueCmd(ds))
-	cmd.AddCommand(newGitHubReopenIssueCmd(ds))
-	cmd.AddCommand(newGitHubListLabelsCmd(ds))
-	cmd.AddCommand(newGitHubGetRepoCmd(ds))
+	cmd.AddCommand(newGitHubGetIssueCmd(ds, bin))
+	cmd.AddCommand(newGitHubCreateIssueCmd(ds, bin))
+	cmd.AddCommand(newGitHubUpdateIssueCmd(ds, bin))
+	cmd.AddCommand(newGitHubListIssuesCmd(ds, bin))
+	cmd.AddCommand(newGitHubListCommentsCmd(ds, bin))
+	cmd.AddCommand(newGitHubCreateCommentCmd(ds, bin))
+	cmd.AddCommand(newGitHubAddLabelsCmd(ds, bin))
+	cmd.AddCommand(newGitHubSetAssigneesCmd(ds, bin))
+	cmd.AddCommand(newGitHubCloseIssueCmd(ds, bin))
+	cmd.AddCommand(newGitHubReopenIssueCmd(ds, bin))
+	cmd.AddCommand(newGitHubListLabelsCmd(ds, bin))
+	cmd.AddCommand(newGitHubGetRepoCmd(ds, bin))
 
 	return cmd
 }
@@ -101,7 +102,7 @@ func githubToken() string {
 //
 // When githubTestBaseURL is non-empty (set by tests via setGitHubTestBaseURL),
 // the direct-path client's BaseURL is overridden to point at the test server.
-func newGitHubClient(ds func() afclient.DataSource) (gh.GitHub, error) {
+func newGitHubClient(ds func() afclient.DataSource, bin string) (gh.GitHub, error) {
 	// Path 1: env-var direct.
 	if token := githubToken(); token != "" {
 		c := gh.NewClient(token)
@@ -119,10 +120,9 @@ func newGitHubClient(ds func() afclient.DataSource) (gh.GitHub, error) {
 	}
 
 	// Path 3: neither — actionable error.
-	return nil, fmt.Errorf(
-		"github access requires either a GITHUB_TOKEN env var or a " +
-			"logged-in platform session: set the env var, or run `af login` " +
-			"then connect a GitHub integration",
+	return nil, userError(
+		"github access requires authentication",
+		"set GITHUB_TOKEN, or run `"+bin+" auth add --user` then connect a GitHub integration",
 	)
 }
 
@@ -223,7 +223,7 @@ func issueJSON(iss *gh.Issue) map[string]any {
 
 // ─── get-issue ────────────────────────────────────────────────────────────────
 
-func newGitHubGetIssueCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	ownerF, repoF := new(string), new(string)
 	var number int
 
@@ -233,13 +233,16 @@ func newGitHubGetIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `Get details of a GitHub issue.
 
 Example:
-  af github get-issue --repo owner/repo --number 42`,
+  donmai github get-issue --repo owner/repo --number 42`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return fmt.Errorf("usage: af github get-issue --repo owner/repo --number 42")
+				return userError(
+					"--number is required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42",
+				)
 			}
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -264,7 +267,7 @@ Example:
 
 // ─── create-issue ─────────────────────────────────────────────────────────────
 
-func newGitHubCreateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		ownerF, repoF string
 		title         string
@@ -280,14 +283,17 @@ func newGitHubCreateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `Create a new GitHub issue.
 
 Example:
-  af github create-issue --repo owner/repo --title "Bug: something broken" \
+  donmai github create-issue --repo owner/repo --title "Bug: something broken" \
     --body "Description" --labels "bug,needs-triage"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if title == "" {
-				return fmt.Errorf("usage: af github create-issue --repo owner/repo --title \"Title\" [--body \"text\"]")
+				return userError(
+					"--title is required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --title \"Title\" [--body \"text\"]",
+				)
 			}
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -329,7 +335,7 @@ Example:
 
 // ─── update-issue ─────────────────────────────────────────────────────────────
 
-func newGitHubUpdateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		ownerF, repoF string
 		number        int
@@ -347,13 +353,16 @@ func newGitHubUpdateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `Update an existing GitHub issue.
 
 Example:
-  af github update-issue --repo owner/repo --number 42 --state closed`,
+  donmai github update-issue --repo owner/repo --number 42 --state closed`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return fmt.Errorf("usage: af github update-issue --repo owner/repo --number 42 [--title ...] [--state open|closed]")
+				return userError(
+					"--number is required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 [--title ...] [--state open|closed]",
+				)
 			}
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -398,7 +407,7 @@ Example:
 
 // ─── list-issues ──────────────────────────────────────────────────────────────
 
-func newGitHubListIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		ownerF, repoF string
 		state         string
@@ -418,10 +427,10 @@ func newGitHubListIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `List GitHub issues with optional filters.
 
 Example:
-  af github list-issues --repo owner/repo --state open --labels "bug" --limit 20`,
+  donmai github list-issues --repo owner/repo --state open --labels "bug" --limit 20`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -477,7 +486,7 @@ Example:
 
 // ─── list-comments ────────────────────────────────────────────────────────────
 
-func newGitHubListCommentsCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubListCommentsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		ownerF, repoF string
 		number        int
@@ -489,13 +498,16 @@ func newGitHubListCommentsCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `List comments on a GitHub issue.
 
 Example:
-  af github list-comments --repo owner/repo --number 42`,
+  donmai github list-comments --repo owner/repo --number 42`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return fmt.Errorf("usage: af github list-comments --repo owner/repo --number 42")
+				return userError(
+					"--number is required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42",
+				)
 			}
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -537,7 +549,7 @@ Example:
 
 // ─── create-comment ───────────────────────────────────────────────────────────
 
-func newGitHubCreateCommentCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubCreateCommentCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		ownerF, repoF string
 		number        int
@@ -551,21 +563,27 @@ func newGitHubCreateCommentCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `Post a comment on a GitHub issue.
 
 Example:
-  af github create-comment --repo owner/repo --number 42 --body "Looks good!"`,
+  donmai github create-comment --repo owner/repo --number 42 --body "Looks good!"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return fmt.Errorf("usage: af github create-comment --repo owner/repo --number 42 --body \"...\"")
+				return userError(
+					"--number is required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 --body \"...\"",
+				)
 			}
 			resolvedBody, err := ghResolveFileArg(body, bodyFile)
 			if err != nil {
 				return err
 			}
 			if resolvedBody == "" {
-				return fmt.Errorf("usage: af github create-comment --repo owner/repo --number 42 --body \"Comment text\" or --body-file /path")
+				return userError(
+					"--body or --body-file is required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 --body \"Comment text\"",
+				)
 			}
 
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -604,7 +622,7 @@ Example:
 
 // ─── add-labels ───────────────────────────────────────────────────────────────
 
-func newGitHubAddLabelsCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubAddLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		ownerF, repoF string
 		number        int
@@ -617,13 +635,16 @@ func newGitHubAddLabelsCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `Add labels to a GitHub issue. Existing labels are preserved.
 
 Example:
-  af github add-labels --repo owner/repo --number 42 --labels "bug,priority:high"`,
+  donmai github add-labels --repo owner/repo --number 42 --labels "bug,priority:high"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 || labels == "" {
-				return fmt.Errorf("usage: af github add-labels --repo owner/repo --number 42 --labels \"label1,label2\"")
+				return userError(
+					"--number and --labels are required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 --labels \"label1,label2\"",
+				)
 			}
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -658,7 +679,7 @@ Example:
 
 // ─── set-assignees ────────────────────────────────────────────────────────────
 
-func newGitHubSetAssigneesCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubSetAssigneesCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		ownerF, repoF string
 		number        int
@@ -672,13 +693,16 @@ func newGitHubSetAssigneesCmd(ds func() afclient.DataSource) *cobra.Command {
 Passing an empty --assignees clears all assignees.
 
 Example:
-  af github set-assignees --repo owner/repo --number 42 --assignees "alice,bob"`,
+  donmai github set-assignees --repo owner/repo --number 42 --assignees "alice,bob"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return fmt.Errorf("usage: af github set-assignees --repo owner/repo --number 42 --assignees \"alice,bob\"")
+				return userError(
+					"--number is required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 --assignees \"alice,bob\"",
+				)
 			}
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -705,7 +729,7 @@ Example:
 
 // ─── close-issue ──────────────────────────────────────────────────────────────
 
-func newGitHubCloseIssueCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubCloseIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		ownerF, repoF string
 		number        int
@@ -718,13 +742,16 @@ func newGitHubCloseIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `Close a GitHub issue, optionally posting a closing comment.
 
 Example:
-  af github close-issue --repo owner/repo --number 42 --comment "Resolved in v2.0"`,
+  donmai github close-issue --repo owner/repo --number 42 --comment "Resolved in v2.0"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return fmt.Errorf("usage: af github close-issue --repo owner/repo --number 42 [--comment \"...\"]")
+				return userError(
+					"--number is required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 [--comment \"...\"]",
+				)
 			}
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -758,7 +785,7 @@ Example:
 
 // ─── reopen-issue ─────────────────────────────────────────────────────────────
 
-func newGitHubReopenIssueCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubReopenIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		ownerF, repoF string
 		number        int
@@ -771,13 +798,16 @@ func newGitHubReopenIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `Reopen a closed GitHub issue, optionally posting a comment.
 
 Example:
-  af github reopen-issue --repo owner/repo --number 42`,
+  donmai github reopen-issue --repo owner/repo --number 42`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return fmt.Errorf("usage: af github reopen-issue --repo owner/repo --number 42 [--comment \"...\"]")
+				return userError(
+					"--number is required",
+					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 [--comment \"...\"]",
+				)
 			}
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -811,7 +841,7 @@ Example:
 
 // ─── list-labels ──────────────────────────────────────────────────────────────
 
-func newGitHubListLabelsCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var ownerF, repoF string
 
 	cmd := &cobra.Command{
@@ -820,10 +850,10 @@ func newGitHubListLabelsCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `List all labels defined in a GitHub repository.
 
 Example:
-  af github list-labels --repo owner/repo`,
+  donmai github list-labels --repo owner/repo`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -858,7 +888,7 @@ Example:
 
 // ─── get-repo ─────────────────────────────────────────────────────────────────
 
-func newGitHubGetRepoCmd(ds func() afclient.DataSource) *cobra.Command {
+func newGitHubGetRepoCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var ownerF, repoF string
 
 	cmd := &cobra.Command{
@@ -867,10 +897,10 @@ func newGitHubGetRepoCmd(ds func() afclient.DataSource) *cobra.Command {
 		Long: `Get metadata about a GitHub repository.
 
 Example:
-  af github get-repo --repo owner/repo`,
+  donmai github get-repo --repo owner/repo`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, err := newGitHubClient(ds)
+			client, err := newGitHubClient(ds, bin)
 			if err != nil {
 				return err
 			}

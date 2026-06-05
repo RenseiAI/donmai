@@ -9,21 +9,21 @@ import (
 	"strings"
 )
 
-// pidDir returns the path to the PID directory (~/.config/agentfactory/pids/),
+// pidDir returns the path to the PID directory (~/.config/donmai/pids/),
 // creating it if it does not exist.
 func pidDir() (string, error) {
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("user config dir: %w", err)
 	}
-	dir := filepath.Join(configDir, "agentfactory", "pids")
+	dir := filepath.Join(configDir, "donmai", "pids")
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", fmt.Errorf("create pid dir: %w", err)
 	}
 	return dir, nil
 }
 
-// savePID writes the given PID to ~/.config/agentfactory/pids/<name>.pid.
+// savePID writes the given PID to ~/.config/donmai/pids/<name>.pid.
 func savePID(name string, pid int) error {
 	dir, err := pidDir()
 	if err != nil {
@@ -37,7 +37,7 @@ func savePID(name string, pid int) error {
 	return nil
 }
 
-// loadPID reads the PID from ~/.config/agentfactory/pids/<name>.pid.
+// loadPID reads the PID from ~/.config/donmai/pids/<name>.pid.
 // Returns an error if the file does not exist or contains invalid data.
 func loadPID(name string) (int, error) {
 	dir, err := pidDir()
