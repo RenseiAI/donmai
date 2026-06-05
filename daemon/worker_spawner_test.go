@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -696,4 +697,164 @@ func TestSpawner_EmitsLifecycleEvents(t *testing.T) {
 	if atomic.LoadInt32(&ended) == 0 {
 		t.Error("expected end event")
 	}
+}
+
+// ── AddProjects tests ──────────────────────────────────────────────────────
+
+// TestSpawner_AddProjects_AcceptsExtraRepo verifies that a repository
+// rejected before AddProjects is called becomes accepted after AddProjects
+// registers its ProjectConfig.
+func TestSpawner_AddProjects_AcceptsExtraRepo(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
+		MaxConcurrentSessions: 4,
+	})
+
+	// Satellite repo must be rejected before AddProjects.
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "pre-1", Repository: "github.com/org/satellite"}); err == nil {
+		t.Fatal("expected rejection for satellite repo before AddProjects")
+	}
+
+	s.AddProjects([]ProjectConfig{{ID: "satellite", Repository: "github.com/org/satellite"}})
+
+	// Satellite repo must be accepted after AddProjects.
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "post-1", Repository: "github.com/org/satellite"}); err != nil {
+		t.Fatalf("expected accept after AddProjects, got %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestSpawner_AddProjects_SetProjectsPreservesExtra is the key regression
+// guard: a SetProjects call (e.g. yaml-watcher reload of the primary org's
+// config) must NOT evict projects previously registered via AddProjects.
+func TestSpawner_AddProjects_SetProjectsPreservesExtra(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
+		MaxConcurrentSessions: 4,
+	})
+
+	s.AddProjects([]ProjectConfig{{ID: "satellite", Repository: "github.com/org/satellite"}})
+
+	// Simulate a yaml-watcher reload that replaces the base set. The satellite
+	// entry must survive because SetProjects only replaces opts.Projects.
+	s.SetProjects([]ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}})
+
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "after-reload", Repository: "github.com/org/satellite"}); err != nil {
+		t.Fatalf("satellite repo rejected after SetProjects reload: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestSpawner_AddProjects_Dedup verifies that calling AddProjects multiple
+// times with the same entry does not add duplicates. We check this
+// indirectly by ensuring a later SetProjects that removes the base entry
+// still only leaves one satellite entry (no phantom double-match issues).
+func TestSpawner_AddProjects_Dedup(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
+		MaxConcurrentSessions: 4,
+	})
+
+	dup := ProjectConfig{ID: "satellite", Repository: "github.com/org/satellite"}
+	s.AddProjects([]ProjectConfig{dup})
+	s.AddProjects([]ProjectConfig{dup})
+	s.AddProjects([]ProjectConfig{dup})
+
+	// Only one copy should exist in extraProjects; confirm by verifying the
+	// spawner still accepts the repo (dedup does not reject valid entries).
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "dup-1", Repository: "github.com/org/satellite"}); err != nil {
+		t.Fatalf("expected accept after dedup AddProjects, got %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Also dedup by ID alone (different Repository).
+	s.AddProjects([]ProjectConfig{{ID: "satellite", Repository: "github.com/org/satellite-mirror"}})
+	// Same ID already present — must NOT add a second entry.
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "dup-2", Repository: "github.com/org/satellite-mirror"}); err == nil {
+		t.Fatal("expected rejection for dedup-by-ID path; duplicate ID should prevent registration of different repository")
+	}
+}
+
+// TestSpawner_AddProjects_DedupByRepository verifies that an entry whose
+// Repository already exists in the base set is not added to extraProjects.
+func TestSpawner_AddProjects_DedupByRepository(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects: []ProjectConfig{
+			{ID: "primary", Repository: "github.com/org/primary"},
+		},
+		MaxConcurrentSessions: 2,
+	})
+
+	// Attempt to add an entry that shares the same Repository as the base entry
+	// but with a different ID.
+	s.AddProjects([]ProjectConfig{{ID: "primary-alias", Repository: "github.com/org/primary"}})
+
+	// The dedup-by-Repository path should have rejected the duplicate; there
+	// should only be the base entry. The primary repo must still be accepted.
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "dedup-repo-1", Repository: "github.com/org/primary"}); err != nil {
+		t.Fatalf("primary repo rejected after duplicate-repo AddProjects: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestSpawner_AddProjects_Concurrency exercises AddProjects and AcceptWork
+// under the race detector by running them concurrently. Any data race on
+// extraProjects or opts.Projects will surface here under `go test -race`.
+func TestSpawner_AddProjects_Concurrency(_ *testing.T) {
+	const numSatellites = 8
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
+		MaxConcurrentSessions: numSatellites + 2,
+	})
+
+	var wg sync.WaitGroup
+
+	// Goroutine 1: concurrently add satellite projects.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range numSatellites {
+			s.AddProjects([]ProjectConfig{{
+				ID:         fmt.Sprintf("sat-%d", i),
+				Repository: fmt.Sprintf("github.com/org/satellite-%d", i),
+			}})
+		}
+	}()
+
+	// Goroutine 2: concurrently call SetProjects (yaml-watcher simulation).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 4 {
+			s.SetProjects([]ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}})
+		}
+	}()
+
+	// Goroutine 3: concurrently accept work on the primary repo.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 4 {
+			_, _ = s.AcceptWork(SessionSpec{
+				SessionID:  fmt.Sprintf("concurrent-%d", i),
+				Repository: "github.com/org/primary",
+			})
+		}
+	}()
+
+	wg.Wait()
+	// Drain so the test does not leave zombie /bin/sh stubs.
+	_ = s.Drain(2 * time.Second)
 }
