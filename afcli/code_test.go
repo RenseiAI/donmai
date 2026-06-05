@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -311,25 +310,35 @@ func TestCodeCmd_NativeNoExecRequired(t *testing.T) {
 	}
 }
 
-// TestCodeCmd_ExecShimFallbackRequired verifies that search-code (not yet
-// natively ported) returns ErrNotAvailable when DONMAI_CODE_BIN is unset and
-// no donmai-code binary is on PATH.
-func TestCodeCmd_ExecShimFallbackRequired(t *testing.T) {
+// TestCodeCmd_SearchCodeNativeNoExec verifies that search-code works without
+// any external binary (S2 native implementation). DONMAI_CODE_BIN is explicitly
+// unset so the native path is used; the command must succeed (returning JSON)
+// even when no donmai-code binary exists on PATH.
+func TestCodeCmd_SearchCodeNativeNoExec(t *testing.T) {
 	t.Setenv("AGENTFACTORY_CODE_BIN", "")
 	t.Setenv("DONMAI_CODE_BIN", "")
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", t.TempDir())
 	defer func() { _ = os.Setenv("PATH", origPath) }()
 
-	if _, err := exec.LookPath("pnpm"); err == nil {
-		t.Skip("pnpm found in PATH; cannot test unavailable binary path")
+	// Run in a temp dir with a minimal Go file so the index has something.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\nfunc main() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	// Change into the temp dir so cwd() picks it up.
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(orig) }()
 
+	var buf bytes.Buffer
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
+	root.SetOut(&buf)
 	root.AddCommand(newCodeCmd(Config{}))
-	root.SetArgs([]string{"code", "search-code", "something"})
-	err := root.Execute()
-	if err == nil {
-		t.Fatal("search-code should error when exec binary is not available")
+	root.SetArgs([]string{"code", "search-code", "main"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("search-code should not error with native S2 impl: %v", err)
 	}
 }

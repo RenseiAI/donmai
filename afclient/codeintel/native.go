@@ -15,15 +15,15 @@ import (
 	xxhash "github.com/cespare/xxhash/v2"
 )
 
-// NativeRunner provides the S0+S1 subset of code intelligence using pure Go
+// NativeRunner provides the S0–S3 code intelligence suite using pure Go
 // implementations (no external binary required). It covers:
 //
-//   - GetRepoMap  — builds / loads index.json, produces a ranked file map
-//   - SearchSymbols — BM25-style symbol search over the native index
-//
-// For operations not yet natively ported (search-code, check-duplicate,
-// find-type-usages, validate-cross-deps) the Runner falls back to the exec-shim
-// path (DONMAI_CODE_BIN / donmai-code / pnpm donmai-code).
+//   - GetRepoMap      — builds / loads index.json, produces a ranked file map
+//   - SearchSymbols   — BM25-style symbol search over the native index
+//   - SearchCode      — BM25 full-text search over the symbol corpus (S2)
+//   - CheckDuplicate  — xxHash64 exact + SimHash near-dup detection (S3)
+//   - FindTypeUsages  — regex scan for type reference sites (S3)
+//   - ValidateCrossDeps — cross-package import validator (S3)
 //
 // The native path is the PRIMARY implementation. The exec-shim is ONLY
 // consulted when DONMAI_CODE_BIN is set, which operators can use for testing
@@ -32,17 +32,21 @@ type NativeRunner struct {
 	cwd      string
 	indexDir string
 
-	tsExtractor *TypeScriptExtractor
-	goExtractor *GoExtractor
+	tsExtractor     *TypeScriptExtractor
+	goExtractor     *GoExtractor
+	pythonExtractor *PythonExtractor
+	rustExtractor   *RustExtractor
 }
 
 // NewNativeRunner creates a NativeRunner that operates relative to cwd.
 func NewNativeRunner(cwd string) *NativeRunner {
 	return &NativeRunner{
-		cwd:         cwd,
-		indexDir:    ".donmai/code-index",
-		tsExtractor: &TypeScriptExtractor{},
-		goExtractor: &GoExtractor{},
+		cwd:             cwd,
+		indexDir:        ".donmai/code-index",
+		tsExtractor:     &TypeScriptExtractor{},
+		goExtractor:     &GoExtractor{},
+		pythonExtractor: &PythonExtractor{},
+		rustExtractor:   &RustExtractor{},
 	}
 }
 
@@ -86,7 +90,7 @@ func (n *NativeRunner) saveIndex(idx IndexFile) error {
 // ── file discovery ────────────────────────────────────────────────────────────
 
 // indexableExtensions lists the file extensions whose language is supported by
-// the native extractors (S1 scope: TypeScript/JS + Go).
+// the native extractors (S2 scope: TypeScript/JS + Go + Python + Rust).
 var indexableExtensions = map[string]bool{
 	".ts":  true,
 	".tsx": true,
@@ -95,6 +99,8 @@ var indexableExtensions = map[string]bool{
 	".mjs": true,
 	".cjs": true,
 	".go":  true,
+	".py":  true,
+	".rs":  true,
 }
 
 // skipDirs lists directory names that should never be indexed.
@@ -201,6 +207,10 @@ func (n *NativeRunner) extractAST(source, filePath string) FileAST {
 		return n.tsExtractor.Extract(source, filePath)
 	case ".go":
 		return n.goExtractor.Extract(source, filePath)
+	case ".py":
+		return n.pythonExtractor.Extract(source, filePath)
+	case ".rs":
+		return n.rustExtractor.Extract(source, filePath)
 	default:
 		return FileAST{FilePath: filePath, Language: "unknown"}
 	}
@@ -267,24 +277,13 @@ func (n *NativeRunner) BuildIndex(opts GetRepoMapOptions) (IndexFile, error) {
 	return idx, nil
 }
 
-// computeRootHash produces a stable root hash over the entire file index by
-// XOR-folding xxhash64 of each "<path>:<gitHash>" entry, sorted by path.
-// This is a simplified alternative to the full Merkle tree used by the TS
-// implementation; it guarantees consistency across runs for the same file set.
+// computeRootHash produces a stable root hash over the entire file index using
+// the Merkle tree approach introduced in S3. This replaces the S0/S1 XOR-fold
+// and now matches the TS IncrementalIndexer's tree-based root hash computation.
+//
+// Delegates to RecomputeRootHash (merkle.go).
 func computeRootHash(files map[string]FileIndex) string {
-	keys := make([]string, 0, len(files))
-	for k := range files {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var combined uint64
-	for _, k := range keys {
-		fi := files[k]
-		entry := k + ":" + fi.GitHash
-		combined ^= xxhash.Sum64String(entry)
-	}
-	return fmt.Sprintf("%016x", combined)
+	return RecomputeRootHash(files)
 }
 
 // ── GetRepoMap ────────────────────────────────────────────────────────────────
@@ -497,4 +496,163 @@ func fuzzyMatch(target, query string) bool {
 		}
 	}
 	return true
+}
+
+// ── SearchCode (S2) ───────────────────────────────────────────────────────────
+
+// SearchCodeNative performs full-text BM25 search over the code symbol corpus.
+//
+// The implementation builds (or loads) the code index, collects all symbols
+// into a BM25 inverted index, scores them against the query, and applies an
+// optional language filter and max-results cap.
+//
+// This matches the TS SearchEngine.search + BM25 pipeline:
+//   - Tokenizer: code-aware camelCase / snake_case expansion (bm25.go:tokenize)
+//   - Scoring: Okapi BM25 (k1=1.5, b=0.75)
+//   - Post-processing: exact-name match × 3.0, partial-name match × 1.5
+//   - Returns: []map[string]any with "symbol", "score", "matchType" keys
+//
+// Intentional deviation from TS: the TS SearchEngine holds an in-process
+// symbol set that is rebuilt on indexer flush; the Go implementation rebuilds
+// on every call from the persisted index.json. This is acceptable because the
+// index is persisted to disk and re-read only on content change (incremental).
+func (n *NativeRunner) SearchCodeNative(opts SearchCodeOptions) (any, error) {
+	if opts.Query == "" {
+		return nil, fmt.Errorf("query is required for search-code")
+	}
+
+	idx, err := n.BuildIndex(GetRepoMapOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect all symbols from the index.
+	var allSymbols []CodeSymbol
+	for _, fi := range idx.Files {
+		for _, sym := range fi.Symbols {
+			// Language filter (optional).
+			if opts.Language != "" && sym.Language != opts.Language {
+				continue
+			}
+			allSymbols = append(allSymbols, sym)
+		}
+	}
+
+	if len(allSymbols) == 0 {
+		return []map[string]any{}, nil
+	}
+
+	// Build inverted index + BM25 score.
+	invertedIdx := buildInvertedIndex(allSymbols)
+	scored := bm25Score(opts.Query, invertedIdx)
+
+	queryLower := strings.ToLower(opts.Query)
+	type result struct {
+		symbol    CodeSymbol
+		score     float64
+		matchType string
+	}
+	var results []result
+
+	for _, sd := range scored {
+		sym := allSymbols[sd.docID]
+		finalScore := sd.score
+		matchType := "bm25"
+		nameLower := strings.ToLower(sym.Name)
+		if nameLower == queryLower {
+			matchType = "exact"
+			finalScore *= 3.0
+		} else if strings.Contains(nameLower, queryLower) {
+			matchType = "fuzzy"
+			finalScore *= 1.5
+		}
+		results = append(results, result{sym, finalScore, matchType})
+	}
+
+	// Re-sort after boosting.
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].score > results[j].score
+	})
+
+	maxResults := opts.MaxResults
+	if maxResults <= 0 {
+		maxResults = 20
+	}
+	if maxResults > len(results) {
+		maxResults = len(results)
+	}
+
+	out := make([]map[string]any, 0, maxResults)
+	for _, r := range results[:maxResults] {
+		out = append(out, map[string]any{
+			"symbol":    r.symbol,
+			"score":     r.score,
+			"matchType": r.matchType,
+		})
+	}
+	return out, nil
+}
+
+// ── CheckDuplicate (S3) ───────────────────────────────────────────────────────
+
+// CheckDuplicateNative checks content for exact or near-duplicate matches in
+// the current index using xxHash64 (Tier 1) and SimHash (Tier 2).
+//
+// The threshold defaults to SimHashDefaultThreshold (3), matching the TS
+// DedupPipeline default.
+func (n *NativeRunner) CheckDuplicateNative(opts CheckDuplicateOptions) (any, error) {
+	content := opts.Content
+	if opts.ContentFile != "" {
+		data, err := os.ReadFile(opts.ContentFile) //nolint:gosec
+		if err != nil {
+			return nil, fmt.Errorf("read content file: %w", err)
+		}
+		content = string(data)
+	}
+	if content == "" {
+		return nil, fmt.Errorf("content is required for check-duplicate")
+	}
+
+	idx, err := n.BuildIndex(GetRepoMapOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect FileIndex entries as the corpus.
+	corpus := make([]FileIndex, 0, len(idx.Files))
+	for _, fi := range idx.Files {
+		corpus = append(corpus, fi)
+	}
+
+	result := CheckDuplicateContent(content, corpus, SimHashDefaultThreshold)
+	return map[string]any{
+		"isDuplicate":     result.IsDuplicate,
+		"matchType":       result.MatchType,
+		"existingId":      result.ExistingID,
+		"hammingDistance": result.HammingDistance,
+	}, nil
+}
+
+// ── FindTypeUsages (S3) ───────────────────────────────────────────────────────
+
+// FindTypeUsagesNative finds all usage sites for a named type in the repository.
+// Delegates to the FindTypeUsages function (type_usages.go).
+func (n *NativeRunner) FindTypeUsagesNative(opts FindTypeUsagesOptions) (any, error) {
+	result, err := FindTypeUsages(n.cwd, opts.TypeName, opts.MaxResults)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ── ValidateCrossDeps (S3) ────────────────────────────────────────────────────
+
+// ValidateCrossDepsNative validates cross-package imports in the monorepo.
+// Delegates to ValidateCrossDeps (crossdeps.go).
+func (n *NativeRunner) ValidateCrossDepsNative(opts ValidateCrossDepsOptions) (any, error) {
+	result, err := ValidateCrossDeps(n.cwd, opts.Path)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
