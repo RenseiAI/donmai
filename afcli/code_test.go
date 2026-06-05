@@ -42,7 +42,7 @@ func execCodeCmd(t *testing.T, subArgs ...string) (map[string]any, error) {
 	fakeCodeBin(t)
 
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -118,7 +118,7 @@ func TestCodeGetRepoMap_WithFilePatterns(t *testing.T) {
 func TestCodeSearchSymbols_RequiresArg(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "search-symbols"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when no query provided")
@@ -161,7 +161,7 @@ func TestCodeSearchSymbols_AllFlags(t *testing.T) {
 func TestCodeSearchCode_RequiresArg(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "search-code"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when no query provided")
@@ -195,7 +195,7 @@ func TestCodeSearchCode_WithLanguage(t *testing.T) {
 func TestCodeCheckDuplicate_RequiresContentOrFile(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "check-duplicate"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when neither --content nor --content-file is provided")
@@ -219,7 +219,7 @@ func TestCodeCheckDuplicate_WithContent(t *testing.T) {
 func TestCodeCheckDuplicate_ContentAndFileMutuallyExclusive(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "check-duplicate", "--content", "x", "--content-file", "/tmp/f"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when both --content and --content-file are provided")
@@ -231,7 +231,7 @@ func TestCodeCheckDuplicate_ContentAndFileMutuallyExclusive(t *testing.T) {
 func TestCodeFindTypeUsages_RequiresArg(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "find-type-usages"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when no type name provided")
@@ -302,7 +302,7 @@ func TestCodeCmd_UnavailableBinary(t *testing.T) {
 	}
 
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "get-repo-map"})
 	err := root.Execute()
 	if err == nil {

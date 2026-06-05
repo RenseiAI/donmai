@@ -946,7 +946,7 @@ func writePoolStatsSection(w io.Writer, p *afclient.WorkareaPoolStats) error {
 // ── evict ─────────────────────────────────────────────────────────────────────
 
 // newDaemonEvictCmd returns the `donmai daemon evict` command.
-// Usage: af daemon evict --repo <url> --older-than <duration>
+// Usage: donmai daemon evict --repo <url> --older-than <duration>
 func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 	var (
 		port      int
@@ -1031,7 +1031,7 @@ var allowedCapacityKeys = map[string]struct{}{
 }
 
 // newDaemonSetCmd returns the `donmai daemon set` command.
-// Usage: af daemon set <capacity key> <N>
+// Usage: donmai daemon set <capacity key> <N>
 func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	var (
 		port    int

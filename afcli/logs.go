@@ -1,13 +1,13 @@
 package afcli
 
-// af logs analyze — port of the legacy TypeScript af-analyze-logs tool.
+// logs analyze — port of the legacy TypeScript af-analyze-logs tool.
 // Parses agent log files (path or stdin), detects known failure signatures,
 // and optionally drafts a Linear issue via the internal/linear package.
 //
 // Usage:
 //
-//	af logs analyze [--input <path>] [--config <path>]
-//	                [--dry-run] [--json] [--team <team>] [--project <project>]
+//	donmai logs analyze [--input <path>] [--config <path>]
+//	                    [--dry-run] [--json] [--team <team>] [--project <project>]
 //
 // Signature catalog:
 //
@@ -104,7 +104,7 @@ func defaultSignatureCatalogPath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".config", "af", "log-signatures.yaml")
+	return filepath.Join(home, ".config", "donmai", "log-signatures.yaml")
 }
 
 // ─── core analysis logic ───────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 // Package logsignatures implements the log-signature catalog and pattern-matching
-// logic for the `af logs analyze` command.
+// logic for the `donmai logs analyze` command.
 //
 // It is a Go port of the PATTERN_RULES array in the legacy TypeScript
 // packages/core/src/orchestrator/log-analyzer.ts.
@@ -7,7 +7,7 @@
 // # Catalog loading
 //
 // DefaultSignatures() returns the built-in catalog ported from the TS reference.
-// LoadCatalog(path) merges a YAML override file from ~/.config/af/log-signatures.yaml
+// LoadCatalog(path) merges a YAML override file from ~/.config/donmai/log-signatures.yaml
 // (or any explicit path) on top of the defaults.
 //
 // # Matching
