@@ -89,6 +89,13 @@ type RegisterRequest struct {
 	// SSH-ing to the host. Omitted when the daemon yaml has no projects[]
 	// entries; the platform falls back to "unknown / unrestricted" semantics.
 	DaemonProjects []ProjectAllowlistEntry `json:"daemonProjects,omitempty"`
+
+	// ProjectIDs is the list of platform project UUIDs this daemon is claiming
+	// beyond the primary project encoded in the registration token. The platform
+	// validates each extra UUID belongs to the same org as the token and unions
+	// the tracker keys across all claimed projects. Omitempty — older daemon
+	// versions that omit this field are treated as single-project workers.
+	ProjectIDs []string `json:"projectIds,omitempty"`
 }
 
 // ProjectAllowlistEntry is the wire shape for a single allowlisted project

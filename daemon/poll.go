@@ -616,8 +616,8 @@ func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*Proje
 // AcceptWork time, but the explicit log makes the resolution failure
 // observable immediately at poll dispatch.
 func pollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
-	repo, _ := resolveAllowlistedRepo(item, projects)
-	return SessionSpec{
+	repo, matched := resolveAllowlistedRepo(item, projects)
+	spec := SessionSpec{
 		SessionID:          item.SessionID,
 		Repository:         repo,
 		Ref:                item.Ref,
@@ -625,6 +625,10 @@ func pollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		Env:                item.Env,
 		MaxDurationSeconds: item.MaxDuration,
 	}
+	if matched != nil {
+		spec.ProjectName = matched.ID
+	}
+	return spec
 }
 
 // resolveAllowlistedRepo returns the canonical clone URL for a poll
