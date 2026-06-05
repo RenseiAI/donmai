@@ -70,7 +70,7 @@ func newWorkareaCmdWithFactory(factory workareaClientFactory) *cobra.Command {
 		Use:   "workarea",
 		Short: "Inspect and manage local-daemon workareas",
 		Long: `Commands for listing, inspecting, restoring, and diffing workareas
-on the local af daemon.
+on the local donmai daemon.
 
 Workareas are queried from the daemon's HTTP control API at
 http://127.0.0.1:7734 by default. Set ` + workareaEnvDaemonURL + ` to override.

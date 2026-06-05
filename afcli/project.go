@@ -42,27 +42,28 @@ func defaultConfigRW() configReaderWriter {
 // newProjectCmd constructs the `project` parent command. It holds no logic of
 // its own; it dispatches to subcommands that manage the daemon's project
 // allowlist and per-project credentials in ~/.donmai/daemon.yaml.
-func newProjectCmd() *cobra.Command {
-	return newProjectCmdWithRW(defaultConfigRW())
+func newProjectCmd(cfg Config) *cobra.Command {
+	return newProjectCmdWithRW(defaultConfigRW(), cfg)
 }
 
 // newProjectCmdWithRW is the injectable variant used in tests.
-func newProjectCmdWithRW(rw configReaderWriter) *cobra.Command {
+func newProjectCmdWithRW(rw configReaderWriter, cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "project",
 		Short: "Manage the daemon's project allowlist and credentials",
-		Long: "Manage the local rensei-daemon's project allowlist.\n\n" +
+		Long: "Manage the local daemon's project allowlist.\n\n" +
 			"Projects must be explicitly allowed before the daemon will accept work\n" +
 			"for them. Credentials can be configured interactively or later via\n" +
-			"`donmai project credentials`.\n\n" +
+			"`" + bin + " project credentials`.\n\n" +
 			"Config is written to ~/.donmai/daemon.yaml atomically.\n" +
 			"The daemon reloads on SIGHUP or restart.",
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newProjectAllowCmd(rw))
+	cmd.AddCommand(newProjectAllowCmd(rw, bin))
 	cmd.AddCommand(newProjectCredentialsCmd(rw))
-	cmd.AddCommand(newProjectListCmd(rw))
+	cmd.AddCommand(newProjectListCmd(rw, bin))
 	cmd.AddCommand(newProjectRemoveCmd(rw))
 
 	return cmd
@@ -70,7 +71,7 @@ func newProjectCmdWithRW(rw configReaderWriter) *cobra.Command {
 
 // ── allow ─────────────────────────────────────────────────────────────────────
 
-func newProjectAllowCmd(rw configReaderWriter) *cobra.Command {
+func newProjectAllowCmd(rw configReaderWriter, bin string) *cobra.Command {
 	var (
 		noCredentials  bool
 		nonInteractive bool
@@ -139,7 +140,7 @@ func newProjectAllowCmd(rw configReaderWriter) *cobra.Command {
 			if entry.CredentialHelper == nil {
 				_, _ = fmt.Fprintln(out,
 					"  No credentials configured — daemon will refuse work until credentials are added.\n"+
-						"  Run: af project credentials "+repoURL,
+						"  Run: "+bin+" project credentials "+repoURL,
 				)
 			} else {
 				_, _ = fmt.Fprintf(out, "  credential helper: %s\n", entry.CredentialHelper.Kind)
@@ -234,7 +235,7 @@ func newProjectCredentialsCmd(rw configReaderWriter) *cobra.Command {
 
 // ── list ──────────────────────────────────────────────────────────────────────
 
-func newProjectListCmd(rw configReaderWriter) *cobra.Command {
+func newProjectListCmd(rw configReaderWriter, bin string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List all allowed projects",
@@ -252,7 +253,7 @@ func newProjectListCmd(rw configReaderWriter) *cobra.Command {
 			if len(cfg.Projects) == 0 {
 				_, _ = fmt.Fprintln(out,
 					"No projects in the allowlist.\n"+
-						"  Add one with: af project allow <repo-url>",
+						"  Add one with: "+bin+" project allow <repo-url>",
 				)
 				return nil
 			}

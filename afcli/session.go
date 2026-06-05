@@ -19,7 +19,7 @@ func newSessionCmd(ds func() afclient.DataSource, projectFunc func() string) *co
 	cmd := &cobra.Command{
 		Use:          "session",
 		Short:        "Inspect and control agent sessions",
-		Long:         "Inspect and control AgentFactory agent sessions. Use subcommands like `list` to query sessions.",
+		Long:         "Inspect and control Donmai agent sessions. Use subcommands like `list` to query sessions.",
 		SilenceUsage: true,
 	}
 
@@ -41,7 +41,7 @@ func newSessionCmd(ds func() afclient.DataSource, projectFunc func() string) *co
 	promptSub := newAgentChatCmd(ds)
 	promptSub.Use = "prompt <session-id> <message>"
 	promptSub.Short = "Forward a prompt to a running agent session"
-	promptSub.Long = "Forward a prompt message to a running AgentFactory session via the coordinator forward-prompt API."
+	promptSub.Long = "Forward a prompt message to a running Donmai session via the coordinator forward-prompt API."
 
 	cmd.AddCommand(listSub)
 	cmd.AddCommand(showSub)

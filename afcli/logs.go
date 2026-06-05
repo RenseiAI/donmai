@@ -1,18 +1,18 @@
 package afcli
 
-// af logs analyze — port of the legacy TypeScript af-analyze-logs tool.
+// logs analyze — port of the legacy TypeScript af-analyze-logs tool.
 // Parses agent log files (path or stdin), detects known failure signatures,
 // and optionally drafts a Linear issue via the internal/linear package.
 //
 // Usage:
 //
-//	af logs analyze [--input <path>] [--config <path>]
-//	                [--dry-run] [--json] [--team <team>] [--project <project>]
+//	donmai logs analyze [--input <path>] [--config <path>]
+//	                    [--dry-run] [--json] [--team <team>] [--project <project>]
 //
 // Signature catalog:
 //
 //	Defaults are compiled from the TS PATTERN_RULES.
-//	Override or extend via ~/.config/af/log-signatures.yaml.
+//	Override or extend via ~/.config/donmai/log-signatures.yaml.
 
 import (
 	"bufio"
@@ -65,23 +65,23 @@ API (LINEAR_API_KEY must be set).
 
 Signature catalog:
   Default signatures are built in (ported from the TypeScript reference).
-  Override or extend via ~/.config/af/log-signatures.yaml or --config.
+  Override or extend via ~/.config/donmai/log-signatures.yaml or --config.
 
 Examples:
   # Analyze a log file (human-readable output)
-  af logs analyze --input /path/to/agent.log
+  donmai logs analyze --input /path/to/agent.log
 
   # Pipe from stdin
-  cat agent.log | af logs analyze
+  cat agent.log | donmai logs analyze
 
   # Dry-run: print what would be filed without posting
-  af logs analyze --input agent.log --dry-run
+  donmai logs analyze --input agent.log --dry-run
 
   # Machine-readable JSON output
-  af logs analyze --input agent.log --json
+  donmai logs analyze --input agent.log --json
 
   # Post a Linear issue to a specific team
-  af logs analyze --input agent.log --team "Engineering" --project "Agent"`,
+  donmai logs analyze --input agent.log --team "Engineering" --project "Agent"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runLogsAnalyze(cmd, inputPath, configPath, dryRun, jsonOutput, teamName, projectName)
@@ -98,13 +98,13 @@ Examples:
 	return cmd
 }
 
-// defaultSignatureCatalogPath returns ~/.config/af/log-signatures.yaml.
+// defaultSignatureCatalogPath returns ~/.config/donmai/log-signatures.yaml.
 func defaultSignatureCatalogPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".config", "af", "log-signatures.yaml")
+	return filepath.Join(home, ".config", "donmai", "log-signatures.yaml")
 }
 
 // ─── core analysis logic ───────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ type DraftedIssue struct {
 	URL        string `json:"url,omitempty"`
 }
 
-// runLogsAnalyze is the implementation of `af logs analyze`.
+// runLogsAnalyze is the implementation of `donmai logs analyze`.
 func runLogsAnalyze(
 	cmd *cobra.Command,
 	inputPath, configPath string,
@@ -465,7 +465,7 @@ func postDrafts(ctx context.Context, drafts []DraftedIssue, teamName, projectNam
 // ─── human-readable output ────────────────────────────────────────────────────
 
 func printHumanResult(w io.Writer, r AnalysisResult, dryRun bool) {
-	_, _ = fmt.Fprintf(w, "\n=== AgentFactory Log Analyzer ===\n\n")
+	_, _ = fmt.Fprintf(w, "\n=== Donmai Log Analyzer ===\n\n")
 	if dryRun {
 		_, _ = fmt.Fprintf(w, "[DRY RUN MODE — No issues will be created]\n\n")
 	}

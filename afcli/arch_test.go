@@ -36,7 +36,7 @@ func execArchCmd(t *testing.T, subArgs ...string) (map[string]any, error) {
 	fakeArchBin(t)
 
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newArchCmd())
+	root.AddCommand(newArchCmd(Config{}))
 
 	oldOut := os.Stdout
 	r, w, _ := os.Pipe()
@@ -181,7 +181,7 @@ func TestArchCmd_UnavailableBinary(t *testing.T) {
 	}
 
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newArchCmd())
+	root.AddCommand(newArchCmd(Config{}))
 	root.SetArgs([]string{"arch", "assess", "https://github.com/org/repo/pull/1"})
 	err := root.Execute()
 	if err == nil {
@@ -195,7 +195,7 @@ func TestArchCmd_UnavailableBinary(t *testing.T) {
 // ── Command tree structure ────────────────────────────────────────────────────
 
 func TestArchCmd_SubcommandsExist(t *testing.T) {
-	root := newArchCmd()
+	root := newArchCmd(Config{})
 	names := make(map[string]bool)
 	for _, sub := range root.Commands() {
 		names[sub.Name()] = true
@@ -206,7 +206,7 @@ func TestArchCmd_SubcommandsExist(t *testing.T) {
 }
 
 func TestCodeCmd_SubcommandsExist(t *testing.T) {
-	root := newCodeCmd()
+	root := newCodeCmd(Config{})
 	names := make(map[string]bool)
 	for _, sub := range root.Commands() {
 		names[sub.Name()] = true

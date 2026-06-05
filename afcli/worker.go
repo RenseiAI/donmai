@@ -13,7 +13,7 @@ import (
 func newWorkerCmd(_ func() afclient.DataSource) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "worker",
-		Short:        "Run an AgentFactory worker process",
+		Short:        "Run a Donmai worker process",
 		Long:         "Register with the coordinator, poll for work, and heartbeat. Intended as a single foreground worker process; use `donmai fleet` for multi-process supervision.",
 		SilenceUsage: true,
 	}

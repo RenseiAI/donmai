@@ -12,7 +12,7 @@ import (
 // newGovernorStopCmd constructs the `governor stop` subcommand.
 // It reads the saved PID, sends SIGTERM, waits up to 10 seconds
 // for graceful shutdown, then SIGKILL if needed.
-func newGovernorStopCmd() *cobra.Command {
+func newGovernorStopCmd(bin string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "stop",
 		Short:        "Stop the running governor",
@@ -21,7 +21,10 @@ func newGovernorStopCmd() *cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) error {
 			pid, err := loadPID(governorPIDName)
 			if err != nil {
-				return fmt.Errorf("governor not running: %w", err)
+				return userError(
+					"governor is not running",
+					"start it with `"+bin+" governor start`",
+				)
 			}
 
 			proc, err := os.FindProcess(pid)
@@ -33,7 +36,10 @@ func newGovernorStopCmd() *cobra.Command {
 			// Check if the process is actually running.
 			if err := proc.Signal(syscall.Signal(0)); err != nil {
 				_ = removePIDFile(governorPIDName)
-				return fmt.Errorf("governor (PID %d) is not running (stale pid file removed)", pid)
+				return userError(
+					"governor is not running (stale pid file removed)",
+					"start it with `"+bin+" governor start`",
+				)
 			}
 
 			// Send SIGTERM for graceful shutdown.

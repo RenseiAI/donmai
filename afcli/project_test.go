@@ -47,7 +47,7 @@ func (m *mockConfigRW) WriteConfig(cfg *afclient.DaemonYAML) error {
 // simulated stdin, then executes it with args.  Returns stdout+stderr and any
 // execution error.
 func newTestProjectCmd(rw configReaderWriter, stdin string, args []string) (*bytes.Buffer, error) {
-	cmd := newProjectCmdWithRW(rw)
+	cmd := newProjectCmdWithRW(rw, Config{})
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
