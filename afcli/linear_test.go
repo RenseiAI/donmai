@@ -66,7 +66,7 @@ func runLinearCmd(t *testing.T, _ string, args ...string) (string, error) {
 	// Build a fresh linear command tree. The DataSource factory is nil for
 	// these tests — they exercise the env-var path (setTestBaseURL +
 	// LINEAR_API_KEY) which short-circuits before the DataSource branch.
-	root := newLinearCmd(nil)
+	root := newLinearCmd(nil, Config{})
 	root.SilenceErrors = true
 
 	// Capture stdout.
@@ -851,7 +851,7 @@ func TestLinearProxyModeViaDataSource(t *testing.T) {
 		return afclient.NewAuthenticatedClient(srv.URL, "rsk_test_token")
 	}
 
-	root := newLinearCmd(ds)
+	root := newLinearCmd(ds, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -894,7 +894,7 @@ func TestLinearWorkerAuthTokenProxyMode(t *testing.T) {
 	t.Setenv("WORKER_AUTH_TOKEN", jwt)
 	t.Setenv("DONMAI_API_URL", srv.URL)
 
-	root := newLinearCmd(nil)
+	root := newLinearCmd(nil, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -925,7 +925,7 @@ func TestLinearWorkerAuthTokenRequiresBaseURL(t *testing.T) {
 	setTestBaseURL("")
 	t.Cleanup(func() { setTestBaseURL("") })
 
-	if _, err := newLinearClient(nil); err == nil {
+	if _, err := newLinearClient(nil, "donmai"); err == nil {
 		t.Fatal("expected error when WORKER_AUTH_TOKEN is set but no platform URL, got nil")
 	}
 }
@@ -955,7 +955,7 @@ func TestLinearEnvWinsOverDataSource(t *testing.T) {
 		return afclient.NewAuthenticatedClient("https://platform.example.com", "rsk_should_not_be_used")
 	}
 
-	root := newLinearCmd(ds)
+	root := newLinearCmd(ds, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -982,7 +982,7 @@ func TestLinearNoAPIKey(t *testing.T) {
 
 	// Pass a nil DataSource factory — exercises path 3 (no env, no
 	// authenticated DataSource → friendly error).
-	root := newLinearCmd(nil)
+	root := newLinearCmd(nil, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)

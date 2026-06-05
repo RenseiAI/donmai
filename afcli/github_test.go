@@ -50,7 +50,7 @@ func setupGitHubTest(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 // and returns captured stdout + any error.
 func runGitHubCmd(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	root := newGitHubCmd(nil)
+	root := newGitHubCmd(nil, Config{})
 	root.SilenceErrors = true
 
 	var buf bytes.Buffer
@@ -622,7 +622,7 @@ func TestGitHubNoToken(t *testing.T) {
 	setGitHubTestBaseURL("")
 	t.Cleanup(func() { setGitHubTestBaseURL("") })
 
-	root := newGitHubCmd(nil)
+	root := newGitHubCmd(nil, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -685,7 +685,7 @@ func TestGitHubProxyModeViaDataSource(t *testing.T) {
 		return afclient.NewAuthenticatedClient(srv.URL, "rsk_test_proxy_token")
 	}
 
-	root := newGitHubCmd(ds)
+	root := newGitHubCmd(ds, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)

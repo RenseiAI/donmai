@@ -17,7 +17,7 @@ func newArchCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "arch",
 		Short: "Architectural intelligence — drift detection for PRs and commits",
-		Long: `Architectural intelligence commands powered by @renseiai/architectural-intelligence.
+		Long: `Architectural intelligence commands powered by @donmai/architectural-intelligence.
 
 Detects deviations between a PR/commit and the stored architectural baseline.
 All commands output JSON to stdout by default.
@@ -34,8 +34,8 @@ Environment:
 
 Binary resolution (in order):
   1. DONMAI_ARCH_BIN env var (legacy: AGENTFACTORY_ARCH_BIN) — explicit override
-  2. af-arch on PATH (npm install -g @renseiai/agentfactory-cli)
-  3. pnpm af-arch (monorepo dev)`,
+  2. donmai-arch on PATH (npm install -g @donmai/cli)
+  3. pnpm donmai-arch (monorepo dev)`,
 		SilenceUsage: true,
 	}
 

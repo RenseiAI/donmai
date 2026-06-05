@@ -106,7 +106,7 @@ func BuildConfigFile(servers []agent.MCPServerConfig) (ConfigFile, error) {
 // Builder writes per-session MCP config tmpfiles.
 //
 // The zero value is valid: TempDir defaults to os.TempDir() and Prefix
-// defaults to "agentfactory-mcp-".
+// defaults to "donmai-mcp-".
 type Builder struct {
 	// TempDir is the directory tmpfiles are created in. Empty falls
 	// back to os.TempDir(). Tests inject a t.TempDir() value.
@@ -152,7 +152,7 @@ func (b *Builder) Build(servers []agent.MCPServerConfig) (path string, cleanup f
 	}
 	prefix := b.Prefix
 	if prefix == "" {
-		prefix = "agentfactory-mcp-"
+		prefix = "donmai-mcp-"
 	}
 
 	f, err := os.CreateTemp(tempDir, prefix+"*.json")

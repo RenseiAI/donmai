@@ -1,5 +1,5 @@
 // Package codeintel provides a shell-out bridge to the TypeScript
-// @renseiai/agentfactory-code-intelligence CLI (pnpm af-code).
+// @donmai/cli (donmai-code).
 //
 // # Architectural choice: shell-out bridge (Phase D parity)
 //
@@ -11,7 +11,7 @@
 //     guarantee when TS owns the indexing entirely.
 //  3. Phase D goal is parity, not re-implementation.
 //
-// This package shells out to `pnpm af-code` (resolving via PATH or
+// This package shells out to `pnpm donmai-code` (resolving via PATH or
 // DONMAI_CODE_BIN env var) and returns the parsed JSON output.
 //
 // A future issue (post-Wave 4) can replace the shell-out with native Go
@@ -21,8 +21,8 @@
 //
 // The binary is resolved in this order:
 //  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override for non-monorepo users
-//  2. `af-code` on PATH (installed via `npm install -g @renseiai/agentfactory-cli`)
-//  3. `pnpm af-code` via pnpm run in the current working directory (monorepo dev)
+//  2. `donmai-code` on PATH (installed via `npm install -g @donmai/cli`)
+//  3. `pnpm donmai-code` via pnpm run in the current working directory (monorepo dev)
 //
 // If none of those resolve, every command returns an ErrNotAvailable error with
 // clear installation instructions. The caller surfaces this gracefully rather
@@ -40,21 +40,21 @@ import (
 	"github.com/RenseiAI/donmai/internal/envcompat"
 )
 
-// ErrNotAvailable is returned when the af-code binary cannot be found.
+// ErrNotAvailable is returned when the donmai-code binary cannot be found.
 // Callers should surface this with instructions rather than treating it as a
 // fatal error.
 var ErrNotAvailable = errors.New(
-	"af-code binary not found — install @renseiai/agentfactory-cli globally " +
-		"(`npm install -g @renseiai/agentfactory-cli`) or set DONMAI_CODE_BIN",
+	"donmai-code binary not found — install @donmai/cli globally " +
+		"(`npm install -g @donmai/cli`) or set DONMAI_CODE_BIN",
 )
 
-// ErrArchNotAvailable is returned when the af-arch binary cannot be found.
+// ErrArchNotAvailable is returned when the donmai-arch binary cannot be found.
 var ErrArchNotAvailable = errors.New(
-	"af-arch binary not found — install @renseiai/agentfactory-cli globally " +
-		"(`npm install -g @renseiai/agentfactory-cli`) or set DONMAI_ARCH_BIN",
+	"donmai-arch binary not found — install @donmai/cli globally " +
+		"(`npm install -g @donmai/cli`) or set DONMAI_ARCH_BIN",
 )
 
-// Runner wraps the af-code / af-arch CLI binaries and exposes each command as
+// Runner wraps the donmai-code / donmai-arch CLI binaries and exposes each command as
 // a typed Go function. All public methods return raw JSON-decoded output as
 // map[string]any or []any, matching the TS CLI's JSON-to-stdout contract.
 type Runner struct {
@@ -70,7 +70,7 @@ func New(cwd string) *Runner {
 	return &Runner{cwd: cwd}
 }
 
-// resolveCodeBin finds the af-code binary using the priority chain described
+// resolveCodeBin finds the donmai-code binary using the priority chain described
 // in the package doc.
 func (r *Runner) resolveCodeBin() ([]string, error) {
 	if r.codeBinCache != "" {
@@ -83,22 +83,22 @@ func (r *Runner) resolveCodeBin() ([]string, error) {
 		return strings.Fields(v), nil
 	}
 
-	// 2. af-code on PATH.
-	if p, err := exec.LookPath("af-code"); err == nil {
+	// 2. donmai-code on PATH.
+	if p, err := exec.LookPath("donmai-code"); err == nil {
 		r.codeBinCache = p
 		return []string{p}, nil
 	}
 
-	// 3. pnpm af-code (monorepo).
+	// 3. pnpm donmai-code (monorepo).
 	if p, err := exec.LookPath("pnpm"); err == nil {
-		r.codeBinCache = p + " af-code"
-		return []string{p, "af-code"}, nil
+		r.codeBinCache = p + " donmai-code"
+		return []string{p, "donmai-code"}, nil
 	}
 
 	return nil, ErrNotAvailable
 }
 
-// resolveArchBin finds the af-arch binary.
+// resolveArchBin finds the donmai-arch binary.
 func (r *Runner) resolveArchBin() ([]string, error) {
 	if r.archBinCache != "" {
 		return strings.Fields(r.archBinCache), nil
@@ -110,22 +110,22 @@ func (r *Runner) resolveArchBin() ([]string, error) {
 		return strings.Fields(v), nil
 	}
 
-	// 2. af-arch on PATH.
-	if p, err := exec.LookPath("af-arch"); err == nil {
+	// 2. donmai-arch on PATH.
+	if p, err := exec.LookPath("donmai-arch"); err == nil {
 		r.archBinCache = p
 		return []string{p}, nil
 	}
 
-	// 3. pnpm af-arch (monorepo).
+	// 3. pnpm donmai-arch (monorepo).
 	if p, err := exec.LookPath("pnpm"); err == nil {
-		r.archBinCache = p + " af-arch"
-		return []string{p, "af-arch"}, nil
+		r.archBinCache = p + " donmai-arch"
+		return []string{p, "donmai-arch"}, nil
 	}
 
 	return nil, ErrArchNotAvailable
 }
 
-// runCode executes af-code <args...> in r.cwd and JSON-decodes stdout.
+// runCode executes donmai-code <args...> in r.cwd and JSON-decodes stdout.
 func (r *Runner) runCode(args ...string) (any, error) {
 	binArgs, err := r.resolveCodeBin()
 	if err != nil {
@@ -146,12 +146,12 @@ func (r *Runner) run(bin []string, extraArgs []string) (any, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("af-code %s: %w\nstderr: %s", strings.Join(extraArgs, " "), err, stderr.String())
+		return nil, fmt.Errorf("donmai-code %s: %w\nstderr: %s", strings.Join(extraArgs, " "), err, stderr.String())
 	}
 
 	var result any
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return nil, fmt.Errorf("af-code %s: invalid JSON output: %w\nstdout: %s", strings.Join(extraArgs, " "), err, stdout.String())
+		return nil, fmt.Errorf("donmai-code %s: invalid JSON output: %w\nstdout: %s", strings.Join(extraArgs, " "), err, stdout.String())
 	}
 	return result, nil
 }
@@ -164,7 +164,7 @@ type GetRepoMapOptions struct {
 	FilePatterns []string
 }
 
-// GetRepoMap runs `af-code get-repo-map`.
+// GetRepoMap runs `donmai-code get-repo-map`.
 func (r *Runner) GetRepoMap(opts GetRepoMapOptions) (any, error) {
 	args := []string{"get-repo-map"}
 	if opts.MaxFiles > 0 {
@@ -184,7 +184,7 @@ type SearchSymbolsOptions struct {
 	FilePattern string
 }
 
-// SearchSymbols runs `af-code search-symbols <query>`.
+// SearchSymbols runs `donmai-code search-symbols <query>`.
 func (r *Runner) SearchSymbols(opts SearchSymbolsOptions) (any, error) {
 	if opts.Query == "" {
 		return nil, fmt.Errorf("query is required for search-symbols")
@@ -209,7 +209,7 @@ type SearchCodeOptions struct {
 	Language   string
 }
 
-// SearchCode runs `af-code search-code <query>`.
+// SearchCode runs `donmai-code search-code <query>`.
 func (r *Runner) SearchCode(opts SearchCodeOptions) (any, error) {
 	if opts.Query == "" {
 		return nil, fmt.Errorf("query is required for search-code")
@@ -230,7 +230,7 @@ type CheckDuplicateOptions struct {
 	ContentFile string
 }
 
-// CheckDuplicate runs `af-code check-duplicate`.
+// CheckDuplicate runs `donmai-code check-duplicate`.
 func (r *Runner) CheckDuplicate(opts CheckDuplicateOptions) (any, error) {
 	if opts.Content == "" && opts.ContentFile == "" {
 		return nil, fmt.Errorf("either --content or --content-file is required for check-duplicate")
@@ -250,7 +250,7 @@ type FindTypeUsagesOptions struct {
 	MaxResults int
 }
 
-// FindTypeUsages runs `af-code find-type-usages <TypeName>`.
+// FindTypeUsages runs `donmai-code find-type-usages <TypeName>`.
 func (r *Runner) FindTypeUsages(opts FindTypeUsagesOptions) (any, error) {
 	if opts.TypeName == "" {
 		return nil, fmt.Errorf("type name is required for find-type-usages")
@@ -267,7 +267,7 @@ type ValidateCrossDepsOptions struct {
 	Path string // Optional scoping path
 }
 
-// ValidateCrossDeps runs `af-code validate-cross-deps [path]`.
+// ValidateCrossDeps runs `donmai-code validate-cross-deps [path]`.
 func (r *Runner) ValidateCrossDeps(opts ValidateCrossDepsOptions) (any, error) {
 	args := []string{"validate-cross-deps"}
 	if opts.Path != "" {
@@ -278,7 +278,7 @@ func (r *Runner) ValidateCrossDeps(opts ValidateCrossDepsOptions) (any, error) {
 
 // ── af arch commands ──────────────────────────────────────────────────────────
 
-// ArchAssessOptions holds the flags for af-arch assess.
+// ArchAssessOptions holds the flags for donmai-arch assess.
 type ArchAssessOptions struct {
 	// PrURL is the full GitHub PR URL (e.g. https://github.com/org/repo/pull/123).
 	// Takes precedence over Repository+PrNumber when both are provided.
@@ -307,7 +307,7 @@ type ArchAssessOptions struct {
 	Summary bool
 }
 
-// ArchAssess runs `af-arch assess`.
+// ArchAssess runs `donmai-arch assess`.
 // Exit code 1 from the subprocess means the gate was triggered — this is
 // mapped to an ErrGateTriggered sentinel rather than a generic error so callers
 // can handle it without parsing stderr.
@@ -360,7 +360,7 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 	if errors.As(runErr, &exitErr) {
 		exitCode = exitErr.ExitCode()
 	} else if runErr != nil {
-		return nil, fmt.Errorf("af-arch assess: %w\nstderr: %s", runErr, stderr.String())
+		return nil, fmt.Errorf("donmai-arch assess: %w\nstderr: %s", runErr, stderr.String())
 	}
 
 	if opts.Summary {
@@ -373,7 +373,7 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 
 	var result any
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return nil, fmt.Errorf("af-arch assess: invalid JSON output: %w\nstdout: %s", err, stdout.String())
+		return nil, fmt.Errorf("donmai-arch assess: invalid JSON output: %w\nstdout: %s", err, stdout.String())
 	}
 
 	// Inject gated flag if exit code indicates it.
@@ -386,13 +386,13 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 	return result, nil
 }
 
-// IsCodeAvailable returns true if the af-code binary can be found.
+// IsCodeAvailable returns true if the donmai-code binary can be found.
 func (r *Runner) IsCodeAvailable() bool {
 	_, err := r.resolveCodeBin()
 	return err == nil
 }
 
-// IsArchAvailable returns true if the af-arch binary can be found.
+// IsArchAvailable returns true if the donmai-arch binary can be found.
 func (r *Runner) IsArchAvailable() bool {
 	_, err := r.resolveArchBin()
 	return err == nil

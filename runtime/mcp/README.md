@@ -23,7 +23,7 @@ defer cleanup()
       "args": ["linear-mcp"],
       "env": { "LINEAR_API_KEY": "..." }
     },
-    "af-code": {
+    "donmai-code": {
       "type": "stdio",
       "command": "/usr/local/bin/af",
       "args": ["code-mcp"]

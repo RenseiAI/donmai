@@ -12,7 +12,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient/repoconfig"
 )
 
-// orchestratorFlags holds the parsed flag values for `af orchestrator`.
+// orchestratorFlags holds the parsed flag values for `donmai orchestrator`.
 // Factored out so unit tests can inspect defaults without executing RunE.
 type orchestratorFlags struct {
 	project   string
@@ -26,9 +26,9 @@ type orchestratorFlags struct {
 	quiet     bool
 }
 
-// newOrchestratorCmd constructs the `af orchestrator` command.
+// newOrchestratorCmd constructs the `donmai orchestrator` command.
 //
-// Flags match the legacy `pnpm af-orchestrator` entrypoint:
+// Flags match the legacy `pnpm donmai-orchestrator` entrypoint:
 //
 //	--project    Filter issues by Linear project name
 //	--single     Process exactly one issue by ID / identifier
@@ -123,7 +123,7 @@ func runOrchestrator(_ *cobra.Command, flags *orchestratorFlags) error {
 
 	// Banner — mirrors the TS orchestrator output.
 	if !flags.quiet {
-		_, _ = fmt.Fprintf(os.Stdout, "AgentFactory Orchestrator\n")
+		_, _ = fmt.Fprintf(os.Stdout, "Donmai Orchestrator\n")
 		_, _ = fmt.Fprintf(os.Stdout, "=========================\n")
 		projectLabel := flags.project
 		if projectLabel == "" {

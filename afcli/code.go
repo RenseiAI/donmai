@@ -19,7 +19,7 @@ func newCodeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "code",
 		Short: "Code intelligence — repo maps, symbol search, BM25, dedup, type usages, cross-dep validation",
-		Long: `Code intelligence commands powered by @renseiai/agentfactory-code-intelligence.
+		Long: `Code intelligence commands powered by @donmai/code-intelligence.
 
 All commands output JSON to stdout. The first invocation builds the index
 (~5-10s); subsequent calls reuse the persisted index from .donmai/code-index/.
@@ -30,8 +30,8 @@ Optional env vars for enhanced search:
 
 Binary resolution (in order):
   1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override
-  2. af-code on PATH (npm install -g @renseiai/agentfactory-cli)
-  3. pnpm af-code (monorepo dev)`,
+  2. donmai-code on PATH (npm install -g @donmai/cli)
+  3. pnpm donmai-code (monorepo dev)`,
 		SilenceUsage: true,
 	}
 

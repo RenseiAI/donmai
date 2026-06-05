@@ -21,7 +21,7 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "chat <session-id> <message>",
 		Short:        "Forward a message to a running agent session",
-		Long:         "Forward a chat message to a running AgentFactory session via the coordinator forward-prompt API.",
+		Long:         "Forward a chat message to a running Donmai session via the coordinator forward-prompt API.",
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {

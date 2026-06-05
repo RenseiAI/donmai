@@ -185,7 +185,7 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 	}
 
 	cmd.PersistentFlags().BoolVar(&flags.mock, "mock", false, "Use mock data instead of live API")
-	cmd.PersistentFlags().StringVar(&flags.url, "url", resolveDefaultURL(), "AgentFactory server URL")
+	cmd.PersistentFlags().StringVar(&flags.url, "url", resolveDefaultURL(), "Donmai server URL")
 	cmd.PersistentFlags().StringVar(&flags.apiKey, "api-key", "", "API key for authenticated requests (env: WORKER_API_KEY)")
 	cmd.PersistentFlags().BoolVar(&flags.debug, "debug", false, "Enable debug logging")
 	cmd.PersistentFlags().BoolVar(&flags.quiet, "quiet", false, "Suppress all log output")

@@ -91,7 +91,7 @@ func (m *mockDaemon) SetCapacityConfig(key, value string) (*afclient.SetCapacity
 // Each call creates an independent command tree — safe for parallel tests.
 func newTestDaemonCmd(mock daemonDoer, args []string) (*bytes.Buffer, error) {
 	factory := func(_ afclient.DaemonConfig) daemonDoer { return mock }
-	cmd := newDaemonCmdWithFactory(factory, "test")
+	cmd := newDaemonCmdWithFactory(factory, Config{HostBinaryVersion: "test"})
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -136,10 +136,10 @@ func fixtureActionResp() *afclient.DaemonActionResponse {
 	return &afclient.DaemonActionResponse{OK: true, Message: "accepted"}
 }
 
-// ── install / uninstall (in-process; REN-1406) ────────────────────────────────
+// ── install / uninstall (in-process) ────────────────────────────────────────────
 //
 // Install/uninstall/doctor used to shell out to a Node `rensei-daemon`
-// subprocess; REN-1406 ports them into Go and dispatches in-process via
+// subprocess; they are implemented in-process via
 // installer. The tests below pin the in-process integration:
 // install writes a unit/plist, uninstall removes it, and doctor inspects it.
 
@@ -148,7 +148,7 @@ func fixtureActionResp() *afclient.DaemonActionResponse {
 func TestDaemonInstallHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd := newDaemonInstallCmd()
+	cmd := newDaemonInstallCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -166,8 +166,7 @@ func TestDaemonInstallHelp(t *testing.T) {
 
 // TestDaemonInstallInProcessRegistersDaemonRun verifies the install command
 // dispatches to the Go installer in-process — writing a unit/plist that
-// registers `<host-binary> daemon run` (the locked REN-1406 decision) and
-// emitting the REN-1408 follow-up note in the success message.
+// registers `<host-binary> daemon run`.
 //
 // IMPORTANT: this test passes --skip-service-manager so it never invokes
 // launchctl/systemctl. Without that flag, the underlying installer
@@ -190,7 +189,7 @@ func TestDaemonInstallInProcessRegistersDaemonRun(t *testing.T) {
 		t.Fatalf("seed fake host binary: %v", err)
 	}
 
-	cmd := newDaemonInstallCmd()
+	cmd := newDaemonInstallCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -209,9 +208,6 @@ func TestDaemonInstallInProcessRegistersDaemonRun(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, hostBin+" daemon run") {
 		t.Errorf("expected install output to register `<bin> daemon run`, got:\n%s", out)
-	}
-	if !strings.Contains(out, "REN-1408") {
-		t.Errorf("install success message should reference REN-1408 (runtime port), got:\n%s", out)
 	}
 	if strings.Contains(out, "rensei-daemon install") || strings.Contains(out, "brew install rensei") {
 		t.Errorf("install output should NOT reference the legacy rensei-daemon shell-out, got:\n%s", out)
@@ -327,7 +323,7 @@ func TestDaemonInstallWipesCachedJWT(t *testing.T) {
 		t.Fatalf("seed fake host binary: %v", err)
 	}
 
-	cmd := newDaemonInstallCmd()
+	cmd := newDaemonInstallCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -360,7 +356,7 @@ func TestDaemonUninstallWipesCachedJWT(t *testing.T) {
 		t.Fatalf("seed stale JWT: %v", err)
 	}
 
-	cmd := newDaemonUninstallCmd()
+	cmd := newDaemonUninstallCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -392,7 +388,7 @@ func TestDaemonInstallNoLegacyShellOut(t *testing.T) {
 	t.Setenv("HOME", tmp)
 	t.Setenv("PATH", t.TempDir()) // empty PATH — would have broken old shim
 
-	cmd := newDaemonInstallCmd()
+	cmd := newDaemonInstallCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -411,7 +407,7 @@ func TestDaemonInstallNoLegacyShellOut(t *testing.T) {
 func TestDaemonUninstallHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd := newDaemonUninstallCmd()
+	cmd := newDaemonUninstallCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -445,7 +441,7 @@ func TestDaemonUninstallNoServiceInstalled(t *testing.T) {
 	t.Setenv("HOME", tmp)
 	t.Setenv("PATH", t.TempDir())
 
-	cmd := newDaemonUninstallCmd()
+	cmd := newDaemonUninstallCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -465,7 +461,7 @@ func TestDaemonUninstallNoServiceInstalled(t *testing.T) {
 func TestDaemonParentHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd := newDaemonCmd("")
+	cmd := newDaemonCmd(Config{})
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -540,8 +536,9 @@ func TestDaemonStatusError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "connection refused") {
-		t.Errorf("error should mention connection error; got: %v", err)
+	// daemonDownErr converts connection-refused errors into actionable user guidance.
+	if !strings.Contains(err.Error(), "daemon is not running") {
+		t.Errorf("error should mention daemon not running; got: %v", err)
 	}
 }
 
@@ -901,13 +898,13 @@ func TestDaemonActionHTTPMock(t *testing.T) {
 	}
 }
 
-// ── doctor (in-process; REN-1406) ─────────────────────────────────────────────
+// ── doctor (in-process) ─────────────────────────────────────────────────────────
 
 // TestDaemonDoctorHelp verifies the doctor command exposes the expected flags.
 func TestDaemonDoctorHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd := newDaemonDoctorCmd()
+	cmd := newDaemonDoctorCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -930,7 +927,7 @@ func TestDaemonDoctorReportsMissingService(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 
-	cmd := newDaemonDoctorCmd()
+	cmd := newDaemonDoctorCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -963,7 +960,7 @@ func TestDaemonDoctorJSONOutput(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 
-	cmd := newDaemonDoctorCmd()
+	cmd := newDaemonDoctorCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
