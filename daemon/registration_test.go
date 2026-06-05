@@ -576,6 +576,72 @@ func TestRegister_ProvidesArraySentInBody(t *testing.T) {
 	}
 }
 
+// TestRegisterRequest_ProjectIDsRoundTrip verifies the A3 Wire contract:
+//   - When ProjectIDs is set, the field round-trips through JSON with key "projectIds".
+//   - When ProjectIDs is nil, the field is omitted from the JSON body (omitempty),
+//     preserving backward-compatibility with older platform versions.
+func TestRegisterRequest_ProjectIDsRoundTrip(t *testing.T) {
+	cases := []struct {
+		name       string
+		projectIDs []string
+		wantKey    bool
+	}{
+		{
+			name:       "populated projectIds round-trips",
+			projectIDs: []string{"uuid-proj-1", "uuid-proj-2"},
+			wantKey:    true,
+		},
+		{
+			name:       "nil projectIds omits key (omitempty)",
+			projectIDs: nil,
+			wantKey:    false,
+		},
+		{
+			name:       "empty slice omits key (omitempty)",
+			projectIDs: []string{},
+			wantKey:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := RegisterRequest{
+				Hostname:   "test-host",
+				Capacity:   2,
+				ProjectIDs: tc.projectIDs,
+			}
+			data, err := json.Marshal(req)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var decoded map[string]json.RawMessage
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			_, hasKey := decoded["projectIds"]
+			if hasKey != tc.wantKey {
+				t.Errorf("projectIds key present=%v, want %v; body: %s", hasKey, tc.wantKey, data)
+			}
+			if !tc.wantKey {
+				return
+			}
+			// Verify the values round-trip correctly.
+			var back RegisterRequest
+			if err := json.Unmarshal(data, &back); err != nil {
+				t.Fatalf("unmarshal back: %v", err)
+			}
+			if len(back.ProjectIDs) != len(tc.projectIDs) {
+				t.Fatalf("ProjectIDs len = %d, want %d", len(back.ProjectIDs), len(tc.projectIDs))
+			}
+			for i, want := range tc.projectIDs {
+				if back.ProjectIDs[i] != want {
+					t.Errorf("ProjectIDs[%d] = %q, want %q", i, back.ProjectIDs[i], want)
+				}
+			}
+		})
+	}
+}
+
 // TestRegister_NilProvidesOmitsField verifies that a nil Provides slice does
 // NOT add a "provides" key to the JSON body (omitempty). Older platform
 // versions that don't recognise the field should still accept the request.
