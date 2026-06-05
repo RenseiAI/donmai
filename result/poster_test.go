@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runner"
 )
 
 // goodResult returns a populated agent.Result mirroring a typical
@@ -43,6 +45,7 @@ func captureServer(t *testing.T,
 ) (*httptest.Server, *struct {
 	completion atomic.Int32
 	status     atomic.Int32
+	mu         sync.Mutex
 	bodies     []string
 },
 ) {
@@ -50,12 +53,18 @@ func captureServer(t *testing.T,
 	state := &struct {
 		completion atomic.Int32
 		status     atomic.Int32
+		mu         sync.Mutex
 		bodies     []string
 	}{}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		// The test server is hit concurrently by the completion + status
+		// posts, so guard the shared slice — mirrors the syncBuffer fix
+		// applied to daemon/child_log_test.go under go test -race.
+		state.mu.Lock()
 		state.bodies = append(state.bodies, string(body))
+		state.mu.Unlock()
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/completion"):
 			n := state.completion.Add(1)
@@ -488,6 +497,7 @@ func TestPosterPost_StatusBodyShape(t *testing.T) {
 	r := goodResult()
 	r.Error = "something blew up"
 	r.Status = "failed"
+	r.FailureMode = "agent-blocked"
 	if err := p.Post(context.Background(), "sess-9", r); err != nil {
 		t.Fatalf("Post: %v", err)
 	}
@@ -508,5 +518,101 @@ func TestPosterPost_StatusBodyShape(t *testing.T) {
 	// Cost fields should be populated.
 	if body["totalCostUsd"] == nil {
 		t.Errorf("totalCostUsd missing")
+	}
+	// failureMode must reach the platform as the authoritative routing
+	// signal (e.g. needs-clarification on "agent-blocked").
+	if body["failureMode"] != "agent-blocked" {
+		t.Errorf("failureMode = %v, want agent-blocked", body["failureMode"])
+	}
+	// summary rides the status path too — lifecycle hooks read it.
+	if body["summary"] != "Implemented X, opened PR." {
+		t.Errorf("summary = %v, want %q", body["summary"], "Implemented X, opened PR.")
+	}
+}
+
+// TestPosterPost_StatusFailureModeSerialized asserts the failureMode field
+// is serialised on the /status body across the runner's failure-mode enum,
+// and is omitted entirely when empty (backward-compatible additive field).
+//
+// The table enumerates every constant defined in runner/failure.go so a new
+// failure mode added there without a corresponding test entry is caught by
+// the round-trip count assertion below — the serialisation path is generic
+// (it passes r.FailureMode verbatim), and the final "unknown free-form"
+// case proves any non-enum string round-trips identically.
+func TestPosterPost_StatusFailureModeSerialized(t *testing.T) {
+	t.Parallel()
+
+	// allFailureModes mirrors the wire strings in runner/failure.go. Keep
+	// in sync when a new constant is added there (the count check below
+	// guards against silent drift).
+	allFailureModes := []string{
+		runner.FailureWorktreeProvision, // "worktree-provision"
+		runner.FailurePromptRender,      // "prompt-render"
+		runner.FailureProviderResolve,   // "provider-resolve"
+		runner.FailureSpawn,             // "spawn-failed"
+		runner.FailureProviderError,     // "provider-error"
+		runner.FailureSilentExit,        // "silent-exit"
+		runner.FailureLostOwnership,     // "lost-ownership"
+		runner.FailureTimeout,           // "timeout"
+		runner.FailureBackstop,          // "backstop-failed"
+		runner.FailureKitProvision,      // "kit-provision"
+		runner.FailureAgentBlocked,      // "agent-blocked"
+	}
+	if got, want := len(allFailureModes), 11; got != want {
+		t.Fatalf("failure-mode count = %d, want %d — a constant was added to "+
+			"runner/failure.go without updating this table", got, want)
+	}
+
+	tests := []struct {
+		name        string
+		failureMode string
+		wantPresent bool
+	}{
+		{name: "empty omitted", failureMode: "", wantPresent: false},
+		// Generic non-enum string must round-trip verbatim — proves the
+		// serializer never gates on the known-enum set.
+		{name: "unknown free-form", failureMode: "some-future-mode", wantPresent: true},
+	}
+	for _, mode := range allFailureModes {
+		tests = append(tests, struct {
+			name        string
+			failureMode string
+			wantPresent bool
+		}{name: mode, failureMode: mode, wantPresent: true})
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+
+			r := goodResult()
+			r.Status = "failed"
+			r.FailureMode = tc.failureMode
+			if err := p.Post(context.Background(), "sess-fm", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+
+			var body map[string]any
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			got, present := body["failureMode"]
+			if present != tc.wantPresent {
+				t.Fatalf("failureMode present = %v, want %v (body %q)", present, tc.wantPresent, statusBody)
+			}
+			if tc.wantPresent && got != tc.failureMode {
+				t.Errorf("failureMode = %v, want %q", got, tc.failureMode)
+			}
+		})
 	}
 }
