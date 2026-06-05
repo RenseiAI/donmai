@@ -114,7 +114,7 @@ type SessionSpec struct {
 	Env                map[string]string `json:"env,omitempty"`
 	MaxDurationSeconds int               `json:"maxDurationSeconds,omitempty"`
 	// ProjectName is the allowlist-resolved ProjectConfig.ID for this session,
-	// populated by pollItemToSessionSpec when the work item matches a daemon
+	// populated by PollItemToSessionSpec when the work item matches a daemon
 	// allowlist entry. Empty when no allowlist entry matched (spec accepted on
 	// the fallback path). Embedders can read this in OnPreSpawn to scope
 	// per-session credential snapshots without a redundant allowlist lookup.

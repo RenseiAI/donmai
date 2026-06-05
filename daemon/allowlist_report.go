@@ -15,14 +15,18 @@ import (
 //
 // Reference: ../runs/2026-05-18-daemon-config-sync-DESIGN.md (Phase 1c, 1d).
 
-// allowlistEntriesFromConfig projects []ProjectConfig down to the trimmed
+// AllowlistEntriesFromConfig projects []ProjectConfig down to the trimmed
 // wire shape sent in RegisterRequest.DaemonProjects and HeartbeatPayload.
 // Entries are sorted by id so the hash is stable regardless of yaml order.
+//
+// Exported so embedders can drive multi-identity poll loops (e.g. a
+// closed-source satellite that registers separate per-org worker identities
+// against the same shared spawner).
 //
 // Returns nil (omitted on the wire) when the daemon has no projects
 // configured. The platform treats nil as "unknown — host may serve any
 // project the dispatcher routes its way" rather than "explicit empty".
-func allowlistEntriesFromConfig(projects []ProjectConfig) []ProjectAllowlistEntry {
+func AllowlistEntriesFromConfig(projects []ProjectConfig) []ProjectAllowlistEntry {
 	if len(projects) == 0 {
 		return nil
 	}
