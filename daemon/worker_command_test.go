@@ -187,18 +187,23 @@ func TestDefaultWorkerCommand_OsExecutableValid(t *testing.T) {
 			t.Errorf("isGoTestBinary(%q) = true, want false (should not guard production binary)", tc.exe)
 		}
 	}
-	// Confirm the command shape: when the guard does not fire, the returned
-	// slice must be [exe, "agent", "run"].
-	exe := "/usr/local/bin/donmai"
-	want := []string{exe, "agent", "run"}
-	// We cannot call defaultWorkerCommand() with a custom exe, but we can
-	// verify the shape contract that the function always returns exactly
-	// these three elements (the callers in daemon.go depend on it).
-	got := []string{exe, "agent", "run"}
-	for i, v := range want {
-		if got[i] != v {
-			t.Errorf("command[%d] = %q, want %q", i, got[i], v)
-		}
+	// Confirm the command shape contract: defaultWorkerCommand always returns
+	// exactly [exe, "agent", "run"] — three elements, with "agent" at index 1
+	// and "run" at index 2. We cannot inject a custom exe into
+	// defaultWorkerCommand (no injection point), so we verify the shape via
+	// the spawner PATH-fallback which IS injectable.
+	tmpDir := t.TempDir()
+	makeExe(t, tmpDir, "donmai")
+	t.Setenv("PATH", tmpDir)
+	cmd := lookPathFallback()
+	if len(cmd) != 3 {
+		t.Fatalf("lookPathFallback() len = %d, want 3 ([exe agent run])", len(cmd))
+	}
+	if cmd[1] != "agent" {
+		t.Errorf("lookPathFallback()[1] = %q, want \"agent\"", cmd[1])
+	}
+	if cmd[2] != "run" {
+		t.Errorf("lookPathFallback()[2] = %q, want \"run\"", cmd[2])
 	}
 }
 
