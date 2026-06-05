@@ -3,7 +3,6 @@ package codeintel
 import (
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -307,22 +306,20 @@ func TestIsCodeAvailable_WhenEnvSet(t *testing.T) {
 	}
 }
 
-func TestIsCodeAvailable_WhenNotFound(t *testing.T) {
+// TestIsCodeAvailable_AlwaysTrue verifies that IsCodeAvailable always returns
+// true because get-repo-map and search-symbols use the native Go implementation
+// and never require an external binary.
+func TestIsCodeAvailable_AlwaysTrue(t *testing.T) {
 	t.Setenv("AGENTFACTORY_CODE_BIN", "")
-	// Temporarily shadow PATH to ensure af-code and pnpm aren't found.
+	// Even with no binary on PATH, the native implementation is available.
 	origPath := os.Getenv("PATH")
-	t.Setenv("PATH", t.TempDir()) // dir with no binaries
+	t.Setenv("PATH", t.TempDir())
 	defer func() { _ = os.Setenv("PATH", origPath) }()
 
 	r := New(t.TempDir())
-	r.codeBinCache = "" // ensure fresh lookup
-	if r.IsCodeAvailable() {
-		// This test may legitimately pass if af-code or pnpm is in the new PATH dir.
-		// Skip rather than fail if the system truly has pnpm somewhere unexpected.
-		if _, err := exec.LookPath("pnpm"); err == nil {
-			t.Skip("pnpm found in PATH; cannot test unavailable path")
-		}
-		t.Error("expected IsCodeAvailable=false when binary not found")
+	r.codeBinCache = ""
+	if !r.IsCodeAvailable() {
+		t.Error("IsCodeAvailable should always return true (native implementation)")
 	}
 }
 

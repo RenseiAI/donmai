@@ -1,32 +1,40 @@
-// Package codeintel provides a shell-out bridge to the TypeScript
-// @donmai/cli (donmai-code).
+// Package codeintel provides code intelligence for the donmai CLI.
 //
-// # Architectural choice: shell-out bridge (Phase D parity)
+// # Native implementation (S0 + S1)
 //
-// The tree-sitter Go bindings (go-tree-sitter) were evaluated but rejected for
-// this phase because:
+// get-repo-map and search-symbols are now implemented natively in Go via
+// pure-regex extractors (TypeScriptExtractor, GoExtractor) and a JSON-serialised
+// index persisted to .donmai/code-index/index.json.
 //
-//  1. CGo + native deps make CI slower and cross-compilation fragile.
-//  2. The AC requires byte-identical index format with TS readers — easiest to
-//     guarantee when TS owns the indexing entirely.
-//  3. Phase D goal is parity, not re-implementation.
+// The native path is the PRIMARY implementation for those two subcommands.
+// The exec-shim (DONMAI_CODE_BIN env override) is kept as a FALLBACK for
+// operators who need to force the TypeScript implementation — e.g., to test
+// against a known-good TS-generated index.
 //
-// This package shells out to `pnpm donmai-code` (resolving via PATH or
-// DONMAI_CODE_BIN env var) and returns the parsed JSON output.
+// # Exec-shim fallback
 //
-// A future issue (post-Wave 4) can replace the shell-out with native Go
-// tree-sitter after parity is verified end-to-end.
+// For subcommands not yet natively ported (search-code, check-duplicate,
+// find-type-usages, validate-cross-deps) the shim path is used:
 //
-// # Binary resolution (PATH portability)
-//
-// The binary is resolved in this order:
-//  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override for non-monorepo users
+//  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override
 //  2. `donmai-code` on PATH (installed via `npm install -g @donmai/cli`)
-//  3. `pnpm donmai-code` via pnpm run in the current working directory (monorepo dev)
+//  3. `pnpm donmai-code` (monorepo dev)
 //
-// If none of those resolve, every command returns an ErrNotAvailable error with
-// clear installation instructions. The caller surfaces this gracefully rather
-// than crashing.
+// If none resolve, the command returns ErrNotAvailable with clear installation
+// instructions. Operators can set DONMAI_CODE_BIN to any binary/script to
+// override the native implementation as well.
+//
+// # Index format compatibility
+//
+// The persisted .donmai/code-index/index.json schema is byte-compatible with
+// the TypeScript @donmai/code-intelligence IncrementalIndexer.save() output:
+//
+//	{ "files": { "<filePath>": FileIndex }, "rootHash": "<hash>" }
+//
+// where FileIndex matches the TS FileIndexSchema (types.ts). The content hash
+// (gitHash field) uses git-blob SHA1, and the S3-scope xxHash64 dedup field
+// uses github.com/cespare/xxhash/v2 (seed=0) which produces identical output
+// to the TS xxhash-wasm h64ToString() call.
 package codeintel
 
 import (
@@ -164,16 +172,25 @@ type GetRepoMapOptions struct {
 	FilePatterns []string
 }
 
-// GetRepoMap runs `donmai-code get-repo-map`.
+// GetRepoMap builds a PageRank-ranked repository map.
+//
+// When DONMAI_CODE_BIN is set the exec-shim is used (operator override for
+// testing or forcing the TypeScript path). Otherwise the native Go
+// implementation is used — no external binary required.
 func (r *Runner) GetRepoMap(opts GetRepoMapOptions) (any, error) {
-	args := []string{"get-repo-map"}
-	if opts.MaxFiles > 0 {
-		args = append(args, "--max-files", fmt.Sprintf("%d", opts.MaxFiles))
+	// Exec-shim override: DONMAI_CODE_BIN is explicitly set.
+	if r.isExecOverride() {
+		args := []string{"get-repo-map"}
+		if opts.MaxFiles > 0 {
+			args = append(args, "--max-files", fmt.Sprintf("%d", opts.MaxFiles))
+		}
+		if len(opts.FilePatterns) > 0 {
+			args = append(args, "--file-patterns", strings.Join(opts.FilePatterns, ","))
+		}
+		return r.runCode(args...)
 	}
-	if len(opts.FilePatterns) > 0 {
-		args = append(args, "--file-patterns", strings.Join(opts.FilePatterns, ","))
-	}
-	return r.runCode(args...)
+	// Native primary path.
+	return NewNativeRunner(r.cwd).GetRepoMapNative(opts)
 }
 
 // SearchSymbolsOptions holds the flags for search-symbols.
@@ -184,22 +201,30 @@ type SearchSymbolsOptions struct {
 	FilePattern string
 }
 
-// SearchSymbols runs `donmai-code search-symbols <query>`.
+// SearchSymbols searches the code index for symbols matching the query.
+//
+// When DONMAI_CODE_BIN is set the exec-shim is used. Otherwise the native Go
+// implementation is used.
 func (r *Runner) SearchSymbols(opts SearchSymbolsOptions) (any, error) {
 	if opts.Query == "" {
 		return nil, fmt.Errorf("query is required for search-symbols")
 	}
-	args := []string{"search-symbols", opts.Query}
-	if opts.MaxResults > 0 {
-		args = append(args, "--max-results", fmt.Sprintf("%d", opts.MaxResults))
+	// Exec-shim override.
+	if r.isExecOverride() {
+		args := []string{"search-symbols", opts.Query}
+		if opts.MaxResults > 0 {
+			args = append(args, "--max-results", fmt.Sprintf("%d", opts.MaxResults))
+		}
+		if len(opts.Kinds) > 0 {
+			args = append(args, "--kinds", strings.Join(opts.Kinds, ","))
+		}
+		if opts.FilePattern != "" {
+			args = append(args, "--file-pattern", opts.FilePattern)
+		}
+		return r.runCode(args...)
 	}
-	if len(opts.Kinds) > 0 {
-		args = append(args, "--kinds", strings.Join(opts.Kinds, ","))
-	}
-	if opts.FilePattern != "" {
-		args = append(args, "--file-pattern", opts.FilePattern)
-	}
-	return r.runCode(args...)
+	// Native primary path.
+	return NewNativeRunner(r.cwd).SearchSymbolsNative(opts)
 }
 
 // SearchCodeOptions holds the flags for search-code.
@@ -386,10 +411,19 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 	return result, nil
 }
 
-// IsCodeAvailable returns true if the donmai-code binary can be found.
+// IsCodeAvailable returns true. The native implementation for get-repo-map and
+// search-symbols is always available (no external binary required). For the
+// remaining exec-shim commands (search-code, check-duplicate, find-type-usages,
+// validate-cross-deps) callers should handle ErrNotAvailable gracefully.
 func (r *Runner) IsCodeAvailable() bool {
-	_, err := r.resolveCodeBin()
-	return err == nil
+	return true
+}
+
+// isExecOverride returns true when DONMAI_CODE_BIN (or legacy
+// AGENTFACTORY_CODE_BIN) is explicitly set, signalling that the operator
+// wants the exec-shim path rather than the native implementation.
+func (r *Runner) isExecOverride() bool {
+	return envcompat.GetCodeBin() != ""
 }
 
 // IsArchAvailable returns true if the donmai-arch binary can be found.
