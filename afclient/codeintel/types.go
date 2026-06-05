@@ -1,32 +1,34 @@
-// Package codeintel provides a shell-out bridge to the TypeScript
-// @donmai/cli (donmai-code).
+// Package codeintel provides native Go code intelligence (S0+S1).
 //
-// # Architectural choice: shell-out bridge (Phase D parity)
+// # Native implementation
 //
-// The tree-sitter Go bindings (go-tree-sitter) were evaluated but rejected for
-// this phase because:
+// get-repo-map and search-symbols use pure-Go regex extractors
+// (TypeScriptExtractor, GoExtractor) with a JSON-serialised index persisted to
+// .donmai/code-index/index.json.  No external binary is required for these
+// subcommands.
 //
-//  1. CGo + native deps make CI slower and cross-compilation fragile.
-//  2. The AC requires byte-identical index format with TS readers — easiest to
-//     guarantee when TS owns the indexing entirely.
-//  3. Phase D goal is parity, not re-implementation.
+// # index.json schema compatibility
 //
-// This package shells out to `pnpm donmai-code` (resolving via PATH or
-// DONMAI_CODE_BIN env var) and returns the parsed JSON output.
+// The persisted schema is byte-compatible with the TypeScript
+// @donmai/code-intelligence IncrementalIndexer.save() output:
 //
-// A future issue (post-Wave 4) can replace the shell-out with native Go
-// tree-sitter after parity is verified end-to-end.
+//	{ "files": { "<filePath>": FileIndex }, "rootHash": "<hash>" }
 //
-// # Binary resolution (PATH portability)
+// where FileIndex matches the TS FileIndexSchema (types.ts).  The gitHash
+// field uses git-blob SHA1 (sha1("blob <size>\0<content>")) — identical to
+// GitHashProvider.hashContent() in the TS package.
 //
-// The binary is resolved in this order:
-//  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override for non-monorepo users
+// # Exec-shim fallback
+//
+// For subcommands not yet natively ported (search-code, check-duplicate,
+// find-type-usages, validate-cross-deps) the Runner falls back to the exec-shim
+// path:
+//
+//  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override
 //  2. `donmai-code` on PATH (installed via `npm install -g @donmai/cli`)
-//  3. `pnpm donmai-code` via pnpm run in the current working directory (monorepo dev)
+//  3. `pnpm donmai-code` (monorepo dev)
 //
-// If none of those resolve, every command returns an ErrNotAvailable error with
-// clear installation instructions. The caller surfaces this gracefully rather
-// than crashing.
+// If none resolve, the command returns ErrNotAvailable.
 package codeintel
 
 // SymbolKind enumerates the kinds of code symbols the extractors recognise.

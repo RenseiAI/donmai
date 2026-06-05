@@ -193,33 +193,27 @@ func TestIndexFileEmptySymbols(t *testing.T) {
 // github.com/cespare/xxhash/v2 package also uses seed=0 by default and must
 // produce identical hex strings for the same input.
 func TestContentXXHash64(t *testing.T) {
+	// Expected values verified against xxhash-wasm@1.1.0 h64ToString(input) with
+	// default seed=0.  The Go github.com/cespare/xxhash/v2 Sum64String must
+	// produce byte-identical output for the same inputs.
 	cases := []struct {
 		input string
-		// Expected values verified against the xxHash64 spec (seed=0).
-		wantLen int // All xxh64 results are 16 hex chars
+		want  string
 	}{
-		{"", 16},
-		{"hello world", 16},
-		{"test", 16},
-		{"function hello() { return 'world' }", 16},
+		{"", "ef46db3751d8e999"},
+		{"hello world", "45ab6734b21e6968"},
+		{"test", "4fdcca5ddb678139"},
+		{"function hello() { return 'world' }", "b061e46f47d40f6b"},
 	}
 
-	seen := make(map[string]string)
 	for _, tc := range cases {
 		got := ContentXXHash64(tc.input)
-		if len(got) != tc.wantLen {
-			t.Errorf("ContentXXHash64(%q) len=%d, want %d; got %q", tc.input, len(got), tc.wantLen, got)
+		if got != tc.want {
+			t.Errorf("ContentXXHash64(%q): got %q, want %q (TS xxhash-wasm h64ToString mismatch)", tc.input, got, tc.want)
 		}
-		for _, c := range got {
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-				t.Errorf("ContentXXHash64(%q) contains non-hex char %q: %s", tc.input, c, got)
-				break
-			}
+		if len(got) != 16 {
+			t.Errorf("ContentXXHash64(%q) len=%d, want 16", tc.input, len(got))
 		}
-		if prev, ok := seen[got]; ok && prev != tc.input {
-			t.Errorf("hash collision: ContentXXHash64(%q) == ContentXXHash64(%q) == %q", tc.input, prev, got)
-		}
-		seen[got] = tc.input
 	}
 
 	// Idempotency: same input always produces same output.
@@ -237,13 +231,33 @@ func TestContentXXHash64(t *testing.T) {
 	}
 }
 
-// TestGitBlobHash verifies the git-blob SHA1 against the well-known value for
-// the string "hello\n" (matches `echo -n 'hello' | git hash-object --stdin`
-// for a 5-byte content).
+// TestGitBlobHash verifies the git-blob SHA1 against known values.
+//
+// All expected values can be independently verified with:
+//
+//	printf "blob <len>\x00<content>" | sha1sum
+//
+// or via `git hash-object` for file content.  The Go output must be
+// byte-identical to the TS GitHashProvider.hashContent() implementation in
+// donmai-libraries/packages/code-intelligence/src/indexing/git-hash-provider.ts.
 func TestGitBlobHash(t *testing.T) {
-	// "test content\n" -> known git hash can be checked with:
-	//   printf "blob 13\x00test content\n" | sha1sum
-	// But we verify at least the format and idempotency here.
+	cases := []struct {
+		input string
+		want  string
+	}{
+		// printf "blob 11\x00hello world" | sha1sum
+		{"hello world", "95d09f2b10159347eece71399a7e2e907ea3df4f"},
+		// printf "blob 0\x00" | sha1sum  (git's empty blob)
+		{"", "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"},
+		// printf "blob 6\x00hello\n" | sha1sum
+		{"hello\n", "ce013625030ba8dba906f756967f9e9ca394464a"},
+	}
+	for _, tc := range cases {
+		got := gitBlobHash([]byte(tc.input))
+		if got != tc.want {
+			t.Errorf("gitBlobHash(%q): got %q, want %q", tc.input, got, tc.want)
+		}
+	}
 	h1 := gitBlobHash([]byte("hello world"))
 	h2 := gitBlobHash([]byte("hello world"))
 	if h1 != h2 {
