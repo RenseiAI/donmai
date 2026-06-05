@@ -276,6 +276,14 @@ func (d *Daemon) ActiveSessions() []SessionHandle {
 	return d.spawner.ActiveSessions()
 }
 
+// Spawner returns the daemon's WorkerSpawner so callers can subscribe to
+// session lifecycle events via WorkerSpawner.On without needing the spawner
+// to be re-exposed through a higher-level hook. Returns nil before Start is
+// called.
+func (d *Daemon) Spawner() *WorkerSpawner {
+	return d.spawner
+}
+
 // maxConcurrentSessions returns the current per-host capacity envelope under
 // the read lock. Capacity can be mutated at runtime via the local control
 // API (POST /api/daemon/capacity → handleSetCapacity), and the heartbeat

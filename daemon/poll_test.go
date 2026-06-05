@@ -577,6 +577,81 @@ func TestPollItemToSessionSpec_ResolvesProjectName(t *testing.T) {
 	}
 }
 
+// TestPollItemToSessionSpec_ProjectNameFromAllowlist asserts that
+// pollItemToSessionSpec populates spec.ProjectName with the matched
+// ProjectConfig.ID when an allowlist entry is found, and leaves it
+// empty when no entry matches. This is a table-driven extension of the
+// existing TestPollItemToSessionSpec_ResolvesProjectName to cover the
+// new A1/A2 field semantics.
+func TestPollItemToSessionSpec_ProjectNameFromAllowlist(t *testing.T) {
+	projects := []ProjectConfig{
+		{ID: "smoke-alpha", Repository: "https://github.com/acme/alpha"},
+		{ID: "smoke-beta", Repository: "https://github.com/acme/beta"},
+	}
+
+	cases := []struct {
+		name            string
+		item            PollWorkItem
+		wantProjectName string
+		wantRepository  string
+	}{
+		{
+			name: "matched by project name slug",
+			item: PollWorkItem{
+				SessionID:   "sess-a",
+				ProjectName: "smoke-alpha",
+				Ref:         "main",
+			},
+			wantProjectName: "smoke-alpha",
+			wantRepository:  "https://github.com/acme/alpha",
+		},
+		{
+			name: "matched by repository URL",
+			item: PollWorkItem{
+				SessionID:  "sess-b",
+				Repository: "https://github.com/acme/beta",
+				Ref:        "main",
+			},
+			wantProjectName: "smoke-beta",
+			wantRepository:  "https://github.com/acme/beta",
+		},
+		{
+			name: "no allowlist match leaves ProjectName empty",
+			item: PollWorkItem{
+				SessionID:   "sess-c",
+				ProjectName: "unknown-project",
+				Ref:         "main",
+			},
+			wantProjectName: "",
+			wantRepository:  "unknown-project", // falls through to item.ProjectName
+		},
+		{
+			name: "empty item leaves ProjectName and Repository empty",
+			item: PollWorkItem{
+				SessionID: "sess-d",
+				Ref:       "main",
+			},
+			wantProjectName: "",
+			wantRepository:  "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := pollItemToSessionSpec(tc.item, projects)
+			if spec.ProjectName != tc.wantProjectName {
+				t.Errorf("ProjectName = %q, want %q", spec.ProjectName, tc.wantProjectName)
+			}
+			if spec.Repository != tc.wantRepository {
+				t.Errorf("Repository = %q, want %q", spec.Repository, tc.wantRepository)
+			}
+			if spec.SessionID != tc.item.SessionID {
+				t.Errorf("SessionID = %q, want %q", spec.SessionID, tc.item.SessionID)
+			}
+		})
+	}
+}
+
 // TestResolveProjectFromAllowlist exercises the matcher's four match
 // modes (slug, URL, URL-suffix-of-id, URL-suffix-of-repo) directly so
 // future regressions in the lookup logic are caught with a small,
