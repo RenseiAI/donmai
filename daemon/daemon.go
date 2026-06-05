@@ -276,10 +276,10 @@ func (d *Daemon) ActiveSessions() []SessionHandle {
 	return d.spawner.ActiveSessions()
 }
 
-// Spawner returns the daemon's WorkerSpawner so callers (e.g. the closed
-// rensei-tui daemon_run.go) can subscribe to session lifecycle events via
-// WorkerSpawner.On without needing the spawner to be re-exposed through a
-// higher-level hook. Returns nil before Start is called.
+// Spawner returns the daemon's WorkerSpawner so callers can subscribe to
+// session lifecycle events via WorkerSpawner.On without needing the spawner
+// to be re-exposed through a higher-level hook. Returns nil before Start is
+// called.
 func (d *Daemon) Spawner() *WorkerSpawner {
 	return d.spawner
 }

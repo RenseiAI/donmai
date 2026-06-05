@@ -116,8 +116,8 @@ type SessionSpec struct {
 	// ProjectName is the allowlist-resolved ProjectConfig.ID for this session,
 	// populated by pollItemToSessionSpec when the work item matches a daemon
 	// allowlist entry. Empty when no allowlist entry matched (spec accepted on
-	// the fallback path). The closed rensei-tui uses this to scope per-session
-	// credential snapshots without a separate allowlist lookup in onPreSpawn.
+	// the fallback path). Embedders can read this in OnPreSpawn to scope
+	// per-session credential snapshots without a redundant allowlist lookup.
 	ProjectName string `json:"projectName,omitempty"`
 }
 
