@@ -31,6 +31,12 @@ type Server struct {
 	// servers built with NewServer get a default scan path automatically.
 	// Tests inject a fake by assigning the field directly before serving.
 	kitReg kitRegistryDoer
+
+	// agentReg is the in-process AgentCard registry serving
+	// /api/daemon/agents* (GO-3 / Wave 5). Lazily constructed via
+	// agentCardRegistryOrDefault using the daemon's sessionDetailStore.
+	// Tests inject a fake by assigning the field directly before serving.
+	agentReg agentCardRegistry
 }
 
 // NewServer builds an HTTP server for d. The handler is registered but the
@@ -136,6 +142,10 @@ func (s *Server) register(mux *http.ServeMux) {
 	// GET /api/daemon/capabilities returns the provides[] set detected
 	// at startup and sent to POST /api/workers/register.
 	mux.HandleFunc("/api/daemon/capabilities", s.method(http.MethodGet, s.handleCapabilities))
+	// agents (GO-3 / Wave 5) — AgentCard stubs synthesised from active
+	// session-detail store entries. GET list + GET detail + 404 on miss.
+	mux.HandleFunc("/api/daemon/agents", s.method(http.MethodGet, s.handleListAgents))
+	mux.HandleFunc("/api/daemon/agents/", s.handleGetAgent) // trailing slash → prefix matcher
 	mux.HandleFunc("/healthz", s.method(http.MethodGet, s.handleHealthz))
 }
 

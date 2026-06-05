@@ -1496,71 +1496,319 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 	return cmd
 }
 
-// ─── check-deployment (exec-shim) ────────────────────────────────────────────
+// ─── check-deployment (native Go via gh CLI) ─────────────────────────────────
 
-// newLinearCheckDeploymentCmd returns a check-deployment subcommand that
-// delegates to the `donmai-linear` JS binary via exec.Command.
+// deploymentStatus holds the per-Vercel-app status returned by GitHub's
+// Commit Status API. Mirrors the TS DeploymentStatus interface in
+// donmai-libraries/packages/linear/src/tools/deployment-bridge.ts.
+type deploymentStatus struct {
+	// App is the Vercel application name extracted from the status context
+	// (e.g. "my-app" from "vercel/my-app (production)").
+	App string `json:"app"`
+	// Context is the raw GitHub status context string.
+	Context string `json:"context"`
+	// State is the GitHub status state: "success" | "failure" | "pending" | "error".
+	State string `json:"state"`
+	// Description is the human-readable status message from GitHub.
+	Description string `json:"description,omitempty"`
+	// TargetURL is the Vercel preview/production URL for this deployment.
+	TargetURL string `json:"targetUrl,omitempty"`
+}
+
+// deploymentCheckResult is the JSON envelope emitted by check-deployment.
+type deploymentCheckResult struct {
+	// PRNumber is the pull-request number that was checked.
+	PRNumber int `json:"prNumber"`
+	// SHA is the PR head commit SHA the status check was resolved against.
+	SHA string `json:"sha"`
+	// AnyFailed is true when at least one Vercel deployment status is
+	// "failure" or "error". Callers gate on this for CI/CD go-no-go checks.
+	AnyFailed bool `json:"anyFailed"`
+	// Deployments is the per-app status slice, one entry per Vercel context
+	// found on the commit. Empty when no Vercel statuses are attached yet
+	// (e.g. the deployment is still queued).
+	Deployments []deploymentStatus `json:"deployments"`
+}
+
+// ghCommitStatus is the minimal shape the GitHub Commit Status API returns.
+// Reference: https://docs.github.com/en/rest/commits/statuses
+type ghCommitStatus struct {
+	State    string `json:"state"`
+	Statuses []struct {
+		Context     string `json:"context"`
+		State       string `json:"state"`
+		Description string `json:"description"`
+		TargetURL   string `json:"target_url"`
+	} `json:"statuses"`
+}
+
+// ghPR is the minimal shape for the GitHub Pull Requests API response.
+type ghPR struct {
+	Head struct {
+		SHA string `json:"sha"`
+	} `json:"head"`
+	Number  int    `json:"number"`
+	HTMLURL string `json:"html_url"`
+}
+
+// runGhAPI executes `gh api <endpoint> [extraArgs...]` and returns the raw
+// JSON stdout. The gh CLI must be on PATH; this is a documented dependency
+// for the check-deployment command.
+var runGhAPI = func(ctx context.Context, endpoint string, extraArgs ...string) ([]byte, error) {
+	args := append([]string{"api", endpoint}, extraArgs...)
+	out, err := exec.CommandContext(ctx, "gh", args...).Output() //nolint:gosec // G204: endpoint is caller-constructed; extraArgs are controlled flags
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return nil, fmt.Errorf("gh api %s: exit %d: %s", endpoint, exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return nil, fmt.Errorf("gh api %s: %w", endpoint, err)
+	}
+	return out, nil
+}
+
+// checkDeployment performs the two-step GitHub API check:
+//  1. Resolve PR number → head SHA via GET repos/{owner}/{repo}/pulls/{pr}.
+//  2. Fetch commit statuses via GET repos/{owner}/{repo}/commits/{sha}/status.
+//  3. Filter statuses whose context starts with "vercel" (case-insensitive).
 //
-// Rationale for exec-shim: check-deployment requires Vercel + GitHub API
-// clients not yet ported to Go. The shim preserves full feature parity for
-// v1.0.0 without coupling this binary to those HTTP surfaces. A proper Go port
-// is tracked for v1.0.x.
+// The function uses runGhAPI (a package-level var) so tests can inject a mock.
+func checkDeployment(ctx context.Context, owner, repo string, prNumber int) (*deploymentCheckResult, error) {
+	// ── Step 1: resolve PR → head SHA ────────────────────────────────────────
+	prEndpoint := fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, prNumber)
+	prRaw, err := runGhAPI(ctx, prEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("get PR %d: %w", prNumber, err)
+	}
+	var pr ghPR
+	if err := json.Unmarshal(prRaw, &pr); err != nil {
+		return nil, fmt.Errorf("parse PR response: %w", err)
+	}
+	sha := strings.TrimSpace(pr.Head.SHA)
+	if sha == "" {
+		return nil, fmt.Errorf("PR %d: head SHA is empty", prNumber)
+	}
+
+	// ── Step 2: fetch commit statuses ────────────────────────────────────────
+	statusEndpoint := fmt.Sprintf("repos/%s/%s/commits/%s/status", owner, repo, sha)
+	statusRaw, err := runGhAPI(ctx, statusEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("get commit statuses for %s: %w", sha[:8], err)
+	}
+	var cs ghCommitStatus
+	if err := json.Unmarshal(statusRaw, &cs); err != nil {
+		return nil, fmt.Errorf("parse commit status response: %w", err)
+	}
+
+	// ── Step 3: filter Vercel contexts ────────────────────────────────────────
+	var deployments []deploymentStatus
+	anyFailed := false
+	for _, s := range cs.Statuses {
+		if !strings.HasPrefix(strings.ToLower(s.Context), "vercel") {
+			continue
+		}
+		// Extract a human-readable app name from the context string.
+		// Typical context shapes: "vercel" | "vercel/my-app" | "vercel/my-app (production)".
+		app := extractVercelApp(s.Context)
+		ds := deploymentStatus{
+			App:         app,
+			Context:     s.Context,
+			State:       s.State,
+			Description: s.Description,
+			TargetURL:   s.TargetURL,
+		}
+		deployments = append(deployments, ds)
+		if s.State == "failure" || s.State == "error" {
+			anyFailed = true
+		}
+	}
+	if deployments == nil {
+		deployments = []deploymentStatus{}
+	}
+
+	return &deploymentCheckResult{
+		PRNumber:    prNumber,
+		SHA:         sha,
+		AnyFailed:   anyFailed,
+		Deployments: deployments,
+	}, nil
+}
+
+// extractVercelApp derives a short app name from a Vercel status context string.
+// Examples:
 //
-// Deprecated: this shim will be replaced by a native Go implementation in a
-// future release.
+//	"vercel"                         → "vercel"
+//	"vercel/my-app"                  → "my-app"
+//	"vercel/my-app (production)"     → "my-app"
+//	"vercel – Deploying my-app"      → "vercel"  (unknown format → keep raw)
+func extractVercelApp(context string) string {
+	// Strip everything after " (" (environment qualifier).
+	if idx := strings.Index(context, " ("); idx != -1 {
+		context = context[:idx]
+	}
+	// Split on "/" — second segment is the app name.
+	parts := strings.SplitN(context, "/", 2)
+	if len(parts) == 2 && parts[1] != "" {
+		return strings.TrimSpace(parts[1])
+	}
+	return strings.TrimSpace(parts[0])
+}
+
+// formatDeploymentMarkdown renders a deploymentCheckResult as a Markdown table.
+func formatDeploymentMarkdown(result *deploymentCheckResult) string {
+	var sb strings.Builder
+	status := "all passed"
+	if result.AnyFailed {
+		status = "FAILED"
+	}
+	fmt.Fprintf(&sb, "## Deployment status for PR #%d\n\n", result.PRNumber)
+	fmt.Fprintf(&sb, "**Commit**: `%s`  \n", result.SHA)
+	fmt.Fprintf(&sb, "**Overall**: %s\n\n", status)
+	if len(result.Deployments) == 0 {
+		sb.WriteString("No Vercel deployment statuses found yet.\n")
+		return sb.String()
+	}
+	sb.WriteString("| App | State | Description | URL |\n")
+	sb.WriteString("|-----|-------|-------------|-----|\n")
+	for _, d := range result.Deployments {
+		url := d.TargetURL
+		if url != "" {
+			url = "[link](" + url + ")"
+		}
+		fmt.Fprintf(&sb, "| %s | %s | %s | %s |\n", d.App, d.State, d.Description, url)
+	}
+	return sb.String()
+}
+
+// newLinearCheckDeploymentCmd returns a native Go check-deployment subcommand.
+// It uses the gh CLI (documented dependency) to query the GitHub Commit Status
+// API, filters for Vercel deployment checks, and formats the result as JSON
+// or Markdown. No external JS binary is required.
 func newLinearCheckDeploymentCmd() *cobra.Command {
-	var format string
+	var (
+		format string
+		owner  string
+		repo   string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "check-deployment <pr-number>",
-		Short: "Check Vercel deployment status for a PR (exec-shim: delegates to donmai-linear)",
+		Short: "Check Vercel deployment status for a PR",
 		Long: `Check Vercel deployment status for a pull request.
 
-DEPRECATED SHIM: This command delegates to the 'donmai-linear' JS binary found
-on PATH. A native Go implementation will replace it in a future release.
+Queries the GitHub Commit Status API (via the gh CLI) for all Vercel deployment
+checks attached to the PR's head commit. Outputs a JSON summary by default.
 
-To use this command, ensure donmai-linear is available:
-  npm install -g @donmai/cli
-  # or: pnpm install (in a donmai project)
+Prerequisites:
+  - gh CLI installed and authenticated (https://cli.github.com)
+  - The PR must be in a GitHub repository
 
-The shim passes all arguments and flags through to donmai-linear unchanged and
-exits with the same exit code.`,
-		SilenceUsage:          true,
-		DisableFlagParsing:    false,
-		Args:                  cobra.MinimumNArgs(1),
-		DisableFlagsInUseLine: true,
+The --owner and --repo flags default to the current git remote when not set.
+
+Exit codes:
+  0 — all deployments passed (or no Vercel statuses found yet)
+  1 — at least one deployment is in failure/error state
+  2 — usage or API error`,
+		SilenceUsage: true,
+		Args:         cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Locate donmai-linear on PATH.
-			afLinear, err := exec.LookPath("donmai-linear")
-			if err != nil {
-				return fmt.Errorf("donmai-linear binary not found on PATH (install with: npm install -g @donmai/cli; a native Go implementation is planned for v1.0.x): %w", err)
+			prNumber := 0
+			if _, err := fmt.Sscanf(args[0], "%d", &prNumber); err != nil || prNumber <= 0 {
+				return userError(
+					fmt.Sprintf("invalid PR number %q — must be a positive integer", args[0]),
+					"example: donmai linear check-deployment 42",
+				)
 			}
 
-			// Build argv: donmai-linear check-deployment <pr-number> [--format <fmt>] [extra args...]
-			argv := []string{"check-deployment"}
-			argv = append(argv, args...)
-			if cmd.Flags().Changed("format") {
-				argv = append(argv, "--format", format)
-			}
-
-			c := exec.CommandContext(cmd.Context(), afLinear, argv...) //nolint:gosec // G204: afLinear is from exec.LookPath; args are user-supplied CLI flags
-			c.Stdout = cmd.OutOrStdout()
-			c.Stderr = cmd.ErrOrStderr()
-			c.Env = os.Environ()
-
-			if err := c.Run(); err != nil {
-				// Propagate non-zero exit codes (e.g. anyFailed=true) transparently.
-				// The subprocess already wrote its output, so exit directly.
-				var exitErr *exec.ExitError
-				if errors.As(err, &exitErr) {
-					os.Exit(exitErr.ExitCode())
+			// Resolve owner/repo from flags or current git remote.
+			if owner == "" || repo == "" {
+				remote, err := runGitCommand("remote", "get-url", "origin")
+				if err != nil {
+					return userError(
+						"could not determine repository owner/repo",
+						"set them explicitly with --owner and --repo",
+					)
 				}
-				return fmt.Errorf("donmai-linear check-deployment: %w", err)
+				detectedOwner, detectedRepo, parseErr := parseGitRemote(remote)
+				if parseErr != nil {
+					return userError(
+						fmt.Sprintf("could not parse git remote %q: %v", remote, parseErr),
+						"set them explicitly with --owner and --repo",
+					)
+				}
+				if owner == "" {
+					owner = detectedOwner
+				}
+				if repo == "" {
+					repo = detectedRepo
+				}
+			}
+
+			result, err := checkDeployment(cmd.Context(), owner, repo, prNumber)
+			if err != nil {
+				return fmt.Errorf("check-deployment: %w", err)
+			}
+
+			switch format {
+			case "markdown", "md":
+				_, _ = fmt.Fprint(cmd.OutOrStdout(), formatDeploymentMarkdown(result))
+			default: // "json" or unrecognised → JSON
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				if encErr := enc.Encode(result); encErr != nil {
+					return fmt.Errorf("encode result: %w", encErr)
+				}
+			}
+
+			// Exit 1 when any deployment failed so CI pipelines can gate on the
+			// exit code without parsing JSON. The output has already been written.
+			if result.AnyFailed {
+				os.Exit(1)
 			}
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&format, "format", "json", "Output format: json or markdown")
+	cmd.Flags().StringVar(&owner, "owner", "", "GitHub repository owner (defaults to current remote)")
+	cmd.Flags().StringVar(&repo, "repo", "", "GitHub repository name (defaults to current remote)")
 	return cmd
+}
+
+// parseGitRemote extracts the owner and repo name from a git remote URL.
+// Supports HTTPS (https://github.com/owner/repo[.git]) and SSH
+// (git@github.com:owner/repo[.git]) formats.
+func parseGitRemote(remote string) (owner, repo string, err error) {
+	remote = strings.TrimSpace(remote)
+	remote = strings.TrimSuffix(remote, ".git")
+
+	// SSH format: git@github.com:owner/repo
+	if strings.HasPrefix(remote, "git@") {
+		colonIdx := strings.LastIndex(remote, ":")
+		if colonIdx == -1 {
+			return "", "", fmt.Errorf("malformed SSH remote: %q", remote)
+		}
+		parts := strings.SplitN(remote[colonIdx+1:], "/", 2)
+		if len(parts) != 2 {
+			return "", "", fmt.Errorf("expected owner/repo in SSH remote: %q", remote)
+		}
+		return parts[0], parts[1], nil
+	}
+
+	// HTTPS format: https://github.com/owner/repo
+	// Strip the scheme and host.
+	if idx := strings.Index(remote, "://"); idx != -1 {
+		remote = remote[idx+3:]
+	}
+	// remote is now "github.com/owner/repo"
+	slashIdx := strings.Index(remote, "/")
+	if slashIdx == -1 {
+		return "", "", fmt.Errorf("could not find owner/repo in remote: %q", remote)
+	}
+	rest := remote[slashIdx+1:] // "owner/repo"
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("expected owner/repo after host in remote: %q", remote)
+	}
+	return parts[0], parts[1], nil
 }
