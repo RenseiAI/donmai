@@ -47,13 +47,23 @@ func defaultWorkerCommand() []string {
 	return []string{exe, "agent", "run"}
 }
 
-// lookPathFallback returns `donmai agent run` resolved via PATH, or nil
-// when `af` is not installed.
+// lookPathFallback locates the worker binary via PATH when os.Executable()
+// is unavailable. Resolution order:
+//
+//  1. "donmai" — the OSS binary name and the preferred resolution target.
+//  2. "af"     — legacy back-compat name kept so existing PATH installs
+//     (e.g. rensei-tui embeds that were on PATH as "af") continue
+//     to work without a forced upgrade.
+//
+// Returns nil when no binary is found; the spawner then falls through to its
+// /bin/sh stub (sessions exit immediately and operators see a log warning).
 func lookPathFallback() []string {
-	if af, err := exec.LookPath("af"); err == nil && af != "" {
-		return []string{af, "agent", "run"}
+	for _, name := range []string{"donmai", "af"} {
+		if p, err := exec.LookPath(name); err == nil && p != "" {
+			return []string{p, "agent", "run"}
+		}
 	}
-	slog.Warn("daemon: could not resolve af binary for WorkerCommand; spawner will use stub fallback (sessions will exit immediately)")
+	slog.Warn("daemon: could not resolve donmai binary for WorkerCommand; spawner will use stub fallback (sessions will exit immediately)")
 	return nil
 }
 
