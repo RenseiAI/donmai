@@ -92,22 +92,31 @@ func TestDupStore_ExactMatch(t *testing.T) {
 }
 
 // TestDupStore_NearDuplicate detects near-duplicates via SimHash.
-func TestDupStore_NearDuplicate(_ *testing.T) {
+// The repeated corpus of 5 identical-except-for-one-digit lines produces
+// fingerprints with Hamming distance 0 (verified: digit tokens "1"/"2" are
+// filtered as <2 runes, so the fingerprint is identical). The test asserts
+// IsDuplicate=true and MatchType in {"near","exact"}.
+func TestDupStore_NearDuplicate(t *testing.T) {
 	store := &DupStore{}
 	// Store a longer text that will produce a stable SimHash fingerprint.
 	original := strings.Repeat("func doSomething(x int) int { return x + 1 }\n", 5)
 	store.Store("original", original)
 
-	// Slightly modified version — one word changed.
+	// Slightly modified version — one digit changed (produces Hamming distance 0
+	// at default threshold because single-char tokens are filtered).
 	modified := strings.Repeat("func doSomething(x int) int { return x + 2 }\n", 5)
 	result := store.CheckDuplicate(modified, SimHashDefaultThreshold)
 
-	// With only one digit changed across 5 repetitions, expect near-dup detection
-	// (Hamming distance likely <= 3 for this stable corpus).
-	// We test that the check runs without error and returns a sensible result.
-	// NOTE: near-dup detection is best-effort; exact threshold depends on tokenization.
-	// We assert at minimum that IsDuplicate or MatchType=="none" is returned cleanly.
-	_ = result // result may or may not be a near-dup depending on fingerprint collision
+	if !result.IsDuplicate {
+		t.Errorf("expected near-duplicate to be detected (matchType=%q, hammingDist=%d)",
+			result.MatchType, result.HammingDistance)
+	}
+	if result.MatchType != "near" && result.MatchType != "exact" {
+		t.Errorf("expected matchType 'near' or 'exact', got %q", result.MatchType)
+	}
+	if result.ExistingID != "original" {
+		t.Errorf("expected existingId 'original', got %q", result.ExistingID)
+	}
 }
 
 // TestDupStore_NoMatch returns "none" for completely different content.
