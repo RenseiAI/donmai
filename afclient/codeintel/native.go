@@ -1,0 +1,500 @@
+package codeintel
+
+import (
+	"crypto/sha1" //nolint:gosec // sha1 is used only for git-compatible blob hashing, not security
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	xxhash "github.com/cespare/xxhash/v2"
+)
+
+// NativeRunner provides the S0+S1 subset of code intelligence using pure Go
+// implementations (no external binary required). It covers:
+//
+//   - GetRepoMap  — builds / loads index.json, produces a ranked file map
+//   - SearchSymbols — BM25-style symbol search over the native index
+//
+// For operations not yet natively ported (search-code, check-duplicate,
+// find-type-usages, validate-cross-deps) the Runner falls back to the exec-shim
+// path (DONMAI_CODE_BIN / donmai-code / pnpm donmai-code).
+//
+// The native path is the PRIMARY implementation. The exec-shim is ONLY
+// consulted when DONMAI_CODE_BIN is set, which operators can use for testing
+// or to force the TypeScript path.
+type NativeRunner struct {
+	cwd      string
+	indexDir string
+
+	tsExtractor *TypeScriptExtractor
+	goExtractor *GoExtractor
+}
+
+// NewNativeRunner creates a NativeRunner that operates relative to cwd.
+func NewNativeRunner(cwd string) *NativeRunner {
+	return &NativeRunner{
+		cwd:         cwd,
+		indexDir:    ".donmai/code-index",
+		tsExtractor: &TypeScriptExtractor{},
+		goExtractor: &GoExtractor{},
+	}
+}
+
+// ── index.json persistence ────────────────────────────────────────────────────
+
+// loadIndex attempts to read the persisted index.json. Returns an empty
+// IndexFile if the file does not exist or cannot be decoded.
+func (n *NativeRunner) loadIndex() IndexFile {
+	path := filepath.Join(n.cwd, n.indexDir, "index.json")
+	data, err := os.ReadFile(path) //nolint:gosec // path is constructed from cwd
+	if err != nil {
+		return IndexFile{Files: map[string]FileIndex{}}
+	}
+	var idx IndexFile
+	if err := json.Unmarshal(data, &idx); err != nil {
+		return IndexFile{Files: map[string]FileIndex{}}
+	}
+	if idx.Files == nil {
+		idx.Files = map[string]FileIndex{}
+	}
+	return idx
+}
+
+// saveIndex persists index.json under .donmai/code-index/.
+func (n *NativeRunner) saveIndex(idx IndexFile) error {
+	dir := filepath.Join(n.cwd, n.indexDir)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("create index dir: %w", err)
+	}
+	data, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal index: %w", err)
+	}
+	path := filepath.Join(dir, "index.json")
+	if err := os.WriteFile(path, data, 0o640); err != nil { //nolint:gosec // G306 intentional — 640 is appropriate for index files
+		return fmt.Errorf("write index: %w", err)
+	}
+	return nil
+}
+
+// ── file discovery ────────────────────────────────────────────────────────────
+
+// indexableExtensions lists the file extensions whose language is supported by
+// the native extractors (S1 scope: TypeScript/JS + Go).
+var indexableExtensions = map[string]bool{
+	".ts":  true,
+	".tsx": true,
+	".js":  true,
+	".jsx": true,
+	".mjs": true,
+	".cjs": true,
+	".go":  true,
+}
+
+// skipDirs lists directory names that should never be indexed.
+var skipDirs = map[string]bool{
+	".git":         true,
+	"node_modules": true,
+	"vendor":       true,
+	".donmai":      true,
+	"dist":         true,
+	"build":        true,
+	".next":        true,
+}
+
+// discoverFiles walks the cwd and returns relative paths of indexable files.
+func (n *NativeRunner) discoverFiles(filePatterns []string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(n.cwd, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if skipDirs[name] || strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(name))
+		if !indexableExtensions[ext] {
+			return nil
+		}
+		rel, err := filepath.Rel(n.cwd, path)
+		if err != nil {
+			return nil
+		}
+		// Apply optional file-pattern filter (simple glob via filepath.Match).
+		if len(filePatterns) > 0 {
+			matched := false
+			for _, pat := range filePatterns {
+				if ok, _ := filepath.Match(pat, rel); ok {
+					matched = true
+					break
+				}
+				if ok, _ := filepath.Match(pat, name); ok {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return nil
+			}
+		}
+		paths = append(paths, rel)
+		return nil
+	})
+	return paths, err
+}
+
+// ── hashing ───────────────────────────────────────────────────────────────────
+
+// gitBlobHash computes a git-compatible SHA1 blob hash for content.
+// This matches the TS GitHashProvider.hashContent() method exactly.
+func gitBlobHash(content []byte) string {
+	header := fmt.Sprintf("blob %d\x00", len(content))
+	h := sha1.New() //nolint:gosec // sha1 is required for git compatibility
+	_, _ = h.Write([]byte(header))
+	_, _ = h.Write(content)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// ContentXXHash64 computes the xxHash64 (seed=0) of content as a hex string.
+// This matches the TS xxhash64() function which calls h64ToString(content)
+// from the xxhash-wasm package.
+//
+// The xxhash-wasm h64ToString function uses seed=0 (default) and returns the
+// hash as a lowercase hex string. github.com/cespare/xxhash/v2 uses seed=0
+// by default and produces identical output.
+func ContentXXHash64(content string) string {
+	return fmt.Sprintf("%016x", xxhash.Sum64String(content))
+}
+
+// ── extraction ────────────────────────────────────────────────────────────────
+
+// extractFile reads a file and extracts its symbols.
+func (n *NativeRunner) extractFile(relPath string) (FileAST, []byte, error) {
+	absPath := filepath.Join(n.cwd, relPath)
+	content, err := os.ReadFile(absPath) //nolint:gosec
+	if err != nil {
+		return FileAST{}, nil, fmt.Errorf("read %s: %w", relPath, err)
+	}
+	// Only extract from valid UTF-8 files to avoid regex panics.
+	if !utf8.Valid(content) {
+		return FileAST{FilePath: relPath, Language: "binary"}, content, nil
+	}
+	ast := n.extractAST(string(content), relPath)
+	return ast, content, nil
+}
+
+// extractAST dispatches to the appropriate language extractor.
+func (n *NativeRunner) extractAST(source, filePath string) FileAST {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	switch ext {
+	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
+		return n.tsExtractor.Extract(source, filePath)
+	case ".go":
+		return n.goExtractor.Extract(source, filePath)
+	default:
+		return FileAST{FilePath: filePath, Language: "unknown"}
+	}
+}
+
+// ── BuildIndex builds / incrementally updates the index ──────────────────────
+
+// BuildIndex walks the repository, extracts symbols from all indexable files,
+// and persists the result to index.json. Returns the updated IndexFile.
+func (n *NativeRunner) BuildIndex(opts GetRepoMapOptions) (IndexFile, error) {
+	files, err := n.discoverFiles(opts.FilePatterns)
+	if err != nil {
+		return IndexFile{}, fmt.Errorf("discover files: %w", err)
+	}
+
+	existing := n.loadIndex()
+	newFiles := make(map[string]FileIndex, len(existing.Files))
+
+	// Copy entries for files that haven't changed (incremental indexing).
+	for path, fi := range existing.Files {
+		newFiles[path] = fi
+	}
+
+	for _, relPath := range files {
+		ast, raw, err := n.extractFile(relPath)
+		if err != nil || ast.Language == "binary" {
+			continue
+		}
+		hash := gitBlobHash(raw)
+		// Skip re-extraction if the file hasn't changed.
+		if existing, ok := newFiles[relPath]; ok && existing.GitHash == hash {
+			continue
+		}
+		fi := FileIndex{
+			FilePath:    relPath,
+			GitHash:     hash,
+			Symbols:     ast.Symbols,
+			LastIndexed: time.Now().UnixMilli(),
+		}
+		if fi.Symbols == nil {
+			fi.Symbols = []CodeSymbol{}
+		}
+		newFiles[relPath] = fi
+	}
+
+	// Remove entries for files no longer on disk.
+	discovered := make(map[string]bool, len(files))
+	for _, p := range files {
+		discovered[p] = true
+	}
+	for path := range newFiles {
+		if !discovered[path] {
+			delete(newFiles, path)
+		}
+	}
+
+	idx := IndexFile{
+		Files:    newFiles,
+		RootHash: computeRootHash(newFiles),
+	}
+	if err := n.saveIndex(idx); err != nil {
+		return idx, fmt.Errorf("save index: %w", err)
+	}
+	return idx, nil
+}
+
+// computeRootHash produces a stable root hash over the entire file index by
+// XOR-folding xxhash64 of each "<path>:<gitHash>" entry, sorted by path.
+// This is a simplified alternative to the full Merkle tree used by the TS
+// implementation; it guarantees consistency across runs for the same file set.
+func computeRootHash(files map[string]FileIndex) string {
+	keys := make([]string, 0, len(files))
+	for k := range files {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var combined uint64
+	for _, k := range keys {
+		fi := files[k]
+		entry := k + ":" + fi.GitHash
+		combined ^= xxhash.Sum64String(entry)
+	}
+	return fmt.Sprintf("%016x", combined)
+}
+
+// ── GetRepoMap ────────────────────────────────────────────────────────────────
+
+// GetRepoMapNative builds (or loads) the code index and returns a
+// PageRank-ranked repository map as a slice of RepoMapEntry values serialised
+// to JSON-compatible any.
+//
+// The ranking heuristic assigns each file a score based on the number of
+// exported symbols and penalises test files. This intentionally mirrors the
+// spirit of the TS implementation (BM25 + PageRank) without the full graph
+// computation, which is deferred to S3.
+func (n *NativeRunner) GetRepoMapNative(opts GetRepoMapOptions) (any, error) {
+	idx, err := n.BuildIndex(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	var entries []RepoMapEntry
+	for _, fi := range idx.Files {
+		rank := computeFileRank(fi)
+		syms := make([]RepoMapSymbol, 0, len(fi.Symbols))
+		for _, s := range fi.Symbols {
+			syms = append(syms, RepoMapSymbol{
+				Name: s.Name,
+				Kind: s.Kind,
+				Line: s.Line,
+			})
+		}
+		entries = append(entries, RepoMapEntry{
+			FilePath: fi.FilePath,
+			Rank:     rank,
+			Symbols:  syms,
+		})
+	}
+
+	// Sort descending by rank, then ascending by path for determinism.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Rank != entries[j].Rank {
+			return entries[i].Rank > entries[j].Rank
+		}
+		return entries[i].FilePath < entries[j].FilePath
+	})
+
+	// Apply max-files cap.
+	maxFiles := opts.MaxFiles
+	if maxFiles <= 0 {
+		maxFiles = 50
+	}
+	if maxFiles > len(entries) {
+		maxFiles = len(entries)
+	}
+	entries = entries[:maxFiles]
+
+	return map[string]any{
+		"entries":  entries,
+		"rootHash": idx.RootHash,
+		"files":    len(idx.Files),
+	}, nil
+}
+
+// computeFileRank assigns a rank score to a file.
+func computeFileRank(fi FileIndex) float64 {
+	exported := 0
+	for _, s := range fi.Symbols {
+		if s.Exported {
+			exported++
+		}
+	}
+	score := float64(exported)*2 + float64(len(fi.Symbols))
+	// Penalise test files.
+	if strings.HasSuffix(fi.FilePath, "_test.go") ||
+		strings.Contains(fi.FilePath, "_test.") ||
+		strings.Contains(fi.FilePath, ".test.") ||
+		strings.Contains(fi.FilePath, ".spec.") {
+		score *= 0.3
+	}
+	return score
+}
+
+// ── SearchSymbols ─────────────────────────────────────────────────────────────
+
+// SearchSymbolsNative searches the code index for symbols matching the query.
+// It uses a simple BM25-inspired scoring: exact-name match > prefix match >
+// contains match, filtered optionally by kind and file pattern.
+func (n *NativeRunner) SearchSymbolsNative(opts SearchSymbolsOptions) (any, error) {
+	if opts.Query == "" {
+		return nil, fmt.Errorf("query is required")
+	}
+
+	idx, err := n.BuildIndex(GetRepoMapOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	queryLower := strings.ToLower(opts.Query)
+	kindsSet := make(map[string]bool, len(opts.Kinds))
+	for _, k := range opts.Kinds {
+		kindsSet[strings.TrimSpace(k)] = true
+	}
+
+	type scored struct {
+		symbol CodeSymbol
+		score  float64
+	}
+	var results []scored
+
+	for _, fi := range idx.Files {
+		// File-pattern filter.
+		if opts.FilePattern != "" {
+			matched, _ := filepath.Match(opts.FilePattern, fi.FilePath)
+			if !matched {
+				matched, _ = filepath.Match(opts.FilePattern, filepath.Base(fi.FilePath))
+			}
+			if !matched {
+				continue
+			}
+		}
+		for _, sym := range fi.Symbols {
+			// Kind filter.
+			if len(kindsSet) > 0 && !kindsSet[string(sym.Kind)] {
+				continue
+			}
+			score := scoreSymbol(sym.Name, queryLower)
+			if score <= 0 {
+				continue
+			}
+			// Boost exported symbols.
+			if sym.Exported {
+				score *= 1.5
+			}
+			results = append(results, scored{sym, score})
+		}
+	}
+
+	// Sort descending by score.
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].score != results[j].score {
+			return results[i].score > results[j].score
+		}
+		return results[i].symbol.Name < results[j].symbol.Name
+	})
+
+	maxResults := opts.MaxResults
+	if maxResults <= 0 {
+		maxResults = 20
+	}
+	if maxResults > len(results) {
+		maxResults = len(results)
+	}
+
+	out := make([]map[string]any, 0, maxResults)
+	for _, r := range results[:maxResults] {
+		out = append(out, map[string]any{
+			"symbol":    r.symbol,
+			"score":     r.score,
+			"matchType": matchType(r.symbol.Name, strings.ToLower(opts.Query)),
+		})
+	}
+	return out, nil
+}
+
+// scoreSymbol computes a BM25-inspired relevance score for a symbol name
+// against a lower-cased query.
+func scoreSymbol(name, queryLower string) float64 {
+	nameLower := strings.ToLower(name)
+	switch {
+	case nameLower == queryLower:
+		return 10.0
+	case strings.HasPrefix(nameLower, queryLower):
+		return 5.0
+	case strings.Contains(nameLower, queryLower):
+		return 2.0
+	default:
+		// fuzzy: all query chars appear in order in the name
+		if fuzzyMatch(nameLower, queryLower) {
+			return 0.5
+		}
+		return 0
+	}
+}
+
+// matchType categorises the match quality as exact/fuzzy/bm25.
+func matchType(name, queryLower string) string {
+	nameLower := strings.ToLower(name)
+	if nameLower == queryLower {
+		return "exact"
+	}
+	if strings.HasPrefix(nameLower, queryLower) || strings.Contains(nameLower, queryLower) {
+		return "bm25"
+	}
+	return "fuzzy"
+}
+
+// fuzzyMatch returns true if all runes of query appear in order in target.
+func fuzzyMatch(target, query string) bool {
+	tIdx := 0
+	trunes := []rune(target)
+	for _, qr := range query {
+		found := false
+		for ; tIdx < len(trunes); tIdx++ {
+			if trunes[tIdx] == qr {
+				tIdx++
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
