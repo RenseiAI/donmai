@@ -303,8 +303,15 @@ func (s *WorkerSpawner) AddProjects(extra []ProjectConfig) {
 // isDuplicateLocked reports whether candidate is already represented in either
 // the base or extra project sets. Must be called with s.mu held.
 func (s *WorkerSpawner) isDuplicateLocked(candidate ProjectConfig) bool {
-	all := append(s.opts.Projects, s.extraProjects...) //nolint:gocritic // intentional temporary union
-	for _, existing := range all {
+	for _, existing := range s.opts.Projects {
+		if candidate.ID != "" && candidate.ID == existing.ID {
+			return true
+		}
+		if candidate.Repository != "" && candidate.Repository == existing.Repository {
+			return true
+		}
+	}
+	for _, existing := range s.extraProjects {
 		if candidate.ID != "" && candidate.ID == existing.ID {
 			return true
 		}
@@ -313,6 +320,27 @@ func (s *WorkerSpawner) isDuplicateLocked(candidate ProjectConfig) bool {
 		}
 	}
 	return false
+}
+
+// AllProjects returns a snapshot of the union of the base project set and any
+// additional projects registered via AddProjects. The returned slice is a
+// defensive copy; callers may safely hold it across subsequent SetProjects or
+// AddProjects calls.
+//
+// This is the correct view to pass to PollItemToSessionSpec /
+// PollItemToSessionDetail in poll-loop closures so that satellite-org projects
+// registered after daemon start are visible to slug→URL resolution.
+func (s *WorkerSpawner) AllProjects() []ProjectConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := len(s.opts.Projects) + len(s.extraProjects)
+	if total == 0 {
+		return nil
+	}
+	out := make([]ProjectConfig, 0, total)
+	out = append(out, s.opts.Projects...)
+	out = append(out, s.extraProjects...)
+	return out
 }
 
 // AcceptWork validates the spec, spawns a worker, and returns its handle.

@@ -480,12 +480,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Region:          cfg.Machine.Region,
 			OnReregister:    reregister,
 			GetAllowlist: func() []ProjectAllowlistEntry {
-				d.mu.RLock()
-				defer d.mu.RUnlock()
-				if d.config == nil {
-					return nil
-				}
-				return AllowlistEntriesFromConfig(d.config.Projects)
+				// Use d.spawner.AllProjects() so that satellite-org
+				// projects registered via AddProjects are included in
+				// the heartbeat's reported allowlist. d.spawner is set
+				// before the heartbeat is constructed (see above).
+				return AllowlistEntriesFromConfig(d.spawner.AllProjects())
 			},
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
@@ -520,10 +519,17 @@ func (d *Daemon) Start(ctx context.Context) error {
 					slog.Info(fmt.Sprintf(format, args...))
 				},
 				OnWork: func(item PollWorkItem) error {
-					spec := PollItemToSessionSpec(item, cfg.Projects)
+					// Use d.spawner.AllProjects() so that satellite-org
+					// projects registered via AddProjects after daemon start
+					// are visible to the slug→URL resolution performed by
+					// PollItemToSessionSpec / PollItemToSessionDetail.
+					// cfg.Projects is the startup snapshot and would miss
+					// any extraProjects appended later.
+					projects := d.spawner.AllProjects()
+					spec := PollItemToSessionSpec(item, projects)
 					detail := PollItemToSessionDetail(
 						item,
-						cfg.Projects,
+						projects,
 						cfg.Orchestrator.URL,
 						d.runtimeJWT(),
 						d.WorkerID(),
