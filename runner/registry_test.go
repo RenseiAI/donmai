@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
 // TestRegistry_RegisterResolve covers the happy path and the

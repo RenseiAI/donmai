@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
 // TestShouldSteer_Table covers the decision matrix in steering.go.

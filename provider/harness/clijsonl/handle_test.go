@@ -1,4 +1,4 @@
-package claude
+package clijsonl
 
 import (
 	"context"
@@ -11,6 +11,22 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 )
+
+// claudeArgs mirrors the fixed headless argv the claude provider's
+// buildArgs emits for a basic prompt-only spawn. The clijsonl driver is
+// argv-agnostic — the harness supplies the flags — so the driver tests
+// drive it with this representative claude-compatible argv.
+func claudeArgs() []string {
+	return []string{
+		"-p",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--dangerously-skip-permissions",
+	}
+}
+
+// Compile-time assertion: the driver Handle satisfies agent.Handle.
+var _ agent.Handle = (*Handle)(nil)
 
 // fakeCLI returns a path to a /bin/sh script that simulates the
 // claude CLI's stream-json output. The script writes the canned body
@@ -44,16 +60,28 @@ func fakeCLI(t *testing.T, body string) string {
 	return path
 }
 
-func newProviderForFake(t *testing.T, fakePath string) *Provider {
+// spawnFake spawns the fake CLI via the shared SpawnBinary driver with a
+// claude-compatible argv and no MCP config. It is the driver-level
+// stand-in for claude.Provider.Spawn used across the clijsonl tests.
+func spawnFake(t *testing.T, binary string, spec agent.Spec) *Handle {
 	t.Helper()
-	p, err := New(Options{
-		Binary:   fakePath,
-		LookPath: func(name string) (string, error) { return name, nil },
-	})
+	return spawnFakeCtx(t.Context(), t, binary, spec)
+}
+
+// spawnFakeCtx is spawnFake with a caller-supplied context (for
+// cancellation tests). The spec's MCPServers drive the Stop-cleanup
+// assertion; pass a spec with none for spawns that have no MCP config.
+func spawnFakeCtx(ctx context.Context, t *testing.T, binary string, spec agent.Spec) *Handle {
+	t.Helper()
+	mcpPath, err := WriteMCPConfig(spec.MCPServers)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("WriteMCPConfig: %v", err)
 	}
-	return p
+	h, err := SpawnBinary(ctx, binary, claudeArgs(), spec.Prompt, mcpPath, spec.Cwd, spec.Env, spec.OnProcessSpawned)
+	if err != nil {
+		t.Fatalf("SpawnBinary: %v", err)
+	}
+	return h
 }
 
 // collect drains events from h until the channel closes OR a
@@ -116,11 +144,7 @@ func TestHandle_HappyPath_FakeCLI(t *testing.T) {
 {"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.001,"usage":{"input_tokens":10,"output_tokens":3}}`
 	cli := fakeCLI(t, body)
 
-	p := newProviderForFake(t, cli)
-	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "test"})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
+	h := spawnFake(t, cli, agent.Spec{Prompt: "test"})
 	defer func() { _ = h.Stop(t.Context()) }()
 
 	events := collect(t, h)
@@ -151,12 +175,8 @@ func TestHandle_StopIdempotent(t *testing.T) {
 
 	cli := fakeCLI(t, `{"type":"system","subtype":"init","session_id":"x"}
 {"type":"result","subtype":"success","is_error":false,"num_turns":0,"usage":{}}`)
-	p := newProviderForFake(t, cli)
 
-	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "x"})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
+	h := spawnFake(t, cli, agent.Spec{Prompt: "x"})
 	_ = collect(t, h)
 
 	if err := h.Stop(t.Context()); err != nil {
@@ -176,11 +196,7 @@ func TestHandle_NoTerminal_SyntheticErrorEvent(t *testing.T) {
 	body := `{"type":"system","subtype":"init","session_id":"sx"}`
 	cli := fakeCLI(t, body)
 
-	p := newProviderForFake(t, cli)
-	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "x"})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
+	h := spawnFake(t, cli, agent.Spec{Prompt: "x"})
 	defer func() { _ = h.Stop(t.Context()) }()
 
 	events := collect(t, h)
@@ -212,13 +228,9 @@ func TestHandle_CtxCancel_Stops(t *testing.T) {
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("chmod: %v", err)
 	}
-	p := newProviderForFake(t, path)
 
 	ctx, cancel := context.WithCancel(t.Context())
-	h, err := p.Spawn(ctx, agent.Spec{Prompt: "x"})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
+	h := spawnFakeCtx(ctx, t, path, agent.Spec{Prompt: "x"})
 
 	// Wait for the init event so we know the subprocess started.
 	// Generous deadline because coverage instrumentation + -race
@@ -252,20 +264,15 @@ func TestHandle_StopCleansMCPTmpfile(t *testing.T) {
 
 	cli := fakeCLI(t, `{"type":"system","subtype":"init","session_id":"x"}
 {"type":"result","subtype":"success","is_error":false,"num_turns":0,"usage":{}}`)
-	p := newProviderForFake(t, cli)
 
-	// Use the package-private spawn so we can read the MCP path off
-	// the concrete *Handle without exposing it on the public
-	// agent.Handle interface.
-	h, err := p.spawn(t.Context(), agent.Spec{
+	// spawnFakeCtx returns the concrete *Handle so we can read the MCP
+	// path off it (mcpConfigPath is unexported on the driver Handle).
+	h := spawnFakeCtx(t.Context(), t, cli, agent.Spec{
 		Prompt: "x",
 		MCPServers: []agent.MCPServerConfig{
 			{Name: "af_linear", Command: "/bin/echo", Args: []string{"hi"}},
 		},
-	}, "")
-	if err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
+	})
 	mcpPath := h.mcpConfigPath
 	if mcpPath == "" {
 		t.Fatal("expected mcpConfigPath to be set")

@@ -1,4 +1,4 @@
-package claude
+package clijsonl
 
 import (
 	"bytes"
@@ -93,12 +93,8 @@ func TestHandle_Inject_ResumeStderr_CapturedInError(t *testing.T) {
 {"type":"result","subtype":"success","is_error":false,"num_turns":0,"usage":{}}`
 	resumeStderrBody := "claude: oauth token expired and refresh failed"
 	cli := fakeMultiCLIResumeStderrFail(t, parentBody, resumeStderrBody)
-	p := newProviderForFake(t, cli)
 
-	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "first"})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
+	h := spawnFake(t, cli, agent.Spec{Prompt: "first"})
 	defer func() { _ = h.Stop(t.Context()) }()
 
 	// Wait for parent init so SessionID is captured.
@@ -114,7 +110,7 @@ func TestHandle_Inject_ResumeStderr_CapturedInError(t *testing.T) {
 	// unblocked.
 	go func() { _ = drainUntilResult(t, h) }()
 
-	err = h.Inject(context.Background(), "follow up")
+	err := h.Inject(context.Background(), "follow up")
 	if err == nil {
 		t.Fatal("Inject should error when resume subprocess exits non-zero")
 	}

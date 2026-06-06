@@ -18,7 +18,7 @@ import (
 	"github.com/RenseiAI/donmai/codesurvival"
 	"github.com/RenseiAI/donmai/internal/envcompat"
 	"github.com/RenseiAI/donmai/kgextract"
-	providerclaude "github.com/RenseiAI/donmai/provider/claude"
+	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/worker"
 )
 

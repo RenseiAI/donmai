@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
 // TestSelectProvider_KnownProvider verifies that SelectProvider returns the

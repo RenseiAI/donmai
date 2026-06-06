@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )

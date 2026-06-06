@@ -8,7 +8,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
-	"github.com/RenseiAI/donmai/provider/claude"
+	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 )
 
 // shouldSteer reports whether stage 1 of tail recovery (steering)
@@ -85,9 +85,9 @@ func (r *Runner) attemptSteering(ctx context.Context, handle agent.Handle, qw Qu
 //
 //   - [agent.ErrUnsupported]      — provider has no injection capability;
 //     the caller relies on the dispatch-time fold / backstop instead.
-//   - [claude.ErrSessionNotReady] — no InitEvent observed yet; injecting
+//   - [clijsonl.ErrSessionNotReady] — no InitEvent observed yet; injecting
 //     before the session id is captured is a transient race, not an error.
-//   - [claude.ErrInjectInFlight]  — a previous inject's --resume subprocess
+//   - [clijsonl.ErrInjectInFlight]  — a previous inject's --resume subprocess
 //     is still running; claude is single-in-flight, so the caller skips
 //     this one rather than failing the run.
 //
@@ -100,10 +100,10 @@ func (r *Runner) injectDirective(ctx context.Context, handle agent.Handle, text 
 		case errors.Is(err, agent.ErrUnsupported):
 			r.logger.Debug("inject skipped: provider does not support injection")
 			return nil
-		case errors.Is(err, claude.ErrSessionNotReady):
+		case errors.Is(err, clijsonl.ErrSessionNotReady):
 			r.logger.Debug("inject skipped: session not ready (no InitEvent yet)")
 			return nil
-		case errors.Is(err, claude.ErrInjectInFlight):
+		case errors.Is(err, clijsonl.ErrInjectInFlight):
 			r.logger.Debug("inject skipped: a previous inject is still in flight")
 			return nil
 		default:
