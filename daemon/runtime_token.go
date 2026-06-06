@@ -50,6 +50,16 @@ type RefreshTokenResult struct {
 	// RuntimeToken is the fresh runtime JWT.
 	RuntimeToken string
 
+	// RuntimeTokenExpiresAt, HeartbeatInterval and PollInterval mirror the
+	// platform's response (refresh endpoint or full re-register). Callers need
+	// them to persist a COMPLETE CachedJWT after a refresh — the on-disk cache
+	// entry carries the expiry + cadence, not just the token, so a daemon that
+	// refreshes its token in-memory but writes back only the token would leave
+	// a half-populated cache. Empty/zero when the platform omitted them.
+	RuntimeTokenExpiresAt string
+	HeartbeatInterval     int
+	PollInterval          int
+
 	// RegistrationTokenSwapped is true when Mode=reregister produced a
 	// different workerId. Operators care about this signal because the
 	// platform forgets the old workerId after a fresh registration —
@@ -119,10 +129,13 @@ func RefreshRuntimeToken(
 				"reason", reason,
 			)
 			return &RefreshTokenResult{
-				Mode:         "refresh",
-				WorkerID:     currentWorkerID,
-				RuntimeToken: fresh.RuntimeToken,
-				Reason:       reason,
+				Mode:                  "refresh",
+				WorkerID:              currentWorkerID,
+				RuntimeToken:          fresh.RuntimeToken,
+				RuntimeTokenExpiresAt: fresh.RuntimeTokenExpiresAt,
+				HeartbeatInterval:     fresh.HeartbeatInterval,
+				PollInterval:          fresh.PollInterval,
+				Reason:                reason,
 			}, nil
 		}
 		// 404 / 405 → endpoint not deployed yet. Fall through to
@@ -179,9 +192,40 @@ func RefreshRuntimeToken(
 		Mode:                     "reregister",
 		WorkerID:                 rr.WorkerID,
 		RuntimeToken:             rr.RuntimeToken,
+		RuntimeTokenExpiresAt:    rr.RuntimeTokenExpiresAt,
+		HeartbeatInterval:        rr.HeartbeatInterval,
+		PollInterval:             rr.PollInterval,
 		RegistrationTokenSwapped: swapped,
 		Reason:                   reason,
 	}, nil
+}
+
+// persistRefreshedToken writes the refreshed credentials to the on-disk JWT
+// cache (daemon.jwt) so processes that read the token from disk — the
+// per-session credential resolver and the runner's platform client — pick up
+// the fresh token instead of the now-stale cached one. The daemon's heartbeat
+// and poll loops swap the token in memory, but anything reading daemon.jwt does
+// not see that swap; without this write they keep presenting the expired token
+// (the platform then 307-redirects credential snapshots to an HTML login page
+// and 401s status updates — the stale-cached-token credential root cause).
+//
+// Best-effort by contract: callers log and continue on error; a cache-write
+// failure must never abort the refresh, since the in-memory swap already keeps
+// poll + heartbeat alive. Returns nil for an empty path or nil result.
+func persistRefreshedToken(jwtPath string, result *RefreshTokenResult, nowFn func() time.Time) error {
+	if jwtPath == "" || result == nil {
+		return nil
+	}
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	return SaveCachedJWT(jwtPath, &RegisterResponse{
+		WorkerID:              result.WorkerID,
+		RuntimeToken:          result.RuntimeToken,
+		HeartbeatInterval:     result.HeartbeatInterval,
+		PollInterval:          result.PollInterval,
+		RuntimeTokenExpiresAt: result.RuntimeTokenExpiresAt,
+	}, nowFn())
 }
 
 // refreshHTTPError carries the HTTP status from the refresh probe so
