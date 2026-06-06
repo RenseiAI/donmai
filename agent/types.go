@@ -363,6 +363,21 @@ type Spec struct {
 	// falls back to provider/env default.
 	Model string `json:"model,omitempty"`
 
+	// Endpoint is the RESOLVED model-endpoint binding. nil == today's
+	// behavior: providers read Spec.Model / Spec.Env as before. nil is the
+	// canonical "unset" sentinel; the Phase-3 Spawn read site gates on
+	// Endpoint == nil (a non-nil pointer is treated as set — IsZero on the
+	// pointee is a convenience, not the unset check). Wired into the Spawn
+	// path in Phase 3; no provider reads it in P1. Spec.Model remains the
+	// source of truth and is NOT yet derived from this.
+	//
+	// Declared as a POINTER (not a value) so the json:"endpoint,omitempty"
+	// tag actually omits the field for pre-P1 producers — Go's encoding/json
+	// never treats a non-pointer struct as "empty", so a value field would
+	// always serialize "endpoint":{...} and break the wire round-trip
+	// guarantee (P1-SPEC §6). nil is the canonical "unset" sentinel.
+	Endpoint *EndpointBinding `json:"endpoint,omitempty"`
+
 	// Effort is the normalized reasoning-effort tier. Honored only
 	// when Capabilities.SupportsReasoningEffort is true.
 	Effort EffortLevel `json:"effort,omitempty"`

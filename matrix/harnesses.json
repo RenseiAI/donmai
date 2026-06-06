@@ -1,0 +1,253 @@
+{
+  "schemaVersion": "p1.0",
+  "contractAbi": "capability-matrix/v1",
+  "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
+  "harnesses": [
+    {
+      "name": "amp",
+      "humanLabel": "Amp",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": false,
+        "resume": false,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": false,
+        "subagents": false,
+        "reasoningEffort": false,
+        "oneShot": true,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "drives": [
+          "anthropic-messages"
+        ],
+        "drivesHosts": [
+          "direct"
+        ],
+        "transport": "cli-injection"
+      },
+      "drives": [
+        "anthropic-messages"
+      ],
+      "drivesHosts": [
+        "direct"
+      ]
+    },
+    {
+      "name": "antigravity",
+      "humanLabel": "Antigravity",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": false,
+        "resume": false,
+        "tools": false,
+        "mcp": false,
+        "allowedToolsList": false,
+        "subagents": false,
+        "reasoningEffort": false,
+        "oneShot": true,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "",
+        "streamingTransport": "none",
+        "drives": [
+          "antigravity-oauth"
+        ],
+        "drivesHosts": [
+          "oauth-cli"
+        ],
+        "transport": "pty"
+      },
+      "drives": [
+        "antigravity-oauth"
+      ],
+      "drivesHosts": [
+        "oauth-cli"
+      ]
+    },
+    {
+      "name": "claude-code",
+      "humanLabel": "Claude Code",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": false,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": true,
+        "subagents": true,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "drives": [
+          "anthropic-messages"
+        ],
+        "drivesHosts": [
+          "bedrock",
+          "direct",
+          "oauth-cli",
+          "vertex"
+        ],
+        "transport": "cli-injection"
+      },
+      "drives": [
+        "anthropic-messages"
+      ],
+      "drivesHosts": [
+        "bedrock",
+        "direct",
+        "oauth-cli",
+        "vertex"
+      ]
+    },
+    {
+      "name": "codex",
+      "humanLabel": "Codex",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": false,
+        "resume": true,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": false,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "codex",
+        "streamingTransport": "none",
+        "drives": [
+          "openai-chat",
+          "openai-responses"
+        ],
+        "drivesHosts": [
+          "azure",
+          "direct",
+          "oauth-cli"
+        ],
+        "transport": "subprocess-jsonrpc"
+      },
+      "drives": [
+        "openai-chat",
+        "openai-responses"
+      ],
+      "drivesHosts": [
+        "azure",
+        "direct",
+        "oauth-cli"
+      ]
+    },
+    {
+      "name": "opencode",
+      "humanLabel": "OpenCode",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": false,
+        "resume": false,
+        "tools": false,
+        "mcp": false,
+        "allowedToolsList": false,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "drives": [
+          "openai-chat"
+        ],
+        "drivesHosts": [
+          "direct",
+          "local",
+          "oauth-cli"
+        ],
+        "transport": "cli-injection"
+      },
+      "drives": [
+        "openai-chat"
+      ],
+      "drivesHosts": [
+        "direct",
+        "local",
+        "oauth-cli"
+      ]
+    },
+    {
+      "name": "raw",
+      "humanLabel": "Gemini (direct)",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": false,
+        "tools": true,
+        "mcp": false,
+        "allowedToolsList": true,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "gemini",
+        "streamingTransport": "sse",
+        "drives": [
+          "gemini-generate",
+          "ollama"
+        ],
+        "drivesHosts": [
+          "direct",
+          "local",
+          "vertex"
+        ],
+        "transport": "direct-api"
+      },
+      "drives": [
+        "gemini-generate",
+        "ollama"
+      ],
+      "drivesHosts": [
+        "direct",
+        "local",
+        "vertex"
+      ]
+    },
+    {
+      "name": "stub",
+      "humanLabel": "Test Stub",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": true,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": true,
+        "subagents": true,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "none",
+        "drives": [
+          "stub"
+        ],
+        "drivesHosts": [
+          "local"
+        ],
+        "transport": "direct-api"
+      },
+      "drives": [
+        "stub"
+      ],
+      "drivesHosts": [
+        "local"
+      ]
+    }
+  ]
+}
