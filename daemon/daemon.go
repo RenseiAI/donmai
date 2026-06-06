@@ -461,6 +461,28 @@ func (d *Daemon) Start(ctx context.Context) error {
 			if d.sessionDetails != nil {
 				d.sessionDetails.UpdateRuntimeCredentials(result.WorkerID, result.RuntimeToken)
 			}
+			// Persist the refreshed credentials to the on-disk cache so other
+			// readers of daemon.jwt pick up the new token instead of the now-
+			// stale one. Heartbeat/poll use the in-memory swap above, but the
+			// per-session credential resolver and the runner's platform client
+			// read the token from disk — without this write they keep using the
+			// expired token (snapshot 307→HTML, status-update 401). Best-effort:
+			// a cache-write failure must never abort the refresh.
+			if regOpts.JWTPath != "" {
+				if serr := persistRefreshedToken(regOpts.JWTPath, result, regOpts.Now); serr != nil {
+					slog.Warn("[runtime-token] failed to persist refreshed token to cache",
+						"event", "refresh.cache-write-failed",
+						"workerId", result.WorkerID,
+						"jwtPath", regOpts.JWTPath,
+						"err", serr.Error(),
+					)
+				} else {
+					slog.Info("[runtime-token]",
+						"event", "refresh.cached",
+						"workerId", result.WorkerID,
+					)
+				}
+			}
 			return result.WorkerID, result.RuntimeToken, nil
 		}
 
