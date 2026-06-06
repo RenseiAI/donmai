@@ -57,6 +57,14 @@ func TestSpecFieldCoverage(t *testing.T) {
 		"ProviderConfig",
 		"SubAgentProvider",
 		"OnProcessSpawned", // documented as honored at spawn time
+		// Endpoint is the additive two-axis model-endpoint binding (P1). The
+		// codex provider takes its cardinal-rule-10 position here: Endpoint is
+		// INTENTIONALLY IGNORED in P1 — no provider reads Spec.Endpoint until
+		// Phase 3 wires resolution, so the codex Spawn translation is byte-for-
+		// byte identical when Endpoint is the zero value (which it always is in
+		// P1). Registered here (the static coverage mirror) so this guard rail
+		// stays green; NewSpawnPlan is unchanged.
+		"Endpoint",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)
