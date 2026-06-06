@@ -3,19 +3,19 @@ package matrix
 import (
 	"github.com/RenseiAI/donmai/agent"
 
-	"github.com/RenseiAI/donmai/provider/agycli"
-	"github.com/RenseiAI/donmai/provider/amp"
-	"github.com/RenseiAI/donmai/provider/claude"
-	"github.com/RenseiAI/donmai/provider/codex"
 	endpAnthropic "github.com/RenseiAI/donmai/provider/endpoint/anthropic"
 	endpGoogle "github.com/RenseiAI/donmai/provider/endpoint/google"
 	endpLocal "github.com/RenseiAI/donmai/provider/endpoint/local"
 	endpOpenAI "github.com/RenseiAI/donmai/provider/endpoint/openai"
 	endpStub "github.com/RenseiAI/donmai/provider/endpoint/stub"
-	"github.com/RenseiAI/donmai/provider/gemini"
-	"github.com/RenseiAI/donmai/provider/ollama"
-	"github.com/RenseiAI/donmai/provider/opencode"
-	stubprov "github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/provider/harness/agycli"
+	"github.com/RenseiAI/donmai/provider/harness/amp"
+	"github.com/RenseiAI/donmai/provider/harness/claude"
+	"github.com/RenseiAI/donmai/provider/harness/codex"
+	"github.com/RenseiAI/donmai/provider/harness/gemini"
+	"github.com/RenseiAI/donmai/provider/harness/ollama"
+	"github.com/RenseiAI/donmai/provider/harness/opencode"
+	stubprov "github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
 // HarnessHarvestList is the harvest list of the 8 harness providers. Each entry

@@ -6,7 +6,7 @@ import (
 	"os/exec"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/claude"
+	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 )
 
 // DefaultBinary is the executable name probed on $PATH at construction.
@@ -146,20 +146,20 @@ func (*Provider) Capabilities() agent.Capabilities {
 //
 // The prompt is delivered via stdin. Amp's --stream-json mode emits
 // Claude Code-compatible JSONL (same system.init / assistant / result
-// event shape), so the claude package's Handle and JSONL mapper are
-// reused via claude.SpawnBinary — no parsing code is duplicated.
+// event shape), so the clijsonl package's Handle and JSONL mapper are
+// reused via clijsonl.SpawnBinary — no parsing code is duplicated.
 //
 // On any pre-spawn failure (tmpfile write, exec start) the provider
 // returns an error wrapping agent.ErrSpawnFailed.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	// Write the per-session MCP config tmpfile (same format as claude).
-	mcpPath, err := claude.WriteMCPConfig(spec.MCPServers)
+	mcpPath, err := clijsonl.WriteMCPConfig(spec.MCPServers)
 	if err != nil {
 		return nil, fmt.Errorf("%w: amp: write MCP config: %v", agent.ErrSpawnFailed, err)
 	}
 
 	argv := buildAmpArgs(spec, mcpPath)
-	h, err := claude.SpawnBinary(
+	h, err := clijsonl.SpawnBinary(
 		ctx,
 		p.binary,
 		argv,

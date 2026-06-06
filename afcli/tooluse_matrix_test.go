@@ -6,11 +6,11 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
-	provideramp "github.com/RenseiAI/donmai/provider/amp"
-	providerclaude "github.com/RenseiAI/donmai/provider/claude"
-	providergemini "github.com/RenseiAI/donmai/provider/gemini"
-	provideropencode "github.com/RenseiAI/donmai/provider/opencode"
-	providerstub "github.com/RenseiAI/donmai/provider/stub"
+	provideramp "github.com/RenseiAI/donmai/provider/harness/amp"
+	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
+	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
+	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
+	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
 // TestToolUseCapabilityMatrix asserts the v2 tool-use surface flags

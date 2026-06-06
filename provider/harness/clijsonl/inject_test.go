@@ -1,4 +1,4 @@
-package claude
+package clijsonl
 
 import (
 	"context"
@@ -64,12 +64,8 @@ func TestHandle_Inject_HappyPath(t *testing.T) {
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Turn 2 (resumed)."}]}}
 {"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.001,"usage":{"input_tokens":4,"output_tokens":3}}`
 	cli := fakeMultiCLI(t, parentBody, resumeBody, traceFile)
-	p := newProviderForFake(t, cli)
 
-	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "first turn"})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
+	h := spawnFake(t, cli, agent.Spec{Prompt: "first turn"})
 	defer func() { _ = h.Stop(t.Context()) }()
 
 	// Drain parent's events: init + assistant + result. Then call
@@ -120,14 +116,10 @@ func TestHandle_Inject_BeforeInit_Errors(t *testing.T) {
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("chmod fake cli: %v", err)
 	}
-	p := newProviderForFake(t, path)
-	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "x"})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
+	h := spawnFake(t, path, agent.Spec{Prompt: "x"})
 	defer func() { _ = h.Stop(t.Context()) }()
 
-	err = h.Inject(t.Context(), "too early")
+	err := h.Inject(t.Context(), "too early")
 	if err == nil {
 		t.Fatal("Inject before InitEvent should error")
 	}
@@ -167,12 +159,7 @@ func TestHandle_Inject_InFlightConflict_Errors(t *testing.T) {
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("chmod fake cli: %v", err)
 	}
-	p := newProviderForFake(t, path)
-
-	h, err := p.spawn(t.Context(), agent.Spec{Prompt: "x"}, "")
-	if err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
+	h := spawnFake(t, path, agent.Spec{Prompt: "x"})
 	defer func() { _ = h.Stop(t.Context()) }()
 
 	// Wait for parent init so SessionID is captured.
@@ -198,7 +185,7 @@ func TestHandle_Inject_InFlightConflict_Errors(t *testing.T) {
 	}
 
 	// Second Inject should immediately error.
-	err = h.Inject(t.Context(), "second")
+	err := h.Inject(t.Context(), "second")
 	if err == nil {
 		t.Fatal("second Inject should error while first is in flight")
 	}
@@ -247,12 +234,7 @@ func TestHandle_Inject_CtxCancel_KillsSubprocess(t *testing.T) {
 	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
 		t.Fatalf("chmod fake cli: %v", err)
 	}
-	p := newProviderForFake(t, path)
-
-	h, err := p.spawn(t.Context(), agent.Spec{Prompt: "x"}, "")
-	if err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
+	h := spawnFake(t, path, agent.Spec{Prompt: "x"})
 	defer func() { _ = h.Stop(t.Context()) }()
 
 	_ = drainUntilResult(t, h)
