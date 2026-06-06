@@ -163,7 +163,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	)
 
 	// 5. Construct registry, runner, and run.
-	reg := buildAgentRunRegistry(logger)
+	reg := BuildAgentRunRegistry(logger)
 	logger.Info("donmai agent run: registry built", "providers", reg.Names())
 
 	wtParent := opts.worktree
@@ -420,12 +420,18 @@ type providerCtor struct {
 	new  func() (agent.Provider, error)
 }
 
-// buildAgentRunRegistry constructs the runner.Registry for one
-// `donmai agent run` invocation. Stub is always registered; claude + codex
-// register on best-effort (their probes return errors when the
-// underlying CLI / app-server is missing — we log + skip rather than
-// fail the whole worker so a misconfigured host does not silently lose
-// stub-mode smoke runs).
+// BuildAgentRunRegistry constructs the runner.Registry of the providers
+// compiled into this binary — the SINGLE SOURCE for the agent-run provider
+// set. It is the public, importable entry point downstream Go binaries (e.g.
+// the closed-source `rensei` TUI) call so they do NOT have to fork the
+// hand-authored ctor list; calling this builder keeps every embedder on the
+// exact same eight providers donmai resolves, eliminating the documented
+// fork-rot between donmai and rensei-tui.
+//
+// Stub is always registered; the others register on best-effort (their probes
+// return errors when the underlying CLI / app-server / API key is missing — we
+// log + skip rather than fail the whole worker so a misconfigured host does
+// not silently lose stub-mode smoke runs).
 //
 // Each spawned `donmai agent run` builds its own Registry — providers are
 // stateless modulo codex's app-server, and that app-server is a
@@ -448,8 +454,26 @@ type providerCtor struct {
 // constructor returns ErrProviderUnavailable (no API key, server
 // unreachable) the registry build logs WARN and proceeds without
 // that provider, identical to the existing probe-failure path.
-func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
-	return buildRegistryFromCtors(logger, []providerCtor{
+//
+// The ctor list below is the single hand-authored source of the agent-run
+// provider set. It is deliberately NOT matrix-generated: each provider's
+// New constructor takes a distinct, package-local Options type (and stub is
+// variadic), so a generated closure could only re-emit these same per-package
+// New(Options{}) call sites verbatim — adding codegen surface for zero
+// single-sourcing gain. Keeping it here, behind a public builder, is the clean
+// realization of "single source + no fork".
+func BuildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
+	return buildRegistryFromCtors(logger, agentRunProviderCtors())
+}
+
+// agentRunProviderCtors returns the single hand-authored ctor list — the SoT
+// for the agent-run provider set. Pulled into its own function (returning a
+// fresh slice on each call) so [BuildAgentRunRegistry] and the no-behavior-
+// change parity test enumerate the SAME provider set without the test having
+// to re-declare it (which would itself become a fork). Order matches the
+// historical slice exactly; behaviour is unchanged.
+func agentRunProviderCtors() []providerCtor {
+	return []providerCtor{
 		{name: "stub", new: func() (agent.Provider, error) { return providerstub.New() }},
 		{name: "claude", new: func() (agent.Provider, error) { return providerclaude.New(providerclaude.Options{}) }},
 		{name: "codex", new: func() (agent.Provider, error) { return providercodex.New(providercodex.Options{}) }},
@@ -474,10 +498,17 @@ func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
 		// host PATH. NOT for cloud sandboxes.
 		{name: "agy-cli", new: func() (agent.Provider, error) { return provideragycli.New(provideragycli.Options{}) }},
 		{name: "opencode", new: func() (agent.Provider, error) { return provideropencode.New(provideropencode.Options{}) }},
-	})
+	}
 }
 
-// buildRegistryFromCtors is the testable core of [buildAgentRunRegistry].
+// buildAgentRunRegistry is a thin internal alias of [BuildAgentRunRegistry],
+// retained so the package's existing call sites and tests keep their
+// short, unexported name. Behaviour is identical — it just delegates.
+func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
+	return BuildAgentRunRegistry(logger)
+}
+
+// buildRegistryFromCtors is the testable core of [BuildAgentRunRegistry].
 // It walks the provided ctors, logs WARN per-provider failure, and
 // emits an ERROR record when the resulting registry has zero
 // successful registrations. Returns the (possibly-empty) Registry.

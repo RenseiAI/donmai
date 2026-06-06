@@ -52,7 +52,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// operator queries. Probes that fail (e.g. ollama not
 			// running) emit WARN logs but do not block daemon start.
 			// Wave 9 / A1.
-			providerReg := buildAgentRunRegistry(slog.Default())
+			providerReg := BuildAgentRunRegistry(slog.Default())
 			// Substitute the well-known DefaultHTTPPort here when the
 			// operator did not pass `--port`. Leaving zero through to
 			// daemon.New would bind an ephemeral port — correct for
