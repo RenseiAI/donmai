@@ -146,9 +146,7 @@ func TestProvider_Shutdown_NoOp(t *testing.T) {
 	}
 }
 
-// Compile-time assertions: Provider satisfies agent.Provider, Handle
-// satisfies agent.Handle.
-var (
-	_ agent.Provider = (*Provider)(nil)
-	_ agent.Handle   = (*Handle)(nil)
-)
+// Compile-time assertion: Provider satisfies agent.Provider. (The
+// Handle type now lives in provider/harness/clijsonl, which carries its
+// own agent.Handle compile assertion.)
+var _ agent.Provider = (*Provider)(nil)

@@ -22,15 +22,16 @@ import (
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/prompt"
-	provideragycli "github.com/RenseiAI/donmai/provider/agycli"
-	provideramp "github.com/RenseiAI/donmai/provider/amp"
-	providerclaude "github.com/RenseiAI/donmai/provider/claude"
-	providercodex "github.com/RenseiAI/donmai/provider/codex"
-	providergemini "github.com/RenseiAI/donmai/provider/gemini"
-	providerollama "github.com/RenseiAI/donmai/provider/ollama"
-	provideropencode "github.com/RenseiAI/donmai/provider/opencode"
-	providerstub "github.com/RenseiAI/donmai/provider/stub"
+	provideragycli "github.com/RenseiAI/donmai/provider/harness/agycli"
+	provideramp "github.com/RenseiAI/donmai/provider/harness/amp"
+	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
+	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
+	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
+	providerollama "github.com/RenseiAI/donmai/provider/harness/ollama"
+	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
+	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -524,12 +525,46 @@ func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor) *runner.R
 		if regErr := reg.Register(p); regErr != nil {
 			logger.Warn("donmai agent run: provider register failed",
 				"provider", c.name, "err", regErr)
+			continue
 		}
+		assertLegacyAlias(logger, p)
 	}
 	if len(reg.Names()) == 0 {
 		logger.Error("donmai agent run: no providers available — every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `donmai doctor`.")
 	}
 	return reg
+}
+
+// assertLegacyAlias consumes the generated matrix.LegacyAliasMap as a
+// defense-in-depth invariant: a registered provider's harness identity
+// (Manifest().Name) MUST match the harness the matrix says its
+// ProviderName resolves to. This makes the alias map a real reader (P1
+// generated it but left it unconsumed) WITHOUT changing which concrete
+// provider answers any name — the registry stays ProviderName-keyed.
+//
+// A mismatch is logged at WARN (never fatal): it would mean the
+// hand-authored cell anchors in matrix/cells.go drifted from the live
+// manifests, a build-time bug to fix at the source, not a runtime path
+// to fail. A provider without a Manifest() (no HarnessProvider) or a
+// ProviderName with no legacy alias is skipped silently — neither is a
+// drift signal.
+func assertLegacyAlias(logger *slog.Logger, p agent.Provider) {
+	name := p.Name()
+	cell, ok := matrix.LegacyCell(name)
+	if !ok {
+		return
+	}
+	hp, ok := p.(agent.HarnessProvider)
+	if !ok {
+		return
+	}
+	if got := hp.Manifest().Name; got != cell.Harness {
+		logger.Warn("donmai agent run: legacy-alias harness mismatch",
+			"provider", name,
+			"manifestHarness", got,
+			"matrixHarness", cell.Harness,
+		)
+	}
 }
 
 // kitScanPaths returns the kit registry scan paths the runner should use,

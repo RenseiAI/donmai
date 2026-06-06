@@ -191,29 +191,3 @@ func dedupAndSort(s []string) []string {
 	sort.Strings(out)
 	return out
 }
-
-// composeEnv builds the child process environment by merging
-// parentEnv (typically os.Environ()) with spec.Env. Per F.1.1 §3.1
-// the runner is responsible for AGENT_ENV_BLOCKLIST filtering before
-// calling Spawn — this provider trusts the spec.Env it receives.
-//
-// Order: parentEnv first, then spec.Env entries appended; later
-// entries override earlier ones via standard exec.Cmd semantics
-// (the kernel uses the last occurrence of each name on Unix).
-func composeEnv(parentEnv []string, specEnv map[string]string) []string {
-	out := make([]string, 0, len(parentEnv)+len(specEnv))
-	out = append(out, parentEnv...)
-	if len(specEnv) == 0 {
-		return out
-	}
-	// Sort keys for deterministic order — important for tests.
-	keys := make([]string, 0, len(specEnv))
-	for k := range specEnv {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		out = append(out, k+"="+specEnv[k])
-	}
-	return out
-}

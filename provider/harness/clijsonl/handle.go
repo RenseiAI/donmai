@@ -1,4 +1,15 @@
-package claude
+// Package clijsonl is the shared CLI-JSONL execution driver extracted
+// from the Claude Code provider. It owns the subprocess spawn machinery
+// (SpawnBinary), the agent.Handle implementation (Handle), the
+// stream-json JSONL decoder (mapLine), and the per-session MCP config
+// tmpfile serializer (WriteMCPConfig).
+//
+// Both the claude and amp harnesses build on this driver: their CLIs
+// emit Claude Code-compatible JSONL, so they share the Handle + decoder
+// and supply only their own argv. Extracting the driver here removes the
+// old amp→claude cross-harness import; neither harness now imports the
+// other.
+package clijsonl
 
 import (
 	"bufio"
@@ -9,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -175,25 +187,48 @@ func (h *Handle) closeEvents() {
 	close(h.events)
 }
 
-// spawn is the internal Provider.Spawn implementation shared with
-// (the future) Resume. It builds the CLI args, writes the MCP config
-// tmpfile, starts the subprocess, and returns a fully-wired Handle.
+// SpawnBinary is the exported entry point for harnesses that share the
+// Claude Code JSONL execution machinery but supply a different binary
+// and their own pre-built argv.
 //
-// On any failure prior to the subprocess being started, spawn cleans
-// up the MCP tmpfile and returns an error wrapping
-// agent.ErrSpawnFailed.
-func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID string) (*Handle, error) {
-	mcpPath, err := writeMCPConfig(spec.MCPServers)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
-	}
-
-	argv, stdinPrompt := buildArgs(spec, mcpPath, resumeSessionID)
-	return spawnRaw(ctx, p.binary, argv, stdinPrompt, mcpPath, spec.Cwd, spec.Env, spec.OnProcessSpawned)
+// The claude provider uses it for its native CLI; amp uses it because
+// amp's --stream-json mode emits Claude Code-compatible JSONL, so the
+// same Handle + JSONL mapper work with the `amp` binary — only the argv
+// differs (amp uses -x --stream-json instead of
+// -p --output-format stream-json --verbose).
+//
+// Parameters:
+//   - ctx: cancellation context for the subprocess lifetime.
+//   - binary: absolute path to the CLI executable (pre-validated by the
+//     caller via exec.LookPath).
+//   - argv: the pre-built argument slice (NOT including the binary
+//     itself). The caller is responsible for all flag translation.
+//   - stdinPrompt: text written to the subprocess's stdin before close.
+//   - mcpConfigPath: absolute path to an MCP config tmpfile written by
+//     the caller, or "" if no MCP servers are configured. The Handle's
+//     Stop() method removes this file.
+//   - cwd: working directory for the subprocess; sets cmd.Dir when
+//     non-empty.
+//   - env: spec.Env passed to composeEnv (merged onto os.Environ()).
+//   - onProcessSpawned: optional PID callback fired after cmd.Start().
+//
+// On any pre-spawn failure (pipe creation, exec start) the function
+// returns an error wrapping agent.ErrSpawnFailed.
+func SpawnBinary(
+	ctx context.Context,
+	binary string,
+	argv []string,
+	stdinPrompt string,
+	mcpConfigPath string,
+	cwd string,
+	env map[string]string,
+	onProcessSpawned func(pid int),
+) (*Handle, error) {
+	return spawnRaw(ctx, binary, argv, stdinPrompt, mcpConfigPath, cwd, env, onProcessSpawned)
 }
 
-// spawnRaw is the low-level subprocess spawn shared by spawn (via
-// Provider.Spawn) and SpawnBinary (used by the amp provider). It
+// spawnRaw is the low-level subprocess spawn shared by the claude
+// Provider (via SpawnBinary) and the amp provider. It
 // creates the exec.Command, wires up stdin/stdout/stderr pipes, starts
 // the subprocess, and returns a fully-wired Handle whose stdout reader
 // goroutine decodes Claude Code-compatible JSONL.
@@ -404,14 +439,17 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 	}
 	defer h.injectInFlight.Store(false)
 
-	// Build a minimal spec for the resume subprocess. The CLI's
-	// --resume restores model/tools/cwd/env from the captured session,
-	// so we only carry the new prompt + the resume id through buildArgs.
-	argv, stdinPrompt := buildArgs(agent.Spec{Prompt: text}, "", sid)
+	// Build the resume argv. The CLI's --resume restores
+	// model/tools/cwd/env from the captured session, so the resume
+	// invocation carries only the new prompt (via stdin) and the
+	// resume id. This is the fixed argv form that the claude provider's
+	// buildArgs emits for an inject-spec (Prompt-only, empty MCP path):
+	// the required headless flags + --resume <id>.
+	argv, stdinPrompt := resumeArgv(sid, text)
 
 	// nolint:gosec // h.binary was resolved via exec.LookPath at
-	// provider construction; argv values come from buildArgs and a
-	// closed set of CLI flags. Same trust model as parent spawn.
+	// provider construction; argv values come from a closed set of CLI
+	// flags. Same trust model as parent spawn.
 	cmd := exec.CommandContext(ctx, h.binary, argv...)
 	// Run the resume subprocess in the same working directory as the
 	// parent spawn. Claude segments its on-disk conversation storage by
@@ -766,4 +804,53 @@ func (b *boundedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return string(b.buf)
+}
+
+// resumeArgv builds the argv + stdin for a between-turn `--resume`
+// subprocess. The shape is the verbatim form the claude provider's
+// buildArgs emits for an inject-spec (a Spec carrying only Prompt, with
+// empty mcpConfigPath): the required headless stream-json flags +
+// --resume <sessionID>. The prompt is delivered via stdin (returned as
+// stdinPrompt) to avoid argv-length limits and keep it off the process
+// listing — identical to the parent spawn.
+//
+// Keeping this builder in the driver (rather than calling back into a
+// harness) lets the Handle drive the resume turn without importing any
+// harness package. The byte sequence matches the pre-extraction
+// `buildArgs(agent.Spec{Prompt: text}, "", sid)` output exactly.
+func resumeArgv(sessionID, prompt string) (argv []string, stdinPrompt string) {
+	argv = []string{
+		"-p",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--dangerously-skip-permissions",
+		"--resume", sessionID,
+	}
+	return argv, prompt
+}
+
+// composeEnv builds the child process environment by merging
+// parentEnv (typically os.Environ()) with specEnv. The caller (the
+// runner) is responsible for AGENT_ENV_BLOCKLIST filtering before
+// spawning — this driver trusts the env it receives.
+//
+// Order: parentEnv first, then specEnv entries appended; later
+// entries override earlier ones via standard exec.Cmd semantics
+// (the kernel uses the last occurrence of each name on Unix).
+func composeEnv(parentEnv []string, specEnv map[string]string) []string {
+	out := make([]string, 0, len(parentEnv)+len(specEnv))
+	out = append(out, parentEnv...)
+	if len(specEnv) == 0 {
+		return out
+	}
+	// Sort keys for deterministic order — important for tests.
+	keys := make([]string, 0, len(specEnv))
+	for k := range specEnv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		out = append(out, k+"="+specEnv[k])
+	}
+	return out
 }

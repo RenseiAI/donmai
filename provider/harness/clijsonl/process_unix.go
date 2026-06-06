@@ -1,6 +1,6 @@
 //go:build unix
 
-package claude
+package clijsonl
 
 import (
 	"os/exec"

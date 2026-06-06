@@ -1,4 +1,4 @@
-package claude
+package clijsonl
 
 import (
 	"encoding/json"
