@@ -115,20 +115,34 @@ func SpawnComplete(ctx context.Context, h HarnessProvider, req OneShotRequest) (
 	var cost *CostData
 	var sawResult bool
 	var failErr error
-	for ev := range sess.Events() {
-		switch e := ev.(type) {
-		case AssistantTextEvent:
-			// Complete-message chunks only (the provider anti-spam rule already
-			// guarantees this) — safe to concatenate without delta coalescing.
-			text.WriteString(e.Text)
-		case ResultEvent:
-			sawResult = true
-			cost = e.Cost
-			if !e.Success {
-				failErr = fmt.Errorf("oneshot: session failed: %s", strings.Join(e.Errors, "; "))
+	events := sess.Events()
+drain:
+	for {
+		// Honor ctx during the drive so a hung/buggy harness that never closes
+		// its event channel can't pin Complete forever — on cancel we return
+		// ctx.Err() and the deferred Stop still tears the session down.
+		select {
+		case <-ctx.Done():
+			return OneShotResult{}, ctx.Err()
+		case ev, open := <-events:
+			if !open {
+				break drain
 			}
-		case ErrorEvent:
-			failErr = fmt.Errorf("oneshot: session error: %s", e.Message)
+			switch e := ev.(type) {
+			case AssistantTextEvent:
+				// Complete-message chunks only (the provider anti-spam rule
+				// already guarantees this) — safe to concatenate without delta
+				// coalescing.
+				text.WriteString(e.Text)
+			case ResultEvent:
+				sawResult = true
+				cost = e.Cost
+				if !e.Success {
+					failErr = fmt.Errorf("oneshot: session failed: %s", strings.Join(e.Errors, "; "))
+				}
+			case ErrorEvent:
+				failErr = fmt.Errorf("oneshot: session error: %s", e.Message)
+			}
 		}
 	}
 	if failErr != nil {
@@ -221,16 +235,33 @@ func extractAndValidate(text string, schema json.RawMessage) (json.RawMessage, b
 	return extracted, true
 }
 
-// extractJSONValue finds the first balanced top-level JSON object or array in a
-// string, tolerating surrounding prose and Markdown code fences (models often
-// wrap JSON despite instructions). It respects string literals and escapes so a
-// brace inside a string never throws off the depth count, and confirms the
-// candidate with json.Valid.
+// extractJSONValue finds the first balanced, VALID top-level JSON object or
+// array in a string, tolerating surrounding prose and Markdown code fences
+// (models often wrap JSON despite instructions). Each candidate opener (`{` or
+// `[`) is scanned with string/escape awareness so a brace inside a string never
+// throws off the depth count; a candidate that fails to balance or fails
+// json.Valid is a FALSE START (e.g. a `{` quoted in leading prose), so the scan
+// advances to the next opener and retries rather than giving up.
 func extractJSONValue(text string) (json.RawMessage, bool) {
-	start := strings.IndexAny(text, "{[")
-	if start < 0 {
-		return nil, false
+	for off := 0; off < len(text); {
+		rel := strings.IndexAny(text[off:], "{[")
+		if rel < 0 {
+			return nil, false
+		}
+		start := off + rel
+		if candidate, ok := scanBalancedJSON(text, start); ok {
+			return candidate, true
+		}
+		off = start + 1 // false start — retry from the next opener
 	}
+	return nil, false
+}
+
+// scanBalancedJSON scans from a candidate opener at text[start] to its matching
+// close, respecting string literals and escapes, and returns the substring iff
+// it balances AND is valid JSON. Returns (nil, false) on an unbalanced run or a
+// balanced-but-invalid candidate so the caller can retry from the next opener.
+func scanBalancedJSON(text string, start int) (json.RawMessage, bool) {
 	open := text[start]
 	closeCh := byte('}')
 	if open == '[' {

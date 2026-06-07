@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ── fakes ────────────────────────────────────────────────────────────────────
@@ -21,11 +22,12 @@ func (h *fakeHandle) Inject(context.Context, string) error { return nil }
 func (h *fakeHandle) Stop(context.Context) error           { h.stopped++; return nil }
 
 type fakeHarness struct {
-	transport  TransportKind
-	events     []Event
-	spawnErr   error
-	lastSpec   Spec
-	lastHandle *fakeHandle
+	transport    TransportKind
+	events       []Event
+	spawnErr     error
+	blockForever bool // when true, Spawn returns a handle whose Events() never closes
+	lastSpec     Spec
+	lastHandle   *fakeHandle
 }
 
 func (f *fakeHarness) Name() ProviderName         { return ProviderName("fake") }
@@ -48,7 +50,9 @@ func (f *fakeHarness) Spawn(_ context.Context, spec Spec) (Handle, error) {
 	for _, e := range f.events {
 		ch <- e
 	}
-	close(ch)
+	if !f.blockForever {
+		close(ch)
+	}
 	h := &fakeHandle{events: ch}
 	f.lastHandle = h
 	return h, nil
@@ -222,6 +226,37 @@ func TestSpawnComplete_SpawnError_Wrapped(t *testing.T) {
 	}
 }
 
+func TestSpawnComplete_ErrorThenSuccess_ErrorWins(t *testing.T) {
+	// An ErrorEvent followed by a success ResultEvent must still be an error:
+	// failErr is set first and a later success cannot clear it.
+	h := &fakeHarness{events: []Event{
+		ErrorEvent{Message: "transport_died"},
+		ResultEvent{Success: true},
+	}}
+	_, err := SpawnComplete(context.Background(), h, OneShotRequest{Messages: []Message{{Content: "x"}}})
+	if err == nil || !strings.Contains(err.Error(), "transport_died") {
+		t.Fatalf("error must win over a trailing success result, got %v", err)
+	}
+}
+
+func TestSpawnComplete_ContextCancel_AbortsAndStops(t *testing.T) {
+	// Events() never closes; a hung harness must not pin Complete forever — ctx
+	// cancellation aborts the drive and the session is still Stop()'d.
+	h := &fakeHarness{blockForever: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	_, err := SpawnComplete(ctx, h, OneShotRequest{Messages: []Message{{Content: "x"}}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if h.lastHandle == nil || h.lastHandle.stopped == 0 {
+		t.Errorf("session not Stop()'d on ctx cancel (cleanup leak)")
+	}
+}
+
 // ── specFromOneShot ───────────────────────────────────────────────────────────
 
 func TestSpecFromOneShot(t *testing.T) {
@@ -281,7 +316,11 @@ func TestExtractJSONValue(t *testing.T) {
 		{"array", `[1,2,3]`, `[1,2,3]`, true},
 		{"brace inside string", `{"s":"has } brace"}`, `{"s":"has } brace"}`, true},
 		{"escaped quote then brace", `{"s":"esc \" and } "}`, `{"s":"esc \" and } "}`, true},
+		{"escaped backslash then quote", `{"k":"a\\"}`, `{"k":"a\\"}`, true},
 		{"first of two", `a {"x":1} b {"y":2}`, `{"x":1}`, true},
+		{"opener quoted in prose recovers", `He said "use {" then {"a":1}`, `{"a":1}`, true},
+		{"bare bracket in prose recovers", `list [ then {"a":1}`, `{"a":1}`, true},
+		{"balanced but invalid recovers to next", `{,} then {"a":1}`, `{"a":1}`, true},
 		{"no json", `no json here`, "", false},
 		{"unbalanced", `{"a":1`, "", false},
 		{"fenced", "```json\n{\"k\":true}\n```", `{"k":true}`, true},
@@ -311,5 +350,14 @@ func TestValidateAgainstSchema(t *testing.T) {
 	}
 	if validateAgainstSchema(json.RawMessage(`not json`), verdictSchema) {
 		t.Errorf("malformed instance accepted")
+	}
+	if !validateAgainstSchema(json.RawMessage(`{"anything":1}`), json.RawMessage(`{}`)) {
+		t.Errorf("empty schema {} should match anything")
+	}
+	if !validateAgainstSchema(json.RawMessage(`{"x":1}`), json.RawMessage(`true`)) {
+		t.Errorf("boolean schema true should match anything")
+	}
+	if validateAgainstSchema(json.RawMessage(`{"x":1}`), json.RawMessage(`false`)) {
+		t.Errorf("boolean schema false should match nothing")
 	}
 }
