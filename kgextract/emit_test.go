@@ -25,6 +25,12 @@ func (p *fakeProvider) Resume(context.Context, string, agent.Spec) (agent.Handle
 	return nil, agent.ErrUnsupported
 }
 
+// Manifest makes fakeProvider a HarnessProvider so it can drive the shared
+// one-shot lane (agent.SpawnComplete) the providerEmitter now delegates to.
+func (p *fakeProvider) Manifest() agent.HarnessManifest {
+	return agent.HarnessManifest{Name: agent.HarnessStub}
+}
+
 func (p *fakeProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
 	p.spawnedN++
 	p.lastSpec = spec

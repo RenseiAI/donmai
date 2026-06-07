@@ -419,3 +419,20 @@ func TestSpecFromOneShot_SetsNativeResponseSchema(t *testing.T) {
 		t.Errorf("soft prompt instruction missing: %q", spec.Prompt)
 	}
 }
+
+func TestSpecFromOneShot_ModelThreading(t *testing.T) {
+	// Bare Model is used when no Endpoint is bound.
+	s1 := specFromOneShot(OneShotRequest{Messages: []Message{{Content: "x"}}, Model: "claude-haiku"})
+	if s1.Model != "claude-haiku" {
+		t.Errorf("bare Model not threaded: %q", s1.Model)
+	}
+	// A bound Endpoint's model wins over the bare Model.
+	s2 := specFromOneShot(OneShotRequest{
+		Messages: []Message{{Content: "x"}},
+		Model:    "ignored",
+		Endpoint: &EndpointBinding{Model: "claude-sonnet"},
+	})
+	if s2.Model != "claude-sonnet" {
+		t.Errorf("Endpoint.Model should win, got %q", s2.Model)
+	}
+}
