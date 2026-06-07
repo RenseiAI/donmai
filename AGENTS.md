@@ -94,6 +94,9 @@ Charm v2 ecosystem + Cobra:
 - `github.com/spf13/cobra` — CLI framework
 - `github.com/sahilm/fuzzy` — Fuzzy search (command palette)
 - `github.com/joho/godotenv` — .env.local loading
+- `github.com/santhosh-tekuri/jsonschema/v6` — JSON Schema validation for the
+  one-shot/structured completion lane (`agent/oneshot.go`). Pure-Go, no cgo;
+  certifies `OneShotResult.SchemaOK` for the soft-JSON validate-repair-drop path.
 
 No other direct dependencies without compelling justification.
 
