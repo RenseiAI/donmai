@@ -22,7 +22,11 @@
 // for cycle 6 after the smoke harness has soaked for 7 nights.
 package daemon
 
-import "time"
+import (
+	"time"
+
+	"github.com/RenseiAI/donmai/runner/access"
+)
 
 // Version is the daemon binary version reported in DaemonStatus and in
 // the registration payload.
@@ -119,6 +123,48 @@ type SessionSpec struct {
 	// the fallback path). Embedders can read this in OnPreSpawn to scope
 	// per-session credential snapshots without a redundant allowlist lookup.
 	ProjectName string `json:"projectName,omitempty"`
+
+	// ── P3 narrow-only gate inputs (ADR-2026-06-06 §5.3) ─────────────────
+	//
+	// Copied through by PollItemToSessionSpec from the platform-stamped
+	// PollWorkItem / ResolvedProfile so the embedder's existing OnPreSpawn
+	// closure can read everything access.ResolveMachineCell needs (plus
+	// d.Config().ModelAccess) WITHOUT changing the OnPreSpawn signature.
+	// The daemon does NOT enforce — enforcement is the rensei-tui S3 gate.
+	// All additive + omitempty; every field is absent on a pre-P3 work item
+	// (=> the gate sees a nil ceiling / identity and the SessionSpec is
+	// byte-identical for the existing fields).
+
+	// PlatformAllowed is the CLOSED set the platform already narrowed
+	// (org∩project) — the immutable CEILING the machine gate may only
+	// subtract from. Same set the platform stamps; carried faithfully.
+	PlatformAllowed []access.AuthMode `json:"platformAllowed,omitempty"`
+
+	// AuthMode is the platform's resolved auth-mode pick (selectAuthMode);
+	// the gate honors it iff it survives the machine ∩ ceiling intersection.
+	AuthMode string `json:"authMode,omitempty"`
+
+	// WorkType is the workflow discriminant ("development", "qa", "research",
+	// "kg-extraction", ...). One input to the embedder's workload derivation.
+	WorkType string `json:"workType,omitempty"`
+
+	// Mode is the run-mode discriminant ("" = headless, "interview" =
+	// interactive). The other input to workload derivation.
+	Mode string `json:"mode,omitempty"`
+
+	// Company is the endpoint company key (e.g. "anthropic") — the matrix
+	// company-row key the gate resolves the machine cell against.
+	Company string `json:"company,omitempty"`
+
+	// Model is the platform-resolved model id (e.g. "claude-sonnet-4-5") —
+	// the most-specific matrix key in the model > company > '*' resolution.
+	Model string `json:"model,omitempty"`
+
+	// Workload is the explicit workload key for the per-workload narrowing
+	// block (e.g. "kg-extraction"); "" => the Default block. Carried when
+	// the platform stamps it explicitly; otherwise the embedder derives it
+	// from WorkType/Mode.
+	Workload string `json:"workload,omitempty"`
 }
 
 // SessionResources is the optional resource request on a SessionSpec.

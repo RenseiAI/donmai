@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/runner/access"
 
 	"gopkg.in/yaml.v3"
 )
@@ -27,6 +28,16 @@ type Config struct {
 	Orchestrator  OrchestratorConfig   `yaml:"orchestrator"           json:"orchestrator"`
 	AutoUpdate    AutoUpdateConfig     `yaml:"autoUpdate"             json:"autoUpdate"`
 	Observability *ObservabilityConfig `yaml:"observability,omitempty" json:"observability,omitempty"`
+	// ModelAccess is the platform-synced per-machine + per-workload
+	// model-access narrowing block (P3 / ADR-2026-06-06 D5). nil = no
+	// machine narrowing => the platform ceiling holds unchanged (identity).
+	// Written by the modelAccess.set / modelAccess.clear daemon mutations
+	// (mutation_apply.go); read by the rensei-tui fail-closed gate one step
+	// before the credential hop. Policy/routing only — NEVER credentials.
+	// The type lives in runner/access so the enforcement mirror and the
+	// daemon read the same struct (daemon -> runner/access, one-way; no
+	// cycle). Mirrors the Observability optional-block slot above.
+	ModelAccess *access.ModelAccessConfig `yaml:"modelAccess,omitempty" json:"modelAccess,omitempty"`
 	// Workarea holds Layer-3 workarea-surface tunables (archive root,
 	// diff streaming threshold). Optional; populated with defaults if
 	// absent.
