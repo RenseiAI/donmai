@@ -118,3 +118,34 @@ func TestSpawn_rejectsEmptyPromptViaBuilder(t *testing.T) {
 		t.Errorf("error should wrap ErrSpawnFailed; got %v", err)
 	}
 }
+
+func TestBuildChatRequest_nativeFormat(t *testing.T) {
+	t.Parallel()
+	schema := json.RawMessage(`{"type":"object","properties":{"v":{"type":"string"}},"required":["v"]}`)
+	body, err := buildChatRequest("llama3.3", agent.Spec{Prompt: "x", ResponseSchema: schema})
+	if err != nil {
+		t.Fatalf("buildChatRequest: %v", err)
+	}
+	var got chatRequest
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if string(got.Format) != string(schema) {
+		t.Errorf("Format = %q, want %q", got.Format, schema)
+	}
+}
+
+func TestBuildChatRequest_noFormatWhenNoSchema(t *testing.T) {
+	t.Parallel()
+	body, err := buildChatRequest("llama3.3", agent.Spec{Prompt: "x"})
+	if err != nil {
+		t.Fatalf("buildChatRequest: %v", err)
+	}
+	var got chatRequest
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Format != nil {
+		t.Errorf("Format should be nil without ResponseSchema, got %q", got.Format)
+	}
+}

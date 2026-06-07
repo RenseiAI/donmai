@@ -65,6 +65,12 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// P1). Registered here (the static coverage mirror) so this guard rail
 		// stays green; NewSpawnPlan is unchanged.
 		"Endpoint",
+		// ResponseSchema is the one-shot lane's native structured-output schema
+		// (P4b). It is honored ONLY by NativeJSONMode harnesses (gemini/ollama);
+		// codex (no JSON-schema flag) INTENTIONALLY IGNORES it and relies on the
+		// soft prompt instruction SpawnComplete appends. The codex Spawn
+		// translation is unchanged.
+		"ResponseSchema",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)

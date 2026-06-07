@@ -72,15 +72,31 @@ type OneShotResult struct {
 	TransportUsed TransportKind   `json:"transportUsed,omitempty"`
 }
 
-// OneShotProvider is the schema-constrained completion lane. A harness MAY
-// implement it directly for native strict structured output (raw over
-// gemini/ollama with NativeJSONMode); CLI/pty harnesses instead get the soft
-// lane for free by delegating Complete to SpawnComplete(ctx, self, req). Every
-// OneShotProvider in this system is also a HarnessProvider, so the manifest is
-// available via that interface — OneShotProvider deliberately carries only the
-// completion verb.
+// OneShotProvider is the schema-constrained completion lane for providers that
+// satisfy a one-shot request WITHOUT driving an interactive session — a pure
+// direct-API completion (e.g. a future Anthropic Messages forced-tool one-shot).
+// It deliberately carries only the completion verb. Most harnesses do NOT
+// implement it: session harnesses (claude-code, codex, amp, antigravity,
+// opencode, stub) ride SpawnComplete, and the raw harnesses (gemini, ollama)
+// deliver STRICT structured natively by honoring Spec.ResponseSchema inside
+// their existing Spawn — so SpawnComplete already yields native-strict output
+// for them without a separate Complete method.
 type OneShotProvider interface {
 	Complete(ctx context.Context, req OneShotRequest) (OneShotResult, error)
+}
+
+// Complete is the public one-shot entry point — the strategy resolver of
+// 02-two-axis-architecture.md §3.5. A provider that implements OneShotProvider
+// (pure direct-API one-shot) is used directly; every HarnessProvider otherwise
+// rides SpawnComplete, which delivers strict output when the harness honors
+// Spec.ResponseSchema (Caps.NativeJSONMode — gemini/ollama) and soft output
+// (prompt-instructed, validate-repair-drop) otherwise. Callers (KG, arch-intel)
+// should call Complete, not SpawnComplete, so the strategy stays config-resolved.
+func Complete(ctx context.Context, h HarnessProvider, req OneShotRequest) (OneShotResult, error) {
+	if osp, ok := h.(OneShotProvider); ok {
+		return osp.Complete(ctx, req)
+	}
+	return SpawnComplete(ctx, h, req)
 }
 
 // SpawnComplete gives any HarnessProvider the one-shot lane for free: spawn an
@@ -164,10 +180,14 @@ drain:
 }
 
 // specFromOneShot translates a OneShotRequest into the interactive Spec
-// SpawnComplete drives. The schema instruction (if any) is appended to the
-// prompt — CLI harnesses have no JSON-schema flag, so soft-instruct is the only
-// lever (§3.5). MaxTurns is pinned to 1: a one-shot is a single completion, not
-// an agent loop.
+// SpawnComplete drives. The schema is delivered TWO ways so one path fits every
+// harness: (1) Spec.ResponseSchema — honored natively (STRICT, server-enforced)
+// by NativeJSONMode harnesses (gemini/ollama); (2) a soft prompt instruction
+// appended for harnesses that have no JSON-schema flag (the CLI/pty harnesses,
+// validate-repair-drop). Setting both is safe: a native harness reads
+// Spec.ResponseSchema and the redundant instruction only reinforces it; a soft
+// harness ignores Spec.ResponseSchema and relies on the instruction. MaxTurns is
+// pinned to 1: a one-shot is a single completion, not an agent loop.
 func specFromOneShot(req OneShotRequest) Spec {
 	prompt := flattenMessages(req.Messages)
 	if len(req.ResponseSchema) > 0 {
@@ -183,6 +203,7 @@ func specFromOneShot(req OneShotRequest) Spec {
 		Autonomous:         true,
 		Effort:             req.Effort,
 		MaxTurns:           &one,
+		ResponseSchema:     req.ResponseSchema, // native-strict for NativeJSONMode harnesses
 	}
 	if req.Endpoint != nil {
 		spec.Endpoint = req.Endpoint
