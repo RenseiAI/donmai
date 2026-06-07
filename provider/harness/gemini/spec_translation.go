@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -63,9 +64,15 @@ type thinkingConfig struct {
 
 // requestGenerationConfig mirrors GenerationConfig. MaxOutputTokens caps
 // a single response; thinkingConfig carries the reasoning-effort knob.
+// ResponseMimeType + ResponseSchema carry Gemini's native structured-output
+// primitive (the one-shot lane, P4b): when set, the model is constrained
+// server-side to emit JSON matching the schema. Gemini requires the mime type
+// to be "application/json" whenever a responseSchema is supplied.
 type requestGenerationConfig struct {
-	MaxOutputTokens int             `json:"maxOutputTokens,omitempty"`
-	ThinkingConfig  *thinkingConfig `json:"thinkingConfig,omitempty"`
+	MaxOutputTokens  int             `json:"maxOutputTokens,omitempty"`
+	ThinkingConfig   *thinkingConfig `json:"thinkingConfig,omitempty"`
+	ResponseMimeType string          `json:"responseMimeType,omitempty"`
+	ResponseSchema   json.RawMessage `json:"responseSchema,omitempty"`
 }
 
 // functionDeclaration mirrors one entry in tools[].functionDeclarations.
@@ -174,6 +181,17 @@ func buildGenerationConfig(spec agent.Spec, model string) *requestGenerationConf
 
 	if tc := thinkingConfigFor(spec, model); tc != nil {
 		gc.ThinkingConfig = tc
+		set = true
+	}
+
+	// Native structured output (P4b one-shot lane). When the spec carries a
+	// ResponseSchema, constrain the model server-side to JSON matching it.
+	// Gemini requires responseMimeType="application/json" alongside the schema.
+	// One-shot requests carry no tools (functionCalling + responseSchema are
+	// mutually exclusive on Gemini), so there is no conflict here.
+	if len(spec.ResponseSchema) > 0 {
+		gc.ResponseMimeType = "application/json"
+		gc.ResponseSchema = spec.ResponseSchema
 		set = true
 	}
 

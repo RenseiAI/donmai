@@ -62,6 +62,18 @@ func ok(success bool, errs ...string) ResultEvent {
 	return ResultEvent{Success: success, Errors: errs}
 }
 
+// fakeOneShot is a harness that ALSO implements OneShotProvider (a pure
+// direct-API one-shot), used to assert Complete's resolver prefers it.
+type fakeOneShot struct {
+	fakeHarness
+	completeCalled bool
+}
+
+func (f *fakeOneShot) Complete(_ context.Context, _ OneShotRequest) (OneShotResult, error) {
+	f.completeCalled = true
+	return OneShotResult{Text: "native", SchemaOK: true}, nil
+}
+
 var verdictSchema = json.RawMessage(`{"type":"object","properties":{"verdict":{"type":"string"}},"required":["verdict"]}`)
 
 // ── SpawnComplete ─────────────────────────────────────────────────────────────
@@ -359,5 +371,51 @@ func TestValidateAgainstSchema(t *testing.T) {
 	}
 	if validateAgainstSchema(json.RawMessage(`{"x":1}`), json.RawMessage(`false`)) {
 		t.Errorf("boolean schema false should match nothing")
+	}
+}
+
+// ── Complete resolver (P4b) ───────────────────────────────────────────────────
+
+func TestComplete_PrefersOneShotProvider(t *testing.T) {
+	f := &fakeOneShot{}
+	res, err := Complete(context.Background(), f, OneShotRequest{Messages: []Message{{Content: "x"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !f.completeCalled {
+		t.Errorf("Complete did not route to OneShotProvider.Complete")
+	}
+	if res.Text != "native" {
+		t.Errorf("Text = %q, want native", res.Text)
+	}
+}
+
+func TestComplete_FallsBackToSpawnComplete(t *testing.T) {
+	h := &fakeHarness{events: []Event{AssistantTextEvent{Text: "soft"}, ok(true)}}
+	res, err := Complete(context.Background(), h, OneShotRequest{Messages: []Message{{Content: "x"}}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Text != "soft" {
+		t.Errorf("Text = %q, want soft", res.Text)
+	}
+	if h.lastHandle == nil {
+		t.Errorf("SpawnComplete drive path was not taken")
+	}
+}
+
+func TestSpecFromOneShot_SetsNativeResponseSchema(t *testing.T) {
+	// Spec.ResponseSchema must be threaded so NativeJSONMode harnesses
+	// (gemini/ollama) constrain output server-side, while the soft prompt
+	// instruction still covers CLI harnesses.
+	spec := specFromOneShot(OneShotRequest{
+		Messages:       []Message{{Content: "x"}},
+		ResponseSchema: verdictSchema,
+	})
+	if string(spec.ResponseSchema) != string(verdictSchema) {
+		t.Errorf("Spec.ResponseSchema not threaded: %q", spec.ResponseSchema)
+	}
+	if !strings.Contains(spec.Prompt, "JSON Schema") {
+		t.Errorf("soft prompt instruction missing: %q", spec.Prompt)
 	}
 }
