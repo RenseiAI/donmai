@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -248,4 +249,34 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestBuildSpawnPlan_NativeResponseSchema(t *testing.T) {
+	t.Parallel()
+	schema := json.RawMessage(`{"type":"object","properties":{"v":{"type":"string"}},"required":["v"]}`)
+	plan, err := buildSpawnPlan(agent.Spec{Prompt: "x", ResponseSchema: schema}, "gemini-3.5-flash")
+	if err != nil {
+		t.Fatalf("buildSpawnPlan: %v", err)
+	}
+	if plan.generationConfig == nil {
+		t.Fatal("generationConfig nil; want native responseSchema set")
+	}
+	if plan.generationConfig.ResponseMimeType != "application/json" {
+		t.Errorf("ResponseMimeType = %q, want application/json", plan.generationConfig.ResponseMimeType)
+	}
+	if string(plan.generationConfig.ResponseSchema) != string(schema) {
+		t.Errorf("ResponseSchema = %q, want %q", plan.generationConfig.ResponseSchema, schema)
+	}
+}
+
+func TestBuildSpawnPlan_NoResponseSchema_NoStructuredFields(t *testing.T) {
+	t.Parallel()
+	plan, err := buildSpawnPlan(agent.Spec{Prompt: "x"}, "gemini-3.5-flash")
+	if err != nil {
+		t.Fatalf("buildSpawnPlan: %v", err)
+	}
+	if plan.generationConfig != nil &&
+		(plan.generationConfig.ResponseMimeType != "" || plan.generationConfig.ResponseSchema != nil) {
+		t.Errorf("structured fields set without ResponseSchema: %#v", plan.generationConfig)
+	}
 }

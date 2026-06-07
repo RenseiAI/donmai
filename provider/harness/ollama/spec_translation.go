@@ -30,6 +30,11 @@ type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
 	Stream   bool          `json:"stream"`
+	// Format carries Ollama's native structured-output primitive (the
+	// one-shot lane, P4b). Ollama accepts either the string "json" or a full
+	// JSON Schema object here; we pass the caller's ResponseSchema through so
+	// output is constrained to that shape. Omitted (nil) for free-text.
+	Format json.RawMessage `json:"format,omitempty"`
 }
 
 // buildChatRequest translates an agent.Spec into a serialized Ollama
@@ -63,6 +68,11 @@ func buildChatRequest(model string, spec agent.Spec) ([]byte, error) {
 		Model:    model,
 		Messages: msgs,
 		Stream:   true,
+	}
+	// Native structured output (P4b one-shot lane): constrain the model to JSON
+	// matching the schema. Ollama's `format` accepts a JSON Schema object.
+	if len(spec.ResponseSchema) > 0 {
+		req.Format = spec.ResponseSchema
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
