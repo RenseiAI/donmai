@@ -50,8 +50,12 @@ type Message struct {
 // binding currency the interactive Spawn path uses (Spec.Endpoint). A nil
 // Endpoint falls back to the harness/env default, mirroring Spec.
 type OneShotRequest struct {
-	System         string           `json:"system,omitempty"`
-	Messages       []Message        `json:"messages"`
+	System   string    `json:"system,omitempty"`
+	Messages []Message `json:"messages"`
+	// Model names the model to run when no Endpoint is bound; when Endpoint is
+	// set, Endpoint.Model wins. Lets a caller request a one-shot against a model
+	// id without constructing a full EndpointBinding (the KG-extraction case).
+	Model          string           `json:"model,omitempty"`
 	Endpoint       *EndpointBinding `json:"endpoint,omitempty"`
 	Effort         EffortLevel      `json:"effort,omitempty"`
 	ResponseSchema json.RawMessage  `json:"responseSchema,omitempty"` // nil => free text
@@ -203,11 +207,14 @@ func specFromOneShot(req OneShotRequest) Spec {
 		Autonomous:         true,
 		Effort:             req.Effort,
 		MaxTurns:           &one,
+		Model:              req.Model,          // bare model id (when no Endpoint bound)
 		ResponseSchema:     req.ResponseSchema, // native-strict for NativeJSONMode harnesses
 	}
 	if req.Endpoint != nil {
 		spec.Endpoint = req.Endpoint
-		spec.Model = req.Endpoint.Model
+		if req.Endpoint.Model != "" {
+			spec.Model = req.Endpoint.Model // a bound endpoint's model wins
+		}
 	}
 	return spec
 }
