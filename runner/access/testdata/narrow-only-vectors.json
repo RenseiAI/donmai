@@ -1,0 +1,495 @@
+{
+  "version": 1,
+  "description": "Narrow-only fail-closed parity vectors. Honored byte-for-byte by platform TS mergeMatrices/resolveEffectiveAllowedModes AND donmai Go access.ResolveMachineCell. Canonical home: donmai-architecture/golden/narrow-only-vectors.json (ADR-2026-06-06 D5). Vendored into donmai/runner/access/testdata/ with a SHA-256 parity check. A vector that diverges between the two readers is the bug.",
+  "vectors": [
+    {
+      "name": "nil-block-identity-keeps-requested",
+      "platformAllowed": ["host-session", "byok", "metered"],
+      "machine": null,
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": {
+        "authMode": "host-session",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "byok", "metered"],
+      "expectedDropped": []
+    },
+    {
+      "name": "nil-block-requested-not-in-ceiling-falls-to-ladder",
+      "platformAllowed": ["host-session"],
+      "machine": null,
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "byok",
+      "expected": {
+        "authMode": "host-session",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session"],
+      "expectedDropped": []
+    },
+    {
+      "name": "machine-denies-byok-keeps-host-session-pins-host",
+      "platformAllowed": ["host-session", "byok", "metered"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "host-session": { "allowed": true, "host": "oauth-cli" },
+              "byok": { "allowed": false }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": {
+        "authMode": "host-session",
+        "host": "oauth-cli",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "metered"],
+      "expectedDropped": []
+    },
+    {
+      "name": "adversarial-machine-grants-unallowed-cell-is-dropped",
+      "platformAllowed": ["host-session"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "byok": { "allowed": true, "host": "vertex", "model": "claude-haiku" }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "byok",
+      "expected": {
+        "authMode": "host-session",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session"],
+      "expectedDropped": ["anthropic.byok"]
+    },
+    {
+      "name": "adversarial-grant-unallowed-but-requested-allowed-survives",
+      "platformAllowed": ["host-session"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "byok": { "allowed": true, "host": "vertex", "model": "claude-haiku" }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": {
+        "authMode": "host-session",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session"],
+      "expectedDropped": ["anthropic.byok"]
+    },
+    {
+      "name": "empty-intersection-denies-all-modes-blocked",
+      "platformAllowed": ["host-session", "byok"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "host-session": { "allowed": false },
+              "byok": { "allowed": false }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": null,
+      "expectedError": "AccessDenied",
+      "expectedEffectiveSet": [],
+      "expectedDropped": []
+    },
+    {
+      "name": "model-row-wins-over-provider-row-precedence",
+      "platformAllowed": ["host-session", "byok"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "host-session": { "allowed": true },
+              "byok": { "allowed": true }
+            },
+            "claude-sonnet": {
+              "byok": { "allowed": false }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "byok",
+      "expected": {
+        "authMode": "host-session",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session"],
+      "expectedDropped": []
+    },
+    {
+      "name": "provider-row-wins-over-wildcard-precedence",
+      "platformAllowed": ["host-session", "byok"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "*": {
+              "byok": { "allowed": false }
+            },
+            "anthropic": {
+              "byok": { "allowed": true },
+              "host-session": { "allowed": true }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "byok",
+      "expected": {
+        "authMode": "byok",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "byok"],
+      "expectedDropped": []
+    },
+    {
+      "name": "wildcard-denies-mode-when-no-specific-row",
+      "platformAllowed": ["host-session", "byok", "metered"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "*": {
+              "metered": { "allowed": false }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": {
+        "authMode": "host-session",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "byok"],
+      "expectedDropped": []
+    },
+    {
+      "name": "absent-cell-inherits-allow-no-narrowing",
+      "platformAllowed": ["host-session", "byok"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "openai": {
+              "byok": { "allowed": false }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "byok",
+      "expected": {
+        "authMode": "byok",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "byok"],
+      "expectedDropped": []
+    },
+    {
+      "name": "mac-studio-kg-extraction-flip-byok-vertex-haiku",
+      "platformAllowed": ["host-session", "byok", "metered"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "host-session": { "allowed": true, "host": "oauth-cli" },
+              "byok": { "allowed": false }
+            }
+          }
+        },
+        "workloads": {
+          "kg-extraction": {
+            "authOrder": ["byok", "metered", "host-session", "local"],
+            "matrix": {
+              "anthropic": {
+                "byok": { "allowed": true, "host": "vertex", "model": "claude-haiku" },
+                "host-session": { "allowed": false }
+              }
+            }
+          }
+        }
+      },
+      "workload": "kg-extraction",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": {
+        "authMode": "byok",
+        "host": "vertex",
+        "model": "claude-haiku"
+      },
+      "expectedEffectiveSet": ["byok", "metered"],
+      "expectedDropped": []
+    },
+    {
+      "name": "mac-studio-sdlc-default-block-stays-host-session",
+      "platformAllowed": ["host-session", "byok", "metered"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "host-session": { "allowed": true, "host": "oauth-cli" },
+              "byok": { "allowed": false }
+            }
+          }
+        },
+        "workloads": {
+          "kg-extraction": {
+            "authOrder": ["byok", "metered", "host-session", "local"],
+            "matrix": {
+              "anthropic": {
+                "byok": { "allowed": true, "host": "vertex", "model": "claude-haiku" },
+                "host-session": { "allowed": false }
+              }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": {
+        "authMode": "host-session",
+        "host": "oauth-cli",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "metered"],
+      "expectedDropped": []
+    },
+    {
+      "name": "unknown-workload-falls-back-to-default-block",
+      "platformAllowed": ["host-session", "byok", "metered"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "host-session": { "allowed": true, "host": "oauth-cli" },
+              "byok": { "allowed": false }
+            }
+          }
+        },
+        "workloads": {
+          "kg-extraction": {
+            "matrix": {
+              "anthropic": {
+                "byok": { "allowed": true, "host": "vertex" }
+              }
+            }
+          }
+        }
+      },
+      "workload": "interview",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": {
+        "authMode": "host-session",
+        "host": "oauth-cli",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "metered"],
+      "expectedDropped": []
+    },
+    {
+      "name": "authorder-picks-byok-over-requested-host-session-both-allowed",
+      "platformAllowed": ["host-session", "byok", "metered"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "host-session": { "allowed": true },
+              "byok": { "allowed": true, "host": "vertex" },
+              "metered": { "allowed": false }
+            }
+          }
+        },
+        "workloads": {
+          "kg-extraction": {
+            "authOrder": ["byok", "metered", "host-session", "local"],
+            "matrix": {
+              "anthropic": {
+                "host-session": { "allowed": true },
+                "byok": { "allowed": true, "host": "vertex" }
+              }
+            }
+          }
+        }
+      },
+      "workload": "kg-extraction",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": {
+        "authMode": "host-session",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "byok", "metered"],
+      "expectedDropped": []
+    },
+    {
+      "name": "requested-survives-so-requested-wins-over-ladder",
+      "platformAllowed": ["host-session", "byok", "metered"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "host-session": { "allowed": true },
+              "byok": { "allowed": true },
+              "metered": { "allowed": true }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "metered",
+      "expected": {
+        "authMode": "metered",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "byok", "metered"],
+      "expectedDropped": []
+    },
+    {
+      "name": "requested-dropped-falls-to-default-ladder-byok-first",
+      "platformAllowed": ["host-session", "byok", "metered"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "metered": { "allowed": false }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "metered",
+      "expected": {
+        "authMode": "byok",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "byok"],
+      "expectedDropped": []
+    },
+    {
+      "name": "pin-tightens-host-and-model-on-surviving-cell",
+      "platformAllowed": ["byok"],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "byok": { "allowed": true, "host": "vertex", "model": "claude-haiku" }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "byok",
+      "expected": {
+        "authMode": "byok",
+        "host": "vertex",
+        "model": "claude-haiku"
+      },
+      "expectedEffectiveSet": ["byok"],
+      "expectedDropped": []
+    },
+    {
+      "name": "empty-machine-matrix-is-identity",
+      "platformAllowed": ["host-session", "byok"],
+      "machine": {
+        "default": {
+          "matrix": {}
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "host-session",
+      "expected": {
+        "authMode": "host-session",
+        "host": "",
+        "model": "claude-sonnet"
+      },
+      "expectedEffectiveSet": ["host-session", "byok"],
+      "expectedDropped": []
+    },
+    {
+      "name": "empty-platform-ceiling-denies-everything",
+      "platformAllowed": [],
+      "machine": {
+        "default": {
+          "matrix": {
+            "anthropic": {
+              "byok": { "allowed": true }
+            }
+          }
+        }
+      },
+      "workload": "",
+      "company": "anthropic",
+      "model": "claude-sonnet",
+      "requested": "byok",
+      "expected": null,
+      "expectedError": "AccessDenied",
+      "expectedEffectiveSet": [],
+      "expectedDropped": ["anthropic.byok"]
+    }
+  ]
+}
