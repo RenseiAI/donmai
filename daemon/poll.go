@@ -628,9 +628,23 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		Resources:          item.Resources,
 		Env:                item.Env,
 		MaxDurationSeconds: item.MaxDuration,
+		// ── P3 narrow-only gate inputs (ADR-2026-06-06 §5.3) ─────────────
+		// Copied through (NOT enforced) so the embedder's OnPreSpawn closure
+		// has everything access.ResolveMachineCell needs. WorkType + Mode are
+		// top-level on the poll item; Company/Model/AuthMode/PlatformAllowed
+		// ride the resolved profile. Every field is absent on a pre-P3 item,
+		// so the spec stays byte-identical for the existing fields (identity).
+		WorkType: item.WorkType,
+		Mode:     item.Mode,
 	}
 	if matched != nil {
 		spec.ProjectName = matched.ID
+	}
+	if rp := item.ResolvedProfile; rp != nil {
+		spec.AuthMode = rp.AuthMode
+		spec.Company = rp.Company
+		spec.Model = rp.Model
+		spec.PlatformAllowed = rp.PlatformAllowed
 	}
 	return spec
 }

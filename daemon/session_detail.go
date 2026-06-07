@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/runner/access"
 )
 
 // SessionDetail is the per-session payload `donmai agent run` reads from
@@ -202,6 +203,26 @@ type SessionResolvedProfile struct {
 	// that predate the Phase-1 snapshot enrichment; the hook treats absence
 	// as fail-open for backward compatibility.
 	AuthMode string `json:"authMode,omitempty"`
+
+	// ── P3 narrow-only gate inputs (ADR-2026-06-06 §5.3) ─────────────────
+	//
+	// These are the values the rensei-tui fail-closed gate (S3) hands to
+	// access.ResolveMachineCell, one step before the credential hop. The
+	// daemon does NOT enforce here — it only carries them through onto the
+	// SessionSpec so the embedder's OnPreSpawn closure can read them. All
+	// additive + omitempty; absent on every pre-P3 dispatch (=> identity).
+
+	// Company is the endpoint company key (the SPEAK-axis cell identity,
+	// e.g. "anthropic"). Stamped by the platform at dispatch alongside the
+	// resolved model. The gate uses it as the matrix company-row key.
+	Company string `json:"company,omitempty"`
+
+	// PlatformAllowed is the CLOSED set of auth modes the platform already
+	// narrowed against org∩project at dispatch — the immutable CEILING the
+	// machine gate may only SUBTRACT from. Carried faithfully (same set the
+	// platform stamps); the daemon never edits it. Absent/empty on pre-P3
+	// dispatches; the gate (S3) treats it as the ceiling.
+	PlatformAllowed []access.AuthMode `json:"platformAllowed,omitempty"`
 }
 
 // SessionModelProfile mirrors runner.ResolvedModelProfile but lives in
