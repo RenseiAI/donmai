@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+
+	"github.com/RenseiAI/donmai/runner/access"
 )
 
 // applyMutations is the daemon-side handler for the heartbeat response's
@@ -81,6 +83,10 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 		return d.applyProjectAddLocked(m)
 	case "project.remove":
 		return d.applyProjectRemoveLocked(m)
+	case "modelAccess.set":
+		return d.applyModelAccessSetLocked(m)
+	case "modelAccess.clear":
+		return d.applyModelAccessClearLocked(m)
 	default:
 		// Unknown op — newer platform than daemon. ACK as failed so the
 		// platform can stop re-queueing.
@@ -142,6 +148,78 @@ func (d *Daemon) applyProjectRemoveLocked(m PendingMutation) error {
 	// with the original (defensive against a later mutation racing the
 	// spawner snapshot via SetProjects).
 	d.config.Projects = append([]ProjectConfig(nil), filtered...)
+	return d.persistAndRefreshLocked()
+}
+
+// applyModelAccessSetLocked writes (or overwrites) a per-machine /
+// per-workload model-access policy block into Config.ModelAccess
+// (P3 / ADR-2026-06-06 §4.2). It decodes {workload?, policy}:
+//   - workload == "" => write into .Default
+//   - workload != "" => write into .Workloads[workload]
+//
+// POLICY ONLY: only the AccessPolicy ({matrix, authOrder?}) crosses this
+// channel — never credentials (keys ride the separate snapshot socket,
+// §4.4). This step is pure plumbing: it STORES the block; enforcement
+// (ResolveMachineCell) stays in the rensei-tui S3 gate. Idempotent: a
+// repeated set with the same params overwrites to the same value.
+// Caller must hold d.mu (applyOneMutation acquires it).
+func (d *Daemon) applyModelAccessSetLocked(m PendingMutation) error {
+	var params struct {
+		Workload string              `json:"workload"`
+		Policy   access.AccessPolicy `json:"policy"`
+	}
+	if err := json.Unmarshal(m.Params, &params); err != nil {
+		return fmt.Errorf("decode params: %w", err)
+	}
+
+	if d.config.ModelAccess == nil {
+		d.config.ModelAccess = &access.ModelAccessConfig{}
+	}
+	if params.Workload == "" {
+		d.config.ModelAccess.Default = params.Policy
+	} else {
+		if d.config.ModelAccess.Workloads == nil {
+			d.config.ModelAccess.Workloads = make(map[string]access.AccessPolicy)
+		}
+		d.config.ModelAccess.Workloads[params.Workload] = params.Policy
+	}
+	return d.persistAndRefreshLocked()
+}
+
+// applyModelAccessClearLocked removes a per-machine / per-workload
+// model-access policy block (P3 / ADR-2026-06-06 §4.2). It decodes
+// {workload}:
+//   - workload != "" => delete .Workloads[workload] (fall back to .Default,
+//     then to the platform org/project ceiling)
+//   - workload == "" => clear the entire ModelAccess block (revert to the
+//     nil-block identity: effective = platformAllowed)
+//
+// Idempotent: clear of an absent workload (or an already-nil block) is a
+// no-op success — it still persists so the ACK lifecycle and on-disk state
+// stay consistent, mirroring applyProjectRemoveLocked's no-op-success
+// contract. Caller must hold d.mu.
+func (d *Daemon) applyModelAccessClearLocked(m PendingMutation) error {
+	var params struct {
+		Workload string `json:"workload"`
+	}
+	if err := json.Unmarshal(m.Params, &params); err != nil {
+		return fmt.Errorf("decode params: %w", err)
+	}
+
+	if d.config.ModelAccess == nil {
+		// Nothing to clear — already at the nil-block identity. No-op success.
+		return nil
+	}
+	if params.Workload == "" {
+		// Clear the whole block — back to the nil-block identity.
+		d.config.ModelAccess = nil
+		return d.persistAndRefreshLocked()
+	}
+	if _, ok := d.config.ModelAccess.Workloads[params.Workload]; !ok {
+		// Idempotent — workload override not present, treat as success.
+		return nil
+	}
+	delete(d.config.ModelAccess.Workloads, params.Workload)
 	return d.persistAndRefreshLocked()
 }
 
