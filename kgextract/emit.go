@@ -27,130 +27,70 @@ type Emitter interface {
 
 // ProviderEmitterConfig configures a providerEmitter.
 type ProviderEmitterConfig struct {
-	// Provider is the agent runtime the emit runs on (claude, etc.).
-	Provider agent.Provider
+	// Provider is the agent harness the emit runs on (claude, etc.). It must be
+	// a HarnessProvider so the shared one-shot lane (agent.SpawnComplete) can
+	// read its manifest; every real provider satisfies this after the two-axis
+	// harness split.
+	Provider agent.HarnessProvider
 	// Model is the optional model id; empty falls back to the provider default.
 	Model string
-	// Cwd is the working directory the constrained turn runs in. Empty is
-	// acceptable for a pure-completion emit (no filesystem work expected).
-	Cwd string
 }
 
-// providerEmitter is the production Emitter. It drives a single constrained turn
-// through an agent.Provider and reads the final assistant text from the event
-// stream.
+// providerEmitter is the production Emitter. It runs ONE constrained completion
+// through the shared one-shot lane (agent.SpawnComplete) and returns the final
+// assistant text.
 //
-// ── PROVIDER-EMIT APPROACH (the novel core; e2e-verified later) ──────────────
-// The agent.Provider interface is built for full agentic SESSIONS, not raw
-// single-shot completions: Spawn(ctx, spec) returns a Handle whose Events()
-// channel emits InitEvent → zero+ assistant/tool events → a terminal
-// ResultEvent (or ErrorEvent), then closes. There is no dedicated
-// "one constrained completion" entry point.
+// A KG emit IS a one-shot: an autonomous, tool-less, single-turn completion with
+// the platform extractionSystemPrompt as the system instruction and the
+// observation as the user turn. SpawnComplete builds exactly that Spec
+// (Autonomous, MaxTurns=1, no tools), drives the session to its terminal
+// ResultEvent, accumulates the assistant text (complete-message chunks; the JSON
+// arrives as assistant_text, never the CLI completion banner), and returns it —
+// replacing the hand-rolled spawn+drain this package used to carry. Under
+// host-session this is an agentic `claude -p` invocation; under a native harness
+// (gemini/ollama) it is a raw completion. The executor parses + validates the
+// returned text.
 //
-// So we drive the SIMPLEST correct shape the interface supports:
-//
-//  1. Build an autonomous, non-interactive Spec with:
-//     - Prompt        = the observation content (the user turn).
-//     - SystemPromptAppend = the platform extractionSystemPrompt (instructs
-//     the model to emit ONLY {nodes,edges} JSON).
-//     - Autonomous=true, MaxTurns=1 — a single round-trip, no tool loop.
-//     - No AllowedTools / no MCP servers — a constrained, tool-less emit.
-//     Under host-session this becomes an agentic `claude -p` invocation
-//     (stream-json); under local it becomes a raw completion. The provider
-//     implementation chosen by the platform's authMode decides the transport;
-//     this emitter is transport-agnostic.
-//  2. Consume Events() to completion, accumulating every AssistantTextEvent.Text.
-//     The claude CLI streams assistant text as one or more chunks; the final
-//     assistant text is the concatenation. (We intentionally do NOT use
-//     ResultEvent.Message — for claude that is the CLI's completion banner, not
-//     the model's emitted JSON; the JSON arrives as assistant_text.)
-//  3. On a terminal ErrorEvent, or a ResultEvent with Success=false, or no
-//     assistant text at all, return an error so the executor records a
-//     per-observation failure.
-//
-// DEVIATION from a clean single-shot: MaxTurns=1 + Autonomous + empty tool list
-// is the closest the session-oriented Provider gets to a constrained emit; a
-// true raw-completion entry point would be cleaner but the interface does not
-// expose one today. This is the documented seam to verify against a live daemon.
+// We deliberately do NOT pass ResponseSchema: kgextract owns the {nodes,edges}
+// shape and validates it in parse.go (the double-parse-then-drop posture), and
+// the extractionSystemPrompt already instructs JSON-only output.
 type providerEmitter struct {
-	provider agent.Provider
+	provider agent.HarnessProvider
 	model    string
-	cwd      string
 }
 
 // NewProviderEmitter builds a providerEmitter. Returns an error when no provider
 // is configured (the caller cannot run a real emit without one).
 func NewProviderEmitter(cfg ProviderEmitterConfig) (Emitter, error) {
 	if cfg.Provider == nil {
-		return nil, errors.New("kgextract: provider emitter requires a non-nil agent.Provider")
+		return nil, errors.New("kgextract: provider emitter requires a non-nil agent.HarnessProvider")
 	}
 	return &providerEmitter{
 		provider: cfg.Provider,
 		model:    cfg.Model,
-		cwd:      cfg.Cwd,
 	}, nil
 }
 
-// maxTurnsOne is the single-round-trip cap for the constrained emit, addressable
-// so it can be taken by reference for Spec.MaxTurns.
-var maxTurnsOne = 1
-
-// Emit drives one constrained turn and returns the accumulated assistant text.
+// Emit runs one constrained completion via the shared lane and returns the
+// accumulated assistant text. A spawn failure, provider error, failed result,
+// or empty output is folded into an error the executor records as a
+// per-observation failure.
 func (e *providerEmitter) Emit(ctx context.Context, systemPrompt, userContent string) (string, error) {
-	spec := agent.Spec{
-		Prompt:             userContent,
-		Cwd:                e.cwd,
-		Autonomous:         true,
-		SystemPromptAppend: systemPrompt,
-		MaxTurns:           &maxTurnsOne,
-		Model:              e.model,
-		// No AllowedTools / MCPServers: a tool-less, constrained completion.
-	}
-
-	handle, err := e.provider.Spawn(ctx, spec)
+	res, err := agent.SpawnComplete(ctx, e.provider, agent.OneShotRequest{
+		System:   systemPrompt,
+		Messages: []agent.Message{{Role: "user", Content: userContent}},
+		Model:    e.model,
+	})
 	if err != nil {
-		return "", fmt.Errorf("kgextract: spawn emit: %w", err)
-	}
-	// Best-effort stop so a child process never lingers past this turn. Safe to
-	// call after the events channel closes (idempotent per the Handle contract).
-	defer func() { _ = handle.Stop(context.Background()) }()
-
-	var (
-		text     strings.Builder
-		gotError string
-		failed   bool
-	)
-	for ev := range handle.Events() {
-		switch v := ev.(type) {
-		case agent.AssistantTextEvent:
-			text.WriteString(v.Text)
-		case agent.ErrorEvent:
-			// Non-recoverable provider error; the channel closes after this.
-			gotError = v.Message
-			failed = true
-		case agent.ResultEvent:
-			if !v.Success {
-				failed = true
-				if len(v.Errors) > 0 {
-					gotError = strings.Join(v.Errors, "; ")
-				} else if v.Message != "" {
-					gotError = v.Message
-				}
-			}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("kgextract: emit context: %w", ctxErr)
 		}
+		return "", fmt.Errorf("kgextract: emit: %w", err)
 	}
-
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return "", fmt.Errorf("kgextract: emit context: %w", ctxErr)
-	}
-	if failed {
-		if gotError == "" {
-			gotError = "provider reported failure"
-		}
-		return "", fmt.Errorf("kgextract: emit failed: %s", gotError)
-	}
-	out := strings.TrimSpace(text.String())
+	out := strings.TrimSpace(res.Text)
 	if out == "" {
+		// SpawnComplete treats empty-but-successful output as a soft result;
+		// kgextract requires text to parse, so an empty emit is a failure here.
 		return "", errors.New("kgextract: emit produced no assistant text")
 	}
 	return out, nil
