@@ -13,16 +13,17 @@ import (
 )
 
 // fakeArchBin writes a shell script that echoes JSON describing the invocation,
-// installs it as DONMAI_ARCH_BIN, and returns the path.
+// installs it as DONMAI_ARCH_BIN (the supported opt-in for the DEPRECATED TS
+// shim), and returns the path.
 func fakeArchBin(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	script := filepath.Join(dir, "donmai-arch")
+	script := filepath.Join(dir, "af-arch")
 	content := `#!/bin/sh
 printf '{"command":"%s","argv":"%s","gated":false}' "$1" "$*"
 `
 	if err := os.WriteFile(script, []byte(content), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
-		t.Fatalf("write fake donmai-arch: %v", err)
+		t.Fatalf("write fake af-arch: %v", err)
 	}
 	t.Setenv("DONMAI_ARCH_BIN", script)
 	return script
@@ -170,11 +171,11 @@ func TestArchAssess_AllFlags(t *testing.T) {
 // ── Native fallback (no binary) ───────────────────────────────────────────────
 
 // TestArchAssess_NativeFallback verifies that `donmai arch assess` works even
-// without DONMAI_ARCH_BIN or donmai-arch on PATH, using the native diff/gate path.
+// without DONMAI_ARCH_BIN or af-arch on PATH, using the native diff/gate path.
 func TestArchAssess_NativeFallback(t *testing.T) {
 	t.Setenv("DONMAI_ARCH_BIN", "")
 	origPath := os.Getenv("PATH")
-	t.Setenv("PATH", t.TempDir()) // empty PATH — no donmai-arch found
+	t.Setenv("PATH", t.TempDir()) // empty PATH — no af-arch found
 	defer func() { _ = os.Setenv("PATH", origPath) }()
 
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}

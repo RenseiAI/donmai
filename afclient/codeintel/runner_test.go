@@ -323,6 +323,95 @@ func TestIsCodeAvailable_AlwaysTrue(t *testing.T) {
 	}
 }
 
+// ── Arch shim resolution (deprecated, opt-in) ─────────────────────────────────
+
+// TestResolveArchBin_EnvOptIn verifies DONMAI_ARCH_BIN is honoured as the
+// explicit opt-in for the deprecated TS shim.
+func TestResolveArchBin_EnvOptIn(t *testing.T) {
+	t.Setenv("DONMAI_ARCH_BIN", "/some/af-arch")
+	t.Setenv("AGENTFACTORY_ARCH_BIN", "")
+	r := New(t.TempDir())
+	bin, err := r.resolveArchBin()
+	if err != nil {
+		t.Fatalf("resolveArchBin with DONMAI_ARCH_BIN set: %v", err)
+	}
+	if len(bin) == 0 || bin[0] != "/some/af-arch" {
+		t.Errorf("expected [/some/af-arch], got %v", bin)
+	}
+	if !r.IsArchBinAvailable() {
+		t.Error("IsArchBinAvailable should be true when DONMAI_ARCH_BIN is set")
+	}
+}
+
+// TestResolveArchBin_NotOptedIn verifies that with no env override and an empty
+// PATH (no af-arch), the shim is reported as not opted into via
+// ErrArchNotAvailable — the native pipeline then takes over in ArchAssess.
+func TestResolveArchBin_NotOptedIn(t *testing.T) {
+	t.Setenv("DONMAI_ARCH_BIN", "")
+	t.Setenv("AGENTFACTORY_ARCH_BIN", "")
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", t.TempDir()) // empty PATH — no af-arch
+	defer func() { _ = os.Setenv("PATH", origPath) }()
+
+	r := New(t.TempDir())
+	r.archBinCache = ""
+	if _, err := r.resolveArchBin(); err != ErrArchNotAvailable {
+		t.Errorf("expected ErrArchNotAvailable, got %v", err)
+	}
+	if r.IsArchBinAvailable() {
+		t.Error("IsArchBinAvailable should be false when shim is not opted into")
+	}
+}
+
+// TestResolveArchBin_AfArchOnPath verifies the reconciled bin name: the
+// published `af-arch` on PATH resolves the shim (the previous resolver probed
+// the never-published `donmai-arch`, which could never match).
+func TestResolveArchBin_AfArchOnPath(t *testing.T) {
+	t.Setenv("DONMAI_ARCH_BIN", "")
+	t.Setenv("AGENTFACTORY_ARCH_BIN", "")
+	dir := t.TempDir()
+	afArch := filepath.Join(dir, "af-arch")
+	if err := os.WriteFile(afArch, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+		t.Fatal(err)
+	}
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir)
+	defer func() { _ = os.Setenv("PATH", origPath) }()
+
+	r := New(t.TempDir())
+	r.archBinCache = ""
+	bin, err := r.resolveArchBin()
+	if err != nil {
+		t.Fatalf("af-arch on PATH should resolve: %v", err)
+	}
+	if len(bin) == 0 || bin[0] != afArch {
+		t.Errorf("expected [%s], got %v", afArch, bin)
+	}
+}
+
+// TestResolveArchBin_NoStaleDonmaiArchProbe verifies the dropped never-published
+// `donmai-arch` PATH probe is gone: a `donmai-arch` on PATH must NOT resolve the
+// shim (only the published `af-arch` name or DONMAI_ARCH_BIN do).
+func TestResolveArchBin_NoStaleDonmaiArchProbe(t *testing.T) {
+	t.Setenv("DONMAI_ARCH_BIN", "")
+	t.Setenv("AGENTFACTORY_ARCH_BIN", "")
+	dir := t.TempDir()
+	// Plant a `donmai-arch` (stale name) on PATH; it must be ignored.
+	stale := filepath.Join(dir, "donmai-arch")
+	if err := os.WriteFile(stale, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+		t.Fatal(err)
+	}
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir)
+	defer func() { _ = os.Setenv("PATH", origPath) }()
+
+	r := New(t.TempDir())
+	r.archBinCache = ""
+	if _, err := r.resolveArchBin(); err != ErrArchNotAvailable {
+		t.Errorf("stale donmai-arch on PATH should NOT resolve; got err=%v", err)
+	}
+}
+
 // ── JSON output round-trip ────────────────────────────────────────────────────
 
 // TestJSONOutputRoundTrip verifies that the output from runCode is
