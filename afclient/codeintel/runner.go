@@ -41,11 +41,14 @@ package codeintel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/RenseiAI/donmai/internal/envcompat"
 )
@@ -58,14 +61,33 @@ var ErrNotAvailable = errors.New(
 		"(`npm install -g @donmai/cli`) or set DONMAI_CODE_BIN",
 )
 
-// ErrArchNotAvailable is returned by resolveArchBin when the donmai-arch binary
-// cannot be found. Note: ArchAssess does NOT surface this sentinel to callers —
-// it falls back to the native diff/gate path instead. IsArchBinAvailable uses it
-// to decide whether to show the informational notice.
+// ErrArchNotAvailable is returned by resolveArchBin when the DEPRECATED TS arch
+// shim is not opted into. Note: ArchAssess does NOT surface this sentinel to
+// callers — the native Go Layer-1+2 pipeline is the primary path, so this is the
+// expected (non-error) state. IsArchBinAvailable uses it to decide whether to
+// route through the legacy shim.
 var ErrArchNotAvailable = errors.New(
-	"donmai-arch binary not found — install @donmai/cli globally " +
-		"(`npm install -g @donmai/cli`) or set DONMAI_ARCH_BIN",
+	"DEPRECATED arch shim not configured — the native Go arch-intel pipeline " +
+		"(Layer 1+2) is the primary path; set DONMAI_ARCH_BIN only to force the " +
+		"legacy @donmai/architectural-intelligence TS implementation",
 )
+
+// archShimWarnOnce guards the one-time deprecation notice emitted when the
+// legacy TS arch shim is resolved (so a single process emits it at most once).
+var archShimWarnOnce sync.Once
+
+// warnArchShimDeprecated prints a single deprecation notice to stderr explaining
+// that the exec-shim is a legacy, opt-in fallback now that the native Go
+// Layer-1+2 pipeline is the primary path.
+func warnArchShimDeprecated(via string) {
+	archShimWarnOnce.Do(func() {
+		fmt.Fprintf(os.Stderr,
+			"warning: using the DEPRECATED TS arch shim (%s). The native Go "+
+				"arch-intel pipeline (Layer 1+2) is the primary path and requires "+
+				"no external binary; unset DONMAI_ARCH_BIN to use it. The shim will "+
+				"be removed in a future release.\n", via)
+	})
+}
 
 // Runner wraps the donmai-code / donmai-arch CLI binaries and exposes each command as
 // a typed Go function. All public methods return raw JSON-decoded output as
@@ -111,28 +133,42 @@ func (r *Runner) resolveCodeBin() ([]string, error) {
 	return nil, ErrNotAvailable
 }
 
-// resolveArchBin finds the donmai-arch binary.
+// resolveArchBin resolves the DEPRECATED, opt-in TS arch shim.
+//
+// The native Go arch-intel pipeline (Layer 1+2) is the primary path and needs no
+// external binary — this resolver only fires when an operator explicitly opts
+// into the legacy @donmai/architectural-intelligence TS implementation. It is
+// NOT a "binary not installed" failure path: ErrArchNotAvailable just means the
+// shim was not opted into, and ArchAssess then runs the native pipeline.
+//
+// Resolution order (all paths emit a one-time deprecation notice):
+//
+//  1. DONMAI_ARCH_BIN (or legacy AGENTFACTORY_ARCH_BIN) — explicit shim override.
+//     This is the supported way to force the TS path; it may point at any
+//     binary/script (e.g. `af-arch`, `pnpm af-arch`, or a wrapper).
+//  2. af-arch on PATH — the published @donmai/cli bin name. (Earlier versions
+//     probed the never-published `donmai-arch`; that mismatch is fixed here.)
+//
+// The previous `pnpm donmai-arch` monorepo probe is dropped: there is no
+// `donmai-arch` bin, and monorepo dev should set DONMAI_ARCH_BIN="pnpm af-arch".
 func (r *Runner) resolveArchBin() ([]string, error) {
 	if r.archBinCache != "" {
 		return strings.Fields(r.archBinCache), nil
 	}
 
-	// 1. Explicit env override (DONMAI_ARCH_BIN; legacy AGENTFACTORY_ARCH_BIN via shim).
+	// 1. Explicit env override (DONMAI_ARCH_BIN; legacy AGENTFACTORY_ARCH_BIN
+	//    emits its own rename warning inside envcompat).
 	if v := envcompat.GetArchBin(); v != "" {
+		warnArchShimDeprecated("DONMAI_ARCH_BIN")
 		r.archBinCache = v
 		return strings.Fields(v), nil
 	}
 
-	// 2. donmai-arch on PATH.
-	if p, err := exec.LookPath("donmai-arch"); err == nil {
+	// 2. af-arch on PATH (the published @donmai/cli bin).
+	if p, err := exec.LookPath("af-arch"); err == nil {
+		warnArchShimDeprecated("af-arch on PATH")
 		r.archBinCache = p
 		return []string{p}, nil
-	}
-
-	// 3. pnpm donmai-arch (monorepo).
-	if p, err := exec.LookPath("pnpm"); err == nil {
-		r.archBinCache = p + " donmai-arch"
-		return []string{p, "donmai-arch"}, nil
 	}
 
 	return nil, ErrArchNotAvailable
@@ -340,7 +376,7 @@ func (r *Runner) ValidateCrossDeps(opts ValidateCrossDepsOptions) (any, error) {
 
 // ── af arch commands ──────────────────────────────────────────────────────────
 
-// ArchAssessOptions holds the flags for donmai-arch assess.
+// ArchAssessOptions holds the flags for arch assess.
 type ArchAssessOptions struct {
 	// PrURL is the full GitHub PR URL (e.g. https://github.com/org/repo/pull/123).
 	// Takes precedence over Repository+PrNumber when both are provided.
@@ -369,21 +405,24 @@ type ArchAssessOptions struct {
 	Summary bool
 }
 
-// ArchAssess runs `donmai-arch assess`.
+// ArchAssess assesses a PR/commit for architectural drift.
 //
-// Resolution order:
-//  1. DONMAI_ARCH_BIN (or legacy AGENTFACTORY_ARCH_BIN) — exec-shim override.
-//     Gives byte-identical output to the TS pipeline including LLM drift
-//     detection and the SQLite observation graph.
-//  2. donmai-arch on PATH (installed via `npm install -g @donmai/cli`).
-//  3. pnpm donmai-arch (monorepo dev).
-//  4. Native Go fallback — pure-regex diff/gate analysis via ReadDiffObservations
-//     + BuildNativeDriftReport. No external binary required. Output is tagged
-//     with "mode": "native-diff-only"; set DONMAI_ARCH_BIN for full LLM assessment.
+// The PRIMARY path is the native Go arch-intel pipeline (Layer 1+2): it fetches
+// the real PR diff, runs the lane-backed assess-against-baseline pipeline
+// ("mode":"native") when an arch ModelAdapter is wired and a baseline exists, or
+// the pure-regex diff/gate fallback ("mode":"native-diff-only") otherwise. No
+// external binary is required.
 //
-// Exit code 1 from the subprocess means the gate was triggered — this is
-// mapped to an ErrGateTriggered sentinel rather than a generic error so callers
-// can handle it without parsing stderr.
+// The DEPRECATED exec-shim is an opt-in legacy fallback for byte-identical TS
+// output, taken ONLY when resolveArchBin succeeds:
+//  1. DONMAI_ARCH_BIN (or legacy AGENTFACTORY_ARCH_BIN) — explicit shim override.
+//  2. af-arch on PATH (published @donmai/cli bin).
+//
+// Both shim paths emit a one-time deprecation notice on stderr.
+//
+// Exit code 1 from the shim subprocess means the gate was triggered — this is
+// surfaced via a "gated":true flag on the result rather than a generic error so
+// callers can handle it without parsing stderr.
 func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 	args := []string{"assess"}
 
@@ -414,7 +453,7 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 
 	binArgs, binErr := r.resolveArchBin()
 	if binErr != nil {
-		// No external binary available — use native diff/gate path.
+		// Shim not opted into (the common case) — run the native Go pipeline.
 		return r.archAssessNative(opts)
 	}
 
@@ -434,7 +473,7 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 	if errors.As(runErr, &exitErr) {
 		exitCode = exitErr.ExitCode()
 	} else if runErr != nil {
-		return nil, fmt.Errorf("donmai-arch assess: %w\nstderr: %s", runErr, stderr.String())
+		return nil, fmt.Errorf("arch shim assess: %w\nstderr: %s", runErr, stderr.String())
 	}
 
 	if opts.Summary {
@@ -447,7 +486,7 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 
 	var result any
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return nil, fmt.Errorf("donmai-arch assess: invalid JSON output: %w\nstdout: %s", err, stdout.String())
+		return nil, fmt.Errorf("arch shim assess: invalid JSON output: %w\nstdout: %s", err, stdout.String())
 	}
 
 	// Inject gated flag if exit code indicates it.
@@ -460,9 +499,23 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 	return result, nil
 }
 
-// archAssessNative is the primary path when no donmai-arch binary is available.
-// It uses the pure-Go diff/gate layer (no external binary, LLM, or DB).
+// archAssessNative is the PRIMARY path: the native Go arch-intel Layer-1
+// diff/gate pipeline, taken whenever the deprecated TS shim is not opted into
+// (the common case).
+//
+// It fetches the REAL PR diff via the GitHub CLI and runs the pure-regex
+// diff/gate layer ("mode":"native-diff-only") over the actual changed files +
+// patches. A missing/failed `gh` degrades to a metadata-only PrDiff rather than
+// erroring, so the gate + JSON shape stay valid.
+//
+// NOTE: the Layer-2 arch-intelligence pipeline (learned baseline + LLM deviation
+// detection against the SQLite observation graph) is intentionally NOT part of
+// this OSS path — it is platform-owned per ADR-2026-06-07. The
+// Go-native Layer-2 substrate is parked unmerged pending a future OSS-standalone
+// ADR.
 func (r *Runner) archAssessNative(opts ArchAssessOptions) (any, error) {
+	ctx := context.Background()
+
 	repo, prNum := opts.Repository, opts.PrNumber
 
 	// Parse PR URL when provided.
@@ -477,32 +530,49 @@ func (r *Runner) archAssessNative(opts ArchAssessOptions) (any, error) {
 		}
 	}
 
-	// We don't have diff content without a VCS call — emit a stub report with
-	// the PR metadata we have so the JSON shape is valid and the gate can fire.
-	// Title is intentionally empty: we only know the URL, not the PR title, and
-	// passing the raw URL as a Title could cause spurious decision-signal matches.
-	diff := PrDiff{
-		Repository: repo,
-		PrNumber:   prNum,
+	scopeLevel := opts.ScopeLevel
+	if scopeLevel == "" {
+		scopeLevel = "project"
 	}
 
-	scope := opts.ScopeLevel
-	if scope == "" {
-		scope = "project"
+	// Fetch the real PR diff. A missing/failed `gh` is non-fatal: we degrade to
+	// a metadata-only PrDiff so the gate + JSON shape stay valid (mirrors the
+	// previous stub behaviour, but only on the failure path).
+	diff := r.fetchDiffOrMeta(ctx, repo, prNum, opts.PrURL)
+
+	observations := ReadDiffObservations(diff, scopeLevel)
+	report := BuildNativeDriftReport(diff, observations, opts.GatePolicy)
+	return reportToMap(report, opts.Summary, report.Gated, report.Summary)
+}
+
+// fetchDiffOrMeta fetches the real PR diff via the GitHub CLI, degrading to a
+// metadata-only PrDiff when `gh` is unavailable or the call fails. The ref
+// passed to gh prefers the full URL (gh resolves it directly); otherwise it
+// builds an "owner/repo#N" ref from the parsed identifier.
+func (r *Runner) fetchDiffOrMeta(ctx context.Context, repo string, prNum int, prURL string) PrDiff {
+	ref := prURL
+	if ref == "" && repo != "" && prNum > 0 {
+		// gh understands "owner/repo#N"; strip the host from "github.com/owner/repo".
+		ref = strings.TrimPrefix(repo, "github.com/") + fmt.Sprintf("#%d", prNum)
 	}
+	if ref != "" {
+		if d, err := FetchPRDiff(ctx, repo, prNum, ref); err == nil {
+			return d
+		}
+	}
+	// Degrade: metadata-only (no Title — avoids spurious decision-signal matches).
+	return PrDiff{Repository: repo, PrNumber: prNum}
+}
 
-	observations := ReadDiffObservations(diff, scope)
-	gatePolicy := opts.GatePolicy
-	report := BuildNativeDriftReport(diff, observations, gatePolicy)
-
-	if opts.Summary {
+// reportToMap marshals a report struct to map[string]any (the consistent caller
+// shape) or, in summary mode, returns the {gated, summaryText} envelope.
+func reportToMap(report any, summary, gated bool, summaryText string) (any, error) {
+	if summary {
 		return map[string]any{
-			"gated":       report.Gated,
-			"summaryText": report.Summary,
+			"gated":       gated,
+			"summaryText": summaryText,
 		}, nil
 	}
-
-	// Marshal to map[string]any so the caller gets a consistent shape.
 	raw, err := json.Marshal(report)
 	if err != nil {
 		return nil, fmt.Errorf("arch assess native: encode report: %w", err)
@@ -551,17 +621,18 @@ func (r *Runner) isExecOverride() bool {
 	return envcompat.GetCodeBin() != ""
 }
 
-// IsArchAvailable returns true. The native diff/gate implementation is always
-// available (no external binary required). When DONMAI_ARCH_BIN or donmai-arch
-// on PATH is present, the full LLM-backed pipeline is used instead; the native
-// path is the fallback. Callers should no longer gate on this method.
+// IsArchAvailable returns true. The native Go arch-intel pipeline is always
+// available (no external binary required). The deprecated TS shim, when opted
+// into via DONMAI_ARCH_BIN or af-arch on PATH, runs instead. Callers should not
+// gate on this method.
 func (r *Runner) IsArchAvailable() bool {
 	return true
 }
 
-// IsArchBinAvailable returns true if a donmai-arch binary can be found on PATH
-// or via DONMAI_ARCH_BIN. Used by arch.go to decide whether to show an
-// informational notice about native-diff-only mode.
+// IsArchBinAvailable returns true only when the DEPRECATED TS arch shim is opted
+// into — via DONMAI_ARCH_BIN (or legacy AGENTFACTORY_ARCH_BIN), or af-arch on
+// PATH. arch.go uses it to decide whether to wire the native LLM lane (when the
+// shim is NOT opted into) vs deferring to the legacy shim.
 func (r *Runner) IsArchBinAvailable() bool {
 	_, err := r.resolveArchBin()
 	return err == nil
