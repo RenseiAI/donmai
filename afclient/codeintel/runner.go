@@ -41,6 +41,7 @@ package codeintel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,6 +75,13 @@ type Runner struct {
 	cwd          string
 	codeBinCache string // lazily resolved, cached after first successful lookup
 	archBinCache string
+
+	// archAdapter is the optional LLM seam for the full assess-against-baseline
+	// pipeline (arch_assess_full.go). When set, ArchAssess runs the lane-backed
+	// full pipeline ("mode":"native") instead of the diff-only fallback. It is
+	// injected by the CLI (afcli/arch.go) which resolves the harness — keeping
+	// the codeintel package free of the provider-registry import.
+	archAdapter ModelAdapter
 }
 
 // New creates a Runner that invokes commands relative to cwd.
@@ -81,6 +89,15 @@ type Runner struct {
 // resides or will reside).
 func New(cwd string) *Runner {
 	return &Runner{cwd: cwd}
+}
+
+// WithArchAdapter sets the ModelAdapter used by the full assess-against-baseline
+// pipeline and returns the Runner for chaining. A nil adapter leaves the Runner
+// on the diff-only native path. Injected by afcli/arch.go so codeintel never
+// imports the provider registry.
+func (r *Runner) WithArchAdapter(a ModelAdapter) *Runner {
+	r.archAdapter = a
+	return r
 }
 
 // resolveCodeBin finds the donmai-code binary using the priority chain described
@@ -461,8 +478,23 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 }
 
 // archAssessNative is the primary path when no donmai-arch binary is available.
-// It uses the pure-Go diff/gate layer (no external binary, LLM, or DB).
+//
+// It now (stage 2) fetches the REAL PR diff via the GitHub CLI and runs one of
+// two native paths:
+//
+//   - FULL ("mode":"native"): when an arch ModelAdapter is injected
+//     (WithArchAdapter) AND a baseline exists in the store, it runs the
+//     lane-backed assess-against-baseline pipeline (arch_assess_full.go) —
+//     real LLM deviation detection materialized into the SQLite graph.
+//   - DIFF-ONLY ("mode":"native-diff-only"): otherwise it runs the pure-regex
+//     diff/gate layer. This is the fallback when no adapter is wired or no
+//     baseline has been contributed yet.
+//
+// The real diff is fetched in BOTH paths, so even diff-only mode now runs on
+// actual file content instead of the previous empty PrDiff{} stub.
 func (r *Runner) archAssessNative(opts ArchAssessOptions) (any, error) {
+	ctx := context.Background()
+
 	repo, prNum := opts.Repository, opts.PrNumber
 
 	// Parse PR URL when provided.
@@ -477,32 +509,70 @@ func (r *Runner) archAssessNative(opts ArchAssessOptions) (any, error) {
 		}
 	}
 
-	// We don't have diff content without a VCS call — emit a stub report with
-	// the PR metadata we have so the JSON shape is valid and the gate can fire.
-	// Title is intentionally empty: we only know the URL, not the PR title, and
-	// passing the raw URL as a Title could cause spurious decision-signal matches.
-	diff := PrDiff{
-		Repository: repo,
-		PrNumber:   prNum,
+	scopeLevel := opts.ScopeLevel
+	if scopeLevel == "" {
+		scopeLevel = "project"
 	}
 
-	scope := opts.ScopeLevel
-	if scope == "" {
-		scope = "project"
+	// Fetch the real PR diff. A missing/failed `gh` is non-fatal: we degrade to
+	// a metadata-only PrDiff so the gate + JSON shape stay valid (mirrors the
+	// previous stub behaviour, but only on the failure path).
+	diff := r.fetchDiffOrMeta(ctx, repo, prNum, opts.PrURL)
+
+	// FULL pipeline when an adapter is wired. assessFull internally returns a
+	// clean "native" report when no baseline exists, so the gate on a baseline
+	// is inside the pipeline — we route here purely on adapter presence.
+	//
+	// NOTE: the query scope intentionally does NOT pin Repo. Repo is a query
+	// REFINEMENT (an "AND repo IN (...)" narrowing); pinning it here would drop
+	// every baseline node contributed without a repo tag (the common case),
+	// silently yielding an empty baseline → false-clean report. The change's
+	// repo still flows into each persisted deviation via introducedBy.
+	if r.archAdapter != nil {
+		report, err := r.ArchAssessFull(ctx, r.archAdapter, diff, ArchScope{
+			Level:     scopeLevel,
+			ProjectID: opts.ProjectID,
+		}, opts.GatePolicy, opts.DB)
+		if err != nil {
+			return nil, err
+		}
+		return reportToMap(report, opts.Summary, report.Gated, report.Summary)
 	}
 
-	observations := ReadDiffObservations(diff, scope)
-	gatePolicy := opts.GatePolicy
-	report := BuildNativeDriftReport(diff, observations, gatePolicy)
+	// DIFF-ONLY fallback (no adapter wired).
+	observations := ReadDiffObservations(diff, scopeLevel)
+	report := BuildNativeDriftReport(diff, observations, opts.GatePolicy)
+	return reportToMap(report, opts.Summary, report.Gated, report.Summary)
+}
 
-	if opts.Summary {
+// fetchDiffOrMeta fetches the real PR diff via the GitHub CLI, degrading to a
+// metadata-only PrDiff when `gh` is unavailable or the call fails. The ref
+// passed to gh prefers the full URL (gh resolves it directly); otherwise it
+// builds an "owner/repo#N" ref from the parsed identifier.
+func (r *Runner) fetchDiffOrMeta(ctx context.Context, repo string, prNum int, prURL string) PrDiff {
+	ref := prURL
+	if ref == "" && repo != "" && prNum > 0 {
+		// gh understands "owner/repo#N"; strip the host from "github.com/owner/repo".
+		ref = strings.TrimPrefix(repo, "github.com/") + fmt.Sprintf("#%d", prNum)
+	}
+	if ref != "" {
+		if d, err := FetchPRDiff(ctx, repo, prNum, ref); err == nil {
+			return d
+		}
+	}
+	// Degrade: metadata-only (no Title — avoids spurious decision-signal matches).
+	return PrDiff{Repository: repo, PrNumber: prNum}
+}
+
+// reportToMap marshals a report struct to map[string]any (the consistent caller
+// shape) or, in summary mode, returns the {gated, summaryText} envelope.
+func reportToMap(report any, summary, gated bool, summaryText string) (any, error) {
+	if summary {
 		return map[string]any{
-			"gated":       report.Gated,
-			"summaryText": report.Summary,
+			"gated":       gated,
+			"summaryText": summaryText,
 		}, nil
 	}
-
-	// Marshal to map[string]any so the caller gets a consistent shape.
 	raw, err := json.Marshal(report)
 	if err != nil {
 		return nil, fmt.Errorf("arch assess native: encode report: %w", err)

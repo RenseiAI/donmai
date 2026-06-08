@@ -2,24 +2,67 @@ package afcli
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
 
 	"github.com/RenseiAI/donmai/afclient/codeintel"
+	"github.com/RenseiAI/donmai/agent"
 )
+
+// archLaneHarnessPreference is the harness preference order for the arch-intel
+// drift lane. The stub is deliberately excluded: it produces deterministic
+// non-LLM output, useless for real deviation detection. We pick the first
+// available real harness so the lane inherits the host's resolved provider.
+var archLaneHarnessPreference = []agent.ProviderName{
+	agent.ProviderClaude,
+	agent.ProviderCodex,
+	agent.ProviderAGYCLI,
+	agent.ProviderGemini,
+	agent.ProviderAmp,
+	agent.ProviderOpenCode,
+	agent.ProviderOllama,
+}
+
+// resolveArchLaneAdapter builds the arch-intel drift ModelAdapter by resolving
+// the first available real harness from the agent-run registry. Returns
+// (nil, false) when no real harness is available (e.g. no API key, no CLI on
+// PATH) — the caller then runs the diff-only native path. This is the single
+// place the provider registry meets the codeintel pipeline; codeintel itself
+// never imports the registry (it consumes the injected ModelAdapter).
+func resolveArchLaneAdapter() (codeintel.ModelAdapter, bool) {
+	reg := BuildAgentRunRegistry(slog.Default())
+	for _, name := range archLaneHarnessPreference {
+		p, err := reg.Resolve(name)
+		if err != nil {
+			continue
+		}
+		hp, ok := p.(agent.HarnessProvider)
+		if !ok {
+			continue
+		}
+		return codeintel.LaneAdapter{Harness: hp}, true
+	}
+	return nil, false
+}
 
 // newArchCmd constructs the `donmai arch` command tree.
 //
-// The assess subcommand uses a two-tier implementation:
-//  1. Primary (always available): native Go diff/gate analysis.
-//     No external binary, LLM, or DB required.
-//     Output is tagged with "mode":"native-diff-only".
-//  2. Full pipeline (when DONMAI_ARCH_BIN or donmai-arch on PATH):
-//     exec-shim to the @donmai/architectural-intelligence TS package.
-//     Provides LLM-backed drift detection and SQLite observation graph.
+// The assess subcommand uses a three-tier implementation (most-capable first):
+//  1. Exec-shim (when DONMAI_ARCH_BIN or donmai-arch on PATH): the
+//     @donmai/architectural-intelligence TS package — byte-identical legacy path.
+//  2. Native LLM pipeline ("mode":"native"): when an LLM harness is available
+//     (and --no-llm is not set) the assess routes through the OSS one-shot lane
+//     (agent.Complete) against the SQLite observation graph — real deviation
+//     detection + materialized Deviation nodes. Requires a baseline in the graph.
+//  3. Native diff-only ("mode":"native-diff-only"): pure-Go regex diff/gate
+//     analysis. No LLM, no baseline required. The fallback when no harness is
+//     available or --no-llm is set.
 //
-// See afclient/codeintel/runner.go and arch_native.go for details.
+// Tiers 2 and 3 both fetch the REAL PR diff via the GitHub CLI (`gh`).
+//
+// See afclient/codeintel/{runner.go,arch_native.go,arch_assess_full.go,arch_difffetch.go}.
 func newArchCmd(cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
 	cmd := &cobra.Command{
@@ -45,8 +88,14 @@ Binary resolution for full LLM pipeline (in order):
   2. donmai-arch on PATH (npm install -g @donmai/cli)
   3. pnpm donmai-arch (monorepo dev)
 
-When none of the above are available, the native diff/gate path runs instead.
-Set DONMAI_ARCH_BIN for full drift detection including LLM deviation analysis.`,
+When none of the above are available, the native pipeline runs instead: it
+fetches the PR diff via the GitHub CLI (gh) and, when an LLM harness is
+available, runs real deviation detection against the SQLite baseline
+("mode":"native"). Without a harness (or with --no-llm) it falls back to
+pure-regex diff/gate analysis ("mode":"native-diff-only").
+
+Requires the GitHub CLI (gh) on PATH for diff fetch; without it the native path
+degrades to PR-metadata-only analysis.`,
 		SilenceUsage: true,
 	}
 
@@ -65,6 +114,7 @@ func newArchAssessCmd(bin string) *cobra.Command {
 		projectID  string
 		db         string
 		summary    bool
+		noLLM      bool
 	)
 
 	cmd := &cobra.Command{
@@ -109,12 +159,26 @@ Examples:
 				opts.PrURL = args[0]
 			}
 
-			// Warn when using native-only mode (no arch binary available).
+			// When no external donmai-arch binary is present, wire the native
+			// LLM lane (unless --no-llm). The lane runs the full
+			// assess-against-baseline pipeline against the SQLite graph; without
+			// a real harness it falls through to diff-only.
 			if !r.IsArchBinAvailable() {
-				fmt.Fprintln(os.Stderr,
-					"notice: DONMAI_ARCH_BIN not set and donmai-arch not on PATH — "+
-						"running native diff/gate analysis (no LLM, no SQLite graph). "+
-						"Set DONMAI_ARCH_BIN for full drift detection.")
+				if noLLM {
+					fmt.Fprintln(os.Stderr,
+						"notice: --no-llm set — running native diff/gate analysis "+
+							"(pure regex, no LLM, no deviation detection).")
+				} else if adapter, ok := resolveArchLaneAdapter(); ok {
+					r = r.WithArchAdapter(adapter)
+					fmt.Fprintln(os.Stderr,
+						"notice: DONMAI_ARCH_BIN not set — running native LLM drift "+
+							"assessment against the SQLite baseline (mode: native).")
+				} else {
+					fmt.Fprintln(os.Stderr,
+						"notice: no LLM harness available (no API key / CLI on PATH) — "+
+							"running native diff/gate analysis (no LLM, no deviation detection). "+
+							"Set DONMAI_ARCH_BIN or configure a provider for full drift detection.")
+				}
 			}
 
 			out, err := r.ArchAssess(opts)
@@ -158,6 +222,7 @@ Examples:
 	cmd.Flags().StringVar(&projectID, "project-id", "", "Project ID for scope")
 	cmd.Flags().StringVar(&db, "db", "", "Path to SQLite DB (overrides DONMAI_ARCH_DB)")
 	cmd.Flags().BoolVar(&summary, "summary", false, "Output human-readable summary instead of JSON")
+	cmd.Flags().BoolVar(&noLLM, "no-llm", false, "Force diff-only native analysis (skip the LLM deviation lane)")
 
 	return cmd
 }
