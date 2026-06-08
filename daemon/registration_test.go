@@ -683,3 +683,158 @@ func TestRegister_NilProvidesOmitsField(t *testing.T) {
 		t.Errorf("provides key should be absent from body when nil; body: %s", rawBody)
 	}
 }
+
+// TestRegister_RejectsStubCacheWhenConfiguredReal is the regression test for
+// the stub-cache poisoning incident: a `go test`/smoke run wrote a stub entry
+// to the shared daemon.jwt; on the next boot a real-config daemon
+// short-circuited on it and ran as an unregistered stub that never polled the
+// platform. Register must now distrust the mismatched cache and perform a
+// fresh real registration instead.
+func TestRegister_RejectsStubCacheWhenConfiguredReal(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "")
+
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	// Poison the cache exactly as the incident did: a stub entry for a
+	// "test-machine" host.
+	if err := SaveCachedJWT(jwtPath, buildStubResponse("test-machine"), time.Now()); err != nil {
+		t.Fatalf("seed stub cache: %v", err)
+	}
+
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		_ = json.NewEncoder(w).Encode(map[string]any{ //nolint:gosec // synthetic test response
+			"workerId":          "wkr_real_after_stub",
+			"runtimeToken":      "real.jwt.value",
+			"heartbeatInterval": 30000,
+			"pollInterval":      5000,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	tok := "rsk_live_" + "abc" //nolint:gosec // synthetic
+	resp, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		Hostname:          "mac-studio-local",
+		Version:           "0.37.0-dev",
+		MaxAgents:         8,
+		JWTPath:           jwtPath,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if !called {
+		t.Fatal("expected real registration endpoint to be hit (stub cache must be rejected)")
+	}
+	if resp.WorkerID != "wkr_real_after_stub" {
+		t.Errorf("WorkerID = %q, want wkr_real_after_stub (returned the stub cache?)", resp.WorkerID)
+	}
+	if strings.HasPrefix(resp.RuntimeToken, "stub.") {
+		t.Errorf("expected a real runtime token, got stub token %q", resp.RuntimeToken)
+	}
+	// The poisoned cache must have been overwritten with the real entry.
+	cached, err := LoadCachedJWT(jwtPath)
+	if err != nil || cached == nil {
+		t.Fatalf("LoadCachedJWT after re-register: cached=%v err=%v", cached, err)
+	}
+	if cached.WorkerID != "wkr_real_after_stub" {
+		t.Errorf("cache not refreshed: WorkerID = %q", cached.WorkerID)
+	}
+}
+
+// TestRegister_KeepsRealCacheWhenConfiguredReal confirms the normal fast path
+// is preserved: a valid real cache is returned without hitting the network.
+func TestRegister_KeepsRealCacheWhenConfiguredReal(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "")
+
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	if err := SaveCachedJWT(jwtPath, &RegisterResponse{ //nolint:gosec // synthetic test token
+		WorkerID:          "wkr_cached_real",
+		RuntimeToken:      "real.cached.jwt",
+		HeartbeatInterval: 30000,
+		PollInterval:      5000,
+	}, time.Now()); err != nil {
+		t.Fatalf("seed real cache: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("real endpoint must NOT be hit when a valid real cache exists")
+	}))
+	t.Cleanup(srv.Close)
+
+	tok := "rsk_live_" + "abc" //nolint:gosec // synthetic
+	resp, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		Hostname:          "mac-studio-local",
+		Version:           "0.37.0-dev",
+		MaxAgents:         8,
+		JWTPath:           jwtPath,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if resp.WorkerID != "wkr_cached_real" {
+		t.Errorf("WorkerID = %q, want wkr_cached_real (cache hit expected)", resp.WorkerID)
+	}
+}
+
+// TestRegister_KeepsStubCacheWhenConfiguredStub confirms a stub cache is still
+// honoured when the daemon is itself configured for stub mode (no real token),
+// so local-dev fast paths keep working.
+func TestRegister_KeepsStubCacheWhenConfiguredStub(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "")
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "")
+
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	if err := SaveCachedJWT(jwtPath, buildStubResponse("test-host"), time.Now()); err != nil {
+		t.Fatalf("seed stub cache: %v", err)
+	}
+
+	resp, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   "https://platform.example.com",
+		RegistrationToken: "local-stub-no-token", // not rsk_/rsp_ -> stub mode
+		Hostname:          "test-host",
+		Version:           "0.37.0-dev",
+		MaxAgents:         4,
+		JWTPath:           jwtPath,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if resp.WorkerID != "worker-test-host-stub" {
+		t.Errorf("WorkerID = %q, want cached stub worker-test-host-stub", resp.WorkerID)
+	}
+}
+
+// TestCachedMatchesMode exercises the cache/config consistency check directly.
+func TestCachedMatchesMode(t *testing.T) {
+	stub := &CachedJWT{WorkerID: "worker-h-stub", RuntimeToken: "stub.aaa.bbb.sig"} //nolint:gosec // synthetic
+	realEntry := &CachedJWT{WorkerID: "wkr_abc", RuntimeToken: "real.jwt.value"}    //nolint:gosec // synthetic
+	// Defensive: a stub-suffixed worker id alone (non-stub token) still counts
+	// as stub — either signal trips the check.
+	stubByIDOnly := &CachedJWT{WorkerID: "worker-h-stub", RuntimeToken: "real.jwt.value"} //nolint:gosec // synthetic
+
+	tests := []struct {
+		name    string
+		cached  *CachedJWT
+		useStub bool
+		want    bool
+	}{
+		{"stub cache, real config -> reject", stub, false, false},
+		{"stub cache, stub config -> keep", stub, true, true},
+		{"real cache, real config -> keep", realEntry, false, true},
+		{"real cache, stub config -> reject", realEntry, true, false},
+		{"stub-by-id-only, real config -> reject", stubByIDOnly, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cachedMatchesMode(tt.cached, tt.useStub); got != tt.want {
+				t.Errorf("cachedMatchesMode(%+v, useStub=%v) = %v, want %v", tt.cached, tt.useStub, got, tt.want)
+			}
+		})
+	}
+}
