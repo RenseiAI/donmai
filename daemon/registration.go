@@ -293,8 +293,19 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		opts.Now = time.Now
 	}
 
+	// Decide real-vs-stub up front so the JWT cache can be validated against
+	// the daemon's *current* config before it is trusted. Computing useStub
+	// only on a cache miss (the prior behaviour) let a stale stub entry — e.g.
+	// one written to the shared DefaultJWTPath by a `go test`/smoke run —
+	// survive a restart: Register returned the cached stub verbatim, the
+	// daemon never registered with the platform, and the poll loop never
+	// started (daemon.go gates the poll loop on a non-"stub." runtime token).
+	useStub := stubModeRequested() ||
+		strings.HasPrefix(opts.OrchestratorURL, "file://") ||
+		!looksLikeRegistrationToken(opts.RegistrationToken)
+
 	if !opts.ForceReregister {
-		if cached, _ := LoadCachedJWT(opts.JWTPath); cached != nil {
+		if cached, _ := LoadCachedJWT(opts.JWTPath); cached != nil && cachedMatchesMode(cached, useStub) {
 			return &RegisterResponse{
 				WorkerID:              cached.WorkerID,
 				RuntimeToken:          cached.RuntimeToken,
@@ -322,10 +333,6 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		req.MachineID = opts.Hostname
 	}
 
-	useStub := stubModeRequested() ||
-		strings.HasPrefix(opts.OrchestratorURL, "file://") ||
-		!looksLikeRegistrationToken(opts.RegistrationToken)
-
 	var resp *RegisterResponse
 	if useStub {
 		resp = buildStubResponse(opts.Hostname)
@@ -343,6 +350,34 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		return resp, nil
 	}
 	return resp, nil
+}
+
+// isStubRuntimeToken reports whether tok was minted by buildStubResponse
+// rather than the platform. makeStubJWT always prefixes stub tokens with
+// "stub." precisely so they can be recognised (and rejected) here and by the
+// platform's worker-auth path.
+func isStubRuntimeToken(tok string) bool {
+	return strings.HasPrefix(tok, "stub.")
+}
+
+// cachedMatchesMode reports whether a cached JWT entry is consistent with the
+// real-vs-stub decision the daemon would make from its *current* config.
+//
+// A mismatch means the cache is stale or poisoned and must not be trusted.
+// The load-bearing case: a stub entry (worker-<host>-stub id + "stub."-prefixed
+// runtime token) loaded by a daemon now configured for real registration
+// (valid rsk_live_/rsp_live_ token, non-file:// orchestrator URL, no
+// DONMAI_DAEMON_FORCE_STUB). Without this check Register short-circuited on the
+// stub cache, the daemon ran as an unregistered stub, never heartbeat or polled
+// the platform, and queued work was never claimed — while `daemon status`
+// still reported "ready". Returning false here drops the cache so a fresh
+// registration handshake runs instead. The symmetric case (a real token cached
+// while the operator has now forced stub mode) is likewise rejected so an
+// explicit stub opt-in is honoured.
+func cachedMatchesMode(cached *CachedJWT, useStub bool) bool {
+	cachedIsStub := isStubRuntimeToken(cached.RuntimeToken) ||
+		strings.HasSuffix(cached.WorkerID, "-stub")
+	return cachedIsStub == useStub
 }
 
 // callRegisterEndpoint calls the real platform endpoint.
