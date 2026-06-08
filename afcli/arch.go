@@ -49,29 +49,36 @@ func resolveArchLaneAdapter() (codeintel.ModelAdapter, bool) {
 
 // newArchCmd constructs the `donmai arch` command tree.
 //
-// The assess subcommand uses a three-tier implementation (most-capable first):
-//  1. Exec-shim (when DONMAI_ARCH_BIN or donmai-arch on PATH): the
-//     @donmai/architectural-intelligence TS package — byte-identical legacy path.
-//  2. Native LLM pipeline ("mode":"native"): when an LLM harness is available
+// The assess subcommand is implemented NATIVELY in Go (Layer 1+2) — no external
+// binary required:
+//  1. Native LLM pipeline ("mode":"native"): when an LLM harness is available
 //     (and --no-llm is not set) the assess routes through the OSS one-shot lane
 //     (agent.Complete) against the SQLite observation graph — real deviation
 //     detection + materialized Deviation nodes. Requires a baseline in the graph.
-//  3. Native diff-only ("mode":"native-diff-only"): pure-Go regex diff/gate
+//  2. Native diff-only ("mode":"native-diff-only"): pure-Go regex diff/gate
 //     analysis. No LLM, no baseline required. The fallback when no harness is
 //     available or --no-llm is set.
 //
-// Tiers 2 and 3 both fetch the REAL PR diff via the GitHub CLI (`gh`).
+// Both native paths fetch the REAL PR diff via the GitHub CLI (`gh`).
+//
+// A DEPRECATED exec-shim (the @donmai/architectural-intelligence TS package) can
+// be opted into via DONMAI_ARCH_BIN or af-arch on PATH; it emits a one-time
+// deprecation notice and will be removed in a future release.
 //
 // See afclient/codeintel/{runner.go,arch_native.go,arch_assess_full.go,arch_difffetch.go}.
 func newArchCmd(cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "arch",
-		Short: "Architectural intelligence — drift detection for PRs and commits",
-		Long: `Architectural intelligence commands powered by @donmai/architectural-intelligence.
+		Short: "Architectural intelligence — native Layer-1+2 drift detection for PRs",
+		Long: `Architectural intelligence — native Go arch-intel (Layer 1+2).
 
-Detects deviations between a PR/commit and the stored architectural baseline.
-All commands output JSON to stdout by default.
+Detects deviations between a PR/commit and the stored architectural baseline,
+entirely in-process: it indexes the change (Layer 1), queries the SQLite
+observation graph for the established baseline, and — when an LLM harness is
+available — runs real deviation detection through the OSS one-shot lane (Layer
+2), materializing Deviation nodes back into the graph. No external binary is
+required. All commands output JSON to stdout by default.
 
 Exit codes (assess subcommand):
   0  Clean — no deviations or gate not triggered
@@ -79,23 +86,21 @@ Exit codes (assess subcommand):
   2  Error — invalid args, network failure, parse error
 
 Environment:
-  ANTHROPIC_API_KEY     Enables live LLM drift assessment (required for full detection)
+  ANTHROPIC_API_KEY     Enables live LLM drift assessment (mode: native)
   DONMAI_DRIFT_GATE     Gate policy: none | no-severity-high | zero-deviations | max:N
   DONMAI_ARCH_DB        SQLite DB path (default: .donmai/arch-intelligence/db.sqlite)
+  DONMAI_ARCH_BIN       DEPRECATED — opt into the legacy TS shim (see below)
 
-Binary resolution for full LLM pipeline (in order):
-  1. DONMAI_ARCH_BIN env var — explicit binary override
-  2. donmai-arch on PATH (npm install -g @donmai/cli)
-  3. pnpm donmai-arch (monorepo dev)
+The native pipeline fetches the PR diff via the GitHub CLI (gh). With a harness
+it runs real deviation detection against the SQLite baseline ("mode":"native");
+without one (or with --no-llm) it falls back to pure-regex diff/gate analysis
+("mode":"native-diff-only"). Without gh on PATH it degrades to PR-metadata-only
+analysis.
 
-When none of the above are available, the native pipeline runs instead: it
-fetches the PR diff via the GitHub CLI (gh) and, when an LLM harness is
-available, runs real deviation detection against the SQLite baseline
-("mode":"native"). Without a harness (or with --no-llm) it falls back to
-pure-regex diff/gate analysis ("mode":"native-diff-only").
-
-Requires the GitHub CLI (gh) on PATH for diff fetch; without it the native path
-degrades to PR-metadata-only analysis.`,
+DEPRECATED shim: set DONMAI_ARCH_BIN (or install af-arch via
+'npm install -g @donmai/cli') to force the legacy @donmai/architectural-intelligence
+TS implementation. This path is deprecated, emits a one-time notice, and will be
+removed once the native pipeline is the sole supported path.`,
 		SilenceUsage: true,
 	}
 
@@ -131,10 +136,11 @@ Gate policy controls the exit code:
   zero-deviations    Block on any deviation
   max:N              Block when total deviations > N
 
-Without DONMAI_ARCH_BIN or donmai-arch on PATH, the native diff/gate path
-runs instead. It performs pure-regex diff analysis and gate evaluation without
-LLM or database access. Output includes "mode":"native-diff-only" to indicate
-the path used. Set DONMAI_ARCH_BIN for full LLM-backed drift assessment.
+This runs natively in Go (no external binary). With an LLM harness and a
+baseline in the SQLite graph it produces real deviations ("mode":"native");
+otherwise it performs pure-regex diff/gate analysis ("mode":"native-diff-only").
+Pass --no-llm to force the diff-only path. The legacy TS shim (DEPRECATED) can
+still be opted into via DONMAI_ARCH_BIN or af-arch on PATH.
 
 Examples:
   ` + bin + ` arch assess https://github.com/org/repo/pull/123
