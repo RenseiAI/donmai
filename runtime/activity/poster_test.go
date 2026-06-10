@@ -533,6 +533,45 @@ func TestEventMappingTable(t *testing.T) {
 			wantSent: false,
 		},
 		{
+			name:        "System reasoning -> thought",
+			event:       agent.SystemEvent{Subtype: "reasoning", Message: "planning the refactor"},
+			wantSent:    true,
+			wantType:    "thought",
+			wantContent: "planning the refactor",
+		},
+		{
+			name:        "System reasoning trims whitespace",
+			event:       agent.SystemEvent{Subtype: "reasoning", Message: "  weighing options \n"},
+			wantSent:    true,
+			wantType:    "thought",
+			wantContent: "weighing options",
+		},
+		{
+			name:     "System reasoning empty message -> skipped",
+			event:    agent.SystemEvent{Subtype: "reasoning", Message: "  \n\t"},
+			wantSent: false,
+		},
+		{
+			name:     "System turn_started -> skipped",
+			event:    agent.SystemEvent{Subtype: "turn_started", Message: "turn 1"},
+			wantSent: false,
+		},
+		{
+			name:     "System command_progress -> skipped",
+			event:    agent.SystemEvent{Subtype: "command_progress", Message: "running tests"},
+			wantSent: false,
+		},
+		{
+			name:     "System diff_updated -> skipped",
+			event:    agent.SystemEvent{Subtype: "diff_updated", Message: "3 files changed"},
+			wantSent: false,
+		},
+		{
+			name:     "System unknown subtype with message -> skipped",
+			event:    agent.SystemEvent{Subtype: "mystery", Message: "should never surface"},
+			wantSent: false,
+		},
+		{
 			name:     "ToolProgress -> skipped",
 			event:    agent.ToolProgressEvent{ToolName: "Bash", ElapsedSeconds: 5},
 			wantSent: false,

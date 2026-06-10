@@ -577,7 +577,12 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // mapEvent translates an agent.Event into the platform activity shape.
 // Returns ok=false for events that should not be forwarded
 // (Init / System / ToolProgress) — those are runner-internal lifecycle
-// signals the platform doesn't render.
+// signals the platform doesn't render. The single exception is
+// SystemEvent{Subtype: "reasoning"}: providers that surface model
+// reasoning as a system event (e.g. codex completed reasoning items)
+// have it forwarded as a "thought" activity so mid-run narrative reaches
+// the platform without polluting the AssistantTextEvent stream the
+// runner scans for verdict markers.
 //
 // timestamp is the wall-clock time at which the event was observed; the
 // platform server defaults to "now" when omitted, but emitting it here
@@ -668,7 +673,21 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 		}
 		return out, true
 
-	case agent.InitEvent, agent.SystemEvent, agent.ToolProgressEvent:
+	case agent.SystemEvent:
+		// Whitelist exactly one subtype: provider reasoning summaries
+		// become thoughts. Every other subtype (turn_started,
+		// command_progress, diff_updated, compaction, unknown, ...) stays
+		// runner-internal and is dropped.
+		if e.Subtype == "reasoning" {
+			if msg := strings.TrimSpace(e.Message); msg != "" {
+				out.Type = "thought"
+				out.Content = msg
+				return out, true
+			}
+		}
+		return payload{}, false
+
+	case agent.InitEvent, agent.ToolProgressEvent:
 		return payload{}, false
 	}
 	return payload{}, false
