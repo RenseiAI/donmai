@@ -86,8 +86,10 @@ func renderActivityLine(a afclient.ActivityEvent, width int) string {
 	if maxContentWidth < 20 {
 		maxContentWidth = 20
 	}
-	if len(content) > maxContentWidth {
-		content = content[:maxContentWidth-3] + "..."
+	// Clip by runes, never bytes: byte slicing can split a multi-byte UTF-8
+	// sequence mid-character and render mojibake.
+	if runes := []rune(content); len(runes) > maxContentWidth {
+		content = string(runes[:maxContentWidth-3]) + "..."
 	}
 
 	rendered := colorStyle.Render(content)
