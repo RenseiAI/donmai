@@ -795,6 +795,15 @@ type streamObservation struct {
 	workResult      string
 	cost            *agent.CostData
 	providerID      string
+	// lastAssistantText is the most recent non-empty assistant message
+	// observed on this stream. It is the summary fallback for providers
+	// whose terminal ResultEvent carries no Message (codex's
+	// turn/completed maps to ResultEvent{Success, Cost} with no text) —
+	// without it the session's Summary posts empty and the platform's
+	// exit CloudEvent derives result=unknown even though the agent's
+	// final message carried the WORK_RESULT marker (2026-06-10 codex
+	// qa/acceptance rehearsals).
+	lastAssistantText string
 	// blocked is set when the agent emitted an explicit decline marker
 	// ("WORK_RESULT:blocked" or "AGENT_BLOCKED: …") — a deliberate,
 	// reasoned refusal to proceed (ambiguous spec, unmet preconditions)
@@ -830,8 +839,22 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	if o.cost != nil {
 		res.Cost = o.cost
 	}
-	if o.terminalEvent != nil && o.terminalEvent.Message != "" && res.Summary == "" {
+	// Terminal summary stamping. The terminal event's message is
+	// authoritative and LAST-wins: when a background-poll wakeup (memory
+	// inject / steering) produces a resume turn, its terminal message is
+	// the TRUE final assistant message and must replace the stale
+	// pre-wakeup summary (2026-06-10 rehearsal 3 — the stale text was
+	// re-emitted as the close response with no result marker).
+	//
+	// When the terminal event carries no message (codex), fall back to
+	// the latest assistant text observed on this stream so the summary —
+	// and the WORK_RESULT marker the agent's final message ends with —
+	// still reach the platform's exit event.
+	switch {
+	case o.terminalEvent != nil && o.terminalEvent.Message != "":
 		res.Summary = o.terminalEvent.Message
+	case o.lastAssistantText != "" && (o.terminalEvent != nil || res.Summary == ""):
+		res.Summary = o.lastAssistantText
 	}
 	if o.errorEvent != nil && res.Error == "" {
 		res.Error = o.errorEvent.Message
@@ -941,6 +964,9 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			return nil
 		})
 	case agent.AssistantTextEvent:
+		if strings.TrimSpace(e.Text) != "" {
+			obs.lastAssistantText = e.Text
+		}
 		if marker := scanWorkResult(e.Text); marker != "" {
 			obs.workResult = marker
 		}

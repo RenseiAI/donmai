@@ -191,6 +191,24 @@ type statusRequest struct {
 	// lifecycle hooks read it on the status path; additive and omitted when
 	// empty.
 	Summary string `json:"summary,omitempty"`
+
+	// Result carries the runner's parsed WORK_RESULT verdict ("passed" |
+	// "failed" | "unknown") so the platform's exit event uses the child's
+	// reported result directly instead of re-deriving it from a marker
+	// scan over Summary. Without it, a provider whose terminal event has
+	// no message text (codex) posts an empty summary and the exit event
+	// falls back to result=unknown even though the runner already
+	// classified the verdict (2026-06-10 codex qa/acceptance rehearsals).
+	// Additive; omitted when empty.
+	Result string `json:"result,omitempty"`
+
+	// ResultMarker is the durable HTML-comment marker form of Result
+	// ("<!-- WORK_RESULT:passed -->"). The platform's lifecycle hooks
+	// treat it as first-priority durable evidence for the exit event's
+	// verdict. Only definitive verdicts (passed/failed/blocked) render a
+	// marker; "unknown" stays empty so the platform's marker scan never
+	// sees a non-verdict. Additive; omitted when empty.
+	ResultMarker string `json:"resultMarker,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -295,6 +313,8 @@ func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Resul
 			WorktreePath:      r.WorktreePath,
 			FailureMode:       r.FailureMode,
 			Summary:           strings.TrimSpace(r.Summary),
+			Result:            r.WorkResult,
+			ResultMarker:      workResultMarker(r.WorkResult),
 		}
 		if r.Cost != nil {
 			body.TotalCostUsd = r.Cost.TotalCostUsd
@@ -428,6 +448,19 @@ func (p *Poster) urlFor(path string) string {
 	cp := *p.platformURL
 	cp.Path = strings.TrimRight(cp.Path, "/") + path
 	return cp.String()
+}
+
+// workResultMarker renders the durable HTML-comment marker for a parsed
+// WORK_RESULT verdict. Only definitive verdicts get a marker — "unknown"
+// (and anything unrecognised) returns "" so downstream marker scans never
+// match on a non-verdict.
+func workResultMarker(workResult string) string {
+	switch workResult {
+	case "passed", "failed", "blocked":
+		return "<!-- WORK_RESULT:" + workResult + " -->"
+	default:
+		return ""
+	}
 }
 
 // synthSummary builds a minimal completion-comment summary from a
