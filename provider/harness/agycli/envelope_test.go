@@ -72,6 +72,63 @@ func TestExtractEnvelope_EmptyBody(t *testing.T) {
 	}
 }
 
+func TestEnvelopeLineFilter(t *testing.T) {
+	t.Parallel()
+	type step struct {
+		line         string
+		wantSuppress bool
+	}
+	cases := []struct {
+		name  string
+		steps []step
+	}{
+		{
+			name: "multi-line block suppressed, prose around it emits",
+			steps: []step{
+				{"I will read the file.", false},
+				{resultEnvelopeBegin, true},
+				{`{"status":"passed","summary":"did it"}`, true},
+				{resultEnvelopeEnd, true},
+				{"WORK_RESULT:passed", false},
+			},
+		},
+		{
+			name: "both markers on one line closes the block",
+			steps: []step{
+				{resultEnvelopeBegin + `{"status":"passed"}` + resultEnvelopeEnd, true},
+				{"after the block", false},
+			},
+		},
+		{
+			name: "marker with leading prose still suppressed",
+			steps: []step{
+				{"final answer: " + resultEnvelopeBegin, true},
+				{`{"status":"passed"}`, true},
+				{resultEnvelopeEnd, true},
+				{"done", false},
+			},
+		},
+		{
+			name: "end marker without open block emits",
+			steps: []step{
+				{resultEnvelopeEnd, false},
+				{"prose", false},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var f envelopeLineFilter
+			for i, s := range tc.steps {
+				if got := f.suppress(s.line); got != s.wantSuppress {
+					t.Errorf("step %d (%q): suppress = %v, want %v", i, s.line, got, s.wantSuppress)
+				}
+			}
+		})
+	}
+}
+
 func TestSuccessFromEnvelope(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

@@ -227,9 +227,16 @@ func (h *Handle) readLoop() {
 	retained := newCappedBuffer(maxRetainedOutput)
 	buf := make([]byte, 32*1024)
 	var lineCarry strings.Builder
+	var envFilter envelopeLineFilter
 	flushLine := func(line string) {
 		clean := sanitizeLine(line)
 		retained.WriteString(clean + "\n")
+		// Envelope lines (markers + result JSON) are retained for
+		// buildResult but never emitted — raw envelope JSON must not
+		// surface as assistant "thoughts".
+		if envFilter.suppress(clean) {
+			return
+		}
 		if strings.TrimSpace(clean) != "" {
 			h.sendEvent(agent.AssistantTextEvent{Text: clean})
 		}

@@ -106,6 +106,13 @@ echo "WORK_RESULT:passed"
 	if !strings.Contains(joined, "WORK_RESULT:passed") {
 		t.Errorf("WORK_RESULT marker not present in assistant text stream (runner scans this): %q", joined)
 	}
+	// Envelope lines are retained for buildResult but must NOT surface as
+	// assistant text — raw envelope JSON would render as thought spam.
+	for _, frag := range []string{resultEnvelopeBegin, resultEnvelopeEnd, `"status":"passed"`} {
+		if strings.Contains(joined, frag) {
+			t.Errorf("envelope fragment %q leaked into assistant text stream: %q", frag, joined)
+		}
+	}
 
 	results := eventsOfKind[agent.ResultEvent](evs)
 	if len(results) != 1 {
