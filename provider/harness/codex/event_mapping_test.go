@@ -1,10 +1,18 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/activity"
 )
 
 func TestMapNotification_ThreadStarted(t *testing.T) {
@@ -146,6 +154,95 @@ func TestMapNotification_ReasoningDelta_Dropped(t *testing.T) {
 		if len(got) != 0 {
 			t.Fatalf("%s: expected delta to be dropped, got %d event(s): %+v", method, len(got), got)
 		}
+	}
+}
+
+// Chain guard: a COMPLETED reasoning item must map to
+// SystemEvent{Subtype: "reasoning"}, and the shared activity poster must
+// forward exactly that event as a type=thought payload. Companion to
+// TestMapNotification_ReasoningDelta_Dropped above, which pins the
+// complete-message discipline (per-token deltas stay dropped); together they
+// guarantee codex emits one thought per completed reasoning item, no spam.
+func TestMapItem_ReasoningCompleted_PostsThoughtActivity(t *testing.T) {
+	t.Parallel()
+	params := mustJSON(t, map[string]any{
+		"item": map[string]any{
+			"id":      "r-1",
+			"type":    "reasoning",
+			"summary": "inspecting the failing test first",
+		},
+	})
+	got := mapNotification("item/completed", params, &mapperState{}, nil)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(got))
+	}
+	se, ok := got[0].(agent.SystemEvent)
+	if !ok {
+		t.Fatalf("expected SystemEvent, got %T", got[0])
+	}
+	if se.Subtype != "reasoning" {
+		t.Fatalf("expected subtype=reasoning, got %q", se.Subtype)
+	}
+	if se.Message != "inspecting the failing test first" {
+		t.Fatalf("unexpected message: %q", se.Message)
+	}
+
+	// Second hop: push the mapped event through a real activity poster and
+	// assert the wire payload is a thought carrying the reasoning text.
+	var captured atomic.Pointer[string]
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/activity") {
+			body, _ := io.ReadAll(r.Body)
+			s := string(body)
+			captured.Store(&s)
+			hits.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	poster, err := activity.New(activity.Config{
+		SessionID:  "s1",
+		WorkerID:   "w1",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := poster.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = poster.Stop() })
+
+	poster.Send(context.Background(), se)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && hits.Load() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if hits.Load() == 0 {
+		t.Fatal("expected reasoning SystemEvent to be posted as an activity")
+	}
+	body := captured.Load()
+	if body == nil {
+		t.Fatal("no body captured")
+	}
+	var wire struct {
+		Activity struct {
+			Type    string `json:"type"`
+			Content string `json:"content"`
+		} `json:"activity"`
+	}
+	if err := json.Unmarshal([]byte(*body), &wire); err != nil {
+		t.Fatalf("decode body: %v\n%s", err, *body)
+	}
+	if wire.Activity.Type != "thought" {
+		t.Fatalf("type = %q; want thought", wire.Activity.Type)
+	}
+	if wire.Activity.Content != "inspecting the failing test first" {
+		t.Fatalf("content = %q; want reasoning summary", wire.Activity.Content)
 	}
 }
 
