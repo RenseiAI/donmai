@@ -53,6 +53,40 @@ func extractEnvelope(stdout string) (env resultEnvelope, rawJSON string, ok bool
 	return parsed, body, true
 }
 
+// envelopeLineFilter tracks whether a line stream is inside a
+// <<<DONMAI_RESULT>>> … <<<END_DONMAI_RESULT>>> block so envelope lines can
+// be withheld from AssistantTextEvent emission. The lines still reach the
+// retained buffer — buildResult/extractEnvelope parse them from there — this
+// filter only stops the raw envelope JSON from surfacing as "thought"
+// activities.
+//
+// Marker detection is per flushed line: pty reads that split a line are
+// reassembled by the caller's line carry before flushing, so a marker is
+// only ever missed if a single line exceeds the forced-flush cap (markers
+// and the one-line envelope JSON are tiny in practice).
+type envelopeLineFilter struct {
+	inEnvelope bool
+}
+
+// suppress reports whether line should be withheld from emission, updating
+// the in-envelope state. Lines carrying a marker are themselves suppressed;
+// a line containing both markers closes the block again.
+func (f *envelopeLineFilter) suppress(line string) bool {
+	if f.inEnvelope {
+		if strings.Contains(line, resultEnvelopeEnd) {
+			f.inEnvelope = false
+		}
+		return true
+	}
+	idx := strings.Index(line, resultEnvelopeBegin)
+	if idx < 0 {
+		return false
+	}
+	rest := line[idx+len(resultEnvelopeBegin):]
+	f.inEnvelope = !strings.Contains(rest, resultEnvelopeEnd)
+	return true
+}
+
 // successFromEnvelope maps a parsed envelope status to a bool. Defaults to the
 // fallback when the status is absent or unrecognized.
 func successFromEnvelope(env resultEnvelope, fallback bool) bool {
