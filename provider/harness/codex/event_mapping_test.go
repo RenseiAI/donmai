@@ -157,6 +157,24 @@ func TestMapNotification_ReasoningDelta_Dropped(t *testing.T) {
 	}
 }
 
+// A reasoning item/started must emit nothing: only item/completed carries
+// the final summary, and the activity poster now forwards reasoning
+// SystemEvents as thoughts — a started-time emission would double-post (or
+// post a partial summary) for every reasoning item.
+func TestMapItem_ReasoningStarted_Dropped(t *testing.T) {
+	t.Parallel()
+	params := mustJSON(t, map[string]any{
+		"item": map[string]any{
+			"id":      "r-1",
+			"type":    "reasoning",
+			"summary": "partial summary at start",
+		},
+	})
+	if got := mapNotification("item/started", params, &mapperState{}, nil); len(got) != 0 {
+		t.Fatalf("expected no events for reasoning item/started, got %d: %#v", len(got), got)
+	}
+}
+
 // Chain guard: a COMPLETED reasoning item must map to
 // SystemEvent{Subtype: "reasoning"}, and the shared activity poster must
 // forward exactly that event as a type=thought payload. Companion to
