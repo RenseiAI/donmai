@@ -537,6 +537,145 @@ func TestObserveEvent_SetsBlockedFlag(t *testing.T) {
 	}
 }
 
+// TestObserveEvent_CapturesLastAssistantText confirms the
+// AssistantTextEvent branch tracks the most recent non-empty assistant
+// message (the codex-path summary fallback) and ignores whitespace-only
+// frames.
+func TestObserveEvent_CapturesLastAssistantText(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	wt := t.TempDir()
+	for _, text := range []string{"first message", "  \n\t", "final message <!-- WORK_RESULT:passed -->"} {
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+	}
+	if want := "final message <!-- WORK_RESULT:passed -->"; obs.lastAssistantText != want {
+		t.Errorf("obs.lastAssistantText = %q; want %q", obs.lastAssistantText, want)
+	}
+	if obs.workResult != "passed" {
+		t.Errorf("obs.workResult = %q; want passed", obs.workResult)
+	}
+}
+
+// TestObserveEvent_MarkerInPenultimateMessage pins the agy-shaped stream:
+// the WORK_RESULT marker arrives as a standalone message BEFORE the final
+// assistant message. The scan covers every assistant message (latest
+// marker wins; a later marker-less message never resets the verdict), so
+// the verdict and the final-message summary both survive. The platform's
+// prompt contract still documents marker-on-the-final-message — this is
+// tolerance, not a contract change.
+func TestObserveEvent_MarkerInPenultimateMessage(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	wt := t.TempDir()
+	for _, text := range []string{
+		"research synthesis complete",
+		"<!-- WORK_RESULT:passed -->",
+		"Here is the final report body.",
+	} {
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+	}
+	if obs.workResult != "passed" {
+		t.Errorf("obs.workResult = %q; want passed (penultimate-message marker dropped)", obs.workResult)
+	}
+	if want := "Here is the final report body."; obs.lastAssistantText != want {
+		t.Errorf("obs.lastAssistantText = %q; want %q", obs.lastAssistantText, want)
+	}
+}
+
+// TestApplyTo_SummaryStamping pins the terminal-summary semantics:
+//
+//   - terminal message present → it IS the summary, and it LAST-wins so a
+//     resume turn after a background-poll wakeup restamps the TRUE final
+//     assistant message instead of keeping the stale pre-wakeup text
+//     (2026-06-10 rehearsal 3, claude wakeup path);
+//   - terminal message absent (codex turn/completed carries no text) →
+//     fall back to the latest assistant text observed on the stream so
+//     the WORK_RESULT marker still reaches the platform's exit event;
+//   - a partial stream (no terminal event) never clobbers an existing
+//     summary but does fill an empty one.
+func TestApplyTo_SummaryStamping(t *testing.T) {
+	t.Parallel()
+
+	terminal := func(msg string) *agent.ResultEvent {
+		return &agent.ResultEvent{Success: true, Message: msg}
+	}
+
+	tests := []struct {
+		name string
+		obs  []streamObservation
+		want string
+	}{
+		{
+			name: "terminal message wins",
+			obs: []streamObservation{
+				{terminalEvent: terminal("final answer"), lastAssistantText: "narration"},
+			},
+			want: "final answer",
+		},
+		{
+			name: "codex: terminal without message falls back to last assistant text",
+			obs: []streamObservation{
+				{terminalEvent: terminal(""), lastAssistantText: "QA verdict <!-- WORK_RESULT:passed -->"},
+			},
+			want: "QA verdict <!-- WORK_RESULT:passed -->",
+		},
+		{
+			name: "wakeup restamps post-wakeup terminal message (last-wins)",
+			obs: []streamObservation{
+				{terminalEvent: terminal("stale pre-wakeup text")},
+				{terminalEvent: terminal("true final message <!-- WORK_RESULT:passed -->")},
+			},
+			want: "true final message <!-- WORK_RESULT:passed -->",
+		},
+		{
+			name: "codex wakeup restamps post-wakeup assistant text",
+			obs: []streamObservation{
+				{terminalEvent: terminal(""), lastAssistantText: "stale pre-wakeup text"},
+				{terminalEvent: terminal(""), lastAssistantText: "true final message"},
+			},
+			want: "true final message",
+		},
+		{
+			name: "partial resume stream keeps existing summary",
+			obs: []streamObservation{
+				{terminalEvent: terminal("final answer")},
+				{lastAssistantText: "mid-turn narration, stream cut"},
+			},
+			want: "final answer",
+		},
+		{
+			name: "partial stream fills empty summary",
+			obs: []streamObservation{
+				{lastAssistantText: "only narration before crash"},
+			},
+			want: "only narration before crash",
+		},
+		{
+			name: "empty observation leaves summary alone",
+			obs: []streamObservation{
+				{terminalEvent: terminal("final answer")},
+				{},
+			},
+			want: "final answer",
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			res := &Result{}
+			for _, o := range tc.obs {
+				o.applyTo(res, agent.ProviderClaude)
+			}
+			if res.Summary != tc.want {
+				t.Errorf("Summary = %q; want %q", res.Summary, tc.want)
+			}
+		})
+	}
+}
+
 // TestShouldBackstop_SkipsBlocked verifies a blocked outcome never
 // triggers the empty-branch backstop — a deliberate decline has no work
 // to commit and an auto-PR would misrepresent the refusal.

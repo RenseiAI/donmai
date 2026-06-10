@@ -528,6 +528,80 @@ func TestPosterPost_StatusBodyShape(t *testing.T) {
 	if body["summary"] != "Implemented X, opened PR." {
 		t.Errorf("summary = %v, want %q", body["summary"], "Implemented X, opened PR.")
 	}
+	// The child's parsed verdict must reach the platform directly — the
+	// exit CloudEvent prefers it over re-deriving from a summary marker
+	// scan (codex's terminal event carries no message, so its summary
+	// posted empty and the 2026-06-10 qa/acceptance rehearsal CEs shipped
+	// result=unknown without these fields).
+	if body["result"] != "passed" {
+		t.Errorf("result = %v, want passed", body["result"])
+	}
+	if body["resultMarker"] != "<!-- WORK_RESULT:passed -->" {
+		t.Errorf("resultMarker = %v, want %q", body["resultMarker"], "<!-- WORK_RESULT:passed -->")
+	}
+}
+
+// TestPosterPost_StatusResultSerialized asserts the WORK_RESULT verdict
+// wire fields on the /status body: `result` carries the runner's parsed
+// verdict verbatim, `resultMarker` renders the durable HTML-comment form
+// for definitive verdicts only, and both are omitted when the runner
+// parsed no marker (backward-compatible additive fields).
+func TestPosterPost_StatusResultSerialized(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		workResult string
+		wantResult any // nil = field absent
+		wantMarker any // nil = field absent
+	}{
+		{"passed", "passed", "passed", "<!-- WORK_RESULT:passed -->"},
+		{"failed", "failed", "failed", "<!-- WORK_RESULT:failed -->"},
+		{"blocked", "blocked", "blocked", "<!-- WORK_RESULT:blocked -->"},
+		// "unknown" rides the result field (the platform defaults to it
+		// anyway) but must NOT render a marker — downstream marker scans
+		// only ever see definitive verdicts.
+		{"unknown", "unknown", "unknown", nil},
+		{"empty omitted", "", nil, nil},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var mu sync.Mutex
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					mu.Lock()
+					statusBody = body
+					mu.Unlock()
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+
+			r := goodResult()
+			r.WorkResult = tc.workResult
+			if err := p.Post(context.Background(), "sess-wr", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			mu.Lock()
+			raw := statusBody
+			mu.Unlock()
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("status body not JSON: %v", err)
+			}
+			if got := body["result"]; got != tc.wantResult {
+				t.Errorf("result = %v, want %v", got, tc.wantResult)
+			}
+			if got := body["resultMarker"]; got != tc.wantMarker {
+				t.Errorf("resultMarker = %v, want %v", got, tc.wantMarker)
+			}
+		})
+	}
 }
 
 // TestPosterPost_StatusFailureModeSerialized asserts the failureMode field
