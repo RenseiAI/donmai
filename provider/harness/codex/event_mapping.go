@@ -263,11 +263,18 @@ func mapItem(method string, params json.RawMessage, raw any) []agent.Event {
 		return nil
 
 	case "reasoning":
-		if msg := p.Item.Summary; msg != "" || p.Item.Content != "" {
-			if msg == "" {
-				msg = p.Item.Content
+		// Only the COMPLETED reasoning item carries the final summary —
+		// mirror the agentMessage gate. item/started must not emit: the
+		// activity poster now forwards reasoning SystemEvents as "thought"
+		// activities, so a started-time emission would double-post (or post
+		// a partial summary) for every reasoning item.
+		if isCompleted {
+			if msg := p.Item.Summary; msg != "" || p.Item.Content != "" {
+				if msg == "" {
+					msg = p.Item.Content
+				}
+				return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: msg, Raw: raw}}
 			}
-			return []agent.Event{agent.SystemEvent{Subtype: "reasoning", Message: msg, Raw: raw}}
 		}
 		return nil
 
