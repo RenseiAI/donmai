@@ -8,6 +8,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Security
+
+- **dmk_ machine token no longer travels in a URL query string.** The
+  dashboard claim link printed on `daemon install` now carries the token in
+  the URL fragment (`<dashboard>/claim#token=…`) instead of
+  `…/api/auth/claim?token=…`. Fragments are never sent over the wire, keeping
+  the secret out of server access logs, proxy logs, and Referer headers.
+  Requires the paired dashboard release that serves the `/claim`
+  fragment-exchange page.
+
 ### Fixes
 
 - **Activity toolOutput truncation no longer drops trailing PR URLs.** The
