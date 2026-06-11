@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test lint fmt vuln coverage clean release-dry-run generate verify-generated
+.PHONY: build run run-mock run-status run-status-mock test lint fmt vuln coverage clean release-dry-run generate verify-generated guard
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -23,6 +23,10 @@ test:
 
 lint:
 	golangci-lint run
+
+guard:
+	bash scripts/leak-guard.sh --self-test
+	bash scripts/leak-guard.sh --all
 
 fmt:
 	gofumpt -w .
