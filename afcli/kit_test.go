@@ -34,6 +34,7 @@ type fakeKitClient struct {
 	srcDisErr   error
 
 	gotInstallID, gotInstallVersion string
+	gotInstallTrustOverride         string
 	gotEnableID, gotDisableID       string
 	gotSrcEnable, gotSrcDisable     string
 }
@@ -53,6 +54,7 @@ func (f *fakeKitClient) VerifyKitSignature(_ string) (*afclient.KitSignatureResu
 func (f *fakeKitClient) InstallKit(id string, req afclient.KitInstallRequest) (*afclient.KitInstallResult, error) {
 	f.gotInstallID = id
 	f.gotInstallVersion = req.Version
+	f.gotInstallTrustOverride = req.TrustOverride
 	return f.installResp, f.installErr
 }
 
@@ -248,6 +250,63 @@ func TestKitCmd_Install_NotFound(t *testing.T) {
 	_, err := runRootCmd(t, root, "kit", "install", "nope")
 	if err == nil || !strings.Contains(err.Error(), "kit not found: nope") {
 		t.Errorf("error: %v, want kit not found", err)
+	}
+}
+
+// TestKitCmd_Install_DefaultSendsNoTrustOverride pins that a plain
+// install does NOT bypass the trust gate.
+func TestKitCmd_Install_DefaultSendsNoTrustOverride(t *testing.T) {
+	client := &fakeKitClient{
+		installResp: &afclient.KitInstallResult{Kit: sampleKit(), Message: "installed"},
+	}
+	root := newKitRootForTest(client)
+	if _, err := runRootCmd(t, root, "kit", "install", "spring/java", "--plain"); err != nil {
+		t.Fatalf("kit install: %v", err)
+	}
+	if client.gotInstallTrustOverride != "" {
+		t.Errorf("trustOverride: want empty without --allow-unsigned, got %q", client.gotInstallTrustOverride)
+	}
+}
+
+// TestKitCmd_Install_AllowUnsignedSendsOverrideAndWarns pins the
+// explicit per-install override path: --allow-unsigned maps to the
+// trustOverride wire field and prints a warning before installing.
+func TestKitCmd_Install_AllowUnsignedSendsOverrideAndWarns(t *testing.T) {
+	client := &fakeKitClient{
+		installResp: &afclient.KitInstallResult{Kit: sampleKit(), Message: "installed"},
+	}
+	root := newKitRootForTest(client)
+	out, err := runRootCmd(t, root, "kit", "install", "spring/java", "--allow-unsigned", "--plain")
+	if err != nil {
+		t.Fatalf("kit install --allow-unsigned: %v", err)
+	}
+	if client.gotInstallTrustOverride != afclient.TrustOverrideAllowedThisOnce {
+		t.Errorf("trustOverride: want %q, got %q", afclient.TrustOverrideAllowedThisOnce, client.gotInstallTrustOverride)
+	}
+	if !strings.Contains(out, "WARNING") || !strings.Contains(out, "bypasses signature verification") {
+		t.Errorf("output missing bypass warning:\n%s", out)
+	}
+}
+
+// TestKitCmd_Install_TrustGateRejectedShowsGuidance pins the failure
+// UX: a daemon 403 (trust-gate rejection) surfaces remediation steps —
+// allowlist the signer, one-time override, or switch the trust mode.
+func TestKitCmd_Install_TrustGateRejectedShowsGuidance(t *testing.T) {
+	client := &fakeKitClient{installErr: fmt.Errorf("i: %w", afclient.ErrUnauthorized)}
+	root := newKitRootForTest(client)
+	_, err := runRootCmd(t, root, "kit", "install", "spring/java")
+	if err == nil {
+		t.Fatal("kit install: want error for trust-gate rejection, got nil")
+	}
+	for _, want := range []string{
+		"trust gate",
+		"trust.issuerSet",
+		"--allow-unsigned",
+		"DONMAI_KIT_TRUST_MODE=permissive",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q:\n%s", want, err.Error())
+		}
 	}
 }
 

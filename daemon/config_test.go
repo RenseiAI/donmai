@@ -450,10 +450,12 @@ autoUpdate:
 	}
 }
 
-// TestLoadConfig_TrustMode_DefaultsToPermissive asserts the Wave 12
-// default trust mode (Q2 of WAVE12_PLAN) — daemon.yaml with no `trust:`
-// block lands `trust.mode: permissive` after applyDefaults.
-func TestLoadConfig_TrustMode_DefaultsToPermissive(t *testing.T) {
+// TestLoadConfig_TrustMode_DefaultsToSignedByAllowlist asserts the
+// secure default trust mode — daemon.yaml with no `trust:` block lands
+// `trust.mode: signed-by-allowlist` after applyDefaults, unless the
+// operator opts out via DONMAI_KIT_TRUST_MODE.
+func TestLoadConfig_TrustMode_DefaultsToSignedByAllowlist(t *testing.T) {
+	t.Setenv(envKitTrustMode, "")
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
 	body := []byte(`apiVersion: donmai.dev/v1
@@ -481,8 +483,19 @@ autoUpdate:
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.Trust.Mode != TrustModePermissive {
-		t.Errorf("Trust.Mode default: want %q, got %q", TrustModePermissive, cfg.Trust.Mode)
+	if cfg.Trust.Mode != TrustModeSignedByAllowlist {
+		t.Errorf("Trust.Mode default: want %q, got %q", TrustModeSignedByAllowlist, cfg.Trust.Mode)
+	}
+
+	// Operator opt-out: DONMAI_KIT_TRUST_MODE=permissive flips the
+	// applyDefaults seed back to permissive.
+	t.Setenv(envKitTrustMode, string(TrustModePermissive))
+	cfg2, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig (env override): %v", err)
+	}
+	if cfg2.Trust.Mode != TrustModePermissive {
+		t.Errorf("Trust.Mode with %s=permissive: want %q, got %q", envKitTrustMode, TrustModePermissive, cfg2.Trust.Mode)
 	}
 }
 

@@ -138,7 +138,9 @@ func TestKitVerifier_TrustGateAllowsByMode(t *testing.T) {
 		{"permissive-allows-unsigned", TrustModePermissive, afclient.KitTrustUnsigned, true},
 		{"permissive-allows-unverified", TrustModePermissive, afclient.KitTrustSignedUnverified, true},
 		{"permissive-allows-verified", TrustModePermissive, afclient.KitTrustSignedVerified, true},
-		{"empty-defaults-permissive", TrustMode(""), afclient.KitTrustUnsigned, true},
+		{"empty-defaults-allowlist-rejects-unsigned", TrustMode(""), afclient.KitTrustUnsigned, false},
+		{"empty-defaults-allowlist-rejects-unverified", TrustMode(""), afclient.KitTrustSignedUnverified, false},
+		{"empty-defaults-allowlist-allows-verified", TrustMode(""), afclient.KitTrustSignedVerified, true},
 		{"allowlist-rejects-unsigned", TrustModeSignedByAllowlist, afclient.KitTrustUnsigned, false},
 		{"allowlist-rejects-unverified", TrustModeSignedByAllowlist, afclient.KitTrustSignedUnverified, false},
 		{"allowlist-allows-verified", TrustModeSignedByAllowlist, afclient.KitTrustSignedVerified, true},
@@ -152,6 +154,91 @@ func TestKitVerifier_TrustGateAllowsByMode(t *testing.T) {
 				t.Errorf("trustGateAllows(%q) under mode %q: want %v, got %v", tc.trust, tc.mode, tc.want, got)
 			}
 		})
+	}
+}
+
+func TestResolveDefaultTrustMode(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		want TrustMode
+	}{
+		{"unset-defaults-allowlist", "", TrustModeSignedByAllowlist},
+		{"permissive-opt-out", "permissive", TrustModePermissive},
+		{"explicit-allowlist", "signed-by-allowlist", TrustModeSignedByAllowlist},
+		{"attested-recognised", "attested", TrustModeAttested},
+		{"unrecognised-falls-back-to-allowlist", "anything-goes", TrustModeSignedByAllowlist},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envKitTrustMode, tc.env)
+			if got := resolveDefaultTrustMode(); got != tc.want {
+				t.Errorf("resolveDefaultTrustMode() with %s=%q: want %q, got %q", envKitTrustMode, tc.env, tc.want, got)
+			}
+		})
+	}
+}
+
+func TestValidateTrustConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     TrustConfig
+		wantErr bool
+	}{
+		{"allowlist-empty-issuerset-rejected", TrustConfig{Mode: TrustModeSignedByAllowlist}, true},
+		{"attested-empty-issuerset-rejected", TrustConfig{Mode: TrustModeAttested}, true},
+		{"allowlist-with-issuerset-ok", TrustConfig{Mode: TrustModeSignedByAllowlist, IssuerSet: []string{"kit-publisher@example.com"}}, false},
+		{"permissive-empty-issuerset-ok", TrustConfig{Mode: TrustModePermissive}, false},
+		{"empty-mode-ok", TrustConfig{}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTrustConfig(tc.cfg)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validateTrustConfig(%+v): err = %v, wantErr %v", tc.cfg, err, tc.wantErr)
+			}
+		})
+	}
+
+	// The misconfiguration error must spell out both remediation paths.
+	err := validateTrustConfig(TrustConfig{Mode: TrustModeSignedByAllowlist})
+	if err == nil {
+		t.Fatal("validateTrustConfig: want error for allowlist + empty issuer set")
+	}
+	for _, want := range []string{"trust.issuerSet", envKitTrustMode} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error: want substring %q, got: %s", want, err.Error())
+		}
+	}
+}
+
+// TestKitRegistry_InstallTrustGateRejectionIsActionable asserts the
+// gate-rejection error names the kit's trust state and every remediation
+// path (allowlist the signer, one-time override, switch mode) — the CLI
+// shows this text to OSS users verbatim.
+func TestKitRegistry_InstallTrustGateRejectionIsActionable(t *testing.T) {
+	repoURL := newLocalGitFixture(t, fixtureFile{name: "rensei-example.kit.toml", body: minimalKitTOML})
+	scan := t.TempDir()
+
+	r := NewKitRegistryWithTrust([]string{scan}, TrustConfig{
+		Mode:      TrustModeSignedByAllowlist,
+		IssuerSet: []string{"kit-publisher@example.com"},
+	})
+	_, err := r.Install("rensei/example", afclient.KitInstallRequest{
+		Source: &afclient.KitInstallSource{Kind: "git", URL: repoURL},
+	})
+	if !errors.Is(err, ErrKitTrustGateRejected) {
+		t.Fatalf("Install: want ErrKitTrustGateRejected, got %v", err)
+	}
+	for _, want := range []string{
+		string(afclient.KitTrustUnsigned),
+		"trust.issuerSet",
+		"--allow-unsigned",
+		envKitTrustMode,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("rejection error: want substring %q, got: %s", want, err.Error())
+		}
 	}
 }
 

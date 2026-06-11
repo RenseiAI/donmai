@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -157,7 +158,7 @@ func (c *DaemonClient) get(path string, target any) error {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if err := statusToError(resp.StatusCode, path); err != nil {
+	if err := daemonStatusToError(resp, path); err != nil {
 		return err
 	}
 	return json.NewDecoder(resp.Body).Decode(target)
@@ -175,13 +176,34 @@ func (c *DaemonClient) post(path string, body any, target any) error {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if err := statusToError(resp.StatusCode, path); err != nil {
+	if err := daemonStatusToError(resp, path); err != nil {
 		return err
 	}
 	if target != nil {
 		return json.NewDecoder(resp.Body).Decode(target)
 	}
 	return nil
+}
+
+// daemonStatusToError maps a non-2xx daemon response to the shared
+// sentinel errors (statusToError) and, when the daemon supplied a JSON
+// `{"error": "..."}` body, appends that detail so callers can show the
+// daemon's actual reason (e.g. the kit trust gate's remediation steps)
+// instead of a bare "unauthorized". errors.Is against the sentinels
+// keeps working — the detail is appended via %w-wrapping the sentinel
+// error.
+func daemonStatusToError(resp *http.Response, path string) error {
+	err := statusToError(resp.StatusCode, path)
+	if err == nil {
+		return nil
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body); decodeErr == nil && body.Error != "" {
+		return fmt.Errorf("%w: %s", err, body.Error)
+	}
+	return err
 }
 
 // GetStatus fetches the daemon's current status snapshot.
