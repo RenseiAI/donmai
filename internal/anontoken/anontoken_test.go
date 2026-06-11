@@ -171,7 +171,7 @@ func TestClaimURL_Format(t *testing.T) {
 // Referer headers — fragments are never sent over the wire.
 func TestClaimURL_TokenNeverInQueryOrPath(t *testing.T) {
 	t.Parallel()
-	const token = "dmk_deadbeef"
+	const token = "dmk_deadbeef" //nolint:gosec // G101: synthetic test fixture, not a credential
 
 	for _, baseURL := range []string{"", "https://donmai.dev/dashboard", "http://localhost:3000"} {
 		got := ClaimURL(token, baseURL)

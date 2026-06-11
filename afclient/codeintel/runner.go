@@ -566,10 +566,10 @@ func (r *Runner) fetchDiffOrMeta(ctx context.Context, repo string, prNum int, pr
 			return d
 		}
 		if errors.Is(err, ErrDiffFetchUnavailable) {
-			fmt.Fprintf(diffFetchWarnWriter,
+			_, _ = fmt.Fprintf(diffFetchWarnWriter,
 				"warning: %v; degrading to metadata-only assessment (no diff observations)\n", err)
 		} else {
-			fmt.Fprintf(diffFetchWarnWriter,
+			_, _ = fmt.Fprintf(diffFetchWarnWriter,
 				"warning: PR diff fetch failed for %s: %v; degrading to metadata-only assessment (no diff observations)\n",
 				ref, err)
 		}
