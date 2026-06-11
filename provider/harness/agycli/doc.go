@@ -44,10 +44,13 @@
 //  3. Transcript enrichment (best-effort): `agy` writes a structured JSONL
 //     transcript to ~/.gemini/antigravity-cli/brain/<conv-id>/.system_generated/
 //     logs/transcript.jsonl. We discover the conv-id (by diffing the brain/
-//     directory across spawn) and replay tool_calls → agent.ToolUseEvent and
-//     tool-result steps → agent.ToolResultEvent. This is an INTERNAL,
-//     version-fragile path: any discovery/parse failure degrades silently to
-//     the stdout spine. Toggle: Options.DisableTranscriptEnrichment.
+//     directory across spawn) and TAIL the transcript live during the run,
+//     streaming tool_calls → agent.ToolUseEvent and tool-result steps →
+//     agent.ToolResultEvent as agy appends them (a final catch-up drain after
+//     exit covers anything still buffered — there is no after-the-fact EOF
+//     replay). This is an INTERNAL, version-fragile path: any discovery/parse
+//     failure degrades silently to the stdout spine. Toggle:
+//     Options.DisableTranscriptEnrichment.
 //
 // # Capability matrix (see CONTRACT.md §5)
 //

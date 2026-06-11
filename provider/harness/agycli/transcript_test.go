@@ -164,7 +164,7 @@ func TestConvIDForCwd(t *testing.T) {
 	}
 }
 
-func TestReadTranscriptEvents_DiscoversAndParses(t *testing.T) {
+func TestTailer_DiscoversAndParses(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()
 	convID := "run-1"
@@ -174,20 +174,45 @@ func TestReadTranscriptEvents_DiscoversAndParses(t *testing.T) {
 	}
 	writeTranscript(t, home, convID, string(fixture))
 
-	// before = empty snapshot → the conv is fresh → discovered + parsed.
-	evs := readTranscriptEvents(home, "/work/x", map[string]struct{}{})
+	var evs []agent.Event
+	var discovered []string
+	tailer := &transcriptTailer{
+		stateHome: home,
+		cwd:       "/work/x",
+		before:    map[string]struct{}{}, // empty snapshot → the conv is fresh
+		emit:      func(ev agent.Event) { evs = append(evs, ev) },
+		onConvID:  func(id string) { discovered = append(discovered, id) },
+	}
+	tailer.poll(true)
+
+	if len(discovered) != 1 || discovered[0] != convID {
+		t.Fatalf("onConvID calls = %v, want exactly [%s]", discovered, convID)
+	}
 	if len(evs) != 4 {
 		t.Fatalf("end-to-end enrichment got %d events, want 4: %#v", len(evs), evs)
 	}
 	if _, ok := evs[0].(agent.ToolUseEvent); !ok {
 		t.Errorf("first enriched event should be a ToolUseEvent, got %#v", evs[0])
 	}
+
+	// A second poll after discovery must not re-emit anything (offset
+	// tracking) nor re-invoke onConvID.
+	tailer.poll(true)
+	if len(evs) != 4 || len(discovered) != 1 {
+		t.Errorf("second poll re-emitted: %d events, %d discoveries", len(evs), len(discovered))
+	}
 }
 
-func TestReadTranscriptEvents_EmptyStateHome(t *testing.T) {
+func TestTailer_EmptyStateHome(t *testing.T) {
 	t.Parallel()
-	if got := readTranscriptEvents("", "/x", map[string]struct{}{}); got != nil {
-		t.Errorf("empty stateHome should return nil, got %#v", got)
+	var evs []agent.Event
+	tailer := &transcriptTailer{
+		stateHome: "",
+		emit:      func(ev agent.Event) { evs = append(evs, ev) },
+	}
+	tailer.poll(true)
+	if len(evs) != 0 {
+		t.Errorf("empty stateHome should emit nothing, got %#v", evs)
 	}
 }
 
