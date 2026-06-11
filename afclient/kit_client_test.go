@@ -133,6 +133,24 @@ func TestDaemonClient_InstallKit_501(t *testing.T) {
 	}
 }
 
+// TestDaemonClient_InstallKit_403SurfacesErrorDetail pins the
+// trust-gate failure UX: the daemon's 403 JSON `error` detail (the
+// remediation text) rides along on the wrapped ErrUnauthorized instead
+// of being discarded.
+func TestDaemonClient_InstallKit_403SurfacesErrorDetail(t *testing.T) {
+	srv := newKitMockServer(t, []kitMockEntry{
+		{http.MethodPost, "/api/daemon/kits/spring/java/install", http.StatusForbidden, `{"error":"kit install: trust gate rejected — add the signer to trust.issuerSet","kitId":"spring/java"}`},
+	}, nil)
+	c := NewDaemonClientFromURL(srv.URL)
+	_, err := c.InstallKit("spring/java", KitInstallRequest{})
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("InstallKit: want ErrUnauthorized sentinel, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "trust gate rejected") || !strings.Contains(err.Error(), "trust.issuerSet") {
+		t.Errorf("InstallKit error: want daemon error detail surfaced, got %v", err)
+	}
+}
+
 func TestDaemonClient_InstallKit_BodyEncoded(t *testing.T) {
 	var captured string
 	srv := newKitMockServer(t, []kitMockEntry{

@@ -612,6 +612,10 @@ func TestKitRegistryOrEmpty_LazyConstruct(t *testing.T) {
 // lazy-constructed KitRegistry. Before this wave, kitRegistryOrEmpty
 // hardcoded [DefaultKitScanPath()] regardless of operator config.
 func TestKitRegistryOrEmpty_HonorsConfigScanPaths(t *testing.T) {
+	// Pin permissive mode so the lazy construction yields a real
+	// *KitRegistry — this test is about scan-path plumbing, not the
+	// trust gate (covered by TestKitRegistryOrEmpty_DefaultTrust*).
+	t.Setenv(envKitTrustMode, string(TrustModePermissive))
 	tmp := t.TempDir()
 	kitsA := filepath.Join(tmp, "kits-a")
 	kitsB := filepath.Join(tmp, "kits-b")
@@ -665,6 +669,10 @@ func TestKitRegistryOrEmpty_HonorsConfigScanPaths(t *testing.T) {
 // daemon), kitRegistryOrEmpty still produces a usable registry pointed
 // at DefaultKitScanPath().
 func TestKitRegistryOrEmpty_FallsBackWhenConfigEmpty(t *testing.T) {
+	// Pin permissive mode so the lazy construction yields a real
+	// *KitRegistry — this test is about scan-path plumbing, not the
+	// trust gate (covered by TestKitRegistryOrEmpty_DefaultTrust*).
+	t.Setenv(envKitTrustMode, string(TrustModePermissive))
 	// Build a daemon whose Config() returns a Config with empty Kit.
 	d := &Daemon{}
 	d.config = &Config{Kit: KitConfig{ScanPaths: nil}}
@@ -678,6 +686,76 @@ func TestKitRegistryOrEmpty_FallsBackWhenConfigEmpty(t *testing.T) {
 	got := concrete.ScanPaths()
 	if len(got) != 1 || got[0] != DefaultKitScanPath() {
 		t.Errorf("ScanPaths = %v, want [%s]", got, DefaultKitScanPath())
+	}
+}
+
+// TestKitRegistryOrEmpty_DefaultTrustBlocksInstall pins the secure
+// out-of-box behaviour: with no daemon.yaml trust block and no env
+// override, the default trust mode is signed-by-allowlist with an empty
+// issuer set — a misconfiguration that blocks Install fail-closed (with
+// an actionable reason) while keeping the kit surface observable.
+func TestKitRegistryOrEmpty_DefaultTrustBlocksInstall(t *testing.T) {
+	t.Setenv(envKitTrustMode, "")
+	s := &Server{}
+	reg := s.kitRegistryOrEmpty()
+	stub, ok := reg.(*misconfiguredKitRegistry)
+	if !ok {
+		t.Fatalf("registry type = %T, want *misconfiguredKitRegistry", reg)
+	}
+	// Read-only surface stays available (no panic, delegates through).
+	_ = stub.List()
+	_ = stub.ListSources()
+	// Install is blocked with the actionable misconfiguration reason.
+	_, err := stub.Install("rensei/example", afclient.KitInstallRequest{})
+	if !errors.Is(err, ErrKitTrustGateRejected) {
+		t.Fatalf("Install: want ErrKitTrustGateRejected, got %v", err)
+	}
+	for _, want := range []string{"trust.issuerSet", envKitTrustMode} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Install error: want substring %q, got: %s", want, err.Error())
+		}
+	}
+}
+
+// TestKitRegistryOrEmpty_EnvOptOutPermissive pins the operator opt-out:
+// DONMAI_KIT_TRUST_MODE=permissive restores a fully-working permissive
+// registry on an unconfigured daemon.
+func TestKitRegistryOrEmpty_EnvOptOutPermissive(t *testing.T) {
+	t.Setenv(envKitTrustMode, string(TrustModePermissive))
+	s := &Server{}
+	if _, ok := s.kitRegistryOrEmpty().(*KitRegistry); !ok {
+		t.Fatalf("registry type = %T, want *KitRegistry under env opt-out", s.kitReg)
+	}
+}
+
+// TestMisconfiguredKitRegistry_TrustOverrideStillWorks pins the explicit
+// per-install escape hatch through the misconfigured-policy stub: a
+// trustOverride: "allowed-this-once" request delegates to the real
+// registry and installs (audit-logged by the gate), matching the
+// behaviour of a healthy signed-by-allowlist gate.
+func TestMisconfiguredKitRegistry_TrustOverrideStillWorks(t *testing.T) {
+	repoURL := newLocalGitFixture(t, fixtureFile{name: "rensei-example.kit.toml", body: minimalKitTOML})
+	wrapped := NewKitRegistryWithTrust([]string{t.TempDir()}, TrustConfig{Mode: TrustModeSignedByAllowlist})
+	stub := &misconfiguredKitRegistry{real: wrapped, reason: errors.New("misconfigured for test")}
+
+	src := &afclient.KitInstallSource{Kind: "git", URL: repoURL}
+
+	// Without the override: blocked with the misconfiguration reason.
+	_, err := stub.Install("rensei/example", afclient.KitInstallRequest{Source: src})
+	if !errors.Is(err, ErrKitTrustGateRejected) {
+		t.Fatalf("Install without override: want ErrKitTrustGateRejected, got %v", err)
+	}
+
+	// With the override: delegates to the real registry and installs.
+	res, err := stub.Install("rensei/example", afclient.KitInstallRequest{
+		Source:        src,
+		TrustOverride: afclient.TrustOverrideAllowedThisOnce,
+	})
+	if err != nil {
+		t.Fatalf("Install with override: want success, got %v", err)
+	}
+	if res.Kit.Trust != afclient.KitTrustUnsigned {
+		t.Errorf("Kit.Trust: want unsigned (override bypasses gate, not the verifier), got %q", res.Kit.Trust)
 	}
 }
 

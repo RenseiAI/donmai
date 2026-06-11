@@ -24,6 +24,28 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Security
 
+- **Kit installs now default to `signed-by-allowlist` (BREAKING).** The
+  daemon's kit trust gate no longer defaults to `permissive`: with no
+  `trust:` block in `daemon.yaml`, only kits whose sigstore signature
+  verifies AND whose signer (Fulcio SAN) appears in `trust.issuerSet`
+  install. Unsigned/unverified kits are rejected (HTTP 403) with an error
+  spelling out every remediation path; `signed-by-allowlist` with an empty
+  `issuerSet` fail-closes installs (the kit surface stays readable) instead
+  of silently accepting any validly-signed kit. Operators who knowingly
+  accept unsigned-kit risk can opt out per install
+  (`donmai kit install --allow-unsigned`, audit-logged) or globally via
+  `trust.mode: permissive` / `DONMAI_KIT_TRUST_MODE=permissive` (logs a
+  prominent warning per gated install). Also fixed: SAN-only
+  `trust.issuerSet` entries were dropped as malformed (sigstore-go requires
+  issuer criteria), so a configured allowlist could never match — entries
+  now match the SAN exactly with the OIDC issuer wildcarded; and a verifier
+  construction failure now keeps the configured trust mode (fail-closed)
+  instead of downgrading to a permissive verifier. The trust-gate 403
+  detail now reaches `donmai kit install` output, which appends the
+  allowlist/override/permissive guidance. Closes the "operator installs
+  attacker kit → arbitrary shell execution" gap (CWE-494). See
+  `daemon/README.md` § "Kit install trust gate".
+
 - **dmk_ machine token no longer travels in a URL query string.** The
   dashboard claim link printed on `daemon install` now carries the token in
   the URL fragment (`<dashboard>/claim#token=…`) instead of

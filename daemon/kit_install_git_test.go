@@ -255,6 +255,65 @@ func TestKitRegistry_InstallFromGit_SignedByAllowlistAccepts(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────
 //
+//	install-issuer-set-allowlist (signer in/out of trust.issuerSet)
+//
+// ─────────────────────────────────────────────────────────────────────
+
+// newAllowlistInstallRegistry builds a registry whose verifier trusts
+// the returned VirtualSigstore material, gated on the given issuerSet —
+// the realistic shape of the secure default (signed-by-allowlist needs
+// a populated trust.issuerSet to construct at all via the daemon path).
+func newAllowlistInstallRegistry(t *testing.T, issuerSet []string) *KitRegistry {
+	t.Helper()
+	vs, err := ca.NewVirtualSigstore()
+	if err != nil {
+		t.Fatalf("NewVirtualSigstore: %v", err)
+	}
+	manifestBytes := []byte(minimalKitTOML)
+	entity, err := vs.Sign("kit-publisher@example.com", "https://issuer.example", manifestBytes)
+	if err != nil {
+		t.Fatalf("vs.Sign: %v", err)
+	}
+	return &KitRegistry{
+		scanPaths: []string{t.TempDir()},
+		verifier: newKitVerifierWithMaterial(TrustConfig{
+			Mode:      TrustModeSignedByAllowlist,
+			IssuerSet: issuerSet,
+		}, vs),
+		fetcher: &hermeticFetcher{
+			manifest:      manifestBytes,
+			manifestName:  "rensei-example.kit.toml",
+			entity:        entity,
+			bundleContent: []byte(`{"placeholder":"sibling .sigstore presence flag"}`),
+		},
+	}
+}
+
+func TestKitRegistry_InstallFromGit_AllowlistedSignerAccepted(t *testing.T) {
+	r := newAllowlistInstallRegistry(t, []string{"kit-publisher@example.com"})
+	res, err := r.Install("rensei/example", afclient.KitInstallRequest{
+		Source: &afclient.KitInstallSource{Kind: "git", URL: "ignored-by-hermetic-fetcher"},
+	})
+	if err != nil {
+		t.Fatalf("Install: want success for allowlisted signer, got %v", err)
+	}
+	if res.Kit.Trust != afclient.KitTrustSignedVerified {
+		t.Errorf("Kit.Trust: want signed-verified, got %q", res.Kit.Trust)
+	}
+}
+
+func TestKitRegistry_InstallFromGit_NonAllowlistedSignerRejected(t *testing.T) {
+	r := newAllowlistInstallRegistry(t, []string{"someone-else@example.com"})
+	_, err := r.Install("rensei/example", afclient.KitInstallRequest{
+		Source: &afclient.KitInstallSource{Kind: "git", URL: "ignored-by-hermetic-fetcher"},
+	})
+	if !errors.Is(err, ErrKitTrustGateRejected) {
+		t.Fatalf("Install: want ErrKitTrustGateRejected for non-allowlisted signer, got %v", err)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//
 //	install-tampered-bundle-allowlist (signed-but-unverified rejected)
 //
 // ─────────────────────────────────────────────────────────────────────

@@ -48,8 +48,9 @@ type Config struct {
 	Kit KitConfig `yaml:"kit,omitempty"          json:"kit,omitempty"`
 	// Trust holds the daemon-wide signature-verification policy
 	// (sigstore bundle-mode verifier mode + issuer allowlist + audit
-	// actor). Optional; applyDefaults seeds Mode to
-	// TrustModePermissive when absent. Per WAVE12_PLAN Q2 and
+	// actor). Optional; applyDefaults seeds Mode via
+	// resolveDefaultTrustMode — TrustModeSignedByAllowlist unless the
+	// operator opts out through DONMAI_KIT_TRUST_MODE. Per
 	// 002-provider-base-contract.md § "Signing and trust". Lives on
 	// Config (not on KitConfig) because the trust mode applies across
 	// all plugin families per 015-plugin-spec.md § "Auth + trust".
@@ -309,7 +310,11 @@ func applyDefaults(c *Config) {
 		c.Kit.ScanPaths = []string{DefaultKitScanPath()}
 	}
 	if c.Trust.Mode == "" {
-		c.Trust.Mode = TrustModePermissive
+		// Secure default: signed-by-allowlist unless the operator opts
+		// out via DONMAI_KIT_TRUST_MODE. Kept in lock-step with
+		// kitRegistryOrEmpty (handle_kit.go), which applies the same
+		// default when no Config is loaded at all.
+		c.Trust.Mode = resolveDefaultTrustMode()
 	}
 	for i := range c.Projects {
 		if c.Projects[i].CloneStrategy == "" {

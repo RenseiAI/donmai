@@ -169,6 +169,41 @@ autoUpdate:
       issuer: https://token.actions.githubusercontent.com
 ```
 
+## Kit install trust gate
+
+Kit installs (`donmai kit install`, `POST /api/daemon/kits/<id>/install`)
+run through a sigstore signature verifier before anything is persisted. The
+trust policy lives in `daemon.yaml`'s top-level `trust` block:
+
+```yaml
+trust:
+  mode: signed-by-allowlist        # permissive | signed-by-allowlist | attested
+  issuerSet:
+    - kit-publisher@example.com    # Fulcio SAN identities you trust
+  actor: ops@example.com           # audit identity for trust overrides
+```
+
+**The default mode is `signed-by-allowlist`** — only kits whose signature
+verifies AND whose signer identity (Fulcio SAN) appears in `trust.issuerSet`
+install. Unsigned or unverified kits are rejected with HTTP 403 and an error
+that spells out the remediation paths. `signed-by-allowlist` with an empty
+`issuerSet` is treated as a misconfiguration: the kit surface stays readable
+but installs are blocked until the operator populates the allowlist or
+explicitly opts out.
+
+Opting out (accepting that unsigned kits can execute arbitrary shell
+commands):
+
+- **Per install** — `donmai kit install <id> --allow-unsigned` sends
+  `trustOverride: "allowed-this-once"`; the bypass is audit-logged with the
+  kit id, signer, and configured `trust.actor`.
+- **Globally** — set `trust.mode: permissive` in `daemon.yaml`, or export
+  `DONMAI_KIT_TRUST_MODE=permissive` before starting the daemon. Permissive
+  mode logs a prominent warning on every gated install.
+
+`donmai kit verify <id>` shows a kit's current trust state and signer so you
+can decide what to allowlist.
+
 ## Operator runbook — debugging a stuck session
 
 When a session appears wedged in the dashboard:

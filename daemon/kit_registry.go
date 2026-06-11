@@ -243,12 +243,22 @@ func NewKitRegistry(scanPaths []string) *KitRegistry {
 // configuration. Used by Server.kitRegistryOrEmpty to thread the
 // daemon.Config().Trust block into the registry.
 //
+// NOTE (fail-closed): this constructor does NOT validate the trust
+// config — callers that need fail-closed behaviour on a misconfigured
+// policy (e.g., signed-by-allowlist with an empty issuer set) must call
+// validateTrustConfig first; kitRegistryOrEmpty (handle_kit.go) does
+// exactly that and wraps the registry in a misconfiguredKitRegistry
+// stub on error.
+//
 // If the verifier fails to construct (e.g., the embedded trust root
-// JSON fails to parse), a permissive verifier with no trusted material
-// is installed instead — every signed manifest reports
-// SignedUnverified, every unsigned reports Unsigned, and the install
-// gate behaves as if Mode=Permissive. The construction error is logged
-// via slog.Warn so operators can diagnose.
+// JSON fails to parse — purely defensive, it ships in the binary), a
+// no-material verifier is installed that KEEPS the configured trust
+// mode: every signed manifest reports SignedUnverified, every unsigned
+// reports Unsigned, so under signed-by-allowlist / attested the install
+// gate rejects everything until the verifier constructs. The historical
+// behaviour of downgrading to a permissive verifier here was fail-open
+// and is intentionally gone. The construction error is logged via
+// slog.Error so operators can diagnose.
 func NewKitRegistryWithTrust(scanPaths []string, trust TrustConfig) *KitRegistry {
 	if len(scanPaths) == 0 {
 		scanPaths = []string{DefaultKitScanPath()}
@@ -259,13 +269,14 @@ func NewKitRegistryWithTrust(scanPaths []string, trust TrustConfig) *KitRegistry
 	}
 	v, err := newKitVerifier(trust)
 	if err != nil {
-		slog.Warn("kit registry: trust verifier construction failed; falling back to permissive verifier", //nolint:gosec // structured slog handler escapes values
+		slog.Error("kit registry: trust verifier construction failed; verification will fail closed under non-permissive modes", //nolint:gosec // structured slog handler escapes values
 			"err", err.Error(),
+			"mode", string(trust.Mode),
 		)
-		// Construct an empty-material verifier so the registry stays
-		// functional. The embedded trust root really shouldn't fail to
-		// parse — this is purely defensive.
-		v = newKitVerifierWithMaterial(TrustConfig{Mode: TrustModePermissive}, nil)
+		// Construct a no-material verifier that preserves the configured
+		// mode so the registry stays observable without silently
+		// downgrading trust.
+		v = newKitVerifierWithMaterial(trust, nil)
 	}
 	return &KitRegistry{scanPaths: expanded, verifier: v, fetcher: newGitKitFetcher()}
 }
@@ -537,7 +548,7 @@ func (r *KitRegistry) installFromGit(id string, source afclient.KitInstallSource
 				r.verifier.auditTrustOverride(id, verifyResult.SignerID)
 				// Fall through past the gate.
 			} else {
-				return afclient.KitInstallResult{}, fmt.Errorf("%s: %w", id, ErrKitTrustGateRejected)
+				return afclient.KitInstallResult{}, trustGateRejectionError(id, verifyResult, r.verifier.config.Mode)
 			}
 		}
 	} else {

@@ -229,14 +229,21 @@ func runKitVerifySignature(out io.Writer, client kitDaemonClient, id string, jso
 
 func newKitInstallCmd(factory kitClientFactory) *cobra.Command {
 	var (
-		version string
-		jsonOut bool
-		plain   bool
+		version       string
+		allowUnsigned bool
+		jsonOut       bool
+		plain         bool
 	)
 	cmd := &cobra.Command{
 		Use:   "install <id>",
 		Short: "Install a kit from a configured registry source",
 		Long: `Install a kit by id from one of the configured registry sources.
+
+The daemon's trust gate verifies kit signatures before installing. The
+default trust mode is signed-by-allowlist: only kits signed by an identity
+listed in daemon.yaml's trust.issuerSet install. Unsigned or unverified
+kits are rejected; pass --allow-unsigned to bypass the gate for a single
+install (the bypass is audit-logged by the daemon).
 
 Wave 9 caveat: only locally-installed kits are supported (.kit.toml under
 ~/.donmai/kits). Remote-registry fetch is deferred and currently returns
@@ -246,20 +253,45 @@ backend lands.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := factory(resolveKitDaemonConfig())
-			return runKitInstall(cmd.OutOrStdout(), client, args[0], version, jsonOut, plain)
+			return runKitInstall(cmd.OutOrStdout(), client, args[0], version, allowUnsigned, jsonOut, plain)
 		},
 	}
 	cmd.Flags().StringVar(&version, "version", "", "Install a specific version (default: latest compatible)")
+	cmd.Flags().BoolVar(&allowUnsigned, "allow-unsigned", false, "Bypass kit signature verification for this single install (audit-logged)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output as JSON")
 	cmd.Flags().BoolVar(&plain, "plain", false, "Plain text (no ANSI / emoji)")
 	return cmd
 }
 
-func runKitInstall(out io.Writer, client kitDaemonClient, id, version string, jsonOut, plain bool) error {
-	res, err := client.InstallKit(id, afclient.KitInstallRequest{Version: version})
+// kitTrustGateGuidance is appended to the install error when the daemon's
+// trust gate rejects a kit, so operators see every remediation path even
+// when the daemon's own error detail is unavailable.
+const kitTrustGateGuidance = `
+The kit was blocked by the daemon's trust gate (default: signed-by-allowlist).
+To proceed, either:
+  1. allowlist the kit's signer:  add it to trust.issuerSet in daemon.yaml
+     (inspect the signer first:   kit verify <id>)
+  2. bypass once (audit-logged):  kit install <id> --allow-unsigned
+  3. disable the gate entirely:   set trust.mode: permissive in daemon.yaml
+     or export DONMAI_KIT_TRUST_MODE=permissive (not recommended — unsigned
+     kits can execute arbitrary shell commands)`
+
+func runKitInstall(out io.Writer, client kitDaemonClient, id, version string, allowUnsigned, jsonOut, plain bool) error {
+	req := afclient.KitInstallRequest{Version: version}
+	if allowUnsigned {
+		req.TrustOverride = afclient.TrustOverrideAllowedThisOnce
+		_, _ = fmt.Fprintf(out, "WARNING: --allow-unsigned bypasses signature verification for %s. Unsigned kits can execute arbitrary shell commands; only proceed if you trust the source. The bypass is audit-logged by the daemon.\n", id)
+	}
+	res, err := client.InstallKit(id, req)
 	if err != nil {
 		if errors.Is(err, afclient.ErrNotFound) {
 			return fmt.Errorf("kit not found: %s", id)
+		}
+		if errors.Is(err, afclient.ErrUnauthorized) {
+			// The daemon's kit-install surface returns 403 exclusively
+			// for trust-gate rejections (unsigned/unverified manifest,
+			// signer not allowlisted, or misconfigured trust policy).
+			return fmt.Errorf("install kit: %w\n%s", err, kitTrustGateGuidance)
 		}
 		return fmt.Errorf("install kit: %w", err)
 	}
