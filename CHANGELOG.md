@@ -8,6 +8,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+_No work staged for the next release._
+
+---
+
+## v0.39.0 — 2026-06-11
+
 ### Features
 
 - **Durable CI wait — runner half (ADR-2026-06-10-durable-ci-wait.md).** Agent
