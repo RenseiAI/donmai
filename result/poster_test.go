@@ -27,6 +27,7 @@ func goodResult() agent.Result {
 		ProviderSessionID: "claude-sess-123",
 		WorktreePath:      "/tmp/wt/ENG-1",
 		PullRequestURL:    "https://github.com/x/y/pull/42",
+		CommitSHA:         "0123456789abcdef0123456789abcdef01234567",
 		Summary:           "Implemented X, opened PR.",
 		WorkResult:        "passed",
 		Cost: &agent.CostData{
@@ -538,6 +539,91 @@ func TestPosterPost_StatusBodyShape(t *testing.T) {
 	}
 	if body["resultMarker"] != "<!-- WORK_RESULT:passed -->" {
 		t.Errorf("resultMarker = %v, want %q", body["resultMarker"], "<!-- WORK_RESULT:passed -->")
+	}
+	// Correlation keys for the orchestration-owned durable CI wait
+	// (ADR-2026-06-10-durable-ci-wait.md): the platform stamps these onto
+	// the session-exit event (headSha / pullRequestUrl) so a CI gate can
+	// bind workflow_run.completed events to this session's pushed head.
+	if body["commitSha"] != "0123456789abcdef0123456789abcdef01234567" {
+		t.Errorf("commitSha = %v, want goodResult's CommitSHA", body["commitSha"])
+	}
+	if body["pullRequestUrl"] != "https://github.com/x/y/pull/42" {
+		t.Errorf("pullRequestUrl = %v, want goodResult's PullRequestURL", body["pullRequestUrl"])
+	}
+}
+
+// TestPosterPost_StatusCorrelationFieldsSerialized asserts the durable
+// CI-wait correlation keys (ADR-2026-06-10-durable-ci-wait.md) on the
+// /status body: commitSha and pullRequestUrl ride the wire when the
+// runner captured them and are omitted entirely when empty
+// (backward-compatible additive fields — old platforms ignore them).
+func TestPosterPost_StatusCorrelationFieldsSerialized(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		commitSHA string
+		prURL     string
+		wantSHA   any // nil = field absent
+		wantPR    any // nil = field absent
+	}{
+		{
+			name:      "both populated",
+			commitSHA: "feedfacefeedfacefeedfacefeedfacefeedface",
+			prURL:     "https://github.com/x/y/pull/7",
+			wantSHA:   "feedfacefeedfacefeedfacefeedfacefeedface",
+			wantPR:    "https://github.com/x/y/pull/7",
+		},
+		{
+			name:      "sha only (push without PR)",
+			commitSHA: "feedfacefeedfacefeedfacefeedfacefeedface",
+			wantSHA:   "feedfacefeedfacefeedfacefeedfacefeedface",
+		},
+		{
+			name:   "pr only (sha capture failed)",
+			prURL:  "https://github.com/x/y/pull/7",
+			wantPR: "https://github.com/x/y/pull/7",
+		},
+		{name: "both empty omitted"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var mu sync.Mutex
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					mu.Lock()
+					statusBody = body
+					mu.Unlock()
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+
+			r := goodResult()
+			r.CommitSHA = tc.commitSHA
+			r.PullRequestURL = tc.prURL
+			if err := p.Post(context.Background(), "sess-ci", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			mu.Lock()
+			raw := statusBody
+			mu.Unlock()
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("status body not JSON: %v", err)
+			}
+			if got := body["commitSha"]; got != tc.wantSHA {
+				t.Errorf("commitSha = %v, want %v", got, tc.wantSHA)
+			}
+			if got := body["pullRequestUrl"]; got != tc.wantPR {
+				t.Errorf("pullRequestUrl = %v, want %v", got, tc.wantPR)
+			}
+		})
 	}
 }
 

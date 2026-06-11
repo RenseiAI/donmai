@@ -29,10 +29,12 @@ prompt: |
   6. Post the PR link as a comment on {{#if issueIdentifier}}{{issueIdentifier}}{{else}}the issue{{/if}} via `{{brandCLI}} linear create-comment`.
   7. End your final assistant message with exactly one marker so the orchestrator can transition the issue:
 
-     - `WORK_RESULT:passed` when the implementation is complete, all checks pass, and the PR is open.
+     - `WORK_RESULT:passed` when the implementation is complete, local verification is green (tests, typecheck, lint), the branch is pushed, and the PR is open. Remote CI is NOT part of this definition — do not wait for it.
      - `WORK_RESULT:failed` when you attempted the work but it regressed or could not be finished (e.g. tests you could not make pass, a broken build).
      - `WORK_RESULT:blocked` when you deliberately declined to proceed because the work is not actionable as specified — an ambiguous or contradictory spec, missing acceptance criteria, or an unmet precondition. Prefer this over `WORK_RESULT:failed` when there is nothing to fix without more input; put the reason on the same line as `AGENT_BLOCKED: <reason>`. This is a reasoned refusal, not a crash, and the orchestrator routes it for clarification instead of retrying the same context.
 
      Without this marker the orchestrator posts a diagnostic comment and leaves the issue in its current status.
+
+  Hard rule: do NOT wait for remote CI after pushing, and never schedule in-process wake-ups (timers, background polls, `gh run watch`, `gh pr checks --watch`) expecting them to outlive your final message — your session ends at your final message and any scheduled wake-up dies with it. The orchestration layer owns the CI wait and resumes the chain when CI completes. Emit your marker and end the session as soon as local verification is green and the PR is open.
 
   When finished, exit with a short summary of what you did. Do not delete the worktree.

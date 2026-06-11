@@ -209,6 +209,18 @@ type statusRequest struct {
 	// marker; "unknown" stays empty so the platform's marker scan never
 	// sees a non-verdict. Additive; omitted when empty.
 	ResultMarker string `json:"resultMarker,omitempty"`
+
+	// CommitSHA and PullRequestURL are the correlation keys for the
+	// orchestration-owned durable CI wait
+	// (ADR-2026-06-10-durable-ci-wait.md). The runner captures the
+	// worktree's head commit at envelope-build time (after tail recovery
+	// and the backstop, both of which may add commits); the platform
+	// stamps both onto the session-exit event (headSha / pullRequestUrl)
+	// so a CI gate can bind workflow_run.completed events to this
+	// session's pushed head. Additive; omitted when empty — old
+	// platforms ignore them.
+	CommitSHA      string `json:"commitSha,omitempty"`
+	PullRequestURL string `json:"pullRequestUrl,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -315,6 +327,8 @@ func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Resul
 			Summary:           strings.TrimSpace(r.Summary),
 			Result:            r.WorkResult,
 			ResultMarker:      workResultMarker(r.WorkResult),
+			CommitSHA:         r.CommitSHA,
+			PullRequestURL:    r.PullRequestURL,
 		}
 		if r.Cost != nil {
 			body.TotalCostUsd = r.Cost.TotalCostUsd
