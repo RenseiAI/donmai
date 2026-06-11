@@ -15,32 +15,36 @@ import (
 //
 // Architecture: shell-out bridge to `pnpm af-code` (TS implementation).
 // See afclient/codeintel/runner.go for the full rationale.
-func newCodeCmd() *cobra.Command {
+func newCodeCmd(cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "code",
 		Short: "Code intelligence — repo maps, symbol search, BM25, dedup, type usages, cross-dep validation",
-		Long: `Code intelligence commands powered by @renseiai/agentfactory-code-intelligence.
+		Long: `Code intelligence commands for navigating and searching code.
 
-All commands output JSON to stdout. The first invocation builds the index
-(~5-10s); subsequent calls reuse the persisted index from .donmai/code-index/.
+get-repo-map and search-symbols use the native Go implementation — no external
+binary required. The first invocation builds the index (~5-10s for a large repo);
+subsequent calls reuse the persisted index from .donmai/code-index/.
 
-Optional env vars for enhanced search:
+search-code, check-duplicate, find-type-usages, and validate-cross-deps require
+the donmai-code binary (npm install -g @donmai/cli) or the DONMAI_CODE_BIN env
+var override.
+
+Override: set DONMAI_CODE_BIN to force the exec-shim path for ALL subcommands
+(useful for testing against the TypeScript reference implementation).
+
+Optional env vars for enhanced search (exec-shim path only):
   VOYAGE_AI_API_KEY   Enables semantic vector embeddings (hybrid BM25+vector mode)
-  COHERE_API_KEY      Enables cross-encoder reranking for more precise result ordering
-
-Binary resolution (in order):
-  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override
-  2. af-code on PATH (npm install -g @renseiai/agentfactory-cli)
-  3. pnpm af-code (monorepo dev)`,
+  COHERE_API_KEY      Enables cross-encoder reranking for more precise result ordering`,
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newCodeGetRepoMapCmd())
-	cmd.AddCommand(newCodeSearchSymbolsCmd())
-	cmd.AddCommand(newCodeSearchCodeCmd())
-	cmd.AddCommand(newCodeCheckDuplicateCmd())
-	cmd.AddCommand(newCodeFindTypeUsagesCmd())
-	cmd.AddCommand(newCodeValidateCrossDepsCmd())
+	cmd.AddCommand(newCodeGetRepoMapCmd(bin))
+	cmd.AddCommand(newCodeSearchSymbolsCmd(bin))
+	cmd.AddCommand(newCodeSearchCodeCmd(bin))
+	cmd.AddCommand(newCodeCheckDuplicateCmd(bin))
+	cmd.AddCommand(newCodeFindTypeUsagesCmd(bin))
+	cmd.AddCommand(newCodeValidateCrossDepsCmd(bin))
 
 	return cmd
 }
@@ -53,7 +57,7 @@ func printJSON(v any) error {
 }
 
 // newCodeGetRepoMapCmd constructs `donmai code get-repo-map`.
-func newCodeGetRepoMapCmd() *cobra.Command {
+func newCodeGetRepoMapCmd(bin string) *cobra.Command {
 	var (
 		maxFiles     int
 		filePatterns string
@@ -68,16 +72,11 @@ Files are ranked by their importance in the dependency graph. The output JSON
 contains both structured entries and a formatted string suitable for agent context.
 
 Examples:
-  af code get-repo-map
-  af code get-repo-map --max-files 20
-  af code get-repo-map --file-patterns "*.go,src/**"`,
+  ` + bin + ` code get-repo-map
+  ` + bin + ` code get-repo-map --max-files 20
+  ` + bin + ` code get-repo-map --file-patterns "*.go,src/**"`,
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			r := codeintel.New(cwd())
-			if !r.IsCodeAvailable() {
-				return fmt.Errorf("%w", codeintel.ErrNotAvailable)
-			}
-
 			opts := codeintel.GetRepoMapOptions{MaxFiles: maxFiles}
 			if filePatterns != "" {
 				for _, p := range strings.Split(filePatterns, ",") {
@@ -86,8 +85,7 @@ Examples:
 					}
 				}
 			}
-
-			out, err := r.GetRepoMap(opts)
+			out, err := codeintel.New(cwd()).GetRepoMap(opts)
 			if err != nil {
 				return fmt.Errorf("get-repo-map: %w", err)
 			}
@@ -102,7 +100,7 @@ Examples:
 }
 
 // newCodeSearchSymbolsCmd constructs `donmai code search-symbols <query>`.
-func newCodeSearchSymbolsCmd() *cobra.Command {
+func newCodeSearchSymbolsCmd(bin string) *cobra.Command {
 	var (
 		maxResults  int
 		kinds       string
@@ -115,17 +113,12 @@ func newCodeSearchSymbolsCmd() *cobra.Command {
 		Long: `BM25 search over the symbol index (function, class, interface, type, etc.).
 
 Examples:
-  af code search-symbols "SearchEngine"
-  af code search-symbols "handleRequest" --kinds "function,method" --file-pattern "*.go"
-  af code search-symbols "Agent" --max-results 5`,
+  ` + bin + ` code search-symbols "SearchEngine"
+  ` + bin + ` code search-symbols "handleRequest" --kinds "function,method" --file-pattern "*.go"
+  ` + bin + ` code search-symbols "Agent" --max-results 5`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {
-			r := codeintel.New(cwd())
-			if !r.IsCodeAvailable() {
-				return fmt.Errorf("%w", codeintel.ErrNotAvailable)
-			}
-
 			opts := codeintel.SearchSymbolsOptions{
 				Query:       args[0],
 				MaxResults:  maxResults,
@@ -138,8 +131,7 @@ Examples:
 					}
 				}
 			}
-
-			out, err := r.SearchSymbols(opts)
+			out, err := codeintel.New(cwd()).SearchSymbols(opts)
 			if err != nil {
 				return fmt.Errorf("search-symbols: %w", err)
 			}
@@ -155,7 +147,7 @@ Examples:
 }
 
 // newCodeSearchCodeCmd constructs `donmai code search-code <query>`.
-func newCodeSearchCodeCmd() *cobra.Command {
+func newCodeSearchCodeCmd(bin string) *cobra.Command {
 	var (
 		maxResults int
 		language   string
@@ -171,9 +163,9 @@ BM25+vector mode. When COHERE_API_KEY is additionally set, results are
 reranked with a cross-encoder for improved precision.
 
 Examples:
-  af code search-code "incremental indexer"
-  af code search-code "pagerank algorithm" --language typescript
-  af code search-code "error handling" --max-results 5`,
+  ` + bin + ` code search-code "incremental indexer"
+  ` + bin + ` code search-code "pagerank algorithm" --language typescript
+  ` + bin + ` code search-code "error handling" --max-results 5`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -201,7 +193,7 @@ Examples:
 }
 
 // newCodeCheckDuplicateCmd constructs `donmai code check-duplicate`.
-func newCodeCheckDuplicateCmd() *cobra.Command {
+func newCodeCheckDuplicateCmd(bin string) *cobra.Command {
 	var (
 		content     string
 		contentFile string
@@ -215,8 +207,8 @@ func newCodeCheckDuplicateCmd() *cobra.Command {
 Exactly one of --content or --content-file must be provided.
 
 Examples:
-  af code check-duplicate --content "function hello() { return 'world' }"
-  af code check-duplicate --content-file /tmp/snippet.go`,
+  ` + bin + ` code check-duplicate --content "function hello() { return 'world' }"
+  ` + bin + ` code check-duplicate --content-file /tmp/snippet.go`,
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			r := codeintel.New(cwd())
@@ -244,7 +236,7 @@ Examples:
 }
 
 // newCodeFindTypeUsagesCmd constructs `donmai code find-type-usages <TypeName>`.
-func newCodeFindTypeUsagesCmd() *cobra.Command {
+func newCodeFindTypeUsagesCmd(bin string) *cobra.Command {
 	var maxResults int
 
 	cmd := &cobra.Command{
@@ -260,8 +252,8 @@ Use this before adding new members to a union type to identify all files
 that need to be updated.
 
 Examples:
-  af code find-type-usages "AgentWorkType"
-  af code find-type-usages "SandboxProvider" --max-results 100`,
+  ` + bin + ` code find-type-usages "AgentWorkType"
+  ` + bin + ` code find-type-usages "SandboxProvider" --max-results 100`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -287,7 +279,7 @@ Examples:
 }
 
 // newCodeValidateCrossDepsCmd constructs `donmai code validate-cross-deps [path]`.
-func newCodeValidateCrossDepsCmd() *cobra.Command {
+func newCodeValidateCrossDepsCmd(bin string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "validate-cross-deps [path]",
 		Short: "Check that cross-package imports have package.json dependency declarations",
@@ -298,8 +290,8 @@ or peerDependencies). Missing entries would cause CI typecheck failures.
 An optional path argument scopes the check to a specific package or file.
 
 Examples:
-  af code validate-cross-deps
-  af code validate-cross-deps packages/linear`,
+  ` + bin + ` code validate-cross-deps
+  ` + bin + ` code validate-cross-deps packages/linear`,
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {

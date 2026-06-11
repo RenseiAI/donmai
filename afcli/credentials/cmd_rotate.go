@@ -74,7 +74,7 @@ type platformErrorResponse struct {
 	Error string `json:"error"`
 }
 
-// newRotateCmd builds the `af creds rotate <kind>` Cobra command.
+// newRotateCmd builds the `donmai creds rotate <kind>` Cobra command.
 func newRotateCmd() *cobra.Command {
 	var (
 		orgID       string

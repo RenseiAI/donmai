@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,15 +17,13 @@ func TestSpawner_AcceptWork_ProjectAllowlist(t *testing.T) {
 		Projects:              []ProjectConfig{{ID: "agentfactory", Repository: "github.com/foo/bar"}},
 		MaxConcurrentSessions: 4,
 	})
+	ended := sessionEnds(s)
 	_, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "github.com/foo/bar", Ref: "main"})
 	if err != nil {
 		t.Fatalf("expected accept, got %v", err)
 	}
 	// Wait for the session to exit (stub exits quickly).
-	deadline := time.Now().Add(2 * time.Second)
-	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitSessionEnd(t, ended)
 	if s.ActiveCount() != 0 {
 		t.Fatalf("expected sessions to drain, still %d active", s.ActiveCount())
 	}
@@ -42,14 +42,12 @@ func TestSpawner_AcceptWork_MatchesByProjectID(t *testing.T) {
 		}},
 		MaxConcurrentSessions: 1,
 	})
+	ended := sessionEnds(s)
 	_, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "smoke-alpha", Ref: "main"})
 	if err != nil {
 		t.Fatalf("expected accept by project id (slug), got %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitSessionEnd(t, ended)
 	if s.ActiveCount() != 0 {
 		t.Fatalf("expected sessions to drain, still %d active", s.ActiveCount())
 	}
@@ -249,18 +247,38 @@ func TestSpawner_ActiveWorkareas_DeterministicOrdering(t *testing.T) {
 	}
 }
 
+// spawnerWaitTimeout is the liveness backstop for the event-driven wait
+// helpers below. It is NOT a pacing knob: green runs return the moment
+// the awaited event fires, so a generous value costs nothing while
+// absorbing arbitrary CI -race scheduler load (the old 2s deadlines
+// flaked at ~2.02s under load).
+const spawnerWaitTimeout = 30 * time.Second
+
 // captureWriter is a PrefixedWriter that accumulates child stdout lines
 // for assertion. Tests use it together with a /bin/sh worker that prints
 // env entries so we can verify the env actually exec'd by the child.
+// Construct via newCaptureWriter so waiters can block on the write
+// signal instead of polling.
 type captureWriter struct {
-	mu    sync.Mutex
-	lines []string
+	mu     sync.Mutex
+	lines  []string
+	notify chan struct{}
+}
+
+func newCaptureWriter() *captureWriter {
+	return &captureWriter{notify: make(chan struct{}, 1)}
 }
 
 func (c *captureWriter) WriteWorkerLine(_, line string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.lines = append(c.lines, line)
+	c.mu.Unlock()
+	// Coalescing wake-up: a buffered token is enough — the waiter
+	// re-snapshots after every wake, so concurrent writes can't be lost.
+	select {
+	case c.notify <- struct{}{}:
+	default:
+	}
 }
 
 func (c *captureWriter) snapshot() []string {
@@ -271,21 +289,57 @@ func (c *captureWriter) snapshot() []string {
 	return out
 }
 
-// waitForLine polls the captured stdout buffer until `substr` appears or
-// the deadline expires. Returns the captured snapshot for further checks.
-func waitForLine(t *testing.T, capability *captureWriter, substr string, timeout time.Duration) []string {
+// waitForLine blocks until a captured stdout line contains substr, then
+// returns the snapshot for further checks. It wakes on the capture
+// writer's write signal (no poll interval) and gives up only after the
+// spawnerWaitTimeout liveness backstop, returning whatever was captured
+// so the caller's assertion produces a useful failure message.
+func waitForLine(t *testing.T, capability *captureWriter, substr string) []string {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	timer := time.NewTimer(spawnerWaitTimeout)
+	defer timer.Stop()
+	for {
 		snap := capability.snapshot()
 		for _, l := range snap {
 			if strings.Contains(l, substr) {
 				return snap
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-capability.notify:
+		case <-timer.C:
+			return capability.snapshot()
+		}
 	}
-	return capability.snapshot()
+}
+
+// sessionEnds subscribes to the spawner's lifecycle stream and returns a
+// channel that receives once per SessionEventEnded. Subscribe BEFORE the
+// AcceptWork that spawns the session — the stub child exits fast, so a
+// late subscription would miss the event.
+func sessionEnds(s *WorkerSpawner) <-chan struct{} {
+	ch := make(chan struct{}, 16)
+	s.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	})
+	return ch
+}
+
+// waitSessionEnd blocks until one SessionEventEnded arrives on ch. The
+// ended event is emitted after the session is removed from the active
+// set, so ActiveCount has already been decremented when this returns.
+func waitSessionEnd(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(spawnerWaitTimeout):
+		t.Fatalf("timed out after %v waiting for session end", spawnerWaitTimeout)
+	}
 }
 
 // TestSpawner_OnPreSpawn_Invoked verifies the hook fires exactly once per
@@ -300,15 +354,16 @@ func TestSpawner_OnPreSpawn_Invoked(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
-		OnPreSpawn: func(spec SessionSpec, env []string) []string {
+		OnPreSpawn: func(spec SessionSpec, env []string) ([]string, error) {
 			atomic.AddInt32(&calls, 1)
 			recordMu.Lock()
 			gotSpec = spec
 			gotEnv = append([]string(nil), env...)
 			recordMu.Unlock()
-			return nil
+			return nil, nil
 		},
 	})
+	ended := sessionEnds(s)
 	if _, err := s.AcceptWork(SessionSpec{
 		SessionID:  "sess-pre-1",
 		Repository: "github.com/a/b",
@@ -316,10 +371,7 @@ func TestSpawner_OnPreSpawn_Invoked(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitSessionEnd(t, ended)
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("OnPreSpawn call count: want 1, got %d", got)
 	}
@@ -354,23 +406,21 @@ func TestSpawner_OnPreSpawn_SeesBaseEnv(t *testing.T) {
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		BaseEnv:               map[string]string{"BASE_KEY": "base-value"},
-		OnPreSpawn: func(_ SessionSpec, env []string) []string {
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
 			mu.Lock()
 			gotEnv = append([]string(nil), env...)
 			mu.Unlock()
-			return nil
+			return nil, nil
 		},
 	})
+	ended := sessionEnds(s)
 	if _, err := s.AcceptWork(SessionSpec{
 		SessionID:  "sess-base-1",
 		Repository: "github.com/a/b",
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitSessionEnd(t, ended)
 	mu.Lock()
 	defer mu.Unlock()
 	found := false
@@ -390,14 +440,14 @@ func TestSpawner_OnPreSpawn_SeesBaseEnv(t *testing.T) {
 // by the hook is echoed by the worker stub and surfaces via the prefix
 // writer.
 func TestSpawner_OnPreSpawn_ReturnedEnvIsExeced(t *testing.T) {
-	capability := &captureWriter{}
+	capability := newCaptureWriter()
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'sentinel=%s\n' "$ONPRESPAWN_SENTINEL"; exit 0`},
 		StdoutPrefixWriter:    capability,
-		OnPreSpawn: func(_ SessionSpec, env []string) []string {
-			return append(env, "ONPRESPAWN_SENTINEL=hello-from-hook")
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			return append(env, "ONPRESPAWN_SENTINEL=hello-from-hook"), nil
 		},
 	})
 	if _, err := s.AcceptWork(SessionSpec{
@@ -406,7 +456,7 @@ func TestSpawner_OnPreSpawn_ReturnedEnvIsExeced(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	lines := waitForLine(t, capability, "sentinel=", 2*time.Second)
+	lines := waitForLine(t, capability, "sentinel=")
 	want := "sentinel=hello-from-hook"
 	found := false
 	for _, l := range lines {
@@ -425,15 +475,15 @@ func TestSpawner_OnPreSpawn_ReturnedEnvIsExeced(t *testing.T) {
 // given key per Go's exec semantics, so appending an override after the
 // input slice is the documented way for callers to win against BaseEnv.
 func TestSpawner_OnPreSpawn_OverridesBaseEnv(t *testing.T) {
-	capability := &captureWriter{}
+	capability := newCaptureWriter()
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		BaseEnv:               map[string]string{"OVERRIDE_ME": "base-value"},
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'override=%s\n' "$OVERRIDE_ME"; exit 0`},
 		StdoutPrefixWriter:    capability,
-		OnPreSpawn: func(_ SessionSpec, env []string) []string {
-			return append(env, "OVERRIDE_ME=hook-wins")
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			return append(env, "OVERRIDE_ME=hook-wins"), nil
 		},
 	})
 	if _, err := s.AcceptWork(SessionSpec{
@@ -442,7 +492,7 @@ func TestSpawner_OnPreSpawn_OverridesBaseEnv(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	lines := waitForLine(t, capability, "override=", 2*time.Second)
+	lines := waitForLine(t, capability, "override=")
 	want := "override=hook-wins"
 	found := false
 	for _, l := range lines {
@@ -457,17 +507,17 @@ func TestSpawner_OnPreSpawn_OverridesBaseEnv(t *testing.T) {
 }
 
 // TestSpawner_OnPreSpawn_NilReturnUsesInput verifies that a hook returning
-// nil is a no-op — the env composeEnv produced is what reaches the child.
+// (nil, nil) is a no-op — the env composeEnv produced is what reaches the child.
 func TestSpawner_OnPreSpawn_NilReturnUsesInput(t *testing.T) {
-	capability := &captureWriter{}
+	capability := newCaptureWriter()
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 		BaseEnv:               map[string]string{"BASE_KEY": "base-value"},
 		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'base=%s\n' "$BASE_KEY"; exit 0`},
 		StdoutPrefixWriter:    capability,
-		OnPreSpawn: func(_ SessionSpec, _ []string) []string {
-			return nil
+		OnPreSpawn: func(_ SessionSpec, _ []string) ([]string, error) {
+			return nil, nil
 		},
 	})
 	if _, err := s.AcceptWork(SessionSpec{
@@ -476,7 +526,7 @@ func TestSpawner_OnPreSpawn_NilReturnUsesInput(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	lines := waitForLine(t, capability, "base=", 2*time.Second)
+	lines := waitForLine(t, capability, "base=")
 	want := "base=base-value"
 	found := false
 	for _, l := range lines {
@@ -494,7 +544,7 @@ func TestSpawner_OnPreSpawn_NilReturnUsesInput(t *testing.T) {
 // SpawnerOptions with OnPreSpawn unset must spawn normally without
 // panicking and without altering the env contract.
 func TestSpawner_OnPreSpawn_NilHookNoPanic(t *testing.T) {
-	capability := &captureWriter{}
+	capability := newCaptureWriter()
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
@@ -509,7 +559,7 @@ func TestSpawner_OnPreSpawn_NilHookNoPanic(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	lines := waitForLine(t, capability, "nohook=", 2*time.Second)
+	lines := waitForLine(t, capability, "nohook=")
 	want := "nohook=base-value"
 	found := false
 	for _, l := range lines {
@@ -523,31 +573,330 @@ func TestSpawner_OnPreSpawn_NilHookNoPanic(t *testing.T) {
 	}
 }
 
+// TestSpawner_OnPreSpawn_ErrorAbortSpawn verifies the fail-closed path: when
+// the hook returns a non-nil error, AcceptWork must fail with that error and
+// the child process must never be started (no lifecycle events, active count
+// stays at zero). This is the credential-injection gate-failure path for
+// byok/metered/shared sessions where the platform snapshot returns 403.
+func TestSpawner_OnPreSpawn_ErrorAbortSpawn(t *testing.T) {
+	var started int32
+	spawnErr := errors.New("credential gate failed: METERED_NOT_ENTITLED")
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 10"},
+		OnPreSpawn: func(_ SessionSpec, _ []string) ([]string, error) {
+			return nil, spawnErr
+		},
+	})
+	s.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventStarted {
+			atomic.AddInt32(&started, 1)
+		}
+	})
+
+	_, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-gate-fail",
+		Repository: "github.com/a/b",
+	})
+	if err == nil {
+		t.Fatal("AcceptWork: expected error from failing OnPreSpawn hook, got nil")
+	}
+	if !strings.Contains(err.Error(), "METERED_NOT_ENTITLED") {
+		t.Errorf("AcceptWork error: want to contain 'METERED_NOT_ENTITLED', got %q", err.Error())
+	}
+	// Allow a brief window for any async spawn that should NOT have happened.
+	time.Sleep(50 * time.Millisecond)
+	if n := atomic.LoadInt32(&started); n != 0 {
+		t.Errorf("started count: want 0 (no child process), got %d", n)
+	}
+	if n := s.ActiveCount(); n != 0 {
+		t.Errorf("active count: want 0 after fail-closed spawn, got %d", n)
+	}
+}
+
+// TestSpawner_OnPreSpawn_ErrorDoesNotConsumeCapacity verifies that a hook
+// error releases the session slot: after a fail-closed abort, a subsequent
+// AcceptWork on a max-1 spawner must succeed.
+func TestSpawner_OnPreSpawn_ErrorDoesNotConsumeCapacity(t *testing.T) {
+	firstCall := true
+	capability := newCaptureWriter()
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'ok\n'; exit 0`},
+		StdoutPrefixWriter:    capability,
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			if firstCall {
+				firstCall = false
+				return nil, errors.New("transient gate failure")
+			}
+			return env, nil
+		},
+	})
+
+	// First spawn must fail-closed.
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-fail",
+		Repository: "github.com/a/b",
+	}); err == nil {
+		t.Fatal("first AcceptWork: expected error, got nil")
+	}
+
+	// Second spawn on the same spawner (same max-1 capacity) must succeed
+	// because the first never consumed a slot.
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-ok",
+		Repository: "github.com/a/b",
+	}); err != nil {
+		t.Fatalf("second AcceptWork after fail-closed: %v", err)
+	}
+	waitForLine(t, capability, "ok")
+}
+
+// TestSpawner_OnPreSpawn_EnvMergeAndFailClosed exercises the composite path:
+// a hook that merges credential env entries on success and fails-closed on
+// a gate error. Asserts (a) merged env reaches the child on success and
+// (b) AcceptWork errors without spawning on gate failure.
+func TestSpawner_OnPreSpawn_EnvMergeAndFailClosed(t *testing.T) {
+	const (
+		sessionOK   = "sess-merge-ok"
+		sessionFail = "sess-merge-fail"
+	)
+	type call struct {
+		sessionID  string
+		shouldFail bool
+	}
+	calls := []call{
+		{sessionID: sessionOK, shouldFail: false},
+		{sessionID: sessionFail, shouldFail: true},
+	}
+	capability := newCaptureWriter()
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", `printf 'apikey=%s\n' "$ANTHROPIC_API_KEY"; exit 0`},
+		StdoutPrefixWriter:    capability,
+		OnPreSpawn: func(spec SessionSpec, env []string) ([]string, error) {
+			// Fail-closed for the designated failure session.
+			if spec.SessionID == sessionFail {
+				return nil, errors.New("credential gate failed: SHARED_QUOTA_EXCEEDED")
+			}
+			// Merge the model key for the success session.
+			return append(env, "ANTHROPIC_API_KEY=sk-ant-mock"), nil
+		},
+	})
+
+	for _, c := range calls {
+		_, err := s.AcceptWork(SessionSpec{
+			SessionID:  c.sessionID,
+			Repository: "github.com/a/b",
+		})
+		if c.shouldFail {
+			if err == nil {
+				t.Errorf("%s: expected fail-closed error, got nil", c.sessionID)
+			} else if !strings.Contains(err.Error(), "SHARED_QUOTA_EXCEEDED") {
+				t.Errorf("%s: expected gate error, got %v", c.sessionID, err)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("%s: expected success, got %v", c.sessionID, err)
+			}
+		}
+	}
+	// Assert the model key reached the child for the success session.
+	lines := waitForLine(t, capability, "apikey=")
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, "apikey=sk-ant-mock") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("ANTHROPIC_API_KEY not merged into child env; got lines %v", lines)
+	}
+}
+
 func TestSpawner_EmitsLifecycleEvents(t *testing.T) {
 	var started, ended int32
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
 	})
+	endedCh := make(chan struct{}, 1)
 	s.On(func(ev SessionEvent) {
 		switch ev.Kind {
 		case SessionEventStarted:
 			atomic.AddInt32(&started, 1)
 		case SessionEventEnded:
 			atomic.AddInt32(&ended, 1)
+			select {
+			case endedCh <- struct{}{}:
+			default:
+			}
 		}
 	})
 	if _, err := s.AcceptWork(SessionSpec{SessionID: "s1", Repository: "github.com/a/b"}); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for atomic.LoadInt32(&ended) == 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitSessionEnd(t, endedCh)
 	if atomic.LoadInt32(&started) == 0 {
 		t.Error("expected start event")
 	}
 	if atomic.LoadInt32(&ended) == 0 {
 		t.Error("expected end event")
 	}
+}
+
+// ── AddProjects tests ──────────────────────────────────────────────────────
+
+// TestSpawner_AddProjects_AcceptsExtraRepo verifies that a repository
+// rejected before AddProjects is called becomes accepted after AddProjects
+// registers its ProjectConfig.
+func TestSpawner_AddProjects_AcceptsExtraRepo(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
+		MaxConcurrentSessions: 4,
+	})
+
+	// Satellite repo must be rejected before AddProjects.
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "pre-1", Repository: "github.com/org/satellite"}); err == nil {
+		t.Fatal("expected rejection for satellite repo before AddProjects")
+	}
+
+	s.AddProjects([]ProjectConfig{{ID: "satellite", Repository: "github.com/org/satellite"}})
+
+	// Satellite repo must be accepted after AddProjects.
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "post-1", Repository: "github.com/org/satellite"}); err != nil {
+		t.Fatalf("expected accept after AddProjects, got %v", err)
+	}
+	waitSessionEnd(t, ended)
+}
+
+// TestSpawner_AddProjects_SetProjectsPreservesExtra is the key regression
+// guard: a SetProjects call (e.g. yaml-watcher reload of the primary org's
+// config) must NOT evict projects previously registered via AddProjects.
+func TestSpawner_AddProjects_SetProjectsPreservesExtra(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
+		MaxConcurrentSessions: 4,
+	})
+
+	s.AddProjects([]ProjectConfig{{ID: "satellite", Repository: "github.com/org/satellite"}})
+
+	// Simulate a yaml-watcher reload that replaces the base set. The satellite
+	// entry must survive because SetProjects only replaces opts.Projects.
+	s.SetProjects([]ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}})
+
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "after-reload", Repository: "github.com/org/satellite"}); err != nil {
+		t.Fatalf("satellite repo rejected after SetProjects reload: %v", err)
+	}
+	waitSessionEnd(t, ended)
+}
+
+// TestSpawner_AddProjects_Dedup verifies that calling AddProjects multiple
+// times with the same entry does not add duplicates. We check this
+// indirectly by ensuring a later SetProjects that removes the base entry
+// still only leaves one satellite entry (no phantom double-match issues).
+func TestSpawner_AddProjects_Dedup(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
+		MaxConcurrentSessions: 4,
+	})
+
+	dup := ProjectConfig{ID: "satellite", Repository: "github.com/org/satellite"}
+	s.AddProjects([]ProjectConfig{dup})
+	s.AddProjects([]ProjectConfig{dup})
+	s.AddProjects([]ProjectConfig{dup})
+
+	// Only one copy should exist in extraProjects; confirm by verifying the
+	// spawner still accepts the repo (dedup does not reject valid entries).
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "dup-1", Repository: "github.com/org/satellite"}); err != nil {
+		t.Fatalf("expected accept after dedup AddProjects, got %v", err)
+	}
+	waitSessionEnd(t, ended)
+
+	// Also dedup by ID alone (different Repository).
+	s.AddProjects([]ProjectConfig{{ID: "satellite", Repository: "github.com/org/satellite-mirror"}})
+	// Same ID already present — must NOT add a second entry.
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "dup-2", Repository: "github.com/org/satellite-mirror"}); err == nil {
+		t.Fatal("expected rejection for dedup-by-ID path; duplicate ID should prevent registration of different repository")
+	}
+}
+
+// TestSpawner_AddProjects_DedupByRepository verifies that an entry whose
+// Repository already exists in the base set is not added to extraProjects.
+func TestSpawner_AddProjects_DedupByRepository(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects: []ProjectConfig{
+			{ID: "primary", Repository: "github.com/org/primary"},
+		},
+		MaxConcurrentSessions: 2,
+	})
+
+	// Attempt to add an entry that shares the same Repository as the base entry
+	// but with a different ID.
+	s.AddProjects([]ProjectConfig{{ID: "primary-alias", Repository: "github.com/org/primary"}})
+
+	// The dedup-by-Repository path should have rejected the duplicate; there
+	// should only be the base entry. The primary repo must still be accepted.
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "dedup-repo-1", Repository: "github.com/org/primary"}); err != nil {
+		t.Fatalf("primary repo rejected after duplicate-repo AddProjects: %v", err)
+	}
+	waitSessionEnd(t, ended)
+}
+
+// TestSpawner_AddProjects_Concurrency exercises AddProjects and AcceptWork
+// under the race detector by running them concurrently. Any data race on
+// extraProjects or opts.Projects will surface here under `go test -race`.
+func TestSpawner_AddProjects_Concurrency(_ *testing.T) {
+	const numSatellites = 8
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
+		MaxConcurrentSessions: numSatellites + 2,
+	})
+
+	var wg sync.WaitGroup
+
+	// Goroutine 1: concurrently add satellite projects.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range numSatellites {
+			s.AddProjects([]ProjectConfig{{
+				ID:         fmt.Sprintf("sat-%d", i),
+				Repository: fmt.Sprintf("github.com/org/satellite-%d", i),
+			}})
+		}
+	}()
+
+	// Goroutine 2: concurrently call SetProjects (yaml-watcher simulation).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 4 {
+			s.SetProjects([]ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}})
+		}
+	}()
+
+	// Goroutine 3: concurrently accept work on the primary repo.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 4 {
+			_, _ = s.AcceptWork(SessionSpec{
+				SessionID:  fmt.Sprintf("concurrent-%d", i),
+				Repository: "github.com/org/primary",
+			})
+		}
+	}()
+
+	wg.Wait()
+	// Drain so the test does not leave zombie /bin/sh stubs.
+	_ = s.Drain(2 * time.Second)
 }

@@ -533,6 +533,45 @@ func TestEventMappingTable(t *testing.T) {
 			wantSent: false,
 		},
 		{
+			name:        "System reasoning -> thought",
+			event:       agent.SystemEvent{Subtype: "reasoning", Message: "planning the refactor"},
+			wantSent:    true,
+			wantType:    "thought",
+			wantContent: "planning the refactor",
+		},
+		{
+			name:        "System reasoning trims whitespace",
+			event:       agent.SystemEvent{Subtype: "reasoning", Message: "  weighing options \n"},
+			wantSent:    true,
+			wantType:    "thought",
+			wantContent: "weighing options",
+		},
+		{
+			name:     "System reasoning empty message -> skipped",
+			event:    agent.SystemEvent{Subtype: "reasoning", Message: "  \n\t"},
+			wantSent: false,
+		},
+		{
+			name:     "System turn_started -> skipped",
+			event:    agent.SystemEvent{Subtype: "turn_started", Message: "turn 1"},
+			wantSent: false,
+		},
+		{
+			name:     "System command_progress -> skipped",
+			event:    agent.SystemEvent{Subtype: "command_progress", Message: "running tests"},
+			wantSent: false,
+		},
+		{
+			name:     "System diff_updated -> skipped",
+			event:    agent.SystemEvent{Subtype: "diff_updated", Message: "3 files changed"},
+			wantSent: false,
+		},
+		{
+			name:     "System unknown subtype with message -> skipped",
+			event:    agent.SystemEvent{Subtype: "mystery", Message: "should never surface"},
+			wantSent: false,
+		},
+		{
 			name:     "ToolProgress -> skipped",
 			event:    agent.ToolProgressEvent{ToolName: "Bash", ElapsedSeconds: 5},
 			wantSent: false,
@@ -635,59 +674,113 @@ func TestEventMappingTable(t *testing.T) {
 	}
 }
 
-// TestToolOutputTruncation confirms ToolResult content > MaxToolOutputChars
-// is truncated.
+// TestToolOutputTruncation pins the toolOutput cap contract: the default
+// (DefaultMaxToolOutputChars) and Config-overridden caps bound the wire
+// payload, negative Config disables truncation, and the middle-elision
+// strategy preserves the TAIL of the output — where `gh pr create` prints
+// the PR URL the platform-side parser scans for.
 func TestToolOutputTruncation(t *testing.T) {
 	t.Parallel()
-	long := strings.Repeat("x", activity.MaxToolOutputChars+200)
-	var captured atomic.Pointer[string]
-	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/activity") {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		body, _ := io.ReadAll(r.Body)
-		s := string(body)
-		captured.Store(&s)
-		w.WriteHeader(http.StatusOK)
-	})
-	p, err := activity.New(activity.Config{
-		SessionID:  "s1",
-		WorkerID:   "w1",
-		BaseURL:    srv.URL,
-		HTTPClient: srv.Client(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := p.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = p.Stop() })
 
-	p.Send(context.Background(), agent.ToolResultEvent{
-		ToolName: "Bash",
-		Content:  long,
-	})
+	const prURL = "https://github.com/owner/repo/pull/42"
+	head := "$ gh pr create --fill"
+	noise := strings.Repeat("x", activity.DefaultMaxToolOutputChars+500)
+	content := head + "\n" + noise + "\n" + prURL
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && captured.Load() == nil {
-		time.Sleep(5 * time.Millisecond)
+	tests := []struct {
+		name       string
+		capConfig  int  // Config.MaxToolOutputChars
+		wantMaxLen int  // 0 → no length assertion
+		wantHead   bool // leading content must survive
+		wantTail   bool // trailing PR URL must survive
+	}{
+		{
+			name:       "default cap preserves head and tail",
+			capConfig:  0,
+			wantMaxLen: activity.DefaultMaxToolOutputChars,
+			wantHead:   true,
+			wantTail:   true,
+		},
+		{
+			name:       "config override is honoured",
+			capConfig:  120,
+			wantMaxLen: 120,
+			wantTail:   true,
+		},
+		{
+			name:      "negative config disables truncation",
+			capConfig: -1,
+			wantHead:  true,
+			wantTail:  true,
+		},
 	}
-	body := captured.Load()
-	if body == nil {
-		t.Fatal("no body captured")
-	}
-	var wire struct {
-		Activity struct {
-			ToolOutput string `json:"toolOutput"`
-		} `json:"activity"`
-	}
-	if err := json.Unmarshal([]byte(*body), &wire); err != nil {
-		t.Fatal(err)
-	}
-	if got := len(wire.Activity.ToolOutput); got > activity.MaxToolOutputChars {
-		t.Fatalf("toolOutput length %d exceeds cap %d", got, activity.MaxToolOutputChars)
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var captured atomic.Pointer[string]
+			srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/activity") {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				body, _ := io.ReadAll(r.Body)
+				s := string(body)
+				captured.Store(&s)
+				w.WriteHeader(http.StatusOK)
+			})
+			p, err := activity.New(activity.Config{
+				SessionID:          "s1",
+				WorkerID:           "w1",
+				BaseURL:            srv.URL,
+				HTTPClient:         srv.Client(),
+				MaxToolOutputChars: tc.capConfig,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = p.Stop() })
+
+			p.Send(context.Background(), agent.ToolResultEvent{
+				ToolName: "Bash",
+				Content:  content,
+			})
+
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && captured.Load() == nil {
+				time.Sleep(5 * time.Millisecond)
+			}
+			body := captured.Load()
+			if body == nil {
+				t.Fatal("no body captured")
+			}
+			var wire struct {
+				Activity struct {
+					ToolOutput string `json:"toolOutput"`
+				} `json:"activity"`
+			}
+			if err := json.Unmarshal([]byte(*body), &wire); err != nil {
+				t.Fatal(err)
+			}
+			out := wire.Activity.ToolOutput
+
+			if tc.wantMaxLen > 0 && len(out) > tc.wantMaxLen {
+				t.Errorf("toolOutput length %d exceeds cap %d", len(out), tc.wantMaxLen)
+			}
+			if tc.capConfig < 0 && out != content {
+				t.Errorf("negative cap must disable truncation; got %d bytes, want %d", len(out), len(content))
+			}
+			if tc.wantHead && !strings.HasPrefix(out, head) {
+				t.Errorf("toolOutput lost its head %q:\n%s", head, out)
+			}
+			if tc.wantTail && !strings.HasSuffix(out, prURL) {
+				t.Errorf("toolOutput lost its trailing PR URL %q:\n%s", prURL, out)
+			}
+		})
 	}
 }
 

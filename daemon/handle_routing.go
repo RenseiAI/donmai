@@ -3,9 +3,9 @@
 //
 // The handlers expose the daemon's RoutingTraceStore as JSON. The wire
 // shape is locked in
-// rensei-architecture/ADR-2026-05-07-daemon-http-control-api.md §D4 and
+// donmai-architecture/ADR-2026-05-07-daemon-http-control-api.md §D4 and
 // matches the surfaces the SaaS dashboard's Routing Intelligence panel
-// (REN-205) consumes, so the same renderer composes both.
+// consumes, so the same renderer composes both.
 //
 // Read-only this wave. The /config endpoint surfaces the static
 // scheduler configuration (weights, capability filters, sandbox/LLM

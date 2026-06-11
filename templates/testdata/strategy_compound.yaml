@@ -6,7 +6,7 @@ metadata:
   workType: refinement
 tools:
   allow:
-    - shell: "rensei linear *"
+    - shell: "donmai linear *"
   disallow:
     - user-input
 prompt: |

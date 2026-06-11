@@ -3,7 +3,7 @@
 Agent-side credential loader for Node.js. Provides a single API surface
 that works in two modes:
 
-- **Daemon mode** — when `RENSEI_CREDENTIAL_SOCKET` is set, the loader
+- **Daemon mode** — when `DONMAI_CREDENTIAL_SOCKET` is set, the loader
   reads from a unix-socket-based credential service using a small
   line-delimited JSON protocol (`HELLO` / `INITIAL` / `UPDATE` / `BYE`)
   and receives live rotation events.
@@ -43,7 +43,7 @@ a single info-level log line.
 
 | Mode         | Triggered by                                 | Behaviour                                                                   |
 | ------------ | -------------------------------------------- | --------------------------------------------------------------------------- |
-| `daemon`     | `process.env.RENSEI_CREDENTIAL_SOCKET` set, sessionId resolvable | Connects, sends `HELLO`, reads `INITIAL`, pumps `UPDATE` deltas. |
+| `daemon`     | `process.env.DONMAI_CREDENTIAL_SOCKET` set, sessionId resolvable | Connects, sends `HELLO`, reads `INITIAL`, pumps `UPDATE` deltas. |
 | `standalone` | otherwise (or on daemon handshake failure)   | Reads from `process.env`; subscribers never fire.                           |
 
 ## License

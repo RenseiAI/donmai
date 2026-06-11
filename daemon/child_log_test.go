@@ -5,9 +5,39 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// syncBuffer is a concurrency-safe wrapper around bytes.Buffer for use as
+// the slog capture sink in these tests. The pump goroutines write into it
+// from a separate goroutine while the test polls its contents, so every
+// access is guarded by a mutex. This keeps `go test -race` deterministic
+// without touching production logging behaviour — only the test's capture
+// buffer is synchronised.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write implements io.Writer for the slog JSON handler.
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// snapshot returns a copy of the bytes written so far. The copy lets
+// callers decode without holding the lock during JSON parsing.
+func (b *syncBuffer) snapshot() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	src := b.buf.Bytes()
+	out := make([]byte, len(src))
+	copy(out, src)
+	return out
+}
 
 // TestSlogLineWriter_StdoutEmitsInfo verifies that the stdout writer
 // emits an INFO record per line, tagging the message with sessionID
@@ -106,7 +136,7 @@ func TestSpawner_DefaultsChildOutputToSlog(t *testing.T) {
 	var sawStdout, sawStderr bool
 	var records []slogRecord
 	for time.Now().Before(pumpDeadline) {
-		records = decodeAll(t, bytes.NewBuffer(buf.Bytes()))
+		records = decodeAll(t, buf)
 		sawStdout, sawStderr = false, false
 		for _, r := range records {
 			if r.Stream == "stdout" && r.Level == "INFO" && strings.Contains(r.Msg, "hello-stdout") && r.SessionID == "sess-1" {
@@ -129,12 +159,13 @@ func TestSpawner_DefaultsChildOutputToSlog(t *testing.T) {
 	}
 }
 
-// captureSlog swaps slog.Default() for a JSON handler over an
-// in-memory buffer and returns the buffer and a restore func. Use
-// defer restore() in tests.
-func captureSlog(t *testing.T) (*bytes.Buffer, func()) {
+// captureSlog swaps slog.Default() for a JSON handler over a
+// concurrency-safe in-memory buffer and returns the buffer and a restore
+// func. Use defer restore() in tests. The buffer is a [syncBuffer] so the
+// pump goroutines can write while the test reads under `go test -race`.
+func captureSlog(t *testing.T) (*syncBuffer, func()) {
 	t.Helper()
-	buf := &bytes.Buffer{}
+	buf := &syncBuffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return buf, func() { slog.SetDefault(prev) }
@@ -148,7 +179,7 @@ type slogRecord struct {
 	Stream    string `json:"stream"`
 }
 
-func decodeSingle(t *testing.T, buf *bytes.Buffer) slogRecord {
+func decodeSingle(t *testing.T, buf *syncBuffer) slogRecord {
 	t.Helper()
 	recs := decodeAll(t, buf)
 	if len(recs) != 1 {
@@ -157,10 +188,10 @@ func decodeSingle(t *testing.T, buf *bytes.Buffer) slogRecord {
 	return recs[0]
 }
 
-func decodeAll(t *testing.T, buf *bytes.Buffer) []slogRecord {
+func decodeAll(t *testing.T, buf *syncBuffer) []slogRecord {
 	t.Helper()
 	var out []slogRecord
-	dec := json.NewDecoder(buf)
+	dec := json.NewDecoder(bytes.NewReader(buf.snapshot()))
 	for dec.More() {
 		var r slogRecord
 		if err := dec.Decode(&r); err != nil {

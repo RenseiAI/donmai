@@ -261,7 +261,7 @@ func TestResolveTargetStatus_Unknown(t *testing.T) {
 // TestResolveTargetStatus_Empty asserts an empty workResult on a
 // result-sensitive type follows the unknown path (post diagnostic, no
 // transition). This is the "agent exited without emitting the marker"
-// path the REN-1467 issue called out.
+// path the WORK_RESULT rollout called out.
 func TestResolveTargetStatus_Empty(t *testing.T) {
 	d := resolveTargetStatus(WorkTypeDevelopmentStr, "completed", "", false)
 	if d.ShouldTransition {
@@ -326,7 +326,7 @@ func TestResolveTargetStatus_NonResultSensitive_NoMappingNoOps(t *testing.T) {
 }
 
 // TestResolveTargetStatus_AcceptancePassed_DefersToMergeQueue covers
-// the REN-503/REN-1153 deferral: a passing acceptance with the local
+// the merge-queue deferral: a passing acceptance with the local
 // merge queue configured does NOT transition to Accepted — the merge
 // worker drives that after the PR lands.
 func TestResolveTargetStatus_AcceptancePassed_DefersToMergeQueue(t *testing.T) {
@@ -385,5 +385,35 @@ func TestDiagnosticCommentBody(t *testing.T) {
 	}
 	if !strings.Contains(body, "Issue status was NOT updated") {
 		t.Errorf("body missing 'NOT updated' callout")
+	}
+}
+
+func TestIsKnownWorkType(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{name: "development", in: WorkTypeDevelopmentStr, want: true},
+		{name: "qa", in: WorkTypeQAStr, want: true},
+		{name: "operational scanner", in: WorkTypeOperationalScannerCI, want: true},
+		{name: "typo", in: "develop-ment", want: false},
+		{name: "empty", in: "", want: false},
+		{name: "case sensitive", in: "Development", want: false},
+		{name: "batch work types are not agent work types", in: "kg-extraction", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsKnownWorkType(tc.in); got != tc.want {
+				t.Errorf("IsKnownWorkType(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+	// Every declared work type must be recognised — guards drift between
+	// AllWorkTypes and the membership index.
+	for _, wt := range AllWorkTypes {
+		if !IsKnownWorkType(wt) {
+			t.Errorf("IsKnownWorkType(%q) = false, want true for declared work type", wt)
+		}
 	}
 }

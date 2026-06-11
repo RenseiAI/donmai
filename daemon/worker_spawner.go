@@ -41,8 +41,7 @@ type SpawnerOptions struct {
 	// OnPreSpawn is an optional hook invoked once per spawn, immediately
 	// before the child process is exec'd. It receives the final SessionSpec
 	// and the env slice that would otherwise be exec'd, and returns the env
-	// slice that will actually be exec'd. Returning nil is equivalent to
-	// returning the input unchanged.
+	// slice that will actually be exec'd plus an optional error.
 	//
 	// Callers may use this to layer per-session env entries (e.g.,
 	// credentials resolved at spawn time) over the spawner's BaseEnv.
@@ -56,7 +55,19 @@ type SpawnerOptions struct {
 	// The hook MUST NOT block on I/O paths that can hang indefinitely.
 	// Spawn latency budget is on the order of 250ms; if the hook needs
 	// to do I/O, it should have its own timeout.
-	OnPreSpawn func(spec SessionSpec, env []string) []string
+	//
+	// Returning a non-nil error aborts the spawn: AcceptWork returns the
+	// error to the caller without starting the child process. This is the
+	// fail-closed path for callers that must deny a spawn when a required
+	// credential is unavailable (e.g. byok/metered/shared sessions where
+	// the credential snapshot gate returns 403). For transient failures
+	// that should not block the spawn, callers should return (env, nil)
+	// with a sentinel env var (e.g. DONMAI_CREDENTIAL_SNAPSHOT_FAILED=1)
+	// so the agent can retry via its own fallback.
+	//
+	// A nil env slice return with a nil error is equivalent to returning
+	// the input env unchanged (no-op, same as the nil hook case).
+	OnPreSpawn func(spec SessionSpec, env []string) ([]string, error)
 
 	// Now lets tests deterministically clock acceptedAt timestamps.
 	Now func() time.Time
@@ -94,9 +105,10 @@ const (
 type WorkerSpawner struct {
 	opts SpawnerOptions
 
-	mu        sync.Mutex
-	sessions  map[string]*spawnedSession
-	accepting bool
+	mu            sync.Mutex
+	sessions      map[string]*spawnedSession
+	accepting     bool
+	extraProjects []ProjectConfig // satellite/additional org projects; never clobbered by SetProjects
 
 	listenersMu sync.Mutex
 	listeners   []func(SessionEvent)
@@ -237,7 +249,7 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 	return nil
 }
 
-// SetProjects atomically swaps the spawner's project allowlist used by
+// SetProjects atomically swaps the spawner's base project allowlist used by
 // AcceptWork's findProjectLocked check. Existing in-flight sessions
 // continue against whichever project they were dispatched under — the
 // new list governs only future AcceptWork calls.
@@ -245,6 +257,11 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 // Phase 2c of 2026-05-18-daemon-config-sync-DESIGN.md — wired by the
 // mutation-applier so platform-driven project.add / project.remove
 // proposals take effect on the very next claim without a daemon restart.
+//
+// SetProjects replaces ONLY the base project set (opts.Projects). Any
+// satellite/additional org projects registered via AddProjects are
+// preserved so a yaml-watcher reload of the primary org's config does
+// NOT evict satellite entries.
 //
 // A defensive copy is taken so subsequent mutations to the caller's
 // slice (e.g. daemon.go reusing a single buffer) don't race the spawner.
@@ -254,6 +271,76 @@ func (s *WorkerSpawner) SetProjects(projects []ProjectConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.opts.Projects = cp
+}
+
+// AddProjects appends additional project configurations (e.g. satellite-org
+// projects in a shared-spawner topology) to the spawner's allowlist. The new
+// entries are held in a separate slice from the base set managed by
+// SetProjects, so a subsequent yaml-watcher reload that calls SetProjects does
+// NOT evict them.
+//
+// Deduplication is by ProjectConfig.ID and ProjectConfig.Repository — a
+// candidate entry is skipped if an entry with the same ID or the same non-empty
+// Repository already exists in either the base or extra set, preventing
+// double-entries when AddProjects is called repeatedly for the same org.
+//
+// The call is safe for concurrent use: it acquires the same mutex that
+// AcceptWork and SetProjects use.
+func (s *WorkerSpawner) AddProjects(extra []ProjectConfig) {
+	if len(extra) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, candidate := range extra {
+		if s.isDuplicateLocked(candidate) {
+			continue
+		}
+		s.extraProjects = append(s.extraProjects, candidate)
+	}
+}
+
+// isDuplicateLocked reports whether candidate is already represented in either
+// the base or extra project sets. Must be called with s.mu held.
+func (s *WorkerSpawner) isDuplicateLocked(candidate ProjectConfig) bool {
+	for _, existing := range s.opts.Projects {
+		if candidate.ID != "" && candidate.ID == existing.ID {
+			return true
+		}
+		if candidate.Repository != "" && candidate.Repository == existing.Repository {
+			return true
+		}
+	}
+	for _, existing := range s.extraProjects {
+		if candidate.ID != "" && candidate.ID == existing.ID {
+			return true
+		}
+		if candidate.Repository != "" && candidate.Repository == existing.Repository {
+			return true
+		}
+	}
+	return false
+}
+
+// AllProjects returns a snapshot of the union of the base project set and any
+// additional projects registered via AddProjects. The returned slice is a
+// defensive copy; callers may safely hold it across subsequent SetProjects or
+// AddProjects calls.
+//
+// This is the correct view to pass to PollItemToSessionSpec /
+// PollItemToSessionDetail in poll-loop closures so that satellite-org projects
+// registered after daemon start are visible to slug→URL resolution.
+func (s *WorkerSpawner) AllProjects() []ProjectConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := len(s.opts.Projects) + len(s.extraProjects)
+	if total == 0 {
+		return nil
+	}
+	out := make([]ProjectConfig, 0, total)
+	out = append(out, s.opts.Projects...)
+	out = append(out, s.extraProjects...)
+	return out
 }
 
 // AcceptWork validates the spec, spawns a worker, and returns its handle.
@@ -281,20 +368,34 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	return s.spawn(spec, project)
 }
 
+// findProjectLocked searches the union of the base project set (opts.Projects)
+// and the extra project set (extraProjects) for an entry matching repository.
+// Must be called with s.mu held.
 func (s *WorkerSpawner) findProjectLocked(repository string) *ProjectConfig {
 	for i := range s.opts.Projects {
-		p := &s.opts.Projects[i]
-		// The platform sends spec.Repository as the Linear project slug
-		// (e.g. "smoke-alpha"), which doesn't match the GitHub repo name
-		// in p.Repository (e.g. ".../rensei-smokes-alpha"). Match by p.ID
-		// as well so operators can express the link via the allowlist
-		// entry's id. (REN-NEW)
-		if p.Repository == repository ||
-			p.ID == repository ||
-			strings.HasSuffix(repository, "/"+p.Repository) ||
-			strings.HasSuffix(p.Repository, "/"+repository) {
+		if p := matchProject(&s.opts.Projects[i], repository); p != nil {
 			return p
 		}
+	}
+	for i := range s.extraProjects {
+		if p := matchProject(&s.extraProjects[i], repository); p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+// matchProject returns p if its ID or Repository fields match repository, or
+// nil if neither matches. The platform sends spec.Repository as the Linear
+// project slug (e.g. "smoke-alpha"), which doesn't match the GitHub repo name
+// in p.Repository (e.g. ".../rensei-smokes-alpha"). Match by p.ID as well so
+// operators can express the link via the allowlist entry's id. (REN-NEW)
+func matchProject(p *ProjectConfig, repository string) *ProjectConfig {
+	if p.Repository == repository ||
+		p.ID == repository ||
+		strings.HasSuffix(repository, "/"+p.Repository) ||
+		strings.HasSuffix(p.Repository, "/"+repository) {
+		return p
 	}
 	return nil
 }
@@ -306,7 +407,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		// should always have WorkerCommand set (see daemon.go's
 		// defaultWorkerCommand). Surfacing this at warn level so
 		// operators notice when the daemon has fallen back to the
-		// test stub. (REN-1461.)
+		// test stub.
 		slog.Warn("worker spawner: WorkerCommand not set; using /bin/sh test stub (sessions exit immediately — set WorkerCommand or deploy a binary that resolves via os.Executable)",
 			"sessionId", spec.SessionID,
 		)
@@ -326,9 +427,18 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// per-session env entries (e.g., credentials resolved at spawn time)
 	// the static BaseEnv map cannot express. It runs after composeEnv so
 	// the returned slice can add or override anything BaseEnv + spec.Env
-	// produced. A nil return is a no-op.
+	// produced. A nil env return with nil error is a no-op.
+	//
+	// A non-nil error aborts the spawn (fail-closed). The child process is
+	// never started and AcceptWork surfaces the error to the caller so the
+	// daemon's poll loop can NACK the session.
 	if s.opts.OnPreSpawn != nil {
-		if next := s.opts.OnPreSpawn(spec, cmd.Env); next != nil {
+		next, hookErr := s.opts.OnPreSpawn(spec, cmd.Env)
+		if hookErr != nil {
+			cancel()
+			return nil, fmt.Errorf("pre-spawn hook: %w", hookErr)
+		}
+		if next != nil {
 			cmd.Env = next
 		}
 	}

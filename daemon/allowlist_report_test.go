@@ -10,10 +10,10 @@ func TestAllowlistEntriesFromConfig(t *testing.T) {
 
 	t.Run("nil and empty input return nil", func(t *testing.T) {
 		t.Parallel()
-		if got := allowlistEntriesFromConfig(nil); got != nil {
+		if got := AllowlistEntriesFromConfig(nil); got != nil {
 			t.Errorf("nil input returned %v, want nil", got)
 		}
-		if got := allowlistEntriesFromConfig([]ProjectConfig{}); got != nil {
+		if got := AllowlistEntriesFromConfig([]ProjectConfig{}); got != nil {
 			t.Errorf("empty input returned %v, want nil", got)
 		}
 	})
@@ -25,7 +25,7 @@ func TestAllowlistEntriesFromConfig(t *testing.T) {
 			{ID: "alpha", Repository: "github.com/x/alpha"},
 			{ID: "middle", Repository: "github.com/x/middle"},
 		}
-		got := allowlistEntriesFromConfig(in)
+		got := AllowlistEntriesFromConfig(in)
 		want := []ProjectAllowlistEntry{
 			{ID: "alpha", Repository: "github.com/x/alpha"},
 			{ID: "middle", Repository: "github.com/x/middle"},
@@ -44,7 +44,7 @@ func TestAllowlistEntriesFromConfig(t *testing.T) {
 			{ID: "no-repo", Repository: ""},
 			{ID: "", Repository: ""},
 		}
-		got := allowlistEntriesFromConfig(in)
+		got := AllowlistEntriesFromConfig(in)
 		want := []ProjectAllowlistEntry{{ID: "ok", Repository: "github.com/x/ok"}}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("got %v, want %v", got, want)
@@ -61,7 +61,7 @@ func TestAllowlistEntriesFromConfig(t *testing.T) {
 				Git:           &ProjectGit{},
 			},
 		}
-		got := allowlistEntriesFromConfig(in)
+		got := AllowlistEntriesFromConfig(in)
 		want := []ProjectAllowlistEntry{{ID: "alpha", Repository: "github.com/x/alpha"}}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("got %v, want %v", got, want)

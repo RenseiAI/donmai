@@ -1,39 +1,53 @@
 package afcli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
 
+	"github.com/RenseiAI/donmai/internal/process"
 	"github.com/spf13/cobra"
 )
 
 // newGovernorStatusCmd constructs the `governor status` subcommand.
-// It checks whether a governor process is currently running by
-// reading the saved PID and probing it with Signal(0).
-func newGovernorStatusCmd() *cobra.Command {
+// It checks whether a governor process is currently running by reading
+// the saved PID (the same process.PIDFile `governor start` writes) and
+// probing it with Signal(0).
+func newGovernorStatusCmd(bin string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "status",
 		Short:        "Check if the governor is running",
 		Long:         "Report whether the governor process is currently running, along with its PID.",
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			pid, err := loadPID(governorPIDName)
+			pf, err := process.NewPIDFile(governorPIDName)
 			if err != nil {
-				fmt.Println("Governor is not running")
+				return fmt.Errorf("governor status: %w", err)
+			}
+
+			pid, err := pf.Read()
+			switch {
+			case errors.Is(err, process.ErrStalePID):
+				_ = pf.Remove()
+				fmt.Printf("Governor is not running (stale pid file cleaned up) — start with `%s governor start`\n", bin)
+				return nil
+			case err != nil:
+				fmt.Printf("Governor is not running — start with `%s governor start`\n", bin)
 				return nil
 			}
 
 			proc, err := os.FindProcess(pid)
 			if err != nil {
-				fmt.Println("Governor is not running")
+				fmt.Printf("Governor is not running — start with `%s governor start`\n", bin)
 				return nil
 			}
 
+			// Re-probe liveness — platforms where PIDFile.Read does
+			// not probe (Windows) still need the stale check.
 			if err := proc.Signal(syscall.Signal(0)); err != nil {
-				// Process not running; clean up stale PID file.
-				_ = removePIDFile(governorPIDName)
-				fmt.Println("Governor is not running (stale pid file cleaned up)")
+				_ = pf.Remove()
+				fmt.Printf("Governor is not running (stale pid file cleaned up) — start with `%s governor start`\n", bin)
 				return nil
 			}
 

@@ -94,6 +94,9 @@ Charm v2 ecosystem + Cobra:
 - `github.com/spf13/cobra` — CLI framework
 - `github.com/sahilm/fuzzy` — Fuzzy search (command palette)
 - `github.com/joho/godotenv` — .env.local loading
+- `github.com/santhosh-tekuri/jsonschema/v6` — JSON Schema validation for the
+  one-shot/structured completion lane (`agent/oneshot.go`). Pure-Go, no cgo;
+  certifies `OneShotResult.SchemaOK` for the soft-JSON validate-repair-drop path.
 
 No other direct dependencies without compelling justification.
 
@@ -160,7 +163,7 @@ endpoints:
 ## `donmai agent run` (F.2.8)
 
 The daemon spawns `donmai agent run` for every claimed session. The subcommand
-reads its session id from `RENSEI_SESSION_ID` (set by the spawner), fetches
+reads its session id from `DONMAI_SESSION_ID` (set by the spawner), fetches
 the full QueuedWork payload from the daemon's local control API, builds a
 runner.Registry with stub + claude + codex (best-effort), and invokes
 `runner.Runner`. Operators rarely invoke this manually; see
@@ -186,14 +189,14 @@ wins over both.
 
 `AGENT_ENV_BLOCKLIST` is the single source of truth in
 `internal/credentials/blocklist.go`. It captures the daemon's own auth
-surface — `RENSEI_DAEMON_JWT`, `WORKER_API_KEY`, `M2M_JWT_SECRET`, …
+surface — `DONMAI_DAEMON_JWT`, `WORKER_API_KEY`, `M2M_JWT_SECRET`, …
 — that must never bleed into a child agent regardless of source. The
 rensei-tui daemon hardcodes the same list in
 `daemon/credentials/socket.go`; the two stay in sync manually until
 the OSS boundary permits a shared import.
 
 Operators can pin the mode via `donmai daemon run --standalone-creds=<on|off|auto>`.
-The default is `auto`, which selects `on` when `RENSEI_DAEMON_JWT` is
+The default is `auto`, which selects `on` when `DONMAI_DAEMON_JWT` is
 unset (i.e. AF-TUI is NOT being driven by rensei-tui's credential
 socket) and `off` otherwise.
 

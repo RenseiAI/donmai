@@ -23,6 +23,18 @@ func newTestClient(t *testing.T) (*queue.Client, func()) {
 	return c, mr.Close
 }
 
+// newTestClientWithMR returns the client AND the miniredis instance so tests
+// can seed Redis keys directly to simulate legacy-producer scenarios.
+func newTestClientWithMR(t *testing.T) (*queue.Client, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	c, err := queue.NewClient("redis://" + mr.Addr())
+	if err != nil {
+		t.Fatalf("NewClient: unexpected error: %v", err)
+	}
+	return c, mr
+}
+
 func TestNewClient_InvalidURL(t *testing.T) {
 	t.Parallel()
 
@@ -143,6 +155,60 @@ func TestEnqueuePeek_MultipleItems(t *testing.T) {
 	}
 	if string(got2) != "first" {
 		t.Fatalf("Peek (second): got %q, want %q", got2, "first")
+	}
+}
+
+// TestEnqueue_CanonicalKeyOnly verifies that Enqueue writes ONLY to the
+// canonical key ("donmai:governor:queue"). The pre-debrand legacy key
+// ("agentfactory:governor:queue") dual-write was removed once all governor
+// instances and platform consumers were restarted; a regression that
+// reintroduces it would silently resurrect unbounded legacy-list growth.
+func TestEnqueue_CanonicalKeyOnly(t *testing.T) {
+	t.Parallel()
+	c, mr := newTestClientWithMR(t)
+	defer func() { _ = c.Close() }()
+
+	ctx := context.Background()
+	payload := []byte(`{"issueId":"Q-1","phase":"development"}`)
+
+	if err := c.Enqueue(ctx, payload); err != nil {
+		t.Fatalf("Enqueue: unexpected error: %v", err)
+	}
+
+	// Canonical key must have the item.
+	primaryItems, err := mr.List("donmai:governor:queue")
+	if err != nil {
+		t.Fatalf("List canonical key: %v", err)
+	}
+	if len(primaryItems) != 1 {
+		t.Fatalf("expected 1 item in canonical key, got %d", len(primaryItems))
+	}
+	if primaryItems[0] != string(payload) {
+		t.Fatalf("canonical key item: got %q, want %q", primaryItems[0], payload)
+	}
+
+	// Legacy key must NOT be created.
+	if mr.Exists("agentfactory:governor:queue") {
+		t.Fatal("legacy key \"agentfactory:governor:queue\" was written — dual-write has been removed")
+	}
+}
+
+// TestPeek_IgnoresLegacyKey verifies that Peek no longer falls back to the
+// pre-debrand legacy key: an item visible only under
+// "agentfactory:governor:queue" is invisible to the consumer.
+func TestPeek_IgnoresLegacyKey(t *testing.T) {
+	t.Parallel()
+	c, mr := newTestClientWithMR(t)
+	defer func() { _ = c.Close() }()
+
+	// Seed ONLY the legacy key (a producer this old no longer exists; if one
+	// did, its items must not be consumed).
+	if _, err := mr.Push("agentfactory:governor:queue", `{"issueId":"LEGACY-1"}`); err != nil {
+		t.Fatalf("seed legacy key: %v", err)
+	}
+
+	if _, err := c.Peek(context.Background()); !errors.Is(err, queue.ErrEmptyQueue) {
+		t.Fatalf("Peek with only legacy-key items: got err %v, want ErrEmptyQueue", err)
 	}
 }
 

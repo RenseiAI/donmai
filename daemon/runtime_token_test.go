@@ -16,7 +16,7 @@ import (
 // available, the daemon takes the refresh path — preserving the
 // workerId — instead of falling through to a full re-register.
 //
-// This is the green-path REN-1481 fix: the platform side ships a
+// This is the green-path refresh fix: the platform side ships a
 // refresh handler, the daemon picks it up automatically, and the
 // 5-min `401 → re-register → 404` cycle goes away because the
 // workerId is stable across token refreshes.
@@ -36,6 +36,8 @@ func TestRefreshRuntimeToken_RefreshPathHonoured(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"runtimeToken":          "fresh.runtime.jwt",
 				"runtimeTokenExpiresAt": "2026-05-03T12:00:00Z",
+				"heartbeatInterval":     30000,
+				"pollInterval":          5000,
 			})
 			return
 		}
@@ -73,13 +75,83 @@ func TestRefreshRuntimeToken_RefreshPathHonoured(t *testing.T) {
 	if result.RegistrationTokenSwapped {
 		t.Fatalf("expected no workerId swap on refresh path")
 	}
+	// The expiry + cadence must be surfaced so the caller can persist a
+	// complete CachedJWT after the refresh (otherwise the on-disk cache keeps
+	// the stale token and downstream readers 401 — the credential root cause).
+	if result.RuntimeTokenExpiresAt != "2026-05-03T12:00:00Z" {
+		t.Errorf("expected RuntimeTokenExpiresAt surfaced, got %q", result.RuntimeTokenExpiresAt)
+	}
+	if result.HeartbeatInterval != 30000 {
+		t.Errorf("expected HeartbeatInterval=30000, got %d", result.HeartbeatInterval)
+	}
+	if result.PollInterval != 5000 {
+		t.Errorf("expected PollInterval=5000, got %d", result.PollInterval)
+	}
+}
+
+// TestPersistRefreshedToken_OverwritesStaleCache covers the persistence fix:
+// after a refresh, the on-disk daemon.jwt must carry the FRESH token +
+// expiry/cadence, replacing the stale entry, so the credential resolver and
+// runner read the new token instead of 401ing on the expired one.
+func TestPersistRefreshedToken_OverwritesStaleCache(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := dir + "/daemon.jwt"
+
+	// Seed a stale cache (an expired token) as the daemon would have on disk.
+	// #nosec G101 -- test fixture token, not a real credential
+	if err := SaveCachedJWT(path, &RegisterResponse{
+		WorkerID:              "wkr_x",
+		RuntimeToken:          "stale.expired.jwt",
+		HeartbeatInterval:     30000,
+		PollInterval:          5000,
+		RuntimeTokenExpiresAt: "2020-01-01T00:00:00Z",
+	}, time.Unix(1_600_000_000, 0)); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	// #nosec G101 -- test fixture token, not a real credential
+	err := persistRefreshedToken(path, &RefreshTokenResult{
+		Mode:                  "refresh",
+		WorkerID:              "wkr_x",
+		RuntimeToken:          "fresh.runtime.jwt",
+		RuntimeTokenExpiresAt: "2030-01-01T00:00:00Z",
+		HeartbeatInterval:     30000,
+		PollInterval:          5000,
+	}, func() time.Time { return time.Unix(1_700_000_000, 0) })
+	if err != nil {
+		t.Fatalf("persistRefreshedToken: %v", err)
+	}
+
+	got, err := LoadCachedJWT(path)
+	if err != nil || got == nil {
+		t.Fatalf("reload cache: %v (got=%v)", err, got)
+	}
+	if got.RuntimeToken != "fresh.runtime.jwt" {
+		t.Errorf("token not refreshed on disk: %q", got.RuntimeToken)
+	}
+	if got.RuntimeTokenExpiresAt != "2030-01-01T00:00:00Z" {
+		t.Errorf("expiry not refreshed on disk: %q", got.RuntimeTokenExpiresAt)
+	}
+	if got.WorkerID != "wkr_x" {
+		t.Errorf("workerId = %q, want wkr_x", got.WorkerID)
+	}
+}
+
+// TestPersistRefreshedToken_NoopOnEmptyPath: an empty JWT path is a no-op (no
+// panic, no error) so callers without a cache path stay best-effort.
+func TestPersistRefreshedToken_NoopOnEmptyPath(t *testing.T) {
+	t.Parallel()
+	if err := persistRefreshedToken("", &RefreshTokenResult{RuntimeToken: "x"}, nil); err != nil {
+		t.Fatalf("empty path should be a no-op, got %v", err)
+	}
 }
 
 // TestRefreshRuntimeToken_FallsBackToReregisterOn404 asserts that
 // when the platform's refresh endpoint returns 404 (current state —
-// REN-1481 platform-side companion not yet shipped), the daemon
+// the platform-side companion not yet shipped), the daemon
 // falls back to a full re-register and observes a NEW workerId. This
-// is the canonical REN-1481 root-cause path — proven, logged, and
+// is the canonical root-cause path — proven, logged, and
 // surfaced via RegistrationTokenSwapped=true so operators see why
 // in-flight heartbeats 404 in the cycle until they swap credentials.
 func TestRefreshRuntimeToken_FallsBackToReregisterOn404(t *testing.T) {
@@ -212,7 +284,7 @@ func TestRefreshRuntimeToken_WorkerNotFound_SkipsRefreshProbe(t *testing.T) {
 
 // TestRefreshRuntimeToken_ProbedBeforeReregister asserts that on every
 // auth-failure the daemon HITS the refresh endpoint FIRST. This is
-// the REN-1481 acceptance check: "assert refresh path is hit BEFORE
+// the acceptance check: "assert refresh path is hit BEFORE
 // re-register". When the platform side ships the handler the daemon
 // flips automatically.
 func TestRefreshRuntimeToken_ProbedBeforeReregister(t *testing.T) {
@@ -261,7 +333,7 @@ func TestRefreshRuntimeToken_ProbedBeforeReregister(t *testing.T) {
 
 // TestAuthFailureReason classifies the platform's specific 401
 // "Runtime token expired" message — the smoking-gun signal for
-// REN-1481.
+// the runtime-token refresh path.
 func TestAuthFailureReason(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -306,7 +378,7 @@ func TestPollAuthFailureReason(t *testing.T) {
 }
 
 // TestHeartbeatService_RefreshOn401Probe asserts the
-// REN-1481 acceptance criterion: when the platform returns
+// refresh-before-reregister acceptance criterion: when the platform returns
 // 401 "Runtime token expired" on a heartbeat, the daemon's
 // OnReregister callback (which the daemon wires through
 // RefreshRuntimeToken) HITS the refresh endpoint before falling back

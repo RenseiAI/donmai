@@ -89,6 +89,13 @@ type RegisterRequest struct {
 	// SSH-ing to the host. Omitted when the daemon yaml has no projects[]
 	// entries; the platform falls back to "unknown / unrestricted" semantics.
 	DaemonProjects []ProjectAllowlistEntry `json:"daemonProjects,omitempty"`
+
+	// ProjectIDs is the list of platform project UUIDs this daemon is claiming
+	// beyond the primary project encoded in the registration token. The platform
+	// validates each extra UUID belongs to the same org as the token and unions
+	// the tracker keys across all claimed projects. Omitempty — older daemon
+	// versions that omit this field are treated as single-project workers.
+	ProjectIDs []string `json:"projectIds,omitempty"`
 }
 
 // ProjectAllowlistEntry is the wire shape for a single allowlisted project
@@ -157,7 +164,7 @@ type CachedJWT struct {
 	RuntimeTokenExpiresAt string `json:"runtimeTokenExpiresAt,omitempty"`
 	CachedAt              string `json:"cachedAt"`
 
-	// Legacy fields retained so old cache files written before REN-1422
+	// Legacy fields retained so old cache files written by older daemons
 	// still load successfully. Newer writes only populate the canonical
 	// platform-named fields above.
 	LegacyRuntimeJWT               string `json:"runtimeJwt,omitempty"`
@@ -179,7 +186,7 @@ func LoadCachedJWT(jwtPath string) (*CachedJWT, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, nil //nolint:nilerr // corrupt cache → re-register
 	}
-	// Migrate legacy fields written by daemons pre-REN-1422.
+	// Migrate legacy fields written by older daemons.
 	if c.RuntimeToken == "" && c.LegacyRuntimeJWT != "" {
 		c.RuntimeToken = c.LegacyRuntimeJWT
 	}
@@ -252,9 +259,9 @@ func WipeCachedJWT(jwtPath string) (bool, error) {
 // platform's accepted registration-token prefixes.
 //
 // The platform's worker-protocol/auth.ts (via the unified validateApiKey hot
-// path landed in REN-1351 / REN-1353) accepts both:
+// path) accepts both:
 //   - rsp_live_*   — legacy worker_registration tokens
-//   - rsk_live_*   — the unified API-key prefix that REN-1351 made the new
+//   - rsk_live_*   — the unified API-key prefix that the platform made the new
 //     mint format. Tokens minted via /api/projects/<id>/runtime-tokens or
 //     /api/org/<id>/keys today come back as rsk_live_*.
 //
@@ -273,7 +280,7 @@ func looksLikeRegistrationToken(token string) bool {
 //   - the orchestrator URL is "file://...", OR
 //   - the registration token does not start with rsp_live_ or rsk_live_.
 //
-// REN-1444 (v0.4.1) inverted the env-gate from opt-in to opt-out. The
+// v0.4.1 inverted the env-gate from opt-in to opt-out. The
 // previous default required DONMAI_DAEMON_REAL_REGISTRATION=1 in the
 // launchd plist; with that env unset, a daemon configured with a real
 // rsk_live_* token would silently fall back to stub mode and never
@@ -286,8 +293,19 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		opts.Now = time.Now
 	}
 
+	// Decide real-vs-stub up front so the JWT cache can be validated against
+	// the daemon's *current* config before it is trusted. Computing useStub
+	// only on a cache miss (the prior behaviour) let a stale stub entry — e.g.
+	// one written to the shared DefaultJWTPath by a `go test`/smoke run —
+	// survive a restart: Register returned the cached stub verbatim, the
+	// daemon never registered with the platform, and the poll loop never
+	// started (daemon.go gates the poll loop on a non-"stub." runtime token).
+	useStub := stubModeRequested() ||
+		strings.HasPrefix(opts.OrchestratorURL, "file://") ||
+		!looksLikeRegistrationToken(opts.RegistrationToken)
+
 	if !opts.ForceReregister {
-		if cached, _ := LoadCachedJWT(opts.JWTPath); cached != nil {
+		if cached, _ := LoadCachedJWT(opts.JWTPath); cached != nil && cachedMatchesMode(cached, useStub) {
 			return &RegisterResponse{
 				WorkerID:              cached.WorkerID,
 				RuntimeToken:          cached.RuntimeToken,
@@ -315,10 +333,6 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		req.MachineID = opts.Hostname
 	}
 
-	useStub := stubModeRequested() ||
-		strings.HasPrefix(opts.OrchestratorURL, "file://") ||
-		!looksLikeRegistrationToken(opts.RegistrationToken)
-
 	var resp *RegisterResponse
 	if useStub {
 		resp = buildStubResponse(opts.Hostname)
@@ -336,6 +350,34 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		return resp, nil
 	}
 	return resp, nil
+}
+
+// isStubRuntimeToken reports whether tok was minted by buildStubResponse
+// rather than the platform. makeStubJWT always prefixes stub tokens with
+// "stub." precisely so they can be recognised (and rejected) here and by the
+// platform's worker-auth path.
+func isStubRuntimeToken(tok string) bool {
+	return strings.HasPrefix(tok, "stub.")
+}
+
+// cachedMatchesMode reports whether a cached JWT entry is consistent with the
+// real-vs-stub decision the daemon would make from its *current* config.
+//
+// A mismatch means the cache is stale or poisoned and must not be trusted.
+// The load-bearing case: a stub entry (worker-<host>-stub id + "stub."-prefixed
+// runtime token) loaded by a daemon now configured for real registration
+// (valid rsk_live_/rsp_live_ token, non-file:// orchestrator URL, no
+// DONMAI_DAEMON_FORCE_STUB). Without this check Register short-circuited on the
+// stub cache, the daemon ran as an unregistered stub, never heartbeat or polled
+// the platform, and queued work was never claimed — while `daemon status`
+// still reported "ready". Returning false here drops the cache so a fresh
+// registration handshake runs instead. The symmetric case (a real token cached
+// while the operator has now forced stub mode) is likewise rejected so an
+// explicit stub opt-in is honoured.
+func cachedMatchesMode(cached *CachedJWT, useStub bool) bool {
+	cachedIsStub := isStubRuntimeToken(cached.RuntimeToken) ||
+		strings.HasSuffix(cached.WorkerID, "-stub")
+	return cachedIsStub == useStub
 }
 
 // callRegisterEndpoint calls the real platform endpoint.
@@ -399,12 +441,12 @@ func buildStubResponse(hostname string) *RegisterResponse {
 
 // stubModeRequested returns true when the operator has explicitly opted into
 // stub registration via DONMAI_DAEMON_FORCE_STUB. The legacy
-// DONMAI_DAEMON_REAL_REGISTRATION env (REN-1422) is also honoured: setting
+// DONMAI_DAEMON_REAL_REGISTRATION env is also honoured: setting
 // it to "0" / "false" / "off" / "no" forces stub mode for back-compat with
 // existing test harnesses; any other non-empty value is treated as a no-op
 // (real path, the new default).
 //
-// REN-1444 (v0.4.1): real registration is now the default. Previously the
+// v0.4.1: real registration is now the default. Previously the
 // daemon required DONMAI_DAEMON_REAL_REGISTRATION=1 in the launchd plist;
 // without it, a fully-configured daemon silently fell back to stub mode.
 func stubModeRequested() bool {

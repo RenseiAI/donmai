@@ -22,9 +22,9 @@ import (
 //   - returns { runtimeToken, runtimeTokenExpiresAt, heartbeatInterval, pollInterval }
 //
 // As of 2026-05-03 this endpoint does NOT exist on the platform side —
-// see REN-1481 platform-companion. Until it ships the daemon probes
+// a platform-side companion is required. Until it ships the daemon probes
 // this URL, observes a 404, and falls back to full re-register (which
-// mints a new workerId, the bug REN-1481 originally documented). When
+// mints a new workerId — the original 5-minute-cycle bug). When
 // the platform side ships the endpoint the daemon picks it up
 // automatically with no further changes.
 // #nosec G101 -- URL endpoint path, not a credential
@@ -50,11 +50,21 @@ type RefreshTokenResult struct {
 	// RuntimeToken is the fresh runtime JWT.
 	RuntimeToken string
 
+	// RuntimeTokenExpiresAt, HeartbeatInterval and PollInterval mirror the
+	// platform's response (refresh endpoint or full re-register). Callers need
+	// them to persist a COMPLETE CachedJWT after a refresh — the on-disk cache
+	// entry carries the expiry + cadence, not just the token, so a daemon that
+	// refreshes its token in-memory but writes back only the token would leave
+	// a half-populated cache. Empty/zero when the platform omitted them.
+	RuntimeTokenExpiresAt string
+	HeartbeatInterval     int
+	PollInterval          int
+
 	// RegistrationTokenSwapped is true when Mode=reregister produced a
 	// different workerId. Operators care about this signal because the
 	// platform forgets the old workerId after a fresh registration —
 	// any in-flight heartbeats / polls keyed on it 404 until the daemon
-	// swaps credentials. (REN-1481 root cause.)
+	// swaps credentials.
 	RegistrationTokenSwapped bool
 
 	// Reason is the structured reason the refresh path was taken
@@ -65,7 +75,7 @@ type RefreshTokenResult struct {
 
 // RefreshRuntimeToken attempts to refresh the daemon's runtime JWT
 // without re-registering — i.e. preserving the workerId. This is the
-// REN-1481 fix path. Behaviour:
+// runtime-token refresh fix path. Behaviour:
 //
 //  1. When reason is "worker-not-found" (HTTP 404 on poll or heartbeat),
 //     the worker's Redis registration entry has expired — the runtime
@@ -87,7 +97,7 @@ type RefreshTokenResult struct {
 // ForceReregister=true outside boot. All in-flight 401/404 detection
 // in HeartbeatService / PollService routes through here so the
 // `[runtime-token]` log line is the single source of truth for
-// operators investigating the 5-minute cycle in REN-1481.
+// operators investigating the 5-minute re-register cycle.
 func RefreshRuntimeToken(
 	ctx context.Context,
 	regOpts RegistrationOptions,
@@ -96,8 +106,12 @@ func RefreshRuntimeToken(
 ) (*RefreshTokenResult, error) {
 	logger := slog.Default()
 
+	// One line per refresh attempt. The reason carries the trigger:
+	// reactive ("runtime-token-expired", "worker-not-found", ...) or the
+	// scheduled "proactive-expiry" path — so the historical "401" event
+	// name no longer fits.
 	logger.Info("[runtime-token]",
-		"event", "401",
+		"event", "refresh-requested",
 		"workerId", currentWorkerID,
 		"reason", reason,
 	)
@@ -119,10 +133,13 @@ func RefreshRuntimeToken(
 				"reason", reason,
 			)
 			return &RefreshTokenResult{
-				Mode:         "refresh",
-				WorkerID:     currentWorkerID,
-				RuntimeToken: fresh.RuntimeToken,
-				Reason:       reason,
+				Mode:                  "refresh",
+				WorkerID:              currentWorkerID,
+				RuntimeToken:          fresh.RuntimeToken,
+				RuntimeTokenExpiresAt: fresh.RuntimeTokenExpiresAt,
+				HeartbeatInterval:     fresh.HeartbeatInterval,
+				PollInterval:          fresh.PollInterval,
+				Reason:                reason,
 			}, nil
 		}
 		// 404 / 405 → endpoint not deployed yet. Fall through to
@@ -143,7 +160,7 @@ func RefreshRuntimeToken(
 			"event", "refresh.unavailable",
 			"workerId", currentWorkerID,
 			"reason", reason,
-			"detail", "platform refresh endpoint not deployed; falling back to full re-register (workerId will change — REN-1481 platform-side companion fix)",
+			"detail", "platform refresh endpoint not deployed; falling back to full re-register (workerId will change — platform-side refresh endpoint pending)",
 		)
 	} else if workerNotFound {
 		logger.Info("[runtime-token]",
@@ -179,9 +196,40 @@ func RefreshRuntimeToken(
 		Mode:                     "reregister",
 		WorkerID:                 rr.WorkerID,
 		RuntimeToken:             rr.RuntimeToken,
+		RuntimeTokenExpiresAt:    rr.RuntimeTokenExpiresAt,
+		HeartbeatInterval:        rr.HeartbeatInterval,
+		PollInterval:             rr.PollInterval,
 		RegistrationTokenSwapped: swapped,
 		Reason:                   reason,
 	}, nil
+}
+
+// persistRefreshedToken writes the refreshed credentials to the on-disk JWT
+// cache (daemon.jwt) so processes that read the token from disk — the
+// per-session credential resolver and the runner's platform client — pick up
+// the fresh token instead of the now-stale cached one. The daemon's heartbeat
+// and poll loops swap the token in memory, but anything reading daemon.jwt does
+// not see that swap; without this write they keep presenting the expired token
+// (the platform then 307-redirects credential snapshots to an HTML login page
+// and 401s status updates — the stale-cached-token credential root cause).
+//
+// Best-effort by contract: callers log and continue on error; a cache-write
+// failure must never abort the refresh, since the in-memory swap already keeps
+// poll + heartbeat alive. Returns nil for an empty path or nil result.
+func persistRefreshedToken(jwtPath string, result *RefreshTokenResult, nowFn func() time.Time) error {
+	if jwtPath == "" || result == nil {
+		return nil
+	}
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	return SaveCachedJWT(jwtPath, &RegisterResponse{
+		WorkerID:              result.WorkerID,
+		RuntimeToken:          result.RuntimeToken,
+		HeartbeatInterval:     result.HeartbeatInterval,
+		PollInterval:          result.PollInterval,
+		RuntimeTokenExpiresAt: result.RuntimeTokenExpiresAt,
+	}, nowFn())
 }
 
 // refreshHTTPError carries the HTTP status from the refresh probe so
@@ -214,7 +262,7 @@ type refreshResponse struct {
 // registration token in Authorization: Bearer + the workerId in the
 // URL path. The path the daemon probes is
 // `/api/workers/<id>/refresh-token`; until the platform side ships
-// REN-1481-companion the platform 404s and we fall through to
+// its companion handler the platform 404s and we fall through to
 // re-register.
 func callRefreshEndpoint(
 	ctx context.Context,

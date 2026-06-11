@@ -1,6 +1,6 @@
 // Package afclient workarea_types.go — wire types for the daemon's
 // /api/daemon/workareas* operator surface. The contract is locked in
-// rensei-architecture/ADR-2026-05-07-daemon-http-control-api.md (D4 + D4a)
+// donmai-architecture/ADR-2026-05-07-daemon-http-control-api.md (D4 + D4a)
 // and follows the pool-member state machine + archive semantics in
 // 003-workarea-provider.md.
 package afclient

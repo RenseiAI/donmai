@@ -30,7 +30,7 @@ type State struct {
 	// IssueID is the platform-side issue UUID.
 	IssueID string `json:"issueId"`
 
-	// IssueIdentifier is the human-readable issue id (e.g. REN-1234).
+	// IssueIdentifier is the human-readable issue id (e.g. ENG-1234).
 	// The cross-issue recovery guard compares this to an expected
 	// value before allowing reuse.
 	IssueIdentifier string `json:"issueIdentifier"`

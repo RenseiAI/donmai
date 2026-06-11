@@ -30,7 +30,7 @@ type DataSource interface {
 	GetCostReport() (*CostReportResponse, error)
 	ListFleet() (*ListFleetResponse, error)
 
-	// Architecture-aware fetch methods added in REN-1333.
+	// Architecture-aware fetch methods.
 	// These surface the new Machine/Daemon/Pool/Workarea/SandboxProvider/Kit
 	// concepts for TUI Phase 2/3 panels per 009-linear-realignment §issues 56-59.
 
@@ -433,7 +433,7 @@ func (c *Client) WhoAmI() (*WhoAmIResponse, error) {
 	return &resp, nil
 }
 
-// ── Architecture-aware methods (REN-1333) ─────────────────────────────────────
+// ── Architecture-aware methods ─────────────────────────────────────
 
 // GetStatsV2 fetches fleet statistics extended with per-machine and per-provider
 // breakdowns from the /api/public/stats/v2 endpoint.
@@ -510,7 +510,7 @@ func (c *Client) GetAuditChain(sessionID string) ([]AuditChainEntry, error) {
 // Empty ScopeQuery returns all cards visible to the caller's (org, project).
 //
 // TODO(lane-H): /api/agents is not yet implemented server-side (pending Lane A1
-// in rensei-architecture/ADR-2026-05-12-agentcard-schema-and-scope.md §3).
+// in the agentcard schema-and-scope ADR §3).
 // Wire shape is canonical; the method returns ErrUnimplemented until the
 // endpoint lands on main.
 func (c *Client) ListAgents(scope AgentScopeQuery) ([]AgentCard, error) {
@@ -541,7 +541,7 @@ func (c *Client) ListAgents(scope AgentScopeQuery) ([]AgentCard, error) {
 // GetAgent fetches a single AgentCard by its platform-generated ID ("ag_…").
 //
 // TODO(lane-H): /api/agents/<id> is not yet implemented server-side (pending
-// Lane A1 in rensei-architecture/ADR-2026-05-12-agentcard-schema-and-scope.md).
+// Lane A1 in the agentcard schema-and-scope ADR).
 // Returns ErrUnimplemented until the endpoint lands on main.
 func (c *Client) GetAgent(id string) (*AgentCard, error) {
 	var resp AgentCard

@@ -8,7 +8,7 @@ import (
 
 // newFleetScaleCmd constructs the `fleet scale` subcommand.
 //
-// TODO(REN-1074): fleet scale currently returns an error advising the
+// TODO: fleet scale currently returns an error advising the
 // operator to stop and start with a new --count. A full implementation
 // requires a supervisor daemon (or equivalent IPC) so scale can reach
 // the live Fleet instance to either spawn additional children or

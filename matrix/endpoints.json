@@ -1,0 +1,313 @@
+{
+  "schemaVersion": "p1.0",
+  "contractAbi": "capability-matrix/v1",
+  "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
+  "endpoints": [
+    {
+      "company": "anthropic",
+      "humanLabel": "Anthropic",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v1",
+      "speaks": [
+        "anthropic-messages"
+      ],
+      "hosts": [
+        {
+          "host": "oauth-cli",
+          "protocol": "anthropic-messages",
+          "authModes": [
+            "host-session"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "host-subscription",
+          "baseUrlTmpl": "",
+          "envKeys": []
+        },
+        {
+          "host": "direct",
+          "protocol": "anthropic-messages",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://api.anthropic.com",
+          "envKeys": [
+            "ANTHROPIC_API_KEY"
+          ]
+        },
+        {
+          "host": "bedrock",
+          "protocol": "anthropic-messages",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://bedrock-runtime.{region}.amazonaws.com",
+          "envKeys": [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_REGION"
+          ]
+        },
+        {
+          "host": "vertex",
+          "protocol": "anthropic-messages",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://{region}-aiplatform.googleapis.com",
+          "envKeys": [
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "ANTHROPIC_VERTEX_PROJECT_ID"
+          ]
+        }
+      ],
+      "models": [
+        {
+          "id": "claude-sonnet-4-5",
+          "humanLabel": "Claude Sonnet 4.5",
+          "contextWindow": 200000,
+          "supportsTools": true,
+          "supportsJsonMode": false,
+          "hosts": [
+            "direct",
+            "bedrock",
+            "vertex"
+          ]
+        },
+        {
+          "id": "claude-haiku",
+          "humanLabel": "Claude Haiku",
+          "contextWindow": 200000,
+          "supportsTools": true,
+          "supportsJsonMode": false,
+          "hosts": [
+            "direct",
+            "bedrock",
+            "vertex"
+          ]
+        }
+      ]
+    },
+    {
+      "company": "google",
+      "humanLabel": "Google",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v1",
+      "speaks": [
+        "gemini-generate",
+        "openai-chat"
+      ],
+      "hosts": [
+        {
+          "host": "direct",
+          "protocol": "gemini-generate",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://generativelanguage.googleapis.com",
+          "envKeys": [
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY"
+          ]
+        },
+        {
+          "host": "vertex",
+          "protocol": "gemini-generate",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://{region}-aiplatform.googleapis.com",
+          "envKeys": [
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_VERTEX_PROJECT_ID"
+          ]
+        },
+        {
+          "host": "oauth-cli",
+          "protocol": "antigravity-oauth",
+          "authModes": [
+            "host-session",
+            "local"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "host-subscription",
+          "baseUrlTmpl": "",
+          "envKeys": []
+        },
+        {
+          "host": "local",
+          "protocol": "openai-chat",
+          "authModes": [
+            "local"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "local",
+          "baseUrlTmpl": "http://127.0.0.1:11434/v1",
+          "envKeys": []
+        }
+      ],
+      "models": [
+        {
+          "id": "gemini-2.5-pro",
+          "humanLabel": "Gemini 2.5 Pro",
+          "contextWindow": 1000000,
+          "supportsTools": true,
+          "supportsJsonMode": true,
+          "hosts": [
+            "direct",
+            "vertex"
+          ]
+        }
+      ]
+    },
+    {
+      "company": "local",
+      "humanLabel": "Local (Ollama)",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v1",
+      "speaks": [
+        "ollama"
+      ],
+      "hosts": [
+        {
+          "host": "local",
+          "protocol": "ollama",
+          "authModes": [
+            "local"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "local",
+          "baseUrlTmpl": "http://127.0.0.1:11434",
+          "envKeys": []
+        }
+      ],
+      "models": []
+    },
+    {
+      "company": "openai",
+      "humanLabel": "OpenAI",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v1",
+      "speaks": [
+        "openai-responses",
+        "openai-chat"
+      ],
+      "hosts": [
+        {
+          "host": "oauth-cli",
+          "protocol": "openai-responses",
+          "authModes": [
+            "host-session"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "host-subscription",
+          "baseUrlTmpl": "",
+          "envKeys": []
+        },
+        {
+          "host": "direct",
+          "protocol": "openai-chat",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://api.openai.com/v1",
+          "envKeys": [
+            "OPENAI_API_KEY"
+          ]
+        },
+        {
+          "host": "azure",
+          "protocol": "openai-chat",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "https://{resource}.openai.azure.com",
+          "envKeys": [
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_ENDPOINT"
+          ]
+        }
+      ],
+      "models": [
+        {
+          "id": "gpt-5-codex",
+          "humanLabel": "GPT-5 Codex",
+          "contextWindow": 400000,
+          "supportsTools": true,
+          "supportsJsonMode": true,
+          "hosts": [
+            "direct",
+            "azure"
+          ]
+        }
+      ]
+    },
+    {
+      "company": "stub",
+      "humanLabel": "Test Stub Endpoint",
+      "family": "model-endpoint",
+      "contractAbi": "model-endpoint/v1",
+      "speaks": [
+        "stub"
+      ],
+      "hosts": [
+        {
+          "host": "local",
+          "protocol": "stub",
+          "authModes": [
+            "local"
+          ],
+          "bringsOwnAuth": true,
+          "needsApiKey": false,
+          "costModel": "local",
+          "baseUrlTmpl": "http://127.0.0.1:0",
+          "envKeys": []
+        }
+      ],
+      "models": [
+        {
+          "id": "stub-model",
+          "humanLabel": "Stub Model",
+          "contextWindow": 8192,
+          "supportsTools": true,
+          "supportsJsonMode": true,
+          "hosts": [
+            "local"
+          ]
+        }
+      ]
+    }
+  ]
+}

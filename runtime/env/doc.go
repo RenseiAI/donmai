@@ -9,6 +9,6 @@
 // operator's interactive shell credential cannot leak into the agent's
 // subprocess.
 //
-// Source: ../agentfactory/packages/core/src/orchestrator/orchestrator.ts
+// Source: ../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts
 // (AGENT_ENV_BLOCKLIST) — port verbatim per F.1.1 §1.
 package env

@@ -32,5 +32,5 @@ func (m *Model) addInlineActivity(actType afclient.ActivityType, content string)
 		Content:   content,
 		Timestamp: time.Now().Format(time.RFC3339),
 	}
-	m.logViewer.Append(renderActivityLine(a, m.width))
+	m.logViewer.Append(renderActivityLine(a))
 }

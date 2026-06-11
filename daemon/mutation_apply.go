@@ -5,7 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
+
+	"github.com/RenseiAI/donmai/codesurvival"
+	"github.com/RenseiAI/donmai/internal/interview"
+	"github.com/RenseiAI/donmai/kgextract"
+	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runner/access"
 )
 
 // applyMutations is the daemon-side handler for the heartbeat response's
@@ -81,6 +88,10 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 		return d.applyProjectAddLocked(m)
 	case "project.remove":
 		return d.applyProjectRemoveLocked(m)
+	case "modelAccess.set":
+		return d.applyModelAccessSetLocked(m)
+	case "modelAccess.clear":
+		return d.applyModelAccessClearLocked(m)
 	default:
 		// Unknown op — newer platform than daemon. ACK as failed so the
 		// platform can stop re-queueing.
@@ -142,6 +153,118 @@ func (d *Daemon) applyProjectRemoveLocked(m PendingMutation) error {
 	// with the original (defensive against a later mutation racing the
 	// spawner snapshot via SetProjects).
 	d.config.Projects = append([]ProjectConfig(nil), filtered...)
+	return d.persistAndRefreshLocked()
+}
+
+// knownWorkloadKey reports whether a modelAccess.set workload key belongs to
+// the shared workload vocabulary: the agent work types (runner.AllWorkTypes),
+// the non-agent batch work types (code-survival-scan, kg-extraction), and the
+// mode-derived "interview" workload. The embedder derives the enforcement-time
+// lookup key from exactly these sources (explicit Workload | WorkType | Mode),
+// so a key outside the vocabulary can never match a session — the strict block
+// the operator thought they configured would be stored verbatim and silently
+// fall back to the Default block / platform ceiling at enforcement time.
+func knownWorkloadKey(key string) bool {
+	if runner.IsKnownWorkType(key) {
+		return true
+	}
+	switch key {
+	case codesurvival.WorkTypeCodeSurvivalScan,
+		kgextract.WorkTypeKGExtraction,
+		interview.InterviewRunMode:
+		return true
+	}
+	return false
+}
+
+// knownWorkloadKeys lists the full workload vocabulary for error messages.
+func knownWorkloadKeys() []string {
+	keys := append([]string(nil), runner.AllWorkTypes...)
+	return append(keys,
+		codesurvival.WorkTypeCodeSurvivalScan,
+		kgextract.WorkTypeKGExtraction,
+		interview.InterviewRunMode,
+	)
+}
+
+// applyModelAccessSetLocked writes (or overwrites) a per-machine /
+// per-workload model-access policy block into Config.ModelAccess
+// (P3 / ADR-2026-06-06 §4.2). It decodes {workload?, policy}:
+//   - workload == "" => write into .Default
+//   - workload != "" => write into .Workloads[workload]
+//
+// POLICY ONLY: only the AccessPolicy ({matrix, authOrder?}) crosses this
+// channel — never credentials (keys ride the separate snapshot socket,
+// §4.4). This step is pure plumbing: it STORES the block; enforcement
+// (ResolveMachineCell) stays in the rensei-tui S3 gate. Idempotent: a
+// repeated set with the same params overwrites to the same value.
+// Caller must hold d.mu (applyOneMutation acquires it).
+func (d *Daemon) applyModelAccessSetLocked(m PendingMutation) error {
+	var params struct {
+		Workload string              `json:"workload"`
+		Policy   access.AccessPolicy `json:"policy"`
+	}
+	if err := json.Unmarshal(m.Params, &params); err != nil {
+		return fmt.Errorf("decode params: %w", err)
+	}
+	// Reject (NACK) workload keys outside the shared vocabulary instead of
+	// storing them: a typo'd key never matches at enforcement time, so the
+	// "strict" block would silently fall back to the ceiling. Failing the
+	// mutation surfaces the typo platform-side via the failure ACK.
+	// modelAccess.clear stays unvalidated so legacy bad keys remain removable.
+	if params.Workload != "" && !knownWorkloadKey(params.Workload) {
+		return fmt.Errorf("unknown workload %q: not in the shared workload vocabulary (known keys: %s)",
+			params.Workload, strings.Join(knownWorkloadKeys(), ", "))
+	}
+
+	if d.config.ModelAccess == nil {
+		d.config.ModelAccess = &access.ModelAccessConfig{}
+	}
+	if params.Workload == "" {
+		d.config.ModelAccess.Default = params.Policy
+	} else {
+		if d.config.ModelAccess.Workloads == nil {
+			d.config.ModelAccess.Workloads = make(map[string]access.AccessPolicy)
+		}
+		d.config.ModelAccess.Workloads[params.Workload] = params.Policy
+	}
+	return d.persistAndRefreshLocked()
+}
+
+// applyModelAccessClearLocked removes a per-machine / per-workload
+// model-access policy block (P3 / ADR-2026-06-06 §4.2). It decodes
+// {workload}:
+//   - workload != "" => delete .Workloads[workload] (fall back to .Default,
+//     then to the platform org/project ceiling)
+//   - workload == "" => clear the entire ModelAccess block (revert to the
+//     nil-block identity: effective = platformAllowed)
+//
+// Idempotent: clear of an absent workload (or an already-nil block) is a
+// no-op success — it still persists so the ACK lifecycle and on-disk state
+// stay consistent, mirroring applyProjectRemoveLocked's no-op-success
+// contract. Caller must hold d.mu.
+func (d *Daemon) applyModelAccessClearLocked(m PendingMutation) error {
+	var params struct {
+		Workload string `json:"workload"`
+	}
+	if err := json.Unmarshal(m.Params, &params); err != nil {
+		return fmt.Errorf("decode params: %w", err)
+	}
+
+	if d.config.ModelAccess == nil {
+		// Nothing to clear — already at the nil-block identity. No-op success.
+		return nil
+	}
+	if params.Workload == "" {
+		// Clear the whole block — back to the nil-block identity.
+		d.config.ModelAccess = nil
+		return d.persistAndRefreshLocked()
+	}
+	if _, ok := d.config.ModelAccess.Workloads[params.Workload]; !ok {
+		// Idempotent — workload override not present, treat as success.
+		return nil
+	}
+	delete(d.config.ModelAccess.Workloads, params.Workload)
 	return d.persistAndRefreshLocked()
 }
 

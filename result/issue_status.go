@@ -1,6 +1,6 @@
 package result
 
-// Issue-tracker proxy calls (REN-1467).
+// Issue-tracker proxy calls.
 //
 // The platform exposes a generic issue-tracker proxy at
 // /api/issue-tracker-proxy that accepts worker bearer auth and forwards
@@ -126,7 +126,7 @@ func (p *Poster) CreateIssueComment(ctx context.Context, issueID, body string) e
 // success=false as the appropriate error type. Credentials are
 // re-resolved before every attempt so a daemon-side runtime-JWT refresh
 // between retries (e.g. after a 401 from an expired token) propagates
-// here — see SUP-1823.
+// here instead of replaying the expired token.
 func (p *Poster) proxyCall(ctx context.Context, body proxyRequest) error {
 	payload, err := json.Marshal(body)
 	if err != nil {

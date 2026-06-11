@@ -62,42 +62,41 @@ func expandHomePath(path string) string {
 }
 
 // newDaemonCmd constructs the `daemon` parent command. It holds no logic of
-// its own; it dispatches to subcommands that manage the local rensei-daemon.
+// its own; it dispatches to subcommands that manage the local donmai-daemon.
 // The factory parameter is the DaemonClient constructor; passing nil selects
 // the production default.
 //
-// hostVersion is the embedding binary's version string; passed through to
-// `daemon run` so the daemon's HTTP /api/daemon/status reports the running
-// binary's version (not the donmai daemon package's vendored
-// default). Empty falls back to the daemon package's own Version var.
-func newDaemonCmd(hostVersion string) *cobra.Command {
-	return newDaemonCmdWithFactory(defaultDaemonFactory, hostVersion)
+// cfg carries the embedding binary's config (HostBinaryVersion, BinaryName, etc.).
+func newDaemonCmd(cfg Config) *cobra.Command {
+	return newDaemonCmdWithFactory(defaultDaemonFactory, cfg)
 }
 
 // newDaemonCmdWithFactory is the injectable variant used in tests.
-func newDaemonCmdWithFactory(factory daemonClientFactory, hostVersion string) *cobra.Command {
+func newDaemonCmdWithFactory(factory daemonClientFactory, cfg Config) *cobra.Command {
+	hostVersion := cfg.HostBinaryVersion
+	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "daemon",
-		Short: "Manage the local rensei-daemon",
-		Long: "Manage the local rensei-daemon process that supervises agent session pools.\n\n" +
+		Short: "Manage the local donmai-daemon",
+		Long: "Manage the local donmai-daemon process that supervises agent session pools.\n\n" +
 			"The daemon replaces the per-workspace `donmai worker` / `donmai fleet` approach.\n" +
 			"Install once, configure once, and sessions run automatically for allowed projects.",
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newDaemonInstallCmd())
-	cmd.AddCommand(newDaemonUninstallCmd())
+	cmd.AddCommand(newDaemonInstallCmd(bin))
+	cmd.AddCommand(newDaemonUninstallCmd(bin))
 	cmd.AddCommand(newDaemonSetupCmd())
 	cmd.AddCommand(newDaemonRunCmd(hostVersion))
-	cmd.AddCommand(newDaemonStatusCmd(factory))
+	cmd.AddCommand(newDaemonStatusCmd(factory, bin))
 	cmd.AddCommand(newDaemonLogsCmd())
-	cmd.AddCommand(newDaemonDoctorCmd())
+	cmd.AddCommand(newDaemonDoctorCmd(bin))
 	cmd.AddCommand(newDaemonPauseCmd(factory))
 	cmd.AddCommand(newDaemonResumeCmd(factory))
 	cmd.AddCommand(newDaemonUpdateCmd(factory))
 	cmd.AddCommand(newDaemonDrainCmd(factory))
 	cmd.AddCommand(newDaemonStopCmd(factory))
-	cmd.AddCommand(newDaemonStatsCmd(factory))
+	cmd.AddCommand(newDaemonStatsCmd(factory, bin))
 	cmd.AddCommand(newDaemonEvictCmd(factory))
 	cmd.AddCommand(newDaemonSetCmd(factory))
 
@@ -106,7 +105,7 @@ func newDaemonCmdWithFactory(factory daemonClientFactory, hostVersion string) *c
 
 // ── install / uninstall ───────────────────────────────────────────────────────
 
-func newDaemonInstallCmd() *cobra.Command {
+func newDaemonInstallCmd(bin string) *cobra.Command {
 	var (
 		binPath            string // --bin-path overrides the host binary path resolved via os.Executable()
 		scopeUser          bool   // Linux systemd: --user  (user-scoped unit, default)
@@ -117,15 +116,15 @@ func newDaemonInstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install the daemon as a system service",
-		Long: "Register the af binary's `daemon run` subcommand as a launchd (macOS) or\n" +
+		Long: "Register the " + bin + " binary's `daemon run` subcommand as a launchd (macOS) or\n" +
 			"systemd (Linux) service so it starts automatically at login and survives\n" +
 			"reboots.\n\n" +
-			"This is implemented in-process — no subprocess shell-out (REN-1406).\n\n" +
+			"This is implemented in-process — no subprocess shell-out.\n\n" +
 			"macOS:\n" +
-			"  af daemon install [--bin-path /path/to/af]\n\n" +
+			"  " + bin + " daemon install [--bin-path /path/to/" + bin + "]\n\n" +
 			"Linux:\n" +
-			"  af daemon install --user    (user-scoped systemd unit, default)\n" +
-			"  af daemon install --system  (system-scoped systemd unit, requires sudo)",
+			"  " + bin + " daemon install --user    (user-scoped systemd unit, default)\n" +
+			"  " + bin + " daemon install --system  (system-scoped systemd unit, requires sudo)",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			scope := installer.ScopeUser
@@ -183,7 +182,7 @@ func newDaemonInstallCmd() *cobra.Command {
 
 			_, _ = fmt.Fprintln(out)
 			_, _ = fmt.Fprintln(out,
-				"The Go daemon runtime is now in-binary (REN-1408): the registered\n"+
+				"The Go daemon runtime is now in-binary: the registered\n"+
 					"service launches `daemon run` directly. Run `daemon status` to\n"+
 					"verify the HTTP control API once the service has started.")
 			return nil
@@ -200,7 +199,7 @@ func newDaemonInstallCmd() *cobra.Command {
 	return cmd
 }
 
-func newDaemonUninstallCmd() *cobra.Command {
+func newDaemonUninstallCmd(bin string) *cobra.Command {
 	var (
 		scopeUser          bool // Linux systemd: --user  (user-scoped unit, default)
 		scopeSystem        bool // Linux systemd: --system (system-scoped unit, requires root)
@@ -211,12 +210,12 @@ func newDaemonUninstallCmd() *cobra.Command {
 		Use:   "uninstall",
 		Short: "Uninstall the daemon system service",
 		Long: "Remove the launchd (macOS) or systemd (Linux) service registration.\n\n" +
-			"This is implemented in-process — no subprocess shell-out (REN-1406).\n\n" +
+			"This is implemented in-process — no subprocess shell-out.\n\n" +
 			"macOS:\n" +
-			"  af daemon uninstall\n\n" +
+			"  " + bin + " daemon uninstall\n\n" +
 			"Linux:\n" +
-			"  af daemon uninstall --user    (user-scoped systemd unit, default)\n" +
-			"  af daemon uninstall --system  (system-scoped systemd unit, requires sudo)",
+			"  " + bin + " daemon uninstall --user    (user-scoped systemd unit, default)\n" +
+			"  " + bin + " daemon uninstall --system  (system-scoped systemd unit, requires sudo)",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			scope := installer.ScopeUser
@@ -276,7 +275,7 @@ func newDaemonSetupCmd() *cobra.Command {
 		Short: "Interactive first-run wizard",
 		Long: "Run the interactive first-run setup wizard that captures machine identity, capacity,\n" +
 			"orchestrator config, project allowlist, and auto-update preferences.\n\n" +
-			"In-process Go implementation (REN-1408): the wizard reads stdin/stdout\n" +
+			"In-process Go implementation: the wizard reads stdin/stdout\n" +
 			"directly so prompts work correctly when stdin is a TTY.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -307,7 +306,7 @@ func newDaemonSetupCmd() *cobra.Command {
 
 // ── status ────────────────────────────────────────────────────────────────────
 
-func newDaemonStatusCmd(factory daemonClientFactory) *cobra.Command {
+func newDaemonStatusCmd(factory daemonClientFactory, bin string) *cobra.Command {
 	var (
 		port    int
 		host    string
@@ -332,7 +331,7 @@ func newDaemonStatusCmd(factory daemonClientFactory) *cobra.Command {
 			client := factory(cfg)
 			resp, err := client.GetStatus()
 			if err != nil {
-				return fmt.Errorf("daemon status: %w", err)
+				return daemonDownErr(bin, err)
 			}
 			out := cmd.OutOrStdout()
 			if jsonOut {
@@ -352,7 +351,7 @@ func newDaemonStatusCmd(factory daemonClientFactory) *cobra.Command {
 }
 
 // writeDaemonStatusTable renders a simple ANSI status block for `donmai daemon status`.
-// Uses plain ANSI (not tui-components primitives per issue note — those are REN-1331).
+// Uses plain ANSI (not tui-components primitives — those arrive with the shared theming pass).
 func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error {
 	statusColor := ansiColor(r.Status)
 	uptime := formatUptimeSeconds(r.UptimeSeconds)
@@ -499,7 +498,7 @@ func printLogLine(w io.Writer, line string, parseJSON bool) {
 
 // ── doctor ────────────────────────────────────────────────────────────────────
 
-func newDaemonDoctorCmd() *cobra.Command {
+func newDaemonDoctorCmd(bin string) *cobra.Command {
 	var (
 		jsonOut     bool
 		scopeUser   bool
@@ -510,7 +509,7 @@ func newDaemonDoctorCmd() *cobra.Command {
 		Use:   "doctor",
 		Short: "Run health checks on the local daemon setup",
 		Long: "Run a suite of health checks and report pass/warn/fail for each.\n\n" +
-			"This is implemented in-process (REN-1406): the command inspects the\n" +
+			"This is implemented in-process: the command inspects the\n" +
 			"installed launchd plist (macOS) or systemd unit (Linux) directly and\n" +
 			"reports whether the service is registered, active, and pointing at the\n" +
 			"current host binary.\n\n" +
@@ -555,7 +554,7 @@ func newDaemonDoctorCmd() *cobra.Command {
 				_, _ = fmt.Fprintln(out, report.Detail)
 			}
 			if !report.Installed {
-				return errors.New("service is not installed — run `daemon install`")
+				return fmt.Errorf("service is not installed — run `%s daemon install`", bin)
 			}
 			return nil
 		},
@@ -571,7 +570,7 @@ func newDaemonDoctorCmd() *cobra.Command {
 // resolveCurrentBinPath returns the absolute path of the currently running
 // executable, or "" if it cannot be resolved. Used by `daemon doctor` to
 // report binary-presence based on the actual Go binary the installer
-// would register (acceptance criterion REN-1406).
+// would register .
 func resolveCurrentBinPath() string {
 	exe, err := os.Executable()
 	if err != nil {
@@ -727,7 +726,7 @@ func newDaemonStopCmd(factory daemonClientFactory) *cobra.Command {
 
 // ── stats ─────────────────────────────────────────────────────────────────────
 
-func newDaemonStatsCmd(factory daemonClientFactory) *cobra.Command {
+func newDaemonStatsCmd(factory daemonClientFactory, bin string) *cobra.Command {
 	var (
 		port      int
 		host      string
@@ -754,7 +753,7 @@ func newDaemonStatsCmd(factory daemonClientFactory) *cobra.Command {
 			client := factory(cfg)
 			resp, err := client.GetStats(withPool, byMachine)
 			if err != nil {
-				return fmt.Errorf("daemon stats: %w", err)
+				return daemonDownErr(bin, err)
 			}
 			out := cmd.OutOrStdout()
 			if jsonOut {
@@ -851,7 +850,7 @@ type poolKey struct {
 //  2. Per-(repo, toolchain) breakdown table sorted by repo+toolchain.
 //
 // Simple ANSI rendering only — WorkareaPoolPanel from tui-components v0.2.0
-// is deferred to REN-1331.
+// is deferred to the shared tui-components theming pass.
 func writePoolStatsSection(w io.Writer, p *afclient.WorkareaPoolStats) error {
 	if _, err := fmt.Fprintln(w, "\n  Workarea pool:"); err != nil {
 		return fmt.Errorf("write pool header: %w", err)
@@ -947,7 +946,7 @@ func writePoolStatsSection(w io.Writer, p *afclient.WorkareaPoolStats) error {
 // ── evict ─────────────────────────────────────────────────────────────────────
 
 // newDaemonEvictCmd returns the `donmai daemon evict` command.
-// Usage: af daemon evict --repo <url> --older-than <duration>
+// Usage: donmai daemon evict --repo <url> --older-than <duration>
 func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 	var (
 		port      int
@@ -965,7 +964,7 @@ func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 			"created, if never acquired) more than --older-than ago are retired.\n" +
 			"In-use (acquired) members are not evicted.\n\n" +
 			"The daemon emits a Layer 6 hook event for each eviction; the correlation\n" +
-			"ID is printed so observability dashboards (REN-1313) can join it.",
+			"ID is printed so observability dashboards can join it.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if repoURL == "" {
@@ -1032,7 +1031,7 @@ var allowedCapacityKeys = map[string]struct{}{
 }
 
 // newDaemonSetCmd returns the `donmai daemon set` command.
-// Usage: af daemon set <capacity key> <N>
+// Usage: donmai daemon set <capacity key> <N>
 func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	var (
 		port    int
@@ -1232,7 +1231,6 @@ func padRight(s string, w int) string {
 
 // formatWorkerStat renders the "Worker:" row of `daemon stats`. Returns a
 // short description of the worker id with stub annotation when applicable.
-// (REN-1446.)
 func formatWorkerStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || r.WorkerID == "" {
 		return "(unregistered)"
@@ -1244,7 +1242,6 @@ func formatWorkerStat(r *afclient.DaemonStatsResponse) string {
 }
 
 // formatRegistrationStat renders the "Registration:" row of `daemon stats`.
-// (REN-1446.)
 func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || r.Registration == nil {
 		return "(unknown)"
@@ -1272,7 +1269,7 @@ func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 
 // formatAllowedProjectsStat renders the "Allowed projects:" row of
 // `daemon stats`. The output is the count followed by a comma-separated
-// list of repo URLs (truncated for very long lists). (REN-1446.)
+// list of repo URLs (truncated for very long lists).
 func formatAllowedProjectsStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || len(r.AllowedProjects) == 0 {
 		return "0 (none allowed — run `donmai project allow <repo-url>`)"

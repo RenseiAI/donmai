@@ -31,6 +31,12 @@ type Server struct {
 	// servers built with NewServer get a default scan path automatically.
 	// Tests inject a fake by assigning the field directly before serving.
 	kitReg kitRegistryDoer
+
+	// agentReg is the in-process AgentCard registry serving
+	// /api/daemon/agents* (GO-3 / Wave 5). Lazily constructed via
+	// agentCardRegistryOrDefault using the daemon's sessionDetailStore.
+	// Tests inject a fake by assigning the field directly before serving.
+	agentReg agentCardRegistry
 }
 
 // NewServer builds an HTTP server for d. The handler is registered but the
@@ -110,7 +116,7 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet, s.handlePoolStats))
 	mux.HandleFunc("/api/daemon/pool/evict", s.method(http.MethodPost, s.handlePoolEvict))
 	mux.HandleFunc("/api/daemon/sessions", s.handleSessions) // GET=list, POST=accept
-	// Per-session detail (REN-1461 / F.2.8). Spawned `donmai agent run`
+	// Per-session detail. Spawned `donmai agent run`
 	// processes fetch their full QueuedWork shape from this endpoint.
 	// The path-pattern dispatch is custom because the stdlib mux only
 	// supports prefix matching pre-Go 1.22 in this codebase.
@@ -136,6 +142,10 @@ func (s *Server) register(mux *http.ServeMux) {
 	// GET /api/daemon/capabilities returns the provides[] set detected
 	// at startup and sent to POST /api/workers/register.
 	mux.HandleFunc("/api/daemon/capabilities", s.method(http.MethodGet, s.handleCapabilities))
+	// agents (GO-3 / Wave 5) — AgentCard stubs synthesised from active
+	// session-detail store entries. GET list + GET detail + 404 on miss.
+	mux.HandleFunc("/api/daemon/agents", s.method(http.MethodGet, s.handleListAgents))
+	mux.HandleFunc("/api/daemon/agents/", s.handleGetAgent) // trailing slash → prefix matcher
 	mux.HandleFunc("/healthz", s.method(http.MethodGet, s.handleHealthz))
 }
 
@@ -328,7 +338,7 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 	if s.daemon.opts.EvictHandler == nil {
 		writeJSON(w, http.StatusNotImplemented, &afclient.EvictPoolResponse{
 			Evicted: 0,
-			Message: "pool eviction handler not wired (REN-1280 WorkareaProvider)",
+			Message: "pool eviction handler not wired (WorkareaProvider wiring pending)",
 		})
 		return
 	}
@@ -354,7 +364,7 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 // to recover its full QueuedWork shape. Localhost-only (the daemon
 // binds to 127.0.0.1); 404s on unknown ids; 405s on non-GET methods.
 //
-// (REN-1461 / F.2.8 — daemon wire-up.)
+// (F.2.8 — daemon wire-up.)
 func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -554,7 +564,7 @@ func safeOrchestratorURL(c *Config) string {
 }
 
 // safeProjectRepos returns the list of repository URLs in the project
-// allowlist for inclusion in DaemonStatsResponse.AllowedProjects. (REN-1446.)
+// allowlist for inclusion in DaemonStatsResponse.AllowedProjects.
 func safeProjectRepos(c *Config) []string {
 	if c == nil || len(c.Projects) == 0 {
 		return nil
@@ -568,7 +578,7 @@ func safeProjectRepos(c *Config) []string {
 
 // buildRegistrationStats summarises the daemon's registration / heartbeat /
 // poll subsystem state for DaemonStatsResponse. Returns nil when no
-// heartbeat has been started (e.g. SkipRegistration mode). (REN-1446.)
+// heartbeat has been started (e.g. SkipRegistration mode).
 func buildRegistrationStats(d *Daemon) *afclient.DaemonRegistrationStats {
 	stats := &afclient.DaemonRegistrationStats{}
 	if d == nil {

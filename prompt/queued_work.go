@@ -17,8 +17,8 @@ import (
 // callers may pass values they have available and leave the rest empty.
 //
 // Source: legacy TS QueuedWork
-// (../agentfactory/packages/server/src/work-queue.ts) and the live
-// Redis session payload observed during F.2.7 verification (REN2-1).
+// (../donmai-libraries/packages/server/src/work-queue.ts) and the live
+// Redis session payload observed during F.2.7 verification.
 type QueuedWork struct {
 	// SessionID is the Rensei session UUID (e.g.
 	// "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c"). It uniquely identifies
@@ -30,7 +30,7 @@ type QueuedWork struct {
 	IssueID string `json:"issueId,omitempty"`
 
 	// IssueIdentifier is the human-readable Linear identifier
-	// (e.g. "REN-1457"). Used in the user prompt header so the agent
+	// (e.g. "ENG-1457"). Used in the user prompt header so the agent
 	// knows which issue it is working on.
 	IssueIdentifier string `json:"issueIdentifier,omitempty"`
 
@@ -92,7 +92,7 @@ type QueuedWork struct {
 	// user prompt when present.
 	ParentContext string `json:"parentContext,omitempty"`
 
-	// ── Phase 2 stage-driven SDLC fields (REN-1485 / REN-1487) ────────
+	// ── Phase 2 stage-driven SDLC fields ────────
 	//
 	// These fields are populated when the platform's
 	// `agent.dispatch_stage` action queues the work (the new
@@ -178,7 +178,7 @@ type QueuedWork struct {
 	// its own defaultDisallowedTools() baseline — it never replaces the
 	// baseline — so the runner's static policy remains the floor.
 	//
-	// This is the Option B wire field for SUP-1840 Layer 3 (cred-surface
+	// This is the Option B wire field for Layer 3 (cred-surface
 	// restriction). The platform stamps it via stampDisallowedTools() in
 	// credential-injection.ts. Round-trips opaquely through Redis JSON;
 	// absent/null/empty is safe and backward-compatible (omitempty).
@@ -197,10 +197,10 @@ type QueuedWork struct {
 	// Wire shape: "memoryBlock" (camelCase, omitempty). Threaded through
 	// every wire hop (PollWorkItem, SessionDetail, detailToQueuedWork) so
 	// Go's strict JSON decoder never drops the platform's emit — the v0.9.3
-	// SystemPromptOverride wire-gap precedent (SUP-1840 silent-drop hazard).
+	// SystemPromptOverride wire-gap precedent (silent-drop hazard).
 	MemoryBlock string `json:"memoryBlock,omitempty"`
 
-	// ── Interactive run-mode fields (REN-1563 / Wave 2 donmai wire-plumbing) ─
+	// ── Interactive run-mode fields (Wave 2 donmai wire-plumbing) ─
 	//
 	// Mode is the run-mode discriminant. "" or absent = normal headless
 	// run. "interview" = interactive interview loop (non-terminating;

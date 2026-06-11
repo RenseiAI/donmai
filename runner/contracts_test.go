@@ -5,7 +5,7 @@ import "testing"
 // TestGetCompletionContract_KnownTypes asserts the contract lookup
 // returns the expected required fields for the canonical work types.
 // Pinned values mirror the per-workType contract from
-// completion-contracts.ts after the REN-1467 update (development /
+// completion-contracts.ts after the WORK_RESULT update (development /
 // inflight / coordination / inflight-coordination now require
 // FieldWorkResult).
 func TestGetCompletionContract_KnownTypes(t *testing.T) {
@@ -84,7 +84,7 @@ func TestGetCompletionContract_UnknownReturnsFalse(t *testing.T) {
 
 // TestRequiresWorkResult_DevAndCoord asserts development /
 // inflight / coordination / inflight-coordination + qa + acceptance
-// all require WORK_RESULT — the REN-1467 acceptance criterion this
+// all require WORK_RESULT — the acceptance criterion this
 // guards.
 func TestRequiresWorkResult_DevAndCoord(t *testing.T) {
 	requiresMarker := []string{

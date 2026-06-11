@@ -66,7 +66,7 @@ func runLinearCmd(t *testing.T, _ string, args ...string) (string, error) {
 	// Build a fresh linear command tree. The DataSource factory is nil for
 	// these tests — they exercise the env-var path (setTestBaseURL +
 	// LINEAR_API_KEY) which short-circuits before the DataSource branch.
-	root := newLinearCmd(nil)
+	root := newLinearCmd(nil, Config{})
 	root.SilenceErrors = true
 
 	// Capture stdout.
@@ -151,19 +151,19 @@ func (h *multiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // ─── get-issue ────────────────────────────────────────────────────────────────
 
 func TestLinearGetIssue(t *testing.T) {
-	issueJSON := issueNodeJSON("issue-1", "REN-1", "Test Issue", "In Progress", "team-1", "REN", "Rensei")
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Test Issue", "In Progress", "team-1", "ENG", "Engineering")
 	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 	})
 
-	out, err := runLinearCmd(t, "", "get-issue", "REN-1")
+	out, err := runLinearCmd(t, "", "get-issue", "ENG-1")
 	if err != nil {
 		t.Fatalf("get-issue failed: %v\nout: %s", err, out)
 	}
 
 	result := decodeJSON(t, out)
-	if result["identifier"] != "REN-1" {
-		t.Errorf("identifier = %v, want REN-1", result["identifier"])
+	if result["identifier"] != "ENG-1" {
+		t.Errorf("identifier = %v, want ENG-1", result["identifier"])
 	}
 	if result["title"] != "Test Issue" {
 		t.Errorf("title = %v, want Test Issue", result["title"])
@@ -182,7 +182,7 @@ func TestLinearGetIssueNotFound(t *testing.T) {
 		writeLinearGQLData(w, `{"issue":null}`)
 	})
 
-	_, err := runLinearCmd(t, "", "get-issue", "REN-999")
+	_, err := runLinearCmd(t, "", "get-issue", "ENG-999")
 	if err == nil {
 		t.Fatal("expected error for not-found issue, got nil")
 	}
@@ -191,8 +191,8 @@ func TestLinearGetIssueNotFound(t *testing.T) {
 // ─── create-issue ─────────────────────────────────────────────────────────────
 
 func TestLinearCreateIssue(t *testing.T) {
-	issueJSON := issueNodeJSON("issue-new", "REN-100", "New Issue", "Backlog", "team-1", "REN", "Rensei")
-	teamJSON := `{"teams":{"nodes":[{"id":"team-1","key":"REN","name":"Rensei"}]}}`
+	issueJSON := issueNodeJSON("issue-new", "ENG-100", "New Issue", "Backlog", "team-1", "ENG", "Engineering")
+	teamJSON := `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}]}}`
 
 	handler := &multiHandler{
 		responses: map[string]string{
@@ -205,15 +205,15 @@ func TestLinearCreateIssue(t *testing.T) {
 
 	out, err := runLinearCmd(t, "", "create-issue",
 		"--title", "New Issue",
-		"--team", "Rensei",
+		"--team", "Engineering",
 	)
 	if err != nil {
 		t.Fatalf("create-issue failed: %v\nout: %s", err, out)
 	}
 
 	result := decodeJSON(t, out)
-	if result["identifier"] != "REN-100" {
-		t.Errorf("identifier = %v, want REN-100", result["identifier"])
+	if result["identifier"] != "ENG-100" {
+		t.Errorf("identifier = %v, want ENG-100", result["identifier"])
 	}
 	if result["title"] != "New Issue" {
 		t.Errorf("title = %v, want New Issue", result["title"])
@@ -222,7 +222,7 @@ func TestLinearCreateIssue(t *testing.T) {
 
 func TestLinearCreateIssueMissingTitle(t *testing.T) {
 	setupLinearTest(t, func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := runLinearCmd(t, "", "create-issue", "--team", "Rensei")
+	_, err := runLinearCmd(t, "", "create-issue", "--team", "Engineering")
 	if err == nil {
 		t.Fatal("expected error when --title is missing")
 	}
@@ -239,10 +239,10 @@ func TestLinearCreateIssueMissingTeam(t *testing.T) {
 }
 
 func TestLinearCreateIssueFromEnvTeam(t *testing.T) {
-	t.Setenv("LINEAR_TEAM_NAME", "Rensei")
+	t.Setenv("LINEAR_TEAM_NAME", "Engineering")
 
-	issueJSON := issueNodeJSON("issue-env", "REN-101", "Env Team Issue", "Backlog", "team-1", "REN", "Rensei")
-	teamJSON := `{"teams":{"nodes":[{"id":"team-1","key":"REN","name":"Rensei"}]}}`
+	issueJSON := issueNodeJSON("issue-env", "ENG-101", "Env Team Issue", "Backlog", "team-1", "ENG", "Engineering")
+	teamJSON := `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}]}}`
 
 	handler := &multiHandler{
 		responses: map[string]string{
@@ -257,8 +257,8 @@ func TestLinearCreateIssueFromEnvTeam(t *testing.T) {
 		t.Fatalf("create-issue via LINEAR_TEAM_NAME failed: %v\nout: %s", err, out)
 	}
 	result := decodeJSON(t, out)
-	if result["identifier"] != "REN-101" {
-		t.Errorf("identifier = %v, want REN-101", result["identifier"])
+	if result["identifier"] != "ENG-101" {
+		t.Errorf("identifier = %v, want ENG-101", result["identifier"])
 	}
 }
 
@@ -275,8 +275,8 @@ func TestLinearCreateIssueDescriptionFile(t *testing.T) {
 	}
 	_ = tmpFile.Close()
 
-	issueJSON := issueNodeJSON("issue-file", "REN-102", "File Desc Issue", "Backlog", "team-1", "REN", "Rensei")
-	teamJSON := `{"teams":{"nodes":[{"id":"team-1","key":"REN","name":"Rensei"}]}}`
+	issueJSON := issueNodeJSON("issue-file", "ENG-102", "File Desc Issue", "Backlog", "team-1", "ENG", "Engineering")
+	teamJSON := `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}]}}`
 
 	handler := &multiHandler{
 		responses: map[string]string{
@@ -289,7 +289,7 @@ func TestLinearCreateIssueDescriptionFile(t *testing.T) {
 
 	out, err := runLinearCmd(t, "", "create-issue",
 		"--title", "File Desc Issue",
-		"--team", "Rensei",
+		"--team", "Engineering",
 		"--description-file", tmpFile.Name(),
 	)
 	if err != nil {
@@ -297,15 +297,15 @@ func TestLinearCreateIssueDescriptionFile(t *testing.T) {
 	}
 
 	result := decodeJSON(t, out)
-	if result["identifier"] != "REN-102" {
-		t.Errorf("identifier = %v, want REN-102", result["identifier"])
+	if result["identifier"] != "ENG-102" {
+		t.Errorf("identifier = %v, want ENG-102", result["identifier"])
 	}
 }
 
 // ─── update-issue ─────────────────────────────────────────────────────────────
 
 func TestLinearUpdateIssue(t *testing.T) {
-	issueJSON := issueNodeJSON("issue-1", "REN-1", "Updated Issue", "Finished", "team-1", "REN", "Rensei")
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Updated Issue", "Finished", "team-1", "ENG", "Engineering")
 
 	handler := &multiHandler{
 		responses: map[string]string{
@@ -317,7 +317,7 @@ func TestLinearUpdateIssue(t *testing.T) {
 
 	setupLinearTest(t, handler.ServeHTTP)
 
-	out, err := runLinearCmd(t, "", "update-issue", "REN-1", "--state", "Finished")
+	out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--state", "Finished")
 	if err != nil {
 		t.Fatalf("update-issue failed: %v\nout: %s", err, out)
 	}
@@ -341,7 +341,7 @@ func TestLinearListComments(t *testing.T) {
 		writeLinearGQLData(w, commentsData)
 	})
 
-	out, err := runLinearCmd(t, "", "list-comments", "REN-1")
+	out, err := runLinearCmd(t, "", "list-comments", "ENG-1")
 	if err != nil {
 		t.Fatalf("list-comments failed: %v\nout: %s", err, out)
 	}
@@ -369,7 +369,7 @@ func TestLinearCreateComment(t *testing.T) {
 		writeLinearGQLData(w, commentData)
 	})
 
-	out, err := runLinearCmd(t, "", "create-comment", "REN-1", "--body", "My comment")
+	out, err := runLinearCmd(t, "", "create-comment", "ENG-1", "--body", "My comment")
 	if err != nil {
 		t.Fatalf("create-comment failed: %v\nout: %s", err, out)
 	}
@@ -385,7 +385,7 @@ func TestLinearCreateComment(t *testing.T) {
 
 func TestLinearCreateCommentMissingBody(t *testing.T) {
 	setupLinearTest(t, func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := runLinearCmd(t, "", "create-comment", "REN-1")
+	_, err := runLinearCmd(t, "", "create-comment", "ENG-1")
 	if err == nil {
 		t.Fatal("expected error when --body is missing")
 	}
@@ -411,7 +411,7 @@ func TestLinearCreateCommentBodyFile(t *testing.T) {
 		writeLinearGQLData(w, commentData)
 	})
 
-	out, err := runLinearCmd(t, "", "create-comment", "REN-1", "--body-file", tmpFile.Name())
+	out, err := runLinearCmd(t, "", "create-comment", "ENG-1", "--body-file", tmpFile.Name())
 	if err != nil {
 		t.Fatalf("create-comment with --body-file failed: %v\nout: %s", err, out)
 	}
@@ -425,8 +425,8 @@ func TestLinearCreateCommentBodyFile(t *testing.T) {
 // ─── add-relation ─────────────────────────────────────────────────────────────
 
 func TestLinearAddRelation(t *testing.T) {
-	issue1 := issueNodeJSON("issue-1", "REN-1", "Issue 1", "Backlog", "team-1", "REN", "Rensei")
-	issue2 := issueNodeJSON("issue-2", "REN-2", "Issue 2", "Backlog", "team-1", "REN", "Rensei")
+	issue1 := issueNodeJSON("issue-1", "ENG-1", "Issue 1", "Backlog", "team-1", "ENG", "Engineering")
+	issue2 := issueNodeJSON("issue-2", "ENG-2", "Issue 2", "Backlog", "team-1", "ENG", "Engineering")
 	var callCount int
 
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
@@ -444,10 +444,10 @@ func TestLinearAddRelation(t *testing.T) {
 			}
 			return
 		}
-		writeLinearGQLData(w, `{"issueRelationCreate":{"success":true,"issueRelation":{"id":"rel-1","type":"blocks","relatedIssue":{"id":"issue-2","identifier":"REN-2"},"createdAt":"2025-01-01T00:00:00Z"}}}`)
+		writeLinearGQLData(w, `{"issueRelationCreate":{"success":true,"issueRelation":{"id":"rel-1","type":"blocks","relatedIssue":{"id":"issue-2","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"}}}`)
 	})
 
-	out, err := runLinearCmd(t, "", "add-relation", "REN-1", "REN-2", "--type", "blocks")
+	out, err := runLinearCmd(t, "", "add-relation", "ENG-1", "ENG-2", "--type", "blocks")
 	if err != nil {
 		t.Fatalf("add-relation failed: %v\nout: %s", err, out)
 	}
@@ -463,7 +463,7 @@ func TestLinearAddRelation(t *testing.T) {
 
 func TestLinearAddRelationInvalidType(t *testing.T) {
 	setupLinearTest(t, func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := runLinearCmd(t, "", "add-relation", "REN-1", "REN-2", "--type", "invalid")
+	_, err := runLinearCmd(t, "", "add-relation", "ENG-1", "ENG-2", "--type", "invalid")
 	if err == nil {
 		t.Fatal("expected error for invalid relation type")
 	}
@@ -473,21 +473,21 @@ func TestLinearAddRelationInvalidType(t *testing.T) {
 
 func TestLinearListRelations(t *testing.T) {
 	relData := `{"issue":{"relations":{"nodes":[
-		{"id":"rel-1","type":"blocks","relatedIssue":{"id":"issue-2","identifier":"REN-2"},"createdAt":"2025-01-01T00:00:00Z"}
+		{"id":"rel-1","type":"blocks","relatedIssue":{"id":"issue-2","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"}
 	]},"inverseRelations":{"nodes":[]}}}`
 
 	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeLinearGQLData(w, relData)
 	})
 
-	out, err := runLinearCmd(t, "", "list-relations", "REN-1")
+	out, err := runLinearCmd(t, "", "list-relations", "ENG-1")
 	if err != nil {
 		t.Fatalf("list-relations failed: %v\nout: %s", err, out)
 	}
 
 	result := decodeJSON(t, out)
-	if result["issueId"] != "REN-1" {
-		t.Errorf("issueId = %v, want REN-1", result["issueId"])
+	if result["issueId"] != "ENG-1" {
+		t.Errorf("issueId = %v, want ENG-1", result["issueId"])
 	}
 	relations, ok := result["relations"].([]any)
 	if !ok || len(relations) != 1 {
@@ -497,8 +497,8 @@ func TestLinearListRelations(t *testing.T) {
 	if rel["type"] != "blocks" {
 		t.Errorf("type = %v, want blocks", rel["type"])
 	}
-	if rel["relatedIssue"] != "REN-2" {
-		t.Errorf("relatedIssue = %v, want REN-2", rel["relatedIssue"])
+	if rel["relatedIssue"] != "ENG-2" {
+		t.Errorf("relatedIssue = %v, want ENG-2", rel["relatedIssue"])
 	}
 }
 
@@ -526,8 +526,8 @@ func TestLinearRemoveRelation(t *testing.T) {
 // ─── list-sub-issues ──────────────────────────────────────────────────────────
 
 func TestLinearListSubIssues(t *testing.T) {
-	parent := issueNodeJSON("parent-1", "REN-1", "Parent", "In Progress", "team-1", "REN", "Rensei")
-	child := issueNodeJSON("child-1", "REN-10", "Child", "Backlog", "team-1", "REN", "Rensei")
+	parent := issueNodeJSON("parent-1", "ENG-1", "Parent", "In Progress", "team-1", "ENG", "Engineering")
+	child := issueNodeJSON("child-1", "ENG-10", "Child", "Backlog", "team-1", "ENG", "Engineering")
 
 	var callCount int
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
@@ -544,31 +544,31 @@ func TestLinearListSubIssues(t *testing.T) {
 		writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, child))
 	})
 
-	out, err := runLinearCmd(t, "", "list-sub-issues", "REN-1")
+	out, err := runLinearCmd(t, "", "list-sub-issues", "ENG-1")
 	if err != nil {
 		t.Fatalf("list-sub-issues failed: %v\nout: %s", err, out)
 	}
 
 	result := decodeJSON(t, out)
-	if result["parentIdentifier"] != "REN-1" {
-		t.Errorf("parentIdentifier = %v, want REN-1", result["parentIdentifier"])
+	if result["parentIdentifier"] != "ENG-1" {
+		t.Errorf("parentIdentifier = %v, want ENG-1", result["parentIdentifier"])
 	}
 	if result["subIssueCount"] != float64(1) {
 		t.Errorf("subIssueCount = %v, want 1", result["subIssueCount"])
 	}
 	subs := result["subIssues"].([]any)
 	sub := subs[0].(map[string]any)
-	if sub["identifier"] != "REN-10" {
-		t.Errorf("sub[0].identifier = %v, want REN-10", sub["identifier"])
+	if sub["identifier"] != "ENG-10" {
+		t.Errorf("sub[0].identifier = %v, want ENG-10", sub["identifier"])
 	}
 }
 
 // ─── list-sub-issue-statuses ──────────────────────────────────────────────────
 
 func TestLinearListSubIssueStatuses(t *testing.T) {
-	parent := issueNodeJSON("parent-1", "REN-1", "Parent", "In Progress", "team-1", "REN", "Rensei")
-	child1 := issueNodeJSON("child-1", "REN-10", "Child Done", "Finished", "team-1", "REN", "Rensei")
-	child2 := issueNodeJSON("child-2", "REN-11", "Child Todo", "Backlog", "team-1", "REN", "Rensei")
+	parent := issueNodeJSON("parent-1", "ENG-1", "Parent", "In Progress", "team-1", "ENG", "Engineering")
+	child1 := issueNodeJSON("child-1", "ENG-10", "Child Done", "Finished", "team-1", "ENG", "Engineering")
+	child2 := issueNodeJSON("child-2", "ENG-11", "Child Todo", "Backlog", "team-1", "ENG", "Engineering")
 
 	var callCount int
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
@@ -585,7 +585,7 @@ func TestLinearListSubIssueStatuses(t *testing.T) {
 		writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s,%s]}}`, child1, child2))
 	})
 
-	out, err := runLinearCmd(t, "", "list-sub-issue-statuses", "REN-1")
+	out, err := runLinearCmd(t, "", "list-sub-issue-statuses", "ENG-1")
 	if err != nil {
 		t.Fatalf("list-sub-issue-statuses failed: %v\nout: %s", err, out)
 	}
@@ -603,8 +603,8 @@ func TestLinearListSubIssueStatuses(t *testing.T) {
 // ─── update-sub-issue ─────────────────────────────────────────────────────────
 
 func TestLinearUpdateSubIssue(t *testing.T) {
-	issueJSON := issueNodeJSON("issue-1", "REN-1", "Sub Issue", "In Progress", "team-1", "REN", "Rensei")
-	finishedJSON := issueNodeJSON("issue-1", "REN-1", "Sub Issue", "Finished", "team-1", "REN", "Rensei")
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Sub Issue", "In Progress", "team-1", "ENG", "Engineering")
+	finishedJSON := issueNodeJSON("issue-1", "ENG-1", "Sub Issue", "Finished", "team-1", "ENG", "Engineering")
 
 	var callCount int
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
@@ -630,7 +630,7 @@ func TestLinearUpdateSubIssue(t *testing.T) {
 		}
 	})
 
-	out, err := runLinearCmd(t, "", "update-sub-issue", "REN-1", "--state", "Finished")
+	out, err := runLinearCmd(t, "", "update-sub-issue", "ENG-1", "--state", "Finished")
 	if err != nil {
 		t.Fatalf("update-sub-issue failed: %v\nout: %s", err, out)
 	}
@@ -643,7 +643,7 @@ func TestLinearUpdateSubIssue(t *testing.T) {
 
 func TestLinearUpdateSubIssueMissingArgs(t *testing.T) {
 	setupLinearTest(t, func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := runLinearCmd(t, "", "update-sub-issue", "REN-1")
+	_, err := runLinearCmd(t, "", "update-sub-issue", "ENG-1")
 	if err == nil {
 		t.Fatal("expected error when neither --state nor --comment is provided")
 	}
@@ -653,8 +653,8 @@ func TestLinearUpdateSubIssueMissingArgs(t *testing.T) {
 
 func TestLinearListIssues(t *testing.T) {
 	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
-	issue1 := issueNodeJSON("issue-1", "REN-1", "First", "Backlog", "team-1", "REN", "Rensei")
-	issue2 := issueNodeJSON("issue-2", "REN-2", "Second", "Started", "team-1", "REN", "Rensei")
+	issue1 := issueNodeJSON("issue-1", "ENG-1", "First", "Backlog", "team-1", "ENG", "Engineering")
+	issue2 := issueNodeJSON("issue-2", "ENG-2", "Second", "Started", "team-1", "ENG", "Engineering")
 
 	handler := &multiHandler{
 		responses: map[string]string{
@@ -679,7 +679,7 @@ func TestLinearListIssues(t *testing.T) {
 // ─── check-blocked ────────────────────────────────────────────────────────────
 
 func TestLinearCheckBlockedNotBlocked(t *testing.T) {
-	issueJSON := issueNodeJSON("issue-1", "REN-1", "Issue", "Backlog", "team-1", "REN", "Rensei")
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
 
 	handler := &multiHandler{
 		responses: map[string]string{
@@ -690,7 +690,7 @@ func TestLinearCheckBlockedNotBlocked(t *testing.T) {
 
 	setupLinearTest(t, handler.ServeHTTP)
 
-	out, err := runLinearCmd(t, "", "check-blocked", "REN-1")
+	out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
 	if err != nil {
 		t.Fatalf("check-blocked failed: %v\nout: %s", err, out)
 	}
@@ -706,12 +706,12 @@ func TestLinearCheckBlockedNotBlocked(t *testing.T) {
 }
 
 func TestLinearCheckBlockedIsBlocked(t *testing.T) {
-	mainIssue := issueNodeJSON("issue-1", "REN-1", "Issue", "Backlog", "team-1", "REN", "Rensei")
-	blockerIssue := issueNodeJSON("blocker-1", "REN-99", "Blocker", "In Progress", "team-1", "REN", "Rensei")
+	mainIssue := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	blockerIssue := issueNodeJSON("blocker-1", "ENG-99", "Blocker", "In Progress", "team-1", "ENG", "Engineering")
 
-	// inverse relation: REN-99 blocks REN-1
+	// inverse relation: ENG-99 blocks ENG-1
 	relData := `{"issue":{"relations":{"nodes":[]},"inverseRelations":{"nodes":[
-		{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"REN-99"},"createdAt":"2025-01-01T00:00:00Z"}
+		{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}
 	]}}}`
 
 	var callCount int
@@ -733,7 +733,7 @@ func TestLinearCheckBlockedIsBlocked(t *testing.T) {
 		writeLinearGQLData(w, relData)
 	})
 
-	out, err := runLinearCmd(t, "", "check-blocked", "REN-1")
+	out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
 	if err != nil {
 		t.Fatalf("check-blocked failed: %v\nout: %s", err, out)
 	}
@@ -747,8 +747,8 @@ func TestLinearCheckBlockedIsBlocked(t *testing.T) {
 		t.Fatalf("blockedBy = %v, want 1 entry", result["blockedBy"])
 	}
 	b := blockedBy[0].(map[string]any)
-	if b["identifier"] != "REN-99" {
-		t.Errorf("blocker identifier = %v, want REN-99", b["identifier"])
+	if b["identifier"] != "ENG-99" {
+		t.Errorf("blocker identifier = %v, want ENG-99", b["identifier"])
 	}
 }
 
@@ -756,7 +756,7 @@ func TestLinearCheckBlockedIsBlocked(t *testing.T) {
 
 func TestLinearListBacklogIssues(t *testing.T) {
 	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
-	issue := issueNodeJSON("issue-1", "REN-1", "Backlog Issue", "Backlog", "team-1", "REN", "Rensei")
+	issue := issueNodeJSON("issue-1", "ENG-1", "Backlog Issue", "Backlog", "team-1", "ENG", "Engineering")
 
 	handler := &multiHandler{
 		responses: map[string]string{
@@ -777,8 +777,8 @@ func TestLinearListBacklogIssues(t *testing.T) {
 		t.Fatalf("got %d issues, want 1", len(arr))
 	}
 	item := arr[0].(map[string]any)
-	if item["identifier"] != "REN-1" {
-		t.Errorf("identifier = %v, want REN-1", item["identifier"])
+	if item["identifier"] != "ENG-1" {
+		t.Errorf("identifier = %v, want ENG-1", item["identifier"])
 	}
 }
 
@@ -794,7 +794,7 @@ func TestLinearListBacklogIssuesMissingProject(t *testing.T) {
 
 func TestLinearListUnblockedBacklog(t *testing.T) {
 	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
-	issue1 := issueNodeJSON("issue-1", "REN-1", "Unblocked Issue", "Backlog", "team-1", "REN", "Rensei")
+	issue1 := issueNodeJSON("issue-1", "ENG-1", "Unblocked Issue", "Backlog", "team-1", "ENG", "Engineering")
 
 	handler := &multiHandler{
 		responses: map[string]string{
@@ -840,7 +840,7 @@ func TestLinearProxyModeViaDataSource(t *testing.T) {
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		// Mimic Linear's GraphQL envelope for a successful get-issue.
-		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"REN-1","title":"Hello","state":{"name":"Backlog"},"team":{"name":"Rensei"},"project":null,"labels":{"nodes":[]}}}`)
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"ENG-1","title":"Hello","state":{"name":"Backlog"},"team":{"name":"Engineering"},"project":null,"labels":{"nodes":[]}}}`)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -851,12 +851,12 @@ func TestLinearProxyModeViaDataSource(t *testing.T) {
 		return afclient.NewAuthenticatedClient(srv.URL, "rsk_test_token")
 	}
 
-	root := newLinearCmd(ds)
+	root := newLinearCmd(ds, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
-	root.SetArgs([]string{"get-issue", "REN-1"})
+	root.SetArgs([]string{"get-issue", "ENG-1"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("proxy-mode get-issue failed: %v\nout: %s", err, buf.String())
 	}
@@ -869,8 +869,7 @@ func TestLinearProxyModeViaDataSource(t *testing.T) {
 	}
 }
 
-// TestLinearWorkerAuthTokenProxyMode verifies the in-box cloud path (REN-1554 /
-// GAP 1): with no LINEAR_API_KEY and no authenticated DataSource, but with the
+// TestLinearWorkerAuthTokenProxyMode verifies the in-box cloud path (GAP 1): with no LINEAR_API_KEY and no authenticated DataSource, but with the
 // runner-exported WORKER_AUTH_TOKEN (runtime JWT) + DONMAI_API_URL, the linear
 // subcommand proxies GraphQL through /api/cli/linear/graphql with a
 // `Bearer <jwt>` auth header.
@@ -884,7 +883,7 @@ func TestLinearWorkerAuthTokenProxyMode(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
-		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"REN-1","title":"Hello","state":{"name":"Backlog"},"team":{"name":"Rensei"},"project":null,"labels":{"nodes":[]}}}`)
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"ENG-1","title":"Hello","state":{"name":"Backlog"},"team":{"name":"Engineering"},"project":null,"labels":{"nodes":[]}}}`)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -894,12 +893,12 @@ func TestLinearWorkerAuthTokenProxyMode(t *testing.T) {
 	t.Setenv("WORKER_AUTH_TOKEN", jwt)
 	t.Setenv("DONMAI_API_URL", srv.URL)
 
-	root := newLinearCmd(nil)
+	root := newLinearCmd(nil, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
-	root.SetArgs([]string{"get-issue", "REN-1"})
+	root.SetArgs([]string{"get-issue", "ENG-1"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("worker-auth get-issue failed: %v\nout: %s", err, buf.String())
 	}
@@ -925,7 +924,7 @@ func TestLinearWorkerAuthTokenRequiresBaseURL(t *testing.T) {
 	setTestBaseURL("")
 	t.Cleanup(func() { setTestBaseURL("") })
 
-	if _, err := newLinearClient(nil); err == nil {
+	if _, err := newLinearClient(nil, "donmai"); err == nil {
 		t.Fatal("expected error when WORKER_AUTH_TOKEN is set but no platform URL, got nil")
 	}
 }
@@ -941,7 +940,7 @@ func TestLinearEnvWinsOverDataSource(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
-		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"REN-1","title":"X","state":{"name":"Backlog"},"team":{"name":"Rensei"},"project":null,"labels":{"nodes":[]}}}`)
+		writeLinearGQLData(w, `{"issue":{"id":"id-1","identifier":"ENG-1","title":"X","state":{"name":"Backlog"},"team":{"name":"Engineering"},"project":null,"labels":{"nodes":[]}}}`)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -955,12 +954,12 @@ func TestLinearEnvWinsOverDataSource(t *testing.T) {
 		return afclient.NewAuthenticatedClient("https://platform.example.com", "rsk_should_not_be_used")
 	}
 
-	root := newLinearCmd(ds)
+	root := newLinearCmd(ds, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
-	root.SetArgs([]string{"get-issue", "REN-1"})
+	root.SetArgs([]string{"get-issue", "ENG-1"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("env-precedence get-issue failed: %v\nout: %s", err, buf.String())
 	}
@@ -982,12 +981,12 @@ func TestLinearNoAPIKey(t *testing.T) {
 
 	// Pass a nil DataSource factory — exercises path 3 (no env, no
 	// authenticated DataSource → friendly error).
-	root := newLinearCmd(nil)
+	root := newLinearCmd(nil, Config{})
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
 	root.SetErr(&buf)
-	root.SetArgs([]string{"get-issue", "REN-1"})
+	root.SetArgs([]string{"get-issue", "ENG-1"})
 	err := root.Execute()
 	if err == nil {
 		t.Fatal("expected error when neither env key nor authenticated DataSource is available")
@@ -1000,9 +999,9 @@ func TestLinearNoAPIKey(t *testing.T) {
 // ─── create-blocker ───────────────────────────────────────────────────────────
 
 func TestLinearCreateBlocker(t *testing.T) {
-	sourceIssue := issueNodeJSON("source-1", "REN-50", "Source Issue", "In Progress", "team-1", "REN", "Rensei")
-	blockerIssue := issueNodeJSON("blocker-1", "REN-99", "Blocker Issue", "Icebox", "team-1", "REN", "Rensei")
-	teamJSON := `{"teams":{"nodes":[{"id":"team-1","key":"REN","name":"Rensei"}]}}`
+	sourceIssue := issueNodeJSON("source-1", "ENG-50", "Source Issue", "In Progress", "team-1", "ENG", "Engineering")
+	blockerIssue := issueNodeJSON("blocker-1", "ENG-99", "Blocker Issue", "Icebox", "team-1", "ENG", "Engineering")
+	teamJSON := `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}]}}`
 
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -1027,7 +1026,7 @@ func TestLinearCreateBlocker(t *testing.T) {
 		case strings.Contains(req.Query, "CreateIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issueCreate":{"success":true,"issue":%s}}`, blockerIssue))
 		case strings.Contains(req.Query, "CreateRelation"):
-			writeLinearGQLData(w, `{"issueRelationCreate":{"success":true,"issueRelation":{"id":"rel-1","type":"blocks","relatedIssue":{"id":"source-1","identifier":"REN-50"},"createdAt":"2025-01-01T00:00:00Z"}}}`)
+			writeLinearGQLData(w, `{"issueRelationCreate":{"success":true,"issueRelation":{"id":"rel-1","type":"blocks","relatedIssue":{"id":"source-1","identifier":"ENG-50"},"createdAt":"2025-01-01T00:00:00Z"}}}`)
 		case strings.Contains(req.Query, "CreateComment"):
 			writeLinearGQLData(w, `{"commentCreate":{"success":true,"comment":{"id":"c-1","body":"blocker created","createdAt":"2025-01-01T00:00:00Z"}}}`)
 		default:
@@ -1035,17 +1034,17 @@ func TestLinearCreateBlocker(t *testing.T) {
 		}
 	})
 
-	out, err := runLinearCmd(t, "", "create-blocker", "REN-50", "--title", "Blocker Issue")
+	out, err := runLinearCmd(t, "", "create-blocker", "ENG-50", "--title", "Blocker Issue")
 	if err != nil {
 		t.Fatalf("create-blocker failed: %v\nout: %s", err, out)
 	}
 
 	result := decodeJSON(t, out)
-	if result["identifier"] != "REN-99" {
-		t.Errorf("identifier = %v, want REN-99", result["identifier"])
+	if result["identifier"] != "ENG-99" {
+		t.Errorf("identifier = %v, want ENG-99", result["identifier"])
 	}
-	if result["sourceIssue"] != "REN-50" {
-		t.Errorf("sourceIssue = %v, want REN-50", result["sourceIssue"])
+	if result["sourceIssue"] != "ENG-50" {
+		t.Errorf("sourceIssue = %v, want ENG-50", result["sourceIssue"])
 	}
 	if result["relation"] != "blocks" {
 		t.Errorf("relation = %v, want blocks", result["relation"])
@@ -1057,7 +1056,7 @@ func TestLinearCreateBlocker(t *testing.T) {
 
 func TestLinearCreateBlockerMissingTitle(t *testing.T) {
 	setupLinearTest(t, func(_ http.ResponseWriter, _ *http.Request) {})
-	_, err := runLinearCmd(t, "", "create-blocker", "REN-50")
+	_, err := runLinearCmd(t, "", "create-blocker", "ENG-50")
 	if err == nil {
 		t.Fatal("expected error when --title is missing")
 	}

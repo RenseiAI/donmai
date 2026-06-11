@@ -47,7 +47,7 @@ case "$archive" in
     # GoReleaser's signs[] block expects a ${artifact}.sig file to publish
     # alongside the archive. Codesign embeds the signature inside the
     # binary so there's no separate detached sig — write a placeholder
-    # noting that linux/non-darwin archives are unsigned (REN-1412 v0.3.6).
+    # noting that linux/non-darwin archives are unsigned (v0.3.6).
     {
       echo "Signature: none"
       echo "Reason: non-darwin archive — no codesigning required"
@@ -129,7 +129,7 @@ done < <(find "$tmpdir" -type f -perm -111 -print0)
 
 # Repack with the original name now that the binaries are signed + notarized.
 # Capture absolute path before `cd "$tmpdir"` because $archive is relative
-# to goreleaser's cwd, not to $tmpdir (REN-1412 v0.3.5 bug fix).
+# to goreleaser's cwd, not to $tmpdir (v0.3.5 bug fix).
 archive_abs="$(cd "$(dirname "$archive")" && pwd)/$(basename "$archive")"
 (cd "$tmpdir" && tar -czf "$archive_abs.signed" .)
 mv "$archive_abs.signed" "$archive_abs"
@@ -143,7 +143,7 @@ while IFS= read -r -d '' bin; do
   echo "sign-and-notarize: verifying $bin"
   # Write codesign output to a file first; piping `... | tee | grep -q`
   # combined with `set -o pipefail` triggers a spurious failure because
-  # grep -q sends SIGPIPE to tee on first match (REN-1412 v0.3.5 bug fix).
+  # grep -q sends SIGPIPE to tee on first match (v0.3.5 bug fix).
   codesign -dvvv "$bin" > "$verify_log" 2>&1
   if ! grep -qE '^Authority=Developer ID Application:' "$verify_log"; then
     echo "::error::repacked archive binary $bin is missing Developer ID Application signature"

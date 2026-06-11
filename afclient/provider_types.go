@@ -1,6 +1,6 @@
 // Package afclient provider_types.go — wire types for the daemon's
 // /api/daemon/providers* operator surface. The contract is locked in
-// rensei-architecture/ADR-2026-05-07-daemon-http-control-api.md (D4) and
+// donmai-architecture/ADR-2026-05-07-daemon-http-control-api.md (D4) and
 // matches the eight Provider Family vocabulary from
 // 002-provider-base-contract.md.
 package afclient

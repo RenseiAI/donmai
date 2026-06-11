@@ -16,7 +16,7 @@ import (
 func TestFleetParentHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd := newFleetCmd(func() afclient.DataSource { return afclient.NewMockClient() })
+	cmd := newFleetCmd(func() afclient.DataSource { return afclient.NewMockClient() }, Config{})
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -133,7 +133,7 @@ func TestFleetStatusNoPIDFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("AGENTFACTORY_FLEET_PID_FILE", filepath.Join(dir, "fleet.pids"))
 
-	cmd := newFleetStatusCmd()
+	cmd := newFleetStatusCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -158,7 +158,7 @@ func TestFleetStatusWithPIDs(t *testing.T) {
 		t.Fatalf("write pids: %v", err)
 	}
 
-	cmd := newFleetStatusCmd()
+	cmd := newFleetStatusCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)

@@ -11,7 +11,7 @@ import (
 // RenderShow writes the detail view for a single provider. Capability
 // flags are rendered via plain ANSI key=value pairs. The real
 // CapabilityChip primitive from tui-components v0.2.0 is pending
-// REN-1331.
+// the shared theming pass.
 func RenderShow(out io.Writer, p *afclient.Provider, noColor bool) error {
 	if p == nil {
 		return fmt.Errorf("provider is nil")

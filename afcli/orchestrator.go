@@ -12,7 +12,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient/repoconfig"
 )
 
-// orchestratorFlags holds the parsed flag values for `af orchestrator`.
+// orchestratorFlags holds the parsed flag values for `donmai orchestrator`.
 // Factored out so unit tests can inspect defaults without executing RunE.
 type orchestratorFlags struct {
 	project   string
@@ -26,9 +26,9 @@ type orchestratorFlags struct {
 	quiet     bool
 }
 
-// newOrchestratorCmd constructs the `af orchestrator` command.
+// newOrchestratorCmd constructs the `donmai orchestrator` command.
 //
-// Flags match the legacy `pnpm af-orchestrator` entrypoint:
+// Flags match the legacy `pnpm donmai-orchestrator` entrypoint:
 //
 //	--project    Filter issues by Linear project name
 //	--single     Process exactly one issue by ID / identifier
@@ -36,7 +36,8 @@ type orchestratorFlags struct {
 //	--dry-run    Print what would be dispatched without spawning agents
 //	--repo       Git remote URL pattern to validate against origin
 //	--templates  Custom workflow template directory path
-func newOrchestratorCmd() *cobra.Command {
+func newOrchestratorCmd(cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
 	flags := &orchestratorFlags{}
 
 	cmd := &cobra.Command{
@@ -52,19 +53,19 @@ Environment:
 
 Examples:
   # Process up to 3 backlog issues from a project
-  af orchestrator --project MyProject
+  ` + bin + ` orchestrator --project MyProject
 
   # Process a specific issue
-  af orchestrator --single REN-42
+  ` + bin + ` orchestrator --single ENG-42
 
   # Preview what would be dispatched without running
-  af orchestrator --project MyProject --dry-run
+  ` + bin + ` orchestrator --project MyProject --dry-run
 
   # Restrict to a specific git repository
-  af orchestrator --project MyProject --repo github.com/org/repo
+  ` + bin + ` orchestrator --project MyProject --repo github.com/org/repo
 
   # Use custom workflow templates
-  af orchestrator --project MyProject --templates .donmai/templates`,
+  ` + bin + ` orchestrator --project MyProject --templates .donmai/templates`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runOrchestrator(cmd, flags)
@@ -123,7 +124,7 @@ func runOrchestrator(_ *cobra.Command, flags *orchestratorFlags) error {
 
 	// Banner — mirrors the TS orchestrator output.
 	if !flags.quiet {
-		_, _ = fmt.Fprintf(os.Stdout, "AgentFactory Orchestrator\n")
+		_, _ = fmt.Fprintf(os.Stdout, "Donmai Orchestrator\n")
 		_, _ = fmt.Fprintf(os.Stdout, "=========================\n")
 		projectLabel := flags.project
 		if projectLabel == "" {

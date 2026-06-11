@@ -227,7 +227,7 @@ func (r *Runner) dispatchInterview(
 }
 
 // runInterviewLoop drives the non-terminating park-and-inject interview
-// loop (REN-1563). It REPLACES the one-shot consumeEvents → drainMemoryInjects
+// loop. It REPLACES the one-shot consumeEvents → drainMemoryInjects
 // → steering → backstop → runPostSession path used by headless runs; the
 // shared setup (spawn, env, worktree, kit, state.json, heartbeat, activity)
 // has already run in runLoop before this is called.

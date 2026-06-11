@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
@@ -237,11 +237,11 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 	}
 }
 
-// TestRunLoop_HeartbeatBodyIncludesIssueID is the REN-1465 regression:
+// TestRunLoop_HeartbeatBodyIncludesIssueID is the heartbeat-issue-id regression:
 // the runner must source heartbeat IssueID from prompt.QueuedWork.IssueID
 // (populated by the daemon's poll handler) so the platform's
 // /api/sessions/<id>/lock-refresh handler accepts the request. Before
-// REN-1465 the runner sourced IssueID from a never-populated
+// the fix the runner sourced IssueID from a never-populated
 // IssueLockID field, producing {"workerId":"...","issueId":""} on the
 // wire and a 400 from the platform on every tick.
 //
@@ -324,7 +324,7 @@ func TestRunLoop_HeartbeatBodyIncludesIssueID(t *testing.T) {
 	// Use queuedWorkBase + override IssueID so we can pin the expected
 	// value. The base helper sets IssueID to "issue-uuid-<identifier>",
 	// but we want a stable UUID-shaped value that mirrors the live wire.
-	base := queuedWorkBase("REN-1465")
+	base := queuedWorkBase("ENG-1465")
 	base.IssueID = wantIssueID
 	qw := QueuedWork{
 		QueuedWork:  base,
@@ -359,7 +359,7 @@ func TestRunLoop_HeartbeatBodyIncludesIssueID(t *testing.T) {
 			t.Errorf("body[%d]: workerId empty (full=%+v)", i, b)
 		}
 		if b.IssueID == "" {
-			t.Errorf("body[%d]: issueId empty — REN-1465 regression (full=%+v)", i, b)
+			t.Errorf("body[%d]: issueId empty — ENG-1465 regression (full=%+v)", i, b)
 		}
 		if b.IssueID != wantIssueID {
 			t.Errorf("body[%d]: issueId = %q; want %q", i, b.IssueID, wantIssueID)
@@ -390,6 +390,304 @@ func TestObserveEvent_ScansWorkResultMarker(t *testing.T) {
 	}
 }
 
+// TestScanBlocked_DetectsDeclineMarkers verifies the structural
+// blocked-agent signal: scanBlocked recognises both the
+// "WORK_RESULT:blocked" verdict form and the "AGENT_BLOCKED: <reason>"
+// reason form (on a line of their own, as agents are instructed to emit
+// them), captures the reason, and does NOT false-positive on ordinary
+// text, a passing verdict, or a mid-sentence quote of the marker.
+func TestScanBlocked_DetectsDeclineMarkers(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		text       string
+		wantOK     bool
+		wantReason string
+	}{
+		{"work-result-blocked", "WORK_RESULT:blocked", true, ""},
+		{"work-result-blocked-final-line", "Here is my summary.\nWORK_RESULT:blocked", true, ""},
+		{"work-result-blocked-indented", "  WORK_RESULT:blocked", true, ""},
+		{"work-result-blocked-comment", "<!-- WORK_RESULT:blocked -->", true, ""},
+		{"agent-blocked-reason", "AGENT_BLOCKED: spec is ambiguous, no acceptance criteria", true, "spec is ambiguous, no acceptance criteria"},
+		{"agent-blocked-reason-final-line", "Some narrative.\nAGENT_BLOCKED: spec ambiguous", true, "spec ambiguous"},
+		{"agent-blocked-reason-trailing-newline", "AGENT_BLOCKED: missing repo access\nmore output", true, "missing repo access"},
+		{"agent-blocked-reason-comment", "<!-- AGENT_BLOCKED: missing repo access -->", true, "missing repo access"},
+		{"passed-not-blocked", "WORK_RESULT:passed", false, ""},
+		{"failed-not-blocked", "WORK_RESULT:failed", false, ""},
+		{"no-marker", "I am working on the task now", false, ""},
+		// False-positive guards: the markers must NOT fire when merely
+		// quoted/discussed mid-sentence in a narrative turn. These two
+		// strings come from the adversarial probe and previously matched.
+		{"agent-blocked-quoted-midsentence", "I would print AGENT_BLOCKED: <reason> if I could not proceed, but I can.", false, ""},
+		{"work-result-blocked-quoted-midsentence", "I'd emit WORK_RESULT: blocked. It isn't, so here is the code.", false, ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reason, ok := scanBlocked(tc.text)
+			if ok != tc.wantOK {
+				t.Fatalf("scanBlocked(%q) ok = %v; want %v", tc.text, ok, tc.wantOK)
+			}
+			if reason != tc.wantReason {
+				t.Errorf("scanBlocked(%q) reason = %q; want %q", tc.text, reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestScanBlocked_DoesNotShadowWorkResult guards the regex split: a
+// "WORK_RESULT:blocked" line is a blocked signal but must NOT be parsed as
+// a passed/failed/unknown QA verdict by scanWorkResult (which drives the
+// Linear status transition). Keeping them separate prevents a deliberate
+// decline from accidentally transitioning the issue.
+func TestScanBlocked_DoesNotShadowWorkResult(t *testing.T) {
+	t.Parallel()
+	if got := scanWorkResult("WORK_RESULT:blocked"); got != "" {
+		t.Errorf("scanWorkResult(blocked) = %q; want \"\" (blocked is not a QA verdict)", got)
+	}
+	if _, ok := scanBlocked("WORK_RESULT:blocked"); !ok {
+		t.Error("scanBlocked(blocked) = false; want true")
+	}
+}
+
+// TestClassifyBlocked_ForksOutcome exercises the classification fork: a
+// blocked observation with no PR becomes FailureAgentBlocked; a blocked
+// observation that nonetheless produced a PR is NOT blocked (the work
+// landed); a non-blocked observation is untouched.
+func TestClassifyBlocked_ForksOutcome(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		obs         streamObservation
+		startPR     string
+		wantBlocked bool
+		wantMode    string
+		wantErrSub  string
+	}{
+		{
+			name:        "blocked-no-pr-with-reason",
+			obs:         streamObservation{blocked: true, blockedReason: "spec ambiguous"},
+			wantBlocked: true,
+			wantMode:    FailureAgentBlocked,
+			wantErrSub:  "spec ambiguous",
+		},
+		{
+			name:        "blocked-no-pr-no-reason",
+			obs:         streamObservation{blocked: true},
+			wantBlocked: true,
+			wantMode:    FailureAgentBlocked,
+			wantErrSub:  "blocked",
+		},
+		{
+			name:        "blocked-but-pr-produced-not-blocked",
+			obs:         streamObservation{blocked: true, blockedReason: "x"},
+			startPR:     "https://github.com/o/r/pull/1",
+			wantBlocked: false,
+			wantMode:    "",
+		},
+		{
+			name:        "not-blocked-untouched",
+			obs:         streamObservation{blocked: false},
+			wantBlocked: false,
+			wantMode:    "",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			res := &Result{}
+			res.PullRequestURL = tt.startPR
+			got := classifyBlocked(res, tt.obs)
+			if got != tt.wantBlocked {
+				t.Fatalf("classifyBlocked = %v; want %v", got, tt.wantBlocked)
+			}
+			if res.FailureMode != tt.wantMode {
+				t.Errorf("FailureMode = %q; want %q", res.FailureMode, tt.wantMode)
+			}
+			if tt.wantBlocked {
+				if res.Status != "failed" {
+					t.Errorf("Status = %q; want failed", res.Status)
+				}
+				if tt.wantErrSub != "" && !strings.Contains(res.Error, tt.wantErrSub) {
+					t.Errorf("Error = %q; want substring %q", res.Error, tt.wantErrSub)
+				}
+			}
+		})
+	}
+}
+
+// TestObserveEvent_SetsBlockedFlag confirms the AssistantTextEvent branch
+// of observeEvent records the blocked flag + reason on the observation so
+// the post-stream classifier can fork to FailureAgentBlocked.
+func TestObserveEvent_SetsBlockedFlag(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	h.runner.observeEvent(
+		agent.AssistantTextEvent{Text: "AGENT_BLOCKED: no acceptance criteria on the issue"},
+		obs, t.TempDir(), QueuedWork{},
+	)
+	if !obs.blocked {
+		t.Fatal("observeEvent did not set obs.blocked")
+	}
+	if obs.blockedReason != "no acceptance criteria on the issue" {
+		t.Errorf("obs.blockedReason = %q; want captured reason", obs.blockedReason)
+	}
+}
+
+// TestObserveEvent_CapturesLastAssistantText confirms the
+// AssistantTextEvent branch tracks the most recent non-empty assistant
+// message (the codex-path summary fallback) and ignores whitespace-only
+// frames.
+func TestObserveEvent_CapturesLastAssistantText(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	wt := t.TempDir()
+	for _, text := range []string{"first message", "  \n\t", "final message <!-- WORK_RESULT:passed -->"} {
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+	}
+	if want := "final message <!-- WORK_RESULT:passed -->"; obs.lastAssistantText != want {
+		t.Errorf("obs.lastAssistantText = %q; want %q", obs.lastAssistantText, want)
+	}
+	if obs.workResult != "passed" {
+		t.Errorf("obs.workResult = %q; want passed", obs.workResult)
+	}
+}
+
+// TestObserveEvent_MarkerInPenultimateMessage pins the agy-shaped stream:
+// the WORK_RESULT marker arrives as a standalone message BEFORE the final
+// assistant message. The scan covers every assistant message (latest
+// marker wins; a later marker-less message never resets the verdict), so
+// the verdict and the final-message summary both survive. The platform's
+// prompt contract still documents marker-on-the-final-message — this is
+// tolerance, not a contract change.
+func TestObserveEvent_MarkerInPenultimateMessage(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	obs := &streamObservation{}
+	wt := t.TempDir()
+	for _, text := range []string{
+		"research synthesis complete",
+		"<!-- WORK_RESULT:passed -->",
+		"Here is the final report body.",
+	} {
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+	}
+	if obs.workResult != "passed" {
+		t.Errorf("obs.workResult = %q; want passed (penultimate-message marker dropped)", obs.workResult)
+	}
+	if want := "Here is the final report body."; obs.lastAssistantText != want {
+		t.Errorf("obs.lastAssistantText = %q; want %q", obs.lastAssistantText, want)
+	}
+}
+
+// TestApplyTo_SummaryStamping pins the terminal-summary semantics:
+//
+//   - terminal message present → it IS the summary, and it LAST-wins so a
+//     resume turn after a background-poll wakeup restamps the TRUE final
+//     assistant message instead of keeping the stale pre-wakeup text
+//     (2026-06-10 rehearsal 3, claude wakeup path);
+//   - terminal message absent (codex turn/completed carries no text) →
+//     fall back to the latest assistant text observed on the stream so
+//     the WORK_RESULT marker still reaches the platform's exit event;
+//   - a partial stream (no terminal event) never clobbers an existing
+//     summary but does fill an empty one.
+func TestApplyTo_SummaryStamping(t *testing.T) {
+	t.Parallel()
+
+	terminal := func(msg string) *agent.ResultEvent {
+		return &agent.ResultEvent{Success: true, Message: msg}
+	}
+
+	tests := []struct {
+		name string
+		obs  []streamObservation
+		want string
+	}{
+		{
+			name: "terminal message wins",
+			obs: []streamObservation{
+				{terminalEvent: terminal("final answer"), lastAssistantText: "narration"},
+			},
+			want: "final answer",
+		},
+		{
+			name: "codex: terminal without message falls back to last assistant text",
+			obs: []streamObservation{
+				{terminalEvent: terminal(""), lastAssistantText: "QA verdict <!-- WORK_RESULT:passed -->"},
+			},
+			want: "QA verdict <!-- WORK_RESULT:passed -->",
+		},
+		{
+			name: "wakeup restamps post-wakeup terminal message (last-wins)",
+			obs: []streamObservation{
+				{terminalEvent: terminal("stale pre-wakeup text")},
+				{terminalEvent: terminal("true final message <!-- WORK_RESULT:passed -->")},
+			},
+			want: "true final message <!-- WORK_RESULT:passed -->",
+		},
+		{
+			name: "codex wakeup restamps post-wakeup assistant text",
+			obs: []streamObservation{
+				{terminalEvent: terminal(""), lastAssistantText: "stale pre-wakeup text"},
+				{terminalEvent: terminal(""), lastAssistantText: "true final message"},
+			},
+			want: "true final message",
+		},
+		{
+			name: "partial resume stream keeps existing summary",
+			obs: []streamObservation{
+				{terminalEvent: terminal("final answer")},
+				{lastAssistantText: "mid-turn narration, stream cut"},
+			},
+			want: "final answer",
+		},
+		{
+			name: "partial stream fills empty summary",
+			obs: []streamObservation{
+				{lastAssistantText: "only narration before crash"},
+			},
+			want: "only narration before crash",
+		},
+		{
+			name: "empty observation leaves summary alone",
+			obs: []streamObservation{
+				{terminalEvent: terminal("final answer")},
+				{},
+			},
+			want: "final answer",
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			res := &Result{}
+			for _, o := range tc.obs {
+				o.applyTo(res, agent.ProviderClaude)
+			}
+			if res.Summary != tc.want {
+				t.Errorf("Summary = %q; want %q", res.Summary, tc.want)
+			}
+		})
+	}
+}
+
+// TestShouldBackstop_SkipsBlocked verifies a blocked outcome never
+// triggers the empty-branch backstop — a deliberate decline has no work
+// to commit and an auto-PR would misrepresent the refusal.
+func TestShouldBackstop_SkipsBlocked(t *testing.T) {
+	t.Parallel()
+	res := &Result{}
+	res.FailureMode = FailureAgentBlocked
+	if shouldBackstop(res) {
+		t.Error("shouldBackstop(FailureAgentBlocked) = true; want false")
+	}
+}
+
 // TestDefaultMCPServers_EmitsHTTPEntryPerSession pins the A2A per-session
 // MCP wire-up: when QueuedWork has PlatformURL + AuthToken + SessionID,
 // defaultMCPServers emits a single HTTP entry pointing at the platform's
@@ -407,8 +705,11 @@ func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
 		t.Fatalf("len(servers)=%d, want 1", len(servers))
 	}
 	got := servers[0]
-	if got.Name != "rensei-platform" {
-		t.Errorf("name=%q, want rensei-platform", got.Name)
+	// Name is brand-derived (statehome.Brand()+"-platform"): OSS default brand
+	// "donmai" -> "donmai-platform"; the closed rensei binary (brand "rensei")
+	// renders "rensei-platform". This parallel test uses the default brand.
+	if got.Name != "donmai-platform" {
+		t.Errorf("name=%q, want donmai-platform", got.Name)
 	}
 	if got.Type != "http" {
 		t.Errorf("type=%q, want http", got.Type)
@@ -511,9 +812,8 @@ func TestEnvToMap_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestBuildSessionEnv_PopulatesStandardKeys confirms DONMAI_* + LINEAR_* +
-// legacy AGENTFACTORY_* keys all land on the per-session env during the
-// one-release backward-compat window.
+// TestBuildSessionEnv_PopulatesStandardKeys confirms DONMAI_* + LINEAR_* keys
+// all land on the per-session env.
 func TestBuildSessionEnv_PopulatesStandardKeys(t *testing.T) {
 	qw := QueuedWork{
 		QueuedWork:  queuedWorkBase("REN-ENV-1"),
@@ -523,20 +823,14 @@ func TestBuildSessionEnv_PopulatesStandardKeys(t *testing.T) {
 	}
 	envOut := buildSessionEnv(qw)
 	for _, key := range []string{
-		// New canonical names.
 		"DONMAI_SESSION_ID",
 		"DONMAI_PROJECT",
 		"DONMAI_ORG_ID",
 		"DONMAI_API_URL",
-		// Legacy aliases retained for one-release compat.
-		"AGENTFACTORY_SESSION_ID",
 		"LINEAR_SESSION_ID",
 		"LINEAR_ISSUE_ID",
 		"LINEAR_ISSUE_IDENTIFIER",
 		"LINEAR_WORK_TYPE",
-		"AGENTFACTORY_PROJECT",
-		"AGENTFACTORY_ORG_ID",
-		"AGENTFACTORY_API_URL",
 		"WORKER_AUTH_TOKEN",
 	} {
 		if envOut[key] == "" {

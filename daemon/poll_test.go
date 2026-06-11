@@ -288,7 +288,7 @@ func TestPollResponse_DecodesLiveWireShape(t *testing.T) {
 		"work": [{
 			"sessionId": "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c",
 			"issueId": "08f26531-f5d2-49dc-b412-b42cef0cbffa",
-			"issueIdentifier": "REN2-1",
+			"issueIdentifier": "DEV-1",
 			"priority": 4,
 			"queuedAt": 1777658441780,
 			"workType": "research",
@@ -432,7 +432,7 @@ func withCapturedSlog(t *testing.T) (*bytes.Buffer, func()) {
 // the daemon's allowlist has a matching entry, SessionDetail.repository
 // MUST be the entry's GitHub URL so `git clone` succeeds. Before this
 // fix the runner received "smoke-alpha" and failed with
-// "fatal: repository 'smoke-alpha' does not exist" (REN-1463 / REN-1464).
+// "fatal: repository 'smoke-alpha' does not exist".
 func TestPollItemToSessionDetail_ResolvesProjectNameToRepoURL(t *testing.T) {
 	projects := []ProjectConfig{{
 		ID:         "smoke-alpha",
@@ -443,7 +443,7 @@ func TestPollItemToSessionDetail_ResolvesProjectNameToRepoURL(t *testing.T) {
 		ProjectName: "smoke-alpha",
 	}
 
-	detail := pollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
+	detail := PollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
 
 	if got, want := detail.Repository, "https://github.com/RenseiAI/rensei-smokes-alpha"; got != want {
 		t.Errorf("Repository = %q, want %q", got, want)
@@ -481,7 +481,7 @@ func TestPollItemToSessionDetail_FallsBackOnNoAllowlistMatch(t *testing.T) {
 		ProjectName: "smoke-charlie", // not in allowlist
 	}
 
-	detail := pollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
+	detail := PollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
 
 	if got, want := detail.Repository, "smoke-charlie"; got != want {
 		t.Errorf("Repository = %q, want %q (fallback to projectName)", got, want)
@@ -511,7 +511,7 @@ func TestPollItemToSessionDetail_EmptyProjectName(t *testing.T) {
 	}}
 	item := PollWorkItem{SessionID: "sess-3"}
 
-	detail := pollItemToSessionDetail(item, projects, "", "", "")
+	detail := PollItemToSessionDetail(item, projects, "", "", "")
 
 	if detail.Repository != "" {
 		t.Errorf("Repository = %q, want empty", detail.Repository)
@@ -539,7 +539,7 @@ func TestPollItemToSessionDetail_RepositoryURLOnWireMatchesAllowlist(t *testing.
 		Repository:  "https://github.com/RenseiAI/rensei-smokes-alpha",
 	}
 
-	detail := pollItemToSessionDetail(item, projects, "", "", "")
+	detail := PollItemToSessionDetail(item, projects, "", "", "")
 
 	if got, want := detail.Repository, "https://github.com/RenseiAI/rensei-smokes-alpha"; got != want {
 		t.Errorf("Repository = %q, want %q", got, want)
@@ -564,7 +564,7 @@ func TestPollItemToSessionSpec_ResolvesProjectName(t *testing.T) {
 		Ref:         "main",
 	}
 
-	spec := pollItemToSessionSpec(item, projects)
+	spec := PollItemToSessionSpec(item, projects)
 
 	if got, want := spec.Repository, "https://github.com/RenseiAI/rensei-smokes-alpha"; got != want {
 		t.Errorf("Repository = %q, want %q", got, want)
@@ -574,6 +574,81 @@ func TestPollItemToSessionSpec_ResolvesProjectName(t *testing.T) {
 	}
 	if spec.Ref != "main" {
 		t.Errorf("Ref = %q", spec.Ref)
+	}
+}
+
+// TestPollItemToSessionSpec_ProjectNameFromAllowlist asserts that
+// PollItemToSessionSpec populates spec.ProjectName with the matched
+// ProjectConfig.ID when an allowlist entry is found, and leaves it
+// empty when no entry matches. This is a table-driven extension of the
+// existing TestPollItemToSessionSpec_ResolvesProjectName to cover the
+// new A1/A2 field semantics.
+func TestPollItemToSessionSpec_ProjectNameFromAllowlist(t *testing.T) {
+	projects := []ProjectConfig{
+		{ID: "smoke-alpha", Repository: "https://github.com/acme/alpha"},
+		{ID: "smoke-beta", Repository: "https://github.com/acme/beta"},
+	}
+
+	cases := []struct {
+		name            string
+		item            PollWorkItem
+		wantProjectName string
+		wantRepository  string
+	}{
+		{
+			name: "matched by project name slug",
+			item: PollWorkItem{
+				SessionID:   "sess-a",
+				ProjectName: "smoke-alpha",
+				Ref:         "main",
+			},
+			wantProjectName: "smoke-alpha",
+			wantRepository:  "https://github.com/acme/alpha",
+		},
+		{
+			name: "matched by repository URL",
+			item: PollWorkItem{
+				SessionID:  "sess-b",
+				Repository: "https://github.com/acme/beta",
+				Ref:        "main",
+			},
+			wantProjectName: "smoke-beta",
+			wantRepository:  "https://github.com/acme/beta",
+		},
+		{
+			name: "no allowlist match leaves ProjectName empty",
+			item: PollWorkItem{
+				SessionID:   "sess-c",
+				ProjectName: "unknown-project",
+				Ref:         "main",
+			},
+			wantProjectName: "",
+			wantRepository:  "unknown-project", // falls through to item.ProjectName
+		},
+		{
+			name: "empty item leaves ProjectName and Repository empty",
+			item: PollWorkItem{
+				SessionID: "sess-d",
+				Ref:       "main",
+			},
+			wantProjectName: "",
+			wantRepository:  "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := PollItemToSessionSpec(tc.item, projects)
+			if spec.ProjectName != tc.wantProjectName {
+				t.Errorf("ProjectName = %q, want %q", spec.ProjectName, tc.wantProjectName)
+			}
+			if spec.Repository != tc.wantRepository {
+				t.Errorf("Repository = %q, want %q", spec.Repository, tc.wantRepository)
+			}
+			if spec.SessionID != tc.item.SessionID {
+				t.Errorf("SessionID = %q, want %q", spec.SessionID, tc.item.SessionID)
+			}
+		})
 	}
 }
 
@@ -641,7 +716,7 @@ func TestPollItemToSessionDetail_URLMatchSilencesProjectNameMiss(t *testing.T) {
 		Repository:  "https://github.com/supaku/supaku.git",
 	}
 
-	detail := pollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
+	detail := PollItemToSessionDetail(item, projects, "https://platform.example", "tok", "wkr-1")
 
 	if detail.Repository != "https://github.com/supaku/supaku.git" {
 		t.Errorf("Repository = %q, want canonical URL", detail.Repository)
@@ -676,7 +751,7 @@ func TestPollItemToSessionDetail_DisallowedToolsForwarded(t *testing.T) {
 				SessionID:       "sess-dt",
 				DisallowedTools: tc.disallowedTools,
 			}
-			detail := pollItemToSessionDetail(item, nil, "", "", "")
+			detail := PollItemToSessionDetail(item, nil, "", "", "")
 			if got := len(detail.DisallowedTools); got != tc.wantLen {
 				t.Errorf("DisallowedTools len = %d, want %d; got %v", got, tc.wantLen, detail.DisallowedTools)
 			}
@@ -691,7 +766,7 @@ func TestPollItemToSessionDetail_DisallowedToolsForwarded(t *testing.T) {
 
 // TestPollResponse_DecodesMemoryBlock proves the Wave 3 dispatch-time
 // agent-memory field survives the strict JSON decode of the poll wire
-// shape — the SUP-1840 silent-drop regression guard (a field on only one
+// shape — the silent-drop regression guard (a field on only one
 // struct is dropped by Go's decoder). Mirrors TestPollResponse_DecodesLiveWireShape.
 func TestPollResponse_DecodesMemoryBlock(t *testing.T) {
 	body := []byte(`{
@@ -732,7 +807,7 @@ func TestPollItemToSessionDetail_MemoryBlockForwarded(t *testing.T) {
 				SessionID:   "sess-mem",
 				MemoryBlock: tc.memoryBlock,
 			}
-			detail := pollItemToSessionDetail(item, nil, "", "", "")
+			detail := PollItemToSessionDetail(item, nil, "", "", "")
 			if detail.MemoryBlock != tc.memoryBlock {
 				t.Errorf("MemoryBlock = %q, want %q", detail.MemoryBlock, tc.memoryBlock)
 			}
@@ -751,10 +826,10 @@ func TestPollItemToSessionSpec_DoesNotWarn(t *testing.T) {
 	projects := []ProjectConfig{{ID: "alpha", Repository: "https://github.com/x/alpha"}}
 	item := PollWorkItem{SessionID: "s", ProjectName: "unmatched"} // misses
 
-	_ = pollItemToSessionSpec(item, projects)
+	_ = PollItemToSessionSpec(item, projects)
 
 	if logs := buf.String(); strings.Contains(logs, "no allowlist match") {
-		t.Errorf("pollItemToSessionSpec must not warn (warn fires from pollItemToSessionDetail); got:\n%s", logs)
+		t.Errorf("PollItemToSessionSpec must not warn (warn fires from PollItemToSessionDetail); got:\n%s", logs)
 	}
 }
 
@@ -784,7 +859,7 @@ func TestCallNackEndpoint_PostsExpectedShape(t *testing.T) {
 	item := &PollWorkItem{
 		SessionID:       "s1",
 		IssueID:         "iss-1",
-		IssueIdentifier: "SUP-1",
+		IssueIdentifier: "OPS-1",
 		Priority:        3,
 		QueuedAt:        1700000000000,
 	}
@@ -850,7 +925,7 @@ func TestCallNackEndpoint_PropagatesServerError(t *testing.T) {
 		"wkr-1",
 		"jwt",
 		"reason",
-		&PollWorkItem{SessionID: "s1", IssueID: "i", IssueIdentifier: "SUP-1", Priority: 1, QueuedAt: 1},
+		&PollWorkItem{SessionID: "s1", IssueID: "i", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 	)
 	if err == nil {
 		t.Fatalf("expected error on HTTP 400")

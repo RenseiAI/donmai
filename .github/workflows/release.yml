@@ -15,12 +15,12 @@ permissions:
 
 jobs:
   release:
-    # macOS runner is required for codesign + xcrun notarytool (REN-1412).
+    # macOS runner is required for codesign + xcrun notarytool.
     # Cross-compile to linux/amd64 + linux/arm64 still works from darwin via
     # CGO_ENABLED=0 (set in .goreleaser.yaml).
     runs-on: macos-latest
-    # Job-level env block: REN-1412. Step-level env: blocks on
-    # goreleaser/goreleaser-action@v6 (node24 action) did not propagate
+    # Job-level env block, deliberately. Step-level env: blocks on
+    # goreleaser/goreleaser-action@v7 (node24 action) did not propagate
     # APPLE_DEVELOPER_ID/APPLE_PASSWORD/APPLE_TEAM_ID to the goreleaser
     # subprocess, causing `signs[].env: APPLE_DEVELOPER_ID={{ .Env.APPLE_DEVELOPER_ID }}`
     # template eval to fail with `map has no entry for key
@@ -35,11 +35,11 @@ jobs:
       APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -52,7 +52,7 @@ jobs:
       # Replaces GoReleaser's built-in `notarize:` block which fails with
       # `failed to verify certificate chain: x509: unhandled critical
       # extension` (Go's x509 strict mode rejects Apple's critical extension
-      # 1.2.840.113635.100.6.1.13). See REN-1412 for the v0.3.1 failure.
+      # 1.2.840.113635.100.6.1.13). This broke the v0.3.1 release.
       - name: Import Apple Developer ID cert to keychain
         if: env.APPLE_DEVELOPER_ID_CERT_BASE64 != ''
         run: |
@@ -79,7 +79,7 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
           rm -f "$RUNNER_TEMP/cert.p12"
 
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7
         with:
           version: "~> v2"
           args: release --clean

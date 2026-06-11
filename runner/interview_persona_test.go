@@ -10,7 +10,7 @@ import (
 // TestBuildInterviewSystemPrompt_PrependsPersona verifies the persona is
 // position-0 (prepended, not appended) so the hard rules are the first thing
 // the model reads — surviving a cloned-repo CLAUDE.md that showcases
-// developer behaviour (REN-1570 proves the hostile case in a live sandbox).
+// developer behaviour (proves the hostile case in a live sandbox).
 func TestBuildInterviewSystemPrompt_PrependsPersona(t *testing.T) {
 	upstream := "## Phase guidance from the compiled interview definition"
 	got := buildInterviewSystemPrompt(upstream, interview.InterviewCompleteSentinel)

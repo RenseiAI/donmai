@@ -160,8 +160,17 @@ type completionRequest struct {
 }
 
 // statusRequest is the wire body for POST /api/sessions/<id>/status.
-// Field set matches the platform handler at
-// platform/src/app/api/sessions/[id]/status/route.ts (StatusRequestBody).
+//
+// The base fields (workerId, status, providerSessionId, worktreePath, error,
+// cost) match the platform handler's StatusRequestBody interface
+// (route.ts handleStatusPOST). The additive failureMode + summary fields are
+// NOT part of that interface — the platform's lifecycle-hook wrappers
+// (session-lifecycle-hooks.ts) re-parse the request body INDEPENDENTLY via
+// their own SessionStatusBody type clone (cloned.json()), so these two fields
+// reach the platform through that separate read path, not the handler's
+// StatusRequestBody. Keep both reader sides in mind when changing field names:
+// the handler could add strict StatusRequestBody validation without ever
+// seeing failureMode/summary.
 type statusRequest struct {
 	WorkerID          string         `json:"workerId"`
 	Status            string         `json:"status"`
@@ -171,6 +180,35 @@ type statusRequest struct {
 	TotalCostUsd      float64        `json:"totalCostUsd,omitempty"`
 	InputTokens       int64          `json:"inputTokens,omitempty"`
 	OutputTokens      int64          `json:"outputTokens,omitempty"`
+
+	// FailureMode carries the runner's structural failure classification
+	// (e.g. "agent-blocked") so the platform routes on the authoritative
+	// signal instead of scanning the human-readable error text. Additive
+	// and backward-compatible: omitted when empty.
+	FailureMode string `json:"failureMode,omitempty"`
+
+	// Summary is the short human-readable session summary. The platform's
+	// lifecycle hooks read it on the status path; additive and omitted when
+	// empty.
+	Summary string `json:"summary,omitempty"`
+
+	// Result carries the runner's parsed WORK_RESULT verdict ("passed" |
+	// "failed" | "unknown") so the platform's exit event uses the child's
+	// reported result directly instead of re-deriving it from a marker
+	// scan over Summary. Without it, a provider whose terminal event has
+	// no message text (codex) posts an empty summary and the exit event
+	// falls back to result=unknown even though the runner already
+	// classified the verdict (2026-06-10 codex qa/acceptance rehearsals).
+	// Additive; omitted when empty.
+	Result string `json:"result,omitempty"`
+
+	// ResultMarker is the durable HTML-comment marker form of Result
+	// ("<!-- WORK_RESULT:passed -->"). The platform's lifecycle hooks
+	// treat it as first-priority durable evidence for the exit event's
+	// verdict. Only definitive verdicts (passed/failed/blocked) render a
+	// marker; "unknown" stays empty so the platform's marker scan never
+	// sees a non-verdict. Additive; omitted when empty.
+	ResultMarker string `json:"resultMarker,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -273,6 +311,10 @@ func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Resul
 			Status:            r.Status,
 			ProviderSessionID: r.ProviderSessionID,
 			WorktreePath:      r.WorktreePath,
+			FailureMode:       r.FailureMode,
+			Summary:           strings.TrimSpace(r.Summary),
+			Result:            r.WorkResult,
+			ResultMarker:      workResultMarker(r.WorkResult),
 		}
 		if r.Cost != nil {
 			body.TotalCostUsd = r.Cost.TotalCostUsd
@@ -301,7 +343,7 @@ func (p *Poster) doRetried(ctx context.Context, path string, buildBody func(Runt
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
 		// Re-resolve credentials before every attempt so a daemon-side
 		// runtime-token refresh between retries propagates here. This is
-		// the fix for SUP-1823: long-running sessions whose initial JWT
+		// the stale-JWT fix: long-running sessions whose initial JWT
 		// expires mid-run would otherwise loop on a cached, dead token.
 		creds := p.credentials(ctx)
 		body := buildBody(creds)
@@ -406,6 +448,19 @@ func (p *Poster) urlFor(path string) string {
 	cp := *p.platformURL
 	cp.Path = strings.TrimRight(cp.Path, "/") + path
 	return cp.String()
+}
+
+// workResultMarker renders the durable HTML-comment marker for a parsed
+// WORK_RESULT verdict. Only definitive verdicts get a marker — "unknown"
+// (and anything unrecognised) returns "" so downstream marker scans never
+// match on a non-verdict.
+func workResultMarker(workResult string) string {
+	switch workResult {
+	case "passed", "failed", "blocked":
+		return "<!-- WORK_RESULT:" + workResult + " -->"
+	default:
+		return ""
+	}
 }
 
 // synthSummary builds a minimal completion-comment summary from a

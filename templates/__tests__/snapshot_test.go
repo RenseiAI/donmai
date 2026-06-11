@@ -22,12 +22,12 @@ import (
 func fixtureWork() prompt.QueuedWork {
 	return prompt.QueuedWork{
 		SessionID:       "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c",
-		IssueIdentifier: "REN2-1",
+		IssueIdentifier: "DEV-1",
 		ProjectName:     "smoke-alpha",
 		OrganizationID:  "org_ejkmv9ojdyifipydw5l1",
 		Repository:      "github.com/RenseiAI/rensei-smokes-alpha",
 		Ref:             "main",
-		PromptContext: "<issue identifier=\"REN2-1\">\n" +
+		PromptContext: "<issue identifier=\"DEV-1\">\n" +
 			"<title>Wave 6 smoke test</title>\n" +
 			"<description>\nCreate hello-from-wave6.md\n</description>\n" +
 			"</issue>",
@@ -46,6 +46,8 @@ func TestSnapshot_SystemBase(t *testing.T) {
 
 	qw := fixtureWork()
 	ctx := map[string]interface{}{
+		"brandDisplay":   "Donmai",
+		"brandCLI":       "donmai",
 		"sessionID":      qw.SessionID,
 		"organizationID": qw.OrganizationID,
 		"projectName":    qw.ProjectName,
@@ -65,9 +67,12 @@ func TestSnapshot_SystemBase(t *testing.T) {
 	}
 
 	// Structural equivalence checks — both outputs must contain the same
-	// mandatory sections.
+	// mandatory sections. The brand token reflects the OSS default
+	// (statehome brand "donmai") — the closed rensei binary renders
+	// "Rensei" via statehome.SetBrand. See prompt/builder_brand_test.go for
+	// the platform-brand contract assertion.
 	sections := []string{
-		"You are an autonomous Rensei agent",
+		"You are an autonomous Donmai agent",
 		"# Identity",
 		"# Operating rules",
 		qw.SessionID,
@@ -109,6 +114,8 @@ func TestSnapshot_SystemBase_WithAppend(t *testing.T) {
 	appendText := "Always run `make verify` before opening a PR."
 
 	ctx := map[string]interface{}{
+		"brandDisplay":   "Donmai",
+		"brandCLI":       "donmai",
 		"sessionID":      qw.SessionID,
 		"organizationID": qw.OrganizationID,
 		"projectName":    qw.ProjectName,
@@ -150,6 +157,7 @@ func TestSnapshot_UserDevelopment(t *testing.T) {
 	qw := fixtureWork()
 	qw.WorkType = string(prompt.WorkTypeDevelopment)
 	ctx := map[string]interface{}{
+		"brandCLI":        "donmai",
 		"issueIdentifier": qw.IssueIdentifier,
 		"context":         qw.PromptContext,
 		"ref":             qw.Ref,
@@ -167,10 +175,14 @@ func TestSnapshot_UserDevelopment(t *testing.T) {
 	}
 
 	mustContain := []string{
-		"REN2-1",
+		"DEV-1",
 		"# What to do",
 		"WORK_RESULT:passed",
 		"WORK_RESULT:failed",
+		// The blocked-decline marker MUST be instructed alongside the
+		// pass/fail verdicts so the runner's scanBlocked detector has a
+		// marker to act on; otherwise blocked classification is dead code.
+		"WORK_RESULT:blocked",
 		"git push",
 		"gh pr create",
 	}
@@ -195,6 +207,7 @@ func TestSnapshot_UserQA(t *testing.T) {
 	qw := fixtureWork()
 	qw.WorkType = string(prompt.WorkTypeQA)
 	ctx := map[string]interface{}{
+		"brandCLI":        "donmai",
 		"issueIdentifier": qw.IssueIdentifier,
 		"context":         qw.PromptContext,
 	}
@@ -210,10 +223,11 @@ func TestSnapshot_UserQA(t *testing.T) {
 	}
 
 	mustContain := []string{
-		"REN2-1",
+		"DEV-1",
 		"acceptance criteria",
 		"WORK_RESULT:passed",
 		"WORK_RESULT:failed",
+		"WORK_RESULT:blocked",
 	}
 	for _, s := range mustContain {
 		if !strings.Contains(raymondOut, s) {
@@ -237,6 +251,7 @@ func TestSnapshot_UserResearch(t *testing.T) {
 	qw := fixtureWork()
 	qw.WorkType = string(prompt.WorkTypeResearch)
 	ctx := map[string]interface{}{
+		"brandCLI":        "donmai",
 		"issueIdentifier": qw.IssueIdentifier,
 		"context":         qw.PromptContext,
 	}
@@ -252,7 +267,7 @@ func TestSnapshot_UserResearch(t *testing.T) {
 	}
 
 	mustContain := []string{
-		"REN2-1",
+		"DEV-1",
 		"Do NOT implement code",
 		"acceptance criteria",
 	}
@@ -282,6 +297,7 @@ func TestSnapshot_ConditionalEquivalence(t *testing.T) {
 	qwParent.ParentContext = parentText
 
 	ctxParent := map[string]interface{}{
+		"brandCLI":        "donmai",
 		"issueIdentifier": qwParent.IssueIdentifier,
 		"context":         qwParent.PromptContext,
 		"parentContext":   parentText,
@@ -311,6 +327,7 @@ func TestSnapshot_ConditionalEquivalence(t *testing.T) {
 	qwNoParent := fixtureWork()
 	qwNoParent.WorkType = string(prompt.WorkTypeDevelopment)
 	ctxNoParent := map[string]interface{}{
+		"brandCLI":        "donmai",
 		"issueIdentifier": qwNoParent.IssueIdentifier,
 		"context":         qwNoParent.PromptContext,
 		"ref":             qwNoParent.Ref,

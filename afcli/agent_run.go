@@ -22,14 +22,16 @@ import (
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/prompt"
-	provideramp "github.com/RenseiAI/donmai/provider/amp"
-	providerclaude "github.com/RenseiAI/donmai/provider/claude"
-	providercodex "github.com/RenseiAI/donmai/provider/codex"
-	providergemini "github.com/RenseiAI/donmai/provider/gemini"
-	providerollama "github.com/RenseiAI/donmai/provider/ollama"
-	provideropencode "github.com/RenseiAI/donmai/provider/opencode"
-	providerstub "github.com/RenseiAI/donmai/provider/stub"
+	provideragycli "github.com/RenseiAI/donmai/provider/harness/agycli"
+	provideramp "github.com/RenseiAI/donmai/provider/harness/amp"
+	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
+	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
+	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
+	providerollama "github.com/RenseiAI/donmai/provider/harness/ollama"
+	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
+	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -71,7 +73,7 @@ type agentRunOpts struct {
 //   - 2  — pre-flight failure (no session id, daemon unreachable,
 //     session not found, registry construction failed).
 //
-// (REN-1461 / F.2.8 — daemon wire-up.)
+// (F.2.8 — daemon wire-up.)
 func newAgentRunCmd() *cobra.Command {
 	opts := &agentRunOpts{}
 	cmd := &cobra.Command{
@@ -162,7 +164,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	)
 
 	// 5. Construct registry, runner, and run.
-	reg := buildAgentRunRegistry(logger)
+	reg := BuildAgentRunRegistry(logger)
 	logger.Info("donmai agent run: registry built", "providers", reg.Names())
 
 	wtParent := opts.worktree
@@ -419,12 +421,18 @@ type providerCtor struct {
 	new  func() (agent.Provider, error)
 }
 
-// buildAgentRunRegistry constructs the runner.Registry for one
-// `donmai agent run` invocation. Stub is always registered; claude + codex
-// register on best-effort (their probes return errors when the
-// underlying CLI / app-server is missing — we log + skip rather than
-// fail the whole worker so a misconfigured host does not silently lose
-// stub-mode smoke runs).
+// BuildAgentRunRegistry constructs the runner.Registry of the providers
+// compiled into this binary — the SINGLE SOURCE for the agent-run provider
+// set. It is the public, importable entry point downstream Go binaries (e.g.
+// the closed-source `rensei` TUI) call so they do NOT have to fork the
+// hand-authored ctor list; calling this builder keeps every embedder on the
+// exact same eight providers donmai resolves, eliminating the documented
+// fork-rot between donmai and rensei-tui.
+//
+// Stub is always registered; the others register on best-effort (their probes
+// return errors when the underlying CLI / app-server / API key is missing — we
+// log + skip rather than fail the whole worker so a misconfigured host does
+// not silently lose stub-mode smoke runs).
 //
 // Each spawned `donmai agent run` builds its own Registry — providers are
 // stateless modulo codex's app-server, and that app-server is a
@@ -433,7 +441,7 @@ type providerCtor struct {
 // coupling we explicitly want to avoid (per F.1.1 §7 + the F.2.8 task
 // guidance).
 //
-// Probe-failure visibility (REN-1462 / v0.5.1): every provider
+// Probe-failure visibility: every provider
 // construction or registration failure logs at WARN with the provider
 // name and underlying error so operators can see at a glance which
 // providers are available on this host. If the resulting registry has
@@ -442,13 +450,31 @@ type providerCtor struct {
 // no provider can resolve.
 //
 // Foundation-runtime-stubs adds three more probe-and-skip entries
-// (REN-1499 amp, REN-1500 gemini, REN-1501 opencode). Each follows
+// (amp, gemini, opencode). Each follows
 // the same warn-and-skip contract as claude / codex: if the
 // constructor returns ErrProviderUnavailable (no API key, server
 // unreachable) the registry build logs WARN and proceeds without
 // that provider, identical to the existing probe-failure path.
-func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
-	return buildRegistryFromCtors(logger, []providerCtor{
+//
+// The ctor list below is the single hand-authored source of the agent-run
+// provider set. It is deliberately NOT matrix-generated: each provider's
+// New constructor takes a distinct, package-local Options type (and stub is
+// variadic), so a generated closure could only re-emit these same per-package
+// New(Options{}) call sites verbatim — adding codegen surface for zero
+// single-sourcing gain. Keeping it here, behind a public builder, is the clean
+// realization of "single source + no fork".
+func BuildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
+	return buildRegistryFromCtors(logger, agentRunProviderCtors())
+}
+
+// agentRunProviderCtors returns the single hand-authored ctor list — the SoT
+// for the agent-run provider set. Pulled into its own function (returning a
+// fresh slice on each call) so [BuildAgentRunRegistry] and the no-behavior-
+// change parity test enumerate the SAME provider set without the test having
+// to re-declare it (which would itself become a fork). Order matches the
+// historical slice exactly; behaviour is unchanged.
+func agentRunProviderCtors() []providerCtor {
+	return []providerCtor{
 		{name: "stub", new: func() (agent.Provider, error) { return providerstub.New() }},
 		{name: "claude", new: func() (agent.Provider, error) { return providerclaude.New(providerclaude.Options{}) }},
 		{name: "codex", new: func() (agent.Provider, error) { return providercodex.New(providercodex.Options{}) }},
@@ -466,11 +492,24 @@ func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
 		// generativelanguage.googleapis.com.
 		{name: "amp", new: func() (agent.Provider, error) { return provideramp.New(provideramp.Options{}) }},
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
+		// agy-cli is a LOCAL/HOST-SESSION/OAUTH provider wrapping the Antigravity `agy` CLI under a pty.
+		// It is the SUBSCRIPTION/no-key local-Gemini path (the user's own OAuth-authed agy on the user's
+		// own machine), and the successor to the now-removed gemini-cli wrap (gemini CLI EOL 2026-06-18).
+		// Distinct from the API-direct "gemini" provider. Requires `agy` installed AND logged in on the
+		// host PATH. NOT for cloud sandboxes.
+		{name: "agy-cli", new: func() (agent.Provider, error) { return provideragycli.New(provideragycli.Options{}) }},
 		{name: "opencode", new: func() (agent.Provider, error) { return provideropencode.New(provideropencode.Options{}) }},
-	})
+	}
 }
 
-// buildRegistryFromCtors is the testable core of [buildAgentRunRegistry].
+// buildAgentRunRegistry is a thin internal alias of [BuildAgentRunRegistry],
+// retained so the package's existing call sites and tests keep their
+// short, unexported name. Behaviour is identical — it just delegates.
+func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
+	return BuildAgentRunRegistry(logger)
+}
+
+// buildRegistryFromCtors is the testable core of [BuildAgentRunRegistry].
 // It walks the provided ctors, logs WARN per-provider failure, and
 // emits an ERROR record when the resulting registry has zero
 // successful registrations. Returns the (possibly-empty) Registry.
@@ -486,12 +525,46 @@ func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor) *runner.R
 		if regErr := reg.Register(p); regErr != nil {
 			logger.Warn("donmai agent run: provider register failed",
 				"provider", c.name, "err", regErr)
+			continue
 		}
+		assertLegacyAlias(logger, p)
 	}
 	if len(reg.Names()) == 0 {
-		logger.Error("donmai agent run: no providers available — every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `donmai doctor`. (REN-1462)")
+		logger.Error("donmai agent run: no providers available — every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `donmai doctor`.")
 	}
 	return reg
+}
+
+// assertLegacyAlias consumes the generated matrix.LegacyAliasMap as a
+// defense-in-depth invariant: a registered provider's harness identity
+// (Manifest().Name) MUST match the harness the matrix says its
+// ProviderName resolves to. This makes the alias map a real reader (P1
+// generated it but left it unconsumed) WITHOUT changing which concrete
+// provider answers any name — the registry stays ProviderName-keyed.
+//
+// A mismatch is logged at WARN (never fatal): it would mean the
+// hand-authored cell anchors in matrix/cells.go drifted from the live
+// manifests, a build-time bug to fix at the source, not a runtime path
+// to fail. A provider without a Manifest() (no HarnessProvider) or a
+// ProviderName with no legacy alias is skipped silently — neither is a
+// drift signal.
+func assertLegacyAlias(logger *slog.Logger, p agent.Provider) {
+	name := p.Name()
+	cell, ok := matrix.LegacyCell(name)
+	if !ok {
+		return
+	}
+	hp, ok := p.(agent.HarnessProvider)
+	if !ok {
+		return
+	}
+	if got := hp.Manifest().Name; got != cell.Harness {
+		logger.Warn("donmai agent run: legacy-alias harness mismatch",
+			"provider", name,
+			"manifestHarness", got,
+			"matrixHarness", cell.Harness,
+		)
+	}
 }
 
 // kitScanPaths returns the kit registry scan paths the runner should use,

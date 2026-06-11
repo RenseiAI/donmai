@@ -1,21 +1,25 @@
 // Package launchd implements the macOS launchd installer for the daemon.
 //
 // This is the Go port of the legacy TypeScript installer at
-// agentfactory/packages/daemon/src/launchd-installer.ts (REN-1292).
+// donmai-libraries/packages/daemon/src/launchd-installer.ts.
 //
 // The installer registers the host binary's `daemon run` subcommand as the
 // LaunchAgent's ProgramArguments — it does NOT register a separate
-// `rensei-daemon` binary (locked decision per REN-1406). The host binary
+// `rensei-daemon` binary (locked decision). The host binary
 // is whichever executable invoked the install (`af`, `rensei`, etc.,
 // resolved via os.Executable), and the subcommand is `daemon run`.
 //
 // Architecture reference:
 //
-//	rensei-architecture/011-local-daemon-fleet.md §macOS (launchd)
+//	donmai-architecture/011-local-daemon-fleet.md §macOS (launchd)
 //
 // Plist path:    ~/Library/LaunchAgents/dev.donmai.daemon.plist
-// Log path:      ~/Library/Logs/rensei/daemon.log
-// Error log:     ~/Library/Logs/rensei/daemon-error.log
+// Log path:      ~/Library/Logs/donmai/daemon.log
+// Error log:     ~/Library/Logs/donmai/daemon-error.log
+//
+// The log directory is derived from the brand-neutral host-state seam
+// (github.com/RenseiAI/donmai/runtime/statehome) and defaults to "donmai";
+// an embedder may rebrand it once at process init.
 //
 // Restart contract:
 //
@@ -34,6 +38,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -53,7 +59,7 @@ const LaunchdLabel = "dev.donmai.daemon"
 const RenseiDaemonLabel = "dev.rensei.daemon"
 
 // DaemonSubcommand is the subcommand the host binary registers for the
-// LaunchAgent entrypoint. The locked decision (REN-1406) is to register
+// LaunchAgent entrypoint. The locked decision is to register
 // `<host-binary> daemon run`, NOT a separate rensei-daemon binary.
 const DaemonSubcommand = "daemon run"
 
@@ -67,32 +73,33 @@ func PlistPath() (string, error) {
 	return filepath.Join(home, "Library", "LaunchAgents", LaunchdLabel+".plist"), nil
 }
 
-// LogDir returns the daemon log directory: ~/Library/Logs/rensei.
+// LogDir returns the daemon log directory: ~/Library/Logs/<brand>, where
+// <brand> defaults to "donmai" (configured via the runtime/statehome seam).
 func LogDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("launchd: resolve home dir: %w", err)
+	dir := statehome.LogDir()
+	if dir == "" {
+		return "", fmt.Errorf("launchd: resolve log dir: home directory unavailable")
 	}
-	return filepath.Join(home, "Library", "Logs", "rensei"), nil
+	return dir, nil
 }
 
-// LogPath returns the daemon stdout log path: ~/Library/Logs/rensei/daemon.log.
+// LogPath returns the daemon stdout log path: ~/Library/Logs/<brand>/daemon.log.
 func LogPath() (string, error) {
-	dir, err := LogDir()
-	if err != nil {
-		return "", err
+	p := statehome.LogPath()
+	if p == "" {
+		return "", fmt.Errorf("launchd: resolve log path: home directory unavailable")
 	}
-	return filepath.Join(dir, "daemon.log"), nil
+	return p, nil
 }
 
 // ErrorLogPath returns the daemon stderr log path:
-// ~/Library/Logs/rensei/daemon-error.log.
+// ~/Library/Logs/<brand>/daemon-error.log.
 func ErrorLogPath() (string, error) {
-	dir, err := LogDir()
-	if err != nil {
-		return "", err
+	p := statehome.ErrorLogPath()
+	if p == "" {
+		return "", fmt.Errorf("launchd: resolve error log path: home directory unavailable")
 	}
-	return filepath.Join(dir, "daemon-error.log"), nil
+	return p, nil
 }
 
 // ── Options ──────────────────────────────────────────────────────────────────
@@ -197,7 +204,7 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 
 // GeneratePlist returns a launchd plist XML string for the daemon
 // LaunchAgent. ProgramArguments registers `<hostBinPath> daemon run` —
-// the locked REN-1406 decision (no separate rensei-daemon binary).
+// the locked decision (no separate rensei-daemon binary).
 //
 // Key behaviours encoded in the plist:
 //
@@ -205,7 +212,7 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 //   - KeepAlive (dict)       — SuccessfulExit=false. See restart-contract
 //     note at the top of the file.
 //   - ThrottleInterval = 30  — crash restart throttle (prevents storms).
-//   - StandardOutPath / Err  — routes stdio to ~/Library/Logs/rensei/.
+//   - StandardOutPath / Err  — routes stdio to ~/Library/Logs/<brand>/.
 //   - EnvironmentVariables   — sets HOME and PATH.
 func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
 	if hostBinPath == "" {
@@ -216,7 +223,7 @@ func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
 		return "", fmt.Errorf("launchd: resolve home dir: %w", err)
 	}
 
-	// Build a sensible PATH covering ~/.local/bin (REN-1462: user-local
+	// Build a sensible PATH covering ~/.local/bin (user-local
 	// installs of provider CLIs like `claude` land here when installed
 	// via the upstream curl|sh script), Homebrew on Apple Silicon and
 	// Intel, then the system bins. Prepending ~/.local/bin keeps the
@@ -323,7 +330,7 @@ type InstallResult struct {
 //
 // Steps:
 //  1. Resolve the host binary path.
-//  2. Create ~/Library/Logs/rensei/ if missing.
+//  2. Create ~/Library/Logs/<brand>/ if missing.
 //  3. Write the plist.
 //  4. Run `launchctl bootstrap gui/<uid> <plist>` unless skipped.
 //
@@ -359,7 +366,7 @@ func Install(opts InstallOptions) (InstallResult, error) {
 	}
 
 	// Ensure log dir exists.
-	// #nosec G301 -- Library/Logs/rensei must be readable by Console.app (0755 by macOS convention).
+	// #nosec G301 -- the brand log dir must be readable by Console.app (0755 by macOS convention).
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		return InstallResult{}, fmt.Errorf("launchd: mkdir log dir: %w", err)
 	}
@@ -551,7 +558,11 @@ func Doctor(opts DoctorOptions) (DoctorResult, error) {
 			pid, _ = strconv.Atoi(m[1])
 		}
 		running := pid > 0
-		runningDetail := "Daemon process is not running (PID = 0). Check logs: ~/Library/Logs/rensei/daemon.log"
+		logHint := statehome.LogPath()
+		if logHint == "" {
+			logHint = "the daemon log"
+		}
+		runningDetail := "Daemon process is not running (PID = 0). Check logs: " + logHint
 		if running {
 			runningDetail = fmt.Sprintf("Daemon running with PID %d", pid)
 		}

@@ -26,6 +26,8 @@ export const AGENT_ENV_BLOCKLIST: readonly string[] = Object.freeze([
   'WORKOS_COOKIE_PASSWORD',
   'DONMAI_RUNTIME_JWT',
   'WORKER_API_KEY',
+  'DONMAI_DAEMON_TOKEN',
+  'DONMAI_ORCHESTRATOR_URL',
 ]);
 
 const BLOCKLIST_SET: ReadonlySet<string> = new Set(AGENT_ENV_BLOCKLIST);

@@ -9,7 +9,7 @@ import (
 )
 
 // TestTranslateSpec_PlatformDisallowedTools_Appended verifies that
-// platform-supplied DisallowedTools patterns (SUP-1840 Option B) are
+// platform-supplied DisallowedTools patterns (Option B) are
 // appended to the runner's defaultDisallowedTools() baseline rather
 // than replacing it. The merge is purely additive — the static floor
 // remains intact.
@@ -89,6 +89,39 @@ func TestTranslateSpec_EmptyPlatformDisallowedTools_IsNoop(t *testing.T) {
 		if !slices.Contains(spec.DisallowedTools, want) {
 			t.Errorf("baseline pattern %q missing from spec.DisallowedTools: %v", want, spec.DisallowedTools)
 		}
+	}
+}
+
+// TestTranslateSpec_InitialContext_GatedByCapability verifies that
+// Spec.InitialContext only flows through when the resolved provider
+// declares Capabilities.SupportsTurnInputContext. Providers without that
+// split receive the same context folded into the system prompt by the
+// loop, so the field must be zeroed here to avoid duplication.
+func TestTranslateSpec_InitialContext_GatedByCapability(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		supports  bool
+		wantValue string
+	}{
+		{name: "supported-flows-through", supports: true, wantValue: "MEMORY BLOCK"},
+		{name: "unsupported-zeroed", supports: false, wantValue: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			caps := agent.Capabilities{SupportsTurnInputContext: tt.supports}
+			in := SpecInputs{
+				Cwd:            "/tmp/wt",
+				Prompt:         "do",
+				InitialContext: "MEMORY BLOCK",
+			}
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{}}
+			spec := translateSpec(qw, caps, in)
+			if spec.InitialContext != tt.wantValue {
+				t.Fatalf("InitialContext: want %q, got %q", tt.wantValue, spec.InitialContext)
+			}
+		})
 	}
 }
 

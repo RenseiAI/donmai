@@ -1,7 +1,7 @@
 # Templates Port Audit — H (2026-05-13)
 
 Scope: survey the TS template system in
-`../agentfactory/packages/core/src/templates/` and the existing Go prompt
+`../donmai-libraries/packages/core/src/templates/` and the existing Go prompt
 machinery in `prompt/`, then recommend a Go porting plan.
 
 ---

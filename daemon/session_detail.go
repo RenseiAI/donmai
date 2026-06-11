@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/runner/access"
 )
 
 // SessionDetail is the per-session payload `donmai agent run` reads from
@@ -27,7 +28,7 @@ type SessionDetail struct {
 	IssueID string `json:"issueId,omitempty"`
 
 	// IssueIdentifier is the human-readable Linear identifier
-	// (e.g. "REN-1457").
+	// (e.g. "ENG-1457").
 	IssueIdentifier string `json:"issueIdentifier,omitempty"`
 
 	// LinearSessionID is the Linear-side agent-session id.
@@ -96,7 +97,16 @@ type SessionDetail struct {
 	// PlatformURL is the base URL of the platform.
 	PlatformURL string `json:"platformUrl,omitempty"`
 
-	// ── Phase 2 stage-driven SDLC fields (REN-1485 / REN-1487) ───────
+	// CredentialPoolID is the non-secret pool accounting sentinel for
+	// metered and shared auth modes: "metered_pool_<provider>" or
+	// "shared_pool_<provider>". Absent for byok/host-session/local.
+	// Forwarded from PollWorkItem.InjectedPoolID (safe at rest — not a
+	// credential, just a billing tag). The runner should echo it in the
+	// session cost-event metadata at completion so the platform can
+	// attribute usage to the correct metered/shared pool.
+	CredentialPoolID string `json:"credentialPoolId,omitempty"`
+
+	// ── Phase 2 stage-driven SDLC fields ───────
 	//
 	// Forwarded opaquely from PollWorkItem; the daemon does not parse
 	// them. The runner consumes them via the prompt.QueuedWork stage
@@ -126,7 +136,7 @@ type SessionDetail struct {
 	// SystemPromptOverride forwards the per-session platform-supplied
 	// system prompt from PollWorkItem onto the runner's QueuedWork.
 	// Read by `prompt/builder.go` (already wired) — this field closes
-	// the daemon→runner wire-shape gap. SUP-1840 precedent.
+	// the daemon→runner wire-shape gap (a missing field is silently dropped).
 	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
 
 	// Kits forwards the platform-resolved kit toolchain demand from
@@ -153,7 +163,7 @@ type SessionDetail struct {
 	// not dropped by the strict JSON decoder.
 	MemoryBlock string `json:"memoryBlock,omitempty"`
 
-	// ── Interactive run-mode fields (REN-1563 / Wave 2 donmai wire-plumbing) ─
+	// ── Interactive run-mode fields (Wave 2 donmai wire-plumbing) ─
 	//
 	// Mode forwards the run-mode discriminant from PollWorkItem onto the
 	// runner's QueuedWork. "" / absent = headless (unchanged behaviour).
@@ -184,6 +194,35 @@ type SessionResolvedProfile struct {
 	Effort         string         `json:"effort,omitempty"`
 	CredentialID   string         `json:"credentialId,omitempty"`
 	ProviderConfig map[string]any `json:"providerConfig,omitempty"`
+
+	// AuthMode is the credential auth mode the platform resolved for this
+	// session: "byok" | "metered" | "shared" | "host-session" | "local".
+	// Used by the daemon's credential injection hook to decide whether a
+	// missing snapshot is a fail-closed condition (byok/metered/shared) or
+	// a safe fail-open (host-session/local). Absent on legacy dispatches
+	// that predate the Phase-1 snapshot enrichment; the hook treats absence
+	// as fail-open for backward compatibility.
+	AuthMode string `json:"authMode,omitempty"`
+
+	// ── P3 narrow-only gate inputs (ADR-2026-06-06 §5.3) ─────────────────
+	//
+	// These are the values the rensei-tui fail-closed gate (S3) hands to
+	// access.ResolveMachineCell, one step before the credential hop. The
+	// daemon does NOT enforce here — it only carries them through onto the
+	// SessionSpec so the embedder's OnPreSpawn closure can read them. All
+	// additive + omitempty; absent on every pre-P3 dispatch (=> identity).
+
+	// Company is the endpoint company key (the SPEAK-axis cell identity,
+	// e.g. "anthropic"). Stamped by the platform at dispatch alongside the
+	// resolved model. The gate uses it as the matrix company-row key.
+	Company string `json:"company,omitempty"`
+
+	// PlatformAllowed is the CLOSED set of auth modes the platform already
+	// narrowed against org∩project at dispatch — the immutable CEILING the
+	// machine gate may only SUBTRACT from. Carried faithfully (same set the
+	// platform stamps); the daemon never edits it. Absent/empty on pre-P3
+	// dispatches; the gate (S3) treats it as the ceiling.
+	PlatformAllowed []access.AuthMode `json:"platformAllowed,omitempty"`
 }
 
 // SessionModelProfile mirrors runner.ResolvedModelProfile but lives in

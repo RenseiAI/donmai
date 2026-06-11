@@ -7,7 +7,7 @@ import (
 	"github.com/RenseiAI/donmai/prompt"
 )
 
-// TestBuilderBuild_StagePromptMode covers the REN-1485 / REN-1487
+// TestBuilderBuild_StagePromptMode covers the
 // Phase 2 dispatch path: when QueuedWork.StagePrompt is non-empty the
 // builder uses it verbatim (with a stage-context preamble) instead of
 // rendering the embedded user template. Cardinal rule 1 (legacy
@@ -25,7 +25,7 @@ func TestBuilderBuild_StagePromptMode(t *testing.T) {
 			name: "stage_prompt_only",
 			work: prompt.QueuedWork{
 				SessionID:       "sess-1",
-				IssueIdentifier: "REN-1487",
+				IssueIdentifier: "ENG-1487",
 				StagePrompt:     "Run the development stage on the issue. Decompose if needed.",
 				StageID:         "development",
 				StageBudget: &prompt.StageBudget{
@@ -49,15 +49,15 @@ func TestBuilderBuild_StagePromptMode(t *testing.T) {
 			name: "legacy_fallback_no_stage_prompt",
 			work: prompt.QueuedWork{
 				SessionID:       "sess-2",
-				IssueIdentifier: "REN-1234",
+				IssueIdentifier: "ENG-1234",
 				WorkType:        string(prompt.WorkTypeDevelopment),
-				PromptContext:   "<issue identifier=\"REN-1234\"><title>Legacy</title></issue>",
+				PromptContext:   "<issue identifier=\"ENG-1234\"><title>Legacy</title></issue>",
 			},
 			expectMode: "legacy",
 			expectInUser: []string{
 				// Legacy path produces template-rendered text;
 				// just assert the issue identifier surfaces.
-				"REN-1234",
+				"ENG-1234",
 			},
 			excludeUser: []string{
 				"<stage>",
@@ -68,7 +68,7 @@ func TestBuilderBuild_StagePromptMode(t *testing.T) {
 			name: "stage_prompt_no_budget",
 			work: prompt.QueuedWork{
 				SessionID:       "sess-3",
-				IssueIdentifier: "REN-1488",
+				IssueIdentifier: "ENG-1488",
 				StagePrompt:     "Research the prior art and produce a memo.",
 				StageID:         "research",
 			},
@@ -131,7 +131,7 @@ func TestBuilderBuild_StagePromptOverridesIssueContext(t *testing.T) {
 	b := prompt.NewBuilder()
 	work := prompt.QueuedWork{
 		SessionID:       "sess-hybrid",
-		IssueIdentifier: "REN-1487",
+		IssueIdentifier: "ENG-1487",
 		PromptContext:   "<issue><description>This should NOT appear</description></issue>",
 		StagePrompt:     "Stage prompt body that wins.",
 		StageID:         "qa",
@@ -163,7 +163,7 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 		b := prompt.NewBuilder()
 		work := prompt.QueuedWork{
 			SessionID:            "sess-override-1",
-			IssueIdentifier:      "REN-9001",
+			IssueIdentifier:      "ENG-9001",
 			StagePrompt:          "Implement the feature described in the issue.",
 			StageID:              "development",
 			SystemPromptOverride: overrideText,
@@ -181,7 +181,9 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 			t.Errorf("user prompt missing stage body: %q", user)
 		}
 		// system_base.tmpl sentinel text must NOT appear when overridden.
-		if strings.Contains(system, "autonomous Rensei agent") {
+		// Brand-agnostic substring (the brand token varies by binary via the
+		// statehome seam — "Donmai"/"Rensei"); the trailing clause is fixed.
+		if strings.Contains(system, "agent operating without an interactive user") {
 			t.Errorf("system_base.tmpl content leaked into overridden system prompt: %q", system)
 		}
 	})
@@ -192,7 +194,7 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 		b := prompt.NewBuilder()
 		work := prompt.QueuedWork{
 			SessionID:            "sess-override-2",
-			IssueIdentifier:      "REN-9002",
+			IssueIdentifier:      "ENG-9002",
 			WorkType:             string(prompt.WorkTypeDevelopment),
 			PromptContext:        "<issue><title>Legacy dispatch</title></issue>",
 			SystemPromptOverride: overrideText,
@@ -205,7 +207,7 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 			t.Errorf("expected system=%q, got %q", overrideText, system)
 		}
 		// User prompt comes from the legacy template and must contain the identifier.
-		if !strings.Contains(user, "REN-9002") {
+		if !strings.Contains(user, "ENG-9002") {
 			t.Errorf("user prompt missing issue identifier: %q", user)
 		}
 	})
@@ -216,7 +218,7 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 		b := prompt.NewBuilder()
 		work := prompt.QueuedWork{
 			SessionID:            "sess-override-3",
-			IssueIdentifier:      "REN-9003",
+			IssueIdentifier:      "ENG-9003",
 			StagePrompt:          "Do the thing.",
 			StageID:              "qa",
 			SystemPromptOverride: "", // explicitly empty
@@ -241,7 +243,7 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 		b := prompt.NewBuilder()
 		work := prompt.QueuedWork{
 			SessionID:            "sess-override-4",
-			IssueIdentifier:      "REN-9004",
+			IssueIdentifier:      "ENG-9004",
 			StagePrompt:          "Do the thing.",
 			StageID:              "qa",
 			SystemPromptOverride: "   \t\n  ",
@@ -270,7 +272,7 @@ func TestBuilderBuild_MemoryBlock(t *testing.T) {
 		b := prompt.NewBuilder()
 		work := prompt.QueuedWork{
 			SessionID:       "sess-mem-1",
-			IssueIdentifier: "REN-9101",
+			IssueIdentifier: "ENG-9101",
 			WorkType:        string(prompt.WorkTypeDevelopment),
 			PromptContext:   "<issue><title>Mem dispatch</title></issue>",
 			MemoryBlock:     memText,
@@ -297,7 +299,7 @@ func TestBuilderBuild_MemoryBlock(t *testing.T) {
 		const overrideText = "You are the upstream override agent."
 		work := prompt.QueuedWork{
 			SessionID:            "sess-mem-2",
-			IssueIdentifier:      "REN-9102",
+			IssueIdentifier:      "ENG-9102",
 			StagePrompt:          "Do the thing.",
 			StageID:              "development",
 			SystemPromptOverride: overrideText,
@@ -324,7 +326,7 @@ func TestBuilderBuild_MemoryBlock(t *testing.T) {
 		b := prompt.NewBuilder()
 		work := prompt.QueuedWork{
 			SessionID:       "sess-mem-3",
-			IssueIdentifier: "REN-9103",
+			IssueIdentifier: "ENG-9103",
 			StagePrompt:     "Do the thing.",
 			StageID:         "qa",
 			MemoryBlock:     "   \t\n ",

@@ -1,11 +1,11 @@
 package afcli
 
-// af admin — operational admin commands.
+// admin — operational admin commands.
 //
 // Subcommands:
-//   af admin cleanup          — prune orphaned git worktrees + stale branches
-//   af admin queue            — inspect / mutate the Redis work queue
-//   af admin merge-queue      — inspect / mutate the Redis merge queue
+//   donmai admin cleanup          — prune orphaned git worktrees + stale branches
+//   donmai admin queue            — inspect / mutate the Redis work queue
+//   donmai admin merge-queue      — inspect / mutate the Redis merge queue
 //
 // Design notes
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ func newAdminCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "admin",
 		Short: "Operational admin commands (cleanup, queue, merge-queue)",
-		Long: `Operational admin commands for AgentFactory.
+		Long: `Operational admin commands for Donmai.
 
 Subcommands:
   cleanup      Prune orphaned git worktrees and stale local branches
@@ -700,7 +700,7 @@ func parsePRNumber(s string) (int, error) {
 // newAdminCleanupCmd — worktree + branch pruning
 // ──────────────────────────────────────────────────────────────────────────────
 
-// CleanupResult is the JSON shape emitted by `af admin cleanup`.
+// CleanupResult is the JSON shape emitted by `donmai admin cleanup`.
 type CleanupResult struct {
 	DryRun    bool              `json:"dryRun"`
 	Worktrees WorktreeResult    `json:"worktrees"`
@@ -750,7 +750,7 @@ func newAdminCleanupCmd() *cobra.Command {
 		Short: "Prune orphaned git worktrees and stale local branches",
 		Long: `Prune orphaned git worktrees and stale local branches.
 
-Mirrors the TypeScript 'af-cleanup' + 'af-cleanup-sub-issues' surface.
+Mirrors the legacy TypeScript cleanup surface.
 
 Orphaned worktrees are identified by:
   - Branch no longer exists (merged/deleted)

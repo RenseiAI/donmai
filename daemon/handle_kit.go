@@ -123,7 +123,7 @@ func (s *Server) handleKitDetail(w http.ResponseWriter, r *http.Request) {
 			body := map[string]string{
 				"error":   err.Error(),
 				"kitId":   id,
-				"details": "Federation cross-repo wave is REN-1308 follow-up.",
+				"details": "Federation cross-repo support is follow-up work.",
 			}
 			if req.Source != nil {
 				body["kind"] = req.Source.Kind

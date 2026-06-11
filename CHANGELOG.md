@@ -8,7 +8,50 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-_No work staged for the next release._
+### Security
+
+- **dmk_ machine token no longer travels in a URL query string.** The
+  dashboard claim link printed on `daemon install` now carries the token in
+  the URL fragment (`<dashboard>/claim#token=…`) instead of
+  `…/api/auth/claim?token=…`. Fragments are never sent over the wire, keeping
+  the secret out of server access logs, proxy logs, and Referer headers.
+  Requires the paired dashboard release that serves the `/claim`
+  fragment-exchange page.
+
+### Fixes
+
+- **Daemon runtime-token churn is now quiet.** Three-part fix for the
+  unbounded daemon-error.log growth: (1) a proactive token refresher re-mints
+  the runtime JWT before expiry (lead 5m, retry 1m), so the hourly reactive
+  401→refresh cycle on BOTH the heartbeat and poll paths becomes a rare
+  backstop; (2) any refresh now fans fresh credentials out to both loops
+  (`SetCredentials`), eliminating the duplicate second refresh per expiry;
+  routine "rejected — refreshing" lines demoted Warn→Info and the
+  `[runtime-token]` trigger event renamed `401`→`refresh-requested`;
+  (3) `daemon run` rotates `daemon.log`/`daemon-error.log` at 10 MiB
+  (copy-truncate, one `.1` generation) at boot and every 6h.
+- **Activity toolOutput truncation no longer drops trailing PR URLs.** The
+  forwarded tool-output cap is raised 500 → 2000 chars
+  (`DefaultMaxToolOutputChars`), switches from head-only to middle-elision
+  truncation (head + tail survive — `gh pr create` prints the PR URL last),
+  and is now overridable per poster via `Config.MaxToolOutputChars`
+  (negative disables the cap).
+- **`arch assess` explains diff-fetch degrades.** When the GitHub CLI is
+  missing (or the PR diff fetch fails), the metadata-only fallback now prints
+  WHY to stderr — including the `gh` install instructions — instead of silently
+  emitting zero observations.
+
+### Changes
+
+- **Arch-drift seam is contract-only.** Removed the `LaneAdapter` reference
+  implementation from `afclient/codeintel` — per
+  ADR-2026-06-07-intelligence-implementation-is-platform, OSS ships the
+  `ModelAdapter` interface, request/response types, and `DriftVerdictSchema`
+  only; drift implementations live with the intelligence owner.
+- **Governor queue: legacy `agentfactory:governor:queue` dual-write/dual-read
+  removed.** The debrand transition window is over — `Enqueue` writes only the
+  canonical `donmai:governor:queue` key and `Peek` no longer falls back to the
+  legacy key.
 
 ---
 
@@ -237,7 +280,7 @@ instead of silently dropped.
 
 ### Features (v0.5.4)
 
-- **Runner WORK_RESULT → Linear state-transition wiring** — The Go runner now closes the Wave 6 Phase F.2.5 gap that left dev sessions in `Backlog` after a passing implementation. New `runner/sdlc.go` ports the `WORK_TYPE_COMPLETE_STATUS` / `WORK_TYPE_FAIL_STATUS` tables from `agentfactory/packages/linear/src/types.ts` and the post-session decision tree from `packages/core/src/orchestrator/event-processor.ts:300-450`. New `runner/contracts.go` ports the per-workType completion contract; development / inflight / coordination / inflight-coordination now require a `WORK_RESULT:passed|failed` marker. New `runner/post_session.go` implements step 11b of the run loop — parses the marker, resolves the target Linear status, and POSTs `updateIssueStatus` to the platform's `/api/issue-tracker-proxy` endpoint via the worker bearer token. Unknown markers post a diagnostic comment instead of stalling the issue. Failures surface as `Result.PostSessionWarnings` + `Result.LinearStatusTransition` (best-effort; a failed transition does NOT change the session's terminal status). Acceptance work continues to defer to the merge worker when a merge-queue adapter is configured (`shouldDeferAcceptanceTransition`). The development prompt template now includes the WORK_RESULT marker requirement so agents emit it on every dev session.
+- **Runner WORK_RESULT → Linear state-transition wiring** — The Go runner now closes the Wave 6 Phase F.2.5 gap that left dev sessions in `Backlog` after a passing implementation. New `runner/sdlc.go` ports the `WORK_TYPE_COMPLETE_STATUS` / `WORK_TYPE_FAIL_STATUS` tables from `donmai-libraries/packages/linear/src/types.ts` and the post-session decision tree from `packages/core/src/orchestrator/event-processor.ts:300-450`. New `runner/contracts.go` ports the per-workType completion contract; development / inflight / coordination / inflight-coordination now require a `WORK_RESULT:passed|failed` marker. New `runner/post_session.go` implements step 11b of the run loop — parses the marker, resolves the target Linear status, and POSTs `updateIssueStatus` to the platform's `/api/issue-tracker-proxy` endpoint via the worker bearer token. Unknown markers post a diagnostic comment instead of stalling the issue. Failures surface as `Result.PostSessionWarnings` + `Result.LinearStatusTransition` (best-effort; a failed transition does NOT change the session's terminal status). Acceptance work continues to defer to the merge worker when a merge-queue adapter is configured (`shouldDeferAcceptanceTransition`). The development prompt template now includes the WORK_RESULT marker requirement so agents emit it on every dev session.
 - **Result poster gains `UpdateIssueStatus` + `CreateIssueComment`** — `result/issue_status.go` exposes the platform's issue-tracker-proxy via two thin methods on `Poster`. Same retry/backoff/permanent-vs-transient classification as the existing `Post` path; reuses the worker bearer token and platform URL the runner already has (no new credential surface).
 
 ### Features

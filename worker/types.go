@@ -7,7 +7,7 @@ import (
 
 // AgentRuntimeProviderCapabilities mirrors the TypeScript AgentProviderCapabilities
 // struct (packages/core/src/providers/types.ts) and is used for typed capability
-// advertisement during worker registration (REN-1282).
+// advertisement during worker registration.
 //
 // The orchestrator prefers CapabilitiesTyped over the legacy Capabilities []string
 // field when both are present; the string slice is retained for backward
@@ -74,7 +74,7 @@ type RegisterRequest struct {
 
 // ResolveCapabilities returns a summary of the effective capability tags for
 // this registration request, implementing the "prefer typed when present"
-// migration path (REN-1282 / ADR-002).
+// migration path (ADR-002).
 //
 // If CapabilitiesTyped is non-nil the orchestrator should use it as the
 // authoritative source. The legacy Capabilities slice is still returned for
@@ -149,6 +149,18 @@ type PollResponse struct {
 	// key) — zero impact on existing dispatch. See
 	// runs/2026-06-01-code-survival-runtime-research/03-SEAM-DESIGN.md.
 	BatchWork []BatchWorkItem `json:"batchWork,omitempty"`
+
+	// KgExtractWork is a SEPARATE non-agent batch lane for the "kg-extraction"
+	// work-type, emitted by the platform poll route as a top-level sibling to
+	// batchWork (NOT nested inside it). Each item is a non-interactive,
+	// constrained LLM emit handled by the kgextract package. It shares the
+	// BatchWorkItem envelope (workType discriminant + Raw payload) and the same
+	// isolation guarantees as BatchWork: never routed to the agent path, never
+	// counted toward quota, never added to activeSessions. An old worker ignores
+	// this field. The poll loop dispatches it through the SAME batchHandler as
+	// BatchWork (a workType mux fans both lanes out to their executors); see
+	// PollLoopWithBatch and afcli/worker_start.go.
+	KgExtractWork []BatchWorkItem `json:"kgExtractWork,omitempty"`
 }
 
 // BatchWorkItem is the worker-package envelope for one batchWork[] item. The

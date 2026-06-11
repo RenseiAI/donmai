@@ -1,11 +1,13 @@
 package agent
 
 // This file ports the type-only declarations from
-// ../agentfactory/packages/core/src/providers/types.ts.
+// ../donmai-libraries/packages/core/src/providers/types.ts.
 //
 // Per the F.1.1 design doc §2 (Type signatures (Go)), these types are
 // the verbatim Go translation. JSON tags use camelCase to match the TS
 // wire format consumed by QueuedWork.resolvedProfile readers.
+
+import "encoding/json"
 
 // ProviderName is the stable identifier for an agent provider family.
 //
@@ -14,7 +16,7 @@ package agent
 // ollama, opencode, jules, amp) extend this enum without breaking the
 // contract.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts (AgentProviderName).
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts (AgentProviderName).
 type ProviderName string
 
 // ProviderName constants. v0.5.0 ships ProviderClaude, ProviderCodex,
@@ -29,6 +31,7 @@ const (
 	ProviderA2A      ProviderName = "a2a"
 	ProviderAmp      ProviderName = "amp"
 	ProviderGemini   ProviderName = "gemini"
+	ProviderAGYCLI   ProviderName = "agy-cli" // Antigravity `agy` CLI-wrap; OAuth/local/host-session, pty, no key. Successor to the removed gemini-cli wrap (gemini CLI EOL 2026-06-18).
 	ProviderOllama   ProviderName = "ollama"
 	ProviderOpenCode ProviderName = "opencode"
 	ProviderJules    ProviderName = "jules"
@@ -41,7 +44,7 @@ const (
 // gate runner behavior rather than try-catching unsupported provider
 // operations.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentProviderCapabilities).
 type Capability string
 
@@ -66,12 +69,20 @@ const (
 	// session-local MCP bridge). Tracks the v2 contract's
 	// `acceptsMcpServerSpec` flag.
 	CapAcceptsMcpServerSpec Capability = "accepts_mcp_server_spec"
+	// CapTurnInputContext reports whether the provider can deliver
+	// session context (Spec.InitialContext) once via the first turn's
+	// user input rather than folding it into the persistent system
+	// prompt. Providers with a turn-input/system-prompt split (codex's
+	// thread/start baseInstructions vs. turn/start input) declare true so
+	// the runner can keep large, volatile context (e.g. recalled agent
+	// memory) out of the re-sent system-prompt prefix.
+	CapTurnInputContext Capability = "turn_input_context"
 )
 
 // Capabilities is the typed capability matrix every provider declares.
 //
 // Verbatim port of AgentProviderCapabilities. Flat struct (no nested
-// objects) per the rensei-architecture base-contract validator
+// objects) per the donmai-architecture base-contract validator
 // constraint (002-provider-base-contract.md §Capabilities).
 //
 // Per F.1.1 §3.1 and the locked coordinator decision, the v0.5.0
@@ -79,7 +90,7 @@ const (
 // injection in CLI JSON-stream mode); flip when a wrapper sidecar
 // lands in F.5.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentProviderCapabilities).
 type Capabilities struct {
 	// SupportsMessageInjection reports whether Handle.Inject works
@@ -153,6 +164,18 @@ type Capabilities struct {
 	// (e.g. "Claude", "Codex"). Used in TUI/dashboard surfaces and
 	// log messages where the raw name is not user-friendly.
 	HumanLabel string `json:"humanLabel,omitempty"`
+
+	// SupportsTurnInputContext reports whether the provider can deliver
+	// Spec.InitialContext once via the first turn's user input rather
+	// than folding it into the persistent system prompt. Providers whose
+	// wire protocol re-includes the system prompt on every model turn
+	// (codex's baseInstructions) declare true so the runner can keep
+	// large, volatile context (recalled agent memory, session history)
+	// out of the per-turn re-sent prefix. Providers that have no such
+	// split (or that already fold everything into one prompt) leave this
+	// false; the runner then folds InitialContext into the system prompt
+	// as before.
+	SupportsTurnInputContext bool `json:"supportsTurnInputContext,omitempty"`
 }
 
 // IsSupported reports whether a Capabilities matrix has the named
@@ -183,6 +206,8 @@ func IsSupported(caps Capabilities, c Capability) bool {
 		return caps.AcceptsAllowedToolsList
 	case CapAcceptsMcpServerSpec:
 		return caps.AcceptsMcpServerSpec
+	case CapTurnInputContext:
+		return caps.SupportsTurnInputContext
 	default:
 		return false
 	}
@@ -190,7 +215,7 @@ func IsSupported(caps Capabilities, c Capability) bool {
 
 // SandboxLevel mirrors AgentSpawnConfig.sandboxLevel from the legacy TS.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts.
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts.
 type SandboxLevel string
 
 // SandboxLevel constants align with Codex sandbox policies (readOnly /
@@ -203,7 +228,7 @@ const (
 )
 
 // EffortLevel mirrors EffortLevel from
-// ../agentfactory/packages/core/src/providers/index.ts. Providers map
+// ../donmai-libraries/packages/core/src/providers/index.ts. Providers map
 // this to their native reasoning-effort knob:
 //   - Claude  : --effort flag
 //   - Codex   : reasoningEffort / model_reasoning_effort
@@ -248,7 +273,7 @@ type MCPServerConfig struct {
 
 // PermissionConfig is the runtime permission policy for the codex
 // approval bridge. Verbatim port of CodexPermissionConfig from
-// ../agentfactory/packages/core/src/templates/adapters.ts.
+// ../donmai-libraries/packages/core/src/templates/adapters.ts.
 //
 // Providers without NeedsPermissionConfig=true ignore this field.
 type PermissionConfig struct {
@@ -287,7 +312,7 @@ type CodeIntelEnforcement struct {
 // for not setting incompatible fields (gate on Capabilities before
 // invoking Spawn).
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentSpawnConfig).
 type Spec struct {
 	// Prompt is the task-specific directive.
@@ -340,9 +365,42 @@ type Spec struct {
 	// falls back to provider/env default.
 	Model string `json:"model,omitempty"`
 
+	// Endpoint is the RESOLVED model-endpoint binding. nil == default
+	// behavior: providers read Spec.Model / Spec.Env as before. nil is the
+	// canonical "unset" sentinel; Spawn read sites gate on Endpoint == nil
+	// (a non-nil pointer is treated as set — IsZero on the pointee is a
+	// convenience, not the unset check). Read sites: the claude harness
+	// projects the binding onto the CLI's serving-host env knobs
+	// (direct/bedrock/vertex — provider/harness/claude/endpoint.go) and
+	// the gemini harness routes the per-session generateContent URL
+	// (direct/vertex — spawnURL in provider/harness/gemini/gemini.go).
+	// Both honor Endpoint.Model over Spec.Model when set, the same rule as
+	// the one-shot lane. Harnesses without a read site (codex / opencode /
+	// amp / agycli) still intentionally ignore the field.
+	//
+	// Declared as a POINTER (not a value) so the json:"endpoint,omitempty"
+	// tag actually omits the field for pre-P1 producers — Go's encoding/json
+	// never treats a non-pointer struct as "empty", so a value field would
+	// always serialize "endpoint":{...} and break the wire round-trip
+	// guarantee (P1-SPEC §6). nil is the canonical "unset" sentinel.
+	Endpoint *EndpointBinding `json:"endpoint,omitempty"`
+
 	// Effort is the normalized reasoning-effort tier. Honored only
 	// when Capabilities.SupportsReasoningEffort is true.
 	Effort EffortLevel `json:"effort,omitempty"`
+
+	// ResponseSchema is the native structured-output JSON Schema for the
+	// one-shot/structured lane (P4b). Honored ONLY by harnesses that
+	// declare HarnessCaps.NativeJSONMode (the raw harnesses over gemini's
+	// responseSchema and ollama's format, plus codex's turn/start
+	// outputSchema) — they set the protocol's structured primitive so
+	// output is constrained server-side (STRICT).
+	// Harnesses without NativeJSONMode ignore it and rely on the soft prompt
+	// instruction SpawnComplete appends. nil/empty == today's free-text
+	// behavior; additive and omitempty so the wire round-trip is unchanged
+	// for every existing producer, and interactive (non-one-shot) Spawns
+	// never set it.
+	ResponseSchema json.RawMessage `json:"responseSchema,omitempty"`
 
 	// BaseInstructions are persistent system instructions
 	// (Codex thread/start ‘instructions'). Honored only when
@@ -353,6 +411,22 @@ type Spec struct {
 	// standard instruction sections (sourced from
 	// RepositoryConfig.systemPrompt).
 	SystemPromptAppend string `json:"systemPromptAppend,omitempty"`
+
+	// InitialContext is session context delivered ONCE with the first
+	// turn's user input rather than via the persistent system prompt.
+	// Use it for large, volatile, reference-style context (e.g. recalled
+	// agent memory) that the model needs available but that must NOT be
+	// re-sent on every model turn.
+	//
+	// Honored only by providers that declare
+	// Capabilities.SupportsTurnInputContext — i.e. those whose wire
+	// protocol re-includes the system prompt on every turn (codex's
+	// baseInstructions). For providers without that split the runner
+	// folds the same content into the system prompt instead, so callers
+	// never have to branch on provider identity. Keeping this content out
+	// of the system-prompt prefix avoids O(turns × prefix) token
+	// amplification on long codex sessions.
+	InitialContext string `json:"initialContext,omitempty"`
 
 	// PermissionConfig is the structured permission policy for
 	// providers that consume one (Codex approval bridge).

@@ -49,4 +49,4 @@ m.Teardown(ctx, "sess-123")
 ## Source
 
 - `manager.go` — `Manager`, `Provision`, `Teardown`, `Path`.
-- Legacy reference: `../../../agentfactory/packages/core/src/workarea/git-worktree.ts` + `../../../agentfactory/packages/cli/src/lib/worker-runner.ts:884-1000`.
+- Legacy reference: `../../../donmai-libraries/packages/core/src/workarea/git-worktree.ts` + `../../../donmai-libraries/packages/cli/src/lib/worker-runner.ts:884-1000`.

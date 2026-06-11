@@ -23,6 +23,13 @@ type SpecInputs struct {
 	// providers that consume it.
 	SystemPromptAppend string
 
+	// InitialContext is large/volatile session context (e.g. recalled
+	// agent memory) the runner routes through Spec.InitialContext so it
+	// rides the first turn's input rather than the re-sent system-prompt
+	// prefix. Empty unless the resolved provider declares
+	// Capabilities.SupportsTurnInputContext.
+	InitialContext string
+
 	// MCPServers is the list of MCP stdio configs the runtime/mcp
 	// builder produced. Empty when no plugins are enabled.
 	MCPServers []agent.MCPServerConfig
@@ -56,6 +63,7 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		MCPServers:         in.MCPServers,
 		Model:              strings.TrimSpace(qw.ResolvedProfile.Model),
 		SystemPromptAppend: in.SystemPromptAppend,
+		InitialContext:     in.InitialContext,
 		ProviderConfig:     copyProviderConfig(qw.ResolvedProfile.ProviderConfig),
 	}
 
@@ -65,6 +73,15 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	// can detect silently-ignored knobs.
 	if caps.SupportsReasoningEffort && qw.ResolvedProfile.Effort != "" {
 		spec.Effort = qw.ResolvedProfile.Effort
+	}
+
+	// InitialContext: only forward when the provider can deliver context
+	// via the first turn's input (SupportsTurnInputContext). Providers
+	// without that split receive the same content folded into the system
+	// prompt by the caller, so zeroing here keeps the on-the-wire Spec
+	// faithful and prevents accidental duplication.
+	if !caps.SupportsTurnInputContext {
+		spec.InitialContext = ""
 	}
 
 	// MCP tool plugins: only forward MCPServers when the provider
@@ -94,7 +111,7 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	// list empty; providers that need it (codex) accept the empty
 	// list as "all tools allowed".
 
-	// Platform-supplied disallowed-tool patterns (SUP-1840 Option B).
+	// Platform-supplied disallowed-tool patterns (Option B).
 	// Appended AFTER the runner's own defaultDisallowedTools() baseline
 	// so the static floor is never replaced, only extended.
 	// qw.DisallowedTools is the embedded prompt.QueuedWork field stamped

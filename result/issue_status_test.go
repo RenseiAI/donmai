@@ -39,7 +39,7 @@ func TestUpdateIssueStatus_HappyPath(t *testing.T) {
 		}
 		captured.Store(&req)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"success":true,"data":{"id":"issue-1","identifier":"REN-1"}}`))
+		_, _ = w.Write([]byte(`{"success":true,"data":{"id":"issue-1","identifier":"ENG-1"}}`))
 	}))
 	defer srv.Close()
 
@@ -218,7 +218,7 @@ func TestCreateIssueComment_HappyPath(t *testing.T) {
 	}
 }
 
-// TestUpdateIssueStatus_RefreshCredentialsOn401 confirms the SUP-1823
+// TestUpdateIssueStatus_RefreshCredentialsOn401 confirms the stale-JWT
 // fix for /api/issue-tracker-proxy: when the runtime JWT has expired
 // mid-session and the platform returns 401, the next retry attempt
 // re-invokes the CredentialProvider and posts with the fresh bearer

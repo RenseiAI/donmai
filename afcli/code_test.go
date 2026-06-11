@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -42,7 +41,7 @@ func execCodeCmd(t *testing.T, subArgs ...string) (map[string]any, error) {
 	fakeCodeBin(t)
 
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -118,7 +117,7 @@ func TestCodeGetRepoMap_WithFilePatterns(t *testing.T) {
 func TestCodeSearchSymbols_RequiresArg(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "search-symbols"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when no query provided")
@@ -161,7 +160,7 @@ func TestCodeSearchSymbols_AllFlags(t *testing.T) {
 func TestCodeSearchCode_RequiresArg(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "search-code"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when no query provided")
@@ -195,7 +194,7 @@ func TestCodeSearchCode_WithLanguage(t *testing.T) {
 func TestCodeCheckDuplicate_RequiresContentOrFile(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "check-duplicate"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when neither --content nor --content-file is provided")
@@ -219,7 +218,7 @@ func TestCodeCheckDuplicate_WithContent(t *testing.T) {
 func TestCodeCheckDuplicate_ContentAndFileMutuallyExclusive(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "check-duplicate", "--content", "x", "--content-file", "/tmp/f"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when both --content and --content-file are provided")
@@ -231,7 +230,7 @@ func TestCodeCheckDuplicate_ContentAndFileMutuallyExclusive(t *testing.T) {
 func TestCodeFindTypeUsages_RequiresArg(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "find-type-usages"})
 	if err := root.Execute(); err == nil {
 		t.Fatal("expected error when no type name provided")
@@ -289,26 +288,57 @@ func TestCodeValidateCrossDeps_WithPath(t *testing.T) {
 
 // ── Unavailable binary ────────────────────────────────────────────────────────
 
-func TestCodeCmd_UnavailableBinary(t *testing.T) {
-	// Clear any binary resolution env and shadow PATH.
+// TestCodeCmd_NativeNoExecRequired verifies that get-repo-map and
+// search-symbols succeed without any external binary because they use the
+// native Go implementation. Only exec-shim commands (search-code, etc.)
+// require the donmai-code binary.
+func TestCodeCmd_NativeNoExecRequired(t *testing.T) {
+	// Clear any binary resolution env and shadow PATH so donmai-code / pnpm
+	// cannot be found.
 	t.Setenv("AGENTFACTORY_CODE_BIN", "")
+	t.Setenv("DONMAI_CODE_BIN", "")
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", t.TempDir()) // dir with no binaries
 	defer func() { _ = os.Setenv("PATH", origPath) }()
 
-	// Verify pnpm really can't be found (skip if it unexpectedly can).
-	if _, err := exec.LookPath("pnpm"); err == nil {
-		t.Skip("pnpm found in PATH; cannot test unavailable binary path")
-	}
-
+	// get-repo-map must succeed without a binary (native implementation).
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newCodeCmd())
+	root.AddCommand(newCodeCmd(Config{}))
 	root.SetArgs([]string{"code", "get-repo-map"})
-	err := root.Execute()
-	if err == nil {
-		t.Fatal("expected error when af-code binary is not available")
+	if err := root.Execute(); err != nil {
+		t.Errorf("get-repo-map should not error without exec binary: %v", err)
 	}
-	if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "af-code") {
-		t.Errorf("expected 'not found' or 'af-code' in error, got: %v", err)
+}
+
+// TestCodeCmd_SearchCodeNativeNoExec verifies that search-code works without
+// any external binary (S2 native implementation). DONMAI_CODE_BIN is explicitly
+// unset so the native path is used; the command must succeed (returning JSON)
+// even when no donmai-code binary exists on PATH.
+func TestCodeCmd_SearchCodeNativeNoExec(t *testing.T) {
+	t.Setenv("AGENTFACTORY_CODE_BIN", "")
+	t.Setenv("DONMAI_CODE_BIN", "")
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", t.TempDir())
+	defer func() { _ = os.Setenv("PATH", origPath) }()
+
+	// Run in a temp dir with a minimal Go file so the index has something.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\nfunc main() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Change into the temp dir so cwd() picks it up.
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(orig) }()
+
+	var buf bytes.Buffer
+	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
+	root.SetOut(&buf)
+	root.AddCommand(newCodeCmd(Config{}))
+	root.SetArgs([]string{"code", "search-code", "main"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("search-code should not error with native S2 impl: %v", err)
 	}
 }

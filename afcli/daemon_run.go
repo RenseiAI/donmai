@@ -3,6 +3,7 @@ package afcli
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -15,12 +16,34 @@ import (
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
+
+// logRotateCheckInterval is how often a long-lived `daemon run` process
+// re-checks the launchd-managed log files for rotation.
+const logRotateCheckInterval = 6 * time.Hour
+
+// rotateDaemonLogs size-checks the launchd-managed daemon log files
+// (daemon.log / daemon-error.log) and rotates any that exceed
+// daemon.DefaultLogRotateMaxBytes. Best-effort: failures are reported to
+// errOut and otherwise ignored — rotation must never block the daemon.
+func rotateDaemonLogs(errOut io.Writer) {
+	for _, path := range []string{statehome.LogPath(), statehome.ErrorLogPath()} {
+		rotated, err := daemon.RotateLogIfOver(path, daemon.DefaultLogRotateMaxBytes)
+		if err != nil {
+			_, _ = fmt.Fprintf(errOut, "[daemon] log rotation failed for %s: %v\n", path, err)
+			continue
+		}
+		if rotated {
+			_, _ = fmt.Fprintf(errOut, "[daemon] rotated %s (previous generation at %s.1)\n", path, path)
+		}
+	}
+}
 
 // newDaemonRunCmd constructs the `daemon run` subcommand. This is the
 // long-running entry point registered by the launchd plist / systemd unit.
 //
-// REN-1406 wired the installer to register `<host-binary> daemon run`; this
+// The installer registers `<host-binary> daemon run` as the service entrypoint; this
 // command is what runs on those service managers.
 func newDaemonRunCmd(hostVersion string) *cobra.Command {
 	var (
@@ -45,6 +68,16 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			"the first-run setup. SIGTERM / SIGINT triggers a graceful drain.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Rotate the launchd-managed log files before anything writes
+			// to them this run, then re-check periodically for long-lived
+			// processes. launchd appends to daemon.log / daemon-error.log
+			// forever with no rotation of its own; without this they grow
+			// unbounded (tens of MB of routine token-refresh and poll
+			// chatter). Best-effort: rotation failures must never block
+			// daemon start. (systemd installs log to the journal; the
+			// files don't exist there and this is a no-op.)
+			rotateDaemonLogs(cmd.ErrOrStderr())
+
 			// Build the in-process AgentRuntime registry once at daemon
 			// startup so the local /api/daemon/providers* HTTP surface
 			// can introspect it. The same registry shape is rebuilt
@@ -52,7 +85,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// operator queries. Probes that fail (e.g. ollama not
 			// running) emit WARN logs but do not block daemon start.
 			// Wave 9 / A1.
-			providerReg := buildAgentRunRegistry(slog.Default())
+			providerReg := BuildAgentRunRegistry(slog.Default())
 			// Substitute the well-known DefaultHTTPPort here when the
 			// operator did not pass `--port`. Leaving zero through to
 			// daemon.New would bind an ephemeral port — correct for
@@ -114,6 +147,21 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 
+			// Periodic rotation re-check for long-lived daemon processes —
+			// the boot-time rotation above only helps across restarts.
+			go func() {
+				tick := time.NewTicker(logRotateCheckInterval)
+				defer tick.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-tick.C:
+						rotateDaemonLogs(cmd.ErrOrStderr())
+					}
+				}
+			}()
+
 			out := cmd.OutOrStdout()
 			if err := d.Start(ctx); err != nil {
 				return fmt.Errorf("daemon start: %w", err)
@@ -121,7 +169,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			_, _ = fmt.Fprintf(out, "[daemon] state -> %s\n", d.State())
 			// Print the worker id only after Start() completes registration so
 			// the value is the live, platform-assigned id (or a clearly-marked
-			// stub fallback). REN-1445 — previously the log fired with a stub
+			// stub fallback). Previously the log fired with a stub
 			// WorkerID like "worker-<host>-stub" before any real registration
 			// had a chance to run, misleading operators into thinking the
 			// daemon was registered when it was not.
@@ -230,7 +278,7 @@ func displayEnvLocalPath(s *afcreds.LocalSource) string {
 // formatStartupWorkerLine returns the post-Start `[daemon] worker-id ...`
 // line, or "" when no worker id has been assigned yet. Stub registrations
 // (worker id ending in `-stub`) are annotated so operators do not mistake
-// them for a successful platform registration. (REN-1445.)
+// them for a successful platform registration.
 func formatStartupWorkerLine(workerID string) string {
 	if workerID == "" {
 		return ""

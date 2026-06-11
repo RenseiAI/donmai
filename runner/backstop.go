@@ -12,7 +12,7 @@ import (
 
 // ============================================================================
 // Path-exclude data tables (verbatim port from
-// agentfactory/packages/core/src/orchestrator/session-backstop.ts:57-95).
+// donmai-libraries/packages/core/src/orchestrator/session-backstop.ts:57-95).
 // ============================================================================
 //
 // The lists below are the data the legacy TS shouldExcludeFromBackstop
@@ -160,7 +160,10 @@ func shouldBackstop(res *Result) bool {
 		return false
 	}
 	switch res.FailureMode {
-	case FailureLostOwnership, FailureTimeout, FailureProviderResolve:
+	case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked:
+		// FailureAgentBlocked: the agent deliberately declined — there is
+		// no in-progress work to commit, and an empty-branch backstop PR
+		// would misrepresent a reasoned refusal as abandoned work.
 		return false
 	}
 	// If the agent already produced a PR, nothing to do.

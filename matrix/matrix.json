@@ -1,0 +1,368 @@
+{
+  "schemaVersion": "p1.0",
+  "contractAbi": "capability-matrix/v1",
+  "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
+  "cells": [
+    {
+      "harness": "amp",
+      "endpoint": "anthropic",
+      "host": "direct",
+      "protocol": "anthropic-messages",
+      "transport": "cli-injection",
+      "authModes": [
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": "amp",
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "antigravity",
+      "endpoint": "google",
+      "host": "oauth-cli",
+      "protocol": "antigravity-oauth",
+      "transport": "pty",
+      "authModes": [
+        "host-session",
+        "local"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "host-subscription",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": "agy-cli",
+      "stability": "stable",
+      "smoked": true
+    },
+    {
+      "harness": "claude-code",
+      "endpoint": "anthropic",
+      "host": "bedrock",
+      "protocol": "anthropic-messages",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "forced-tool",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "claude-code",
+      "endpoint": "anthropic",
+      "host": "direct",
+      "protocol": "anthropic-messages",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "forced-tool",
+      "legacyProviderId": null,
+      "stability": "stable",
+      "smoked": false
+    },
+    {
+      "harness": "claude-code",
+      "endpoint": "anthropic",
+      "host": "oauth-cli",
+      "protocol": "anthropic-messages",
+      "transport": "cli-injection",
+      "authModes": [
+        "host-session"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "host-subscription",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": "claude",
+      "stability": "stable",
+      "smoked": true
+    },
+    {
+      "harness": "claude-code",
+      "endpoint": "anthropic",
+      "host": "vertex",
+      "protocol": "anthropic-messages",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "forced-tool",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "codex",
+      "endpoint": "openai",
+      "host": "azure",
+      "protocol": "openai-chat",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "output-schema",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "codex",
+      "endpoint": "openai",
+      "host": "direct",
+      "protocol": "openai-chat",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "output-schema",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "codex",
+      "endpoint": "openai",
+      "host": "oauth-cli",
+      "protocol": "openai-responses",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "host-session"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "host-subscription",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "output-schema",
+      "legacyProviderId": "codex",
+      "stability": "stable",
+      "smoked": true
+    },
+    {
+      "harness": "opencode",
+      "endpoint": "google",
+      "host": "local",
+      "protocol": "openai-chat",
+      "transport": "cli-injection",
+      "authModes": [
+        "local"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "local",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "json-schema",
+      "legacyProviderId": null,
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
+      "harness": "opencode",
+      "endpoint": "openai",
+      "host": "direct",
+      "protocol": "openai-chat",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "json-schema",
+      "legacyProviderId": "opencode",
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "raw",
+      "endpoint": "google",
+      "host": "direct",
+      "protocol": "gemini-generate",
+      "transport": "direct-api",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "response-schema",
+      "legacyProviderId": "gemini",
+      "stability": "stable",
+      "smoked": true
+    },
+    {
+      "harness": "raw",
+      "endpoint": "google",
+      "host": "vertex",
+      "protocol": "gemini-generate",
+      "transport": "direct-api",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "response-schema",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "raw",
+      "endpoint": "local",
+      "host": "local",
+      "protocol": "ollama",
+      "transport": "direct-api",
+      "authModes": [
+        "local"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "local",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "format-json",
+      "legacyProviderId": "ollama",
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "stub",
+      "endpoint": "stub",
+      "host": "local",
+      "protocol": "stub",
+      "transport": "direct-api",
+      "authModes": [
+        "local"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "local",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "stub",
+      "legacyProviderId": "stub",
+      "stability": "stable",
+      "smoked": true
+    }
+  ],
+  "denylist": [],
+  "legacyAliases": [
+    {
+      "providerName": "agy-cli",
+      "cell": {
+        "harness": "antigravity",
+        "endpoint": "google",
+        "host": "oauth-cli"
+      }
+    },
+    {
+      "providerName": "amp",
+      "cell": {
+        "harness": "amp",
+        "endpoint": "anthropic",
+        "host": "direct"
+      }
+    },
+    {
+      "providerName": "claude",
+      "cell": {
+        "harness": "claude-code",
+        "endpoint": "anthropic",
+        "host": "oauth-cli"
+      }
+    },
+    {
+      "providerName": "codex",
+      "cell": {
+        "harness": "codex",
+        "endpoint": "openai",
+        "host": "oauth-cli"
+      }
+    },
+    {
+      "providerName": "gemini",
+      "cell": {
+        "harness": "raw",
+        "endpoint": "google",
+        "host": "direct"
+      }
+    },
+    {
+      "providerName": "ollama",
+      "cell": {
+        "harness": "raw",
+        "endpoint": "local",
+        "host": "local"
+      }
+    },
+    {
+      "providerName": "opencode",
+      "cell": {
+        "harness": "opencode",
+        "endpoint": "openai",
+        "host": "direct"
+      }
+    },
+    {
+      "providerName": "stub",
+      "cell": {
+        "harness": "stub",
+        "endpoint": "stub",
+        "host": "local"
+      }
+    }
+  ]
+}

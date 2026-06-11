@@ -4,7 +4,7 @@ package runner
 //
 // Typed declaration of what each work type must produce before a session
 // is considered successful. Verbatim port of the per-workType contract
-// from agentfactory/packages/core/src/orchestrator/completion-contracts.ts
+// from donmai-libraries/packages/core/src/orchestrator/completion-contracts.ts
 // — see that file for the design rationale.
 //
 // The runner consults these contracts in two places:
@@ -16,7 +16,7 @@ package runner
 //     a WORK_RESULT marker, the runner posts the diagnostic comment from
 //     sdlc.go::diagnosticCommentBody.
 //
-// REN-1467 (this wave): WORK_RESULT is added to the development /
+// WORK_RESULT is added to the development /
 // coordination / inflight / inflight-coordination required fields so the
 // post-session decision tree (sdlc.go::resolveTargetStatus) has the
 // signal it needs to decide promote vs fail.
@@ -110,11 +110,10 @@ var (
 
 // completionContracts is the per-workType contract table.
 //
-// REN-1467 difference vs the legacy TS table: development / inflight /
+// Difference vs the legacy TS table: development / inflight /
 // coordination / inflight-coordination now include FieldWorkResult so
 // the post-session decision tree has a parseable signal for
-// promote-vs-fail. The legacy TS table is being updated in lockstep
-// (umbrella REN-1466).
+// promote-vs-fail. The legacy TS table is being updated in lockstep.
 var completionContracts = map[string]CompletionContract{
 	WorkTypeDevelopmentStr: {
 		WorkType: WorkTypeDevelopmentStr,

@@ -50,7 +50,7 @@ type Options struct {
 	// PoolStatsProvider returns the current workarea pool snapshot. May be
 	// nil — the /api/daemon/pool/stats endpoint will return an empty
 	// snapshot in that case (acceptance criterion: pool integration is
-	// optional in the runtime port; full WorkareaProvider wiring is REN-1280).
+	// optional in the runtime port; full WorkareaProvider wiring is future work).
 	PoolStatsProvider PoolStatsProvider
 	// EvictHandler handles pool eviction requests. May be nil; the endpoint
 	// returns 501 in that case.
@@ -122,6 +122,11 @@ type Daemon struct {
 	poller    *PollService
 	spawner   *WorkerSpawner
 
+	// tokenRefresher proactively re-mints the runtime JWT before expiry
+	// so the reactive 401 paths in heartbeat/poll stay quiet backstops.
+	// Nil for stub registrations and when registration is skipped.
+	tokenRefresher *tokenRefresher
+
 	// lastHostStatus stores the most recent hostStatus the platform sent
 	// in a heartbeat response. The pool-deleted / pool-disabled signals
 	// surface here so af daemon stats can show "your pool was deleted —
@@ -135,7 +140,7 @@ type Daemon struct {
 
 	// sessionDetails stores the per-session payload the spawner
 	// hands out to `donmai agent run` workers via the local control
-	// HTTP API at /api/daemon/sessions/<id>. (REN-1461 / F.2.8.)
+	// HTTP API at /api/daemon/sessions/<id>.
 	sessionDetails *sessionDetailStore
 
 	// routingTraces is the in-process record of cross-provider
@@ -276,6 +281,14 @@ func (d *Daemon) ActiveSessions() []SessionHandle {
 	return d.spawner.ActiveSessions()
 }
 
+// Spawner returns the daemon's WorkerSpawner so callers can subscribe to
+// session lifecycle events via WorkerSpawner.On without needing the spawner
+// to be re-exposed through a higher-level hook. Returns nil before Start is
+// called.
+func (d *Daemon) Spawner() *WorkerSpawner {
+	return d.spawner
+}
+
 // maxConcurrentSessions returns the current per-host capacity envelope under
 // the read lock. Capacity can be mutated at runtime via the local control
 // API (POST /api/daemon/capacity → handleSetCapacity), and the heartbeat
@@ -358,7 +371,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Region:            cfg.Machine.Region,
 			JWTPath:           d.opts.JWTPath,
 			Provides:          provides,
-			DaemonProjects:    allowlistEntriesFromConfig(cfg.Projects),
+			DaemonProjects:    AllowlistEntriesFromConfig(cfg.Projects),
 		}
 		var err error
 		regResp, err = Register(ctx, regOpts)
@@ -386,7 +399,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// Default WorkerCommand: spawn `donmai agent run` from the same
 	// binary as the running daemon process so session lifecycle is
 	// owned in-tree. Operators can override via SpawnerOptions.
-	// (REN-1461 / F.2.8 — daemon wire-up.)
+	// (F.2.8 — daemon wire-up.)
 	if len(spawnerOpts.WorkerCommand) == 0 {
 		if cmd := defaultWorkerCommand(); cmd != nil {
 			spawnerOpts.WorkerCommand = cmd
@@ -399,7 +412,6 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// drain-and-discard — leaving operators flying blind between
 	// runner.Run() start and a `status=failed` post. Callers that already
 	// supply their own writers via SpawnerOptions retain priority.
-	// (REN-1463 / v0.5.1.)
 	if spawnerOpts.StdoutPrefixWriter == nil {
 		spawnerOpts.StdoutPrefixWriter = newStdoutSlogWriter()
 	}
@@ -429,22 +441,22 @@ func (d *Daemon) Start(ctx context.Context) error {
 	})
 
 	if regResp != nil {
-		// Heartbeat + poll share an OnReregister implementation so a 401 on
-		// either path re-mints the runtime JWT once and refreshes both
-		// services with the new credentials.
+		// Heartbeat + poll + the proactive token refresher share ONE refresh
+		// implementation so a refresh on any path re-mints the runtime JWT
+		// once and fans the fresh credentials out to every consumer.
 		//
-		// REN-1481 fix: route through RefreshRuntimeToken which probes a
+		// Token-refresh fix: route through RefreshRuntimeToken which probes a
 		// real refresh endpoint first (preserving the workerId) and only
 		// falls back to a full Register() — minting a fresh workerId — if
 		// the platform side has not yet shipped the refresh handler. The
 		// `[runtime-token]` log line attests which path was taken.
-		reregister := func(rctx context.Context, reason string) (string, string, error) {
+		refreshCreds := func(rctx context.Context, reason string) (*RefreshTokenResult, error) {
 			d.mu.RLock()
 			currentWorker := d.workerID
 			d.mu.RUnlock()
 			result, err := RefreshRuntimeToken(rctx, regOpts, currentWorker, reason)
 			if err != nil {
-				return "", "", err
+				return nil, err
 			}
 			d.mu.Lock()
 			d.workerID = result.WorkerID
@@ -453,13 +465,53 @@ func (d *Daemon) Start(ctx context.Context) error {
 			if d.sessionDetails != nil {
 				d.sessionDetails.UpdateRuntimeCredentials(result.WorkerID, result.RuntimeToken)
 			}
+			// Fan the fresh credentials out to both long-running loops. The
+			// loop that triggered the refresh re-applies its own copy too —
+			// harmlessly idempotent — but the OTHER loop now picks up the new
+			// token without burning a 401 round-trip (and a duplicate refresh
+			// + log cycle) of its own.
+			if d.heartbeat != nil {
+				d.heartbeat.SetCredentials(result.WorkerID, result.RuntimeToken)
+			}
+			if d.poller != nil {
+				d.poller.SetCredentials(result.WorkerID, result.RuntimeToken)
+			}
+			// Persist the refreshed credentials to the on-disk cache so other
+			// readers of daemon.jwt pick up the new token instead of the now-
+			// stale one. Heartbeat/poll use the in-memory swap above, but the
+			// per-session credential resolver and the runner's platform client
+			// read the token from disk — without this write they keep using the
+			// expired token (snapshot 307→HTML, status-update 401). Best-effort:
+			// a cache-write failure must never abort the refresh.
+			if regOpts.JWTPath != "" {
+				if serr := persistRefreshedToken(regOpts.JWTPath, result, regOpts.Now); serr != nil {
+					slog.Warn("[runtime-token] failed to persist refreshed token to cache",
+						"event", "refresh.cache-write-failed",
+						"workerId", result.WorkerID,
+						"jwtPath", regOpts.JWTPath,
+						"err", serr.Error(),
+					)
+				} else {
+					slog.Info("[runtime-token]",
+						"event", "refresh.cached",
+						"workerId", result.WorkerID,
+					)
+				}
+			}
+			return result, nil
+		}
+		reregister := func(rctx context.Context, reason string) (string, string, error) {
+			result, err := refreshCreds(rctx, reason)
+			if err != nil {
+				return "", "", err
+			}
 			return result.WorkerID, result.RuntimeToken, nil
 		}
 
-		// Heartbeat. OnReregister handles runtime-token expiry: the platform
-		// runtime JWT TTL is 1h with no refresh endpoint, so on a 401 (or the
-		// worker falling out of Redis after the 5-min heartbeat TTL — returned
-		// as 404) we re-mint by calling Register() with ForceReregister=true.
+		// Heartbeat. OnReregister handles reactive runtime-token expiry (the
+		// backstop behind the proactive refresher below): on a 401, or the
+		// worker falling out of Redis after the 5-min heartbeat TTL (returned
+		// as 404), we re-mint via RefreshRuntimeToken.
 		d.heartbeat = NewHeartbeatService(HeartbeatOptions{
 			WorkerID:        regResp.WorkerID,
 			Hostname:        cfg.Machine.ID,
@@ -468,16 +520,21 @@ func (d *Daemon) Start(ctx context.Context) error {
 			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
 			GetActiveCount:  func() int { return d.spawnerActiveCount() },
 			GetMaxCount:     func() int { return d.maxConcurrentSessions() },
-			GetStatus:       d.registrationStatus,
+			GetStatus:       d.RegistrationStatus,
 			Region:          cfg.Machine.Region,
 			OnReregister:    reregister,
+			LogWarn: func(format string, args ...any) {
+				slog.Warn(fmt.Sprintf(format, args...))
+			},
+			LogInfo: func(format string, args ...any) {
+				slog.Info(fmt.Sprintf(format, args...))
+			},
 			GetAllowlist: func() []ProjectAllowlistEntry {
-				d.mu.RLock()
-				defer d.mu.RUnlock()
-				if d.config == nil {
-					return nil
-				}
-				return allowlistEntriesFromConfig(d.config.Projects)
+				// Use d.spawner.AllProjects() so that satellite-org
+				// projects registered via AddProjects are included in
+				// the heartbeat's reported allowlist. d.spawner is set
+				// before the heartbeat is constructed (see above).
+				return AllowlistEntriesFromConfig(d.spawner.AllProjects())
 			},
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
@@ -512,10 +569,17 @@ func (d *Daemon) Start(ctx context.Context) error {
 					slog.Info(fmt.Sprintf(format, args...))
 				},
 				OnWork: func(item PollWorkItem) error {
-					spec := pollItemToSessionSpec(item, cfg.Projects)
-					detail := pollItemToSessionDetail(
+					// Use d.spawner.AllProjects() so that satellite-org
+					// projects registered via AddProjects after daemon start
+					// are visible to the slug→URL resolution performed by
+					// PollItemToSessionSpec / PollItemToSessionDetail.
+					// cfg.Projects is the startup snapshot and would miss
+					// any extraProjects appended later.
+					projects := d.spawner.AllProjects()
+					spec := PollItemToSessionSpec(item, projects)
+					detail := PollItemToSessionDetail(
 						item,
-						cfg.Projects,
+						projects,
 						cfg.Orchestrator.URL,
 						d.runtimeJWT(),
 						d.WorkerID(),
@@ -565,6 +629,24 @@ func (d *Daemon) Start(ctx context.Context) error {
 				OnReregister: reregister,
 			})
 			d.poller.Start()
+
+			// Proactive token refresh — re-mint the runtime JWT shortly
+			// BEFORE expiry so the steady state is one quiet scheduled
+			// refresh per TTL window instead of the reactive hourly
+			// 401→refresh log cycle on both the heartbeat and poll paths.
+			// Gated like the poll loop: stub registrations have no platform
+			// to refresh against.
+			d.tokenRefresher = newTokenRefresher(tokenRefresherOptions{
+				ExpiresAt: parseTokenExpiry(regResp.RuntimeTokenExpiresAt),
+				Refresh: func(rctx context.Context) (time.Time, error) {
+					result, err := refreshCreds(rctx, "proactive-expiry")
+					if err != nil {
+						return time.Time{}, err
+					}
+					return parseTokenExpiry(result.RuntimeTokenExpiresAt), nil
+				},
+			})
+			d.tokenRefresher.Start()
 		}
 	}
 
@@ -608,8 +690,8 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	// Cheap equality check on the structured allowlist projection — same
 	// shape the heartbeat reports, so this exactly matches "what the
 	// platform would see change".
-	before := allowlistEntriesFromConfig(d.config.Projects)
-	after := allowlistEntriesFromConfig(cfg.Projects)
+	before := AllowlistEntriesFromConfig(d.config.Projects)
+	after := AllowlistEntriesFromConfig(cfg.Projects)
 	if allowlistHash(before) == allowlistHash(after) {
 		d.mu.Unlock()
 		return
@@ -650,6 +732,9 @@ func (d *Daemon) Stop(_ context.Context) error {
 		}
 		if d.poller != nil {
 			d.poller.Stop()
+		}
+		if d.tokenRefresher != nil {
+			d.tokenRefresher.Stop()
 		}
 		if d.yamlWatcherStop != nil {
 			d.yamlWatcherStop()
@@ -813,7 +898,26 @@ func (d *Daemon) spawnerActiveCount() int {
 	return d.spawner.ActiveCount()
 }
 
-func (d *Daemon) registrationStatus() RegistrationStatus {
+// ActiveSessionCount returns the number of agent sessions currently running
+// under the daemon's shared WorkerSpawner. Exported so embedders can wire this
+// into a satellite heartbeat's GetActiveCount callback for a shared-spawner
+// multi-identity configuration.
+func (d *Daemon) ActiveSessionCount() int {
+	return d.spawnerActiveCount()
+}
+
+// MaxConcurrentSessions returns the per-host capacity ceiling configured for
+// this daemon. Exported so embedders can wire this into a satellite heartbeat's
+// GetMaxCount callback for a shared-spawner multi-identity configuration.
+func (d *Daemon) MaxConcurrentSessions() int {
+	return d.maxConcurrentSessions()
+}
+
+// RegistrationStatus returns the current registration state of the daemon
+// (idle, busy, or draining). Exported so embedders can wire this into a
+// satellite heartbeat's GetStatus callback for a shared-spawner multi-identity
+// configuration.
+func (d *Daemon) RegistrationStatus() RegistrationStatus {
 	switch d.State() {
 	case StateDraining, StateUpdating:
 		return RegistrationDraining

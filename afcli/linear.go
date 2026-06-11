@@ -1,20 +1,20 @@
 package afcli
 
-// af linear — Linear issue-tracker operations.
+// donmai linear — Linear issue-tracker operations.
 //
-// This file ports the TypeScript `af-linear` CLI surface to Go. Each subcommand
+// This file ports the TypeScript `donmai-linear` CLI surface to Go. Each subcommand
 // mirrors the TS implementation in packages/linear/src/tools/linear-runner.ts.
 // JSON output shapes are intentionally preserved for automation compatibility.
 //
 // Auth strategy (per ADR-2026-05-12-cli-linear-proxy):
 //   1. LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) env var → direct GraphQL calls
-//      to api.linear.app. Preserves the standalone `af` path AND the
+//      to api.linear.app. Preserves the standalone `donmai` path AND the
 //      worker-fleet path where `donmai agent run` injects the env var into the
 //      in-session shell.
 //   1.5. No env key + WORKER_AUTH_TOKEN + DONMAI_API_URL set → in-box cloud
 //      agent. The runner exports the short-lived worker runtime JWT and the
 //      platform URL; proxy GraphQL through /api/cli/linear/graphql under that
-//      JWT (the route accepts it as an additive auth fall-through). REN-1554.
+//      JWT (the route accepts it as an additive auth fall-through).
 //   2. No env key + ds() returns an authenticated *afclient.Client (rsk_ token
 //      + base URL) → platform proxy mode via `linear.NewProxiedClient`. The
 //      platform unwraps the rsk_, looks up the org's stored Linear OAuth
@@ -26,10 +26,9 @@ package afcli
 // without conditional logic and matches the explicit-env-overrides-default
 // posture every other afcli command uses.
 //
-// check-deployment is implemented as an exec-shim for v1.0.0: the Go command
-// delegates to the `af-linear` JS binary on PATH when available. A full Go
-// port (requiring Vercel + GitHub API clients) is deferred to v1.0.x. The
-// shim is explicitly marked deprecated in its help text.
+// check-deployment is implemented natively in Go (GO-3): it uses the gh CLI
+// to query the GitHub Commit Status API, filters Vercel contexts, and outputs
+// JSON or Markdown. No external JS binary is required.
 
 import (
 	"context"
@@ -57,13 +56,14 @@ import (
 // pick up rsk_ credentials when running embedded under rensei. The factory
 // may be nil (e.g. minimal test embedders) — subcommands degrade to the
 // LINEAR_API_KEY env path.
-func newLinearCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearCmd(ds func() afclient.DataSource, cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "linear",
 		Short: "Linear issue-tracker operations",
 		Long: `Linear issue-tracker operations.
 
-Mirrors the TypeScript 'pnpm af-linear' surface. Outputs JSON to stdout.
+Mirrors the TypeScript 'pnpm donmai-linear' surface. Outputs JSON to stdout.
 
 Authentication (in order):
   1. LINEAR_API_KEY (or LINEAR_ACCESS_TOKEN) env var → direct calls to api.linear.app.
@@ -76,22 +76,22 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newLinearGetIssueCmd(ds))
-	cmd.AddCommand(newLinearCreateIssueCmd(ds))
-	cmd.AddCommand(newLinearUpdateIssueCmd(ds))
-	cmd.AddCommand(newLinearListCommentsCmd(ds))
-	cmd.AddCommand(newLinearCreateCommentCmd(ds))
-	cmd.AddCommand(newLinearAddRelationCmd(ds))
-	cmd.AddCommand(newLinearListRelationsCmd(ds))
-	cmd.AddCommand(newLinearRemoveRelationCmd(ds))
-	cmd.AddCommand(newLinearListSubIssuesCmd(ds))
-	cmd.AddCommand(newLinearListSubIssueStatusesCmd(ds))
-	cmd.AddCommand(newLinearUpdateSubIssueCmd(ds))
-	cmd.AddCommand(newLinearListIssuesCmd(ds))
-	cmd.AddCommand(newLinearCheckBlockedCmd(ds))
-	cmd.AddCommand(newLinearListBacklogIssuesCmd(ds))
-	cmd.AddCommand(newLinearListUnblockedBacklogCmd(ds))
-	cmd.AddCommand(newLinearCreateBlockerCmd(ds))
+	cmd.AddCommand(newLinearGetIssueCmd(ds, bin))
+	cmd.AddCommand(newLinearCreateIssueCmd(ds, bin))
+	cmd.AddCommand(newLinearUpdateIssueCmd(ds, bin))
+	cmd.AddCommand(newLinearListCommentsCmd(ds, bin))
+	cmd.AddCommand(newLinearCreateCommentCmd(ds, bin))
+	cmd.AddCommand(newLinearAddRelationCmd(ds, bin))
+	cmd.AddCommand(newLinearListRelationsCmd(ds, bin))
+	cmd.AddCommand(newLinearRemoveRelationCmd(ds, bin))
+	cmd.AddCommand(newLinearListSubIssuesCmd(ds, bin))
+	cmd.AddCommand(newLinearListSubIssueStatusesCmd(ds, bin))
+	cmd.AddCommand(newLinearUpdateSubIssueCmd(ds, bin))
+	cmd.AddCommand(newLinearListIssuesCmd(ds, bin))
+	cmd.AddCommand(newLinearCheckBlockedCmd(ds, bin))
+	cmd.AddCommand(newLinearListBacklogIssuesCmd(ds, bin))
+	cmd.AddCommand(newLinearListUnblockedBacklogCmd(ds, bin))
+	cmd.AddCommand(newLinearCreateBlockerCmd(ds, bin))
 	cmd.AddCommand(newLinearCheckDeploymentCmd())
 
 	return cmd
@@ -110,8 +110,7 @@ func apiKey() string {
 
 // workerAuthProxyCredentials resolves the in-box worker proxy credentials from
 // the environment the runner exports for cloud agents: the worker runtime JWT
-// (WORKER_AUTH_TOKEN) plus the platform base URL (DONMAI_API_URL, with the
-// deprecated AGENTFACTORY_API_URL accepted during the v1 transition). Returns
+// (WORKER_AUTH_TOKEN) plus the platform base URL (DONMAI_API_URL). Returns
 // ok=false when either is absent, so the caller falls through to the rsk_
 // DataSource path. Mirrors the env names set in runner/loop.go buildSessionEnv.
 func workerAuthProxyCredentials() (baseURL, token string, ok bool) {
@@ -120,9 +119,6 @@ func workerAuthProxyCredentials() (baseURL, token string, ok bool) {
 		return "", "", false
 	}
 	baseURL = strings.TrimSpace(os.Getenv("DONMAI_API_URL"))
-	if baseURL == "" {
-		baseURL = strings.TrimSpace(os.Getenv("AGENTFACTORY_API_URL"))
-	}
 	if baseURL == "" {
 		return "", "", false
 	}
@@ -142,7 +138,7 @@ func workerAuthProxyCredentials() (baseURL, token string, ok bool) {
 // HTTP server. The proxy path is exercised by tests via injecting a
 // MockClient-equivalent DataSource that returns an *afclient.Client whose
 // BaseURL points at the test server.
-func newLinearClient(ds func() afclient.DataSource) (linear.Linear, error) {
+func newLinearClient(ds func() afclient.DataSource, bin string) (linear.Linear, error) {
 	// Path 1: env-var direct.
 	if key := apiKey(); key != "" {
 		c, err := linear.NewClient(key)
@@ -155,8 +151,8 @@ func newLinearClient(ds func() afclient.DataSource) (linear.Linear, error) {
 		return c, nil
 	}
 
-	// Path 1.5: in-box worker runtime JWT (REN-1554 / GAP 1). Cloud agents
-	// running under `donmai agent run` have neither a LINEAR_API_KEY nor an
+	// Path 1.5: in-box worker runtime JWT. Cloud agents running under
+	// `donmai agent run` have neither a LINEAR_API_KEY nor an
 	// rsk_-authenticated DataSource — the runner exports the short-lived worker
 	// runtime JWT as WORKER_AUTH_TOKEN and the platform base URL as
 	// DONMAI_API_URL (see donmai/runner/loop.go buildSessionEnv). The platform's
@@ -168,7 +164,7 @@ func newLinearClient(ds func() afclient.DataSource) (linear.Linear, error) {
 		return linear.NewProxiedClient(baseURL, token)
 	}
 
-	// Path 2: platform proxy (rensei login session).
+	// Path 2: platform proxy (platform login session).
 	if ds != nil {
 		if baseURL, token, ok := afclient.CredentialsFromDataSource(ds()); ok {
 			return linear.NewProxiedClient(baseURL, token)
@@ -176,10 +172,9 @@ func newLinearClient(ds func() afclient.DataSource) (linear.Linear, error) {
 	}
 
 	// Path 3: neither — actionable error.
-	return nil, fmt.Errorf(
-		"linear access requires either a LINEAR_API_KEY env var or a " +
-			"logged-in platform session: set the env var, or run `rensei login` " +
-			"then `rensei project trackers connect-linear`",
+	return nil, userError(
+		"linear access requires either a LINEAR_API_KEY env var or a logged-in platform session",
+		"set the LINEAR_API_KEY env var, or run `"+bin+" auth add --user` then `"+bin+" project trackers connect-linear`",
 	)
 }
 
@@ -306,14 +301,14 @@ func labelNames(labels []linear.Label) []string {
 
 // ─── get-issue ────────────────────────────────────────────────────────────────
 
-func newLinearGetIssueCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	return &cobra.Command{
 		Use:          "get-issue <id>",
 		Short:        "Get issue details",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -348,7 +343,7 @@ func newLinearGetIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── create-issue ─────────────────────────────────────────────────────────────
 
-func newLinearCreateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		title           string
 		team            string
@@ -373,13 +368,13 @@ func newLinearCreateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 				team = os.Getenv("LINEAR_TEAM_NAME")
 			}
 			if title == "" || team == "" {
-				return fmt.Errorf(
-					"usage: af linear create-issue --title \"Title\" --team \"Team\" [--description \"...\"] ...\n" +
-						"Tip: Set LINEAR_TEAM_NAME env var to provide a default team",
+				return userError(
+					"--title and --team are required (or set LINEAR_TEAM_NAME)",
+					"Usage: "+cmd.UseLine()+" --title \"Title\" --team \"Team\"",
 				)
 			}
 
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -467,7 +462,7 @@ func newLinearCreateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── update-issue ─────────────────────────────────────────────────────────────
 
-func newLinearUpdateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		title           string
 		description     string
@@ -483,7 +478,7 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -566,14 +561,14 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── list-comments ────────────────────────────────────────────────────────────
 
-func newLinearListCommentsCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearListCommentsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	return &cobra.Command{
 		Use:          "list-comments <issue-id>",
 		Short:        "List comments on an issue",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -597,7 +592,7 @@ func newLinearListCommentsCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── create-comment ───────────────────────────────────────────────────────────
 
-func newLinearCreateCommentCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearCreateCommentCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		body     string
 		bodyFile string
@@ -614,10 +609,13 @@ func newLinearCreateCommentCmd(ds func() afclient.DataSource) *cobra.Command {
 				return err
 			}
 			if resolvedBody == "" {
-				return fmt.Errorf("usage: af linear create-comment <issue-id> --body \"Comment text\" or --body-file /path/to/file")
+				return userError(
+					"--body or --body-file is required",
+					"Usage: "+cmd.UseLine()+" --body \"Comment text\" (or --body-file /path/to/file)",
+				)
 			}
 
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -642,7 +640,7 @@ func newLinearCreateCommentCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── add-relation ─────────────────────────────────────────────────────────────
 
-func newLinearAddRelationCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearAddRelationCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var relType string
 
 	cmd := &cobra.Command{
@@ -652,10 +650,13 @@ func newLinearAddRelationCmd(ds func() afclient.DataSource) *cobra.Command {
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !isValidRelationType(relType) {
-				return fmt.Errorf("usage: af linear add-relation <issue-id> <related-issue-id> --type <related|blocks|duplicate>")
+				return userError(
+					"--type is required and must be one of: related, blocks, duplicate",
+					"Usage: "+cmd.UseLine()+" --type <related|blocks|duplicate>",
+				)
 			}
 
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -699,14 +700,14 @@ func isValidRelationType(t string) bool {
 
 // ─── list-relations ───────────────────────────────────────────────────────────
 
-func newLinearListRelationsCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearListRelationsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	return &cobra.Command{
 		Use:          "list-relations <issue-id>",
 		Short:        "List relations for an issue",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -754,14 +755,14 @@ func newLinearListRelationsCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── remove-relation ──────────────────────────────────────────────────────────
 
-func newLinearRemoveRelationCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearRemoveRelationCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	return &cobra.Command{
 		Use:          "remove-relation <relation-id>",
 		Short:        "Remove a relation by ID",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -779,14 +780,14 @@ func newLinearRemoveRelationCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── list-sub-issues ──────────────────────────────────────────────────────────
 
-func newLinearListSubIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearListSubIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	return &cobra.Command{
 		Use:          "list-sub-issues <parent-issue-id>",
 		Short:        "List sub-issues of a parent issue",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -837,14 +838,14 @@ var terminalStatuses = map[string]bool{
 	"Canceled":  true,
 }
 
-func newLinearListSubIssueStatusesCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearListSubIssueStatusesCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	return &cobra.Command{
 		Use:          "list-sub-issue-statuses <parent-issue-id>",
 		Short:        "List sub-issue statuses (lightweight)",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -896,7 +897,7 @@ func newLinearListSubIssueStatusesCmd(ds func() afclient.DataSource) *cobra.Comm
 
 // ─── update-sub-issue ─────────────────────────────────────────────────────────
 
-func newLinearUpdateSubIssueCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearUpdateSubIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		state   string
 		comment string
@@ -909,10 +910,13 @@ func newLinearUpdateSubIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if state == "" && comment == "" {
-				return fmt.Errorf("usage: af linear update-sub-issue <issue-id> --state \"Finished\" [--comment \"...\"]")
+				return userError(
+					"--state or --comment is required",
+					"Usage: "+cmd.UseLine()+" --state \"Finished\" [--comment \"...\"]",
+				)
 			}
 
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -963,7 +967,7 @@ func newLinearUpdateSubIssueCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── list-issues ──────────────────────────────────────────────────────────────
 
-func newLinearListIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		project  string
 		status   string
@@ -981,7 +985,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
 		Short:        "List issues with flexible filters",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -1120,14 +1124,14 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── check-blocked ────────────────────────────────────────────────────────────
 
-func newLinearCheckBlockedCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearCheckBlockedCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	return &cobra.Command{
 		Use:          "check-blocked <issue-id>",
 		Short:        "Check if an issue is blocked",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -1157,7 +1161,7 @@ func newLinearCheckBlockedCmd(ds func() afclient.DataSource) *cobra.Command {
 
 // ─── list-backlog-issues ──────────────────────────────────────────────────────
 
-func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var project string
 
 	cmd := &cobra.Command{
@@ -1166,10 +1170,13 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource) *cobra.Command
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if project == "" {
-				return fmt.Errorf("usage: af linear list-backlog-issues --project \"ProjectName\"")
+				return userError(
+					"--project is required",
+					"Usage: "+cmd.UseLine()+" --project \"ProjectName\"",
+				)
 			}
 
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -1223,7 +1230,7 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource) *cobra.Command
 
 // ─── list-unblocked-backlog ───────────────────────────────────────────────────
 
-func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var project string
 
 	cmd := &cobra.Command{
@@ -1232,10 +1239,13 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource) *cobra.Comm
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if project == "" {
-				return fmt.Errorf("usage: af linear list-unblocked-backlog --project \"ProjectName\"")
+				return userError(
+					"--project is required",
+					"Usage: "+cmd.UseLine()+" --project \"ProjectName\"",
+				)
 			}
 
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -1310,7 +1320,7 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource) *cobra.Comm
 
 // ─── create-blocker ───────────────────────────────────────────────────────────
 
-func newLinearCreateBlockerCmd(ds func() afclient.DataSource) *cobra.Command {
+func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		title       string
 		description string
@@ -1326,13 +1336,13 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource) *cobra.Command {
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if title == "" {
-				return fmt.Errorf(
-					"usage: af linear create-blocker <source-issue-id> --title \"Title\" " +
-						"[--description \"...\"] [--team \"...\"] [--project \"...\"] [--assignee \"user@email.com\"]",
+				return userError(
+					"--title is required",
+					"Usage: "+cmd.UseLine()+" --title \"Title\" [--description \"...\"] [--team \"...\"] [--project \"...\"] [--assignee \"user@email.com\"]",
 				)
 			}
 
-			client, err := newLinearClient(ds)
+			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
 			}
@@ -1485,71 +1495,319 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource) *cobra.Command {
 	return cmd
 }
 
-// ─── check-deployment (exec-shim) ────────────────────────────────────────────
+// ─── check-deployment (native Go via gh CLI) ─────────────────────────────────
 
-// newLinearCheckDeploymentCmd returns a check-deployment subcommand that
-// delegates to the `af-linear` JS binary via exec.Command.
+// deploymentStatus holds the per-Vercel-app status returned by GitHub's
+// Commit Status API. Mirrors the TS DeploymentStatus interface in
+// donmai-libraries/packages/linear/src/tools/deployment-bridge.ts.
+type deploymentStatus struct {
+	// App is the Vercel application name extracted from the status context
+	// (e.g. "my-app" from "vercel/my-app (production)").
+	App string `json:"app"`
+	// Context is the raw GitHub status context string.
+	Context string `json:"context"`
+	// State is the GitHub status state: "success" | "failure" | "pending" | "error".
+	State string `json:"state"`
+	// Description is the human-readable status message from GitHub.
+	Description string `json:"description,omitempty"`
+	// TargetURL is the Vercel preview/production URL for this deployment.
+	TargetURL string `json:"targetUrl,omitempty"`
+}
+
+// deploymentCheckResult is the JSON envelope emitted by check-deployment.
+type deploymentCheckResult struct {
+	// PRNumber is the pull-request number that was checked.
+	PRNumber int `json:"prNumber"`
+	// SHA is the PR head commit SHA the status check was resolved against.
+	SHA string `json:"sha"`
+	// AnyFailed is true when at least one Vercel deployment status is
+	// "failure" or "error". Callers gate on this for CI/CD go-no-go checks.
+	AnyFailed bool `json:"anyFailed"`
+	// Deployments is the per-app status slice, one entry per Vercel context
+	// found on the commit. Empty when no Vercel statuses are attached yet
+	// (e.g. the deployment is still queued).
+	Deployments []deploymentStatus `json:"deployments"`
+}
+
+// ghCommitStatus is the minimal shape the GitHub Commit Status API returns.
+// Reference: https://docs.github.com/en/rest/commits/statuses
+type ghCommitStatus struct {
+	State    string `json:"state"`
+	Statuses []struct {
+		Context     string `json:"context"`
+		State       string `json:"state"`
+		Description string `json:"description"`
+		TargetURL   string `json:"target_url"`
+	} `json:"statuses"`
+}
+
+// ghPR is the minimal shape for the GitHub Pull Requests API response.
+type ghPR struct {
+	Head struct {
+		SHA string `json:"sha"`
+	} `json:"head"`
+	Number  int    `json:"number"`
+	HTMLURL string `json:"html_url"`
+}
+
+// runGhAPI executes `gh api <endpoint> [extraArgs...]` and returns the raw
+// JSON stdout. The gh CLI must be on PATH; this is a documented dependency
+// for the check-deployment command.
+var runGhAPI = func(ctx context.Context, endpoint string, extraArgs ...string) ([]byte, error) {
+	args := append([]string{"api", endpoint}, extraArgs...)
+	out, err := exec.CommandContext(ctx, "gh", args...).Output() //nolint:gosec // G204: endpoint is caller-constructed; extraArgs are controlled flags
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return nil, fmt.Errorf("gh api %s: exit %d: %s", endpoint, exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return nil, fmt.Errorf("gh api %s: %w", endpoint, err)
+	}
+	return out, nil
+}
+
+// checkDeployment performs the two-step GitHub API check:
+//  1. Resolve PR number → head SHA via GET repos/{owner}/{repo}/pulls/{pr}.
+//  2. Fetch commit statuses via GET repos/{owner}/{repo}/commits/{sha}/status.
+//  3. Filter statuses whose context starts with "vercel" (case-insensitive).
 //
-// Rationale for exec-shim: check-deployment requires Vercel + GitHub API
-// clients not yet ported to Go. The shim preserves full feature parity for
-// v1.0.0 without coupling this binary to those HTTP surfaces. A proper Go port
-// is tracked for v1.0.x.
+// The function uses runGhAPI (a package-level var) so tests can inject a mock.
+func checkDeployment(ctx context.Context, owner, repo string, prNumber int) (*deploymentCheckResult, error) {
+	// ── Step 1: resolve PR → head SHA ────────────────────────────────────────
+	prEndpoint := fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, prNumber)
+	prRaw, err := runGhAPI(ctx, prEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("get PR %d: %w", prNumber, err)
+	}
+	var pr ghPR
+	if err := json.Unmarshal(prRaw, &pr); err != nil {
+		return nil, fmt.Errorf("parse PR response: %w", err)
+	}
+	sha := strings.TrimSpace(pr.Head.SHA)
+	if sha == "" {
+		return nil, fmt.Errorf("PR %d: head SHA is empty", prNumber)
+	}
+
+	// ── Step 2: fetch commit statuses ────────────────────────────────────────
+	statusEndpoint := fmt.Sprintf("repos/%s/%s/commits/%s/status", owner, repo, sha)
+	statusRaw, err := runGhAPI(ctx, statusEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("get commit statuses for %s: %w", sha[:min(len(sha), 8)], err)
+	}
+	var cs ghCommitStatus
+	if err := json.Unmarshal(statusRaw, &cs); err != nil {
+		return nil, fmt.Errorf("parse commit status response: %w", err)
+	}
+
+	// ── Step 3: filter Vercel contexts ────────────────────────────────────────
+	var deployments []deploymentStatus
+	anyFailed := false
+	for _, s := range cs.Statuses {
+		if !strings.HasPrefix(strings.ToLower(s.Context), "vercel") {
+			continue
+		}
+		// Extract a human-readable app name from the context string.
+		// Typical context shapes: "vercel" | "vercel/my-app" | "vercel/my-app (production)".
+		app := extractVercelApp(s.Context)
+		ds := deploymentStatus{
+			App:         app,
+			Context:     s.Context,
+			State:       s.State,
+			Description: s.Description,
+			TargetURL:   s.TargetURL,
+		}
+		deployments = append(deployments, ds)
+		if s.State == "failure" || s.State == "error" {
+			anyFailed = true
+		}
+	}
+	if deployments == nil {
+		deployments = []deploymentStatus{}
+	}
+
+	return &deploymentCheckResult{
+		PRNumber:    prNumber,
+		SHA:         sha,
+		AnyFailed:   anyFailed,
+		Deployments: deployments,
+	}, nil
+}
+
+// extractVercelApp derives a short app name from a Vercel status context string.
+// Examples:
 //
-// Deprecated: this shim will be replaced by a native Go implementation in a
-// future release.
+//	"vercel"                         → "vercel"
+//	"vercel/my-app"                  → "my-app"
+//	"vercel/my-app (production)"     → "my-app"
+//	"vercel – Deploying my-app"      → "vercel"  (unknown format → keep raw)
+func extractVercelApp(context string) string {
+	// Strip everything after " (" (environment qualifier).
+	if idx := strings.Index(context, " ("); idx != -1 {
+		context = context[:idx]
+	}
+	// Split on "/" — second segment is the app name.
+	parts := strings.SplitN(context, "/", 2)
+	if len(parts) == 2 && parts[1] != "" {
+		return strings.TrimSpace(parts[1])
+	}
+	return strings.TrimSpace(parts[0])
+}
+
+// formatDeploymentMarkdown renders a deploymentCheckResult as a Markdown table.
+func formatDeploymentMarkdown(result *deploymentCheckResult) string {
+	var sb strings.Builder
+	status := "all passed"
+	if result.AnyFailed {
+		status = "FAILED"
+	}
+	fmt.Fprintf(&sb, "## Deployment status for PR #%d\n\n", result.PRNumber)
+	fmt.Fprintf(&sb, "**Commit**: `%s`  \n", result.SHA)
+	fmt.Fprintf(&sb, "**Overall**: %s\n\n", status)
+	if len(result.Deployments) == 0 {
+		sb.WriteString("No Vercel deployment statuses found yet.\n")
+		return sb.String()
+	}
+	sb.WriteString("| App | State | Description | URL |\n")
+	sb.WriteString("|-----|-------|-------------|-----|\n")
+	for _, d := range result.Deployments {
+		url := d.TargetURL
+		if url != "" {
+			url = "[link](" + url + ")"
+		}
+		fmt.Fprintf(&sb, "| %s | %s | %s | %s |\n", d.App, d.State, d.Description, url)
+	}
+	return sb.String()
+}
+
+// newLinearCheckDeploymentCmd returns a native Go check-deployment subcommand.
+// It uses the gh CLI (documented dependency) to query the GitHub Commit Status
+// API, filters for Vercel deployment checks, and formats the result as JSON
+// or Markdown. No external JS binary is required.
 func newLinearCheckDeploymentCmd() *cobra.Command {
-	var format string
+	var (
+		format string
+		owner  string
+		repo   string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "check-deployment <pr-number>",
-		Short: "Check Vercel deployment status for a PR (exec-shim: delegates to af-linear)",
+		Short: "Check Vercel deployment status for a PR",
 		Long: `Check Vercel deployment status for a pull request.
 
-DEPRECATED SHIM: This command delegates to the 'af-linear' JS binary found
-on PATH. A native Go implementation will replace it in a future release.
+Queries the GitHub Commit Status API (via the gh CLI) for all Vercel deployment
+checks attached to the PR's head commit. Outputs a JSON summary by default.
 
-To use this command, ensure af-linear is available:
-  npm install -g @renseiai/agentfactory-cli
-  # or: pnpm install (in an agentfactory project)
+Prerequisites:
+  - gh CLI installed and authenticated (https://cli.github.com)
+  - The PR must be in a GitHub repository
 
-The shim passes all arguments and flags through to af-linear unchanged and
-exits with the same exit code.`,
-		SilenceUsage:          true,
-		DisableFlagParsing:    false,
-		Args:                  cobra.MinimumNArgs(1),
-		DisableFlagsInUseLine: true,
+The --owner and --repo flags default to the current git remote when not set.
+
+Exit codes:
+  0 — all deployments passed (or no Vercel statuses found yet)
+  1 — at least one deployment is in failure/error state
+  2 — usage or API error`,
+		SilenceUsage: true,
+		Args:         cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Locate af-linear on PATH.
-			afLinear, err := exec.LookPath("af-linear")
-			if err != nil {
-				return fmt.Errorf("af-linear binary not found on PATH (install with: npm install -g @renseiai/agentfactory-cli; a native Go implementation is planned for v1.0.x): %w", err)
+			prNumber := 0
+			if _, err := fmt.Sscanf(args[0], "%d", &prNumber); err != nil || prNumber <= 0 {
+				return userError(
+					fmt.Sprintf("invalid PR number %q — must be a positive integer", args[0]),
+					"example: donmai linear check-deployment 42",
+				)
 			}
 
-			// Build argv: af-linear check-deployment <pr-number> [--format <fmt>] [extra args...]
-			argv := []string{"check-deployment"}
-			argv = append(argv, args...)
-			if cmd.Flags().Changed("format") {
-				argv = append(argv, "--format", format)
-			}
-
-			c := exec.CommandContext(cmd.Context(), afLinear, argv...) //nolint:gosec // G204: afLinear is from exec.LookPath; args are user-supplied CLI flags
-			c.Stdout = cmd.OutOrStdout()
-			c.Stderr = cmd.ErrOrStderr()
-			c.Env = os.Environ()
-
-			if err := c.Run(); err != nil {
-				// Propagate non-zero exit codes (e.g. anyFailed=true) transparently.
-				// The subprocess already wrote its output, so exit directly.
-				var exitErr *exec.ExitError
-				if errors.As(err, &exitErr) {
-					os.Exit(exitErr.ExitCode())
+			// Resolve owner/repo from flags or current git remote.
+			if owner == "" || repo == "" {
+				remote, err := runGitCommand("remote", "get-url", "origin")
+				if err != nil {
+					return userError(
+						"could not determine repository owner/repo",
+						"set them explicitly with --owner and --repo",
+					)
 				}
-				return fmt.Errorf("af-linear check-deployment: %w", err)
+				detectedOwner, detectedRepo, parseErr := parseGitRemote(remote)
+				if parseErr != nil {
+					return userError(
+						fmt.Sprintf("could not parse git remote %q: %v", remote, parseErr),
+						"set them explicitly with --owner and --repo",
+					)
+				}
+				if owner == "" {
+					owner = detectedOwner
+				}
+				if repo == "" {
+					repo = detectedRepo
+				}
+			}
+
+			result, err := checkDeployment(cmd.Context(), owner, repo, prNumber)
+			if err != nil {
+				return fmt.Errorf("check-deployment: %w", err)
+			}
+
+			switch format {
+			case "markdown", "md":
+				_, _ = fmt.Fprint(cmd.OutOrStdout(), formatDeploymentMarkdown(result))
+			default: // "json" or unrecognised → JSON
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				if encErr := enc.Encode(result); encErr != nil {
+					return fmt.Errorf("encode result: %w", encErr)
+				}
+			}
+
+			// Exit 1 when any deployment failed so CI pipelines can gate on the
+			// exit code without parsing JSON. The output has already been written.
+			if result.AnyFailed {
+				os.Exit(1)
 			}
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&format, "format", "json", "Output format: json or markdown")
+	cmd.Flags().StringVar(&owner, "owner", "", "GitHub repository owner (defaults to current remote)")
+	cmd.Flags().StringVar(&repo, "repo", "", "GitHub repository name (defaults to current remote)")
 	return cmd
+}
+
+// parseGitRemote extracts the owner and repo name from a git remote URL.
+// Supports HTTPS (https://github.com/owner/repo[.git]) and SSH
+// (git@github.com:owner/repo[.git]) formats.
+func parseGitRemote(remote string) (owner, repo string, err error) {
+	remote = strings.TrimSpace(remote)
+	remote = strings.TrimSuffix(remote, ".git")
+
+	// SSH format: git@github.com:owner/repo
+	if strings.HasPrefix(remote, "git@") {
+		colonIdx := strings.LastIndex(remote, ":")
+		if colonIdx == -1 {
+			return "", "", fmt.Errorf("malformed SSH remote: %q", remote)
+		}
+		parts := strings.SplitN(remote[colonIdx+1:], "/", 2)
+		if len(parts) != 2 {
+			return "", "", fmt.Errorf("expected owner/repo in SSH remote: %q", remote)
+		}
+		return parts[0], parts[1], nil
+	}
+
+	// HTTPS format: https://github.com/owner/repo
+	// Strip the scheme and host.
+	if idx := strings.Index(remote, "://"); idx != -1 {
+		remote = remote[idx+3:]
+	}
+	// remote is now "github.com/owner/repo"
+	slashIdx := strings.Index(remote, "/")
+	if slashIdx == -1 {
+		return "", "", fmt.Errorf("could not find owner/repo in remote: %q", remote)
+	}
+	rest := remote[slashIdx+1:] // "owner/repo"
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("expected owner/repo after host in remote: %q", remote)
+	}
+	return parts[0], parts[1], nil
 }

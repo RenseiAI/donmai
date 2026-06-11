@@ -10,15 +10,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	// defaultQueueKey is the Redis list key used for the governor work queue.
-	defaultQueueKey = "agentfactory:governor:queue"
-)
+// primaryQueueKey is the canonical Redis list key for the governor work queue.
+// Introduced during the agentfactory→donmai debrand transition; the legacy
+// "agentfactory:governor:queue" dual-write/dual-read was removed once all
+// governor instances and platform consumers had been restarted and drained.
+const primaryQueueKey = "donmai:governor:queue"
 
 // Client wraps a *redis.Client and implements the Queue interface.
 type Client struct {
-	rdb      *redis.Client
-	queueKey string
+	rdb *redis.Client
 }
 
 // NewClient parses url and returns a connected Client.
@@ -34,10 +34,7 @@ func NewClient(url string) (*Client, error) {
 	}
 
 	rdb := redis.NewClient(opts)
-	return &Client{
-		rdb:      rdb,
-		queueKey: defaultQueueKey,
-	}, nil
+	return &Client{rdb: rdb}, nil
 }
 
 // Ping verifies connectivity to Redis.
@@ -54,9 +51,9 @@ func (c *Client) Close() error {
 	return c.rdb.Close()
 }
 
-// Enqueue appends payload to the tail of the queue using RPUSH.
+// Enqueue appends payload to the tail of the governor work queue using RPUSH.
 func (c *Client) Enqueue(ctx context.Context, payload []byte) error {
-	if err := c.rdb.RPush(ctx, c.queueKey, payload).Err(); err != nil {
+	if err := c.rdb.RPush(ctx, primaryQueueKey, payload).Err(); err != nil {
 		return fmt.Errorf("queue: enqueue: %w", err)
 	}
 	return nil
@@ -65,7 +62,7 @@ func (c *Client) Enqueue(ctx context.Context, payload []byte) error {
 // Peek returns the oldest payload (head of the list) without removing it.
 // Returns ErrEmptyQueue when the list is empty.
 func (c *Client) Peek(ctx context.Context) ([]byte, error) {
-	vals, err := c.rdb.LRange(ctx, c.queueKey, 0, 0).Result()
+	vals, err := c.rdb.LRange(ctx, primaryQueueKey, 0, 0).Result()
 	if err != nil {
 		return nil, fmt.Errorf("queue: peek: %w", err)
 	}

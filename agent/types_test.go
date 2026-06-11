@@ -149,7 +149,7 @@ func TestResult_RoundTrip(t *testing.T) {
 		Status:            "completed",
 		ProviderName:      ProviderClaude,
 		ProviderSessionID: "sess-123",
-		WorktreePath:      "/tmp/wt/REN-1",
+		WorktreePath:      "/tmp/wt/ENG-1",
 		PullRequestURL:    "https://github.com/x/y/pull/1",
 		CommitSHA:         "abc123",
 		Summary:           "did the thing",
@@ -186,7 +186,7 @@ func TestResult_RoundTrip(t *testing.T) {
 		`"status":"completed"`,
 		`"providerName":"claude"`,
 		`"providerSessionId":"sess-123"`,
-		`"worktreePath":"/tmp/wt/REN-1"`,
+		`"worktreePath":"/tmp/wt/ENG-1"`,
 		`"pullRequestUrl":"https://github.com/x/y/pull/1"`,
 		`"commitSha":"abc123"`,
 		`"workResult":"passed"`,
@@ -245,6 +245,8 @@ func TestIsSupported(t *testing.T) {
 		{"tool-perm-claude-explicit", CapToolPermissionFormatClaude, caps, true},
 		{"tool-perm-claude-empty-default", CapToolPermissionFormatClaude, Capabilities{}, true},
 		{"tool-perm-claude-codex", CapToolPermissionFormatClaude, Capabilities{ToolPermissionFormat: "codex"}, false},
+		{"turn-input-context-true", CapTurnInputContext, Capabilities{SupportsTurnInputContext: true}, true},
+		{"turn-input-context-false", CapTurnInputContext, Capabilities{}, false},
 		{"unknown-capability", Capability("nonexistent"), caps, false},
 	}
 	for _, tt := range tests {

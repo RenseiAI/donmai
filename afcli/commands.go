@@ -1,6 +1,6 @@
-// Package afcli provides Cobra command factories for the AgentFactory CLI.
+// Package afcli provides Cobra command factories for the Donmai CLI.
 // Downstream projects can import this package and call
-// RegisterCommands to add the shared af subcommands to their own root command.
+// RegisterCommands to add the shared donmai subcommands to their own root command.
 package afcli
 
 import (
@@ -66,6 +66,11 @@ type Config struct {
 	// instead of donmai's vendored package default. Empty
 	// falls back to the daemon package's own Version var.
 	HostBinaryVersion string
+
+	// BinaryName is the user-facing binary name to embed in error messages,
+	// usage hints, and remediation instructions. Defaults to "donmai" when empty.
+	// Embedders (e.g. rensei-tui) set this to "rensei".
+	BinaryName string
 }
 
 // scopedClientFactory wraps cfg.ClientFactory so every produced Client
@@ -110,12 +115,12 @@ func (c Config) resolveURL() string {
 	return "http://localhost:3000"
 }
 
-// RegisterCommands adds the shared AgentFactory subcommands to the given root
+// RegisterCommands adds the shared Donmai subcommands to the given root
 // command. Optional local/debug surfaces are controlled by Config. The commands
 // use cfg to resolve API clients and defaults.
 //
 // This is the primary integration point for downstream CLIs that want
-// to embed AgentFactory functionality under their own root command
+// to embed Donmai functionality under their own root command
 // (e.g. `mycli agent list`, `mycli daemon status`, etc.).
 func RegisterCommands(root *cobra.Command, cfg Config) {
 	// Wrap ClientFactory so every produced client carries the active
@@ -126,18 +131,18 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newStatusCmd(ds))
 	root.AddCommand(newAgentCmd(ds, cfg.ProjectFunc))
 	root.AddCommand(newSessionCmd(ds, cfg.ProjectFunc))
-	root.AddCommand(newGovernorCmd(ds))
+	root.AddCommand(newGovernorCmd(ds, cfg))
 	if cfg.EnableLegacyWorkerFleet {
 		root.AddCommand(newWorkerCmd(ds))
-		root.AddCommand(newFleetCmd(ds))
+		root.AddCommand(newFleetCmd(ds, cfg))
 	}
-	root.AddCommand(newDaemonCmd(cfg.HostBinaryVersion))
-	root.AddCommand(newProjectCmd())
-	root.AddCommand(newOrchestratorCmd())
-	root.AddCommand(newCodeCmd())
-	root.AddCommand(newArchCmd())
-	root.AddCommand(newLinearCmd(ds))
-	root.AddCommand(newGitHubCmd(ds))
+	root.AddCommand(newDaemonCmd(cfg))
+	root.AddCommand(newProjectCmd(cfg))
+	root.AddCommand(newOrchestratorCmd(cfg))
+	root.AddCommand(newCodeCmd(cfg))
+	root.AddCommand(newArchCmd(cfg))
+	root.AddCommand(newLinearCmd(ds, cfg))
+	root.AddCommand(newGitHubCmd(ds, cfg))
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newAdminCmd())
 	root.AddCommand(credentials.NewCmd())

@@ -17,7 +17,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
-	"github.com/RenseiAI/donmai/provider/stub"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -154,8 +154,8 @@ func TestIntegration_StubProvider_FullRun(t *testing.T) {
 // TestIntegration_StagePromptHappyPath asserts that a QueuedWork
 // dispatched with the new Phase 2 stage fields (StagePrompt /
 // StageID / StageBudget) runs end-to-end with the stub provider and
-// surfaces the budget report on Result. (REN-1485 / REN-1487 Phase 2
-// daemon-side acceptance.)
+// surfaces the budget report on Result (Phase 2
+// daemon-side acceptance).
 func TestIntegration_StagePromptHappyPath(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
@@ -204,14 +204,14 @@ func TestIntegration_StagePromptHappyPath(t *testing.T) {
 		QueuedWork: prompt.QueuedWork{
 			SessionID:       "sess-stage",
 			IssueID:         "issue-stage",
-			IssueIdentifier: "REN-1487",
+			IssueIdentifier: "ENG-1487",
 			WorkType:        "development",
 			ProjectName:     "Stage",
 			OrganizationID:  "org_stage",
 			Repository:      bareRepo,
 			Body:            "Stage smoke",
 			Title:           "Stage smoke",
-			StagePrompt:     "Run the development stage on REN-1487.",
+			StagePrompt:     "Run the development stage on ENG-1487.",
 			StageID:         "development",
 			StageBudget: &prompt.StageBudget{
 				MaxDurationSeconds: 600,
@@ -254,7 +254,7 @@ func TestIntegration_StagePromptHappyPath(t *testing.T) {
 // provider that emits N+1 Task tool-use events, asserting that
 // runner.Run cleanly classifies the outcome as
 // FailureBudgetExceeded with cap=max-sub-agents and surfaces the
-// breach on Result.BudgetReport. (REN-1485 / REN-1487 acceptance #4.)
+// breach on Result.BudgetReport.
 func TestIntegration_BudgetExceeded_SubAgentCap(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
@@ -302,7 +302,7 @@ func TestIntegration_BudgetExceeded_SubAgentCap(t *testing.T) {
 		QueuedWork: prompt.QueuedWork{
 			SessionID:       "sess-budget",
 			IssueID:         "issue-budget",
-			IssueIdentifier: "REN-1485",
+			IssueIdentifier: "ENG-1485",
 			Repository:      bareRepo,
 			Body:            "Budget breach scenario",
 			Title:           "Budget breach",

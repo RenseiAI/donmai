@@ -31,7 +31,7 @@ no dependencies beyond the Go standard library and `log/slog`.
 This package is the verbatim Go translation of the legacy TS contract at:
 
 ```
-../agentfactory/packages/core/src/providers/types.ts
+../donmai-libraries/packages/core/src/providers/types.ts
 ```
 
 JSON tags on every struct use **camelCase** to match the TS wire format

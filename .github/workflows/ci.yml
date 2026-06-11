@@ -7,13 +7,24 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  leak-guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Leak guard self-test
+        run: bash scripts/leak-guard.sh --self-test
+
+      - name: Closed-source content guard
+        run: bash scripts/leak-guard.sh --all
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -27,7 +38,7 @@ jobs:
         run: go tool cover -func=coverage.out
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9
         with:
           version: v2.11.4
 

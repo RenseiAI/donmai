@@ -12,17 +12,18 @@ import (
 // The ds parameter is accepted for signature consistency with newAgentCmd
 // but is unused because fleet subcommands work by spawning and signaling
 // local processes, not by calling the coordinator API.
-func newFleetCmd(_ func() afclient.DataSource) *cobra.Command {
+func newFleetCmd(_ func() afclient.DataSource, cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:          "fleet",
 		Short:        "Manage a fleet of worker processes",
-		Long:         "Spawn, scale, and supervise multiple af worker processes.",
+		Long:         "Spawn, scale, and supervise multiple donmai worker processes.",
 		SilenceUsage: true,
 	}
 
 	cmd.AddCommand(newFleetStartCmd())
 	cmd.AddCommand(newFleetStopCmd())
-	cmd.AddCommand(newFleetStatusCmd())
+	cmd.AddCommand(newFleetStatusCmd(bin))
 	cmd.AddCommand(newFleetScaleCmd())
 
 	return cmd
