@@ -39,22 +39,15 @@ type UpdateResult struct {
 	Reason  string `json:"reason"`
 }
 
-// BinaryVerifier is a narrow signature-verification interface. The default
-// production verifier rejects all signatures (until a future release ships a Go
-// sigstore adapter). Tests can inject a passing verifier.
+// BinaryVerifier is a narrow signature-verification interface.
+// contentHash is the lowercase hex SHA-256 of the downloaded binary;
+// signatureValue is the raw content of the sibling signature artifact
+// (`<binary>.sigstore` — a sigstore bundle JSON for the production
+// verifier, see auto_update_verifier.go). The default production verifier
+// is sigstore bundle-mode when autoUpdate.signers is configured, and
+// fail-closed (refuses every swap) otherwise. Tests can inject their own.
 type BinaryVerifier interface {
 	Verify(ctx context.Context, contentHash, signatureValue string) (valid bool, reason string)
-}
-
-// alwaysFailVerifier is the default production verifier. Production
-// auto-update is only enabled when a real verifier is wired in. Until then,
-// the daemon refuses to swap binaries — and runUpdate returns "no verifier".
-type alwaysFailVerifier struct{}
-
-// Verify implements BinaryVerifier. It always returns false to prevent the
-// daemon from swapping in a binary without proper signature verification.
-func (alwaysFailVerifier) Verify(_ context.Context, _, _ string) (bool, string) {
-	return false, "no verifier configured (sigstore adapter not yet wired); refusing swap"
 }
 
 // UpdaterOptions configure an Updater.
@@ -66,8 +59,10 @@ type UpdaterOptions struct {
 	// HTTPClient is the client used to fetch the manifest, binary, and
 	// signature. Defaults to a 60s-timeout client.
 	HTTPClient *http.Client
-	// Verifier is the binary-signature verifier. Defaults to
-	// alwaysFailVerifier (production-safe — no real swaps until configured).
+	// Verifier is the binary-signature verifier. Defaults to the sigstore
+	// bundle verifier when Config.Signers is set, and to a fail-closed
+	// verifier that refuses every swap otherwise (production-safe — no
+	// unsigned swaps, ever).
 	Verifier BinaryVerifier
 	// SkipExit, when true, prevents the swap step from calling os.Exit. Used
 	// by tests and by callers that want to handle the restart explicitly.
@@ -92,7 +87,7 @@ func NewUpdater(opts UpdaterOptions) *Updater {
 		opts.HTTPClient = &http.Client{Timeout: 60 * time.Second}
 	}
 	if opts.Verifier == nil {
-		opts.Verifier = alwaysFailVerifier{}
+		opts.Verifier = newAutoUpdateVerifier(opts.Config)
 	}
 	if opts.ExitFn == nil {
 		opts.ExitFn = os.Exit
@@ -138,9 +133,12 @@ func (u *Updater) BuildBinaryURL(channel UpdateChannel, version string) string {
 		strings.TrimRight(u.opts.CDNBase, "/"), channel, version, u.opts.PlatformSuffix)
 }
 
-// BuildSignatureURL returns the signature URL for a binary URL.
+// BuildSignatureURL returns the signature-artifact URL for a binary URL.
+// The artifact is a sigstore bundle JSON published as a sibling of the
+// binary — same `<path>.sigstore` convention as kit manifests
+// (kit_trust.go).
 func (u *Updater) BuildSignatureURL(binURL string) string {
-	return binURL + ".sig"
+	return binURL + ".sigstore"
 }
 
 // CheckForUpdate fetches the version manifest and returns it iff a strictly
@@ -212,10 +210,10 @@ func (u *Updater) RunUpdate(ctx context.Context) (*UpdateResult, error) {
 
 	// Integrity check: verify the downloaded binary matches the SHA256
 	// declared in the manifest before proceeding to any swap. This is
-	// defense-in-depth independent of signature verification and guards
-	// against a corrupted or tampered download even when a real verifier
-	// is not yet wired in. An empty manifest SHA256 is also rejected so
-	// that a manifest that omits the field cannot bypass this check.
+	// defense-in-depth independent of the signature stage below and guards
+	// against a corrupted or truncated download. An empty manifest SHA256
+	// is also rejected so that a manifest that omits the field cannot
+	// bypass this check.
 	if manifest.SHA256 == "" {
 		return &UpdateResult{Updated: false, Version: u.opts.CurrentVersion, Reason: "checksum-missing: manifest SHA256 is empty; refusing swap"}, errors.New("manifest SHA256 is empty")
 	}

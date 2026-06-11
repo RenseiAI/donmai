@@ -569,6 +569,96 @@ trust:
 	}
 }
 
+// TestLoadConfig_UpdateSigners_RoundTrip asserts the autoUpdate signer
+// allowlist + trust-root override round-trip through YAML.
+func TestLoadConfig_UpdateSigners_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: donmai.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+orchestrator:
+  url: https://platform.example.com
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+  trustRootPath: /etc/donmai/trusted_root.json
+  signers:
+    - san: https://github.com/example/repo/.github/workflows/release.yml@refs/tags/v1.0.0
+      issuer: https://token.actions.githubusercontent.com
+    - san: releases@example.com
+      issuer: https://issuer.example
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(cfg.AutoUpdate.Signers) != 2 {
+		t.Fatalf("AutoUpdate.Signers len: want 2, got %d (%v)", len(cfg.AutoUpdate.Signers), cfg.AutoUpdate.Signers)
+	}
+	if got := cfg.AutoUpdate.Signers[1]; got.SAN != "releases@example.com" || got.Issuer != "https://issuer.example" {
+		t.Errorf("Signers[1]: got %+v", got)
+	}
+	if cfg.AutoUpdate.TrustRootPath != "/etc/donmai/trusted_root.json" {
+		t.Errorf("TrustRootPath: got %q", cfg.AutoUpdate.TrustRootPath)
+	}
+}
+
+// TestLoadConfig_UpdateSigners_IncompleteRejected asserts validateConfig
+// rejects signer entries that omit the san or the issuer — both must be
+// pinned for binary-swap verification to be meaningful.
+func TestLoadConfig_UpdateSigners_IncompleteRejected(t *testing.T) {
+	cases := []struct {
+		name, signerYAML string
+	}{
+		{"missing issuer", "    - san: releases@example.com"},
+		{"missing san", "    - issuer: https://issuer.example"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.yaml")
+			body := []byte(`apiVersion: donmai.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+orchestrator:
+  url: https://platform.example.com
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+  signers:
+` + c.signerYAML + "\n")
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if _, err := LoadConfig(path); err == nil {
+				t.Fatalf("LoadConfig: want validation error for incomplete signer, got nil")
+			}
+		})
+	}
+}
+
 // TestLoadConfig_KitScanPaths_ExplicitOverride asserts that an explicit
 // `kit.scanPaths` block round-trips through YAML in declaration order
 // (no reordering, no de-duping, no default merge).

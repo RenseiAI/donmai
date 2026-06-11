@@ -117,6 +117,58 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `GET    /api/daemon/doctor`            | Aggregated health snapshot |
 | `GET    /healthz`                      | Liveness probe |
 
+## Auto-update signing
+
+Auto-update is **opt-in and fail-closed**: the binary ships with no default
+CDN (`autoUpdate` only runs when the operator configures a CDN base), and the
+daemon refuses every binary swap unless signature verification passes against
+an operator-pinned signer allowlist.
+
+CDN layout per channel (`stable` | `beta` | `main`):
+
+```
+<cdnBase>/<channel>/latest.json                              # {version, sha256, releasedAt}
+<cdnBase>/<channel>/<version>/donmai-daemon-<arch>-<os>      # binary
+<cdnBase>/<channel>/<version>/donmai-daemon-<arch>-<os>.sigstore  # sigstore bundle JSON
+```
+
+The update flow is drain → fetch manifest → download binary + bundle →
+SHA-256 integrity check against the manifest → sigstore bundle verification →
+swap → restart. Verification (see `auto_update_verifier.go`) checks that:
+
+1. the bundle's attested artifact digest matches the downloaded binary,
+2. the signing certificate chains to the trust root — the embedded public
+   Sigstore production root by default (shared with kit verification,
+   `kit_trust.go`), or an operator-supplied root via
+   `autoUpdate.trustRootPath` for private sigstore deployments,
+3. the certificate identity matches one of the pinned
+   `autoUpdate.signers` entries — `issuer` (exact) plus `san` (exact) or
+   `sanRegex` (for CI identities whose SAN embeds the release ref).
+
+If `autoUpdate.signers` is empty — the out-of-the-box state — every swap is
+refused with `sig-rejected: no update signers configured`. There is
+deliberately no identity-less mode: "any keyless signer the public trust
+root validates" is not an acceptable policy for swapping the daemon binary.
+
+Release pipelines produce the bundle with keyless signing, e.g.:
+
+```bash
+cosign sign-blob --yes --new-bundle-format \
+  --bundle donmai-daemon-arm64-darwin.sigstore donmai-daemon-arm64-darwin
+```
+
+and operators pin the workflow identity in `daemon.yaml`:
+
+```yaml
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+  signers:
+    - sanRegex: ^https://github\.com/<org>/<repo>/\.github/workflows/release\.yml@refs/tags/v.+$
+      issuer: https://token.actions.githubusercontent.com
+```
+
 ## Operator runbook — debugging a stuck session
 
 When a session appears wedged in the dashboard:
