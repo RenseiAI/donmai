@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -55,10 +56,14 @@ const (
 	// unbounded on noisy tool outputs.
 	MaxToolSummaryChars = 200
 
-	// MaxToolOutputChars caps ToolResultEvent.Content forwarded as
-	// toolOutput. Generous enough to preserve the gh pr create URL the
-	// platform-side parser scans for.
-	MaxToolOutputChars = 500
+	// DefaultMaxToolOutputChars caps ToolResultEvent.Content forwarded
+	// as toolOutput when Config.MaxToolOutputChars is unset. Tool output
+	// is bounded observability payload, not a transcript: the cap keeps
+	// the platform's activity buffer in check on noisy tools while the
+	// middle-elision truncation preserves both the head (command echo)
+	// and the tail (results — e.g. the `gh pr create` PR URL the
+	// platform-side parser scans for).
+	DefaultMaxToolOutputChars = 2000
 )
 
 // RuntimeCredentials are the bearer-token credentials needed for an
@@ -115,6 +120,11 @@ type Config struct {
 	// Empty is permitted; the bridge falls back to "unknown".
 	ProviderName string
 
+	// MaxToolOutputChars overrides DefaultMaxToolOutputChars — the cap
+	// applied to ToolResultEvent content forwarded as toolOutput. Zero
+	// selects the default; negative disables truncation entirely.
+	MaxToolOutputChars int
+
 	// QueueSize overrides DefaultQueueSize.
 	QueueSize int
 	// MaxRetries overrides DefaultMaxRetries.
@@ -132,6 +142,20 @@ func (c Config) queueSize() int {
 		return c.QueueSize
 	}
 	return DefaultQueueSize
+}
+
+// maxToolOutputChars resolves the toolOutput cap: positive values are
+// honoured, zero falls back to DefaultMaxToolOutputChars, and negative
+// values disable truncation (returned as 0 — the no-op sentinel the
+// truncation helpers use).
+func (c Config) maxToolOutputChars() int {
+	switch {
+	case c.MaxToolOutputChars > 0:
+		return c.MaxToolOutputChars
+	case c.MaxToolOutputChars < 0:
+		return 0
+	}
+	return DefaultMaxToolOutputChars
 }
 
 func (c Config) maxRetries() int {
@@ -326,7 +350,7 @@ func (p *Poster) Send(_ context.Context, ev agent.Event) {
 		return
 	}
 	now := p.cfg.now()
-	if _, ok := mapEvent(ev, now, p.cfg.ProviderName, 0); !ok {
+	if _, ok := mapEvent(ev, now, p.cfg.ProviderName, 0, p.cfg.maxToolOutputChars()); !ok {
 		// Skip events that don't map to a platform activity shape —
 		// no point enqueuing only to drop them in the worker.
 		return
@@ -380,7 +404,7 @@ func (p *Poster) run(ctx context.Context) {
 // deliver runs the retry loop for one event. After the first
 // successful POST it best-effort fires the running-status nudge.
 func (p *Poster) deliver(ctx context.Context, j job) {
-	body, ok := mapEvent(j.event, j.enqueuedAt, p.cfg.ProviderName, j.durationMs)
+	body, ok := mapEvent(j.event, j.enqueuedAt, p.cfg.ProviderName, j.durationMs, p.cfg.maxToolOutputChars())
 	if !ok {
 		// Defense in depth — Send already filtered these out. Reachable
 		// only if the mapping table changes mid-run.
@@ -595,7 +619,10 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // durationMs is meaningful only for ToolResultEvent payloads (the elapsed
 // wall-clock time between the paired ToolUseEvent and this result, computed
 // by the caller). Ignored for all other event kinds.
-func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int64) (payload, bool) {
+//
+// toolOutputCap bounds ToolResultEvent content forwarded as toolOutput
+// (Config.maxToolOutputChars resolved by the caller); 0 disables the cap.
+func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int64, toolOutputCap int) (payload, bool) {
 	out := payload{
 		Timestamp:    ts.UTC().Format(time.RFC3339Nano),
 		ProviderName: providerName,
@@ -644,7 +671,7 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 		out.ToolUseID = e.ToolUseID
 		out.IsError = e.IsError
 		out.DurationMs = durationMs
-		out.ToolOutput = truncate(e.Content, MaxToolOutputChars)
+		out.ToolOutput = truncateMiddle(e.Content, toolOutputCap)
 		return out, true
 
 	case agent.ResultEvent:
@@ -739,7 +766,7 @@ func stringArg(input map[string]any, key string) string {
 	return strings.TrimSpace(s)
 }
 
-// truncate clips s to at most n runes, appending an ellipsis when
+// truncate clips s to at most n bytes, appending an ellipsis when
 // the input was shortened. n <= 0 returns s untouched.
 func truncate(s string, n int) string {
 	if n <= 0 {
@@ -753,6 +780,36 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s[:n-len(ellipsis)] + ellipsis
+}
+
+// truncateMiddle clips s to at most n bytes by keeping the head and the
+// tail and eliding the middle. Tool output carries its load-bearing
+// content at the edges — the command echo up front, the result (e.g. the
+// `gh pr create` PR URL) at the end — so middle elision preserves both,
+// where head-only truncation dropped trailing URLs whenever a tool was
+// chatty. Cuts snap back to rune boundaries so the output stays valid
+// UTF-8. n <= 0 returns s untouched.
+func truncateMiddle(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	const sep = " […] "
+	if n <= len(sep) {
+		return truncate(s, n)
+	}
+	keep := n - len(sep)
+	head := keep / 2
+	tail := keep - head
+	// Snap to rune boundaries: shrink the head, then grow the tail's
+	// start forward, so neither slice splits a multi-byte rune.
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	tailStart := len(s) - tail
+	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
+		tailStart++
+	}
+	return s[:head] + sep + s[tailStart:]
 }
 
 // collapseWhitespace replaces runs of whitespace with a single space.

@@ -10,6 +10,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
+- **Activity toolOutput truncation no longer drops trailing PR URLs.** The
+  forwarded tool-output cap is raised 500 → 2000 chars
+  (`DefaultMaxToolOutputChars`), switches from head-only to middle-elision
+  truncation (head + tail survive — `gh pr create` prints the PR URL last),
+  and is now overridable per poster via `Config.MaxToolOutputChars`
+  (negative disables the cap).
 - **`arch assess` explains diff-fetch degrades.** When the GitHub CLI is
   missing (or the PR diff fetch fails), the metadata-only fallback now prints
   WHY to stderr — including the `gh` install instructions — instead of silently
