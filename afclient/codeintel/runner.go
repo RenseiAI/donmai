@@ -549,6 +549,11 @@ func (r *Runner) archAssessNative(opts ArchAssessOptions) (any, error) {
 // metadata-only PrDiff when `gh` is unavailable or the call fails. The ref
 // passed to gh prefers the full URL (gh resolves it directly); otherwise it
 // builds an "owner/repo#N" ref from the parsed identifier.
+//
+// The degrade is loud: a metadata-only PrDiff yields zero diff observations, so
+// the WHY (gh missing, fetch error) is written to diffFetchWarnWriter — a
+// silent fallback left operators staring at an empty assessment with no
+// explanation.
 func (r *Runner) fetchDiffOrMeta(ctx context.Context, repo string, prNum int, prURL string) PrDiff {
 	ref := prURL
 	if ref == "" && repo != "" && prNum > 0 {
@@ -556,8 +561,17 @@ func (r *Runner) fetchDiffOrMeta(ctx context.Context, repo string, prNum int, pr
 		ref = strings.TrimPrefix(repo, "github.com/") + fmt.Sprintf("#%d", prNum)
 	}
 	if ref != "" {
-		if d, err := FetchPRDiff(ctx, repo, prNum, ref); err == nil {
+		d, err := FetchPRDiff(ctx, repo, prNum, ref)
+		if err == nil {
 			return d
+		}
+		if errors.Is(err, ErrDiffFetchUnavailable) {
+			fmt.Fprintf(diffFetchWarnWriter,
+				"warning: %v; degrading to metadata-only assessment (no diff observations)\n", err)
+		} else {
+			fmt.Fprintf(diffFetchWarnWriter,
+				"warning: PR diff fetch failed for %s: %v; degrading to metadata-only assessment (no diff observations)\n",
+				ref, err)
 		}
 	}
 	// Degrade: metadata-only (no Title — avoids spurious decision-signal matches).

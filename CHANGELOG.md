@@ -8,6 +8,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **`arch assess` explains diff-fetch degrades.** When the GitHub CLI is
+  missing (or the PR diff fetch fails), the metadata-only fallback now prints
+  WHY to stderr — including the `gh` install instructions — instead of silently
+  emitting zero observations.
+
 ### Changes
 
 - **Arch-drift seam is contract-only.** Removed the `LaneAdapter` reference

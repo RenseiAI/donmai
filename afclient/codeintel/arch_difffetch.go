@@ -22,6 +22,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -33,6 +35,11 @@ var ErrDiffFetchUnavailable = errors.New(
 	"gh CLI not found on PATH — install GitHub CLI (https://cli.github.com) " +
 		"for native PR diff fetch, or set DONMAI_ARCH_BIN for the full pipeline",
 )
+
+// diffFetchWarnWriter receives the human-readable degrade warnings emitted when
+// the PR diff fetch fails and arch assess falls back to metadata-only.
+// Package-level var so tests capture the output without a real stderr.
+var diffFetchWarnWriter io.Writer = os.Stderr
 
 // diffFetchTimeout bounds a single gh invocation. A PR with thousands of files
 // is rare; 60s is generous headroom over the typical sub-second `gh` call.
