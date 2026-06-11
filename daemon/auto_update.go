@@ -40,7 +40,7 @@ type UpdateResult struct {
 }
 
 // BinaryVerifier is a narrow signature-verification interface. The default
-// production verifier rejects all signatures (until REN-1314 ships a Go
+// production verifier rejects all signatures (until a future release ships a Go
 // sigstore adapter). Tests can inject a passing verifier.
 type BinaryVerifier interface {
 	Verify(ctx context.Context, contentHash, signatureValue string) (valid bool, reason string)
@@ -54,7 +54,7 @@ type alwaysFailVerifier struct{}
 // Verify implements BinaryVerifier. It always returns false to prevent the
 // daemon from swapping in a binary without proper signature verification.
 func (alwaysFailVerifier) Verify(_ context.Context, _, _ string) (bool, string) {
-	return false, "no verifier configured (REN-1314 sigstore adapter not yet wired); refusing swap"
+	return false, "no verifier configured (sigstore adapter not yet wired); refusing swap"
 }
 
 // UpdaterOptions configure an Updater.

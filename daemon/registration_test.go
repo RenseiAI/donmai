@@ -41,7 +41,7 @@ func TestRegister_StubPath_NoToken(t *testing.T) {
 	}
 }
 
-// TestRegister_DefaultsToRealPath covers REN-1444: with NO env var set and a
+// TestRegister_DefaultsToRealPath covers the real-registration default: with NO env var set and a
 // valid rsk_live_* token and an http:// URL, the daemon must take the real
 // path. Previously useStub defaulted to true unless
 // DONMAI_DAEMON_REAL_REGISTRATION was explicitly set; that gate broke
@@ -230,7 +230,7 @@ func TestRegister_RealEndpoint(t *testing.T) {
 }
 
 // TestRegister_AcceptsRskLivePrefix confirms the stub-vs-real switch accepts
-// the new rsk_live_* prefix that REN-1351's unified mint endpoint produces,
+// the new rsk_live_* prefix that the unified mint endpoint produces,
 // not just the legacy rsp_live_* shape.
 func TestRegister_AcceptsRskLivePrefix(t *testing.T) {
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")

@@ -158,7 +158,7 @@ func TestAdminQueueList_WithItems(t *testing.T) {
 	mr := startMiniredis(t)
 
 	// Seed a work item
-	itemJSON := `{"issueIdentifier":"REN-77","workType":"development","priority":1}`
+	itemJSON := `{"issueIdentifier":"ENG-77","workType":"development","priority":1}`
 	mr.HSet("work:items", "sess-001", itemJSON)
 	if _, err := mr.ZAdd("work:queue", 100, "sess-001"); err != nil {
 		t.Fatalf("zadd: %v", err)
@@ -186,7 +186,7 @@ func TestAdminQueueList_WithItems(t *testing.T) {
 func TestAdminQueuePeek_ItemPresent(t *testing.T) {
 	mr := startMiniredis(t)
 
-	itemJSON := `{"issueIdentifier":"REN-88","workType":"qa"}`
+	itemJSON := `{"issueIdentifier":"ENG-88","workType":"qa"}`
 	mr.HSet("work:items", "sess-peek", itemJSON)
 	if _, err := mr.ZAdd("work:queue", 50, "sess-peek"); err != nil {
 		t.Fatalf("zadd: %v", err)
@@ -198,8 +198,8 @@ func TestAdminQueuePeek_ItemPresent(t *testing.T) {
 	}
 
 	m := parseJSONObject(t, out)
-	if id, _ := m["issueIdentifier"].(string); id != "REN-88" {
-		t.Errorf("want issueIdentifier REN-88, got %q", id)
+	if id, _ := m["issueIdentifier"].(string); id != "ENG-88" {
+		t.Errorf("want issueIdentifier ENG-88, got %q", id)
 	}
 }
 
@@ -220,7 +220,7 @@ func TestAdminQueueRequeue_NotFound(t *testing.T) {
 func TestAdminQueueRequeue_Success(t *testing.T) {
 	mr := startMiniredis(t)
 
-	sessJSON := `{"status":"running","workerId":"w1","issueIdentifier":"REN-10"}`
+	sessJSON := `{"status":"running","workerId":"w1","issueIdentifier":"ENG-10"}`
 	if err := mr.Set("agent:session:sess-rq", sessJSON); err != nil {
 		t.Fatalf("mr.Set: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestAdminQueueDrop_NotFound(t *testing.T) {
 func TestAdminQueueDrop_Success(t *testing.T) {
 	mr := startMiniredis(t)
 
-	sessJSON := `{"status":"pending","issueIdentifier":"REN-20"}`
+	sessJSON := `{"status":"pending","issueIdentifier":"ENG-20"}`
 	if err := mr.Set("agent:session:sess-drop", sessJSON); err != nil {
 		t.Fatalf("mr.Set: %v", err)
 	}

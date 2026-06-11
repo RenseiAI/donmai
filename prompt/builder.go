@@ -111,7 +111,7 @@ func NewBuilder() *Builder {
 // [Builder] state) it produces byte-identical output. The
 // golden-file tests in builder_test.go assert this property.
 //
-// Stage-prompt mode (REN-1485 / REN-1487): when qw.StagePrompt is
+// Stage-prompt mode: when qw.StagePrompt is
 // non-empty the runner is being dispatched by the new
 // `agent.dispatch_stage` action. The user prompt body is taken from
 // StagePrompt verbatim — pre-rendered platform-side from the stage

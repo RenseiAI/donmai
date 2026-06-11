@@ -164,7 +164,7 @@ type CachedJWT struct {
 	RuntimeTokenExpiresAt string `json:"runtimeTokenExpiresAt,omitempty"`
 	CachedAt              string `json:"cachedAt"`
 
-	// Legacy fields retained so old cache files written before REN-1422
+	// Legacy fields retained so old cache files written by older daemons
 	// still load successfully. Newer writes only populate the canonical
 	// platform-named fields above.
 	LegacyRuntimeJWT               string `json:"runtimeJwt,omitempty"`
@@ -186,7 +186,7 @@ func LoadCachedJWT(jwtPath string) (*CachedJWT, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, nil //nolint:nilerr // corrupt cache → re-register
 	}
-	// Migrate legacy fields written by daemons pre-REN-1422.
+	// Migrate legacy fields written by older daemons.
 	if c.RuntimeToken == "" && c.LegacyRuntimeJWT != "" {
 		c.RuntimeToken = c.LegacyRuntimeJWT
 	}
@@ -259,9 +259,9 @@ func WipeCachedJWT(jwtPath string) (bool, error) {
 // platform's accepted registration-token prefixes.
 //
 // The platform's worker-protocol/auth.ts (via the unified validateApiKey hot
-// path landed in REN-1351 / REN-1353) accepts both:
+// path) accepts both:
 //   - rsp_live_*   — legacy worker_registration tokens
-//   - rsk_live_*   — the unified API-key prefix that REN-1351 made the new
+//   - rsk_live_*   — the unified API-key prefix that the platform made the new
 //     mint format. Tokens minted via /api/projects/<id>/runtime-tokens or
 //     /api/org/<id>/keys today come back as rsk_live_*.
 //
@@ -280,7 +280,7 @@ func looksLikeRegistrationToken(token string) bool {
 //   - the orchestrator URL is "file://...", OR
 //   - the registration token does not start with rsp_live_ or rsk_live_.
 //
-// REN-1444 (v0.4.1) inverted the env-gate from opt-in to opt-out. The
+// v0.4.1 inverted the env-gate from opt-in to opt-out. The
 // previous default required DONMAI_DAEMON_REAL_REGISTRATION=1 in the
 // launchd plist; with that env unset, a daemon configured with a real
 // rsk_live_* token would silently fall back to stub mode and never
@@ -441,12 +441,12 @@ func buildStubResponse(hostname string) *RegisterResponse {
 
 // stubModeRequested returns true when the operator has explicitly opted into
 // stub registration via DONMAI_DAEMON_FORCE_STUB. The legacy
-// DONMAI_DAEMON_REAL_REGISTRATION env (REN-1422) is also honoured: setting
+// DONMAI_DAEMON_REAL_REGISTRATION env is also honoured: setting
 // it to "0" / "false" / "off" / "no" forces stub mode for back-compat with
 // existing test harnesses; any other non-empty value is treated as a no-op
 // (real path, the new default).
 //
-// REN-1444 (v0.4.1): real registration is now the default. Previously the
+// v0.4.1: real registration is now the default. Previously the
 // daemon required DONMAI_DAEMON_REAL_REGISTRATION=1 in the launchd plist;
 // without it, a fully-configured daemon silently fell back to stub mode.
 func stubModeRequested() bool {

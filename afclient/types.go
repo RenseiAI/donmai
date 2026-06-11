@@ -398,7 +398,7 @@ type EvictPoolResponse struct {
 	// Message is a human-readable summary.
 	Message string `json:"message"`
 	// CorrelationID is the Layer 6 hook event correlation ID emitted by the
-	// daemon's observability subscriber (REN-1313). Consumers can match this
+	// daemon's observability subscriber. Consumers can match this
 	// against the pool-stats-evict hook stream.
 	CorrelationID string `json:"correlationId,omitempty"`
 }
@@ -571,7 +571,7 @@ type Attestation struct {
 
 // AuditChainEntry is a single entry in a session's Layer 6 audit chain.
 // Matches the "AuditEntry" TUI primitive in 014 and the Merkle-log row shape
-// referenced in 009 §REN-46-49 reframe.
+// referenced in the 009 reframe.
 type AuditChainEntry struct {
 	// Sequence is the monotonic index of this entry within the session's chain.
 	Sequence uint64 `json:"sequence"`

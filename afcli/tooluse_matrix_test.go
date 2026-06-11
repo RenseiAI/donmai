@@ -17,7 +17,7 @@ import (
 // (`AcceptsAllowedToolsList`, `AcceptsMcpServerSpec`,
 // `SupportsToolPlugins`) declared by every provider that can be
 // constructed in-test match the canonical matrix in
-// rensei-architecture/002-provider-base-contract.md §"Tool-use surface".
+// donmai-architecture/002-provider-base-contract.md §"Tool-use surface".
 //
 // Codex and Ollama are exercised by their package-level tests
 // (provider/codex/codex_test.go, provider/ollama/integration_test.go);
@@ -102,7 +102,7 @@ func TestToolUseCapabilityMatrix(t *testing.T) {
 				}
 				return p
 			},
-			// Post-REN-1499 (commit 3c6b6c6): amp Spawn writes a
+			// Since commit 3c6b6c6, amp Spawn writes a
 			// per-session MCP tmpfile and passes --mcp-config, so
 			// SupportsToolPlugins+AcceptsMcpServerSpec are both true.
 			// AllowedTools is not honoured (amp has no --allowedTools;

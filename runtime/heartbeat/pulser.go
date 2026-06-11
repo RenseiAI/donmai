@@ -50,7 +50,7 @@ type Config struct {
 	// IssueID is the platform-side Linear issue UUID. The platform's
 	// /api/sessions/<id>/lock-refresh handler keys the per-issue lock
 	// on issue:lock:{IssueID} and rejects the request with 400 when
-	// this is empty — so callers must populate it (REN-1465). Sourced
+	// this is empty — so callers must populate it. Sourced
 	// from prompt.QueuedWork.IssueID (camelCase "issueId" on the wire).
 	IssueID string
 	// BaseURL is the platform API base, e.g. "https://platform.example.com".

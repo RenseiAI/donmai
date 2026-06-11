@@ -1,8 +1,8 @@
 # `runtime/` — cross-cutting machinery for the agent runner
 
-> **Status:** Wave 6 / Phase F.2.5 (REN-1456). Public package; importable by `rensei-tui` without depending on the rest of `donmai`.
+> **Status:** Wave 6 / Phase F.2.5. Public package; importable by `rensei-tui` without depending on the rest of `donmai`.
 > **Spec:** `../../../runs/2026-05-01-wave-6-fleet-iteration/F1.1-runner-contract.md` §1 (layout) + §5 (failure modes).
-> **Legacy reference:** `../../../agentfactory/packages/core/src/orchestrator/{state-recovery,heartbeat-writer}.ts`, `../../../agentfactory/packages/core/src/workarea/git-worktree.ts`, `../../../agentfactory/packages/cli/src/lib/worker-runner.ts`.
+> **Legacy reference:** `../../../donmai-libraries/packages/core/src/orchestrator/{state-recovery,heartbeat-writer}.ts`, `../../../donmai-libraries/packages/core/src/workarea/git-worktree.ts`, `../../../donmai-libraries/packages/cli/src/lib/worker-runner.ts`.
 
 `runtime/` owns stateful machinery shared across sessions. The runner consumes these sub-packages; provider implementations do not import them.
 

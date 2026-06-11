@@ -185,7 +185,7 @@ func TestHeartbeatResponse_EmptyBodyDecodes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// REN-1282: AgentRuntimeProviderCapabilities + CapabilitiesTyped migration
+// AgentRuntimeProviderCapabilities + CapabilitiesTyped migration
 // ---------------------------------------------------------------------------
 
 func TestAgentRuntimeProviderCapabilities_JSONRoundTrip(t *testing.T) {

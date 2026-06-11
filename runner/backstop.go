@@ -12,7 +12,7 @@ import (
 
 // ============================================================================
 // Path-exclude data tables (verbatim port from
-// agentfactory/packages/core/src/orchestrator/session-backstop.ts:57-95).
+// donmai-libraries/packages/core/src/orchestrator/session-backstop.ts:57-95).
 // ============================================================================
 //
 // The lists below are the data the legacy TS shouldExcludeFromBackstop

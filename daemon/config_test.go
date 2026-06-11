@@ -170,7 +170,7 @@ func TestDefaultConfig_HasSaneDefaults(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_LegacyRepoURLKey covers the REN-1419 back-compat path:
+// TestLoadConfig_LegacyRepoURLKey covers the legacy `repoUrl` back-compat path:
 // pre-fix daemon.yaml files written by `rensei project allow` used the
 // `repoUrl` key while the daemon reader expected `repository`. The
 // ProjectConfig UnmarshalYAML now accepts both for one cycle, mapping the
@@ -221,7 +221,7 @@ autoUpdate:
 }
 
 // TestProjectAllowWriter_DaemonReader_RoundTrip is the regression test for
-// REN-1419 itself: it writes a project allowlist entry via the same code path
+// the original bug: it writes a project allowlist entry via the same code path
 // that `rensei project allow` exercises (afclient.WriteDaemonYAML), then
 // stitches the resulting YAML into a full daemon.yaml shape and parses it
 // with the daemon-side reader (LoadConfig). The Repository field on the
@@ -244,7 +244,7 @@ func TestProjectAllowWriter_DaemonReader_RoundTrip(t *testing.T) {
 	}
 
 	// Sanity: the on-disk file uses the canonical `repository` key, not the
-	// legacy `repoUrl`. This is the line that would have caught REN-1419.
+	// legacy `repoUrl`. This is the line that would have caught the original regression.
 	raw, err := os.ReadFile(writerPath)
 	if err != nil {
 		t.Fatalf("read writer yaml: %v", err)
@@ -293,7 +293,7 @@ func TestProjectAllowWriter_DaemonReader_RoundTrip(t *testing.T) {
 }
 
 // TestProjectAllowWriter_PreservesFullConfig_ThenLoadConfigSucceeds is the
-// regression test for the v0.4.1 follow-up to REN-1419 (REN-1442 + REN-1443).
+// regression test for the v0.4.1 follow-up.
 // Sequence:
 //
 //  1. Wizard / installer writes a full daemon.yaml via daemon.WriteConfig.

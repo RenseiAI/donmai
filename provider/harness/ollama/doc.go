@@ -54,7 +54,7 @@
 // # No tools, no MCP
 //
 // Spec.AllowedTools, Spec.DisallowedTools, Spec.MCPServers are silently
-// ignored — see the capability flags above. Per the rensei-architecture
+// ignored — see the capability flags above. Per the donmai-architecture
 // 002 base contract: providers that do not advertise a capability MUST
 // NOT pretend to honor it; the runner is expected to gate before
 // invoking Spawn.

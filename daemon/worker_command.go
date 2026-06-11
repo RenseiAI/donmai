@@ -21,7 +21,7 @@ import (
 // "exit 0"` fallback. We log a warning at runtime when the stub fires
 // in production so operators don't silently lose work.
 //
-// (REN-1461 / F.2.8 — daemon wire-up.)
+// (F.2.8 — daemon wire-up.)
 func defaultWorkerCommand() []string {
 	exe, err := os.Executable()
 	if err != nil || exe == "" {

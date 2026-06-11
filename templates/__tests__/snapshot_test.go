@@ -22,12 +22,12 @@ import (
 func fixtureWork() prompt.QueuedWork {
 	return prompt.QueuedWork{
 		SessionID:       "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c",
-		IssueIdentifier: "REN2-1",
+		IssueIdentifier: "DEV-1",
 		ProjectName:     "smoke-alpha",
 		OrganizationID:  "org_ejkmv9ojdyifipydw5l1",
 		Repository:      "github.com/RenseiAI/rensei-smokes-alpha",
 		Ref:             "main",
-		PromptContext: "<issue identifier=\"REN2-1\">\n" +
+		PromptContext: "<issue identifier=\"DEV-1\">\n" +
 			"<title>Wave 6 smoke test</title>\n" +
 			"<description>\nCreate hello-from-wave6.md\n</description>\n" +
 			"</issue>",
@@ -175,7 +175,7 @@ func TestSnapshot_UserDevelopment(t *testing.T) {
 	}
 
 	mustContain := []string{
-		"REN2-1",
+		"DEV-1",
 		"# What to do",
 		"WORK_RESULT:passed",
 		"WORK_RESULT:failed",
@@ -223,7 +223,7 @@ func TestSnapshot_UserQA(t *testing.T) {
 	}
 
 	mustContain := []string{
-		"REN2-1",
+		"DEV-1",
 		"acceptance criteria",
 		"WORK_RESULT:passed",
 		"WORK_RESULT:failed",
@@ -267,7 +267,7 @@ func TestSnapshot_UserResearch(t *testing.T) {
 	}
 
 	mustContain := []string{
-		"REN2-1",
+		"DEV-1",
 		"Do NOT implement code",
 		"acceptance criteria",
 	}

@@ -5,8 +5,7 @@
 // against org∩project.
 //
 // NARROW-ONLY, FAIL-CLOSED. The single load-bearing invariant
-// (ADR-2026-06-06 D5, mirrored byte-for-byte in donmai-architecture and
-// rensei-architecture):
+// (ADR-2026-06-06 D5 in donmai-architecture):
 //
 //	For any machine M, workload W, and cell (company, model, authMode):
 //	  effective(M, W) = platformAllowed(org, project) ∩ machineAllowed(M, W)

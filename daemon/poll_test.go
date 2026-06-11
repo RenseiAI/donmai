@@ -288,7 +288,7 @@ func TestPollResponse_DecodesLiveWireShape(t *testing.T) {
 		"work": [{
 			"sessionId": "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c",
 			"issueId": "08f26531-f5d2-49dc-b412-b42cef0cbffa",
-			"issueIdentifier": "REN2-1",
+			"issueIdentifier": "DEV-1",
 			"priority": 4,
 			"queuedAt": 1777658441780,
 			"workType": "research",
@@ -432,7 +432,7 @@ func withCapturedSlog(t *testing.T) (*bytes.Buffer, func()) {
 // the daemon's allowlist has a matching entry, SessionDetail.repository
 // MUST be the entry's GitHub URL so `git clone` succeeds. Before this
 // fix the runner received "smoke-alpha" and failed with
-// "fatal: repository 'smoke-alpha' does not exist" (REN-1463 / REN-1464).
+// "fatal: repository 'smoke-alpha' does not exist".
 func TestPollItemToSessionDetail_ResolvesProjectNameToRepoURL(t *testing.T) {
 	projects := []ProjectConfig{{
 		ID:         "smoke-alpha",
@@ -766,7 +766,7 @@ func TestPollItemToSessionDetail_DisallowedToolsForwarded(t *testing.T) {
 
 // TestPollResponse_DecodesMemoryBlock proves the Wave 3 dispatch-time
 // agent-memory field survives the strict JSON decode of the poll wire
-// shape — the SUP-1840 silent-drop regression guard (a field on only one
+// shape — the silent-drop regression guard (a field on only one
 // struct is dropped by Go's decoder). Mirrors TestPollResponse_DecodesLiveWireShape.
 func TestPollResponse_DecodesMemoryBlock(t *testing.T) {
 	body := []byte(`{
@@ -859,7 +859,7 @@ func TestCallNackEndpoint_PostsExpectedShape(t *testing.T) {
 	item := &PollWorkItem{
 		SessionID:       "s1",
 		IssueID:         "iss-1",
-		IssueIdentifier: "SUP-1",
+		IssueIdentifier: "OPS-1",
 		Priority:        3,
 		QueuedAt:        1700000000000,
 	}
@@ -925,7 +925,7 @@ func TestCallNackEndpoint_PropagatesServerError(t *testing.T) {
 		"wkr-1",
 		"jwt",
 		"reason",
-		&PollWorkItem{SessionID: "s1", IssueID: "i", IssueIdentifier: "SUP-1", Priority: 1, QueuedAt: 1},
+		&PollWorkItem{SessionID: "s1", IssueID: "i", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 	)
 	if err == nil {
 		t.Fatalf("expected error on HTTP 400")

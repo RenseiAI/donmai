@@ -478,7 +478,7 @@ Models: discovered dynamically (empty `Models` allowed). `SupportsJSONMode: part
 
 `Speaks: [stub]`, one `local` HostDesc, one model. Lets the matrix carry a `stub × stub` cell that satisfies the parity intersection rule with no special-casing.
 
-> **Boundary safety:** EnvKeys are env-var **names** only (public facts). No concrete key values, no metered-key identity, no Linear IDs. `02` §7 / `03` §7 — the JSON passes `grep -nE 'REN-[0-9]|rensei-architecture|RenseiAI/rensei'` by construction. **Bedrock/vertex metered Anthropic cells are platform-only docs surfaces** but the *manifest data* (auth-mode legality, env-var names) is OSS-canonical — fine to ship in OSS donmai per `03` §7.
+> **Boundary safety:** EnvKeys are env-var **names** only (public facts). No concrete key values, no metered-key identity, no Linear IDs. `02` §7 / `03` §7 — the JSON passes `scripts/leak-guard.sh` by construction. **Bedrock/vertex metered Anthropic cells are platform-only docs surfaces** but the *manifest data* (auth-mode legality, env-var names) is OSS-canonical — fine to ship in OSS donmai per `03` §7.
 
 ---
 

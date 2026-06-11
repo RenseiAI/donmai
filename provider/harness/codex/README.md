@@ -106,7 +106,7 @@ provider still works, sessions just run without tool plugins.
   `agent.SystemEvent{Subtype: "unhandled_server_request"}` for
   observability.
 
-## Event-channel close protocol (REN-1460)
+## Event-channel close protocol
 
 The events channel on `Handle` has multiple potential closers — the
 forwarder goroutine's defer (terminal event reached), `Stop` (caller-
@@ -186,14 +186,14 @@ go test -tags codex_integration -timeout 120s ./provider/codex/
   `runtime/tokendelta` transport, not the activity-event stream.)
 - **PID-file orphan-killing** — the legacy TS writes
   `~/.donmai/codex-app-server.pid` to detect stranded processes
-  on restart. Wave 6 daemon owns subprocess lifecycle (REN-1408+); the
+  on restart. Wave 6 daemon owns subprocess lifecycle; the
   provider does not duplicate.
 
 ## See also
 
-- `../agentfactory/packages/core/src/providers/codex-app-server-provider.ts`
+- `../donmai-libraries/packages/core/src/providers/codex-app-server-provider.ts`
   (read-only legacy reference, 1928 LOC)
-- `../agentfactory/packages/core/src/providers/codex-approval-bridge.ts`
+- `../donmai-libraries/packages/core/src/providers/codex-approval-bridge.ts`
   (read-only legacy reference, 124 LOC)
 - F.1.1 design doc §3.2
 - F.0.1 codex deep-dive

@@ -8,7 +8,7 @@
 //
 // Architecture reference:
 //
-//	rensei-architecture/ADR-2026-05-12-capacity-pools-and-substrate-resolution.md
+//	the capacity-pools and substrate-resolution ADR
 //	§ Stream H sub-lane — donmai daemon pool awareness
 package daemon
 

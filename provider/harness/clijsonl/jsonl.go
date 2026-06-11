@@ -146,7 +146,7 @@ type rawResultEnvelope struct {
 // caller's loop is responsible for whether a parse error is fatal.
 //
 // This is the verbatim Go port of the legacy TS mapSDKMessage from
-// ../agentfactory/packages/core/src/providers/claude-provider.ts.
+// ../donmai-libraries/packages/core/src/providers/claude-provider.ts.
 //
 // Design note: each Event variant carries the original raw line in
 // its `Raw` field as json.RawMessage so the runner can persist the

@@ -8,7 +8,7 @@
 store := state.NewStore()
 
 // Read on session start (or recovery).
-st, err := store.ReadExpect(worktree, "REN-1234")
+st, err := store.ReadExpect(worktree, "ENG-1234")
 switch {
 case errors.Is(err, state.ErrNotFound):           // fresh worktree
 case errors.Is(err, state.ErrIdentifierMismatch): // refuse cross-issue reuse
@@ -45,7 +45,7 @@ Atomic write: `state.json.tmp-XXXX` is written + fsync'd, then renamed over `sta
 | `startedAt`, `lastUpdatedAt`, `lastHeartbeat` | Unix-ms timestamps (matches legacy TS `Date.now()`). |
 | `pid`, `workerId` | Provider subprocess pid, owning worker. |
 
-The shape mirrors the legacy TS `WorktreeState` (`../../../agentfactory/packages/core/src/orchestrator/state-types.ts`) closely enough that the two readers can co-exist during the F.0/F.5 migration window.
+The shape mirrors the legacy TS `WorktreeState` (`../../../donmai-libraries/packages/core/src/orchestrator/state-types.ts`) closely enough that the two readers can co-exist during the F.0/F.5 migration window.
 
 ## Concurrency
 

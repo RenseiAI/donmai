@@ -944,7 +944,7 @@ func TestDaemonDoctorReportsMissingService(t *testing.T) {
 	}
 
 	// The doctor output must report binary-presence based on the *actual*
-	// Go binary the installer would register (REN-1406 acceptance criterion).
+	// Go binary the installer would register.
 	out := buf.String()
 	if !strings.Contains(out, "Host binary:") || !strings.Contains(out, "Binary present:") {
 		t.Errorf("expected doctor output to include Host binary / Binary present rows; got:\n%s", out)
@@ -1104,7 +1104,7 @@ func TestDaemonConfigBaseURL(t *testing.T) {
 }
 
 // TestDaemonSetupWritesDefaultConfig verifies that `daemon setup` runs the
-// in-process Go wizard (REN-1408) and, in non-TTY environments, writes the
+// in-process Go wizard and, in non-TTY environments, writes the
 // default config to the path provided via --config.
 func TestDaemonSetupWritesDefaultConfig(t *testing.T) {
 	// Force the non-TTY path via the wizard skip env (mirrors

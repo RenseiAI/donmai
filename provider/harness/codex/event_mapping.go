@@ -12,7 +12,7 @@ import (
 // mapperState carries the running totals across notifications so
 // turn/completed can emit a ResultEvent with accumulated cost. Mirrors
 // AppServerEventMapperState from
-// ../agentfactory/packages/core/src/providers/codex-app-server-provider.ts.
+// ../donmai-libraries/packages/core/src/providers/codex-app-server-provider.ts.
 type mapperState struct {
 	sessionID           string
 	model               string

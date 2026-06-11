@@ -66,12 +66,12 @@ MCP children that inherit stdout.
 | `ToolPermissionFormat` | `claude` | `Bash(prefix:glob)` grammar. |
 
 The remaining bolded flags reflect the v0.5.0 CLI shell-out approach.
-They flip to `true` in v0.5.+ once option C lands per **REN-1451**.
+They flip to `true` in v0.5.+ once option C lands.
 
 ### Between-turn injection (`Inject` semantics)
 
 `v0.5.0` ships `SupportsMessageInjection=true` via `--resume`-based
-injection (REN-1455 / F.2.3-cap-flip). Each `Inject(ctx, text)` call:
+injection (F.2.3-cap-flip). Each `Inject(ctx, text)` call:
 
 1. Reads the session id captured from the parent's `system.init`
    event. Pre-init calls error with `ErrSessionNotReady`.
@@ -90,7 +90,7 @@ reader no longer closes on EOF (Inject would have nowhere to send).
 `Stop()` is the sole closer; the spawn ctx's cancellation triggers an
 internal Stop via a watcher goroutine.
 
-### Path to the option C upgrade (REN-1451)
+### Path to the option C upgrade
 
 The `--resume` mechanism is between-turn — same level as the legacy
 TS Agent SDK in v0.5.0. Option C replaces the subprocess shell-out
@@ -130,7 +130,7 @@ alongside so the CLI ignores any other host-wide MCP configurations.
 ## JSONL → Event mapping
 
 Port of the legacy `mapSDKMessage` from
-`../agentfactory/packages/core/src/providers/claude-provider.ts`.
+`../donmai-libraries/packages/core/src/providers/claude-provider.ts`.
 
 | CLI line `type` | Variant emitted |
 |---|---|
@@ -215,7 +215,7 @@ Test inventory (per cardinal rule 10):
 
 | Concern | Legacy path |
 |---|---|
-| Provider class + capabilities + spawn loop | `../agentfactory/packages/core/src/providers/claude-provider.ts` |
+| Provider class + capabilities + spawn loop | `../donmai-libraries/packages/core/src/providers/claude-provider.ts` |
 | `mapSDKMessage` translation | same file, `mapSDKMessage` / `mapAssistantMessage` / `mapUserMessage` / `mapResultMessage` |
 | `canUseTool` factory | same file, `createAutonomousCanUseTool` (not ported in v0.5.0; CLI has no callback surface) |
 | Linear MCP disallow list | same file, `disallowedTools` array under `agentQuery.options` |

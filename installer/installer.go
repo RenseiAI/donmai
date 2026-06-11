@@ -2,7 +2,7 @@
 //
 // On macOS, calls flow through installer/launchd. On Linux, calls flow
 // through installer/systemd. The host binary's `daemon run` subcommand is
-// what gets registered as the service entrypoint (locked REN-1406
+// what gets registered as the service entrypoint (locked
 // decision — no separate rensei-daemon binary).
 //
 // This package is the single import surface for `donmai daemon install`,
@@ -66,7 +66,7 @@ type InstallResult struct {
 	ServicePath string
 	// ServiceCommand is the full command line registered as the service
 	// entrypoint, e.g. "/usr/local/bin/af daemon run". This is what the
-	// runtime port (REN-1408) must implement.
+	// runtime port must implement.
 	ServiceCommand string
 	// Loaded reports whether the service was successfully registered with
 	// the OS service manager. False when SkipServiceManager is set or when

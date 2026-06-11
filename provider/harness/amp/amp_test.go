@@ -149,7 +149,7 @@ func TestProvider_Capabilities(t *testing.T) {
 	if caps.SupportsSessionResume {
 		t.Error("SupportsSessionResume: want false")
 	}
-	// Post-REN-1499 (commit 3c6b6c6): amp Spawn writes a per-session
+	// Since commit 3c6b6c6, amp Spawn writes a per-session
 	// MCP tmpfile and passes --mcp-config, so SupportsToolPlugins is
 	// honestly true. This also satisfies the invariant that
 	// AcceptsMcpServerSpec=true requires SupportsToolPlugins=true

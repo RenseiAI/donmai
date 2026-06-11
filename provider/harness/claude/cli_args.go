@@ -11,7 +11,7 @@ import (
 // linearMCPDisallowList mirrors the legacy TS provider's hard block on
 // Linear MCP tools. Agents must use the af-linear CLI / af_linear_*
 // stdio MCP tools instead. Sourced from
-// ../agentfactory/packages/core/src/providers/claude-provider.ts.
+// ../donmai-libraries/packages/core/src/providers/claude-provider.ts.
 //
 // The list is sorted to keep diffs stable.
 var linearMCPDisallowList = []string{

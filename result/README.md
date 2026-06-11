@@ -27,7 +27,7 @@ import (
 )
 
 p, err := result.NewPoster(result.Options{
-    PlatformURL: "https://app.rensei.ai",
+    PlatformURL: "https://platform.example.com",
     AuthToken:   runtimeJWT,
     WorkerID:    "wkr_xxx",
 })
@@ -37,7 +37,7 @@ err = p.Post(ctx, sessionID, agent.Result{
     Status:            "completed",
     ProviderName:      agent.ProviderClaude,
     ProviderSessionID: "claude-sess-uuid",
-    WorktreePath:      "/tmp/wt/REN-123-DEV",
+    WorktreePath:      "/tmp/wt/ENG-123-DEV",
     PullRequestURL:    "https://github.com/owner/repo/pull/42",
     Summary:           "Implemented X, opened PR.",
     WorkResult:        "passed",
@@ -54,7 +54,7 @@ err = p.Post(ctx, sessionID, agent.Result{
 Both calls are wrapped by a 3-attempt exponential-backoff helper —
 `baseDelay << (attempt-1)` defaults to 1s, 2s, 4s. The shape is the
 verbatim port of the legacy `apiRequestWithError` from
-`../agentfactory/packages/cli/src/lib/worker-runner.ts`.
+`../donmai-libraries/packages/cli/src/lib/worker-runner.ts`.
 
 | Failure                                     | Behavior                                         |
 |---------------------------------------------|--------------------------------------------------|
@@ -72,7 +72,7 @@ combines them so downstream logs see the full picture.
 
 - Posts to the platform only. Does NOT post directly to Linear; the
   platform's completion + status handlers own the Linear-side
-  reflection (REN-1399 tenant scoping requires it).
+  reflection (tenant scoping requires it).
 - Knows nothing about how the `agent.Result` was produced. The runner
   hands it a fully-populated value; this package only translates that
   to the wire shape.

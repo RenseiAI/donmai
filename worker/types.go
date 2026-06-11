@@ -7,7 +7,7 @@ import (
 
 // AgentRuntimeProviderCapabilities mirrors the TypeScript AgentProviderCapabilities
 // struct (packages/core/src/providers/types.ts) and is used for typed capability
-// advertisement during worker registration (REN-1282).
+// advertisement during worker registration.
 //
 // The orchestrator prefers CapabilitiesTyped over the legacy Capabilities []string
 // field when both are present; the string slice is retained for backward
@@ -74,7 +74,7 @@ type RegisterRequest struct {
 
 // ResolveCapabilities returns a summary of the effective capability tags for
 // this registration request, implementing the "prefer typed when present"
-// migration path (REN-1282 / ADR-002).
+// migration path (ADR-002).
 //
 // If CapabilitiesTyped is non-nil the orchestrator should use it as the
 // authoritative source. The legacy Capabilities slice is still returned for

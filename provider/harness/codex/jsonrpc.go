@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// JSON-RPC 2.0 message shapes. See ../agentfactory/packages/core/src/
+// JSON-RPC 2.0 message shapes. See ../donmai-libraries/packages/core/src/
 // providers/codex-app-server-provider.ts for the authoritative legacy
 // TS shapes — the Go equivalents are deliberately small subsets that
 // the codex app-server actually exercises today.
@@ -244,7 +244,7 @@ func (c *Client) Request(ctx context.Context, method string, params map[string]a
 	// in the same instant that c.doneCh closes, and an unguarded select
 	// would pick the doneCh case 50% of the time and lose a perfectly
 	// good reply, surfacing as a spurious "client stopped" error
-	// (REN-1460 follow-up).
+	// (follow-up).
 	checkResp := func() (json.RawMessage, error, bool) {
 		select {
 		case resp := <-pending.ch:
@@ -408,7 +408,7 @@ func (c *Client) CloseErr() error {
 // readLoop reads JSON-RPC messages from r line-by-line and dispatches
 // them. Exits when r returns EOF or a hard error.
 //
-// Termination protocol (REN-1460): the scanner error is captured into
+// Termination protocol: the scanner error is captured into
 // a local and passed to Stop as the cause, NOT written to c.closeErr
 // directly. Stop's closeOnce serializes the closeErr write with
 // CloseErr / Request readers via doneCh's happens-before, so this is

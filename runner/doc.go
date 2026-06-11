@@ -64,7 +64,7 @@
 //     list, `git commit`, `git push`, `gh pr create`).
 //
 // The path-exclude list in [backstop.go] is ported verbatim from the
-// legacy TS at agentfactory/packages/core/src/orchestrator/session-backstop.ts:57-95.
+// legacy TS at donmai-libraries/packages/core/src/orchestrator/session-backstop.ts:57-95.
 //
 // # Telemetry
 //

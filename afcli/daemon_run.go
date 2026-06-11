@@ -20,7 +20,7 @@ import (
 // newDaemonRunCmd constructs the `daemon run` subcommand. This is the
 // long-running entry point registered by the launchd plist / systemd unit.
 //
-// REN-1406 wired the installer to register `<host-binary> daemon run`; this
+// The installer registers `<host-binary> daemon run` as the service entrypoint; this
 // command is what runs on those service managers.
 func newDaemonRunCmd(hostVersion string) *cobra.Command {
 	var (
@@ -121,7 +121,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			_, _ = fmt.Fprintf(out, "[daemon] state -> %s\n", d.State())
 			// Print the worker id only after Start() completes registration so
 			// the value is the live, platform-assigned id (or a clearly-marked
-			// stub fallback). REN-1445 — previously the log fired with a stub
+			// stub fallback). Previously the log fired with a stub
 			// WorkerID like "worker-<host>-stub" before any real registration
 			// had a chance to run, misleading operators into thinking the
 			// daemon was registered when it was not.
@@ -230,7 +230,7 @@ func displayEnvLocalPath(s *afcreds.LocalSource) string {
 // formatStartupWorkerLine returns the post-Start `[daemon] worker-id ...`
 // line, or "" when no worker id has been assigned yet. Stub registrations
 // (worker id ending in `-stub`) are annotated so operators do not mistake
-// them for a successful platform registration. (REN-1445.)
+// them for a successful platform registration.
 func formatStartupWorkerLine(workerID string) string {
 	if workerID == "" {
 		return ""

@@ -1,8 +1,8 @@
 // Package afclient routing_types.go — wire types for the daemon's
 // /api/daemon/routing/* operator surface. The contract is locked in
-// rensei-architecture/ADR-2026-05-07-daemon-http-control-api.md (D4) and
+// donmai-architecture/ADR-2026-05-07-daemon-http-control-api.md (D4) and
 // surfaces the cross-provider scheduler decisions described in
-// 004-sandbox-capability-matrix.md and the REN-205 reframe.
+// 004-sandbox-capability-matrix.md and the capability-matrix reframe.
 package afclient
 
 import "time"
@@ -10,7 +10,7 @@ import "time"
 // RoutingConfig is the current routing configuration returned by
 // GET /api/daemon/routing/config. It surfaces Thompson-Sampling state
 // across both dimensions (LLM × sandbox) per
-// 004-sandbox-capability-matrix.md and the REN-205 reframe.
+// 004-sandbox-capability-matrix.md and the capability-matrix reframe.
 type RoutingConfig struct {
 	// CapabilityFilters are the active hard-filter constraints the
 	// scheduler enforces before scoring (e.g. region, OS, arch, GPU

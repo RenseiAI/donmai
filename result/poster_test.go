@@ -25,7 +25,7 @@ func goodResult() agent.Result {
 		Status:            "completed",
 		ProviderName:      agent.ProviderClaude,
 		ProviderSessionID: "claude-sess-123",
-		WorktreePath:      "/tmp/wt/REN-1",
+		WorktreePath:      "/tmp/wt/ENG-1",
 		PullRequestURL:    "https://github.com/x/y/pull/42",
 		Summary:           "Implemented X, opened PR.",
 		WorkResult:        "passed",
@@ -303,7 +303,7 @@ func TestPosterPost_UsesCredentialProvider(t *testing.T) {
 	}
 }
 
-// TestPosterPost_RefreshCredentialsOn401 confirms the SUP-1823 fix:
+// TestPosterPost_RefreshCredentialsOn401 confirms the stale-JWT fix:
 // when the platform returns 401 (cached runtime JWT expired mid-session),
 // the next retry attempt re-invokes the CredentialProvider and posts
 // with the fresh bearer token. Mirrors

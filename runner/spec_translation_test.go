@@ -9,7 +9,7 @@ import (
 )
 
 // TestTranslateSpec_PlatformDisallowedTools_Appended verifies that
-// platform-supplied DisallowedTools patterns (SUP-1840 Option B) are
+// platform-supplied DisallowedTools patterns (Option B) are
 // appended to the runner's defaultDisallowedTools() baseline rather
 // than replacing it. The merge is purely additive — the static floor
 // remains intact.

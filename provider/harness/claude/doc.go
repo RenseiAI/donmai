@@ -26,7 +26,7 @@
 // # Capability matrix (v0.5.0)
 //
 // Per coordinator decision #1 in F.1.1 §10 (with F.2.3-cap-flip
-// follow-up REN-1455), this provider ships with
+// follow-up), this provider ships with
 // SupportsMessageInjection=true (between-turn) and
 // SupportsSessionResume=false.
 //
@@ -35,14 +35,14 @@
 //     spawns a fresh resume subprocess and forwards its JSONL stream
 //     onto the parent Handle's events channel. Same semantic level
 //     as the legacy TS Agent SDK. Sequential (one --resume at a
-//     time); see ErrInjectInFlight. Option C upgrade (REN-1451)
+//     time); see ErrInjectInFlight. Option C upgrade
 //     replaces the subprocess shell-out with the Anthropic Go SDK
 //     for true mid-turn injection without subprocess overhead.
 //
 //   - SupportsSessionResume=false: while the CLI exposes `--resume
 //     <session-id>`, the v0.5.0 runner does not yet exercise the
 //     resume code path on Provider.Resume. Flip to true in v0.5.+
-//     once F.5's option C lands (REN-1451).
+//     once F.5's option C lands.
 //
 // All other capabilities follow F.1.1 §3.1: tool plugins (true), no
 // base instructions (false), no permission config (false), code-intel
@@ -65,7 +65,7 @@
 // # Legacy TS reference
 //
 // The legacy in-process Anthropic SDK provider lives at
-// ../agentfactory/packages/core/src/providers/claude-provider.ts. The
+// ../donmai-libraries/packages/core/src/providers/claude-provider.ts. The
 // JSONL → Event mapping in jsonl.go ports the verbatim `mapSDKMessage`
 // translation logic from that file. The Go port does NOT re-implement
 // the in-process SDK integration (that is a Node-runtime concern).

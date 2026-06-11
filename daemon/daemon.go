@@ -50,7 +50,7 @@ type Options struct {
 	// PoolStatsProvider returns the current workarea pool snapshot. May be
 	// nil — the /api/daemon/pool/stats endpoint will return an empty
 	// snapshot in that case (acceptance criterion: pool integration is
-	// optional in the runtime port; full WorkareaProvider wiring is REN-1280).
+	// optional in the runtime port; full WorkareaProvider wiring is future work).
 	PoolStatsProvider PoolStatsProvider
 	// EvictHandler handles pool eviction requests. May be nil; the endpoint
 	// returns 501 in that case.
@@ -135,7 +135,7 @@ type Daemon struct {
 
 	// sessionDetails stores the per-session payload the spawner
 	// hands out to `donmai agent run` workers via the local control
-	// HTTP API at /api/daemon/sessions/<id>. (REN-1461 / F.2.8.)
+	// HTTP API at /api/daemon/sessions/<id>.
 	sessionDetails *sessionDetailStore
 
 	// routingTraces is the in-process record of cross-provider
@@ -394,7 +394,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// Default WorkerCommand: spawn `donmai agent run` from the same
 	// binary as the running daemon process so session lifecycle is
 	// owned in-tree. Operators can override via SpawnerOptions.
-	// (REN-1461 / F.2.8 — daemon wire-up.)
+	// (F.2.8 — daemon wire-up.)
 	if len(spawnerOpts.WorkerCommand) == 0 {
 		if cmd := defaultWorkerCommand(); cmd != nil {
 			spawnerOpts.WorkerCommand = cmd
@@ -407,7 +407,6 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// drain-and-discard — leaving operators flying blind between
 	// runner.Run() start and a `status=failed` post. Callers that already
 	// supply their own writers via SpawnerOptions retain priority.
-	// (REN-1463 / v0.5.1.)
 	if spawnerOpts.StdoutPrefixWriter == nil {
 		spawnerOpts.StdoutPrefixWriter = newStdoutSlogWriter()
 	}
@@ -441,7 +440,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// either path re-mints the runtime JWT once and refreshes both
 		// services with the new credentials.
 		//
-		// REN-1481 fix: route through RefreshRuntimeToken which probes a
+		// Token-refresh fix: route through RefreshRuntimeToken which probes a
 		// real refresh endpoint first (preserving the workerId) and only
 		// falls back to a full Register() — minting a fresh workerId — if
 		// the platform side has not yet shipped the refresh handler. The

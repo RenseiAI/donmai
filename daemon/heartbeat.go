@@ -253,7 +253,7 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 
 	// Real-endpoint call is gated on (a) operator-requested stub mode and
 	// (b) whether the runtime JWT is a stub (the stub path returns a token
-	// with the "stub." prefix). REN-1444 inverted the default to real
+	// with the "stub." prefix). v0.4.1 inverted the default to real
 	// registration; the JWT-prefix check ensures a daemon configured with
 	// a non-rs[pk]_live token still does not try to call prod with a
 	// stub token.
@@ -275,7 +275,7 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 	// re-register and retry once with fresh credentials. Any other error
 	// is logged and left for the platform to detect via missed heartbeats.
 	if isAuthFailure(err) && h.opts.OnReregister != nil {
-		// Surface the structured [runtime-token] event so REN-1481
+		// Surface the structured [runtime-token] event so token-refresh
 		// observers can grep one line per cycle rather than parsing
 		// the LogWarn body. The OnReregister implementation is also
 		// expected to log the resolution event ("refresh" or
@@ -521,7 +521,7 @@ func isAuthFailure(err error) bool {
 
 // authFailureReason classifies the auth-failure error into a stable
 // short string for the [runtime-token] log line. Distinguishes
-// runtime-token-expired (the canonical REN-1481 trigger) from
+// runtime-token-expired (the canonical trigger) from
 // worker-not-found and generic-unauthorized so operators can tell
 // which path the daemon entered without scraping the response body.
 func authFailureReason(err error) string {

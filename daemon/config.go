@@ -69,7 +69,7 @@ type CapacityConfig struct {
 	MaxMemoryMbPerSession int                `yaml:"maxMemoryMbPerSession"     json:"maxMemoryMbPerSession"`
 	ReservedForSystem     ReservedSystemSpec `yaml:"reservedForSystem"         json:"reservedForSystem"`
 	// PoolMaxDiskGb is the LRU-eviction trigger for the workarea pool.
-	// 0 means no limit. (REN-1334.)
+	// 0 means no limit.
 	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
 }
 
@@ -88,7 +88,7 @@ type ProjectConfig struct {
 }
 
 // UnmarshalYAML accepts either the canonical `repository` key or the legacy
-// `repoUrl` key (pre-REN-1419 daemon.yaml files written by older versions of
+// `repoUrl` key (legacy daemon.yaml files written by older versions of
 // `rensei project allow`). When the legacy key is found a one-line warning
 // is logged so operators know to rewrite the file; this back-compat shim is
 // scheduled for removal one release after the canonical writer ships.
@@ -112,7 +112,7 @@ func (p *ProjectConfig) UnmarshalYAML(node *yaml.Node) error {
 	case raw.RepoURL != "":
 		p.Repository = raw.RepoURL
 		slog.Warn(
-			"daemon.yaml: legacy 'repoUrl' key on project entry; will be rewritten as 'repository' on next write (REN-1419)",
+			"daemon.yaml: legacy 'repoUrl' key on project entry; will be rewritten as 'repository' on next write",
 			"id", raw.ID,
 			"repoUrl", raw.RepoURL,
 		)

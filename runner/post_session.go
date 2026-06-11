@@ -1,6 +1,6 @@
 package runner
 
-// Post-session Linear state transition (REN-1467).
+// Post-session Linear state transition.
 //
 // This file implements the runner-side of the WORK_RESULT → Linear
 // state-transition wire that closes Wave 6 Phase F.2.5's outstanding
@@ -54,7 +54,7 @@ func (r *Runner) runPostSession(parentCtx context.Context, qw QueuedWork, res *R
 
 	workType := qw.WorkType
 	workResult := res.WorkResult
-	// REN-1467: when the runner has no merge-queue adapter (today: the
+	// When the runner has no merge-queue adapter (today: the
 	// Go runner ships without one), shouldDeferAcceptanceTransition is
 	// always false. Reserved for parity with the TS path; flip when a
 	// Go merge-queue adapter lands.

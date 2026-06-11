@@ -2,7 +2,7 @@ package afclient
 
 // ── AgentCard types (H — workType lane) ──────────────────────────────────────
 // Mirrors the canonical TypeScript interface in
-// rensei-architecture/11-runtime-binding-strategy.md §1 and the schema
+// the runtime-binding-strategy doc §1 and the schema
 // decisions codified in ADR-2026-05-12-agentcard-schema-and-scope.md (D1–D8,
 // D21). JSON tags match the wire keys emitted by the platform's
 // /api/agents endpoint.
@@ -198,7 +198,7 @@ type AgentCard struct {
 
 	// Partials is the ordered list of partial references assembled at dispatch.
 	Partials []PartialRef `json:"partials,omitempty"`
-	// Capabilities is the flat-typed boolean capability struct (REN-1513 pattern).
+	// Capabilities is the flat-typed boolean capability struct.
 	Capabilities map[string]bool `json:"capabilities,omitempty"`
 
 	// ── THE ONTOLOGY — five runtime/auth/substrate axes ─────────────────────

@@ -1,7 +1,7 @@
 package agent
 
 // This file ports the type-only declarations from
-// ../agentfactory/packages/core/src/providers/types.ts.
+// ../donmai-libraries/packages/core/src/providers/types.ts.
 //
 // Per the F.1.1 design doc §2 (Type signatures (Go)), these types are
 // the verbatim Go translation. JSON tags use camelCase to match the TS
@@ -16,7 +16,7 @@ import "encoding/json"
 // ollama, opencode, jules, amp) extend this enum without breaking the
 // contract.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts (AgentProviderName).
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts (AgentProviderName).
 type ProviderName string
 
 // ProviderName constants. v0.5.0 ships ProviderClaude, ProviderCodex,
@@ -44,7 +44,7 @@ const (
 // gate runner behavior rather than try-catching unsupported provider
 // operations.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentProviderCapabilities).
 type Capability string
 
@@ -82,7 +82,7 @@ const (
 // Capabilities is the typed capability matrix every provider declares.
 //
 // Verbatim port of AgentProviderCapabilities. Flat struct (no nested
-// objects) per the rensei-architecture base-contract validator
+// objects) per the donmai-architecture base-contract validator
 // constraint (002-provider-base-contract.md §Capabilities).
 //
 // Per F.1.1 §3.1 and the locked coordinator decision, the v0.5.0
@@ -90,7 +90,7 @@ const (
 // injection in CLI JSON-stream mode); flip when a wrapper sidecar
 // lands in F.5.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentProviderCapabilities).
 type Capabilities struct {
 	// SupportsMessageInjection reports whether Handle.Inject works
@@ -215,7 +215,7 @@ func IsSupported(caps Capabilities, c Capability) bool {
 
 // SandboxLevel mirrors AgentSpawnConfig.sandboxLevel from the legacy TS.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts.
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts.
 type SandboxLevel string
 
 // SandboxLevel constants align with Codex sandbox policies (readOnly /
@@ -228,7 +228,7 @@ const (
 )
 
 // EffortLevel mirrors EffortLevel from
-// ../agentfactory/packages/core/src/providers/index.ts. Providers map
+// ../donmai-libraries/packages/core/src/providers/index.ts. Providers map
 // this to their native reasoning-effort knob:
 //   - Claude  : --effort flag
 //   - Codex   : reasoningEffort / model_reasoning_effort
@@ -273,7 +273,7 @@ type MCPServerConfig struct {
 
 // PermissionConfig is the runtime permission policy for the codex
 // approval bridge. Verbatim port of CodexPermissionConfig from
-// ../agentfactory/packages/core/src/templates/adapters.ts.
+// ../donmai-libraries/packages/core/src/templates/adapters.ts.
 //
 // Providers without NeedsPermissionConfig=true ignore this field.
 type PermissionConfig struct {
@@ -312,7 +312,7 @@ type CodeIntelEnforcement struct {
 // for not setting incompatible fields (gate on Capabilities before
 // invoking Spawn).
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentSpawnConfig).
 type Spec struct {
 	// Prompt is the task-specific directive.

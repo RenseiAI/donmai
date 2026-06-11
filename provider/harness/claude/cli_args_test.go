@@ -40,7 +40,7 @@ func TestBuildArgs_AllSpecFields(t *testing.T) {
 
 	maxTurns := 7
 	spec := agent.Spec{
-		Prompt:             "implement REN-1",
+		Prompt:             "implement ENG-1",
 		Cwd:                "/tmp/work",
 		Env:                map[string]string{"FOO": "bar"},
 		Autonomous:         true,
@@ -68,7 +68,7 @@ func TestBuildArgs_AllSpecFields(t *testing.T) {
 
 	argv, stdin := buildArgs(spec, "/tmp/mcp.json", "")
 
-	if stdin != "implement REN-1" {
+	if stdin != "implement ENG-1" {
 		t.Errorf("stdin: got %q, want prompt", stdin)
 	}
 

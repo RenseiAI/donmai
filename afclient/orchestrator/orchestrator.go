@@ -52,7 +52,7 @@ const (
 type AgentDispatch struct {
 	// IssueID is the Linear issue UUID.
 	IssueID string
-	// Identifier is the human-readable issue identifier (e.g. "REN-42").
+	// Identifier is the human-readable issue identifier (e.g. "ENG-42").
 	Identifier string
 	// Title is the issue title.
 	Title string

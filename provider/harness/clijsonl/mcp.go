@@ -21,7 +21,7 @@ import (
 //	  }
 //	}
 //
-// Source: ../agentfactory/packages/core/src/providers/claude-provider.ts
+// Source: ../donmai-libraries/packages/core/src/providers/claude-provider.ts
 // (the `mcpServers` Object.fromEntries block) and the Claude CLI
 // `--mcp-config` documentation.
 type mcpConfigFile struct {

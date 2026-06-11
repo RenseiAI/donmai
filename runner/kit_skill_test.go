@@ -175,7 +175,7 @@ func TestKitSkillSources_PromptContainsSkillSection(t *testing.T) {
 
 	qw := prompt.QueuedWork{
 		SessionID:       "test-session",
-		IssueIdentifier: "REN-9",
+		IssueIdentifier: "ENG-9",
 		Repository:      "github.com/RenseiAI/test",
 		Ref:             "main",
 		PromptContext:   "<issue>test</issue>",

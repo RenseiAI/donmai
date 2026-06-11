@@ -190,7 +190,7 @@ func TestAgentEnvBlocklistMatchesLegacyTS(t *testing.T) {
 	t.Parallel()
 
 	// Verbatim port from
-	// ../agentfactory/packages/core/src/orchestrator/orchestrator.ts
+	// ../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts
 	// AGENT_ENV_BLOCKLIST. If the legacy list grows, port the new entries
 	// AND update this test.
 	want := []string{

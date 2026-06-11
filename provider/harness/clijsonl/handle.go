@@ -97,7 +97,7 @@ type Handle struct {
 	// the same cwd: claude segments its conversation storage by project
 	// (cwd-based), so a `claude --resume <id>` from a different cwd
 	// surfaces "No conversation found with session ID: <id>" and exits
-	// non-zero. REN-1485 wave 7 e2e on REN2-21 surfaced this — captured
+	// non-zero. A live e2e run surfaced this — captured
 	// via the inject stderr ring buffer added in PR #76.
 	cwd    string
 	cmd    *exec.Cmd
@@ -390,7 +390,7 @@ func (h *Handle) Events() <-chan agent.Event { return h.events }
 // Spawn) processes its single headless turn and exits; subsequent
 // Inject calls each spawn one --resume subprocess that contributes
 // another turn's events. Same semantic level as the legacy TS Agent
-// SDK and the future Go-native option C upgrade in REN-1451.
+// SDK and the future Go-native option C upgrade.
 //
 // Concurrency policy: sequential. While one Inject's --resume
 // subprocess is still running, a concurrent Inject returns
@@ -455,8 +455,8 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 	// parent spawn. Claude segments its on-disk conversation storage by
 	// project (cwd-based); resuming from a different cwd looks under a
 	// different project's session pool and reports "No conversation
-	// found with session ID: ...". Surfaced by REN2-21 wave 7 e2e
-	// (REN-1485) once PR #76's inject stderr capture made the failure
+	// found with session ID: ...". Surfaced by a live e2e run
+	// once PR #76's inject stderr capture made the failure
 	// visible.
 	if h.cwd != "" {
 		cmd.Dir = h.cwd

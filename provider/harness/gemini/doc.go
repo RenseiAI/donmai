@@ -52,5 +52,5 @@
 //   - event_mapping.go     — generateContent response → agent.Event
 //   - handle.go            — Handle impl + multi-turn driver goroutine
 //
-// Tracked in REN-1500 (Gemini native runner) on the Rensei Linear team.
+// A native Gemini runner is tracked as follow-up work.
 package gemini

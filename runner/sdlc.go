@@ -3,7 +3,7 @@ package runner
 // SDLC status mappings + post-session transition decision.
 //
 // This file ports the Linear status-mapping tables from the legacy TS
-// orchestrator (agentfactory/packages/linear/src/types.ts —
+// orchestrator (donmai-libraries/packages/linear/src/types.ts —
 // WORK_TYPE_COMPLETE_STATUS / WORK_TYPE_FAIL_STATUS) and the
 // post-session decision logic from
 // packages/core/src/orchestrator/event-processor.ts:300-450.
@@ -18,14 +18,14 @@ package runner
 //   - non-result-sensitive types (research, backlog-creation, refinement, etc.)
 //     promote on completion regardless of marker
 //   - acceptance with a passing marker DEFERS to the merge worker when a
-//     local merge queue is configured (REN-503/REN-1153)
+//     local merge queue is configured
 //
 // Wire shape: targetStatus is the Linear workflow-state name (e.g.
 // "Finished", "Rejected", "Backlog"). The runtime/result layer resolves
 // the name to a Linear stateId via the platform's issue-tracker proxy.
 
 // Known agent work-type names. Verbatim mirror of AgentWorkType from
-// agentfactory/packages/core/src/orchestrator/work-types.ts so any
+// donmai-libraries/packages/core/src/orchestrator/work-types.ts so any
 // new work type the platform adds shows up here as a missing entry on
 // `make test` (TestWorkTypeStatusMappings_Exhaustive).
 //
@@ -85,7 +85,7 @@ var AllWorkTypes = []string{
 // Empty string ("") means no auto-transition.
 //
 // Verbatim port of WORK_TYPE_COMPLETE_STATUS from
-// agentfactory/packages/linear/src/types.ts.
+// donmai-libraries/packages/linear/src/types.ts.
 var workTypeCompleteStatus = map[string]string{
 	WorkTypeResearch:                 "",          // No auto-transition; user moves to Backlog
 	WorkTypeBacklogCreation:          "",          // Source stays in Icebox
@@ -119,7 +119,7 @@ var workTypeCompleteStatus = map[string]string{
 // Empty string ("") means no auto-transition (stay in current status).
 //
 // Verbatim port of WORK_TYPE_FAIL_STATUS from
-// agentfactory/packages/linear/src/types.ts.
+// donmai-libraries/packages/linear/src/types.ts.
 var workTypeFailStatus = map[string]string{
 	WorkTypeResearch:                 "",
 	WorkTypeBacklogCreation:          "",
@@ -176,7 +176,7 @@ func isResultSensitive(workType string) bool {
 // shouldDeferAcceptanceTransition decides whether a passing acceptance
 // session should DEFER its Delivered → Accepted promotion to the merge
 // worker. Verbatim port of `shouldDeferAcceptanceTransition` from
-// agentfactory/packages/core/src/orchestrator/dispatcher.ts:74.
+// donmai-libraries/packages/core/src/orchestrator/dispatcher.ts:74.
 //
 // Returns false when:
 //   - no merge queue adapter is configured (acceptance merges directly)
@@ -261,7 +261,7 @@ func resolveTargetStatus(workType, sessionStatus, workResult string, hasMergeQue
 
 		switch effectiveResult {
 		case "passed":
-			// REN-503/REN-1153: passing acceptance defers to the
+			// Passing acceptance defers to the
 			// merge worker when the local queue is enabled.
 			if shouldDeferAcceptanceTransition(workType, hasMergeQueueAdapter) {
 				d.Deferred = true

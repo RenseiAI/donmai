@@ -47,7 +47,7 @@ func TestGeneratePlist_RegistersDaemonRunNotRenseiDaemon(t *testing.T) {
 		t.Fatalf("GeneratePlist: %v", err)
 	}
 
-	// Locked REN-1406 decision: ProgramArguments must register the host
+	// Locked decision: ProgramArguments must register the host
 	// binary's `daemon run` subcommand (NOT a separate rensei-daemon
 	// binary, NOT the legacy `start` subcommand).
 	if !strings.Contains(out, "<string>/usr/local/bin/af</string>") {
@@ -482,7 +482,7 @@ func TestResolveHostBinPath_ExplicitOverride(t *testing.T) {
 // TestGeneratePlist_PathIncludesUserLocalBin asserts the v0.5.1 fix:
 // the plist's EnvironmentVariables.PATH must prepend ~/.local/bin so
 // user-local installs of provider CLIs like `claude` are visible to
-// the daemon. (REN-1462.)
+// the daemon.
 func TestGeneratePlist_PathIncludesUserLocalBin(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)

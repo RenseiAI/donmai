@@ -11,7 +11,7 @@ import (
 
 // DefaultCodexModel is the model identifier used when Spec.Model is
 // unset. Mirrors the legacy TS CODEX_DEFAULT_MODEL constant from
-// ../agentfactory/packages/core/src/providers/codex-app-server-provider.ts.
+// ../donmai-libraries/packages/core/src/providers/codex-app-server-provider.ts.
 const DefaultCodexModel = "gpt-5-codex"
 
 // codexModelTierMap mirrors CODEX_MODEL_MAP from the legacy TS. When a

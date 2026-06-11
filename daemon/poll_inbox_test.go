@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// TestPollService_RoutesInboxUserTurn verifies the REN-1563 inbox-routing
+// TestPollService_RoutesInboxUserTurn verifies the interview inbox-routing
 // path: a kind="user" inbox message is decoded from the poll response and
 // forwarded to OnInbox, keyed by its session id (the daemon then injects it
 // into the running session's runner).

@@ -1,8 +1,8 @@
 # `runner/` — per-session orchestration loop
 
-> **Status:** Wave 6 / Phase F.2.6 (REN-1459). Public package; importable by `rensei-tui` without depending on the rest of `donmai` daemon plumbing.
+> **Status:** Wave 6 / Phase F.2.6. Public package; importable by `rensei-tui` without depending on the rest of `donmai` daemon plumbing.
 > **Spec:** `../../../runs/2026-05-01-wave-6-fleet-iteration/F1.1-runner-contract.md` §1 (layout) + §4 (orchestration) + §5 (failure modes).
-> **Legacy reference:** `../../../agentfactory/packages/core/src/orchestrator/{agent-spawner,event-processor,session-backstop}.ts`.
+> **Legacy reference:** `../../../donmai-libraries/packages/core/src/orchestrator/{agent-spawner,event-processor,session-backstop}.ts`.
 
 `runner/` ties the Wave 2 + Wave 2b building blocks together into the per-session main loop. F.2.8 (daemon wire-up) calls `Runner.Run` for every claimed `QueuedWork` and the function does not return until the session is fully terminated, the result has been posted, and the worktree torn down.
 
@@ -82,7 +82,7 @@ Two-stage post-completion recovery (F.0.1 §1):
 1. **Stage 1 — steering.** Fires when the provider supports `SupportsMessageInjection` *or* `SupportsSessionResume` AND the session ended successfully but without a PR URL. The runner injects a templated follow-up prompt asking the agent to commit/push/PR. Skipped via `Options.SkipSteering`.
 2. **Stage 2 — backstop.** Deterministic git workflow when steering didn't produce a PR (or the provider doesn't support steering). Skipped via `Options.SkipBackstop` for tests that don't have a real remote.
 
-The backstop's path-exclude list is ported verbatim from `agentfactory/packages/core/src/orchestrator/session-backstop.ts:57-95`. The list lives at the top of `backstop.go` as Go data tables (`excludeDirAnyDepth`, `excludeDirTopLevel`, `excludeExtensions`, `excludeBasenamePrefixes`, `excludePathPrefixes`). When the legacy TS adds an entry, port it here in the same wave.
+The backstop's path-exclude list is ported verbatim from `donmai-libraries/packages/core/src/orchestrator/session-backstop.ts:57-95`. The list lives at the top of `backstop.go` as Go data tables (`excludeDirAnyDepth`, `excludeDirTopLevel`, `excludeExtensions`, `excludeBasenamePrefixes`, `excludePathPrefixes`). When the legacy TS adds an entry, port it here in the same wave.
 
 Backstop steps:
 1. `git status --porcelain` — snapshot uncommitted state.

@@ -1,6 +1,6 @@
 // Package afclient routing_client.go — DaemonClient methods for the
 // /api/daemon/routing/* surface. The contract is locked in
-// rensei-architecture/ADR-2026-05-07-daemon-http-control-api.md (D1, D2,
+// donmai-architecture/ADR-2026-05-07-daemon-http-control-api.md (D1, D2,
 // D4) and the wire types live in routing_types.go.
 package afclient
 

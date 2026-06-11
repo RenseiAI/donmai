@@ -118,7 +118,7 @@ func TestRender_UserDevelopment(t *testing.T) {
 	}
 
 	ctx := map[string]interface{}{
-		"issueIdentifier": "REN-1234",
+		"issueIdentifier": "ENG-1234",
 		"context":         "Implement feature X.",
 		"parentContext":   "Parent epic context.",
 		"mentionContext":  "User mentioned feature Y.",
@@ -130,7 +130,7 @@ func TestRender_UserDevelopment(t *testing.T) {
 		t.Fatalf("Render error: %v", err)
 	}
 
-	checkContains(t, out, "REN-1234", "issueIdentifier missing")
+	checkContains(t, out, "ENG-1234", "issueIdentifier missing")
 	checkContains(t, out, "Implement feature X.", "context missing")
 	checkContains(t, out, "# Parent issue context", "parentContext section missing")
 	checkContains(t, out, "Parent epic context.", "parentContext content missing")
@@ -150,7 +150,7 @@ func TestRender_UserDevelopment_OptionalSections(t *testing.T) {
 	}
 
 	out, err := reg.Render("user_development", map[string]interface{}{
-		"issueIdentifier": "REN-0001",
+		"issueIdentifier": "ENG-0001",
 		"context":         "Do something.",
 	})
 	if err != nil {
@@ -174,7 +174,7 @@ func TestRender_UserQA(t *testing.T) {
 	}
 
 	ctx := map[string]interface{}{
-		"issueIdentifier": "REN-5678",
+		"issueIdentifier": "ENG-5678",
 		"context":         "Validate PR #42.",
 	}
 	out, err := reg.Render("user_qa", ctx)
@@ -182,7 +182,7 @@ func TestRender_UserQA(t *testing.T) {
 		t.Fatalf("Render error: %v", err)
 	}
 
-	checkContains(t, out, "REN-5678", "issueIdentifier missing")
+	checkContains(t, out, "ENG-5678", "issueIdentifier missing")
 	checkContains(t, out, "Validate PR #42.", "context missing")
 	checkContains(t, out, "WORK_RESULT:passed", "pass marker missing")
 	checkContains(t, out, "WORK_RESULT:failed", "fail marker missing")
@@ -197,7 +197,7 @@ func TestRender_UserResearch(t *testing.T) {
 	}
 
 	ctx := map[string]interface{}{
-		"issueIdentifier": "REN-9999",
+		"issueIdentifier": "ENG-9999",
 		"context":         "Explore options for caching.",
 	}
 	out, err := reg.Render("user_research", ctx)
@@ -205,7 +205,7 @@ func TestRender_UserResearch(t *testing.T) {
 		t.Fatalf("Render error: %v", err)
 	}
 
-	checkContains(t, out, "REN-9999", "issueIdentifier missing")
+	checkContains(t, out, "ENG-9999", "issueIdentifier missing")
 	checkContains(t, out, "Explore options for caching.", "context missing")
 	checkContains(t, out, "Do NOT implement code", "research constraint missing")
 }

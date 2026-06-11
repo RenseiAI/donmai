@@ -57,7 +57,7 @@ verify-generated:
 
 # Local snapshot release (no publish, no signing). Per goreleaser convention,
 # `--snapshot` implies `--skip=sign,notarize` — the macOS signing/notarize
-# blocks (REN-1412) only fire on tag-pushed CI runs. Use this to validate the
+# blocks only fire on tag-pushed CI runs. Use this to validate the
 # build matrix and archive layout locally; for signed binaries, push a tag.
 release-dry-run:
 	goreleaser release --snapshot --clean

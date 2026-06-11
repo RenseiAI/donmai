@@ -1,7 +1,7 @@
 package afclient
 
 // arch_types_test.go — type-shape stability tests and mock round-trip tests for
-// the architecture-aware types added in REN-1333.
+// the architecture-aware types.
 //
 // Two categories:
 //   1. JSON round-trip tests: marshal + unmarshal and verify field names + values
@@ -712,6 +712,6 @@ func TestMockClientGetAuditChain(t *testing.T) {
 
 // ── Compile-time interface check ──────────────────────────────────────────────
 
-// Ensures MockClient satisfies DataSource including the new REN-1333 methods.
+// Ensures MockClient satisfies DataSource including the architecture-aware methods.
 // This fails at compile time if a method is missing — no runtime cost.
 var _ DataSource = (*MockClient)(nil)

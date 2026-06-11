@@ -16,7 +16,7 @@ import (
 // available, the daemon takes the refresh path — preserving the
 // workerId — instead of falling through to a full re-register.
 //
-// This is the green-path REN-1481 fix: the platform side ships a
+// This is the green-path refresh fix: the platform side ships a
 // refresh handler, the daemon picks it up automatically, and the
 // 5-min `401 → re-register → 404` cycle goes away because the
 // workerId is stable across token refreshes.
@@ -149,9 +149,9 @@ func TestPersistRefreshedToken_NoopOnEmptyPath(t *testing.T) {
 
 // TestRefreshRuntimeToken_FallsBackToReregisterOn404 asserts that
 // when the platform's refresh endpoint returns 404 (current state —
-// REN-1481 platform-side companion not yet shipped), the daemon
+// the platform-side companion not yet shipped), the daemon
 // falls back to a full re-register and observes a NEW workerId. This
-// is the canonical REN-1481 root-cause path — proven, logged, and
+// is the canonical root-cause path — proven, logged, and
 // surfaced via RegistrationTokenSwapped=true so operators see why
 // in-flight heartbeats 404 in the cycle until they swap credentials.
 func TestRefreshRuntimeToken_FallsBackToReregisterOn404(t *testing.T) {
@@ -284,7 +284,7 @@ func TestRefreshRuntimeToken_WorkerNotFound_SkipsRefreshProbe(t *testing.T) {
 
 // TestRefreshRuntimeToken_ProbedBeforeReregister asserts that on every
 // auth-failure the daemon HITS the refresh endpoint FIRST. This is
-// the REN-1481 acceptance check: "assert refresh path is hit BEFORE
+// the acceptance check: "assert refresh path is hit BEFORE
 // re-register". When the platform side ships the handler the daemon
 // flips automatically.
 func TestRefreshRuntimeToken_ProbedBeforeReregister(t *testing.T) {
@@ -333,7 +333,7 @@ func TestRefreshRuntimeToken_ProbedBeforeReregister(t *testing.T) {
 
 // TestAuthFailureReason classifies the platform's specific 401
 // "Runtime token expired" message — the smoking-gun signal for
-// REN-1481.
+// the runtime-token refresh path.
 func TestAuthFailureReason(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -378,7 +378,7 @@ func TestPollAuthFailureReason(t *testing.T) {
 }
 
 // TestHeartbeatService_RefreshOn401Probe asserts the
-// REN-1481 acceptance criterion: when the platform returns
+// refresh-before-reregister acceptance criterion: when the platform returns
 // 401 "Runtime token expired" on a heartbeat, the daemon's
 // OnReregister callback (which the daemon wires through
 // RefreshRuntimeToken) HITS the refresh endpoint before falling back
