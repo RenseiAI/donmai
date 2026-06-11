@@ -20,6 +20,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
+- **Daemon runtime-token churn is now quiet.** Three-part fix for the
+  unbounded daemon-error.log growth: (1) a proactive token refresher re-mints
+  the runtime JWT before expiry (lead 5m, retry 1m), so the hourly reactive
+  401→refresh cycle on BOTH the heartbeat and poll paths becomes a rare
+  backstop; (2) any refresh now fans fresh credentials out to both loops
+  (`SetCredentials`), eliminating the duplicate second refresh per expiry;
+  routine "rejected — refreshing" lines demoted Warn→Info and the
+  `[runtime-token]` trigger event renamed `401`→`refresh-requested`;
+  (3) `daemon run` rotates `daemon.log`/`daemon-error.log` at 10 MiB
+  (copy-truncate, one `.1` generation) at boot and every 6h.
 - **Activity toolOutput truncation no longer drops trailing PR URLs.** The
   forwarded tool-output cap is raised 500 → 2000 chars
   (`DefaultMaxToolOutputChars`), switches from head-only to middle-elision

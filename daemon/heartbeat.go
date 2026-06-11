@@ -66,6 +66,9 @@ type HeartbeatOptions struct {
 	// failures are non-fatal — the platform will detect via missed
 	// heartbeats and Redis TTL expiry).
 	LogWarn func(format string, args ...any)
+	// LogInfo is called for routine, self-healing events (e.g. a token
+	// rejection that immediately triggers a refresh). Defaults to no-op.
+	LogInfo func(format string, args ...any)
 	// Now provides the heartbeat sentAt timestamp.
 	Now func() time.Time
 	// OnHeartbeat is invoked after each heartbeat payload is composed
@@ -131,6 +134,9 @@ func NewHeartbeatService(opts HeartbeatOptions) *HeartbeatService {
 	}
 	if opts.LogWarn == nil {
 		opts.LogWarn = func(string, ...any) {}
+	}
+	if opts.LogInfo == nil {
+		opts.LogInfo = func(string, ...any) {}
 	}
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = &http.Client{Timeout: 5 * time.Second}
@@ -286,7 +292,10 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 			"path", "heartbeat",
 			"reason", reason,
 		)
-		h.opts.LogWarn("daemon heartbeat rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
+		// Routine + self-healing (the refresh fires right below), so Info
+		// not Warn — with the proactive refresher running this path is the
+		// backstop, not the steady state.
+		h.opts.LogInfo("daemon heartbeat rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
 		newWorkerID, newJWT, regErr := h.opts.OnReregister(ctx, reason)
 		if regErr != nil {
 			h.opts.LogWarn("daemon runtime-token refresh failed: %v", regErr)
@@ -317,6 +326,22 @@ func (h *HeartbeatService) workerIDLocked() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.workerID
+}
+
+// SetCredentials swaps the worker id + runtime JWT this service presents.
+// Called by the daemon whenever ANOTHER path re-minted credentials (the
+// proactive token refresher, or the poll loop's reactive refresh) so the
+// heartbeat does not have to burn its own 401 round-trip — and its own log
+// cycle — to discover them. Empty values are ignored.
+func (h *HeartbeatService) SetCredentials(workerID, jwt string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if workerID != "" {
+		h.workerID = workerID
+	}
+	if jwt != "" {
+		h.jwt = jwt
+	}
 }
 
 // heartbeatRequestBody is the JSON body sent on POST

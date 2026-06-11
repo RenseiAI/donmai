@@ -106,8 +106,12 @@ func RefreshRuntimeToken(
 ) (*RefreshTokenResult, error) {
 	logger := slog.Default()
 
+	// One line per refresh attempt. The reason carries the trigger:
+	// reactive ("runtime-token-expired", "worker-not-found", ...) or the
+	// scheduled "proactive-expiry" path — so the historical "401" event
+	// name no longer fits.
 	logger.Info("[runtime-token]",
-		"event", "401",
+		"event", "refresh-requested",
 		"workerId", currentWorkerID,
 		"reason", reason,
 	)

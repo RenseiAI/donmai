@@ -122,6 +122,11 @@ type Daemon struct {
 	poller    *PollService
 	spawner   *WorkerSpawner
 
+	// tokenRefresher proactively re-mints the runtime JWT before expiry
+	// so the reactive 401 paths in heartbeat/poll stay quiet backstops.
+	// Nil for stub registrations and when registration is skipped.
+	tokenRefresher *tokenRefresher
+
 	// lastHostStatus stores the most recent hostStatus the platform sent
 	// in a heartbeat response. The pool-deleted / pool-disabled signals
 	// surface here so af daemon stats can show "your pool was deleted —
@@ -436,22 +441,22 @@ func (d *Daemon) Start(ctx context.Context) error {
 	})
 
 	if regResp != nil {
-		// Heartbeat + poll share an OnReregister implementation so a 401 on
-		// either path re-mints the runtime JWT once and refreshes both
-		// services with the new credentials.
+		// Heartbeat + poll + the proactive token refresher share ONE refresh
+		// implementation so a refresh on any path re-mints the runtime JWT
+		// once and fans the fresh credentials out to every consumer.
 		//
 		// Token-refresh fix: route through RefreshRuntimeToken which probes a
 		// real refresh endpoint first (preserving the workerId) and only
 		// falls back to a full Register() — minting a fresh workerId — if
 		// the platform side has not yet shipped the refresh handler. The
 		// `[runtime-token]` log line attests which path was taken.
-		reregister := func(rctx context.Context, reason string) (string, string, error) {
+		refreshCreds := func(rctx context.Context, reason string) (*RefreshTokenResult, error) {
 			d.mu.RLock()
 			currentWorker := d.workerID
 			d.mu.RUnlock()
 			result, err := RefreshRuntimeToken(rctx, regOpts, currentWorker, reason)
 			if err != nil {
-				return "", "", err
+				return nil, err
 			}
 			d.mu.Lock()
 			d.workerID = result.WorkerID
@@ -459,6 +464,17 @@ func (d *Daemon) Start(ctx context.Context) error {
 			d.mu.Unlock()
 			if d.sessionDetails != nil {
 				d.sessionDetails.UpdateRuntimeCredentials(result.WorkerID, result.RuntimeToken)
+			}
+			// Fan the fresh credentials out to both long-running loops. The
+			// loop that triggered the refresh re-applies its own copy too —
+			// harmlessly idempotent — but the OTHER loop now picks up the new
+			// token without burning a 401 round-trip (and a duplicate refresh
+			// + log cycle) of its own.
+			if d.heartbeat != nil {
+				d.heartbeat.SetCredentials(result.WorkerID, result.RuntimeToken)
+			}
+			if d.poller != nil {
+				d.poller.SetCredentials(result.WorkerID, result.RuntimeToken)
 			}
 			// Persist the refreshed credentials to the on-disk cache so other
 			// readers of daemon.jwt pick up the new token instead of the now-
@@ -482,13 +498,20 @@ func (d *Daemon) Start(ctx context.Context) error {
 					)
 				}
 			}
+			return result, nil
+		}
+		reregister := func(rctx context.Context, reason string) (string, string, error) {
+			result, err := refreshCreds(rctx, reason)
+			if err != nil {
+				return "", "", err
+			}
 			return result.WorkerID, result.RuntimeToken, nil
 		}
 
-		// Heartbeat. OnReregister handles runtime-token expiry: the platform
-		// runtime JWT TTL is 1h with no refresh endpoint, so on a 401 (or the
-		// worker falling out of Redis after the 5-min heartbeat TTL — returned
-		// as 404) we re-mint by calling Register() with ForceReregister=true.
+		// Heartbeat. OnReregister handles reactive runtime-token expiry (the
+		// backstop behind the proactive refresher below): on a 401, or the
+		// worker falling out of Redis after the 5-min heartbeat TTL (returned
+		// as 404), we re-mint via RefreshRuntimeToken.
 		d.heartbeat = NewHeartbeatService(HeartbeatOptions{
 			WorkerID:        regResp.WorkerID,
 			Hostname:        cfg.Machine.ID,
@@ -500,6 +523,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 			GetStatus:       d.RegistrationStatus,
 			Region:          cfg.Machine.Region,
 			OnReregister:    reregister,
+			LogWarn: func(format string, args ...any) {
+				slog.Warn(fmt.Sprintf(format, args...))
+			},
+			LogInfo: func(format string, args ...any) {
+				slog.Info(fmt.Sprintf(format, args...))
+			},
 			GetAllowlist: func() []ProjectAllowlistEntry {
 				// Use d.spawner.AllProjects() so that satellite-org
 				// projects registered via AddProjects are included in
@@ -600,6 +629,24 @@ func (d *Daemon) Start(ctx context.Context) error {
 				OnReregister: reregister,
 			})
 			d.poller.Start()
+
+			// Proactive token refresh — re-mint the runtime JWT shortly
+			// BEFORE expiry so the steady state is one quiet scheduled
+			// refresh per TTL window instead of the reactive hourly
+			// 401→refresh log cycle on both the heartbeat and poll paths.
+			// Gated like the poll loop: stub registrations have no platform
+			// to refresh against.
+			d.tokenRefresher = newTokenRefresher(tokenRefresherOptions{
+				ExpiresAt: parseTokenExpiry(regResp.RuntimeTokenExpiresAt),
+				Refresh: func(rctx context.Context) (time.Time, error) {
+					result, err := refreshCreds(rctx, "proactive-expiry")
+					if err != nil {
+						return time.Time{}, err
+					}
+					return parseTokenExpiry(result.RuntimeTokenExpiresAt), nil
+				},
+			})
+			d.tokenRefresher.Start()
 		}
 	}
 
@@ -685,6 +732,9 @@ func (d *Daemon) Stop(_ context.Context) error {
 		}
 		if d.poller != nil {
 			d.poller.Stop()
+		}
+		if d.tokenRefresher != nil {
+			d.tokenRefresher.Stop()
 		}
 		if d.yamlWatcherStop != nil {
 			d.yamlWatcherStop()

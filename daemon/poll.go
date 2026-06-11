@@ -296,6 +296,30 @@ func NewPollService(opts PollOptions) *PollService {
 	}
 }
 
+// CurrentCredentials returns the worker id and runtime JWT currently in
+// use. Mirrors HeartbeatService.CurrentCredentials.
+func (p *PollService) CurrentCredentials() (workerID, runtimeJWT string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.workerID, p.jwt
+}
+
+// SetCredentials swaps the worker id + runtime JWT this service presents.
+// Called by the daemon whenever ANOTHER path re-minted credentials (the
+// proactive token refresher, or the heartbeat's reactive refresh) so the
+// poll loop does not have to burn its own 401 round-trip — and its own log
+// cycle — to discover them. Empty values are ignored.
+func (p *PollService) SetCredentials(workerID, jwt string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if workerID != "" {
+		p.workerID = workerID
+	}
+	if jwt != "" {
+		p.jwt = jwt
+	}
+}
+
 // Start launches the poll goroutine. Subsequent calls are no-ops.
 func (p *PollService) Start() {
 	p.mu.Lock()
@@ -384,7 +408,10 @@ func (p *PollService) pollOnce(ctx context.Context) {
 			"path", "poll",
 			"reason", reason,
 		)
-		p.opts.LogWarn("daemon poll rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
+		// Routine + self-healing (the refresh fires right below), so Info
+		// not Warn — with the proactive refresher running this path is the
+		// backstop, not the steady state.
+		p.opts.LogInfo("daemon poll rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
 		newWorkerID, newJWT, regErr := p.opts.OnReregister(ctx, reason)
 		if regErr != nil {
 			p.opts.LogWarn("daemon poll runtime-token refresh failed: %v", regErr)
