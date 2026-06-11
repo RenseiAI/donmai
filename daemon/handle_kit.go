@@ -322,7 +322,8 @@ func writeKitNotFound(w http.ResponseWriter, err error) bool {
 // The stub allows read-only operations (List, Get, VerifySignature,
 // ListSources, EnableSource, DisableSource) so the kit surface remains
 // observable, but Install returns ErrKitTrustGateRejected with the
-// misconfiguration reason — the operator must fix daemon.yaml before kits
+// misconfiguration reason — the operator must fix daemon.yaml (or send the
+// explicit, audit-logged trustOverride: "allowed-this-once") before kits
 // can be installed.
 func (s *Server) kitRegistryOrEmpty() kitRegistryDoer {
 	s.mu.Lock()
@@ -358,8 +359,8 @@ func (s *Server) kitRegistryOrEmpty() kitRegistryDoer {
 		slog.Error("kit trust: misconfigured trust policy; Install is blocked until resolved",
 			"err", err.Error(),
 		)
-		real := NewKitRegistryWithTrust(scanPaths, trust)
-		s.kitReg = &misconfiguredKitRegistry{real: real, reason: err}
+		wrapped := NewKitRegistryWithTrust(scanPaths, trust)
+		s.kitReg = &misconfiguredKitRegistry{real: wrapped, reason: err}
 		return s.kitReg
 	}
 	s.kitReg = NewKitRegistryWithTrust(scanPaths, trust)
@@ -371,6 +372,12 @@ func (s *Server) kitRegistryOrEmpty() kitRegistryDoer {
 // It is returned by kitRegistryOrEmpty when the trust config is invalid so
 // that the kit surface stays observable (GET /kits, verify-signature, etc.)
 // but no new kits can be installed until the misconfiguration is resolved.
+//
+// The one exception is the explicit per-install escape hatch: a request
+// carrying trustOverride: "allowed-this-once" delegates to the real
+// registry, whose gate honours (and audit-logs) the override — the same
+// explicit operator intent that bypasses a healthy gate bypasses a
+// misconfigured one.
 type misconfiguredKitRegistry struct {
 	real   *KitRegistry
 	reason error
@@ -380,24 +387,34 @@ func (m *misconfiguredKitRegistry) List() []afclient.Kit { return m.real.List() 
 func (m *misconfiguredKitRegistry) Get(id string) (afclient.KitManifest, error) {
 	return m.real.Get(id)
 }
+
 func (m *misconfiguredKitRegistry) Enable(id string) (afclient.Kit, error) {
 	return m.real.Enable(id)
 }
+
 func (m *misconfiguredKitRegistry) Disable(id string) (afclient.Kit, error) {
 	return m.real.Disable(id)
 }
+
 func (m *misconfiguredKitRegistry) VerifySignature(id string) (afclient.KitSignatureResult, error) {
 	return m.real.VerifySignature(id)
 }
-func (m *misconfiguredKitRegistry) Install(_ string, _ afclient.KitInstallRequest) (afclient.KitInstallResult, error) {
+
+func (m *misconfiguredKitRegistry) Install(id string, req afclient.KitInstallRequest) (afclient.KitInstallResult, error) {
+	if req.TrustOverride == afclient.TrustOverrideAllowedThisOnce {
+		return m.real.Install(id, req)
+	}
 	return afclient.KitInstallResult{}, fmt.Errorf("%w: %s", ErrKitTrustGateRejected, m.reason.Error())
 }
+
 func (m *misconfiguredKitRegistry) ListSources() []afclient.KitRegistrySource {
 	return m.real.ListSources()
 }
+
 func (m *misconfiguredKitRegistry) EnableSource(name string) (afclient.KitRegistrySource, error) {
 	return m.real.EnableSource(name)
 }
+
 func (m *misconfiguredKitRegistry) DisableSource(name string) (afclient.KitRegistrySource, error) {
 	return m.real.DisableSource(name)
 }

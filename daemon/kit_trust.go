@@ -210,10 +210,13 @@ func newKitVerifier(cfg TrustConfig) (*kitVerifier, error) {
 // BEFORE constructing the registry so they can surface a clear operator
 // action item rather than silently accepting over-permissive behaviour.
 //
-// This function is intentionally NOT called inside newKitVerifier because
-// newKitVerifier's error triggers a permissive fallback inside
-// NewKitRegistryWithTrust (kit_registry.go), which would be worse than
-// the misconfiguration it is trying to prevent.
+// This function is intentionally NOT called inside newKitVerifier:
+// newKitVerifier's error return is reserved for trust-root parse
+// failures, which NewKitRegistryWithTrust (kit_registry.go) handles by
+// installing a no-material verifier that keeps the configured mode.
+// Mixing misconfiguration errors into that path would conflate the two
+// failure classes; validation belongs to the caller (kitRegistryOrEmpty)
+// so it can block Install with a clear operator action item.
 func validateTrustConfig(cfg TrustConfig) error {
 	switch cfg.Mode {
 	case TrustModeSignedByAllowlist, TrustModeAttested:
@@ -228,6 +231,26 @@ func validateTrustConfig(cfg TrustConfig) error {
 		}
 	}
 	return nil
+}
+
+// trustGateRejectionError builds the operator-facing error for an
+// install the trust gate refused. It wraps ErrKitTrustGateRejected
+// (so errors.Is keeps working and the handler still maps it to HTTP
+// 403) and spells out WHY the kit was rejected plus every remediation
+// path: allowlist the signer, one-time override, or switch the trust
+// mode. The CLI surfaces this text verbatim, so keep it actionable.
+func trustGateRejectionError(id string, verifyResult afclient.KitSignatureResult, mode TrustMode) error {
+	signer := verifyResult.SignerID
+	if signer == "" {
+		signer = "unknown"
+	}
+	return fmt.Errorf(
+		"%s: %w: kit is %s (signer: %s) and trust mode %q only installs signed kits from allowlisted signers. "+
+			"To proceed: add the kit's signer to trust.issuerSet in daemon.yaml, "+
+			"re-run the install with a one-time override (donmai kit install --allow-unsigned, audit-logged), "+
+			"or set %s=permissive / trust.mode: permissive to disable the gate entirely (not recommended)",
+		id, ErrKitTrustGateRejected, verifyResult.Trust, signer, mode, envKitTrustMode,
+	)
 }
 
 // newKitVerifierWithMaterial constructs a verifier with caller-supplied
@@ -378,7 +401,14 @@ func buildIdentityPolicies(issuerSet []string) []verify.PolicyOption {
 	for _, san := range issuerSet {
 		// san-as-exact-match; regex deferred to a Wave 13+ extension
 		// when the productionized signing CI's issuer set materializes.
-		ident, err := verify.NewShortCertificateIdentity("", "", san, "")
+		//
+		// The OIDC issuer axis is intentionally wildcarded (".*"):
+		// IssuerSet entries are Fulcio SAN identities per the TrustConfig
+		// contract, not issuer URLs. sigstore-go's NewCertificateIdentity
+		// rejects identities with NO issuer criteria at all, so an empty
+		// issuer + empty issuer-regex would mark every entry malformed
+		// and fail-close the whole allowlist.
+		ident, err := verify.NewShortCertificateIdentity("", ".*", san, "")
 		if err != nil {
 			slog.Warn("kit verifier: skipping malformed issuer entry", //nolint:gosec // structured slog handler escapes values
 				"san", san,
