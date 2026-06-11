@@ -23,7 +23,7 @@ is the foundation of the F.4 smoke harness in
 The behavior name is read from (in order):
 
 1. `Spec.ProviderConfig["stub.behavior"]` (typed v0.5.0 knob)
-2. `Spec.Env["RENSEI_STUB_MODE"]` (legacy F.1.1 §3.3 knob)
+2. `Spec.Env["DONMAI_STUB_MODE"]` (legacy F.1.1 §3.3 knob)
 3. The `WithDefaultBehavior` provider option, default `succeed-with-pr`.
 
 | Behavior | Source | Event sequence | Use case |

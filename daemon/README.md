@@ -33,8 +33,8 @@ The daemon is a single-machine, multi-project supervisor that:
                    ▼
         ┌────────────────────┐
         │ WorkerSpawner.spawn│  exec.CommandContext(<af>, "agent", "run")
-        │                    │  env: RENSEI_SESSION_ID=<id>,
-        │                    │       RENSEI_REPOSITORY=<repo>, …
+        │                    │  env: DONMAI_SESSION_ID=<id>,
+        │                    │       DONMAI_REPOSITORY=<repo>, …
         └──────────┬─────────┘
                    │
                    ▼
@@ -83,7 +83,7 @@ by `id`, by `repository`, or by URL-suffix. The matching
 entry's `repository` field is substituted into
 `SessionDetail.repository`, and the canonical `id` is mirrored back
 into `SessionDetail.projectName` so downstream code that reads
-`RENSEI_PROJECT_ID` sees a stable value.
+`DONMAI_PROJECT_ID` sees a stable value.
 
 If no allowlist entry matches, the daemon falls back to whatever the
 platform sent (preserving prior behaviour) and emits a Warn log

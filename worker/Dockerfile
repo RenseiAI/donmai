@@ -107,6 +107,6 @@ ENV CODE_SURVIVAL_TS_REACHABILITY_SCRIPT=/usr/local/lib/code-survival/ts-morph/r
 COPY --from=build /out/donmai /usr/local/bin/donmai
 
 # The box's reason to exist: run the in-box donmai runner. It reads its session
-# context from the env injected by the platform (RENSEI_SESSION_ID, registration
+# context from the env injected by the platform (DONMAI_SESSION_ID, registration
 # token, etc.), self-registers, and owns clone + kit install + agent loop.
 ENTRYPOINT ["donmai", "agent", "run"]

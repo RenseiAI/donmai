@@ -237,7 +237,7 @@ donmai daemon set capacity.maxConcurrentSessions <sessions>
 donmai daemon set capacity.poolMaxDiskGb <gb>
 ```
 
-Environment: `RENSEI_DAEMON_TOKEN` (optional — `donmai daemon install` provisions
+Environment: `DONMAI_DAEMON_TOKEN` (optional — `donmai daemon install` provisions
 this automatically when `~/.config/rensei/config.json` contains a platform key).
 
 ### `donmai governor`
