@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	googleendpoint "github.com/RenseiAI/donmai/provider/endpoint/google"
 )
 
 // TestSpawnURL_Table exercises the Spec.Endpoint → generateContent URL
@@ -227,5 +228,39 @@ func TestProvider_Spawn_EndpointHalfBoundVertexFails(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("Spawn: want error for half-bound vertex endpoint, got nil")
+	}
+}
+
+// TestSpawnURL_ResolvedGoogleVertexCell pins the manifest↔harness contract
+// end-to-end: the REAL google endpoint package resolves the declared vertex
+// cell (region-templated aiplatform base URL + project-id env key) and the
+// resulting binding routes through spawnURL to the full publisher resource
+// path. Hand-rolled bindings in the tests above cannot catch a manifest
+// edit (BaseURLTmpl, EnvKeys) that strands the declared raw × google ×
+// vertex matrix cell — this test does.
+func TestSpawnURL_ResolvedGoogleVertexCell(t *testing.T) {
+	t.Parallel()
+
+	binding, err := googleendpoint.New().Resolve(context.Background(), agent.EndpointRequest{
+		Model:  "gemini-2.5-pro",
+		Host:   agent.HostVertex,
+		Auth:   agent.AuthBYOK,
+		Region: "us-central1",
+		EnvProvided: map[string]string{
+			EnvVertexProject: "proj-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("google endpoint Resolve(vertex): %v", err)
+	}
+
+	got, err := spawnURL(DefaultEndpoint, binding.Model, &binding)
+	if err != nil {
+		t.Fatalf("spawnURL(resolved vertex binding): %v", err)
+	}
+	want := "https://us-central1-aiplatform.googleapis.com" +
+		"/v1/projects/proj-1/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent"
+	if got != want {
+		t.Errorf("spawnURL = %q, want %q", got, want)
 	}
 }
