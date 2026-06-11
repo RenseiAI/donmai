@@ -120,31 +120,52 @@ func TestDrainMemoryInjects_SkipsEmptyText(t *testing.T) {
 	}
 }
 
-// TestMemoryInjectOnInject_DedupesByDeliveryID exercises the dedup-by-
-// DeliveryID gate that lives in the OnInject closure (the heartbeat-side
-// guard against a re-delivery in the window before the ack lands). A second
-// delivery with the same DeliveryID must be dropped; a different one passes.
-func TestMemoryInjectOnInject_DedupesByDeliveryID(t *testing.T) {
-	// Mirror the closure built in runLoop (kept identical so the test
-	// guards the real dedup contract).
-	seenInject := map[string]struct{}{}
-	injectCh := make(chan heartbeat.InjectPayload, 8)
-	onInject := func(p heartbeat.InjectPayload) {
+// runLoopOnInject mirrors the OnInject closure built in runLoop (kept
+// identical so these tests guard the real dedup + ack-or-requeue contract):
+// already-seen deliveries are acked without re-buffering, a successful
+// buffer marks the DeliveryID seen and acks, and a full channel REJECTS the
+// delivery (returns false → stays unacked → platform re-delivers) without
+// marking it seen.
+func runLoopOnInject(seenInject map[string]struct{}, injectCh chan heartbeat.InjectPayload) func(heartbeat.InjectPayload) bool {
+	return func(p heartbeat.InjectPayload) bool {
 		if p.DeliveryID != "" {
 			if _, ok := seenInject[p.DeliveryID]; ok {
-				return
+				return true
 			}
-			seenInject[p.DeliveryID] = struct{}{}
 		}
 		select {
 		case injectCh <- p:
+			if p.DeliveryID != "" {
+				seenInject[p.DeliveryID] = struct{}{}
+			}
+			return true
 		default:
+			return false
 		}
 	}
+}
 
-	onInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "first"})
-	onInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "duplicate"}) // dropped
-	onInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "second"})
+// TestMemoryInjectOnInject_DedupesByDeliveryID exercises the dedup-by-
+// DeliveryID gate that lives in the OnInject closure (the heartbeat-side
+// guard against a re-delivery in the window before the ack lands). A second
+// delivery with the same DeliveryID must be dropped (but still acked); a
+// different one passes.
+func TestMemoryInjectOnInject_DedupesByDeliveryID(t *testing.T) {
+	seenInject := map[string]struct{}{}
+	injectCh := make(chan heartbeat.InjectPayload, 8)
+	onInject := runLoopOnInject(seenInject, injectCh)
+
+	if !onInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "first"}) {
+		t.Fatal("first delivery must be accepted")
+	}
+	// Duplicate: dropped from the buffer but ACKED (already buffered once;
+	// re-acking stops the platform from re-sending forever).
+	if !onInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "duplicate"}) {
+		t.Fatal("duplicate delivery must still report accepted (ack stops re-sends)")
+	}
+	if !onInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "second"}) {
+		t.Fatal("second distinct delivery must be accepted")
+	}
 
 	if got := len(injectCh); got != 2 {
 		t.Fatalf("expected 2 distinct injects buffered (dup dropped), got %d", got)
@@ -156,35 +177,35 @@ func TestMemoryInjectOnInject_DedupesByDeliveryID(t *testing.T) {
 	}
 }
 
-// TestMemoryInjectOnInject_DropsWhenChannelFull verifies the non-blocking
-// send: when injectCh is full the OnInject closure drops the inject (logs)
-// rather than stalling the heartbeat goroutine.
-func TestMemoryInjectOnInject_DropsWhenChannelFull(t *testing.T) {
+// TestMemoryInjectOnInject_RejectsWhenChannelFull verifies the non-blocking
+// send: when injectCh is full the OnInject closure REJECTS the inject
+// (returns false, so the pulser leaves it unacked and the platform
+// re-delivers) rather than stalling the heartbeat goroutine — and the
+// rejected DeliveryID is NOT marked seen, so the re-delivery is buffered
+// once capacity frees up (ack-or-requeue, KG-04).
+func TestMemoryInjectOnInject_RejectsWhenChannelFull(t *testing.T) {
 	seenInject := map[string]struct{}{}
 	injectCh := make(chan heartbeat.InjectPayload, 1) // tiny buffer
-	var dropped bool
-	onInject := func(p heartbeat.InjectPayload) {
-		if p.DeliveryID != "" {
-			if _, ok := seenInject[p.DeliveryID]; ok {
-				return
-			}
-			seenInject[p.DeliveryID] = struct{}{}
-		}
-		select {
-		case injectCh <- p:
-		default:
-			dropped = true
-		}
+	onInject := runLoopOnInject(seenInject, injectCh)
+
+	if !onInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "fits"}) {
+		t.Fatal("first inject must be accepted")
 	}
-
-	onInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "fits"})
-	onInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "overflow"}) // dropped
-
-	if !dropped {
-		t.Fatal("expected the second inject to be dropped on a full channel")
+	if onInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "overflow"}) {
+		t.Fatal("expected the second inject to be rejected on a full channel")
 	}
 	if got := len(injectCh); got != 1 {
 		t.Fatalf("channel should hold exactly 1 inject, got %d", got)
+	}
+
+	// Drain the buffered inject — the platform's re-delivery of the
+	// rejected dlv-2 must now be accepted (it was never marked seen).
+	<-injectCh
+	if !onInject(heartbeat.InjectPayload{DeliveryID: "dlv-2", Text: "overflow retry"}) {
+		t.Fatal("re-delivery of a rejected inject must be accepted once capacity frees up")
+	}
+	if got := <-injectCh; got.DeliveryID != "dlv-2" {
+		t.Fatalf("re-delivered inject = %q; want dlv-2", got.DeliveryID)
 	}
 }
 

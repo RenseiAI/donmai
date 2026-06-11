@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The repo's merge-queue ruleset builds merge-group refs; without this
+  # trigger the required `test` check never reports there and every queued
+  # PR stalls until the queue's 30-minute check timeout.
+  merge_group:
 
 jobs:
   leak-guard:

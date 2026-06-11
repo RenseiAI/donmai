@@ -2,6 +2,12 @@ name: Security Scan
 on:
   push: { branches: [main] }
   pull_request: { branches: [main] }
+  # `Secret scan (trufflehog)` is a required check on main; the merge-queue
+  # ruleset builds merge-group refs, so the workflow must run there too or
+  # queued PRs stall until the queue's check timeout. On merge_group the
+  # action has no PR base/head and falls back to a full-history scan — the
+  # same scan the weekly schedule already runs green.
+  merge_group:
   schedule: [{ cron: "0 7 * * 1" }]
 permissions:
   contents: read
