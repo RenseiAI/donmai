@@ -152,28 +152,31 @@ var validCells = []HarnessEndpointCell{
 	},
 
 	// codex × OpenAI ---------------------------------------------------------
+	// All three cells ride the app-server harness (TransportSubprocessRPC),
+	// which threads Spec.ResponseSchema as turn/start outputSchema — native
+	// strict structured output ("output-schema").
 	{
 		Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: agent.HostOAuthCLI,
 		Protocol: agent.ProtoOpenAIResponses, Transport: agent.TransportSubprocessRPC,
 		AuthModes: []agent.AuthMode{agent.AuthHostSession}, BringsOwnAuth: true, NeedsAPIKey: false,
-		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: false,
-		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderCodex),
+		CostModel: agent.CostHostSubscription, OneShot: true, NativeJSONMode: true,
+		StructuredVia: "output-schema", LegacyProviderID: pn(agent.ProviderCodex),
 		Stability: "stable", Smoked: true,
 	},
 	{
 		Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: agent.HostDirect,
 		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportSubprocessRPC,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
-		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
-		StructuredVia: "json-schema", LegacyProviderID: nil,
+		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
+		StructuredVia: "output-schema", LegacyProviderID: nil,
 		Stability: "beta", Smoked: false,
 	},
 	{
 		Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: agent.HostAzure,
 		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportSubprocessRPC,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
-		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
-		StructuredVia: "json-schema", LegacyProviderID: nil,
+		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
+		StructuredVia: "output-schema", LegacyProviderID: nil,
 		Stability: "beta", Smoked: false,
 	},
 

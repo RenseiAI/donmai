@@ -392,8 +392,9 @@ type Spec struct {
 	// ResponseSchema is the native structured-output JSON Schema for the
 	// one-shot/structured lane (P4b). Honored ONLY by harnesses that
 	// declare HarnessCaps.NativeJSONMode (the raw harnesses over gemini's
-	// responseSchema and ollama's format) — they set the protocol's
-	// structured primitive so output is constrained server-side (STRICT).
+	// responseSchema and ollama's format, plus codex's turn/start
+	// outputSchema) — they set the protocol's structured primitive so
+	// output is constrained server-side (STRICT).
 	// Harnesses without NativeJSONMode ignore it and rely on the soft prompt
 	// instruction SpawnComplete appends. nil/empty == today's free-text
 	// behavior; additive and omitempty so the wire round-trip is unchanged

@@ -123,6 +123,18 @@ func threadStartParams(spec agent.Spec) map[string]any {
 // `model`, optional `reasoningEffort`, and optional `sandboxPolicy`
 // (the rich form). We keep that shape verbatim.
 //
+// Spec.ResponseSchema (the one-shot lane's structured-output schema)
+// rides as `outputSchema` — TurnStartParams.outputSchema, "Optional
+// JSON Schema used to constrain the final assistant message for this
+// turn", verified against the codex app-server v2 protocol dump
+// (`codex app-server generate-json-schema`, codex-cli 0.139.0). This
+// upgrades codex one-shots from soft (prompt-instruction +
+// validate-repair-drop) to native strict. App-server versions that
+// predate the field tolerate unknown optional params (serde default),
+// so older binaries silently degrade to the soft path: the schema
+// instruction is still appended to the prompt by the one-shot lane and
+// SpawnComplete's validate-repair-drop still certifies SchemaOK.
+//
 // The first turn's input carries the Spec.Prompt; resume + steering
 // flows reuse this builder with a different input slice.
 func turnStartParams(threadID string, spec agent.Spec, input []map[string]any) map[string]any {
@@ -138,6 +150,9 @@ func turnStartParams(threadID string, spec agent.Spec, input []map[string]any) m
 	}
 	if policy := resolveSandboxPolicy(spec); policy != nil {
 		params["sandboxPolicy"] = policy
+	}
+	if len(spec.ResponseSchema) > 0 {
+		params["outputSchema"] = spec.ResponseSchema
 	}
 	return params
 }

@@ -41,6 +41,11 @@ func TestSpecFieldCoverage(t *testing.T) {
 		"BaseInstructions",
 		"SystemPromptAppend",
 		"InitialContext",
+		// ResponseSchema (the one-shot lane's structured-output schema, P4d)
+		// rides turn/start.outputSchema — verified against the app-server v2
+		// protocol (codex-cli 0.139.0 generate-json-schema). See
+		// turnStartParams for the degrade path on older binaries.
+		"ResponseSchema",
 	}
 
 	// All fields ignoredSpecFields can return — independent of
@@ -66,12 +71,6 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// is the zero value. Registered here (the static coverage mirror) so
 		// this guard rail stays green; NewSpawnPlan is unchanged.
 		"Endpoint",
-		// ResponseSchema is the one-shot lane's native structured-output schema
-		// (P4b). It is honored ONLY by NativeJSONMode harnesses (gemini/ollama);
-		// codex (no JSON-schema flag) INTENTIONALLY IGNORES it and relies on the
-		// soft prompt instruction SpawnComplete appends. The codex Spawn
-		// translation is unchanged.
-		"ResponseSchema",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)
@@ -212,6 +211,45 @@ func TestNewSpawnPlan_EffortPropagatesToTurn(t *testing.T) {
 	plan := NewSpawnPlan(agent.Spec{Cwd: "/tmp", Effort: agent.EffortHigh})
 	if plan.TurnStart["reasoningEffort"] != "high" {
 		t.Fatalf("expected reasoningEffort=high, got %v", plan.TurnStart["reasoningEffort"])
+	}
+}
+
+// Spec.ResponseSchema must ride turn/start as `outputSchema` — the
+// app-server v2 param ("Optional JSON Schema used to constrain the final
+// assistant message for this turn"; codex-cli 0.139.0 protocol fixture).
+// This is the native-strict half of the one-shot lane; the soft prompt
+// instruction remains as the degrade path for older app-servers.
+func TestNewSpawnPlan_ResponseSchemaRidesOutputSchema(t *testing.T) {
+	t.Parallel()
+	schema := json.RawMessage(`{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}`)
+	plan := NewSpawnPlan(agent.Spec{Cwd: "/tmp", Prompt: "x", ResponseSchema: schema})
+
+	got, ok := plan.TurnStart["outputSchema"].(json.RawMessage)
+	if !ok {
+		t.Fatalf("expected outputSchema as json.RawMessage on turn/start, got %T", plan.TurnStart["outputSchema"])
+	}
+	if string(got) != string(schema) {
+		t.Fatalf("outputSchema = %s, want %s", got, schema)
+	}
+
+	// The wire encoding must carry the schema as a raw JSON object, not a
+	// re-encoded string.
+	wire, err := json.Marshal(plan.TurnStart)
+	if err != nil {
+		t.Fatalf("marshal turn/start params: %v", err)
+	}
+	if !strings.Contains(string(wire), `"outputSchema":{"type":"object"`) {
+		t.Fatalf("wire params should embed the schema object, got %s", wire)
+	}
+}
+
+// Without a ResponseSchema the turn/start params stay byte-for-byte free
+// of the outputSchema key (additive-safety: pre-change shape preserved).
+func TestNewSpawnPlan_NoResponseSchemaNoOutputSchema(t *testing.T) {
+	t.Parallel()
+	plan := NewSpawnPlan(agent.Spec{Cwd: "/tmp", Prompt: "x"})
+	if v, ok := plan.TurnStart["outputSchema"]; ok {
+		t.Fatalf("outputSchema must be absent without ResponseSchema, got %v", v)
 	}
 }
 

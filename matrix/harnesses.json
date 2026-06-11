@@ -119,7 +119,7 @@
         "subagents": false,
         "reasoningEffort": true,
         "oneShot": true,
-        "nativeJsonMode": false,
+        "nativeJsonMode": true,
         "toolPermissionFormat": "codex",
         "streamingTransport": "none",
         "drives": [
