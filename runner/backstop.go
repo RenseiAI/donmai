@@ -345,6 +345,33 @@ func runGit(ctx context.Context, cwd string, args ...string) (string, error) {
 	return strings.TrimRight(string(out), " \n\t"), err
 }
 
+// captureHeadSHA returns the worktree's current HEAD commit sha via
+// `git rev-parse HEAD`. It is the runner's correlation-key capture for
+// the orchestration-owned durable CI wait
+// (ADR-2026-06-10-durable-ci-wait.md): the sha is stamped onto
+// Result.CommitSHA at envelope-build time — after tail recovery and the
+// backstop, both of which may add commits — so the platform can bind CI
+// completion events to this session's pushed head.
+//
+// The output is validated against the hex object-name shape (40 chars
+// for SHA-1 repos, 64 for SHA-256) so a git error message or an
+// unborn-HEAD diagnostic is never stamped onto the wire field.
+func captureHeadSHA(ctx context.Context, worktreePath string) (string, error) {
+	out, err := runGit(ctx, worktreePath, "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse HEAD: %w (output: %s)", err, out)
+	}
+	sha := strings.TrimSpace(out)
+	if !headSHARE.MatchString(sha) {
+		return "", fmt.Errorf("git rev-parse HEAD: unexpected output %q", sha)
+	}
+	return sha, nil
+}
+
+// headSHARE matches a full git object name: 40 lowercase hex chars
+// (SHA-1) or 64 (SHA-256 repos).
+var headSHARE = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+
 // runGh invokes the gh binary similarly to runGit. Kept distinct so
 // PATH-lookup failures surface with the right binary name in the
 // diagnostic message.
@@ -368,6 +395,3 @@ func filterEmpty(in []string) []string {
 	}
 	return out
 }
-
-// _ keeps the regexp import used (scanPRURL is reused from loop.go).
-var _ = regexp.MustCompile

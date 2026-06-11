@@ -132,6 +132,20 @@ func TestRun_HappyPath_StubProvider(t *testing.T) {
 	if res.WorkResult != "passed" {
 		t.Errorf("expected WorkResult=passed (stub emits WORK_RESULT:passed); got %q", res.WorkResult)
 	}
+	// Correlation-key capture for the orchestration-owned durable CI
+	// wait (ADR-2026-06-10-durable-ci-wait.md): the envelope must carry
+	// the worktree's post-backstop head commit so the terminal status
+	// post can correlate CI completion events to this session.
+	if res.CommitSHA == "" {
+		t.Fatal("expected CommitSHA captured at envelope-build time")
+	}
+	headOut, gitErr := runGit(context.Background(), res.WorktreePath, "rev-parse", "HEAD")
+	if gitErr != nil {
+		t.Fatalf("rev-parse worktree HEAD: %v", gitErr)
+	}
+	if want := strings.TrimSpace(headOut); res.CommitSHA != want {
+		t.Errorf("CommitSHA = %q; want worktree HEAD %q", res.CommitSHA, want)
+	}
 }
 
 // TestRun_UnknownProvider_FailsFast confirms the runner classifies a
