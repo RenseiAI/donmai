@@ -8,7 +8,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-_No work staged for the next release._
+### Changes
+
+- **Governor queue: legacy `agentfactory:governor:queue` dual-write/dual-read
+  removed.** The debrand transition window is over — `Enqueue` writes only the
+  canonical `donmai:governor:queue` key and `Peek` no longer falls back to the
+  legacy key.
 
 ---
 
