@@ -23,7 +23,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			SupportsMessageInjection: true,
 			SupportsSessionResume:    false,
 			SupportsToolPlugins:      true,
-			AcceptsMcpServerSpec:     false,
+			AcceptsMcpServerSpec:     true, // in-box MCP bridge (mcp.go + runtime/mcp)
 			AcceptsAllowedToolsList:  true,
 			EmitsSubagentEvents:      false,
 			SupportsReasoningEffort:  true,

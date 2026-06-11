@@ -188,7 +188,7 @@
         "inject": true,
         "resume": false,
         "tools": true,
-        "mcp": false,
+        "mcp": true,
         "allowedToolsList": true,
         "subagents": false,
         "reasoningEffort": true,

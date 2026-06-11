@@ -83,10 +83,11 @@ func TestToolUseCapabilityMatrix(t *testing.T) {
 			},
 			// Gemini-first-class program: native function-calling +
 			// in-provider tool executor (Bash/Read/Edit/Write) → tool
-			// plugins + AllowedTools honoured. MCP-server spec is NOT yet
-			// honored (no in-box MCP stdio client; acceptsMcpServerSpec=false,
-			// MCP→functionDeclaration bridge is a follow-up).
-			want: want{supportsToolPlugins: true, acceptsAllowedToolsList: true, acceptsMcpServerSpec: false},
+			// plugins + AllowedTools honoured. MCP-server spec is honored
+			// via the in-box MCP bridge (provider/harness/gemini/mcp.go
+			// over runtime/mcp): Spawn dials the declared servers,
+			// discovers their tools, and routes mcp__* functionCalls live.
+			want: want{supportsToolPlugins: true, acceptsAllowedToolsList: true, acceptsMcpServerSpec: true},
 		},
 		{
 			name: "amp",

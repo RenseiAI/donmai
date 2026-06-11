@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/mcp"
 )
 
 // DefaultEndpoint is the public Gemini API base URL. Override via
@@ -75,6 +76,9 @@ type Provider struct {
 	httpClient   *http.Client
 	sessionIDFn  func() string
 	defaultModel string
+	// dialMCP connects one Spec.MCPServers entry for the in-box MCP
+	// bridge. Defaults to runtime/mcp.Dial; tests inject fakes.
+	dialMCP mcpDialer
 }
 
 // New constructs a Provider after probing for an API key.
@@ -122,6 +126,7 @@ func New(opts Options) (*Provider, error) {
 		httpClient:   client,
 		sessionIDFn:  sidFn,
 		defaultModel: DefaultModel,
+		dialMCP:      mcp.Dial,
 	}, nil
 }
 
@@ -144,10 +149,10 @@ func (*Provider) Capabilities() agent.Capabilities {
 		// Resume folds prior contents into a fresh Spawn; the REST
 		// endpoint is stateless so resume is best-effort prompt-fold.
 		SupportsSessionResume: false,
-		// SupportsToolPlugins covers the native tool surface: the
-		// session-local executor runs Bash/Read/Edit/Write functionCalls
-		// in-box. (It does NOT cover stdio MCP plugins — see
-		// AcceptsMcpServerSpec below.)
+		// SupportsToolPlugins covers both tool surfaces: the session-local
+		// executor runs Bash/Read/Edit/Write functionCalls in-box, and the
+		// in-box MCP bridge routes mcp__* functionCalls to the declared
+		// MCP servers (see AcceptsMcpServerSpec below).
 		SupportsToolPlugins:                 true,
 		NeedsBaseInstructions:               false,
 		NeedsPermissionConfig:               false,
@@ -165,15 +170,15 @@ func (*Provider) Capabilities() agent.Capabilities {
 		// functionCall (Bash/Read/Edit/Write), so the field shape is not
 		// silently dropped.
 		AcceptsAllowedToolsList: true,
-		// AcceptsMcpServerSpec: FALSE. There is no in-box MCP client in
-		// this repo — Spec.MCPServers entries are surfaced to the model
-		// as catch-all functionDeclarations, but no code routes the
-		// resulting mcp__* functionCall to a live MCP server (the
-		// executor returns a structured "not executable" error). Per the
-		// v2 contract a provider MUST declare false when the field is
-		// silently dropped end-to-end. Flip to true only once a real MCP
-		// bridge lands.
-		AcceptsMcpServerSpec: false,
+		// AcceptsMcpServerSpec: Spec.MCPServers is honored end-to-end via
+		// the in-box MCP bridge (mcp.go + runtime/mcp): Spawn dials every
+		// declared server (stdio or Streamable HTTP), discovers its tools,
+		// declares them to the model as mcp__<server>__<tool> function
+		// declarations, and the session-local executor routes the
+		// resulting mcp__* functionCalls to the live server. A server
+		// that fails to connect degrades to a structured tool error — the
+		// shape is consumed either way, satisfying the v2 contract.
+		AcceptsMcpServerSpec: true,
 		HumanLabel:           "Gemini",
 	}
 }
@@ -226,6 +231,19 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		maxTurns = *spec.MaxTurns
 	}
 
+	// In-box MCP bridge: dial the declared servers and discover their tool
+	// surfaces so the model sees real mcp__<server>__<tool> declarations
+	// (replacing the catch-all per-server placeholders in the plan). Best
+	// effort with a hard time budget — a failed server degrades to
+	// structured tool errors, never a failed Spawn.
+	var bridge *mcpBridge
+	if len(spec.MCPServers) > 0 {
+		dialCtx, cancel := context.WithTimeout(ctx, mcpConnectTimeout)
+		bridge = newMCPBridge(dialCtx, spec.MCPServers, p.dialMCP)
+		cancel()
+		bridge.amendPlan(&plan)
+	}
+
 	return startSession(ctx, sessionParams{
 		apiKey:    apiKey,
 		endpoint:  p.endpoint,
@@ -235,9 +253,11 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		sessionID: p.sessionIDFn(),
 		// cwd / env drive the session-local tool executor: native
 		// functionCalls (Bash/Read/Edit/Write) run in the session's
-		// working directory with the session env.
+		// working directory with the session env; mcp routes mcp__*
+		// calls to the bridged servers.
 		cwd:      spec.Cwd,
 		env:      spec.Env,
+		mcp:      bridge,
 		maxTurns: maxTurns,
 	})
 }

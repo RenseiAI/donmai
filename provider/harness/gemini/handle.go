@@ -41,6 +41,10 @@ type sessionParams struct {
 	// directory native tools run in + per-session environment for Bash).
 	cwd string
 	env map[string]string
+	// mcp is the per-session MCP bridge (nil when the spec declares no
+	// MCP servers). The executor routes mcp__* calls through it; the
+	// driver closes it on exit.
+	mcp *mcpBridge
 	// maxTurns is the maximum number of generateContent round-trips
 	// (agentic turns) allowed before the driver terminates with an
 	// error_max_turns result. 0 means uncapped.
@@ -74,9 +78,13 @@ type Handle struct {
 	client    *http.Client
 
 	// executor runs the model's functionCalls (native filesystem / shell
-	// tools) and folds the functionResponse back into the loop. The
-	// Gemini REST endpoint does not execute tools itself.
+	// tools + bridged MCP tools) and folds the functionResponse back into
+	// the loop. The Gemini REST endpoint does not execute tools itself.
 	executor *toolExecutor
+
+	// mcp is the per-session MCP bridge (nil without MCP servers); closed
+	// by the driver on exit so server subprocesses/sessions are released.
+	mcp *mcpBridge
 
 	// maxTurns caps the number of generateContent round-trips (agentic
 	// turns). 0 means uncapped. When the cap is hit the driver emits a
@@ -129,7 +137,8 @@ func startSession(ctx context.Context, p sessionParams) (*Handle, error) {
 		model:     p.model,
 		plan:      p.plan,
 		client:    client,
-		executor:  newToolExecutor(p.cwd, p.env),
+		executor:  newToolExecutor(p.cwd, p.env, p.mcp),
+		mcp:       p.mcp,
 		maxTurns:  p.maxTurns,
 		events:    make(chan agent.Event, eventBufferSize),
 		cancel:    cancel,
@@ -196,6 +205,7 @@ func (h *Handle) Stop(_ context.Context) error {
 // Closes the events channel exactly once on exit.
 func (h *Handle) drive(ctx context.Context) {
 	defer h.closeEvents()
+	defer h.mcp.Close() // nil-safe; releases bridged MCP server connections
 
 	for {
 		select {
