@@ -1,0 +1,1 @@
+{"type":"assistant","message":{"model":"claude-opus-4-7","id":"msg_031","role":"assistant","content":[{"type":"thinking","thinking":"The user wants the file listed; ls is sufficient.","signature":"EuYBCkgIBRgCIkDl"},{"type":"text","text":"Listing the directory."}]},"session_id":"sess1"}
