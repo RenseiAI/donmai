@@ -8,6 +8,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **Durable CI wait — runner half (ADR-2026-06-10-durable-ci-wait.md).** Agent
+  sessions no longer wait for remote CI; the orchestration layer owns the CI
+  wait. The runner now captures the worktree's head commit at envelope-build
+  time (after tail recovery and the backstop) into the already-typed
+  `Result.CommitSHA`, and the terminal status post carries additive
+  `commitSha` + `pullRequestUrl` fields so the platform can correlate CI
+  completion events to the session's pushed head. The development prompt
+  contract is redefined: `WORK_RESULT:passed` means local verification green
+  (tests/typecheck/lint) + branch pushed + PR open — remote CI is explicitly
+  excluded, and a new hard rule forbids in-process wake-ups that expect to
+  outlive the final message. Additive wire fields; old platforms ignore them.
+
 ### Security
 
 - **dmk_ machine token no longer travels in a URL query string.** The

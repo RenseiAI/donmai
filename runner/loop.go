@@ -664,6 +664,26 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}
 	}
 
+	// 11d. Correlation-key capture (ADR-2026-06-10-durable-ci-wait.md).
+	// AFTER tail recovery and the backstop — both of which may add
+	// commits — capture the worktree's head commit and stamp
+	// Result.CommitSHA so the terminal status post carries the key the
+	// orchestration layer's durable CI gate correlates
+	// workflow_run.completed events against. Nothing pushes after this
+	// point (the session is torn down), so the captured sha is the sha
+	// CI runs against. Best-effort: a capture failure is logged, never
+	// fatal — the platform degrades headSha-less exit events to its
+	// timeout/reconciliation path. Background ctx so a cancelled run
+	// ctx does not lose the capture.
+	shaCtx, shaCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if sha, shaErr := captureHeadSHA(shaCtx, wpath); shaErr != nil {
+		r.logger.Warn("head commit capture failed",
+			"sessionId", qw.SessionID, "err", shaErr)
+	} else {
+		res.CommitSHA = sha
+	}
+	shaCancel()
+
 	// 12. Finalise the Result envelope. Status defaults to
 	// "completed" when no failure mode was set; otherwise the
 	// classifier above has already filled it in.

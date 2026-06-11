@@ -9,6 +9,64 @@ import (
 	"testing"
 )
 
+// TestCaptureHeadSHA table-tests the correlation-key capture for the
+// orchestration-owned durable CI wait (ADR-2026-06-10-durable-ci-wait.md).
+// A worktree with a commit yields its full hex object name; a non-repo
+// directory and an unborn-HEAD repo error instead of leaking a git
+// diagnostic onto the wire field.
+func TestCaptureHeadSHA(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+
+	committed := t.TempDir()
+	gitInit(t, committed)
+	wantSHA, err := runGit(context.Background(), committed, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("fixture rev-parse: %v", err)
+	}
+	wantSHA = strings.TrimSpace(wantSHA)
+
+	unborn := t.TempDir()
+	//nolint:gosec // G204: test fixture, args are hard-coded literals.
+	initCmd := exec.Command("git", "init", "-b", "main")
+	initCmd.Dir = unborn
+	if out, initErr := initCmd.CombinedOutput(); initErr != nil {
+		t.Fatalf("git init: %v\n%s", initErr, out)
+	}
+
+	cases := []struct {
+		name    string
+		dir     string
+		want    string
+		wantErr bool
+	}{
+		{name: "repo with commit", dir: committed, want: wantSHA},
+		{name: "not a git repo", dir: t.TempDir(), wantErr: true},
+		{name: "unborn HEAD (no commits)", dir: unborn, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, gotErr := captureHeadSHA(context.Background(), tc.dir)
+			if tc.wantErr {
+				if gotErr == nil {
+					t.Fatalf("captureHeadSHA(%q) = %q, want error", tc.dir, got)
+				}
+				if got != "" {
+					t.Errorf("captureHeadSHA error path returned non-empty sha %q", got)
+				}
+				return
+			}
+			if gotErr != nil {
+				t.Fatalf("captureHeadSHA(%q): %v", tc.dir, gotErr)
+			}
+			if got != tc.want {
+				t.Errorf("captureHeadSHA = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestShouldExcludeFromBackstop_Table table-tests the path-exclude
 // decision against the data tables. The rows mirror the legacy TS
 // shouldExcludeFromBackstop test cases verbatim.
