@@ -413,26 +413,36 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// enabled AND the provider can accept injects. The closure runs on the
 	// heartbeat goroutine; it owns seenInject (dedup-by-DeliveryID lives
 	// here exclusively so the map is never touched off this goroutine) and
-	// performs a non-blocking send onto injectCh — a full buffer drops the
-	// inject with a log rather than stalling the heartbeat loop. The runner
-	// goroutine drains injectCh at the post-terminal seam and is the only
-	// caller of handle.Inject (claude's single-in-flight contract).
-	var onInject func(heartbeat.InjectPayload)
+	// performs a non-blocking send onto injectCh — a full buffer REJECTS
+	// the inject (returns false) rather than stalling the heartbeat loop,
+	// so the pulser leaves it unacked and the platform re-delivers it on a
+	// later refresh (ack-or-requeue). A DeliveryID is marked seen only
+	// AFTER a successful buffer so a re-delivery of a rejected inject is
+	// not dedup-blocked. The runner goroutine drains injectCh at the
+	// post-terminal seam and is the only caller of handle.Inject (claude's
+	// single-in-flight contract).
+	var onInject func(heartbeat.InjectPayload) bool
 	if runtimeInjectEnabled {
-		onInject = func(p heartbeat.InjectPayload) {
+		onInject = func(p heartbeat.InjectPayload) bool {
 			if p.DeliveryID != "" {
 				if _, ok := seenInject[p.DeliveryID]; ok {
 					r.logger.Debug("memory inject: skipping already-seen delivery",
 						"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
-					return
+					// Already buffered earlier in this Run — safe to ack
+					// so the platform stops re-sending it.
+					return true
 				}
-				seenInject[p.DeliveryID] = struct{}{}
 			}
 			select {
 			case injectCh <- p:
+				if p.DeliveryID != "" {
+					seenInject[p.DeliveryID] = struct{}{}
+				}
+				return true
 			default:
-				r.logger.Warn("memory inject: channel full, dropping inject",
+				r.logger.Warn("memory inject: channel full, leaving unacked for re-delivery",
 					"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
+				return false
 			}
 		}
 	}
