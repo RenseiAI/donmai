@@ -387,3 +387,33 @@ func TestDiagnosticCommentBody(t *testing.T) {
 		t.Errorf("body missing 'NOT updated' callout")
 	}
 }
+
+func TestIsKnownWorkType(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{name: "development", in: WorkTypeDevelopmentStr, want: true},
+		{name: "qa", in: WorkTypeQAStr, want: true},
+		{name: "operational scanner", in: WorkTypeOperationalScannerCI, want: true},
+		{name: "typo", in: "developement", want: false},
+		{name: "empty", in: "", want: false},
+		{name: "case sensitive", in: "Development", want: false},
+		{name: "batch work types are not agent work types", in: "kg-extraction", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsKnownWorkType(tc.in); got != tc.want {
+				t.Errorf("IsKnownWorkType(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+	// Every declared work type must be recognised — guards drift between
+	// AllWorkTypes and the membership index.
+	for _, wt := range AllWorkTypes {
+		if !IsKnownWorkType(wt) {
+			t.Errorf("IsKnownWorkType(%q) = false, want true for declared work type", wt)
+		}
+	}
+}

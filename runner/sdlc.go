@@ -80,6 +80,25 @@ var AllWorkTypes = []string{
 	WorkTypeInflightCoordination,
 }
 
+// knownWorkTypes indexes AllWorkTypes for O(1) membership checks.
+var knownWorkTypes = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(AllWorkTypes))
+	for _, wt := range AllWorkTypes {
+		m[wt] = struct{}{}
+	}
+	return m
+}()
+
+// IsKnownWorkType reports whether s is one of the recognised agent work
+// types (AllWorkTypes). Callers that key configuration off a work-type
+// string (e.g. the daemon's per-workload model-access blocks) use this to
+// reject typo'd keys that would otherwise be stored but never match at
+// enforcement time.
+func IsKnownWorkType(s string) bool {
+	_, ok := knownWorkTypes[s]
+	return ok
+}
+
 // workTypeCompleteStatus maps a work type to the Linear status the
 // runner should transition the issue to on a passing/clean completion.
 // Empty string ("") means no auto-transition.
