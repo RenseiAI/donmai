@@ -127,7 +127,7 @@ func resolveDefaultTrustMode() TrustMode {
 		case TrustModePermissive, TrustModeSignedByAllowlist, TrustModeAttested:
 			return TrustMode(v)
 		default:
-			slog.Warn("kit trust: DONMAI_KIT_TRUST_MODE value unrecognised; falling back to signed-by-allowlist",
+			slog.Warn("kit trust: DONMAI_KIT_TRUST_MODE value unrecognised; falling back to signed-by-allowlist", //nolint:gosec // structured slog handler escapes values
 				"value", v,
 				"recognised", []string{string(TrustModePermissive), string(TrustModeSignedByAllowlist), string(TrustModeAttested)},
 			)
