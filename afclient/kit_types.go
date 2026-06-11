@@ -1,7 +1,7 @@
 // Package afclient kit_types.go — wire types for the daemon's
 // /api/daemon/kits* and /api/daemon/kit-sources* operator surfaces. The
 // contract is locked in
-// rensei-architecture/ADR-2026-05-07-daemon-http-control-api.md (D4) and
+// donmai-architecture/ADR-2026-05-07-daemon-http-control-api.md (D4) and
 // follows the manifest schema in 005-kit-manifest-spec.md.
 package afclient
 
@@ -192,7 +192,7 @@ type KitInstallRequest struct {
 	Source  *KitInstallSource `json:"source,omitempty"`
 	// TrustOverride bypasses the configured trust gate for this single
 	// install. The only accepted value is "allowed-this-once" (per
-	// REN-1314 / 002-provider-base-contract.md § "Signing and trust").
+	// 002-provider-base-contract.md § "Signing and trust").
 	// When set the daemon emits a structured slog audit log with the
 	// kitId, signerId, actor, and timestamp. The override is single-shot:
 	// not persisted; subsequent re-installs re-evaluate the gate. Empty
@@ -202,7 +202,7 @@ type KitInstallRequest struct {
 
 // TrustOverrideAllowedThisOnce is the only accepted value of
 // KitInstallRequest.TrustOverride. Mirrors the
-// 'trustOverride: "allowed-this-once"' contract from REN-1314.
+// 'trustOverride: "allowed-this-once"' contract above.
 const TrustOverrideAllowedThisOnce = "allowed-this-once"
 
 // KitInstallResult is returned by POST /api/daemon/kits/<id>/install.

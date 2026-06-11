@@ -41,7 +41,7 @@ type Handle struct {
 	events   chan agent.Event
 	notifyCh chan notification
 
-	// Close-protocol invariant (REN-1460):
+	// Close-protocol invariant:
 	//
 	// The events channel has multiple potential senders (the forwarder
 	// goroutine running emit, the failNow path posting an
@@ -256,7 +256,7 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 //   - h.closed is signalled by Stop / failNow
 //   - a terminal ResultEvent / ErrorEvent has been emitted
 //
-// Close protocol (REN-1460): the defer here always runs the cleanup
+// Close protocol: the defer here always runs the cleanup
 // helpers, but each helper is internally idempotent — it is safe for
 // failNow to have already closed events from a parallel goroutine.
 // Without this, a Stop call from inside ctx.Done could leave events
@@ -414,7 +414,7 @@ func (h *Handle) handleServerRequest(n notification) {
 // expected to keep up; emitting backpressure into the JSON-RPC stream
 // would deadlock the codex side.
 //
-// Close-protocol invariant (REN-1460): emit holds eventsMu.RLock for
+// Close-protocol invariant: emit holds eventsMu.RLock for
 // the duration of the send and aborts early when eventsClosed is set.
 // The matching writer (closeEvents) takes the write lock before
 // flipping the flag and closing the channel, so emit can never observe

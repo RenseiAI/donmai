@@ -358,7 +358,7 @@ func TestMapItem_MCPToolCall_NormalizedName(t *testing.T) {
 			"type":      "mcpToolCall",
 			"server":    "af-linear",
 			"tool":      "af_linear_get_issue",
-			"arguments": map[string]any{"id": "REN-1"},
+			"arguments": map[string]any{"id": "ENG-1"},
 		},
 	})
 	got := mapNotification("item/started", params, &mapperState{}, nil)

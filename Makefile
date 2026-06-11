@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test lint fmt vuln coverage clean release-dry-run generate verify-generated
+.PHONY: build run run-mock run-status run-status-mock test lint fmt vuln coverage clean release-dry-run generate verify-generated guard
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -23,6 +23,10 @@ test:
 
 lint:
 	golangci-lint run
+
+guard:
+	bash scripts/leak-guard.sh --self-test
+	bash scripts/leak-guard.sh --all
 
 fmt:
 	gofumpt -w .
@@ -57,7 +61,7 @@ verify-generated:
 
 # Local snapshot release (no publish, no signing). Per goreleaser convention,
 # `--snapshot` implies `--skip=sign,notarize` — the macOS signing/notarize
-# blocks (REN-1412) only fire on tag-pushed CI runs. Use this to validate the
+# blocks only fire on tag-pushed CI runs. Use this to validate the
 # build matrix and archive layout locally; for signed binaries, push a tag.
 release-dry-run:
 	goreleaser release --snapshot --clean

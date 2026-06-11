@@ -26,7 +26,7 @@
 //
 //   - Posts to the platform only. Does NOT post directly to Linear; the
 //     platform's completion + status handlers own the Linear-side
-//     reflection (REN-1399 tenant scoping requires it).
+//     reflection (tenant scoping requires it).
 //   - Knows nothing about how the Result was produced. The runner
 //     hands it a fully-populated [agent.Result]; this package only
 //     translates that to the wire shape.
@@ -41,7 +41,7 @@
 // over.
 //
 // Source: F.1.1 §6, F.0.1 §5 ("Result"), legacy
-// ../agentfactory/packages/cli/src/lib/worker-runner.ts::reportStatus
-// + ../agentfactory/packages/core/src/orchestrator/orchestrator.ts
+// ../donmai-libraries/packages/cli/src/lib/worker-runner.ts::reportStatus
+// + ../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts
 // (completion fetch).
 package result

@@ -113,6 +113,59 @@ func TestMapLine_AssistantMixed(t *testing.T) {
 	}
 }
 
+// Claude extended-thinking blocks must surface as
+// SystemEvent{Subtype: "reasoning"} — the activity poster whitelists
+// exactly that subtype and forwards it as a "thought" activity (parity
+// with codex completed reasoning items). They must never become
+// AssistantTextEvent: the runner scans assistant text for verdict
+// markers.
+func TestMapLine_AssistantThinking(t *testing.T) {
+	t.Parallel()
+
+	events := mapLine(readFixture(t, "assistant_thinking.jsonl"))
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want 2 (reasoning + text): %v", len(events), events)
+	}
+	sys, ok := events[0].(agent.SystemEvent)
+	if !ok {
+		t.Fatalf("event[0] %T, want SystemEvent", events[0])
+	}
+	if sys.Subtype != "reasoning" {
+		t.Errorf("Subtype = %q, want %q", sys.Subtype, "reasoning")
+	}
+	if sys.Message != "The user wants the file listed; ls is sufficient." {
+		t.Errorf("Message = %q, want fixture thinking text", sys.Message)
+	}
+	if sys.Raw == nil {
+		t.Errorf("Raw should be non-nil")
+	}
+	at, ok := events[1].(agent.AssistantTextEvent)
+	if !ok {
+		t.Fatalf("event[1] %T, want AssistantTextEvent", events[1])
+	}
+	if at.Text != "Listing the directory." {
+		t.Errorf("Text = %q, want fixture text", at.Text)
+	}
+}
+
+// redacted_thinking carries encrypted, non-renderable reasoning — it is
+// passed over without emitting an event (and without an error).
+func TestMapLine_AssistantRedactedThinking(t *testing.T) {
+	t.Parallel()
+
+	events := mapLine(readFixture(t, "assistant_redacted_thinking.jsonl"))
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1 (text only): %v", len(events), events)
+	}
+	at, ok := events[0].(agent.AssistantTextEvent)
+	if !ok {
+		t.Fatalf("event[0] %T, want AssistantTextEvent", events[0])
+	}
+	if at.Text != "Done." {
+		t.Errorf("Text = %q, want fixture text", at.Text)
+	}
+}
+
 func TestMapLine_UserToolResult(t *testing.T) {
 	t.Parallel()
 

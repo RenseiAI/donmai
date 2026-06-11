@@ -158,102 +158,57 @@ func TestEnqueuePeek_MultipleItems(t *testing.T) {
 	}
 }
 
-// TestEnqueue_DualWrite verifies that Enqueue (DT-5 transition) writes to both
-// the new primary key ("donmai:governor:queue") and the legacy key
-// ("agentfactory:governor:queue") so platform consumers still on the old key
-// continue to receive work during the migration window.
-func TestEnqueue_DualWrite(t *testing.T) {
+// TestEnqueue_CanonicalKeyOnly verifies that Enqueue writes ONLY to the
+// canonical key ("donmai:governor:queue"). The pre-debrand legacy key
+// ("agentfactory:governor:queue") dual-write was removed once all governor
+// instances and platform consumers were restarted; a regression that
+// reintroduces it would silently resurrect unbounded legacy-list growth.
+func TestEnqueue_CanonicalKeyOnly(t *testing.T) {
 	t.Parallel()
 	c, mr := newTestClientWithMR(t)
 	defer func() { _ = c.Close() }()
 
 	ctx := context.Background()
-	payload := []byte(`{"issueId":"DT-5","phase":"development"}`)
+	payload := []byte(`{"issueId":"Q-1","phase":"development"}`)
 
 	if err := c.Enqueue(ctx, payload); err != nil {
 		t.Fatalf("Enqueue: unexpected error: %v", err)
 	}
 
-	// Primary key must have the item.
+	// Canonical key must have the item.
 	primaryItems, err := mr.List("donmai:governor:queue")
 	if err != nil {
-		t.Fatalf("List primary key: %v", err)
+		t.Fatalf("List canonical key: %v", err)
 	}
 	if len(primaryItems) != 1 {
-		t.Fatalf("expected 1 item in primary key, got %d", len(primaryItems))
+		t.Fatalf("expected 1 item in canonical key, got %d", len(primaryItems))
 	}
 	if primaryItems[0] != string(payload) {
-		t.Fatalf("primary key item: got %q, want %q", primaryItems[0], payload)
+		t.Fatalf("canonical key item: got %q, want %q", primaryItems[0], payload)
 	}
 
-	// Legacy key must also have the item (dual-write transition).
-	legacyItems, err := mr.List("agentfactory:governor:queue")
-	if err != nil {
-		t.Fatalf("List legacy key: %v", err)
-	}
-	if len(legacyItems) != 1 {
-		t.Fatalf("expected 1 item in legacy key (dual-write), got %d", len(legacyItems))
-	}
-	if legacyItems[0] != string(payload) {
-		t.Fatalf("legacy key item: got %q, want %q", legacyItems[0], payload)
+	// Legacy key must NOT be created.
+	if mr.Exists("agentfactory:governor:queue") {
+		t.Fatal("legacy key \"agentfactory:governor:queue\" was written — dual-write has been removed")
 	}
 }
 
-// TestPeek_LegacyFallback verifies that Peek (DT-5 transition) falls back to
-// the legacy key ("agentfactory:governor:queue") when the primary key is empty,
-// so that items enqueued by a legacy producer are still visible to a migrated
-// consumer.
-func TestPeek_LegacyFallback(t *testing.T) {
+// TestPeek_IgnoresLegacyKey verifies that Peek no longer falls back to the
+// pre-debrand legacy key: an item visible only under
+// "agentfactory:governor:queue" is invisible to the consumer.
+func TestPeek_IgnoresLegacyKey(t *testing.T) {
 	t.Parallel()
 	c, mr := newTestClientWithMR(t)
 	defer func() { _ = c.Close() }()
 
-	ctx := context.Background()
-	legacyPayload := `{"issueId":"LEGACY-1","phase":"research"}`
-
-	// Seed the legacy key directly (simulating an old producer that only wrote
-	// to "agentfactory:governor:queue" before this migration was deployed).
-	if _, err := mr.Push("agentfactory:governor:queue", legacyPayload); err != nil {
+	// Seed ONLY the legacy key (a producer this old no longer exists; if one
+	// did, its items must not be consumed).
+	if _, err := mr.Push("agentfactory:governor:queue", `{"issueId":"LEGACY-1"}`); err != nil {
 		t.Fatalf("seed legacy key: %v", err)
 	}
 
-	// Primary key is intentionally empty — Peek must fall back to legacy.
-	got, err := c.Peek(ctx)
-	if err != nil {
-		t.Fatalf("Peek: unexpected error: %v", err)
-	}
-	if string(got) != legacyPayload {
-		t.Fatalf("Peek fallback: got %q, want %q", got, legacyPayload)
-	}
-}
-
-// TestPeek_PrimaryTakesPrecedence verifies that when both keys have items, Peek
-// returns from the primary key ("donmai:governor:queue") rather than the legacy
-// key, draining the new key first.
-func TestPeek_PrimaryTakesPrecedence(t *testing.T) {
-	t.Parallel()
-	c, mr := newTestClientWithMR(t)
-	defer func() { _ = c.Close() }()
-
-	ctx := context.Background()
-	primaryPayload := `{"issueId":"PRIMARY-1","phase":"development"}`
-	legacyPayload := `{"issueId":"LEGACY-1","phase":"research"}`
-
-	// Seed both keys.
-	if _, err := mr.Push("donmai:governor:queue", primaryPayload); err != nil {
-		t.Fatalf("seed primary key: %v", err)
-	}
-	if _, err := mr.Push("agentfactory:governor:queue", legacyPayload); err != nil {
-		t.Fatalf("seed legacy key: %v", err)
-	}
-
-	// Peek must return the primary key's item, not the legacy item.
-	got, err := c.Peek(ctx)
-	if err != nil {
-		t.Fatalf("Peek: unexpected error: %v", err)
-	}
-	if string(got) != primaryPayload {
-		t.Fatalf("Peek: got %q, want primary %q", got, primaryPayload)
+	if _, err := c.Peek(context.Background()); !errors.Is(err, queue.ErrEmptyQueue) {
+		t.Fatalf("Peek with only legacy-key items: got err %v, want ErrEmptyQueue", err)
 	}
 }
 

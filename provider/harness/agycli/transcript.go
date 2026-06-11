@@ -1,7 +1,6 @@
 package agycli
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -172,53 +171,19 @@ type transcriptToolCall struct {
 	Args map[string]json.RawMessage `json:"args"`
 }
 
-// readTranscriptEvents discovers this run's conversation and replays its
-// transcript as structured ToolUse / ToolResult events. Returns nil on any
-// failure (best-effort enrichment).
+// parseTranscriptFile reads a complete transcript.jsonl file and maps its
+// lines to structured events in step order.
 //
-// AssistantTextEvents are NOT emitted here — agy's prose already streamed live
-// off stdout, so re-emitting PLANNER_RESPONSE text would duplicate it. We only
-// recover the tool structure stdout could not carry.
-func readTranscriptEvents(stateHome, cwd string, before map[string]struct{}) []agent.Event {
-	if stateHome == "" {
-		return nil
-	}
-	convID, ok := discoverConvID(stateHome, cwd, before)
-	if !ok {
-		return nil
-	}
-	return parseTranscriptFile(transcriptPath(stateHome, convID))
-}
-
-// parseTranscriptFile reads a transcript.jsonl file and maps its lines to
-// structured events in step order.
+// AssistantTextEvents are NOT emitted — agy's prose already streamed live
+// off stdout, so re-emitting PLANNER_RESPONSE text would duplicate it; only
+// the tool structure stdout could not carry is recovered.
+//
+// This is the whole-file convenience over the incremental transcriptTailer
+// (tail.go); live sessions tail the file during the run instead.
 func parseTranscriptFile(path string) []agent.Event {
-	f, err := os.Open(path) //nolint:gosec // path derived from config-discovered conv-id
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = f.Close() }()
-
-	var st transcriptState
 	var events []agent.Event
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	for scanner.Scan() {
-		raw := scanner.Bytes()
-		if len(raw) == 0 {
-			continue
-		}
-		line := append([]byte(nil), raw...)
-		var tl transcriptLine
-		if err := json.Unmarshal(line, &tl); err != nil {
-			continue // skip unparseable lines rather than abort enrichment
-		}
-		events = append(events, st.mapLine(tl, line)...)
-	}
-	if err := scanner.Err(); err != nil {
-		// Return whatever parsed cleanly before the error.
-		return events
-	}
+	t := &transcriptTailer{path: path, emit: func(ev agent.Event) { events = append(events, ev) }}
+	t.drain(true)
 	return events
 }
 

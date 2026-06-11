@@ -15,7 +15,7 @@
 FROM debian:bookworm-slim
 
 # Base tools + GitHub CLI (`gh`). `gh` is not in Debian's default repos, so we
-# add the official GitHub CLI apt repo (REN-1554 / GAP 3). Development work
+# add the official GitHub CLI apt repo (GAP 3). Development work
 # types open PRs via `gh pr create`; `gh` auto-authenticates from the GH_TOKEN
 # the platform threads in-box (the short-lived git clone token). arch=amd64
 # matches the e2b sandbox arch and the prebuilt linux/amd64 donmai binary.

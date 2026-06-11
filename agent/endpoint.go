@@ -67,19 +67,31 @@ type EndpointRequest struct {
 // EndpointBinding — the resolved cell. The currency crossing into
 // Spec.Endpoint.
 type EndpointBinding struct {
-	Company       Company           `json:"company"`
-	Model         string            `json:"model"`
-	BaseURL       string            `json:"baseUrl"`
-	Protocol      WireProtocol      `json:"protocol"`
-	Host          ServingHost       `json:"host"`
-	Auth          AuthMode          `json:"auth"`
-	CostModel     CostModel         `json:"costModel"`
-	BringsOwnAuth bool              `json:"bringsOwnAuth"`
-	Env           map[string]string `json:"-"`
+	Company  Company      `json:"company"`
+	Model    string       `json:"model"`
+	BaseURL  string       `json:"baseUrl"`
+	Protocol WireProtocol `json:"protocol"`
+	Host     ServingHost  `json:"host"`
+	Auth     AuthMode     `json:"auth"`
+	// Region is the serving region the binding was resolved for (the same
+	// value templated into BaseURL). Harness read sites that must hand the
+	// region to a CLI env knob (bedrock → AWS_REGION, vertex →
+	// CLOUD_ML_REGION) or a resource path (vertex
+	// projects/{p}/locations/{r}/publishers) read it here rather than
+	// re-parsing the templated URL. Empty for region-less hosts
+	// (direct/local/oauth-cli).
+	Region        string    `json:"region,omitempty"`
+	CostModel     CostModel `json:"costModel"`
+	BringsOwnAuth bool      `json:"bringsOwnAuth"`
+	// Env carries the resolved credential/config VALUES for the cell's
+	// declared EnvKeys. json:"-" — values never cross the wire; bindings
+	// that travel (QueuedWork payloads) deliver credentials via Spec.Env,
+	// so harness read sites consult Endpoint.Env first, then Spec.Env.
+	Env map[string]string `json:"-"`
 }
 
-// IsZero reports whether the binding is unset (today's behavior). Used by the
-// (future, Phase-3) Spawn path to decide between Spec.Model and Endpoint.Model.
+// IsZero reports whether the binding is unset (today's behavior). Used by
+// Spawn read sites to decide between Spec.Model and Endpoint.Model.
 func (b EndpointBinding) IsZero() bool {
 	return b.Company == "" && b.Model == "" && b.Protocol == ""
 }

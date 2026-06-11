@@ -10,14 +10,14 @@
 //
 // Architecture reference:
 //
-//	rensei-architecture/004-sandbox-capability-matrix.md §Local daemon mode
-//	rensei-architecture/011-local-daemon-fleet.md
+//	donmai-architecture/004-sandbox-capability-matrix.md §Local daemon mode
+//	donmai-architecture/011-local-daemon-fleet.md
 //
 // This is the public package surface — downstream binaries can import it
 // directly to embed the daemon runtime under their own command tree. The
 // afcli package re-exports the runtime as the `daemon run` subcommand.
 //
-// This package is the Go port of agentfactory/packages/daemon/src (REN-1408).
+// This package is the Go port of donmai-libraries/packages/daemon/src.
 // The TS package @renseiai/daemon is deprecated; final removal is scheduled
 // for cycle 6 after the smoke harness has soaked for 7 nights.
 package daemon

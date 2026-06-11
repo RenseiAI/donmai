@@ -22,7 +22,7 @@ List active agent sessions. Support `--all` flag to include completed/failed. Di
 **Priority**: High
 **Labels**: migration
 
-Stop a running agent session by identifier. `af agent stop SUP-674`. Send graceful shutdown signal.
+Stop a running agent session by identifier. `af agent stop OPS-674`. Send graceful shutdown signal.
 
 ### AF-013: Implement `af agent status` subcommand
 **Priority**: Medium
@@ -34,7 +34,7 @@ Show detailed status for a specific agent session. Display: status, duration, to
 **Priority**: Medium
 **Labels**: migration
 
-Send a message to a running agent. `af agent chat SUP-674 "your message"`. Uses forward-prompt API.
+Send a message to a running agent. `af agent chat OPS-674 "your message"`. Uses forward-prompt API.
 
 ### AF-015: Implement `af agent reconnect` subcommand
 **Priority**: Low

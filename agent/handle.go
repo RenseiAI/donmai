@@ -5,7 +5,7 @@ import "context"
 // Handle is the live interface to one running session.
 //
 // Verbatim port of the legacy TS AgentHandle interface from
-// ../agentfactory/packages/core/src/providers/types.ts.
+// ../donmai-libraries/packages/core/src/providers/types.ts.
 //
 // Returned by Provider.Spawn / Provider.Resume. The provider closes
 // the channel returned by Events() after emitting a terminal

@@ -7,8 +7,8 @@ import (
 
 // slogLineWriter is a [PrefixedWriter] that emits one slog record per
 // child stdout/stderr line. The default daemon-level construction wires
-// this up so spawn children's output is visible to operators by default
-// (REN-1463 / v0.5.1). Callers that pass their own [PrefixedWriter] via
+// this up so spawn children's output is visible to operators by
+// default. Callers that pass their own [PrefixedWriter] via
 // [SpawnerOptions] override these defaults.
 //
 // The writer captures slog.Default() at construction time. Reading the

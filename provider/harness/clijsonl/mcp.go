@@ -21,7 +21,7 @@ import (
 //	  }
 //	}
 //
-// Source: ../agentfactory/packages/core/src/providers/claude-provider.ts
+// Source: ../donmai-libraries/packages/core/src/providers/claude-provider.ts
 // (the `mcpServers` Object.fromEntries block) and the Claude CLI
 // `--mcp-config` documentation.
 type mcpConfigFile struct {
@@ -107,7 +107,7 @@ func writeMCPConfig(servers []agent.MCPServerConfig) (path string, err error) {
 		return "", fmt.Errorf("provider/claude: marshal MCP config: %w", err)
 	}
 
-	f, err := os.CreateTemp("", "agentfactory-claude-mcp-*.json")
+	f, err := os.CreateTemp("", "donmai-claude-mcp-*.json")
 	if err != nil {
 		return "", fmt.Errorf("provider/claude: create MCP tmpfile: %w", err)
 	}

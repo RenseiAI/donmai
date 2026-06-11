@@ -5,8 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
+	"github.com/RenseiAI/donmai/codesurvival"
+	"github.com/RenseiAI/donmai/internal/interview"
+	"github.com/RenseiAI/donmai/kgextract"
+	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runner/access"
 )
 
@@ -151,6 +156,37 @@ func (d *Daemon) applyProjectRemoveLocked(m PendingMutation) error {
 	return d.persistAndRefreshLocked()
 }
 
+// knownWorkloadKey reports whether a modelAccess.set workload key belongs to
+// the shared workload vocabulary: the agent work types (runner.AllWorkTypes),
+// the non-agent batch work types (code-survival-scan, kg-extraction), and the
+// mode-derived "interview" workload. The embedder derives the enforcement-time
+// lookup key from exactly these sources (explicit Workload | WorkType | Mode),
+// so a key outside the vocabulary can never match a session — the strict block
+// the operator thought they configured would be stored verbatim and silently
+// fall back to the Default block / platform ceiling at enforcement time.
+func knownWorkloadKey(key string) bool {
+	if runner.IsKnownWorkType(key) {
+		return true
+	}
+	switch key {
+	case codesurvival.WorkTypeCodeSurvivalScan,
+		kgextract.WorkTypeKGExtraction,
+		interview.InterviewRunMode:
+		return true
+	}
+	return false
+}
+
+// knownWorkloadKeys lists the full workload vocabulary for error messages.
+func knownWorkloadKeys() []string {
+	keys := append([]string(nil), runner.AllWorkTypes...)
+	return append(keys,
+		codesurvival.WorkTypeCodeSurvivalScan,
+		kgextract.WorkTypeKGExtraction,
+		interview.InterviewRunMode,
+	)
+}
+
 // applyModelAccessSetLocked writes (or overwrites) a per-machine /
 // per-workload model-access policy block into Config.ModelAccess
 // (P3 / ADR-2026-06-06 §4.2). It decodes {workload?, policy}:
@@ -170,6 +206,15 @@ func (d *Daemon) applyModelAccessSetLocked(m PendingMutation) error {
 	}
 	if err := json.Unmarshal(m.Params, &params); err != nil {
 		return fmt.Errorf("decode params: %w", err)
+	}
+	// Reject (NACK) workload keys outside the shared vocabulary instead of
+	// storing them: a typo'd key never matches at enforcement time, so the
+	// "strict" block would silently fall back to the ceiling. Failing the
+	// mutation surfaces the typo platform-side via the failure ACK.
+	// modelAccess.clear stays unvalidated so legacy bad keys remain removable.
+	if params.Workload != "" && !knownWorkloadKey(params.Workload) {
+		return fmt.Errorf("unknown workload %q: not in the shared workload vocabulary (known keys: %s)",
+			params.Workload, strings.Join(knownWorkloadKeys(), ", "))
 	}
 
 	if d.config.ModelAccess == nil {

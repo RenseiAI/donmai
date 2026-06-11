@@ -84,6 +84,9 @@ func TestResolve_RegionTemplating(t *testing.T) {
 	if got.BaseURL != "https://bedrock-runtime.us-east-1.amazonaws.com" {
 		t.Errorf("region not templated: %q", got.BaseURL)
 	}
+	if got.Region != "us-east-1" {
+		t.Errorf("Region not recorded on the binding: %q (harness env/path mapping reads it)", got.Region)
+	}
 }
 
 // TestResolve_UnknownHost errors rather than dialing or guessing.

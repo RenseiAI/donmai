@@ -21,62 +21,62 @@ func NewMockClient() *MockClient {
 	return &MockClient{
 		sessions: []SessionResponse{
 			{
-				ID: "mock-001", Identifier: "SUP-1180", Status: StatusWorking,
+				ID: "mock-001", Identifier: "OPS-1180", Status: StatusWorking,
 				WorkType: "development", StartedAt: now.Add(-47 * time.Minute).Format(time.RFC3339),
 				Duration: 2820, CostUsd: ptr(3.42), Provider: ptr("anthropic"),
 			},
 			{
-				ID: "mock-002", Identifier: "SUP-1195", Status: StatusWorking,
+				ID: "mock-002", Identifier: "OPS-1195", Status: StatusWorking,
 				WorkType: "research", StartedAt: now.Add(-72 * time.Minute).Format(time.RFC3339),
 				Duration: 4320, CostUsd: ptr(5.18), Provider: ptr("anthropic"),
 			},
 			{
-				ID: "mock-003", Identifier: "SUP-1201", Status: StatusWorking,
+				ID: "mock-003", Identifier: "OPS-1201", Status: StatusWorking,
 				WorkType: "qa", StartedAt: now.Add(-22 * time.Minute).Format(time.RFC3339),
 				Duration: 1320, CostUsd: ptr(1.87), Provider: ptr("openai"),
 			},
 			{
-				ID: "mock-004", Identifier: "SUP-1199", Status: StatusWorking,
+				ID: "mock-004", Identifier: "OPS-1199", Status: StatusWorking,
 				WorkType: "feature", StartedAt: now.Add(-35 * time.Minute).Format(time.RFC3339),
 				Duration: 2100, CostUsd: ptr(2.91), Provider: ptr("anthropic"),
 			},
 			{
-				ID: "mock-005", Identifier: "SUP-1188", Status: StatusWorking,
+				ID: "mock-005", Identifier: "OPS-1188", Status: StatusWorking,
 				WorkType: "bugfix", StartedAt: now.Add(-63 * time.Minute).Format(time.RFC3339),
 				Duration: 3780, CostUsd: ptr(4.20), Provider: ptr("openai"),
 			},
 			{
-				ID: "mock-006", Identifier: "SUP-1205", Status: StatusQueued,
+				ID: "mock-006", Identifier: "OPS-1205", Status: StatusQueued,
 				WorkType: "acceptance", StartedAt: now.Add(-5 * time.Minute).Format(time.RFC3339),
 				Duration: 300, CostUsd: nil, Provider: nil,
 			},
 			{
-				ID: "mock-007", Identifier: "SUP-1208", Status: StatusQueued,
+				ID: "mock-007", Identifier: "OPS-1208", Status: StatusQueued,
 				WorkType: "coordination", StartedAt: now.Add(-2 * time.Minute).Format(time.RFC3339),
 				Duration: 120, CostUsd: nil, Provider: nil,
 			},
 			{
-				ID: "mock-008", Identifier: "SUP-1150", Status: StatusCompleted,
+				ID: "mock-008", Identifier: "OPS-1150", Status: StatusCompleted,
 				WorkType: "development", StartedAt: now.Add(-4 * time.Hour).Format(time.RFC3339),
 				Duration: 13500, CostUsd: ptr(8.50), Provider: ptr("anthropic"),
 			},
 			{
-				ID: "mock-009", Identifier: "SUP-1162", Status: StatusCompleted,
+				ID: "mock-009", Identifier: "OPS-1162", Status: StatusCompleted,
 				WorkType: "refactor", StartedAt: now.Add(-3 * time.Hour).Format(time.RFC3339),
 				Duration: 7800, CostUsd: ptr(6.33), Provider: ptr("anthropic"),
 			},
 			{
-				ID: "mock-010", Identifier: "SUP-1175", Status: StatusFailed,
+				ID: "mock-010", Identifier: "OPS-1175", Status: StatusFailed,
 				WorkType: "qa", StartedAt: now.Add(-2 * time.Hour).Format(time.RFC3339),
 				Duration: 2700, CostUsd: ptr(2.10), Provider: ptr("openai"),
 			},
 			{
-				ID: "mock-011", Identifier: "SUP-1190", Status: StatusStopped,
+				ID: "mock-011", Identifier: "OPS-1190", Status: StatusStopped,
 				WorkType: "docs", StartedAt: now.Add(-90 * time.Minute).Format(time.RFC3339),
 				Duration: 900, CostUsd: ptr(0.85), Provider: ptr("anthropic"),
 			},
 			{
-				ID: "mock-012", Identifier: "SUP-1202", Status: StatusParked,
+				ID: "mock-012", Identifier: "OPS-1202", Status: StatusParked,
 				WorkType: "refinement", StartedAt: now.Add(-8 * time.Minute).Format(time.RFC3339),
 				Duration: 480, CostUsd: nil, Provider: nil,
 			},
@@ -307,7 +307,7 @@ func (m *MockClient) ListFleet() (*ListFleetResponse, error) {
 	return &ListFleetResponse{Total: len(sessions.Sessions), Returned: len(sessions.Sessions), Sessions: sessions.Sessions}, nil
 }
 
-// ── Architecture-aware mock methods (REN-1333) ────────────────────────────────
+// ── Architecture-aware mock methods ────────────────────────────────
 
 // GetStatsV2 returns mock fleet statistics extended with per-machine and
 // per-provider breakdowns. Returns realistic-but-empty slices so callers can

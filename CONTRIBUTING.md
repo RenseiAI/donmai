@@ -55,6 +55,7 @@ make build           # Build bin/donmai
 make test            # go test -race ./...
 make lint            # golangci-lint run
 make fmt             # gofumpt -w .
+make guard           # closed-source content leak guard
 make vuln            # govulncheck ./...
 make coverage        # Race tests with coverage report
 make run-mock        # Run TUI dashboard with mock data
@@ -170,9 +171,18 @@ go test -race ./runner/...
 make fmt
 make test
 make lint
+make guard
 ```
 
 Run `make vuln` when dependency changes or release work is involved.
+
+`make guard` runs `scripts/leak-guard.sh`, which blocks content that must
+never ship in this open-source repository: internal tracker issue IDs,
+private repo references, internal platform hostnames, closed-source
+environment variable names, and developer workspace paths. CI enforces it
+on every push and pull request. Describe behavior in comments instead of
+citing internal trackers; use neutral fixture identifiers (`ENG-123`)
+in tests and docs.
 
 ## Terminal UI Work
 

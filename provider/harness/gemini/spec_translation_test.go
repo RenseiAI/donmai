@@ -47,7 +47,7 @@ func TestBuildSpawnPlan_SystemInstruction(t *testing.T) {
 	plan, err := buildSpawnPlan(agent.Spec{
 		Prompt:             "do work",
 		BaseInstructions:   "you are a helpful agent",
-		SystemPromptAppend: "follow REN-1500",
+		SystemPromptAppend: "follow ENG-1500",
 	}, "gemini-3.5-flash")
 	if err != nil {
 		t.Fatalf("buildSpawnPlan: %v", err)
@@ -56,7 +56,7 @@ func TestBuildSpawnPlan_SystemInstruction(t *testing.T) {
 		t.Fatal("systemInstruction: want non-nil")
 	}
 	text := plan.systemInstruction.Parts[0].Text
-	if !contains(text, "you are a helpful agent") || !contains(text, "REN-1500") {
+	if !contains(text, "you are a helpful agent") || !contains(text, "ENG-1500") {
 		t.Errorf("systemInstruction text missing parts: %q", text)
 	}
 }

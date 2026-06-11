@@ -371,7 +371,7 @@ func (e *Executor) baseResult(item BatchWorkItem) CodeSurvivalScanResult {
 
 // clone clones cloneURL into dst deep enough to reach the merge SHA. It does
 // NOT use --depth 1 (the merge SHA must be reachable; the merge parent's blame
-// must resolve). Mirrors the in-box clone path (REN-1554): the credential is
+// must resolve). Mirrors the in-box clone path: the credential is
 // already injected into cloneURL by the platform at dispatch.
 func (e *Executor) clone(ctx context.Context, dst, cloneURL string) error {
 	// Full-history clone (no --depth) so `git blame <mergeSha>` and the merge's

@@ -39,7 +39,7 @@ func TestAgentStatusMockHumanOutput(t *testing.T) {
 
 	for _, want := range []string{
 		"mock-001",
-		"SUP-1180",
+		"OPS-1180",
 		"working",
 		"45200",
 		"12800",

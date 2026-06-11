@@ -1,6 +1,6 @@
 // Package templates provides Go scaffolding for loading the YAML-based
 // workflow template system that mirrors the TS implementation in
-// packages/core/src/templates/ of the legacy agentfactory repo.
+// packages/core/src/templates/ of the legacy TS monorepo (now donmai-libraries).
 //
 // Current state (Phase H): stub loader only.
 // Full Handlebars rendering, partial support, TemplateContext, and

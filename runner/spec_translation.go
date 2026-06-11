@@ -111,7 +111,7 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	// list empty; providers that need it (codex) accept the empty
 	// list as "all tools allowed".
 
-	// Platform-supplied disallowed-tool patterns (SUP-1840 Option B).
+	// Platform-supplied disallowed-tool patterns (Option B).
 	// Appended AFTER the runner's own defaultDisallowedTools() baseline
 	// so the static floor is never replaced, only extended.
 	// qw.DisallowedTools is the embedded prompt.QueuedWork field stamped

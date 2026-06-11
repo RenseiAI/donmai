@@ -196,6 +196,79 @@ func TestSpawn_TranscriptEnrichment(t *testing.T) {
 	}
 }
 
+// TestSpawn_TranscriptLiveStreaming proves tool structure streams DURING the
+// run, not as an after-exit replay: the fake agy writes a tool-call line,
+// then blocks until a flag file appears. The test creates the flag only
+// AFTER observing the live ToolUseEvent — under the old EOF-replay contract
+// the event could never arrive while the process was alive, and this test
+// would deadlock into its timeout.
+func TestSpawn_TranscriptLiveStreaming(t *testing.T) {
+	t.Parallel()
+	stateHome := t.TempDir()
+	flag := filepath.Join(t.TempDir(), "release")
+	convDir := filepath.Join(stateHome, "antigravity-cli", "brain", "live-conv", ".system_generated", "logs")
+	transcript := filepath.Join(convDir, "transcript.jsonl")
+
+	script := "mkdir -p '" + convDir + "'\n" +
+		"printf '%s\\n' '" + tailPlannerLine + "' > '" + transcript + "'\n" +
+		"echo working\n" +
+		"while [ ! -f '" + flag + "' ]; do sleep 0.05; done\n" +
+		"printf '%s\\n' '" + tailResultLine + "' >> '" + transcript + "'\n" +
+		"echo done\n"
+
+	p := newFakeProvider(t, script, Options{StateHome: stateHome})
+	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "x", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+
+	deadline := time.After(20 * time.Second)
+	var evs []agent.Event
+	released := false
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				t.Fatalf("events channel closed before terminal ResultEvent: %#v", evs)
+			}
+			evs = append(evs, ev)
+			if _, isUse := ev.(agent.ToolUseEvent); isUse && !released {
+				// Live ToolUse observed while the subprocess is still
+				// blocked on the flag file → tailing streamed it mid-run.
+				// The conv-id must already be discovered at this point.
+				if h.SessionID() != "live-conv" {
+					t.Errorf("SessionID during run = %q, want live-conv (corrective InitEvent should precede tool events)", h.SessionID())
+				}
+				if err := os.WriteFile(flag, nil, 0o600); err != nil { //nolint:gosec // test flag file
+					t.Fatal(err)
+				}
+				released = true
+			}
+			if _, terminal := ev.(agent.ResultEvent); terminal {
+				goto drained
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for live-streamed events (EOF-replay regression?); got %#v", evs)
+		}
+	}
+drained:
+	if !released {
+		t.Fatal("never observed a live ToolUseEvent")
+	}
+	if n := len(eventsOfKind[agent.ToolUseEvent](evs)); n != 1 {
+		t.Errorf("ToolUseEvents = %d, want exactly 1 (no duplicate EOF replay)", n)
+	}
+	results := eventsOfKind[agent.ToolResultEvent](evs)
+	if len(results) != 1 || !strings.Contains(results[0].Content, "notes body") {
+		t.Errorf("want exactly one ToolResultEvent carrying the tool output, got %#v", results)
+	}
+	inits := eventsOfKind[agent.InitEvent](evs)
+	if len(inits) != 2 || inits[1].SessionID != "live-conv" {
+		t.Errorf("want initial + corrective InitEvent (live-conv), got %#v", inits)
+	}
+}
+
 func TestSpawn_TrustWorkspaceOptIn(t *testing.T) {
 	t.Parallel()
 	stateHome := t.TempDir()

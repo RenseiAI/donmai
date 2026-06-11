@@ -1,8 +1,8 @@
 # `daemon/` — long-running rensei-daemon runtime
 
-> **Status:** Wave 6 / Phase F.2.8 (REN-1461). Public package; the
+> **Status:** Wave 6 / Phase F.2.8. Public package; the
 > `af daemon …` CLI surface is in `afcli/daemon.go`.
-> **Architecture:** `rensei-architecture/004-sandbox-capability-matrix.md`
+> **Architecture:** `donmai-architecture/004-sandbox-capability-matrix.md`
 > §Local daemon mode + `011-local-daemon-fleet.md`.
 
 The daemon is a single-machine, multi-project supervisor that:
@@ -33,8 +33,8 @@ The daemon is a single-machine, multi-project supervisor that:
                    ▼
         ┌────────────────────┐
         │ WorkerSpawner.spawn│  exec.CommandContext(<af>, "agent", "run")
-        │                    │  env: RENSEI_SESSION_ID=<id>,
-        │                    │       RENSEI_REPOSITORY=<repo>, …
+        │                    │  env: DONMAI_SESSION_ID=<id>,
+        │                    │       DONMAI_REPOSITORY=<repo>, …
         └──────────┬─────────┘
                    │
                    ▼
@@ -69,7 +69,7 @@ WorkerCommand defaults to `[<self-exe>, "agent", "run"]` resolved via
   child process exits; the daemon's listener removes the entry from
   the store so stale auth tokens do not linger in memory.
 
-### Repository URL resolution (REN-1464 / v0.5.2)
+### Repository URL resolution (v0.5.2)
 
 `SessionDetail.repository` is **resolved from the `daemon.yaml`
 project allowlist** by `PollItemToSessionDetail` (in `poll.go`). The
@@ -79,11 +79,11 @@ The platform's QueuedWork wire shape historically carries a
 `projectName` slug (e.g. `"smoke-alpha"`) with no separate repository
 URL — slugs are not clonable. When the poll item arrives the daemon
 runs the same matcher as `WorkerSpawner.findProjectLocked`
-(REN-1448): by `id`, by `repository`, or by URL-suffix. The matching
+by `id`, by `repository`, or by URL-suffix. The matching
 entry's `repository` field is substituted into
 `SessionDetail.repository`, and the canonical `id` is mirrored back
 into `SessionDetail.projectName` so downstream code that reads
-`RENSEI_PROJECT_ID` sees a stable value.
+`DONMAI_PROJECT_ID` sees a stable value.
 
 If no allowlist entry matches, the daemon falls back to whatever the
 platform sent (preserving prior behaviour) and emits a Warn log
@@ -117,6 +117,58 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `GET    /api/daemon/doctor`            | Aggregated health snapshot |
 | `GET    /healthz`                      | Liveness probe |
 
+## Auto-update signing
+
+Auto-update is **opt-in and fail-closed**: the binary ships with no default
+CDN (`autoUpdate` only runs when the operator configures a CDN base), and the
+daemon refuses every binary swap unless signature verification passes against
+an operator-pinned signer allowlist.
+
+CDN layout per channel (`stable` | `beta` | `main`):
+
+```
+<cdnBase>/<channel>/latest.json                              # {version, sha256, releasedAt}
+<cdnBase>/<channel>/<version>/donmai-daemon-<arch>-<os>      # binary
+<cdnBase>/<channel>/<version>/donmai-daemon-<arch>-<os>.sigstore  # sigstore bundle JSON
+```
+
+The update flow is drain → fetch manifest → download binary + bundle →
+SHA-256 integrity check against the manifest → sigstore bundle verification →
+swap → restart. Verification (see `auto_update_verifier.go`) checks that:
+
+1. the bundle's attested artifact digest matches the downloaded binary,
+2. the signing certificate chains to the trust root — the embedded public
+   Sigstore production root by default (shared with kit verification,
+   `kit_trust.go`), or an operator-supplied root via
+   `autoUpdate.trustRootPath` for private sigstore deployments,
+3. the certificate identity matches one of the pinned
+   `autoUpdate.signers` entries — `issuer` (exact) plus `san` (exact) or
+   `sanRegex` (for CI identities whose SAN embeds the release ref).
+
+If `autoUpdate.signers` is empty — the out-of-the-box state — every swap is
+refused with `sig-rejected: no update signers configured`. There is
+deliberately no identity-less mode: "any keyless signer the public trust
+root validates" is not an acceptable policy for swapping the daemon binary.
+
+Release pipelines produce the bundle with keyless signing, e.g.:
+
+```bash
+cosign sign-blob --yes --new-bundle-format \
+  --bundle donmai-daemon-arm64-darwin.sigstore donmai-daemon-arm64-darwin
+```
+
+and operators pin the workflow identity in `daemon.yaml`:
+
+```yaml
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+  signers:
+    - sanRegex: ^https://github\.com/<org>/<repo>/\.github/workflows/release\.yml@refs/tags/v.+$
+      issuer: https://token.actions.githubusercontent.com
+```
+
 ## Operator runbook — debugging a stuck session
 
 When a session appears wedged in the dashboard:
@@ -126,7 +178,7 @@ When a session appears wedged in the dashboard:
    showing `pid=…` and the matching `[child stdout sessionID=<id>]`
    (INFO) and `[child stderr sessionID=<id>]` (WARN) records from
    the spawned `af agent run` worker. Spawn output is wired to slog
-   by default as of v0.5.1 (REN-1463) — earlier daemons drained
+   by default as of v0.5.1 — earlier daemons drained
    child stdio silently.
 2. **Session detail** —
    `curl http://127.0.0.1:7734/api/daemon/sessions/<id>` to confirm
@@ -145,7 +197,7 @@ When a session appears wedged in the dashboard:
    (`PROVIDER_DEBUG=1` for claude, `CODEX_LOG_LEVEL=debug` for
    codex).
 5. **Platform-side state** —
-   `curl http://app.rensei.ai/api/sessions/<id>` (with bearer auth)
+   `curl https://platform.example.com/api/sessions/<id>` (with bearer auth)
    to confirm the platform sees the session in the expected state.
    A divergence between the daemon's view (still active) and the
    platform's view (already terminal) usually indicates a missed

@@ -1,17 +1,17 @@
 // Package launchd implements the macOS launchd installer for the daemon.
 //
 // This is the Go port of the legacy TypeScript installer at
-// agentfactory/packages/daemon/src/launchd-installer.ts (REN-1292).
+// donmai-libraries/packages/daemon/src/launchd-installer.ts.
 //
 // The installer registers the host binary's `daemon run` subcommand as the
 // LaunchAgent's ProgramArguments — it does NOT register a separate
-// `rensei-daemon` binary (locked decision per REN-1406). The host binary
+// `rensei-daemon` binary (locked decision). The host binary
 // is whichever executable invoked the install (`af`, `rensei`, etc.,
 // resolved via os.Executable), and the subcommand is `daemon run`.
 //
 // Architecture reference:
 //
-//	rensei-architecture/011-local-daemon-fleet.md §macOS (launchd)
+//	donmai-architecture/011-local-daemon-fleet.md §macOS (launchd)
 //
 // Plist path:    ~/Library/LaunchAgents/dev.donmai.daemon.plist
 // Log path:      ~/Library/Logs/donmai/daemon.log
@@ -59,7 +59,7 @@ const LaunchdLabel = "dev.donmai.daemon"
 const RenseiDaemonLabel = "dev.rensei.daemon"
 
 // DaemonSubcommand is the subcommand the host binary registers for the
-// LaunchAgent entrypoint. The locked decision (REN-1406) is to register
+// LaunchAgent entrypoint. The locked decision is to register
 // `<host-binary> daemon run`, NOT a separate rensei-daemon binary.
 const DaemonSubcommand = "daemon run"
 
@@ -204,7 +204,7 @@ func ResolveHostBinPath(hostBinPath string) (string, error) {
 
 // GeneratePlist returns a launchd plist XML string for the daemon
 // LaunchAgent. ProgramArguments registers `<hostBinPath> daemon run` —
-// the locked REN-1406 decision (no separate rensei-daemon binary).
+// the locked decision (no separate rensei-daemon binary).
 //
 // Key behaviours encoded in the plist:
 //
@@ -223,7 +223,7 @@ func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
 		return "", fmt.Errorf("launchd: resolve home dir: %w", err)
 	}
 
-	// Build a sensible PATH covering ~/.local/bin (REN-1462: user-local
+	// Build a sensible PATH covering ~/.local/bin (user-local
 	// installs of provider CLIs like `claude` land here when installed
 	// via the upstream curl|sh script), Homebrew on Apple Silicon and
 	// Intel, then the system bins. Prepending ~/.local/bin keeps the

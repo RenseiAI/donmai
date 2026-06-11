@@ -237,11 +237,11 @@ func TestLoop_HeartbeatLostOwnership(t *testing.T) {
 	}
 }
 
-// TestRunLoop_HeartbeatBodyIncludesIssueID is the REN-1465 regression:
+// TestRunLoop_HeartbeatBodyIncludesIssueID is the heartbeat-issue-id regression:
 // the runner must source heartbeat IssueID from prompt.QueuedWork.IssueID
 // (populated by the daemon's poll handler) so the platform's
 // /api/sessions/<id>/lock-refresh handler accepts the request. Before
-// REN-1465 the runner sourced IssueID from a never-populated
+// the fix the runner sourced IssueID from a never-populated
 // IssueLockID field, producing {"workerId":"...","issueId":""} on the
 // wire and a 400 from the platform on every tick.
 //
@@ -324,7 +324,7 @@ func TestRunLoop_HeartbeatBodyIncludesIssueID(t *testing.T) {
 	// Use queuedWorkBase + override IssueID so we can pin the expected
 	// value. The base helper sets IssueID to "issue-uuid-<identifier>",
 	// but we want a stable UUID-shaped value that mirrors the live wire.
-	base := queuedWorkBase("REN-1465")
+	base := queuedWorkBase("ENG-1465")
 	base.IssueID = wantIssueID
 	qw := QueuedWork{
 		QueuedWork:  base,
@@ -359,7 +359,7 @@ func TestRunLoop_HeartbeatBodyIncludesIssueID(t *testing.T) {
 			t.Errorf("body[%d]: workerId empty (full=%+v)", i, b)
 		}
 		if b.IssueID == "" {
-			t.Errorf("body[%d]: issueId empty — REN-1465 regression (full=%+v)", i, b)
+			t.Errorf("body[%d]: issueId empty — ENG-1465 regression (full=%+v)", i, b)
 		}
 		if b.IssueID != wantIssueID {
 			t.Errorf("body[%d]: issueId = %q; want %q", i, b.IssueID, wantIssueID)

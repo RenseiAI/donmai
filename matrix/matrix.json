@@ -135,8 +135,8 @@
       "needsApiKey": true,
       "costModel": "metered",
       "oneShot": true,
-      "nativeJsonMode": false,
-      "structuredVia": "json-schema",
+      "nativeJsonMode": true,
+      "structuredVia": "output-schema",
       "legacyProviderId": null,
       "stability": "beta",
       "smoked": false
@@ -155,8 +155,8 @@
       "needsApiKey": true,
       "costModel": "metered",
       "oneShot": true,
-      "nativeJsonMode": false,
-      "structuredVia": "json-schema",
+      "nativeJsonMode": true,
+      "structuredVia": "output-schema",
       "legacyProviderId": null,
       "stability": "beta",
       "smoked": false
@@ -174,8 +174,8 @@
       "needsApiKey": false,
       "costModel": "host-subscription",
       "oneShot": true,
-      "nativeJsonMode": false,
-      "structuredVia": "spawn-collect",
+      "nativeJsonMode": true,
+      "structuredVia": "output-schema",
       "legacyProviderId": "codex",
       "stability": "stable",
       "smoked": true

@@ -1,7 +1,7 @@
 package agent
 
 // This file ports the type-only declarations from
-// ../agentfactory/packages/core/src/providers/types.ts.
+// ../donmai-libraries/packages/core/src/providers/types.ts.
 //
 // Per the F.1.1 design doc §2 (Type signatures (Go)), these types are
 // the verbatim Go translation. JSON tags use camelCase to match the TS
@@ -16,7 +16,7 @@ import "encoding/json"
 // ollama, opencode, jules, amp) extend this enum without breaking the
 // contract.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts (AgentProviderName).
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts (AgentProviderName).
 type ProviderName string
 
 // ProviderName constants. v0.5.0 ships ProviderClaude, ProviderCodex,
@@ -44,7 +44,7 @@ const (
 // gate runner behavior rather than try-catching unsupported provider
 // operations.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentProviderCapabilities).
 type Capability string
 
@@ -82,7 +82,7 @@ const (
 // Capabilities is the typed capability matrix every provider declares.
 //
 // Verbatim port of AgentProviderCapabilities. Flat struct (no nested
-// objects) per the rensei-architecture base-contract validator
+// objects) per the donmai-architecture base-contract validator
 // constraint (002-provider-base-contract.md §Capabilities).
 //
 // Per F.1.1 §3.1 and the locked coordinator decision, the v0.5.0
@@ -90,7 +90,7 @@ const (
 // injection in CLI JSON-stream mode); flip when a wrapper sidecar
 // lands in F.5.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentProviderCapabilities).
 type Capabilities struct {
 	// SupportsMessageInjection reports whether Handle.Inject works
@@ -215,7 +215,7 @@ func IsSupported(caps Capabilities, c Capability) bool {
 
 // SandboxLevel mirrors AgentSpawnConfig.sandboxLevel from the legacy TS.
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts.
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts.
 type SandboxLevel string
 
 // SandboxLevel constants align with Codex sandbox policies (readOnly /
@@ -228,7 +228,7 @@ const (
 )
 
 // EffortLevel mirrors EffortLevel from
-// ../agentfactory/packages/core/src/providers/index.ts. Providers map
+// ../donmai-libraries/packages/core/src/providers/index.ts. Providers map
 // this to their native reasoning-effort knob:
 //   - Claude  : --effort flag
 //   - Codex   : reasoningEffort / model_reasoning_effort
@@ -273,7 +273,7 @@ type MCPServerConfig struct {
 
 // PermissionConfig is the runtime permission policy for the codex
 // approval bridge. Verbatim port of CodexPermissionConfig from
-// ../agentfactory/packages/core/src/templates/adapters.ts.
+// ../donmai-libraries/packages/core/src/templates/adapters.ts.
 //
 // Providers without NeedsPermissionConfig=true ignore this field.
 type PermissionConfig struct {
@@ -312,7 +312,7 @@ type CodeIntelEnforcement struct {
 // for not setting incompatible fields (gate on Capabilities before
 // invoking Spawn).
 //
-// Source: ../agentfactory/packages/core/src/providers/types.ts
+// Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentSpawnConfig).
 type Spec struct {
 	// Prompt is the task-specific directive.
@@ -365,13 +365,18 @@ type Spec struct {
 	// falls back to provider/env default.
 	Model string `json:"model,omitempty"`
 
-	// Endpoint is the RESOLVED model-endpoint binding. nil == today's
+	// Endpoint is the RESOLVED model-endpoint binding. nil == default
 	// behavior: providers read Spec.Model / Spec.Env as before. nil is the
-	// canonical "unset" sentinel; the Phase-3 Spawn read site gates on
-	// Endpoint == nil (a non-nil pointer is treated as set — IsZero on the
-	// pointee is a convenience, not the unset check). Wired into the Spawn
-	// path in Phase 3; no provider reads it in P1. Spec.Model remains the
-	// source of truth and is NOT yet derived from this.
+	// canonical "unset" sentinel; Spawn read sites gate on Endpoint == nil
+	// (a non-nil pointer is treated as set — IsZero on the pointee is a
+	// convenience, not the unset check). Read sites: the claude harness
+	// projects the binding onto the CLI's serving-host env knobs
+	// (direct/bedrock/vertex — provider/harness/claude/endpoint.go) and
+	// the gemini harness routes the per-session generateContent URL
+	// (direct/vertex — spawnURL in provider/harness/gemini/gemini.go).
+	// Both honor Endpoint.Model over Spec.Model when set, the same rule as
+	// the one-shot lane. Harnesses without a read site (codex / opencode /
+	// amp / agycli) still intentionally ignore the field.
 	//
 	// Declared as a POINTER (not a value) so the json:"endpoint,omitempty"
 	// tag actually omits the field for pre-P1 producers — Go's encoding/json
@@ -387,8 +392,9 @@ type Spec struct {
 	// ResponseSchema is the native structured-output JSON Schema for the
 	// one-shot/structured lane (P4b). Honored ONLY by harnesses that
 	// declare HarnessCaps.NativeJSONMode (the raw harnesses over gemini's
-	// responseSchema and ollama's format) — they set the protocol's
-	// structured primitive so output is constrained server-side (STRICT).
+	// responseSchema and ollama's format, plus codex's turn/start
+	// outputSchema) — they set the protocol's structured primitive so
+	// output is constrained server-side (STRICT).
 	// Harnesses without NativeJSONMode ignore it and rely on the soft prompt
 	// instruction SpawnComplete appends. nil/empty == today's free-text
 	// behavior; additive and omitempty so the wire round-trip is unchanged

@@ -73,7 +73,7 @@ type agentRunOpts struct {
 //   - 2  — pre-flight failure (no session id, daemon unreachable,
 //     session not found, registry construction failed).
 //
-// (REN-1461 / F.2.8 — daemon wire-up.)
+// (F.2.8 — daemon wire-up.)
 func newAgentRunCmd() *cobra.Command {
 	opts := &agentRunOpts{}
 	cmd := &cobra.Command{
@@ -441,7 +441,7 @@ type providerCtor struct {
 // coupling we explicitly want to avoid (per F.1.1 §7 + the F.2.8 task
 // guidance).
 //
-// Probe-failure visibility (REN-1462 / v0.5.1): every provider
+// Probe-failure visibility: every provider
 // construction or registration failure logs at WARN with the provider
 // name and underlying error so operators can see at a glance which
 // providers are available on this host. If the resulting registry has
@@ -450,7 +450,7 @@ type providerCtor struct {
 // no provider can resolve.
 //
 // Foundation-runtime-stubs adds three more probe-and-skip entries
-// (REN-1499 amp, REN-1500 gemini, REN-1501 opencode). Each follows
+// (amp, gemini, opencode). Each follows
 // the same warn-and-skip contract as claude / codex: if the
 // constructor returns ErrProviderUnavailable (no API key, server
 // unreachable) the registry build logs WARN and proceeds without

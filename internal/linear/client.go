@@ -352,7 +352,7 @@ func nodeToComment(n commentNode) Comment {
 
 // ─── Read operations ──────────────────────────────────────────────────────────
 
-// GetIssue fetches a single issue by its Linear ID or identifier (e.g. "REN-42").
+// GetIssue fetches a single issue by its Linear ID or identifier (e.g. "ENG-42").
 func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	vars := map[string]any{"id": id}
 	var data getIssueData

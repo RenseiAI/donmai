@@ -42,11 +42,12 @@ type rawAssistantEnvelope struct {
 }
 
 // rawContentBlock is one block inside an assistant or user message.
-// We only care about text + tool_use for assistant messages and
-// tool_result for user messages.
+// We only care about text + tool_use + thinking for assistant messages
+// and tool_result for user messages.
 type rawContentBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
+	Thinking  string          `json:"thinking,omitempty"`
 	ID        string          `json:"id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
@@ -146,7 +147,7 @@ type rawResultEnvelope struct {
 // caller's loop is responsible for whether a parse error is fatal.
 //
 // This is the verbatim Go port of the legacy TS mapSDKMessage from
-// ../agentfactory/packages/core/src/providers/claude-provider.ts.
+// ../donmai-libraries/packages/core/src/providers/claude-provider.ts.
 //
 // Design note: each Event variant carries the original raw line in
 // its `Raw` field as json.RawMessage so the runner can persist the
@@ -260,6 +261,24 @@ func mapAssistant(line []byte) []agent.Event {
 				Input:     input,
 				Raw:       json.RawMessage(line),
 			})
+		case "thinking":
+			// Model reasoning rides as SystemEvent{Subtype: "reasoning"}
+			// — the activity poster whitelists exactly that subtype and
+			// forwards it as a "thought" activity (parity with codex
+			// completed reasoning items). It must NOT become an
+			// AssistantTextEvent: the runner scans assistant text for
+			// verdict markers.
+			if block.Thinking == "" {
+				continue
+			}
+			out = append(out, agent.SystemEvent{
+				Subtype: "reasoning",
+				Message: block.Thinking,
+				Raw:     json.RawMessage(line),
+			})
+		case "redacted_thinking":
+			// Encrypted reasoning — nothing renderable; deliberately
+			// passed over.
 		}
 	}
 	return out

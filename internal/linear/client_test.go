@@ -161,7 +161,7 @@ func TestListIssuesByProjectSuccess(t *testing.T) {
 	nodes := []map[string]any{
 		{
 			"id":         "issue-1",
-			"identifier": "REN-1",
+			"identifier": "ENG-1",
 			"title":      "First issue",
 			"state":      map[string]any{"name": "In Progress"},
 			"project":    map[string]any{"name": "MyProject"},
@@ -169,7 +169,7 @@ func TestListIssuesByProjectSuccess(t *testing.T) {
 		},
 		{
 			"id":         "issue-2",
-			"identifier": "REN-2",
+			"identifier": "ENG-2",
 			"title":      "Second issue",
 			"state":      map[string]any{"name": "Todo"},
 			"project":    map[string]any{"name": "MyProject"},
@@ -187,7 +187,7 @@ func TestListIssuesByProjectSuccess(t *testing.T) {
 	if len(issues) != 2 {
 		t.Fatalf("got %d issues, want 2", len(issues))
 	}
-	if issues[0].ID != "issue-1" || issues[0].Identifier != "REN-1" {
+	if issues[0].ID != "issue-1" || issues[0].Identifier != "ENG-1" {
 		t.Errorf("issues[0] = %+v", issues[0])
 	}
 	if issues[1].ParentID != "issue-0" {
@@ -219,7 +219,7 @@ func TestListIssuesByProjectNoStates(t *testing.T) {
 func TestGetIssueSuccess(t *testing.T) {
 	t.Parallel()
 	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		writeGQLData(w, `{"issue":{"id":"issue-1","identifier":"REN-1","title":"Some issue","state":{"name":"Done"},"project":{"name":"MyProj"},"parent":null}}`)
+		writeGQLData(w, `{"issue":{"id":"issue-1","identifier":"ENG-1","title":"Some issue","state":{"name":"Done"},"project":{"name":"MyProj"},"parent":null}}`)
 	})
 
 	iss, err := c.GetIssue(context.Background(), "issue-1")
@@ -252,7 +252,7 @@ func TestListSubIssuesSuccess(t *testing.T) {
 	nodes := []map[string]any{
 		{
 			"id":         "child-1",
-			"identifier": "REN-10",
+			"identifier": "ENG-10",
 			"title":      "Child issue",
 			"state":      map[string]any{"name": "In Progress"},
 			"project":    map[string]any{"name": "Proj"},

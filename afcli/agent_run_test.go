@@ -32,7 +32,7 @@ func quietLogger() *slog.Logger {
 
 // codexOnPath reports whether the `codex` binary resolves on $PATH.
 // Used by the happy-path test to skip when the codex provider would
-// be probed (and trigger REN-1460's startup/shutdown race).
+// be probed (and trigger the codex startup/shutdown race).
 func codexOnPath() bool {
 	_, err := exec.LookPath("codex")
 	return err == nil
@@ -70,7 +70,7 @@ func TestFetchSessionDetail_HappyPath(t *testing.T) {
 	// nolint:gosec // G101: fake test fixture, not a real credential.
 	want := &daemon.SessionDetail{
 		SessionID:       "sess-1",
-		IssueIdentifier: "REN-9999",
+		IssueIdentifier: "ENG-9999",
 		Repository:      "github.com/foo/bar",
 		WorkerID:        "wkr_1",
 		AuthToken:       "rt.fake.jwt",
@@ -201,7 +201,7 @@ func TestDetailToQueuedWork(t *testing.T) {
 	d := &daemon.SessionDetail{
 		SessionID:       "sess-3",
 		IssueID:         "lin-1",
-		IssueIdentifier: "REN-1",
+		IssueIdentifier: "ENG-1",
 		Repository:      "github.com/foo/bar",
 		Branch:          "agent/sess-3",
 		WorkType:        "development",
@@ -215,7 +215,7 @@ func TestDetailToQueuedWork(t *testing.T) {
 		},
 	}
 	qw := detailToQueuedWork(d)
-	if qw.SessionID != "sess-3" || qw.IssueIdentifier != "REN-1" {
+	if qw.SessionID != "sess-3" || qw.IssueIdentifier != "ENG-1" {
 		t.Errorf("session/identifier mismatch: %+v", qw)
 	}
 	if qw.Branch != "agent/sess-3" || qw.AuthToken != "tok" || qw.WorkerID != "wkr_1" {
@@ -433,7 +433,7 @@ func TestBuildAgentRunRegistry_AlwaysHasStub(t *testing.T) {
 	}
 }
 
-// TestBuildRegistryFromCtors_LogsProbeFailures covers REN-1462's
+// TestBuildRegistryFromCtors_LogsProbeFailures covers the
 // per-provider WARN line: a registry built with one of three
 // providers failing must emit exactly one WARN with provider=<name>
 // + err, plus two happy registrations.
@@ -612,13 +612,13 @@ func TestRunAgentRun_PreflightSessionNotFound(t *testing.T) {
 // emitted to stdout.
 //
 // Skipped under -race when `codex` is on PATH — the codex provider's
-// startup/shutdown race is tracked separately as REN-1460. This test
+// startup/shutdown race is tracked separately. This test
 // drives runAgentRun which uses the production buildAgentRunRegistry
-// path; that path probes for codex unconditionally. Once REN-1460
+// path; that path probes for codex unconditionally. Once that race
 // lands the skip can drop.
 func TestRunAgentRun_HappyPath_StubProvider(t *testing.T) {
 	if codexOnPath() && raceEnabled() {
-		t.Skip("skipping under -race because codex is on PATH and codex.New/Shutdown have a known race (REN-1460); rerun without -race or after REN-1460 lands")
+		t.Skip("skipping under -race because codex is on PATH and codex.New/Shutdown have a known race (ENG-1460); rerun without -race or after ENG-1460 lands")
 	}
 	platformHits := 0
 	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -630,7 +630,7 @@ func TestRunAgentRun_HappyPath_StubProvider(t *testing.T) {
 
 	detail := &daemon.SessionDetail{
 		SessionID:       "sess-stub-1",
-		IssueIdentifier: "REN-9000",
+		IssueIdentifier: "ENG-9000",
 		Repository:      "github.com/foo/bar",
 		WorkType:        "development",
 		Body:            "Stub-mode test issue body.",

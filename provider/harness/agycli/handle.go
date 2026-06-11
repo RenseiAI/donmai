@@ -45,10 +45,12 @@ var ansiRE = regexp.MustCompile("\x1b\\[[0-9;?=]*[ -/]*[@-~]|\x1b\\][^\x07]*(\x0
 //  1. spawn() starts the subprocess under a pty (creack/pty) and launches the
 //     readLoop goroutine.
 //  2. readLoop emits an InitEvent, streams sanitized stdout lines as
-//     AssistantTextEvents, then on EOF + cmd.Wait emits best-effort transcript
-//     ToolUse/ToolResult events and a terminal ResultEvent, then closes the
-//     events channel and signals done. It is self-contained: completion does
-//     NOT require an external Stop().
+//     AssistantTextEvents while a transcript tailer (tail.go) streams
+//     best-effort ToolUse/ToolResult events live off agy's on-disk
+//     transcript.jsonl, then on EOF + cmd.Wait waits for the tailer's final
+//     catch-up drain and emits a terminal ResultEvent, then closes the events
+//     channel and signals done. It is self-contained: completion does NOT
+//     require an external Stop().
 //  3. Stop() (or ctx cancellation) force-closes the pty to unblock a blocked
 //     reader, SIGTERM→SIGKILLs the process group, and is idempotent.
 type Handle struct {
@@ -224,6 +226,35 @@ func (h *Handle) readLoop() {
 
 	h.sendEvent(agent.InitEvent{})
 
+	// Live transcript tailing: stream agy's structured tool events DURING the
+	// run (agy writes them only to its on-disk transcript; stdout is prose).
+	// The tailer also discovers the conversation id mid-run and re-emits a
+	// corrective InitEvent — the first InitEvent fired with an empty SessionID
+	// because the conv-id is only knowable post-spawn — so the runner
+	// overwrites the durable ProviderSessionID while the session is still
+	// alive. Its final catch-up drain (after cmd.Wait below) replaces the old
+	// after-EOF transcript replay; the tailer is the only transcript emitter,
+	// so nothing is duplicated.
+	var tailStop, tailDone chan struct{}
+	if h.enrichTranscript && h.stateHome != "" {
+		tailStop, tailDone = make(chan struct{}), make(chan struct{})
+		tailer := &transcriptTailer{
+			stateHome: h.stateHome,
+			cwd:       h.cwd,
+			before:    h.brainBefore,
+			emit:      h.sendEvent,
+			onConvID: func(convID string) {
+				id := convID
+				h.sessionID.Store(&id)
+				h.sendEvent(agent.InitEvent{SessionID: convID})
+			},
+		}
+		go func() {
+			defer close(tailDone)
+			tailer.run(tailStop)
+		}()
+	}
+
 	retained := newCappedBuffer(maxRetainedOutput)
 	buf := make([]byte, 32*1024)
 	var lineCarry strings.Builder
@@ -276,20 +307,12 @@ func (h *Handle) readLoop() {
 
 	waitErr := h.cmd.Wait()
 
-	// Best-effort structured enrichment from agy's on-disk transcript.
-	if h.enrichTranscript {
-		if convID, ok := discoverConvID(h.stateHome, h.cwd, h.brainBefore); ok {
-			id := convID
-			h.sessionID.Store(&id)
-			// Corrective InitEvent: the first InitEvent fired with an empty
-			// SessionID (the conv-id is only knowable post-spawn). Re-emit with
-			// the real id so the runner overwrites the durable ProviderSessionID
-			// (observeEvent mirrors InitEvent.SessionID to state.json).
-			h.sendEvent(agent.InitEvent{SessionID: convID})
-			for _, ev := range parseTranscriptFile(transcriptPath(h.stateHome, convID)) {
-				h.sendEvent(ev)
-			}
-		}
+	// Stop the tailer and wait for its final catch-up drain so every
+	// transcript event (and the corrective InitEvent, when discovery only
+	// succeeds post-exit) is emitted before the terminal ResultEvent.
+	if tailDone != nil {
+		close(tailStop)
+		<-tailDone
 	}
 
 	h.sendEvent(h.buildResult(retained.String(), waitErr))

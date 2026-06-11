@@ -7,6 +7,17 @@ on:
     branches: [main]
 
 jobs:
+  leak-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Leak guard self-test
+        run: bash scripts/leak-guard.sh --self-test
+
+      - name: Closed-source content guard
+        run: bash scripts/leak-guard.sh --all
+
   test:
     runs-on: ubuntu-latest
     steps:

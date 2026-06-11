@@ -1,6 +1,7 @@
 package codeintel
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -160,5 +161,98 @@ func TestFetchPRDiff_ViewFailurePropagates(t *testing.T) {
 
 	if _, err := FetchPRDiff(context.Background(), "r", 1, "ref"); err == nil {
 		t.Fatal("expected view failure to propagate")
+	}
+}
+
+// TestFetchDiffOrMeta_SurfacesDegradeReason pins the loud-degrade contract:
+// when the diff fetch fails, fetchDiffOrMeta must explain WHY on the warn
+// writer before falling back to the metadata-only PrDiff. A silent fallback
+// regression would leave `arch assess` emitting zero observations with no
+// explanation (the gh-missing case in particular must surface the install
+// instructions carried by ErrDiffFetchUnavailable).
+func TestFetchDiffOrMeta_SurfacesDegradeReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		fetchErr   error // nil → fetch succeeds
+		prURL      string
+		repo       string
+		prNum      int
+		wantInWarn []string // substrings the warning must carry; empty → no warning
+	}{
+		{
+			name:     "gh missing surfaces install instructions",
+			fetchErr: ErrDiffFetchUnavailable,
+			prURL:    "https://github.com/owner/repo/pull/7",
+			repo:     "github.com/owner/repo",
+			prNum:    7,
+			wantInWarn: []string{
+				"gh CLI not found on PATH",
+				"https://cli.github.com",
+				"metadata-only",
+			},
+		},
+		{
+			name:     "fetch error names the ref and reason",
+			fetchErr: errors.New("gh pr view: exit 1: HTTP 502"),
+			repo:     "github.com/owner/repo",
+			prNum:    9,
+			wantInWarn: []string{
+				"owner/repo#9",
+				"HTTP 502",
+				"metadata-only",
+			},
+		},
+		{
+			name:       "successful fetch is silent",
+			repo:       "github.com/owner/repo",
+			prNum:      3,
+			wantInWarn: nil,
+		},
+		{
+			name:       "no ref resolvable stays silent",
+			repo:       "",
+			prNum:      0,
+			wantInWarn: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			origView, origDiff, origWarn := runGhPRView, runGhPRDiff, diffFetchWarnWriter
+			t.Cleanup(func() {
+				runGhPRView, runGhPRDiff, diffFetchWarnWriter = origView, origDiff, origWarn
+			})
+
+			var warnBuf bytes.Buffer
+			diffFetchWarnWriter = &warnBuf
+			runGhPRView = func(_ context.Context, _ string) ([]byte, error) {
+				if tc.fetchErr != nil {
+					return nil, tc.fetchErr
+				}
+				return []byte(`{"title":"t","body":"b","files":[]}`), nil
+			}
+			runGhPRDiff = func(_ context.Context, _ string) ([]byte, error) {
+				return []byte(""), nil
+			}
+
+			diff := New(t.TempDir()).fetchDiffOrMeta(context.Background(), tc.repo, tc.prNum, tc.prURL)
+			if diff.Repository != tc.repo || diff.PrNumber != tc.prNum {
+				t.Errorf("PrDiff identity = (%q, %d), want (%q, %d)",
+					diff.Repository, diff.PrNumber, tc.repo, tc.prNum)
+			}
+
+			warn := warnBuf.String()
+			if len(tc.wantInWarn) == 0 {
+				if warn != "" {
+					t.Fatalf("expected no warning, got %q", warn)
+				}
+				return
+			}
+			for _, want := range tc.wantInWarn {
+				if !strings.Contains(warn, want) {
+					t.Errorf("warning missing %q:\n%s", want, warn)
+				}
+			}
+		})
 	}
 }

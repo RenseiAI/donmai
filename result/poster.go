@@ -343,7 +343,7 @@ func (p *Poster) doRetried(ctx context.Context, path string, buildBody func(Runt
 	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
 		// Re-resolve credentials before every attempt so a daemon-side
 		// runtime-token refresh between retries propagates here. This is
-		// the fix for SUP-1823: long-running sessions whose initial JWT
+		// the stale-JWT fix: long-running sessions whose initial JWT
 		// expires mid-run would otherwise loop on a cached, dead token.
 		creds := p.credentials(ctx)
 		body := buildBody(creds)

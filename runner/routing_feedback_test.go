@@ -59,7 +59,7 @@ func completedResult() *Result {
 	res.Status = "completed"
 	res.WorkResult = "passed"
 	res.PullRequestURL = "https://github.com/x/y/pull/1"
-	res.IssueIdentifier = "REN-1"
+	res.IssueIdentifier = "ENG-1"
 	res.Cost = &agent.CostData{TotalCostUsd: 1.0}
 	res.StartedAt = 1000
 	res.FinishedAt = 4000

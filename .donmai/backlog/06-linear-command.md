@@ -10,7 +10,7 @@ Port from legacy `af-linear` (linear.ts). Comprehensive Linear API wrapper with 
 **Priority**: High
 **Labels**: migration
 
-Get issue details by identifier. `af linear get-issue SUP-674`. Output: title, status, assignee, labels, description.
+Get issue details by identifier. `af linear get-issue OPS-674`. Output: title, status, assignee, labels, description.
 
 ### AF-061: Implement `af linear list-issues` subcommand
 **Priority**: High
@@ -28,7 +28,7 @@ Create a new issue. Support: `--title`, `--description`, `--project`, `--status`
 **Priority**: High
 **Labels**: migration
 
-Update issue fields. `af linear update-issue SUP-674 --status "In Progress" --assignee "user"`.
+Update issue fields. `af linear update-issue OPS-674 --status "In Progress" --assignee "user"`.
 
 ### AF-064: Implement `af linear list-comments` / `create-comment` subcommands
 **Priority**: Medium

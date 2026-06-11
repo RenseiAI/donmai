@@ -98,7 +98,7 @@ func TestGenerateUnitFile_RegistersDaemonRunNotRenseiDaemon(t *testing.T) {
 		t.Fatalf("GenerateUnitFile: %v", err)
 	}
 
-	// Locked REN-1406 decision: ExecStart must be `<host-binary> daemon run`,
+	// Locked decision: ExecStart must be `<host-binary> daemon run`,
 	// NOT a separate rensei-daemon binary.
 	if !strings.Contains(out, "ExecStart=/opt/af daemon run") {
 		t.Errorf("ExecStart must register the host binary's daemon run subcommand. Got:\n%s", out)
@@ -141,7 +141,7 @@ func TestGenerateUnitFile_RequiresBinPath(t *testing.T) {
 // TestGenerateUnitFile_PathIncludesUserLocalBin asserts the v0.5.1
 // fix: the unit file's Environment=PATH must prepend ~/.local/bin so
 // user-local installs of provider CLIs like `claude` are visible to
-// the daemon. (REN-1462.)
+// the daemon.
 func TestGenerateUnitFile_PathIncludesUserLocalBin(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)

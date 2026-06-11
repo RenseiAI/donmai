@@ -2,7 +2,7 @@
 // session persistence and crash recovery.
 //
 // The legacy TS analogue lives in
-// ../agentfactory/packages/core/src/orchestrator/state-recovery.ts. The
+// ../donmai-libraries/packages/core/src/orchestrator/state-recovery.ts. The
 // shape ported here keeps wire compatibility with the legacy reader so
 // a worktree initialized by either runner is recoverable by the other
 // during the F.0/F.5 migration window.

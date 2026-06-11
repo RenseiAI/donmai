@@ -19,5 +19,5 @@
 // the provider/claude or provider/gemini layout: probe.go,
 // spec_translation.go, event_mapping.go, handle.go.
 //
-// Tracked in REN-1499 (Amp runner) on the Rensei Linear team.
+// A native Amp runner is tracked as follow-up work.
 package amp

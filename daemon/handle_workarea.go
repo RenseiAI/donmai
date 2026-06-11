@@ -359,7 +359,7 @@ func (d *Daemon) workareaArchiveRegistry() *WorkareaArchiveRegistry {
 
 // SetWorkareaArchiveRegistry replaces the daemon's archive registry
 // with the provided one. Used by tests + by the future pool wire-up
-// (REN-1280) to inject an ActiveWorkareaProvider that sees the live
+// to inject an ActiveWorkareaProvider that sees the live
 // pool.
 func (d *Daemon) SetWorkareaArchiveRegistry(reg *WorkareaArchiveRegistry) {
 	d.mu.Lock()

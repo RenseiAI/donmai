@@ -9,7 +9,7 @@ import (
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
 )
 
-// TestFormatStartupWorkerLine covers REN-1445: the daemon startup log used to
+// TestFormatStartupWorkerLine covers the startup-line regression: the daemon startup log used to
 // print `[daemon] worker-id worker-test-machine-stub` in stub mode, which
 // misled operators into thinking the daemon had registered with the platform.
 // The new helper annotates stub ids and returns "" when no id is assigned.

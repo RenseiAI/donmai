@@ -14,6 +14,7 @@ func renderHelpOverlay(_ string, width, height int) string {
 		{"g/G", "Jump to top/bottom"},
 		{"ctrl+u/ctrl+d", "Page up/down"},
 		{"f", "Toggle auto-follow"},
+		{"w", "Toggle line wrap"},
 		{"s", "Stop agent"},
 		{"p", "Forward prompt to agent"},
 		{"r", "Manual refresh"},

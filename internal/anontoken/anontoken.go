@@ -81,9 +81,16 @@ func EnsureToken() (string, bool, error) {
 
 // ClaimURL builds the browser claim URL for a token.
 // baseURL should be the dashboard base URL (e.g. "https://donmai.dev/dashboard").
+//
+// The token rides in the URL FRAGMENT (#token=...), never in the query
+// string: fragments are not sent over the wire, so the dmk_ secret stays out
+// of server access logs, proxy logs, and Referer headers (a ?token= query
+// leaked into all three). The dashboard's /claim page reads location.hash
+// client-side and exchanges the token via POST /api/auth/claim — see the
+// donmai-dashboard claim flow.
 func ClaimURL(token, baseURL string) string {
 	if baseURL == "" {
 		baseURL = "https://donmai.dev/dashboard"
 	}
-	return baseURL + "/api/auth/claim?token=" + token
+	return baseURL + "/claim#token=" + token
 }

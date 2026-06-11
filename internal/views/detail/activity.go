@@ -47,16 +47,19 @@ func activityColor(t afclient.ActivityType) lipgloss.Style {
 }
 
 // activityKeyMap returns a LogViewer KeyMap customized for the activity
-// viewport. Clear and ToggleWrap are disabled since the parent view
-// manages the activity buffer lifecycle.
+// viewport. Clear is disabled since the parent view manages the activity
+// buffer lifecycle; ToggleWrap ("w") stays enabled so long lines can be
+// expanded (soft-wrapped) or collapsed to one clipped row per activity.
 func activityKeyMap() widget.KeyMap {
 	km := widget.DefaultKeyMap()
 	km.Clear.SetEnabled(false)
-	km.ToggleWrap.SetEnabled(false)
 	return km
 }
 
 // newActivityLogViewer creates a LogViewer configured for activity display.
+// Wrap follows the LogViewer default (on): long activity content is fully
+// visible across wrapped rows; ToggleWrap collapses to one clipped row per
+// activity.
 func newActivityLogViewer() *widget.LogViewer {
 	return widget.NewLogViewer(
 		widget.WithLogViewerKeyMap(activityKeyMap()),
@@ -65,34 +68,30 @@ func newActivityLogViewer() *widget.LogViewer {
 
 // renderActivityLine formats a single activity event as a styled string
 // suitable for LogViewer.Append.
-func renderActivityLine(a afclient.ActivityEvent, width int) string {
+//
+// The full content is retained — no pre-clipping. The LogViewer owns the
+// presentation: with wrap on it soft-wraps the styled line to the viewport
+// width, with wrap off the viewport clips it by display cells (ANSI-aware
+// ansi.Cut — never byte or rune slicing, so no mojibake and no double-width
+// CJK/emoji overflow). Clipping at append time would make ToggleWrap a
+// no-op: the stored line must stay whole for wrap to have anything to show.
+func renderActivityLine(a afclient.ActivityEvent) string {
 	ts := formatActivityTimestamp(a.Timestamp)
 	tsRendered := theme.Dimmed().Render("[" + ts + "]")
 
 	icon := activityIcon(a.Type)
 	colorStyle := activityColor(a.Type)
 
-	content := a.Content
+	var badge string
 	if a.ToolName != nil && a.Type == afclient.ActivityAction {
-		badge := lipgloss.NewStyle().
+		badge = lipgloss.NewStyle().
 			Foreground(theme.Default().BgPrimary).
 			Background(theme.Default().Teal).
 			Padding(0, 1).
-			Render(*a.ToolName)
-		content = badge + " " + content
+			Render(*a.ToolName) + " "
 	}
 
-	maxContentWidth := width - 18
-	if maxContentWidth < 20 {
-		maxContentWidth = 20
-	}
-	// Clip by runes, never bytes: byte slicing can split a multi-byte UTF-8
-	// sequence mid-character and render mojibake.
-	if runes := []rune(content); len(runes) > maxContentWidth {
-		content = string(runes[:maxContentWidth-3]) + "..."
-	}
-
-	rendered := colorStyle.Render(content)
+	rendered := badge + colorStyle.Render(a.Content)
 	return fmt.Sprintf("  %s %s %s", tsRendered, icon, rendered)
 }
 

@@ -16,7 +16,7 @@
 //
 // The KitDetectResult, AttestationChip, and ScopePill primitives from
 // tui-components v0.2.0 are not yet shipped; trust state and detect
-// rules render as plain text. Swap in when REN-1331 lands.
+// rules render as plain text. Swap in when the shared theming pass lands.
 package kit
 
 import (
@@ -39,7 +39,7 @@ func NoColorEnv() bool {
 
 // ---- ANSI helpers -----------------------------------------------------------
 // These are intentionally minimal — a real refactor will replace them with
-// tui-components theme helpers once REN-1331 ships.
+// tui-components theme helpers once the shared theming pass ships.
 
 const (
 	ansiReset   = "\033[0m"

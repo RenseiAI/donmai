@@ -59,7 +59,7 @@ goreleaser builds the following targets (see `.goreleaser.yaml`):
 - GitHub CLI (`gh auth status`)
 - `GITHUB_TOKEN` env var with `repo` + `write:packages` scopes (goreleaser uses this automatically)
 - `HOMEBREW_TAP_GITHUB_TOKEN` env var with write access to `RenseiAI/homebrew-tap`
-- For darwin signing (REN-1412): `APPLE_DEVELOPER_ID_CERT_BASE64`, `APPLE_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_DEVELOPER_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` configured as org-level GitHub Actions secrets — see [macOS signing](#macos-signing). Local dry-runs (`goreleaser release --snapshot`) skip signing per goreleaser convention.
+- For darwin signing: `APPLE_DEVELOPER_ID_CERT_BASE64`, `APPLE_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_DEVELOPER_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` configured as org-level GitHub Actions secrets — see [macOS signing](#macos-signing). Local dry-runs (`goreleaser release --snapshot`) skip signing per goreleaser convention.
 - All tests passing locally: `make test && make lint`
 
 ---
@@ -198,7 +198,7 @@ The tap formula lives at:
 
 ## macOS signing
 
-Per REN-1412, all darwin builds of `af` are **signed** with the Apple Developer ID Application certificate (Yuisei-iOS enrollment) and **notarized** via Apple's `notarytool` service. The notarization ticket is **stapled** to each archive so binaries are Gatekeeper-clean offline (a fresh Mac with no network can launch `af` without a callback to Apple's servers).
+All darwin builds of `af` are **signed** with the Apple Developer ID Application certificate (Yuisei-iOS enrollment) and **notarized** via Apple's `notarytool` service. The notarization ticket is **stapled** to each archive so binaries are Gatekeeper-clean offline (a fresh Mac with no network can launch `af` without a callback to Apple's servers).
 
 This eliminates the Gatekeeper popup that previously required users to approve `af` in System Settings → Privacy & Security after `brew install RenseiAI/tap/af`.
 
@@ -290,7 +290,7 @@ Run these checks after installing the new binary from Homebrew or a direct downl
 [ ] spctl --assess --verbose /opt/homebrew/bin/af  → accepted, source=Notarized Developer ID
 [ ] stapler validate /opt/homebrew/bin/af  → ticket stapled (Gatekeeper-offline-clean)
 [ ] codesign -dvv /opt/homebrew/bin/af  → Authority=Developer ID Application
-[ ] No System Settings → Privacy & Security popup on first launch (REN-1412 regression check)
+[ ] No System Settings → Privacy & Security popup on first launch (notarization regression check)
 ```
 
 ---
