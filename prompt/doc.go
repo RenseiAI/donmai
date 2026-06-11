@@ -26,7 +26,7 @@
 // # Migration note
 //
 // The legacy TS prompt builder lives in
-// ../agentfactory/packages/core/src/templates/{registry,renderer}.ts.
+// ../donmai-libraries/packages/core/src/templates/{registry,renderer}.ts.
 // This Go port carries forward only the v0.5.0 work types
 // (development, qa, research) per the F.2 scope. The full Handlebars
 // template surface is deferred to F.5 — once the v0.5.0 walkthrough is

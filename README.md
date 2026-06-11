@@ -237,7 +237,7 @@ donmai daemon set capacity.maxConcurrentSessions <sessions>
 donmai daemon set capacity.poolMaxDiskGb <gb>
 ```
 
-Environment: `RENSEI_DAEMON_TOKEN` (optional — `donmai daemon install` provisions
+Environment: `DONMAI_DAEMON_TOKEN` (optional — `donmai daemon install` provisions
 this automatically when `~/.config/rensei/config.json` contains a platform key).
 
 ### `donmai governor`
@@ -448,7 +448,7 @@ Example: `donmai admin queue list`:
   "items": [
     {
       "sessionId": "sess-abc123",
-      "issueIdentifier": "REN-42",
+      "issueIdentifier": "ENG-42",
       "workType": "development",
       "priority": 2,
       "queuedAt": 1714000000000
@@ -508,7 +508,7 @@ Example: `donmai admin merge-queue list --repo my-org/my-repo`:
 
 If you are moving from the previous TypeScript-based `pnpm af-*` scripts, see
 [migration-from-legacy-cli.md](https://github.com/RenseiAI/donmai-libraries/blob/main/docs/migration-from-legacy-cli.md)
-(REN-1365 in flight).
+(migration guide in flight).
 
 ---
 

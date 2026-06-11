@@ -28,7 +28,7 @@ func TestInstall_SkipServiceManager(t *testing.T) {
 	}
 
 	// ServiceCommand must register `daemon run` against the host binary —
-	// the locked REN-1406 decision.
+	// the locked service-entrypoint decision.
 	want := "/usr/local/bin/af daemon run"
 	if !strings.Contains(res.ServiceCommand, want) {
 		t.Errorf("expected ServiceCommand to contain %q, got %q", want, res.ServiceCommand)

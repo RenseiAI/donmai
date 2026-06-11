@@ -26,12 +26,15 @@ const (
 // every declared MCP tool/server becomes one functionDeclaration so the
 // model can call it.
 //
-// Native tools (Bash/Read/Edit/Write derived from AllowedTools) ARE
-// executed end-to-end by the session-local executor (handle.go ->
-// executor.go). MCP entries are surfaced for forward-compatibility, but
-// there is NO in-box MCP client: an mcp__* functionCall resolves to a
-// structured "not executable" error rather than being routed to a live
-// server. Capabilities.AcceptsMcpServerSpec is false to reflect this.
+// Native tools (Bash/Read/Edit/Write derived from AllowedTools) are
+// executed end-to-end by the session-local executor (handle.go →
+// executor.go). MCP servers initially get a catch-all per-server
+// declaration; once Spawn's MCP bridge has dialed the server and listed
+// its tools, mcpBridge.amendPlan (mcp.go) swaps the catch-all for the
+// real mcp__<server>__<tool> declarations, and the executor routes the
+// resulting mcp__* functionCalls to the live server. A server that fails
+// to connect keeps its catch-all and resolves calls to a structured
+// error.
 //
 // Returns nil when the session declares no tools (no AllowedTools, no
 // MCPToolNames, no MCPServers) so the request omits the tools field and
@@ -73,16 +76,16 @@ func toolsFromSpec(spec agent.Spec) []requestTool {
 	}
 
 	// MCP servers: expose one catch-all declaration per server keyed by
-	// the server name (we do not have the server's tool manifest at Spawn
-	// time). This is forward-compat only — there is no in-box MCP client,
-	// so a resulting mcp__* functionCall is NOT routed to a live server;
-	// the session-local executor returns a structured "not executable"
-	// error (Capabilities.AcceptsMcpServerSpec is false).
+	// the server name (the server's tool manifest is not known at plan
+	// build time). Spawn's MCP bridge replaces it with the discovered
+	// per-tool declarations via amendPlan; when the server cannot be
+	// reached the catch-all stays and the executor resolves calls to a
+	// structured error.
 	for _, s := range spec.MCPServers {
 		if s.Name == "" {
 			continue
 		}
-		add("mcp__"+s.Name, "MCP server (declared; not executable in the native runner): "+s.Name)
+		add("mcp__"+s.Name, "MCP server (declared): "+s.Name)
 	}
 
 	if len(decls) == 0 {
@@ -189,9 +192,13 @@ func thinkingConfigFor(spec agent.Spec, model string) *thinkingConfig {
 // Casing note: the Gemini REST API (generativelanguage.googleapis.com)
 // accepts lowercase values for thinkingConfig.thinkingLevel. The canonical
 // examples in the Google AI for Developers documentation
-// (https://ai.google.dev/gemini-api/docs/thinking) use lowercase
-// ("low", "medium", "high"), and the API rejects uppercase variants.
-// Lowercase is intentional here — do NOT change to uppercase.
+// (https://ai.google.dev/gemini-api/docs/thinking, re-verified 2026-06-10:
+// accepted values are minimal | low | medium | high, REST example
+// "thinkingLevel": "low") use lowercase, and the API rejects uppercase
+// variants. Lowercase is intentional here — do NOT change to uppercase.
+// Pinned by thinking_level_test.go: the enum/wire fixture tests run
+// always; TestLive_ThinkingLevelCasing (GEMINI_LIVE=1) probes the real
+// API in both casings.
 func thinkingLevelForEffort(e agent.EffortLevel) string {
 	switch e {
 	case agent.EffortLow:

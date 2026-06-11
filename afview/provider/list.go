@@ -14,7 +14,7 @@
 //
 // The CapabilityChip primitive from tui-components v0.2.0 is not yet
 // shipped; capability flags render as plain key=value pairs. Swap in
-// when REN-1331 lands.
+// when the shared theming pass lands.
 package provider
 
 import (
@@ -97,7 +97,7 @@ func NoColorEnv() bool {
 
 // ---- ANSI helpers -----------------------------------------------------------
 // These are intentionally minimal — a real refactor will replace them with
-// tui-components theme helpers once REN-1331 ships.
+// tui-components theme helpers once the shared theming pass ships.
 
 const (
 	ansiReset   = "\033[0m"

@@ -82,19 +82,19 @@ type DaemonStatsResponse struct {
 	Timestamp string `json:"timestamp"`
 
 	// WorkerID is the platform-assigned worker id (or stub fallback). Empty
-	// if registration has not yet completed. (REN-1446.)
+	// if registration has not yet completed.
 	WorkerID string `json:"workerId,omitempty"`
 	// Registration carries the human-readable registration status and the
-	// timestamp of the most recent successful heartbeat. (REN-1446.)
+	// timestamp of the most recent successful heartbeat.
 	Registration *DaemonRegistrationStats `json:"registration,omitempty"`
 	// AllowedProjects is the list of repositories in the daemon's allowlist
 	// (from daemon.yaml). May be empty when no projects have been
-	// configured. (REN-1446.)
+	// configured.
 	AllowedProjects []string `json:"allowedProjects,omitempty"`
 }
 
 // DaemonRegistrationStats summarises the daemon's connection to the platform
-// for `daemon stats` consumers. (REN-1446.)
+// for `daemon stats` consumers.
 type DaemonRegistrationStats struct {
 	// Status is the registration status reported in the most recent
 	// heartbeat: idle / busy / draining / stub / unregistered.
@@ -104,7 +104,7 @@ type DaemonRegistrationStats struct {
 	LastHeartbeatAt string `json:"lastHeartbeatAt,omitempty"`
 	// HeartbeatRunning reports whether the heartbeat goroutine is active.
 	HeartbeatRunning bool `json:"heartbeatRunning,omitempty"`
-	// PollRunning reports whether the poll goroutine is active. (REN-1441.)
+	// PollRunning reports whether the poll goroutine is active.
 	PollRunning bool `json:"pollRunning,omitempty"`
 }
 
@@ -261,7 +261,7 @@ func (c *DaemonClient) Update() (*DaemonActionResponse, error) {
 
 // GetPoolStats fetches the full workarea pool state, including per-member
 // detail and aggregate counts.  The daemon response includes Layer 6
-// correlation IDs so observability subscribers (REN-1313) can correlate events.
+// correlation IDs so observability subscribers can correlate events.
 func (c *DaemonClient) GetPoolStats() (*WorkareaPoolStats, error) {
 	var resp WorkareaPoolStats
 	if err := c.get("/api/daemon/pool/stats", &resp); err != nil {

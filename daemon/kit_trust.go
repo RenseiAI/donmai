@@ -29,7 +29,7 @@
 // The embedded trust root is the public Sigstore production trust root
 // (https://raw.githubusercontent.com/sigstore/sigstore-go/main/examples/trusted-root-public-good.json).
 // It will be replaced with a Rensei-published trust root once the
-// productionized signing CI from REN-1344 emits a Rensei-signed Fulcio +
+// productionized signing CI emits a vendor-signed Fulcio +
 // Rekor cert chain (Wave 13+ work).
 //
 // Q-audit-2 resolution (taken 2026-05-07 by /loop coordinator):
@@ -62,7 +62,7 @@ import (
 // https://raw.githubusercontent.com/sigstore/sigstore-go/main/examples/trusted-root-public-good.json.
 //
 // Ship-with-the-binary so the OSS daemon verifies bundles offline. To
-// be replaced with a Rensei-published trust root once REN-1344's
+// be replaced with a vendor-published trust root once the signing CI's
 // productionized signing CI emits Rensei-signed Fulcio + Rekor cert
 // chain (Wave 13+).
 //
@@ -127,7 +127,7 @@ type kitVerifier struct {
 // newKitVerifier constructs a verifier from the daemon's TrustConfig.
 //
 // The trust root is loaded from the embedded JSON; it will be replaced
-// with Rensei-signed material in Wave 13+ once REN-1344 productionizes
+// with vendor-signed material in Wave 13+ once the signing CI productionizes
 // the signing CI. Callers that want a different trust root (e.g.,
 // hermetic tests) construct via newKitVerifierWithMaterial.
 func newKitVerifier(cfg TrustConfig) (*kitVerifier, error) {
@@ -278,7 +278,7 @@ func buildIdentityPolicies(issuerSet []string) []verify.PolicyOption {
 	out := make([]verify.PolicyOption, 0, len(issuerSet))
 	for _, san := range issuerSet {
 		// san-as-exact-match; regex deferred to a Wave 13+ extension
-		// when ${REN-1344}'s Rensei issuer set materializes.
+		// when the productionized signing CI's issuer set materializes.
 		ident, err := verify.NewShortCertificateIdentity("", "", san, "")
 		if err != nil {
 			slog.Warn("kit verifier: skipping malformed issuer entry", //nolint:gosec // structured slog handler escapes values

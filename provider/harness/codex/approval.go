@@ -11,7 +11,7 @@ import (
 // ApprovalAction is the JSON value codex expects on approval responses.
 //
 // Mirrors the legacy TS ApprovalDecision.action union from
-// ../agentfactory/packages/core/src/providers/codex-approval-bridge.ts.
+// ../donmai-libraries/packages/core/src/providers/codex-approval-bridge.ts.
 type ApprovalAction string
 
 const (
@@ -60,7 +60,7 @@ type ApprovalRequest struct {
 
 // safetyDeny is a built-in deny pattern checked before any user-level
 // allow/deny rules. Mirrors the SAFETY_DENY_PATTERNS list from
-// ../agentfactory/packages/core/src/providers/safety-rules.ts but
+// ../donmai-libraries/packages/core/src/providers/safety-rules.ts but
 // trimmed to the rules that mattered most in production.
 //
 // Order matters — the FIRST match wins. Keep the most-specific rules

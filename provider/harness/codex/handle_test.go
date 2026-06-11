@@ -432,7 +432,7 @@ func TestHandle_StopIsIdempotent(t *testing.T) {
 }
 
 // TestHandle_EventChannelCloseRace_REN1460 is the regression test for
-// REN-1460: prior to the close-protocol fix, the events channel had
+// Prior to the close-protocol fix, the events channel had
 // multiple potential closers (failNow via onClientClose, forward's
 // defer, Stop) and multiple senders (emit / forward) with no shared
 // guard. Under -race -count=N, a forward goroutine could be in the
@@ -536,7 +536,7 @@ func TestHandle_EventChannelCloseRace_REN1460(t *testing.T) {
 			}
 		}
 
-		// Fire ctx cancel and Shutdown concurrently. Per REN-1460
+		// Fire ctx cancel and Shutdown concurrently. Per the close protocol
 		// these are the two close paths (forward's ctx.Done emit +
 		// failNow via onClientClose) that previously raced.
 		var wg sync.WaitGroup
@@ -571,7 +571,7 @@ func TestHandle_EventChannelCloseRace_REN1460(t *testing.T) {
 // Stop race directly without the fakeServer overhead. Both paths used
 // to share closeOnce and could leave the events channel half-closed
 // (h.closed closed but h.events not, or vice versa) depending on which
-// goroutine won the closeOnce. After REN-1460 they share the
+// goroutine won the closeOnce. After the close-protocol fix they share the
 // idempotent closeEvents + signalClosed helpers and converge cleanly.
 func TestHandle_FailNowAndStopRaceClosingEvents(t *testing.T) {
 	t.Parallel()

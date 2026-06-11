@@ -26,7 +26,7 @@ const (
 )
 
 // FailureBudgetExceeded classifies a session that hit a stage-budget
-// cap (REN-1485 / REN-1487 Phase 2 acceptance criterion #4). The
+// cap. The
 // per-cap details live on Result.BudgetReport.
 const FailureBudgetExceeded = "budget-exceeded"
 

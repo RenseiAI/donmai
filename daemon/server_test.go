@@ -377,7 +377,7 @@ func TestServer_StopEndpointTransitionsState(t *testing.T) {
 }
 
 // TestServer_Compatibility_Endpoints_Match_Client verifies the server speaks
-// the exact paths consumed by afclient.DaemonClient (REN-1336 contract).
+// the exact paths consumed by afclient.DaemonClient (contract).
 func TestServer_Compatibility_Endpoints_Match_Client(t *testing.T) {
 	_, srv, cleanup := mustStartDaemon(t)
 	defer cleanup()
@@ -495,14 +495,14 @@ func TestServer_PoolStats_UsesProvider(t *testing.T) {
 
 // TestServer_SessionDetail_HappyPath verifies the
 // /api/daemon/sessions/<id> endpoint returns the SessionDetail
-// recorded by AcceptWorkWithDetail. (REN-1461 / F.2.8.)
+// recorded by AcceptWorkWithDetail.
 func TestServer_SessionDetail_HappyPath(t *testing.T) {
 	d, srv, cleanup := mustStartDaemon(t)
 	defer cleanup()
 
 	want := &SessionDetail{
 		SessionID:       "sess-detail-1",
-		IssueIdentifier: "REN-9001",
+		IssueIdentifier: "ENG-9001",
 		Repository:      "github.com/foo/bar",
 		Ref:             "main",
 		WorkType:        "development",

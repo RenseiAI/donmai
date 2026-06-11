@@ -31,8 +31,11 @@ var ErrSessionNotReady = errors.New("provider/gemini: session not ready; wait fo
 // sessionParams bundles the pre-spawn inputs Provider.Spawn passes into
 // startSession.
 type sessionParams struct {
-	apiKey    string
-	endpoint  string
+	apiKey string
+	// turnURL is the fully-resolved generateContent URL for this session
+	// (base endpoint + host-shaped path + model), computed once by
+	// Provider.Spawn via spawnURL so the driver never re-derives routing.
+	turnURL   string
 	model     string
 	plan      spawnPlan
 	client    *http.Client
@@ -41,6 +44,10 @@ type sessionParams struct {
 	// directory native tools run in + per-session environment for Bash).
 	cwd string
 	env map[string]string
+	// mcp is the per-session MCP bridge (nil when the spec declares no
+	// MCP servers). The executor routes mcp__* calls through it; the
+	// driver closes it on exit.
+	mcp *mcpBridge
 	// maxTurns is the maximum number of generateContent round-trips
 	// (agentic turns) allowed before the driver terminates with an
 	// error_max_turns result. 0 means uncapped.
@@ -68,15 +75,19 @@ type injectMsg struct {
 type Handle struct {
 	sessionID string
 	apiKey    string
-	endpoint  string
+	turnURL   string
 	model     string
 	plan      spawnPlan
 	client    *http.Client
 
 	// executor runs the model's functionCalls (native filesystem / shell
-	// tools) and folds the functionResponse back into the loop. The
-	// Gemini REST endpoint does not execute tools itself.
+	// tools + bridged MCP tools) and folds the functionResponse back into
+	// the loop. The Gemini REST endpoint does not execute tools itself.
 	executor *toolExecutor
+
+	// mcp is the per-session MCP bridge (nil without MCP servers); closed
+	// by the driver on exit so server subprocesses/sessions are released.
+	mcp *mcpBridge
 
 	// maxTurns caps the number of generateContent round-trips (agentic
 	// turns). 0 means uncapped. When the cap is hit the driver emits a
@@ -125,11 +136,12 @@ func startSession(ctx context.Context, p sessionParams) (*Handle, error) {
 	h := &Handle{
 		sessionID: p.sessionID,
 		apiKey:    p.apiKey,
-		endpoint:  p.endpoint,
+		turnURL:   p.turnURL,
 		model:     p.model,
 		plan:      p.plan,
 		client:    client,
-		executor:  newToolExecutor(p.cwd, p.env),
+		executor:  newToolExecutor(p.cwd, p.env, p.mcp),
+		mcp:       p.mcp,
 		maxTurns:  p.maxTurns,
 		events:    make(chan agent.Event, eventBufferSize),
 		cancel:    cancel,
@@ -196,6 +208,7 @@ func (h *Handle) Stop(_ context.Context) error {
 // Closes the events channel exactly once on exit.
 func (h *Handle) drive(ctx context.Context) {
 	defer h.closeEvents()
+	defer h.mcp.Close() // nil-safe; releases bridged MCP server connections
 
 	for {
 		select {
@@ -372,8 +385,7 @@ func (h *Handle) buildTurnBody() ([]byte, error) {
 // body. Non-200 responses surface as an error wrapping the status + body
 // tail.
 func (h *Handle) postTurn(ctx context.Context, body []byte) ([]byte, error) {
-	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent", h.endpoint, h.model)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.turnURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}

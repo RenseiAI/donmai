@@ -14,7 +14,7 @@ import (
 //
 // Wire shape: matches the platform Redis session payload at
 // "agent:session:<id>" verbatim. F.1.1 §1 + the live payload observed
-// during F.2.7 (REN2-1) drive the field set.
+// during F.2.7 drive the field set.
 type QueuedWork struct {
 	prompt.QueuedWork
 
@@ -82,7 +82,7 @@ type ResolvedProfile struct {
 }
 
 // isInterview reports whether this QueuedWork runs the interactive
-// interview loop (REN-1563) rather than the one-shot headless path. The
+// interview loop rather than the one-shot headless path. The
 // discriminant is the platform-frozen Mode value (CONTRACT-FREEZE §4 /
 // internal/interview.InterviewRunMode). Anything else (including the empty
 // string) is a normal headless run.
@@ -118,7 +118,7 @@ type Result struct {
 	SessionID string `json:"sessionId,omitempty"`
 
 	// IssueIdentifier is the human-readable issue identifier (e.g.
-	// "REN-1459"). Echoed for log correlation.
+	// "ENG-1459"). Echoed for log correlation.
 	IssueIdentifier string `json:"issueIdentifier,omitempty"`
 
 	// StartedAt is the unix-ms timestamp when [Runner.Run] entered
@@ -133,7 +133,7 @@ type Result struct {
 	SteeringTriggered bool `json:"steeringTriggered,omitempty"`
 
 	// PostSessionWarnings collects non-fatal warnings raised by the
-	// post-session block (REN-1467) — e.g. "Linear updateIssueStatus
+	// post-session block — e.g. "Linear updateIssueStatus
 	// failed: …" or "diagnostic comment post failed: …". These are
 	// strictly observability — they do NOT change the session's
 	// terminal Status. Surface them in operator dashboards so a
@@ -141,14 +141,14 @@ type Result struct {
 	PostSessionWarnings []string `json:"postSessionWarnings,omitempty"`
 
 	// LinearStatusTransition records the result of the post-session
-	// Linear status-update attempt (REN-1467). Empty when no
+	// Linear status-update attempt. Empty when no
 	// transition was attempted (non-result-sensitive type with no
 	// mapping, or marker was unknown). Non-nil even on failure so the
 	// caller can correlate dashboard signals to runner logs.
 	LinearStatusTransition *LinearStatusTransition `json:"linearStatusTransition,omitempty"`
 
-	// BudgetReport captures the per-stage budget enforcement record
-	// (REN-1485 / REN-1487 Phase 2 acceptance criterion #4). Non-nil
+	// BudgetReport captures the per-stage budget enforcement record.
+	// Non-nil
 	// for every Run; the .Enforced flag distinguishes
 	// stage-dispatched work (caps configured) from legacy work
 	// (caps absent). When a cap was breached .CapBreached + .BreachDetail

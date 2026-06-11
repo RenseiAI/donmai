@@ -351,7 +351,7 @@ func newDaemonStatusCmd(factory daemonClientFactory, bin string) *cobra.Command 
 }
 
 // writeDaemonStatusTable renders a simple ANSI status block for `donmai daemon status`.
-// Uses plain ANSI (not tui-components primitives per issue note — those are REN-1331).
+// Uses plain ANSI (not tui-components primitives — those arrive with the shared theming pass).
 func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error {
 	statusColor := ansiColor(r.Status)
 	uptime := formatUptimeSeconds(r.UptimeSeconds)
@@ -850,7 +850,7 @@ type poolKey struct {
 //  2. Per-(repo, toolchain) breakdown table sorted by repo+toolchain.
 //
 // Simple ANSI rendering only — WorkareaPoolPanel from tui-components v0.2.0
-// is deferred to REN-1331.
+// is deferred to the shared tui-components theming pass.
 func writePoolStatsSection(w io.Writer, p *afclient.WorkareaPoolStats) error {
 	if _, err := fmt.Fprintln(w, "\n  Workarea pool:"); err != nil {
 		return fmt.Errorf("write pool header: %w", err)
@@ -964,7 +964,7 @@ func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 			"created, if never acquired) more than --older-than ago are retired.\n" +
 			"In-use (acquired) members are not evicted.\n\n" +
 			"The daemon emits a Layer 6 hook event for each eviction; the correlation\n" +
-			"ID is printed so observability dashboards (REN-1313) can join it.",
+			"ID is printed so observability dashboards can join it.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if repoURL == "" {
@@ -1231,7 +1231,6 @@ func padRight(s string, w int) string {
 
 // formatWorkerStat renders the "Worker:" row of `daemon stats`. Returns a
 // short description of the worker id with stub annotation when applicable.
-// (REN-1446.)
 func formatWorkerStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || r.WorkerID == "" {
 		return "(unregistered)"
@@ -1243,7 +1242,6 @@ func formatWorkerStat(r *afclient.DaemonStatsResponse) string {
 }
 
 // formatRegistrationStat renders the "Registration:" row of `daemon stats`.
-// (REN-1446.)
 func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || r.Registration == nil {
 		return "(unknown)"
@@ -1271,7 +1269,7 @@ func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 
 // formatAllowedProjectsStat renders the "Allowed projects:" row of
 // `daemon stats`. The output is the count followed by a comma-separated
-// list of repo URLs (truncated for very long lists). (REN-1446.)
+// list of repo URLs (truncated for very long lists).
 func formatAllowedProjectsStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || len(r.AllowedProjects) == 0 {
 		return "0 (none allowed — run `donmai project allow <repo-url>`)"

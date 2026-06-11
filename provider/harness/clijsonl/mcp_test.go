@@ -51,7 +51,7 @@ func TestWriteMCPConfig_HappyPath(t *testing.T) {
 	if !strings.HasSuffix(path, ".json") {
 		t.Errorf("path %q should end in .json", path)
 	}
-	if !strings.Contains(path, "agentfactory-claude-mcp-") {
+	if !strings.Contains(path, "donmai-claude-mcp-") {
 		t.Errorf("path %q should contain session prefix", path)
 	}
 
@@ -115,7 +115,7 @@ func TestRemoveMCPConfig_Idempotent(t *testing.T) {
 	if err := removeMCPConfig(""); err != nil {
 		t.Errorf("remove of empty path returned error: %v", err)
 	}
-	if err := removeMCPConfig("/tmp/agentfactory-claude-mcp-does-not-exist.json"); err != nil {
+	if err := removeMCPConfig("/tmp/donmai-claude-mcp-does-not-exist.json"); err != nil {
 		t.Errorf("remove of missing file returned error: %v", err)
 	}
 

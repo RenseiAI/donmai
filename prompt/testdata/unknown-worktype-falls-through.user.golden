@@ -1,8 +1,8 @@
-Start work on REN2-1.
+Start work on DEV-1.
 
 # Issue context
 
-<issue identifier="REN2-1">
+<issue identifier="DEV-1">
 <title>Wave 6 smoke test — daemon E2E verification</title>
 <description>
 rensei please create a file `hello-from-wave6.md` at the repo root containing a single line with the current ISO-8601 UTC timestamp, then commit and open a PR.
@@ -18,7 +18,7 @@ rensei please create a file `hello-from-wave6.md` at the repo root containing a 
 3. Commit on the worktree's branch.
 4. Push the branch (`git push -u origin <branch>`).
 5. Open a pull request (`gh pr create --base main --head <branch>`) targeting the repository at github.com/RenseiAI/rensei-smokes-alpha.
-6. Post the PR link as a comment on REN2-1 via `donmai linear create-comment`.
+6. Post the PR link as a comment on DEV-1 via `donmai linear create-comment`.
 7. End your final assistant message with exactly one marker so the orchestrator can transition the issue:
 
    - `WORK_RESULT:passed` when the implementation is complete, all checks pass, and the PR is open.

@@ -46,7 +46,7 @@ var kitLoadSkills = kit.LoadSkills
 //  9. Stream events
 //  10. Wait for terminal event
 //  11. Tail recovery (steering → backstop)
-//     11b. Linear state transition (REN-1467) — parse WORK_RESULT,
+//     11b. Linear state transition — parse WORK_RESULT,
 //     resolve target status from sdlc.go, post update via the
 //     issue-tracker proxy. Failures recorded as PostSessionWarnings;
 //     never fatal.
@@ -64,7 +64,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	}
 	res.ProviderName = qw.resolvedProvider()
 
-	// REN-1485 / REN-1487 Phase 2: log which dispatch path is in use
+	// Log which dispatch path is in use
 	// so operators can grep one session end-to-end through the
 	// stage-vs-legacy fork. `mode=stage` means the platform's new
 	// `agent.dispatch_stage` action queued this work and the runner is
@@ -81,7 +81,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		"mode", stageMode,
 	)
 
-	// REN-1485 / REN-1487 acceptance criterion #4 — sub-agent budget
+	// Sub-agent budget
 	// enforcement. The enforcer is always constructed; when qw.StageBudget
 	// is nil (legacy path) it is a disabled no-op so the runner can
 	// observe events through it unconditionally.
@@ -256,12 +256,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}
 	}
 
-	// Interview mode (REN-1563): prepend the hardened interview persona to
+	// Interview mode: prepend the hardened interview persona to
 	// the upstream-supplied system-prompt override BEFORE rendering so the
 	// prompt builder emits persona-first (the builder uses
 	// SystemPromptOverride verbatim as the entire system prompt). The
 	// persona pins the agent into one-question-per-turn / thinking-only
-	// behaviour and survives a cloned-repo CLAUDE.md (REN-1570 proves the
+	// behaviour and survives a cloned-repo CLAUDE.md (a live sandbox run proves the
 	// hostile-CLAUDE.md case in a live sandbox). Headless runs are
 	// untouched — this only fires when qw.Mode == interview.
 	if qw.isInterview() {
@@ -312,7 +312,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		spec.DisallowedTools = append(spec.DisallowedTools, kitDisallowedTools...)
 	}
 
-	// Interview mode (REN-1563 / REN-1570): lock down the tool surface at
+	// Interview mode: lock down the tool surface at
 	// the Spec level for interview sessions. Two categories:
 	//
 	//   1. AskUserQuestion — turn-taking happens via claude --resume (the
@@ -329,8 +329,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	//      Belt-and-suspenders: disallow them structurally at the Spec level so
 	//      the provider rejects any attempt to invoke them regardless of what
 	//      the persona or CLAUDE.md says.  The structural proof is in
-	//      runner/interview_persona_hostile_test.go (REN-1570); the behavioural
-	//      proof against a live hostile-repo sandbox is REN-1572 (W5).
+	//      runner/interview_persona_hostile_test.go; the behavioural
+	//      proof against a live hostile-repo sandbox is deferred to follow-up work.
 	if qw.isInterview() {
 		spec.DisallowedTools = append(spec.DisallowedTools,
 			"AskUserQuestion",
@@ -503,7 +503,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		defer func() { _ = actPoster.Stop() }()
 	}
 
-	// ── Interview run-mode branch (REN-1563) ─────────────────────────────
+	// ── Interview run-mode branch ─────────────────────────────
 	//
 	// When qw.Mode == "interview" the runner drives the non-terminating
 	// park-and-inject loop instead of the one-shot consumeEvents → drain →
@@ -563,7 +563,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	default:
 	}
 
-	// Budget-exceeded short-circuit (REN-1485 / REN-1487 acceptance #4).
+	// Budget-exceeded short-circuit.
 	// Either the enforcer surfaced *BudgetExceededError directly via
 	// streamErr, or the wall-clock deadline tripped streamCtx and we
 	// detect the breach now via CheckDuration. Either way the failure
@@ -678,8 +678,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}
 	}
 
-	// Attach the budget enforcement report on the success path
-	// (REN-1485 / REN-1487 acceptance #4). Always non-nil; when
+	// Attach the budget enforcement report on the success path.
+	// Always non-nil; when
 	// .Enforced is false (legacy work, no StageBudget) it serves as a
 	// "no budget enforced" observation record. Breach paths attach the
 	// report on the failure short-circuit above.
@@ -687,7 +687,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		res.BudgetReport = enforcer.Report(r.now())
 	}
 
-	// 11b. Post-session Linear state transition (REN-1467). Runs after
+	// 11b. Post-session Linear state transition. Runs after
 	// the Result.Status has been finalised so resolveTargetStatus sees
 	// the same "completed"/"failed" classification the platform will
 	// receive. Skipped when SkipPostSession is set, or when the runner
@@ -927,7 +927,7 @@ func (r *Runner) consumeEvents(
 			// failure rather than stalling the runner). Lives next to
 			// observeEvent so steering's tail consume picks it up too.
 			sink.Send(ctx, ev)
-			// Budget enforcement (REN-1485 / REN-1487 acceptance #4):
+			// Budget enforcement:
 			// every event flows through the enforcer; on a cap breach
 			// we surface the *BudgetExceededError so runLoop can
 			// classify the failure as FailureBudgetExceeded.

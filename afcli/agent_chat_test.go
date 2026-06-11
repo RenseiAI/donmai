@@ -131,8 +131,8 @@ func TestAgentChatArgValidation(t *testing.T) {
 		args []string
 	}{
 		{name: "zero_args", args: []string{"chat"}},
-		{name: "one_arg", args: []string{"chat", "SUP-674"}},
-		{name: "three_args", args: []string{"chat", "SUP-674", "hello", "world"}},
+		{name: "one_arg", args: []string{"chat", "OPS-674"}},
+		{name: "three_args", args: []string{"chat", "OPS-674", "hello", "world"}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -166,7 +166,7 @@ func TestAgentChatEmptyMessageSkipsRPC(t *testing.T) {
 		t.Run(m.name, func(t *testing.T) {
 			t.Parallel()
 			ds := &chatStubDataSource{failIfInvoked: t}
-			_, err := runChatWithStub(t, ds, []string{"SUP-674", m.message})
+			_, err := runChatWithStub(t, ds, []string{"OPS-674", m.message})
 			if err == nil {
 				t.Fatal("expected error for empty message, got nil")
 			}
@@ -185,11 +185,11 @@ func TestAgentChatMockHumanMode(t *testing.T) {
 
 	mock := afclient.NewMockClient()
 	ds := func() afclient.DataSource { return mock }
-	cmd, buf := newTestAgentCmd(ds, []string{"chat", "SUP-674", "hello"})
+	cmd, buf := newTestAgentCmd(ds, []string{"chat", "OPS-674", "hello"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	const want = "forwarded prompt mock-prm-1 to SUP-674 (status: running)\n"
+	const want = "forwarded prompt mock-prm-1 to OPS-674 (status: running)\n"
 	if got := buf.String(); got != want {
 		t.Errorf("stdout = %q, want %q", got, want)
 	}
@@ -200,7 +200,7 @@ func TestAgentChatMockJSONMode(t *testing.T) {
 
 	mock := afclient.NewMockClient()
 	ds := func() afclient.DataSource { return mock }
-	cmd, buf := newTestAgentCmd(ds, []string{"chat", "--json", "SUP-674", "hello"})
+	cmd, buf := newTestAgentCmd(ds, []string{"chat", "--json", "OPS-674", "hello"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -215,11 +215,11 @@ func TestAgentChatMockJSONMode(t *testing.T) {
 	if resp.PromptID != "mock-prm-1" {
 		t.Errorf("PromptID = %q, want %q", resp.PromptID, "mock-prm-1")
 	}
-	if resp.TaskID != "SUP-674" {
-		t.Errorf("TaskID = %q, want %q", resp.TaskID, "SUP-674")
+	if resp.TaskID != "OPS-674" {
+		t.Errorf("TaskID = %q, want %q", resp.TaskID, "OPS-674")
 	}
-	if resp.IssueID != "SUP-674" {
-		t.Errorf("IssueID = %q, want %q", resp.IssueID, "SUP-674")
+	if resp.IssueID != "OPS-674" {
+		t.Errorf("IssueID = %q, want %q", resp.IssueID, "OPS-674")
 	}
 	if resp.SessionStatus != "running" {
 		t.Errorf("SessionStatus = %q, want %q", resp.SessionStatus, "running")
@@ -233,7 +233,7 @@ func TestAgentChatSentinelPropagation(t *testing.T) {
 	t.Parallel()
 
 	ds := &chatStubDataSource{forwardErr: afclient.ErrNotFound}
-	_, err := runChatWithStub(t, ds, []string{"SUP-674", "hello"})
+	_, err := runChatWithStub(t, ds, []string{"OPS-674", "hello"})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -255,7 +255,7 @@ func TestAgentChatHTTPNotFound(t *testing.T) {
 
 	client := afclient.NewClient(srv.URL)
 	ds := func() afclient.DataSource { return client }
-	cmd, _ := newTestAgentCmd(ds, []string{"chat", "SUP-674", "hello"})
+	cmd, _ := newTestAgentCmd(ds, []string{"chat", "OPS-674", "hello"})
 	err := cmd.Execute()
 	if err == nil {
 		t.Fatal("expected error for 404, got nil")

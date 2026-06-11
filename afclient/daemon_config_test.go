@@ -10,7 +10,7 @@ import (
 )
 
 // TestWriteDaemonYAML_PreservesFullShape is the regression test for the
-// v0.4.1 follow-up to REN-1419: `rensei project allow <repo>` must NOT
+// v0.4.1 follow-up: `rensei project allow <repo>` must NOT
 // clobber unrelated top-level keys in daemon.yaml. The previous writer
 // marshalled the partial DaemonYAML struct directly and dropped
 // apiVersion / kind / machine / orchestrator / autoUpdate, leaving a file
@@ -133,7 +133,7 @@ func TestWriteDaemonYAML_StableYAMLShape(t *testing.T) {
 
 // TestWriteDaemonYAML_PopulatesProjectID confirms that a project entry written
 // without an explicit ID gets a derived id, satisfying the daemon reader's
-// `projects[i].id is required` validation (REN-1443).
+// `projects[i].id is required` validation.
 func TestWriteDaemonYAML_PopulatesProjectID(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

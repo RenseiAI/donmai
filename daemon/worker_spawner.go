@@ -407,7 +407,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		// should always have WorkerCommand set (see daemon.go's
 		// defaultWorkerCommand). Surfacing this at warn level so
 		// operators notice when the daemon has fallen back to the
-		// test stub. (REN-1461.)
+		// test stub.
 		slog.Warn("worker spawner: WorkerCommand not set; using /bin/sh test stub (sessions exit immediately — set WorkerCommand or deploy a binary that resolves via os.Executable)",
 			"sessionId", spec.SessionID,
 		)

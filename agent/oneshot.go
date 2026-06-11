@@ -93,7 +93,7 @@ type OneShotProvider interface {
 // 02-two-axis-architecture.md §3.5. A provider that implements OneShotProvider
 // (pure direct-API one-shot) is used directly; every HarnessProvider otherwise
 // rides SpawnComplete, which delivers strict output when the harness honors
-// Spec.ResponseSchema (Caps.NativeJSONMode — gemini/ollama) and soft output
+// Spec.ResponseSchema (Caps.NativeJSONMode — gemini/ollama/codex) and soft output
 // (prompt-instructed, validate-repair-drop) otherwise. Callers (KG, arch-intel)
 // should call Complete, not SpawnComplete, so the strategy stays config-resolved.
 func Complete(ctx context.Context, h HarnessProvider, req OneShotRequest) (OneShotResult, error) {
@@ -106,8 +106,9 @@ func Complete(ctx context.Context, h HarnessProvider, req OneShotRequest) (OneSh
 // SpawnComplete gives any HarnessProvider the one-shot lane for free: spawn an
 // interactive session, drive it to terminal, and project the assistant output
 // onto a OneShotResult. Native-JSON harnesses (raw) override with a direct
-// Complete(); everything else (claude-code, codex, amp, antigravity, opencode,
-// stub) rides this soft path.
+// Complete(); codex stays on this path but threads Spec.ResponseSchema as
+// turn/start outputSchema (native strict); everything else (claude-code, amp,
+// antigravity, opencode, stub) rides this soft path.
 //
 // SOFT JSON: when req.ResponseSchema is set, the schema instruction is appended
 // to the prompt and the collected text is run through extractAndValidate. A
@@ -186,7 +187,7 @@ drain:
 // specFromOneShot translates a OneShotRequest into the interactive Spec
 // SpawnComplete drives. The schema is delivered TWO ways so one path fits every
 // harness: (1) Spec.ResponseSchema — honored natively (STRICT, server-enforced)
-// by NativeJSONMode harnesses (gemini/ollama); (2) a soft prompt instruction
+// by NativeJSONMode harnesses (gemini/ollama/codex); (2) a soft prompt instruction
 // appended for harnesses that have no JSON-schema flag (the CLI/pty harnesses,
 // validate-repair-drop). Setting both is safe: a native harness reads
 // Spec.ResponseSchema and the redundant instruction only reinforces it; a soft

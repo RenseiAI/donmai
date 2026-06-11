@@ -12,7 +12,7 @@ import (
 // binary guard. When the running executable is a Go test binary
 // (`<pkg>.test`), defaultWorkerCommand returns nil so callers fall
 // through to the spawner's /bin/sh stub instead of recursing into
-// the test runner. (REN-1461 / F.2.8.)
+// the test runner.
 func TestDefaultWorkerCommand_ReturnsNilUnderGoTest(t *testing.T) {
 	got := defaultWorkerCommand()
 	// Two acceptable outcomes:

@@ -92,7 +92,7 @@ func (s *stubDataSource) ForwardPrompt(_ afclient.ForwardPromptRequest) (*afclie
 	return &afclient.ForwardPromptResponse{}, nil
 }
 
-// Architecture-aware stub methods (REN-1333). Return empty-but-non-nil values
+// Architecture-aware stub methods. Return empty-but-non-nil values
 // so callers can safely introspect length and structure in tests.
 
 func (s *stubDataSource) GetStatsV2() (*afclient.StatsResponseV2, error) {

@@ -13,7 +13,7 @@ import (
 // provider subprocess.
 //
 // The list mirrors AGENT_ENV_BLOCKLIST in
-// ../agentfactory/packages/core/src/orchestrator/orchestrator.ts and
+// ../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts and
 // agent-spawner.ts verbatim. It captures the sensitive Anthropic auth
 // surface plus the OpenClaw gateway token; provider implementations
 // inject their credential of choice through Spec.Env (which is NOT

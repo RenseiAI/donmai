@@ -4,7 +4,7 @@ Renders work-type-specific (system, user) prompt pairs for the
 donmai Go agent runner.
 
 This is the v0.5.0 port of the legacy TS template subsystem
-(`../agentfactory/packages/core/src/templates/{registry,renderer}.ts`)
+(`../donmai-libraries/packages/core/src/templates/{registry,renderer}.ts`)
 boiled down to the minimum surface F.2 needs: take a `QueuedWork`
 (the Redis session JSON shape the daemon's poll loop already decodes),
 return two strings.
@@ -17,13 +17,13 @@ import "github.com/RenseiAI/donmai/prompt"
 var b prompt.Builder
 system, user, err := b.Build(prompt.QueuedWork{
     SessionID:       "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c",
-    IssueIdentifier: "REN-123",
+    IssueIdentifier: "ENG-123",
     ProjectName:     "smoke-alpha",
     OrganizationID:  "org_xxx",
     Repository:      "github.com/RenseiAI/rensei-smokes-alpha",
     Ref:             "main",
     WorkType:        string(prompt.WorkTypeDevelopment),
-    PromptContext:   "<issue identifier=\"REN-123\">…</issue>",
+    PromptContext:   "<issue identifier=\"ENG-123\">…</issue>",
 })
 ```
 

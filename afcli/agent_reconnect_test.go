@@ -251,17 +251,17 @@ func TestAgentReconnectPassesResumeHints(t *testing.T) {
 	}{
 		{
 			name:       "cursor_only",
-			args:       []string{"--cursor", "2026-04-15T10:00:00Z", "SUP-674"},
+			args:       []string{"--cursor", "2026-04-15T10:00:00Z", "OPS-674"},
 			wantCursor: ptr("2026-04-15T10:00:00Z"),
 		},
 		{
 			name:            "last_event_id_only",
-			args:            []string{"--last-event-id", "evt_abc123", "SUP-674"},
+			args:            []string{"--last-event-id", "evt_abc123", "OPS-674"},
 			wantLastEventID: ptr("evt_abc123"),
 		},
 		{
 			name:            "both_hints",
-			args:            []string{"--cursor", "2026-04-15T10:00:00Z", "--last-event-id", "evt_abc123", "SUP-674"},
+			args:            []string{"--cursor", "2026-04-15T10:00:00Z", "--last-event-id", "evt_abc123", "OPS-674"},
 			wantCursor:      ptr("2026-04-15T10:00:00Z"),
 			wantLastEventID: ptr("evt_abc123"),
 		},
@@ -275,7 +275,7 @@ func TestAgentReconnectPassesResumeHints(t *testing.T) {
 			ds := &reconnectStubDataSource{
 				reconnectResp: &afclient.ReconnectSessionResponse{
 					Reconnected:   true,
-					SessionID:     "SUP-674",
+					SessionID:     "OPS-674",
 					SessionStatus: afclient.StatusWorking,
 					MissedEvents:  2,
 				},
@@ -288,8 +288,8 @@ func TestAgentReconnectPassesResumeHints(t *testing.T) {
 			if ds.reconnectCalls != 1 {
 				t.Fatalf("ReconnectSession call count = %d, want 1", ds.reconnectCalls)
 			}
-			if ds.lastID != "SUP-674" {
-				t.Errorf("session id = %q, want %q", ds.lastID, "SUP-674")
+			if ds.lastID != "OPS-674" {
+				t.Errorf("session id = %q, want %q", ds.lastID, "OPS-674")
 			}
 			switch {
 			case tc.wantCursor == nil && ds.lastReq.Cursor != nil:
@@ -303,7 +303,7 @@ func TestAgentReconnectPassesResumeHints(t *testing.T) {
 			case tc.wantLastEventID != nil && (ds.lastReq.LastEventID == nil || *ds.lastReq.LastEventID != *tc.wantLastEventID):
 				t.Fatalf("lastEventID = %v, want %q", ds.lastReq.LastEventID, *tc.wantLastEventID)
 			}
-			if out != "reconnected to SUP-674 (status: working, missed: 2 events)\n" {
+			if out != "reconnected to OPS-674 (status: working, missed: 2 events)\n" {
 				t.Errorf("unexpected output: %q", out)
 			}
 		})
@@ -316,7 +316,7 @@ func TestAgentReconnectCommandPassesResumeHints(t *testing.T) {
 	ds := &reconnectStubDataSource{
 		reconnectResp: &afclient.ReconnectSessionResponse{
 			Reconnected:   true,
-			SessionID:     "SUP-674",
+			SessionID:     "OPS-674",
 			SessionStatus: afclient.StatusWorking,
 			MissedEvents:  2,
 		},
@@ -326,7 +326,7 @@ func TestAgentReconnectCommandPassesResumeHints(t *testing.T) {
 		"reconnect",
 		"--cursor", "2026-04-15T10:00:00Z",
 		"--last-event-id", "evt_abc123",
-		"SUP-674",
+		"OPS-674",
 	})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -346,14 +346,14 @@ func TestAgentReconnectSentinelPropagation(t *testing.T) {
 	t.Parallel()
 
 	ds := &reconnectStubDataSource{reconnectErr: afclient.ErrNotFound}
-	_, err := runReconnectWithStub(t, ds, []string{"SUP-674"})
+	_, err := runReconnectWithStub(t, ds, []string{"OPS-674"})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
 	if !errors.Is(err, afclient.ErrNotFound) {
 		t.Errorf("errors.Is(err, afclient.ErrNotFound) = false; err = %v", err)
 	}
-	if !strings.Contains(err.Error(), "reconnect session SUP-674") {
+	if !strings.Contains(err.Error(), "reconnect session OPS-674") {
 		t.Errorf("expected reconnect wrapper; got: %v", err)
 	}
 }
@@ -364,20 +364,20 @@ func TestAgentReconnectDeclined(t *testing.T) {
 	ds := &reconnectStubDataSource{
 		reconnectResp: &afclient.ReconnectSessionResponse{
 			Reconnected:   false,
-			SessionID:     "SUP-674",
+			SessionID:     "OPS-674",
 			SessionStatus: afclient.StatusQueued,
 			MissedEvents:  0,
 		},
 	}
 
-	out, err := runReconnectWithStub(t, ds, []string{"SUP-674"})
+	out, err := runReconnectWithStub(t, ds, []string{"OPS-674"})
 	if err == nil {
 		t.Fatal("expected declined reconnect error, got nil")
 	}
 	if out != "" {
 		t.Errorf("stdout = %q, want empty output", out)
 	}
-	if !strings.Contains(err.Error(), "reconnect declined for SUP-674") {
+	if !strings.Contains(err.Error(), "reconnect declined for OPS-674") {
 		t.Errorf("expected declined reconnect error; got: %v", err)
 	}
 }
@@ -388,18 +388,18 @@ func TestAgentReconnectCommandDeclined(t *testing.T) {
 	ds := &reconnectStubDataSource{
 		reconnectResp: &afclient.ReconnectSessionResponse{
 			Reconnected:   false,
-			SessionID:     "SUP-674",
+			SessionID:     "OPS-674",
 			SessionStatus: afclient.StatusQueued,
 			MissedEvents:  0,
 		},
 	}
 
-	cmd, _ := newTestAgentCmd(func() afclient.DataSource { return ds }, []string{"reconnect", "SUP-674"})
+	cmd, _ := newTestAgentCmd(func() afclient.DataSource { return ds }, []string{"reconnect", "OPS-674"})
 	err := cmd.Execute()
 	if err == nil {
 		t.Fatal("expected declined reconnect error, got nil")
 	}
-	if !strings.Contains(err.Error(), "reconnect declined for SUP-674") {
+	if !strings.Contains(err.Error(), "reconnect declined for OPS-674") {
 		t.Errorf("expected declined reconnect error; got: %v", err)
 	}
 }

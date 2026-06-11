@@ -66,7 +66,7 @@ type CredentialHelper struct {
 // ProjectEntry is one entry in the daemon.yaml `projects` list.
 //
 // The yaml key for the repo URL is `repository`, matching the daemon-side
-// reader (daemon.ProjectConfig). REN-1419 renamed this from `repoUrl` to
+// reader (daemon.ProjectConfig). A past release renamed this from `repoUrl` to
 // align writer + reader after a schema-drift bug where the writer emitted
 // `repoUrl` but the reader looked for `repository`, causing
 // `rensei daemon stats` to report `Projects: 0 allowed` after a successful
@@ -76,7 +76,7 @@ type CredentialHelper struct {
 // (see UnmarshalYAML below) so pre-fix files in the wild still load.
 type ProjectEntry struct {
 	// ID is the daemon-side project identifier. The daemon reader requires
-	// projects[i].id (see daemon/config.go validateConfig); REN-1443
+	// projects[i].id (see daemon/config.go validateConfig); DeriveProjectID
 	// derives it automatically from the repo URL when the caller does not
 	// set one (DeriveProjectID).
 	ID string `yaml:"id,omitempty" json:"id,omitempty"`
@@ -89,8 +89,8 @@ type ProjectEntry struct {
 	CredentialHelper *CredentialHelper `yaml:"credentialHelper,omitempty" json:"credentialHelper,omitempty"`
 }
 
-// UnmarshalYAML accepts either the canonical `repository` key (post-REN-1419)
-// or the legacy `repoUrl` key (pre-REN-1419). When the legacy key is found a
+// UnmarshalYAML accepts either the canonical `repository` key or the
+// legacy `repoUrl` key. When the legacy key is found a
 // one-line warning is logged via slog so operators know to rewrite the file
 // (the next write will use the canonical key automatically).
 func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
@@ -113,7 +113,7 @@ func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 	case raw.RepoURL != "":
 		p.RepoURL = raw.RepoURL
 		slog.Warn(
-			"daemon.yaml: legacy 'repoUrl' key on project entry; will be rewritten as 'repository' on next write (REN-1419)",
+			"daemon.yaml: legacy 'repoUrl' key on project entry; will be rewritten as 'repository' on next write",
 			"repoUrl", raw.RepoURL,
 		)
 	}
@@ -121,7 +121,7 @@ func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 }
 
 // CapacityConfig holds the configurable capacity limits written into
-// daemon.yaml under the `capacity` key. REN-1334 adds `poolMaxDiskGb` for
+// daemon.yaml under the `capacity` key. `poolMaxDiskGb` drives
 // automatic LRU eviction of the workarea pool once the disk threshold is hit.
 type CapacityConfig struct {
 	// MaxConcurrentSessions is the maximum number of sessions the local
@@ -180,7 +180,7 @@ func ReadDaemonYAML(path string) (*DaemonYAML, error) {
 // file (e.g. apiVersion, kind, machine, orchestrator, autoUpdate,
 // observability) by parsing the on-disk file as a yaml.Node tree, replacing
 // only the `projects` and `capacity` mappings, and re-marshalling. This is
-// the v0.4.1 follow-up to REN-1419: the previous writer marshalled the
+// the v0.4.1 follow-up: the previous writer marshalled the
 // minimal DaemonYAML struct directly, which clobbered every key the project
 // command tree did not model. After a single `rensei project allow` the
 // daemon would refuse to load the resulting file (machine.id missing,
@@ -198,7 +198,7 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 	// Auto-derive ID for any project entry that does not have one. The
 	// daemon reader treats projects[i].id as required; CLI callers (e.g.
 	// `rensei project allow <repo>`) historically left it unset, so the
-	// daemon rejected the resulting file at next read. (REN-1443.)
+	// daemon rejected the resulting file at next read.
 	for i := range cfg.Projects {
 		if cfg.Projects[i].ID == "" {
 			cfg.Projects[i].ID = DeriveProjectID(cfg.Projects[i].RepoURL)
@@ -388,7 +388,7 @@ var derivedIDRepeatRE = regexp.MustCompile(`-+`)
 // repo URL. The daemon validates that projects[i].id is non-empty; the CLI
 // did not historically write this field, so daemon.yaml files written by
 // `rensei project allow` were rejected at next read with
-// "projects[0].id is required" (REN-1443).
+// "projects[0].id is required".
 //
 // Heuristics:
 //   - github.com/foo/bar  → "foo-bar"

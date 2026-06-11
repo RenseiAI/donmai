@@ -292,3 +292,75 @@ func TestApplyPendingMutations_ModelAccess_UnknownOp(t *testing.T) {
 		t.Errorf("failure.Error = %q, want unsupported-op message", failures[0].Error)
 	}
 }
+
+func TestApplyPendingMutations_ModelAccessSet_UnknownWorkloadRejected(t *testing.T) {
+	t.Parallel()
+	// A workload key outside the shared vocabulary (e.g. a typo'd
+	// "develop-ment") can never match at enforcement time — the strict block
+	// would be stored but silently fall back to the ceiling. The mutation must
+	// fail (NACK) and leave both memory and disk untouched.
+	d, path := newTestDaemonWithProjects(t, nil)
+
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+		{
+			ID: "set_typo",
+			Op: "modelAccess.set",
+			Params: mustParams(t, map[string]any{
+				"workload": "develop-ment",
+				"policy":   anthropicHostSessionPolicy(),
+			}),
+		},
+	})
+	if len(applied) != 0 {
+		t.Errorf("applied = %v, want none for unknown workload", applied)
+	}
+	if len(failures) != 1 || failures[0].ID != "set_typo" {
+		t.Fatalf("failures = %v, want one for set_typo", failures)
+	}
+	if !strings.Contains(failures[0].Error, `unknown workload "develop-ment"`) {
+		t.Errorf("failure.Error = %q, want unknown-workload message", failures[0].Error)
+	}
+	// The error must teach the fix: list the valid vocabulary.
+	if !strings.Contains(failures[0].Error, "development") {
+		t.Errorf("failure.Error = %q, want the known-keys list included", failures[0].Error)
+	}
+	if d.config.ModelAccess != nil {
+		t.Errorf("in-memory ModelAccess = %+v, want nil after rejected set", d.config.ModelAccess)
+	}
+	if got := readYamlModelAccess(t, path); got != nil {
+		t.Errorf("yaml ModelAccess = %+v, want nothing persisted after rejected set", got)
+	}
+}
+
+func TestApplyPendingMutations_ModelAccessSet_WorkloadVocabulary(t *testing.T) {
+	t.Parallel()
+	// Pin the breadth of the accepted vocabulary: agent work types, the
+	// non-agent batch work types, and the mode-derived interview workload.
+	keys := []string{"development", "qa", "code-survival-scan", "kg-extraction", "interview"}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+			d, path := newTestDaemonWithProjects(t, nil)
+			applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+				{
+					ID: "set_" + key,
+					Op: "modelAccess.set",
+					Params: mustParams(t, map[string]any{
+						"workload": key,
+						"policy":   anthropicHostSessionPolicy(),
+					}),
+				},
+			})
+			if len(applied) != 1 || len(failures) != 0 {
+				t.Fatalf("applied/failures = %v/%v, want [set_%s]/[]", applied, failures, key)
+			}
+			got := readYamlModelAccess(t, path)
+			if got == nil || got.Workloads == nil {
+				t.Fatalf("yaml ModelAccess.Workloads nil after set: %+v", got)
+			}
+			if _, ok := got.Workloads[key]; !ok {
+				t.Errorf("workload %q absent after accepted set", key)
+			}
+		})
+	}
+}

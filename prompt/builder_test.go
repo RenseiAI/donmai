@@ -18,20 +18,20 @@ import (
 var updateGolden = flag.Bool("update", false, "rewrite testdata/*.golden fixtures")
 
 // fixtureSession mirrors the live Redis session payload observed in
-// F.2.7 verification (REN2-1). Keeping the fixture in code rather than
+// F.2.7 verification. Keeping the fixture in code rather than
 // JSON keeps the golden tests' inputs documented inline.
 func fixtureSession() prompt.QueuedWork {
 	return prompt.QueuedWork{
 		SessionID:         "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c",
 		IssueID:           "08f26531-f5d2-49dc-b412-b42cef0cbffa",
-		IssueIdentifier:   "REN2-1",
+		IssueIdentifier:   "DEV-1",
 		LinearSessionID:   "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c",
 		ProviderSessionID: "",
 		ProjectName:       "smoke-alpha",
 		OrganizationID:    "org_ejkmv9ojdyifipydw5l1",
 		Repository:        "github.com/RenseiAI/rensei-smokes-alpha",
 		Ref:               "main",
-		PromptContext: "<issue identifier=\"REN2-1\">\n" +
+		PromptContext: "<issue identifier=\"DEV-1\">\n" +
 			"<title>Wave 6 smoke test — daemon E2E verification</title>\n" +
 			"<description>\nrensei please create a file `hello-from-wave6.md` " +
 			"at the repo root containing a single line with the current ISO-8601 " +
@@ -83,7 +83,7 @@ func TestBuilderBuild_GoldenSnapshots(t *testing.T) {
 			name: "fallback-no-promptcontext",
 			work: prompt.QueuedWork{
 				SessionID:       "session-fallback",
-				IssueIdentifier: "REN-9999",
+				IssueIdentifier: "ENG-9999",
 				Title:           "Fallback path",
 				Body:            "No prompt context, just a body.",
 				WorkType:        string(prompt.WorkTypeDevelopment),

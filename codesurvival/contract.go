@@ -179,7 +179,7 @@ type BatchWorkItem struct {
 	// complete and forward-compatible.
 	Needs BatchWorkNeeds `json:"needs"`
 	// GitCredential carries the short-lived per-repo token + clone URL minted at
-	// dispatch (REN-1554). Scrubbed after use; never persisted.
+	// dispatch. Scrubbed after use; never persisted.
 	GitCredential BatchWorkGitCredential `json:"gitCredential"`
 	// ResultEndpoint is the platform ingestion URL the result is POSTed to.
 	ResultEndpoint string `json:"resultEndpoint"`

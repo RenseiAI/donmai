@@ -15,13 +15,13 @@ import (
 func brandFixture(workType prompt.WorkType) prompt.QueuedWork {
 	return prompt.QueuedWork{
 		SessionID:       "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c",
-		IssueIdentifier: "REN2-1",
+		IssueIdentifier: "DEV-1",
 		ProjectName:     "smoke-alpha",
 		OrganizationID:  "org_ejkmv9ojdyifipydw5l1",
 		Repository:      "github.com/RenseiAI/rensei-smokes-alpha",
 		Ref:             "main",
 		WorkType:        string(workType),
-		PromptContext:   "<issue identifier=\"REN2-1\"><title>brand check</title></issue>",
+		PromptContext:   "<issue identifier=\"DEV-1\"><title>brand check</title></issue>",
 	}
 }
 
@@ -72,7 +72,7 @@ func TestBuilderBuild_Brand_OSSDefault(t *testing.T) {
 // brand "rensei" (statehome.SetBrand("rensei")), the donmai runner's default
 // templates render byte-identically to the pre-brand-seam templates — i.e.
 // "autonomous Rensei agent" and "rensei linear". The platform's fallback prompt
-// path (system_base.tmpl when no SystemPromptOverride is set) and the SUP-1840
+// path (system_base.tmpl when no SystemPromptOverride is set) and the
 // fail-loud guard depend on this exact wording, so the brand seam must be a
 // no-op in effect for the platform.
 //

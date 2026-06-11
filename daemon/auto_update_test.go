@@ -68,14 +68,15 @@ func TestUpdater_CheckForUpdate_NewerAvailable(t *testing.T) {
 
 func TestUpdater_RunUpdate_RejectsByDefaultVerifier(t *testing.T) {
 	// Manifest reports a newer version with a CORRECT sha256 of the served
-	// binary, so the new checksum-integrity gate passes and the request still
-	// reaches (and is rejected by) the default verifier — the swap MUST be
-	// aborted at the signature stage. (sha256("fakebinary") below.)
+	// binary, so the checksum-integrity gate passes and the request still
+	// reaches (and is rejected by) the default verifier — with no
+	// autoUpdate.signers configured the swap MUST be aborted fail-closed at
+	// the signature stage. (sha256("fakebinary") below.)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/latest.json"):
 			_ = json.NewEncoder(w).Encode(VersionManifest{Version: "9.9.9", SHA256: "035d560c0302d4caedadfc31e1b9d76dfad27622b64282576c34244a4fed6458"})
-		case strings.HasSuffix(r.URL.Path, ".sig"):
+		case strings.HasSuffix(r.URL.Path, ".sigstore"):
 			_, _ = w.Write([]byte("fakesig"))
 		default:
 			_, _ = w.Write([]byte("fakebinary"))
@@ -97,6 +98,9 @@ func TestUpdater_RunUpdate_RejectsByDefaultVerifier(t *testing.T) {
 	}
 	if !strings.Contains(res.Reason, "sig-rejected") {
 		t.Errorf("expected sig-rejected reason, got %q", res.Reason)
+	}
+	if !strings.Contains(res.Reason, "no update signers configured") {
+		t.Errorf("expected fail-closed no-signers reason, got %q", res.Reason)
 	}
 }
 

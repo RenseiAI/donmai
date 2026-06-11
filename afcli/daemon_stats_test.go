@@ -8,7 +8,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 )
 
-// TestFormatWorkerStat covers REN-1446's worker-id row formatting.
+// TestFormatWorkerStat covers the worker-id row formatting.
 func TestFormatWorkerStat(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -31,7 +31,7 @@ func TestFormatWorkerStat(t *testing.T) {
 	}
 }
 
-// TestFormatRegistrationStat covers REN-1446's registration row formatting.
+// TestFormatRegistrationStat covers the registration row formatting.
 func TestFormatRegistrationStat(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -78,7 +78,7 @@ func TestFormatRegistrationStat(t *testing.T) {
 	}
 }
 
-// TestFormatAllowedProjectsStat covers REN-1446's allowed-projects row.
+// TestFormatAllowedProjectsStat covers the allowed-projects row.
 func TestFormatAllowedProjectsStat(t *testing.T) {
 	t.Parallel()
 	zero := formatAllowedProjectsStat(&afclient.DaemonStatsResponse{})
@@ -103,7 +103,7 @@ func TestFormatAllowedProjectsStat(t *testing.T) {
 }
 
 // TestWriteDaemonStatsTable_IncludesNewRows confirms that the rendered table
-// surfaces all three new rows for REN-1446.
+// surfaces all three new rows.
 func TestWriteDaemonStatsTable_IncludesNewRows(t *testing.T) {
 	t.Parallel()
 	r := &afclient.DaemonStatsResponse{

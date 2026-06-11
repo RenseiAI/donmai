@@ -99,7 +99,7 @@ func makePostSessionRunner(t *testing.T, srv *httptest.Server) *Runner {
 }
 
 // TestRunPostSession_PassedTransitionsToFinished is the integration
-// test for the REN-1467 happy path: a development session emits
+// test for the post-session-transition happy path: a development session emits
 // WORK_RESULT:passed and the runner POSTs updateIssueStatus("Finished")
 // to the platform's issue-tracker proxy.
 func TestRunPostSession_PassedTransitionsToFinished(t *testing.T) {

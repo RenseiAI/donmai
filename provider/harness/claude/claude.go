@@ -72,19 +72,19 @@ func (*Provider) Name() agent.ProviderName { return agent.ProviderClaude }
 
 // Capabilities returns the v0.5.0 capability matrix.
 //
-// Per F.1.1 §3.1 and the F.2.3-cap-flip coordinator decision (REN-1455):
+// Per F.1.1 §3.1 and the F.2.3-cap-flip coordinator decision:
 //
 //   - SupportsMessageInjection=true. Implemented by spawning a fresh
 //     `claude --resume <session-id> -p <text>` subprocess between turns
 //     and forwarding its JSONL stream to the parent Handle's events
 //     channel. This is between-turn injection — same semantic level as
 //     the legacy TS Agent SDK and the future Go-native option C upgrade
-//     in REN-1451 (which replaces the subprocess shell-out with the
+//     (which replaces the subprocess shell-out with the
 //     Anthropic Go SDK + a Go-native agent loop for true mid-turn
 //     injection without subprocess overhead).
 //   - SupportsSessionResume=false. The Provider.Resume entrypoint is
 //     wired but not exercised by the v0.5.0 runner; flips to true when
-//     the resume code path lands (also tracked under REN-1451).
+//     the resume code path lands.
 //
 // All other flags follow the legacy claude-provider.ts capability
 // table verbatim, except SupportsCodeIntelligenceEnforcement which is
@@ -136,6 +136,14 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // cleans up the MCP tmpfile and returns an error wrapping
 // agent.ErrSpawnFailed.
 func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID string) (agent.Handle, error) {
+	// Project the resolved model-endpoint binding (when set) onto the
+	// spec the CLI sees: serving-host env knobs (direct/bedrock/vertex),
+	// binding credentials, and the binding's model. See endpoint.go.
+	spec, err := applyEndpoint(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+
 	mcpPath, err := clijsonl.WriteMCPConfig(spec.MCPServers)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
@@ -149,7 +157,7 @@ func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID s
 // capability matrix. When the runner gains resume support this method
 // will dispatch to spawn(ctx, spec, sessionID).
 func (*Provider) Resume(_ context.Context, _ string, _ agent.Spec) (agent.Handle, error) {
-	return nil, fmt.Errorf("provider/claude: Resume: %w (SupportsSessionResume=false in v0.5.0; tracked in REN-1451)", agent.ErrUnsupported)
+	return nil, fmt.Errorf("provider/claude: Resume: %w (SupportsSessionResume=false in v0.5.0)", agent.ErrUnsupported)
 }
 
 // Shutdown is a no-op for the CLI shell-out provider. Each session is

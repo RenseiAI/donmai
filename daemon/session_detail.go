@@ -28,7 +28,7 @@ type SessionDetail struct {
 	IssueID string `json:"issueId,omitempty"`
 
 	// IssueIdentifier is the human-readable Linear identifier
-	// (e.g. "REN-1457").
+	// (e.g. "ENG-1457").
 	IssueIdentifier string `json:"issueIdentifier,omitempty"`
 
 	// LinearSessionID is the Linear-side agent-session id.
@@ -106,7 +106,7 @@ type SessionDetail struct {
 	// attribute usage to the correct metered/shared pool.
 	CredentialPoolID string `json:"credentialPoolId,omitempty"`
 
-	// ── Phase 2 stage-driven SDLC fields (REN-1485 / REN-1487) ───────
+	// ── Phase 2 stage-driven SDLC fields ───────
 	//
 	// Forwarded opaquely from PollWorkItem; the daemon does not parse
 	// them. The runner consumes them via the prompt.QueuedWork stage
@@ -136,7 +136,7 @@ type SessionDetail struct {
 	// SystemPromptOverride forwards the per-session platform-supplied
 	// system prompt from PollWorkItem onto the runner's QueuedWork.
 	// Read by `prompt/builder.go` (already wired) — this field closes
-	// the daemon→runner wire-shape gap. SUP-1840 precedent.
+	// the daemon→runner wire-shape gap (a missing field is silently dropped).
 	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
 
 	// Kits forwards the platform-resolved kit toolchain demand from
@@ -163,7 +163,7 @@ type SessionDetail struct {
 	// not dropped by the strict JSON decoder.
 	MemoryBlock string `json:"memoryBlock,omitempty"`
 
-	// ── Interactive run-mode fields (REN-1563 / Wave 2 donmai wire-plumbing) ─
+	// ── Interactive run-mode fields (Wave 2 donmai wire-plumbing) ─
 	//
 	// Mode forwards the run-mode discriminant from PollWorkItem onto the
 	// runner's QueuedWork. "" / absent = headless (unchanged behaviour).

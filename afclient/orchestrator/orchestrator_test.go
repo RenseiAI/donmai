@@ -181,14 +181,14 @@ func newTestOrchestrator(t *testing.T, cfg orchestrator.Config, lin linear.Linea
 
 func TestRunSingle_DryRun(t *testing.T) {
 	dir := t.TempDir()
-	issue := makeIssue("id-1", "REN-1", "Implement feature", "MyProject")
+	issue := makeIssue("id-1", "ENG-1", "Implement feature", "MyProject")
 	lin := &mockLinear{issues: []linear.Issue{issue}}
 	lin.singleFn = func(_ context.Context, _ string) (*linear.Issue, error) { return &issue, nil }
 	disp := &mockDispatcher{}
 
 	cfg := orchestrator.Config{
 		LinearAPIKey: "test-key",
-		Single:       "REN-1",
+		Single:       "ENG-1",
 		DryRun:       true,
 		GitRoot:      dir,
 	}
@@ -212,14 +212,14 @@ func TestRunSingle_DryRun(t *testing.T) {
 
 func TestRunSingle_Dispatch(t *testing.T) {
 	dir := t.TempDir()
-	issue := makeIssue("id-1", "REN-1", "Implement feature", "MyProject")
+	issue := makeIssue("id-1", "ENG-1", "Implement feature", "MyProject")
 	lin := &mockLinear{issues: []linear.Issue{issue}}
 	lin.singleFn = func(_ context.Context, _ string) (*linear.Issue, error) { return &issue, nil }
 	disp := &mockDispatcher{}
 
 	cfg := orchestrator.Config{
 		LinearAPIKey: "test-key",
-		Single:       "REN-1",
+		Single:       "ENG-1",
 		DryRun:       false,
 		GitRoot:      dir,
 	}
@@ -244,8 +244,8 @@ func TestRunSingle_Dispatch(t *testing.T) {
 func TestRunBacklog_DryRun(t *testing.T) {
 	dir := t.TempDir()
 	issues := []linear.Issue{
-		makeIssue("id-1", "REN-1", "Issue one", "Alpha"),
-		makeIssue("id-2", "REN-2", "Issue two", "Alpha"),
+		makeIssue("id-1", "ENG-1", "Issue one", "Alpha"),
+		makeIssue("id-2", "ENG-2", "Issue two", "Alpha"),
 	}
 	lin := &mockLinear{issues: issues}
 	disp := &mockDispatcher{}
@@ -283,7 +283,7 @@ func TestRunBacklog_RepoMismatch(t *testing.T) {
 		initGitRepo(t, dir, "https://github.com/org/other-repo.git")
 	}
 
-	issue := makeIssue("id-1", "REN-1", "Implement feature", "Alpha")
+	issue := makeIssue("id-1", "ENG-1", "Implement feature", "Alpha")
 	lin := &mockLinear{issues: []linear.Issue{issue}}
 	disp := &mockDispatcher{}
 
@@ -337,14 +337,14 @@ kind: RepositoryConfig
 allowedProjects:
   - AllowedProject
 `)
-	issue := makeIssue("id-1", "REN-1", "Issue title", "NotAllowed")
+	issue := makeIssue("id-1", "ENG-1", "Issue title", "NotAllowed")
 	lin := &mockLinear{issues: []linear.Issue{issue}}
 	lin.singleFn = func(_ context.Context, _ string) (*linear.Issue, error) { return &issue, nil }
 	disp := &mockDispatcher{}
 
 	cfg := orchestrator.Config{
 		LinearAPIKey: "test-key",
-		Single:       "REN-1",
+		Single:       "ENG-1",
 		DryRun:       false,
 		GitRoot:      dir,
 	}

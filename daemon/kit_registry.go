@@ -73,7 +73,7 @@ var ErrKitTrustGateRejected = errors.New("kit install: trust gate rejected (sign
 // — the descriptor list returned by /api/daemon/kit-sources continues
 // to surface those kinds so operators can see the federation order.
 //
-// Federation cross-repo wave is REN-1308 follow-up.
+// Federation cross-repo support is deferred to follow-up work.
 var ErrKitSourceFederationUnimplemented = errors.New("kit install: federation source kind not yet implemented")
 
 // ErrKitInstallSourceFetchFailed is returned when the configured source
@@ -450,7 +450,7 @@ func (r *KitRegistry) VerifySignature(id string) (afclient.KitSignatureResult, e
 //     scanPaths[0]. Errors map to ErrKitInstallSourceFetchFailed (502)
 //     or ErrKitInstallManifestNotFound (422).
 //   - req.Source.Kind == "tessl" / "agentskills" / "community" —
-//     federation cross-repo wave (REN-1308 follow-up). Returns
+//     federation cross-repo wave (follow-up). Returns
 //     ErrKitSourceFederationUnimplemented (HTTP 501).
 //   - Any other kind — wrapped fmt error (handler-mapped to 400).
 //
@@ -473,7 +473,7 @@ func (r *KitRegistry) Install(id string, req afclient.KitInstallRequest) (afclie
 	case "git":
 		return r.installFromGit(id, *req.Source, req)
 	case "tessl", "agentskills", "community":
-		return afclient.KitInstallResult{}, fmt.Errorf("%s: %w (kind=%s; federation cross-repo wave is REN-1308 follow-up)",
+		return afclient.KitInstallResult{}, fmt.Errorf("%s: %w (kind=%s; federation cross-repo support is follow-up work)",
 			id, ErrKitSourceFederationUnimplemented, req.Source.Kind)
 	default:
 		return afclient.KitInstallResult{}, fmt.Errorf("kit install: unknown source kind %q for %s", req.Source.Kind, id)

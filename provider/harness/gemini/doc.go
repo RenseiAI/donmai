@@ -35,13 +35,15 @@
 // public generateContent API rejects the legacy "function" role).
 // Post-completion steering arrives via Handle.Inject (a user turn).
 //
-// MCP: there is NO native MCP and NO in-box MCP client. Spec.MCPServers
-// entries are surfaced to the model as catch-all functionDeclarations
-// for forward-compatibility, but no code routes an mcp__* functionCall
-// to a live server — the executor returns a structured "not executable"
-// error and Capabilities.AcceptsMcpServerSpec is false. A real MCP
-// bridge is future work; until it lands, MCP tools are not honored
-// end-to-end.
+// MCP: Gemini has no native MCP loader, so the provider bridges in-box
+// (mcp.go over runtime/mcp): Spawn dials every Spec.MCPServers entry
+// (stdio subprocess or Streamable HTTP — the platform's per-session MCP
+// endpoint), lists the server's tools, declares them to the model as
+// mcp__<server>__<tool> functionDeclarations (schemas sanitized to the
+// Gemini OpenAPI subset), and the session-local executor routes the
+// resulting mcp__* functionCalls to the live server. Connection failures
+// degrade per-server to structured tool errors — never a failed Spawn —
+// and Capabilities.AcceptsMcpServerSpec is true.
 //
 // File layout (parallels provider/codex):
 //
@@ -49,8 +51,9 @@
 //   - probe.go             — env-var probe at construction
 //   - spec_translation.go  — agent.Spec → Gemini request scaffold
 //   - tools.go             — functionDeclarations, thinkingConfig, pricing
+//   - mcp.go               — in-box MCP bridge (dial, discover, route)
 //   - event_mapping.go     — generateContent response → agent.Event
 //   - handle.go            — Handle impl + multi-turn driver goroutine
 //
-// Tracked in REN-1500 (Gemini native runner) on the Rensei Linear team.
+// A native Gemini runner is tracked as follow-up work.
 package gemini

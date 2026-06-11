@@ -1,5 +1,5 @@
 // Package tokendelta implements the batched token-delta forwarder used by
-// the interactive interview run-mode (REN-1563 / Wave 2). During an
+// the interactive interview run-mode. During an
 // interview the runner streams the agent's assistant-text output as
 // token-delta frames so the browser can render the question incrementally.
 //

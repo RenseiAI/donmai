@@ -30,7 +30,7 @@ func TestWriteReadRoundtrip(t *testing.T) {
 	s := state.NewStore()
 	in := &state.State{
 		IssueID:           "issue-uuid",
-		IssueIdentifier:   "REN-1",
+		IssueIdentifier:   "ENG-1",
 		SessionID:         "sess-1",
 		ProviderName:      agent.ProviderClaude,
 		ProviderSessionID: "claude-uuid",
@@ -48,7 +48,7 @@ func TestWriteReadRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if out.IssueID != "issue-uuid" || out.IssueIdentifier != "REN-1" || out.AttemptCount != 1 {
+	if out.IssueID != "issue-uuid" || out.IssueIdentifier != "ENG-1" || out.AttemptCount != 1 {
 		t.Fatalf("roundtrip mismatch: %+v", out)
 	}
 	if out.LastUpdatedAt == 0 {
@@ -63,14 +63,14 @@ func TestUpdateCreatesAndIncrements(t *testing.T) {
 	s := state.NewStore()
 
 	got, err := s.Update(dir, func(st *state.State) error {
-		st.IssueIdentifier = "REN-7"
+		st.IssueIdentifier = "ENG-7"
 		st.AttemptCount = 1
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("Update first: %v", err)
 	}
-	if got.AttemptCount != 1 || got.IssueIdentifier != "REN-7" {
+	if got.AttemptCount != 1 || got.IssueIdentifier != "ENG-7" {
 		t.Fatalf("first update: %+v", got)
 	}
 
@@ -84,7 +84,7 @@ func TestUpdateCreatesAndIncrements(t *testing.T) {
 	if got2.AttemptCount != 2 {
 		t.Fatalf("expected AttemptCount=2, got %d", got2.AttemptCount)
 	}
-	if got2.IssueIdentifier != "REN-7" {
+	if got2.IssueIdentifier != "ENG-7" {
 		t.Fatalf("Update lost prior fields: %+v", got2)
 	}
 }
@@ -95,7 +95,7 @@ func TestUpdateConcurrentSerializes(t *testing.T) {
 	dir := t.TempDir()
 	s := state.NewStore()
 
-	if err := s.Write(dir, &state.State{IssueIdentifier: "REN-1", AttemptCount: 0}); err != nil {
+	if err := s.Write(dir, &state.State{IssueIdentifier: "ENG-1", AttemptCount: 0}); err != nil {
 		t.Fatalf("seed Write: %v", err)
 	}
 
@@ -217,7 +217,7 @@ func TestWriteAtomicNoTempLeftover(t *testing.T) {
 
 	dir := t.TempDir()
 	s := state.NewStore()
-	if err := s.Write(dir, &state.State{IssueIdentifier: "REN-1"}); err != nil {
+	if err := s.Write(dir, &state.State{IssueIdentifier: "ENG-1"}); err != nil {
 		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(filepath.Join(dir, state.AgentDirName))

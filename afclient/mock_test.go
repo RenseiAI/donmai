@@ -72,8 +72,8 @@ func TestMockClientGetSessionDetail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSessionDetail() error: %v", err)
 	}
-	if detail.Session.Identifier != "SUP-1180" {
-		t.Errorf("Identifier = %q, want %q", detail.Session.Identifier, "SUP-1180")
+	if detail.Session.Identifier != "OPS-1180" {
+		t.Errorf("Identifier = %q, want %q", detail.Session.Identifier, "OPS-1180")
 	}
 	if detail.Session.Status != StatusWorking {
 		t.Errorf("Status = %q, want %q", detail.Session.Status, StatusWorking)

@@ -9,7 +9,7 @@ p, _ := heartbeat.New(heartbeat.Config{
     SessionID:  "sess-123",
     WorkerID:   "worker-1",
     IssueID:    "issue-uuid",
-    BaseURL:    "https://app.rensei.ai",
+    BaseURL:    "https://platform.example.com",
     AuthToken:  bearerToken,
     HTTPClient: c,
 })
@@ -46,7 +46,7 @@ A `refreshed: false` response is treated as a strike-eligible failure — it mea
 
 ## Distinction from worker heartbeat
 
-This package is the **per-session** heartbeat (REN-1399). The **worker-level** heartbeat is in `daemon/heartbeat.go` and uses `POST /api/workers/<id>/heartbeat`. They have separate cadences, separate failure modes, and serve different lifecycles.
+This package is the **per-session** heartbeat. The **worker-level** heartbeat is in `daemon/heartbeat.go` and uses `POST /api/workers/<id>/heartbeat`. They have separate cadences, separate failure modes, and serve different lifecycles.
 
 ## Tests
 

@@ -132,7 +132,7 @@ type Options struct {
 	SkipSteering bool
 
 	// SkipPostSession disables the post-session Linear state-transition
-	// block (REN-1467 / loop.go step 11b). Tests that don't have a
+	// block (loop.go step 11b). Tests that don't have a
 	// platform mock with /api/issue-tracker-proxy support, or that
 	// want to assert on the pre-transition Result envelope, set this
 	// to skip the block entirely. Production daemons leave it false.

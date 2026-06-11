@@ -78,8 +78,8 @@ func TestProvider_Capabilities_FullAgentic(t *testing.T) {
 	if !caps.AcceptsAllowedToolsList {
 		t.Error("AcceptsAllowedToolsList: want true (native tools executed in-box)")
 	}
-	if caps.AcceptsMcpServerSpec {
-		t.Error("AcceptsMcpServerSpec: want false (no in-box MCP client; mcp__* calls are not routed)")
+	if !caps.AcceptsMcpServerSpec {
+		t.Error("AcceptsMcpServerSpec: want true (in-box MCP bridge routes mcp__* calls to live servers)")
 	}
 	if !caps.SupportsReasoningEffort {
 		t.Error("SupportsReasoningEffort: want true")
@@ -320,19 +320,27 @@ func TestResolveSpawnKey_Precedence(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name     string
+		epEnv    map[string]string // nil = no Spec.Endpoint
 		env      map[string]string
 		fallback string
 		want     string
 	}{
-		{"primary wins", map[string]string{EnvAPIKeyPrimary: "p", EnvAPIKeyFallback: "g"}, "c", "p"},
-		{"google fallback", map[string]string{EnvAPIKeyFallback: "g"}, "c", "g"},
-		{"construction fallback", nil, "c", "c"},
-		{"blank env values ignored", map[string]string{EnvAPIKeyPrimary: "  "}, "c", "c"},
+		{"primary wins", nil, map[string]string{EnvAPIKeyPrimary: "p", EnvAPIKeyFallback: "g"}, "c", "p"},
+		{"google fallback", nil, map[string]string{EnvAPIKeyFallback: "g"}, "c", "g"},
+		{"construction fallback", nil, nil, "c", "c"},
+		{"blank env values ignored", nil, map[string]string{EnvAPIKeyPrimary: "  "}, "c", "c"},
+		{"endpoint binding wins over session env", map[string]string{EnvAPIKeyPrimary: "ep"}, map[string]string{EnvAPIKeyPrimary: "p"}, "c", "ep"},
+		{"endpoint google key wins over session primary", map[string]string{EnvAPIKeyFallback: "epg"}, map[string]string{EnvAPIKeyPrimary: "p"}, "c", "epg"},
+		{"keyless endpoint falls through to session env", map[string]string{}, map[string]string{EnvAPIKeyPrimary: "p"}, "c", "p"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := resolveSpawnKey(agent.Spec{Env: tc.env}, tc.fallback)
+			spec := agent.Spec{Env: tc.env}
+			if tc.epEnv != nil {
+				spec.Endpoint = &agent.EndpointBinding{Company: agent.CompanyGoogle, Env: tc.epEnv}
+			}
+			got := resolveSpawnKey(spec, tc.fallback)
 			if got != tc.want {
 				t.Errorf("resolveSpawnKey: want %q, got %q", tc.want, got)
 			}
@@ -583,6 +591,213 @@ func TestProvider_Spawn_MaxTurnsZeroUncapped(t *testing.T) {
 	}
 	if !res.Success {
 		t.Errorf("Result.Success: want true for STOP with MaxTurns=0 (uncapped), got %#v", res)
+	}
+}
+
+// TestProvider_Spawn_MCPToolRoundTrip drives the full bridged-MCP loop
+// against a REAL Streamable HTTP MCP server (httptest, via runtime/mcp's
+// default dialer): Spawn dials it, discovers its tools, declares
+// mcp__fake__echo to the model (replacing the catch-all placeholder), the
+// model calls it, the bridge routes the call to the live server, and the
+// server's output folds back into turn 2 as the functionResponse.
+func TestProvider_Spawn_MCPToolRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	mcpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     *int64          `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("MCP server: decode: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.ID == nil { // notifications/initialized
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer rsk-test" {
+			t.Errorf("MCP Authorization = %q, want configured bearer", got)
+		}
+		var result any
+		switch req.Method {
+		case "initialize":
+			result = map[string]any{"protocolVersion": "2025-03-26", "capabilities": map[string]any{}, "serverInfo": map[string]any{"name": "fake", "version": "0"}}
+		case "tools/list":
+			result = map[string]any{"tools": []map[string]any{{
+				"name":        "echo",
+				"description": "echoes text back",
+				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string"}}, "required": []string{"text"}},
+			}}}
+		case "tools/call":
+			var p struct {
+				Name      string         `json:"name"`
+				Arguments map[string]any `json:"arguments"`
+			}
+			_ = json.Unmarshal(req.Params, &p)
+			if p.Name != "echo" {
+				t.Errorf("tools/call name = %q, want echo", p.Name)
+			}
+			text, _ := p.Arguments["text"].(string)
+			result = map[string]any{"content": []map[string]any{{"type": "text", "text": "echo: " + text}}}
+		default:
+			t.Errorf("unexpected MCP method %q", req.Method)
+		}
+		body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": *req.ID, "result": result})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer mcpSrv.Close()
+
+	var mu sync.Mutex
+	var turnNum int
+	geminiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		turnNum++
+		n := turnNum
+		mu.Unlock()
+
+		body, _ := io.ReadAll(r.Body)
+		var req requestBody
+		_ = json.Unmarshal(body, &req)
+
+		switch n {
+		case 1:
+			// The discovered tool must be declared under its real name and
+			// the per-server catch-all must be gone.
+			names := sortedToolNames(req.Tools)
+			hasReal, hasCatchAll := false, false
+			for _, name := range names {
+				hasReal = hasReal || name == "mcp__fake__echo"
+				hasCatchAll = hasCatchAll || name == "mcp__fake"
+			}
+			if !hasReal || hasCatchAll {
+				t.Errorf("turn 1 declarations = %v, want mcp__fake__echo and no catch-all", names)
+			}
+			writeJSON(w, `{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-7","name":"mcp__fake__echo","args":{"text":"hi"}}}]}}]}`)
+		case 2:
+			last := req.Contents[len(req.Contents)-1]
+			fr := last.Parts[0].FunctionResponse
+			if fr == nil || fr.ID != "call-7" {
+				t.Errorf("turn 2: want functionResponse call-7, got %#v", last)
+			} else if out, _ := fr.Response["output"].(string); out != "echo: hi" {
+				t.Errorf("turn 2 functionResponse = %#v, want live MCP server output", fr.Response)
+			}
+			writeJSON(w, `{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`)
+		default:
+			t.Errorf("unexpected turn %d", n)
+			writeJSON(w, `{"candidates":[{"finishReason":"STOP"}]}`)
+		}
+	}))
+	defer geminiSrv.Close()
+
+	p := mustNew(t, geminiSrv.URL)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:     "use the MCP tool",
+		Autonomous: true,
+		MCPServers: []agent.MCPServerConfig{{
+			Name:    "fake",
+			Type:    "http",
+			URL:     mcpSrv.URL,
+			Headers: map[string]string{"Authorization": "Bearer rsk-test"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+
+	events := drainUntilResult(t, h)
+	var sawToolResult bool
+	for _, ev := range events {
+		if e, ok := ev.(agent.ToolResultEvent); ok {
+			sawToolResult = true
+			if e.IsError || e.Content != "echo: hi" {
+				t.Errorf("ToolResult = %#v, want live MCP output", e)
+			}
+		}
+	}
+	if !sawToolResult {
+		t.Fatal("never observed the bridged ToolResultEvent")
+	}
+	res, ok := events[len(events)-1].(agent.ResultEvent)
+	if !ok || !res.Success {
+		t.Fatalf("terminal event: want successful ResultEvent, got %#v", events[len(events)-1])
+	}
+}
+
+// TestProvider_Spawn_MCPServerUnavailable_Degrades locks in the degraded
+// path: an unreachable MCP server must not fail Spawn; its catch-all
+// declaration stays in the plan and a call against it resolves to a
+// structured error functionResponse the model can recover from.
+func TestProvider_Spawn_MCPServerUnavailable_Degrades(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var turnNum int
+	geminiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		turnNum++
+		n := turnNum
+		mu.Unlock()
+
+		body, _ := io.ReadAll(r.Body)
+		var req requestBody
+		_ = json.Unmarshal(body, &req)
+
+		switch n {
+		case 1:
+			names := sortedToolNames(req.Tools)
+			found := false
+			for _, name := range names {
+				found = found || name == "mcp__bad"
+			}
+			if !found {
+				t.Errorf("turn 1: failed server should keep its catch-all declaration, got %v", names)
+			}
+			writeJSON(w, `{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-1","name":"mcp__bad__sometool","args":{}}}]}}]}`)
+		default:
+			last := req.Contents[len(req.Contents)-1]
+			fr := last.Parts[0].FunctionResponse
+			if fr == nil {
+				t.Errorf("turn 2: want functionResponse, got %#v", last)
+			} else if msg, _ := fr.Response["error"].(string); !strings.Contains(msg, "unavailable") {
+				t.Errorf("turn 2: want unavailability error in functionResponse, got %#v", fr.Response)
+			}
+			writeJSON(w, `{"candidates":[{"content":{"parts":[{"text":"cannot reach the tool"}]},"finishReason":"STOP"}]}`)
+		}
+	}))
+	defer geminiSrv.Close()
+
+	p := mustNew(t, geminiSrv.URL)
+	p.dialMCP = failingDialer
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:     "try the MCP tool",
+		Autonomous: true,
+		MCPServers: []agent.MCPServerConfig{{Name: "bad", Type: "http", URL: "http://127.0.0.1:1"}},
+	})
+	if err != nil {
+		t.Fatalf("Spawn must not fail on an unreachable MCP server: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+
+	events := drainUntilResult(t, h)
+	var sawErrResult bool
+	for _, ev := range events {
+		if e, ok := ev.(agent.ToolResultEvent); ok {
+			sawErrResult = true
+			if !e.IsError || !strings.Contains(e.Content, "unavailable") {
+				t.Errorf("ToolResult = %#v, want structured unavailability error", e)
+			}
+		}
+	}
+	if !sawErrResult {
+		t.Fatal("never observed the degraded ToolResultEvent")
+	}
+	if res, ok := events[len(events)-1].(agent.ResultEvent); !ok || !res.Success {
+		t.Fatalf("session should still complete: %#v", events[len(events)-1])
 	}
 }
 

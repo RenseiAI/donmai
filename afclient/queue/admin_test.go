@@ -92,7 +92,7 @@ func TestListWorkItems_Single(t *testing.T) {
 	t.Parallel()
 	c, mr := newTestAdmin(t)
 	seedWorkItem(t, mr, "sess-001", map[string]any{
-		"issueIdentifier": "REN-99",
+		"issueIdentifier": "ENG-99",
 		"workType":        "development",
 		"priority":        float64(2),
 	}, 100)
@@ -104,8 +104,8 @@ func TestListWorkItems_Single(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("want 1 item, got %d", len(items))
 	}
-	if items[0].IssueIdentifier != "REN-99" {
-		t.Errorf("want IssueIdentifier REN-99, got %q", items[0].IssueIdentifier)
+	if items[0].IssueIdentifier != "ENG-99" {
+		t.Errorf("want IssueIdentifier ENG-99, got %q", items[0].IssueIdentifier)
 	}
 }
 
@@ -127,10 +127,10 @@ func TestPeekWorkItem_ReturnsFirstByScore(t *testing.T) {
 	c, mr := newTestAdmin(t)
 
 	seedWorkItem(t, mr, "sess-low", map[string]any{
-		"issueIdentifier": "REN-200",
+		"issueIdentifier": "ENG-200",
 	}, 200)
 	seedWorkItem(t, mr, "sess-high", map[string]any{
-		"issueIdentifier": "REN-100",
+		"issueIdentifier": "ENG-100",
 	}, 100)
 
 	item, err := c.PeekWorkItem(context.Background())
@@ -138,8 +138,8 @@ func TestPeekWorkItem_ReturnsFirstByScore(t *testing.T) {
 		t.Fatalf("PeekWorkItem: %v", err)
 	}
 	// score 100 should be first
-	if item.IssueIdentifier != "REN-100" {
-		t.Errorf("want REN-100 (lowest score), got %q", item.IssueIdentifier)
+	if item.IssueIdentifier != "ENG-100" {
+		t.Errorf("want ENG-100 (lowest score), got %q", item.IssueIdentifier)
 	}
 }
 
@@ -164,7 +164,7 @@ func TestListSessions_Found(t *testing.T) {
 	c, mr := newTestAdmin(t)
 	seedSession(t, mr, "abc123", map[string]any{
 		"status":          "running",
-		"issueIdentifier": "REN-42",
+		"issueIdentifier": "ENG-42",
 		"workType":        "qa",
 	})
 
@@ -197,7 +197,7 @@ func TestDropSession_RemovesSession(t *testing.T) {
 	t.Parallel()
 	c, mr := newTestAdmin(t)
 	seedSession(t, mr, "sess-drop", map[string]any{"status": "running"})
-	seedWorkItem(t, mr, "sess-drop", map[string]any{"issueIdentifier": "REN-55"}, 50)
+	seedWorkItem(t, mr, "sess-drop", map[string]any{"issueIdentifier": "ENG-55"}, 50)
 
 	n, err := c.DropSession(context.Background(), "sess-drop")
 	if err != nil {

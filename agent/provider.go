@@ -5,7 +5,7 @@ import "context"
 // Provider is the contract every agent runtime implements.
 //
 // Verbatim port of the legacy TS AgentProvider interface from
-// ../agentfactory/packages/core/src/providers/types.ts.
+// ../donmai-libraries/packages/core/src/providers/types.ts.
 //
 // Implementations live in github.com/RenseiAI/donmai/provider/
 // subpackages (claude, codex, stub for v0.5.0). Each implementation is

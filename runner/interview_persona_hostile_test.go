@@ -1,7 +1,7 @@
 package runner
 
 // TestInterviewMode_HostileCLAUDEmd_StructuralProof is a STRUCTURAL proof
-// (REN-1570 donmai part) that interview mode's prompt-assembly and spec-
+// (donmai part) that interview mode's prompt-assembly and spec-
 // translation paths harden the session against a user-controlled repository
 // whose .claude/CLAUDE.md tries to override system-prompt directives.
 //
@@ -29,9 +29,9 @@ package runner
 // prompt — it does NOT spawn a real Claude process.  A true BEHAVIOURAL
 // proof (running claude against a hostile-repo with these constraints in
 // place and asserting that no file writes occur) is a live-sandbox smoke
-// tracked as REN-1572 (W5 real-mode smoke).
+// tracked as follow-up work (real-mode smoke).
 //
-// followUp: REN-1572 — W5 behavioural proof in a real sandbox (claude run
+// followUp: behavioural proof in a real sandbox (claude run
 // against hostile-CLAUDE.md; assert no file writes, no exfiltration, session
 // ends on sentinel).
 

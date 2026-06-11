@@ -3,7 +3,7 @@ package runner
 import "strings"
 
 // interviewPersonaHeader is the hardened interview persona prepended to
-// qw.SystemPromptOverride when Mode == interview (REN-1563). It pins the
+// qw.SystemPromptOverride when Mode == interview. It pins the
 // agent into a turn-taking interviewer: ONE question per turn then stop,
 // thinking-only (no code authoring), and an explicit completion sentinel.
 //
@@ -15,8 +15,8 @@ import "strings"
 // into developer behaviour; the persona therefore states the constraints
 // as hard rules with the rationale, not as a single throwaway line. The
 // hostile-CLAUDE.md proof (a repo whose CLAUDE.md actively tries to make
-// the agent write code / ask many questions) is tracked as REN-1570 and
-// is validated in a live sandbox (REN-1572 / W5), not here.
+// the agent write code / ask many questions) is tracked as follow-up work and
+// is validated in a live sandbox, not here.
 //
 // The %s placeholder is filled with the platform-supplied completion
 // sentinel (interview.InterviewCompleteSentinel) so the persona and the

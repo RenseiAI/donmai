@@ -25,5 +25,5 @@
 // the optional OPENCODE_API_KEY env var is forwarded as a Bearer token
 // for future hosted variants.
 //
-// Tracked in REN-1501 (OpenCode runner) on the Rensei Linear team.
+// A native OpenCode runner is tracked as follow-up work.
 package opencode

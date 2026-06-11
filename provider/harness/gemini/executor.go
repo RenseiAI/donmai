@@ -24,24 +24,29 @@ import (
 // back into the conversation loop, so an autonomous Gemini session
 // completes without the runner having to dispatch + Inject every call.
 //
-// MCP tools (name prefixed "mcp__") have no in-box client in this repo,
-// so they resolve to a structured error functionResponse. That lets the
-// model recover (retry with a native tool, or report the limitation)
-// rather than hanging forever. The Capabilities matrix declares
-// AcceptsMcpServerSpec=false to reflect this — see gemini.go.
+// MCP tools (name prefixed "mcp__") route through the session's mcpBridge
+// (mcp.go): the bridge dialed the declared Spec.MCPServers at Spawn and
+// forwards the call to the live server over the runtime/mcp client. When
+// the session declared no servers — or the named server failed to connect —
+// the call resolves to a structured error functionResponse so the model can
+// recover (retry with a native tool, or report the limitation) rather than
+// hanging forever.
 type toolExecutor struct {
 	// cwd is the working directory native tools run in (the runner's
 	// worktree). Empty falls back to the process working directory.
 	cwd string
 	// env is the per-session environment forwarded to Bash invocations.
 	env map[string]string
+	// mcp routes mcp__* calls to the live servers. nil when the session
+	// declared no MCP servers.
+	mcp *mcpBridge
 }
 
 // newToolExecutor builds an executor from the spawn spec. nil-safe: a
 // zero Spec yields an executor that runs in the process cwd with no
-// extra env.
-func newToolExecutor(cwd string, env map[string]string) *toolExecutor {
-	return &toolExecutor{cwd: cwd, env: env}
+// extra env and no MCP routing.
+func newToolExecutor(cwd string, env map[string]string, bridge *mcpBridge) *toolExecutor {
+	return &toolExecutor{cwd: cwd, env: env, mcp: bridge}
 }
 
 // execResult is the outcome of running one tool. response is the object
@@ -60,13 +65,9 @@ type execResult struct {
 func (e *toolExecutor) execute(ctx context.Context, call candidateFuncCall) execResult {
 	name := call.Name
 
-	// MCP tools have no in-box client: surface a structured error the
-	// model can act on instead of deadlocking the loop.
+	// MCP tools route through the session's bridge to the live server.
 	if strings.HasPrefix(name, "mcp__") {
-		return e.errResult(fmt.Sprintf(
-			"MCP tool %q is not executable in the Gemini native runner: no in-box MCP client is wired. Use a native tool (Bash/Read/Edit/Write) or report the limitation.",
-			name,
-		))
+		return e.execMCP(ctx, call)
 	}
 
 	switch strings.ToLower(name) {
@@ -83,6 +84,35 @@ func (e *toolExecutor) execute(ctx context.Context, call candidateFuncCall) exec
 			"tool %q is not implemented by the Gemini native runner's session-local executor (supported: Bash, Read, Write, Edit)",
 			name,
 		))
+	}
+}
+
+// execMCP routes one mcp__* functionCall to its live server via the
+// session's bridge. Failures — no bridge, unroutable name, unavailable
+// server, transport error — resolve to a structured error functionResponse
+// the model can recover from; a tool-side failure (isError result) keeps
+// the server's own error text.
+func (e *toolExecutor) execMCP(ctx context.Context, call candidateFuncCall) execResult {
+	if e.mcp == nil {
+		return e.errResult(fmt.Sprintf(
+			"MCP tool %q is not executable: the session declared no MCP servers. Use a native tool (Bash/Read/Edit/Write) or report the limitation.",
+			call.Name,
+		))
+	}
+	res, err := e.mcp.call(ctx, call.Name, call.Args)
+	if err != nil {
+		return e.errResult(fmt.Sprintf("MCP tool %q: %v", call.Name, err))
+	}
+	if res.IsError {
+		return execResult{
+			response: map[string]any{"error": res.Content},
+			text:     res.Content,
+			isError:  true,
+		}
+	}
+	return execResult{
+		response: map[string]any{"output": res.Content},
+		text:     res.Content,
 	}
 }
 

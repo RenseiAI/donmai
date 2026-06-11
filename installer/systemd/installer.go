@@ -1,17 +1,17 @@
 // Package systemd implements the Linux systemd installer for the daemon.
 //
 // This is the Go port of the legacy TypeScript installer at
-// agentfactory/packages/daemon/src/installer-linux.ts (REN-1293).
+// donmai-libraries/packages/daemon/src/installer-linux.ts.
 //
 // The installer registers the host binary's `daemon run` subcommand as the
 // service entrypoint — it does NOT register a separate `rensei-daemon`
-// binary (locked decision per REN-1406). The host binary is whichever
+// binary (locked decision). The host binary is whichever
 // executable invoked the install (`af`, `rensei`, etc., resolved via
 // os.Executable), and the subcommand is `daemon run`.
 //
 // Architecture reference:
 //
-//	rensei-architecture/011-local-daemon-fleet.md §Linux (systemd)
+//	donmai-architecture/011-local-daemon-fleet.md §Linux (systemd)
 //
 // Two scopes are supported:
 //
@@ -55,7 +55,7 @@ const (
 	DefaultDescription = "Rensei local daemon — worker pool"
 
 	// DaemonSubcommand is the subcommand the host binary registers for the
-	// service entrypoint. The locked decision (REN-1406) is to register
+	// service entrypoint. The locked decision is to register
 	// `<host-binary> daemon run`, NOT a separate rensei-daemon binary.
 	DaemonSubcommand = "daemon run"
 )
@@ -208,7 +208,7 @@ func ResolveHostBinPath(binPath string) (string, error) {
 // GenerateUnitFile renders a systemd .service unit file for the daemon.
 //
 // The ExecStart line is `<binPath> daemon run` — registering the host
-// binary's daemon run subcommand (locked REN-1406 decision). The unit
+// binary's daemon run subcommand (locked decision). The unit
 // file is arch-agnostic; the binary path is resolved at install time.
 func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string, error) {
 	if binPath == "" {
@@ -242,7 +242,7 @@ func GenerateUnitFile(scope Scope, binPath string, opts InstallOptions) (string,
 		lines = append(lines, "Environment=DONMAI_DAEMON_CONFIG="+opts.ConfigPath)
 	}
 
-	// PATH override (REN-1462 / v0.5.1): prepend ~/.local/bin so
+	// PATH override: prepend ~/.local/bin so
 	// user-local installs of provider CLIs like `claude` (default
 	// install location for the upstream curl|sh script) win over any
 	// stale system-scope copy. The home directory resolves at install

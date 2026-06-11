@@ -26,7 +26,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			EmitsSubagentEvents:      false,
 			SupportsReasoningEffort:  true,
 			SupportsOneShot:          true,
-			NativeJSONMode:           false,
+			NativeJSONMode:           true, // turn/start outputSchema (app-server v2; see turnStartParams)
 			ToolPermissionFormat:     "codex",
 			StreamingTransport:       "none", // app-server JSON-RPC, not SSE/ndjson over the wire surface
 			Drives:                   []agent.WireProtocol{agent.ProtoOpenAIResponses, agent.ProtoOpenAIChat},

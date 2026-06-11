@@ -69,7 +69,7 @@ type CapacityConfig struct {
 	MaxMemoryMbPerSession int                `yaml:"maxMemoryMbPerSession"     json:"maxMemoryMbPerSession"`
 	ReservedForSystem     ReservedSystemSpec `yaml:"reservedForSystem"         json:"reservedForSystem"`
 	// PoolMaxDiskGb is the LRU-eviction trigger for the workarea pool.
-	// 0 means no limit. (REN-1334.)
+	// 0 means no limit.
 	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
 }
 
@@ -88,7 +88,7 @@ type ProjectConfig struct {
 }
 
 // UnmarshalYAML accepts either the canonical `repository` key or the legacy
-// `repoUrl` key (pre-REN-1419 daemon.yaml files written by older versions of
+// `repoUrl` key (legacy daemon.yaml files written by older versions of
 // `rensei project allow`). When the legacy key is found a one-line warning
 // is logged so operators know to rewrite the file; this back-compat shim is
 // scheduled for removal one release after the canonical writer ships.
@@ -112,7 +112,7 @@ func (p *ProjectConfig) UnmarshalYAML(node *yaml.Node) error {
 	case raw.RepoURL != "":
 		p.Repository = raw.RepoURL
 		slog.Warn(
-			"daemon.yaml: legacy 'repoUrl' key on project entry; will be rewritten as 'repository' on next write (REN-1419)",
+			"daemon.yaml: legacy 'repoUrl' key on project entry; will be rewritten as 'repository' on next write",
 			"id", raw.ID,
 			"repoUrl", raw.RepoURL,
 		)
@@ -137,6 +137,40 @@ type AutoUpdateConfig struct {
 	Channel             UpdateChannel  `yaml:"channel"             json:"channel"`
 	Schedule            UpdateSchedule `yaml:"schedule"            json:"schedule"`
 	DrainTimeoutSeconds int            `yaml:"drainTimeoutSeconds" json:"drainTimeoutSeconds"`
+
+	// Signers is the allowlist of identities trusted to sign release
+	// binaries. Auto-update is fail-closed: when this list is empty the
+	// daemon refuses every binary swap. Each downloaded binary must come
+	// with a sibling sigstore bundle (`<binary>.sigstore`, e.g. produced
+	// by `cosign sign-blob --bundle … --new-bundle-format`) whose
+	// certificate matches one of these identities and chains to the
+	// configured trust root. See daemon/README.md § "Auto-update signing".
+	Signers []UpdateSigner `yaml:"signers,omitempty" json:"signers,omitempty"`
+
+	// TrustRootPath optionally points at a sigstore trusted-root JSON
+	// file used to verify update bundles — for private sigstore
+	// deployments. Empty = the embedded public Sigstore production trust
+	// root (the same root kit verification uses; see kit_trust.go).
+	TrustRootPath string `yaml:"trustRootPath,omitempty" json:"trustRootPath,omitempty"`
+}
+
+// UpdateSigner pins one identity trusted to sign release binaries.
+// Issuer plus at least one of SAN/SANRegex is required: sigstore identity
+// verification is only meaningful when the certificate subject AND the
+// OIDC issuer that authenticated it are pinned together.
+type UpdateSigner struct {
+	// SAN is the exact Fulcio certificate subject
+	// (SubjectAlternativeName), e.g. a signer e-mail for
+	// key-based/manual signing setups.
+	SAN string `yaml:"san,omitempty" json:"san,omitempty"`
+	// SANRegex matches the certificate subject by regular expression —
+	// needed for CI workflow identities whose SAN embeds the release
+	// ref, e.g.
+	// "^https://github\\.com/<org>/<repo>/\\.github/workflows/release\\.yml@refs/tags/v.+$".
+	SANRegex string `yaml:"sanRegex,omitempty" json:"sanRegex,omitempty"`
+	// Issuer is the OIDC issuer that authenticated the signer, e.g.
+	// "https://token.actions.githubusercontent.com" for GitHub Actions.
+	Issuer string `yaml:"issuer" json:"issuer"`
 }
 
 // ObservabilityConfig holds optional log/metrics tuning.
@@ -317,6 +351,14 @@ func validateConfig(c *Config) error {
 	case "", ScheduleNightly, ScheduleOnRelease, ScheduleManual:
 	default:
 		return fmt.Errorf("autoUpdate.schedule invalid: %q", c.AutoUpdate.Schedule)
+	}
+	for i, s := range c.AutoUpdate.Signers {
+		if strings.TrimSpace(s.SAN) == "" && strings.TrimSpace(s.SANRegex) == "" {
+			return fmt.Errorf("autoUpdate.signers[%d]: san or sanRegex is required", i)
+		}
+		if strings.TrimSpace(s.Issuer) == "" {
+			return fmt.Errorf("autoUpdate.signers[%d].issuer is required", i)
+		}
 	}
 	switch c.Trust.Mode {
 	case "", TrustModePermissive, TrustModeSignedByAllowlist, TrustModeAttested:

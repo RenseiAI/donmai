@@ -14,7 +14,7 @@ package afcli
 //   1.5. No env key + WORKER_AUTH_TOKEN + DONMAI_API_URL set → in-box cloud
 //      agent. The runner exports the short-lived worker runtime JWT and the
 //      platform URL; proxy GraphQL through /api/cli/linear/graphql under that
-//      JWT (the route accepts it as an additive auth fall-through). REN-1554.
+//      JWT (the route accepts it as an additive auth fall-through).
 //   2. No env key + ds() returns an authenticated *afclient.Client (rsk_ token
 //      + base URL) → platform proxy mode via `linear.NewProxiedClient`. The
 //      platform unwraps the rsk_, looks up the org's stored Linear OAuth

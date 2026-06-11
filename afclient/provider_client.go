@@ -2,7 +2,7 @@
 // /api/daemon/providers* surface. The wire types live in
 // provider_types.go; this file holds the HTTP method bodies. The contract
 // is locked in
-// rensei-architecture/ADR-2026-05-07-daemon-http-control-api.md (D1).
+// donmai-architecture/ADR-2026-05-07-daemon-http-control-api.md (D1).
 package afclient
 
 import "fmt"

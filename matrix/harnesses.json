@@ -119,7 +119,7 @@
         "subagents": false,
         "reasoningEffort": true,
         "oneShot": true,
-        "nativeJsonMode": false,
+        "nativeJsonMode": true,
         "toolPermissionFormat": "codex",
         "streamingTransport": "none",
         "drives": [
@@ -188,7 +188,7 @@
         "inject": true,
         "resume": false,
         "tools": true,
-        "mcp": false,
+        "mcp": true,
         "allowedToolsList": true,
         "subagents": false,
         "reasoningEffort": true,

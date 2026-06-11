@@ -50,7 +50,7 @@ type PollWorkItem struct {
 	QueuedAt     int64             `json:"queuedAt,omitempty"`
 	ProjectScope string            `json:"projectScope,omitempty"`
 
-	// REN-1461 / F.2.8 — enriched fields the platform may send so the
+	// F.2.8 — enriched fields the platform may send so the
 	// `donmai agent run` worker has the runner context it needs without
 	// requiring a separate platform fetch. Optional during the rollout
 	// window; absent fields fall through to the default render path.
@@ -69,7 +69,7 @@ type PollWorkItem struct {
 	ResolvedProfile   *SessionResolvedProfile `json:"resolvedProfile,omitempty"`
 	ModelProfile      *SessionModelProfile    `json:"modelProfile,omitempty"`
 
-	// REN-1485 / REN-1487 Phase 2 stage-driven SDLC fields. Populated
+	// Phase 2 stage-driven SDLC fields. Populated
 	// by the platform's `agent.dispatch_stage` action; absent when the
 	// work was queued by the legacy `agent.dispatch_to_queue` action.
 	// Round-trip opaquely on the QueuedWork JSON; the daemon forwards
@@ -85,7 +85,7 @@ type PollWorkItem struct {
 	// when non-empty. The leaf consumer at `prompt/builder.go` already
 	// reads `qw.SystemPromptOverride`; this struct field is the wire-
 	// shape forwarder. Without it Go's strict JSON decoder drops the
-	// platform's emit (unknown-field discard) — SUP-1840 backlog-writer
+	// platform's emit (unknown-field discard) — backlog-writer
 	// sessions fell through to system_base.tmpl and produced developer-
 	// style behavior (`pnpm af-linear`, Bash/Write/Edit churn).
 	SystemPromptOverride string `json:"systemPromptOverride,omitempty"`
@@ -129,7 +129,7 @@ type PollWorkItem struct {
 	// SystemPromptOverride (v0.9.3). Opaque forwarder only.
 	MemoryBlock string `json:"memoryBlock,omitempty"`
 
-	// ── Interactive run-mode fields (REN-1563 / Wave 2 donmai wire-plumbing) ─
+	// ── Interactive run-mode fields (Wave 2 donmai wire-plumbing) ─
 	//
 	// Mode is the run-mode discriminant ("" = headless, "interview" =
 	// interactive). Forwarded opaquely onto SessionDetail so the runner
@@ -164,7 +164,7 @@ type PollInterviewBudget struct {
 // daemon can decode + forward it without depending on the runner
 // package (cardinal package-architecture rule: daemon does not import
 // runner). The runner re-types this into prompt.StageBudget when it
-// constructs the QueuedWork. (REN-1485 / REN-1487.)
+// constructs the QueuedWork.
 type PollStageBudget struct {
 	MaxDurationSeconds int   `json:"maxDurationSeconds,omitempty"`
 	MaxSubAgents       int   `json:"maxSubAgents,omitempty"`
@@ -181,7 +181,7 @@ type PollResponse struct {
 	// session. Interactive-interview user turns (kind="user") arrive here as
 	// well as on the heartbeat lock-refresh piggyback; the daemon routes a
 	// kind="user" inbox message to the running session via OnInbox so the
-	// runner can inject it (REN-1563 / CONTRACT-FREEZE §3). Without this
+	// runner can inject it (CONTRACT-FREEZE §3). Without this
 	// field Go's strict JSON decoder silently drops the platform's emit —
 	// the messages were decoded into nothing and never routed.
 	InboxMessages     map[string][]InboxMessage `json:"inboxMessages,omitempty"`
@@ -240,8 +240,8 @@ type PollOptions struct {
 	// OnWork is invoked for each item returned in the work[] slice. Errors are
 	// logged at warn and do not stop the loop. Required.
 	OnWork func(item PollWorkItem) error
-	// OnInbox is invoked for each inbox message routed to a running session
-	// (REN-1563). The poll loop decodes the inboxMessages map and calls
+	// OnInbox is invoked for each inbox message routed to a running
+	// session. The poll loop decodes the inboxMessages map and calls
 	// OnInbox(sessionID, msg) for every message; the daemon wires this to
 	// forward the message into the running session — for a kind="user"
 	// interview turn, into the runner's live agent.Handle.Inject path. Optional:
@@ -293,6 +293,30 @@ func NewPollService(opts PollOptions) *PollService {
 		opts:     opts,
 		workerID: opts.WorkerID,
 		jwt:      opts.RuntimeJWT,
+	}
+}
+
+// CurrentCredentials returns the worker id and runtime JWT currently in
+// use. Mirrors HeartbeatService.CurrentCredentials.
+func (p *PollService) CurrentCredentials() (workerID, runtimeJWT string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.workerID, p.jwt
+}
+
+// SetCredentials swaps the worker id + runtime JWT this service presents.
+// Called by the daemon whenever ANOTHER path re-minted credentials (the
+// proactive token refresher, or the heartbeat's reactive refresh) so the
+// poll loop does not have to burn its own 401 round-trip — and its own log
+// cycle — to discover them. Empty values are ignored.
+func (p *PollService) SetCredentials(workerID, jwt string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if workerID != "" {
+		p.workerID = workerID
+	}
+	if jwt != "" {
+		p.jwt = jwt
 	}
 }
 
@@ -366,7 +390,7 @@ func (p *PollService) pollOnce(ctx context.Context) {
 			}
 		}
 		// Route any inbox messages (interactive-interview user turns +
-		// memory blocks) to the running sessions. REN-1563: previously the
+		// memory blocks) to the running sessions. Previously the
 		// inboxMessages map was not even decoded, so a kind="user" turn
 		// delivered on the poll transport was silently discarded. We now
 		// decode it and forward each message via OnInbox so the daemon can
@@ -376,7 +400,7 @@ func (p *PollService) pollOnce(ctx context.Context) {
 	}
 	if isPollAuthFailure(err) && p.opts.OnReregister != nil {
 		// Surface the structured [runtime-token] event mirroring the
-		// heartbeat path — REN-1481 observers see one log line per
+		// heartbeat path — observers see one log line per
 		// cycle on either path.
 		reason := pollAuthFailureReason(err)
 		slog.Info("[runtime-token]",
@@ -384,7 +408,10 @@ func (p *PollService) pollOnce(ctx context.Context) {
 			"path", "poll",
 			"reason", reason,
 		)
-		p.opts.LogWarn("daemon poll rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
+		// Routine + self-healing (the refresh fires right below), so Info
+		// not Warn — with the proactive refresher running this path is the
+		// backstop, not the steady state.
+		p.opts.LogInfo("daemon poll rejected (%v) — refreshing runtime token (reason=%s)", err, reason)
 		newWorkerID, newJWT, regErr := p.opts.OnReregister(ctx, reason)
 		if regErr != nil {
 			p.opts.LogWarn("daemon poll runtime-token refresh failed: %v", regErr)
@@ -405,7 +432,7 @@ func (p *PollService) pollOnce(ctx context.Context) {
 // OnInbox is back-compat, not a hard drop). Whitespace-only messages are
 // skipped. Errors from OnInbox are logged at warn and never stop the loop.
 //
-// REN-1563 / CONTRACT-FREEZE §3: the kind="user" inbox message is the
+// CONTRACT-FREEZE §3: the kind="user" inbox message is the
 // interactive-interview user turn; the daemon's OnInbox implementation
 // routes it into the running session's runner so handle.Inject (claude
 // --resume) delivers it as the next turn.
@@ -550,7 +577,7 @@ func isPollAuthFailure(err error) bool {
 // poll path: classifies a 401/404 into a short structured reason for
 // the [runtime-token] log line. Uses the platform's specific
 // "Runtime token expired" message as the smoking-gun signal for the
-// REN-1481 refresh path.
+// runtime-token refresh path.
 func pollAuthFailureReason(err error) string {
 	var hErr *PollHTTPError
 	if errors.As(err, &hErr) {
@@ -571,7 +598,7 @@ func pollAuthFailureReason(err error) string {
 // the platform sent as the poll-item project identifier (a Linear project
 // slug, the GitHub URL, or a suffix-equivalent of either).
 //
-// The match logic mirrors WorkerSpawner.findProjectLocked (REN-1448) so
+// The match logic mirrors WorkerSpawner.findProjectLocked so
 // the SessionDetail.repository the runner sees is the SAME entry the
 // spawner will later validate the SessionSpec against:
 //
@@ -580,7 +607,6 @@ func pollAuthFailureReason(err error) string {
 //   - URL-suffixes ".../<id>" or ".../<repository>"
 //
 // Returns (nil, false) when the value is empty or no entry matches.
-// (REN-1464 / v0.5.2.)
 func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*ProjectConfig, bool) {
 	if value == "" {
 		return nil, false
@@ -606,8 +632,7 @@ func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*Proje
 // daemon's project allowlist matches the slug we substitute the URL
 // from p.Repository so `git clone <repo>` actually targets a real URL
 // instead of failing with "fatal: repository 'smoke-alpha' does not
-// exist" (the v0.5.1 failure mode this v0.5.2 hotfix is for —
-// REN-1463 / REN-1464).
+// exist" (the v0.5.1 failure mode this v0.5.2 hotfix is for).
 //
 // When no allowlist match exists we fall through to whatever the
 // platform sent (preserving prior behaviour) and emit a Warn log so
@@ -701,7 +726,7 @@ func resolveAllowlistedRepo(item PollWorkItem, projects []ProjectConfig) (repo s
 // allowlist using the SAME matcher as the WorkerSpawner (slug, URL, or
 // URL-suffix). The runner uses this URL for `git clone` — a slug
 // passed through unchanged would fail with "fatal: repository '<slug>'
-// does not exist" (REN-1463 / REN-1464). When no match is found we
+// does not exist". When no match is found we
 // fall back to whatever the platform sent and emit a Warn log so the
 // fallback is visible in operator logs.
 //

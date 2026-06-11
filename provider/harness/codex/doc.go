@@ -13,7 +13,7 @@
 // are multiplexed as JSON-RPC `thread/start` calls; each Handle subscribes
 // to notifications matching its threadId. This mirrors the legacy TS
 // `CodexAppServerProvider`/`AppServerProcessManager` pair from
-// ../agentfactory/packages/core/src/providers/codex-app-server-provider.ts.
+// ../donmai-libraries/packages/core/src/providers/codex-app-server-provider.ts.
 //
 // # Why no exec fallback
 //

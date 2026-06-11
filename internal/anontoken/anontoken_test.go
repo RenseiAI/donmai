@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -137,19 +138,19 @@ func TestClaimURL_Format(t *testing.T) {
 			name:    "explicit base URL",
 			token:   "dmk_abc123",
 			baseURL: "https://donmai.dev/dashboard",
-			want:    "https://donmai.dev/dashboard/api/auth/claim?token=dmk_abc123",
+			want:    "https://donmai.dev/dashboard/claim#token=dmk_abc123",
 		},
 		{
 			name:    "default base URL",
 			token:   "dmk_xyz456",
 			baseURL: "",
-			want:    "https://donmai.dev/dashboard/api/auth/claim?token=dmk_xyz456",
+			want:    "https://donmai.dev/dashboard/claim#token=dmk_xyz456",
 		},
 		{
 			name:    "custom base URL",
 			token:   "dmk_test",
 			baseURL: "http://localhost:3000",
-			want:    "http://localhost:3000/api/auth/claim?token=dmk_test",
+			want:    "http://localhost:3000/claim#token=dmk_test",
 		},
 	}
 
@@ -161,5 +162,30 @@ func TestClaimURL_Format(t *testing.T) {
 				t.Errorf("ClaimURL(%q, %q) = %q, want %q", tc.token, tc.baseURL, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestClaimURL_TokenNeverInQueryOrPath pins the security contract: the dmk_
+// machine token must ride ONLY in the URL fragment. A query-string (or path)
+// regression would leak the secret into server access logs, proxy logs, and
+// Referer headers — fragments are never sent over the wire.
+func TestClaimURL_TokenNeverInQueryOrPath(t *testing.T) {
+	t.Parallel()
+	const token = "dmk_deadbeef" //nolint:gosec // G101: synthetic test fixture, not a credential
+
+	for _, baseURL := range []string{"", "https://donmai.dev/dashboard", "http://localhost:3000"} {
+		got := ClaimURL(token, baseURL)
+
+		frag := strings.Index(got, "#")
+		if frag < 0 {
+			t.Fatalf("ClaimURL(%q, %q) = %q: no fragment — token must be fragment-carried", token, baseURL, got)
+		}
+		wire := got[:frag] // the part a browser actually sends
+		if strings.Contains(wire, token) {
+			t.Errorf("ClaimURL(%q, %q) = %q: token appears outside the fragment", token, baseURL, got)
+		}
+		if !strings.Contains(got[frag:], "token="+token) {
+			t.Errorf("ClaimURL(%q, %q) = %q: fragment missing token=", token, baseURL, got)
+		}
 	}
 }
