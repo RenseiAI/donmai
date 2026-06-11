@@ -152,7 +152,7 @@ func (m *Model) Update(msg tea.Msg) tea.Cmd {
 		if msg.err == nil && len(msg.activities) > 0 {
 			lines := make([]string, 0, len(msg.activities))
 			for _, a := range msg.activities {
-				lines = append(lines, renderActivityLine(a, m.width))
+				lines = append(lines, renderActivityLine(a))
 			}
 			m.logViewer.Append(lines...)
 			m.activityCursor = msg.cursor
@@ -425,6 +425,7 @@ func (m *Model) renderBottomBar() string {
 		{"s", "stop"},
 		{"p", "prompt"},
 		{"f", "follow"},
+		{"w", "wrap"},
 		{"\u2191\u2193", "scroll"},
 		{"?", "help"},
 	}
