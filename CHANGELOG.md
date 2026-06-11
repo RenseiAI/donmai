@@ -10,6 +10,11 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Changes
 
+- **Arch-drift seam is contract-only.** Removed the `LaneAdapter` reference
+  implementation from `afclient/codeintel` — per
+  ADR-2026-06-07-intelligence-implementation-is-platform, OSS ships the
+  `ModelAdapter` interface, request/response types, and `DriftVerdictSchema`
+  only; drift implementations live with the intelligence owner.
 - **Governor queue: legacy `agentfactory:governor:queue` dual-write/dual-read
   removed.** The debrand transition window is over — `Enqueue` writes only the
   canonical `donmai:governor:queue` key and `Peek` no longer falls back to the

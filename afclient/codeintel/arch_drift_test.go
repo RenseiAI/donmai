@@ -1,172 +1,143 @@
 package codeintel
 
+// arch_drift_test.go — pins the drift-seam CONTRACT (types + schema). There is
+// deliberately no adapter implementation under test: per
+// ADR-2026-06-07-intelligence-implementation-is-platform.md the OSS tree ships
+// the ModelAdapter seam only; implementations live platform-side.
+
 import (
-	"context"
-	"errors"
-	"strings"
+	"bytes"
+	"encoding/json"
 	"testing"
 
-	"github.com/RenseiAI/donmai/agent"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-// archFakeHarness is a minimal HarnessProvider that replays a fixed event
-// sequence, driving the real one-shot lane (agent.Complete → SpawnComplete) that
-// LaneAdapter.AssessChange depends on.
-type archFakeHarness struct {
-	events   []agent.Event
-	spawnErr error
-}
-
-func (archFakeHarness) Name() agent.ProviderName         { return agent.ProviderStub }
-func (archFakeHarness) Capabilities() agent.Capabilities { return agent.Capabilities{} }
-func (archFakeHarness) Shutdown(context.Context) error   { return nil }
-func (archFakeHarness) Resume(context.Context, string, agent.Spec) (agent.Handle, error) {
-	return nil, agent.ErrUnsupported
-}
-
-func (archFakeHarness) Manifest() agent.HarnessManifest {
-	return agent.HarnessManifest{Name: agent.HarnessStub}
-}
-
-func (h archFakeHarness) Spawn(_ context.Context, _ agent.Spec) (agent.Handle, error) {
-	if h.spawnErr != nil {
-		return nil, h.spawnErr
-	}
-	ch := make(chan agent.Event, len(h.events))
-	for _, e := range h.events {
-		ch <- e
-	}
-	close(ch)
-	return &archFakeHandle{events: ch}, nil
-}
-
-type archFakeHandle struct{ events chan agent.Event }
-
-func (h *archFakeHandle) SessionID() string                    { return "arch-fake" }
-func (h *archFakeHandle) Events() <-chan agent.Event           { return h.events }
-func (h *archFakeHandle) Inject(context.Context, string) error { return agent.ErrUnsupported }
-func (h *archFakeHandle) Stop(context.Context) error           { return nil }
-
-func emitJSON(text string) []agent.Event {
-	return []agent.Event{
-		agent.AssistantTextEvent{Text: text},
-		agent.ResultEvent{Success: true},
-	}
-}
-
-func sampleReq() AssessChangeRequest {
-	return AssessChangeRequest{
-		Change:       "owner/repo#123",
-		Observations: []DiffObservation{{Kind: "pattern", Payload: map[string]any{"name": "global state"}, Confidence: 0.9, Scope: "project"}},
-		Conventions:  []string{"no global mutable state"},
-	}
-}
-
-func TestLaneAdapter_AssessChange_CriticalDeviation(t *testing.T) {
-	h := archFakeHarness{events: emitJSON(
-		`{"deviations":[{"observation":"global state","severity":"critical","rationale":"violates no-globals"}]}`,
-	)}
-	got, err := LaneAdapter{Harness: h}.AssessChange(context.Background(), sampleReq())
+// compileDriftSchema compiles DriftVerdictSchema, failing the test on any
+// malformed-schema regression.
+func compileDriftSchema(t *testing.T) *jsonschema.Schema {
+	t.Helper()
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(DriftVerdictSchema))
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("DriftVerdictSchema is not valid JSON: %v", err)
 	}
-	if !got.SchemaOK {
-		t.Errorf("SchemaOK = false, want true")
+	c := jsonschema.NewCompiler()
+	if err := c.AddResource("archdrift://verdict-schema", doc); err != nil {
+		t.Fatalf("AddResource: %v", err)
 	}
-	if len(got.Deviations) != 1 || got.Deviations[0].Severity != SeverityCritical {
-		t.Fatalf("deviations = %+v", got.Deviations)
-	}
-	if !got.HasCriticalDrift {
-		t.Errorf("HasCriticalDrift = false, want true")
-	}
-}
-
-func TestLaneAdapter_AssessChange_NoDeviations(t *testing.T) {
-	h := archFakeHarness{events: emitJSON(`{"deviations":[]}`)}
-	got, err := LaneAdapter{Harness: h}.AssessChange(context.Background(), sampleReq())
+	sch, err := c.Compile("archdrift://verdict-schema")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("DriftVerdictSchema does not compile as a JSON Schema: %v", err)
 	}
-	if !got.SchemaOK {
-		t.Errorf("SchemaOK = false, want true")
+	return sch
+}
+
+// TestDriftVerdictSchema_Validation pins the schema contract a ModelAdapter
+// implementation's output is certified against.
+func TestDriftVerdictSchema_Validation(t *testing.T) {
+	t.Parallel()
+	sch := compileDriftSchema(t)
+
+	tests := []struct {
+		name    string
+		payload string
+		valid   bool
+	}{
+		{
+			name:    "critical deviation",
+			payload: `{"deviations":[{"observation":"global state","severity":"critical","rationale":"violates no-globals"}]}`,
+			valid:   true,
+		},
+		{
+			name:    "empty deviations",
+			payload: `{"deviations":[]}`,
+			valid:   true,
+		},
+		{
+			name:    "optional citation",
+			payload: `{"deviations":[{"observation":"x","severity":"info","rationale":"r","citation":"doc §2"}]}`,
+			valid:   true,
+		},
+		{
+			name:    "missing required severity",
+			payload: `{"deviations":[{"observation":"x","rationale":"r"}]}`,
+			valid:   false,
+		},
+		{
+			name:    "severity outside enum",
+			payload: `{"deviations":[{"observation":"x","severity":"fatal","rationale":"r"}]}`,
+			valid:   false,
+		},
+		{
+			name:    "missing deviations key",
+			payload: `{"verdict":"ok"}`,
+			valid:   false,
+		},
 	}
-	if len(got.Deviations) != 0 || got.HasCriticalDrift {
-		t.Errorf("expected no deviations + no critical drift, got %+v / %v", got.Deviations, got.HasCriticalDrift)
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			doc, err := jsonschema.UnmarshalJSON(bytes.NewReader([]byte(tc.payload)))
+			if err != nil {
+				t.Fatalf("payload is not valid JSON: %v", err)
+			}
+			err = sch.Validate(doc)
+			if tc.valid && err != nil {
+				t.Errorf("payload should validate, got: %v", err)
+			}
+			if !tc.valid && err == nil {
+				t.Error("payload should NOT validate, but did")
+			}
+		})
 	}
 }
 
-func TestLaneAdapter_AssessChange_WarningOnly(t *testing.T) {
-	h := archFakeHarness{events: emitJSON(
-		`{"deviations":[{"observation":"x","severity":"warning","rationale":"minor"}]}`,
-	)}
-	got, err := LaneAdapter{Harness: h}.AssessChange(context.Background(), sampleReq())
+// TestDeviation_WireShape pins the JSON field names Deviation marshals to —
+// they must stay compatible with DriftVerdictSchema (and the legacy TS shape)
+// so a platform-side ModelAdapter and this contract never skew.
+func TestDeviation_WireShape(t *testing.T) {
+	t.Parallel()
+
+	d := Deviation{
+		Observation: "global state",
+		Severity:    SeverityCritical,
+		Rationale:   "violates no-globals",
+		Citation:    "conventions §1",
+	}
+	raw, err := json.Marshal(d)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("marshal: %v", err)
 	}
-	if got.HasCriticalDrift {
-		t.Errorf("HasCriticalDrift = true, want false for warning-only")
-	}
-	if len(got.Deviations) != 1 {
-		t.Errorf("want 1 deviation, got %d", len(got.Deviations))
-	}
-}
 
-func TestLaneAdapter_AssessChange_SoftMiss(t *testing.T) {
-	// Model emits prose, not schema-valid JSON → SchemaOK false, no error.
-	h := archFakeHarness{events: emitJSON("I could not determine any deviations, sorry.")}
-	got, err := LaneAdapter{Harness: h}.AssessChange(context.Background(), sampleReq())
-	if err != nil {
-		t.Fatalf("soft miss must not be an error: %v", err)
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.SchemaOK {
-		t.Errorf("SchemaOK = true, want false on a non-JSON response")
-	}
-	if len(got.Deviations) != 0 || got.HasCriticalDrift {
-		t.Errorf("soft miss must yield no deviations, got %+v", got)
-	}
-}
-
-func TestLaneAdapter_AssessChange_SchemaMismatchIsSoftMiss(t *testing.T) {
-	// Valid JSON but wrong shape (missing required severity) → schema-invalid → soft miss.
-	h := archFakeHarness{events: emitJSON(`{"deviations":[{"observation":"x"}]}`)}
-	got, err := LaneAdapter{Harness: h}.AssessChange(context.Background(), sampleReq())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.SchemaOK {
-		t.Errorf("SchemaOK = true, want false on schema mismatch")
-	}
-}
-
-func TestLaneAdapter_AssessChange_NilHarness(t *testing.T) {
-	_, err := LaneAdapter{}.AssessChange(context.Background(), sampleReq())
-	if err == nil {
-		t.Fatal("expected error for nil Harness")
-	}
-}
-
-func TestLaneAdapter_AssessChange_ProviderError(t *testing.T) {
-	sentinel := errors.New("spawn boom")
-	h := archFakeHarness{spawnErr: sentinel}
-	_, err := LaneAdapter{Harness: h}.AssessChange(context.Background(), sampleReq())
-	if err == nil {
-		t.Fatal("expected provider error to surface")
-	}
-}
-
-// LaneAdapter must satisfy ModelAdapter — the mandated seam.
-var _ ModelAdapter = LaneAdapter{}
-
-func TestRenderAssessPrompt(t *testing.T) {
-	p := renderAssessPrompt(sampleReq())
-	for _, want := range []string{"owner/repo#123", "Observations", "global state", "no global mutable state"} {
-		if !strings.Contains(p, want) {
-			t.Errorf("prompt missing %q:\n%s", want, p)
+	for _, key := range []string{"observation", "severity", "rationale", "citation"} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("Deviation wire shape missing %q: %s", key, raw)
 		}
 	}
-	// No conventions → explicit "(none provided)".
-	empty := renderAssessPrompt(AssessChangeRequest{Observations: []DiffObservation{}})
-	if !strings.Contains(empty, "(none provided)") {
-		t.Errorf("empty conventions should render '(none provided)': %s", empty)
+
+	// A schema-valid verdict document must decode into the typed contract.
+	verdict := []byte(`{"deviations":[{"observation":"x","severity":"warning","rationale":"r"}]}`)
+	sch := compileDriftSchema(t)
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(verdict))
+	if err != nil {
+		t.Fatalf("verdict not valid JSON: %v", err)
+	}
+	if err := sch.Validate(doc); err != nil {
+		t.Fatalf("verdict should validate: %v", err)
+	}
+	var parsed struct {
+		Deviations []Deviation `json:"deviations"`
+	}
+	if err := json.Unmarshal(verdict, &parsed); err != nil {
+		t.Fatalf("typed decode: %v", err)
+	}
+	if len(parsed.Deviations) != 1 || parsed.Deviations[0].Severity != SeverityWarning {
+		t.Fatalf("typed decode mismatch: %+v", parsed.Deviations)
 	}
 }
