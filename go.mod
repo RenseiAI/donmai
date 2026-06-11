@@ -14,6 +14,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/go-git/go-git/v5 v5.19.0
 	github.com/joho/godotenv v1.5.1
+	github.com/mattn/go-runewidth v0.0.21
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/sahilm/fuzzy v0.1.1
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
@@ -95,7 +96,6 @@ require (
 	github.com/letsencrypt/boulder v0.20251110.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/mattn/go-runewidth v0.0.21 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect

@@ -8,6 +8,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/tui-components/theme"
 	"github.com/RenseiAI/tui-components/widget"
+	"github.com/mattn/go-runewidth"
 )
 
 // activityIcon returns the icon for an activity type.
@@ -72,27 +73,37 @@ func renderActivityLine(a afclient.ActivityEvent, width int) string {
 	icon := activityIcon(a.Type)
 	colorStyle := activityColor(a.Type)
 
-	content := a.Content
+	// Budget for the content, in terminal display cells (width minus the
+	// indent + timestamp + icon prefix).
+	budget := width - 18
+	if budget < 20 {
+		budget = 20
+	}
+
+	var badge string
 	if a.ToolName != nil && a.Type == afclient.ActivityAction {
-		badge := lipgloss.NewStyle().
+		badge = lipgloss.NewStyle().
 			Foreground(theme.Default().BgPrimary).
 			Background(theme.Default().Teal).
 			Padding(0, 1).
-			Render(*a.ToolName)
-		content = badge + " " + content
+			Render(*a.ToolName) + " "
+		// The badge spends part of the content budget; measure it in
+		// display cells (ANSI-aware) so the clipped row still fits.
+		if bw := lipgloss.Width(badge); bw < budget {
+			budget -= bw
+		} else {
+			budget = 1
+		}
 	}
 
-	maxContentWidth := width - 18
-	if maxContentWidth < 20 {
-		maxContentWidth = 20
-	}
-	// Clip by runes, never bytes: byte slicing can split a multi-byte UTF-8
-	// sequence mid-character and render mojibake.
-	if runes := []rune(content); len(runes) > maxContentWidth {
-		content = string(runes[:maxContentWidth-3]) + "..."
-	}
+	// Clip by display cells, never runes or bytes: byte slicing splits a
+	// multi-byte UTF-8 sequence into mojibake, and rune counting lets
+	// double-width CJK/emoji runes overflow the row to twice the budget.
+	// runewidth.Truncate measures terminal cells and appends the ellipsis
+	// only when it actually clips.
+	content := runewidth.Truncate(a.Content, budget, "...")
 
-	rendered := colorStyle.Render(content)
+	rendered := badge + colorStyle.Render(content)
 	return fmt.Sprintf("  %s %s %s", tsRendered, icon, rendered)
 }
 
