@@ -397,7 +397,7 @@ func TestIsKnownWorkType(t *testing.T) {
 		{name: "development", in: WorkTypeDevelopmentStr, want: true},
 		{name: "qa", in: WorkTypeQAStr, want: true},
 		{name: "operational scanner", in: WorkTypeOperationalScannerCI, want: true},
-		{name: "typo", in: "developement", want: false},
+		{name: "typo", in: "develop-ment", want: false},
 		{name: "empty", in: "", want: false},
 		{name: "case sensitive", in: "Development", want: false},
 		{name: "batch work types are not agent work types", in: "kg-extraction", want: false},

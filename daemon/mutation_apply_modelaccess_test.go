@@ -296,7 +296,7 @@ func TestApplyPendingMutations_ModelAccess_UnknownOp(t *testing.T) {
 func TestApplyPendingMutations_ModelAccessSet_UnknownWorkloadRejected(t *testing.T) {
 	t.Parallel()
 	// A workload key outside the shared vocabulary (e.g. a typo'd
-	// "developement") can never match at enforcement time — the strict block
+	// "develop-ment") can never match at enforcement time — the strict block
 	// would be stored but silently fall back to the ceiling. The mutation must
 	// fail (NACK) and leave both memory and disk untouched.
 	d, path := newTestDaemonWithProjects(t, nil)
@@ -306,7 +306,7 @@ func TestApplyPendingMutations_ModelAccessSet_UnknownWorkloadRejected(t *testing
 			ID: "set_typo",
 			Op: "modelAccess.set",
 			Params: mustParams(t, map[string]any{
-				"workload": "developement",
+				"workload": "develop-ment",
 				"policy":   anthropicHostSessionPolicy(),
 			}),
 		},
@@ -317,7 +317,7 @@ func TestApplyPendingMutations_ModelAccessSet_UnknownWorkloadRejected(t *testing
 	if len(failures) != 1 || failures[0].ID != "set_typo" {
 		t.Fatalf("failures = %v, want one for set_typo", failures)
 	}
-	if !strings.Contains(failures[0].Error, `unknown workload "developement"`) {
+	if !strings.Contains(failures[0].Error, `unknown workload "develop-ment"`) {
 		t.Errorf("failure.Error = %q, want unknown-workload message", failures[0].Error)
 	}
 	// The error must teach the fix: list the valid vocabulary.
