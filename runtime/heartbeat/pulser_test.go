@@ -374,10 +374,11 @@ func TestInjectPayloadFiresOnInjectAndAcks(t *testing.T) {
 		BaseURL:    srv.URL,
 		HTTPClient: srv.Client(),
 		Interval:   5 * time.Millisecond, // drive a 2nd tick promptly
-		OnInject: func(p heartbeat.InjectPayload) {
+		OnInject: func(p heartbeat.InjectPayload) bool {
 			mu.Lock()
 			received = append(received, p)
 			mu.Unlock()
+			return true
 		},
 	}
 	p, err := heartbeat.New(cfg)
@@ -465,8 +466,9 @@ func TestInjectNotAppliedOnRefreshedFalse(t *testing.T) {
 		MaxAttemptsPerTick: 1,
 		StrikesUntilLost:   2,
 		Sleep:              func(time.Duration) {},
-		OnInject: func(heartbeat.InjectPayload) {
+		OnInject: func(heartbeat.InjectPayload) bool {
 			injectFired.Store(true)
+			return true
 		},
 	}
 	p, err := heartbeat.New(cfg)
@@ -488,6 +490,169 @@ func TestInjectNotAppliedOnRefreshedFalse(t *testing.T) {
 	}
 	if injectFired.Load() {
 		t.Fatal("OnInject fired on refreshed=false; inject must be ignored when ownership is refused")
+	}
+}
+
+// TestInjectRejectedByConsumerStaysUnacked covers the ack-or-requeue
+// contract: when OnInject reports the consumer did NOT accept the payload
+// (e.g. the runner's buffer was full), the pulser must not ack it — the
+// platform keeps re-delivering until a delivery is accepted, and only then
+// does a request carry the ack echo.
+func TestInjectRejectedByConsumerStaysUnacked(t *testing.T) {
+	t.Parallel()
+
+	var sawAck atomic.Bool
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			AckedInject string `json:"ackedInject"`
+		}
+		_ = json.Unmarshal(body, &req)
+		if req.AckedInject == "dlv-1" {
+			sawAck.Store(true)
+			_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+			return
+		}
+		// No ack yet — keep re-delivering the same inject, exactly like
+		// the platform's delivered-but-unacked requeue.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"refreshed": true,
+			"inject": map[string]any{
+				"deliveryId": "dlv-1",
+				"text":       "must not be lost",
+			},
+		})
+	})
+
+	var calls atomic.Int64
+	cfg := heartbeat.Config{
+		SessionID:  "s1",
+		WorkerID:   "w1",
+		IssueID:    "i1",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		Interval:   5 * time.Millisecond,
+		OnInject: func(heartbeat.InjectPayload) bool {
+			// First delivery is rejected (full buffer); the re-delivery
+			// is accepted.
+			return calls.Add(1) > 1
+		},
+	}
+	p, err := heartbeat.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !sawAck.Load() {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !sawAck.Load() {
+		t.Fatal("ack for dlv-1 never arrived after the consumer accepted the re-delivery")
+	}
+	if got := calls.Load(); got < 2 {
+		t.Fatalf("OnInject called %d times; want >= 2 (rejected delivery must be re-delivered)", got)
+	}
+}
+
+// TestStopFlushesPendingInjectAck covers the short-session ack gap (the
+// delivered=true/acked=false strand): an inject accepted on the synchronous
+// first tick whose ack would only ride the NEXT tick must be flushed by
+// Stop with one final ack-only request — short sessions exit long before
+// the next heartbeat interval elapses.
+func TestStopFlushesPendingInjectAck(t *testing.T) {
+	t.Parallel()
+
+	var (
+		hits     atomic.Int64
+		flushAck atomic.Pointer[string]
+	)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			AckedInject string `json:"ackedInject"`
+		}
+		_ = json.Unmarshal(body, &req)
+		if hits.Add(1) == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"refreshed": true,
+				"inject": map[string]any{
+					"deliveryId": "dlv-9",
+					"text":       "applied on the only tick",
+				},
+			})
+			return
+		}
+		acked := req.AckedInject
+		flushAck.Store(&acked)
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+	})
+
+	cfg := heartbeat.Config{
+		SessionID:  "s1",
+		WorkerID:   "w1",
+		IssueID:    "i1",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		Interval:   24 * time.Hour, // no natural second tick
+		OnInject:   func(heartbeat.InjectPayload) bool { return true },
+	}
+	p, err := heartbeat.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("expected exactly 2 requests (tick + Stop ack flush), got %d", got)
+	}
+	if got := flushAck.Load(); got == nil || *got != "dlv-9" {
+		t.Fatalf("Stop flush ackedInject = %v; want dlv-9", got)
+	}
+}
+
+// TestStopSkipsFlushWithoutPendingAck pins the no-op guard: a session that
+// never received an inject must not pay an extra request on Stop.
+func TestStopSkipsFlushWithoutPendingAck(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int64
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+	})
+
+	cfg := heartbeat.Config{
+		SessionID:  "s1",
+		WorkerID:   "w1",
+		IssueID:    "i1",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		Interval:   24 * time.Hour,
+		OnInject:   func(heartbeat.InjectPayload) bool { return true },
+	}
+	p, err := heartbeat.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 request (no ack to flush), got %d", got)
 	}
 }
 
