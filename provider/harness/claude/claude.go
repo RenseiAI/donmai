@@ -136,6 +136,14 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // cleans up the MCP tmpfile and returns an error wrapping
 // agent.ErrSpawnFailed.
 func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID string) (agent.Handle, error) {
+	// Project the resolved model-endpoint binding (when set) onto the
+	// spec the CLI sees: serving-host env knobs (direct/bedrock/vertex),
+	// binding credentials, and the binding's model. See endpoint.go.
+	spec, err := applyEndpoint(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+
 	mcpPath, err := clijsonl.WriteMCPConfig(spec.MCPServers)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)

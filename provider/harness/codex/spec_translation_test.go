@@ -57,13 +57,14 @@ func TestSpecFieldCoverage(t *testing.T) {
 		"ProviderConfig",
 		"SubAgentProvider",
 		"OnProcessSpawned", // documented as honored at spawn time
-		// Endpoint is the additive two-axis model-endpoint binding (P1). The
-		// codex provider takes its cardinal-rule-10 position here: Endpoint is
-		// INTENTIONALLY IGNORED in P1 — no provider reads Spec.Endpoint until
-		// Phase 3 wires resolution, so the codex Spawn translation is byte-for-
-		// byte identical when Endpoint is the zero value (which it always is in
-		// P1). Registered here (the static coverage mirror) so this guard rail
-		// stays green; NewSpawnPlan is unchanged.
+		// Endpoint is the additive two-axis model-endpoint binding. The claude
+		// and gemini harnesses read it (serving-host env knobs / URL routing);
+		// codex takes its cardinal-rule-10 position here: Endpoint is
+		// INTENTIONALLY IGNORED — the codex × openai azure cell needs the
+		// CLI's config-file model_provider wiring (its own change), so the
+		// codex Spawn translation stays byte-for-byte identical when Endpoint
+		// is the zero value. Registered here (the static coverage mirror) so
+		// this guard rail stays green; NewSpawnPlan is unchanged.
 		"Endpoint",
 		// ResponseSchema is the one-shot lane's native structured-output schema
 		// (P4b). It is honored ONLY by NativeJSONMode harnesses (gemini/ollama);

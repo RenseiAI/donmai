@@ -201,9 +201,24 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 
+	// Model resolution: a bound endpoint's model wins over the bare
+	// Spec.Model (the binding is the resolved cell — same rule as the
+	// one-shot lane), then the provider default.
 	model := spec.Model
+	if spec.Endpoint != nil && spec.Endpoint.Model != "" {
+		model = spec.Endpoint.Model
+	}
 	if model == "" {
 		model = p.defaultModel
+	}
+
+	// Endpoint routing: the resolved Spec.Endpoint binding (when set)
+	// picks the serving host (direct vs vertex) and base URL for this
+	// session's generateContent calls. nil == today's behavior (the
+	// construction-time endpoint, direct host).
+	turnURL, err := spawnURL(p.endpoint, model, spec.Endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 
 	plan, err := buildSpawnPlan(spec, model)
@@ -212,6 +227,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	}
 
 	// Per-Spawn credential resolution (per-session BYOK + rotation):
+	// Spec.Endpoint.Env (the deliberately resolved cell credential) →
 	// Spec.Env[GEMINI_API_KEY] → Spec.Env[GOOGLE_API_KEY] → the
 	// construction-time fallback captured in New().
 	apiKey := resolveSpawnKey(spec, p.apiKey)
@@ -246,7 +262,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 
 	return startSession(ctx, sessionParams{
 		apiKey:    apiKey,
-		endpoint:  p.endpoint,
+		turnURL:   turnURL,
 		model:     model,
 		plan:      plan,
 		client:    p.httpClient,
@@ -263,19 +279,93 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 }
 
 // resolveSpawnKey resolves the API key for a single Spawn. The
-// precedence is Spec.Env[GEMINI_API_KEY] → Spec.Env[GOOGLE_API_KEY] →
-// the construction-time fallback. This supports per-session BYOK and
+// precedence is Spec.Endpoint.Env (the resolved cell's deliberately
+// bound credential) → Spec.Env[GEMINI_API_KEY] → Spec.Env[GOOGLE_API_KEY]
+// → the construction-time fallback. This supports per-session BYOK and
 // key rotation without reconstructing the Provider.
 func resolveSpawnKey(spec agent.Spec, fallback string) string {
-	if spec.Env != nil {
-		if k := strings.TrimSpace(spec.Env[EnvAPIKeyPrimary]); k != "" {
-			return k
-		}
-		if k := strings.TrimSpace(spec.Env[EnvAPIKeyFallback]); k != "" {
+	if spec.Endpoint != nil {
+		if k := lookupKey(spec.Endpoint.Env); k != "" {
 			return k
 		}
 	}
+	if k := lookupKey(spec.Env); k != "" {
+		return k
+	}
 	return fallback
+}
+
+// lookupKey probes one env map for the primary then fallback API-key
+// names, ignoring blank values.
+func lookupKey(env map[string]string) string {
+	if env == nil {
+		return ""
+	}
+	if k := strings.TrimSpace(env[EnvAPIKeyPrimary]); k != "" {
+		return k
+	}
+	return strings.TrimSpace(env[EnvAPIKeyFallback])
+}
+
+// EnvVertexProject is the env-var NAME carrying the GCP project id a
+// vertex binding serves from (matches the Google endpoint manifest's
+// declared EnvKeys; name only — never a value).
+const EnvVertexProject = "GOOGLE_VERTEX_PROJECT_ID"
+
+// spawnURL resolves the per-session generateContent URL from the
+// provider's construction endpoint and the optional resolved
+// Spec.Endpoint binding — the read site that makes the declared
+// raw × google matrix cells (direct / vertex) actually route:
+//
+//	host        URL shape
+//	──────────  ─────────────────────────────────────────────────────────
+//	(nil) / ""  {base}/v1beta/models/{model}:generateContent  (today)
+//	direct      as above, with the binding's BaseURL when set
+//	vertex      {base}/v1/projects/{project}/locations/{region}/
+//	            publishers/google/models/{model}:generateContent
+//
+// The vertex cell requires the binding to carry both a project id
+// (Endpoint.Env[GOOGLE_VERTEX_PROJECT_ID]) and a region — a half-bound
+// vertex cell fails loudly rather than silently falling back to the
+// public endpoint (which would mis-route and mis-bill). Auth rides the
+// same x-goog-api-key header on both hosts (the keyed BYOK/metered
+// surface the matrix declares); ADC/OAuth bearer auth is not wired.
+//
+// A binding for a company this harness cannot route (anything
+// non-Google) or an unknown serving host errors for the same reason.
+func spawnURL(constructionEndpoint, model string, ep *agent.EndpointBinding) (string, error) {
+	base := constructionEndpoint
+	host := agent.HostDirect
+	if ep != nil {
+		if ep.Company != "" && ep.Company != agent.CompanyGoogle {
+			return "", fmt.Errorf("endpoint company %q is not routable by the gemini harness", ep.Company)
+		}
+		if ep.Host != "" {
+			host = ep.Host
+		}
+		if ep.BaseURL != "" {
+			base = strings.TrimRight(ep.BaseURL, "/")
+		}
+	}
+
+	switch host {
+	case agent.HostDirect:
+		return fmt.Sprintf("%s/v1beta/models/%s:generateContent", base, model), nil
+	case agent.HostVertex:
+		project := ep.Env[EnvVertexProject]
+		if project == "" || ep.Region == "" {
+			return "", fmt.Errorf(
+				"vertex endpoint binding is missing %s and/or a region (project set: %t, region set: %t)",
+				EnvVertexProject, project != "", ep.Region != "",
+			)
+		}
+		return fmt.Sprintf(
+			"%s/v1/projects/%s/locations/%s/publishers/google/models/%s:generateContent",
+			base, project, ep.Region, model,
+		), nil
+	default:
+		return "", fmt.Errorf("serving host %q is not routable by the gemini harness", host)
+	}
 }
 
 // Resume folds prior conversation history into a fresh Spawn. Gemini's

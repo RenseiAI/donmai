@@ -365,13 +365,18 @@ type Spec struct {
 	// falls back to provider/env default.
 	Model string `json:"model,omitempty"`
 
-	// Endpoint is the RESOLVED model-endpoint binding. nil == today's
+	// Endpoint is the RESOLVED model-endpoint binding. nil == default
 	// behavior: providers read Spec.Model / Spec.Env as before. nil is the
-	// canonical "unset" sentinel; the Phase-3 Spawn read site gates on
-	// Endpoint == nil (a non-nil pointer is treated as set — IsZero on the
-	// pointee is a convenience, not the unset check). Wired into the Spawn
-	// path in Phase 3; no provider reads it in P1. Spec.Model remains the
-	// source of truth and is NOT yet derived from this.
+	// canonical "unset" sentinel; Spawn read sites gate on Endpoint == nil
+	// (a non-nil pointer is treated as set — IsZero on the pointee is a
+	// convenience, not the unset check). Read sites: the claude harness
+	// projects the binding onto the CLI's serving-host env knobs
+	// (direct/bedrock/vertex — provider/harness/claude/endpoint.go) and
+	// the gemini harness routes the per-session generateContent URL
+	// (direct/vertex — spawnURL in provider/harness/gemini/gemini.go).
+	// Both honor Endpoint.Model over Spec.Model when set, the same rule as
+	// the one-shot lane. Harnesses without a read site (codex / opencode /
+	// amp / agycli) still intentionally ignore the field.
 	//
 	// Declared as a POINTER (not a value) so the json:"endpoint,omitempty"
 	// tag actually omits the field for pre-P1 producers — Go's encoding/json

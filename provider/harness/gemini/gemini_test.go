@@ -320,19 +320,27 @@ func TestResolveSpawnKey_Precedence(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name     string
+		epEnv    map[string]string // nil = no Spec.Endpoint
 		env      map[string]string
 		fallback string
 		want     string
 	}{
-		{"primary wins", map[string]string{EnvAPIKeyPrimary: "p", EnvAPIKeyFallback: "g"}, "c", "p"},
-		{"google fallback", map[string]string{EnvAPIKeyFallback: "g"}, "c", "g"},
-		{"construction fallback", nil, "c", "c"},
-		{"blank env values ignored", map[string]string{EnvAPIKeyPrimary: "  "}, "c", "c"},
+		{"primary wins", nil, map[string]string{EnvAPIKeyPrimary: "p", EnvAPIKeyFallback: "g"}, "c", "p"},
+		{"google fallback", nil, map[string]string{EnvAPIKeyFallback: "g"}, "c", "g"},
+		{"construction fallback", nil, nil, "c", "c"},
+		{"blank env values ignored", nil, map[string]string{EnvAPIKeyPrimary: "  "}, "c", "c"},
+		{"endpoint binding wins over session env", map[string]string{EnvAPIKeyPrimary: "ep"}, map[string]string{EnvAPIKeyPrimary: "p"}, "c", "ep"},
+		{"endpoint google key wins over session primary", map[string]string{EnvAPIKeyFallback: "epg"}, map[string]string{EnvAPIKeyPrimary: "p"}, "c", "epg"},
+		{"keyless endpoint falls through to session env", map[string]string{}, map[string]string{EnvAPIKeyPrimary: "p"}, "c", "p"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := resolveSpawnKey(agent.Spec{Env: tc.env}, tc.fallback)
+			spec := agent.Spec{Env: tc.env}
+			if tc.epEnv != nil {
+				spec.Endpoint = &agent.EndpointBinding{Company: agent.CompanyGoogle, Env: tc.epEnv}
+			}
+			got := resolveSpawnKey(spec, tc.fallback)
 			if got != tc.want {
 				t.Errorf("resolveSpawnKey: want %q, got %q", tc.want, got)
 			}

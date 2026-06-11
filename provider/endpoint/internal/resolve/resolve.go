@@ -17,8 +17,9 @@ import (
 
 // FromManifest constructs the resolved EndpointBinding for req.Host without
 // dialing. It looks up the requested host in m.Hosts, templates the base URL
-// with req.Region, copies the host's declared env keys from req.EnvProvided,
-// and returns the binding. Returns an error for an unknown host.
+// with req.Region (also recorded on the binding for harness env/path
+// mapping), copies the host's declared env keys from req.EnvProvided, and
+// returns the binding. Returns an error for an unknown host.
 func FromManifest(m agent.ModelEndpointManifest, req agent.EndpointRequest) (agent.EndpointBinding, error) {
 	var host *agent.HostDesc
 	for i := range m.Hosts {
@@ -45,6 +46,7 @@ func FromManifest(m agent.ModelEndpointManifest, req agent.EndpointRequest) (age
 		Protocol:      host.Protocol,
 		Host:          host.Host,
 		Auth:          req.Auth,
+		Region:        req.Region,
 		CostModel:     host.CostModel,
 		BringsOwnAuth: host.BringsOwnAuth,
 		Env:           env,

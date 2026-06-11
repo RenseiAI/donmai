@@ -31,8 +31,11 @@ var ErrSessionNotReady = errors.New("provider/gemini: session not ready; wait fo
 // sessionParams bundles the pre-spawn inputs Provider.Spawn passes into
 // startSession.
 type sessionParams struct {
-	apiKey    string
-	endpoint  string
+	apiKey string
+	// turnURL is the fully-resolved generateContent URL for this session
+	// (base endpoint + host-shaped path + model), computed once by
+	// Provider.Spawn via spawnURL so the driver never re-derives routing.
+	turnURL   string
 	model     string
 	plan      spawnPlan
 	client    *http.Client
@@ -72,7 +75,7 @@ type injectMsg struct {
 type Handle struct {
 	sessionID string
 	apiKey    string
-	endpoint  string
+	turnURL   string
 	model     string
 	plan      spawnPlan
 	client    *http.Client
@@ -133,7 +136,7 @@ func startSession(ctx context.Context, p sessionParams) (*Handle, error) {
 	h := &Handle{
 		sessionID: p.sessionID,
 		apiKey:    p.apiKey,
-		endpoint:  p.endpoint,
+		turnURL:   p.turnURL,
 		model:     p.model,
 		plan:      p.plan,
 		client:    client,
@@ -382,8 +385,7 @@ func (h *Handle) buildTurnBody() ([]byte, error) {
 // body. Non-200 responses surface as an error wrapping the status + body
 // tail.
 func (h *Handle) postTurn(ctx context.Context, body []byte) ([]byte, error) {
-	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent", h.endpoint, h.model)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.turnURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}

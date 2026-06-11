@@ -82,6 +82,9 @@ var linearMCPDisallowList = []string{
 //	MCPToolNames        → appended to AllowedTools so headless agents can call them
 //	MaxTurns            → --max-turns <n>
 //	Model               → --model <id>
+//	Endpoint            → applied BEFORE buildArgs by spawn via applyEndpoint
+//	                      (endpoint.go): serving-host env knobs + binding
+//	                      env/model are projected onto Spec.Env / Spec.Model
 //	Effort              → --effort <level>
 //	BaseInstructions    → no flag (Codex-only); silently dropped
 //	SystemPromptAppend  → --append-system-prompt <text>
