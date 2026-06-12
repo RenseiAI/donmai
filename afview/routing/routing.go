@@ -448,7 +448,7 @@ func RenderExplain(out io.Writer, resp *afclient.RoutingExplainResponse, noColor
 
 	_, _ = fmt.Fprintln(out, bold("Decision Trace", noColor))
 	for _, step := range resp.Trace {
-		stepHeader := fmt.Sprintf("Step %d — %s [%s]",
+		stepHeader := fmt.Sprintf("Step %d: %s [%s]",
 			step.Step,
 			step.Phase,
 			step.Dimension,
@@ -474,7 +474,7 @@ func RenderExplain(out io.Writer, resp *afclient.RoutingExplainResponse, noColor
 			if e.Detail != "" {
 				detail = " (" + e.Detail + ")"
 			}
-			_, _ = fmt.Fprintf(out, "  %s %s — %s%s\n",
+			_, _ = fmt.Fprintf(out, "  %s %s: %s%s\n",
 				muted("Eliminated:", noColor),
 				errStr(e.ProviderID, noColor),
 				e.Reason,

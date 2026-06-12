@@ -467,7 +467,7 @@ func postDrafts(ctx context.Context, drafts []DraftedIssue, teamName, projectNam
 func printHumanResult(w io.Writer, r AnalysisResult, dryRun bool) {
 	_, _ = fmt.Fprintf(w, "\n=== Donmai Log Analyzer ===\n\n")
 	if dryRun {
-		_, _ = fmt.Fprintf(w, "[DRY RUN MODE — No issues will be created]\n\n")
+		_, _ = fmt.Fprintf(w, "[DRY RUN MODE - No issues will be created]\n\n")
 	}
 	_, _ = fmt.Fprintf(w, "Lines scanned:   %d\n", r.LinesScanned)
 	_, _ = fmt.Fprintf(w, "Error lines:     %d\n", r.ErrorLines)
@@ -488,7 +488,7 @@ func printHumanResult(w io.Writer, r AnalysisResult, dryRun bool) {
 		for _, d := range r.DraftedIssues {
 			switch {
 			case d.Posted:
-				_, _ = fmt.Fprintf(w, "  [CREATED] %s — %s\n", d.Identifier, d.Title)
+				_, _ = fmt.Fprintf(w, "  [CREATED] %s: %s\n", d.Identifier, d.Title)
 			case dryRun:
 				_, _ = fmt.Fprintf(w, "  [WOULD CREATE] %s\n", d.Title)
 			default:

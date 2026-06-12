@@ -1,7 +1,7 @@
-// Package codeintel — native arch-intel diff/gate layer.
+// Package codeintel - native arch-intel diff/gate layer.
 //
-// This file ports the pure-regex/JSON layers of the TS
-// @donmai/architectural-intelligence package to Go:
+// This file ports the pure-regex/JSON layers of the legacy TS
+// architectural-intelligence package to Go:
 //
 //   - ReadDiffObservations — file-path zone inference, convention detection,
 //     decision inference, acceptance-criteria inference (all pure regex).

@@ -11,14 +11,14 @@ import (
 
 // newArchCmd constructs the `donmai arch` command tree.
 //
-// The assess subcommand is implemented NATIVELY in Go (Layer 1) — no external
+// The assess subcommand is implemented NATIVELY in Go (Layer 1) - no external
 // binary required. It fetches the REAL PR diff via the GitHub CLI (`gh`) and
 // runs pure-Go regex diff/gate analysis ("mode":"native-diff-only"). No LLM and
 // no datastore are involved.
 //
-// A DEPRECATED exec-shim (the @donmai/architectural-intelligence TS package) can
-// be opted into via DONMAI_ARCH_BIN or af-arch on PATH; it emits a one-time
-// deprecation notice and will be removed in a future release.
+// A DEPRECATED exec-shim (legacy TS arch implementation) can be opted into via
+// DONMAI_ARCH_BIN or af-arch on PATH; it emits a one-time deprecation notice
+// and will be removed in a future release.
 //
 // NOTE: the Layer-2 arch-intelligence pipeline (learned baseline + LLM deviation
 // detection) is platform-owned per ADR-2026-06-07 and is NOT part
@@ -29,8 +29,8 @@ func newArchCmd(cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "arch",
-		Short: "Architectural intelligence — native Layer-1 drift detection for PRs",
-		Long: `Architectural intelligence — native Go arch-intel (Layer 1).
+		Short: "Architectural intelligence: native Layer-1 drift detection for PRs",
+		Long: `Architectural intelligence - native Go arch-intel (Layer 1).
 
 Detects architectural drift in a PR/commit entirely in-process: it fetches the
 PR diff via the GitHub CLI (gh), indexes the change (Layer 1), and runs pure-Go
@@ -38,13 +38,13 @@ regex diff/gate analysis. No external binary, LLM, or datastore is required. All
 commands output JSON to stdout by default.
 
 Exit codes (assess subcommand):
-  0  Clean — no deviations or gate not triggered
-  1  Gated — threshold exceeded per policy
-  2  Error — invalid args, network failure, parse error
+  0  Clean - no deviations or gate not triggered
+  1  Gated - threshold exceeded per policy
+  2  Error - invalid args, network failure, parse error
 
 Environment:
   DONMAI_DRIFT_GATE     Gate policy: none | no-severity-high | zero-deviations | max:N
-  DONMAI_ARCH_BIN       DEPRECATED — opt into the legacy TS shim (see below)
+  DONMAI_ARCH_BIN       DEPRECATED - opt into the legacy TS shim (see below)
 
 The native pipeline fetches the PR diff via the GitHub CLI (gh) and performs
 pure-regex diff/gate analysis ("mode":"native-diff-only"). Without gh on PATH it
@@ -53,10 +53,9 @@ degrades to PR-metadata-only analysis.
 The Layer-2 arch-intelligence pipeline (learned baseline + LLM deviation
 detection) is platform-owned and not part of this OSS surface.
 
-DEPRECATED shim: set DONMAI_ARCH_BIN (or install af-arch via
-'npm install -g @donmai/cli') to force the legacy @donmai/architectural-intelligence
-TS implementation. This path is deprecated, emits a one-time notice, and will be
-removed once the native pipeline is the sole supported path.`,
+DEPRECATED shim: set DONMAI_ARCH_BIN to force the legacy TS arch shim.
+This path is deprecated, emits a one-time notice, and will be removed once
+the native pipeline is the sole supported path.`,
 		SilenceUsage: true,
 	}
 

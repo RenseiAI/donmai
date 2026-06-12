@@ -90,7 +90,7 @@ func newAgentRunCmd() *cobra.Command {
 			"The session id is read from --session-id or the\n" +
 			"DONMAI_SESSION_ID environment variable (set automatically by\n" +
 			"the daemon spawner).\n\n" +
-			"Operators rarely invoke this directly — `donmai daemon run` spawns it\n" +
+			"Operators rarely invoke this directly. `donmai daemon run` spawns it\n" +
 			"on every accepted session. To debug a session locally, set\n" +
 			"DONMAI_SESSION_ID and invoke this command against a running\n" +
 			"daemon.",
@@ -530,7 +530,7 @@ func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor) *runner.R
 		assertLegacyAlias(logger, p)
 	}
 	if len(reg.Names()) == 0 {
-		logger.Error("donmai agent run: no providers available — every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `donmai doctor`.")
+		logger.Error("donmai agent run: no providers available. Every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `donmai doctor`.")
 	}
 	return reg
 }

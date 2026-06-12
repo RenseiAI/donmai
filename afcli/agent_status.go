@@ -14,7 +14,7 @@ import (
 )
 
 // emDash is the placeholder rendered for nil pointer fields in human output.
-const emDash = "—"
+const emDash = "-"
 
 // agentStatusJSON is the combined payload emitted by `agent status --json`.
 // Activity is a pointer so it is omitted entirely when the session has no
@@ -105,7 +105,7 @@ func latestActivity(events []afclient.ActivityEvent) *afclient.ActivityEvent {
 }
 
 // writeSessionDetail renders the eight-row detail block to w using tabwriter
-// for column alignment. Nil pointer fields on SessionDetail render as em-dash.
+// for column alignment. Nil pointer fields on SessionDetail render as "-".
 func writeSessionDetail(w io.Writer, s afclient.SessionDetail, current *afclient.ActivityEvent) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
@@ -131,7 +131,7 @@ func writeSessionDetail(w io.Writer, s afclient.SessionDetail, current *afclient
 	return nil
 }
 
-// intPtrValue renders a *int as a decimal string, or em-dash when nil.
+// intPtrValue renders a *int as a decimal string, or "-" when nil.
 func intPtrValue(v *int) string {
 	if v == nil {
 		return emDash
@@ -139,7 +139,7 @@ func intPtrValue(v *int) string {
 	return strconv.Itoa(*v)
 }
 
-// costValue renders a *float64 USD cost as "$1.2345", or em-dash when nil.
+// costValue renders a *float64 USD cost as "$1.2345", or "-" when nil.
 func costValue(v *float64) string {
 	if v == nil {
 		return emDash
@@ -147,10 +147,10 @@ func costValue(v *float64) string {
 	return fmt.Sprintf("$%.4f", *v)
 }
 
-// activityValue renders an activity as "Type — Content", or em-dash when nil.
+// activityValue renders an activity as "Type: Content", or "-" when nil.
 func activityValue(a *afclient.ActivityEvent) string {
 	if a == nil {
 		return emDash
 	}
-	return fmt.Sprintf("%s — %s", string(a.Type), a.Content)
+	return fmt.Sprintf("%s: %s", string(a.Type), a.Content)
 }

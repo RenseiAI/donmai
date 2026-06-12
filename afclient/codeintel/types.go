@@ -9,8 +9,8 @@
 //
 // # index.json schema compatibility
 //
-// The persisted schema is byte-compatible with the TypeScript
-// @donmai/code-intelligence IncrementalIndexer.save() output:
+// The persisted schema is byte-compatible with the legacy TypeScript
+// code-intelligence IncrementalIndexer.save() output:
 //
 //	{ "files": { "<filePath>": FileIndex }, "rootHash": "<hash>" }
 //
@@ -22,19 +22,19 @@
 //
 // For subcommands not yet natively ported (search-code, check-duplicate,
 // find-type-usages, validate-cross-deps) the Runner falls back to the exec-shim
-// path:
+// path when DONMAI_CODE_BIN is set:
 //
-//  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override
-//  2. `donmai-code` on PATH (installed via `npm install -g @donmai/cli`)
+//  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) - explicit override
+//  2. `donmai-code` on PATH
 //  3. `pnpm donmai-code` (monorepo dev)
 //
 // If none resolve, the command returns ErrNotAvailable.
 package codeintel
 
 // SymbolKind enumerates the kinds of code symbols the extractors recognise.
-// Values are the string literals used in the TS @donmai/code-intelligence
-// package (types.ts — SymbolKindSchema) and serialised into index.json
-// verbatim. Do NOT change these strings without also updating the TS side.
+// Values are the string literals used in the TS code-intelligence package
+// (types.ts - SymbolKindSchema) and serialised into index.json verbatim.
+// Do NOT change these strings without also updating the TS side.
 type SymbolKind string
 
 // Symbol kind constants — string values must match the TS SymbolKindSchema in
@@ -58,7 +58,7 @@ const (
 	KindModule    SymbolKind = "module"
 )
 
-// CodeSymbol mirrors the TS CodeSymbol type from types.ts.
+// CodeSymbol mirrors the legacy TS CodeSymbol type from types.ts.
 // JSON field names must match the TS serialisation exactly for index.json
 // round-trip compatibility.
 type CodeSymbol struct {

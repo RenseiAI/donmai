@@ -284,7 +284,7 @@ func formatStartupWorkerLine(workerID string) string {
 		return ""
 	}
 	if strings.HasSuffix(workerID, "-stub") {
-		return fmt.Sprintf("[daemon] worker-id %s (stub registration — not registered with platform)", workerID)
+		return fmt.Sprintf("[daemon] worker-id %s (stub registration, not registered with platform)", workerID)
 	}
 	return fmt.Sprintf("[daemon] worker-id %s", workerID)
 }

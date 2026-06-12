@@ -1,6 +1,6 @@
 // Package codeintel provides code intelligence for the donmai CLI.
 //
-// # Native implementation (S0–S3)
+// # Native implementation (S0-S3)
 //
 // All six code-intel subcommands are now implemented natively in Go:
 //   - get-repo-map (S0/S1): TypeScript/JS + Go + Python + Rust regex extractors
@@ -18,8 +18,8 @@
 //
 // When DONMAI_CODE_BIN is set the shim path is used:
 //
-//  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) — explicit override
-//  2. `donmai-code` on PATH (installed via `npm install -g @donmai/cli`)
+//  1. DONMAI_CODE_BIN env var (legacy: AGENTFACTORY_CODE_BIN) - explicit override
+//  2. `donmai-code` on PATH (set DONMAI_CODE_BIN to use this shim)
 //  3. `pnpm donmai-code` (monorepo dev)
 //
 // If none resolve, the command returns ErrNotAvailable with clear installation
@@ -29,7 +29,7 @@
 // # Index format compatibility
 //
 // The persisted .donmai/code-index/index.json schema is byte-compatible with
-// the TypeScript @donmai/code-intelligence IncrementalIndexer.save() output:
+// the legacy TypeScript code-intelligence IncrementalIndexer.save() output:
 //
 //	{ "files": { "<filePath>": FileIndex }, "rootHash": "<hash>" }
 //
@@ -57,19 +57,20 @@ import (
 // Callers should surface this with instructions rather than treating it as a
 // fatal error.
 var ErrNotAvailable = errors.New(
-	"donmai-code binary not found — install @donmai/cli globally " +
-		"(`npm install -g @donmai/cli`) or set DONMAI_CODE_BIN",
+	"donmai-code binary not found. Set DONMAI_CODE_BIN to the binary path, " +
+		"or install donmai via `brew install RenseiAI/homebrew-tap/donmai` " +
+		"or `go install github.com/RenseiAI/donmai/cmd/donmai@latest`",
 )
 
 // ErrArchNotAvailable is returned by resolveArchBin when the DEPRECATED TS arch
 // shim is not opted into. Note: ArchAssess does NOT surface this sentinel to
-// callers — the native Go Layer-1+2 pipeline is the primary path, so this is the
+// callers - the native Go Layer-1+2 pipeline is the primary path, so this is the
 // expected (non-error) state. IsArchBinAvailable uses it to decide whether to
 // route through the legacy shim.
 var ErrArchNotAvailable = errors.New(
-	"DEPRECATED arch shim not configured — the native Go arch-intel pipeline " +
+	"DEPRECATED arch shim not configured - the native Go arch-intel pipeline " +
 		"(Layer 1+2) is the primary path; set DONMAI_ARCH_BIN only to force the " +
-		"legacy @donmai/architectural-intelligence TS implementation",
+		"legacy TS arch shim",
 )
 
 // archShimWarnOnce guards the one-time deprecation notice emitted when the
@@ -136,18 +137,17 @@ func (r *Runner) resolveCodeBin() ([]string, error) {
 // resolveArchBin resolves the DEPRECATED, opt-in TS arch shim.
 //
 // The native Go arch-intel pipeline (Layer 1+2) is the primary path and needs no
-// external binary — this resolver only fires when an operator explicitly opts
-// into the legacy @donmai/architectural-intelligence TS implementation. It is
-// NOT a "binary not installed" failure path: ErrArchNotAvailable just means the
-// shim was not opted into, and ArchAssess then runs the native pipeline.
+// external binary - this resolver only fires when an operator explicitly opts
+// into the legacy TS arch shim. It is NOT a "binary not installed" failure path:
+// ErrArchNotAvailable just means the shim was not opted into, and ArchAssess
+// then runs the native pipeline.
 //
 // Resolution order (all paths emit a one-time deprecation notice):
 //
-//  1. DONMAI_ARCH_BIN (or legacy AGENTFACTORY_ARCH_BIN) — explicit shim override.
+//  1. DONMAI_ARCH_BIN (or legacy AGENTFACTORY_ARCH_BIN) - explicit shim override.
 //     This is the supported way to force the TS path; it may point at any
 //     binary/script (e.g. `af-arch`, `pnpm af-arch`, or a wrapper).
-//  2. af-arch on PATH — the published @donmai/cli bin name. (Earlier versions
-//     probed the never-published `donmai-arch`; that mismatch is fixed here.)
+//  2. af-arch on PATH (legacy bin name; earlier versions of the shim).
 //
 // The previous `pnpm donmai-arch` monorepo probe is dropped: there is no
 // `donmai-arch` bin, and monorepo dev should set DONMAI_ARCH_BIN="pnpm af-arch".
@@ -164,7 +164,7 @@ func (r *Runner) resolveArchBin() ([]string, error) {
 		return strings.Fields(v), nil
 	}
 
-	// 2. af-arch on PATH (the published @donmai/cli bin).
+	// 2. af-arch on PATH (legacy bin name from the deprecated TS shim).
 	if p, err := exec.LookPath("af-arch"); err == nil {
 		warnArchShimDeprecated("af-arch on PATH")
 		r.archBinCache = p
@@ -415,12 +415,12 @@ type ArchAssessOptions struct {
 //
 // The DEPRECATED exec-shim is an opt-in legacy fallback for byte-identical TS
 // output, taken ONLY when resolveArchBin succeeds:
-//  1. DONMAI_ARCH_BIN (or legacy AGENTFACTORY_ARCH_BIN) — explicit shim override.
-//  2. af-arch on PATH (published @donmai/cli bin).
+//  1. DONMAI_ARCH_BIN (or legacy AGENTFACTORY_ARCH_BIN) - explicit shim override.
+//  2. af-arch on PATH (legacy bin name from the deprecated TS shim).
 //
 // Both shim paths emit a one-time deprecation notice on stderr.
 //
-// Exit code 1 from the shim subprocess means the gate was triggered — this is
+// Exit code 1 from the shim subprocess means the gate was triggered - this is
 // surfaced via a "gated":true flag on the result rather than a generic error so
 // callers can handle it without parsing stderr.
 func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
