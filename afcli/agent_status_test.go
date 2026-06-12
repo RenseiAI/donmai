@@ -150,8 +150,8 @@ func TestAgentStatusNilPointerFields(t *testing.T) {
 				t.Errorf("missing row %q; got:\n%s", line, out)
 			}
 		}
-		if got := strings.Count(out, "—"); got < 4 {
-			t.Errorf("expected em-dash on >= 4 rows, got %d; out:\n%s", got, out)
+		if got := strings.Count(out, "-\n"); got < 4 {
+			t.Errorf("expected '-' placeholder on >= 4 rows, got %d; out:\n%s", got, out)
 		}
 	})
 
