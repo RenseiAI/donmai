@@ -28,7 +28,7 @@ func newFleetStatusCmd(bin string) *cobra.Command {
 			}
 			out := cmd.OutOrStdout()
 			if len(pids) == 0 {
-				_, _ = fmt.Fprintf(out, "Fleet is not running — start with `%s fleet start`\n", bin)
+				_, _ = fmt.Fprintf(out, "Fleet is not running. Start with `%s fleet start`\n", bin)
 				return nil
 			}
 			return writeFleetStatusTable(out, pids)

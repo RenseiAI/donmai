@@ -102,7 +102,7 @@ func runSetup(ctx context.Context, env *wizardEnv) error {
 	reader := bufio.NewReader(env.In)
 
 	// ── Step 1: welcome ────────────────────────────────────────────
-	_, _ = fmt.Fprintln(env.Out, "donmai creds setup — standalone credentials wizard")
+	_, _ = fmt.Fprintln(env.Out, "donmai creds setup: standalone credentials wizard")
 	_, _ = fmt.Fprintln(env.Out, "")
 	_, _ = fmt.Fprintln(env.Out,
 		"Sets up the credentials donmai forwards to spawned agents when running outside")

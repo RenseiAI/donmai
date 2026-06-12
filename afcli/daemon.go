@@ -1178,7 +1178,7 @@ func daemonActionRunE(
 // writeDaemonActionResult renders the outcome of an action command.
 func writeDaemonActionResult(w io.Writer, action string, r *afclient.DaemonActionResponse) error {
 	if !r.OK {
-		_, _ = fmt.Fprintf(w, "daemon %s: not accepted — %s\n", action, r.Message)
+		_, _ = fmt.Fprintf(w, "daemon %s: not accepted: %s\n", action, r.Message)
 		return fmt.Errorf("daemon %s rejected: %s", action, r.Message)
 	}
 	_, _ = fmt.Fprintf(w, "daemon %s: %s\n", action, r.Message)
@@ -1272,13 +1272,13 @@ func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 // list of repo URLs (truncated for very long lists).
 func formatAllowedProjectsStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || len(r.AllowedProjects) == 0 {
-		return "0 (none allowed — run `donmai project allow <repo-url>`)"
+		return "0 (none allowed; run `donmai project allow <repo-url>`)"
 	}
 	const maxShown = 6
 	count := len(r.AllowedProjects)
 	if count <= maxShown {
-		return fmt.Sprintf("%d — %s", count, strings.Join(r.AllowedProjects, ", "))
+		return fmt.Sprintf("%d: %s", count, strings.Join(r.AllowedProjects, ", "))
 	}
 	shown := strings.Join(r.AllowedProjects[:maxShown], ", ")
-	return fmt.Sprintf("%d — %s, … (+%d more)", count, shown, count-maxShown)
+	return fmt.Sprintf("%d: %s, (+%d more)", count, shown, count-maxShown)
 }

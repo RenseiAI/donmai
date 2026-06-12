@@ -137,7 +137,7 @@ func TestLoadLocalSource_MissingBoth_WarnMissing(t *testing.T) {
 	s := loadWithStderr(t, root, &buf)
 	s.WarnMissing([]string{missing})
 	out := buf.String()
-	wantSubstr := "[creds] no source for " + missing + " — agent may fail"
+	wantSubstr := "[creds] no source for " + missing + "; agent may fail"
 	if !strings.Contains(out, wantSubstr) {
 		t.Errorf("WarnMissing stderr did not contain %q\n  got: %q", wantSubstr, out)
 	}

@@ -1387,7 +1387,7 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 						if strings.EqualFold(c.Title, title) {
 							// +1 comment on duplicate
 							_, _ = client.CreateComment(ctx, c.ID,
-								fmt.Sprintf("+1 — Also needed by %s", sourceIssue.Identifier))
+								fmt.Sprintf("+1 - Also needed by %s", sourceIssue.Identifier))
 							return writeJSON(cmd.OutOrStdout(), map[string]any{
 								"id":           c.ID,
 								"identifier":   c.Identifier,
@@ -1460,7 +1460,7 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 
 			// 7. Comment on source issue
 			_, _ = client.CreateComment(ctx, sourceIssue.ID,
-				fmt.Sprintf("🚧 Human blocker created: [%s](%s) — %s",
+				fmt.Sprintf("🚧 Human blocker created: [%s](%s) - %s",
 					blockerIssue.Identifier, blockerIssue.URL, title))
 
 			// 8. Optional: assign
@@ -1714,7 +1714,7 @@ Exit codes:
 			prNumber := 0
 			if _, err := fmt.Sscanf(args[0], "%d", &prNumber); err != nil || prNumber <= 0 {
 				return userError(
-					fmt.Sprintf("invalid PR number %q — must be a positive integer", args[0]),
+					fmt.Sprintf("invalid PR number %q; must be a positive integer", args[0]),
 					"example: donmai linear check-deployment 42",
 				)
 			}

@@ -394,7 +394,7 @@ func (h *Handle) handleServerRequest(n notification) {
 		mcpServer, _ := rawObj["mcpServer"].(string)
 		h.emit(agent.SystemEvent{
 			Subtype: "elicitation_cancelled",
-			Message: fmt.Sprintf("Cancelled MCP elicitation from %s — autonomous mode has no user to prompt", emptyToUnknown(mcpServer)),
+			Message: fmt.Sprintf("Cancelled MCP elicitation from %s; autonomous mode has no user to prompt", emptyToUnknown(mcpServer)),
 			Raw:     rawObj,
 		})
 		return

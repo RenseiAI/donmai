@@ -30,16 +30,16 @@ func newGovernorStatusCmd(bin string) *cobra.Command {
 			switch {
 			case errors.Is(err, process.ErrStalePID):
 				_ = pf.Remove()
-				fmt.Printf("Governor is not running (stale pid file cleaned up) — start with `%s governor start`\n", bin)
+				fmt.Printf("Governor is not running (stale pid file cleaned up). Start with `%s governor start`\n", bin)
 				return nil
 			case err != nil:
-				fmt.Printf("Governor is not running — start with `%s governor start`\n", bin)
+				fmt.Printf("Governor is not running. Start with `%s governor start`\n", bin)
 				return nil
 			}
 
 			proc, err := os.FindProcess(pid)
 			if err != nil {
-				fmt.Printf("Governor is not running — start with `%s governor start`\n", bin)
+				fmt.Printf("Governor is not running. Start with `%s governor start`\n", bin)
 				return nil
 			}
 
@@ -47,7 +47,7 @@ func newGovernorStatusCmd(bin string) *cobra.Command {
 			// not probe (Windows) still need the stale check.
 			if err := proc.Signal(syscall.Signal(0)); err != nil {
 				_ = pf.Remove()
-				fmt.Printf("Governor is not running (stale pid file cleaned up) — start with `%s governor start`\n", bin)
+				fmt.Printf("Governor is not running (stale pid file cleaned up). Start with `%s governor start`\n", bin)
 				return nil
 			}
 
