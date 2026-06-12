@@ -42,7 +42,7 @@ func newOrchestratorCmd(cfg Config) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "orchestrator",
-		Short: "Local orchestrator — pick Linear backlog issues and dispatch agents",
+		Short: "Local orchestrator: pick Linear backlog issues and dispatch agents",
 		Long: `orchestrator is the local entrypoint for OSS users without a coordinator
 daemon.  It loads .donmai/config.yaml, validates the git remote, picks
 Linear backlog issues from the configured project(s), and dispatches agents
@@ -173,7 +173,7 @@ func runOrchestrator(_ *cobra.Command, flags *orchestratorFlags) error {
 				dur := d.CompletedAt.Sub(d.StartedAt).Round(time.Second)
 				statusLabel = fmt.Sprintf("completed (%s)", dur)
 			}
-			_, _ = fmt.Fprintf(os.Stdout, "  %s — %s [%s]\n", d.Identifier, d.Title, statusLabel)
+			_, _ = fmt.Fprintf(os.Stdout, "  %s: %s [%s]\n", d.Identifier, d.Title, statusLabel)
 		}
 		if len(result.Errors) > 0 {
 			_, _ = fmt.Fprintf(os.Stdout, "\nErrors (%d):\n", len(result.Errors))

@@ -403,7 +403,7 @@ func resolveContext(qw QueuedWork) string {
 	}
 	var lines []string
 	if qw.IssueIdentifier != "" || qw.Title != "" {
-		lines = append(lines, fmt.Sprintf("Issue %s — %s",
+		lines = append(lines, fmt.Sprintf("Issue %s: %s",
 			qw.IssueIdentifier, qw.Title))
 	}
 	if qw.Body != "" {

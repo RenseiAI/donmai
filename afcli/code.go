@@ -19,16 +19,16 @@ func newCodeCmd(cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "code",
-		Short: "Code intelligence — repo maps, symbol search, BM25, dedup, type usages, cross-dep validation",
+		Short: "Code intelligence: repo maps, symbol search, BM25, dedup, type usages, cross-dep validation",
 		Long: `Code intelligence commands for navigating and searching code.
 
-get-repo-map and search-symbols use the native Go implementation — no external
-binary required. The first invocation builds the index (~5-10s for a large repo);
+get-repo-map and search-symbols use the native Go implementation; no external
+binary is required. The first invocation builds the index (~5-10s for a large repo);
 subsequent calls reuse the persisted index from .donmai/code-index/.
 
-search-code, check-duplicate, find-type-usages, and validate-cross-deps require
-the donmai-code binary (npm install -g @donmai/cli) or the DONMAI_CODE_BIN env
-var override.
+search-code, check-duplicate, find-type-usages, and validate-cross-deps use the
+native Go implementation by default. Set DONMAI_CODE_BIN to force the legacy
+TypeScript exec-shim path.
 
 Override: set DONMAI_CODE_BIN to force the exec-shim path for ALL subcommands
 (useful for testing against the TypeScript reference implementation).

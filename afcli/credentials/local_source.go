@@ -326,7 +326,7 @@ func (s *LocalSource) WarnMissing(names []string) {
 		if _, _, ok := s.Resolve(n); ok {
 			continue
 		}
-		_, _ = fmt.Fprintf(s.stderr, "[creds] no source for %s — agent may fail\n", n)
+		_, _ = fmt.Fprintf(s.stderr, "[creds] no source for %s; agent may fail\n", n)
 	}
 }
 

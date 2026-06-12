@@ -20,8 +20,8 @@ func TestFormatStartupWorkerLine(t *testing.T) {
 	}{
 		{"empty", "", ""},
 		{"real platform id", "wkr_60eb0a2f35124d56", "[daemon] worker-id wkr_60eb0a2f35124d56"},
-		{"stub id flagged", "worker-test-machine-stub", "[daemon] worker-id worker-test-machine-stub (stub registration — not registered with platform)"},
-		{"another stub", "worker-host-stub", "[daemon] worker-id worker-host-stub (stub registration — not registered with platform)"},
+		{"stub id flagged", "worker-test-machine-stub", "[daemon] worker-id worker-test-machine-stub (stub registration, not registered with platform)"},
+		{"another stub", "worker-host-stub", "[daemon] worker-id worker-host-stub (stub registration, not registered with platform)"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

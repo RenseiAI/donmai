@@ -98,7 +98,7 @@ func newWorkareaListCmd(factory workareaClientFactory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List active pool members and on-disk archives",
-		Long: `List workareas from the local daemon — both active pool
+		Long: `List workareas from the local daemon: both active pool
 members and on-disk archives. Each row carries a ` + "`kind`" + ` field
 indicating which side of the boundary it sits on.
 

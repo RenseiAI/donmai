@@ -88,13 +88,13 @@ func TestFormatAllowedProjectsStat(t *testing.T) {
 	one := formatAllowedProjectsStat(&afclient.DaemonStatsResponse{
 		AllowedProjects: []string{"github.com/foo/bar"},
 	})
-	if one != "1 — github.com/foo/bar" {
+	if one != "1: github.com/foo/bar" {
 		t.Errorf("got %q", one)
 	}
 	many := formatAllowedProjectsStat(&afclient.DaemonStatsResponse{
 		AllowedProjects: []string{"a", "b", "c", "d", "e", "f", "g", "h"},
 	})
-	if !strings.HasPrefix(many, "8 — a, b, c, d, e, f") {
+	if !strings.HasPrefix(many, "8: a, b, c, d, e, f") {
 		t.Errorf("missing first 6 with truncation marker, got %q", many)
 	}
 	if !strings.Contains(many, "+2 more") {

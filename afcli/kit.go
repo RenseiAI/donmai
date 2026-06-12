@@ -72,7 +72,7 @@ func newKitCmdWithFactory(factory kitClientFactory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "kit",
 		Short: "Browse, install, and manage installed kits",
-		Long: `Commands for managing kits — the buildpacks-style packaging unit for
+		Long: `Commands for managing kits, the buildpacks-style packaging unit for
 language, framework, and domain support (see 005-kit-manifest-spec.md).
 
 Kits are queried from the local donmai daemon at http://127.0.0.1:7734 by
