@@ -2,6 +2,7 @@ package afcli
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -62,7 +63,7 @@ func newProjectCmdWithRW(rw configReaderWriter, cfg Config) *cobra.Command {
 	}
 
 	cmd.AddCommand(newProjectAllowCmd(rw, bin))
-	cmd.AddCommand(newProjectCredentialsCmd(rw))
+	cmd.AddCommand(newProjectCredentialsCmd(rw, bin))
 	cmd.AddCommand(newProjectListCmd(rw, bin))
 	cmd.AddCommand(newProjectRemoveCmd(rw))
 
@@ -84,7 +85,7 @@ func newProjectAllowCmd(rw configReaderWriter, bin string) *cobra.Command {
 		Long: "Add a project to the daemon's project allowlist in ~/.donmai/daemon.yaml.\n\n" +
 			"By default, an interactive prompt selects the credential helper.\n" +
 			"Pass --no-credentials to skip credential configuration; the daemon will\n" +
-			"refuse work for this project until `donmai project credentials` is run.\n" +
+			"refuse work for this project until `" + bin + " project credentials` is run.\n" +
 			"Pass --non-interactive to suppress all prompts (for CI/scripts).",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
@@ -118,7 +119,7 @@ func newProjectAllowCmd(rw configReaderWriter, bin string) *cobra.Command {
 				_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
 					"warning: --non-interactive set without --no-credentials; "+
 						"project added without credential helper. "+
-						"Run `donmai project credentials "+repoURL+"` to configure.",
+						"Run `"+bin+" project credentials "+repoURL+"` to configure.",
 				)
 				entry.CredentialHelper = nil
 			default:
@@ -161,7 +162,7 @@ func newProjectAllowCmd(rw configReaderWriter, bin string) *cobra.Command {
 
 // ── credentials ───────────────────────────────────────────────────────────────
 
-func newProjectCredentialsCmd(rw configReaderWriter) *cobra.Command {
+func newProjectCredentialsCmd(rw configReaderWriter, bin string) *cobra.Command {
 	var nonInteractive bool
 
 	cmd := &cobra.Command{
@@ -173,7 +174,7 @@ func newProjectCredentialsCmd(rw configReaderWriter) *cobra.Command {
 			"  2. ssh         — path to an SSH private key\n" +
 			"  3. pat         — env-var name holding a Personal Access Token\n" +
 			"  4. gh          — delegate to `gh auth` (GitHub CLI)\n\n" +
-			"The project must already be in the allowlist; run `donmai project allow` first.",
+			"The project must already be in the allowlist; run `" + bin + " project allow` first.",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -187,16 +188,14 @@ func newProjectCredentialsCmd(rw configReaderWriter) *cobra.Command {
 			idx := cfg.FindProject(repoURL)
 			if idx < 0 {
 				return fmt.Errorf(
-					"project %q is not in the allowlist — run `donmai project allow %s` first",
-					repoURL, repoURL,
+					"project %q is not in the allowlist — run `%s project allow %s` first",
+					repoURL, bin, repoURL,
 				)
 			}
 
 			if nonInteractive {
-				return fmt.Errorf(
-					"--non-interactive requires --no-credentials flag; " +
-						"use `donmai project allow --non-interactive --no-credentials` for scripted onboarding",
-				)
+				return errors.New("--non-interactive requires --no-credentials flag; " +
+					"use `" + bin + " project allow --non-interactive --no-credentials` for scripted onboarding")
 			}
 
 			helper, promptErr := promptCredentialHelper(cmd.InOrStdin(), cmd.OutOrStdout(), repoURL)

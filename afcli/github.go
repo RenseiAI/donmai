@@ -56,7 +56,7 @@ func newGitHubCmd(ds func() afclient.DataSource, cfg Config) *cobra.Command {
 		Short: "GitHub Issues operations",
 		Long: `GitHub Issues operations.
 
-Mirrors the 'donmai linear' surface adapted to GitHub Issues vocabulary.
+Mirrors the '` + bin + ` linear' surface adapted to GitHub Issues vocabulary.
 Outputs JSON to stdout.
 
 Authentication (in order):

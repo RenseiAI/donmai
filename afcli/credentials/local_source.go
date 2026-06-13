@@ -1,7 +1,8 @@
-// Package credentials provides the AF-TUI standalone credential source used
-// when `af` runs outside of rensei-tui (no daemon credential pipeline, no
-// platform session). Agents inherit credentials from the af process per the
-// "Credentials in standalone mode" precedence ladder:
+// Package credentials provides the standalone credential source used
+// when the daemon runs outside of a managed control plane (no external
+// credential pipeline, no platform session). Agents inherit credentials
+// from the daemon process per the "Credentials in standalone mode"
+// precedence ladder:
 //
 //  1. Existing environment variables in the af process (os.Environ())
 //  2. ${gitRoot}/.env.local, parsed once at af startup

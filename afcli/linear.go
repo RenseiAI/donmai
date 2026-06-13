@@ -92,7 +92,7 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 	cmd.AddCommand(newLinearListBacklogIssuesCmd(ds, bin))
 	cmd.AddCommand(newLinearListUnblockedBacklogCmd(ds, bin))
 	cmd.AddCommand(newLinearCreateBlockerCmd(ds, bin))
-	cmd.AddCommand(newLinearCheckDeploymentCmd())
+	cmd.AddCommand(newLinearCheckDeploymentCmd(bin))
 
 	return cmd
 }
@@ -1683,7 +1683,7 @@ func formatDeploymentMarkdown(result *deploymentCheckResult) string {
 // It uses the gh CLI (documented dependency) to query the GitHub Commit Status
 // API, filters for Vercel deployment checks, and formats the result as JSON
 // or Markdown. No external JS binary is required.
-func newLinearCheckDeploymentCmd() *cobra.Command {
+func newLinearCheckDeploymentCmd(bin string) *cobra.Command {
 	var (
 		format string
 		owner  string
@@ -1715,7 +1715,7 @@ Exit codes:
 			if _, err := fmt.Sscanf(args[0], "%d", &prNumber); err != nil || prNumber <= 0 {
 				return userError(
 					fmt.Sprintf("invalid PR number %q; must be a positive integer", args[0]),
-					"example: donmai linear check-deployment 42",
+					"example: "+bin+" linear check-deployment 42",
 				)
 			}
 

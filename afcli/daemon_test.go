@@ -1171,7 +1171,7 @@ func TestWriteDaemonStatsTable(t *testing.T) {
 
 	r := fixtureStatsResp()
 	var buf bytes.Buffer
-	if err := writeDaemonStatsTable(&buf, r); err != nil {
+	if err := writeDaemonStatsTable(&buf, r, "donmai"); err != nil {
 		t.Fatalf("writeDaemonStatsTable: %v", err)
 	}
 	out := buf.String()

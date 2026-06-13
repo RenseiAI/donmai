@@ -36,7 +36,7 @@ func TestFleetStartRequiresCount(t *testing.T) {
 	t.Parallel()
 
 	// cobra's MarkFlagRequired reports missing required flags via Execute.
-	cmd := newFleetStartCmd()
+	cmd := newFleetStartCmd("donmai")
 	cmd.SetArgs(nil)
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
@@ -50,7 +50,7 @@ func TestFleetStartRequiresCount(t *testing.T) {
 func TestFleetStartInvalidCount(t *testing.T) {
 	t.Parallel()
 
-	cmd := newFleetStartCmd()
+	cmd := newFleetStartCmd("donmai")
 	cmd.SetArgs([]string{"--count", "0"})
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)

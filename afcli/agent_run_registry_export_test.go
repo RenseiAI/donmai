@@ -120,7 +120,7 @@ func TestBuildAgentRunRegistry_ForcedSuccessResolvesAllEight(t *testing.T) {
 		})
 	}
 
-	reg := buildRegistryFromCtors(quietLogger(), forced)
+	reg := buildRegistryFromCtors(quietLogger(), forced, "donmai")
 
 	for _, want := range canonicalAgentRunProviders {
 		if _, err := reg.Resolve(want); err != nil {
