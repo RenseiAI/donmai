@@ -81,19 +81,19 @@ func TestFormatRegistrationStat(t *testing.T) {
 // TestFormatAllowedProjectsStat covers the allowed-projects row.
 func TestFormatAllowedProjectsStat(t *testing.T) {
 	t.Parallel()
-	zero := formatAllowedProjectsStat(&afclient.DaemonStatsResponse{})
+	zero := formatAllowedProjectsStat(&afclient.DaemonStatsResponse{}, "donmai")
 	if !strings.HasPrefix(zero, "0") {
 		t.Errorf("expected '0...' for empty list, got %q", zero)
 	}
 	one := formatAllowedProjectsStat(&afclient.DaemonStatsResponse{
 		AllowedProjects: []string{"github.com/foo/bar"},
-	})
+	}, "donmai")
 	if one != "1: github.com/foo/bar" {
 		t.Errorf("got %q", one)
 	}
 	many := formatAllowedProjectsStat(&afclient.DaemonStatsResponse{
 		AllowedProjects: []string{"a", "b", "c", "d", "e", "f", "g", "h"},
-	})
+	}, "donmai")
 	if !strings.HasPrefix(many, "8: a, b, c, d, e, f") {
 		t.Errorf("missing first 6 with truncation marker, got %q", many)
 	}
@@ -122,7 +122,7 @@ func TestWriteDaemonStatsTable_IncludesNewRows(t *testing.T) {
 		AllowedProjects: []string{"github.com/foo/bar"},
 	}
 	buf := &bytes.Buffer{}
-	if err := writeDaemonStatsTable(buf, r); err != nil {
+	if err := writeDaemonStatsTable(buf, r, "donmai"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	for _, want := range []string{

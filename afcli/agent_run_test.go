@@ -42,7 +42,7 @@ func codexOnPath() bool {
 // registered under `agent run` and produces the expected help text.
 func TestNewAgentRunCmd_Help(t *testing.T) {
 	root := &cobra.Command{Use: "donmai"}
-	root.AddCommand(newAgentCmd(nil, nil))
+	root.AddCommand(newAgentCmd(nil, nil, Config{}))
 
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -450,7 +450,7 @@ func TestBuildRegistryFromCtors_LogsProbeFailures(t *testing.T) {
 		{name: "alpha", new: func() (agent.Provider, error) { return good1, nil }},
 		{name: "broken", new: func() (agent.Provider, error) { return nil, failErr }},
 		{name: "beta", new: func() (agent.Provider, error) { return good2, nil }},
-	})
+	}, "donmai")
 
 	if got := len(reg.Names()); got != 2 {
 		t.Errorf("registry size = %d, want 2", got)
@@ -484,7 +484,7 @@ func TestBuildRegistryFromCtors_ZeroProvidersErrors(t *testing.T) {
 		{name: "p1", new: func() (agent.Provider, error) { return nil, bad }},
 		{name: "p2", new: func() (agent.Provider, error) { return nil, bad }},
 		{name: "p3", new: func() (agent.Provider, error) { return nil, bad }},
-	})
+	}, "donmai")
 
 	if got := len(reg.Names()); got != 0 {
 		t.Errorf("registry size = %d, want 0", got)

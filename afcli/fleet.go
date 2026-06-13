@@ -17,11 +17,11 @@ func newFleetCmd(_ func() afclient.DataSource, cfg Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "fleet",
 		Short:        "Manage a fleet of worker processes",
-		Long:         "Spawn, scale, and supervise multiple donmai worker processes.",
+		Long:         "Spawn, scale, and supervise multiple `" + bin + " worker` processes.",
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newFleetStartCmd())
+	cmd.AddCommand(newFleetStartCmd(bin))
 	cmd.AddCommand(newFleetStopCmd())
 	cmd.AddCommand(newFleetStatusCmd(bin))
 	cmd.AddCommand(newFleetScaleCmd())

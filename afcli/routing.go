@@ -51,7 +51,7 @@ func newRoutingCmdWithFactory(factory routingClientFactory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "routing",
 		Short: "Inspect 2D routing decisions (LLM × sandbox)",
-		Long: `Commands for inspecting the cross-provider scheduler on the local donmai daemon.
+		Long: `Commands for inspecting the cross-provider scheduler on the local daemon.
 
 Routing decisions are queried from the daemon's HTTP control API at
 http://127.0.0.1:7734 by default. Set ` + providerEnvDaemonURL + ` to override.
@@ -91,7 +91,7 @@ Output includes:
   • Recent routing decisions table
 
 With --json the snapshot prints as machine-readable JSON. With --plain
-the deterministic plain-text form (rensei-smokes pin point) is emitted
+the deterministic plain-text form (smoke-test pin point) is emitted
 instead of the ANSI table form.`,
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,

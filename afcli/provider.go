@@ -102,7 +102,7 @@ func newProviderCmdWithFactory(factory providerClientFactory) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "provider",
 		Short: "Inspect registered providers on the local daemon",
-		Long: `Commands for inspecting registered providers on the local donmai daemon.
+		Long: `Commands for inspecting registered providers on the local daemon.
 
 Providers are queried from the daemon's HTTP control API at
 http://127.0.0.1:7734 by default. Set ` + providerEnvDaemonURL + ` to override.

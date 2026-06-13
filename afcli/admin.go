@@ -40,7 +40,7 @@ func newAdminCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "admin",
 		Short: "Operational admin commands (cleanup, queue, merge-queue)",
-		Long: `Operational admin commands for Donmai.
+		Long: `Operational admin commands.
 
 Subcommands:
   cleanup      Prune orphaned git worktrees and stale local branches

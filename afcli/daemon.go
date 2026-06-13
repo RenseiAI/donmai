@@ -77,9 +77,9 @@ func newDaemonCmdWithFactory(factory daemonClientFactory, cfg Config) *cobra.Com
 	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "daemon",
-		Short: "Manage the local donmai-daemon",
-		Long: "Manage the local donmai-daemon process that supervises agent session pools.\n\n" +
-			"The daemon replaces the per-workspace `donmai worker` / `donmai fleet` approach.\n" +
+		Short: "Manage the local daemon",
+		Long: "Manage the local daemon process that supervises agent session pools.\n\n" +
+			"The daemon replaces the per-workspace `" + bin + " worker` / `" + bin + " fleet` approach.\n" +
 			"Install once, configure once, and sessions run automatically for allowed projects.",
 		SilenceUsage: true,
 	}
@@ -91,11 +91,11 @@ func newDaemonCmdWithFactory(factory daemonClientFactory, cfg Config) *cobra.Com
 	cmd.AddCommand(newDaemonStatusCmd(factory, bin))
 	cmd.AddCommand(newDaemonLogsCmd())
 	cmd.AddCommand(newDaemonDoctorCmd(bin))
-	cmd.AddCommand(newDaemonPauseCmd(factory))
+	cmd.AddCommand(newDaemonPauseCmd(factory, bin))
 	cmd.AddCommand(newDaemonResumeCmd(factory))
 	cmd.AddCommand(newDaemonUpdateCmd(factory))
 	cmd.AddCommand(newDaemonDrainCmd(factory))
-	cmd.AddCommand(newDaemonStopCmd(factory))
+	cmd.AddCommand(newDaemonStopCmd(factory, bin))
 	cmd.AddCommand(newDaemonStatsCmd(factory, bin))
 	cmd.AddCommand(newDaemonEvictCmd(factory))
 	cmd.AddCommand(newDaemonSetCmd(factory))
@@ -165,7 +165,7 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 			}
 
 			// Mint (or read) the machine's anon token so the user can
-			// connect this machine to the donmai dashboard on first install.
+			// connect this machine to the dashboard on first install.
 			dashBaseURL := os.Getenv("DONMAI_API_URL")
 			if dashBaseURL == "" {
 				dashBaseURL = "https://donmai.dev/dashboard"
@@ -176,7 +176,7 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 					"warning: failed to ensure machine token: %v\n", tokErr)
 			} else if justMinted {
 				_, _ = fmt.Fprintln(out)
-				_, _ = fmt.Fprintln(out, "First run: connect this machine to the donmai dashboard:")
+				_, _ = fmt.Fprintln(out, "First run: connect this machine to the dashboard:")
 				_, _ = fmt.Fprintf(out, "  %s\n", anontoken.ClaimURL(tok, dashBaseURL))
 			}
 
@@ -587,7 +587,7 @@ func resolveCurrentBinPath() string {
 
 // ── pause ─────────────────────────────────────────────────────────────────────
 
-func newDaemonPauseCmd(factory daemonClientFactory) *cobra.Command {
+func newDaemonPauseCmd(factory daemonClientFactory, bin string) *cobra.Command {
 	var (
 		port int
 		host string
@@ -597,7 +597,7 @@ func newDaemonPauseCmd(factory daemonClientFactory) *cobra.Command {
 		Use:   "pause",
 		Short: "Pause the daemon (stop accepting new sessions)",
 		Long: "Signal the daemon to stop accepting new session assignments while keeping\n" +
-			"currently running sessions alive. Use `donmai daemon resume` to re-enable.",
+			"currently running sessions alive. Use `" + bin + " daemon resume` to re-enable.",
 		SilenceUsage: true,
 		RunE: daemonActionRunE("pause", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
 			return c.Pause()
@@ -701,7 +701,7 @@ func newDaemonDrainCmd(factory daemonClientFactory) *cobra.Command {
 
 // ── stop ──────────────────────────────────────────────────────────────────────
 
-func newDaemonStopCmd(factory daemonClientFactory) *cobra.Command {
+func newDaemonStopCmd(factory daemonClientFactory, bin string) *cobra.Command {
 	var (
 		port int
 		host string
@@ -711,7 +711,7 @@ func newDaemonStopCmd(factory daemonClientFactory) *cobra.Command {
 		Use:   "stop",
 		Short: "Stop the daemon process",
 		Long: "Signal the daemon to stop immediately. In-flight sessions are interrupted.\n" +
-			"Use `donmai daemon drain` first for a graceful shutdown.",
+			"Use `" + bin + " daemon drain` first for a graceful shutdown.",
 		SilenceUsage: true,
 		RunE: daemonActionRunE("stop", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
 			return c.Stop()
@@ -761,7 +761,7 @@ func newDaemonStatsCmd(factory daemonClientFactory, bin string) *cobra.Command {
 				enc.SetIndent("", "  ")
 				return enc.Encode(resp)
 			}
-			return writeDaemonStatsTable(out, resp)
+			return writeDaemonStatsTable(out, resp, bin)
 		},
 	}
 
@@ -775,13 +775,17 @@ func newDaemonStatsCmd(factory daemonClientFactory, bin string) *cobra.Command {
 }
 
 // writeDaemonStatsTable renders the daemon stats as a simple ANSI table.
-func writeDaemonStatsTable(w io.Writer, r *afclient.DaemonStatsResponse) error {
+// bin is the host binary name used in remediation hints (e.g. "donmai" or "rensei").
+func writeDaemonStatsTable(w io.Writer, r *afclient.DaemonStatsResponse, bin string) error {
+	if bin == "" {
+		bin = "donmai"
+	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
 	rows := []struct{ label, value string }{
 		{"Worker:", formatWorkerStat(r)},
 		{"Registration:", formatRegistrationStat(r)},
-		{"Allowed projects:", formatAllowedProjectsStat(r)},
+		{"Allowed projects:", formatAllowedProjectsStat(r, bin)},
 		{"Active sessions:", fmt.Sprintf("%d / %d", r.ActiveSessions, r.Capacity.MaxConcurrentSessions)},
 		{"Queue depth:", fmt.Sprintf("%d", r.QueueDepth)},
 		{"Max vCPU/session:", fmt.Sprintf("%d", r.Capacity.MaxVCpuPerSession)},
@@ -1270,9 +1274,10 @@ func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 // formatAllowedProjectsStat renders the "Allowed projects:" row of
 // `daemon stats`. The output is the count followed by a comma-separated
 // list of repo URLs (truncated for very long lists).
-func formatAllowedProjectsStat(r *afclient.DaemonStatsResponse) string {
+// bin is the host binary name used in the remediation hint.
+func formatAllowedProjectsStat(r *afclient.DaemonStatsResponse, bin string) string {
 	if r == nil || len(r.AllowedProjects) == 0 {
-		return "0 (none allowed; run `donmai project allow <repo-url>`)"
+		return "0 (none allowed; run `" + bin + " project allow <repo-url>`)"
 	}
 	const maxShown = 6
 	count := len(r.AllowedProjects)

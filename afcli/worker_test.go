@@ -14,7 +14,7 @@ import (
 func TestWorkerParentHelp(t *testing.T) {
 	t.Parallel()
 
-	cmd := newWorkerCmd(func() afclient.DataSource { return afclient.NewMockClient() })
+	cmd := newWorkerCmd(func() afclient.DataSource { return afclient.NewMockClient() }, Config{})
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)

@@ -129,11 +129,11 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	// transparent to them.
 	ds := scopedClientFactory(cfg)
 	root.AddCommand(newStatusCmd(ds))
-	root.AddCommand(newAgentCmd(ds, cfg.ProjectFunc))
+	root.AddCommand(newAgentCmd(ds, cfg.ProjectFunc, cfg))
 	root.AddCommand(newSessionCmd(ds, cfg.ProjectFunc))
 	root.AddCommand(newGovernorCmd(ds, cfg))
 	if cfg.EnableLegacyWorkerFleet {
-		root.AddCommand(newWorkerCmd(ds))
+		root.AddCommand(newWorkerCmd(ds, cfg))
 		root.AddCommand(newFleetCmd(ds, cfg))
 	}
 	root.AddCommand(newDaemonCmd(cfg))
