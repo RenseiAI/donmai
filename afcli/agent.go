@@ -16,11 +16,11 @@ import (
 // logic of its own; it dispatches to subcommands such as `list`.
 // projectFunc is optional; when non-nil and returning a non-empty
 // value, `list` scopes results to that project.
-func newAgentCmd(ds func() afclient.DataSource, projectFunc func() string) *cobra.Command {
+func newAgentCmd(ds func() afclient.DataSource, projectFunc func() string, cfg Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "agent",
 		Short:        "Inspect and control agent sessions",
-		Long:         "Inspect and control Donmai agent sessions. Use subcommands like `list` to query sessions.",
+		Long:         "Inspect and control agent sessions. Use subcommands like `list` to query sessions.",
 		SilenceUsage: true,
 	}
 
@@ -29,7 +29,7 @@ func newAgentCmd(ds func() afclient.DataSource, projectFunc func() string) *cobr
 	cmd.AddCommand(newAgentStopCmd(ds))
 	cmd.AddCommand(newAgentChatCmd(ds))
 	cmd.AddCommand(newAgentReconnectCmd(ds))
-	cmd.AddCommand(newAgentRunCmd())
+	cmd.AddCommand(newAgentRunCmd(cfg))
 
 	return cmd
 }

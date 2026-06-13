@@ -143,7 +143,7 @@ func newTestAgentCmd(ds func() afclient.DataSource, args []string) (*cobra.Comma
 // newTestAgentCmdWithProject is like newTestAgentCmd but lets the caller
 // inject a ProjectFunc to exercise project-scoping paths.
 func newTestAgentCmdWithProject(ds func() afclient.DataSource, projectFunc func() string, args []string) (*cobra.Command, *bytes.Buffer) {
-	cmd := newAgentCmd(ds, projectFunc)
+	cmd := newAgentCmd(ds, projectFunc, Config{})
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)

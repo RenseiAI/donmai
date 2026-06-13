@@ -51,6 +51,9 @@ type agentRunOpts struct {
 	worktree   string
 	preserveWT bool
 	jsonOut    bool
+	// bin is the host binary name (from binaryName(cfg)) used in error hints.
+	// Defaults to "donmai" when empty.
+	bin string
 }
 
 // newAgentRunCmd constructs the `agent run` subcommand. This is the
@@ -74,8 +77,9 @@ type agentRunOpts struct {
 //     session not found, registry construction failed).
 //
 // (F.2.8 — daemon wire-up.)
-func newAgentRunCmd() *cobra.Command {
-	opts := &agentRunOpts{}
+func newAgentRunCmd(cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
+	opts := &agentRunOpts{bin: bin}
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run a single agent session (invoked by the daemon spawner).",
@@ -90,7 +94,7 @@ func newAgentRunCmd() *cobra.Command {
 			"The session id is read from --session-id or the\n" +
 			"DONMAI_SESSION_ID environment variable (set automatically by\n" +
 			"the daemon spawner).\n\n" +
-			"Operators rarely invoke this directly. `donmai daemon run` spawns it\n" +
+			"Operators rarely invoke this directly. `" + bin + " daemon run` spawns it\n" +
 			"on every accepted session. To debug a session locally, set\n" +
 			"DONMAI_SESSION_ID and invoke this command against a running\n" +
 			"daemon.",
@@ -140,7 +144,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	defer cancel()
 
 	logger := slog.Default()
-	logger.Info("donmai agent run: starting",
+	logger.Info("agent run: starting",
 		"sessionId", sessionID,
 		"daemonUrl", daemonURL,
 	)
@@ -150,7 +154,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if err != nil {
 		return preflightErr(fmt.Sprintf("fetch session detail: %v", err))
 	}
-	logger.Info("donmai agent run: session detail fetched",
+	logger.Info("agent run: session detail fetched",
 		"sessionId", detail.SessionID,
 		"identifier", detail.IssueIdentifier,
 		"provider", providerNameFromDetail(detail),
@@ -164,8 +168,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	)
 
 	// 5. Construct registry, runner, and run.
-	reg := BuildAgentRunRegistry(logger)
-	logger.Info("donmai agent run: registry built", "providers", reg.Names())
+	agentBin := opts.bin
+	if agentBin == "" {
+		agentBin = "donmai"
+	}
+	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(), agentBin)
+	logger.Info("agent run: registry built", "providers", reg.Names())
 
 	wtParent := opts.worktree
 	if wtParent == "" {
@@ -464,7 +472,7 @@ type providerCtor struct {
 // single-sourcing gain. Keeping it here, behind a public builder, is the clean
 // realization of "single source + no fork".
 func BuildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
-	return buildRegistryFromCtors(logger, agentRunProviderCtors())
+	return buildRegistryFromCtors(logger, agentRunProviderCtors(), "donmai")
 }
 
 // agentRunProviderCtors returns the single hand-authored ctor list — the SoT
@@ -506,31 +514,32 @@ func agentRunProviderCtors() []providerCtor {
 // retained so the package's existing call sites and tests keep their
 // short, unexported name. Behaviour is identical — it just delegates.
 func buildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
-	return BuildAgentRunRegistry(logger)
+	return buildRegistryFromCtors(logger, agentRunProviderCtors(), "donmai")
 }
 
 // buildRegistryFromCtors is the testable core of [BuildAgentRunRegistry].
 // It walks the provided ctors, logs WARN per-provider failure, and
 // emits an ERROR record when the resulting registry has zero
 // successful registrations. Returns the (possibly-empty) Registry.
-func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor) *runner.Registry {
+// bin is the host binary name (from binaryName(cfg)) used in the error hint.
+func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor, bin string) *runner.Registry {
 	reg := runner.NewRegistry()
 	for _, c := range ctors {
 		p, err := c.new()
 		if err != nil {
-			logger.Warn("donmai agent run: provider probe failed",
+			logger.Warn("agent run: provider probe failed",
 				"provider", c.name, "err", err)
 			continue
 		}
 		if regErr := reg.Register(p); regErr != nil {
-			logger.Warn("donmai agent run: provider register failed",
+			logger.Warn("agent run: provider register failed",
 				"provider", c.name, "err", regErr)
 			continue
 		}
 		assertLegacyAlias(logger, p)
 	}
 	if len(reg.Names()) == 0 {
-		logger.Error("donmai agent run: no providers available. Every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `donmai doctor`.")
+		logger.Error("agent run: no providers available. Every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `" + bin + " daemon doctor`.")
 	}
 	return reg
 }

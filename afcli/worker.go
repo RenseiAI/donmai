@@ -10,11 +10,12 @@ import (
 // foreground worker process. The ds parameter is accepted for signature
 // consistency with newAgentCmd but is unused because the worker package
 // owns its own HTTP client rather than using afclient.
-func newWorkerCmd(_ func() afclient.DataSource) *cobra.Command {
+func newWorkerCmd(_ func() afclient.DataSource, cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:          "worker",
-		Short:        "Run a Donmai worker process",
-		Long:         "Register with the coordinator, poll for work, and heartbeat. Intended as a single foreground worker process; use `donmai fleet` for multi-process supervision.",
+		Short:        "Run a worker process",
+		Long:         "Register with the coordinator, poll for work, and heartbeat. Intended as a single foreground worker process; use `" + bin + " fleet` for multi-process supervision.",
 		SilenceUsage: true,
 	}
 

@@ -52,13 +52,13 @@ func buildWorkerChildArgs(f *fleetStartFlags) []string {
 // newFleetStartCmd constructs the `fleet start` subcommand. It resolves
 // the current binary path, builds the per-child argv, and delegates to
 // worker.Fleet.Start which writes the PID file on success.
-func newFleetStartCmd() *cobra.Command {
+func newFleetStartCmd(bin string) *cobra.Command {
 	flags := &fleetStartFlags{}
 
 	cmd := &cobra.Command{
 		Use:          "start",
 		Short:        "Start a fleet of worker processes",
-		Long:         "Spawn --count `donmai worker start` processes and supervise them. The PID of each child is recorded in the fleet PID file so `fleet stop` and `fleet status` can find them.",
+		Long:         "Spawn --count `" + bin + " worker start` processes and supervise them. The PID of each child is recorded in the fleet PID file so `fleet stop` and `fleet status` can find them.",
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if flags.count <= 0 {

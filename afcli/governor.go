@@ -12,8 +12,8 @@ func newGovernorCmd(_ func() afclient.DataSource, cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:          "governor",
-		Short:        "Manage the Donmai governor (scan loop)",
-		Long:         "Manage the Donmai governor process that scans Linear issues and dispatches work to the agent queue.",
+		Short:        "Manage the governor (scan loop)",
+		Long:         "Manage the governor process that scans Linear issues and dispatches work to the agent queue.",
 		SilenceUsage: true,
 	}
 
