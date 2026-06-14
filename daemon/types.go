@@ -174,11 +174,44 @@ type SessionResources struct {
 }
 
 // SessionHandle is the daemon-side handle for an in-flight session.
+//
+// Wire shape (camelCase JSON) returned by GET /api/daemon/sessions. The
+// list endpoint is the live index of what is running on this host; the
+// enrichment fields below (WorktreePath / ProjectName / Repository) make
+// it self-sufficient for a local reader (e.g. the host-watch fleet
+// dashboard) that wants to locate each session's on-disk worktree
+// (and thus its `.agent/events.jsonl` + `.agent/state.json`) WITHOUT a
+// per-session GET /api/daemon/sessions/<id> round-trip.
+//
+// All three enrichment fields are additive + omitempty — a pre-enrichment
+// client sees a byte-identical handle for the original four fields, and a
+// new client tolerates their absence (empty string). See
+// ADR-2026-06-13-daemon-sessionhandle-enrichment (amends
+// ADR-2026-05-07-daemon-http-control-api).
 type SessionHandle struct {
 	SessionID  string       `json:"sessionId"`
 	PID        int          `json:"pid"`
 	AcceptedAt string       `json:"acceptedAt"`
 	State      SessionState `json:"state"`
+
+	// WorktreePath is the absolute on-disk path of the per-session
+	// worktree the spawned worker operates in
+	// (<WorktreeParentDir>/<sessionID>). A local reader joins this with
+	// state.AgentDirName to reach <path>/.agent/events.jsonl and
+	// <path>/.agent/state.json. Empty when the daemon cannot resolve the
+	// worktree parent (no state dir).
+	WorktreePath string `json:"worktreePath,omitempty"`
+
+	// ProjectName is the allowlist-resolved project identifier
+	// (ProjectConfig.ID) this session was dispatched under. Mirrors
+	// SessionSpec.ProjectName. Empty when no allowlist entry matched.
+	ProjectName string `json:"projectName,omitempty"`
+
+	// Repository is the git URL (or owner/name slug) the session operates
+	// on, as carried on the inbound SessionSpec. Lets a local reader scope
+	// the fleet view to the sessions for one repo (the CWD's repo) without
+	// a per-session detail call.
+	Repository string `json:"repository,omitempty"`
 }
 
 // ── Heartbeat payload ──────────────────────────────────────────────────────

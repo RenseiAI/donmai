@@ -110,7 +110,7 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `POST   /api/daemon/capacity`          | Update a config key (e.g. `capacity.poolMaxDiskGb`) |
 | `GET    /api/daemon/pool/stats`        | Workarea pool snapshot |
 | `POST   /api/daemon/pool/evict`        | Evict pool members |
-| `GET    /api/daemon/sessions`          | List active session handles |
+| `GET    /api/daemon/sessions`          | List active session handles (incl. `worktreePath`/`projectName`/`repository` enrichment) |
 | `POST   /api/daemon/sessions`          | Accept a session (test entrypoint) |
 | `GET    /api/daemon/sessions/<id>`     | **F.2.8** — per-session detail for the spawned worker |
 | `GET    /api/daemon/heartbeat`         | Most-recent heartbeat payload |

@@ -13,6 +13,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	internaldaemon "github.com/RenseiAI/donmai/internal/daemon"
+	"github.com/RenseiAI/donmai/internal/statepath"
 )
 
 // Options configure a Daemon.
@@ -396,6 +397,17 @@ func (d *Daemon) Start(ctx context.Context) error {
 		spawnerOpts.BaseEnv["DONMAI_WORKER_ID"] = d.workerID
 	}
 	spawnerOpts.BaseEnv["DONMAI_ORCHESTRATOR_URL"] = cfg.Orchestrator.URL
+	// Default WorktreeParentDir to the same statepath-resolved worktrees
+	// directory the spawned `donmai agent run` worker uses when no
+	// --worktree-dir override is passed (afcli/agent_run.go). Keeping the
+	// two in sync lets the daemon publish each session's on-disk worktree
+	// path on its SessionHandle (GET /api/daemon/sessions) so a local
+	// reader (host-watch) can locate `.agent/events.jsonl` without a
+	// per-session detail round-trip. Operators overriding the spawner can
+	// pin a different value.
+	if spawnerOpts.WorktreeParentDir == "" {
+		spawnerOpts.WorktreeParentDir = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
+	}
 	// Default WorkerCommand: spawn `donmai agent run` from the same
 	// binary as the running daemon process so session lifecycle is
 	// owned in-tree. Operators can override via SpawnerOptions.

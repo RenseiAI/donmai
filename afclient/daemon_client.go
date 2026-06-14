@@ -125,6 +125,37 @@ type DaemonDrainRequest struct {
 	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`
 }
 
+// DaemonSessionHandle is the client-side mirror of the daemon's
+// SessionHandle wire shape returned by GET /api/daemon/sessions. It is
+// duplicated here (rather than importing the daemon package, which would
+// create a dependency cycle) so client consumers — e.g. the host-watch
+// fleet dashboard — can decode the list endpoint with no platform call.
+//
+// The WorktreePath / ProjectName / Repository enrichment fields let a
+// local reader locate each session's on-disk worktree (and thus its
+// `.agent/events.jsonl` + `.agent/state.json`) without a per-session
+// GET /api/daemon/sessions/<id> round-trip. They are omitempty and may be
+// absent against a pre-enrichment daemon — the reader then falls back to a
+// per-session detail call. See
+// ADR-2026-06-13-daemon-sessionhandle-enrichment.
+type DaemonSessionHandle struct {
+	// SessionID is the platform session UUID.
+	SessionID string `json:"sessionId"`
+	// PID is the spawned worker process id.
+	PID int `json:"pid"`
+	// AcceptedAt is the RFC3339 time the session was admitted.
+	AcceptedAt string `json:"acceptedAt"`
+	// State is the session lifecycle state (starting/running/...).
+	State string `json:"state"`
+	// WorktreePath is the absolute on-disk worktree path for the session
+	// (<parent>/<sessionID>). Empty when the daemon cannot resolve it.
+	WorktreePath string `json:"worktreePath,omitempty"`
+	// ProjectName is the allowlist-resolved project identifier.
+	ProjectName string `json:"projectName,omitempty"`
+	// Repository is the git URL (or owner/name slug) the session runs on.
+	Repository string `json:"repository,omitempty"`
+}
+
 // ── DaemonClient ─────────────────────────────────────────────────────────────
 
 // DaemonClient is an HTTP client for the local daemon's control API.
@@ -233,6 +264,20 @@ func (c *DaemonClient) GetStats(withPool, byMachine bool) (*DaemonStatsResponse,
 		return nil, fmt.Errorf("daemon stats: %w", err)
 	}
 	return &resp, nil
+}
+
+// GetSessions fetches the daemon's active session handles from
+// GET /api/daemon/sessions. The returned handles carry the worktree
+// path / project / repository enrichment when the daemon supports it,
+// letting a local reader locate each session's `.agent/` log files with
+// no further round-trip. A nil slice with a nil error means the daemon
+// reported no active sessions.
+func (c *DaemonClient) GetSessions() ([]DaemonSessionHandle, error) {
+	var resp []DaemonSessionHandle
+	if err := c.get("/api/daemon/sessions", &resp); err != nil {
+		return nil, fmt.Errorf("daemon sessions: %w", err)
+	}
+	return resp, nil
 }
 
 // Pause sends a pause command to the daemon (stops accepting new sessions).
