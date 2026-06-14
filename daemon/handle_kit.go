@@ -314,11 +314,14 @@ func writeKitNotFound(w http.ResponseWriter, err error) bool {
 // When the daemon has no Config loaded yet (no daemon.yaml on disk),
 // trust.Mode falls back to resolveDefaultTrustMode(), which returns
 // TrustModeSignedByAllowlist unless the operator has set
-// DONMAI_KIT_TRUST_MODE=permissive. This means kit installs from an
-// unconfigured daemon default to strict mode rather than permissive.
+// DONMAI_KIT_TRUST_MODE=permissive, and trust.IssuerSet falls back to
+// defaultVendorIssuerSet() (the official donmai-kits signing identity).
+// This means kit installs from an unconfigured daemon default to strict
+// mode AND already trust official signed kits — no --allow-unsigned needed.
 //
 // If the resolved trust configuration is invalid (e.g., signed-by-allowlist
-// with an empty IssuerSet), a misconfiguredKitRegistry stub is returned.
+// with an operator-cleared IssuerSet), a misconfiguredKitRegistry stub is
+// returned.
 // The stub allows read-only operations (List, Get, VerifySignature,
 // ListSources, EnableSource, DisableSource) so the kit surface remains
 // observable, but Install returns ErrKitTrustGateRejected with the
@@ -349,6 +352,15 @@ func (s *Server) kitRegistryOrEmpty() kitRegistryDoer {
 		// resolveDefaultTrustMode() returns TrustModeSignedByAllowlist unless
 		// DONMAI_KIT_TRUST_MODE overrides it.
 		trust.Mode = resolveDefaultTrustMode()
+	}
+	if len(trust.IssuerSet) == 0 {
+		// Seed the vendor default allowlist (the official donmai-kits
+		// signing identity) when the daemon has no Config / no configured
+		// issuerSet, mirroring applyDefaults (config.go). Without this the
+		// default signed-by-allowlist mode would fail closed on an empty
+		// allowlist; with it, official signed kits install cleanly while
+		// every other signer is still rejected.
+		trust.IssuerSet = defaultVendorIssuerSet()
 	}
 	// Validate the trust configuration BEFORE constructing the registry.
 	// NewKitRegistryWithTrust falls back to a permissive verifier when
