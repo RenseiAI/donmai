@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -68,6 +69,17 @@ type SpawnerOptions struct {
 	// A nil env slice return with a nil error is equivalent to returning
 	// the input env unchanged (no-op, same as the nil hook case).
 	OnPreSpawn func(spec SessionSpec, env []string) ([]string, error)
+
+	// WorktreeParentDir is the directory under which the spawned worker
+	// creates each per-session worktree (<WorktreeParentDir>/<sessionID>).
+	// It MUST match the parent the worker resolves (the worker uses
+	// statepath.Resolve("worktrees", …) when no --worktree-dir override is
+	// passed), so the daemon can publish the worktree path on the
+	// SessionHandle without spawning anything. When empty, the spawner
+	// leaves SessionHandle.WorktreePath empty (a local reader then falls
+	// back to a per-session detail call). The daemon sets this to the same
+	// statepath-resolved default the worker uses.
+	WorktreeParentDir string
 
 	// Now lets tests deterministically clock acceptedAt timestamps.
 	Now func() time.Time
@@ -457,10 +469,20 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	}
 
 	handle := SessionHandle{
-		SessionID:  spec.SessionID,
-		PID:        pid,
-		AcceptedAt: s.opts.Now().UTC().Format(time.RFC3339),
-		State:      SessionRunning,
+		SessionID:   spec.SessionID,
+		PID:         pid,
+		AcceptedAt:  s.opts.Now().UTC().Format(time.RFC3339),
+		State:       SessionRunning,
+		ProjectName: project.ID,
+		Repository:  spec.Repository,
+	}
+	// Publish the worktree path so GET /api/daemon/sessions is
+	// self-sufficient for a local reader (host-watch). The worker resolves
+	// the same <parent>/<sessionID> leaf; we mirror that here without
+	// spawning anything. Empty parent leaves WorktreePath empty (the reader
+	// falls back to a per-session detail call).
+	if s.opts.WorktreeParentDir != "" {
+		handle.WorktreePath = filepath.Join(s.opts.WorktreeParentDir, spec.SessionID)
 	}
 
 	ss := &spawnedSession{
