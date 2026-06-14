@@ -486,6 +486,11 @@ autoUpdate:
 	if cfg.Trust.Mode != TrustModeSignedByAllowlist {
 		t.Errorf("Trust.Mode default: want %q, got %q", TrustModeSignedByAllowlist, cfg.Trust.Mode)
 	}
+	// The default issuer set is seeded with the official vendor signer so
+	// official signed kits install out of the box without --allow-unsigned.
+	if got := cfg.Trust.IssuerSet; len(got) != 1 || got[0] != vendorSignerSAN {
+		t.Errorf("Trust.IssuerSet default: want [%q], got %v", vendorSignerSAN, got)
+	}
 
 	// Operator opt-out: DONMAI_KIT_TRUST_MODE=permissive flips the
 	// applyDefaults seed back to permissive.

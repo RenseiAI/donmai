@@ -51,6 +51,138 @@ func newHermeticVerifier(t *testing.T, mode TrustMode) (*kitVerifier, *ca.Virtua
 	return newKitVerifierWithMaterial(cfg, vs), vs
 }
 
+// newHermeticVerifierWithIssuerSet builds a hermetic verifier whose trust
+// config carries the given mode AND issuer allowlist, so tests can exercise
+// the SAN/issuer identity policy (not just the mode gate).
+func newHermeticVerifierWithIssuerSet(t *testing.T, mode TrustMode, issuerSet []string) (*kitVerifier, *ca.VirtualSigstore) {
+	t.Helper()
+	vs, err := ca.NewVirtualSigstore()
+	if err != nil {
+		t.Fatalf("NewVirtualSigstore: %v", err)
+	}
+	cfg := TrustConfig{Mode: mode, IssuerSet: issuerSet}
+	return newKitVerifierWithMaterial(cfg, vs), vs
+}
+
+// TestDefaultVendorIssuerSet asserts the baked-in vendor allowlist contains
+// exactly the official donmai-kits signing identity. If this identity ever
+// changes, the founder-confirmed SAN must be updated here in lock-step with
+// the donmai-kits sign workflow's OIDC subject.
+func TestDefaultVendorIssuerSet(t *testing.T) {
+	got := defaultVendorIssuerSet()
+	if len(got) != 1 {
+		t.Fatalf("defaultVendorIssuerSet: want exactly 1 entry, got %d: %v", len(got), got)
+	}
+	const wantSAN = "https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main"
+	if got[0] != wantSAN {
+		t.Errorf("defaultVendorIssuerSet[0] (SAN): want %q, got %q", wantSAN, got[0])
+	}
+	if vendorSignerSAN != wantSAN {
+		t.Errorf("vendorSignerSAN: want %q, got %q", wantSAN, vendorSignerSAN)
+	}
+	const wantIssuer = "https://token.actions.githubusercontent.com"
+	if vendorSignerIssuer != wantIssuer {
+		t.Errorf("vendorSignerIssuer: want %q, got %q", wantIssuer, vendorSignerIssuer)
+	}
+}
+
+// TestApplyDefaultsSeedsVendorIssuerSet asserts a daemon with no configured
+// trust.issuerSet ends up trusting the official signer by default — the
+// whole point of the vendor trust root: official kits install under the
+// default signed-by-allowlist mode without --allow-unsigned.
+func TestApplyDefaultsSeedsVendorIssuerSet(t *testing.T) {
+	t.Setenv(envKitTrustMode, "") // ensure the secure default mode.
+	var c Config
+	applyDefaults(&c)
+	if c.Trust.Mode != TrustModeSignedByAllowlist {
+		t.Fatalf("default trust mode: want %q, got %q", TrustModeSignedByAllowlist, c.Trust.Mode)
+	}
+	if len(c.Trust.IssuerSet) != 1 || c.Trust.IssuerSet[0] != vendorSignerSAN {
+		t.Fatalf("default issuerSet: want [%q], got %v", vendorSignerSAN, c.Trust.IssuerSet)
+	}
+	// The seeded config must NOT be a misconfiguration (non-empty allowlist).
+	if err := validateTrustConfig(c.Trust); err != nil {
+		t.Errorf("validateTrustConfig on default-seeded config: want nil, got %v", err)
+	}
+
+	// An operator-configured issuerSet must NOT be overwritten by the seed.
+	c2 := Config{Trust: TrustConfig{IssuerSet: []string{"operator@example.com"}}}
+	applyDefaults(&c2)
+	if len(c2.Trust.IssuerSet) != 1 || c2.Trust.IssuerSet[0] != "operator@example.com" {
+		t.Errorf("operator issuerSet must survive applyDefaults: got %v", c2.Trust.IssuerSet)
+	}
+}
+
+// TestKitVerifier_DefaultIssuerSetAcceptsVendorIdentity verifies the
+// end-to-end trust loop conceptually: a manifest signed by the official CI
+// identity (vendor SAN + GitHub Actions OIDC issuer) verifies against the
+// daemon's DEFAULT issuerSet under the default signed-by-allowlist mode.
+func TestKitVerifier_DefaultIssuerSetAcceptsVendorIdentity(t *testing.T) {
+	v, vs := newHermeticVerifierWithIssuerSet(t, TrustModeSignedByAllowlist, defaultVendorIssuerSet())
+	manifestBytes := []byte(minimalKitTOML)
+
+	// Sign as the official CI would: vendor SAN + vendor OIDC issuer.
+	entity, err := vs.Sign(vendorSignerSAN, vendorSignerIssuer, manifestBytes)
+	if err != nil {
+		t.Fatalf("vs.Sign as vendor identity: %v", err)
+	}
+
+	res := v.verifyEntity("default/go", entity, manifestBytes)
+	if res.Trust != afclient.KitTrustSignedVerified {
+		t.Fatalf("Trust: want signed-verified for vendor identity under default issuerSet, got %q (details=%q)", res.Trust, res.Details)
+	}
+	if !v.trustGateAllows(res.Trust) {
+		t.Errorf("signed-by-allowlist gate must allow the vendor-signed kit, got false")
+	}
+}
+
+// TestKitVerifier_DefaultIssuerSetRejectsOtherSAN asserts a kit signed by a
+// DIFFERENT SAN (e.g., a fork's workflow or an attacker's repo) is rejected
+// by the default issuerSet — the allowlist is exact-match on SAN.
+func TestKitVerifier_DefaultIssuerSetRejectsOtherSAN(t *testing.T) {
+	v, vs := newHermeticVerifierWithIssuerSet(t, TrustModeSignedByAllowlist, defaultVendorIssuerSet())
+	manifestBytes := []byte(minimalKitTOML)
+
+	// Same OIDC issuer, different SAN (a fork / unrelated workflow).
+	const otherSAN = "https://github.com/attacker/donmai-kits/.github/workflows/sign.yml@refs/heads/main"
+	entity, err := vs.Sign(otherSAN, vendorSignerIssuer, manifestBytes)
+	if err != nil {
+		t.Fatalf("vs.Sign as other SAN: %v", err)
+	}
+
+	res := v.verifyEntity("default/go", entity, manifestBytes)
+	if res.Trust != afclient.KitTrustSignedUnverified {
+		t.Fatalf("Trust: want signed-unverified for non-allowlisted SAN, got %q (details=%q)", res.Trust, res.Details)
+	}
+	if v.trustGateAllows(res.Trust) {
+		t.Errorf("gate must reject a kit signed by a non-allowlisted SAN")
+	}
+}
+
+// TestKitVerifier_DefaultIssuerSetRejectsOtherIssuer asserts the vendor
+// identity pins the OIDC issuer too: a kit with the EXACT vendor SAN but a
+// different issuer (a forged or non-GitHub token presenting the same SAN
+// string) is rejected. This is the issuer-pin guarantee that distinguishes
+// the official identity from any other holder of the same SAN string.
+func TestKitVerifier_DefaultIssuerSetRejectsOtherIssuer(t *testing.T) {
+	v, vs := newHermeticVerifierWithIssuerSet(t, TrustModeSignedByAllowlist, defaultVendorIssuerSet())
+	manifestBytes := []byte(minimalKitTOML)
+
+	// Exact vendor SAN, but a different OIDC issuer.
+	entity, err := vs.Sign(vendorSignerSAN, "https://evil-issuer.example", manifestBytes)
+	if err != nil {
+		t.Fatalf("vs.Sign with wrong issuer: %v", err)
+	}
+
+	res := v.verifyEntity("default/go", entity, manifestBytes)
+	if res.Trust != afclient.KitTrustSignedUnverified {
+		t.Fatalf("Trust: want signed-unverified for wrong issuer, got %q (details=%q)", res.Trust, res.Details)
+	}
+	if v.trustGateAllows(res.Trust) {
+		t.Errorf("gate must reject the vendor SAN under a non-vendor issuer")
+	}
+}
+
 func TestKitVerifier_BundleVerifiesOK(t *testing.T) {
 	v, vs := newHermeticVerifier(t, TrustModePermissive)
 	manifestBytes := []byte(minimalKitTOML)

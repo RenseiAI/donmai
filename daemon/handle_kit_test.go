@@ -691,24 +691,34 @@ func TestKitRegistryOrEmpty_FallsBackWhenConfigEmpty(t *testing.T) {
 
 // TestKitRegistryOrEmpty_DefaultTrustBlocksInstall pins the secure
 // out-of-box behaviour: with no daemon.yaml trust block and no env
-// override, the default trust mode is signed-by-allowlist with an empty
-// issuer set — a misconfiguration that blocks Install fail-closed (with
-// an actionable reason) while keeping the kit surface observable.
+// override, the default trust mode is signed-by-allowlist AND the issuer
+// set is seeded with the official vendor signer (defaultVendorIssuerSet).
+// That is a VALID config (not a misconfiguration), so kitRegistryOrEmpty
+// returns a real *KitRegistry — official signed kits install, while an
+// unsigned kit is still rejected fail-closed by the trust gate with an
+// actionable reason.
 func TestKitRegistryOrEmpty_DefaultTrustBlocksInstall(t *testing.T) {
 	t.Setenv(envKitTrustMode, "")
 	s := &Server{}
 	reg := s.kitRegistryOrEmpty()
-	stub, ok := reg.(*misconfiguredKitRegistry)
+	kitReg, ok := reg.(*KitRegistry)
 	if !ok {
-		t.Fatalf("registry type = %T, want *misconfiguredKitRegistry", reg)
+		t.Fatalf("registry type = %T, want *KitRegistry (default issuerSet is seeded, so config is valid)", reg)
 	}
-	// Read-only surface stays available (no panic, delegates through).
-	_ = stub.List()
-	_ = stub.ListSources()
-	// Install is blocked with the actionable misconfiguration reason.
-	_, err := stub.Install("rensei/example", afclient.KitInstallRequest{})
+	// The seeded default issuer set must be the official vendor identity.
+	if got := kitReg.TrustConfig().IssuerSet; len(got) != 1 || got[0] != vendorSignerSAN {
+		t.Fatalf("default issuerSet = %v, want [%q]", got, vendorSignerSAN)
+	}
+	if got := kitReg.TrustConfig().Mode; got != TrustModeSignedByAllowlist {
+		t.Errorf("default trust mode = %q, want %q", got, TrustModeSignedByAllowlist)
+	}
+	// An UNSIGNED kit is still rejected fail-closed at the gate.
+	repoURL := newLocalGitFixture(t, fixtureFile{name: "rensei-example.kit.toml", body: minimalKitTOML})
+	_, err := kitReg.Install("rensei/example", afclient.KitInstallRequest{
+		Source: &afclient.KitInstallSource{Kind: "git", URL: repoURL},
+	})
 	if !errors.Is(err, ErrKitTrustGateRejected) {
-		t.Fatalf("Install: want ErrKitTrustGateRejected, got %v", err)
+		t.Fatalf("Install of unsigned kit: want ErrKitTrustGateRejected, got %v", err)
 	}
 	for _, want := range []string{"trust.issuerSet", envKitTrustMode} {
 		if !strings.Contains(err.Error(), want) {

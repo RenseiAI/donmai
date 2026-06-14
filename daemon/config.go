@@ -316,6 +316,14 @@ func applyDefaults(c *Config) {
 		// default when no Config is loaded at all.
 		c.Trust.Mode = resolveDefaultTrustMode()
 	}
+	if len(c.Trust.IssuerSet) == 0 {
+		// Seed the vendor trust root's default allowlist — the official
+		// donmai-kits signing identity — so signed-by-allowlist is usable
+		// out of the box for official kits without --allow-unsigned. An
+		// operator who configures their own issuerSet replaces this
+		// entirely. Kept in lock-step with kitRegistryOrEmpty.
+		c.Trust.IssuerSet = defaultVendorIssuerSet()
+	}
 	for i := range c.Projects {
 		if c.Projects[i].CloneStrategy == "" {
 			c.Projects[i].CloneStrategy = CloneShallow
