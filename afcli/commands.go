@@ -150,6 +150,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newKitCmd(ds))
 	root.AddCommand(newRoutingCmd(ds))
 	root.AddCommand(newWorkareaCmd(ds))
+	root.AddCommand(newHostWatchCmd())
 	if cfg.EnableDashboard {
 		root.AddCommand(newDashboardCmd(cfg))
 	}
