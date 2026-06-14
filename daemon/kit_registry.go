@@ -304,6 +304,18 @@ func (r *KitRegistry) ScanPaths() []string {
 	return out
 }
 
+// TrustConfig returns the registry verifier's effective trust
+// configuration (mode + issuer allowlist + actor). Used by callers that
+// need to observe the resolved trust policy — e.g., to confirm the
+// default vendor issuer set was seeded. Returns the zero TrustConfig when
+// no verifier is wired.
+func (r *KitRegistry) TrustConfig() TrustConfig {
+	if r.verifier == nil {
+		return TrustConfig{}
+	}
+	return r.verifier.config
+}
+
 // List returns all installed kits across all scan paths. Malformed
 // manifests log a warning and are excluded. Empty scan paths return an
 // empty slice with no error.

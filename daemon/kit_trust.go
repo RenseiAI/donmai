@@ -59,17 +59,64 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 )
 
-// embeddedTrustRoot is the public Sigstore production trust root JSON
-// (Fulcio + Rekor + CT log + TSA cert chain). Sourced from
+// embeddedTrustRoot is the Sigstore production trust root JSON (Fulcio +
+// Rekor + CT log + TSA cert chain). Sourced from
 // https://raw.githubusercontent.com/sigstore/sigstore-go/main/examples/trusted-root-public-good.json.
 //
-// Ship-with-the-binary so the OSS daemon verifies bundles offline. To
-// be replaced with a vendor-published trust root once the signing CI's
-// productionized signing CI emits Rensei-signed Fulcio + Rekor cert
-// chain (Wave 13+).
+// This is the VENDOR trust root for the OSS execution layer: the official
+// kit-signing CI signs keyless via GitHub Actions OIDC, whose short-lived
+// certificates are issued by the public-good Fulcio instance and logged in
+// the public-good Rekor transparency log. The cert *chain* must therefore
+// validate against this public-good root — a self-hosted Fulcio would be
+// unable to validate a GitHub-OIDC-issued certificate at all.
+//
+// What makes this a *vendor* trust root rather than "trust anyone with a
+// GitHub OIDC token" is the default issuer allowlist: the daemon ships with
+// defaultVendorIssuerSet() seeded into trust.issuerSet, which pins the exact
+// Fulcio SAN + OIDC issuer of the official donmai-kits signing workflow (see
+// vendorSignerSAN / vendorSignerIssuer below). Chain-validates against this
+// embedded root AND matches that one identity → official kits install under
+// the default signed-by-allowlist mode without --allow-unsigned. Any other
+// signer (even a validly keyless-signed one) fails the identity policy.
+//
+// Ship-with-the-binary so the OSS daemon verifies bundles offline.
 //
 //go:embed trust_root_embedded.json
 var embeddedTrustRoot []byte
+
+// The official donmai-kits signing identity, allowlisted by default so that
+// official kits install under the default signed-by-allowlist trust mode
+// without an --allow-unsigned override.
+//
+// These are the keyless (Fulcio) certificate fields the donmai-kits sign
+// workflow (.github/workflows/sign.yml, on push to main) presents:
+//
+//   - vendorSignerSAN is the Fulcio Subject Alternative Name, which for a
+//     GitHub Actions OIDC identity is the workflow ref URI.
+//   - vendorSignerIssuer is the OIDC issuer that minted the token Fulcio
+//     exchanged for the signing certificate.
+//
+// The verifier pins BOTH (exact-match) for this identity — see
+// buildIdentityPolicies, which special-cases the vendor SAN to also bind the
+// issuer rather than wildcarding it. Operator-added trust.issuerSet entries
+// remain SAN-only (issuer wildcarded) for backward compatibility.
+const (
+	vendorSignerSAN    = "https://github.com/RenseiAI/donmai-kits/.github/workflows/sign.yml@refs/heads/main"
+	vendorSignerIssuer = "https://token.actions.githubusercontent.com"
+)
+
+// defaultVendorIssuerSet returns the issuer allowlist the daemon seeds when
+// the operator has not configured trust.issuerSet. It contains exactly the
+// official donmai-kits signing identity (vendorSignerSAN), so the default
+// signed-by-allowlist mode is usable out of the box for official kits while
+// still rejecting every other signer.
+//
+// Seeded by applyDefaults (config.go) and kitRegistryOrEmpty (handle_kit.go)
+// — the same two sites that resolve the default trust mode — so all code
+// paths that fill a missing trust config agree on the default allowlist.
+func defaultVendorIssuerSet() []string {
+	return []string{vendorSignerSAN}
+}
 
 // TrustMode is the operator-configured policy for how the install
 // gate reacts to verifier outcomes.
@@ -399,16 +446,28 @@ func buildIdentityPolicies(issuerSet []string) []verify.PolicyOption {
 	}
 	out := make([]verify.PolicyOption, 0, len(issuerSet))
 	for _, san := range issuerSet {
-		// san-as-exact-match; regex deferred to a Wave 13+ extension
-		// when the productionized signing CI's issuer set materializes.
+		// san-as-exact-match; SAN-pattern regex deferred to a later
+		// extension when a broader signer set materializes.
 		//
-		// The OIDC issuer axis is intentionally wildcarded (".*"):
-		// IssuerSet entries are Fulcio SAN identities per the TrustConfig
-		// contract, not issuer URLs. sigstore-go's NewCertificateIdentity
-		// rejects identities with NO issuer criteria at all, so an empty
+		// Issuer axis: the official vendor identity (vendorSignerSAN)
+		// pins BOTH the SAN and the OIDC issuer (vendorSignerIssuer) so
+		// that only the donmai-kits GitHub Actions workflow — not any
+		// other holder of a keyless cert with the same SAN string —
+		// satisfies the policy. Operator-added entries stay SAN-only
+		// (issuer wildcarded ".*") for backward compatibility: their
+		// entries are Fulcio SAN identities per the TrustConfig contract,
+		// not issuer URLs, and sigstore-go's NewCertificateIdentity
+		// rejects an identity with NO issuer criteria at all, so an empty
 		// issuer + empty issuer-regex would mark every entry malformed
 		// and fail-close the whole allowlist.
-		ident, err := verify.NewShortCertificateIdentity("", ".*", san, "")
+		var ident verify.CertificateIdentity
+		var err error
+		if san == vendorSignerSAN {
+			// Exact SAN + exact issuer — the official-kit signer.
+			ident, err = verify.NewShortCertificateIdentity(vendorSignerIssuer, "", san, "")
+		} else {
+			ident, err = verify.NewShortCertificateIdentity("", ".*", san, "")
+		}
 		if err != nil {
 			slog.Warn("kit verifier: skipping malformed issuer entry", //nolint:gosec // structured slog handler escapes values
 				"san", san,
