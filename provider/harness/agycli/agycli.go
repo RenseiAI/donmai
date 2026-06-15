@@ -10,7 +10,7 @@ import (
 
 // ProviderName is the stable identifier for the agy-cli provider.
 // It is distinct from agent.ProviderGemini ("gemini", the API-direct provider);
-// it is the successor to the removed gemini-cli wrap (gemini CLI EOL 2026-06-18).
+// agy-cli wraps the Antigravity `agy` CLI (OAuth/local, pty, no key).
 const ProviderName agent.ProviderName = "agy-cli"
 
 // DefaultBinary is the executable name probed on $PATH at construction.

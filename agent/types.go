@@ -12,7 +12,7 @@ import "encoding/json"
 // ProviderName is the stable identifier for an agent provider family.
 //
 // It mirrors AgentProviderName from the legacy TS port. v0.5.0 ships
-// claude, codex, and stub. Future families (spring-ai, a2a, gemini,
+// claude, codex, and stub. Additional families (gemini, agy-cli,
 // ollama, opencode, jules, amp) extend this enum without breaking the
 // contract.
 //
@@ -20,18 +20,15 @@ import "encoding/json"
 type ProviderName string
 
 // ProviderName constants. v0.5.0 ships ProviderClaude, ProviderCodex,
-// and ProviderStub. The remaining identifiers are reserved for v0.6.0+
-// providers per F.1.1 §1; declaring them now keeps the wire enum stable
-// across waves so platform-side dispatch routing does not regress.
+// and ProviderStub. The remaining identifiers cover the implemented providers;
+// declaring them keeps the wire enum stable so dispatch routing does not regress.
 const (
 	ProviderClaude   ProviderName = "claude"
 	ProviderCodex    ProviderName = "codex"
 	ProviderStub     ProviderName = "stub" // test-only; deterministic
-	ProviderSpringAI ProviderName = "spring-ai"
-	ProviderA2A      ProviderName = "a2a"
 	ProviderAmp      ProviderName = "amp"
 	ProviderGemini   ProviderName = "gemini"
-	ProviderAGYCLI   ProviderName = "agy-cli" // Antigravity `agy` CLI-wrap; OAuth/local/host-session, pty, no key. Successor to the removed gemini-cli wrap (gemini CLI EOL 2026-06-18).
+	ProviderAGYCLI   ProviderName = "agy-cli" // Antigravity `agy` CLI-wrap; OAuth/local/host-session, pty, no key.
 	ProviderOllama   ProviderName = "ollama"
 	ProviderOpenCode ProviderName = "opencode"
 	ProviderJules    ProviderName = "jules"
@@ -136,8 +133,8 @@ type Capabilities struct {
 	SupportsReasoningEffort bool `json:"supportsReasoningEffort,omitempty"`
 
 	// ToolPermissionFormat names the tool-permission grammar this
-	// provider uses ("claude" | "codex" | "spring-ai"). When empty
-	// callers should default to "claude".
+	// provider uses ("claude" | "codex"). When empty callers should
+	// default to "claude".
 	ToolPermissionFormat string `json:"toolPermissionFormat,omitempty"`
 
 	// AcceptsAllowedToolsList reports whether the provider honors

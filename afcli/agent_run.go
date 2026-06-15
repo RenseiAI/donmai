@@ -492,9 +492,8 @@ func agentRunProviderCtors() []providerCtor {
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
 		// agy-cli is a LOCAL/HOST-SESSION/OAUTH provider wrapping the Antigravity `agy` CLI under a pty.
 		// It is the SUBSCRIPTION/no-key local-Gemini path (the user's own OAuth-authed agy on the user's
-		// own machine), and the successor to the now-removed gemini-cli wrap (gemini CLI EOL 2026-06-18).
-		// Distinct from the API-direct "gemini" provider. Requires `agy` installed AND logged in on the
-		// host PATH. NOT for cloud sandboxes.
+		// own machine). Distinct from the API-direct "gemini" provider. Requires `agy` installed AND
+		// logged in on the host PATH. NOT for cloud sandboxes.
 		{name: "agy-cli", new: func() (agent.Provider, error) { return provideragycli.New(provideragycli.Options{}) }},
 		{name: "opencode", new: func() (agent.Provider, error) { return provideropencode.New(provideropencode.Options{}) }},
 	}

@@ -335,8 +335,8 @@ func isCanonicalAuthMode(a agent.AuthMode) bool {
 }
 
 // realProviderNames is the set of ProviderName consts that name a real,
-// implemented provider (8 of them). Reserved-but-unimplemented names
-// (spring-ai, a2a, jules) are intentionally absent.
+// implemented provider (8 of them). The platform-reserved name (jules)
+// is intentionally absent.
 func realProviderNames() []agent.ProviderName {
 	return []agent.ProviderName{
 		agent.ProviderClaude,
