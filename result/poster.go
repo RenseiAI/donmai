@@ -221,6 +221,20 @@ type statusRequest struct {
 	// platforms ignore them.
 	CommitSHA      string `json:"commitSha,omitempty"`
 	PullRequestURL string `json:"pullRequestUrl,omitempty"`
+
+	// Manifest is the structured turn-result manifest the agent wrote to
+	// `.agent/turn-result.json` (W3 — deterministic turn outcome), when one was
+	// present + valid. The platform's `applyTurnManifest` route consumes the
+	// whole object (idempotent by content hash) as the authoritative turn
+	// verdict + summary + artifacts, in preference to re-deriving them from the
+	// scraped marker / scalar fields above. Additive + back-compat: omitted
+	// (nil) when no manifest was written, and an old platform that does not
+	// read it simply ignores the extra field. The scalar fields
+	// (result/resultMarker/summary/pullRequestUrl/commitSha) are still sent so
+	// the lock-step rollout works either direction: a new runner against an old
+	// platform degrades to the scalars, an old runner against a new platform
+	// posts no manifest and the platform falls back to the scalars/marker scan.
+	Manifest *agent.TurnManifest `json:"manifest,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -329,6 +343,9 @@ func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Resul
 			ResultMarker:      workResultMarker(r.WorkResult),
 			CommitSHA:         r.CommitSHA,
 			PullRequestURL:    r.PullRequestURL,
+			// Structured turn-result manifest (W3) — posted verbatim when the
+			// agent wrote one. Additive; nil when absent.
+			Manifest: r.Manifest,
 		}
 		if r.Cost != nil {
 			body.TotalCostUsd = r.Cost.TotalCostUsd
