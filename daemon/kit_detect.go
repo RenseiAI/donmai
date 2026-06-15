@@ -166,6 +166,18 @@ func manifestToView(m kitManifestTOML) kit.ManifestView {
 			}
 		}
 	}
+	// Project [provide.prompt_fragments] into the view so the runner can
+	// inject workType-filtered fragment bodies into the system prompt (step 5a).
+	if len(m.Provide.PromptFragments) > 0 {
+		v.PromptFragments = make([]kit.PromptFragmentEntry, 0, len(m.Provide.PromptFragments))
+		for _, pf := range m.Provide.PromptFragments {
+			v.PromptFragments = append(v.PromptFragments, kit.PromptFragmentEntry{
+				Partial: pf.Partial,
+				When:    copyStrings(pf.When),
+				File:    pf.File,
+			})
+		}
+	}
 	return v
 }
 

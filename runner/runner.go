@@ -149,10 +149,33 @@ type Options struct {
 	// empty no Kit skill injection occurs — the runner behaves as before
 	// this feature was added (additive/cardinal rule 1 compliant).
 	//
+	// DEPRECATED path: this field pre-computes skill sources at daemon CWD,
+	// which races against kit detect on the real worktree. Prefer wiring
+	// KitSkillDetector instead (see below) which resolves against the cloned
+	// worktree AFTER clone (step 2b). Both fields are supported: if
+	// KitSkillDetector is set it takes precedence over KitSkillSources.
+	//
 	// Each element describes one active Kit's skill file list (paths
 	// relative to the Kit's manifest directory) and priority for
 	// ordering the merged system-prompt append block.
 	KitSkillSources []kit.KitSkillSource
+
+	// KitSkillDetector resolves kit skill sources against the cloned worktree
+	// path (post-clone, step 2b) so detection runs against the REAL repo
+	// contents rather than the daemon's CWD. Implemented by
+	// KitRegistry.SkillSourcesForRepo. When non-nil it replaces KitSkillSources
+	// for the lifetime of a single Run (the daemon-CWD pre-compute is stale
+	// once the repo is cloned to wpath).
+	//
+	// Additive/cardinal rule 1: nil keeps KitSkillSources behaviour intact.
+	KitSkillDetector KitSkillDetector
+
+	// KitPromptFragmentDetector resolves kit prompt-fragment sources against
+	// the cloned worktree path (post-clone, step 2b). Implemented by
+	// KitRegistry.PromptFragmentSourcesForRepo. When non-nil the runner injects
+	// workType-filtered fragment bodies into the system prompt at step 5a
+	// alongside skill bodies. nil = no fragment injection (additive).
+	KitPromptFragmentDetector KitPromptFragmentDetector
 
 	// KitDetector resolves the kit manifests that apply to a provisioned
 	// worktree, ordered foundation → framework → project. The daemon
@@ -175,6 +198,16 @@ type Options struct {
 // empty slice when no kit applies. Implemented by KitRegistry.DetectForRepo.
 type KitDetector func(repoRoot, targetOS string) ([]kit.ManifestView, error)
 
+// KitSkillDetector resolves kit skill sources against the cloned worktree
+// path so skill injection uses the actual repo's detected kits. Implemented
+// by KitRegistry.SkillSourcesForRepo.
+type KitSkillDetector func(repoRoot, targetOS string) ([]kit.KitSkillSource, error)
+
+// KitPromptFragmentDetector resolves kit prompt-fragment sources against
+// the cloned worktree path for workType-filtered injection. Implemented
+// by KitRegistry.PromptFragmentSourcesForRepo.
+type KitPromptFragmentDetector func(repoRoot, targetOS string) ([]kit.KitPromptFragmentSource, error)
+
 // Runner is the long-lived per-daemon orchestrator. Build one via
 // [New] at daemon startup and call [Runner.Run] for every claimed
 // QueuedWork.
@@ -184,27 +217,29 @@ type KitDetector func(repoRoot, targetOS string) ([]kit.ManifestView, error)
 // WorktreeManager, etc.) are documented as concurrency-safe by their
 // own packages.
 type Runner struct {
-	registry           *Registry
-	wt                 *worktree.Manager
-	poster             *result.Poster
-	credentialProvider CredentialProvider
-	envc               *env.Composer
-	mcpb               *mcp.Builder
-	store              *state.Store
-	promptBuilder      *prompt.Builder
-	httpClient         *http.Client
-	logger             *slog.Logger
-	now                func() time.Time
-	maxDuration        time.Duration
-	preserveOnFail     bool
-	preserveAlways     bool
-	skipBackstop       bool
-	skipSteering       bool
-	skipPostSession    bool
-	hbInterval         time.Duration
-	kitSkillSources    []kit.KitSkillSource
-	kitDetector        KitDetector
-	kitTargetOS        string
+	registry              *Registry
+	wt                    *worktree.Manager
+	poster                *result.Poster
+	credentialProvider    CredentialProvider
+	envc                  *env.Composer
+	mcpb                  *mcp.Builder
+	store                 *state.Store
+	promptBuilder         *prompt.Builder
+	httpClient            *http.Client
+	logger                *slog.Logger
+	now                   func() time.Time
+	maxDuration           time.Duration
+	preserveOnFail        bool
+	preserveAlways        bool
+	skipBackstop          bool
+	skipSteering          bool
+	skipPostSession       bool
+	hbInterval            time.Duration
+	kitSkillSources       []kit.KitSkillSource
+	kitSkillDetector      KitSkillDetector
+	kitPromptFragDetector KitPromptFragmentDetector
+	kitDetector           KitDetector
+	kitTargetOS           string
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session
@@ -231,27 +266,29 @@ func New(opts Options) (*Runner, error) {
 		return nil, errors.New("runner: Poster is required")
 	}
 	r := &Runner{
-		registry:           opts.Registry,
-		wt:                 opts.WorktreeManager,
-		poster:             opts.Poster,
-		credentialProvider: opts.CredentialProvider,
-		envc:               opts.EnvComposer,
-		mcpb:               opts.MCPBuilder,
-		store:              opts.StateStore,
-		promptBuilder:      opts.PromptBuilder,
-		httpClient:         opts.HTTPClient,
-		logger:             opts.Logger,
-		now:                opts.Now,
-		maxDuration:        opts.MaxSessionDuration,
-		preserveOnFail:     opts.PreserveWorktreeOnFailure,
-		preserveAlways:     opts.PreserveWorktreeAlways,
-		skipBackstop:       opts.SkipBackstop,
-		skipSteering:       opts.SkipSteering,
-		skipPostSession:    opts.SkipPostSession,
-		hbInterval:         opts.HeartbeatInterval,
-		kitSkillSources:    opts.KitSkillSources,
-		kitDetector:        opts.KitDetector,
-		kitTargetOS:        opts.KitTargetOS,
+		registry:              opts.Registry,
+		wt:                    opts.WorktreeManager,
+		poster:                opts.Poster,
+		credentialProvider:    opts.CredentialProvider,
+		envc:                  opts.EnvComposer,
+		mcpb:                  opts.MCPBuilder,
+		store:                 opts.StateStore,
+		promptBuilder:         opts.PromptBuilder,
+		httpClient:            opts.HTTPClient,
+		logger:                opts.Logger,
+		now:                   opts.Now,
+		maxDuration:           opts.MaxSessionDuration,
+		preserveOnFail:        opts.PreserveWorktreeOnFailure,
+		preserveAlways:        opts.PreserveWorktreeAlways,
+		skipBackstop:          opts.SkipBackstop,
+		skipSteering:          opts.SkipSteering,
+		skipPostSession:       opts.SkipPostSession,
+		hbInterval:            opts.HeartbeatInterval,
+		kitSkillSources:       opts.KitSkillSources,
+		kitSkillDetector:      opts.KitSkillDetector,
+		kitPromptFragDetector: opts.KitPromptFragmentDetector,
+		kitDetector:           opts.KitDetector,
+		kitTargetOS:           opts.KitTargetOS,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

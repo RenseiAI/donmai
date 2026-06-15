@@ -300,6 +300,109 @@ func parseYAMLDisallows(frontmatter string) []string {
 	return out
 }
 
+// KitPromptFragmentSource is the minimal kit descriptor the prompt-fragment
+// loader needs. Produced by daemon.KitRegistry.PromptFragmentSourcesForRepo.
+type KitPromptFragmentSource struct { //nolint:revive // name accepted as-is; mirrors KitSkillSource pattern
+	// ID is the kit's canonical id.
+	ID string
+	// Priority is the kit's declared priority — higher value means earlier
+	// position in the merged system-prompt append.
+	Priority int
+	// ManifestPath is the absolute path to the kit's .kit.toml file.
+	// Fragment file paths declared in the manifest are resolved relative to
+	// the directory containing this file.
+	ManifestPath string
+	// Fragments is the slice of prompt_fragment entries from the manifest.
+	Fragments []PromptFragmentEntry
+}
+
+// LoadedPromptFragments is the output of LoadPromptFragments: the merged
+// system-prompt append text assembled from workType-matching fragments.
+type LoadedPromptFragments struct {
+	// SystemAppend is the concatenation of all matching fragment bodies in
+	// kit-priority order, separated by blank lines. Empty when no fragment
+	// matches the workType or when all fragment files are unreadable.
+	SystemAppend string
+}
+
+// LoadPromptFragments walks sources in descending priority order, filters
+// each fragment by workType (empty When = always include), reads the file,
+// and returns the merged body as a system-prompt append block.
+//
+// Unreadable fragment files are skipped with a slog.Warn so a single broken
+// kit does not abort the session. Callers should treat a non-nil error as
+// diagnostic-only; the returned LoadedPromptFragments contains whatever was
+// successfully loaded.
+func LoadPromptFragments(sources []KitPromptFragmentSource, workType string) (LoadedPromptFragments, error) {
+	// Sort descending by priority.
+	sorted := make([]KitPromptFragmentSource, len(sources))
+	copy(sorted, sources)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Priority != sorted[j].Priority {
+			return sorted[i].Priority > sorted[j].Priority
+		}
+		return sorted[i].ID < sorted[j].ID
+	})
+
+	var (
+		bodies []string
+		errs   []string
+	)
+
+	for _, src := range sorted {
+		kitDir := filepath.Dir(src.ManifestPath)
+		for _, frag := range src.Fragments {
+			// workType filter: empty When means "always"; otherwise
+			// workType must appear in the When list.
+			if !fragmentMatchesWorkType(frag.When, workType) {
+				continue
+			}
+			if frag.File == "" {
+				continue
+			}
+			absPath := filepath.Join(kitDir, frag.File)
+			data, err := os.ReadFile(absPath) //nolint:gosec // operator-installed kit file
+			if err != nil {
+				msg := fmt.Sprintf("kit %s: prompt_fragment %q: %v", src.ID, frag.Partial, err)
+				slog.Warn("kit prompt-fragment loader: skip unreadable fragment", //nolint:gosec
+					"kitId", src.ID,
+					"partial", frag.Partial,
+					"file", absPath,
+					"err", err.Error(),
+				)
+				errs = append(errs, msg)
+				continue
+			}
+			body := strings.TrimSpace(string(data))
+			if body != "" {
+				bodies = append(bodies, body)
+			}
+		}
+	}
+
+	var joinedErr error
+	if len(errs) > 0 {
+		joinedErr = fmt.Errorf("prompt-fragment loader: %s", strings.Join(errs, "; "))
+	}
+	return LoadedPromptFragments{
+		SystemAppend: strings.Join(bodies, "\n\n"),
+	}, joinedErr
+}
+
+// fragmentMatchesWorkType reports whether a fragment with the given when list
+// applies to workType. An empty when list matches any workType (no filter).
+func fragmentMatchesWorkType(when []string, workType string) bool {
+	if len(when) == 0 {
+		return true
+	}
+	for _, w := range when {
+		if w == workType {
+			return true
+		}
+	}
+	return false
+}
+
 // deduplicateStrings returns s with duplicates removed, preserving order.
 func deduplicateStrings(s []string) []string {
 	if len(s) == 0 {

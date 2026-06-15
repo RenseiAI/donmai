@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -337,10 +338,19 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 // runGit invokes the git binary in cwd with the supplied args and
 // returns the combined stdout+stderr trimmed of trailing whitespace.
 // The caller chooses ctx; a cancelled ctx aborts the subprocess.
+//
+// GIT_AUTHOR_*/GIT_COMMITTER_* are inherited from the process environment
+// when set (e.g. by buildSessionEnv → agent.Spec.Env → the spawned worker).
+// We forward os.Environ() so those vars are visible to git even when the
+// backstop runs as a direct subprocess of the runner rather than through
+// the provider's shell. This closes the cloud-runner case where the
+// sandbox's git global config is absent and commits would fail with
+// "Author identity unknown".
 func runGit(ctx context.Context, cwd string, args ...string) (string, error) {
 	//nolint:gosec // G204: args come from runner-controlled call sites.
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = cwd
+	cmd.Env = os.Environ() // inherit GIT_AUTHOR_*/GIT_COMMITTER_* from process env
 	out, err := cmd.CombinedOutput()
 	return strings.TrimRight(string(out), " \n\t"), err
 }
