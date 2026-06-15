@@ -204,6 +204,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	//   - KitDetector: the registry's repo-detection fallback. When the
 	//     platform threads no explicit demand on the work item, the runner
 	//     detects kits from the cloned worktree (OD-1 fallback).
+	//   - KitSkillDetector: resolves skill sources POST-CLONE against the
+	//     real worktree path (closes the stale-CWD bug). Replaces the prior
+	//     KitSkillSources pre-compute-at-daemon-CWD approach.
+	//   - KitPromptFragmentDetector: resolves prompt-fragment sources
+	//     POST-CLONE so [provide.prompt_fragments] bodies are injected at
+	//     step 5a filtered by the session's workType.
 	//   - KitTargetOS: "linux" for cloud sandboxes (a cloud sandbox is Linux
 	//     even when this binary runs on a macOS host, OD-2); the host GOOS
 	//     for local execution. The daemon-spawned worker for a cloud
@@ -214,26 +220,6 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	kitTargetOS, _ := kit.ResolveOS(runtime.GOOS)
 	if kitTargetOS == "" {
 		kitTargetOS = kit.OSLinux
-	}
-
-	// Surface the active kits' [provide.skills] contributions so the runner
-	// activates kit skills at loop step 5a. This closes the follow-up the
-	// kits pivot (e5c5aee4) flagged: K1 added runner.Options.KitSkillSources
-	// and step 5a consumes it, but until now the daemon never populated it,
-	// so kit skills were inert. SkillSourcesForRepo mirrors DetectForRepo's
-	// applicability rules over the same active kits, so detection (toolchain)
-	// and skill sourcing stay consistent. The repo isn't cloned yet at this
-	// construction site, so we resolve against the daemon's current working
-	// directory; SkillSourcesForRepo returns nil (→ no kit skills) when
-	// nothing applies, which is additive/cardinal-rule-1 safe. A detection
-	// error (e.g. foundation conflict) is logged and treated as "no kit
-	// skills" rather than failing the session.
-	repoRootForKits, _ := os.Getwd()
-	kitSkillSources, kitSkillErr := kitReg.SkillSourcesForRepo(repoRootForKits, kitTargetOS)
-	if kitSkillErr != nil {
-		logger.Warn("donmai agent run: kit skill sourcing failed; proceeding without kit skills",
-			"err", kitSkillErr)
-		kitSkillSources = nil
 	}
 
 	r, err := runner.New(runner.Options{
@@ -249,9 +235,13 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// detection; KitDetector is the fallback.
 		KitDetector: kitReg.DetectForRepo,
 		KitTargetOS: kitTargetOS,
-		// Kit skills (loop step 5a) — populated from the active kits'
-		// [provide.skills] via KitRegistry.SkillSourcesForRepo. nil = none.
-		KitSkillSources: kitSkillSources,
+		// KIT BOOTSTRAP — wire post-clone skill + prompt-fragment detectors
+		// so the runner re-detects against the REAL worktree (step 2c in
+		// loop.go) rather than relying on the pre-computed daemon-CWD sources.
+		// KitSkillSources is intentionally left nil — KitSkillDetector takes
+		// precedence when set (see runner/runner.go field docs).
+		KitSkillDetector:          kitReg.SkillSourcesForRepo,
+		KitPromptFragmentDetector: kitReg.PromptFragmentSourcesForRepo,
 		// Runtime memory-inject (v2) needs NO worker config: the runner always
 		// wires the inject handler when the provider supports injection, and the
 		// PLATFORM decides per-session whether to deliver (per-project memory

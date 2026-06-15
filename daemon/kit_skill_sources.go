@@ -88,3 +88,70 @@ func (r *KitRegistry) SkillSourcesForRepo(repoRoot, targetOS string) ([]kit.KitS
 	}
 	return out, nil
 }
+
+// PromptFragmentSourcesForRepo returns the kit prompt-fragment sources for
+// every active kit that applies to the repo rooted at repoRoot for the given
+// targetOS. It mirrors SkillSourcesForRepo's applicability decision (reuses
+// DetectForRepo) but surfaces each applicable kit's manifest path and the
+// [provide.prompt_fragments] entries — including their [when] workType filters.
+//
+// The returned slice is handed to runner.Options.KitPromptFragmentSources so
+// the runner can inject workType-filtered fragment bodies into the system
+// prompt at step 5a (alongside skill bodies). Kits that declare no
+// prompt_fragments are omitted. Ordering follows DetectForRepo
+// (foundation → framework → project).
+//
+// A detection error is surfaced to the caller; on error the returned slice is
+// nil. A repo with no applicable kits — or no applicable kits that declare
+// prompt_fragments — returns (nil, nil).
+func (r *KitRegistry) PromptFragmentSourcesForRepo(repoRoot, targetOS string) ([]kit.KitPromptFragmentSource, error) {
+	views, err := r.DetectForRepo(repoRoot, targetOS)
+	if err != nil {
+		return nil, err
+	}
+	if len(views) == 0 {
+		return nil, nil
+	}
+
+	manifests, paths := r.scanWithPaths()
+	byID := make(map[string]int, len(manifests))
+	for i, m := range manifests {
+		byID[m.Kit.ID] = i
+	}
+
+	out := make([]kit.KitPromptFragmentSource, 0, len(views))
+	for _, v := range views {
+		idx, ok := byID[v.ID]
+		if !ok {
+			continue
+		}
+		m := manifests[idx]
+		if len(m.Provide.PromptFragments) == 0 {
+			continue
+		}
+		frags := make([]kit.PromptFragmentEntry, 0, len(m.Provide.PromptFragments))
+		for _, pf := range m.Provide.PromptFragments {
+			if pf.File == "" {
+				continue
+			}
+			frags = append(frags, kit.PromptFragmentEntry{
+				Partial: pf.Partial,
+				When:    copyStrings(pf.When),
+				File:    pf.File,
+			})
+		}
+		if len(frags) == 0 {
+			continue
+		}
+		out = append(out, kit.KitPromptFragmentSource{
+			ID:           m.Kit.ID,
+			Priority:     m.Kit.Priority,
+			ManifestPath: paths[idx],
+			Fragments:    frags,
+		})
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
