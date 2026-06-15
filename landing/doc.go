@@ -15,10 +15,3 @@
 //
 // See landing/DESIGN.md for the full TS->Go file map and the keying rationale.
 package landing
-
-import "errors"
-
-// ErrNotImplemented is returned by stubbed methods that are scaffolded but not
-// yet ported. Wrap it with fmt.Errorf("<op>: %w", ErrNotImplemented) at call
-// sites so the failing operation is identifiable.
-var ErrNotImplemented = errors.New("not implemented")

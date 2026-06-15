@@ -42,16 +42,16 @@ uses provider-neutral names:
 | `merge-queue/file-manifest.ts`                  | `landing/filemanifest.go`                | `git diff --name-only target...source` |
 | `merge-queue/types.ts` (queue adapter)          | `landing/manifest.go`                    | queue status / state types + adapter contract |
 | `merge-queue/branch-conflict.ts`                | `landing/branchconflict.go`              | git error-string classifiers |
-| `merge-queue/conflict-resolver.ts`              | `landing/conflictresolver.go`            | mergiraf check + escalation (stub) |
-| `merge-queue/lock-file-regeneration.ts`         | `landing/lockfile.go`                    | lock-file regen (stub) |
+| `merge-queue/conflict-resolver.ts`              | `landing/conflictresolver.go`            | mergiraf marker-check + escalation (reassign/notify/park) |
+| `merge-queue/lock-file-regeneration.ts`         | `landing/lockfile.go`                    | lock-file regen (npm/pnpm/yarn) + git-attributes union driver |
 | `merge-queue/merge-worker.ts`                   | `landing/worker.go`                      | prepare→execute→resolve→test→finalize loop |
 | `merge-queue/merge-pool.ts`                     | `landing/pool.go`                        | conflict-graph batching over `Worker` |
 | `merge-queue/strategies/types.ts`               | `landing/strategies/strategy.go`         | `Strategy` interface + context/results |
 | `merge-queue/strategies/index.ts`               | `landing/strategies/strategies.go`       | `New(name)` factory |
-| `merge-queue/strategies/rebase-strategy.ts`     | `landing/strategies/rebase.go`           | stub |
-| `merge-queue/strategies/merge-commit-strategy.ts` | `landing/strategies/mergecommit.go`    | stub |
-| `merge-queue/strategies/squash-strategy.ts`     | `landing/strategies/squash.go`           | stub |
-| `merge-queue/strategies/worktree-cleanup.ts`    | `landing/strategies/worktree.go`         | stub |
+| `merge-queue/strategies/rebase-strategy.ts`     | `landing/strategies/rebase.go`           | git rebase onto target |
+| `merge-queue/strategies/merge-commit-strategy.ts` | `landing/strategies/mergecommit.go`    | git merge --no-ff |
+| `merge-queue/strategies/squash-strategy.ts`     | `landing/strategies/squash.go`           | git merge --squash |
+| `merge-queue/strategies/worktree-cleanup.ts`    | `landing/strategies/worktree.go`         | git worktree add/remove helpers |
 | `merge-queue/adapters/local.ts` (storage iface) | `landing/queue.go`                       | Redis sorted-set storage |
 | `merge-queue/adapters/local.ts` (gh eligibility)| `landing/queue.go` (`extractIssueID`)    | issue-id extraction (pure, ported) |
 | `merge-queue/adapters/github-native.ts`         | (not ported — GitHub-native queue)       | external provider; out of scope for FD-4 stage 1 |
@@ -242,24 +242,14 @@ remove a set of proposals atomically (so the `Pool` never double-dispatches a
 proposal across concurrent coordinators). All operations take a `context.Context`
 for cancellation/deadlines.
 
-## Stage-1 scope
+## Build-out history
 
-Stage 1 is **design + scaffold that compiles**. Interfaces, value types, the
-`Key` composite + `Key.String()`, the conflict graph and issue-id extraction (the
-two pure, fully-portable pieces) are real; the git/network/Redis-heavy bodies are
-stubs that return `errNotImplemented` (wrapped with `fmt.Errorf("...: %w", ...)`)
-so `go build ./landing/...` passes. Subsequent stages fill the bodies and port
-the table-driven tests from the TS `*.test.ts` suites.
-
-### Stage-1 implemented vs stubbed
-
-- Implemented: `ConflictGraph` (full), `ExtractIssueID`, `Key.String()`,
-  `AssertCapability` / `UnsupportedOperationError`, the strategy factory's
-  unknown-name error, all type/interface declarations.
-- Stubbed (return not-implemented): `BuildFileManifest(s)`, `RedisStorage`
-  methods, `Worker.Start/ProcessEntry`, `Pool.Start`, all three strategies'
-  `Prepare/Execute/Finalize`, `vcs.github`/`vcs.atomic` adapter verbs,
-  conflict resolver, lock-file regen, worktree cleanup.
+The port landed in stages. Stage 1 was design + scaffold that compiles
+(interfaces, value types, the `Key` composite + `Key.String()`, the conflict
+graph and issue-id extraction real; everything else a stub). Subsequent stages
+filled the bodies and ported the table-driven tests from the TS `*.test.ts`
+suites. **As of Stage 5 there are no stubs left** — `landing.ErrNotImplemented`
+was removed because nothing returns it.
 
 ## Stage-3 scope — pool + worker + (orgId,repoId)-keyed Redis queue (DONE)
 
@@ -302,11 +292,11 @@ Test seams: `Worker`/`Pool` expose unexported `newStrategy`/`newResolver`/
 so tests drive the pipeline with fakes and never spawn git or sleep wall-clock.
 `RedisStorage` is tested against an in-process miniredis (`redis_test.go`).
 
-Still stubbed after Stage 3: the three strategies' git bodies are real (Stage 2);
-`vcs.github`/`vcs.atomic` adapter verbs remain stubs; the optional issue-tracker
-/ PR-labeler bubble-up hooks from the TS source are intentionally not wired (the
-`Entry` is threaded through `handleResult` for a later stage); GitHub-native
-queue adapter is out of scope.
+Stage 4 replaced the `vcs.github`/`vcs.atomic` adapter-verb stubs with full
+git/gh/atomic-CLI implementations (see the vcs section below). The optional
+issue-tracker / PR-labeler bubble-up hooks from the TS source are intentionally
+not wired (the `Entry` is threaded through `handleResult` for a later stage); the
+GitHub-native server-side queue adapter is out of scope (external provider).
 
 ## OSS hygiene
 
