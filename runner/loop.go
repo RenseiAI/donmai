@@ -699,6 +699,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// Apply event-stream observations onto the result envelope.
 	streamRes.applyTo(res, provider.Name())
 
+	// 10·M. Turn-result manifest resolution (W3 — deterministic turn outcome).
+	// Resolution order for the verdict: the agent-written
+	// `.agent/turn-result.json` manifest FIRST, then the WORK_RESULT marker the
+	// stream observation already scraped (streamRes.applyTo above), then the
+	// deterministic backstop further down. The manifest WINS when present —
+	// a structured file the agent wrote is more reliable than a marker scraped
+	// out of free-form prose. Best-effort: a missing manifest is the common
+	// case (ErrNoManifest) and a no-op; a malformed one logs + falls through
+	// to the scraped marker. A manifest verdict of "blocked" feeds the same
+	// streamRes.blocked signal the marker scan produces, so the blocked
+	// classification fork below treats both channels identically.
+	r.applyTurnManifest(wpath, qw, res, &streamRes)
+
 	// 10a. Structural blocked-agent classification. When the agent
 	// announced a deliberate decline (scanBlocked picked up a
 	// "WORK_RESULT:blocked" / "AGENT_BLOCKED: …" marker) and did not also

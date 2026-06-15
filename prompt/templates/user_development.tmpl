@@ -20,14 +20,14 @@ Start work on {{or .IssueIdentifier "<unidentified issue>"}}.
 4. Push the branch (`git push -u origin <branch>`).
 5. Open a pull request (`gh pr create --base {{or .Ref "main"}} --head <branch>`) targeting the repository at {{or .Repository "the configured remote"}}.
 6. Post the PR link as a comment on {{or .IssueIdentifier "the issue"}} via `{{.BrandCLI}} linear create-comment`.
-7. End your final assistant message with exactly one marker so the orchestrator can transition the issue:
+7. Before you finish, write your turn result to `.agent/turn-result.json` (relative to the worktree root) so the orchestrator can transition the issue. The file is JSON of the form `{"schemaVersion": 1, "verdict": "passed", "summary": "<one line>", "pullRequestUrl": "<pr url>"}`. The `verdict` is exactly one of:
 
-   - `WORK_RESULT:passed` when the implementation is complete, local verification is green (tests, typecheck, lint), the branch is pushed, and the PR is open. Remote CI is NOT part of this definition — do not wait for it.
-   - `WORK_RESULT:failed` when you attempted the work but it regressed or could not be finished (e.g. tests you could not make pass, a broken build).
-   - `WORK_RESULT:blocked` when you deliberately declined to proceed because the work is not actionable as specified — an ambiguous or contradictory spec, missing acceptance criteria, or an unmet precondition. Prefer this over `WORK_RESULT:failed` when there is nothing to fix without more input; put the reason on the same line as `AGENT_BLOCKED: <reason>`. This is a reasoned refusal, not a crash, and the orchestrator routes it for clarification instead of retrying the same context.
+   - `passed` when the implementation is complete, local verification is green (tests, typecheck, lint), the branch is pushed, and the PR is open. Remote CI is NOT part of this definition — do not wait for it. Include the `pullRequestUrl`.
+   - `failed` when you attempted the work but it regressed or could not be finished (e.g. tests you could not make pass, a broken build).
+   - `blocked` when you deliberately declined to proceed because the work is not actionable as specified — an ambiguous or contradictory spec, missing acceptance criteria, or an unmet precondition. Prefer this over `failed` when there is nothing to fix without more input; add a `"blockedReason": "<reason>"` field. This is a reasoned refusal, not a crash, and the orchestrator routes it for clarification instead of retrying the same context.
 
-   Without this marker the orchestrator posts a diagnostic comment and leaves the issue in its current status.
+   Then end your final assistant message with the matching fallback marker (`WORK_RESULT:passed` / `WORK_RESULT:failed`, or `WORK_RESULT:blocked` plus `AGENT_BLOCKED: <reason>` on its own line). The manifest file is authoritative; the marker is the backstop if the file could not be written. Without either, the orchestrator posts a diagnostic comment and leaves the issue in its current status.
 
-Hard rule: do NOT wait for remote CI after pushing, and never schedule in-process wake-ups (timers, background polls, `gh run watch`, `gh pr checks --watch`) expecting them to outlive your final message — your session ends at your final message and any scheduled wake-up dies with it. The orchestration layer owns the CI wait and resumes the chain when CI completes. Emit your marker and end the session as soon as local verification is green and the PR is open.
+Hard rule: do NOT wait for remote CI after pushing, and never schedule in-process wake-ups (timers, background polls, `gh run watch`, `gh pr checks --watch`) expecting them to outlive your final message — your session ends at your final message and any scheduled wake-up dies with it. The orchestration layer owns the CI wait and resumes the chain when CI completes. Write your turn-result manifest and end the session as soon as local verification is green and the PR is open.
 
 When finished, exit with a short summary of what you did. Do not delete the worktree.
