@@ -161,7 +161,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// when the branch already exists (replay during recovery) `git
 	// checkout -b` returns non-zero; we surface a Debug log and
 	// continue so the agent still operates on the existing branch.
-	if _, gerr := runGit(ctx, wpath, "checkout", "-b", branch); gerr != nil {
+	if _, gerr := runGit(ctx, wpath, gitIdentity{}, "checkout", "-b", branch); gerr != nil {
 		r.logger.Debug("create work branch failed (may already exist)",
 			"branch", branch, "err", gerr)
 	}

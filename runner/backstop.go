@@ -203,8 +203,17 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		return report
 	}
 
+	// Derive git identity from the same source as buildSessionEnv so
+	// backstop commits carry the agent-session author, not whatever the
+	// cloud sandbox's git global config says (which is often absent).
+	sessionEnv := buildSessionEnv(qw)
+	id := gitIdentity{
+		Name:  sessionEnv["GIT_AUTHOR_NAME"],
+		Email: sessionEnv["GIT_AUTHOR_EMAIL"],
+	}
+
 	// 1. Sanity check that the worktree has uncommitted changes.
-	statusOut, err := runGit(ctx, worktreePath, "status", "--porcelain")
+	statusOut, err := runGit(ctx, worktreePath, id, "status", "--porcelain")
 	if err != nil {
 		report.Diagnostics = fmt.Sprintf("git status failed: %v", err)
 		return report
@@ -213,14 +222,14 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 
 	// 2. Stage everything.
 	if hasUncommitted {
-		if _, err := runGit(ctx, worktreePath, "add", "-A"); err != nil {
+		if _, err := runGit(ctx, worktreePath, id, "add", "-A"); err != nil {
 			report.Diagnostics = fmt.Sprintf("git add -A failed: %v", err)
 			return report
 		}
 	}
 
 	// 3. Enumerate staged files and unstage anything excluded.
-	stagedOut, err := runGit(ctx, worktreePath,
+	stagedOut, err := runGit(ctx, worktreePath, id,
 		"-c", "core.quotePath=false",
 		"diff", "--cached", "--name-only",
 	)
@@ -245,18 +254,18 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		args := append([]string{"reset", "HEAD", "--"}, batch...)
 		// Best-effort: a path unknown to git fails the command but we
 		// keep going — subsequent safety checks catch any residue.
-		_, _ = runGit(ctx, worktreePath, args...)
+		_, _ = runGit(ctx, worktreePath, id, args...)
 	}
 
 	// 4. Re-check staged count post-filter.
-	stagedAfterOut, _ := runGit(ctx, worktreePath,
+	stagedAfterOut, _ := runGit(ctx, worktreePath, id,
 		"-c", "core.quotePath=false",
 		"diff", "--cached", "--name-only",
 	)
 	stagedAfter := filterEmpty(strings.Split(strings.TrimSpace(stagedAfterOut), "\n"))
 	if len(stagedAfter) > backstopMaxFiles {
 		// Reset the index to leave a clean slate.
-		_, _ = runGit(ctx, worktreePath, "reset", "HEAD")
+		_, _ = runGit(ctx, worktreePath, id, "reset", "HEAD")
 		report.Diagnostics = fmt.Sprintf(
 			"backstop aborted — %d files staged exceeds safety cap (%d)",
 			len(stagedAfter), backstopMaxFiles,
@@ -270,7 +279,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		if qw.IssueIdentifier != "" {
 			commitMsg = fmt.Sprintf("Backstop: %s (%s)", qw.IssueIdentifier, qw.SessionID)
 		}
-		if _, err := runGit(ctx, worktreePath, "commit", "-m", commitMsg); err != nil {
+		if _, err := runGit(ctx, worktreePath, id, "commit", "-m", commitMsg); err != nil {
 			report.Diagnostics = fmt.Sprintf("git commit failed: %v", err)
 			return report
 		}
@@ -280,7 +289,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	pushBranch := branch
 	if pushBranch == "" {
 		// Derive from current branch.
-		bOut, _ := runGit(ctx, worktreePath, "branch", "--show-current")
+		bOut, _ := runGit(ctx, worktreePath, id, "branch", "--show-current")
 		pushBranch = strings.TrimSpace(bOut)
 	}
 	if pushBranch == "" || pushBranch == "main" || pushBranch == "master" {
@@ -288,7 +297,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		return report
 	}
 	pushArgs := []string{"push", "-u", "origin", pushBranch}
-	if _, err := runGit(ctx, worktreePath, pushArgs...); err != nil {
+	if _, err := runGit(ctx, worktreePath, id, pushArgs...); err != nil {
 		// Try force-with-lease on diverged history.
 		errMsg := err.Error()
 		if !strings.Contains(errMsg, "non-fast-forward") && !strings.Contains(errMsg, "rejected") {
@@ -296,7 +305,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 			return report
 		}
 		forceArgs := []string{"push", "--force-with-lease", "-u", "origin", pushBranch}
-		if _, err := runGit(ctx, worktreePath, forceArgs...); err != nil {
+		if _, err := runGit(ctx, worktreePath, id, forceArgs...); err != nil {
 			report.Diagnostics = fmt.Sprintf("git push --force-with-lease failed: %v", err)
 			return report
 		}
@@ -335,22 +344,50 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	return report
 }
 
+// gitIdentity carries the GIT_AUTHOR_*/GIT_COMMITTER_* values the
+// backstop injects into every git subprocess so commits carry the
+// agent's session identity regardless of the sandbox's git global config
+// (which is absent in most cloud runners).
+type gitIdentity struct {
+	Name  string
+	Email string
+}
+
+// envOverrides returns the four GIT_* env vars as KEY=VALUE strings
+// suitable for appending to os.Environ(). Later entries in a process
+// environment WIN on Linux/macOS (exec(3) uses the last value for a
+// duplicated key when the libc getenv/putenv implementation is used, and
+// Go's os/exec passes the slice directly to execve — so appending after
+// os.Environ() guarantees the override wins over any inherited value).
+func (id gitIdentity) envOverrides() []string {
+	if id.Name == "" && id.Email == "" {
+		return nil
+	}
+	return []string{
+		"GIT_AUTHOR_NAME=" + id.Name,
+		"GIT_AUTHOR_EMAIL=" + id.Email,
+		"GIT_COMMITTER_NAME=" + id.Name,
+		"GIT_COMMITTER_EMAIL=" + id.Email,
+	}
+}
+
 // runGit invokes the git binary in cwd with the supplied args and
 // returns the combined stdout+stderr trimmed of trailing whitespace.
 // The caller chooses ctx; a cancelled ctx aborts the subprocess.
 //
-// GIT_AUTHOR_*/GIT_COMMITTER_* are inherited from the process environment
-// when set (e.g. by buildSessionEnv → agent.Spec.Env → the spawned worker).
-// We forward os.Environ() so those vars are visible to git even when the
-// backstop runs as a direct subprocess of the runner rather than through
-// the provider's shell. This closes the cloud-runner case where the
-// sandbox's git global config is absent and commits would fail with
-// "Author identity unknown".
-func runGit(ctx context.Context, cwd string, args ...string) (string, error) {
+// id carries the GIT_AUTHOR_*/GIT_COMMITTER_* overrides that are
+// appended AFTER os.Environ() so they WIN over any stale inherited
+// values (later entries in an exec env override earlier ones). This is
+// the fix for the cloud-runner NO-OP: simply setting cmd.Env =
+// os.Environ() is equivalent to leaving it nil (Go inherits the process
+// env either way), so the agent-session identity built by buildSessionEnv
+// never reached backstop commits. Now the identity is threaded explicitly.
+func runGit(ctx context.Context, cwd string, id gitIdentity, args ...string) (string, error) {
 	//nolint:gosec // G204: args come from runner-controlled call sites.
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = cwd
-	cmd.Env = os.Environ() // inherit GIT_AUTHOR_*/GIT_COMMITTER_* from process env
+	// Append identity overrides AFTER os.Environ() so they WIN.
+	cmd.Env = append(os.Environ(), id.envOverrides()...)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimRight(string(out), " \n\t"), err
 }
@@ -367,7 +404,7 @@ func runGit(ctx context.Context, cwd string, args ...string) (string, error) {
 // for SHA-1 repos, 64 for SHA-256) so a git error message or an
 // unborn-HEAD diagnostic is never stamped onto the wire field.
 func captureHeadSHA(ctx context.Context, worktreePath string) (string, error) {
-	out, err := runGit(ctx, worktreePath, "rev-parse", "HEAD")
+	out, err := runGit(ctx, worktreePath, gitIdentity{}, "rev-parse", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("git rev-parse HEAD: %w (output: %s)", err, out)
 	}
