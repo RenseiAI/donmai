@@ -54,11 +54,15 @@ func (r *Runner) runPostSession(parentCtx context.Context, qw QueuedWork, res *R
 
 	workType := qw.WorkType
 	workResult := res.WorkResult
-	// When the runner has no merge-queue adapter (today: the
-	// Go runner ships without one), shouldDeferAcceptanceTransition is
-	// always false. Reserved for parity with the TS path; flip when a
-	// Go merge-queue adapter lands.
-	hasMergeQueueAdapter := false
+	// Whether a merge-queue adapter is available is now DAEMON-ADVERTISED via
+	// the per-session capability flags rather than hardcoded false. The daemon
+	// stamps CapabilityMergeQueue=true only when it actually provides a
+	// merge-queue adapter; a missing/false flag (every daemon today, and any
+	// older daemon that predates capability advertising) keeps
+	// shouldDeferAcceptanceTransition a no-op so acceptance transitions
+	// directly — the mixed-version-safe default. The platform owns the merge
+	// gate via the gate.merge workflow node regardless of this flag.
+	hasMergeQueueAdapter := qw.hasCapability(CapabilityMergeQueue)
 
 	decision := resolveTargetStatus(workType, res.Status, workResult, hasMergeQueueAdapter)
 

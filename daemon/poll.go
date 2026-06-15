@@ -715,6 +715,33 @@ func resolveAllowlistedRepo(item PollWorkItem, projects []ProjectConfig) (repo s
 	return repo, nil
 }
 
+// SessionDetailOption customises the SessionDetail built by
+// PollItemToSessionDetail. Added as variadic options so the function stays
+// back-compatible for existing callers (the donmai-internal daemon loop passes
+// none) while embedders can opt in to extra wiring — e.g. advertising
+// daemon-side worker capabilities through to the runner.
+type SessionDetailOption func(*SessionDetail)
+
+// WithWorkerCapabilities advertises the daemon's worker capability flags on the
+// built SessionDetail (deterministic-landing, FD-3). The runner reads these via
+// runner.QueuedWork.Capabilities to gate adapter-dependent behaviour. Passing
+// nil/empty (or omitting the option entirely) leaves Capabilities nil, the
+// mixed-version-safe default where every capability reads false.
+func WithWorkerCapabilities(caps map[string]bool) SessionDetailOption {
+	return func(d *SessionDetail) {
+		if len(caps) == 0 {
+			return
+		}
+		// Defensive copy so a later mutation of the caller's map can't race the
+		// stored SessionDetail.
+		copied := make(map[string]bool, len(caps))
+		for k, v := range caps {
+			copied[k] = v
+		}
+		d.Capabilities = copied
+	}
+}
+
 // PollItemToSessionDetail constructs the SessionDetail payload `donmai agent
 // run` will fetch from the daemon's HTTP API for the given poll item.
 // platformURL + authToken + workerID come from the daemon's
@@ -736,8 +763,10 @@ func resolveAllowlistedRepo(item PollWorkItem, projects []ProjectConfig) (repo s
 //
 // Exported so embedders can drive multi-identity poll loops (e.g. a
 // downstream embedder that builds a SessionDetail from its own poll
-// loop before calling a shared daemon's AcceptWorkWithDetail).
-func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string) *SessionDetail {
+// loop before calling a shared daemon's AcceptWorkWithDetail). Optional
+// SessionDetailOption args customise the result without breaking existing
+// callers (the donmai-internal loop passes none).
+func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string, opts ...SessionDetailOption) *SessionDetail {
 	repo, matched := resolveAllowlistedRepo(item, projects)
 	projectName := item.ProjectName
 	if matched != nil && matched.ID != "" {
@@ -758,7 +787,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 			"fallback", repo,
 		)
 	}
-	return &SessionDetail{
+	detail := &SessionDetail{
 		SessionID:            item.SessionID,
 		IssueID:              item.IssueID,
 		IssueIdentifier:      item.IssueIdentifier,
@@ -794,6 +823,10 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		InterviewBudget:      item.InterviewBudget,
 		InterviewDefinition:  item.InterviewDefinition,
 	}
+	for _, opt := range opts {
+		opt(detail)
+	}
+	return detail
 }
 
 // firstNonEmptyStr returns the first non-empty string from values.

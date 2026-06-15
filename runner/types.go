@@ -42,6 +42,38 @@ type QueuedWork struct {
 	// "https://platform.example.com" or "http://127.0.0.1:3010"). The runner
 	// forwards this to result.Poster + heartbeat.Pulser. Required.
 	PlatformURL string `json:"-"`
+
+	// Capabilities carries the daemon-advertised worker capability flags for
+	// the session, threaded from the daemon's SessionDetail. A capability is
+	// PRESENT-and-true only when the daemon explicitly advertises it; a missing
+	// key reads false. The runner uses this to gate behaviour that depends on a
+	// daemon-side adapter being available — e.g. CapabilityMergeQueue gates the
+	// acceptance merge-queue deferral in post_session.go. Nil/absent → every
+	// capability is false, which is the mixed-version-safe default (an older
+	// daemon that does not advertise capabilities keeps the prior behaviour).
+	Capabilities map[string]bool `json:"capabilities,omitempty"`
+}
+
+// Capability keys advertised by the daemon on QueuedWork.Capabilities. Kept as
+// typed constants so the producer (daemon SessionDetail) and the consumer
+// (runner post-session) agree on the wire string and a typo can't silently
+// disable a capability gate.
+const (
+	// CapabilityMergeQueue is true when the daemon provides a merge-queue
+	// adapter, so a passing acceptance session should DEFER its
+	// Delivered → Accepted promotion to the merge worker rather than
+	// transitioning the issue directly. Default false (no adapter today) —
+	// the platform owns the merge gate via the gate.merge workflow node.
+	CapabilityMergeQueue = "merge-queue"
+)
+
+// hasCapability reports whether the daemon advertised the named capability as
+// true. A nil map or a missing key returns false (mixed-version-safe default).
+func (q *QueuedWork) hasCapability(name string) bool {
+	if q.Capabilities == nil {
+		return false
+	}
+	return q.Capabilities[name]
 }
 
 // ResolvedProfile names the profile knobs the platform resolved for
