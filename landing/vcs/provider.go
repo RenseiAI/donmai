@@ -1,5 +1,5 @@
 // Package vcs defines the VersionControlProvider abstraction used by the landing
-// serializer, plus GitHub and Atomic adapter stubs.
+// serializer, plus the GitHub (git + gh CLI) and Atomic (atomic CLI) adapters.
 //
 // Design:
 //   - Required verbs (Clone, RecordChange, Push, Pull) every provider implements.

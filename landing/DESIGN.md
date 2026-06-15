@@ -56,8 +56,9 @@ uses provider-neutral names:
 | `merge-queue/adapters/local.ts` (gh eligibility)| `landing/queue.go` (`extractIssueID`)    | issue-id extraction (pure, ported) |
 | `merge-queue/adapters/github-native.ts`         | (not ported — GitHub-native queue)       | external provider; out of scope for FD-4 stage 1 |
 | `vcs/types.ts`                                   | `landing/vcs/provider.go`                | `Provider` interface + value types |
-| `vcs/github.ts`                                  | `landing/vcs/github.go`                  | stub |
-| `vcs/atomic.ts`                                  | `landing/vcs/atomic.go`                  | stub |
+| `vcs/github.ts`                                  | `landing/vcs/github.go` (+ `github_graphql.go`) | `GitHubProvider`, gated behind `GitHubOpts.Available` (default-off, skew-safe) |
+| `vcs/atomic.ts`                                  | `landing/vcs/atomic.go`                  | `AtomicProvider` (commutative; PR/queue verbs return `*UnsupportedOperationError`) |
+| (CLI exec seam)                                  | `landing/vcs/runner.go`                  | `commandRunner` seam for git/gh/atomic; tests inject a fake |
 
 ## Public API (package `landing`)
 
