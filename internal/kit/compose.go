@@ -63,6 +63,24 @@ type ManifestView struct {
 	ToolchainInstall map[string]map[string]string
 	// Hooks is [provide.hooks] (generic + OS-keyed overlay).
 	Hooks HooksView
+	// PromptFragments is the slice of [provide.prompt_fragments] entries.
+	// Each entry names a partial to inject, a workType filter ([when]),
+	// and the file that contains the fragment body (relative to manifest dir).
+	// The runtime loader (kit.LoadPromptFragments) applies workType filtering
+	// and resolves file paths.
+	PromptFragments []PromptFragmentEntry
+}
+
+// PromptFragmentEntry mirrors one [[provide.prompt_fragments]] TOML
+// declaration projected into the daemon-independent view type.
+type PromptFragmentEntry struct {
+	// Partial is the logical name of the fragment (e.g. "spring-conventions").
+	Partial string
+	// When is the list of workType values for which this fragment is injected.
+	// An empty slice means "always inject" (no workType filter).
+	When []string
+	// File is the fragment body path relative to the kit manifest directory.
+	File string
 }
 
 // HooksView mirrors [provide.hooks] for composition.

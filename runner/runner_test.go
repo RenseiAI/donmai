@@ -139,7 +139,7 @@ func TestRun_HappyPath_StubProvider(t *testing.T) {
 	if res.CommitSHA == "" {
 		t.Fatal("expected CommitSHA captured at envelope-build time")
 	}
-	headOut, gitErr := runGit(context.Background(), res.WorktreePath, "rev-parse", "HEAD")
+	headOut, gitErr := runGit(context.Background(), res.WorktreePath, gitIdentity{}, "rev-parse", "HEAD")
 	if gitErr != nil {
 		t.Fatalf("rev-parse worktree HEAD: %v", gitErr)
 	}

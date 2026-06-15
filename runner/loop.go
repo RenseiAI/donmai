@@ -161,7 +161,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// when the branch already exists (replay during recovery) `git
 	// checkout -b` returns non-zero; we surface a Debug log and
 	// continue so the agent still operates on the existing branch.
-	if _, gerr := runGit(ctx, wpath, "checkout", "-b", branch); gerr != nil {
+	if _, gerr := runGit(ctx, wpath, gitIdentity{}, "checkout", "-b", branch); gerr != nil {
 		r.logger.Debug("create work branch failed (may already exist)",
 			"branch", branch, "err", gerr)
 	}
@@ -211,6 +211,45 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}
 	}
 
+	// 2c. Post-clone kit skill + prompt-fragment re-detection.
+	//
+	// The daemon pre-computed KitSkillSources at runner construction time
+	// using its CWD, but the real repo has now been cloned to wpath so
+	// detection against the actual repo contents may differ (e.g. a framework
+	// manifest declares files=[pom.xml] and the daemon's CWD has no pom.xml).
+	// When KitSkillDetector is wired, replace the pre-computed sources with a
+	// fresh scan against wpath. Additive: nil KitSkillDetector keeps the
+	// existing KitSkillSources (pre-K1-bootstrap behaviour).
+	kitSkillSources := r.kitSkillSources // default: daemon-CWD pre-compute
+	if r.kitSkillDetector != nil {
+		targetOS := r.kitTargetOS
+		detected, detectErr := r.kitSkillDetector(wpath, targetOS)
+		if detectErr != nil {
+			r.logger.Warn("kit skill detector (post-clone) failed; falling back to pre-computed sources",
+				"sessionId", qw.SessionID,
+				"err", detectErr,
+			)
+		} else {
+			kitSkillSources = detected // nil is fine → step 5a skips injection
+		}
+	}
+
+	// Detect prompt-fragment sources from the cloned worktree when the detector
+	// is wired. nil = no fragment injection (additive).
+	var kitPromptFragSources []kit.KitPromptFragmentSource
+	if r.kitPromptFragDetector != nil {
+		targetOS := r.kitTargetOS
+		frags, fragErr := r.kitPromptFragDetector(wpath, targetOS)
+		if fragErr != nil {
+			r.logger.Warn("kit prompt-fragment detector (post-clone) failed; skipping fragment injection",
+				"sessionId", qw.SessionID,
+				"err", fragErr,
+			)
+		} else {
+			kitPromptFragSources = frags
+		}
+	}
+
 	// 3. Compose env. Daemon is expected to inject the resolved
 	// credential into qw.AuthToken's matching env var via Spec.Env;
 	// we forward whatever the caller set plus the standard session
@@ -230,15 +269,27 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 
 	// 5. Render prompt.
 	//
-	// 5a. Collect Kit [provide.skills] contributions and inject them into
-	// the prompt builder before rendering. Skills are loaded in kit-priority
-	// order (higher priority → earlier position); unreadable files are
-	// skipped with a warning so a broken kit does not abort the session.
-	// Tool disallow rules scraped from SKILL.md frontmatter are carried
-	// forward to step 6 for application to the agent.Spec.
+	// 5a. Collect Kit [provide.skills] + [provide.prompt_fragments]
+	// contributions and inject them into the prompt builder before rendering.
+	//
+	// Skills (from kitSkillSources — post-clone-detected or daemon-CWD
+	// pre-computed): loaded in kit-priority order (higher priority → earlier
+	// position); unreadable files are skipped with a warning so a broken kit
+	// does not abort the session. Tool disallow rules scraped from SKILL.md
+	// frontmatter are carried forward to step 6 for application to the
+	// agent.Spec.
+	//
+	// Prompt fragments (from kitPromptFragSources — post-clone-detected):
+	// filtered by qw.WorkType, then their file bodies are appended AFTER
+	// the skill block. Fragments with an empty [when] list match all
+	// workTypes (no filter). Additive: nil sources = no fragment injection.
+	// Reset SkillAppend at the start of each Run so no session bleeds
+	// into the next (the Runner is long-lived; SkillAppend is per-Run).
+	r.promptBuilder.SkillAppend = ""
+
 	var kitDisallowedTools []string
-	if len(r.kitSkillSources) > 0 {
-		loaded, skillErr := kitLoadSkills(r.kitSkillSources)
+	if len(kitSkillSources) > 0 {
+		loaded, skillErr := kitLoadSkills(kitSkillSources)
 		if skillErr != nil {
 			r.logger.Warn("kit skill loader: partial load (some skill files skipped)",
 				"sessionId", qw.SessionID,
@@ -252,6 +303,32 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 				"sessionId", qw.SessionID,
 				"skillBytes", len(loaded.SystemAppend),
 				"disallowCount", len(kitDisallowedTools),
+			)
+		}
+	}
+	// Inject workType-filtered prompt fragments into the prompt builder.
+	// Fragment bodies are appended after the skill block so the kit's skills
+	// always precede its work-type-specific guidance.
+	if len(kitPromptFragSources) > 0 {
+		loadedFrags, fragErr := kit.LoadPromptFragments(kitPromptFragSources, qw.WorkType)
+		if fragErr != nil {
+			r.logger.Warn("kit prompt-fragment loader: partial load (some fragment files skipped)",
+				"sessionId", qw.SessionID,
+				"err", fragErr,
+			)
+		}
+		if loadedFrags.SystemAppend != "" {
+			// Append to any skill text already set above.
+			existing := r.promptBuilder.SkillAppend
+			if existing != "" {
+				r.promptBuilder.SkillAppend = existing + "\n\n" + loadedFrags.SystemAppend
+			} else {
+				r.promptBuilder.SkillAppend = loadedFrags.SystemAppend
+			}
+			r.logger.Info("kit prompt fragments injected into system prompt",
+				"sessionId", qw.SessionID,
+				"workType", qw.WorkType,
+				"fragBytes", len(loadedFrags.SystemAppend),
 			)
 		}
 	}
@@ -1130,10 +1207,31 @@ func envToMap(in []string) map[string]string {
 
 // buildSessionEnv collects the per-session env entries every agent
 // session needs. Mirrors the legacy TS LINEAR_* + DONMAI_* keys.
+//
+// GIT_AUTHOR_*/GIT_COMMITTER_* are set so backstop commits (and any
+// commits made by the agent) carry a traceable author identity rather
+// than whatever the git global config happens to contain inside the
+// cloud sandbox or local worktree. The session id is the "email" so
+// every commit is unambiguously linked to the originating session.
 func buildSessionEnv(qw QueuedWork) map[string]string {
+	// Derive a stable display name: prefer the issue identifier, fall back
+	// to a shortened session id prefix.
+	gitName := "Donmai Agent"
+	if qw.IssueIdentifier != "" {
+		gitName = "Donmai Agent (" + qw.IssueIdentifier + ")"
+	}
+	gitEmail := "agent+" + qw.SessionID + "@donmai.dev"
+
 	envMap := map[string]string{
 		"DONMAI_SESSION_ID": qw.SessionID,
 		"LINEAR_SESSION_ID": qw.SessionID,
+		// Git identity — pins author/committer to the session so backstop
+		// commits and agent-authored commits are attributable even in
+		// sandboxes whose git global config is empty or wrong.
+		"GIT_AUTHOR_NAME":     gitName,
+		"GIT_AUTHOR_EMAIL":    gitEmail,
+		"GIT_COMMITTER_NAME":  gitName,
+		"GIT_COMMITTER_EMAIL": gitEmail,
 	}
 	if qw.IssueID != "" {
 		envMap["LINEAR_ISSUE_ID"] = qw.IssueID
