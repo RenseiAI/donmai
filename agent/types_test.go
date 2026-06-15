@@ -267,8 +267,6 @@ func TestEnumValues(t *testing.T) {
 		string(ProviderClaude):        "claude",
 		string(ProviderCodex):         "codex",
 		string(ProviderStub):          "stub",
-		string(ProviderSpringAI):      "spring-ai",
-		string(ProviderA2A):           "a2a",
 		string(SandboxReadOnly):       "read-only",
 		string(SandboxWorkspaceWrite): "workspace-write",
 		string(SandboxFullAccess):     "full-access",

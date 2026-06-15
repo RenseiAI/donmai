@@ -53,7 +53,7 @@ const resultEnvelopeInstruction = "\n\n" +
 //	AllowedTools/Disallowed/MaxTurns/Effort/PermissionConfig — no headless flag.
 //
 // The full prompt (with the optional result-envelope instruction) is returned
-// as the -p value. Unlike geminicli there is no stdin channel.
+// as the -p value. agy has no stdin-prompt mode; the prompt is always a flag value.
 func buildArgs(spec agent.Spec, injectEnvelope bool) []string {
 	prompt := buildPrompt(spec.Prompt, injectEnvelope)
 	return []string{

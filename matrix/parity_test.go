@@ -269,8 +269,8 @@ func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
 }
 
 // TestParity_AliasCoverageCompleteness covers §6's alias-coverage obligation:
-// every real provider's ProviderName maps to a cell, and the reserved-but-
-// unimplemented names (spring-ai, a2a, jules) are intentionally absent.
+// every real provider's ProviderName maps to a cell, and the platform-reserved
+// name (jules) is intentionally absent.
 func TestParity_AliasCoverageCompleteness(t *testing.T) {
 	built, err := Build()
 	if err != nil {
@@ -287,7 +287,7 @@ func TestParity_AliasCoverageCompleteness(t *testing.T) {
 		}
 	}
 
-	for _, reserved := range []agent.ProviderName{agent.ProviderSpringAI, agent.ProviderA2A, agent.ProviderJules} {
+	for _, reserved := range []agent.ProviderName{agent.ProviderJules} {
 		if aliasByName[reserved] {
 			t.Errorf("reserved-but-unimplemented provider %q must NOT have a cell/alias", reserved)
 		}

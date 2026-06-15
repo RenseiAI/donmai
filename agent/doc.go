@@ -7,7 +7,7 @@
 //	../donmai-libraries/packages/core/src/providers/types.ts
 //
 // It defines the types every provider implementation (claude, codex, stub,
-// future spring-ai/a2a/gemini/ollama/opencode/jules/amp) and the runner
+// gemini, agy-cli, ollama, opencode, jules, amp) and the runner
 // orchestrator depend on. The package is pure types + interfaces with zero
 // behavior, no I/O, no business logic, and no dependencies beyond the Go
 // standard library and log/slog.
