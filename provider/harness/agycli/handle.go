@@ -18,7 +18,7 @@ import (
 )
 
 // stopGracePeriod is the deadline between SIGTERM and SIGKILL on Stop / ctx
-// cancellation. Mirrors the claude and geminicli providers.
+// cancellation. Matches the grace period used across CLI-backed providers.
 const stopGracePeriod = 5 * time.Second
 
 // eventBufferSize is the buffered capacity of the events channel.
@@ -203,7 +203,7 @@ func (h *Handle) watchCtx(ctx context.Context) {
 // readLoop drains the pty master, emits events, and reaps the subprocess.
 //
 // It does NOT close the events channel — Stop() is the exclusive owner of the
-// close (matching the geminicli/claude provider family). The runner returns on
+// close (consistent with other CLI-backed providers). The runner returns on
 // the terminal ResultEvent and then defers Stop(); watchCtx also Stops on ctx
 // cancellation, so the channel always eventually closes. readLoop closes only
 // h.done, which Stop() waits on.

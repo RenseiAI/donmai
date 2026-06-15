@@ -1,6 +1,5 @@
 // Package agycli implements an agent.Provider that shells out to Google
-// Antigravity's `agy` CLI — the closed-source Go successor to the EOL
-// `gemini` CLI.
+// Antigravity's `agy` CLI.
 //
 // This is the LOCAL / HOST-SESSION / USER-SUBSCRIPTION provider: it launches
 // the user's own, already-logged-in, first-party `agy` binary on the user's
@@ -11,22 +10,19 @@
 // the official tool the user authenticated, not a re-implementation that
 // borrows the user's token.
 //
-// It is DISTINCT from two sibling providers:
+// It is DISTINCT from the sibling "gemini" provider:
 //
-//   - "gemini"     — API-direct Go provider (net/http to generativelanguage),
-//     key-based, structured.
-//   - "gemini-cli" — subprocess wrap of the EOL `gemini` CLI, API-KEY-only,
-//     stdin + `--output-format stream-json`. Retired after 2026-06-18.
-//   - "agy-cli"    — THIS package: subprocess wrap of `agy`, OAuth/local,
-//     pty + plain-text, no key.
+//   - "gemini"  — API-direct Go provider (net/http to generativelanguage),
+//     key-based, structured, cloud-capable.
+//   - "agy-cli" — THIS package: subprocess wrap of `agy`, OAuth/local,
+//     pty + plain-text, no key. Host-only.
 //
-// # Why this is materially different from the gemini-cli wrap
+// # Why agy requires a pty
 //
 // Empirical probe of `agy` v1.0.4 (runs/2026-06-03-antigravity-migration/CONTRACT.md):
 //
 //   - `agy -p "<prompt>"` MUST run under a pty — plain stdin/stdout pipes hang
-//     with zero output. We allocate a pseudo-terminal via github.com/creack/pty;
-//     the geminicli stdin-pipe path does NOT transfer.
+//     with zero output. We allocate a pseudo-terminal via github.com/creack/pty.
 //   - There is NO structured output mode. `--output-format json` hard-errors in
 //     v1.0.4. stdout is plain-text agentic prose (terse narration + final
 //     answer). There is NO `--model` and NO `--skip-trust` flag.
@@ -79,6 +75,6 @@
 //
 // No key is injected; the `agy` binary authenticates via its own host OAuth.
 // Token/cost accounting is NOT available (the transcript carries no token
-// counts) — agent.ResultEvent.Cost is left nil. This is a documented loss
-// versus the gemini stream-json provider.
+// counts) — agent.ResultEvent.Cost is left nil. This is a documented limitation
+// versus API-direct providers (e.g. "gemini") that receive structured token usage.
 package agycli

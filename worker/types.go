@@ -34,15 +34,14 @@ type AgentRuntimeProviderCapabilities struct {
 	// canUseTool-style code intelligence enforcement.
 	SupportsCodeIntelligenceEnforcement bool `json:"supportsCodeIntelligenceEnforcement,omitempty"`
 	// ToolPermissionFormat is the tool permission format used by this provider
-	// (one of "claude", "codex", "spring-ai"). Empty string means default.
+	// (one of "claude", "codex"). Empty string means default.
 	ToolPermissionFormat string `json:"toolPermissionFormat,omitempty"`
 	// EmitsSubagentEvents indicates whether the provider emits Anthropic-style
 	// subagent events (e.g. Task tool progress). Used by the Topology view.
-	// Only true for the Claude provider; Codex and Spring AI have no equivalent
-	// emission today.
+	// Only true for the Claude provider today.
 	EmitsSubagentEvents bool `json:"emitsSubagentEvents"`
 	// HumanLabel is the human-readable display name for this provider family
-	// (e.g. "Claude", "Codex", "Spring AI"). Used in UI and log messages.
+	// (e.g. "Claude", "Codex"). Used in UI and log messages.
 	HumanLabel string `json:"humanLabel,omitempty"`
 }
 
@@ -90,9 +89,7 @@ func (r *RegisterRequest) ResolveCapabilities() (*AgentRuntimeProviderCapabiliti
 		// that still read the string slice.
 		var tags []string
 		if r.CapabilitiesTyped.HumanLabel != "" {
-			// Normalise to lower-case for the tag (e.g. "Spring AI" → "spring-ai"
-			// would require package-level mapping; use the raw label here and let
-			// the coordinator normalise if needed).
+			// Use the raw label; the coordinator normalises case if needed.
 			tags = append(tags, r.CapabilitiesTyped.HumanLabel)
 		}
 		// Merge any explicit legacy tags the caller may have set.
