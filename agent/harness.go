@@ -1,5 +1,7 @@
 package agent
 
+import "context"
+
 // This file declares Family A — the harness (loop-driver) family — for the
 // two-axis provider model (Phase 1). It is purely additive: HarnessProvider
 // is a SUPERSET interface that embeds the existing Provider and adds one
@@ -58,6 +60,30 @@ type HarnessManifest struct {
 	Caps        HarnessCaps `json:"capabilities"`
 }
 
+// Base projects the harness manifest onto the family-agnostic ProviderBase
+// header so HarnessManifest satisfies BaseManifest — the additive realization
+// of "every family manifest extends ProviderManifest<F>" (002 §"The base
+// interface"). It does NOT change HarnessManifest's wire layout (the projection
+// is computed, not stored): ID is the within-family HarnessName, Family is the
+// declared discriminant, Name comes from HumanLabel, Version from the
+// ContractABI, APIVersion from the base-contract constant, and Scope defaults
+// to global (a bundled OSS harness applies everywhere). Signature is nil today
+// — signing is deferred for the two-axis manifests per ADR-2026-06-06.
+func (m HarnessManifest) Base() ProviderBase {
+	return ProviderBase{
+		APIVersion: ProviderAPIVersion,
+		Family:     m.Family,
+		ID:         string(m.Name),
+		Name:       m.HumanLabel,
+		Version:    m.ContractABI,
+		Scope:      GlobalScope(),
+		Stability:  StabilityStable,
+	}
+}
+
+// Compile-time assertion: HarnessManifest satisfies the base contract.
+var _ BaseManifest = HarnessManifest{}
+
 // Session is the live session interface. P1 ALIASES it to the existing Handle
 // so every existing implementor of Handle is already a Session — no rename,
 // no churn. (Renaming Handle → Session is a later cosmetic phase, if ever.)
@@ -70,7 +96,40 @@ type Session = Handle
 // Because Session = Handle (alias) and Spec.Endpoint is additive, the existing
 // Provider.Spawn(ctx, Spec) (Handle, error) signature is already the §2.2
 // signature — embedding Provider is the zero-churn realization of §2.2.
+//
+// HOW THE HARNESS FAMILY EXTENDS THE BASE CONTRACT (002 §"The base interface").
+// The harness family extends the SDK base contract at the MANIFEST level:
+// HarnessManifest.Base() projects the manifest onto ProviderBase, so a harness
+// is administrable, scopable, and verifiable through the family-agnostic header
+// like any other family. The base LIFECYCLE maps onto the existing surface:
+// Provider construction (provider.New, fail-fast probing) ≡ the base
+// activate(); Provider.Shutdown ≡ the base deactivate(); the base health() is
+// the additive Health verb 002 §v2-enrichment-2 accepts (stub-by-default for
+// harnesses with no liveness signal beyond Spawn). Adding the base methods to
+// THIS interface would break every existing harness implementor, so the
+// extension is realized additively via the manifest projection + the
+// BaseProviderFromHarness bridge below, NOT by widening this interface.
 type HarnessProvider interface {
 	Provider
 	Manifest() HarnessManifest
 }
+
+// BaseProviderFromHarness adapts a HarnessProvider into a BaseProvider so the
+// host can administer a harness through the family-agnostic lifecycle without
+// the harness implementing the base methods directly. It maps Provider.Shutdown
+// onto the base Deactivate (the documented harness↔base lifecycle mapping
+// above), no-ops Activate (construction already probed fail-fast), and reports
+// always-ready Health. This is the bridge that proves the harness family
+// formally extends BaseProvider while keeping every existing harness unchanged.
+func BaseProviderFromHarness(h HarnessProvider) BaseProvider {
+	return harnessBase{h: h}
+}
+
+type harnessBase struct {
+	NoopLifecycle
+	h HarnessProvider
+}
+
+func (b harnessBase) Base() ProviderBase { return b.h.Manifest().Base() }
+
+func (b harnessBase) Deactivate(ctx context.Context) error { return b.h.Shutdown(ctx) }

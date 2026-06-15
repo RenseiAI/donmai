@@ -34,4 +34,11 @@ var (
 	// app-server failed to start). It is a probe-time error distinct
 	// from ErrSpawnFailed which is per-session.
 	ErrProviderUnavailable = errors.New("agent: provider runtime unavailable")
+
+	// ErrInvalidScope is returned by ValidateScope when a ProviderScope
+	// violates the base-contract scope rules (002-provider-base-contract.md
+	// §"Scope resolution"): an unknown level, or a non-global level with an
+	// empty selector (rule 4 — declare what the scope applies to, or use
+	// level "global").
+	ErrInvalidScope = errors.New("agent: invalid provider scope")
 )

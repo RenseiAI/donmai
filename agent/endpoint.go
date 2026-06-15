@@ -55,6 +55,30 @@ type ModelEndpointManifest struct {
 	Models      []ModelDesc    `json:"models"`
 }
 
+// Base projects the model-endpoint manifest onto the family-agnostic
+// ProviderBase header so ModelEndpointManifest satisfies BaseManifest — the
+// additive realization of "every family manifest extends ProviderManifest<F>"
+// (002 §"The base interface"). It does NOT change the wire layout (the
+// projection is computed, not stored): ID is the within-family Company, Family
+// is the declared discriminant, Name comes from HumanLabel, Version from the
+// ContractABI, APIVersion from the base-contract constant, Scope defaults to
+// global. Signature is nil today — signing is deferred for the two-axis
+// manifests per ADR-2026-06-06.
+func (m ModelEndpointManifest) Base() ProviderBase {
+	return ProviderBase{
+		APIVersion: ProviderAPIVersion,
+		Family:     m.Family,
+		ID:         string(m.Company),
+		Name:       m.HumanLabel,
+		Version:    m.ContractABI,
+		Scope:      GlobalScope(),
+		Stability:  StabilityStable,
+	}
+}
+
+// Compile-time assertion: ModelEndpointManifest satisfies the base contract.
+var _ BaseManifest = ModelEndpointManifest{}
+
 // EndpointRequest — every field already RESOLVED FROM CONFIG.
 type EndpointRequest struct {
 	Model       string            `json:"model"`
@@ -98,7 +122,36 @@ func (b EndpointBinding) IsZero() bool {
 
 // ModelEndpointProvider — Family B. Declare + resolve. No existing
 // implementor; the company endpoint packages are the only ones.
+//
+// HOW THE MODEL-ENDPOINT FAMILY EXTENDS THE BASE CONTRACT (002 §"The base
+// interface"). Like the harness family, the extension is at the MANIFEST level:
+// ModelEndpointManifest.Base() projects onto ProviderBase, so the thin 9th
+// family is administrable through the same family-agnostic header as every
+// other family (002 §"Two-axis decomposition"). Resolve is the family's sole
+// verb (002: "its sole verb is Resolve" — the accepted exception to the
+// "families have user-facing verbs" norm). The base lifecycle is supplied
+// additively by the BaseProviderFromEndpoint bridge below rather than by
+// widening this interface, so the existing company endpoint packages stay
+// unchanged.
 type ModelEndpointProvider interface {
 	Manifest() ModelEndpointManifest
 	Resolve(ctx context.Context, req EndpointRequest) (EndpointBinding, error)
 }
+
+// BaseProviderFromEndpoint adapts a ModelEndpointProvider into a BaseProvider
+// so the host can administer an endpoint through the family-agnostic lifecycle.
+// A model endpoint holds no long-lived process (Resolve is a pure
+// config→binding transform), so Activate/Deactivate are no-ops and Health is
+// always-ready — the stub-by-default verdict 002 §v2-enrichment-2 accepts. This
+// bridge proves the model-endpoint family formally extends BaseProvider while
+// keeping every existing endpoint package unchanged.
+func BaseProviderFromEndpoint(e ModelEndpointProvider) BaseProvider {
+	return endpointBase{e: e}
+}
+
+type endpointBase struct {
+	NoopLifecycle
+	e ModelEndpointProvider
+}
+
+func (b endpointBase) Base() ProviderBase { return b.e.Manifest().Base() }
