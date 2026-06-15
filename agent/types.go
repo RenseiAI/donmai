@@ -520,6 +520,59 @@ type Result struct {
 	// Error is the human-readable error message when Status is
 	// "failed".
 	Error string `json:"error,omitempty"`
+
+	// Manifest is the structured turn-result manifest the agent wrote to
+	// `.agent/turn-result.json`, when one was present + valid (W3 —
+	// deterministic turn outcome). The runner parses + validates it
+	// (runner/manifest.go) and folds its verdict/summary/PR onto the scalar
+	// fields above; this field carries the manifest VERBATIM so the platform's
+	// `applyTurnManifest` route receives the structured object (idempotent by
+	// content hash) instead of re-deriving it from the scalars. nil when no
+	// manifest was written. Additive — old platforms ignore it.
+	Manifest *TurnManifest `json:"manifest,omitempty"`
+}
+
+// TurnManifest is the deterministic turn-outcome the agent writes to
+// `.agent/turn-result.json` (W3). It is the wire-canonical shape carried on
+// [Result.Manifest] and posted to the platform; the runner's parse + validate
+// surface (runner/manifest.go `ParseManifest`) is a type alias of this struct,
+// so there is a single source of truth for the contract across the agent (wire)
+// and runner (parse) layers.
+//
+// Field discipline: keep this MINIMAL. Only the agent-owned half of the session
+// completion contract belongs here (verdict, summary, the artifacts the agent
+// produced). Runner-owned signals (cost, provider session id, failure-mode
+// classification) stay on [Result] proper, not in the manifest. A breaking
+// change bumps SchemaVersion.
+//
+// Canonical: donmai-architecture/ADR-2026-06-15-turn-result-manifest.md
+// (boundary: shared) + 013-orchestrator-and-governor.md § "completion
+// contracts".
+type TurnManifest struct {
+	// SchemaVersion is the manifest schema version. REQUIRED — a missing or
+	// unrecognised version is a validation failure so an older runner never
+	// mis-reads a newer breaking schema.
+	SchemaVersion int `json:"schemaVersion"`
+
+	// Verdict is the agent's self-reported turn verdict. REQUIRED. One of
+	// "passed" | "failed" | "blocked" — the same vocabulary as the legacy
+	// WORK_RESULT marker, so the platform consumes either channel uniformly.
+	Verdict string `json:"verdict"`
+
+	// Summary is a short human-readable summary of what the turn did. Optional.
+	Summary string `json:"summary,omitempty"`
+
+	// BlockedReason is the reason the agent declined, present only when
+	// Verdict == "blocked". Surfaced to the operator on the needs-clarification
+	// path. Optional.
+	BlockedReason string `json:"blockedReason,omitempty"`
+
+	// PullRequestURL is the URL of the PR the agent opened, when any. Optional.
+	PullRequestURL string `json:"pullRequestUrl,omitempty"`
+
+	// CommitSHA is the head commit sha of the work branch when the agent knows
+	// it. Optional — advisory; the runner's post-backstop capture wins.
+	CommitSHA string `json:"commitSha,omitempty"`
 }
 
 // BackstopReport captures what the post-session backstop did, if

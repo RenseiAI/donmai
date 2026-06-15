@@ -19,10 +19,12 @@ Validate the implementation referenced by {{or .IssueIdentifier "<unidentified i
 3. Run the project's test, typecheck, and lint commands. Capture any failures.
 4. Decide pass or fail strictly against the acceptance criteria.
 5. Post a comment on {{or .IssueIdentifier "the issue"}} via `{{.BrandCLI}} linear create-comment` summarising what you checked and the verdict.
-6. End your final assistant message with exactly one marker:
+6. Before you finish, write your verdict to `.agent/turn-result.json` (relative to the worktree root). The file is JSON of the form `{"schemaVersion": 1, "verdict": "passed", "summary": "<one line>"}`. The `verdict` is exactly one of:
 
-   - `WORK_RESULT:passed` when every acceptance criterion is met and tests are green.
-   - `WORK_RESULT:failed` when any criterion is missed or tests regress.
-   - `WORK_RESULT:blocked` when you cannot validate at all because the work is not actionable as specified — no acceptance criteria to check against, no implementing branch/PR to inspect, or a contradictory spec. Prefer this over `WORK_RESULT:failed` when there is nothing to validate without more input; put the reason on the same line as `AGENT_BLOCKED: <reason>`. The orchestrator routes a blocked verdict for clarification instead of retrying.
+   - `passed` when every acceptance criterion is met and tests are green.
+   - `failed` when any criterion is missed or tests regress.
+   - `blocked` when you cannot validate at all because the work is not actionable as specified — no acceptance criteria to check against, no implementing branch/PR to inspect, or a contradictory spec. Prefer this over `failed` when there is nothing to validate without more input; add a `"blockedReason": "<reason>"` field. The orchestrator routes a blocked verdict for clarification instead of retrying.
+
+   Then end your final assistant message with the matching fallback marker (`WORK_RESULT:passed` / `WORK_RESULT:failed`, or `WORK_RESULT:blocked` plus `AGENT_BLOCKED: <reason>` on its own line). The manifest file is authoritative; the marker is the backstop if the file could not be written.
 
 Do not implement code yourself. Do not delete the worktree.
