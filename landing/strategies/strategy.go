@@ -8,13 +8,9 @@ package strategies
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"strings"
 )
-
-// errNotImplemented is returned by stubbed strategy methods. Wrapped with
-// fmt.Errorf so the failing operation is identifiable.
-var errNotImplemented = errors.New("not implemented")
 
 // Strategy names.
 const (
@@ -101,12 +97,49 @@ type Strategy interface {
 func New(name string) (Strategy, error) {
 	switch name {
 	case NameRebase:
-		return &RebaseStrategy{}, nil
+		return NewRebaseStrategy(), nil
 	case NameMerge:
-		return &MergeCommitStrategy{}, nil
+		return NewMergeCommitStrategy(), nil
 	case NameSquash:
-		return &SquashStrategy{}, nil
+		return NewSquashStrategy(), nil
 	default:
 		return nil, fmt.Errorf("unknown landing strategy: %q", name)
 	}
+}
+
+// collectConflictFiles returns the unmerged (diff-filter=U) files in worktreePath
+// using a runner, or nil when the command fails (e.g. no merge/rebase in
+// progress). Shared by every strategy's Execute conflict-detection branch.
+func collectConflictFiles(ctx context.Context, r commandRunner, worktreePath string) []string {
+	out, err := r.run(ctx, worktreePath, nil, "git", "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return nil
+	}
+	return splitLines(out)
+}
+
+// splitLines splits trimmed stdout into non-empty lines, mirroring the legacy
+// `stdout.trim().split('\n').filter(Boolean)`.
+func splitLines(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, "\n")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// errMessage returns the message used by the branch-conflict classifiers,
+// matching the legacy `err instanceof Error ? err.message : String(err)`.
+func errMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
