@@ -260,6 +260,53 @@ the table-driven tests from the TS `*.test.ts` suites.
   `Prepare/Execute/Finalize`, `vcs.github`/`vcs.atomic` adapter verbs,
   conflict resolver, lock-file regen, worktree cleanup.
 
+## Stage-3 scope — pool + worker + (orgId,repoId)-keyed Redis queue (DONE)
+
+Real, fully-ported and table-driven `-race`-tested:
+
+- `queue.go` `RedisStorage` — Redis sorted-set queue per `(orgId, repoId)`.
+  Score packs `(priority, enqueuedAt)` into one float so the queue orders by
+  priority ascending (lower = higher precedence), FIFO on ties; the fractional
+  tie-breaker is bounded in `[0,1)` so it never bleeds into the next priority
+  band (`encodeScore`). Per-proposal metadata lives in a sibling hash so the
+  ZSET stays small. `DequeueBatch` runs ZREM+DEL in a `MULTI/EXEC` pipeline and
+  returns only the proposals whose ZREM reported a removal — so concurrent
+  coordinators never double-dispatch. Every method validates the key first
+  (`validateKey`) so an unscoped key can never silently share tenant state.
+- `worker.go` `Worker` — single-instance processor. `Start` acquires the
+  per-`(orgId,repoId)` lock (errors on contention), runs a heartbeat goroutine
+  to re-extend the TTL, honors the pause flag, and loops dequeue → `ProcessEntry`
+  → `handleResult` until `Stop`/ctx-cancel; the lock is always released (detached
+  ctx). `ProcessEntry` is the full pipeline: pre-flight local-marker noop →
+  prepare (with retryable backoff) → execute → resolve conflicts → regenerate
+  lock files → run tests → finalize → optional source-branch delete; every leg
+  maps to a `ProcessStatus`. `handleResult` records the disposition in storage
+  (`MarkCompleted` + recently-landed marker / `MarkBlocked` / `MarkFailed`,
+  honoring `onTestFailure: park`). `NewRedisClient` adapts `*redis.Client` to
+  the minimal `RedisClient` surface.
+- `pool.go` `Pool` — concurrent coordinator. `Concurrency <= 1` delegates to a
+  single `Worker`. Otherwise: acquire lock → peek all → fetch refs → build
+  manifests → conflict graph → first independent batch (size-capped by
+  concurrency) → atomic `DequeueBatch` → process the batch in parallel → record
+  each result. Non-conflicting proposals land together; conflicting ones split
+  across batches.
+- `adapter_local.go` `LocalAdapter` — self-hosted `Adapter` over `Storage`,
+  carrying `OrgID` (FD-4). Proposal eligibility / merged-state probed via the
+  `gh` CLI (injectable runner). `Enqueue` resolves the issue id from branch then
+  title then `PR-N`; `GetStatus` walks position → failed → blocked → merged →
+  not-queued.
+
+Test seams: `Worker`/`Pool` expose unexported `newStrategy`/`newResolver`/
+`newLockHandler`/`newWorker`/`buildManifests`/`fetchRefs`/`sleep`/`now` fields
+so tests drive the pipeline with fakes and never spawn git or sleep wall-clock.
+`RedisStorage` is tested against an in-process miniredis (`redis_test.go`).
+
+Still stubbed after Stage 3: the three strategies' git bodies are real (Stage 2);
+`vcs.github`/`vcs.atomic` adapter verbs remain stubs; the optional issue-tracker
+/ PR-labeler bubble-up hooks from the TS source are intentionally not wired (the
+`Entry` is threaded through `handleResult` for a later stage); GitHub-native
+queue adapter is out of scope.
+
 ## OSS hygiene
 
 No ticket IDs, no private-repo URLs, no internal SHAs, no developer absolute

@@ -2,8 +2,10 @@ package landing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -129,6 +131,42 @@ type Storage interface {
 	BlockedReason(ctx context.Context, key Key, proposal int) (string, error)
 }
 
+// DefaultReasonTTL is the lifetime of a failed / blocked reason marker. The
+// reason is a transient signal consumed by `Status` lookups and the bubble-up;
+// it does not need to live forever and an unbounded key set is a leak.
+const DefaultReasonTTL = 24 * time.Hour
+
+// enqueueEpoch anchors the fractional tie-breaker so the encoded nanosecond
+// offset stays small enough to survive a float64 mantissa without losing
+// ordering precision among entries enqueued seconds apart. Any fixed past
+// instant works; this one is arbitrary and stable.
+var enqueueEpoch = time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+// encodeScore packs (priority, enqueuedAt) into a single sorted-set score so the
+// queue orders by priority ascending (lower priority value = higher precedence),
+// breaking ties by enqueue time (FIFO). The fractional part is the seconds since
+// enqueueEpoch scaled into (0,1) so it never bleeds into the next integer
+// priority band: two entries with the same priority order by enqueue time, but
+// an entry with a lower priority always sorts ahead of a higher one regardless
+// of time.
+//
+// This mirrors the legacy "lower = higher priority; ties by enqueue time"
+// intent of the server-side queue while keeping a single Redis ZSET score.
+func encodeScore(priority int, enqueuedAt time.Time) float64 {
+	// Seconds since the epoch, mapped through 1/(1+x) into (0,1] so older
+	// entries (smaller x) get a larger fraction... we want OLDER first, so use
+	// x/(1+x) which is monotonic increasing in x and bounded in [0,1): a larger
+	// elapsed time yields a larger fraction. To keep FIFO (older first) we want
+	// the older entry to have the SMALLER score, so subtract from 1.
+	secs := enqueuedAt.Sub(enqueueEpoch).Seconds()
+	if secs < 0 {
+		secs = 0
+	}
+	frac := secs / (1 + secs) // in [0,1); monotonic increasing in secs
+	// Older (smaller secs) → smaller frac → smaller score → dequeued first. FIFO.
+	return float64(priority) + frac
+}
+
 // RedisStorage is the Redis sorted-set implementation of Storage. The queue is a
 // sorted set per (orgId, repoId); per-proposal metadata lives in sibling hashes.
 //
@@ -136,6 +174,8 @@ type Storage interface {
 // stack, now keyed by (orgId, repoId).
 type RedisStorage struct {
 	rdb *redis.Client
+	// reasonTTL bounds failed/blocked reason markers; 0 ⇒ DefaultReasonTTL.
+	reasonTTL time.Duration
 }
 
 // compile-time assertion that RedisStorage satisfies Storage.
@@ -146,106 +186,345 @@ func NewRedisStorage(rdb *redis.Client) *RedisStorage {
 	return &RedisStorage{rdb: rdb}
 }
 
-// Enqueue — stub: not yet ported.
+func (s *RedisStorage) reasonExpiry() time.Duration {
+	if s.reasonTTL > 0 {
+		return s.reasonTTL
+	}
+	return DefaultReasonTTL
+}
+
+// entryFields serializes an Entry into a Redis hash field map. Proposal/OrgID/
+// RepoID are derivable from the key + member, so only the bubble-up metadata is
+// stored.
+func entryFields(e Entry) map[string]any {
+	return map[string]any{
+		"proposalUrl":  e.ProposalURL,
+		"issueId":      e.IssueID,
+		"priority":     e.Priority,
+		"sourceBranch": e.SourceBranch,
+		"targetBranch": e.TargetBranch,
+		"enqueuedAt":   e.EnqueuedAt.UnixNano(),
+	}
+}
+
+// entryFromHash rebuilds an Entry from its key, proposal number, and stored hash.
+func entryFromHash(key Key, proposal int, h map[string]string) Entry {
+	priority, _ := strconv.Atoi(h["priority"])
+	var enqueuedAt time.Time
+	if ns, err := strconv.ParseInt(h["enqueuedAt"], 10, 64); err == nil {
+		enqueuedAt = time.Unix(0, ns).UTC()
+	}
+	return Entry{
+		OrgID:        key.OrgID,
+		RepoID:       key.RepoID,
+		Proposal:     proposal,
+		ProposalURL:  h["proposalUrl"],
+		IssueID:      h["issueId"],
+		Priority:     priority,
+		SourceBranch: h["sourceBranch"],
+		TargetBranch: h["targetBranch"],
+		EnqueuedAt:   enqueuedAt,
+	}
+}
+
+// validateKey rejects an unscoped key before any Redis op so a caller bug never
+// silently shares queue state across tenants (FD-4).
+func validateKey(key Key) error {
+	if !key.Valid() {
+		return fmt.Errorf("landing: invalid key (orgId=%q repoId=%q): both required", key.OrgID, key.RepoID)
+	}
+	return nil
+}
+
+// Enqueue adds an entry to the queue. A no-op if the proposal is already queued.
+// The sorted-set member is the proposal number; metadata lives in a sibling hash.
 func (s *RedisStorage) Enqueue(ctx context.Context, e Entry) error {
-	_ = ctx
-	_ = e
-	return fmt.Errorf("RedisStorage.Enqueue: %w", ErrNotImplemented)
+	key := e.Key()
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	if e.EnqueuedAt.IsZero() {
+		e.EnqueuedAt = time.Now().UTC()
+	}
+	member := strconv.Itoa(e.Proposal)
+
+	// Skip if already queued (NX on the ZADD), then write metadata. ZADD NX
+	// returns the number of NEW members added (0 when it already existed).
+	added, err := s.rdb.ZAddNX(ctx, key.queueKey(), redis.Z{
+		Score:  encodeScore(e.Priority, e.EnqueuedAt),
+		Member: member,
+	}).Result()
+	if err != nil {
+		return fmt.Errorf("RedisStorage.Enqueue zadd %s: %w", key.queueKey(), err)
+	}
+	if added == 0 {
+		// Already queued — leave the existing entry untouched.
+		return nil
+	}
+	if err := s.rdb.HSet(ctx, key.entryKey(e.Proposal), entryFields(e)).Err(); err != nil {
+		return fmt.Errorf("RedisStorage.Enqueue hset %s: %w", key.entryKey(e.Proposal), err)
+	}
+	return nil
 }
 
-// Dequeue — stub: not yet ported.
+// Dequeue atomically removes and returns the highest-priority entry, or nil when
+// the queue is empty. ZPOPMIN pops the lowest score, which encodeScore maps to
+// the highest-precedence proposal.
 func (s *RedisStorage) Dequeue(ctx context.Context, key Key) (*Entry, error) {
-	_ = ctx
-	_ = key
-	return nil, fmt.Errorf("RedisStorage.Dequeue: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return nil, err
+	}
+	popped, err := s.rdb.ZPopMin(ctx, key.queueKey(), 1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("RedisStorage.Dequeue zpopmin %s: %w", key.queueKey(), err)
+	}
+	if len(popped) == 0 {
+		return nil, nil
+	}
+	proposal, convErr := strconv.Atoi(memberString(popped[0].Member))
+	if convErr != nil {
+		return nil, fmt.Errorf("RedisStorage.Dequeue parse member %v: %w", popped[0].Member, convErr)
+	}
+	entry, err := s.loadEntry(ctx, key, proposal)
+	if err != nil {
+		return nil, err
+	}
+	// Clear the metadata hash now that the entry left the queue.
+	if err := s.rdb.Del(ctx, key.entryKey(proposal)).Err(); err != nil {
+		return nil, fmt.Errorf("RedisStorage.Dequeue del entry %s: %w", key.entryKey(proposal), err)
+	}
+	return &entry, nil
 }
 
-// PeekAll — stub: not yet ported.
+// PeekAll returns all queued entries in dequeue order without removing them
+// (used by Pool to build the conflict graph).
 func (s *RedisStorage) PeekAll(ctx context.Context, key Key) ([]Entry, error) {
-	_ = ctx
-	_ = key
-	return nil, fmt.Errorf("RedisStorage.PeekAll: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return nil, err
+	}
+	members, err := s.rdb.ZRange(ctx, key.queueKey(), 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("RedisStorage.PeekAll zrange %s: %w", key.queueKey(), err)
+	}
+	entries := make([]Entry, 0, len(members))
+	for _, m := range members {
+		proposal, convErr := strconv.Atoi(m)
+		if convErr != nil {
+			return nil, fmt.Errorf("RedisStorage.PeekAll parse member %q: %w", m, convErr)
+		}
+		entry, loadErr := s.loadEntry(ctx, key, proposal)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
 }
 
-// DequeueBatch — stub: not yet ported.
+// DequeueBatch atomically removes and returns the given proposals (used by Pool
+// for parallel landing). Proposals not present are skipped. The ZREM + HGETALL
+// reads run in a MULTI/EXEC transaction so the Pool never double-dispatches a
+// proposal across concurrent coordinators: only the coordinator whose ZREM
+// reports the member as removed gets the entry.
 func (s *RedisStorage) DequeueBatch(ctx context.Context, key Key, proposals []int) ([]Entry, error) {
-	_ = ctx
-	_ = key
-	_ = proposals
-	return nil, fmt.Errorf("RedisStorage.DequeueBatch: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return nil, err
+	}
+	if len(proposals) == 0 {
+		return nil, nil
+	}
+
+	// Load metadata first (outside the transaction) so we can return full
+	// entries; the transaction then claims membership atomically via per-member
+	// ZREM whose integer reply tells us who actually owned the member.
+	loaded := make(map[int]Entry, len(proposals))
+	for _, p := range proposals {
+		entry, err := s.loadEntry(ctx, key, p)
+		if err != nil {
+			return nil, err
+		}
+		loaded[p] = entry
+	}
+
+	remCmds := make(map[int]*redis.IntCmd, len(proposals))
+	pipe := s.rdb.TxPipeline()
+	for _, p := range proposals {
+		remCmds[p] = pipe.ZRem(ctx, key.queueKey(), strconv.Itoa(p))
+		pipe.Del(ctx, key.entryKey(p))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("RedisStorage.DequeueBatch exec: %w", err)
+	}
+
+	out := make([]Entry, 0, len(proposals))
+	for _, p := range proposals {
+		removed, err := remCmds[p].Result()
+		if err != nil {
+			return nil, fmt.Errorf("RedisStorage.DequeueBatch zrem %d: %w", p, err)
+		}
+		if removed == 1 {
+			out = append(out, loaded[p])
+		}
+	}
+	return out, nil
 }
 
-// QueueDepth — stub: not yet ported.
+// QueueDepth returns the number of queued proposals.
 func (s *RedisStorage) QueueDepth(ctx context.Context, key Key) (int, error) {
-	_ = ctx
-	_ = key
-	return 0, fmt.Errorf("RedisStorage.QueueDepth: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	n, err := s.rdb.ZCard(ctx, key.queueKey()).Result()
+	if err != nil {
+		return 0, fmt.Errorf("RedisStorage.QueueDepth zcard %s: %w", key.queueKey(), err)
+	}
+	return int(n), nil
 }
 
-// IsEnqueued — stub: not yet ported.
+// IsEnqueued reports whether a proposal is in the queue.
 func (s *RedisStorage) IsEnqueued(ctx context.Context, key Key, proposal int) (bool, error) {
-	_ = ctx
-	_ = key
-	_ = proposal
-	return false, fmt.Errorf("RedisStorage.IsEnqueued: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return false, err
+	}
+	_, err := s.rdb.ZScore(ctx, key.queueKey(), strconv.Itoa(proposal)).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("RedisStorage.IsEnqueued zscore %s: %w", key.queueKey(), err)
+	}
+	return true, nil
 }
 
-// Position — stub: not yet ported.
+// Position returns the 1-based queue position of a proposal, or 0 when not
+// queued.
 func (s *RedisStorage) Position(ctx context.Context, key Key, proposal int) (int, error) {
-	_ = ctx
-	_ = key
-	_ = proposal
-	return 0, fmt.Errorf("RedisStorage.Position: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return 0, err
+	}
+	rank, err := s.rdb.ZRank(ctx, key.queueKey(), strconv.Itoa(proposal)).Result()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("RedisStorage.Position zrank %s: %w", key.queueKey(), err)
+	}
+	return int(rank) + 1, nil
 }
 
-// Remove — stub: not yet ported.
+// Remove deletes a specific proposal from the queue and its metadata hash.
 func (s *RedisStorage) Remove(ctx context.Context, key Key, proposal int) error {
-	_ = ctx
-	_ = key
-	_ = proposal
-	return fmt.Errorf("RedisStorage.Remove: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	pipe := s.rdb.TxPipeline()
+	pipe.ZRem(ctx, key.queueKey(), strconv.Itoa(proposal))
+	pipe.Del(ctx, key.entryKey(proposal))
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("RedisStorage.Remove exec: %w", err)
+	}
+	return nil
 }
 
-// MarkCompleted — stub: not yet ported.
+// MarkCompleted records that a proposal landed: clears it from the queue and
+// metadata. The short-lived recently-landed marker is written separately by the
+// worker (see markRecentlyMerged) which owns its TTL.
 func (s *RedisStorage) MarkCompleted(ctx context.Context, key Key, proposal int) error {
-	_ = ctx
-	_ = key
-	_ = proposal
-	return fmt.Errorf("RedisStorage.MarkCompleted: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	pipe := s.rdb.TxPipeline()
+	pipe.ZRem(ctx, key.queueKey(), strconv.Itoa(proposal))
+	pipe.Del(ctx, key.entryKey(proposal))
+	// Completing a proposal clears any stale failed/blocked reason.
+	pipe.Del(ctx, key.failedKey(proposal))
+	pipe.Del(ctx, key.blockedKey(proposal))
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("RedisStorage.MarkCompleted exec: %w", err)
+	}
+	return nil
 }
 
-// MarkFailed — stub: not yet ported.
+// MarkFailed records a terminal failure reason for a proposal and clears it from
+// the queue.
 func (s *RedisStorage) MarkFailed(ctx context.Context, key Key, proposal int, reason string) error {
-	_ = ctx
-	_ = key
-	_ = proposal
-	_ = reason
-	return fmt.Errorf("RedisStorage.MarkFailed: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	pipe := s.rdb.TxPipeline()
+	pipe.ZRem(ctx, key.queueKey(), strconv.Itoa(proposal))
+	pipe.Del(ctx, key.entryKey(proposal))
+	pipe.Set(ctx, key.failedKey(proposal), reason, s.reasonExpiry())
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("RedisStorage.MarkFailed exec: %w", err)
+	}
+	return nil
 }
 
-// MarkBlocked — stub: not yet ported.
+// MarkBlocked records a blocked reason for a proposal and clears it from the
+// queue.
 func (s *RedisStorage) MarkBlocked(ctx context.Context, key Key, proposal int, reason string) error {
-	_ = ctx
-	_ = key
-	_ = proposal
-	_ = reason
-	return fmt.Errorf("RedisStorage.MarkBlocked: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	pipe := s.rdb.TxPipeline()
+	pipe.ZRem(ctx, key.queueKey(), strconv.Itoa(proposal))
+	pipe.Del(ctx, key.entryKey(proposal))
+	pipe.Set(ctx, key.blockedKey(proposal), reason, s.reasonExpiry())
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("RedisStorage.MarkBlocked exec: %w", err)
+	}
+	return nil
 }
 
-// FailedReason — stub: not yet ported.
+// FailedReason returns the failure reason for a proposal, or "" if none.
 func (s *RedisStorage) FailedReason(ctx context.Context, key Key, proposal int) (string, error) {
-	_ = ctx
-	_ = key
-	_ = proposal
-	return "", fmt.Errorf("RedisStorage.FailedReason: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	reason, err := s.rdb.Get(ctx, key.failedKey(proposal)).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("RedisStorage.FailedReason get %s: %w", key.failedKey(proposal), err)
+	}
+	return reason, nil
 }
 
-// BlockedReason — stub: not yet ported.
+// BlockedReason returns the blocked reason for a proposal, or "" if none.
 func (s *RedisStorage) BlockedReason(ctx context.Context, key Key, proposal int) (string, error) {
-	_ = ctx
-	_ = key
-	_ = proposal
-	return "", fmt.Errorf("RedisStorage.BlockedReason: %w", ErrNotImplemented)
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	reason, err := s.rdb.Get(ctx, key.blockedKey(proposal)).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("RedisStorage.BlockedReason get %s: %w", key.blockedKey(proposal), err)
+	}
+	return reason, nil
+}
+
+// loadEntry rebuilds an Entry from its metadata hash. A missing hash (e.g. a
+// member that lost its sibling) yields an entry with only the derivable fields.
+func (s *RedisStorage) loadEntry(ctx context.Context, key Key, proposal int) (Entry, error) {
+	h, err := s.rdb.HGetAll(ctx, key.entryKey(proposal)).Result()
+	if err != nil {
+		return Entry{}, fmt.Errorf("RedisStorage.loadEntry hgetall %s: %w", key.entryKey(proposal), err)
+	}
+	return entryFromHash(key, proposal, h), nil
+}
+
+// memberString coerces a ZSet member (string in practice) to its string form.
+func memberString(member any) string {
+	switch v := member.(type) {
+	case string:
+		return v
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // issueIDPattern matches a Linear-style identifier (ALPHA-DIGITS) anchored to a
