@@ -181,6 +181,16 @@ type SessionDetail struct {
 	// from PollWorkItem onto the runner's QueuedWork. The daemon does not
 	// parse it — opaque forwarder only.
 	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
+
+	// Capabilities carries the daemon-advertised worker capability flags for
+	// this session (deterministic-landing, FD-3). The daemon stamps a flag
+	// true only when it actually provides the corresponding adapter; the runner
+	// reads them via runner.QueuedWork.Capabilities to gate adapter-dependent
+	// behaviour (e.g. the merge-queue acceptance deferral). Absent/nil → every
+	// capability is false, the mixed-version-safe default: an older daemon that
+	// does not advertise capabilities, or one with no adapters, keeps the prior
+	// behaviour. Forwarded opaquely; the daemon does not interpret the keys.
+	Capabilities map[string]bool `json:"capabilities,omitempty"`
 }
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in

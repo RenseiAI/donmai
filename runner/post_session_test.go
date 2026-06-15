@@ -265,6 +265,108 @@ func TestRunPostSession_AcceptancePassedNoMQTransitions(t *testing.T) {
 	}
 }
 
+// TestRunPostSession_AcceptancePassedMergeQueueDefers covers the
+// deterministic-landing (FD-3) capability gate: when the daemon advertises the
+// merge-queue capability, a passing acceptance session DEFERS its
+// Delivered→Accepted promotion to the merge worker — so NO direct issue
+// transition fires (the platform/merge-queue owns the landing).
+func TestRunPostSession_AcceptancePassedMergeQueueDefers(t *testing.T) {
+	srv, calls, mu := stubProxyServer(t)
+	r := makePostSessionRunner(t, srv)
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("REN-PS-MQ"),
+		WorkerID:    "wkr-post",
+		AuthToken:   "tok-post",
+		PlatformURL: srv.URL,
+		// Daemon advertises a merge-queue adapter for this session.
+		Capabilities: map[string]bool{CapabilityMergeQueue: true},
+	}
+	qw.WorkType = WorkTypeAcceptance
+	qw.IssueID = "issue-uuid-mq"
+
+	res := &Result{}
+	res.Status = "completed"
+	res.WorkResult = "passed"
+
+	r.runPostSession(context.Background(), qw, res)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*calls) != 0 {
+		t.Fatalf("expected 0 proxy calls (deferred to merge queue); got %d", len(*calls))
+	}
+	tr := res.LinearStatusTransition
+	if tr == nil {
+		t.Fatal("expected a LinearStatusTransition; got nil")
+	}
+	if tr.Attempted {
+		t.Errorf("expected Attempted=false (deferred); got true")
+	}
+	if tr.Reason != "deferred-merge-queue" {
+		t.Errorf("Reason = %q; want deferred-merge-queue", tr.Reason)
+	}
+}
+
+// TestRunPostSession_AcceptancePassedMergeQueueFalseTransitions covers the
+// mixed-version-safe default: a merge-queue capability explicitly false (or
+// absent) means acceptance transitions directly, identical to a daemon that
+// predates capability advertising.
+func TestRunPostSession_AcceptancePassedMergeQueueFalseTransitions(t *testing.T) {
+	srv, calls, mu := stubProxyServer(t)
+	r := makePostSessionRunner(t, srv)
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("REN-PS-MQF"),
+		WorkerID:    "wkr-post",
+		AuthToken:   "tok-post",
+		PlatformURL: srv.URL,
+		// Capability present but false — must behave exactly like absent.
+		Capabilities: map[string]bool{CapabilityMergeQueue: false},
+	}
+	qw.WorkType = WorkTypeAcceptance
+	qw.IssueID = "issue-uuid-mqf"
+
+	res := &Result{}
+	res.Status = "completed"
+	res.WorkResult = "passed"
+
+	r.runPostSession(context.Background(), qw, res)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 proxy call (direct transition); got %d", len(*calls))
+	}
+	if (*calls)[0].Args[1] != "Accepted" {
+		t.Errorf("targetStatus = %v; want Accepted", (*calls)[0].Args[1])
+	}
+}
+
+// TestQueuedWork_hasCapability pins the mixed-version-safe default: a nil map
+// and a missing key both read false; only a present-and-true key reads true.
+func TestQueuedWork_hasCapability(t *testing.T) {
+	tests := []struct {
+		name string
+		caps map[string]bool
+		key  string
+		want bool
+	}{
+		{"nil map", nil, CapabilityMergeQueue, false},
+		{"missing key", map[string]bool{"other": true}, CapabilityMergeQueue, false},
+		{"present false", map[string]bool{CapabilityMergeQueue: false}, CapabilityMergeQueue, false},
+		{"present true", map[string]bool{CapabilityMergeQueue: true}, CapabilityMergeQueue, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			qw := QueuedWork{Capabilities: tc.caps}
+			if got := qw.hasCapability(tc.key); got != tc.want {
+				t.Errorf("hasCapability(%q) = %v; want %v", tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRunPostSession_NonResultSensitive_PromotesOnComplete covers the
 // research/refinement fast-path: completion alone triggers the
 // configured status transition (when one exists).
