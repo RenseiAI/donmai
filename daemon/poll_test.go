@@ -465,6 +465,38 @@ func TestPollItemToSessionDetail_ResolvesProjectNameToRepoURL(t *testing.T) {
 	}
 }
 
+// TestPollItemToSessionDetail_WorkerCapabilities covers the deterministic-
+// landing (FD-3) capability wire: with no option the SessionDetail carries no
+// capabilities (mixed-version-safe default); WithWorkerCapabilities advertises
+// the daemon's worker capability flags through to the runner.
+func TestPollItemToSessionDetail_WorkerCapabilities(t *testing.T) {
+	item := PollWorkItem{SessionID: "sess-cap"}
+
+	// Default: no option → Capabilities stays nil (every capability false).
+	bare := PollItemToSessionDetail(item, nil, "", "", "")
+	if bare.Capabilities != nil {
+		t.Errorf("Capabilities = %v; want nil (default)", bare.Capabilities)
+	}
+
+	// An empty/nil map is a no-op (still nil — not an empty map).
+	empty := PollItemToSessionDetail(item, nil, "", "", "", WithWorkerCapabilities(nil))
+	if empty.Capabilities != nil {
+		t.Errorf("Capabilities = %v; want nil for empty option", empty.Capabilities)
+	}
+
+	// A populated map is advertised through, defensively copied.
+	src := map[string]bool{"merge-queue": true}
+	withCaps := PollItemToSessionDetail(item, nil, "", "", "", WithWorkerCapabilities(src))
+	if got := withCaps.Capabilities["merge-queue"]; !got {
+		t.Errorf("Capabilities[merge-queue] = %v; want true", got)
+	}
+	// Mutating the source after the call must not affect the stored detail.
+	src["merge-queue"] = false
+	if !withCaps.Capabilities["merge-queue"] {
+		t.Error("WithWorkerCapabilities did not defensively copy the map")
+	}
+}
+
 // TestPollItemToSessionDetail_FallsBackOnNoAllowlistMatch verifies the
 // non-match path: the SessionDetail.repository is whatever was on the
 // wire, and a Warn log is emitted so operators see the fallback.
