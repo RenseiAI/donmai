@@ -108,16 +108,19 @@ func (c *Client) PollLoopWithBatch(
 			}
 			// BATCH LANE — separate from the agent path. Routed here BEFORE the
 			// agent handler ever sees it (the lanes are distinct slices). A nil
-			// batchHandler or unknown work-type degrades gracefully. Both the
-			// code-survival batchWork[] lane and the kg-extraction kgExtractWork[]
-			// lane share the BatchWorkItem envelope and flow through the SAME
-			// batchHandler — the handler is a workType mux that fans each item out
-			// to its executor (see afcli/worker_start.go). Neither lane ever
-			// touches resp.WorkItems.
+			// batchHandler or unknown work-type degrades gracefully. The
+			// code-survival batchWork[], kg-extraction kgExtractWork[], and FD-4
+			// landing landingWork[] lanes all share the BatchWorkItem envelope and
+			// flow through the SAME batchHandler — the handler is a workType mux
+			// that fans each item out to its executor (see afcli/worker_start.go).
+			// No lane ever touches resp.WorkItems.
 			for _, item := range resp.BatchWork {
 				c.dispatchBatchItem(ctx, item, batchHandler)
 			}
 			for _, item := range resp.KgExtractWork {
+				c.dispatchBatchItem(ctx, item, batchHandler)
+			}
+			for _, item := range resp.LandingWork {
 				c.dispatchBatchItem(ctx, item, batchHandler)
 			}
 		}
