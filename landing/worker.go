@@ -2,6 +2,8 @@ package landing
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -59,6 +61,13 @@ type WorkerConfig struct {
 	Key Key
 	// RepoPath is the path to the local repository.
 	RepoPath string
+	// WorktreePath, when set, is the dedicated working tree the strategy runs in
+	// for this proposal. The Pool sets it per in-flight proposal so concurrent
+	// batch members never share one working tree (which would let them clobber
+	// each other's index/checkout/lock-file regen). When empty, the strategy runs
+	// directly in RepoPath — the single-flight (Concurrency<=1) Worker path, whose
+	// behavior is unchanged.
+	WorktreePath string
 	// Strategy is one of "rebase", "merge", "squash".
 	Strategy string
 	// TestCommand is run after landing to validate the result.
@@ -114,6 +123,12 @@ type RedisClient interface {
 	SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 	// Del deletes a key.
 	Del(ctx context.Context, key string) error
+	// DelIfMatches atomically deletes key only if its current value equals value,
+	// returning whether it deleted. This is the compare-and-delete used to release
+	// the coordinator lock: an unconditional Del could free a DIFFERENT worker's
+	// lock if this worker had already lost it (its TTL expired and another worker
+	// re-acquired). The check + delete must be atomic, so it is a Lua script.
+	DelIfMatches(ctx context.Context, key, value string) (bool, error)
 	// Get returns the value of a key, or "" if absent.
 	Get(ctx context.Context, key string) (string, error)
 	// Set sets key=value with no expiry.
@@ -217,7 +232,14 @@ func (w *Worker) Start(ctx context.Context) error {
 		return err
 	}
 	lockKey := w.cfg.Key.lockKey()
-	acquired, err := w.deps.Redis.SetNX(ctx, lockKey, "worker", lockTTL)
+	// A unique per-Start token lets release be a compare-and-delete: if this
+	// worker's lock TTL expired and another worker re-acquired the lock, our
+	// release must NOT free the new holder's lock.
+	lockToken, err := newLockToken()
+	if err != nil {
+		return fmt.Errorf("Worker.Start mint lock token: %w", err)
+	}
+	acquired, err := w.deps.Redis.SetNX(ctx, lockKey, lockToken, lockTTL)
 	if err != nil {
 		return fmt.Errorf("Worker.Start acquire lock: %w", err)
 	}
@@ -229,9 +251,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	stopHeartbeat := w.startHeartbeat(ctx, lockKey)
 	defer func() {
 		stopHeartbeat()
-		// Release the lock on shutdown. Use a detached context so a cancelled ctx
-		// still frees the lock for the next worker.
-		if delErr := w.deps.Redis.Del(context.WithoutCancel(ctx), lockKey); delErr != nil {
+		// Release the lock on shutdown via compare-and-delete so we never free a
+		// lock another worker re-acquired after ours expired. Use a detached
+		// context so a cancelled ctx still frees our own lock for the next worker.
+		if _, delErr := w.deps.Redis.DelIfMatches(context.WithoutCancel(ctx), lockKey, lockToken); delErr != nil {
 			slog.Warn("landing worker: failed to release lock", "key", lockKey, "err", delErr)
 		}
 		w.running = false
@@ -351,9 +374,16 @@ func (w *Worker) ProcessEntry(ctx context.Context, e Entry) (ProcessResult, erro
 	if remote == "" {
 		remote = "origin"
 	}
+	// A dedicated per-proposal worktree (set by the Pool) isolates concurrent
+	// batch members; the single-flight Worker path leaves WorktreePath empty and
+	// runs directly in RepoPath.
+	worktreePath := w.cfg.WorktreePath
+	if worktreePath == "" {
+		worktreePath = w.cfg.RepoPath
+	}
 	sctx := strategies.Context{
 		RepoPath:     w.cfg.RepoPath,
-		WorktreePath: w.cfg.RepoPath, // a dedicated worktree is wired by the Pool/host in a later stage.
+		WorktreePath: worktreePath,
 		SourceBranch: e.SourceBranch,
 		TargetBranch: targetBranch,
 		Proposal:     e.Proposal,
@@ -528,6 +558,17 @@ func (w *Worker) startHeartbeat(ctx context.Context, lockKey string) func() {
 	}
 }
 
+// newLockToken mints a random per-Start lock token. The token is the value
+// stored under the coordinator lock key so release can compare-and-delete: only
+// the worker that owns the current value frees it.
+func newLockToken() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("read random: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
 // sleepCtx sleeps for d or until ctx is cancelled, whichever comes first. A
 // non-positive duration is a no-op (yields to the scheduler once).
 func sleepCtx(ctx context.Context, d time.Duration) {
@@ -567,6 +608,26 @@ func (a *redisClientAdapter) Del(ctx context.Context, key string) error {
 		return fmt.Errorf("redis del %s: %w", key, err)
 	}
 	return nil
+}
+
+// delIfMatchesScript is the atomic compare-and-delete: delete the key only if its
+// value matches the caller's token. Returns 1 if deleted, 0 otherwise. The check
+// and delete run in one Redis round trip so they cannot interleave with another
+// worker re-acquiring the lock.
+var delIfMatchesScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+else
+	return 0
+end
+`)
+
+func (a *redisClientAdapter) DelIfMatches(ctx context.Context, key, value string) (bool, error) {
+	res, err := delIfMatchesScript.Run(ctx, a.rdb, []string{key}, value).Int64()
+	if err != nil {
+		return false, fmt.Errorf("redis compare-and-delete %s: %w", key, err)
+	}
+	return res == 1, nil
 }
 
 func (a *redisClientAdapter) Get(ctx context.Context, key string) (string, error) {
