@@ -158,6 +158,17 @@ type PollResponse struct {
 	// BatchWork (a workType mux fans both lanes out to their executors); see
 	// PollLoopWithBatch and afcli/worker_start.go.
 	KgExtractWork []BatchWorkItem `json:"kgExtractWork,omitempty"`
+
+	// LandingWork is a SEPARATE non-agent batch lane for the "landing" claim
+	// lane, emitted by the platform poll route as a top-level sibling to
+	// batchWork and kgExtractWork (NOT nested inside either). It shares the
+	// BatchWorkItem envelope (workType discriminant + Raw payload) and the same
+	// isolation guarantees as BatchWork and KgExtractWork: never routed to the
+	// agent path, never counted toward quota, never added to activeSessions. An
+	// old worker ignores this field. The poll loop dispatches it through the SAME
+	// batchHandler as BatchWork and KgExtractWork (a workType mux fans all lanes
+	// out to their executors); see PollLoopWithBatch and afcli/worker_start.go.
+	LandingWork []BatchWorkItem `json:"landingWork,omitempty"`
 }
 
 // BatchWorkItem is the worker-package envelope for one batchWork[] item. The
