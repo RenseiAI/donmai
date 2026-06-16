@@ -34,6 +34,16 @@ type ResolvedModelProfile struct {
 	// which converts this to agent.ProviderName internally.
 	ProviderID string `json:"providerId"`
 
+	// Harness is the loop-driver attribute the platform catalog models on
+	// the model identity (e.g. "agy" for the Antigravity `agy` CLI-wrap).
+	// When non-empty it is AUTHORITATIVE for provider selection over
+	// ProviderID: ToResolvedProfile copies it into ResolvedProfile.Harness,
+	// which the runner's resolvedProvider() reads first (see
+	// runner/types.go). This keeps the modelProfile dispatch path
+	// harness-aware in lock-step with the resolvedProfile path. Empty falls
+	// back to the ProviderID/default chain.
+	Harness string `json:"harness,omitempty"`
+
 	// Model is the model variant within the provider family
 	// (e.g. "claude-opus-4-7", "gpt-4o-2025-04"). Empty falls back to
 	// the provider's built-in default model.
@@ -62,6 +72,7 @@ type ResolvedModelProfile struct {
 // providers that honor extended knobs can consume them.
 func (p ResolvedModelProfile) ToResolvedProfile() ResolvedProfile {
 	rp := ResolvedProfile{
+		Harness:  p.Harness,
 		Provider: agent.ProviderName(p.ProviderID),
 		Model:    p.Model,
 		Effort:   agent.EffortLevel(p.Mode),

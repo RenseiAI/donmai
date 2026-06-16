@@ -640,6 +640,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 		mp := runner.ResolvedModelProfile{
 			ID:              d.ModelProfile.ID,
 			ProviderID:      d.ModelProfile.ProviderID,
+			Harness:         d.ModelProfile.Harness,
 			Model:           d.ModelProfile.Model,
 			Mode:            d.ModelProfile.Mode,
 			Context:         d.ModelProfile.Context,

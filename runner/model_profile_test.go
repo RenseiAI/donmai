@@ -1,7 +1,9 @@
 package runner
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -148,6 +150,74 @@ func TestResolvedModelProfile_ToResolvedProfile(t *testing.T) {
 	}
 	if maxOut, ok := rp.ProviderConfig["maxOutputTokens"]; !ok || maxOut != 32_000 {
 		t.Errorf("ProviderConfig[maxOutputTokens] = %v; want 32000", maxOut)
+	}
+}
+
+// TestResolvedModelProfile_ToResolvedProfile_CarriesHarness verifies that the
+// Harness loop-driver attribute survives the bridge into the legacy
+// ResolvedProfile shape. The platform may model a model as
+// ProviderID="gemini" with Harness="agy"; the runner's resolvedProvider()
+// reads ResolvedProfile.Harness first, so the modelProfile dispatch path must
+// produce the same harness-aware profile the resolvedProfile path does.
+func TestResolvedModelProfile_ToResolvedProfile_CarriesHarness(t *testing.T) {
+	profile := ResolvedModelProfile{
+		ID:         "mp_test_harness",
+		ProviderID: string(agent.ProviderGemini),
+		Harness:    "agy",
+		Model:      "gemini-3.1-pro",
+	}
+	rp := profile.ToResolvedProfile()
+
+	if rp.Harness != "agy" {
+		t.Errorf("Harness = %q; want %q", rp.Harness, "agy")
+	}
+	// Harness must not clobber Provider — both survive the bridge, and the
+	// runner's resolvedProvider() prefers Harness when it maps.
+	if rp.Provider != agent.ProviderGemini {
+		t.Errorf("Provider = %q; want %q (Harness must not clobber Provider)", rp.Provider, agent.ProviderGemini)
+	}
+
+	// The bridged profile must resolve to the agy-cli provider via the
+	// runner's harness-native selection, proving end-to-end carriage.
+	qw := &QueuedWork{ResolvedProfile: rp}
+	if got := qw.resolvedProvider(); got != agent.ProviderAGYCLI {
+		t.Errorf("resolvedProvider() = %q; want %q (harness=agy must select agy-cli)", got, agent.ProviderAGYCLI)
+	}
+}
+
+// TestResolvedModelProfile_HarnessJSONRoundTrip verifies the new harness
+// field marshals under its camelCase wire tag and round-trips intact, so a
+// platform that populates modelProfile.harness reaches the runner unchanged.
+func TestResolvedModelProfile_HarnessJSONRoundTrip(t *testing.T) {
+	in := ResolvedModelProfile{
+		ID:         "mp_test_rt",
+		ProviderID: string(agent.ProviderGemini),
+		Harness:    "agy",
+		Model:      "gemini-3.1-pro",
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"harness":"agy"`) {
+		t.Errorf("marshalled JSON missing harness field: %s", b)
+	}
+
+	var out ResolvedModelProfile
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out.Harness != "agy" {
+		t.Errorf("round-tripped Harness = %q; want %q", out.Harness, "agy")
+	}
+
+	// omitempty: an empty harness must not appear on the wire.
+	empty, err := json.Marshal(ResolvedModelProfile{ID: "mp_empty", ProviderID: "claude"})
+	if err != nil {
+		t.Fatalf("Marshal empty: %v", err)
+	}
+	if strings.Contains(string(empty), "harness") {
+		t.Errorf("empty Harness should be omitted, got: %s", empty)
 	}
 }
 

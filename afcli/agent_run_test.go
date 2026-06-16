@@ -402,6 +402,41 @@ func TestDetailToQueuedWork_ModelProfileEmptyProviderIDFallback(t *testing.T) {
 	}
 }
 
+// TestDetailToQueuedWork_ModelProfileOnlyThreadsHarness verifies the
+// modelProfile dispatch path is harness-aware in lock-step with the
+// resolvedProfile path. When ONLY modelProfile is present (no
+// resolvedProfile) and it models the model as ProviderID="gemini" with
+// Harness="agy", the bridged QueuedWork.ResolvedProfile must carry Harness
+// so the runner's harness-native selection resolves the agy-cli provider.
+// Defense-in-depth: the platform writes only resolvedProfile today, so this
+// guards the day it populates modelProfile.
+func TestDetailToQueuedWork_ModelProfileOnlyThreadsHarness(t *testing.T) {
+	d := &daemon.SessionDetail{
+		SessionID:       "sess-mp-harness",
+		IssueIdentifier: "REN-MP-AGY",
+		Body:            "test body",
+		WorkerID:        "wkr_mp",
+		AuthToken:       "tok_mp",
+		PlatformURL:     "https://app.example.com",
+		// resolvedProfile intentionally absent — only modelProfile drives this.
+		ModelProfile: &daemon.SessionModelProfile{
+			ID:         "mp_agy",
+			ProviderID: string(agent.ProviderGemini),
+			Harness:    "agy",
+			Model:      "gemini-3.1-pro",
+		},
+	}
+	qw := detailToQueuedWork(d)
+
+	if qw.ResolvedProfile.Harness != "agy" {
+		t.Errorf("Harness = %q; want agy (modelProfile path must carry harness)", qw.ResolvedProfile.Harness)
+	}
+	// Harness must not clobber Provider — both survive the bridge.
+	if qw.ResolvedProfile.Provider != agent.ProviderGemini {
+		t.Errorf("Provider = %q; want gemini (Harness must not clobber Provider)", qw.ResolvedProfile.Provider)
+	}
+}
+
 // TestDetailToQueuedWork_DisallowedToolsForwarded verifies that
 // DisallowedTools stamped by the platform's credential-injection layer
 // is forwarded from SessionDetail into the runner's QueuedWork.

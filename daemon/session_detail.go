@@ -258,6 +258,19 @@ type SessionModelProfile struct {
 	// "gemini", "ollama").
 	ProviderID string `json:"providerId"`
 
+	// Harness is the loop-driver attribute the platform catalog models on
+	// the model identity (e.g. "agy" for the Antigravity `agy` CLI-wrap).
+	// When present it is AUTHORITATIVE for binary/provider selection in the
+	// runner (it maps the harness token onto its concrete provider impl
+	// regardless of ProviderID), mirroring SessionResolvedProfile.Harness.
+	// Carried opaquely by the daemon and bridged into
+	// runner.ResolvedModelProfile.Harness via detailToQueuedWork so the
+	// modelProfile dispatch path produces the same harness-aware
+	// ResolvedProfile the resolvedProfile path does. Absent today — the
+	// platform writes only resolvedProfile — so this is defense-in-depth
+	// for the day the platform populates modelProfile.
+	Harness string `json:"harness,omitempty"`
+
 	// Model is the model variant within the provider family.
 	Model string `json:"model"`
 
