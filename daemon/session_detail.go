@@ -198,6 +198,14 @@ type SessionDetail struct {
 // stay independent of the runner package — `donmai agent run` constructs
 // its own runner from this opaque payload).
 type SessionResolvedProfile struct {
+	// Harness is the platform catalog's loop-driver attribute (e.g. "agy").
+	// Forwarded opaquely; the daemon does not interpret it. The runner
+	// reads it first and maps it onto the concrete provider impl, so the
+	// platform can drop the transitional Provider="agy-cli" wire token.
+	// Additive + omitempty: absent on every legacy dispatch (=> the runner
+	// falls back to Provider/Runner). Round-tripped through the daemon's
+	// SessionDetail wire shape.
+	Harness        string         `json:"harness,omitempty"`
 	Provider       string         `json:"provider,omitempty"`
 	Runner         string         `json:"runner,omitempty"`
 	Model          string         `json:"model,omitempty"`

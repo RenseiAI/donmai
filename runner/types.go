@@ -82,9 +82,22 @@ func (q *QueuedWork) hasCapability(name string) bool {
 // JSON tags follow the platform-side camelCase wire shape (consumed
 // by the daemon poll handler).
 type ResolvedProfile struct {
+	// Harness is the loop-driver attribute the platform catalog models on
+	// the model identity (e.g. "agy" for the Antigravity `agy` CLI-wrap).
+	// When present it is AUTHORITATIVE for binary/provider selection: the
+	// runner maps the harness token onto its concrete provider impl
+	// regardless of the Provider value (so a catalog that models the
+	// model as Provider="gemini" with Harness="agy" still resolves to the
+	// agy-cli provider). Empty falls back to the Provider/Runner/default
+	// chain — see [QueuedWork.resolvedProvider]. This lets the platform
+	// drop the transitional Provider="agy-cli" wire token once every
+	// runner reads Harness.
+	Harness string `json:"harness,omitempty"`
+
 	// Provider names the provider family that should run the session
 	// (claude/codex/stub for v0.5.0). When empty the runner falls
 	// back to the legacy `Runner` field, then to agent.ProviderClaude.
+	// Superseded by Harness when Harness is non-empty.
 	Provider agent.ProviderName `json:"provider,omitempty"`
 
 	// Runner is the legacy field name some platform deployments use
@@ -122,9 +135,44 @@ func (q *QueuedWork) isInterview() bool {
 	return q.Mode == interview.InterviewRunMode
 }
 
+// harnessToProvider maps a platform-wire harness token (the catalog's
+// loop-driver attribute) onto the concrete provider impl that drives it.
+// This is the harness-native selection seam: it lets the platform model a
+// model as e.g. Provider="gemini" with Harness="agy" and still resolve to
+// the agy-cli provider, so the platform can drop the transitional
+// Provider="agy-cli" wire token.
+//
+// The token is the lowercase catalog attribute (e.g. "agy"), NOT the
+// internal agent.HarnessName ("antigravity"); the two are deliberately
+// distinct. An unrecognized token returns ("", false) so the caller falls
+// back to the Provider/Runner/default chain — a forward-compatible default
+// (a new harness token a stale runner doesn't know maps cleanly to its
+// Provider field).
+func harnessToProvider(harness string) (agent.ProviderName, bool) {
+	switch harness {
+	case "agy":
+		return agent.ProviderAGYCLI, true
+	default:
+		return "", false
+	}
+}
+
 // resolvedProvider returns the effective provider name for this
-// QueuedWork, falling back through the Provider/Runner/default chain.
+// QueuedWork.
+//
+// Selection order:
+//  1. ResolvedProfile.Harness (when it maps to a known provider) — the
+//     harness-native path; the catalog's loop-driver attribute is
+//     authoritative over Provider.
+//  2. ResolvedProfile.Provider — includes the legacy "agy-cli" alias the
+//     platform still emits today (kept for one release so an in-flight
+//     dispatch from a not-yet-updated platform cannot break a session).
+//  3. ResolvedProfile.Runner (legacy field name).
+//  4. agent.ProviderClaude (default).
 func (q *QueuedWork) resolvedProvider() agent.ProviderName {
+	if name, ok := harnessToProvider(q.ResolvedProfile.Harness); ok {
+		return name
+	}
 	if q.ResolvedProfile.Provider != "" {
 		return q.ResolvedProfile.Provider
 	}
