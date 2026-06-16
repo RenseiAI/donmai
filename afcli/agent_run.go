@@ -640,6 +640,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 		mp := runner.ResolvedModelProfile{
 			ID:              d.ModelProfile.ID,
 			ProviderID:      d.ModelProfile.ProviderID,
+			Harness:         d.ModelProfile.Harness,
 			Model:           d.ModelProfile.Model,
 			Mode:            d.ModelProfile.Mode,
 			Context:         d.ModelProfile.Context,
@@ -656,6 +657,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 		}
 	} else if d.ResolvedProfile != nil {
 		qw.ResolvedProfile = runner.ResolvedProfile{
+			Harness:        d.ResolvedProfile.Harness,
 			Provider:       agent.ProviderName(d.ResolvedProfile.Provider),
 			Runner:         d.ResolvedProfile.Runner,
 			Model:          d.ResolvedProfile.Model,
@@ -672,14 +674,20 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 // runner.QueuedWork.resolvedProvider uses. Only used for log lines —
 // the runner does the authoritative resolution itself.
 //
-// Lookup order: ModelProfile.ProviderID → ResolvedProfile.Provider →
-// ResolvedProfile.Runner → default claude.
+// Lookup order: ModelProfile.ProviderID → ResolvedProfile.Harness (when
+// it maps to a known provider) → ResolvedProfile.Provider →
+// ResolvedProfile.Runner → default claude. The Harness branch mirrors the
+// runner's harness-native selection so this log line does not diverge from
+// the provider actually resolved; the runner remains authoritative.
 func providerNameFromDetail(d *daemon.SessionDetail) string {
 	if d.ModelProfile != nil && d.ModelProfile.ProviderID != "" {
 		return d.ModelProfile.ProviderID
 	}
 	if d.ResolvedProfile == nil {
 		return string(agent.ProviderClaude)
+	}
+	if name, ok := harnessToProviderName(d.ResolvedProfile.Harness); ok {
+		return name
 	}
 	if d.ResolvedProfile.Provider != "" {
 		return d.ResolvedProfile.Provider
@@ -688,6 +696,20 @@ func providerNameFromDetail(d *daemon.SessionDetail) string {
 		return d.ResolvedProfile.Runner
 	}
 	return string(agent.ProviderClaude)
+}
+
+// harnessToProviderName mirrors the runner's harness→provider mapping for
+// the log-line path (runner.harnessToProvider is unexported). Authoritative
+// selection happens inside the runner; this only keeps the dispatch log
+// honest. An unrecognized token returns ("", false) so the caller falls
+// back to the Provider/Runner chain.
+func harnessToProviderName(harness string) (string, bool) {
+	switch harness {
+	case "agy":
+		return string(agent.ProviderAGYCLI), true
+	default:
+		return "", false
+	}
 }
 
 // emitResultJSON writes the runner.Result as a single newline-

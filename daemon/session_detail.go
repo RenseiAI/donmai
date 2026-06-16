@@ -198,6 +198,14 @@ type SessionDetail struct {
 // stay independent of the runner package — `donmai agent run` constructs
 // its own runner from this opaque payload).
 type SessionResolvedProfile struct {
+	// Harness is the platform catalog's loop-driver attribute (e.g. "agy").
+	// Forwarded opaquely; the daemon does not interpret it. The runner
+	// reads it first and maps it onto the concrete provider impl, so the
+	// platform can drop the transitional Provider="agy-cli" wire token.
+	// Additive + omitempty: absent on every legacy dispatch (=> the runner
+	// falls back to Provider/Runner). Round-tripped through the daemon's
+	// SessionDetail wire shape.
+	Harness        string         `json:"harness,omitempty"`
 	Provider       string         `json:"provider,omitempty"`
 	Runner         string         `json:"runner,omitempty"`
 	Model          string         `json:"model,omitempty"`
@@ -249,6 +257,19 @@ type SessionModelProfile struct {
 	// ProviderID is the canonical provider family (e.g. "claude", "codex",
 	// "gemini", "ollama").
 	ProviderID string `json:"providerId"`
+
+	// Harness is the loop-driver attribute the platform catalog models on
+	// the model identity (e.g. "agy" for the Antigravity `agy` CLI-wrap).
+	// When present it is AUTHORITATIVE for binary/provider selection in the
+	// runner (it maps the harness token onto its concrete provider impl
+	// regardless of ProviderID), mirroring SessionResolvedProfile.Harness.
+	// Carried opaquely by the daemon and bridged into
+	// runner.ResolvedModelProfile.Harness via detailToQueuedWork so the
+	// modelProfile dispatch path produces the same harness-aware
+	// ResolvedProfile the resolvedProfile path does. Absent today — the
+	// platform writes only resolvedProfile — so this is defense-in-depth
+	// for the day the platform populates modelProfile.
+	Harness string `json:"harness,omitempty"`
 
 	// Model is the model variant within the provider family.
 	Model string `json:"model"`
