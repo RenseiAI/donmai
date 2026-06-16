@@ -16,16 +16,33 @@ import (
 // access is guarded by a mutex. This keeps `go test -race` deterministic
 // without touching production logging behaviour — only the test's capture
 // buffer is synchronised.
+//
+// A buffered notify channel lets waitSlogRecords wake on each write instead
+// of sleeping a fixed interval, making the integration test timing-independent.
 type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	notify chan struct{}
+}
+
+func newSyncBuffer() *syncBuffer {
+	return &syncBuffer{notify: make(chan struct{}, 1)}
 }
 
 // Write implements io.Writer for the slog JSON handler.
 func (b *syncBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
+	n, err := b.buf.Write(p)
+	b.mu.Unlock()
+	// Coalescing wake-up: one buffered token is enough — the waiter
+	// re-snapshots after every wake, so concurrent writes can't be lost.
+	if b.notify != nil {
+		select {
+		case b.notify <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
 }
 
 // snapshot returns a copy of the bytes written so far. The copy lets
@@ -110,52 +127,70 @@ func TestSpawner_DefaultsChildOutputToSlog(t *testing.T) {
 		StderrPrefixWriter:    stderrW,
 	})
 
+	// Subscribe before AcceptWork so a fast-exiting child can't race past
+	// the subscription before it is registered.
+	ended := sessionEnds(s)
+
 	if _, err := s.AcceptWork(SessionSpec{SessionID: "sess-1", Repository: "github.com/a/b"}); err != nil {
 		t.Fatalf("accept work: %v", err)
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
-	for s.ActiveCount() > 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if s.ActiveCount() != 0 {
-		t.Fatalf("session did not exit in time")
-	}
+	// Wait for the session to exit. Event-driven: returns as soon as the
+	// SessionEventEnded fires; spawnerWaitTimeout is only a liveness backstop.
+	waitSessionEnd(t, ended)
 
-	// cmd.Wait() returning + ActiveCount==0 does NOT mean the
-	// pumpLines goroutines have flushed yet. They scan child
-	// stdout/stderr asynchronously via bufio.Scanner; when the child
-	// closes its pipe end, Scan returns false on the next read and
-	// the goroutine exits — but only AFTER any buffered bytes have
-	// been delivered. Under CI's -race overhead this can lag the
-	// process exit by tens of milliseconds. Previously this
-	// synchronised on a fixed 50ms sleep that proved unreliable on
-	// Linux runners; poll the buffer for both expected records (or
-	// an upper-bound timeout) so the test is timing-independent.
-	pumpDeadline := time.Now().Add(3 * time.Second)
-	var sawStdout, sawStderr bool
-	var records []slogRecord
-	for time.Now().Before(pumpDeadline) {
-		records = decodeAll(t, buf)
-		sawStdout, sawStderr = false, false
-		for _, r := range records {
-			if r.Stream == "stdout" && r.Level == "INFO" && strings.Contains(r.Msg, "hello-stdout") && r.SessionID == "sess-1" {
-				sawStdout = true
-			}
-			if r.Stream == "stderr" && r.Level == "WARN" && strings.Contains(r.Msg, "hello-stderr") && r.SessionID == "sess-1" {
-				sawStderr = true
-			}
-		}
-		if sawStdout && sawStderr {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// cmd.Wait() returning + SessionEventEnded does NOT mean the pumpLines
+	// goroutines have flushed yet. They scan child stdout/stderr asynchronously
+	// via bufio.Scanner; when the child closes its pipe end, Scan returns false
+	// on the next read and the goroutine exits — but only AFTER any buffered
+	// bytes have been delivered. Under CI's -race overhead this can lag the
+	// process exit by tens of milliseconds.
+	//
+	// waitSlogRecords wakes on each Write to the capture buffer (via
+	// syncBuffer.notify) and asserts as soon as both expected records are
+	// present, only failing if the generous 10s deadline elapses first.
+	records, sawStdout, sawStderr := waitSlogRecords(t, buf, "sess-1")
 	if !sawStdout {
 		t.Errorf("missing INFO stdout record; records=%v", records)
 	}
 	if !sawStderr {
 		t.Errorf("missing WARN stderr record; records=%v", records)
+	}
+}
+
+// waitSlogRecords polls buf until it contains an INFO stdout record and a WARN
+// stderr record for sessionID, or the 10s deadline elapses. It wakes on each
+// Write to buf (via syncBuffer.notify) rather than sleeping a fixed interval,
+// so green runs return as soon as the pump goroutines flush — regardless of
+// scheduler load.
+func waitSlogRecords(t *testing.T, buf *syncBuffer, sessionID string) ([]slogRecord, bool, bool) {
+	t.Helper()
+	const deadline = 10 * time.Second
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+
+	var records []slogRecord
+	var sawStdout, sawStderr bool
+	for {
+		records = decodeAll(t, buf)
+		sawStdout, sawStderr = false, false
+		for _, r := range records {
+			if r.Stream == "stdout" && r.Level == "INFO" && strings.Contains(r.Msg, "hello-stdout") && r.SessionID == sessionID {
+				sawStdout = true
+			}
+			if r.Stream == "stderr" && r.Level == "WARN" && strings.Contains(r.Msg, "hello-stderr") && r.SessionID == sessionID {
+				sawStderr = true
+			}
+		}
+		if sawStdout && sawStderr {
+			return records, true, true
+		}
+		select {
+		case <-timer.C:
+			return records, sawStdout, sawStderr
+		case <-buf.notify:
+			// a new slog record was written; re-check
+		}
 	}
 }
 
@@ -165,7 +200,7 @@ func TestSpawner_DefaultsChildOutputToSlog(t *testing.T) {
 // pump goroutines can write while the test reads under `go test -race`.
 func captureSlog(t *testing.T) (*syncBuffer, func()) {
 	t.Helper()
-	buf := &syncBuffer{}
+	buf := newSyncBuffer()
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	return buf, func() { slog.SetDefault(prev) }
