@@ -4,7 +4,7 @@ Status of the Go-native landing serializer (`landing/`, `landing/strategies/`,
 `landing/vcs/`) as of the Stage-5 finalize. This is the precise "what's done vs
 what isn't" record; the conceptual design lives in `DESIGN.md`.
 
-## Verification snapshot (Stage 5)
+## Verification snapshot (Stage 5 + deferred-hardening pass)
 
 Run from the `donmai` module root with `GOWORK=off` (CI / donmai-smokes
 convention — the org `go.work` `use`s `./donmai`, not this worktree):
@@ -15,11 +15,11 @@ convention — the org `go.work` `use`s `./donmai`, not this worktree):
 | `GOWORK=off go vet ./landing/...`      | PASS   |
 | `GOWORK=off go test -race ./landing/...` | PASS (3/3 packages) |
 | `GOWORK=off golangci-lint run ./landing/...` | 0 issues |
-| `bash scripts/leak-guard.sh --all`     | OK — no closed-source content (778 files) |
+| `bash scripts/leak-guard.sh --all`     | OK — no closed-source content (779 files) |
 | Private-ref sweep over `git diff origin/main` | clean (only `github.com/RenseiAI/donmai/...` import paths) |
 
-Test functions: `landing` 70, `landing/strategies` 20, `landing/vcs` 34
-(124 total). Statement coverage: `landing` 78.6%, `strategies` 78.1%,
+Test functions: `landing` 79, `landing/strategies` 24, `landing/vcs` 34
+(137 total). Statement coverage: `landing` 79.9%, `strategies` 78.0%,
 `vcs` 83.1% — all above the repo's 70% minimum.
 
 > Note: plain `go build ./...` (workspace mode) fails with "directory prefix .
@@ -39,21 +39,36 @@ These have real bodies (no stubs) and table-driven `-race` tests:
 - `filemanifest.go` — `git diff --name-only target...source` per proposal.
 - `manifest.go` — queue status/state value types + the `Adapter` contract.
 - `queue.go` `RedisStorage` — Redis sorted-set queue keyed by `(orgId, repoId)`.
-  Score packs `(priority, enqueuedAt)` into one float (`encodeScore`, FIFO on
-  ties, fractional tie-breaker bounded in `[0,1)`); per-proposal metadata in a
-  sibling hash; `DequeueBatch` runs ZREM+DEL in a `MULTI/EXEC` pipeline and
-  returns only proposals whose ZREM reported a removal (no double-dispatch);
-  every method `validateKey`s first. `ExtractIssueID` (pure).
+  Score packs `(priority, seq)` into one float (`encodeScore`, FIFO on ties): the
+  tiebreaker is a **strictly increasing per-key sequence** (a Redis `INCR` on
+  `:seq`), not a wall-clock fraction, so sub-second same-priority enqueues never
+  collide on one float64 score and lose FIFO ordering. The fractional part is
+  `seq/(1+seq)` clamped strictly below 1 (`maxScoreFrac`) so it can never bleed
+  into the next integer priority band. Per-proposal metadata in a sibling hash;
+  `DequeueBatch` runs ZREM+DEL in a `MULTI/EXEC` pipeline and returns only
+  proposals whose ZREM reported a removal (no double-dispatch); every method
+  `validateKey`s first. `(orgId,repoId)` keying intact. `ExtractIssueID` (pure).
 - `worker.go` `Worker` — single-instance processor: lock acquire + TTL
-  heartbeat + pause-flag honoring + dequeue→`ProcessEntry`→`handleResult` loop;
-  lock always released on a detached ctx. `ProcessEntry` is the full pipeline
+  heartbeat + pause-flag honoring + dequeue→`ProcessEntry`→`handleResult` loop.
+  The lock is acquired with a unique per-`Start` token and released by
+  **compare-and-delete** (`DelIfMatches`, a Lua `GET==token then DEL` script) on a
+  detached ctx, so a worker whose TTL expired and was re-acquired by another
+  worker can never free the new holder's lock. `ProcessEntry` is the full pipeline
   (pre-flight local-marker noop → prepare w/ retryable backoff → execute →
   resolve conflicts → regenerate lock files → run tests → finalize → optional
-  source-branch delete).
+  source-branch delete), running in `WorkerConfig.WorktreePath` when set (the
+  Pool's per-proposal worktree) and otherwise directly in `RepoPath` (single
+  flight).
 - `pool.go` `Pool` — concurrent coordinator: `Concurrency<=1` delegates to one
   `Worker`; otherwise peek-all → fetch refs → build manifests → conflict graph →
   first independent batch (capped by concurrency) → atomic `DequeueBatch` →
-  parallel process → record results.
+  parallel process → record results. Each in-flight batch member gets its **own
+  dedicated git worktree** (`strategies.AddWorktree`/`RemoveWorktree`, a
+  `worktreeManager` seam) created before processing and removed after via `defer`
+  (always, even on error), so parallel members never share one working tree and
+  clobber each other's index/checkout/lock-regen. The coordinator lock uses the
+  same unique-token compare-and-delete release as the Worker. Single-flight
+  behavior is unchanged (it delegates to a `Worker` that runs in `RepoPath`).
 - `adapter_local.go` `LocalAdapter` — self-hosted `Adapter` over `Storage`,
   carries `OrgID` (FD-4); eligibility/merged probed via injectable `gh` runner.
 - `conflictresolver.go` `ConflictResolver` — mergiraf marker-check pass (stage
@@ -67,7 +82,9 @@ These have real bodies (no stubs) and table-driven `-race` tests:
 - `strategy.go` — `Strategy` interface + `Context`/`PrepareResult`/`MergeResult`.
 - `rebase.go` / `mergecommit.go` / `squash.go` — git rebase / `merge --no-ff` /
   `merge --squash` Prepare/Execute/Finalize bodies.
-- `worktree.go` — `git worktree add/remove` helpers.
+- `worktree.go` — `CleanWorktreeState` plus the `AddWorktree`/`RemoveWorktree`
+  `git worktree add --detach … / remove --force` lifecycle helpers the Pool uses
+  to give each in-flight proposal its own isolated working tree.
 - `runner.go` — exec seam mirroring the `landing` one; fake in tests.
 
 ### package `landing/vcs`
@@ -97,14 +114,37 @@ These have real bodies (no stubs) and table-driven `-race` tests:
   wired. This is a thin add-on for a later stage, not load-bearing for
   serialization correctness.
 
-## Partial / deferred wiring (works today, hardening later)
+## Hardening landed (was "Partial / deferred wiring")
 
-- **Per-proposal dedicated worktree.** `Worker.ProcessEntry` currently runs the
-  strategy with `WorktreePath == RepoPath` (`worker.go` ~L356). The
-  `strategies.worktree.go` add/remove helpers exist; wiring the host/`Pool` to
-  hand each in-flight proposal its own isolated worktree (so parallel batch
-  members don't share a working tree) is the natural next step. Single-flight
-  (`Concurrency<=1`) is unaffected.
+These three deferred-hardening items are now fully wired + `-race`-tested:
+
+- **Per-proposal dedicated worktree.** The `Pool` now hands each in-flight batch
+  member its own isolated git worktree via `strategies.AddWorktree`/
+  `RemoveWorktree` (new `git worktree add --detach … / remove --force` helpers)
+  behind a `worktreeManager` seam. `Pool.processOne` creates the worktree, sets
+  `WorkerConfig.WorktreePath`, processes, and removes the worktree in a `defer`
+  (always, even on error / on a `ProcessError` result). `Worker.ProcessEntry`
+  honors `WorktreePath` when set and falls back to `RepoPath` otherwise, so the
+  single-flight (`Concurrency<=1`) path is byte-for-byte unchanged. Tests:
+  two concurrent batch members get distinct worktree paths; cleanup runs on
+  success and on error; a worktree-add failure becomes a `ProcessError` with no
+  dangling remove; `proposalWorktreePath` is distinct-per-proposal and stable.
+- **Sub-second FIFO tiebreak.** `encodeScore` now packs `(priority, seq)` where
+  `seq` is a strictly increasing per-key Redis `INCR` sequence (`:seq`) rather
+  than a wall-clock fraction. Sub-second same-priority enqueues no longer collide
+  on one float64 score; the `seq/(1+seq)` fraction is clamped strictly below 1
+  (`maxScoreFrac`) so it never bleeds into the next priority band, and
+  `(orgId,repoId)` keying is intact. Tests: 20 same-priority proposals at one
+  identical instant dequeue in strict enqueue order; interleaved priorities still
+  honor priority-then-FIFO; `encodeScore` is strictly monotonic in `seq` and the
+  tiebreaker stays in-band for huge `seq`.
+- **Non-token lock release (compare-and-delete).** The coordinator lock is now
+  acquired with a unique per-`Start` token and released via `DelIfMatches` — an
+  atomic Lua `GET==token then DEL` — in both `Worker.Start` and `Pool.Start`. A
+  worker whose TTL expired and was re-acquired by another worker can no longer
+  free the new holder's lock. Tests (against miniredis): a release with a
+  non-matching token is a no-op and leaves the lock untouched; the matching token
+  deletes; a stale worker cannot free a re-acquired lock.
 
 ## DEFERRED to a separate platform PR — do NOT do in this donmai PR
 

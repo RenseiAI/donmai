@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -47,23 +48,22 @@ func TestKeyValid(t *testing.T) {
 }
 
 func TestEncodeScoreOrdering(t *testing.T) {
-	base := fixedTime
 	tests := []struct {
 		name     string
 		aPri     int
-		aTime    time.Time
+		aSeq     int64
 		bPri     int
-		bTime    time.Time
+		bSeq     int64
 		aBeforeB bool // true if entry a should dequeue before b (lower score)
 	}{
-		{"lower priority wins regardless of time", 1, base.Add(time.Hour), 3, base, true},
-		{"same priority FIFO older first", 2, base, 2, base.Add(time.Minute), true},
-		{"higher priority value loses", 5, base, 2, base.Add(time.Hour), false},
+		{"lower priority wins regardless of seq", 1, 9999, 3, 0, true},
+		{"same priority FIFO earlier seq first", 2, 1, 2, 2, true},
+		{"higher priority value loses", 5, 0, 2, 9999, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sa := encodeScore(tt.aPri, tt.aTime)
-			sb := encodeScore(tt.bPri, tt.bTime)
+			sa := encodeScore(tt.aPri, tt.aSeq)
+			sb := encodeScore(tt.bPri, tt.bSeq)
 			if got := sa < sb; got != tt.aBeforeB {
 				t.Errorf("encodeScore: a(%v) < b(%v) = %v, want %v", sa, sb, got, tt.aBeforeB)
 			}
@@ -71,15 +71,29 @@ func TestEncodeScoreOrdering(t *testing.T) {
 	}
 }
 
-// TestEncodeScoreTieBreakerStaysInBand verifies the fractional FIFO tie-breaker
-// never bleeds into the next integer priority band.
+// TestEncodeScoreTieBreakerStaysInBand verifies the FIFO tie-breaker never bleeds
+// into the next integer priority band.
 func TestEncodeScoreTieBreakerStaysInBand(t *testing.T) {
-	// A priority-2 entry enqueued far in the future must still sort ahead of a
-	// priority-3 entry enqueued at the epoch.
-	high := encodeScore(2, fixedTime.Add(100*365*24*time.Hour))
-	low := encodeScore(3, enqueueEpoch)
+	// A priority-2 entry with the largest practical sequence must still sort ahead
+	// of a priority-3 entry with sequence 0.
+	high := encodeScore(2, 1<<53) // seq large enough to saturate frac toward 1
+	low := encodeScore(3, 0)
 	if high >= low {
 		t.Fatalf("priority-2 score %v should be < priority-3 score %v", high, low)
+	}
+}
+
+// TestEncodeScoreStrictlyMonotonicInSeq verifies that within one priority band,
+// every distinct sequence yields a strictly increasing score — the property the
+// wall-clock-fraction scheme lost for sub-second timestamps.
+func TestEncodeScoreStrictlyMonotonicInSeq(t *testing.T) {
+	prev := encodeScore(2, 0)
+	for seq := int64(1); seq <= 1000; seq++ {
+		cur := encodeScore(2, seq)
+		if cur <= prev {
+			t.Fatalf("score not strictly increasing at seq=%d: prev=%v cur=%v", seq, prev, cur)
+		}
+		prev = cur
 	}
 }
 
@@ -108,11 +122,14 @@ func TestRedisStorageEnqueueDequeueOrdering(t *testing.T) {
 	ctx := context.Background()
 	key := Key{OrgID: "org1", RepoID: "owner/repo"}
 
-	// Enqueue out of priority order; expect dequeue in priority order, FIFO ties.
+	// Enqueue out of priority order; expect dequeue in priority order, with
+	// same-priority ties broken by ENQUEUE order (FIFO via the monotonic seq, not
+	// the EnqueuedAt timestamp). Proposal 12 is enqueued before 11, so among the
+	// two priority-1 entries 12 lands first.
 	entries := []Entry{
 		mkEntry("org1", "owner/repo", 10, 3, "10", fixedTime),
-		mkEntry("org1", "owner/repo", 11, 1, "11", fixedTime.Add(time.Minute)),
-		mkEntry("org1", "owner/repo", 12, 1, "12", fixedTime), // same pri, earlier → first
+		mkEntry("org1", "owner/repo", 12, 1, "12", fixedTime), // pri1, enqueued first → first
+		mkEntry("org1", "owner/repo", 11, 1, "11", fixedTime), // pri1, enqueued second
 		mkEntry("org1", "owner/repo", 13, 2, "13", fixedTime),
 	}
 	for _, e := range entries {
@@ -121,7 +138,7 @@ func TestRedisStorageEnqueueDequeueOrdering(t *testing.T) {
 		}
 	}
 
-	wantOrder := []int{12, 11, 13, 10} // pri1(older), pri1(newer), pri2, pri3
+	wantOrder := []int{12, 11, 13, 10} // pri1(first), pri1(second), pri2, pri3
 	for i, want := range wantOrder {
 		got, err := s.Dequeue(ctx, key)
 		if err != nil {
@@ -141,6 +158,81 @@ func TestRedisStorageEnqueueDequeueOrdering(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("Dequeue on empty queue = %+v, want nil", got)
+	}
+}
+
+// TestRedisStorageSubSecondFIFO is the regression test for the sub-second FIFO
+// defect: several proposals enqueued at the same priority within the same
+// nanosecond (so the old wall-clock-fraction score collided) must still dequeue
+// in strict enqueue order. The monotonic INCR sequence tiebreaker guarantees it.
+func TestRedisStorageSubSecondFIFO(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	key := Key{OrgID: "org1", RepoID: "owner/repo"}
+
+	// All identical priority, all the SAME instant — the worst case for a
+	// timestamp-derived score. Enqueue order is 100..119.
+	const n = 20
+	sameInstant := fixedTime
+	for i := 0; i < n; i++ {
+		e := mkEntry("org1", "owner/repo", 100+i, 2, strconv.Itoa(100+i), sameInstant)
+		if err := s.Enqueue(ctx, e); err != nil {
+			t.Fatalf("Enqueue(%d): %v", 100+i, err)
+		}
+	}
+
+	for i := 0; i < n; i++ {
+		got, err := s.Dequeue(ctx, key)
+		if err != nil {
+			t.Fatalf("Dequeue #%d: %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Dequeue #%d returned nil, want proposal %d", i, 100+i)
+		}
+		if got.Proposal != 100+i {
+			t.Fatalf("FIFO broken at #%d: got proposal %d, want %d", i, got.Proposal, 100+i)
+		}
+	}
+}
+
+// TestRedisStorageFIFOAcrossPrioritiesAndSeq verifies FIFO holds within each
+// priority band while priority still dominates: lower priority always dequeues
+// first, and same-priority entries come out in enqueue order even when all share
+// one timestamp.
+func TestRedisStorageFIFOAcrossPrioritiesAndSeq(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	key := Key{OrgID: "org1", RepoID: "owner/repo"}
+
+	// Interleave priorities, all at the same instant. Enqueue order matters only
+	// within a band.
+	type enq struct {
+		proposal int
+		priority int
+	}
+	order := []enq{
+		{1, 2}, {2, 1}, {3, 2}, {4, 1}, {5, 3}, {6, 1},
+	}
+	for _, e := range order {
+		if err := s.Enqueue(ctx, mkEntry("org1", "owner/repo", e.proposal, e.priority, strconv.Itoa(e.proposal), fixedTime)); err != nil {
+			t.Fatalf("Enqueue(%d): %v", e.proposal, err)
+		}
+	}
+
+	// Priority 1 first (FIFO: 2,4,6), then priority 2 (FIFO: 1,3), then priority 3 (5).
+	want := []int{2, 4, 6, 1, 3, 5}
+	for i, w := range want {
+		got, err := s.Dequeue(ctx, key)
+		if err != nil {
+			t.Fatalf("Dequeue #%d: %v", i, err)
+		}
+		if got == nil || got.Proposal != w {
+			var p int
+			if got != nil {
+				p = got.Proposal
+			}
+			t.Fatalf("Dequeue #%d = %d, want %d", i, p, w)
+		}
 	}
 }
 

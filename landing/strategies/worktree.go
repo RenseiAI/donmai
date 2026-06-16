@@ -1,6 +1,9 @@
 package strategies
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // CleanWorktreeState resets a landing worktree to a clean state at the start of
 // every Prepare. The worktree is reused across proposals and any number of steps
@@ -35,5 +38,49 @@ func cleanWorktreeState(ctx context.Context, r commandRunner, worktreePath strin
 	// node_modules survive and Prepare stays fast.
 	_, _ = r.run(ctx, worktreePath, nil, "git", "clean", "-fd")
 
+	return nil
+}
+
+// AddWorktree creates a dedicated linked git worktree at worktreePath, checked
+// out at targetBranch, so a single in-flight proposal gets its own isolated
+// working tree. With a concurrent landing pool, sharing one working tree across
+// parallel proposals lets them clobber each other's staged index, checkout, and
+// lock-file regen; a dedicated worktree per proposal isolates them.
+//
+// `--detach` keeps the worktree off any branch ref so two concurrent worktrees
+// can both start from the same targetBranch without git's "branch already
+// checked out" guard rejecting the second.
+//
+// Ported/extended from the worktree lifecycle in
+// donmai-libraries merge-queue/strategies/worktree-cleanup.ts (which only kept
+// the cleanup half).
+func AddWorktree(ctx context.Context, repoPath, worktreePath, targetBranch string) error {
+	return addWorktree(ctx, defaultRunner, repoPath, worktreePath, targetBranch)
+}
+
+// addWorktree is the runner-injectable implementation.
+func addWorktree(ctx context.Context, r commandRunner, repoPath, worktreePath, targetBranch string) error {
+	if _, err := r.run(ctx, repoPath, nil, "git", "worktree", "add", "--detach", worktreePath, targetBranch); err != nil {
+		return fmt.Errorf("git worktree add %s: %w", worktreePath, err)
+	}
+	return nil
+}
+
+// RemoveWorktree tears down a dedicated worktree created by AddWorktree.
+// `--force` is used because the worktree may carry staged or untracked changes
+// from a failed landing; the caller always wants it gone regardless.
+//
+// Best-effort by contract: callers run it in a defer so the worktree is removed
+// even when the landing errored. A removal failure is returned so the caller can
+// log it, but it never aborts the surrounding flow.
+func RemoveWorktree(ctx context.Context, repoPath, worktreePath string) error {
+	return removeWorktree(ctx, defaultRunner, repoPath, worktreePath)
+}
+
+// removeWorktree is the runner-injectable implementation.
+func removeWorktree(ctx context.Context, r commandRunner, repoPath, worktreePath string) error {
+	if _, err := r.run(ctx, repoPath, nil, "git", "worktree", "remove", "--force", worktreePath); err != nil {
+		return fmt.Errorf("git worktree remove %s: %w", worktreePath, err)
+	}
 	return nil
 }

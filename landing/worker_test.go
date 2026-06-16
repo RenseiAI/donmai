@@ -139,6 +139,16 @@ func (r *fakeRedis) Del(_ context.Context, key string) error {
 	return nil
 }
 
+func (r *fakeRedis) DelIfMatches(_ context.Context, key, value string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.values[key] != value {
+		return false, nil
+	}
+	delete(r.values, key)
+	return true, nil
+}
+
 func (r *fakeRedis) Get(_ context.Context, key string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

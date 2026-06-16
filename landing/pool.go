@@ -4,8 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/RenseiAI/donmai/landing/strategies"
 )
 
 // PoolConfig configures a Pool. It embeds WorkerConfig and adds concurrency.
@@ -42,6 +46,33 @@ type Pool struct {
 	fetchRefs func(ctx context.Context, repoPath, remote string)
 	// sleep is the cancellable poll sleep; tests stub it.
 	sleep func(ctx context.Context, d time.Duration)
+	// worktrees creates and removes the per-proposal isolated worktrees so
+	// concurrent batch members never share one working tree; tests inject a fake.
+	worktrees worktreeManager
+}
+
+// worktreeManager creates and removes a dedicated git worktree for one in-flight
+// proposal. The production implementation shells out to `git worktree
+// add/remove` (see strategies.AddWorktree / strategies.RemoveWorktree); tests
+// inject a fake that records add/remove calls without touching git.
+type worktreeManager interface {
+	// add creates an isolated worktree at worktreePath checked out at
+	// targetBranch.
+	add(ctx context.Context, repoPath, worktreePath, targetBranch string) error
+	// remove tears the worktree down (always run in a defer, even on error).
+	remove(ctx context.Context, repoPath, worktreePath string) error
+}
+
+// gitWorktreeManager is the production worktreeManager backed by the strategies
+// git-worktree helpers.
+type gitWorktreeManager struct{}
+
+func (gitWorktreeManager) add(ctx context.Context, repoPath, worktreePath, targetBranch string) error {
+	return strategies.AddWorktree(ctx, repoPath, worktreePath, targetBranch)
+}
+
+func (gitWorktreeManager) remove(ctx context.Context, repoPath, worktreePath string) error {
+	return strategies.RemoveWorktree(ctx, repoPath, worktreePath)
 }
 
 // batchWorker is the Pool's view of a Worker (one method) so tests can supply a
@@ -65,7 +96,8 @@ func NewPool(cfg PoolConfig, deps WorkerDeps) *Pool {
 				slog.Debug("landing pool: git fetch failed (non-fatal)", "err", err)
 			}
 		},
-		sleep: sleepCtx,
+		sleep:     sleepCtx,
+		worktrees: gitWorktreeManager{},
 	}
 }
 
@@ -83,7 +115,13 @@ func (p *Pool) Start(ctx context.Context) error {
 	}
 
 	lockKey := p.cfg.Key.lockKey()
-	acquired, err := p.deps.Redis.SetNX(ctx, lockKey, "pool", lockTTL)
+	// Unique per-Start token so release is a compare-and-delete (never frees a
+	// lock another coordinator re-acquired after ours expired).
+	lockToken, err := newLockToken()
+	if err != nil {
+		return fmt.Errorf("Pool.Start mint lock token: %w", err)
+	}
+	acquired, err := p.deps.Redis.SetNX(ctx, lockKey, lockToken, lockTTL)
 	if err != nil {
 		return fmt.Errorf("Pool.Start acquire lock: %w", err)
 	}
@@ -95,7 +133,7 @@ func (p *Pool) Start(ctx context.Context) error {
 	stopHeartbeat := p.startHeartbeat(ctx, lockKey)
 	defer func() {
 		stopHeartbeat()
-		if delErr := p.deps.Redis.Del(context.WithoutCancel(ctx), lockKey); delErr != nil {
+		if _, delErr := p.deps.Redis.DelIfMatches(context.WithoutCancel(ctx), lockKey, lockToken); delErr != nil {
 			slog.Warn("landing pool: failed to release lock", "key", lockKey, "err", delErr)
 		}
 		p.running = false
@@ -210,15 +248,52 @@ func (p *Pool) processBatch(ctx context.Context) ([]ProcessResult, error) {
 	return results, nil
 }
 
-// processOne lands a single proposal via a fresh Worker, normalizing any error
-// into a ProcessError result so one failed proposal never aborts the batch.
+// processOne lands a single proposal via a fresh Worker in its OWN dedicated
+// worktree, normalizing any error into a ProcessError result so one failed
+// proposal never aborts the batch. The per-proposal worktree isolates concurrent
+// batch members: without it they would all run the strategy in p.cfg.RepoPath and
+// clobber each other's index, checkout, and lock-file regeneration. The worktree
+// is always removed (defer), even when creation succeeds but processing errors.
 func (p *Pool) processOne(ctx context.Context, entry Entry) ProcessResult {
-	w := p.newWorker(p.cfg.WorkerConfig, p.deps)
+	cfg := p.cfg.WorkerConfig
+
+	targetBranch := cfg.TargetBranch
+	if targetBranch == "" {
+		targetBranch = "main"
+	}
+	worktreePath := p.proposalWorktreePath(entry.Proposal)
+	if err := p.worktrees.add(ctx, cfg.RepoPath, worktreePath, targetBranch); err != nil {
+		// Without an isolated worktree we cannot safely land in parallel, so fail
+		// this proposal rather than fall back to the shared tree.
+		return ProcessResult{Proposal: entry.Proposal, Status: ProcessError, Message: fmt.Errorf("create worktree: %w", err).Error()}
+	}
+	defer func() {
+		if err := p.worktrees.remove(context.WithoutCancel(ctx), cfg.RepoPath, worktreePath); err != nil {
+			slog.Warn("landing pool: failed to remove proposal worktree", "proposal", entry.Proposal, "path", worktreePath, "err", err)
+		}
+	}()
+	cfg.WorktreePath = worktreePath
+
+	w := p.newWorker(cfg, p.deps)
 	result, err := w.ProcessEntry(ctx, entry)
 	if err != nil {
 		return ProcessResult{Proposal: entry.Proposal, Status: ProcessError, Message: err.Error()}
 	}
 	return result
+}
+
+// proposalWorktreePath derives a stable, per-proposal worktree directory beside
+// the repo. Two proposals always get distinct paths, so concurrent batch members
+// never collide on one working tree.
+func (p *Pool) proposalWorktreePath(proposal int) string {
+	dir := ".landing-worktrees/" + p.cfg.Key.OrgID + "-" + sanitizeRepoID(p.cfg.Key.RepoID) + "-" + strconv.Itoa(proposal)
+	return filepath.Join(p.cfg.RepoPath, dir)
+}
+
+// sanitizeRepoID makes a repoId (often "owner/repo") safe to embed in a directory
+// name by replacing path separators.
+func sanitizeRepoID(repoID string) string {
+	return filepath.Base(repoID)
 }
 
 // startHeartbeat extends the lock TTL on an interval until the returned stop
