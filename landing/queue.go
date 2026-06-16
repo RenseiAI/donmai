@@ -84,15 +84,20 @@ func (k Key) blockedKey(proposal int) string {
 // Ported from the LocalMergeQueueStorage entry shape in
 // donmai-libraries merge-queue/adapters/local.ts, with OrgID added (FD-4).
 type Entry struct {
-	OrgID        string
-	RepoID       string
-	Proposal     int
-	ProposalURL  string
-	IssueID      string
-	Priority     int
-	SourceBranch string
-	TargetBranch string
-	EnqueuedAt   time.Time
+	OrgID       string
+	RepoID      string
+	Proposal    int
+	ProposalURL string
+	IssueID     string
+	// LinearSessionID identifies the agent session that produced this proposal.
+	// Carried so a ResultPoster can promote+close that session by id after the
+	// proposal lands, without the coordinator re-resolving it from IssueID.
+	// Optional; empty when the producer does not supply it.
+	LinearSessionID string
+	Priority        int
+	SourceBranch    string
+	TargetBranch    string
+	EnqueuedAt      time.Time
 }
 
 // Key returns the (orgId, repoId) key for this entry.
@@ -213,12 +218,13 @@ func (s *RedisStorage) reasonExpiry() time.Duration {
 // stored.
 func entryFields(e Entry) map[string]any {
 	return map[string]any{
-		"proposalUrl":  e.ProposalURL,
-		"issueId":      e.IssueID,
-		"priority":     e.Priority,
-		"sourceBranch": e.SourceBranch,
-		"targetBranch": e.TargetBranch,
-		"enqueuedAt":   e.EnqueuedAt.UnixNano(),
+		"proposalUrl":     e.ProposalURL,
+		"issueId":         e.IssueID,
+		"linearSessionId": e.LinearSessionID,
+		"priority":        e.Priority,
+		"sourceBranch":    e.SourceBranch,
+		"targetBranch":    e.TargetBranch,
+		"enqueuedAt":      e.EnqueuedAt.UnixNano(),
 	}
 }
 
@@ -230,15 +236,16 @@ func entryFromHash(key Key, proposal int, h map[string]string) Entry {
 		enqueuedAt = time.Unix(0, ns).UTC()
 	}
 	return Entry{
-		OrgID:        key.OrgID,
-		RepoID:       key.RepoID,
-		Proposal:     proposal,
-		ProposalURL:  h["proposalUrl"],
-		IssueID:      h["issueId"],
-		Priority:     priority,
-		SourceBranch: h["sourceBranch"],
-		TargetBranch: h["targetBranch"],
-		EnqueuedAt:   enqueuedAt,
+		OrgID:           key.OrgID,
+		RepoID:          key.RepoID,
+		Proposal:        proposal,
+		ProposalURL:     h["proposalUrl"],
+		IssueID:         h["issueId"],
+		LinearSessionID: h["linearSessionId"],
+		Priority:        priority,
+		SourceBranch:    h["sourceBranch"],
+		TargetBranch:    h["targetBranch"],
+		EnqueuedAt:      enqueuedAt,
 	}
 }
 

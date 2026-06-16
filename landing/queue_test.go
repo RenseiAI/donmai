@@ -105,15 +105,16 @@ func newTestStorage(t *testing.T) *RedisStorage {
 
 func mkEntry(orgID, repoID string, proposal, priority int, branch string, at time.Time) Entry {
 	return Entry{
-		OrgID:        orgID,
-		RepoID:       repoID,
-		Proposal:     proposal,
-		ProposalURL:  "https://example.test/pull/" + branch,
-		IssueID:      "ABC-" + branch,
-		Priority:     priority,
-		SourceBranch: branch,
-		TargetBranch: "main",
-		EnqueuedAt:   at,
+		OrgID:           orgID,
+		RepoID:          repoID,
+		Proposal:        proposal,
+		ProposalURL:     "https://example.test/pull/" + branch,
+		IssueID:         "ABC-" + branch,
+		LinearSessionID: "sess-" + branch,
+		Priority:        priority,
+		SourceBranch:    branch,
+		TargetBranch:    "main",
+		EnqueuedAt:      at,
 	}
 }
 
@@ -249,6 +250,7 @@ func TestRedisStorageDequeuePreservesMetadata(t *testing.T) {
 		t.Fatalf("Dequeue: %v", err)
 	}
 	if out.SourceBranch != in.SourceBranch || out.IssueID != in.IssueID ||
+		out.LinearSessionID != in.LinearSessionID ||
 		out.Priority != in.Priority || out.ProposalURL != in.ProposalURL ||
 		out.TargetBranch != in.TargetBranch || out.OrgID != "org1" || out.RepoID != "owner/repo" {
 		t.Errorf("Dequeue metadata mismatch: got %+v, in %+v", *out, in)

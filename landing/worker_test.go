@@ -321,12 +321,32 @@ func (s *fakeStorage) BlockedReason(_ context.Context, _ Key, proposal int) (str
 	return s.blocked[proposal], nil
 }
 
+// fakePoster is a programmable ResultPoster recording each PostResult call.
+type fakePoster struct {
+	mu    sync.Mutex
+	err   error // returned from every PostResult call
+	calls []posterCall
+}
+
+type posterCall struct {
+	entry  Entry
+	result ProcessResult
+}
+
+func (p *fakePoster) PostResult(_ context.Context, e Entry, result ProcessResult) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, posterCall{entry: e, result: result})
+	return p.err
+}
+
 // compile-time assertions for fakes.
 var (
 	_ Storage          = (*fakeStorage)(nil)
 	_ RedisClient      = (*fakeRedis)(nil)
 	_ conflictResolver = (*fakeResolver)(nil)
 	_ lockHandler      = (*fakeLockHandler)(nil)
+	_ ResultPoster     = (*fakePoster)(nil)
 )
 
 // newTestWorker wires a Worker with injectable fakes and an instant sleep.
@@ -623,6 +643,107 @@ func TestWorkerHandleResult(t *testing.T) {
 			}
 			tt.check(t, st, rd)
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ResultPoster bubble-up tests
+// ---------------------------------------------------------------------------
+
+// TestWorkerHandleResultBubblesToPoster verifies handleResult calls
+// ResultPoster.PostResult with the exact Entry + ProcessResult for
+// representative statuses when a poster is wired.
+func TestWorkerHandleResultBubblesToPoster(t *testing.T) {
+	key := Key{OrgID: "org1", RepoID: "owner/repo"}
+	entry := Entry{OrgID: "org1", RepoID: "owner/repo", Proposal: 7, ProposalURL: "https://example/p/7"}
+
+	tests := []struct {
+		name   string
+		cfg    WorkerConfig
+		result ProcessResult
+	}{
+		{
+			name:   "merged bubbles up",
+			cfg:    WorkerConfig{Key: key},
+			result: ProcessResult{Proposal: 7, Status: ProcessMerged},
+		},
+		{
+			name:   "conflict bubbles up",
+			cfg:    WorkerConfig{Key: key},
+			result: ProcessResult{Proposal: 7, Status: ProcessConflict, Message: "conflict in x"},
+		},
+		{
+			name:   "error bubbles up",
+			cfg:    WorkerConfig{Key: key},
+			result: ProcessResult{Proposal: 7, Status: ProcessError, Message: "boom"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newFakeStorage()
+			rd := newFakeRedis()
+			poster := &fakePoster{}
+			w := NewWorker(tt.cfg, WorkerDeps{Storage: st, Redis: rd, ResultPoster: poster})
+			w.now = func() time.Time { return fixedTime }
+
+			if err := w.handleResult(context.Background(), entry, tt.result); err != nil {
+				t.Fatalf("handleResult: %v", err)
+			}
+
+			if len(poster.calls) != 1 {
+				t.Fatalf("PostResult called %d times, want 1", len(poster.calls))
+			}
+			got := poster.calls[0]
+			if got.entry.Proposal != entry.Proposal || got.entry.ProposalURL != entry.ProposalURL {
+				t.Errorf("PostResult entry = %+v, want %+v", got.entry, entry)
+			}
+			if got.result != tt.result {
+				t.Errorf("PostResult result = %+v, want %+v", got.result, tt.result)
+			}
+		})
+	}
+}
+
+// TestWorkerHandleResultNilPosterNoOp verifies a nil poster is a no-op: no
+// panic, queue state still recorded.
+func TestWorkerHandleResultNilPosterNoOp(t *testing.T) {
+	key := Key{OrgID: "org1", RepoID: "owner/repo"}
+	entry := Entry{OrgID: "org1", RepoID: "owner/repo", Proposal: 9}
+	st := newFakeStorage()
+	rd := newFakeRedis()
+	// WorkerDeps.ResultPoster left nil.
+	w := NewWorker(WorkerConfig{Key: key}, WorkerDeps{Storage: st, Redis: rd})
+	w.now = func() time.Time { return fixedTime }
+
+	if err := w.handleResult(context.Background(), entry, ProcessResult{Proposal: 9, Status: ProcessMerged}); err != nil {
+		t.Fatalf("handleResult with nil poster: %v", err)
+	}
+	if len(st.completed) != 1 || st.completed[0] != 9 {
+		t.Errorf("completed = %v, want [9] (queue state recorded despite nil poster)", st.completed)
+	}
+}
+
+// TestWorkerHandleResultPosterErrorSwallowed verifies a poster error is
+// best-effort: it is swallowed (handleResult returns nil) and the queue state
+// is still recorded so the queue advances.
+func TestWorkerHandleResultPosterErrorSwallowed(t *testing.T) {
+	key := Key{OrgID: "org1", RepoID: "owner/repo"}
+	entry := Entry{OrgID: "org1", RepoID: "owner/repo", Proposal: 11}
+	st := newFakeStorage()
+	rd := newFakeRedis()
+	poster := &fakePoster{err: errors.New("tracker down")}
+	w := NewWorker(WorkerConfig{Key: key}, WorkerDeps{Storage: st, Redis: rd, ResultPoster: poster})
+	w.now = func() time.Time { return fixedTime }
+
+	if err := w.handleResult(context.Background(), entry, ProcessResult{Proposal: 11, Status: ProcessMerged}); err != nil {
+		t.Fatalf("handleResult should swallow poster error, got: %v", err)
+	}
+	if len(poster.calls) != 1 {
+		t.Errorf("PostResult called %d times, want 1", len(poster.calls))
+	}
+	if len(st.completed) != 1 || st.completed[0] != 11 {
+		t.Errorf("completed = %v, want [11] (queue advances despite poster error)", st.completed)
 	}
 }
 

@@ -108,11 +108,15 @@ These have real bodies (no stubs) and table-driven `-race` tests:
   hosted merge queue (an external provider's server feature) and does not belong
   in the OSS execution-layer serializer. Left out; documented in `DESIGN.md`.
 - **Issue-tracker / PR-labeler bubble-up hooks.** The TS worker optionally pushed
-  the landing result back to an issue tracker / labeled the PR. The `Entry` is
-  threaded through `handleResult` (see `worker.go` `_ = e`) and the
-  `AcceptedStatus`/`RejectedStatus` config fields exist, but no tracker call is
-  wired. This is a thin add-on for a later stage, not load-bearing for
-  serialization correctness.
+  the landing result back to an issue tracker / labeled the PR. The extension
+  point now exists: `WorkerDeps.ResultPoster` (a `ResultPoster` interface with a
+  single `PostResult(ctx, Entry, ProcessResult)` method) is called best-effort
+  from `handleResult` after the queue state is recorded — a poster error is
+  logged and swallowed so the queue still advances. The **concrete
+  implementation lives in the embedding binary** (transport-agnostic by design);
+  with no poster wired (`ResultPoster == nil`) this is a no-op, so it is not
+  load-bearing for serialization correctness. The `AcceptedStatus`/
+  `RejectedStatus` config fields remain available for a poster to consume.
 
 ## Hardening landed (was "Partial / deferred wiring")
 
