@@ -51,22 +51,60 @@ func TestCleanWorktreeState_NoThrowEvenWhenEveryCommandFails(t *testing.T) {
 	}
 }
 
+// TestAddWorktree_PruneBeforeAdd verifies that addWorktree runs
+// "git worktree remove --force" and "git worktree prune" BEFORE the actual
+// "git worktree add". This is the crash-leak recovery path: if a prior run
+// crashed before its defer-remove ran, git retains the stale path registration
+// and a bare "worktree add" at the same deterministic path would fail
+// non-retryably. The prune-before-add clears stale metadata so the subsequent
+// add succeeds even when the path was previously registered.
+func TestAddWorktree_PruneBeforeAdd(t *testing.T) {
+	// Simulate a "stale" worktree by making "worktree add" fail the first
+	// time it runs (as git would when the path is already registered), then
+	// succeed. With the prune-before-add in place, the force-remove + prune
+	// run BEFORE the add, so the add call itself should see a clean state and
+	// succeed (here simulated by the default no-error fake reply).
+	//
+	// We verify the command ordering directly: remove → prune → add.
+	fr := &fakeRunner{}
+	if err := addWorktree(context.Background(), fr, "/repo", "/repo/.wt/p1", "main"); err != nil {
+		t.Fatalf("addWorktree with prune-before-add returned error: %v", err)
+	}
+	got := fr.commandLines()
+	// Expect exactly: [worktree remove --force, worktree prune, worktree add --detach]
+	if len(got) != 3 {
+		t.Fatalf("addWorktree ran %d commands, want 3 (remove + prune + add): %v", len(got), got)
+	}
+	if !strings.Contains(got[0], "worktree remove --force") {
+		t.Errorf("cmd[0] = %q, want worktree remove --force", got[0])
+	}
+	if !strings.Contains(got[1], "worktree prune") {
+		t.Errorf("cmd[1] = %q, want worktree prune", got[1])
+	}
+	if !strings.Contains(got[2], "worktree add --detach") {
+		t.Errorf("cmd[2] = %q, want worktree add --detach", got[2])
+	}
+}
+
 func TestAddWorktree_CommandAndDetach(t *testing.T) {
 	fr := &fakeRunner{}
 	if err := addWorktree(context.Background(), fr, "/repo", "/repo/.wt/p1", "main"); err != nil {
 		t.Fatalf("addWorktree error: %v", err)
 	}
 	got := fr.commandLines()
-	if len(got) != 1 {
-		t.Fatalf("addWorktree ran %d commands, want 1: %v", len(got), got)
+	// addWorktree now runs remove --force + prune before the actual add (D2 prune-before-add).
+	if len(got) != 3 {
+		t.Fatalf("addWorktree ran %d commands, want 3 (remove + prune + add): %v", len(got), got)
 	}
 	want := "git worktree add --detach /repo/.wt/p1 main"
-	if got[0] != want {
-		t.Errorf("command = %q, want %q", got[0], want)
+	if got[2] != want {
+		t.Errorf("add command = %q, want %q", got[2], want)
 	}
-	// Must run from the repo root, not the (not-yet-existing) worktree path.
-	if dirs := fr.dirs(); len(dirs) != 1 || dirs[0] != "/repo" {
-		t.Errorf("dir = %v, want [/repo]", dirs)
+	// All commands must run from the repo root, not the worktree path.
+	for i, d := range fr.dirs() {
+		if d != "/repo" {
+			t.Errorf("cmd[%d] dir = %q, want /repo", i, d)
+		}
 	}
 }
 

@@ -111,8 +111,14 @@ func (f *fakeLockHandler) Regenerate(_ context.Context, _ string, _ PackageManag
 type fakeRedis struct {
 	mu     sync.Mutex
 	values map[string]string
-	// setNXFail makes the next SetNX return (false, nil) — simulates a held lock.
+	// lockHeld makes SetNX return (false, nil) — simulates a held lock.
 	lockHeld map[string]bool
+	// expireErr, when non-nil, is returned by ExpireIfMatches.
+	expireErr error
+	// extendCalls counts how many times ExpireIfMatches has been called.
+	extendCalls int
+	// lastExtendTTL is the TTL passed to the most recent ExpireIfMatches call.
+	lastExtendTTL time.Duration
 }
 
 func newFakeRedis() *fakeRedis {
@@ -130,13 +136,6 @@ func (r *fakeRedis) SetNX(_ context.Context, key, value string, _ time.Duration)
 	}
 	r.values[key] = value
 	return true, nil
-}
-
-func (r *fakeRedis) Del(_ context.Context, key string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.values, key)
-	return nil
 }
 
 func (r *fakeRedis) DelIfMatches(_ context.Context, key, value string) (bool, error) {
@@ -163,6 +162,20 @@ func (r *fakeRedis) Set(_ context.Context, key, value string) error {
 }
 
 func (r *fakeRedis) Expire(_ context.Context, _ string, _ time.Duration) error { return nil }
+
+func (r *fakeRedis) ExpireIfMatches(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.extendCalls++
+	r.lastExtendTTL = ttl
+	if r.expireErr != nil {
+		return false, r.expireErr
+	}
+	if r.values[key] != value {
+		return false, nil
+	}
+	return true, nil
+}
 
 func (r *fakeRedis) setMarker(key string) {
 	r.mu.Lock()
@@ -689,4 +702,115 @@ func TestErrReplyHelper(t *testing.T) {
 		t.Errorf("expected (ok,nil), got (%q,%v)", out, err)
 	}
 	_ = errors.New("") // keep errors import used if helper changes
+}
+
+// ---------------------------------------------------------------------------
+// heartbeatExtend tests
+// ---------------------------------------------------------------------------
+
+func TestHeartbeatExtend(t *testing.T) {
+	const key = "landing:org1:owner/repo:lock"
+	const ttl = lockTTL
+
+	tests := []struct {
+		name      string
+		stored    string // value stored in fakeRedis before the call; "" means key absent
+		token     string // token passed to heartbeatExtend
+		expireErr error  // if set, fakeRedis returns this error from ExpireIfMatches
+		wantMatch bool
+		wantErr   bool
+		// assertRedis verifies observable side-effects in the fake after the call.
+		assertRedis func(t *testing.T, rd *fakeRedis)
+	}{
+		{
+			name:      "lock held by our token → matched and TTL refreshed",
+			stored:    "mytoken",
+			token:     "mytoken",
+			wantMatch: true,
+			assertRedis: func(t *testing.T, rd *fakeRedis) {
+				rd.mu.Lock()
+				calls := rd.extendCalls
+				gotTTL := rd.lastExtendTTL
+				rd.mu.Unlock()
+				if calls != 1 {
+					t.Errorf("ExpireIfMatches called %d times, want 1", calls)
+				}
+				if gotTTL != ttl {
+					t.Errorf("TTL passed = %v, want %v", gotTTL, ttl)
+				}
+			},
+		},
+		{
+			name:      "lock held by different token → not matched, no panic",
+			stored:    "othertoken",
+			token:     "mytoken",
+			wantMatch: false,
+			assertRedis: func(t *testing.T, rd *fakeRedis) {
+				rd.mu.Lock()
+				calls := rd.extendCalls
+				rd.mu.Unlock()
+				if calls != 1 {
+					t.Errorf("ExpireIfMatches called %d times, want 1", calls)
+				}
+			},
+		},
+		{
+			name:      "lock absent → not matched, no panic",
+			stored:    "",
+			token:     "mytoken",
+			wantMatch: false,
+			assertRedis: func(t *testing.T, rd *fakeRedis) {
+				rd.mu.Lock()
+				calls := rd.extendCalls
+				rd.mu.Unlock()
+				if calls != 1 {
+					t.Errorf("ExpireIfMatches called %d times, want 1", calls)
+				}
+			},
+		},
+		{
+			name:      "redis error → error propagated",
+			stored:    "mytoken",
+			token:     "mytoken",
+			expireErr: errors.New("connection refused"),
+			wantMatch: false,
+			wantErr:   true,
+			assertRedis: func(t *testing.T, rd *fakeRedis) {
+				rd.mu.Lock()
+				calls := rd.extendCalls
+				rd.mu.Unlock()
+				if calls != 1 {
+					t.Errorf("ExpireIfMatches called %d times, want 1", calls)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rd := newFakeRedis()
+			if tt.stored != "" {
+				rd.values[key] = tt.stored
+			}
+			rd.expireErr = tt.expireErr
+
+			matched, err := heartbeatExtend(context.Background(), rd, key, tt.token, ttl)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("heartbeatExtend: expected error, got nil")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("heartbeatExtend: unexpected error: %v", err)
+				}
+			}
+			if matched != tt.wantMatch {
+				t.Errorf("matched = %v, want %v", matched, tt.wantMatch)
+			}
+			if tt.assertRedis != nil {
+				tt.assertRedis(t, rd)
+			}
+		})
+	}
 }

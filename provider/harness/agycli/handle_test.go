@@ -26,7 +26,14 @@ func newFakeProvider(t *testing.T, script string, opts Options) *Provider {
 	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-agy")
-	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o755); err != nil { //nolint:gosec // test fixture
+	// Write WITHOUT the exec bit, then chmod-add it after close.
+	// Linux can throw ETXTBSY on fork+exec when a writable FD is open on an
+	// executable inode — writing 0o600 then chmodding to 0o755 post-close
+	// means the file never carries the exec bit while any writable FD exists.
+	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o600); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
 		t.Fatal(err)
 	}
 	opts.Binary = bin
