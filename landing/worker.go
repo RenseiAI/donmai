@@ -121,8 +121,6 @@ type RedisClient interface {
 	// SetNX sets key=value with a TTL only if it does not already exist,
 	// returning whether it was set.
 	SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
-	// Del deletes a key.
-	Del(ctx context.Context, key string) error
 	// DelIfMatches atomically deletes key only if its current value equals value,
 	// returning whether it deleted. This is the compare-and-delete used to release
 	// the coordinator lock: an unconditional Del could free a DIFFERENT worker's
@@ -135,6 +133,12 @@ type RedisClient interface {
 	Set(ctx context.Context, key, value string) error
 	// Expire sets a TTL on a key.
 	Expire(ctx context.Context, key string, ttl time.Duration) error
+	// ExpireIfMatches atomically extends the TTL of key only when its current
+	// value equals the caller's token, returning whether the extension took
+	// effect. Used by heartbeat loops to avoid extending a lock that this
+	// instance no longer owns (TOCTOU guard). Backed by a Lua script so the
+	// check and the PEXPIRE run in a single Redis round trip.
+	ExpireIfMatches(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 }
 
 // WorkerDeps are the injected dependencies of a Worker.
@@ -248,7 +252,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	w.running = true
-	stopHeartbeat := w.startHeartbeat(ctx, lockKey)
+	stopHeartbeat := w.startHeartbeat(ctx, lockKey, lockToken)
 	defer func() {
 		stopHeartbeat()
 		// Release the lock on shutdown via compare-and-delete so we never free a
@@ -526,10 +530,20 @@ func (w *Worker) markRecentlyMerged(ctx context.Context, proposal int) {
 	}
 }
 
+// heartbeatExtend is the per-tick extend action shared by Worker and Pool
+// heartbeat loops. It calls ExpireIfMatches with the caller's lock token so the
+// TTL is only refreshed when this instance still holds the lock. Returns the
+// matched bool and any Redis error. Callers are responsible for logging.
+func heartbeatExtend(ctx context.Context, rc RedisClient, key, token string, ttl time.Duration) (bool, error) {
+	return rc.ExpireIfMatches(ctx, key, token, ttl)
+}
+
 // startHeartbeat extends the lock TTL on an interval until the returned stop
 // func is called. The interval ticker is owned by a goroutine that exits on stop
-// or ctx cancellation.
-func (w *Worker) startHeartbeat(ctx context.Context, lockKey string) func() {
+// or ctx cancellation. lockToken is the value stored under lockKey: the
+// extension is a compare-and-extend (ExpireIfMatches) so we never refresh a
+// lock another worker re-acquired after ours expired.
+func (w *Worker) startHeartbeat(ctx context.Context, lockKey, lockToken string) func() {
 	ticker := time.NewTicker(heartbeatInterval)
 	done := make(chan struct{})
 	go func() {
@@ -542,8 +556,11 @@ func (w *Worker) startHeartbeat(ctx context.Context, lockKey string) func() {
 				ticker.Stop()
 				return
 			case <-ticker.C:
-				if err := w.deps.Redis.Expire(ctx, lockKey, lockTTL); err != nil {
+				matched, err := heartbeatExtend(ctx, w.deps.Redis, lockKey, lockToken, lockTTL)
+				if err != nil {
 					slog.Debug("landing worker: heartbeat expire failed", "key", lockKey, "err", err)
+				} else if !matched {
+					slog.Warn("landing worker: lock lost — heartbeat will stop extending", "key", lockKey)
 				}
 			}
 		}
@@ -603,13 +620,6 @@ func (a *redisClientAdapter) SetNX(ctx context.Context, key, value string, ttl t
 	return ok, nil
 }
 
-func (a *redisClientAdapter) Del(ctx context.Context, key string) error {
-	if err := a.rdb.Del(ctx, key).Err(); err != nil {
-		return fmt.Errorf("redis del %s: %w", key, err)
-	}
-	return nil
-}
-
 // delIfMatchesScript is the atomic compare-and-delete: delete the key only if its
 // value matches the caller's token. Returns 1 if deleted, 0 otherwise. The check
 // and delete run in one Redis round trip so they cannot interleave with another
@@ -626,6 +636,26 @@ func (a *redisClientAdapter) DelIfMatches(ctx context.Context, key, value string
 	res, err := delIfMatchesScript.Run(ctx, a.rdb, []string{key}, value).Int64()
 	if err != nil {
 		return false, fmt.Errorf("redis compare-and-delete %s: %w", key, err)
+	}
+	return res == 1, nil
+}
+
+// expireIfMatchesScript atomically extends the TTL of a key only when its
+// current value matches the caller's token. Returns 1 if the PEXPIRE was
+// applied, 0 otherwise. ARGV[2] is the TTL in milliseconds so sub-second
+// precision is preserved (matching PEXPIRE semantics).
+var expireIfMatchesScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+else
+	return 0
+end
+`)
+
+func (a *redisClientAdapter) ExpireIfMatches(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	res, err := expireIfMatchesScript.Run(ctx, a.rdb, []string{key}, value, ttl.Milliseconds()).Int64()
+	if err != nil {
+		return false, fmt.Errorf("redis compare-and-expire %s: %w", key, err)
 	}
 	return res == 1, nil
 }
