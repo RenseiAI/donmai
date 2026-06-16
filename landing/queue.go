@@ -42,8 +42,15 @@ func (k Key) Valid() bool {
 }
 
 // queueKey is the sorted-set key holding queued proposal numbers (score =
-// priority + fractional enqueue time).
+// priority + fractional enqueue sequence).
 func (k Key) queueKey() string { return k.String() + ":queue" }
+
+// seqKey is the monotonic enqueue-sequence counter. Each Enqueue does an INCR on
+// it to obtain a strictly increasing tiebreaker, so two proposals enqueued at the
+// same priority within the same nanosecond still order FIFO — a guarantee the
+// previous wall-clock-fraction score could not make once a float64 mantissa ran
+// out of precision for sub-second timestamps.
+func (k Key) seqKey() string { return k.String() + ":seq" }
 
 // entryKey is the hash key holding a single proposal's metadata.
 func (k Key) entryKey(proposal int) string {
@@ -136,36 +143,44 @@ type Storage interface {
 // it does not need to live forever and an unbounded key set is a leak.
 const DefaultReasonTTL = 24 * time.Hour
 
-// enqueueEpoch anchors the fractional tie-breaker so the encoded nanosecond
-// offset stays small enough to survive a float64 mantissa without losing
-// ordering precision among entries enqueued seconds apart. Any fixed past
-// instant works; this one is arbitrary and stable.
-var enqueueEpoch = time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
-
-// encodeScore packs (priority, enqueuedAt) into a single sorted-set score so the
-// queue orders by priority ascending (lower priority value = higher precedence),
-// breaking ties by enqueue time (FIFO). The fractional part is the seconds since
-// enqueueEpoch scaled into (0,1) so it never bleeds into the next integer
-// priority band: two entries with the same priority order by enqueue time, but
-// an entry with a lower priority always sorts ahead of a higher one regardless
-// of time.
+// encodeScore packs (priority, seq) into a single sorted-set score so the queue
+// orders by priority ascending (lower priority value = higher precedence),
+// breaking ties by enqueue order (FIFO). The tiebreaker is a strictly increasing
+// per-key sequence number (a Redis INCR, not a timestamp), mapped through
+// seq/(1+seq) into [0,1) so it never bleeds into the next integer priority band:
+// two entries with the same priority order by enqueue sequence, but an entry with
+// a lower priority always sorts ahead of a higher one regardless of sequence.
 //
-// This mirrors the legacy "lower = higher priority; ties by enqueue time"
+// Using a monotonic integer sequence instead of a wall-clock fraction fixes the
+// sub-second FIFO defect: float64 cannot resolve fine-grained nanosecond
+// timestamps within a priority band, so several proposals enqueued in the same
+// second could collide on one score and lose FIFO ordering. A small, strictly
+// increasing seq (0, 1, 2, …) is exactly representable and is strictly monotonic
+// under seq/(1+seq) for every distinct seq, so same-priority entries always
+// dequeue in enqueue order.
+//
+// This mirrors the legacy "lower = higher priority; ties by enqueue order"
 // intent of the server-side queue while keeping a single Redis ZSET score.
-func encodeScore(priority int, enqueuedAt time.Time) float64 {
-	// Seconds since the epoch, mapped through 1/(1+x) into (0,1] so older
-	// entries (smaller x) get a larger fraction... we want OLDER first, so use
-	// x/(1+x) which is monotonic increasing in x and bounded in [0,1): a larger
-	// elapsed time yields a larger fraction. To keep FIFO (older first) we want
-	// the older entry to have the SMALLER score, so subtract from 1.
-	secs := enqueuedAt.Sub(enqueueEpoch).Seconds()
-	if secs < 0 {
-		secs = 0
+func encodeScore(priority int, seq int64) float64 {
+	if seq < 0 {
+		seq = 0
 	}
-	frac := secs / (1 + secs) // in [0,1); monotonic increasing in secs
-	// Older (smaller secs) → smaller frac → smaller score → dequeued first. FIFO.
+	frac := float64(seq) / (1 + float64(seq)) // in [0,1); strictly increasing in seq
+	// Guard the float64 edge: once seq is large enough that 1+seq rounds back to
+	// seq, frac would evaluate to exactly 1.0 and bleed into the next priority
+	// band. Clamp strictly below 1 so the priority integer part is always
+	// authoritative. The clamp ceiling is far above any realistic queue depth, so
+	// it never affects FIFO ordering in practice.
+	if frac >= maxScoreFrac {
+		frac = maxScoreFrac
+	}
+	// Earlier (smaller seq) → smaller frac → smaller score → dequeued first. FIFO.
 	return float64(priority) + frac
 }
+
+// maxScoreFrac is the largest fractional tiebreaker, kept strictly below 1 so an
+// entry can never sort into the next integer priority band regardless of seq.
+const maxScoreFrac = 0.9999999999
 
 // RedisStorage is the Redis sorted-set implementation of Storage. The queue is a
 // sorted set per (orgId, repoId); per-proposal metadata lives in sibling hashes.
@@ -248,17 +263,27 @@ func (s *RedisStorage) Enqueue(ctx context.Context, e Entry) error {
 	}
 	member := strconv.Itoa(e.Proposal)
 
+	// A strictly increasing per-key sequence is the FIFO tiebreaker. INCR is
+	// atomic, so concurrent enqueues at the same priority still get distinct,
+	// strictly ordered sequence numbers — no sub-second float collision.
+	seq, err := s.rdb.Incr(ctx, key.seqKey()).Result()
+	if err != nil {
+		return fmt.Errorf("RedisStorage.Enqueue incr seq %s: %w", key.seqKey(), err)
+	}
+
 	// Skip if already queued (NX on the ZADD), then write metadata. ZADD NX
 	// returns the number of NEW members added (0 when it already existed).
 	added, err := s.rdb.ZAddNX(ctx, key.queueKey(), redis.Z{
-		Score:  encodeScore(e.Priority, e.EnqueuedAt),
+		Score:  encodeScore(e.Priority, seq),
 		Member: member,
 	}).Result()
 	if err != nil {
 		return fmt.Errorf("RedisStorage.Enqueue zadd %s: %w", key.queueKey(), err)
 	}
 	if added == 0 {
-		// Already queued — leave the existing entry untouched.
+		// Already queued — leave the existing entry untouched. The INCR above
+		// consumed a sequence number for a no-op enqueue; that is harmless (the
+		// counter only needs to be strictly increasing, not gap-free).
 		return nil
 	}
 	if err := s.rdb.HSet(ctx, key.entryKey(e.Proposal), entryFields(e)).Err(); err != nil {

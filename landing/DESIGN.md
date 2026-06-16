@@ -51,7 +51,7 @@ uses provider-neutral names:
 | `merge-queue/strategies/rebase-strategy.ts`     | `landing/strategies/rebase.go`           | git rebase onto target |
 | `merge-queue/strategies/merge-commit-strategy.ts` | `landing/strategies/mergecommit.go`    | git merge --no-ff |
 | `merge-queue/strategies/squash-strategy.ts`     | `landing/strategies/squash.go`           | git merge --squash |
-| `merge-queue/strategies/worktree-cleanup.ts`    | `landing/strategies/worktree.go`         | git worktree add/remove helpers |
+| `merge-queue/strategies/worktree-cleanup.ts`    | `landing/strategies/worktree.go`         | `CleanWorktreeState` + `AddWorktree`/`RemoveWorktree` (git worktree add --detach / remove --force) lifecycle helpers |
 | `merge-queue/adapters/local.ts` (storage iface) | `landing/queue.go`                       | Redis sorted-set storage |
 | `merge-queue/adapters/local.ts` (gh eligibility)| `landing/queue.go` (`extractIssueID`)    | issue-id extraction (pure, ported) |
 | `merge-queue/adapters/github-native.ts`         | (not ported — GitHub-native queue)       | external provider; out of scope for FD-4 stage 1 |
@@ -234,13 +234,42 @@ Rationale for org+repo (not just org, not a hash):
 ## Redis storage shape (queue.go)
 
 The queue is a Redis **sorted set** per `(orgId, repoId)`, score = priority
-(lower = higher priority; ties broken by enqueue time encoded into the score's
-fractional part). Members are proposal numbers. Per-proposal metadata
-(`Entry`) lives in a sibling hash so the sorted set stays small and
-`PeekAll`/`Position` are cheap. `DequeueBatch` uses a `MULTI/EXEC` transaction to
-remove a set of proposals atomically (so the `Pool` never double-dispatches a
-proposal across concurrent coordinators). All operations take a `context.Context`
-for cancellation/deadlines.
+(lower = higher priority; ties broken by enqueue order encoded into the score's
+fractional part). The tiebreaker is a strictly increasing per-key sequence
+number (a Redis `INCR` on `landing:<orgId>:<repoId>:seq`), **not** a wall-clock
+timestamp: a float64 score cannot resolve fine-grained sub-second timestamps, so
+several proposals enqueued in the same second at one priority could collide on a
+single score and lose FIFO ordering. A small monotonic integer sequence is
+exactly representable and strictly increasing under `seq/(1+seq)`, which is
+clamped strictly below 1 so it never bleeds into the next integer priority band.
+Members are proposal numbers. Per-proposal metadata (`Entry`) lives in a sibling
+hash so the sorted set stays small and `PeekAll`/`Position` are cheap.
+`DequeueBatch` uses a `MULTI/EXEC` transaction to remove a set of proposals
+atomically (so the `Pool` never double-dispatches a proposal across concurrent
+coordinators). All operations take a `context.Context` for cancellation/deadlines.
+
+### Coordinator lock release (compare-and-delete)
+
+The single-instance coordinator lock (`landing:<orgId>:<repoId>:lock`) is
+acquired with a unique per-`Start` token and released by **compare-and-delete**:
+an atomic Lua `GET == token then DEL` (`RedisClient.DelIfMatches`). An
+unconditional `DEL` could free a *different* worker's lock — if this worker's
+lock TTL expired and another worker re-acquired it, an unconditional release on
+shutdown would delete the new holder's lock. Comparing the stored token to this
+worker's own token before deleting closes that race; both `Worker.Start` and
+`Pool.Start` use it.
+
+### Per-proposal dedicated worktree (concurrent landing isolation)
+
+When `Concurrency > 1`, the `Pool` lands non-conflicting proposals in parallel.
+Each in-flight batch member runs the landing strategy in its **own** dedicated
+git worktree (`strategies.AddWorktree` → `git worktree add --detach`; torn down
+by `strategies.RemoveWorktree` → `git worktree remove --force` in a `defer`).
+Sharing one working tree across parallel proposals would let them clobber each
+other's index, checkout, and lock-file regeneration. `--detach` lets two
+worktrees start from the same target branch without git's "branch already checked
+out" guard. The single-flight (`Concurrency <= 1`) path delegates to a `Worker`
+that runs directly in `RepoPath` (`WorkerConfig.WorktreePath` empty) — unchanged.
 
 ## Build-out history
 
@@ -256,11 +285,12 @@ was removed because nothing returns it.
 Real, fully-ported and table-driven `-race`-tested:
 
 - `queue.go` `RedisStorage` — Redis sorted-set queue per `(orgId, repoId)`.
-  Score packs `(priority, enqueuedAt)` into one float so the queue orders by
-  priority ascending (lower = higher precedence), FIFO on ties; the fractional
-  tie-breaker is bounded in `[0,1)` so it never bleeds into the next priority
-  band (`encodeScore`). Per-proposal metadata lives in a sibling hash so the
-  ZSET stays small. `DequeueBatch` runs ZREM+DEL in a `MULTI/EXEC` pipeline and
+  Score packs `(priority, seq)` into one float so the queue orders by priority
+  ascending (lower = higher precedence), FIFO on ties; the tie-breaker is a
+  strictly increasing per-key `INCR` sequence (not a timestamp) mapped through
+  `seq/(1+seq)` and clamped strictly below 1 so it never bleeds into the next
+  priority band (`encodeScore`). Per-proposal metadata lives in a sibling hash so
+  the ZSET stays small. `DequeueBatch` runs ZREM+DEL in a `MULTI/EXEC` pipeline and
   returns only the proposals whose ZREM reported a removal — so concurrent
   coordinators never double-dispatch. Every method validates the key first
   (`validateKey`) so an unscoped key can never silently share tenant state.

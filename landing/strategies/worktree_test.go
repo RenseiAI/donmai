@@ -51,6 +51,63 @@ func TestCleanWorktreeState_NoThrowEvenWhenEveryCommandFails(t *testing.T) {
 	}
 }
 
+func TestAddWorktree_CommandAndDetach(t *testing.T) {
+	fr := &fakeRunner{}
+	if err := addWorktree(context.Background(), fr, "/repo", "/repo/.wt/p1", "main"); err != nil {
+		t.Fatalf("addWorktree error: %v", err)
+	}
+	got := fr.commandLines()
+	if len(got) != 1 {
+		t.Fatalf("addWorktree ran %d commands, want 1: %v", len(got), got)
+	}
+	want := "git worktree add --detach /repo/.wt/p1 main"
+	if got[0] != want {
+		t.Errorf("command = %q, want %q", got[0], want)
+	}
+	// Must run from the repo root, not the (not-yet-existing) worktree path.
+	if dirs := fr.dirs(); len(dirs) != 1 || dirs[0] != "/repo" {
+		t.Errorf("dir = %v, want [/repo]", dirs)
+	}
+}
+
+func TestAddWorktree_PropagatesError(t *testing.T) {
+	fr := &fakeRunner{reply: func(string, []string) (string, error) {
+		return "", errors.New("fatal: invalid reference")
+	}}
+	err := addWorktree(context.Background(), fr, "/repo", "/repo/.wt/p1", "main")
+	if err == nil {
+		t.Fatal("addWorktree should return an error when git fails")
+	}
+	if !strings.Contains(err.Error(), "git worktree add") {
+		t.Errorf("error = %v, want it to wrap the git worktree add failure", err)
+	}
+}
+
+func TestRemoveWorktree_CommandAndForce(t *testing.T) {
+	fr := &fakeRunner{}
+	if err := removeWorktree(context.Background(), fr, "/repo", "/repo/.wt/p1"); err != nil {
+		t.Fatalf("removeWorktree error: %v", err)
+	}
+	got := fr.commandLines()
+	if len(got) != 1 {
+		t.Fatalf("removeWorktree ran %d commands, want 1: %v", len(got), got)
+	}
+	// --force because a failed landing may leave staged/untracked changes.
+	want := "git worktree remove --force /repo/.wt/p1"
+	if got[0] != want {
+		t.Errorf("command = %q, want %q", got[0], want)
+	}
+}
+
+func TestRemoveWorktree_PropagatesError(t *testing.T) {
+	fr := &fakeRunner{reply: func(string, []string) (string, error) {
+		return "", errors.New("fatal: not a working tree")
+	}}
+	if err := removeWorktree(context.Background(), fr, "/repo", "/repo/.wt/p1"); err == nil {
+		t.Fatal("removeWorktree should return an error when git fails")
+	}
+}
+
 func TestCleanWorktreeState_NeverUsesCleanX(t *testing.T) {
 	fr := &fakeRunner{}
 	if err := cleanWorktreeState(context.Background(), fr, "/worktree"); err != nil {
