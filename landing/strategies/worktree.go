@@ -60,6 +60,14 @@ func AddWorktree(ctx context.Context, repoPath, worktreePath, targetBranch strin
 
 // addWorktree is the runner-injectable implementation.
 func addWorktree(ctx context.Context, r commandRunner, repoPath, worktreePath, targetBranch string) error {
+	// Prune before add: if a previous run crashed after creating the worktree
+	// but before the defer-remove could run, the path is still registered in
+	// git's worktree list and "git worktree add" will refuse to reuse it.
+	// Force-remove the stale registration first (ignored when absent), then
+	// prune dangling metadata, so the subsequent add always starts clean.
+	_, _ = r.run(ctx, repoPath, nil, "git", "worktree", "remove", "--force", worktreePath)
+	_, _ = r.run(ctx, repoPath, nil, "git", "worktree", "prune")
+
 	if _, err := r.run(ctx, repoPath, nil, "git", "worktree", "add", "--detach", worktreePath, targetBranch); err != nil {
 		return fmt.Errorf("git worktree add %s: %w", worktreePath, err)
 	}

@@ -130,7 +130,7 @@ func (p *Pool) Start(ctx context.Context) error {
 	}
 
 	p.running = true
-	stopHeartbeat := p.startHeartbeat(ctx, lockKey)
+	stopHeartbeat := p.startHeartbeat(ctx, lockKey, lockToken)
 	defer func() {
 		stopHeartbeat()
 		if _, delErr := p.deps.Redis.DelIfMatches(context.WithoutCancel(ctx), lockKey, lockToken); delErr != nil {
@@ -297,8 +297,10 @@ func sanitizeRepoID(repoID string) string {
 }
 
 // startHeartbeat extends the lock TTL on an interval until the returned stop
-// func is called.
-func (p *Pool) startHeartbeat(ctx context.Context, lockKey string) func() {
+// func is called. lockToken is the value stored under lockKey: the extension
+// is a compare-and-extend (heartbeatExtend) so we never refresh a lock another
+// coordinator re-acquired after ours expired.
+func (p *Pool) startHeartbeat(ctx context.Context, lockKey, lockToken string) func() {
 	ticker := time.NewTicker(heartbeatInterval)
 	done := make(chan struct{})
 	go func() {
@@ -311,8 +313,11 @@ func (p *Pool) startHeartbeat(ctx context.Context, lockKey string) func() {
 				ticker.Stop()
 				return
 			case <-ticker.C:
-				if err := p.deps.Redis.Expire(ctx, lockKey, lockTTL); err != nil {
+				matched, err := heartbeatExtend(ctx, p.deps.Redis, lockKey, lockToken, lockTTL)
+				if err != nil {
 					slog.Debug("landing pool: heartbeat expire failed", "key", lockKey, "err", err)
+				} else if !matched {
+					slog.Warn("landing pool: lock lost — heartbeat will stop extending", "key", lockKey)
 				}
 			}
 		}
