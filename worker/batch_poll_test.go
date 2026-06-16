@@ -53,6 +53,7 @@ func TestPollResponse_DecodesBatchWork(t *testing.T) {
 // TestPollLoopWithBatch_LaneIsolation is the core isolation guarantee: a batch
 // item is routed to the batch handler and NEVER to the agent handler, and an
 // agent item is routed to the agent handler and NEVER to the batch handler.
+// It also verifies that a landingWork item flows through batchHandler (same mux).
 func TestPollLoopWithBatch_LaneIsolation(t *testing.T) {
 	var served atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -69,6 +70,11 @@ func TestPollLoopWithBatch_LaneIsolation(t *testing.T) {
 				WorkType:   "code-survival-scan",
 				Raw:        json.RawMessage(`{"batchJobId":"batch:due_checkpoint:1","workType":"code-survival-scan"}`),
 			}},
+			LandingWork: []BatchWorkItem{{
+				BatchJobID: "landing:claim:99",
+				WorkType:   "landing-claim",
+				Raw:        json.RawMessage(`{"batchJobId":"landing:claim:99","workType":"landing-claim"}`),
+			}},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
@@ -82,7 +88,7 @@ func TestPollLoopWithBatch_LaneIsolation(t *testing.T) {
 	agentHandler := func(item WorkItem) error {
 		agentItems = append(agentItems, item.ID)
 		// An agent handler must NEVER receive a batch job id.
-		if item.ID == "batch:due_checkpoint:1" {
+		if item.ID == "batch:due_checkpoint:1" || item.ID == "landing:claim:99" {
 			agentSawBatch.Store(true)
 		}
 		return nil
@@ -103,14 +109,77 @@ func TestPollLoopWithBatch_LaneIsolation(t *testing.T) {
 	if len(agentItems) == 0 || agentItems[0] != "wi_agent" {
 		t.Errorf("agent lane = %v, want [wi_agent]", agentItems)
 	}
-	if len(batchItems) == 0 || batchItems[0] != "batch:due_checkpoint:1" {
-		t.Errorf("batch lane = %v, want [batch:due_checkpoint:1]", batchItems)
+	if len(batchItems) < 2 {
+		t.Fatalf("batch lane = %v, want at least 2 items (batchWork + landingWork)", batchItems)
+	}
+	var sawBatchWork, sawLandingWork bool
+	for _, id := range batchItems {
+		switch id {
+		case "batch:due_checkpoint:1":
+			sawBatchWork = true
+		case "landing:claim:99":
+			sawLandingWork = true
+		}
+	}
+	if !sawBatchWork {
+		t.Errorf("batch lane missing batchWork item: %v", batchItems)
+	}
+	if !sawLandingWork {
+		t.Errorf("batch lane missing landingWork item: %v", batchItems)
 	}
 	if agentSawBatch.Load() {
 		t.Error("ISOLATION VIOLATION: agent handler received a batch item")
 	}
 	if batchSawAgent.Load() {
 		t.Error("ISOLATION VIOLATION: batch handler received an agent item")
+	}
+}
+
+// TestPollLoopWithBatch_LandingWorkDispatched verifies that landingWork[] items
+// are routed through batchHandler exactly like batchWork[] and kgExtractWork[]
+// items — sharing the same workType-mux, never touching the agent lane.
+func TestPollLoopWithBatch_LandingWorkDispatched(t *testing.T) {
+	var served atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if served.Swap(true) {
+			_ = json.NewEncoder(w).Encode(PollResponse{})
+			return
+		}
+		resp := PollResponse{
+			LandingWork: []BatchWorkItem{{
+				BatchJobID: "landing:claim:42",
+				WorkType:   "landing-claim",
+				Raw:        json.RawMessage(`{"batchJobId":"landing:claim:42","workType":"landing-claim","orgId":"org-x"}`),
+			}},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newRegisteredClient(srv)
+
+	var batchItems []string
+	var agentCalls atomic.Int32
+
+	agentHandler := func(_ WorkItem) error {
+		agentCalls.Add(1)
+		return nil
+	}
+	batchHandler := func(_ context.Context, item BatchWorkItem) error {
+		batchItems = append(batchItems, item.BatchJobID)
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_ = c.PollLoopWithBatch(ctx, 10*time.Millisecond, agentHandler, batchHandler)
+
+	if len(batchItems) == 0 || batchItems[0] != "landing:claim:42" {
+		t.Errorf("landing lane = %v, want [landing:claim:42]", batchItems)
+	}
+	if agentCalls.Load() != 0 {
+		t.Errorf("ISOLATION VIOLATION: agent handler called %d times, want 0", agentCalls.Load())
 	}
 }
 
