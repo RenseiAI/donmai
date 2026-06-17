@@ -997,3 +997,177 @@ func TestCallNackEndpoint_RejectsMissingArgs(t *testing.T) {
 		})
 	}
 }
+
+// TestPollService_RoutesLandingWork verifies that the per-(orgId,repoId)
+// landing-trigger lane (`landingWork[]`) is decoded and routed through OnWork
+// as a synthesized LandingWorkType item — the gap this change closes (the
+// orchestrator emitted landingWork[] but the daemon decoded only work[], so
+// triggers were dropped and the per-tenant serializer never started).
+//
+// Cases:
+//   - a body with landingWork[] → OnWork called once per item with
+//     WorkType==LandingWorkType and the right OrganizationID/Repository;
+//   - absent/empty landingWork → zero extra OnWork calls (inert);
+//   - malformed items (missing orgId or repoId) → skipped, no OnWork call.
+func TestPollService_RoutesLandingWork(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		want    []PollWorkItem // expected OnWork items, in order
+		wantLen int
+	}{
+		{
+			name: "single landing trigger routed",
+			body: `{
+				"work": [],
+				"landingWork": [{
+					"batchJobId": "batch:landing:org_1:foo/bar",
+					"workType": "landing-run",
+					"contractVersion": 1,
+					"orgId": "org_1",
+					"repoId": "foo/bar"
+				}]
+			}`,
+			want: []PollWorkItem{
+				{WorkType: LandingWorkType, OrganizationID: "org_1", Repository: "foo/bar"},
+			},
+			wantLen: 1,
+		},
+		{
+			name: "multiple landing triggers routed",
+			body: `{
+				"landingWork": [
+					{"batchJobId": "b1", "workType": "landing-run", "contractVersion": "1", "orgId": "org_a", "repoId": "a/one"},
+					{"batchJobId": "b2", "workType": "landing-run", "contractVersion": 1, "orgId": "org_b", "repoId": "b/two"}
+				]
+			}`,
+			want: []PollWorkItem{
+				{WorkType: LandingWorkType, OrganizationID: "org_a", Repository: "a/one"},
+				{WorkType: LandingWorkType, OrganizationID: "org_b", Repository: "b/two"},
+			},
+			wantLen: 2,
+		},
+		{
+			name:    "absent landingWork is inert",
+			body:    `{"work": []}`,
+			want:    nil,
+			wantLen: 0,
+		},
+		{
+			name:    "empty landingWork is inert",
+			body:    `{"work": [], "landingWork": []}`,
+			want:    nil,
+			wantLen: 0,
+		},
+		{
+			name: "missing orgId is skipped",
+			body: `{
+				"landingWork": [{"batchJobId": "b", "workType": "landing-run", "repoId": "foo/bar"}]
+			}`,
+			want:    nil,
+			wantLen: 0,
+		},
+		{
+			name: "missing repoId is skipped",
+			body: `{
+				"landingWork": [{"batchJobId": "b", "workType": "landing-run", "orgId": "org_1"}]
+			}`,
+			want:    nil,
+			wantLen: 0,
+		},
+		{
+			name: "valid trigger routed even when one sibling is malformed",
+			body: `{
+				"landingWork": [
+					{"batchJobId": "b1", "workType": "landing-run", "orgId": "", "repoId": "x/y"},
+					{"batchJobId": "b2", "workType": "landing-run", "orgId": "org_ok", "repoId": "ok/repo"}
+				]
+			}`,
+			want: []PollWorkItem{
+				{WorkType: LandingWorkType, OrganizationID: "org_ok", Repository: "ok/repo"},
+			},
+			wantLen: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+
+			var got []PollWorkItem
+			p := NewPollService(PollOptions{
+				WorkerID:        "wkr_landing",
+				OrchestratorURL: srv.URL,
+				RuntimeJWT:      "rt",
+				IntervalSeconds: 1,
+				OnWork: func(item PollWorkItem) error {
+					got = append(got, item)
+					return nil
+				},
+			})
+			// Drive a single synchronous poll so the assertion is deterministic
+			// (no ticker timing). pollOnce decodes the body and routes both
+			// work[] and landingWork[].
+			p.pollOnce(context.Background())
+
+			if len(got) != tc.wantLen {
+				t.Fatalf("OnWork called %d times; want %d (items=%+v)", len(got), tc.wantLen, got)
+			}
+			for i, w := range tc.want {
+				if got[i].WorkType != w.WorkType {
+					t.Errorf("item[%d].WorkType = %q, want %q", i, got[i].WorkType, w.WorkType)
+				}
+				if got[i].OrganizationID != w.OrganizationID {
+					t.Errorf("item[%d].OrganizationID = %q, want %q", i, got[i].OrganizationID, w.OrganizationID)
+				}
+				if got[i].Repository != w.Repository {
+					t.Errorf("item[%d].Repository = %q, want %q", i, got[i].Repository, w.Repository)
+				}
+				if got[i].SessionID != "" {
+					t.Errorf("item[%d].SessionID = %q, want empty (trigger is not a session)", i, got[i].SessionID)
+				}
+			}
+		})
+	}
+}
+
+// TestPollResponse_DecodesLandingWork confirms the wire shape decodes the
+// fields the daemon uses (orgId, repoId, workType, batchJobId) and that an
+// unknown/extra field (contractVersion, as either number or string) is
+// harmlessly ignored — PollResponse does not use DisallowUnknownFields.
+func TestPollResponse_DecodesLandingWork(t *testing.T) {
+	body := []byte(`{
+		"work": [],
+		"landingWork": [{
+			"batchJobId": "batch:landing:org_1:foo/bar",
+			"workType": "landing-run",
+			"contractVersion": 1,
+			"orgId": "org_1",
+			"repoId": "foo/bar"
+		}]
+	}`)
+
+	var resp PollResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode landingWork wire shape: %v", err)
+	}
+	if len(resp.LandingWork) != 1 {
+		t.Fatalf("LandingWork len = %d, want 1", len(resp.LandingWork))
+	}
+	lw := resp.LandingWork[0]
+	if lw.OrgID != "org_1" {
+		t.Errorf("OrgID = %q, want org_1", lw.OrgID)
+	}
+	if lw.RepoID != "foo/bar" {
+		t.Errorf("RepoID = %q, want foo/bar", lw.RepoID)
+	}
+	if lw.WorkType != "landing-run" {
+		t.Errorf("WorkType = %q, want landing-run", lw.WorkType)
+	}
+	if lw.BatchJobID != "batch:landing:org_1:foo/bar" {
+		t.Errorf("BatchJobID = %q", lw.BatchJobID)
+	}
+}
