@@ -155,6 +155,30 @@ type SessionDetail struct {
 	// Mirror of the v0.9.3 SystemPromptOverride fix.
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
 
+	// ── WS5 agent-card → runner fidelity fields ─────────────────────────
+	//
+	// AllowedTools, McpServers, and Skills forward the resolved agent card's
+	// tool-allowlist, MCP servers, and inline skills from PollWorkItem onto
+	// the runner's QueuedWork. The daemon does not interpret them — opaque
+	// forwarders, same pattern as DisallowedTools / SystemPromptOverride.
+	// McpServers/Skills use the daemon-local PollMCPServer / PollSkill mirrors
+	// so the daemon stays free of the runner/prompt/agent packages.
+
+	// AllowedTools forwards the agent-card tool allowlist. When non-empty the
+	// runner uses it verbatim in place of its default allowlist (card is
+	// authoritative). Consumed by runner/spec_translation.go.
+	AllowedTools []string `json:"allowedTools,omitempty"`
+
+	// McpServers forwards the agent-card MCP server set. The runner appends
+	// these to its per-session default MCP set (the platform HTTP gate is
+	// always retained; dedup by name, default wins). Consumed by runner/loop.go.
+	McpServers []PollMCPServer `json:"mcpServers,omitempty"`
+
+	// Skills forwards the agent-card inline skill set. The runner folds each
+	// skill body into SkillAppend after kit skills and unions their
+	// disallowedTools into the disallowed set. Consumed by runner/loop.go.
+	Skills []PollSkill `json:"skills,omitempty"`
+
 	// MemoryBlock forwards the dispatch-time agent-memory context from
 	// PollWorkItem onto the runner's QueuedWork (Wave 3 memory-inject v1).
 	// Consumed by prompt/builder.go, which appends it to the system prompt.

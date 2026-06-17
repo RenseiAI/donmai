@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"log/slog"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -41,6 +42,17 @@ type SpecInputs struct {
 	// Autonomous mirrors the daemon's session-mode flag — true for
 	// agent sessions invoked from the work queue.
 	Autonomous bool
+
+	// Logger is the optional structured logger translateSpec uses to WARN
+	// when it drops a capability-gated field (e.g. the agent card's
+	// AllowedTools on a provider that does not accept a flat allowlist and
+	// has no PermissionConfig bridge). Nil is safe — the warn is skipped.
+	Logger *slog.Logger
+
+	// ProviderName names the resolved provider for the dropped-field WARN
+	// so operators can see which provider dropped the card's allowlist.
+	// Empty is safe.
+	ProviderName string
 }
 
 // translateSpec converts a QueuedWork plus per-session SpecInputs into
@@ -51,6 +63,16 @@ type SpecInputs struct {
 // defensively ignore them. The runner does not error on
 // capability-mismatch — that path runs in the loop's recovery layer.
 func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.Spec {
+	// AllowedTools resolution: the agent card is AUTHORITATIVE when it
+	// supplies an explicit allowlist (WS5) — the runner uses it verbatim in
+	// place of its curated default. When the card sends none, the runner
+	// falls back to defaultAllowedTools() (backward-compatible). The
+	// DisallowedTools floor is applied below regardless.
+	allowedTools := defaultAllowedTools()
+	if len(qw.AllowedTools) > 0 {
+		allowedTools = append([]string(nil), qw.AllowedTools...)
+	}
+
 	spec := agent.Spec{
 		Prompt:             in.Prompt,
 		Cwd:                in.Cwd,
@@ -58,7 +80,7 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		Autonomous:         in.Autonomous,
 		SandboxEnabled:     true,
 		SandboxLevel:       agent.SandboxWorkspaceWrite,
-		AllowedTools:       defaultAllowedTools(),
+		AllowedTools:       allowedTools,
 		DisallowedTools:    defaultDisallowedTools(),
 		MCPServers:         in.MCPServers,
 		Model:              strings.TrimSpace(qw.ResolvedProfile.Model),
@@ -93,14 +115,58 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		spec.MCPServers = nil
 	}
 
-	// AllowedTools: only forward when the provider honours the Spec
-	// field shape (AcceptsAllowedToolsList). Codex routes per-tool
-	// permission through the approval bridge (Spec.PermissionConfig)
-	// and ignores AllowedTools; zero the field to match what the
-	// provider actually consumes. Behaviour is warn-and-ignore in the
-	// loop's spec-prep path: stripped values surface as a Debug log
-	// (see loop.go) so operators can detect silently dropped knobs.
+	// Platform-supplied disallowed-tool patterns (Option B).
+	// Appended AFTER the runner's own defaultDisallowedTools() baseline
+	// so the static floor is never replaced, only extended.
+	// qw.DisallowedTools is the embedded prompt.QueuedWork field stamped
+	// by the platform's stampDisallowedTools() helper (platform PR #196).
+	// Applied BEFORE the AllowedTools gate below so the codex
+	// PermissionConfig bridge sees the full disallowed set.
+	if len(qw.DisallowedTools) > 0 {
+		spec.DisallowedTools = append(spec.DisallowedTools, qw.DisallowedTools...)
+	}
+
+	// AllowedTools: only forward as a flat allowlist when the provider
+	// honours the Spec field shape (AcceptsAllowedToolsList). When it does
+	// not, the field would otherwise be silently zeroed. Two sub-cases:
+	//
+	//   1. Codex — does NOT accept a flat allowlist but DOES consume a
+	//      structured PermissionConfig (NeedsPermissionConfig). Rather than
+	//      drop the card's allow/deny intent, we TRANSLATE it into the
+	//      approval bridge: AllowedTools → PermissionConfig.AllowPatterns and
+	//      the full DisallowedTools set → PermissionConfig.DisallowPatterns.
+	//      The codex approval bridge (provider/harness/codex/approval.go)
+	//      already consumes PermissionConfig, so the card's intent reaches
+	//      the agent instead of being dropped.
+	//
+	//   2. amp / agy-cli — accept neither a flat allowlist NOR a
+	//      PermissionConfig (NeedsPermissionConfig=false). The allowlist has
+	//      nowhere to go, so we drop it — but upgrade the historically
+	//      SILENT zero to a structured WARN naming the dropped field and the
+	//      provider so operators can see the agent card's allowlist did not
+	//      take effect.
 	if !caps.AcceptsAllowedToolsList {
+		if caps.NeedsPermissionConfig {
+			pc := spec.PermissionConfig
+			if pc == nil {
+				pc = &agent.PermissionConfig{}
+			}
+			if len(spec.AllowedTools) > 0 {
+				pc.AllowPatterns = append(pc.AllowPatterns, spec.AllowedTools...)
+			}
+			if len(spec.DisallowedTools) > 0 {
+				pc.DisallowPatterns = append(pc.DisallowPatterns, spec.DisallowedTools...)
+			}
+			if len(pc.AllowPatterns) > 0 || len(pc.DisallowPatterns) > 0 {
+				spec.PermissionConfig = pc
+			}
+		} else if len(spec.AllowedTools) > 0 && in.Logger != nil {
+			in.Logger.Warn("translateSpec: provider does not accept an allowed-tools list and has no permission-config bridge; dropping the agent card's AllowedTools",
+				"droppedField", "AllowedTools",
+				"provider", in.ProviderName,
+				"droppedCount", len(spec.AllowedTools),
+			)
+		}
 		spec.AllowedTools = nil
 	}
 
@@ -110,15 +176,6 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	// MCP config when a richer derivation lands. v0.5.0 leaves the
 	// list empty; providers that need it (codex) accept the empty
 	// list as "all tools allowed".
-
-	// Platform-supplied disallowed-tool patterns (Option B).
-	// Appended AFTER the runner's own defaultDisallowedTools() baseline
-	// so the static floor is never replaced, only extended.
-	// qw.DisallowedTools is the embedded prompt.QueuedWork field stamped
-	// by the platform's stampDisallowedTools() helper (platform PR #196).
-	if len(qw.DisallowedTools) > 0 {
-		spec.DisallowedTools = append(spec.DisallowedTools, qw.DisallowedTools...)
-	}
 
 	return spec
 }

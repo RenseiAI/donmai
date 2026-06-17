@@ -1,7 +1,10 @@
 package runner
 
 import (
+	"bytes"
+	"log/slog"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -215,5 +218,129 @@ func TestTranslateSpec_ToolUse_Stripped(t *testing.T) {
 				t.Errorf("MCPServers non-empty: want %v, got %v (%v)", tt.wantMCPServers, got, spec.MCPServers)
 			}
 		})
+	}
+}
+
+// TestTranslateSpec_CardAllowedTools_ReplacesDefault verifies the WS5 rule:
+// when the agent card supplies an explicit AllowedTools list it is
+// AUTHORITATIVE and used verbatim in place of the runner's curated default.
+// An empty/absent card list falls back to defaultAllowedTools().
+func TestTranslateSpec_CardAllowedTools_ReplacesDefault(t *testing.T) {
+	t.Parallel()
+	caps := agent.Capabilities{AcceptsAllowedToolsList: true}
+	in := SpecInputs{Cwd: "/tmp/wt", Prompt: "do"}
+
+	t.Run("card list replaces default verbatim", func(t *testing.T) {
+		t.Parallel()
+		card := []string{"Bash(cargo:*)", "Read"}
+		qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: card}}
+		spec := translateSpec(qw, caps, in)
+		if !slices.Equal(spec.AllowedTools, card) {
+			t.Errorf("AllowedTools = %v, want exactly the card list %v", spec.AllowedTools, card)
+		}
+		// A default-only entry must NOT be present (verbatim replacement).
+		if slices.Contains(spec.AllowedTools, "Bash(pnpm:*)") {
+			t.Errorf("default entry leaked into card-authoritative list: %v", spec.AllowedTools)
+		}
+	})
+
+	t.Run("absent card falls back to default", func(t *testing.T) {
+		t.Parallel()
+		qw := QueuedWork{QueuedWork: prompt.QueuedWork{}}
+		spec := translateSpec(qw, caps, in)
+		if !slices.Equal(spec.AllowedTools, defaultAllowedTools()) {
+			t.Errorf("AllowedTools = %v, want default %v", spec.AllowedTools, defaultAllowedTools())
+		}
+	})
+}
+
+// TestTranslateSpec_Codex_RoutesAllowedToolsToPermissionConfig verifies the
+// WS5 codex bridge: codex does not accept a flat allowlist but DOES consume a
+// structured PermissionConfig, so the card's AllowedTools route into
+// PermissionConfig.AllowPatterns and the disallowed set into
+// DisallowPatterns instead of being dropped.
+func TestTranslateSpec_Codex_RoutesAllowedToolsToPermissionConfig(t *testing.T) {
+	t.Parallel()
+	// codex-shaped caps: needs permission config, does not accept a flat list.
+	caps := agent.Capabilities{
+		NeedsPermissionConfig:   true,
+		AcceptsAllowedToolsList: false,
+	}
+	card := []string{"Bash(cargo:*)", "Edit"}
+	platformDisallow := []string{"WebFetch(http://169.254.169.254/*)"}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		AllowedTools:    card,
+		DisallowedTools: platformDisallow,
+	}}
+	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do"})
+
+	if spec.AllowedTools != nil {
+		t.Errorf("AllowedTools must be zeroed for codex (routed to PermissionConfig); got %v", spec.AllowedTools)
+	}
+	if spec.PermissionConfig == nil {
+		t.Fatal("PermissionConfig must be set for codex when the card supplies an allowlist")
+	}
+	for _, want := range card {
+		if !slices.Contains(spec.PermissionConfig.AllowPatterns, want) {
+			t.Errorf("AllowPatterns missing %q; got %v", want, spec.PermissionConfig.AllowPatterns)
+		}
+	}
+	// The runner's disallowed floor + the platform disallow must reach DisallowPatterns.
+	for _, want := range append(defaultDisallowedTools(), platformDisallow...) {
+		if !slices.Contains(spec.PermissionConfig.DisallowPatterns, want) {
+			t.Errorf("DisallowPatterns missing %q; got %v", want, spec.PermissionConfig.DisallowPatterns)
+		}
+	}
+}
+
+// TestTranslateSpec_AmpAgyCli_WarnAndDrop verifies that for providers that
+// accept neither a flat allowlist NOR a PermissionConfig (amp / agy-cli), the
+// card's AllowedTools are dropped — but the previously-silent zero is now a
+// structured WARN naming the dropped field + provider.
+func TestTranslateSpec_AmpAgyCli_WarnAndDrop(t *testing.T) {
+	t.Parallel()
+	for _, provider := range []string{"amp", "agy-cli"} {
+		t.Run(provider, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+			caps := agent.Capabilities{
+				NeedsPermissionConfig:   false,
+				AcceptsAllowedToolsList: false,
+			}
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Bash(cargo:*)"}}}
+			spec := translateSpec(qw, caps, SpecInputs{
+				Cwd:          "/tmp/wt",
+				Prompt:       "do",
+				Logger:       logger,
+				ProviderName: provider,
+			})
+			if spec.AllowedTools != nil {
+				t.Errorf("AllowedTools must be dropped for %s; got %v", provider, spec.AllowedTools)
+			}
+			if spec.PermissionConfig != nil {
+				t.Errorf("%s must NOT get a PermissionConfig; got %+v", provider, spec.PermissionConfig)
+			}
+			logs := buf.String()
+			if !strings.Contains(logs, "dropping the agent card's AllowedTools") {
+				t.Errorf("expected WARN about dropped AllowedTools; got logs:\n%s", logs)
+			}
+			if !strings.Contains(logs, provider) {
+				t.Errorf("WARN must name the provider %q; got logs:\n%s", provider, logs)
+			}
+		})
+	}
+}
+
+// TestTranslateSpec_AllowedToolsDrop_NoWarnWhenNoLogger verifies the WARN path
+// is nil-safe: with no logger and no card allowlist, the drop is silent and no
+// panic occurs.
+func TestTranslateSpec_AllowedToolsDrop_NoWarnWhenNoLogger(t *testing.T) {
+	t.Parallel()
+	caps := agent.Capabilities{NeedsPermissionConfig: false, AcceptsAllowedToolsList: false}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Edit"}}}
+	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do"})
+	if spec.AllowedTools != nil {
+		t.Errorf("AllowedTools must be dropped; got %v", spec.AllowedTools)
 	}
 }
