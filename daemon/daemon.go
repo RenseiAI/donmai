@@ -16,6 +16,15 @@ import (
 	"github.com/RenseiAI/donmai/internal/statepath"
 )
 
+// LandingWorkType is the poll WorkType wire value for a landing-run trigger:
+// a poll item that asks the worker to land a queued proposal (the concurrent
+// landing serializer in landing/) rather than to spawn an agent session.
+//
+// A landing-run item is routed out-of-band by Options.OnLandingWork when that
+// hook is wired; with no hook set, no producer emits this WorkType today, so
+// the value is inert.
+const LandingWorkType = "landing-run"
+
 // Options configure a Daemon.
 type Options struct {
 	// ConfigPath is where to load / persist daemon.yaml. Defaults to
@@ -72,6 +81,37 @@ type Options struct {
 	// running binary, not whatever string donmai's vendored
 	// source had at the time.
 	Version string
+
+	// WorkerCapabilitiesFunc returns the worker capability flags the daemon
+	// advertises on each claimed session's SessionDetail (e.g.
+	// "deterministic-landing"). It is consulted once per claimed poll item in
+	// the primary poll loop and the result is threaded via
+	// WithWorkerCapabilities so the runner can gate adapter-dependent
+	// behaviour.
+	//
+	// Nil ⇒ no capabilities are advertised: the SessionDetail is built with
+	// no capability option, which is byte-identical to today's behaviour
+	// (Capabilities stays nil, every flag reads false). This keeps mixed
+	// binary versions safe — an older embedder that never sets this is
+	// unaffected. Embedders that want to advertise capabilities supply a
+	// func that returns a non-empty map.
+	WorkerCapabilitiesFunc func() map[string]bool
+
+	// OnLandingWork handles a landing-run poll item (WorkType ==
+	// LandingWorkType) out-of-band from the session-spawn path. The whole
+	// PollWorkItem is passed so the handler can route by tenant
+	// (OrganizationID, Repository) and read any trigger context it needs
+	// without a separate fetch.
+	//
+	// When set, a landing-run item is dispatched to this hook and never
+	// becomes a session or counts toward the concurrency quota; the handler's
+	// error (if any) is logged best-effort and the poll item is reported
+	// handled.
+	//
+	// Nil ⇒ landing-run items fall through to the normal session-spawn path
+	// unchanged. No producer emits LandingWorkType today, so a nil hook leaves
+	// the poll path byte-identical to current behaviour.
+	OnLandingWork func(ctx context.Context, item PollWorkItem) error
 }
 
 // PoolStatsProvider returns a workarea pool snapshot.
@@ -219,6 +259,20 @@ func (d *Daemon) EffectiveVersion() string {
 
 func (d *Daemon) setState(s State) {
 	d.state.Store(s)
+}
+
+// workerCapabilitiesFunc returns the configured capability-flag provider, or
+// nil when none was supplied. Accessor so the poll closure (and tests) read
+// the hook through one seam.
+func (d *Daemon) workerCapabilitiesFunc() func() map[string]bool {
+	return d.opts.WorkerCapabilitiesFunc
+}
+
+// onLandingWork returns the configured landing-run handler, or nil when none
+// was supplied. Accessor so the poll closure (and tests) read the hook through
+// one seam.
+func (d *Daemon) onLandingWork() func(ctx context.Context, item PollWorkItem) error {
+	return d.opts.OnLandingWork
 }
 
 // Config returns a copy of the loaded config (or nil if not started).
@@ -581,62 +635,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 					slog.Info(fmt.Sprintf(format, args...))
 				},
 				OnWork: func(item PollWorkItem) error {
-					// Use d.spawner.AllProjects() so that satellite-org
-					// projects registered via AddProjects after daemon start
-					// are visible to the slug→URL resolution performed by
-					// PollItemToSessionSpec / PollItemToSessionDetail.
-					// cfg.Projects is the startup snapshot and would miss
-					// any extraProjects appended later.
-					projects := d.spawner.AllProjects()
-					spec := PollItemToSessionSpec(item, projects)
-					detail := PollItemToSessionDetail(
-						item,
-						projects,
-						cfg.Orchestrator.URL,
-						d.runtimeJWT(),
-						d.WorkerID(),
-					)
-					if _, err := d.AcceptWorkWithDetail(spec, detail); err != nil {
-						// Local accept-work failure means the orchestrator's
-						// claim of this session is stale on first contact —
-						// the session is in `claimed` state with this worker,
-						// but no `donmai agent run` subprocess will ever execute
-						// for it. NACK so the orchestrator releases the
-						// claim and re-queues immediately, instead of waiting
-						// for the stale-claim sweep (15min default) to
-						// reclaim. NACK is best-effort: failure to deliver it
-						// only adds latency; the original AcceptWork error
-						// is what the caller logs.
-						item := item
-						nackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-						defer cancel()
-						nackErr := callNackEndpoint(
-							nackCtx,
-							nil, // default 10s-timeout client
-							cfg.Orchestrator.URL,
-							item.SessionID,
-							d.WorkerID(),
-							d.runtimeJWT(),
-							fmt.Sprintf("accept work failed: %v", err),
-							&item,
-						)
-						if nackErr != nil {
-							slog.Warn(
-								"daemon poll: nack failed; orchestrator will reclaim via stale-claim sweep",
-								"sessionId", item.SessionID,
-								"acceptErr", err.Error(),
-								"nackErr", nackErr.Error(),
-							)
-						} else {
-							slog.Info(
-								"daemon poll: nacked rejected session",
-								"sessionId", item.SessionID,
-								"reason", err.Error(),
-							)
-						}
-						return fmt.Errorf("accept work %s: %w", item.SessionID, err)
-					}
-					return nil
+					return d.handlePollWorkItem(item, cfg.Orchestrator.URL)
 				},
 				OnReregister: reregister,
 			})
@@ -755,6 +754,103 @@ func (d *Daemon) Stop(_ context.Context) error {
 		close(d.doneCh)
 		d.setState(StateStopped)
 	})
+	return nil
+}
+
+// handlePollWorkItem is the body of the primary poll loop's OnWork callback,
+// extracted as a method so the landing-run routing and worker-capability
+// threading are directly unit-testable without standing up a full PollService.
+//
+// orchestratorURL is the registration-time orchestrator URL captured by the
+// poll loop; it is used for the best-effort NACK on a stale claim.
+//
+// Behaviour is byte-identical to the inlined closure for the existing
+// (session-spawn) path. Two additive, nil-safe hooks layer on top:
+//
+//   - When item.WorkType == LandingWorkType AND OnLandingWork is wired, the
+//     item is routed to that handler out-of-band and never becomes a session.
+//     With no hook wired the branch is skipped entirely, so the item flows to
+//     the unchanged session path exactly as before (no producer emits
+//     LandingWorkType today).
+//   - When WorkerCapabilitiesFunc is wired, its flags are advertised on the
+//     built SessionDetail via WithWorkerCapabilities. With no func wired the
+//     SessionDetail is built with no capability option, preserving the current
+//     wire shape exactly.
+func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) error {
+	// Landing-run routing — INERT unless OnLandingWork is wired. A landing-run
+	// trigger is not a session: route it out-of-band so it never spawns an
+	// agent or counts toward the concurrency quota.
+	if item.WorkType == LandingWorkType {
+		if onLanding := d.onLandingWork(); onLanding != nil {
+			if lerr := onLanding(context.Background(), item); lerr != nil {
+				slog.Warn("daemon poll: landing-run handler failed",
+					"repository", item.Repository, "err", lerr)
+			}
+			return nil
+		}
+		// No handler wired: fall through to the unchanged session path.
+	}
+
+	// Use d.spawner.AllProjects() so that satellite-org projects registered
+	// via AddProjects after daemon start are visible to the slug→URL
+	// resolution performed by PollItemToSessionSpec / PollItemToSessionDetail.
+	// cfg.Projects is the startup snapshot and would miss any extraProjects
+	// appended later.
+	projects := d.spawner.AllProjects()
+	spec := PollItemToSessionSpec(item, projects)
+
+	// Advertise worker capabilities only when a provider is wired, so the nil
+	// case builds a byte-identical SessionDetail (no capability option).
+	opts := []SessionDetailOption{}
+	if capsFn := d.workerCapabilitiesFunc(); capsFn != nil {
+		opts = append(opts, WithWorkerCapabilities(capsFn()))
+	}
+	detail := PollItemToSessionDetail(
+		item,
+		projects,
+		orchestratorURL,
+		d.runtimeJWT(),
+		d.WorkerID(),
+		opts...,
+	)
+	if _, err := d.AcceptWorkWithDetail(spec, detail); err != nil {
+		// Local accept-work failure means the orchestrator's claim of this
+		// session is stale on first contact — the session is in `claimed`
+		// state with this worker, but no `donmai agent run` subprocess will
+		// ever execute for it. NACK so the orchestrator releases the claim and
+		// re-queues immediately, instead of waiting for the stale-claim sweep
+		// (15min default) to reclaim. NACK is best-effort: failure to deliver
+		// it only adds latency; the original AcceptWork error is what the
+		// caller logs.
+		item := item
+		nackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		nackErr := callNackEndpoint(
+			nackCtx,
+			nil, // default 10s-timeout client
+			orchestratorURL,
+			item.SessionID,
+			d.WorkerID(),
+			d.runtimeJWT(),
+			fmt.Sprintf("accept work failed: %v", err),
+			&item,
+		)
+		if nackErr != nil {
+			slog.Warn(
+				"daemon poll: nack failed; orchestrator will reclaim via stale-claim sweep",
+				"sessionId", item.SessionID,
+				"acceptErr", err.Error(),
+				"nackErr", nackErr.Error(),
+			)
+		} else {
+			slog.Info(
+				"daemon poll: nacked rejected session",
+				"sessionId", item.SessionID,
+				"reason", err.Error(),
+			)
+		}
+		return fmt.Errorf("accept work %s: %w", item.SessionID, err)
+	}
 	return nil
 }
 
