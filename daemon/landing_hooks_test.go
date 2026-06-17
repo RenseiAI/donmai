@@ -200,3 +200,89 @@ func TestHandlePollWorkItem_WorkerCapabilitiesThreaded(t *testing.T) {
 		})
 	}
 }
+
+// mqlBoolPtr is a test-local *bool helper (poll_test.go's boolPtr lives in the
+// same package, but keeping this local keeps the test self-contained).
+func mqlBoolPtr(b bool) *bool { return &b }
+
+// TestHandlePollWorkItem_MergeQueueLandingPerItem verifies the per-org
+// merge-queue landing flag the coordinator stamps on the poll item flows onto
+// the stored SessionDetail.Capabilities["merge-queue"], and that it is
+// authoritative over the org-agnostic WorkerCapabilitiesFunc value:
+//
+//   - item flag = &true  ⇒ merge-queue=true (regardless of WorkerCapabilities).
+//   - item flag = &false ⇒ merge-queue=false, overriding a legacy true.
+//   - item flag = nil    ⇒ no-op: the legacy WorkerCapabilitiesFunc value stands
+//     (the mixed-version-safe default for an older coordinator).
+func TestHandlePollWorkItem_MergeQueueLandingPerItem(t *testing.T) {
+	projects := []ProjectConfig{{ID: "proj", Repository: "github.com/x/repo"}}
+
+	tests := []struct {
+		name      string
+		capsFunc  func() map[string]bool
+		itemFlag  *bool
+		wantKey   bool // expected Capabilities["merge-queue"]
+		wantNoCap bool // true ⇒ merge-queue key must be absent (Capabilities nil)
+	}{
+		{
+			name:     "item &true sets merge-queue true",
+			capsFunc: nil,
+			itemFlag: mqlBoolPtr(true),
+			wantKey:  true,
+		},
+		{
+			name:     "item &false overrides legacy capability true",
+			capsFunc: func() map[string]bool { return map[string]bool{"merge-queue": true} },
+			itemFlag: mqlBoolPtr(false),
+			wantKey:  false,
+		},
+		{
+			name:     "item nil leaves legacy capability true intact",
+			capsFunc: func() map[string]bool { return map[string]bool{"merge-queue": true} },
+			itemFlag: nil,
+			wantKey:  true,
+		},
+		{
+			name:      "item nil with no legacy caps leaves capabilities nil",
+			capsFunc:  nil,
+			itemFlag:  nil,
+			wantNoCap: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var holder *Daemon
+			var captured *SessionDetail
+			d := newRunningTestDaemon(t, Options{WorkerCapabilitiesFunc: tt.capsFunc}, projects,
+				func(spec SessionSpec, env []string) ([]string, error) {
+					if dt, ok := holder.SessionDetail(spec.SessionID); ok {
+						captured = dt
+					}
+					return env, nil
+				})
+			holder = d
+
+			item := PollWorkItem{
+				SessionID:         "mql-item",
+				Repository:        "github.com/x/repo",
+				MergeQueueLanding: tt.itemFlag,
+			}
+			if err := d.handlePollWorkItem(item, "https://orchestrator.example"); err != nil {
+				t.Fatalf("handlePollWorkItem: %v", err)
+			}
+			if captured == nil {
+				t.Fatal("OnPreSpawn never captured a SessionDetail (spawn did not proceed)")
+			}
+			if tt.wantNoCap {
+				if captured.Capabilities != nil {
+					t.Errorf("Capabilities = %v, want nil (nil flag + no legacy caps)", captured.Capabilities)
+				}
+				return
+			}
+			if got := captured.Capabilities["merge-queue"]; got != tt.wantKey {
+				t.Errorf("Capabilities[merge-queue] = %v, want %v", got, tt.wantKey)
+			}
+		})
+	}
+}
