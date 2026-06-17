@@ -3,6 +3,7 @@ package prompt
 import (
 	"encoding/json"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/kit"
 )
 
@@ -187,6 +188,50 @@ type QueuedWork struct {
 	// platform PR #196.
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
 
+	// ── WS5 agent-card → runner fidelity fields ─────────────────────────
+	//
+	// AllowedTools, McpServers, and Skills carry the resolved agent card's
+	// tool-allowlist, MCP servers, and inline skills to the runtime. The
+	// platform's emit side stamps them onto QueuedWork from the resolved
+	// agent composition. Each is additive + omitempty so a pre-WS5,
+	// field-less payload decodes unchanged (the v0.9.3 SystemPromptOverride
+	// wire-gap precedent: a field absent on the wire is silently dropped, so
+	// every wire hop — PollWorkItem, SessionDetail, detailToQueuedWork —
+	// carries them).
+
+	// AllowedTools is the platform-supplied set of tool-call patterns the
+	// agent card authorises for this session. When non-empty it is
+	// AUTHORITATIVE — the runner uses it verbatim in place of its own
+	// defaultAllowedTools() baseline (the card is the source of truth for
+	// what the agent may call). When empty/absent the runner falls back to
+	// defaultAllowedTools() — backward-compatible. The runner's
+	// defaultDisallowedTools() floor still applies regardless.
+	//
+	// Wire shape: "allowedTools" (camelCase, omitempty). Mirrors the
+	// claude/gemini AllowedTools permission-pattern grammar
+	// ("Bash(prefix:glob)", "Edit", "Read", …).
+	AllowedTools []string `json:"allowedTools,omitempty"`
+
+	// McpServers is the platform-supplied set of MCP servers the agent card
+	// declares. The runner APPENDS these to its own per-session default MCP
+	// set (the platform per-session HTTP gate is always retained; dedup by
+	// name with the default winning on collision). Reuses agent.MCPServerConfig
+	// (stdio + http transports) so the wire shape is shared with the Spec.
+	//
+	// Wire shape: "mcpServers" (camelCase, omitempty). Opaque to the prompt
+	// renderer — consumed only by the runner loop.
+	McpServers []agent.MCPServerConfig `json:"mcpServers,omitempty"`
+
+	// Skills is the platform-supplied set of INLINE skills the agent card
+	// declares (distinct from kit file-sourced skills). Each skill's body is
+	// folded into the prompt builder's SkillAppend AFTER any kit skills, and
+	// its disallowedTools are unioned into the kit-derived disallowed set
+	// (subtractive: skills may only narrow the tool surface).
+	//
+	// Wire shape: "skills" (camelCase, omitempty). Opaque to the prompt
+	// renderer — consumed only by the runner loop.
+	Skills []SkillSpec `json:"skills,omitempty"`
+
 	// MemoryBlock is the dispatch-time agent-memory context the platform
 	// folds into the system prompt for this session (Wave 3 memory-inject
 	// v1). When non-empty the prompt builder APPENDS it to the resolved
@@ -264,4 +309,25 @@ type StageBudget struct {
 	// across all turns, summed from per-turn ResultEvent.Cost or the
 	// roll-up CostData on terminal). 0 = no cap.
 	MaxTokens int64 `json:"maxTokens,omitempty"`
+}
+
+// SkillSpec is one INLINE skill carried by the agent card (WS5). It is
+// distinct from a kit file-sourced skill: the skill body arrives verbatim
+// on the wire rather than being read from a SKILL.md on disk. The runner
+// folds Body into the system-prompt SkillAppend block (after kit skills)
+// and unions DisallowedTools into the kit-derived disallowed set
+// (subtractive — skills may only narrow the tool surface, never widen it).
+type SkillSpec struct {
+	// ID is the skill's canonical id (e.g. "spring-debugging"). Used for
+	// log correlation; carried opaquely by the runner.
+	ID string `json:"id,omitempty"`
+
+	// Body is the inline skill body folded into the system prompt's
+	// SkillAppend block. Markdown text, used verbatim.
+	Body string `json:"body,omitempty"`
+
+	// DisallowedTools is the optional set of tool-call patterns this skill
+	// forbids. Unioned into the kit-derived disallowed set and appended to
+	// the agent.Spec's DisallowedTools — subtractive (narrows only).
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
 }

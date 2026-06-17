@@ -777,6 +777,74 @@ func TestDefaultMCPServers_OmitsWhenStandalone(t *testing.T) {
 	}
 }
 
+// TestMergeMCPServers_RetainsPlatformGate verifies the WS5 MCP merge: the
+// platform per-session HTTP gate (the default) ALWAYS leads and the agent
+// card's servers are appended after it.
+func TestMergeMCPServers_RetainsPlatformGate(t *testing.T) {
+	t.Parallel()
+
+	qw := QueuedWork{}
+	qw.SessionID = "sess_abc"
+	qw.PlatformURL = "https://platform.example.com"
+	qw.AuthToken = "rsk_test"
+	qw.McpServers = []agent.MCPServerConfig{
+		{Name: "card-linear", Type: "stdio", Command: "pnpm", Args: []string{"af-linear"}},
+		{Name: "card-remote", Type: "http", URL: "https://card.test/mcp"},
+	}
+
+	merged := mergeMCPServers(defaultMCPServers(qw), qw.McpServers)
+	if len(merged) != 3 {
+		t.Fatalf("merged len = %d, want 3 (platform gate + 2 card)", len(merged))
+	}
+	// Platform gate must lead and be retained.
+	if merged[0].Name != "donmai-platform" || merged[0].Type != "http" {
+		t.Errorf("merged[0] must be the platform gate; got %+v", merged[0])
+	}
+	if merged[1].Name != "card-linear" || merged[2].Name != "card-remote" {
+		t.Errorf("card servers must follow the gate; got %+v", merged)
+	}
+}
+
+// TestMergeMCPServers_DefaultWinsOnNameCollision verifies a card entry whose
+// name collides with the platform gate does NOT shadow the gate.
+func TestMergeMCPServers_DefaultWinsOnNameCollision(t *testing.T) {
+	t.Parallel()
+
+	defaults := []agent.MCPServerConfig{
+		{Name: "donmai-platform", Type: "http", URL: "https://gate.test/mcp"},
+	}
+	card := []agent.MCPServerConfig{
+		{Name: "donmai-platform", Type: "stdio", Command: "evil"}, // collision attempt
+		{Name: "card-extra", Type: "stdio", Command: "ok"},
+	}
+	merged := mergeMCPServers(defaults, card)
+	if len(merged) != 2 {
+		t.Fatalf("merged len = %d, want 2 (gate + card-extra; collision dropped)", len(merged))
+	}
+	if merged[0].Type != "http" || merged[0].URL != "https://gate.test/mcp" {
+		t.Errorf("platform gate must win on collision; got %+v", merged[0])
+	}
+	if merged[1].Name != "card-extra" {
+		t.Errorf("non-colliding card entry must survive; got %+v", merged[1])
+	}
+}
+
+// TestMergeMCPServers_NoCardEntries_IsIdentity verifies the additive
+// back-compat path: with no card servers the merge returns the defaults
+// unchanged (including the standalone nil case).
+func TestMergeMCPServers_NoCardEntries_IsIdentity(t *testing.T) {
+	t.Parallel()
+
+	defaults := []agent.MCPServerConfig{{Name: "donmai-platform", Type: "http"}}
+	if got := mergeMCPServers(defaults, nil); len(got) != 1 || got[0].Name != "donmai-platform" {
+		t.Errorf("no-card merge must be identity; got %+v", got)
+	}
+	// Standalone mode: nil defaults + nil card => nil.
+	if got := mergeMCPServers(nil, nil); got != nil {
+		t.Errorf("nil+nil merge must be nil; got %+v", got)
+	}
+}
+
 // TestScanPRURL_ExtractsURL confirms the regex captures a github PR
 // URL out of arbitrary tool output.
 func TestScanPRURL_ExtractsURL(t *testing.T) {

@@ -109,6 +109,30 @@ type PollWorkItem struct {
 	// fix — opaque forwarder only, no new logic.
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
 
+	// ── WS5 agent-card → runner fidelity fields ─────────────────────────
+	//
+	// AllowedTools, McpServers, and Skills carry the resolved agent card's
+	// tool-allowlist, MCP servers, and inline skills. The daemon forwards
+	// them opaquely onto SessionDetail — it never interprets them. McpServers
+	// and Skills use daemon-LOCAL mirror structs (PollMCPServer / PollSkill)
+	// so the daemon does not depend on the runner/prompt/agent packages
+	// (cardinal package-architecture rule: poll.go stays import-light — same
+	// rule that produced PollStageBudget / PollInterviewBudget). Without these
+	// fields Go's strict JSON decoder silently drops the platform's emit — the
+	// v0.9.3 SystemPromptOverride wire-gap precedent.
+
+	// AllowedTools is the platform-supplied agent-card tool allowlist.
+	// Forwarded opaquely; absent/empty is safe (omitempty).
+	AllowedTools []string `json:"allowedTools,omitempty"`
+
+	// McpServers is the platform-supplied agent-card MCP server set.
+	// Forwarded opaquely via the PollMCPServer mirror.
+	McpServers []PollMCPServer `json:"mcpServers,omitempty"`
+
+	// Skills is the platform-supplied agent-card inline skill set.
+	// Forwarded opaquely via the PollSkill mirror.
+	Skills []PollSkill `json:"skills,omitempty"`
+
 	// InjectedPoolID is the non-secret pool accounting sentinel the
 	// platform stamps for metered and shared auth modes:
 	// "metered_pool_<provider>" or "shared_pool_<provider>". Safe at
@@ -169,6 +193,38 @@ type PollStageBudget struct {
 	MaxDurationSeconds int   `json:"maxDurationSeconds,omitempty"`
 	MaxSubAgents       int   `json:"maxSubAgents,omitempty"`
 	MaxTokens          int64 `json:"maxTokens,omitempty"`
+}
+
+// PollMCPServer mirrors agent.MCPServerConfig for the daemon package so the
+// daemon can decode + forward the agent-card MCP set (WS5) without importing
+// the agent package (cardinal package-architecture rule: poll.go stays
+// import-light — same rule that produced PollStageBudget). The runner
+// re-types this into agent.MCPServerConfig in detailToQueuedWork.
+//
+// JSON tags are byte-identical to agent.MCPServerConfig so the wire shape is
+// shared: the transport discriminator is "type" (NOT "transport"), defaulting
+// to "stdio" when empty. NOTE (platform mirror): the agreed WS5 shape named
+// the discriminator "transport"; the existing agent.MCPServerConfig type
+// already uses "type", so the platform emit side must serialize this field as
+// "type" to match (delta from the agreed shape).
+type PollMCPServer struct {
+	Name    string            `json:"name"`
+	Type    string            `json:"type,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// PollSkill mirrors prompt.SkillSpec for the daemon package so the daemon can
+// decode + forward the agent-card inline skill set (WS5) without importing the
+// prompt package. The runner re-types this into prompt.SkillSpec in
+// detailToQueuedWork. JSON tags are byte-identical to prompt.SkillSpec.
+type PollSkill struct {
+	ID              string   `json:"id,omitempty"`
+	Body            string   `json:"body,omitempty"`
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
 }
 
 // LandingWorkItem mirrors one element of the orchestrator's poll-response
@@ -875,6 +931,9 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		SystemPromptOverride: item.SystemPromptOverride,
 		Kits:                 item.Kits,
 		DisallowedTools:      item.DisallowedTools,
+		AllowedTools:         item.AllowedTools,
+		McpServers:           item.McpServers,
+		Skills:               item.Skills,
 		MemoryBlock:          item.MemoryBlock,
 		Mode:                 item.Mode,
 		InterviewBudget:      item.InterviewBudget,

@@ -498,6 +498,57 @@ func TestDetailToQueuedWork_MemoryBlockForwarded(t *testing.T) {
 	}
 }
 
+// TestDetailToQueuedWork_WS5FidelityForwarded verifies the WS5 agent-card
+// fields (AllowedTools, McpServers, Skills) survive the SessionDetail →
+// runner.QueuedWork translation (the third + final wire hop), including the
+// daemon-mirror → agent.MCPServerConfig / prompt.SkillSpec re-typing.
+func TestDetailToQueuedWork_WS5FidelityForwarded(t *testing.T) {
+	t.Run("populated", func(t *testing.T) {
+		d := &daemon.SessionDetail{
+			SessionID:    "ws5-rt",
+			AllowedTools: []string{"Bash(go:*)", "Read"},
+			McpServers: []daemon.PollMCPServer{
+				{Name: "linear", Type: "stdio", Command: "pnpm", Args: []string{"af-linear"}, Env: map[string]string{"K": "v"}},
+				{Name: "remote", Type: "http", URL: "https://x.test/mcp", Headers: map[string]string{"Authorization": "Bearer t"}},
+			},
+			Skills: []daemon.PollSkill{
+				{ID: "spring", Body: "do the thing", DisallowedTools: []string{"Bash(rm:*)"}},
+			},
+			ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+		}
+		qw := detailToQueuedWork(d)
+		if len(qw.AllowedTools) != 2 || qw.AllowedTools[0] != "Bash(go:*)" {
+			t.Errorf("AllowedTools = %v, want [Bash(go:*) Read]", qw.AllowedTools)
+		}
+		if len(qw.McpServers) != 2 {
+			t.Fatalf("McpServers len = %d, want 2", len(qw.McpServers))
+		}
+		if qw.McpServers[0].Name != "linear" || qw.McpServers[0].Type != "stdio" ||
+			qw.McpServers[0].Command != "pnpm" || qw.McpServers[0].Env["K"] != "v" {
+			t.Errorf("McpServers[0] re-type wrong: %+v", qw.McpServers[0])
+		}
+		if qw.McpServers[1].Type != "http" || qw.McpServers[1].URL != "https://x.test/mcp" ||
+			qw.McpServers[1].Headers["Authorization"] != "Bearer t" {
+			t.Errorf("McpServers[1] re-type wrong: %+v", qw.McpServers[1])
+		}
+		if len(qw.Skills) != 1 || qw.Skills[0].ID != "spring" || qw.Skills[0].Body != "do the thing" ||
+			len(qw.Skills[0].DisallowedTools) != 1 || qw.Skills[0].DisallowedTools[0] != "Bash(rm:*)" {
+			t.Errorf("Skills re-type wrong: %+v", qw.Skills)
+		}
+	})
+	t.Run("absent — nil round-trip", func(t *testing.T) {
+		d := &daemon.SessionDetail{
+			SessionID:       "bare",
+			ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+		}
+		qw := detailToQueuedWork(d)
+		if qw.AllowedTools != nil || qw.McpServers != nil || qw.Skills != nil {
+			t.Errorf("WS5 fields must be nil when absent: allowed=%v mcp=%v skills=%v",
+				qw.AllowedTools, qw.McpServers, qw.Skills)
+		}
+	})
+}
+
 // TestProviderNameFromDetail_PrefersModelProfile verifies the log-line
 // helper reads ModelProfile.ProviderID first.
 func TestProviderNameFromDetail_PrefersModelProfile(t *testing.T) {

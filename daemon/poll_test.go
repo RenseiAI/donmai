@@ -1171,3 +1171,94 @@ func TestPollResponse_DecodesLandingWork(t *testing.T) {
 		t.Errorf("BatchJobID = %q", lw.BatchJobID)
 	}
 }
+
+// TestPollResponse_DecodesWS5Fidelity proves the WS5 agent-card → runner
+// fidelity fields (allowedTools, mcpServers, skills) survive the strict
+// JSON decode of the poll wire shape — the silent-drop regression guard.
+// Mirrors the v0.9.3 SystemPromptOverride precedent. Note the MCP transport
+// discriminator on the wire is "type" (NOT "transport") — it reuses the
+// agent.MCPServerConfig shape.
+func TestPollResponse_DecodesWS5Fidelity(t *testing.T) {
+	body := []byte(`{
+		"work": [{
+			"sessionId": "ws5-sess-1",
+			"workType": "development",
+			"allowedTools": ["Bash(pnpm:*)", "Edit", "Read"],
+			"mcpServers": [
+				{"name": "linear", "type": "stdio", "command": "pnpm", "args": ["af-linear"], "env": {"FOO": "bar"}},
+				{"name": "remote", "type": "http", "url": "https://example.test/mcp", "headers": {"Authorization": "Bearer x"}}
+			],
+			"skills": [
+				{"id": "spring", "body": "Check @SpringBootTest first.", "disallowedTools": ["Bash(npm publish *)"]}
+			]
+		}]
+	}`)
+
+	var resp PollResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode wire shape: %v", err)
+	}
+	if len(resp.Work) != 1 {
+		t.Fatalf("Work len = %d, want 1", len(resp.Work))
+	}
+	w := resp.Work[0]
+	if len(w.AllowedTools) != 3 || w.AllowedTools[0] != "Bash(pnpm:*)" {
+		t.Errorf("AllowedTools = %v, want 3 entries leading with Bash(pnpm:*)", w.AllowedTools)
+	}
+	if len(w.McpServers) != 2 {
+		t.Fatalf("McpServers len = %d, want 2", len(w.McpServers))
+	}
+	if w.McpServers[0].Name != "linear" || w.McpServers[0].Type != "stdio" ||
+		w.McpServers[0].Command != "pnpm" || len(w.McpServers[0].Args) != 1 ||
+		w.McpServers[0].Env["FOO"] != "bar" {
+		t.Errorf("McpServers[0] stdio shape wrong: %+v", w.McpServers[0])
+	}
+	if w.McpServers[1].Name != "remote" || w.McpServers[1].Type != "http" ||
+		w.McpServers[1].URL != "https://example.test/mcp" ||
+		w.McpServers[1].Headers["Authorization"] != "Bearer x" {
+		t.Errorf("McpServers[1] http shape wrong: %+v", w.McpServers[1])
+	}
+	if len(w.Skills) != 1 {
+		t.Fatalf("Skills len = %d, want 1", len(w.Skills))
+	}
+	if w.Skills[0].ID != "spring" || w.Skills[0].Body != "Check @SpringBootTest first." ||
+		len(w.Skills[0].DisallowedTools) != 1 || w.Skills[0].DisallowedTools[0] != "Bash(npm publish *)" {
+		t.Errorf("Skills[0] shape wrong: %+v", w.Skills[0])
+	}
+}
+
+// TestPollItemToSessionDetail_WS5FidelityForwarded verifies the WS5
+// agent-card fields survive the PollWorkItem → SessionDetail forwarding step.
+// Mirrors the DisallowedTools / v0.9.3 SystemPromptOverride precedent.
+func TestPollItemToSessionDetail_WS5FidelityForwarded(t *testing.T) {
+	t.Run("populated", func(t *testing.T) {
+		item := PollWorkItem{
+			SessionID:    "ws5-fwd",
+			AllowedTools: []string{"Edit", "Read"},
+			McpServers: []PollMCPServer{
+				{Name: "linear", Type: "stdio", Command: "pnpm", Args: []string{"af-linear"}},
+			},
+			Skills: []PollSkill{
+				{ID: "s1", Body: "body", DisallowedTools: []string{"Bash(rm:*)"}},
+			},
+		}
+		detail := PollItemToSessionDetail(item, nil, "", "", "")
+		if len(detail.AllowedTools) != 2 {
+			t.Errorf("AllowedTools len = %d, want 2", len(detail.AllowedTools))
+		}
+		if len(detail.McpServers) != 1 || detail.McpServers[0].Name != "linear" {
+			t.Errorf("McpServers = %+v, want 1 named linear", detail.McpServers)
+		}
+		if len(detail.Skills) != 1 || detail.Skills[0].ID != "s1" ||
+			len(detail.Skills[0].DisallowedTools) != 1 {
+			t.Errorf("Skills = %+v, want 1 with disallow", detail.Skills)
+		}
+	})
+	t.Run("absent — omitted", func(t *testing.T) {
+		detail := PollItemToSessionDetail(PollWorkItem{SessionID: "bare"}, nil, "", "", "")
+		if detail.AllowedTools != nil || detail.McpServers != nil || detail.Skills != nil {
+			t.Errorf("WS5 fields must be nil when absent: allowed=%v mcp=%v skills=%v",
+				detail.AllowedTools, detail.McpServers, detail.Skills)
+		}
+	})
+}

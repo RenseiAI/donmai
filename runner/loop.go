@@ -15,6 +15,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/activity"
 	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/state"
@@ -257,7 +258,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	specEnv := buildSessionEnv(qw)
 
 	// 4. Build MCP config (capability-gated by translateSpec later).
-	mcpServers := defaultMCPServers(qw)
+	//
+	// The platform per-session HTTP gate (defaultMCPServers) ALWAYS leads:
+	// it is the A2A capability-bundle + tool-call allow-list enforcement
+	// point, so it must remain in the set. The agent card's MCP servers
+	// (qw.McpServers, WS5) are APPENDED after it; dedup is by server name
+	// with the default winning on collision (the platform gate is never
+	// shadowed by a card entry of the same name). Additive: no card servers
+	// → identical to the prior behaviour.
+	mcpServers := mergeMCPServers(defaultMCPServers(qw), qw.McpServers)
 	mcpResult, err := buildMCPConfigPath(r.mcpb, mcpServers)
 	if err != nil {
 		res.Status = "failed"
@@ -303,6 +312,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 				"sessionId", qw.SessionID,
 				"skillBytes", len(loaded.SystemAppend),
 				"disallowCount", len(kitDisallowedTools),
+			)
+		}
+	}
+
+	// Fold the agent card's INLINE skills (WS5) into the prompt builder AFTER
+	// the kit (file-sourced) skills, and union their disallowedTools into the
+	// kit-derived disallowed set. Inline skills carry their body verbatim on
+	// the wire (no SKILL.md on disk). Additive: no card skills → no change.
+	if len(qw.Skills) > 0 {
+		newAppend, inlineDisallow, injected := foldInlineSkills(r.promptBuilder.SkillAppend, qw.Skills)
+		r.promptBuilder.SkillAppend = newAppend
+		kitDisallowedTools = append(kitDisallowedTools, inlineDisallow...)
+		if injected > 0 {
+			r.logger.Info("agent-card inline skills injected into system prompt",
+				"sessionId", qw.SessionID,
+				"skillCount", injected,
+				"skillBytes", len(newAppend),
 			)
 		}
 	}
@@ -380,13 +406,27 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		MCPServers:         mcpServers,
 		Env:                composedEnv,
 		Autonomous:         true,
+		Logger:             r.logger,
+		ProviderName:       string(provider.Name()),
 	})
-	// Apply Kit skill tool disallow rules (subtractive: Kit skills may
-	// only narrow the tool surface, never widen it). Appended after the
-	// defaults produced by translateSpec so the Kit-declared restrictions
-	// are visible and auditable in the Spec.
+	// Apply Kit skill + agent-card inline-skill tool disallow rules
+	// (subtractive: skills may only narrow the tool surface, never widen
+	// it). Appended after the defaults produced by translateSpec so the
+	// declared restrictions are visible and auditable in the Spec. For
+	// providers that route per-tool permission through PermissionConfig
+	// (codex), also mirror these patterns into the approval bridge's
+	// DisallowPatterns so the narrowing reaches the agent — translateSpec
+	// only saw the platform DisallowedTools floor, not the kit/skill set
+	// computed here.
 	if len(kitDisallowedTools) > 0 {
 		spec.DisallowedTools = append(spec.DisallowedTools, kitDisallowedTools...)
+		if caps.NeedsPermissionConfig && !caps.AcceptsAllowedToolsList {
+			if spec.PermissionConfig == nil {
+				spec.PermissionConfig = &agent.PermissionConfig{}
+			}
+			spec.PermissionConfig.DisallowPatterns = append(
+				spec.PermissionConfig.DisallowPatterns, kitDisallowedTools...)
+		}
 	}
 
 	// Interview mode: lock down the tool surface at
@@ -1323,6 +1363,67 @@ func defaultMCPServers(qw QueuedWork) []agent.MCPServerConfig {
 			"Authorization": "Bearer " + qw.AuthToken,
 		},
 	}}
+}
+
+// foldInlineSkills appends the agent card's INLINE skill bodies (WS5) to an
+// existing SkillAppend block and collects the union of their disallowedTools.
+// Inline skills carry their body verbatim on the wire (no SKILL.md on disk),
+// so the bodies are joined directly. Skills follow the kit (file-sourced)
+// skills already in existingAppend, separated by a blank line. Whitespace-only
+// bodies contribute no text but their disallowedTools still count. Returns the
+// new append text, the unioned disallowed-tool patterns, and the number of
+// non-empty bodies injected (for the caller's log line). Pure — no I/O.
+func foldInlineSkills(existingAppend string, skills []prompt.SkillSpec) (newAppend string, disallowed []string, injected int) {
+	var inlineBodies []string
+	for _, sk := range skills {
+		if strings.TrimSpace(sk.Body) != "" {
+			inlineBodies = append(inlineBodies, sk.Body)
+		}
+		if len(sk.DisallowedTools) > 0 {
+			disallowed = append(disallowed, sk.DisallowedTools...)
+		}
+	}
+	newAppend = existingAppend
+	if len(inlineBodies) > 0 {
+		inlineAppend := strings.Join(inlineBodies, "\n\n")
+		if existingAppend != "" {
+			newAppend = existingAppend + "\n\n" + inlineAppend
+		} else {
+			newAppend = inlineAppend
+		}
+	}
+	return newAppend, disallowed, len(inlineBodies)
+}
+
+// mergeMCPServers unions the runner's per-session default MCP set (the
+// platform per-session HTTP gate) with the agent card's MCP servers (WS5).
+// The defaults LEAD and WIN on a name collision: the platform gate is the
+// A2A enforcement point and must never be shadowed by a card-supplied entry
+// of the same name. Card entries whose name is not already present are
+// appended in order. Returns nil only when both inputs are empty so the
+// existing standalone-mode (no platform gate) back-compat path is preserved.
+func mergeMCPServers(defaults, cardServers []agent.MCPServerConfig) []agent.MCPServerConfig {
+	if len(cardServers) == 0 {
+		return defaults
+	}
+	seen := make(map[string]struct{}, len(defaults)+len(cardServers))
+	merged := make([]agent.MCPServerConfig, 0, len(defaults)+len(cardServers))
+	for _, s := range defaults {
+		seen[s.Name] = struct{}{}
+		merged = append(merged, s)
+	}
+	for _, s := range cardServers {
+		if _, dup := seen[s.Name]; dup {
+			// Default wins on collision — skip the card entry.
+			continue
+		}
+		seen[s.Name] = struct{}{}
+		merged = append(merged, s)
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
 }
 
 // scanWorkResult scans the assistant text for the WORK_RESULT marker

@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -197,6 +198,69 @@ func TestKitSkillSources_PromptContainsSkillSection(t *testing.T) {
 // need to exercise translateSpec without caring about capability gating.
 func noopCaps() agent.Capabilities {
 	return agent.Capabilities{}
+}
+
+// TestFoldInlineSkills_AppendsAfterKitSkills verifies the WS5 inline-skill
+// fold: the agent card's inline skill bodies are appended AFTER the existing
+// (kit) skill block, and their disallowedTools are collected.
+func TestFoldInlineSkills_AppendsAfterKitSkills(t *testing.T) {
+	t.Parallel()
+
+	existing := "KIT SKILL: check circular deps"
+	skills := []prompt.SkillSpec{
+		{ID: "a", Body: "INLINE A", DisallowedTools: []string{"Bash(rm:*)"}},
+		{ID: "b", Body: "INLINE B", DisallowedTools: []string{"Bash(curl:*)"}},
+	}
+	got, disallow, injected := foldInlineSkills(existing, skills)
+
+	if injected != 2 {
+		t.Errorf("injected = %d, want 2", injected)
+	}
+	// Kit skill must precede inline skills.
+	kitIdx := strings.Index(got, "KIT SKILL")
+	aIdx := strings.Index(got, "INLINE A")
+	if kitIdx < 0 || aIdx < 0 || kitIdx > aIdx {
+		t.Errorf("kit skill must precede inline skills; got %q", got)
+	}
+	if !strings.Contains(got, "INLINE A") || !strings.Contains(got, "INLINE B") {
+		t.Errorf("both inline bodies must be present; got %q", got)
+	}
+	if !slices.Contains(disallow, "Bash(rm:*)") || !slices.Contains(disallow, "Bash(curl:*)") {
+		t.Errorf("disallowed union missing entries; got %v", disallow)
+	}
+}
+
+// TestFoldInlineSkills_EmptyExistingAndWhitespaceBody verifies the no-kit-skill
+// path (empty existing append) and that a whitespace-only body contributes no
+// text but its disallowedTools still count.
+func TestFoldInlineSkills_EmptyExistingAndWhitespaceBody(t *testing.T) {
+	t.Parallel()
+
+	skills := []prompt.SkillSpec{
+		{ID: "real", Body: "REAL BODY"},
+		{ID: "blank", Body: "   ", DisallowedTools: []string{"Bash(sudo:*)"}},
+	}
+	got, disallow, injected := foldInlineSkills("", skills)
+	if injected != 1 {
+		t.Errorf("injected = %d, want 1 (blank body skipped)", injected)
+	}
+	if got != "REAL BODY" {
+		t.Errorf("append = %q, want exactly REAL BODY (no leading separator)", got)
+	}
+	if !slices.Contains(disallow, "Bash(sudo:*)") {
+		t.Errorf("whitespace-body disallow must still count; got %v", disallow)
+	}
+}
+
+// TestFoldInlineSkills_NoSkills_IsIdentity verifies the additive back-compat
+// path: no inline skills leaves the existing append untouched.
+func TestFoldInlineSkills_NoSkills_IsIdentity(t *testing.T) {
+	t.Parallel()
+
+	got, disallow, injected := foldInlineSkills("KEEP ME", nil)
+	if got != "KEEP ME" || injected != 0 || len(disallow) != 0 {
+		t.Errorf("identity violated: got=%q injected=%d disallow=%v", got, injected, disallow)
+	}
 }
 
 // noopLogger returns a slog.Logger that discards all output. Used by

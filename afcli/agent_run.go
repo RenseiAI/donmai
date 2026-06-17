@@ -607,6 +607,9 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			SystemPromptOverride: d.SystemPromptOverride,
 			Kits:                 d.Kits,
 			DisallowedTools:      d.DisallowedTools,
+			AllowedTools:         d.AllowedTools,
+			McpServers:           detailMCPServers(d.McpServers),
+			Skills:               detailSkills(d.Skills),
 			MemoryBlock:          d.MemoryBlock,
 			Mode:                 d.Mode,
 			InterviewDefinition:  d.InterviewDefinition,
@@ -667,6 +670,48 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 		}
 	}
 	return qw
+}
+
+// detailMCPServers re-types the daemon's PollMCPServer mirror slice into the
+// runner-consumable agent.MCPServerConfig slice (WS5 agent-card MCP set). The
+// daemon carries the agent-card MCP servers as PollMCPServer so it stays free
+// of the agent package; this is the bridge. Field-for-field copy; nil/empty
+// returns nil so the omitempty round-trip is faithful.
+func detailMCPServers(in []daemon.PollMCPServer) []agent.MCPServerConfig {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]agent.MCPServerConfig, len(in))
+	for i, s := range in {
+		out[i] = agent.MCPServerConfig{
+			Name:    s.Name,
+			Type:    s.Type,
+			Command: s.Command,
+			Args:    s.Args,
+			Env:     s.Env,
+			URL:     s.URL,
+			Headers: s.Headers,
+		}
+	}
+	return out
+}
+
+// detailSkills re-types the daemon's PollSkill mirror slice into the
+// runner-consumable prompt.SkillSpec slice (WS5 agent-card inline skills).
+// Field-for-field copy; nil/empty returns nil.
+func detailSkills(in []daemon.PollSkill) []prompt.SkillSpec {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]prompt.SkillSpec, len(in))
+	for i, s := range in {
+		out[i] = prompt.SkillSpec{
+			ID:              s.ID,
+			Body:            s.Body,
+			DisallowedTools: s.DisallowedTools,
+		}
+	}
+	return out
 }
 
 // providerNameFromDetail returns the provider name the runner will
