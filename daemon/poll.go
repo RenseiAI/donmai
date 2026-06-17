@@ -133,6 +133,13 @@ type PollWorkItem struct {
 	// Forwarded opaquely via the PollSkill mirror.
 	Skills []PollSkill `json:"skills,omitempty"`
 
+	// MergeQueueLanding is the coordinator's per-org merge-queue landing flag for
+	// THIS session's org, stamped per-item on the poll payload. true ⇒ the runner
+	// DEFERS the acceptance Delivered→Accepted promotion to the landing finalizer;
+	// false/absent ⇒ direct transition. *bool so absent (older coordinator) is
+	// distinguishable from explicit false, preserving the legacy capability fallback.
+	MergeQueueLanding *bool `json:"mergeQueueLanding,omitempty"`
+
 	// InjectedPoolID is the non-secret pool accounting sentinel the
 	// platform stamps for metered and shared auth modes:
 	// "metered_pool_<provider>" or "shared_pool_<provider>". Safe at
@@ -852,6 +859,31 @@ func WithWorkerCapabilities(caps map[string]bool) SessionDetailOption {
 			copied[k] = v
 		}
 		d.Capabilities = copied
+	}
+}
+
+// capabilityMergeQueue mirrors runner.CapabilityMergeQueue ("merge-queue") — kept
+// as a daemon-local literal to keep this package import-light.
+const capabilityMergeQueue = "merge-queue"
+
+// WithMergeQueueLanding stamps the coordinator's per-org merge-queue flag onto
+// SessionDetail.Capabilities["merge-queue"] for THIS item. nil ⇒ no-op (legacy
+// value stands). Append AFTER WithWorkerCapabilities so the per-item flag wins.
+//
+// This makes the runner's Delivered→Accepted deferral per-org-flag-driven: when
+// the coordinator stamps mergeQueueLanding=true on the poll payload for an
+// org that has the landing flag enabled, the runner defers the acceptance
+// promotion to the landing finalizer. Absent (older coordinator) leaves the
+// org-agnostic worker capability in place — the mixed-version-safe default.
+func WithMergeQueueLanding(flag *bool) SessionDetailOption {
+	return func(d *SessionDetail) {
+		if flag == nil {
+			return
+		}
+		if d.Capabilities == nil {
+			d.Capabilities = make(map[string]bool, 1)
+		}
+		d.Capabilities[capabilityMergeQueue] = *flag
 	}
 }
 

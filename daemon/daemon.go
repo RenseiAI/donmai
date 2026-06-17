@@ -805,6 +805,11 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	if capsFn := d.workerCapabilitiesFunc(); capsFn != nil {
 		opts = append(opts, WithWorkerCapabilities(capsFn()))
 	}
+	// Per-item, per-org merge-queue landing flag from the coordinator wins over
+	// the org-agnostic worker capability above. nil (older coordinator) is a
+	// no-op, so the legacy WorkerCapabilitiesFunc value stands. Appended AFTER
+	// WithWorkerCapabilities so the per-org flag is authoritative when present.
+	opts = append(opts, WithMergeQueueLanding(item.MergeQueueLanding))
 	detail := PollItemToSessionDetail(
 		item,
 		projects,
