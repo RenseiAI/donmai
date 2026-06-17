@@ -43,6 +43,14 @@ type ProcessResult struct {
 	Message  string
 }
 
+// ResultPoster bubbles a landing disposition back to the coordinator after
+// each proposal is processed. Optional; nil ⇒ no bubble-up. The concrete
+// implementation lives in the embedding binary so this package stays
+// transport-agnostic.
+type ResultPoster interface {
+	PostResult(ctx context.Context, e Entry, result ProcessResult) error
+}
+
 // EscalationConfig controls how conflict and test-failure outcomes escalate.
 type EscalationConfig struct {
 	// OnConflict is one of "reassign", "notify", "park".
@@ -155,6 +163,11 @@ type WorkerDeps struct {
 	// VCS, when set, gates serialization on capabilities (commutative VCS skips
 	// the queue). When nil, git semantics are assumed.
 	VCS vcs.Provider
+	// ResultPoster, when set, bubbles each processed proposal's disposition
+	// back to the coordinator (best-effort) after the queue state is recorded.
+	// Optional; nil ⇒ no bubble-up. The concrete implementation lives in the
+	// embedding binary so this package stays transport-agnostic.
+	ResultPoster ResultPoster
 }
 
 // lockTTL is the coordinator single-instance lock lifetime; the heartbeat
@@ -349,7 +362,15 @@ func (w *Worker) handleResult(ctx context.Context, e Entry, result ProcessResult
 			return fmt.Errorf("mark failed: %w", err)
 		}
 	}
-	_ = e // entry retained for a future issue-tracker bubble-up (wired in a later stage).
+	// Best-effort bubble-up of the disposition, after the queue state above is
+	// recorded. A poster error is logged and swallowed so it never blocks the
+	// queue from advancing.
+	if w.deps.ResultPoster != nil {
+		if perr := w.deps.ResultPoster.PostResult(ctx, e, result); perr != nil {
+			slog.Warn("landing: result bubble-up failed",
+				"proposal", e.Proposal, "status", result.Status, "err", perr)
+		}
+	}
 	return nil
 }
 
