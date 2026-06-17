@@ -497,6 +497,52 @@ func TestPollItemToSessionDetail_WorkerCapabilities(t *testing.T) {
 	}
 }
 
+// boolPtr is a test helper for building *bool option args.
+func boolPtr(b bool) *bool { return &b }
+
+// TestWithMergeQueueLanding covers the per-org merge-queue landing option that
+// stamps Capabilities["merge-queue"] from the coordinator's per-item flag,
+// replacing the org-agnostic worker capability when present:
+//
+//   - nil ⇒ no-op (an older coordinator that omits the field): the legacy
+//     WorkerCapabilities value stands, so absent stays distinguishable from an
+//     explicit false.
+//   - &true ⇒ merge-queue=true (defer Delivered→Accepted to the finalizer).
+//   - &false ⇒ merge-queue=false, OVERRIDING a legacy true (direct transition).
+func TestWithMergeQueueLanding(t *testing.T) {
+	item := PollWorkItem{SessionID: "sess-mql"}
+
+	// nil flag is a no-op: a SessionDetail built with a legacy merge-queue=true
+	// keeps that value (option must not clobber the legacy capability).
+	legacy := PollItemToSessionDetail(item, nil, "", "", "",
+		WithWorkerCapabilities(map[string]bool{capabilityMergeQueue: true}),
+		WithMergeQueueLanding(nil))
+	if got := legacy.Capabilities[capabilityMergeQueue]; !got {
+		t.Errorf("nil flag clobbered legacy capability: merge-queue = %v, want true (no-op)", got)
+	}
+
+	// nil flag with NO legacy capability leaves Capabilities nil entirely.
+	bare := PollItemToSessionDetail(item, nil, "", "", "", WithMergeQueueLanding(nil))
+	if bare.Capabilities != nil {
+		t.Errorf("nil flag created a Capabilities map: %v, want nil", bare.Capabilities)
+	}
+
+	// &true sets merge-queue=true even with no prior capability map.
+	on := PollItemToSessionDetail(item, nil, "", "", "", WithMergeQueueLanding(boolPtr(true)))
+	if got := on.Capabilities[capabilityMergeQueue]; !got {
+		t.Errorf("&true: merge-queue = %v, want true", got)
+	}
+
+	// &false sets merge-queue=false, OVERRIDING a legacy true (per-org flag wins
+	// because the option is appended after WithWorkerCapabilities).
+	off := PollItemToSessionDetail(item, nil, "", "", "",
+		WithWorkerCapabilities(map[string]bool{capabilityMergeQueue: true}),
+		WithMergeQueueLanding(boolPtr(false)))
+	if got := off.Capabilities[capabilityMergeQueue]; got {
+		t.Errorf("&false: merge-queue = %v, want false (per-org flag overrides legacy true)", got)
+	}
+}
+
 // TestPollItemToSessionDetail_FallsBackOnNoAllowlistMatch verifies the
 // non-match path: the SessionDetail.repository is whatever was on the
 // wire, and a Warn log is emitted so operators see the fallback.
@@ -1169,6 +1215,58 @@ func TestPollResponse_DecodesLandingWork(t *testing.T) {
 	}
 	if lw.BatchJobID != "batch:landing:org_1:foo/bar" {
 		t.Errorf("BatchJobID = %q", lw.BatchJobID)
+	}
+}
+
+// TestPollResponse_DecodesMergeQueueLanding proves the per-org merge-queue
+// landing flag survives the strict poll wire decode into a *bool, so that
+// absent (older coordinator, nil) is distinguishable from explicit false. This
+// is the silent-drop regression guard — the v0.9.3 SystemPromptOverride
+// precedent — for the per-session merge-queue capability.
+func TestPollResponse_DecodesMergeQueueLanding(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want *bool // nil ⇒ absent
+	}{
+		{
+			name: "true",
+			body: `{"work":[{"sessionId":"mql-t","mergeQueueLanding":true}]}`,
+			want: boolPtr(true),
+		},
+		{
+			name: "false",
+			body: `{"work":[{"sessionId":"mql-f","mergeQueueLanding":false}]}`,
+			want: boolPtr(false),
+		},
+		{
+			name: "absent",
+			body: `{"work":[{"sessionId":"mql-a"}]}`,
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resp PollResponse
+			if err := json.Unmarshal([]byte(tt.body), &resp); err != nil {
+				t.Fatalf("decode mergeQueueLanding wire shape: %v", err)
+			}
+			if len(resp.Work) != 1 {
+				t.Fatalf("Work len = %d, want 1", len(resp.Work))
+			}
+			got := resp.Work[0].MergeQueueLanding
+			switch {
+			case tt.want == nil:
+				if got != nil {
+					t.Errorf("MergeQueueLanding = %v, want nil (absent must stay nil)", *got)
+				}
+			case got == nil:
+				t.Errorf("MergeQueueLanding = nil, want %v", *tt.want)
+			case *got != *tt.want:
+				t.Errorf("MergeQueueLanding = %v, want %v", *got, *tt.want)
+			}
+		})
 	}
 }
 
