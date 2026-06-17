@@ -171,6 +171,27 @@ type PollStageBudget struct {
 	MaxTokens          int64 `json:"maxTokens,omitempty"`
 }
 
+// LandingWorkItem mirrors one element of the orchestrator's poll-response
+// `landingWork[]` array. It is a per-(orgId,repoId) TRIGGER to run the landing
+// serializer for that tenant — NOT a session. The item never becomes an agent
+// session, never enters activeSessions, and never counts toward the agent
+// concurrency quota; it is routed out-of-band to the landing handler.
+//
+// Field names follow the orchestrator wire shape (camelCase). The daemon only
+// needs OrgID + RepoID (plus WorkType as a sanity tag) to locate the tenant's
+// landing state and run the serializer. The orchestrator also emits a
+// batchJobId (the stable per-(orgId,repoId) claim key) and a contractVersion;
+// batchJobId is decoded for completeness, and contractVersion is intentionally
+// omitted to avoid number/string decode ambiguity — it is unused by the daemon
+// and harmlessly discarded by the JSON decoder (PollResponse does NOT use
+// DisallowUnknownFields, mirroring the InboxMessages forward-compat note above).
+type LandingWorkItem struct {
+	BatchJobID string `json:"batchJobId,omitempty"`
+	WorkType   string `json:"workType,omitempty"`
+	OrgID      string `json:"orgId,omitempty"`
+	RepoID     string `json:"repoId,omitempty"`
+}
+
 // PollResponse is the body of GET /api/workers/<id>/poll. Only the fields the
 // daemon currently consumes are decoded; unknown fields are ignored.
 type PollResponse struct {
@@ -187,6 +208,17 @@ type PollResponse struct {
 	InboxMessages     map[string][]InboxMessage `json:"inboxMessages,omitempty"`
 	PreClaimed        bool                      `json:"preClaimed,omitempty"`
 	ClaimedSessionIDs []string                  `json:"claimedSessionIds,omitempty"`
+
+	// LandingWork is the per-(orgId,repoId) landing-trigger lane. The
+	// orchestrator emits `landingWork[]` to tell a capable worker to run the
+	// landing serializer for a tenant; pollOnce routes each item through
+	// OnWork as a synthesized LandingWorkType item, so the existing landing-run
+	// branch (out-of-band, never a session) handles it. Previously the
+	// orchestrator emitted landingWork[] but the daemon decoded only work[],
+	// so the triggers were silently dropped and the per-tenant serializer
+	// never started — that gap is what this field closes. Absent/empty is
+	// safe (no producer emits it unless landing triggers are staged).
+	LandingWork []LandingWorkItem `json:"landingWork,omitempty"`
 }
 
 // InboxMessage is one queued message for a running session, delivered in
@@ -387,6 +419,31 @@ func (p *PollService) pollOnce(ctx context.Context) {
 		for _, item := range resp.Work {
 			if herr := p.opts.OnWork(item); herr != nil {
 				p.opts.LogWarn("poll handler error for session %s: %v", item.SessionID, herr)
+			}
+		}
+		// Route landing-trigger items (the per-(orgId,repoId) landing lane).
+		// The orchestrator emits landingWork[] separately from work[]; each
+		// item is a TRIGGER, not a session. We synthesize a LandingWorkType
+		// poll item and push it through the SAME OnWork callback so the
+		// existing landing-run branch in the OnWork handler routes it
+		// out-of-band to the landing serializer (never a session, never
+		// counted toward the agent quota). Best-effort: a handler error is
+		// logged at warn and does not stop the loop, mirroring the work[] loop.
+		if len(resp.LandingWork) > 0 {
+			p.opts.LogInfo("daemon poll: %d landing-trigger item(s) received", len(resp.LandingWork))
+		}
+		for _, lw := range resp.LandingWork {
+			if lw.OrgID == "" || lw.RepoID == "" {
+				p.opts.LogWarn("poll: dropping landing-trigger item with missing orgId/repoId (orgId=%q repoId=%q)", lw.OrgID, lw.RepoID)
+				continue
+			}
+			item := PollWorkItem{
+				WorkType:       LandingWorkType,
+				OrganizationID: lw.OrgID,
+				Repository:     lw.RepoID,
+			}
+			if herr := p.opts.OnWork(item); herr != nil {
+				p.opts.LogWarn("poll handler error for landing-trigger %s/%s: %v", lw.OrgID, lw.RepoID, herr)
 			}
 		}
 		// Route any inbox messages (interactive-interview user turns +
