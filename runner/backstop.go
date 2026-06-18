@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/gitexec"
 )
 
 // ============================================================================
@@ -386,8 +387,18 @@ func runGit(ctx context.Context, cwd string, id gitIdentity, args ...string) (st
 	//nolint:gosec // G204: args come from runner-controlled call sites.
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = cwd
-	// Append identity overrides AFTER os.Environ() so they WIN.
-	cmd.Env = append(os.Environ(), id.envOverrides()...)
+	// Append identity overrides AFTER os.Environ() so they WIN, then run the
+	// result through gitexec.HardenedEnv to add the headless non-interactive
+	// baseline (GIT_TERMINAL_PROMPT=0, GCM_INTERACTIVE=never). The backstop runs
+	// in the daemon's workarea under launchd, where a credential/passphrase
+	// prompt would hang the push forever; the baseline makes git fail fast
+	// instead. suppress/header are off here — the backstop reuses whatever
+	// credential the agent session left in the cloned remote (the worktree
+	// manager's GitAuth seam is the chokepoint for per-invocation auth at
+	// clone time). HardenedEnv with (false, "") appends only the two
+	// non-interactive vars, so the identity overrides remain the last identity
+	// entries and still win.
+	cmd.Env = gitexec.HardenedEnv(append(os.Environ(), id.envOverrides()...), false, "")
 	out, err := cmd.CombinedOutput()
 	return strings.TrimRight(string(out), " \n\t"), err
 }

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/RenseiAI/donmai/internal/gitexec"
 )
 
 // MaxSpawnRetries is the maximum number of attempts Provision will
@@ -77,11 +79,54 @@ type OwnershipProber func(ctx context.Context, sessionID string) (owned bool, er
 // implementation is exec.CommandContext + cmd.CombinedOutput().
 type CommandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
+// EnvCommandRunner is the env-aware variant of CommandRunner. It is only
+// consulted on the GitAuth-engaged path: when a GitAuth callback is set, the
+// manager builds a hardened env via gitexec.HardenedEnv and runs the git
+// invocation through this runner so the env reaches the subprocess. The default
+// (no GitAuth) path never touches it, keeping behaviour byte-identical to a
+// manager built without the seam.
+//
+// extraEnv entries (each "KEY=VALUE") are appended to the inherited process
+// environment. The default implementation is exec.CommandContext +
+// cmd.CombinedOutput() with cmd.Env = os.Environ()+extraEnv.
+type EnvCommandRunner func(ctx context.Context, extraEnv []string, name string, args ...string) ([]byte, error)
+
+// GitAuth is the daemon-supplied, per-invocation git auth resolver. Given the
+// repo URL about to be cloned/operated on, it returns the HTTP authorization
+// header to inject (e.g. "Authorization: Bearer <token>" or
+// "AUTHORIZATION: basic <base64>") and whether the OS credential helper must be
+// suppressed (which avoids the launchd keychain-popup hang).
+//
+// The seam is INERT by default: when GitAuth is nil the manager runs git
+// exactly as before — no env hardening, no URL rewriting. When set, each git
+// invocation that touches a remote applies gitexec.HardenedEnv(env, suppress,
+// header), and a clone of a URL carrying embedded userinfo clones the
+// userinfo-stripped URL so the token never persists in .git/config (auth flows
+// through the injected http.extraHeader instead).
+//
+// Returning an error aborts the provisioning attempt with that error wrapped.
+// Returning ("", false, nil) is valid and means "no header, do not suppress" —
+// equivalent to a no-op for that invocation.
+type GitAuth func(ctx context.Context, repoURL string) (authHeader string, suppressHelper bool, err error)
+
 // defaultRunner is the production CommandRunner; tests inject a stub.
 func defaultRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
 	// nolint:gosec // G204: name is a hard-coded "git" binary; args are
 	// constructed from validated ProvisionSpec fields at this layer.
 	cmd := exec.CommandContext(ctx, name, args...)
+	return cmd.CombinedOutput()
+}
+
+// defaultEnvRunner is the production EnvCommandRunner; tests inject a stub.
+func defaultEnvRunner(ctx context.Context, extraEnv []string, name string, args ...string) ([]byte, error) {
+	// nolint:gosec // G204: name is a hard-coded "git" binary; args are
+	// constructed from validated ProvisionSpec fields at this layer.
+	cmd := exec.CommandContext(ctx, name, args...)
+	if len(extraEnv) > 0 {
+		// nil Env means inherit the parent's environment; materialize it
+		// before appending so the hardened entries do not replace it wholesale.
+		cmd.Env = append(cmd.Environ(), extraEnv...)
+	}
 	return cmd.CombinedOutput()
 }
 
@@ -106,6 +151,8 @@ type Manager struct {
 	logger    *slog.Logger
 	prober    OwnershipProber
 	runner    CommandRunner
+	envRunner EnvCommandRunner
+	gitAuth   GitAuth
 	delay     time.Duration
 
 	mu       sync.Mutex
@@ -122,8 +169,19 @@ type Options struct {
 	// OwnershipProber is invoked between retries; nil disables the
 	// ownership check (useful for unit tests with no platform).
 	OwnershipProber OwnershipProber
-	// CommandRunner overrides the default exec.CommandContext runner.
+	// CommandRunner overrides the default exec.CommandContext runner. Used on
+	// the inert path (no GitAuth) and for env-free git invocations.
 	CommandRunner CommandRunner
+	// EnvCommandRunner overrides the default env-aware runner. It is only
+	// consulted when GitAuth is set; nil defaults to defaultEnvRunner. Tests
+	// inject a recording stub to assert the hardened env reaches the
+	// subprocess.
+	EnvCommandRunner EnvCommandRunner
+	// GitAuth, when non-nil, engages the credential-hardening seam: each git
+	// invocation that touches a remote runs with gitexec.HardenedEnv applied,
+	// and clones strip embedded userinfo from the URL. Nil leaves the manager
+	// byte-identical to today (no env hardening, no URL rewriting).
+	GitAuth GitAuth
 	// RetryDelay overrides SpawnRetryDelay. Useful for tests.
 	RetryDelay time.Duration
 }
@@ -141,6 +199,10 @@ func NewManager(opts Options) (*Manager, error) {
 	if runner == nil {
 		runner = defaultRunner
 	}
+	envRunner := opts.EnvCommandRunner
+	if envRunner == nil {
+		envRunner = defaultEnvRunner
+	}
 	delay := opts.RetryDelay
 	if delay == 0 {
 		delay = SpawnRetryDelay
@@ -157,6 +219,8 @@ func NewManager(opts Options) (*Manager, error) {
 		logger:    logger,
 		prober:    opts.OwnershipProber,
 		runner:    runner,
+		envRunner: envRunner,
+		gitAuth:   opts.GitAuth,
 		delay:     delay,
 		sessions:  make(map[string]*ProvisionResult),
 	}, nil
@@ -274,8 +338,10 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 	}
 	if res.Strategy == StrategyWorktreeAdd {
 		// Best-effort: ignore errors so a partial worktree from a
-		// prior crash does not block cleanup.
-		_, _ = m.runner(ctx, "git", "-C", m.parentDir, "worktree", "remove", "--force", res.Path)
+		// prior crash does not block cleanup. Local op (no remote) — the
+		// hardened path still suppresses the credential helper so a stray
+		// keychain prompt cannot hang teardown under launchd.
+		_, _ = m.runGit(ctx, "", "-C", m.parentDir, "worktree", "remove", "--force", res.Path)
 	}
 	if err := os.RemoveAll(res.Path); err != nil {
 		return fmt.Errorf("runtime/worktree: remove %q: %w", res.Path, err)
@@ -311,12 +377,22 @@ func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionS
 		if spec.RepoURL == "" {
 			return errors.New("RepoURL required for StrategyClone")
 		}
+		// When the credential-hardening seam is engaged, clone the
+		// userinfo-stripped URL and rely on the injected http.extraHeader for
+		// auth, so the token never lands in the persisted .git/config remote.
+		// When inert, RepoURL is left untouched (current behaviour).
+		cloneURL := spec.RepoURL
+		if m.gitAuth != nil {
+			if clean, stripped := gitexec.CleanURL(spec.RepoURL); stripped {
+				cloneURL = clean
+			}
+		}
 		args := []string{"clone"}
 		if spec.Branch != "" {
 			args = append(args, "--branch", spec.Branch)
 		}
-		args = append(args, spec.RepoURL, dst)
-		out, err := m.runner(ctx, "git", args...)
+		args = append(args, cloneURL, dst)
+		out, err := m.runGit(ctx, spec.RepoURL, args...)
 		if err != nil {
 			return fmt.Errorf("git clone: %w (%s)", err, strings.TrimSpace(string(out)))
 		}
@@ -337,7 +413,7 @@ func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionS
 			// branches are also fine because -B resets the branch.
 			args = append(args, "origin/"+spec.Branch)
 		}
-		out, err := m.runner(ctx, "git", args...)
+		out, err := m.runGit(ctx, spec.RepoURL, args...)
 		if err != nil {
 			return fmt.Errorf("git worktree add: %w (%s)", err, strings.TrimSpace(string(out)))
 		}
@@ -347,11 +423,31 @@ func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionS
 	}
 }
 
+// runGit runs a git invocation, applying the credential-hardening seam when a
+// GitAuth callback is configured. repoURL is the remote the operation targets;
+// it is passed to the GitAuth resolver and is "" for purely-local operations
+// (e.g. `worktree remove`), in which case GitAuth still runs and may suppress
+// the credential helper.
+//
+// When m.gitAuth is nil this routes straight through the env-free CommandRunner
+// — byte-identical to the pre-seam path.
+func (m *Manager) runGit(ctx context.Context, repoURL string, args ...string) ([]byte, error) {
+	if m.gitAuth == nil {
+		return m.runner(ctx, "git", args...)
+	}
+	header, suppress, err := m.gitAuth(ctx, repoURL)
+	if err != nil {
+		return nil, fmt.Errorf("runtime/worktree: resolve git auth: %w", err)
+	}
+	env := gitexec.HardenedEnv(nil, suppress, header)
+	return m.envRunner(ctx, env, "git", args...)
+}
+
 // cleanupConflict tries to remove a stale worktree entry left by a
 // prior failed Provision. Best-effort; never returns an error.
 func (m *Manager) cleanupConflict(ctx context.Context, dst string, spec ProvisionSpec) error {
 	if spec.Strategy == StrategyWorktreeAdd && spec.ParentRepoPath != "" {
-		_, _ = m.runner(ctx, "git", "-C", spec.ParentRepoPath, "worktree", "remove", "--force", dst)
+		_, _ = m.runGit(ctx, "", "-C", spec.ParentRepoPath, "worktree", "remove", "--force", dst)
 	}
 	if _, err := os.Stat(dst); err == nil {
 		_ = os.RemoveAll(dst)

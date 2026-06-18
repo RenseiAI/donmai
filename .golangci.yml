@@ -25,6 +25,13 @@ linters:
         linters:
           - gosec
         text: "G304"
+      # G101 (hardcoded credentials) in tests: fixtures embed fake tokens /
+      # token-bearing URLs to exercise credential-stripping and env-hardening
+      # logic; these are not real secrets.
+      - path: _test\.go
+        linters:
+          - gosec
+        text: "G101"
 
 formatters:
   enable:
