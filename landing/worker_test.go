@@ -80,6 +80,52 @@ func (s *retryThenSucceedStrategy) Finalize(_ context.Context, _ strategies.Cont
 	return nil
 }
 
+// blockingStrategy.Finalize blocks until ctx is cancelled, simulating a git
+// subprocess that hangs (e.g. a push awaiting credentials). Prepare/Execute
+// succeed so the worker reaches Finalize.
+type blockingStrategy struct{}
+
+func (blockingStrategy) Name() string { return "blocking" }
+
+func (blockingStrategy) Prepare(_ context.Context, _ strategies.Context) (strategies.PrepareResult, error) {
+	return strategies.PrepareResult{Success: true, HeadSHA: "abc"}, nil
+}
+
+func (blockingStrategy) Execute(_ context.Context, _ strategies.Context) (strategies.MergeResult, error) {
+	return strategies.MergeResult{Status: strategies.StatusSuccess, MergedSHA: "abc"}, nil
+}
+
+func (blockingStrategy) Finalize(ctx context.Context, _ strategies.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestWorkerProcessEntryFinalizeHangBounded proves the ProcessTimeout safety net:
+// a Finalize that blocks forever is bounded by the per-entry timeout and returns
+// a ProcessError result rather than hanging the tenant queue, so handleResult can
+// still write a terminal marker. This is the regression guard for the land-step
+// hang (entry dequeued, no :completed/:failed/:blocked marker).
+func TestWorkerProcessEntryFinalizeHangBounded(t *testing.T) {
+	key := Key{OrgID: "org1", RepoID: "owner/repo"}
+	cfg := WorkerConfig{Key: key, Strategy: "blocking", ProcessTimeout: 50 * time.Millisecond}
+	w := newTestWorker(cfg, newFakeStorage(), newFakeRedis(), blockingStrategy{}, &fakeResolver{}, &fakeLockHandler{}, &fakeRunner{})
+
+	done := make(chan struct{})
+	var result ProcessResult
+	go func() {
+		result, _ = w.ProcessEntry(context.Background(), Entry{Proposal: 1, SourceBranch: "feat", TargetBranch: "main"})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ProcessEntry did not return — ProcessTimeout failed to bound a hanging Finalize")
+	}
+	if result.Status != ProcessError {
+		t.Errorf("Status = %q, want %q (a timed-out finalize must normalize to error)", result.Status, ProcessError)
+	}
+}
+
 // fakeResolver is a programmable conflictResolver.
 type fakeResolver struct {
 	result ResolutionResult
