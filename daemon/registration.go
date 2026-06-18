@@ -75,6 +75,20 @@ type RegisterRequest struct {
 	Projects  []string            `json:"projects,omitempty"`
 	Provides  []ProvideCapability `json:"provides,omitempty"`
 
+	// Capabilities is the flat capability-tag allowlist the platform persists
+	// on workers.capabilities and gates its claim lanes against via
+	// workerAdvertisesCapability (the KG-extraction lane keys on a kg-extract
+	// tag; the FD-4 landing lane keys on "merge-queue"). Sourced verbatim from
+	// RegistrationOptions.Capabilities. Omitempty — a platform that does not
+	// read body.capabilities simply ignores it, and a daemon that leaves
+	// RegistrationOptions.Capabilities nil omits the field (the platform then
+	// stores [] and no capability-gated lane routes to this worker).
+	//
+	// NB: before this field existed RegistrationOptions.Capabilities was set at
+	// the call sites but NEVER serialised, so workers.capabilities was always []
+	// and every capability-gated lane silently no-routed. This closes that gap.
+	Capabilities []string `json:"capabilities,omitempty"`
+
 	// DaemonProjects is the structured project allowlist read from the
 	// daemon's local config (daemon.yaml's projects[]). Each entry carries
 	// the project id and resolved repository URL the daemon enforces at
@@ -327,6 +341,7 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		Capacity:       capacity,
 		Version:        opts.Version,
 		Provides:       opts.Provides,
+		Capabilities:   opts.Capabilities,
 		DaemonProjects: opts.DaemonProjects,
 	}
 	if req.MachineID == "" {
