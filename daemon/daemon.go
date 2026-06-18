@@ -97,6 +97,19 @@ type Options struct {
 	// func that returns a non-empty map.
 	WorkerCapabilitiesFunc func() map[string]bool
 
+	// RegistrationCapabilities is the flat capability-tag list advertised at
+	// REGISTRATION time (distinct from WorkerCapabilitiesFunc, which is the
+	// typed per-session map). It is sent verbatim as RegisterRequest.capabilities
+	// and the platform persists it on workers.capabilities, where it gates the
+	// capability-keyed claim lanes (KG-extraction, FD-4 landing's "merge-queue").
+	//
+	// Nil ⇒ the primary daemon falls back to the base substrate set
+	// ({local,sandbox,workarea}) — byte-identical to today's behaviour — so a
+	// pure-OSS embedder that never sets this is unaffected. Embedders that want
+	// the worker to receive a capability-gated lane supply the full tag list
+	// here (e.g. rensei-tui appends "merge-queue").
+	RegistrationCapabilities []string
+
 	// OnLandingWork handles a landing-run poll item (WorkType ==
 	// LandingWorkType) out-of-band from the session-spawn path. The whole
 	// PollWorkItem is passed so the handler can route by tenant
@@ -415,6 +428,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 		for i, c := range detected {
 			provides[i] = ProvideCapability{Kind: string(c.Kind)}
 		}
+		// Registration capabilities: the embedder-supplied list when set
+		// (rensei-tui appends "merge-queue" for the FD-4 landing lane), else the
+		// base substrate set so a pure-OSS daemon is unchanged.
+		regCaps := d.opts.RegistrationCapabilities
+		if regCaps == nil {
+			regCaps = []string{"local", "sandbox", "workarea"}
+		}
 		regOpts = RegistrationOptions{
 			OrchestratorURL:   cfg.Orchestrator.URL,
 			RegistrationToken: token,
@@ -422,7 +442,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Hostname:          cfg.Machine.ID,
 			Version:           d.EffectiveVersion(),
 			MaxAgents:         cfg.Capacity.MaxConcurrentSessions,
-			Capabilities:      []string{"local", "sandbox", "workarea"},
+			Capabilities:      regCaps,
 			Region:            cfg.Machine.Region,
 			JWTPath:           d.opts.JWTPath,
 			Provides:          provides,

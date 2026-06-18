@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -573,6 +574,75 @@ func TestRegister_ProvidesArraySentInBody(t *testing.T) {
 		if !kinds[want] {
 			t.Errorf("provides[] missing %q; got %v", want, capturedBody.Provides)
 		}
+	}
+}
+
+// TestRegister_CapabilitiesSentInBody verifies that RegistrationOptions.Capabilities
+// is serialised into the RegisterRequest body as "capabilities". This is a
+// regression pin for a wire gap where Capabilities was set at the call sites but
+// never copied into the request struct, so the platform stored workers.capabilities
+// = [] and every capability-gated claim lane (KG-extraction, FD-4 landing's
+// "merge-queue") silently no-routed.
+func TestRegister_CapabilitiesSentInBody(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	var capturedBody RegisterRequest
+	var rawBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rawBody, _ = io.ReadAll(r.Body)
+		_ = json.Unmarshal(rawBody, &capturedBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workerId":          "wkr_c",
+			"runtimeToken":      "tok",
+			"heartbeatInterval": 30000,
+			"pollInterval":      5000,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	caps := []string{"local", "sandbox", "workarea", "merge-queue"}
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	tok := "rsk_live_" + "abc" //nolint:gosec // synthetic test token
+	_, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		Hostname:          "cap-host",
+		Version:           "0.6.0-dev",
+		MaxAgents:         2,
+		JWTPath:           jwtPath,
+		Capabilities:      caps,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if len(capturedBody.Capabilities) != len(caps) {
+		t.Fatalf("body.capabilities = %v, want %v", capturedBody.Capabilities, caps)
+	}
+	got := make(map[string]bool, len(capturedBody.Capabilities))
+	for _, c := range capturedBody.Capabilities {
+		got[c] = true
+	}
+	for _, want := range caps {
+		if !got[want] {
+			t.Errorf("capabilities[] missing %q; got %v", want, capturedBody.Capabilities)
+		}
+	}
+	// The JSON key must be exactly "capabilities" (the platform reads body.capabilities).
+	if !bytes.Contains(rawBody, []byte(`"capabilities"`)) {
+		t.Errorf("request body missing \"capabilities\" key: %s", rawBody)
+	}
+}
+
+// TestRegisterRequest_CapabilitiesOmittedWhenNil verifies omitempty: a daemon
+// that leaves Capabilities nil sends no "capabilities" key, so an older platform
+// is byte-unaffected and the field degrades to [] server-side.
+func TestRegisterRequest_CapabilitiesOmittedWhenNil(t *testing.T) {
+	buf, err := json.Marshal(RegisterRequest{Hostname: "h", Capacity: 1})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(buf, []byte(`"capabilities"`)) {
+		t.Errorf("nil Capabilities should be omitted; got %s", buf)
 	}
 }
 
