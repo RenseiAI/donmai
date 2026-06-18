@@ -28,6 +28,7 @@ func (execRunner) run(ctx context.Context, dir string, extraEnv []string, name s
 	// fake; production callers pass fixed verbs (git, pnpm, …).
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
+	extraEnv = gitNonInteractiveEnv(name, extraEnv)
 	if len(extraEnv) > 0 {
 		// nil Env means inherit the parent's environment; we must materialize
 		// it before appending so the extra entries do not replace it wholesale.
@@ -47,6 +48,21 @@ func (execRunner) run(ctx context.Context, dir string, extraEnv []string, name s
 		return strings.TrimSpace(stdout.String()), fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// gitNonInteractiveEnv hardens the environment for git so a headless serializer
+// can never block on an interactive credential or passphrase prompt. When name
+// is "git" it appends GIT_TERMINAL_PROMPT=0 (git fails fast instead of waiting on
+// a controlling terminal) and GCM_INTERACTIVE=never (git-credential-manager, if
+// installed, skips its interactive device-code flow). Auth must come from the
+// remote URL token or a non-interactive helper. Without this a push/fetch that
+// awaits credentials hangs the land step forever — the entry is dequeued but no
+// terminal marker is ever written. Non-git commands are returned unchanged.
+func gitNonInteractiveEnv(name string, extraEnv []string) []string {
+	if name != "git" {
+		return extraEnv
+	}
+	return append(extraEnv, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
 }
 
 // defaultRunner is the package-wide production runner. Strategy constructors

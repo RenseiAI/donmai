@@ -113,6 +113,13 @@ type WorkerConfig struct {
 	// RecentlyMergedTTL is the lifetime of the short-lived "recently landed"
 	// marker.
 	RecentlyMergedTTL time.Duration
+	// ProcessTimeout bounds the total time spent landing a single entry
+	// (prepare → execute → resolve → regenerate → test → finalize). It is the
+	// safety net that guarantees a blocked git subprocess — e.g. a push awaiting
+	// credentials — can never wedge the tenant queue: on expiry the in-flight
+	// command is killed (exec.CommandContext) and the entry is marked failed so
+	// the queue advances. Zero ⇒ DefaultProcessTimeout.
+	ProcessTimeout time.Duration
 }
 
 // DefaultRetryablePrepareBackoffs are the default in-process backoffs for
@@ -121,6 +128,12 @@ var DefaultRetryablePrepareBackoffs = []time.Duration{5 * time.Second, 15 * time
 
 // DefaultRecentlyMergedTTL is the default lifetime of the recently-landed marker.
 const DefaultRecentlyMergedTTL = 10 * time.Minute
+
+// DefaultProcessTimeout bounds a single ProcessEntry when WorkerConfig leaves
+// ProcessTimeout unset. Generous enough for a fetch + rebase + push of a normal
+// PR delta, far below "hang forever"; on expiry the entry is marked failed and
+// the queue advances rather than wedging on a blocked git subprocess.
+const DefaultProcessTimeout = 10 * time.Minute
 
 // RedisClient is the minimal Redis surface the worker and pool need for locking,
 // pausing, and the recently-landed marker. Satisfied by an adapter over
@@ -381,6 +394,18 @@ func (w *Worker) handleResult(ctx context.Context, e Entry, result ProcessResult
 // hooks from the TS source are not wired here; pre-flight skip relies on the
 // local recently-landed marker (the GitHub-state path lived in those hooks).
 func (w *Worker) ProcessEntry(ctx context.Context, e Entry) (ProcessResult, error) {
+	// Bound the whole land so a blocked git subprocess (e.g. push awaiting
+	// credentials) can never wedge the tenant queue. On expiry the in-flight
+	// command is killed and the steps below normalize to a ProcessError result,
+	// which handleResult records as failed so the queue advances. handleResult
+	// itself runs on the caller's ctx, so the terminal marker is still written.
+	timeout := w.cfg.ProcessTimeout
+	if timeout <= 0 {
+		timeout = DefaultProcessTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	strategy, err := w.newStrategy(w.cfg.Strategy)
 	if err != nil {
 		return ProcessResult{Proposal: e.Proposal, Status: ProcessError, Message: err.Error()}, nil
