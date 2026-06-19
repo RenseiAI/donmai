@@ -358,3 +358,179 @@ func TestProvisionRequiresSessionID(t *testing.T) {
 		t.Fatal("expected error for missing SessionID")
 	}
 }
+
+// envHas reports whether env contains an exact "KEY=VALUE" entry.
+func envHas(env []string, want string) bool {
+	for _, e := range env {
+		if e == want {
+			return true
+		}
+	}
+	return false
+}
+
+// configValueForKey resolves the GIT_CONFIG_VALUE_n paired with the
+// GIT_CONFIG_KEY_n holding key. Returns ("", false) when key is absent.
+func configValueForKey(env []string, key string) (string, bool) {
+	m := make(map[string]string, len(env))
+	for _, e := range env {
+		k, v, ok := strings.Cut(e, "=")
+		if ok {
+			m[k] = v
+		}
+	}
+	for k, v := range m {
+		if !strings.HasPrefix(k, "GIT_CONFIG_KEY_") || v != key {
+			continue
+		}
+		n := strings.TrimPrefix(k, "GIT_CONFIG_KEY_")
+		val, ok := m["GIT_CONFIG_VALUE_"+n]
+		return val, ok
+	}
+	return "", false
+}
+
+// TestProvisionGitAuthEngaged asserts that when a GitAuth callback is set the
+// clone runs through the env-aware runner with the hardened env (suppressed
+// credential helper + injected http.extraHeader + GIT_TERMINAL_PROMPT=0) and
+// that the cloned URL is the userinfo-stripped (clean) form.
+func TestProvisionGitAuthEngaged(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const dirtyURL = "https://x-access-token:ghp_secret@github.com/org/repo.git"
+	const cleanURL = "https://github.com/org/repo.git"
+	const header = "Authorization: Bearer ghp_secret"
+
+	var (
+		gotEnv     []string
+		gotArgs    []string
+		envRunHits int
+		authURL    string
+	)
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir: dir,
+		// The plain CommandRunner must NOT be used on the engaged path.
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			t.Error("plain CommandRunner called on GitAuth-engaged path")
+			return nil, nil
+		},
+		EnvCommandRunner: func(_ context.Context, extraEnv []string, name string, args ...string) ([]byte, error) {
+			envRunHits++
+			gotEnv = append([]string(nil), extraEnv...)
+			gotArgs = append([]string(nil), args...)
+			if name != "git" {
+				t.Errorf("unexpected binary %q", name)
+			}
+			dst := args[len(args)-1]
+			_ = os.MkdirAll(dst, 0o750)
+			return nil, nil
+		},
+		GitAuth: func(_ context.Context, repoURL string) (string, bool, error) {
+			authURL = repoURL
+			return header, true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "s1",
+		RepoURL:   dirtyURL,
+		Strategy:  worktree.StrategyClone,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	if envRunHits != 1 {
+		t.Fatalf("env runner hits = %d, want 1", envRunHits)
+	}
+	// GitAuth must be resolved against the ORIGINAL (dirty) URL.
+	if authURL != dirtyURL {
+		t.Errorf("GitAuth repoURL = %q, want original dirty URL %q", authURL, dirtyURL)
+	}
+	// Hardened env assertions.
+	if !envHas(gotEnv, "GIT_TERMINAL_PROMPT=0") {
+		t.Errorf("hardened env missing GIT_TERMINAL_PROMPT=0: %v", gotEnv)
+	}
+	if !envHas(gotEnv, "GCM_INTERACTIVE=never") {
+		t.Errorf("hardened env missing GCM_INTERACTIVE=never: %v", gotEnv)
+	}
+	if !envHas(gotEnv, "GIT_ASKPASS=") {
+		t.Errorf("hardened env missing GIT_ASKPASS=: %v", gotEnv)
+	}
+	if v, ok := configValueForKey(gotEnv, "credential.helper"); !ok || v != "" {
+		t.Errorf("credential.helper = %q present=%v, want empty+present", v, ok)
+	}
+	if v, ok := configValueForKey(gotEnv, "http.extraHeader"); !ok || v != header {
+		t.Errorf("http.extraHeader = %q present=%v, want %q", v, ok, header)
+	}
+	// The cloned URL must be the CLEAN (userinfo-stripped) form, never the
+	// token-bearing one.
+	clonedURL := gotArgs[len(gotArgs)-2] // [clone, <url>, <dst>]
+	if clonedURL != cleanURL {
+		t.Errorf("cloned URL = %q, want clean %q", clonedURL, cleanURL)
+	}
+	for _, a := range gotArgs {
+		if strings.Contains(a, "ghp_secret") {
+			t.Fatalf("token leaked into clone argv: %v", gotArgs)
+		}
+	}
+}
+
+// TestProvisionGitAuthInertRegression is the regression guard: with GitAuth nil
+// the manager must run git through the plain CommandRunner, never touch the env
+// runner, and clone the URL UNCHANGED (no userinfo stripping).
+func TestProvisionGitAuthInertRegression(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const dirtyURL = "https://x-access-token:ghp_secret@github.com/org/repo.git"
+
+	var (
+		gotArgs       []string
+		plainRunHits  int
+		envRunnerUsed bool
+	)
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir: dir,
+		CommandRunner: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			plainRunHits++
+			if name != "git" {
+				t.Errorf("unexpected binary %q", name)
+			}
+			gotArgs = append([]string(nil), args...)
+			dst := args[len(args)-1]
+			_ = os.MkdirAll(dst, 0o750)
+			return nil, nil
+		},
+		EnvCommandRunner: func(_ context.Context, _ []string, _ string, _ ...string) ([]byte, error) {
+			envRunnerUsed = true
+			return nil, nil
+		},
+		// GitAuth deliberately left nil → seam inert.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "s1",
+		RepoURL:   dirtyURL,
+		Strategy:  worktree.StrategyClone,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if plainRunHits != 1 {
+		t.Fatalf("plain runner hits = %d, want 1", plainRunHits)
+	}
+	if envRunnerUsed {
+		t.Fatal("env runner used on inert path — seam not inert")
+	}
+	// URL must be unchanged (still carries userinfo) — current behaviour.
+	clonedURL := gotArgs[len(gotArgs)-2]
+	if clonedURL != dirtyURL {
+		t.Errorf("inert clone URL = %q, want unchanged %q", clonedURL, dirtyURL)
+	}
+}

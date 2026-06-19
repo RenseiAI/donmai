@@ -125,7 +125,48 @@ type Options struct {
 	// unchanged. No producer emits LandingWorkType today, so a nil hook leaves
 	// the poll path byte-identical to current behaviour.
 	OnLandingWork func(ctx context.Context, item PollWorkItem) error
+
+	// GitAuth is the per-invocation git auth resolver an embedder supplies to
+	// drive the credential-hardening seam. Given the repo URL a git invocation
+	// is about to touch, it returns the HTTP authorization header to inject
+	// (e.g. "Authorization: Bearer <token>" or "AUTHORIZATION: basic <base64>")
+	// and whether the OS credential helper must be suppressed.
+	//
+	// Suppressing the credential helper resets git's credential.helper list to
+	// empty so no keychain get/store runs — this is what avoids the blocking
+	// GUI popup ("A keychain cannot be found to store …") that hangs a daemon
+	// running under launchd with no logged-in keychain session. Injecting the
+	// header lets auth travel per invocation instead of being baked into the
+	// persisted remote URL, so the token never lands in .git/config.
+	//
+	// IMPORTANT — this field is a declarative contract surface, NOT an
+	// auto-thread. The OSS daemon does not itself construct the per-session
+	// worktree Manager: it spawns `donmai agent run` as a subprocess, and that
+	// subprocess builds the runner + worktree.Manager (see afcli/agent_run.go).
+	// Because the Manager lives in another process, the daemon cannot wire this
+	// callback into it directly, and setting daemon.Options.GitAuth here has no
+	// in-process effect on its own.
+	//
+	// The seam that actually applies hardening is runtime/worktree.Options.GitAuth
+	// (applied via internal/gitexec.HardenedEnv): when set on the Manager, each
+	// git invocation runs with the hardened env, and a clone of a URL carrying
+	// embedded userinfo clones the userinfo-stripped URL and relies on the
+	// injected http.extraHeader for auth. An embedder that wants hardening must
+	// thread its resolver into the worktree Manager it constructs (or into the
+	// spawn path it owns) — this daemon field exists so the embedder can carry
+	// that resolver alongside the rest of its Options without restating the type.
+	//
+	// The OSS binary leaves this nil, the worktree seam stays inert, and
+	// standalone behaviour is byte-identical to before.
+	GitAuth GitAuth
 }
+
+// GitAuth is the per-invocation git auth resolver an embedder supplies via
+// Options.GitAuth. See that field's documentation for the full contract. It
+// mirrors runtime/worktree.GitAuth — the type is restated here so the daemon's
+// public surface does not force a runtime/worktree import on consumers that
+// only construct Options.
+type GitAuth func(ctx context.Context, repoURL string) (authHeader string, suppressHelper bool, err error)
 
 // PoolStatsProvider returns a workarea pool snapshot.
 type PoolStatsProvider interface {

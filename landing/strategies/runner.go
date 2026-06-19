@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/RenseiAI/donmai/internal/gitexec"
 )
 
 // commandRunner runs a single command in a working directory and returns its
@@ -52,17 +54,24 @@ func (execRunner) run(ctx context.Context, dir string, extraEnv []string, name s
 
 // gitNonInteractiveEnv hardens the environment for git so a headless serializer
 // can never block on an interactive credential or passphrase prompt. When name
-// is "git" it appends GIT_TERMINAL_PROMPT=0 (git fails fast instead of waiting on
-// a controlling terminal) and GCM_INTERACTIVE=never (git-credential-manager, if
-// installed, skips its interactive device-code flow). Auth must come from the
-// remote URL token or a non-interactive helper. Without this a push/fetch that
-// awaits credentials hangs the land step forever — the entry is dequeued but no
-// terminal marker is ever written. Non-git commands are returned unchanged.
+// is "git" it delegates to gitexec.HardenedEnv with no helper-suppression and no
+// auth header, which appends GIT_TERMINAL_PROMPT=0 (git fails fast instead of
+// waiting on a controlling terminal) and GCM_INTERACTIVE=never
+// (git-credential-manager, if installed, skips its interactive device-code
+// flow). Auth must come from the remote URL token or a non-interactive helper.
+// Without this a push/fetch that awaits credentials hangs the land step forever
+// — the entry is dequeued but no terminal marker is ever written. Non-git
+// commands are returned unchanged.
+//
+// The keychain-suppression / per-invocation auth-header behaviour of
+// gitexec.HardenedEnv is not engaged here: callers that need it pass the
+// already-hardened slice through extraEnv (HardenedEnv composes — its
+// GIT_CONFIG_COUNT continuation preserves any pairs already present).
 func gitNonInteractiveEnv(name string, extraEnv []string) []string {
 	if name != "git" {
 		return extraEnv
 	}
-	return append(extraEnv, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
+	return gitexec.HardenedEnv(extraEnv, false, "")
 }
 
 // defaultRunner is the package-wide production runner. Strategy constructors
