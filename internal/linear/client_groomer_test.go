@@ -249,3 +249,84 @@ func orHasIDPredicate(or []any, wantEq string) bool {
 	}
 	return false
 }
+
+// --- UpdateIssue priority / estimate (C3) ---
+
+// issueUpdateResponseJSON returns a minimal issueUpdate GraphQL response.
+func issueUpdateResponseJSON() string {
+	return `{"issueUpdate":{"success":true,"issue":{"id":"issue-1","identifier":"ENG-1","title":"T","state":{"name":"Backlog"},"team":{"id":"t1","key":"ENG","name":"Engineering"},"labels":{"nodes":[]}}}}`
+}
+
+func TestUpdateIssue_PrioritySentToLinear(t *testing.T) {
+	t.Parallel()
+	c, rec := captureClient(t, issueUpdateResponseJSON())
+
+	p := 1
+	_, err := c.UpdateIssue(context.Background(), "issue-1", UpdateIssueInput{Priority: &p})
+	if err != nil {
+		t.Fatalf("UpdateIssue: %v", err)
+	}
+	inp, _ := rec.variables["input"].(map[string]any)
+	if got, ok := inp["priority"].(float64); !ok || int(got) != 1 {
+		t.Errorf("input.priority = %v; want 1", inp["priority"])
+	}
+	if _, has := inp["estimate"]; has {
+		t.Errorf("estimate must not appear in input when not set: %#v", inp)
+	}
+}
+
+func TestUpdateIssue_EstimateSentToLinear(t *testing.T) {
+	t.Parallel()
+	c, rec := captureClient(t, issueUpdateResponseJSON())
+
+	e := 5
+	_, err := c.UpdateIssue(context.Background(), "issue-1", UpdateIssueInput{Estimate: &e})
+	if err != nil {
+		t.Fatalf("UpdateIssue: %v", err)
+	}
+	inp, _ := rec.variables["input"].(map[string]any)
+	if got, ok := inp["estimate"].(float64); !ok || int(got) != 5 {
+		t.Errorf("input.estimate = %v; want 5", inp["estimate"])
+	}
+	if _, has := inp["priority"]; has {
+		t.Errorf("priority must not appear in input when not set: %#v", inp)
+	}
+}
+
+func TestUpdateIssue_PriorityZeroSentToLinear(t *testing.T) {
+	t.Parallel()
+	// priority=0 (no priority) is a valid Linear value; pointer is non-nil so
+	// the zero value MUST be forwarded, not suppressed.
+	c, rec := captureClient(t, issueUpdateResponseJSON())
+
+	p := 0
+	_, err := c.UpdateIssue(context.Background(), "issue-1", UpdateIssueInput{Priority: &p})
+	if err != nil {
+		t.Fatalf("UpdateIssue: %v", err)
+	}
+	inp, _ := rec.variables["input"].(map[string]any)
+	if _, has := inp["priority"]; !has {
+		t.Fatalf("input must contain priority=0 when pointer is non-nil: %#v", inp)
+	}
+	if got, ok := inp["priority"].(float64); !ok || int(got) != 0 {
+		t.Errorf("input.priority = %v; want 0", inp["priority"])
+	}
+}
+
+func TestUpdateIssue_NilPriorityNotSentToLinear(t *testing.T) {
+	t.Parallel()
+	// When Priority is nil (flag not passed), the field must not appear in the input.
+	c, rec := captureClient(t, issueUpdateResponseJSON())
+
+	_, err := c.UpdateIssue(context.Background(), "issue-1", UpdateIssueInput{})
+	if err != nil {
+		t.Fatalf("UpdateIssue: %v", err)
+	}
+	inp, _ := rec.variables["input"].(map[string]any)
+	if _, has := inp["priority"]; has {
+		t.Errorf("priority must not appear in input when nil: %#v", inp)
+	}
+	if _, has := inp["estimate"]; has {
+		t.Errorf("estimate must not appear in input when nil: %#v", inp)
+	}
+}

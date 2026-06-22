@@ -105,6 +105,8 @@ type UpdateIssueInput struct {
 	LabelIDs    []string `json:"labelIds,omitempty"`
 	ParentID    *string  `json:"parentId,omitempty"` // pointer so null can be sent
 	AssigneeID  string   `json:"assigneeId,omitempty"`
+	Priority    *int     `json:"priority,omitempty"` // 0=no priority,1=urgent,2=high,3=medium,4=low
+	Estimate    *int     `json:"estimate,omitempty"` // story points / t-shirt size value
 }
 
 // ─── internal GraphQL wire types ────────────────────────────────────────────

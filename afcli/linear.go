@@ -81,6 +81,7 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 	cmd.AddCommand(newLinearUpdateIssueCmd(ds, bin))
 	cmd.AddCommand(newLinearListCommentsCmd(ds, bin))
 	cmd.AddCommand(newLinearCreateCommentCmd(ds, bin))
+	cmd.AddCommand(newLinearCommentCmd(ds, bin))
 	cmd.AddCommand(newLinearAddRelationCmd(ds, bin))
 	cmd.AddCommand(newLinearListRelationsCmd(ds, bin))
 	cmd.AddCommand(newLinearRemoveRelationCmd(ds, bin))
@@ -92,6 +93,8 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 	cmd.AddCommand(newLinearListBacklogIssuesCmd(ds, bin))
 	cmd.AddCommand(newLinearListUnblockedBacklogCmd(ds, bin))
 	cmd.AddCommand(newLinearCreateBlockerCmd(ds, bin))
+	cmd.AddCommand(newLinearListLabelsCmd(ds, bin))
+	cmd.AddCommand(newLinearApplyLabelCmd(ds, bin))
 	cmd.AddCommand(newLinearCheckDeploymentCmd(bin))
 
 	return cmd
@@ -468,8 +471,11 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		description     string
 		descriptionFile string
 		state           string
+		status          string
 		labels          string
 		parentID        string
+		priority        int
+		estimate        int
 	)
 
 	cmd := &cobra.Command{
@@ -484,6 +490,17 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 			}
 			ctx := cmd.Context()
 			issueID := args[0]
+
+			// --status is the contract-canonical flag; --state is an alias.
+			// If both are set to different values, fail loud.
+			stateChanged := cmd.Flags().Changed("state")
+			statusChanged := cmd.Flags().Changed("status")
+			switch {
+			case stateChanged && statusChanged && state != status:
+				return fmt.Errorf("--state and --status both set with different values (%q vs %q); use one", state, status)
+			case statusChanged && !stateChanged:
+				state = status
+			}
 
 			// Fetch the issue (needed for team ID to resolve state)
 			issue, err := client.GetIssue(ctx, issueID)
@@ -501,7 +518,7 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				Description: desc,
 			}
 
-			// Optional state
+			// Optional state (resolved from either --status or --state)
 			if state != "" {
 				stateID, err := resolveStateID(ctx, client, issue.Team.ID, state)
 				if err != nil {
@@ -534,6 +551,16 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				}
 			}
 
+			// Optional priority (0 = no priority is valid, so check Changed)
+			if cmd.Flags().Changed("priority") {
+				input.Priority = &priority
+			}
+
+			// Optional estimate (0 = clear estimate, so check Changed)
+			if cmd.Flags().Changed("estimate") {
+				input.Estimate = &estimate
+			}
+
 			updated, err := client.UpdateIssue(ctx, issue.ID, input)
 			if err != nil {
 				return fmt.Errorf("update issue: %w", err)
@@ -552,9 +579,12 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 	cmd.Flags().StringVar(&title, "title", "", "New title")
 	cmd.Flags().StringVar(&description, "description", "", "New description")
 	cmd.Flags().StringVar(&descriptionFile, "description-file", "", "Path to file containing description")
-	cmd.Flags().StringVar(&state, "state", "", "New state name (e.g. 'Finished')")
+	cmd.Flags().StringVar(&status, "status", "", "New state name — contract-canonical alias for --state (e.g. 'Cancelled')")
+	cmd.Flags().StringVar(&state, "state", "", "New state name (alias for --status; e.g. 'Finished')")
 	cmd.Flags().StringVar(&labels, "labels", "", "Comma-separated label names")
 	cmd.Flags().StringVar(&parentID, "parentId", "", "New parent issue ID ('null' to clear)")
+	cmd.Flags().IntVar(&priority, "priority", 0, "Issue priority: 0=no priority, 1=urgent, 2=high, 3=medium, 4=low")
+	cmd.Flags().IntVar(&estimate, "estimate", 0, "Issue estimate (story points or t-shirt size value)")
 
 	return cmd
 }
@@ -811,11 +841,13 @@ func newLinearListSubIssuesCmd(ds func() afclient.DataSource, bin string) *cobra
 					"identifier": c.Identifier,
 					"title":      c.Title,
 					"status":     c.State.Name,
+					"parentId":   parent.ID,
 					"priority":   c.Priority,
 					"labels":     labelNames(c.Labels),
 					"url":        c.URL,
 					"blockedBy":  []any{},
 					"blocks":     []any{},
+					"relations":  []any{},
 				}
 			}
 
@@ -1174,9 +1206,16 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 		Short:        "List grooming-target issues for a project",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Apply env defaults for grooming scope (brand-neutral DONMAI_* vars).
+			if project == "" {
+				project = os.Getenv("DONMAI_LINEAR_PROJECT")
+			}
+			if team == "" {
+				team = os.Getenv("DONMAI_LINEAR_TEAM")
+			}
 			if project == "" {
 				return userError(
-					"--project is required",
+					"--project is required (or set DONMAI_LINEAR_PROJECT)",
 					"Usage: "+cmd.UseLine()+" --project \"ProjectName\"",
 				)
 			}
@@ -1252,9 +1291,16 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 		Short:        "List unblocked grooming-target issues for a project",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Apply env defaults for grooming scope (brand-neutral DONMAI_* vars).
+			if project == "" {
+				project = os.Getenv("DONMAI_LINEAR_PROJECT")
+			}
+			if team == "" {
+				team = os.Getenv("DONMAI_LINEAR_TEAM")
+			}
 			if project == "" {
 				return userError(
-					"--project is required",
+					"--project is required (or set DONMAI_LINEAR_PROJECT)",
 					"Usage: "+cmd.UseLine()+" --project \"ProjectName\"",
 				)
 			}
@@ -1509,6 +1555,207 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 	cmd.Flags().StringVar(&team, "team", "", "Team name or key (defaults to source issue's team)")
 	cmd.Flags().StringVar(&project, "project", "", "Project name (defaults to source issue's project)")
 	cmd.Flags().StringVar(&assignee, "assignee", "", "Assignee name or email")
+
+	return cmd
+}
+
+// ─── comment ──────────────────────────────────────────────────────────────────
+
+// newLinearCommentCmd provides the `comment <issue-id> --body <text>` verb used
+// by the backlog groomer to post its run summary. It is a first-class command
+// (rather than an alias for create-comment) so the grooming CLI contract is
+// met exactly: `rensei linear comment <id> --body <text>`.
+func newLinearCommentCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
+	var (
+		body     string
+		bodyFile string
+	)
+
+	cmd := &cobra.Command{
+		Use:          "comment <issue-id>",
+		Short:        "Post a comment on an issue (groomer run summary)",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			resolvedBody, err := resolveFileArg(body, bodyFile)
+			if err != nil {
+				return err
+			}
+			if resolvedBody == "" {
+				return userError(
+					"--body or --body-file is required",
+					"Usage: "+cmd.UseLine()+" --body \"Comment text\"",
+				)
+			}
+
+			client, err := newLinearClient(ds, bin)
+			if err != nil {
+				return err
+			}
+			comment, err := client.CreateComment(cmd.Context(), args[0], resolvedBody)
+			if err != nil {
+				return fmt.Errorf("create comment: %w", err)
+			}
+
+			return writeJSON(cmd.OutOrStdout(), map[string]any{
+				"id":        comment.ID,
+				"body":      comment.Body,
+				"createdAt": comment.CreatedAt,
+			})
+		},
+	}
+
+	cmd.Flags().StringVar(&body, "body", "", "Comment body text")
+	cmd.Flags().StringVar(&bodyFile, "body-file", "", "Path to file containing comment body")
+
+	return cmd
+}
+
+// ─── list-labels ──────────────────────────────────────────────────────────────
+
+// newLinearListLabelsCmd provides `list-labels [--team <id>]`.
+// Returns all issue labels as a JSON array of {id, name} objects.
+// The optional --team flag is accepted for forward-compatibility but Linear's
+// issueLabels query is org-wide; filtering client-side is a future extension.
+func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
+	var team string
+
+	cmd := &cobra.Command{
+		Use:          "list-labels",
+		Short:        "List all issue labels in the workspace",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			client, err := newLinearClient(ds, bin)
+			if err != nil {
+				return err
+			}
+
+			labels, err := client.ListLabels(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("list labels: %w", err)
+			}
+
+			// Sort by name for deterministic output.
+			type labelEntry struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			}
+			out := make([]labelEntry, 0, len(labels))
+			for name, id := range labels {
+				out = append(out, labelEntry{ID: id, Name: name})
+			}
+			sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+			return writeJSON(cmd.OutOrStdout(), out)
+		},
+	}
+
+	cmd.Flags().StringVar(&team, "team", "", "Team id (accepted but currently unused; Linear labels are org-wide)")
+
+	return cmd
+}
+
+// ─── apply-label ──────────────────────────────────────────────────────────────
+
+// newLinearApplyLabelCmd provides `apply-label <issue-id> --label <name>`.
+// Applies an EXISTING label to an issue by name (case-insensitive lookup).
+// Label creation is intentionally gated behind --create to avoid silent
+// failures when the bot identity lacks label-create scope on the Linear app.
+func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
+	var (
+		labelName  string
+		createFlag bool
+	)
+
+	cmd := &cobra.Command{
+		Use:          "apply-label <issue-id>",
+		Short:        "Apply an existing label to an issue",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if labelName == "" {
+				return userError(
+					"--label is required",
+					"Usage: "+cmd.UseLine()+" --label \"Bug\"",
+				)
+			}
+
+			client, err := newLinearClient(ds, bin)
+			if err != nil {
+				return err
+			}
+			ctx := cmd.Context()
+
+			// Fetch the issue to get its current label IDs.
+			issue, err := client.GetIssue(ctx, args[0])
+			if err != nil {
+				return fmt.Errorf("get issue: %w", err)
+			}
+
+			// Resolve the label name to an ID.
+			allLabels, err := client.ListLabels(ctx)
+			if err != nil {
+				return fmt.Errorf("list labels: %w", err)
+			}
+
+			var targetID string
+			for name, id := range allLabels {
+				if strings.EqualFold(name, labelName) {
+					targetID = id
+					break
+				}
+			}
+
+			if targetID == "" {
+				if !createFlag {
+					// Fail loud — do not silently no-op. The bot may lack label-create
+					// scope, so we require explicit opt-in via --create.
+					return userError(
+						fmt.Sprintf("label %q not found in workspace; use --create to create it (requires label-create scope)", labelName),
+						"Available labels: run `"+bin+" linear list-labels` to see existing labels",
+					)
+				}
+				// --create requested: fail loud with a clear message that creation is
+				// not yet implemented. This surfaces scope issues immediately rather
+				// than silently skipping the label.
+				return userError(
+					"label creation (--create) is not yet implemented; ask a workspace admin to create the label first",
+					"After the label exists, run without --create: "+cmd.UseLine()+" --label \""+labelName+"\"",
+				)
+			}
+
+			// Build the merged label set: existing + new (de-duped).
+			labelIDs := make([]string, 0, len(issue.Labels)+1)
+			alreadyApplied := false
+			for _, l := range issue.Labels {
+				labelIDs = append(labelIDs, l.ID)
+				if l.ID == targetID {
+					alreadyApplied = true
+				}
+			}
+			if !alreadyApplied {
+				labelIDs = append(labelIDs, targetID)
+			}
+
+			updated, err := client.UpdateIssue(ctx, issue.ID, linear.UpdateIssueInput{
+				LabelIDs: labelIDs,
+			})
+			if err != nil {
+				return fmt.Errorf("apply label: %w", err)
+			}
+
+			return writeJSON(cmd.OutOrStdout(), map[string]any{
+				"id":             updated.ID,
+				"identifier":     updated.Identifier,
+				"appliedLabel":   labelName,
+				"alreadyApplied": alreadyApplied,
+				"labels":         labelNames(updated.Labels),
+			})
+		},
+	}
+
+	cmd.Flags().StringVar(&labelName, "label", "", "Label name to apply (case-insensitive; must already exist)")
+	cmd.Flags().BoolVar(&createFlag, "create", false, "Allow creating the label if it does not exist (requires label-create scope)")
 
 	return cmd
 }

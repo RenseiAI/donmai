@@ -714,6 +714,12 @@ func (c *Client) UpdateIssue(ctx context.Context, id string, input UpdateIssueIn
 	if input.AssigneeID != "" {
 		inp["assigneeId"] = input.AssigneeID
 	}
+	if input.Priority != nil {
+		inp["priority"] = *input.Priority
+	}
+	if input.Estimate != nil {
+		inp["estimate"] = *input.Estimate
+	}
 
 	vars := map[string]any{"id": id, "input": inp}
 	var data updateIssueData
