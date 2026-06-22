@@ -40,8 +40,8 @@ func newSessionCmd(ds func() afclient.DataSource, projectFunc func() string) *co
 
 	promptSub := newAgentChatCmd(ds)
 	promptSub.Use = "prompt <session-id> <message>"
-	promptSub.Short = "Forward a prompt to a running agent session"
-	promptSub.Long = "Forward a prompt message to a running agent session via the coordinator forward-prompt API."
+	promptSub.Short = "Send a prompt to a running agent session"
+	promptSub.Long = "Send a prompt message to a running agent session via the public sessions prompt endpoint (POST /api/public/sessions/:id/prompt). The <session-id> is the public session id shown by `session list`/`session show`."
 
 	cmd.AddCommand(listSub)
 	cmd.AddCommand(showSub)

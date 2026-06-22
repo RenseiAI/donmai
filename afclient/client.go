@@ -26,6 +26,10 @@ type DataSource interface {
 	ReconnectSession(id string, req ReconnectSessionRequest) (*ReconnectSessionResponse, error)
 	SubmitTask(req SubmitTaskRequest) (*SubmitTaskResponse, error)
 	StopAgent(req StopAgentRequest) (*StopAgentResponse, error)
+	// Deprecated: ForwardPrompt targets POST /api/mcp/forward-prompt, a route
+	// that does not exist on the platform (requests redirect to /login). Use
+	// ChatSession, which posts to the live POST /api/public/sessions/:id/prompt.
+	// Retained only for embed-surface compatibility; no live caller uses it.
 	ForwardPrompt(req ForwardPromptRequest) (*ForwardPromptResponse, error)
 	GetCostReport() (*CostReportResponse, error)
 	ListFleet() (*ListFleetResponse, error)
@@ -398,6 +402,11 @@ func (c *Client) StopAgent(req StopAgentRequest) (*StopAgentResponse, error) {
 }
 
 // ForwardPrompt forwards a message to a running agent session.
+//
+// Deprecated: this posts to /api/mcp/forward-prompt, which does not exist on
+// the platform (requests redirect to /login and return an HTML 200). Use
+// ChatSession, which posts to the live POST /api/public/sessions/:id/prompt.
+// Retained only for embed-surface compatibility; no live caller uses it.
 func (c *Client) ForwardPrompt(req ForwardPromptRequest) (*ForwardPromptResponse, error) {
 	var resp ForwardPromptResponse
 	if err := c.post("/api/mcp/forward-prompt", req, &resp); err != nil {

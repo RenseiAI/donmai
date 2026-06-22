@@ -39,8 +39,9 @@ type MCPSubmitTaskMsg struct{ IssueID string }
 // MCPStopAgentMsg signals a stop-agent action with collected input.
 type MCPStopAgentMsg struct{ TaskID string }
 
-// MCPForwardPromptMsg signals a forward-prompt action with collected input.
-type MCPForwardPromptMsg struct{ TaskID, Message string }
+// MCPPromptSessionMsg signals a prompt-session action with collected input.
+// SessionID is the public session id (POST /api/public/sessions/:id/prompt).
+type MCPPromptSessionMsg struct{ SessionID, Message string }
 
 // MCPCostReportMsg signals a cost-report action.
 type MCPCostReportMsg struct{}
@@ -95,13 +96,13 @@ func DefaultActions() []Action {
 			},
 		},
 		{
-			Name: "Forward Prompt",
+			Name: "Prompt Session",
 			Prompts: []PromptStep{
-				{Label: "Task ID", Field: "taskId"},
+				{Label: "Session ID", Field: "sessionId"},
 				{Label: "Message", Field: "message"},
 			},
 			BuildMsg: func(inputs map[string]string) tea.Msg {
-				return MCPForwardPromptMsg{TaskID: inputs["taskId"], Message: inputs["message"]}
+				return MCPPromptSessionMsg{SessionID: inputs["sessionId"], Message: inputs["message"]}
 			},
 		},
 		{

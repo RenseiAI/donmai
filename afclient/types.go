@@ -174,12 +174,18 @@ type StopAgentResponse struct {
 }
 
 // ForwardPromptRequest matches POST /api/mcp/forward-prompt.
+//
+// Deprecated: the /api/mcp/forward-prompt route does not exist on the
+// platform. Use ChatSessionRequest with ChatSession (POST
+// /api/public/sessions/:id/prompt). Retained for embed-surface compatibility.
 type ForwardPromptRequest struct {
 	TaskID  string `json:"taskId"`
 	Message string `json:"message"`
 }
 
 // ForwardPromptResponse matches the forward-prompt response.
+//
+// Deprecated: see ForwardPromptRequest. Use ChatSessionResponse.
 type ForwardPromptResponse struct {
 	Forwarded     bool   `json:"forwarded"`
 	PromptID      string `json:"promptId"`
