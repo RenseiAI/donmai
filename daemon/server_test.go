@@ -579,6 +579,94 @@ func TestServer_SessionDetail_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+// TestServer_SessionStop_HappyPath verifies POST /api/daemon/sessions/<id>/stop
+// kills a live session, frees its slot, and returns 200 — the daemon half of
+// the deterministic per-session cancel wire (Guard 3 hard out-of-band leg).
+func TestServer_SessionStop_HappyPath(t *testing.T) {
+	d, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	// mustStartDaemon spawns `sleep 10`, so the session stays resident.
+	if _, err := d.AcceptWork(SessionSpec{
+		SessionID: "stop-me", Repository: "github.com/foo/bar", Ref: "main",
+	}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	if d.ActiveSessionCount() != 1 {
+		t.Fatalf("ActiveSessionCount before stop = %d, want 1", d.ActiveSessionCount())
+	}
+
+	var resp afclient.DaemonActionResponse
+	status := requirePost(t, srv.Addr(), "/api/daemon/sessions/stop-me/stop", nil, &resp)
+	if status != http.StatusOK {
+		t.Fatalf("stop status = %d, want 200", status)
+	}
+	if !resp.OK {
+		t.Errorf("resp.OK = false, want true (%+v)", resp)
+	}
+	if d.ActiveSessionCount() != 0 {
+		t.Errorf("ActiveSessionCount after stop = %d, want 0", d.ActiveSessionCount())
+	}
+}
+
+// TestServer_SessionStop_NotFound verifies stopping an unknown id returns 404.
+func TestServer_SessionStop_NotFound(t *testing.T) {
+	_, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	status := requirePost(t, srv.Addr(), "/api/daemon/sessions/never-spawned/stop", nil, nil)
+	if status != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", status)
+	}
+}
+
+// TestServer_SessionStop_MethodNotAllowed verifies a non-POST to the stop
+// route produces 405 (and is not mis-routed to the detail handler).
+func TestServer_SessionStop_MethodNotAllowed(t *testing.T) {
+	_, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	req, _ := http.NewRequest(http.MethodGet, "http://"+srv.Addr()+"/api/daemon/sessions/x/stop", nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", res.StatusCode)
+	}
+}
+
+// TestServer_SessionStop_LeavesSiblingRunning is the HOL-isolation guarantee
+// at the HTTP layer: stopping one session must not terminate the others.
+func TestServer_SessionStop_LeavesSiblingRunning(t *testing.T) {
+	d, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	for _, id := range []string{"keep", "drop"} {
+		if _, err := d.AcceptWork(SessionSpec{
+			SessionID: id, Repository: "github.com/foo/bar", Ref: "main",
+		}); err != nil {
+			t.Fatalf("AcceptWork %q: %v", id, err)
+		}
+	}
+	if d.ActiveSessionCount() != 2 {
+		t.Fatalf("ActiveSessionCount = %d, want 2", d.ActiveSessionCount())
+	}
+
+	if status := requirePost(t, srv.Addr(), "/api/daemon/sessions/drop/stop", nil, nil); status != http.StatusOK {
+		t.Fatalf("stop status = %d, want 200", status)
+	}
+	if d.ActiveSessionCount() != 1 {
+		t.Fatalf("ActiveSessionCount after stop = %d, want 1", d.ActiveSessionCount())
+	}
+	for _, h := range d.ActiveSessions() {
+		if h.SessionID == "drop" {
+			t.Error("stopped session still active")
+		}
+	}
+}
+
 // TestServer_SessionDetail_BindsLocalhostOnly is an explicit guard
 // that the daemon's HTTP server has bound 127.0.0.1 (the localhost-
 // only auth model the F.2.8 wire-up depends on). Failing this test

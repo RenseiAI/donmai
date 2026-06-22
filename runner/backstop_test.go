@@ -130,7 +130,10 @@ func TestShouldExcludeFromBackstop_Table(t *testing.T) {
 // TestShouldBackstop_FailureModes confirms the runner skips the
 // deterministic backstop for failure modes that imply we no longer
 // own the worktree (lost-ownership, timeout) or for unrecoverable
-// programmer errors (provider-resolve).
+// programmer errors (provider-resolve). All cases use a result-
+// sensitive work type (development) so the contract gate is open and
+// only the failure-mode rule decides — see TestShouldBackstop_ContractGate
+// for the work-type gate.
 func TestShouldBackstop_FailureModes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -146,8 +149,44 @@ func TestShouldBackstop_FailureModes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldBackstop(tc.res); got != tc.want {
+			if got := shouldBackstop(tc.res, WorkTypeDevelopmentStr); got != tc.want {
 				t.Fatalf("shouldBackstop = %v; want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShouldBackstop_ContractGate asserts the work-type gate: a
+// non-result-sensitive work type (backlog-groomer, research,
+// refinement) is NEVER backstopped — even on a completed, PR-less
+// result that would otherwise trigger the deterministic git backstop.
+// This is the root-cause fix for the empty marker PR. Result-sensitive
+// types (development, qa, acceptance) are unchanged.
+func TestShouldBackstop_ContractGate(t *testing.T) {
+	// A result that WOULD backstop under a result-sensitive type:
+	// completed, no PR, no skip-worthy failure mode.
+	completedNoPR := &Result{}
+
+	cases := []struct {
+		workType string
+		want     bool
+	}{
+		// Non-result-sensitive → never backstopped (empty-commit fix).
+		{WorkTypeBacklogGroomer, false},
+		{WorkTypeResearch, false},
+		{WorkTypeRefinement, false},
+		{WorkTypeBacklogCreation, false},
+		{"imaginary-future-type", false},
+		// Result-sensitive → behaviour preserved (still backstops).
+		{WorkTypeDevelopmentStr, true},
+		{WorkTypeInflight, true},
+		{WorkTypeQAStr, true},
+		{WorkTypeAcceptance, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.workType, func(t *testing.T) {
+			if got := shouldBackstop(completedNoPR, tc.workType); got != tc.want {
+				t.Fatalf("shouldBackstop(workType=%q) = %v; want %v", tc.workType, got, tc.want)
 			}
 		})
 	}

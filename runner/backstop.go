@@ -157,15 +157,34 @@ func shouldExcludeFromBackstop(path string) bool {
 // Sessions classified as "lost-ownership" or "timeout" skip backstop
 // because the daemon has already lost the right to push from this
 // worker.
-func shouldBackstop(res *Result) bool {
+//
+// workType gates the chain on result-sensitivity (isResultSensitive,
+// sdlc.go): a work type whose completion requires no PR/branch
+// artifact (e.g. WorkTypeBacklogGroomer / research / refinement) is
+// never backstopped into an empty marker PR. This is the root-cause
+// fix for the empty-commit bug: a backlog groomer that posts a comment
+// and exits has nothing to commit, so the deterministic git backstop
+// must not run. Development / qa / acceptance are result-sensitive and
+// keep their existing backstop flow.
+func shouldBackstop(res *Result, workType string) bool {
 	if res == nil {
 		return false
 	}
+	// Contract gate: non-result-sensitive work types never enter the
+	// deterministic git backstop — there is no code to commit/push.
+	if !isResultSensitive(workType) {
+		return false
+	}
 	switch res.FailureMode {
-	case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked:
+	case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
 		// FailureAgentBlocked: the agent deliberately declined — there is
 		// no in-progress work to commit, and an empty-branch backstop PR
 		// would misrepresent a reasoned refusal as abandoned work.
+		// FailureOperatorCancelled: the platform deterministically stopped
+		// the session — the worker has lost the right to push (same posture
+		// as lost-ownership) and the cancel is intentional, so an empty
+		// backstop PR would misrepresent a deliberate cancel as abandoned
+		// work. Mirrors FailureAgentBlocked routing.
 		return false
 	}
 	// If the agent already produced a PR, nothing to do.

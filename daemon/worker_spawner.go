@@ -539,6 +539,53 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	return &handle, nil
 }
 
+// StopSession terminates a single in-flight session by id without
+// disturbing its siblings or pausing the spawner (unlike Drain, which
+// stops accepting and force-kills the whole pool). It looks up the stored
+// spawnedSession, invokes its stored cancel (the same process-teardown
+// machinery Drain uses for stragglers), and deletes it from s.sessions so
+// the capacity slot frees immediately — even if the underlying provider is
+// wedged and the cmd.Wait goroutine has not yet observed the exit.
+//
+// This is the hard out-of-band leg of the deterministic cancel wire
+// (Guard 3): the platform's fast in-band path is the heartbeat stop signal
+// (immediate LostOwnership), and this gives head-of-line-blocking
+// isolation — one stuck session can be killed without a pool drain.
+//
+// Returns false when no session with the given id is currently active
+// (already exited or never spawned); true when a session was found and its
+// cancel invoked + slot freed. Deleting under the lock makes the slot-free
+// race-free against AcceptWork's capacity check; cancel() is invoked after
+// the lock is released so a slow process teardown never blocks AcceptWork.
+//
+// StopSession itself emits the SessionEventEnded lifecycle event (state
+// SessionTerminated) immediately, rather than relying on the spawn
+// goroutine's cmd.Wait → emit: a wedged provider may never let cmd.Wait
+// return, so deferring the event would strand listeners (and the slot-free
+// signal) indefinitely. The spawn goroutine's own cmd.Wait → delete/emit is
+// a no-op once StopSession has removed the entry — it guards on a nil lookup
+// — so the event fires exactly once and a double-free is impossible.
+func (s *WorkerSpawner) StopSession(id string) bool {
+	s.mu.Lock()
+	ss := s.sessions[id]
+	if ss == nil {
+		s.mu.Unlock()
+		return false
+	}
+	delete(s.sessions, id)
+	ss.handle.State = SessionTerminated
+	final := ss.handle
+	s.mu.Unlock()
+
+	// Cancel outside the lock: the stored cancel tears the child process
+	// down (context cancellation → process kill), which can take longer
+	// than we want to hold s.mu (AcceptWork / capacity checks contend on
+	// it). The slot is already freed above.
+	ss.cancel()
+	s.emit(SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: ss.spec})
+	return true
+}
+
 // Drain waits for all in-flight sessions to exit, then resolves. After
 // timeout, remaining sessions receive SIGTERM via context cancellation and
 // the function returns an error indicating how many were forcibly stopped.

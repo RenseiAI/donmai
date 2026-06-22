@@ -113,6 +113,7 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `GET    /api/daemon/sessions`          | List active session handles (incl. `worktreePath`/`projectName`/`repository` enrichment) |
 | `POST   /api/daemon/sessions`          | Accept a session (test entrypoint) |
 | `GET    /api/daemon/sessions/<id>`     | **F.2.8** — per-session detail for the spawned worker |
+| `POST   /api/daemon/sessions/<id>/stop`| Per-session kill: terminate one session + free its slot (200 on stop, 404 if unknown). Siblings unaffected — the HOL-isolation cancel path |
 | `GET    /api/daemon/heartbeat`         | Most-recent heartbeat payload |
 | `GET    /api/daemon/doctor`            | Aggregated health snapshot |
 | `GET    /healthz`                      | Liveness probe |

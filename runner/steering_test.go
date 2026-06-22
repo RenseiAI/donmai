@@ -10,48 +10,94 @@ import (
 )
 
 // TestShouldSteer_Table covers the decision matrix in steering.go.
+// All version-controlled cases use WorkTypeDevelopmentStr (its
+// contract requires a PR); the contract-gate behaviour is exercised
+// separately in TestShouldSteer_ContractGate.
 func TestShouldSteer_Table(t *testing.T) {
 	cases := []struct {
-		name string
-		obs  streamObservation
-		caps agent.Capabilities
-		want bool
+		name     string
+		obs      streamObservation
+		caps     agent.Capabilities
+		workType string
+		want     bool
 	}{
 		{
-			name: "no capability",
-			obs:  streamObservation{terminalSuccess: true},
-			caps: agent.Capabilities{},
-			want: false,
+			name:     "no capability",
+			obs:      streamObservation{terminalSuccess: true},
+			caps:     agent.Capabilities{},
+			workType: WorkTypeDevelopmentStr,
+			want:     false,
 		},
 		{
-			name: "unsuccessful terminal",
-			obs:  streamObservation{terminalSuccess: false},
-			caps: agent.Capabilities{SupportsMessageInjection: true},
-			want: false,
+			name:     "unsuccessful terminal",
+			obs:      streamObservation{terminalSuccess: false},
+			caps:     agent.Capabilities{SupportsMessageInjection: true},
+			workType: WorkTypeDevelopmentStr,
+			want:     false,
 		},
 		{
-			name: "PR already opened",
-			obs:  streamObservation{terminalSuccess: true, pullRequestURL: "https://example.test/pr/1"},
-			caps: agent.Capabilities{SupportsMessageInjection: true},
-			want: false,
+			name:     "PR already opened",
+			obs:      streamObservation{terminalSuccess: true, pullRequestURL: "https://example.test/pr/1"},
+			caps:     agent.Capabilities{SupportsMessageInjection: true},
+			workType: WorkTypeDevelopmentStr,
+			want:     false,
 		},
 		{
-			name: "should steer (injection)",
-			obs:  streamObservation{terminalSuccess: true},
-			caps: agent.Capabilities{SupportsMessageInjection: true},
-			want: true,
+			name:     "should steer (injection)",
+			obs:      streamObservation{terminalSuccess: true},
+			caps:     agent.Capabilities{SupportsMessageInjection: true},
+			workType: WorkTypeDevelopmentStr,
+			want:     true,
 		},
 		{
-			name: "should steer (resume only)",
-			obs:  streamObservation{terminalSuccess: true},
-			caps: agent.Capabilities{SupportsSessionResume: true},
-			want: true,
+			name:     "should steer (resume only)",
+			obs:      streamObservation{terminalSuccess: true},
+			caps:     agent.Capabilities{SupportsSessionResume: true},
+			workType: WorkTypeDevelopmentStr,
+			want:     true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldSteer(tc.obs, tc.caps); got != tc.want {
+			if got := shouldSteer(tc.obs, tc.caps, tc.workType); got != tc.want {
 				t.Fatalf("shouldSteer = %v; want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShouldSteer_ContractGate asserts the work-type gate: a work
+// type whose completion is NOT result-sensitive (backlog-groomer,
+// refinement, research) is NEVER steered toward a commit/PR — even
+// with full provider capability and a successful terminal.
+// Result-sensitive types (development, qa, acceptance) keep their
+// existing steering flow and are UNCHANGED by this gate.
+func TestShouldSteer_ContractGate(t *testing.T) {
+	// A fully steer-eligible observation: succeeded, no PR, provider
+	// supports injection. Only the work-type gate should decide.
+	obs := streamObservation{terminalSuccess: true}
+	caps := agent.Capabilities{SupportsMessageInjection: true}
+
+	cases := []struct {
+		workType string
+		want     bool
+	}{
+		// Non-result-sensitive (no PR/branch artifact) → never steered.
+		{WorkTypeBacklogGroomer, false},
+		{WorkTypeResearch, false},
+		{WorkTypeRefinement, false},
+		{WorkTypeBacklogCreation, false},
+		{"imaginary-future-type", false}, // unknown → not result-sensitive → no steering
+		// Result-sensitive → behaviour preserved (still steerable).
+		{WorkTypeDevelopmentStr, true},
+		{WorkTypeInflight, true},
+		{WorkTypeQAStr, true},
+		{WorkTypeAcceptance, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.workType, func(t *testing.T) {
+			if got := shouldSteer(obs, caps, tc.workType); got != tc.want {
+				t.Fatalf("shouldSteer(workType=%q) = %v; want %v", tc.workType, got, tc.want)
 			}
 		})
 	}

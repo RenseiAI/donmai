@@ -76,4 +76,30 @@ const (
 	// re-runs the agent into the same wall while re-billing the full
 	// context-assembly prefix.
 	FailureAgentBlocked = "agent-blocked"
+
+	// FailureOperatorCancelled indicates the platform deterministically
+	// asked the session to stop — the lock-refresh response carried
+	// {"stop": true}, which the heartbeat pulser surfaces by closing
+	// LostOwnership immediately (the fast in-band leg of the cancel wire,
+	// Guard 3). It is distinct from FailureLostOwnership (a 3-strike
+	// heartbeat fuse or a hand-off) because it is an intentional operator
+	// action: the work was cancelled on purpose, so the platform MUST NOT
+	// blind-re-dispatch it (re-dispatch would just re-run the cancelled
+	// work and re-bill the context prefix). Routing mirrors
+	// FailureAgentBlocked — a terminal, non-retryable outcome the platform
+	// surfaces as cancelled rather than failed-and-retry.
+	FailureOperatorCancelled = "operator-cancelled"
+
+	// FailureNoProgress indicates the idle/no-progress watchdog fired:
+	// the event stream produced no agent.Event for longer than the
+	// configured Options.IdleTimeout window. This catches the
+	// wedged-but-channel-alive class — a session whose events channel is
+	// still open (so it is not a silent exit or a closed channel) but
+	// which has stopped making forward progress (no tool calls, no
+	// assistant text, no terminal Result). The watchdog cancels the
+	// stream context, so the runner observes ctx cancellation; this
+	// failure mode disambiguates the watchdog cut-off from a genuine
+	// ctx/deadline timeout (FailureTimeout) so the platform can route a
+	// stuck session distinctly rather than blind-re-dispatching it.
+	FailureNoProgress = "no-progress"
 )

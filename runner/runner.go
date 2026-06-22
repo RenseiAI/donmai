@@ -53,6 +53,16 @@ const (
 	// number keeps memory bounded; spikes block the provider for at
 	// most one event before backpressure kicks in.
 	DefaultEventBufferSize = 64
+
+	// DefaultIdleTimeout is the no-progress watchdog window applied to
+	// the event stream when [Options.IdleTimeout] is zero. The timer
+	// resets on every agent.Event; when it expires with no event the
+	// runner cancels the stream and classifies the session as
+	// FailureNoProgress. Twelve minutes is comfortably longer than a
+	// normal think/tool-call gap but short enough to free a wedged slot
+	// well before the 2h MaxSessionDuration. A NEGATIVE
+	// Options.IdleTimeout disables the watchdog.
+	DefaultIdleTimeout = 12 * time.Minute
 )
 
 // Options carries the long-lived configuration a Runner needs.
@@ -111,6 +121,19 @@ type Options struct {
 	// falls back to DefaultMaxSessionDuration. Negative disables the
 	// runner-side timeout (caller is responsible for ctx expiry).
 	MaxSessionDuration time.Duration
+
+	// IdleTimeout is the no-progress watchdog window applied to the
+	// event stream. A resettable timer is armed in consumeEvents and
+	// reset on every agent.Event; when it expires with no event in the
+	// window the runner cancels the stream and surfaces
+	// FailureNoProgress — catching the wedged-but-channel-alive class
+	// the MaxSessionDuration ctx misses (a session whose events channel
+	// is still open but which has stopped making forward progress).
+	//
+	// Zero falls back to DefaultIdleTimeout (watchdog ON by default).
+	// NEGATIVE disables the watchdog entirely (caller relies solely on
+	// MaxSessionDuration / external ctx for liveness).
+	IdleTimeout time.Duration
 
 	// PreserveWorktreeOnFailure keeps the worktree on disk after a
 	// failed Run for debugging. Defaults to true in v0.5.0 per F.1.1
@@ -229,6 +252,7 @@ type Runner struct {
 	logger                *slog.Logger
 	now                   func() time.Time
 	maxDuration           time.Duration
+	idleTimeout           time.Duration
 	preserveOnFail        bool
 	preserveAlways        bool
 	skipBackstop          bool
@@ -278,6 +302,7 @@ func New(opts Options) (*Runner, error) {
 		logger:                opts.Logger,
 		now:                   opts.Now,
 		maxDuration:           opts.MaxSessionDuration,
+		idleTimeout:           opts.IdleTimeout,
 		preserveOnFail:        opts.PreserveWorktreeOnFailure,
 		preserveAlways:        opts.PreserveWorktreeAlways,
 		skipBackstop:          opts.SkipBackstop,
@@ -313,6 +338,9 @@ func New(opts Options) (*Runner, error) {
 	}
 	if r.maxDuration == 0 {
 		r.maxDuration = DefaultMaxSessionDuration
+	}
+	if r.idleTimeout == 0 {
+		r.idleTimeout = DefaultIdleTimeout
 	}
 	return r, nil
 }
