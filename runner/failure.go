@@ -76,4 +76,17 @@ const (
 	// re-runs the agent into the same wall while re-billing the full
 	// context-assembly prefix.
 	FailureAgentBlocked = "agent-blocked"
+
+	// FailureNoProgress indicates the idle/no-progress watchdog fired:
+	// the event stream produced no agent.Event for longer than the
+	// configured Options.IdleTimeout window. This catches the
+	// wedged-but-channel-alive class — a session whose events channel is
+	// still open (so it is not a silent exit or a closed channel) but
+	// which has stopped making forward progress (no tool calls, no
+	// assistant text, no terminal Result). The watchdog cancels the
+	// stream context, so the runner observes ctx cancellation; this
+	// failure mode disambiguates the watchdog cut-off from a genuine
+	// ctx/deadline timeout (FailureTimeout) so the platform can route a
+	// stuck session distinctly rather than blind-re-dispatching it.
+	FailureNoProgress = "no-progress"
 )

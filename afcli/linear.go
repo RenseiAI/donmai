@@ -1162,11 +1162,16 @@ func newLinearCheckBlockedCmd(ds func() afclient.DataSource, bin string) *cobra.
 // ─── list-backlog-issues ──────────────────────────────────────────────────────
 
 func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
-	var project string
+	var (
+		project     string
+		team        string
+		statuses    []string
+		parentsOnly bool
+	)
 
 	cmd := &cobra.Command{
 		Use:          "list-backlog-issues",
-		Short:        "List backlog issues for a project",
+		Short:        "List grooming-target issues for a project",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if project == "" {
@@ -1182,12 +1187,12 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 			}
 			ctx := cmd.Context()
 
-			proj, err := client.GetProjectByName(ctx, project)
+			proj, err := client.GetProjectByNameInTeam(ctx, project, team)
 			if err != nil {
 				return fmt.Errorf("resolve project: %w", err)
 			}
 
-			issues, err := client.ListBacklogIssues(ctx, proj.ID)
+			issues, err := client.ListBacklogIssues(ctx, proj.ID, statuses, parentsOnly)
 			if err != nil {
 				return fmt.Errorf("list backlog issues: %w", err)
 			}
@@ -1216,6 +1221,7 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 					"priority":    iss.Priority,
 					"status":      iss.State.Name,
 					"labels":      labelNames(iss.Labels),
+					"parentID":    iss.ParentID,
 				}
 			}
 
@@ -1224,6 +1230,9 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 	}
 
 	cmd.Flags().StringVar(&project, "project", "", "Project name (required)")
+	cmd.Flags().StringVar(&team, "team", "", "Team key, name, or id to disambiguate same-named projects across teams")
+	cmd.Flags().StringSliceVar(&statuses, "statuses", []string{"Icebox"}, "Workflow-state names to enumerate (e.g. Icebox; Backlog is a documented fallback)")
+	cmd.Flags().BoolVar(&parentsOnly, "parents-only", true, "Enumerate only top-level (parent) issues; cascade into sub-issues separately")
 
 	return cmd
 }
@@ -1231,11 +1240,16 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 // ─── list-unblocked-backlog ───────────────────────────────────────────────────
 
 func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
-	var project string
+	var (
+		project     string
+		team        string
+		statuses    []string
+		parentsOnly bool
+	)
 
 	cmd := &cobra.Command{
 		Use:          "list-unblocked-backlog",
-		Short:        "List unblocked backlog issues for a project",
+		Short:        "List unblocked grooming-target issues for a project",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if project == "" {
@@ -1251,12 +1265,12 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 			}
 			ctx := cmd.Context()
 
-			proj, err := client.GetProjectByName(ctx, project)
+			proj, err := client.GetProjectByNameInTeam(ctx, project, team)
 			if err != nil {
 				return fmt.Errorf("resolve project: %w", err)
 			}
 
-			issues, err := client.ListBacklogIssues(ctx, proj.ID)
+			issues, err := client.ListBacklogIssues(ctx, proj.ID, statuses, parentsOnly)
 			if err != nil {
 				return fmt.Errorf("list backlog issues: %w", err)
 			}
@@ -1279,6 +1293,7 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 					"priority":    iss.Priority,
 					"status":      iss.State.Name,
 					"labels":      labelNames(iss.Labels),
+					"parentID":    iss.ParentID,
 					"blocked":     len(blockers) > 0,
 					"blockedBy":   blockers,
 				})
@@ -1314,6 +1329,9 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 	}
 
 	cmd.Flags().StringVar(&project, "project", "", "Project name (required)")
+	cmd.Flags().StringVar(&team, "team", "", "Team key, name, or id to disambiguate same-named projects across teams")
+	cmd.Flags().StringSliceVar(&statuses, "statuses", []string{"Icebox"}, "Workflow-state names to enumerate (e.g. Icebox; Backlog is a documented fallback)")
+	cmd.Flags().BoolVar(&parentsOnly, "parents-only", true, "Enumerate only top-level (parent) issues; cascade into sub-issues separately")
 
 	return cmd
 }

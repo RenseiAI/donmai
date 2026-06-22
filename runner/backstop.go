@@ -157,8 +157,22 @@ func shouldExcludeFromBackstop(path string) bool {
 // Sessions classified as "lost-ownership" or "timeout" skip backstop
 // because the daemon has already lost the right to push from this
 // worker.
-func shouldBackstop(res *Result) bool {
+//
+// workType gates the chain on result-sensitivity (isResultSensitive,
+// sdlc.go): a work type whose completion requires no PR/branch
+// artifact (e.g. WorkTypeBacklogGroomer / research / refinement) is
+// never backstopped into an empty marker PR. This is the root-cause
+// fix for the empty-commit bug: a backlog groomer that posts a comment
+// and exits has nothing to commit, so the deterministic git backstop
+// must not run. Development / qa / acceptance are result-sensitive and
+// keep their existing backstop flow.
+func shouldBackstop(res *Result, workType string) bool {
 	if res == nil {
+		return false
+	}
+	// Contract gate: non-result-sensitive work types never enter the
+	// deterministic git backstop — there is no code to commit/push.
+	if !isResultSensitive(workType) {
 		return false
 	}
 	switch res.FailureMode {

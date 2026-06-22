@@ -790,6 +790,95 @@ func TestLinearListBacklogIssuesMissingProject(t *testing.T) {
 	}
 }
 
+// TestLinearListBacklogIssues_FlagsAndOutput asserts the grooming flags
+// propagate into the GraphQL query/variables and that parentID is
+// projected into the JSON output so a caller can assert it is empty
+// (top-level) on a parents-only listing.
+func TestLinearListBacklogIssues_FlagsAndOutput(t *testing.T) {
+	const teamUUID = "11111111-2222-3333-4444-555555555555"
+
+	// Capture the backlog-issues request body for assertion.
+	var sawStates []any
+	var sawParentNull bool
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			sawStates, _ = req.Variables["states"].([]any)
+			sawParentNull = strings.Contains(req.Query, "parent: { null: true }")
+			issue := `{"id":"issue-1","identifier":"ENG-1","title":"Top","state":{"name":"Icebox"},"parent":null}`
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-backlog-issues",
+		"--project", "TestProject",
+		"--team", teamUUID,
+		"--statuses", "Icebox,Backlog",
+		"--parents-only",
+	)
+	if err != nil {
+		t.Fatalf("list-backlog-issues failed: %v\nout: %s", err, out)
+	}
+
+	if len(sawStates) != 2 || sawStates[0] != "Icebox" || sawStates[1] != "Backlog" {
+		t.Errorf("query states = %v; want [Icebox Backlog]", sawStates)
+	}
+	if !sawParentNull {
+		t.Error("parents-only query missing parent-null clause")
+	}
+
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 1 {
+		t.Fatalf("got %d issues; want 1", len(arr))
+	}
+	item := arr[0].(map[string]any)
+	if _, has := item["parentID"]; !has {
+		t.Errorf("output item missing parentID field: %#v", item)
+	}
+	if item["parentID"] != "" {
+		t.Errorf("top-level issue parentID = %v; want empty", item["parentID"])
+	}
+}
+
+// TestLinearListBacklogIssues_DefaultStatusIsIcebox confirms the
+// command defaults --statuses to Icebox (the grooming target) when the
+// flag is omitted.
+func TestLinearListBacklogIssues_DefaultStatusIsIcebox(t *testing.T) {
+	var sawStates []any
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			sawStates, _ = req.Variables["states"].([]any)
+			writeLinearGQLData(w, `{"issues":{"nodes":[]}}`)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	if _, err := runLinearCmd(t, "", "list-backlog-issues", "--project", "TestProject"); err != nil {
+		t.Fatalf("list-backlog-issues failed: %v", err)
+	}
+	if len(sawStates) != 1 || sawStates[0] != "Icebox" {
+		t.Errorf("default states = %v; want [Icebox]", sawStates)
+	}
+}
+
 // ─── list-unblocked-backlog ───────────────────────────────────────────────────
 
 func TestLinearListUnblockedBacklog(t *testing.T) {

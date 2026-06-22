@@ -6,9 +6,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// uuidRE matches a canonical UUID (the shape Linear uses for entity
+// ids: team/project/issue ids). Used by the team/project resolvers to
+// recognise when the caller passed an id rather than a key/name so the
+// query can match on the `id` field directly.
+var uuidRE = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// looksLikeID reports whether s has the canonical UUID shape Linear
+// uses for entity identifiers.
+func looksLikeID(s string) bool {
+	return uuidRE.MatchString(s)
+}
 
 const defaultBaseURL = "https://api.linear.app/graphql"
 
@@ -52,12 +65,28 @@ const (
 }
 ` + issueFragment
 
-	queryListBacklogIssues = `query ListBacklogIssues($projectId: ID!) {
-  issues(filter: { project: { id: { eq: $projectId } }, state: { name: { eqIgnoreCase: "Backlog" } } }) {
+	// queryListBacklogIssues filters a project's issues by a caller-supplied
+	// set of workflow-state names ($states: [String!]). The parent-null
+	// clause that restricts the result to top-level (parent) issues is
+	// appended dynamically by buildListBacklogQuery — Linear's IssueFilter
+	// is structurally typed, so a `parent: { null: true }` predicate cannot
+	// be made conditional from inside a single static query string. The two
+	// %s placeholders carry the parent clause (empty when parents-only is
+	// off) inside the filter and an empty trailer respectively.
+	queryListBacklogIssuesFmt = `query ListBacklogIssues($projectId: ID!, $states: [String!]) {
+  issues(filter: { project: { id: { eq: $projectId } }, state: { name: { in: $states } }%s }) {
     nodes { ...IssueFields }
   }
 }
 ` + issueFragment
+
+	// parentNullFilterClause is the IssueFilter predicate that restricts a
+	// query to top-level (parent) issues — issues whose `parent` is null.
+	// Verified against Linear's IssueFilter schema: the nullable-relation
+	// predicate is `parent: { null: true }` (a NullableParentFilter), NOT
+	// `parent: { id: { null: true } }`. Spliced into queryListBacklogIssuesFmt
+	// when parents-only listing is requested.
+	parentNullFilterClause = `, parent: { null: true }`
 
 	queryListComments = `query ListComments($issueId: String!) {
   issue(id: $issueId) {
@@ -405,14 +434,38 @@ func (c *Client) ListSubIssues(ctx context.Context, parentID string) ([]Issue, e
 	return nodesToIssues(data.Issues.Nodes), nil
 }
 
-// ListBacklogIssues returns all issues in the named project with state "Backlog".
-func (c *Client) ListBacklogIssues(ctx context.Context, projectID string) ([]Issue, error) {
-	vars := map[string]any{"projectId": projectID}
+// ListBacklogIssues returns the issues in the project whose workflow
+// state matches one of the supplied state names. When states is empty
+// it defaults to {"Backlog"} (the historical behaviour). When
+// parentsOnly is true the result is restricted to top-level issues
+// (parent == null) so a grooming pass enumerates parents and cascades
+// into sub-issues itself rather than treating a sub-issue as a
+// standalone target.
+func (c *Client) ListBacklogIssues(ctx context.Context, projectID string, states []string, parentsOnly bool) ([]Issue, error) {
+	if len(states) == 0 {
+		states = []string{"Backlog"}
+	}
+	vars := map[string]any{
+		"projectId": projectID,
+		"states":    states,
+	}
 	var data listIssuesData
-	if err := c.do(ctx, queryListBacklogIssues, vars, &data); err != nil {
+	if err := c.do(ctx, buildListBacklogQuery(parentsOnly), vars, &data); err != nil {
 		return nil, err
 	}
 	return nodesToIssues(data.Issues.Nodes), nil
+}
+
+// buildListBacklogQuery renders the backlog-issues query, splicing the
+// parent-null filter clause into the IssueFilter when parentsOnly is
+// requested. Kept separate so the (small) string assembly is unit-
+// testable and the format placeholder is never exposed to callers.
+func buildListBacklogQuery(parentsOnly bool) string {
+	clause := ""
+	if parentsOnly {
+		clause = parentNullFilterClause
+	}
+	return fmt.Sprintf(queryListBacklogIssuesFmt, clause)
 }
 
 // GetIssueComments returns comments for the given issue ID.
@@ -493,35 +546,68 @@ func (c *Client) ListLabels(ctx context.Context) (map[string]string, error) {
 	return out, nil
 }
 
-// GetTeamByName returns the team with the given name or key (case-insensitive).
-func (c *Client) GetTeamByName(ctx context.Context, nameOrKey string) (*Team, error) {
-	// Try by key first, then by name
+// GetTeamByName returns the team identified by the given key, name
+// (case-insensitive), or id/UUID. The platform feeds a team UUID in
+// some dispatch paths, so the resolver matches an `id` predicate too
+// (added only when the input has the canonical UUID shape, so a
+// non-UUID key/name is never sent to the ID comparator).
+func (c *Client) GetTeamByName(ctx context.Context, nameOrKeyOrID string) (*Team, error) {
+	or := []map[string]any{
+		{"key": map[string]any{"eqIgnoreCase": nameOrKeyOrID}},
+		{"name": map[string]any{"eqIgnoreCase": nameOrKeyOrID}},
+	}
+	if looksLikeID(nameOrKeyOrID) {
+		or = append(or, map[string]any{"id": map[string]any{"eq": nameOrKeyOrID}})
+	}
 	vars := map[string]any{
-		"filter": map[string]any{
-			"or": []map[string]any{
-				{"key": map[string]any{"eqIgnoreCase": nameOrKey}},
-				{"name": map[string]any{"eqIgnoreCase": nameOrKey}},
-			},
-		},
+		"filter": map[string]any{"or": or},
 	}
 	var data listTeamsData
 	if err := c.do(ctx, queryListTeams, vars, &data); err != nil {
 		return nil, err
 	}
 	if len(data.Teams.Nodes) == 0 {
-		return nil, fmt.Errorf("%w: team %q", ErrNotFound, nameOrKey)
+		return nil, fmt.Errorf("%w: team %q", ErrNotFound, nameOrKeyOrID)
 	}
 	n := data.Teams.Nodes[0]
 	return &Team{ID: n.ID, Key: n.Key, Name: n.Name}, nil
 }
 
-// GetProjectByName returns the project with the given name (case-insensitive).
+// GetProjectByName returns the project with the given name
+// (case-insensitive). It is a thin wrapper over GetProjectByNameInTeam
+// with no team disambiguation.
 func (c *Client) GetProjectByName(ctx context.Context, name string) (*Project, error) {
-	vars := map[string]any{
-		"filter": map[string]any{
-			"name": map[string]any{"eqIgnoreCase": name},
-		},
+	return c.GetProjectByNameInTeam(ctx, name, "")
+}
+
+// GetProjectByNameInTeam returns the project with the given name
+// (case-insensitive), optionally scoped to a team to disambiguate
+// same-named projects across teams. teamID may be a team UUID or a
+// team key/name (resolved to an id first); empty disables the team
+// filter and the resolver behaves like GetProjectByName.
+func (c *Client) GetProjectByNameInTeam(ctx context.Context, name, teamID string) (*Project, error) {
+	filter := map[string]any{
+		"name": map[string]any{"eqIgnoreCase": name},
 	}
+	if teamID != "" {
+		resolvedTeamID := teamID
+		// A key/name (non-UUID) must be resolved to an id before it can
+		// scope the project filter; a UUID is used as-is.
+		if !looksLikeID(teamID) {
+			t, err := c.GetTeamByName(ctx, teamID)
+			if err != nil {
+				return nil, fmt.Errorf("resolve team for project scope: %w", err)
+			}
+			resolvedTeamID = t.ID
+		}
+		// ProjectFilter scopes by team membership via accessibleTeams.
+		filter["accessibleTeams"] = map[string]any{
+			"some": map[string]any{
+				"id": map[string]any{"eq": resolvedTeamID},
+			},
+		}
+	}
+	vars := map[string]any{"filter": filter}
 	var data listProjectsData
 	if err := c.do(ctx, queryListProjects, vars, &data); err != nil {
 		return nil, err
