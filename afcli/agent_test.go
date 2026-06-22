@@ -88,6 +88,11 @@ func (s *stubDataSource) StopAgent(_ afclient.StopAgentRequest) (*afclient.StopA
 	return &afclient.StopAgentResponse{}, nil
 }
 
+// ForwardPrompt is required to satisfy afclient.DataSource. The method and its
+// types are deprecated (use ChatSession), but the stub must keep implementing
+// the interface for embed-surface compatibility, so the deprecation is muted.
+//
+//nolint:staticcheck // SA1019: interface-satisfying stub for deprecated method.
 func (s *stubDataSource) ForwardPrompt(_ afclient.ForwardPromptRequest) (*afclient.ForwardPromptResponse, error) {
 	return &afclient.ForwardPromptResponse{}, nil
 }

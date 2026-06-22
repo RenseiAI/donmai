@@ -530,11 +530,12 @@ func TestDecodeJSONResponseHTMLGET(t *testing.T) {
 	}
 }
 
-// TestDecodeJSONResponseHTMLPOST verifies that the POST path (used by
-// ForwardPrompt / session prompt) also surfaces a useful error when the
-// platform returns an HTML body with a 2xx status. This is the exact
-// scenario reported as "rensei session prompt CLI: HTML-response decode
-// failure".
+// TestDecodeJSONResponseHTMLPOST verifies that the shared POST decode path
+// surfaces a useful error when the platform returns an HTML body with a 2xx
+// status. This is the exact scenario reported as "rensei session prompt CLI:
+// HTML-response decode failure". The live `session prompt`/`agent chat` path
+// now uses ChatSession (POST /api/public/sessions/:id/prompt); ForwardPrompt
+// is retained only as a convenient exerciser of the same generic POST path.
 func TestDecodeJSONResponseHTMLPOST(t *testing.T) {
 	t.Parallel()
 	const htmlBody = "<html><body>Authentication required</body></html>"

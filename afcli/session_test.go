@@ -130,7 +130,7 @@ func TestSessionPromptMatchesAgentChat(t *testing.T) {
 	t.Parallel()
 
 	const (
-		id  = "OPS-674"
+		id  = "mock-001" // public session id known to the mock
 		msg = "hello"
 	)
 
