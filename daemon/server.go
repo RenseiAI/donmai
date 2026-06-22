@@ -116,11 +116,13 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet, s.handlePoolStats))
 	mux.HandleFunc("/api/daemon/pool/evict", s.method(http.MethodPost, s.handlePoolEvict))
 	mux.HandleFunc("/api/daemon/sessions", s.handleSessions) // GET=list, POST=accept
-	// Per-session detail. Spawned `donmai agent run`
-	// processes fetch their full QueuedWork shape from this endpoint.
+	// Per-session sub-routes. Spawned `donmai agent run` processes fetch
+	// their full QueuedWork shape via GET <id>; the deterministic cancel
+	// wire posts to <id>/stop to kill exactly one session + free its slot.
 	// The path-pattern dispatch is custom because the stdlib mux only
-	// supports prefix matching pre-Go 1.22 in this codebase.
-	mux.HandleFunc("/api/daemon/sessions/", s.handleSessionDetail)
+	// supports prefix matching pre-Go 1.22 in this codebase, so the single
+	// prefix handler multiplexes both shapes.
+	mux.HandleFunc("/api/daemon/sessions/", s.handleSessionSubroute)
 	mux.HandleFunc("/api/daemon/heartbeat", s.method(http.MethodGet, s.handleHeartbeat))
 	mux.HandleFunc("/api/daemon/doctor", s.method(http.MethodGet, s.handleDoctor))
 	// providers (Wave 9)
@@ -359,19 +361,36 @@ func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleSessionSubroute multiplexes the per-session paths under the
+// /api/daemon/sessions/ prefix:
+//
+//	GET  /api/daemon/sessions/<id>       → handleSessionDetail
+//	POST /api/daemon/sessions/<id>/stop  → handleSessionStop
+//
+// A single prefix handler is used because the stdlib mux only supports
+// prefix matching pre-Go 1.22 in this codebase. The path tail is parsed
+// here so each leaf handler sees a clean session id.
+func (s *Server) handleSessionSubroute(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/api/daemon/sessions/"
+	tail := strings.TrimPrefix(r.URL.Path, prefix)
+	if id, ok := strings.CutSuffix(tail, "/stop"); ok {
+		s.handleSessionStop(w, r, id)
+		return
+	}
+	s.handleSessionDetail(w, r, tail)
+}
+
 // handleSessionDetail handles GET /api/daemon/sessions/<id> — the
 // detail endpoint a spawned `donmai agent run` process reads on startup
 // to recover its full QueuedWork shape. Localhost-only (the daemon
 // binds to 127.0.0.1); 404s on unknown ids; 405s on non-GET methods.
 //
 // (F.2.8 — daemon wire-up.)
-func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	const prefix = "/api/daemon/sessions/"
-	id := strings.TrimPrefix(r.URL.Path, prefix)
 	if id == "" || strings.Contains(id, "/") {
 		http.NotFound(w, r)
 		return
@@ -385,6 +404,31 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, detail)
+}
+
+// handleSessionStop handles POST /api/daemon/sessions/<id>/stop — the
+// deterministic per-session cancel route (Guard 3 hard out-of-band leg).
+// It kills exactly one in-flight session and frees its capacity slot,
+// leaving siblings untouched (unlike POST /api/daemon/drain). Returns 200
+// on stop, 404 when the id is unknown (already exited or never spawned),
+// 405 on non-POST methods. Localhost-only (the daemon binds to 127.0.0.1).
+func (s *Server) handleSessionStop(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if id == "" || strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.daemon.StopSession(id) {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":     "session not found",
+			"sessionId": id,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "stopped"})
 }
 
 // handleSessions multiplexes GET (list active sessions) and POST (accept work).

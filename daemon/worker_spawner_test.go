@@ -118,6 +118,102 @@ func TestSpawner_Drain_RespectsTimeout(t *testing.T) {
 	}
 }
 
+// TestSpawner_StopSession_RemovesSessionAndFreesSlot covers the R5
+// per-session kill: StopSession(id) on a live session must return true,
+// remove it from the active map (freeing the capacity slot so a new accept
+// at the same cap succeeds), and emit SessionEventEnded — all without
+// disturbing the spawner's accepting state.
+func TestSpawner_StopSession_RemovesSessionAndFreesSlot(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"sleep", "30"},
+	})
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "victim", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if s.ActiveCount() != 1 {
+		t.Fatalf("ActiveCount after accept = %d, want 1", s.ActiveCount())
+	}
+	// At capacity — a second accept must be rejected until the slot frees.
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "next", Repository: "github.com/a/b"}); err == nil {
+		t.Fatal("expected capacity rejection before StopSession")
+	}
+
+	if !s.StopSession("victim") {
+		t.Fatal("StopSession(victim) = false, want true for a live session")
+	}
+	if s.ActiveCount() != 0 {
+		t.Fatalf("ActiveCount after StopSession = %d, want 0 (slot freed)", s.ActiveCount())
+	}
+	// The cmd.Wait goroutine still emits the ended event after the process
+	// is reaped; wait for it so the test does not leak a goroutine.
+	waitSessionEnd(t, ended)
+
+	// Slot is free → the previously-rejected accept now succeeds.
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "next", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("accept after StopSession freed the slot: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Drain(time.Second) })
+
+	// Spawner stays accepting (unlike Drain, StopSession does not pause).
+	if !s.IsAccepting() {
+		t.Error("StopSession must not flip the spawner out of accepting state")
+	}
+}
+
+// TestSpawner_StopSession_UnknownSessionReturnsFalse pins the 404-equivalent
+// contract: stopping an id that is not in flight is a no-op returning false.
+func TestSpawner_StopSession_UnknownSessionReturnsFalse(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 2,
+	})
+	if s.StopSession("does-not-exist") {
+		t.Fatal("StopSession(unknown) = true, want false")
+	}
+}
+
+// TestSpawner_StopSession_LeavesSiblingsRunning is the head-of-line-blocking
+// isolation guarantee: killing one session must not touch the others.
+func TestSpawner_StopSession_LeavesSiblingsRunning(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 3,
+		WorkerCommand:         []string{"sleep", "30"},
+	})
+	ended := sessionEnds(s)
+	t.Cleanup(func() { _ = s.Drain(time.Second) })
+	for _, id := range []string{"a", "b", "c"} {
+		if _, err := s.AcceptWork(SessionSpec{SessionID: id, Repository: "github.com/a/b"}); err != nil {
+			t.Fatalf("accept %q: %v", id, err)
+		}
+	}
+	if s.ActiveCount() != 3 {
+		t.Fatalf("ActiveCount = %d, want 3", s.ActiveCount())
+	}
+
+	if !s.StopSession("b") {
+		t.Fatal("StopSession(b) = false, want true")
+	}
+	waitSessionEnd(t, ended)
+
+	if s.ActiveCount() != 2 {
+		t.Fatalf("ActiveCount after stopping one = %d, want 2", s.ActiveCount())
+	}
+	remaining := map[string]bool{}
+	for _, h := range s.ActiveSessions() {
+		remaining[h.SessionID] = true
+	}
+	if remaining["b"] {
+		t.Error("stopped session b still active")
+	}
+	if !remaining["a"] || !remaining["c"] {
+		t.Errorf("siblings should still be active, got %+v", remaining)
+	}
+}
+
 func TestSpawner_PauseResume(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},

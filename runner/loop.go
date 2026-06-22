@@ -677,9 +677,22 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	select {
 	case <-lostOwnership:
 		res.Status = "failed"
-		res.FailureMode = FailureLostOwnership
-		if res.Error == "" {
-			res.Error = heartbeat.ErrLostOwnership.Error()
+		// Distinguish a deterministic operator cancel ({"stop": true} on
+		// the lock-refresh, surfaced via Pulser.StopRequested) from the
+		// 3-strike heartbeat fuse / hand-off. Operator cancel is an
+		// intentional terminal outcome the platform MUST NOT
+		// blind-re-dispatch, so it gets its own FailureMode (mirroring
+		// FailureAgentBlocked routing); the fuse stays FailureLostOwnership.
+		if pulser != nil && pulser.StopRequested() {
+			res.FailureMode = FailureOperatorCancelled
+			if res.Error == "" {
+				res.Error = "operator cancelled session (lock-refresh stop=true)"
+			}
+		} else {
+			res.FailureMode = FailureLostOwnership
+			if res.Error == "" {
+				res.Error = heartbeat.ErrLostOwnership.Error()
+			}
 		}
 		// Best-effort stop the provider so it doesn't keep tokens
 		// running.

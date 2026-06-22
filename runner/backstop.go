@@ -176,10 +176,15 @@ func shouldBackstop(res *Result, workType string) bool {
 		return false
 	}
 	switch res.FailureMode {
-	case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked:
+	case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
 		// FailureAgentBlocked: the agent deliberately declined — there is
 		// no in-progress work to commit, and an empty-branch backstop PR
 		// would misrepresent a reasoned refusal as abandoned work.
+		// FailureOperatorCancelled: the platform deterministically stopped
+		// the session — the worker has lost the right to push (same posture
+		// as lost-ownership) and the cancel is intentional, so an empty
+		// backstop PR would misrepresent a deliberate cancel as abandoned
+		// work. Mirrors FailureAgentBlocked routing.
 		return false
 	}
 	// If the agent already produced a PR, nothing to do.

@@ -226,6 +226,15 @@ type Pulser struct {
 	strikes  atomic.Int64
 	lastTick atomic.Int64 // unix-millis
 
+	// stopRequested records that the platform sent the deterministic
+	// operator-cancel signal ({"stop": true} on a lock-refresh response).
+	// Set immediately before the LostOwnership channel is closed via the
+	// fast in-band path so the runner can distinguish an operator cancel
+	// (route to FailureOperatorCancelled — do NOT blind-re-dispatch) from
+	// the 3-strike fuse (FailureLostOwnership). Read via StopRequested
+	// after LostOwnership fires.
+	stopRequested atomic.Bool
+
 	// lastAckedInject is the DeliveryID of the most recent inject the
 	// pulser delivered to OnInject AND the consumer accepted. It is echoed
 	// back to the platform on every subsequent request via
@@ -274,6 +283,15 @@ func (p *Pulser) LostOwnership() <-chan struct{} {
 // observability; the runner usually only watches LostOwnership.
 func (p *Pulser) Strikes() int {
 	return int(p.strikes.Load())
+}
+
+// StopRequested reports whether LostOwnership was closed by the platform's
+// deterministic operator-cancel signal ({"stop": true} on a lock-refresh
+// response) rather than by the 3-strike heartbeat fuse. The runner reads it
+// after LostOwnership fires to fork to FailureOperatorCancelled (which is
+// NOT blind-re-dispatched) instead of FailureLostOwnership.
+func (p *Pulser) StopRequested() bool {
+	return p.stopRequested.Load()
 }
 
 // LastTick returns the unix-ms timestamp of the most recent successful
@@ -398,7 +416,13 @@ func (p *Pulser) run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			p.tick(ctx)
-			if p.tripped() {
+			// Exit on either the 3-strike fuse (tripped) or the fast
+			// in-band immediate-lose path (ownershipLost set by
+			// loseOwnershipNow inside doRefresh). Without the
+			// ownershipLost check the loop would keep posting heartbeats
+			// to a session the platform has already told us to stop until
+			// strikes happen to reach the threshold.
+			if p.tripped() || p.ownershipLost() {
 				return
 			}
 		}
@@ -409,6 +433,24 @@ func (p *Pulser) stopChannel() <-chan struct{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.stopCh
+}
+
+// ownershipLost reports whether the LostOwnership channel has been closed,
+// by either the 3-strike fuse (tripped) or the fast in-band immediate-lose
+// path (loseOwnershipNow). Used by the run loop to exit promptly after an
+// operator stop / hand-off without waiting for the strike counter.
+func (p *Pulser) ownershipLost() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lostCh == nil {
+		return false
+	}
+	select {
+	case <-p.lostCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // tripped reports whether the strike counter has reached the lost
@@ -430,6 +472,28 @@ func (p *Pulser) tripped() bool {
 		}
 	}
 	return true
+}
+
+// loseOwnershipNow closes the LostOwnership channel immediately, bypassing
+// the 3-strike fuse. It is the fast in-band leg of the deterministic cancel
+// wire (Guard 3): called from doRefresh the instant the platform answers a
+// lock-refresh with {"stop": true}, so the session dies within one heartbeat
+// interval instead of waiting out three failed ticks. Idempotent — the same
+// guarded-close pattern as tripped() — so a later strike-trip is a no-op.
+// The lostCh is allocated lazily in Start/LostOwnership; on the off chance
+// neither has run yet, allocate it here so the close target exists.
+func (p *Pulser) loseOwnershipNow() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lostCh == nil {
+		p.lostCh = make(chan struct{})
+	}
+	select {
+	case <-p.lostCh:
+		// already closed
+	default:
+		close(p.lostCh)
+	}
 }
 
 // tick performs one heartbeat attempt — including up to maxAttempts
@@ -486,6 +550,14 @@ type refreshRequest struct {
 // has likely already been handed off.
 type refreshResponse struct {
 	Refreshed bool `json:"refreshed"`
+	// Stop is the deterministic operator-cancel signal: when the platform
+	// has flipped the session to a terminal/stopping status it sets
+	// {"stop": true} on the lock-refresh response. The pulser closes
+	// LostOwnership IMMEDIATELY on this (one heartbeat interval, ~30s)
+	// rather than waiting out the 3-strike fuse (~90s+) — the in-band fast
+	// leg of the deterministic cancel wire (Guard 3). The wire field name
+	// is EXACTLY "stop"; the platform half writes the same key.
+	Stop bool `json:"stop"`
 	// Inject is an optional agent-memory inject the platform piggybacks
 	// onto a successful refresh. Only honoured when Refreshed is true (an
 	// inject on a refused refresh is ignored — ownership was lost). Wave 3
@@ -550,10 +622,29 @@ func (p *Pulser) doRefresh(ctx context.Context) error {
 		// Empty-body 204-style response: accepted, nothing to decode.
 		return nil
 	}
+	if out.Stop {
+		// Deterministic operator-cancel (Guard 3 fast in-band leg): the
+		// platform flipped the session to a terminal/stopping status.
+		// Close LostOwnership IMMEDIATELY (one heartbeat interval, ~30s)
+		// instead of waiting out the 3-strike fuse, and record that this
+		// was an operator cancel so the runner forks to
+		// FailureOperatorCancelled rather than FailureLostOwnership. Do
+		// NOT apply any piggybacked inject — the session is being torn
+		// down.
+		p.stopRequested.Store(true)
+		p.loseOwnershipNow()
+		return errors.New("lock-refresh: platform requested stop (stop=true)")
+	}
 	if !out.Refreshed {
 		// Ownership refused — do NOT apply any piggybacked inject. The
 		// platform only routes injects to the current lock holder; a
-		// refused refresh means we are no longer it.
+		// refused refresh means we are no longer it. Close LostOwnership
+		// IMMEDIATELY (the session has already been handed off; there is
+		// nothing to gain from three more failed ticks) — but leave
+		// stopRequested unset so the runner classifies this as
+		// FailureLostOwnership, the correct mode for a hand-off, not an
+		// operator cancel.
+		p.loseOwnershipNow()
 		return errors.New("lock-refresh: platform refused (refreshed=false)")
 	}
 	// Wave 3 runtime memory-inject: the platform piggybacks at most one

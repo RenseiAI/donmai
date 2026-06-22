@@ -185,6 +185,105 @@ func TestRefreshedFalseCountsAsFailure(t *testing.T) {
 	}
 }
 
+// TestStopSignalClosesLostOwnershipImmediately covers the R8 fast in-band
+// cancel leg: a lock-refresh response carrying {"stop": true} must close
+// LostOwnership on the FIRST tick (the synchronous Start tick), well before
+// the 3-strike fuse, and StopRequested must report the operator-cancel
+// origin so the runner forks to FailureOperatorCancelled.
+func TestStopSignalClosesLostOwnershipImmediately(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int64
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		// refreshed:true so the only reason to lose ownership is the
+		// explicit stop flag — this isolates the stop path from the
+		// refreshed=false path.
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true, "stop": true})
+	})
+
+	cfg := heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           24 * time.Hour, // suppress further ticks — first tick must suffice
+		MaxAttemptsPerTick: 1,
+		StrikesUntilLost:   3, // prove we did NOT wait out the fuse
+		Sleep:              func(time.Duration) {},
+	}
+	p, err := heartbeat.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	select {
+	case <-p.LostOwnership():
+		// good — fired immediately
+	case <-time.After(2 * time.Second):
+		t.Fatalf("LostOwnership did not fire on stop=true (hits=%d, strikes=%d)",
+			hits.Load(), p.Strikes())
+	}
+	if !p.StopRequested() {
+		t.Error("StopRequested = false after stop=true; runner cannot distinguish operator cancel")
+	}
+	// The immediate path must NOT have waited for 3 strikes. With a 24h
+	// interval only the synchronous first tick has run, so a single hit
+	// proves the immediate close.
+	if got := hits.Load(); got != 1 {
+		t.Errorf("hits = %d, want exactly 1 (immediate close, no fuse wait)", got)
+	}
+	if got := p.Strikes(); got >= cfg.StrikesUntilLost {
+		t.Errorf("strikes = %d; immediate stop should not have tripped the 3-strike fuse", got)
+	}
+}
+
+// TestRefreshedFalseDoesNotSetStopRequested guards the disambiguation: a
+// hand-off (refreshed=false) closes LostOwnership but is NOT an operator
+// cancel, so StopRequested must stay false (runner → FailureLostOwnership,
+// not FailureOperatorCancelled).
+func TestRefreshedFalseDoesNotSetStopRequested(t *testing.T) {
+	t.Parallel()
+
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": false})
+	})
+
+	cfg := heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           24 * time.Hour,
+		MaxAttemptsPerTick: 1,
+		StrikesUntilLost:   3,
+		Sleep:              func(time.Duration) {},
+	}
+	p, err := heartbeat.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	select {
+	case <-p.LostOwnership():
+	case <-time.After(2 * time.Second):
+		t.Fatal("LostOwnership did not fire on refreshed=false")
+	}
+	if p.StopRequested() {
+		t.Error("StopRequested = true on refreshed=false; should be false (hand-off, not operator cancel)")
+	}
+}
+
 func TestStopIsIdempotent(t *testing.T) {
 	t.Parallel()
 
