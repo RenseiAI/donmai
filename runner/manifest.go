@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -61,6 +62,22 @@ const ManifestSchemaVersion = 1
 // a genuine parse/validation failure (which signals a malformed file the agent
 // DID write).
 var ErrNoManifest = errors.New("runner: no turn-result manifest")
+
+// ErrNoInlineManifest is returned by [ParseInlineManifest] when the agent's
+// final message carries no recoverable inline manifest — either there is no
+// `Intended manifest:` label, or the JSON after it does not parse / validate.
+// Like [ErrNoManifest] it is a benign, expected condition: the caller degrades
+// cleanly to the WORK_RESULT marker scrape rather than failing the turn. It
+// mirrors ErrNoManifest so the inline tier behaves like the file tier.
+var ErrNoInlineManifest = errors.New("runner: no inline turn-result manifest")
+
+// inlineManifestLabelRE matches the `Intended manifest:` label some agents
+// print next to the WORK_RESULT marker as a backstop when their tool policy
+// removed the file-writing tool and they COULD NOT write
+// `.agent/turn-result.json`. Case-insensitive with flexible internal/leading
+// whitespace; the balanced-brace scan that follows starts at the first `{`
+// after the label.
+var inlineManifestLabelRE = regexp.MustCompile(`(?i)intended\s+manifest\s*:`)
 
 // TurnManifest is the deterministic turn-outcome the agent writes to
 // `.agent/turn-result.json`. It is the agent-owned half of the session
@@ -165,6 +182,111 @@ func ParseManifest(worktreePath string) (*TurnManifest, error) {
 	return &m, nil
 }
 
+// ParseInlineManifest recovers a turn-result manifest from an `Intended
+// manifest: { … }` JSON block the agent printed INLINE in its final message.
+//
+// Some stages run under a tool policy that removes the file-writing tool, so the
+// agent CANNOT write `.agent/turn-result.json`. Their prompt has them print the
+// manifest inline next to the WORK_RESULT marker as a backstop. Without this
+// tier the runner would reduce that backstop to only the scraped marker verdict
+// and lose the structured summary; this recovers the full manifest so the same
+// structured outcome the file tier produces reaches the wire.
+//
+// It scans finalMessage for the (case-insensitive, whitespace-flexible)
+// `Intended manifest:` label, extracts the FIRST balanced JSON object after it
+// with a string-literal-aware brace scan (a `{`/`}` inside a JSON string value
+// does NOT truncate the object), and validates the result through the SAME path
+// the file tier uses ([validateManifestSchema] + the [ManifestSchemaVersion]
+// guard + the verdict enum).
+//
+// Returns:
+//   - ([*TurnManifest], nil) when a labelled, balanced, valid manifest is found.
+//   - (nil, [ErrNoInlineManifest]) for every degrade case — no label, no
+//     balanced object after the label, JSON that does not parse, a schema
+//     violation, or an unrecognised schemaVersion. The caller MUST fall through
+//     to the marker scrape on this sentinel; an inline backstop is best-effort
+//     and must never fail the turn on bad text.
+//
+// Pure: no I/O, no mutation. A trailing WORK_RESULT marker (or any other prose)
+// after the JSON object is tolerated — the balanced scan stops at the matching
+// close brace and ignores the remainder.
+func ParseInlineManifest(finalMessage string) (*TurnManifest, error) {
+	loc := inlineManifestLabelRE.FindStringIndex(finalMessage)
+	if loc == nil {
+		return nil, ErrNoInlineManifest
+	}
+
+	raw, ok := extractBalancedJSONObject(finalMessage[loc[1]:])
+	if !ok {
+		return nil, ErrNoInlineManifest
+	}
+
+	if !validateManifestSchema(json.RawMessage(raw)) {
+		return nil, ErrNoInlineManifest
+	}
+
+	var m TurnManifest
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, ErrNoInlineManifest
+	}
+
+	// Version + verdict gates mirror ParseManifest so the inline tier accepts
+	// exactly what the file tier does — no looser contract via a side door.
+	if m.SchemaVersion != ManifestSchemaVersion {
+		return nil, ErrNoInlineManifest
+	}
+	if _, ok := validVerdicts[m.Verdict]; !ok {
+		return nil, ErrNoInlineManifest
+	}
+
+	return &m, nil
+}
+
+// extractBalancedJSONObject returns the FIRST balanced `{ … }` object in s,
+// starting the scan at the first `{`. The scan is string-literal-aware: braces
+// inside a JSON string value (and escaped quotes within it) do NOT affect the
+// nesting depth, so a `}` in a summary string cannot truncate the object early.
+// Returns (object, true) on the matched object, (\"\", false) when there is no
+// opening brace or the object never closes (unbalanced).
+func extractBalancedJSONObject(s string) (string, bool) {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return "", false
+	}
+
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			switch {
+			case escaped:
+				// Previous byte was a backslash; this byte is consumed as the
+				// escaped char (handles \" and \\) and ends the escape.
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1], true
+			}
+		}
+	}
+	return "", false
+}
+
 // validateManifestSchema reports whether raw validates against the manifest
 // JSON Schema. A malformed schema or instance returns false (fail-closed —
 // an unparseable instance can't certify anything). Mirrors
@@ -209,8 +331,17 @@ func validateManifestSchema(raw json.RawMessage) bool {
 //     head sha; the runner's post-backstop git capture is authoritative.
 //
 // Best-effort, never fatal: ErrNoManifest (the common case — the agent wrote
-// no file) is a silent no-op; any other error logs at warn and falls through
-// to the scraped marker. Mutates res + obs in place.
+// no file) falls through to the INLINE tier; any other file error logs at warn
+// and falls through to the scraped marker. Mutates res + obs in place.
+//
+// Resolution order for the structured manifest: the written file FIRST, then —
+// when no file exists — an `Intended manifest: { … }` block recovered from the
+// agent's final message (the same text the marker scan reads). This inline tier
+// exists for stages whose tool policy removed the file-writing tool: they cannot
+// write the file but their prompt has them print the manifest inline as a
+// backstop. The WORK_RESULT marker scrape remains the FINAL fallback below — any
+// inline-parse degrade (ErrNoInlineManifest) is a silent no-op so a bad inline
+// block never fails the turn.
 func (r *Runner) applyTurnManifest(worktreePath string, qw QueuedWork, res *Result, obs *streamObservation) {
 	m, err := ParseManifest(worktreePath)
 	if err != nil {
@@ -219,15 +350,27 @@ func (r *Runner) applyTurnManifest(worktreePath string, qw QueuedWork, res *Resu
 				"sessionId", qw.SessionID,
 				"err", err,
 			)
+			return
 		}
-		return
+		// No file. Try to recover an inline manifest the agent printed in its
+		// final message (a backstop for tool-restricted stages that cannot write
+		// the file). On any degrade, fall through to the marker scrape.
+		m, err = ParseInlineManifest(obs.lastAssistantText)
+		if err != nil {
+			return
+		}
+		r.logger.Info("inline turn-result manifest recovered from final message (no file written)",
+			"sessionId", qw.SessionID,
+			"verdict", m.Verdict,
+			"hasPR", m.PullRequestURL != "",
+		)
+	} else {
+		r.logger.Info("turn-result manifest applied (overrides marker scrape)",
+			"sessionId", qw.SessionID,
+			"verdict", m.Verdict,
+			"hasPR", m.PullRequestURL != "",
+		)
 	}
-
-	r.logger.Info("turn-result manifest applied (overrides marker scrape)",
-		"sessionId", qw.SessionID,
-		"verdict", m.Verdict,
-		"hasPR", m.PullRequestURL != "",
-	)
 
 	// Carry the validated manifest VERBATIM on the envelope so the poster can
 	// post the structured object to the platform's applyTurnManifest route

@@ -164,6 +164,179 @@ func TestParseManifest_EmptyWorktreePath(t *testing.T) {
 	}
 }
 
+func TestParseInlineManifest(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		// wantErr asserts ParseInlineManifest returns the ErrNoInlineManifest
+		// sentinel (every degrade case maps to it).
+		wantErr bool
+		want    *TurnManifest
+	}{
+		{
+			name:    "well-formed inline manifest recovered",
+			message: `Done. Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"shipped it"}`,
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "passed", Summary: "shipped it"},
+		},
+		{
+			name:    "full inline manifest with PR and sha",
+			message: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"tests red","pullRequestUrl":"https://github.com/o/r/pull/7","commitSha":"abc123"}`,
+			want: &TurnManifest{
+				SchemaVersion:  1,
+				Verdict:        "failed",
+				Summary:        "tests red",
+				PullRequestURL: "https://github.com/o/r/pull/7",
+				CommitSHA:      "abc123",
+			},
+		},
+		{
+			name: "brace inside summary string does not truncate",
+			// The summary contains a `}` (and a `{`) inside the JSON string —
+			// a naive first-`}` scan would truncate here. The literal-aware scan
+			// must keep going to the real closing brace.
+			message: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"refactored the func(x) { return x } body"}`,
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "passed", Summary: "refactored the func(x) { return x } body"},
+		},
+		{
+			name:    "escaped quote inside summary tolerated",
+			message: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"used \"quoted\" }text{ inside"}`,
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "passed", Summary: `used "quoted" }text{ inside`},
+		},
+		{
+			name:    "trailing WORK_RESULT marker after JSON tolerated",
+			message: "Intended manifest: {\"schemaVersion\":1,\"verdict\":\"passed\",\"summary\":\"ok\"}\n\nWORK_RESULT:passed",
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "passed", Summary: "ok"},
+		},
+		{
+			name:    "label case-insensitive",
+			message: `INTENDED MANIFEST: {"schemaVersion":1,"verdict":"blocked","blockedReason":"ambiguous spec"}`,
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "blocked", BlockedReason: "ambiguous spec"},
+		},
+		{
+			name:    "label whitespace tolerance",
+			message: "Intended    manifest\t:   {\"schemaVersion\":1,\"verdict\":\"passed\"}",
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "passed"},
+		},
+		{
+			name:    "nested object inside manifest stays balanced",
+			message: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"a {nested {deeper}} note"}`,
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "passed", Summary: "a {nested {deeper}} note"},
+		},
+		{
+			name:    "no label is sentinel",
+			message: `All done. WORK_RESULT:passed`,
+			wantErr: true,
+		},
+		{
+			name:    "empty message is sentinel",
+			message: "",
+			wantErr: true,
+		},
+		{
+			name:    "label but no brace is sentinel",
+			message: `Intended manifest: see above`,
+			wantErr: true,
+		},
+		{
+			name:    "unbalanced JSON is sentinel",
+			message: `Intended manifest: {"schemaVersion":1,"verdict":"passed"`,
+			wantErr: true,
+		},
+		{
+			name:    "malformed JSON is sentinel",
+			message: `Intended manifest: {"schemaVersion":1 "verdict" "passed"}`,
+			wantErr: true,
+		},
+		{
+			name:    "invalid verdict is sentinel",
+			message: `Intended manifest: {"schemaVersion":1,"verdict":"maybe"}`,
+			wantErr: true,
+		},
+		{
+			name:    "missing schemaVersion is sentinel",
+			message: `Intended manifest: {"verdict":"passed"}`,
+			wantErr: true,
+		},
+		{
+			name:    "wrong schemaVersion is sentinel",
+			message: `Intended manifest: {"schemaVersion":99,"verdict":"passed"}`,
+			wantErr: true,
+		},
+		{
+			name:    "missing required verdict is sentinel",
+			message: `Intended manifest: {"schemaVersion":1}`,
+			wantErr: true,
+		},
+		{
+			name:    "non-object json after label is sentinel",
+			message: `Intended manifest: ["passed"]`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseInlineManifest(tt.message)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseInlineManifest() = %+v, want error", got)
+				}
+				if !errors.Is(err, ErrNoInlineManifest) {
+					t.Fatalf("ParseInlineManifest() err = %v, want ErrNoInlineManifest", err)
+				}
+				if got != nil {
+					t.Fatalf("ParseInlineManifest() returned non-nil manifest with error: %+v", got)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("ParseInlineManifest() unexpected error: %v", err)
+			}
+			if *got != *tt.want {
+				t.Fatalf("ParseInlineManifest() = %+v, want %+v", *got, *tt.want)
+			}
+		})
+	}
+}
+
+// TestExtractBalancedJSONObject exercises the string-literal-aware brace scan in
+// isolation — the load-bearing guarantee is that a `}` inside a JSON string
+// value does not close the object early.
+func TestExtractBalancedJSONObject(t *testing.T) {
+	tests := []struct {
+		name   string
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{name: "simple object", in: `{"a":1}`, want: `{"a":1}`, wantOK: true},
+		{name: "leading prose then object", in: `noise {"a":1} trailing`, want: `{"a":1}`, wantOK: true},
+		{name: "brace in string value", in: `{"s":"a } b"}`, want: `{"s":"a } b"}`, wantOK: true},
+		{name: "open brace in string value", in: `{"s":"a { b"}`, want: `{"s":"a { b"}`, wantOK: true},
+		{name: "nested objects", in: `{"o":{"i":1}} tail`, want: `{"o":{"i":1}}`, wantOK: true},
+		{name: "escaped quote then brace in string", in: `{"s":"x\" } y"}`, want: `{"s":"x\" } y"}`, wantOK: true},
+		{name: "escaped backslash before quote", in: `{"s":"x\\"}`, want: `{"s":"x\\"}`, wantOK: true},
+		{name: "no opening brace", in: `no object here`, wantOK: false},
+		{name: "unbalanced never closes", in: `{"a":1`, wantOK: false},
+		{name: "unbalanced nested", in: `{"o":{"i":1}`, wantOK: false},
+		{name: "empty string", in: ``, wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := extractBalancedJSONObject(tt.in)
+			if ok != tt.wantOK {
+				t.Fatalf("extractBalancedJSONObject() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && got != tt.want {
+				t.Fatalf("extractBalancedJSONObject() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // discardRunner returns a Runner whose logger discards everything — enough for
 // applyTurnManifest, which only logs + mutates its arguments.
 func discardRunner() *Runner {
@@ -175,6 +348,9 @@ func TestApplyTurnManifest(t *testing.T) {
 		name string
 		// manifest file content; empty string ⇒ no file written.
 		raw string
+		// inlineMessage seeds obs.lastAssistantText — the agent's final message
+		// the inline tier scans when no file was written. Empty ⇒ no inline text.
+		inlineMessage string
 		// seed values on the Result + observation before applying.
 		seedWorkResult string
 		seedSummary    string
@@ -247,6 +423,61 @@ func TestApplyTurnManifest(t *testing.T) {
 			wantWorkResult: "passed",
 			wantManifest:   false,
 		},
+		{
+			// Resolution order: no file ⇒ the inline tier recovers the structured
+			// manifest from the final message, beating the bare scraped marker.
+			name:           "inline manifest recovered when file absent",
+			raw:            "",
+			inlineMessage:  `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"inline summary"}` + "\nWORK_RESULT:failed",
+			seedWorkResult: "failed", // marker scraped only the bare verdict
+			seedSummary:    "scraped summary",
+			wantWorkResult: "failed",
+			wantSummary:    "inline summary", // the structured summary the marker lost
+			wantManifest:   true,
+		},
+		{
+			// Resolution order: a written file WINS over an inline block — the
+			// file tier is reached first and the inline tier is never consulted.
+			name:           "file manifest preferred over inline when both present",
+			raw:            `{"schemaVersion":1,"verdict":"passed","summary":"file summary"}`,
+			inlineMessage:  `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"inline summary"}`,
+			seedWorkResult: "passed",
+			wantWorkResult: "passed",
+			wantSummary:    "file summary",
+			wantManifest:   true,
+		},
+		{
+			// No file AND no recoverable inline block ⇒ both structured tiers
+			// degrade and the scraped marker stands untouched.
+			name:           "no file and no inline leaves scraped marker",
+			raw:            "",
+			inlineMessage:  "all done, see WORK_RESULT below\nWORK_RESULT:passed",
+			seedWorkResult: "passed",
+			seedSummary:    "scraped summary",
+			wantWorkResult: "passed",
+			wantSummary:    "scraped summary",
+			wantManifest:   false,
+		},
+		{
+			// Inline blocked verdict feeds the blocked signal like a file would.
+			name:           "inline blocked manifest feeds blocked signal",
+			raw:            "",
+			inlineMessage:  `Intended manifest: {"schemaVersion":1,"verdict":"blocked","blockedReason":"needs spec"}`,
+			seedWorkResult: "",
+			wantWorkResult: "",
+			wantBlocked:    true,
+			wantBlockedRsn: "needs spec",
+			wantManifest:   true,
+		},
+		{
+			// A malformed inline block degrades to the marker, never fails.
+			name:           "malformed inline block is a no-op fallback",
+			raw:            "",
+			inlineMessage:  `Intended manifest: {"schemaVersion":1,"verdict":`,
+			seedWorkResult: "passed",
+			wantWorkResult: "passed",
+			wantManifest:   false,
+		},
 	}
 
 	r := discardRunner()
@@ -264,8 +495,9 @@ func TestApplyTurnManifest(t *testing.T) {
 				CommitSHA:      tt.seedCommitSHA,
 			}}
 			obs := &streamObservation{
-				workResult:     tt.seedWorkResult,
-				pullRequestURL: tt.seedPR,
+				workResult:        tt.seedWorkResult,
+				pullRequestURL:    tt.seedPR,
+				lastAssistantText: tt.inlineMessage,
 			}
 
 			r.applyTurnManifest(dir, QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "test-session"}}, res, obs)
