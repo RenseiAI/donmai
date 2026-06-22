@@ -790,6 +790,95 @@ func TestLinearListBacklogIssuesMissingProject(t *testing.T) {
 	}
 }
 
+// TestLinearListBacklogIssues_FlagsAndOutput asserts the grooming flags
+// propagate into the GraphQL query/variables and that parentID is
+// projected into the JSON output so a caller can assert it is empty
+// (top-level) on a parents-only listing.
+func TestLinearListBacklogIssues_FlagsAndOutput(t *testing.T) {
+	const teamUUID = "11111111-2222-3333-4444-555555555555"
+
+	// Capture the backlog-issues request body for assertion.
+	var sawStates []any
+	var sawParentNull bool
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			sawStates, _ = req.Variables["states"].([]any)
+			sawParentNull = strings.Contains(req.Query, "parent: { null: true }")
+			issue := `{"id":"issue-1","identifier":"ENG-1","title":"Top","state":{"name":"Icebox"},"parent":null}`
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-backlog-issues",
+		"--project", "TestProject",
+		"--team", teamUUID,
+		"--statuses", "Icebox,Backlog",
+		"--parents-only",
+	)
+	if err != nil {
+		t.Fatalf("list-backlog-issues failed: %v\nout: %s", err, out)
+	}
+
+	if len(sawStates) != 2 || sawStates[0] != "Icebox" || sawStates[1] != "Backlog" {
+		t.Errorf("query states = %v; want [Icebox Backlog]", sawStates)
+	}
+	if !sawParentNull {
+		t.Error("parents-only query missing parent-null clause")
+	}
+
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 1 {
+		t.Fatalf("got %d issues; want 1", len(arr))
+	}
+	item := arr[0].(map[string]any)
+	if _, has := item["parentID"]; !has {
+		t.Errorf("output item missing parentID field: %#v", item)
+	}
+	if item["parentID"] != "" {
+		t.Errorf("top-level issue parentID = %v; want empty", item["parentID"])
+	}
+}
+
+// TestLinearListBacklogIssues_DefaultStatusIsIcebox confirms the
+// command defaults --statuses to Icebox (the grooming target) when the
+// flag is omitted.
+func TestLinearListBacklogIssues_DefaultStatusIsIcebox(t *testing.T) {
+	var sawStates []any
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			sawStates, _ = req.Variables["states"].([]any)
+			writeLinearGQLData(w, `{"issues":{"nodes":[]}}`)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	if _, err := runLinearCmd(t, "", "list-backlog-issues", "--project", "TestProject"); err != nil {
+		t.Fatalf("list-backlog-issues failed: %v", err)
+	}
+	if len(sawStates) != 1 || sawStates[0] != "Icebox" {
+		t.Errorf("default states = %v; want [Icebox]", sawStates)
+	}
+}
+
 // ─── list-unblocked-backlog ───────────────────────────────────────────────────
 
 func TestLinearListUnblockedBacklog(t *testing.T) {
@@ -1059,6 +1148,462 @@ func TestLinearCreateBlockerMissingTitle(t *testing.T) {
 	_, err := runLinearCmd(t, "", "create-blocker", "ENG-50")
 	if err == nil {
 		t.Fatal("expected error when --title is missing")
+	}
+}
+
+// ─── update-issue --priority / --estimate (C3) ───────────────────────────────
+
+// TestLinearUpdateIssuePriority verifies --priority is forwarded to the
+// update mutation. We capture the GraphQL variables and confirm `priority` is set.
+func TestLinearUpdateIssuePriority(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Prioritised Issue", "Backlog", "team-1", "ENG", "Engineering")
+
+	var capturedInput map[string]any
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "UpdateIssue"):
+			inp, _ := req.Variables["input"].(map[string]any)
+			capturedInput = inp
+			writeLinearGQLData(w, fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, issueJSON))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--priority", "1")
+	if err != nil {
+		t.Fatalf("update-issue --priority failed: %v\nout: %s", err, out)
+	}
+	// JSON numbers decode as float64.
+	if p, ok := capturedInput["priority"].(float64); !ok || int(p) != 1 {
+		t.Errorf("update input priority = %v; want 1", capturedInput["priority"])
+	}
+	// estimate must NOT be present when --estimate is not passed.
+	if _, has := capturedInput["estimate"]; has {
+		t.Errorf("update input should not have estimate when flag omitted: %#v", capturedInput)
+	}
+}
+
+func TestLinearUpdateIssueEstimate(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Estimated Issue", "Backlog", "team-1", "ENG", "Engineering")
+
+	var capturedInput map[string]any
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "UpdateIssue"):
+			inp, _ := req.Variables["input"].(map[string]any)
+			capturedInput = inp
+			writeLinearGQLData(w, fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, issueJSON))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--estimate", "3")
+	if err != nil {
+		t.Fatalf("update-issue --estimate failed: %v\nout: %s", err, out)
+	}
+	if e, ok := capturedInput["estimate"].(float64); !ok || int(e) != 3 {
+		t.Errorf("update input estimate = %v; want 3", capturedInput["estimate"])
+	}
+	if _, has := capturedInput["priority"]; has {
+		t.Errorf("update input should not have priority when flag omitted: %#v", capturedInput)
+	}
+}
+
+// TestLinearUpdateIssuePriorityAndEstimate verifies that --priority 0 is sent
+// (0 = "no priority" is a valid Linear value and must not be silently dropped).
+func TestLinearUpdateIssuePriorityZero(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "No Priority Issue", "Backlog", "team-1", "ENG", "Engineering")
+
+	var capturedInput map[string]any
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "UpdateIssue"):
+			capturedInput, _ = req.Variables["input"].(map[string]any)
+			writeLinearGQLData(w, fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, issueJSON))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	// --priority 0 explicitly: must be forwarded (not treated as "not set").
+	out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--priority", "0")
+	if err != nil {
+		t.Fatalf("update-issue --priority=0 failed: %v\nout: %s", err, out)
+	}
+	p, has := capturedInput["priority"]
+	if !has {
+		t.Fatalf("update input missing priority when --priority=0 was passed: %#v", capturedInput)
+	}
+	if pf, ok := p.(float64); !ok || int(pf) != 0 {
+		t.Errorf("update input priority = %v; want 0", p)
+	}
+}
+
+// ─── update-issue --status (contract alias for --state) ──────────────────────
+
+// TestLinearUpdateIssueStatus verifies that --status (the contract-canonical flag)
+// resolves the state and forwards its ID exactly like --state does.
+func TestLinearUpdateIssueStatus(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantState string
+		wantErr   bool
+	}{
+		{
+			name:      "--status Cancelled resolves state",
+			args:      []string{"update-issue", "ENG-1", "--status", "Cancelled"},
+			wantState: "Cancelled",
+		},
+		{
+			name:      "--status Accepted resolves state",
+			args:      []string{"update-issue", "ENG-1", "--status", "Accepted"},
+			wantState: "Accepted",
+		},
+		{
+			name:      "--state still works unchanged",
+			args:      []string{"update-issue", "ENG-1", "--state", "Finished"},
+			wantState: "Finished",
+		},
+		{
+			name:    "--status and --state with different values is an error",
+			args:    []string{"update-issue", "ENG-1", "--status", "Cancelled", "--state", "Finished"},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			stateName := tc.wantState
+			if stateName == "" {
+				stateName = "Backlog" // placeholder for wantErr cases that never reach the query
+			}
+			issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", stateName, "team-1", "ENG", "Engineering")
+			handler := &multiHandler{
+				responses: map[string]string{
+					"GetIssue":           fmt.Sprintf(`{"issue":%s}`, issueJSON),
+					"ListWorkflowStates": fmt.Sprintf(`{"workflowStates":{"nodes":[{"id":"state-x","name":%q,"type":"completed"}]}}`, stateName),
+					"UpdateIssue":        fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, issueJSON),
+				},
+			}
+			setupLinearTest(t, handler.ServeHTTP)
+
+			out, err := runLinearCmd(t, "", tc.args...)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error but got none; output: %s", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("update-issue failed: %v\nout: %s", err, out)
+			}
+			result := decodeJSON(t, out)
+			if result["status"] != tc.wantState {
+				t.Errorf("status = %v; want %v", result["status"], tc.wantState)
+			}
+		})
+	}
+}
+
+// ─── list-labels (C4) ────────────────────────────────────────────────────────
+
+func TestLinearListLabels(t *testing.T) {
+	labelsData := `{"issueLabels":{"nodes":[
+		{"id":"label-1","name":"Bug"},
+		{"id":"label-2","name":"Feature"},
+		{"id":"label-3","name":"Needs Human"}
+	]}}`
+
+	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeLinearGQLData(w, labelsData)
+	})
+
+	out, err := runLinearCmd(t, "", "list-labels")
+	if err != nil {
+		t.Fatalf("list-labels failed: %v\nout: %s", err, out)
+	}
+
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 3 {
+		t.Fatalf("got %d labels; want 3", len(arr))
+	}
+	// Output is sorted by name.
+	first := arr[0].(map[string]any)
+	if first["name"] != "Bug" {
+		t.Errorf("first label name = %v; want Bug", first["name"])
+	}
+	if first["id"] != "label-1" {
+		t.Errorf("first label id = %v; want label-1", first["id"])
+	}
+}
+
+// ─── apply-label (C4) ────────────────────────────────────────────────────────
+
+func TestLinearApplyLabel(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	// Issue already has label "Feature" from issueNodeJSON fixture.
+	// We apply "Bug" which doesn't yet exist on the issue.
+	labelsData := `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"},{"id":"label-1","name":"Feature"}]}}`
+	updatedJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+
+	var capturedLabelIDs []any
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "issueLabels"):
+			writeLinearGQLData(w, labelsData)
+		case strings.Contains(req.Query, "UpdateIssue"):
+			inp, _ := req.Variables["input"].(map[string]any)
+			capturedLabelIDs, _ = inp["labelIds"].([]any)
+			writeLinearGQLData(w, fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, updatedJSON))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "apply-label", "ENG-1", "--label", "Bug")
+	if err != nil {
+		t.Fatalf("apply-label failed: %v\nout: %s", err, out)
+	}
+
+	result := decodeJSON(t, out)
+	if result["appliedLabel"] != "Bug" {
+		t.Errorf("appliedLabel = %v; want Bug", result["appliedLabel"])
+	}
+	if result["alreadyApplied"] != false {
+		t.Errorf("alreadyApplied = %v; want false", result["alreadyApplied"])
+	}
+	// Should have merged: existing "label-1" (Feature) + new "label-bug" (Bug).
+	if len(capturedLabelIDs) != 2 {
+		t.Errorf("UpdateIssue labelIds = %v; want 2 entries (existing + new)", capturedLabelIDs)
+	}
+}
+
+func TestLinearApplyLabelMissingLabel(t *testing.T) {
+	setupLinearTest(t, func(_ http.ResponseWriter, _ *http.Request) {})
+	_, err := runLinearCmd(t, "", "apply-label", "ENG-1")
+	if err == nil {
+		t.Fatal("expected error when --label flag is missing")
+	}
+}
+
+func TestLinearApplyLabelNotFound(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	labelsData := `{"issueLabels":{"nodes":[{"id":"label-1","name":"Feature"}]}}`
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "issueLabels"):
+			writeLinearGQLData(w, labelsData)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	_, err := runLinearCmd(t, "", "apply-label", "ENG-1", "--label", "NonExistentLabel")
+	if err == nil {
+		t.Fatal("expected error when label does not exist in workspace")
+	}
+	if !strings.Contains(err.Error(), "NonExistentLabel") {
+		t.Errorf("error should mention the label name; got: %v", err)
+	}
+}
+
+// ─── comment (grooming contract verb) ────────────────────────────────────────
+
+func TestLinearComment(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	commentData := fmt.Sprintf(`{"commentCreate":{"success":true,"comment":{"id":"c-run","body":"Grooming run summary","createdAt":%q,"user":null}}}`, now)
+
+	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeLinearGQLData(w, commentData)
+	})
+
+	out, err := runLinearCmd(t, "", "comment", "ENG-1", "--body", "Grooming run summary")
+	if err != nil {
+		t.Fatalf("comment failed: %v\nout: %s", err, out)
+	}
+
+	result := decodeJSON(t, out)
+	if result["id"] != "c-run" {
+		t.Errorf("id = %v; want c-run", result["id"])
+	}
+	if result["body"] != "Grooming run summary" {
+		t.Errorf("body = %v; want Grooming run summary", result["body"])
+	}
+}
+
+func TestLinearCommentMissingBody(t *testing.T) {
+	setupLinearTest(t, func(_ http.ResponseWriter, _ *http.Request) {})
+	_, err := runLinearCmd(t, "", "comment", "ENG-1")
+	if err == nil {
+		t.Fatal("expected error when --body is missing from comment command")
+	}
+}
+
+// ─── list-sub-issues parentId per sub-issue ──────────────────────────────────
+
+func TestLinearListSubIssuesParentIDPerSubIssue(t *testing.T) {
+	parentJSON := issueNodeJSON("parent-1", "ENG-1", "Parent", "Backlog", "team-1", "ENG", "Engineering")
+	childJSON := issueNodeJSON("child-1", "ENG-2", "Child", "Backlog", "team-1", "ENG", "Engineering")
+
+	handler := &multiHandler{
+		responses: map[string]string{
+			"GetIssue":      fmt.Sprintf(`{"issue":%s}`, parentJSON),
+			"ListSubIssues": fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, childJSON),
+		},
+	}
+	setupLinearTest(t, handler.ServeHTTP)
+
+	out, err := runLinearCmd(t, "", "list-sub-issues", "ENG-1")
+	if err != nil {
+		t.Fatalf("list-sub-issues failed: %v\nout: %s", err, out)
+	}
+
+	result := decodeJSON(t, out)
+	subIssues, ok := result["subIssues"].([]any)
+	if !ok || len(subIssues) != 1 {
+		t.Fatalf("subIssues = %v; want 1 entry", result["subIssues"])
+	}
+	sub := subIssues[0].(map[string]any)
+	// Each sub-issue must carry parentId per the grooming CLI contract.
+	if _, has := sub["parentId"]; !has {
+		t.Errorf("sub-issue missing parentId field: %#v", sub)
+	}
+	if sub["parentId"] != "parent-1" {
+		t.Errorf("sub-issue parentId = %v; want parent-1", sub["parentId"])
+	}
+	// relations field must also be present (empty slice).
+	if _, has := sub["relations"]; !has {
+		t.Errorf("sub-issue missing relations field: %#v", sub)
+	}
+}
+
+// ─── env defaults for grooming verbs (A2 donmai half) ────────────────────────
+
+// TestLinearListBacklogIssuesEnvDefaults verifies that DONMAI_LINEAR_PROJECT
+// and DONMAI_LINEAR_TEAM are used when --project/--team flags are omitted.
+// NOTE: must NOT call t.Parallel() — uses t.Setenv.
+func TestLinearListBacklogIssuesEnvDefaults(t *testing.T) {
+	t.Setenv("DONMAI_LINEAR_PROJECT", "EnvProject")
+	t.Setenv("DONMAI_LINEAR_TEAM", "")
+
+	var sawProjectFilter string
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			// Capture the name filter to confirm env var was used.
+			if f, ok := req.Variables["filter"].(map[string]any); ok {
+				if n, ok := f["name"].(map[string]any); ok {
+					sawProjectFilter, _ = n["eqIgnoreCase"].(string)
+				}
+			}
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-env","name":"EnvProject"}]}}`)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			writeLinearGQLData(w, `{"issues":{"nodes":[]}}`)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	// No --project flag: must fall back to DONMAI_LINEAR_PROJECT.
+	out, err := runLinearCmd(t, "", "list-backlog-issues")
+	if err != nil {
+		t.Fatalf("list-backlog-issues from DONMAI_LINEAR_PROJECT failed: %v\nout: %s", err, out)
+	}
+	if sawProjectFilter != "EnvProject" {
+		t.Errorf("project filter = %q; want EnvProject (from DONMAI_LINEAR_PROJECT)", sawProjectFilter)
+	}
+}
+
+// TestLinearListBacklogIssuesMissingProjectWithoutEnv verifies the fail-loud
+// error when neither --project nor DONMAI_LINEAR_PROJECT is set.
+func TestLinearListBacklogIssuesMissingProjectWithoutEnv(t *testing.T) {
+	t.Setenv("DONMAI_LINEAR_PROJECT", "")
+	setupLinearTest(t, func(_ http.ResponseWriter, _ *http.Request) {})
+	_, err := runLinearCmd(t, "", "list-backlog-issues")
+	if err == nil {
+		t.Fatal("expected error when --project and DONMAI_LINEAR_PROJECT are both absent")
+	}
+}
+
+// TestLinearListUnblockedBacklogEnvDefaults mirrors the test above for list-unblocked-backlog.
+func TestLinearListUnblockedBacklogEnvDefaults(t *testing.T) {
+	t.Setenv("DONMAI_LINEAR_PROJECT", "EnvProject2")
+	t.Setenv("DONMAI_LINEAR_TEAM", "")
+
+	var sawProjectFilter string
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			if f, ok := req.Variables["filter"].(map[string]any); ok {
+				if n, ok := f["name"].(map[string]any); ok {
+					sawProjectFilter, _ = n["eqIgnoreCase"].(string)
+				}
+			}
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-env2","name":"EnvProject2"}]}}`)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			writeLinearGQLData(w, `{"issues":{"nodes":[]}}`)
+		case strings.Contains(req.Query, "ListRelations"):
+			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[]},"inverseRelations":{"nodes":[]}}}`)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-unblocked-backlog")
+	if err != nil {
+		t.Fatalf("list-unblocked-backlog from DONMAI_LINEAR_PROJECT failed: %v\nout: %s", err, out)
+	}
+	if sawProjectFilter != "EnvProject2" {
+		t.Errorf("project filter = %q; want EnvProject2 (from DONMAI_LINEAR_PROJECT)", sawProjectFilter)
 	}
 }
 

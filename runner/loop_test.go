@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -683,7 +684,9 @@ func TestShouldBackstop_SkipsBlocked(t *testing.T) {
 	t.Parallel()
 	res := &Result{}
 	res.FailureMode = FailureAgentBlocked
-	if shouldBackstop(res) {
+	// Use a result-sensitive work type so the contract gate is open and
+	// the FailureAgentBlocked rule (not the work-type gate) is what skips.
+	if shouldBackstop(res, WorkTypeDevelopmentStr) {
 		t.Error("shouldBackstop(FailureAgentBlocked) = true; want false")
 	}
 }
@@ -1088,6 +1091,109 @@ func TestConsumeEvents_DispatchesToSink(t *testing.T) {
 	defer rec.mu.Unlock()
 	if got := len(rec.events); got != 4 {
 		t.Fatalf("recorded %d events; want 4 (got=%v)", got, kindsOf(rec.events))
+	}
+}
+
+// TestConsumeEvents_IdleWatchdogFires verifies the no-progress
+// watchdog: a stream whose events channel stays OPEN but emits no
+// event within the IdleTimeout window self-cancels and flags
+// obs.noProgress so the caller classifies FailureNoProgress.
+func TestConsumeEvents_IdleWatchdogFires(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	// Short idle window so the test is fast; the watchdog is otherwise
+	// armed to DefaultIdleTimeout.
+	r.idleTimeout = 30 * time.Millisecond
+
+	// Open channel that never receives — the wedged-but-channel-alive
+	// class the watchdog targets.
+	events := make(chan agent.Event)
+	handle := &fakeHandle{events: events}
+	wpath := t.TempDir()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-IDLE-1")}
+
+	// Parent ctx generously exceeds the idle window so the watchdog (not
+	// the ctx) is what trips.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	enforcer := NewBudgetEnforcer(nil, time.Now())
+
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{})
+	if !obs.noProgress {
+		t.Fatalf("obs.noProgress = false; want true (watchdog should have fired)")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v; want context.Canceled (watchdog cancels the stream ctx)", err)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		t.Fatalf("parent ctx err = %v; want nil (watchdog must not be the parent deadline)", ctxErr)
+	}
+}
+
+// TestConsumeEvents_IdleWatchdogResetsOnEvent verifies the watchdog
+// timer is RESET on every observed event: a stream that emits events
+// faster than the idle window, then terminates, completes normally
+// with no no-progress flag even though the total run exceeds a single
+// idle window.
+func TestConsumeEvents_IdleWatchdogResetsOnEvent(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	r.idleTimeout = 60 * time.Millisecond
+
+	events := make(chan agent.Event)
+	handle := &fakeHandle{events: events}
+	wpath := t.TempDir()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-IDLE-2")}
+
+	// Feed several events spaced under the idle window, then terminate.
+	go func() {
+		for i := 0; i < 4; i++ {
+			time.Sleep(20 * time.Millisecond)
+			events <- agent.AssistantTextEvent{Text: "progress"}
+		}
+		events <- agent.ResultEvent{Success: true}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	enforcer := NewBudgetEnforcer(nil, time.Now())
+
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{})
+	if err != nil {
+		t.Fatalf("consumeEvents: %v; want nil (terminal Result reached)", err)
+	}
+	if obs.noProgress {
+		t.Fatalf("obs.noProgress = true; want false (events kept resetting the watchdog)")
+	}
+	if !obs.terminalSuccess {
+		t.Fatalf("obs.terminalSuccess = false; want true (ResultEvent observed)")
+	}
+}
+
+// TestConsumeEvents_IdleWatchdogDisabled verifies a non-positive
+// IdleTimeout disables the watchdog entirely: a silent open channel is
+// only stopped by the parent ctx, and no-progress is never flagged.
+func TestConsumeEvents_IdleWatchdogDisabled(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	r.idleTimeout = -1 // disabled
+
+	events := make(chan agent.Event)
+	handle := &fakeHandle{events: events}
+	wpath := t.TempDir()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-IDLE-3")}
+
+	// Parent ctx is what stops the consume; it is short so the test is fast.
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	enforcer := NewBudgetEnforcer(nil, time.Now())
+
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{})
+	if obs.noProgress {
+		t.Fatalf("obs.noProgress = true; want false (watchdog disabled)")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v; want context.DeadlineExceeded (parent ctx stops the consume)", err)
 	}
 }
 

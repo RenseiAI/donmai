@@ -677,9 +677,22 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	select {
 	case <-lostOwnership:
 		res.Status = "failed"
-		res.FailureMode = FailureLostOwnership
-		if res.Error == "" {
-			res.Error = heartbeat.ErrLostOwnership.Error()
+		// Distinguish a deterministic operator cancel ({"stop": true} on
+		// the lock-refresh, surfaced via Pulser.StopRequested) from the
+		// 3-strike heartbeat fuse / hand-off. Operator cancel is an
+		// intentional terminal outcome the platform MUST NOT
+		// blind-re-dispatch, so it gets its own FailureMode (mirroring
+		// FailureAgentBlocked routing); the fuse stays FailureLostOwnership.
+		if pulser != nil && pulser.StopRequested() {
+			res.FailureMode = FailureOperatorCancelled
+			if res.Error == "" {
+				res.Error = "operator cancelled session (lock-refresh stop=true)"
+			}
+		} else {
+			res.FailureMode = FailureLostOwnership
+			if res.Error == "" {
+				res.Error = heartbeat.ErrLostOwnership.Error()
+			}
 		}
 		// Best-effort stop the provider so it doesn't keep tokens
 		// running.
@@ -725,6 +738,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 			"detail", budgetErr.Detail,
 		)
 		return res, budgetErr
+	}
+
+	// Idle/no-progress watchdog cut-off. The watchdog cancels the stream
+	// ctx (surfacing context.Canceled), so this must be checked BEFORE
+	// the generic ctx-cancelled timeout branch below to classify the
+	// wedged-but-channel-alive session as FailureNoProgress rather than
+	// FailureTimeout. Stop the provider so it doesn't keep burning tokens.
+	if streamRes.noProgress {
+		res.Status = "failed"
+		res.FailureMode = FailureNoProgress
+		if res.Error == "" {
+			res.Error = fmt.Sprintf("no agent event within idle timeout (%s)", r.idleTimeout)
+		}
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = handle.Stop(stopCtx)
+		stopCancel()
+		return res, streamErr
 	}
 
 	if streamErr != nil && errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
@@ -783,7 +813,17 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// 11. Tail recovery. Skipped entirely when the agent deliberately
 	// declined (FailureAgentBlocked): there is nothing to steer toward and
 	// no work to backstop into an empty branch.
-	if !r.skipSteering && !streamRes.blocked && shouldSteer(streamRes, caps) {
+	//
+	// Belt-and-suspenders bypass on top of the contract gate inside
+	// shouldSteer/shouldBackstop: a non-result-sensitive work type that
+	// already produced a passing WorkResult (marker or manifest verdict,
+	// resolved into res.WorkResult above) has demonstrably completed — it
+	// must not be steered toward a commit nor backstopped into an empty
+	// PR. The contract check alone would already skip these, but the
+	// explicit success marker makes the intent unambiguous and survives a
+	// future contract-table edit.
+	nonVCPassed := !isResultSensitive(qw.WorkType) && res.WorkResult == "passed"
+	if !r.skipSteering && !streamRes.blocked && !nonVCPassed && shouldSteer(streamRes, caps, qw.WorkType) {
 		res.SteeringTriggered = true
 		if err := r.attemptSteering(ctx, handle, qw, streamRes); err != nil {
 			r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
@@ -794,7 +834,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}
 	}
 
-	if !r.skipBackstop && shouldBackstop(res) {
+	if !r.skipBackstop && !nonVCPassed && shouldBackstop(res, qw.WorkType) {
 		bsCtx, bsCancel := context.WithTimeout(context.Background(), 90*time.Second)
 		bsReport := r.runBackstop(bsCtx, qw, branch, res)
 		bsCancel()
@@ -979,6 +1019,13 @@ type streamObservation struct {
 	// classification path to fork to FailureBudgetExceeded instead of
 	// the generic FailureProviderError / FailureSilentExit branches.
 	budgetBreach *BudgetExceededError
+	// noProgress is set when the idle/no-progress watchdog fired — the
+	// event stream produced no agent.Event for longer than the runner's
+	// IdleTimeout window. The runner reads it in the post-stream
+	// classification path to fork to FailureNoProgress instead of the
+	// generic FailureTimeout (ctx-cancelled) branch, so a wedged session
+	// is routed distinctly from a deadline expiry.
+	noProgress bool
 }
 
 // applyTo merges the observation into a Result envelope. Idempotent
@@ -1072,21 +1119,67 @@ func (r *Runner) consumeEvents(
 		_, _ = jsonlFile.Write(append(body, '\n'))
 	}
 
+	// Idle/no-progress watchdog. A resettable timer is reset on every
+	// agent.Event; if no event arrives within r.idleTimeout the session
+	// is wedged-but-channel-alive (the events channel is still open, so
+	// it is not a silent exit, but forward progress has stopped). On
+	// expiry we cancel a stream-scoped context and flag obs.noProgress so
+	// the caller classifies FailureNoProgress instead of the generic
+	// FailureTimeout. A non-positive r.idleTimeout disables the watchdog
+	// (idleC stays nil → its select case never fires).
+	watchCtx, watchCancel := context.WithCancel(ctx)
+	defer watchCancel()
+	var idleTimer *time.Timer
+	var idleC <-chan time.Time
+	if r.idleTimeout > 0 {
+		idleTimer = time.NewTimer(r.idleTimeout)
+		defer idleTimer.Stop()
+		idleC = idleTimer.C
+	}
+	// resetIdle re-arms the watchdog after each observed event. Drains a
+	// possibly-already-fired timer channel before Reset per the stdlib
+	// time.Timer contract.
+	resetIdle := func() {
+		if idleTimer == nil {
+			return
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(r.idleTimeout)
+	}
+
 	for {
 		select {
-		case <-ctx.Done():
-			return obs, ctx.Err()
+		case <-watchCtx.Done():
+			// watchCtx is cancelled either because the parent ctx was
+			// cancelled (timeout / lost-ownership / budget) or because the
+			// watchdog fired below. obs.noProgress disambiguates the latter.
+			return obs, watchCtx.Err()
+		case <-idleC:
+			r.logger.Warn("idle watchdog: no event within window — cancelling stream",
+				"sessionId", qw.SessionID,
+				"idleTimeout", r.idleTimeout.String(),
+			)
+			obs.noProgress = true
+			watchCancel()
+			return obs, watchCtx.Err()
 		case ev, ok := <-handle.Events():
 			if !ok {
 				return obs, nil
 			}
+			// Forward progress observed — re-arm the watchdog.
+			resetIdle()
 			appendJSONL(ev)
 			r.observeEvent(ev, &obs, worktreePath, qw)
 			// Push the event to the platform's activity buffer (best-
 			// effort, non-blocking — the sink drops on overflow / HTTP
 			// failure rather than stalling the runner). Lives next to
 			// observeEvent so steering's tail consume picks it up too.
-			sink.Send(ctx, ev)
+			sink.Send(watchCtx, ev)
 			// Budget enforcement:
 			// every event flows through the enforcer; on a cap breach
 			// we surface the *BudgetExceededError so runLoop can

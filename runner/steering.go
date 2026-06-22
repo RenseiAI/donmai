@@ -26,7 +26,21 @@ import (
 // When neither precondition holds the runner skips steering and goes
 // straight to the deterministic backstop. The decision is encoded
 // here so backstop.go and the loop don't have to re-derive it.
-func shouldSteer(obs streamObservation, caps agent.Capabilities) bool {
+//
+// workType gates the whole chain on the completion contract: a work
+// type whose completion is NOT result-sensitive (isResultSensitive,
+// sdlc.go — the contract requires no PR/branch artifact, e.g.
+// WorkTypeBacklogGroomer / research / refinement which produce only a
+// comment or issue update) NEVER enters the commit/PR steering chain.
+// This exempts non-version-controlled PM work from PR pressure WITHOUT
+// changing behaviour for development / qa / acceptance, all of which
+// are result-sensitive and keep their existing steering flow.
+func shouldSteer(obs streamObservation, caps agent.Capabilities, workType string) bool {
+	// Contract gate: non-result-sensitive work types are never steered
+	// toward a commit/PR — they produce comments/issue updates, not code.
+	if !isResultSensitive(workType) {
+		return false
+	}
 	// Provider must support some form of post-completion steering.
 	if !caps.SupportsMessageInjection && !caps.SupportsSessionResume {
 		return false

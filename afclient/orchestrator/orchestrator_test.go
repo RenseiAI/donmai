@@ -55,7 +55,7 @@ func (m *mockLinear) ListIssues(_ context.Context, _ map[string]any, _ int, _ st
 	return nil, nil
 }
 
-func (m *mockLinear) ListBacklogIssues(_ context.Context, _ string) ([]linear.Issue, error) {
+func (m *mockLinear) ListBacklogIssues(_ context.Context, _ string, _ []string, _ bool) ([]linear.Issue, error) {
 	return nil, nil
 }
 
@@ -80,6 +80,10 @@ func (m *mockLinear) GetTeamByName(_ context.Context, _ string) (*linear.Team, e
 }
 
 func (m *mockLinear) GetProjectByName(_ context.Context, _ string) (*linear.Project, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) GetProjectByNameInTeam(_ context.Context, _, _ string) (*linear.Project, error) {
 	return nil, nil
 }
 

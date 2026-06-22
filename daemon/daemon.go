@@ -398,6 +398,18 @@ func (d *Daemon) Spawner() *WorkerSpawner {
 	return d.spawner
 }
 
+// StopSession terminates a single in-flight session by id and frees its
+// capacity slot. Returns false when the session is unknown (already exited
+// or never spawned) or the spawner is not yet initialised. Wired to the
+// POST /api/daemon/sessions/<id>/stop control-API route for the
+// deterministic per-session cancel path (Guard 3 hard out-of-band leg).
+func (d *Daemon) StopSession(id string) bool {
+	if d.spawner == nil {
+		return false
+	}
+	return d.spawner.StopSession(id)
+}
+
 // maxConcurrentSessions returns the current per-host capacity envelope under
 // the read lock. Capacity can be mutated at runtime via the local control
 // API (POST /api/daemon/capacity → handleSetCapacity), and the heartbeat
