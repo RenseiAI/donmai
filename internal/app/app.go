@@ -119,8 +119,8 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case palette.MCPStopAgentMsg:
 		return a, a.mcpStopAgent(msg.TaskID)
 
-	case palette.MCPForwardPromptMsg:
-		return a, a.mcpForwardPrompt(msg.TaskID, msg.Message)
+	case palette.MCPPromptSessionMsg:
+		return a, a.mcpPromptSession(msg.SessionID, msg.Message)
 
 	case MCPResultMsg:
 		// After an MCP action completes, refresh the dashboard
@@ -202,17 +202,20 @@ func (a *App) mcpStopAgent(taskID string) tea.Cmd {
 	}
 }
 
-func (a *App) mcpForwardPrompt(taskID, message string) tea.Cmd {
+// mcpPromptSession delivers a prompt to a running session via the public
+// sessions prompt endpoint (POST /api/public/sessions/:id/prompt). The id
+// is the public session id shown in the dashboard / `session list`.
+func (a *App) mcpPromptSession(sessionID, message string) tea.Cmd {
 	ds := a.ctx.DataSource
 	return func() tea.Msg {
-		resp, err := ds.ForwardPrompt(afclient.ForwardPromptRequest{TaskID: taskID, Message: message})
+		resp, err := ds.ChatSession(sessionID, afclient.ChatSessionRequest{Prompt: message})
 		if err != nil {
-			return MCPResultMsg{Action: "forward-prompt", Success: false, Message: err.Error()}
+			return MCPResultMsg{Action: "prompt-session", Success: false, Message: err.Error()}
 		}
 		return MCPResultMsg{
-			Action:  "forward-prompt",
-			Success: resp.Forwarded,
-			Message: fmt.Sprintf("Prompt %s forwarded to %s", resp.PromptID, resp.TaskID),
+			Action:  "prompt-session",
+			Success: resp.Delivered,
+			Message: fmt.Sprintf("Prompt %s delivered to %s", resp.PromptID, resp.SessionID),
 		}
 	}
 }

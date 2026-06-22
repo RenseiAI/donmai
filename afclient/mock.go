@@ -292,6 +292,9 @@ func (m *MockClient) StopAgent(req StopAgentRequest) (*StopAgentResponse, error)
 }
 
 // ForwardPrompt returns a mock prompt-forwarding response.
+//
+// Deprecated: see Client.ForwardPrompt. Use ChatSession. Retained so
+// MockClient continues to satisfy DataSource for embed-surface compatibility.
 func (m *MockClient) ForwardPrompt(req ForwardPromptRequest) (*ForwardPromptResponse, error) {
 	return &ForwardPromptResponse{Forwarded: true, PromptID: "mock-prm-1", TaskID: req.TaskID, IssueID: req.TaskID, SessionStatus: "running"}, nil
 }
