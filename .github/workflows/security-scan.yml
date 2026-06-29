@@ -16,17 +16,17 @@ jobs:
     name: Secret scan (trufflehog)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
       - name: TruffleHog
-        uses: trufflesecurity/trufflehog@d411fff7b8879a62509f3fa98c07f247ac089a51 # v3.95.5
+        uses: trufflesecurity/trufflehog@f446421baf832d6356c42c1743d99abff52ff334 # v3.95.7
         with:
           extra_args: --only-verified
   govulncheck:
     name: Go vuln scan (report-only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with: { go-version: "1.25.x" }
       - name: govulncheck
@@ -37,7 +37,7 @@ jobs:
     name: SAST (semgrep, report-only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - name: Run semgrep
