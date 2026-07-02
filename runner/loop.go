@@ -20,6 +20,7 @@ import (
 	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/state"
 	"github.com/RenseiAI/donmai/runtime/statehome"
+	"github.com/RenseiAI/donmai/runtime/stepheartbeat"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -628,6 +629,47 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	} else {
 		sink = actPoster
 		defer func() { _ = actPoster.Stop() }()
+	}
+
+	// 9c. Start the step-heartbeat emitter (mirrors the heartbeat pulser +
+	// activity poster per-session lifecycle). Every 15s it POSTs a
+	// decoupled step-liveness beat to /api/sessions/<id>/step-heartbeat so
+	// the platform can stamp agent_sessions.last_step_heartbeat +
+	// last_progress_at and refresh the Redis session:heartbeat pointer —
+	// closing governor Class-1 stale detection for the worker-alive/
+	// session-wedged case (a runner still holding its ownership lock but
+	// producing no genuine tool/token events for minutes). Best-effort: a
+	// construction/start error is logged and skipped, and a POST failure
+	// (including a 404 from a platform build without the companion route)
+	// is swallowed inside the emitter — a step-heartbeat outage must never
+	// fail the run. Wave 3 item 1.
+	var stepCredentialProvider stepheartbeat.CredentialProvider
+	if r.credentialProvider != nil {
+		stepCredentialProvider = func(ctx context.Context) (stepheartbeat.RuntimeCredentials, error) {
+			creds, err := r.credentialProvider(ctx)
+			return stepheartbeat.RuntimeCredentials{
+				WorkerID:  creds.WorkerID,
+				AuthToken: creds.AuthToken,
+			}, err
+		}
+	}
+	stepEmitter, stepErr := stepheartbeat.New(stepheartbeat.Config{
+		SessionID:          qw.SessionID,
+		WorkerID:           qw.WorkerID,
+		BaseURL:            qw.PlatformURL,
+		AuthToken:          qw.AuthToken,
+		CredentialProvider: stepCredentialProvider,
+		HTTPClient:         r.httpClient,
+		Logger:             r.logger,
+		// Interval intentionally left at the 15s default — calibrated
+		// against the platform's 60s SESSION_STALE_THRESHOLD_MS.
+	})
+	if stepErr != nil {
+		r.logger.Warn("step-heartbeat construct failed", "err", stepErr)
+	} else if startErr := stepEmitter.Start(ctx); startErr != nil {
+		r.logger.Warn("step-heartbeat start failed", "err", startErr)
+	} else {
+		defer func() { _ = stepEmitter.Stop() }()
 	}
 
 	// ── Interview run-mode branch ─────────────────────────────
