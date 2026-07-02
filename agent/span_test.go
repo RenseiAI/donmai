@@ -120,9 +120,9 @@ func TestSpan_AllKindsRoundTrip(t *testing.T) {
 		},
 		{
 			"agent",
-			AgentSpan{SpanCore: fullSpanCore(SpanKindAgent), AgentProvider: "claude"},
+			SessionSpan{SpanCore: fullSpanCore(SpanKindAgent), AgentProvider: "claude"},
 			SpanKindAgent,
-			"agent.AgentSpan",
+			"agent.SessionSpan",
 		},
 		{
 			"subagent",
@@ -180,7 +180,7 @@ func TestSpan_KindWireValues(t *testing.T) {
 		{ToolSpan{SpanCore: SpanCore{Kind: SpanKindTool}}, "tool"},
 		{ChainSpan{SpanCore: SpanCore{Kind: SpanKindChain}}, "chain"},
 		{RetrievalSpan{SpanCore: SpanCore{Kind: SpanKindRetrieval}}, "retrieval"},
-		{AgentSpan{SpanCore: SpanCore{Kind: SpanKindAgent}}, "agent"},
+		{SessionSpan{SpanCore: SpanCore{Kind: SpanKindAgent}}, "agent"},
 		{SubagentSpan{SpanCore: SpanCore{Kind: SpanKindSubagent}}, "subagent"},
 	}
 	for _, tc := range cases {
@@ -279,10 +279,10 @@ func TestSpan_GoldenMatches(t *testing.T) {
 	want = append(want, '\n')
 
 	if *updateGolden {
-		if err := os.MkdirAll(filepath.Dir(goldenLlmCallPath), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(goldenLlmCallPath), 0o750); err != nil {
 			t.Fatalf("mkdir testdata: %v", err)
 		}
-		if err := os.WriteFile(goldenLlmCallPath, want, 0o644); err != nil {
+		if err := os.WriteFile(goldenLlmCallPath, want, 0o600); err != nil {
 			t.Fatalf("write golden: %v", err)
 		}
 		t.Logf("updated golden fixture %s", goldenLlmCallPath)

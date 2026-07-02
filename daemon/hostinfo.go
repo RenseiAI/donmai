@@ -243,6 +243,7 @@ func osReleaseValue(key string) string {
 func runSysctlString(name string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	//nolint:gosec // G204: fixed system command (sysctl); name is a hardcoded metric key, never user input.
 	out, err := exec.CommandContext(ctx, "sysctl", "-n", name).Output()
 	if err != nil {
 		return ""

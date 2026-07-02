@@ -238,18 +238,18 @@ type RetrievalSpan struct {
 func (RetrievalSpan) spanKind() SpanKind { return SpanKindRetrieval }
 func (RetrievalSpan) isSpan()            {}
 
-// AgentSpan is the whole-session root span.
-type AgentSpan struct {
+// SessionSpan is the whole-session root span.
+type SessionSpan struct {
 	SpanCore
 	// AgentProvider is the harness/provider that ran the session.
 	AgentProvider string `json:"agentProvider,omitempty"`
 }
 
-func (AgentSpan) spanKind() SpanKind { return SpanKindAgent }
-func (AgentSpan) isSpan()            {}
+func (SessionSpan) spanKind() SpanKind { return SpanKindAgent }
+func (SessionSpan) isSpan()            {}
 
 // SubagentSpan is a spawned sub-agent; its parentSpanId anchors it under
-// the enclosing AgentSpan.
+// the enclosing SessionSpan.
 type SubagentSpan struct {
 	SpanCore
 	// SubagentProvider is the sub-agent harness/provider.
@@ -262,7 +262,7 @@ func (SubagentSpan) isSpan()            {}
 // Span is the sealed-interface base type for all span variants.
 //
 // Implementations: LlmCallSpan, ToolSpan, ChainSpan, RetrievalSpan,
-// AgentSpan, SubagentSpan. The unexported isSpan marker seals the
+// SessionSpan, SubagentSpan. The unexported isSpan marker seals the
 // interface so external packages cannot add variants, keeping the
 // discriminated union closed. spanKind reports the variant's canonical
 // kind (it is unexported to avoid colliding with the SpanCore.Kind
@@ -327,9 +327,9 @@ func UnmarshalSpan(data []byte) (Span, error) {
 		}
 		return s, nil
 	case SpanKindAgent:
-		var s AgentSpan
+		var s SessionSpan
 		if err := json.Unmarshal(data, &s); err != nil {
-			return nil, fmt.Errorf("agent: decode AgentSpan: %w", err)
+			return nil, fmt.Errorf("agent: decode SessionSpan: %w", err)
 		}
 		return s, nil
 	case SpanKindSubagent:
