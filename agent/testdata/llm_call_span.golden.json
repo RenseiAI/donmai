@@ -1,0 +1,31 @@
+{
+  "traceId": "0af7651916cd43dd8448eb211c80319c",
+  "spanId": "b7ad6b7169203331",
+  "parentSpanId": "b9c7c989f97918e1",
+  "kind": "llm",
+  "name": "chat anthropic/claude-opus",
+  "startTimeUnixNano": "1719600000000000000",
+  "endTimeUnixNano": "1719600002500000000",
+  "status": {
+    "code": "OK"
+  },
+  "donmai": {
+    "orgId": "org_123",
+    "workspaceId": "org_123",
+    "sessionId": "sess_abc",
+    "workType": "sdlc",
+    "poolId": "pool_1",
+    "cedarDecisionId": "dec_9",
+    "promptHash": "sha256:aa",
+    "contextHash": "sha256:bb",
+    "modelSnapshotId": "snap_7"
+  },
+  "genAi": {
+    "system": "anthropic",
+    "requestModel": "claude-opus-4",
+    "usageInputTokens": 1200,
+    "usageOutputTokens": 340,
+    "usageCacheReadInputTokens": 800,
+    "responseFinishReason": "end_turn"
+  }
+}
