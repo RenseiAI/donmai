@@ -408,3 +408,103 @@ func TestHeartbeatService_AllowlistOmittedWhenUnconfigured(t *testing.T) {
 		t.Errorf("Allowlist = %v, want nil", captured.Allowlist)
 	}
 }
+
+// TestHeartbeatService_LoadRoundTrips confirms the item-8 per-beat load sample
+// is wired end-to-end: when GetLoad reports ok, the outbound body carries a
+// nested load:{cpu,memory} object with the exact key names the platform
+// heartbeat route parses (heartbeat/route.ts:127-138 → last_cpu_pct/last_mem_pct).
+func TestHeartbeatService_LoadRoundTrips(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	var (
+		mu  sync.Mutex
+		raw map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		buf, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(buf, &raw)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+	}))
+	t.Cleanup(srv.Close)
+
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID:        "wkr_load",
+		Hostname:        "h",
+		OrchestratorURL: srv.URL,
+		RuntimeJWT:      "runtime.jwt.value",
+		IntervalSeconds: 60,
+		GetActiveCount:  func() int { return 1 },
+		GetMaxCount:     func() int { return 4 },
+		GetStatus:       func() RegistrationStatus { return RegistrationIdle },
+		GetLoad: func() (float64, float64, bool) {
+			return 37.5, 62.0, true
+		},
+	})
+	hs.sendOne(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	load, ok := raw["load"].(map[string]any)
+	if !ok {
+		t.Fatalf("body.load missing or not an object: %v", raw["load"])
+	}
+	if got, _ := load["cpu"].(float64); got != 37.5 {
+		t.Errorf("load.cpu = %v, want 37.5", load["cpu"])
+	}
+	if got, _ := load["memory"].(float64); got != 62.0 {
+		t.Errorf("load.memory = %v, want 62.0", load["memory"])
+	}
+}
+
+// TestHeartbeatService_LoadOmittedWhenSamplerMisses confirms the load key is
+// omitted entirely (omitempty on the *heartbeatLoadFields pointer) when GetLoad
+// reports ok=false or is nil — so an absent sample is distinguishable from a
+// genuine {cpu:0,memory:0} and an old platform simply ignores the missing key.
+func TestHeartbeatService_LoadOmittedWhenSamplerMisses(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	cases := []struct {
+		name    string
+		getLoad func() (float64, float64, bool)
+	}{
+		{"nil sampler", nil},
+		{"sampler miss (ok=false)", func() (float64, float64, bool) { return 12, 34, false }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu  sync.Mutex
+				raw map[string]any
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				buf, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(buf, &raw)
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+			}))
+			t.Cleanup(srv.Close)
+
+			hs := NewHeartbeatService(HeartbeatOptions{
+				WorkerID:        "wkr_noload",
+				Hostname:        "h",
+				OrchestratorURL: srv.URL,
+				RuntimeJWT:      "runtime.jwt.value",
+				IntervalSeconds: 60,
+				GetActiveCount:  func() int { return 0 },
+				GetMaxCount:     func() int { return 1 },
+				GetStatus:       func() RegistrationStatus { return RegistrationIdle },
+				GetLoad:         tc.getLoad,
+			})
+			hs.sendOne(context.Background())
+
+			mu.Lock()
+			defer mu.Unlock()
+			if _, present := raw["load"]; present {
+				t.Errorf("expected load key absent, got %v", raw["load"])
+			}
+		})
+	}
+}

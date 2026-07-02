@@ -908,3 +908,124 @@ func TestCachedMatchesMode(t *testing.T) {
 		})
 	}
 }
+
+// TestRegister_RegionAndHostInfoWire verifies the item-8 additions round-trip
+// onto the wire with the EXACT JSON key names the platform register route
+// parses (register/route.ts HostInfoBody + body.region → worker_hosts columns).
+// It captures the raw request body and asserts key presence/nesting rather than
+// only the Go struct, since the contract is the JSON shape.
+func TestRegister_RegionAndHostInfoWire(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	var raw map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(buf, &raw)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workerId":          "wkr_hi",
+			"runtimeToken":      "real.jwt.value",
+			"heartbeatInterval": 30000,
+			"pollInterval":      5000,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	tok := "rsk_live_" + "hi" //nolint:gosec // synthetic
+	_, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		MachineID:         "m",
+		Hostname:          "h",
+		Version:           "9.9.9",
+		MaxAgents:         2,
+		Region:            "us-west-2",
+		JWTPath:           jwtPath,
+		HostInfo: &HostInfo{
+			IP:            "10.0.0.5",
+			OS:            "linux",
+			OSVersion:     "22.04",
+			Arch:          "arm64",
+			CPUCores:      8,
+			CPUModel:      "Test CPU",
+			MemTotalMB:    16384,
+			DaemonVersion: "9.9.9",
+			StartedAt:     "2026-07-01T00:00:00Z",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Top-level region key.
+	if got, _ := raw["region"].(string); got != "us-west-2" {
+		t.Errorf("body.region = %v, want us-west-2", raw["region"])
+	}
+
+	hi, ok := raw["hostInfo"].(map[string]any)
+	if !ok {
+		t.Fatalf("body.hostInfo missing or not an object: %v", raw["hostInfo"])
+	}
+	// Exact platform-parsed key names (register/route.ts:65-76).
+	wantStr := map[string]string{
+		"ip":            "10.0.0.5",
+		"os":            "linux",
+		"osVersion":     "22.04",
+		"arch":          "arm64",
+		"cpuModel":      "Test CPU",
+		"daemonVersion": "9.9.9",
+		"startedAt":     "2026-07-01T00:00:00Z",
+	}
+	for k, want := range wantStr {
+		if got, _ := hi[k].(string); got != want {
+			t.Errorf("hostInfo.%s = %v, want %q", k, hi[k], want)
+		}
+	}
+	// Numbers decode as float64 through map[string]any.
+	if got, _ := hi["cpuCores"].(float64); got != 8 {
+		t.Errorf("hostInfo.cpuCores = %v, want 8", hi["cpuCores"])
+	}
+	if got, _ := hi["memTotalMb"].(float64); got != 16384 {
+		t.Errorf("hostInfo.memTotalMb = %v, want 16384", hi["memTotalMb"])
+	}
+}
+
+// TestRegister_OmitsRegionAndHostInfoWhenUnset confirms the fields are
+// omitempty: a registration with no region and nil HostInfo must not emit the
+// `region` / `hostInfo` keys at all (an old platform simply ignores absent
+// keys — back-compat guarantee).
+func TestRegister_OmitsRegionAndHostInfoWhenUnset(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	var raw map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(buf, &raw)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workerId":          "wkr_bare",
+			"runtimeToken":      "real.jwt.value",
+			"heartbeatInterval": 30000,
+			"pollInterval":      5000,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
+	tok := "rsk_live_" + "bare" //nolint:gosec // synthetic
+	if _, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:   srv.URL,
+		RegistrationToken: tok,
+		Hostname:          "h",
+		Version:           "1.0.0",
+		MaxAgents:         1,
+		JWTPath:           jwtPath,
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, present := raw["region"]; present {
+		t.Errorf("expected region key absent when unset, got %v", raw["region"])
+	}
+	if _, present := raw["hostInfo"]; present {
+		t.Errorf("expected hostInfo key absent when nil, got %v", raw["hostInfo"])
+	}
+}
