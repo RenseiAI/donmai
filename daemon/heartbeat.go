@@ -28,6 +28,16 @@ type HeartbeatOptions struct {
 	GetStatus       func() RegistrationStatus
 	Region          string
 
+	// GetLoad returns the current CPU and memory utilisation percentages
+	// (0–100) for this beat. ok=false means "no sample this beat" and the
+	// outbound body omits the `load` key entirely (the platform then leaves
+	// worker_hosts.last_cpu_pct / last_mem_pct unchanged). Called once per
+	// beat. Optional — leave nil to never sample, matching the
+	// GetAllowlist/OnHostStatus optional-callback convention above. Wire it to
+	// SampleLoad for the stdlib best-effort probe (item 8, per-beat load →
+	// last_cpu_pct/last_mem_pct).
+	GetLoad func() (cpuPct, memPct float64, ok bool)
+
 	// GetAllowlist returns the daemon's current project allowlist entries
 	// (derived from cfg.Projects). Called every beat so a hot yaml reload
 	// (when that lands) or in-process mutation reflects in the next
@@ -241,6 +251,15 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		h.mu.Unlock()
 	}
 
+	// Item 8: sample per-beat CPU/mem load when a sampler is configured.
+	// ok=false leaves payload.Load nil so the wire body omits the key
+	// entirely (best-effort — a sampling miss must never fail a beat).
+	if h.opts.GetLoad != nil {
+		if cpu, mem, ok := h.opts.GetLoad(); ok {
+			payload.Load = &heartbeatLoadFields{CPU: cpu, Memory: mem}
+		}
+	}
+
 	// Phase 2c: pull any ACKs we owe the platform from the buffer. Cleared
 	// only on a SUCCESSFUL POST below; a network failure leaves them
 	// queued for the next attempt.
@@ -426,11 +445,17 @@ func (h *HeartbeatService) callEndpoint(
 	body := heartbeatRequestBody{
 		ActiveCount:      payload.ActiveSessions,
 		MaxSessions:      payload.MaxSessions,
+		Load:             payload.Load,
 		AllowlistHash:    payload.AllowlistHash,
 		Allowlist:        payload.Allowlist,
 		AppliedMutations: ackApplied,
 		MutationFailures: ackFailures,
 	}
+	// NB: region is deliberately NOT sent on the heartbeat leg. The platform's
+	// heartbeat route parses no `region` key — region is a register-time-only
+	// field written from RegisterRequest.Region (registration.go). Do not add a
+	// region field to heartbeatRequestBody: it would be silently ignored and
+	// duplicate the register-time write. (Wave-3 item 8 note.)
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)

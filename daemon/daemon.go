@@ -500,6 +500,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 			JWTPath:           d.opts.JWTPath,
 			Provides:          provides,
 			DaemonProjects:    AllowlistEntriesFromConfig(cfg.Projects),
+			// Item 8 (fleet host-info): gather best-effort machine telemetry
+			// once at startup and thread it onto RegisterRequest.HostInfo so
+			// the platform populates the worker_hosts host-info columns. All
+			// fields degrade to empty on an unsupported platform; gathering
+			// never crashes registration.
+			HostInfo: GatherHostInfo(d.EffectiveVersion(), d.StartedAt()),
 		}
 		var err error
 		regResp, err = Register(ctx, regOpts)
@@ -661,7 +667,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 			GetMaxCount:     func() int { return d.maxConcurrentSessions() },
 			GetStatus:       d.RegistrationStatus,
 			Region:          cfg.Machine.Region,
-			OnReregister:    reregister,
+			// Item 8: per-beat CPU/mem load sample → last_cpu_pct/last_mem_pct.
+			// Best-effort stdlib probe; omits the load key when it can't sample.
+			GetLoad:      SampleLoad,
+			OnReregister: reregister,
 			LogWarn: func(format string, args ...any) {
 				slog.Warn(fmt.Sprintf(format, args...))
 			},

@@ -41,6 +41,13 @@ type RegistrationOptions struct {
 	// Populate from cfg.Projects at the call site.
 	DaemonProjects []ProjectAllowlistEntry
 
+	// HostInfo is the best-effort machine telemetry gathered once at daemon
+	// startup (see hostinfo.go / GatherHostInfo). Threaded onto the wire
+	// RegisterRequest.HostInfo so the platform can populate the worker_hosts
+	// host-info columns (ip_address, os, arch, cpu_cores, …). Optional — nil
+	// omits the block entirely (item 8, 2026-07-01 preview-readiness sweep).
+	HostInfo *HostInfo
+
 	// HTTPClient is the client used when the real (non-stub) path is taken.
 	// Defaults to http.DefaultClient with a 10s timeout.
 	HTTPClient *http.Client
@@ -74,6 +81,25 @@ type RegisterRequest struct {
 	Version   string              `json:"version,omitempty"`
 	Projects  []string            `json:"projects,omitempty"`
 	Provides  []ProvideCapability `json:"provides,omitempty"`
+
+	// Region is the deployment region the daemon reports (from
+	// cfg.Machine.Region → RegistrationOptions.Region). The platform's
+	// register route parses body.region into worker_hosts.region
+	// (register/route.ts:493). Register-time only — the heartbeat route
+	// deliberately does NOT parse a region key, so this is the sole wire
+	// path for region (see heartbeat.go's note on heartbeatRequestBody).
+	// Omitempty — a daemon with no region configured omits the field and the
+	// column stays null.
+	Region string `json:"region,omitempty"`
+
+	// HostInfo is the optional machine-telemetry block parsed by the
+	// platform's register route (register/route.ts:65-76 HostInfoBody) into
+	// the worker_hosts host-info columns. Wire key names MUST match the
+	// platform parser exactly: ip, os, osVersion, arch, cpuCores, cpuModel,
+	// memTotalMb, daemonVersion, startedAt (see HostInfo). Omitempty — legacy
+	// daemons that omit it leave those columns null (item 8, additive,
+	// back-compat).
+	HostInfo *HostInfo `json:"hostInfo,omitempty"`
 
 	// Capabilities is the flat capability-tag allowlist the platform persists
 	// on workers.capabilities and gates its claim lanes against via
@@ -340,9 +366,11 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		Hostname:       opts.Hostname,
 		Capacity:       capacity,
 		Version:        opts.Version,
+		Region:         opts.Region,
 		Provides:       opts.Provides,
 		Capabilities:   opts.Capabilities,
 		DaemonProjects: opts.DaemonProjects,
+		HostInfo:       opts.HostInfo,
 	}
 	if req.MachineID == "" {
 		req.MachineID = opts.Hostname

@@ -240,6 +240,14 @@ type HeartbeatPayload struct {
 	// list only on first beat or on change). Steady-state overhead per
 	// beat is the 64-byte hash + ~8 bytes of JSON framing.
 	Allowlist []ProjectAllowlistEntry `json:"allowlist,omitempty"`
+
+	// Load carries the per-beat CPU/memory utilisation sample (0–100).
+	// Populated from HeartbeatOptions.GetLoad when it returns ok; nil (and
+	// thus omitted from the wire body) otherwise. The platform's heartbeat
+	// route parses load.{cpu,memory} into worker_hosts.last_cpu_pct /
+	// last_mem_pct (item 8). Pointer + omitempty so an absent sample is
+	// distinguishable from a genuine {cpu:0,memory:0}.
+	Load *heartbeatLoadFields `json:"load,omitempty"`
 }
 
 // ── Auto-update channel/schedule ───────────────────────────────────────────
