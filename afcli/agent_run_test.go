@@ -90,12 +90,89 @@ func TestFetchSessionDetail_HappyPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := fetchSessionDetail(context.Background(), &http.Client{Timeout: 2 * time.Second}, srv.URL, "sess-1")
+	got, err := fetchSessionDetail(context.Background(), &http.Client{Timeout: 2 * time.Second}, srv.URL, "sess-1", "")
 	if err != nil {
 		t.Fatalf("fetchSessionDetail: %v", err)
 	}
 	if got.SessionID != want.SessionID || got.IssueIdentifier != want.IssueIdentifier {
 		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+// TestFetchSessionDetail_BearerTokenAttached verifies that when a
+// non-empty daemon-control token is supplied, the session-detail request
+// carries an `Authorization: Bearer <token>` header. This is the cloud
+// sandbox case: DONMAI_DAEMON_URL points at an authenticated remote
+// endpoint and DONMAI_RUNTIME_JWT carries the token it expects.
+func TestFetchSessionDetail_BearerTokenAttached(t *testing.T) {
+	// nolint:gosec // G101: fake test fixture, not a real credential.
+	const token = "test.bearer.token"
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(&daemon.SessionDetail{SessionID: "sess-auth"}) // nolint:gosec // G117: test fixture
+	}))
+	defer srv.Close()
+
+	_, err := fetchSessionDetail(context.Background(), &http.Client{Timeout: 2 * time.Second}, srv.URL, "sess-auth", token)
+	if err != nil {
+		t.Fatalf("fetchSessionDetail: %v", err)
+	}
+	if want := "Bearer " + token; gotAuth != want {
+		t.Errorf("Authorization = %q, want %q", gotAuth, want)
+	}
+}
+
+// TestFetchSessionDetail_NoTokenNoAuthHeader verifies that with an empty
+// token (the localhost loopback default), no Authorization header is sent —
+// preserving the unauthenticated loopback behavior exactly.
+func TestFetchSessionDetail_NoTokenNoAuthHeader(t *testing.T) {
+	var hadAuth bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, hadAuth = r.Header["Authorization"]
+		_ = json.NewEncoder(w).Encode(&daemon.SessionDetail{SessionID: "sess-loopback"}) // nolint:gosec // G117: test fixture
+	}))
+	defer srv.Close()
+
+	_, err := fetchSessionDetail(context.Background(), &http.Client{Timeout: 2 * time.Second}, srv.URL, "sess-loopback", "")
+	if err != nil {
+		t.Fatalf("fetchSessionDetail: %v", err)
+	}
+	if hadAuth {
+		t.Error("expected no Authorization header for empty token (loopback), but one was sent")
+	}
+}
+
+// TestAgentRunCredentialCache_BearerTokenAttached verifies the credential
+// cache's refetch path (which re-hits the session-detail endpoint) also
+// carries the bearer token when one is configured.
+func TestAgentRunCredentialCache_BearerTokenAttached(t *testing.T) {
+	// nolint:gosec // G101: fake test fixture, not a real credential.
+	const token = "cache.bearer.token"
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(&daemon.SessionDetail{ // nolint:gosec // G117: test fixture
+			SessionID: "sess-cred",
+			WorkerID:  "wkr_fresh",
+			AuthToken: "fresh-token",
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	cache := newAgentRunCredentialCache(
+		srv.Client(),
+		srv.URL,
+		"sess-cred",
+		token,
+		&daemon.SessionDetail{SessionID: "sess-cred", WorkerID: "wkr_old", AuthToken: "old-token"},
+	)
+
+	if _, err := cache.runnerCredentials(context.Background()); err != nil {
+		t.Fatalf("runnerCredentials: %v", err)
+	}
+	if want := "Bearer " + token; gotAuth != want {
+		t.Errorf("Authorization = %q, want %q", gotAuth, want)
 	}
 }
 
@@ -109,7 +186,7 @@ func TestFetchSessionDetail_NotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := fetchSessionDetail(context.Background(), &http.Client{Timeout: 2 * time.Second}, srv.URL, "missing")
+	_, err := fetchSessionDetail(context.Background(), &http.Client{Timeout: 2 * time.Second}, srv.URL, "missing", "")
 	if err == nil {
 		t.Fatal("expected error for 404")
 	}
@@ -139,7 +216,7 @@ func TestFetchSessionDetail_TransientThenSucceeds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := fetchSessionDetail(context.Background(), &http.Client{Timeout: 2 * time.Second}, srv.URL, "sess-2")
+	got, err := fetchSessionDetail(context.Background(), &http.Client{Timeout: 2 * time.Second}, srv.URL, "sess-2", "")
 	if err != nil {
 		t.Fatalf("expected recovery, got %v", err)
 	}
@@ -171,6 +248,7 @@ func TestAgentRunCredentialCacheRefreshesFromDaemon(t *testing.T) {
 		srv.Client(),
 		srv.URL,
 		"sess-cred",
+		"",
 		&daemon.SessionDetail{SessionID: "sess-cred", WorkerID: "wkr_old", AuthToken: "old-token"},
 	)
 
@@ -189,7 +267,7 @@ func TestFetchSessionDetail_DaemonUnreachable(t *testing.T) {
 	// Use 127.0.0.1:1 — typically unreachable.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_, err := fetchSessionDetail(ctx, &http.Client{Timeout: 200 * time.Millisecond}, "http://127.0.0.1:1", "sess")
+	_, err := fetchSessionDetail(ctx, &http.Client{Timeout: 200 * time.Millisecond}, "http://127.0.0.1:1", "sess", "")
 	if err == nil {
 		t.Fatal("expected unreachable error")
 	}
