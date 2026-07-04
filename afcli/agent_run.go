@@ -138,6 +138,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		daemonURL = DefaultAgentRunDaemonURL
 	}
 
+	// 2b. Resolve the optional daemon-control bearer token. In a cloud
+	// sandbox the provisioner points DONMAI_DAEMON_URL at an authenticated
+	// remote endpoint and sets DONMAI_RUNTIME_JWT to the token that
+	// endpoint expects; the token is attached as `Authorization: Bearer
+	// <token>` on daemon-control requests. When unset (the default
+	// localhost loopback at 127.0.0.1:7734) no Authorization header is
+	// sent, preserving the unauthenticated loopback behavior.
+	daemonToken := strings.TrimSpace(os.Getenv("DONMAI_RUNTIME_JWT"))
+
 	// 3. Set up signal handling so SIGTERM/SIGINT translates into a
 	// clean ctx cancellation through the runner.
 	runCtx, cancel := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
@@ -150,7 +159,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	)
 
 	// 4. Fetch session detail from the daemon (3-attempt exp backoff).
-	detail, err := fetchSessionDetail(runCtx, &http.Client{Timeout: 10 * time.Second}, daemonURL, sessionID)
+	detail, err := fetchSessionDetail(runCtx, &http.Client{Timeout: 10 * time.Second}, daemonURL, sessionID, daemonToken)
 	if err != nil {
 		return preflightErr(fmt.Sprintf("fetch session detail: %v", err))
 	}
@@ -164,6 +173,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		&http.Client{Timeout: 5 * time.Second},
 		daemonURL,
 		sessionID,
+		daemonToken,
 		detail,
 	)
 
@@ -289,7 +299,11 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 // daemon's local HTTP control API. Retries up to 3 times with
 // 200ms / 400ms / 800ms exponential backoff on transient failures (5xx,
 // network) — 4xx responses (404 session not found) short-circuit.
-func fetchSessionDetail(ctx context.Context, client *http.Client, baseURL, sessionID string) (*daemon.SessionDetail, error) {
+//
+// token is the optional daemon-control bearer token. When non-empty it is
+// attached as `Authorization: Bearer <token>`; when empty (the localhost
+// loopback default) no Authorization header is sent.
+func fetchSessionDetail(ctx context.Context, client *http.Client, baseURL, sessionID, token string) (*daemon.SessionDetail, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -298,7 +312,7 @@ func fetchSessionDetail(ctx context.Context, client *http.Client, baseURL, sessi
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		detail, err := fetchSessionDetailOnce(ctx, client, endpoint)
+		detail, err := fetchSessionDetailOnce(ctx, client, endpoint, token)
 		if err == nil {
 			return detail, nil
 		}
@@ -336,12 +350,18 @@ func (e *permanentFetchError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
 }
 
-func fetchSessionDetailOnce(ctx context.Context, client *http.Client, endpoint string) (*daemon.SessionDetail, error) {
+func fetchSessionDetailOnce(ctx context.Context, client *http.Client, endpoint, token string) (*daemon.SessionDetail, error) {
 	// nolint:gosec // G107: endpoint is the operator-supplied daemon URL,
 	// defaulting to 127.0.0.1:7734 — not user-tainted SSRF.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
+	}
+	// Attach the bearer token only when one is configured. The default
+	// localhost loopback endpoint is unauthenticated, so an empty token
+	// means no Authorization header is sent.
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := client.Do(req) // nolint:gosec // see above
 	if err != nil {
@@ -363,19 +383,21 @@ func fetchSessionDetailOnce(ctx context.Context, client *http.Client, endpoint s
 }
 
 type agentRunCredentialCache struct {
-	mu        sync.Mutex
-	client    *http.Client
-	daemonURL string
-	sessionID string
-	workerID  string
-	authToken string
+	mu          sync.Mutex
+	client      *http.Client
+	daemonURL   string
+	sessionID   string
+	daemonToken string
+	workerID    string
+	authToken   string
 }
 
-func newAgentRunCredentialCache(client *http.Client, daemonURL, sessionID string, initial *daemon.SessionDetail) *agentRunCredentialCache {
+func newAgentRunCredentialCache(client *http.Client, daemonURL, sessionID, daemonToken string, initial *daemon.SessionDetail) *agentRunCredentialCache {
 	c := &agentRunCredentialCache{
-		client:    client,
-		daemonURL: daemonURL,
-		sessionID: sessionID,
+		client:      client,
+		daemonURL:   daemonURL,
+		sessionID:   sessionID,
+		daemonToken: daemonToken,
 	}
 	if initial != nil {
 		c.workerID = initial.WorkerID
@@ -385,7 +407,7 @@ func newAgentRunCredentialCache(client *http.Client, daemonURL, sessionID string
 }
 
 func (c *agentRunCredentialCache) current(ctx context.Context) (workerID, authToken string, err error) {
-	detail, fetchErr := fetchSessionDetail(ctx, c.client, c.daemonURL, c.sessionID)
+	detail, fetchErr := fetchSessionDetail(ctx, c.client, c.daemonURL, c.sessionID, c.daemonToken)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
