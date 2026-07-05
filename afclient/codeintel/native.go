@@ -416,23 +416,34 @@ func (n *NativeRunner) newFileIndex(relPath, gitHash string, raw []byte, ast Fil
 
 // ── GetRepoMap ────────────────────────────────────────────────────────────────
 
-// GetRepoMapNative builds (or loads) the code index and returns a
-// PageRank-ranked repository map as a slice of RepoMapEntry values serialised
-// to JSON-compatible any.
+// GetRepoMapNative builds (or loads) the code index and returns a PageRank-ranked
+// repository map as a slice of RepoMapEntry values serialised to JSON-compatible
+// any.
 //
-// The ranking heuristic assigns each file a score based on the number of
-// exported symbols and penalises test files. This intentionally mirrors the
-// spirit of the TS implementation (BM25 + PageRank) without the full graph
-// computation, which is deferred to S3.
+// Ranking is real PageRank (import_graph.go + pagerank.go, ported from the TS
+// RepoMapGenerator): an import dependency graph is built over the whole index,
+// then PageRank (damping 0.85, tolerance 1e-6) scores each file by structural
+// importance. rank IS the PageRank score — the TS reference blends no other
+// signal, so neither do we (the old exported*2+symbolCount heuristic and the
+// test-file penalty are gone). opts.FilePatterns is an OUTPUT filter over the
+// ranked entries (matching RepoMapGenerator); the graph and ranking always span
+// the whole repository so a filtered-out hub still contributes its edges.
 func (n *NativeRunner) GetRepoMapNative(opts GetRepoMapOptions) (any, error) {
 	idx, err := n.indexForQuery()
 	if err != nil {
 		return nil, err
 	}
 
+	graph := NewImportGraph()
+	graph.BuildFromIndex(idx.Files)
+	ranks := NewPageRank().Compute(graph.Adjacency())
+
 	var entries []RepoMapEntry
 	for _, fi := range idx.Files {
-		rank := computeFileRank(fi)
+		// Output filter: limit which files appear, not which are ranked/graphed.
+		if len(opts.FilePatterns) > 0 && !matchesAnyPattern(fi.FilePath, opts.FilePatterns) {
+			continue
+		}
 		syms := make([]RepoMapSymbol, 0, len(fi.Symbols))
 		for _, s := range fi.Symbols {
 			syms = append(syms, RepoMapSymbol{
@@ -443,7 +454,7 @@ func (n *NativeRunner) GetRepoMapNative(opts GetRepoMapOptions) (any, error) {
 		}
 		entries = append(entries, RepoMapEntry{
 			FilePath: fi.FilePath,
-			Rank:     rank,
+			Rank:     ranks[normalizeSlash(fi.FilePath)],
 			Symbols:  syms,
 		})
 	}
@@ -473,23 +484,20 @@ func (n *NativeRunner) GetRepoMapNative(opts GetRepoMapOptions) (any, error) {
 	}, nil
 }
 
-// computeFileRank assigns a rank score to a file.
-func computeFileRank(fi FileIndex) float64 {
-	exported := 0
-	for _, s := range fi.Symbols {
-		if s.Exported {
-			exported++
+// matchesAnyPattern reports whether path matches any of the glob patterns,
+// tested against both the full relative path and the basename (the same
+// semantics discoverFiles uses for its file-pattern filter).
+func matchesAnyPattern(path string, patterns []string) bool {
+	base := filepath.Base(path)
+	for _, pat := range patterns {
+		if ok, _ := filepath.Match(pat, path); ok {
+			return true
+		}
+		if ok, _ := filepath.Match(pat, base); ok {
+			return true
 		}
 	}
-	score := float64(exported)*2 + float64(len(fi.Symbols))
-	// Penalise test files.
-	if strings.HasSuffix(fi.FilePath, "_test.go") ||
-		strings.Contains(fi.FilePath, "_test.") ||
-		strings.Contains(fi.FilePath, ".test.") ||
-		strings.Contains(fi.FilePath, ".spec.") {
-		score *= 0.3
-	}
-	return score
+	return false
 }
 
 // ── SearchSymbols ─────────────────────────────────────────────────────────────
