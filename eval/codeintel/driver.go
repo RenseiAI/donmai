@@ -90,7 +90,11 @@ type RunRecord struct {
 	Grades   []GradeResult  `json:"grades"`
 	Envelope ReportEnvelope `json:"envelope"`
 	Posted   bool           `json:"posted"`
-	PostErr  string         `json:"postError,omitempty"`
+	// PostedRunID is the platform-assigned eval_runs id returned by the ingest
+	// route (empty when offline or on a post error) — the handle an operator uses
+	// to find this trial in /admin/evals.
+	PostedRunID string `json:"postedRunId,omitempty"`
+	PostErr     string `json:"postError,omitempty"`
 }
 
 // Report is the aggregate outcome of a Run.
@@ -217,11 +221,20 @@ func (d *Driver) runOne(ctx context.Context, c Case, arm Arm, trial int) (RunRec
 
 	rec := RunRecord{CaseID: c.ID, Family: c.Family(), Repo: c.Input.Repo, Arm: arm, Trial: trial, Pass: pass, Grades: grades, Envelope: env}
 	if d.cfg.Bridge != nil {
-		posted, perr := d.cfg.Bridge.Post(ctx, env)
-		rec.Posted = posted
+		// The wire contract is the platform's flat per-trial /api/evals/ingest
+		// body (the route runs the registered graders inline). The local
+		// ReportEnvelope above stays the harness's canonical eval_runs+eval_traces
+		// capture (dumped by --dry and used for the offline record).
+		ingest := BuildIngestRequest(c, tr, trial, sessionID, d.cfg.DatasetID, d.cfg.ProjectID)
+		resp, perr := d.cfg.Bridge.Post(ctx, ingest)
 		if perr != nil {
 			rec.PostErr = perr.Error()
 			d.cfg.Logf("bridge post failed for %s/%s: %v", c.ID, arm, perr)
+		}
+		if resp != nil {
+			rec.Posted = true
+			rec.PostedRunID = resp.RunID
+			d.cfg.Logf("posted %s/%s → eval_run %s (platform graders: %v)", c.ID, arm, resp.RunID, resp.GradersRun)
 		}
 	}
 	return rec, nil

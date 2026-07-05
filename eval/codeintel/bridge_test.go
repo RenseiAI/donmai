@@ -11,16 +11,29 @@ import (
 
 func TestBridge_Disabled_NoOp(t *testing.T) {
 	b := NewBridge("", "tok", "")
-	posted, err := b.Post(context.Background(), ReportEnvelope{})
+	resp, err := b.Post(context.Background(), IngestRequest{})
 	if err != nil {
 		t.Fatalf("disabled bridge should not error: %v", err)
 	}
-	if posted {
+	if resp != nil {
 		t.Error("disabled bridge must not post")
 	}
 }
 
-func TestBridge_Post_ShapePathAndAuth(t *testing.T) {
+// TestBridge_DefaultPath_MatchesPlatformRoute locks the default ingest path to
+// the route the platform lane actually shipped (/api/evals/ingest), not the
+// earlier placeholder (/api/evals/runs/ingest).
+func TestBridge_DefaultPath_MatchesPlatformRoute(t *testing.T) {
+	if DefaultBridgePath != "/api/evals/ingest" {
+		t.Errorf("DefaultBridgePath = %q, want /api/evals/ingest", DefaultBridgePath)
+	}
+	b := NewBridge("http://x", "tok", "")
+	if b.Path != "/api/evals/ingest" {
+		t.Errorf("empty --platform-path should default to /api/evals/ingest, got %q", b.Path)
+	}
+}
+
+func TestBridge_Post_FlatIngestShapePathAndAuth(t *testing.T) {
 	var gotPath, gotAuth, gotMethod string
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -30,41 +43,70 @@ func TestBridge_Post_ShapePathAndAuth(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &gotBody)
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		// Mirror the platform route's 201 body so Post can parse the runId.
+		_, _ = w.Write([]byte(`{"runId":"evr_abc","traceId":"evt_abc","datasetId":"evd_ci","gradersRun":["structural/codeintel-task-v1","tool-use-correctness/codeintel-v1"],"gradeResults":[]}`))
 	}))
 	defer srv.Close()
 
-	b := NewBridge(srv.URL, "rsk_test", "/api/evals/runs/ingest")
-	env, err := BuildEnvelope("run-1", "trace-1", "disp-1", "org-1", "proj-1", "ds-1", sampleCase(),
-		Transcript{Arm: ArmWith, FinalAnswer: "afcli/agent_run.go:80", TokenCounts: TokenCounts{Input: 10, Output: 5}},
-		[]GradeResult{{GraderID: GraderFindSymbol, Score: 1, Pass: true}},
-		ReportMeta{CaseID: "codeintel-find-symbol-donmai-001", Arm: ArmWith, Family: "find-symbol", Repo: "RenseiAI/donmai", Trial: 1, Advertisement: "mcp"})
-	if err != nil {
-		t.Fatal(err)
+	tr := Transcript{
+		Arm:         ArmWith,
+		FinalAnswer: "afcli/agent_run.go:80",
+		ToolCalls:   []ToolCall{{Name: "mcp__af-code-intelligence__af_code_search_symbols", ResultText: "afcli/agent_run.go:79"}},
+		TurnCount:   2,
+		TokenCounts: TokenCounts{Input: 10, Output: 5},
 	}
+	req := BuildIngestRequest(sampleCase(), tr, 1, "disp-1", "evd_ci", "proj-1")
 
-	posted, err := b.Post(context.Background(), env)
-	if err != nil || !posted {
-		t.Fatalf("Post = (%v, %v), want (true, nil)", posted, err)
+	// Empty --platform-path must resolve to the reconciled default route.
+	b := NewBridge(srv.URL, "rsk_test", "")
+	resp, err := b.Post(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Post error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("Post returned nil response on a 2xx")
+	}
+	if resp.RunID != "evr_abc" {
+		t.Errorf("parsed runId = %q, want evr_abc", resp.RunID)
 	}
 	if gotMethod != http.MethodPost {
 		t.Errorf("method = %s, want POST", gotMethod)
 	}
-	if gotPath != "/api/evals/runs/ingest" {
-		t.Errorf("path = %s", gotPath)
+	if gotPath != "/api/evals/ingest" {
+		t.Errorf("path = %s, want /api/evals/ingest", gotPath)
 	}
 	if gotAuth != "Bearer rsk_test" {
 		t.Errorf("auth = %q, want Bearer rsk_test", gotAuth)
 	}
-	// The body must carry the run + trace + meta the platform ingests.
-	for _, k := range []string{"run", "trace", "meta"} {
+
+	// The body must be the platform's FLAT per-trial ingest shape — NOT the old
+	// {run, trace, meta} envelope.
+	for _, k := range []string{"arm", "datasetId", "datasetCase", "outputPayload", "toolCalls", "turnCount", "tokenCounts"} {
 		if _, ok := gotBody[k]; !ok {
 			t.Errorf("posted body missing %q key", k)
 		}
 	}
-	run, _ := gotBody["run"].(map[string]any)
-	if run["orgId"] != "org-1" || run["datasetCaseId"] != "codeintel-find-symbol-donmai-001" {
-		t.Errorf("run row shape wrong: %v", run)
+	for _, k := range []string{"run", "trace", "meta"} {
+		if _, ok := gotBody[k]; ok {
+			t.Errorf("posted body must NOT carry legacy envelope key %q", k)
+		}
+	}
+	if gotBody["arm"] != "with" {
+		t.Errorf("arm = %v, want with", gotBody["arm"])
+	}
+	if gotBody["datasetId"] != "evd_ci" {
+		t.Errorf("datasetId = %v, want evd_ci", gotBody["datasetId"])
+	}
+	dc, _ := gotBody["datasetCase"].(map[string]any)
+	if dc["id"] != "codeintel-find-symbol-donmai-001" {
+		t.Errorf("datasetCase.id = %v, want codeintel-find-symbol-donmai-001", dc["id"])
+	}
+	// datasetCase must carry the full input the platform graders grade against.
+	if in, _ := dc["input"].(map[string]any); in["taskType"] != "find-symbol" {
+		t.Errorf("datasetCase.input.taskType = %v, want find-symbol", in["taskType"])
+	}
+	if gotBody["outputPayload"] != "afcli/agent_run.go:80" {
+		t.Errorf("outputPayload = %v", gotBody["outputPayload"])
 	}
 }
 
@@ -74,7 +116,7 @@ func TestBridge_Post_Non2xxErrors(t *testing.T) {
 	}))
 	defer srv.Close()
 	b := NewBridge(srv.URL, "", "")
-	if _, err := b.Post(context.Background(), ReportEnvelope{}); err == nil {
+	if _, err := b.Post(context.Background(), IngestRequest{}); err == nil {
 		t.Error("a 5xx response must surface as an error")
 	}
 }
