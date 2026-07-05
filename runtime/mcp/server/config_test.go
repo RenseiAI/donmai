@@ -149,3 +149,44 @@ func TestResolveScopedFile(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveScopedFile_SymlinkEscapeRejected proves an in-root symlink whose
+// target is outside --root is rejected, closing the boolean-oracle gap the
+// Wave-2 re-review flagged (lexical confinement alone followed the link).
+func TestResolveScopedFile_SymlinkEscapeRejected(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	root := t.TempDir()
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "secret.env")
+	if err := os.WriteFile(outside, []byte("PASSWORD=hunter2"), 0o600); err != nil {
+		t.Fatalf("write outside: %v", err)
+	}
+	// A symlink that lives inside root but points outside it.
+	link := filepath.Join(root, "linked_leak.go")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	// Lexically the path is inside root, so the old lexical-only check passed;
+	// after resolving symlinks it must be rejected as escaping the root.
+	if _, err := resolveScopedFile(root, "linked_leak.go"); err == nil ||
+		!strings.Contains(err.Error(), "outside the root") {
+		t.Fatalf("in-root symlink escaping the root should be rejected, got %v", err)
+	}
+
+	// A symlink to a sibling *inside* the root still resolves fine.
+	realInside := filepath.Join(root, "real.go")
+	if err := os.WriteFile(realInside, []byte("package x"), 0o600); err != nil {
+		t.Fatalf("write inside: %v", err)
+	}
+	innerLink := filepath.Join(root, "inner_link.go")
+	if err := os.Symlink(realInside, innerLink); err != nil {
+		t.Fatalf("symlink inner: %v", err)
+	}
+	if _, err := resolveScopedFile(root, "inner_link.go"); err != nil {
+		t.Fatalf("in-root symlink to an in-root target should be allowed, got %v", err)
+	}
+}

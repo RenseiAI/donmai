@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -126,9 +127,41 @@ func resolveScopedFile(root, p string) (string, error) {
 		return "", fmt.Errorf("contentFile must be relative to the root, got absolute path %q", p)
 	}
 	cleaned := filepath.Clean(filepath.Join(root, p))
-	rel, err := filepath.Rel(root, cleaned)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if !withinRoot(root, cleaned) {
 		return "", fmt.Errorf("contentFile %q escapes the root %q", p, root)
 	}
+	// Lexical confinement is not sufficient: a symlink that lives inside the
+	// root but targets a path outside it passes the check above and would then
+	// be followed by os.ReadFile. Resolve symlinks and re-verify containment so
+	// the documented "a tool call cannot read outside --root" guarantee holds
+	// for this path exactly as discoverFiles enforces it for the index walk.
+	resolved, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		// A path that cannot be resolved (e.g. does not exist) is no escape
+		// vector — the subsequent read fails closed. Surface anything else.
+		if errors.Is(err, fs.ErrNotExist) {
+			return cleaned, nil
+		}
+		return "", fmt.Errorf("contentFile %q: %w", p, err)
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("root %q: %w", root, err)
+	}
+	if !withinRoot(realRoot, resolved) {
+		return "", fmt.Errorf("contentFile %q resolves outside the root %q", p, root)
+	}
+	// Return the lexical path (not the symlink-resolved one) to keep the value
+	// stable across platforms where the root itself is a symlink (e.g. macOS
+	// /var -> /private/var); the read follows the same links we just verified.
 	return cleaned, nil
+}
+
+// withinRoot reports whether target is lexically at or under root.
+func withinRoot(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
