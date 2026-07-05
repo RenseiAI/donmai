@@ -3,6 +3,7 @@ package codeintel
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -271,5 +272,92 @@ func TestDriver_Refactor_NilJudge_NeverPasses(t *testing.T) {
 	fam := rep.Families[TaskRefactorAcrossFiles]
 	if fam.WithPasses != 0 || fam.WithoutPasses != 0 {
 		t.Errorf("refactor with nil judge must never pass; got with=%d without=%d", fam.WithPasses, fam.WithoutPasses)
+	}
+}
+
+// TestDriver_UnderpoweredRunIsNotAGAPass proves the founder-threshold verdict
+// hard-refuses a PASS on an underpowered corpus. One find-symbol case, one
+// trial, one repo: WITH passes / WITHOUT fails → +100pp, no regression, tokens
+// under budget — yet this is one task, one trial, one repo, one family, far
+// below the locked bar (>=8 tasks/family x 2 repos x >=3 trials/arm). A raw
+// +100pp here is a null/underpowered result masquerading as a passing verdict;
+// MeetsThreshold must be false.
+func TestDriver_UnderpoweredRunIsNotAGAPass(t *testing.T) {
+	repoDir, sha := initTempRepo(t)
+	donmaiDir := writeFakeBinary(t, "donmai")
+	c := Case{
+		ID:             "codeintel-find-symbol-test-001",
+		Input:          CaseInput{TaskType: TaskFindSymbol, Repo: "test/repo", Ref: sha, Prompt: "Where is the function Target defined?"},
+		ExpectedOutput: json.RawMessage(`{"file":"foo.go","lineRange":[1,10]}`),
+		Tags:           []string{tagSuite, "find-symbol", tagVersion},
+	}
+	d, err := NewDriver(Config{
+		Trials: 1, Advertise: AdvertiseMCP, DonmaiBin: filepath.Join(donmaiDir, "donmai"),
+		RepoRoots: map[string]string{"test/repo": repoDir}, WorkareaParent: t.TempDir(),
+		Executor: &recordingExecutor{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := d.Run(context.Background(), []Case{c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Aggregate.DeltaPP < 15 {
+		t.Fatalf("precondition: raw delta should clear +15pp, got %.0f", rep.Aggregate.DeltaPP)
+	}
+	if rep.Aggregate.MeetsThreshold {
+		t.Error("underpowered run (1 task / 1 trial / 1 repo / 1 family) must NOT meet the founder threshold")
+	}
+	if !rep.Aggregate.Underpowered {
+		t.Error("underpowered run must be flagged Underpowered")
+	}
+	if !strings.Contains(rep.Aggregate.Status, "UNDERPOWERED") {
+		t.Errorf("status must call out UNDERPOWERED, got %q", rep.Aggregate.Status)
+	}
+	if !strings.Contains(rep.Summary(), "UNDERPOWERED") {
+		t.Error("summary of an underpowered run must call out UNDERPOWERED")
+	}
+}
+
+// TestComputeAggregate_PoweredCorpusCanPass proves the power gate is not a
+// blanket refusal: a corpus meeting every locked precondition (>=8 tasks/family
+// across all four families, >=2 repos, >=3 trials/arm) with a >=+15pp delta, no
+// regression, and tokens under budget reports MeetsThreshold=true.
+func TestComputeAggregate_PoweredCorpusCanPass(t *testing.T) {
+	repos := []string{"RenseiAI/platform", "RenseiAI/donmai"}
+	fams := map[TaskType]*FamilyStat{}
+	var cases []Case
+	for _, fam := range families {
+		f := &FamilyStat{}
+		for i := 0; i < minTasksPerFamily; i++ {
+			// minTrialsForGA trials/arm/case; WITH passes all, WITHOUT fails all.
+			for tr := 0; tr < minTrialsForGA; tr++ {
+				f.WithTrials++
+				f.WithPasses++
+				f.WithoutTrials++
+				f.WithTokens = append(f.WithTokens, 100)
+				f.WithoutTokens = append(f.WithoutTokens, 110)
+			}
+			cases = append(cases, Case{
+				ID:    fmt.Sprintf("%s-%02d", fam, i),
+				Input: CaseInput{TaskType: fam, Repo: repos[i%len(repos)]},
+			})
+		}
+		fams[fam] = f
+	}
+
+	agg := computeAggregate(fams, cases, minTrialsForGA)
+	if agg.Underpowered {
+		t.Fatalf("powered corpus must not be underpowered; shortfalls=%v", agg.PowerShortfalls)
+	}
+	if agg.DeltaPP < 15 {
+		t.Fatalf("precondition: delta should be +100pp, got %.0f", agg.DeltaPP)
+	}
+	if !agg.MeetsThreshold {
+		t.Errorf("powered +100pp corpus (no regression, tokens<budget) must meet threshold; status=%q", agg.Status)
+	}
+	if !strings.Contains(agg.Status, "GA-PASS") {
+		t.Errorf("status should be GA-PASS, got %q", agg.Status)
 	}
 }

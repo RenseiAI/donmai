@@ -140,16 +140,41 @@ func (f *FamilyStat) TokenRatio() float64 {
 // AdoptionRate is the fraction of WITH-arm trials that used a code-intel tool.
 func (f *FamilyStat) AdoptionRate() float64 { return rate(f.Adoption, f.WithTrials) }
 
+// Locked founder-threshold power preconditions (brief 06 §4.5): the >=+15pp
+// verdict is only a GA claim over >=8-12 tasks/family x 2 repos x >=3 trials/arm.
+// An underpowered or --task-filtered run must never report a PASS.
+const (
+	// minTasksPerFamily is the floor of the brief's 8-12 tasks/family band.
+	minTasksPerFamily = 8
+	// minReposCovered is the brief's "x 2 repos" (platform TS + donmai Go).
+	minReposCovered = 2
+	// minTrialsForGA is the brief's ">=3 trials/arm" to average out LLM nondeterminism.
+	minTrialsForGA = 3
+)
+
 // AggregateStat is the whole-benchmark rollup + the founder-threshold verdict.
 type AggregateStat struct {
 	DeltaPP           float64    `json:"deltaPP"`
 	TokenRatio        float64    `json:"tokenRatio"`
 	AdoptionRate      float64    `json:"adoptionRate"`
 	RegressedFamilies []TaskType `json:"regressedFamilies"`
+	// Trials / FamilyCounts / RepoCounts capture the corpus power actually run,
+	// computed from the executed cases — not assumed.
+	Trials       int              `json:"trials"`
+	FamilyCounts map[TaskType]int `json:"familyCounts"`
+	RepoCounts   map[string]int   `json:"repoCounts"`
+	// Underpowered is true when the run does not meet the locked power
+	// preconditions (>=8 tasks/family across all four families, >=2 repos, >=3
+	// trials). PowerShortfalls enumerates exactly which preconditions failed.
+	Underpowered    bool     `json:"underpowered"`
+	PowerShortfalls []string `json:"powerShortfalls,omitempty"`
+	// Status is the human-legible verdict category: "UNDERPOWERED — not a GA
+	// verdict", "GA-PASS …", or "GA-FAIL …".
+	Status string `json:"status"`
 	// MeetsThreshold reflects the LOCKED founder bar: >=+15pp aggregate delta,
-	// no per-family regression, median tokens <=+10%. Only meaningful on a full
-	// statistically-powered run (>=3 trials); a plumbing run reports it but it is
-	// not a GA claim.
+	// no per-family regression, median tokens <=+10% — AND the power
+	// preconditions above. It can only be true on a statistically-powered run;
+	// an underpowered run is forced to false regardless of the point estimate.
 	MeetsThreshold bool `json:"meetsThreshold"`
 }
 
@@ -179,7 +204,7 @@ func (d *Driver) Run(ctx context.Context, cases []Case) (Report, error) {
 			}
 		}
 	}
-	rep.Aggregate = computeAggregate(rep.Families)
+	rep.Aggregate = computeAggregate(rep.Families, cases, d.cfg.Trials)
 	return rep, nil
 }
 
@@ -375,7 +400,7 @@ func accumulate(f *FamilyStat, rec RunRecord) {
 	}
 }
 
-func computeAggregate(fams map[TaskType]*FamilyStat) AggregateStat {
+func computeAggregate(fams map[TaskType]*FamilyStat, cases []Case, trials int) AggregateStat {
 	var withP, withT, woP, woT int
 	var withTok, woTok []int64
 	var regressed []TaskType
@@ -399,14 +424,53 @@ func computeAggregate(fams map[TaskType]*FamilyStat) AggregateStat {
 	if m := medianI64(woTok); m > 0 {
 		tokenRatio = float64(medianI64(withTok)) / float64(m)
 	}
+	famCounts := CountByFamily(cases)
+	repoCounts := CountByRepo(cases)
+	shortfalls := powerShortfalls(famCounts, repoCounts, trials)
 	agg := AggregateStat{
 		DeltaPP:           deltaPP,
 		TokenRatio:        tokenRatio,
 		AdoptionRate:      rate(withPassesAdopt(fams), withT),
 		RegressedFamilies: regressed,
+		Trials:            trials,
+		FamilyCounts:      famCounts,
+		RepoCounts:        repoCounts,
+		Underpowered:      len(shortfalls) > 0,
+		PowerShortfalls:   shortfalls,
 	}
-	agg.MeetsThreshold = deltaPP >= 15.0 && len(regressed) == 0 && tokenRatio > 0 && tokenRatio <= 1.10
+	statBar := deltaPP >= 15.0 && len(regressed) == 0 && tokenRatio > 0 && tokenRatio <= 1.10
+	// The power preconditions HARD-GATE the verdict: a null/underpowered result
+	// can never be reported as a GA pass, no matter how large the point estimate.
+	agg.MeetsThreshold = statBar && !agg.Underpowered
+	switch {
+	case agg.Underpowered:
+		agg.Status = "UNDERPOWERED — not a GA verdict (" + strings.Join(shortfalls, "; ") + ")"
+	case agg.MeetsThreshold:
+		agg.Status = "GA-PASS (>=+15pp, no regression, tokens<=+10%)"
+	default:
+		agg.Status = "GA-FAIL (powered, but did not clear the founder bar)"
+	}
 	return agg
+}
+
+// powerShortfalls enumerates which locked power preconditions the run misses:
+// every family must carry >=minTasksPerFamily cases, >=minReposCovered repos
+// must be present, and >=minTrialsForGA trials/arm must have run. An empty slice
+// means the corpus is powered enough for a GA verdict.
+func powerShortfalls(famCounts map[TaskType]int, repoCounts map[string]int, trials int) []string {
+	var out []string
+	for _, fam := range families {
+		if n := famCounts[fam]; n < minTasksPerFamily {
+			out = append(out, fmt.Sprintf("family %s has %d task(s), need >=%d", fam, n, minTasksPerFamily))
+		}
+	}
+	if len(repoCounts) < minReposCovered {
+		out = append(out, fmt.Sprintf("%d repo(s) covered, need >=%d", len(repoCounts), minReposCovered))
+	}
+	if trials < minTrialsForGA {
+		out = append(out, fmt.Sprintf("%d trial(s)/arm, need >=%d", trials, minTrialsForGA))
+	}
+	return out
 }
 
 func withPassesAdopt(fams map[TaskType]*FamilyStat) int {
@@ -470,7 +534,10 @@ func (r Report) Summary() string {
 	if len(a.RegressedFamilies) > 0 {
 		fmt.Fprintf(&b, "regressed families: %v\n", a.RegressedFamilies)
 	}
+	fmt.Fprintf(&b, "power: %d trial(s)/arm, families=%v, repos=%d (need >=%d tasks/family, >=%d repos, >=%d trials)\n",
+		a.Trials, a.FamilyCounts, len(a.RepoCounts), minTasksPerFamily, minReposCovered, minTrialsForGA)
 	fmt.Fprintf(&b, "founder-threshold (>=+15pp, no regression, tokens<=+10%%): %v\n", a.MeetsThreshold)
+	fmt.Fprintf(&b, "verdict: %s\n", a.Status)
 	if r.PostedCount > 0 || r.PostErrors > 0 {
 		fmt.Fprintf(&b, "bridge: posted=%d errors=%d\n", r.PostedCount, r.PostErrors)
 	}
