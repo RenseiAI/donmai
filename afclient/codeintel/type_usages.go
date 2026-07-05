@@ -85,6 +85,17 @@ func FindTypeUsages(cwd, typeName string, maxResults int) (TypeUsagesResult, err
 			return nil
 		}
 		name := d.Name()
+		// Never follow symlinks. A symlinked *file* dirent has IsDir()==false and
+		// would otherwise pass the extension filter and be os.ReadFile'd,
+		// transparently following the link — a repo could plant pkg/innocent.go ->
+		// ../outside-secret/x.go and exfiltrate arbitrary host file lines through
+		// the agent-facing find-type-usages tool. Skipping the symlink dirent
+		// excludes both symlinked files and symlinked directories (WalkDir already
+		// never descends into a symlinked directory). Mirrors discoverFiles in
+		// native.go.
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
 		if d.IsDir() {
 			if skipDirs[name] || strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
