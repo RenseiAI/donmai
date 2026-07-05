@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 
@@ -13,25 +15,35 @@ import (
 
 // newCodeCmd constructs the `donmai code` command tree.
 //
-// Architecture: shell-out bridge to `pnpm af-code` (TS implementation).
-// See afclient/codeintel/runner.go for the full rationale.
+// Architecture: all six subcommands are implemented natively in Go
+// (afclient/codeintel/native.go) — no external binary is required. Setting
+// DONMAI_CODE_BIN (or legacy AGENTFACTORY_CODE_BIN) routes all subcommands
+// through the deprecated TypeScript exec-shim instead; see
+// afclient/codeintel/runner.go for the resolution order and rationale.
 func newCodeCmd(cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
+	var repoPath string
 	cmd := &cobra.Command{
 		Use:   "code",
 		Short: "Code intelligence: repo maps, symbol search, BM25, dedup, type usages, cross-dep validation",
 		Long: `Code intelligence commands for navigating and searching code.
 
-get-repo-map and search-symbols use the native Go implementation; no external
-binary is required. The first invocation builds the index (~5-10s for a large repo);
-subsequent calls reuse the persisted index from .donmai/code-index/.
+All six subcommands (get-repo-map, search-symbols, search-code, check-duplicate,
+find-type-usages, validate-cross-deps) use the native Go implementation by
+default; no external binary is required. The first invocation builds the index
+(~5-10s for a large repo); subsequent calls reuse the persisted index from
+.donmai/code-index/.
 
-search-code, check-duplicate, find-type-usages, and validate-cross-deps use the
-native Go implementation by default. Set DONMAI_CODE_BIN to force the legacy
-TypeScript exec-shim path.
+By default the index root is the enclosing git repository root (discovered by
+walking up from the current directory for a ` + "`.git`" + ` entry — directory or file,
+so worktree checkouts resolve correctly), not just the invocation cwd. Use
+--repo-path to scope to a subtree within that root (e.g. a single package in a
+monorepo). If no git root is found, the current directory is used as a
+fallback and a note is printed to stderr.
 
-Override: set DONMAI_CODE_BIN to force the exec-shim path for ALL subcommands
-(useful for testing against the TypeScript reference implementation).
+Override: set DONMAI_CODE_BIN to force the deprecated TypeScript exec-shim
+path for ALL subcommands (useful for testing against the legacy reference
+implementation; prints a one-time deprecation notice to stderr).
 
 Optional env vars for enhanced search (exec-shim path only):
   VOYAGE_AI_API_KEY   Enables semantic vector embeddings (hybrid BM25+vector mode)
@@ -39,12 +51,15 @@ Optional env vars for enhanced search (exec-shim path only):
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newCodeGetRepoMapCmd(bin))
-	cmd.AddCommand(newCodeSearchSymbolsCmd(bin))
-	cmd.AddCommand(newCodeSearchCodeCmd(bin))
-	cmd.AddCommand(newCodeCheckDuplicateCmd(bin))
-	cmd.AddCommand(newCodeFindTypeUsagesCmd(bin))
-	cmd.AddCommand(newCodeValidateCrossDepsCmd(bin))
+	cmd.PersistentFlags().StringVar(&repoPath, "repo-path", "",
+		"Relative path under the git root to scope indexing to (e.g. a monorepo package); must stay inside the root")
+
+	cmd.AddCommand(newCodeGetRepoMapCmd(bin, &repoPath))
+	cmd.AddCommand(newCodeSearchSymbolsCmd(bin, &repoPath))
+	cmd.AddCommand(newCodeSearchCodeCmd(bin, &repoPath))
+	cmd.AddCommand(newCodeCheckDuplicateCmd(bin, &repoPath))
+	cmd.AddCommand(newCodeFindTypeUsagesCmd(bin, &repoPath))
+	cmd.AddCommand(newCodeValidateCrossDepsCmd(bin, &repoPath))
 
 	return cmd
 }
@@ -57,7 +72,7 @@ func printJSON(v any) error {
 }
 
 // newCodeGetRepoMapCmd constructs `donmai code get-repo-map`.
-func newCodeGetRepoMapCmd(bin string) *cobra.Command {
+func newCodeGetRepoMapCmd(bin string, repoPath *string) *cobra.Command {
 	var (
 		maxFiles     int
 		filePatterns string
@@ -85,7 +100,11 @@ Examples:
 					}
 				}
 			}
-			out, err := codeintel.New(cwd()).GetRepoMap(opts)
+			root, err := indexRoot(*repoPath)
+			if err != nil {
+				return fmt.Errorf("get-repo-map: %w", err)
+			}
+			out, err := codeintel.New(root).GetRepoMap(opts)
 			if err != nil {
 				return fmt.Errorf("get-repo-map: %w", err)
 			}
@@ -100,7 +119,7 @@ Examples:
 }
 
 // newCodeSearchSymbolsCmd constructs `donmai code search-symbols <query>`.
-func newCodeSearchSymbolsCmd(bin string) *cobra.Command {
+func newCodeSearchSymbolsCmd(bin string, repoPath *string) *cobra.Command {
 	var (
 		maxResults  int
 		kinds       string
@@ -131,7 +150,11 @@ Examples:
 					}
 				}
 			}
-			out, err := codeintel.New(cwd()).SearchSymbols(opts)
+			root, err := indexRoot(*repoPath)
+			if err != nil {
+				return fmt.Errorf("search-symbols: %w", err)
+			}
+			out, err := codeintel.New(root).SearchSymbols(opts)
 			if err != nil {
 				return fmt.Errorf("search-symbols: %w", err)
 			}
@@ -147,7 +170,7 @@ Examples:
 }
 
 // newCodeSearchCodeCmd constructs `donmai code search-code <query>`.
-func newCodeSearchCodeCmd(bin string) *cobra.Command {
+func newCodeSearchCodeCmd(bin string, repoPath *string) *cobra.Command {
 	var (
 		maxResults int
 		language   string
@@ -169,7 +192,11 @@ Examples:
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {
-			r := codeintel.New(cwd())
+			root, err := indexRoot(*repoPath)
+			if err != nil {
+				return fmt.Errorf("search-code: %w", err)
+			}
+			r := codeintel.New(root)
 			if !r.IsCodeAvailable() {
 				return fmt.Errorf("%w", codeintel.ErrNotAvailable)
 			}
@@ -193,7 +220,7 @@ Examples:
 }
 
 // newCodeCheckDuplicateCmd constructs `donmai code check-duplicate`.
-func newCodeCheckDuplicateCmd(bin string) *cobra.Command {
+func newCodeCheckDuplicateCmd(bin string, repoPath *string) *cobra.Command {
 	var (
 		content     string
 		contentFile string
@@ -211,7 +238,11 @@ Examples:
   ` + bin + ` code check-duplicate --content-file /tmp/snippet.go`,
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			r := codeintel.New(cwd())
+			root, err := indexRoot(*repoPath)
+			if err != nil {
+				return fmt.Errorf("check-duplicate: %w", err)
+			}
+			r := codeintel.New(root)
 			if !r.IsCodeAvailable() {
 				return fmt.Errorf("%w", codeintel.ErrNotAvailable)
 			}
@@ -236,7 +267,7 @@ Examples:
 }
 
 // newCodeFindTypeUsagesCmd constructs `donmai code find-type-usages <TypeName>`.
-func newCodeFindTypeUsagesCmd(bin string) *cobra.Command {
+func newCodeFindTypeUsagesCmd(bin string, repoPath *string) *cobra.Command {
 	var maxResults int
 
 	cmd := &cobra.Command{
@@ -257,7 +288,11 @@ Examples:
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {
-			r := codeintel.New(cwd())
+			root, err := indexRoot(*repoPath)
+			if err != nil {
+				return fmt.Errorf("find-type-usages: %w", err)
+			}
+			r := codeintel.New(root)
 			if !r.IsCodeAvailable() {
 				return fmt.Errorf("%w", codeintel.ErrNotAvailable)
 			}
@@ -279,7 +314,7 @@ Examples:
 }
 
 // newCodeValidateCrossDepsCmd constructs `donmai code validate-cross-deps [path]`.
-func newCodeValidateCrossDepsCmd(bin string) *cobra.Command {
+func newCodeValidateCrossDepsCmd(bin string, repoPath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "validate-cross-deps [path]",
 		Short: "Check that cross-package imports have package.json dependency declarations",
@@ -295,7 +330,11 @@ Examples:
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, args []string) error {
-			r := codeintel.New(cwd())
+			root, err := indexRoot(*repoPath)
+			if err != nil {
+				return fmt.Errorf("validate-cross-deps: %w", err)
+			}
+			r := codeintel.New(root)
 			if !r.IsCodeAvailable() {
 				return fmt.Errorf("%w", codeintel.ErrNotAvailable)
 			}
@@ -322,4 +361,60 @@ func cwd() string {
 		return wd
 	}
 	return "."
+}
+
+// gitRootWarnOnce guards the one-line stderr note emitted (at most once per
+// process) when no enclosing git repository is found and cwd() is used as
+// the index root fallback instead.
+var gitRootWarnOnce sync.Once
+
+// indexRoot resolves the effective root directory that code-intel commands
+// should index: the enclosing git repository root, discovered by walking up
+// from the current directory for a `.git` entry (directory or file form —
+// worktree checkouts use a `.git` file), optionally narrowed to a subtree via
+// repoPath (the --repo-path flag).
+//
+// When no git root is found, the current directory is used as a fallback and
+// a one-line note is printed to stderr (once per process) so operators
+// understand indexing may be narrower than the whole repository.
+//
+// repoPath, when non-empty, must be a path RELATIVE to the discovered root
+// (absolute paths are rejected) and must resolve, after filepath.Clean, to a
+// location that stays inside that root (rejecting ../ escapes). The resolved
+// path must exist and be a directory.
+func indexRoot(repoPath string) (string, error) {
+	dir := cwd()
+	root := dir
+	if gitRoot, ok := codeintel.FindGitRoot(dir); ok {
+		root = gitRoot
+	} else {
+		gitRootWarnOnce.Do(func() {
+			fmt.Fprintf(os.Stderr,
+				"note: no enclosing git repository found from %s; indexing is scoped to the current directory only\n", dir)
+		})
+	}
+
+	if repoPath == "" {
+		return root, nil
+	}
+
+	if filepath.IsAbs(repoPath) {
+		return "", fmt.Errorf("--repo-path must be a relative path under the git root, got absolute path %q", repoPath)
+	}
+
+	cleaned := filepath.Clean(filepath.Join(root, repoPath))
+	rel, err := filepath.Rel(root, cleaned)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("--repo-path %q escapes the git root %q", repoPath, root)
+	}
+
+	info, err := os.Stat(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("--repo-path %q: %w", repoPath, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("--repo-path %q is not a directory", repoPath)
+	}
+
+	return cleaned, nil
 }
