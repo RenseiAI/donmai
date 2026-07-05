@@ -41,9 +41,15 @@ type TokenCounts struct {
 	CacheRead int64 `json:"cache_read"`
 }
 
-// Total returns input+output — the "tokens-to-solution" numerator for the
-// efficiency metric (brief 06 §4.5).
-func (t TokenCounts) Total() int64 { return t.Input + t.Output }
+// Total returns the "tokens-to-solution" numerator for the efficiency metric
+// (brief 06 §4.5): input + output + cache-read. Cache reads are included
+// deliberately — the WITH arm attaches the af-code-intelligence MCP surface
+// (tool schemas + tool-result payloads) and a larger orienting context, much of
+// which lands in cached-input / cache-read accounting in a real agent harness.
+// Excluding cache-read would let the WITH arm breach the true <=+10% token
+// budget while the harness reported a ratio under the gate — a token cost the
+// WITH arm is most likely to grow must not be counted as free.
+func (t TokenCounts) Total() int64 { return t.Input + t.Output + t.CacheRead }
 
 // Retain tags for a snapshot / trace (EvalTraceRetain).
 const (

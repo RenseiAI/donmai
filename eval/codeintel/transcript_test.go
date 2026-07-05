@@ -104,3 +104,22 @@ func TestTokenCounts_JSONTagsMatchPlatform(t *testing.T) {
 		t.Errorf("tokenCounts JSON = %s, want %s", got, want)
 	}
 }
+
+// TestTokenCounts_TotalIncludesCacheRead guards the tokens-to-solution numerator
+// against the WITH-arm hiding its context/MCP-schema overhead in cached-input
+// accounting: cache-read tokens are real cost and MUST count toward Total(),
+// or the <=+10% token gate can be satisfied by an arm that is actually more
+// expensive.
+func TestTokenCounts_TotalIncludesCacheRead(t *testing.T) {
+	// A WITH-arm-shaped trace: modest fresh input+output, but a large cached
+	// prompt (the MCP tool schemas + orienting context) landing as cache reads.
+	tc := TokenCounts{Input: 200, Output: 45, CacheRead: 5000}
+	if got := tc.Total(); got != 5245 {
+		t.Errorf("Total() = %d, want 5245 (input+output+cacheRead) — cache reads must not be free", got)
+	}
+	// Cache-read-only cost must still register (an arm whose spend is entirely
+	// cached input is not a zero-cost arm).
+	if got := (TokenCounts{CacheRead: 1000}).Total(); got != 1000 {
+		t.Errorf("Total() = %d, want 1000 for a cache-read-only trace", got)
+	}
+}
