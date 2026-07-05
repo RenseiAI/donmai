@@ -166,6 +166,18 @@ func (n *NativeRunner) discoverFiles(filePatterns []string) ([]string, error) {
 			return nil // skip unreadable entries
 		}
 		name := d.Name()
+		// Never follow symlinks. WalkDir already declines to DESCEND into a
+		// symlinked directory, but a symlinked *file* dirent has IsDir()==false
+		// and would otherwise pass the extension filter and be os.ReadFile'd,
+		// transparently following the link — a repo could plant leak.go ->
+		// /etc/... or ../outside-secret/x.go and exfiltrate arbitrary host files
+		// into the index (and, with hybrid search, off the box). A symlink dirent
+		// reports IsDir()==false, so skipping it here excludes both symlinked
+		// files and symlinked directories (WalkDir already never descends into a
+		// symlinked directory).
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
 		if d.IsDir() {
 			if skipDirs[name] || strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
