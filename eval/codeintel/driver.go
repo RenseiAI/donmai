@@ -247,29 +247,48 @@ func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, _ string
 		Arm: arm, Case: c, Workarea: wa, DonmaiBin: d.cfg.DonmaiBin,
 		Budget: d.cfg.Budget, AdvertiseMode: d.cfg.Advertise, SnapshotID: workareaLeaf(wa),
 	}
-	if arm == ArmWithout {
-		// Control: strip donmai from PATH (mandatory guard).
-		spec.Env, _ = ScrubBinaryFromEnv(base, "donmai")
-		return spec, nil, nil
+	// Neutralize donmai on the SHARED base so BOTH arms resolve an identical set
+	// of non-donmai tools (rg/gh/git). Dropping the whole directory that holds
+	// donmai (the old ScrubBinaryFromEnv approach) strips those baseline tools
+	// from the control only when donmai is co-installed alongside them (e.g.
+	// /opt/homebrew/bin on the dogfooding host), asymmetrically inflating the A/B
+	// delta. Name-granular masking removes donmai and nothing else.
+	neutralBase, neutralCleanup, err := NeutralizeBinaryInEnv(base, "donmai")
+	if err != nil {
+		return ArmSpec{}, nil, fmt.Errorf("neutralize control PATH: %w", err)
 	}
-	// Treatment: make donmai reachable (prepend its dir) and attach the advertisement.
-	withEnv := PrependPath(base, filepath.Dir(d.cfg.DonmaiBin))
+	if arm == ArmWithout {
+		// Control: the neutral base — same tools as WITH, minus donmai.
+		spec.Env = neutralBase
+		return spec, neutralCleanup, nil
+	}
+	// Treatment: neutral base + a dedicated donmai-ONLY dir (re-adding donmai
+	// cannot re-introduce any sibling tool the control lacks) and the advertisement.
+	donmaiDir, donmaiCleanup, err := StageBinaryOnlyDir(d.cfg.DonmaiBin, "donmai")
+	if err != nil {
+		neutralCleanup()
+		return ArmSpec{}, nil, fmt.Errorf("stage donmai dir: %w", err)
+	}
+	withEnv := PrependPath(neutralBase, donmaiDir)
 	spec.Env = withEnv
+	cleanup := func() { donmaiCleanup(); neutralCleanup() }
 	servers, suffix, err := d.ad.Apply(ctx, d.cfg.DonmaiBin, wa, c.Input.RepoPath, withEnv)
 	if err != nil {
+		cleanup()
 		return ArmSpec{}, nil, fmt.Errorf("advertise: %w", err)
 	}
 	spec.MCPServers = servers
 	spec.PromptSuffix = suffix
 	spec.AdvertisedTools = d.ad.AdvertisedToolNames()
-	var cleanup func()
 	if len(servers) > 0 {
 		path, werr := clijsonl.WriteMCPConfig(servers)
 		if werr != nil {
+			cleanup()
 			return ArmSpec{}, nil, fmt.Errorf("write mcp config: %w", werr)
 		}
 		spec.MCPConfigPath = path
-		cleanup = func() { _ = clijsonl.RemoveMCPConfig(path) }
+		prev := cleanup
+		cleanup = func() { _ = clijsonl.RemoveMCPConfig(path); prev() }
 	}
 	return spec, cleanup, nil
 }

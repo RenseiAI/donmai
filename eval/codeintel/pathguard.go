@@ -122,6 +122,86 @@ func PrependPath(env []string, dir string) []string {
 	return setEnvPath(env, dir+pathListSep+path)
 }
 
+// NeutralizeBinaryInEnv returns a copy of env whose PATH resolves every tool it
+// did before EXCEPT `name`, plus a cleanup for the shadow directories it creates.
+//
+// Unlike ScrubBinaryFromEnv — which drops the WHOLE directory that holds the
+// binary, taking sibling tools (rg/gh/git) down with it — this masks ONLY
+// `name`: any PATH dir that contains an executable `name` is replaced, in place
+// in the PATH order, by a freshly-built shadow dir that symlinks every sibling
+// entry except `name`. After this, BinaryOnPath(name, PATH) is false while every
+// other tool resolves exactly as before.
+//
+// This is what makes the A/B control clean WITHOUT biasing it: on a dogfooding
+// host donmai is co-installed alongside baseline tools (e.g. /opt/homebrew/bin),
+// so dropping that whole dir would strip ripgrep/gh from the control only. The
+// driver neutralizes donmai on the SHARED base for BOTH arms and re-adds it only
+// for WITH via StageBinaryOnlyDir, so the two arms resolve an identical set of
+// non-donmai tools and differ solely on donmai.
+func NeutralizeBinaryInEnv(env []string, name string) (out []string, cleanup func(), err error) {
+	var shadows []string
+	cleanup = func() {
+		for _, d := range shadows {
+			_ = os.RemoveAll(d)
+		}
+	}
+	path := envPath(env)
+	newDirs := make([]string, 0)
+	for _, dir := range strings.Split(path, pathListSep) {
+		if dir == "" || !isExecutable(filepath.Join(dir, name)) {
+			newDirs = append(newDirs, dir)
+			continue
+		}
+		shadow, serr := shadowDirExcluding(dir, name)
+		if serr != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("neutralize %q in %s: %w", name, dir, serr)
+		}
+		shadows = append(shadows, shadow)
+		newDirs = append(newDirs, shadow)
+	}
+	return setEnvPath(env, strings.Join(newDirs, pathListSep)), cleanup, nil
+}
+
+// shadowDirExcluding builds a temp dir that symlinks every entry of src except
+// `exclude`, so the shadow resolves every sibling tool but not the excluded one.
+func shadowDirExcluding(src, exclude string) (string, error) {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return "", err
+	}
+	shadow, err := os.MkdirTemp("", "codeintel-eval-mask-")
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if e.Name() == exclude {
+			continue
+		}
+		// Best-effort: skip entries we can't link (name clashes, odd perms); the
+		// goal is to preserve resolvable sibling tools, not mirror the dir exactly.
+		_ = os.Symlink(filepath.Join(src, e.Name()), filepath.Join(shadow, e.Name()))
+	}
+	return shadow, nil
+}
+
+// StageBinaryOnlyDir creates a temp dir containing a single symlink `name` →
+// binPath, and returns the dir plus a cleanup. Prepending this dir to a
+// neutralized PATH makes exactly ONE binary reachable and nothing else — the
+// dedicated donmai-only directory the WITH arm gets, so re-adding donmai cannot
+// re-introduce any sibling tool the WITHOUT arm lacks.
+func StageBinaryOnlyDir(binPath, name string) (dir string, cleanup func(), err error) {
+	dir, err = os.MkdirTemp("", "codeintel-eval-bin-")
+	if err != nil {
+		return "", nil, err
+	}
+	if err := os.Symlink(binPath, filepath.Join(dir, name)); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("stage %q: %w", name, err)
+	}
+	return dir, func() { _ = os.RemoveAll(dir) }, nil
+}
+
 // VerifyControlClean asserts the mandatory contamination guard held: the given
 // arm environment must NOT resolve `name`. Returns a descriptive error when the
 // binary is still reachable (the control is contaminated) — callers treat this
