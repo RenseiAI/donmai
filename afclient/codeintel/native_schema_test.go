@@ -22,7 +22,7 @@ func TestLoadIndex_VersionMismatchDiscards(t *testing.T) {
 	}
 	// Legacy v1 index: no "version" key, one file entry.
 	v1 := `{"files":{"a.go":{"filePath":"a.go","gitHash":"abc","symbols":[],"lastIndexed":1}},"rootHash":"deadbeef"}`
-	if err := os.WriteFile(filepath.Join(idxDir, "index.json"), []byte(v1), 0o640); err != nil {
+	if err := os.WriteFile(filepath.Join(idxDir, "index.json"), []byte(v1), 0o640); err != nil { //nolint:gosec // G306 test fixture
 		t.Fatalf("write: %v", err)
 	}
 
