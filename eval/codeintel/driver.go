@@ -115,8 +115,10 @@ type FamilyStat struct {
 	WithoutTokens []int64 `json:"-"`
 }
 
-// WithRate / WithoutRate are the arm success rates.
-func (f *FamilyStat) WithRate() float64    { return rate(f.WithPasses, f.WithTrials) }
+// WithRate is the WITH-arm task-success rate.
+func (f *FamilyStat) WithRate() float64 { return rate(f.WithPasses, f.WithTrials) }
+
+// WithoutRate is the WITHOUT-arm task-success rate.
 func (f *FamilyStat) WithoutRate() float64 { return rate(f.WithoutPasses, f.WithoutTrials) }
 
 // DeltaPP is the WITH−WITHOUT success delta in percentage points.
@@ -226,7 +228,7 @@ func (d *Driver) runOne(ctx context.Context, c Case, arm Arm, trial int) (RunRec
 }
 
 // buildArmSpec assembles the per-arm env + advertisement + MCP config.
-func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, sessionID string) (ArmSpec, func(), error) {
+func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, _ string) (ArmSpec, func(), error) {
 	base := os.Environ()
 	spec := ArmSpec{
 		Arm: arm, Case: c, Workarea: wa, DonmaiBin: d.cfg.DonmaiBin,

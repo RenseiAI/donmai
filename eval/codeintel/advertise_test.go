@@ -58,7 +58,7 @@ func writeFakeDonmai(t *testing.T) string {
 		"  echo 'Code intelligence commands: get-repo-map search-symbols search-code'\n" +
 		"  exit 0\nfi\nexit 0\n"
 	p := filepath.Join(dir, "donmai")
-	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil { // nolint:gosec // must be executable to run as the WITH-arm donmai
 		t.Fatalf("write fake donmai: %v", err)
 	}
 	return p

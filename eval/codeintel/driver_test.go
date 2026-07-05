@@ -16,7 +16,7 @@ func initTempRepo(t *testing.T) (string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	run := func(args ...string) string {
-		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...) // nolint:gosec // fixed git command; args are test-controlled
 		cmd.Env = append(os.Environ(),
 			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
 		out, err := cmd.CombinedOutput()
@@ -26,7 +26,7 @@ func initTempRepo(t *testing.T) (string, string) {
 		return strings.TrimSpace(string(out))
 	}
 	run("init", "-q")
-	if err := os.WriteFile(filepath.Join(dir, "foo.go"), []byte("package x\n\nfunc Target() {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "foo.go"), []byte("package x\n\nfunc Target() {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	run("add", ".")

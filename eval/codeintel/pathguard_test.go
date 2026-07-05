@@ -17,7 +17,7 @@ func writeFakeBinary(t *testing.T, name string) string {
 	t.Helper()
 	dir := t.TempDir()
 	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, []byte("#!/bin/sh\necho fake\n"), 0o755); err != nil {
+	if err := os.WriteFile(p, []byte("#!/bin/sh\necho fake\n"), 0o755); err != nil { // nolint:gosec // must be executable to exercise PATH resolution
 		t.Fatalf("write fake binary: %v", err)
 	}
 	return dir
