@@ -683,12 +683,7 @@ func (n *NativeRunner) SearchCodeNative(opts SearchCodeOptions) (any, error) {
 	scored := bm25Score(opts.Query, invertedIdx)
 
 	queryLower := strings.ToLower(opts.Query)
-	type result struct {
-		symbol    CodeSymbol
-		score     float64
-		matchType string
-	}
-	var results []result
+	var results []searchCandidate
 
 	for _, sd := range scored {
 		sym := allSymbols[sd.docID]
@@ -702,13 +697,17 @@ func (n *NativeRunner) SearchCodeNative(opts SearchCodeOptions) (any, error) {
 			matchType = "fuzzy"
 			finalScore *= 1.5
 		}
-		results = append(results, result{sym, finalScore, matchType})
+		results = append(results, searchCandidate{sym, finalScore, matchType})
 	}
 
 	// Re-sort after boosting.
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].score > results[j].score
 	})
+
+	// Optional Voyage+Cohere hybrid rescoring; no-op (zero network) unless
+	// VOYAGE_AI_API_KEY is set. See afclient/codeintel/hybrid.go.
+	results = applyHybridSearch(opts.Query, results)
 
 	maxResults := opts.MaxResults
 	if maxResults <= 0 {
