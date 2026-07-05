@@ -26,7 +26,7 @@ func fakeCodeBin(t *testing.T) string {
 	content := `#!/bin/sh
 printf '{"command":"%s","argv":"%s"}' "$1" "$*"
 `
-	if err := os.WriteFile(script, []byte(content), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+	if err := os.WriteFile(script, []byte(content), 0o750); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
 		t.Fatalf("write fake af-code: %v", err)
 	}
 	t.Setenv("AGENTFACTORY_CODE_BIN", script)
@@ -371,7 +371,7 @@ func runNativeCodeCmd(t *testing.T, dir string, args ...string) (map[string]any,
 // it counts as an indexable file with a symbol.
 func writeSymbolFile(t *testing.T, path, funcName string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	content := fmt.Sprintf("package p\n\nfunc %s() {}\n", funcName)
@@ -387,7 +387,7 @@ func writeSymbolFile(t *testing.T, path, funcName string) {
 // os.Getwd(), so this fails (the repo map only sees the subdirectory's file).
 func TestCodeGetRepoMap_ScopesToGitRootFromSubdirectory(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	writeSymbolFile(t, filepath.Join(root, "root.go"), "Root")
@@ -409,7 +409,7 @@ func TestCodeGetRepoMap_ScopesToGitRootFromSubdirectory(t *testing.T) {
 // server will drive via this exact flag).
 func TestCodeGetRepoMap_RepoPathScopesSubtree(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	writeSymbolFile(t, filepath.Join(root, "pkga", "a.go"), "A")
@@ -430,7 +430,7 @@ func TestCodeGetRepoMap_RepoPathScopesSubtree(t *testing.T) {
 // relative to the git root; an absolute path is rejected.
 func TestCodeGetRepoMap_RepoPathRejectsAbsolutePath(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 
@@ -445,11 +445,11 @@ func TestCodeGetRepoMap_RepoPathRejectsAbsolutePath(t *testing.T) {
 // after filepath.Clean.
 func TestCodeGetRepoMap_RepoPathRejectsTraversal(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	sub := filepath.Join(root, "sub")
-	if err := os.MkdirAll(sub, 0o755); err != nil {
+	if err := os.MkdirAll(sub, 0o750); err != nil {
 		t.Fatal(err)
 	}
 
@@ -463,7 +463,7 @@ func TestCodeGetRepoMap_RepoPathRejectsTraversal(t *testing.T) {
 // that doesn't exist under the git root is rejected.
 func TestCodeGetRepoMap_RepoPathRejectsNonexistentPath(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 
@@ -477,7 +477,7 @@ func TestCodeGetRepoMap_RepoPathRejectsNonexistentPath(t *testing.T) {
 // pointing at a file (not a directory) is rejected.
 func TestCodeGetRepoMap_RepoPathRejectsNonDirectory(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	writeSymbolFile(t, filepath.Join(root, "file.go"), "F")
