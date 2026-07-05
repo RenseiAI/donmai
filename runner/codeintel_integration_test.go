@@ -95,11 +95,17 @@ func TestIntegration_QueuedWorkJSON_ComposesCodeIntelSpec(t *testing.T) {
 	if ci.Command == "" {
 		t.Errorf("code-intel entry Command must be the self-referential executable, got empty")
 	}
+	// --tools is derived from the SAME filtered canonical set as the FQ
+	// allow-list (Assertion 2), so it is emitted in canonical order
+	// (get_repo_map precedes search_symbols) even though the block listed them in
+	// the opposite order. This byte-consistency is the point: an unknown/typo
+	// name would be dropped here identically to the allow-list, never reaching
+	// the server's all-or-nothing --tools validator.
 	wantArgs := []string{
 		"mcp", "code-intel",
 		"--root", wpath,
 		"--repo-path", "packages/linear",
-		"--tools", "af_code_search_symbols,af_code_get_repo_map",
+		"--tools", "af_code_get_repo_map,af_code_search_symbols",
 	}
 	if !slices.Equal(ci.Args, wantArgs) {
 		t.Errorf("code-intel Args = %v\nwant %v", ci.Args, wantArgs)
