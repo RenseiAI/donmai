@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -38,12 +39,29 @@ type NativeRunner struct {
 	pythonExtractor *PythonExtractor
 	rustExtractor   *RustExtractor
 
+	// mu guards the persisted-index disk I/O (loadIndex/saveIndex) and the
+	// in-process warm cache below. A long-lived process (the Wave-2 MCP server)
+	// shares one NativeRunner across concurrent tool calls; the RWMutex makes
+	// those calls safe. The single-shot CLI creates a fresh runner per process,
+	// so the lock is uncontended there and behaviour is unchanged.
+	mu sync.RWMutex
+
+	// cached is the in-process warm index. Once a build populates it, index-
+	// consuming queries reuse it WITHOUT re-walking the tree or re-hashing files
+	// (an explicit staleness contract — see Refresh/Invalidate). nil == cold.
+	cached *IndexFile
+
 	// extractCount is a test seam: it counts how many times a language
 	// extractor was actually invoked on a file (the expensive parse step). The
 	// incremental hot path must NOT re-invoke extractors for unchanged files, so
 	// tests assert this counter stays flat across repeated builds of an
 	// unchanged tree. Atomic for the concurrent warm-path model.
 	extractCount atomic.Int64
+
+	// walkCount is a test seam: it counts full filepath.WalkDir passes. The warm
+	// path must serve queries without re-walking, so tests assert this stays flat
+	// across repeated queries on one runner.
+	walkCount atomic.Int64
 }
 
 // NewNativeRunner creates a NativeRunner that operates relative to cwd.
@@ -141,6 +159,7 @@ var skipDirs = map[string]bool{
 
 // discoverFiles walks the cwd and returns relative paths of indexable files.
 func (n *NativeRunner) discoverFiles(filePatterns []string) ([]string, error) {
+	n.walkCount.Add(1) // test seam: one full-tree walk
 	var paths []string
 	err := filepath.WalkDir(n.cwd, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -246,6 +265,15 @@ func (n *NativeRunner) extractAST(source, filePath string) FileAST {
 // covers the entire indexable tree so the import graph (PageRank) and the
 // in-process warm cache stay coherent regardless of which query invoked it.
 func (n *NativeRunner) BuildIndex(_ GetRepoMapOptions) (IndexFile, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.buildIndexLocked()
+}
+
+// buildIndexLocked is the disk-path incremental builder. Callers must hold
+// n.mu for writing. It also refreshes the in-process warm cache so subsequent
+// queries can reuse it without re-walking.
+func (n *NativeRunner) buildIndexLocked() (IndexFile, error) {
 	files, err := n.discoverFiles(nil)
 	if err != nil {
 		return IndexFile{}, fmt.Errorf("discover files: %w", err)
@@ -274,6 +302,7 @@ func (n *NativeRunner) BuildIndex(_ GetRepoMapOptions) (IndexFile, error) {
 	// changed. Reuse the existing index wholesale (no extraction, no re-save).
 	if MerkleIdentical(oldTree, newTree) && len(existing.Files) == len(newHashes) {
 		existing.Version = IndexSchemaVersion
+		n.cached = &existing
 		return existing, nil
 	}
 
@@ -309,7 +338,59 @@ func (n *NativeRunner) BuildIndex(_ GetRepoMapOptions) (IndexFile, error) {
 	if err := n.saveIndex(idx); err != nil {
 		return idx, fmt.Errorf("save index: %w", err)
 	}
+	n.cached = &idx
 	return idx, nil
+}
+
+// ── in-process warm path (Wave-2 MCP server) ─────────────────────────────────
+//
+// A long-lived MCP-server process constructs ONE NativeRunner and calls its
+// query methods repeatedly. indexForQuery serves those calls from an in-memory
+// cache, skipping the disk load AND the full-tree walk+rehash entirely once the
+// index is warm. Staleness is an EXPLICIT contract, not a per-call re-check
+// (re-hashing every file each call is O(files), which defeats the point): the
+// server invalidates or refreshes the cache when it knows the working tree
+// changed — e.g. after an agent tool writes files, or on a filesystem-watch
+// debounce.
+//
+//	Refresh()    — eagerly rebuild from disk now (re-walk + selective
+//	               re-extraction of changed files) and re-warm the cache.
+//	Invalidate() — drop the cache; the next query rebuilds lazily.
+//
+// The single-shot CLI never calls these: it builds once and exits, so its
+// behaviour is byte-for-byte identical to before the cache existed.
+
+// indexForQuery returns the index for a read-only query, using the warm cache
+// when available and falling back to a disk build (which re-warms it) when cold.
+func (n *NativeRunner) indexForQuery() (IndexFile, error) {
+	n.mu.RLock()
+	if n.cached != nil {
+		idx := *n.cached
+		n.mu.RUnlock()
+		return idx, nil
+	}
+	n.mu.RUnlock()
+	// Cold: build from disk (takes the write lock internally). A concurrent
+	// builder may win the race; that is fine — the build is idempotent.
+	return n.BuildIndex(GetRepoMapOptions{})
+}
+
+// Refresh eagerly rebuilds the index from disk and re-warms the in-process
+// cache. The MCP server calls this when it knows the working tree may have
+// changed. Cheap when nothing changed (Merkle short-circuit), proportional to
+// the change set otherwise.
+func (n *NativeRunner) Refresh() error {
+	_, err := n.BuildIndex(GetRepoMapOptions{})
+	return err
+}
+
+// Invalidate drops the in-process cache so the next index-consuming call
+// rebuilds from disk. Cheaper than Refresh when an immediate rebuild is not
+// required (lazy re-warm on the next tool call).
+func (n *NativeRunner) Invalidate() {
+	n.mu.Lock()
+	n.cached = nil
+	n.mu.Unlock()
 }
 
 // newFileIndex assembles a schema-v2 FileIndex for a freshly-extracted file,
@@ -344,7 +425,7 @@ func (n *NativeRunner) newFileIndex(relPath, gitHash string, raw []byte, ast Fil
 // spirit of the TS implementation (BM25 + PageRank) without the full graph
 // computation, which is deferred to S3.
 func (n *NativeRunner) GetRepoMapNative(opts GetRepoMapOptions) (any, error) {
-	idx, err := n.BuildIndex(opts)
+	idx, err := n.indexForQuery()
 	if err != nil {
 		return nil, err
 	}
@@ -421,7 +502,7 @@ func (n *NativeRunner) SearchSymbolsNative(opts SearchSymbolsOptions) (any, erro
 		return nil, fmt.Errorf("query is required")
 	}
 
-	idx, err := n.BuildIndex(GetRepoMapOptions{})
+	idx, err := n.indexForQuery()
 	if err != nil {
 		return nil, err
 	}
@@ -568,7 +649,7 @@ func (n *NativeRunner) SearchCodeNative(opts SearchCodeOptions) (any, error) {
 		return nil, fmt.Errorf("query is required for search-code")
 	}
 
-	idx, err := n.BuildIndex(GetRepoMapOptions{})
+	idx, err := n.indexForQuery()
 	if err != nil {
 		return nil, err
 	}
@@ -660,7 +741,7 @@ func (n *NativeRunner) CheckDuplicateNative(opts CheckDuplicateOptions) (any, er
 		return nil, fmt.Errorf("content is required for check-duplicate")
 	}
 
-	idx, err := n.BuildIndex(GetRepoMapOptions{})
+	idx, err := n.indexForQuery()
 	if err != nil {
 		return nil, err
 	}
