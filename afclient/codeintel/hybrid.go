@@ -288,7 +288,8 @@ func applyHybridSearch(query string, candidates []searchCandidate) []searchCandi
 func embedHead(ctx context.Context, httpClient *http.Client, apiKey, query string, head []searchCandidate) (queryAndDocs struct {
 	query []float32
 	docs  [][]float32
-}, err error) {
+}, err error,
+) {
 	// Query embedding (rarely cached, since queries vary, but a cache hit
 	// on a repeated identical query costs nothing extra).
 	if v, ok := embedCacheGet("query", query); ok {
@@ -344,7 +345,8 @@ func embedHead(ctx context.Context, httpClient *http.Client, apiKey, query strin
 func blendHeadScores(head []searchCandidate, vectors struct {
 	query []float32
 	docs  [][]float32
-}) {
+},
+) {
 	bm25Raw := make([]float64, len(head))
 	vecRaw := make([]float64, len(head))
 	for i, c := range head {

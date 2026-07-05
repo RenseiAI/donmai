@@ -81,7 +81,7 @@ func voyageEmbed(ctx context.Context, httpClient *http.Client, apiKey string, te
 		// details, so this is safe to surface.
 		return nil, fmt.Errorf("voyage: request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		// Deliberately do not echo the response body: some providers echo

@@ -47,15 +47,15 @@ func withEnv(t *testing.T, key, val string) {
 	t.Helper()
 	prev, had := os.LookupEnv(key)
 	if val == "" {
-		os.Unsetenv(key)
+		_ = os.Unsetenv(key)
 	} else {
-		os.Setenv(key, val)
+		_ = os.Setenv(key, val)
 	}
 	t.Cleanup(func() {
 		if had {
-			os.Setenv(key, prev)
+			_ = os.Setenv(key, prev)
 		} else {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 	})
 }
@@ -92,7 +92,7 @@ func captureStderr(t *testing.T, fn func()) string {
 	os.Stderr = w
 	fn()
 	os.Stderr = orig
-	w.Close()
+	_ = w.Close()
 	var buf bytes.Buffer
 	_, _ = io.Copy(&buf, r)
 	return buf.String()
@@ -270,7 +270,7 @@ func namesOf(cands []searchCandidate) []string {
 func TestApplyHybridSearch_APIFailure_FallsBackToBM25(t *testing.T) {
 	resetEmbedCache(t)
 	var voyageReqs int64
-	voyage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	voyage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt64(&voyageReqs, 1)
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"detail":"internal error"}`))
@@ -302,7 +302,7 @@ func TestApplyHybridSearch_APIFailure_FallsBackToBM25(t *testing.T) {
 // timeout bounds the wait, and the result still falls back to BM25.
 func TestApplyHybridSearch_Timeout_FallsBackAndDoesNotHang(t *testing.T) {
 	resetEmbedCache(t)
-	voyage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	voyage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(500 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"data":[]}`))
@@ -341,7 +341,7 @@ func TestApplyHybridSearch_Timeout_FallsBackAndDoesNotHang(t *testing.T) {
 func TestApplyHybridSearch_CacheHitAvoidsReEmbedding(t *testing.T) {
 	resetEmbedCache(t)
 	var voyageReqs int64
-	voyage := fakeVoyageServer(t, &voyageReqs, func(text, inputType string) []float32 {
+	voyage := fakeVoyageServer(t, &voyageReqs, func(_, _ string) []float32 {
 		return unitVec(0, 4)
 	})
 	defer voyage.Close()
@@ -373,6 +373,7 @@ func TestApplyHybridSearch_NoKeyMaterialInError(t *testing.T) {
 		// Echo the Authorization header back into the error body to prove
 		// our error path doesn't surface it even if a server misbehaves.
 		w.WriteHeader(http.StatusInternalServerError)
+		//nolint:gosec // G705: test deliberately reflects the auth header to prove the client never surfaces it.
 		_, _ = w.Write([]byte(`{"detail":"saw auth header: ` + r.Header.Get("Authorization") + `"}`))
 	}))
 	defer voyage.Close()
@@ -398,11 +399,11 @@ func TestApplyHybridSearch_NoKeyMaterialInError(t *testing.T) {
 func TestApplyHybridSearch_BoundedRequestCount_NotWholeCorpus(t *testing.T) {
 	resetEmbedCache(t)
 	var voyageReqs, cohereReqs int64
-	voyage := fakeVoyageServer(t, &voyageReqs, func(text, inputType string) []float32 {
+	voyage := fakeVoyageServer(t, &voyageReqs, func(_, _ string) []float32 {
 		return unitVec(0, 4)
 	})
 	defer voyage.Close()
-	cohere := fakeCohereServer(t, &cohereReqs, func(text string) float64 { return 0.5 })
+	cohere := fakeCohereServer(t, &cohereReqs, func(_ string) float64 { return 0.5 })
 	defer cohere.Close()
 
 	withEnv(t, "VOYAGE_AI_API_KEY", "test-voyage-key")

@@ -78,7 +78,7 @@ func cohereRerank(ctx context.Context, httpClient *http.Client, apiKey string, q
 	if err != nil {
 		return nil, fmt.Errorf("cohere: request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		// Never echo the response body — see voyage.go for rationale.
