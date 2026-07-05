@@ -186,52 +186,48 @@ func (d *DupStore) Store(id, content string) {
 	})
 }
 
-// CheckDuplicateContent performs a stateless duplicate check against an
-// existing index using xxHash64 + SimHash. It operates on individual file
-// content items without a persistent store.
+// CheckDuplicateContent performs a stateless duplicate check of content against
+// the REAL file content captured in the persisted index (schema v2). It is a
+// two-tier check that mirrors the TS DedupPipeline, but over actual file content
+// rather than serialized symbol text:
+//
+//   - Tier 1 (exact): the query's normalised-content xxHash64 is compared
+//     against each file's persisted ContentHash (also the xxHash64 of that
+//     file's normalised content, computed at index time). A byte-identical copy
+//     of an indexed file therefore hashes equal and is flagged exact-dup.
+//   - Tier 2 (near): the query's SimHash fingerprint is compared against each
+//     file's persisted SimHash (computed over the same normalised content) using
+//     Hamming distance; within threshold ⇒ near-dup.
+//
+// Files lacking both content fields (e.g. a pre-v2 entry, or a file that failed
+// to hash) are skipped rather than producing a spurious match.
 //
 // Parameters:
 //   - content is the content to check.
-//   - index is the list of FileIndex entries (from the persisted index.json)
-//     representing the corpus to search.
+//   - index is the list of FileIndex entries (from the persisted index.json).
 //   - threshold is the SimHash Hamming-distance threshold.
 func CheckDuplicateContent(content string, index []FileIndex, threshold int) DupResult {
 	normalized := normalizeDupContent(content)
 	contentHash := ContentXXHash64(normalized)
 	contentFP := SimHashCompute(normalized)
 
+	// Tier 1: exact match against persisted content hashes.
 	for _, fi := range index {
-		// We index by git blob hash (SHA1), so we cannot do exact xxHash64
-		// matching against the file hashes directly.  Instead we compute
-		// the SimHash fingerprint of the file symbols as a corpus.  For
-		// exact matching we compare the xxHash64 of the normalised content
-		// against the normalised xxHash64 of the file contents — however the
-		// index only stores git blob SHA1.  So for S3 we use SimHash only
-		// across files and xxHash64 for within-request duplication.
-		// That matches the TS DedupPipeline which holds an in-memory store.
-		//
-		// Intentional deviation from TS: the TS pipeline holds state across
-		// calls (InMemoryStore); the native Go path uses the persisted index
-		// file list as the corpus.  This means:
-		//   - Exact dedup: we compare contentHash against a per-call xxHash64
-		//     computed from the symbols text of each file.
-		//   - Near dedup: SimHash(content) vs SimHash(file symbol text).
-		//
-		// The TS DedupPipeline is designed for memory entries, not code files.
-		// We apply the same two-tier strategy but over code symbols.
-
-		fileText := fileIndexToText(fi)
-		fileHash := ContentXXHash64(fileText)
-		if fileHash == contentHash {
+		if fi.ContentHash != "" && fi.ContentHash == contentHash {
 			return DupResult{
 				IsDuplicate: true,
 				MatchType:   "exact",
 				ExistingID:  fi.FilePath,
 			}
 		}
+	}
 
-		fileFP := SimHashCompute(fileText)
-		dist := SimHashHammingDistance(contentFP, fileFP)
+	// Tier 2: near match against persisted content fingerprints.
+	for _, fi := range index {
+		if fi.ContentHash == "" || fi.SimHash == 0 {
+			continue // no real-content fingerprint to compare against
+		}
+		dist := SimHashHammingDistance(contentFP, fi.SimHash)
 		if dist <= threshold {
 			return DupResult{
 				IsDuplicate:     true,
@@ -243,16 +239,6 @@ func CheckDuplicateContent(content string, index []FileIndex, threshold int) Dup
 	}
 
 	return DupResult{MatchType: "none"}
-}
-
-// fileIndexToText converts a FileIndex into a text string for SimHash computation.
-func fileIndexToText(fi FileIndex) string {
-	parts := make([]string, 0, len(fi.Symbols)+1)
-	parts = append(parts, fi.FilePath)
-	for _, sym := range fi.Symbols {
-		parts = append(parts, symbolToText(sym))
-	}
-	return strings.Join(parts, " ")
 }
 
 // ── Compiled regexps ──────────────────────────────────────────────────────────
