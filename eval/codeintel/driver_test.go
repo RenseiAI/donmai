@@ -328,9 +328,12 @@ func TestComputeAggregate_PoweredCorpusCanPass(t *testing.T) {
 	repos := []string{"RenseiAI/platform", "RenseiAI/donmai"}
 	fams := map[TaskType]*FamilyStat{}
 	var cases []Case
+	var records []RunRecord
 	for _, fam := range families {
 		f := &FamilyStat{}
 		for i := 0; i < minTasksPerFamily; i++ {
+			id := fmt.Sprintf("%s-%02d", fam, i)
+			repo := repos[i%len(repos)]
 			// minTrialsForGA trials/arm/case; WITH passes all, WITHOUT fails all.
 			for tr := 0; tr < minTrialsForGA; tr++ {
 				f.WithTrials++
@@ -338,26 +341,100 @@ func TestComputeAggregate_PoweredCorpusCanPass(t *testing.T) {
 				f.WithoutTrials++
 				f.WithTokens = append(f.WithTokens, 100)
 				f.WithoutTokens = append(f.WithoutTokens, 110)
+				records = append(records,
+					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWith, Pass: true},
+					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWithout, Pass: false},
+				)
 			}
-			cases = append(cases, Case{
-				ID:    fmt.Sprintf("%s-%02d", fam, i),
-				Input: CaseInput{TaskType: fam, Repo: repos[i%len(repos)]},
-			})
+			cases = append(cases, Case{ID: id, Input: CaseInput{TaskType: fam, Repo: repo}})
 		}
 		fams[fam] = f
 	}
 
-	agg := computeAggregate(fams, cases, minTrialsForGA)
+	agg := computeAggregate(fams, records, cases, minTrialsForGA)
 	if agg.Underpowered {
 		t.Fatalf("powered corpus must not be underpowered; shortfalls=%v", agg.PowerShortfalls)
 	}
 	if agg.DeltaPP < 15 {
 		t.Fatalf("precondition: delta should be +100pp, got %.0f", agg.DeltaPP)
 	}
+	// Every case is a clean +100pp win, so the bootstrap CI is a point mass at 100.
+	if agg.DeltaCILow < 15 {
+		t.Fatalf("precondition: a uniform +100pp corpus must have a tight CI lower bound, got %.1f", agg.DeltaCILow)
+	}
 	if !agg.MeetsThreshold {
 		t.Errorf("powered +100pp corpus (no regression, tokens<budget) must meet threshold; status=%q", agg.Status)
 	}
 	if !strings.Contains(agg.Status, "GA-PASS") {
 		t.Errorf("status should be GA-PASS, got %q", agg.Status)
+	}
+}
+
+// TestComputeAggregate_WideCIPoweredRunFailsOnLowerBound is the finding-7
+// red-first guard: a fully-POWERED corpus (>=8 tasks/family x4, 2 repos, 3
+// trials) whose per-case outcomes are heterogeneous — most cases a tie, a
+// handful big WITH wins — has a point-estimate delta above +15pp but a WIDE 95%
+// CI whose LOWER BOUND falls below +15pp. Gating on the point estimate would
+// pass this borderline/noisy result; the founder verdict must gate on the CI
+// lower bound and REFUSE it.
+func TestComputeAggregate_WideCIPoweredRunFailsOnLowerBound(t *testing.T) {
+	repos := []string{"RenseiAI/platform", "RenseiAI/donmai"}
+	fams := map[TaskType]*FamilyStat{}
+	var cases []Case
+	var records []RunRecord
+
+	// 6 "win" cases (WITH beats WITHOUT +100pp) out of 32; the other 26 are ties
+	// (both arms pass). Pooled point estimate ≈ +18.75pp, but the case-level
+	// variance is high → the bootstrap 95% lower bound sits well below +15pp.
+	winsRemaining := 6
+	caseIdx := 0
+	for _, fam := range families {
+		f := &FamilyStat{}
+		fams[fam] = f
+		for i := 0; i < minTasksPerFamily; i++ {
+			id := fmt.Sprintf("%s-%02d", fam, i)
+			repo := repos[caseIdx%len(repos)]
+			caseIdx++
+			cases = append(cases, Case{ID: id, Input: CaseInput{TaskType: fam, Repo: repo}})
+			isWin := winsRemaining > 0
+			if isWin {
+				winsRemaining--
+			}
+			for tr := 0; tr < minTrialsForGA; tr++ {
+				// WITH always passes; WITHOUT passes on ties, fails on wins.
+				f.WithTrials++
+				f.WithPasses++
+				f.WithTokens = append(f.WithTokens, 100)
+				f.WithoutTrials++
+				f.WithoutTokens = append(f.WithoutTokens, 110)
+				woPass := !isWin
+				if woPass {
+					f.WithoutPasses++
+				}
+				records = append(records,
+					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWith, Pass: true},
+					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWithout, Pass: woPass},
+				)
+			}
+		}
+	}
+
+	agg := computeAggregate(fams, records, cases, minTrialsForGA)
+	if agg.Underpowered {
+		t.Fatalf("corpus should be powered; shortfalls=%v", agg.PowerShortfalls)
+	}
+	if len(agg.RegressedFamilies) != 0 {
+		t.Fatalf("no family should regress (WITH >= WITHOUT everywhere); got %v", agg.RegressedFamilies)
+	}
+	if agg.DeltaPP < 15 {
+		t.Fatalf("precondition: point-estimate delta must clear +15pp, got %.2f", agg.DeltaPP)
+	}
+	if agg.DeltaCILow >= 15 {
+		t.Fatalf("precondition: the 95%% CI lower bound must fall BELOW +15pp for this wide-variance corpus, got %.2f (hi=%.2f, stddev=%.2f)",
+			agg.DeltaCILow, agg.DeltaCIHigh, agg.DeltaStdDev)
+	}
+	if agg.MeetsThreshold {
+		t.Errorf("a powered run whose 95%% CI lower bound (%.2f) is below +15pp must NOT meet the founder threshold — the point estimate (%.2f) is not enough",
+			agg.DeltaCILow, agg.DeltaPP)
 	}
 }
