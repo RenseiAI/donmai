@@ -17,7 +17,12 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 	var imports []string
 	var exports []string
 
-	var currentDoc string
+	// docBuf accumulates consecutive /// doc lines. strings.Builder (not
+	// `s += ...`) keeps accumulation O(n) rather than O(n^2), so a huge doc
+	// block cannot hang indexing for seconds. docString()/resetDoc() read/clear.
+	var docBuf strings.Builder
+	docString := docBuf.String
+	resetDoc := docBuf.Reset
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -25,11 +30,10 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 		// Doc-comments (///).
 		if strings.HasPrefix(trimmed, "///") {
 			body := strings.TrimSpace(trimmed[3:])
-			if currentDoc != "" {
-				currentDoc += "\n" + body
-			} else {
-				currentDoc = body
+			if docBuf.Len() > 0 {
+				docBuf.WriteByte('\n')
 			}
+			docBuf.WriteString(body)
 			continue
 		}
 
@@ -68,14 +72,14 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Signature: sig,
 				Language:  "rust",
 			}
-			if currentDoc != "" {
-				sym.Documentation = currentDoc
+			if docBuf.Len() > 0 {
+				sym.Documentation = docString()
 			}
 			symbols = append(symbols, sym)
 			if isPublic {
 				exports = append(exports, name)
 			}
-			currentDoc = ""
+			resetDoc()
 			continue
 		}
 
@@ -90,14 +94,14 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Exported: isPublic,
 				Language: "rust",
 			}
-			if currentDoc != "" {
-				sym.Documentation = currentDoc
+			if docBuf.Len() > 0 {
+				sym.Documentation = docString()
 			}
 			symbols = append(symbols, sym)
 			if isPublic {
 				exports = append(exports, name)
 			}
-			currentDoc = ""
+			resetDoc()
 			continue
 		}
 
@@ -112,14 +116,14 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Exported: isPublic,
 				Language: "rust",
 			}
-			if currentDoc != "" {
-				sym.Documentation = currentDoc
+			if docBuf.Len() > 0 {
+				sym.Documentation = docString()
 			}
 			symbols = append(symbols, sym)
 			if isPublic {
 				exports = append(exports, name)
 			}
-			currentDoc = ""
+			resetDoc()
 			continue
 		}
 
@@ -134,14 +138,14 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Exported: isPublic,
 				Language: "rust",
 			}
-			if currentDoc != "" {
-				sym.Documentation = currentDoc
+			if docBuf.Len() > 0 {
+				sym.Documentation = docString()
 			}
 			symbols = append(symbols, sym)
 			if isPublic {
 				exports = append(exports, name)
 			}
-			currentDoc = ""
+			resetDoc()
 			continue
 		}
 
@@ -161,11 +165,11 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Exported: false,
 				Language: "rust",
 			}
-			if currentDoc != "" {
-				sym.Documentation = currentDoc
+			if docBuf.Len() > 0 {
+				sym.Documentation = docString()
 			}
 			symbols = append(symbols, sym)
-			currentDoc = ""
+			resetDoc()
 			continue
 		}
 
@@ -180,14 +184,14 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Exported: isPublic,
 				Language: "rust",
 			}
-			if currentDoc != "" {
-				sym.Documentation = currentDoc
+			if docBuf.Len() > 0 {
+				sym.Documentation = docString()
 			}
 			symbols = append(symbols, sym)
 			if isPublic {
 				exports = append(exports, name)
 			}
-			currentDoc = ""
+			resetDoc()
 			continue
 		}
 
@@ -206,7 +210,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 			if isPublic {
 				exports = append(exports, name)
 			}
-			currentDoc = ""
+			resetDoc()
 			continue
 		}
 
@@ -225,7 +229,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 			if isPublic {
 				exports = append(exports, name)
 			}
-			currentDoc = ""
+			resetDoc()
 			continue
 		}
 
@@ -244,13 +248,13 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 			if isPublic {
 				exports = append(exports, name)
 			}
-			currentDoc = ""
+			resetDoc()
 			continue
 		}
 
 		// Clear doc comment on any non-empty, non-comment, non-attribute line.
 		if trimmed != "" && !strings.HasPrefix(trimmed, "#[") && !strings.HasPrefix(trimmed, "*") {
-			currentDoc = ""
+			resetDoc()
 		}
 	}
 

@@ -18,7 +18,13 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 	var imports []string
 	var exports []string
 
-	var currentComment string
+	// commentBuf accumulates consecutive // doc lines. Using a strings.Builder
+	// (not `s += ...`) keeps accumulation O(n) rather than O(n^2) — a huge
+	// license-header/changelog comment block would otherwise hang indexing for
+	// many seconds. commentString()/resetComment() read/clear it.
+	var commentBuf strings.Builder
+	commentString := commentBuf.String
+	resetComment := commentBuf.Reset
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -26,11 +32,10 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 		// Track doc-comments (// lines accumulate until a blank or non-comment line).
 		if strings.HasPrefix(trimmed, "//") {
 			body := strings.TrimSpace(trimmed[2:])
-			if currentComment != "" {
-				currentComment += "\n" + body
-			} else {
-				currentComment = body
+			if commentBuf.Len() > 0 {
+				commentBuf.WriteByte('\n')
 			}
+			commentBuf.WriteString(body)
 			continue
 		}
 
@@ -77,8 +82,8 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 				Signature: sig,
 				Language:  "go",
 			}
-			if currentComment != "" {
-				sym.Documentation = currentComment
+			if commentBuf.Len() > 0 {
+				sym.Documentation = commentString()
 			}
 			if receiverType != "" {
 				sym.ParentName = receiverType
@@ -87,7 +92,7 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 			if exported {
 				exports = append(exports, name)
 			}
-			currentComment = ""
+			resetComment()
 			continue
 		}
 
@@ -103,14 +108,14 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 				Exported: exported,
 				Language: "go",
 			}
-			if currentComment != "" {
-				sym.Documentation = currentComment
+			if commentBuf.Len() > 0 {
+				sym.Documentation = commentString()
 			}
 			symbols = append(symbols, sym)
 			if exported {
 				exports = append(exports, name)
 			}
-			currentComment = ""
+			resetComment()
 			continue
 		}
 
@@ -126,14 +131,14 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 				Exported: exported,
 				Language: "go",
 			}
-			if currentComment != "" {
-				sym.Documentation = currentComment
+			if commentBuf.Len() > 0 {
+				sym.Documentation = commentString()
 			}
 			symbols = append(symbols, sym)
 			if exported {
 				exports = append(exports, name)
 			}
-			currentComment = ""
+			resetComment()
 			continue
 		}
 
@@ -156,7 +161,7 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 				if exported {
 					exports = append(exports, name)
 				}
-				currentComment = ""
+				resetComment()
 				continue
 			}
 		}
@@ -177,13 +182,13 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 			if exported {
 				exports = append(exports, name)
 			}
-			currentComment = ""
+			resetComment()
 			continue
 		}
 
 		// Clear accumulated comment on any non-empty, non-comment line.
 		if trimmed != "" {
-			currentComment = ""
+			resetComment()
 		}
 	}
 
