@@ -45,7 +45,7 @@ Override: set DONMAI_CODE_BIN to force the deprecated TypeScript exec-shim
 path for ALL subcommands (useful for testing against the legacy reference
 implementation; prints a one-time deprecation notice to stderr).
 
-Optional env vars for enhanced search (exec-shim path only):
+Optional env vars for enhanced search-code results:
   VOYAGE_AI_API_KEY   Enables semantic vector embeddings (hybrid BM25+vector mode)
   COHERE_API_KEY      Enables cross-encoder reranking for more precise result ordering`,
 		SilenceUsage: true,
@@ -83,8 +83,13 @@ func newCodeGetRepoMapCmd(bin string, repoPath *string) *cobra.Command {
 		Short: "Get a PageRank-ranked repository map showing the most important files",
 		Long: `Generates a PageRank-ranked map of repository files and their key symbols.
 
-Files are ranked by their importance in the dependency graph. The output JSON
-contains both structured entries and a formatted string suitable for agent context.
+Files are ranked by PageRank over the file import/dependency graph. The output
+JSON contains both structured entries and a formatted string suitable for
+agent context.
+
+The index is built once and persisted under .donmai/code-index/; later calls
+incrementally update only files that changed rather than re-extracting the
+whole repo.
 
 Examples:
   ` + bin + ` code get-repo-map
@@ -179,11 +184,13 @@ func newCodeSearchCodeCmd(bin string, repoPath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "search-code <query>",
 		Short: "BM25 keyword search with code-aware tokenization",
-		Long: `Hybrid BM25 + optional semantic search over code content.
+		Long: `Hybrid BM25 + optional semantic search over code content, natively in Go.
 
-When VOYAGE_AI_API_KEY is set, the search automatically upgrades to hybrid
-BM25+vector mode. When COHERE_API_KEY is additionally set, results are
-reranked with a cross-encoder for improved precision.
+Okapi BM25 keyword search runs by default with no external services. When
+VOYAGE_AI_API_KEY is set, the search upgrades to hybrid BM25+vector mode
+(falling back to BM25-only if the embedding call fails). When COHERE_API_KEY
+is additionally set, results are reranked with a cross-encoder for improved
+precision.
 
 Examples:
   ` + bin + ` code search-code "incremental indexer"
