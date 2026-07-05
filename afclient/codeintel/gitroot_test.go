@@ -11,11 +11,11 @@ import (
 // nested subdirectory several levels below the root.
 func TestFindGitRoot_DirectoryForm(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	sub := filepath.Join(root, "a", "b", "c")
-	if err := os.MkdirAll(sub, 0o755); err != nil {
+	if err := os.MkdirAll(sub, 0o750); err != nil {
 		t.Fatal(err)
 	}
 
@@ -41,7 +41,7 @@ func TestFindGitRoot_FileForm(t *testing.T) {
 		t.Fatal(err)
 	}
 	sub := filepath.Join(root, "nested")
-	if err := os.MkdirAll(sub, 0o755); err != nil {
+	if err := os.MkdirAll(sub, 0o750); err != nil {
 		t.Fatal(err)
 	}
 
@@ -63,7 +63,7 @@ func TestFindGitRoot_NoRepoFound(t *testing.T) {
 	// roots live outside any repo checkout).
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "x", "y")
-	if err := os.MkdirAll(sub, 0o755); err != nil {
+	if err := os.MkdirAll(sub, 0o750); err != nil {
 		t.Fatal(err)
 	}
 
@@ -76,7 +76,7 @@ func TestFindGitRoot_NoRepoFound(t *testing.T) {
 // starting directory itself, not just its ancestors.
 func TestFindGitRoot_StartsAtRootItself(t *testing.T) {
 	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 
