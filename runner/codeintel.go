@@ -187,3 +187,68 @@ func codeIntelMCPEntry(root string, ci *prompt.CodeIntelWork) agent.MCPServerCon
 		Args:    args,
 	}
 }
+
+// injectCodeIntelPartial appends the compact code-intel usage partial to the
+// composed system prompt. It is a STRICT no-op when ci is nil — a session
+// without the capability block gets a byte-identical prompt to today
+// (additive contract). Otherwise it appends a provider-appropriate partial:
+//
+//   - MCP-capable providers (SupportsToolPlugins && AcceptsMcpServerSpec:
+//     claude/codex/gemini) get the six mcp__af-code-intelligence__* FQ tool
+//     names with one-line when-to-use guidance.
+//   - Providers that ignore MCP specs (ollama/opencode/agycli) get Bash-CLI
+//     fallback guidance (`<brand> code <subcommand>`) — the binary is in-box on
+//     every target — so the capability is still discoverable without an MCP
+//     surface.
+//
+// No enforcement/lockout (deferred per Q7): the partial only advertises the
+// tools; it never redirects Grep/Glob.
+func injectCodeIntelPartial(systemPrompt string, caps agent.Capabilities, ci *prompt.CodeIntelWork) string {
+	if ci == nil {
+		return systemPrompt
+	}
+	mcpCapable := caps.SupportsToolPlugins && caps.AcceptsMcpServerSpec
+	partial := codeIntelUsagePartial(mcpCapable, ci)
+	if partial == "" {
+		return systemPrompt
+	}
+	if strings.TrimSpace(systemPrompt) == "" {
+		return partial
+	}
+	return systemPrompt + "\n\n" + partial
+}
+
+// codeIntelUsagePartial renders the code-intel usage block for the resolved
+// provider family, scoped to the block's exposed tool subset. Returns "" when
+// the block exposes no tools (nothing to advertise). Pure aside from resolving
+// the active brand for the CLI-fallback command name.
+func codeIntelUsagePartial(mcpCapable bool, ci *prompt.CodeIntelWork) string {
+	tools := effectiveCodeIntelTools(ci)
+	if len(tools) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("# Code Intelligence\n\n")
+	if mcpCapable {
+		b.WriteString("This session has the af-code-intelligence tools available. " +
+			"Prefer them over ad-hoc grep/glob/find when navigating or searching this repository:\n")
+		for _, tm := range tools {
+			b.WriteString("\n- ")
+			b.WriteString(codeIntelFQPrefix + tm.tool)
+			b.WriteString(" — ")
+			b.WriteString(tm.guidance)
+		}
+	} else {
+		cli := prompt.ResolveBrand().BrandCLI
+		b.WriteString("This session has code-intelligence CLI commands available (run them with Bash). " +
+			"Prefer them over ad-hoc grep/glob/find when navigating or searching this repository:\n")
+		for _, tm := range tools {
+			b.WriteString("\n- `")
+			b.WriteString(cli + " code " + tm.subcommand)
+			b.WriteString("` — ")
+			b.WriteString(tm.guidance)
+		}
+	}
+	return b.String()
+}

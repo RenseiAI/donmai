@@ -3,11 +3,143 @@ package runner
 import (
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
 )
+
+// mcpCaps / cliCaps model the two provider families the code-intel prompt
+// partial branches on: MCP-capable (claude/codex/gemini) vs providers that
+// ignore MCP specs (ollama/opencode/agycli), which get the Bash-CLI fallback.
+func mcpCaps() agent.Capabilities {
+	return agent.Capabilities{SupportsToolPlugins: true, AcceptsMcpServerSpec: true}
+}
+
+func cliCaps() agent.Capabilities {
+	return agent.Capabilities{SupportsToolPlugins: false, AcceptsMcpServerSpec: false}
+}
+
+// TestInjectCodeIntelPartial_NilBlockByteIdentical is the regression guard for
+// the additive contract: a session WITHOUT the block gets a byte-identical
+// system prompt — the injector is a strict no-op when ci is nil.
+func TestInjectCodeIntelPartial_NilBlockByteIdentical(t *testing.T) {
+	t.Parallel()
+	const sys = "You are the runner.\n\n# Operating rules\n- do the thing"
+	if got := injectCodeIntelPartial(sys, mcpCaps(), nil); got != sys {
+		t.Errorf("nil block must be byte-identical:\n got %q\nwant %q", got, sys)
+	}
+	if got := injectCodeIntelPartial(sys, cliCaps(), nil); got != sys {
+		t.Errorf("nil block (cli caps) must be byte-identical:\n got %q\nwant %q", got, sys)
+	}
+}
+
+// TestInjectCodeIntelPartial_MCPWording verifies MCP-capable providers get the
+// FQ tool names (not the CLI form), appended after the base system prompt.
+func TestInjectCodeIntelPartial_MCPWording(t *testing.T) {
+	t.Parallel()
+	const sys = "BASE-SYSTEM-PROMPT"
+	got := injectCodeIntelPartial(sys, mcpCaps(), &prompt.CodeIntelWork{Repo: "owner/repo"})
+
+	if !strings.HasPrefix(got, sys+"\n\n") {
+		t.Errorf("partial must be appended after the base prompt; got %q", got)
+	}
+	for _, fq := range wantCodeIntelFQ {
+		if !strings.Contains(got, fq) {
+			t.Errorf("MCP partial missing FQ tool %q:\n%s", fq, got)
+		}
+	}
+	// MCP wording must NOT emit the Bash-CLI form.
+	if strings.Contains(got, "code get-repo-map") {
+		t.Errorf("MCP partial must not carry the CLI form; got:\n%s", got)
+	}
+}
+
+// TestInjectCodeIntelPartial_CLIWording verifies providers that ignore MCP
+// specs get Bash-CLI fallback guidance (brand `code <subcommand>`), never the
+// FQ MCP names.
+func TestInjectCodeIntelPartial_CLIWording(t *testing.T) {
+	t.Parallel()
+	const sys = "BASE"
+	got := injectCodeIntelPartial(sys, cliCaps(), &prompt.CodeIntelWork{Repo: "owner/repo"})
+
+	brand := prompt.ResolveBrand().BrandCLI // "donmai" in OSS test builds
+	for _, sub := range []string{"get-repo-map", "search-symbols", "search-code", "check-duplicate", "find-type-usages", "validate-cross-deps"} {
+		if !strings.Contains(got, brand+" code "+sub) {
+			t.Errorf("CLI partial missing %q:\n%s", brand+" code "+sub, got)
+		}
+	}
+	if strings.Contains(got, "mcp__af-code-intelligence__") {
+		t.Errorf("CLI partial must not carry FQ MCP names; got:\n%s", got)
+	}
+}
+
+// TestCodeIntel_AbsentBlock_SpecByteIdentical is the snapshot regression for
+// the additive contract across all three seams the loop composes: a session
+// with NO CodeIntel block leaves the system prompt untouched, adds no
+// MCPToolNames, and adds no code-intel MCP entry — so the Spec is byte-identical
+// to the pre-code-intel composition.
+func TestCodeIntel_AbsentBlock_SpecByteIdentical(t *testing.T) {
+	t.Parallel()
+
+	qw := QueuedWork{} // no CodeIntel block
+	caps := mcpCaps()
+	baseSys := "SYS-BASE\n\n# Operating rules"
+	baseServers := []agent.MCPServerConfig{{Name: "donmai-platform", Type: "http"}}
+
+	// Seam 1 — prompt partial: no-op.
+	sysAfter := injectCodeIntelPartial(baseSys, caps, qw.CodeIntel)
+	if sysAfter != baseSys {
+		t.Errorf("absent block must leave the system prompt byte-identical:\n got %q\nwant %q", sysAfter, baseSys)
+	}
+
+	// Seam 2 — defaultMCPServers: no code-intel entry appended.
+	gated := QueuedWork{}
+	gated.SessionID = "s"
+	gated.PlatformURL = "https://p.test"
+	gated.AuthToken = "rsk"
+	if servers := defaultMCPServers(gated, "/tmp/wt"); len(servers) != 1 {
+		t.Errorf("absent block must not append a code-intel MCP entry; got %+v", servers)
+	}
+
+	// Seam 3 — translateSpec: MCPToolNames untouched, MCPServers unchanged.
+	spec := translateSpec(qw, caps, SpecInputs{
+		Cwd:                "/tmp/wt",
+		Prompt:             "u",
+		SystemPromptAppend: sysAfter,
+		MCPServers:         baseServers,
+	})
+	if len(spec.MCPToolNames) != 0 {
+		t.Errorf("absent block must add no MCPToolNames; got %v", spec.MCPToolNames)
+	}
+	if !reflect.DeepEqual(spec.MCPServers, baseServers) {
+		t.Errorf("absent block must not mutate MCPServers; got %+v", spec.MCPServers)
+	}
+}
+
+// TestInjectCodeIntelPartial_FilteredSubset verifies the block's Tools subset
+// narrows the guidance to just the exposed tools (both provider families).
+func TestInjectCodeIntelPartial_FilteredSubset(t *testing.T) {
+	t.Parallel()
+	ci := &prompt.CodeIntelWork{Repo: "owner/repo", Tools: []string{"af_code_search_symbols"}}
+
+	mcp := injectCodeIntelPartial("S", mcpCaps(), ci)
+	if !strings.Contains(mcp, "mcp__af-code-intelligence__af_code_search_symbols") {
+		t.Errorf("subset MCP partial missing the requested tool:\n%s", mcp)
+	}
+	if strings.Contains(mcp, "af_code_get_repo_map") {
+		t.Errorf("subset MCP partial must not name unexposed tools:\n%s", mcp)
+	}
+
+	cli := injectCodeIntelPartial("S", cliCaps(), ci)
+	if !strings.Contains(cli, "code search-symbols") {
+		t.Errorf("subset CLI partial missing the requested tool:\n%s", cli)
+	}
+	if strings.Contains(cli, "get-repo-map") {
+		t.Errorf("subset CLI partial must not name unexposed tools:\n%s", cli)
+	}
+}
 
 // argValue returns the value following the named flag in an MCP entry's Args,
 // or "" when the flag is absent.
