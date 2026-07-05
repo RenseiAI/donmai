@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
+	mrand "math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -168,6 +170,16 @@ type AggregateStat struct {
 	// trials). PowerShortfalls enumerates exactly which preconditions failed.
 	Underpowered    bool     `json:"underpowered"`
 	PowerShortfalls []string `json:"powerShortfalls,omitempty"`
+	// DeltaCILow/High are the 95% confidence interval of the aggregate delta from
+	// a CASE-CLUSTERED bootstrap (resampling whole cases, not trials, since the
+	// >=3 trials of one case@sha are strongly correlated — pooling them as
+	// independent Bernoulli understates variance). DeltaStdDev is the bootstrap
+	// standard deviation. The founder verdict gates on DeltaCILow (the lower
+	// bound), NOT the point estimate, so a borderline +15pp with a wide interval
+	// cannot clear a bar meant to justify a permanent badge removal.
+	DeltaCILow  float64 `json:"deltaCiLow"`
+	DeltaCIHigh float64 `json:"deltaCiHigh"`
+	DeltaStdDev float64 `json:"deltaStdDev"`
 	// Status is the human-legible verdict category: "UNDERPOWERED — not a GA
 	// verdict", "GA-PASS …", or "GA-FAIL …".
 	Status string `json:"status"`
@@ -204,7 +216,7 @@ func (d *Driver) Run(ctx context.Context, cases []Case) (Report, error) {
 			}
 		}
 	}
-	rep.Aggregate = computeAggregate(rep.Families, cases, d.cfg.Trials)
+	rep.Aggregate = computeAggregate(rep.Families, rep.Records, cases, d.cfg.Trials)
 	return rep, nil
 }
 
@@ -400,7 +412,7 @@ func accumulate(f *FamilyStat, rec RunRecord) {
 	}
 }
 
-func computeAggregate(fams map[TaskType]*FamilyStat, cases []Case, trials int) AggregateStat {
+func computeAggregate(fams map[TaskType]*FamilyStat, records []RunRecord, cases []Case, trials int) AggregateStat {
 	var withP, withT, woP, woT int
 	var withTok, woTok []int64
 	var regressed []TaskType
@@ -427,6 +439,7 @@ func computeAggregate(fams map[TaskType]*FamilyStat, cases []Case, trials int) A
 	famCounts := CountByFamily(cases)
 	repoCounts := CountByRepo(cases)
 	shortfalls := powerShortfalls(famCounts, repoCounts, trials)
+	ciLow, ciHigh, stddev := bootstrapDeltaCI(caseAggsFromRecords(records))
 	agg := AggregateStat{
 		DeltaPP:           deltaPP,
 		TokenRatio:        tokenRatio,
@@ -437,8 +450,13 @@ func computeAggregate(fams map[TaskType]*FamilyStat, cases []Case, trials int) A
 		RepoCounts:        repoCounts,
 		Underpowered:      len(shortfalls) > 0,
 		PowerShortfalls:   shortfalls,
+		DeltaCILow:        ciLow,
+		DeltaCIHigh:       ciHigh,
+		DeltaStdDev:       stddev,
 	}
-	statBar := deltaPP >= 15.0 && len(regressed) == 0 && tokenRatio > 0 && tokenRatio <= 1.10
+	// Gate on the CI LOWER BOUND (not the point estimate): a borderline +15pp
+	// whose interval dips below +15pp is noise, not a GA-grade positive delta.
+	statBar := ciLow >= 15.0 && len(regressed) == 0 && tokenRatio > 0 && tokenRatio <= 1.10
 	// The power preconditions HARD-GATE the verdict: a null/underpowered result
 	// can never be reported as a GA pass, no matter how large the point estimate.
 	agg.MeetsThreshold = statBar && !agg.Underpowered
@@ -446,11 +464,108 @@ func computeAggregate(fams map[TaskType]*FamilyStat, cases []Case, trials int) A
 	case agg.Underpowered:
 		agg.Status = "UNDERPOWERED — not a GA verdict (" + strings.Join(shortfalls, "; ") + ")"
 	case agg.MeetsThreshold:
-		agg.Status = "GA-PASS (>=+15pp, no regression, tokens<=+10%)"
+		agg.Status = "GA-PASS (95% CI lower bound >=+15pp, no regression, tokens<=+10%)"
 	default:
 		agg.Status = "GA-FAIL (powered, but did not clear the founder bar)"
 	}
 	return agg
+}
+
+// caseAgg is one benchmark case's pooled A/B tally (summed across its trials) —
+// the resampling unit for the case-clustered bootstrap.
+type caseAgg struct {
+	withPasses, withTrials int
+	woPasses, woTrials     int
+}
+
+// caseAggsFromRecords folds the per-(case,arm,trial) records into per-case
+// tallies, preserving first-seen order.
+func caseAggsFromRecords(records []RunRecord) []caseAgg {
+	idx := map[string]int{}
+	var out []caseAgg
+	for _, r := range records {
+		i, ok := idx[r.CaseID]
+		if !ok {
+			i = len(out)
+			idx[r.CaseID] = i
+			out = append(out, caseAgg{})
+		}
+		if r.Arm == ArmWith {
+			out[i].withTrials++
+			if r.Pass {
+				out[i].withPasses++
+			}
+		} else {
+			out[i].woTrials++
+			if r.Pass {
+				out[i].woPasses++
+			}
+		}
+	}
+	return out
+}
+
+const (
+	// bootstrapIters is the resample count for the delta CI — enough for a stable
+	// 95% interval, cheap (no LLM/IO in the loop).
+	bootstrapIters = 2000
+	// bootstrapSeed fixes the RNG so a given corpus yields a REPRODUCIBLE CI — a
+	// GA verdict must not wobble between runs of the same data.
+	bootstrapSeed = 0x5EED5
+)
+
+// bootstrapDeltaCI returns the 95% confidence interval [lo, hi] and standard
+// deviation of the aggregate WITH−WITHOUT success delta (percentage points) by
+// resampling CASES with replacement (not trials). Clustering on cases is the
+// correct unit: the >=3 trials of one case@sha are strongly correlated, so
+// pooling them as independent Bernoulli understates the true variance.
+func bootstrapDeltaCI(cases []caseAgg) (lo, hi, stddev float64) {
+	n := len(cases)
+	if n == 0 {
+		return 0, 0, 0
+	}
+	rng := mrand.New(mrand.NewSource(bootstrapSeed)) // nolint:gosec // deterministic non-crypto RNG for a reproducible CI, not a security context.
+	deltas := make([]float64, 0, bootstrapIters)
+	var sum float64
+	for it := 0; it < bootstrapIters; it++ {
+		var wp, wt, op, ot int
+		for k := 0; k < n; k++ {
+			c := cases[rng.Intn(n)]
+			wp += c.withPasses
+			wt += c.withTrials
+			op += c.woPasses
+			ot += c.woTrials
+		}
+		d := (rate(wp, wt) - rate(op, ot)) * 100
+		deltas = append(deltas, d)
+		sum += d
+	}
+	sort.Float64s(deltas)
+	lo = percentile(deltas, 2.5)
+	hi = percentile(deltas, 97.5)
+	mean := sum / float64(len(deltas))
+	var ss float64
+	for _, d := range deltas {
+		ss += (d - mean) * (d - mean)
+	}
+	stddev = math.Sqrt(ss / float64(len(deltas)))
+	return lo, hi, stddev
+}
+
+// percentile returns the p-th percentile (0-100) of a pre-sorted slice via
+// nearest-rank.
+func percentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(p/100*float64(len(sorted)-1) + 0.5)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
 }
 
 // powerShortfalls enumerates which locked power preconditions the run misses:
@@ -534,9 +649,11 @@ func (r Report) Summary() string {
 	if len(a.RegressedFamilies) > 0 {
 		fmt.Fprintf(&b, "regressed families: %v\n", a.RegressedFamilies)
 	}
+	fmt.Fprintf(&b, "aggregate delta 95%% CI: [%+.1f, %+.1f]pp (stddev %.1f, case-clustered bootstrap)\n",
+		a.DeltaCILow, a.DeltaCIHigh, a.DeltaStdDev)
 	fmt.Fprintf(&b, "power: %d trial(s)/arm, families=%v, repos=%d (need >=%d tasks/family, >=%d repos, >=%d trials)\n",
 		a.Trials, a.FamilyCounts, len(a.RepoCounts), minTasksPerFamily, minReposCovered, minTrialsForGA)
-	fmt.Fprintf(&b, "founder-threshold (>=+15pp, no regression, tokens<=+10%%): %v\n", a.MeetsThreshold)
+	fmt.Fprintf(&b, "founder-threshold (95%% CI lower bound >=+15pp, no regression, tokens<=+10%%): %v\n", a.MeetsThreshold)
 	fmt.Fprintf(&b, "verdict: %s\n", a.Status)
 	if r.PostedCount > 0 || r.PostErrors > 0 {
 		fmt.Fprintf(&b, "bridge: posted=%d errors=%d\n", r.PostedCount, r.PostErrors)
