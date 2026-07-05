@@ -154,7 +154,7 @@ func runEvalCodeIntel(cmd *cobra.Command, opts *evalCodeIntelOpts) error {
 		DatasetName:   opts.datasetName,
 		KeepWorkareas: opts.keepWA,
 		Logf: func(format string, args ...any) {
-			fmt.Fprintf(cmd.ErrOrStderr(), "[eval] "+format+"\n", args...)
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[eval] "+format+"\n", args...)
 		},
 	})
 	if err != nil {
@@ -168,14 +168,14 @@ func runEvalCodeIntel(cmd *cobra.Command, opts *evalCodeIntelOpts) error {
 	ctx, cancel := context.WithTimeout(baseCtx, opts.timeout)
 	defer cancel()
 
-	fmt.Fprintf(cmd.ErrOrStderr(), "[eval] running %d case(s) x %d trial(s) x 2 arms (advertise=%s, donmai-bin=%s)\n",
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[eval] running %d case(s) x %d trial(s) x 2 arms (advertise=%s, donmai-bin=%s)\n",
 		len(cases), opts.trials, advertise, donmaiBin)
 	rep, err := driver.Run(ctx, cases)
 	if err != nil {
 		return fmt.Errorf("eval run: %w", err)
 	}
 
-	fmt.Fprint(out, rep.Summary())
+	_, _ = fmt.Fprint(out, rep.Summary())
 
 	if opts.dry {
 		if err := dumpTranscripts(out, rep); err != nil {
@@ -190,7 +190,7 @@ func runEvalCodeIntel(cmd *cobra.Command, opts *evalCodeIntelOpts) error {
 		}
 	}
 	if bridge == nil {
-		fmt.Fprintln(cmd.ErrOrStderr(), "[eval] NOTE: no --platform-url; results captured locally only (offline). "+
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "[eval] NOTE: no --platform-url; results captured locally only (offline). "+
 			"This proves the two-arm plumbing; a live platform + LLM executor is needed for a GA statistical result.")
 	}
 	return nil
@@ -204,13 +204,13 @@ func dumpTranscripts(out io.Writer, rep eval.Report) error {
 		return nil
 	}
 	firstCase := rep.Records[0].CaseID
-	fmt.Fprintf(out, "\n=== transcripts for %s (WITH + WITHOUT) ===\n", firstCase)
+	_, _ = fmt.Fprintf(out, "\n=== transcripts for %s (WITH + WITHOUT) ===\n", firstCase)
 	for _, arm := range []eval.Arm{eval.ArmWithout, eval.ArmWith} {
 		for _, rec := range rep.Records {
 			if rec.CaseID != firstCase || rec.Arm != arm {
 				continue
 			}
-			fmt.Fprintf(out, "\n--- arm=%s pass=%v ---\n", rec.Arm, rec.Pass)
+			_, _ = fmt.Fprintf(out, "\n--- arm=%s pass=%v ---\n", rec.Arm, rec.Pass)
 			enc := json.NewEncoder(out)
 			enc.SetIndent("", "  ")
 			if err := enc.Encode(rec.Envelope.Trace); err != nil {

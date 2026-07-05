@@ -42,7 +42,7 @@ func fsCaseFor(symbol string) Case {
 func TestExecuteWithout_ControlCleanGuard_And_Grep(t *testing.T) {
 	// A workarea with the target symbol.
 	wa := t.TempDir()
-	if err := os.WriteFile(filepath.Join(wa, "foo.go"), []byte("package x\n\nfunc newAgentRunCmd() {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(wa, "foo.go"), []byte("package x\n\nfunc newAgentRunCmd() {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// A dir holding a fake donmai (the "baked-in" binary).

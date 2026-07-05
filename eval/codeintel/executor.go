@@ -55,13 +55,12 @@ type Executor interface {
 	Execute(ctx context.Context, spec ArmSpec) (Transcript, error)
 }
 
-// ── PlumbingExecutor ─────────────────────────────────────────────────────────
-//
-// A deterministic, no-LLM stand-in agent used by the --dry/plumbing path and by
-// tests. It PROVES the harness end-to-end — two-arm provisioning, the PATH-strip
-// contamination guard, a REAL MCP round-trip on the WITH arm, and transcript
-// capture in the EvalTrace shape — WITHOUT the cost/nondeterminism of a live LLM.
-// It is a scripted agent: it derives a query from the prompt, and
+// PlumbingExecutor is a deterministic, no-LLM stand-in agent used by the
+// --dry/plumbing path and by tests. It PROVES the harness end-to-end — two-arm
+// provisioning, the PATH-strip contamination guard, a REAL MCP round-trip on the
+// WITH arm, and transcript capture in the EvalTrace shape — WITHOUT the
+// cost/nondeterminism of a live LLM. It is a scripted agent: it derives a query
+// from the prompt, and
 //
 //   - WITHOUT arm: asserts donmai is unreachable, then runs a real `grep` on the
 //     workarea (baseline tools only) and reports what grep found.
@@ -78,8 +77,10 @@ type PlumbingExecutor struct{}
 // NewPlumbingExecutor returns the deterministic plumbing executor.
 func NewPlumbingExecutor() PlumbingExecutor { return PlumbingExecutor{} }
 
+// Name identifies the executor in logs/reports.
 func (PlumbingExecutor) Name() string { return "plumbing" }
 
+// Execute runs one arm of the plumbing agent and returns its transcript.
 func (e PlumbingExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, error) {
 	snap := &SnapshotRef{Provider: "local", SnapshotID: spec.SnapshotID, Retain: RetainEvalPermanent, CapturedAt: nowISO()}
 	if spec.Arm == ArmWithout {
@@ -97,7 +98,7 @@ func (e PlumbingExecutor) executeWithout(ctx context.Context, spec ArmSpec, snap
 	}
 	query := queryFromCase(spec.Case)
 	tc, resultText := e.grep(ctx, spec, query)
-	answer := deriveAnswerFromGrep(spec.Case, resultText, spec.Workarea)
+	answer := deriveAnswerFromGrep(spec.Case, resultText)
 	return Transcript{
 		Arm:         ArmWithout,
 		FinalAnswer: answer,
@@ -291,14 +292,14 @@ func deriveAnswerFromTool(c Case, resultText string) string {
 		}
 		return resultText
 	case TaskDedup:
-		return dedupAnswerFromResult(c, resultText)
+		return dedupAnswerFromResult(resultText)
 	default:
 		return resultText
 	}
 }
 
 // deriveAnswerFromGrep turns grep -rn output into a concise answer per family.
-func deriveAnswerFromGrep(c Case, grepOut, workarea string) string {
+func deriveAnswerFromGrep(c Case, grepOut string) string {
 	lines := nonEmptyLines(grepOut)
 	switch c.Family() {
 	case TaskFindSymbol:
@@ -336,7 +337,7 @@ func deriveAnswerFromGrep(c Case, grepOut, workarea string) string {
 }
 
 // dedupAnswerFromResult formats a check-duplicate result into a verdict answer.
-func dedupAnswerFromResult(c Case, resultText string) string {
+func dedupAnswerFromResult(resultText string) string {
 	var r struct {
 		IsDuplicate bool `json:"isDuplicate"`
 		Match       struct {
@@ -378,8 +379,8 @@ func topSymbolHit(resultText string) (string, int, bool) {
 // collectFilePaths pulls distinct "filePath" values out of an arbitrary tool
 // result JSON (search-code / find-type-usages), preserving first-seen order.
 func collectFilePaths(resultText string) []string {
-	var any interface{}
-	if err := json.Unmarshal([]byte(resultText), &any); err != nil {
+	var parsed interface{}
+	if err := json.Unmarshal([]byte(resultText), &parsed); err != nil {
 		return nil
 	}
 	seen := map[string]bool{}
@@ -403,7 +404,7 @@ func collectFilePaths(resultText string) []string {
 			}
 		}
 	}
-	walk(any)
+	walk(parsed)
 	return order
 }
 
