@@ -33,6 +33,7 @@ func newEvalCmd(cfg Config) *cobra.Command {
 type evalCodeIntelOpts struct {
 	trials       int
 	dry          bool
+	executor     string
 	advertise    string
 	benchmarkDir string
 	donmaiBin    string
@@ -64,14 +65,27 @@ WITHOUT (` + bin + ` stripped from PATH, the mandatory contamination guard) and
 WITH (the real af-code-intelligence MCP surface) — grade both, and report the
 success delta, tokens-to-solution ratio, and tool adoption.
 
-Without a live-LLM executor wired in, the harness runs its deterministic
-plumbing agent, which proves the two-arm execution end to end (provisioning,
-PATH strip, a REAL MCP round-trip, transcript capture) but is NOT a statistical
-GA result. Use --dry to also dump the WITH/WITHOUT transcripts for one task.
+Two executors are available via --executor:
+
+  plumbing (default) — a deterministic, no-LLM agent that proves the two-arm
+    execution end to end (provisioning, PATH strip, a REAL MCP round-trip,
+    transcript capture). Hermetic; keeps CI green. NOT a statistical GA result.
+
+  claude — the live agent: spawns the real ` + "`claude`" + ` CLI in headless
+    stream-json mode on each arm and captures the actual tool calls, turns,
+    tokens (including cache-read), and final answer. A live run needs:
+      * ` + "`claude`" + ` on PATH (claude 2.x, headless stream-json).
+      * for the WITH arm, the af-code-intelligence MCP server reachable via the
+        donmai binary (--donmai-bin / on PATH) so --mcp-config resolves.
+      * VOYAGE_API_KEY and/or COHERE_API_KEY in env when the code-intel engine
+        runs in hybrid (embedding) mode.
+
+Use --dry to also dump the WITH/WITHOUT transcripts for one task.
 
 Examples:
   ` + bin + ` eval codeintel --dry --trials 1 --task codeintel-find-symbol-donmai-001
-  ` + bin + ` eval codeintel --trials 3 --advertise mcp --platform-url https://... --platform-token rsk_...`,
+  ` + bin + ` eval codeintel --executor claude --trials 3 --advertise mcp --repo-root RenseiAI/donmai=.
+  ` + bin + ` eval codeintel --executor claude --trials 3 --platform-url https://... --platform-token rsk_...`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runEvalCodeIntel(cmd, opts)
@@ -79,7 +93,8 @@ Examples:
 	}
 	f := cmd.Flags()
 	f.IntVar(&opts.trials, "trials", 3, "Repeated trials per arm (default 3; use 1 for a fast plumbing run)")
-	f.BoolVar(&opts.dry, "dry", false, "Plumbing mode: run the deterministic agent and dump WITH/WITHOUT transcripts (no live LLM)")
+	f.BoolVar(&opts.dry, "dry", false, "Dump the WITH/WITHOUT transcripts for the first task (works with any executor)")
+	f.StringVar(&opts.executor, "executor", "plumbing", "Arm executor: plumbing (default, hermetic no-LLM) or claude (live claude CLI)")
 	f.StringVar(&opts.advertise, "advertise", "mcp", "WITH-arm advertisement mechanism: mcp (default) or prompt-help")
 	f.StringVar(&opts.benchmarkDir, "benchmark-dir", "", "Benchmark JSONL dir (default: afclient/codeintel/testdata/eval-benchmark under the git root)")
 	f.StringVar(&opts.donmaiBin, "donmai-bin", "", "Path to the donmai binary the WITH arm uses (default: this executable)")
@@ -141,12 +156,18 @@ func runEvalCodeIntel(cmd *cobra.Command, opts *evalCodeIntelOpts) error {
 		bridge = eval.NewBridge(opts.platformURL, opts.platformTok, opts.platformPath)
 	}
 
+	executor, err := selectExecutor(opts.executor)
+	if err != nil {
+		return err
+	}
+
 	driver, err := eval.NewDriver(eval.Config{
 		Trials:        opts.trials,
 		Advertise:     advertise,
 		DonmaiBin:     donmaiBin,
 		RepoRoots:     repoRoots,
 		Budget:        eval.Budget{MaxTurns: opts.maxTurns, MaxTokens: opts.maxTokens},
+		Executor:      executor,
 		Bridge:        bridge,
 		OrgID:         opts.orgID,
 		ProjectID:     opts.projectID,
@@ -168,8 +189,8 @@ func runEvalCodeIntel(cmd *cobra.Command, opts *evalCodeIntelOpts) error {
 	ctx, cancel := context.WithTimeout(baseCtx, opts.timeout)
 	defer cancel()
 
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[eval] running %d case(s) x %d trial(s) x 2 arms (advertise=%s, donmai-bin=%s)\n",
-		len(cases), opts.trials, advertise, donmaiBin)
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[eval] running %d case(s) x %d trial(s) x 2 arms (executor=%s, advertise=%s, donmai-bin=%s)\n",
+		len(cases), opts.trials, executor.Name(), advertise, donmaiBin)
 	rep, err := driver.Run(ctx, cases)
 	if err != nil {
 		return fmt.Errorf("eval run: %w", err)
@@ -190,8 +211,13 @@ func runEvalCodeIntel(cmd *cobra.Command, opts *evalCodeIntelOpts) error {
 		}
 	}
 	if bridge == nil {
-		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "[eval] NOTE: no --platform-url; results captured locally only (offline). "+
-			"This proves the two-arm plumbing; a live platform + LLM executor is needed for a GA statistical result.")
+		note := "[eval] NOTE: no --platform-url; results captured locally only (offline). "
+		if executor.Name() == "plumbing" {
+			note += "This proves the two-arm plumbing; a live platform + the --executor claude agent are needed for a GA statistical result."
+		} else {
+			note += "A live platform (--platform-url) is still needed to persist the eval_runs/eval_traces for a GA statistical result."
+		}
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), note)
 	}
 	return nil
 }
@@ -220,6 +246,20 @@ func dumpTranscripts(out io.Writer, rep eval.Report) error {
 		}
 	}
 	return nil
+}
+
+// selectExecutor maps the --executor flag to an eval.Executor. Plumbing is the
+// default so `donmai eval codeintel` stays hermetic (no live LLM) in CI and the
+// existing --dry path is unchanged; claude selects the live agent executor.
+func selectExecutor(name string) (eval.Executor, error) {
+	switch strings.TrimSpace(name) {
+	case "", "plumbing":
+		return eval.NewPlumbingExecutor(), nil
+	case "claude":
+		return eval.NewClaudeExecutor(), nil
+	default:
+		return nil, fmt.Errorf("unknown --executor %q (want plumbing or claude)", name)
+	}
 }
 
 // defaultBenchmarkDir resolves the in-repo benchmark location from the git root.
