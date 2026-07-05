@@ -93,10 +93,23 @@ const (
 // without a real 10s wait. Production code never mutates it.
 var hybridHTTPTimeout = 10 * time.Second
 
+// voyageAPIKey returns the Voyage API key from the environment, preferring
+// VOYAGE_API_KEY (Voyage's own SDK convention, and what the platform/rensei
+// credential path provisions) and falling back to VOYAGE_AI_API_KEY (the name
+// this CLI's help text historically documented). Returning the first non-empty
+// of the two keeps every existing deployment working while accepting the
+// standard name the credential store actually ships.
+func voyageAPIKey() string {
+	if k := strings.TrimSpace(os.Getenv("VOYAGE_API_KEY")); k != "" {
+		return k
+	}
+	return strings.TrimSpace(os.Getenv("VOYAGE_AI_API_KEY"))
+}
+
 // isHybridEnabled reports whether Voyage-based rescoring should run at all.
 // This is the single gate: no key, no network, byte-identical BM25 output.
 func isHybridEnabled() bool {
-	return strings.TrimSpace(os.Getenv("VOYAGE_AI_API_KEY")) != ""
+	return voyageAPIKey() != ""
 }
 
 // isRerankEnabled reports whether the Cohere rerank pass should run on top
@@ -255,7 +268,7 @@ func applyHybridSearch(query string, candidates []searchCandidate) []searchCandi
 	ctx, cancel := context.WithTimeout(context.Background(), hybridHTTPTimeout)
 	defer cancel()
 
-	apiKey := os.Getenv("VOYAGE_AI_API_KEY")
+	apiKey := voyageAPIKey()
 	vectors, err := embedHead(ctx, httpClient, apiKey, query, head)
 	if err != nil {
 		warnf("voyage embeddings unavailable, falling back to BM25-only results (%v)", err)
