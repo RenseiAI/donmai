@@ -703,7 +703,7 @@ func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
 	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
 
-	servers := defaultMCPServers(qw)
+	servers := defaultMCPServers(qw, "/abs/wt")
 	if len(servers) != 1 {
 		t.Fatalf("len(servers)=%d, want 1", len(servers))
 	}
@@ -735,7 +735,7 @@ func TestDefaultMCPServers_TrimsTrailingSlash(t *testing.T) {
 	qw.PlatformURL = "https://platform.example.com/"
 	qw.AuthToken = "rsk_test"
 
-	servers := defaultMCPServers(qw)
+	servers := defaultMCPServers(qw, "/abs/wt")
 	if len(servers) != 1 {
 		t.Fatalf("len(servers)=%d, want 1", len(servers))
 	}
@@ -773,7 +773,7 @@ func TestDefaultMCPServers_OmitsWhenStandalone(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := defaultMCPServers(tc.qw); got != nil {
+			if got := defaultMCPServers(tc.qw, "/abs/wt"); got != nil {
 				t.Errorf("got %+v; want nil", got)
 			}
 		})
@@ -795,7 +795,7 @@ func TestMergeMCPServers_RetainsPlatformGate(t *testing.T) {
 		{Name: "card-remote", Type: "http", URL: "https://card.test/mcp"},
 	}
 
-	merged := mergeMCPServers(defaultMCPServers(qw), qw.McpServers)
+	merged := mergeMCPServers(defaultMCPServers(qw, "/abs/wt"), qw.McpServers)
 	if len(merged) != 3 {
 		t.Fatalf("merged len = %d, want 3 (platform gate + 2 card)", len(merged))
 	}
