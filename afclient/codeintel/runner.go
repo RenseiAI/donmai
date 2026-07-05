@@ -73,6 +73,27 @@ var ErrArchNotAvailable = errors.New(
 		"legacy TS arch shim",
 )
 
+// codeShimWarnOnce guards the one-time deprecation notice emitted when the
+// legacy TS code exec-shim is resolved (so a single process emits it at most
+// once).
+var codeShimWarnOnce sync.Once
+
+// warnCodeShimDeprecated prints a single deprecation notice to stderr
+// explaining that the code exec-shim is a legacy, opt-in fallback now that
+// the native Go implementation is the primary path for all six code-intel
+// subcommands. Mirrors the arch-shim precedent (warnArchShimDeprecated,
+// below) — same one-time-per-process guard, same tone.
+func warnCodeShimDeprecated(via string) {
+	codeShimWarnOnce.Do(func() {
+		fmt.Fprintf(os.Stderr,
+			"warning: using the DEPRECATED TS code exec-shim (%s). The native Go "+
+				"code-intel implementation (get-repo-map, search-symbols, search-code, "+
+				"check-duplicate, find-type-usages, validate-cross-deps) is the primary "+
+				"path and requires no external binary; unset DONMAI_CODE_BIN to use it. "+
+				"The shim will be removed when donmai-libraries is archived.\n", via)
+	})
+}
+
 // archShimWarnOnce guards the one-time deprecation notice emitted when the
 // legacy TS arch shim is resolved (so a single process emits it at most once).
 var archShimWarnOnce sync.Once
@@ -115,18 +136,21 @@ func (r *Runner) resolveCodeBin() ([]string, error) {
 
 	// 1. Explicit env override (DONMAI_CODE_BIN; legacy AGENTFACTORY_CODE_BIN via shim).
 	if v := envcompat.GetCodeBin(); v != "" {
+		warnCodeShimDeprecated("DONMAI_CODE_BIN")
 		r.codeBinCache = v
 		return strings.Fields(v), nil
 	}
 
 	// 2. donmai-code on PATH.
 	if p, err := exec.LookPath("donmai-code"); err == nil {
+		warnCodeShimDeprecated("donmai-code on PATH")
 		r.codeBinCache = p
 		return []string{p}, nil
 	}
 
 	// 3. pnpm donmai-code (monorepo).
 	if p, err := exec.LookPath("pnpm"); err == nil {
+		warnCodeShimDeprecated("pnpm donmai-code")
 		r.codeBinCache = p + " donmai-code"
 		return []string{p, "donmai-code"}, nil
 	}
