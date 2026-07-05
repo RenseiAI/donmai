@@ -111,10 +111,15 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 
 // runError classifies the outcome of a completed (or aborted) run into a single
 // harness error, or nil on a clean success. Precedence: context cancellation
-// (timeout) → non-zero exit → no terminal result (truncated/crashed) → a
-// partially-unparseable stream. A well-formed terminal result with a clean exit
-// is a success even if the task itself failed — the graders judge task success,
-// not this function.
+// (timeout) → non-zero exit → no terminal result (truncated/crashed) →
+// agent-error terminal result (error_max_turns / error_during_execution) → a
+// partially-unparseable stream. A well-formed SUCCESS terminal result with a
+// clean exit is a success even if the task answer is wrong — the graders judge
+// task correctness, not this function. But an agent-error result is NOT a valid
+// completion: the session ran out of turns or crashed mid-flight, so it must
+// fail the run regardless of the process exit code (the CLI emits such a result
+// as a valid terminal event and may still exit 0 — cf. the frozen clijsonl
+// decoder, which classifies Success off is_error/subtype, not exit code).
 func runError(ctx context.Context, ps parsedStream, waitErr error, stderrTail string) error {
 	if cerr := ctx.Err(); cerr != nil {
 		return fmt.Errorf("run aborted: %w%s", cerr, stderrSuffix(stderrTail))
@@ -127,6 +132,13 @@ func runError(ctx context.Context, ps parsedStream, waitErr error, stderrTail st
 			return fmt.Errorf("claude stream ended before a terminal result event: %w%s", ps.parseErr, stderrSuffix(stderrTail))
 		}
 		return fmt.Errorf("claude stream ended before a terminal result event%s", stderrSuffix(stderrTail))
+	}
+	if ps.resultErrored() {
+		sub := ps.resultSubtype
+		if sub == "" {
+			sub = "error"
+		}
+		return fmt.Errorf("claude reported an agent-error terminal result (subtype=%s is_error=%t): session did not complete%s", sub, ps.resultIsError, stderrSuffix(stderrTail))
 	}
 	if ps.parseErr != nil {
 		return fmt.Errorf("claude stream partially unparseable: %w", ps.parseErr)
@@ -145,12 +157,25 @@ func stderrSuffix(tail string) string {
 
 // parsedStream is the accumulated result of decoding a claude stream-json run.
 type parsedStream struct {
-	toolCalls   []ToolCall
-	turnCount   int
-	tokens      TokenCounts
-	finalAnswer string
-	sawResult   bool
-	parseErr    error
+	toolCalls     []ToolCall
+	turnCount     int
+	tokens        TokenCounts
+	finalAnswer   string
+	sawResult     bool
+	resultSubtype string // terminal result event's `subtype` (e.g. "success", "error_max_turns")
+	resultIsError bool   // terminal result event's `is_error`
+	parseErr      error
+}
+
+// resultErrored reports whether the terminal result event signalled an
+// agent-level failure — an error_max_turns / error_during_execution (or any
+// non-"success") subtype, or is_error=true. It mirrors the frozen clijsonl
+// decoder's Success = (subtype=="success" && !is_error) (clijsonl/jsonl.go),
+// which the CLI can emit with a CLEAN process exit — so exit code alone is not a
+// safe success signal. False until a terminal result is actually seen, so a
+// truncated stream (sawResult=false) is handled by the no-result branch instead.
+func (ps parsedStream) resultErrored() bool {
+	return ps.sawResult && (ps.resultIsError || ps.resultSubtype != "success")
 }
 
 // claudeUsage mirrors the terminal result event's `usage` object. Only the
@@ -224,8 +249,14 @@ func parseClaudeStream(r io.Reader) parsedStream {
 		ps.parseErr = fmt.Errorf("scan claude stream: %w", err)
 	}
 	// FinalAnswer prefers the terminal result text; fall back to the last
-	// assistant text block for a truncated stream with no result.
-	if ps.finalAnswer == "" {
+	// assistant text block ONLY for a stream that produced no *successful*
+	// terminal result — i.e. a genuinely truncated/crashed run. An agent-error
+	// terminal result (error_max_turns / error_during_execution) typically
+	// carries an empty result string; masking it with a stale mid-session line
+	// would let the task-success grader (which only rejects EMPTY answers) score
+	// an unfinished session as a valid answer, so we leave FinalAnswer empty and
+	// let runError fail the run instead.
+	if ps.finalAnswer == "" && !ps.resultErrored() {
 		ps.finalAnswer = lastAssistantText
 	}
 	if badLines > 0 && ps.parseErr == nil {
@@ -313,8 +344,10 @@ func parseUser(raw []byte, ps *parsedStream, idIndex map[string]int) bool {
 // it is most likely to grow — is never reported as free (W5 review finding).
 func parseResult(raw []byte, ps *parsedStream) bool {
 	var res struct {
-		Result string      `json:"result"`
-		Usage  claudeUsage `json:"usage"`
+		Result  string      `json:"result"`
+		Subtype string      `json:"subtype"`
+		IsError bool        `json:"is_error"`
+		Usage   claudeUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return false
@@ -324,6 +357,13 @@ func parseResult(raw []byte, ps *parsedStream) bool {
 		Output:    res.Usage.OutputTokens,
 		CacheRead: res.Usage.CacheReadInputTokens,
 	}
+	// Preserve the agent-error signal: an error_max_turns / error_during_execution
+	// terminal result is a valid stream event (claude may still exit 0), but the
+	// session did NOT finish — runError turns this into a run failure and the
+	// FinalAnswer fallback below refuses to mask an empty error result with a
+	// stale mid-session line (W6 review finding).
+	ps.resultSubtype = res.Subtype
+	ps.resultIsError = res.IsError
 	if res.Result != "" {
 		ps.finalAnswer = res.Result
 	}

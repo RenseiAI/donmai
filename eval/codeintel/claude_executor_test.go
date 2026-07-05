@@ -227,6 +227,63 @@ func TestClaudeExecutor_NonZeroExit(t *testing.T) {
 	}
 }
 
+// TestClaudeExecutor_ErrorMaxTurns_NotASuccess proves an agent-error terminal
+// result (subtype=error_max_turns, is_error=true) delivered with a CLEAN process
+// exit (waitErr nil, exit 0 — the observed 2.1.201 headless behavior) is
+// classified as a RUN ERROR, never a clean success, and that its empty result is
+// NOT masked by a stale mid-session assistant line. Regression for the W6 review
+// finding: parseResult dropped is_error/subtype, so a truncated/degraded WITH
+// session was graded as a valid transcript (mid-session text handed to the
+// task-success grader) and — with usage omitted on the error result — reported 0
+// tokens, deflating the badge-gating token ratio.
+func TestClaudeExecutor_ErrorMaxTurns_NotASuccess(t *testing.T) {
+	// The fixture carries NO usage object (tokens would be {0,0,0}) and a clean
+	// exit (fakeSpawn waitErr defaults to nil), reproducing the exact scenario
+	// where the drop bit hardest.
+	fs := &fakeSpawn{stream: readFixture(t, "claude_error_max_turns.jsonl")}
+	exec := newClaudeExecutorWithSpawner(fs.spawn)
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Env: []string{"PATH=/x"}, SnapshotID: "emt"})
+	if err == nil {
+		t.Fatal("error_max_turns terminal result must yield a run error, not a clean success")
+	}
+	if !strings.Contains(err.Error(), "error_max_turns") {
+		t.Errorf("run error should name the agent-error subtype; got %v", err)
+	}
+	// The mid-session line must NOT be presented as the final answer — otherwise
+	// the task-success grader (which only rejects EMPTY answers) would score an
+	// unfinished session on a stale, hedged line.
+	if strings.Contains(tr.FinalAnswer, "foo.go:42") {
+		t.Errorf("mid-session text must not be graded as the final answer; got %q", tr.FinalAnswer)
+	}
+	if strings.TrimSpace(tr.FinalAnswer) != "" {
+		t.Errorf("an errored result with empty result text should leave FinalAnswer empty; got %q", tr.FinalAnswer)
+	}
+}
+
+// TestClaudeExecutor_ErrorDuringExecution_NotASuccess proves the sibling
+// error_during_execution subtype (is_error=true, clean exit, with usage present)
+// is likewise classified as a run error rather than silently graded. Mirrors the
+// frozen clijsonl decoder's Success = (subtype=="success" && !is_error).
+func TestClaudeExecutor_ErrorDuringExecution_NotASuccess(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"system","subtype":"init","session_id":"ede1"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial reasoning, not a final answer"}]},"session_id":"ede1"}`,
+		`{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","usage":{"input_tokens":500,"output_tokens":10,"cache_read_input_tokens":100}}`,
+	}, "\n")
+	fs := &fakeSpawn{stream: stream}
+	exec := newClaudeExecutorWithSpawner(fs.spawn)
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Env: []string{"PATH=/x"}, SnapshotID: "ede"})
+	if err == nil {
+		t.Fatal("error_during_execution terminal result must yield a run error")
+	}
+	if !strings.Contains(err.Error(), "error_during_execution") {
+		t.Errorf("run error should name the agent-error subtype; got %v", err)
+	}
+	if strings.Contains(tr.FinalAnswer, "partial reasoning") {
+		t.Errorf("mid-session text must not become the final answer; got %q", tr.FinalAnswer)
+	}
+}
+
 type fakeExitErr struct{}
 
 func (fakeExitErr) Error() string { return "exit status 1" }
