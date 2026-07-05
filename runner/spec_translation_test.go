@@ -344,3 +344,108 @@ func TestTranslateSpec_AllowedToolsDrop_NoWarnWhenNoLogger(t *testing.T) {
 		t.Errorf("AllowedTools must be dropped; got %v", spec.AllowedTools)
 	}
 }
+
+// mcpCapableCaps returns capabilities that advertise MCP tool-plugin support
+// end-to-end (claude/codex/gemini shape): SupportsToolPlugins &&
+// AcceptsMcpServerSpec. This is the exact gate the code-intel MCPToolNames
+// allow-list and the Spec.MCPServers forwarding both key off.
+func mcpCapableCaps() agent.Capabilities {
+	return agent.Capabilities{
+		SupportsToolPlugins:     true,
+		AcceptsMcpServerSpec:    true,
+		AcceptsAllowedToolsList: true,
+	}
+}
+
+var wantCodeIntelFQ = []string{
+	"mcp__af-code-intelligence__af_code_get_repo_map",
+	"mcp__af-code-intelligence__af_code_search_symbols",
+	"mcp__af-code-intelligence__af_code_search_code",
+	"mcp__af-code-intelligence__af_code_check_duplicate",
+	"mcp__af-code-intelligence__af_code_find_type_usages",
+	"mcp__af-code-intelligence__af_code_validate_cross_deps",
+}
+
+// TestTranslateSpec_CodeIntelMCPToolNames_MCPCapable verifies that on an
+// MCP-capable provider a present CodeIntel block allow-lists all six FQ
+// code-intel tool names, in canonical order, on Spec.MCPToolNames.
+func TestTranslateSpec_CodeIntelMCPToolNames_MCPCapable(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		CodeIntel: &prompt.CodeIntelWork{Repo: "owner/repo"},
+	}}
+	spec := translateSpec(qw, mcpCapableCaps(), SpecInputs{Cwd: "/tmp/wt"})
+	if !slices.Equal(spec.MCPToolNames, wantCodeIntelFQ) {
+		t.Errorf("MCPToolNames = %v\nwant %v", spec.MCPToolNames, wantCodeIntelFQ)
+	}
+}
+
+// TestTranslateSpec_CodeIntelMCPToolNames_FilteredSubset verifies the block's
+// Tools subset narrows the allow-list to just the requested tools (canonical
+// order), so a restricted capability does not over-allow.
+func TestTranslateSpec_CodeIntelMCPToolNames_FilteredSubset(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		CodeIntel: &prompt.CodeIntelWork{
+			Repo:  "owner/repo",
+			Tools: []string{"af_code_search_code", "af_code_search_symbols"},
+		},
+	}}
+	spec := translateSpec(qw, mcpCapableCaps(), SpecInputs{Cwd: "/tmp/wt"})
+	want := []string{
+		"mcp__af-code-intelligence__af_code_search_symbols",
+		"mcp__af-code-intelligence__af_code_search_code",
+	}
+	if !slices.Equal(spec.MCPToolNames, want) {
+		t.Errorf("MCPToolNames = %v\nwant %v (canonical order, filtered)", spec.MCPToolNames, want)
+	}
+}
+
+// TestTranslateSpec_CodeIntelMCPToolNames_NilBlockEmpty verifies MCPToolNames
+// stays empty when there is no CodeIntel block — byte-identical to today.
+func TestTranslateSpec_CodeIntelMCPToolNames_NilBlockEmpty(t *testing.T) {
+	t.Parallel()
+	spec := translateSpec(QueuedWork{}, mcpCapableCaps(), SpecInputs{Cwd: "/tmp/wt"})
+	if len(spec.MCPToolNames) != 0 {
+		t.Errorf("no-block MCPToolNames must be empty, got %v", spec.MCPToolNames)
+	}
+}
+
+// TestTranslateSpec_CodeIntelMCPToolNames_NonMCPProviderEmpty verifies that a
+// provider that ignores MCP specs (ollama/opencode/agycli shape:
+// SupportsToolPlugins=false) never gets the FQ allow-list — the gate matches
+// the Spec.MCPServers forwarding gate.
+func TestTranslateSpec_CodeIntelMCPToolNames_NonMCPProviderEmpty(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		CodeIntel: &prompt.CodeIntelWork{Repo: "owner/repo"},
+	}}
+	caps := agent.Capabilities{SupportsToolPlugins: false, AcceptsMcpServerSpec: false}
+	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt"})
+	if len(spec.MCPToolNames) != 0 {
+		t.Errorf("non-MCP provider MCPToolNames must be empty, got %v", spec.MCPToolNames)
+	}
+}
+
+// TestCodeIntelFQToolNames_AllAndFiltered pins the pure helper: nil/empty subset
+// yields all six FQ names in canonical order; a subset filters and canonicalises
+// order; unknown names are ignored (never allow-listed).
+func TestCodeIntelFQToolNames_AllAndFiltered(t *testing.T) {
+	t.Parallel()
+	if got := codeIntelFQToolNames(nil); !slices.Equal(got, wantCodeIntelFQ) {
+		t.Errorf("nil block: got %v\nwant %v", got, wantCodeIntelFQ)
+	}
+	if got := codeIntelFQToolNames(&prompt.CodeIntelWork{}); !slices.Equal(got, wantCodeIntelFQ) {
+		t.Errorf("empty subset: got %v\nwant %v", got, wantCodeIntelFQ)
+	}
+	got := codeIntelFQToolNames(&prompt.CodeIntelWork{
+		Tools: []string{"af_code_validate_cross_deps", "bogus_tool", "af_code_get_repo_map"},
+	})
+	want := []string{
+		"mcp__af-code-intelligence__af_code_get_repo_map",
+		"mcp__af-code-intelligence__af_code_validate_cross_deps",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("filtered subset (unknown ignored, canonical order): got %v\nwant %v", got, want)
+	}
+}
