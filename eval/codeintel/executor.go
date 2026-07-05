@@ -529,6 +529,16 @@ func BuildClaudeInvocation(spec ArmSpec) AgentInvocation {
 		for _, fq := range spec.AdvertisedTools {
 			argv = append(argv, "--allowedTools", fq)
 		}
+	} else {
+		// Every arm WITHOUT an authored MCP config (the control arm, and a WITH
+		// prompt-help arm) still gets --strict-mcp-config — with no --mcp-config
+		// it yields ZERO MCP servers, so the agent never auto-loads the operator's
+		// ambient ~/.claude.json or a target repo's committed .mcp.json. This
+		// guarantees symmetric MCP isolation: WITH sees exactly
+		// af-code-intelligence, WITHOUT sees exactly nothing. Omitting it would
+		// leave the control open to a dogfooded code-intel MCP server, contaminating
+		// the very capability under test.
+		argv = append(argv, "--strict-mcp-config")
 	}
 	return AgentInvocation{Argv: argv, Env: spec.Env, MCPConfigPath: spec.MCPConfigPath}
 }

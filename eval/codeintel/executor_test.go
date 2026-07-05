@@ -112,10 +112,19 @@ func TestBuildClaudeInvocation_WiresArms(t *testing.T) {
 
 	withoutSpec := ArmSpec{Arm: ArmWithout, Case: fsCaseFor("X"), Env: []string{"PATH=/clean/bin"}, Budget: Budget{MaxTurns: 5}}
 	winv := BuildClaudeInvocation(withoutSpec)
-	if strings.Contains(strings.Join(winv.Argv, " "), "--mcp-config") {
+	wjoined := strings.Join(winv.Argv, " ")
+	if strings.Contains(wjoined, "--mcp-config") {
 		t.Errorf("WITHOUT invocation must NOT wire an MCP config; got %v", winv.Argv)
 	}
-	if !strings.Contains(strings.Join(winv.Argv, " "), "--max-turns 5") {
+	// Symmetric MCP isolation: the control MUST also pass --strict-mcp-config so
+	// the agent loads ZERO MCP servers, never the operator's ambient
+	// ~/.claude.json or a target repo's committed .mcp.json. Without it the
+	// control silently gains any dogfooded af-code-intelligence server, collapsing
+	// the measured delta.
+	if !strings.Contains(wjoined, "--strict-mcp-config") {
+		t.Errorf("WITHOUT invocation must pass --strict-mcp-config (zero MCP servers); got %v", winv.Argv)
+	}
+	if !strings.Contains(wjoined, "--max-turns 5") {
 		t.Error("both arms must carry the equal budget")
 	}
 }
