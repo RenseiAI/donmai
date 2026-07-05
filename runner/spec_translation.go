@@ -170,12 +170,18 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		spec.AllowedTools = nil
 	}
 
-	// MCPToolNames is derived from MCPServers — every server we ship
-	// today (af_linear, af_code) advertises tools under its name
-	// prefix; the loop will populate MCPToolNames after building the
-	// MCP config when a richer derivation lands. v0.5.0 leaves the
-	// list empty; providers that need it (codex) accept the empty
-	// list as "all tools allowed".
+	// MCPToolNames: allow-list the fully-qualified code-intel tool names so
+	// autonomous agents may call them without a permission prompt. Gated on the
+	// SAME capability pair as the Spec.MCPServers forwarding above
+	// (SupportsToolPlugins && AcceptsMcpServerSpec) — a provider that ignores
+	// MCP specs (ollama/opencode/agycli) gets the CLI-fallback prompt guidance
+	// instead, so allow-listing MCP names there would be dead. Only populated
+	// when the CodeIntel block is present; a nil block leaves the list empty
+	// (byte-identical to pre-code-intel), and providers that consume it (codex)
+	// treat an empty list as "all tools allowed".
+	if qw.CodeIntel != nil && caps.SupportsToolPlugins && caps.AcceptsMcpServerSpec {
+		spec.MCPToolNames = codeIntelFQToolNames(qw.CodeIntel)
+	}
 
 	return spec
 }
