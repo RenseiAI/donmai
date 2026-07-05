@@ -180,22 +180,11 @@ func (n *NativeRunner) discoverFiles(filePatterns []string) ([]string, error) {
 		if err != nil {
 			return nil
 		}
-		// Apply optional file-pattern filter (simple glob via filepath.Match).
-		if len(filePatterns) > 0 {
-			matched := false
-			for _, pat := range filePatterns {
-				if ok, _ := filepath.Match(pat, rel); ok {
-					matched = true
-					break
-				}
-				if ok, _ := filepath.Match(pat, name); ok {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				return nil
-			}
+		// Apply optional file-pattern filter (TS-faithful glob semantics, so a
+		// trailing "/**" matches the whole subtree). Shared with the get-repo-map
+		// output filter via matchesAnyPattern.
+		if len(filePatterns) > 0 && !matchesAnyPattern(rel, filePatterns) {
+			return nil
 		}
 		paths = append(paths, rel)
 		return nil
@@ -439,7 +428,9 @@ func (n *NativeRunner) GetRepoMapNative(opts GetRepoMapOptions) (any, error) {
 	graph.BuildFromIndex(idx.Files)
 	ranks := NewPageRank().Compute(graph.Adjacency())
 
-	var entries []RepoMapEntry
+	// Non-nil so an empty/filtered-out result serialises as JSON [] (an array),
+	// never null — array-typed consumers must not break on a zero match.
+	entries := make([]RepoMapEntry, 0, len(idx.Files))
 	for _, fi := range idx.Files {
 		// Output filter: limit which files appear, not which are ranked/graphed.
 		if len(opts.FilePatterns) > 0 && !matchesAnyPattern(fi.FilePath, opts.FilePatterns) {
@@ -511,16 +502,40 @@ func (n *NativeRunner) goModulePrefix() string {
 	return ""
 }
 
-// matchesAnyPattern reports whether path matches any of the glob patterns,
-// tested against both the full relative path and the basename (the same
-// semantics discoverFiles uses for its file-pattern filter).
-func matchesAnyPattern(path string, patterns []string) bool {
-	base := filepath.Base(path)
-	for _, pat := range patterns {
-		if ok, _ := filepath.Match(pat, path); ok {
+// matchGlob reports whether a single file pattern matches a slash-relative path.
+//
+// It mirrors the TS RepoMapGenerator.matchAnyPattern semantics so the documented
+// examples work as written — crucially, a trailing "/**" matches the whole
+// subtree (filepath.Match's "**" is a single-level "*" that does NOT cross "/",
+// which silently dropped every nested file under a documented "src/**" pattern):
+//
+//   - "*ext"   → suffix match (path ends with ext), e.g. "*.go" matches
+//     "afclient/native.go" as well as "main.go".
+//   - "dir/**" → subtree prefix match (path starts with "dir/" or equals "dir").
+//   - otherwise → filepath.Match against the full path, then the basename, so
+//     single-segment globs like "native.go" still match by basename.
+func matchGlob(pattern, path string) bool {
+	path = normalizeSlash(path)
+	switch {
+	case strings.HasPrefix(pattern, "*") && !strings.ContainsAny(pattern[1:], "*?["):
+		return strings.HasSuffix(path, pattern[1:])
+	case strings.HasSuffix(pattern, "/**"):
+		prefix := strings.TrimSuffix(pattern, "/**")
+		return path == prefix || strings.HasPrefix(path, prefix+"/")
+	default:
+		if ok, _ := filepath.Match(pattern, path); ok {
 			return true
 		}
-		if ok, _ := filepath.Match(pat, base); ok {
+		ok, _ := filepath.Match(pattern, filepath.Base(path))
+		return ok
+	}
+}
+
+// matchesAnyPattern reports whether path matches any of the glob patterns,
+// using matchGlob's TS-faithful semantics (trailing "/**" = subtree match).
+func matchesAnyPattern(path string, patterns []string) bool {
+	for _, pat := range patterns {
+		if matchGlob(pat, path) {
 			return true
 		}
 	}
@@ -555,15 +570,10 @@ func (n *NativeRunner) SearchSymbolsNative(opts SearchSymbolsOptions) (any, erro
 	var results []scored
 
 	for _, fi := range idx.Files {
-		// File-pattern filter.
-		if opts.FilePattern != "" {
-			matched, _ := filepath.Match(opts.FilePattern, fi.FilePath)
-			if !matched {
-				matched, _ = filepath.Match(opts.FilePattern, filepath.Base(fi.FilePath))
-			}
-			if !matched {
-				continue
-			}
+		// File-pattern filter (same TS-faithful glob semantics as get-repo-map,
+		// so "svc/**" reaches nested files).
+		if opts.FilePattern != "" && !matchGlob(opts.FilePattern, fi.FilePath) {
+			continue
 		}
 		for _, sym := range fi.Symbols {
 			// Kind filter.
