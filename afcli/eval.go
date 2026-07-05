@@ -231,13 +231,14 @@ func defaultBenchmarkDir() string {
 	return filepath.Join(root, "afclient", "codeintel", "testdata", "eval-benchmark")
 }
 
-// resolveRepoRoots merges explicit --repo-root slug=path pairs over the defaults
-// (donmai = the enclosing git root; platform = its sibling).
+// resolveRepoRoots maps benchmark repo slugs to on-disk clone roots. The
+// enclosing git root (this repo) is registered under its own slug by default;
+// any additional dogfood repo is supplied at eval time via --repo-root
+// slug=path (repeatable), so the OSS harness never hard-codes another repo.
 func resolveRepoRoots(pairs []string) (map[string]string, error) {
 	roots := map[string]string{}
 	if root, ok := engine.FindGitRoot(cwd()); ok {
 		roots["RenseiAI/donmai"] = root
-		roots["RenseiAI/platform"] = filepath.Join(filepath.Dir(root), "platform")
 	}
 	for _, p := range pairs {
 		slug, path, ok := strings.Cut(p, "=")

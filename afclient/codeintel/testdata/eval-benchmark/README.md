@@ -26,10 +26,13 @@ an `EvalDatasetCase` (brief 06 §4.2):
 ## Pinned refs
 
 - `RenseiAI/donmai` → `13a3fdd404331a8b7348bbf6474e85fe68c073f1`
-- `RenseiAI/platform` → `f9bb5f16b5826bdb006ea050882ac292bb494c24`
 
-The ground truth was derived at these SHAs; the driver provisions each workarea
-at exactly the case's `ref` so a fixture stays valid even as the repos evolve.
+The committed cases here dogfood this repo. A second dogfood repo's cases are
+supplied privately at eval time (via `--benchmark-dir` plus `--repo-root
+slug=path`) — the OSS harness stays repo-agnostic and never names a private
+repo. The ground truth was derived at the pinned `ref` on each case; the driver
+provisions each workarea at exactly that `ref` so a fixture stays valid even as
+the repos evolve.
 
 ## How the ground truth was derived (and spot-verified)
 
