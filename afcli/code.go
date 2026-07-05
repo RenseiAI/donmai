@@ -46,7 +46,8 @@ path for ALL subcommands (useful for testing against the legacy reference
 implementation; prints a one-time deprecation notice to stderr).
 
 Optional env vars for enhanced search-code results:
-  VOYAGE_AI_API_KEY   Enables semantic vector embeddings (hybrid BM25+vector mode)
+  VOYAGE_API_KEY      Enables semantic vector embeddings (hybrid BM25+vector mode)
+                      (VOYAGE_AI_API_KEY is also accepted for back-compat)
   COHERE_API_KEY      Enables cross-encoder reranking for more precise result ordering`,
 		SilenceUsage: true,
 	}

@@ -183,6 +183,42 @@ func TestIsHybridEnabled(t *testing.T) {
 	}
 }
 
+// The credential store (platform/.env.local, Voyage's own SDK) ships the key as
+// VOYAGE_API_KEY, not the historically-documented VOYAGE_AI_API_KEY. Hybrid must
+// engage on the standard name, and it must take precedence over the alias.
+func TestVoyageAPIKey_StandardNamePreferredWithAliasFallback(t *testing.T) {
+	// Standard name alone enables hybrid (this failed before the fix).
+	withEnv(t, "VOYAGE_AI_API_KEY", "")
+	withEnv(t, "VOYAGE_API_KEY", "std-key")
+	if !isHybridEnabled() {
+		t.Fatal("expected hybrid enabled when only VOYAGE_API_KEY is set")
+	}
+	if got := voyageAPIKey(); got != "std-key" {
+		t.Fatalf("voyageAPIKey() = %q, want std-key", got)
+	}
+
+	// Standard name wins when both are set.
+	withEnv(t, "VOYAGE_AI_API_KEY", "alias-key")
+	withEnv(t, "VOYAGE_API_KEY", "std-key")
+	if got := voyageAPIKey(); got != "std-key" {
+		t.Fatalf("voyageAPIKey() = %q, want std-key (standard name takes precedence)", got)
+	}
+
+	// Alias still works alone (back-compat).
+	withEnv(t, "VOYAGE_API_KEY", "")
+	withEnv(t, "VOYAGE_AI_API_KEY", "alias-key")
+	if got := voyageAPIKey(); got != "alias-key" {
+		t.Fatalf("voyageAPIKey() = %q, want alias-key (fallback)", got)
+	}
+
+	// Neither set → disabled, no key.
+	withEnv(t, "VOYAGE_API_KEY", "")
+	withEnv(t, "VOYAGE_AI_API_KEY", "")
+	if isHybridEnabled() {
+		t.Fatal("expected hybrid disabled when neither Voyage key is set")
+	}
+}
+
 // Key-absent passthrough: candidates come back byte-identical (same order,
 // same scores) and zero network calls are made — proven by pointing the
 // endpoints at an address nothing should ever dial.
