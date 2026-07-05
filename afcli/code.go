@@ -83,9 +83,10 @@ func newCodeGetRepoMapCmd(bin string, repoPath *string) *cobra.Command {
 		Short: "Get a PageRank-ranked repository map showing the most important files",
 		Long: `Generates a PageRank-ranked map of repository files and their key symbols.
 
-Files are ranked by PageRank over the file import/dependency graph. The output
-JSON contains both structured entries and a formatted string suitable for
-agent context.
+Files are ranked by PageRank over the intra-repo import/dependency graph
+(resolved for TypeScript/JS relative imports and Go/Python/Rust package
+imports). The output JSON has the shape {entries, rootHash, files}, where each
+entry carries a filePath, its PageRank rank, and its extracted symbols.
 
 The index is built once and persisted under .donmai/code-index/; later calls
 incrementally update only files that changed rather than re-extracting the

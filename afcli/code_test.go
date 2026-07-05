@@ -77,6 +77,28 @@ func execCodeCmd(t *testing.T, subArgs ...string) (map[string]any, error) {
 
 // ── get-repo-map ─────────────────────────────────────────────────────────────
 
+// TestCodeGetRepoMap_HelpDescribesActualOutput guards the honesty of the
+// get-repo-map Long help. GetRepoMapNative returns {entries, rootHash, files}
+// and NO rendered/formatted string, so the help must not promise one.
+//
+// RED (before the fix): the Long help claimed "The output JSON contains both
+// structured entries and a formatted string suitable for agent context", which
+// no output field ever provided.
+func TestCodeGetRepoMap_HelpDescribesActualOutput(t *testing.T) {
+	root := &cobra.Command{Use: "donmai"}
+	root.AddCommand(newCodeCmd(Config{}))
+	sub, _, err := root.Find([]string{"code", "get-repo-map"})
+	if err != nil {
+		t.Fatalf("find get-repo-map: %v", err)
+	}
+	if strings.Contains(sub.Long, "formatted string") {
+		t.Errorf("get-repo-map help still claims a 'formatted string' the output never contains:\n%s", sub.Long)
+	}
+	if !strings.Contains(sub.Long, "{entries, rootHash, files}") {
+		t.Errorf("get-repo-map help should describe the real output shape {entries, rootHash, files}:\n%s", sub.Long)
+	}
+}
+
 func TestCodeGetRepoMap_NoFlags(t *testing.T) {
 	m, err := execCodeCmd(t, "get-repo-map")
 	if err != nil {
