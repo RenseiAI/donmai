@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -36,6 +37,13 @@ type NativeRunner struct {
 	goExtractor     *GoExtractor
 	pythonExtractor *PythonExtractor
 	rustExtractor   *RustExtractor
+
+	// extractCount is a test seam: it counts how many times a language
+	// extractor was actually invoked on a file (the expensive parse step). The
+	// incremental hot path must NOT re-invoke extractors for unchanged files, so
+	// tests assert this counter stays flat across repeated builds of an
+	// unchanged tree. Atomic for the concurrent warm-path model.
+	extractCount atomic.Int64
 }
 
 // NewNativeRunner creates a NativeRunner that operates relative to cwd.
@@ -201,23 +209,9 @@ func ContentXXHash64(content string) string {
 
 // ── extraction ────────────────────────────────────────────────────────────────
 
-// extractFile reads a file and extracts its symbols.
-func (n *NativeRunner) extractFile(relPath string) (FileAST, []byte, error) {
-	absPath := filepath.Join(n.cwd, relPath)
-	content, err := os.ReadFile(absPath) //nolint:gosec
-	if err != nil {
-		return FileAST{}, nil, fmt.Errorf("read %s: %w", relPath, err)
-	}
-	// Only extract from valid UTF-8 files to avoid regex panics.
-	if !utf8.Valid(content) {
-		return FileAST{FilePath: relPath, Language: "binary"}, content, nil
-	}
-	ast := n.extractAST(string(content), relPath)
-	return ast, content, nil
-}
-
 // extractAST dispatches to the appropriate language extractor.
 func (n *NativeRunner) extractAST(source, filePath string) FileAST {
+	n.extractCount.Add(1) // test seam: one language-extractor invocation
 	ext := strings.ToLower(filepath.Ext(filePath))
 	switch ext {
 	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
@@ -235,59 +229,82 @@ func (n *NativeRunner) extractAST(source, filePath string) FileAST {
 
 // ── BuildIndex builds / incrementally updates the index ──────────────────────
 
-// BuildIndex walks the repository, extracts symbols from all indexable files,
-// and persists the result to index.json. Returns the updated IndexFile.
-func (n *NativeRunner) BuildIndex(opts GetRepoMapOptions) (IndexFile, error) {
-	files, err := n.discoverFiles(opts.FilePatterns)
+// BuildIndex updates the persisted index incrementally and returns it.
+//
+// It performs a cheap pass over the repository — read + git-blob-hash every
+// indexable file — then diffs the resulting Merkle tree against the persisted
+// index (MerkleTreeFromIndex / MerkleDiff / MerkleIdentical). The expensive
+// language extractor is invoked ONLY on added or modified files; unchanged
+// files keep their existing FileIndex verbatim and deleted files are dropped.
+// This is the fix for the long-standing bug where the git-blob hash was compared
+// only AFTER extraction had already run, so the hash check skipped the map write
+// but not the parse — making "incremental" indexing re-parse the whole tree on
+// every call.
+//
+// opts.FilePatterns is NOT applied here: it is an OUTPUT filter (see
+// GetRepoMapNative), never an index-scope filter. The persisted index always
+// covers the entire indexable tree so the import graph (PageRank) and the
+// in-process warm cache stay coherent regardless of which query invoked it.
+func (n *NativeRunner) BuildIndex(_ GetRepoMapOptions) (IndexFile, error) {
+	files, err := n.discoverFiles(nil)
 	if err != nil {
 		return IndexFile{}, fmt.Errorf("discover files: %w", err)
 	}
 
 	existing := n.loadIndex()
-	newFiles := make(map[string]FileIndex, len(existing.Files))
 
-	// Copy entries for files that haven't changed (incremental indexing).
-	for path, fi := range existing.Files {
-		newFiles[path] = fi
-	}
-
+	// Cheap pass: read + git-blob-hash every discovered file. Retain the raw
+	// bytes so a changed file can be extracted without a second read. Binary /
+	// unreadable files are skipped (never indexed), matching prior behaviour.
+	newHashes := make(map[string]string, len(files))
+	rawByPath := make(map[string][]byte, len(files))
 	for _, relPath := range files {
-		ast, raw, err := n.extractFile(relPath)
-		if err != nil || ast.Language == "binary" {
+		raw, rerr := os.ReadFile(filepath.Join(n.cwd, relPath)) //nolint:gosec // path from cwd
+		if rerr != nil || !utf8.Valid(raw) {
 			continue
 		}
-		hash := gitBlobHash(raw)
-		// Skip re-extraction if the file hasn't changed.
-		if existing, ok := newFiles[relPath]; ok && existing.GitHash == hash {
-			continue
-		}
-		fi := FileIndex{
-			FilePath:    relPath,
-			GitHash:     hash,
-			Symbols:     ast.Symbols,
-			LastIndexed: time.Now().UnixMilli(),
-		}
-		if fi.Symbols == nil {
-			fi.Symbols = []CodeSymbol{}
-		}
-		newFiles[relPath] = fi
+		newHashes[relPath] = gitBlobHash(raw)
+		rawByPath[relPath] = raw
 	}
 
-	// Remove entries for files no longer on disk.
-	discovered := make(map[string]bool, len(files))
-	for _, p := range files {
-		discovered[p] = true
+	oldTree := MerkleTreeFromIndex(existing)
+	newTree := MerkleTreeFromHashes(newHashes)
+
+	// Fast path: the tree is byte-identical to what's persisted — nothing
+	// changed. Reuse the existing index wholesale (no extraction, no re-save).
+	if MerkleIdentical(oldTree, newTree) && len(existing.Files) == len(newHashes) {
+		existing.Version = IndexSchemaVersion
+		return existing, nil
 	}
-	for path := range newFiles {
-		if !discovered[path] {
-			delete(newFiles, path)
+
+	// Otherwise compute the precise added/modified/deleted change set and
+	// re-extract only what actually changed.
+	changes := MerkleDiff(oldTree, newTree)
+	changed := make(map[string]bool, len(changes.Added)+len(changes.Modified))
+	for _, p := range changes.Added {
+		changed[p] = true
+	}
+	for _, p := range changes.Modified {
+		changed[p] = true
+	}
+
+	newFiles := make(map[string]FileIndex, len(newHashes))
+	for relPath, hash := range newHashes {
+		if !changed[relPath] {
+			if prev, ok := existing.Files[relPath]; ok {
+				newFiles[relPath] = prev // unchanged: reuse verbatim, no extraction
+				continue
+			}
 		}
+		ast := n.extractAST(string(rawByPath[relPath]), relPath) // counted extraction
+		newFiles[relPath] = n.newFileIndex(relPath, hash, rawByPath[relPath], ast)
 	}
+	// changes.Deleted paths are simply absent from newFiles.
 
 	idx := IndexFile{
 		Version:  IndexSchemaVersion,
 		Files:    newFiles,
-		RootHash: computeRootHash(newFiles),
+		RootHash: newTree.RootHash(),
 	}
 	if err := n.saveIndex(idx); err != nil {
 		return idx, fmt.Errorf("save index: %w", err)
@@ -295,13 +312,25 @@ func (n *NativeRunner) BuildIndex(opts GetRepoMapOptions) (IndexFile, error) {
 	return idx, nil
 }
 
-// computeRootHash produces a stable root hash over the entire file index using
-// the Merkle tree approach introduced in S3. This replaces the S0/S1 XOR-fold
-// and now matches the TS IncrementalIndexer's tree-based root hash computation.
-//
-// Delegates to RecomputeRootHash (merkle.go).
-func computeRootHash(files map[string]FileIndex) string {
-	return RecomputeRootHash(files)
+// newFileIndex assembles a schema-v2 FileIndex for a freshly-extracted file,
+// computing the content-identity fields (ContentHash, SimHash) over the file's
+// normalised content so dedup can compare against them later.
+func (n *NativeRunner) newFileIndex(relPath, gitHash string, raw []byte, ast FileAST) FileIndex {
+	normalized := normalizeDupContent(string(raw))
+	fi := FileIndex{
+		FilePath:    relPath,
+		GitHash:     gitHash,
+		ContentHash: ContentXXHash64(normalized),
+		SimHash:     SimHashCompute(normalized),
+		Symbols:     ast.Symbols,
+		Imports:     ast.Imports,
+		Exports:     ast.Exports,
+		LastIndexed: time.Now().UnixMilli(),
+	}
+	if fi.Symbols == nil {
+		fi.Symbols = []CodeSymbol{}
+	}
+	return fi
 }
 
 // ── GetRepoMap ────────────────────────────────────────────────────────────────
