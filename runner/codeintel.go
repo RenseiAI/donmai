@@ -137,20 +137,34 @@ func codeIntelFQToolNames(ci *prompt.CodeIntelWork) []string {
 	return out
 }
 
-// codeIntelToolsCSV joins the block's requested Tools verbatim (trimmed,
-// non-empty), preserving the caller's order, for the stdio server's `--tools`
-// flag. Returns "" when the block requests no subset (server default = all).
+// codeIntelToolsCSV renders the block's EXPOSED tool subset as the stdio
+// server's `--tools` CSV, in canonical order. It derives from
+// effectiveCodeIntelTools — the SAME already-filtered canonical set the FQ
+// allow-list (codeIntelFQToolNames) and the prompt partial use — so an unknown
+// / typo name is dropped consistently across every derivation and never reaches
+// the server's `--tools` flag. This matters because server.validateTools
+// rejects any unknown name all-or-nothing at startup: forwarding a single bad
+// name verbatim would fail New() and take the ENTIRE code-intel server down
+// while the composed Spec still advertised (and allow-listed) the tools.
+//
+// Returns "" when the exposed set is the full six — whether because the block
+// requested no subset, an all-unknown subset (which collapses to all six), or
+// explicitly listed all six — since the server defaults to all six when
+// `--tools` is omitted, so listing them is redundant and the minimal-block wire
+// contract omits the flag entirely.
 func codeIntelToolsCSV(ci *prompt.CodeIntelWork) string {
-	if ci == nil {
+	eff := effectiveCodeIntelTools(ci)
+	// Full set → omit --tools and let the server default to all six. This keeps
+	// the all-unknown case consistent with the FQ/prompt lanes (which also expose
+	// all six) instead of passing a bogus name that would kill the server.
+	if len(eff) == len(codeIntelTools) {
 		return ""
 	}
-	var parts []string
-	for _, t := range ci.Tools {
-		if s := strings.TrimSpace(t); s != "" {
-			parts = append(parts, s)
-		}
+	names := make([]string, 0, len(eff))
+	for _, tm := range eff {
+		names = append(names, tm.tool)
 	}
-	return strings.Join(parts, ",")
+	return strings.Join(names, ",")
 }
 
 // codeIntelExecutable resolves the self-referential binary path used as the
