@@ -141,6 +141,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newOrchestratorCmd(cfg))
 	root.AddCommand(newCodeCmd(cfg))
 	root.AddCommand(newMCPCmd(cfg))
+	root.AddCommand(newEvalCmd(cfg))
 	root.AddCommand(newArchCmd(cfg))
 	root.AddCommand(newLinearCmd(ds, cfg))
 	root.AddCommand(newGitHubCmd(ds, cfg))
