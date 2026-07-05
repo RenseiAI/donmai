@@ -271,6 +271,57 @@ type QueuedWork struct {
 	//
 	// Wire shape: "interviewDefinition" (camelCase, omitempty).
 	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
+
+	// CodeIntel is the platform-resolved code-intelligence capability block
+	// for this session (Wave 2 code-intel activation). When non-nil the runner
+	// turns on the in-box `af-code-intelligence` stdio MCP plugin: it appends a
+	// self-referential stdio server entry (os.Executable() + `mcp code-intel
+	// --root <worktree>`) to the session's MCP set and allow-lists the six
+	// mcp__af-code-intelligence__af_code_* tool names for MCP-capable
+	// providers. When nil the capability is OFF and behaviour is byte-identical
+	// to a pre-code-intel session (additive — nil = zero change).
+	//
+	// Wire shape: "codeIntel" (camelCase, omitempty). Threaded opaquely through
+	// every wire hop (PollWorkItem, SessionDetail, detailToQueuedWork) so Go's
+	// strict JSON decoder never drops the platform's emit — the v0.9.3
+	// SystemPromptOverride wire-gap precedent (silent-drop hazard). Old runners
+	// ignore the unknown field; old platforms simply never emit it (the runner
+	// tolerates its absence — nil = capability off).
+	CodeIntel *CodeIntelWork `json:"codeIntel,omitempty"`
+}
+
+// CodeIntelWork is the typed code-intelligence capability block on QueuedWork.
+// It is the platform→runner signal that the session should run with the in-box
+// code-intelligence engine exposed as an MCP tool surface. The runner — never
+// the platform — constructs the concrete stdio MCP entry from this block (it
+// owns os.Executable() and the provisioned worktree path), per the frozen wire
+// contract (runs/2026-07-04-code-intel-capability).
+//
+// All inner fields except Repo are optional; a minimal block is `{"repo":…}`.
+type CodeIntelWork struct {
+	// Repo is the repository the capability is scoped to (owner/name slug or
+	// remote URL). Present for audit/correlation and to support a future
+	// cross-repo capability ref; the runner indexes the provisioned worktree
+	// regardless, so an empty Repo does not disable the capability.
+	Repo string `json:"repo,omitempty"`
+
+	// Ref is the optional git ref (branch/tag/sha) the capability was pinned
+	// to. Carried for correlation; the runner indexes whatever the worktree
+	// was provisioned at.
+	Ref string `json:"ref,omitempty"`
+
+	// RepoPath is an optional path RELATIVE to the session worktree root that
+	// scopes indexing to a subtree (e.g. a single package in a monorepo). Same
+	// validation semantics as the `donmai code --repo-path` flag (must stay
+	// inside the root). Forwarded to the stdio server as `--repo-path`. Empty
+	// = index the whole worktree.
+	RepoPath string `json:"repoPath,omitempty"`
+
+	// Tools is an optional subset of the six code-intel tool names to expose
+	// (e.g. ["af_code_search_symbols","af_code_get_repo_map"]). Empty = expose
+	// all six. Forwarded to the stdio server as `--tools` and used to filter
+	// the FQ tool names the runner allow-lists.
+	Tools []string `json:"tools,omitempty"`
 }
 
 // InterviewBudget is the per-interview wall-clock and idle-grace cap the
