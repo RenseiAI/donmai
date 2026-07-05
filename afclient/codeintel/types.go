@@ -7,16 +7,23 @@
 // .donmai/code-index/index.json.  No external binary is required for these
 // subcommands.
 //
-// # index.json schema compatibility
+// # index.json schema (Go-authoritative, v2)
 //
-// The persisted schema is byte-compatible with the legacy TypeScript
-// code-intelligence IncrementalIndexer.save() output:
+// The Go engine now OWNS this schema. Byte-compatibility with the legacy
+// TypeScript code-intelligence IncrementalIndexer.save() output has been
+// DELIBERATELY DROPPED: donmai-libraries is being deprecated, so the schema is
+// free to evolve for the Go engine's needs (real import graph, content-based
+// dedup) without a cross-repo sync constraint. The persisted shape is:
 //
-//	{ "files": { "<filePath>": FileIndex }, "rootHash": "<hash>" }
+//	{ "version": 2, "files": { "<filePath>": FileIndex }, "rootHash": "<hash>" }
 //
-// where FileIndex matches the TS FileIndexSchema (types.ts).  The gitHash
-// field uses git-blob SHA1 (sha1("blob <size>\0<content>")) — identical to
-// GitHashProvider.hashContent() in the TS package.
+// The top-level "version" field is authoritative: on load, a missing or older
+// version causes the whole index to be discarded and rebuilt from scratch (see
+// IndexSchemaVersion / loadIndex). This is a clean full rebuild, never a
+// half-migration. FileIndex.gitHash uses git-blob SHA1
+// (sha1("blob <size>\0<content>")) as the change-detection / Merkle key;
+// contentHash + simHash are content-identity fields for real dedup;
+// imports/exports feed the PageRank import graph.
 //
 // # Exec-shim fallback
 //
@@ -32,13 +39,14 @@
 package codeintel
 
 // SymbolKind enumerates the kinds of code symbols the extractors recognise.
-// Values are the string literals used in the TS code-intelligence package
-// (types.ts - SymbolKindSchema) and serialised into index.json verbatim.
-// Do NOT change these strings without also updating the TS side.
+// The Go engine is authoritative for these string values; they are serialised
+// into index.json verbatim. (They historically matched the TS SymbolKindSchema,
+// but with donmai-libraries deprecating there is no longer a TS side to keep in
+// lockstep — change them freely as the Go engine requires.)
 type SymbolKind string
 
-// Symbol kind constants — string values must match the TS SymbolKindSchema in
-// donmai-libraries/packages/code-intelligence/src/types.ts exactly.
+// Symbol kind constants — Go-authoritative string values serialised into
+// index.json. No cross-repo sync constraint (donmai-libraries is deprecating).
 const (
 	KindFunction  SymbolKind = "function"
 	KindClass     SymbolKind = "class"
@@ -85,12 +93,29 @@ type FileAST struct {
 	Exports  []string
 }
 
-// FileIndex is the per-file node persisted to index.json.
-// Schema matches the TS FileIndexSchema in types.ts.
+// FileIndex is the per-file node persisted to index.json (schema v2,
+// Go-authoritative).
+//
+//   - GitHash is the git-blob SHA1 of raw file content — the change-detection
+//     and Merkle-tree key (cheap to recompute; drives incremental re-extraction).
+//   - ContentHash is the xxHash64 of the file's normalised content — the exact
+//     content-identity key used by dedup (compared against a query's normalised
+//     content hash). Distinct from GitHash: git-compat vs dedup-normalised.
+//   - SimHash is the 64-bit Charikar fingerprint of the file's normalised
+//     content — the near-duplicate key used by dedup.
+//   - Imports/Exports are the module specifiers / exported names extracted from
+//     the file; Imports feed the PageRank import graph (import_graph.go).
+//
+// ContentHash/SimHash/Imports/Exports are computed only when a file is actually
+// (re)extracted, so they cost nothing on the incremental hash-match fast path.
 type FileIndex struct {
 	FilePath    string       `json:"filePath"`
 	GitHash     string       `json:"gitHash"`
+	ContentHash string       `json:"contentHash,omitempty"`
+	SimHash     uint64       `json:"simHash,omitempty"`
 	Symbols     []CodeSymbol `json:"symbols"`
+	Imports     []string     `json:"imports,omitempty"`
+	Exports     []string     `json:"exports,omitempty"`
 	LastIndexed int64        `json:"lastIndexed"` // Unix ms
 }
 
@@ -105,11 +130,15 @@ type IndexMetadata struct {
 	Languages    []string `json:"languages"`
 }
 
-// IndexFile is the top-level structure of .donmai/code-index/index.json.
-// The TS IncrementalIndexer.save() writes:
+// IndexFile is the top-level structure of .donmai/code-index/index.json
+// (schema v2, Go-authoritative):
 //
-//	{ "files": { "<filePath>": FileIndex, ... }, "rootHash": "<hash>" }
+//	{ "version": 2, "files": { "<filePath>": FileIndex, ... }, "rootHash": "<hash>" }
+//
+// Version is the authoritative schema tag. A persisted index whose Version does
+// not equal IndexSchemaVersion is discarded on load and rebuilt from scratch.
 type IndexFile struct {
+	Version  int                  `json:"version"`
 	Files    map[string]FileIndex `json:"files"`
 	RootHash string               `json:"rootHash"`
 }
