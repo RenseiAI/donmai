@@ -1,10 +1,12 @@
 package codeintel
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -295,6 +297,51 @@ func TestResolveCodeBin_CachingIdempotent(t *testing.T) {
 	b2, _ := r.resolveCodeBin()
 	if strings.Join(b1, " ") != strings.Join(b2, " ") {
 		t.Errorf("resolution not idempotent: %v vs %v", b1, b2)
+	}
+}
+
+// TestResolveCodeBin_PrintsDeprecationWarning is the RED-FIRST test for the
+// exec-shim deprecation notice: whenever DONMAI_CODE_BIN/AGENTFACTORY_CODE_BIN
+// routes commands to the legacy TS CLI, resolveCodeBin must print a one-line
+// stderr deprecation warning (mirroring the arch-shim precedent,
+// warnArchShimDeprecated).
+func TestResolveCodeBin_PrintsDeprecationWarning(t *testing.T) {
+	dir := t.TempDir()
+	fakebin := filepath.Join(dir, "my-af-code")
+	if err := os.WriteFile(fakebin, []byte("#!/bin/sh\necho '{}'"), 0o755); err != nil { //nolint:gosec // #nosec G306 -- test fake binary; needs owner exec bit
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTFACTORY_CODE_BIN", fakebin)
+
+	// Reset the process-wide once-guard so this test observes the warning
+	// regardless of test execution order within the package (other tests in
+	// this file also resolve the exec-shim bin).
+	codeShimWarnOnce = sync.Once{}
+
+	oldStderr := os.Stderr
+	pr, pw, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatal(pipeErr)
+	}
+	os.Stderr = pw
+
+	rn := New(t.TempDir())
+	_, err := rn.resolveCodeBin()
+
+	_ = pw.Close()
+	os.Stderr = oldStderr
+
+	if err != nil {
+		t.Fatalf("resolveCodeBin: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if _, readErr := buf.ReadFrom(pr); readErr != nil {
+		t.Fatal(readErr)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "DEPRECATED") || !strings.Contains(got, "DONMAI_CODE_BIN") {
+		t.Errorf("resolveCodeBin() with exec-shim override did not print a deprecation warning to stderr; got %q", got)
 	}
 }
 

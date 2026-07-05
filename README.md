@@ -356,14 +356,37 @@ installation credential instead.
 
 ### `donmai code`
 
-Code intelligence commands (repo map, symbol search, BM25 + vector hybrid
-search).
+Code intelligence commands, implemented natively in Go — no external binary
+required by default:
 
 ```bash
-donmai code search <query>
-donmai code map [--depth <n>]
-donmai code symbols <file>
+donmai code get-repo-map [--max-files <n>] [--file-patterns "*.go,src/**"]
+donmai code search-symbols <query> [--kinds function,method] [--file-pattern "*.go"]
+donmai code search-code <query> [--language go] [--max-results <n>]
+donmai code check-duplicate --content <text> | --content-file <path>
+donmai code find-type-usages <TypeName> [--max-results <n>]
+donmai code validate-cross-deps [path]
 ```
+
+- `get-repo-map` ranks files by PageRank over the file import/dependency graph.
+- `search-code` runs Okapi BM25 by default, upgrading to hybrid BM25+vector
+  search when `VOYAGE_AI_API_KEY` is set, with `COHERE_API_KEY` enabling
+  cross-encoder reranking.
+- `check-duplicate` detects exact (xxHash64) and near (SimHash) duplicates.
+- `find-type-usages` scans for switch/case, mapping-object, and import sites
+  for a union type or enum.
+- `validate-cross-deps` checks cross-package imports have `package.json`
+  dependency declarations (monorepo JS/TS).
+
+**Scoping**: by default the index root is the enclosing git repository root
+(discovered by walking up from the current directory), not just the
+invocation cwd. Pass `--repo-path <relative-path>` (a persistent flag on the
+`code` command group) to scope indexing to a subtree under that root, e.g. a
+single package in a monorepo.
+
+**Override**: set `DONMAI_CODE_BIN` to force the deprecated TypeScript
+exec-shim path for all subcommands instead (prints a one-time deprecation
+notice to stderr; will be removed once `donmai-libraries` is archived).
 
 ### `donmai arch`
 
