@@ -435,6 +435,7 @@ func (n *NativeRunner) GetRepoMapNative(opts GetRepoMapOptions) (any, error) {
 	}
 
 	graph := NewImportGraph()
+	graph.GoModulePrefix = n.goModulePrefix()
 	graph.BuildFromIndex(idx.Files)
 	ranks := NewPageRank().Compute(graph.Adjacency())
 
@@ -482,6 +483,32 @@ func (n *NativeRunner) GetRepoMapNative(opts GetRepoMapOptions) (any, error) {
 		"rootHash": idx.RootHash,
 		"files":    len(idx.Files),
 	}, nil
+}
+
+// goModulePrefix reads the `module` line from go.mod at the index root, if one
+// exists, so Go package imports under that prefix resolve exactly to their
+// intra-repo directory in the import graph. Returns "" when there is no go.mod
+// (or it has no module line), in which case the graph falls back to suffix
+// matching. Best-effort: any read/parse failure yields "".
+func (n *NativeRunner) goModulePrefix() string {
+	data, err := os.ReadFile(filepath.Join(n.cwd, "go.mod")) //nolint:gosec // path from cwd
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "module"); ok {
+			// require a space/tab after the keyword, then the module path
+			if trimmed := strings.TrimSpace(rest); trimmed != "" && (rest[0] == ' ' || rest[0] == '\t') {
+				// strip an optional trailing comment
+				if i := strings.Index(trimmed, "//"); i >= 0 {
+					trimmed = strings.TrimSpace(trimmed[:i])
+				}
+				return trimmed
+			}
+		}
+	}
+	return ""
 }
 
 // matchesAnyPattern reports whether path matches any of the glob patterns,
