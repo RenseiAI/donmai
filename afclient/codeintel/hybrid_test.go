@@ -68,6 +68,18 @@ func withEndpoint(t *testing.T, target *string, val string) {
 	t.Cleanup(func() { *target = prev })
 }
 
+// resetEmbedCache clears the package-level embedding cache so tests that
+// share deterministic candidate text (mkCandidates is fully deterministic)
+// don't observe cache hits left behind by a previous test. Production code
+// never needs this — the cache is meant to persist for the process
+// lifetime.
+func resetEmbedCache(t *testing.T) {
+	t.Helper()
+	embedCacheMu.Lock()
+	embedCache = map[string][]float32{}
+	embedCacheMu.Unlock()
+}
+
 // captureStderr redirects os.Stderr for the duration of fn and returns what
 // was written to it.
 func captureStderr(t *testing.T, fn func()) string {
@@ -175,6 +187,7 @@ func TestIsHybridEnabled(t *testing.T) {
 // same scores) and zero network calls are made — proven by pointing the
 // endpoints at an address nothing should ever dial.
 func TestApplyHybridSearch_KeyAbsent_Passthrough(t *testing.T) {
+	resetEmbedCache(t)
 	withEnv(t, "VOYAGE_AI_API_KEY", "")
 	withEnv(t, "COHERE_API_KEY", "")
 	withEndpoint(t, &voyageAPIURL, "http://127.0.0.1:1/unreachable")
@@ -197,6 +210,7 @@ func TestApplyHybridSearch_KeyAbsent_Passthrough(t *testing.T) {
 // closest to the query rises, and Cohere rerank confirms/adjusts the final
 // order.
 func TestApplyHybridSearch_HappyPath_Reorders(t *testing.T) {
+	resetEmbedCache(t)
 	var voyageReqs, cohereReqs int64
 
 	// symbol4 (lowest BM25 rank in mkCandidates) is made the closest semantic
@@ -254,6 +268,7 @@ func namesOf(cands []searchCandidate) []string {
 // API failure (500) falls back to the original BM25 order with exactly one
 // stderr warning, never a hard error.
 func TestApplyHybridSearch_APIFailure_FallsBackToBM25(t *testing.T) {
+	resetEmbedCache(t)
 	var voyageReqs int64
 	voyage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&voyageReqs, 1)
@@ -286,6 +301,7 @@ func TestApplyHybridSearch_APIFailure_FallsBackToBM25(t *testing.T) {
 // A slow/hanging Voyage server must not hang the caller: the client's own
 // timeout bounds the wait, and the result still falls back to BM25.
 func TestApplyHybridSearch_Timeout_FallsBackAndDoesNotHang(t *testing.T) {
+	resetEmbedCache(t)
 	voyage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
@@ -323,6 +339,7 @@ func TestApplyHybridSearch_Timeout_FallsBackAndDoesNotHang(t *testing.T) {
 // second call with the same query+candidates should hit the in-memory
 // content-hash cache and issue zero additional Voyage requests.
 func TestApplyHybridSearch_CacheHitAvoidsReEmbedding(t *testing.T) {
+	resetEmbedCache(t)
 	var voyageReqs int64
 	voyage := fakeVoyageServer(t, &voyageReqs, func(text, inputType string) []float32 {
 		return unitVec(0, 4)
@@ -350,6 +367,7 @@ func TestApplyHybridSearch_CacheHitAvoidsReEmbedding(t *testing.T) {
 
 // Errors and warnings must never contain the API key material.
 func TestApplyHybridSearch_NoKeyMaterialInError(t *testing.T) {
+	resetEmbedCache(t)
 	const secretKey = "sk-supersecret-voyage-key-DO-NOT-LEAK"
 	voyage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Echo the Authorization header back into the error body to prove
@@ -378,6 +396,7 @@ func TestApplyHybridSearch_NoKeyMaterialInError(t *testing.T) {
 // (independent of corpus size) because only the top-K BM25 candidates are
 // ever embedded, batched into a small, fixed number of API calls.
 func TestApplyHybridSearch_BoundedRequestCount_NotWholeCorpus(t *testing.T) {
+	resetEmbedCache(t)
 	var voyageReqs, cohereReqs int64
 	voyage := fakeVoyageServer(t, &voyageReqs, func(text, inputType string) []float32 {
 		return unitVec(0, 4)
