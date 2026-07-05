@@ -52,17 +52,34 @@ func NewNativeRunner(cwd string) *NativeRunner {
 
 // ── index.json persistence ────────────────────────────────────────────────────
 
+// IndexSchemaVersion is the authoritative on-disk schema version for
+// .donmai/code-index/index.json. A persisted index whose top-level "version"
+// does not equal this value is discarded on load and rebuilt from scratch (a
+// clean full rebuild, never a half-migration). Bump this whenever the persisted
+// FileIndex/IndexFile shape changes in a way that makes stale data unusable.
+//
+//	v1: { files, rootHash }                          (legacy, TS-compatible)
+//	v2: { version, files{…,contentHash,simHash,imports,exports}, rootHash }
+const IndexSchemaVersion = 2
+
 // loadIndex attempts to read the persisted index.json. Returns an empty
-// IndexFile if the file does not exist or cannot be decoded.
+// IndexFile if the file does not exist, cannot be decoded, or carries a schema
+// version other than IndexSchemaVersion (which forces a clean full rebuild).
 func (n *NativeRunner) loadIndex() IndexFile {
+	empty := IndexFile{Version: IndexSchemaVersion, Files: map[string]FileIndex{}}
 	path := filepath.Join(n.cwd, n.indexDir, "index.json")
 	data, err := os.ReadFile(path) //nolint:gosec // path is constructed from cwd
 	if err != nil {
-		return IndexFile{Files: map[string]FileIndex{}}
+		return empty
 	}
 	var idx IndexFile
 	if err := json.Unmarshal(data, &idx); err != nil {
-		return IndexFile{Files: map[string]FileIndex{}}
+		return empty
+	}
+	// Version gate: a missing (0) or older/newer version means the persisted
+	// data does not match the current schema — discard it and rebuild clean.
+	if idx.Version != IndexSchemaVersion {
+		return empty
 	}
 	if idx.Files == nil {
 		idx.Files = map[string]FileIndex{}
@@ -268,6 +285,7 @@ func (n *NativeRunner) BuildIndex(opts GetRepoMapOptions) (IndexFile, error) {
 	}
 
 	idx := IndexFile{
+		Version:  IndexSchemaVersion,
 		Files:    newFiles,
 		RootHash: computeRootHash(newFiles),
 	}
