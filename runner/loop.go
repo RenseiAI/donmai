@@ -267,7 +267,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// with the default winning on collision (the platform gate is never
 	// shadowed by a card entry of the same name). Additive: no card servers
 	// → identical to the prior behaviour.
-	mcpServers := mergeMCPServers(defaultMCPServers(qw), qw.McpServers)
+	mcpServers := mergeMCPServers(defaultMCPServers(qw, wpath), qw.McpServers)
 	mcpResult, err := buildMCPConfigPath(r.mcpb, mcpServers)
 	if err != nil {
 		res.Status = "failed"
@@ -1468,36 +1468,52 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 // defaultMCPServers returns the list of MCP servers every session ships
 // with by default.
 //
-// Currently emits one HTTP entry per session pointing at the platform's
+// Leads with one HTTP entry per session pointing at the platform's
 // per-session MCP endpoint (/api/mcp/<sessionId>). The platform applies
 // the A2A capability bundle filter at list-tools time and the
 // defense-in-depth allow-list check at tool-call time — see the A2A ADR
 // at runs/2026-05-20-adr-a2a-per-session-mcp.md.
 //
 // When PlatformURL or AuthToken are missing (standalone-mode sessions
-// without a platform), the entry is omitted: the agent runs without any
-// MCP gate, which matches the legacy back-compat path.
+// without a platform), the gate entry is omitted: the agent runs without any
+// platform MCP gate, which matches the legacy back-compat path.
 //
-// F.5 will layer additional entries (af_linear / af_code stdio plugins)
-// once the daemon's installed-plugin set is wired through. This function
-// is the single place the runner extends MCP defaults.
-func defaultMCPServers(qw QueuedWork) []agent.MCPServerConfig {
-	if qw.PlatformURL == "" || qw.AuthToken == "" || qw.SessionID == "" {
-		return nil
+// F.5 code-intel: when qw.CodeIntel is set the runner appends the in-box
+// af-code-intelligence stdio plugin (os.Executable() + `mcp code-intel --root
+// <wpath>`) AFTER the platform gate. root is the provisioned worktree path
+// (loop.go step 2) and MUST be passed explicitly — the caller builds this list
+// AFTER Provision so wpath exists. This function is the single place the runner
+// extends MCP defaults.
+func defaultMCPServers(qw QueuedWork, wpath string) []agent.MCPServerConfig {
+	var servers []agent.MCPServerConfig
+
+	// Platform per-session HTTP gate — omitted in standalone mode (no platform
+	// creds). Always leads the list so it is never shadowed by a later entry.
+	if qw.PlatformURL != "" && qw.AuthToken != "" && qw.SessionID != "" {
+		url := strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID
+		servers = append(servers, agent.MCPServerConfig{
+			// Brand-derived so OSS renders "donmai-platform" while the closed
+			// rensei binary (statehome brand "rensei") renders "rensei-platform"
+			// byte-identically. The platform reports its own serverInfo.name
+			// independently; this is the client-side label only.
+			Name: statehome.Brand() + "-platform",
+			Type: "http",
+			URL:  url,
+			Headers: map[string]string{
+				"Authorization": "Bearer " + qw.AuthToken,
+			},
+		})
 	}
-	url := strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID
-	return []agent.MCPServerConfig{{
-		// Brand-derived so OSS renders "donmai-platform" while the closed
-		// rensei binary (statehome brand "rensei") renders "rensei-platform"
-		// byte-identically. The platform reports its own serverInfo.name
-		// independently; this is the client-side label only.
-		Name: statehome.Brand() + "-platform",
-		Type: "http",
-		URL:  url,
-		Headers: map[string]string{
-			"Authorization": "Bearer " + qw.AuthToken,
-		},
-	}}
+
+	// In-box code-intelligence stdio plugin. Purely in-box — no platform
+	// coupling — so it is emitted whenever the capability block is present,
+	// including standalone-mode sessions. When the block is nil this is a no-op
+	// and the output is byte-identical to the pre-code-intel path.
+	if qw.CodeIntel != nil {
+		servers = append(servers, codeIntelMCPEntry(wpath, qw.CodeIntel))
+	}
+
+	return servers
 }
 
 // foldInlineSkills appends the agent card's INLINE skill bodies (WS5) to an
