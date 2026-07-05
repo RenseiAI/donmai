@@ -1,0 +1,228 @@
+package server
+
+import (
+	"encoding/json"
+	"errors"
+
+	"github.com/RenseiAI/donmai/afclient/codeintel"
+)
+
+// buildTools constructs the full six-tool set bound to this server's warm
+// NativeRunner. Each tool mirrors 1:1 the corresponding `donmai code`
+// subcommand handler in afcli/code.go — same options, same JSON output — so an
+// agent that sees both surfaces gets consistent results. The enabled subset is
+// selected from this set by registerTools.
+//
+// Tool results carry the SAME indented JSON the CLI prints (json.MarshalIndent
+// with two-space indent, matching afcli's printJSON), wrapped in a single MCP
+// text content item.
+func (s *Server) buildTools() []*toolDef {
+	r := s.runner
+	root := s.root
+
+	return []*toolDef{
+		{
+			name: ToolGetRepoMap,
+			description: "PageRank-ranked repository map: the most important files (by intra-repo " +
+				"import graph) and their extracted symbols. Output: {entries, rootHash, files}.",
+			inputSchema: schemaGetRepoMap,
+			invoke: func(args json.RawMessage) (any, error) {
+				var in struct {
+					MaxFiles     int      `json:"maxFiles"`
+					FilePatterns []string `json:"filePatterns"`
+				}
+				if err := decodeArgs(args, &in); err != nil {
+					return nil, err
+				}
+				return r.GetRepoMapNative(codeintel.GetRepoMapOptions{
+					MaxFiles:     in.MaxFiles,
+					FilePatterns: in.FilePatterns,
+				})
+			},
+		},
+		{
+			name: ToolSearchSymbols,
+			description: "BM25 search over the symbol index (functions, methods, classes, interfaces, " +
+				"types, structs, enums). Returns scored symbols with match type.",
+			inputSchema: schemaSearchSymbols,
+			invoke: func(args json.RawMessage) (any, error) {
+				var in struct {
+					Query       string   `json:"query"`
+					MaxResults  int      `json:"maxResults"`
+					Kinds       []string `json:"kinds"`
+					FilePattern string   `json:"filePattern"`
+				}
+				if err := decodeArgs(args, &in); err != nil {
+					return nil, err
+				}
+				return r.SearchSymbolsNative(codeintel.SearchSymbolsOptions{
+					Query:       in.Query,
+					MaxResults:  in.MaxResults,
+					Kinds:       in.Kinds,
+					FilePattern: in.FilePattern,
+				})
+			},
+		},
+		{
+			name: ToolSearchCode,
+			description: "Okapi BM25 keyword search over code content with code-aware tokenization " +
+				"(camelCase / snake_case). Returns scored symbols with match type.",
+			inputSchema: schemaSearchCode,
+			invoke: func(args json.RawMessage) (any, error) {
+				var in struct {
+					Query      string `json:"query"`
+					MaxResults int    `json:"maxResults"`
+					Language   string `json:"language"`
+				}
+				if err := decodeArgs(args, &in); err != nil {
+					return nil, err
+				}
+				return r.SearchCodeNative(codeintel.SearchCodeOptions{
+					Query:      in.Query,
+					MaxResults: in.MaxResults,
+					Language:   in.Language,
+				})
+			},
+		},
+		{
+			name: ToolCheckDuplicate,
+			description: "Check whether content is an exact (xxHash64) or near (SimHash) duplicate of " +
+				"indexed content. Provide exactly one of content (inline) or contentFile " +
+				"(relative to the repo root).",
+			inputSchema: schemaCheckDuplicate,
+			invoke: func(args json.RawMessage) (any, error) {
+				var in struct {
+					Content     string `json:"content"`
+					ContentFile string `json:"contentFile"`
+				}
+				if err := decodeArgs(args, &in); err != nil {
+					return nil, err
+				}
+				if (in.Content == "") == (in.ContentFile == "") {
+					return nil, errors.New("exactly one of content or contentFile is required")
+				}
+				opts := codeintel.CheckDuplicateOptions{Content: in.Content}
+				if in.ContentFile != "" {
+					// Confine contentFile to the served root — reject absolute
+					// paths and ../ escapes so a tool call cannot read outside
+					// --root (the CLI allows arbitrary paths; the agent-facing
+					// MCP surface does not).
+					scoped, err := resolveScopedFile(root, in.ContentFile)
+					if err != nil {
+						return nil, err
+					}
+					opts.ContentFile = scoped
+				}
+				return r.CheckDuplicateNative(opts)
+			},
+		},
+		{
+			name: ToolFindTypeUsages,
+			description: "Find all usage sites of a union type or enum: switch/case discriminators, " +
+				"Record<> mappings, exhaustive checks, and type references. Use before adding a " +
+				"new member to a union type.",
+			inputSchema: schemaFindTypeUsages,
+			invoke: func(args json.RawMessage) (any, error) {
+				var in struct {
+					TypeName   string `json:"typeName"`
+					MaxResults int    `json:"maxResults"`
+				}
+				if err := decodeArgs(args, &in); err != nil {
+					return nil, err
+				}
+				return r.FindTypeUsagesNative(codeintel.FindTypeUsagesOptions{
+					TypeName:   in.TypeName,
+					MaxResults: in.MaxResults,
+				})
+			},
+		},
+		{
+			name: ToolValidateCrossDeps,
+			description: "Validate that cross-package imports in a monorepo have matching package.json " +
+				"dependency declarations. Optional path scopes the check to a subtree.",
+			inputSchema: schemaValidateCrossDeps,
+			invoke: func(args json.RawMessage) (any, error) {
+				var in struct {
+					Path string `json:"path"`
+				}
+				if err := decodeArgs(args, &in); err != nil {
+					return nil, err
+				}
+				return r.ValidateCrossDepsNative(codeintel.ValidateCrossDepsOptions{Path: in.Path})
+			},
+		},
+	}
+}
+
+// ── inputSchema definitions (JSON Schema, mirroring the CLI flags) ────────────
+
+var schemaGetRepoMap = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "maxFiles": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Maximum files to include (0 = default 50)"
+    },
+    "filePatterns": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Glob filters over file paths (e.g. \"*.go\", \"src/**\"); a trailing /** matches a whole subtree. Output filter only."
+    }
+  },
+  "additionalProperties": false
+}`)
+
+var schemaSearchSymbols = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "query": {"type": "string", "description": "Symbol name or query (BM25 over the symbol index)"},
+    "maxResults": {"type": "integer", "minimum": 0, "description": "Maximum results (0 = default 20)"},
+    "kinds": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Restrict to these symbol kinds: function, method, class, interface, type, struct, enum, trait, impl, ..."
+    },
+    "filePattern": {"type": "string", "description": "Restrict to files matching this glob (e.g. \"*.go\", \"svc/**\")"}
+  },
+  "required": ["query"],
+  "additionalProperties": false
+}`)
+
+var schemaSearchCode = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "query": {"type": "string", "description": "Keyword query (Okapi BM25 over code content)"},
+    "maxResults": {"type": "integer", "minimum": 0, "description": "Maximum results (0 = default 20)"},
+    "language": {"type": "string", "description": "Restrict to one language (e.g. go, typescript, python, rust)"}
+  },
+  "required": ["query"],
+  "additionalProperties": false
+}`)
+
+var schemaCheckDuplicate = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "content": {"type": "string", "description": "Inline content to check for exact (xxHash64) / near (SimHash) duplicates"},
+    "contentFile": {"type": "string", "description": "Path RELATIVE to the repo root of a file whose content to check; absolute paths and traversal outside the root are rejected"}
+  },
+  "additionalProperties": false
+}`)
+
+var schemaFindTypeUsages = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "typeName": {"type": "string", "description": "Union type / enum name to find usage sites for"},
+    "maxResults": {"type": "integer", "minimum": 0, "description": "Maximum results (0 = default 50)"}
+  },
+  "required": ["typeName"],
+  "additionalProperties": false
+}`)
+
+var schemaValidateCrossDeps = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "path": {"type": "string", "description": "Optional relative path prefix scoping the check to a package or subtree"}
+  },
+  "additionalProperties": false
+}`)
