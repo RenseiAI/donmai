@@ -22,14 +22,21 @@ func TestBenchmark_Loads_AndMeetsMatrix(t *testing.T) {
 		t.Fatalf("benchmark is empty")
 	}
 
+	// The committed OSS benchmark holds only this repo's (public) cases; the
+	// second dogfood repo's cases are supplied privately at eval time. The
+	// founder's full-corpus floor (>=8/family across both repos) is enforced at
+	// run time by the driver's corpus-power gate (computeAggregate). Here we
+	// assert the self-repo contribution meets a per-repo floor so the committed
+	// half never silently thins out.
+	const perRepoFloor = 4
 	byFam := CountByFamily(cases)
 	for _, fam := range Families() {
-		if byFam[fam] < 8 {
-			t.Errorf("family %s has %d cases; founder floor is >=8 per family", fam, byFam[fam])
+		if byFam[fam] < perRepoFloor {
+			t.Errorf("family %s has %d committed cases; per-repo floor is >=%d", fam, byFam[fam], perRepoFloor)
 		}
 	}
 
-	// Every family must exercise BOTH dogfood repos (platform TS + donmai Go).
+	// Every committed case must name this (public) dogfood repo.
 	perFamRepo := map[TaskType]map[string]int{}
 	for _, c := range cases {
 		if perFamRepo[c.Family()] == nil {
@@ -37,12 +44,13 @@ func TestBenchmark_Loads_AndMeetsMatrix(t *testing.T) {
 		}
 		perFamRepo[c.Family()][c.Input.Repo]++
 	}
+	// The committed OSS benchmark ships this repo's own (public) cases; the
+	// second dogfood repo's cases are supplied at eval time from a private dir
+	// (see resolveRepoRoots / --benchmark-dir), so only the self-repo family
+	// coverage is asserted here.
 	for _, fam := range Families() {
 		if perFamRepo[fam]["RenseiAI/donmai"] == 0 {
 			t.Errorf("family %s has no donmai cases", fam)
-		}
-		if perFamRepo[fam]["RenseiAI/platform"] == 0 {
-			t.Errorf("family %s has no platform cases", fam)
 		}
 	}
 }

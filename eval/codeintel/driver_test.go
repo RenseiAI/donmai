@@ -325,7 +325,7 @@ func TestDriver_UnderpoweredRunIsNotAGAPass(t *testing.T) {
 // across all four families, >=2 repos, >=3 trials/arm) with a >=+15pp delta, no
 // regression, and tokens under budget reports MeetsThreshold=true.
 func TestComputeAggregate_PoweredCorpusCanPass(t *testing.T) {
-	repos := []string{"RenseiAI/platform", "RenseiAI/donmai"}
+	repos := []string{"acme/webapp", "acme/service"}
 	fams := map[TaskType]*FamilyStat{}
 	var cases []Case
 	var records []RunRecord
@@ -378,7 +378,7 @@ func TestComputeAggregate_PoweredCorpusCanPass(t *testing.T) {
 // pass this borderline/noisy result; the founder verdict must gate on the CI
 // lower bound and REFUSE it.
 func TestComputeAggregate_WideCIPoweredRunFailsOnLowerBound(t *testing.T) {
-	repos := []string{"RenseiAI/platform", "RenseiAI/donmai"}
+	repos := []string{"acme/webapp", "acme/service"}
 	fams := map[TaskType]*FamilyStat{}
 	var cases []Case
 	var records []RunRecord
