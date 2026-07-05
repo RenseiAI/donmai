@@ -397,6 +397,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		return res, err
 	}
 
+	// 5b. Code-intel usage partial. When (and only when) the CodeIntel
+	// capability block is present, append a compact usage partial to the
+	// composed system prompt — FQ MCP tool names for MCP-capable providers,
+	// Bash-CLI fallback guidance for providers that ignore MCP specs. Strict
+	// no-op when the block is absent (byte-identical prompt to today).
+	systemPrompt = injectCodeIntelPartial(systemPrompt, caps, qw.CodeIntel)
+
 	// 6. Translate to agent.Spec.
 	composedEnv := envToMap(r.envc.Compose(hostEnv(), agent.Spec{Env: specEnv}))
 	spec := translateSpec(qw, caps, SpecInputs{
