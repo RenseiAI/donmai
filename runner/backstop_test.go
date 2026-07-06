@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -455,4 +456,87 @@ func TestRunBackstop_RefusesMain(t *testing.T) {
 	if report.PRCreated {
 		t.Fatalf("expected no PR created on main")
 	}
+}
+
+// TestRunBackstop_RecoversExistingPR is the regression guard for the
+// backstop already-exists recovery (finding donmai[5]): when
+// `gh pr create` fails because a PR already exists for the branch, the
+// backstop recovers the existing PR URL from gh's failure output and
+// reports success (non-empty PRURL, PRCreated=true, no diagnostics)
+// rather than a pushed-but-no-PR failure — which the loop's 11c-b block
+// would otherwise reclassify as a failed session.
+//
+// The test pushes to a local bare remote so the push step succeeds, then
+// shadows `gh` on PATH with a stub that emulates the "already exists"
+// failure (exit 1 with the existing PR URL in its output, which runGh
+// folds into its combined output via CombinedOutput).
+func TestRunBackstop_RecoversExistingPR(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+
+	// Bare remote the backstop's `git push -u origin <branch>` targets.
+	remote := t.TempDir()
+	//nolint:gosec // G204: test fixture, args are hard-coded literals.
+	bareCmd := exec.Command("git", "init", "--bare", "-b", "main", remote)
+	if out, err := bareCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+
+	repo := t.TempDir()
+	gitInit(t, repo)
+	//nolint:gosec // G204: test fixture, args are hard-coded literals.
+	remoteAdd := exec.Command("git", "remote", "add", "origin", remote)
+	remoteAdd.Dir = repo
+	if out, err := remoteAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add origin: %v\n%s", err, out)
+	}
+	checkout(t, repo, "feature/already-exists")
+	// Uncommitted change so the backstop has something to commit + push.
+	writeFile(t, repo, "src/fix.go", "package fix\n")
+
+	const wantURL = "https://github.com/RenseiAI/donmai/pull/4242"
+	stubGhOnPath(t, 1, "a pull request for branch \"feature/already-exists\" into branch \"main\" already exists:\n"+wantURL+"\n")
+
+	r := minimalRunner(t)
+	res := &Result{}
+	res.WorktreePath = repo
+
+	report := r.runBackstop(context.Background(), QueuedWork{
+		QueuedWork: queuedWorkBase("ENG-77"),
+	}, "feature/already-exists", res)
+
+	if report.Diagnostics != "" {
+		t.Fatalf("expected no diagnostics on already-exists recovery; got %q", report.Diagnostics)
+	}
+	if !report.Pushed {
+		t.Errorf("expected Pushed=true (push to the bare remote should succeed)")
+	}
+	if !report.PRCreated {
+		t.Errorf("expected PRCreated=true after recovering an existing PR")
+	}
+	if report.PRURL != wantURL {
+		t.Errorf("report.PRURL = %q; want %q", report.PRURL, wantURL)
+	}
+}
+
+// stubGhOnPath writes a fake `gh` executable that echoes output to stderr
+// and exits with exitCode, then prepends its directory to PATH for the
+// test's duration so runGh resolves the stub instead of a real gh. The
+// output is written to a sibling file the stub cats, so arbitrary
+// multi-line text survives without shell-escaping hazards.
+func stubGhOnPath(t *testing.T, exitCode int, output string) {
+	t.Helper()
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "gh-output.txt")
+	if err := os.WriteFile(outFile, []byte(output), 0o600); err != nil {
+		t.Fatalf("write gh stub output: %v", err)
+	}
+	script := fmt.Sprintf("#!/bin/sh\ncat %q 1>&2\nexit %d\n", outFile, exitCode)
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }

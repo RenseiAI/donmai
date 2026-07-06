@@ -353,6 +353,19 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		"--body", prBody,
 	)
 	if err != nil {
+		// `gh pr create` fails ("a pull request for branch ... already
+		// exists:\n<url>") when the branch already has an open PR — e.g. the
+		// agent pushed and opened one but its URL never surfaced in the event
+		// stream, or a prior backstop already created it. gh prints the
+		// existing PR's URL in that failure output (runGh uses CombinedOutput,
+		// so stderr is in prOut). An existing PR satisfies the completion
+		// contract, so recover the URL and report success rather than a
+		// pushed-but-no-PR failure that would reclassify the session failed.
+		if u := scanPRURL(prOut); u != "" {
+			report.PRURL = u
+			report.PRCreated = true
+			return report
+		}
 		report.Diagnostics = fmt.Sprintf("gh pr create failed: %v\noutput: %s", err, prOut)
 		return report
 	}
