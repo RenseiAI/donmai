@@ -71,17 +71,37 @@ func spawnFake(t *testing.T, binary string, spec agent.Spec) *Handle {
 // spawnFakeCtx is spawnFake with a caller-supplied context (for
 // cancellation tests). The spec's MCPServers drive the Stop-cleanup
 // assertion; pass a spec with none for spawns that have no MCP config.
+//
+// The spawn retries briefly on ETXTBSY ("text file busy"): the fake CLI
+// script is written by this test binary moments before exec, and a
+// concurrently forking sibling test can inherit the not-yet-closed write
+// fd, making the kernel refuse the exec (golang.org/issue/22315). The
+// race is test-fixture-specific — production binaries are not freshly
+// written by the spawning process — so the retry lives here, not in
+// SpawnBinary.
 func spawnFakeCtx(ctx context.Context, t *testing.T, binary string, spec agent.Spec) *Handle {
 	t.Helper()
 	mcpPath, err := WriteMCPConfig(spec.MCPServers)
 	if err != nil {
 		t.Fatalf("WriteMCPConfig: %v", err)
 	}
-	h, err := SpawnBinary(ctx, binary, claudeArgs(), spec.Prompt, mcpPath, spec.Cwd, spec.Env, spec.OnProcessSpawned)
-	if err != nil {
-		t.Fatalf("SpawnBinary: %v", err)
+	var h *Handle
+	for attempt := 0; ; attempt++ {
+		h, err = SpawnBinary(ctx, binary, claudeArgs(), spec.Prompt, mcpPath, spec.Cwd, spec.Env, spec.OnProcessSpawned)
+		if err == nil {
+			return h
+		}
+		if attempt >= 3 || !strings.Contains(err.Error(), "text file busy") {
+			t.Fatalf("SpawnBinary: %v", err)
+		}
+		time.Sleep(time.Duration(25*(attempt+1)) * time.Millisecond)
+		// WriteMCPConfig's file was cleaned up by the failed spawn; re-write it.
+		if mcpPath != "" {
+			if mcpPath, err = WriteMCPConfig(spec.MCPServers); err != nil {
+				t.Fatalf("WriteMCPConfig (retry): %v", err)
+			}
+		}
 	}
-	return h
 }
 
 // collect drains events from h until the channel closes OR a
