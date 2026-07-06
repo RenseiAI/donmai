@@ -897,16 +897,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// runs for a result-sensitive work type that reached teardown without a
 	// PR (shouldBackstop gates on both). If it ran but still could not open
 	// one — e.g. a 403 on `gh pr create`, a push failure, or a main/master
-	// push refusal — the completion contract is UNSATISFIED: there is no PR
-	// for the v2 exit handler to merge. Without this the run would fall
-	// through to the "completed" default below with an empty PullRequestURL,
-	// and the exit handler would try to merge PR #0. Report it as an explicit
-	// backstop failure and surface the backstop's diagnostics into the
-	// terminal envelope (res.Error) so the platform's completion post carries
-	// the reason instead of an opaque completed-with-no-PR. The
-	// isResultSensitive guard is belt-and-suspenders on top of shouldBackstop
-	// so a future backstop-gate edit can't silently re-open this hole.
-	if res.BackstopReport != nil && res.PullRequestURL == "" && isResultSensitive(qw.WorkType) {
+	// push refusal — AND the work type's completion contract actually owes a
+	// PR, the contract is UNSATISFIED: there is no PR for the v2 exit handler
+	// to merge. Without this the run would fall through to the "completed"
+	// default below with an empty PullRequestURL, and the exit handler would
+	// try to merge PR #0. Report it as an explicit backstop failure and
+	// surface the backstop's diagnostics into the terminal envelope
+	// (res.Error) so the platform's completion post carries the reason
+	// instead of an opaque completed-with-no-PR.
+	//
+	// The gate is RequiresPRURL (contract owes a PR — today development /
+	// inflight), NOT isResultSensitive: QA / acceptance / merge / coordination
+	// are result-sensitive yet legitimately produce no new PR. A passing QA or
+	// merge session whose PR URL never surfaced would have res.PullRequestURL
+	// == "" with a non-nil BackstopReport; gating on isResultSensitive here
+	// would flip it to failed → resolveTargetStatus forces effectiveResult
+	// "failed" → the issue transitions to Rejected instead of Delivered.
+	if res.BackstopReport != nil && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType) {
 		res.Status = "failed"
 		if res.FailureMode == "" {
 			res.FailureMode = FailureBackstop

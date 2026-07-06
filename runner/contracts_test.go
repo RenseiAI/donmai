@@ -126,6 +126,54 @@ func TestRequiresWorkResult_UnknownTypeFalse(t *testing.T) {
 	}
 }
 
+// TestRequiresPRURL_DevAndInflight asserts ONLY development / inflight
+// owe a PR to complete — the two contracts whose Required set contains
+// FieldPRURL. This is the gate for the pushed-but-no-PR terminal
+// reclassification (loop.go 11c-b): only these types should be
+// reclassified failed when the backstop cannot surface a PR.
+func TestRequiresPRURL_DevAndInflight(t *testing.T) {
+	for _, wt := range []string{
+		WorkTypeDevelopmentStr,
+		WorkTypeInflight,
+	} {
+		if !RequiresPRURL(wt) {
+			t.Errorf("RequiresPRURL(%q) = false; want true", wt)
+		}
+	}
+}
+
+// TestRequiresPRURL_ResultSensitiveButNoPR is the regression guard for
+// MUST-FIX 2: QA / acceptance / merge / coordination are
+// result-sensitive (isResultSensitive == true) yet legitimately owe NO
+// new PR, so RequiresPRURL must return false. Gating the 11c-b
+// reclassification on isResultSensitive instead of RequiresPRURL would
+// flip a passing QA/acceptance/merge/coordination leg with no scannable
+// PR to failed → Rejected.
+func TestRequiresPRURL_ResultSensitiveButNoPR(t *testing.T) {
+	for _, wt := range []string{
+		WorkTypeQAStr,
+		WorkTypeAcceptance,
+		WorkTypeMerge,
+		WorkTypeCoordination,
+		WorkTypeInflightCoordination,
+	} {
+		if !isResultSensitive(wt) {
+			t.Fatalf("precondition: isResultSensitive(%q) = false; test premise broken", wt)
+		}
+		if RequiresPRURL(wt) {
+			t.Errorf("RequiresPRURL(%q) = true; want false (result-sensitive but owes no PR)", wt)
+		}
+	}
+}
+
+// TestRequiresPRURL_UnknownTypeFalse asserts an unknown work type
+// returns false (no contract → no PR requirement).
+func TestRequiresPRURL_UnknownTypeFalse(t *testing.T) {
+	if RequiresPRURL("imaginary-type") {
+		t.Errorf("RequiresPRURL(unknown) = true; want false")
+	}
+}
+
 // TestCompletionFieldsBackstopCapability pins the backstop-capable
 // flag on each field. Backstop-capable fields are auto-recovered by
 // runner/backstop.go; not-backstop-capable fields surface as a
