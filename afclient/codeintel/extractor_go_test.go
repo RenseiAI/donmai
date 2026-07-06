@@ -248,3 +248,92 @@ func undocumented() {}
 		}
 	}
 }
+
+// TestGoExtractor_EndLine_BraceInStringOrComment pins the string/comment-aware
+// block scanner: a '}' inside a string literal, rune literal, raw string, or a
+// // comment must not close the function extent early. A truncated extent
+// hashes the wrong span (or, below symbolHashMinLines, drops the fingerprint
+// entirely), making symbol-granular dedup silently miss exact pastes.
+//
+// RED (against the naive brace counter): EndLine = 6 (the `// }` comment line
+// closed the block), want 12.
+func TestGoExtractor_EndLine_BraceInStringOrComment(t *testing.T) {
+	src := `package p
+
+func Render(names []string) string {
+	open := "{"
+	clos := "}"
+	// } this commented brace must not close the block
+	raw := ` + "`}`" + `
+	if len(names) == 0 {
+		return open + clos + raw + string('}')
+	}
+	return names[0]
+}
+
+func After() {}
+`
+	ast := (&GoExtractor{}).Extract(src, "render.go")
+	fn := findSymbol(ast.Symbols, "Render", KindFunction)
+	if fn == nil {
+		t.Fatal("missing symbol Render")
+	}
+	if fn.EndLine == nil {
+		t.Fatal("Render EndLine = nil, want 12")
+	}
+	if *fn.EndLine != 12 {
+		t.Errorf("Render EndLine = %d, want 12 (braces in strings/comments must not truncate the extent)", *fn.EndLine)
+	}
+	after := findSymbol(ast.Symbols, "After", KindFunction)
+	if after == nil || after.EndLine == nil || *after.EndLine != 14 {
+		t.Errorf("After EndLine = %v, want 14 (one-liner closes on its own line)", after.EndLine)
+	}
+}
+
+// TestGoExtractor_EndLine_WrappedSignature pins extent recording for a
+// declaration whose parameter list wraps across lines: the opening '{' is not
+// on the keyword line, so the scanner must look ahead for it. Without this,
+// wrapped-signature functions get no EndLine and therefore no dedup
+// fingerprint at all.
+//
+// RED (against the decl-line-contains-'{' gate): Combine EndLine = nil.
+func TestGoExtractor_EndLine_WrappedSignature(t *testing.T) {
+	src := `package p
+
+func Combine(
+	a int,
+	b int,
+) (int, error) {
+	return a + b, nil
+}
+
+//go:noescape
+func stub(a, b int) int
+
+func Sub(a, b int) int { return a - b }
+`
+	ast := (&GoExtractor{}).Extract(src, "combine.go")
+	fn := findSymbol(ast.Symbols, "Combine", KindFunction)
+	if fn == nil {
+		t.Fatal("missing symbol Combine")
+	}
+	if fn.EndLine == nil {
+		t.Fatal("Combine EndLine = nil, want 8 (wrapped signature: '{' is on line 6, body closes line 8)")
+	}
+	if *fn.EndLine != 8 {
+		t.Errorf("Combine EndLine = %d, want 8", *fn.EndLine)
+	}
+	// A bodyless declaration (assembly stub / linkname) must NOT borrow the next
+	// declaration's brace: no extent at all.
+	stub := findSymbol(ast.Symbols, "stub", KindFunction)
+	if stub == nil {
+		t.Fatal("missing symbol stub")
+	}
+	if stub.EndLine != nil {
+		t.Errorf("bodyless stub EndLine = %d, want nil (must not borrow the next decl's brace)", *stub.EndLine)
+	}
+	sub := findSymbol(ast.Symbols, "Sub", KindFunction)
+	if sub == nil || sub.EndLine == nil || *sub.EndLine != 13 {
+		t.Errorf("Sub EndLine = %v, want 13", sub.EndLine)
+	}
+}

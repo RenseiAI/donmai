@@ -287,3 +287,122 @@ export function greetUser(name: string): string {
 		t.Errorf("function Line = %d, want 11", fn.Line)
 	}
 }
+
+// TestTypeScriptExtractor_FunctionEndLine pins body extents for the TS
+// function forms: function declarations, arrow functions, and function
+// expressions must carry EndLine (the 1-based closing-brace line) so
+// symbol-granular dedup can fingerprint them — before this, only classes and
+// interfaces got extents and symbol dedup was inert for every TS function.
+// Braces inside string literals and comments must not truncate the extent,
+// and bodyless overload signatures get no EndLine at all.
+//
+// RED (against the extents-only-for-classes extractor): every function
+// EndLine = nil.
+func TestTypeScriptExtractor_FunctionEndLine(t *testing.T) {
+	src := `export function greetUser(name: string): string {
+  const suffix = "}"
+  // } commented brace must not close the block
+  return name + suffix
+}
+
+const arrowFn = (name: string) => {
+  return name + ` + "`}${name}`" + `
+}
+
+const exprFn = function(name: string) {
+  return name
+}
+
+export function overloaded(name: string): string;
+export function overloaded(name: number): string;
+export function overloaded(name: unknown): string {
+  return String(name)
+}
+`
+	ast := (&TypeScriptExtractor{}).Extract(src, "fns.ts")
+
+	wantEnd := map[string]int{
+		"greetUser": 5,
+		"arrowFn":   9,
+		"exprFn":    13,
+	}
+	for name, want := range wantEnd {
+		sym := findSymbol(ast.Symbols, name, KindFunction)
+		if sym == nil {
+			t.Fatalf("missing function %s", name)
+		}
+		if sym.EndLine == nil {
+			t.Errorf("%s EndLine = nil, want %d (TS functions must carry body extents)", name, want)
+			continue
+		}
+		if *sym.EndLine != want {
+			t.Errorf("%s EndLine = %d, want %d", name, *sym.EndLine, want)
+		}
+	}
+
+	// Overload signatures (lines 15-16) are bodyless — no EndLine; the
+	// implementation (line 17) closes at line 19.
+	var sigs, impls []CodeSymbol
+	for _, s := range ast.Symbols {
+		if s.Name != "overloaded" {
+			continue
+		}
+		if s.Line == 17 {
+			impls = append(impls, s)
+		} else {
+			sigs = append(sigs, s)
+		}
+	}
+	if len(sigs) != 2 || len(impls) != 1 {
+		t.Fatalf("overloaded symbols: %d signatures + %d impls, want 2 + 1", len(sigs), len(impls))
+	}
+	for _, s := range sigs {
+		if s.EndLine != nil {
+			t.Errorf("overload signature at line %d has EndLine = %d, want nil (bodyless)", s.Line, *s.EndLine)
+		}
+	}
+	if impls[0].EndLine == nil || *impls[0].EndLine != 19 {
+		t.Errorf("overloaded impl EndLine = %v, want 19", impls[0].EndLine)
+	}
+}
+
+// TestTypeScriptExtractor_MethodEndLine pins extents for class methods (the
+// fourth TS function form) plus the string/comment-awareness of the class
+// extent itself.
+func TestTypeScriptExtractor_MethodEndLine(t *testing.T) {
+	src := `class Wrapper {
+  compute(a: number): number {
+    const brace = "}"
+    // } commented brace
+    return a
+  }
+  overloadSig(a: string): void;
+}
+`
+	ast := (&TypeScriptExtractor{}).Extract(src, "wrap.ts")
+	cls := findSymbol(ast.Symbols, "Wrapper", KindClass)
+	if cls == nil {
+		t.Fatal("missing class Wrapper")
+	}
+	if cls.EndLine == nil {
+		t.Error("class EndLine = nil, want 8")
+	} else if *cls.EndLine != 8 {
+		t.Errorf("class EndLine = %d, want 8 (the \"}\" string and // } comment must not truncate it)", *cls.EndLine)
+	}
+	m := findSymbol(ast.Symbols, "compute", KindMethod)
+	if m == nil {
+		t.Fatal("missing method compute")
+	}
+	if m.EndLine == nil {
+		t.Error("method compute EndLine = nil, want 6")
+	} else if *m.EndLine != 6 {
+		t.Errorf("method compute EndLine = %d, want 6", *m.EndLine)
+	}
+	sig := findSymbol(ast.Symbols, "overloadSig", KindMethod)
+	if sig == nil {
+		t.Fatal("missing method overloadSig")
+	}
+	if sig.EndLine != nil {
+		t.Errorf("bodyless method signature EndLine = %d, want nil", *sig.EndLine)
+	}
+}

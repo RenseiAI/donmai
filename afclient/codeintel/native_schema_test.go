@@ -144,6 +144,33 @@ func TestLoadIndex_V3IndexDiscarded(t *testing.T) {
 	}
 }
 
+// TestLoadIndex_V4IndexDiscarded pins the v4→v5 migration: a persisted index
+// written under schema v4 (extents from the naive brace counter) must be
+// discarded on load — v4 extents could be truncated by a '}' inside a string
+// literal or comment (wrong symbol fingerprints) and TS functions/methods
+// carried no extents at all (missing fingerprints), so stale v4 data must be
+// rebuilt with the string/comment-aware scanner.
+func TestLoadIndex_V4IndexDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	idxDir := filepath.Join(dir, ".donmai/code-index")
+	if err := os.MkdirAll(idxDir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	v4 := `{"version":4,"files":{"a.go":{"filePath":"a.go","gitHash":"abc","symbols":[{"name":"Foo","kind":"function","filePath":"a.go","line":9,"endLine":11}],"symbolHashes":[{"name":"Foo","line":9,"contentHash":"0011223344556677","simHash":1}],"lastIndexed":1}},"rootHash":"beef"}`
+	if err := os.WriteFile(filepath.Join(idxDir, "index.json"), []byte(v4), 0o640); err != nil { //nolint:gosec // G306 test fixture
+		t.Fatalf("write: %v", err)
+	}
+
+	nr := NewNativeRunner(dir)
+	loaded := nr.loadIndex()
+	if len(loaded.Files) != 0 {
+		t.Errorf("loaded %d files from a v4 index; want 0 — v4 extents (naive brace counting, no TS function extents) are wrong/missing and must be discarded+rebuilt", len(loaded.Files))
+	}
+	if loaded.Version != IndexSchemaVersion {
+		t.Errorf("discarded index Version = %d; want %d", loaded.Version, IndexSchemaVersion)
+	}
+}
+
 // TestIndexSchemaVersion_AtLeastV3 pins the version floor: v3 is the schema
 // bump that made persisted symbol line/endLine 1-based at the declaration
 // keyword (WS8). Regressing the constant below 3 would let stale 0-based line

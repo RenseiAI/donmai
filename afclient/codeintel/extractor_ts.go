@@ -82,7 +82,10 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 		if m := reFuncDecl.FindStringSubmatch(effective); m != nil {
 			name := m[1]
 			sig := extractSignatureTS(effective)
-			symbols = append(symbols, makeSymbolTS(name, KindFunction, filePath, i+1, isExported, sig, currentJSDoc, language, ""))
+			sym := makeSymbolTS(name, KindFunction, filePath, i+1, isExported, sig, currentJSDoc, language, "")
+			end, ok := findFuncExtentTS(lines, i, 0)
+			setEndLineTS(&sym, end, ok)
+			symbols = append(symbols, sym)
 			if isExported {
 				exports = append(exports, name)
 			}
@@ -98,7 +101,15 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 			if arrowIdx > 0 {
 				sig = strings.TrimSpace(effective[:arrowIdx])
 			}
-			symbols = append(symbols, makeSymbolTS(name, KindFunction, filePath, i+1, isExported, sig, currentJSDoc, language, ""))
+			sym := makeSymbolTS(name, KindFunction, filePath, i+1, isExported, sig, currentJSDoc, language, "")
+			// Scan for the body '{' AFTER the '=>' on the raw line so a
+			// destructured parameter's '{' is never taken for the body; an
+			// expression-body arrow (no '{') simply records no extent.
+			if rawArrow := strings.Index(line, "=>"); rawArrow >= 0 {
+				end, ok := findFuncExtentTS(lines, i, rawArrow+2)
+				setEndLineTS(&sym, end, ok)
+			}
+			symbols = append(symbols, sym)
 			if isExported {
 				exports = append(exports, name)
 			}
@@ -109,7 +120,10 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 		// const function expression.
 		if m := reFuncExpr.FindStringSubmatch(effective); m != nil {
 			name := m[1]
-			symbols = append(symbols, makeSymbolTS(name, KindFunction, filePath, i+1, isExported, "", currentJSDoc, language, ""))
+			sym := makeSymbolTS(name, KindFunction, filePath, i+1, isExported, "", currentJSDoc, language, "")
+			end, ok := findFuncExtentTS(lines, i, 0)
+			setEndLineTS(&sym, end, ok)
+			symbols = append(symbols, sym)
 			if isExported {
 				exports = append(exports, name)
 			}
@@ -234,7 +248,12 @@ func extractClassMembersTS(lines []string, startLine, endLine int, filePath, cla
 		if m := reClassMethod.FindStringSubmatch(trimmed); m != nil {
 			name := m[1]
 			if !isControlKeyword(name) {
-				out = append(out, makeSymbolTS(name, KindMethod, filePath, i+1, false, "", "", language, className))
+				sym := makeSymbolTS(name, KindMethod, filePath, i+1, false, "", "", language, className)
+				// Body extent; a bodyless overload signature (terminated by
+				// ';') records none.
+				end, ok := findFuncExtentTS(lines, i, 0)
+				setEndLineTS(&sym, end, ok)
+				out = append(out, sym)
 				continue
 			}
 		}
@@ -302,26 +321,37 @@ func extractSignatureTS(line string) string {
 
 // findBlockEndTS returns the line index of the closing brace that matches the
 // opening brace on or after startLine, or a capped estimate if not found.
+// Brace counting is string/comment-aware (scanBlockExtent), so a '}' inside a
+// string literal, template literal, or comment never closes the block early.
 func findBlockEndTS(lines []string, startLine int) int {
-	depth := 0
-	for i := startLine; i < len(lines); i++ {
-		for _, ch := range lines[i] {
-			if ch == '{' {
-				depth++
-			}
-			if ch == '}' {
-				depth--
-				if depth == 0 {
-					return i
-				}
-			}
-		}
+	if end, ok := scanBlockExtent(lines, startLine, scanTS, blockScanOpts{noLookaheadCap: true}); ok {
+		return end
 	}
 	end := startLine + 100
 	if end >= len(lines) {
 		end = len(lines) - 1
 	}
 	return end
+}
+
+// findFuncExtentTS returns the 0-based closing-brace line of the function
+// body opening on (or shortly after) startLine, scanning from startCol on
+// that line. ok=false for bodyless forms — overload signatures and declare
+// stubs (a code-context ';' terminates the declaration before any body '{')
+// and expression-body arrow functions — which get no extent rather than a
+// wrong one.
+func findFuncExtentTS(lines []string, startLine, startCol int) (int, bool) {
+	return scanBlockExtent(lines, startLine, scanTS, blockScanOpts{stopAtSemi: true, startCol: startCol})
+}
+
+// setEndLineTS stamps sym.EndLine (1-based, like Line) from a 0-based scan
+// result when the body was found.
+func setEndLineTS(sym *CodeSymbol, end int, ok bool) {
+	if !ok {
+		return
+	}
+	endLine1 := end + 1
+	sym.EndLine = &endLine1
 }
 
 // lineOffset returns the byte offset in the joined source string at which

@@ -212,12 +212,17 @@ func (d *DupStore) Store(id, content string) {
 const symbolHashMinLines = 3
 
 // ComputeSymbolHashes computes the symbol-granular dedup fingerprints for one
-// file's extracted symbols (schema v4). For each symbol with a known body
-// extent (EndLine set) spanning at least symbolHashMinLines lines, the body —
-// the declaration line through EndLine — is normalised with the SAME
-// normalization as whole-file dedup hashing (normalizeDupContent) and hashed
-// with xxHash64 (exact tier) + SimHash (near tier). Symbols without EndLine
-// (e.g. Python/Rust extractors don't emit body extents yet) are skipped and
+// file's extracted symbols. For each symbol with a known body extent (EndLine
+// set) spanning at least symbolHashMinLines lines, the body — the declaration
+// line through EndLine — is normalised with the SAME normalization as
+// whole-file dedup hashing (normalizeDupContent) and hashed with xxHash64
+// (exact tier) + SimHash (near tier).
+//
+// Extent coverage (schema v5): the Go extractor records extents for
+// functions/methods, and the TS extractor for classes, interfaces, functions
+// (declaration/arrow/expression forms), and class methods — all via the
+// string/comment-aware block scanner (blockscan.go). The Python and Rust
+// extractors do NOT emit body extents yet; their symbols are skipped here and
 // remain covered by whole-file hashing only.
 func ComputeSymbolHashes(content string, symbols []CodeSymbol) []SymbolDup {
 	if len(symbols) == 0 {

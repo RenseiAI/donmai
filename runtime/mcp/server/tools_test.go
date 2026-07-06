@@ -2,7 +2,10 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -74,5 +77,59 @@ func TestToolSurfaceWeight_Budget(t *testing.T) {
 	}
 	if combined > maxCombinedChars {
 		t.Errorf("combined tool surface weight = %d chars, budget %d", combined, maxCombinedChars)
+	}
+}
+
+// TestCheckDuplicate_MaxResultsForwarded proves the maxResults argument is
+// plumbed from the MCP tool call through to the dedup engine: against a
+// fixture where the same function exists in two files, maxResults=2 must
+// return BOTH duplicate sites in a ranked matches array (the default is the
+// single top match with no matches array at all).
+func TestCheckDuplicate_MaxResultsForwarded(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	fn := "func addNums(a int, b int) int {\n\tsum := a + b\n\treturn sum\n}\n"
+	for _, f := range []struct{ name, pkg string }{{"a.go", "a"}, {"b.go", "b"}} {
+		if err := os.WriteFile(filepath.Join(dir, f.name), []byte("package "+f.pkg+"\n\n"+fn), 0o600); err != nil {
+			t.Fatalf("write fixture %s: %v", f.name, err)
+		}
+	}
+	s := newTestServer(t, dir)
+
+	res, rerr := s.callTool(context.Background(), ToolCheckDuplicate,
+		json.RawMessage(`{"content":"func addNums(a int, b int) int {\n\tsum := a + b\n\treturn sum\n}","maxResults":2}`))
+	if rerr != nil {
+		t.Fatalf("check-duplicate protocol error: %v", rerr)
+	}
+	if res.IsError {
+		t.Fatalf("check-duplicate returned isError: %+v", res.Content)
+	}
+	if len(res.Content) != 1 || res.Content[0].Type != "text" {
+		t.Fatalf("want a single text content item, got %+v", res.Content)
+	}
+	var out struct {
+		MatchType string `json:"matchType"`
+		Matches   []struct {
+			FilePath   string `json:"filePath"`
+			SymbolName string `json:"symbolName"`
+			MatchType  string `json:"matchType"`
+		} `json:"matches"`
+	}
+	if err := json.Unmarshal([]byte(res.Content[0].Text), &out); err != nil {
+		t.Fatalf("decode result JSON: %v\n%s", err, res.Content[0].Text)
+	}
+	if out.MatchType != "exact" {
+		t.Fatalf("matchType = %q, want exact", out.MatchType)
+	}
+	if len(out.Matches) != 2 {
+		t.Fatalf("len(matches) = %d, want 2 (maxResults=2 must reach the engine)\n%s", len(out.Matches), res.Content[0].Text)
+	}
+	if out.Matches[0].FilePath != "a.go" || out.Matches[1].FilePath != "b.go" {
+		t.Errorf("match files = %s, %s; want a.go, b.go (deterministic order)", out.Matches[0].FilePath, out.Matches[1].FilePath)
+	}
+	for i, m := range out.Matches {
+		if m.SymbolName != "addNums" {
+			t.Errorf("matches[%d].symbolName = %q, want addNums", i, m.SymbolName)
+		}
 	}
 }

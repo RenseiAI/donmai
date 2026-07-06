@@ -238,6 +238,17 @@ func TestCodeCheckDuplicate_WithContent(t *testing.T) {
 	}
 }
 
+func TestCodeCheckDuplicate_WithMaxResults(t *testing.T) {
+	m, err := execCodeCmd(t, "check-duplicate", "--content", "function hello() {}", "--max-results", "2")
+	if err != nil {
+		t.Fatalf("check-duplicate --max-results: %v", err)
+	}
+	argv, _ := m["argv"].(string)
+	if !strings.Contains(argv, "--max-results") || !strings.Contains(argv, "2") {
+		t.Errorf("argv %q missing --max-results 2", argv)
+	}
+}
+
 func TestCodeCheckDuplicate_ContentAndFileMutuallyExclusive(t *testing.T) {
 	fakeCodeBin(t)
 	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
