@@ -348,54 +348,89 @@ func TestRunGitEnvContainsIdentityOverrides(t *testing.T) {
 	}
 }
 
-// TestRunBackstop_CommitUsesSessionIdentity confirms that a backstop
-// commit carries the agent-session author/committer identity derived
-// from QueuedWork (via buildSessionEnv), not the stale inherited env.
-// Regression test for the NO-OP: previously runGit set cmd.Env =
-// os.Environ() with no identity appended, so the commit used whatever
-// git config / inherited env happened to be present.
-func TestRunBackstop_CommitUsesSessionIdentity(t *testing.T) {
+// unsetGitIdentityEnv clears the GIT_AUTHOR_*/GIT_COMMITTER_* process env for
+// the duration of the test so buildSessionEnv exercises its session-derived
+// fallback. t.Setenv cannot unset a var, so we save + restore manually.
+func unsetGitIdentityEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+		"GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+	} {
+		if orig, ok := os.LookupEnv(k); ok {
+			t.Cleanup(func() { _ = os.Setenv(k, orig) })
+		} else {
+			t.Cleanup(func() { _ = os.Unsetenv(k) })
+		}
+		_ = os.Unsetenv(k)
+	}
+}
+
+// TestRunBackstop_CommitIdentity confirms the backstop commit's author/committer
+// is single-sourced through buildSessionEnv (rank 15f): a provisioner-supplied
+// GIT_AUTHOR_*/GIT_COMMITTER_* identity — the canonical "Rensei Agent" the cloud
+// box stamps into the env — is HONORED so backstop commits match the agent's
+// own in-box commits; absent one, the session-derived "Donmai Agent (<issue>)"
+// default is used. runGit appends the chosen identity AFTER os.Environ() so it
+// wins for the commit subprocess (regression test for the earlier NO-OP where
+// cmd.Env = os.Environ() appended no identity at all).
+func TestRunBackstop_CommitIdentity(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
 	}
 
-	// Poison the inherited process env with a stale identity so a
-	// regression would produce a wrong author on the commit.
-	t.Setenv("GIT_AUTHOR_NAME", "Stale Process Env")
-	t.Setenv("GIT_AUTHOR_EMAIL", "stale@example.com")
-	t.Setenv("GIT_COMMITTER_NAME", "Stale Process Env")
-	t.Setenv("GIT_COMMITTER_EMAIL", "stale@example.com")
+	commitAuthor := func(t *testing.T) string {
+		t.Helper()
+		repo := t.TempDir()
+		gitInit(t, repo)
+		writeFile(t, repo, "fix.go", "package fix\n")
+		checkout(t, repo, "feature/session-identity")
 
-	repo := t.TempDir()
-	gitInit(t, repo)
-	writeFile(t, repo, "fix.go", "package fix\n")
-	checkout(t, repo, "feature/session-identity")
+		qw := QueuedWork{QueuedWork: queuedWorkBase("ENG-42")}
+		r := minimalRunner(t)
+		res := &Result{}
+		res.WorktreePath = repo
 
-	qw := QueuedWork{QueuedWork: queuedWorkBase("ENG-42")}
-	r := minimalRunner(t)
-	res := &Result{}
-	res.WorktreePath = repo
+		// runBackstop stages + commits fix.go then fails on push (no remote).
+		r.runBackstop(context.Background(), qw, "feature/session-identity", res)
 
-	// runBackstop will stage + commit fix.go then fail on push (no remote).
-	r.runBackstop(context.Background(), qw, "feature/session-identity", res)
+		authorOut, err := runGit(context.Background(), repo, gitIdentity{}, "log", "-1", "--pretty=format:%an <%ae>")
+		if err != nil {
+			t.Fatalf("git log: %v", err)
+		}
+		return authorOut
+	}
 
-	// Inspect the commit author the backstop wrote.
-	authorOut, err := runGit(context.Background(), repo, gitIdentity{}, "log", "-1", "--pretty=format:%an <%ae>")
-	if err != nil {
-		t.Fatalf("git log: %v", err)
-	}
-	// buildSessionEnv produces "Donmai Agent (ENG-42)" + "agent+test-session-ENG-42@donmai.dev"
-	wantName := "Donmai Agent (ENG-42)"
-	wantEmail := "agent+test-session-ENG-42@donmai.dev"
-	if !strings.Contains(authorOut, wantName) {
-		t.Errorf("commit author = %q; want name %q", authorOut, wantName)
-	}
-	if !strings.Contains(authorOut, wantEmail) {
-		t.Errorf("commit author = %q; want email %q", authorOut, wantEmail)
-	}
-	if strings.Contains(authorOut, "Stale Process Env") {
-		t.Errorf("commit author = %q; stale inherited identity leaked", authorOut)
-	}
+	t.Run("honors provisioner-supplied identity", func(t *testing.T) {
+		// The cloud box provisioner stamps this into the env.
+		t.Setenv("GIT_AUTHOR_NAME", "Rensei Agent")
+		t.Setenv("GIT_AUTHOR_EMAIL", "agent@rensei.dev")
+		t.Setenv("GIT_COMMITTER_NAME", "Rensei Agent")
+		t.Setenv("GIT_COMMITTER_EMAIL", "agent@rensei.dev")
+
+		authorOut := commitAuthor(t)
+		if !strings.Contains(authorOut, "Rensei Agent") || !strings.Contains(authorOut, "agent@rensei.dev") {
+			t.Errorf("commit author = %q; want provisioner identity \"Rensei Agent <agent@rensei.dev>\"", authorOut)
+		}
+		if strings.Contains(authorOut, "Donmai Agent") {
+			t.Errorf("commit author = %q; provisioner identity should win over the session default", authorOut)
+		}
+	})
+
+	t.Run("falls back to session default when unset", func(t *testing.T) {
+		unsetGitIdentityEnv(t)
+
+		authorOut := commitAuthor(t)
+		// buildSessionEnv produces "Donmai Agent (ENG-42)" + "agent+test-session-ENG-42@donmai.dev".
+		wantName := "Donmai Agent (ENG-42)"
+		wantEmail := "agent+test-session-ENG-42@donmai.dev"
+		if !strings.Contains(authorOut, wantName) {
+			t.Errorf("commit author = %q; want name %q", authorOut, wantName)
+		}
+		if !strings.Contains(authorOut, wantEmail) {
+			t.Errorf("commit author = %q; want email %q", authorOut, wantEmail)
+		}
+	})
 }
 
 // TestRunBackstop_RefusesMain ensures the backstop refuses to push

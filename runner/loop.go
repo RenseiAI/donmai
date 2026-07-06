@@ -1423,14 +1423,32 @@ func envToMap(in []string) map[string]string {
 	return out
 }
 
+// envOrDefault returns the process env value for key when it is set and
+// non-empty, otherwise def. Used to let a provisioner-stamped value win over
+// a locally-derived fallback.
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 // buildSessionEnv collects the per-session env entries every agent
 // session needs. Mirrors the legacy TS LINEAR_* + DONMAI_* keys.
 //
-// GIT_AUTHOR_*/GIT_COMMITTER_* are set so backstop commits (and any
-// commits made by the agent) carry a traceable author identity rather
-// than whatever the git global config happens to contain inside the
-// cloud sandbox or local worktree. The session id is the "email" so
-// every commit is unambiguously linked to the originating session.
+// GIT_AUTHOR_*/GIT_COMMITTER_* give backstop commits (and any commits made by
+// the agent) a traceable author identity rather than whatever the git global
+// config happens to contain inside the cloud sandbox or local worktree.
+//
+// Single-source precedence: a provisioner-stamped identity wins. The cloud box
+// provisioner injects the canonical "Rensei Agent" GIT_AUTHOR_*/GIT_COMMITTER_*
+// into the box env; when present it is authoritative here, so the runner's
+// backstop commits carry the SAME identity as the agent's own in-box commits
+// instead of overriding them with a divergent "Donmai Agent" persona. Absent a
+// provisioner value (standalone / local worktree), fall back to a
+// session-derived default: the issue identifier as the display name and the
+// session id as the email so every commit is unambiguously linked to its
+// originating session.
 func buildSessionEnv(qw QueuedWork) map[string]string {
 	// Derive a stable display name: prefer the issue identifier, fall back
 	// to a shortened session id prefix.
@@ -1440,16 +1458,24 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	}
 	gitEmail := "agent+" + qw.SessionID + "@donmai.dev"
 
+	// Honor a provisioner-supplied identity when set; committer defaults to the
+	// resolved author (matching git's own convention) when only GIT_AUTHOR_* is
+	// stamped, so the four values never diverge.
+	authorName := envOrDefault("GIT_AUTHOR_NAME", gitName)
+	authorEmail := envOrDefault("GIT_AUTHOR_EMAIL", gitEmail)
+	committerName := envOrDefault("GIT_COMMITTER_NAME", authorName)
+	committerEmail := envOrDefault("GIT_COMMITTER_EMAIL", authorEmail)
+
 	envMap := map[string]string{
 		"DONMAI_SESSION_ID": qw.SessionID,
 		"LINEAR_SESSION_ID": qw.SessionID,
-		// Git identity — pins author/committer to the session so backstop
-		// commits and agent-authored commits are attributable even in
+		// Git identity — provisioner-stamped when present, else pinned to the
+		// session so backstop and agent commits are attributable even in
 		// sandboxes whose git global config is empty or wrong.
-		"GIT_AUTHOR_NAME":     gitName,
-		"GIT_AUTHOR_EMAIL":    gitEmail,
-		"GIT_COMMITTER_NAME":  gitName,
-		"GIT_COMMITTER_EMAIL": gitEmail,
+		"GIT_AUTHOR_NAME":     authorName,
+		"GIT_AUTHOR_EMAIL":    authorEmail,
+		"GIT_COMMITTER_NAME":  committerName,
+		"GIT_COMMITTER_EMAIL": committerEmail,
 	}
 	if qw.IssueID != "" {
 		envMap["LINEAR_ISSUE_ID"] = qw.IssueID
