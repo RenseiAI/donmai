@@ -213,9 +213,21 @@ func TestProvider_Spawn_FakeCLI_StreamJSON(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
-	h, err := p.Spawn(ctx, agent.Spec{Prompt: "say hello"})
-	if err != nil {
-		t.Fatalf("Spawn: unexpected error: %v", err)
+	// Retry briefly on ETXTBSY: the fake amp script is written by this test
+	// binary moments before exec, and a concurrently forking sibling test can
+	// inherit the not-yet-closed write fd (golang.org/issue/22315). The race is
+	// fixture-specific, so the retry lives in the test, not the provider.
+	var h agent.Handle
+	var err error
+	for attempt := 0; ; attempt++ {
+		h, err = p.Spawn(ctx, agent.Spec{Prompt: "say hello"})
+		if err == nil {
+			break
+		}
+		if attempt >= 3 || !strings.Contains(err.Error(), "text file busy") {
+			t.Fatalf("Spawn: unexpected error: %v", err)
+		}
+		time.Sleep(time.Duration(25*(attempt+1)) * time.Millisecond)
 	}
 	if h == nil {
 		t.Fatal("Spawn: returned nil handle")

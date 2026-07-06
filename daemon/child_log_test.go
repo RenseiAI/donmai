@@ -159,13 +159,15 @@ func TestSpawner_DefaultsChildOutputToSlog(t *testing.T) {
 }
 
 // waitSlogRecords polls buf until it contains an INFO stdout record and a WARN
-// stderr record for sessionID, or the 10s deadline elapses. It wakes on each
+// stderr record for sessionID, or the deadline elapses. It wakes on each
 // Write to buf (via syncBuffer.notify) rather than sleeping a fixed interval,
 // so green runs return as soon as the pump goroutines flush — regardless of
-// scheduler load.
+// scheduler load. The deadline is a liveness backstop only (green runs return
+// in milliseconds); 30s matches the amp harness convention after a loaded CI
+// runner burned through the previous 10s (2026-07-06, run 28821240724).
 func waitSlogRecords(t *testing.T, buf *syncBuffer, sessionID string) ([]slogRecord, bool, bool) {
 	t.Helper()
-	const deadline = 10 * time.Second
+	const deadline = 30 * time.Second
 	timer := time.NewTimer(deadline)
 	defer timer.Stop()
 
