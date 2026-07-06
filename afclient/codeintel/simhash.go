@@ -17,6 +17,7 @@ package codeintel
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -113,11 +114,28 @@ type DupEntry struct {
 }
 
 // DupResult is the result of a CheckDuplicate call.
+//
+// The v4 additions (FilePath, SymbolName, Line) carry symbol-granular match
+// identity; existing fields keep their v2 names and meaning (ExistingID stays
+// the matched file's path) so JSON consumers of the old shape keep working.
 type DupResult struct {
 	IsDuplicate     bool   `json:"isDuplicate"`
 	MatchType       string `json:"matchType"`       // "exact", "near", "none"
-	ExistingID      string `json:"existingId"`      // set when IsDuplicate=true
+	ExistingID      string `json:"existingId"`      // set when IsDuplicate=true; the matched file path
 	HammingDistance int    `json:"hammingDistance"` // set when MatchType=="near"
+	FilePath        string `json:"filePath,omitempty"`
+	SymbolName      string `json:"symbolName,omitempty"` // set on a symbol-granular match
+	Line            int    `json:"line,omitempty"`       // 1-based declaration line of the matched symbol
+}
+
+// DupMatch is one ranked duplicate site returned by FindDuplicateMatches.
+// SymbolName/Line are zero for a file-level match.
+type DupMatch struct {
+	FilePath        string `json:"filePath"`
+	SymbolName      string `json:"symbolName,omitempty"`
+	Line            int    `json:"line,omitempty"`
+	MatchType       string `json:"matchType"` // "exact" or "near"
+	HammingDistance int    `json:"hammingDistance,omitempty"`
 }
 
 // DupStore is an in-memory content deduplication store.
@@ -186,59 +204,172 @@ func (d *DupStore) Store(id, content string) {
 	})
 }
 
-// CheckDuplicateContent performs a stateless duplicate check of content against
-// the REAL file content captured in the persisted index (schema v2). It is a
-// two-tier check that mirrors the TS DedupPipeline, but over actual file content
-// rather than serialized symbol text:
+// symbolHashMinLines is the minimum body extent (declaration line through
+// EndLine, inclusive) for a symbol to get its own dedup fingerprint. Shorter
+// symbols are too token-poor for SimHash to discriminate (false-positive
+// risk) and hashing every one-liner would bloat the index; whole-file hashing
+// still covers them.
+const symbolHashMinLines = 3
+
+// ComputeSymbolHashes computes the symbol-granular dedup fingerprints for one
+// file's extracted symbols (schema v4). For each symbol with a known body
+// extent (EndLine set) spanning at least symbolHashMinLines lines, the body —
+// the declaration line through EndLine — is normalised with the SAME
+// normalization as whole-file dedup hashing (normalizeDupContent) and hashed
+// with xxHash64 (exact tier) + SimHash (near tier). Symbols without EndLine
+// (e.g. Python/Rust extractors don't emit body extents yet) are skipped and
+// remain covered by whole-file hashing only.
+func ComputeSymbolHashes(content string, symbols []CodeSymbol) []SymbolDup {
+	if len(symbols) == 0 {
+		return nil
+	}
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	var out []SymbolDup
+	for _, s := range symbols {
+		if s.EndLine == nil {
+			continue
+		}
+		start, end := s.Line, *s.EndLine
+		if start < 1 || end > len(lines) || end-start+1 < symbolHashMinLines {
+			continue
+		}
+		normalized := normalizeDupContent(strings.Join(lines[start-1:end], "\n"))
+		if normalized == "" {
+			continue
+		}
+		out = append(out, SymbolDup{
+			Name:        s.Name,
+			Line:        s.Line,
+			ContentHash: ContentXXHash64(normalized),
+			SimHash:     SimHashCompute(normalized),
+		})
+	}
+	return out
+}
+
+// FindDuplicateMatches performs a stateless duplicate check of content against
+// BOTH the file-level and symbol-level fingerprints captured in the persisted
+// index (schema v4), returning up to maxResults ranked duplicate sites.
 //
-//   - Tier 1 (exact): the query's normalised-content xxHash64 is compared
-//     against each file's persisted ContentHash (also the xxHash64 of that
-//     file's normalised content, computed at index time). A byte-identical copy
-//     of an indexed file therefore hashes equal and is flagged exact-dup.
-//   - Tier 2 (near): the query's SimHash fingerprint is compared against each
-//     file's persisted SimHash (computed over the same normalised content) using
-//     Hamming distance; within threshold ⇒ near-dup.
+// Two tiers at two granularities:
 //
-// Files lacking both content fields (e.g. a pre-v2 entry, or a file that failed
-// to hash) are skipped rather than producing a spurious match.
+//   - Exact: the query's normalised-content xxHash64 is compared against each
+//     file's persisted ContentHash (whole-file paste) and each symbol's
+//     persisted ContentHash (function/type paste buried in a larger file).
+//   - Near: the query's SimHash fingerprint is compared against the persisted
+//     file-level and symbol-level SimHashes using Hamming distance; within
+//     threshold ⇒ near-dup.
+//
+// Ranking: exact before near; within a tier, a symbol-level match wins over a
+// file-level one (it pinpoints the duplicate — the agent needs no grep
+// follow-up); near matches order by ascending Hamming distance; remaining ties
+// break on (filePath, line) for determinism. Entries lacking fingerprints
+// (pre-v4 or failed-to-hash) are skipped rather than producing spurious
+// matches. maxResults <= 0 means 1.
+func FindDuplicateMatches(content string, index []FileIndex, threshold, maxResults int) []DupMatch {
+	if maxResults <= 0 {
+		maxResults = 1
+	}
+	normalized := normalizeDupContent(content)
+	contentHash := ContentXXHash64(normalized)
+	contentFP := SimHashCompute(normalized)
+
+	type candidate struct {
+		match DupMatch
+		tier  int // 0 sym-exact, 1 file-exact, 2 sym-near, 3 file-near
+	}
+	var cands []candidate
+
+	for _, fi := range index {
+		for _, sh := range fi.SymbolHashes {
+			if sh.ContentHash == "" {
+				continue
+			}
+			if sh.ContentHash == contentHash {
+				cands = append(cands, candidate{tier: 0, match: DupMatch{
+					FilePath: fi.FilePath, SymbolName: sh.Name, Line: sh.Line, MatchType: "exact",
+				}})
+				continue
+			}
+			if sh.SimHash == 0 {
+				continue
+			}
+			if dist := SimHashHammingDistance(contentFP, sh.SimHash); dist <= threshold {
+				cands = append(cands, candidate{tier: 2, match: DupMatch{
+					FilePath: fi.FilePath, SymbolName: sh.Name, Line: sh.Line,
+					MatchType: "near", HammingDistance: dist,
+				}})
+			}
+		}
+		if fi.ContentHash == "" {
+			continue // no real-content fingerprint to compare against
+		}
+		if fi.ContentHash == contentHash {
+			cands = append(cands, candidate{tier: 1, match: DupMatch{
+				FilePath: fi.FilePath, MatchType: "exact",
+			}})
+			continue
+		}
+		if fi.SimHash == 0 {
+			continue
+		}
+		if dist := SimHashHammingDistance(contentFP, fi.SimHash); dist <= threshold {
+			cands = append(cands, candidate{tier: 3, match: DupMatch{
+				FilePath: fi.FilePath, MatchType: "near", HammingDistance: dist,
+			}})
+		}
+	}
+
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if a.tier != b.tier {
+			return a.tier < b.tier
+		}
+		if a.match.HammingDistance != b.match.HammingDistance {
+			return a.match.HammingDistance < b.match.HammingDistance
+		}
+		if a.match.FilePath != b.match.FilePath {
+			return a.match.FilePath < b.match.FilePath
+		}
+		return a.match.Line < b.match.Line
+	})
+
+	if maxResults > len(cands) {
+		maxResults = len(cands)
+	}
+	out := make([]DupMatch, 0, maxResults)
+	for _, c := range cands[:maxResults] {
+		out = append(out, c.match)
+	}
+	return out
+}
+
+// CheckDuplicateContent performs a stateless duplicate check of content
+// against the persisted index and returns the single top match as a
+// DupResult. Since schema v4 the comparison spans both file-level and
+// symbol-level fingerprints (see FindDuplicateMatches for tiers and ranking);
+// a symbol-level match carries SymbolName/Line so the caller can point at the
+// exact duplicate site inside a larger file.
 //
 // Parameters:
 //   - content is the content to check.
 //   - index is the list of FileIndex entries (from the persisted index.json).
 //   - threshold is the SimHash Hamming-distance threshold.
 func CheckDuplicateContent(content string, index []FileIndex, threshold int) DupResult {
-	normalized := normalizeDupContent(content)
-	contentHash := ContentXXHash64(normalized)
-	contentFP := SimHashCompute(normalized)
-
-	// Tier 1: exact match against persisted content hashes.
-	for _, fi := range index {
-		if fi.ContentHash != "" && fi.ContentHash == contentHash {
-			return DupResult{
-				IsDuplicate: true,
-				MatchType:   "exact",
-				ExistingID:  fi.FilePath,
-			}
-		}
+	matches := FindDuplicateMatches(content, index, threshold, 1)
+	if len(matches) == 0 {
+		return DupResult{MatchType: "none"}
 	}
-
-	// Tier 2: near match against persisted content fingerprints.
-	for _, fi := range index {
-		if fi.ContentHash == "" || fi.SimHash == 0 {
-			continue // no real-content fingerprint to compare against
-		}
-		dist := SimHashHammingDistance(contentFP, fi.SimHash)
-		if dist <= threshold {
-			return DupResult{
-				IsDuplicate:     true,
-				MatchType:       "near",
-				ExistingID:      fi.FilePath,
-				HammingDistance: dist,
-			}
-		}
+	m := matches[0]
+	return DupResult{
+		IsDuplicate:     true,
+		MatchType:       m.MatchType,
+		ExistingID:      m.FilePath,
+		HammingDistance: m.HammingDistance,
+		FilePath:        m.FilePath,
+		SymbolName:      m.SymbolName,
+		Line:            m.Line,
 	}
-
-	return DupResult{MatchType: "none"}
 }
 
 // ── Compiled regexps ──────────────────────────────────────────────────────────

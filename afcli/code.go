@@ -239,12 +239,15 @@ func newCodeCheckDuplicateCmd(bin string, repoPath *string) *cobra.Command {
 	var (
 		content     string
 		contentFile string
+		maxResults  int
 	)
 
 	cmd := &cobra.Command{
 		Use:   "check-duplicate",
 		Short: "Check if content is a duplicate using xxHash64 and SimHash",
-		Long: `Checks content for exact duplicates (xxHash64) and near-duplicates (SimHash).
+		Long: `Checks content for exact duplicates (xxHash64) and near-duplicates (SimHash),
+at both file and symbol granularity: a function pasted from inside a larger
+indexed file is matched to that symbol (filePath + symbolName + line).
 
 Exactly one of --content or --content-file must be provided.
 
@@ -265,6 +268,7 @@ Examples:
 			out, err := r.CheckDuplicate(codeintel.CheckDuplicateOptions{
 				Content:     content,
 				ContentFile: contentFile,
+				MaxResults:  maxResults,
 			})
 			if err != nil {
 				return fmt.Errorf("check-duplicate: %w", err)
@@ -275,6 +279,7 @@ Examples:
 
 	cmd.Flags().StringVar(&content, "content", "", "Content to check for duplicates (inline)")
 	cmd.Flags().StringVar(&contentFile, "content-file", "", "Path to file containing content to check")
+	cmd.Flags().IntVar(&maxResults, "max-results", 0, "Duplicate sites to return (0 = top match only)")
 	cmd.MarkFlagsOneRequired("content", "content-file")
 	cmd.MarkFlagsMutuallyExclusive("content", "content-file")
 

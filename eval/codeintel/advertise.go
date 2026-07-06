@@ -201,7 +201,8 @@ func (a mcpAdvertisement) Apply(_ context.Context, donmaiBin, workarea, repoPath
 	}
 	if in["af_code_check_duplicate"] {
 		b.WriteString("- Checking whether code like this already exists (exact or near-duplicate): call " +
-			fqName("af_code_check_duplicate") + " with the candidate snippet.\n")
+			fqName("af_code_check_duplicate") + " with the candidate snippet. A match names the file, " +
+			"symbol, and line — trust it; a matchType of \"none\" means no duplicate. Do not re-verify with grep.\n")
 	}
 	if in["af_code_search_symbols"] && in["af_code_search_code"] {
 		b.WriteString("- Searching by name or concept across the codebase: " + fqName("af_code_search_symbols") +

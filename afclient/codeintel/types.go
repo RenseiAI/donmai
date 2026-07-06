@@ -7,15 +7,16 @@
 // .donmai/code-index/index.json.  No external binary is required for these
 // subcommands.
 //
-// # index.json schema (Go-authoritative, v2)
+// # index.json schema (Go-authoritative, v4)
 //
 // The Go engine now OWNS this schema. Byte-compatibility with the legacy
 // TypeScript code-intelligence IncrementalIndexer.save() output has been
 // DELIBERATELY DROPPED: donmai-libraries is being deprecated, so the schema is
 // free to evolve for the Go engine's needs (real import graph, content-based
-// dedup) without a cross-repo sync constraint. The persisted shape is:
+// dedup at file AND symbol granularity) without a cross-repo sync constraint.
+// The persisted shape is:
 //
-//	{ "version": 2, "files": { "<filePath>": FileIndex }, "rootHash": "<hash>" }
+//	{ "version": 4, "files": { "<filePath>": FileIndex }, "rootHash": "<hash>" }
 //
 // The top-level "version" field is authoritative: on load, a missing or older
 // version causes the whole index to be discarded and rebuilt from scratch (see
@@ -23,7 +24,8 @@
 // half-migration. FileIndex.gitHash uses git-blob SHA1
 // (sha1("blob <size>\0<content>")) as the change-detection / Merkle key;
 // contentHash + simHash are content-identity fields for real dedup;
-// imports/exports feed the PageRank import graph.
+// symbolHashes carry the same pair per extracted symbol body (v4,
+// symbol-granular dedup); imports/exports feed the PageRank import graph.
 //
 // # Exec-shim fallback
 //
@@ -109,8 +111,9 @@ type FileAST struct {
 //   - Imports/Exports are the module specifiers / exported names extracted from
 //     the file; Imports feed the PageRank import graph (import_graph.go).
 //
-// ContentHash/SimHash/Imports/Exports are computed only when a file is actually
-// (re)extracted, so they cost nothing on the incremental hash-match fast path.
+// ContentHash/SimHash/Imports/Exports/SymbolHashes are computed only when a
+// file is actually (re)extracted, so they cost nothing on the incremental
+// hash-match fast path.
 type FileIndex struct {
 	FilePath    string       `json:"filePath"`
 	GitHash     string       `json:"gitHash"`
@@ -119,7 +122,24 @@ type FileIndex struct {
 	Symbols     []CodeSymbol `json:"symbols"`
 	Imports     []string     `json:"imports,omitempty"`
 	Exports     []string     `json:"exports,omitempty"`
-	LastIndexed int64        `json:"lastIndexed"` // Unix ms
+	// SymbolHashes are the symbol-granular dedup fingerprints (schema v4).
+	// One entry per extracted symbol that has a known body extent (EndLine)
+	// spanning at least symbolHashMinLines lines; hashed over the symbol's
+	// normalised body with the same normalization as ContentHash/SimHash.
+	SymbolHashes []SymbolDup `json:"symbolHashes,omitempty"`
+	LastIndexed  int64       `json:"lastIndexed"` // Unix ms
+}
+
+// SymbolDup is the per-symbol dedup fingerprint persisted in index.json
+// (schema v4). ContentHash is the xxHash64 of the symbol's normalised body
+// (declaration line through EndLine); SimHash is the Charikar fingerprint of
+// the same text. Line is the 1-based declaration line, matching
+// CodeSymbol.Line.
+type SymbolDup struct {
+	Name        string `json:"name"`
+	Line        int    `json:"line"`
+	ContentHash string `json:"contentHash"`
+	SimHash     uint64 `json:"simHash,omitempty"`
 }
 
 // IndexMetadata is the top-level metadata block persisted to index.json.

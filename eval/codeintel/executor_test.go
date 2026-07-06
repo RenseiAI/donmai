@@ -140,6 +140,42 @@ func TestDedupSnippetExtraction(t *testing.T) {
 	}
 }
 
+// TestDedupAnswerFromResult_Shapes pins the parser over every check-duplicate
+// result shape the WITH arm can see:
+//
+//   - the v4 symbol-granular shape (filePath + symbolName + line) — the answer
+//     must carry the file AND the symbol site so the dedup grader's
+//     file-mention check passes with no grep follow-up;
+//   - the flat v2 native shape (existingId only) — the file must still be
+//     named (previously this shape yielded "duplicate of ." and failed the
+//     grader, forcing the both-costs grep);
+//   - the legacy TS shape (match.filePath / duplicates[]);
+//   - the negative shape.
+func TestDedupAnswerFromResult_Shapes(t *testing.T) {
+	v4 := `{"isDuplicate":true,"matchType":"exact","existingId":"big.go","hammingDistance":0,"filePath":"big.go","symbolName":"computeRollingChecksum","line":42}`
+	got := dedupAnswerFromResult(v4)
+	for _, want := range []string{"big.go", "computeRollingChecksum", "42"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("v4 shape answer %q missing %q", got, want)
+		}
+	}
+
+	v2 := `{"isDuplicate":true,"matchType":"near","existingId":"records.go","hammingDistance":1}`
+	if got := dedupAnswerFromResult(v2); !strings.Contains(got, "records.go") {
+		t.Errorf("flat v2 shape answer %q does not name records.go", got)
+	}
+
+	legacy := `{"isDuplicate":true,"match":{"filePath":"x.ts"}}`
+	if got := dedupAnswerFromResult(legacy); !strings.Contains(got, "x.ts") {
+		t.Errorf("legacy TS shape answer %q does not name x.ts", got)
+	}
+
+	neg := `{"isDuplicate":false,"matchType":"none","existingId":"","hammingDistance":0}`
+	if got := dedupAnswerFromResult(neg); !strings.Contains(strings.ToLower(got), "not a duplicate") {
+		t.Errorf("negative shape answer %q is not a NOT-a-duplicate verdict", got)
+	}
+}
+
 // TestResultParsers_TolerateTruncationSentinel pins the F1 wire contract: the
 // exact-match short-circuit may APPEND a sentinel element
 // {"truncatedExactMatches": n, "hint": …} to a search-symbols result. The
