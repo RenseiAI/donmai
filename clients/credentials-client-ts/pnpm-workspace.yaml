@@ -1,0 +1,18 @@
+# pnpm 11 reads overrides / build-allow settings from here (the package.json
+# "pnpm" field is ignored). This package is not a workspace root; the file
+# exists solely to carry the security overrides below.
+
+# esbuild ships a native binary via its install script; allow it to run.
+allowBuilds:
+  esbuild: true
+
+# Security: force minimum versions for DEV-only transitive deps with known CVEs.
+# These deps enter via vitest; there are no direct vite/esbuild dependencies.
+overrides:
+  # HIGH + 2 MEDIUM: vite dev-server path traversal / fs.deny bypass - fixed in 6.4.3.
+  # Pinned to the ^6 line to stay within vitest@3.2.6's vite peer range (^5 || ^6 || ^7);
+  # a jump to 7.x/8.x would break vitest's peer contract.
+  vite: '^6.4.3'
+  # MEDIUM: esbuild dev-server enables any website to send requests and read the
+  # response - fixed in 0.25.0. Transitive via vite/vitest (dev-only, not in any bundle).
+  esbuild: '^0.25.0'
