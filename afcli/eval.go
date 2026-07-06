@@ -35,6 +35,7 @@ type evalCodeIntelOpts struct {
 	dry          bool
 	executor     string
 	advertise    string
+	advertiseAll bool
 	benchmarkDir string
 	donmaiBin    string
 	repoRoots    []string
@@ -96,6 +97,7 @@ Examples:
 	f.BoolVar(&opts.dry, "dry", false, "Dump the WITH/WITHOUT transcripts for the first task (works with any executor)")
 	f.StringVar(&opts.executor, "executor", "plumbing", "Arm executor: plumbing (default, hermetic no-LLM) or claude (live claude CLI)")
 	f.StringVar(&opts.advertise, "advertise", "mcp", "WITH-arm advertisement mechanism: mcp (default) or prompt-help")
+	f.BoolVar(&opts.advertiseAll, "advertise-all-tools", false, "Advertise all six af_code_* tools (default: the family-conditional core subset)")
 	f.StringVar(&opts.benchmarkDir, "benchmark-dir", "", "Benchmark JSONL dir (default: afclient/codeintel/testdata/eval-benchmark under the git root)")
 	f.StringVar(&opts.donmaiBin, "donmai-bin", "", "Path to the donmai binary the WITH arm uses (default: this executable)")
 	f.StringArrayVar(&opts.repoRoots, "repo-root", nil, "Repo clone source as slug=path (e.g. RenseiAI/donmai=/path/to/donmai); repeatable")
@@ -162,18 +164,19 @@ func runEvalCodeIntel(cmd *cobra.Command, opts *evalCodeIntelOpts) error {
 	}
 
 	driver, err := eval.NewDriver(eval.Config{
-		Trials:        opts.trials,
-		Advertise:     advertise,
-		DonmaiBin:     donmaiBin,
-		RepoRoots:     repoRoots,
-		Budget:        eval.Budget{MaxTurns: opts.maxTurns, MaxTokens: opts.maxTokens},
-		Executor:      executor,
-		Bridge:        bridge,
-		OrgID:         opts.orgID,
-		ProjectID:     opts.projectID,
-		DatasetID:     opts.datasetID,
-		DatasetName:   opts.datasetName,
-		KeepWorkareas: opts.keepWA,
+		Trials:            opts.trials,
+		Advertise:         advertise,
+		AdvertiseAllTools: opts.advertiseAll,
+		DonmaiBin:         donmaiBin,
+		RepoRoots:         repoRoots,
+		Budget:            eval.Budget{MaxTurns: opts.maxTurns, MaxTokens: opts.maxTokens},
+		Executor:          executor,
+		Bridge:            bridge,
+		OrgID:             opts.orgID,
+		ProjectID:         opts.projectID,
+		DatasetID:         opts.datasetID,
+		DatasetName:       opts.datasetName,
+		KeepWorkareas:     opts.keepWA,
 		Logf: func(format string, args ...any) {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[eval] "+format+"\n", args...)
 		},
