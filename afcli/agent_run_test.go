@@ -989,7 +989,7 @@ func TestPostSessionRunning_NoTokenNoAuthHeader(t *testing.T) {
 
 // TestPostSessionRunning_Non2xxIsSwallowed verifies a platform error status
 // never panics or surfaces — the nudge is best-effort observability.
-func TestPostSessionRunning_Non2xxIsSwallowed(t *testing.T) {
+func TestPostSessionRunning_Non2xxIsSwallowed(_ *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
