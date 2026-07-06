@@ -199,3 +199,26 @@ func RequiresWorkResult(workType string) bool {
 	}
 	return false
 }
+
+// RequiresPRURL reports whether the contract for this work type includes
+// FieldPRURL as a required field. Today only development / inflight owe a
+// PR to complete; QA / acceptance / merge / coordination are
+// result-sensitive yet legitimately produce NO new PR.
+//
+// This gates the pushed-but-no-PR terminal reclassification in
+// loop.go's post-session block: only a work type whose completion
+// CONTRACT requires a PR should be reclassified failed when the backstop
+// cannot surface one. Gating on isResultSensitive instead would flip a
+// passing QA/acceptance/merge leg (which owes no PR) to failed → Rejected.
+func RequiresPRURL(workType string) bool {
+	c, ok := completionContracts[workType]
+	if !ok {
+		return false
+	}
+	for _, f := range c.Required {
+		if f.Type == FieldPRURL {
+			return true
+		}
+	}
+	return false
+}
