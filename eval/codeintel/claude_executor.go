@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // ClaudeExecutor is the LIVE-LLM Executor: it spawns the real `claude` CLI in
@@ -31,12 +32,13 @@ type ClaudeExecutor struct {
 	spawn claudeSpawner
 }
 
-// claudeSpawner launches the claude CLI for the fully-assembled argv/env and
-// returns its stdout stream plus a wait func. The caller reads stdout to EOF,
-// then calls wait to collect the process exit status and a stderr tail for
-// diagnostics. Abstracting the spawn keeps the stream parser hermetically
-// testable.
-type claudeSpawner func(ctx context.Context, argv []string, env []string) (stdout io.ReadCloser, wait func() (stderrTail string, err error), spawnErr error)
+// claudeSpawner launches the claude CLI in the working directory dir for the
+// fully-assembled argv/env and returns its stdout stream plus a wait func. dir
+// MUST be the provisioned workarea: the agent's built-in Read/Grep/Bash tools
+// operate on the process cwd. The caller reads stdout to EOF, then calls wait to
+// collect the process exit status and a stderr tail for diagnostics. Abstracting
+// the spawn keeps the stream parser hermetically testable.
+type claudeSpawner func(ctx context.Context, dir string, argv []string, env []string) (stdout io.ReadCloser, wait func() (stderrTail string, err error), spawnErr error)
 
 // NewClaudeExecutor returns the live claude executor.
 func NewClaudeExecutor() ClaudeExecutor { return ClaudeExecutor{spawn: spawnClaude} }
@@ -72,6 +74,19 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 		}
 	}
 
+	// The live agent MUST run inside the provisioned workarea (repo@ref): claude's
+	// built-in Read/Grep/Bash/Edit tools operate on the process cwd. An empty
+	// workarea would silently run the agent in the operator's own checkout —
+	// grading against a tree the agent never saw, fabricating the WITH/WITHOUT
+	// delta (the WITH arm's MCP server is rooted at the workarea while the control
+	// arm's native tools would read the wrong tree), and, with
+	// --dangerously-skip-permissions, letting Edit/Write land in the real working
+	// tree. Fail loud rather than measure garbage. Mirrors PlumbingExecutor's
+	// cmd.Dir = spec.Workarea (executor.go).
+	if strings.TrimSpace(spec.Workarea) == "" {
+		return Transcript{}, fmt.Errorf("claude %s arm: no workarea provisioned (driver bug)", spec.Arm)
+	}
+
 	inv := BuildClaudeInvocation(spec)
 	argv := append(append([]string(nil), inv.Argv...), streamFlags...)
 
@@ -79,7 +94,7 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 	if spawn == nil {
 		spawn = spawnClaude
 	}
-	stdout, wait, err := spawn(ctx, argv, inv.Env)
+	stdout, wait, err := spawn(ctx, spec.Workarea, argv, inv.Env)
 	if err != nil {
 		return Transcript{}, fmt.Errorf("claude %s arm: spawn: %w", spec.Arm, err)
 	}
@@ -110,16 +125,27 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 }
 
 // runError classifies the outcome of a completed (or aborted) run into a single
-// harness error, or nil on a clean success. Precedence: context cancellation
-// (timeout) → non-zero exit → no terminal result (truncated/crashed) →
-// agent-error terminal result (error_max_turns / error_during_execution) → a
-// partially-unparseable stream. A well-formed SUCCESS terminal result with a
-// clean exit is a success even if the task answer is wrong — the graders judge
-// task correctness, not this function. But an agent-error result is NOT a valid
-// completion: the session ran out of turns or crashed mid-flight, so it must
-// fail the run regardless of the process exit code (the CLI emits such a result
-// as a valid terminal event and may still exit 0 — cf. the frozen clijsonl
-// decoder, which classifies Success off is_error/subtype, not exit code).
+// HARNESS error, or nil when the run produced a well-formed terminal result.
+// Precedence: context cancellation (timeout) → non-zero exit → no terminal
+// result at all (truncated/crashed) → a partially-unparseable stream.
+//
+// An agent-ERROR terminal result (subtype=error_max_turns / error_during_execution,
+// is_error=true) is deliberately NOT a harness error and must not be returned
+// here. Exhausting the equal per-arm turn budget is a legitimate, gradeable TASK
+// failure — and a disproportionately CONTROL-arm one, since the whole hypothesis
+// is that code-intel helps the agent finish in fewer turns. parseClaudeStream
+// leaves FinalAnswer empty for such a result (it refuses to mask it with a stale
+// mid-session line), so the task-success grader scores it pass=false and the
+// driver records a normal failed trial. Returning an error instead would make
+// driver.runOne → driver.Run abort and DISCARD the entire A/B report on the first
+// control-arm timeout, censoring exactly the positive-delta regime the eval
+// exists to measure (W6 review blocker). Only genuine harness/infra faults are
+// fatal here.
+//
+// So a well-formed terminal result with a clean exit is a completed run (nil)
+// even if the task answer is wrong or empty — the graders, not this function,
+// judge task correctness (cf. the frozen clijsonl decoder, which classifies
+// Success off is_error/subtype, not the exit code).
 func runError(ctx context.Context, ps parsedStream, waitErr error, stderrTail string) error {
 	if cerr := ctx.Err(); cerr != nil {
 		return fmt.Errorf("run aborted: %w%s", cerr, stderrSuffix(stderrTail))
@@ -132,13 +158,6 @@ func runError(ctx context.Context, ps parsedStream, waitErr error, stderrTail st
 			return fmt.Errorf("claude stream ended before a terminal result event: %w%s", ps.parseErr, stderrSuffix(stderrTail))
 		}
 		return fmt.Errorf("claude stream ended before a terminal result event%s", stderrSuffix(stderrTail))
-	}
-	if ps.resultErrored() {
-		sub := ps.resultSubtype
-		if sub == "" {
-			sub = "error"
-		}
-		return fmt.Errorf("claude reported an agent-error terminal result (subtype=%s is_error=%t): session did not complete%s", sub, ps.resultIsError, stderrSuffix(stderrTail))
 	}
 	if ps.parseErr != nil {
 		return fmt.Errorf("claude stream partially unparseable: %w", ps.parseErr)
@@ -165,6 +184,13 @@ type parsedStream struct {
 	resultSubtype string // terminal result event's `subtype` (e.g. "success", "error_max_turns")
 	resultIsError bool   // terminal result event's `is_error`
 	parseErr      error
+	// assistantTokens is the running sum of per-turn usage across `assistant`
+	// events. The terminal result's own usage is authoritative when present, but
+	// some terminal results (notably error_max_turns) omit usage entirely; this
+	// sum is the fallback so a failed session's real token cost is not recorded as
+	// zero — which, for the control-arm-heavy max-turns case, would drag the
+	// WITHOUT median down and inflate the WITH/WITHOUT token-ratio gate.
+	assistantTokens TokenCounts
 }
 
 // resultErrored reports whether the terminal result event signalled an
@@ -284,11 +310,21 @@ func parseAssistant(raw []byte, ps *parsedStream, idIndex map[string]int) (strin
 				Name  string          `json:"name"`
 				Input json.RawMessage `json:"input"`
 			} `json:"content"`
+			Usage claudeUsage `json:"usage"`
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil {
 		return errSentinel, false
 	}
+	// Accumulate this turn's usage as the token fallback for a terminal result
+	// that omits its own usage (see parsedStream.assistantTokens). Per-turn usage
+	// is incremental, so the running sum reconstructs the cumulative session total
+	// the terminal result would otherwise report. cache_creation is folded into
+	// Input for the same reason parseResult does (fresh input tokens).
+	u := a.Message.Usage
+	ps.assistantTokens.Input += u.InputTokens + u.CacheCreationInputTokens
+	ps.assistantTokens.Output += u.OutputTokens
+	ps.assistantTokens.CacheRead += u.CacheReadInputTokens
 	var textParts []string
 	for _, b := range a.Message.Content {
 		switch b.Type {
@@ -357,11 +393,20 @@ func parseResult(raw []byte, ps *parsedStream) bool {
 		Output:    res.Usage.OutputTokens,
 		CacheRead: res.Usage.CacheReadInputTokens,
 	}
+	// A terminal result may omit its usage object (observed on error_max_turns);
+	// fall back to the per-turn assistant usage sum so a failed session's real
+	// token cost is not silently recorded as zero. A zeroed WITHOUT-arm cost would
+	// drag the control median down and inflate the WITH/WITHOUT ratio the
+	// founder-gated token budget (<=+10%) is measured against.
+	if ps.tokens == (TokenCounts{}) {
+		ps.tokens = ps.assistantTokens
+	}
 	// Preserve the agent-error signal: an error_max_turns / error_during_execution
-	// terminal result is a valid stream event (claude may still exit 0), but the
-	// session did NOT finish — runError turns this into a run failure and the
-	// FinalAnswer fallback below refuses to mask an empty error result with a
-	// stale mid-session line (W6 review finding).
+	// terminal result is a valid stream event the CLI may emit with a CLEAN exit,
+	// but the session did NOT finish. resultErrored() drives the FinalAnswer
+	// fallback below to refuse masking an empty error result with a stale
+	// mid-session line, so the grader scores it pass=false (a recorded failed
+	// trial, not a harness abort — see runError, W6 review finding).
 	ps.resultSubtype = res.Subtype
 	ps.resultIsError = res.IsError
 	if res.Result != "" {
@@ -409,14 +454,18 @@ func toolResultText(raw json.RawMessage) string {
 
 // ── real subprocess spawn ────────────────────────────────────────────────────
 
-// spawnClaude launches the claude CLI as a real subprocess. The binary is
-// resolved against the ARM env PATH (BinaryOnPath) so the invocation is driven
-// entirely by the authoritative arm environment; cmd.Env is set to that env
-// verbatim (NOT merged with os.Environ) so the WITHOUT arm's donmai-scrubbed
-// PATH is honored. stdin is left unset (/dev/null → instant EOF): the prompt is
-// carried in argv by BuildClaudeInvocation. The context deadline is enforced by
-// exec.CommandContext, which kills the process when ctx fires.
-func spawnClaude(ctx context.Context, argv []string, env []string) (io.ReadCloser, func() (string, error), error) {
+// spawnClaude launches the claude CLI as a real subprocess in the working
+// directory dir (the provisioned workarea — claude's Read/Grep/Bash tools run on
+// the process cwd). The binary is resolved against the ARM env PATH (BinaryOnPath)
+// so the invocation is driven entirely by the authoritative arm environment;
+// cmd.Env is set to that env verbatim (NOT merged with os.Environ) so the WITHOUT
+// arm's donmai-scrubbed PATH is honored. stdin is left unset (/dev/null → instant
+// EOF): the prompt is carried in argv by BuildClaudeInvocation. The context
+// deadline is enforced by exec.CommandContext, which kills the process when ctx
+// fires; cmd.WaitDelay bounds the post-exit I/O wait so a grandchild that
+// inherited a pipe (e.g. an MCP stdio server) can never hang the run past its
+// deadline.
+func spawnClaude(ctx context.Context, dir string, argv []string, env []string) (io.ReadCloser, func() (string, error), error) {
 	if len(argv) == 0 {
 		return nil, nil, fmt.Errorf("empty argv")
 	}
@@ -432,6 +481,15 @@ func spawnClaude(ctx context.Context, argv []string, env []string) (io.ReadClose
 
 	cmd := exec.CommandContext(ctx, bin, argv[1:]...) // nolint:gosec // bin is the fixed claude CLI; argv = BuildClaudeInvocation + fixed stream flags.
 	cmd.Env = env
+	cmd.Dir = dir
+	// After ctx cancellation SIGKILLs claude, a grandchild that inherited the
+	// stdout/stderr pipe (an MCP stdio server, or a process the agent backgrounded)
+	// can keep the write end open, so cmd.Wait would block forever waiting for I/O
+	// to close. WaitDelay caps that: the runtime force-closes the pipes this long
+	// after the process exits/cancels, unblocking the drain goroutine so the eval
+	// never stalls past its deadline (the orphaned grandchild is reaped when the
+	// harness exits).
+	cmd.WaitDelay = 15 * time.Second
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -456,8 +514,14 @@ func spawnClaude(ctx context.Context, argv []string, env []string) (io.ReadClose
 	}()
 
 	wait := func() (string, error) {
-		<-stderrDone
+		// Wait FIRST: cmd.Wait returns on process exit (bounded by WaitDelay if a
+		// grandchild kept a pipe open) and closes the stderr pipe, which unblocks
+		// the drain goroutine below. The previous order (<-stderrDone before Wait)
+		// could block forever on such a grandchild since EOF never arrives. The
+		// <-stderrDone barrier after Wait guarantees the goroutine has finished
+		// writing `tail` before we read it (no data race).
 		werr := cmd.Wait()
+		<-stderrDone
 		return tail.String(), werr
 	}
 	return stdout, wait, nil

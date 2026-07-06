@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -20,12 +21,14 @@ type fakeSpawn struct {
 	spawnEr error
 
 	called  bool
+	gotDir  string
 	gotArgv []string
 	gotEnv  []string
 }
 
-func (f *fakeSpawn) spawn(_ context.Context, argv []string, env []string) (io.ReadCloser, func() (string, error), error) {
+func (f *fakeSpawn) spawn(_ context.Context, dir string, argv []string, env []string) (io.ReadCloser, func() (string, error), error) {
 	f.called = true
+	f.gotDir = dir
 	f.gotArgv = append([]string(nil), argv...)
 	f.gotEnv = append([]string(nil), env...)
 	if f.spawnEr != nil {
@@ -50,9 +53,11 @@ func readFixture(t *testing.T, name string) string {
 func TestClaudeExecutor_With_ParsesSymbolSearch(t *testing.T) {
 	fs := &fakeSpawn{stream: readFixture(t, "claude_with_search_symbols.jsonl")}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
+	waWith := t.TempDir()
 	spec := ArmSpec{
 		Arm:             ArmWith,
 		Case:            fsCaseFor("BuildClaudeInvocation"),
+		Workarea:        waWith,
 		Env:             []string{"PATH=/with/bin"},
 		Budget:          Budget{MaxTurns: 8},
 		AdvertiseMode:   AdvertiseMCP,
@@ -114,6 +119,11 @@ func TestClaudeExecutor_With_ParsesSymbolSearch(t *testing.T) {
 	if strings.Join(fs.gotEnv, " ") != "PATH=/with/bin" {
 		t.Errorf("arm env not carried verbatim: %v", fs.gotEnv)
 	}
+	// The agent MUST be spawned inside the provisioned workarea (its native
+	// Read/Grep/Bash operate on the process cwd), not the operator's checkout.
+	if fs.gotDir != waWith {
+		t.Errorf("claude cwd = %q, want the provisioned workarea %q", fs.gotDir, waWith)
+	}
 }
 
 // TestClaudeExecutor_Without_GuardAndGrep proves the WITHOUT arm runs the
@@ -124,7 +134,7 @@ func TestClaudeExecutor_Without_GuardAndGrep(t *testing.T) {
 	donmaiDir := writeFakeBinary(t, "donmai")
 	fs := &fakeSpawn{stream: readFixture(t, "claude_without_grep.jsonl")}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	dirty := ArmSpec{Arm: ArmWithout, Case: fsCaseFor("BuildClaudeInvocation"), Env: []string{"PATH=" + donmaiDir}, SnapshotID: "wa-wo"}
+	dirty := ArmSpec{Arm: ArmWithout, Case: fsCaseFor("BuildClaudeInvocation"), Workarea: t.TempDir(), Env: []string{"PATH=" + donmaiDir}, SnapshotID: "wa-wo"}
 	if _, err := exec.Execute(context.Background(), dirty); err == nil {
 		t.Fatal("WITHOUT arm must fail when donmai is reachable")
 	} else if !strings.Contains(err.Error(), "contamination") {
@@ -135,7 +145,7 @@ func TestClaudeExecutor_Without_GuardAndGrep(t *testing.T) {
 	}
 
 	// (b) Clean env → parses the Grep tool call + final answer.
-	clean := ArmSpec{Arm: ArmWithout, Case: fsCaseFor("BuildClaudeInvocation"), Env: []string{"PATH=/clean/bin"}, SnapshotID: "wa-wo"}
+	clean := ArmSpec{Arm: ArmWithout, Case: fsCaseFor("BuildClaudeInvocation"), Workarea: t.TempDir(), Env: []string{"PATH=/clean/bin"}, SnapshotID: "wa-wo"}
 	tr, err := exec.Execute(context.Background(), clean)
 	if err != nil {
 		t.Fatalf("clean WITHOUT execute: %v", err)
@@ -175,7 +185,7 @@ func TestClaudeExecutor_ZeroToolSession(t *testing.T) {
 	}, "\n")
 	fs := &fakeSpawn{stream: stream}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Env: []string{"PATH=/x"}, SnapshotID: "z"})
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "z"})
 	if err != nil {
 		t.Fatalf("zero-tool execute: %v", err)
 	}
@@ -203,7 +213,7 @@ func TestClaudeExecutor_GarbledStream(t *testing.T) {
 	}, "\n")
 	fs := &fakeSpawn{stream: stream}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Env: []string{"PATH=/x"}, SnapshotID: "g"})
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "g"})
 	if err == nil {
 		t.Fatal("garbled/truncated stream must yield an error")
 	}
@@ -218,7 +228,7 @@ func TestClaudeExecutor_GarbledStream(t *testing.T) {
 func TestClaudeExecutor_NonZeroExit(t *testing.T) {
 	fs := &fakeSpawn{stream: readFixture(t, "claude_without_grep.jsonl"), waitErr: &fakeExitErr{}, stderr: "boom"}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Env: []string{"PATH=/x"}, SnapshotID: "e"})
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "e"})
 	if err == nil {
 		t.Fatal("non-zero claude exit must yield an error")
 	}
@@ -227,44 +237,49 @@ func TestClaudeExecutor_NonZeroExit(t *testing.T) {
 	}
 }
 
-// TestClaudeExecutor_ErrorMaxTurns_NotASuccess proves an agent-error terminal
-// result (subtype=error_max_turns, is_error=true) delivered with a CLEAN process
-// exit (waitErr nil, exit 0 — the observed 2.1.201 headless behavior) is
-// classified as a RUN ERROR, never a clean success, and that its empty result is
-// NOT masked by a stale mid-session assistant line. Regression for the W6 review
-// finding: parseResult dropped is_error/subtype, so a truncated/degraded WITH
-// session was graded as a valid transcript (mid-session text handed to the
-// task-success grader) and — with usage omitted on the error result — reported 0
-// tokens, deflating the badge-gating token ratio.
-func TestClaudeExecutor_ErrorMaxTurns_NotASuccess(t *testing.T) {
-	// The fixture carries NO usage object (tokens would be {0,0,0}) and a clean
-	// exit (fakeSpawn waitErr defaults to nil), reproducing the exact scenario
-	// where the drop bit hardest.
+// TestClaudeExecutor_ErrorMaxTurns_RecordedNotAborted proves an agent-error
+// terminal result (subtype=error_max_turns, is_error=true) delivered with a CLEAN
+// process exit (waitErr nil, exit 0 — the observed 2.1.201 headless behavior) is a
+// completed-but-FAILED task, NOT a harness error: Execute returns nil error (so
+// the driver records the trial instead of aborting the whole A/B matrix), its
+// empty result is NOT masked by a stale mid-session assistant line (so the
+// task-success grader scores it pass=false), and its token cost is reconstructed
+// from the per-turn assistant usage rather than reported as zero. Regression for
+// the W6 review blocker: runError used to return a fatal error here, discarding
+// the entire report on the first — disproportionately control-arm — max-turns.
+func TestClaudeExecutor_ErrorMaxTurns_RecordedNotAborted(t *testing.T) {
+	// The fixture's terminal result carries NO usage object; only the per-turn
+	// assistant events do (input 5000 + cache_read 800, output 120). A clean exit
+	// (fakeSpawn waitErr defaults to nil) reproduces the exact headless scenario.
 	fs := &fakeSpawn{stream: readFixture(t, "claude_error_max_turns.jsonl")}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Env: []string{"PATH=/x"}, SnapshotID: "emt"})
-	if err == nil {
-		t.Fatal("error_max_turns terminal result must yield a run error, not a clean success")
-	}
-	if !strings.Contains(err.Error(), "error_max_turns") {
-		t.Errorf("run error should name the agent-error subtype; got %v", err)
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "emt"})
+	if err != nil {
+		t.Fatalf("error_max_turns is a recorded task failure, not a harness error: %v", err)
 	}
 	// The mid-session line must NOT be presented as the final answer — otherwise
 	// the task-success grader (which only rejects EMPTY answers) would score an
-	// unfinished session on a stale, hedged line.
+	// unfinished session pass on a stale, hedged line.
 	if strings.Contains(tr.FinalAnswer, "foo.go:42") {
 		t.Errorf("mid-session text must not be graded as the final answer; got %q", tr.FinalAnswer)
 	}
 	if strings.TrimSpace(tr.FinalAnswer) != "" {
 		t.Errorf("an errored result with empty result text should leave FinalAnswer empty; got %q", tr.FinalAnswer)
 	}
+	// Token cost must fall back to the per-turn assistant usage, not zero — a
+	// zeroed control-arm max-turns cost would inflate the WITH/WITHOUT token gate.
+	if tr.TokenCounts.Input != 5000 || tr.TokenCounts.Output != 120 || tr.TokenCounts.CacheRead != 800 {
+		t.Errorf("TokenCounts = %+v, want {5000 120 800} (fallback from assistant usage)", tr.TokenCounts)
+	}
 }
 
-// TestClaudeExecutor_ErrorDuringExecution_NotASuccess proves the sibling
-// error_during_execution subtype (is_error=true, clean exit, with usage present)
-// is likewise classified as a run error rather than silently graded. Mirrors the
-// frozen clijsonl decoder's Success = (subtype=="success" && !is_error).
-func TestClaudeExecutor_ErrorDuringExecution_NotASuccess(t *testing.T) {
+// TestClaudeExecutor_ErrorDuringExecution_RecordedNotAborted proves the sibling
+// error_during_execution subtype (is_error=true, clean exit, usage present on the
+// result) is likewise a recorded failed trial, not a harness error: nil error,
+// empty FinalAnswer (mid-session text suppressed), and tokens taken from the
+// result's own usage. Mirrors the frozen clijsonl decoder's Success =
+// (subtype=="success" && !is_error).
+func TestClaudeExecutor_ErrorDuringExecution_RecordedNotAborted(t *testing.T) {
 	stream := strings.Join([]string{
 		`{"type":"system","subtype":"init","session_id":"ede1"}`,
 		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"partial reasoning, not a final answer"}]},"session_id":"ede1"}`,
@@ -272,21 +287,76 @@ func TestClaudeExecutor_ErrorDuringExecution_NotASuccess(t *testing.T) {
 	}, "\n")
 	fs := &fakeSpawn{stream: stream}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Env: []string{"PATH=/x"}, SnapshotID: "ede"})
-	if err == nil {
-		t.Fatal("error_during_execution terminal result must yield a run error")
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "ede"})
+	if err != nil {
+		t.Fatalf("error_during_execution is a recorded task failure, not a harness error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "error_during_execution") {
-		t.Errorf("run error should name the agent-error subtype; got %v", err)
-	}
-	if strings.Contains(tr.FinalAnswer, "partial reasoning") {
+	if strings.TrimSpace(tr.FinalAnswer) != "" {
 		t.Errorf("mid-session text must not become the final answer; got %q", tr.FinalAnswer)
+	}
+	// Result usage is present, so it is authoritative (not the assistant fallback).
+	if tr.TokenCounts.Input != 500 || tr.TokenCounts.Output != 10 || tr.TokenCounts.CacheRead != 100 {
+		t.Errorf("TokenCounts = %+v, want {500 10 100} (from the result usage)", tr.TokenCounts)
 	}
 }
 
 type fakeExitErr struct{}
 
 func (fakeExitErr) Error() string { return "exit status 1" }
+
+// TestSpawnClaude_RealSubprocess exercises the real exec seam (never touched by
+// the fakeSpawn tests): it stages a fake `claude` on a temp PATH and asserts the
+// two contamination-critical invariants of spawnClaude — the child runs in the
+// provisioned workarea (cmd.Dir), and it receives the arm env VERBATIM (cmd.Env,
+// not merged with os.Environ) — plus the argv/lookup guards. Without this, an
+// env- or cwd-handling regression would silently defeat the A/B isolation and no
+// fake-spawner test would go red.
+func TestSpawnClaude_RealSubprocess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake claude is a POSIX shell script")
+	}
+	workarea := t.TempDir()
+	binDir := t.TempDir()
+	// Fake claude: prove cwd by dropping a marker file in it, and prove the arm env
+	// passthrough by echoing an env var into the terminal result.
+	// Use only shell builtins (`:` redirection, printf) — the fake claude's PATH is
+	// just binDir, so an external `touch` would not resolve. The redirect creating
+	// ./ran-here is relative to the child cwd, which spawnClaude must set to the
+	// workarea.
+	script := "#!/bin/sh\n: > ./ran-here\nprintf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"marker=%s\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"cache_read_input_tokens\":0}}\\n' \"$CI_EVAL_MARKER\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil { // nolint:gosec // test fixture must be executable
+		t.Fatalf("write fake claude: %v", err)
+	}
+	env := []string{"PATH=" + binDir, "CI_EVAL_MARKER=env-ok"}
+
+	stdout, wait, err := spawnClaude(context.Background(), workarea, []string{"claude"}, env)
+	if err != nil {
+		t.Fatalf("spawnClaude: %v", err)
+	}
+	ps := parseClaudeStream(stdout)
+	_ = stdout.Close()
+	tail, werr := wait()
+	if werr != nil {
+		t.Fatalf("claude exited non-zero: %v (stderr: %q)", werr, tail)
+	}
+	// cmd.Dir was set to the workarea: the marker landed there, not in the test cwd.
+	if _, statErr := os.Stat(filepath.Join(workarea, "ran-here")); statErr != nil {
+		t.Errorf("claude did not run in the provisioned workarea: %v", statErr)
+	}
+	// cmd.Env was the arm env verbatim: the child saw CI_EVAL_MARKER.
+	if ps.finalAnswer != "marker=env-ok" {
+		t.Errorf("arm env not passed to the child; result = %q", ps.finalAnswer)
+	}
+
+	// Guard: empty argv is an error, not a panic.
+	if _, _, e := spawnClaude(context.Background(), workarea, nil, env); e == nil {
+		t.Error("empty argv must error")
+	}
+	// Guard: a binary resolvable on neither the arm PATH nor the process PATH errors.
+	if _, _, e := spawnClaude(context.Background(), workarea, []string{"claude-nonexistent-xyz-123"}, []string{"PATH=" + binDir}); e == nil {
+		t.Error("an unresolvable binary must error")
+	}
+}
 
 // TestClaudeExecutor_Name pins the executor identifier used in reports.
 func TestClaudeExecutor_Name(t *testing.T) {
