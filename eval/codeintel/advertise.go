@@ -50,12 +50,18 @@ var codeIntelToolNames = []string{
 	"af_code_check_duplicate", "af_code_find_type_usages", "af_code_validate_cross_deps",
 }
 
+// fqName returns the fully-qualified MCP name for one tool
+// (mcp__af-code-intelligence__<tool>).
+func fqName(tool string) string {
+	return "mcp__" + CodeIntelServerName + "__" + tool
+}
+
 // fqToolNames returns the fully-qualified MCP tool names
 // (mcp__af-code-intelligence__<tool>).
 func fqToolNames() []string {
 	out := make([]string, 0, len(codeIntelToolNames))
 	for _, t := range codeIntelToolNames {
-		out = append(out, "mcp__"+CodeIntelServerName+"__"+t)
+		out = append(out, fqName(t))
 	}
 	return out
 }
@@ -107,13 +113,24 @@ func (mcpAdvertisement) Mode() AdvertiseMode { return AdvertiseMCP }
 
 func (mcpAdvertisement) Apply(_ context.Context, donmaiBin, workarea, repoPath string, _ []string) ([]agent.MCPServerConfig, string, error) {
 	entry := BuildMCPEntry(donmaiBin, workarea, repoPath)
+	// WS4: capability-anchored, task-conditional framing. Each bullet names the
+	// job the tool wins over grep+read; trivial exact-identifier lookups are
+	// explicitly de-scoped to grep. The earlier blanket "prefer them over
+	// grep/glob/find" framing steered adoption onto tasks grep already wins
+	// (pilot: 1.0–2.10x token cost at +0pp success) — never reintroduce it.
 	var b strings.Builder
 	b.WriteString("# Code Intelligence\n\n")
-	b.WriteString("This session has the af-code-intelligence tools available over MCP. " +
-		"Prefer them over ad-hoc grep/glob/find when navigating or searching this repository:\n")
-	for _, fq := range fqToolNames() {
-		b.WriteString("\n- " + fq)
-	}
+	b.WriteString("This session has the af-code-intelligence MCP tools. Each is built for a job " +
+		"where grep+read is weak; use them in exactly these situations:\n\n")
+	b.WriteString("- Orienting in an unfamiliar repo or subsystem: call " + fqName("af_code_get_repo_map") +
+		" FIRST — it ranks files by import centrality, which reading files one by one cannot.\n")
+	b.WriteString("- Before ANY cross-file rename or refactor: call " + fqName("af_code_find_type_usages") +
+		" to enumerate every affected site BEFORE editing, then work from that list.\n")
+	b.WriteString("- Checking whether code like this already exists (exact or near-duplicate): call " +
+		fqName("af_code_check_duplicate") + " with the candidate snippet.\n")
+	b.WriteString("- Searching by name or concept across the codebase: " + fqName("af_code_search_symbols") +
+		" (symbol names) or " + fqName("af_code_search_code") + " (code content).\n")
+	b.WriteString("\nFor an exact single-identifier lookup, plain grep is fine — do not add a tool call.\n")
 	return []agent.MCPServerConfig{entry}, b.String(), nil
 }
 
@@ -134,10 +151,16 @@ func (promptHelpAdvertisement) Apply(ctx context.Context, donmaiBin, _, _ string
 	if err != nil {
 		return nil, "", fmt.Errorf("prompt-help: capture `donmai code --help`: %w", err)
 	}
+	// Same WS4 framing contract as the MCP variant: task-conditional bullets,
+	// no blanket prefer-over-grep, and an explicit grep de-scope clause.
 	var b strings.Builder
 	b.WriteString("# Code Intelligence\n\n")
 	b.WriteString("This session has code-intelligence CLI commands available (run them with Bash). " +
-		"Prefer them over ad-hoc grep/glob/find. Live `donmai code --help`:\n\n")
+		"Each is built for a job where grep+read is weak: `get-repo-map` FIRST when orienting in an " +
+		"unfamiliar repo (ranks files by import centrality); `find-type-usages` BEFORE any cross-file " +
+		"rename/refactor to enumerate every affected site before editing; `check-duplicate` to check " +
+		"whether code like a candidate snippet already exists. For an exact single-identifier lookup, " +
+		"plain grep is fine — do not add a tool call. Live `donmai code --help`:\n\n")
 	b.WriteString("```\n")
 	b.WriteString(strings.TrimSpace(help))
 	b.WriteString("\n```\n")

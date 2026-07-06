@@ -78,3 +78,55 @@ func TestPromptHelpAdvertisement_Apply_UsesLiveHelp(t *testing.T) {
 		t.Errorf("prompt suffix should embed live `donmai code --help` output; got %q", suffix)
 	}
 }
+
+// ── WS4: task-conditional, capability-anchored advertisement framing ─────────
+
+// TestMCPAdvertisement_TaskConditionalFraming pins the WS4 rewrite: the prompt
+// suffix must anchor each tool to the job it wins (orientation, pre-edit xref
+// enumeration, near-duplicate) and explicitly de-scope trivial grep lookups —
+// NOT the losing blanket "prefer them over grep" framing that drove adoption
+// onto tasks grep wins.
+func TestMCPAdvertisement_TaskConditionalFraming(t *testing.T) {
+	ad := NewAdvertisement(AdvertiseMCP)
+	_, suffix, err := ad.Apply(context.Background(), "/bin/donmai", "/wa", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(suffix, "Prefer them over") {
+		t.Errorf("blanket instead-of-grep framing must be gone; got %q", suffix)
+	}
+	low := strings.ToLower(suffix)
+	// (a) orientation → repo map FIRST.
+	if !strings.Contains(suffix, "af_code_get_repo_map") || !strings.Contains(low, "first") {
+		t.Errorf("suffix should anchor af_code_get_repo_map to orientation FIRST; got %q", suffix)
+	}
+	// (b) cross-file rename/refactor → enumerate sites BEFORE editing.
+	if !strings.Contains(suffix, "af_code_find_type_usages") || !strings.Contains(low, "before editing") {
+		t.Errorf("suffix should anchor af_code_find_type_usages to pre-edit enumeration; got %q", suffix)
+	}
+	// (c) already-exists / near-duplicate → check_duplicate.
+	if !strings.Contains(suffix, "af_code_check_duplicate") {
+		t.Errorf("suffix should anchor af_code_check_duplicate to duplicate checks; got %q", suffix)
+	}
+	// (d) trivial lookup de-scope: grep is fine, no tool call.
+	if !strings.Contains(low, "grep is fine") {
+		t.Errorf("suffix should de-scope exact single-identifier lookups to grep; got %q", suffix)
+	}
+}
+
+// TestPromptHelpAdvertisement_TaskConditionalFraming: the prompt-help variant
+// shares the framing contract (no blanket prefer-over-grep; grep de-scope).
+func TestPromptHelpAdvertisement_TaskConditionalFraming(t *testing.T) {
+	bin := writeFakeDonmai(t)
+	ad := NewAdvertisement(AdvertisePromptHelp)
+	_, suffix, err := ad.Apply(context.Background(), bin, "/wa", "", os.Environ())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(suffix, "Prefer them over") {
+		t.Errorf("blanket instead-of-grep framing must be gone; got %q", suffix)
+	}
+	if !strings.Contains(strings.ToLower(suffix), "grep is fine") {
+		t.Errorf("suffix should de-scope exact single-identifier lookups to grep; got %q", suffix)
+	}
+}
