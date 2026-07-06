@@ -22,9 +22,8 @@ func (s *Server) buildTools() []*toolDef {
 
 	return []*toolDef{
 		{
-			name: ToolGetRepoMap,
-			description: "PageRank-ranked repository map: the most important files (by intra-repo " +
-				"import graph) and their extracted symbols. Output: {entries, rootHash, files}.",
+			name:        ToolGetRepoMap,
+			description: "Repo map ranked by import centrality: most important files + their symbols. Call FIRST to orient.",
 			inputSchema: schemaGetRepoMap,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
@@ -41,9 +40,8 @@ func (s *Server) buildTools() []*toolDef {
 			},
 		},
 		{
-			name: ToolSearchSymbols,
-			description: "BM25 search over the symbol index (functions, methods, classes, interfaces, " +
-				"types, structs, enums). Returns scored symbols with match type.",
+			name:        ToolSearchSymbols,
+			description: "Search symbols by name (functions, methods, types, ...); exact names return only the exact hits.",
 			inputSchema: schemaSearchSymbols,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
@@ -66,9 +64,8 @@ func (s *Server) buildTools() []*toolDef {
 			},
 		},
 		{
-			name: ToolSearchCode,
-			description: "Okapi BM25 keyword search over code content with code-aware tokenization " +
-				"(camelCase / snake_case). Returns scored symbols with match type.",
+			name:        ToolSearchCode,
+			description: "Keyword search over code content with code-aware tokenization (camelCase/snake_case).",
 			inputSchema: schemaSearchCode,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
@@ -89,10 +86,8 @@ func (s *Server) buildTools() []*toolDef {
 			},
 		},
 		{
-			name: ToolCheckDuplicate,
-			description: "Check whether content is an exact (xxHash64) or near (SimHash) duplicate of " +
-				"indexed content. Provide exactly one of content (inline) or contentFile " +
-				"(relative to the repo root).",
+			name:        ToolCheckDuplicate,
+			description: "Check whether code already exists (exact or near duplicate). Pass content OR contentFile.",
 			inputSchema: schemaCheckDuplicate,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
@@ -121,11 +116,8 @@ func (s *Server) buildTools() []*toolDef {
 			},
 		},
 		{
-			name: ToolFindTypeUsages,
-			description: "Find every usage site of a named type across the repo (Go, TypeScript, and other " +
-				"indexed languages): declarations, type references, switch/case sites, and lookup-table " +
-				"keys. Call BEFORE a cross-file rename, refactor, or member addition to enumerate all " +
-				"affected sites before editing.",
+			name:        ToolFindTypeUsages,
+			description: "Find every usage site of a named type. Call BEFORE a cross-file rename/refactor to list all sites.",
 			inputSchema: schemaFindTypeUsages,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
@@ -142,9 +134,8 @@ func (s *Server) buildTools() []*toolDef {
 			},
 		},
 		{
-			name: ToolValidateCrossDeps,
-			description: "Validate that cross-package imports in a monorepo have matching package.json " +
-				"dependency declarations. Optional path scopes the check to a subtree.",
+			name:        ToolValidateCrossDeps,
+			description: "Validate monorepo cross-package imports against package.json dependency declarations.",
 			inputSchema: schemaValidateCrossDeps,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
@@ -160,20 +151,20 @@ func (s *Server) buildTools() []*toolDef {
 }
 
 // ── inputSchema definitions (JSON Schema, mirroring the CLI flags) ────────────
+//
+// WS11: these schemas + the tool descriptions above are injected into the
+// model context on every tool load, so they are a fixed per-session token tax.
+// Keep every property description one line, drop schema boilerplate (e.g.
+// "minimum": 0 — the engine already treats <= 0 as "use the default"), and
+// never remove or rename a property: the plumbing executor, the CLI, and the
+// conformance tests pass these names. TestToolSurfaceWeight_Budget enforces
+// the character budget.
 
 var schemaGetRepoMap = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "maxFiles": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Maximum files to include (0 = default 50)"
-    },
-    "filePatterns": {
-      "type": "array",
-      "items": {"type": "string"},
-      "description": "Glob filters over file paths (e.g. \"*.go\", \"src/**\"); a trailing /** matches a whole subtree. Output filter only."
-    }
+    "maxFiles": {"type": "integer", "description": "Max files (0 = default 50)"},
+    "filePatterns": {"type": "array", "items": {"type": "string"}, "description": "Glob filters"}
   },
   "additionalProperties": false
 }`)
@@ -181,15 +172,11 @@ var schemaGetRepoMap = json.RawMessage(`{
 var schemaSearchSymbols = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "query": {"type": "string", "description": "Symbol name or query (BM25 over the symbol index)"},
-    "maxResults": {"type": "integer", "minimum": 0, "description": "Maximum results (0 = default: 5, or up to 3 when an exact-name match short-circuits)"},
-    "kinds": {
-      "type": "array",
-      "items": {"type": "string"},
-      "description": "Restrict to these symbol kinds: function, method, class, interface, type, struct, enum, trait, impl, ..."
-    },
-    "filePattern": {"type": "string", "description": "Restrict to files matching this glob (e.g. \"*.go\", \"svc/**\")"},
-    "includeDoc": {"type": "boolean", "description": "Return full symbol details including the complete multi-line documentation (default: compact hits with one-line docs)"}
+    "query": {"type": "string"},
+    "maxResults": {"type": "integer", "description": "Max results (0 = default)"},
+    "kinds": {"type": "array", "items": {"type": "string"}, "description": "Symbol kind filter"},
+    "filePattern": {"type": "string", "description": "Glob filter"},
+    "includeDoc": {"type": "boolean", "description": "Return full docs (default one-line)"}
   },
   "required": ["query"],
   "additionalProperties": false
@@ -198,10 +185,10 @@ var schemaSearchSymbols = json.RawMessage(`{
 var schemaSearchCode = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "query": {"type": "string", "description": "Keyword query (Okapi BM25 over code content)"},
-    "maxResults": {"type": "integer", "minimum": 0, "description": "Maximum results (0 = default 20)"},
-    "language": {"type": "string", "description": "Restrict to one language (e.g. go, typescript, python, rust)"},
-    "includeDoc": {"type": "boolean", "description": "Return full symbol details including the complete multi-line documentation (default: compact hits with one-line docs)"}
+    "query": {"type": "string"},
+    "maxResults": {"type": "integer", "description": "Max results (0 = default)"},
+    "language": {"type": "string", "description": "Language filter (go, typescript, ...)"},
+    "includeDoc": {"type": "boolean", "description": "Return full docs (default one-line)"}
   },
   "required": ["query"],
   "additionalProperties": false
@@ -210,8 +197,8 @@ var schemaSearchCode = json.RawMessage(`{
 var schemaCheckDuplicate = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "content": {"type": "string", "description": "Inline content to check for exact (xxHash64) / near (SimHash) duplicates"},
-    "contentFile": {"type": "string", "description": "Path RELATIVE to the repo root of a file whose content to check; absolute paths and traversal outside the root are rejected"}
+    "content": {"type": "string", "description": "Inline content to check"},
+    "contentFile": {"type": "string", "description": "Path relative to the repo root"}
   },
   "additionalProperties": false
 }`)
@@ -219,8 +206,8 @@ var schemaCheckDuplicate = json.RawMessage(`{
 var schemaFindTypeUsages = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "typeName": {"type": "string", "description": "Union type / enum name to find usage sites for"},
-    "maxResults": {"type": "integer", "minimum": 0, "description": "Maximum results (0 = default 50)"}
+    "typeName": {"type": "string"},
+    "maxResults": {"type": "integer", "description": "Max results (0 = default)"}
   },
   "required": ["typeName"],
   "additionalProperties": false
@@ -229,7 +216,7 @@ var schemaFindTypeUsages = json.RawMessage(`{
 var schemaValidateCrossDeps = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "path": {"type": "string", "description": "Optional relative path prefix scoping the check to a package or subtree"}
+    "path": {"type": "string", "description": "Relative path scope"}
   },
   "additionalProperties": false
 }`)
