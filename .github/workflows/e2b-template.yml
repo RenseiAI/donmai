@@ -12,9 +12,13 @@ name: e2b-template
 # `apiKey = process.env.E2B_API_KEY` and errors "You must be logged in ... set
 # the E2B_API_KEY environment variable" when it is missing.
 #
-# This workflow is manual-only (workflow_dispatch). Add the E2B_API_KEY repo
-# secret before running it (Settings -> Secrets and variables -> Actions).
-# E2B_ACCESS_TOKEN is also passed through when present, for any management call.
+# Runs on manual dispatch AND automatically on every release tag (push: tags
+# v*), so the baked worker binary can never silently lag the runner code — the
+# stale-template failure mode that blocked cloud on-demand SDLC (2026-07-06).
+# release.yml fires on the same tag (notarized binary release); the two run
+# independently. Add the E2B_API_KEY repo secret before running it (Settings ->
+# Secrets and variables -> Actions). E2B_ACCESS_TOKEN is also passed through
+# when present, for any management call.
 
 on:
   workflow_dispatch:
@@ -23,6 +27,9 @@ on:
         description: "Version stamped into the donmai binary (e.g. v0.10.0)"
         required: false
         default: "v0.10.0"
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -60,7 +67,11 @@ jobs:
 
       - name: Cross-compile donmai binary (linux/amd64)
         env:
-          VERSION: ${{ github.event.inputs.version }}
+          # On workflow_dispatch this is the input (default v0.10.0). On a tag
+          # push github.event.inputs.version is empty, so fall back to the tag
+          # ref (e.g. v0.50.2) — otherwise the binary would stamp an empty
+          # version on the auto-rebuild.
+          VERSION: ${{ github.event.inputs.version || github.ref_name }}
         run: |
           set -euo pipefail
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
@@ -132,6 +143,11 @@ jobs:
           fi
 
       - name: Commit updated e2b.toml (template_id)
+        # On a tag push the checkout is a detached HEAD at the tag, so a
+        # push to main is unsafe/unwanted; same-name rebuilds reuse the existing
+        # template_id (nothing new to record). Only record on manual dispatch
+        # (which runs on a branch and may be a first-time template_id capture).
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           if git diff --quiet -- worker/e2b/e2b.toml; then
