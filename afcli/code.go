@@ -131,6 +131,7 @@ func newCodeSearchSymbolsCmd(bin string, repoPath *string) *cobra.Command {
 		maxResults  int
 		kinds       string
 		filePattern string
+		includeDoc  bool
 	)
 
 	cmd := &cobra.Command{
@@ -149,6 +150,7 @@ Examples:
 				Query:       args[0],
 				MaxResults:  maxResults,
 				FilePattern: filePattern,
+				IncludeDoc:  includeDoc,
 			}
 			if kinds != "" {
 				for _, k := range strings.Split(kinds, ",") {
@@ -169,9 +171,10 @@ Examples:
 		},
 	}
 
-	cmd.Flags().IntVar(&maxResults, "max-results", 0, "Maximum results (0 = use default of 20)")
+	cmd.Flags().IntVar(&maxResults, "max-results", 0, "Maximum results (0 = default of 5; exact-name matches short-circuit to at most 3)")
 	cmd.Flags().StringVar(&kinds, "kinds", "", "Comma-separated symbol kinds: function,class,interface,type,etc.")
 	cmd.Flags().StringVar(&filePattern, "file-pattern", "", "Filter by file pattern (e.g. \"*.go\")")
+	cmd.Flags().BoolVar(&includeDoc, "include-doc", false, "Include full multi-line symbol documentation (default: compact one-line docs)")
 
 	return cmd
 }
@@ -181,6 +184,7 @@ func newCodeSearchCodeCmd(bin string, repoPath *string) *cobra.Command {
 	var (
 		maxResults int
 		language   string
+		includeDoc bool
 	)
 
 	cmd := &cobra.Command{
@@ -214,6 +218,7 @@ Examples:
 				Query:      args[0],
 				MaxResults: maxResults,
 				Language:   language,
+				IncludeDoc: includeDoc,
 			})
 			if err != nil {
 				return fmt.Errorf("search-code: %w", err)
@@ -224,6 +229,7 @@ Examples:
 
 	cmd.Flags().IntVar(&maxResults, "max-results", 0, "Maximum results (0 = use default of 20)")
 	cmd.Flags().StringVar(&language, "language", "", "Filter by language (e.g. typescript, go, python)")
+	cmd.Flags().BoolVar(&includeDoc, "include-doc", false, "Include full multi-line symbol documentation (default: compact one-line docs)")
 
 	return cmd
 }

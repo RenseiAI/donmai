@@ -81,9 +81,9 @@ func TestSearchSymbols_DoubleStarMatchesSubtree(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("svc/** should match exactly the nested svc symbol; got %d results", len(results))
 	}
-	sym := results[0]["symbol"].(CodeSymbol)
-	if sym.FilePath != "svc/deep/handler.go" {
-		t.Errorf("got %s; want svc/deep/handler.go", sym.FilePath)
+	sym := results[0]["symbol"].(map[string]any)
+	if sym["filePath"] != "svc/deep/handler.go" {
+		t.Errorf("got %s; want svc/deep/handler.go", sym["filePath"])
 	}
 }
 
