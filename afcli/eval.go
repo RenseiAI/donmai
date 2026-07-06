@@ -18,8 +18,9 @@ import (
 
 // newEvalCmd constructs the hidden `donmai eval` command group. It hosts the
 // code-intelligence A/B eval harness — the GA acceptance vehicle that measures
-// agent-success delta WITH vs WITHOUT the code-intel MCP surface. Hidden because
-// it is an operator/CI harness, not an everyday command.
+// token efficiency (the Q1v2 GA bar) and agent-success delta (informational)
+// WITH vs WITHOUT the code-intel MCP surface. Hidden because it is an
+// operator/CI harness, not an everyday command.
 func newEvalCmd(cfg Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:    "eval",
@@ -64,7 +65,14 @@ func newEvalCodeIntelCmd(cfg Config) *cobra.Command {
 fresh identical workareas at the pinned repo@sha, run an agent on each —
 WITHOUT (` + bin + ` stripped from PATH, the mandatory contamination guard) and
 WITH (the real af-code-intelligence MCP surface) — grade both, and report the
-success delta, tokens-to-solution ratio, and tool adoption.
+tokens-to-solution ratio, success delta, and tool adoption.
+
+The GA verdict is the efficiency bar (Q1v2, 2026-07-06): aggregate WITH/WITHOUT
+median-token ratio <=1.0x, every family <=1.10x, and no per-family success
+regression, on a statistically powered run. The earlier >=+15pp success-delta
+bar was retired after the 2026-07-06 decision-gate eval proved it unreachable
+(the control arm scored 100% even on grep-resistant probes); the success delta
+and its bootstrap CI are still reported as informational.
 
 Two executors are available via --executor:
 

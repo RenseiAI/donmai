@@ -146,9 +146,11 @@ func (f *FamilyStat) TokenRatio() float64 {
 // AdoptionRate is the fraction of WITH-arm trials that used a code-intel tool.
 func (f *FamilyStat) AdoptionRate() float64 { return rate(f.Adoption, f.WithTrials) }
 
-// Locked founder-threshold power preconditions (brief 06 §4.5): the >=+15pp
-// verdict is only a GA claim over >=8-12 tasks/family x 2 repos x >=3 trials/arm.
-// An underpowered or --task-filtered run must never report a PASS.
+// Locked power preconditions (brief 06 §4.5): ANY GA verdict — the retired
+// success-delta bar or the current efficiency bar — is only a claim over
+// >=8-12 tasks/family x 2 repos x >=3 trials/arm; token-ratio medians need
+// sample size just as much as success rates did. An underpowered or
+// --task-filtered run must never report a PASS.
 const (
 	// minTasksPerFamily is the floor of the brief's 8-12 tasks/family band.
 	minTasksPerFamily = 8
@@ -158,12 +160,43 @@ const (
 	minTrialsForGA = 3
 )
 
-// AggregateStat is the whole-benchmark rollup + the founder-threshold verdict.
+// Q1v2 efficiency bar (founder decision, 2026-07-06). The ORIGINAL GA bar —
+// aggregate success delta >=+15pp on the 95% CI lower bound — was RETIRED
+// after the 2026-07-06 decision-gate eval proved it unreachable against
+// frontier agents: the control (WITHOUT) arm scored 100% even on
+// grep-resistant probes, so no tool surface can buy +15 percentage points of
+// success. The GA claim is now an EFFICIENCY claim: the code-intel surface
+// must make the agent CHEAPER without making it worse. On a powered run the
+// verdict requires all three of:
+//
+//  1. aggregate tokenRatio <= maxAggregateTokenRatio — WITH is no more
+//     expensive than WITHOUT overall;
+//  2. every family WITH token data holds tokenRatio <= maxFamilyTokenRatio —
+//     no family pays more than +10% for the surface (families lacking token
+//     data on either arm are excluded, same convention as the regression
+//     check);
+//  3. no per-family SUCCESS regression — WithRate >= WithoutRate wherever
+//     both arms ran.
+//
+// The success delta (DeltaPP + case-clustered bootstrap CI) stays COMPUTED
+// AND REPORTED — informational now, not gating.
+const (
+	// maxAggregateTokenRatio is the whole-benchmark median-token ceiling.
+	maxAggregateTokenRatio = 1.0
+	// maxFamilyTokenRatio is the per-family ceiling (+10% worst case).
+	maxFamilyTokenRatio = 1.10
+)
+
+// AggregateStat is the whole-benchmark rollup + the efficiency-threshold verdict.
 type AggregateStat struct {
 	DeltaPP           float64    `json:"deltaPP"`
 	TokenRatio        float64    `json:"tokenRatio"`
 	AdoptionRate      float64    `json:"adoptionRate"`
 	RegressedFamilies []TaskType `json:"regressedFamilies"`
+	// TokenRegressedFamilies lists families (with token data on both arms)
+	// whose median-token ratio exceeds maxFamilyTokenRatio — each one is an
+	// independent efficiency-bar failure.
+	TokenRegressedFamilies []TaskType `json:"tokenRegressedFamilies,omitempty"`
 	// Trials / FamilyCounts / RepoCounts capture the corpus power actually run,
 	// computed from the executed cases — not assumed.
 	Trials       int              `json:"trials"`
@@ -178,19 +211,21 @@ type AggregateStat struct {
 	// a CASE-CLUSTERED bootstrap (resampling whole cases, not trials, since the
 	// >=3 trials of one case@sha are strongly correlated — pooling them as
 	// independent Bernoulli understates variance). DeltaStdDev is the bootstrap
-	// standard deviation. The founder verdict gates on DeltaCILow (the lower
-	// bound), NOT the point estimate, so a borderline +15pp with a wide interval
-	// cannot clear a bar meant to justify a permanent badge removal.
+	// standard deviation. INFORMATIONAL since the Q1v2 decision (2026-07-06):
+	// the retired success-delta bar gated on DeltaCILow; the efficiency bar
+	// does not, but the interval stays computed and reported so a run's delta
+	// claim is always variance-qualified.
 	DeltaCILow  float64 `json:"deltaCiLow"`
 	DeltaCIHigh float64 `json:"deltaCiHigh"`
 	DeltaStdDev float64 `json:"deltaStdDev"`
 	// Status is the human-legible verdict category: "UNDERPOWERED — not a GA
 	// verdict", "GA-PASS …", or "GA-FAIL …".
 	Status string `json:"status"`
-	// MeetsThreshold reflects the LOCKED founder bar: >=+15pp aggregate delta,
-	// no per-family regression, median tokens <=+10% — AND the power
-	// preconditions above. It can only be true on a statistically-powered run;
-	// an underpowered run is forced to false regardless of the point estimate.
+	// MeetsThreshold reflects the Q1v2 EFFICIENCY bar (see the constant block
+	// above): aggregate tokenRatio <= 1.0, every family with data <= 1.10,
+	// no per-family success regression — AND the power preconditions. It can
+	// only be true on a statistically-powered run; an underpowered run is
+	// forced to false regardless of the ratios.
 	MeetsThreshold bool `json:"meetsThreshold"`
 }
 
@@ -419,7 +454,7 @@ func accumulate(f *FamilyStat, rec RunRecord) {
 func computeAggregate(fams map[TaskType]*FamilyStat, records []RunRecord, cases []Case, trials int) AggregateStat {
 	var withP, withT, woP, woT int
 	var withTok, woTok []int64
-	var regressed []TaskType
+	var regressed, tokenRegressed []TaskType
 	for _, fam := range families {
 		f := fams[fam]
 		if f == nil {
@@ -431,8 +466,16 @@ func computeAggregate(fams map[TaskType]*FamilyStat, records []RunRecord, cases 
 		woT += f.WithoutTrials
 		withTok = append(withTok, f.WithTokens...)
 		woTok = append(woTok, f.WithoutTokens...)
-		if f.WithTrials > 0 && f.WithoutTrials > 0 && f.WithRate() < f.WithoutRate() {
-			regressed = append(regressed, fam)
+		if f.WithTrials > 0 && f.WithoutTrials > 0 {
+			if f.WithRate() < f.WithoutRate() {
+				regressed = append(regressed, fam)
+			}
+			// Per-family token guard: a TokenRatio of 0 means no WITHOUT-arm
+			// token data — exclude the family rather than pass/fail on garbage
+			// (same missing-data convention as the regression check above).
+			if r := f.TokenRatio(); r > 0 && r > maxFamilyTokenRatio {
+				tokenRegressed = append(tokenRegressed, fam)
+			}
 		}
 	}
 	deltaPP := (rate(withP, withT) - rate(woP, woT)) * 100
@@ -445,34 +488,57 @@ func computeAggregate(fams map[TaskType]*FamilyStat, records []RunRecord, cases 
 	shortfalls := powerShortfalls(famCounts, repoCounts, trials)
 	ciLow, ciHigh, stddev := bootstrapDeltaCI(caseAggsFromRecords(records))
 	agg := AggregateStat{
-		DeltaPP:           deltaPP,
-		TokenRatio:        tokenRatio,
-		AdoptionRate:      rate(withPassesAdopt(fams), withT),
-		RegressedFamilies: regressed,
-		Trials:            trials,
-		FamilyCounts:      famCounts,
-		RepoCounts:        repoCounts,
-		Underpowered:      len(shortfalls) > 0,
-		PowerShortfalls:   shortfalls,
-		DeltaCILow:        ciLow,
-		DeltaCIHigh:       ciHigh,
-		DeltaStdDev:       stddev,
+		DeltaPP:                deltaPP,
+		TokenRatio:             tokenRatio,
+		AdoptionRate:           rate(withPassesAdopt(fams), withT),
+		RegressedFamilies:      regressed,
+		TokenRegressedFamilies: tokenRegressed,
+		Trials:                 trials,
+		FamilyCounts:           famCounts,
+		RepoCounts:             repoCounts,
+		Underpowered:           len(shortfalls) > 0,
+		PowerShortfalls:        shortfalls,
+		DeltaCILow:             ciLow,
+		DeltaCIHigh:            ciHigh,
+		DeltaStdDev:            stddev,
 	}
-	// Gate on the CI LOWER BOUND (not the point estimate): a borderline +15pp
-	// whose interval dips below +15pp is noise, not a GA-grade positive delta.
-	statBar := ciLow >= 15.0 && len(regressed) == 0 && tokenRatio > 0 && tokenRatio <= 1.10
+	// The Q1v2 efficiency bar (see the constant block above): aggregate token
+	// win, no family paying >+10%, no success regression. A tokenRatio of 0
+	// means NO token data — that cannot clear a bar about token cost. The
+	// success delta (and its bootstrap CI) is informational, not gating.
+	effBar := tokenRatio > 0 && tokenRatio <= maxAggregateTokenRatio &&
+		len(tokenRegressed) == 0 && len(regressed) == 0
 	// The power preconditions HARD-GATE the verdict: a null/underpowered result
-	// can never be reported as a GA pass, no matter how large the point estimate.
-	agg.MeetsThreshold = statBar && !agg.Underpowered
+	// can never be reported as a GA pass, no matter how favorable the ratios.
+	agg.MeetsThreshold = effBar && !agg.Underpowered
 	switch {
 	case agg.Underpowered:
 		agg.Status = "UNDERPOWERED — not a GA verdict (" + strings.Join(shortfalls, "; ") + ")"
 	case agg.MeetsThreshold:
-		agg.Status = "GA-PASS (95% CI lower bound >=+15pp, no regression, tokens<=+10%)"
+		agg.Status = "GA-PASS (efficiency bar: aggregate tokens<=1.0x, per-family <=1.10x, no success regression)"
 	default:
-		agg.Status = "GA-FAIL (powered, but did not clear the founder bar)"
+		agg.Status = "GA-FAIL (powered, but did not clear the efficiency bar: " + strings.Join(efficiencyFailures(tokenRatio, tokenRegressed, regressed), "; ") + ")"
 	}
 	return agg
+}
+
+// efficiencyFailures enumerates which efficiency-bar conditions a powered run
+// missed, for the GA-FAIL status line.
+func efficiencyFailures(tokenRatio float64, tokenRegressed, regressed []TaskType) []string {
+	var out []string
+	switch {
+	case tokenRatio <= 0:
+		out = append(out, "no token data")
+	case tokenRatio > maxAggregateTokenRatio:
+		out = append(out, fmt.Sprintf("aggregate tokenRatio %.2fx > %.2fx", tokenRatio, maxAggregateTokenRatio))
+	}
+	if len(tokenRegressed) > 0 {
+		out = append(out, fmt.Sprintf("family tokenRatio > %.2fx: %v", maxFamilyTokenRatio, tokenRegressed))
+	}
+	if len(regressed) > 0 {
+		out = append(out, fmt.Sprintf("success regression: %v", regressed))
+	}
+	return out
 }
 
 // caseAgg is one benchmark case's pooled A/B tally (summed across its trials) —
@@ -651,13 +717,17 @@ func (r Report) Summary() string {
 	a := r.Aggregate
 	fmt.Fprintf(&b, "%-22s %8s %8s %+7.0fpp %9.2fx %8.0f%%\n", "AGGREGATE", "", "", a.DeltaPP, a.TokenRatio, a.AdoptionRate*100)
 	if len(a.RegressedFamilies) > 0 {
-		fmt.Fprintf(&b, "regressed families: %v\n", a.RegressedFamilies)
+		fmt.Fprintf(&b, "regressed families (success): %v\n", a.RegressedFamilies)
 	}
-	fmt.Fprintf(&b, "aggregate delta 95%% CI: [%+.1f, %+.1f]pp (stddev %.1f, case-clustered bootstrap)\n",
+	if len(a.TokenRegressedFamilies) > 0 {
+		fmt.Fprintf(&b, "regressed families (tokens > %.2fx): %v\n", maxFamilyTokenRatio, a.TokenRegressedFamilies)
+	}
+	fmt.Fprintf(&b, "aggregate delta 95%% CI: [%+.1f, %+.1f]pp (stddev %.1f, case-clustered bootstrap; informational — success-delta bar retired 2026-07-06)\n",
 		a.DeltaCILow, a.DeltaCIHigh, a.DeltaStdDev)
 	fmt.Fprintf(&b, "power: %d trial(s)/arm, families=%v, repos=%d (need >=%d tasks/family, >=%d repos, >=%d trials)\n",
 		a.Trials, a.FamilyCounts, len(a.RepoCounts), minTasksPerFamily, minReposCovered, minTrialsForGA)
-	fmt.Fprintf(&b, "founder-threshold (95%% CI lower bound >=+15pp, no regression, tokens<=+10%%): %v\n", a.MeetsThreshold)
+	fmt.Fprintf(&b, "efficiency-threshold (aggregate tokens<=%.1fx, per-family <=%.2fx, no success regression): %v\n",
+		maxAggregateTokenRatio, maxFamilyTokenRatio, a.MeetsThreshold)
 	fmt.Fprintf(&b, "verdict: %s\n", a.Status)
 	if r.PostedCount > 0 || r.PostErrors > 0 {
 		fmt.Fprintf(&b, "bridge: posted=%d errors=%d\n", r.PostedCount, r.PostErrors)

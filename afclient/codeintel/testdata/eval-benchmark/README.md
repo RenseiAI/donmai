@@ -76,6 +76,22 @@ run (brief threshold: 8–12 tasks/family × 2 repos × ≥3 trials/arm) may ext
 these files; edits stay reviewable because the format is canonical JSONL and the
 ground truth is `git grep`-reproducible.
 
+## GA verdict bar
+
+The driver's verdict (`MeetsThreshold`) is the **efficiency bar** (founder
+decision Q1v2, 2026-07-06), evaluated only on a powered run (the floor above):
+
+- aggregate WITH/WITHOUT median-token ratio ≤ 1.0x;
+- every family with token data ≤ 1.10x (no family pays >+10% for the surface);
+- no per-family success regression (WITH rate ≥ WITHOUT rate everywhere).
+
+History: the original bar was an agent-success delta of ≥+15pp on the 95% CI
+lower bound. It was retired after the 2026-07-06 decision-gate eval proved it
+unreachable against frontier agents — the control (WITHOUT) arm scored 100%
+even on grep-resistant probes, so no tool surface can buy +15pp of success.
+The success delta and its case-clustered bootstrap CI are still computed and
+reported, as informational context only.
+
 ## Regenerating
 
 `find-symbol`, `locate-usage`, `refactor-across-files` are hand-authored. The
