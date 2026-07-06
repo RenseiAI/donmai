@@ -163,6 +163,51 @@ func TestDriver_EndToEnd_ProvisionArmsGradeAggregate(t *testing.T) {
 	}
 }
 
+// TestDriver_ControlArmMaxTurns_RecordedNotAborted is the driver-seam regression
+// for the W6 review blocker: a live-executor arm that ends in error_max_turns
+// (empty result, clean exit — the disproportionately-control-arm outcome) must be
+// RECORDED as a failed trial, not abort the whole A/B matrix and discard the
+// report. It drives the real ClaudeExecutor with a fake spawner emitting the
+// error_max_turns fixture on every arm and asserts Run completes with both arms
+// recorded pass=false.
+func TestDriver_ControlArmMaxTurns_RecordedNotAborted(t *testing.T) {
+	repoDir, sha := initTempRepo(t)
+	donmaiDir := writeFakeBinary(t, "donmai")
+
+	c := Case{
+		ID:             "codeintel-find-symbol-maxturns-001",
+		Input:          CaseInput{TaskType: TaskFindSymbol, Repo: "test/repo", Ref: sha, Prompt: "Where is the function Target defined?"},
+		ExpectedOutput: json.RawMessage(`{"file":"foo.go","lineRange":[1,10]}`),
+		Tags:           []string{tagSuite, "find-symbol", tagVersion},
+	}
+
+	exec := newClaudeExecutorWithSpawner((&fakeSpawn{stream: readFixture(t, "claude_error_max_turns.jsonl")}).spawn)
+	d, err := NewDriver(Config{
+		Trials:         1,
+		Advertise:      AdvertiseMCP,
+		DonmaiBin:      filepath.Join(donmaiDir, "donmai"),
+		RepoRoots:      map[string]string{"test/repo": repoDir},
+		WorkareaParent: t.TempDir(),
+		Executor:       exec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := d.Run(context.Background(), []Case{c})
+	if err != nil {
+		t.Fatalf("Run must NOT abort on a control-arm error_max_turns: %v", err)
+	}
+	if len(rep.Records) != 2 {
+		t.Fatalf("both arms must be recorded, got %d", len(rep.Records))
+	}
+	for _, r := range rep.Records {
+		if r.Pass {
+			t.Errorf("arm %s: an empty error_max_turns answer must grade pass=false", r.Arm)
+		}
+	}
+}
+
 // writeExecInto drops an executable file `name` into an existing dir (unlike
 // writeFakeBinary, which makes its own temp dir) — so several tools can share a
 // single directory, simulating a co-install location like /opt/homebrew/bin.
