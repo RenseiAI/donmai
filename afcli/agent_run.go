@@ -342,7 +342,7 @@ func postSessionRunning(ctx context.Context, client *http.Client, logger *slog.L
 		return
 	}
 	url := strings.TrimRight(platformURL, "/") + "/api/sessions/" + sessionID + "/status"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body)) //nolint:gosec // G704: platformURL is the operator-configured platform base URL (trusted daemon/session config, not request-derived input)
 	if err != nil {
 		logger.Debug("agent run: status=running new request failed", "sessionId", sessionID, "err", err)
 		return
@@ -351,7 +351,7 @@ func postSessionRunning(ctx context.Context, client *http.Client, logger *slog.L
 	if authToken != "" {
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:gosec // G704: same trusted operator-configured URL as above
 	if err != nil {
 		logger.Debug("agent run: status=running post failed", "sessionId", sessionID, "err", err)
 		return
