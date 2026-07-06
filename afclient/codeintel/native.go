@@ -95,7 +95,12 @@ func NewNativeRunner(cwd string) *NativeRunner {
 //	    comment (wrong symbol fingerprints) and TS functions/methods carried
 //	    no extents at all (missing fingerprints), so stale v4 hashes must be
 //	    rebuilt
-const IndexSchemaVersion = 5
+//	v6: dedup fingerprints (file + symbol ContentHash/SimHash) are computed
+//	    over comment-STRIPPED normalized content (normalizeDupContent) — v5
+//	    hashes embed comment tokens, so a query normalized under v6 rules
+//	    could never match them (silent dedup false negatives; the
+//	    codeintel-dedup-donmai-001 renamed-function regression)
+const IndexSchemaVersion = 6
 
 // loadIndex attempts to read the persisted index.json. Returns an empty
 // IndexFile if the file does not exist, cannot be decoded, or carries a schema

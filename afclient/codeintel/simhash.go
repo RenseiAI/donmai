@@ -144,20 +144,115 @@ type DupStore struct {
 	entries []DupEntry
 }
 
-// normalizeDupContent normalises content for consistent hashing, matching the
-// TS DedupPipeline.normalize method:
-//   - CRLF → LF
-//   - tabs → two spaces
-//   - trailing whitespace stripped per line
-//   - trimmed overall
+// normalizeDupContent normalises content for consistent hashing. Extends the
+// TS DedupPipeline.normalize rules (CRLF → LF, tabs → two spaces, trailing
+// whitespace stripped per line, trimmed overall) with comment stripping
+// (index schema v6): // line comments and /* */ block comments are removed
+// BEFORE hashing, on BOTH the index side (file + symbol fingerprints) and the
+// query side.
+//
+// Why: symbol fingerprints cover the body from the declaration keyword line,
+// but agents paste candidate snippets WITH their doc comments. Hashing the
+// query as-is let comment tokens pollute its xxHash/SimHash — a pasted
+// function with its doc comment could never exact-match its indexed symbol,
+// and a comment rewording alone burned the entire near-match Hamming budget
+// before identifier renames even counted (the codeintel-dedup-donmai-001
+// live false negative). Stripping on both sides makes comments hash-neutral.
 func normalizeDupContent(content string) string {
 	s := strings.ReplaceAll(content, "\r\n", "\n")
+	s = stripDedupComments(s)
 	s = strings.ReplaceAll(s, "\t", "  ")
 	lines := strings.Split(s, "\n")
 	for i, l := range lines {
 		lines[i] = strings.TrimRight(l, " ")
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+// stripDedupComments removes // line comments and /* */ block comments from
+// content using the same string-literal-aware scanning discipline as
+// scanBlockExtent (blockscan.go): comment markers inside "…", '…', or `…`
+// literals are code, never comments. Lines that held ONLY a comment (or lie
+// entirely inside a block comment) are dropped outright, so a leading doc
+// comment reduces a pasted query to the same normalized body the index
+// stored, and rewording a comment across a different number of lines leaves
+// no differing blank-line residue in the exact tier.
+//
+// Dialect: one language-neutral pass. Quoted strings honor backslash escapes
+// and terminate at EOL (skipQuoted); backtick strings span lines with no
+// escapes (Go raw-string semantics; a TS template's \` escape would end the
+// skip early — acceptable because BOTH the index and query sides normalize
+// identically, so hashes stay consistent). Python/Rust # is untouched; # is
+// not a comment marker in the Go/TS grammars this engine fingerprints at
+// symbol granularity.
+func stripDedupComments(content string) string {
+	const (
+		stCode = iota
+		stBlockComment
+		stBacktick
+	)
+	st := stCode
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines))
+	var b strings.Builder
+	for _, line := range lines {
+		b.Reset()
+		// A line beginning inside a block comment is comment content even when
+		// it is empty (blank line inside /* … */).
+		stripped := st == stBlockComment
+		j := 0
+		for j < len(line) {
+			ch := line[j]
+			switch st {
+			case stBlockComment:
+				if ch == '*' && j+1 < len(line) && line[j+1] == '/' {
+					st = stCode
+					j += 2
+					continue
+				}
+				j++
+			case stBacktick:
+				b.WriteByte(ch)
+				if ch == '`' {
+					st = stCode
+				}
+				j++
+			default: // stCode
+				switch ch {
+				case '/':
+					if j+1 < len(line) && line[j+1] == '/' {
+						stripped = true
+						j = len(line) // line comment: rest of line is not code
+						continue
+					}
+					if j+1 < len(line) && line[j+1] == '*' {
+						stripped = true
+						st = stBlockComment
+						j += 2
+						continue
+					}
+					b.WriteByte(ch)
+					j++
+				case '"', '\'':
+					end := skipQuoted(line, j)
+					b.WriteString(line[j:end])
+					j = end
+				case '`':
+					st = stBacktick
+					b.WriteByte(ch)
+					j++
+				default:
+					b.WriteByte(ch)
+					j++
+				}
+			}
+		}
+		if stripped && strings.TrimSpace(b.String()) == "" {
+			continue // the line was comment-only — drop it, not a blank residue
+		}
+		out = append(out, b.String())
+	}
+	return strings.Join(out, "\n")
 }
 
 // CheckDuplicate checks content against the store for exact and near duplicates.

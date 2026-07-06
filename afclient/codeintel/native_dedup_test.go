@@ -472,6 +472,206 @@ func TestCheckDuplicate_SymbolWithBraceInString_Exact(t *testing.T) {
 	}
 }
 
+// ── Doc-comment/rename dedup ladder (live A/B regression, codeintel-dedup-donmai-001) ──
+//
+// The live eval regressed because the WITH agent pasted a near-duplicate of
+// FindGitRoot WITH its doc comment, renamed (LocateRepoRoot, start vs
+// startDir) and with the comment reworded — and the engine said "none".
+// Root cause: symbol hashes cover the BODY (from the func keyword line), but
+// the query was hashed as-is, so comment tokens polluted the query's
+// xxHash/SimHash. The empirical ladder before the comment-stripping fix:
+//
+//	rung 1  body-only verbatim              → symbol EXACT      (worked)
+//	rung 2  verbatim including doc comment  → file-level "near" (symbol match lost)
+//	rung 3  reworded comment, same idents   → NONE
+//	rung 4  reworded comment + 2 renames    → NONE  (the benchmark shape)
+//
+// After the fix (comments stripped from BOTH index-side and query-side
+// normalization) rungs 2–3 are symbol EXACT. Rung 4 measures Hamming 4 —
+// the two identifier renames alone (funcRename=0 bits, paramRename=5 bits,
+// both=4 bits over a 43-token body) exceed the default near threshold of 3,
+// so the default tool path still answers "none"; the threshold is NOT
+// loosened globally to force it (false-positive risk on every other query).
+// Instead the advertisement's none-branch was softened (4b): a "none" on
+// code suspected to be RENAMED from existing code warrants one targeted
+// grep, while positive matches stay authoritative.
+
+// dedupGitrootFixture is the FindGitRoot-shaped repo file: a doc-commented
+// walking-upward helper with an interior comment and backtick-quoted terms in
+// the doc text — the exact shape from the live regression.
+const dedupGitrootFixture = "package codeintel\n\n" +
+	"import (\n\t\"os\"\n\t\"path/filepath\"\n)\n\n" +
+	"// FindGitRoot walks upward from startDir looking for the enclosing git\n" +
+	"// repository root, i.e. the nearest ancestor (including startDir itself) that\n" +
+	"// contains a `.git` entry.\n" +
+	"//\n" +
+	"// Both forms of `.git` are accepted:\n" +
+	"//   - a DIRECTORY, the normal case for a primary checkout.\n" +
+	"//   - a FILE containing a `gitdir: <path>` pointer, the form used by\n" +
+	"//     `git worktree add` checkouts.\n" +
+	"//\n" +
+	"// Returns the absolute path to the discovered root and true, or (\"\", false)\n" +
+	"// if no `.git` entry is found before reaching the filesystem root.\n" +
+	dedupGitrootBody + "\n"
+
+// dedupGitrootBody is the fixture function from the `func` keyword line —
+// the exact span the index fingerprints at symbol granularity.
+const dedupGitrootBody = `func FindGitRoot(startDir string) (string, bool) {
+	dir, err := filepath.Abs(startDir)
+	if err != nil {
+		return "", false
+	}
+
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir, true
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached the filesystem root without finding .git.
+			return "", false
+		}
+		dir = parent
+	}
+}`
+
+// dedupRewordedDoc is a from-scratch rewording of the fixture's doc comment —
+// zero token overlap is not required, just realistic doc-drift.
+const dedupRewordedDoc = `// LocateRepoRoot scans parent directories to locate the repository
+// top-level folder: any ancestor holding a .git marker (directory or
+// worktree pointer file form).
+`
+
+// gitrootLadderRunner indexes the fixture repo file once for the ladder tests.
+func gitrootLadderRunner(t *testing.T) *NativeRunner {
+	t.Helper()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "gitroot.go"), dedupGitrootFixture)
+	nr := NewNativeRunner(dir)
+	if _, err := nr.BuildIndex(GetRepoMapOptions{}); err != nil {
+		t.Fatalf("BuildIndex: %v", err)
+	}
+	return nr
+}
+
+// checkDup runs one query through CheckDuplicateNative and returns the map.
+func checkDup(t *testing.T, nr *NativeRunner, content string) map[string]any {
+	t.Helper()
+	out, err := nr.CheckDuplicateNative(CheckDuplicateOptions{Content: content})
+	if err != nil {
+		t.Fatalf("CheckDuplicateNative: %v", err)
+	}
+	return out.(map[string]any)
+}
+
+// TestCheckDuplicate_Ladder_BodyOnlyExact pins rung 1 (the pre-fix baseline
+// that already worked): a verbatim body-only paste is a symbol-level exact.
+func TestCheckDuplicate_Ladder_BodyOnlyExact(t *testing.T) {
+	nr := gitrootLadderRunner(t)
+	m := checkDup(t, nr, dedupGitrootBody)
+	if m["matchType"] != "exact" || m["symbolName"] != "FindGitRoot" {
+		t.Errorf("body-only paste: matchType=%v symbolName=%v; want exact/FindGitRoot", m["matchType"], m["symbolName"])
+	}
+}
+
+// TestCheckDuplicate_Ladder_VerbatimWithDocComment pins rung 2: pasting the
+// function WITH its doc comment — the normal agent behavior — must still hit
+// the symbol-level EXACT match, not degrade to a file-level near.
+//
+// RED (before comment-stripping normalization):
+//
+//	native_dedup_test.go: doc-commented paste got matchType "near" symbolName <nil>; want exact/FindGitRoot
+func TestCheckDuplicate_Ladder_VerbatimWithDocComment(t *testing.T) {
+	nr := gitrootLadderRunner(t)
+	docStart := strings.Index(dedupGitrootFixture, "// FindGitRoot walks")
+	if docStart < 0 {
+		t.Fatal("fixture lost its doc comment")
+	}
+	m := checkDup(t, nr, dedupGitrootFixture[docStart:])
+	if m["matchType"] != "exact" {
+		t.Fatalf("doc-commented paste got matchType %q (symbolName=%v); want \"exact\" — comment tokens must not pollute the query hash", m["matchType"], m["symbolName"])
+	}
+	if m["symbolName"] != "FindGitRoot" {
+		t.Errorf("symbolName=%v; want FindGitRoot", m["symbolName"])
+	}
+}
+
+// TestCheckDuplicate_Ladder_RewordedCommentSameIdents pins rung 3: a reworded
+// doc comment with the code untouched must reduce to the same normalized body
+// — symbol-level EXACT.
+//
+// RED (before comment-stripping normalization):
+//
+//	native_dedup_test.go: reworded-comment paste got matchType "none"; want "exact"
+func TestCheckDuplicate_Ladder_RewordedCommentSameIdents(t *testing.T) {
+	nr := gitrootLadderRunner(t)
+	m := checkDup(t, nr, dedupRewordedDoc+dedupGitrootBody)
+	if m["matchType"] != "exact" {
+		t.Fatalf("reworded-comment paste got matchType %q; want \"exact\" — comment rewording alone must not defeat dedup", m["matchType"])
+	}
+	if m["symbolName"] != "FindGitRoot" {
+		t.Errorf("symbolName=%v; want FindGitRoot", m["symbolName"])
+	}
+}
+
+// TestCheckDuplicate_Ladder_BenchmarkRenameShape pins rung 4 — the exact
+// codeintel-dedup-donmai-001 failure shape: function renamed
+// (FindGitRoot→LocateRepoRoot), param renamed (startDir→start), doc comment
+// reworded — at its honest post-fix behavior:
+//
+//  1. Comment stripping moved the shape from token-noise-drowned (the reworded
+//     doc alone burned the whole Hamming budget) to a pure rename distance:
+//     the query is a symbol-level NEAR at Hamming 4 — one bit past the default
+//     threshold of 3 — with the correct filePath+symbolName+line identity.
+//  2. The DEFAULT tool path therefore still answers "none". The threshold is
+//     deliberately NOT loosened globally to absorb this shape (that would
+//     trade a benchmark rung for false positives everywhere); instead the
+//     advertisement's none-branch says a "none" on suspected-RENAMED code
+//     warrants one targeted grep (eval/codeintel/advertise.go, 4b).
+//
+// If a future normalization change brings the rename shape within the default
+// threshold, assertion 2 flips — restore the "trust the none" advertisement
+// wording in the same change.
+func TestCheckDuplicate_Ladder_BenchmarkRenameShape(t *testing.T) {
+	nr := gitrootLadderRunner(t)
+	renamed := strings.ReplaceAll(dedupGitrootBody, "FindGitRoot", "LocateRepoRoot")
+	renamed = strings.ReplaceAll(renamed, "startDir", "start")
+	query := dedupRewordedDoc + renamed
+
+	// (1) One bit past the default budget: at threshold+1 the symbol-level
+	// near fires with full identity. RED before comment stripping: no match at
+	// ANY sane threshold — comment tokens pushed the distance far beyond it.
+	idx := nr.loadIndex()
+	corpus := make([]FileIndex, 0, len(idx.Files))
+	for _, fi := range idx.Files {
+		corpus = append(corpus, fi)
+	}
+	matches := FindDuplicateMatches(query, corpus, SimHashDefaultThreshold+1, 1)
+	if len(matches) == 0 {
+		t.Fatalf("benchmark rename shape found no match even at threshold %d — comment stripping regressed", SimHashDefaultThreshold+1)
+	}
+	m := matches[0]
+	if m.MatchType != "near" || m.SymbolName != "FindGitRoot" || m.FilePath != "gitroot.go" {
+		t.Errorf("threshold+1 match = %+v; want symbol-level near on gitroot.go/FindGitRoot", m)
+	}
+	wantLine := strings.Count(strings.SplitAfter(dedupGitrootFixture, "func FindGitRoot")[0], "\n") + 1
+	if m.Line != wantLine {
+		t.Errorf("line=%d; want %d", m.Line, wantLine)
+	}
+	if m.HammingDistance != SimHashDefaultThreshold+1 {
+		t.Errorf("hammingDistance=%d; want exactly %d (the measured rename cost — if this drops to <=%d, flip the default-path assertion below and restore the advertisement wording)",
+			m.HammingDistance, SimHashDefaultThreshold+1, SimHashDefaultThreshold)
+	}
+
+	// (2) The default tool path still answers "none" — the residual limitation
+	// the 4b advertisement caveat exists for.
+	got := checkDup(t, nr, query)
+	if got["matchType"] != "none" {
+		t.Errorf("default-threshold path got matchType %q; the 4b none-branch caveat assumes \"none\" — if the engine now catches the rename shape, restore the trust-the-none advertisement instead", got["matchType"])
+	}
+}
+
 // TestComputeSymbolHashes_MinLinesBoundary pins the symbolHashMinLines
 // boundary exactly (a `<` vs `<=` mutation must go red): a 2-line extent is
 // excluded, a 3-line extent is included — and the inclusion is observable

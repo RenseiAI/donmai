@@ -171,6 +171,32 @@ func TestLoadIndex_V4IndexDiscarded(t *testing.T) {
 	}
 }
 
+// TestLoadIndex_V5IndexDiscarded pins the v5→v6 migration: a persisted index
+// written under schema v5 (dedup hashes computed over comment-INCLUSIVE
+// content) must be discarded on load — v5 fingerprints embed comment tokens,
+// so a query normalized under v6's comment-stripping rules could never match
+// them (silent dedup false negatives against stale hashes).
+func TestLoadIndex_V5IndexDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	idxDir := filepath.Join(dir, ".donmai/code-index")
+	if err := os.MkdirAll(idxDir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	v5 := `{"version":5,"files":{"a.go":{"filePath":"a.go","gitHash":"abc","symbols":[{"name":"Foo","kind":"function","filePath":"a.go","line":9,"endLine":11}],"symbolHashes":[{"name":"Foo","line":9,"contentHash":"0011223344556677","simHash":1}],"lastIndexed":1}},"rootHash":"beef"}`
+	if err := os.WriteFile(filepath.Join(idxDir, "index.json"), []byte(v5), 0o640); err != nil { //nolint:gosec // G306 test fixture
+		t.Fatalf("write: %v", err)
+	}
+
+	nr := NewNativeRunner(dir)
+	loaded := nr.loadIndex()
+	if len(loaded.Files) != 0 {
+		t.Errorf("loaded %d files from a v5 index; want 0 — v5 hashes include comment tokens and must be discarded+rebuilt under v6 comment-stripped normalization", len(loaded.Files))
+	}
+	if loaded.Version != IndexSchemaVersion {
+		t.Errorf("discarded index Version = %d; want %d", loaded.Version, IndexSchemaVersion)
+	}
+}
+
 // TestIndexSchemaVersion_AtLeastV3 pins the version floor: v3 is the schema
 // bump that made persisted symbol line/endLine 1-based at the declaration
 // keyword (WS8). Regressing the constant below 3 would let stale 0-based line
