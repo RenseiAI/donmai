@@ -240,3 +240,50 @@ func contains(ss []string, s string) bool {
 	}
 	return false
 }
+
+// TestTypeScriptExtractor_LineIsDeclarationKeywordLine pins 1-based line
+// attribution at the declaration keyword for TS symbols, including class
+// members and EndLine (the closing-brace line).
+func TestTypeScriptExtractor_LineIsDeclarationKeywordLine(t *testing.T) {
+	src := `/**
+ * GreetingService provides greetings.
+ * Multi-line JSDoc so doc start and keyword line differ.
+ */
+export class GreetingService {
+  greet(name: string): string {
+    return name
+  }
+}
+
+export function greetUser(name: string): string {
+  return name
+}
+`
+	ext := &TypeScriptExtractor{}
+	ast := ext.Extract(src, "svc.ts")
+
+	cls := findSymbol(ast.Symbols, "GreetingService", KindClass)
+	if cls == nil {
+		t.Fatal("missing class GreetingService")
+	}
+	if cls.Line != 5 {
+		t.Errorf("class Line = %d, want 5 (1-based keyword line)", cls.Line)
+	}
+	if cls.EndLine == nil || *cls.EndLine != 9 {
+		t.Errorf("class EndLine = %v, want 9 (1-based closing-brace line)", cls.EndLine)
+	}
+	method := findSymbol(ast.Symbols, "greet", KindMethod)
+	if method == nil {
+		t.Fatal("missing method greet")
+	}
+	if method.Line != 6 {
+		t.Errorf("method Line = %d, want 6", method.Line)
+	}
+	fn := findSymbol(ast.Symbols, "greetUser", KindFunction)
+	if fn == nil {
+		t.Fatal("missing function greetUser")
+	}
+	if fn.Line != 11 {
+		t.Errorf("function Line = %d, want 11", fn.Line)
+	}
+}

@@ -42,11 +42,13 @@ sample was verified by hand:
 
 - **find-symbol** — `git grep -n '^func <name>'` / `'^type <name>'` /
   `'^export (function|class|interface) <name>'` gives the authoritative
-  definition line. `lineRange` is a tolerance window around it (the engine
-  reports the definition line off-by-one in some cases, e.g. `newAgentRunCmd`
-  is at `afcli/agent_run.go:80` but `donmai code search-symbols` reports 79 —
-  which is precisely why the ground truth is the hand-verified `git grep` line
-  with a window, not the engine's output). The grader passes only when the
+  definition line. `lineRange` is a tolerance window around it. The window
+  exists to absorb agent phrasing variance (answers citing the doc-comment
+  start or the opening-brace line), NOT engine error: the engine reports the
+  exact 1-based declaration-keyword line (`newAgentRunCmd` →
+  `afcli/agent_run.go:80`; historic index schema v2 stored 0-based lines and
+  reported 79, fixed in v3 — see `TestGoExtractor_LineIsDeclarationKeywordLine`
+  and `TestEngineLine_MatchesGitGrepLine`). The grader passes only when the
   answer names the right file **and** a line inside the window.
 - **locate-usage** — `git grep -ln '<symbol>' -- '<glob>' | grep -v test`
   enumerates the usage-site file set. `minRecall` scales with set size

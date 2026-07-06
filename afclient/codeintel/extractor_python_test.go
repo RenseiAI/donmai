@@ -169,3 +169,36 @@ func pySymbolNames(syms []CodeSymbol) []string {
 	}
 	return out
 }
+
+// TestPythonExtractor_LineIsDeclarationKeywordLine pins 1-based line
+// attribution at the def/class keyword line.
+func TestPythonExtractor_LineIsDeclarationKeywordLine(t *testing.T) {
+	src := `import os
+
+
+class Greeter:
+    def greet(self, name):
+        return name
+
+
+def greet_user(name):
+    return name
+`
+	ext := &PythonExtractor{}
+	ast := ext.Extract(src, "svc.py")
+
+	cls := findSymbol(ast.Symbols, "Greeter", KindClass)
+	if cls == nil {
+		t.Fatal("missing class Greeter")
+	}
+	if cls.Line != 4 {
+		t.Errorf("class Line = %d, want 4 (1-based keyword line)", cls.Line)
+	}
+	fn := findSymbol(ast.Symbols, "greet_user", KindFunction)
+	if fn == nil {
+		t.Fatal("missing function greet_user")
+	}
+	if fn.Line != 9 {
+		t.Errorf("function Line = %d, want 9", fn.Line)
+	}
+}

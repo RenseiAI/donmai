@@ -70,16 +70,19 @@ const (
 // JSON field names must match the TS serialisation exactly for index.json
 // round-trip compatibility.
 type CodeSymbol struct {
-	Name          string     `json:"name"`
-	Kind          SymbolKind `json:"kind"`
-	FilePath      string     `json:"filePath"`
-	Line          int        `json:"line"`
-	EndLine       *int       `json:"endLine,omitempty"`
-	Signature     string     `json:"signature,omitempty"`
-	Documentation string     `json:"documentation,omitempty"`
-	Exported      bool       `json:"exported"`
-	ParentName    string     `json:"parentName,omitempty"`
-	Language      string     `json:"language,omitempty"`
+	Name     string     `json:"name"`
+	Kind     SymbolKind `json:"kind"`
+	FilePath string     `json:"filePath"`
+	// Line is the 1-based line of the declaration keyword itself (`func`,
+	// `type`, `class`, …) — not the doc-comment start. EndLine (when set) is
+	// the 1-based closing-brace line.
+	Line          int    `json:"line"`
+	EndLine       *int   `json:"endLine,omitempty"`
+	Signature     string `json:"signature,omitempty"`
+	Documentation string `json:"documentation,omitempty"`
+	Exported      bool   `json:"exported"`
+	ParentName    string `json:"parentName,omitempty"`
+	Language      string `json:"language,omitempty"`
 }
 
 // FileAST holds the extraction result for a single file. It is an in-memory

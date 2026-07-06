@@ -169,3 +169,35 @@ func TestRustExtractor_Exports(t *testing.T) {
 		t.Error("expected private_func not in exports")
 	}
 }
+
+// TestRustExtractor_LineIsDeclarationKeywordLine pins 1-based line attribution
+// at the fn/struct keyword line, with a doc comment above.
+func TestRustExtractor_LineIsDeclarationKeywordLine(t *testing.T) {
+	src := `/// Greets a user.
+/// Multi-line doc so doc start and keyword line differ.
+pub fn greet_user(name: &str) -> String {
+    name.to_string()
+}
+
+pub struct Greeter {
+    name: String,
+}
+`
+	ext := &RustExtractor{}
+	ast := ext.Extract(src, "svc.rs")
+
+	fn := findSymbol(ast.Symbols, "greet_user", KindFunction)
+	if fn == nil {
+		t.Fatal("missing fn greet_user")
+	}
+	if fn.Line != 3 {
+		t.Errorf("fn Line = %d, want 3 (1-based keyword line)", fn.Line)
+	}
+	st := findSymbol(ast.Symbols, "Greeter", KindStruct)
+	if st == nil {
+		t.Fatal("missing struct Greeter")
+	}
+	if st.Line != 7 {
+		t.Errorf("struct Line = %d, want 7", st.Line)
+	}
+}

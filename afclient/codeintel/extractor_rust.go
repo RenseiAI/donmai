@@ -67,7 +67,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Name:      name,
 				Kind:      KindFunction,
 				FilePath:  filePath,
-				Line:      i,
+				Line:      i + 1,
 				Exported:  isPublic,
 				Signature: sig,
 				Language:  "rust",
@@ -90,7 +90,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindStruct,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: isPublic,
 				Language: "rust",
 			}
@@ -112,7 +112,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindEnum,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: isPublic,
 				Language: "rust",
 			}
@@ -134,7 +134,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindTrait,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: isPublic,
 				Language: "rust",
 			}
@@ -161,7 +161,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindImpl,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: false,
 				Language: "rust",
 			}
@@ -180,7 +180,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindMacro,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: isPublic,
 				Language: "rust",
 			}
@@ -202,7 +202,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindVariable,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: isPublic,
 				Language: "rust",
 			}
@@ -221,7 +221,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindType,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: isPublic,
 				Language: "rust",
 			}
@@ -240,7 +240,7 @@ func (e *RustExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindModule,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: isPublic,
 				Language: "rust",
 			}
