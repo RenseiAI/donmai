@@ -405,13 +405,13 @@ func TestRunBackstop_CommitIdentity(t *testing.T) {
 	t.Run("honors provisioner-supplied identity", func(t *testing.T) {
 		// The cloud box provisioner stamps this into the env.
 		t.Setenv("GIT_AUTHOR_NAME", "Rensei Agent")
-		t.Setenv("GIT_AUTHOR_EMAIL", "agent@rensei.dev")
+		t.Setenv("GIT_AUTHOR_EMAIL", "agent@example.com")
 		t.Setenv("GIT_COMMITTER_NAME", "Rensei Agent")
-		t.Setenv("GIT_COMMITTER_EMAIL", "agent@rensei.dev")
+		t.Setenv("GIT_COMMITTER_EMAIL", "agent@example.com")
 
 		authorOut := commitAuthor(t)
-		if !strings.Contains(authorOut, "Rensei Agent") || !strings.Contains(authorOut, "agent@rensei.dev") {
-			t.Errorf("commit author = %q; want provisioner identity \"Rensei Agent <agent@rensei.dev>\"", authorOut)
+		if !strings.Contains(authorOut, "Rensei Agent") || !strings.Contains(authorOut, "agent@example.com") {
+			t.Errorf("commit author = %q; want provisioner identity \"Rensei Agent <agent@example.com>\"", authorOut)
 		}
 		if strings.Contains(authorOut, "Donmai Agent") {
 			t.Errorf("commit author = %q; provisioner identity should win over the session default", authorOut)
