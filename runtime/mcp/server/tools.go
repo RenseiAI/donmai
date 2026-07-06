@@ -122,9 +122,10 @@ func (s *Server) buildTools() []*toolDef {
 		},
 		{
 			name: ToolFindTypeUsages,
-			description: "Find all usage sites of a union type or enum: switch/case discriminators, " +
-				"Record<> mappings, exhaustive checks, and type references. Use before adding a " +
-				"new member to a union type.",
+			description: "Find every usage site of a named type across the repo (Go, TypeScript, and other " +
+				"indexed languages): declarations, type references, switch/case sites, and lookup-table " +
+				"keys. Call BEFORE a cross-file rename, refactor, or member addition to enumerate all " +
+				"affected sites before editing.",
 			inputSchema: schemaFindTypeUsages,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
