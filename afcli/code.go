@@ -171,7 +171,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().IntVar(&maxResults, "max-results", 0, "Maximum results (0 = default of 5; exact-name matches short-circuit to at most 3)")
+	cmd.Flags().IntVar(&maxResults, "max-results", 0, "Maximum results (0 = default of 5; exact-name matches return every exact hit, up to 20)")
 	cmd.Flags().StringVar(&kinds, "kinds", "", "Comma-separated symbol kinds: function,class,interface,type,etc.")
 	cmd.Flags().StringVar(&filePattern, "file-pattern", "", "Filter by file pattern (e.g. \"*.go\")")
 	cmd.Flags().BoolVar(&includeDoc, "include-doc", false, "Include full multi-line symbol documentation (default: compact one-line docs)")

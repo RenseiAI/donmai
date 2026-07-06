@@ -52,31 +52,38 @@ type codeIntelToolMeta struct {
 // codeIntelTools is the canonical, ordered set of the six code-intel tools —
 // the single source of truth the entry args, the FQ allow-list, and the prompt
 // partial all derive from. Order matches the frozen wire contract.
+// Guidance framing contract (WS4 parity with eval/codeintel/advertise.go):
+// task-conditional and language-neutral. Each line names the job the tool wins
+// over grep+read — orientation, pre-edit site enumeration, near-dup detection —
+// and the partial closes with an explicit grep de-scope clause. Never
+// reintroduce the blanket "prefer them over grep/glob/find" framing (pilot:
+// 1.0–2.10x token cost at +0pp success) or single-language idioms ("union
+// type", "Record<") that told non-TS agents a tool was inapplicable.
 var codeIntelTools = []codeIntelToolMeta{
 	{
 		tool:       "af_code_get_repo_map",
 		subcommand: "get-repo-map",
-		guidance:   "get a PageRank-ranked map of the most important files and their key symbols to orient in an unfamiliar repo",
+		guidance:   "when orienting in an unfamiliar repo or subsystem, call this FIRST: it ranks files by import centrality with their key symbols",
 	},
 	{
 		tool:       "af_code_search_symbols",
 		subcommand: "search-symbols <query>",
-		guidance:   "find a function, class, interface, or type by name or query (BM25 over the symbol index) instead of grepping",
+		guidance:   "find where a function, method, or type is defined when you only know (part of) its name",
 	},
 	{
 		tool:       "af_code_search_code",
 		subcommand: "search-code <query>",
-		guidance:   "BM25 keyword search over code content (upgrades to hybrid vector + rerank when VOYAGE_AI_API_KEY / COHERE_API_KEY are set)",
+		guidance:   "search code content by keyword or concept when the exact identifier is unknown",
 	},
 	{
 		tool:       "af_code_check_duplicate",
 		subcommand: "check-duplicate --content <snippet>",
-		guidance:   "check whether a snippet is an exact (xxHash64) or near (SimHash) duplicate before writing new code",
+		guidance:   "before writing new code, check whether an equivalent snippet already exists (exact or near-duplicate)",
 	},
 	{
 		tool:       "af_code_find_type_usages",
 		subcommand: "find-type-usages <TypeName>",
-		guidance:   "find every switch/case, mapping, and usage site of a union type or enum before adding a member",
+		guidance:   "before any cross-file rename or refactor, enumerate every usage site of the type and work from that list",
 	},
 	{
 		tool:       "af_code_validate_cross_deps",
@@ -246,7 +253,7 @@ func codeIntelUsagePartial(mcpCapable bool, ci *prompt.CodeIntelWork) string {
 	b.WriteString("# Code Intelligence\n\n")
 	if mcpCapable {
 		b.WriteString("This session has the af-code-intelligence tools available. " +
-			"Prefer them over ad-hoc grep/glob/find when navigating or searching this repository:\n")
+			"Each is built for a job where grep+read is weak; use them in exactly these situations:\n")
 		for _, tm := range tools {
 			b.WriteString("\n- ")
 			b.WriteString(codeIntelFQPrefix + tm.tool)
@@ -256,7 +263,7 @@ func codeIntelUsagePartial(mcpCapable bool, ci *prompt.CodeIntelWork) string {
 	} else {
 		cli := prompt.ResolveBrand().BrandCLI
 		b.WriteString("This session has code-intelligence CLI commands available (run them with Bash). " +
-			"Prefer them over ad-hoc grep/glob/find when navigating or searching this repository:\n")
+			"Each is built for a job where grep+read is weak; use them in exactly these situations:\n")
 		for _, tm := range tools {
 			b.WriteString("\n- `")
 			b.WriteString(cli + " code " + tm.subcommand)
@@ -264,5 +271,6 @@ func codeIntelUsagePartial(mcpCapable bool, ci *prompt.CodeIntelWork) string {
 			b.WriteString(tm.guidance)
 		}
 	}
+	b.WriteString("\n\nFor an exact single-identifier lookup, plain grep is fine — do not add a tool call.")
 	return b.String()
 }

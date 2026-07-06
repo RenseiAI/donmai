@@ -606,31 +606,47 @@ func (n *NativeRunner) SearchSymbolsNative(opts SearchSymbolsOptions) (any, erro
 		}
 	}
 
-	// Sort descending by score.
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].score != results[j].score {
-			return results[i].score > results[j].score
+	// Sort descending by score with a FULLY-ORDERING tie-break chain
+	// (name, filePath, line): candidates come from map iteration, so any tie
+	// left to the incoming order makes the result — and any truncation cut —
+	// nondeterministic run to run. Exact matches all share the same score AND
+	// name, which is why the chain must reach filePath/line.
+	sort.SliceStable(results, func(i, j int) bool {
+		a, b := results[i], results[j]
+		if a.score != b.score {
+			return a.score > b.score
 		}
-		return results[i].symbol.Name < results[j].symbol.Name
+		if a.symbol.Name != b.symbol.Name {
+			return a.symbol.Name < b.symbol.Name
+		}
+		if a.symbol.FilePath != b.symbol.FilePath {
+			return a.symbol.FilePath < b.symbol.FilePath
+		}
+		return a.symbol.Line < b.symbol.Line
 	})
 
 	// Exact-match short-circuit: when the query names a symbol exactly, the
-	// sibling prefix/fuzzy hits are noise — return only the exact match(es),
-	// capped at symbolExactCap unless the caller explicitly raised MaxResults.
+	// sibling prefix/fuzzy hits are noise — return the exact matches, ALL of
+	// them up to symbolExactMaxResults (or an explicit MaxResults). "Where is
+	// X defined" with several same-name definitions must surface every
+	// definition, never a silent subset; if a cap still truncates, a trailing
+	// sentinel reports the omitted count.
 	var exacts []scored
 	for _, r := range results {
 		if strings.ToLower(r.symbol.Name) == queryLower {
 			exacts = append(exacts, r)
 		}
 	}
+	truncatedExacts := 0
 	if len(exacts) > 0 {
-		limit := symbolExactCap
+		limit := symbolExactMaxResults
 		if opts.MaxResults > 0 {
 			limit = opts.MaxResults
 		}
 		if limit > len(exacts) {
 			limit = len(exacts)
 		}
+		truncatedExacts = len(exacts) - limit
 		results = exacts[:limit]
 	} else {
 		maxResults := opts.MaxResults
@@ -643,12 +659,21 @@ func (n *NativeRunner) SearchSymbolsNative(opts SearchSymbolsOptions) (any, erro
 		results = results[:maxResults]
 	}
 
-	out := make([]map[string]any, 0, len(results))
+	out := make([]map[string]any, 0, len(results)+1)
 	for _, r := range results {
 		out = append(out, map[string]any{
 			"symbol":    projectSymbol(r.symbol, opts.IncludeDoc),
 			"score":     r.score,
 			"matchType": matchType(r.symbol.Name, queryLower),
+		})
+	}
+	if truncatedExacts > 0 {
+		// Sentinel final element: no "symbol"/"filePath" keys, so parsers that
+		// walk hits (or collect filePath values) skip it safely, while an agent
+		// reading the JSON sees the truncation instead of a silent subset.
+		out = append(out, map[string]any{
+			"truncatedExactMatches": truncatedExacts,
+			"hint":                  "raise maxResults to see all exact definitions",
 		})
 	}
 	return out, nil
@@ -660,10 +685,14 @@ func (n *NativeRunner) SearchSymbolsNative(opts SearchSymbolsOptions) (any, erro
 // Callers can always raise MaxResults explicitly.
 const symbolDefaultMaxResults = 5
 
-// symbolExactCap bounds the exact-match short-circuit: when the query names a
-// symbol exactly, at most this many exact hits are returned (unless the caller
-// explicitly set MaxResults higher).
-const symbolExactCap = 3
+// symbolExactMaxResults bounds the exact-match short-circuit: when the query
+// names a symbol exactly, ALL exact hits are returned up to this hard cap —
+// the pre-WS1 effective ceiling, so the short-circuit is never lossier than
+// the old default path. An explicit MaxResults overrides the cap in either
+// direction. When the cap still truncates, a trailing sentinel element
+// {"truncatedExactMatches": n, "hint": …} reports the omitted count so the
+// caller is never silently shown a subset of same-name definitions.
+const symbolExactMaxResults = 20
 
 // compactDocMaxLen is the rune cap for the truncated one-line documentation in
 // the compact (default) search result projection.

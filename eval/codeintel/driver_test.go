@@ -386,7 +386,8 @@ func TestComputeAggregate_PoweredCorpusCanPass(t *testing.T) {
 				f.WithoutTrials++
 				f.WithTokens = append(f.WithTokens, 100)
 				f.WithoutTokens = append(f.WithoutTokens, 110)
-				records = append(records,
+				records = append(
+					records,
 					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWith, Pass: true},
 					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWithout, Pass: false},
 				)
@@ -456,7 +457,8 @@ func TestComputeAggregate_WideCIPoweredRunFailsOnLowerBound(t *testing.T) {
 				if woPass {
 					f.WithoutPasses++
 				}
-				records = append(records,
+				records = append(
+					records,
 					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWith, Pass: true},
 					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWithout, Pass: woPass},
 				)
@@ -481,5 +483,123 @@ func TestComputeAggregate_WideCIPoweredRunFailsOnLowerBound(t *testing.T) {
 	if agg.MeetsThreshold {
 		t.Errorf("a powered run whose 95%% CI lower bound (%.2f) is below +15pp must NOT meet the founder threshold — the point estimate (%.2f) is not enough",
 			agg.DeltaCILow, agg.DeltaPP)
+	}
+}
+
+// TestAccumulate_CorrectSkipNotCountedAsAdoption keeps the adoption-rate
+// metric honest under the F3 correct-skip policy: a WITH-arm trial graded as a
+// correct skip (Pass true, adopted=false) must NOT bump FamilyStat.Adoption,
+// while a genuinely adopted trial still does.
+func TestAccumulate_CorrectSkipNotCountedAsAdoption(t *testing.T) {
+	f := &FamilyStat{}
+
+	correctSkip := RunRecord{
+		Arm: ArmWith, Pass: true,
+		Grades: []GradeResult{{
+			GraderID: GraderToolUse, Score: 1, Pass: true,
+			Metadata: map[string]any{"applicable": true, "adopted": false, "correctSkip": true},
+		}},
+	}
+	accumulate(f, correctSkip)
+	if f.Adoption != 0 {
+		t.Errorf("correct skip counted as adoption: Adoption = %d, want 0", f.Adoption)
+	}
+	if f.WithTrials != 1 || f.WithPasses != 1 {
+		t.Errorf("correct skip must still count the trial/pass: %+v", f)
+	}
+
+	adopted := RunRecord{
+		Arm: ArmWith, Pass: true,
+		Grades: []GradeResult{{
+			GraderID: GraderToolUse, Score: 1, Pass: true,
+			Metadata: map[string]any{"applicable": true, "adopted": true, "correctTool": true},
+		}},
+	}
+	accumulate(f, adopted)
+	if f.Adoption != 1 {
+		t.Errorf("real adoption must count: Adoption = %d, want 1", f.Adoption)
+	}
+}
+
+// TestBuildArmSpec_FamilyToolSubsetPlumbing pins the WS2 family→surface
+// plumbing end to end through buildArmSpec: the refactor family's WITH arm
+// carries find_type_usages (5 advertised tools) and the MCP server's --tools
+// allow-list names exactly the same subset; the find-symbol family carries the
+// core four without it.
+func TestBuildArmSpec_FamilyToolSubsetPlumbing(t *testing.T) {
+	donmaiDir := writeFakeBinary(t, "donmai")
+	d, err := NewDriver(Config{
+		Trials:         1,
+		Advertise:      AdvertiseMCP,
+		DonmaiBin:      filepath.Join(donmaiDir, "donmai"),
+		WorkareaParent: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	build := func(family TaskType) (ArmSpec, func()) {
+		t.Helper()
+		c := Case{
+			ID:    "sub-" + string(family),
+			Input: CaseInput{TaskType: family, Repo: "r", Ref: "s", Prompt: "p"},
+		}
+		spec, cleanup, err := d.buildArmSpec(context.Background(), c, ArmWith, t.TempDir(), "sess")
+		if err != nil {
+			t.Fatalf("buildArmSpec(%s): %v", family, err)
+		}
+		return spec, cleanup
+	}
+
+	toolsCSV := func(spec ArmSpec) string {
+		t.Helper()
+		if len(spec.MCPServers) != 1 {
+			t.Fatalf("want one MCP server, got %d", len(spec.MCPServers))
+		}
+		args := spec.MCPServers[0].Args
+		for i := 0; i < len(args)-1; i++ {
+			if args[i] == "--tools" {
+				return args[i+1]
+			}
+		}
+		t.Fatalf("no --tools flag in server args %v", args)
+		return ""
+	}
+
+	// Refactor family: 5 advertised tools including find_type_usages, and the
+	// server --tools list matches the advertised set 1:1 (FQ prefix aside).
+	rfSpec, rfCleanup := build(TaskRefactorAcrossFiles)
+	defer rfCleanup()
+	if len(rfSpec.AdvertisedTools) != 5 {
+		t.Fatalf("refactor AdvertisedTools = %v, want 5 entries", rfSpec.AdvertisedTools)
+	}
+	hasXref := false
+	for _, n := range rfSpec.AdvertisedTools {
+		if n == fqName("af_code_find_type_usages") {
+			hasXref = true
+		}
+	}
+	if !hasXref {
+		t.Errorf("refactor arm must advertise af_code_find_type_usages; got %v", rfSpec.AdvertisedTools)
+	}
+	rfServer := strings.Split(toolsCSV(rfSpec), ",")
+	if len(rfServer) != len(rfSpec.AdvertisedTools) {
+		t.Fatalf("server --tools (%v) and AdvertisedTools (%v) diverge in size", rfServer, rfSpec.AdvertisedTools)
+	}
+	for i, unq := range rfServer {
+		if fqName(unq) != rfSpec.AdvertisedTools[i] {
+			t.Errorf("server tool %d = %q does not match advertised %q", i, unq, rfSpec.AdvertisedTools[i])
+		}
+	}
+
+	// Find-symbol family: core four, no find_type_usages anywhere.
+	fsSpec, fsCleanup := build(TaskFindSymbol)
+	defer fsCleanup()
+	if len(fsSpec.AdvertisedTools) != 4 {
+		t.Fatalf("find-symbol AdvertisedTools = %v, want 4 entries", fsSpec.AdvertisedTools)
+	}
+	fsJoined := strings.Join(fsSpec.AdvertisedTools, " ") + " " + toolsCSV(fsSpec)
+	if strings.Contains(fsJoined, "find_type_usages") {
+		t.Errorf("find-symbol arm must not carry find_type_usages: %s", fsJoined)
 	}
 }

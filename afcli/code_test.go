@@ -161,7 +161,8 @@ func TestCodeSearchSymbols_BasicQuery(t *testing.T) {
 }
 
 func TestCodeSearchSymbols_AllFlags(t *testing.T) {
-	m, err := execCodeCmd(t, "search-symbols", "handleRequest",
+	m, err := execCodeCmd(
+		t, "search-symbols", "handleRequest",
 		"--max-results", "5",
 		"--kinds", "function,method",
 		"--file-pattern", "*.go",
@@ -536,5 +537,127 @@ func TestCodeCmd_SearchCodeNativeNoExec(t *testing.T) {
 	root.SetArgs([]string{"code", "search-code", "main"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("search-code should not error with native S2 impl: %v", err)
+	}
+}
+
+// ── F8: --include-doc flag plumbing (search-symbols / search-code) ───────────
+
+// runNativeCodeCmdArray is runNativeCodeCmd for subcommands whose stdout JSON
+// is an ARRAY of hits (search-symbols / search-code) rather than an object.
+func runNativeCodeCmdArray(t *testing.T, dir string, args ...string) []map[string]any {
+	t.Helper()
+	t.Setenv("AGENTFACTORY_CODE_BIN", "")
+	t.Setenv("DONMAI_CODE_BIN", "")
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", t.TempDir()) // no donmai-code/pnpm resolvable
+	defer func() { _ = os.Setenv("PATH", origPath) }()
+
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(orig) }()
+
+	root := &cobra.Command{Use: "donmai", SilenceUsage: true, SilenceErrors: true}
+	root.AddCommand(newCodeCmd(Config{}))
+
+	oldOut := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	root.SetArgs(append([]string{"code"}, args...))
+	runErr := root.Execute()
+
+	_ = w.Close()
+	os.Stdout = oldOut
+
+	var out bytes.Buffer
+	if _, readErr := out.ReadFrom(r); readErr != nil {
+		t.Fatalf("read stdout pipe: %v", readErr)
+	}
+	if runErr != nil {
+		t.Fatalf("code %v: %v", args, runErr)
+	}
+
+	var hits []map[string]any
+	if jsonErr := json.Unmarshal(out.Bytes(), &hits); jsonErr != nil {
+		t.Fatalf("parse stdout JSON array: %v (raw: %q)", jsonErr, out.String())
+	}
+	return hits
+}
+
+// cliDocSecondLine is a sentinel confined to the 2nd doc line of the fixture
+// symbol, so the flag tests can tell compact from full projections apart.
+const cliDocSecondLine = "CLI-SECOND-DOC-LINE-SENTINEL"
+
+// writeMultilineDocRepo builds a .git-rooted repo whose one symbol carries a
+// multi-line documentation block.
+func writeMultilineDocRepo(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	src := `package pay
+
+// ProcessPayment handles a payment end to end.
+// ` + cliDocSecondLine + ` it validates, authorizes and settles.
+func ProcessPayment(id string) error { return nil }
+`
+	if err := os.WriteFile(filepath.Join(root, "pay.go"), []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// docOfFirstHit extracts hits[0].symbol.documentation.
+func docOfFirstHit(t *testing.T, hits []map[string]any) string {
+	t.Helper()
+	if len(hits) == 0 {
+		t.Fatal("expected at least one hit")
+	}
+	sym, ok := hits[0]["symbol"].(map[string]any)
+	if !ok {
+		t.Fatalf("hit has no symbol object: %v", hits[0])
+	}
+	doc, _ := sym["documentation"].(string)
+	if doc == "" {
+		t.Fatalf("hit carries no documentation: %v", sym)
+	}
+	return doc
+}
+
+// TestCodeSearchSymbols_IncludeDocFlagPlumbing proves the --include-doc flag
+// reaches the engine: without it the JSON documentation is the compact single
+// line (no 2nd doc line); with it the full multi-line block comes back.
+func TestCodeSearchSymbols_IncludeDocFlagPlumbing(t *testing.T) {
+	root := writeMultilineDocRepo(t)
+
+	compact := docOfFirstHit(t, runNativeCodeCmdArray(t, root, "search-symbols", "ProcessPayment"))
+	if strings.Contains(compact, "\n") || strings.Contains(compact, cliDocSecondLine) {
+		t.Errorf("default search-symbols documentation must be the single first line, got %q", compact)
+	}
+
+	full := docOfFirstHit(t, runNativeCodeCmdArray(t, root, "search-symbols", "ProcessPayment", "--include-doc"))
+	if !strings.Contains(full, "\n") || !strings.Contains(full, cliDocSecondLine) {
+		t.Errorf("--include-doc search-symbols documentation must be the full multi-line block, got %q", full)
+	}
+}
+
+// TestCodeSearchCode_IncludeDocFlagPlumbing: same contract on search-code.
+func TestCodeSearchCode_IncludeDocFlagPlumbing(t *testing.T) {
+	root := writeMultilineDocRepo(t)
+
+	compact := docOfFirstHit(t, runNativeCodeCmdArray(t, root, "search-code", "ProcessPayment"))
+	if strings.Contains(compact, "\n") || strings.Contains(compact, cliDocSecondLine) {
+		t.Errorf("default search-code documentation must be the single first line, got %q", compact)
+	}
+
+	full := docOfFirstHit(t, runNativeCodeCmdArray(t, root, "search-code", "ProcessPayment", "--include-doc"))
+	if !strings.Contains(full, "\n") || !strings.Contains(full, cliDocSecondLine) {
+		t.Errorf("--include-doc search-code documentation must be the full multi-line block, got %q", full)
 	}
 }
