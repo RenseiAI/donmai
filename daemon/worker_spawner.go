@@ -113,6 +113,14 @@ const (
 	SessionEventEnded   SessionEventKind = "ended"
 )
 
+// pumpDrainGrace bounds how long the session reaper waits for the stdout/
+// stderr pump goroutines to reach EOF before calling cmd.Wait (which closes
+// the pipes and discards anything still buffered). Normally-exiting children
+// close their pipe ends on exit, so the pumps finish in microseconds and the
+// grace never elapses; it only fires when a grandchild inherited a pipe end
+// and outlived the worker.
+const pumpDrainGrace = 10 * time.Second
+
 // WorkerSpawner manages the lifecycle of worker child processes.
 type WorkerSpawner struct {
 	opts SpawnerOptions
@@ -420,7 +428,8 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		// defaultWorkerCommand). Surfacing this at warn level so
 		// operators notice when the daemon has fallen back to the
 		// test stub.
-		slog.Warn("worker spawner: WorkerCommand not set; using /bin/sh test stub (sessions exit immediately — set WorkerCommand or deploy a binary that resolves via os.Executable)",
+		slog.Warn(
+			"worker spawner: WorkerCommand not set; using /bin/sh test stub (sessions exit immediately — set WorkerCommand or deploy a binary that resolves via os.Executable)",
 			"sessionId", spec.SessionID,
 		)
 		command = []string{"/bin/sh", "-c", `printf 'session-started:%s\n' "$DONMAI_SESSION_ID"; exit 0`}
@@ -496,21 +505,46 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	s.sessions[spec.SessionID] = ss
 	s.mu.Unlock()
 
-	// Stream stdout / stderr with worker-tagged prefix.
-	if s.opts.StdoutPrefixWriter != nil {
-		go pumpLines(stdout, spec.SessionID, s.opts.StdoutPrefixWriter)
-	} else {
-		go drain(stdout)
-	}
-	if s.opts.StderrPrefixWriter != nil {
-		go pumpLines(stderr, spec.SessionID, s.opts.StderrPrefixWriter)
-	} else {
-		go drain(stderr)
-	}
+	// Stream stdout / stderr with worker-tagged prefix. Pump completion is
+	// tracked because os/exec's Wait CLOSES the pipe read ends: reaping
+	// before the pumps hit EOF silently discards buffered, not-yet-read
+	// child output (a loaded CI runner lost the child's only stderr record
+	// that way — 2026-07-06, run 28822266352).
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	go func() {
+		defer pumps.Done()
+		if s.opts.StdoutPrefixWriter != nil {
+			pumpLines(stdout, spec.SessionID, s.opts.StdoutPrefixWriter)
+		} else {
+			drain(stdout)
+		}
+	}()
+	go func() {
+		defer pumps.Done()
+		if s.opts.StderrPrefixWriter != nil {
+			pumpLines(stderr, spec.SessionID, s.opts.StderrPrefixWriter)
+		} else {
+			drain(stderr)
+		}
+	}()
 
 	s.emit(SessionEvent{Kind: SessionEventStarted, Handle: handle, Spec: spec})
 
 	go func() {
+		// Give the pumps a bounded grace to reach EOF before reaping. For a
+		// normally exiting child the pipe write ends close on exit and both
+		// pumps finish in microseconds, so this preserves every buffered
+		// line. The ceiling keeps the reaper hang-resistant in the
+		// degenerate case where a grandchild inherited a pipe end and
+		// outlives the worker — there we accept the pre-existing tail loss
+		// rather than never reaping the session.
+		pumpsDone := make(chan struct{})
+		go func() { pumps.Wait(); close(pumpsDone) }()
+		select {
+		case <-pumpsDone:
+		case <-time.After(pumpDrainGrace):
+		}
 		err := cmd.Wait()
 
 		s.mu.Lock()
