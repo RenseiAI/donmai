@@ -223,9 +223,13 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		return report
 	}
 
-	// Derive git identity from the same source as buildSessionEnv so
-	// backstop commits carry the agent-session author, not whatever the
-	// cloud sandbox's git global config says (which is often absent).
+	// Single-source the git identity through buildSessionEnv so backstop
+	// commits carry the SAME author as the agent's own in-box commits: a
+	// provisioner-stamped "Rensei Agent" GIT_AUTHOR_*/GIT_COMMITTER_* wins
+	// when present, otherwise the session-derived default is used. Either way
+	// this beats whatever the cloud sandbox's git global config says (often
+	// absent). runGit appends these overrides AFTER os.Environ() so the chosen
+	// identity is authoritative for the commit subprocess.
 	sessionEnv := buildSessionEnv(qw)
 	id := gitIdentity{
 		Name:  sessionEnv["GIT_AUTHOR_NAME"],
