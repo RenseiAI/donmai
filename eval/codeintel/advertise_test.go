@@ -104,9 +104,21 @@ func TestMCPAdvertisement_TaskConditionalFraming(t *testing.T) {
 	if !strings.Contains(suffix, "af_code_find_type_usages") || !strings.Contains(low, "before editing") {
 		t.Errorf("suffix should anchor af_code_find_type_usages to pre-edit enumeration; got %q", suffix)
 	}
-	// (c) already-exists / near-duplicate → check_duplicate.
-	if !strings.Contains(suffix, "af_code_check_duplicate") {
-		t.Errorf("suffix should anchor af_code_check_duplicate to duplicate checks; got %q", suffix)
+	// (c) already-exists / near-duplicate → check_duplicate. Positive matches
+	// stay authoritative (trust, no grep re-verification)…
+	if !strings.Contains(suffix, "af_code_check_duplicate") || !strings.Contains(low, "trust it") {
+		t.Errorf("suffix should anchor af_code_check_duplicate to duplicate checks with authoritative positives; got %q", suffix)
+	}
+	// …but the none-branch must carry the renamed-code caveat, not the old
+	// blanket "none means no duplicate, do not re-verify" claim: a renamed
+	// near-duplicate measures one bit past the default near threshold and
+	// legitimately comes back "none" (codeintel-dedup-donmai-001; see
+	// codeintel.TestCheckDuplicate_Ladder_BenchmarkRenameShape).
+	if !strings.Contains(low, "renamed") || !strings.Contains(low, "targeted grep") {
+		t.Errorf("none-branch must warrant one targeted grep on suspected renames; got %q", suffix)
+	}
+	if strings.Contains(low, "do not re-verify") {
+		t.Errorf("the blanket trust-the-none claim must be gone (live A/B false negative); got %q", suffix)
 	}
 	// (d) trivial lookup de-scope: grep is fine, no tool call.
 	if !strings.Contains(low, "grep is fine") {

@@ -200,9 +200,20 @@ func (a mcpAdvertisement) Apply(_ context.Context, donmaiBin, workarea, repoPath
 			" to enumerate every affected site BEFORE editing, then work from that list.\n")
 	}
 	if in["af_code_check_duplicate"] {
+		// None-branch truth maintenance (codeintel-dedup-donmai-001): positive
+		// matches stay authoritative, but a renamed near-duplicate (identifier
+		// renames alone measure Hamming 4 over a ~40-token body — one bit past
+		// the default near threshold; see TestCheckDuplicate_Ladder_
+		// BenchmarkRenameShape) can legitimately come back "none", so the
+		// advertisement must not claim "none" is grep-free on suspected renames.
+		// Never restore the old blanket "a matchType of \"none\" means no
+		// duplicate. Do not re-verify with grep." wording while that ladder rung
+		// still answers "none" on the default path.
 		b.WriteString("- Checking whether code like this already exists (exact or near-duplicate): call " +
 			fqName("af_code_check_duplicate") + " with the candidate snippet. A match names the file, " +
-			"symbol, and line — trust it; a matchType of \"none\" means no duplicate. Do not re-verify with grep.\n")
+			"symbol, and line — trust it; no grep re-verification is needed. A matchType of \"none\" is " +
+			"reliable for code being written fresh, but if you suspect the snippet was RENAMED from " +
+			"existing code (identifiers changed), confirm the \"none\" with one targeted grep.\n")
 	}
 	if in["af_code_search_symbols"] && in["af_code_search_code"] {
 		b.WriteString("- Searching by name or concept across the codebase: " + fqName("af_code_search_symbols") +

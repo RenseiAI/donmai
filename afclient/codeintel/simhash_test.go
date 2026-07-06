@@ -150,6 +150,48 @@ func TestNormalizeDupContent(t *testing.T) {
 	}
 }
 
+// TestNormalizeDupContent_StripsComments pins the comment-stripping
+// normalization (index schema v6): // line comments and /* */ block comments
+// are removed before hashing, on BOTH the index and query sides, so a doc
+// comment or comment rewording can never defeat a dedup match. Lines that
+// held only a comment are dropped entirely (a reworded comment must not leave
+// differing blank-line residue in the exact tier).
+func TestNormalizeDupContent_StripsComments(t *testing.T) {
+	withComments := "// doc line one\n// doc line two\nfunc f(a int) int {\n\t// interior note\n\tx := a * 3 /* inline */ + 1\n\t/* block\n\t   spanning */\n\treturn x\n}"
+	bare := "func f(a int) int {\n\tx := a * 3  + 1\n\treturn x\n}"
+	if got, want := normalizeDupContent(withComments), normalizeDupContent(bare); got != want {
+		t.Errorf("commented and bare forms must normalize identically:\ngot  %q\nwant %q", got, want)
+	}
+}
+
+// TestNormalizeDupContent_CommentMarkersInStrings pins the string-literal
+// awareness of the comment stripper: // and /* inside quoted strings, raw
+// backtick strings (including multi-line ones), and char literals are CODE,
+// never comment markers.
+func TestNormalizeDupContent_CommentMarkersInStrings(t *testing.T) {
+	cases := []struct {
+		name, in, mustKeep string
+	}{
+		{"double-quoted url", `u := "https://example.com/x"`, "https://example.com/x"},
+		{"escaped quote then slashes", `s := "a\"//b"`, `//b`},
+		{"single-quoted rune", `r := '/'` + "\n" + `q := '/'`, `'/'`},
+		{"backtick raw", "s := `keep // this /* too */`", "keep // this /* too */"},
+		{"multiline backtick", "s := `line1 // keep\nline2 /* keep */`\nx := 1 // drop", "line2 /* keep */"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeDupContent(tc.in)
+			if !strings.Contains(got, tc.mustKeep) {
+				t.Errorf("normalizeDupContent(%q) = %q; must keep %q (marker inside a string literal is code)", tc.in, got, tc.mustKeep)
+			}
+		})
+	}
+	// And the trailing real comment in the multiline-backtick case is gone.
+	if got := normalizeDupContent("s := `x // keep`\ny := 1 // drop me"); strings.Contains(got, "drop me") {
+		t.Errorf("real comment after a closed backtick string must be stripped; got %q", got)
+	}
+}
+
 // TestXXHash64_Stability verifies xxHash64 output is deterministic and
 // consistent with the cespare/xxhash/v2 package.
 //
