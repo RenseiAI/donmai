@@ -88,7 +88,9 @@ func NewNativeRunner(cwd string) *NativeRunner {
 //	v2: { version, files{…,contentHash,simHash,imports,exports}, rootHash }
 //	v3: symbol line/endLine are 1-based declaration-keyword lines (v2 stored
 //	    0-based indexes, reporting every definition one line early)
-const IndexSchemaVersion = 3
+//	v4: per-file symbolHashes (symbol-granular dedup fingerprints; a v3 index
+//	    lacks them, so file-buried duplicates would silently miss)
+const IndexSchemaVersion = 4
 
 // loadIndex attempts to read the persisted index.json. Returns an empty
 // IndexFile if the file does not exist, cannot be decoded, or carries a schema
@@ -396,20 +398,25 @@ func (n *NativeRunner) Invalidate() {
 	n.mu.Unlock()
 }
 
-// newFileIndex assembles a schema-v2 FileIndex for a freshly-extracted file,
+// newFileIndex assembles a schema-v4 FileIndex for a freshly-extracted file,
 // computing the content-identity fields (ContentHash, SimHash) over the file's
-// normalised content so dedup can compare against them later.
+// normalised content, plus the symbol-granular dedup fingerprints
+// (SymbolHashes), so dedup can compare against them later. This only runs on
+// actual (re)extraction, so per-symbol hashing costs nothing on the
+// incremental hash-match fast path.
 func (n *NativeRunner) newFileIndex(relPath, gitHash string, raw []byte, ast FileAST) FileIndex {
-	normalized := normalizeDupContent(string(raw))
+	content := string(raw)
+	normalized := normalizeDupContent(content)
 	fi := FileIndex{
-		FilePath:    relPath,
-		GitHash:     gitHash,
-		ContentHash: ContentXXHash64(normalized),
-		SimHash:     SimHashCompute(normalized),
-		Symbols:     ast.Symbols,
-		Imports:     ast.Imports,
-		Exports:     ast.Exports,
-		LastIndexed: time.Now().UnixMilli(),
+		FilePath:     relPath,
+		GitHash:      gitHash,
+		ContentHash:  ContentXXHash64(normalized),
+		SimHash:      SimHashCompute(normalized),
+		Symbols:      ast.Symbols,
+		Imports:      ast.Imports,
+		Exports:      ast.Exports,
+		SymbolHashes: ComputeSymbolHashes(content, ast.Symbols),
+		LastIndexed:  time.Now().UnixMilli(),
 	}
 	if fi.Symbols == nil {
 		fi.Symbols = []CodeSymbol{}
@@ -896,7 +903,14 @@ func (n *NativeRunner) SearchCodeNative(opts SearchCodeOptions) (any, error) {
 // ── CheckDuplicate (S3) ───────────────────────────────────────────────────────
 
 // CheckDuplicateNative checks content for exact or near-duplicate matches in
-// the current index using xxHash64 (Tier 1) and SimHash (Tier 2).
+// the current index using xxHash64 (Tier 1) and SimHash (Tier 2), at both
+// file and symbol granularity (schema v4). A symbol-level match carries
+// filePath/symbolName/line so the caller can point at the exact duplicate
+// site inside a larger file with no grep follow-up.
+//
+// The result is bounded to the single top match by default — the agent needs
+// ONE authoritative answer. opts.MaxResults > 1 opts into a ranked "matches"
+// list alongside the top-match fields.
 //
 // The threshold defaults to SimHashDefaultThreshold (3), matching the TS
 // DedupPipeline default.
@@ -918,19 +932,41 @@ func (n *NativeRunner) CheckDuplicateNative(opts CheckDuplicateOptions) (any, er
 		return nil, err
 	}
 
-	// Collect FileIndex entries as the corpus.
+	// Collect FileIndex entries as the corpus, sorted for deterministic
+	// ranking (idx.Files is a map; tie-breaks must not depend on its order).
 	corpus := make([]FileIndex, 0, len(idx.Files))
 	for _, fi := range idx.Files {
 		corpus = append(corpus, fi)
 	}
+	sort.Slice(corpus, func(i, j int) bool { return corpus[i].FilePath < corpus[j].FilePath })
 
-	result := CheckDuplicateContent(content, corpus, SimHashDefaultThreshold)
-	return map[string]any{
-		"isDuplicate":     result.IsDuplicate,
-		"matchType":       result.MatchType,
-		"existingId":      result.ExistingID,
-		"hammingDistance": result.HammingDistance,
-	}, nil
+	matches := FindDuplicateMatches(content, corpus, SimHashDefaultThreshold, opts.MaxResults)
+
+	// JSON contract: the v2 fields (isDuplicate, matchType, existingId,
+	// hammingDistance) keep their names and meaning; v4 ADDS filePath,
+	// symbolName, line, matches — never renames.
+	out := map[string]any{
+		"isDuplicate":     false,
+		"matchType":       "none",
+		"existingId":      "",
+		"hammingDistance": 0,
+	}
+	if len(matches) > 0 {
+		top := matches[0]
+		out["isDuplicate"] = true
+		out["matchType"] = top.MatchType
+		out["existingId"] = top.FilePath
+		out["hammingDistance"] = top.HammingDistance
+		out["filePath"] = top.FilePath
+		if top.SymbolName != "" {
+			out["symbolName"] = top.SymbolName
+			out["line"] = top.Line
+		}
+	}
+	if opts.MaxResults > 1 && len(matches) > 0 {
+		out["matches"] = matches
+	}
+	return out, nil
 }
 
 // ── FindTypeUsages (S3) ───────────────────────────────────────────────────────

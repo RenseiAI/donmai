@@ -93,6 +93,7 @@ func (s *Server) buildTools() []*toolDef {
 				var in struct {
 					Content     string `json:"content"`
 					ContentFile string `json:"contentFile"`
+					MaxResults  int    `json:"maxResults"`
 				}
 				if err := decodeArgs(args, &in); err != nil {
 					return nil, err
@@ -100,7 +101,7 @@ func (s *Server) buildTools() []*toolDef {
 				if (in.Content == "") == (in.ContentFile == "") {
 					return nil, errors.New("exactly one of content or contentFile is required")
 				}
-				opts := codeintel.CheckDuplicateOptions{Content: in.Content}
+				opts := codeintel.CheckDuplicateOptions{Content: in.Content, MaxResults: in.MaxResults}
 				if in.ContentFile != "" {
 					// Confine contentFile to the served root — reject absolute
 					// paths and ../ escapes so a tool call cannot read outside
@@ -176,7 +177,7 @@ var schemaSearchSymbols = json.RawMessage(`{
     "maxResults": {"type": "integer", "description": "Max results (0 = default)"},
     "kinds": {"type": "array", "items": {"type": "string"}, "description": "Symbol kind filter"},
     "filePattern": {"type": "string", "description": "Glob filter"},
-    "includeDoc": {"type": "boolean", "description": "Return full docs (default one-line)"}
+    "includeDoc": {"type": "boolean", "description": "Full docs (default one-line)"}
   },
   "required": ["query"],
   "additionalProperties": false
@@ -188,7 +189,7 @@ var schemaSearchCode = json.RawMessage(`{
     "query": {"type": "string"},
     "maxResults": {"type": "integer", "description": "Max results (0 = default)"},
     "language": {"type": "string", "description": "Language filter (go, typescript, ...)"},
-    "includeDoc": {"type": "boolean", "description": "Return full docs (default one-line)"}
+    "includeDoc": {"type": "boolean", "description": "Full docs (default one-line)"}
   },
   "required": ["query"],
   "additionalProperties": false
@@ -197,8 +198,9 @@ var schemaSearchCode = json.RawMessage(`{
 var schemaCheckDuplicate = json.RawMessage(`{
   "type": "object",
   "properties": {
-    "content": {"type": "string", "description": "Inline content to check"},
-    "contentFile": {"type": "string", "description": "Path relative to the repo root"}
+    "content": {"type": "string", "description": "Inline content"},
+    "contentFile": {"type": "string", "description": "Repo-relative path"},
+    "maxResults": {"type": "integer", "description": "Duplicate sites (0 = top match only)"}
   },
   "additionalProperties": false
 }`)

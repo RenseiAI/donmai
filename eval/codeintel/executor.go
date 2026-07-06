@@ -336,10 +336,18 @@ func deriveAnswerFromGrep(c Case, grepOut string) string {
 	}
 }
 
-// dedupAnswerFromResult formats a check-duplicate result into a verdict answer.
+// dedupAnswerFromResult formats a check-duplicate result into a verdict
+// answer. It prefers the v4 symbol-granular shape (filePath + symbolName +
+// line — one authoritative answer, no grep follow-up), falls back to the flat
+// v2 native shape (existingId), then to the legacy TS shape (match.filePath /
+// duplicates[]).
 func dedupAnswerFromResult(resultText string) string {
 	var r struct {
-		IsDuplicate bool `json:"isDuplicate"`
+		IsDuplicate bool   `json:"isDuplicate"`
+		FilePath    string `json:"filePath"`
+		SymbolName  string `json:"symbolName"`
+		Line        int    `json:"line"`
+		ExistingID  string `json:"existingId"`
 		Match       struct {
 			FilePath string `json:"filePath"`
 		} `json:"match"`
@@ -348,11 +356,20 @@ func dedupAnswerFromResult(resultText string) string {
 		} `json:"duplicates"`
 	}
 	if err := json.Unmarshal([]byte(resultText), &r); err == nil {
-		file := r.Match.FilePath
+		file := r.FilePath
+		if file == "" {
+			file = r.ExistingID
+		}
+		if file == "" {
+			file = r.Match.FilePath
+		}
 		if file == "" && len(r.Duplicates) > 0 {
 			file = r.Duplicates[0].FilePath
 		}
 		if r.IsDuplicate || file != "" {
+			if r.SymbolName != "" {
+				return fmt.Sprintf("Yes, this is a duplicate of %s (symbol %s, line %d).", file, r.SymbolName, r.Line)
+			}
 			return fmt.Sprintf("Yes, this is a duplicate of %s.", file)
 		}
 		return "No, this snippet is not a duplicate of existing code."

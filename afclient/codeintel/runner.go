@@ -334,6 +334,9 @@ func (r *Runner) SearchCode(opts SearchCodeOptions) (any, error) {
 type CheckDuplicateOptions struct {
 	Content     string
 	ContentFile string
+	// MaxResults bounds the duplicate sites returned. 0 (default) means the
+	// single top match only; > 1 adds a ranked "matches" list to the result.
+	MaxResults int
 }
 
 // CheckDuplicate detects exact and near-duplicate content against the index.
@@ -351,6 +354,9 @@ func (r *Runner) CheckDuplicate(opts CheckDuplicateOptions) (any, error) {
 			args = append(args, "--content-file", opts.ContentFile)
 		} else {
 			args = append(args, "--content", opts.Content)
+		}
+		if opts.MaxResults > 0 {
+			args = append(args, "--max-results", fmt.Sprintf("%d", opts.MaxResults))
 		}
 		return r.runCode(args...)
 	}

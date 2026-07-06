@@ -119,6 +119,31 @@ func TestLoadIndex_V2IndexDiscarded(t *testing.T) {
 	}
 }
 
+// TestLoadIndex_V3IndexDiscarded pins the v3→v4 migration: a persisted index
+// written under schema v3 (no per-symbol dedup hashes) must be discarded on
+// load — reported as zero files, forcing the clean full rebuild that computes
+// v4's symbol-granular ContentHash/SimHash for every extracted symbol.
+func TestLoadIndex_V3IndexDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	idxDir := filepath.Join(dir, ".donmai/code-index")
+	if err := os.MkdirAll(idxDir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	v3 := `{"version":3,"files":{"a.go":{"filePath":"a.go","gitHash":"abc","symbols":[{"name":"Foo","kind":"function","filePath":"a.go","line":9}],"lastIndexed":1}},"rootHash":"beef"}`
+	if err := os.WriteFile(filepath.Join(idxDir, "index.json"), []byte(v3), 0o640); err != nil { //nolint:gosec // G306 test fixture
+		t.Fatalf("write: %v", err)
+	}
+
+	nr := NewNativeRunner(dir)
+	loaded := nr.loadIndex()
+	if len(loaded.Files) != 0 {
+		t.Errorf("loaded %d files from a v3 index; want 0 — v3 lacks symbol-granular dedup hashes and must be discarded+rebuilt", len(loaded.Files))
+	}
+	if loaded.Version != IndexSchemaVersion {
+		t.Errorf("discarded index Version = %d; want %d", loaded.Version, IndexSchemaVersion)
+	}
+}
+
 // TestIndexSchemaVersion_AtLeastV3 pins the version floor: v3 is the schema
 // bump that made persisted symbol line/endLine 1-based at the declaration
 // keyword (WS8). Regressing the constant below 3 would let stale 0-based line

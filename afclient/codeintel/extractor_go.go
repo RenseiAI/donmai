@@ -88,6 +88,14 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 			if receiverType != "" {
 				sym.ParentName = receiverType
 			}
+			// Body extent (1-based closing-brace line) via the shared brace
+			// matcher (findBlockEndTS is language-agnostic brace counting).
+			// Only when the declaration line opens the body — a bodyless decl
+			// (assembly stub / external linkname) has no extent to record.
+			if strings.Contains(line, "{") {
+				endLine1 := findBlockEndTS(lines, i) + 1 // EndLine is 1-based like Line
+				sym.EndLine = &endLine1
+			}
 			symbols = append(symbols, sym)
 			if exported {
 				exports = append(exports, name)
