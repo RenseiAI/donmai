@@ -1,6 +1,7 @@
 package afcli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -266,6 +267,20 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 	qw := detailToQueuedWork(detail)
 
+	// Flip the session to 'running' eagerly, BEFORE runner.Run spawns the
+	// provider. The activity-gated maybePostRunning
+	// (runtime/activity/poster.go) only fires after the first successful
+	// activity POST, so a credential-blocked or slow-booting agent sits
+	// indistinguishably in 'pending' with no activity — the same terminal
+	// appearance as a stuck spawn. Posting running at spawn makes a
+	// no-activity failure a distinct reap signal and unblocks the
+	// platform-side lock re-acquire path, which only passes once the
+	// session is 'running'. Best-effort + idempotent with the later
+	// maybePostRunning: the platform treats a repeated running transition
+	// as a no-op, so racing the two posts is safe.
+	postSessionRunning(runCtx, &http.Client{Timeout: 5 * time.Second}, logger,
+		detail.PlatformURL, sessionID, detail.WorkerID, detail.AuthToken)
+
 	logger.Info("donmai agent run: invoking runner.Run", "sessionId", qw.SessionID)
 	res, runErr := r.Run(runCtx, qw)
 
@@ -293,6 +308,61 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		return fmt.Errorf("session %s ended with status %q (failureMode=%s)", sessionID, res.Status, res.FailureMode)
 	}
 	return nil
+}
+
+// postSessionRunning fires an eager, best-effort POST
+// /api/sessions/<id>/status with {"status":"running","workerId":"..."}
+// against the PLATFORM (not the local daemon) before the runner spawns the
+// provider. It mirrors the wire shape of runtime/activity's maybePostRunning
+// so the two are interchangeable and idempotent: the platform treats a
+// repeated running transition as a no-op.
+//
+// All failures are logged at debug and discarded — the running nudge is
+// pure observability + it unblocks the platform-side lock re-acquire path
+// (which only passes once the session is 'running'); it must never fail the
+// worker. A no-op when platformURL is empty (standalone / no-platform mode,
+// where there is no platform status endpoint to hit).
+func postSessionRunning(ctx context.Context, client *http.Client, logger *slog.Logger, platformURL, sessionID, workerID, authToken string) {
+	platformURL = strings.TrimSpace(platformURL)
+	if platformURL == "" {
+		return
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	body, err := json.Marshal(map[string]string{
+		"status":   "running",
+		"workerId": workerID,
+	})
+	if err != nil {
+		logger.Debug("agent run: status=running marshal failed", "sessionId", sessionID, "err", err)
+		return
+	}
+	url := strings.TrimRight(platformURL, "/") + "/api/sessions/" + sessionID + "/status"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		logger.Debug("agent run: status=running new request failed", "sessionId", sessionID, "err", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Debug("agent run: status=running post failed", "sessionId", sessionID, "err", err)
+		return
+	}
+	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		logger.Debug("agent run: status=running non-2xx", "sessionId", sessionID, "status", resp.StatusCode)
+		return
+	}
+	logger.Info("agent run: session flipped to running (pre-spawn)",
+		"sessionId", sessionID, "workerId", workerID)
 }
 
 // fetchSessionDetail retrieves the per-session payload from the

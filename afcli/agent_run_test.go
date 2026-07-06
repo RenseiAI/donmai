@@ -907,3 +907,95 @@ func TestRunAgentRun_HappyPath_StubProvider(t *testing.T) {
 		t.Errorf("expected Result JSON to include session id; got %q", body)
 	}
 }
+
+// TestPostSessionRunning_PostsRunningWithBearer verifies the eager pre-spawn
+// status nudge hits POST /api/sessions/<id>/status with the running body,
+// workerId, and bearer token — the wire shape maybePostRunning also uses, so
+// the two are interchangeable + idempotent.
+func TestPostSessionRunning_PostsRunningWithBearer(t *testing.T) {
+	// nolint:gosec // G101: fake test fixture, not a real credential.
+	const token = "run.bearer.token"
+	var (
+		gotPath   string
+		gotMethod string
+		gotAuth   string
+		gotBody   map[string]string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		quietLogger(), srv.URL, "sess-run-1", "wkr_run", token)
+
+	if want := "/api/sessions/sess-run-1/status"; gotPath != want {
+		t.Errorf("path = %q, want %q", gotPath, want)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if want := "Bearer " + token; gotAuth != want {
+		t.Errorf("Authorization = %q, want %q", gotAuth, want)
+	}
+	if gotBody["status"] != "running" {
+		t.Errorf("body status = %q, want running", gotBody["status"])
+	}
+	if gotBody["workerId"] != "wkr_run" {
+		t.Errorf("body workerId = %q, want wkr_run", gotBody["workerId"])
+	}
+}
+
+// TestPostSessionRunning_EmptyPlatformURLIsNoop verifies the standalone /
+// no-platform path makes no HTTP call when PlatformURL is empty.
+func TestPostSessionRunning_EmptyPlatformURLIsNoop(t *testing.T) {
+	var called atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Empty platformURL — must short-circuit before building any request.
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		quietLogger(), "  ", "sess-noop", "wkr", "tok")
+
+	if called.Load() {
+		t.Error("expected no HTTP call for empty platform URL")
+	}
+}
+
+// TestPostSessionRunning_NoTokenNoAuthHeader verifies an empty auth token
+// sends no Authorization header (mirrors the loopback/unauthenticated case).
+func TestPostSessionRunning_NoTokenNoAuthHeader(t *testing.T) {
+	var hadAuth bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, hadAuth = r.Header["Authorization"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		quietLogger(), srv.URL, "sess-noauth", "wkr", "")
+
+	if hadAuth {
+		t.Error("expected no Authorization header for empty token")
+	}
+}
+
+// TestPostSessionRunning_Non2xxIsSwallowed verifies a platform error status
+// never panics or surfaces — the nudge is best-effort observability.
+func TestPostSessionRunning_Non2xxIsSwallowed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	// Must return cleanly (no panic, no error surface) on a 5xx.
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		quietLogger(), srv.URL, "sess-5xx", "wkr", "tok")
+}
