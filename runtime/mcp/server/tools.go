@@ -51,6 +51,7 @@ func (s *Server) buildTools() []*toolDef {
 					MaxResults  int      `json:"maxResults"`
 					Kinds       []string `json:"kinds"`
 					FilePattern string   `json:"filePattern"`
+					IncludeDoc  bool     `json:"includeDoc"`
 				}
 				if err := decodeArgs(args, &in); err != nil {
 					return nil, err
@@ -60,6 +61,7 @@ func (s *Server) buildTools() []*toolDef {
 					MaxResults:  in.MaxResults,
 					Kinds:       in.Kinds,
 					FilePattern: in.FilePattern,
+					IncludeDoc:  in.IncludeDoc,
 				})
 			},
 		},
@@ -73,6 +75,7 @@ func (s *Server) buildTools() []*toolDef {
 					Query      string `json:"query"`
 					MaxResults int    `json:"maxResults"`
 					Language   string `json:"language"`
+					IncludeDoc bool   `json:"includeDoc"`
 				}
 				if err := decodeArgs(args, &in); err != nil {
 					return nil, err
@@ -81,6 +84,7 @@ func (s *Server) buildTools() []*toolDef {
 					Query:      in.Query,
 					MaxResults: in.MaxResults,
 					Language:   in.Language,
+					IncludeDoc: in.IncludeDoc,
 				})
 			},
 		},
@@ -177,13 +181,14 @@ var schemaSearchSymbols = json.RawMessage(`{
   "type": "object",
   "properties": {
     "query": {"type": "string", "description": "Symbol name or query (BM25 over the symbol index)"},
-    "maxResults": {"type": "integer", "minimum": 0, "description": "Maximum results (0 = default 20)"},
+    "maxResults": {"type": "integer", "minimum": 0, "description": "Maximum results (0 = default: 5, or up to 3 when an exact-name match short-circuits)"},
     "kinds": {
       "type": "array",
       "items": {"type": "string"},
       "description": "Restrict to these symbol kinds: function, method, class, interface, type, struct, enum, trait, impl, ..."
     },
-    "filePattern": {"type": "string", "description": "Restrict to files matching this glob (e.g. \"*.go\", \"svc/**\")"}
+    "filePattern": {"type": "string", "description": "Restrict to files matching this glob (e.g. \"*.go\", \"svc/**\")"},
+    "includeDoc": {"type": "boolean", "description": "Return full symbol details including the complete multi-line documentation (default: compact hits with one-line docs)"}
   },
   "required": ["query"],
   "additionalProperties": false
@@ -194,7 +199,8 @@ var schemaSearchCode = json.RawMessage(`{
   "properties": {
     "query": {"type": "string", "description": "Keyword query (Okapi BM25 over code content)"},
     "maxResults": {"type": "integer", "minimum": 0, "description": "Maximum results (0 = default 20)"},
-    "language": {"type": "string", "description": "Restrict to one language (e.g. go, typescript, python, rust)"}
+    "language": {"type": "string", "description": "Restrict to one language (e.g. go, typescript, python, rust)"},
+    "includeDoc": {"type": "boolean", "description": "Return full symbol details including the complete multi-line documentation (default: compact hits with one-line docs)"}
   },
   "required": ["query"],
   "additionalProperties": false

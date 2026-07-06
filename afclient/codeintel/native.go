@@ -612,23 +612,108 @@ func (n *NativeRunner) SearchSymbolsNative(opts SearchSymbolsOptions) (any, erro
 		return results[i].symbol.Name < results[j].symbol.Name
 	})
 
-	maxResults := opts.MaxResults
-	if maxResults <= 0 {
-		maxResults = 20
+	// Exact-match short-circuit: when the query names a symbol exactly, the
+	// sibling prefix/fuzzy hits are noise — return only the exact match(es),
+	// capped at symbolExactCap unless the caller explicitly raised MaxResults.
+	var exacts []scored
+	for _, r := range results {
+		if strings.ToLower(r.symbol.Name) == queryLower {
+			exacts = append(exacts, r)
+		}
 	}
-	if maxResults > len(results) {
-		maxResults = len(results)
+	if len(exacts) > 0 {
+		limit := symbolExactCap
+		if opts.MaxResults > 0 {
+			limit = opts.MaxResults
+		}
+		if limit > len(exacts) {
+			limit = len(exacts)
+		}
+		results = exacts[:limit]
+	} else {
+		maxResults := opts.MaxResults
+		if maxResults <= 0 {
+			maxResults = symbolDefaultMaxResults
+		}
+		if maxResults > len(results) {
+			maxResults = len(results)
+		}
+		results = results[:maxResults]
 	}
 
-	out := make([]map[string]any, 0, maxResults)
-	for _, r := range results[:maxResults] {
+	out := make([]map[string]any, 0, len(results))
+	for _, r := range results {
 		out = append(out, map[string]any{
-			"symbol":    r.symbol,
+			"symbol":    projectSymbol(r.symbol, opts.IncludeDoc),
 			"score":     r.score,
-			"matchType": matchType(r.symbol.Name, strings.ToLower(opts.Query)),
+			"matchType": matchType(r.symbol.Name, queryLower),
 		})
 	}
 	return out, nil
+}
+
+// symbolDefaultMaxResults is the default result cap for symbol lookups when no
+// exact match exists. Deliberately small: search-symbols answers "where is X
+// defined" and each extra hit is pure token cost for the calling agent.
+// Callers can always raise MaxResults explicitly.
+const symbolDefaultMaxResults = 5
+
+// symbolExactCap bounds the exact-match short-circuit: when the query names a
+// symbol exactly, at most this many exact hits are returned (unless the caller
+// explicitly set MaxResults higher).
+const symbolExactCap = 3
+
+// compactDocMaxLen is the rune cap for the truncated one-line documentation in
+// the compact (default) search result projection.
+const compactDocMaxLen = 160
+
+// firstDocLine reduces a (possibly multi-line) documentation block to its
+// trimmed first line, capped at compactDocMaxLen runes with a trailing
+// ellipsis when cut.
+func firstDocLine(doc string) string {
+	if doc == "" {
+		return ""
+	}
+	line := doc
+	if idx := strings.IndexByte(doc, '\n'); idx >= 0 {
+		line = doc[:idx]
+	}
+	line = strings.TrimSpace(line)
+	runes := []rune(line)
+	if len(runes) > compactDocMaxLen {
+		return string(runes[:compactDocMaxLen]) + "…"
+	}
+	return line
+}
+
+// projectSymbol returns the result-payload representation of a symbol.
+//
+// Default (includeDoc=false) is the compact projection — {name, kind,
+// filePath, line, signature, documentation(first line)} — which is what an
+// agent needs to jump to the definition; the full multi-line documentation
+// block was the dominant token cost per hit and bought no task success.
+// includeDoc=true restores the full CodeSymbol (same JSON field names, so the
+// compact shape is a strict subset).
+func projectSymbol(sym CodeSymbol, includeDoc bool) any {
+	if includeDoc {
+		return sym
+	}
+	m := map[string]any{
+		"name":     sym.Name,
+		"kind":     sym.Kind,
+		"filePath": sym.FilePath,
+		"line":     sym.Line,
+	}
+	if sym.Signature != "" {
+		m["signature"] = sym.Signature
+	}
+	if doc := firstDocLine(sym.Documentation); doc != "" {
+		m["documentation"] = doc
+	}
+	if sym.ParentName != "" {
+		m["parentName"] = sym.ParentName
+	}
+	return m
 }
 
 // scoreSymbol computes a BM25-inspired relevance score for a symbol name
@@ -769,7 +854,7 @@ func (n *NativeRunner) SearchCodeNative(opts SearchCodeOptions) (any, error) {
 	out := make([]map[string]any, 0, maxResults)
 	for _, r := range results[:maxResults] {
 		out = append(out, map[string]any{
-			"symbol":    r.symbol,
+			"symbol":    projectSymbol(r.symbol, opts.IncludeDoc),
 			"score":     r.score,
 			"matchType": r.matchType,
 		})

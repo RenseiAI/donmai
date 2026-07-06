@@ -264,6 +264,11 @@ type SearchSymbolsOptions struct {
 	MaxResults  int
 	Kinds       []string
 	FilePattern string
+	// IncludeDoc opts in to the full CodeSymbol per hit, including the complete
+	// multi-line documentation block. Default (false) returns the compact
+	// projection {name, kind, filePath, line, signature} with documentation
+	// truncated to its first line.
+	IncludeDoc bool
 }
 
 // SearchSymbols searches the code index for symbols matching the query.
@@ -297,6 +302,9 @@ type SearchCodeOptions struct {
 	Query      string
 	MaxResults int
 	Language   string
+	// IncludeDoc opts in to the full CodeSymbol per hit (see
+	// SearchSymbolsOptions.IncludeDoc).
+	IncludeDoc bool
 }
 
 // SearchCode performs BM25 full-text code search.
