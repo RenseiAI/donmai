@@ -77,7 +77,7 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 				Name:      name,
 				Kind:      kind,
 				FilePath:  filePath,
-				Line:      i,
+				Line:      i + 1,
 				Exported:  exported,
 				Signature: sig,
 				Language:  "go",
@@ -104,7 +104,7 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindStruct,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: exported,
 				Language: "go",
 			}
@@ -127,7 +127,7 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindInterface,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: exported,
 				Language: "go",
 			}
@@ -153,7 +153,7 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 					Name:     name,
 					Kind:     KindType,
 					FilePath: filePath,
-					Line:     i,
+					Line:     i + 1,
 					Exported: exported,
 					Language: "go",
 				}
@@ -174,7 +174,7 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 				Name:     name,
 				Kind:     KindVariable,
 				FilePath: filePath,
-				Line:     i,
+				Line:     i + 1,
 				Exported: exported,
 				Language: "go",
 			}

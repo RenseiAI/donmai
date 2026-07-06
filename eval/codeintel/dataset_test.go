@@ -1,8 +1,11 @@
 package codeintel
 
 import (
+	"os"
 	"strings"
 	"testing"
+
+	engine "github.com/RenseiAI/donmai/afclient/codeintel"
 )
 
 // benchmarkDir is the in-repo canonical benchmark location, relative to this
@@ -188,5 +191,58 @@ func TestLoadCases_RejectsDuplicateID(t *testing.T) {
 	_, err := LoadCases(strings.NewReader(dup + "\n" + dup))
 	if err == nil || !strings.Contains(err.Error(), "duplicate case id") {
 		t.Fatalf("expected duplicate-id error, got %v", err)
+	}
+}
+
+// TestEngineLine_MatchesGitGrepLine pins the WS8 line-attribution contract on
+// live seed symbols from this repo: the engine's reported symbol line must
+// equal the 1-based line of the declaration keyword itself — exactly what
+// `git grep -n '^func <name>'` returns — with no tolerance window.
+func TestEngineLine_MatchesGitGrepLine(t *testing.T) {
+	seeds := []struct {
+		file   string
+		symbol string
+		prefix string
+	}{
+		{"../../afcli/agent_run.go", "newAgentRunCmd", "func newAgentRunCmd("},
+		{"../../afclient/codeintel/gitroot.go", "FindGitRoot", "func FindGitRoot("},
+	}
+	for _, s := range seeds {
+		t.Run(s.symbol, func(t *testing.T) {
+			data, err := os.ReadFile(s.file)
+			if err != nil {
+				t.Fatalf("read %s: %v", s.file, err)
+			}
+			src := string(data)
+
+			// grep-equivalent: 1-based line of the declaration keyword.
+			grepLine := 0
+			for i, line := range strings.Split(src, "\n") {
+				if strings.HasPrefix(line, s.prefix) {
+					grepLine = i + 1
+					break
+				}
+			}
+			if grepLine == 0 {
+				t.Fatalf("seed symbol %s not found in %s (repo drifted?)", s.symbol, s.file)
+			}
+
+			ext := &engine.GoExtractor{}
+			ast := ext.Extract(src, s.file)
+			var got int
+			for _, sym := range ast.Symbols {
+				if sym.Name == s.symbol {
+					got = sym.Line
+					break
+				}
+			}
+			if got == 0 {
+				t.Fatalf("engine did not extract symbol %s from %s", s.symbol, s.file)
+			}
+			if got != grepLine {
+				t.Errorf("engine line %d != git-grep line %d for %s (no tolerance window allowed)",
+					got, grepLine, s.symbol)
+			}
+		})
 	}
 }

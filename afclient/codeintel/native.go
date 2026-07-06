@@ -86,7 +86,9 @@ func NewNativeRunner(cwd string) *NativeRunner {
 //
 //	v1: { files, rootHash }                          (legacy, TS-compatible)
 //	v2: { version, files{…,contentHash,simHash,imports,exports}, rootHash }
-const IndexSchemaVersion = 2
+//	v3: symbol line/endLine are 1-based declaration-keyword lines (v2 stored
+//	    0-based indexes, reporting every definition one line early)
+const IndexSchemaVersion = 3
 
 // loadIndex attempts to read the persisted index.json. Returns an empty
 // IndexFile if the file does not exist, cannot be decoded, or carries a schema

@@ -82,7 +82,7 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 		if m := reFuncDecl.FindStringSubmatch(effective); m != nil {
 			name := m[1]
 			sig := extractSignatureTS(effective)
-			symbols = append(symbols, makeSymbolTS(name, KindFunction, filePath, i, isExported, sig, currentJSDoc, language, ""))
+			symbols = append(symbols, makeSymbolTS(name, KindFunction, filePath, i+1, isExported, sig, currentJSDoc, language, ""))
 			if isExported {
 				exports = append(exports, name)
 			}
@@ -98,7 +98,7 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 			if arrowIdx > 0 {
 				sig = strings.TrimSpace(effective[:arrowIdx])
 			}
-			symbols = append(symbols, makeSymbolTS(name, KindFunction, filePath, i, isExported, sig, currentJSDoc, language, ""))
+			symbols = append(symbols, makeSymbolTS(name, KindFunction, filePath, i+1, isExported, sig, currentJSDoc, language, ""))
 			if isExported {
 				exports = append(exports, name)
 			}
@@ -109,7 +109,7 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 		// const function expression.
 		if m := reFuncExpr.FindStringSubmatch(effective); m != nil {
 			name := m[1]
-			symbols = append(symbols, makeSymbolTS(name, KindFunction, filePath, i, isExported, "", currentJSDoc, language, ""))
+			symbols = append(symbols, makeSymbolTS(name, KindFunction, filePath, i+1, isExported, "", currentJSDoc, language, ""))
 			if isExported {
 				exports = append(exports, name)
 			}
@@ -121,8 +121,9 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 		if m := reClassDecl.FindStringSubmatch(effective); m != nil {
 			name := m[1]
 			endLine := findBlockEndTS(lines, i)
-			sym := makeSymbolTS(name, KindClass, filePath, i, isExported, strings.SplitN(effective, "{", 2)[0], currentJSDoc, language, "")
-			sym.EndLine = &endLine
+			endLine1 := endLine + 1 // EndLine is 1-based like Line
+			sym := makeSymbolTS(name, KindClass, filePath, i+1, isExported, strings.SplitN(effective, "{", 2)[0], currentJSDoc, language, "")
+			sym.EndLine = &endLine1
 			symbols = append(symbols, sym)
 			if isExported {
 				exports = append(exports, name)
@@ -138,8 +139,9 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 		if m := reIfaceDecl.FindStringSubmatch(effective); m != nil {
 			name := m[1]
 			endLine := findBlockEndTS(lines, i)
-			sym := makeSymbolTS(name, KindInterface, filePath, i, isExported, strings.SplitN(effective, "{", 2)[0], currentJSDoc, language, "")
-			sym.EndLine = &endLine
+			endLine1 := endLine + 1 // EndLine is 1-based like Line
+			sym := makeSymbolTS(name, KindInterface, filePath, i+1, isExported, strings.SplitN(effective, "{", 2)[0], currentJSDoc, language, "")
+			sym.EndLine = &endLine1
 			symbols = append(symbols, sym)
 			if isExported {
 				exports = append(exports, name)
@@ -151,7 +153,7 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 		// Type alias.
 		if m := reTypeAlias.FindStringSubmatch(effective); m != nil {
 			name := m[1]
-			symbols = append(symbols, makeSymbolTS(name, KindType, filePath, i, isExported, "", currentJSDoc, language, ""))
+			symbols = append(symbols, makeSymbolTS(name, KindType, filePath, i+1, isExported, "", currentJSDoc, language, ""))
 			if isExported {
 				exports = append(exports, name)
 			}
@@ -162,7 +164,7 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 		// Enum.
 		if m := reEnumDecl.FindStringSubmatch(effective); m != nil {
 			name := m[1]
-			symbols = append(symbols, makeSymbolTS(name, KindEnum, filePath, i, isExported, "", currentJSDoc, language, ""))
+			symbols = append(symbols, makeSymbolTS(name, KindEnum, filePath, i+1, isExported, "", currentJSDoc, language, ""))
 			if isExported {
 				exports = append(exports, name)
 			}
@@ -173,7 +175,7 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 		// Variable declarations (non-function).
 		if m := reVarDecl.FindStringSubmatch(effective); m != nil {
 			name := m[1]
-			symbols = append(symbols, makeSymbolTS(name, KindVariable, filePath, i, isExported, "", currentJSDoc, language, ""))
+			symbols = append(symbols, makeSymbolTS(name, KindVariable, filePath, i+1, isExported, "", currentJSDoc, language, ""))
 			if isExported {
 				exports = append(exports, name)
 			}
@@ -183,7 +185,7 @@ func (e *TypeScriptExtractor) Extract(source, filePath string) FileAST {
 
 		// Decorator.
 		if m := reDecorator.FindStringSubmatch(trimmed); m != nil {
-			symbols = append(symbols, makeSymbolTS(m[1], KindDecorator, filePath, i, false, "", "", language, ""))
+			symbols = append(symbols, makeSymbolTS(m[1], KindDecorator, filePath, i+1, false, "", "", language, ""))
 			continue
 		}
 
@@ -232,7 +234,7 @@ func extractClassMembersTS(lines []string, startLine, endLine int, filePath, cla
 		if m := reClassMethod.FindStringSubmatch(trimmed); m != nil {
 			name := m[1]
 			if !isControlKeyword(name) {
-				out = append(out, makeSymbolTS(name, KindMethod, filePath, i, false, "", "", language, className))
+				out = append(out, makeSymbolTS(name, KindMethod, filePath, i+1, false, "", "", language, className))
 				continue
 			}
 		}
@@ -240,7 +242,7 @@ func extractClassMembersTS(lines []string, startLine, endLine int, filePath, cla
 		if m := reClassProp.FindStringSubmatch(trimmed); m != nil {
 			name := m[1]
 			if !isControlKeyword(name) {
-				out = append(out, makeSymbolTS(name, KindProperty, filePath, i, false, "", "", language, className))
+				out = append(out, makeSymbolTS(name, KindProperty, filePath, i+1, false, "", "", language, className))
 			}
 		}
 	}

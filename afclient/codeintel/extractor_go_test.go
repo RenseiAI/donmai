@@ -202,3 +202,49 @@ func main() {
 		t.Error("main should not be considered exported in Go")
 	}
 }
+
+// TestGoExtractor_LineIsDeclarationKeywordLine pins symbol line attribution:
+// Line must be the 1-based line of the `func`/`type` keyword itself — not the
+// doc-comment start, and not a 0-based index (the engine historically reported
+// the definition one line early, e.g. newAgentRunCmd at afcli/agent_run.go:80
+// was reported as 79).
+func TestGoExtractor_LineIsDeclarationKeywordLine(t *testing.T) {
+	src := `package pay
+
+// ProcessPayment handles a payment.
+// It has a multi-line doc comment so the doc start
+// and the keyword line differ by several lines.
+func ProcessPayment(id string) error {
+	return nil
+}
+
+// Ledger is a documented struct.
+type Ledger struct {
+	Total int
+}
+
+func undocumented() {}
+`
+	ext := &GoExtractor{}
+	ast := ext.Extract(src, "pay.go")
+
+	tests := []struct {
+		name     string
+		kind     SymbolKind
+		wantLine int
+	}{
+		{"ProcessPayment", KindFunction, 6},
+		{"Ledger", KindStruct, 11},
+		{"undocumented", KindFunction, 15},
+	}
+	for _, tt := range tests {
+		sym := findSymbol(ast.Symbols, tt.name, tt.kind)
+		if sym == nil {
+			t.Fatalf("missing symbol %s", tt.name)
+		}
+		if sym.Line != tt.wantLine {
+			t.Errorf("%s: Line = %d, want %d (the declaration keyword line, 1-based)",
+				tt.name, sym.Line, tt.wantLine)
+		}
+	}
+}
