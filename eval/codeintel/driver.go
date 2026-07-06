@@ -204,7 +204,10 @@ type AggregateStat struct {
 	RepoCounts   map[string]int   `json:"repoCounts"`
 	// Underpowered is true when the run does not meet the locked power
 	// preconditions (>=8 tasks/family across all four families, >=2 repos, >=3
-	// trials). PowerShortfalls enumerates exactly which preconditions failed.
+	// trials) or the token-coverage precondition (every executed family must
+	// carry a nonzero token median on BOTH arms — the efficiency bar is a
+	// token-cost claim). PowerShortfalls enumerates exactly which
+	// preconditions failed.
 	Underpowered    bool     `json:"underpowered"`
 	PowerShortfalls []string `json:"powerShortfalls,omitempty"`
 	// DeltaCILow/High are the 95% confidence interval of the aggregate delta from
@@ -428,10 +431,19 @@ func taskSuccessPass(grades []GradeResult) bool {
 }
 
 func accumulate(f *FamilyStat, rec RunRecord) {
+	// A zero token total means the trial's usage capture FAILED (no real LLM
+	// trial costs zero tokens) — record NO token sample rather than a fake
+	// zero-cost one: the per-family guard excludes a 0 median, but the pooled
+	// aggregate median would count it as a genuinely cheap trial and bias the
+	// efficiency bar toward PASS. Success/pass counting is unaffected; the
+	// token-coverage power precondition (tokenCoverageShortfalls) surfaces
+	// families whose samples all went missing.
 	total := rec.Envelope.Trace.TokenCounts.Total()
 	if rec.Arm == ArmWith {
 		f.WithTrials++
-		f.WithTokens = append(f.WithTokens, total)
+		if total > 0 {
+			f.WithTokens = append(f.WithTokens, total)
+		}
 		if rec.Pass {
 			f.WithPasses++
 		}
@@ -444,7 +456,9 @@ func accumulate(f *FamilyStat, rec RunRecord) {
 		}
 	} else {
 		f.WithoutTrials++
-		f.WithoutTokens = append(f.WithoutTokens, total)
+		if total > 0 {
+			f.WithoutTokens = append(f.WithoutTokens, total)
+		}
 		if rec.Pass {
 			f.WithoutPasses++
 		}
@@ -486,6 +500,7 @@ func computeAggregate(fams map[TaskType]*FamilyStat, records []RunRecord, cases 
 	famCounts := CountByFamily(cases)
 	repoCounts := CountByRepo(cases)
 	shortfalls := powerShortfalls(famCounts, repoCounts, trials)
+	shortfalls = append(shortfalls, tokenCoverageShortfalls(fams)...)
 	ciLow, ciHigh, stddev := bootstrapDeltaCI(caseAggsFromRecords(records))
 	agg := AggregateStat{
 		DeltaPP:                deltaPP,
@@ -504,8 +519,10 @@ func computeAggregate(fams map[TaskType]*FamilyStat, records []RunRecord, cases 
 	}
 	// The Q1v2 efficiency bar (see the constant block above): aggregate token
 	// win, no family paying >+10%, no success regression. A tokenRatio of 0
-	// means NO token data — that cannot clear a bar about token cost. The
-	// success delta (and its bootstrap CI) is informational, not gating.
+	// means NO token data — that cannot clear a bar about token cost (kept as
+	// defense-in-depth even though the token-coverage precondition already
+	// forces such a run UNDERPOWERED). The success delta (and its bootstrap
+	// CI) is informational, not gating.
 	effBar := tokenRatio > 0 && tokenRatio <= maxAggregateTokenRatio &&
 		len(tokenRegressed) == 0 && len(regressed) == 0
 	// The power preconditions HARD-GATE the verdict: a null/underpowered result
@@ -654,6 +671,30 @@ func powerShortfalls(famCounts map[TaskType]int, repoCounts map[string]int, tria
 	}
 	if trials < minTrialsForGA {
 		out = append(out, fmt.Sprintf("%d trial(s)/arm, need >=%d", trials, minTrialsForGA))
+	}
+	return out
+}
+
+// tokenCoverageShortfalls enumerates executed families whose token medians
+// are missing/zero on either arm — the token-coverage power precondition. The
+// efficiency bar is a claim about token cost; accumulate drops zero-token
+// (capture-failure) trials, so a family whose captures failed would otherwise
+// silently shrink the claim to the families that happened to report usage. A
+// family that ran trials but has no nonzero token median on an arm makes the
+// run UNDERPOWERED — it can never PASS.
+func tokenCoverageShortfalls(fams map[TaskType]*FamilyStat) []string {
+	var out []string
+	for _, fam := range families {
+		f := fams[fam]
+		if f == nil || (f.WithTrials == 0 && f.WithoutTrials == 0) {
+			continue // family not executed at all — corpus power covers it
+		}
+		if medianI64(f.WithTokens) <= 0 {
+			out = append(out, fmt.Sprintf("family %s has no token data on the WITH arm", fam))
+		}
+		if medianI64(f.WithoutTokens) <= 0 {
+			out = append(out, fmt.Sprintf("family %s has no token data on the WITHOUT arm", fam))
+		}
 	}
 	return out
 }

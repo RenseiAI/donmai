@@ -547,12 +547,14 @@ func TestComputeAggregate_EfficiencyBar_AggregateRatioFails(t *testing.T) {
 	}
 }
 
-// TestComputeAggregate_EfficiencyBar_FamilyWithoutTokenDataExcluded: a family
-// whose trials carry NO token samples (usage capture failed on an arm) is
-// EXCLUDED from the per-family guard — same convention as the success
-// regression check (WithTrials>0 && WithoutTrials>0) — rather than passing or
-// failing on a garbage 0-median ratio.
-func TestComputeAggregate_EfficiencyBar_FamilyWithoutTokenDataExcluded(t *testing.T) {
+// TestComputeAggregate_EfficiencyBar_FamilyWithoutTokenDataUnderpowered: a
+// family whose trials carry NO token samples (usage capture failed on an arm)
+// is still EXCLUDED from the per-family ratio guard (no pass/fail on a
+// garbage 0-median), but the missing coverage is a POWER shortfall: the
+// efficiency bar is a claim about token cost, and a family with no usable
+// token median on either arm cannot back that claim — the run must land
+// UNDERPOWERED, never PASS on just the families that have data.
+func TestComputeAggregate_EfficiencyBar_FamilyWithoutTokenDataUnderpowered(t *testing.T) {
 	fams, records, cases := efficiencyCorpus(map[TaskType][2]int64{
 		TaskFindSymbol:          {95, 100},
 		TaskLocateUsage:         {95, 100},
@@ -560,14 +562,106 @@ func TestComputeAggregate_EfficiencyBar_FamilyWithoutTokenDataExcluded(t *testin
 		TaskDedup:               {0, 0}, // no token samples on either arm
 	})
 	agg := computeAggregate(fams, records, cases, minTrialsForGA)
+	if len(agg.TokenRegressedFamilies) != 0 {
+		t.Errorf("token-data-less family must be excluded from the ratio guard, got %v", agg.TokenRegressedFamilies)
+	}
+	if agg.MeetsThreshold {
+		t.Errorf("a family with no token data must force UNDERPOWERED, not pass; status=%q", agg.Status)
+	}
+	if !agg.Underpowered {
+		t.Error("missing per-family token coverage must flag the run Underpowered")
+	}
+	found := false
+	for _, s := range agg.PowerShortfalls {
+		if strings.Contains(s, string(TaskDedup)) && strings.Contains(s, "token") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("PowerShortfalls must name the token-coverage gap for %s; got %v", TaskDedup, agg.PowerShortfalls)
+	}
+	if !strings.Contains(agg.Status, "UNDERPOWERED") {
+		t.Errorf("status must call out UNDERPOWERED, got %q", agg.Status)
+	}
+}
+
+// TestComputeAggregate_EfficiencyBar_SuccessRegressionFails pins the third
+// leg of the Q1v2 bar: a powered corpus with every token ratio passing but
+// ONE family whose WITH success rate falls below WITHOUT must fail — cheaper
+// is not allowed to mean worse.
+func TestComputeAggregate_EfficiencyBar_SuccessRegressionFails(t *testing.T) {
+	fams, records, cases := efficiencyCorpus(map[TaskType][2]int64{
+		TaskFindSymbol:          {95, 100},
+		TaskLocateUsage:         {95, 100},
+		TaskRefactorAcrossFiles: {95, 100},
+		TaskDedup:               {95, 100},
+	})
+	// Regress the WITH arm of one family: WithRate drops below WithoutRate.
+	fams[TaskLocateUsage].WithPasses -= 5
+	agg := computeAggregate(fams, records, cases, minTrialsForGA)
 	if agg.Underpowered {
 		t.Fatalf("corpus should be powered; shortfalls=%v", agg.PowerShortfalls)
 	}
 	if len(agg.TokenRegressedFamilies) != 0 {
-		t.Errorf("token-data-less family must be excluded from the guard, got %v", agg.TokenRegressedFamilies)
+		t.Fatalf("precondition: every token ratio passes, got %v", agg.TokenRegressedFamilies)
 	}
-	if !agg.MeetsThreshold {
-		t.Errorf("run must still pass on the families that HAVE data; status=%q", agg.Status)
+	if agg.MeetsThreshold {
+		t.Errorf("a per-family success regression must fail the efficiency bar; status=%q", agg.Status)
+	}
+	if len(agg.RegressedFamilies) != 1 || agg.RegressedFamilies[0] != TaskLocateUsage {
+		t.Errorf("RegressedFamilies = %v, want [%s]", agg.RegressedFamilies, TaskLocateUsage)
+	}
+	if !strings.Contains(agg.Status, "success regression") {
+		t.Errorf("status must call out the success regression, got %q", agg.Status)
+	}
+	if !strings.Contains(agg.Status, "GA-FAIL") {
+		t.Errorf("status should be GA-FAIL, got %q", agg.Status)
+	}
+}
+
+// TestComputeAggregate_EfficiencyBar_NoTokenDataFails: a powered corpus where
+// NO family produced token samples (every arm's usage capture failed) must
+// never PASS a bar that is entirely about token cost. With the token-coverage
+// power precondition this lands UNDERPOWERED; the aggregate tokenRatio>0
+// guard inside the bar remains as defense-in-depth.
+func TestComputeAggregate_EfficiencyBar_NoTokenDataFails(t *testing.T) {
+	fams, records, cases := efficiencyCorpus(map[TaskType][2]int64{}) // zero-value {0,0} for every family
+	agg := computeAggregate(fams, records, cases, minTrialsForGA)
+	if agg.TokenRatio != 0 {
+		t.Fatalf("precondition: aggregate tokenRatio must be 0 with no token data, got %.2f", agg.TokenRatio)
+	}
+	if agg.MeetsThreshold {
+		t.Errorf("a run with NO token data must not pass the efficiency bar; status=%q", agg.Status)
+	}
+	if !agg.Underpowered {
+		t.Error("a run with no token data on any family must be Underpowered (token-coverage precondition)")
+	}
+	if !strings.Contains(agg.Status, "UNDERPOWERED") {
+		t.Errorf("status must call out UNDERPOWERED, got %q", agg.Status)
+	}
+}
+
+// TestAccumulate_ZeroTokenTrialNotASample pins the U2 capture-failure rule: a
+// completed trial whose usage capture failed (TokenCounts.Total()==0) counts
+// for success/pass bookkeeping but contributes NO token sample — a fake
+// zero-cost sample would bias the aggregate median toward PASS.
+func TestAccumulate_ZeroTokenTrialNotASample(t *testing.T) {
+	f := &FamilyStat{}
+	accumulate(f, RunRecord{Arm: ArmWith, Pass: true})     // zero-value TokenCounts
+	accumulate(f, RunRecord{Arm: ArmWithout, Pass: false}) // zero-value TokenCounts
+	if f.WithTrials != 1 || f.WithPasses != 1 || f.WithoutTrials != 1 || f.WithoutPasses != 0 {
+		t.Errorf("zero-token trials must still count trials/passes: %+v", f)
+	}
+	if len(f.WithTokens) != 0 || len(f.WithoutTokens) != 0 {
+		t.Errorf("zero-token trials must contribute no token samples: with=%v without=%v", f.WithTokens, f.WithoutTokens)
+	}
+
+	// Real usage still lands as a sample.
+	rec := RunRecord{Arm: ArmWith, Pass: true}
+	rec.Envelope.Trace.TokenCounts = TokenCounts{Input: 100, Output: 20}
+	accumulate(f, rec)
+	if len(f.WithTokens) != 1 || f.WithTokens[0] != 120 {
+		t.Errorf("nonzero-token trial must contribute its total: %v", f.WithTokens)
 	}
 }
 

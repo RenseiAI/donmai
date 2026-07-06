@@ -88,12 +88,15 @@ func (e *GoExtractor) Extract(source, filePath string) FileAST {
 			if receiverType != "" {
 				sym.ParentName = receiverType
 			}
-			// Body extent (1-based closing-brace line) via the shared brace
-			// matcher (findBlockEndTS is language-agnostic brace counting).
-			// Only when the declaration line opens the body — a bodyless decl
-			// (assembly stub / external linkname) has no extent to record.
-			if strings.Contains(line, "{") {
-				endLine1 := findBlockEndTS(lines, i) + 1 // EndLine is 1-based like Line
+			// Body extent (1-based closing-brace line) via the
+			// string/comment-aware block scanner. The scanner finds the
+			// body's opening '{' itself — on the declaration line, or (for a
+			// wrapped multi-line signature) within the next few lines — so a
+			// '}' inside a string literal or comment can no longer truncate
+			// the extent. A bodyless decl (assembly stub / external linkname:
+			// no '{' before the next top-level declaration) records none.
+			if end, ok := scanBlockExtent(lines, i, scanGo, blockScanOpts{stopAtTopLevelDecl: true}); ok {
+				endLine1 := end + 1 // EndLine is 1-based like Line
 				sym.EndLine = &endLine1
 			}
 			symbols = append(symbols, sym)

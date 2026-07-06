@@ -357,3 +357,165 @@ func TestCheckDuplicate_UnrelatedContentNone(t *testing.T) {
 		t.Errorf("unrelated content got matchType %q; want \"none\"", m["matchType"])
 	}
 }
+
+// dedupTargetFuncTS is the TS mirror of dedupTargetFunc: a ~10-line function
+// whose duplicate hides inside a large .ts file.
+const dedupTargetFuncTS = `function computeRollingChecksumTS(data: number[], window: number): number {
+  let sum = 0
+  for (let i = 0; i < data.length; i++) {
+    sum += data[i] * ((i % window) + 1)
+    if (i >= window) {
+      sum -= data[i - window]
+    }
+    sum = ((sum << 1) | (sum >>> 31)) >>> 0
+  }
+  return sum
+}`
+
+// dedupLargeSourceTS builds a 100+ line TS file that embeds dedupTargetFuncTS
+// among unrelated functions, so the whole-file SimHash is dominated by filler.
+func dedupLargeSourceTS() string {
+	var b strings.Builder
+	b.WriteString("// bigmod: assorted subsystem handlers\n\n")
+	fillers := []string{"orders", "invoices", "payments", "refunds", "ledgers", "audits", "batches", "queues", "streams", "shards", "tokens", "cursors", "buffers", "windows", "frames"}
+	for i, w := range fillers {
+		fmt.Fprintf(&b, "// handle%d processes %s records for the %s subsystem.\n", i, w, w)
+		fmt.Fprintf(&b, "export function process_%s_%d(input: %sInput): Out {\n", w, i, w)
+		fmt.Fprintf(&b, "  const validated = validate_%s(input)\n", w)
+		b.WriteString("  if (!validated) {\n    throw new Error(\"invalid\")\n  }\n")
+		fmt.Fprintf(&b, "  return transform_%s(validated)\n}\n\n", w)
+	}
+	b.WriteString(dedupTargetFuncTS)
+	b.WriteString("\n")
+	return b.String()
+}
+
+// TestCheckDuplicate_SymbolInLargeFileExact_TS is the TS mirror of
+// TestCheckDuplicate_SymbolInLargeFileExact: an exact copy of a ~10-line TS
+// function buried in a 100+ line .ts file must be flagged as a symbol-level
+// exact duplicate with the symbol name and line.
+//
+// RED (against the extents-only-for-classes TS extractor): TS functions carry
+// no EndLine, so no symbol fingerprints exist and the copy comes back "none".
+func TestCheckDuplicate_SymbolInLargeFileExact_TS(t *testing.T) {
+	dir := t.TempDir()
+	src := dedupLargeSourceTS()
+	if n := strings.Count(src, "\n"); n < 100 {
+		t.Fatalf("fixture too small: %d lines; want 100+", n)
+	}
+	writeFile(t, filepath.Join(dir, "big.ts"), src)
+
+	nr := NewNativeRunner(dir)
+	if _, err := nr.BuildIndex(GetRepoMapOptions{}); err != nil {
+		t.Fatalf("BuildIndex: %v", err)
+	}
+
+	out, err := nr.CheckDuplicateNative(CheckDuplicateOptions{Content: dedupTargetFuncTS})
+	if err != nil {
+		t.Fatalf("CheckDuplicateNative: %v", err)
+	}
+	m := out.(map[string]any)
+	if m["matchType"] != "exact" {
+		t.Fatalf("TS symbol-in-large-file copy got matchType %q; want \"exact\" (TS functions must carry dedup fingerprints)", m["matchType"])
+	}
+	if m["filePath"] != "big.ts" {
+		t.Errorf("filePath=%v; want big.ts", m["filePath"])
+	}
+	if m["symbolName"] != "computeRollingChecksumTS" {
+		t.Errorf("symbolName=%v; want computeRollingChecksumTS", m["symbolName"])
+	}
+	wantLine := strings.Count(strings.SplitAfter(src, "function computeRollingChecksumTS")[0], "\n") + 1
+	if m["line"] != wantLine {
+		t.Errorf("line=%v; want %d", m["line"], wantLine)
+	}
+}
+
+// dedupBraceyTargetFunc is a function whose body is full of braces inside
+// string literals and comments — the shapes that fooled the naive brace
+// counter into truncating the hashed extent.
+const dedupBraceyTargetFunc = `func renderBraces(names []string) string {
+	out := "{"
+	// } keep the scanner honest
+	for _, n := range names {
+		out += n + "},{"
+	}
+	out += "}"
+	return out
+}`
+
+// TestCheckDuplicate_SymbolWithBraceInString_Exact proves the hashed extent
+// survives braces in strings/comments: an exact paste of the brace-laden
+// function must produce a symbol-level exact match.
+//
+// RED (against the naive brace counter): the extent is truncated at the first
+// '}' inside a string, so the persisted fingerprint never equals the paste.
+func TestCheckDuplicate_SymbolWithBraceInString_Exact(t *testing.T) {
+	dir := t.TempDir()
+	src := dedupLargeSource() + "\n" + dedupBraceyTargetFunc + "\n"
+	writeFile(t, filepath.Join(dir, "bracey.go"), src)
+
+	nr := NewNativeRunner(dir)
+	if _, err := nr.BuildIndex(GetRepoMapOptions{}); err != nil {
+		t.Fatalf("BuildIndex: %v", err)
+	}
+
+	out, err := nr.CheckDuplicateNative(CheckDuplicateOptions{Content: dedupBraceyTargetFunc})
+	if err != nil {
+		t.Fatalf("CheckDuplicateNative: %v", err)
+	}
+	m := out.(map[string]any)
+	if m["matchType"] != "exact" {
+		t.Fatalf("brace-laden symbol paste got matchType %q; want \"exact\" (string/comment braces truncated the hashed extent)", m["matchType"])
+	}
+	if m["symbolName"] != "renderBraces" {
+		t.Errorf("symbolName=%v; want renderBraces", m["symbolName"])
+	}
+}
+
+// TestComputeSymbolHashes_MinLinesBoundary pins the symbolHashMinLines
+// boundary exactly (a `<` vs `<=` mutation must go red): a 2-line extent is
+// excluded, a 3-line extent is included — and the inclusion is observable
+// end-to-end through CheckDuplicateNative.
+func TestComputeSymbolHashes_MinLinesBoundary(t *testing.T) {
+	twoLiner := "func twoLiner(a int) int {\n\treturn a*31 + a }"
+	threeLiner := "func threeLiner(widgets []string) int {\n\treturn len(widgets) * 7\n}"
+	src := "package mb\n\n" + twoLiner + "\n\n" + threeLiner + "\n"
+
+	ast := (&GoExtractor{}).Extract(src, "mb.go")
+	hashes := ComputeSymbolHashes(src, ast.Symbols)
+	names := map[string]bool{}
+	for _, h := range hashes {
+		names[h.Name] = true
+	}
+	if names["twoLiner"] {
+		t.Errorf("2-line extent got a symbol hash; want excluded (< %d lines)", symbolHashMinLines)
+	}
+	if !names["threeLiner"] {
+		t.Errorf("3-line extent got no symbol hash; want included (exactly %d lines)", symbolHashMinLines)
+	}
+
+	// End-to-end: the 3-liner pastes back as a symbol-level exact match; the
+	// 2-liner does not (whole-file coverage aside, there is no fingerprint).
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "mb.go"), dedupLargeSource()+"\n"+twoLiner+"\n\n"+threeLiner+"\n")
+	nr := NewNativeRunner(dir)
+	if _, err := nr.BuildIndex(GetRepoMapOptions{}); err != nil {
+		t.Fatalf("BuildIndex: %v", err)
+	}
+	out, err := nr.CheckDuplicateNative(CheckDuplicateOptions{Content: threeLiner})
+	if err != nil {
+		t.Fatalf("CheckDuplicateNative(threeLiner): %v", err)
+	}
+	m := out.(map[string]any)
+	if m["matchType"] != "exact" || m["symbolName"] != "threeLiner" {
+		t.Errorf("3-line func: matchType=%v symbolName=%v; want exact/threeLiner", m["matchType"], m["symbolName"])
+	}
+	out, err = nr.CheckDuplicateNative(CheckDuplicateOptions{Content: twoLiner})
+	if err != nil {
+		t.Fatalf("CheckDuplicateNative(twoLiner): %v", err)
+	}
+	m = out.(map[string]any)
+	if m["matchType"] != "none" {
+		t.Errorf("2-line func: matchType=%v; want none (below the %d-line fingerprint floor)", m["matchType"], symbolHashMinLines)
+	}
+}

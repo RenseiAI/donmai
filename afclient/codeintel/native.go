@@ -90,7 +90,12 @@ func NewNativeRunner(cwd string) *NativeRunner {
 //	    0-based indexes, reporting every definition one line early)
 //	v4: per-file symbolHashes (symbol-granular dedup fingerprints; a v3 index
 //	    lacks them, so file-buried duplicates would silently miss)
-const IndexSchemaVersion = 4
+//	v5: body extents come from the string/comment-aware block scanner — v4
+//	    extents could be truncated by a '}' inside a string literal or
+//	    comment (wrong symbol fingerprints) and TS functions/methods carried
+//	    no extents at all (missing fingerprints), so stale v4 hashes must be
+//	    rebuilt
+const IndexSchemaVersion = 5
 
 // loadIndex attempts to read the persisted index.json. Returns an empty
 // IndexFile if the file does not exist, cannot be decoded, or carries a schema
