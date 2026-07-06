@@ -330,3 +330,47 @@ func TestMergeMCPServers_CodeIntelDefaultWinsOnCollision(t *testing.T) {
 		t.Errorf("surviving code-intel entry must be the runner-authored one (--root=%q, want %q)", got, root)
 	}
 }
+
+// TestCodeIntelPartial_TaskConditionalLanguageNeutral extends the WS4 framing
+// contract to the PRODUCTION prompt partial (the existing framing tests only
+// covered runtime/mcp/server descriptions and the eval advertisement): no
+// blanket "Prefer them over grep" steering, no single-language idiom in any
+// guidance string, and the explicit grep de-scope clause present in every
+// rendered variant. The pilot showed the blanket framing drove adoption onto
+// tasks grep already wins (1.0-2.10x token cost at +0pp success), and the TS
+// idioms told Go agents the xref tool was inapplicable.
+func TestCodeIntelPartial_TaskConditionalLanguageNeutral(t *testing.T) {
+	t.Parallel()
+	banned := []string{"Prefer them over", "union type", "Record<"}
+
+	for _, tm := range codeIntelTools {
+		for _, b := range banned {
+			if strings.Contains(tm.guidance, b) {
+				t.Errorf("guidance for %s contains banned phrase %q: %q", tm.tool, b, tm.guidance)
+			}
+		}
+	}
+
+	for name, caps := range map[string]agent.Capabilities{"mcp": mcpCaps(), "cli": cliCaps()} {
+		got := injectCodeIntelPartial("S", caps, &prompt.CodeIntelWork{Repo: "owner/repo"})
+		for _, b := range banned {
+			if strings.Contains(got, b) {
+				t.Errorf("%s partial contains banned phrase %q:\n%s", name, b, got)
+			}
+		}
+		low := strings.ToLower(got)
+		// The grep de-scope sentence is pinned: trivial exact-identifier
+		// lookups belong to grep, not a tool call.
+		if !strings.Contains(low, "grep is fine") {
+			t.Errorf("%s partial must de-scope exact single-identifier lookups to grep:\n%s", name, got)
+		}
+		// Task-conditional anchors: orientation -> repo map FIRST; pre-edit
+		// enumeration before a cross-file rename/refactor.
+		if !strings.Contains(low, "first") {
+			t.Errorf("%s partial should anchor get_repo_map to orientation FIRST:\n%s", name, got)
+		}
+		if !strings.Contains(low, "rename or refactor") {
+			t.Errorf("%s partial should anchor find_type_usages to pre-edit cross-file rename/refactor:\n%s", name, got)
+		}
+	}
+}

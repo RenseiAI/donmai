@@ -257,7 +257,7 @@ func toolCallText(tc ToolCall) string {
 	return tc.Name + " " + string(tc.Arguments)
 }
 
-func (g toolUseGrader) Grade(_ context.Context, c Case, tr Transcript) GradeResult {
+func (g toolUseGrader) Grade(ctx context.Context, c Case, tr Transcript) GradeResult {
 	if tr.Arm != ArmWith {
 		return GradeResult{
 			GraderID: g.ID(), Score: 0, Pass: false,
@@ -289,10 +289,39 @@ func (g toolUseGrader) Grade(_ context.Context, c Case, tr Transcript) GradeResu
 			Reasoning: fmt.Sprintf("adopted a code-intel tool but not the one matched to %s (%v)", c.Family(), want),
 		}
 	default:
+		return g.gradeZeroAdoption(ctx, c, tr, want, meta)
+	}
+}
+
+// gradeZeroAdoption scores a WITH-arm trial that made no code-intel call.
+//
+// Family-aware correct-skip policy: the WS4 advertisement explicitly de-scopes
+// trivial exact-identifier lookups ("plain grep is fine — do not add a tool
+// call"), and find-symbol is the ONE family whose task definition matches that
+// clause. So for TaskFindSymbol, zero adoption WITH a passing task grade is a
+// CORRECT skip (Pass true, correctSkip metadata) — grading it as a failure
+// would anti-correlate the tool-use metric with the very advertisement under
+// test. adopted stays false so driver.accumulate never counts a correct skip
+// toward the adoption rate. Zero adoption with a FAILED task still fails (the
+// tool might have helped), and every other family fails as before — their
+// advertised jobs are not de-scoped.
+func (g toolUseGrader) gradeZeroAdoption(ctx context.Context, c Case, tr Transcript, want []string, meta map[string]any) GradeResult {
+	if c.Family() == TaskFindSymbol {
+		if tg := TaskGraderFor(c.Family()); tg != nil && tg.Grade(ctx, c, tr).Pass {
+			meta["correctSkip"] = true
+			return GradeResult{
+				GraderID: g.ID(), Score: 1, Pass: true, Metadata: meta,
+				Reasoning: "correct skip: the advertisement de-scopes trivial exact-identifier lookups to grep, and the task succeeded without a code-intel call",
+			}
+		}
 		return GradeResult{
 			GraderID: g.ID(), Score: 0, Pass: false, Metadata: meta,
-			Reasoning: "no code-intel tool was invoked despite the WITH-arm advertisement",
+			Reasoning: "no code-intel tool was invoked and the task did not succeed — the grep de-scope only covers lookups grep actually wins",
 		}
+	}
+	return GradeResult{
+		GraderID: g.ID(), Score: 0, Pass: false, Metadata: meta,
+		Reasoning: fmt.Sprintf("no code-intel tool was invoked for %s, a family whose advertised job (%v) is not de-scoped to grep", c.Family(), want),
 	}
 }
 

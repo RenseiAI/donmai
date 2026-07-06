@@ -117,6 +117,11 @@ Examples:
 	return cmd
 }
 
+// evalNewDriver is a test seam over eval.NewDriver (same pattern as
+// githubTestBaseURL): tests swap it to capture the eval.Config the command
+// assembled — proving flag→Config propagation — without running a live eval.
+var evalNewDriver = eval.NewDriver
+
 func runEvalCodeIntel(cmd *cobra.Command, opts *evalCodeIntelOpts) error {
 	out := cmd.OutOrStdout()
 	advertise, err := eval.ParseAdvertiseMode(opts.advertise)
@@ -163,7 +168,7 @@ func runEvalCodeIntel(cmd *cobra.Command, opts *evalCodeIntelOpts) error {
 		return err
 	}
 
-	driver, err := eval.NewDriver(eval.Config{
+	driver, err := evalNewDriver(eval.Config{
 		Trials:            opts.trials,
 		Advertise:         advertise,
 		AdvertiseAllTools: opts.advertiseAll,

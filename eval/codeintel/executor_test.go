@@ -139,3 +139,26 @@ func TestDedupSnippetExtraction(t *testing.T) {
 		t.Errorf("dedupSnippet leaked fence/prose; got %q", snip)
 	}
 }
+
+// TestResultParsers_TolerateTruncationSentinel pins the F1 wire contract: the
+// exact-match short-circuit may APPEND a sentinel element
+// {"truncatedExactMatches": n, "hint": …} to a search-symbols result. The
+// harness parsers must ignore it — topSymbolHit still reads the first REAL
+// hit, and collectFilePaths collects only elements carrying filePath keys.
+func TestResultParsers_TolerateTruncationSentinel(t *testing.T) {
+	result := `[
+	  {"symbol":{"name":"Extract","filePath":"a.go","line":3},"score":15,"matchType":"exact"},
+	  {"symbol":{"name":"Extract","filePath":"b.go","line":7},"score":15,"matchType":"exact"},
+	  {"truncatedExactMatches":2,"hint":"raise maxResults to see all exact definitions"}
+	]`
+
+	f, l, ok := topSymbolHit(result)
+	if !ok || f != "a.go" || l != 3 {
+		t.Errorf("topSymbolHit = (%q,%d,%v), want (a.go,3,true) — sentinel must not break the top hit", f, l, ok)
+	}
+
+	files := collectFilePaths(result)
+	if len(files) != 2 || files[0] != "a.go" || files[1] != "b.go" {
+		t.Errorf("collectFilePaths = %v, want [a.go b.go] — sentinel must contribute nothing", files)
+	}
+}
