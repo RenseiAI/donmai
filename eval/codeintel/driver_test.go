@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -320,13 +321,13 @@ func TestDriver_Refactor_NilJudge_NeverPasses(t *testing.T) {
 	}
 }
 
-// TestDriver_UnderpoweredRunIsNotAGAPass proves the founder-threshold verdict
-// hard-refuses a PASS on an underpowered corpus. One find-symbol case, one
-// trial, one repo: WITH passes / WITHOUT fails → +100pp, no regression, tokens
-// under budget — yet this is one task, one trial, one repo, one family, far
-// below the locked bar (>=8 tasks/family x 2 repos x >=3 trials/arm). A raw
-// +100pp here is a null/underpowered result masquerading as a passing verdict;
-// MeetsThreshold must be false.
+// TestDriver_UnderpoweredRunIsNotAGAPass proves the efficiency-threshold
+// verdict hard-refuses a PASS on an underpowered corpus. One find-symbol case,
+// one trial, one repo: WITH passes / WITHOUT fails, WITH cheaper on tokens —
+// the raw numbers would clear the Q1v2 efficiency bar — yet this is one task,
+// one trial, one repo, one family, far below the locked power preconditions
+// (>=8 tasks/family x 2 repos x >=3 trials/arm). Medians over one trial are
+// noise masquerading as a verdict; MeetsThreshold must be false.
 func TestDriver_UnderpoweredRunIsNotAGAPass(t *testing.T) {
 	repoDir, sha := initTempRepo(t)
 	donmaiDir := writeFakeBinary(t, "donmai")
@@ -348,11 +349,14 @@ func TestDriver_UnderpoweredRunIsNotAGAPass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.Aggregate.DeltaPP < 15 {
-		t.Fatalf("precondition: raw delta should clear +15pp, got %.0f", rep.Aggregate.DeltaPP)
+	if r := rep.Aggregate.TokenRatio; r <= 0 || r > 1.0 {
+		t.Fatalf("precondition: raw tokenRatio should clear the efficiency bar (<=1.0x), got %.2f", r)
+	}
+	if len(rep.Aggregate.RegressedFamilies) != 0 {
+		t.Fatalf("precondition: no family should regress, got %v", rep.Aggregate.RegressedFamilies)
 	}
 	if rep.Aggregate.MeetsThreshold {
-		t.Error("underpowered run (1 task / 1 trial / 1 repo / 1 family) must NOT meet the founder threshold")
+		t.Error("underpowered run (1 task / 1 trial / 1 repo / 1 family) must NOT meet the efficiency threshold")
 	}
 	if !rep.Aggregate.Underpowered {
 		t.Error("underpowered run must be flagged Underpowered")
@@ -367,8 +371,10 @@ func TestDriver_UnderpoweredRunIsNotAGAPass(t *testing.T) {
 
 // TestComputeAggregate_PoweredCorpusCanPass proves the power gate is not a
 // blanket refusal: a corpus meeting every locked precondition (>=8 tasks/family
-// across all four families, >=2 repos, >=3 trials/arm) with a >=+15pp delta, no
-// regression, and tokens under budget reports MeetsThreshold=true.
+// across all four families, >=2 repos, >=3 trials/arm) that clears the Q1v2
+// efficiency bar (aggregate tokens <=1.0x, every family <=1.10x, no success
+// regression) reports MeetsThreshold=true. The +100pp delta here is
+// informational — the verdict rides on the token ratios.
 func TestComputeAggregate_PoweredCorpusCanPass(t *testing.T) {
 	repos := []string{"acme/webapp", "acme/service"}
 	fams := map[TaskType]*FamilyStat{}
@@ -404,26 +410,175 @@ func TestComputeAggregate_PoweredCorpusCanPass(t *testing.T) {
 	if agg.DeltaPP < 15 {
 		t.Fatalf("precondition: delta should be +100pp, got %.0f", agg.DeltaPP)
 	}
-	// Every case is a clean +100pp win, so the bootstrap CI is a point mass at 100.
+	// Every case is a clean +100pp win, so the bootstrap CI is a point mass at
+	// 100 — still computed and reported (informational since Q1v2).
 	if agg.DeltaCILow < 15 {
 		t.Fatalf("precondition: a uniform +100pp corpus must have a tight CI lower bound, got %.1f", agg.DeltaCILow)
 	}
 	if !agg.MeetsThreshold {
-		t.Errorf("powered +100pp corpus (no regression, tokens<budget) must meet threshold; status=%q", agg.Status)
+		t.Errorf("powered corpus (tokens 0.91x, no regression) must meet the efficiency threshold; status=%q", agg.Status)
 	}
 	if !strings.Contains(agg.Status, "GA-PASS") {
 		t.Errorf("status should be GA-PASS, got %q", agg.Status)
 	}
 }
 
-// TestComputeAggregate_WideCIPoweredRunFailsOnLowerBound is the finding-7
-// red-first guard: a fully-POWERED corpus (>=8 tasks/family x4, 2 repos, 3
-// trials) whose per-case outcomes are heterogeneous — most cases a tie, a
-// handful big WITH wins — has a point-estimate delta above +15pp but a WIDE 95%
-// CI whose LOWER BOUND falls below +15pp. Gating on the point estimate would
-// pass this borderline/noisy result; the founder verdict must gate on the CI
-// lower bound and REFUSE it.
-func TestComputeAggregate_WideCIPoweredRunFailsOnLowerBound(t *testing.T) {
+// efficiencyCorpus builds a fully-POWERED corpus (minTasksPerFamily tasks per
+// family x all four families x 2 repos x minTrialsForGA trials/arm) where BOTH
+// arms pass every trial — DeltaPP is exactly 0, which the retired success bar
+// would have refused — and each family's per-trial token totals are fixed at
+// tok[fam] = {WITH, WITHOUT}. A family mapped to {0, 0} contributes trials but
+// NO token samples (the missing-token-data shape a live run produces when an
+// arm's usage capture fails).
+func efficiencyCorpus(tok map[TaskType][2]int64) (map[TaskType]*FamilyStat, []RunRecord, []Case) {
+	repos := []string{"acme/webapp", "acme/service"}
+	fams := map[TaskType]*FamilyStat{}
+	var cases []Case
+	var records []RunRecord
+	for _, fam := range families {
+		f := &FamilyStat{}
+		fams[fam] = f
+		for i := 0; i < minTasksPerFamily; i++ {
+			id := fmt.Sprintf("%s-%02d", fam, i)
+			repo := repos[i%len(repos)]
+			cases = append(cases, Case{ID: id, Input: CaseInput{TaskType: fam, Repo: repo}})
+			for tr := 0; tr < minTrialsForGA; tr++ {
+				f.WithTrials++
+				f.WithPasses++
+				f.WithoutTrials++
+				f.WithoutPasses++
+				if t := tok[fam]; t[0] > 0 || t[1] > 0 {
+					f.WithTokens = append(f.WithTokens, t[0])
+					f.WithoutTokens = append(f.WithoutTokens, t[1])
+				}
+				records = append(
+					records,
+					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWith, Pass: true},
+					RunRecord{CaseID: id, Family: fam, Repo: repo, Arm: ArmWithout, Pass: true},
+				)
+			}
+		}
+	}
+	return fams, records, cases
+}
+
+// TestComputeAggregate_EfficiencyBar_ZeroDeltaTokenWinPasses is the Q1v2
+// red-first core case: a powered run with DeltaPP = 0 (both arms always pass —
+// exactly what the 2026-07-06 decision-gate eval showed: control = 100% even on
+// grep-resistant probes) but a clean token win (0.95x aggregate, every family
+// <=1.10x, no regression) MEETS the threshold. Under the retired >=+15pp bar
+// this exact corpus was an automatic FAIL.
+func TestComputeAggregate_EfficiencyBar_ZeroDeltaTokenWinPasses(t *testing.T) {
+	fams, records, cases := efficiencyCorpus(map[TaskType][2]int64{
+		TaskFindSymbol:          {95, 100},
+		TaskLocateUsage:         {95, 100},
+		TaskRefactorAcrossFiles: {95, 100},
+		TaskDedup:               {95, 100},
+	})
+	agg := computeAggregate(fams, records, cases, minTrialsForGA)
+	if agg.Underpowered {
+		t.Fatalf("corpus should be powered; shortfalls=%v", agg.PowerShortfalls)
+	}
+	if agg.DeltaPP != 0 {
+		t.Fatalf("precondition: delta must be exactly 0pp, got %.2f", agg.DeltaPP)
+	}
+	if math.Abs(agg.TokenRatio-0.95) > 1e-9 {
+		t.Fatalf("precondition: aggregate tokenRatio must be 0.95, got %.4f", agg.TokenRatio)
+	}
+	if !agg.MeetsThreshold {
+		t.Errorf("powered 0.95x-token run with zero delta must MEET the efficiency threshold; status=%q", agg.Status)
+	}
+	if !strings.Contains(agg.Status, "GA-PASS") {
+		t.Errorf("status should be GA-PASS, got %q", agg.Status)
+	}
+}
+
+// TestComputeAggregate_EfficiencyBar_FamilyTokenRegressionFails: one family at
+// 1.50x (the pre-WS5 dedup shape) fails the per-family <=1.10x guard even
+// though the AGGREGATE median is well under 1.0x — a family-level cost
+// regression cannot hide inside a favorable pooled median.
+func TestComputeAggregate_EfficiencyBar_FamilyTokenRegressionFails(t *testing.T) {
+	fams, records, cases := efficiencyCorpus(map[TaskType][2]int64{
+		TaskFindSymbol:          {80, 100},
+		TaskLocateUsage:         {80, 100},
+		TaskRefactorAcrossFiles: {80, 100},
+		TaskDedup:               {150, 100}, // 1.50x — the dedup cost shape WS5 exists to fix
+	})
+	agg := computeAggregate(fams, records, cases, minTrialsForGA)
+	if agg.Underpowered {
+		t.Fatalf("corpus should be powered; shortfalls=%v", agg.PowerShortfalls)
+	}
+	if agg.TokenRatio > 1.0 {
+		t.Fatalf("precondition: aggregate ratio must stay <=1.0x (pooled median hides the dedup cost), got %.2f", agg.TokenRatio)
+	}
+	if agg.MeetsThreshold {
+		t.Errorf("a 1.50x family must fail the per-family <=1.10x guard; status=%q", agg.Status)
+	}
+	if len(agg.TokenRegressedFamilies) != 1 || agg.TokenRegressedFamilies[0] != TaskDedup {
+		t.Errorf("TokenRegressedFamilies = %v, want [dedup]", agg.TokenRegressedFamilies)
+	}
+	if !strings.Contains(agg.Status, "GA-FAIL") {
+		t.Errorf("status should be GA-FAIL, got %q", agg.Status)
+	}
+}
+
+// TestComputeAggregate_EfficiencyBar_AggregateRatioFails: every family inside
+// the +10% per-family allowance (1.05x) but the AGGREGATE over 1.0x fails —
+// the overall surface must be net-non-costing, not merely never-terrible.
+func TestComputeAggregate_EfficiencyBar_AggregateRatioFails(t *testing.T) {
+	fams, records, cases := efficiencyCorpus(map[TaskType][2]int64{
+		TaskFindSymbol:          {105, 100},
+		TaskLocateUsage:         {105, 100},
+		TaskRefactorAcrossFiles: {105, 100},
+		TaskDedup:               {105, 100},
+	})
+	agg := computeAggregate(fams, records, cases, minTrialsForGA)
+	if agg.Underpowered {
+		t.Fatalf("corpus should be powered; shortfalls=%v", agg.PowerShortfalls)
+	}
+	if len(agg.TokenRegressedFamilies) != 0 {
+		t.Fatalf("precondition: no family exceeds 1.10x, got %v", agg.TokenRegressedFamilies)
+	}
+	if agg.MeetsThreshold {
+		t.Errorf("aggregate 1.05x > 1.0x must fail the efficiency threshold; status=%q", agg.Status)
+	}
+	if !strings.Contains(agg.Status, "GA-FAIL") {
+		t.Errorf("status should be GA-FAIL, got %q", agg.Status)
+	}
+}
+
+// TestComputeAggregate_EfficiencyBar_FamilyWithoutTokenDataExcluded: a family
+// whose trials carry NO token samples (usage capture failed on an arm) is
+// EXCLUDED from the per-family guard — same convention as the success
+// regression check (WithTrials>0 && WithoutTrials>0) — rather than passing or
+// failing on a garbage 0-median ratio.
+func TestComputeAggregate_EfficiencyBar_FamilyWithoutTokenDataExcluded(t *testing.T) {
+	fams, records, cases := efficiencyCorpus(map[TaskType][2]int64{
+		TaskFindSymbol:          {95, 100},
+		TaskLocateUsage:         {95, 100},
+		TaskRefactorAcrossFiles: {95, 100},
+		TaskDedup:               {0, 0}, // no token samples on either arm
+	})
+	agg := computeAggregate(fams, records, cases, minTrialsForGA)
+	if agg.Underpowered {
+		t.Fatalf("corpus should be powered; shortfalls=%v", agg.PowerShortfalls)
+	}
+	if len(agg.TokenRegressedFamilies) != 0 {
+		t.Errorf("token-data-less family must be excluded from the guard, got %v", agg.TokenRegressedFamilies)
+	}
+	if !agg.MeetsThreshold {
+		t.Errorf("run must still pass on the families that HAVE data; status=%q", agg.Status)
+	}
+}
+
+// TestComputeAggregate_DeltaCIReportedButNoLongerGates re-aims the old
+// finding-7 lower-bound guard at the Q1v2 bar: a fully-POWERED corpus whose
+// per-case outcomes are heterogeneous — most cases a tie, a handful big WITH
+// wins — has a WIDE 95% delta CI whose lower bound falls below +15pp. Under
+// the retired success-delta bar that CI REFUSED the run; under the efficiency
+// bar the delta (and its CI) stay computed and reported as INFORMATIONAL, and
+// the same corpus PASSES on its token win (0.91x, no regression).
+func TestComputeAggregate_DeltaCIReportedButNoLongerGates(t *testing.T) {
 	repos := []string{"acme/webapp", "acme/service"}
 	fams := map[TaskType]*FamilyStat{}
 	var cases []Case
@@ -476,13 +631,18 @@ func TestComputeAggregate_WideCIPoweredRunFailsOnLowerBound(t *testing.T) {
 	if agg.DeltaPP < 15 {
 		t.Fatalf("precondition: point-estimate delta must clear +15pp, got %.2f", agg.DeltaPP)
 	}
+	// The CI machinery stays intact and reported: a wide-variance corpus still
+	// yields a lower bound below the old +15pp mark, and stddev is nonzero.
 	if agg.DeltaCILow >= 15 {
 		t.Fatalf("precondition: the 95%% CI lower bound must fall BELOW +15pp for this wide-variance corpus, got %.2f (hi=%.2f, stddev=%.2f)",
 			agg.DeltaCILow, agg.DeltaCIHigh, agg.DeltaStdDev)
 	}
-	if agg.MeetsThreshold {
-		t.Errorf("a powered run whose 95%% CI lower bound (%.2f) is below +15pp must NOT meet the founder threshold — the point estimate (%.2f) is not enough",
-			agg.DeltaCILow, agg.DeltaPP)
+	if agg.DeltaStdDev <= 0 {
+		t.Fatalf("bootstrap stddev must still be computed, got %.4f", agg.DeltaStdDev)
+	}
+	if !agg.MeetsThreshold {
+		t.Errorf("under the Q1v2 efficiency bar the wide delta CI (lower bound %.2f) is informational — the 0.91x token win must PASS; status=%q",
+			agg.DeltaCILow, agg.Status)
 	}
 }
 

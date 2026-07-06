@@ -14,7 +14,7 @@ import (
 const benchmarkDir = "../../afclient/codeintel/testdata/eval-benchmark"
 
 // TestBenchmark_Loads_AndMeetsMatrix loads the shipped benchmark and asserts the
-// family/repo matrix from brief 06 §4.1 + the founder threshold (>=8 tasks per
+// family/repo matrix from brief 06 §4.1 + the locked power floor (>=8 tasks per
 // family, both dogfood repos represented in each family).
 func TestBenchmark_Loads_AndMeetsMatrix(t *testing.T) {
 	cases, err := LoadCasesDir(benchmarkDir)

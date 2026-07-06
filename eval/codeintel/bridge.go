@@ -30,7 +30,7 @@ const DefaultBridgePath = "/api/evals/ingest"
 // model-grader/codeintel-refactor-v1, and — WITH arm only —
 // tool-use-correctness/codeintel-v1), so the dashboard's gradeResults come from
 // the platform graders. The driver's own Go graders still drive its local A/B
-// console rollup + founder-threshold verdict; the two are independent by design.
+// console rollup + efficiency-threshold verdict; the two are independent by design.
 type IngestRequest struct {
 	// Arm is which side of the A/B this trial belongs to ("with" | "without").
 	// The platform only auto-adds the tool-use-correctness grader on "with".

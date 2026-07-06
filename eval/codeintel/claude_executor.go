@@ -397,7 +397,8 @@ func parseResult(raw []byte, ps *parsedStream) bool {
 	// fall back to the per-turn assistant usage sum so a failed session's real
 	// token cost is not silently recorded as zero. A zeroed WITHOUT-arm cost would
 	// drag the control median down and inflate the WITH/WITHOUT ratio the
-	// founder-gated token budget (<=+10%) is measured against.
+	// Q1v2 efficiency bar (aggregate <=1.0x, per-family <=1.10x) is measured
+	// against.
 	if ps.tokens == (TokenCounts{}) {
 		ps.tokens = ps.assistantTokens
 	}

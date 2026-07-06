@@ -2,9 +2,15 @@
 // benchmark-dataset loader, three grader classes, a two-arm (WITH / WITHOUT)
 // execution driver, and a thin platform reporting bridge.
 //
-// The harness measures the agent-success delta of the in-box
-// code-intelligence engine (shipped in donmai v0.50.0) by driving an agent
-// through a real code task twice on two fresh, identical workareas:
+// The harness measures the token-efficiency ratio AND the agent-success delta
+// of the in-box code-intelligence engine (shipped in donmai v0.50.0) by
+// driving an agent through a real code task twice on two fresh, identical
+// workareas. The GA verdict is the Q1v2 EFFICIENCY bar (founder decision,
+// 2026-07-06): aggregate WITH/WITHOUT median-token ratio <= 1.0x, every
+// family <= 1.10x, no per-family success regression. The original >=+15pp
+// success-delta bar was retired after the 2026-07-06 decision-gate eval
+// proved it unreachable (the control arm scored 100% even on grep-resistant
+// probes); the success delta stays reported as informational. The two arms:
 //
 //   - the WITHOUT arm gets the baseline tool surface only, with the donmai
 //     binary explicitly stripped from PATH (the mandatory contamination guard
