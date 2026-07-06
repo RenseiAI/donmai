@@ -224,3 +224,35 @@ func TestRubricGrader(t *testing.T) {
 		t.Errorf("nil judge must fail; got %+v", got)
 	}
 }
+
+// TestCodeIntelToolForFamily pins the WS13-lite family→tool map against
+// today's six-tool surface: the expected tool must be the one that actually
+// serves the family AND is advertised to that family's WITH arm (WS2 subset).
+func TestCodeIntelToolForFamily(t *testing.T) {
+	tests := []struct {
+		family TaskType
+		want   []string
+	}{
+		{TaskFindSymbol, []string{"af_code_search_symbols"}},
+		// locate-usage: search_code lists usage sites; find_type_usages is a
+		// type-xref (and not advertised for this family post-WS2).
+		{TaskLocateUsage, []string{"af_code_search_code"}},
+		{TaskDedup, []string{"af_code_check_duplicate"}},
+		// refactor: the xref tool enumerates edit sites; repo-map orients.
+		// search_symbols does not enumerate sites and must not count as correct.
+		{TaskRefactorAcrossFiles, []string{"af_code_find_type_usages", "af_code_get_repo_map"}},
+	}
+	for _, tt := range tests {
+		got := codeIntelToolForFamily(tt.family)
+		if len(got) != len(tt.want) {
+			t.Errorf("%s: got %v, want %v", tt.family, got, tt.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("%s: got %v, want %v", tt.family, got, tt.want)
+				break
+			}
+		}
+	}
+}

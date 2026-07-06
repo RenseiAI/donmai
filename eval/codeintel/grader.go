@@ -210,17 +210,23 @@ func NewToolUseGrader() Grader { return toolUseGrader{} }
 func (toolUseGrader) ID() string { return GraderToolUse }
 
 // codeIntelToolForFamily maps a family to the canonical af_code_* tool(s) the
-// agent should invoke.
+// agent should invoke — the tool that genuinely serves the family on today's
+// six-tool surface (WS13-lite), kept consistent with the WS2 advertised
+// subset so the grader never expects a tool the arm was not shown.
 func codeIntelToolForFamily(f TaskType) []string {
 	switch f {
 	case TaskFindSymbol:
 		return []string{"af_code_search_symbols"}
 	case TaskLocateUsage:
-		return []string{"af_code_find_type_usages", "af_code_search_code"}
+		// search_code lists usage sites; find_type_usages is a type-xref (and
+		// not advertised for this family), so it must not count as correct.
+		return []string{"af_code_search_code"}
 	case TaskDedup:
 		return []string{"af_code_check_duplicate"}
 	case TaskRefactorAcrossFiles:
-		return []string{"af_code_get_repo_map", "af_code_find_type_usages", "af_code_search_symbols"}
+		// The xref tool enumerates the edit sites; repo-map orients. Plain
+		// symbol search does not enumerate sites and is not a correct choice.
+		return []string{"af_code_find_type_usages", "af_code_get_repo_map"}
 	default:
 		return nil
 	}

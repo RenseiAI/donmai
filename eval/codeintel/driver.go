@@ -24,6 +24,10 @@ type Config struct {
 	Trials int
 	// Advertise selects the WITH-arm advertisement mechanism (default MCP).
 	Advertise AdvertiseMode
+	// AdvertiseAllTools disables the WS2 core-subset rule and advertises all
+	// six af_code_* tools to every WITH arm (the pre-WS2 surface) — kept as an
+	// A/B escape hatch for measuring the subset's own effect.
+	AdvertiseAllTools bool
 	// DonmaiBin is the absolute path to the donmai binary the WITH arm uses.
 	DonmaiBin string
 	// RepoRoots maps a case repo slug (e.g. "RenseiAI/donmai") to a local clone
@@ -78,7 +82,7 @@ func NewDriver(cfg Config) (*Driver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("driver: worktree manager: %w", err)
 	}
-	return &Driver{cfg: cfg, wm: wm, ad: NewAdvertisement(cfg.Advertise)}, nil
+	return &Driver{cfg: cfg, wm: wm, ad: NewAdvertisement(cfg.Advertise, cfg.AdvertiseAllTools)}, nil
 }
 
 // RunRecord is one (case, arm, trial) outcome.
@@ -309,14 +313,14 @@ func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, _ string
 	withEnv := PrependPath(neutralBase, donmaiDir)
 	spec.Env = withEnv
 	cleanup := func() { donmaiCleanup(); neutralCleanup() }
-	servers, suffix, err := d.ad.Apply(ctx, d.cfg.DonmaiBin, wa, c.Input.RepoPath, withEnv)
+	servers, suffix, err := d.ad.Apply(ctx, d.cfg.DonmaiBin, wa, c.Input.RepoPath, c.Family(), withEnv)
 	if err != nil {
 		cleanup()
 		return ArmSpec{}, nil, fmt.Errorf("advertise: %w", err)
 	}
 	spec.MCPServers = servers
 	spec.PromptSuffix = suffix
-	spec.AdvertisedTools = d.ad.AdvertisedToolNames()
+	spec.AdvertisedTools = d.ad.AdvertisedToolNames(c.Family())
 	if len(servers) > 0 {
 		path, werr := clijsonl.WriteMCPConfig(servers)
 		if werr != nil {

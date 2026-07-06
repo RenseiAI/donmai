@@ -31,8 +31,8 @@ func TestBuildMCPEntry_FrozenContract(t *testing.T) {
 }
 
 func TestMCPAdvertisement_Apply(t *testing.T) {
-	ad := NewAdvertisement(AdvertiseMCP)
-	servers, suffix, err := ad.Apply(context.Background(), "/bin/donmai", "/wa", "", nil)
+	ad := NewAdvertisement(AdvertiseMCP, true) // all-tools surface
+	servers, suffix, err := ad.Apply(context.Background(), "/bin/donmai", "/wa", "", TaskFindSymbol, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,8 +42,8 @@ func TestMCPAdvertisement_Apply(t *testing.T) {
 	if !strings.Contains(suffix, "mcp__af-code-intelligence__af_code_search_symbols") {
 		t.Errorf("prompt suffix should advertise FQ tool names; got %q", suffix)
 	}
-	if len(ad.AdvertisedToolNames()) != 6 {
-		t.Errorf("expected 6 advertised tools, got %d", len(ad.AdvertisedToolNames()))
+	if n := len(ad.AdvertisedToolNames(TaskFindSymbol)); n != 6 {
+		t.Errorf("expected 6 advertised tools, got %d", n)
 	}
 }
 
@@ -66,8 +66,8 @@ func writeFakeDonmai(t *testing.T) string {
 
 func TestPromptHelpAdvertisement_Apply_UsesLiveHelp(t *testing.T) {
 	bin := writeFakeDonmai(t)
-	ad := NewAdvertisement(AdvertisePromptHelp)
-	servers, suffix, err := ad.Apply(context.Background(), bin, "/wa", "", os.Environ())
+	ad := NewAdvertisement(AdvertisePromptHelp, false)
+	servers, suffix, err := ad.Apply(context.Background(), bin, "/wa", "", TaskFindSymbol, os.Environ())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,8 +87,8 @@ func TestPromptHelpAdvertisement_Apply_UsesLiveHelp(t *testing.T) {
 // NOT the losing blanket "prefer them over grep" framing that drove adoption
 // onto tasks grep wins.
 func TestMCPAdvertisement_TaskConditionalFraming(t *testing.T) {
-	ad := NewAdvertisement(AdvertiseMCP)
-	_, suffix, err := ad.Apply(context.Background(), "/bin/donmai", "/wa", "", nil)
+	ad := NewAdvertisement(AdvertiseMCP, true) // all-tools: every bullet present
+	_, suffix, err := ad.Apply(context.Background(), "/bin/donmai", "/wa", "", TaskFindSymbol, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,8 +118,8 @@ func TestMCPAdvertisement_TaskConditionalFraming(t *testing.T) {
 // shares the framing contract (no blanket prefer-over-grep; grep de-scope).
 func TestPromptHelpAdvertisement_TaskConditionalFraming(t *testing.T) {
 	bin := writeFakeDonmai(t)
-	ad := NewAdvertisement(AdvertisePromptHelp)
-	_, suffix, err := ad.Apply(context.Background(), bin, "/wa", "", os.Environ())
+	ad := NewAdvertisement(AdvertisePromptHelp, false)
+	_, suffix, err := ad.Apply(context.Background(), bin, "/wa", "", TaskFindSymbol, os.Environ())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,5 +128,78 @@ func TestPromptHelpAdvertisement_TaskConditionalFraming(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(suffix), "grep is fine") {
 		t.Errorf("suffix should de-scope exact single-identifier lookups to grep; got %q", suffix)
+	}
+}
+
+// ── WS2: core-subset advertisement (discovery-tax reduction) ─────────────────
+
+// TestMCPAdvertisement_CoreSubsetDefault pins the WS2 default: a non-refactor
+// WITH arm carries only the core four tools — the MCP entry passes the
+// server's --tools allow-list and the prompt/advertised names match it — so
+// the arm's ToolSearch/schema weight shrinks. The MCP server binary itself
+// still registers all six by default (wire contract).
+func TestMCPAdvertisement_CoreSubsetDefault(t *testing.T) {
+	ad := NewAdvertisement(AdvertiseMCP, false)
+	servers, suffix, err := ad.Apply(context.Background(), "/bin/donmai", "/wa", "", TaskFindSymbol, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 {
+		t.Fatalf("expected one server, got %d", len(servers))
+	}
+	args := strings.Join(servers[0].Args, " ")
+	wantTools := "af_code_get_repo_map,af_code_search_symbols,af_code_search_code,af_code_check_duplicate"
+	if !strings.Contains(args, "--tools "+wantTools) {
+		t.Errorf("MCP entry should carry the core-four --tools allow-list; args = %q", args)
+	}
+	names := ad.AdvertisedToolNames(TaskFindSymbol)
+	if len(names) != 4 {
+		t.Errorf("core subset should advertise 4 tools, got %d: %v", len(names), names)
+	}
+	for _, n := range names {
+		if strings.Contains(n, "find_type_usages") || strings.Contains(n, "validate_cross_deps") {
+			t.Errorf("core subset must not advertise %s", n)
+		}
+	}
+	if strings.Contains(suffix, "af_code_find_type_usages") {
+		t.Errorf("prompt suffix must not mention an un-advertised tool; got %q", suffix)
+	}
+}
+
+// TestMCPAdvertisement_RefactorAddsTypeUsages: the refactor family adds the
+// xref tool (find_type_usages) to the core four — the one family whose job it
+// serves — keeping the rule a deterministic function of the family only.
+func TestMCPAdvertisement_RefactorAddsTypeUsages(t *testing.T) {
+	ad := NewAdvertisement(AdvertiseMCP, false)
+	servers, suffix, err := ad.Apply(context.Background(), "/bin/donmai", "/wa", "", TaskRefactorAcrossFiles, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(servers[0].Args, " ")
+	if !strings.Contains(args, "af_code_find_type_usages") {
+		t.Errorf("refactor arm should carry find_type_usages in --tools; args = %q", args)
+	}
+	if !strings.Contains(suffix, "af_code_find_type_usages") {
+		t.Errorf("refactor prompt should anchor find_type_usages; got %q", suffix)
+	}
+	names := ad.AdvertisedToolNames(TaskRefactorAcrossFiles)
+	if len(names) != 5 {
+		t.Errorf("refactor subset should advertise 5 tools, got %d: %v", len(names), names)
+	}
+}
+
+// TestMCPAdvertisement_AllToolsOption: the all-six escape hatch restores the
+// full surface and passes NO --tools allow-list (server default = all six).
+func TestMCPAdvertisement_AllToolsOption(t *testing.T) {
+	ad := NewAdvertisement(AdvertiseMCP, true)
+	servers, _, err := ad.Apply(context.Background(), "/bin/donmai", "/wa", "", TaskFindSymbol, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args := strings.Join(servers[0].Args, " "); strings.Contains(args, "--tools") {
+		t.Errorf("all-tools mode must not pass --tools; args = %q", args)
+	}
+	if n := len(ad.AdvertisedToolNames(TaskFindSymbol)); n != 6 {
+		t.Errorf("all-tools mode should advertise 6 tools, got %d", n)
 	}
 }

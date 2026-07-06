@@ -56,14 +56,50 @@ func fqName(tool string) string {
 	return "mcp__" + CodeIntelServerName + "__" + tool
 }
 
-// fqToolNames returns the fully-qualified MCP tool names
-// (mcp__af-code-intelligence__<tool>).
-func fqToolNames() []string {
-	out := make([]string, 0, len(codeIntelToolNames))
-	for _, t := range codeIntelToolNames {
+// fqNames maps tool names to their fully-qualified MCP forms.
+func fqNames(tools []string) []string {
+	out := make([]string, 0, len(tools))
+	for _, t := range tools {
 		out = append(out, fqName(t))
 	}
 	return out
+}
+
+// ── WS2: core-subset advertisement (discovery-tax reduction) ────────────────
+//
+// Discovery-tax finding: every pilot WITH session opened with a client-side
+// ToolSearch round-trip loading the deferred MCP tools before the first real
+// tool call (pilot-drycase.txt:82, plat-fs003-dry.txt:74; pilot-lu-dry.txt:74
+// loaded THREE tools in one select). The deferral decision belongs to the
+// claude CLI, not this server: the tools registered deferred even though the
+// six-tool surface was only ~3.5KB of schema+description, so the server side
+// cannot force eager loading. The two real levers are (a) advertising fewer
+// tools per arm — this subset — and (b) smaller schemas (WS11); both shrink
+// the ToolSearch payload and the loaded-schema context on every later turn.
+//
+// Subset rule: the WITH arm carries the CORE FOUR (get_repo_map,
+// search_symbols, search_code, check_duplicate) for every family, plus
+// find_type_usages for the refactor family only — the one family whose job
+// (pre-edit cross-file site enumeration) that tool serves.
+// validate_cross_deps is never in the default subset (no differentiated job
+// on the current benchmark; WS12 pending). The rule is a DETERMINISTIC
+// function of the case family only — never of case content or ground truth.
+// Fairness: production stamps a fixed work.codeIntel tool list per project
+// and the platform prompt partial describes family-appropriate tools, so a
+// family-conditional subset mirrors what a real session advertises; the
+// family is already explicit in the task prompt itself, so no per-task hint
+// leaks into the WITH arm beyond what production grants.
+func advertisedToolSubset(family TaskType, allTools bool) []string {
+	switch {
+	case allTools:
+		return append([]string(nil), codeIntelToolNames...)
+	case family == TaskRefactorAcrossFiles:
+		// codeIntelToolNames order: repo_map, search_symbols, search_code,
+		// check_duplicate, find_type_usages, validate_cross_deps.
+		return append([]string(nil), codeIntelToolNames[:5]...)
+	default:
+		return append([]string(nil), codeIntelToolNames[:4]...)
+	}
 }
 
 // BuildMCPEntry authors the frozen af-code-intelligence stdio MCP entry for the
@@ -85,56 +121,99 @@ func BuildMCPEntry(donmaiBin, workarea, repoPath string) agent.MCPServerConfig {
 	}
 }
 
+// BuildMCPEntryWithTools is BuildMCPEntry plus the server's EXISTING --tools
+// allow-list (afcli/mcp.go): the spawned server registers only the named
+// subset. Empty tools = no --tools flag = the server's default all-six
+// registration, so the frozen wire contract is untouched — surface reduction
+// happens only when the eval opts in.
+func BuildMCPEntryWithTools(donmaiBin, workarea, repoPath string, tools []string) agent.MCPServerConfig {
+	entry := BuildMCPEntry(donmaiBin, workarea, repoPath)
+	if len(tools) > 0 {
+		entry.Args = append(entry.Args, "--tools", strings.Join(tools, ","))
+	}
+	return entry
+}
+
 // Advertisement is the swappable WITH-arm advertisement mechanism.
 type Advertisement interface {
 	Mode() AdvertiseMode
-	// Apply produces the WITH-arm attachment: the MCP servers to wire (empty for
-	// prompt-help) and a system-prompt suffix telling the agent the tools exist.
-	Apply(ctx context.Context, donmaiBin, workarea, repoPath string, env []string) (servers []agent.MCPServerConfig, promptSuffix string, err error)
+	// Apply produces the WITH-arm attachment for one case: the MCP servers to
+	// wire (empty for prompt-help) and a system-prompt suffix telling the agent
+	// the tools exist. family selects the WS2 advertised-tool subset (a
+	// deterministic function of the family only — see advertisedToolSubset).
+	Apply(ctx context.Context, donmaiBin, workarea, repoPath string, family TaskType, env []string) (servers []agent.MCPServerConfig, promptSuffix string, err error)
 	// AdvertisedToolNames is the set of tool identifiers the arm was told about
 	// (FQ MCP names, or CLI subcommands) — recorded on the transcript so the
 	// tool-use grader knows what adoption was possible.
-	AdvertisedToolNames() []string
+	AdvertisedToolNames(family TaskType) []string
 }
 
 // NewAdvertisement returns the advertisement implementation for mode.
-func NewAdvertisement(mode AdvertiseMode) Advertisement {
+// allTools=true restores the full six-tool surface (no WS2 subset) — the
+// escape hatch for measuring the subset's own effect.
+func NewAdvertisement(mode AdvertiseMode, allTools bool) Advertisement {
 	if mode == AdvertisePromptHelp {
 		return promptHelpAdvertisement{}
 	}
-	return mcpAdvertisement{}
+	return mcpAdvertisement{allTools: allTools}
 }
 
 // ── MCP advertisement (default) ──────────────────────────────────────────────
 
-type mcpAdvertisement struct{}
+type mcpAdvertisement struct {
+	// allTools disables the WS2 core-subset rule and advertises all six.
+	allTools bool
+}
 
 func (mcpAdvertisement) Mode() AdvertiseMode { return AdvertiseMCP }
 
-func (mcpAdvertisement) Apply(_ context.Context, donmaiBin, workarea, repoPath string, _ []string) ([]agent.MCPServerConfig, string, error) {
-	entry := BuildMCPEntry(donmaiBin, workarea, repoPath)
+func (a mcpAdvertisement) Apply(_ context.Context, donmaiBin, workarea, repoPath string, family TaskType, _ []string) ([]agent.MCPServerConfig, string, error) {
+	subset := advertisedToolSubset(family, a.allTools)
+	// The --tools allow-list is passed only when a strict subset is selected;
+	// all-tools mode spawns the server with its default all-six registration.
+	var toolsArg []string
+	if len(subset) < len(codeIntelToolNames) {
+		toolsArg = subset
+	}
+	entry := BuildMCPEntryWithTools(donmaiBin, workarea, repoPath, toolsArg)
+
+	in := make(map[string]bool, len(subset))
+	for _, t := range subset {
+		in[t] = true
+	}
 	// WS4: capability-anchored, task-conditional framing. Each bullet names the
 	// job the tool wins over grep+read; trivial exact-identifier lookups are
 	// explicitly de-scoped to grep. The earlier blanket "prefer them over
 	// grep/glob/find" framing steered adoption onto tasks grep already wins
 	// (pilot: 1.0–2.10x token cost at +0pp success) — never reintroduce it.
+	// Bullets appear only for tools the arm actually carries (WS2 subset).
 	var b strings.Builder
 	b.WriteString("# Code Intelligence\n\n")
 	b.WriteString("This session has the af-code-intelligence MCP tools. Each is built for a job " +
 		"where grep+read is weak; use them in exactly these situations:\n\n")
-	b.WriteString("- Orienting in an unfamiliar repo or subsystem: call " + fqName("af_code_get_repo_map") +
-		" FIRST — it ranks files by import centrality, which reading files one by one cannot.\n")
-	b.WriteString("- Before ANY cross-file rename or refactor: call " + fqName("af_code_find_type_usages") +
-		" to enumerate every affected site BEFORE editing, then work from that list.\n")
-	b.WriteString("- Checking whether code like this already exists (exact or near-duplicate): call " +
-		fqName("af_code_check_duplicate") + " with the candidate snippet.\n")
-	b.WriteString("- Searching by name or concept across the codebase: " + fqName("af_code_search_symbols") +
-		" (symbol names) or " + fqName("af_code_search_code") + " (code content).\n")
+	if in["af_code_get_repo_map"] {
+		b.WriteString("- Orienting in an unfamiliar repo or subsystem: call " + fqName("af_code_get_repo_map") +
+			" FIRST — it ranks files by import centrality, which reading files one by one cannot.\n")
+	}
+	if in["af_code_find_type_usages"] {
+		b.WriteString("- Before ANY cross-file rename or refactor: call " + fqName("af_code_find_type_usages") +
+			" to enumerate every affected site BEFORE editing, then work from that list.\n")
+	}
+	if in["af_code_check_duplicate"] {
+		b.WriteString("- Checking whether code like this already exists (exact or near-duplicate): call " +
+			fqName("af_code_check_duplicate") + " with the candidate snippet.\n")
+	}
+	if in["af_code_search_symbols"] && in["af_code_search_code"] {
+		b.WriteString("- Searching by name or concept across the codebase: " + fqName("af_code_search_symbols") +
+			" (symbol names) or " + fqName("af_code_search_code") + " (code content).\n")
+	}
 	b.WriteString("\nFor an exact single-identifier lookup, plain grep is fine — do not add a tool call.\n")
 	return []agent.MCPServerConfig{entry}, b.String(), nil
 }
 
-func (mcpAdvertisement) AdvertisedToolNames() []string { return fqToolNames() }
+func (a mcpAdvertisement) AdvertisedToolNames(family TaskType) []string {
+	return fqNames(advertisedToolSubset(family, a.allTools))
+}
 
 // ── Prompt-help advertisement (alternate) ────────────────────────────────────
 
@@ -146,7 +225,7 @@ func (promptHelpAdvertisement) Mode() AdvertiseMode { return AdvertisePromptHelp
 // arm env, and returns it as the prompt suffix. It deliberately reads the live
 // binary's help rather than any doc so the WITH arm never advertises a command
 // that doesn't exist (brief 06 §5 risk 7).
-func (promptHelpAdvertisement) Apply(ctx context.Context, donmaiBin, _, _ string, env []string) ([]agent.MCPServerConfig, string, error) {
+func (promptHelpAdvertisement) Apply(ctx context.Context, donmaiBin, _, _ string, _ TaskType, env []string) ([]agent.MCPServerConfig, string, error) {
 	help, err := runHelp(ctx, donmaiBin, env, "code", "--help")
 	if err != nil {
 		return nil, "", fmt.Errorf("prompt-help: capture `donmai code --help`: %w", err)
@@ -168,8 +247,9 @@ func (promptHelpAdvertisement) Apply(ctx context.Context, donmaiBin, _, _ string
 }
 
 // AdvertisedToolNames lists the CLI subcommand forms (the prompt-help arm cannot
-// advertise MCP FQ names).
-func (promptHelpAdvertisement) AdvertisedToolNames() []string {
+// advertise MCP FQ names, and its live --help output always shows every
+// subcommand, so the WS2 subset does not apply).
+func (promptHelpAdvertisement) AdvertisedToolNames(TaskType) []string {
 	return []string{
 		"donmai code get-repo-map", "donmai code search-symbols", "donmai code search-code",
 		"donmai code check-duplicate", "donmai code find-type-usages", "donmai code validate-cross-deps",
