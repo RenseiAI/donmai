@@ -893,6 +893,29 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}
 	}
 
+	// 11c-b. Pushed-but-no-PR terminal classification. The backstop only
+	// runs for a result-sensitive work type that reached teardown without a
+	// PR (shouldBackstop gates on both). If it ran but still could not open
+	// one — e.g. a 403 on `gh pr create`, a push failure, or a main/master
+	// push refusal — the completion contract is UNSATISFIED: there is no PR
+	// for the v2 exit handler to merge. Without this the run would fall
+	// through to the "completed" default below with an empty PullRequestURL,
+	// and the exit handler would try to merge PR #0. Report it as an explicit
+	// backstop failure and surface the backstop's diagnostics into the
+	// terminal envelope (res.Error) so the platform's completion post carries
+	// the reason instead of an opaque completed-with-no-PR. The
+	// isResultSensitive guard is belt-and-suspenders on top of shouldBackstop
+	// so a future backstop-gate edit can't silently re-open this hole.
+	if res.BackstopReport != nil && res.PullRequestURL == "" && isResultSensitive(qw.WorkType) {
+		res.Status = "failed"
+		if res.FailureMode == "" {
+			res.FailureMode = FailureBackstop
+		}
+		if res.Error == "" && res.BackstopReport.Diagnostics != "" {
+			res.Error = res.BackstopReport.Diagnostics
+		}
+	}
+
 	// 11d. Correlation-key capture (ADR-2026-06-10-durable-ci-wait.md).
 	// AFTER tail recovery and the backstop — both of which may add
 	// commits — capture the worktree's head commit and stamp
