@@ -168,6 +168,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 			"branch", branch, "err", gerr)
 	}
 
+	// 2a-bis. Materialize read-only sibling context repos named by
+	// DONMAI_SIBLING_REPOS next to the session worktree so agents find
+	// their governing corpus at ../<name> as their repo AGENTS.md
+	// contracts promise (ADR-2026-07-07-sibling-context-repos). Never
+	// fatal: a failed sibling logs a warning and the session proceeds —
+	// agents fall back to cloning it themselves.
+	r.provisionSiblings(ctx, qw, wpath)
+
 	// 2b. Provision kit toolchain into the worktree (Seam 2 / 006).
 	//
 	// Cloud sandboxes boot bare; the kit's [provide.toolchain_install.<os>]
