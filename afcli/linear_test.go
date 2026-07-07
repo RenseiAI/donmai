@@ -333,7 +333,7 @@ func TestLinearUpdateIssue(t *testing.T) {
 func TestLinearListComments(t *testing.T) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	commentsData := fmt.Sprintf(`{"issue":{"comments":{"nodes":[
-		{"id":"c-1","body":"Hello","createdAt":%q,"user":{"id":"u-1","name":"Alice"}},
+		{"id":"c-1","body":"Hello","createdAt":%q,"user":{"id":"u-1","name":"Alice","email":"alice@example.com"}},
 		{"id":"c-2","body":"World","createdAt":%q,"user":null}
 	]}}}`, now, now)
 
@@ -356,6 +356,23 @@ func TestLinearListComments(t *testing.T) {
 	}
 	if c0["body"] != "Hello" {
 		t.Errorf("comment[0].body = %v, want Hello", c0["body"])
+	}
+	u0, ok := c0["user"].(map[string]any)
+	if !ok {
+		t.Fatalf("comment[0].user missing or wrong shape: %#v", c0["user"])
+	}
+	if u0["id"] != "u-1" {
+		t.Errorf("comment[0].user.id = %v, want u-1", u0["id"])
+	}
+	if u0["name"] != "Alice" {
+		t.Errorf("comment[0].user.name = %v, want Alice", u0["name"])
+	}
+	if u0["email"] != "alice@example.com" {
+		t.Errorf("comment[0].user.email = %v, want alice@example.com", u0["email"])
+	}
+	c1 := arr[1].(map[string]any)
+	if _, ok := c1["user"]; ok {
+		t.Errorf("comment[1].user present for null GraphQL user: %#v", c1["user"])
 	}
 }
 

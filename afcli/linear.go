@@ -609,11 +609,15 @@ func newLinearListCommentsCmd(ds func() afclient.DataSource, bin string) *cobra.
 
 			out := make([]map[string]any, len(comments))
 			for i, c := range comments {
-				out[i] = map[string]any{
+				rec := map[string]any{
 					"id":        c.ID,
 					"body":      c.Body,
 					"createdAt": c.CreatedAt,
 				}
+				if c.User != nil {
+					rec["user"] = c.User
+				}
+				out[i] = rec
 			}
 			return writeJSON(cmd.OutOrStdout(), out)
 		},

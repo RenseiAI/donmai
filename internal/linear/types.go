@@ -167,8 +167,9 @@ type commentNode struct {
 	Body      string     `json:"body"`
 	CreatedAt *time.Time `json:"createdAt"`
 	User      *struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Email string `json:"email"`
 	} `json:"user,omitempty"`
 }
 

@@ -90,7 +90,7 @@ const (
 
 	queryListComments = `query ListComments($issueId: String!) {
   issue(id: $issueId) {
-    comments { nodes { id body createdAt user { id name } } }
+    comments { nodes { id body createdAt user { id name email } } }
   }
 }`
 
@@ -374,7 +374,7 @@ func nodeToComment(n commentNode) Comment {
 		CreatedAt: n.CreatedAt,
 	}
 	if n.User != nil {
-		c.User = &User{ID: n.User.ID, Name: n.User.Name}
+		c.User = &User{ID: n.User.ID, Name: n.User.Name, Email: n.User.Email}
 	}
 	return c
 }
