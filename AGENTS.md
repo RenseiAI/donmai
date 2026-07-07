@@ -1,215 +1,133 @@
-# donmai
+# donmai — the OSS agent-fleet CLI and daemon (OSS-public)
 
-Unified CLI and terminal dashboard for Donmai AI agent fleets.
+Go. Module `github.com/RenseiAI/donmai`. The single `donmai` binary operates a
+local agent fleet: daemon lifecycle, runner, governor scan loop, issue-tracker
+ops, kits, code intelligence, TUI dashboard. It is a client/execution layer with
+essentially no server side; downstream embedders compose it as a library via
+`afcli.RegisterCommands`. Everything here must build, run, and operate WITHOUT
+any commercial control plane.
 
-**Module**: `github.com/RenseiAI/donmai`
+## Operating context
 
-## Purpose
+- Governing corpus: `../donmai-architecture/` (public,
+  `github.com/RenseiAI/donmai-architecture`). Read order:
+  `001-layered-execution-model.md` first → the layer doc(s) for your area
+  (`002`–`008`, `011`, `013`–`016`) → open `ADR-*.md` → `BOUNDARY.md` before
+  authoring an ADR or moving doc content. The corpus wins over code: align the
+  code or open an ADR. Missing? `gh repo clone RenseiAI/donmai-architecture
+  ../donmai-architecture` (from a worktree: `../../donmai-architecture`).
+- Smokes live in `../donmai-smokes` (platform-free by contract); public docs at
+  donmai.dev come from `../donmai-site/content/docs/`; official kits in
+  `../donmai-kits`; shared TUI widgets in `../tui-components`.
+- Legacy TypeScript reference: `../donmai-libraries/` (deprecating). Issue
+  descriptions citing `packages/cli/src/*.ts` resolve there. **Read-only** —
+  never modify it from a donmai session. Thin-shell scaffolds that exec an
+  external binary are stopgaps, not the destination; when an issue's acceptance
+  criteria contradict a scaffold, follow the issue.
+- Code work happens in a sibling worktree: `scripts/create-worktree.sh <name>` →
+  `../donmai.wt/<name>`. A `SessionStart` hook runs
+  `scripts/refresh-worktree.sh` on linked worktrees.
+- State home is `~/.donmai/`; env vars are `DONMAI_*` (the pre-debrand
+  fallbacks were removed in v0.14.0). Local daemon control API:
+  `127.0.0.1:7734` (`/api/daemon/*`, localhost-only) — full reference in
+  `daemon/README.md`. `donmai agent run` reads `DONMAI_SESSION_ID`, fetches its
+  QueuedWork from that API, and invokes `runner.Runner`.
 
-`donmai` is the single binary for operating Donmai. The goal is for every AgentFactory capability — running fleets, managing agents, scanning Linear for work, dispatching via Redis, inspecting status — to be available through this one binary. The only operations outside scope are ones that are inherently server-side (e.g., the coordinator's own HTTP service).
+## Before you start — read in this order
 
-This project is taking over the CLI surface from the older TypeScript AgentFactory project. Functionality is being ported into Go in this repo: governor scan loop, Linear client, Redis queue, fleet workers, etc. Use Linear, Redis, GitHub, and other well-known services directly — there is no boundary preventing it.
+| The moment you... | Read |
+|---|---|
+| change a CLI command surface, daemon endpoint, provider contract, kit surface, or wire type | the corpus read order above |
+| add a new command | §Package architecture below + copy the pattern in `afcli/agent.go` |
+| touch credential or env handling | `docs/agents/CREDENTIALS-STANDALONE.md` |
+| edit README, docs, help text, or anything shipped | §Boundary below + run `make guard` |
+| are about to write "done"/"fixed" or open a PR | Gates below + `../donmai-architecture/agents/PROTOCOL.md` §V |
+| hit a failing test or a `-race` flake | `../donmai-architecture/agents/PROTOCOL.md` §D |
+| cut or dry-run a release | `PROTOCOL.md` §R + `.goreleaser.yaml` |
 
-Some commands are temporarily scaffolded as thin shells that exec an external binary on PATH (e.g., `findGovernorBinary` in `afcli/governor_start.go`). **Treat those as stopgaps, not the destination.** When a sub-issue's acceptance criteria contradict a thin-shell scaffold, follow the issue — the in-process implementation is the goal.
+When a row matches, read that doc before your next edit and follow it literally.
 
-The library surface (`afclient`, `afcli`, `worker`) is exposed so other Go binaries can compose these commands via `afcli.RegisterCommands`.
-
-## Legacy AgentFactory reference
-
-The legacy TypeScript AgentFactory project lives in a sibling directory: `../donmai-libraries/`. Issue descriptions in this project reference paths like `packages/cli/src/governor.ts` — those resolve relative to that legacy repo, e.g. `../donmai-libraries/packages/cli/src/governor.ts`.
-
-Key packages there:
-
-* `packages/cli/` — TypeScript CLI commands being ported into `afcli/`
-* `packages/core/` — runner / decision-engine logic
-* `packages/linear/` — Linear GraphQL client (port target for `internal/linear/`)
-* `packages/server/` — coordinator HTTP service (stays server-side; not in scope for this binary)
-* `packages/mcp-server/`, `packages/dashboard/`, `packages/nextjs/` — out of scope for `af`
-
-Treat the legacy repo as **read-only reference**. Don't modify it from work in this project.
-
-## Architecture
-
-The canonical architecture corpus is [`donmai-architecture`](https://github.com/RenseiAI/donmai-architecture) (public). Read it first; it is the source of truth for everything in the execution layer — the `donmai` binary, daemon, runner, the eight Provider Families, kits, the workflow engine. Locally it sits alongside this repo at `../donmai-architecture/`.
-
-Read in this order:
-
-1. `donmai-architecture/001-layered-execution-model.md` — canonical synthesis. Always first.
-2. The reference doc(s) for whichever layer you are working on — `donmai-architecture/002`–`008`, `011`, `013`–`016`.
-3. Any open ADRs that touch your work (`donmai-architecture/ADR-*.md`).
-4. `donmai-architecture/BOUNDARY.md` — boundary-tagging convention. Read before authoring a new ADR or moving doc content; it determines what kind of doc you're writing and where new ADRs live.
-
-If this project's docs conflict with `donmai-architecture/`, the corpus wins. Either update this project's docs to align, or open an ADR to amend the corpus.
-
-## Package Architecture
-
-```
-donmai/
-├── afclient/        # PUBLIC — API client, types, mock, errors
-├── afcli/           # PUBLIC — Cobra command factories (RegisterCommands pattern)
-├── worker/          # PUBLIC — Worker protocol (register, poll, heartbeat, fleet)
-├── cmd/donmai/      # Binary entry point (thin wrapper over afcli)
-└── internal/        # MODULE-PRIVATE — TUI views, app routing, inline output
-    ├── app/         #   Root Bubble Tea model, view routing
-    ├── views/       #   Dashboard, detail, palette views
-    └── inline/      #   TTY-aware inline output helpers
-```
-
-### Public Packages (importable by downstream consumers)
-
-- **`afclient/`** — `DataSource` interface, `Client`, `MockClient`, all request/response types, sentinel errors. This is the API contract.
-- **`afcli/`** — Command factories registered via `RegisterCommands(root *cobra.Command, cfg Config)`. The `Config.ClientFactory` provides the `DataSource`. All command factories are unexported — only `RegisterCommands` and `Config` are exported. The dashboard is exposed as the `dashboard` subcommand when `Config.EnableDashboard` is true.
-- **`worker/`** — Worker protocol client: registration (rsp_live_ tokens), polling, heartbeat, fleet process management.
-
-### Adding New Commands
-
-New commands go in `afcli/` as unexported factory functions, then wire into `RegisterCommands`:
-
-```go
-// afcli/mycommand.go
-func newMyCmd(ds func() afclient.DataSource) *cobra.Command {
-    return &cobra.Command{
-        Use: "mycommand",
-        RunE: func(cmd *cobra.Command, args []string) error {
-            client := ds()
-            // ... use client ...
-        },
-    }
-}
-
-// afcli/commands.go — add to RegisterCommands:
-root.AddCommand(newMyCmd(ds))
-```
-
-Follow existing patterns in `afcli/agent.go` and `afcli/status.go`.
-
-## Dependency Stack
-
-Charm v2 ecosystem + Cobra:
-- `charm.land/bubbletea/v2` — TUI framework (Elm architecture)
-- `charm.land/lipgloss/v2` — Terminal styling
-- `charm.land/bubbles/v2` — Reusable UI components
-- `github.com/RenseiAI/tui-components` — Shared theme, format, widgets
-- `log/slog` — Structured logging (stdlib)
-- `github.com/spf13/cobra` — CLI framework
-- `github.com/sahilm/fuzzy` — Fuzzy search (command palette)
-- `github.com/joho/godotenv` — .env.local loading
-- `github.com/santhosh-tekuri/jsonschema/v6` — JSON Schema validation for the
-  one-shot/structured completion lane (`agent/oneshot.go`). Pure-Go, no cgo;
-  certifies `OneShotResult.SchemaOK` for the soft-JSON validate-repair-drop path.
-
-No other direct dependencies without compelling justification.
-
-## Commands
+## Gates — "done" means these passed
 
 ```bash
-make build           # Build donmai binary
-make test            # go test -race ./...
-make lint            # golangci-lint run
-make fmt             # gofumpt -w .
-make vuln            # govulncheck ./...
-make coverage        # Test with coverage report
-make run-mock        # Run TUI dashboard with mock data
-make run-status-mock # Run status with mock data
+make test       # go test -race ./...   (the race flag is mandatory)
+make lint       # golangci-lint run
+make guard      # leak-guard: closed-source reference linter (CI blocks on it)
+make build      # type/compile gate — lint and test alone do not prove linkage
 ```
 
-## Conventions
+Also available and CI-relevant: `make fmt` (gofumpt), `make vuln`
+(govulncheck), `make verify-generated` (`GOWORK=off go test -race ./matrix/...`
+after `make generate`), `make release-dry-run`. CI's parallel `-race` run
+exposes flakes a local serial run hides — treat them as real bugs, not noise.
+Quote each gate's result line in your completion report.
 
-- **Errors**: `fmt.Errorf("context: %w", err)`. Sentinel errors in `afclient/errors.go` for expected failures. Never panic. Never `log.Fatal`.
-- **Logging**: `log/slog` to stderr. Disabled in TUI mode. `--debug`/`--quiet` flags for CLI.
-- **Testing**: stdlib `testing` + table-driven tests. No testify. `afclient.NewMockClient()` for data. `httptest` for API mocks. Coverage: 80% target, 70% minimum.
-- **Linting**: `golangci-lint` with govet, staticcheck, gofumpt, errcheck, gosec, gocritic, revive.
-- **Naming**: Lowercase single-word packages, PascalCase exports.
-- **API types**: All request/response types in `afclient/types.go`. Client methods in `afclient/client.go`. Sentinel errors in `afclient/errors.go`.
+## Package architecture
 
-## Hooks
+- Public, consumed downstream — changing these is a breaking release:
+  `afclient/` (DataSource, Client, MockClient, types, sentinel errors — the API
+  contract), `afcli/` (Cobra factories; only `RegisterCommands(root, cfg)` and
+  `Config` are exported), `worker/` (register, poll, heartbeat, fleet).
+- `internal/` is module-private (TUI app, views, inline output).
+- New commands: unexported factory in `afcli/<name>.go`, wired in
+  `afcli/commands.go` `RegisterCommands` — follow `afcli/agent.go`.
+- Dependency stack is fixed: Charm v2 (`charm.land/{bubbletea,lipgloss,bubbles}/v2`),
+  `github.com/RenseiAI/tui-components`, `spf13/cobra`, `log/slog`,
+  `sahilm/fuzzy`, `joho/godotenv`, `santhosh-tekuri/jsonschema/v6`. No other
+  direct dependencies without stated compelling justification.
 
-- `.claude/settings.json` registers a `SessionStart` hook running `scripts/refresh-worktree.sh` to auto-rebase and refresh deps; active only on linked worktrees.
+## Iron rules
 
-## API Endpoints
+- Errors: `fmt.Errorf("context: %w", err)`; sentinel errors in
+  `afclient/errors.go`. Never `panic`, never `log.Fatal` (this is a library).
+- Tests: stdlib `testing`, table-driven, no testify;
+  `afclient.NewMockClient()` for data, `httptest` for APIs. Coverage 80%
+  target / 70% minimum.
+- Logging: `log/slog` to stderr, disabled in TUI mode; `--debug`/`--quiet`.
+- API types go in `afclient/types.go`, client methods in `afclient/client.go`.
+- The wire surface embedders consume is coupled: breaking `afclient`/`afcli`/
+  `worker` requires a coordinated lock-step release downstream — flag it in
+  your report rather than shipping silently.
+- New/changed behavior gains smoke coverage in `../donmai-smokes`; state where
+  or report `SMOKE-GAP: <what is uncovered>`.
 
-The AgentFactory coordinator exposes these endpoints:
+## Boundary — this repo is public
 
-**Public (read-only):**
+- Nothing closed-source leaks in: no commercial-platform brand words, no
+  internal tracker IDs, no private repo links, no internal hostnames or
+  workspace paths, no closed env-var names. `make guard` runs
+  `scripts/leak-guard.sh --self-test` + `--all` (allowlist:
+  `.leak-guard-allowlist`); CI blocks on it.
+- Platform-needing features do not ship half-working clients here: OSS defines
+  interfaces AND ships a working implementation of each; commercial extensions
+  live downstream. When only a downstream implementation would exist, split the
+  work per `../donmai-architecture/BOUNDARY.md`.
+- Never push to `../tui-components` or other repos from a donmai session —
+  describe the upstream need instead.
 
-- `GET /api/public/stats` — Fleet statistics
-- `GET /api/public/sessions` — Session list
-- `GET /api/public/sessions/:id` — Session detail
-- `GET /api/public/sessions/:id/activities` — Activity stream
+## Gotchas
 
-**Authenticated (Bearer token):**
+- `go test ./...` on daemon install/uninstall tests can bootout your own
+  developer launchd daemon — expect it and reinstall (`donmai host install`)
+  after test runs that touch `daemon/`.
+- `GOWORK`: the org `go.work` ties sibling Go repos together; matrix generation
+  and smokes intentionally run with `GOWORK=off` — don't "fix" that.
+- After a brew upgrade of the daemon-shipping binary, restart the service
+  (`brew services restart donmai`, service `dev.donmai.daemon`) — a resident
+  old daemon exec's a dead versioned Caskroom path.
+- A checked-in stale binary artifact (`af`, `bin/`) may exist in the tree — do
+  not ship or reference it; builds come from `make build`.
 
-- `POST /api/mcp/submit-task` — Queue new task
-- `POST /api/mcp/stop-agent` — Stop running agent
-- `POST /api/mcp/forward-prompt` — Send prompt to agent
-- `GET /api/mcp/cost-report` — Cost analytics
-- `GET /api/mcp/list-fleet` — Fleet snapshot
+## Hard stops
 
-**CLI auth:**
-
-- `GET /api/cli/whoami` — Verify API key, return org/project context
-
-## Local daemon control API (127.0.0.1:7734)
-
-The locally-installed `rensei-daemon` exposes an HTTP control API consumed
-by the `donmai daemon …` CLI surface and by per-session worker children. See
-`daemon/README.md` for the full endpoint reference. Notable post-F.2.8
-endpoints:
-
-- `GET /api/daemon/sessions` — list active session handles
-- `GET /api/daemon/sessions/:id` — per-session detail (issued to spawned
-  `donmai agent run` workers; localhost-only)
-
-## `donmai agent run` (F.2.8)
-
-The daemon spawns `donmai agent run` for every claimed session. The subcommand
-reads its session id from `DONMAI_SESSION_ID` (set by the spawner), fetches
-the full QueuedWork payload from the daemon's local control API, builds a
-runner.Registry with stub + claude + codex (best-effort), and invokes
-`runner.Runner`. Operators rarely invoke this manually; see
-`daemon/README.md`'s operator runbook for debugging tips.
-
-## Credentials in standalone mode (no daemon, no platform)
-
-When `af` runs OUTSIDE of rensei-tui (no daemon credential pipeline, no
-platform session), agents inherit credentials from the donmai process per a
-fixed two-tier precedence:
-
-| Precedence | Source                                | Notes                                                                 |
-| ---------- | ------------------------------------- | --------------------------------------------------------------------- |
-| 1          | AF-TUI process env (`os.Environ()`)   | Anything the operator `export`'d before launching `af`.               |
-| 2          | `${gitRoot}/.env.local`               | Parsed once at donmai startup; never copied into spawned worktrees.       |
-| Fail-open  | Redacted stderr warning               | `[creds] no source for KEY — agent may fail` per missing variable.    |
-
-Sources are merged at `daemon run` time into `SpawnerOptions.BaseEnv` so
-the standard child-spawn path picks them up. The merge order respects
-the precedence above: process env wins over `.env.local`, and any
-caller-supplied `BaseEnv` entry (set by daemon code, not the operator)
-wins over both.
-
-`AGENT_ENV_BLOCKLIST` is the single source of truth in
-`internal/credentials/blocklist.go`. It captures the daemon's own auth
-surface — `DONMAI_DAEMON_JWT`, `WORKER_API_KEY`, `M2M_JWT_SECRET`, …
-— that must never bleed into a child agent regardless of source. The
-rensei-tui daemon hardcodes the same list in
-`daemon/credentials/socket.go`; the two stay in sync manually until
-the OSS boundary permits a shared import.
-
-Operators can pin the mode via `donmai daemon run --standalone-creds=<on|off|auto>`.
-The default is `auto`, which selects `on` when `DONMAI_DAEMON_JWT` is
-unset (i.e. AF-TUI is NOT being driven by rensei-tui's credential
-socket) and `off` otherwise.
-
-Security guardrails:
-
-- AF-TUI never copies `.env.local` into the worktree — the file stays
-  at `${gitRoot}`; only the parsed values live in the AF-TUI process
-  memory and are forwarded through child env.
-- `.env.local` paths are resolved from `gitRoot` only; AF-TUI does NOT
-  walk parent directories looking for one.
-- World-readable `.env.local` triggers a one-time stderr warning
-  recommending `chmod 600`; the file is still parsed.
-- Values are never echoed to stdout/stderr/logs — log lines reference
-  variable names only.
-- Malformed `.env.local` lines are non-fatal: the variable name is
-  logged with line number; the value side is dropped.
+- NEVER modify `../donmai-libraries` from work in this repo -> instead: note
+  the needed change in your report.
+- NEVER commit content that fails `make guard` -> instead: rewrite
+  brand-neutrally or add a justified allowlist entry in the same change.
+- NEVER weaken a failing check (skip, deleted test, loosened assert,
+  lint-disable) -> instead: quote the failure and propose the change.
+- NEVER tag a release from a branch name (`$GITHUB_REF_NAME` on
+  workflow_dispatch) -> instead: `gh release create v<X> --target <sha>`.
+- NEVER run `git worktree remove/prune`, `git reset --hard`, `git clean -fd`,
+  or checkout to another branch as a sub-agent -> instead: the orchestrator
+  owns worktree lifecycle.
