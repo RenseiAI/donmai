@@ -41,6 +41,13 @@ type RegistrationOptions struct {
 	// Populate from cfg.Projects at the call site.
 	DaemonProjects []ProjectAllowlistEntry
 
+	// ProjectIDs is the authoritative project-admission set. It is reported
+	// independently of repository resources.
+	ProjectIDs []string
+	// ProjectAdmissionVersion distinguishes an explicit empty v2 set from a
+	// legacy registration that omitted project identity.
+	ProjectAdmissionVersion int
+
 	// HostInfo is the best-effort machine telemetry gathered once at daemon
 	// startup (see hostinfo.go / GatherHostInfo). Threaded onto the wire
 	// RegisterRequest.HostInfo so the platform can populate the worker_hosts
@@ -114,6 +121,10 @@ type RegisterRequest struct {
 	// the call sites but NEVER serialised, so workers.capabilities was always []
 	// and every capability-gated lane silently no-routed. This closes that gap.
 	Capabilities []string `json:"capabilities,omitempty"`
+
+	// ProjectAdmissionVersion makes ProjectIDs authoritative when set to 2.
+	// Zero preserves the legacy registration contract.
+	ProjectAdmissionVersion int `json:"projectAdmissionVersion,omitempty"`
 
 	// DaemonProjects is the structured project allowlist read from the
 	// daemon's local config (daemon.yaml's projects[]). Each entry carries
@@ -362,15 +373,17 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		capacity = 1
 	}
 	req := RegisterRequest{
-		MachineID:      opts.MachineID,
-		Hostname:       opts.Hostname,
-		Capacity:       capacity,
-		Version:        opts.Version,
-		Region:         opts.Region,
-		Provides:       opts.Provides,
-		Capabilities:   opts.Capabilities,
-		DaemonProjects: opts.DaemonProjects,
-		HostInfo:       opts.HostInfo,
+		MachineID:               opts.MachineID,
+		Hostname:                opts.Hostname,
+		Capacity:                capacity,
+		Version:                 opts.Version,
+		Region:                  opts.Region,
+		Provides:                opts.Provides,
+		Capabilities:            opts.Capabilities,
+		DaemonProjects:          opts.DaemonProjects,
+		ProjectIDs:              normalizeProjectIDs(opts.ProjectIDs),
+		ProjectAdmissionVersion: opts.ProjectAdmissionVersion,
+		HostInfo:                opts.HostInfo,
 	}
 	if req.MachineID == "" {
 		req.MachineID = opts.Hostname

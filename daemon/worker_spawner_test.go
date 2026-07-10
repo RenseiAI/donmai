@@ -64,6 +64,116 @@ func TestSpawner_RejectsUnknownProject(t *testing.T) {
 	}
 }
 
+func TestSpawner_ProjectAdmissionIndependentOfRepositories(t *testing.T) {
+	tests := []struct {
+		name     string
+		allowed  []string
+		projects []ProjectConfig
+		spec     SessionSpec
+		wantErr  string
+	}{
+		{
+			name:    "admitted project without repository accepts repository-free work",
+			allowed: []string{"alpha"},
+			spec:    SessionSpec{SessionID: "no-repo", ProjectID: "alpha"},
+		},
+		{
+			name:    "repository must belong to admitted project",
+			allowed: []string{"alpha"},
+			projects: []ProjectConfig{
+				{ID: "alpha", Repository: "example.com/acme/one"},
+				{ID: "alpha", Repository: "example.com/acme/two"},
+			},
+			spec: SessionSpec{SessionID: "second-repo", ProjectID: "alpha", Repository: "example.com/acme/two"},
+		},
+		{
+			name:     "repository cannot override project identity",
+			allowed:  []string{"alpha", "beta"},
+			projects: []ProjectConfig{{ID: "beta", Repository: "example.com/acme/beta"}},
+			spec:     SessionSpec{SessionID: "mismatch", ProjectID: "alpha", Repository: "example.com/acme/beta"},
+			wantErr:  "not configured for project",
+		},
+		{
+			name:     "repository resource does not imply admission in v2",
+			allowed:  []string{},
+			projects: []ProjectConfig{{ID: "alpha", Repository: "example.com/acme/alpha"}},
+			spec:     SessionSpec{SessionID: "disabled", ProjectID: "alpha", Repository: "example.com/acme/alpha"},
+			wantErr:  "is not allowed",
+		},
+		{
+			name:    "stable repository id selects one repository explicitly",
+			allowed: []string{"alpha"},
+			projects: []ProjectConfig{
+				{ID: "alpha", RepositoryID: "repo-one", Repository: "example.com/acme/one"},
+				{ID: "alpha", RepositoryID: "repo-two", Repository: "example.com/acme/two"},
+			},
+			spec: SessionSpec{SessionID: "repo-id", ProjectID: "alpha", RepositoryID: "repo-two", RequiresRepository: true},
+		},
+		{
+			name:    "repository id cannot override project identity",
+			allowed: []string{"alpha", "beta"},
+			projects: []ProjectConfig{
+				{ID: "beta", RepositoryID: "repo-beta", Repository: "example.com/acme/beta"},
+			},
+			spec:    SessionSpec{SessionID: "repo-id-mismatch", ProjectID: "alpha", RepositoryID: "repo-beta", RequiresRepository: true},
+			wantErr: "not configured for project",
+		},
+		{
+			name:    "repository-required work selects configured primary",
+			allowed: []string{"alpha"},
+			projects: []ProjectConfig{
+				{ID: "alpha", RepositoryID: "repo-primary", Repository: "example.com/acme/primary", Primary: true},
+				{ID: "alpha", RepositoryID: "repo-secondary", Repository: "example.com/acme/secondary"},
+			},
+			spec: SessionSpec{SessionID: "primary", ProjectID: "alpha", RequiresRepository: true},
+		},
+		{
+			name:    "repository-required work rejects ambiguous selection",
+			allowed: []string{"alpha"},
+			projects: []ProjectConfig{
+				{ID: "alpha", RepositoryID: "repo-one", Repository: "example.com/acme/one"},
+			},
+			spec:    SessionSpec{SessionID: "no-primary", ProjectID: "alpha", RequiresRepository: true},
+			wantErr: "explicit repository or configured primary",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewWorkerSpawner(SpawnerOptions{
+				EnabledProjectIDs:     test.allowed,
+				Projects:              test.projects,
+				MaxConcurrentSessions: 1,
+			})
+			ended := sessionEnds(s)
+			_, err := s.AcceptWork(test.spec)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("AcceptWork error = %v, want containing %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("AcceptWork: %v", err)
+			}
+			waitSessionEnd(t, ended)
+		})
+	}
+}
+
+func TestSpawner_AddEnabledProjectIDs(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{EnabledProjectIDs: []string{}, MaxConcurrentSessions: 1})
+	s.AddEnabledProjectIDs([]string{"satellite", "satellite"})
+	if got := s.AllEnabledProjectIDs(); len(got) != 1 || got[0] != "satellite" {
+		t.Fatalf("AllEnabledProjectIDs() = %v, want [satellite]", got)
+	}
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "satellite-work", ProjectID: "satellite"}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	waitSessionEnd(t, ended)
+}
+
 func TestSpawner_CapacityEnforced(t *testing.T) {
 	// Use a longer-running stub so we can exceed capacity deterministically.
 	s := NewWorkerSpawner(SpawnerOptions{
@@ -893,10 +1003,9 @@ func TestSpawner_AddProjects_SetProjectsPreservesExtra(t *testing.T) {
 	waitSessionEnd(t, ended)
 }
 
-// TestSpawner_AddProjects_Dedup verifies that calling AddProjects multiple
-// times with the same entry does not add duplicates. We check this
-// indirectly by ensuring a later SetProjects that removes the base entry
-// still only leaves one satellite entry (no phantom double-match issues).
+// TestSpawner_AddProjects_Dedup verifies that exact entries are idempotent
+// while a second repository for the same project remains independently
+// addressable.
 func TestSpawner_AddProjects_Dedup(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
@@ -916,12 +1025,13 @@ func TestSpawner_AddProjects_Dedup(t *testing.T) {
 	}
 	waitSessionEnd(t, ended)
 
-	// Also dedup by ID alone (different Repository).
+	// A different repository with the same ID is a valid one-to-many binding.
 	s.AddProjects([]ProjectConfig{{ID: "satellite", Repository: "github.com/org/satellite-mirror"}})
-	// Same ID already present — must NOT add a second entry.
-	if _, err := s.AcceptWork(SessionSpec{SessionID: "dup-2", Repository: "github.com/org/satellite-mirror"}); err == nil {
-		t.Fatal("expected rejection for dedup-by-ID path; duplicate ID should prevent registration of different repository")
+	ended = sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "dup-2", Repository: "github.com/org/satellite-mirror"}); err != nil {
+		t.Fatalf("second repository for project was rejected: %v", err)
 	}
+	waitSessionEnd(t, ended)
 }
 
 // TestSpawner_AddProjects_DedupByRepository verifies that an entry whose

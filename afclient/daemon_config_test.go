@@ -208,6 +208,48 @@ func TestDeriveProjectID(t *testing.T) {
 	}
 }
 
+func TestDaemonYAML_ProjectAdmissionIsIndependentOfRepositories(t *testing.T) {
+	cfg := &DaemonYAML{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{},
+		Projects: []ProjectEntry{
+			{ID: "alpha", RepoURL: "example.com/acme/one"},
+			{ID: "alpha", RepoURL: "example.com/acme/two"},
+		},
+	}
+	if cfg.IsProjectEnabled("alpha") {
+		t.Fatal("repository resources must not imply admission in an explicit v2 config")
+	}
+	cfg.EnableProject("alpha")
+	if !cfg.IsProjectEnabled("alpha") {
+		t.Fatal("EnableProject did not admit alpha")
+	}
+	cfg.DisableProject("alpha")
+	if cfg.IsProjectEnabled("alpha") {
+		t.Fatal("DisableProject did not remove alpha")
+	}
+	if len(cfg.Repositories) != 2 {
+		t.Fatalf("DisableProject removed repository resources: %+v", cfg.Repositories)
+	}
+	if len(cfg.Projects) != 0 {
+		t.Fatalf("disabled project leaked into legacy projection: %+v", cfg.Projects)
+	}
+}
+
+func TestReadDaemonYAML_MigratesLegacyRepositoryProjects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	if err := os.WriteFile(path, []byte("projects:\n  - id: alpha\n    repository: example.com/acme/alpha\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("ReadDaemonYAML: %v", err)
+	}
+	if !cfg.IsProjectEnabled("alpha") {
+		t.Fatalf("EnabledProjectIDs = %v, want legacy alpha migrated", cfg.EnabledProjectIDs)
+	}
+}
+
 // TestWriteDaemonYAML_DoesNotDuplicateProjects confirms upserting an existing
 // project rewrites in-place rather than appending.
 func TestWriteDaemonYAML_DoesNotDuplicateProjects(t *testing.T) {

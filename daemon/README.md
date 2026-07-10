@@ -69,28 +69,49 @@ WorkerCommand defaults to `[<self-exe>, "agent", "run"]` resolved via
   child process exits; the daemon's listener removes the entry from
   the store so stale auth tokens do not linger in memory.
 
-### Repository URL resolution (v0.5.2)
+### Project admission and repository resolution
 
-`SessionDetail.repository` is **resolved from the `daemon.yaml`
-project allowlist** by `PollItemToSessionDetail` (in `poll.go`). The
-runner uses this URL for `git clone`.
+Project admission is independent of repository resources:
+
+```yaml
+projectAdmissionVersion: 2
+enabledProjectIds: [project-alpha]
+repositories:
+  - id: repo-alpha
+    projectId: project-alpha
+    source: https://example.invalid/acme/alpha.git
+    primary: true
+```
+
+`enabledProjectIds` is authoritative in v2, including when empty.
+`SessionSpec.projectId` is checked before repository selection. When work names
+a repository, the daemon verifies that resource belongs to the same project;
+it never chooses the first configured repository implicitly.
+
+For one compatibility window, a config without `projectAdmissionVersion`
+migrates legacy `projects[].{id,repository}` tuples into the enabled set and
+normalized repository resources. V2 writes retain a legacy projection only for
+enabled, repository-bearing projects.
+
+`SessionDetail.repository` is resolved from normalized repository resources by
+`PollItemToSessionDetail` (in `poll.go`). The runner uses this URL for `git clone`.
 
 The platform's QueuedWork wire shape historically carries a
 `projectName` slug (e.g. `"smoke-alpha"`) with no separate repository
 URL — slugs are not clonable. When the poll item arrives the daemon
 runs the same matcher as `WorkerSpawner.findProjectLocked`
 by `id`, by `repository`, or by URL-suffix. The matching
-entry's `repository` field is substituted into
+resource's `source` field is substituted into
 `SessionDetail.repository`, and the canonical `id` is mirrored back
 into `SessionDetail.projectName` so downstream code that reads
 `DONMAI_PROJECT_ID` sees a stable value.
 
-If no allowlist entry matches, the daemon falls back to whatever the
+If no repository resource matches, the daemon falls back to whatever the
 platform sent (preserving prior behaviour) and emits a Warn log
 `no allowlist match for projectName, falling back to as-given repo
 string` so the misconfiguration is visible. Downstream
-`WorkerSpawner.AcceptWork` will then reject the spec with
-`repository ... is not in the project allowlist`, but the explicit
+`WorkerSpawner.AcceptWork` will then reject an unconfigured repository or
+project/repository mismatch, but the explicit
 log makes the resolution-time failure observable separately from
 the spawn-time rejection.
 
@@ -100,8 +121,8 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 
 | Method + Path                          | Purpose |
 |----------------------------------------|---------|
-| `GET    /api/daemon/status`            | Daemon lifecycle state, version, uptime, sessions |
-| `GET    /api/daemon/stats`             | Capacity envelope, worker stats, allowed projects |
+| `GET    /api/daemon/status`            | Daemon lifecycle state, desired enabled IDs, applied project IDs, sessions |
+| `GET    /api/daemon/stats`             | Capacity envelope, worker stats, enabled/applied project IDs |
 | `POST   /api/daemon/pause`             | Stop accepting new work |
 | `POST   /api/daemon/resume`            | Resume accepting work |
 | `POST   /api/daemon/stop`              | Graceful stop |

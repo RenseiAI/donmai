@@ -111,8 +111,17 @@ const (
 // Subset of SandboxSpec from 004 relevant to the daemon's session-dispatch
 // path.
 type SessionSpec struct {
-	SessionID          string            `json:"sessionId"`
-	Repository         string            `json:"repository"`
+	SessionID string `json:"sessionId"`
+	// ProjectID is the authoritative project-admission identity. New
+	// dispatchers must set it explicitly; repository-only dispatch remains
+	// supported for legacy OSS coordinators.
+	ProjectID string `json:"projectId,omitempty"`
+	// RepositoryID is the stable selected repository-resource identity.
+	RepositoryID string `json:"repositoryId,omitempty"`
+	Repository   string `json:"repository"`
+	// RequiresRepository distinguishes repository-free work from work that
+	// must select a repository resource or configured primary.
+	RequiresRepository bool              `json:"requiresRepository,omitempty"`
 	Ref                string            `json:"ref"`
 	Resources          *SessionResources `json:"resources,omitempty"`
 	Env                map[string]string `json:"env,omitempty"`

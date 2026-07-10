@@ -210,7 +210,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	wln("\n[4/5] Project allowlist")
 	projects := []ProjectConfig{}
 	if opts.Existing != nil {
-		projects = append(projects, opts.Existing.Projects...)
+		projects = append(projects, opts.Existing.EffectiveProjectConfigs()...)
 	}
 	detect := opts.DetectGitRemote
 	if detect == nil {
@@ -295,9 +295,12 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	}
 
 	cfg := &Config{
-		APIVersion: "donmai.dev/v1",
-		Kind:       "LocalDaemon",
-		Machine:    MachineConfig{ID: machineID, Region: region},
+		APIVersion:              "donmai.dev/v1",
+		Kind:                    "LocalDaemon",
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       projectIDsFromRepositories(projects),
+		Repositories:            normalizeRepositories(nil, projects),
+		Machine:                 MachineConfig{ID: machineID, Region: region},
 		Capacity: CapacityConfig{
 			MaxConcurrentSessions: maxSess,
 			MaxVCpuPerSession:     4,
@@ -307,7 +310,6 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 				MemoryMb: reservedMem,
 			},
 		},
-		Projects:     projects,
 		Orchestrator: OrchestratorConfig{URL: orchestratorURL, AuthToken: authToken},
 		AutoUpdate: AutoUpdateConfig{
 			Channel:             channel,
