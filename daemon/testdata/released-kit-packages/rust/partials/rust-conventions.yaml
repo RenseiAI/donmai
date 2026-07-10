@@ -1,0 +1,26 @@
+# Rust conventions prompt fragment
+# Injected during development, qa, and refinement work types
+
+name: rust-conventions
+content: |
+  ## Rust Project Context
+
+  This project uses Rust + Cargo. Follow these conventions:
+
+  ### Build & Test
+  - `cargo build` — build the crate/workspace
+  - `cargo test` — run tests (unit + integration + doctests)
+  - `cargo clippy -- -D warnings` — lint, warnings-as-errors (part of validate)
+  - `cargo fmt --check` — formatting gate (part of validate)
+  - `cargo fmt` — apply formatting before committing
+
+  ### Code Style
+  - Prefer `Result<T, E>` + `?` over `unwrap()`/`expect()` in non-test code
+  - Model errors with `thiserror` (libraries) / `anyhow` (binaries) where present
+  - Borrow before clone; reach for `&str`/`&[T]` in function signatures
+  - Keep `unsafe` rare and documented with a `// SAFETY:` comment
+  - Run `cargo clippy` and fix lints rather than `#[allow(...)]`-ing them
+
+  ### Dependencies
+  - `cargo fetch` pre-downloads deps (this kit's post_acquire hook)
+  - Commit Cargo.lock for binaries; libraries typically omit it

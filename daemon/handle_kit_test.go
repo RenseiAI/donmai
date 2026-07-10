@@ -342,6 +342,51 @@ func TestHandleKits_InstallTrustGateRejected403(t *testing.T) {
 	}
 }
 
+func TestHandleKits_InstallPackageTrustGatePreservesPackageState(t *testing.T) {
+	installErr := trustGateRejectionError("default/go", afclient.KitSignatureResult{
+		KitID: "default/go",
+		Trust: afclient.KitTrustPackageSignedUnverified,
+	}, TrustModeSignedByAllowlist)
+	fake := &fakeKitRegistry{installErr: installErr}
+	srv := kitTestServer(t, fake)
+	resp, err := http.Post(srv.URL+"/api/daemon/kits/default/go/install", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusForbidden || body["trust"] != string(afclient.KitTrustPackageSignedUnverified) {
+		t.Fatalf("status/body = %d %+v", resp.StatusCode, body)
+	}
+}
+
+func TestHandleKits_InstallPackageErrorsMapToContractStatuses(t *testing.T) {
+	tests := []struct {
+		err    error
+		status int
+	}{
+		{ErrKitPackageInvalid, http.StatusUnprocessableEntity},
+		{ErrKitPackageEquivocation, http.StatusConflict},
+		{ErrKitPackageConflict, http.StatusConflict},
+	}
+	for _, test := range tests {
+		fake := &fakeKitRegistry{installErr: test.err}
+		srv := kitTestServer(t, fake)
+		resp, err := http.Post(srv.URL+"/api/daemon/kits/default/go/install", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		srv.Close()
+		if resp.StatusCode != test.status {
+			t.Errorf("%v status = %d, want %d", test.err, resp.StatusCode, test.status)
+		}
+	}
+}
+
 func TestHandleKits_InstallEmptyBody(t *testing.T) {
 	fake := &fakeKitRegistry{}
 	srv := kitTestServer(t, fake)

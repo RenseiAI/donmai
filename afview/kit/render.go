@@ -109,18 +109,22 @@ func statusStr(status afclient.KitStatus, noColor bool) string {
 func TrustSymbol(trust afclient.KitTrustState, noColor bool) string {
 	if noColor {
 		switch trust {
-		case afclient.KitTrustSignedVerified:
-			return "[verified]"
-		case afclient.KitTrustSignedUnverified:
-			return "[signed/unverified]"
+		case afclient.KitTrustPackageVerified:
+			return "[package-verified]"
+		case afclient.KitTrustPackageSignedUnverified:
+			return "[package-signed/unverified]"
+		case afclient.KitTrustLegacyManifestVerified:
+			return "[manifest-verified]"
+		case afclient.KitTrustLegacyManifestUnverified:
+			return "[manifest-signed/unverified]"
 		default:
 			return "[unsigned]"
 		}
 	}
 	switch trust {
-	case afclient.KitTrustSignedVerified:
+	case afclient.KitTrustPackageVerified, afclient.KitTrustLegacyManifestVerified:
 		return "✅"
-	case afclient.KitTrustSignedUnverified:
+	case afclient.KitTrustPackageSignedUnverified, afclient.KitTrustLegacyManifestUnverified:
 		return "⚠"
 	default:
 		return "🔓"
@@ -129,10 +133,14 @@ func TrustSymbol(trust afclient.KitTrustState, noColor bool) string {
 
 func trustLabel(trust afclient.KitTrustState, noColor bool) string {
 	switch trust {
-	case afclient.KitTrustSignedVerified:
-		return colored("signed and verified", ansiGreen, noColor)
-	case afclient.KitTrustSignedUnverified:
-		return colored("signed but unverified", ansiYellow, noColor)
+	case afclient.KitTrustPackageVerified:
+		return colored("complete package verified", ansiGreen, noColor)
+	case afclient.KitTrustPackageSignedUnverified:
+		return colored("package signed but unverified", ansiYellow, noColor)
+	case afclient.KitTrustLegacyManifestVerified:
+		return colored("legacy manifest verified (payloads unverified)", ansiYellow, noColor)
+	case afclient.KitTrustLegacyManifestUnverified:
+		return colored("legacy manifest signed but unverified", ansiYellow, noColor)
 	default:
 		return colored("unsigned", ansiRed, noColor)
 	}

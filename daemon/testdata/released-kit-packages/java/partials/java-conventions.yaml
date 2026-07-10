@@ -1,0 +1,27 @@
+# Java conventions prompt fragment
+# Injected during development, qa, and refinement work types
+
+name: java-conventions
+content: |
+  ## Java Project Context
+
+  This project uses Java with Maven (or Gradle). Follow these conventions:
+
+  ### Build & Test
+  - `./mvnw -B -DskipTests package` — build without running tests
+  - `./mvnw -B test` — run the test suite
+  - `./mvnw -B compile` — compile-only validate gate
+  - Gradle variants: `./gradlew build`, `./gradlew test`, `./gradlew compileJava`
+  - Prefer the committed wrapper (`./mvnw` / `./gradlew`) over a system tool so
+    the build uses the project's pinned build-tool version
+
+  ### Code Style
+  - Favor immutability — `final` fields, unmodifiable collections
+  - Use `Optional<T>` for absent return values, not `null`
+  - Throw specific exceptions; never swallow into a bare `catch (Exception)`
+  - Keep one top-level public class per file, matching the filename
+  - Prefer constructor injection over field injection
+
+  ### Dependencies
+  - `dependency:go-offline` pre-resolves Maven deps (this kit's post_acquire)
+  - Commit the wrapper (`mvnw`/`gradlew` + `.mvn/`/`gradle/`) for reproducibility

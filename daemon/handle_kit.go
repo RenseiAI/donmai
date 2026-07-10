@@ -112,11 +112,24 @@ func (s *Server) handleKitDetail(w http.ResponseWriter, r *http.Request) {
 		}
 		res, err := reg.Install(id, req)
 		if errors.Is(err, ErrKitTrustGateRejected) {
+			trust := afclient.KitTrustLegacyManifestUnverified
+			var gateErr *kitTrustGateError
+			if errors.As(err, &gateErr) {
+				trust = gateErr.result.Trust
+			}
 			writeJSON(w, http.StatusForbidden, map[string]string{
 				"error": err.Error(),
 				"kitId": id,
-				"trust": string(afclient.KitTrustSignedUnverified),
+				"trust": string(trust),
 			})
+			return
+		}
+		if errors.Is(err, ErrKitPackageEquivocation) || errors.Is(err, ErrKitPackageConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "kitId": id})
+			return
+		}
+		if errors.Is(err, ErrKitPackageInvalid) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error(), "kitId": id})
 			return
 		}
 		if errors.Is(err, ErrKitSourceFederationUnimplemented) {
