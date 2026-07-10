@@ -23,6 +23,12 @@ _No work staged for the next release._
   the versioned contract while preserving repository credentials and stable
   project identifiers.
 
+### Chores
+
+- **Reliable release snapshots.** Local release dry-runs now skip the
+  production signing pipe explicitly, matching GoReleaser v2 behavior while
+  leaving tag-pushed release signing unchanged.
+
 ---
 
 ## v0.39.0 — 2026-06-11

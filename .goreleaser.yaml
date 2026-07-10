@@ -52,10 +52,10 @@ archives:
 # step in .github/workflows/release.yml (RUNNER_TEMP keychain — ephemeral,
 # auto-cleanup).
 #
-# Local dry-run note: `goreleaser release --snapshot --clean` skips the
-# `signs` block entirely (per goreleaser convention; snapshot implies
-# `--skip=sign`). Real signing only fires on tag-pushed CI runs that have
-# the APPLE_* secrets set.
+# Local dry-run note: use `make release-dry-run`, which passes `--skip=sign`
+# explicitly. Snapshot mode skips publication but GoReleaser v2 still runs
+# custom sign pipes unless told otherwise. Real signing fires on tag-pushed CI
+# runs that have the APPLE_* secrets set.
 signs:
   - id: macos-codesign-and-notarize
     artifacts: archive
