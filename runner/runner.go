@@ -33,6 +33,20 @@ type activitySink interface {
 	Send(ctx context.Context, ev agent.Event)
 }
 
+// spanEventProcessor is the per-session correlation seam. Process may prepend
+// a synthetic aggregate LlmCallEvent before a terminal ResultEvent; callers
+// persist and observe every returned event in order. Finish emits the session
+// root after the runner has finalized its result.
+type spanEventProcessor interface {
+	Process(agent.Event) []agent.Event
+	Finish(status, message string)
+}
+
+type noopSpanProcessor struct{}
+
+func (noopSpanProcessor) Process(ev agent.Event) []agent.Event { return []agent.Event{ev} }
+func (noopSpanProcessor) Finish(string, string)                {}
+
 // noopSink is the default sink used when no real poster has been
 // constructed (e.g. unit tests, or a runner running offline). All
 // methods are no-ops.
@@ -165,6 +179,17 @@ type Options struct {
 	// Zero falls back to runtime/heartbeat.DefaultInterval.
 	HeartbeatInterval time.Duration
 
+	// SpanEmissionEnabled explicitly enables the additive per-call span
+	// pipeline. Platform dispatchers may instead advertise
+	// CapabilitySpanIngest per session; either signal enables it. Default false
+	// is mixed-version safe while the ingest route is unavailable.
+	SpanEmissionEnabled bool
+
+	// SpanEndpointPath overrides runtime/span.DefaultEndpointPath. Empty uses
+	// the accepted /api/daemon/traces path. This exists for OSS embedders and
+	// contract tests; no hosted address is baked into the library.
+	SpanEndpointPath string
+
 	// KitSkillSources is the optional slice of Kit skill contributions to
 	// inject into each dispatched agent's system prompt and tool surface.
 	// Populated by the daemon at runner construction time from the active
@@ -259,6 +284,8 @@ type Runner struct {
 	skipSteering          bool
 	skipPostSession       bool
 	hbInterval            time.Duration
+	spanEmissionEnabled   bool
+	spanEndpointPath      string
 	kitSkillSources       []kit.KitSkillSource
 	kitSkillDetector      KitSkillDetector
 	kitPromptFragDetector KitPromptFragmentDetector
@@ -309,6 +336,8 @@ func New(opts Options) (*Runner, error) {
 		skipSteering:          opts.SkipSteering,
 		skipPostSession:       opts.SkipPostSession,
 		hbInterval:            opts.HeartbeatInterval,
+		spanEmissionEnabled:   opts.SpanEmissionEnabled,
+		spanEndpointPath:      opts.SpanEndpointPath,
 		kitSkillSources:       opts.KitSkillSources,
 		kitSkillDetector:      opts.KitSkillDetector,
 		kitPromptFragDetector: opts.KitPromptFragmentDetector,

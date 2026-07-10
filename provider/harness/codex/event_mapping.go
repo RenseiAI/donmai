@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -20,6 +21,7 @@ type mapperState struct {
 	totalOutputTokens   int64
 	totalCachedInputTok int64
 	turnCount           int
+	turnStarted         time.Time
 }
 
 // mapNotification translates one inbound JSON-RPC notification into
@@ -51,6 +53,7 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 	// ─── Turn lifecycle ───────────────────────────────────────────
 	case "turn/started":
 		state.turnCount++
+		state.turnStarted = time.Now()
 		return []agent.Event{agent.SystemEvent{
 			Subtype: "turn_started",
 			Message: fmt.Sprintf("Turn %d started", state.turnCount),
@@ -182,10 +185,31 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		TotalCostUsd:      calculateCostUSD(state.totalInputTokens, state.totalCachedInputTok, state.totalOutputTokens, state.model),
 		NumTurns:          state.turnCount,
 	}
+	finishReason := p.Turn.Status
+	if finishReason == "" || finishReason == "completed" {
+		finishReason = "stop"
+	}
+	llm := agent.LlmCallEvent{
+		System:            "openai",
+		Model:             state.model,
+		InputTokens:       in,
+		OutputTokens:      out,
+		CachedInputTokens: cached,
+		FinishReason:      finishReason,
+		UsageSource:       agent.LlmUsageProvider,
+	}
+	ended := time.Now()
+	started := state.turnStarted
+	if started.IsZero() {
+		started = ended
+	}
+	llm.StartTimeUnixNano = fmt.Sprintf("%d", started.UnixNano())
+	llm.EndTimeUnixNano = fmt.Sprintf("%d", ended.UnixNano())
+	state.turnStarted = time.Time{}
 
 	switch p.Turn.Status {
 	case "", "completed":
-		return []agent.Event{agent.ResultEvent{Success: true, Cost: cost, Raw: raw}}
+		return []agent.Event{llm, agent.ResultEvent{Success: true, Cost: cost, Raw: raw}}
 	case "failed":
 		errMsg := p.Turn.Error.Message
 		if errMsg == "" {
@@ -195,7 +219,7 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		if subtype == "" {
 			subtype = "turn_failed"
 		}
-		return []agent.Event{agent.ResultEvent{
+		return []agent.Event{llm, agent.ResultEvent{
 			Success:      false,
 			Errors:       []string{errMsg},
 			ErrorSubtype: subtype,
@@ -203,7 +227,7 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 			Raw:          raw,
 		}}
 	case "interrupted":
-		return []agent.Event{agent.ResultEvent{
+		return []agent.Event{llm, agent.ResultEvent{
 			Success:      false,
 			Errors:       []string{"Turn was interrupted"},
 			ErrorSubtype: "interrupted",
@@ -211,7 +235,7 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 			Raw:          raw,
 		}}
 	default:
-		return []agent.Event{agent.SystemEvent{
+		return []agent.Event{llm, agent.SystemEvent{
 			Subtype: "turn_completed",
 			Message: "Turn completed with status: " + p.Turn.Status,
 			Raw:     raw,

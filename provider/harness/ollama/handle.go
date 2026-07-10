@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -42,8 +43,9 @@ type Handle struct {
 	resp      *http.Response
 	cancel    context.CancelFunc
 
-	events chan agent.Event
-	logger *slog.Logger
+	events      chan agent.Event
+	logger      *slog.Logger
+	callStarted time.Time
 
 	// shutdown is closed by Stop to broadcast termination to the body
 	// reader (which selects on it before each channel send).
@@ -83,6 +85,7 @@ func (p *Provider) startStream(parentCtx context.Context, body []byte, _ agent.S
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	callStarted := time.Now()
 	resp, err := p.client.Do(req)
 	if err != nil {
 		cancel()
@@ -98,13 +101,14 @@ func (p *Provider) startStream(parentCtx context.Context, body []byte, _ agent.S
 	}
 
 	h := &Handle{
-		sessionID: newSessionID(),
-		resp:      resp,
-		cancel:    cancel,
-		events:    make(chan agent.Event, eventBufferSize),
-		logger:    slog.With("provider", "ollama", "endpoint", p.endpoint),
-		shutdown:  make(chan struct{}),
-		done:      make(chan struct{}),
+		sessionID:   newSessionID(),
+		resp:        resp,
+		cancel:      cancel,
+		events:      make(chan agent.Event, eventBufferSize),
+		logger:      slog.With("provider", "ollama", "endpoint", p.endpoint),
+		callStarted: callStarted,
+		shutdown:    make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 
 	go h.readBody()
@@ -243,6 +247,11 @@ func (h *Handle) readBody() {
 			return
 		}
 		for _, ev := range evs {
+			if llm, ok := ev.(agent.LlmCallEvent); ok {
+				llm.StartTimeUnixNano = fmt.Sprintf("%d", h.callStarted.UnixNano())
+				llm.EndTimeUnixNano = fmt.Sprintf("%d", time.Now().UnixNano())
+				ev = llm
+			}
 			if _, ok := ev.(agent.ResultEvent); ok {
 				terminal = true
 			}

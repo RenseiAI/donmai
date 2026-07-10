@@ -37,7 +37,15 @@ type rawAssistantEnvelope struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id,omitempty"`
 	Message   struct {
-		Content []rawContentBlock `json:"content"`
+		ID         string            `json:"id,omitempty"`
+		Model      string            `json:"model,omitempty"`
+		StopReason string            `json:"stop_reason,omitempty"`
+		Content    []rawContentBlock `json:"content"`
+		Usage      struct {
+			InputTokens          int64 `json:"input_tokens"`
+			OutputTokens         int64 `json:"output_tokens"`
+			CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
+		} `json:"usage,omitempty"`
 	} `json:"message"`
 }
 
@@ -149,10 +157,10 @@ type rawResultEnvelope struct {
 // This is the verbatim Go port of the legacy TS mapSDKMessage from
 // ../donmai-libraries/packages/core/src/providers/claude-provider.ts.
 //
-// Design note: each Event variant carries the original raw line in
-// its `Raw` field as json.RawMessage so the runner can persist the
-// full provider-native event to <worktree>/.agent/events.jsonl per
-// F.1.1 §4 step 9.
+// Design note: provider-native projection events carry the original raw line
+// in `Raw` so the runner can persist it to <worktree>/.agent/events.jsonl per
+// F.1.1 §4 step 9. LlmCallEvent is the deliberate exception: it stays
+// metadata/digest-only and never duplicates prompt/completion content.
 func mapLine(line []byte) []agent.Event {
 	var head rawJSONLEnvelope
 	if err := json.Unmarshal(line, &head); err != nil {
@@ -242,7 +250,23 @@ func mapAssistant(line []byte) []agent.Event {
 			Raw:     json.RawMessage(line),
 		}}
 	}
-	out := make([]agent.Event, 0, len(a.Message.Content))
+	out := make([]agent.Event, 0, len(a.Message.Content)+1)
+	// Recent Claude-compatible stream-json emitters expose usage on each
+	// complete assistant message. Emit the LLM event before its tool-use
+	// blocks so the runtime correlator can parent those tools under this call.
+	// Older emitters omit message.usage; their terminal ResultEvent is handled
+	// conservatively by the aggregate fallback in runtime/span.
+	if a.Message.Usage.InputTokens != 0 || a.Message.Usage.OutputTokens != 0 ||
+		a.Message.Usage.CacheReadInputTokens != 0 || a.Message.StopReason != "" {
+		out = append(out, agent.LlmCallEvent{
+			Model:             a.Message.Model,
+			InputTokens:       a.Message.Usage.InputTokens,
+			OutputTokens:      a.Message.Usage.OutputTokens,
+			CachedInputTokens: a.Message.Usage.CacheReadInputTokens,
+			FinishReason:      a.Message.StopReason,
+			UsageSource:       agent.LlmUsageProvider,
+		})
+	}
 	for _, block := range a.Message.Content {
 		switch block.Type {
 		case "text":

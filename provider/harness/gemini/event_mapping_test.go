@@ -14,11 +14,15 @@ func TestMapResponse_TextOnly_Final(t *testing.T) {
 	if turn.outcome != outcomeFinal {
 		t.Fatalf("outcome: want outcomeFinal, got %v", turn.outcome)
 	}
-	if len(turn.events) != 1 {
-		t.Fatalf("events: want 1 (text), got %d", len(turn.events))
+	if len(turn.events) != 2 {
+		t.Fatalf("events: want LLM call + text, got %d", len(turn.events))
 	}
-	if ev, ok := turn.events[0].(agent.AssistantTextEvent); !ok || ev.Text != "hello" {
-		t.Fatalf("events[0]: want AssistantTextEvent(hello), got %#v", turn.events[0])
+	llm, ok := turn.events[0].(agent.LlmCallEvent)
+	if !ok || llm.InputTokens != 10 || llm.OutputTokens != 4 || llm.UsageSource != agent.LlmUsageProvider {
+		t.Fatalf("events[0]: want provider LlmCallEvent(10/4), got %#v", turn.events[0])
+	}
+	if ev, ok := turn.events[1].(agent.AssistantTextEvent); !ok || ev.Text != "hello" {
+		t.Fatalf("events[1]: want AssistantTextEvent(hello), got %#v", turn.events[1])
 	}
 	res, ok := turn.result.(agent.ResultEvent)
 	if !ok {
@@ -48,9 +52,13 @@ func TestMapResponse_FunctionCall_Continue(t *testing.T) {
 	if turn.funcCalls[0].ID != "call-1" || turn.funcCalls[0].Name != "Bash" {
 		t.Errorf("funcCall: want id=call-1 name=Bash, got %#v", turn.funcCalls[0])
 	}
-	tu, ok := turn.events[0].(agent.ToolUseEvent)
+	llm, ok := turn.events[0].(agent.LlmCallEvent)
+	if !ok || llm.UsageSource != agent.LlmUsageProvider || llm.Synthetic {
+		t.Fatalf("events[0]: want provider LlmCallEvent, got %#v", turn.events[0])
+	}
+	tu, ok := turn.events[1].(agent.ToolUseEvent)
 	if !ok {
-		t.Fatalf("events[0]: want ToolUseEvent, got %T", turn.events[0])
+		t.Fatalf("events[1]: want ToolUseEvent, got %T", turn.events[1])
 	}
 	if tu.ToolName != "Bash" || tu.ToolUseID != "call-1" {
 		t.Errorf("ToolUse: want Bash/call-1, got %s/%s", tu.ToolName, tu.ToolUseID)
@@ -81,6 +89,9 @@ func TestMapResponse_FinishReasonSafety_Failure(t *testing.T) {
 	if !strings.Contains(res.ErrorSubtype, "SAFETY") {
 		t.Errorf("ErrorSubtype: want SAFETY mention, got %q", res.ErrorSubtype)
 	}
+	if llm, ok := turn.events[0].(agent.LlmCallEvent); !ok || llm.FinishReason != "SAFETY" {
+		t.Fatalf("want SAFETY LlmCallEvent, got %#v", turn.events)
+	}
 }
 
 func TestMapResponse_PromptBlocked_Error(t *testing.T) {
@@ -97,6 +108,9 @@ func TestMapResponse_PromptBlocked_Error(t *testing.T) {
 	if errEv.Code != "prompt_blocked" {
 		t.Errorf("Code: want prompt_blocked, got %q", errEv.Code)
 	}
+	if llm, ok := turn.events[0].(agent.LlmCallEvent); !ok || llm.FinishReason != "prompt_blocked_OTHER" {
+		t.Fatalf("want explicit blocked LlmCallEvent, got %#v", turn.events)
+	}
 }
 
 func TestMapResponse_MalformedJSON_Error(t *testing.T) {
@@ -107,6 +121,9 @@ func TestMapResponse_MalformedJSON_Error(t *testing.T) {
 	}
 	if _, ok := turn.result.(agent.ErrorEvent); !ok {
 		t.Fatalf("result: want ErrorEvent on bad JSON, got %T", turn.result)
+	}
+	if llm, ok := turn.events[0].(agent.LlmCallEvent); !ok || llm.FinishReason != "decode_error" {
+		t.Fatalf("want decode-error LlmCallEvent, got %#v", turn.events)
 	}
 }
 
@@ -168,10 +185,13 @@ func TestMapResponse_MaxTokens_IsNonSuccess(t *testing.T) {
 		t.Errorf("Errors: want [MAX_TOKENS], got %v", res.Errors)
 	}
 	// Text events must still be emitted even though the result is non-success.
-	if len(turn.events) != 1 {
-		t.Fatalf("events: want 1 (partial text), got %d", len(turn.events))
+	if len(turn.events) != 2 {
+		t.Fatalf("events: want LLM call + partial text, got %d", len(turn.events))
 	}
-	if _, ok := turn.events[0].(agent.AssistantTextEvent); !ok {
-		t.Fatalf("events[0]: want AssistantTextEvent, got %T", turn.events[0])
+	if _, ok := turn.events[0].(agent.LlmCallEvent); !ok {
+		t.Fatalf("events[0]: want LlmCallEvent, got %T", turn.events[0])
+	}
+	if _, ok := turn.events[1].(agent.AssistantTextEvent); !ok {
+		t.Fatalf("events[1]: want AssistantTextEvent, got %T", turn.events[1])
 	}
 }

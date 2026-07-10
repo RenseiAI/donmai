@@ -21,8 +21,27 @@ func TestEvent_AllVariantsRoundTrip(t *testing.T) {
 		{"system", SystemEvent{Subtype: "compaction", Message: "compacted", Raw: nil}, EventSystem},
 		{"assistant_text", AssistantTextEvent{Text: "hello world"}, EventAssistantText},
 		{
+			"llm_call",
+			LlmCallEvent{
+				TraceID:         "00112233445566778899aabbccddeeff",
+				SpanID:          "0011223344556677",
+				ParentSpanID:    "8899aabbccddeeff",
+				System:          "anthropic",
+				Model:           "claude-opus-4",
+				InputTokens:     10,
+				OutputTokens:    5,
+				FinishReason:    "end_turn",
+				UsageSource:     LlmUsageProvider,
+				ModelSnapshotID: "claude-opus-4-20260701",
+			},
+			EventLlmCall,
+		},
+		{
 			"tool_use",
 			ToolUseEvent{
+				TraceID:      "00112233445566778899aabbccddeeff",
+				SpanID:       "0011223344556677",
+				ParentSpanID: "8899aabbccddeeff",
 				ToolName:     "Bash",
 				ToolUseID:    "tu-1",
 				Input:        map[string]any{"cmd": "git status"},
@@ -33,10 +52,13 @@ func TestEvent_AllVariantsRoundTrip(t *testing.T) {
 		{
 			"tool_result",
 			ToolResultEvent{
-				ToolName:  "Bash",
-				ToolUseID: "tu-1",
-				Content:   "clean",
-				IsError:   false,
+				TraceID:      "00112233445566778899aabbccddeeff",
+				SpanID:       "0011223344556677",
+				ParentSpanID: "8899aabbccddeeff",
+				ToolName:     "Bash",
+				ToolUseID:    "tu-1",
+				Content:      "clean",
+				IsError:      false,
 			},
 			EventToolResult,
 		},
@@ -118,6 +140,7 @@ func TestUnmarshalEvent_ErrorPaths(t *testing.T) {
 		{"missing-kind", `{"sessionId":"x"}`, "missing kind discriminator"},
 		{"unknown-kind", `{"kind":"alien"}`, `unknown event kind "alien"`},
 		{"variant-decode-bad-text", `{"kind":"assistant_text","text":12}`, "decode AssistantTextEvent"},
+		{"variant-decode-bad-llm-usage", `{"kind":"llm_call","inputTokens":"many"}`, "decode LlmCallEvent"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -151,6 +174,7 @@ func TestEvent_KindWireValues(t *testing.T) {
 		{InitEvent{}, "init"},
 		{SystemEvent{}, "system"},
 		{AssistantTextEvent{}, "assistant_text"},
+		{LlmCallEvent{}, "llm_call"},
 		{ToolUseEvent{}, "tool_use"},
 		{ToolResultEvent{}, "tool_result"},
 		{ToolProgressEvent{}, "tool_progress"},
@@ -172,6 +196,7 @@ func TestEvent_PolymorphicDispatch(t *testing.T) {
 		InitEvent{SessionID: "s1"},
 		SystemEvent{Subtype: "x"},
 		AssistantTextEvent{Text: "y"},
+		LlmCallEvent{System: "openai", UsageSource: LlmUsageAggregate, Synthetic: true},
 		ToolUseEvent{ToolName: "Bash", Input: map[string]any{}},
 		ToolResultEvent{Content: "ok"},
 		ToolProgressEvent{ToolName: "Bash", ElapsedSeconds: 1.0},
@@ -182,6 +207,7 @@ func TestEvent_PolymorphicDispatch(t *testing.T) {
 		"agent.InitEvent",
 		"agent.SystemEvent",
 		"agent.AssistantTextEvent",
+		"agent.LlmCallEvent",
 		"agent.ToolUseEvent",
 		"agent.ToolResultEvent",
 		"agent.ToolProgressEvent",

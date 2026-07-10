@@ -441,12 +441,16 @@ func TestMapOpenCodeLine_StepFinish_Stop_EmitsResult(t *testing.T) {
 	t.Parallel()
 	line := []byte(`{"type":"step_finish","sessionID":"ses_x","part":{"type":"step-finish","reason":"stop","tokens":{"total":100,"input":80,"output":20},"cost":0.001}}`)
 	evs := mapOpenCodeLine(line)
-	if len(evs) != 1 {
-		t.Fatalf("want 1 event (ResultEvent), got %d", len(evs))
+	if len(evs) != 2 {
+		t.Fatalf("want LlmCallEvent + ResultEvent, got %d", len(evs))
 	}
-	r, ok := evs[0].(agent.ResultEvent)
+	llm, ok := evs[0].(agent.LlmCallEvent)
+	if !ok || llm.InputTokens != 80 || llm.OutputTokens != 20 || llm.UsageSource != agent.LlmUsageProvider {
+		t.Fatalf("want provider LlmCallEvent(80/20), got %#v", evs[0])
+	}
+	r, ok := evs[1].(agent.ResultEvent)
 	if !ok {
-		t.Fatalf("want ResultEvent, got %T", evs[0])
+		t.Fatalf("want ResultEvent, got %T", evs[1])
 	}
 	if !r.Success {
 		t.Error("ResultEvent.Success: want true")
@@ -458,12 +462,15 @@ func TestMapOpenCodeLine_StepFinish_Stop_EmitsResult(t *testing.T) {
 	}
 }
 
-func TestMapOpenCodeLine_StepFinish_ToolCalls_EmitsNothing(t *testing.T) {
+func TestMapOpenCodeLine_StepFinish_ToolCalls_EmitsLlmCall(t *testing.T) {
 	t.Parallel()
 	line := []byte(`{"type":"step_finish","sessionID":"ses_x","part":{"type":"step-finish","reason":"tool-calls"}}`)
 	evs := mapOpenCodeLine(line)
-	if len(evs) != 0 {
-		t.Errorf("want no events for tool-calls step_finish, got %d", len(evs))
+	if len(evs) != 1 {
+		t.Fatalf("want one LlmCallEvent for tool-calls step_finish, got %d", len(evs))
+	}
+	if llm, ok := evs[0].(agent.LlmCallEvent); !ok || llm.FinishReason != "tool-calls" {
+		t.Fatalf("want tool-calls LlmCallEvent, got %#v", evs[0])
 	}
 }
 

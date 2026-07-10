@@ -94,6 +94,7 @@ func TestIntegration_StubProvider_FullRun(t *testing.T) {
 		SkipSteering:           true,
 		SkipPostSession:        true,
 		PreserveWorktreeAlways: false,
+		SpanEmissionEnabled:    true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -116,6 +117,7 @@ func TestIntegration_StubProvider_FullRun(t *testing.T) {
 		PlatformURL: srv.URL,
 		ResolvedProfile: runner.ResolvedProfile{
 			Provider: agent.ProviderStub,
+			Model:    "stub-model",
 		},
 	}
 
@@ -134,7 +136,7 @@ func TestIntegration_StubProvider_FullRun(t *testing.T) {
 	// Verify platform calls.
 	callsMu.Lock()
 	defer callsMu.Unlock()
-	var sawCompletion, sawStatus bool
+	var sawCompletion, sawStatus, sawSpanBatch bool
 	for _, c := range calls {
 		if strings.Contains(c.Path, "/completion") {
 			sawCompletion = true
@@ -142,12 +144,35 @@ func TestIntegration_StubProvider_FullRun(t *testing.T) {
 		if strings.Contains(c.Path, "/status") {
 			sawStatus = true
 		}
+		if c.Path == "/api/daemon/traces" {
+			sawSpanBatch = true
+			var batch []json.RawMessage
+			if err := json.Unmarshal([]byte(c.Body), &batch); err != nil {
+				t.Errorf("decode span batch: %v (body=%q)", err, c.Body)
+				continue
+			}
+			var sawLlm, sawRoot bool
+			for _, raw := range batch {
+				var head struct {
+					Kind agent.SpanKind `json:"kind"`
+				}
+				_ = json.Unmarshal(raw, &head)
+				sawLlm = sawLlm || head.Kind == agent.SpanKindLLM
+				sawRoot = sawRoot || head.Kind == agent.SpanKindAgent
+			}
+			if !sawLlm || !sawRoot {
+				t.Errorf("span batch missing llm/root: %s", c.Body)
+			}
+		}
 	}
 	if !sawCompletion {
 		t.Errorf("expected /completion call; calls=%v", calls)
 	}
 	if !sawStatus {
 		t.Errorf("expected /status call; calls=%v", calls)
+	}
+	if !sawSpanBatch {
+		t.Errorf("expected /api/daemon/traces call; calls=%v", calls)
 	}
 }
 

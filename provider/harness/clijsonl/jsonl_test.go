@@ -76,6 +76,35 @@ func TestMapLine_AssistantText(t *testing.T) {
 	}
 }
 
+func TestMapLine_AssistantPerCallUsage(t *testing.T) {
+	t.Parallel()
+	line := []byte(`{"type":"assistant","message":{"model":"claude-opus-4","stop_reason":"tool_use","usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":80},"content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"README.md"}}]}}`)
+	events := mapLine(line)
+	if len(events) != 2 {
+		t.Fatalf("got %d events, want LlmCallEvent + ToolUseEvent", len(events))
+	}
+	llm, ok := events[0].(agent.LlmCallEvent)
+	if !ok {
+		t.Fatalf("event[0] %T, want LlmCallEvent", events[0])
+	}
+	if llm.Model != "claude-opus-4" || llm.InputTokens != 120 || llm.OutputTokens != 30 || llm.CachedInputTokens != 80 {
+		t.Fatalf("unexpected usage event: %+v", llm)
+	}
+	if llm.UsageSource != agent.LlmUsageProvider || llm.Synthetic {
+		t.Fatalf("unexpected usage provenance: %+v", llm)
+	}
+	encoded, err := agent.MarshalEvent(llm)
+	if err != nil {
+		t.Fatalf("MarshalEvent: %v", err)
+	}
+	if bytes.Contains(encoded, []byte("README.md")) || bytes.Contains(encoded, []byte(`"raw"`)) {
+		t.Fatalf("LLM metadata event leaked provider content: %s", encoded)
+	}
+	if _, ok := events[1].(agent.ToolUseEvent); !ok {
+		t.Fatalf("event[1] %T, want ToolUseEvent", events[1])
+	}
+}
+
 func TestMapLine_AssistantToolUse(t *testing.T) {
 	t.Parallel()
 

@@ -65,12 +65,25 @@ func TestMapNotification_TurnCompleted_Success(t *testing.T) {
 		},
 	})
 	got := mapNotification("turn/completed", params, state, nil)
-	if len(got) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(got))
+	if len(got) != 2 {
+		t.Fatalf("expected LlmCallEvent + ResultEvent, got %d", len(got))
 	}
-	res, ok := got[0].(agent.ResultEvent)
+	llm, ok := got[0].(agent.LlmCallEvent)
 	if !ok {
-		t.Fatalf("expected ResultEvent, got %T", got[0])
+		t.Fatalf("expected LlmCallEvent first, got %T", got[0])
+	}
+	if llm.UsageSource != agent.LlmUsageProvider || llm.Synthetic {
+		t.Fatalf("unexpected usage provenance: %+v", llm)
+	}
+	if llm.StartTimeUnixNano == "" || llm.EndTimeUnixNano == "" {
+		t.Fatalf("per-call timing missing: %+v", llm)
+	}
+	if llm.InputTokens != 500_000 || llm.OutputTokens != 100_000 || llm.CachedInputTokens != 100_000 {
+		t.Fatalf("unexpected per-call usage: %+v", llm)
+	}
+	res, ok := got[1].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("expected ResultEvent second, got %T", got[1])
 	}
 	if !res.Success {
 		t.Fatalf("expected success=true")
@@ -95,7 +108,11 @@ func TestMapNotification_TurnCompleted_CamelCaseUsage(t *testing.T) {
 		},
 	})
 	got := mapNotification("turn/completed", params, state, nil)
-	res := got[0].(agent.ResultEvent)
+	llm := got[0].(agent.LlmCallEvent)
+	if llm.InputTokens != 1000 || llm.OutputTokens != 500 || llm.CachedInputTokens != 200 {
+		t.Fatalf("unexpected per-call tokens: %+v", llm)
+	}
+	res := got[1].(agent.ResultEvent)
 	if res.Cost.InputTokens != 1000 || res.Cost.OutputTokens != 500 {
 		t.Fatalf("unexpected token totals: %+v", res.Cost)
 	}
@@ -111,7 +128,11 @@ func TestMapNotification_TurnCompleted_Failed(t *testing.T) {
 		},
 	})
 	got := mapNotification("turn/completed", params, state, nil)
-	res := got[0].(agent.ResultEvent)
+	llm := got[0].(agent.LlmCallEvent)
+	if llm.FinishReason != "failed" {
+		t.Fatalf("finish reason = %q, want failed", llm.FinishReason)
+	}
+	res := got[1].(agent.ResultEvent)
 	if res.Success {
 		t.Fatalf("expected failure")
 	}
@@ -128,7 +149,7 @@ func TestMapNotification_TurnCompleted_Interrupted(t *testing.T) {
 	state := &mapperState{model: DefaultCodexModel}
 	params := mustJSON(t, map[string]any{"turn": map[string]any{"status": "interrupted"}})
 	got := mapNotification("turn/completed", params, state, nil)
-	res := got[0].(agent.ResultEvent)
+	res := got[1].(agent.ResultEvent)
 	if res.ErrorSubtype != "interrupted" {
 		t.Fatalf("expected interrupted, got %q", res.ErrorSubtype)
 	}

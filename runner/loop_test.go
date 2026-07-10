@@ -1083,7 +1083,7 @@ func TestConsumeEvents_DispatchesToSink(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
-	if _, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, rec); err != nil {
+	if _, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, rec, nil); err != nil {
 		t.Fatalf("consumeEvents: %v", err)
 	}
 
@@ -1091,6 +1091,47 @@ func TestConsumeEvents_DispatchesToSink(t *testing.T) {
 	defer rec.mu.Unlock()
 	if got := len(rec.events); got != 4 {
 		t.Fatalf("recorded %d events; want 4 (got=%v)", got, kindsOf(rec.events))
+	}
+}
+
+func TestConsumeEvents_PersistsSyntheticCorrelatedEvents(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	rec := &recordingSink{}
+	processor := &recordingSpanProcessor{}
+	events := make(chan agent.Event, 1)
+	events <- agent.ResultEvent{Success: true, Cost: &agent.CostData{InputTokens: 20, OutputTokens: 4}}
+	close(events)
+
+	wpath := t.TempDir()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("TEST-SPAN-EVENT-1")}
+	enforcer := NewBudgetEnforcer(nil, time.Now())
+	if _, err := r.consumeEvents(t.Context(), &fakeHandle{events: events}, wpath, qw, nil, enforcer, rec, processor); err != nil {
+		t.Fatalf("consumeEvents: %v", err)
+	}
+
+	rec.mu.Lock()
+	gotEvents := append([]agent.Event(nil), rec.events...)
+	rec.mu.Unlock()
+	if len(gotEvents) != 2 || gotEvents[0].Kind() != agent.EventLlmCall || gotEvents[1].Kind() != agent.EventResult {
+		t.Fatalf("sink events = %v, want [llm_call result]", kindsOf(gotEvents))
+	}
+
+	body, err := os.ReadFile(filepath.Join(wpath, ".agent", "events.jsonl"))
+	if err != nil {
+		t.Fatalf("read events.jsonl: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("events.jsonl rows = %d, want 2", len(lines))
+	}
+	first, err := agent.UnmarshalEvent([]byte(lines[0]))
+	if err != nil {
+		t.Fatalf("decode first row: %v", err)
+	}
+	llm := first.(agent.LlmCallEvent)
+	if !llm.Synthetic || llm.UsageSource != agent.LlmUsageAggregate || llm.InputTokens != 20 || llm.OutputTokens != 4 {
+		t.Fatalf("synthetic event lost provenance/usage: %+v", llm)
 	}
 }
 
@@ -1118,7 +1159,7 @@ func TestConsumeEvents_IdleWatchdogFires(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{})
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
 	if !obs.noProgress {
 		t.Fatalf("obs.noProgress = false; want true (watchdog should have fired)")
 	}
@@ -1158,7 +1199,7 @@ func TestConsumeEvents_IdleWatchdogResetsOnEvent(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{})
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
 	if err != nil {
 		t.Fatalf("consumeEvents: %v; want nil (terminal Result reached)", err)
 	}
@@ -1188,7 +1229,7 @@ func TestConsumeEvents_IdleWatchdogDisabled(t *testing.T) {
 	defer cancel()
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{})
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
 	if obs.noProgress {
 		t.Fatalf("obs.noProgress = true; want false (watchdog disabled)")
 	}
@@ -1203,6 +1244,22 @@ type recordingSink struct {
 	mu     sync.Mutex
 	events []agent.Event
 }
+
+type recordingSpanProcessor struct{}
+
+func (*recordingSpanProcessor) Process(ev agent.Event) []agent.Event {
+	if result, ok := ev.(agent.ResultEvent); ok {
+		llm := agent.LlmCallEvent{Synthetic: true, UsageSource: agent.LlmUsageAggregate}
+		if result.Cost != nil {
+			llm.InputTokens = result.Cost.InputTokens
+			llm.OutputTokens = result.Cost.OutputTokens
+		}
+		return []agent.Event{llm, result}
+	}
+	return []agent.Event{ev}
+}
+
+func (*recordingSpanProcessor) Finish(string, string) {}
 
 func (s *recordingSink) Send(_ context.Context, ev agent.Event) {
 	s.mu.Lock()

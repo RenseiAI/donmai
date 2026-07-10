@@ -136,6 +136,16 @@ func TestProvider_Spawn_HappyPath(t *testing.T) {
 	if _, ok := events[0].(agent.InitEvent); !ok {
 		t.Fatalf("events[0]: want InitEvent, got %T", events[0])
 	}
+	var llm *agent.LlmCallEvent
+	for _, ev := range events {
+		if event, ok := ev.(agent.LlmCallEvent); ok {
+			llm = &event
+			break
+		}
+	}
+	if llm == nil || llm.StartTimeUnixNano == "" || llm.EndTimeUnixNano == "" {
+		t.Fatalf("events missing timed LlmCallEvent: %#v", events)
+	}
 	res, ok := events[len(events)-1].(agent.ResultEvent)
 	if !ok {
 		t.Fatalf("events[-1]: want ResultEvent, got %T", events[len(events)-1])
