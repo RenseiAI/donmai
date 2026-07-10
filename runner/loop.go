@@ -1414,35 +1414,87 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 // session, applying the explicit-overrides-detection precedence (OD-1,
 // KITS PIVOT #3):
 //
-//  1. qw.Kits — the platform-resolved demand threaded on the work item.
-//     When non-nil and non-empty it is authoritative; detection is skipped.
-//  2. r.kitDetector — fallback: detect kits from the cloned worktree at
+//  1. qw.Kits — the platform-resolved lifecycle demand threaded on the work
+//     item. Its exact selected kit versions still undergo local command
+//     ownership preflight before any provisioning.
+//  2. r.kitComposer / r.kitDetector — fallback: detect kits from the cloned worktree at
 //     wpath and compose a demand for r.kitTargetOS (sandbox OS for cloud,
-//     host OS for local). Requires KitDetector to be wired at runner
-//     construction; nil disables the fallback entirely.
+//     host OS for local). Requires KitComposer or KitDetector to be wired at
+//     runner construction; nil disables the fallback entirely.
 //
 // Returns nil when there is nothing to provision (no platform demand AND no
 // detector / no detected kits) — the caller skips step 2b. On a detect or
 // compose error it stamps res.Status="failed" + FailureKitProvision and
 // returns a non-nil (non-empty) demand so the caller short-circuits Run.
 func (r *Runner) resolveKitDemand(qw QueuedWork, wpath string, res *Result) *kit.ToolchainDemand {
-	// 1. Platform-supplied demand wins (explicit overrides detection).
-	if qw.Kits != nil && !qw.Kits.IsEmpty() {
-		r.logger.Info("kit toolchain: using platform-supplied demand",
-			"sessionId", qw.SessionID,
-			"os", qw.Kits.OS,
-			"kits", qw.Kits.Kits,
-		)
-		return qw.Kits
-	}
-
-	// 2. Detection fallback — only when a detector is wired.
-	if r.kitDetector == nil {
-		return nil
-	}
 	targetOS := r.kitTargetOS
+	if qw.Kits != nil && qw.Kits.OS != "" {
+		targetOS = qw.Kits.OS
+	}
 	if targetOS == "" {
 		targetOS = kit.MustResolveOS()
+	}
+
+	// 1. Platform lifecycle demand remains authoritative, but its exact kit
+	// selection must pass local command ownership preflight. This prevents a
+	// platform payload from bypassing the same collision/lock checks used by
+	// repository detection.
+	if hasPlatformKitDemand(qw.Kits) {
+		if r.kitComposer == nil {
+			return failKitComposition(res, targetOS, errors.New("platform-supplied kit demand requires local command composition preflight"))
+		}
+		selected, err := parseExactKitSelections(qw.Kits.Kits)
+		if err != nil {
+			return failKitComposition(res, targetOS, err)
+		}
+		composed, err := r.kitComposer(wpath, kit.CompositionTarget{
+			OS: targetOS, WorkType: qw.WorkType, PathScope: ".",
+		}, selected)
+		if err != nil {
+			return failKitComposition(res, targetOS, err)
+		}
+		if composed == nil {
+			return failKitComposition(res, targetOS, errors.New("local command composition returned no demand"))
+		}
+		demand := cloneToolchainDemand(qw.Kits)
+		if demand.OS == "" {
+			demand.OS = targetOS
+		}
+		demand.Commands = append([]kit.QualifiedCommand(nil), composed.Commands...)
+		demand.CommandBindings = append([]kit.GenericCommandBinding(nil), composed.CommandBindings...)
+		demand.CompositionDigest = composed.CompositionDigest
+		r.logger.Info("kit toolchain: using platform-supplied lifecycle demand after command composition preflight",
+			"sessionId", qw.SessionID,
+			"os", demand.OS,
+			"kits", demand.Kits,
+			"compositionDigest", demand.CompositionDigest,
+			"commandCount", len(demand.Commands),
+			"bindingCount", len(demand.CommandBindings),
+		)
+		return demand
+	}
+
+	// 2. Detection fallback — only when a detector/composer is wired.
+	if r.kitDetector == nil && r.kitComposer == nil {
+		return nil
+	}
+	if r.kitComposer != nil {
+		demand, composeErr := r.kitComposer(wpath, kit.CompositionTarget{
+			OS: targetOS, WorkType: qw.WorkType, PathScope: ".",
+		}, nil)
+		if composeErr != nil {
+			return failKitComposition(res, targetOS, composeErr)
+		}
+		if demand.IsEmpty() {
+			return nil
+		}
+		r.logger.Info("kit command composition resolved",
+			"sessionId", qw.SessionID,
+			"compositionDigest", demand.CompositionDigest,
+			"commandCount", len(demand.Commands),
+			"bindingCount", len(demand.CommandBindings),
+		)
+		return demand
 	}
 	views, detErr := r.kitDetector(wpath, targetOS)
 	if detErr != nil {
@@ -1463,6 +1515,54 @@ func (r *Runner) resolveKitDemand(qw QueuedWork, wpath string, res *Result) *kit
 		return nil
 	}
 	return demand
+}
+
+func hasPlatformKitDemand(demand *kit.ToolchainDemand) bool {
+	return demand != nil && (!demand.IsEmpty() || len(demand.Kits) > 0)
+}
+
+func parseExactKitSelections(refs []string) ([]kit.Selection, error) {
+	if len(refs) == 0 {
+		return nil, errors.New("platform kit demand must include at least one exact id@version selection")
+	}
+	selected := make([]kit.Selection, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		at := strings.LastIndex(ref, "@")
+		if at <= 0 || at == len(ref)-1 {
+			return nil, fmt.Errorf("platform kit selection %q must be an exact id@version reference", ref)
+		}
+		selection := kit.Selection{ID: ref[:at], Version: ref[at+1:]}
+		key := selection.ID + "\x00" + selection.Version
+		if _, duplicate := seen[key]; duplicate {
+			return nil, fmt.Errorf("duplicate platform kit selection %s@%s", selection.ID, selection.Version)
+		}
+		seen[key] = struct{}{}
+		selected = append(selected, selection)
+	}
+	return selected, nil
+}
+
+func failKitComposition(res *Result, targetOS string, err error) *kit.ToolchainDemand {
+	res.Status = "failed"
+	res.FailureMode = FailureKitProvision
+	res.Error = fmt.Sprintf("kit compose: %v", err)
+	return &kit.ToolchainDemand{OS: targetOS}
+}
+
+func cloneToolchainDemand(source *kit.ToolchainDemand) *kit.ToolchainDemand {
+	clone := *source
+	clone.Kits = append([]string(nil), source.Kits...)
+	clone.ToolchainInstall = append([]string(nil), source.ToolchainInstall...)
+	clone.PostAcquire = append([]string(nil), source.PostAcquire...)
+	clone.PreRelease = append([]string(nil), source.PreRelease...)
+	if source.Env != nil {
+		clone.Env = make(map[string]string, len(source.Env))
+		for key, value := range source.Env {
+			clone.Env[key] = value
+		}
+	}
+	return &clone
 }
 
 // classifyWorktreeErr maps a worktree.Provision error to the

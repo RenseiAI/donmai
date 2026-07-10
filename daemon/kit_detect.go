@@ -12,6 +12,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,7 +44,7 @@ func (r *KitRegistry) DetectForRepo(repoRoot, targetOS string) ([]kit.ManifestVi
 		targetOS = kit.MustResolveOS()
 	}
 
-	manifests := r.scan()
+	manifests, manifestPaths := r.scanWithPaths()
 	state := r.loadState()
 	disabled := make(map[string]struct{}, len(state.DisabledIDs))
 	for _, id := range state.DisabledIDs {
@@ -51,7 +52,7 @@ func (r *KitRegistry) DetectForRepo(repoRoot, targetOS string) ([]kit.ManifestVi
 	}
 
 	var matched []kit.ManifestView
-	for _, m := range manifests {
+	for i, m := range manifests {
 		if _, off := disabled[m.Kit.ID]; off {
 			continue
 		}
@@ -63,7 +64,11 @@ func (r *KitRegistry) DetectForRepo(repoRoot, targetOS string) ([]kit.ManifestVi
 		if !detectMatches(m, repoRoot) {
 			continue
 		}
-		matched = append(matched, manifestToView(m))
+		packageDigest, legacyDigest, err := commandOwnerDigests(manifestPaths[i])
+		if err != nil {
+			return nil, fmt.Errorf("kit detect: command owner digest for %s: %w", m.Kit.ID, err)
+		}
+		matched = append(matched, manifestToView(m, packageDigest, legacyDigest))
 	}
 
 	// Order foundation → framework → project (deterministic within group).
@@ -144,14 +149,19 @@ func detectMatches(m kitManifestTOML, repoRoot string) bool {
 // manifestToView projects a parsed manifest into the exported view the
 // compose layer consumes (K1.2 bridge — keeps kitManifestTOML
 // daemon-private while the runner imports only internal/kit).
-func manifestToView(m kitManifestTOML) kit.ManifestView {
+func manifestToView(m kitManifestTOML, packageDigest, legacyDigest string) kit.ManifestView {
 	v := kit.ManifestView{
-		ID:               m.Kit.ID,
-		Version:          m.Kit.Version,
-		Priority:         m.Kit.Priority,
-		Order:            m.Composition.Order,
-		SupportedOS:      copyStrings(m.Supports.OS),
-		ToolchainInstall: copyStringMapMap(m.Provide.ToolchainInstall),
+		ID:                   m.Kit.ID,
+		Version:              m.Kit.Version,
+		Priority:             m.Kit.Priority,
+		Order:                m.Composition.Order,
+		SupportedOS:          copyStrings(m.Supports.OS),
+		PackageDigest:        packageDigest,
+		LegacyManifestDigest: legacyDigest,
+		PathScope:            ".",
+		Commands:             copyStringMap(m.Provide.Commands),
+		CommandsOverride:     copyStringMapMap(m.Provide.CommandsOverride),
+		ToolchainInstall:     copyStringMapMap(m.Provide.ToolchainInstall),
 		Hooks: kit.HooksView{
 			PostAcquire: m.Provide.Hooks.PostAcquire,
 			PreRelease:  m.Provide.Hooks.PreRelease,
@@ -179,6 +189,24 @@ func manifestToView(m kitManifestTOML) kit.ManifestView {
 		}
 	}
 	return v
+}
+
+// commandOwnerDigest returns the immutable package digest when a manifest is
+// generation-bound. Legacy manifests use the exact manifest-content SHA-256 so
+// command ownership remains deterministic without upgrading their trust state.
+func commandOwnerDigests(manifestPath string) (packageDigest, legacyDigest string, err error) {
+	if isPackageManifestPath(manifestPath) {
+		digest := filepath.Base(filepath.Dir(manifestPath))
+		if !isCanonicalSHA256(digest) {
+			return "", "", errors.New("invalid package digest path")
+		}
+		return digest, "", nil
+	}
+	raw, err := os.ReadFile(manifestPath) //nolint:gosec // path came from the registry's validated scan result
+	if err != nil {
+		return "", "", err
+	}
+	return "", sha256Hex(raw), nil
 }
 
 // osSupported reports whether supported (from [supports].os) admits
