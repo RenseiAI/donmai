@@ -59,6 +59,20 @@ type ManifestView struct {
 	Order string
 	// SupportedOS is [supports].os; empty means "any".
 	SupportedOS []string
+	// PackageDigest is the immutable package digest used in command identity.
+	PackageDigest string
+	// LegacyManifestDigest is used only when no package digest exists; keeping
+	// the fields separate prevents a legacy manifest from being serialized as a
+	// verified package identity.
+	LegacyManifestDigest string
+	// PathScope is the repository-relative contribution scope. Empty means the
+	// repository root. WorkTypes optionally narrows command applicability.
+	PathScope string
+	WorkTypes []string
+	// Commands and CommandsOverride are the v1 owner-local command map and its
+	// same-owner OS specializations.
+	Commands         map[string]string
+	CommandsOverride map[string]map[string]string
 	// ToolchainInstall is [provide.toolchain_install.<os>] → {key: cmd}.
 	ToolchainInstall map[string]map[string]string
 	// Hooks is [provide.hooks] (generic + OS-keyed overlay).
@@ -119,6 +133,12 @@ type ToolchainDemand struct {
 	// that installs to ~/.cargo can export PATH). Reserved for K3 kits;
 	// currently always nil from Compose.
 	Env map[string]string `json:"env,omitempty"`
+	// Commands retain every owner-qualified command. CommandBindings resolve
+	// generic aliases without erasing ownership; CompositionDigest binds the
+	// exact target, commands, and bindings for diagnostics/audit evidence.
+	Commands          []QualifiedCommand      `json:"commands,omitempty"`
+	CommandBindings   []GenericCommandBinding `json:"command_bindings,omitempty"`
+	CompositionDigest string                  `json:"composition_digest,omitempty"`
 }
 
 // IsEmpty reports whether the demand has nothing to execute. The runner
@@ -128,7 +148,7 @@ func (d *ToolchainDemand) IsEmpty() bool {
 	if d == nil {
 		return true
 	}
-	return len(d.ToolchainInstall) == 0 && len(d.PostAcquire) == 0 && len(d.PreRelease) == 0
+	return len(d.ToolchainInstall) == 0 && len(d.PostAcquire) == 0 && len(d.PreRelease) == 0 && len(d.Commands) == 0
 }
 
 // orderRank maps a [composition].order value to a sort rank so manifests
@@ -185,6 +205,15 @@ func SortManifests(views []ManifestView) []ManifestView {
 // conflicts (two exact pins of the same toolchain) are a kit-authoring
 // concern resolved upstream at version-pin resolution (006:59), not here.
 func Compose(views []ManifestView, targetOS string) (*ToolchainDemand, error) {
+	return ComposeForTarget(views, CompositionTarget{OS: targetOS, PathScope: "."}, nil, nil)
+}
+
+// ComposeForTarget composes executable lifecycle demand and owner-qualified
+// commands for the exact session target. Generic command ownership fails closed
+// unless one owner exists, an authenticated delegation chain has one terminal,
+// or an exact operator lock binding selects the owner.
+func ComposeForTarget(views []ManifestView, target CompositionTarget, lock *CompositionLock, delegations []CommandDelegation) (*ToolchainDemand, error) {
+	targetOS := target.OS
 	if targetOS == "" {
 		return nil, fmt.Errorf("kit compose: targetOS is required")
 	}
@@ -228,6 +257,13 @@ func Compose(views []ManifestView, targetOS string) (*ToolchainDemand, error) {
 			d.PreRelease = append(d.PreRelease, pr)
 		}
 	}
+	commands, err := ResolveCommandComposition(views, target, lock, delegations)
+	if err != nil {
+		return nil, err
+	}
+	d.Commands = commands.Commands
+	d.CommandBindings = commands.Bindings
+	d.CompositionDigest = commands.Digest
 
 	return d, nil
 }

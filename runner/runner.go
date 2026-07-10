@@ -234,6 +234,11 @@ type Options struct {
 	// daemon-populated.
 	KitDetector KitDetector
 
+	// KitComposer performs target-aware detection plus owner-qualified command
+	// composition. When set it takes precedence over KitDetector so the exact
+	// work type/path scope and operator lock participate in preflight.
+	KitComposer KitComposer
+
 	// KitTargetOS overrides the OS the kit toolchain demand is composed
 	// for. Empty falls back to the host OS (kit.MustResolveOS). The daemon
 	// sets this to the SANDBOX OS ("linux") for cloud-targeted sessions so
@@ -245,6 +250,9 @@ type Options struct {
 // at repoRoot for targetOS (foundation → framework → project). Returns an
 // empty slice when no kit applies. Implemented by KitRegistry.DetectForRepo.
 type KitDetector func(repoRoot, targetOS string) ([]kit.ManifestView, error)
+
+// KitComposer resolves target-aware kit lifecycle and command demand.
+type KitComposer func(repoRoot string, target kit.CompositionTarget, selected []kit.Selection) (*kit.ToolchainDemand, error)
 
 // KitSkillDetector resolves kit skill sources against the cloned worktree
 // path so skill injection uses the actual repo's detected kits. Implemented
@@ -290,6 +298,7 @@ type Runner struct {
 	kitSkillDetector      KitSkillDetector
 	kitPromptFragDetector KitPromptFragmentDetector
 	kitDetector           KitDetector
+	kitComposer           KitComposer
 	kitTargetOS           string
 }
 
@@ -342,6 +351,7 @@ func New(opts Options) (*Runner, error) {
 		kitSkillDetector:      opts.KitSkillDetector,
 		kitPromptFragDetector: opts.KitPromptFragmentDetector,
 		kitDetector:           opts.KitDetector,
+		kitComposer:           opts.KitComposer,
 		kitTargetOS:           opts.KitTargetOS,
 	}
 	if r.envc == nil {

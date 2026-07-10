@@ -161,8 +161,9 @@ type QueuedWork struct {
 	// KitRef[] into a kit.ToolchainDemand and threads it here so the runner
 	// runs toolchain_install + post_acquire AFTER the repo is cloned
 	// (runner/loop.go step 2b). When non-nil and non-empty it is the
-	// authoritative demand for this session and OVERRIDES the runner's
-	// repo-detection fallback (OD-1: explicit-overrides-detection). When
+	// authoritative lifecycle demand for this session and OVERRIDES the
+	// repo-detection fallback (OD-1: explicit-overrides-detection). Its exact
+	// kit selections still undergo local command-ownership preflight. When
 	// nil/empty the runner falls back to detecting kits from the cloned
 	// worktree via its KitDetector — backward-compatible.
 	//

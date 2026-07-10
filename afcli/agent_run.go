@@ -249,6 +249,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// The platform-supplied demand on the work item (qw.Kits) overrides
 		// detection; KitDetector is the fallback.
 		KitDetector: kitReg.DetectForRepo,
+		KitComposer: kitReg.ComposeForRepo,
 		KitTargetOS: kitTargetOS,
 		// KIT BOOTSTRAP — wire post-clone skill + prompt-fragment detectors
 		// so the runner re-detects against the REAL worktree (step 2c in
