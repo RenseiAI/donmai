@@ -725,6 +725,15 @@ func mapOpenCodeToolUse(line []byte, part *rawOpenCodePart) []agent.Event {
 }
 
 func mapOpenCodeStepFinish(line []byte, part *rawOpenCodePart) []agent.Event {
+	llm := agent.LlmCallEvent{
+		System:       "opencode",
+		FinishReason: part.Reason,
+		UsageSource:  agent.LlmUsageProvider,
+	}
+	if part.Tokens != nil {
+		llm.InputTokens = part.Tokens.Input
+		llm.OutputTokens = part.Tokens.Output
+	}
 	switch part.Reason {
 	case "stop":
 		// Terminal step — emit ResultEvent(success=true).
@@ -736,16 +745,16 @@ func mapOpenCodeStepFinish(line []byte, part *rawOpenCodePart) []agent.Event {
 				TotalCostUsd: part.Cost,
 			}
 		}
-		return []agent.Event{agent.ResultEvent{
+		return []agent.Event{llm, agent.ResultEvent{
 			Success: true,
 			Cost:    cost,
 			Raw:     json.RawMessage(line),
 		}}
 	case "tool-calls":
 		// Intermediate step — agent is about to execute tools; not terminal.
-		return nil
+		return []agent.Event{llm}
 	case "error":
-		return []agent.Event{agent.ResultEvent{
+		return []agent.Event{llm, agent.ResultEvent{
 			Success:      false,
 			Errors:       []string{"opencode step finished with error"},
 			ErrorSubtype: "error",
@@ -753,7 +762,7 @@ func mapOpenCodeStepFinish(line []byte, part *rawOpenCodePart) []agent.Event {
 		}}
 	default:
 		// Unknown reason — emit as a system event so runners observe it.
-		return []agent.Event{agent.SystemEvent{
+		return []agent.Event{llm, agent.SystemEvent{
 			Subtype: "step_finish_unknown",
 			Message: fmt.Sprintf("step_finish reason=%s", part.Reason),
 			Raw:     json.RawMessage(line),

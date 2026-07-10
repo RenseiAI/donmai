@@ -240,6 +240,10 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		CredentialProvider:        credentialCache.runnerCredentials,
 		Logger:                    logger,
 		PreserveWorktreeOnFailure: opts.preserveWT,
+		// The library stays env-free; this binary is the operator boundary.
+		// Dispatch capability `llm-span-ingest` can also enable the pipeline
+		// per session once a compatible server advertises it.
+		SpanEmissionEnabled: donmaiSpanTracingEnabled(),
 		// KITS PIVOT #3 — arm runner/loop.go step 2b so kit toolchain
 		// (toolchain_install + post_acquire) runs AFTER the repo is cloned.
 		// The platform-supplied demand on the work item (qw.Kits) overrides
@@ -308,6 +312,11 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		return fmt.Errorf("session %s ended with status %q (failureMode=%s)", sessionID, res.Status, res.FailureMode)
 	}
 	return nil
+}
+
+func donmaiSpanTracingEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("DONMAI_OTEL_TRACES"))
+	return v == "1" || strings.EqualFold(v, "true")
 }
 
 // postSessionRunning fires an eager, best-effort POST

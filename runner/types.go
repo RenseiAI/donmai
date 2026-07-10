@@ -65,6 +65,10 @@ const (
 	// transitioning the issue directly. Default false (no adapter today) —
 	// the platform owns the merge gate via the gate.merge workflow node.
 	CapabilityMergeQueue = "merge-queue"
+	// CapabilitySpanIngest is true when the dispatch target accepts the
+	// additive span batch contract. Missing/false keeps mixed-version workers
+	// from posting to a server that has not shipped the ingest route yet.
+	CapabilitySpanIngest = "llm-span-ingest"
 )
 
 // hasCapability reports whether the daemon advertised the named capability as

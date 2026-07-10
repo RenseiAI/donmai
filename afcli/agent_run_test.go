@@ -999,3 +999,25 @@ func TestPostSessionRunning_Non2xxIsSwallowed(_ *testing.T) {
 	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
 		quietLogger(), srv.URL, "sess-5xx", "wkr", "tok")
 }
+
+func TestDonmaiSpanTracingEnabled(t *testing.T) {
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"1", true},
+		{"true", true},
+		{" TRUE ", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			t.Setenv("DONMAI_OTEL_TRACES", tt.value)
+			if got := donmaiSpanTracingEnabled(); got != tt.want {
+				t.Fatalf("donmaiSpanTracingEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

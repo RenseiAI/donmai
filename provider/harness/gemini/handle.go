@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -232,7 +233,9 @@ func (h *Handle) drive(ctx context.Context) {
 			return
 		}
 
+		callStarted := time.Now()
 		respBody, err := h.postTurn(ctx, body)
+		callEnded := time.Now()
 		if err != nil {
 			// Honor shutdown so a Stop-cancelled request does not emit a
 			// confusing trailing transport error.
@@ -249,6 +252,13 @@ func (h *Handle) drive(ctx context.Context) {
 		}
 
 		turn := mapResponse(respBody, h.state)
+		for i, ev := range turn.events {
+			if llm, ok := ev.(agent.LlmCallEvent); ok {
+				llm.StartTimeUnixNano = fmt.Sprintf("%d", callStarted.UnixNano())
+				llm.EndTimeUnixNano = fmt.Sprintf("%d", callEnded.UnixNano())
+				turn.events[i] = llm
+			}
+		}
 		for _, ev := range turn.events {
 			if !h.sendEvent(ev) {
 				return

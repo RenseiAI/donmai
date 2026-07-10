@@ -201,6 +201,7 @@ func TestSpawn_streamsToTerminalEvent(t *testing.T) {
 		agent.EventInit,
 		agent.EventAssistantText,
 		agent.EventAssistantText,
+		agent.EventLlmCall,
 		agent.EventResult,
 	}
 	if len(got) != len(wantKinds) {
@@ -212,6 +213,10 @@ func TestSpawn_streamsToTerminalEvent(t *testing.T) {
 		}
 	}
 	res := got[len(got)-1].(agent.ResultEvent)
+	llm := got[len(got)-2].(agent.LlmCallEvent)
+	if llm.StartTimeUnixNano == "" || llm.EndTimeUnixNano == "" {
+		t.Fatalf("LlmCallEvent timing missing: %+v", llm)
+	}
 	if !res.Success {
 		t.Errorf("ResultEvent.Success: got false want true")
 	}

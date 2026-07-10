@@ -125,7 +125,8 @@ type interviewLoopConfig struct {
 	qw          QueuedWork
 	res         *Result
 	sink        activitySink // platform activity buffer (shared with headless)
-	tokens      tokenSink    // batched token-delta forwarder
+	spans       spanEventProcessor
+	tokens      tokenSink // batched token-delta forwarder
 	injectCh    <-chan heartbeat.InjectPayload
 	clock       interviewClock // idle-grace timer source
 	idleGrace   time.Duration  // 0 = no idle-grace cap
@@ -157,6 +158,7 @@ func (r *Runner) dispatchInterview(
 	qw QueuedWork,
 	res *Result,
 	sink activitySink,
+	spans spanEventProcessor,
 	injectCh <-chan heartbeat.InjectPayload,
 ) (*Result, error) {
 	// Interview budget: wall-clock cap (ctx deadline) + idle-grace
@@ -218,6 +220,7 @@ func (r *Runner) dispatchInterview(
 		qw:          qw,
 		res:         res,
 		sink:        sink,
+		spans:       spans,
 		tokens:      tokens,
 		injectCh:    injectCh,
 		clock:       realInterviewClock{},
@@ -265,6 +268,9 @@ func (r *Runner) runInterviewLoop(ctx context.Context, cfg interviewLoopConfig) 
 	sink := cfg.sink
 	if sink == nil {
 		sink = noopSink{}
+	}
+	if cfg.spans == nil {
+		cfg.spans = noopSpanProcessor{}
 	}
 	tokens := cfg.tokens
 	if tokens == nil {
@@ -405,23 +411,25 @@ func (r *Runner) consumeInterviewTurn(
 				emitFrame("", true)
 				return sentinelContains(sentinelBuf.String())
 			}
-			r.appendInterviewJSONL(cfg.worktree, ev)
-			sink.Send(ctx, ev)
+			for _, correlatedEvent := range cfg.spans.Process(ev) {
+				r.appendInterviewJSONL(cfg.worktree, correlatedEvent)
+				sink.Send(ctx, correlatedEvent)
 
-			if at, isText := ev.(agent.AssistantTextEvent); isText && at.Text != "" {
-				sentinelBuf.WriteString(at.Text)
-				// Forward the assistant text as a (non-terminal) token-delta
-				// frame. The tokendelta poster batches these per the
-				// 100ms-or-20-frames contract — the runner does not batch
-				// here; one AssistantTextEvent maps to one frame.
-				emitFrame(at.Text, false)
-			}
+				if at, isText := correlatedEvent.(agent.AssistantTextEvent); isText && at.Text != "" {
+					sentinelBuf.WriteString(at.Text)
+					// Forward the assistant text as a (non-terminal) token-delta
+					// frame. The tokendelta poster batches these per the
+					// 100ms-or-20-frames contract — the runner does not batch
+					// here; one AssistantTextEvent maps to one frame.
+					emitFrame(at.Text, false)
+				}
 
-			if _, terminal := ev.(agent.ResultEvent); terminal {
-				// Turn complete. Emit the terminal frame so the browser
-				// closes the message stream for this turn.
-				emitFrame("", true)
-				return sentinelContains(sentinelBuf.String())
+				if _, terminal := correlatedEvent.(agent.ResultEvent); terminal {
+					// Turn complete. Emit the terminal frame so the browser
+					// closes the message stream for this turn.
+					emitFrame("", true)
+					return sentinelContains(sentinelBuf.String())
+				}
 			}
 		}
 	}

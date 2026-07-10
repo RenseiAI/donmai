@@ -12,7 +12,8 @@ foundation block of the v0.5.0 multi-provider agent-runner subsystem.
 | `types.go` | Enums, struct types: `ProviderName`, `Capability`, `Capabilities`, `SandboxLevel`, `EffortLevel`, `MCPServerConfig`, `PermissionConfig`, `CodeIntelEnforcement`, `Spec`, `CostData`, `Result`, `BackstopReport`, `QualityReport`, plus the `IsSupported` capability gate |
 | `provider.go` | `Provider` interface (5 methods: `Name`, `Capabilities`, `Spawn`, `Resume`, `Shutdown`) |
 | `handle.go` | `Handle` interface (4 methods: `SessionID`, `Events`, `Inject`, `Stop`) |
-| `event.go` | `Event` sealed-interface + 8 variant structs + `MarshalEvent` / `UnmarshalEvent` polymorphic JSON helpers |
+| `event.go` | `Event` sealed-interface + 9 variant structs (including per-call `LlmCallEvent`) + `MarshalEvent` / `UnmarshalEvent` polymorphic JSON helpers |
+| `span.go` | Six-kind additive observability `Span` union + validated JSON codec; `testdata/llm_call_span.golden.json` pins the cross-language wire fixture |
 | `errors.go` | Sentinel errors: `ErrUnsupported`, `ErrNoProvider`, `ErrSessionNotFound`, `ErrSpawnFailed`, `ErrProviderUnavailable` |
 
 ## What does NOT live here
@@ -84,10 +85,10 @@ CLI either. Both flip to `true` in F.5 if/when a wrapper sidecar lands.
 The `Event` interface is sealed: it requires both `Kind() EventKind`
 and an unexported `isAgentEvent()` marker. External packages cannot
 satisfy the interface, which keeps the discriminated union closed to
-the 8 variants defined in `event.go`:
+the 9 variants defined in `event.go`:
 
 ```
-InitEvent → SystemEvent* → (AssistantTextEvent | ToolUseEvent | ToolResultEvent | ToolProgressEvent)* → (ResultEvent | ErrorEvent)
+InitEvent → SystemEvent* → (AssistantTextEvent | LlmCallEvent | ToolUseEvent | ToolResultEvent | ToolProgressEvent)* → (ResultEvent | ErrorEvent)
 ```
 
 To decode an `Event` polymorphically from JSON (e.g. the events.jsonl

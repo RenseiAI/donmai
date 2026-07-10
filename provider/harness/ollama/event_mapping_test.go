@@ -32,12 +32,19 @@ func TestMapLine_terminalChunk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mapLine: %v", err)
 	}
-	if len(evs) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(evs))
+	if len(evs) != 2 {
+		t.Fatalf("expected LlmCallEvent + ResultEvent, got %d", len(evs))
 	}
-	res, ok := evs[0].(agent.ResultEvent)
+	llm, ok := evs[0].(agent.LlmCallEvent)
 	if !ok {
-		t.Fatalf("expected ResultEvent, got %T", evs[0])
+		t.Fatalf("expected LlmCallEvent, got %T", evs[0])
+	}
+	if llm.System != "ollama" || llm.Model != "llama3.3" || llm.InputTokens != 12 || llm.OutputTokens != 34 || llm.UsageSource != agent.LlmUsageProvider {
+		t.Fatalf("unexpected LlmCallEvent: %+v", llm)
+	}
+	res, ok := evs[1].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("expected ResultEvent, got %T", evs[1])
 	}
 	if !res.Success {
 		t.Errorf("success: got false want true")
@@ -63,7 +70,7 @@ func TestMapLine_terminalChunk_lengthIsFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mapLine: %v", err)
 	}
-	res := evs[0].(agent.ResultEvent)
+	res := evs[1].(agent.ResultEvent)
 	if res.Success {
 		t.Errorf("success: got true want false (done_reason=length)")
 	}
