@@ -489,17 +489,19 @@ func (d *Daemon) Start(ctx context.Context) error {
 			regCaps = []string{"local", "sandbox", "workarea"}
 		}
 		regOpts = RegistrationOptions{
-			OrchestratorURL:   cfg.Orchestrator.URL,
-			RegistrationToken: token,
-			MachineID:         cfg.Machine.ID,
-			Hostname:          cfg.Machine.ID,
-			Version:           d.EffectiveVersion(),
-			MaxAgents:         cfg.Capacity.MaxConcurrentSessions,
-			Capabilities:      regCaps,
-			Region:            cfg.Machine.Region,
-			JWTPath:           d.opts.JWTPath,
-			Provides:          provides,
-			DaemonProjects:    AllowlistEntriesFromConfig(cfg.Projects),
+			OrchestratorURL:         cfg.Orchestrator.URL,
+			RegistrationToken:       token,
+			MachineID:               cfg.Machine.ID,
+			Hostname:                cfg.Machine.ID,
+			Version:                 d.EffectiveVersion(),
+			MaxAgents:               cfg.Capacity.MaxConcurrentSessions,
+			Capabilities:            regCaps,
+			Region:                  cfg.Machine.Region,
+			JWTPath:                 d.opts.JWTPath,
+			Provides:                provides,
+			DaemonProjects:          AllowlistEntriesFromConfig(cfg.EffectiveProjectConfigs()),
+			ProjectIDs:              cfg.EffectiveEnabledProjectIDs(),
+			ProjectAdmissionVersion: ProjectAdmissionVersionV2,
 			// Item 8 (fleet host-info): gather best-effort machine telemetry
 			// once at startup and thread it onto RegisterRequest.HostInfo so
 			// the platform populates the worker_hosts host-info columns. All
@@ -521,7 +523,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// Spawner — built before heartbeat/poll so the poll loop has a target for
 	// AcceptWork dispatch on its very first tick.
 	spawnerOpts := d.opts.SpawnerOptions
-	spawnerOpts.Projects = cfg.Projects
+	spawnerOpts.Projects = cfg.EffectiveProjectConfigs()
+	spawnerOpts.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
 	spawnerOpts.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
 	if spawnerOpts.BaseEnv == nil {
 		spawnerOpts.BaseEnv = map[string]string{}
@@ -783,19 +786,24 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	// Cheap equality check on the structured allowlist projection — same
 	// shape the heartbeat reports, so this exactly matches "what the
 	// platform would see change".
-	before := AllowlistEntriesFromConfig(d.config.Projects)
-	after := AllowlistEntriesFromConfig(cfg.Projects)
-	if allowlistHash(before) == allowlistHash(after) {
+	before := AllowlistEntriesFromConfig(d.config.EffectiveProjectConfigs())
+	after := AllowlistEntriesFromConfig(cfg.EffectiveProjectConfigs())
+	beforeIDs := strings.Join(d.config.EffectiveEnabledProjectIDs(), "\x00")
+	afterIDs := strings.Join(cfg.EffectiveEnabledProjectIDs(), "\x00")
+	if allowlistHash(before) == allowlistHash(after) && beforeIDs == afterIDs {
 		d.mu.Unlock()
 		return
 	}
+	d.config.ProjectAdmissionVersion = cfg.ProjectAdmissionVersion
+	d.config.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
+	d.config.Repositories = cfg.Repositories
 	d.config.Projects = cfg.Projects
 	d.mu.Unlock()
 
 	slog.Info("[yaml-watcher] reloaded projects",
 		"beforeCount", len(before), "afterCount", len(after))
 	if d.spawner != nil {
-		d.spawner.SetProjects(cfg.Projects)
+		d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
 	}
 }
 

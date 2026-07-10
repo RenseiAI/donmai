@@ -57,6 +57,19 @@ func readYamlProjects(t *testing.T, path string) []ProjectConfig {
 	return parsed.Projects
 }
 
+func readYamlConfig(t *testing.T, path string) Config {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read yaml: %v", err)
+	}
+	var parsed Config
+	if err := yaml.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("unmarshal yaml: %v", err)
+	}
+	return parsed
+}
+
 func mustParams(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	out, err := json.Marshal(v)
@@ -154,6 +167,98 @@ func TestApplyPendingMutations_ProjectRemove_NotPresent(t *testing.T) {
 	}
 	if len(failures) != 0 {
 		t.Fatalf("failures = %v, want none", failures)
+	}
+}
+
+func TestApplyPendingMutations_ProjectEnableDisable(t *testing.T) {
+	t.Parallel()
+	d, path := newTestDaemonWithProjects(t, []ProjectConfig{
+		{ID: "alpha", Repository: "example.com/acme/one"},
+		{ID: "alpha", Repository: "example.com/acme/two"},
+	})
+	d.config.EnabledProjectIDs = []string{}
+
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+		{ID: "enable", Op: "project.enable", Params: mustParams(t, map[string]string{"id": "alpha"})},
+		{ID: "disable", Op: "project.disable", Params: mustParams(t, map[string]string{"id": "alpha"})},
+	})
+	if len(applied) != 2 || len(failures) != 0 {
+		t.Fatalf("applied/failures = %v/%v, want two successes", applied, failures)
+	}
+	got := readYamlConfig(t, path)
+	if got.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {
+		t.Errorf("ProjectAdmissionVersion = %d, want 2", got.ProjectAdmissionVersion)
+	}
+	if len(got.EnabledProjectIDs) != 0 {
+		t.Errorf("EnabledProjectIDs = %v, want empty", got.EnabledProjectIDs)
+	}
+	if len(got.Repositories) != 2 {
+		t.Errorf("Repositories = %+v, disable must retain repository resources", got.Repositories)
+	}
+	if len(got.Projects) != 0 {
+		t.Errorf("Projects = %+v, disabled projects must be omitted from the legacy projection", got.Projects)
+	}
+}
+
+func TestApplyPendingMutations_FirstV2MutationBacksUpLegacyConfigOnce(t *testing.T) {
+	t.Parallel()
+	d, path := newTestDaemonWithProjects(t, []ProjectConfig{{ID: "alpha", Repository: "example.com/acme/alpha"}})
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read original config: %v", err)
+	}
+
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+		{ID: "disable", Op: "project.disable", Params: mustParams(t, map[string]string{"id": "alpha"})},
+		{ID: "enable", Op: "project.enable", Params: mustParams(t, map[string]string{"id": "alpha"})},
+	})
+	if len(applied) != 2 || len(failures) != 0 {
+		t.Fatalf("applied/failures = %v/%v, want two successes", applied, failures)
+	}
+	backups, err := filepath.Glob(path + ".v1-backup-*")
+	if err != nil {
+		t.Fatalf("glob backups: %v", err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("backups = %v, want exactly one", backups)
+	}
+	backup, err := os.ReadFile(backups[0])
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(backup) != string(original) {
+		t.Fatalf("backup differs from original legacy config\nbackup:\n%s\noriginal:\n%s", backup, original)
+	}
+	info, err := os.Stat(backups[0])
+	if err != nil {
+		t.Fatalf("stat backup: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("backup mode = %o, want 600", got)
+	}
+}
+
+func TestApplyPendingMutations_LegacyProjectAddSupportsMultipleRepositories(t *testing.T) {
+	t.Parallel()
+	d, path := newTestDaemonWithProjects(t, []ProjectConfig{{ID: "alpha", Repository: "example.com/acme/one"}})
+
+	applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{{
+		ID:     "add-second",
+		Op:     "project.add",
+		Params: mustParams(t, map[string]string{"id": "alpha", "repository": "example.com/acme/two"}),
+	}})
+	if len(applied) != 1 || len(failures) != 0 {
+		t.Fatalf("applied/failures = %v/%v", applied, failures)
+	}
+	got := readYamlConfig(t, path)
+	if len(got.Projects) != 2 {
+		t.Fatalf("Projects = %+v, want two repository resources", got.Projects)
+	}
+	if len(got.Repositories) != 2 {
+		t.Fatalf("Repositories = %+v, want two normalized repository resources", got.Repositories)
+	}
+	if len(got.EnabledProjectIDs) != 1 || got.EnabledProjectIDs[0] != "alpha" {
+		t.Fatalf("EnabledProjectIDs = %v, want [alpha]", got.EnabledProjectIDs)
 	}
 }
 

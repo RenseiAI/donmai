@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -709,6 +710,46 @@ func TestRegisterRequest_ProjectIDsRoundTrip(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRegister_PopulatesProjectIDsIndependentlyOfRepositories(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+	var got RegisterRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(RegisterResponse{
+			WorkerID:          "worker-1",
+			RuntimeToken:      "runtime-token",
+			HeartbeatInterval: 30000,
+			PollInterval:      5000,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL:         srv.URL,
+		RegistrationToken:       "rsp_live_test",
+		Hostname:                "host",
+		MaxAgents:               2,
+		JWTPath:                 filepath.Join(t.TempDir(), "daemon.jwt"),
+		ProjectIDs:              []string{"project-b", "project-a", "project-b"},
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		DaemonProjects:          nil,
+	})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if want := []string{"project-a", "project-b"}; !reflect.DeepEqual(got.ProjectIDs, want) {
+		t.Fatalf("ProjectIDs = %v, want %v", got.ProjectIDs, want)
+	}
+	if got.DaemonProjects != nil {
+		t.Fatalf("DaemonProjects = %v, want nil", got.DaemonProjects)
+	}
+	if got.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {
+		t.Fatalf("ProjectAdmissionVersion = %d, want 2", got.ProjectAdmissionVersion)
 	}
 }
 

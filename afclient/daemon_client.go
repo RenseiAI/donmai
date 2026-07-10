@@ -47,6 +47,9 @@ func (c DaemonConfig) BaseURL() string {
 
 // DaemonStatusResponse is the response from GET /api/daemon/status.
 type DaemonStatusResponse struct {
+	// ProjectAdmissionVersion is 2 when project IDs are explicit and an empty
+	// set means serve no projects.
+	ProjectAdmissionVersion int `json:"projectAdmissionVersion,omitempty"`
 	// Status is the lifecycle state of the daemon.
 	Status DaemonStatus `json:"status"`
 	// Version is the rensei-daemon binary version.
@@ -63,12 +66,30 @@ type DaemonStatusResponse struct {
 	MaxSessions int `json:"maxSessions"`
 	// ProjectsAllowed is the number of projects in the allowlist.
 	ProjectsAllowed int `json:"projectsAllowed"`
+	// EnabledProjectIDs is the desired project-admission set from config.
+	EnabledProjectIDs []string `json:"enabledProjectIds,omitempty"`
+	// AppliedProjectIDs is the project set currently applied by the runtime.
+	AppliedProjectIDs []string `json:"appliedProjectIds,omitempty"`
+	// Projects carries desired/applied/connection/repository state per project.
+	Projects []DaemonProjectStatus `json:"projects,omitempty"`
 	// Timestamp is the RFC3339 time of this snapshot.
 	Timestamp string `json:"timestamp"`
 }
 
+// DaemonProjectStatus is one truthful host-project status row.
+type DaemonProjectStatus struct {
+	ProjectID           string   `json:"projectId"`
+	Desired             string   `json:"desired"`
+	Applied             string   `json:"applied"`
+	Connection          string   `json:"connection"`
+	RepositoryCount     int      `json:"repositoryCount"`
+	PrimaryRepositoryID string   `json:"primaryRepositoryId,omitempty"`
+	Warnings            []string `json:"warnings,omitempty"`
+}
+
 // DaemonStatsResponse is the response from GET /api/daemon/stats.
 type DaemonStatsResponse struct {
+	ProjectAdmissionVersion int `json:"projectAdmissionVersion,omitempty"`
 	// Capacity is the machine capacity envelope.
 	Capacity MachineCapacity `json:"capacity"`
 	// ActiveSessions is the count of currently running sessions.
@@ -92,6 +113,10 @@ type DaemonStatsResponse struct {
 	// (from daemon.yaml). May be empty when no projects have been
 	// configured.
 	AllowedProjects []string `json:"allowedProjects,omitempty"`
+	// EnabledProjectIDs is the desired project-admission set from config.
+	EnabledProjectIDs []string `json:"enabledProjectIds,omitempty"`
+	// AppliedProjectIDs is the project set currently applied by the runtime.
+	AppliedProjectIDs []string `json:"appliedProjectIds,omitempty"`
 }
 
 // DaemonRegistrationStats summarises the daemon's connection to the platform
