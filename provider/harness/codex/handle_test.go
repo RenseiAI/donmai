@@ -169,11 +169,12 @@ func TestHandle_SpawnEventsTerminalResult(t *testing.T) {
 	got := drainEvents(t, h.Events(), 5*time.Second)
 
 	// Expect the canned sequence: init, system (turn_started),
-	// assistant_text, result.
+	// assistant_text, per-call usage, result.
 	wantKinds := []agent.EventKind{
 		agent.EventInit,
 		agent.EventSystem,
 		agent.EventAssistantText,
+		agent.EventLlmCall,
 		agent.EventResult,
 	}
 	if len(got) != len(wantKinds) {

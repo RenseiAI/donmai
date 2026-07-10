@@ -83,9 +83,9 @@ type SpanStatus struct {
 	Message string `json:"message,omitempty"`
 }
 
-// GenAIAttributes is the OpenTelemetry GenAI semantic-convention
-// attribute group carried by llm spans. The camelCase JSON wire keys map
-// to OTLP attribute names at serialization to an OTLP backend:
+// GenAIAttributes is the accepted June-28 compatibility group carried by LLM
+// spans. The camelCase JSON keys remain frozen for existing consumers. They
+// originated from the then-current OpenTelemetry GenAI convention:
 //
 //	system                    → gen_ai.system
 //	requestModel              → gen_ai.request.model
@@ -94,10 +94,15 @@ type SpanStatus struct {
 //	usageCacheReadInputTokens → gen_ai.usage.cache_read_input_tokens
 //	responseFinishReason      → gen_ai.response.finish_reason
 //
-// The WS2 poster populates these from the harness CostData; WS1 does not
-// wire that mapping.
+// Current OpenTelemetry conventions have since renamed several attributes:
+// system is now gen_ai.provider.name, operation name is separately required,
+// cache-read usage is gen_ai.usage.cache_read.input_tokens, and finish reasons
+// are plural. Emitters preserve this wire type; OTLP exporters/ingesters must
+// translate it rather than silently changing the golden contract. See
+// runtime/span/README.md for the pinned delta and primary-source links.
 type GenAIAttributes struct {
-	// System is the GenAI system identifier (e.g. "anthropic").
+	// System is the compatibility provider/system identifier (e.g.
+	// "anthropic"). Current OTLP mapping targets gen_ai.provider.name.
 	System string `json:"system"`
 	// RequestModel is the requested model id (e.g. "claude-opus-4").
 	RequestModel string `json:"requestModel"`
@@ -105,10 +110,12 @@ type GenAIAttributes struct {
 	UsageInputTokens int64 `json:"usageInputTokens"`
 	// UsageOutputTokens is the completion/output token count.
 	UsageOutputTokens int64 `json:"usageOutputTokens"`
-	// UsageCacheReadInputTokens is the cache-read input token count.
+	// UsageCacheReadInputTokens is the cache-read input token count. Current
+	// OTLP mapping targets gen_ai.usage.cache_read.input_tokens.
 	UsageCacheReadInputTokens int64 `json:"usageCacheReadInputTokens,omitempty"`
-	// ResponseFinishReason is the provider finish reason (e.g.
-	// "end_turn", "max_tokens").
+	// ResponseFinishReason is the provider finish reason (e.g. "end_turn",
+	// "max_tokens"). Current OTLP mapping wraps it as the singular element of
+	// gen_ai.response.finish_reasons.
 	ResponseFinishReason string `json:"responseFinishReason,omitempty"`
 }
 

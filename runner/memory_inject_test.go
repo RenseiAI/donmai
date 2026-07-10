@@ -49,7 +49,7 @@ func TestDrainMemoryInjects_DeliversBufferedBlock(t *testing.T) {
 	res := &Result{SessionID: qw.SessionID}
 	enforcer := NewBudgetEnforcer(nil, time.Now())
 
-	r.drainMemoryInjects(ctx, handle, wpath, qw, res, enforcer, rec, injectCh)
+	r.drainMemoryInjects(ctx, handle, wpath, qw, res, enforcer, rec, nil, injectCh)
 
 	// The resume turn must have produced an AssistantTextEvent echoing the
 	// injected block (the stub prefixes it with "injected: ").
@@ -81,7 +81,7 @@ func TestDrainMemoryInjects_EmptyChannelNoop(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	got := r.drainMemoryInjects(ctx, handle, t.TempDir(), qw, res, enforcer, rec, injectCh)
+	got := r.drainMemoryInjects(ctx, handle, t.TempDir(), qw, res, enforcer, rec, nil, injectCh)
 
 	if got.terminalEvent != nil || got.pullRequestURL != "" {
 		t.Fatalf("expected zero observation on empty drain, got %+v", got)
@@ -113,7 +113,7 @@ func TestDrainMemoryInjects_SkipsEmptyText(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r.drainMemoryInjects(ctx, handle, t.TempDir(), qw, res, enforcer, rec, injectCh)
+	r.drainMemoryInjects(ctx, handle, t.TempDir(), qw, res, enforcer, rec, nil, injectCh)
 
 	if got := handle.injectCount(); got != 0 {
 		t.Fatalf("empty-text block must not be delivered; Inject called %d times", got)

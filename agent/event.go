@@ -19,6 +19,7 @@ const (
 	EventInit          EventKind = "init"
 	EventSystem        EventKind = "system"
 	EventAssistantText EventKind = "assistant_text"
+	EventLlmCall       EventKind = "llm_call"
 	EventToolUse       EventKind = "tool_use"
 	EventToolResult    EventKind = "tool_result"
 	EventToolProgress  EventKind = "tool_progress"
@@ -29,8 +30,8 @@ const (
 // Event is the sealed-interface base type for all agent event variants.
 //
 // Implementations: InitEvent, SystemEvent, AssistantTextEvent,
-// ToolUseEvent, ToolResultEvent, ToolProgressEvent, ResultEvent,
-// ErrorEvent. The unexported isAgentEvent marker prevents external
+// LlmCallEvent, ToolUseEvent, ToolResultEvent, ToolProgressEvent,
+// ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
 // packages from satisfying the interface, keeping the discriminated
 // union closed.
 //
@@ -90,9 +91,74 @@ type AssistantTextEvent struct {
 func (AssistantTextEvent) Kind() EventKind { return EventAssistantText }
 func (AssistantTextEvent) isAgentEvent()   {}
 
+// LlmUsageSource records whether an LlmCallEvent carries usage reported for
+// that exact provider call or a session/turn aggregate copied without
+// apportionment. Consumers must never interpret aggregate usage as a measured
+// per-call value.
+type LlmUsageSource string
+
+const (
+	// LlmUsageProvider means the provider reported usage for this exact call.
+	LlmUsageProvider LlmUsageSource = "provider"
+	// LlmUsageAggregate means the provider exposed only a rolled-up total. The
+	// event is necessarily synthetic and preserves that total without dividing
+	// or otherwise inventing per-call usage.
+	LlmUsageAggregate LlmUsageSource = "aggregate"
+)
+
+// LlmCallEvent captures one completed request/response exchange with a model.
+// Provider adapters emit it when their native stream exposes per-call usage;
+// the runtime span processor may synthesize one at a terminal ResultEvent when
+// only aggregate usage is available. Prompt and completion bodies are never
+// carried on this event: optional prompt/context correlation is digest-only.
+type LlmCallEvent struct {
+	// TraceID, SpanID, and ParentSpanID are populated by the runner's session
+	// correlator. Provider adapters may leave them empty.
+	TraceID      string `json:"traceId,omitempty"`
+	SpanID       string `json:"spanId,omitempty"`
+	ParentSpanID string `json:"parentSpanId,omitempty"`
+
+	// System is the accepted GenAI provider/system identifier (for example,
+	// "anthropic" or "openai"). Model is the requested model identifier.
+	System string `json:"system,omitempty"`
+	Model  string `json:"model,omitempty"`
+
+	InputTokens       int64  `json:"inputTokens,omitempty"`
+	OutputTokens      int64  `json:"outputTokens,omitempty"`
+	CachedInputTokens int64  `json:"cachedInputTokens,omitempty"`
+	FinishReason      string `json:"finishReason,omitempty"`
+
+	// StartTimeUnixNano and EndTimeUnixNano use decimal strings so JSON
+	// consumers do not lose fixed64 precision. Empty values are stamped by the
+	// runner at the nearest observable call boundary.
+	StartTimeUnixNano string `json:"startTimeUnixNano,omitempty"`
+	EndTimeUnixNano   string `json:"endTimeUnixNano,omitempty"`
+
+	// UsageSource is explicit even when token counts are zero. Synthetic is
+	// true only for aggregate fallback events; such events never fabricate
+	// prompt/completion bodies or split aggregate counts across calls.
+	UsageSource LlmUsageSource `json:"usageSource"`
+	Synthetic   bool           `json:"synthetic,omitempty"`
+
+	PromptHash      string `json:"promptHash,omitempty"`
+	ContextHash     string `json:"contextHash,omitempty"`
+	ModelSnapshotID string `json:"modelSnapshotId,omitempty"`
+}
+
+// Kind reports the EventKind discriminant.
+func (LlmCallEvent) Kind() EventKind { return EventLlmCall }
+func (LlmCallEvent) isAgentEvent()   {}
+
 // ToolUseEvent fires when the agent invokes a tool. Verbatim port of
 // AgentToolUseEvent.
 type ToolUseEvent struct {
+	// TraceID, SpanID, and ParentSpanID are populated by the runner's session
+	// correlator. SpanID is stable through the matching ToolResultEvent and
+	// ParentSpanID identifies the enclosing LLM call.
+	TraceID      string `json:"traceId,omitempty"`
+	SpanID       string `json:"spanId,omitempty"`
+	ParentSpanID string `json:"parentSpanId,omitempty"`
+
 	// ToolName is the tool identifier (e.g. "Bash", "Edit",
 	// "mcp__af_linear__af_linear_get_issue").
 	ToolName string `json:"toolName"`
@@ -120,6 +186,11 @@ func (ToolUseEvent) isAgentEvent()   {}
 // ToolResultEvent carries a tool-execution result (success or error).
 // Verbatim port of AgentToolResultEvent.
 type ToolResultEvent struct {
+	// TraceID, SpanID, and ParentSpanID mirror the matching ToolUseEvent.
+	TraceID      string `json:"traceId,omitempty"`
+	SpanID       string `json:"spanId,omitempty"`
+	ParentSpanID string `json:"parentSpanId,omitempty"`
+
 	// ToolName is the tool identifier; may be empty when the provider
 	// only reports the tool-use id.
 	ToolName string `json:"toolName,omitempty"`
@@ -268,6 +339,12 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		var ev AssistantTextEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, fmt.Errorf("agent: decode AssistantTextEvent: %w", err)
+		}
+		return ev, nil
+	case EventLlmCall:
+		var ev LlmCallEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("agent: decode LlmCallEvent: %w", err)
 		}
 		return ev, nil
 	case EventToolUse:

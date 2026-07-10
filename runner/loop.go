@@ -18,6 +18,7 @@ import (
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/activity"
 	"github.com/RenseiAI/donmai/runtime/heartbeat"
+	spanruntime "github.com/RenseiAI/donmai/runtime/span"
 	"github.com/RenseiAI/donmai/runtime/state"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 	"github.com/RenseiAI/donmai/runtime/stepheartbeat"
@@ -646,7 +647,58 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		defer func() { _ = actPoster.Stop() }()
 	}
 
-	// 9c. Start the step-heartbeat emitter (mirrors the heartbeat pulser +
+	// 9c. Start the additive per-call span pipeline when explicitly enabled by
+	// the binary/operator or when the dispatch advertises a compatible ingest
+	// route. The capability gate is the mixed-version seam: an older server
+	// receives no unknown requests, while DONMAI_OTEL_TRACES can opt an OSS
+	// embedder into a configured endpoint. Both poster and processor are
+	// best-effort; construction failure leaves the activity stream untouched.
+	var traceProcessor spanEventProcessor = noopSpanProcessor{}
+	if r.spanEmissionEnabled || qw.hasCapability(CapabilitySpanIngest) {
+		var spanCredentialProvider spanruntime.CredentialProvider
+		if r.credentialProvider != nil {
+			spanCredentialProvider = func(ctx context.Context) (spanruntime.RuntimeCredentials, error) {
+				creds, credErr := r.credentialProvider(ctx)
+				return spanruntime.RuntimeCredentials{AuthToken: creds.AuthToken}, credErr
+			}
+		}
+		spanPoster, spanErr := spanruntime.NewPoster(spanruntime.PosterConfig{
+			BaseURL:            qw.PlatformURL,
+			EndpointPath:       r.spanEndpointPath,
+			AuthToken:          qw.AuthToken,
+			CredentialProvider: spanCredentialProvider,
+			HTTPClient:         r.httpClient,
+			Logger:             r.logger,
+		})
+		if spanErr != nil {
+			r.logger.Warn("span poster construct failed; per-call tracing disabled", "err", spanErr)
+		} else if startErr := spanPoster.Start(ctx); startErr != nil {
+			r.logger.Warn("span poster start failed; per-call tracing disabled", "err", startErr)
+		} else {
+			processor, processorErr := spanruntime.NewProcessor(spanruntime.ProcessorConfig{
+				SessionID:   qw.SessionID,
+				OrgID:       qw.OrganizationID,
+				WorkspaceID: qw.OrganizationID,
+				WorkType:    qw.WorkType,
+				System:      spanruntime.ProviderSystem(qw.resolvedProvider()),
+				Model:       qw.ResolvedProfile.Model,
+				Sender:      spanPoster,
+				Now:         r.now,
+			})
+			if processorErr != nil {
+				r.logger.Warn("span processor construct failed; per-call tracing disabled", "err", processorErr)
+				_ = spanPoster.Stop()
+			} else {
+				traceProcessor = processor
+				defer func() {
+					processor.Finish(res.Status, res.Error)
+					_ = spanPoster.Stop()
+				}()
+			}
+		}
+	}
+
+	// 9d. Start the step-heartbeat emitter (mirrors the heartbeat pulser +
 	// activity poster per-session lifecycle). Every 15s it POSTs a
 	// decoupled step-liveness beat to /api/sessions/<id>/step-heartbeat so
 	// the platform can stamp agent_sessions.last_step_heartbeat +
@@ -700,7 +752,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// and drives no Linear state transition (the SDLC handoff happens via
 	// the platform's /complete CloudEvent gate, not here).
 	if qw.isInterview() {
-		return r.dispatchInterview(ctx, handle, wpath, qw, res, sink, injectCh)
+		return r.dispatchInterview(ctx, handle, wpath, qw, res, sink, traceProcessor, injectCh)
 	}
 
 	// 10. Stream events; wait for terminal.
@@ -727,7 +779,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		}()
 	}
 
-	streamRes, streamErr := r.consumeEvents(streamCtx, handle, wpath, qw, res, enforcer, sink)
+	streamRes, streamErr := r.consumeEvents(streamCtx, handle, wpath, qw, res, enforcer, sink, traceProcessor)
 
 	// Disambiguate between ctx-cancelled and lost-ownership before
 	// classifying the failure mode.
@@ -863,7 +915,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// steering so a memory-driven follow-up turn can itself produce the PR
 	// that makes steering unnecessary.
 	if runtimeInjectEnabled && !streamRes.blocked {
-		injRes := r.drainMemoryInjects(ctx, handle, wpath, qw, res, enforcer, sink, injectCh)
+		injRes := r.drainMemoryInjects(ctx, handle, wpath, qw, res, enforcer, sink, traceProcessor, injectCh)
 		injRes.applyTo(res, provider.Name())
 	}
 
@@ -886,7 +938,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 			r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
 		} else {
 			// Re-consume any events the steering inject produced.
-			tailRes, _ := r.consumeEvents(ctx, handle, wpath, qw, res, enforcer, sink)
+			tailRes, _ := r.consumeEvents(ctx, handle, wpath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
 		}
 	}
@@ -1026,6 +1078,7 @@ func (r *Runner) drainMemoryInjects(
 	res *Result,
 	enforcer *BudgetEnforcer,
 	sink activitySink,
+	traceProcessor spanEventProcessor,
 	injectCh <-chan heartbeat.InjectPayload,
 ) streamObservation {
 	var merged streamObservation
@@ -1057,7 +1110,7 @@ func (r *Runner) drainMemoryInjects(
 			}
 			// Re-consume the resume turn's events so the follow-up work
 			// (commit/PR/cost) is observed + mirrored.
-			injRes, _ := r.consumeEvents(ctx, handle, worktreePath, qw, res, enforcer, sink)
+			injRes, _ := r.consumeEvents(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
 			injRes.applyTo(res, qw.resolvedProvider())
 			merged = injRes
 		default:
@@ -1174,9 +1227,13 @@ func (r *Runner) consumeEvents(
 	_ *Result,
 	enforcer *BudgetEnforcer,
 	sink activitySink,
+	traceProcessor spanEventProcessor,
 ) (streamObservation, error) {
 	if sink == nil {
 		sink = noopSink{}
+	}
+	if traceProcessor == nil {
+		traceProcessor = noopSpanProcessor{}
 	}
 	obs := streamObservation{}
 
@@ -1260,25 +1317,22 @@ func (r *Runner) consumeEvents(
 			}
 			// Forward progress observed — re-arm the watchdog.
 			resetIdle()
-			appendJSONL(ev)
-			r.observeEvent(ev, &obs, worktreePath, qw)
-			// Push the event to the platform's activity buffer (best-
-			// effort, non-blocking — the sink drops on overflow / HTTP
-			// failure rather than stalling the runner). Lives next to
-			// observeEvent so steering's tail consume picks it up too.
-			sink.Send(watchCtx, ev)
-			// Budget enforcement:
-			// every event flows through the enforcer; on a cap breach
-			// we surface the *BudgetExceededError so runLoop can
-			// classify the failure as FailureBudgetExceeded.
-			if enforcer != nil {
-				if berr := enforcer.ObserveEvent(ev); berr != nil {
-					obs.budgetBreach = berr
-					return obs, berr
+			for _, correlatedEvent := range traceProcessor.Process(ev) {
+				appendJSONL(correlatedEvent)
+				r.observeEvent(correlatedEvent, &obs, worktreePath, qw)
+				// Push every correlated/synthetic event to the platform's
+				// activity buffer. LlmCallEvent intentionally maps to no legacy
+				// activity, while tool events retain their stamped IDs.
+				sink.Send(watchCtx, correlatedEvent)
+				if enforcer != nil {
+					if berr := enforcer.ObserveEvent(correlatedEvent); berr != nil {
+						obs.budgetBreach = berr
+						return obs, berr
+					}
 				}
-			}
-			if _, terminal := ev.(agent.ResultEvent); terminal {
-				return obs, nil
+				if _, terminal := correlatedEvent.(agent.ResultEvent); terminal {
+					return obs, nil
+				}
 			}
 		}
 	}

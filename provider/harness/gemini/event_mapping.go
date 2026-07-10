@@ -105,6 +105,12 @@ func mapResponse(body []byte, state *turnState) decodedTurn {
 	var resp generateContentResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return decodedTurn{
+			events: []agent.Event{agent.LlmCallEvent{
+				System:       "gcp.gemini",
+				Model:        state.model,
+				FinishReason: "decode_error",
+				UsageSource:  agent.LlmUsageProvider,
+			}},
 			outcome: outcomeError,
 			result: agent.ErrorEvent{
 				Message: fmt.Sprintf("provider/gemini: decode response: %v", err),
@@ -117,6 +123,12 @@ func mapResponse(body []byte, state *turnState) decodedTurn {
 	// Blocked prompts are terminal failures.
 	if resp.PromptFeedback != nil && resp.PromptFeedback.BlockReason != "" {
 		return decodedTurn{
+			events: []agent.Event{agent.LlmCallEvent{
+				System:       "gcp.gemini",
+				Model:        state.model,
+				FinishReason: "prompt_blocked_" + resp.PromptFeedback.BlockReason,
+				UsageSource:  agent.LlmUsageProvider,
+			}},
 			outcome: outcomeError,
 			result: agent.ErrorEvent{
 				Message: "gemini: prompt blocked: " + resp.PromptFeedback.BlockReason,
@@ -160,6 +172,22 @@ func mapResponse(body []byte, state *turnState) decodedTurn {
 			}
 		}
 	}
+	var inputTokens, outputTokens, cachedTokens int64
+	if resp.UsageMetadata != nil {
+		inputTokens = int64(resp.UsageMetadata.PromptTokenCount)
+		outputTokens = int64(resp.UsageMetadata.CandidatesTokenCount)
+		cachedTokens = int64(resp.UsageMetadata.CachedContentTokenCount)
+	}
+	llm := agent.LlmCallEvent{
+		System:            "gcp.gemini",
+		Model:             state.model,
+		InputTokens:       inputTokens,
+		OutputTokens:      outputTokens,
+		CachedInputTokens: cachedTokens,
+		FinishReason:      turn.finishReason,
+		UsageSource:       agent.LlmUsageProvider,
+	}
+	turn.events = append([]agent.Event{llm}, turn.events...)
 
 	// Function calls pending → continue once the caller supplies results.
 	if len(turn.funcCalls) > 0 {

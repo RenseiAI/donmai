@@ -15,6 +15,7 @@
 | [`runtime/mcp`](./mcp/) | Per-session MCP stdio config tmpfile; cleanup tied to session lifecycle. Wire shape consistent with `provider/claude` and `provider/codex`. |
 | [`runtime/state`](./state/) | `.agent/state.json` persistence per-worktree. Atomic tmpfile + rename, per-worktree mutex, cross-issue recovery guard, malformed-recovery. |
 | [`runtime/heartbeat`](./heartbeat/) | Per-session heartbeat to platform `POST /api/sessions/<id>/lock-refresh`. 3-strike rule emits `LostOwnership` event the runner consumes. Distinct from worker-level heartbeat in `daemon/heartbeat.go`. |
+| [`runtime/span`](./span/) | Correlate per-call LLM/tool/session spans and forward metadata-only JSON batches through a bounded, non-blocking poster. |
 
 ## Layered consumption
 
