@@ -1,0 +1,114 @@
+api = "rensei.dev/v1"
+
+# ---------------------------------------------------------------------------
+# Kit identity — Ruby foundation kit.
+#
+# PATH-MUTATING INSTALLER: rbenv installs to ~/.rbenv and shims onto PATH via
+# `rbenv init`. Until demand.env is wired end-to-end (see CONTRIBUTING.md
+# § "demand.env follow-up"), the install scripts and post_acquire hook set up
+# the rbenv shims on PATH themselves.
+#
+# DETECTION NOTE: the daemon's declarative file matcher checks EXACT filenames
+# (no globbing), so `*.gemspec` cannot appear in [detect].files. We detect on
+# `Gemfile` + `.ruby-version`, which covers the vast majority of Ruby repos. A
+# gemspec-only library without a Gemfile won't auto-match until exec/glob
+# detection lands; such repos can ship a local `.kit.toml`. See CONTRIBUTING.md.
+# ---------------------------------------------------------------------------
+
+[kit]
+id = "default/ruby"
+version = "1.0.0"
+name = "Ruby"
+description = "OSS default foundation kit for Ruby projects. Detects Gemfile / .ruby-version and provides Ruby 3.3 via rbenv, build/test/lint commands, and Ruby conventions."
+author = "donmai"
+authorIdentity = "did:web:donmai.dev"
+license = "MIT"
+homepage = "https://donmai.dev"
+repository = "https://github.com/RenseiAI/donmai-kits"
+priority = 70
+
+[supports]
+os = ["linux", "macos", "windows"]
+arch = ["x86_64", "arm64"]
+
+[requires]
+rensei = "^1.0"
+capabilities = []
+
+# ---------------------------------------------------------------------------
+# Detection — Bundler project or pinned Ruby version.
+# ---------------------------------------------------------------------------
+
+[detect]
+files = ["Gemfile", ".ruby-version"]
+
+[detect.toolchain]
+ruby = "3.3"
+
+# ---------------------------------------------------------------------------
+# Contributions
+# ---------------------------------------------------------------------------
+
+[provide.commands]
+build    = "bundle exec rake build"
+test     = "bundle exec rspec"
+validate = "bundle exec rubocop"
+
+[[provide.tool_permissions]]
+shell = "ruby *"
+
+[[provide.tool_permissions]]
+shell = "bundle *"
+
+[[provide.tool_permissions]]
+shell = "rake *"
+
+[[provide.tool_permissions]]
+shell = "gem *"
+
+[[provide.tool_permissions]]
+shell = "rbenv *"
+
+[[provide.tool_permissions]]
+shell = "git *"
+
+[[provide.prompt_fragments]]
+partial = "ruby-conventions"
+when    = ["development", "qa", "refinement"]
+file    = "partials/ruby-conventions.yaml"
+
+[[provide.skills]]
+file = "skills/ruby-debugging/SKILL.md"
+id   = "ruby-debugging"
+
+[provide.workarea_config]
+clean_dirs    = ["tmp", "coverage", "pkg"]
+# Preserve the bundle + gem caches across acquisitions.
+preserve_dirs = ["~/.bundle", "vendor/bundle", "~/.gem"]
+
+# Per-OS toolchain install — Ruby 3.3 via rbenv. Cloud sandboxes are Linux →
+# .linux is load-bearing. The script sources the rbenv shims so `ruby`/`bundle`
+# resolve in the same shell.
+[provide.toolchain_install.linux]
+ruby_3_3 = "apt-get update && apt-get install -y rbenv ruby-build && export PATH=\"$HOME/.rbenv/bin:$PATH\" && eval \"$(rbenv init - bash)\" && rbenv install -s 3.3.6 && rbenv global 3.3.6 && gem install bundler"
+
+[provide.toolchain_install.macos]
+ruby_3_3 = "brew install rbenv ruby-build && eval \"$(rbenv init - bash)\" && rbenv install -s 3.3.6 && rbenv global 3.3.6 && gem install bundler"
+
+[provide.toolchain_install.windows]
+ruby_3_3 = "winget install RubyInstallerTeam.Ruby.3.3 && gem install bundler"
+
+[provide.hooks]
+post_acquire = "bin/setup.sh"
+
+[provide.hooks.os.windows]
+post_acquire = "bin\\setup.cmd"
+
+# ---------------------------------------------------------------------------
+# Composition
+# ---------------------------------------------------------------------------
+
+[composition]
+order          = "foundation"
+conflicts_with = []
+composes_with  = ["default/docker-compose", "default/postgres-dev"]

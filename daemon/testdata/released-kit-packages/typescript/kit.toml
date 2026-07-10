@@ -1,0 +1,114 @@
+api = "rensei.dev/v1"
+
+# ---------------------------------------------------------------------------
+# Kit identity — base TypeScript foundation kit.
+#
+# This is the foundation half of the TypeScript split: it covers any
+# TypeScript/Node project (tsconfig.json + package.json) WITHOUT assuming a
+# framework. The `ts-nextjs` framework kit composes ON TOP of this for Next.js
+# projects (it declares order = "framework" and detects next.config.* +
+# package.json#dependencies.next).
+# ---------------------------------------------------------------------------
+
+[kit]
+id = "default/typescript"
+version = "1.0.0"
+name = "TypeScript"
+description = "OSS default foundation kit for TypeScript / Node projects. Detects tsconfig.json + package.json and provides Node 22, build/test/typecheck commands, and TS conventions."
+author = "donmai"
+authorIdentity = "did:web:donmai.dev"
+license = "MIT"
+homepage = "https://donmai.dev"
+repository = "https://github.com/RenseiAI/donmai-kits"
+priority = 70
+
+[supports]
+os = ["linux", "macos", "windows"]
+arch = ["x86_64", "arm64"]
+
+[requires]
+rensei = "^1.0"
+capabilities = []
+
+# ---------------------------------------------------------------------------
+# Detection — any TypeScript/Node project.
+# ---------------------------------------------------------------------------
+
+[detect]
+# Match when tsconfig.json is present (Phase 1 declarative, any-exists).
+files = ["tsconfig.json"]
+# AND package.json must exist (all-exist).
+files_all = ["package.json"]
+
+# Toolchain pre-declared so the workarea/sandbox can pre-warm Node 22.
+[detect.toolchain]
+node = "22"
+
+# ---------------------------------------------------------------------------
+# Contributions
+# ---------------------------------------------------------------------------
+
+[provide.commands]
+build    = "npm run build"
+test     = "npm test"
+validate = "npm run typecheck"
+
+[provide.commands_override.windows]
+build    = "npm.cmd run build"
+test     = "npm.cmd test"
+validate = "npm.cmd run typecheck"
+
+[[provide.tool_permissions]]
+shell = "npm *"
+
+[[provide.tool_permissions]]
+shell = "node *"
+
+[[provide.tool_permissions]]
+shell = "npx *"
+
+[[provide.tool_permissions]]
+shell = "tsc *"
+
+[[provide.tool_permissions]]
+shell = "git *"
+
+[[provide.prompt_fragments]]
+partial = "typescript-conventions"
+when    = ["development", "qa", "refinement"]
+file    = "partials/typescript-conventions.yaml"
+
+[[provide.skills]]
+file = "skills/typescript-debugging/SKILL.md"
+id   = "typescript-debugging"
+
+[provide.workarea_config]
+clean_dirs    = ["dist", "build", ".tsbuildinfo", "coverage"]
+preserve_dirs = ["~/.npm", "node_modules/.cache"]
+
+# Per-OS toolchain install — used by the workarea/sandbox provider when Node 22
+# is not pre-warmed in the pool. Cloud sandboxes are Linux, so the .linux
+# script is the load-bearing one; .macos / .windows are local/dev parity.
+[provide.toolchain_install.linux]
+node_22 = "curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y nodejs"
+
+[provide.toolchain_install.macos]
+node_22 = "brew install node@22 && brew link --overwrite node@22"
+
+[provide.toolchain_install.windows]
+node_22 = "winget install OpenJS.NodeJS.LTS"
+
+[provide.hooks]
+post_acquire = "bin/setup.sh"
+
+[provide.hooks.os.windows]
+post_acquire = "bin\\setup.cmd"
+
+# ---------------------------------------------------------------------------
+# Composition — foundation: base language layer, frameworks compose on top.
+# ---------------------------------------------------------------------------
+
+[composition]
+order          = "foundation"
+conflicts_with = []
+composes_with  = ["default/ts-nextjs"]

@@ -1,0 +1,123 @@
+api = "rensei.dev/v1"
+
+# ---------------------------------------------------------------------------
+# Kit identity — Python foundation kit.
+#
+# PATH-MUTATING INSTALLER: the `uv` installer writes to ~/.local/bin. Until
+# demand.env is wired end-to-end (see CONTRIBUTING.md § "demand.env follow-up"),
+# the install scripts and post_acquire hook prepend ~/.local/bin to PATH
+# themselves so `uv` resolves. When demand.env lands, the kit will declare
+# PATH=$HOME/.local/bin once.
+# ---------------------------------------------------------------------------
+
+[kit]
+id = "default/python"
+version = "1.0.0"
+name = "Python"
+description = "OSS default foundation kit for Python projects. Detects pyproject.toml / requirements.txt / setup.py and provides Python 3.12 + uv, build/test/lint commands, and Python conventions."
+author = "donmai"
+authorIdentity = "did:web:donmai.dev"
+license = "MIT"
+homepage = "https://donmai.dev"
+repository = "https://github.com/RenseiAI/donmai-kits"
+priority = 70
+
+[supports]
+os = ["linux", "macos", "windows"]
+arch = ["x86_64", "arm64"]
+
+[requires]
+rensei = "^1.0"
+capabilities = []
+
+# ---------------------------------------------------------------------------
+# Detection — any Python project layout.
+# ---------------------------------------------------------------------------
+
+[detect]
+files = ["pyproject.toml", "requirements.txt", "setup.py"]
+
+[detect.toolchain]
+python = "3.12"
+
+# ---------------------------------------------------------------------------
+# Contributions
+# ---------------------------------------------------------------------------
+
+[provide.commands]
+build    = "python -m build"
+test     = "pytest"
+validate = "ruff check . && mypy ."
+
+[provide.commands_override.windows]
+build    = "py -m build"
+test     = "pytest"
+validate = "ruff check . && mypy ."
+
+[[provide.tool_permissions]]
+shell = "python *"
+
+[[provide.tool_permissions]]
+shell = "python3 *"
+
+[[provide.tool_permissions]]
+shell = "pip *"
+
+[[provide.tool_permissions]]
+shell = "uv *"
+
+[[provide.tool_permissions]]
+shell = "pytest *"
+
+[[provide.tool_permissions]]
+shell = "ruff *"
+
+[[provide.tool_permissions]]
+shell = "mypy *"
+
+[[provide.tool_permissions]]
+shell = "git *"
+
+[[provide.prompt_fragments]]
+partial = "python-conventions"
+when    = ["development", "qa", "refinement"]
+file    = "partials/python-conventions.yaml"
+
+[[provide.skills]]
+file = "skills/python-debugging/SKILL.md"
+id   = "python-debugging"
+
+[provide.workarea_config]
+clean_dirs    = ["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "build", "dist", "*.egg-info"]
+# Preserve the pip + uv caches across acquisitions.
+preserve_dirs = ["~/.cache/pip", "~/.cache/uv"]
+
+# Per-OS toolchain install — Python 3.12 plus uv. Cloud sandboxes are Linux →
+# .linux is load-bearing (deadsnakes for 3.12, then the uv standalone installer
+# which writes to ~/.local/bin).
+[provide.toolchain_install.linux]
+python_3_12 = "apt-get update && apt-get install -y software-properties-common && add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && apt-get install -y python3.12 python3.12-venv python3-pip"
+uv          = "curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH=\"$HOME/.local/bin:$PATH\""
+
+[provide.toolchain_install.macos]
+python_3_12 = "brew install python@3.12 && brew link --overwrite python@3.12"
+uv          = "brew install uv"
+
+[provide.toolchain_install.windows]
+python_3_12 = "winget install Python.Python.3.12"
+uv          = "winget install astral-sh.uv"
+
+[provide.hooks]
+post_acquire = "bin/setup.sh"
+
+[provide.hooks.os.windows]
+post_acquire = "bin\\setup.cmd"
+
+# ---------------------------------------------------------------------------
+# Composition
+# ---------------------------------------------------------------------------
+
+[composition]
+order          = "foundation"
+conflicts_with = []
+composes_with  = ["default/docker-compose", "default/postgres-dev"]

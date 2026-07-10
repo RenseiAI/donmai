@@ -1,0 +1,105 @@
+api = "rensei.dev/v1"
+
+# ---------------------------------------------------------------------------
+# Kit identity — Rust foundation kit.
+#
+# PATH-MUTATING INSTALLER: rustup installs to ~/.cargo and puts cargo/rustc on
+# PATH via ~/.cargo/env. Until `demand.env` is wired end-to-end (Go Compose +
+# platform composeToolchainDemand → execer — see CONTRIBUTING.md § "demand.env
+# follow-up"), the install scripts and the post_acquire hook BOTH source
+# ~/.cargo/env so cargo resolves without relying on composed-env PATH
+# augmentation. When demand.env lands, the kit will declare PATH=$HOME/.cargo/bin
+# once and drop the per-script sourcing.
+# ---------------------------------------------------------------------------
+
+[kit]
+id = "default/rust"
+version = "1.0.0"
+name = "Rust"
+description = "OSS default foundation kit for Rust projects. Detects Cargo.toml and provides the stable Rust toolchain, build/test/clippy commands, and Rust conventions."
+author = "donmai"
+authorIdentity = "did:web:donmai.dev"
+license = "MIT"
+homepage = "https://donmai.dev"
+repository = "https://github.com/RenseiAI/donmai-kits"
+priority = 70
+
+[supports]
+os = ["linux", "macos", "windows"]
+arch = ["x86_64", "arm64"]
+
+[requires]
+rensei = "^1.0"
+capabilities = []
+
+# ---------------------------------------------------------------------------
+# Detection — any Cargo workspace/crate.
+# ---------------------------------------------------------------------------
+
+[detect]
+files = ["Cargo.toml"]
+
+[detect.toolchain]
+rust = "stable"
+
+# ---------------------------------------------------------------------------
+# Contributions
+# ---------------------------------------------------------------------------
+
+[provide.commands]
+build    = "cargo build"
+test     = "cargo test"
+validate = "cargo clippy -- -D warnings && cargo fmt --check"
+
+[[provide.tool_permissions]]
+shell = "cargo *"
+
+[[provide.tool_permissions]]
+shell = "rustc *"
+
+[[provide.tool_permissions]]
+shell = "rustup *"
+
+[[provide.tool_permissions]]
+shell = "git *"
+
+[[provide.prompt_fragments]]
+partial = "rust-conventions"
+when    = ["development", "qa", "refinement"]
+file    = "partials/rust-conventions.yaml"
+
+[[provide.skills]]
+file = "skills/rust-debugging/SKILL.md"
+id   = "rust-debugging"
+
+[provide.workarea_config]
+clean_dirs    = ["target"]
+# Preserve the cargo registry + git cache so dependency builds aren't redone.
+preserve_dirs = ["~/.cargo/registry", "~/.cargo/git", "target"]
+
+# Per-OS toolchain install. rustup is the canonical installer on every OS.
+# Each script sources ~/.cargo/env so a following command in the same shell
+# sees cargo (see PATH note in the header — demand.env is the durable fix).
+[provide.toolchain_install.linux]
+rust_stable = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal && . $HOME/.cargo/env && rustup component add clippy rustfmt"
+
+[provide.toolchain_install.macos]
+rust_stable = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal && . $HOME/.cargo/env && rustup component add clippy rustfmt"
+
+[provide.toolchain_install.windows]
+rust_stable = "winget install Rustlang.Rustup && rustup default stable && rustup component add clippy rustfmt"
+
+[provide.hooks]
+post_acquire = "bin/setup.sh"
+
+[provide.hooks.os.windows]
+post_acquire = "bin\\setup.cmd"
+
+# ---------------------------------------------------------------------------
+# Composition
+# ---------------------------------------------------------------------------
+
+[composition]
+order          = "foundation"
+conflicts_with = []
+composes_with  = ["default/docker-compose", "default/postgres-dev"]

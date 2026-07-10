@@ -1,0 +1,121 @@
+api = "rensei.dev/v1"
+
+# ---------------------------------------------------------------------------
+# Kit identity — Next.js framework kit.
+#
+# This is the framework half of the TypeScript split: it detects Next.js
+# projects (next.config.* + package.json#dependencies.next) and composes ON TOP
+# of the base `default/typescript` foundation kit. Ported from the original
+# combined TS/Next.js kit, de-branded for the OSS catalog.
+# ---------------------------------------------------------------------------
+
+[kit]
+id = "default/ts-nextjs"
+version = "1.0.0"
+name = "TypeScript / Next.js"
+description = "OSS default kit for TypeScript and Next.js projects. Detects next.config.{ts,js,mjs} and package.json#dependencies.next."
+author = "donmai"
+authorIdentity = "did:web:donmai.dev"
+license = "MIT"
+homepage = "https://donmai.dev"
+repository = "https://github.com/RenseiAI/donmai-kits"
+priority = 80
+
+[supports]
+os = ["linux", "macos", "windows"]
+arch = ["x86_64", "arm64"]
+
+[requires]
+rensei = "^1.0"
+capabilities = []
+
+# ---------------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------------
+
+[detect]
+# Phase 1 declarative: match if any Next.js config file is present
+files = ["next.config.ts", "next.config.js", "next.config.mjs"]
+# AND package.json must exist
+files_all = ["package.json"]
+
+[[detect.content_matches]]
+file = "package.json"
+json_path = "$.dependencies.next"
+
+# Toolchain pre-declared so the workarea provider can pre-warm Node 22
+[detect.toolchain]
+node = "22"
+
+# ---------------------------------------------------------------------------
+# Contributions
+# ---------------------------------------------------------------------------
+
+[provide.commands]
+build    = "pnpm build"
+test     = "pnpm test"
+validate = "pnpm typecheck"
+
+[provide.commands_override.windows]
+build    = "pnpm.cmd build"
+test     = "pnpm.cmd test"
+validate = "pnpm.cmd typecheck"
+
+[[provide.tool_permissions]]
+shell = "pnpm *"
+
+[[provide.tool_permissions]]
+shell = "node *"
+
+[[provide.tool_permissions]]
+shell = "npx *"
+
+[[provide.tool_permissions]]
+shell = "git *"
+
+[[provide.prompt_fragments]]
+partial = "ts-nextjs-conventions"
+when    = ["development", "qa", "refinement"]
+file    = "partials/ts-nextjs-conventions.yaml"
+
+[[provide.prompt_fragments]]
+partial = "ts-nextjs-qa"
+when    = ["qa"]
+file    = "partials/ts-nextjs-qa.yaml"
+
+[[provide.skills]]
+file = "skills/ts-nextjs-debugging/SKILL.md"
+id   = "ts-nextjs-debugging"
+
+[provide.workarea_config]
+clean_dirs    = [".next", "dist", "out", ".turbo"]
+preserve_dirs = ["~/.npm", "~/.pnpm-store", "node_modules/.cache"]
+
+# Per-OS toolchain install — used by WorkareaProvider when Node 22 is not
+# pre-warmed in the pool. Cloud sandboxes are Linux, so .linux is load-bearing.
+[provide.toolchain_install.linux]
+node_22 = "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash && export NVM_DIR=$HOME/.nvm && . $NVM_DIR/nvm.sh && nvm install 22 && nvm use 22"
+pnpm    = "npm install -g pnpm@latest"
+
+[provide.toolchain_install.macos]
+node_22 = "brew install node@22 && brew link node@22"
+pnpm    = "npm install -g pnpm@latest"
+
+[provide.toolchain_install.windows]
+node_22 = "winget install OpenJS.NodeJS.LTS"
+pnpm    = "npm install -g pnpm@latest"
+
+[provide.hooks]
+post_acquire = "bin/setup.sh"
+
+[provide.hooks.os.windows]
+post_acquire = "bin\\setup.cmd"
+
+# ---------------------------------------------------------------------------
+# Composition — framework: composes on top of the base TypeScript kit.
+# ---------------------------------------------------------------------------
+
+[composition]
+order          = "framework"
+conflicts_with = []
+composes_with  = ["default/typescript", "default/docker-compose", "default/postgres-dev"]
