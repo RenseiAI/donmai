@@ -459,10 +459,12 @@ func TestFakeAmpScript_ProducesExpectedLines(t *testing.T) {
 	t.Parallel()
 
 	scriptPath := writeFakeAmpScript(t)
-	cmd := exec.Command(scriptPath) //nolint:gosec // test fixture: subprocess path is t.TempDir()-scoped
-	// Provide a dummy stdin so the script's cat can drain it.
-	cmd.Stdin = strings.NewReader("test prompt")
-	out, err := cmd.Output()
+	out, err := outputWithTextFileBusyRetry(func() ([]byte, error) {
+		cmd := exec.Command(scriptPath) //nolint:gosec // test fixture: subprocess path is t.TempDir()-scoped
+		// Provide a fresh dummy stdin on every attempt so the script's cat can drain it.
+		cmd.Stdin = strings.NewReader("test prompt")
+		return cmd.Output()
+	}, time.Sleep)
 	if err != nil {
 		t.Fatalf("fake amp script exited non-zero: %v\nstdout: %s", err, out)
 	}
@@ -475,5 +477,86 @@ func TestFakeAmpScript_ProducesExpectedLines(t *testing.T) {
 	}
 	if lines < 3 {
 		t.Errorf("expected at least 3 JSONL lines from fake script, got %d", lines)
+	}
+}
+
+// outputWithTextFileBusyRetry contains the same bounded retry policy as the
+// provider fixture above. A concurrently forking sibling test can inherit the
+// script's recently closed write fd on Linux and make exec return ETXTBSY.
+func outputWithTextFileBusyRetry(
+	run func() ([]byte, error),
+	sleep func(time.Duration),
+) ([]byte, error) {
+	for attempt := 0; ; attempt++ {
+		out, err := run()
+		if err == nil || attempt >= 3 || !strings.Contains(err.Error(), "text file busy") {
+			return out, err
+		}
+		sleep(time.Duration(25*(attempt+1)) * time.Millisecond)
+	}
+}
+
+func TestOutputWithTextFileBusyRetry(t *testing.T) {
+	t.Parallel()
+
+	var attempts int
+	var sleeps []time.Duration
+	out, err := outputWithTextFileBusyRetry(func() ([]byte, error) {
+		attempts++
+		if attempts < 3 {
+			return nil, errors.New("fork/exec fake-amp.sh: text file busy")
+		}
+		return []byte("ok"), nil
+	}, func(delay time.Duration) {
+		sleeps = append(sleeps, delay)
+	})
+	if err != nil {
+		t.Fatalf("retry returned error: %v", err)
+	}
+	if string(out) != "ok" {
+		t.Fatalf("output = %q, want ok", out)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	if len(sleeps) != 2 || sleeps[0] != 25*time.Millisecond || sleeps[1] != 50*time.Millisecond {
+		t.Fatalf("sleep delays = %v, want [25ms 50ms]", sleeps)
+	}
+
+	attempts = 0
+	sleeps = nil
+	exhaustedErr := errors.New("fork/exec fake-amp.sh: text file busy")
+	out, err = outputWithTextFileBusyRetry(func() ([]byte, error) {
+		attempts++
+		return []byte("final partial output"), exhaustedErr
+	}, func(delay time.Duration) {
+		sleeps = append(sleeps, delay)
+	})
+	if !errors.Is(err, exhaustedErr) {
+		t.Fatalf("exhausted error = %v, want %v", err, exhaustedErr)
+	}
+	if string(out) != "final partial output" {
+		t.Fatalf("exhausted output = %q, want final partial output", out)
+	}
+	if attempts != 4 {
+		t.Fatalf("exhausted attempts = %d, want 4", attempts)
+	}
+	if len(sleeps) != 3 || sleeps[0] != 25*time.Millisecond || sleeps[1] != 50*time.Millisecond || sleeps[2] != 75*time.Millisecond {
+		t.Fatalf("exhausted sleep delays = %v, want [25ms 50ms 75ms]", sleeps)
+	}
+
+	attempts = 0
+	wantErr := errors.New("permission denied")
+	_, err = outputWithTextFileBusyRetry(func() ([]byte, error) {
+		attempts++
+		return nil, wantErr
+	}, func(time.Duration) {
+		t.Fatal("non-ETXTBSY error must not sleep")
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("non-ETXTBSY error = %v, want %v", err, wantErr)
+	}
+	if attempts != 1 {
+		t.Fatalf("non-ETXTBSY attempts = %d, want 1", attempts)
 	}
 }
