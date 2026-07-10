@@ -12,6 +12,25 @@ _No work staged for the next release._
 
 ---
 
+## v0.50.3 — 2026-07-10
+
+### Features
+
+- **Explicit project admission.** Daemon configuration now keeps the set of
+  enabled projects separate from repository resources, allowing a project to
+  be admitted before any repository is configured and allowing multiple
+  repositories to belong to one project. Existing configurations migrate to
+  the versioned contract while preserving repository credentials and stable
+  project identifiers.
+
+### Chores
+
+- **Reliable release snapshots.** Local release dry-runs now skip the
+  production signing pipe explicitly, matching GoReleaser v2 behavior while
+  leaving tag-pushed release signing unchanged.
+
+---
+
 ## v0.39.0 — 2026-06-11
 
 ### Features

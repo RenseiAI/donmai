@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/RenseiAI/donmai/codesurvival"
 	"github.com/RenseiAI/donmai/internal/interview"
@@ -84,6 +87,10 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 	}
 
 	switch m.Op {
+	case "project.enable":
+		return d.applyProjectEnableLocked(m)
+	case "project.disable":
+		return d.applyProjectDisableLocked(m)
 	case "project.add":
 		return d.applyProjectAddLocked(m)
 	case "project.remove":
@@ -110,18 +117,29 @@ func (d *Daemon) applyProjectAddLocked(m PendingMutation) error {
 	if params.ID == "" || params.Repository == "" {
 		return fmt.Errorf("project.add requires id + repository")
 	}
+	migrated := migrateProjectAdmissionV2(d.config)
 
-	// Idempotent — if already present (matching id), do nothing.
-	for _, p := range d.config.Projects {
-		if p.ID == params.ID {
-			return nil
+	// Legacy compatibility: project.add creates one repository resource and
+	// enables its project. Multiple repositories may share the same project ID.
+	repositoryExists := false
+	for _, repository := range d.config.Repositories {
+		if repository.ProjectID == params.ID && normalizeRepositorySource(repository.Source) == normalizeRepositorySource(params.Repository) {
+			repositoryExists = true
+			break
 		}
 	}
-	d.config.Projects = append(d.config.Projects, ProjectConfig{
-		ID:         params.ID,
-		Repository: params.Repository,
-	})
-	return d.persistAndRefreshLocked()
+	if !repositoryExists {
+		d.config.Repositories = append(d.config.Repositories, RepositoryConfig{
+			ID:        legacyRepositoryID(params.ID, params.Repository),
+			ProjectID: params.ID,
+			Source:    params.Repository,
+		})
+	}
+	enabled := enableProjectID(&d.config.EnabledProjectIDs, params.ID)
+	if repositoryExists && !enabled && !migrated {
+		return nil
+	}
+	return d.persistProjectAdmissionAndRefreshLocked(migrated)
 }
 
 func (d *Daemon) applyProjectRemoveLocked(m PendingMutation) error {
@@ -134,26 +152,93 @@ func (d *Daemon) applyProjectRemoveLocked(m PendingMutation) error {
 	if params.ID == "" {
 		return fmt.Errorf("project.remove requires id")
 	}
+	migrated := migrateProjectAdmissionV2(d.config)
 
-	original := d.config.Projects
+	// Legacy compatibility: project.remove removes every repository resource
+	// for the ID and disables admission. New callers should use
+	// project.disable when repository configuration must be retained.
+	original := d.config.Repositories
 	filtered := original[:0]
 	removed := false
-	for _, p := range original {
-		if p.ID == params.ID {
+	for _, repository := range original {
+		if repository.ProjectID == params.ID {
 			removed = true
 			continue
 		}
-		filtered = append(filtered, p)
+		filtered = append(filtered, repository)
 	}
-	if !removed {
+	disabled := disableProjectID(&d.config.EnabledProjectIDs, params.ID)
+	if !removed && !disabled && !migrated {
 		// Idempotent — id not present, treat as success.
 		return nil
 	}
 	// Build a fresh slice so we don't accidentally share backing storage
 	// with the original (defensive against a later mutation racing the
 	// spawner snapshot via SetProjects).
-	d.config.Projects = append([]ProjectConfig(nil), filtered...)
-	return d.persistAndRefreshLocked()
+	d.config.Repositories = append([]RepositoryConfig(nil), filtered...)
+	return d.persistProjectAdmissionAndRefreshLocked(migrated)
+}
+
+func (d *Daemon) applyProjectEnableLocked(m PendingMutation) error {
+	id, err := mutationProjectID(m)
+	if err != nil {
+		return fmt.Errorf("project.enable: %w", err)
+	}
+	migrated := migrateProjectAdmissionV2(d.config)
+	if !enableProjectID(&d.config.EnabledProjectIDs, id) && !migrated {
+		return nil
+	}
+	return d.persistProjectAdmissionAndRefreshLocked(migrated)
+}
+
+func (d *Daemon) applyProjectDisableLocked(m PendingMutation) error {
+	id, err := mutationProjectID(m)
+	if err != nil {
+		return fmt.Errorf("project.disable: %w", err)
+	}
+	migrated := migrateProjectAdmissionV2(d.config)
+	if !disableProjectID(&d.config.EnabledProjectIDs, id) && !migrated {
+		return nil
+	}
+	return d.persistProjectAdmissionAndRefreshLocked(migrated)
+}
+
+func mutationProjectID(m PendingMutation) (string, error) {
+	var params struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(m.Params, &params); err != nil {
+		return "", fmt.Errorf("decode params: %w", err)
+	}
+	params.ID = strings.TrimSpace(params.ID)
+	if params.ID == "" {
+		return "", fmt.Errorf("requires id")
+	}
+	return params.ID, nil
+}
+
+func enableProjectID(ids *[]string, id string) bool {
+	for _, existing := range *ids {
+		if existing == id {
+			return false
+		}
+	}
+	*ids = normalizeProjectIDs(append(*ids, id))
+	return true
+}
+
+func disableProjectID(ids *[]string, id string) bool {
+	filtered := make([]string, 0, len(*ids))
+	removed := false
+	for _, existing := range *ids {
+		if existing == id {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, existing)
+	}
+	*ids = filtered
+	return removed
 }
 
 // knownWorkloadKey reports whether a modelAccess.set workload key belongs to
@@ -268,17 +353,50 @@ func (d *Daemon) applyModelAccessClearLocked(m PendingMutation) error {
 	return d.persistAndRefreshLocked()
 }
 
+func (d *Daemon) persistProjectAdmissionAndRefreshLocked(migrated bool) error {
+	if migrated {
+		if err := backupLegacyProjectConfig(d.opts.ConfigPath); err != nil {
+			return fmt.Errorf("back up legacy project config: %w", err)
+		}
+	}
+	return d.persistAndRefreshLocked()
+}
+
+func backupLegacyProjectConfig(path string) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("open config directory %q: %w", dir, err)
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(base)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", path, err)
+	}
+	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	backupName := base + ".v1-backup-" + stamp
+	backupPath := filepath.Join(dir, backupName)
+	if err := root.WriteFile(backupName, data, 0o600); err != nil {
+		return fmt.Errorf("write %q: %w", backupPath, err)
+	}
+	return nil
+}
+
 // persistAndRefreshLocked writes the current config atomically and pushes
 // the new project list into the spawner. Caller must hold d.mu.
 func (d *Daemon) persistAndRefreshLocked() error {
 	if d.opts.ConfigPath == "" {
 		return fmt.Errorf("no config path — cannot persist mutation")
 	}
+	syncLegacyProjectProjection(d.config)
+	normalizeProjectContract(d.config)
+	syncLegacyProjectProjection(d.config)
 	if err := WriteConfig(d.opts.ConfigPath, d.config); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 	if d.spawner != nil {
-		d.spawner.SetProjects(d.config.Projects)
+		d.spawner.SetProjectConfiguration(d.config.EffectiveProjectConfigs(), d.config.EffectiveEnabledProjectIDs())
 	}
 	return nil
 }

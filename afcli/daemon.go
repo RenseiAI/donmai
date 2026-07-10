@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -364,7 +365,7 @@ func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error
 		{"PID:", fmt.Sprintf("%d", r.PID)},
 		{"Uptime:", uptime},
 		{"Sessions:", fmt.Sprintf("%d / %d", r.ActiveSessions, r.MaxSessions)},
-		{"Projects:", fmt.Sprintf("%d allowed", r.ProjectsAllowed)},
+		{"Projects:", formatStatusProjectIDs(r)},
 		{"Timestamp:", r.Timestamp},
 	}
 	for _, row := range rows {
@@ -373,6 +374,17 @@ func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error
 		}
 	}
 	return tw.Flush()
+}
+
+func formatStatusProjectIDs(r *afclient.DaemonStatusResponse) string {
+	if len(r.AppliedProjectIDs) == 0 {
+		return fmt.Sprintf("%d allowed", r.ProjectsAllowed)
+	}
+	value := fmt.Sprintf("%d applied: %s", len(r.AppliedProjectIDs), strings.Join(r.AppliedProjectIDs, ", "))
+	if !slices.Equal(r.EnabledProjectIDs, r.AppliedProjectIDs) {
+		value += fmt.Sprintf(" (desired: %s)", strings.Join(r.EnabledProjectIDs, ", "))
+	}
+	return value
 }
 
 // ── logs ──────────────────────────────────────────────────────────────────────
@@ -1273,17 +1285,28 @@ func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 
 // formatAllowedProjectsStat renders the "Allowed projects:" row of
 // `daemon stats`. The output is the count followed by a comma-separated
-// list of repo URLs (truncated for very long lists).
+// list of applied project IDs (truncated for very long lists). Older daemons
+// that do not expose IDs fall back to repository URLs.
 // bin is the host binary name used in the remediation hint.
 func formatAllowedProjectsStat(r *afclient.DaemonStatsResponse, bin string) string {
-	if r == nil || len(r.AllowedProjects) == 0 {
+	if r == nil {
+		return "0 (none allowed; run `" + bin + " project allow <repo-url>`)"
+	}
+	projects := r.AppliedProjectIDs
+	if len(projects) == 0 {
+		projects = r.EnabledProjectIDs
+	}
+	if len(projects) == 0 {
+		projects = r.AllowedProjects
+	}
+	if len(projects) == 0 {
 		return "0 (none allowed; run `" + bin + " project allow <repo-url>`)"
 	}
 	const maxShown = 6
-	count := len(r.AllowedProjects)
+	count := len(projects)
 	if count <= maxShown {
-		return fmt.Sprintf("%d: %s", count, strings.Join(r.AllowedProjects, ", "))
+		return fmt.Sprintf("%d: %s", count, strings.Join(projects, ", "))
 	}
-	shown := strings.Join(r.AllowedProjects[:maxShown], ", ")
+	shown := strings.Join(projects[:maxShown], ", ")
 	return fmt.Sprintf("%d: %s, (+%d more)", count, shown, count-maxShown)
 }

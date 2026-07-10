@@ -59,7 +59,7 @@ goreleaser builds the following targets (see `.goreleaser.yaml`):
 - GitHub CLI (`gh auth status`)
 - `GITHUB_TOKEN` env var with `repo` + `write:packages` scopes (goreleaser uses this automatically)
 - `HOMEBREW_TAP_GITHUB_TOKEN` env var with write access to `RenseiAI/homebrew-tap`
-- For darwin signing: `APPLE_DEVELOPER_ID_CERT_BASE64`, `APPLE_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_DEVELOPER_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` configured as org-level GitHub Actions secrets — see [macOS signing](#macos-signing). Local dry-runs (`goreleaser release --snapshot`) skip signing per goreleaser convention.
+- For darwin signing: `APPLE_DEVELOPER_ID_CERT_BASE64`, `APPLE_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_DEVELOPER_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` configured as org-level GitHub Actions secrets — see [macOS signing](#macos-signing). Local dry-runs use `make release-dry-run` to skip signing explicitly.
 - All tests passing locally: `make test && make lint`
 
 ---
@@ -144,7 +144,7 @@ goreleaser will:
 To run a dry-run locally (no publish):
 
 ```bash
-goreleaser release --snapshot --clean
+goreleaser release --snapshot --clean --skip=sign
 ```
 
 Artifacts appear in `dist/`.
@@ -266,7 +266,12 @@ Apple Developer ID Application certificates are valid for **5 years**. Track the
 
 ### Local dry-run convention
 
-`goreleaser release --snapshot --clean` skips the `signs` and `notarize` blocks entirely (per goreleaser convention). Local snapshot builds produce **unsigned** binaries — useful for testing the build matrix, but they will trigger Gatekeeper popups on macOS. Real signing only fires on tag-pushed CI runs that have all five `APPLE_*` secrets set.
+`goreleaser release --snapshot --clean --skip=sign` skips the custom signing
+pipe explicitly. Snapshot mode itself skips publication and validation, but in
+GoReleaser v2 it does not skip custom sign pipes. Local snapshot builds produce
+**unsigned** binaries — useful for testing the build matrix, but they will
+trigger Gatekeeper popups on macOS. Real signing only fires on tag-pushed CI
+runs that have all five `APPLE_*` secrets set.
 
 ---
 

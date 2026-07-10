@@ -39,16 +39,19 @@ import (
 // number into Go struct field PollWorkItem.work.queuedAt of type string") and
 // silently drop pre-claimed sessions.
 type PollWorkItem struct {
-	SessionID    string            `json:"sessionId"`
-	ProjectName  string            `json:"projectName,omitempty"`
-	Repository   string            `json:"repository,omitempty"`
-	Ref          string            `json:"ref,omitempty"`
-	Priority     int               `json:"priority,omitempty"`
-	Env          map[string]string `json:"env,omitempty"`
-	MaxDuration  int               `json:"maxDurationSeconds,omitempty"`
-	Resources    *SessionResources `json:"resources,omitempty"`
-	QueuedAt     int64             `json:"queuedAt,omitempty"`
-	ProjectScope string            `json:"projectScope,omitempty"`
+	SessionID          string            `json:"sessionId"`
+	ProjectID          string            `json:"projectId,omitempty"`
+	RepositoryID       string            `json:"repositoryId,omitempty"`
+	ProjectName        string            `json:"projectName,omitempty"`
+	Repository         string            `json:"repository,omitempty"`
+	RequiresRepository bool              `json:"requiresRepository,omitempty"`
+	Ref                string            `json:"ref,omitempty"`
+	Priority           int               `json:"priority,omitempty"`
+	Env                map[string]string `json:"env,omitempty"`
+	MaxDuration        int               `json:"maxDurationSeconds,omitempty"`
+	Resources          *SessionResources `json:"resources,omitempty"`
+	QueuedAt           int64             `json:"queuedAt,omitempty"`
+	ProjectScope       string            `json:"projectScope,omitempty"`
 
 	// F.2.8 — enriched fields the platform may send so the
 	// `donmai agent run` worker has the runner context it needs without
@@ -768,7 +771,10 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 	repo, matched := resolveAllowlistedRepo(item, projects)
 	spec := SessionSpec{
 		SessionID:          item.SessionID,
+		ProjectID:          item.ProjectID,
+		RepositoryID:       item.RepositoryID,
 		Repository:         repo,
+		RequiresRepository: item.RequiresRepository,
 		Ref:                item.Ref,
 		Resources:          item.Resources,
 		Env:                item.Env,
@@ -818,6 +824,36 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 // about to succeed, which produced a daily flood of false-alarm
 // warnings on healthy operator setups.
 func resolveAllowlistedRepo(item PollWorkItem, projects []ProjectConfig) (repo string, matched *ProjectConfig) {
+	if item.ProjectID != "" {
+		if item.RepositoryID != "" {
+			for i := range projects {
+				project := &projects[i]
+				if project.ID == item.ProjectID && project.RepositoryID == item.RepositoryID {
+					return project.Repository, project
+				}
+			}
+			return item.Repository, nil
+		}
+		if item.Repository == "" {
+			if item.RequiresRepository {
+				for i := range projects {
+					project := &projects[i]
+					if project.ID == item.ProjectID && project.Primary {
+						return project.Repository, project
+					}
+				}
+				return "", nil
+			}
+			return "", &ProjectConfig{ID: item.ProjectID}
+		}
+		for i := range projects {
+			project := &projects[i]
+			if project.ID == item.ProjectID && matchProject(project, item.Repository) != nil {
+				return project.Repository, project
+			}
+		}
+		return item.Repository, nil
+	}
 	if item.Repository != "" {
 		if proj, ok := resolveProjectFromAllowlist(item.Repository, projects); ok {
 			return proj.Repository, proj
@@ -914,6 +950,7 @@ func WithMergeQueueLanding(flag *bool) SessionDetailOption {
 func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string, opts ...SessionDetailOption) *SessionDetail {
 	repo, matched := resolveAllowlistedRepo(item, projects)
 	projectName := item.ProjectName
+	projectID := item.ProjectID
 	if matched != nil && matched.ID != "" {
 		projectName = matched.ID
 	}
@@ -939,6 +976,8 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		LinearSessionID:      item.LinearSessionID,
 		ProviderSessionID:    item.ProviderSessionID,
 		ProjectName:          projectName,
+		ProjectID:            projectID,
+		RepositoryID:         item.RepositoryID,
 		OrganizationID:       item.OrganizationID,
 		Repository:           repo,
 		Ref:                  item.Ref,

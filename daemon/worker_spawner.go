@@ -26,7 +26,10 @@ var _ ActiveWorkareaProvider = (*WorkerSpawner)(nil)
 
 // SpawnerOptions configure a WorkerSpawner.
 type SpawnerOptions struct {
-	Projects              []ProjectConfig
+	Projects []ProjectConfig
+	// EnabledProjectIDs is the authoritative project-admission set. When nil,
+	// IDs are derived from Projects for legacy callers.
+	EnabledProjectIDs     []string
 	MaxConcurrentSessions int
 	// WorkerCommand is the command to run for each accepted session. The
 	// caller may pass arbitrary args; the session-specific environment is
@@ -125,10 +128,11 @@ const pumpDrainGrace = 10 * time.Second
 type WorkerSpawner struct {
 	opts SpawnerOptions
 
-	mu            sync.Mutex
-	sessions      map[string]*spawnedSession
-	accepting     bool
-	extraProjects []ProjectConfig // satellite/additional org projects; never clobbered by SetProjects
+	mu                     sync.Mutex
+	sessions               map[string]*spawnedSession
+	accepting              bool
+	extraProjects          []ProjectConfig // satellite/additional org projects; never clobbered by SetProjects
+	extraEnabledProjectIDs map[string]struct{}
 
 	listenersMu sync.Mutex
 	listeners   []func(SessionEvent)
@@ -150,11 +154,20 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 	if opts.MaxConcurrentSessions <= 0 {
 		opts.MaxConcurrentSessions = 8
 	}
+	opts.EnabledProjectIDs = normalizeSpawnerEnabledIDs(opts.EnabledProjectIDs, opts.Projects)
 	return &WorkerSpawner{
-		opts:      opts,
-		sessions:  make(map[string]*spawnedSession),
-		accepting: true,
+		opts:                   opts,
+		sessions:               make(map[string]*spawnedSession),
+		accepting:              true,
+		extraEnabledProjectIDs: make(map[string]struct{}),
 	}
+}
+
+func normalizeSpawnerEnabledIDs(explicit []string, projects []ProjectConfig) []string {
+	if explicit != nil {
+		return normalizeProjectIDs(explicit)
+	}
+	return projectIDsFromRepositories(projects)
 }
 
 // On registers a session-event listener. Listeners are invoked synchronously
@@ -226,8 +239,14 @@ func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
 			Ref:        ss.spec.Ref,
 			SessionID:  ss.spec.SessionID,
 		}
-		if project := s.findProjectLocked(ss.spec.Repository); project != nil {
+		project := s.findProjectForSpecLocked(ss.spec)
+		if ss.spec.ProjectID == "" {
+			project = s.findProjectLocked(ss.spec.Repository)
+		}
+		if project != nil {
 			summary.ProjectID = project.ID
+		} else {
+			summary.ProjectID = ss.spec.ProjectID
 		}
 		// handle.AcceptedAt is RFC3339 today; surface it on the wire as
 		// AcquiredAt (the active-only "session admitted to pool" stamp).
@@ -286,11 +305,19 @@ func (s *WorkerSpawner) SetMaxConcurrentSessions(n int) error {
 // A defensive copy is taken so subsequent mutations to the caller's
 // slice (e.g. daemon.go reusing a single buffer) don't race the spawner.
 func (s *WorkerSpawner) SetProjects(projects []ProjectConfig) {
-	cp := make([]ProjectConfig, len(projects))
-	copy(cp, projects)
+	s.SetProjectConfiguration(projects, projectIDsFromRepositories(projects))
+}
+
+// SetProjectConfiguration atomically replaces the base repository resources
+// and project-admission set. Additional identities registered through
+// AddProjects/AddEnabledProjectIDs remain intact.
+func (s *WorkerSpawner) SetProjectConfiguration(projects []ProjectConfig, enabledProjectIDs []string) {
+	projectCopy := append([]ProjectConfig(nil), projects...)
+	enabledCopy := normalizeProjectIDs(enabledProjectIDs)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.opts.Projects = cp
+	s.opts.Projects = projectCopy
+	s.opts.EnabledProjectIDs = enabledCopy
 }
 
 // AddProjects appends additional project configurations (e.g. satellite-org
@@ -317,6 +344,20 @@ func (s *WorkerSpawner) AddProjects(extra []ProjectConfig) {
 			continue
 		}
 		s.extraProjects = append(s.extraProjects, candidate)
+		if candidate.ID != "" {
+			s.extraEnabledProjectIDs[candidate.ID] = struct{}{}
+		}
+	}
+}
+
+// AddEnabledProjectIDs admits additional projects without requiring a
+// repository resource. It is used by shared-spawner embedders for identities
+// whose repository bindings are managed independently.
+func (s *WorkerSpawner) AddEnabledProjectIDs(ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range normalizeProjectIDs(ids) {
+		s.extraEnabledProjectIDs[id] = struct{}{}
 	}
 }
 
@@ -324,7 +365,7 @@ func (s *WorkerSpawner) AddProjects(extra []ProjectConfig) {
 // the base or extra project sets. Must be called with s.mu held.
 func (s *WorkerSpawner) isDuplicateLocked(candidate ProjectConfig) bool {
 	for _, existing := range s.opts.Projects {
-		if candidate.ID != "" && candidate.ID == existing.ID {
+		if candidate.ID == existing.ID && candidate.Repository == existing.Repository {
 			return true
 		}
 		if candidate.Repository != "" && candidate.Repository == existing.Repository {
@@ -332,7 +373,7 @@ func (s *WorkerSpawner) isDuplicateLocked(candidate ProjectConfig) bool {
 		}
 	}
 	for _, existing := range s.extraProjects {
-		if candidate.ID != "" && candidate.ID == existing.ID {
+		if candidate.ID == existing.ID && candidate.Repository == existing.Repository {
 			return true
 		}
 		if candidate.Repository != "" && candidate.Repository == existing.Repository {
@@ -363,6 +404,18 @@ func (s *WorkerSpawner) AllProjects() []ProjectConfig {
 	return out
 }
 
+// AllEnabledProjectIDs returns the sorted union of base and additional
+// project-admission identities.
+func (s *WorkerSpawner) AllEnabledProjectIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := append([]string(nil), s.opts.EnabledProjectIDs...)
+	for id := range s.extraEnabledProjectIDs {
+		ids = append(ids, id)
+	}
+	return normalizeProjectIDs(ids)
+}
+
 // AcceptWork validates the spec, spawns a worker, and returns its handle.
 func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	s.mu.Lock()
@@ -378,14 +431,104 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 		// S5 work; pre-existing.)
 		return nil, fmt.Errorf("at capacity (%d/%d sessions)", active, capacity)
 	}
-	project := s.findProjectLocked(spec.Repository)
+	project, admissionErr := s.resolveProjectForSpecLocked(spec)
+	if admissionErr != nil {
+		s.mu.Unlock()
+		return nil, admissionErr
+	}
 	if project == nil {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("repository %q is not in the project allowlist", spec.Repository)
+		return nil, fmt.Errorf("project admission could not be resolved")
+	}
+	if spec.Repository == "" && project.Repository != "" {
+		spec.Repository = project.Repository
+	}
+	if spec.RepositoryID == "" && project.RepositoryID != "" {
+		spec.RepositoryID = project.RepositoryID
 	}
 	s.mu.Unlock()
 
 	return s.spawn(spec, project)
+}
+
+func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectConfig, error) {
+	if spec.ProjectID != "" {
+		if !s.isProjectAllowedLocked(spec.ProjectID) {
+			return nil, fmt.Errorf("project %q is not allowed", spec.ProjectID)
+		}
+		if spec.Repository == "" && spec.RepositoryID == "" {
+			if spec.RequiresRepository {
+				if primary := s.findPrimaryProjectRepositoryLocked(spec.ProjectID); primary != nil {
+					return primary, nil
+				}
+				return nil, fmt.Errorf("project %q requires an explicit repository or configured primary", spec.ProjectID)
+			}
+			return &ProjectConfig{ID: spec.ProjectID}, nil
+		}
+		project := s.findProjectForSpecLocked(spec)
+		if project == nil {
+			if spec.RepositoryID != "" {
+				return nil, fmt.Errorf("repository %q is not configured for project %q", spec.RepositoryID, spec.ProjectID)
+			}
+			return nil, fmt.Errorf("repository %q is not configured for project %q", spec.Repository, spec.ProjectID)
+		}
+		return project, nil
+	}
+
+	project := s.findProjectLocked(spec.Repository)
+	if project == nil {
+		return nil, fmt.Errorf("repository %q is not configured", spec.Repository)
+	}
+	if !s.isProjectAllowedLocked(project.ID) {
+		return nil, fmt.Errorf("project %q is not allowed", project.ID)
+	}
+	return project, nil
+}
+
+func (s *WorkerSpawner) findPrimaryProjectRepositoryLocked(projectID string) *ProjectConfig {
+	for i := range s.opts.Projects {
+		if s.opts.Projects[i].ID == projectID && s.opts.Projects[i].Primary {
+			return &s.opts.Projects[i]
+		}
+	}
+	for i := range s.extraProjects {
+		if s.extraProjects[i].ID == projectID && s.extraProjects[i].Primary {
+			return &s.extraProjects[i]
+		}
+	}
+	return nil
+}
+
+func (s *WorkerSpawner) isProjectAllowedLocked(id string) bool {
+	for _, allowed := range s.opts.EnabledProjectIDs {
+		if allowed == id {
+			return true
+		}
+	}
+	_, ok := s.extraEnabledProjectIDs[id]
+	return ok
+}
+
+func (s *WorkerSpawner) findProjectForSpecLocked(spec SessionSpec) *ProjectConfig {
+	find := func(projects []ProjectConfig) *ProjectConfig {
+		for i := range projects {
+			project := &projects[i]
+			if project.ID != spec.ProjectID {
+				continue
+			}
+			if spec.RepositoryID != "" && project.RepositoryID == spec.RepositoryID {
+				return project
+			}
+			if spec.RepositoryID == "" && matchProject(project, spec.Repository) != nil {
+				return project
+			}
+		}
+		return nil
+	}
+	if project := find(s.opts.Projects); project != nil {
+		return project
+	}
+	return find(s.extraProjects)
 }
 
 // findProjectLocked searches the union of the base project set (opts.Projects)
@@ -438,10 +581,11 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, command[0], command[1:]...) //nolint:gosec
 	cmd.Env = composeEnv(s.opts.BaseEnv, spec.Env, map[string]string{
-		"DONMAI_SESSION_ID": spec.SessionID,
-		"DONMAI_REPOSITORY": spec.Repository,
-		"DONMAI_REF":        spec.Ref,
-		"DONMAI_PROJECT_ID": project.ID,
+		"DONMAI_SESSION_ID":    spec.SessionID,
+		"DONMAI_REPOSITORY":    spec.Repository,
+		"DONMAI_REPOSITORY_ID": spec.RepositoryID,
+		"DONMAI_REF":           spec.Ref,
+		"DONMAI_PROJECT_ID":    project.ID,
 	})
 
 	// OnPreSpawn is the extension point for callers that need to compute

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -104,7 +105,6 @@ func requirePost(t *testing.T, addr, path string, body any, into any) int {
 func TestServer_Status(t *testing.T) {
 	d, srv, cleanup := mustStartDaemon(t)
 	defer cleanup()
-	_ = d
 
 	var resp afclient.DaemonStatusResponse
 	requireGet(t, srv.Addr(), "/api/daemon/status", &resp)
@@ -123,6 +123,49 @@ func TestServer_Status(t *testing.T) {
 	}
 	if resp.Status != afclient.DaemonReady {
 		t.Errorf("Status = %q, want ready", resp.Status)
+	}
+	if len(resp.EnabledProjectIDs) != 1 || resp.EnabledProjectIDs[0] != "demo" {
+		t.Errorf("EnabledProjectIDs = %v, want [demo]", resp.EnabledProjectIDs)
+	}
+	if !reflect.DeepEqual(resp.AppliedProjectIDs, resp.EnabledProjectIDs) {
+		t.Errorf("AppliedProjectIDs = %v, want %v", resp.AppliedProjectIDs, resp.EnabledProjectIDs)
+	}
+
+	d.spawner.AddEnabledProjectIDs([]string{"satellite"})
+	requireGet(t, srv.Addr(), "/api/daemon/status", &resp)
+	if want := []string{"demo", "satellite"}; !reflect.DeepEqual(resp.AppliedProjectIDs, want) {
+		t.Errorf("AppliedProjectIDs after runtime admission = %v, want %v", resp.AppliedProjectIDs, want)
+	}
+	if want := []string{"demo"}; !reflect.DeepEqual(resp.EnabledProjectIDs, want) {
+		t.Errorf("EnabledProjectIDs after runtime admission = %v, want %v", resp.EnabledProjectIDs, want)
+	}
+	if resp.ProjectsAllowed != 2 {
+		t.Errorf("ProjectsAllowed = %d, want 2", resp.ProjectsAllowed)
+	}
+}
+
+func TestBuildProjectStatusRows_ReportsDriftAndRepositoryReadiness(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{Repositories: []RepositoryConfig{
+		{ID: "repo-alpha", ProjectID: "alpha", Source: "example.com/acme/alpha", Primary: true},
+		{ID: "repo-disabled", ProjectID: "disabled", Source: "example.com/acme/disabled"},
+	}}
+	rows := buildProjectStatusRows(nil, cfg, []string{"alpha", "no-repo"}, []string{"alpha", "runtime-only"})
+	byID := make(map[string]afclient.DaemonProjectStatus, len(rows))
+	for _, row := range rows {
+		byID[row.ProjectID] = row
+	}
+	if got := byID["alpha"]; got.Desired != "enabled" || got.Applied != "ready" || got.Connection != "healthy" || got.RepositoryCount != 1 || got.PrimaryRepositoryID != "repo-alpha" {
+		t.Errorf("alpha row = %+v", got)
+	}
+	if got := byID["no-repo"]; got.Desired != "enabled" || got.Applied != "absent" || got.Connection != "pending" || len(got.Warnings) != 1 {
+		t.Errorf("no-repo row = %+v", got)
+	}
+	if got := byID["runtime-only"]; got.Desired != "disabled" || got.Applied != "ready" {
+		t.Errorf("runtime-only row = %+v", got)
+	}
+	if got := byID["disabled"]; got.Desired != "disabled" || got.Applied != "absent" || got.RepositoryCount != 1 {
+		t.Errorf("disabled repository row = %+v", got)
 	}
 }
 

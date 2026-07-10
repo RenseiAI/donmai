@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,26 +168,91 @@ func (s *Server) method(want string, fn http.HandlerFunc) http.HandlerFunc {
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	cfg := s.daemon.Config()
 	statusName := daemonStatus(s.daemon)
+	enabledProjectIDs := safeEnabledProjectIDs(cfg)
+	appliedIDs := appliedProjectIDs(s.daemon, cfg)
 	resp := afclient.DaemonStatusResponse{
-		Status:          statusName,
-		Version:         s.daemon.EffectiveVersion(),
-		MachineID:       safeMachineID(cfg),
-		PID:             os.Getpid(),
-		UptimeSeconds:   int64(time.Since(s.daemon.StartedAt()).Seconds()),
-		ActiveSessions:  countActive(s.daemon),
-		MaxSessions:     safeMaxSessions(cfg),
-		ProjectsAllowed: safeProjectsLen(cfg),
-		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		Status:                  statusName,
+		Version:                 s.daemon.EffectiveVersion(),
+		MachineID:               safeMachineID(cfg),
+		PID:                     os.Getpid(),
+		UptimeSeconds:           int64(time.Since(s.daemon.StartedAt()).Seconds()),
+		ActiveSessions:          countActive(s.daemon),
+		MaxSessions:             safeMaxSessions(cfg),
+		ProjectsAllowed:         len(appliedIDs),
+		EnabledProjectIDs:       enabledProjectIDs,
+		AppliedProjectIDs:       appliedIDs,
+		Projects:                buildProjectStatusRows(s.daemon, cfg, enabledProjectIDs, appliedIDs),
+		Timestamp:               time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, &resp)
 }
 
+func buildProjectStatusRows(d *Daemon, cfg *Config, enabledIDs, appliedIDs []string) []afclient.DaemonProjectStatus {
+	enabled := make(map[string]struct{}, len(enabledIDs))
+	applied := make(map[string]struct{}, len(appliedIDs))
+	all := make(map[string]struct{}, len(enabledIDs)+len(appliedIDs))
+	for _, id := range enabledIDs {
+		enabled[id] = struct{}{}
+		all[id] = struct{}{}
+	}
+	for _, id := range appliedIDs {
+		applied[id] = struct{}{}
+		all[id] = struct{}{}
+	}
+	repositoryCount := make(map[string]int)
+	primaryRepository := make(map[string]string)
+	if cfg != nil {
+		for _, repository := range cfg.Repositories {
+			all[repository.ProjectID] = struct{}{}
+			repositoryCount[repository.ProjectID]++
+			if repository.Primary {
+				primaryRepository[repository.ProjectID] = repository.ID
+			}
+		}
+	}
+	ids := make([]string, 0, len(all))
+	for id := range all {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	rows := make([]afclient.DaemonProjectStatus, 0, len(ids))
+	for _, id := range ids {
+		row := afclient.DaemonProjectStatus{
+			ProjectID:           id,
+			Desired:             "disabled",
+			Applied:             "absent",
+			Connection:          "pending",
+			RepositoryCount:     repositoryCount[id],
+			PrimaryRepositoryID: primaryRepository[id],
+		}
+		if _, ok := enabled[id]; ok {
+			row.Desired = "enabled"
+		}
+		if _, ok := applied[id]; ok {
+			row.Applied = "ready"
+			row.Connection = "healthy"
+		}
+		if _, ok := enabled[id]; ok && row.RepositoryCount == 0 {
+			row.Warnings = append(row.Warnings, "no repository resources configured")
+		}
+		if d != nil && d.State() == StateDraining {
+			row.Connection = "draining"
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	cfg := s.daemon.Config()
+	enabledProjectIDs := safeEnabledProjectIDs(cfg)
+	appliedIDs := appliedProjectIDs(s.daemon, cfg)
 	withPool := r.URL.Query().Get("pool") == "true"
 	byMachine := r.URL.Query().Get("byMachine") == "true"
 
 	resp := afclient.DaemonStatsResponse{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
 		Capacity: afclient.MachineCapacity{
 			MaxConcurrentSessions: safeMaxSessions(cfg),
 			MaxVCpuPerSession:     safeMaxVCPU(cfg),
@@ -194,12 +260,14 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			ReservedVCpu:          safeReservedVCPU(cfg),
 			ReservedMemoryMb:      safeReservedMem(cfg),
 		},
-		ActiveSessions:  countActive(s.daemon),
-		QueueDepth:      0,
-		Timestamp:       time.Now().UTC().Format(time.RFC3339),
-		WorkerID:        s.daemon.WorkerID(),
-		Registration:    buildRegistrationStats(s.daemon),
-		AllowedProjects: safeProjectRepos(cfg),
+		ActiveSessions:    countActive(s.daemon),
+		QueueDepth:        0,
+		Timestamp:         time.Now().UTC().Format(time.RFC3339),
+		WorkerID:          s.daemon.WorkerID(),
+		Registration:      buildRegistrationStats(s.daemon),
+		AllowedProjects:   safeProjectRepos(cfg),
+		EnabledProjectIDs: enabledProjectIDs,
+		AppliedProjectIDs: appliedIDs,
 	}
 	if withPool {
 		stats, err := s.poolStats(r.Context())
@@ -597,7 +665,24 @@ func safeProjectsLen(c *Config) int {
 	if c == nil {
 		return 0
 	}
-	return len(c.Projects)
+	return len(c.EffectiveEnabledProjectIDs())
+}
+
+func safeEnabledProjectIDs(c *Config) []string {
+	if c == nil {
+		return nil
+	}
+	return c.EffectiveEnabledProjectIDs()
+}
+
+func appliedProjectIDs(d *Daemon, c *Config) []string {
+	if d != nil && d.spawner != nil {
+		return d.spawner.AllEnabledProjectIDs()
+	}
+	if c == nil {
+		return nil
+	}
+	return c.EffectiveEnabledProjectIDs()
 }
 
 func safeOrchestratorURL(c *Config) string {
@@ -610,11 +695,15 @@ func safeOrchestratorURL(c *Config) string {
 // safeProjectRepos returns the list of repository URLs in the project
 // allowlist for inclusion in DaemonStatsResponse.AllowedProjects.
 func safeProjectRepos(c *Config) []string {
-	if c == nil || len(c.Projects) == 0 {
+	if c == nil {
 		return nil
 	}
-	out := make([]string, 0, len(c.Projects))
-	for _, p := range c.Projects {
+	projects := c.EffectiveProjectConfigs()
+	if len(projects) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(projects))
+	for _, p := range projects {
 		out = append(out, p.Repository)
 	}
 	return out
