@@ -7,12 +7,14 @@
 package afclient
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -89,6 +91,17 @@ type ProjectEntry struct {
 	CredentialHelper *CredentialHelper `yaml:"credentialHelper,omitempty" json:"credentialHelper,omitempty"`
 }
 
+// RepositoryEntry is one normalized repository resource. Its ProjectID link
+// does not grant project admission.
+type RepositoryEntry struct {
+	ID               string            `yaml:"id"                         json:"id"`
+	ProjectID        string            `yaml:"projectId"                  json:"projectId"`
+	Source           string            `yaml:"source"                     json:"source"`
+	Primary          bool              `yaml:"primary,omitempty"          json:"primary,omitempty"`
+	CloneStrategy    CloneStrategy     `yaml:"cloneStrategy,omitempty"    json:"cloneStrategy,omitempty"`
+	CredentialHelper *CredentialHelper `yaml:"credentialHelper,omitempty" json:"credentialHelper,omitempty"`
+}
+
 // UnmarshalYAML accepts either the canonical `repository` key or the
 // legacy `repoUrl` key. When the legacy key is found a
 // one-line warning is logged via slog so operators know to rewrite the file
@@ -136,11 +149,24 @@ type CapacityConfig struct {
 // Only the fields relevant to the project command tree are modelled here;
 // unknown top-level keys are preserved via the yaml decoder's pass-through.
 type DaemonYAML struct {
-	// Projects is the allowlist of repos the daemon will accept work for.
+	// ProjectAdmissionVersion distinguishes the legacy repository-derived
+	// contract (absent) from explicit v2 admission.
+	ProjectAdmissionVersion int `yaml:"projectAdmissionVersion,omitempty"`
+	// EnabledProjectIDs is the authoritative project-admission set. It is
+	// independent of repository resources so a project can be enabled before
+	// any repository is configured. It is authoritative only in v2.
+	EnabledProjectIDs []string `yaml:"enabledProjectIds,omitempty"`
+	// Repositories is the normalized zero-to-many repository-resource set.
+	Repositories []RepositoryEntry `yaml:"repositories,omitempty"`
+	// Projects contains repository resources. Multiple entries may share a
+	// project ID.
 	Projects []ProjectEntry `yaml:"projects,omitempty"`
 	// Capacity holds the configurable resource limits for the daemon.
 	Capacity CapacityConfig `yaml:"capacity,omitempty"`
 }
+
+// ProjectAdmissionVersionV2 marks enabledProjectIds as authoritative.
+const ProjectAdmissionVersionV2 = 2
 
 // ── default path ─────────────────────────────────────────────────────────────
 
@@ -170,6 +196,7 @@ func ReadDaemonYAML(path string) (*DaemonYAML, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse daemon config %q: %w", path, err)
 	}
+	cfg.normalizeProjectContract()
 	return &cfg, nil
 }
 
@@ -204,8 +231,16 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 			cfg.Projects[i].ID = DeriveProjectID(cfg.Projects[i].RepoURL)
 		}
 	}
+	cfg.normalizeProjectContract()
 
-	data, err := mergeDaemonYAML(path, cfg)
+	writeCfg := *cfg
+	if writeCfg.ProjectAdmissionVersion == 0 {
+		writeCfg.EnabledProjectIDs = nil
+		writeCfg.Repositories = nil
+	} else {
+		writeCfg.syncLegacyProjectProjection()
+	}
+	data, err := mergeDaemonYAML(path, &writeCfg)
 	if err != nil {
 		return fmt.Errorf("merge daemon config: %w", err)
 	}
@@ -223,8 +258,8 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 }
 
 // mergeDaemonYAML loads the existing daemon.yaml at path (if present) as a
-// yaml.Node tree, replaces the `projects` and `capacity` keys with the
-// values from cfg, and returns the marshalled result. When the file does
+// yaml.Node tree, replaces the project-admission, projects, and capacity keys
+// with the values from cfg, and returns the marshalled result. When the file does
 // not exist the cfg struct is marshalled directly.
 func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
 	existing, readErr := os.ReadFile(path) //nolint:gosec // operator-supplied path
@@ -259,11 +294,30 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encode projects: %w", err)
 	}
+	repositoriesNode, err := encodeYAMLNode(cfg.Repositories)
+	if err != nil {
+		return nil, fmt.Errorf("encode repositories: %w", err)
+	}
+	enabledProjectIDsNode, err := encodeYAMLNode(cfg.EnabledProjectIDs)
+	if err != nil {
+		return nil, fmt.Errorf("encode enabled project ids: %w", err)
+	}
 	capacityNode, err := encodeYAMLNode(cfg.Capacity)
 	if err != nil {
 		return nil, fmt.Errorf("encode capacity: %w", err)
 	}
 
+	if cfg.ProjectAdmissionVersion != 0 {
+		projectAdmissionVersionNode, versionErr := encodeYAMLNode(cfg.ProjectAdmissionVersion)
+		if versionErr != nil {
+			return nil, fmt.Errorf("encode project admission version: %w", versionErr)
+		}
+		upsertMappingKey(doc, "projectAdmissionVersion", projectAdmissionVersionNode)
+	}
+	if cfg.ProjectAdmissionVersion == ProjectAdmissionVersionV2 {
+		upsertMappingKey(doc, "enabledProjectIds", enabledProjectIDsNode)
+		upsertMappingKey(doc, "repositories", repositoriesNode)
+	}
 	upsertMappingKey(doc, "projects", projectsNode)
 	// Capacity is preserved as a partial overlay — only the cfg-modelled
 	// fields (e.g. poolMaxDiskGb) are merged into the existing capacity
@@ -349,6 +403,8 @@ func mergeMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
 // FindProject returns the index of the first ProjectEntry whose RepoURL
 // matches repoURL, or -1 if not found.
 func (d *DaemonYAML) FindProject(repoURL string) int {
+	d.normalizeProjectContract()
+	d.syncLegacyProjectProjection()
 	for i, p := range d.Projects {
 		if p.RepoURL == repoURL {
 			return i
@@ -357,25 +413,250 @@ func (d *DaemonYAML) FindProject(repoURL string) int {
 	return -1
 }
 
+// FindRepository returns the normalized repository-resource index by source.
+func (d *DaemonYAML) FindRepository(source string) int {
+	d.normalizeProjectContract()
+	key := normalizeRepositoryEntrySource(source)
+	for i, repository := range d.Repositories {
+		if normalizeRepositoryEntrySource(repository.Source) == key {
+			return i
+		}
+	}
+	return -1
+}
+
+// RepositoryProjectEntries returns repository resources in the legacy table
+// shape used by compatibility CLI renderers.
+func (d *DaemonYAML) RepositoryProjectEntries() []ProjectEntry {
+	d.syncLegacyProjectProjection()
+	return append([]ProjectEntry(nil), d.Projects...)
+}
+
 // AddOrUpdateProject upserts a ProjectEntry by RepoURL.
 // If a matching entry exists it is replaced; otherwise the entry is appended.
 func (d *DaemonYAML) AddOrUpdateProject(entry ProjectEntry) {
-	if i := d.FindProject(entry.RepoURL); i >= 0 {
-		d.Projects[i] = entry
-		return
+	explicitProjectID := strings.TrimSpace(entry.ID) != ""
+	if entry.ID == "" {
+		entry.ID = DeriveProjectID(entry.RepoURL)
 	}
-	d.Projects = append(d.Projects, entry)
+	d.migrateProjectAdmissionV2()
+	existingIndex := d.FindRepository(entry.RepoURL)
+	if existingIndex >= 0 && !explicitProjectID {
+		entry.ID = d.Repositories[existingIndex].ProjectID
+	}
+	repository := RepositoryEntry{
+		ID:               deriveRepositoryID(entry.ID, entry.RepoURL),
+		ProjectID:        entry.ID,
+		Source:           entry.RepoURL,
+		CloneStrategy:    entry.CloneStrategy,
+		CredentialHelper: entry.CredentialHelper,
+	}
+	if existingIndex >= 0 {
+		repository.ID = d.Repositories[existingIndex].ID
+		d.Repositories[existingIndex] = repository
+	} else {
+		d.Repositories = append(d.Repositories, repository)
+	}
+	d.EnableProject(entry.ID)
+	d.syncLegacyProjectProjection()
+}
+
+// SetRepositoryCredentialHelper updates a repository resource by source. A
+// successful update migrates legacy project configuration to the v2 contract
+// and refreshes the compatibility projection.
+func (d *DaemonYAML) SetRepositoryCredentialHelper(source string, helper *CredentialHelper) bool {
+	d.migrateProjectAdmissionV2()
+	i := d.FindRepository(source)
+	if i < 0 {
+		return false
+	}
+	d.Repositories[i].CredentialHelper = helper
+	d.syncLegacyProjectProjection()
+	return true
 }
 
 // RemoveProject removes the entry matching repoURL.
 // Returns true if an entry was removed, false if none matched.
 func (d *DaemonYAML) RemoveProject(repoURL string) bool {
-	i := d.FindProject(repoURL)
+	d.migrateProjectAdmissionV2()
+	i := d.FindRepository(repoURL)
 	if i < 0 {
 		return false
 	}
-	d.Projects = append(d.Projects[:i], d.Projects[i+1:]...)
+	removedID := d.Repositories[i].ProjectID
+	d.Repositories = append(d.Repositories[:i], d.Repositories[i+1:]...)
+	for _, repository := range d.Repositories {
+		if repository.ProjectID == removedID {
+			d.syncLegacyProjectProjection()
+			return true
+		}
+	}
+	d.DisableProject(removedID)
+	d.syncLegacyProjectProjection()
 	return true
+}
+
+// EnableProject adds id to the project-admission set idempotently.
+func (d *DaemonYAML) EnableProject(id string) {
+	d.migrateProjectAdmissionV2()
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	for _, existing := range d.EnabledProjectIDs {
+		if existing == id {
+			d.syncLegacyProjectProjection()
+			return
+		}
+	}
+	d.EnabledProjectIDs = append(d.EnabledProjectIDs, id)
+	d.normalizeProjectContract()
+	d.syncLegacyProjectProjection()
+}
+
+// DisableProject removes id from the project-admission set without deleting
+// its repository resources.
+func (d *DaemonYAML) DisableProject(id string) {
+	d.migrateProjectAdmissionV2()
+	filtered := make([]string, 0, len(d.EnabledProjectIDs))
+	for _, existing := range d.EnabledProjectIDs {
+		if existing != id {
+			filtered = append(filtered, existing)
+		}
+	}
+	d.EnabledProjectIDs = filtered
+	d.syncLegacyProjectProjection()
+}
+
+// IsProjectEnabled reports whether id is in the project-admission set.
+func (d *DaemonYAML) IsProjectEnabled(id string) bool {
+	d.normalizeProjectContract()
+	for _, existing := range d.EnabledProjectIDs {
+		if existing == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *DaemonYAML) normalizeProjectContract() {
+	legacy := d.ProjectAdmissionVersion == 0
+	seen := make(map[string]struct{}, len(d.EnabledProjectIDs)+len(d.Projects))
+	ids := make([]string, 0, len(d.EnabledProjectIDs)+len(d.Projects))
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for _, id := range d.EnabledProjectIDs {
+		add(id)
+	}
+	if legacy {
+		for _, project := range d.Projects {
+			projectID := project.ID
+			if strings.TrimSpace(projectID) == "" {
+				projectID = DeriveProjectID(project.RepoURL)
+			}
+			add(projectID)
+		}
+	}
+	slices.Sort(ids)
+	if ids == nil {
+		ids = []string{}
+	}
+	d.EnabledProjectIDs = ids
+	d.Repositories = normalizeRepositoryEntries(d.Repositories, d.Projects)
+}
+
+func (d *DaemonYAML) migrateProjectAdmissionV2() {
+	d.normalizeProjectContract()
+	d.ProjectAdmissionVersion = ProjectAdmissionVersionV2
+}
+
+func normalizeRepositoryEntries(v2 []RepositoryEntry, legacy []ProjectEntry) []RepositoryEntry {
+	byKey := make(map[string]RepositoryEntry, len(v2)+len(legacy))
+	order := make([]string, 0, len(v2)+len(legacy))
+	add := func(repository RepositoryEntry, wins bool) {
+		repository.ProjectID = strings.TrimSpace(repository.ProjectID)
+		repository.Source = strings.TrimSpace(repository.Source)
+		if repository.ProjectID == "" || repository.Source == "" {
+			return
+		}
+		if repository.ID == "" {
+			repository.ID = deriveRepositoryID(repository.ProjectID, repository.Source)
+		}
+		if repository.CloneStrategy == "" {
+			repository.CloneStrategy = CloneShallow
+		}
+		key := repository.ProjectID + "\x00" + normalizeRepositoryEntrySource(repository.Source)
+		if _, exists := byKey[key]; exists && !wins {
+			return
+		}
+		if _, exists := byKey[key]; !exists {
+			order = append(order, key)
+		}
+		byKey[key] = repository
+	}
+	for _, project := range legacy {
+		projectID := project.ID
+		if strings.TrimSpace(projectID) == "" {
+			projectID = DeriveProjectID(project.RepoURL)
+		}
+		add(RepositoryEntry{
+			ID:               deriveRepositoryID(projectID, project.RepoURL),
+			ProjectID:        projectID,
+			Source:           project.RepoURL,
+			CloneStrategy:    project.CloneStrategy,
+			CredentialHelper: project.CredentialHelper,
+		}, false)
+	}
+	for _, repository := range v2 {
+		add(repository, true)
+	}
+	slices.Sort(order)
+	out := make([]RepositoryEntry, 0, len(order))
+	for _, key := range order {
+		out = append(out, byKey[key])
+	}
+	return out
+}
+
+func normalizeRepositoryEntrySource(source string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(source), "/"), ".git"))
+}
+
+func deriveRepositoryID(projectID, source string) string {
+	sum := sha256.Sum256([]byte(projectID + "\x00" + normalizeRepositoryEntrySource(source)))
+	return fmt.Sprintf("repo-%x", sum[:6])
+}
+
+func (d *DaemonYAML) syncLegacyProjectProjection() {
+	if d.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {
+		return
+	}
+	enabled := make(map[string]struct{}, len(d.EnabledProjectIDs))
+	for _, id := range d.EnabledProjectIDs {
+		enabled[id] = struct{}{}
+	}
+	projects := make([]ProjectEntry, 0, len(d.Repositories))
+	for _, repository := range d.Repositories {
+		if _, ok := enabled[repository.ProjectID]; !ok {
+			continue
+		}
+		projects = append(projects, ProjectEntry{
+			ID:               repository.ProjectID,
+			RepoURL:          repository.Source,
+			CloneStrategy:    repository.CloneStrategy,
+			CredentialHelper: repository.CredentialHelper,
+		})
+	}
+	d.Projects = projects
 }
 
 // derivedIDCleanRE matches any character outside [a-z0-9-] for sanitisation.

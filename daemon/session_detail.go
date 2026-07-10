@@ -41,6 +41,12 @@ type SessionDetail struct {
 	// ProjectName is the canonical Linear project identifier.
 	ProjectName string `json:"projectName,omitempty"`
 
+	// ProjectID is the stable project-admission identity from the dispatch.
+	ProjectID string `json:"projectId,omitempty"`
+
+	// RepositoryID is the stable selected repository-resource identity.
+	RepositoryID string `json:"repositoryId,omitempty"`
+
 	// OrganizationID is the Rensei tenant UUID.
 	OrganizationID string `json:"organizationId,omitempty"`
 

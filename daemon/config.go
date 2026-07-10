@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/RenseiAI/donmai/internal/statepath"
@@ -20,10 +22,21 @@ import (
 // schema mirrors the TS DaemonConfig (donmai-architecture/004 §Configuration
 // shape).
 type Config struct {
-	APIVersion    string               `yaml:"apiVersion"             json:"apiVersion"`
-	Kind          string               `yaml:"kind"                   json:"kind"`
-	Machine       MachineConfig        `yaml:"machine"                json:"machine"`
-	Capacity      CapacityConfig       `yaml:"capacity"               json:"capacity"`
+	APIVersion              string         `yaml:"apiVersion"                       json:"apiVersion"`
+	Kind                    string         `yaml:"kind"                             json:"kind"`
+	ProjectAdmissionVersion int            `yaml:"projectAdmissionVersion,omitempty" json:"projectAdmissionVersion,omitempty"`
+	Machine                 MachineConfig  `yaml:"machine"                  json:"machine"`
+	Capacity                CapacityConfig `yaml:"capacity"                 json:"capacity"`
+	// EnabledProjectIDs is the authoritative project-admission set. A
+	// project may be admitted before it has any repository resources.
+	// Legacy projects[] entries are projected only when
+	// ProjectAdmissionVersion is absent. Version 2 makes this set authoritative,
+	// including when it is empty.
+	EnabledProjectIDs []string           `yaml:"enabledProjectIds,omitempty" json:"enabledProjectIds,omitempty"`
+	Repositories      []RepositoryConfig `yaml:"repositories,omitempty"      json:"repositories,omitempty"`
+	// Projects is the legacy compatibility projection. Version 2 readers use
+	// Repositories; writers retain enabled repository-bearing entries here for
+	// one mixed-version window.
 	Projects      []ProjectConfig      `yaml:"projects,omitempty"     json:"projects,omitempty"`
 	Orchestrator  OrchestratorConfig   `yaml:"orchestrator"           json:"orchestrator"`
 	AutoUpdate    AutoUpdateConfig     `yaml:"autoUpdate"             json:"autoUpdate"`
@@ -57,6 +70,10 @@ type Config struct {
 	Trust TrustConfig `yaml:"trust,omitempty"        json:"trust,omitempty"`
 }
 
+// ProjectAdmissionVersionV2 marks enabledProjectIds as the sole project
+// admission authority. Zero is the legacy repository-derived contract.
+const ProjectAdmissionVersionV2 = 2
+
 // MachineConfig captures the machine identity block from daemon.yaml.
 type MachineConfig struct {
 	ID     string `yaml:"id"               json:"id"`
@@ -80,12 +97,27 @@ type ReservedSystemSpec struct {
 	MemoryMb int `yaml:"memoryMb" json:"memoryMb"`
 }
 
-// ProjectConfig describes one entry in the project allowlist.
+// ProjectConfig describes one repository resource bound to a project. More
+// than one entry may share an ID; project admission is controlled separately
+// by Config.EnabledProjectIDs.
 type ProjectConfig struct {
+	RepositoryID  string        `yaml:"-"                        json:"repositoryId,omitempty"`
+	Primary       bool          `yaml:"-"                        json:"primary,omitempty"`
 	ID            string        `yaml:"id"                       json:"id"`
 	Repository    string        `yaml:"repository"               json:"repository"`
 	CloneStrategy CloneStrategy `yaml:"cloneStrategy,omitempty"  json:"cloneStrategy,omitempty"`
 	Git           *ProjectGit   `yaml:"git,omitempty"            json:"git,omitempty"`
+}
+
+// RepositoryConfig is one repository resource linked to a project. Repository
+// identity and project admission are independent.
+type RepositoryConfig struct {
+	ID            string        `yaml:"id"                      json:"id"`
+	ProjectID     string        `yaml:"projectId"               json:"projectId"`
+	Source        string        `yaml:"source"                  json:"source"`
+	Primary       bool          `yaml:"primary,omitempty"       json:"primary,omitempty"`
+	CloneStrategy CloneStrategy `yaml:"cloneStrategy,omitempty" json:"cloneStrategy,omitempty"`
+	Git           *ProjectGit   `yaml:"git,omitempty"           json:"git,omitempty"`
 }
 
 // UnmarshalYAML accepts either the canonical `repository` key or the legacy
@@ -240,11 +272,11 @@ func LoadConfig(path string) (*Config, error) {
 	if envTok := os.Getenv("DONMAI_DAEMON_TOKEN"); envTok != "" {
 		cfg.Orchestrator.AuthToken = envTok
 	}
-
 	if err := validateConfig(&cfg); err != nil {
 		return nil, fmt.Errorf("invalid daemon config %q: %w", path, err)
 	}
 
+	normalizeProjectContract(&cfg)
 	applyDefaults(&cfg)
 	return &cfg, nil
 }
@@ -256,7 +288,17 @@ func WriteConfig(path string, cfg *Config) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config dir %q: %w", dir, err)
 	}
-	data, err := yaml.Marshal(cfg)
+	normalized := *cfg
+	normalizeProjectContract(&normalized)
+	if normalized.ProjectAdmissionVersion == 0 {
+		// Keep a legacy write legacy. The enabled set is an in-memory
+		// projection until the first successful v2 mutation.
+		normalized.EnabledProjectIDs = nil
+		normalized.Repositories = nil
+	} else {
+		syncLegacyProjectProjection(&normalized)
+	}
+	data, err := yaml.Marshal(&normalized)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
@@ -273,6 +315,7 @@ func WriteConfig(path string, cfg *Config) error {
 
 // applyDefaults fills in zero-valued fields with their schema defaults.
 func applyDefaults(c *Config) {
+	normalizeProjectContract(c)
 	if c.APIVersion == "" {
 		c.APIVersion = "donmai.dev/v1"
 	}
@@ -331,6 +374,169 @@ func applyDefaults(c *Config) {
 	}
 }
 
+// EffectiveEnabledProjectIDs returns the normalized project-admission set.
+// Explicit v2 entries are authoritative. When that key is absent, legacy
+// repository-bearing projects[] entries are projected so old configurations
+// retain their complete working behavior.
+func (c *Config) EffectiveEnabledProjectIDs() []string {
+	if c == nil {
+		return nil
+	}
+	if c.ProjectAdmissionVersion == ProjectAdmissionVersionV2 {
+		return normalizeProjectIDs(c.EnabledProjectIDs)
+	}
+	return normalizeProjectIDs(append(
+		append([]string(nil), c.EnabledProjectIDs...),
+		projectIDsFromRepositories(c.Projects)...,
+	))
+}
+
+func normalizeProjectContract(c *Config) {
+	if c == nil {
+		return
+	}
+	c.EnabledProjectIDs = c.EffectiveEnabledProjectIDs()
+	c.Repositories = normalizeRepositories(c.Repositories, c.Projects)
+}
+
+func migrateProjectAdmissionV2(c *Config) bool {
+	if c == nil || c.ProjectAdmissionVersion == ProjectAdmissionVersionV2 {
+		return false
+	}
+	normalizeProjectContract(c)
+	c.ProjectAdmissionVersion = ProjectAdmissionVersionV2
+	return true
+}
+
+func normalizeProjectIDs(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	ids := make([]string, 0, len(values))
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for _, id := range values {
+		add(id)
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return []string{}
+	}
+	return ids
+}
+
+func projectIDsFromRepositories(projects []ProjectConfig) []string {
+	ids := make([]string, 0, len(projects))
+	for _, project := range projects {
+		ids = append(ids, project.ID)
+	}
+	return normalizeProjectIDs(ids)
+}
+
+// EffectiveProjectConfigs projects normalized repository resources into the
+// legacy runtime shape consumed by the existing spawner and poll resolver.
+func (c *Config) EffectiveProjectConfigs() []ProjectConfig {
+	if c == nil {
+		return nil
+	}
+	repositories := normalizeRepositories(c.Repositories, c.Projects)
+	out := make([]ProjectConfig, 0, len(repositories))
+	for _, repository := range repositories {
+		out = append(out, ProjectConfig{
+			RepositoryID:  repository.ID,
+			Primary:       repository.Primary,
+			ID:            repository.ProjectID,
+			Repository:    repository.Source,
+			CloneStrategy: repository.CloneStrategy,
+			Git:           repository.Git,
+		})
+	}
+	return out
+}
+
+func normalizeRepositories(v2 []RepositoryConfig, legacy []ProjectConfig) []RepositoryConfig {
+	byKey := make(map[string]RepositoryConfig, len(v2)+len(legacy))
+	order := make([]string, 0, len(v2)+len(legacy))
+	add := func(repository RepositoryConfig, wins bool) {
+		repository.ProjectID = strings.TrimSpace(repository.ProjectID)
+		repository.Source = strings.TrimSpace(repository.Source)
+		if repository.ProjectID == "" || repository.Source == "" {
+			return
+		}
+		if repository.ID == "" {
+			repository.ID = legacyRepositoryID(repository.ProjectID, repository.Source)
+		}
+		if repository.CloneStrategy == "" {
+			repository.CloneStrategy = CloneShallow
+		}
+		key := repository.ProjectID + "\x00" + normalizeRepositorySource(repository.Source)
+		if _, exists := byKey[key]; exists && !wins {
+			return
+		}
+		if _, exists := byKey[key]; !exists {
+			order = append(order, key)
+		}
+		byKey[key] = repository
+	}
+	for _, project := range legacy {
+		add(RepositoryConfig{
+			ID:            legacyRepositoryID(project.ID, project.Repository),
+			ProjectID:     project.ID,
+			Source:        project.Repository,
+			CloneStrategy: project.CloneStrategy,
+			Git:           project.Git,
+		}, false)
+	}
+	for _, repository := range v2 {
+		add(repository, true)
+	}
+	sort.Strings(order)
+	out := make([]RepositoryConfig, 0, len(order))
+	for _, key := range order {
+		out = append(out, byKey[key])
+	}
+	return out
+}
+
+func normalizeRepositorySource(source string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(source), "/"), ".git"))
+}
+
+func legacyRepositoryID(projectID, source string) string {
+	sum := sha256.Sum256([]byte(projectID + "\x00" + normalizeRepositorySource(source)))
+	return fmt.Sprintf("repo-%x", sum[:6])
+}
+
+func syncLegacyProjectProjection(c *Config) {
+	if c == nil || c.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {
+		return
+	}
+	enabled := make(map[string]struct{}, len(c.EnabledProjectIDs))
+	for _, id := range c.EnabledProjectIDs {
+		enabled[id] = struct{}{}
+	}
+	projects := make([]ProjectConfig, 0, len(c.Repositories))
+	for _, repository := range c.Repositories {
+		if _, ok := enabled[repository.ProjectID]; !ok {
+			continue
+		}
+		projects = append(projects, ProjectConfig{
+			ID:            repository.ProjectID,
+			Repository:    repository.Source,
+			CloneStrategy: repository.CloneStrategy,
+			Git:           repository.Git,
+		})
+	}
+	c.Projects = projects
+}
+
 // validateConfig enforces required fields and value ranges.
 func validateConfig(c *Config) error {
 	if c.Machine.ID == "" {
@@ -341,6 +547,14 @@ func validateConfig(c *Config) error {
 	}
 	if c.Capacity.MaxConcurrentSessions < 0 {
 		return errors.New("capacity.maxConcurrentSessions must be >= 0")
+	}
+	if c.ProjectAdmissionVersion != 0 && c.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {
+		return fmt.Errorf("projectAdmissionVersion invalid: %d (want 2)", c.ProjectAdmissionVersion)
+	}
+	for i, id := range c.EnabledProjectIDs {
+		if strings.TrimSpace(id) == "" {
+			return fmt.Errorf("enabledProjectIds[%d] is required", i)
+		}
 	}
 	for i, p := range c.Projects {
 		if p.ID == "" {
@@ -353,6 +567,34 @@ func validateConfig(c *Config) error {
 		case "", CloneShallow, CloneFull, CloneReference:
 		default:
 			return fmt.Errorf("projects[%d].cloneStrategy invalid: %q", i, p.CloneStrategy)
+		}
+	}
+	repositoryIDs := make(map[string]struct{}, len(c.Repositories))
+	primaryByProject := make(map[string]string)
+	for i, repository := range c.Repositories {
+		if strings.TrimSpace(repository.ID) == "" {
+			return fmt.Errorf("repositories[%d].id is required", i)
+		}
+		if _, exists := repositoryIDs[repository.ID]; exists {
+			return fmt.Errorf("repositories[%d].id is duplicated: %q", i, repository.ID)
+		}
+		repositoryIDs[repository.ID] = struct{}{}
+		if strings.TrimSpace(repository.ProjectID) == "" {
+			return fmt.Errorf("repositories[%d].projectId is required", i)
+		}
+		if strings.TrimSpace(repository.Source) == "" {
+			return fmt.Errorf("repositories[%d].source is required", i)
+		}
+		switch repository.CloneStrategy {
+		case "", CloneShallow, CloneFull, CloneReference:
+		default:
+			return fmt.Errorf("repositories[%d].cloneStrategy invalid: %q", i, repository.CloneStrategy)
+		}
+		if repository.Primary {
+			if prior, exists := primaryByProject[repository.ProjectID]; exists {
+				return fmt.Errorf("repositories[%d].primary conflicts with %q for project %q", i, prior, repository.ProjectID)
+			}
+			primaryByProject[repository.ProjectID] = repository.ID
 		}
 	}
 	switch c.AutoUpdate.Channel {

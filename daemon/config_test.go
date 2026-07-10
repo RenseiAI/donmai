@@ -3,6 +3,7 @@ package daemon
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -167,6 +168,155 @@ func TestDefaultConfig_HasSaneDefaults(t *testing.T) {
 	}
 	if cfg.AutoUpdate.DrainTimeoutSeconds != 600 {
 		t.Errorf("drain = %d, want 600", cfg.AutoUpdate.DrainTimeoutSeconds)
+	}
+}
+
+func TestProjectContractMigration(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  int
+		allowed  []string
+		projects []ProjectConfig
+		wantIDs  []string
+	}{
+		{
+			name:     "legacy repositories imply admission",
+			projects: []ProjectConfig{{ID: "alpha", Repository: "example.com/acme/alpha"}},
+			wantIDs:  []string{"alpha"},
+		},
+		{
+			name:     "explicit empty v2 admission stays empty",
+			version:  ProjectAdmissionVersionV2,
+			allowed:  []string{},
+			projects: []ProjectConfig{{ID: "alpha", Repository: "example.com/acme/alpha"}},
+			wantIDs:  []string{},
+		},
+		{
+			name:    "project can be admitted without repositories",
+			version: ProjectAdmissionVersionV2,
+			allowed: []string{"beta"},
+			wantIDs: []string{"beta"},
+		},
+		{
+			name:     "multiple repositories share one admission identity",
+			projects: []ProjectConfig{{ID: "alpha", Repository: "example.com/acme/one"}, {ID: "alpha", Repository: "example.com/acme/two"}},
+			wantIDs:  []string{"alpha"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &Config{ProjectAdmissionVersion: test.version, EnabledProjectIDs: test.allowed, Projects: test.projects}
+			normalizeProjectContract(cfg)
+			if diff := strings.Join(cfg.EffectiveEnabledProjectIDs(), ","); diff != strings.Join(test.wantIDs, ",") {
+				t.Fatalf("EffectiveEnabledProjectIDs() = %v, want %v", cfg.EffectiveEnabledProjectIDs(), test.wantIDs)
+			}
+		})
+	}
+}
+
+func TestWriteConfig_PreservesLegacyAdmissionVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	cfg := &Config{
+		Machine:      MachineConfig{ID: "machine"},
+		Orchestrator: OrchestratorConfig{URL: "file:///tmp/queue"},
+		Projects: []ProjectConfig{
+			{ID: "alpha", Repository: "example.com/acme/one"},
+			{ID: "alpha", Repository: "example.com/acme/two"},
+		},
+	}
+	if err := WriteConfig(path, cfg); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(raw), "projectAdmissionVersion") || strings.Contains(string(raw), "enabledProjectIds") {
+		t.Fatalf("legacy write prematurely emitted v2 admission fields: %s", raw)
+	}
+}
+
+func TestWriteConfig_ExplicitEmptyAdmissionSurvivesRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	cfg := &Config{
+		Machine:                 MachineConfig{ID: "machine"},
+		Orchestrator:            OrchestratorConfig{URL: "file:///tmp/queue"},
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{},
+		Projects:                []ProjectConfig{{ID: "alpha", Repository: "example.com/acme/alpha"}},
+	}
+	if err := WriteConfig(path, cfg); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := loaded.EffectiveEnabledProjectIDs(); len(got) != 0 {
+		t.Fatalf("EffectiveEnabledProjectIDs() = %v, want empty", got)
+	}
+	if len(loaded.Repositories) != 1 {
+		t.Fatalf("Repositories = %+v, repository resource was not preserved", loaded.Repositories)
+	}
+	if len(loaded.Projects) != 0 {
+		t.Fatalf("Projects = %+v, disabled project leaked into legacy projection", loaded.Projects)
+	}
+}
+
+func TestRepositoryNormalization_V2WinsAndRetainsDistinctLegacy(t *testing.T) {
+	cfg := &Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{"alpha"},
+		Projects: []ProjectConfig{
+			{ID: "alpha", Repository: "https://example.com/acme/api.git", CloneStrategy: CloneShallow},
+			{ID: "alpha", Repository: "https://example.com/acme/web.git", CloneStrategy: CloneFull},
+		},
+		Repositories: []RepositoryConfig{{
+			ID:            "repo-api",
+			ProjectID:     "alpha",
+			Source:        "https://example.com/acme/api",
+			Primary:       true,
+			CloneStrategy: CloneFull,
+		}},
+	}
+	normalizeProjectContract(cfg)
+	if len(cfg.Repositories) != 2 {
+		t.Fatalf("Repositories = %+v, want v2 winner plus distinct legacy resource", cfg.Repositories)
+	}
+	var api RepositoryConfig
+	for _, repository := range cfg.Repositories {
+		if normalizeRepositorySource(repository.Source) == "https://example.com/acme/api" {
+			api = repository
+		}
+	}
+	if api.ID != "repo-api" || api.CloneStrategy != CloneFull || !api.Primary {
+		t.Fatalf("v2 repository did not win conflict: %+v", api)
+	}
+}
+
+func TestLegacyRepositoryID_IsStableAcrossEquivalentSources(t *testing.T) {
+	t.Parallel()
+	want := legacyRepositoryID("alpha", "https://EXAMPLE.com/acme/api.git/")
+	if got := legacyRepositoryID("alpha", "https://example.com/acme/api"); got != want {
+		t.Fatalf("legacyRepositoryID equivalent source = %q, want %q", got, want)
+	}
+	if got := legacyRepositoryID("beta", "https://example.com/acme/api"); got == want {
+		t.Fatalf("legacyRepositoryID did not incorporate project identity: %q", got)
+	}
+}
+
+func TestValidateConfig_RejectsMultiplePrimaryRepositories(t *testing.T) {
+	cfg := &Config{
+		Machine:      MachineConfig{ID: "machine"},
+		Orchestrator: OrchestratorConfig{URL: "file:///tmp/queue"},
+		Repositories: []RepositoryConfig{
+			{ID: "repo-a", ProjectID: "alpha", Source: "example.com/a", Primary: true},
+			{ID: "repo-b", ProjectID: "alpha", Source: "example.com/b", Primary: true},
+		},
+	}
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "primary conflicts") {
+		t.Fatalf("validateConfig() error = %v, want primary conflict", err)
 	}
 }
 

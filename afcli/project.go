@@ -185,7 +185,7 @@ func newProjectCredentialsCmd(rw configReaderWriter, bin string) *cobra.Command 
 				return fmt.Errorf("read daemon config: %w", err)
 			}
 
-			idx := cfg.FindProject(repoURL)
+			idx := cfg.FindRepository(repoURL)
 			if idx < 0 {
 				return fmt.Errorf(
 					"project %q is not in the allowlist — run `%s project allow %s` first",
@@ -203,7 +203,9 @@ func newProjectCredentialsCmd(rw configReaderWriter, bin string) *cobra.Command 
 				return fmt.Errorf("credential helper prompt: %w", promptErr)
 			}
 
-			cfg.Projects[idx].CredentialHelper = helper
+			if !cfg.SetRepositoryCredentialHelper(repoURL, helper) {
+				return fmt.Errorf("project %q disappeared from the allowlist", repoURL)
+			}
 
 			if err := rw.WriteConfig(cfg); err != nil {
 				return fmt.Errorf("write daemon config: %w", err)
@@ -249,7 +251,8 @@ func newProjectListCmd(rw configReaderWriter, bin string) *cobra.Command {
 
 			out := cmd.OutOrStdout()
 
-			if len(cfg.Projects) == 0 {
+			projects := cfg.RepositoryProjectEntries()
+			if len(projects) == 0 {
 				_, _ = fmt.Fprintln(out,
 					"No projects in the allowlist.\n"+
 						"  Add one with: "+bin+" project allow <repo-url>",
@@ -257,7 +260,7 @@ func newProjectListCmd(rw configReaderWriter, bin string) *cobra.Command {
 				return nil
 			}
 
-			return writeProjectTable(out, cfg.Projects)
+			return writeProjectTable(out, projects)
 		},
 	}
 }
@@ -326,7 +329,7 @@ func newProjectRemoveCmd(rw configReaderWriter) *cobra.Command {
 				return fmt.Errorf("read daemon config: %w", err)
 			}
 
-			if cfg.FindProject(repoURL) < 0 {
+			if cfg.FindRepository(repoURL) < 0 {
 				return fmt.Errorf("project %q not found in allowlist", repoURL)
 			}
 
