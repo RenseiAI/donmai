@@ -48,6 +48,21 @@ func newFakeProvider(t *testing.T, script string, opts Options) *Provider {
 	return p
 }
 
+// spawnFake retries the Linux ETXTBSY race that can occur when a concurrently
+// forking sibling test inherits the recently closed write descriptor for the
+// executable fixture. The policy matches the bounded fixture retry used by the
+// Amp harness tests.
+func spawnFake(ctx context.Context, t *testing.T, p *Provider, spec agent.Spec) (agent.Handle, error) {
+	t.Helper()
+	for attempt := 0; ; attempt++ {
+		h, err := p.Spawn(ctx, spec)
+		if err == nil || attempt >= 3 || !strings.Contains(err.Error(), "text file busy") {
+			return h, err
+		}
+		time.Sleep(time.Duration(25*(attempt+1)) * time.Millisecond)
+	}
+}
+
 // collectEvents drains a handle until a terminal ResultEvent, channel close, or
 // timeout.
 func collectEvents(t *testing.T, h agent.Handle) []agent.Event {
@@ -91,7 +106,7 @@ echo '<<<END_DONMAI_RESULT>>>'
 echo "WORK_RESULT:passed"
 `
 	p := newFakeProvider(t, script, Options{DisableTranscriptEnrichment: true})
-	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "task", Cwd: t.TempDir()})
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{Prompt: "task", Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -141,7 +156,7 @@ echo '{"status":"failed","summary":"could not"}'
 echo '<<<END_DONMAI_RESULT>>>'
 `
 	p := newFakeProvider(t, script, Options{DisableTranscriptEnrichment: true})
-	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "x", Cwd: t.TempDir()})
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{Prompt: "x", Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +171,7 @@ echo '<<<END_DONMAI_RESULT>>>'
 func TestSpawn_NoOutputNonzeroExit(t *testing.T) {
 	t.Parallel()
 	p := newFakeProvider(t, "exit 3\n", Options{DisableTranscriptEnrichment: true})
-	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "x", Cwd: t.TempDir()})
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{Prompt: "x", Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +203,7 @@ func TestSpawn_TranscriptEnrichment(t *testing.T) {
 		"echo done\n"
 
 	p := newFakeProvider(t, script, Options{StateHome: stateHome})
-	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "x", Cwd: t.TempDir()})
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{Prompt: "x", Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +239,7 @@ func TestSpawn_TranscriptLiveStreaming(t *testing.T) {
 		"echo done\n"
 
 	p := newFakeProvider(t, script, Options{StateHome: stateHome})
-	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "x", Cwd: t.TempDir()})
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{Prompt: "x", Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +300,7 @@ func TestSpawn_TrustWorkspaceOptIn(t *testing.T) {
 		TrustWorkspace:              true,
 		DisableTranscriptEnrichment: true,
 	})
-	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "x", Cwd: cwd})
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{Prompt: "x", Cwd: cwd})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +321,7 @@ func TestStop_Idempotent(t *testing.T) {
 	t.Parallel()
 	// A script that would run a while; Stop should terminate it promptly.
 	p := newFakeProvider(t, "sleep 30\n", Options{DisableTranscriptEnrichment: true})
-	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "x", Cwd: t.TempDir()})
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{Prompt: "x", Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
