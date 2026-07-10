@@ -731,7 +731,7 @@ func TestRegister_PopulatesProjectIDsIndependentlyOfRepositories(t *testing.T) {
 
 	_, err := Register(context.Background(), RegistrationOptions{
 		OrchestratorURL:         srv.URL,
-		RegistrationToken:       "rsk_live_test",
+		RegistrationToken:       "test-registration-token",
 		Hostname:                "host",
 		MaxAgents:               2,
 		JWTPath:                 filepath.Join(t.TempDir(), "daemon.jwt"),
