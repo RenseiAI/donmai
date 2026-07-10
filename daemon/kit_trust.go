@@ -50,6 +50,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sigstore/sigstore-go/pkg/bundle"
@@ -286,18 +287,27 @@ func validateTrustConfig(cfg TrustConfig) error {
 // 403) and spells out WHY the kit was rejected plus every remediation
 // path: allowlist the signer, one-time override, or switch the trust
 // mode. The CLI surfaces this text verbatim, so keep it actionable.
+type kitTrustGateError struct {
+	message string
+	result  afclient.KitSignatureResult
+}
+
+func (e *kitTrustGateError) Error() string { return e.message }
+func (e *kitTrustGateError) Unwrap() error { return ErrKitTrustGateRejected }
+
 func trustGateRejectionError(id string, verifyResult afclient.KitSignatureResult, mode TrustMode) error {
 	signer := verifyResult.SignerID
 	if signer == "" {
 		signer = "unknown"
 	}
-	return fmt.Errorf(
-		"%s: %w: kit is %s (signer: %s) and trust mode %q only installs signed kits from allowlisted signers. "+
+	message := fmt.Sprintf(
+		"%s: %v: kit is %s (signer: %s) and trust mode %q only installs signed kits from allowlisted signers. "+
 			"To proceed: add the kit's signer to trust.issuerSet in daemon.yaml, "+
 			"re-run the install with a one-time override (donmai kit install --allow-unsigned, audit-logged), "+
 			"or set %s=permissive / trust.mode: permissive to disable the gate entirely (not recommended)",
 		id, ErrKitTrustGateRejected, verifyResult.Trust, signer, mode, envKitTrustMode,
 	)
+	return &kitTrustGateError{message: message, result: verifyResult}
 }
 
 // newKitVerifierWithMaterial constructs a verifier with caller-supplied
@@ -396,6 +406,21 @@ func (v *kitVerifier) verifyEntity(kitID string, entity verify.SignedEntity, man
 		res.SignedAt = out.VerifiedTimestamps[0].Timestamp.UTC().Format(time.RFC3339)
 	}
 	res.Details = fmt.Sprintf("trust root: %s; manifest sha256: %s", v.rootSource, hex.EncodeToString(digest[:]))
+	return res
+}
+
+// verifyPackageEntity authenticates the canonical package descriptor. It is
+// deliberately separate from verifyEntity so API/audit callers can never
+// mistake manifest-only authentication for complete package verification.
+func (v *kitVerifier) verifyPackageEntity(kitID string, entity verify.SignedEntity, descriptorBytes []byte) afclient.KitSignatureResult {
+	res := v.verifyEntity(kitID, entity, descriptorBytes)
+	switch res.Trust {
+	case afclient.KitTrustLegacyManifestVerified:
+		res.Trust = afclient.KitTrustPackageVerified
+		res.Details = strings.Replace(res.Details, "manifest sha256:", "package descriptor sha256:", 1)
+	case afclient.KitTrustLegacyManifestUnverified:
+		res.Trust = afclient.KitTrustPackageSignedUnverified
+	}
 	return res
 }
 
@@ -525,18 +550,24 @@ func signerIDFromVerifyError(entity verify.SignedEntity) string {
 // resolveDefaultTrustMode; it is handled here as a belt-and-suspenders
 // guard.
 func (v *kitVerifier) trustGateAllows(trust afclient.KitTrustState) bool {
-	switch v.config.Mode {
-	case TrustModePermissive:
+	if v.config.Mode == TrustModePermissive {
 		slog.Warn("kit trust: PERMISSIVE mode is active — unsigned kits and kits from any OIDC issuer will be allowed to execute shell commands; set trust.mode: signed-by-allowlist or remove DONMAI_KIT_TRUST_MODE=permissive to enforce signature verification",
 			"trustState", string(trust),
 		)
+	}
+	return v.trustGateAllowsQuiet(trust)
+}
+
+func (v *kitVerifier) trustGateAllowsQuiet(trust afclient.KitTrustState) bool {
+	switch v.config.Mode {
+	case TrustModePermissive:
 		return true
 	case "", TrustModeSignedByAllowlist, TrustModeAttested:
-		return trust == afclient.KitTrustSignedVerified
+		return trust == afclient.KitTrustPackageVerified || trust == afclient.KitTrustLegacyManifestVerified
 	default:
 		// Unknown mode — fail-safe to allowlist semantics. validateConfig
 		// rejects unknown modes at load time so this branch is defensive.
-		return trust == afclient.KitTrustSignedVerified
+		return trust == afclient.KitTrustPackageVerified || trust == afclient.KitTrustLegacyManifestVerified
 	}
 }
 

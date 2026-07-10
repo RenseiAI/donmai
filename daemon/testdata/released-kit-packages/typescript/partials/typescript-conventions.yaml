@@ -1,0 +1,25 @@
+# TypeScript conventions prompt fragment
+# Injected during development, qa, and refinement work types
+
+name: typescript-conventions
+content: |
+  ## TypeScript Project Context
+
+  This project uses TypeScript. Follow these conventions:
+
+  ### Build & Test
+  - `npm run build` — compile the project
+  - `npm test` — run the test suite
+  - `npm run typecheck` — TypeScript type-checking (preferred as `validate`)
+
+  ### Code Style
+  - Use TypeScript strict mode (`strict: true` in tsconfig.json)
+  - Prefer named exports over default exports
+  - Prefer `import type` for type-only imports (verbatimModuleSyntax-safe)
+  - Avoid `any`; reach for `unknown` + narrowing instead
+  - Colocate tests with source files (`foo.test.ts` next to `foo.ts`)
+
+  ### Errors & Types
+  - Re-export types with `export type { Foo }` so verbatimModuleSyntax holds
+  - Read the FIRST tsc error — TypeScript errors cascade; fix the root cause
+  - Keep public APIs explicitly typed; let local inference do the rest

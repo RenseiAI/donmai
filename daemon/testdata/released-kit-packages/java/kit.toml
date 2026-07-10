@@ -1,0 +1,109 @@
+api = "rensei.dev/v1"
+
+# ---------------------------------------------------------------------------
+# Kit identity — Java foundation kit.
+#
+# Build-tool assumption: this kit's default commands assume a committed Maven
+# wrapper (./mvnw). Gradle projects should override commands via the local
+# manifest or a future gradle framework kit; the per-OS toolchain_install still
+# provisions the JDK regardless of build tool. See CONTRIBUTING.md.
+# ---------------------------------------------------------------------------
+
+[kit]
+id = "default/java"
+version = "1.0.0"
+name = "Java"
+description = "OSS default foundation kit for Java projects. Detects pom.xml / build.gradle(.kts) and provides Temurin JDK 17, Maven build/test commands, and Java conventions."
+author = "donmai"
+authorIdentity = "did:web:donmai.dev"
+license = "MIT"
+homepage = "https://donmai.dev"
+repository = "https://github.com/RenseiAI/donmai-kits"
+priority = 70
+
+[supports]
+os = ["linux", "macos", "windows"]
+arch = ["x86_64", "arm64"]
+
+[requires]
+rensei = "^1.0"
+capabilities = []
+
+# ---------------------------------------------------------------------------
+# Detection — Maven or Gradle project.
+# ---------------------------------------------------------------------------
+
+[detect]
+files = ["pom.xml", "build.gradle", "build.gradle.kts"]
+
+[detect.toolchain]
+java = "17"
+
+# ---------------------------------------------------------------------------
+# Contributions
+# ---------------------------------------------------------------------------
+
+[provide.commands]
+build    = "./mvnw -B -DskipTests package"
+test     = "./mvnw -B test"
+validate = "./mvnw -B compile"
+
+[provide.commands_override.windows]
+build    = "mvnw.cmd -B -DskipTests package"
+test     = "mvnw.cmd -B test"
+validate = "mvnw.cmd -B compile"
+
+[[provide.tool_permissions]]
+shell = "./mvnw *"
+
+[[provide.tool_permissions]]
+shell = "mvn *"
+
+[[provide.tool_permissions]]
+shell = "./gradlew *"
+
+[[provide.tool_permissions]]
+shell = "java *"
+
+[[provide.tool_permissions]]
+shell = "git *"
+
+[[provide.prompt_fragments]]
+partial = "java-conventions"
+when    = ["development", "qa", "refinement"]
+file    = "partials/java-conventions.yaml"
+
+[[provide.skills]]
+file = "skills/java-debugging/SKILL.md"
+id   = "java-debugging"
+
+[provide.workarea_config]
+clean_dirs    = ["target", "build", ".gradle"]
+# Preserve the Maven/Gradle local caches across acquisitions.
+preserve_dirs = ["~/.m2/repository", "~/.gradle/caches"]
+
+# Per-OS toolchain install — Eclipse Temurin JDK 17. Cloud sandboxes are
+# Linux → .linux is load-bearing (apt temurin with an Adoptium repo).
+[provide.toolchain_install.linux]
+jdk_17 = "apt-get update && apt-get install -y wget apt-transport-https gnupg && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg && echo 'deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(awk -F= \"/VERSION_CODENAME/{print $2}\" /etc/os-release) main' > /etc/apt/sources.list.d/adoptium.list && apt-get update && apt-get install -y temurin-17-jdk"
+
+[provide.toolchain_install.macos]
+jdk_17 = "brew install --cask temurin@17"
+
+[provide.toolchain_install.windows]
+jdk_17 = "winget install EclipseAdoptium.Temurin.17.JDK"
+
+[provide.hooks]
+post_acquire = "bin/setup.sh"
+
+[provide.hooks.os.windows]
+post_acquire = "bin\\setup.cmd"
+
+# ---------------------------------------------------------------------------
+# Composition
+# ---------------------------------------------------------------------------
+
+[composition]
+order          = "foundation"
+conflicts_with = []
+composes_with  = ["default/docker-compose", "default/postgres-dev"]

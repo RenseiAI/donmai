@@ -1,0 +1,27 @@
+# Python conventions prompt fragment
+# Injected during development, qa, and refinement work types
+
+name: python-conventions
+content: |
+  ## Python Project Context
+
+  This project uses Python 3.12. Follow these conventions:
+
+  ### Build & Test
+  - `python -m build` — build sdist/wheel (or `uv build`)
+  - `pytest` — run the test suite
+  - `ruff check .` — lint (part of validate)
+  - `mypy .` — static type-check (part of validate)
+  - `ruff format .` — apply formatting before committing
+
+  ### Code Style
+  - Add type hints to public function signatures; let `mypy` enforce them
+  - Prefer `pathlib.Path` over `os.path` string juggling
+  - Use f-strings; avoid `%`/`.format()` for new code
+  - Raise specific exceptions; never `except:` bare or swallow silently
+  - Keep functions small and pure where practical; isolate I/O at the edges
+
+  ### Environments & Dependencies
+  - Prefer `uv sync` (pyproject.toml) or a `.venv` + `pip install` (requirements)
+  - Never install into the system interpreter; always use a virtualenv
+  - This kit's post_acquire hook sets up dependencies automatically

@@ -1,0 +1,96 @@
+api = "rensei.dev/v1"
+
+# ---------------------------------------------------------------------------
+# Kit identity — Go foundation kit.
+# ---------------------------------------------------------------------------
+
+[kit]
+id = "default/go"
+version = "1.0.0"
+name = "Go"
+description = "OSS default foundation kit for Go projects. Detects go.mod and provides Go 1.23, build/test/vet commands, and Go conventions."
+author = "donmai"
+authorIdentity = "did:web:donmai.dev"
+license = "MIT"
+homepage = "https://donmai.dev"
+repository = "https://github.com/RenseiAI/donmai-kits"
+priority = 70
+
+[supports]
+os = ["linux", "macos", "windows"]
+arch = ["x86_64", "arm64"]
+
+[requires]
+rensei = "^1.0"
+capabilities = []
+
+# ---------------------------------------------------------------------------
+# Detection — any Go module.
+# ---------------------------------------------------------------------------
+
+[detect]
+files = ["go.mod"]
+
+# Pre-declare the toolchain pin so the workarea/sandbox can pre-warm Go 1.23.
+[detect.toolchain]
+go = "1.23"
+
+# ---------------------------------------------------------------------------
+# Contributions
+# ---------------------------------------------------------------------------
+
+[provide.commands]
+build    = "go build ./..."
+test     = "go test ./..."
+validate = "go vet ./..."
+
+[[provide.tool_permissions]]
+shell = "go *"
+
+[[provide.tool_permissions]]
+shell = "gofmt *"
+
+[[provide.tool_permissions]]
+shell = "git *"
+
+[[provide.prompt_fragments]]
+partial = "go-conventions"
+when    = ["development", "qa", "refinement"]
+file    = "partials/go-conventions.yaml"
+
+[[provide.skills]]
+file = "skills/go-debugging/SKILL.md"
+id   = "go-debugging"
+
+[provide.workarea_config]
+clean_dirs    = ["bin", "dist"]
+# Preserve the module + build caches across acquisitions to avoid re-download.
+preserve_dirs = ["~/go/pkg/mod", "~/.cache/go-build"]
+
+# Per-OS toolchain install. Cloud sandboxes are Linux → .linux is load-bearing.
+# NOTE(arch): the linux tarball install hardcodes amd64. arm64 cloud images
+# need a $(uname -m)-keyed variant or an OS+arch-keyed install map — see
+# CONTRIBUTING.md § "Authoring gotchas".
+[provide.toolchain_install.linux]
+go_1_23 = "curl -fsSL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz -o /tmp/go.tgz && rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tgz && ln -sf /usr/local/go/bin/go /usr/local/bin/go && ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt"
+
+[provide.toolchain_install.macos]
+go_1_23 = "brew install go@1.23 && brew link --overwrite --force go@1.23"
+
+[provide.toolchain_install.windows]
+go_1_23 = "winget install GoLang.Go"
+
+[provide.hooks]
+post_acquire = "bin/setup.sh"
+
+[provide.hooks.os.windows]
+post_acquire = "bin\\setup.cmd"
+
+# ---------------------------------------------------------------------------
+# Composition
+# ---------------------------------------------------------------------------
+
+[composition]
+order          = "foundation"
+conflicts_with = []
+composes_with  = ["default/docker-compose", "default/postgres-dev"]

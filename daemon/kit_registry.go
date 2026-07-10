@@ -1,6 +1,6 @@
-// Package daemon kit_registry.go — minimal in-process Kit registry that
-// scans the filesystem for installed kit manifests and exposes them via
-// the operator control API.
+// Package daemon kit_registry.go implements the in-process kit registry.
+// Complete packages are selected by an atomic immutable generation; flat
+// manifests remain a visibly weaker compatibility source.
 //
 // This is the OSS-execution-layer's "Local manifests" registry source
 // from the federation list in 005-kit-manifest-spec.md § "Registry
@@ -20,11 +20,9 @@
 //   - Enable/disable state is persisted to a sidecar file at
 //     ~/.donmai/kits/.state.json so toggle outcomes survive daemon
 //     restarts. The file is created on first toggle.
-//   - Install is currently a stub returning ErrKitInstallUnimplemented;
-//     fetching kits from a remote registry is deferred until the
-//     federation sources land.
-//   - Verify-signature returns KitTrustUnsigned for all kits in this
-//     wave (signing is partially implemented per the ADR caveat).
+//   - Git installs resolve exact package/legacy identities; other remote
+//     federation transports remain unimplemented.
+//   - Verify-signature reports package and legacy-manifest states separately.
 package daemon
 
 import (
@@ -197,6 +195,7 @@ type kitManifestTOML struct {
 		A2ASkills []struct {
 			ID          string `toml:"id"`
 			Description string `toml:"description"`
+			Endpoint    string `toml:"endpoint"`
 		} `toml:"a2a_skills"`
 		IntelligenceExtractors []struct {
 			Name     string `toml:"name"`
@@ -219,6 +218,15 @@ type kitManifestTOML struct {
 type KitRegistry struct {
 	scanPaths []string
 	verifier  *kitVerifier
+	// packageLimits bounds descriptor and payload work before allocation.
+	// Zero values resolve to conservative defaults; tests may inject lower
+	// limits without exposing a new daemon configuration surface.
+	packageLimits kitPackageLimits
+	// packageAfterInventory and packageFault are deterministic test seams for
+	// source-race and durability boundary coverage. Production leaves both nil.
+	packageAfterInventory func()
+	packageFault          func(string) error
+	packageSyncObserver   func(string)
 	// fetcher resolves git-source kit installs into local manifest
 	// paths so the registry can verify-then-persist. Tests can inject
 	// an alternate fetcher via the package-level setter on the
@@ -320,15 +328,16 @@ func (r *KitRegistry) TrustConfig() TrustConfig {
 // manifests log a warning and are excluded. Empty scan paths return an
 // empty slice with no error.
 func (r *KitRegistry) List() []afclient.Kit {
-	manifests := r.scan()
+	manifests, paths := r.scanWithPaths()
 	state := r.loadState()
 	disabled := make(map[string]struct{}, len(state.DisabledIDs))
 	for _, id := range state.DisabledIDs {
 		disabled[id] = struct{}{}
 	}
 	out := make([]afclient.Kit, 0, len(manifests))
-	for _, m := range manifests {
+	for i, m := range manifests {
 		k := manifestToKit(m)
+		r.applyInstalledKitEvidence(&k, paths[i])
 		if _, ok := disabled[k.ID]; ok {
 			k.Status = afclient.KitStatusDisabled
 		} else {
@@ -343,17 +352,18 @@ func (r *KitRegistry) List() []afclient.Kit {
 // Get returns the full manifest for a single kit id. Returns ErrKitNotFound
 // when the id is not registered.
 func (r *KitRegistry) Get(id string) (afclient.KitManifest, error) {
-	manifests := r.scan()
+	manifests, paths := r.scanWithPaths()
 	state := r.loadState()
 	disabled := make(map[string]struct{}, len(state.DisabledIDs))
 	for _, did := range state.DisabledIDs {
 		disabled[did] = struct{}{}
 	}
-	for _, m := range manifests {
+	for i, m := range manifests {
 		if m.Kit.ID != id {
 			continue
 		}
 		k := manifestToKit(m)
+		r.applyInstalledKitEvidence(&k, paths[i])
 		if _, ok := disabled[k.ID]; ok {
 			k.Status = afclient.KitStatusDisabled
 		} else {
@@ -369,11 +379,13 @@ func (r *KitRegistry) Get(id string) (afclient.KitManifest, error) {
 func (r *KitRegistry) Enable(id string) (afclient.Kit, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	manifests := r.scan()
+	manifests, paths := r.scanWithPaths()
 	var match *kitManifestTOML
+	matchPath := ""
 	for i := range manifests {
 		if manifests[i].Kit.ID == id {
 			match = &manifests[i]
+			matchPath = paths[i]
 			break
 		}
 	}
@@ -386,6 +398,7 @@ func (r *KitRegistry) Enable(id string) (afclient.Kit, error) {
 		return afclient.Kit{}, fmt.Errorf("save kit state: %w", err)
 	}
 	k := manifestToKit(*match)
+	r.applyInstalledKitEvidence(&k, matchPath)
 	k.Status = afclient.KitStatusActive
 	return k, nil
 }
@@ -395,11 +408,13 @@ func (r *KitRegistry) Enable(id string) (afclient.Kit, error) {
 func (r *KitRegistry) Disable(id string) (afclient.Kit, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	manifests := r.scan()
+	manifests, paths := r.scanWithPaths()
 	var match *kitManifestTOML
+	matchPath := ""
 	for i := range manifests {
 		if manifests[i].Kit.ID == id {
 			match = &manifests[i]
+			matchPath = paths[i]
 			break
 		}
 	}
@@ -414,6 +429,7 @@ func (r *KitRegistry) Disable(id string) (afclient.Kit, error) {
 		return afclient.Kit{}, fmt.Errorf("save kit state: %w", err)
 	}
 	k := manifestToKit(*match)
+	r.applyInstalledKitEvidence(&k, matchPath)
 	k.Status = afclient.KitStatusDisabled
 	return k, nil
 }
@@ -425,6 +441,27 @@ func (r *KitRegistry) Disable(id string) (afclient.Kit, error) {
 // outcomes map to KitTrustSignedVerified / KitTrustSignedUnverified;
 // see kit_trust.go for the full state machine.
 func (r *KitRegistry) VerifySignature(id string) (afclient.KitSignatureResult, error) {
+	if store := r.packageStoreRoot(); store != "" {
+		_, generation, generationErr := loadCurrentGeneration(store)
+		if generationErr != nil {
+			return afclient.KitSignatureResult{}, generationErr
+		}
+		for _, entry := range generation.Packages {
+			if entry.ID != id {
+				continue
+			}
+			packageDir := filepath.Join(store, "packages", "sha256", entry.Digest)
+			verified, err := r.verifyKitPackage(packageDir, kitPackageDescriptorName, entry.ID, entry.Version, "", nil)
+			verified.Signature.KitID = id
+			verified.Signature.PackageDigest = entry.Digest
+			if err != nil || verified.Digest != entry.Digest {
+				verified.Signature.Trust = afclient.KitTrustPackageSignedUnverified
+				verified.Signature.OK = false
+				verified.Signature.Details = fmt.Sprintf("package closure verification failed: %v", err)
+			}
+			return verified.Signature, nil
+		}
+	}
 	manifests, paths := r.scanWithPaths()
 	for i, m := range manifests {
 		if m.Kit.ID != id {
@@ -514,11 +551,14 @@ func (r *KitRegistry) installFromGit(id string, source afclient.KitInstallSource
 	}
 
 	ctx := context.Background()
-	fetched, cleanup, err := r.fetcher.Fetch(ctx, source)
+	fetched, cleanup, err := r.fetcher.Fetch(ctx, source, id, req.Version)
 	if err != nil {
 		return afclient.KitInstallResult{}, err
 	}
 	defer cleanup()
+	if fetched.DescriptorPath != "" {
+		return r.installFetchedPackage(id, req, fetched)
+	}
 
 	// Read the fetched manifest now so we can populate the install
 	// result envelope and double-check kit.id alignment with the
@@ -618,6 +658,7 @@ func (r *KitRegistry) installFromGit(id string, source afclient.KitInstallSource
 	kitSummary.SignerID = verifyResult.SignerID
 	kitSummary.SignedAt = verifyResult.SignedAt
 	kitSummary.Status = afclient.KitStatusActive
+	kitSummary.InstallKind = afclient.KitInstallKindLegacy
 
 	return afclient.KitInstallResult{
 		Kit:     kitSummary,
@@ -720,9 +761,8 @@ func (r *KitRegistry) DisableSource(name string) (afclient.KitRegistrySource, er
 // scan walks each scan path and returns the parsed manifests.
 // Malformed manifests are skipped with a warning.
 //
-// Per 005-kit-manifest-spec.md § "Daemon kit registry": "Multiple paths
-// are scanned in declaration order; later paths override earlier ones on
-// kit.id collision."
+// Scan order is never authority. The active package generation wins by exact
+// digest; ambiguous duplicate legacy identities are excluded.
 func (r *KitRegistry) scan() []kitManifestTOML {
 	manifests, _ := r.scanWithPaths()
 	return manifests
@@ -737,6 +777,34 @@ func (r *KitRegistry) scanWithPaths() ([]kitManifestTOML, []string) {
 		manifests []kitManifestTOML
 		paths     []string
 	)
+	// Immutable packages named by the active generation are authoritative.
+	// Invalid/tampered package material is excluded rather than falling back to
+	// a flat manifest with the same identity.
+	if store := r.packageStoreRoot(); store != "" {
+		_, generation, err := loadCurrentGeneration(store)
+		if err != nil {
+			slog.Warn("kit registry: load active package generation", "err", err)
+			return nil, nil
+		}
+		for _, entry := range generation.Packages {
+			packageDir := filepath.Join(store, "packages", "sha256", entry.Digest)
+			verified, err := r.verifyKitPackage(packageDir, kitPackageDescriptorName, entry.ID, entry.Version, "", nil)
+			if err != nil || verified.Digest != entry.Digest {
+				slog.Warn("kit registry: active package failed verification", "kitId", entry.ID, "digest", entry.Digest, "err", err)
+				seen[entry.ID] = -1 // reserve identity; never legacy-fallback.
+				continue
+			}
+			if r.verifier != nil && !r.verifier.trustGateAllowsQuiet(verified.Signature.Trust) {
+				slog.Warn("kit registry: active package no longer satisfies trust policy", "kitId", entry.ID, "trust", verified.Signature.Trust)
+				seen[entry.ID] = -1
+				continue
+			}
+			seen[entry.ID] = len(manifests)
+			manifests = append(manifests, verified.Manifest)
+			paths = append(paths, filepath.Join(packageDir, filepath.FromSlash(verified.Descriptor.Manifest)))
+		}
+	}
+	legacyConflicts := map[string]struct{}{}
 	for _, dir := range r.scanPaths {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -773,8 +841,13 @@ func (r *KitRegistry) scanWithPaths() ([]kitManifestTOML, []string) {
 				continue
 			}
 			if idx, ok := seen[m.Kit.ID]; ok {
-				manifests[idx] = m
-				paths[idx] = full
+				if idx >= 0 && isPackageManifestPath(paths[idx]) {
+					// The active generation explicitly binds this identity.
+					continue
+				}
+				if idx >= 0 {
+					legacyConflicts[m.Kit.ID] = struct{}{}
+				}
 				continue
 			}
 			seen[m.Kit.ID] = len(manifests)
@@ -782,7 +855,70 @@ func (r *KitRegistry) scanWithPaths() ([]kitManifestTOML, []string) {
 			paths = append(paths, full)
 		}
 	}
+	if len(legacyConflicts) > 0 {
+		filteredManifests := manifests[:0]
+		filteredPaths := paths[:0]
+		for i, manifest := range manifests {
+			if _, conflict := legacyConflicts[manifest.Kit.ID]; conflict && !isPackageManifestPath(paths[i]) {
+				slog.Warn("kit registry: excluding ambiguous legacy identity", "kitId", manifest.Kit.ID)
+				continue
+			}
+			filteredManifests = append(filteredManifests, manifest)
+			filteredPaths = append(filteredPaths, paths[i])
+		}
+		manifests, paths = filteredManifests, filteredPaths
+	}
 	return manifests, paths
+}
+
+func isRegularFileNoLinks(name string) bool {
+	root, err := os.OpenRoot(filepath.Dir(name))
+	if err != nil {
+		return false
+	}
+	defer func() { _ = root.Close() }()
+	info, err := root.Lstat(filepath.Base(name))
+	return err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && nlink(info) == 1
+}
+
+func isPackageManifestPath(name string) bool {
+	return isRegularFileNoLinks(filepath.Join(filepath.Dir(name), kitPackageDescriptorName))
+}
+
+func (r *KitRegistry) applyInstalledKitEvidence(kit *afclient.Kit, manifestPath string) {
+	kit.InstallKind = afclient.KitInstallKindLegacy
+	if !isPackageManifestPath(manifestPath) {
+		if r.verifier != nil {
+			if result, err := r.verifier.VerifyManifest(kit.ID, manifestPath); err == nil {
+				kit.Trust, kit.SignerID, kit.SignedAt = result.Trust, result.SignerID, result.SignedAt
+			}
+		}
+		return
+	}
+	kit.InstallKind = afclient.KitInstallKindPackage
+	kit.PackageDigest = filepath.Base(filepath.Dir(manifestPath))
+	verified, verifyErr := r.verifyKitPackage(filepath.Dir(manifestPath), kitPackageDescriptorName, kit.ID, kit.Version, "", nil)
+	if verifyErr != nil || verified.Digest != kit.PackageDigest {
+		kit.Status = afclient.KitStatusError
+		kit.Trust = afclient.KitTrustPackageSignedUnverified
+		return
+	}
+	kit.Trust, kit.SignerID, kit.SignedAt = verified.Signature.Trust, verified.Signature.SignerID, verified.Signature.SignedAt
+	store := r.packageStoreRoot()
+	_, generation, err := loadCurrentGeneration(store)
+	if err != nil {
+		kit.Status = afclient.KitStatusError
+		kit.Trust = afclient.KitTrustPackageSignedUnverified
+		return
+	}
+	kit.CatalogSnapshotDigest = generation.CatalogSnapshotDigest
+	for _, entry := range generation.Packages {
+		if entry.ID == kit.ID && entry.Digest == kit.PackageDigest {
+			return
+		}
+	}
+	kit.Status = afclient.KitStatusError
+	kit.Trust = afclient.KitTrustPackageSignedUnverified
 }
 
 // loadKitManifestFile decodes a single .kit.toml file.
@@ -869,6 +1005,7 @@ func manifestToKit(m kitManifestTOML) afclient.Kit {
 		Source:             afclient.KitSourceLocal,
 		Scope:              afclient.KitScopeProject,
 		Trust:              afclient.KitTrustUnsigned,
+		InstallKind:        afclient.KitInstallKindLegacy,
 		DetectFiles:        copyStrings(m.Detect.Files),
 		DetectExec:         m.Detect.Exec,
 		ProvidesCommands:   len(m.Provide.Commands) > 0,

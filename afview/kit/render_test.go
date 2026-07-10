@@ -267,8 +267,10 @@ func TestTrustSymbol_NoColor(t *testing.T) {
 		trust afclient.KitTrustState
 		want  string
 	}{
-		{afclient.KitTrustSignedVerified, "[verified]"},
-		{afclient.KitTrustSignedUnverified, "[signed/unverified]"},
+		{afclient.KitTrustPackageVerified, "[package-verified]"},
+		{afclient.KitTrustPackageSignedUnverified, "[package-signed/unverified]"},
+		{afclient.KitTrustLegacyManifestVerified, "[manifest-verified]"},
+		{afclient.KitTrustLegacyManifestUnverified, "[manifest-signed/unverified]"},
 		{afclient.KitTrustUnsigned, "[unsigned]"},
 	}
 	for _, c := range tests {
@@ -284,8 +286,10 @@ func TestTrustSymbol_Color(t *testing.T) {
 		trust afclient.KitTrustState
 		want  string
 	}{
-		{afclient.KitTrustSignedVerified, "✅"},
-		{afclient.KitTrustSignedUnverified, "⚠"},
+		{afclient.KitTrustPackageVerified, "✅"},
+		{afclient.KitTrustPackageSignedUnverified, "⚠"},
+		{afclient.KitTrustLegacyManifestVerified, "✅"},
+		{afclient.KitTrustLegacyManifestUnverified, "⚠"},
 		{afclient.KitTrustUnsigned, "🔓"},
 	}
 	for _, c := range tests {

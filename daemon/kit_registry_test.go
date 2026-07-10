@@ -205,21 +205,18 @@ func TestKitRegistry_EmptyIDExcluded(t *testing.T) {
 	}
 }
 
-func TestKitRegistry_MultipleScanPathsOverride(t *testing.T) {
+func TestKitRegistry_MultipleScanPathsConflictIsExcluded(t *testing.T) {
 	dirA := t.TempDir()
 	dirB := t.TempDir()
 	writeManifest(t, dirA, "spring", validKitTOML)
-	// Second scan path overrides on id collision per 005 § "Daemon kit registry".
+	// Scan order is not authority: duplicate legacy identities are ambiguous.
 	override := strings.Replace(validKitTOML, `version = "1.0.0"`, `version = "2.0.0"`, 1)
 	writeManifest(t, dirB, "spring", override)
 
 	r := NewKitRegistry([]string{dirA, dirB})
 	kits := r.List()
-	if len(kits) != 1 {
-		t.Fatalf("want 1 kit after override, got %d", len(kits))
-	}
-	if kits[0].Version != "2.0.0" {
-		t.Errorf("override: want version 2.0.0, got %q", kits[0].Version)
+	if len(kits) != 0 {
+		t.Fatalf("want ambiguous legacy identity excluded, got %+v", kits)
 	}
 }
 

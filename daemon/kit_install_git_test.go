@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,7 @@ import (
 type fixtureFile struct {
 	name string // path relative to repo root (may include subdirs)
 	body string
+	mode fs.FileMode
 }
 
 // newLocalGitFixture initialises a git repo under t.TempDir(), commits
@@ -74,7 +76,11 @@ func newLocalGitFixture(t *testing.T, files ...fixtureFile) string {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 			t.Fatalf("mkdir %q: %v", filepath.Dir(dst), err)
 		}
-		if err := os.WriteFile(dst, []byte(f.body), 0o600); err != nil {
+		mode := f.mode
+		if mode == 0 {
+			mode = 0o600
+		}
+		if err := os.WriteFile(dst, []byte(f.body), mode); err != nil {
 			t.Fatalf("write %q: %v", dst, err)
 		}
 		if _, err := wt.Add(f.name); err != nil {
@@ -122,7 +128,7 @@ type hermeticFetcher struct {
 	bundleContent []byte // optional: written as <manifest>.sigstore on disk
 }
 
-func (h *hermeticFetcher) Fetch(_ context.Context, _ afclient.KitInstallSource) (*fetchedKit, func(), error) {
+func (h *hermeticFetcher) Fetch(_ context.Context, _ afclient.KitInstallSource, _, _ string) (*fetchedKit, func(), error) {
 	dir, err := os.MkdirTemp("", "rensei-hermetic-fetcher-")
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("temp dir: %w", err)

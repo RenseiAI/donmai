@@ -1,4 +1,6 @@
 bin/
+!daemon/testdata/released-kit-packages/*/bin/
+!daemon/testdata/released-kit-packages/*/bin/*
 /af
 
 # env files

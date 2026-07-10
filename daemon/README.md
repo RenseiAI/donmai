@@ -173,8 +173,14 @@ autoUpdate:
 ## Kit install trust gate
 
 Kit installs (`donmai kit install`, `POST /api/daemon/kits/<id>/install`)
-run through a sigstore signature verifier before anything is persisted. The
-trust policy lives in `daemon.yaml`'s top-level `trust` block:
+prefer complete `donmai.dev/kit-package/v1` packages. The daemon authenticates
+the canonical descriptor first, verifies the exact path/digest/size/mode
+inventory in a private same-filesystem staging directory, and atomically
+activates an immutable package digest through a durable registry generation.
+Failures leave the prior generation active. Flat manifest installs remain a
+compatibility path and are labeled `legacy-manifest-*`; their signature does
+not authenticate payload files. The trust policy lives in `daemon.yaml`'s
+top-level `trust` block:
 
 ```yaml
 trust:
@@ -202,8 +208,15 @@ commands):
   `DONMAI_KIT_TRUST_MODE=permissive` before starting the daemon. Permissive
   mode logs a prominent warning on every gated install.
 
-`donmai kit verify <id>` shows a kit's current trust state and signer so you
-can decide what to allowlist.
+`donmai kit verify <id>` shows one of `package-verified`,
+`package-signed-unverified`, `legacy-manifest-verified`,
+`legacy-manifest-unverified`, or `unsigned`, plus the signer and package digest
+when applicable. These states are deliberately not interchangeable.
+
+This package-installer substrate does not implement signed catalog snapshot
+synchronization or generic-command owner/delegation composition. Those remain
+separate fail-closed prerequisites before the broader catalog can expand; a
+verified package claim covers package bytes and atomic activation only.
 
 ## Operator runbook — debugging a stuck session
 

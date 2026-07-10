@@ -1,0 +1,25 @@
+# Go conventions prompt fragment
+# Injected during development, qa, and refinement work types
+
+name: go-conventions
+content: |
+  ## Go Project Context
+
+  This project uses Go. Follow these conventions:
+
+  ### Build & Test
+  - `go build ./...` — build every package
+  - `go test ./...` — run the full test suite (add `-race` for concurrency code)
+  - `go vet ./...` — static analysis (preferred as `validate`)
+  - `gofmt -w .` (or `gofumpt -w .`) — format before committing
+
+  ### Code Style
+  - Wrap errors with context: `fmt.Errorf("doing X: %w", err)`
+  - Return errors; never `panic` / `log.Fatal` in library code
+  - Accept interfaces, return concrete types
+  - Table-driven tests with the stdlib `testing` package (no assertion libs)
+  - Keep package names lowercase and single-word; export with PascalCase
+
+  ### Modules
+  - `go mod tidy` after changing imports; commit go.mod + go.sum together
+  - `go mod download` to pre-fetch dependencies (this kit's post_acquire hook)

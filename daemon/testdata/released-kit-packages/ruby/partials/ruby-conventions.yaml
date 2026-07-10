@@ -1,0 +1,26 @@
+# Ruby conventions prompt fragment
+# Injected during development, qa, and refinement work types
+
+name: ruby-conventions
+content: |
+  ## Ruby Project Context
+
+  This project uses Ruby 3.3 with Bundler. Follow these conventions:
+
+  ### Build & Test
+  - `bundle exec rake build` — build the gem (where a gemspec exists)
+  - `bundle exec rspec` — run the spec suite (or `bundle exec rake test`)
+  - `bundle exec rubocop` — lint / style gate (validate)
+  - `bundle exec rubocop -A` — auto-correct safe offenses before committing
+  - Always run tools via `bundle exec` so the locked gem versions are used
+
+  ### Code Style
+  - Follow the rubocop config in the repo; fix offenses rather than disabling
+  - Prefer keyword arguments for clarity on multi-arg methods
+  - Use `frozen_string_literal: true` magic comments
+  - Raise specific exception classes; avoid rescuing bare `StandardError` broadly
+  - Keep methods short; extract private helpers over deep nesting
+
+  ### Dependencies
+  - `bundle install` resolves gems against Gemfile.lock (this kit's post_acquire)
+  - Commit Gemfile.lock for applications; gems typically gitignore it

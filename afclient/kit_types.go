@@ -28,15 +28,33 @@ const (
 	KitSourceCommunity   KitSource = "community"   // tenant-declared community/enterprise registries
 )
 
-// KitTrustState encodes the three trust states visible in the operator
-// surface, mirroring ProviderTrustState for consistency.
+// KitTrustState reports exactly which bytes a verifier authenticated.
+// Package and legacy-manifest verification are intentionally distinct:
+// authenticating kit.toml alone does not authenticate package payloads.
 type KitTrustState string
 
-// Kit trust states (mirror of ProviderTrustState).
+// Kit trust states.
 const (
-	KitTrustSignedVerified   KitTrustState = "signed-verified"
-	KitTrustSignedUnverified KitTrustState = "signed-unverified"
-	KitTrustUnsigned         KitTrustState = "unsigned"
+	KitTrustPackageVerified          KitTrustState = "package-verified"
+	KitTrustPackageSignedUnverified  KitTrustState = "package-signed-unverified"
+	KitTrustLegacyManifestVerified   KitTrustState = "legacy-manifest-verified"
+	KitTrustLegacyManifestUnverified KitTrustState = "legacy-manifest-unverified"
+	KitTrustUnsigned                 KitTrustState = "unsigned"
+
+	// Deprecated source aliases. These retain compile compatibility while
+	// deliberately serializing the honest legacy-manifest states.
+	KitTrustSignedVerified   = KitTrustLegacyManifestVerified
+	KitTrustSignedUnverified = KitTrustLegacyManifestUnverified
+)
+
+// KitInstallKind identifies the integrity/activation substrate backing a kit.
+type KitInstallKind string
+
+const (
+	// KitInstallKindPackage is a digest-bound immutable package generation.
+	KitInstallKindPackage KitInstallKind = "immutable-package"
+	// KitInstallKindLegacy is the flat-manifest compatibility path.
+	KitInstallKindLegacy KitInstallKind = "legacy-manifest"
 )
 
 // KitScope is the activation scope level, mirroring ProviderScope.
@@ -75,6 +93,12 @@ type Kit struct {
 	Trust    KitTrustState `json:"trust"`
 	SignerID string        `json:"signerId,omitempty"`
 	SignedAt string        `json:"signedAt,omitempty"`
+	// InstallKind distinguishes generation-bound immutable packages from
+	// compatibility-path flat manifests.
+	InstallKind           KitInstallKind `json:"installKind"`
+	PackageDigest         string         `json:"packageDigest,omitempty"`
+	CatalogSnapshotDigest string         `json:"catalogSnapshotDigest,omitempty"`
+	CompositionDigest     string         `json:"compositionDigest,omitempty"`
 
 	// Detect summary — shows what the kit detects without running detect.
 	DetectFiles []string `json:"detectFiles,omitempty"`
@@ -181,8 +205,9 @@ type KitInstallSource struct {
 	URL string `json:"url"`
 	// Ref is the optional git ref (branch/tag/commit). Default: HEAD.
 	Ref string `json:"ref,omitempty"`
-	// ManifestPath is the optional path inside the source to the kit
-	// manifest. Default: registry walks the source root for *.kit.toml.
+	// ManifestPath is the optional path inside the source to kit.toml or
+	// kit.package.json. Default: resolve exactly one package descriptor by the
+	// requested identity, with legacy fallback only when no descriptors exist.
 	ManifestPath string `json:"manifestPath,omitempty"`
 }
 
@@ -213,12 +238,13 @@ type KitInstallResult struct {
 
 // KitSignatureResult is returned by GET /api/daemon/kits/<id>/verify-signature.
 type KitSignatureResult struct {
-	KitID    string        `json:"kitId"`
-	Trust    KitTrustState `json:"trust"`
-	SignerID string        `json:"signerId,omitempty"`
-	SignedAt string        `json:"signedAt,omitempty"`
-	OK       bool          `json:"ok"`
-	Details  string        `json:"details,omitempty"`
+	KitID         string        `json:"kitId"`
+	Trust         KitTrustState `json:"trust"`
+	PackageDigest string        `json:"packageDigest,omitempty"`
+	SignerID      string        `json:"signerId,omitempty"`
+	SignedAt      string        `json:"signedAt,omitempty"`
+	OK            bool          `json:"ok"`
+	Details       string        `json:"details,omitempty"`
 }
 
 // KitRegistrySource is a kit registry source descriptor.
