@@ -758,19 +758,9 @@ func (r *KitRegistry) DisableSource(name string) (afclient.KitRegistrySource, er
 	return src, nil
 }
 
-// scan walks each scan path and returns the parsed manifests.
-// Malformed manifests are skipped with a warning.
-//
-// Scan order is never authority. The active package generation wins by exact
-// digest; ambiguous duplicate legacy identities are excluded.
-func (r *KitRegistry) scan() []kitManifestTOML {
-	manifests, _ := r.scanWithPaths()
-	return manifests
-}
-
-// scanWithPaths is the same as scan but also returns each manifest's
-// on-disk file path (parallel-indexed). Used by VerifySignature /
-// Install to find the sibling `.sigstore` bundle file.
+// scanWithPaths returns each selected manifest and its parallel-indexed on-disk
+// path. Scan order is never authority: the active package generation wins by
+// exact digest and ambiguous duplicate legacy identities are excluded.
 func (r *KitRegistry) scanWithPaths() ([]kitManifestTOML, []string) {
 	var (
 		seen      = map[string]int{}

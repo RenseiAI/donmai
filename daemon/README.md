@@ -213,10 +213,26 @@ commands):
 `legacy-manifest-unverified`, or `unsigned`, plus the signer and package digest
 when applicable. These states are deliberately not interchangeable.
 
-This package-installer substrate does not implement signed catalog snapshot
-synchronization or generic-command owner/delegation composition. Those remain
-separate fail-closed prerequisites before the broader catalog can expand; a
-verified package claim covers package bytes and atomic activation only.
+Target-aware session preflight now retains every command as the structured
+`(kit id, local name, package digest)` identity and resolves generic aliases
+for the exact OS, work type, and repository path scope. Multiple overlapping
+claims fail before kit-controlled provisioning or command execution. An
+operator can select one exact claimant with the RFC 8785 canonical lock at
+`<first kit.scanPaths entry>/.composition.lock.json`; keeping this authority in
+the daemon's private store prevents the target repository from selecting its
+own command owner. Platform-supplied lifecycle demands remain authoritative,
+but their exact `id@version` selections undergo the same local ownership
+preflight. The resolved in-memory demand carries the qualified commands,
+generic bindings, and canonical `compositionDigest`; structured session logs
+currently emit that digest plus command and binding counts. Durable result
+evidence for the full command plan remains future work. Legacy manifests use
+their exact manifest-content digest for stable identity without upgrading
+their trust state.
+
+Signed owner/catalog delegation ingestion and signed catalog snapshot/TUF
+synchronization remain separate fail-closed prerequisites before broader
+catalog expansion. A verified package claim still covers package bytes and
+atomic activation only; it does not imply catalog freshness.
 
 ## Operator runbook — debugging a stuck session
 
