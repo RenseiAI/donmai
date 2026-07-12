@@ -2,11 +2,14 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -71,6 +74,49 @@ func mockPlatformServer(t *testing.T) *httptest.Server {
 		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
 	}))
 	return srv
+}
+
+// recordingPlatformServer is a mockPlatformServer that additionally captures
+// the sessionClass field observed on any /lock-refresh request body. It
+// accepts every session endpoint (200 OK) so result.Poster + heartbeat.Pulser
+// + activity/step-heartbeat posters all succeed. lastSessionClass reads the
+// most recent stamp (empty until a lock-refresh with a sessionClass lands).
+type recordingPlatformServer struct {
+	*httptest.Server
+	mu           sync.Mutex
+	sessionClass string
+	refreshes    int
+}
+
+// lastSessionClass returns the sessionClass most recently observed on a
+// lock-refresh body, and the count of lock-refresh calls seen.
+func (s *recordingPlatformServer) lastSessionClass() (string, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sessionClass, s.refreshes
+}
+
+func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
+	t.Helper()
+	rec := &recordingPlatformServer{}
+	rec.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/lock-refresh") {
+			var body struct {
+				SessionClass string `json:"sessionClass"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			rec.mu.Lock()
+			rec.refreshes++
+			if body.SessionClass != "" {
+				rec.sessionClass = body.SessionClass
+			}
+			rec.mu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+	}))
+	t.Cleanup(rec.Server.Close)
+	return rec
 }
 
 // gitInit initialises a fresh git repo at dir with a single committed

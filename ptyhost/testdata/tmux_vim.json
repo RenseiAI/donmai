@@ -1,0 +1,44 @@
+{
+  "name": "tmux_vim",
+  "description": "vim -u NONE inside tmux (status off), single full 80x24 pane, after gg/O/insert/Esc/G. Client-leg redraw recorded; compared byte-for-byte (per-cell text) against tmux capture-pane -p -e.",
+  "cmd": [
+    "tmux",
+    "-L",
+    "vtspike",
+    "attach",
+    "-t",
+    "s1",
+    "(vim -u NONE -i NONE -n vim_input.txt)"
+  ],
+  "env": [
+    "TERM=xterm-256color",
+    "COLORTERM=truecolor",
+    "LANG=en_US.UTF-8",
+    "LC_ALL=en_US.UTF-8"
+  ],
+  "cols": 80,
+  "rows": 24,
+  "bytes": 3323,
+  "checkpoints": [
+    {
+      "label": "attached_redraw",
+      "offset": 3147
+    }
+  ],
+  "how_recorded": "detached tmux session running vim; status off; drove edits via send-keys while detached; captured capture-pane -p -e + geometry + cursor as ground truth; attached under creack/pty at 80x24 to record the full redraw; detached with C-b d.",
+  "reference": {
+    "panes": [
+      {
+        "id": "%0",
+        "left": 0,
+        "top": 0,
+        "width": 80,
+        "height": 24,
+        "active": true,
+        "cursor_x": 0,
+        "cursor_y": 22,
+        "capture_e": "LINE_0058 the quick brown fox jumps over the lazy dog\nLINE_0059 the quick brown fox jumps over the lazy dog\nLINE_0060 the quick brown fox jumps over the lazy dog\nLINE_0061 the quick brown fox jumps over the lazy dog\nLINE_0062 the quick brown fox jumps over the lazy dog\nLINE_0063 the quick brown fox jumps over the lazy dog\nLINE_0064 the quick brown fox jumps over the lazy dog\nLINE_0065 the quick brown fox jumps over the lazy dog\nLINE_0066 the quick brown fox jumps over the lazy dog\nLINE_0067 the quick brown fox jumps over the lazy dog\nLINE_0068 the quick brown fox jumps over the lazy dog\nLINE_0069 the quick brown fox jumps over the lazy dog\nLINE_0070 the quick brown fox jumps over the lazy dog\nLINE_0071 the quick brown fox jumps over the lazy dog\nLINE_0072 the quick brown fox jumps over the lazy dog\nLINE_0073 the quick brown fox jumps over the lazy dog\nLINE_0074 the quick brown fox jumps over the lazy dog\nLINE_0075 the quick brown fox jumps over the lazy dog\nLINE_0076 the quick brown fox jumps over the lazy dog\nLINE_0077 the quick brown fox jumps over the lazy dog\nLINE_0078 the quick brown fox jumps over the lazy dog\nLINE_0079 the quick brown fox jumps over the lazy dog\nLINE_0080 the quick brown fox jumps over the lazy dog\n\n"
+      }
+    ]
+  }
+}

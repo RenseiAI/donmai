@@ -44,6 +44,15 @@
 //     baseInstructions prefix — avoiding O(turns × prefix) input-token
 //     amplification on long sessions.
 //
+// # Interactive spawn mode (W4)
+//
+// HarnessCaps.SupportsInteractivePTY declares a SECOND, independent spawn
+// mode (interactive.go: SpawnInteractive): Spec.Interactive != nil routes
+// Spawn to the bare `codex` TUI under a PTY (provider/harness/ptycli)
+// instead of `codex app-server`/`codex exec`. It never touches the
+// JSON-RPC client or thread/turn machinery below — see interactive.go for
+// the full contract.
+//
 // # Approval bridge
 //
 // The codex app-server fires JSON-RPC server-requests (id + method) for

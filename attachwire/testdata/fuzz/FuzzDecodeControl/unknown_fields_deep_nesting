@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"type\":\"subscribe\",\"sessionId\":\"s\",\"asRole\":\"viewer\",\"resumeFrom\":null,\"resumeEpoch\":null,\"future\":{\"a\":{\"b\":{\"c\":[1,2,3,{\"d\":\"e\"}]}}},\"anotherFuture\":\"x\"}")

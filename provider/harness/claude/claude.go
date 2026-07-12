@@ -124,6 +124,13 @@ func (*Provider) Capabilities() agent.Capabilities {
 // returns an error wrapping agent.ErrSpawnFailed and cleans up any
 // half-allocated resources.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	// Interactive spawn mode (W4): capability-gated on the live manifest, not
+	// a static branch — a future edit that flips SupportsInteractivePTY back
+	// to false makes this a silent no-op fallthrough to the headless path
+	// rather than a crash. See interactive.go.
+	if spec.Interactive != nil && p.Manifest().Caps.SupportsInteractivePTY {
+		return p.spawnInteractive(ctx, spec)
+	}
 	return p.spawn(ctx, spec, "")
 }
 

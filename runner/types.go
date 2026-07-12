@@ -130,6 +130,18 @@ type ResolvedProfile struct {
 	ProviderConfig map[string]any `json:"providerConfig,omitempty"`
 }
 
+// interactiveRunMode is the QueuedWork.Mode value that activates the
+// PTY-hosted interactive-session dispatch path (spawn-under-PTY + outbound
+// relay attach, interactive-attach-v1). It is a DISTINCT mode from
+// interview.InterviewRunMode: the interview loop is a park-and-inject
+// model turn-taking loop with no PTY, whereas interactive mode runs a real
+// terminal under a pseudo-terminal and attaches a live byte stream. The
+// two must never be conflated — interactive must not trip the interview
+// branch or inherit its thinking-only tool lockdown. The platform emits
+// this literal on the wire (opaquely forwarded by the daemon SessionDetail
+// as QueuedWork.Mode); the runner is the consumer.
+const interactiveRunMode = "interactive"
+
 // isInterview reports whether this QueuedWork runs the interactive
 // interview loop rather than the one-shot headless path. The
 // discriminant is the platform-frozen Mode value (CONTRACT-FREEZE §4 /
@@ -137,6 +149,16 @@ type ResolvedProfile struct {
 // string) is a normal headless run.
 func (q *QueuedWork) isInterview() bool {
 	return q.Mode == interview.InterviewRunMode
+}
+
+// isInteractive reports whether this QueuedWork runs the PTY-hosted
+// interactive-session dispatch path (interactiveRunMode). It mirrors
+// isInterview and is mutually exclusive with it: a Mode value matches at
+// most one branch, so an interactive dispatch never enters the interview
+// loop (nor vice versa). Anything unrecognised (including the empty
+// string) falls through both to the normal headless path.
+func (q *QueuedWork) isInteractive() bool {
+	return q.Mode == interactiveRunMode
 }
 
 // harnessToProvider maps a platform-wire harness token (the catalog's

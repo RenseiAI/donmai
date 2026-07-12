@@ -423,6 +423,53 @@ func TestRequestBodyShape(t *testing.T) {
 	if !strings.Contains(*got, `"workerId":"w1"`) || !strings.Contains(*got, `"issueId":"i1"`) {
 		t.Fatalf("body missing workerId/issueId: %s", *got)
 	}
+	// A Config with no SessionClass must NOT emit the field (omitempty keeps
+	// the wire byte-identical for every headless / interview session — W4).
+	if strings.Contains(*got, "sessionClass") {
+		t.Fatalf("unset SessionClass leaked onto the wire: %s", *got)
+	}
+}
+
+// TestSessionClassStampedOnLockRefresh covers the W4 amendment-4 stamp: when
+// Config.SessionClass is set the lock-refresh body carries
+// `"sessionClass":"interactive"` so the platform's activity-stall reaper can
+// exempt an interactive session during human think-time. This is the named
+// cross-repo rail W3 reads.
+func TestSessionClassStampedOnLockRefresh(t *testing.T) {
+	t.Parallel()
+
+	var captured atomic.Pointer[string]
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		s := string(body)
+		captured.Store(&s)
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+	})
+
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:    "s1",
+		WorkerID:     "w1",
+		IssueID:      "i1",
+		SessionClass: "interactive",
+		BaseURL:      srv.URL,
+		HTTPClient:   srv.Client(),
+		Interval:     24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	got := captured.Load()
+	if got == nil {
+		t.Fatal("no body captured")
+	}
+	if !strings.Contains(*got, `"sessionClass":"interactive"`) {
+		t.Fatalf("lock-refresh body missing sessionClass stamp: %s", *got)
+	}
 }
 
 // TestInjectPayloadFiresOnInjectAndAcks covers the Wave 3 runtime

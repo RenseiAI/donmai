@@ -32,6 +32,7 @@ import (
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
 	providerollama "github.com/RenseiAI/donmai/provider/harness/ollama"
 	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
+	providershell "github.com/RenseiAI/donmai/provider/harness/shell"
 	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
@@ -598,6 +599,10 @@ func agentRunProviderCtors() []providerCtor {
 		// logged in on the host PATH. NOT for cloud sandboxes.
 		{name: "agy-cli", new: func() (agent.Provider, error) { return provideragycli.New(provideragycli.Options{}) }},
 		{name: "opencode", new: func() (agent.Provider, error) { return provideropencode.New(provideropencode.Options{}) }},
+		// shell is the interactive-only PTY harness (W4 interactive
+		// sessions): spawns ${SHELL:-/bin/sh} under ptyhost. Headless
+		// Spawn (Spec.Interactive == nil) fails loudly by design.
+		{name: "shell", new: func() (agent.Provider, error) { return providershell.New() }},
 	}
 }
 

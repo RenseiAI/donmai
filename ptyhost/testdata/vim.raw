@@ -1,0 +1,35 @@
+
+The default interactive shell is now zsh.
+To update your account to use zsh, please run `chsh -s /bin/zsh`.
+For more details, please visit https://support.apple.com/kb/HT208050.
+[?1034hbash-3.2$ PS1='SPIKE$ '
+SPIKE$ cd /home/user/terminal-fixture-recordings/vt-spike-session-dirxxxxxxxxxxx /home/user/terminal-fixture-recordings/vt-spike-session-dirxxxxxxxxxxxxxxxxxx
+SPIKE$ clear
+[H[2J[3JSPIKE$ echo PREVIM_MARKER_LINE
+PREVIM_MARKER_LINE
+SPIKE$ vim -u NONE -i NONE -n -N vim_input.txt
+[?1049h[>4;2m[?1h=[?2004h[?1004h[1;24r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[24;1H"vim_input.txt" 80L, 4320B[2;1H▽[6n[2;1H  [3;1HPzz\[0%m[6n[3;1H           [1;1H[>c[1;1HLINE_0001 the quick brown fox jumps over the lazy dog
+LINE_0002 the quick brown fox jumps over the lazy dog[2;54H[K[3;1HLINE_0003 the quick brown fox jumps over the lazy dog[3;54H[K[4;1HLINE_0004 the quick brown fox jumps over the lazy dog
+LINE_0005 the quick brown fox jumps over the lazy dog
+LINE_0006 the quick brown fox jumps over the lazy dog
+LINE_0007 the quick brown fox jumps over the lazy dog
+LINE_0008 the quick brown fox jumps over the lazy dog
+LINE_0009 the quick brown fox jumps over the lazy dog
+LINE_0010 the quick brown fox jumps over the lazy dog
+LINE_0011 the quick brown fox jumps over the lazy dog
+LINE_0012 the quick brown fox jumps over the lazy dog
+LINE_0013 the quick brown fox jumps over the lazy dog
+LINE_0014 the quick brown fox jumps over the lazy dog
+LINE_0015 the quick brown fox jumps over the lazy dog
+LINE_0016 the quick brown fox jumps over the lazy dog
+LINE_0017 the quick brown fox jumps over the lazy dog
+LINE_0018 the quick brown fox jumps over the lazy dog
+LINE_0019 the quick brown fox jumps over the lazy dog
+LINE_0020 the quick brown fox jumps over the lazy dog
+LINE_0021 the quick brown fox jumps over the lazy dog
+LINE_0022 the quick brown fox jumps over the lazy dog
+LINE_0023 the quick brown fox jumps over the lazy dog[1;1H[?25h[?25l[24;70Hgg[1;1H[24;70H  [1;1H[?25h[?4m[?25l[24;70HO[1;1H[24;70H [1;1H[24;1H[1m-- INSERT --[m[24;13H[K[1;1H[K[2;9H1[3;9H2[4;9H3[5;9H4[6;9H5[7;9H6[8;9H7[9;9H8[10;8H09[11;9H0[12;9H1[13;9H2[14;9H3[15;9H4[16;9H5[17;9H6[18;9H7[19;9H8[20;8H19[21;9H0[22;9H1[23;9H2[1;1H[?25h[?25lEDIT_SPIKE_LINE_XYZZY[?25h[24;1H[K[1;21H[?25l[24;70H^[[1;21H[?25h[?25l[24;70H  [1;22H[?25h[?25l[24;70HG[1;21H[24;70H [23;1H[1;1HLINE_0058 the quick brown fox jumps over the lazy dog[2;8H59[3;8H60[4;8H61[5;8H62[6;8H63[7;8H64[8;8H65[9;8H66[10;8H67[11;8H68[12;8H69[13;8H70[14;8H71[15;8H72[16;8H73[17;8H74[18;8H75[19;8H76[20;8H77[21;8H78[22;8H79[23;8H80[?25h[?25l
+:q![?2004l[>4;m[23;2t[23;1t[24;1H[K[24;1H[?1004l[?2004l[?1l>[?1049l[?25h[>4;mSPIKE$ echo POSTVIM_BACK
+POSTVIM_BACK
+SPIKE$ exit
+exit
