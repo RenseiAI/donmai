@@ -62,7 +62,7 @@ func TestVarintByteIdenticalToStdlib(t *testing.T) {
 		case 2:
 			x &= 0x3FFF
 		case 3:
-			x >>= uint(rng.Intn(64))
+			x >>= rng.Uint64() & 63
 		}
 		mine := AppendUvarint(nil, x)
 		std := binary.AppendUvarint(nil, x)

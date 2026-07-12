@@ -13,7 +13,7 @@ import (
 // EchoUnknown (0xFF), which biases predictive echo to SUPPRESSED (§10) — the
 // safe default. Callers that hold the slave fd should read that instead.
 func echoModeOfFd(fd uintptr) uint8 {
-	t, err := unix.IoctlGetTermios(int(fd), unix.TCGETS)
+	t, err := unix.IoctlGetTermios(fdToInt(fd), unix.TCGETS)
 	if err != nil {
 		return attachwire.EchoUnknown
 	}

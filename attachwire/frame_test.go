@@ -127,8 +127,8 @@ func TestFramePropertyRoundTrip(t *testing.T) {
 		}
 		f := Frame{
 			Type:    known[rng.Intn(len(known))],
-			Seq:     rng.Uint64() >> uint(rng.Intn(64)),
-			RelTime: rng.Uint64() >> uint(rng.Intn(64)),
+			Seq:     rng.Uint64() >> (rng.Uint64() & 63),
+			RelTime: rng.Uint64() >> (rng.Uint64() & 63),
 			Payload: payload,
 		}
 		got, err := DecodeFrame(f.Encode())

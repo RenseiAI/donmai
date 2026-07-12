@@ -316,7 +316,7 @@ func TestScreenPropertyRoundTrip(t *testing.T) {
 		rows := uint64(rng.Intn(4) + 1) //nolint:gosec // G115: Intn(4)+1 is bounded to 1-4, always fits uint64
 		n := cols * rows
 		s := Screen{
-			Epoch:          rng.Uint64() >> uint(rng.Intn(64)),
+			Epoch:          rng.Uint64() >> (rng.Uint64() & 63),
 			EchoMode:       []uint8{EchoOff, EchoOn, EchoUnknown}[rng.Intn(3)],
 			Cols:           cols,
 			Rows:           rows,
