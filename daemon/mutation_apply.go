@@ -80,6 +80,9 @@ func (d *Daemon) applyPendingMutations(_ context.Context, mutations []PendingMut
 }
 
 func (d *Daemon) applyOneMutation(m PendingMutation) error {
+	if m.Op == "session.kill" {
+		return d.applySessionKill(m)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.config == nil {
@@ -104,6 +107,48 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 		// platform can stop re-queueing.
 		return fmt.Errorf("unsupported mutation op %q (upgrade daemon?)", m.Op)
 	}
+}
+
+// ApplySessionMutations applies only runtime session mutations and ignores
+// config mutations. Downstream embedders with additional worker identities can
+// use it as HeartbeatOptions.OnPendingMutations while keeping config ownership
+// with each identity's own config pipeline.
+func (d *Daemon) ApplySessionMutations(_ context.Context, mutations []PendingMutation) (
+	applied []string,
+	failures []HeartbeatMutationFailure,
+) {
+	for _, m := range mutations {
+		if m.Op != "session.kill" {
+			continue
+		}
+		if err := d.applySessionKill(m); err != nil {
+			failures = append(failures, HeartbeatMutationFailure{ID: m.ID, Error: err.Error()})
+			continue
+		}
+		applied = append(applied, m.ID)
+	}
+	return applied, failures
+}
+
+func (d *Daemon) applySessionKill(m PendingMutation) error {
+	var params struct {
+		SessionID string `json:"sessionId"`
+		Reason    string `json:"reason"`
+	}
+	if err := json.Unmarshal(m.Params, &params); err != nil {
+		return fmt.Errorf("session.kill decode params: %w", err)
+	}
+	params.SessionID = strings.TrimSpace(params.SessionID)
+	if params.SessionID == "" {
+		return fmt.Errorf("session.kill requires sessionId")
+	}
+	if d.spawner == nil {
+		return fmt.Errorf("session.kill: worker spawner is not initialized")
+	}
+	if err := d.spawner.ForceKillSession(params.SessionID); err != nil {
+		return fmt.Errorf("session.kill: %w", err)
+	}
+	return nil
 }
 
 func (d *Daemon) applyProjectAddLocked(m PendingMutation) error {

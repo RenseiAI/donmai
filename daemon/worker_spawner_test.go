@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,27 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 )
+
+func TestSpawner_ForceKillSignalFailureKeepsSession(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"sleep", "30"},
+	})
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "signal-fails", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	s.killProcessGroup = func(*exec.Cmd) error { return errors.New("permission denied") }
+	if err := s.ForceKillSession("signal-fails"); err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("ForceKillSession error = %v", err)
+	}
+	if got := s.ActiveCount(); got != 1 {
+		t.Fatalf("failed signal removed session; ActiveCount=%d", got)
+	}
+	if !s.StopSession("signal-fails") {
+		t.Fatal("cleanup StopSession failed")
+	}
+}
 
 func TestSpawner_AcceptWork_ProjectAllowlist(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
