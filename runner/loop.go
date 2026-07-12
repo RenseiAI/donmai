@@ -475,6 +475,26 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		)
 	}
 
+	// Interactive mode: request spawn-under-PTY with a live interactive
+	// session surface (interactive-attach-v1). Spec.Interactive is
+	// capability-gated by the harness manifest — only PTY-transport
+	// harnesses honor it; any other harness ignores it (the same rule as
+	// every other Spec field), which the runner catches after Spawn by
+	// type-asserting the handle to agent.InteractiveCapable.
+	//
+	// Geometry is intentionally left at zero so ptyhost falls back to its
+	// 80×24 default (agent.InteractiveSpec § Cols/Rows): QueuedWork carries
+	// no viewport hint today, and the relay resizes the PTY authoritatively
+	// once the first viewer joins (spec § 8, applied verbatim), so a fixed
+	// initial geometry is not load-bearing. The asciinema-v2 recording lands
+	// in the session workarea next to events.jsonl, matching the workarea
+	// convention (state.AgentDirName).
+	if qw.isInteractive() {
+		spec.Interactive = &agent.InteractiveSpec{
+			RecordPath: filepath.Join(wpath, state.AgentDirName, "term.cast"),
+		}
+	}
+
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.
 	if _, err := r.store.Update(wpath, func(s *state.State) error {
@@ -588,9 +608,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		// and rejects the request with 400 when this is empty.
 		// Sourced from prompt.QueuedWork.IssueID (camelCase
 		// "issueId" on the wire).
-		IssueID:            qw.IssueID,
-		BaseURL:            qw.PlatformURL,
-		AuthToken:          qw.AuthToken,
+		IssueID:   qw.IssueID,
+		BaseURL:   qw.PlatformURL,
+		AuthToken: qw.AuthToken,
+		// SessionClass stamps every lock-refresh body with the runtime
+		// session class so the platform's activity-stall reaper exempts an
+		// interactive session during human think-time (W4 amendment 4 —
+		// the named cross-repo dependency W3 reads). "interactive" for the
+		// PTY-hosted interactive dispatch; empty for every other mode
+		// (omitempty keeps the wire byte-identical for headless/interview).
+		SessionClass:       interactiveSessionClass(qw),
 		CredentialProvider: hbCredentialProvider,
 		Interval:           r.hbInterval,
 		HTTPClient:         r.httpClient,
@@ -753,6 +780,22 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// the platform's /complete CloudEvent gate, not here).
 	if qw.isInterview() {
 		return r.dispatchInterview(ctx, handle, wpath, qw, res, sink, traceProcessor, injectCh)
+	}
+
+	// ── Interactive run-mode branch ───────────────────────────
+	//
+	// When qw.Mode == "interactive" the runner drives the PTY-hosted
+	// interactive session: attach the spawned InteractiveSession's live
+	// byte stream outbound to the relay (env-provided ATTACH_URL/
+	// ATTACH_TOKEN) and run until the child exits, ctx cancel, budget cap,
+	// or operator stop. Everything above (spawn, env, worktree, kit,
+	// state.json, heartbeat with the sessionClass stamp, activity) is shared
+	// and has already run. Steering / backstop / post-session are SKIPPED
+	// for the same reason interviews skip them: an interactive session
+	// produces no PR and drives no issue-tracker state transition — the
+	// lifecycle is owned by the human at the terminal, not the runner.
+	if qw.isInteractive() {
+		return r.dispatchInteractive(ctx, handle, wpath, qw, res, sink, pulser)
 	}
 
 	// 10. Stream events; wait for terminal.

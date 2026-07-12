@@ -60,6 +60,18 @@ type Config struct {
 	// Optional — when empty no auth header is set (test paths use
 	// httptest.Server without auth).
 	AuthToken string
+	// SessionClass is the runtime session-class discriminator stamped on
+	// every lock-refresh request body (wire field "sessionClass"). The
+	// runner sets it to "interactive" for a PTY-hosted interactive session
+	// so the platform's session-state store learns the class and its
+	// activity-stall reaper / idle-watchdog exempts human think-time — an
+	// interactive session must not be reaped while a human is thinking
+	// (ADR-2026-07-12-interactive-pty-session-host § "sessionClass on the
+	// host SessionState"; W4 amendment 4). Empty for every other mode:
+	// the omitempty tag keeps the wire byte-identical for existing
+	// (headless / interview) sessions, and an absent field reads as the
+	// unclassified default the platform already assumes.
+	SessionClass string
 	// CredentialProvider returns the latest worker id + runtime token.
 	// When set, every heartbeat tick calls it before posting so child
 	// runners can pick up daemon-side runtime-token refreshes mid-session.
@@ -534,7 +546,8 @@ func (p *Pulser) tick(ctx context.Context) {
 }
 
 // refreshRequest is the body shape sent to /api/sessions/<id>/lock-refresh.
-// Matches the legacy TS body plus the Wave 3 AckedInject echo.
+// Matches the legacy TS body plus the Wave 3 AckedInject echo and the W4
+// SessionClass stamp.
 type refreshRequest struct {
 	WorkerID string `json:"workerId,omitempty"`
 	IssueID  string `json:"issueId,omitempty"`
@@ -542,6 +555,12 @@ type refreshRequest struct {
 	// applied so the platform can mark it delivered and stop re-sending it.
 	// Empty until the first inject is received. Wave 3 runtime memory-inject.
 	AckedInject string `json:"ackedInject,omitempty"`
+	// SessionClass carries the runtime session-class discriminator (e.g.
+	// "interactive") so the platform's reaper / idle-watchdog exemption has
+	// something to read (W4 amendment 4; the named cross-repo dependency W3
+	// keys the interactive-session reaper exemption off). Empty for headless
+	// / interview sessions; omitempty keeps the wire byte-identical for them.
+	SessionClass string `json:"sessionClass,omitempty"`
 }
 
 // refreshResponse is the body shape returned by lock-refresh. The
@@ -573,9 +592,10 @@ type refreshResponse struct {
 func (p *Pulser) postRefresh(ctx context.Context, ack string) (*refreshResponse, error) {
 	creds := p.cfg.credentials(ctx)
 	body, err := json.Marshal(refreshRequest{
-		WorkerID:    creds.WorkerID,
-		IssueID:     p.cfg.IssueID,
-		AckedInject: ack,
+		WorkerID:     creds.WorkerID,
+		IssueID:      p.cfg.IssueID,
+		AckedInject:  ack,
+		SessionClass: p.cfg.SessionClass,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)

@@ -90,6 +90,24 @@ const (
 	// surfaces as cancelled rather than failed-and-retry.
 	FailureOperatorCancelled = "operator-cancelled"
 
+	// FailureInteractiveUnsupported indicates a mode:"interactive" dispatch
+	// spawned a handle that is NOT agent.InteractiveCapable (or whose
+	// InteractiveSession() is nil) — the resolved harness does not declare
+	// PTY transport, so Spec.Interactive was ignored and there is no live PTY
+	// surface to attach. This is a configuration/capability failure, not a
+	// crash: the fix is to route the session to a PTY-capable harness. The
+	// error names the harness so the misconfiguration is actionable.
+	FailureInteractiveUnsupported = "interactive-unsupported"
+
+	// FailureInteractiveConfig indicates a mode:"interactive" dispatch was
+	// half-configured for relay attach: exactly ONE of the ATTACH_URL /
+	// ATTACH_TOKEN env vars was present. A half-configured attach is a
+	// deployment misconfiguration (the composing daemon injects both or
+	// neither), so the runner fails loud rather than silently running
+	// local-only against a partial attach intent. Both-absent is the valid
+	// OSS-standalone local-only path; both-present drives the relay.
+	FailureInteractiveConfig = "interactive-config"
+
 	// FailureNoProgress indicates the idle/no-progress watchdog fired:
 	// the event stream produced no agent.Event for longer than the
 	// configured Options.IdleTimeout window. This catches the
