@@ -123,7 +123,7 @@ func mkInteractiveViewerToken(sessionID, userID, role string) string {
 
 func waitRelayBound(t *testing.T, relay *attachtest.StubRelay) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if relay.HostBound() {
 			return
@@ -131,6 +131,23 @@ func waitRelayBound(t *testing.T, relay *attachtest.StubRelay) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for the interactive host leg to bind")
+}
+
+// sendInputUntil re-sends data on the driver until effect() reports true or
+// the deadline elapses — the §5 client resend discipline the one-shot helper
+// lacks (the stub relay has no input_ack; see the call site).
+func sendInputUntil(ctx context.Context, t *testing.T, v *attachtest.Viewer, data []byte, effect func() bool, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := v.SendInput(ctx, data); err != nil {
+			t.Fatalf("SendInput: %v", err)
+		}
+		if effect() {
+			return true
+		}
+	}
+	return false
 }
 
 // waitForOutput drains the viewer's frames until an Output frame containing
@@ -373,7 +390,7 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderShell},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	resCh := make(chan *Result, 1)
@@ -394,10 +411,16 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = driver.Close() })
 
-	if err := driver.SendInput(ctx, []byte("hello\n")); err != nil {
-		t.Fatalf("driver SendInput: %v", err)
-	}
-	if !waitForOutput(driver, "got:hello", 15*time.Second) {
+	// Resend-until-echo: §5's delivery contract is client resend from
+	// ack+1 (input_ack); the stub relay implements no input_ack and its
+	// host sink DROPS on overflow / during host-rebind windows
+	// (attachtest/room.go sendToHost), so a one-shot send can be lost by
+	// design under load. Resending with fresh inputSeqs is the
+	// protocol-correct client behavior; duplicate echoes are harmless to
+	// the substring assertion.
+	if !sendInputUntil(ctx, t, driver, []byte("hello\n"), func() bool {
+		return waitForOutput(driver, "got:hello", 2*time.Second)
+	}, 30*time.Second) {
 		t.Fatal("driver never observed the shell echo (stamped input did not reach the PTY)")
 	}
 
@@ -408,22 +431,31 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 		t.Fatalf("attach late viewer: %v", err)
 	}
 	t.Cleanup(func() { _ = late.Close() })
-	if !waitForSnapshot(late, 15*time.Second) {
+	if !waitForSnapshot(late, 30*time.Second) {
 		t.Fatal("late-joining viewer never converged on a Snapshot")
 	}
 
-	// End the session cleanly → child exits 0 → completed Result.
-	if err := driver.SendInput(ctx, []byte("quit\n")); err != nil {
-		t.Fatalf("driver SendInput quit: %v", err)
-	}
-
-	select {
-	case res := <-resCh:
-		if res.Status != "completed" {
-			t.Fatalf("Run status=%q error=%q; want completed", res.Status, res.Error)
+	// End the session cleanly → child exits 0 → completed Result. Same
+	// resend discipline as above (the quit line can be dropped by the
+	// stub's host sink too; repeated "quit" lines are harmless — the
+	// shell exits on the first one it reads).
+	var res *Result
+	quitDeadline := time.After(40 * time.Second)
+quitLoop:
+	for {
+		if err := driver.SendInput(ctx, []byte("quit\n")); err != nil {
+			t.Fatalf("driver SendInput quit: %v", err)
 		}
-	case <-time.After(25 * time.Second):
-		t.Fatal("Run did not complete after the interactive child exited")
+		select {
+		case res = <-resCh:
+			break quitLoop
+		case <-quitDeadline:
+			t.Fatal("Run did not complete after the interactive child exited")
+		case <-time.After(2 * time.Second):
+		}
+	}
+	if res.Status != "completed" {
+		t.Fatalf("Run status=%q error=%q; want completed", res.Status, res.Error)
 	}
 
 	// The sessionClass stamp reached the lock-refresh double (W4 → W3 rail).
