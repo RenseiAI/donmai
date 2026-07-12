@@ -20,6 +20,7 @@
         "nativeJsonMode": false,
         "toolPermissionFormat": "claude",
         "streamingTransport": "ndjson",
+        "interactivePty": false,
         "drives": [
           "anthropic-messages"
         ],
@@ -52,6 +53,7 @@
         "nativeJsonMode": false,
         "toolPermissionFormat": "",
         "streamingTransport": "none",
+        "interactivePty": false,
         "drives": [
           "antigravity-oauth"
         ],
@@ -84,6 +86,7 @@
         "nativeJsonMode": false,
         "toolPermissionFormat": "claude",
         "streamingTransport": "ndjson",
+        "interactivePty": true,
         "drives": [
           "anthropic-messages"
         ],
@@ -122,6 +125,7 @@
         "nativeJsonMode": true,
         "toolPermissionFormat": "codex",
         "streamingTransport": "none",
+        "interactivePty": true,
         "drives": [
           "openai-chat",
           "openai-responses"
@@ -160,6 +164,7 @@
         "nativeJsonMode": true,
         "toolPermissionFormat": "claude",
         "streamingTransport": "ndjson",
+        "interactivePty": false,
         "drives": [
           "openai-chat"
         ],
@@ -196,6 +201,7 @@
         "nativeJsonMode": true,
         "toolPermissionFormat": "gemini",
         "streamingTransport": "sse",
+        "interactivePty": false,
         "drives": [
           "gemini-generate",
           "ollama"
@@ -218,6 +224,31 @@
       ]
     },
     {
+      "name": "shell",
+      "humanLabel": "Shell",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": false,
+        "resume": false,
+        "tools": false,
+        "mcp": false,
+        "allowedToolsList": false,
+        "subagents": false,
+        "reasoningEffort": false,
+        "oneShot": false,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "",
+        "streamingTransport": "none",
+        "interactivePty": true,
+        "drives": [],
+        "drivesHosts": [],
+        "transport": "pty"
+      },
+      "drives": [],
+      "drivesHosts": []
+    },
+    {
       "name": "stub",
       "humanLabel": "Test Stub",
       "family": "agent-runtime",
@@ -234,6 +265,7 @@
         "nativeJsonMode": true,
         "toolPermissionFormat": "claude",
         "streamingTransport": "none",
+        "interactivePty": false,
         "drives": [
           "stub"
         ],

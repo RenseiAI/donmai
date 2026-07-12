@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("\a\xe7\a\xe7\a\x0f{\"type\":\"grab\"}")

@@ -32,6 +32,12 @@ const (
 	ProviderOllama   ProviderName = "ollama"
 	ProviderOpenCode ProviderName = "opencode"
 	ProviderJules    ProviderName = "jules"
+	// ProviderShell is the bare interactive-only PTY harness
+	// (provider/harness/shell, W4). It drives no model endpoint and so is
+	// intentionally absent from the matrix's legacy-alias cell coverage
+	// (matrix/cells.go realProviderNames) — it is a spawn mode, not a
+	// (harness × model-endpoint) binding.
+	ProviderShell ProviderName = "shell"
 )
 
 // Capability names a single optional behavior a provider may support.
@@ -398,6 +404,15 @@ type Spec struct {
 	// for every existing producer, and interactive (non-one-shot) Spawns
 	// never set it.
 	ResponseSchema json.RawMessage `json:"responseSchema,omitempty"`
+
+	// Interactive requests spawn-under-PTY with a live interactive
+	// session surface (interactive-attach-v1; see agent/interactive.go).
+	// Honored only by harnesses whose manifest declares PTY transport
+	// capability — others ignore it (capability-gated, the same rule as
+	// every other Spec field). nil == today's pipe-spawn behavior;
+	// additive and omitempty so the wire round-trip is unchanged for
+	// every existing producer.
+	Interactive *InteractiveSpec `json:"interactive,omitempty"`
 
 	// BaseInstructions are persistent system instructions
 	// (Codex thread/start ‘instructions'). Honored only when

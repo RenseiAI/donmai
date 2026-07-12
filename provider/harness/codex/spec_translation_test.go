@@ -71,6 +71,15 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// is the zero value. Registered here (the static coverage mirror) so
 		// this guard rail stays green; NewSpawnPlan is unchanged.
 		"Endpoint",
+		// Interactive (W4, interactive-attach-v1) is INTENTIONALLY IGNORED by
+		// NewSpawnPlan/this JSON-RPC translation layer: Provider.Spawn
+		// (codex.go) branches on Spec.Interactive != nil BEFORE NewSpawnPlan
+		// ever runs, routing to SpawnInteractive (interactive.go) — the bare
+		// `codex` TUI under a PTY, entirely independent of the app-server
+		// JSON-RPC thread/turn machinery this file translates into. So
+		// NewSpawnPlan's own translation table is correctly untouched by
+		// Interactive; the field just never reaches it.
+		"Interactive",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)

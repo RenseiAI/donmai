@@ -27,6 +27,7 @@ lint:
 guard:
 	bash scripts/leak-guard.sh --self-test
 	bash scripts/leak-guard.sh --all
+	bash scripts/check-no-inbound-attach.sh
 
 fmt:
 	gofumpt -w .

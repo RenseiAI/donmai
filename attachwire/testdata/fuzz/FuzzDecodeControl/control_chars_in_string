@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"type\":\"error\",\"code\":\"framing\",\"message\":\"a\x00b\x1bc\x7fd\",\"retryable\":true}")

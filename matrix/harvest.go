@@ -15,16 +15,25 @@ import (
 	"github.com/RenseiAI/donmai/provider/harness/gemini"
 	"github.com/RenseiAI/donmai/provider/harness/ollama"
 	"github.com/RenseiAI/donmai/provider/harness/opencode"
+	"github.com/RenseiAI/donmai/provider/harness/shell"
 	stubprov "github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
-// HarnessHarvestList is the harvest list of the 8 harness providers. Each entry
+// HarnessHarvestList is the harvest list of the 9 harness providers. Each entry
 // returns the harness manifest from a constructed instance WITHOUT relying on
 // probe state:
-//   - The seven real providers expose a state-free Manifest() on (*Provider),
+//   - The eight real providers expose a state-free Manifest() on (*Provider),
 //     so a zero-value struct is sufficient and no New() probe runs.
 //   - The stub provider's Manifest() projects p.caps; it is harvested via
 //     New() so it picks up defaultCapabilities() (all-on) per §2.8.
+//
+// This is also THE registry P8's future harnesses (Vertex/Bedrock/Azure/
+// OpenRouter/Fireworks/Groq) join by flipping HarnessCaps.SupportsInteractivePTY
+// on their own Manifest() — nothing anywhere derives the interactive-capable
+// set from a hardcoded {claude, codex, shell} literal; callers filter this
+// list (or matrix.CapabilityMatrix.Harnesses, its rendered projection) on
+// that field instead (see provider/harness/ptycli's registry-driven matrix
+// test).
 //
 // A slice (not a map) so iteration — and generated output — is deterministic.
 func HarnessHarvestList() []HarnessHarvest {
@@ -36,6 +45,7 @@ func HarnessHarvestList() []HarnessHarvest {
 		{Name: agent.HarnessRaw, Manifest: func() agent.HarnessManifest { return (&ollama.Provider{}).Manifest() }},
 		{Name: agent.HarnessOpenCode, Manifest: func() agent.HarnessManifest { return (&opencode.Provider{}).Manifest() }},
 		{Name: agent.HarnessAmp, Manifest: func() agent.HarnessManifest { return (&amp.Provider{}).Manifest() }},
+		{Name: agent.HarnessShell, Manifest: func() agent.HarnessManifest { return (&shell.Provider{}).Manifest() }},
 		{Name: agent.HarnessStub, Manifest: stubManifest},
 	}
 }
@@ -65,7 +75,7 @@ func EndpointHarvestList() []EndpointHarvest {
 	}
 }
 
-// HarnessProvidersForParity returns the 8 harness providers as constructed
+// HarnessProvidersForParity returns the 9 harness providers as constructed
 // instances for the parity test's "manifest agrees with Capabilities()" rule.
 // Each is the same zero/New instance used for harvesting, so the comparison is
 // against the exact value the matrix is built from.
@@ -80,6 +90,7 @@ func HarnessProvidersForParity() []agent.HarnessProvider {
 		&ollama.Provider{},
 		&opencode.Provider{},
 		&amp.Provider{},
+		&shell.Provider{},
 		stubHP,
 	}
 }

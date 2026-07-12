@@ -11,6 +11,17 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // subprocess and drives it over JSON-RPC, speaking openai-responses (and
 // openai-chat per its Drives). No wire-level SSE/ndjson framing — the
 // app-server is the transport surface, so StreamingTransport is "none".
+//
+// SupportsInteractivePTY (W4) declares an ADDITIONAL spawn mode: bare
+// `codex` under a PTY (interactive.go: SpawnInteractive), entirely
+// independent of the app-server subprocess above — NOT a change to the
+// declared Transport. Transport names how the DEFAULT headless loop runs
+// (subprocess-jsonrpc, unchanged); TransportPTY is used only where PTY is a
+// harness's ONLY transport (see provider/harness/shell/manifest.go) — codex
+// keeps subprocess-jsonrpc here and gets PTY strictly as a per-Spawn-call
+// mode, selected by Spec.Interactive != nil, not by a Transport value. See
+// agent/harness.go's HarnessCaps.SupportsInteractivePTY doc comment for the
+// general rule this and claude/manifest.go both follow.
 func (*Provider) Manifest() agent.HarnessManifest {
 	return agent.HarnessManifest{
 		Name:        agent.HarnessCodex,
@@ -29,6 +40,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:           true, // turn/start outputSchema (app-server v2; see turnStartParams)
 			ToolPermissionFormat:     "codex",
 			StreamingTransport:       "none", // app-server JSON-RPC, not SSE/ndjson over the wire surface
+			SupportsInteractivePTY:   true,
 			Drives:                   []agent.WireProtocol{agent.ProtoOpenAIResponses, agent.ProtoOpenAIChat},
 			DrivesHosts:              []agent.ServingHost{agent.HostOAuthCLI, agent.HostDirect, agent.HostAzure},
 			Transport:                agent.TransportSubprocessRPC,

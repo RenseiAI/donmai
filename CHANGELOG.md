@@ -8,7 +8,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-_No work staged for the next release._
+### Features
+
+- **v0.52.0 candidate — outbound interactive attach and PTY hosting.** Adds the
+  versioned attach wire, stateful terminal sanitizer and snapshots, bounded PTY
+  host, outbound attach client, interactive runner loop, and registry-declared
+  Claude Code, Codex, and shell PTY harness modes without introducing an inbound
+  listener into the OSS daemon.
+
+### Fixes
+
+- **Deterministic interactive terminal environment.** PTY children now receive
+  `TERM=xterm-256color` and `COLORTERM=truecolor` regardless of the launching
+  process's terminal environment, while explicit per-session overrides remain
+  authoritative.
 
 ---
 
