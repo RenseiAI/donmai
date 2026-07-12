@@ -25,8 +25,10 @@ func TestLegacyAlias_EightProvidersResolveToTheirHarness(t *testing.T) {
 
 	reg := runner.NewRegistry()
 	providers := matrix.HarnessProvidersForParity()
-	if len(providers) != 8 {
-		t.Fatalf("expected 8 harness providers, got %d", len(providers))
+	// 8 legacy-aliased providers + the interactive-only shell harness
+	// (W4; no legacy alias by definition — it is not a back-compat name).
+	if len(providers) != 9 {
+		t.Fatalf("expected 9 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if err := reg.Register(p); err != nil {
@@ -125,6 +127,7 @@ func TestAssertLegacyAlias_NoMismatchForRealProviders(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.DiscardHandler)
+	legacyCells := 0
 	for _, p := range matrix.HarnessProvidersForParity() {
 		// assertLegacyAlias must not panic and must agree for every
 		// shipped provider; a mismatch would mean cells.go drifted.
@@ -133,12 +136,20 @@ func TestAssertLegacyAlias_NoMismatchForRealProviders(t *testing.T) {
 		name := p.Name()
 		cell, ok := matrix.LegacyCell(name)
 		if !ok {
-			t.Errorf("no legacy cell for shipped provider %q", name)
+			// Providers newer than the P2 back-compat split (shell)
+			// have no legacy alias by definition; assertLegacyAlias
+			// is quiet for them (verified above by not panicking).
 			continue
 		}
+		legacyCells++
 		if got := p.Manifest().Name; got != cell.Harness {
 			t.Errorf("shipped provider %q Manifest().Name=%q != matrix harness %q",
 				name, got, cell.Harness)
 		}
+	}
+	// The back-compat guarantee itself must not shrink: exactly the
+	// eight P2 legacy names carry cells.
+	if legacyCells != 8 {
+		t.Errorf("legacy-aliased shipped providers = %d; want 8", legacyCells)
 	}
 }

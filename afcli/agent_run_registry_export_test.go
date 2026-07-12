@@ -8,10 +8,13 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// canonicalAgentRunProviders is the eight-provider set the agent-run registry
-// is the single source for. Kept here as the test's independent oracle so a
-// silent drop/rename of any ctor in the production list (agentRunProviderCtors)
-// fails loudly. Mirrors matrix's realProviderNames() set.
+// canonicalAgentRunProviders is the canonical provider set the agent-run
+// registry is the single source for: the eight legacy providers plus the
+// interactive-only shell harness (W4 interactive sessions). Kept here as the
+// test's independent oracle so a silent drop/rename of any ctor in the
+// production list (agentRunProviderCtors) fails loudly. Mirrors matrix's
+// harvested harness set. An intentional addition updates THIS list in the
+// same change that adds the ctor — that friction is the point.
 var canonicalAgentRunProviders = []agent.ProviderName{
 	agent.ProviderStub,
 	agent.ProviderClaude,
@@ -21,15 +24,16 @@ var canonicalAgentRunProviders = []agent.ProviderName{
 	agent.ProviderGemini,
 	agent.ProviderAGYCLI,
 	agent.ProviderOpenCode,
+	agent.ProviderShell,
 }
 
-// TestBuildAgentRunRegistry_DeclaresAllEightProviders is the host-independent
+// TestBuildAgentRunRegistry_DeclaresAllCanonicalProviders is the host-independent
 // no-behavior-change proof: the single-source ctor list (agentRunProviderCtors)
-// enumerates EXACTLY the eight canonical ProviderNames — no more, no fewer —
+// enumerates EXACTLY the canonical ProviderNames — no more, no fewer —
 // regardless of what is probe-available on this host. This is what lets
 // rensei-tui delete its byte-for-byte fork and call BuildAgentRunRegistry:
 // every embedder gets the same eight providers.
-func TestBuildAgentRunRegistry_DeclaresAllEightProviders(t *testing.T) {
+func TestBuildAgentRunRegistry_DeclaresAllCanonicalProviders(t *testing.T) {
 	t.Parallel()
 
 	got := make([]agent.ProviderName, 0, len(agentRunProviderCtors()))
@@ -64,7 +68,7 @@ func TestBuildAgentRunRegistry_EachCtorNamesAProvider(t *testing.T) {
 	}
 	for _, c := range agentRunProviderCtors() {
 		if !known[agent.ProviderName(c.name)] {
-			t.Errorf("ctor name %q is not one of the eight canonical ProviderNames", c.name)
+			t.Errorf("ctor name %q is not one of the canonical ProviderNames", c.name)
 		}
 	}
 }
@@ -99,14 +103,14 @@ func TestBuildAgentRunRegistry_PublicEqualsInternal(t *testing.T) {
 	}
 }
 
-// TestBuildAgentRunRegistry_ForcedSuccessResolvesAllEight proves that when
+// TestBuildAgentRunRegistry_ForcedSuccessResolvesAllCanonical proves that when
 // every ctor succeeds (the fully-provisioned-host case), the registry resolves
-// ALL eight ProviderNames — and that each ctor maps to the right name. It runs
+// ALL canonical ProviderNames — and that each ctor maps to the right name. It runs
 // the SAME buildRegistryFromCtors core the production builder uses, but swaps
 // each real New() for a fakeProvider carrying that ctor's declared name, so the
 // assertion is host-independent yet exercises the real registration path
 // (Register → Resolve) over the real single-source ctor list.
-func TestBuildAgentRunRegistry_ForcedSuccessResolvesAllEight(t *testing.T) {
+func TestBuildAgentRunRegistry_ForcedSuccessResolvesAllCanonical(t *testing.T) {
 	t.Parallel()
 
 	forced := make([]providerCtor, 0, len(agentRunProviderCtors()))
