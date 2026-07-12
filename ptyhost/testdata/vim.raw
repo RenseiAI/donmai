@@ -3,7 +3,7 @@ The default interactive shell is now zsh.
 To update your account to use zsh, please run `chsh -s /bin/zsh`.
 For more details, please visit https://support.apple.com/kb/HT208050.
 [?1034hbash-3.2$ PS1='SPIKE$ '
-SPIKE$ cd /Users/markkropf/Developer/RenseiAi-Org/runs/2026-07-11-ios-interactiv e-sessions-program/waves/wave-04-pty-host-protocol/research/vt-spike/fixtures
+SPIKE$ cd /home/user/terminal-fixture-recordings/vt-spike-session-dirxxxxxxxxxxx /home/user/terminal-fixture-recordings/vt-spike-session-dirxxxxxxxxxxxxxxxxxx
 SPIKE$ clear
 [H[2J[3JSPIKE$ echo PREVIM_MARKER_LINE
 PREVIM_MARKER_LINE
