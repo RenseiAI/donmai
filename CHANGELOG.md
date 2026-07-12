@@ -12,6 +12,19 @@ _No work staged for the next release._
 
 ---
 
+## v0.51.0 — 2026-07-12
+
+### Features
+
+- **Hard per-session daemon mutation.** Heartbeats now apply `session.kill`
+  mutations by sending `SIGKILL` to the daemon-owned worker process group,
+  preserving sibling sessions and reporting applied or failed mutation ACKs on
+  the next heartbeat. Repeated kills of a known, already-ended session are
+  idempotent; unknown session IDs fail closed instead of signaling arbitrary
+  processes.
+
+---
+
 ## v0.50.3 — 2026-07-10
 
 ### Features
