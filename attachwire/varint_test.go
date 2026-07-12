@@ -52,7 +52,7 @@ func TestVarintFixtureTableByteExact(t *testing.T) {
 }
 
 func TestVarintByteIdenticalToStdlib(t *testing.T) {
-	rng := rand.New(rand.NewSource(0x5eed))
+	rng := rand.New(rand.NewSource(0x5eed)) //nolint:gosec // G404: non-cryptographic randomness for test data
 	for i := 0; i < 20000; i++ {
 		x := rng.Uint64()
 		// Bias toward small values and boundaries too.

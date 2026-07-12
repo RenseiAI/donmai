@@ -293,39 +293,40 @@ func TestDecodeScreenNegative(t *testing.T) {
 
 // TestScreenPropertyRoundTrip fuzzes random valid screens.
 func TestScreenPropertyRoundTrip(t *testing.T) {
-	rng := rand.New(rand.NewSource(123))
+	rng := rand.New(rand.NewSource(123)) //nolint:gosec // G404: non-cryptographic randomness for test data
 	glyphs := []string{"a", "Z", "0", " ", "é", "世", "🚀", "~"}
 	randColor := func() Color {
 		switch rng.Intn(3) {
 		case 0:
 			return DefaultColor
 		case 1:
-			return IndexedColor(uint8(rng.Intn(256)))
+			return IndexedColor(uint8(rng.Intn(256))) //nolint:gosec // G115: Intn(256) is bounded to 0-255, always fits uint8
 		default:
-			return TrueColor(uint8(rng.Intn(256)), uint8(rng.Intn(256)), uint8(rng.Intn(256)))
+			return TrueColor(uint8(rng.Intn(256)), uint8(rng.Intn(256)), uint8(rng.Intn(256))) //nolint:gosec // G115: Intn(256) is bounded to 0-255, always fits uint8
 		}
 	}
 	randCell := func() Cell {
-		style := uint8(rng.Intn(64)) & 0x3F // no reserved / no forced continuation here
+		// style is masked to no reserved / no forced continuation bits below.
+		style := uint8(rng.Intn(64)) & 0x3F //nolint:gosec // G115: Intn(64) is bounded to 0-63, always fits uint8
 		style &^= StyleWideContinuation
 		return Cell{RuneBytes: []byte(glyphs[rng.Intn(len(glyphs))]), Style: style, FG: randColor(), BG: randColor()}
 	}
 	for iter := 0; iter < 400; iter++ {
-		cols := uint64(rng.Intn(4) + 1)
-		rows := uint64(rng.Intn(4) + 1)
+		cols := uint64(rng.Intn(4) + 1) //nolint:gosec // G115: Intn(4)+1 is bounded to 1-4, always fits uint64
+		rows := uint64(rng.Intn(4) + 1) //nolint:gosec // G115: Intn(4)+1 is bounded to 1-4, always fits uint64
 		n := cols * rows
 		s := Screen{
 			Epoch:          rng.Uint64() >> uint(rng.Intn(64)),
 			EchoMode:       []uint8{EchoOff, EchoOn, EchoUnknown}[rng.Intn(3)],
 			Cols:           cols,
 			Rows:           rows,
-			ActiveBuffer:   uint8(rng.Intn(2)),
-			CursorRow:      uint64(rng.Intn(int(rows))),
-			CursorCol:      uint64(rng.Intn(int(cols))),
+			ActiveBuffer:   uint8(rng.Intn(2)),          //nolint:gosec // G115: Intn(2) is bounded to 0-1, always fits uint8
+			CursorRow:      uint64(rng.Intn(int(rows))), //nolint:gosec // G115: rows is bounded to 1-4 above, always fits int
+			CursorCol:      uint64(rng.Intn(int(cols))), //nolint:gosec // G115: cols is bounded to 1-4 above, always fits int
 			CursorVisible:  rng.Intn(2) == 0,
-			CursorShape:    uint8(rng.Intn(4)),
-			SavedCursorRow: uint64(rng.Intn(int(rows))),
-			SavedCursorCol: uint64(rng.Intn(int(cols))),
+			CursorShape:    uint8(rng.Intn(4)),          //nolint:gosec // G115: Intn(4) is bounded to 0-3, always fits uint8
+			SavedCursorRow: uint64(rng.Intn(int(rows))), //nolint:gosec // G115: rows is bounded to 1-4 above, always fits int
+			SavedCursorCol: uint64(rng.Intn(int(cols))), //nolint:gosec // G115: cols is bounded to 1-4 above, always fits int
 		}
 		for i := uint64(0); i < n; i++ {
 			s.Primary = append(s.Primary, randCell())
@@ -339,7 +340,7 @@ func TestScreenPropertyRoundTrip(t *testing.T) {
 		if lines := rng.Intn(3); lines > 0 {
 			for l := 0; l < lines; l++ {
 				var line []Cell
-				for c := rng.Intn(int(cols) + 1); c > 0; c-- {
+				for c := rng.Intn(int(cols) + 1); c > 0; c-- { //nolint:gosec // G115: cols is bounded to 1-4 above, always fits int
 					line = append(line, randCell())
 				}
 				s.Scrollback = append(s.Scrollback, line)

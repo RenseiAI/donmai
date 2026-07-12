@@ -85,6 +85,7 @@ const (
 // ColorMode discriminates the §12.1 cell color union.
 type ColorMode uint8
 
+// The §12.1 ColorMode discriminant values.
 const (
 	ColorDefault   ColorMode = 0x00 // no operand bytes
 	ColorIndexed   ColorMode = 0x01 // [idx:u8]
@@ -194,7 +195,7 @@ func (s Screen) Encode() ([]byte, error) {
 		return nil, fmt.Errorf("attachwire: alt grid has %d cells, want rows*cols=%d", len(s.Alt), n)
 	}
 
-	buf := make([]byte, 0, 32+int(min64(n, 1024))*5)
+	buf := make([]byte, 0, 32+int(min64(n, 1024))*5) //nolint:gosec // G115: min64(n, 1024) is capped to 1024, always fits int
 	buf = AppendUvarint(buf, s.Epoch)
 	buf = append(buf, s.EchoMode)
 	buf = AppendUvarint(buf, s.Cols)

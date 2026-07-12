@@ -117,13 +117,13 @@ func TestEventTypeString(t *testing.T) {
 
 // TestFramePropertyRoundTrip fuzzes random valid frames through encode/decode.
 func TestFramePropertyRoundTrip(t *testing.T) {
-	rng := rand.New(rand.NewSource(7))
+	rng := rand.New(rand.NewSource(7)) //nolint:gosec // G404: non-cryptographic randomness for test data
 	known := []EventType{TypeOutput, TypeInput, TypeResize, TypeMarker, TypeExit, TypeSnapshot, TypeControl}
 	for i := 0; i < 5000; i++ {
 		var payload []byte
 		if n := rng.Intn(20); n > 0 {
 			payload = make([]byte, n)
-			rng.Read(payload)
+			_, _ = rng.Read(payload) // math/rand.Rand.Read never returns a non-nil error
 		}
 		f := Frame{
 			Type:    known[rng.Intn(len(known))],

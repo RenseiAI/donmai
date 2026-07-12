@@ -321,6 +321,7 @@ func (s *Session) Resize(cols, rows, pxWidth, pxHeight uint32) error {
 	if s.exited {
 		return errExited
 	}
+	//nolint:gosec // G115: terminal geometry is small; the relay is the authoritative source (same trust boundary as attachclient/inbound.go's uint64->uint32 narrowing)
 	if err := s.setWinsizeLocked(uint16(cols), uint16(rows), uint16(pxWidth), uint16(pxHeight)); err != nil {
 		return err
 	}
@@ -496,9 +497,15 @@ func exitPayloadFrom(err error) attachwire.ExitPayload {
 				sig := ws.Signal()
 				return attachwire.NewSignalExit(signalName(sig), int(sig))
 			}
-			return attachwire.NewNormalExit(uint64(ws.ExitStatus()))
+			// cmd.Wait() only returns once the child has terminated, so a
+			// non-signaled WaitStatus here is always Exited(): ExitStatus()
+			// is therefore in [0,255], never the -1 "didn't exit" sentinel.
+			return attachwire.NewNormalExit(uint64(ws.ExitStatus())) //nolint:gosec // G115: guaranteed Exited() per cmd.Wait() contract, so ExitStatus() is in [0,255]
 		}
-		return attachwire.NewNormalExit(uint64(ee.ExitCode()))
+		// This package is unix-only (see the `unix` build-tagged files
+		// alongside this one); ee.Sys() is always a syscall.WaitStatus on
+		// unix, so this branch is unreachable in any supported build.
+		return attachwire.NewNormalExit(uint64(ee.ExitCode())) //nolint:gosec // G115: unreachable on the unix-only build (ee.Sys() is always syscall.WaitStatus above)
 	}
 	return attachwire.NewNormalExit(1)
 }

@@ -22,20 +22,25 @@ func buildScreen(raw vtRaw, epoch uint64, echoMode uint8, logger *slog.Logger) a
 	if raw.altActive {
 		activeBuf = attachwire.BufferAlt
 	}
+	// cols/rows/cursorX/cursorY/savedX/savedY are all VT grid dimensions and
+	// cursor coordinates sourced from vtHost.raw() (§ vt.go), which reads them
+	// straight from the terminal emulator's own grid/cursor state — always
+	// non-negative and bounded by the emulator's width/height, so these
+	// int->uint64 widenings cannot overflow.
 	s := attachwire.Screen{
 		Epoch:          epoch,
 		EchoMode:       echoMode,
-		Cols:           uint64(cols),
-		Rows:           uint64(rows),
+		Cols:           uint64(cols), //nolint:gosec // G115: VT grid width, always non-negative
+		Rows:           uint64(rows), //nolint:gosec // G115: VT grid height, always non-negative
 		ActiveBuffer:   activeBuf,
-		CursorRow:      uint64(raw.cursorY),
-		CursorCol:      uint64(raw.cursorX),
+		CursorRow:      uint64(raw.cursorY), //nolint:gosec // G115: cursor row clamped to VT grid height, always non-negative
+		CursorCol:      uint64(raw.cursorX), //nolint:gosec // G115: cursor col clamped to VT grid width, always non-negative
 		CursorVisible:  raw.cursorVisible,
 		CursorShape:    raw.cursorShape,
 		Modes:          raw.modes,
 		MouseProto:     raw.mouseProto,
-		SavedCursorRow: uint64(raw.savedY),
-		SavedCursorCol: uint64(raw.savedX),
+		SavedCursorRow: uint64(raw.savedY), //nolint:gosec // G115: saved cursor row clamped to VT grid height, always non-negative
+		SavedCursorCol: uint64(raw.savedX), //nolint:gosec // G115: saved cursor col clamped to VT grid width, always non-negative
 		Primary:        convertGrid(raw.primary, cols, rows, logger),
 		AltPresent:     raw.altActive,
 	}
@@ -180,6 +185,8 @@ func convertColor(c color.Color) attachwire.Color {
 		// Truecolor / RGBColor / any other color.Color: read the 16-bit channels
 		// and scale to 8-bit.
 		r, g, b, _ := c.RGBA()
-		return attachwire.TrueColor(uint8(r>>8), uint8(g>>8), uint8(b>>8))
+		// color.Color.RGBA() returns 16-bit-scaled channels (0-65535); >>8
+		// leaves exactly 0-255, always fits uint8.
+		return attachwire.TrueColor(uint8(r>>8), uint8(g>>8), uint8(b>>8)) //nolint:gosec // G115: RGBA()>>8 is bounded to 0-255
 	}
 }

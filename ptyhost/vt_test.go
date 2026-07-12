@@ -34,7 +34,7 @@ func TestTmuxReference(t *testing.T) {
 				t.Fatalf("%s: serialized screen should be alt-active with alt grid present", name)
 			}
 			grid := scr.Alt
-			cols := int(scr.Cols)
+			cols := int(scr.Cols) //nolint:gosec // G115: scr.Cols is the VT grid width from a small fixture terminal, always fits int
 
 			total := 0
 			for _, p := range m.Reference.Panes {
@@ -59,7 +59,7 @@ func TestTmuxReference(t *testing.T) {
 				}
 				if p.Active {
 					wantX, wantY := p.Left+p.CursorX, p.Top+p.CursorY
-					if int(scr.CursorCol) != wantX || int(scr.CursorRow) != wantY {
+					if int(scr.CursorCol) != wantX || int(scr.CursorRow) != wantY { //nolint:gosec // G115: cursor coords are clamped to the VT grid dims above, always fit int
 						t.Errorf("%s active pane %s cursor = (%d,%d), want (%d,%d)",
 							name, p.ID, scr.CursorCol, scr.CursorRow, wantX, wantY)
 					}

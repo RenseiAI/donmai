@@ -154,7 +154,7 @@ loop:
 	runtime.ReadMemStats(&after)
 	var growth int64
 	if after.HeapAlloc > before.HeapAlloc {
-		growth = int64(after.HeapAlloc - before.HeapAlloc)
+		growth = int64(after.HeapAlloc - before.HeapAlloc) //nolint:gosec // G115: the guard above proves this is a positive delta well under MaxInt64 (no process holds exabytes of heap)
 	}
 	t.Logf("heap growth after GC: %d bytes (%.2f MiB)", growth, float64(growth)/(1<<20))
 	if growth > 64<<20 {

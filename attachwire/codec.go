@@ -54,11 +54,12 @@ func (r *reader) uvarint() (uint64, error) {
 // so the returned slice never aliases the input buffer. A declared length past
 // the end of the buffer is a truncation FramingError.
 func (r *reader) bytes(n uint64) ([]byte, error) {
-	if n > uint64(r.remaining()) {
+	if n > uint64(r.remaining()) { //nolint:gosec // G115: remaining() = len(buf)-off is always >= 0; a single decoded frame is far under MaxInt64
 		return nil, newFramingf("declared length %d exceeds %d remaining bytes", n, r.remaining())
 	}
-	out := cloneBytes(r.buf[r.off : r.off+int(n)])
-	r.off += int(n)
+	// n <= remaining() (an int) was just proven above, so n fits in int.
+	out := cloneBytes(r.buf[r.off : r.off+int(n)]) //nolint:gosec // G115: n bounded by the remaining()-check above
+	r.off += int(n)                                //nolint:gosec // G115: n bounded by the remaining()-check above
 	return out, nil
 }
 

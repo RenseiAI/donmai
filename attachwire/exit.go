@@ -31,7 +31,7 @@ func NewSignalExit(signal string, signum int) ExitPayload {
 // ExitCodeForSignal returns the shell-convention exit code for death by the
 // given signal number: 128 + signum (§12.2).
 func ExitCodeForSignal(signum int) uint64 {
-	return uint64(ExitSignalBase + signum)
+	return uint64(ExitSignalBase + signum) //nolint:gosec // G115: signum is a POSIX signal number (1-64), so 128+signum is always positive and well under MaxInt64
 }
 
 // SignumFromExitCode inverts the §12.2 convention: if code is in the

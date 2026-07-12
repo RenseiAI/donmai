@@ -41,6 +41,7 @@ const (
 // connection can never escalate over the wire (§6, §11.1, §15).
 type Role string
 
+// The three §15 role values a connection may claim.
 const (
 	RoleHost   Role = "host"
 	RoleDriver Role = "driver"
@@ -50,6 +51,7 @@ const (
 // SnapshotReason is the §7 snapshot_request.reason enum.
 type SnapshotReason string
 
+// The §7 snapshot_request.reason enum values.
 const (
 	ReasonJoin         SnapshotReason = "join"
 	ReasonResync       SnapshotReason = "resync"
@@ -60,6 +62,7 @@ const (
 // KillReason is the §7 kill.reason enum.
 type KillReason string
 
+// The §7 kill.reason enum values.
 const (
 	KillStopped KillReason = "stopped"
 	KillQuota   KillReason = "quota"
@@ -69,6 +72,7 @@ const (
 // PresenceOp is the §7 presence.op enum.
 type PresenceOp string
 
+// The §7 presence.op enum values.
 const (
 	PresenceJoin  PresenceOp = "join"
 	PresenceLeave PresenceOp = "leave"
@@ -79,6 +83,7 @@ const (
 // host leg is currently attached via the degraded SSE+POST carrier (§14).
 type RoomStateValue string
 
+// The §7 room_state.state enum values.
 const (
 	RoomLive             RoomStateValue = "live"
 	RoomHostReconnecting RoomStateValue = "host-reconnecting"
@@ -113,6 +118,7 @@ type Subscribe struct {
 	Viewport    *Viewport   `json:"viewport,omitempty"`
 }
 
+// ControlType implements ControlMessage for Subscribe, returning CtrlSubscribe.
 func (Subscribe) ControlType() ControlType { return CtrlSubscribe }
 
 // ResumeFrom requests replay from a sequence (§7, §13). Epoch is int|null.
@@ -122,6 +128,7 @@ type ResumeFrom struct {
 	Epoch *int64      `json:"epoch"`
 }
 
+// ControlType implements ControlMessage for ResumeFrom, returning CtrlResumeFrom.
 func (ResumeFrom) ControlType() ControlType { return CtrlResumeFrom }
 
 // SnapshotRequest asks the host to emit a Snapshot (§7). Relay → host.
@@ -130,6 +137,8 @@ type SnapshotRequest struct {
 	Reason SnapshotReason `json:"reason"`
 }
 
+// ControlType implements ControlMessage for SnapshotRequest, returning
+// CtrlSnapshotRequest.
 func (SnapshotRequest) ControlType() ControlType { return CtrlSnapshotRequest }
 
 // Kill terminates the session (§7). Relay → host. Signal is str|null (a
@@ -140,6 +149,7 @@ type Kill struct {
 	Signal *string     `json:"signal"`
 }
 
+// ControlType implements ControlMessage for Kill, returning CtrlKill.
 func (Kill) ControlType() ControlType { return CtrlKill }
 
 // Grab takes the pen (§7). Viewer → relay.
@@ -147,6 +157,7 @@ type Grab struct {
 	Type ControlType `json:"type"`
 }
 
+// ControlType implements ControlMessage for Grab, returning CtrlGrab.
 func (Grab) ControlType() ControlType { return CtrlGrab }
 
 // Release drops the pen (§7). Viewer → relay.
@@ -154,6 +165,7 @@ type Release struct {
 	Type ControlType `json:"type"`
 }
 
+// ControlType implements ControlMessage for Release, returning CtrlRelease.
 func (Release) ControlType() ControlType { return CtrlRelease }
 
 // PresenceMember is one entry in a presence roster (§7). Identity is a
@@ -172,6 +184,7 @@ type Presence struct {
 	Members []PresenceMember `json:"members"`
 }
 
+// ControlType implements ControlMessage for Presence, returning CtrlPresence.
 func (Presence) ControlType() ControlType { return CtrlPresence }
 
 // InputAck acks the highest contiguous inputSeq accepted for a connection (§5,
@@ -181,6 +194,7 @@ type InputAck struct {
 	AckInputSeq int64       `json:"ackInputSeq"`
 }
 
+// ControlType implements ControlMessage for InputAck, returning CtrlInputAck.
 func (InputAck) ControlType() ControlType { return CtrlInputAck }
 
 // PenGranted announces the pen was assigned (§7). Relay → all.
@@ -191,6 +205,8 @@ type PenGranted struct {
 	PenGeneration int64       `json:"penGeneration"`
 }
 
+// ControlType implements ControlMessage for PenGranted, returning
+// CtrlPenGranted.
 func (PenGranted) ControlType() ControlType { return CtrlPenGranted }
 
 // PenRevoked announces the pen was lost or went stale (§7). Relay → all.
@@ -201,6 +217,8 @@ type PenRevoked struct {
 	PenGeneration int64       `json:"penGeneration"`
 }
 
+// ControlType implements ControlMessage for PenRevoked, returning
+// CtrlPenRevoked.
 func (PenRevoked) ControlType() ControlType { return CtrlPenRevoked }
 
 // PenState reports the current pen holder, pushed on join/reconnect (§7).
@@ -212,6 +230,7 @@ type PenState struct {
 	PenGeneration int64       `json:"penGeneration"`
 }
 
+// ControlType implements ControlMessage for PenState, returning CtrlPenState.
 func (PenState) ControlType() ControlType { return CtrlPenState }
 
 // RoomState reports host-leg / room lifecycle (§7). Relay → viewers. SinceSeq is
@@ -222,6 +241,8 @@ type RoomState struct {
 	SinceSeq *int64         `json:"sinceSeq"`
 }
 
+// ControlType implements ControlMessage for RoomState, returning
+// CtrlRoomState.
 func (RoomState) ControlType() ControlType { return CtrlRoomState }
 
 // ControlError is a typed error (§7). Any → any. The message-type itself is
@@ -233,6 +254,8 @@ type ControlError struct {
 	Retryable bool        `json:"retryable"`
 }
 
+// ControlType implements ControlMessage for ControlError, returning
+// CtrlError.
 func (ControlError) ControlType() ControlType { return CtrlError }
 
 // MarshalControl serializes a control message to its JSON object, stamping the
