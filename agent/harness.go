@@ -24,6 +24,11 @@ const (
 	HarnessAmp         HarnessName = "amp"
 	HarnessRaw         HarnessName = "raw" // in-box net/http loop (gemini-direct + ollama)
 	HarnessStub        HarnessName = "stub"
+	// HarnessShell is the bare interactive-only PTY spawn mode
+	// (provider/harness/shell): it drives no model endpoint at all, so it
+	// anchors no matrix cell (matrix/cells.go) — it exists purely as an
+	// interactive spawn-mode row alongside claude/codex. W4.
+	HarnessShell HarnessName = "shell"
 )
 
 // HarnessCaps = today's flat agent-loop capabilities + the DRIVE surface.
@@ -43,6 +48,22 @@ type HarnessCaps struct {
 	NativeJSONMode           bool   `json:"nativeJsonMode"` // strict structured-out vs spawn-collect-validate
 	ToolPermissionFormat     string `json:"toolPermissionFormat"`
 	StreamingTransport       string `json:"streamingTransport"` // "sse"|"ndjson"|"websocket"|"none"
+
+	// SupportsInteractivePTY declares an ADDITIONAL spawn mode (W4,
+	// interactive-attach-v1): this harness can be spawned under a PTY
+	// (agent.Spec.Interactive != nil; see agent/interactive.go) running its
+	// own interactive UI instead of its headless loop. It is orthogonal to
+	// the agent-loop bools above and to Transport below — Transport still
+	// names how the harness's DEFAULT headless loop runs (e.g. claude stays
+	// cli-injection, codex stays subprocess-jsonrpc); TransportPTY is used
+	// only by a harness whose ONLY transport is PTY (e.g. the shell
+	// harness). The set of interactive-capable harnesses is always read
+	// from this field on the live manifest registry — never hardcoded as a
+	// closed {claude, codex, shell} list, so P8's Vertex/Bedrock/Azure/
+	// OpenRouter/Fireworks/Groq harnesses join by flipping this flag alone.
+	// See HarnessManifest.SupportsInteractivePTY for the registry-check
+	// helper.
+	SupportsInteractivePTY bool `json:"interactivePty"`
 
 	// the DRIVE surface (the axis link)
 	Drives      []WireProtocol `json:"drives"`
@@ -83,6 +104,18 @@ func (m HarnessManifest) Base() ProviderBase {
 
 // Compile-time assertion: HarnessManifest satisfies the base contract.
 var _ BaseManifest = HarnessManifest{}
+
+// SupportsInteractivePTY reports whether this harness declares the
+// interactive PTY spawn-mode capability (W4; HarnessCaps.SupportsInteractivePTY).
+// This is the helper a composing layer (e.g. the runner) calls BEFORE
+// setting Spec.Interactive, so the set of interactive-capable harnesses is
+// always derived from the live manifest — never a hardcoded
+// {claude, codex, shell} literal. A harness without the capability that
+// nonetheless receives Spec.Interactive != nil ignores it, per the same
+// capability-gated-Spec contract every other Spec field follows.
+func (m HarnessManifest) SupportsInteractivePTY() bool {
+	return m.Caps.SupportsInteractivePTY
+}
 
 // Session is the live session interface. P1 ALIASES it to the existing Handle
 // so every existing implementor of Handle is already a Session — no rename,

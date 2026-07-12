@@ -108,16 +108,9 @@ func New(opts Options) (*Provider, error) {
 		p.stdout = opts.stdoutOverride
 		p.stderr = opts.stderrOverride
 	} else {
-		bin := opts.CodexBin
-		if bin == "" {
-			bin = os.Getenv("CODEX_BIN")
-		}
-		if bin == "" {
-			bin = "codex"
-		}
-		full, err := exec.LookPath(bin)
+		full, err := resolveCodexBinary(opts.CodexBin)
 		if err != nil {
-			return nil, fmt.Errorf("%w: codex binary %q not on PATH (install: brew install codex or follow https://developers.openai.com/codex/)", agent.ErrProviderUnavailable, bin)
+			return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 		}
 		// nolint:gosec // bin is sourced from explicit Options/env, not user input.
 		cmd := exec.Command(full, opts.Args...)
@@ -215,6 +208,15 @@ func (p *Provider) Capabilities() agent.Capabilities {
 // params, pushes MCP server config (once per Provider instance), opens
 // a thread, and starts the first turn.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	// Interactive spawn mode (W4): completely independent of the app-server
+	// JSON-RPC subprocess this Provider otherwise drives — see interactive.go.
+	// Capability-gated on the live manifest so a future edit that flips
+	// SupportsInteractivePTY back to false silently falls through to the
+	// headless app-server path instead of a hardcoded branch always firing.
+	if spec.Interactive != nil && p.Manifest().Caps.SupportsInteractivePTY {
+		return SpawnInteractive(ctx, p.opts, spec)
+	}
+
 	if err := p.checkAlive(); err != nil {
 		return nil, err
 	}
@@ -405,6 +407,29 @@ func (p *Provider) checkAlive() error {
 		}
 	}
 	return nil
+}
+
+// resolveCodexBinary applies the shared CodexBin → $CODEX_BIN → "codex"
+// fallback chain and resolves the result via exec.LookPath. Used by New (the
+// app-server subprocess) and by SpawnInteractive (interactive.go, the bare
+// TUI spawn mode) — both need the same codex binary, resolved the same way,
+// even though they never share a process. Returns the raw LookPath error
+// (unwrapped by any agent sentinel) so each call site can wrap it with the
+// sentinel appropriate to when the resolution happens: New's failure is
+// probe-time (agent.ErrProviderUnavailable); SpawnInteractive's is per-Spawn
+// (agent.ErrSpawnFailed).
+func resolveCodexBinary(bin string) (string, error) {
+	if bin == "" {
+		bin = os.Getenv("CODEX_BIN")
+	}
+	if bin == "" {
+		bin = "codex"
+	}
+	full, err := exec.LookPath(bin)
+	if err != nil {
+		return "", fmt.Errorf("codex binary %q not on PATH (install: brew install codex or follow https://developers.openai.com/codex/): %w", bin, err)
+	}
+	return full, nil
 }
 
 func mergeEnv(extra map[string]string) []string {

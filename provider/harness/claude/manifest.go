@@ -18,6 +18,16 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // framing = ndjson), driving the anthropic-messages protocol over
 // cli-injection. It can ride host login (oauth-cli) or keyed direct/bedrock/
 // vertex hosts.
+//
+// SupportsInteractivePTY (W4) declares an ADDITIONAL spawn mode: bare
+// `claude` under a PTY (interactive.go), NOT a change to the declared
+// Transport above. Transport names how the DEFAULT headless loop runs
+// (cli-injection, unchanged); TransportPTY is used only where PTY is a
+// harness's ONLY transport (see provider/harness/shell/manifest.go) — claude
+// keeps cli-injection here and gets PTY strictly as a per-Spawn-call mode,
+// selected by Spec.Interactive != nil, not by a Transport value. See
+// agent/harness.go's HarnessCaps.SupportsInteractivePTY doc comment for the
+// general rule this and codex/manifest.go both follow.
 func (*Provider) Manifest() agent.HarnessManifest {
 	return agent.HarnessManifest{
 		Name:        agent.HarnessClaudeCode,
@@ -36,6 +46,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:           false,
 			ToolPermissionFormat:     "claude",
 			StreamingTransport:       "ndjson", // claude CLI JSONL = ndjson framing
+			SupportsInteractivePTY:   true,
 			Drives:                   []agent.WireProtocol{agent.ProtoAnthropicMessages},
 			DrivesHosts: []agent.ServingHost{
 				agent.HostOAuthCLI, agent.HostDirect, agent.HostBedrock, agent.HostVertex,
