@@ -130,13 +130,18 @@ type WorkerSpawner struct {
 
 	mu                     sync.Mutex
 	sessions               map[string]*spawnedSession
+	sessionHistory         map[string]struct{}
+	sessionHistoryOrder    []string
 	accepting              bool
 	extraProjects          []ProjectConfig // satellite/additional org projects; never clobbered by SetProjects
 	extraEnabledProjectIDs map[string]struct{}
+	killProcessGroup       func(*exec.Cmd) error
 
 	listenersMu sync.Mutex
 	listeners   []func(SessionEvent)
 }
+
+const sessionHistoryLimit = 4096
 
 type spawnedSession struct {
 	handle SessionHandle
@@ -158,8 +163,10 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 	return &WorkerSpawner{
 		opts:                   opts,
 		sessions:               make(map[string]*spawnedSession),
+		sessionHistory:         make(map[string]struct{}),
 		accepting:              true,
 		extraEnabledProjectIDs: make(map[string]struct{}),
+		killProcessGroup:       killSessionProcessGroup,
 	}
 }
 
@@ -580,6 +587,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, command[0], command[1:]...) //nolint:gosec
+	configureSessionProcessGroup(cmd)
 	cmd.Env = composeEnv(s.opts.BaseEnv, spec.Env, map[string]string{
 		"DONMAI_SESSION_ID":    spec.SessionID,
 		"DONMAI_REPOSITORY":    spec.Repository,
@@ -647,6 +655,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 
 	s.mu.Lock()
 	s.sessions[spec.SessionID] = ss
+	s.rememberSessionLocked(spec.SessionID)
 	s.mu.Unlock()
 
 	// Stream stdout / stderr with worker-tagged prefix. Pump completion is
@@ -762,6 +771,62 @@ func (s *WorkerSpawner) StopSession(id string) bool {
 	ss.cancel()
 	s.emit(SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: ss.spec})
 	return true
+}
+
+// ForceKillSession sends SIGKILL to the daemon-created process group for one
+// owned session. It is deliberately separate from StopSession so normal local
+// stop paths retain their existing context-cancellation behavior.
+//
+// A session seen by this daemon but already reaped is an idempotent success.
+// A never-seen id is rejected: that distinction prevents a mutation routed to
+// the wrong daemon from being falsely acknowledged. The bounded history is
+// process-local because ownership does not survive a daemon restart.
+func (s *WorkerSpawner) ForceKillSession(id string) error {
+	s.mu.Lock()
+	ss := s.sessions[id]
+	_, owned := s.sessionHistory[id]
+	s.mu.Unlock()
+	if ss == nil {
+		if owned {
+			return nil
+		}
+		return fmt.Errorf("session %q is not owned by this daemon", id)
+	}
+
+	if err := s.killProcessGroup(ss.cmd); err != nil && !errors.Is(err, errSessionProcessExited) {
+		return fmt.Errorf("SIGKILL session %q process group: %w", id, err)
+	}
+
+	// The wait goroutine may have reaped the process after the signal. Only the
+	// goroutine that still owns this exact registry entry emits the terminal
+	// event; duplicates and races are successful no-ops.
+	s.mu.Lock()
+	if s.sessions[id] != ss {
+		s.mu.Unlock()
+		return nil
+	}
+	delete(s.sessions, id)
+	ss.handle.State = SessionTerminated
+	final := ss.handle
+	s.mu.Unlock()
+
+	ss.cancel()
+	s.emit(SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: ss.spec})
+	return nil
+}
+
+func (s *WorkerSpawner) rememberSessionLocked(id string) {
+	if _, exists := s.sessionHistory[id]; exists {
+		return
+	}
+	s.sessionHistory[id] = struct{}{}
+	s.sessionHistoryOrder = append(s.sessionHistoryOrder, id)
+	if len(s.sessionHistoryOrder) <= sessionHistoryLimit {
+		return
+	}
+	oldest := s.sessionHistoryOrder[0]
+	s.sessionHistoryOrder = s.sessionHistoryOrder[1:]
+	delete(s.sessionHistory, oldest)
 }
 
 // Drain waits for all in-flight sessions to exit, then resolves. After
