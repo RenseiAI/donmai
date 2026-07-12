@@ -1,0 +1,46 @@
+{
+  "name": "vim",
+  "description": "vim -u NONE -i NONE editing an 80-line file inside bash; alt-screen enter, edit, scroll, :q! restores pre-vim shell content.",
+  "cmd": [
+    "bash",
+    "-i",
+    "-\u003e",
+    "vim -u NONE -i NONE vim_input.txt"
+  ],
+  "env": [
+    "TERM=xterm-256color",
+    "COLORTERM=truecolor",
+    "LANG=en_US.UTF-8",
+    "LC_ALL=en_US.UTF-8"
+  ],
+  "cols": 80,
+  "rows": 24,
+  "bytes": 2891,
+  "checkpoints": [
+    {
+      "label": "shell_before",
+      "offset": 461
+    },
+    {
+      "label": "vim_opened",
+      "offset": 2016
+    },
+    {
+      "label": "vim_edited",
+      "offset": 2408
+    },
+    {
+      "label": "vim_scrolled",
+      "offset": 2732
+    },
+    {
+      "label": "vim_quit",
+      "offset": 2839
+    },
+    {
+      "label": "shell_after",
+      "offset": 2879
+    }
+  ],
+  "how_recorded": "spawned bash under creack/pty at 80x24, scripted stdin with settle sleeps, teed master to disk. Checkpoints mark byte offsets at named UI states."
+}

@@ -1,0 +1,55 @@
+{
+  "name": "tmux_split",
+  "description": "Two vertically-stacked tmux panes (status off); each printed a scrolling seq within its pane scroll region. Each pane's sub-rectangle in the VT grid compared against its capture-pane -p -e.",
+  "cmd": [
+    "tmux",
+    "-L",
+    "vtspike",
+    "attach",
+    "-t",
+    "s2",
+    "(split; scrolling seq per pane)"
+  ],
+  "env": [
+    "TERM=xterm-256color",
+    "COLORTERM=truecolor",
+    "LANG=en_US.UTF-8",
+    "LC_ALL=en_US.UTF-8"
+  ],
+  "cols": 80,
+  "rows": 24,
+  "bytes": 2083,
+  "checkpoints": [
+    {
+      "label": "attached_redraw",
+      "offset": 1907
+    }
+  ],
+  "how_recorded": "detached tmux session; -v split; each pane ran a scrolling seq then slept; status off; captured per-pane capture-pane -p -e + geometry + cursor while detached; attached under creack/pty at 80x24 to record the redraw; detached with C-b d.",
+  "reference": {
+    "panes": [
+      {
+        "id": "%0",
+        "left": 0,
+        "top": 0,
+        "width": 80,
+        "height": 12,
+        "active": false,
+        "cursor_x": 0,
+        "cursor_y": 11,
+        "capture_e": "top_pane_row_50\ntop_pane_row_51\ntop_pane_row_52\ntop_pane_row_53\ntop_pane_row_54\ntop_pane_row_55\ntop_pane_row_56\ntop_pane_row_57\ntop_pane_row_58\ntop_pane_row_59\ntop_pane_row_60\n\n"
+      },
+      {
+        "id": "%1",
+        "left": 0,
+        "top": 13,
+        "width": 80,
+        "height": 11,
+        "active": true,
+        "cursor_x": 0,
+        "cursor_y": 10,
+        "capture_e": "bottom_pane_row_91\nbottom_pane_row_92\nbottom_pane_row_93\nbottom_pane_row_94\nbottom_pane_row_95\nbottom_pane_row_96\nbottom_pane_row_97\nbottom_pane_row_98\nbottom_pane_row_99\nbottom_pane_row_100\n\n"
+      }
+    ]
+  }
+}
