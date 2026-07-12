@@ -68,7 +68,7 @@ func (r *recorder) writeEvent(relMicros uint64, code, data string) {
 	// data is JSON-escaped.
 	secs := float64(relMicros) / 1e6
 	dataJSON, _ := json.Marshal(data)
-	line := make([]byte, 0, len(dataJSON)+32)
+	line := make([]byte, 0, recorderCapHint(len(dataJSON)))
 	line = append(line, '[')
 	line = strconv.AppendFloat(line, secs, 'f', 6, 64)
 	line = append(line, ',', '"')

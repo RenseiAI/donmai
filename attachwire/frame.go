@@ -68,7 +68,7 @@ type Frame struct {
 // Encode serializes the frame to a fresh byte slice (§2). The WebSocket layer
 // already delimits the message, so no total length is prepended.
 func (f Frame) Encode() []byte {
-	buf := make([]byte, 0, 1+2*MaxVarintLen+len(f.Payload))
+	buf := make([]byte, 0, capHint(1+2*MaxVarintLen, len(f.Payload)))
 	buf = append(buf, byte(f.Type))
 	buf = AppendUvarint(buf, f.Seq)
 	buf = AppendUvarint(buf, f.RelTime)

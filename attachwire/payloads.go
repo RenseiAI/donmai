@@ -243,7 +243,7 @@ func DecodeSnapshotEnvelope(payload []byte) (SnapshotEnvelope, error) {
 // EncodeControlPayload wraps a JSON control object as the §3.1 Control payload:
 // [jsonLen][json]. See control.go for the typed message set and BuildControlFrame.
 func EncodeControlPayload(jsonObj []byte) []byte {
-	buf := make([]byte, 0, MaxVarintLen+len(jsonObj))
+	buf := make([]byte, 0, capHint(MaxVarintLen, len(jsonObj)))
 	buf = AppendUvarint(buf, uint64(len(jsonObj)))
 	buf = append(buf, jsonObj...)
 	return buf
