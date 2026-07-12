@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("\x9d52;c;QQ==\x9c\x900$qm\x9c")

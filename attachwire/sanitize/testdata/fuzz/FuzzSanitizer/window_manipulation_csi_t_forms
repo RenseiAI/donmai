@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("\x1b[8;24;80t\x1b[22;0t\x1b[23;0t\x1b[9;1t\x1b[31mred\x1b[0m\x1b[18t")
