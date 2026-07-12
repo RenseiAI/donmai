@@ -399,6 +399,15 @@ type Spec struct {
 	// never set it.
 	ResponseSchema json.RawMessage `json:"responseSchema,omitempty"`
 
+	// Interactive requests spawn-under-PTY with a live interactive
+	// session surface (interactive-attach-v1; see agent/interactive.go).
+	// Honored only by harnesses whose manifest declares PTY transport
+	// capability — others ignore it (capability-gated, the same rule as
+	// every other Spec field). nil == today's pipe-spawn behavior;
+	// additive and omitempty so the wire round-trip is unchanged for
+	// every existing producer.
+	Interactive *InteractiveSpec `json:"interactive,omitempty"`
+
 	// BaseInstructions are persistent system instructions
 	// (Codex thread/start ‘instructions'). Honored only when
 	// Capabilities.NeedsBaseInstructions is true.
