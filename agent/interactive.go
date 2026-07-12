@@ -85,10 +85,31 @@ type InteractiveSession interface {
 	Resize(cols, rows, pxWidth, pxHeight uint32) error
 
 	// Snapshot serializes the current screen (spec § 12.1) together
-	// with the host output sequence it reflects (atSeq). After Exit it
-	// keeps returning the final screen with atSeq == the Exit seq
-	// (spec § 12.2).
+	// with the host output sequence it reflects (atSeq), WITHOUT
+	// emitting anything into the frame stream (read-only; local
+	// rendering and tests). After Exit it keeps returning the final
+	// screen with atSeq == the Exit seq (spec § 12.2).
 	Snapshot() (screen attachwire.Screen, atSeq attachwire.HostSeq, err error)
+
+	// EmitSnapshot produces a Snapshot frame in answer to a
+	// snapshot_request (spec § 12).
+	//
+	// Before Exit the frame is seq-bearing (§ 4: Snapshot is a
+	// host-produced frame): the session atomically allocates the next
+	// host seq, appends the frame to the ring and every subscription
+	// (ordering by construction), and reports inStream == true — the
+	// caller sends nothing itself, the frame arrives on its
+	// subscription. After Exit the frame carries header seq == 0 with
+	// atSeq == the Exit seq (§ 12.2 out-of-namespace convention) and
+	// inStream == false — the caller transmits it directly (on the
+	// degraded lane it rides the outOfSeq array, § 14).
+	EmitSnapshot() (frame attachwire.Frame, inStream bool, err error)
+
+	// EmitMarker appends a seq-bearing Marker frame (display-only
+	// annotation, spec § 3.1) to the stream and the recording — e.g.
+	// the tool-approval suspend markers above. Returns an error after
+	// Exit (Exit is the final seq-bearing frame, § 12.2).
+	EmitMarker(label string) error
 
 	// Subscribe returns a live feed of host-produced, seq-bearing
 	// frames starting at fromSeq+1. A fromSeq still in the ring
