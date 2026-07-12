@@ -39,8 +39,8 @@ type Spec struct {
 
 	// Env is applied on top of the parent process environment as KEY=VALUE
 	// overrides (last-wins). TERM=xterm-256color and COLORTERM=truecolor are
-	// injected unless the caller supplies them, so interactive programs detect a
-	// capable terminal.
+	// the interactive defaults even when the parent carries different values;
+	// explicit entries in Env override those defaults.
 	Env []string
 
 	// Cwd is the child working directory. Empty inherits the parent's.
@@ -110,8 +110,10 @@ func (s Spec) logger() *slog.Logger {
 	return slog.Default()
 }
 
-// composeEnv layers Spec.Env overrides onto the parent environment and injects
-// TERM/COLORTERM defaults when the caller did not set them.
+// composeEnv layers the interactive terminal defaults over the parent
+// environment, then applies Spec.Env last. Parent TERM/COLORTERM values describe
+// the process that launched donmai, not the child PTY contract; only explicit
+// per-request overrides may replace the interactive defaults.
 func composeEnv(parent, overrides []string) []string {
 	idx := make(map[string]int, len(parent)+len(overrides))
 	out := make([]string, 0, len(parent)+len(overrides)+2)
@@ -130,14 +132,10 @@ func composeEnv(parent, overrides []string) []string {
 	for _, kv := range parent {
 		put(kv)
 	}
+	put("TERM=xterm-256color")
+	put("COLORTERM=truecolor")
 	for _, kv := range overrides {
 		put(kv)
-	}
-	if _, ok := idx["TERM"]; !ok {
-		put("TERM=xterm-256color")
-	}
-	if _, ok := idx["COLORTERM"]; !ok {
-		put("COLORTERM=truecolor")
 	}
 	return out
 }

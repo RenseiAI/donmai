@@ -65,6 +65,43 @@ func writeShim(t *testing.T) string {
 // Spec.Interactive.
 type spawnFn func(t *testing.T, bin string, spec agent.Spec) (agent.Handle, error)
 
+type terminalEnvCase struct {
+	name          string
+	parentAbsent  bool
+	parentTERM    string
+	parentColor   string
+	requestEnv    map[string]string
+	wantTERM      string
+	wantCOLORTERM string
+}
+
+var terminalEnvCases = []terminalEnvCase{
+	{
+		name:          "parent absent uses interactive defaults",
+		parentAbsent:  true,
+		wantTERM:      "xterm-256color",
+		wantCOLORTERM: "truecolor",
+	},
+	{
+		name:          "parent values do not override interactive defaults",
+		parentTERM:    "dumb",
+		parentColor:   "",
+		wantTERM:      "xterm-256color",
+		wantCOLORTERM: "truecolor",
+	},
+	{
+		name:        "explicit request overrides parent and defaults",
+		parentTERM:  "dumb",
+		parentColor: "",
+		requestEnv: map[string]string{
+			"TERM":      "vt100",
+			"COLORTERM": "24bit",
+		},
+		wantTERM:      "vt100",
+		wantCOLORTERM: "24bit",
+	},
+}
+
 // spawnTable maps HarnessName -> "how to construct a fake-binary instance of
 // it." The set of harnesses this test COVERS is decided by the registry
 // filter in the test below (matrix.HarnessHarvestList(), filtered on
@@ -138,50 +175,85 @@ func TestInteractiveSpawn_EnvAndGeometry_RegistryDriven(t *testing.T) {
 				t.Fatalf("harness %q declares SupportsInteractivePTY=true but this test has no fake-binary constructor for it — add one to spawnTable()", name)
 			}
 
-			bin := writeShim(t)
-			spec := agent.Spec{
-				Cwd:         t.TempDir(),
-				Interactive: &agent.InteractiveSpec{Cols: 100, Rows: 40},
-			}
+			for _, envCase := range terminalEnvCases {
+				t.Run(envCase.name, func(t *testing.T) {
+					setParentTerminalEnv(t, envCase)
+					bin := writeShim(t)
+					spec := agent.Spec{
+						Cwd:         t.TempDir(),
+						Env:         envCase.requestEnv,
+						Interactive: &agent.InteractiveSpec{Cols: 100, Rows: 40},
+					}
 
-			h, err := fn(t, bin, spec)
-			if err != nil {
-				t.Fatalf("interactive Spawn: %v", err)
-			}
-			defer func() { _ = h.Stop(context.Background()) }()
+					h, err := fn(t, bin, spec)
+					if err != nil {
+						t.Fatalf("interactive Spawn: %v", err)
+					}
+					defer func() { _ = h.Stop(context.Background()) }()
 
-			ic, ok := h.(agent.InteractiveCapable)
-			if !ok {
-				t.Fatalf("handle for %q does not implement agent.InteractiveCapable", name)
-			}
-			sess := ic.InteractiveSession()
-			if sess == nil {
-				t.Fatalf("InteractiveSession() returned nil for %q", name)
-			}
+					ic, ok := h.(agent.InteractiveCapable)
+					if !ok {
+						t.Fatalf("handle for %q does not implement agent.InteractiveCapable", name)
+					}
+					sess := ic.InteractiveSession()
+					if sess == nil {
+						t.Fatalf("InteractiveSession() returned nil for %q", name)
+					}
 
-			out := collectOutput(t, sess)
+					out := collectOutput(t, sess)
+					if want := "TERM=" + envCase.wantTERM; !strings.Contains(out, want) {
+						t.Errorf("%q: output missing %s; got:\n%s", name, want, out)
+					}
+					if want := "COLORTERM=" + envCase.wantCOLORTERM; !strings.Contains(out, want) {
+						t.Errorf("%q: output missing %s; got:\n%s", name, want, out)
+					}
+					if !strings.Contains(out, "40 100") {
+						t.Errorf("%q: `stty size` output missing \"40 100\" (rows cols); got:\n%s", name, out)
+					}
 
-			if !strings.Contains(out, "TERM=xterm-256color") {
-				t.Errorf("%q: output missing TERM=xterm-256color; got:\n%s", name, out)
-			}
-			if !strings.Contains(out, "COLORTERM=truecolor") {
-				t.Errorf("%q: output missing COLORTERM=truecolor; got:\n%s", name, out)
-			}
-			if !strings.Contains(out, "40 100") {
-				t.Errorf("%q: `stty size` output missing \"40 100\" (rows cols); got:\n%s", name, out)
-			}
-
-			// Snapshot round-trip: callable at any point, never erroring,
-			// and reflects the same geometry Spec.Interactive requested.
-			scr, _, err := sess.Snapshot()
-			if err != nil {
-				t.Errorf("%q: Snapshot: %v", name, err)
-			}
-			if scr.Cols != 100 || scr.Rows != 40 {
-				t.Errorf("%q: snapshot geometry = %dx%d, want 100x40", name, scr.Cols, scr.Rows)
+					// Snapshot round-trip: callable at any point, never erroring,
+					// and reflects the same geometry Spec.Interactive requested.
+					scr, _, err := sess.Snapshot()
+					if err != nil {
+						t.Errorf("%q: Snapshot: %v", name, err)
+					}
+					if scr.Cols != 100 || scr.Rows != 40 {
+						t.Errorf("%q: snapshot geometry = %dx%d, want 100x40", name, scr.Cols, scr.Rows)
+					}
+				})
 			}
 		})
 	}
+}
+
+func setParentTerminalEnv(t *testing.T, envCase terminalEnvCase) {
+	t.Helper()
+	if envCase.parentAbsent {
+		unsetEnv(t, "TERM")
+		unsetEnv(t, "COLORTERM")
+		return
+	}
+	t.Setenv("TERM", envCase.parentTERM)
+	t.Setenv("COLORTERM", envCase.parentColor)
+}
+
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	old, existed := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unset %s: %v", key, err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			if err := os.Setenv(key, old); err != nil {
+				t.Errorf("restore %s: %v", key, err)
+			}
+			return
+		}
+		if err := os.Unsetenv(key); err != nil {
+			t.Errorf("clear %s: %v", key, err)
+		}
+	})
 }
 
 // collectOutput subscribes from seq 0 and accumulates every Output frame's
