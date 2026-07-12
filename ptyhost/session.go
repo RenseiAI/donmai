@@ -33,6 +33,7 @@ var errExited = errors.New("ptyhost: session has exited")
 type Session struct {
 	cmd     *exec.Cmd
 	ptmx    *os.File
+	replyW  *replyWriter
 	spawnAt time.Time
 	epoch   uint64
 	logger  *slog.Logger
@@ -89,13 +90,21 @@ func Spawn(spec Spec) (*Session, error) {
 		return nil, fmt.Errorf("ptyhost: recorder: %w", err)
 	}
 
+	// Query replies go through a bounded async writer, never directly to
+	// the master: the responders run inside the read loop under s.mu, and a
+	// child that emits queries without reading stdin would otherwise wedge
+	// the whole session on the kernel's bounded slave input queue (the T10
+	// querywedge finding; reproducer in querywedge_test.go).
+	replyW := newReplyWriter(ptmx, spec.logger())
+
 	s := &Session{
 		cmd:      cmd,
 		ptmx:     ptmx,
+		replyW:   replyW,
 		spawnAt:  spawnAt,
 		epoch:    spec.Epoch,
 		logger:   spec.logger(),
-		vt:       newVTHost(int(cols), int(rows), spec.scrollback(), ptmx, spec.logger()),
+		vt:       newVTHost(int(cols), int(rows), spec.scrollback(), replyW, spec.logger()),
 		rec:      rec,
 		nextSeq:  attachwire.HostSeqStart,
 		ring:     newRing(spec.ringBytes()),
@@ -232,6 +241,9 @@ func (s *Session) triggerShutdown() {
 func (s *Session) closePTY() {
 	s.ptmxCloseOnce.Do(func() {
 		s.closedFlag.Store(true)
+		if s.replyW != nil {
+			_ = s.replyW.Close()
+		}
 		if s.ptmx != nil {
 			_ = s.ptmx.Close()
 		}
