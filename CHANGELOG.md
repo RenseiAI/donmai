@@ -8,6 +8,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+_No work staged for the next release._
+
+---
+
+## v0.51.0 — 2026-07-12
+
 ### Features
 
 - **Hard per-session daemon mutation.** Heartbeats now apply `session.kill`
