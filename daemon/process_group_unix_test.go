@@ -27,21 +27,7 @@ func TestSpawner_ForceKillSessionProcessTree(t *testing.T) {
 		t.Fatalf("accept: %v", err)
 	}
 
-	var grandchildPID int
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		raw, readErr := os.ReadFile(grandchildPIDPath)
-		if readErr == nil {
-			grandchildPID, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
-			if grandchildPID > 1 {
-				break
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if grandchildPID <= 1 {
-		t.Fatal("grandchild pid was not published")
-	}
+	grandchildPID := waitPIDFile(t, grandchildPIDPath)
 	parentPGID, err := syscall.Getpgid(handle.PID)
 	if err != nil {
 		t.Fatalf("parent getpgid: %v", err)
@@ -68,4 +54,87 @@ func TestSpawner_ForceKillSessionProcessTree(t *testing.T) {
 	if err := s.ForceKillSession("never-owned"); err == nil || !strings.Contains(err.Error(), "not owned") {
 		t.Fatalf("never-owned error = %v", err)
 	}
+}
+
+func TestSpawner_ForceKillSessionLeavesSiblingProcessTreeAlive(t *testing.T) {
+	pidDir := t.TempDir()
+	command := `sleep 30 & echo $! > "$PID_DIR/$DONMAI_SESSION_ID.pid"; wait`
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", command},
+		BaseEnv:               map[string]string{"PID_DIR": pidDir},
+	})
+	t.Cleanup(func() { _ = s.Drain(time.Second) })
+	ended := sessionEnds(s)
+	victim, err := s.AcceptWork(SessionSpec{SessionID: "victim", Repository: "github.com/a/b"})
+	if err != nil {
+		t.Fatalf("accept victim: %v", err)
+	}
+	sibling, err := s.AcceptWork(SessionSpec{SessionID: "sibling", Repository: "github.com/a/b"})
+	if err != nil {
+		t.Fatalf("accept sibling: %v", err)
+	}
+	victimChild := waitPIDFile(t, filepath.Join(pidDir, "victim.pid"))
+	siblingChild := waitPIDFile(t, filepath.Join(pidDir, "sibling.pid"))
+
+	victimPGID, err := syscall.Getpgid(victim.PID)
+	if err != nil {
+		t.Fatalf("victim getpgid: %v", err)
+	}
+	siblingPGID, err := syscall.Getpgid(sibling.PID)
+	if err != nil {
+		t.Fatalf("sibling getpgid: %v", err)
+	}
+	if victimPGID == siblingPGID || victimPGID != victim.PID || siblingPGID != sibling.PID {
+		t.Fatalf("process groups not isolated: victim=%d sibling=%d", victimPGID, siblingPGID)
+	}
+	if childGroup, _ := syscall.Getpgid(victimChild); childGroup != victimPGID {
+		t.Fatalf("victim child group = %d, want %d", childGroup, victimPGID)
+	}
+	if childGroup, _ := syscall.Getpgid(siblingChild); childGroup != siblingPGID {
+		t.Fatalf("sibling child group = %d, want %d", childGroup, siblingPGID)
+	}
+
+	if err := s.ForceKillSession("victim"); err != nil {
+		t.Fatalf("ForceKillSession victim: %v", err)
+	}
+	waitSessionEnd(t, ended)
+	time.Sleep(50 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), 0); err != nil {
+		t.Fatalf("test/daemon process did not survive: %v", err)
+	}
+	if err := syscall.Kill(sibling.PID, 0); err != nil {
+		t.Fatalf("sibling parent did not survive: %v", err)
+	}
+	if err := syscall.Kill(siblingChild, 0); err != nil {
+		t.Fatalf("sibling child did not survive: %v", err)
+	}
+	active := s.ActiveSessions()
+	if len(active) != 1 || active[0].SessionID != "sibling" {
+		t.Fatalf("active sessions after victim kill = %+v, want sibling only", active)
+	}
+	if !s.StopSession("sibling") {
+		t.Fatal("cleanup failed to stop surviving sibling")
+	}
+}
+
+func waitPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	var pid int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		raw, readErr := os.ReadFile(path)
+		if readErr == nil {
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
+			if pid > 1 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pid <= 1 {
+		t.Fatalf("pid was not published at %s", path)
+	}
+	return pid
 }

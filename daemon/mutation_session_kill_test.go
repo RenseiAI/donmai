@@ -150,3 +150,60 @@ func TestSessionKillMutationACKsOnNextHeartbeat(t *testing.T) {
 		t.Fatalf("unexpected failure ACKs: %v", requests[1].MutationFailures)
 	}
 }
+
+func TestSessionKillRedeliveryAfterRestartACKsFailure(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+	_, oldSpawner := newSessionKillTestDaemon(t, []string{"/bin/sh", "-c", "exit 0"})
+	ended := sessionEnds(oldSpawner)
+	if _, err := oldSpawner.AcceptWork(SessionSpec{SessionID: "pre-restart", Repository: "github.com/a/b"}); err != nil {
+		t.Fatal(err)
+	}
+	waitSessionEnd(t, ended)
+
+	// A fresh daemon has no process-local ownership tombstone for the old
+	// session. It must fail closed instead of falsely applying a redelivery.
+	fresh, _ := newSessionKillTestDaemon(t, []string{"sleep", "30"})
+	var (
+		mu       sync.Mutex
+		requests []heartbeatRequestBody
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload heartbeatRequestBody
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &payload)
+		mu.Lock()
+		requests = append(requests, payload)
+		beat := len(requests)
+		mu.Unlock()
+		response := heartbeatResponseBody{Acknowledged: true}
+		if beat == 1 {
+			response.PendingMutations = []PendingMutation{sessionKillMutation(t, "restart-redelivery", "pre-restart")}
+		}
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	t.Cleanup(srv.Close)
+
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "fresh-worker", Hostname: "host", OrchestratorURL: srv.URL, RuntimeJWT: "runtime.jwt",
+		GetActiveCount:     func() int { return 0 },
+		GetMaxCount:        func() int { return 2 },
+		GetStatus:          func() RegistrationStatus { return RegistrationIdle },
+		OnPendingMutations: fresh.ApplySessionMutations,
+	})
+	hs.sendOne(context.Background())
+	hs.sendOne(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("heartbeat request count = %d, want 2", len(requests))
+	}
+	ack := requests[1]
+	if len(ack.AppliedMutations) != 0 {
+		t.Fatalf("redelivery falsely applied: %v", ack.AppliedMutations)
+	}
+	if len(ack.MutationFailures) != 1 || ack.MutationFailures[0].ID != "restart-redelivery" ||
+		!strings.Contains(ack.MutationFailures[0].Error, "not owned") {
+		t.Fatalf("failure ACK = %+v", ack.MutationFailures)
+	}
+}
