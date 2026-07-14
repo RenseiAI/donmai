@@ -103,6 +103,24 @@ func (v *Viewer) SendInput(ctx context.Context, data []byte) error {
 	return v.conn.Write(wctx, websocket.MessageBinary, frame.Encode())
 }
 
+// RequestSnapshot sends a snapshot_request control frame (§7) with the given
+// reason. The relay forwards it to the bound host, which emits a seq-bearing
+// Snapshot that streams back on Frames() to this (and every) viewer. Pass an
+// empty reason to default to "resync". This is the viewer-driven path a screen
+// asserter uses to force a fresh, authoritative screen after driving input.
+func (v *Viewer) RequestSnapshot(ctx context.Context, reason attachwire.SnapshotReason) error {
+	if reason == "" {
+		reason = attachwire.ReasonResync
+	}
+	f, err := attachwire.BuildControlFrame(attachwire.SnapshotRequest{Reason: reason})
+	if err != nil {
+		return err
+	}
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return v.conn.Write(wctx, websocket.MessageBinary, f.Encode())
+}
+
 // Close disconnects the viewer.
 func (v *Viewer) Close() error {
 	v.cancel()
