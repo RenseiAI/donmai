@@ -75,16 +75,22 @@ func firehoseCommand(mib int) []string {
 func testFirehoseFastSubscriber(t *testing.T) {
 	// Volume and throughput floor are race-mode-aware: this lane's gate runs
 	// `go test -race`, and the race detector's per-op bookkeeping measurably
-	// slows the pipeline (empirically ~15 MiB/s plain -> ~3 MB/s under -race
-	// on the T10 dev machine), which throttles the producer via ordinary PTY
+	// slows the pipeline (empirically ~15 MiB/s plain -> ~3-5 MB/s under -race,
+	// hardware-dependent), which throttles the producer via ordinary PTY
 	// buffer backpressure (dd blocks on write once the kernel PTY buffer is
-	// full and our reader isn't draining fast enough to keep it empty). A
-	// smaller volume keeps runtime -race-reasonable while still safely
-	// clearing >=5s; the >=10 MB/s bar from the plan is enforced verbatim in
-	// the plain (non -race) build, where it was verified to hold with margin.
+	// full and our reader isn't draining fast enough to keep it empty). The
+	// race-mode volume must be large enough that the firehose SUSTAINS >=5s
+	// (the "sustained production" floor below) even on a fast host: the prior
+	// 18 MiB drained in ~3.7s at ~5 MB/s (W14 chaos lane finding), tripping the
+	// >=5s floor deterministically on hardware faster than the original T10 dev
+	// machine. 64 MiB clears >=5s with ~2x margin at ~5 MB/s. NOTE: a fixed
+	// byte count cannot be fully machine-speed-immune; the durable fix is a
+	// warmup-throughput probe that sizes the volume from the measured rate
+	// (W14 chaos-soak report follow-up). The >=10 MB/s bar from the plan is
+	// enforced verbatim in the plain (non -race) build.
 	mib, floorMBs := 224, 10.0
 	if raceEnabled {
-		mib, floorMBs = 18, 2.0
+		mib, floorMBs = 64, 2.0
 	}
 	s, err := Spawn(Spec{Command: firehoseCommand(mib)})
 	if err != nil {
@@ -168,13 +174,15 @@ loop:
 // byte-bounded regardless, the fast peer is unaffected by the slow one, and
 // the slow subscriber's own queue is NOT bounded (documented gap).
 func testFirehoseSlowVsFastSubscriber(t *testing.T) {
-	// See testFirehoseFastSubscriber for why volume/floor are race-mode-aware.
-	// Both values comfortably clear the 8 MiB default ring bound so the
-	// ring-stays-bounded and slow-queue-exceeds-ring-bound assertions below
-	// are meaningful regardless of timing variance.
+	// See testFirehoseFastSubscriber for why volume/floor are race-mode-aware
+	// and why the race volume was raised 18->64 MiB (the >=5s sustained-
+	// production floor under-ran on fast hardware). Both values comfortably
+	// clear the 8 MiB default ring bound so the ring-stays-bounded and
+	// slow-queue-exceeds-ring-bound assertions below are meaningful regardless
+	// of timing variance.
 	mib, floorMBs := 224, 10.0
 	if raceEnabled {
-		mib, floorMBs = 18, 2.0
+		mib, floorMBs = 64, 2.0
 	}
 	s, err := Spawn(Spec{Command: firehoseCommand(mib)})
 	if err != nil {
