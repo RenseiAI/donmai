@@ -436,7 +436,8 @@ func (s *StubRelay) viewerInbound(ctx context.Context, conn *websocket.Conn, con
 		if derr != nil {
 			return
 		}
-		if frame.Type == attachwire.TypeInput {
+		switch frame.Type {
+		case attachwire.TypeInput:
 			in, err := attachwire.DecodeInput(frame.Payload)
 			if err != nil {
 				continue
@@ -446,9 +447,24 @@ func (s *StubRelay) viewerInbound(ctx context.Context, conn *websocket.Conn, con
 			}
 			in.UserID = []byte(claims.UserID) // relay stamps the verified userId
 			s.room.sendToHost(attachwire.Frame{Type: attachwire.TypeInput, Payload: in.Encode()})
+		case attachwire.TypeControl:
+			// A viewer-driven snapshot_request is forwarded to the host; the
+			// resulting seq-bearing Snapshot rides the ring back to viewers via
+			// deliverToViewer. Other viewer controls (resume_from, grab/release)
+			// are out of the stub's minimal scope; tests drive resume via
+			// subscribe.resumeFrom.
+			if j, err := attachwire.DecodeControlPayload(frame.Payload); err == nil {
+				if msg, err := attachwire.DecodeControl(j); err == nil {
+					if req, ok := msg.(attachwire.SnapshotRequest); ok {
+						reason := req.Reason
+						if reason == "" {
+							reason = attachwire.ReasonResync
+						}
+						s.room.sendToHost(snapshotRequestFrame(reason))
+					}
+				}
+			}
 		}
-		// Other viewer controls (resume_from, grab/release) are out of the stub's
-		// minimal scope; the tests drive resume via subscribe.resumeFrom.
 	}
 }
 

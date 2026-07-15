@@ -10,6 +10,19 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.52.1 — 2026-07-15
+
+### Chores
+
+- **Interactive-attach viewertest harness.** Adds an OSS viewer-side test
+  harness for the interactive attach path: a `viewertest` package with a
+  screen-decode driver and Screen-assert helpers over the attach VT feed, plus a
+  `vtfixture` fixture TUI and viewer-driven `snapshot_request` support in the
+  attach test client. Test infrastructure only — no changes to shipped runtime
+  behavior.
+
+---
+
 ## v0.52.0 — 2026-07-14
 
 ### Features
