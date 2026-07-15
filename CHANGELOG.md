@@ -8,9 +8,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.52.0 — 2026-07-14
+
 ### Features
 
-- **v0.52.0 candidate — outbound interactive attach and PTY hosting.** Adds the
+- **Outbound interactive attach and PTY hosting.** Adds the
   versioned attach wire, stateful terminal sanitizer and snapshots, bounded PTY
   host, outbound attach client, interactive runner loop, and registry-declared
   Claude Code, Codex, and shell PTY harness modes without introducing an inbound
