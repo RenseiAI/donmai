@@ -40,10 +40,23 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 
 	"golang.org/x/term"
 )
+
+// fdToInt converts an os.File.Fd() uintptr to the int the term wrappers take.
+// Fd() on a live *os.File is always a small non-negative descriptor, but the
+// uintptr->int conversion is flagged by gosec (G115), so bound it explicitly:
+// an out-of-range value collapses to -1, which term.MakeRaw rejects instead of
+// silently truncating.
+func fdToInt(fd uintptr) int {
+	if fd > math.MaxInt32 {
+		return -1
+	}
+	return int(fd)
+}
 
 // The fixture geometry and the byte-exact screen contract. These constants are
 // the single source of truth the harness/smoke assertions are written against.
@@ -74,7 +87,7 @@ func main() {
 	// Raw mode: disable line-discipline echo so a driven keystroke is NOT echoed
 	// onto the screen (which would pollute the deterministic cell contract), and
 	// deliver input byte-at-a-time.
-	fd := int(os.Stdin.Fd())
+	fd := fdToInt(os.Stdin.Fd())
 	if oldState, err := term.MakeRaw(fd); err == nil {
 		defer func() { _ = term.Restore(fd, oldState) }()
 	}
