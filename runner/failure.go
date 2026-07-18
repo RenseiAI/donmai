@@ -120,4 +120,11 @@ const (
 	// ctx/deadline timeout (FailureTimeout) so the platform can route a
 	// stuck session distinctly rather than blind-re-dispatching it.
 	FailureNoProgress = "no-progress"
+
+	// FailureInteractiveInput indicates a mode:"interactive" session
+	// spawned a live PTY successfully but the runner could not deliver its
+	// optional initialPrompt as the first input. This is post-spawn I/O, not
+	// FailureSpawn: the handle and event stream already exist. A cancelled
+	// delivery remains a stopped session and does not use this failure mode.
+	FailureInteractiveInput = "interactive-input"
 )

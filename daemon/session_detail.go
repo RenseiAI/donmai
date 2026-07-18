@@ -196,9 +196,10 @@ type SessionDetail struct {
 	// ── Interactive run-mode fields (Wave 2 donmai wire-plumbing) ─
 	//
 	// Mode forwards the run-mode discriminant from PollWorkItem onto the
-	// runner's QueuedWork. "" / absent = headless (unchanged behaviour).
-	// "interview" = non-terminating interactive loop. The daemon does not
-	// interpret this value — opaque forwarder only (same pattern as
+	// runner's QueuedWork. "" / absent = headless (unchanged behaviour),
+	// "interview" = non-terminating inject-driven loop, and "interactive" =
+	// live PTY session. The daemon does not interpret this value — opaque
+	// forwarder only (same pattern as
 	// SystemPromptOverride / Kits / DisallowedTools).
 	Mode string `json:"mode,omitempty"`
 

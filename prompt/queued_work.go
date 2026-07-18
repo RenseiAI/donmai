@@ -249,9 +249,10 @@ type QueuedWork struct {
 	// ── Interactive run-mode fields (Wave 2 donmai wire-plumbing) ─
 	//
 	// Mode is the run-mode discriminant. "" or absent = normal headless
-	// run. "interview" = interactive interview loop (non-terminating;
-	// parks on injectCh between user turns). The runner branches on this
-	// value; the prompt renderer does not interpret it.
+	// run. "interview" = inject-driven interview loop (non-terminating;
+	// parks on injectCh between user turns). "interactive" = live PTY
+	// session. The runner branches on this value; the prompt renderer does
+	// not interpret it.
 	//
 	// Wire shape: "mode" (camelCase, omitempty). Canonical value:
 	// internal/interview/wiretypes.go InterviewRunMode.

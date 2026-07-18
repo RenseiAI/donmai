@@ -111,7 +111,8 @@ func (r *Runner) dispatchInteractive(
 		res.FailureMode = FailureInteractiveUnsupported
 		res.Error = fmt.Sprintf(
 			"interactive mode: provider %q spawned a non-interactive handle — harness does not declare PTY transport, so Spec.Interactive was ignored (no live PTY surface to attach)",
-			res.ProviderName)
+			res.ProviderName,
+		)
 		r.logger.Error("[interactive] handle is not InteractiveCapable",
 			"sessionId", qw.SessionID, "provider", res.ProviderName)
 		return res, errors.New(res.Error)
@@ -143,7 +144,8 @@ func (r *Runner) dispatchInteractive(
 		res.FailureMode = FailureInteractiveConfig
 		res.Error = fmt.Sprintf(
 			"interactive mode: half-configured relay attach — exactly one of %s/%s is set (both or neither required)",
-			envAttachURL, envAttachToken)
+			envAttachURL, envAttachToken,
+		)
 		r.logger.Error("[interactive] half-configured attach env",
 			"sessionId", qw.SessionID, "hasURL", attachURL != "", "hasToken", attachToken != "")
 		return res, errors.New(res.Error)
@@ -165,10 +167,20 @@ func (r *Runner) dispatchInteractive(
 	// This happens before relay attach starts, so local-only sessions receive
 	// the same seed and carrier reconnects can never replay it.
 	if qw.isInteractive() && qw.InitialPrompt != "" {
-		if err := writeInitialPromptInput(isess, qw.InitialPrompt); err != nil {
+		if err := writeInitialPromptInput(interactiveCtx, handle, isess, qw.InitialPrompt); err != nil {
+			if interactiveCtx.Err() != nil {
+				res.Status = "stopped"
+				res.Error = interactiveStopReason(interactiveCtx, ctx)
+				r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
+					"interactive session stopped during initial prompt delivery: "+res.Error)
+				r.logger.Info("[interactive] initial prompt delivery cancelled",
+					"sessionId", qw.SessionID, "reason", res.Error)
+				return res, interactiveCtx.Err()
+			}
+
 			wrapped := fmt.Errorf("interactive initial prompt delivery: %w", err)
 			res.Status = "failed"
-			res.FailureMode = FailureSpawn
+			res.FailureMode = FailureInteractiveInput
 			res.Error = wrapped.Error()
 			r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
 				"interactive session failed during initial prompt delivery")
@@ -351,10 +363,39 @@ func (r *Runner) postInteractiveActivity(ctx context.Context, worktreePath strin
 }
 
 // writeInitialPromptInput writes prompt plus exactly one newline to the live
-// PTY, retrying short writes until the whole logical input is accepted. A
-// zero-byte write would otherwise spin forever, so it fails the interactive
-// startup explicitly. The caller owns the mode/non-empty gate.
-func writeInitialPromptInput(isess agent.InteractiveSession, initialPrompt string) error {
+// PTY, retrying short writes until the whole logical input is accepted. PTY
+// writes can block when the child has not started reading its bounded input
+// queue, so the write runs separately and cancellation stops the handle to
+// close the PTY and unblock it. The caller owns the mode/non-empty gate.
+func writeInitialPromptInput(
+	ctx context.Context,
+	handle agent.Handle,
+	isess agent.InteractiveSession,
+	initialPrompt string,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- writeInitialPromptBytes(isess, initialPrompt)
+	}()
+
+	select {
+	case err := <-writeDone:
+		return err
+	case <-ctx.Done():
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		if err := handle.Stop(stopCtx); err != nil {
+			return fmt.Errorf("cancel PTY input after %v: stop handle: %w", ctx.Err(), err)
+		}
+		return ctx.Err()
+	}
+}
+
+func writeInitialPromptBytes(isess agent.InteractiveSession, initialPrompt string) error {
 	remaining := append([]byte(initialPrompt), '\n')
 	for len(remaining) > 0 {
 		n, err := isess.WriteInput(remaining)

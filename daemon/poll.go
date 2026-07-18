@@ -166,8 +166,9 @@ type PollWorkItem struct {
 	// ── Interactive run-mode fields (Wave 2 donmai wire-plumbing) ─
 	//
 	// Mode is the run-mode discriminant ("" = headless, "interview" =
-	// interactive). Forwarded opaquely onto SessionDetail so the runner
-	// can branch on it. Opaque forwarder only — same pattern as
+	// inject-driven interview loop, "interactive" = live PTY session).
+	// Forwarded opaquely onto SessionDetail so the runner can branch on it.
+	// Opaque forwarder only — same pattern as
 	// SystemPromptOverride / Kits / DisallowedTools.
 	Mode string `json:"mode,omitempty"`
 
@@ -532,7 +533,8 @@ func (p *PollService) pollOnce(ctx context.Context) {
 		// heartbeat path — observers see one log line per
 		// cycle on either path.
 		reason := pollAuthFailureReason(err)
-		slog.Info("[runtime-token]",
+		slog.Info(
+			"[runtime-token]",
 			"event", "auth-failure-detected",
 			"path", "poll",
 			"reason", reason,

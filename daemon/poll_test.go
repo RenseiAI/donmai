@@ -922,6 +922,14 @@ func TestPollResponse_DecodesInitialPrompt(t *testing.T) {
 			}
 		})
 	}
+
+	absentBody, err := json.Marshal(PollWorkItem{SessionID: "seed-absent"})
+	if err != nil {
+		t.Fatalf("marshal empty PollWorkItem: %v", err)
+	}
+	if bytes.Contains(absentBody, []byte(`"initialPrompt"`)) {
+		t.Fatalf("empty InitialPrompt must stay omitted, got %s", absentBody)
+	}
 }
 
 // TestPollItemToSessionDetail_InitialPromptForwarded verifies the first opaque

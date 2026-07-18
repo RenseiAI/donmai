@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -95,6 +96,17 @@ func (h *testInteractiveHandle) InteractiveSession() agent.InteractiveSession {
 	return h.session
 }
 
+type stopCallbackHandle struct {
+	agent.Handle
+	stopOnce sync.Once
+	stop     func()
+}
+
+func (h *stopCallbackHandle) Stop(context.Context) error {
+	h.stopOnce.Do(h.stop)
+	return nil
+}
+
 // recordingInteractiveSession records every accepted input byte. It embeds the
 // remaining interface methods from an optional real session; focused local-only
 // tests override Done/Exit and never call the promoted attach methods.
@@ -157,6 +169,19 @@ func (s *recordingInteractiveSession) writeCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.writes)
+}
+
+type blockingInteractiveSession struct {
+	agent.InteractiveSession
+	startedOnce sync.Once
+	started     chan struct{}
+	release     chan struct{}
+}
+
+func (s *blockingInteractiveSession) WriteInput([]byte) (int, error) {
+	s.startedOnce.Do(func() { close(s.started) })
+	<-s.release
+	return 0, errors.New("PTY stopped")
 }
 
 func completedRecordingInteractiveSession() *recordingInteractiveSession {
@@ -450,7 +475,7 @@ func TestWriteInitialPromptInput_RetriesShortWrites(t *testing.T) {
 	session := completedRecordingInteractiveSession()
 	session.maxWrite = 3
 	const seed = "雪だるま\nline two"
-	if err := writeInitialPromptInput(session, seed); err != nil {
+	if err := writeInitialPromptInput(context.Background(), &fakeHandle{}, session, seed); err != nil {
 		t.Fatalf("writeInitialPromptInput: %v", err)
 	}
 	if got, want := string(session.inputBytes()), seed+"\n"; got != want {
@@ -458,6 +483,18 @@ func TestWriteInitialPromptInput_RetriesShortWrites(t *testing.T) {
 	}
 	if session.writeCount() < 2 {
 		t.Fatalf("short-write fixture recorded %d call(s), want multiple", session.writeCount())
+	}
+}
+
+func TestWriteInitialPromptInput_PreCanceledDoesNotWrite(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	session := completedRecordingInteractiveSession()
+	if err := writeInitialPromptInput(ctx, &fakeHandle{}, session, "must not run"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("writeInitialPromptInput error = %v, want context.Canceled", err)
+	}
+	if got := session.writeCount(); got != 0 {
+		t.Fatalf("pre-cancelled initial prompt wrote %d time(s), want 0", got)
 	}
 }
 
@@ -483,12 +520,80 @@ func TestInteractive_InitialPromptWriteFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected initial-prompt write failure")
 	}
-	if out.Status != "failed" || out.FailureMode != FailureSpawn {
-		t.Fatalf("status=%q mode=%q; want failed/%s", out.Status, out.FailureMode, FailureSpawn)
+	if out.Status != "failed" || out.FailureMode != FailureInteractiveInput {
+		t.Fatalf("status=%q mode=%q; want failed/%s", out.Status, out.FailureMode, FailureInteractiveInput)
 	}
 	for _, ev := range sink.events {
 		if system, ok := ev.(agent.SystemEvent); ok && system.Subtype == "interactive-initial-prompt-delivered" {
 			t.Fatal("delivery activity emitted after failed PTY write")
+		}
+	}
+}
+
+// TestInteractive_InitialPromptCancellation proves a child that never reads
+// from its bounded PTY input queue cannot wedge runner cancellation while the
+// initial prompt write is blocked.
+func TestInteractive_InitialPromptCancellation(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	session := &blockingInteractiveSession{
+		InteractiveSession: completedRecordingInteractiveSession(),
+		started:            started,
+		release:            release,
+	}
+	baseHandle := &stopCallbackHandle{
+		Handle: &fakeHandle{events: make(chan agent.Event)},
+		stop:   func() { close(release) },
+	}
+	handle := &testInteractiveHandle{Handle: baseHandle, session: session}
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		SessionID:     "seed-cancel",
+		Mode:          interactiveRunMode,
+		InitialPrompt: strings.Repeat("blocked input ", 4096),
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := minimalRunner(t)
+	worktreePath := t.TempDir()
+	resultCh := make(chan struct {
+		res *Result
+		err error
+	}, 1)
+	go func() {
+		out, err := runner.dispatchInteractive(
+			ctx, handle, worktreePath, qw, &Result{SessionID: qw.SessionID}, sink, nil,
+		)
+		resultCh <- struct {
+			res *Result
+			err error
+		}{res: out, err: err}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("initial prompt write never started")
+	}
+	cancel()
+
+	select {
+	case got := <-resultCh:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("dispatch error = %v, want context.Canceled", got.err)
+		}
+		if got.res.Status != "stopped" || got.res.FailureMode != "" {
+			t.Fatalf("status=%q mode=%q; want stopped with no failure mode", got.res.Status, got.res.FailureMode)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runner cancellation remained wedged on initial prompt input")
+	}
+
+	for _, ev := range sink.events {
+		if system, ok := ev.(agent.SystemEvent); ok && system.Subtype == "interactive-initial-prompt-delivered" {
+			t.Fatal("delivery activity emitted after cancelled PTY write")
 		}
 	}
 }
