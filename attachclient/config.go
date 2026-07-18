@@ -29,8 +29,9 @@ type HostConfig struct {
 	// (§ 14): wss→https / ws→http, plus the /host/sse and /host/output suffixes.
 	AttachURL string
 
-	// TokenSource yields the current bearer JWT, called once per dial attempt
-	// (§ 15).
+	// TokenSource yields the current bearer JWT. It is resolved before each
+	// top-level carrier attempt and may also be called concurrently by degraded-
+	// lane 401 recovery and the background WSS upgrade probe (§ 14/§ 15).
 	TokenSource TokenSource
 
 	// Session is the live PTY surface (structurally == agent.InteractiveSession).

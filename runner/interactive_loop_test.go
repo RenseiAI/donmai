@@ -1,13 +1,20 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +25,7 @@ import (
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
+	"github.com/coder/websocket"
 )
 
 // ─── interactive PTY-backed stub provider ──────────────────────────────────
@@ -301,6 +309,153 @@ func TestInteractive_LocalOnlyNonzeroExitFails(t *testing.T) {
 	}
 }
 
+func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
+	requireSh(t)
+
+	const (
+		sessionID = "sess-token-file-reconnect"
+		roomPath  = "/v1/rooms/room-1"
+	)
+	initialExp := time.Now().Add(300 * time.Millisecond)
+	initialToken := fakeInteractiveJWT(map[string]any{
+		"sessionId": sessionID,
+		"roomId":    "room-1",
+		"role":      "host",
+		"aud":       "relay",
+		"jti":       "host-initial",
+		"epoch":     int64(1),
+		"exp":       initialExp.Unix(),
+	})
+	replacementToken := fakeInteractiveJWT(map[string]any{
+		"sessionId": sessionID,
+		"roomId":    "room-1",
+		"role":      "host",
+		"aud":       "relay",
+		"jti":       "host-replacement",
+		"epoch":     int64(1),
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+
+	var allowedToken atomic.Value
+	allowedToken.Store(initialToken)
+	admitted := make(chan string, 2)
+	dropInitial := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != roomPath {
+			http.NotFound(w, r)
+			return
+		}
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token != allowedToken.Load().(string) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols:       []string{attachwire.SubprotocolVersion},
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()                                //nolint:errcheck
+		if _, _, err := conn.Read(r.Context()); err != nil { // host subscribe
+			return
+		}
+		admitted <- token
+		if token == initialToken {
+			select {
+			case <-dropInitial:
+				return
+			case <-r.Context().Done():
+				return
+			}
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "attach-token") // intentionally missing initially
+	donePath := filepath.Join(t.TempDir(), "done")
+	t.Setenv(envAttachURL, strings.Replace(srv.URL, "http://", "ws://", 1)+roomPath)
+	t.Setenv(envAttachToken, initialToken)
+	t.Setenv(envAttachTokenFile, tokenPath)
+
+	r := minimalRunner(t)
+	sess, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{
+		"/bin/sh", "-c", `while [ ! -f "$1" ]; do sleep 0.05; done`, "sh", donePath,
+	}})
+	if err != nil {
+		t.Fatalf("ptyhost.Spawn: %v", err)
+	}
+	h := newInteractivePTYHandle(sess)
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	type dispatchResult struct {
+		res *Result
+		err error
+	}
+	resultCh := make(chan dispatchResult, 1)
+	go func() {
+		res := &Result{SessionID: sessionID}
+		res.ProviderName = agent.ProviderShell
+		qw := QueuedWork{}
+		qw.SessionID = sessionID
+		out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil)
+		resultCh <- dispatchResult{res: out, err: err}
+	}()
+
+	select {
+	case got := <-admitted:
+		if got != initialToken {
+			t.Fatalf("initial admission token=%q; want static token", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("initial static attach token was not admitted")
+	}
+
+	// The live connection may remain valid until it drops. Once the initial JWT's
+	// exp has passed, simulate relay re-admission policy, atomically publish the
+	// replacement file, and force a reconnect.
+	if wait := time.Until(initialExp.Add(20 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	tmp := tokenPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(replacementToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, tokenPath); err != nil {
+		t.Fatal(err)
+	}
+	allowedToken.Store(replacementToken)
+	close(dropInitial)
+
+	select {
+	case got := <-admitted:
+		if got != replacementToken {
+			t.Fatalf("reconnect admission token=%q; want replacement token", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay reconnect did not re-read ATTACH_TOKEN_FILE")
+	}
+
+	if err := os.WriteFile(donePath, []byte("done"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("dispatchInteractive: %v", got.err)
+		}
+		if got.res.Status != "completed" {
+			t.Fatalf("status=%q error=%q; want completed", got.res.Status, got.res.Error)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchInteractive did not finish after token-file reconnect")
+	}
+}
+
 // ─── full-stack attach e2e ─────────────────────────────────────────────────
 
 // TestInteractive_FullStackAttachE2E wires the REAL stack end to end:
@@ -465,5 +620,166 @@ quitLoop:
 	}
 	if sc != "interactive" {
 		t.Fatalf("lock-refresh sessionClass=%q; want interactive", sc)
+	}
+}
+
+// ─── attachTokenSource — per-attempt token re-resolution (refresh rail) ────
+
+func TestAttachTokenSource_NoFileReturnsStatic(t *testing.T) {
+	src := attachTokenSource("static-tok", "", nil)
+	for i := 0; i < 3; i++ {
+		tok, err := src(context.Background())
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", i, err)
+		}
+		if tok != "static-tok" {
+			t.Fatalf("call %d: tok=%q; want static-tok", i, tok)
+		}
+	}
+}
+
+func TestAttachTokenSource_FileVariants(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string // written to the token file before the call
+		noFile  bool   // point at a path that does not exist
+		want    string
+	}{
+		{name: "fresh token", content: "fresh-tok", want: "fresh-tok"},
+		{name: "trailing newline trimmed", content: "fresh-tok\n", want: "fresh-tok"},
+		{name: "surrounding whitespace trimmed", content: "  fresh-tok \n\n", want: "fresh-tok"},
+		{name: "empty file falls back to static", content: "", want: "static-tok"},
+		{name: "whitespace-only file falls back to static", content: " \n\t\n", want: "static-tok"},
+		{name: "missing file falls back to static", noFile: true, want: "static-tok"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "token")
+			if !tc.noFile {
+				if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			src := attachTokenSource("static-tok", path, nil)
+			tok, err := src(context.Background())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tok != tc.want {
+				t.Fatalf("tok=%q; want %q", tok, tc.want)
+			}
+		})
+	}
+}
+
+// The load-bearing behavior of the refresh rail: the file is re-read on EVERY
+// attempt, so a provisioner rewriting it between dials swaps the presented
+// token — and a file that degrades (removed) falls back to the static token
+// without erroring.
+func TestAttachTokenSource_PerAttemptReRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("tok-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := attachTokenSource("static-tok", path, nil)
+
+	if tok, _ := src(context.Background()); tok != "tok-1" {
+		t.Fatalf("first read tok=%q; want tok-1", tok)
+	}
+
+	// Provisioner refresh: atomic replace (tmp + rename), as documented.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte("tok-2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	if tok, _ := src(context.Background()); tok != "tok-2" {
+		t.Fatalf("post-rewrite tok=%q; want tok-2", tok)
+	}
+
+	// File vanishes → degrade to the static token, no error (an error would
+	// only burn a backoff cycle; the static token may still admit).
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := src(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error after remove: %v", err)
+	}
+	if tok != "static-tok" {
+		t.Fatalf("post-remove tok=%q; want static-tok", tok)
+	}
+}
+
+// TokenSource is a concurrent-use contract: the degraded carrier can re-mint
+// from its POST-up, SSE, and upgrade-probe paths at the same time. Exercise the
+// warning-state transitions under a synchronized fan-out so -race observes any
+// unsynchronized closure state, while the assertions also pin one warning per
+// distinct failure until a successful read clears the condition.
+func TestAttachTokenSource_ConcurrentWarningState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	src := attachTokenSource("static-tok", path, logger)
+
+	callConcurrently := func(want string) {
+		t.Helper()
+		const callers = 64
+		start := make(chan struct{})
+		errCh := make(chan error, callers)
+		var wg sync.WaitGroup
+		wg.Add(callers)
+		for i := 0; i < callers; i++ {
+			go func() {
+				defer wg.Done()
+				<-start
+				tok, err := src(context.Background())
+				if err != nil {
+					errCh <- fmt.Errorf("unexpected source error: %w", err)
+					return
+				}
+				if tok != want {
+					errCh <- fmt.Errorf("tok=%q; want %q", tok, want)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			t.Error(err)
+		}
+	}
+
+	// A persistent missing file warns once even when many callers observe it.
+	callConcurrently("static-tok")
+	callConcurrently("static-tok")
+	if got := strings.Count(logs.String(), "attach token file unreadable"); got != 1 {
+		t.Fatalf("unreadable warning count=%d; want 1 before recovery\nlogs:\n%s", got, logs.String())
+	}
+
+	// A different failure condition gets its own warning.
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	callConcurrently("static-tok")
+	if got := strings.Count(logs.String(), "attach token file empty"); got != 1 {
+		t.Fatalf("empty warning count=%d; want 1\nlogs:\n%s", got, logs.String())
+	}
+
+	// A successful read clears the warning state. A later recurrence of the
+	// missing-file condition must therefore warn exactly once again.
+	if err := os.WriteFile(path, []byte("fresh-tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	callConcurrently("fresh-tok")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	callConcurrently("static-tok")
+	if got := strings.Count(logs.String(), "attach token file unreadable"); got != 2 {
+		t.Fatalf("unreadable warning count=%d; want 2 after recovery and recurrence\nlogs:\n%s", got, logs.String())
 	}
 }

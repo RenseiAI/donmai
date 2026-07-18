@@ -2,6 +2,11 @@ package attachclient
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +65,106 @@ func TestDegradedFallbackStreamsViaPOST(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("RunHost (degraded) did not return after Exit")
+	}
+}
+
+func TestDegradedPersistentSSE401BacksOffRecoversAndCancels(t *testing.T) {
+	const basePath = "/v1/rooms/room-1"
+	stale := mkHostToken(testSessionID, 1, "host-stale", true)
+	replacement := mkHostToken(testSessionID, 1, "host-replacement", true)
+
+	var sourceToken atomic.Value
+	sourceToken.Store(stale)
+	var allowedToken atomic.Value
+	allowedToken.Store(replacement)
+	var sseRequests atomic.Int64
+	admitted := make(chan struct{}, 1)
+	postAccepted := make(chan struct{}, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case basePath:
+			http.Error(w, "upgrade unavailable", http.StatusNotFound)
+		case basePath + "/host/sse":
+			sseRequests.Add(1)
+			if r.Header.Get("Authorization") != "Bearer "+allowedToken.Load().(string) {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			select {
+			case admitted <- struct{}{}:
+			default:
+			}
+			<-r.Context().Done()
+		case basePath + "/host/output":
+			if r.Header.Get("Authorization") != "Bearer "+allowedToken.Load().(string) {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			writeAccepted(w)
+			select {
+			case postAccepted <- struct{}{}:
+			default:
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	sess := newFakeSession(32)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RunHost(ctx, HostConfig{
+			AttachURL: strings.Replace(srv.URL, "http://", "ws://", 1) + basePath,
+			TokenSource: func(context.Context) (string, error) {
+				return sourceToken.Load().(string), nil
+			},
+			Session:              sess,
+			FallbackAfterN:       1,
+			BackoffMin:           40 * time.Millisecond,
+			BackoffMax:           40 * time.Millisecond,
+			UpgradeProbeInterval: time.Hour,
+		})
+	}()
+
+	// A missing/empty runner token file resolves to the same rejected static
+	// bearer. The degraded SSE leg must hand that failure back to RunHost's
+	// reconnect backoff instead of spinning inside openHostSSE.
+	time.Sleep(220 * time.Millisecond)
+	if got := sseRequests.Load(); got < 2 || got > 12 {
+		cancel()
+		t.Fatalf("SSE request count=%d during persistent 401; want bounded [2,12]", got)
+	}
+
+	// Once the provisioner makes a replacement available, the next top-level
+	// attempt is admitted and the POST-up half uses the same refreshed bearer.
+	sourceToken.Store(replacement)
+	select {
+	case <-admitted:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("degraded SSE did not recover after token replacement")
+	}
+	select {
+	case <-postAccepted:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("degraded POST-up did not use the replacement token")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunHost returned %v after cancellation; want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunHost did not cancel promptly after degraded recovery")
 	}
 }
 

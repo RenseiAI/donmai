@@ -3,10 +3,12 @@ package attachclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -154,6 +156,115 @@ func TestPostHostBatchTaxonomy(t *testing.T) {
 	}
 	if tokH.current() != "tok-2" {
 		t.Errorf("token after 401 = %q, want tok-2", tokH.current())
+	}
+}
+
+func TestOpenHostSSEPersistentUnauthorizedIsBounded(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	for _, tc := range []struct {
+		name       string
+		current    string
+		resolved   string
+		wantCalls  int64
+		wantErrIs  error
+		wantErrSub string
+	}{
+		{
+			name:      "unchanged rejected token stops immediately",
+			current:   "stale",
+			resolved:  "stale",
+			wantCalls: 1,
+			wantErrIs: errRejectedTokenUnchanged,
+		},
+		{
+			name:       "replacement is retried only once",
+			current:    "stale",
+			resolved:   "replacement",
+			wantCalls:  2,
+			wantErrSub: "remained unauthorized",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := requests.Load()
+			tokH := &tokenHolder{cur: tc.current, src: func(context.Context) (string, error) {
+				return tc.resolved, nil
+			}}
+			h := &host{cfg: HostConfig{HTTPClient: srv.Client()}, log: discardLogger()}
+			resp, err := h.openHostSSE(context.Background(), srv.URL, tokH, hostClaims{Epoch: 1})
+			if resp != nil {
+				_ = resp.Body.Close()
+				t.Fatal("openHostSSE unexpectedly returned a response")
+			}
+			if err == nil {
+				t.Fatal("openHostSSE unexpectedly succeeded against persistent 401")
+			}
+			if tc.wantErrIs != nil && !errors.Is(err, tc.wantErrIs) {
+				t.Fatalf("error=%v; want errors.Is(%v)", err, tc.wantErrIs)
+			}
+			if tc.wantErrSub != "" && !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Fatalf("error=%v; want substring %q", err, tc.wantErrSub)
+			}
+			if got := requests.Load() - before; got != tc.wantCalls {
+				t.Fatalf("request count=%d; want %d", got, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestPostHostBatchPersistentUnauthorizedIsBoundedAndRecovers(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int64
+	var allowed atomic.Value
+	allowed.Store("never")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Header.Get("Authorization") != "Bearer "+allowed.Load().(string) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		writeAccepted(w)
+	}))
+	defer srv.Close()
+
+	var resolved atomic.Value
+	resolved.Store("stale")
+	tokH := &tokenHolder{cur: "stale", src: func(context.Context) (string, error) {
+		return resolved.Load().(string), nil
+	}}
+	h := &host{cfg: HostConfig{HTTPClient: srv.Client()}, log: discardLogger()}
+	batch := attachwire.HostFrameBatch{BatchID: "persistent-401", FirstSeq: 1, LastSeq: 3}
+
+	_, outcome, err := h.postHostBatch(context.Background(), srv.URL, tokH, batch)
+	if outcome != postFatal || !errors.Is(err, errRejectedTokenUnchanged) {
+		t.Fatalf("first POST outcome=%v err=%v; want postFatal + unchanged-token error", outcome, err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("request count=%d after unchanged token; want 1", got)
+	}
+
+	resolved.Store("replacement")
+	_, outcome, err = h.postHostBatch(context.Background(), srv.URL, tokH, batch)
+	if outcome != postFatal || err == nil || !strings.Contains(err.Error(), "remained unauthorized") {
+		t.Fatalf("second POST outcome=%v err=%v; want bounded persistent-401 failure", outcome, err)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("request count=%d after one replacement retry; want 3", got)
+	}
+
+	allowed.Store("replacement")
+	ack, outcome, err := h.postHostBatch(context.Background(), srv.URL, tokH, batch)
+	if err != nil || outcome != postOK || ack != 3 {
+		t.Fatalf("recovery POST outcome=%v ack=%d err=%v; want postOK ack=3", outcome, ack, err)
+	}
+	if got := requests.Load(); got != 4 {
+		t.Fatalf("request count=%d after recovery; want 4", got)
 	}
 }
 
