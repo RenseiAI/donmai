@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -199,7 +200,8 @@ func TestProvisionExhaustsRetries(t *testing.T) {
 	dir := t.TempDir()
 	runner := newStubRunner()
 	for i := 0; i < 6; i++ {
-		runner.plan = append(runner.plan,
+		runner.plan = append(
+			runner.plan,
 			func(_ string, _ ...string) ([]byte, error) {
 				return []byte("already checked out"), exec.Command("false").Run()
 			},
@@ -295,6 +297,137 @@ func TestTeardownRemovesPath(t *testing.T) {
 	}
 }
 
+func TestTerminalLeaseRetainsLeafUntilAcknowledgement(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	leaseStore, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(dir, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := newStubRunner(func(_ string, args ...string) ([]byte, error) {
+		dst := args[len(args)-1]
+		return nil, os.MkdirAll(dst, 0o750)
+	})
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir:     dir,
+		CommandRunner: runner.run,
+		LeaseStore:    leaseStore,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "s1",
+		RepoURL:   "x",
+		Strategy:  worktree.StrategyClone,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := m.AcquireTerminalLease(context.Background(), workarea.AcquireSpec{
+		SessionID:        "s1",
+		TerminalResultID: "result-1",
+		Policy: workarea.LeasePolicy{
+			SettlementBudget: time.Minute,
+			SafetyMargin:     time.Second,
+			LeaseDuration:    2 * time.Minute,
+			MaxLeaseDuration: 5 * time.Minute,
+		},
+	})
+	if err != nil {
+		t.Fatalf("AcquireTerminalLease: %v", err)
+	}
+	persisted, err := leaseStore.Get(lease.LeaseID)
+	if err != nil || persisted.State != workarea.LeaseActive {
+		t.Fatalf("lease not durable before teardown: lease=%+v err=%v", persisted, err)
+	}
+
+	if err := m.Teardown(context.Background(), "s1"); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("leased leaf was removed before acknowledgement: %v", err)
+	}
+	retained, err := leaseStore.Get(lease.LeaseID)
+	if err != nil || !retained.ReleaseRequested || retained.State != workarea.LeaseActive {
+		t.Fatalf("teardown did not retain active lease: lease=%+v err=%v", retained, err)
+	}
+
+	ack := workarea.TerminalResultAcknowledgement{
+		LeaseID:          lease.LeaseID,
+		SessionID:        lease.SessionID,
+		TerminalResultID: lease.TerminalResultID,
+		WorkareaID:       lease.WorkareaID,
+		Acknowledged:     true,
+	}
+	for i := 0; i < 2; i++ {
+		released, ackErr := m.AcknowledgeTerminalResult(context.Background(), ack)
+		if ackErr != nil {
+			t.Fatalf("AcknowledgeTerminalResult %d: %v", i+1, ackErr)
+		}
+		if released.State != workarea.LeaseReleased {
+			t.Fatalf("acknowledgement %d state = %q", i+1, released.State)
+		}
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("acknowledged leaf still exists: %v", err)
+	}
+	if _, err := m.Path("s1"); !errors.Is(err, worktree.ErrUnknownSession) {
+		t.Fatalf("released session remained owned: %v", err)
+	}
+}
+
+func TestTerminalLeaseAcknowledgementRecoversAfterManagerRestart(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	runner := newStubRunner(func(_ string, args ...string) ([]byte, error) {
+		dst := args[len(args)-1]
+		return nil, os.MkdirAll(dst, 0o750)
+	})
+	first, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner.run})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := first.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "s1",
+		RepoURL:   "x",
+		Strategy:  worktree.StrategyClone,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := first.AcquireTerminalLease(context.Background(), workarea.AcquireSpec{
+		SessionID:        "s1",
+		TerminalResultID: "result-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Teardown(context.Background(), "s1"); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner.run})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = recovered.AcknowledgeTerminalResult(context.Background(), workarea.TerminalResultAcknowledgement{
+		LeaseID:          lease.LeaseID,
+		SessionID:        lease.SessionID,
+		TerminalResultID: lease.TerminalResultID,
+		WorkareaID:       lease.WorkareaID,
+		Acknowledged:     true,
+	})
+	if err != nil {
+		t.Fatalf("recovered acknowledgement: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("recovered release retained leaf: %v", err)
+	}
+}
+
 func TestPathUnknownSession(t *testing.T) {
 	t.Parallel()
 	m, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
@@ -344,6 +477,23 @@ func TestProvisionStrategyWorktreeAdd(t *testing.T) {
 		if captured[i] != want[i] {
 			t.Fatalf("git args mismatch:\n got: %v\nwant prefix: %v", captured, want)
 		}
+	}
+}
+
+func TestProvisionRejectsLeaseStateDirectoryAsLeaf(t *testing.T) {
+	t.Parallel()
+	m, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "s1",
+		RepoURL:   "x",
+		Strategy:  worktree.StrategyClone,
+		LeafName:  ".terminal-leases",
+	})
+	if err == nil || !strings.Contains(err.Error(), "lease state directory") {
+		t.Fatalf("Provision error = %v, want lease state directory conflict", err)
 	}
 }
 
