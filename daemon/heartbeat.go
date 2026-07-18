@@ -28,6 +28,20 @@ type HeartbeatOptions struct {
 	GetStatus       func() RegistrationStatus
 	Region          string
 
+	// GetActiveInteractiveCount returns the number of in-flight sessions
+	// whose run-mode is interactive ("interview"), a subset of GetActiveCount.
+	// It lets the platform tell PTY-attach interactive sessions apart from
+	// headless runs.
+	//
+	// Optional and nil-safe: nil means "this embedder does not classify
+	// interactive occupancy", and the outbound body omits the
+	// `activeInteractiveCount` key entirely. This is deliberately distinct
+	// from reporting 0 — a nil callback must NOT be reported as zero
+	// interactive load, which would falsely claim the host is running no
+	// interactive sessions. Matches the GetLoad/GetAllowlist optional-callback
+	// convention.
+	GetActiveInteractiveCount func() int
+
 	// GetLoad returns the current CPU and memory utilisation percentages
 	// (0–100) for this beat. ok=false means "no sample this beat" and the
 	// outbound body omits the `load` key entirely (the platform then leaves
@@ -238,6 +252,15 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		SentAt:         h.opts.Now().UTC().Format(time.RFC3339),
 	}
 
+	// Interactive-occupancy split: when the embedder classifies interactive
+	// ("interview") sessions, attach the count as a *int so "not reported"
+	// (nil) stays distinguishable from a genuine zero on the wire. A nil
+	// callback leaves payload.ActiveInteractiveSessions nil → key omitted.
+	if h.opts.GetActiveInteractiveCount != nil {
+		n := h.opts.GetActiveInteractiveCount()
+		payload.ActiveInteractiveSessions = &n
+	}
+
 	// Phase 1d: attach allowlist hash every beat, full list only on change.
 	if h.opts.GetAllowlist != nil {
 		entries := h.opts.GetAllowlist()
@@ -366,19 +389,24 @@ func (h *HeartbeatService) SetCredentials(workerID, jwt string) {
 // heartbeatRequestBody is the JSON body sent on POST
 // /api/workers/<id>/heartbeat. Matches the platform contract:
 //
-//	{ activeCount, maxSessions?, load?, allowlistHash?, allowlist?,
-//	  appliedMutations?, mutationFailures? }
+//	{ activeCount, activeInteractiveCount?, maxSessions?, load?,
+//	  allowlistHash?, allowlist?, appliedMutations?, mutationFailures? }
 //
-// allowlistHash + allowlist are Phase 1d fields; appliedMutations +
-// mutationFailures are Phase 2c ACK fields.
+// activeInteractiveCount is the interactive-occupancy split of activeCount
+// (interview-mode sessions); allowlistHash + allowlist are Phase 1d fields;
+// appliedMutations + mutationFailures are Phase 2c ACK fields.
 type heartbeatRequestBody struct {
-	ActiveCount      int                        `json:"activeCount"`
-	MaxSessions      int                        `json:"maxSessions,omitempty"`
-	Load             *heartbeatLoadFields       `json:"load,omitempty"`
-	AllowlistHash    string                     `json:"allowlistHash,omitempty"`
-	Allowlist        []ProjectAllowlistEntry    `json:"allowlist,omitempty"`
-	AppliedMutations []string                   `json:"appliedMutations,omitempty"`
-	MutationFailures []HeartbeatMutationFailure `json:"mutationFailures,omitempty"`
+	ActiveCount int `json:"activeCount"`
+	// ActiveInteractiveCount is a *int so a nil (unreported) value drops the
+	// key via omitempty — an embedder that does not classify interactive
+	// occupancy must not send a misleading 0.
+	ActiveInteractiveCount *int                       `json:"activeInteractiveCount,omitempty"`
+	MaxSessions            int                        `json:"maxSessions,omitempty"`
+	Load                   *heartbeatLoadFields       `json:"load,omitempty"`
+	AllowlistHash          string                     `json:"allowlistHash,omitempty"`
+	Allowlist              []ProjectAllowlistEntry    `json:"allowlist,omitempty"`
+	AppliedMutations       []string                   `json:"appliedMutations,omitempty"`
+	MutationFailures       []HeartbeatMutationFailure `json:"mutationFailures,omitempty"`
 }
 
 type heartbeatLoadFields struct {
@@ -443,13 +471,14 @@ func (h *HeartbeatService) callEndpoint(
 	url := strings.TrimRight(h.opts.OrchestratorURL, "/") + "/api/workers/" + workerID + "/heartbeat"
 
 	body := heartbeatRequestBody{
-		ActiveCount:      payload.ActiveSessions,
-		MaxSessions:      payload.MaxSessions,
-		Load:             payload.Load,
-		AllowlistHash:    payload.AllowlistHash,
-		Allowlist:        payload.Allowlist,
-		AppliedMutations: ackApplied,
-		MutationFailures: ackFailures,
+		ActiveCount:            payload.ActiveSessions,
+		ActiveInteractiveCount: payload.ActiveInteractiveSessions,
+		MaxSessions:            payload.MaxSessions,
+		Load:                   payload.Load,
+		AllowlistHash:          payload.AllowlistHash,
+		Allowlist:              payload.Allowlist,
+		AppliedMutations:       ackApplied,
+		MutationFailures:       ackFailures,
 	}
 	// NB: region is deliberately NOT sent on the heartbeat leg. The platform's
 	// heartbeat route parses no `region` key — region is a register-time-only

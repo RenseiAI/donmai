@@ -508,3 +508,92 @@ func TestHeartbeatService_LoadOmittedWhenSamplerMisses(t *testing.T) {
 		})
 	}
 }
+
+// TestHeartbeatService_ActiveInteractiveCountRoundTrips confirms the
+// interactive-occupancy split is wired end-to-end: when
+// GetActiveInteractiveCount is set, the outbound body carries an
+// `activeInteractiveCount` key with the reported value, alongside the
+// unclassed `activeCount`.
+func TestHeartbeatService_ActiveInteractiveCountRoundTrips(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	var (
+		mu  sync.Mutex
+		raw map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		buf, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(buf, &raw)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+	}))
+	t.Cleanup(srv.Close)
+
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID:                  "wkr_interactive",
+		Hostname:                  "h",
+		OrchestratorURL:           srv.URL,
+		RuntimeJWT:                "runtime.jwt.value",
+		IntervalSeconds:           60,
+		GetActiveCount:            func() int { return 3 },
+		GetActiveInteractiveCount: func() int { return 2 },
+		GetMaxCount:               func() int { return 4 },
+		GetStatus:                 func() RegistrationStatus { return RegistrationIdle },
+	})
+	hs.sendOne(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got, _ := raw["activeCount"].(float64); got != 3 {
+		t.Errorf("body.activeCount = %v, want 3", raw["activeCount"])
+	}
+	got, present := raw["activeInteractiveCount"]
+	if !present {
+		t.Fatalf("body.activeInteractiveCount missing, want 2")
+	}
+	if v, _ := got.(float64); v != 2 {
+		t.Errorf("body.activeInteractiveCount = %v, want 2", got)
+	}
+}
+
+// TestHeartbeatService_ActiveInteractiveCountOmittedWhenUnclassified confirms
+// the `activeInteractiveCount` key is omitted entirely (pointer + omitempty)
+// when GetActiveInteractiveCount is nil — a nil callback must not send a
+// misleading 0. Asserts key ABSENCE, not `== 0`, so a genuine zero-interactive
+// beat (which DOES send the key) stays distinguishable.
+func TestHeartbeatService_ActiveInteractiveCountOmittedWhenUnclassified(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	var (
+		mu  sync.Mutex
+		raw map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		buf, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(buf, &raw)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+	}))
+	t.Cleanup(srv.Close)
+
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID:        "wkr_nointeractive",
+		Hostname:        "h",
+		OrchestratorURL: srv.URL,
+		RuntimeJWT:      "runtime.jwt.value",
+		IntervalSeconds: 60,
+		GetActiveCount:  func() int { return 1 },
+		GetMaxCount:     func() int { return 4 },
+		GetStatus:       func() RegistrationStatus { return RegistrationIdle },
+		// GetActiveInteractiveCount deliberately nil.
+	})
+	hs.sendOne(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if _, present := raw["activeInteractiveCount"]; present {
+		t.Errorf("expected activeInteractiveCount key absent, got %v", raw["activeInteractiveCount"])
+	}
+}

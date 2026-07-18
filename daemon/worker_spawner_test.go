@@ -1128,3 +1128,57 @@ func TestSpawner_AddProjects_Concurrency(_ *testing.T) {
 	// Drain so the test does not leave zombie /bin/sh stubs.
 	_ = s.Drain(2 * time.Second)
 }
+
+// TestSpawner_ActiveInteractiveCount pins the interactive-occupancy split:
+// only sessions whose run-mode is "interview" count toward
+// ActiveInteractiveCount, and it never exceeds ActiveCount.
+func TestSpawner_ActiveInteractiveCount(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 5,
+		WorkerCommand:         []string{"sleep", "30"},
+	})
+	ended := sessionEnds(s)
+	t.Cleanup(func() { _ = s.Drain(time.Second) })
+
+	// Empty spawner: zero interactive, zero total.
+	if got := s.ActiveInteractiveCount(); got != 0 {
+		t.Fatalf("ActiveInteractiveCount on empty spawner = %d, want 0", got)
+	}
+
+	specs := []SessionSpec{
+		{SessionID: "head-1", Repository: "github.com/a/b"},                   // headless
+		{SessionID: "int-1", Repository: "github.com/a/b", Mode: "interview"}, // interactive
+		{SessionID: "head-2", Repository: "github.com/a/b"},                   // headless
+		{SessionID: "int-2", Repository: "github.com/a/b", Mode: "interview"}, // interactive
+	}
+	for _, spec := range specs {
+		if _, err := s.AcceptWork(spec); err != nil {
+			t.Fatalf("accept %q: %v", spec.SessionID, err)
+		}
+	}
+
+	if got := s.ActiveCount(); got != 4 {
+		t.Fatalf("ActiveCount = %d, want 4", got)
+	}
+	if got := s.ActiveInteractiveCount(); got != 2 {
+		t.Fatalf("ActiveInteractiveCount = %d, want 2 (only interview-mode)", got)
+	}
+	if s.ActiveInteractiveCount() > s.ActiveCount() {
+		t.Fatalf("ActiveInteractiveCount(%d) must never exceed ActiveCount(%d)",
+			s.ActiveInteractiveCount(), s.ActiveCount())
+	}
+
+	// Stop one interactive session; the interactive count drops, headless
+	// count is untouched.
+	if !s.StopSession("int-1") {
+		t.Fatal("StopSession(int-1) = false, want true")
+	}
+	waitSessionEnd(t, ended)
+	if got := s.ActiveInteractiveCount(); got != 1 {
+		t.Fatalf("ActiveInteractiveCount after stopping one interview session = %d, want 1", got)
+	}
+	if got := s.ActiveCount(); got != 3 {
+		t.Fatalf("ActiveCount after stopping one interview session = %d, want 3", got)
+	}
+}

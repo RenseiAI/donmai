@@ -231,9 +231,14 @@ type HeartbeatPayload struct {
 	Hostname       string             `json:"hostname"`
 	Status         RegistrationStatus `json:"status"`
 	ActiveSessions int                `json:"activeSessions"`
-	MaxSessions    int                `json:"maxSessions"`
-	Region         string             `json:"region,omitempty"`
-	SentAt         string             `json:"sentAt"`
+	// ActiveInteractiveSessions is the interactive ("interview" run-mode)
+	// subset of ActiveSessions. A *int so nil ("not classified by this
+	// embedder") stays distinct from a genuine 0. The corresponding wire key
+	// on heartbeatRequestBody is `activeInteractiveCount` (heartbeat.go).
+	ActiveInteractiveSessions *int   `json:"activeInteractiveSessions,omitempty"`
+	MaxSessions               int    `json:"maxSessions"`
+	Region                    string `json:"region,omitempty"`
+	SentAt                    string `json:"sentAt"`
 
 	// AllowlistHash is the SHA-256 of the daemon's current project
 	// allowlist (see allowlist_report.go). Sent on every beat so the

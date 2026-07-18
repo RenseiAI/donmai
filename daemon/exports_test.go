@@ -177,6 +177,20 @@ func TestDaemon_ActiveSessionCount_Exported(t *testing.T) {
 	}
 }
 
+// TestDaemon_ActiveInteractiveSessionCount_Exported proves
+// ActiveInteractiveSessionCount is callable from outside the package. Before
+// Start(), the spawner is nil so the count is 0.
+func TestDaemon_ActiveInteractiveSessionCount_Exported(t *testing.T) {
+	t.Parallel()
+	d := daemon.New(daemon.Options{
+		ConfigPath: "/dev/null",
+		HTTPPort:   0,
+	})
+	if got := d.ActiveInteractiveSessionCount(); got != 0 {
+		t.Errorf("ActiveInteractiveSessionCount before Start = %d, want 0", got)
+	}
+}
+
 // TestDaemon_MaxConcurrentSessions_Exported proves MaxConcurrentSessions is
 // callable from outside the package. Before Start() (config not loaded),
 // it returns 0.

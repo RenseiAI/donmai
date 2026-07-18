@@ -201,6 +201,21 @@ func (s *WorkerSpawner) ActiveCount() int {
 	return len(s.sessions)
 }
 
+// ActiveInteractiveCount returns the number of in-flight sessions whose
+// run-mode is interactive ("interview"). Headless sessions (Mode "") are
+// excluded, so the result is always <= ActiveCount().
+func (s *WorkerSpawner) ActiveInteractiveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, ss := range s.sessions {
+		if ss.spec.Mode == "interview" {
+			n++
+		}
+	}
+	return n
+}
+
 // IsAccepting reports whether the spawner is currently accepting work.
 func (s *WorkerSpawner) IsAccepting() bool {
 	s.mu.Lock()

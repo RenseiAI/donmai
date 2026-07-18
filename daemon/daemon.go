@@ -667,9 +667,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 			RuntimeJWT:      regResp.RuntimeToken,
 			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
 			GetActiveCount:  func() int { return d.spawnerActiveCount() },
-			GetMaxCount:     func() int { return d.maxConcurrentSessions() },
-			GetStatus:       d.RegistrationStatus,
-			Region:          cfg.Machine.Region,
+			// Interactive-occupancy split: report the interview-mode subset
+			// so the platform can tell PTY-attach interactive sessions apart
+			// from headless runs (distinct from the unclassed activeCount).
+			GetActiveInteractiveCount: func() int { return d.spawnerActiveInteractiveCount() },
+			GetMaxCount:               func() int { return d.maxConcurrentSessions() },
+			GetStatus:                 d.RegistrationStatus,
+			Region:                    cfg.Machine.Region,
 			// Item 8: per-beat CPU/mem load sample → last_cpu_pct/last_mem_pct.
 			// Best-effort stdlib probe; omits the load key when it can't sample.
 			GetLoad:      SampleLoad,
@@ -1101,12 +1105,28 @@ func (d *Daemon) spawnerActiveCount() int {
 	return d.spawner.ActiveCount()
 }
 
+func (d *Daemon) spawnerActiveInteractiveCount() int {
+	if d.spawner == nil {
+		return 0
+	}
+	return d.spawner.ActiveInteractiveCount()
+}
+
 // ActiveSessionCount returns the number of agent sessions currently running
 // under the daemon's shared WorkerSpawner. Exported so embedders can wire this
 // into a satellite heartbeat's GetActiveCount callback for a shared-spawner
 // multi-identity configuration.
 func (d *Daemon) ActiveSessionCount() int {
 	return d.spawnerActiveCount()
+}
+
+// ActiveInteractiveSessionCount returns the number of interactive ("interview"
+// run-mode) agent sessions currently running under the daemon's shared
+// WorkerSpawner. Exported so embedders can wire this into a satellite
+// heartbeat's GetActiveInteractiveCount callback for a shared-spawner
+// multi-identity configuration.
+func (d *Daemon) ActiveInteractiveSessionCount() int {
+	return d.spawnerActiveInteractiveCount()
 }
 
 // MaxConcurrentSessions returns the per-host capacity ceiling configured for
