@@ -257,6 +257,15 @@ type QueuedWork struct {
 	// internal/interview/wiretypes.go InterviewRunMode.
 	Mode string `json:"mode,omitempty"`
 
+	// InitialPrompt is opaque first-input data for Mode="interactive". The
+	// interactive runner writes it verbatim plus one newline into the live PTY
+	// before relay attach. The prompt renderer MUST NOT include it in either
+	// headless or interview system/user prompts.
+	//
+	// Wire shape: "initialPrompt" (camelCase, omitempty). Empty/absent is a
+	// no-op and preserves the pre-field wire shape.
+	InitialPrompt string `json:"initialPrompt,omitempty"`
+
 	// InterviewBudget is the per-interview runtime budget the runner
 	// enforces when Mode="interview". nil = no caps. Carried through
 	// every wire hop so the strict JSON decoder never drops it.

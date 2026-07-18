@@ -202,6 +202,11 @@ type SessionDetail struct {
 	// SystemPromptOverride / Kits / DisallowedTools).
 	Mode string `json:"mode,omitempty"`
 
+	// InitialPrompt forwards the optional first terminal input for a
+	// mode:"interactive" session. It stays opaque through the daemon and is
+	// never incorporated into headless or interview prompt builders.
+	InitialPrompt string `json:"initialPrompt,omitempty"`
+
 	// InterviewBudget forwards the per-interview wall-clock + idle-grace
 	// budget from PollWorkItem onto the runner's QueuedWork. nil/absent
 	// is safe and backward-compatible. Opaque forwarder only.

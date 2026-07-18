@@ -82,6 +82,93 @@ func (h *interactivePTYHandle) InteractiveSession() agent.InteractiveSession {
 	return h.sess
 }
 
+// testInteractiveHandle decorates any agent.Handle with a caller-supplied PTY
+// surface. It lets focused tests record input while preserving the real handle's
+// Stop semantics, and lets reconnect tests wrap a real ptyhost.Session without
+// altering the production fixture.
+type testInteractiveHandle struct {
+	agent.Handle
+	session agent.InteractiveSession
+}
+
+func (h *testInteractiveHandle) InteractiveSession() agent.InteractiveSession {
+	return h.session
+}
+
+// recordingInteractiveSession records every accepted input byte. It embeds the
+// remaining interface methods from an optional real session; focused local-only
+// tests override Done/Exit and never call the promoted attach methods.
+type recordingInteractiveSession struct {
+	agent.InteractiveSession
+	mu       sync.Mutex
+	writes   [][]byte
+	maxWrite int
+	writeErr error
+	done     chan struct{}
+	exit     attachwire.ExitPayload
+	exitOK   bool
+}
+
+func (s *recordingInteractiveSession) WriteInput(p []byte) (int, error) {
+	if s.writeErr != nil {
+		return 0, s.writeErr
+	}
+	limit := len(p)
+	if s.maxWrite > 0 && limit > s.maxWrite {
+		limit = s.maxWrite
+	}
+	n, err := limit, error(nil)
+	if s.InteractiveSession != nil {
+		n, err = s.InteractiveSession.WriteInput(p[:limit])
+	}
+	if n > 0 && n <= limit {
+		s.mu.Lock()
+		s.writes = append(s.writes, append([]byte(nil), p[:n]...))
+		s.mu.Unlock()
+	}
+	return n, err
+}
+
+func (s *recordingInteractiveSession) Done() <-chan struct{} {
+	if s.done != nil {
+		return s.done
+	}
+	return s.InteractiveSession.Done()
+}
+
+func (s *recordingInteractiveSession) Exit() (attachwire.ExitPayload, bool) {
+	if s.done != nil {
+		return s.exit, s.exitOK
+	}
+	return s.InteractiveSession.Exit()
+}
+
+func (s *recordingInteractiveSession) inputBytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []byte
+	for _, write := range s.writes {
+		out = append(out, write...)
+	}
+	return out
+}
+
+func (s *recordingInteractiveSession) writeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.writes)
+}
+
+func completedRecordingInteractiveSession() *recordingInteractiveSession {
+	done := make(chan struct{})
+	close(done)
+	return &recordingInteractiveSession{
+		done:   done,
+		exit:   attachwire.NewNormalExit(0),
+		exitOK: true,
+	}
+}
+
 // ─── test helpers ──────────────────────────────────────────────────────────
 
 func requireSh(t *testing.T) {
@@ -181,6 +268,57 @@ func waitForOutput(v *attachtest.Viewer, want string, timeout time.Duration) boo
 	}
 }
 
+// waitForTerminalText accepts either live/replayed Output frames or a Snapshot
+// containing want. Pre-attach terminal history is allowed to converge through
+// the snapshot path rather than being replayed as Output.
+func waitForTerminalText(v *attachtest.Viewer, want string, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	var output strings.Builder
+	for {
+		select {
+		case f, ok := <-v.Frames():
+			if !ok {
+				return strings.Contains(output.String(), want)
+			}
+			switch f.Type {
+			case attachwire.TypeOutput:
+				output.Write(attachwire.DecodeOutput(f.Payload).Data)
+				if strings.Contains(output.String(), want) {
+					return true
+				}
+			case attachwire.TypeSnapshot:
+				env, err := attachwire.DecodeSnapshotEnvelope(f.Payload)
+				if err != nil {
+					continue
+				}
+				screen, err := attachwire.DecodeScreen(env.Snap)
+				if err != nil {
+					continue
+				}
+				var snapshot strings.Builder
+				for _, line := range screen.Scrollback {
+					for _, cell := range line {
+						snapshot.Write(cell.RuneBytes)
+					}
+					snapshot.WriteByte('\n')
+				}
+				cells := screen.Primary
+				if screen.ActiveBuffer == attachwire.BufferAlt && screen.AltPresent {
+					cells = screen.Alt
+				}
+				for _, cell := range cells {
+					snapshot.Write(cell.RuneBytes)
+				}
+				if strings.Contains(snapshot.String(), want) {
+					return true
+				}
+			}
+		case <-deadline:
+			return strings.Contains(output.String(), want)
+		}
+	}
+}
+
 // waitForSnapshot drains the viewer's frames until a Snapshot frame with a
 // decodable envelope (atSeq > 0) is seen — the late-join convergence signal.
 func waitForSnapshot(v *attachtest.Viewer, timeout time.Duration) bool {
@@ -223,6 +361,135 @@ func TestInteractive_CapabilityFailure(t *testing.T) {
 	}
 	if !strings.Contains(out.Error, "PTY transport") {
 		t.Fatalf("error should name the missing PTY transport: %q", out.Error)
+	}
+}
+
+// TestInteractive_InitialPromptContract locks the leaf-consumer semantics:
+// absent/explicit-empty inputs are no-ops, non-empty data is written verbatim
+// plus one newline, and headless/interview modes never receive it even when a
+// direct caller reaches dispatchInteractive.
+func TestInteractive_InitialPromptContract(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	tests := []struct {
+		name          string
+		mode          string
+		initialPrompt string
+		wantInput     string
+		wantDelivered bool
+	}{
+		{name: "absent", mode: interactiveRunMode},
+		{name: "explicit empty", mode: interactiveRunMode, initialPrompt: ""},
+		{name: "whitespace preserved", mode: interactiveRunMode, initialPrompt: "  ", wantInput: "  \n", wantDelivered: true},
+		{name: "unicode multiline", mode: interactiveRunMode, initialPrompt: "こんにちは 🌱\nsecond line", wantInput: "こんにちは 🌱\nsecond line\n", wantDelivered: true},
+		{name: "headless excluded", mode: "", initialPrompt: "headless seed must not run"},
+		{name: "interview excluded", mode: "interview", initialPrompt: "interview seed must not run"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session := completedRecordingInteractiveSession()
+			handle := &testInteractiveHandle{
+				Handle:  &fakeHandle{events: make(chan agent.Event)},
+				session: session,
+			}
+			sink := &recordingSink{}
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+				SessionID:     "seed-contract",
+				Mode:          tt.mode,
+				InitialPrompt: tt.initialPrompt,
+			}}
+			res := &Result{SessionID: qw.SessionID}
+
+			out, err := minimalRunner(t).dispatchInteractive(
+				context.Background(), handle, t.TempDir(), qw, res, sink, nil,
+			)
+			if err != nil {
+				t.Fatalf("dispatchInteractive: %v", err)
+			}
+			if out.Status != "completed" {
+				t.Fatalf("status=%q error=%q; want completed", out.Status, out.Error)
+			}
+			if got := string(session.inputBytes()); got != tt.wantInput {
+				t.Errorf("PTY input = %q, want %q", got, tt.wantInput)
+			}
+			wantWrites := 0
+			if tt.wantDelivered {
+				wantWrites = 1
+			}
+			if got := session.writeCount(); got != wantWrites {
+				t.Errorf("WriteInput calls = %d, want %d", got, wantWrites)
+			}
+
+			var subtypes []string
+			for _, ev := range sink.events {
+				system, ok := ev.(agent.SystemEvent)
+				if !ok {
+					continue
+				}
+				subtypes = append(subtypes, system.Subtype)
+				if tt.initialPrompt != "" && strings.Contains(system.Message, tt.initialPrompt) {
+					t.Errorf("activity message leaked initialPrompt content: %q", system.Message)
+				}
+			}
+			wantSubtypes := "interactive-session-started,interactive-session-ended"
+			if tt.wantDelivered {
+				wantSubtypes = "interactive-session-started,interactive-initial-prompt-delivered,interactive-session-ended"
+			}
+			if got := strings.Join(subtypes, ","); got != wantSubtypes {
+				t.Errorf("activity subtypes = %q, want %q", got, wantSubtypes)
+			}
+		})
+	}
+}
+
+// TestWriteInitialPromptInput_RetriesShortWrites makes the exact-byte contract
+// sensitive to a mutation that assumes one WriteInput call always consumes the
+// full Unicode payload.
+func TestWriteInitialPromptInput_RetriesShortWrites(t *testing.T) {
+	session := completedRecordingInteractiveSession()
+	session.maxWrite = 3
+	const seed = "雪だるま\nline two"
+	if err := writeInitialPromptInput(session, seed); err != nil {
+		t.Fatalf("writeInitialPromptInput: %v", err)
+	}
+	if got, want := string(session.inputBytes()), seed+"\n"; got != want {
+		t.Fatalf("PTY input = %q, want %q", got, want)
+	}
+	if session.writeCount() < 2 {
+		t.Fatalf("short-write fixture recorded %d call(s), want multiple", session.writeCount())
+	}
+}
+
+func TestInteractive_InitialPromptWriteFailure(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	session := completedRecordingInteractiveSession()
+	session.writeErr = fmt.Errorf("PTY closed")
+	handle := &testInteractiveHandle{
+		Handle:  &fakeHandle{events: make(chan agent.Event)},
+		session: session,
+	}
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		SessionID:     "seed-failure",
+		Mode:          interactiveRunMode,
+		InitialPrompt: "must be delivered",
+	}}
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, sink, nil,
+	)
+	if err == nil {
+		t.Fatal("expected initial-prompt write failure")
+	}
+	if out.Status != "failed" || out.FailureMode != FailureSpawn {
+		t.Fatalf("status=%q mode=%q; want failed/%s", out.Status, out.FailureMode, FailureSpawn)
+	}
+	for _, ev := range sink.events {
+		if system, ok := ev.(agent.SystemEvent); ok && system.Subtype == "interactive-initial-prompt-delivered" {
+			t.Fatal("delivery activity emitted after failed PTY write")
+		}
 	}
 }
 
@@ -313,8 +580,9 @@ func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
 	requireSh(t)
 
 	const (
-		sessionID = "sess-token-file-reconnect"
-		roomPath  = "/v1/rooms/room-1"
+		sessionID     = "sess-token-file-reconnect"
+		roomPath      = "/v1/rooms/room-1"
+		initialPrompt = "reconnect seed 🌱"
 	)
 	initialExp := time.Now().Add(300 * time.Millisecond)
 	initialToken := fakeInteractiveJWT(map[string]any{
@@ -387,7 +655,9 @@ func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ptyhost.Spawn: %v", err)
 	}
-	h := newInteractivePTYHandle(sess)
+	baseHandle := newInteractivePTYHandle(sess)
+	recordedSession := &recordingInteractiveSession{InteractiveSession: sess}
+	h := &testInteractiveHandle{Handle: baseHandle, session: recordedSession}
 	t.Cleanup(func() { _ = h.Stop(context.Background()) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -402,6 +672,8 @@ func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
 		res.ProviderName = agent.ProviderShell
 		qw := QueuedWork{}
 		qw.SessionID = sessionID
+		qw.Mode = interactiveRunMode
+		qw.InitialPrompt = initialPrompt
 		out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil)
 		resultCh <- dispatchResult{res: out, err: err}
 	}()
@@ -439,6 +711,12 @@ func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("relay reconnect did not re-read ATTACH_TOKEN_FILE")
 	}
+	if got, want := string(recordedSession.inputBytes()), initialPrompt+"\n"; got != want {
+		t.Fatalf("initial prompt after reconnect = %q, want %q", got, want)
+	}
+	if got := recordedSession.writeCount(); got != 1 {
+		t.Fatalf("initial prompt WriteInput calls after reconnect = %d, want 1", got)
+	}
 
 	if err := os.WriteFile(donePath, []byte("done"), 0o600); err != nil {
 		t.Fatal(err)
@@ -471,7 +749,10 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 		t.Skip("git not on PATH")
 	}
 
-	const sessionID = "sess-interactive-e2e"
+	const (
+		sessionID     = "sess-interactive-e2e"
+		initialPrompt = "seed-first-雪"
+	)
 
 	relay := attachtest.New(attachtest.Config{RoomID: "room-1"})
 	if err := relay.Start(); err != nil {
@@ -537,6 +818,7 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 			WorkType:        "development",
 			Body:            "interactive session",
 			Mode:            interactiveRunMode,
+			InitialPrompt:   initialPrompt,
 			Repository:      bareRepo,
 		},
 		WorkerID:        "w1",
@@ -565,6 +847,12 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 		t.Fatalf("attach driver: %v", err)
 	}
 	t.Cleanup(func() { _ = driver.Close() })
+
+	// The seed was written before the relay host leg started, so it is the
+	// shell's first input and reaches a later viewer through the PTY ring replay.
+	if !waitForTerminalText(driver, "got:"+initialPrompt, 30*time.Second) {
+		t.Fatal("driver never observed the initial prompt as the PTY's first input")
+	}
 
 	// Resend-until-echo: §5's delivery contract is client resend from
 	// ack+1 (input_ack); the stub relay implements no input_ack and its

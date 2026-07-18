@@ -154,6 +154,32 @@ func (r *Runner) dispatchInteractive(
 	r.postInteractiveActivity(interactiveCtx, worktreePath, sink, "interactive-session-started",
 		"interactive PTY session started")
 
+	// Deliver the optional seed as the PTY's first runner-owned input. The
+	// gate stays explicit even though dispatchInteractive is reached only from
+	// the interactive branch: direct callers and future refactors must not leak
+	// this field into headless or interview sessions. Do not trim or otherwise
+	// normalize the payload — the upstream dispatch owns normalization, while
+	// this hop preserves Unicode, multiline content, and whitespace verbatim
+	// before appending the contract-required newline.
+	//
+	// This happens before relay attach starts, so local-only sessions receive
+	// the same seed and carrier reconnects can never replay it.
+	if qw.isInteractive() && qw.InitialPrompt != "" {
+		if err := writeInitialPromptInput(isess, qw.InitialPrompt); err != nil {
+			wrapped := fmt.Errorf("interactive initial prompt delivery: %w", err)
+			res.Status = "failed"
+			res.FailureMode = FailureSpawn
+			res.Error = wrapped.Error()
+			r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
+				"interactive session failed during initial prompt delivery")
+			r.logger.Error("[interactive] initial prompt delivery failed",
+				"sessionId", qw.SessionID, "err", err)
+			return res, wrapped
+		}
+		r.postInteractiveActivity(interactiveCtx, worktreePath, sink, "interactive-initial-prompt-delivered",
+			"interactive initial prompt delivered")
+	}
+
 	// Start the outbound relay attach when configured. RunHost dials OUT only
 	// (no inbound listener) and blocks until the session ends or a terminal
 	// relay condition; run it in a goroutine and treat any terminal return as
@@ -322,6 +348,30 @@ func (r *Runner) postInteractiveActivity(ctx context.Context, worktreePath strin
 	if body, err := agent.MarshalEvent(ev); err == nil {
 		r.appendJSONLLine(filepath.Join(worktreePath, state.AgentDirName, "events.jsonl"), body)
 	}
+}
+
+// writeInitialPromptInput writes prompt plus exactly one newline to the live
+// PTY, retrying short writes until the whole logical input is accepted. A
+// zero-byte write would otherwise spin forever, so it fails the interactive
+// startup explicitly. The caller owns the mode/non-empty gate.
+func writeInitialPromptInput(isess agent.InteractiveSession, initialPrompt string) error {
+	remaining := append([]byte(initialPrompt), '\n')
+	for len(remaining) > 0 {
+		n, err := isess.WriteInput(remaining)
+		if n < 0 || n > len(remaining) {
+			return fmt.Errorf("PTY input returned invalid write count %d for %d bytes", n, len(remaining))
+		}
+		if n > 0 {
+			remaining = remaining[n:]
+		}
+		if err != nil {
+			return fmt.Errorf("write PTY input: %w", err)
+		}
+		if n == 0 {
+			return errors.New("write PTY input: zero-byte write")
+		}
+	}
+	return nil
 }
 
 // attachTokenSource builds the host leg's attachclient.TokenSource. RunHost
