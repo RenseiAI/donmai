@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -22,9 +24,19 @@ import (
 // hostname. The composing daemon injects BOTH to drive the outbound relay
 // attach, or NEITHER for a valid OSS-standalone local-only session; exactly
 // one is a deployment misconfiguration the runner fails loud on.
+//
+// ATTACH_TOKEN_FILE is the optional token-refresh rail: a provisioner that
+// maintains a fresh short-exp attach token (re-minted before each expiry) may
+// point this at a file it atomically rewrites; the runner then re-reads it
+// before each carrier attempt and on degraded-lane refreshes, so a reconnect
+// AFTER the initial token's exp still presents a live token. It is meaningful
+// only alongside the attach pair — ATTACH_TOKEN remains the initial value and
+// the fallback — and a stray ATTACH_TOKEN_FILE with no attach pair is ignored.
 const (
 	envAttachURL   = "ATTACH_URL"
 	envAttachToken = "ATTACH_TOKEN"
+	// #nosec G101 -- an env var NAME (the runner reads a path from it), not a credential.
+	envAttachTokenFile = "ATTACH_TOKEN_FILE"
 )
 
 // interactiveSessionClass returns the sessionClass discriminator the runner
@@ -155,12 +167,17 @@ func (r *Runner) dispatchInteractive(
 		attachDone = make(chan error, 1)
 		hostCfg := attachclient.HostConfig{
 			AttachURL: attachURL,
-			// Static token for v1: the daemon-injected ATTACH_TOKEN is
-			// re-presented on every dial attempt and its exp bounds the
-			// session. The post-exp re-mint rail (a TokenSource that mints a
-			// fresh short-exp token per attempt) is W3's control-plane work.
-			TokenSource: func(context.Context) (string, error) { return attachToken, nil },
-			Session:     sessAdapter{isess},
+			// Token re-mint rail: the provisioner may maintain a fresh
+			// short-exp token at ATTACH_TOKEN_FILE (atomically rewritten
+			// before each expiry); the source re-reads it before carrier
+			// attempts and degraded-lane refreshes so a reconnect after the
+			// initial token's exp presents a live token.
+			// The static ATTACH_TOKEN is the initial value and the fallback —
+			// without the file (or on any file failure) its exp bounds
+			// reconnectability exactly as before.
+			TokenSource: attachTokenSource(attachToken,
+				strings.TrimSpace(os.Getenv(envAttachTokenFile)), r.logger),
+			Session: sessAdapter{isess},
 			// Kill hook = handle.Stop so a relay kill drives the normal
 			// drain→Exit flow (SIGTERM→grace→SIGKILL). Idempotent.
 			Kill: func(kctx context.Context, _, _ string) error {
@@ -304,6 +321,70 @@ func (r *Runner) postInteractiveActivity(ctx context.Context, worktreePath strin
 	}
 	if body, err := agent.MarshalEvent(ev); err == nil {
 		r.appendJSONLLine(filepath.Join(worktreePath, state.AgentDirName, "events.jsonl"), body)
+	}
+}
+
+// attachTokenSource builds the host leg's attachclient.TokenSource. RunHost
+// resolves it before each top-level carrier attempt; degraded-lane 401 recovery
+// and the WSS upgrade probe may additionally call it concurrently. That is the
+// seam the token-refresh rail rides:
+//
+//   - tokenFilePath == "": today's behavior, unchanged — the static token is
+//     re-presented on every attempt and its exp bounds the session's
+//     reconnectability.
+//   - tokenFilePath != "": the file is re-read on every resolution (the
+//     provisioner rewrites it atomically with a fresh short-exp token), so a
+//     reconnect after the static token's exp still presents a live token. A read
+//     failure or an empty file falls back to the static token — degraded to
+//     exactly today's behavior, never worse — with one WARN per distinct
+//     failure condition (not per attempt: attempts are backoff-paced and a
+//     persistent condition would otherwise spam).
+//
+// The source never returns an error for a fallback-able condition: a
+// TokenSource error just burns a backoff cycle inside RunHost, while the
+// static token still has a chance of admission.
+func attachTokenSource(staticToken, tokenFilePath string, logger *slog.Logger) attachclient.TokenSource {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	if tokenFilePath == "" {
+		return func(context.Context) (string, error) { return staticToken, nil }
+	}
+	// TokenSource is a concurrent-use contract: the degraded carrier may re-mint
+	// from POST-up, SSE, and upgrade-probe paths at the same time. Protect the
+	// warning-state transition while leaving the file reads concurrent.
+	var warnMu sync.Mutex
+	lastWarn := ""
+	warningChanged := func(warn string) bool {
+		warnMu.Lock()
+		defer warnMu.Unlock()
+		if warn == lastWarn {
+			return false
+		}
+		lastWarn = warn
+		return true
+	}
+	return func(context.Context) (string, error) {
+		// #nosec G304 G703 -- tokenFilePath is the provisioner-injected ATTACH_TOKEN_FILE
+		// contract: the same trusted process that already injects ATTACH_TOKEN itself.
+		raw, err := os.ReadFile(tokenFilePath)
+		if err != nil {
+			if warningChanged("read: " + err.Error()) {
+				logger.Warn("[interactive] attach token file unreadable — falling back to static token",
+					"path", tokenFilePath, "err", err)
+			}
+			return staticToken, nil
+		}
+		tok := strings.TrimSpace(string(raw))
+		if tok == "" {
+			if warningChanged("empty") {
+				logger.Warn("[interactive] attach token file empty — falling back to static token",
+					"path", tokenFilePath)
+			}
+			return staticToken, nil
+		}
+		warningChanged("")
+		return tok, nil
 	}
 }
 

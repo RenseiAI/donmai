@@ -7,6 +7,7 @@ import (
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,7 +67,9 @@ func (t *tokenHolder) current() string {
 	return t.cur
 }
 
-// remint re-resolves the token (401 handling). Returns the new token.
+var errRejectedTokenUnchanged = errors.New("attachclient: token source returned the rejected bearer unchanged")
+
+// remint re-resolves the token for proactive refresh (the upgrade probe).
 func (t *tokenHolder) remint(ctx context.Context) (string, error) {
 	tok, err := t.src(ctx)
 	if err != nil {
@@ -76,6 +79,28 @@ func (t *tokenHolder) remint(ctx context.Context) (string, error) {
 	t.cur = tok
 	t.mu.Unlock()
 	return tok, nil
+}
+
+// remintAfterUnauthorized re-resolves after the relay rejects a bearer. It
+// refuses to retry the same bearer immediately: returning a transient error
+// hands control to RunHost's cancel-aware reconnect backoff instead of spinning
+// on 401. If another concurrent lane already installed a different token, keep
+// that newer value rather than regressing the holder to rejected.
+func (t *tokenHolder) remintAfterUnauthorized(ctx context.Context, rejected string) error {
+	tok, err := t.src(ctx)
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if tok == rejected {
+		if t.cur != rejected {
+			return nil
+		}
+		return errRejectedTokenUnchanged
+	}
+	t.cur = tok
+	return nil
 }
 
 // dedupKey identifies a keystroke on the degraded SSE-down lane using only
@@ -356,12 +381,14 @@ func (h *host) degradedWindow(legCtx context.Context, postURL string, tokH *toke
 // § 14). 401 → re-mint and retry; 409 → epoch-stale (terminal).
 func (h *host) openHostSSE(ctx context.Context, sseURL string, tokH *tokenHolder, cl hostClaims) (*http.Response, error) {
 	u := sseURL + "?epoch=" + strconv.FormatInt(cl.Epoch, 10)
+	authRetried := false
 	for {
+		rejected := tokH.current()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+tokH.current())
+		req.Header.Set("Authorization", "Bearer "+rejected)
 		req.Header.Set("Accept", "text/event-stream")
 		resp, err := h.httpClient().Do(req)
 		if err != nil {
@@ -372,7 +399,11 @@ func (h *host) openHostSSE(ctx context.Context, sseURL string, tokH *tokenHolder
 			return resp, nil
 		case http.StatusUnauthorized:
 			_ = resp.Body.Close()
-			if _, err := tokH.remint(ctx); err != nil {
+			if authRetried {
+				return nil, errors.New("attachclient: host SSE GET remained unauthorized after token refresh")
+			}
+			authRetried = true
+			if err := tokH.remintAfterUnauthorized(ctx, rejected); err != nil {
 				return nil, fmt.Errorf("attachclient: re-minting after 401 on host SSE GET: %w", err)
 			}
 		case http.StatusConflict:
@@ -495,13 +526,15 @@ func (h *host) postHostBatch(ctx context.Context, url string, tokH *tokenHolder,
 		return 0, postFatal, fmt.Errorf("attachclient: marshaling host batch: %w", err)
 	}
 	attempts := 0
+	authRetried := false
 	for {
 		attempts++
+		rejected := tokH.current()
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if rerr != nil {
 			return 0, postFatal, rerr
 		}
-		req.Header.Set("Authorization", "Bearer "+tokH.current())
+		req.Header.Set("Authorization", "Bearer "+rejected)
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, derr := h.httpClient().Do(req)
@@ -529,10 +562,14 @@ func (h *host) postHostBatch(ctx context.Context, url string, tokH *tokenHolder,
 			return rej.AckSeq, postRewind, nil
 		case http.StatusUnauthorized:
 			_ = resp.Body.Close()
-			if _, err := tokH.remint(ctx); err != nil {
+			if authRetried {
+				return 0, postFatal, fmt.Errorf("attachclient: host POST %q remained unauthorized after token refresh", batch.BatchID)
+			}
+			authRetried = true
+			if err := tokH.remintAfterUnauthorized(ctx, rejected); err != nil {
 				return 0, postFatal, fmt.Errorf("attachclient: re-minting after 401 on host POST: %w", err)
 			}
-			// retry same batchId
+			// retry same batchId once with the refreshed bearer
 		case http.StatusTooManyRequests:
 			ra := parseRetryAfter(resp.Header.Get("Retry-After"))
 			_ = resp.Body.Close()
