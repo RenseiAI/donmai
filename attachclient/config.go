@@ -10,8 +10,8 @@ import (
 
 // Defaults for the optional HostConfig knobs.
 const (
-	defaultBackoffMin        = 250 * time.Millisecond
-	defaultBackoffMax        = 30 * time.Second
+	defaultBackoffFloor      = 250 * time.Millisecond
+	defaultBackoffCeiling    = 30 * time.Second
 	defaultFallbackAfterN    = 3
 	defaultFinalScreenWindow = 60 * time.Second
 	defaultUpgradeProbeEvery = 30 * time.Second
@@ -101,10 +101,10 @@ func (c *HostConfig) withDefaults() error {
 		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	if c.BackoffMin <= 0 {
-		c.BackoffMin = defaultBackoffMin
+		c.BackoffMin = defaultBackoffFloor
 	}
 	if c.BackoffMax < c.BackoffMin {
-		c.BackoffMax = defaultBackoffMax
+		c.BackoffMax = defaultBackoffCeiling
 		if c.BackoffMax < c.BackoffMin {
 			c.BackoffMax = c.BackoffMin
 		}
