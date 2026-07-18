@@ -12,6 +12,13 @@
 // the ADR's outbound-only mandate. Viewers are W5/W7/W11; this package is the
 // host side only.
 //
+// TokenSource is called once per dial attempt (§ 15) — that per-attempt
+// re-resolution is the token-refresh seam: a composing binary whose relay
+// provisioner maintains a fresh short-exp token (e.g. rewritten to a file the
+// source re-reads, see the runner's ATTACH_TOKEN_FILE contract) keeps the host
+// leg reconnectable past the initial token's exp; a static closure bounds
+// reconnectability at that exp.
+//
 // # Two carriers, one interface
 //
 // RunHost speaks the WSS lane (§ 1) and, when WSS is unavailable, transparently

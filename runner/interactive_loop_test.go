@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -465,5 +466,95 @@ quitLoop:
 	}
 	if sc != "interactive" {
 		t.Fatalf("lock-refresh sessionClass=%q; want interactive", sc)
+	}
+}
+
+// ─── attachTokenSource — per-attempt token re-resolution (refresh rail) ────
+
+func TestAttachTokenSource_NoFileReturnsStatic(t *testing.T) {
+	src := attachTokenSource("static-tok", "", nil)
+	for i := 0; i < 3; i++ {
+		tok, err := src(context.Background())
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", i, err)
+		}
+		if tok != "static-tok" {
+			t.Fatalf("call %d: tok=%q; want static-tok", i, tok)
+		}
+	}
+}
+
+func TestAttachTokenSource_FileVariants(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string // written to the token file before the call
+		noFile  bool   // point at a path that does not exist
+		want    string
+	}{
+		{name: "fresh token", content: "fresh-tok", want: "fresh-tok"},
+		{name: "trailing newline trimmed", content: "fresh-tok\n", want: "fresh-tok"},
+		{name: "surrounding whitespace trimmed", content: "  fresh-tok \n\n", want: "fresh-tok"},
+		{name: "empty file falls back to static", content: "", want: "static-tok"},
+		{name: "whitespace-only file falls back to static", content: " \n\t\n", want: "static-tok"},
+		{name: "missing file falls back to static", noFile: true, want: "static-tok"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "token")
+			if !tc.noFile {
+				if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			src := attachTokenSource("static-tok", path, nil)
+			tok, err := src(context.Background())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tok != tc.want {
+				t.Fatalf("tok=%q; want %q", tok, tc.want)
+			}
+		})
+	}
+}
+
+// The load-bearing behavior of the refresh rail: the file is re-read on EVERY
+// attempt, so a provisioner rewriting it between dials swaps the presented
+// token — and a file that degrades (removed) falls back to the static token
+// without erroring.
+func TestAttachTokenSource_PerAttemptReRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("tok-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := attachTokenSource("static-tok", path, nil)
+
+	if tok, _ := src(context.Background()); tok != "tok-1" {
+		t.Fatalf("first read tok=%q; want tok-1", tok)
+	}
+
+	// Provisioner refresh: atomic replace (tmp + rename), as documented.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte("tok-2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	if tok, _ := src(context.Background()); tok != "tok-2" {
+		t.Fatalf("post-rewrite tok=%q; want tok-2", tok)
+	}
+
+	// File vanishes → degrade to the static token, no error (an error would
+	// only burn a backoff cycle; the static token may still admit).
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := src(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error after remove: %v", err)
+	}
+	if tok != "static-tok" {
+		t.Fatalf("post-remove tok=%q; want static-tok", tok)
 	}
 }
