@@ -36,7 +36,7 @@ permissions:
 
 jobs:
   build-template:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Guard - require E2B_API_KEY secret
         env:
