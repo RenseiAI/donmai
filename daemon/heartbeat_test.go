@@ -509,12 +509,10 @@ func TestHeartbeatService_LoadOmittedWhenSamplerMisses(t *testing.T) {
 	}
 }
 
-// TestHeartbeatService_ActiveInteractiveCountRoundTrips confirms the
-// interactive-occupancy split is wired end-to-end: when
-// GetActiveInteractiveCount is set, the outbound body carries an
-// `activeInteractiveCount` key with the reported value, alongside the
-// unclassed `activeCount`.
-func TestHeartbeatService_ActiveInteractiveCountRoundTrips(t *testing.T) {
+// TestHeartbeatService_ActiveSessionCountsRoundTrips confirms the coherent
+// occupancy snapshot is wired end-to-end as distinct activeCount and
+// activeInteractiveCount values.
+func TestHeartbeatService_ActiveSessionCountsRoundTrips(t *testing.T) {
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
 	var (
@@ -531,15 +529,15 @@ func TestHeartbeatService_ActiveInteractiveCountRoundTrips(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hs := NewHeartbeatService(HeartbeatOptions{
-		WorkerID:                  "wkr_interactive",
-		Hostname:                  "h",
-		OrchestratorURL:           srv.URL,
-		RuntimeJWT:                "runtime.jwt.value",
-		IntervalSeconds:           60,
-		GetActiveCount:            func() int { return 3 },
-		GetActiveInteractiveCount: func() int { return 2 },
-		GetMaxCount:               func() int { return 4 },
-		GetStatus:                 func() RegistrationStatus { return RegistrationIdle },
+		WorkerID:               "wkr_interactive",
+		Hostname:               "h",
+		OrchestratorURL:        srv.URL,
+		RuntimeJWT:             "runtime.jwt.value",
+		IntervalSeconds:        60,
+		GetActiveSessionCounts: func() (int, int) { return 3, 2 },
+		GetActiveCount:         func() int { return 99 },
+		GetMaxCount:            func() int { return 4 },
+		GetStatus:              func() RegistrationStatus { return RegistrationIdle },
 	})
 	hs.sendOne(context.Background())
 
@@ -559,9 +557,8 @@ func TestHeartbeatService_ActiveInteractiveCountRoundTrips(t *testing.T) {
 
 // TestHeartbeatService_ActiveInteractiveCountOmittedWhenUnclassified confirms
 // the `activeInteractiveCount` key is omitted entirely (pointer + omitempty)
-// when GetActiveInteractiveCount is nil — a nil callback must not send a
-// misleading 0. Asserts key ABSENCE, not `== 0`, so a genuine zero-interactive
-// beat (which DOES send the key) stays distinguishable.
+// when GetActiveSessionCounts is nil. It asserts key ABSENCE, not `== 0`, so a
+// genuine classified zero remains distinguishable.
 func TestHeartbeatService_ActiveInteractiveCountOmittedWhenUnclassified(t *testing.T) {
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
@@ -587,7 +584,7 @@ func TestHeartbeatService_ActiveInteractiveCountOmittedWhenUnclassified(t *testi
 		GetActiveCount:  func() int { return 1 },
 		GetMaxCount:     func() int { return 4 },
 		GetStatus:       func() RegistrationStatus { return RegistrationIdle },
-		// GetActiveInteractiveCount deliberately nil.
+		// GetActiveSessionCounts deliberately nil.
 	})
 	hs.sendOne(context.Background())
 
@@ -596,4 +593,160 @@ func TestHeartbeatService_ActiveInteractiveCountOmittedWhenUnclassified(t *testi
 	if _, present := raw["activeInteractiveCount"]; present {
 		t.Errorf("expected activeInteractiveCount key absent, got %v", raw["activeInteractiveCount"])
 	}
+}
+
+func TestHeartbeatService_ActiveSessionCountsTakePrecedence(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	var (
+		mu  sync.Mutex
+		raw map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		buf, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(buf, &raw)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+	}))
+	t.Cleanup(srv.Close)
+
+	var atomicCalls, legacyActiveCalls int32
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID:        "wkr_atomic_occupancy",
+		Hostname:        "h",
+		OrchestratorURL: srv.URL,
+		RuntimeJWT:      "runtime.jwt.value",
+		IntervalSeconds: 60,
+		GetActiveSessionCounts: func() (int, int) {
+			atomic.AddInt32(&atomicCalls, 1)
+			return 3, 0
+		},
+		GetActiveCount: func() int {
+			atomic.AddInt32(&legacyActiveCalls, 1)
+			return 99
+		},
+		GetMaxCount: func() int { return 4 },
+		GetStatus:   func() RegistrationStatus { return RegistrationIdle },
+	})
+	hs.sendOne(context.Background())
+
+	if got := atomic.LoadInt32(&atomicCalls); got != 1 {
+		t.Fatalf("GetActiveSessionCounts calls = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&legacyActiveCalls); got != 0 {
+		t.Fatalf("GetActiveCount calls = %d, want 0 when coherent callback is configured", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := raw["activeCount"]; got != float64(3) {
+		t.Errorf("body.activeCount = %v, want 3", got)
+	}
+	got, present := raw["activeInteractiveCount"]
+	if !present {
+		t.Fatal("body.activeInteractiveCount missing for classified zero occupancy")
+	}
+	if got != float64(0) {
+		t.Errorf("body.activeInteractiveCount = %v, want 0", got)
+	}
+}
+
+func TestHeartbeatService_ActiveSessionCountsCoherentUnderConcurrentLifecycle(t *testing.T) {
+	spawner := NewWorkerSpawner(SpawnerOptions{})
+	started := make(chan struct{})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		close(started)
+		present := false
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			spawner.mu.Lock()
+			if present {
+				delete(spawner.sessions, "interactive")
+			} else {
+				spawner.sessions["interactive"] = &spawnedSession{
+					spec: SessionSpec{SessionID: "interactive", Mode: "interview"},
+				}
+			}
+			present = !present
+			spawner.mu.Unlock()
+		}
+	}()
+	<-started
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID:               "wkr_concurrent_occupancy",
+		Hostname:               "h",
+		RuntimeJWT:             "stub.runtime.jwt",
+		GetActiveSessionCounts: spawner.ActiveSessionCounts,
+		// This fallback deliberately disagrees with the live spawner. If sendOne
+		// stops using the coherent callback, classification disappears and the
+		// assertions below fail.
+		GetActiveCount: func() int { return 99 },
+		GetMaxCount:    func() int { return 4 },
+		GetStatus:      func() RegistrationStatus { return RegistrationIdle },
+	})
+
+	for range 10_000 {
+		hs.sendOne(context.Background())
+		payload := hs.LastPayload()
+		if payload.ActiveInteractiveSessions == nil {
+			t.Fatal("classified occupancy omitted activeInteractiveSessions")
+		}
+		// This synthetic lifecycle has either no sessions or one exact
+		// interview session, so only coherent snapshots (0,0) and (1,1) exist.
+		if payload.ActiveSessions != *payload.ActiveInteractiveSessions {
+			t.Fatalf("torn heartbeat occupancy: active=%d interactive=%d",
+				payload.ActiveSessions, *payload.ActiveInteractiveSessions)
+		}
+	}
+}
+
+func TestHeartbeatPayload_ActiveInteractiveSessionsJSONCompatibility(t *testing.T) {
+	t.Run("unclassified omits introspection field", func(t *testing.T) {
+		buf, err := json.Marshal(HeartbeatPayload{ActiveSessions: 2})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(buf, &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, present := raw["activeInteractiveSessions"]; present {
+			t.Fatalf("activeInteractiveSessions unexpectedly present: %s", buf)
+		}
+	})
+
+	t.Run("classified zero remains present", func(t *testing.T) {
+		zero := 0
+		buf, err := json.Marshal(HeartbeatPayload{
+			ActiveSessions:            2,
+			ActiveInteractiveSessions: &zero,
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(buf, &raw); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		got, present := raw["activeInteractiveSessions"]
+		if !present {
+			t.Fatalf("activeInteractiveSessions missing: %s", buf)
+		}
+		if got != float64(0) {
+			t.Fatalf("activeInteractiveSessions = %v, want 0", got)
+		}
+	})
 }

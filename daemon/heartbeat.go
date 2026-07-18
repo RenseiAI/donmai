@@ -28,19 +28,18 @@ type HeartbeatOptions struct {
 	GetStatus       func() RegistrationStatus
 	Region          string
 
-	// GetActiveInteractiveCount returns the number of in-flight sessions
-	// whose run-mode is interactive ("interview"), a subset of GetActiveCount.
-	// It lets the platform tell PTY-attach interactive sessions apart from
-	// headless runs.
+	// GetActiveSessionCounts returns one coherent occupancy snapshot. active is
+	// the unclassed count across every run mode; activeInteractive is the exact
+	// "interview" subset. Both values are sampled together so concurrent session
+	// lifecycle changes cannot split them across different instants. A configured
+	// callback classifies interactive occupancy, so the outbound body includes
+	// `activeInteractiveCount` even when its value is zero.
 	//
-	// Optional and nil-safe: nil means "this embedder does not classify
-	// interactive occupancy", and the outbound body omits the
-	// `activeInteractiveCount` key entirely. This is deliberately distinct
-	// from reporting 0 — a nil callback must NOT be reported as zero
-	// interactive load, which would falsely claim the host is running no
-	// interactive sessions. Matches the GetLoad/GetAllowlist optional-callback
-	// convention.
-	GetActiveInteractiveCount func() int
+	// Optional and nil-safe: nil preserves the legacy GetActiveCount-only path
+	// and omits `activeInteractiveCount` entirely. Reporting the interactive split
+	// requires this paired callback; there is deliberately no separately sampled
+	// callback because that could serialize a torn occupancy pair.
+	GetActiveSessionCounts func() (active, activeInteractive int)
 
 	// GetLoad returns the current CPU and memory utilisation percentages
 	// (0–100) for this beat. ok=false means "no sample this beat" and the
@@ -148,7 +147,8 @@ type HeartbeatService struct {
 }
 
 // NewHeartbeatService constructs a HeartbeatService from opts. Required
-// callbacks are GetActiveCount, GetMaxCount, and GetStatus.
+// callbacks are GetMaxCount, GetStatus, and either GetActiveSessionCounts or
+// GetActiveCount.
 func NewHeartbeatService(opts HeartbeatOptions) *HeartbeatService {
 	if opts.IntervalSeconds <= 0 {
 		opts.IntervalSeconds = int(HeartbeatDefaultInterval / time.Second)
@@ -242,23 +242,28 @@ func (h *HeartbeatService) loop(ctx context.Context) {
 }
 
 func (h *HeartbeatService) sendOne(ctx context.Context) {
-	payload := HeartbeatPayload{
-		WorkerID:       h.workerIDLocked(),
-		Hostname:       h.opts.Hostname,
-		Status:         h.opts.GetStatus(),
-		ActiveSessions: h.opts.GetActiveCount(),
-		MaxSessions:    h.opts.GetMaxCount(),
-		Region:         h.opts.Region,
-		SentAt:         h.opts.Now().UTC().Format(time.RFC3339),
+	var (
+		activeCount       int
+		activeInteractive *int
+	)
+	switch {
+	case h.opts.GetActiveSessionCounts != nil:
+		active, interactive := h.opts.GetActiveSessionCounts()
+		activeCount = active
+		activeInteractive = &interactive
+	default:
+		activeCount = h.opts.GetActiveCount()
 	}
 
-	// Interactive-occupancy split: when the embedder classifies interactive
-	// ("interview") sessions, attach the count as a *int so "not reported"
-	// (nil) stays distinguishable from a genuine zero on the wire. A nil
-	// callback leaves payload.ActiveInteractiveSessions nil → key omitted.
-	if h.opts.GetActiveInteractiveCount != nil {
-		n := h.opts.GetActiveInteractiveCount()
-		payload.ActiveInteractiveSessions = &n
+	payload := HeartbeatPayload{
+		WorkerID:                  h.workerIDLocked(),
+		Hostname:                  h.opts.Hostname,
+		Status:                    h.opts.GetStatus(),
+		ActiveSessions:            activeCount,
+		ActiveInteractiveSessions: activeInteractive,
+		MaxSessions:               h.opts.GetMaxCount(),
+		Region:                    h.opts.Region,
+		SentAt:                    h.opts.Now().UTC().Format(time.RFC3339),
 	}
 
 	// Phase 1d: attach allowlist hash every beat, full list only on change.

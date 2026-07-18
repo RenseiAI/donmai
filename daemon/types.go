@@ -231,10 +231,11 @@ type HeartbeatPayload struct {
 	Hostname       string             `json:"hostname"`
 	Status         RegistrationStatus `json:"status"`
 	ActiveSessions int                `json:"activeSessions"`
-	// ActiveInteractiveSessions is the interactive ("interview" run-mode)
-	// subset of ActiveSessions. A *int so nil ("not classified by this
-	// embedder") stays distinct from a genuine 0. The corresponding wire key
-	// on heartbeatRequestBody is `activeInteractiveCount` (heartbeat.go).
+	// ActiveInteractiveSessions is the exact "interview" run-mode subset of
+	// the unclassed ActiveSessions count from the same occupancy snapshot. A
+	// *int keeps nil ("not classified by this embedder") distinct from a
+	// genuine 0. The corresponding request-body key is
+	// `activeInteractiveCount` (heartbeat.go).
 	ActiveInteractiveSessions *int   `json:"activeInteractiveSessions,omitempty"`
 	MaxSessions               int    `json:"maxSessions"`
 	Region                    string `json:"region,omitempty"`

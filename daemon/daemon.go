@@ -666,14 +666,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 			OrchestratorURL: cfg.Orchestrator.URL,
 			RuntimeJWT:      regResp.RuntimeToken,
 			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
-			GetActiveCount:  func() int { return d.spawnerActiveCount() },
-			// Interactive-occupancy split: report the interview-mode subset
-			// so the platform can tell PTY-attach interactive sessions apart
-			// from headless runs (distinct from the unclassed activeCount).
-			GetActiveInteractiveCount: func() int { return d.spawnerActiveInteractiveCount() },
-			GetMaxCount:               func() int { return d.maxConcurrentSessions() },
-			GetStatus:                 d.RegistrationStatus,
-			Region:                    cfg.Machine.Region,
+			GetActiveCount:  d.spawnerActiveCount,
+			// Interactive-occupancy split: sample the unclassed total and exact
+			// interview-mode subset under one spawner lock so lifecycle changes
+			// cannot serialize values from different instants.
+			GetActiveSessionCounts: d.spawnerActiveSessionCounts,
+			GetMaxCount:            func() int { return d.maxConcurrentSessions() },
+			GetStatus:              d.RegistrationStatus,
+			Region:                 cfg.Machine.Region,
 			// Item 8: per-beat CPU/mem load sample → last_cpu_pct/last_mem_pct.
 			// Best-effort stdlib probe; omits the load key when it can't sample.
 			GetLoad:      SampleLoad,
@@ -1112,21 +1112,35 @@ func (d *Daemon) spawnerActiveInteractiveCount() int {
 	return d.spawner.ActiveInteractiveCount()
 }
 
+func (d *Daemon) spawnerActiveSessionCounts() (active, activeInteractive int) {
+	if d.spawner == nil {
+		return 0, 0
+	}
+	return d.spawner.ActiveSessionCounts()
+}
+
 // ActiveSessionCount returns the number of agent sessions currently running
-// under the daemon's shared WorkerSpawner. Exported so embedders can wire this
-// into a satellite heartbeat's GetActiveCount callback for a shared-spawner
-// multi-identity configuration.
+// under the daemon's shared WorkerSpawner. Exported for compatibility with
+// embedders that wire a satellite heartbeat's GetActiveCount callback.
 func (d *Daemon) ActiveSessionCount() int {
 	return d.spawnerActiveCount()
 }
 
-// ActiveInteractiveSessionCount returns the number of interactive ("interview"
-// run-mode) agent sessions currently running under the daemon's shared
-// WorkerSpawner. Exported so embedders can wire this into a satellite
-// heartbeat's GetActiveInteractiveCount callback for a shared-spawner
-// multi-identity configuration.
+// ActiveInteractiveSessionCount returns the number of exact "interview"
+// run-mode sessions currently running under the daemon's shared WorkerSpawner.
+// Callers that need a value paired with total occupancy should use
+// ActiveSessionCounts instead.
 func (d *Daemon) ActiveInteractiveSessionCount() int {
 	return d.spawnerActiveInteractiveCount()
+}
+
+// ActiveSessionCounts returns a coherent machine-wide occupancy snapshot for a
+// shared-spawner multi-identity configuration. active includes every run mode;
+// activeInteractive is the exact "interview" subset. Embedders should wire this
+// method to a satellite heartbeat's GetActiveSessionCounts callback so both
+// fields are sampled under one spawner lock.
+func (d *Daemon) ActiveSessionCounts() (active, activeInteractive int) {
+	return d.spawnerActiveSessionCounts()
 }
 
 // MaxConcurrentSessions returns the per-host capacity ceiling configured for

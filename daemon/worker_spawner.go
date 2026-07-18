@@ -194,7 +194,7 @@ func (s *WorkerSpawner) emit(ev SessionEvent) {
 	}
 }
 
-// ActiveCount returns the number of in-flight sessions.
+// ActiveCount returns the number of in-flight sessions across all run modes.
 func (s *WorkerSpawner) ActiveCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -202,18 +202,26 @@ func (s *WorkerSpawner) ActiveCount() int {
 }
 
 // ActiveInteractiveCount returns the number of in-flight sessions whose
-// run-mode is interactive ("interview"). Headless sessions (Mode "") are
-// excluded, so the result is always <= ActiveCount().
+// run-mode is exactly "interview". Headless and all other modes are excluded.
 func (s *WorkerSpawner) ActiveInteractiveCount() int {
+	_, interactive := s.ActiveSessionCounts()
+	return interactive
+}
+
+// ActiveSessionCounts returns one coherent occupancy snapshot: active is the
+// unclassed count across every run mode, while activeInteractive is the exact
+// "interview" subset. Both values are derived while holding the same lock, so
+// concurrent session starts/stops cannot produce activeInteractive > active.
+func (s *WorkerSpawner) ActiveSessionCounts() (active, activeInteractive int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	n := 0
+	active = len(s.sessions)
 	for _, ss := range s.sessions {
 		if ss.spec.Mode == "interview" {
-			n++
+			activeInteractive++
 		}
 	}
-	return n
+	return active, activeInteractive
 }
 
 // IsAccepting reports whether the spawner is currently accepting work.

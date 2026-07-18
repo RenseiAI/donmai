@@ -191,6 +191,21 @@ func TestDaemon_ActiveInteractiveSessionCount_Exported(t *testing.T) {
 	}
 }
 
+// TestDaemon_ActiveSessionCounts_Exported proves the coherent callback can be
+// wired directly by an external embedder. Before Start(), both counts are 0.
+func TestDaemon_ActiveSessionCounts_Exported(t *testing.T) {
+	t.Parallel()
+	d := daemon.New(daemon.Options{
+		ConfigPath: "/dev/null",
+		HTTPPort:   0,
+	})
+	callback := d.ActiveSessionCounts
+	active, interactive := callback()
+	if active != 0 || interactive != 0 {
+		t.Errorf("ActiveSessionCounts before Start = (%d, %d), want (0, 0)", active, interactive)
+	}
+}
+
 // TestDaemon_MaxConcurrentSessions_Exported proves MaxConcurrentSessions is
 // callable from outside the package. Before Start() (config not loaded),
 // it returns 0.

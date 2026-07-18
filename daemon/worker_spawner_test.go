@@ -1130,25 +1130,25 @@ func TestSpawner_AddProjects_Concurrency(_ *testing.T) {
 }
 
 // TestSpawner_ActiveInteractiveCount pins the interactive-occupancy split:
-// only sessions whose run-mode is "interview" count toward
-// ActiveInteractiveCount, and it never exceeds ActiveCount.
+// only the exact "interview" run mode counts toward activeInteractive, while
+// active remains the unclassed count across every mode.
 func TestSpawner_ActiveInteractiveCount(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
-		MaxConcurrentSessions: 5,
+		MaxConcurrentSessions: 6,
 		WorkerCommand:         []string{"sleep", "30"},
 	})
 	ended := sessionEnds(s)
 	t.Cleanup(func() { _ = s.Drain(time.Second) })
 
-	// Empty spawner: zero interactive, zero total.
-	if got := s.ActiveInteractiveCount(); got != 0 {
-		t.Fatalf("ActiveInteractiveCount on empty spawner = %d, want 0", got)
+	if active, interactive := s.ActiveSessionCounts(); active != 0 || interactive != 0 {
+		t.Fatalf("ActiveSessionCounts on empty spawner = (%d, %d), want (0, 0)", active, interactive)
 	}
 
 	specs := []SessionSpec{
 		{SessionID: "head-1", Repository: "github.com/a/b"},                   // headless
 		{SessionID: "int-1", Repository: "github.com/a/b", Mode: "interview"}, // interactive
+		{SessionID: "other", Repository: "github.com/a/b", Mode: "interactive"},
 		{SessionID: "head-2", Repository: "github.com/a/b"},                   // headless
 		{SessionID: "int-2", Repository: "github.com/a/b", Mode: "interview"}, // interactive
 	}
@@ -1158,27 +1158,69 @@ func TestSpawner_ActiveInteractiveCount(t *testing.T) {
 		}
 	}
 
-	if got := s.ActiveCount(); got != 4 {
-		t.Fatalf("ActiveCount = %d, want 4", got)
+	active, interactive := s.ActiveSessionCounts()
+	if active != 5 || interactive != 2 {
+		t.Fatalf("ActiveSessionCounts = (%d, %d), want (5, 2)", active, interactive)
 	}
-	if got := s.ActiveInteractiveCount(); got != 2 {
-		t.Fatalf("ActiveInteractiveCount = %d, want 2 (only interview-mode)", got)
+	if got := s.ActiveCount(); got != active {
+		t.Fatalf("ActiveCount = %d, snapshot active = %d", got, active)
 	}
-	if s.ActiveInteractiveCount() > s.ActiveCount() {
-		t.Fatalf("ActiveInteractiveCount(%d) must never exceed ActiveCount(%d)",
-			s.ActiveInteractiveCount(), s.ActiveCount())
+	if got := s.ActiveInteractiveCount(); got != interactive {
+		t.Fatalf("ActiveInteractiveCount = %d, snapshot interactive = %d", got, interactive)
 	}
 
-	// Stop one interactive session; the interactive count drops, headless
-	// count is untouched.
+	// Stop one interactive session; the exact subset drops while every other
+	// mode remains in the unclassed total.
 	if !s.StopSession("int-1") {
 		t.Fatal("StopSession(int-1) = false, want true")
 	}
 	waitSessionEnd(t, ended)
-	if got := s.ActiveInteractiveCount(); got != 1 {
-		t.Fatalf("ActiveInteractiveCount after stopping one interview session = %d, want 1", got)
+	active, interactive = s.ActiveSessionCounts()
+	if active != 4 || interactive != 1 {
+		t.Fatalf("ActiveSessionCounts after stopping interview session = (%d, %d), want (4, 1)", active, interactive)
 	}
-	if got := s.ActiveCount(); got != 3 {
-		t.Fatalf("ActiveCount after stopping one interview session = %d, want 3", got)
+}
+
+func TestSpawner_ActiveSessionCountsConcurrentLifecycle(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{})
+	started := make(chan struct{})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		close(started)
+		present := false
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			s.mu.Lock()
+			if present {
+				delete(s.sessions, "interactive")
+			} else {
+				s.sessions["interactive"] = &spawnedSession{
+					spec: SessionSpec{SessionID: "interactive", Mode: "interview"},
+				}
+			}
+			present = !present
+			s.mu.Unlock()
+		}
+	}()
+	<-started
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	for range 10_000 {
+		active, interactive := s.ActiveSessionCounts()
+		// This synthetic lifecycle has either no sessions or one exact
+		// interview session, so only coherent snapshots (0,0) and (1,1) exist.
+		if active != interactive {
+			t.Fatalf("torn occupancy snapshot under concurrent lifecycle: active=%d interactive=%d", active, interactive)
+		}
 	}
 }
