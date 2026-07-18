@@ -27,11 +27,11 @@ import (
 //
 // ATTACH_TOKEN_FILE is the optional token-refresh rail: a provisioner that
 // maintains a fresh short-exp attach token (re-minted before each expiry) may
-// point this at a file it atomically rewrites; the runner then re-reads the
-// file once per dial attempt so a reconnect AFTER the initial token's exp
-// still presents a live token. It is meaningful only alongside the attach
-// pair — ATTACH_TOKEN remains the initial value and the fallback — and a
-// stray ATTACH_TOKEN_FILE with no attach pair is ignored.
+// point this at a file it atomically rewrites; the runner then re-reads it
+// before each carrier attempt and on degraded-lane refreshes, so a reconnect
+// AFTER the initial token's exp still presents a live token. It is meaningful
+// only alongside the attach pair — ATTACH_TOKEN remains the initial value and
+// the fallback — and a stray ATTACH_TOKEN_FILE with no attach pair is ignored.
 const (
 	envAttachURL   = "ATTACH_URL"
 	envAttachToken = "ATTACH_TOKEN"
@@ -169,8 +169,9 @@ func (r *Runner) dispatchInteractive(
 			AttachURL: attachURL,
 			// Token re-mint rail: the provisioner may maintain a fresh
 			// short-exp token at ATTACH_TOKEN_FILE (atomically rewritten
-			// before each expiry); the source re-reads it per dial attempt so
-			// a reconnect after the initial token's exp presents a live token.
+			// before each expiry); the source re-reads it before carrier
+			// attempts and degraded-lane refreshes so a reconnect after the
+			// initial token's exp presents a live token.
 			// The static ATTACH_TOKEN is the initial value and the fallback —
 			// without the file (or on any file failure) its exp bounds
 			// reconnectability exactly as before.
@@ -324,15 +325,16 @@ func (r *Runner) postInteractiveActivity(ctx context.Context, worktreePath strin
 }
 
 // attachTokenSource builds the host leg's attachclient.TokenSource. RunHost
-// calls it once per dial attempt (serially, from its own loop), which is the
+// resolves it before each top-level carrier attempt; degraded-lane 401 recovery
+// and the WSS upgrade probe may additionally call it concurrently. That is the
 // seam the token-refresh rail rides:
 //
 //   - tokenFilePath == "": today's behavior, unchanged — the static token is
 //     re-presented on every attempt and its exp bounds the session's
 //     reconnectability.
-//   - tokenFilePath != "": the file is re-read per attempt (the provisioner
-//     rewrites it atomically with a fresh short-exp token), so a reconnect
-//     after the static token's exp still presents a live token. A read
+//   - tokenFilePath != "": the file is re-read on every resolution (the
+//     provisioner rewrites it atomically with a fresh short-exp token), so a
+//     reconnect after the static token's exp still presents a live token. A read
 //     failure or an empty file falls back to the static token — degraded to
 //     exactly today's behavior, never worse — with one WARN per distinct
 //     failure condition (not per attempt: attempts are backoff-paced and a

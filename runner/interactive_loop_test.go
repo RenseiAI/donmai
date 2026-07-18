@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +25,7 @@ import (
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
+	"github.com/coder/websocket"
 )
 
 // ─── interactive PTY-backed stub provider ──────────────────────────────────
@@ -302,6 +306,153 @@ func TestInteractive_LocalOnlyNonzeroExitFails(t *testing.T) {
 	}
 	if !strings.Contains(out.Error, "exit 3") {
 		t.Fatalf("error should carry the exit detail: %q", out.Error)
+	}
+}
+
+func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
+	requireSh(t)
+
+	const (
+		sessionID = "sess-token-file-reconnect"
+		roomPath  = "/v1/rooms/room-1"
+	)
+	initialExp := time.Now().Add(300 * time.Millisecond)
+	initialToken := fakeInteractiveJWT(map[string]any{
+		"sessionId": sessionID,
+		"roomId":    "room-1",
+		"role":      "host",
+		"aud":       "relay",
+		"jti":       "host-initial",
+		"epoch":     int64(1),
+		"exp":       initialExp.Unix(),
+	})
+	replacementToken := fakeInteractiveJWT(map[string]any{
+		"sessionId": sessionID,
+		"roomId":    "room-1",
+		"role":      "host",
+		"aud":       "relay",
+		"jti":       "host-replacement",
+		"epoch":     int64(1),
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+
+	var allowedToken atomic.Value
+	allowedToken.Store(initialToken)
+	admitted := make(chan string, 2)
+	dropInitial := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != roomPath {
+			http.NotFound(w, r)
+			return
+		}
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token != allowedToken.Load().(string) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols:       []string{attachwire.SubprotocolVersion},
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()                                //nolint:errcheck
+		if _, _, err := conn.Read(r.Context()); err != nil { // host subscribe
+			return
+		}
+		admitted <- token
+		if token == initialToken {
+			select {
+			case <-dropInitial:
+				return
+			case <-r.Context().Done():
+				return
+			}
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "attach-token") // intentionally missing initially
+	donePath := filepath.Join(t.TempDir(), "done")
+	t.Setenv(envAttachURL, strings.Replace(srv.URL, "http://", "ws://", 1)+roomPath)
+	t.Setenv(envAttachToken, initialToken)
+	t.Setenv(envAttachTokenFile, tokenPath)
+
+	r := minimalRunner(t)
+	sess, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{
+		"/bin/sh", "-c", `while [ ! -f "$1" ]; do sleep 0.05; done`, "sh", donePath,
+	}})
+	if err != nil {
+		t.Fatalf("ptyhost.Spawn: %v", err)
+	}
+	h := newInteractivePTYHandle(sess)
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	type dispatchResult struct {
+		res *Result
+		err error
+	}
+	resultCh := make(chan dispatchResult, 1)
+	go func() {
+		res := &Result{SessionID: sessionID}
+		res.ProviderName = agent.ProviderShell
+		qw := QueuedWork{}
+		qw.SessionID = sessionID
+		out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil)
+		resultCh <- dispatchResult{res: out, err: err}
+	}()
+
+	select {
+	case got := <-admitted:
+		if got != initialToken {
+			t.Fatalf("initial admission token=%q; want static token", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("initial static attach token was not admitted")
+	}
+
+	// The live connection may remain valid until it drops. Once the initial JWT's
+	// exp has passed, simulate relay re-admission policy, atomically publish the
+	// replacement file, and force a reconnect.
+	if wait := time.Until(initialExp.Add(20 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	tmp := tokenPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(replacementToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, tokenPath); err != nil {
+		t.Fatal(err)
+	}
+	allowedToken.Store(replacementToken)
+	close(dropInitial)
+
+	select {
+	case got := <-admitted:
+		if got != replacementToken {
+			t.Fatalf("reconnect admission token=%q; want replacement token", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay reconnect did not re-read ATTACH_TOKEN_FILE")
+	}
+
+	if err := os.WriteFile(donePath, []byte("done"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("dispatchInteractive: %v", got.err)
+		}
+		if got.res.Status != "completed" {
+			t.Fatalf("status=%q error=%q; want completed", got.res.Status, got.res.Error)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchInteractive did not finish after token-file reconnect")
 	}
 }
 

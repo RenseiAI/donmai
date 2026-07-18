@@ -19,7 +19,9 @@ import (
 //
 // It dials OUT only (WSS, with degraded HTTPS fallback per § 14); it never opens
 // an inbound listener. Reconnect uses cancel-aware exponential backoff, reset on
-// success, with per-attempt TokenSource re-resolution (§ 15).
+// success, with TokenSource re-resolution before each top-level carrier attempt;
+// degraded-lane 401 recovery and upgrade probes may resolve it concurrently
+// (§ 14/§ 15).
 func RunHost(ctx context.Context, cfg HostConfig) error {
 	if err := cfg.withDefaults(); err != nil {
 		return err

@@ -12,12 +12,14 @@
 // the ADR's outbound-only mandate. Viewers are W5/W7/W11; this package is the
 // host side only.
 //
-// TokenSource is called once per dial attempt (§ 15) — that per-attempt
-// re-resolution is the token-refresh seam: a composing binary whose relay
-// provisioner maintains a fresh short-exp token (e.g. rewritten to a file the
-// source re-reads, see the runner's ATTACH_TOKEN_FILE contract) keeps the host
-// leg reconnectable past the initial token's exp; a static closure bounds
-// reconnectability at that exp.
+// TokenSource is resolved before every top-level carrier attempt (§ 15), and
+// the degraded carrier may additionally call it concurrently to recover from a
+// 401 on SSE-down or POST-up and from its background WSS upgrade probe. Sources
+// MUST therefore be safe for concurrent use. This re-resolution is the token-
+// refresh seam: a composing binary whose relay provisioner maintains a fresh
+// short-exp token (e.g. rewritten to a file the source re-reads, see the
+// runner's ATTACH_TOKEN_FILE contract) keeps the host leg reconnectable past
+// the initial token's exp; a static closure bounds reconnectability at that exp.
 //
 // # Two carriers, one interface
 //

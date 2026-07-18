@@ -72,10 +72,12 @@ type Subscription interface {
 	Close() error
 }
 
-// TokenSource yields the current bearer JWT for the host leg. It is called once
-// per dial attempt (§ 15: identity-based re-presentation — within the token's
-// exp the same jti is legitimately re-presented on reconnect; at/after exp the
-// composing binary mints a fresh token). It MUST be safe for concurrent use.
+// TokenSource yields the current bearer JWT for the host leg. It is resolved
+// before each top-level carrier attempt and may also be called concurrently by
+// degraded-lane 401 recovery and the background WSS upgrade probe (§ 14/§ 15).
+// Within a token's exp the same jti is legitimately re-presented on reconnect;
+// at/after exp the composing binary mints a fresh token. It MUST be safe for
+// concurrent use.
 type TokenSource func(ctx context.Context) (string, error)
 
 // KillFunc is the composing runner's process-group termination hook, invoked
