@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -347,16 +348,26 @@ func attachTokenSource(staticToken, tokenFilePath string, logger *slog.Logger) a
 	if tokenFilePath == "" {
 		return func(context.Context) (string, error) { return staticToken, nil }
 	}
-	// Per-attempt calls are serialized by RunHost's single loop goroutine, so
-	// this closure state needs no lock.
+	// TokenSource is a concurrent-use contract: the degraded carrier may re-mint
+	// from POST-up, SSE, and upgrade-probe paths at the same time. Protect the
+	// warning-state transition while leaving the file reads concurrent.
+	var warnMu sync.Mutex
 	lastWarn := ""
+	warningChanged := func(warn string) bool {
+		warnMu.Lock()
+		defer warnMu.Unlock()
+		if warn == lastWarn {
+			return false
+		}
+		lastWarn = warn
+		return true
+	}
 	return func(context.Context) (string, error) {
 		// #nosec G304 G703 -- tokenFilePath is the provisioner-injected ATTACH_TOKEN_FILE
 		// contract: the same trusted process that already injects ATTACH_TOKEN itself.
 		raw, err := os.ReadFile(tokenFilePath)
 		if err != nil {
-			if warn := "read: " + err.Error(); warn != lastWarn {
-				lastWarn = warn
+			if warningChanged("read: " + err.Error()) {
 				logger.Warn("[interactive] attach token file unreadable — falling back to static token",
 					"path", tokenFilePath, "err", err)
 			}
@@ -364,14 +375,13 @@ func attachTokenSource(staticToken, tokenFilePath string, logger *slog.Logger) a
 		}
 		tok := strings.TrimSpace(string(raw))
 		if tok == "" {
-			if lastWarn != "empty" {
-				lastWarn = "empty"
+			if warningChanged("empty") {
 				logger.Warn("[interactive] attach token file empty — falling back to static token",
 					"path", tokenFilePath)
 			}
 			return staticToken, nil
 		}
-		lastWarn = ""
+		warningChanged("")
 		return tok, nil
 	}
 }

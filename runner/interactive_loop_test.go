@@ -1,14 +1,17 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -556,5 +559,76 @@ func TestAttachTokenSource_PerAttemptReRead(t *testing.T) {
 	}
 	if tok != "static-tok" {
 		t.Fatalf("post-remove tok=%q; want static-tok", tok)
+	}
+}
+
+// TokenSource is a concurrent-use contract: the degraded carrier can re-mint
+// from its POST-up, SSE, and upgrade-probe paths at the same time. Exercise the
+// warning-state transitions under a synchronized fan-out so -race observes any
+// unsynchronized closure state, while the assertions also pin one warning per
+// distinct failure until a successful read clears the condition.
+func TestAttachTokenSource_ConcurrentWarningState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	src := attachTokenSource("static-tok", path, logger)
+
+	callConcurrently := func(want string) {
+		t.Helper()
+		const callers = 64
+		start := make(chan struct{})
+		errCh := make(chan error, callers)
+		var wg sync.WaitGroup
+		wg.Add(callers)
+		for i := 0; i < callers; i++ {
+			go func() {
+				defer wg.Done()
+				<-start
+				tok, err := src(context.Background())
+				if err != nil {
+					errCh <- fmt.Errorf("unexpected source error: %w", err)
+					return
+				}
+				if tok != want {
+					errCh <- fmt.Errorf("tok=%q; want %q", tok, want)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			t.Error(err)
+		}
+	}
+
+	// A persistent missing file warns once even when many callers observe it.
+	callConcurrently("static-tok")
+	callConcurrently("static-tok")
+	if got := strings.Count(logs.String(), "attach token file unreadable"); got != 1 {
+		t.Fatalf("unreadable warning count=%d; want 1 before recovery\nlogs:\n%s", got, logs.String())
+	}
+
+	// A different failure condition gets its own warning.
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	callConcurrently("static-tok")
+	if got := strings.Count(logs.String(), "attach token file empty"); got != 1 {
+		t.Fatalf("empty warning count=%d; want 1\nlogs:\n%s", got, logs.String())
+	}
+
+	// A successful read clears the warning state. A later recurrence of the
+	// missing-file condition must therefore warn exactly once again.
+	if err := os.WriteFile(path, []byte("fresh-tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	callConcurrently("fresh-tok")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	callConcurrently("static-tok")
+	if got := strings.Count(logs.String(), "attach token file unreadable"); got != 2 {
+		t.Fatalf("unreadable warning count=%d; want 2 after recovery and recurrence\nlogs:\n%s", got, logs.String())
 	}
 }
