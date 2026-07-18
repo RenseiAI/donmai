@@ -84,7 +84,7 @@ func testFirehoseFastSubscriber(t *testing.T) {
 	// the plain (non -race) build, where it was verified to hold with margin.
 	mib, floorMBs := 224, 10.0
 	if raceEnabled {
-		mib, floorMBs = 18, 2.0
+		mib, floorMBs = 28, 2.0
 	}
 	s, err := Spawn(Spec{Command: firehoseCommand(mib)})
 	if err != nil {
@@ -174,7 +174,7 @@ func testFirehoseSlowVsFastSubscriber(t *testing.T) {
 	// are meaningful regardless of timing variance.
 	mib, floorMBs := 224, 10.0
 	if raceEnabled {
-		mib, floorMBs = 18, 2.0
+		mib, floorMBs = 28, 2.0
 	}
 	s, err := Spawn(Spec{Command: firehoseCommand(mib)})
 	if err != nil {
