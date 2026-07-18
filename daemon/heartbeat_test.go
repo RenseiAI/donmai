@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/internal/interview"
 )
 
 func TestHeartbeatService_StartStop(t *testing.T) {
@@ -672,7 +674,7 @@ func TestHeartbeatService_ActiveSessionCountsCoherentUnderConcurrentLifecycle(t 
 				delete(spawner.sessions, "interactive")
 			} else {
 				spawner.sessions["interactive"] = &spawnedSession{
-					spec: SessionSpec{SessionID: "interactive", Mode: "interview"},
+					spec: SessionSpec{SessionID: "interactive", Mode: interview.InterviewRunMode},
 				}
 			}
 			present = !present

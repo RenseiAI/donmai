@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/interview"
 )
 
 func TestSpawner_ForceKillSignalFailureKeepsSession(t *testing.T) {
@@ -1146,11 +1147,11 @@ func TestSpawner_ActiveInteractiveCount(t *testing.T) {
 	}
 
 	specs := []SessionSpec{
-		{SessionID: "head-1", Repository: "github.com/a/b"},                   // headless
-		{SessionID: "int-1", Repository: "github.com/a/b", Mode: "interview"}, // interactive
-		{SessionID: "other", Repository: "github.com/a/b", Mode: "interactive"},
-		{SessionID: "head-2", Repository: "github.com/a/b"},                   // headless
-		{SessionID: "int-2", Repository: "github.com/a/b", Mode: "interview"}, // interactive
+		{SessionID: "head-1", Repository: "github.com/a/b"},                                  // headless
+		{SessionID: "int-1", Repository: "github.com/a/b", Mode: interview.InterviewRunMode}, // interactive
+		{SessionID: "other", Repository: "github.com/a/b", Mode: "interactive"},              // explicit near-match
+		{SessionID: "head-2", Repository: "github.com/a/b"},                                  // headless
+		{SessionID: "int-2", Repository: "github.com/a/b", Mode: interview.InterviewRunMode}, // interactive
 	}
 	for _, spec := range specs {
 		if _, err := s.AcceptWork(spec); err != nil {
@@ -1202,7 +1203,7 @@ func TestSpawner_ActiveSessionCountsConcurrentLifecycle(t *testing.T) {
 				delete(s.sessions, "interactive")
 			} else {
 				s.sessions["interactive"] = &spawnedSession{
-					spec: SessionSpec{SessionID: "interactive", Mode: "interview"},
+					spec: SessionSpec{SessionID: "interactive", Mode: interview.InterviewRunMode},
 				}
 			}
 			present = !present

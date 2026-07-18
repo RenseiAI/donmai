@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/interview"
 )
 
 // Compile-time assertion that WorkerSpawner satisfies the
@@ -217,7 +218,7 @@ func (s *WorkerSpawner) ActiveSessionCounts() (active, activeInteractive int) {
 	defer s.mu.Unlock()
 	active = len(s.sessions)
 	for _, ss := range s.sessions {
-		if ss.spec.Mode == "interview" {
+		if ss.spec.Mode == interview.InterviewRunMode {
 			activeInteractive++
 		}
 	}
