@@ -557,10 +557,53 @@ func TestHeartbeatService_ActiveSessionCountsRoundTrips(t *testing.T) {
 	}
 }
 
+func TestHeartbeatService_LegacyActiveInteractiveCountRoundTrips(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	var (
+		mu  sync.Mutex
+		raw map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		buf, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(buf, &raw)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+	}))
+	t.Cleanup(srv.Close)
+
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID:                  "wkr_legacy_interactive",
+		Hostname:                  "h",
+		OrchestratorURL:           srv.URL,
+		RuntimeJWT:                "runtime.jwt.value",
+		IntervalSeconds:           60,
+		GetActiveCount:            func() int { return 3 },
+		GetActiveInteractiveCount: func() int { return 2 },
+		GetMaxCount:               func() int { return 4 },
+		GetStatus:                 func() RegistrationStatus { return RegistrationIdle },
+	})
+	hs.sendOne(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got, _ := raw["activeCount"].(float64); got != 3 {
+		t.Errorf("body.activeCount = %v, want 3", raw["activeCount"])
+	}
+	got, present := raw["activeInteractiveCount"]
+	if !present {
+		t.Fatal("body.activeInteractiveCount missing for legacy callback")
+	}
+	if got != float64(2) {
+		t.Errorf("body.activeInteractiveCount = %v, want 2", got)
+	}
+}
+
 // TestHeartbeatService_ActiveInteractiveCountOmittedWhenUnclassified confirms
 // the `activeInteractiveCount` key is omitted entirely (pointer + omitempty)
-// when GetActiveSessionCounts is nil. It asserts key ABSENCE, not `== 0`, so a
-// genuine classified zero remains distinguishable.
+// when both interactive-classification callbacks are nil. It asserts key
+// ABSENCE, not `== 0`, so a genuine classified zero remains distinguishable.
 func TestHeartbeatService_ActiveInteractiveCountOmittedWhenUnclassified(t *testing.T) {
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
@@ -586,7 +629,7 @@ func TestHeartbeatService_ActiveInteractiveCountOmittedWhenUnclassified(t *testi
 		GetActiveCount:  func() int { return 1 },
 		GetMaxCount:     func() int { return 4 },
 		GetStatus:       func() RegistrationStatus { return RegistrationIdle },
-		// GetActiveSessionCounts deliberately nil.
+		// Both interactive-classification callbacks deliberately nil.
 	})
 	hs.sendOne(context.Background())
 
@@ -613,7 +656,7 @@ func TestHeartbeatService_ActiveSessionCountsTakePrecedence(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	var atomicCalls, legacyActiveCalls int32
+	var atomicCalls, legacyActiveCalls, legacyInteractiveCalls int32
 	hs := NewHeartbeatService(HeartbeatOptions{
 		WorkerID:        "wkr_atomic_occupancy",
 		Hostname:        "h",
@@ -628,6 +671,10 @@ func TestHeartbeatService_ActiveSessionCountsTakePrecedence(t *testing.T) {
 			atomic.AddInt32(&legacyActiveCalls, 1)
 			return 99
 		},
+		GetActiveInteractiveCount: func() int {
+			atomic.AddInt32(&legacyInteractiveCalls, 1)
+			return 88
+		},
 		GetMaxCount: func() int { return 4 },
 		GetStatus:   func() RegistrationStatus { return RegistrationIdle },
 	})
@@ -638,6 +685,9 @@ func TestHeartbeatService_ActiveSessionCountsTakePrecedence(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&legacyActiveCalls); got != 0 {
 		t.Fatalf("GetActiveCount calls = %d, want 0 when coherent callback is configured", got)
+	}
+	if got := atomic.LoadInt32(&legacyInteractiveCalls); got != 0 {
+		t.Fatalf("GetActiveInteractiveCount calls = %d, want 0 when coherent callback is configured", got)
 	}
 	mu.Lock()
 	defer mu.Unlock()

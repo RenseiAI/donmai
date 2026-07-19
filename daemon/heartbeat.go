@@ -35,11 +35,20 @@ type HeartbeatOptions struct {
 	// callback classifies interactive occupancy, so the outbound body includes
 	// `activeInteractiveCount` even when its value is zero.
 	//
-	// Optional and nil-safe: nil preserves the legacy GetActiveCount-only path
-	// and omits `activeInteractiveCount` entirely. Reporting the interactive split
-	// requires this paired callback; there is deliberately no separately sampled
-	// callback because that could serialize a torn occupancy pair.
+	// Optional and nil-safe: nil falls back to GetActiveCount and, when configured,
+	// the legacy GetActiveInteractiveCount callback below. New embedders should use
+	// this paired callback so the two occupancy values come from the same instant.
 	GetActiveSessionCounts func() (active, activeInteractive int)
+
+	// GetActiveInteractiveCount is the legacy separately sampled interactive
+	// occupancy callback. It remains source-compatible with embedders that adopted
+	// the initial activeInteractiveCount contract before GetActiveSessionCounts was
+	// introduced. When the paired callback above is nil, sendOne samples
+	// GetActiveCount first and this callback second; nil omits the interactive key.
+	//
+	// Deprecated: use GetActiveSessionCounts to avoid a torn occupancy pair during
+	// concurrent session lifecycle changes.
+	GetActiveInteractiveCount func() int
 
 	// GetLoad returns the current CPU and memory utilisation percentages
 	// (0–100) for this beat. ok=false means "no sample this beat" and the
@@ -253,6 +262,10 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		activeInteractive = &interactive
 	default:
 		activeCount = h.opts.GetActiveCount()
+		if h.opts.GetActiveInteractiveCount != nil {
+			interactive := h.opts.GetActiveInteractiveCount()
+			activeInteractive = &interactive
+		}
 	}
 
 	payload := HeartbeatPayload{
