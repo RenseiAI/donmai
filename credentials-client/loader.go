@@ -23,6 +23,12 @@ import (
 // in standalone mode.
 const SocketEnvVar = "DONMAI_CREDENTIAL_SOCKET"
 
+// CapabilityEnvVar is the name of the environment variable containing the
+// per-session credential-socket capability sent in the optional HELLO
+// capability field. The value is resolved before credential snapshots are
+// blocklist-filtered and is never exposed through [Loader.Get] or [Loader.All].
+const CapabilityEnvVar = "DONMAI_CREDENTIAL_CAPABILITY"
+
 // defaultHandshakeTimeout is used when [Options.HandshakeTimeout] is
 // zero. Five seconds is generous for a local unix-socket round trip
 // (microseconds in practice) but rules out a hung daemon making New
@@ -44,6 +50,12 @@ type Options struct {
 	// Sent verbatim as the HELLO frame's sessionId in daemon mode.
 	// Ignored in standalone mode.
 	SessionID string
+
+	// Capability is the optional per-session credential-socket capability.
+	// A non-empty value is sent verbatim as HELLO.capability. When empty,
+	// New reads [CapabilityEnvVar]. If both are empty, the capability field
+	// is omitted to preserve the legacy HELLO shape.
+	Capability string
 
 	// HandshakeTimeout caps the dial + HELLO + INITIAL round-trip.
 	// Default: 5 s.
@@ -129,12 +141,17 @@ func New(ctx context.Context, opts Options) (*Loader, error) {
 		return newStandalone(opts, logger), nil
 	}
 
+	capability := opts.Capability
+	if capability == "" {
+		capability = os.Getenv(CapabilityEnvVar)
+	}
+
 	timeout := opts.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = defaultHandshakeTimeout
 	}
 
-	loader, err := dialAndHandshake(ctx, socketPath, opts.SessionID, timeout)
+	loader, err := dialAndHandshake(ctx, socketPath, opts.SessionID, capability, timeout)
 	if err != nil {
 		logger.Info("[creds] socket unavailable, falling back to process env",
 			slog.String("reason", err.Error()))
@@ -183,7 +200,7 @@ func newStandalone(opts Options, logger *slog.Logger) *Loader {
 // sequence. Returns a partially-initialised Loader on success.
 func dialAndHandshake(
 	ctx context.Context,
-	socketPath, sessionID string,
+	socketPath, sessionID, capability string,
 	timeout time.Duration,
 ) (*Loader, error) {
 	if sessionID == "" {
@@ -203,8 +220,13 @@ func dialAndHandshake(
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 
-	// 1. Send HELLO.
-	helloBytes, err := json.Marshal(helloMessage{Type: "HELLO", SessionID: sessionID})
+	// 1. Send HELLO. Capability is optional for staged compatibility;
+	// omitempty preserves the legacy type/sessionId-only frame.
+	helloBytes, err := json.Marshal(helloMessage{
+		Type:       "HELLO",
+		SessionID:  sessionID,
+		Capability: capability,
+	})
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("marshal HELLO: %w", err)

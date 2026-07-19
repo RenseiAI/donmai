@@ -7,8 +7,10 @@
 //     harness) has set the DONMAI_CREDENTIAL_SOCKET environment variable
 //     to the path of a unix socket speaking the HELLO/INITIAL/UPDATE/BYE
 //     line-delimited JSON protocol. The loader connects, sends a HELLO
-//     frame naming the session id, receives an INITIAL snapshot, and
-//     reads UPDATE frames in the background.
+//     frame naming the session id and, when available, a per-session
+//     capability, receives an INITIAL snapshot, and reads UPDATE frames in
+//     the background. Capability resolution prefers [Options.Capability]
+//     and otherwise reads [CapabilityEnvVar].
 //
 //   - Standalone mode: the socket env var is unset (or the daemon-mode
 //     handshake failed). The loader snapshots os.Environ() into an
@@ -22,7 +24,9 @@
 // The loader applies [AgentEnvBlocklist] from
 // internal/credentials at read time. Any name appearing on that list
 // returns ("", false) from Get, is omitted from All, and is stripped
-// from UPDATE deltas before subscribers see them. This is a
+// from UPDATE deltas before subscribers see them. This includes
+// [CapabilityEnvVar]: the handshake resolves it directly before snapshot
+// filtering, and callers can never retrieve it as a credential. This is a
 // defence-in-depth layer; the daemon also filters on emission.
 //
 // # Wire protocol (daemon mode)
@@ -32,6 +36,10 @@
 // Client → server (one frame):
 //
 //	{"type":"HELLO","sessionId":"<id>"}
+//	{"type":"HELLO","sessionId":"<id>","capability":"<per-session capability>"}
+//
+// The capability property is optional and omitted when unavailable so
+// existing servers that decode only type/sessionId remain compatible.
 //
 // Server → client (one frame, then zero or more UPDATE frames):
 //
