@@ -8,6 +8,14 @@ import (
 	"github.com/RenseiAI/donmai/runner/access"
 )
 
+// CredentialEnvRequirement describes one non-secret credential requirement
+// group. AnyOf contains environment-variable NAMES only: satisfying any one
+// name satisfies the group. Values must never be placed on this wire surface.
+// Group order and name order are preserved opaquely by the daemon.
+type CredentialEnvRequirement struct {
+	AnyOf []string `json:"anyOf,omitempty"`
+}
+
 // SessionDetail is the per-session payload `donmai agent run` reads from
 // the daemon's local control HTTP API on spawn. It carries the full
 // runner-side QueuedWork shape (issue context, resolved profile,
@@ -92,6 +100,22 @@ type SessionDetail struct {
 	// routing). When present it supersedes ResolvedProfile.Provider /
 	// Model / Effort in the runner. Forwarded opaquely by the daemon.
 	ModelProfile *SessionModelProfile `json:"modelProfile,omitempty"`
+
+	// CredentialRequirements is the ordered, non-secret set of environment-
+	// variable name groups required by the resolved execution cell. Each group
+	// is satisfied by any one of its AnyOf names. The daemon never resolves or
+	// logs values; it only carries the metadata to spawn-time consumers.
+	CredentialRequirements []CredentialEnvRequirement `json:"credentialRequirements,omitempty"`
+
+	// Harness is the resolved loop-driver identity projected from the poll item
+	// (for example, a CLI wrapper or native driver). It is duplicated from the
+	// resolved profile intentionally so spawn-time consumers need not traverse
+	// the opaque profile payload.
+	Harness string `json:"harness,omitempty"`
+
+	// ServingHost is the resolved model-serving location (for example direct,
+	// bedrock, vertex, azure, local, or oauth-cli). It is non-secret metadata.
+	ServingHost string `json:"servingHost,omitempty"`
 
 	// WorkerID is the daemon worker id that claimed this session.
 	WorkerID string `json:"workerId,omitempty"`
@@ -241,7 +265,17 @@ type SessionResolvedProfile struct {
 	// Additive + omitempty: absent on every legacy dispatch (=> the runner
 	// falls back to Provider/Runner). Round-tripped through the daemon's
 	// SessionDetail wire shape.
-	Harness        string         `json:"harness,omitempty"`
+	Harness string `json:"harness,omitempty"`
+
+	// ServingHost is the resolved model-serving location. It stays a string in
+	// the daemon mirror so this wire package does not import the agent package.
+	ServingHost string `json:"servingHost,omitempty"`
+
+	// CredentialRequirements carries ordered groups of environment-variable
+	// names. It is metadata only; credential values never enter the poll/detail
+	// JSON path.
+	CredentialRequirements []CredentialEnvRequirement `json:"credentialRequirements,omitempty"`
+
 	Provider       string         `json:"provider,omitempty"`
 	Runner         string         `json:"runner,omitempty"`
 	Model          string         `json:"model,omitempty"`
