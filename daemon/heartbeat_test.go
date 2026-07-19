@@ -11,8 +11,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/RenseiAI/donmai/internal/interview"
 )
 
 func TestHeartbeatService_StartStop(t *testing.T) {
@@ -560,43 +558,163 @@ func TestHeartbeatService_ActiveSessionCountsRoundTrips(t *testing.T) {
 func TestHeartbeatService_LegacyActiveInteractiveCountRoundTrips(t *testing.T) {
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
+	for _, tc := range []struct {
+		name        string
+		active      int
+		interactive int
+	}{
+		{name: "nonzero", active: 3, interactive: 2},
+		{name: "classified zero", active: 0, interactive: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu  sync.Mutex
+				raw map[string]any
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				buf, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(buf, &raw)
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+			}))
+			t.Cleanup(srv.Close)
+
+			hs := NewHeartbeatService(HeartbeatOptions{
+				WorkerID:                  "wkr_legacy_interactive",
+				Hostname:                  "h",
+				OrchestratorURL:           srv.URL,
+				RuntimeJWT:                "runtime.jwt.value",
+				IntervalSeconds:           60,
+				GetActiveCount:            func() int { return tc.active },
+				GetActiveInteractiveCount: func() int { return tc.interactive },
+				GetMaxCount:               func() int { return 4 },
+				GetStatus:                 func() RegistrationStatus { return RegistrationIdle },
+			})
+			hs.sendOne(context.Background())
+
+			mu.Lock()
+			defer mu.Unlock()
+			if got, _ := raw["activeCount"].(float64); got != float64(tc.active) {
+				t.Errorf("body.activeCount = %v, want %d", raw["activeCount"], tc.active)
+			}
+			got, present := raw["activeInteractiveCount"]
+			if !present {
+				t.Fatal("body.activeInteractiveCount missing for legacy callback")
+			}
+			if got != float64(tc.interactive) {
+				t.Errorf("body.activeInteractiveCount = %v, want %d", got, tc.interactive)
+			}
+		})
+	}
+}
+
+func TestHeartbeatService_LegacyActiveInteractiveCountOmitsImpossibleTornSample(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
 	var (
-		mu  sync.Mutex
-		raw map[string]any
+		stateMu        sync.Mutex
+		activeNow      int
+		interactiveNow int
+	)
+	activeSampled := make(chan struct{})
+	releaseInteractiveSample := make(chan struct{})
+
+	var (
+		bodyMu sync.Mutex
+		raw    map[string]any
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
+		bodyMu.Lock()
 		buf, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(buf, &raw)
-		mu.Unlock()
+		bodyMu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
 	}))
 	t.Cleanup(srv.Close)
 
+	var (
+		warningMu     sync.Mutex
+		warningFormat string
+		warningArgs   []any
+	)
 	hs := NewHeartbeatService(HeartbeatOptions{
-		WorkerID:                  "wkr_legacy_interactive",
-		Hostname:                  "h",
-		OrchestratorURL:           srv.URL,
-		RuntimeJWT:                "runtime.jwt.value",
-		IntervalSeconds:           60,
-		GetActiveCount:            func() int { return 3 },
-		GetActiveInteractiveCount: func() int { return 2 },
-		GetMaxCount:               func() int { return 4 },
-		GetStatus:                 func() RegistrationStatus { return RegistrationIdle },
+		WorkerID:        "wkr_legacy_torn",
+		Hostname:        "h",
+		OrchestratorURL: srv.URL,
+		RuntimeJWT:      "runtime.jwt.value",
+		IntervalSeconds: 60,
+		GetActiveCount: func() int {
+			stateMu.Lock()
+			active := activeNow
+			stateMu.Unlock()
+			close(activeSampled)
+			return active
+		},
+		GetActiveInteractiveCount: func() int {
+			<-releaseInteractiveSample
+			stateMu.Lock()
+			defer stateMu.Unlock()
+			return interactiveNow
+		},
+		GetMaxCount: func() int { return 4 },
+		GetStatus:   func() RegistrationStatus { return RegistrationIdle },
+		LogWarn: func(format string, args ...any) {
+			warningMu.Lock()
+			warningFormat = format
+			warningArgs = append([]any(nil), args...)
+			warningMu.Unlock()
+		},
 	})
-	hs.sendOne(context.Background())
 
-	mu.Lock()
-	defer mu.Unlock()
-	if got, _ := raw["activeCount"].(float64); got != 3 {
-		t.Errorf("body.activeCount = %v, want 3", raw["activeCount"])
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		hs.sendOne(context.Background())
+	}()
+
+	// The legacy active callback observed (0,0). Advance the coherent state to
+	// (1,1) before releasing the separately sampled interactive callback. The
+	// two valid instants therefore tear into the impossible legacy pair (0,1).
+	<-activeSampled
+	stateMu.Lock()
+	activeNow = 1
+	interactiveNow = 1
+	stateMu.Unlock()
+	close(releaseInteractiveSample)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat did not complete after releasing legacy sample barrier")
 	}
-	got, present := raw["activeInteractiveCount"]
-	if !present {
-		t.Fatal("body.activeInteractiveCount missing for legacy callback")
+
+	payload := hs.LastPayload()
+	if payload.ActiveSessions != 0 {
+		t.Fatalf("payload.ActiveSessions = %d, want sampled legacy value 0", payload.ActiveSessions)
 	}
-	if got != float64(2) {
-		t.Errorf("body.activeInteractiveCount = %v, want 2", got)
+	if payload.ActiveInteractiveSessions != nil {
+		t.Fatalf("payload.ActiveInteractiveSessions = %d, want nil for impossible legacy pair", *payload.ActiveInteractiveSessions)
+	}
+
+	bodyMu.Lock()
+	if got := raw["activeCount"]; got != float64(0) {
+		bodyMu.Unlock()
+		t.Fatalf("body.activeCount = %v, want 0", got)
+	}
+	if got, present := raw["activeInteractiveCount"]; present {
+		bodyMu.Unlock()
+		t.Fatalf("body.activeInteractiveCount = %v, want key omitted for impossible legacy pair", got)
+	}
+	bodyMu.Unlock()
+
+	warningMu.Lock()
+	defer warningMu.Unlock()
+	if !strings.Contains(warningFormat, "invalid legacy occupancy sample") {
+		t.Fatalf("warning format = %q, want invalid legacy occupancy sample", warningFormat)
+	}
+	if len(warningArgs) != 2 || warningArgs[0] != 0 || warningArgs[1] != 1 {
+		t.Fatalf("warning args = %v, want [0 1]", warningArgs)
 	}
 }
 
@@ -724,7 +842,7 @@ func TestHeartbeatService_ActiveSessionCountsCoherentUnderConcurrentLifecycle(t 
 				delete(spawner.sessions, "interactive")
 			} else {
 				spawner.sessions["interactive"] = &spawnedSession{
-					spec: SessionSpec{SessionID: "interactive", Mode: interview.InterviewRunMode},
+					spec: SessionSpec{SessionID: "interactive", Mode: interactiveRunMode},
 				}
 			}
 			present = !present
@@ -756,8 +874,8 @@ func TestHeartbeatService_ActiveSessionCountsCoherentUnderConcurrentLifecycle(t 
 		if payload.ActiveInteractiveSessions == nil {
 			t.Fatal("classified occupancy omitted activeInteractiveSessions")
 		}
-		// This synthetic lifecycle has either no sessions or one exact
-		// interview session, so only coherent snapshots (0,0) and (1,1) exist.
+		// This synthetic lifecycle has either no sessions or one exact PTY
+		// interactive session, so only coherent snapshots (0,0) and (1,1) exist.
 		if payload.ActiveSessions != *payload.ActiveInteractiveSessions {
 			t.Fatalf("torn heartbeat occupancy: active=%d interactive=%d",
 				payload.ActiveSessions, *payload.ActiveInteractiveSessions)

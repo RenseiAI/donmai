@@ -1126,19 +1126,20 @@ func (d *Daemon) ActiveSessionCount() int {
 	return d.spawnerActiveCount()
 }
 
-// ActiveInteractiveSessionCount returns the number of exact "interview"
+// ActiveInteractiveSessionCount returns the number of exact PTY "interactive"
 // run-mode sessions currently running under the daemon's shared WorkerSpawner.
-// Callers that need a value paired with total occupancy should use
-// ActiveSessionCounts instead.
+// Interview-mode sessions are excluded. Callers that need a value paired with
+// total occupancy should use ActiveSessionCounts instead.
 func (d *Daemon) ActiveInteractiveSessionCount() int {
 	return d.spawnerActiveInteractiveCount()
 }
 
 // ActiveSessionCounts returns a coherent machine-wide occupancy snapshot for a
 // shared-spawner multi-identity configuration. active includes every run mode;
-// activeInteractive is the exact "interview" subset. Embedders should wire this
-// method to a satellite heartbeat's GetActiveSessionCounts callback so both
-// fields are sampled under one spawner lock.
+// activeInteractive is the exact PTY "interactive" subset and excludes interview
+// mode. Embedders should wire this method to a satellite heartbeat's
+// GetActiveSessionCounts callback so both fields are sampled under one spawner
+// lock.
 func (d *Daemon) ActiveSessionCounts() (active, activeInteractive int) {
 	return d.spawnerActiveSessionCounts()
 }

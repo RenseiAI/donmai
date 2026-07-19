@@ -30,10 +30,11 @@ type HeartbeatOptions struct {
 
 	// GetActiveSessionCounts returns one coherent occupancy snapshot. active is
 	// the unclassed count across every run mode; activeInteractive is the exact
-	// "interview" subset. Both values are sampled together so concurrent session
-	// lifecycle changes cannot split them across different instants. A configured
-	// callback classifies interactive occupancy, so the outbound body includes
-	// `activeInteractiveCount` even when its value is zero.
+	// PTY "interactive" subset, excluding interview mode. Both values are sampled
+	// together so concurrent session lifecycle changes cannot split them across
+	// different instants. A configured callback classifies interactive occupancy,
+	// so the outbound body includes `activeInteractiveCount` even when its value
+	// is zero.
 	//
 	// Optional and nil-safe: nil falls back to GetActiveCount and, when configured,
 	// the legacy GetActiveInteractiveCount callback below. New embedders should use
@@ -44,7 +45,9 @@ type HeartbeatOptions struct {
 	// occupancy callback. It remains source-compatible with embedders that adopted
 	// the initial activeInteractiveCount contract before GetActiveSessionCounts was
 	// introduced. When the paired callback above is nil, sendOne samples
-	// GetActiveCount first and this callback second; nil omits the interactive key.
+	// GetActiveCount first and this callback second. A sample outside the subset
+	// invariant (0 <= activeInteractive <= active) is omitted and logged; nil omits
+	// the interactive key because occupancy classification is unavailable.
 	//
 	// Deprecated: use GetActiveSessionCounts to avoid a torn occupancy pair during
 	// concurrent session lifecycle changes.
@@ -264,7 +267,15 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		activeCount = h.opts.GetActiveCount()
 		if h.opts.GetActiveInteractiveCount != nil {
 			interactive := h.opts.GetActiveInteractiveCount()
-			activeInteractive = &interactive
+			if interactive < 0 || interactive > activeCount {
+				h.opts.LogWarn(
+					"heartbeat: omitting invalid legacy occupancy sample: activeCount=%d activeInteractiveCount=%d",
+					activeCount,
+					interactive,
+				)
+			} else {
+				activeInteractive = &interactive
+			}
 		}
 	}
 
@@ -410,9 +421,9 @@ func (h *HeartbeatService) SetCredentials(workerID, jwt string) {
 //	{ activeCount, activeInteractiveCount?, maxSessions?, load?,
 //	  allowlistHash?, allowlist?, appliedMutations?, mutationFailures? }
 //
-// activeInteractiveCount is the interactive-occupancy split of activeCount
-// (interview-mode sessions); allowlistHash + allowlist are Phase 1d fields;
-// appliedMutations + mutationFailures are Phase 2c ACK fields.
+// activeInteractiveCount is the PTY interactive-occupancy split of activeCount
+// (Mode == "interactive"; interview mode is excluded); allowlistHash + allowlist
+// are Phase 1d fields; appliedMutations + mutationFailures are Phase 2c ACK fields.
 type heartbeatRequestBody struct {
 	ActiveCount int `json:"activeCount"`
 	// ActiveInteractiveCount is a *int so a nil (unreported) value drops the
