@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.53.0 — 2026-07-20
+
 ### Features
 
 - **Per-session credential-socket capabilities.** The Go and TypeScript
