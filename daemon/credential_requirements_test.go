@@ -164,13 +164,13 @@ func TestCredentialMetadata_GroupAndNameOrderPreserved(t *testing.T) {
 		t.Errorf("SessionDetail changed requirement groups: got %#v want %#v", detail.CredentialRequirements, item.CredentialRequirements)
 	}
 
-	encoded, err := json.Marshal(detail)
+	encoded, err := json.Marshal(spec)
 	if err != nil {
-		t.Fatalf("marshal SessionDetail: %v", err)
+		t.Fatalf("marshal SessionSpec: %v", err)
 	}
-	var roundTripped SessionDetail
+	var roundTripped SessionSpec
 	if err := json.Unmarshal(encoded, &roundTripped); err != nil {
-		t.Fatalf("unmarshal SessionDetail: %v", err)
+		t.Fatalf("unmarshal SessionSpec: %v", err)
 	}
 	if len(roundTripped.CredentialRequirements) != 4 {
 		t.Fatalf("round-tripped group count = %d, want 4; JSON=%s", len(roundTripped.CredentialRequirements), encoded)
