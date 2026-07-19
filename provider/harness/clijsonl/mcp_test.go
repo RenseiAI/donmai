@@ -30,7 +30,12 @@ func TestWriteMCPConfig_HappyPath(t *testing.T) {
 			Name:    "af_linear",
 			Command: "node",
 			Args:    []string{"dist/stdio.js", "--plugin", "linear"},
-			Env:     map[string]string{"FOO": "bar"},
+			Env: map[string]string{
+				"FOO":               "bar",
+				"ATTACH_TOKEN":      "must-not-serialize",
+				"ATTACH_TOKEN_FILE": "/must/not/serialize",
+				"ATTACH_URL":        "wss://must-not-serialize.invalid",
+			},
 		},
 		{
 			Name:    "af_code",
@@ -82,6 +87,11 @@ func TestWriteMCPConfig_HappyPath(t *testing.T) {
 	}
 	if linear.Env["FOO"] != "bar" {
 		t.Errorf("env FOO = %q, want bar", linear.Env["FOO"])
+	}
+	for _, key := range []string{"ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL"} {
+		if _, leaked := linear.Env[key]; leaked {
+			t.Errorf("serialized runner-only %s: %v", key, linear.Env)
+		}
 	}
 }
 

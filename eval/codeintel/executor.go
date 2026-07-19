@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // Budget is the equal per-arm turn/token cap (brief 06 §4.3.4). Both arms MUST
@@ -155,7 +156,7 @@ func (e PlumbingExecutor) executeWithCLI(ctx context.Context, spec ArmSpec, snap
 	}
 	full := append([]string{"code", sub}, cliArgs...)
 	cmd := exec.CommandContext(ctx, spec.DonmaiBin, full...) // nolint:gosec // donmai bin + fixed subcommand.
-	cmd.Env = spec.Env
+	cmd.Env = runtimeenv.FilterRunnerOnly(spec.Env)
 	cmd.Dir = spec.Workarea
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -198,7 +199,7 @@ func (e PlumbingExecutor) grep(ctx context.Context, spec ArmSpec, query string) 
 	}
 	args := []string{"-rn", "--exclude-dir=.git", query, "."}
 	cmd := exec.CommandContext(ctx, "grep", args...) // nolint:gosec // fixed grep args; query derived from the prompt.
-	cmd.Env = spec.Env
+	cmd.Env = runtimeenv.FilterRunnerOnly(spec.Env)
 	cmd.Dir = spec.Workarea
 	var out bytes.Buffer
 	cmd.Stdout = &out

@@ -102,6 +102,58 @@ func TestHandle_Inject_HappyPath(t *testing.T) {
 	}
 }
 
+func TestHandle_Inject_ChildEnvSanitized(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake CLI uses /bin/sh; skip on windows")
+	}
+	t.Setenv("ATTACH_TOKEN", "parent-secret")
+	t.Setenv("ATTACH_TOKEN_FILE", "/parent/token")
+	t.Setenv("ATTACH_URL", "wss://parent.invalid/v1/rooms/room-1")
+
+	report := filepath.Join(t.TempDir(), "env-report.log")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "env-check-claude.sh")
+	script := "#!/bin/sh\n" +
+		"mode=parent\n" +
+		"case \" $* \" in *' --resume '*) mode=resume ;; esac\n" +
+		"status=leaked\n" +
+		"if [ \"${ATTACH_TOKEN+x}${ATTACH_TOKEN_FILE+x}${ATTACH_URL+x}\" = \"\" ] && [ \"$SAFE_CHILD_ENV\" = \"present\" ]; then status=clean; fi\n" +
+		"printf '%s:%s\\n' \"$mode\" \"$status\" >> " + report + "\n" +
+		"printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-env-1\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"num_turns\":1,\"usage\":{}}'\n"
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write fake cli: %v", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+		t.Fatalf("chmod fake cli: %v", err)
+	}
+
+	h := spawnFake(t, path, agent.Spec{
+		Prompt: "first turn",
+		Env: map[string]string{
+			"ATTACH_TOKEN":      "spec-secret",
+			"ATTACH_TOKEN_FILE": "/spec/token",
+			"ATTACH_URL":        "wss://spec.invalid/v1/rooms/room-1",
+			"SAFE_CHILD_ENV":    "present",
+		},
+	})
+	defer func() { _ = h.Stop(t.Context()) }()
+
+	_ = drainUntilResult(t, h)
+	if err := h.Inject(t.Context(), "follow up"); err != nil {
+		t.Fatalf("Inject: %v", err)
+	}
+	_ = drainUntilResult(t, h)
+
+	body, err := os.ReadFile(report) //nolint:gosec // report is a test-owned temp file
+	if err != nil {
+		t.Fatalf("read env report: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(body)), "parent:clean\nresume:clean"; got != want {
+		t.Fatalf("child env report:\n got: %q\nwant: %q", got, want)
+	}
+}
+
 func TestHandle_Inject_BeforeInit_Errors(t *testing.T) {
 	t.Parallel()
 

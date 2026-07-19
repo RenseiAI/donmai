@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // DefaultBinary is the executable name probed on $PATH at construction.
@@ -790,12 +791,7 @@ func drainStderr(r io.ReadCloser, buf *boundedBuffer, logger *slog.Logger) {
 }
 
 func composeEnv(parentEnv []string, specEnv map[string]string) []string {
-	out := make([]string, 0, len(parentEnv)+len(specEnv))
-	out = append(out, parentEnv...)
-	for k, v := range specEnv {
-		out = append(out, k+"="+v)
-	}
-	return out
+	return runtimeenv.ComposeChildEnv(parentEnv, specEnv)
 }
 
 // boundedBuffer accumulates the last N bytes written, dropping the

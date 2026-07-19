@@ -307,8 +307,8 @@ func (fakeExitErr) Error() string { return "exit status 1" }
 // TestSpawnClaude_RealSubprocess exercises the real exec seam (never touched by
 // the fakeSpawn tests): it stages a fake `claude` on a temp PATH and asserts the
 // two contamination-critical invariants of spawnClaude — the child runs in the
-// provisioned workarea (cmd.Dir), and it receives the arm env VERBATIM (cmd.Env,
-// not merged with os.Environ) — plus the argv/lookup guards. Without this, an
+// provisioned workarea (cmd.Dir), and it receives the safe arm env without a
+// merge from os.Environ or runner-only attach controls — plus the argv/lookup guards. Without this, an
 // env- or cwd-handling regression would silently defeat the A/B isolation and no
 // fake-spawner test would go red.
 func TestSpawnClaude_RealSubprocess(t *testing.T) {
@@ -317,17 +317,23 @@ func TestSpawnClaude_RealSubprocess(t *testing.T) {
 	}
 	workarea := t.TempDir()
 	binDir := t.TempDir()
-	// Fake claude: prove cwd by dropping a marker file in it, and prove the arm env
-	// passthrough by echoing an env var into the terminal result.
+	// Fake claude: prove cwd by dropping a marker file in it, prove safe arm env
+	// passthrough, and prove runner-only attach controls are absent.
 	// Use only shell builtins (`:` redirection, printf) — the fake claude's PATH is
 	// just binDir, so an external `touch` would not resolve. The redirect creating
 	// ./ran-here is relative to the child cwd, which spawnClaude must set to the
 	// workarea.
-	script := "#!/bin/sh\n: > ./ran-here\nprintf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"marker=%s\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"cache_read_input_tokens\":0}}\\n' \"$CI_EVAL_MARKER\"\n"
+	script := "#!/bin/sh\n: > ./ran-here\nattach=leaked\nif [ \"${ATTACH_TOKEN+x}${ATTACH_TOKEN_FILE+x}${ATTACH_URL+x}\" = \"\" ]; then attach=clean; fi\nprintf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"marker=%s,attach=%s\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"cache_read_input_tokens\":0}}\\n' \"$CI_EVAL_MARKER\" \"$attach\"\n"
 	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o755); err != nil { // nolint:gosec // test fixture must be executable
 		t.Fatalf("write fake claude: %v", err)
 	}
-	env := []string{"PATH=" + binDir, "CI_EVAL_MARKER=env-ok"}
+	env := []string{
+		"PATH=" + binDir,
+		"CI_EVAL_MARKER=env-ok",
+		"ATTACH_TOKEN=explicit-secret",
+		"ATTACH_TOKEN_FILE=/explicit/token",
+		"ATTACH_URL=wss://explicit.invalid/v1/rooms/room-1",
+	}
 
 	stdout, wait, err := spawnClaude(context.Background(), workarea, []string{"claude"}, env)
 	if err != nil {
@@ -343,9 +349,9 @@ func TestSpawnClaude_RealSubprocess(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(workarea, "ran-here")); statErr != nil {
 		t.Errorf("claude did not run in the provisioned workarea: %v", statErr)
 	}
-	// cmd.Env was the arm env verbatim: the child saw CI_EVAL_MARKER.
-	if ps.finalAnswer != "marker=env-ok" {
-		t.Errorf("arm env not passed to the child; result = %q", ps.finalAnswer)
+	// cmd.Env carried the safe arm value but removed runner-only controls.
+	if ps.finalAnswer != "marker=env-ok,attach=clean" {
+		t.Errorf("arm env boundary mismatch; result = %q", ps.finalAnswer)
 	}
 
 	// Guard: empty argv is an error, not a panic.

@@ -74,6 +74,19 @@ type SpawnerOptions struct {
 	// the input env unchanged (no-op, same as the nil hook case).
 	OnPreSpawn func(spec SessionSpec, env []string) ([]string, error)
 
+	// OnSpawnAborted is the optional rollback partner for OnPreSpawn. It is
+	// invoked synchronously exactly once when OnPreSpawn returned nil (and
+	// therefore transferred ownership of any resources it acquired) but the
+	// subsequent cmd.Start failed. The error is the same wrapped
+	// "start worker" error AcceptWork returns.
+	//
+	// It is deliberately NOT invoked when OnPreSpawn itself fails: the hook
+	// never transferred ownership, so it remains responsible for releasing
+	// anything acquired before returning its error. It is also never invoked
+	// after a successful start; SessionEventEnded owns cleanup from that point.
+	// A nil hook is a no-op.
+	OnSpawnAborted func(spec SessionSpec, err error)
+
 	// WorktreeParentDir is the directory under which the spawned worker
 	// creates each per-session worktree (<WorktreeParentDir>/<sessionID>).
 	// It MUST match the parent the worker resolves (the worker uses
@@ -632,12 +645,14 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// A non-nil error aborts the spawn (fail-closed). The child process is
 	// never started and AcceptWork surfaces the error to the caller so the
 	// daemon's poll loop can NACK the session.
+	preSpawnOwnsCleanup := false
 	if s.opts.OnPreSpawn != nil {
 		next, hookErr := s.opts.OnPreSpawn(spec, cmd.Env)
 		if hookErr != nil {
 			cancel()
 			return nil, fmt.Errorf("pre-spawn hook: %w", hookErr)
 		}
+		preSpawnOwnsCleanup = true
 		if next != nil {
 			cmd.Env = next
 		}
@@ -648,7 +663,11 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 
 	if err := cmd.Start(); err != nil {
 		cancel()
-		return nil, fmt.Errorf("start worker: %w", err)
+		startErr := fmt.Errorf("start worker: %w", err)
+		if preSpawnOwnsCleanup && s.opts.OnSpawnAborted != nil {
+			s.opts.OnSpawnAborted(spec, startErr)
+		}
+		return nil, startErr
 	}
 
 	pid := 0

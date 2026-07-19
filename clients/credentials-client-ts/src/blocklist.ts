@@ -28,6 +28,7 @@ export const AGENT_ENV_BLOCKLIST: readonly string[] = Object.freeze([
   'WORKER_API_KEY',
   'DONMAI_DAEMON_TOKEN',
   'DONMAI_ORCHESTRATOR_URL',
+  'DONMAI_CREDENTIAL_CAPABILITY',
 ]);
 
 const BLOCKLIST_SET: ReadonlySet<string> = new Set(AGENT_ENV_BLOCKLIST);

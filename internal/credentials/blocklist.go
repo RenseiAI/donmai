@@ -34,6 +34,7 @@ import "strings"
 //   - WORKER_API_KEY               — worker-protocol bearer (rsk_*)
 //   - DONMAI_DAEMON_TOKEN          — orchestrator auth token (daemon registration / re-auth)
 //   - DONMAI_ORCHESTRATOR_URL      — orchestrator base URL (internal routing surface)
+//   - DONMAI_CREDENTIAL_CAPABILITY — per-session credential-socket capability
 var AgentEnvBlocklist = []string{
 	"DONMAI_DAEMON_JWT",
 	"DONMAI_DAEMON_API_KEY",
@@ -46,6 +47,7 @@ var AgentEnvBlocklist = []string{
 	"WORKER_API_KEY",
 	"DONMAI_DAEMON_TOKEN",
 	"DONMAI_ORCHESTRATOR_URL",
+	"DONMAI_CREDENTIAL_CAPABILITY",
 }
 
 // IsBlocked reports whether name is in AgentEnvBlocklist.

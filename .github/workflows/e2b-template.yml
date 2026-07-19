@@ -2,76 +2,98 @@ name: e2b-template
 
 # Builds the `donmai-worker` E2B sandbox template in CI.
 #
-# GitHub-hosted runners provide Docker, so this avoids requiring local Docker
-# or interactive `e2b auth login`. The e2b CLI (v2.10.x) authenticates the
-# `template create` build path non-interactively via the E2B_API_KEY env var
-# (the org/team API key from https://e2b.dev/dashboard?tab=keys). NOTE: despite
-# what an earlier version of this file claimed, `template create` does NOT use
-# E2B_ACCESS_TOKEN — that var only authenticates account-management commands.
-# Verified against @e2b/cli 2.10.2: the build path calls
-# `apiKey = process.env.E2B_API_KEY` and errors "You must be logged in ... set
-# the E2B_API_KEY environment variable" when it is missing.
+# The Dockerfile build authenticates non-interactively with E2B_API_KEY (the
+# org/team API key from https://e2b.dev/dashboard?tab=keys).
 #
-# Runs on manual dispatch AND automatically on every release tag (push: tags
-# v*), so the baked worker binary can never silently lag the runner code — the
-# stale-template failure mode that blocked cloud on-demand SDLC (2026-07-06).
-# release.yml fires on the same tag (notarized binary release); the two run
-# independently. Add the E2B_API_KEY repo secret before running it (Settings ->
-# Secrets and variables -> Actions). E2B_ACCESS_TOKEN is also passed through
-# when present, for any management call.
+# Every release writes the verified semantic version to an explicit E2B target
+# such as `donmai-worker:v0.53.0`. Automatic stable tag pushes also assign
+# `default` to the same build, preserving the rolling target. Prereleases and
+# manual retries rebuild only the version target, so neither can move `default`.
+#
+# @e2b/cli 2.13.3 help confirms `template create` accepts only an untagged name
+# constrained to lowercase letters, numbers, dashes, and underscores. E2B's
+# supported SDK `Template.build(template, "name:tag", { tags: [...] })` API is
+# therefore used for the version and optional rolling tags.
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version stamped into the donmai binary (e.g. v0.10.0)"
-        required: false
-        default: "v0.10.0"
+      tag:
+        description: "Existing release tag to retry (for example, v1.2.3)"
+        required: true
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-template:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
+      # Keep the current workflow's verifier and tagged-build wrapper available
+      # when a manual retry checks out a release that predates these scripts.
+      - name: Checkout release automation
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Stage release automation
+        run: |
+          install -m 0755 scripts/verify-release-tag.sh "${RUNNER_TEMP}/verify-release-tag.sh"
+          install -m 0644 scripts/build-e2b-template.cjs "${RUNNER_TEMP}/build-e2b-template.cjs"
+
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Verify immutable release ref
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          "${RUNNER_TEMP}/verify-release-tag.sh" --verify \
+            "${RELEASE_TAG}" \
+            "${GITHUB_EVENT_NAME}" \
+            "${GITHUB_OUTPUT}" \
+            "${GITHUB_ENV}"
+          if [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
+            echo "::notice::Manual retry rebuilds only donmai-worker:${RELEASE_TAG}; default is unchanged."
+          fi
+
       - name: Guard - require E2B_API_KEY secret
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
         run: |
-          if [ -z "${E2B_API_KEY}" ]; then
+          set -euo pipefail
+          if [[ -z "${E2B_API_KEY}" ]]; then
             echo "::error::E2B_API_KEY secret is not set."
-            echo "::error::The e2b CLI 'template create' build path authenticates via E2B_API_KEY (NOT E2B_ACCESS_TOKEN)."
-            echo "::error::Add it at: donmai repo Settings -> Secrets and variables -> Actions."
-            echo "::error::Get the key from https://e2b.dev/dashboard?tab=keys (the org/team API key)."
+            echo "::error::Add the org/team API key from https://e2b.dev/dashboard?tab=keys."
             exit 1
           fi
           echo "E2B_API_KEY is present."
 
-      - name: Checkout
-        uses: actions/checkout@v6
-
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25.10"
+          go-version-file: go.mod
           check-latest: true
 
-      - name: Install e2b CLI
+      - name: Install pinned E2B CLI and SDK
         run: |
-          npm install -g @e2b/cli
+          set -euo pipefail
+          npm install --global @e2b/cli@2.13.3 e2b@2.33.1
           e2b --version
+          printf 'NODE_PATH=%s\n' "$(npm root --global)" >> "${GITHUB_ENV}"
 
       - name: Cross-compile donmai binary (linux/amd64)
         env:
-          # On workflow_dispatch this is the input (default v0.10.0). On a tag
-          # push github.event.inputs.version is empty, so fall back to the tag
-          # ref (e.g. v0.50.2) — otherwise the binary would stamp an empty
-          # version on the auto-rebuild.
-          VERSION: ${{ github.event.inputs.version || github.ref_name }}
+          VERSION: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
@@ -82,81 +104,24 @@ jobs:
           chmod +x worker/e2b/donmai
           ls -lh worker/e2b/donmai
 
-      - name: Build E2B template (donmai-worker)
+      - name: Build versioned E2B template
+        id: template
         working-directory: worker/e2b
         env:
-          # `template create` authenticates via E2B_API_KEY (verified against
-          # @e2b/cli 2.10.2). E2B_ACCESS_TOKEN is passed through too for any
-          # management call, but the build path requires E2B_API_KEY.
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
-          E2B_ACCESS_TOKEN: ${{ secrets.E2B_ACCESS_TOKEN }}
-        run: |
-          set -euo pipefail
-          # e2b CLI v2.10.2: `template create <template-name>` builds
-          # e2b.Dockerfile from the cwd and pushes it. The name is a POSITIONAL
-          # argument (there is no -n flag). When a start command (-c) is set, the
-          # CLI requires a matching ready command (--ready-cmd, no short flag) —
-          # for a keep-alive sandbox `true` (always ready) suffices. The platform
-          # e2b provider execs `donmai agent run` inline, so the start command is
-          # just a keep-alive (`sleep infinity`).
-          #
-          # NOTE: `template create` (unlike the legacy `template init`/`build`
-          # flow) does NOT write the resulting template_id back into e2b.toml. It
-          # only prints "Template created with ID: <id>" to stdout. We tee the
-          # output so the next step can parse the ID and persist it.
-          e2b template create donmai-worker \
-            -d e2b.Dockerfile \
-            -c "sleep infinity" \
-            --ready-cmd "true" 2>&1 | tee /tmp/e2b-build.log
+          E2B_TEMPLATE_REF: ${{ steps.release.outputs.e2b_template_ref }}
+          E2B_ADDITIONAL_TAGS: ${{ steps.release.outputs.e2b_additional_tags }}
+        run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
 
-      - name: Surface template ID
-        working-directory: worker/e2b
+      - name: Summarize E2B template build
+        env:
+          TEMPLATE_REF: ${{ steps.template.outputs.template_ref }}
+          TEMPLATE_ID: ${{ steps.template.outputs.template_id }}
+          BUILD_ID: ${{ steps.template.outputs.build_id }}
         run: |
-          set -euo pipefail
-          echo "===================================================="
-          echo "e2b.toml after build:"
-          cat e2b.toml
-          echo "===================================================="
-          # Prefer template_id already in e2b.toml; otherwise parse the build
-          # log line: "... Template created with ID: <id>, Build ID: <buildid>".
-          TEMPLATE_ID="$(grep -E '^[[:space:]]*template_id[[:space:]]*=' e2b.toml | head -1 | sed -E 's/.*=[[:space:]]*"?([^"]*)"?.*/\1/' || true)"
-          if [ -z "${TEMPLATE_ID}" ] && [ -f /tmp/e2b-build.log ]; then
-            TEMPLATE_ID="$(grep -oE 'Template created with ID: [a-z0-9]+' /tmp/e2b-build.log | head -1 | sed -E 's/.*ID: //' || true)"
-            if [ -n "${TEMPLATE_ID}" ]; then
-              echo "Parsed template_id from build log: ${TEMPLATE_ID}"
-              # Persist it into e2b.toml so the image can be rebuilt / referenced
-              # deterministically and the commit step records it.
-              if grep -qE '^[[:space:]]*template_id[[:space:]]*=' e2b.toml; then
-                sed -i -E "s|^[[:space:]]*template_id[[:space:]]*=.*|template_id = \"${TEMPLATE_ID}\"|" e2b.toml
-              else
-                printf 'template_id = "%s"\n' "${TEMPLATE_ID}" >> e2b.toml
-              fi
-              echo "e2b.toml after writing template_id:"
-              cat e2b.toml
-            fi
-          fi
-          if [ -n "${TEMPLATE_ID}" ]; then
-            echo "::notice::donmai-worker template_id = ${TEMPLATE_ID}"
-            echo "## donmai-worker template_id: \`${TEMPLATE_ID}\`" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::Could not parse template_id from e2b.toml or build log; check the build log above."
-          fi
-
-      - name: Commit updated e2b.toml (template_id)
-        # On a tag push the checkout is a detached HEAD at the tag, so a
-        # push to main is unsafe/unwanted; same-name rebuilds reuse the existing
-        # template_id (nothing new to record). Only record on manual dispatch
-        # (which runs on a branch and may be a first-time template_id capture).
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- worker/e2b/e2b.toml; then
-            echo "No changes to worker/e2b/e2b.toml; nothing to commit."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add worker/e2b/e2b.toml
-          git commit -m "chore(e2b): record donmai-worker template id" \
-            -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-          git push origin HEAD:main
+          {
+            printf '## E2B template release\n\n'
+            printf -- "- Target: \`%s\`\n" "${TEMPLATE_REF}"
+            printf -- "- Template ID: \`%s\`\n" "${TEMPLATE_ID}"
+            printf -- "- Build ID: \`%s\`\n" "${BUILD_ID}"
+          } >> "${GITHUB_STEP_SUMMARY}"

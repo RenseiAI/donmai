@@ -1,6 +1,6 @@
 module github.com/RenseiAI/donmai
 
-go 1.25.10
+go 1.25.12
 
 require (
 	charm.land/bubbletea/v2 v2.0.7

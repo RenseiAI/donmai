@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/internal/gitexec"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // commandRunner runs a single command in a working directory and returns its
@@ -15,7 +16,8 @@ import (
 // without a real repository — the Go equivalent of the legacy TS suite mocking
 // child_process.exec.
 //
-// extraEnv entries (each "KEY=VALUE") are appended to the inherited environment.
+// extraEnv entries (each "KEY=VALUE") are appended to the inherited environment
+// after runner-only attach controls are removed from both layers.
 type commandRunner interface {
 	run(ctx context.Context, dir string, extraEnv []string, name string, args ...string) (string, error)
 }
@@ -31,11 +33,7 @@ func (execRunner) run(ctx context.Context, dir string, extraEnv []string, name s
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	extraEnv = gitNonInteractiveEnv(name, extraEnv)
-	if len(extraEnv) > 0 {
-		// nil Env means inherit the parent's environment; we must materialize
-		// it before appending so the extra entries do not replace it wholesale.
-		cmd.Env = append(cmd.Environ(), extraEnv...)
-	}
+	cmd.Env = append(runtimeenv.FilterRunnerOnly(cmd.Environ()), runtimeenv.FilterRunnerOnly(extraEnv)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

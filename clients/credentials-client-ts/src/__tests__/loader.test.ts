@@ -32,6 +32,12 @@ function restoreEnv(): void {
   }
 }
 
+interface HelloFrame {
+  type: 'HELLO';
+  sessionId: string;
+  capability?: string;
+}
+
 interface FakeServerOptions {
   /** Initial env to send back in the INITIAL message. */
   initial?: Record<string, string>;
@@ -39,8 +45,10 @@ interface FakeServerOptions {
   withholdInitial?: boolean;
   /** If true, send malformed INITIAL JSON. */
   malformedInitial?: boolean;
+  /** If true, decode only the legacy type/sessionId HELLO fields. */
+  legacyHelloOnly?: boolean;
   /** Called once the server receives a HELLO. */
-  onHello?: (hello: { sessionId: string }, socket: net.Socket) => void;
+  onHello?: (hello: HelloFrame, socket: net.Socket) => void;
   /** Called once the server receives a BYE. */
   onBye?: () => void;
 }
@@ -48,8 +56,9 @@ interface FakeServerOptions {
 interface FakeServerHandle {
   path: string;
   pushUpdate: (delta: Record<string, string>) => void;
+  pushFrame: (frame: unknown) => void;
   close: () => Promise<void>;
-  helloReceived: () => Promise<{ sessionId: string }>;
+  helloReceived: () => Promise<HelloFrame>;
   byeReceived: () => Promise<void>;
 }
 
@@ -63,8 +72,8 @@ async function startFakeServer(
   const sockPath = newSocketPath();
   let activeConn: net.Socket | null = null;
 
-  let helloResolve: (h: { sessionId: string }) => void = () => undefined;
-  const helloPromise = new Promise<{ sessionId: string }>((resolve) => {
+  let helloResolve: (h: HelloFrame) => void = () => undefined;
+  const helloPromise = new Promise<HelloFrame>((resolve) => {
     helloResolve = resolve;
   });
   let byeResolve: () => void = () => undefined;
@@ -89,11 +98,17 @@ async function startFakeServer(
         } catch {
           continue;
         }
-        const msg = parsed as { type?: string; sessionId?: string };
+        const msg = parsed as { type?: string; sessionId?: string; capability?: unknown };
         if (msg.type === 'HELLO') {
-          const sid = msg.sessionId ?? '';
-          helloResolve({ sessionId: sid });
-          options.onHello?.({ sessionId: sid }, socket);
+          const hello: HelloFrame = {
+            type: 'HELLO',
+            sessionId: msg.sessionId ?? '',
+          };
+          if (!options.legacyHelloOnly && typeof msg.capability === 'string') {
+            hello.capability = msg.capability;
+          }
+          helloResolve(hello);
+          options.onHello?.(hello, socket);
           if (options.withholdInitial) {
             // Do nothing — let the client timeout.
           } else if (options.malformedInitial) {
@@ -135,6 +150,10 @@ async function startFakeServer(
         }) + '\n',
       );
     },
+    pushFrame(frame) {
+      if (!activeConn || activeConn.destroyed || !activeConn.writable) return;
+      activeConn.write(JSON.stringify(frame) + '\n');
+    },
     async close() {
       if (activeConn && !activeConn.destroyed) {
         activeConn.destroy();
@@ -166,6 +185,7 @@ beforeEach(() => {
   // Clean slate for each test.
   delete process.env.DONMAI_CREDENTIAL_SOCKET;
   delete process.env.DONMAI_CREDENTIAL_SESSION_ID;
+  delete process.env.DONMAI_CREDENTIAL_CAPABILITY;
 });
 
 afterEach(() => {
@@ -176,6 +196,7 @@ describe('blocklist helpers', () => {
   it('isBlocked returns true for blocklisted names', () => {
     expect(isBlocked('DONMAI_DAEMON_JWT')).toBe(true);
     expect(isBlocked('WORKER_API_KEY')).toBe(true);
+    expect(isBlocked('DONMAI_CREDENTIAL_CAPABILITY')).toBe(true);
     expect(isBlocked('FOO')).toBe(false);
   });
 
@@ -183,6 +204,7 @@ describe('blocklist helpers', () => {
     const out = filterBlocklist({
       FOO: 'bar',
       DONMAI_DAEMON_JWT: 'secret',
+      DONMAI_CREDENTIAL_CAPABILITY: 'handshake-only',
       BAR: 'baz',
     });
     expect(out).toEqual({ FOO: 'bar', BAR: 'baz' });
@@ -207,13 +229,16 @@ describe('createLoader — standalone mode', () => {
 
   it('blocks blocklisted names even in standalone mode', async () => {
     process.env.DONMAI_DAEMON_JWT = 'secret';
+    process.env.DONMAI_CREDENTIAL_CAPABILITY = 'handshake-only';
     process.env.FOO = 'visible';
     const loader = await createLoader({ logger: silentLogger() });
     try {
       expect(loader.get('DONMAI_DAEMON_JWT')).toBeUndefined();
+      expect(loader.get('DONMAI_CREDENTIAL_CAPABILITY')).toBeUndefined();
       expect(loader.get('FOO')).toBe('visible');
       const all = loader.all();
       expect(all.DONMAI_DAEMON_JWT).toBeUndefined();
+      expect(all.DONMAI_CREDENTIAL_CAPABILITY).toBeUndefined();
       expect(all.FOO).toBe('visible');
     } finally {
       await loader.close();
@@ -242,7 +267,11 @@ describe('createLoader — standalone mode', () => {
 describe('createLoader — daemon mode', () => {
   it('happy path: HELLO/INITIAL populates snapshot', async () => {
     const server = await startFakeServer({
-      initial: { FOO: 'from-daemon', DONMAI_DAEMON_JWT: 'blocked' },
+      initial: {
+        FOO: 'from-daemon',
+        DONMAI_DAEMON_JWT: 'blocked',
+        DONMAI_CREDENTIAL_CAPABILITY: 'must-not-enter-snapshot',
+      },
     });
     process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
     const loader = await createLoader({
@@ -254,8 +283,106 @@ describe('createLoader — daemon mode', () => {
       expect(loader.get('FOO')).toBe('from-daemon');
       // Blocklist applied on the daemon's INITIAL.
       expect(loader.get('DONMAI_DAEMON_JWT')).toBeUndefined();
+      expect(loader.get('DONMAI_CREDENTIAL_CAPABILITY')).toBeUndefined();
+      expect(loader.all().DONMAI_CREDENTIAL_CAPABILITY).toBeUndefined();
       const hello = await server.helloReceived();
       expect(hello.sessionId).toBe('test-session-1');
+    } finally {
+      await loader.close();
+      await server.close();
+    }
+  });
+
+  it('serializes an explicit HELLO capability', async () => {
+    const server = await startFakeServer({ initial: {} });
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    const loader = await createLoader({
+      sessionId: 'explicit-capability',
+      capability: 'cap-explicit',
+      logger: silentLogger(),
+    });
+    try {
+      expect(loader.mode).toBe('daemon');
+      await expect(server.helloReceived()).resolves.toEqual({
+        type: 'HELLO',
+        sessionId: 'explicit-capability',
+        capability: 'cap-explicit',
+      });
+    } finally {
+      await loader.close();
+      await server.close();
+    }
+  });
+
+  it('uses DONMAI_CREDENTIAL_CAPABILITY when the option is absent', async () => {
+    const server = await startFakeServer({ initial: {} });
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_CAPABILITY = 'cap-from-env';
+    const loader = await createLoader({
+      sessionId: 'environment-capability',
+      logger: silentLogger(),
+    });
+    try {
+      expect((await server.helloReceived()).capability).toBe('cap-from-env');
+    } finally {
+      await loader.close();
+      await server.close();
+    }
+  });
+
+  it('prefers a non-empty capability option over the environment', async () => {
+    const server = await startFakeServer({ initial: {} });
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    process.env.DONMAI_CREDENTIAL_CAPABILITY = 'cap-from-env';
+    const loader = await createLoader({
+      sessionId: 'capability-precedence',
+      capability: 'cap-from-option',
+      logger: silentLogger(),
+    });
+    try {
+      expect((await server.helloReceived()).capability).toBe('cap-from-option');
+    } finally {
+      await loader.close();
+      await server.close();
+    }
+  });
+
+  it('omits capability when neither option nor environment provides one', async () => {
+    const server = await startFakeServer({ initial: {} });
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    const loader = await createLoader({
+      sessionId: 'legacy-shape',
+      logger: silentLogger(),
+    });
+    try {
+      await expect(server.helloReceived()).resolves.toEqual({
+        type: 'HELLO',
+        sessionId: 'legacy-shape',
+      });
+    } finally {
+      await loader.close();
+      await server.close();
+    }
+  });
+
+  it('completes HELLO/INITIAL with a legacy server that decodes only type/sessionId', async () => {
+    const server = await startFakeServer({
+      initial: { FOO: 'legacy-server' },
+      legacyHelloOnly: true,
+    });
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    const loader = await createLoader({
+      sessionId: 'legacy-server',
+      capability: 'additive-capability',
+      logger: silentLogger(),
+    });
+    try {
+      expect(loader.mode).toBe('daemon');
+      expect(loader.get('FOO')).toBe('legacy-server');
+      await expect(server.helloReceived()).resolves.toEqual({
+        type: 'HELLO',
+        sessionId: 'legacy-server',
+      });
     } finally {
       await loader.close();
       await server.close();
@@ -269,14 +396,21 @@ describe('createLoader — daemon mode', () => {
     const logger = silentLogger();
     const loader = await createLoader({
       sessionId: 'timeout-session',
+      capability: 'capability-value-must-not-be-logged',
       handshakeTimeoutMs: 200,
       logger,
     });
     try {
       expect(loader.mode).toBe('standalone');
       expect(loader.get('STANDALONE_FALLBACK_FOO')).toBe('standalone-value');
-      // info-level fallback log surfaced.
+      // info-level fallback log surfaced without the capability value.
       expect(logger.info).toHaveBeenCalled();
+      expect(JSON.stringify(logger.info.mock.calls)).not.toContain(
+        'capability-value-must-not-be-logged',
+      );
+      expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(
+        'capability-value-must-not-be-logged',
+      );
     } finally {
       delete process.env.STANDALONE_FALLBACK_FOO;
       await loader.close();
@@ -302,6 +436,71 @@ describe('createLoader — daemon mode', () => {
     }
   });
 
+  it('uses a fixed data-free diagnostic for a reflected wrong INITIAL type', async () => {
+    const capability = 'reflected-capability-must-not-enter-diagnostic';
+    const server = await startFakeServer({
+      withholdInitial: true,
+      onHello: (hello, socket) => {
+        socket.write(
+          JSON.stringify({
+            type: hello.capability,
+            capability: hello.capability,
+          }) + '\n',
+        );
+      },
+    });
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    const logger = silentLogger();
+    const loader = await createLoader({
+      sessionId: 'wrong-frame-session',
+      capability,
+      handshakeTimeoutMs: 500,
+      logger,
+    });
+    try {
+      expect(loader.mode).toBe('standalone');
+      expect(logger.info).toHaveBeenCalledWith(
+        'credentials-client: daemon handshake failed (expected INITIAL frame); falling back to standalone mode',
+      );
+      const diagnostics = JSON.stringify({
+        info: logger.info.mock.calls,
+        warn: logger.warn.mock.calls,
+      });
+      expect(diagnostics).not.toContain(capability);
+    } finally {
+      await loader.close();
+      await server.close();
+    }
+  });
+
+  it('uses a fixed data-free diagnostic for a reflected unknown frame', async () => {
+    const capability = 'reflected-capability-must-not-enter-warning';
+    const server = await startFakeServer({ initial: { FOO: 'v1' } });
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    const logger = silentLogger();
+    const loader = await createLoader({
+      sessionId: 'unknown-frame-session',
+      capability,
+      logger,
+    });
+    try {
+      expect(loader.mode).toBe('daemon');
+      server.pushFrame({ type: capability, capability });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(logger.warn).toHaveBeenCalledWith(
+        'credentials-client: unknown message type; ignored',
+      );
+      const diagnostics = JSON.stringify({
+        info: logger.info.mock.calls,
+        warn: logger.warn.mock.calls,
+      });
+      expect(diagnostics).not.toContain(capability);
+    } finally {
+      await loader.close();
+      await server.close();
+    }
+  });
+
   it('subscribe delivers UPDATE deltas (blocklist applied)', async () => {
     const server = await startFakeServer({ initial: { FOO: 'v1' } });
     process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
@@ -315,13 +514,19 @@ describe('createLoader — daemon mode', () => {
         received.push(delta);
       });
 
-      server.pushUpdate({ FOO: 'v2', DONMAI_DAEMON_JWT: 'blocked' });
+      server.pushUpdate({
+        FOO: 'v2',
+        DONMAI_DAEMON_JWT: 'blocked',
+        DONMAI_CREDENTIAL_CAPABILITY: 'must-not-rotate',
+      });
       // Give the event loop a couple of ticks to flush the socket.
       await new Promise((r) => setTimeout(r, 50));
       expect(received).toHaveLength(1);
       expect(received[0]).toEqual({ FOO: 'v2' });
       expect(loader.get('FOO')).toBe('v2');
       expect(loader.get('DONMAI_DAEMON_JWT')).toBeUndefined();
+      expect(loader.get('DONMAI_CREDENTIAL_CAPABILITY')).toBeUndefined();
+      expect(loader.all().DONMAI_CREDENTIAL_CAPABILITY).toBeUndefined();
       unsub();
     } finally {
       await loader.close();

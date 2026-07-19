@@ -70,6 +70,10 @@ signs:
 
 homebrew_casks:
   - name: donmai
+    # Only an automatic stable tag push may update the rolling stable cask.
+    # The staged verifier exports false for prereleases and every manual retry,
+    # so replaying an older tag cannot roll Casks/donmai.rb backward.
+    skip_upload: '{{ if eq .Env.GORELEASER_PUBLISH_HOMEBREW "true" }}false{{ else }}true{{ end }}'
     repository:
       owner: RenseiAI
       name: homebrew-tap
@@ -81,6 +85,15 @@ homebrew_casks:
 
 checksum:
   name_template: "checksums.txt"
+
+release:
+  # If GitHub must create the tag while publishing, anchor it to the exact
+  # commit GoReleaser built rather than the repository's moving default branch.
+  target_commitish: "{{ .Commit }}"
+  # Automatic stable tag pushes retain GoReleaser's historical "make latest"
+  # behavior. Prereleases and manual retries export false so neither can replace
+  # the repository's current GitHub Latest release.
+  make_latest: '{{ if eq .Env.GORELEASER_MAKE_LATEST "false" }}false{{ else }}true{{ end }}'
 
 changelog:
   sort: asc

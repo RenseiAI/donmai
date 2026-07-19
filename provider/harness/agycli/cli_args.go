@@ -1,10 +1,10 @@
 package agycli
 
 import (
-	"sort"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // Result-envelope markers. The provider appends an instruction asking `agy`
@@ -79,17 +79,8 @@ func buildPrompt(prompt string, injectEnvelope bool) string {
 // composeEnv builds the child environment by merging parentEnv (typically
 // os.Environ()) with spec.Env. No API key is injected — `agy` authenticates via
 // its own host OAuth. spec.Env keys are sorted for deterministic test output.
-// Per the runner contract spec.Env is pre-filtered by AGENT_ENV_BLOCKLIST.
+// Runner-only attach controls are removed from both layers even when this
+// provider is used directly outside the runner.
 func composeEnv(parentEnv []string, specEnv map[string]string) []string {
-	out := make([]string, 0, len(parentEnv)+len(specEnv))
-	out = append(out, parentEnv...)
-	keys := make([]string, 0, len(specEnv))
-	for k := range specEnv {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		out = append(out, k+"="+specEnv[k])
-	}
-	return out
+	return runtimeenv.ComposeChildEnv(parentEnv, specEnv)
 }

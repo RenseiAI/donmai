@@ -51,6 +51,7 @@ import (
 	"sync"
 
 	"github.com/RenseiAI/donmai/internal/envcompat"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // ErrNotAvailable is returned when the donmai-code binary cannot be found.
@@ -213,6 +214,7 @@ func (r *Runner) run(bin []string, extraArgs []string) (any, error) {
 	argv := bin
 	cmd := exec.Command(argv[0], argv[1:]...) //nolint:gosec
 	cmd.Dir = r.cwd
+	cmd.Env = runtimeenv.FilterRunnerOnly(os.Environ())
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -498,6 +500,7 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 	binArgs = append(binArgs, args...)
 	cmd := exec.Command(binArgs[0], binArgs[1:]...) //nolint:gosec
 	cmd.Dir = r.cwd
+	cmd.Env = runtimeenv.FilterRunnerOnly(os.Environ())
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

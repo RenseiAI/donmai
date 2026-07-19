@@ -20,13 +20,13 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // ErrInjectInFlight is returned by Handle.Inject when a previous Inject
@@ -99,7 +99,11 @@ type Handle struct {
 	// surfaces "No conversation found with session ID: <id>" and exits
 	// non-zero. A live e2e run surfaced this — captured
 	// via the inject stderr ring buffer added in PR #76.
-	cwd    string
+	cwd string
+	// env is the fully composed, runner-control-free environment used by the
+	// parent process. Inject reuses the same snapshot for every resume child so
+	// it cannot fall back to the host's unsanitized inherited environment.
+	env    []string
 	cmd    *exec.Cmd
 	events chan agent.Event
 	logger *slog.Logger
@@ -253,7 +257,8 @@ func spawnRaw(
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
-	cmd.Env = composeEnv(os.Environ(), env)
+	childEnv := composeEnv(os.Environ(), env)
+	cmd.Env = childEnv
 	// Place the child in its own process group so we can signal the
 	// whole group atomically (the binary may fork shell helpers;
 	// sending SIGTERM to the leader alone leaves stdout-inheriting
@@ -305,6 +310,7 @@ func spawnRaw(
 		binary:        binary,
 		mcpConfigPath: mcpConfigPath,
 		cwd:           cwd,
+		env:           append([]string(nil), childEnv...),
 		cmd:           cmd,
 		events:        make(chan agent.Event, eventBufferSize),
 		logger:        slog.With("provider", "claude", "pid", cmd.Process.Pid),
@@ -461,6 +467,7 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 	if h.cwd != "" {
 		cmd.Dir = h.cwd
 	}
+	cmd.Env = append([]string(nil), h.env...)
 	configureProcessGroup(cmd)
 	cmd.Cancel = func() error {
 		signalProcessGroup(cmd, syscall.SIGKILL)
@@ -829,28 +836,10 @@ func resumeArgv(sessionID, prompt string) (argv []string, stdinPrompt string) {
 	return argv, prompt
 }
 
-// composeEnv builds the child process environment by merging
-// parentEnv (typically os.Environ()) with specEnv. The caller (the
-// runner) is responsible for AGENT_ENV_BLOCKLIST filtering before
-// spawning — this driver trusts the env it receives.
-//
-// Order: parentEnv first, then specEnv entries appended; later
-// entries override earlier ones via standard exec.Cmd semantics
-// (the kernel uses the last occurrence of each name on Unix).
+// composeEnv builds the child process environment by merging parentEnv
+// (typically os.Environ()) with specEnv. The runner applies its general agent
+// blocklist before spawning; this driver independently removes runner-only
+// attach controls from both layers so direct provider use cannot leak them.
 func composeEnv(parentEnv []string, specEnv map[string]string) []string {
-	out := make([]string, 0, len(parentEnv)+len(specEnv))
-	out = append(out, parentEnv...)
-	if len(specEnv) == 0 {
-		return out
-	}
-	// Sort keys for deterministic order — important for tests.
-	keys := make([]string, 0, len(specEnv))
-	for k := range specEnv {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		out = append(out, k+"="+specEnv[k])
-	}
-	return out
+	return runtimeenv.ComposeChildEnv(parentEnv, specEnv)
 }

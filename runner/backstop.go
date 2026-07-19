@@ -10,6 +10,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/gitexec"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // ============================================================================
@@ -434,7 +435,7 @@ func runGit(ctx context.Context, cwd string, id gitIdentity, args ...string) (st
 	// clone time). HardenedEnv with (false, "") appends only the two
 	// non-interactive vars, so the identity overrides remain the last identity
 	// entries and still win.
-	cmd.Env = gitexec.HardenedEnv(append(os.Environ(), id.envOverrides()...), false, "")
+	cmd.Env = gitexec.HardenedEnv(runtimeenv.FilterRunnerOnly(append(os.Environ(), id.envOverrides()...)), false, "")
 	out, err := cmd.CombinedOutput()
 	return strings.TrimRight(string(out), " \n\t"), err
 }
@@ -473,6 +474,7 @@ func runGh(ctx context.Context, cwd string, args ...string) (string, error) {
 	//nolint:gosec // G204: args come from runner-controlled call sites.
 	cmd := exec.CommandContext(ctx, "gh", args...)
 	cmd.Dir = cwd
+	cmd.Env = runtimeenv.FilterRunnerOnly(cmd.Environ())
 	out, err := cmd.CombinedOutput()
 	return strings.TrimRight(string(out), " \n\t"), err
 }

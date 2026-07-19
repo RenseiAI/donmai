@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // toolExecutor runs a single Gemini functionCall and returns the
@@ -257,17 +259,10 @@ func (e *toolExecutor) resolvePath(path string) string {
 	return filepath.Join(e.cwd, path)
 }
 
-// processEnv folds the per-session env onto the process environment for
-// Bash invocations.
+// processEnv folds the per-session env onto the process environment for Bash
+// invocations while keeping runner-only attach controls on the host side.
 func (e *toolExecutor) processEnv() []string {
-	if len(e.env) == 0 {
-		return os.Environ()
-	}
-	out := os.Environ()
-	for k, v := range e.env {
-		out = append(out, k+"="+v)
-	}
-	return out
+	return runtimeenv.ComposeChildEnv(os.Environ(), e.env)
 }
 
 // stringArg reads a string-valued arg from a functionCall args map.

@@ -2,8 +2,11 @@ package runner
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -42,6 +45,16 @@ const (
 	// complete first PTY input stays within the conservative 1,024-byte
 	// canonical-mode boundary shared by the supported host environments.
 	maxInitialPromptBytes = 1023
+
+	// maxAttachTokenFileBytes is deliberately generous for a compact host JWT
+	// while bounding a provisioner-controlled file read to a small allocation.
+	maxAttachTokenFileBytes = 16 << 10
+)
+
+var (
+	errAttachTokenFileOversized = errors.New("attach token file exceeds the JWT size limit")
+	errAttachTokenFileEmpty     = errors.New("attach token file is empty")
+	errAttachTokenFileMalformed = errors.New("attach token file does not contain a syntactically valid compact JWT")
 )
 
 // interactiveSessionClass returns the sessionClass discriminator the runner
@@ -493,15 +506,11 @@ func writeInitialPromptBytes(isess agent.InteractiveSession, initialPrompt strin
 //     reconnectability.
 //   - tokenFilePath != "": the file is re-read on every resolution (the
 //     provisioner rewrites it atomically with a fresh short-exp token), so a
-//     reconnect after the static token's exp still presents a live token. A read
-//     failure or an empty file falls back to the static token — degraded to
-//     exactly today's behavior, never worse — with one WARN per distinct
-//     failure condition (not per attempt: attempts are backoff-paced and a
-//     persistent condition would otherwise spam).
-//
-// The source never returns an error for a fallback-able condition: a
-// TokenSource error just burns a backoff cycle inside RunHost, while the
-// static token still has a chance of admission.
+//     reconnect after the static token's exp still presents a live token.
+//     Missing/unreadable files retain the static-token fallback for startup and
+//     refresh races. A present file must be bounded, non-empty, and a syntactic
+//     compact JWT; invalid content fails the attempt rather than silently
+//     presenting a stale bearer.
 func attachTokenSource(staticToken, tokenFilePath string, logger *slog.Logger) attachclient.TokenSource {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -511,7 +520,7 @@ func attachTokenSource(staticToken, tokenFilePath string, logger *slog.Logger) a
 	}
 	// TokenSource is a concurrent-use contract: the degraded carrier may re-mint
 	// from POST-up, SSE, and upgrade-probe paths at the same time. Protect the
-	// warning-state transition while leaving the file reads concurrent.
+	// warning-state transition while leaving the bounded file reads concurrent.
 	var warnMu sync.Mutex
 	lastWarn := ""
 	warningChanged := func(warn string) bool {
@@ -526,7 +535,7 @@ func attachTokenSource(staticToken, tokenFilePath string, logger *slog.Logger) a
 	return func(context.Context) (string, error) {
 		// #nosec G304 G703 -- tokenFilePath is the provisioner-injected ATTACH_TOKEN_FILE
 		// contract: the same trusted process that already injects ATTACH_TOKEN itself.
-		raw, err := os.ReadFile(tokenFilePath)
+		f, err := os.Open(tokenFilePath)
 		if err != nil {
 			if warningChanged("read: " + err.Error()) {
 				logger.Warn("[interactive] attach token file unreadable — falling back to static token",
@@ -534,17 +543,67 @@ func attachTokenSource(staticToken, tokenFilePath string, logger *slog.Logger) a
 			}
 			return staticToken, nil
 		}
-		tok := strings.TrimSpace(string(raw))
-		if tok == "" {
-			if warningChanged("empty") {
-				logger.Warn("[interactive] attach token file empty — falling back to static token",
-					"path", tokenFilePath)
+		raw, readErr := io.ReadAll(io.LimitReader(f, maxAttachTokenFileBytes+1))
+		closeErr := f.Close()
+		if readErr != nil {
+			if warningChanged("read: " + readErr.Error()) {
+				logger.Warn("[interactive] attach token file unreadable — falling back to static token",
+					"path", tokenFilePath, "err", readErr)
 			}
 			return staticToken, nil
+		}
+		if closeErr != nil {
+			if warningChanged("close: " + closeErr.Error()) {
+				logger.Warn("[interactive] attach token file unreadable — falling back to static token",
+					"path", tokenFilePath, "err", closeErr)
+			}
+			return staticToken, nil
+		}
+		if len(raw) > maxAttachTokenFileBytes {
+			warningChanged("oversized")
+			return "", fmt.Errorf("%w (maximum %d bytes)", errAttachTokenFileOversized, maxAttachTokenFileBytes)
+		}
+		tok := strings.TrimSpace(string(raw))
+		if tok == "" {
+			warningChanged("empty")
+			return "", errAttachTokenFileEmpty
+		}
+		if !isCompactJWT(tok) {
+			warningChanged("malformed")
+			return "", errAttachTokenFileMalformed
 		}
 		warningChanged("")
 		return tok, nil
 	}
+}
+
+// isCompactJWT performs syntax validation only. The relay remains the
+// signature/claim authority; the runner verifies that a token-file value has
+// three non-empty base64url segments, JSON-object header/payload segments, and
+// a non-empty signature so malformed files fail before a carrier dial.
+func isCompactJWT(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	decoded := make([][]byte, len(parts))
+	for i, part := range parts {
+		if part == "" {
+			return false
+		}
+		raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(part, "="))
+		if err != nil || len(raw) == 0 {
+			return false
+		}
+		decoded[i] = raw
+	}
+	for _, raw := range decoded[:2] {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // wallCapSeconds returns the interactive wall-clock cap (seconds) from the
