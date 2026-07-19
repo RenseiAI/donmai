@@ -35,6 +35,14 @@ const CapabilityEnvVar = "DONMAI_CREDENTIAL_CAPABILITY"
 // block forever.
 const defaultHandshakeTimeout = 5 * time.Second
 
+// Frame diagnostics are fixed strings by contract. A peer can reflect the
+// HELLO capability into an unexpected frame type, so diagnostics must never
+// interpolate frame-controlled type or payload material.
+const (
+	unexpectedInitialFrameError = "expected INITIAL frame"
+	unknownFrameWarning         = "[creds] unknown frame type; ignored"
+)
+
 // Mode constants returned by [Loader.Mode].
 const (
 	ModeDaemon     = "daemon"
@@ -251,7 +259,7 @@ func dialAndHandshake(
 	}
 	if initial.Type != "INITIAL" {
 		_ = conn.Close()
-		return nil, fmt.Errorf("expected INITIAL frame, got %q", initial.Type)
+		return nil, errors.New(unexpectedInitialFrameError)
 	}
 
 	// Clear the handshake deadline; the background pumper runs with no
@@ -341,7 +349,10 @@ func (l *Loader) handleFrame(line []byte) {
 		// Server-initiated close; the next read will hit EOF and pump
 		// returns. Nothing else to do here.
 	default:
-		// Unknown / future type — ignore.
+		// Unknown / future type — ignore after a fixed, data-free warning.
+		// Never include probe.Type or the raw frame: a peer can reflect
+		// capability material into either one.
+		l.logger.Warn(unknownFrameWarning)
 	}
 }
 

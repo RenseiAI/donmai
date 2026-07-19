@@ -56,6 +56,7 @@ interface FakeServerOptions {
 interface FakeServerHandle {
   path: string;
   pushUpdate: (delta: Record<string, string>) => void;
+  pushFrame: (frame: unknown) => void;
   close: () => Promise<void>;
   helloReceived: () => Promise<HelloFrame>;
   byeReceived: () => Promise<void>;
@@ -148,6 +149,10 @@ async function startFakeServer(
           rotatedAt: new Date().toISOString(),
         }) + '\n',
       );
+    },
+    pushFrame(frame) {
+      if (!activeConn || activeConn.destroyed || !activeConn.writable) return;
+      activeConn.write(JSON.stringify(frame) + '\n');
     },
     async close() {
       if (activeConn && !activeConn.destroyed) {
@@ -425,6 +430,71 @@ describe('createLoader — daemon mode', () => {
     try {
       expect(loader.mode).toBe('standalone');
       expect(logger.info).toHaveBeenCalled();
+    } finally {
+      await loader.close();
+      await server.close();
+    }
+  });
+
+  it('uses a fixed data-free diagnostic for a reflected wrong INITIAL type', async () => {
+    const capability = 'reflected-capability-must-not-enter-diagnostic';
+    const server = await startFakeServer({
+      withholdInitial: true,
+      onHello: (hello, socket) => {
+        socket.write(
+          JSON.stringify({
+            type: hello.capability,
+            capability: hello.capability,
+          }) + '\n',
+        );
+      },
+    });
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    const logger = silentLogger();
+    const loader = await createLoader({
+      sessionId: 'wrong-frame-session',
+      capability,
+      handshakeTimeoutMs: 500,
+      logger,
+    });
+    try {
+      expect(loader.mode).toBe('standalone');
+      expect(logger.info).toHaveBeenCalledWith(
+        'credentials-client: daemon handshake failed (expected INITIAL frame); falling back to standalone mode',
+      );
+      const diagnostics = JSON.stringify({
+        info: logger.info.mock.calls,
+        warn: logger.warn.mock.calls,
+      });
+      expect(diagnostics).not.toContain(capability);
+    } finally {
+      await loader.close();
+      await server.close();
+    }
+  });
+
+  it('uses a fixed data-free diagnostic for a reflected unknown frame', async () => {
+    const capability = 'reflected-capability-must-not-enter-warning';
+    const server = await startFakeServer({ initial: { FOO: 'v1' } });
+    process.env.DONMAI_CREDENTIAL_SOCKET = server.path;
+    const logger = silentLogger();
+    const loader = await createLoader({
+      sessionId: 'unknown-frame-session',
+      capability,
+      logger,
+    });
+    try {
+      expect(loader.mode).toBe('daemon');
+      server.pushFrame({ type: capability, capability });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(logger.warn).toHaveBeenCalledWith(
+        'credentials-client: unknown message type; ignored',
+      );
+      const diagnostics = JSON.stringify({
+        info: logger.info.mock.calls,
+        warn: logger.warn.mock.calls,
+      });
+      expect(diagnostics).not.toContain(capability);
     } finally {
       await loader.close();
       await server.close();
