@@ -158,6 +158,67 @@ func TestSuccessfulSendPostsActivityThenStatus(t *testing.T) {
 	}
 }
 
+// TestInitialPromptDeliveredPostsGenericContextActivity exercises the real
+// asynchronous Poster request path. The marker is observable, but its supplied
+// message is never treated as prompt/transcript content.
+func TestInitialPromptDeliveredPostsGenericContextActivity(t *testing.T) {
+	t.Parallel()
+
+	const privatePrompt = "private initial prompt: do not forward"
+	requestBody := make(chan []byte, 1)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/activity") {
+			body, _ := io.ReadAll(r.Body)
+			requestBody <- body
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	p, err := activity.New(activity.Config{
+		SessionID:  "s-delivery",
+		WorkerID:   "w-delivery",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	p.Send(context.Background(), agent.SystemEvent{
+		Subtype: "interactive-initial-prompt-delivered",
+		Message: privatePrompt,
+	})
+
+	var body []byte
+	select {
+	case body = <-requestBody:
+	case <-time.After(2 * time.Second):
+		t.Fatal("activity request was not received")
+	}
+	if bytes.Contains(body, []byte(privatePrompt)) {
+		t.Fatalf("activity request leaked prompt content: %s", body)
+	}
+	var wire struct {
+		Activity struct {
+			Type    string `json:"type"`
+			Content string `json:"content"`
+		} `json:"activity"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("decode activity request: %v", err)
+	}
+	if wire.Activity.Type != "context" {
+		t.Errorf("activity type = %q, want context", wire.Activity.Type)
+	}
+	if wire.Activity.Content != "interactive initial prompt delivered" {
+		t.Errorf("activity content = %q, want generic delivery marker", wire.Activity.Content)
+	}
+}
+
 // TestUnauthorizedTriggersCredentialRefresh confirms that a 401 response
 // triggers the next attempt to re-resolve credentials.
 func TestUnauthorizedTriggersCredentialRefresh(t *testing.T) {
@@ -418,14 +479,15 @@ func TestEventMappingTable(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name        string
-		event       agent.Event
-		wantSent    bool
-		wantType    string
-		wantContent string // substring assertion
-		wantTool    string
-		hasInput    bool
-		hasOutput   bool
+		name          string
+		event         agent.Event
+		wantSent      bool
+		wantType      string
+		wantContent   string // substring assertion
+		rejectContent string
+		wantTool      string
+		hasInput      bool
+		hasOutput     bool
 	}{
 		{
 			name:        "AssistantText -> thought",
@@ -530,6 +592,24 @@ func TestEventMappingTable(t *testing.T) {
 		{
 			name:     "System -> skipped",
 			event:    agent.SystemEvent{Subtype: "compaction"},
+			wantSent: false,
+		},
+		{
+			name:          "System initial prompt delivered -> generic context",
+			event:         agent.SystemEvent{Subtype: "interactive-initial-prompt-delivered", Message: "private prompt text must not cross the wire"},
+			wantSent:      true,
+			wantType:      "context",
+			wantContent:   "interactive initial prompt delivered",
+			rejectContent: "private prompt text",
+		},
+		{
+			name:     "System interactive start -> skipped",
+			event:    agent.SystemEvent{Subtype: "interactive-session-started", Message: "started"},
+			wantSent: false,
+		},
+		{
+			name:     "System interactive end -> skipped",
+			event:    agent.SystemEvent{Subtype: "interactive-session-ended", Message: "ended"},
 			wantSent: false,
 		},
 		{
@@ -657,6 +737,9 @@ func TestEventMappingTable(t *testing.T) {
 			}
 			if !strings.Contains(wire.Activity.Content, tc.wantContent) {
 				t.Errorf("content = %q; want substring %q", wire.Activity.Content, tc.wantContent)
+			}
+			if tc.rejectContent != "" && strings.Contains(wire.Activity.Content, tc.rejectContent) {
+				t.Errorf("content = %q; must not contain %q", wire.Activity.Content, tc.rejectContent)
 			}
 			if tc.wantTool != "" && wire.Activity.ToolName != tc.wantTool {
 				t.Errorf("toolName = %q; want %q", wire.Activity.ToolName, tc.wantTool)

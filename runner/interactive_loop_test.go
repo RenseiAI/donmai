@@ -487,6 +487,114 @@ func TestWriteInitialPromptInput_RetriesShortWrites(t *testing.T) {
 	}
 }
 
+func TestWriteInitialPromptInput_ByteLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		prompt    string
+		wantWrite bool
+		multibyte bool
+	}{
+		{
+			name:      "1023 ASCII bytes accepted",
+			prompt:    strings.Repeat("a", maxInitialPromptBytes),
+			wantWrite: true,
+		},
+		{
+			name:   "1024 ASCII bytes rejected",
+			prompt: strings.Repeat("b", maxInitialPromptBytes+1),
+		},
+		{
+			name:      "1023 multibyte UTF-8 bytes accepted",
+			prompt:    strings.Repeat("雪", maxInitialPromptBytes/len("雪")),
+			wantWrite: true,
+			multibyte: true,
+		},
+		{
+			name:      "multibyte rune count below limit but byte count rejected",
+			prompt:    strings.Repeat("雪", maxInitialPromptBytes/len("雪")+1),
+			multibyte: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session := completedRecordingInteractiveSession()
+			err := writeInitialPromptInput(context.Background(), nil, &fakeHandle{}, session, tt.prompt)
+			if tt.wantWrite {
+				if err != nil {
+					t.Fatalf("writeInitialPromptInput: %v", err)
+				}
+				if got, want := string(session.inputBytes()), tt.prompt+"\n"; got != want {
+					t.Fatalf("PTY input length = %d, want %d", len(got), len(want))
+				}
+				if got := session.writeCount(); got == 0 {
+					t.Fatal("accepted prompt did not call WriteInput")
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatal("oversize prompt was accepted")
+			}
+			if got := session.writeCount(); got != 0 {
+				t.Fatalf("oversize prompt wrote %d time(s), want 0", got)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("%d UTF-8 bytes", len(tt.prompt))) ||
+				!strings.Contains(err.Error(), fmt.Sprintf("limit is %d bytes", maxInitialPromptBytes)) {
+				t.Fatalf("error = %q, want actual byte count and limit", err)
+			}
+			if strings.Contains(err.Error(), tt.prompt) {
+				t.Fatalf("error leaked prompt content: %q", err)
+			}
+			if tt.multibyte && len([]rune(tt.prompt)) > maxInitialPromptBytes {
+				t.Fatalf("fixture rune count = %d, want <= byte limit %d", len([]rune(tt.prompt)), maxInitialPromptBytes)
+			}
+		})
+	}
+}
+
+// TestWriteInitialPromptInput_CanonicalModeBoundary proves the accepted maximum
+// reaches a real canonical-mode PTY reader. A successful master write alone is
+// insufficient evidence; the child must consume the complete line and exit 0.
+func TestWriteInitialPromptInput_CanonicalModeBoundary(t *testing.T) {
+	requireSh(t)
+	command := fmt.Sprintf(
+		`stty icanon || exit 3; IFS= read -r line || exit 2; [ "${#line}" -eq %d ]`,
+		maxInitialPromptBytes,
+	)
+	session, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{"/bin/sh", "-c", command}})
+	if err != nil {
+		t.Fatalf("ptyhost.Spawn: %v", err)
+	}
+	handle := newInteractivePTYHandle(session)
+	t.Cleanup(func() { _ = handle.Stop(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := writeInitialPromptInput(
+		ctx,
+		nil,
+		handle,
+		session,
+		strings.Repeat("x", maxInitialPromptBytes),
+	); err != nil {
+		t.Fatalf("writeInitialPromptInput: %v", err)
+	}
+
+	select {
+	case <-session.Done():
+		exit, ok := session.Exit()
+		if !ok {
+			t.Fatal("canonical reader exited without an Exit payload")
+		}
+		if exit.BySignal() || exit.ExitCode != 0 {
+			t.Fatalf("canonical reader exit = %+v, want normal exit 0", exit)
+		}
+	case <-ctx.Done():
+		t.Fatalf("canonical reader did not receive %d-byte line: %v", maxInitialPromptBytes, ctx.Err())
+	}
+}
+
 func TestWriteInitialPromptInput_PreCanceledDoesNotWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -518,6 +626,30 @@ func TestWriteInitialPromptInput_PreLostOwnershipDoesNotWrite(t *testing.T) {
 	}
 	if got := session.writeCount(); got != 0 {
 		t.Fatalf("pre-lost initial prompt wrote %d time(s), want 0", got)
+	}
+	if got := stops.Load(); got != 1 {
+		t.Fatalf("handle Stop calls = %d, want 1", got)
+	}
+}
+
+// TestWaitInitialPromptWrite_ReadyOwnershipOutranksCompletion pins the
+// concurrent-ready case without probabilistic select repetition: both channels
+// are ready before arbitration starts, and ownership loss must stop the handle
+// and win over the successful write result.
+func TestWaitInitialPromptWrite_ReadyOwnershipOutranksCompletion(t *testing.T) {
+	writeDone := make(chan error, 1)
+	writeDone <- nil
+	lost := make(chan struct{})
+	close(lost)
+	var stops atomic.Int64
+	handle := &stopCallbackHandle{
+		Handle: &fakeHandle{},
+		stop:   func() { stops.Add(1) },
+	}
+
+	err := waitInitialPromptWrite(context.Background(), lost, handle, writeDone)
+	if !errors.Is(err, heartbeat.ErrLostOwnership) {
+		t.Fatalf("waitInitialPromptWrite error = %v, want ErrLostOwnership", err)
 	}
 	if got := stops.Load(); got != 1 {
 		t.Fatalf("handle Stop calls = %d, want 1", got)
@@ -713,6 +845,53 @@ func TestInteractive_InitialPromptWriteFailure(t *testing.T) {
 	}
 }
 
+func TestInteractive_InitialPromptOversizeFailsBeforeWrite(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	initialPrompt := strings.Repeat("oversized-seed-", 1500)
+	session := completedRecordingInteractiveSession()
+	handle := &testInteractiveHandle{
+		Handle:  &fakeHandle{events: make(chan agent.Event)},
+		session: session,
+	}
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		SessionID:     "seed-oversize",
+		Mode:          interactiveRunMode,
+		InitialPrompt: initialPrompt,
+	}}
+
+	started := time.Now()
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, sink, nil,
+	)
+	if err == nil {
+		t.Fatal("expected oversize initial-prompt failure")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("oversize prompt failed after %v, want immediate pre-write rejection", elapsed)
+	}
+	if out.Status != "failed" || out.FailureMode != FailureInteractiveInput {
+		t.Fatalf("status=%q mode=%q; want failed/%s", out.Status, out.FailureMode, FailureInteractiveInput)
+	}
+	if got := session.writeCount(); got != 0 {
+		t.Fatalf("oversize initial prompt wrote %d time(s), want 0", got)
+	}
+	if !strings.Contains(out.Error, fmt.Sprintf("%d UTF-8 bytes", len(initialPrompt))) ||
+		!strings.Contains(out.Error, fmt.Sprintf("limit is %d bytes", maxInitialPromptBytes)) {
+		t.Fatalf("result error = %q, want actual byte count and limit", out.Error)
+	}
+	if strings.Contains(out.Error, initialPrompt) {
+		t.Fatalf("result error leaked prompt content: %q", out.Error)
+	}
+	for _, ev := range sink.events {
+		if system, ok := ev.(agent.SystemEvent); ok && system.Subtype == "interactive-initial-prompt-delivered" {
+			t.Fatal("delivery activity emitted for rejected oversize prompt")
+		}
+	}
+}
+
 // TestInteractive_InitialPromptCancellation proves a child that never reads
 // from its bounded PTY input queue cannot wedge runner cancellation while the
 // initial prompt write is blocked.
@@ -736,7 +915,7 @@ func TestInteractive_InitialPromptCancellation(t *testing.T) {
 	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
 		SessionID:     "seed-cancel",
 		Mode:          interactiveRunMode,
-		InitialPrompt: strings.Repeat("blocked input ", 4096),
+		InitialPrompt: strings.Repeat("b", maxInitialPromptBytes),
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	runner := minimalRunner(t)

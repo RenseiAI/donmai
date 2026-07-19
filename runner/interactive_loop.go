@@ -37,6 +37,11 @@ const (
 	envAttachToken = "ATTACH_TOKEN"
 	// #nosec G101 -- an env var NAME (the runner reads a path from it), not a credential.
 	envAttachTokenFile = "ATTACH_TOKEN_FILE"
+
+	// maxInitialPromptBytes leaves one byte for the appended newline so the
+	// complete first PTY input stays within the conservative 1,024-byte
+	// canonical-mode boundary shared by the supported host environments.
+	maxInitialPromptBytes = 1023
 )
 
 // interactiveSessionClass returns the sessionClass discriminator the runner
@@ -388,13 +393,18 @@ func writeInitialPromptInput(
 	isess agent.InteractiveSession,
 	initialPrompt string,
 ) error {
+	if initialPromptOwnershipLost(lost) {
+		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	select {
-	case <-lost:
-		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
-	default:
+	if promptBytes := len(initialPrompt); promptBytes > maxInitialPromptBytes {
+		return fmt.Errorf(
+			"interactive initial prompt is %d UTF-8 bytes; limit is %d bytes",
+			promptBytes,
+			maxInitialPromptBytes,
+		)
 	}
 
 	writeDone := make(chan error, 1)
@@ -402,13 +412,45 @@ func writeInitialPromptInput(
 		writeDone <- writeInitialPromptBytes(isess, initialPrompt)
 	}()
 
+	return waitInitialPromptWrite(ctx, lost, handle, writeDone)
+}
+
+// waitInitialPromptWrite arbitrates write completion, caller cancellation, and
+// ownership loss. Ownership is probed before blocking and again after either
+// competing arm wins so an already-ready hand-off deterministically outranks a
+// successful write or cancelled parent.
+func waitInitialPromptWrite(
+	ctx context.Context,
+	lost <-chan struct{},
+	handle agent.Handle,
+	writeDone <-chan error,
+) error {
+	if initialPromptOwnershipLost(lost) {
+		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+	}
+
 	select {
 	case err := <-writeDone:
+		if initialPromptOwnershipLost(lost) {
+			return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+		}
 		return err
 	case <-ctx.Done():
+		if initialPromptOwnershipLost(lost) {
+			return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+		}
 		return stopBlockedInitialPrompt(handle, ctx.Err())
 	case <-lost:
 		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+	}
+}
+
+func initialPromptOwnershipLost(lost <-chan struct{}) bool {
+	select {
+	case <-lost:
+		return true
+	default:
+		return false
 	}
 }
 
