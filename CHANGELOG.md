@@ -8,10 +8,6 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
----
-
-## v0.53.0 — 2026-07-19
-
 ### Features
 
 - **Per-session credential-socket capabilities.** The Go and TypeScript
@@ -50,9 +46,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   material.
 - **Interactive attach reconnection.** The runner can re-read a rotating attach
   token from `ATTACH_TOKEN_FILE` for every relay dial attempt, so a reconnect is
-  not stranded after the initial short-lived token expires. Missing or empty
-  files degrade to the existing static token with deduplicated warnings, and
-  degraded auth refresh retries are bounded.
+  not stranded after the initial short-lived token expires. A missing or
+  unreadable file may fall back to the static token during startup or atomic
+  refresh races, with deduplicated warnings. An existing empty, malformed, or
+  oversized file fails explicitly instead of silently presenting stale auth,
+  and degraded auth refresh retries are bounded.
+- **Interactive attach child-environment isolation.** Runner-owned `ATTACH_URL`,
+  `ATTACH_TOKEN`, and `ATTACH_TOKEN_FILE` controls are removed from every
+  provider process, PTY child, and model-invoked tool subprocess, including
+  explicit per-session environment overrides, while remaining available to the
+  runner's host-side attach leg.
 
 ### Chores
 
@@ -65,9 +68,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 - **Faster hosted CI.** Migrates repository workflows to Blacksmith runners
   without changing their test, security, release, or image-build responsibilities.
 - **Reproducible release automation.** Pins the Blacksmith worker-image actions
-  to reviewed immutable commits, makes manual release reruns check out and
-  validate an explicit existing tag, and anchors GoReleaser publication to the
-  exact commit it built.
+  to reviewed immutable commits, makes every manual publisher retry check out
+  and validate an explicit existing tag, derives published versions from that
+  verified tag, preserves `latest` only on automatic tag pushes, and anchors
+  GoReleaser publication to the exact commit it built.
 - **Go 1.25.12 release floor.** Raises the module and worker-image toolchain to
   Go 1.25.12 and makes every Go-using workflow consume the canonical `go.mod`
   version instead of carrying independent floating or stale versions.

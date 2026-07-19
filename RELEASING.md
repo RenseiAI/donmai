@@ -102,19 +102,29 @@ new patch version.
 
 ## Retry a release workflow
 
-The release workflow supports a manual rerun only for an existing explicit tag:
+Each publisher supports a manual retry only for an existing explicit release
+tag:
 
 ```bash
 gh workflow run release.yml --ref main -f tag=vX.Y.Z
+gh workflow run worker-image.yml --ref main -f tag=vX.Y.Z
+gh workflow run e2b-template.yml --ref main -f tag=vX.Y.Z
 ```
 
-The `--ref` value selects the workflow definition. The workflow's required
-`tag` input selects the release checkout. The job fails before signing or
-publishing if that tag is missing or if the checked-out commit does not match
-it.
+The `--ref` value selects the workflow definition. Each workflow's required
+`tag` input selects a detached checkout of `refs/tags/vX.Y.Z`. Before signing,
+building, or publishing, the job verifies that the tag exists and that its
+peeled commit equals `HEAD`; the published image tag and embedded binary
+version are derived from that same verified tag.
 
-Do not pass a branch name as the `tag` input. Do not use a branch-derived
-`GITHUB_REF_NAME` as a release target.
+A manual worker-image retry republishes only the versioned image and leaves
+`latest` unchanged. Only an automatic release-tag push updates `latest`. A
+manual E2B retry also remains read-only with respect to the repository: it may
+surface the created template id in the job output, but it does not commit an
+updated `worker/e2b/e2b.toml` to `main`.
+
+Do not pass a branch name, `latest`, or any other mutable label as the `tag`
+input. Do not use a branch-derived `GITHUB_REF_NAME` as a release target.
 
 ## Verify the GitHub release
 
