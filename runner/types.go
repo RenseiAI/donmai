@@ -4,6 +4,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // QueuedWork is the runner's input contract — the per-session payload
@@ -42,6 +43,10 @@ type QueuedWork struct {
 	// "https://platform.example.com" or "http://127.0.0.1:3010"). The runner
 	// forwards this to result.Poster + heartbeat.Pulser. Required.
 	PlatformURL string `json:"-"`
+
+	// TerminalWorkareaLease requests bounded retention of a successful workarea.
+	// Nil preserves the legacy immediate-teardown behavior.
+	TerminalWorkareaLease *workarea.TerminalLeaseRequest `json:"terminalWorkareaLease,omitempty"`
 
 	// Capabilities carries the daemon-advertised worker capability flags for
 	// the session, threaded from the daemon's SessionDetail. A capability is
@@ -261,6 +266,10 @@ type Result struct {
 	// surface the reason; the session's Status is "failed" with
 	// FailureMode=FailureBudgetExceeded.
 	BudgetReport *BudgetReport `json:"budgetReport,omitempty"`
+
+	// TerminalWorkareaLease is the path-free descriptor attached to the
+	// successful terminal status after durable acquire + deferred teardown.
+	TerminalWorkareaLease *workarea.TerminalLeaseDescriptor `json:"terminalWorkareaLease,omitempty"`
 }
 
 // LinearStatusTransition records the runner's post-session attempt to

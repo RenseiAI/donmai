@@ -6,6 +6,7 @@ import (
 
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/runner/access"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // SessionDetail is the per-session payload `donmai agent run` reads from
@@ -211,6 +212,11 @@ type SessionDetail struct {
 	// from PollWorkItem onto the runner's QueuedWork. The daemon does not
 	// parse it — opaque forwarder only.
 	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
+
+	// TerminalWorkareaLease forwards the optional provider-neutral retention
+	// request. The daemon does not interpret it; the runner validates the finite
+	// policy before using it. Nil preserves immediate teardown.
+	TerminalWorkareaLease *workarea.TerminalLeaseRequest `json:"terminalWorkareaLease,omitempty"`
 
 	// Capabilities carries the daemon-advertised worker capability flags for
 	// this session (deterministic-landing, FD-3). The daemon stamps a flag

@@ -120,4 +120,9 @@ const (
 	// ctx/deadline timeout (FailureTimeout) so the platform can route a
 	// stuck session distinctly rather than blind-re-dispatching it.
 	FailureNoProgress = "no-progress"
+
+	// FailureTerminalWorkareaLease indicates the runner completed the agent work
+	// but could not durably acquire the requested bounded terminal-workarea hold
+	// or record ordinary teardown as deferred. A successful status is never sent.
+	FailureTerminalWorkareaLease = "terminal-workarea-lease"
 )

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // PollWorkItem mirrors one element of the platform's poll response `work[]`
@@ -181,6 +182,11 @@ type PollWorkItem struct {
 	// Forwarded opaquely as json.RawMessage so the strict decoder never
 	// drops it. Opaque forwarder only.
 	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
+
+	// TerminalWorkareaLease is the optional provider-neutral request to retain a
+	// successful terminal workarea until semantic acknowledgement or bounded
+	// expiry. Nil preserves the legacy immediate-teardown behavior.
+	TerminalWorkareaLease *workarea.TerminalLeaseRequest `json:"terminalWorkareaLease,omitempty"`
 }
 
 // PollInterviewBudget mirrors prompt.InterviewBudget for the daemon
@@ -970,45 +976,46 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		)
 	}
 	detail := &SessionDetail{
-		SessionID:            item.SessionID,
-		IssueID:              item.IssueID,
-		IssueIdentifier:      item.IssueIdentifier,
-		LinearSessionID:      item.LinearSessionID,
-		ProviderSessionID:    item.ProviderSessionID,
-		ProjectName:          projectName,
-		ProjectID:            projectID,
-		RepositoryID:         item.RepositoryID,
-		OrganizationID:       item.OrganizationID,
-		Repository:           repo,
-		Ref:                  item.Ref,
-		WorkType:             item.WorkType,
-		PromptContext:        item.PromptContext,
-		Body:                 item.Body,
-		Title:                item.Title,
-		MentionContext:       item.MentionContext,
-		ParentContext:        item.ParentContext,
-		Branch:               item.Branch,
-		ResolvedProfile:      item.ResolvedProfile,
-		ModelProfile:         item.ModelProfile,
-		WorkerID:             workerID,
-		AuthToken:            authToken,
-		PlatformURL:          platformURL,
-		CredentialPoolID:     item.InjectedPoolID,
-		StagePrompt:          item.StagePrompt,
-		StageID:              item.StageID,
-		StageBudget:          item.StageBudget,
-		StageLifecycle:       item.StageLifecycle,
-		StageSourceEventID:   item.StageSourceEventID,
-		SystemPromptOverride: item.SystemPromptOverride,
-		Kits:                 item.Kits,
-		DisallowedTools:      item.DisallowedTools,
-		AllowedTools:         item.AllowedTools,
-		McpServers:           item.McpServers,
-		Skills:               item.Skills,
-		MemoryBlock:          item.MemoryBlock,
-		Mode:                 item.Mode,
-		InterviewBudget:      item.InterviewBudget,
-		InterviewDefinition:  item.InterviewDefinition,
+		SessionID:             item.SessionID,
+		IssueID:               item.IssueID,
+		IssueIdentifier:       item.IssueIdentifier,
+		LinearSessionID:       item.LinearSessionID,
+		ProviderSessionID:     item.ProviderSessionID,
+		ProjectName:           projectName,
+		ProjectID:             projectID,
+		RepositoryID:          item.RepositoryID,
+		OrganizationID:        item.OrganizationID,
+		Repository:            repo,
+		Ref:                   item.Ref,
+		WorkType:              item.WorkType,
+		PromptContext:         item.PromptContext,
+		Body:                  item.Body,
+		Title:                 item.Title,
+		MentionContext:        item.MentionContext,
+		ParentContext:         item.ParentContext,
+		Branch:                item.Branch,
+		ResolvedProfile:       item.ResolvedProfile,
+		ModelProfile:          item.ModelProfile,
+		WorkerID:              workerID,
+		AuthToken:             authToken,
+		PlatformURL:           platformURL,
+		CredentialPoolID:      item.InjectedPoolID,
+		StagePrompt:           item.StagePrompt,
+		StageID:               item.StageID,
+		StageBudget:           item.StageBudget,
+		StageLifecycle:        item.StageLifecycle,
+		StageSourceEventID:    item.StageSourceEventID,
+		SystemPromptOverride:  item.SystemPromptOverride,
+		Kits:                  item.Kits,
+		DisallowedTools:       item.DisallowedTools,
+		AllowedTools:          item.AllowedTools,
+		McpServers:            item.McpServers,
+		Skills:                item.Skills,
+		MemoryBlock:           item.MemoryBlock,
+		Mode:                  item.Mode,
+		InterviewBudget:       item.InterviewBudget,
+		InterviewDefinition:   item.InterviewDefinition,
+		TerminalWorkareaLease: item.TerminalWorkareaLease,
 	}
 	for _, opt := range opts {
 		opt(detail)

@@ -721,11 +721,12 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			Mode:                 d.Mode,
 			InterviewDefinition:  d.InterviewDefinition,
 		},
-		Branch:       d.Branch,
-		WorkerID:     d.WorkerID,
-		AuthToken:    d.AuthToken,
-		PlatformURL:  d.PlatformURL,
-		Capabilities: d.Capabilities,
+		Branch:                d.Branch,
+		WorkerID:              d.WorkerID,
+		AuthToken:             d.AuthToken,
+		PlatformURL:           d.PlatformURL,
+		TerminalWorkareaLease: d.TerminalWorkareaLease,
+		Capabilities:          d.Capabilities,
 	}
 	if d.StageBudget != nil {
 		qw.StageBudget = &prompt.StageBudget{
