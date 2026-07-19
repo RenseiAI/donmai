@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/interview"
 )
 
 // Compile-time assertion that WorkerSpawner satisfies the
@@ -194,11 +195,37 @@ func (s *WorkerSpawner) emit(ev SessionEvent) {
 	}
 }
 
-// ActiveCount returns the number of in-flight sessions.
+// ActiveCount returns the number of in-flight sessions across all run modes.
 func (s *WorkerSpawner) ActiveCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.sessions)
+}
+
+// ActiveInteractiveCount returns the number of in-flight interactive-occupancy
+// sessions. Both the PTY "interactive" mode and legacy "interview" mode count;
+// headless and unknown modes do not.
+func (s *WorkerSpawner) ActiveInteractiveCount() int {
+	_, interactive := s.ActiveSessionCounts()
+	return interactive
+}
+
+// ActiveSessionCounts returns one coherent occupancy snapshot: active is the
+// unclassed count across every run mode, while activeInteractive is the union of
+// PTY "interactive" and legacy "interview" sessions. Both values are derived
+// while holding the same lock, so concurrent session starts/stops cannot produce
+// activeInteractive > active.
+func (s *WorkerSpawner) ActiveSessionCounts() (active, activeInteractive int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active = len(s.sessions)
+	for _, ss := range s.sessions {
+		switch ss.spec.Mode {
+		case interactiveRunMode, interview.InterviewRunMode:
+			activeInteractive++
+		}
+	}
+	return active, activeInteractive
 }
 
 // IsAccepting reports whether the spawner is currently accepting work.
