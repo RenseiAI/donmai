@@ -38,6 +38,26 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          # A manual rerun must build the requested tag, never the branch from
+          # which workflow_dispatch was invoked.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Verify immutable release ref
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            echo "::error::Release ref must be an existing tag: ${RELEASE_TAG}"
+            exit 1
+          fi
+          tag_sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_sha="$(git rev-parse HEAD)"
+          if [ "${tag_sha}" != "${head_sha}" ]; then
+            echo "::error::Checked-out SHA ${head_sha} does not match ${RELEASE_TAG} (${tag_sha})"
+            exit 1
+          fi
+          echo "Releasing ${RELEASE_TAG} at immutable commit ${head_sha}"
 
       - uses: actions/setup-go@v6
         with:

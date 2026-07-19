@@ -82,6 +82,11 @@ homebrew_casks:
 checksum:
   name_template: "checksums.txt"
 
+release:
+  # If GitHub must create the tag while publishing, anchor it to the exact
+  # commit GoReleaser built rather than the repository's moving default branch.
+  target_commitish: "{{ .Commit }}"
+
 changelog:
   sort: asc
   filters:
