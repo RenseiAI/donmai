@@ -86,9 +86,9 @@ release:
   # If GitHub must create the tag while publishing, anchor it to the exact
   # commit GoReleaser built rather than the repository's moving default branch.
   target_commitish: "{{ .Commit }}"
-  # Automatic tag pushes retain GoReleaser's historical "make latest" behavior.
-  # Manual retries export false so replaying an older release cannot replace the
-  # repository's current GitHub Latest release.
+  # Automatic stable tag pushes retain GoReleaser's historical "make latest"
+  # behavior. Prereleases and manual retries export false so neither can replace
+  # the repository's current GitHub Latest release.
   make_latest: '{{ if eq .Env.GORELEASER_MAKE_LATEST "false" }}false{{ else }}true{{ end }}'
 
 changelog:

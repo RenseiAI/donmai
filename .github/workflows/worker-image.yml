@@ -1,5 +1,8 @@
 name: worker-image
 
+# Every verified release tag publishes an immutable versioned image. Only an
+# automatic stable tag push also advances the rolling `latest` image.
+
 on:
   workflow_dispatch:
     inputs:

@@ -9,13 +9,19 @@ template, and the generated Homebrew cask.
 A `v*` tag push starts three independent workflows:
 
 - `.github/workflows/release.yml` signs, notarizes, packages, and publishes the
-  `donmai` binary with GoReleaser.
-- `.github/workflows/worker-image.yml` publishes the versioned and `latest`
-  worker images to GHCR.
+  `donmai` binary with GoReleaser. Every tag gets immutable release assets; only
+  an automatic stable tag push may advance GitHub Latest.
+- `.github/workflows/worker-image.yml` publishes the immutable versioned worker
+  image to GHCR. Only an automatic stable tag push also advances `latest`.
 - `.github/workflows/e2b-template.yml` publishes an E2B target named
-  `donmai-worker:<version>` with the release version embedded in the binary and,
-  on automatic tag pushes only, advances the rolling `donmai-worker:default`
-  target to the same build.
+  `donmai-worker:<version>` with the release version embedded in the binary.
+  Only an automatic stable tag push also advances the rolling
+  `donmai-worker:default` target to the same build.
+
+A prerelease tag such as `v1.2.3-rc.1` therefore publishes version-addressable
+GitHub assets, a `ghcr.io/renseiai/donmai-worker:v1.2.3-rc.1` image, and a
+`donmai-worker:v1.2.3-rc.1` E2B target without changing GitHub Latest, GHCR
+`latest`, or E2B `default`.
 
 GoReleaser publishes these archives plus `checksums.txt` and signature-provenance
 sidecars:
@@ -103,7 +109,9 @@ The tag push starts the release, worker-image, and E2B workflows. The release
 workflow verifies that its checkout is the commit referenced by the release
 tag. GoReleaser also sends that exact commit through
 `release.target_commitish`; it never asks GitHub to target the moving default
-branch.
+branch. The shared verifier exposes both prerelease status and the rolling-alias
+policy to every publisher. Automatic stable tags advance rolling aliases;
+prerelease tags publish their immutable version targets only.
 
 Do not move or reuse a published tag. If a release is bad, fix it and publish a
 new patch version.
@@ -132,12 +140,13 @@ template, and embedded binary versions.
 
 A manual binary retry sets GoReleaser's supported `release.make_latest` policy
 to false, so replaying an older release cannot replace the repository's current
-GitHub Latest release. Automatic tag pushes retain the normal make-latest
-behavior. A manual worker-image retry republishes only the versioned image and
-leaves `latest` unchanged. A manual E2B retry creates or updates only
-`donmai-worker:vX.Y.Z` and leaves `donmai-worker:default` unchanged; automatic
-tag pushes assign both the version tag and `default` to the new E2B build.
-Neither E2B path writes back to the repository.
+GitHub Latest release. Prereleases use the same no-latest policy. Only automatic
+stable tag pushes retain the normal make-latest behavior. A manual retry or
+prerelease worker-image publication writes only the versioned image and leaves
+`latest` unchanged. The corresponding E2B path creates or updates only
+`donmai-worker:vX.Y.Z[-prerelease]` and leaves `donmai-worker:default` unchanged;
+automatic stable tag pushes assign both the version tag and `default` to the new
+E2B build. Neither E2B path writes back to the repository.
 
 Do not pass a branch name, `latest`, or any other mutable label as the `tag`
 input. Do not use a branch-derived `GITHUB_REF_NAME` as a release target.
@@ -156,8 +165,9 @@ Confirm:
 
 - `target_commitish` is the immutable release commit SHA, not `main`.
 - The release is neither a draft nor a prerelease unless intentionally planned.
-- After a manual retry of an older tag, `/releases/latest` still returns the
-  previously current release rather than the retried tag.
+- After a prerelease publication or manual retry of an older tag,
+  `/releases/latest` still returns the previously current stable release rather
+  than the prerelease or retried tag.
 - All four archives, `checksums.txt`, and expected `.sig` provenance files are
   attached.
 - Archive names follow the `donmai_<version>_<os>_<arch>.tar.gz` template.
@@ -248,7 +258,8 @@ Run on at least one supported macOS host and one Linux environment:
 [ ] Homebrew cask installs the same version and SHA-256 values
 [ ] Versioned GHCR worker image exists
 [ ] E2B target donmai-worker:vX.Y.Z exists for the release build
-[ ] Automatic release moved donmai-worker:default to that same E2B build
+[ ] Automatic stable release moved donmai-worker:default to that same E2B build
+[ ] Prerelease publication left GitHub Latest, GHCR latest, and E2B default unchanged
 ```
 
 ## Failure and rollback

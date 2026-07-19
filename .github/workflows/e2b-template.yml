@@ -6,9 +6,9 @@ name: e2b-template
 # org/team API key from https://e2b.dev/dashboard?tab=keys).
 #
 # Every release writes the verified semantic version to an explicit E2B target
-# such as `donmai-worker:v0.53.0`. Automatic tag pushes also assign `default` to
-# the same build, preserving the rolling target. Manual retries rebuild only the
-# version target, so retrying an older release cannot move `default`.
+# such as `donmai-worker:v0.53.0`. Automatic stable tag pushes also assign
+# `default` to the same build, preserving the rolling target. Prereleases and
+# manual retries rebuild only the version target, so neither can move `default`.
 #
 # @e2b/cli 2.13.3 help confirms `template create` accepts only an untagged name
 # constrained to lowercase letters, numbers, dashes, and underscores. E2B's

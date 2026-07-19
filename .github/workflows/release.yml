@@ -1,5 +1,8 @@
 name: Release
 
+# All verified tags publish immutable release assets. Only an automatic stable
+# tag push may advance GitHub Latest; prereleases and manual retries may not.
+
 on:
   push:
     tags:

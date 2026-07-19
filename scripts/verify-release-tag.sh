@@ -29,25 +29,42 @@ verify_release_tag() {
   local branch_ref
   local tag_commit
   local head_commit
+  local is_prerelease
+  local publish_rolling_aliases
   local make_latest
   local e2b_additional_tags
 
   validate_release_tag "${tag}"
 
+  if [[ "${tag}" == *-* ]]; then
+    is_prerelease=true
+  else
+    is_prerelease=false
+  fi
+
   case "${event_name}" in
     push)
-      make_latest=true
-      e2b_additional_tags=default
+      if [[ "${is_prerelease}" == false ]]; then
+        publish_rolling_aliases=true
+      else
+        publish_rolling_aliases=false
+      fi
       ;;
     workflow_dispatch)
-      make_latest=false
-      e2b_additional_tags=
+      publish_rolling_aliases=false
       ;;
     *)
       printf 'Unsupported release event: %s\n' "${event_name}" >&2
       return 1
       ;;
   esac
+
+  make_latest=${publish_rolling_aliases}
+  if [[ "${publish_rolling_aliases}" == true ]]; then
+    e2b_additional_tags=default
+  else
+    e2b_additional_tags=
+  fi
 
   if ! git show-ref --verify --quiet "refs/tags/${tag}"; then
     printf 'Release ref must be an existing tag: %s\n' "${tag}" >&2
@@ -69,12 +86,14 @@ verify_release_tag() {
   {
     printf 'tag=%s\n' "${tag}"
     printf 'commit=%s\n' "${head_commit}"
+    printf 'is_prerelease=%s\n' "${is_prerelease}"
+    printf 'publish_rolling_aliases=%s\n' "${publish_rolling_aliases}"
     printf 'goreleaser_make_latest=%s\n' "${make_latest}"
     printf 'e2b_template_ref=donmai-worker:%s\n' "${tag}"
     printf 'e2b_additional_tags=%s\n' "${e2b_additional_tags}"
     printf 'image_tags<<EOF\n'
     printf 'ghcr.io/renseiai/donmai-worker:%s\n' "${tag}"
-    if [[ "${event_name}" == push ]]; then
+    if [[ "${publish_rolling_aliases}" == true ]]; then
       printf 'ghcr.io/renseiai/donmai-worker:latest\n'
     fi
     printf 'EOF\n'
@@ -83,6 +102,8 @@ verify_release_tag() {
   {
     printf 'GORELEASER_CURRENT_TAG=%s\n' "${tag}"
     printf 'GORELEASER_MAKE_LATEST=%s\n' "${make_latest}"
+    printf 'RELEASE_IS_PRERELEASE=%s\n' "${is_prerelease}"
+    printf 'RELEASE_PUBLISH_ROLLING_ALIASES=%s\n' "${publish_rolling_aliases}"
   } >> "${env_file}"
 
   printf 'Verified %s at detached commit %s\n' "${tag}" "${head_commit}"
