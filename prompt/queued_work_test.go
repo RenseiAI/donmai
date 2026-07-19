@@ -77,6 +77,57 @@ func TestQueuedWork_CodeIntel_OptionalFieldsOmitted(t *testing.T) {
 	}
 }
 
+// TestQueuedWork_InitialPromptWireSemantics locks the public wire contract:
+// camelCase, omitempty for absent/explicit-empty values, exact Unicode and
+// multiline round-trip when populated.
+func TestQueuedWork_InitialPromptWireSemantics(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		input      string
+		wantOnWire bool
+	}{
+		{name: "absent zero value", input: "", wantOnWire: false},
+		{name: "unicode multiline", input: "こんにちは 🌱\nsecond line", wantOnWire: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			qw := QueuedWork{SessionID: "seed-wire", InitialPrompt: tt.input}
+			body, err := json.Marshal(qw)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			hasKey := strings.Contains(string(body), `"initialPrompt"`)
+			if hasKey != tt.wantOnWire {
+				t.Fatalf("initialPrompt key presence = %v, want %v: %s", hasKey, tt.wantOnWire, body)
+			}
+			var back QueuedWork
+			if err := json.Unmarshal(body, &back); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if back.InitialPrompt != tt.input {
+				t.Errorf("round-trip InitialPrompt = %q, want %q", back.InitialPrompt, tt.input)
+			}
+		})
+	}
+
+	// An explicit empty key from a newer peer decodes safely, then omitempty
+	// returns to the same field-less shape as an older peer's absent key.
+	var explicitEmpty QueuedWork
+	if err := json.Unmarshal([]byte(`{"sessionId":"seed-empty","initialPrompt":""}`), &explicitEmpty); err != nil {
+		t.Fatalf("decode explicit empty: %v", err)
+	}
+	body, err := json.Marshal(explicitEmpty)
+	if err != nil {
+		t.Fatalf("re-marshal explicit empty: %v", err)
+	}
+	if strings.Contains(string(body), `"initialPrompt"`) {
+		t.Fatalf("explicit empty must re-encode as omitted, got %s", body)
+	}
+}
+
 // TestQueuedWork_CodeIntel_UnknownFieldTolerance proves BOTH mixed-version
 // directions decode without error:
 //

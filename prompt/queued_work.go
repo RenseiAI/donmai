@@ -249,13 +249,23 @@ type QueuedWork struct {
 	// ── Interactive run-mode fields (Wave 2 donmai wire-plumbing) ─
 	//
 	// Mode is the run-mode discriminant. "" or absent = normal headless
-	// run. "interview" = interactive interview loop (non-terminating;
-	// parks on injectCh between user turns). The runner branches on this
-	// value; the prompt renderer does not interpret it.
+	// run. "interview" = inject-driven interview loop (non-terminating;
+	// parks on injectCh between user turns). "interactive" = live PTY
+	// session. The runner branches on this value; the prompt renderer does
+	// not interpret it.
 	//
 	// Wire shape: "mode" (camelCase, omitempty). Canonical value:
 	// internal/interview/wiretypes.go InterviewRunMode.
 	Mode string `json:"mode,omitempty"`
+
+	// InitialPrompt is opaque first-input data for Mode="interactive". The
+	// interactive runner writes it verbatim plus one newline into the live PTY
+	// before relay attach. The prompt renderer MUST NOT include it in either
+	// headless or interview system/user prompts.
+	//
+	// Wire shape: "initialPrompt" (camelCase, omitempty). Empty/absent is a
+	// no-op and preserves the pre-field wire shape.
+	InitialPrompt string `json:"initialPrompt,omitempty"`
 
 	// InterviewBudget is the per-interview runtime budget the runner
 	// enforces when Mode="interview". nil = no caps. Carried through

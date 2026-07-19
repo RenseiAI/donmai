@@ -37,6 +37,11 @@ const (
 	envAttachToken = "ATTACH_TOKEN"
 	// #nosec G101 -- an env var NAME (the runner reads a path from it), not a credential.
 	envAttachTokenFile = "ATTACH_TOKEN_FILE"
+
+	// maxInitialPromptBytes leaves one byte for the appended newline so the
+	// complete first PTY input stays within the conservative 1,024-byte
+	// canonical-mode boundary shared by the supported host environments.
+	maxInitialPromptBytes = 1023
 )
 
 // interactiveSessionClass returns the sessionClass discriminator the runner
@@ -111,7 +116,8 @@ func (r *Runner) dispatchInteractive(
 		res.FailureMode = FailureInteractiveUnsupported
 		res.Error = fmt.Sprintf(
 			"interactive mode: provider %q spawned a non-interactive handle — harness does not declare PTY transport, so Spec.Interactive was ignored (no live PTY surface to attach)",
-			res.ProviderName)
+			res.ProviderName,
+		)
 		r.logger.Error("[interactive] handle is not InteractiveCapable",
 			"sessionId", qw.SessionID, "provider", res.ProviderName)
 		return res, errors.New(res.Error)
@@ -143,7 +149,8 @@ func (r *Runner) dispatchInteractive(
 		res.FailureMode = FailureInteractiveConfig
 		res.Error = fmt.Sprintf(
 			"interactive mode: half-configured relay attach — exactly one of %s/%s is set (both or neither required)",
-			envAttachURL, envAttachToken)
+			envAttachURL, envAttachToken,
+		)
 		r.logger.Error("[interactive] half-configured attach env",
 			"sessionId", qw.SessionID, "hasURL", attachURL != "", "hasToken", attachToken != "")
 		return res, errors.New(res.Error)
@@ -153,6 +160,53 @@ func (r *Runner) dispatchInteractive(
 		"sessionId", qw.SessionID, "attach", attachURL != "", "wallCapSec", wallCapSeconds(qw))
 	r.postInteractiveActivity(interactiveCtx, worktreePath, sink, "interactive-session-started",
 		"interactive PTY session started")
+
+	// Operator-stop signal (lock-refresh stop=true / 3-strike hand-off). Resolve
+	// it before initial-prompt delivery so a PTY child that is not reading input
+	// cannot hide a deterministic stop behind a blocked write.
+	var lost <-chan struct{}
+	if pulser != nil {
+		lost = pulser.LostOwnership()
+	}
+
+	// Deliver the optional seed as the PTY's first runner-owned input. The
+	// gate stays explicit even though dispatchInteractive is reached only from
+	// the interactive branch: direct callers and future refactors must not leak
+	// this field into headless or interview sessions. Do not trim or otherwise
+	// normalize the payload — the upstream dispatch owns normalization, while
+	// this hop preserves Unicode, multiline content, and whitespace verbatim
+	// before appending the contract-required newline.
+	//
+	// This happens before relay attach starts, so local-only sessions receive
+	// the same seed and carrier reconnects can never replay it.
+	if qw.isInteractive() && qw.InitialPrompt != "" {
+		if err := writeInitialPromptInput(interactiveCtx, lost, handle, isess, qw.InitialPrompt); err != nil {
+			if errors.Is(err, heartbeat.ErrLostOwnership) {
+				return r.finishInteractiveOwnershipLoss(worktreePath, qw, res, sink, pulser)
+			}
+			if interactiveCtx.Err() != nil {
+				res.Status = "stopped"
+				res.Error = interactiveStopReason(interactiveCtx, ctx)
+				r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
+					"interactive session stopped during initial prompt delivery: "+res.Error)
+				r.logger.Info("[interactive] initial prompt delivery cancelled",
+					"sessionId", qw.SessionID, "reason", res.Error)
+				return res, interactiveCtx.Err()
+			}
+
+			wrapped := fmt.Errorf("interactive initial prompt delivery: %w", err)
+			res.Status = "failed"
+			res.FailureMode = FailureInteractiveInput
+			res.Error = wrapped.Error()
+			r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
+				"interactive session failed during initial prompt delivery")
+			r.logger.Error("[interactive] initial prompt delivery failed",
+				"sessionId", qw.SessionID, "err", err)
+			return res, wrapped
+		}
+		r.postInteractiveActivity(interactiveCtx, worktreePath, sink, "interactive-initial-prompt-delivered",
+			"interactive initial prompt delivered")
+	}
 
 	// Start the outbound relay attach when configured. RunHost dials OUT only
 	// (no inbound listener) and blocks until the session ends or a terminal
@@ -188,13 +242,6 @@ func (r *Runner) dispatchInteractive(
 		go func() { attachDone <- attachclient.RunHost(attachCtx, hostCfg) }()
 	}
 
-	// Operator-stop signal (lock-refresh stop=true / 3-strike hand-off). Nil
-	// pulser (construction failure) or nil channel disables this case.
-	var lost <-chan struct{}
-	if pulser != nil {
-		lost = pulser.LostOwnership()
-	}
-
 	for {
 		select {
 		case <-isess.Done():
@@ -218,23 +265,7 @@ func (r *Runner) dispatchInteractive(
 			return res, interactiveCtx.Err()
 
 		case <-lost:
-			// Operator cancel ({"stop":true}) or hand-off — mirror the
-			// headless classification: operator cancel is terminal-non-
-			// retryable (FailureOperatorCancelled); a fuse / hand-off is
-			// FailureLostOwnership. The deferred handle.Stop tears down the PTY.
-			res.Status = "failed"
-			if pulser != nil && pulser.StopRequested() {
-				res.FailureMode = FailureOperatorCancelled
-				res.Error = "operator cancelled interactive session (lock-refresh stop=true)"
-			} else {
-				res.FailureMode = FailureLostOwnership
-				res.Error = heartbeat.ErrLostOwnership.Error()
-			}
-			r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
-				"interactive session ownership lost: "+res.FailureMode)
-			r.logger.Info("[interactive] ownership lost — stopping session",
-				"sessionId", qw.SessionID, "failureMode", res.FailureMode)
-			return res, heartbeat.ErrLostOwnership
+			return r.finishInteractiveOwnershipLoss(worktreePath, qw, res, sink, pulser)
 
 		case err := <-attachDone:
 			// The attach leg terminated (epoch-stale, a non-retryable relay
@@ -245,6 +276,32 @@ func (r *Runner) dispatchInteractive(
 			r.recordAttachLoss(qw, res, err)
 		}
 	}
+}
+
+// finishInteractiveOwnershipLoss classifies both ownership-loss observation
+// points: the steady-state supervisor and a blocked initial-prompt write.
+func (r *Runner) finishInteractiveOwnershipLoss(
+	worktreePath string,
+	qw QueuedWork,
+	res *Result,
+	sink activitySink,
+	pulser *heartbeat.Pulser,
+) (*Result, error) {
+	// Operator cancel ({"stop":true}) is terminal and non-retryable; a
+	// heartbeat fuse or hand-off retains the generic lost-ownership mode.
+	res.Status = "failed"
+	if pulser != nil && pulser.StopRequested() {
+		res.FailureMode = FailureOperatorCancelled
+		res.Error = "operator cancelled interactive session (lock-refresh stop=true)"
+	} else {
+		res.FailureMode = FailureLostOwnership
+		res.Error = heartbeat.ErrLostOwnership.Error()
+	}
+	r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
+		"interactive session ownership lost: "+res.FailureMode)
+	r.logger.Info("[interactive] ownership lost — stopping session",
+		"sessionId", qw.SessionID, "failureMode", res.FailureMode)
+	return res, heartbeat.ErrLostOwnership
 }
 
 // finishInteractive builds the terminal Result from the PTY child's Exit
@@ -322,6 +379,108 @@ func (r *Runner) postInteractiveActivity(ctx context.Context, worktreePath strin
 	if body, err := agent.MarshalEvent(ev); err == nil {
 		r.appendJSONLLine(filepath.Join(worktreePath, state.AgentDirName, "events.jsonl"), body)
 	}
+}
+
+// writeInitialPromptInput writes prompt plus exactly one newline to the live
+// PTY, retrying short writes until the whole logical input is accepted. PTY
+// writes can block when the child has not started reading its bounded input
+// queue, so the write runs separately and cancellation stops the handle to
+// close the PTY and unblock it. The caller owns the mode/non-empty gate.
+func writeInitialPromptInput(
+	ctx context.Context,
+	lost <-chan struct{},
+	handle agent.Handle,
+	isess agent.InteractiveSession,
+	initialPrompt string,
+) error {
+	if initialPromptOwnershipLost(lost) {
+		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if promptBytes := len(initialPrompt); promptBytes > maxInitialPromptBytes {
+		return fmt.Errorf(
+			"interactive initial prompt is %d UTF-8 bytes; limit is %d bytes",
+			promptBytes,
+			maxInitialPromptBytes,
+		)
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- writeInitialPromptBytes(isess, initialPrompt)
+	}()
+
+	return waitInitialPromptWrite(ctx, lost, handle, writeDone)
+}
+
+// waitInitialPromptWrite arbitrates write completion, caller cancellation, and
+// ownership loss. Ownership is probed before blocking and again after either
+// competing arm wins so an already-ready hand-off deterministically outranks a
+// successful write or cancelled parent.
+func waitInitialPromptWrite(
+	ctx context.Context,
+	lost <-chan struct{},
+	handle agent.Handle,
+	writeDone <-chan error,
+) error {
+	if initialPromptOwnershipLost(lost) {
+		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+	}
+
+	select {
+	case err := <-writeDone:
+		if initialPromptOwnershipLost(lost) {
+			return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+		}
+		return err
+	case <-ctx.Done():
+		if initialPromptOwnershipLost(lost) {
+			return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+		}
+		return stopBlockedInitialPrompt(handle, ctx.Err())
+	case <-lost:
+		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+	}
+}
+
+func initialPromptOwnershipLost(lost <-chan struct{}) bool {
+	select {
+	case <-lost:
+		return true
+	default:
+		return false
+	}
+}
+
+func stopBlockedInitialPrompt(handle agent.Handle, cause error) error {
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopCancel()
+	if err := handle.Stop(stopCtx); err != nil {
+		return fmt.Errorf("%w: stop handle after blocked PTY input: %v", cause, err)
+	}
+	return cause
+}
+
+func writeInitialPromptBytes(isess agent.InteractiveSession, initialPrompt string) error {
+	remaining := append([]byte(initialPrompt), '\n')
+	for len(remaining) > 0 {
+		n, err := isess.WriteInput(remaining)
+		if n < 0 || n > len(remaining) {
+			return fmt.Errorf("PTY input returned invalid write count %d for %d bytes", n, len(remaining))
+		}
+		if n > 0 {
+			remaining = remaining[n:]
+		}
+		if err != nil {
+			return fmt.Errorf("write PTY input: %w", err)
+		}
+		if n == 0 {
+			return errors.New("write PTY input: zero-byte write")
+		}
+	}
+	return nil
 }
 
 // attachTokenSource builds the host leg's attachclient.TokenSource. RunHost

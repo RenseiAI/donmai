@@ -239,6 +239,69 @@ func TestBuilderBuild_RaymondShim_NilRegistryPreservesLegacy(t *testing.T) {
 	}
 }
 
+// TestBuilderBuild_InitialPromptExcluded proves initialPrompt remains opaque to
+// every prompt-rendering branch used by headless and interview sessions. A
+// mutation that folds the seed into either system or user output changes the
+// byte-for-byte comparison and fails this test.
+func TestBuilderBuild_InitialPromptExcluded(t *testing.T) {
+	t.Parallel()
+
+	reg, err := templates.New()
+	if err != nil {
+		t.Fatalf("templates.New: %v", err)
+	}
+	builders := []struct {
+		name string
+		new  func() *prompt.Builder
+	}{
+		{name: "legacy", new: prompt.NewBuilder},
+		{name: "raymond", new: func() *prompt.Builder { return &prompt.Builder{Registry: reg} }},
+	}
+	cases := []struct {
+		name   string
+		modify func(*prompt.QueuedWork)
+	}{
+		{name: "headless standard"},
+		{name: "headless stage prompt", modify: func(qw *prompt.QueuedWork) {
+			qw.StageID = "development"
+			qw.StagePrompt = "Implement the requested change."
+		}},
+		{name: "interview", modify: func(qw *prompt.QueuedWork) {
+			qw.Mode = "interview"
+			qw.SystemPromptOverride = "# INTERVIEW MODE\n\nAsk one question per turn."
+		}},
+	}
+	const seed = "seed-only sentinel 🌱\nsecond line"
+	for _, builder := range builders {
+		for _, tc := range cases {
+			t.Run(builder.name+"/"+tc.name, func(t *testing.T) {
+				base := fixtureSession()
+				if tc.modify != nil {
+					tc.modify(&base)
+				}
+				seeded := base
+				seeded.InitialPrompt = seed
+
+				baseSystem, baseUser, err := builder.new().Build(base)
+				if err != nil {
+					t.Fatalf("Build baseline: %v", err)
+				}
+				seededSystem, seededUser, err := builder.new().Build(seeded)
+				if err != nil {
+					t.Fatalf("Build seeded: %v", err)
+				}
+				if seededSystem != baseSystem || seededUser != baseUser {
+					t.Fatalf("initialPrompt changed rendered prompts\nbase system=%q\nseeded system=%q\nbase user=%q\nseeded user=%q",
+						baseSystem, seededSystem, baseUser, seededUser)
+				}
+				if strings.Contains(seededSystem, seed) || strings.Contains(seededUser, seed) {
+					t.Fatal("initialPrompt leaked into prompt output")
+				}
+			})
+		}
+	}
+}
+
 // assertGolden compares got against testdata/<name>.golden, rewriting
 // the file when -update is set. A golden mismatch dumps a unified diff
 // to make template diffs reviewable.

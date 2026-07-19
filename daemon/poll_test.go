@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -888,6 +889,58 @@ func TestPollItemToSessionDetail_MemoryBlockForwarded(t *testing.T) {
 			detail := PollItemToSessionDetail(item, nil, "", "", "")
 			if detail.MemoryBlock != tc.memoryBlock {
 				t.Errorf("MemoryBlock = %q, want %q", detail.MemoryBlock, tc.memoryBlock)
+			}
+		})
+	}
+}
+
+// TestPollResponse_DecodesInitialPrompt proves the optional interactive seed
+// survives strict poll-wire decoding without normalization. Explicit empty and
+// absent both decode to the zero value; non-empty Unicode/multiline content is
+// preserved byte-for-byte.
+func TestPollResponse_DecodesInitialPrompt(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "absent", body: `{"work":[{"sessionId":"seed-a"}]}`, want: ""},
+		{name: "explicit empty", body: `{"work":[{"sessionId":"seed-e","initialPrompt":""}]}`, want: ""},
+		{name: "unicode multiline", body: `{"work":[{"sessionId":"seed-u","initialPrompt":"こんにちは世界 🌱\nsecond line"}]}`, want: "こんにちは世界 🌱\nsecond line"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resp PollResponse
+			if err := json.Unmarshal([]byte(tt.body), &resp); err != nil {
+				t.Fatalf("decode initialPrompt wire shape: %v", err)
+			}
+			if len(resp.Work) != 1 {
+				t.Fatalf("Work len = %d, want 1", len(resp.Work))
+			}
+			if got := resp.Work[0].InitialPrompt; got != tt.want {
+				t.Errorf("InitialPrompt = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	absentBody, err := json.Marshal(PollWorkItem{SessionID: "seed-absent"})
+	if err != nil {
+		t.Fatalf("marshal empty PollWorkItem: %v", err)
+	}
+	if bytes.Contains(absentBody, []byte(`"initialPrompt"`)) {
+		t.Fatalf("empty InitialPrompt must stay omitted, got %s", absentBody)
+	}
+}
+
+// TestPollItemToSessionDetail_InitialPromptForwarded verifies the first opaque
+// forwarding hop preserves the exact value and does not trim whitespace.
+func TestPollItemToSessionDetail_InitialPromptForwarded(t *testing.T) {
+	for _, initialPrompt := range []string{"", "  ", "line one\nline two\n雪"} {
+		t.Run(fmt.Sprintf("bytes-%d", len(initialPrompt)), func(t *testing.T) {
+			item := PollWorkItem{SessionID: "seed-fwd", InitialPrompt: initialPrompt}
+			detail := PollItemToSessionDetail(item, nil, "", "", "")
+			if detail.InitialPrompt != initialPrompt {
+				t.Errorf("InitialPrompt = %q, want %q", detail.InitialPrompt, initialPrompt)
 			}
 		})
 	}

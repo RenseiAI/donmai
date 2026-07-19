@@ -2,12 +2,14 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -265,6 +267,191 @@ func TestRun_PostsToPlatform(t *testing.T) {
 	}
 	if statusHits.Load() == 0 {
 		t.Errorf("expected /status call; got 0")
+	}
+}
+
+// TestRun_CancellationStillPostsTerminalResult exercises the complete Run →
+// result.Poster HTTP path after the run context has been cancelled. The
+// terminal post must retain context values, use a fresh deadline, and deliver a
+// stopped status instead of being short-circuited by the dead parent context.
+func TestRun_CancellationStillPostsTerminalResult(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+
+	type contextKey struct{}
+	type contextObservation struct {
+		err          error
+		hasDeadline  bool
+		deadlineLeft time.Duration
+		value        any
+	}
+
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	var completionHits atomic.Int64
+	statusBodies := make(chan map[string]any, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/lock-refresh"):
+			startedOnce.Do(func() { close(started) })
+		case strings.HasSuffix(req.URL.Path, "/completion"):
+			completionHits.Add(1)
+		case strings.HasSuffix(req.URL.Path, "/status"):
+			var body map[string]any
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Errorf("decode status request: %v", err)
+			} else {
+				statusBodies <- body
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	var observationMu sync.Mutex
+	var observations []contextObservation
+	key := contextKey{}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: srv.URL,
+		WorkerID:    "worker-1",
+		AuthToken:   "tok",
+		HTTPClient:  srv.Client(),
+		MaxAttempts: 1,
+		BaseDelay:   0,
+		CredentialProvider: func(ctx context.Context) (result.RuntimeCredentials, error) {
+			deadline, hasDeadline := ctx.Deadline()
+			observation := contextObservation{
+				err:         ctx.Err(),
+				hasDeadline: hasDeadline,
+				value:       ctx.Value(key),
+			}
+			if hasDeadline {
+				observation.deadlineLeft = time.Until(deadline)
+			}
+			observationMu.Lock()
+			observations = append(observations, observation)
+			observationMu.Unlock()
+			return result.RuntimeCredentials{WorkerID: "worker-1", AuthToken: "tok"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("result.NewPoster: %v", err)
+	}
+
+	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("worktree.NewManager: %v", err)
+	}
+	reg := NewRegistry()
+	provider, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	if err := reg.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	r, err := New(Options{
+		Registry:               reg,
+		WorktreeManager:        wtm,
+		Poster:                 poster,
+		HTTPClient:             srv.Client(),
+		SkipBackstop:           true,
+		SkipSteering:           true,
+		SkipPostSession:        true,
+		PreserveWorktreeAlways: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	qw := QueuedWork{
+		QueuedWork:  queuedWorkBase("CANCEL-POST"),
+		WorkerID:    "worker-1",
+		AuthToken:   "tok",
+		PlatformURL: srv.URL,
+		ResolvedProfile: ResolvedProfile{
+			Provider: agent.ProviderStub,
+			ProviderConfig: map[string]any{
+				"stub.behavior": string(stub.BehaviorHangThenTimeout),
+			},
+		},
+	}
+	qw.Mode = "interview"
+	qw.Repository = makeBareRepo(t)
+
+	parent := context.WithValue(context.Background(), key, "terminal-context-value")
+	runCtx, cancel := context.WithCancel(parent)
+	resultCh := make(chan struct {
+		res *Result
+		err error
+	}, 1)
+	go func() {
+		res, runErr := r.Run(runCtx, qw)
+		resultCh <- struct {
+			res *Result
+			err error
+		}{res: res, err: runErr}
+	}()
+
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("Run did not reach lock refresh before cancellation")
+	}
+
+	var got struct {
+		res *Result
+		err error
+	}
+	select {
+	case got = <-resultCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", got.err)
+	}
+	if got.res == nil || got.res.Status != "stopped" {
+		t.Fatalf("Run result = %#v, want status stopped", got.res)
+	}
+	if completionHits.Load() == 0 {
+		t.Fatal("terminal /completion request was not received")
+	}
+
+	var terminalStatus map[string]any
+	for len(statusBodies) > 0 {
+		body := <-statusBodies
+		if body["status"] == "stopped" {
+			terminalStatus = body
+		}
+	}
+	if terminalStatus == nil {
+		t.Fatal("terminal /status request with status=stopped was not received")
+	}
+
+	observationMu.Lock()
+	gotObservations := append([]contextObservation(nil), observations...)
+	observationMu.Unlock()
+	if len(gotObservations) < 2 {
+		t.Fatalf("credential provider calls = %d, want at least completion + status", len(gotObservations))
+	}
+	for i, observation := range gotObservations {
+		if observation.err != nil {
+			t.Errorf("credential context %d error = %v, want live context", i, observation.err)
+		}
+		if !observation.hasDeadline {
+			t.Errorf("credential context %d has no cleanup deadline", i)
+		}
+		if observation.deadlineLeft <= 0 || observation.deadlineLeft > terminalResultPostTimeout+time.Second {
+			t.Errorf("credential context %d deadline remaining = %v, want (0, %v]", i, observation.deadlineLeft, terminalResultPostTimeout+time.Second)
+		}
+		if observation.value != "terminal-context-value" {
+			t.Errorf("credential context %d value = %v, want preserved parent value", i, observation.value)
+		}
 	}
 }
 

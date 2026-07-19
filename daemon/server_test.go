@@ -552,6 +552,7 @@ func TestServer_SessionDetail_HappyPath(t *testing.T) {
 		WorkerID:        "wkr_1",
 		AuthToken:       "tok",
 		PlatformURL:     "https://app.example.com",
+		InitialPrompt:   "first line\n二行目 🌱",
 		ResolvedProfile: &SessionResolvedProfile{Provider: "stub"},
 	}
 	if _, err := d.AcceptWorkWithDetail(SessionSpec{
@@ -586,6 +587,17 @@ func TestServer_SessionDetail_HappyPath(t *testing.T) {
 	}
 	if got.ResolvedProfile == nil || got.ResolvedProfile.Provider != "stub" {
 		t.Errorf("ResolvedProfile.Provider = %+v, want stub", got.ResolvedProfile)
+	}
+	if got.InitialPrompt != want.InitialPrompt {
+		t.Errorf("InitialPrompt = %q, want %q", got.InitialPrompt, want.InitialPrompt)
+	}
+
+	field, ok := reflect.TypeOf(SessionDetail{}).FieldByName("InitialPrompt")
+	if !ok {
+		t.Fatal("SessionDetail.InitialPrompt field missing")
+	}
+	if got := field.Tag.Get("json"); got != "initialPrompt,omitempty" {
+		t.Fatalf("SessionDetail.InitialPrompt JSON tag = %q, want initialPrompt,omitempty", got)
 	}
 }
 

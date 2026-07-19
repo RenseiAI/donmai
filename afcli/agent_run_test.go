@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -571,6 +572,25 @@ func TestDetailToQueuedWork_MemoryBlockForwarded(t *testing.T) {
 			qw := detailToQueuedWork(d)
 			if qw.MemoryBlock != tc.memoryBlock {
 				t.Errorf("MemoryBlock = %q, want %q", qw.MemoryBlock, tc.memoryBlock)
+			}
+		})
+	}
+}
+
+// TestDetailToQueuedWork_InitialPromptForwarded verifies the daemon-to-runner
+// hop preserves the optional interactive seed exactly, including empty,
+// whitespace-only, Unicode, and multiline values.
+func TestDetailToQueuedWork_InitialPromptForwarded(t *testing.T) {
+	for _, initialPrompt := range []string{"", "  ", "first line\n二行目 🌱"} {
+		t.Run(fmt.Sprintf("bytes-%d", len(initialPrompt)), func(t *testing.T) {
+			d := &daemon.SessionDetail{
+				SessionID:       "sess-seed",
+				InitialPrompt:   initialPrompt,
+				ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+			}
+			qw := detailToQueuedWork(d)
+			if qw.InitialPrompt != initialPrompt {
+				t.Errorf("InitialPrompt = %q, want %q", qw.InitialPrompt, initialPrompt)
 			}
 		})
 	}

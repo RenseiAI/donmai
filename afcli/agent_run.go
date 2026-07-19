@@ -719,6 +719,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			Skills:               detailSkills(d.Skills),
 			MemoryBlock:          d.MemoryBlock,
 			Mode:                 d.Mode,
+			InitialPrompt:        d.InitialPrompt,
 			InterviewDefinition:  d.InterviewDefinition,
 		},
 		Branch:       d.Branch,
