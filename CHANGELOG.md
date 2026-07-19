@@ -68,10 +68,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 - **Faster hosted CI.** Migrates repository workflows to Blacksmith runners
   without changing their test, security, release, or image-build responsibilities.
 - **Reproducible release automation.** Pins the Blacksmith worker-image actions
-  to reviewed immutable commits, makes every manual publisher retry check out
-  and validate an explicit existing tag, derives published versions from that
-  verified tag, preserves `latest` only on automatic tag pushes, and anchors
-  GoReleaser publication to the exact commit it built.
+  to reviewed immutable commits; makes every publisher share one strict SemVer
+  tag grammar and prove a detached checkout at the tag's peeled commit; passes
+  the verified tag explicitly to GoReleaser; prevents manual retries from
+  moving GitHub Latest, the GHCR `latest` image, or E2B `default`; publishes an
+  E2B `donmai-worker:<version>` target for every release; and anchors GoReleaser
+  publication to the exact commit it built.
 - **Go 1.25.12 release floor.** Raises the module and worker-image toolchain to
   Go 1.25.12 and makes every Go-using workflow consume the canonical `go.mod`
   version instead of carrying independent floating or stale versions.

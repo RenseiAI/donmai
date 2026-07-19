@@ -12,8 +12,10 @@ A `v*` tag push starts three independent workflows:
   `donmai` binary with GoReleaser.
 - `.github/workflows/worker-image.yml` publishes the versioned and `latest`
   worker images to GHCR.
-- `.github/workflows/e2b-template.yml` rebuilds the `donmai-worker` E2B
-  template with the release version embedded in the binary.
+- `.github/workflows/e2b-template.yml` publishes an E2B target named
+  `donmai-worker:<version>` with the release version embedded in the binary and,
+  on automatic tag pushes only, advances the rolling `donmai-worker:default`
+  target to the same build.
 
 GoReleaser publishes these archives plus `checksums.txt` and signature-provenance
 sidecars:
@@ -80,8 +82,14 @@ version file to bump.
 
 ## Create the release tag
 
-Tags are immutable release inputs. Always create the tag at an explicit commit
-SHA, never from an implicit branch ref:
+Tags are immutable release inputs. Publisher tags must be strict semantic
+versions: `vMAJOR.MINOR.PATCH`, optionally followed by well-formed SemVer
+prerelease identifiers such as `-rc.1`. Numeric identifiers cannot contain
+leading zeroes. Build metadata, arbitrary suffixes, trailing dots, mutable
+labels such as `latest`, and branch names are rejected.
+
+Always create the tag at an explicit commit SHA, never from an implicit branch
+ref:
 
 ```bash
 tag=vX.Y.Z
@@ -112,16 +120,24 @@ gh workflow run e2b-template.yml --ref main -f tag=vX.Y.Z
 ```
 
 The `--ref` value selects the workflow definition. Each workflow's required
-`tag` input selects a detached checkout of `refs/tags/vX.Y.Z`. Before signing,
-building, or publishing, the job verifies that the tag exists and that its
-peeled commit equals `HEAD`; the published image tag and embedded binary
-version are derived from that same verified tag.
+`tag` input selects a namespace-qualified, detached checkout of
+`refs/tags/vX.Y.Z`, so a same-name branch cannot win ref resolution. The current
+workflow's verifier, E2B wrapper, and GoReleaser latest policy are staged outside
+the workspace before that tag checkout, allowing retries of tags that predate
+the hardening. Before signing, building, or publishing, the shared verifier
+enforces the release-tag grammar, proves detached `HEAD`, and proves that `HEAD`
+equals the tag's peeled commit. The verified tag is exported as
+`GORELEASER_CURRENT_TAG` and is also the only source for published image,
+template, and embedded binary versions.
 
-A manual worker-image retry republishes only the versioned image and leaves
-`latest` unchanged. Only an automatic release-tag push updates `latest`. A
-manual E2B retry also remains read-only with respect to the repository: it may
-surface the created template id in the job output, but it does not commit an
-updated `worker/e2b/e2b.toml` to `main`.
+A manual binary retry sets GoReleaser's supported `release.make_latest` policy
+to false, so replaying an older release cannot replace the repository's current
+GitHub Latest release. Automatic tag pushes retain the normal make-latest
+behavior. A manual worker-image retry republishes only the versioned image and
+leaves `latest` unchanged. A manual E2B retry creates or updates only
+`donmai-worker:vX.Y.Z` and leaves `donmai-worker:default` unchanged; automatic
+tag pushes assign both the version tag and `default` to the new E2B build.
+Neither E2B path writes back to the repository.
 
 Do not pass a branch name, `latest`, or any other mutable label as the `tag`
 input. Do not use a branch-derived `GITHUB_REF_NAME` as a release target.
@@ -133,12 +149,15 @@ tag=vX.Y.Z
 gh release view "$tag" --repo RenseiAI/donmai
 gh api "repos/RenseiAI/donmai/releases/tags/$tag" \
   --jq '{tag_name, target_commitish, draft, prerelease}'
+gh api "repos/RenseiAI/donmai/releases/latest" --jq '.tag_name'
 ```
 
 Confirm:
 
 - `target_commitish` is the immutable release commit SHA, not `main`.
 - The release is neither a draft nor a prerelease unless intentionally planned.
+- After a manual retry of an older tag, `/releases/latest` still returns the
+  previously current release rather than the retried tag.
 - All four archives, `checksums.txt`, and expected `.sig` provenance files are
   attached.
 - Archive names follow the `donmai_<version>_<os>_<arch>.tar.gz` template.
@@ -228,7 +247,8 @@ Run on at least one supported macOS host and one Linux environment:
 [ ] Darwin binary passes codesign and spctl checks
 [ ] Homebrew cask installs the same version and SHA-256 values
 [ ] Versioned GHCR worker image exists
-[ ] E2B template workflow completed for the release tag
+[ ] E2B target donmai-worker:vX.Y.Z exists for the release build
+[ ] Automatic release moved donmai-worker:default to that same E2B build
 ```
 
 ## Failure and rollback
