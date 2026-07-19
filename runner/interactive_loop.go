@@ -156,6 +156,14 @@ func (r *Runner) dispatchInteractive(
 	r.postInteractiveActivity(interactiveCtx, worktreePath, sink, "interactive-session-started",
 		"interactive PTY session started")
 
+	// Operator-stop signal (lock-refresh stop=true / 3-strike hand-off). Resolve
+	// it before initial-prompt delivery so a PTY child that is not reading input
+	// cannot hide a deterministic stop behind a blocked write.
+	var lost <-chan struct{}
+	if pulser != nil {
+		lost = pulser.LostOwnership()
+	}
+
 	// Deliver the optional seed as the PTY's first runner-owned input. The
 	// gate stays explicit even though dispatchInteractive is reached only from
 	// the interactive branch: direct callers and future refactors must not leak
@@ -167,7 +175,10 @@ func (r *Runner) dispatchInteractive(
 	// This happens before relay attach starts, so local-only sessions receive
 	// the same seed and carrier reconnects can never replay it.
 	if qw.isInteractive() && qw.InitialPrompt != "" {
-		if err := writeInitialPromptInput(interactiveCtx, handle, isess, qw.InitialPrompt); err != nil {
+		if err := writeInitialPromptInput(interactiveCtx, lost, handle, isess, qw.InitialPrompt); err != nil {
+			if errors.Is(err, heartbeat.ErrLostOwnership) {
+				return r.finishInteractiveOwnershipLoss(worktreePath, qw, res, sink, pulser)
+			}
 			if interactiveCtx.Err() != nil {
 				res.Status = "stopped"
 				res.Error = interactiveStopReason(interactiveCtx, ctx)
@@ -226,13 +237,6 @@ func (r *Runner) dispatchInteractive(
 		go func() { attachDone <- attachclient.RunHost(attachCtx, hostCfg) }()
 	}
 
-	// Operator-stop signal (lock-refresh stop=true / 3-strike hand-off). Nil
-	// pulser (construction failure) or nil channel disables this case.
-	var lost <-chan struct{}
-	if pulser != nil {
-		lost = pulser.LostOwnership()
-	}
-
 	for {
 		select {
 		case <-isess.Done():
@@ -256,23 +260,7 @@ func (r *Runner) dispatchInteractive(
 			return res, interactiveCtx.Err()
 
 		case <-lost:
-			// Operator cancel ({"stop":true}) or hand-off — mirror the
-			// headless classification: operator cancel is terminal-non-
-			// retryable (FailureOperatorCancelled); a fuse / hand-off is
-			// FailureLostOwnership. The deferred handle.Stop tears down the PTY.
-			res.Status = "failed"
-			if pulser != nil && pulser.StopRequested() {
-				res.FailureMode = FailureOperatorCancelled
-				res.Error = "operator cancelled interactive session (lock-refresh stop=true)"
-			} else {
-				res.FailureMode = FailureLostOwnership
-				res.Error = heartbeat.ErrLostOwnership.Error()
-			}
-			r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
-				"interactive session ownership lost: "+res.FailureMode)
-			r.logger.Info("[interactive] ownership lost — stopping session",
-				"sessionId", qw.SessionID, "failureMode", res.FailureMode)
-			return res, heartbeat.ErrLostOwnership
+			return r.finishInteractiveOwnershipLoss(worktreePath, qw, res, sink, pulser)
 
 		case err := <-attachDone:
 			// The attach leg terminated (epoch-stale, a non-retryable relay
@@ -283,6 +271,32 @@ func (r *Runner) dispatchInteractive(
 			r.recordAttachLoss(qw, res, err)
 		}
 	}
+}
+
+// finishInteractiveOwnershipLoss classifies both ownership-loss observation
+// points: the steady-state supervisor and a blocked initial-prompt write.
+func (r *Runner) finishInteractiveOwnershipLoss(
+	worktreePath string,
+	qw QueuedWork,
+	res *Result,
+	sink activitySink,
+	pulser *heartbeat.Pulser,
+) (*Result, error) {
+	// Operator cancel ({"stop":true}) is terminal and non-retryable; a
+	// heartbeat fuse or hand-off retains the generic lost-ownership mode.
+	res.Status = "failed"
+	if pulser != nil && pulser.StopRequested() {
+		res.FailureMode = FailureOperatorCancelled
+		res.Error = "operator cancelled interactive session (lock-refresh stop=true)"
+	} else {
+		res.FailureMode = FailureLostOwnership
+		res.Error = heartbeat.ErrLostOwnership.Error()
+	}
+	r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
+		"interactive session ownership lost: "+res.FailureMode)
+	r.logger.Info("[interactive] ownership lost — stopping session",
+		"sessionId", qw.SessionID, "failureMode", res.FailureMode)
+	return res, heartbeat.ErrLostOwnership
 }
 
 // finishInteractive builds the terminal Result from the PTY child's Exit
@@ -369,12 +383,18 @@ func (r *Runner) postInteractiveActivity(ctx context.Context, worktreePath strin
 // close the PTY and unblock it. The caller owns the mode/non-empty gate.
 func writeInitialPromptInput(
 	ctx context.Context,
+	lost <-chan struct{},
 	handle agent.Handle,
 	isess agent.InteractiveSession,
 	initialPrompt string,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	select {
+	case <-lost:
+		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
+	default:
 	}
 
 	writeDone := make(chan error, 1)
@@ -386,13 +406,19 @@ func writeInitialPromptInput(
 	case err := <-writeDone:
 		return err
 	case <-ctx.Done():
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer stopCancel()
-		if err := handle.Stop(stopCtx); err != nil {
-			return fmt.Errorf("cancel PTY input after %v: stop handle: %w", ctx.Err(), err)
-		}
-		return ctx.Err()
+		return stopBlockedInitialPrompt(handle, ctx.Err())
+	case <-lost:
+		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
 	}
+}
+
+func stopBlockedInitialPrompt(handle agent.Handle, cause error) error {
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopCancel()
+	if err := handle.Stop(stopCtx); err != nil {
+		return fmt.Errorf("%w: stop handle after blocked PTY input: %v", cause, err)
+	}
+	return cause
 }
 
 func writeInitialPromptBytes(isess agent.InteractiveSession, initialPrompt string) error {

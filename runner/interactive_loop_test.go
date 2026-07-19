@@ -25,6 +25,7 @@ import (
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 	"github.com/coder/websocket"
 )
@@ -475,7 +476,7 @@ func TestWriteInitialPromptInput_RetriesShortWrites(t *testing.T) {
 	session := completedRecordingInteractiveSession()
 	session.maxWrite = 3
 	const seed = "雪だるま\nline two"
-	if err := writeInitialPromptInput(context.Background(), &fakeHandle{}, session, seed); err != nil {
+	if err := writeInitialPromptInput(context.Background(), nil, &fakeHandle{}, session, seed); err != nil {
 		t.Fatalf("writeInitialPromptInput: %v", err)
 	}
 	if got, want := string(session.inputBytes()), seed+"\n"; got != want {
@@ -490,11 +491,193 @@ func TestWriteInitialPromptInput_PreCanceledDoesNotWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	session := completedRecordingInteractiveSession()
-	if err := writeInitialPromptInput(ctx, &fakeHandle{}, session, "must not run"); !errors.Is(err, context.Canceled) {
+	if err := writeInitialPromptInput(ctx, nil, &fakeHandle{}, session, "must not run"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("writeInitialPromptInput error = %v, want context.Canceled", err)
 	}
 	if got := session.writeCount(); got != 0 {
 		t.Fatalf("pre-cancelled initial prompt wrote %d time(s), want 0", got)
+	}
+}
+
+// TestWriteInitialPromptInput_PreLostOwnershipDoesNotWrite locks the ordering
+// guarantee: an ownership signal already present when delivery begins must win
+// before the write goroutine can race it and inject input into a handed-off PTY.
+func TestWriteInitialPromptInput_PreLostOwnershipDoesNotWrite(t *testing.T) {
+	lost := make(chan struct{})
+	close(lost)
+	var stops atomic.Int64
+	handle := &stopCallbackHandle{
+		Handle: &fakeHandle{},
+		stop:   func() { stops.Add(1) },
+	}
+	session := completedRecordingInteractiveSession()
+
+	err := writeInitialPromptInput(context.Background(), lost, handle, session, "must not run")
+	if !errors.Is(err, heartbeat.ErrLostOwnership) {
+		t.Fatalf("writeInitialPromptInput error = %v, want ErrLostOwnership", err)
+	}
+	if got := session.writeCount(); got != 0 {
+		t.Fatalf("pre-lost initial prompt wrote %d time(s), want 0", got)
+	}
+	if got := stops.Load(); got != 1 {
+		t.Fatalf("handle Stop calls = %d, want 1", got)
+	}
+}
+
+// TestInteractive_InitialPromptBlockedOwnershipLoss covers the dispatch-level
+// race where ownership changes while the PTY child is not reading its seed.
+// The lost-ownership signal must stop the handle, unblock the write, preserve
+// the terminal classification, and emit no false delivery activity.
+func TestInteractive_InitialPromptBlockedOwnershipLoss(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	tests := []struct {
+		name            string
+		response        map[string]any
+		wantFailureMode string
+		wantError       string
+	}{
+		{
+			name:            "handoff",
+			response:        map[string]any{"refreshed": false},
+			wantFailureMode: FailureLostOwnership,
+			wantError:       heartbeat.ErrLostOwnership.Error(),
+		},
+		{
+			name:            "operator cancel",
+			response:        map[string]any{"refreshed": true, "stop": true},
+			wantFailureMode: FailureOperatorCancelled,
+			wantError:       "operator cancelled interactive session (lock-refresh stop=true)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var loseOwnership atomic.Bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				response := map[string]any{"refreshed": true}
+				if loseOwnership.Load() {
+					response = tt.response
+				}
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			t.Cleanup(srv.Close)
+
+			pulser, err := heartbeat.New(heartbeat.Config{
+				SessionID:          "seed-ownership-loss",
+				BaseURL:            srv.URL,
+				HTTPClient:         srv.Client(),
+				Interval:           time.Millisecond,
+				MaxAttemptsPerTick: 1,
+				StrikesUntilLost:   3,
+				Logger:             slog.New(slog.DiscardHandler),
+			})
+			if err != nil {
+				t.Fatalf("heartbeat.New: %v", err)
+			}
+			pulseCtx, pulseCancel := context.WithCancel(context.Background())
+			if err := pulser.Start(pulseCtx); err != nil {
+				pulseCancel()
+				t.Fatalf("pulser.Start: %v", err)
+			}
+			t.Cleanup(func() {
+				pulseCancel()
+				_ = pulser.Stop()
+			})
+
+			started := make(chan struct{})
+			release := make(chan struct{})
+			session := &blockingInteractiveSession{
+				InteractiveSession: completedRecordingInteractiveSession(),
+				started:            started,
+				release:            release,
+			}
+			var stops atomic.Int64
+			baseHandle := &stopCallbackHandle{
+				Handle: &fakeHandle{events: make(chan agent.Event)},
+				stop: func() {
+					stops.Add(1)
+					close(release)
+				},
+			}
+			handle := &testInteractiveHandle{Handle: baseHandle, session: session}
+			sink := &recordingSink{}
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+				SessionID:     "seed-ownership-loss",
+				Mode:          interactiveRunMode,
+				InitialPrompt: "blocked seed must never be reported delivered",
+			}}
+			worktreePath := t.TempDir()
+			runner := minimalRunner(t)
+			resultCh := make(chan struct {
+				res *Result
+				err error
+			}, 1)
+			go func() {
+				out, err := runner.dispatchInteractive(
+					context.Background(), handle, worktreePath, qw,
+					&Result{SessionID: qw.SessionID}, sink, pulser,
+				)
+				resultCh <- struct {
+					res *Result
+					err error
+				}{res: out, err: err}
+			}()
+
+			select {
+			case <-started:
+				loseOwnership.Store(true)
+			case <-time.After(time.Second):
+				t.Fatal("initial prompt write never blocked")
+			}
+
+			var got struct {
+				res *Result
+				err error
+			}
+			select {
+			case got = <-resultCh:
+			case <-time.After(2 * time.Second):
+				t.Fatal("ownership loss did not unblock initial prompt delivery")
+			}
+			if !errors.Is(got.err, heartbeat.ErrLostOwnership) {
+				t.Fatalf("dispatch error = %v, want ErrLostOwnership", got.err)
+			}
+			if got.res.Status != "failed" || got.res.FailureMode != tt.wantFailureMode {
+				t.Fatalf("status=%q mode=%q; want failed/%s", got.res.Status, got.res.FailureMode, tt.wantFailureMode)
+			}
+			if got.res.Error != tt.wantError {
+				t.Fatalf("result error = %q, want %q", got.res.Error, tt.wantError)
+			}
+			if got := stops.Load(); got != 1 {
+				t.Fatalf("handle Stop calls = %d, want 1", got)
+			}
+
+			sink.mu.Lock()
+			events := append([]agent.Event(nil), sink.events...)
+			sink.mu.Unlock()
+			var subtypes []string
+			var terminalMessage string
+			for _, ev := range events {
+				system, ok := ev.(agent.SystemEvent)
+				if !ok {
+					continue
+				}
+				subtypes = append(subtypes, system.Subtype)
+				if system.Subtype == "interactive-session-ended" {
+					terminalMessage = system.Message
+				}
+				if strings.Contains(system.Message, qw.InitialPrompt) {
+					t.Fatalf("activity message leaked initialPrompt content: %q", system.Message)
+				}
+			}
+			if got, want := strings.Join(subtypes, ","), "interactive-session-started,interactive-session-ended"; got != want {
+				t.Fatalf("activity subtypes = %q, want %q", got, want)
+			}
+			if got, want := terminalMessage, "interactive session ownership lost: "+tt.wantFailureMode; got != want {
+				t.Fatalf("terminal activity = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
