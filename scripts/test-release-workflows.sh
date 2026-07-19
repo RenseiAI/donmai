@@ -216,6 +216,44 @@ grep -Fq 'steps.release.outputs.e2b_template_ref' "${root_dir}/.github/workflows
 grep -Fq 'steps.release.outputs.e2b_additional_tags' "${root_dir}/.github/workflows/e2b-template.yml" || fail 'E2B rolling default policy is not event-scoped'
 grep -Fq 'RUNNER_TEMP}/build-e2b-template.cjs' "${root_dir}/.github/workflows/e2b-template.yml" || fail 'older E2B retries can lose the current tagged-build wrapper'
 
+# Pull requests exercise the release image's real multi-platform build without
+# inheriting any release credentials or publication surface.
+pr_workflow="${root_dir}/.github/workflows/worker-image-pr.yml"
+worker_workflow="${root_dir}/.github/workflows/worker-image.yml"
+assert_line '  pull_request:' "${pr_workflow}"
+assert_line '  contents: read' "${pr_workflow}"
+assert_line '          platforms: linux/amd64,linux/arm64' "${pr_workflow}"
+assert_line '          push: false' "${pr_workflow}"
+assert_line "            DONMAI_VERSION=pr-\${{ github.event.pull_request.number }}-\${{ github.sha }}" "${pr_workflow}"
+assert_line '          cache-from: type=gha,scope=worker-image-pr' "${pr_workflow}"
+assert_line '          cache-to: type=gha,mode=max,scope=worker-image-pr' "${pr_workflow}"
+
+permission_count=$(grep -Ec '^  [a-z-]+: (read|write|none)$' "${pr_workflow}")
+[[ "${permission_count}" == 1 ]] || fail 'PR worker workflow permissions are not contents:read only'
+
+if grep -Eq '^  (push|workflow_dispatch|schedule|workflow_call):' "${pr_workflow}"; then
+  fail 'PR worker workflow has a non-pull-request trigger'
+fi
+if grep -Eq 'docker/login-action@|\$\{\{ secrets\.|^[[:space:]]+tags:|^[[:space:]]+outputs:|^[[:space:]]+push: true$|^[[:space:]]+load: true$' "${pr_workflow}"; then
+  fail 'PR worker workflow contains credentials or an image export target'
+fi
+if grep -Eq '^[[:space:]]*uses: [^#[:space:]]+@v[0-9]' "${pr_workflow}"; then
+  fail 'PR worker workflow contains a mutable action version tag'
+fi
+if ! grep -Eq '^[[:space:]]*uses: actions/checkout@[0-9a-f]{40}( |$)' "${pr_workflow}"; then
+  fail 'PR worker workflow checkout action is not pinned to a commit SHA'
+fi
+
+for action in \
+  docker/setup-qemu-action \
+  useblacksmith/setup-docker-builder \
+  useblacksmith/build-push-action; do
+  release_ref=$(grep -Eo "${action}@[0-9a-f]{40}" "${worker_workflow}")
+  pr_ref=$(grep -Eo "${action}@[0-9a-f]{40}" "${pr_workflow}")
+  [[ -n "${release_ref}" ]] || fail "release worker workflow does not pin ${action}"
+  [[ "${pr_ref}" == "${release_ref}" ]] || fail "PR worker workflow does not reuse ${release_ref}"
+done
+
 # The E2B build wrapper must pass the versioned target on every build and add
 # the rolling default only when requested by an automatic tag push.
 node - "${e2b_script}" <<'NODE'

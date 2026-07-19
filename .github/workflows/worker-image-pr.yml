@@ -1,0 +1,36 @@
+name: worker-image-pr
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build worker image
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
+
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@6ff44f8e5255f9d8aa31ef22f7e57a2d926b7da0 # v1.11.0
+
+      - name: Build worker image
+        uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2.2.0
+        with:
+          context: .
+          file: worker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            DONMAI_VERSION=pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+          cache-from: type=gha,scope=worker-image-pr
+          cache-to: type=gha,mode=max,scope=worker-image-pr
