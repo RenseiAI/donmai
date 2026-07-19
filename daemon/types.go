@@ -107,6 +107,10 @@ const (
 	SessionTerminated SessionState = "terminated"
 )
 
+// interactiveRunMode is the SessionSpec.Mode value for a PTY-hosted interactive
+// session. It is distinct from the "interview" turn-taking mode.
+const interactiveRunMode = "interactive"
+
 // SessionSpec is an inbound work specification dispatched by the orchestrator.
 // Subset of SandboxSpec from 004 relevant to the daemon's session-dispatch
 // path.
@@ -157,8 +161,9 @@ type SessionSpec struct {
 	// "kg-extraction", ...). One input to the embedder's workload derivation.
 	WorkType string `json:"workType,omitempty"`
 
-	// Mode is the run-mode discriminant ("" = headless, "interview" =
-	// interactive). The other input to workload derivation.
+	// Mode is the run-mode discriminant ("" = headless, "interactive" =
+	// PTY-hosted interactive session, "interview" = turn-taking interview).
+	// The other input to workload derivation.
 	Mode string `json:"mode,omitempty"`
 
 	// Company is the endpoint company key (e.g. "anthropic") — the matrix
@@ -231,9 +236,16 @@ type HeartbeatPayload struct {
 	Hostname       string             `json:"hostname"`
 	Status         RegistrationStatus `json:"status"`
 	ActiveSessions int                `json:"activeSessions"`
-	MaxSessions    int                `json:"maxSessions"`
-	Region         string             `json:"region,omitempty"`
-	SentAt         string             `json:"sentAt"`
+	// ActiveInteractiveSessions is the union of PTY "interactive" and legacy
+	// "interview" run-mode sessions within the unclassed ActiveSessions count
+	// from the same occupancy snapshot. Headless and unknown modes are excluded.
+	// A *int keeps nil ("not classified by this embedder") distinct from a genuine
+	// 0. The corresponding request-body key is `activeInteractiveCount`
+	// (heartbeat.go).
+	ActiveInteractiveSessions *int   `json:"activeInteractiveSessions,omitempty"`
+	MaxSessions               int    `json:"maxSessions"`
+	Region                    string `json:"region,omitempty"`
+	SentAt                    string `json:"sentAt"`
 
 	// AllowlistHash is the SHA-256 of the daemon's current project
 	// allowlist (see allowlist_report.go). Sent on every beat so the
