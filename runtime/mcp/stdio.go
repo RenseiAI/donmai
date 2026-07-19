@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // stdioCloseGrace is how long Close waits for the server to exit on stdin
@@ -100,13 +101,9 @@ func (c *stdioClient) Close() error {
 }
 
 // composeServerEnv merges the server's Env entries onto the process
-// environment (server entries win).
+// environment while keeping runner-only attach controls out of both layers.
 func composeServerEnv(extra map[string]string) []string {
-	env := os.Environ()
-	for k, v := range extra {
-		env = append(env, k+"="+v)
-	}
-	return env
+	return runtimeenv.ComposeChildEnv(os.Environ(), extra)
 }
 
 // stdioConn is the framing + demux layer: one writer mutex, a background

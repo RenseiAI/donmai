@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `donmai` (`af` binary) are documented here.
+All notable changes to the `donmai` binary are documented here.
 
 Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores`. Unreleased work goes under `## [Unreleased]`.
 
@@ -10,10 +10,75 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Features
 
+- **Per-session credential-socket capabilities.** The Go and TypeScript
+  credential clients can send an optional `HELLO.capability`, resolved from an
+  explicit option or `DONMAI_CREDENTIAL_CAPABILITY`, while continuing to omit
+  the field for legacy clients and servers. The capability control variable is
+  blocklisted from credential snapshots and updates.
+- **Credential requirement metadata.** Daemon poll, resolved-profile,
+  session-detail, and spawn-spec wires now carry ordered, non-secret
+  `credentialRequirements` groups plus the resolved `harness` and
+  `servingHost`. All fields are additive and omitted when absent; explicit
+  empty requirement lists and group/name ordering remain distinguishable while
+  decoding and are forwarded without normalization.
 - **Interactive session initial prompts.** Carries the optional `initialPrompt`
   field through daemon polling into the runner and writes it exactly once as the
-  first PTY input for interactive sessions, without changing headless or
-  interview prompt construction.
+  first PTY input for interactive sessions. Delivery remains cancellable on
+  ownership loss and does not change headless or interview prompt construction.
+- **Classified interactive occupancy.** Registration and heartbeat payloads can
+  report additive `activeInteractiveCount` alongside total active sessions,
+  counting both current interactive mode and its legacy interview alias while
+  preserving absent-versus-zero compatibility for older embedders.
+
+### Fixes
+
+- **Aborted spawn and session-detail cleanup.** Adds the public
+  `SpawnerOptions.OnSpawnAborted` rollback hook with exact ownership semantics:
+  pre-spawn failures retain their own cleanup, process-start failures roll back
+  once with the returned wrapped error, and successful starts transfer cleanup
+  to `SessionEventEnded`. `AcceptWorkWithDetail` validates matching session ids,
+  rejects duplicate active deliveries before replacing their detail, and uses
+  generation-owned rollback so a rejected attempt cannot delete a live or later
+  session's detail.
+- **Data-free credential frame diagnostics.** Wrong handshake frames and
+  unknown post-handshake frames now produce fixed Go and TypeScript diagnostics
+  that never interpolate peer-controlled frame types or reflected capability
+  material.
+- **Interactive attach reconnection.** The runner can re-read a rotating attach
+  token from `ATTACH_TOKEN_FILE` for every relay dial attempt, so a reconnect is
+  not stranded after the initial short-lived token expires. A missing or
+  unreadable file may fall back to the static token during startup or atomic
+  refresh races, with deduplicated warnings. An existing empty, malformed, or
+  oversized file fails explicitly instead of silently presenting stale auth,
+  and degraded auth refresh retries are bounded.
+- **Interactive attach child-environment isolation.** Runner-owned `ATTACH_URL`,
+  `ATTACH_TOKEN`, and `ATTACH_TOKEN_FILE` controls are removed from every
+  provider process, PTY child, and model-invoked tool subprocess, including
+  explicit per-session environment overrides, while remaining available to the
+  runner's host-side attach leg.
+
+### Chores
+
+- **Adaptive PTY firehose race gate.** Sizes the race-mode backpressure volume
+  from a bounded warmup throughput probe instead of a machine-specific fixed
+  byte count, retaining all existing pressure and memory assertions.
+- **Secret-safe credential metadata tests.** Verifies ordered credential
+  requirements directly instead of serializing session-detail fixtures that
+  also contain secret-bearing authentication fields.
+- **Faster hosted CI.** Migrates repository workflows to Blacksmith runners
+  without changing their test, security, release, or image-build responsibilities.
+- **Reproducible release automation.** Pins the Blacksmith worker-image actions
+  to reviewed immutable commits; makes every publisher share one strict SemVer
+  tag grammar and prove a detached checkout at the tag's peeled commit; passes
+  the verified tag explicitly to GoReleaser; prevents manual retries and
+  prerelease tags from moving GitHub Latest, the GHCR `latest` image, or E2B
+  `default`; skips the Homebrew publisher for every prerelease and manual retry
+  so older tags cannot roll back the stable cask; publishes an E2B
+  `donmai-worker:<version>` target for every release; and anchors GoReleaser
+  publication to the exact commit it built.
+- **Go 1.25.12 release floor.** Raises the module and worker-image toolchain to
+  Go 1.25.12 and makes every Go-using workflow consume the canonical `go.mod`
+  version instead of carrying independent floating or stale versions.
 
 ---
 

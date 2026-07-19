@@ -72,6 +72,15 @@ type PollWorkItem struct {
 	ResolvedProfile   *SessionResolvedProfile `json:"resolvedProfile,omitempty"`
 	ModelProfile      *SessionModelProfile    `json:"modelProfile,omitempty"`
 
+	// CredentialRequirements, Harness, and ServingHost are additive top-level
+	// projections accepted for producers that stamp resolved execution metadata
+	// beside resolvedProfile. When absent, the conversion helpers fall back to
+	// the same fields nested inside ResolvedProfile. CredentialRequirements
+	// contains environment-variable names only, never values.
+	CredentialRequirements []CredentialEnvRequirement `json:"credentialRequirements,omitempty"`
+	Harness                string                     `json:"harness,omitempty"`
+	ServingHost            string                     `json:"servingHost,omitempty"`
+
 	// Phase 2 stage-driven SDLC fields. Populated
 	// by the platform's `agent.dispatch_stage` action; absent when the
 	// work was queued by the legacy `agent.dispatch_to_queue` action.
@@ -754,6 +763,29 @@ func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*Proje
 	return nil, false
 }
 
+// pollItemCredentialMetadata resolves the additive, non-secret execution-cell
+// metadata accepted in either top-level projected form or nested inside
+// ResolvedProfile. A non-nil top-level CredentialRequirements slice is
+// authoritative even when empty, preserving absent-vs-present-empty semantics;
+// strings use their non-empty top-level projection and otherwise fall back.
+func pollItemCredentialMetadata(item PollWorkItem) (requirements []CredentialEnvRequirement, harness, servingHost string) {
+	requirements = item.CredentialRequirements
+	harness = item.Harness
+	servingHost = item.ServingHost
+	if profile := item.ResolvedProfile; profile != nil {
+		if requirements == nil {
+			requirements = profile.CredentialRequirements
+		}
+		if harness == "" {
+			harness = profile.Harness
+		}
+		if servingHost == "" {
+			servingHost = profile.ServingHost
+		}
+	}
+	return requirements, harness, servingHost
+}
+
 // PollItemToSessionSpec maps a PollWorkItem to a SessionSpec the
 // WorkerSpawner can dispatch.
 //
@@ -777,16 +809,20 @@ func resolveProjectFromAllowlist(value string, projects []ProjectConfig) (*Proje
 // loop before calling a shared daemon's AcceptWorkWithDetail).
 func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
 	repo, matched := resolveAllowlistedRepo(item, projects)
+	credentialRequirements, harness, servingHost := pollItemCredentialMetadata(item)
 	spec := SessionSpec{
-		SessionID:          item.SessionID,
-		ProjectID:          item.ProjectID,
-		RepositoryID:       item.RepositoryID,
-		Repository:         repo,
-		RequiresRepository: item.RequiresRepository,
-		Ref:                item.Ref,
-		Resources:          item.Resources,
-		Env:                item.Env,
-		MaxDurationSeconds: item.MaxDuration,
+		SessionID:              item.SessionID,
+		ProjectID:              item.ProjectID,
+		RepositoryID:           item.RepositoryID,
+		Repository:             repo,
+		RequiresRepository:     item.RequiresRepository,
+		Ref:                    item.Ref,
+		Resources:              item.Resources,
+		Env:                    item.Env,
+		MaxDurationSeconds:     item.MaxDuration,
+		CredentialRequirements: credentialRequirements,
+		Harness:                harness,
+		ServingHost:            servingHost,
 		// ── P3 narrow-only gate inputs (ADR-2026-06-06 §5.3) ─────────────
 		// Copied through (NOT enforced) so the embedder's OnPreSpawn closure
 		// has everything access.ResolveMachineCell needs. WorkType + Mode are
@@ -957,6 +993,7 @@ func WithMergeQueueLanding(flag *bool) SessionDetailOption {
 // callers (the donmai-internal loop passes none).
 func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string, opts ...SessionDetailOption) *SessionDetail {
 	repo, matched := resolveAllowlistedRepo(item, projects)
+	credentialRequirements, harness, servingHost := pollItemCredentialMetadata(item)
 	projectName := item.ProjectName
 	projectID := item.ProjectID
 	if matched != nil && matched.ID != "" {
@@ -978,46 +1015,49 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		)
 	}
 	detail := &SessionDetail{
-		SessionID:            item.SessionID,
-		IssueID:              item.IssueID,
-		IssueIdentifier:      item.IssueIdentifier,
-		LinearSessionID:      item.LinearSessionID,
-		ProviderSessionID:    item.ProviderSessionID,
-		ProjectName:          projectName,
-		ProjectID:            projectID,
-		RepositoryID:         item.RepositoryID,
-		OrganizationID:       item.OrganizationID,
-		Repository:           repo,
-		Ref:                  item.Ref,
-		WorkType:             item.WorkType,
-		PromptContext:        item.PromptContext,
-		Body:                 item.Body,
-		Title:                item.Title,
-		MentionContext:       item.MentionContext,
-		ParentContext:        item.ParentContext,
-		Branch:               item.Branch,
-		ResolvedProfile:      item.ResolvedProfile,
-		ModelProfile:         item.ModelProfile,
-		WorkerID:             workerID,
-		AuthToken:            authToken,
-		PlatformURL:          platformURL,
-		CredentialPoolID:     item.InjectedPoolID,
-		StagePrompt:          item.StagePrompt,
-		StageID:              item.StageID,
-		StageBudget:          item.StageBudget,
-		StageLifecycle:       item.StageLifecycle,
-		StageSourceEventID:   item.StageSourceEventID,
-		SystemPromptOverride: item.SystemPromptOverride,
-		Kits:                 item.Kits,
-		DisallowedTools:      item.DisallowedTools,
-		AllowedTools:         item.AllowedTools,
-		McpServers:           item.McpServers,
-		Skills:               item.Skills,
-		MemoryBlock:          item.MemoryBlock,
-		Mode:                 item.Mode,
-		InitialPrompt:        item.InitialPrompt,
-		InterviewBudget:      item.InterviewBudget,
-		InterviewDefinition:  item.InterviewDefinition,
+		SessionID:              item.SessionID,
+		IssueID:                item.IssueID,
+		IssueIdentifier:        item.IssueIdentifier,
+		LinearSessionID:        item.LinearSessionID,
+		ProviderSessionID:      item.ProviderSessionID,
+		ProjectName:            projectName,
+		ProjectID:              projectID,
+		RepositoryID:           item.RepositoryID,
+		OrganizationID:         item.OrganizationID,
+		Repository:             repo,
+		Ref:                    item.Ref,
+		WorkType:               item.WorkType,
+		PromptContext:          item.PromptContext,
+		Body:                   item.Body,
+		Title:                  item.Title,
+		MentionContext:         item.MentionContext,
+		ParentContext:          item.ParentContext,
+		Branch:                 item.Branch,
+		ResolvedProfile:        item.ResolvedProfile,
+		ModelProfile:           item.ModelProfile,
+		CredentialRequirements: credentialRequirements,
+		Harness:                harness,
+		ServingHost:            servingHost,
+		WorkerID:               workerID,
+		AuthToken:              authToken,
+		PlatformURL:            platformURL,
+		CredentialPoolID:       item.InjectedPoolID,
+		StagePrompt:            item.StagePrompt,
+		StageID:                item.StageID,
+		StageBudget:            item.StageBudget,
+		StageLifecycle:         item.StageLifecycle,
+		StageSourceEventID:     item.StageSourceEventID,
+		SystemPromptOverride:   item.SystemPromptOverride,
+		Kits:                   item.Kits,
+		DisallowedTools:        item.DisallowedTools,
+		AllowedTools:           item.AllowedTools,
+		McpServers:             item.McpServers,
+		Skills:                 item.Skills,
+		MemoryBlock:            item.MemoryBlock,
+		Mode:                   item.Mode,
+		InitialPrompt:          item.InitialPrompt,
+		InterviewBudget:        item.InterviewBudget,
+		InterviewDefinition:    item.InterviewDefinition,
 	}
 	for _, opt := range opts {
 		opt(detail)

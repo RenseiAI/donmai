@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // Default session parameters.
@@ -121,6 +123,9 @@ func composeEnv(parent, overrides []string) []string {
 		key := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			key = kv[:i]
+		}
+		if runtimeenv.IsRunnerOnly(key) {
+			return
 		}
 		if at, ok := idx[key]; ok {
 			out[at] = kv

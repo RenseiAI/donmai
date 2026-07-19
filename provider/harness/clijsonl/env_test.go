@@ -29,3 +29,20 @@ func TestComposeEnv_EmptySpecEnv(t *testing.T) {
 		t.Errorf("composeEnv with empty spec.Env = %v, want %v", out, parent)
 	}
 }
+
+func TestComposeEnv_StripsRunnerOnlyControlsFromBothLayers(t *testing.T) {
+	t.Parallel()
+
+	got := composeEnv(
+		[]string{"PATH=/usr/bin", "ATTACH_TOKEN=parent-secret", "ATTACH_URL=wss://parent.invalid"},
+		map[string]string{
+			"ATTACH_TOKEN":      "spec-secret",
+			"ATTACH_TOKEN_FILE": "/tmp/token",
+			"SAFE":              "kept",
+		},
+	)
+	want := []string{"PATH=/usr/bin", "SAFE=kept"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("composeEnv leaked runner-only controls: got %v, want %v", got, want)
+	}
+}

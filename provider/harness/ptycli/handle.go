@@ -10,6 +10,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/ptyhost"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // stopGrace bounds how long watchCtx waits for a graceful exit after ctx is
@@ -188,6 +189,9 @@ func envSlice(env map[string]string) []string {
 	}
 	keys := make([]string, 0, len(env))
 	for k := range env {
+		if runtimeenv.IsRunnerOnly(k) {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)

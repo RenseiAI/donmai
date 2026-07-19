@@ -8,6 +8,14 @@ import (
 	"github.com/RenseiAI/donmai/runner/access"
 )
 
+// CredentialEnvRequirement describes one non-secret credential requirement
+// group. AnyOf contains environment-variable NAMES only: satisfying any one
+// name satisfies the group. Values must never be placed on this wire surface.
+// Group order and name order are preserved opaquely by the daemon.
+type CredentialEnvRequirement struct {
+	AnyOf []string `json:"anyOf,omitempty"`
+}
+
 // SessionDetail is the per-session payload `donmai agent run` reads from
 // the daemon's local control HTTP API on spawn. It carries the full
 // runner-side QueuedWork shape (issue context, resolved profile,
@@ -92,6 +100,22 @@ type SessionDetail struct {
 	// routing). When present it supersedes ResolvedProfile.Provider /
 	// Model / Effort in the runner. Forwarded opaquely by the daemon.
 	ModelProfile *SessionModelProfile `json:"modelProfile,omitempty"`
+
+	// CredentialRequirements is the ordered, non-secret set of environment-
+	// variable name groups required by the resolved execution cell. Each group
+	// is satisfied by any one of its AnyOf names. The daemon never resolves or
+	// logs values; it only carries the metadata to spawn-time consumers.
+	CredentialRequirements []CredentialEnvRequirement `json:"credentialRequirements,omitempty"`
+
+	// Harness is the resolved loop-driver identity projected from the poll item
+	// (for example, a CLI wrapper or native driver). It is duplicated from the
+	// resolved profile intentionally so spawn-time consumers need not traverse
+	// the opaque profile payload.
+	Harness string `json:"harness,omitempty"`
+
+	// ServingHost is the resolved model-serving location (for example direct,
+	// bedrock, vertex, azure, local, or oauth-cli). It is non-secret metadata.
+	ServingHost string `json:"servingHost,omitempty"`
 
 	// WorkerID is the daemon worker id that claimed this session.
 	WorkerID string `json:"workerId,omitempty"`
@@ -241,7 +265,17 @@ type SessionResolvedProfile struct {
 	// Additive + omitempty: absent on every legacy dispatch (=> the runner
 	// falls back to Provider/Runner). Round-tripped through the daemon's
 	// SessionDetail wire shape.
-	Harness        string         `json:"harness,omitempty"`
+	Harness string `json:"harness,omitempty"`
+
+	// ServingHost is the resolved model-serving location. It stays a string in
+	// the daemon mirror so this wire package does not import the agent package.
+	ServingHost string `json:"servingHost,omitempty"`
+
+	// CredentialRequirements carries ordered groups of environment-variable
+	// names. It is metadata only; credential values never enter the poll/detail
+	// JSON path.
+	CredentialRequirements []CredentialEnvRequirement `json:"credentialRequirements,omitempty"`
+
 	Provider       string         `json:"provider,omitempty"`
 	Runner         string         `json:"runner,omitempty"`
 	Model          string         `json:"model,omitempty"`
@@ -327,16 +361,28 @@ type SessionModelProfile struct {
 // writes on AcceptWork and the HTTP server reads on
 // /api/daemon/sessions/<id>.
 type sessionDetailStore struct {
-	mu      sync.RWMutex
-	details map[string]*SessionDetail
+	mu             sync.RWMutex
+	details        map[string]*SessionDetail
+	generations    map[string]uint64
+	nextGeneration uint64
+}
+
+type sessionDetailLease struct {
+	sessionID  string
+	generation uint64
 }
 
 // newSessionDetailStore returns an empty store.
 func newSessionDetailStore() *sessionDetailStore {
-	return &sessionDetailStore{details: make(map[string]*SessionDetail)}
+	return &sessionDetailStore{
+		details:     make(map[string]*SessionDetail),
+		generations: make(map[string]uint64),
+	}
 }
 
 // Set stores the detail under d.SessionID. Overwrites any prior entry.
+// Runtime admission uses StoreIfAbsent instead so a retry cannot replace an
+// already-running session's detail.
 func (s *sessionDetailStore) Set(d *SessionDetail) {
 	if d == nil || d.SessionID == "" {
 		return
@@ -344,6 +390,33 @@ func (s *sessionDetailStore) Set(d *SessionDetail) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.details[d.SessionID] = d
+	s.generations[d.SessionID] = s.nextGenerationLocked()
+}
+
+// StoreIfAbsent installs d only when its session id is not already owned. The
+// returned lease identifies this exact installation so a failed attempt can
+// roll itself back without deleting a later generation.
+func (s *sessionDetailStore) StoreIfAbsent(d *SessionDetail) (sessionDetailLease, bool) {
+	if d == nil || d.SessionID == "" {
+		return sessionDetailLease{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.details[d.SessionID]; exists {
+		return sessionDetailLease{}, false
+	}
+	generation := s.nextGenerationLocked()
+	s.details[d.SessionID] = d
+	s.generations[d.SessionID] = generation
+	return sessionDetailLease{sessionID: d.SessionID, generation: generation}, true
+}
+
+func (s *sessionDetailStore) nextGenerationLocked() uint64 {
+	s.nextGeneration++
+	if s.nextGeneration == 0 {
+		s.nextGeneration++
+	}
+	return s.nextGeneration
 }
 
 // Get returns the detail for the given session id, or (nil, false)
@@ -351,8 +424,8 @@ func (s *sessionDetailStore) Set(d *SessionDetail) {
 func (s *sessionDetailStore) Get(id string) (*SessionDetail, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	d, ok := s.details[id]
-	return d, ok
+	detail, ok := s.details[id]
+	return detail, ok
 }
 
 // UpdateRuntimeCredentials refreshes the worker credentials exposed to every
@@ -385,6 +458,24 @@ func (s *sessionDetailStore) Delete(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.details, id)
+	delete(s.generations, id)
+}
+
+// DeleteIfOwner removes only the generation installed by lease. It is the
+// rollback path for a rejected spawn attempt; a stale rollback must never
+// remove a detail installed by a later attempt for the same session id.
+func (s *sessionDetailStore) DeleteIfOwner(lease sessionDetailLease) bool {
+	if lease.sessionID == "" || lease.generation == 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.details[lease.sessionID]; !ok || s.generations[lease.sessionID] != lease.generation {
+		return false
+	}
+	delete(s.details, lease.sessionID)
+	delete(s.generations, lease.sessionID)
+	return true
 }
 
 // Len reports the number of currently-tracked sessions. Useful for

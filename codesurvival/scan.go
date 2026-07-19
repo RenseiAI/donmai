@@ -4,6 +4,8 @@ import (
 	"context"
 	"os/exec"
 	"strings"
+
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // gitRunner abstracts `git` invocation so tests can substitute a fixture
@@ -23,6 +25,7 @@ func (execGitRunner) run(ctx context.Context, repoPath string, args ...string) (
 	// constructed from validated batch-work fields at the call sites below.
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = repoPath
+	cmd.Env = runtimeenv.FilterRunnerOnly(cmd.Environ())
 	out, err := cmd.CombinedOutput()
 	return strings.TrimRight(string(out), " \n\t"), err
 }

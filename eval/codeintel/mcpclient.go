@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // mcpToolResult is one code-intel MCP tool call's outcome: the text content the
@@ -33,7 +34,7 @@ func callMCPTool(ctx context.Context, entry agent.MCPServerConfig, env []string,
 		return mcpToolResult{}, fmt.Errorf("mcp entry has empty Command")
 	}
 	cmd := exec.CommandContext(ctx, entry.Command, entry.Args...) // nolint:gosec // command/args are the frozen af-code-intelligence entry.
-	cmd.Env = env
+	cmd.Env = runtimeenv.FilterRunnerOnly(env)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return mcpToolResult{}, fmt.Errorf("stdin pipe: %w", err)

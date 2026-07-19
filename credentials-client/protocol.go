@@ -9,8 +9,9 @@ import "time"
 
 // helloMessage is the first frame an agent sends after dial.
 type helloMessage struct {
-	Type      string `json:"type"`
-	SessionID string `json:"sessionId"`
+	Type       string `json:"type"`
+	SessionID  string `json:"sessionId"`
+	Capability string `json:"capability,omitempty"`
 }
 
 // initialMessage is the server's reply to a HELLO. Env carries the

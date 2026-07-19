@@ -27,6 +27,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // ErrDiffFetchUnavailable is returned when the GitHub CLI (`gh`) is not on PATH.
@@ -78,7 +80,9 @@ func runGh(ctx context.Context, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, diffFetchTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, "gh", args...).Output() //nolint:gosec // G204: args are controlled flags + a caller-validated PR ref.
+	cmd := exec.CommandContext(ctx, "gh", args...) //nolint:gosec // G204: args are controlled flags + a caller-validated PR ref.
+	cmd.Env = runtimeenv.ComposeChildEnv(os.Environ())
+	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {

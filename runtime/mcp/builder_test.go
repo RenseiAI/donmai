@@ -39,7 +39,12 @@ func TestBuildRoundtrip(t *testing.T) {
 			Name:    "af-linear",
 			Command: "/usr/local/bin/af",
 			Args:    []string{"linear-mcp"},
-			Env:     map[string]string{"LINEAR_API_KEY": "sk-test"},
+			Env: map[string]string{
+				"LINEAR_API_KEY":    "sk-test",
+				"ATTACH_TOKEN":      "must-not-serialize",
+				"ATTACH_TOKEN_FILE": "/must/not/serialize",
+				"ATTACH_URL":        "wss://must-not-serialize.invalid",
+			},
 		},
 		{
 			Name:    "af-code",
@@ -74,6 +79,12 @@ func TestBuildRoundtrip(t *testing.T) {
 		!reflect.DeepEqual(got.Args, []string{"linear-mcp"}) ||
 		got.Env["LINEAR_API_KEY"] != "sk-test" {
 		t.Fatalf("af-linear roundtrip mismatch: %+v", got)
+	} else {
+		for _, key := range []string{"ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL"} {
+			if _, leaked := got.Env[key]; leaked {
+				t.Fatalf("af-linear serialized runner-only %s: %+v", key, got.Env)
+			}
+		}
 	}
 	if got := cfg.MCPServers["af-code"]; got.Type != "stdio" || got.Command != "/usr/local/bin/af" ||
 		!reflect.DeepEqual(got.Args, []string{"code-mcp"}) || got.Env != nil {

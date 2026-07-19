@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // AdvertiseMode selects how the WITH arm learns the code-intel tools exist
@@ -272,7 +273,7 @@ func (promptHelpAdvertisement) AdvertisedToolNames(TaskType) []string {
 // output. Used to author the prompt-help advertisement from live help text.
 func runHelp(ctx context.Context, donmaiBin string, env []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, donmaiBin, args...) // nolint:gosec // donmaiBin is the operator-supplied harness binary path.
-	cmd.Env = env
+	cmd.Env = runtimeenv.FilterRunnerOnly(env)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), err

@@ -25,6 +25,23 @@ func TestMain(m *testing.M) {
 }
 
 func runFakeStdioServer() {
+	if report := os.Getenv("MCP_FAKE_ENV_REPORT"); report != "" {
+		status := "clean"
+		if _, ok := os.LookupEnv("ATTACH_TOKEN"); ok {
+			status = "leaked"
+		}
+		if _, ok := os.LookupEnv("ATTACH_TOKEN_FILE"); ok {
+			status = "leaked"
+		}
+		if _, ok := os.LookupEnv("ATTACH_URL"); ok {
+			status = "leaked"
+		}
+		if os.Getenv("MCP_SAFE_ENV") != "present" {
+			status = "missing-safe-env"
+		}
+		_ = os.WriteFile(report, []byte(status), 0o600) //nolint:gosec // test re-exec writes its caller-owned temp report
+	}
+
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	enc := json.NewEncoder(os.Stdout)
@@ -112,6 +129,40 @@ func TestStdioClient_EndToEnd(t *testing.T) {
 		t.Errorf("Close: %v", err)
 	}
 	_ = c.Close() // idempotent
+}
+
+func TestStdioClient_ChildEnvSanitized(t *testing.T) {
+	t.Setenv("ATTACH_TOKEN", "parent-secret")
+	t.Setenv("ATTACH_TOKEN_FILE", "/parent/token")
+	t.Setenv("ATTACH_URL", "wss://parent.invalid/v1/rooms/room-1")
+
+	report := t.TempDir() + "/env-report.txt"
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, agent.MCPServerConfig{
+		Name:    "fake-stdio-env",
+		Command: os.Args[0],
+		Env: map[string]string{
+			"MCP_FAKE_STDIO_SERVER": "1",
+			"MCP_FAKE_ENV_REPORT":   report,
+			"MCP_SAFE_ENV":          "present",
+			"ATTACH_TOKEN":          "explicit-secret",
+			"ATTACH_TOKEN_FILE":     "/explicit/token",
+			"ATTACH_URL":            "wss://explicit.invalid/v1/rooms/room-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Dial(stdio): %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	body, err := os.ReadFile(report) //nolint:gosec // report is a test-owned temp file
+	if err != nil {
+		t.Fatalf("read env report: %v", err)
+	}
+	if got, want := string(body), "clean"; got != want {
+		t.Fatalf("MCP child env report = %q, want %q", got, want)
+	}
 }
 
 func TestStdioClient_MissingCommandRejected(t *testing.T) {

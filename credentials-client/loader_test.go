@@ -2,10 +2,12 @@ package credentials
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -51,8 +53,14 @@ type fakeServer struct {
 	malformedInitial bool
 
 	// wrongTypeInitial, when true, sends a well-formed frame whose
-	// type is not "INITIAL".
-	wrongTypeInitial bool
+	// type is not "INITIAL". wrongTypeInitialValue overrides the default
+	// so redaction tests can reflect capability material into the type.
+	wrongTypeInitial      bool
+	wrongTypeInitialValue string
+
+	// legacyHelloOnly makes the server decode only the original
+	// type/sessionId fields, proving additive HELLO properties are ignored.
+	legacyHelloOnly bool
 
 	// updates is an ordered queue of update frames to push after the
 	// INITIAL handshake.
@@ -68,9 +76,11 @@ type fakeServer struct {
 	serverBye bool
 
 	// hello captures the HELLO frame the client sent (one per
-	// connection). Tests read this after dialing.
-	helloMu sync.Mutex
-	hellos  []helloMessage
+	// connection). Tests read this after dialing. helloLines preserves the
+	// exact JSON object so omission tests can distinguish absent from empty.
+	helloMu    sync.Mutex
+	hellos     []helloMessage
+	helloLines [][]byte
 
 	// stopCh closes when the server should shut down.
 	stopCh chan struct{}
@@ -133,9 +143,21 @@ func (s *fakeServer) handle(conn net.Conn) {
 		return
 	}
 	var hello helloMessage
-	if jerr := json.Unmarshal(line, &hello); jerr == nil {
+	var helloErr error
+	if s.legacyHelloOnly {
+		var legacy struct {
+			Type      string `json:"type"`
+			SessionID string `json:"sessionId"`
+		}
+		helloErr = json.Unmarshal(line, &legacy)
+		hello = helloMessage{Type: legacy.Type, SessionID: legacy.SessionID}
+	} else {
+		helloErr = json.Unmarshal(line, &hello)
+	}
+	if helloErr == nil {
 		s.helloMu.Lock()
 		s.hellos = append(s.hellos, hello)
+		s.helloLines = append(s.helloLines, bytes.TrimSpace(append([]byte(nil), line...)))
 		s.helloMu.Unlock()
 	}
 
@@ -155,9 +177,13 @@ func (s *fakeServer) handle(conn net.Conn) {
 	}
 
 	if s.wrongTypeInitial {
+		wrongType := s.wrongTypeInitialValue
+		if wrongType == "" {
+			wrongType = "OOPS"
+		}
 		bad, _ := json.Marshal(struct {
 			Type string `json:"type"`
-		}{Type: "OOPS"})
+		}{Type: wrongType})
 		bad = append(bad, '\n')
 		_, _ = conn.Write(bad)
 		<-s.stopCh
@@ -247,6 +273,20 @@ func (s *fakeServer) helloCount() int {
 	return len(s.hellos)
 }
 
+func (s *fakeServer) capturedHello(t *testing.T) (helloMessage, map[string]json.RawMessage) {
+	t.Helper()
+	s.helloMu.Lock()
+	defer s.helloMu.Unlock()
+	if len(s.hellos) == 0 || len(s.helloLines) == 0 {
+		t.Fatal("server did not capture a HELLO frame")
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(s.helloLines[0], &raw); err != nil {
+		t.Fatalf("decode captured HELLO: %v", err)
+	}
+	return s.hellos[0], raw
+}
+
 // withEnvironOverride returns an Options that sources environ from the
 // given map (KEY=VAL slice). Used by standalone-mode tests.
 func withEnvironOverride(entries []string) Options {
@@ -282,6 +322,7 @@ func TestStandaloneBlocklist(t *testing.T) {
 		"FOO=visible",
 		"DONMAI_DAEMON_JWT=should-be-blocked",
 		"WORKER_API_KEY=also-blocked",
+		CapabilityEnvVar + "=handshake-only",
 	})
 	loader, err := New(t.Context(), opts)
 	if err != nil {
@@ -295,12 +336,18 @@ func TestStandaloneBlocklist(t *testing.T) {
 	if v, ok := loader.Get("WORKER_API_KEY"); ok || v != "" {
 		t.Fatalf("Get(WORKER_API_KEY) = (%q, %v); want (\"\", false)", v, ok)
 	}
+	if v, ok := loader.Get(CapabilityEnvVar); ok || v != "" {
+		t.Fatalf("Get(%s) = (%q, %v); want (\"\", false)", CapabilityEnvVar, v, ok)
+	}
 	if v, ok := loader.Get("FOO"); !ok || v != "visible" {
 		t.Fatalf("Get(FOO) = (%q, %v); want (visible, true)", v, ok)
 	}
 	all := loader.All()
 	if _, present := all["DONMAI_DAEMON_JWT"]; present {
 		t.Fatalf("All() leaked DONMAI_DAEMON_JWT: %v", all)
+	}
+	if _, present := all[CapabilityEnvVar]; present {
+		t.Fatalf("All() leaked %s: %v", CapabilityEnvVar, all)
 	}
 }
 
@@ -370,10 +417,130 @@ func TestDaemonHappyPath(t *testing.T) {
 	fs.helloMu.Unlock()
 }
 
+func TestDaemonHelloCapabilityExplicit(t *testing.T) {
+	t.Setenv(CapabilityEnvVar, "")
+	fs := newFakeServer(t, map[string]string{"API_KEY": "value"})
+	fs.start()
+
+	loader, err := New(t.Context(), Options{
+		SessionID:          "explicit-capability",
+		Capability:         "cap-explicit",
+		SocketPathOverride: fs.path,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = loader.Close() })
+
+	hello, raw := fs.capturedHello(t)
+	if hello.Capability != "cap-explicit" {
+		t.Fatalf("HELLO capability = %q; want cap-explicit", hello.Capability)
+	}
+	if _, ok := raw["capability"]; !ok {
+		t.Fatalf("HELLO omitted the explicit capability property")
+	}
+}
+
+func TestDaemonHelloCapabilityEnvironmentFallback(t *testing.T) {
+	t.Setenv(CapabilityEnvVar, "cap-from-env")
+	fs := newFakeServer(t, map[string]string{})
+	fs.start()
+
+	loader, err := New(t.Context(), Options{
+		SessionID:          "env-capability",
+		SocketPathOverride: fs.path,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = loader.Close() })
+
+	hello, _ := fs.capturedHello(t)
+	if hello.Capability != "cap-from-env" {
+		t.Fatalf("HELLO capability = %q; want cap-from-env", hello.Capability)
+	}
+}
+
+func TestDaemonHelloCapabilityExplicitWins(t *testing.T) {
+	t.Setenv(CapabilityEnvVar, "cap-from-env")
+	fs := newFakeServer(t, map[string]string{})
+	fs.start()
+
+	loader, err := New(t.Context(), Options{
+		SessionID:          "option-precedence",
+		Capability:         "cap-from-option",
+		SocketPathOverride: fs.path,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = loader.Close() })
+
+	hello, _ := fs.capturedHello(t)
+	if hello.Capability != "cap-from-option" {
+		t.Fatalf("HELLO capability = %q; want cap-from-option", hello.Capability)
+	}
+}
+
+func TestDaemonHelloCapabilityOmittedWhenEmpty(t *testing.T) {
+	t.Setenv(CapabilityEnvVar, "")
+	fs := newFakeServer(t, map[string]string{})
+	fs.start()
+
+	loader, err := New(t.Context(), Options{
+		SessionID:          "legacy-shape",
+		SocketPathOverride: fs.path,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = loader.Close() })
+
+	_, raw := fs.capturedHello(t)
+	if _, ok := raw["capability"]; ok {
+		t.Fatalf("legacy HELLO unexpectedly contains capability: %s", fs.helloLines[0])
+	}
+	if len(raw) != 2 {
+		t.Fatalf("legacy HELLO fields = %v; want only type/sessionId", raw)
+	}
+}
+
+func TestDaemonLegacyServerIgnoresCapability(t *testing.T) {
+	t.Setenv(CapabilityEnvVar, "")
+	fs := newFakeServer(t, map[string]string{"API_KEY": "legacy-server"})
+	fs.legacyHelloOnly = true
+	fs.start()
+
+	loader, err := New(t.Context(), Options{
+		SessionID:          "legacy-server",
+		Capability:         "additive-capability",
+		SocketPathOverride: fs.path,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = loader.Close() })
+
+	if loader.Mode() != ModeDaemon {
+		t.Fatalf("legacy server handshake mode = %q; want daemon", loader.Mode())
+	}
+	if value, ok := loader.Get("API_KEY"); !ok || value != "legacy-server" {
+		t.Fatalf("legacy server INITIAL value = (%q, %v); want (legacy-server, true)", value, ok)
+	}
+	hello, raw := fs.capturedHello(t)
+	if hello.SessionID != "legacy-server" {
+		t.Fatalf("legacy server decoded sessionId = %q; want legacy-server", hello.SessionID)
+	}
+	if _, ok := raw["capability"]; !ok {
+		t.Fatalf("client did not send additive capability to legacy server")
+	}
+}
+
 func TestDaemonBlocklistFromINITIAL(t *testing.T) {
 	fs := newFakeServer(t, map[string]string{
 		"API_KEY":           "good",
 		"DONMAI_DAEMON_JWT": "leaked-via-bad-daemon",
+		CapabilityEnvVar:    "must-not-enter-snapshot",
 	})
 	fs.start()
 
@@ -391,6 +558,12 @@ func TestDaemonBlocklistFromINITIAL(t *testing.T) {
 	}
 	if _, present := loader.All()["DONMAI_DAEMON_JWT"]; present {
 		t.Fatalf("All() leaked DONMAI_DAEMON_JWT")
+	}
+	if value, ok := loader.Get(CapabilityEnvVar); ok || value != "" {
+		t.Fatalf("Get(%s) leaked INITIAL capability", CapabilityEnvVar)
+	}
+	if _, present := loader.All()[CapabilityEnvVar]; present {
+		t.Fatalf("All() leaked %s from INITIAL", CapabilityEnvVar)
 	}
 }
 
@@ -447,15 +620,21 @@ func TestDaemonMalformedINITIALFallsBack(t *testing.T) {
 }
 
 func TestDaemonWrongTypeINITIALFallsBack(t *testing.T) {
+	const capability = "reflected-capability-must-stay-private"
 	t.Setenv(SocketEnvVar, "")
 	fs := newFakeServer(t, nil)
 	fs.wrongTypeInitial = true
+	fs.wrongTypeInitialValue = capability
 	fs.start()
+	var diagnostics bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&diagnostics, nil))
 
 	loader, err := New(t.Context(), Options{
 		SessionID:          "s",
+		Capability:         capability,
 		SocketPathOverride: fs.path,
 		HandshakeTimeout:   500 * time.Millisecond,
+		Logger:             logger,
 		environFn:          func() []string { return nil },
 	})
 	if err != nil {
@@ -465,6 +644,59 @@ func TestDaemonWrongTypeINITIALFallsBack(t *testing.T) {
 
 	if loader.Mode() != ModeStandalone {
 		t.Fatalf("expected standalone fallback on wrong-type INITIAL")
+	}
+	if got := diagnostics.String(); strings.Contains(got, capability) {
+		t.Fatalf("wrong-frame fallback diagnostic reflected capability material: %s", got)
+	} else if !strings.Contains(got, unexpectedInitialFrameError) {
+		t.Fatalf("wrong-frame fallback diagnostic = %q, want fixed %q", got, unexpectedInitialFrameError)
+	}
+}
+
+func TestDialAndHandshakeWrongTypeErrorIsFixedAndDataFree(t *testing.T) {
+	const capability = "reflected-capability-must-not-enter-error"
+	fs := newFakeServer(t, nil)
+	fs.wrongTypeInitial = true
+	fs.wrongTypeInitialValue = capability
+	fs.start()
+
+	loader, err := dialAndHandshake(t.Context(), fs.path, "s", capability, 500*time.Millisecond)
+	if loader != nil {
+		_ = loader.Close()
+		t.Fatal("dialAndHandshake returned a loader for a wrong INITIAL frame")
+	}
+	if err == nil {
+		t.Fatal("dialAndHandshake returned nil error for a wrong INITIAL frame")
+	}
+	if got := err.Error(); got != unexpectedInitialFrameError {
+		t.Fatalf("wrong-frame error = %q, want fixed %q", got, unexpectedInitialFrameError)
+	}
+	if strings.Contains(err.Error(), capability) {
+		t.Fatalf("wrong-frame error reflected capability material: %q", err)
+	}
+}
+
+func TestUnknownFrameDiagnosticIsFixedAndDataFree(t *testing.T) {
+	const capability = "reflected-capability-must-not-enter-warning"
+	var diagnostics bytes.Buffer
+	loader := &Loader{
+		logger: slog.New(slog.NewTextHandler(&diagnostics, nil)),
+		env:    make(map[string]string),
+	}
+	frame, err := json.Marshal(map[string]any{
+		"type":       capability,
+		"capability": capability,
+	})
+	if err != nil {
+		t.Fatalf("marshal reflected frame: %v", err)
+	}
+
+	loader.handleFrame(frame)
+	got := diagnostics.String()
+	if strings.Contains(got, capability) {
+		t.Fatalf("unknown-frame diagnostic reflected capability material: %s", got)
+	}
+	if !strings.Contains(got, unknownFrameWarning) {
+		t.Fatalf("unknown-frame diagnostic = %q, want fixed %q", got, unknownFrameWarning)
 	}
 }
 
@@ -488,6 +720,34 @@ func TestDaemonDialFailureFallsBack(t *testing.T) {
 	}
 	if v, _ := loader.Get("GOT_FALLBACK"); v != "1" {
 		t.Fatalf("standalone env not populated: Get(GOT_FALLBACK)=%q", v)
+	}
+}
+
+func TestDaemonCapabilityValueNotLoggedOnFallback(t *testing.T) {
+	const capability = "capability-value-must-not-be-logged"
+	t.Setenv(SocketEnvVar, "")
+	t.Setenv(CapabilityEnvVar, capability)
+	missing := filepath.Join("/tmp", "afc-creds-missing-capability-log", "no.sock")
+	var diagnostics bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&diagnostics, nil))
+
+	loader, err := New(t.Context(), Options{
+		SessionID:          "log-redaction",
+		SocketPathOverride: missing,
+		HandshakeTimeout:   100 * time.Millisecond,
+		Logger:             logger,
+		environFn:          func() []string { return []string{CapabilityEnvVar + "=" + capability} },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = loader.Close() })
+
+	if strings.Contains(diagnostics.String(), capability) {
+		t.Fatalf("diagnostic log exposed the capability value")
+	}
+	if _, present := loader.All()[CapabilityEnvVar]; present {
+		t.Fatalf("standalone fallback exposed %s", CapabilityEnvVar)
 	}
 }
 
@@ -605,6 +865,7 @@ func TestDaemonUpdateAppliesBlocklist(t *testing.T) {
 	fs.pushUpdate(map[string]string{
 		"GOOD":              "ok",
 		"DONMAI_DAEMON_JWT": "leak",
+		CapabilityEnvVar:    "must-not-rotate",
 	})
 	fs.releaseUpdates = make(chan struct{})
 	fs.start()
@@ -629,6 +890,9 @@ func TestDaemonUpdateAppliesBlocklist(t *testing.T) {
 		if _, leaked := d["DONMAI_DAEMON_JWT"]; leaked {
 			t.Fatalf("subscriber received blocked key: %v", d)
 		}
+		if _, leaked := d[CapabilityEnvVar]; leaked {
+			t.Fatalf("subscriber received %s", CapabilityEnvVar)
+		}
 		if d["GOOD"] != "ok" {
 			t.Fatalf("subscriber missing GOOD: %v", d)
 		}
@@ -638,6 +902,12 @@ func TestDaemonUpdateAppliesBlocklist(t *testing.T) {
 
 	if v, _ := loader.Get("DONMAI_DAEMON_JWT"); v != "" {
 		t.Fatalf("Get leaked blocked key from UPDATE")
+	}
+	if v, ok := loader.Get(CapabilityEnvVar); ok || v != "" {
+		t.Fatalf("Get leaked %s from UPDATE", CapabilityEnvVar)
+	}
+	if _, present := loader.All()[CapabilityEnvVar]; present {
+		t.Fatalf("All() leaked %s from UPDATE", CapabilityEnvVar)
 	}
 }
 
@@ -685,6 +955,12 @@ func TestDaemonServerBYEEndsPumpCleanly(t *testing.T) {
 	case <-loader.readerDone:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("pump did not exit after server BYE")
+	}
+}
+
+func TestCapabilityEnvVar(t *testing.T) {
+	if CapabilityEnvVar != "DONMAI_CREDENTIAL_CAPABILITY" {
+		t.Fatalf("CapabilityEnvVar = %q; want DONMAI_CREDENTIAL_CAPABILITY", CapabilityEnvVar)
 	}
 }
 

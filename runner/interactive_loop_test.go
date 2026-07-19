@@ -1229,10 +1229,16 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 
 	platform := newRecordingPlatformServer(t)
 
-	// The composing daemon would inject these; the OSS runner reads them
-	// from its process env.
+	// The composing daemon would inject these; the OSS runner reads them from
+	// its process env but must not pass the runner-only controls to the PTY child.
+	hostToken := mkInteractiveHostToken(sessionID, 1)
+	tokenPath := filepath.Join(t.TempDir(), "attach-token")
+	if err := os.WriteFile(tokenPath, []byte(hostToken+"\n"), 0o600); err != nil {
+		t.Fatalf("write attach token file: %v", err)
+	}
 	t.Setenv(envAttachURL, relay.BaseWSURL())
-	t.Setenv(envAttachToken, mkInteractiveHostToken(sessionID, 1))
+	t.Setenv(envAttachToken, hostToken)
+	t.Setenv(envAttachTokenFile, tokenPath)
 
 	bareRepo := makeBareRepo(t)
 	wtParent := t.TempDir()
@@ -1252,11 +1258,11 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 	}
 
 	reg := NewRegistry()
-	// A shell that echoes each line as "got:<line>" and exits cleanly on
-	// "quit" — keeps the PTY alive across viewer joins, then exits 0.
+	// A shell first reports whether any runner-only attach control reached its
+	// real PTY environment, then echoes input until "quit".
 	prov := &interactivePTYProvider{command: []string{
 		"/bin/sh", "-c",
-		`while IFS= read -r line; do echo "got:$line"; [ "$line" = quit ] && break; done`,
+		`if [ "${ATTACH_TOKEN+x}${ATTACH_TOKEN_FILE+x}${ATTACH_URL+x}" = "" ]; then env_status=attach-env-clean; else env_status=attach-env-leaked; fi; while IFS= read -r line; do echo "$env_status:got:$line"; [ "$line" = quit ] && break; done`,
 	}}
 	if err := reg.Register(prov); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -1317,8 +1323,10 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 
 	// The seed was written before the relay host leg started, so it is the
 	// shell's first input and reaches a later viewer through the PTY ring replay.
-	if !waitForTerminalText(driver, "got:"+initialPrompt, 30*time.Second) {
-		t.Fatal("driver never observed the initial prompt as the PTY's first input")
+	// The prefix proves the runner kept all three controls for its own attach path
+	// while the real PTY child observed none of them.
+	if !waitForTerminalText(driver, "attach-env-clean:got:"+initialPrompt, 30*time.Second) {
+		t.Fatal("PTY child observed a runner-only attach control or missed the initial prompt")
 	}
 
 	// Resend-until-echo: §5's delivery contract is client resend from
@@ -1394,17 +1402,22 @@ func TestAttachTokenSource_NoFileReturnsStatic(t *testing.T) {
 }
 
 func TestAttachTokenSource_FileVariants(t *testing.T) {
+	validToken := mkInteractiveHostToken("sess-token-source", 1)
 	tests := []struct {
 		name    string
 		content string // written to the token file before the call
 		noFile  bool   // point at a path that does not exist
 		want    string
+		wantErr error
 	}{
-		{name: "fresh token", content: "fresh-tok", want: "fresh-tok"},
-		{name: "trailing newline trimmed", content: "fresh-tok\n", want: "fresh-tok"},
-		{name: "surrounding whitespace trimmed", content: "  fresh-tok \n\n", want: "fresh-tok"},
-		{name: "empty file falls back to static", content: "", want: "static-tok"},
-		{name: "whitespace-only file falls back to static", content: " \n\t\n", want: "static-tok"},
+		{name: "fresh token", content: validToken, want: validToken},
+		{name: "trailing newline trimmed", content: validToken + "\n", want: validToken},
+		{name: "surrounding whitespace trimmed", content: "  " + validToken + " \n\n", want: validToken},
+		{name: "empty file fails", content: "", wantErr: errAttachTokenFileEmpty},
+		{name: "whitespace-only file fails", content: " \n\t\n", wantErr: errAttachTokenFileEmpty},
+		{name: "malformed token fails", content: "not-a-compact-jwt", wantErr: errAttachTokenFileMalformed},
+		{name: "invalid payload fails", content: "e30.bm90LWpzb24.c2ln", wantErr: errAttachTokenFileMalformed},
+		{name: "oversized file fails", content: strings.Repeat("x", maxAttachTokenFileBytes+1), wantErr: errAttachTokenFileOversized},
 		{name: "missing file falls back to static", noFile: true, want: "static-tok"},
 	}
 	for _, tc := range tests {
@@ -1417,8 +1430,8 @@ func TestAttachTokenSource_FileVariants(t *testing.T) {
 			}
 			src := attachTokenSource("static-tok", path, nil)
 			tok, err := src(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err=%v; want %v", err, tc.wantErr)
 			}
 			if tok != tc.want {
 				t.Fatalf("tok=%q; want %q", tok, tc.want)
@@ -1433,25 +1446,27 @@ func TestAttachTokenSource_FileVariants(t *testing.T) {
 // without erroring.
 func TestAttachTokenSource_PerAttemptReRead(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(path, []byte("tok-1\n"), 0o600); err != nil {
+	token1 := mkInteractiveHostToken("sess-token-1", 1)
+	token2 := mkInteractiveHostToken("sess-token-2", 2)
+	if err := os.WriteFile(path, []byte(token1+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	src := attachTokenSource("static-tok", path, nil)
 
-	if tok, _ := src(context.Background()); tok != "tok-1" {
-		t.Fatalf("first read tok=%q; want tok-1", tok)
+	if tok, err := src(context.Background()); err != nil || tok != token1 {
+		t.Fatalf("first read tok=%q err=%v; want first valid token", tok, err)
 	}
 
 	// Provisioner refresh: atomic replace (tmp + rename), as documented.
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte("tok-2\n"), 0o600); err != nil {
+	if err := os.WriteFile(tmp, []byte(token2+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		t.Fatal(err)
 	}
-	if tok, _ := src(context.Background()); tok != "tok-2" {
-		t.Fatalf("post-rewrite tok=%q; want tok-2", tok)
+	if tok, err := src(context.Background()); err != nil || tok != token2 {
+		t.Fatalf("post-rewrite tok=%q err=%v; want second valid token", tok, err)
 	}
 
 	// File vanishes → degrade to the static token, no error (an error would
@@ -1468,6 +1483,55 @@ func TestAttachTokenSource_PerAttemptReRead(t *testing.T) {
 	}
 }
 
+func TestAttachTokenSource_InvalidFileRecoversOnNextAttempt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("malformed-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src := attachTokenSource("static-tok", path, nil)
+
+	if tok, err := src(context.Background()); tok != "" || !errors.Is(err, errAttachTokenFileMalformed) {
+		t.Fatalf("malformed read tok=%q err=%v; want explicit malformed failure", tok, err)
+	}
+
+	fresh := mkInteractiveHostToken("sess-recovered", 3)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(fresh+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	if tok, err := src(context.Background()); err != nil || tok != fresh {
+		t.Fatalf("recovery read tok=%q err=%v; want refreshed token", tok, err)
+	}
+}
+
+func TestAttachTokenSource_FailuresDoNotExposeTokenContent(t *testing.T) {
+	const secretMarker = "do-not-log-this-token-content"
+	path := filepath.Join(t.TempDir(), "token")
+	malformed := "e30." + base64.RawURLEncoding.EncodeToString([]byte(`{"secret":"`+secretMarker+`"}`)) + ".%%%"
+	if err := os.WriteFile(path, []byte(malformed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	src := attachTokenSource("static-tok", path, logger)
+
+	_, err := src(context.Background())
+	if !errors.Is(err, errAttachTokenFileMalformed) {
+		t.Fatalf("err=%v; want malformed failure", err)
+	}
+	if strings.Contains(err.Error(), secretMarker) {
+		t.Fatalf("error exposed token content: %v", err)
+	}
+	// The token source emits no malformed-token diagnostic itself; RunHost logs
+	// only the content-free sentinel returned above.
+	if strings.Contains(logs.String(), secretMarker) {
+		t.Fatal("logs exposed malformed token content")
+	}
+}
+
 // TokenSource is a concurrent-use contract: the degraded carrier can re-mint
 // from its POST-up, SSE, and upgrade-probe paths at the same time. Exercise the
 // warning-state transitions under a synchronized fan-out so -race observes any
@@ -1479,7 +1543,7 @@ func TestAttachTokenSource_ConcurrentWarningState(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	src := attachTokenSource("static-tok", path, logger)
 
-	callConcurrently := func(want string) {
+	callConcurrently := func(want string, wantErr error) {
 		t.Helper()
 		const callers = 64
 		start := make(chan struct{})
@@ -1491,8 +1555,8 @@ func TestAttachTokenSource_ConcurrentWarningState(t *testing.T) {
 				defer wg.Done()
 				<-start
 				tok, err := src(context.Background())
-				if err != nil {
-					errCh <- fmt.Errorf("unexpected source error: %w", err)
+				if !errors.Is(err, wantErr) {
+					errCh <- fmt.Errorf("source err=%v; want %v", err, wantErr)
 					return
 				}
 				if tok != want {
@@ -1509,31 +1573,33 @@ func TestAttachTokenSource_ConcurrentWarningState(t *testing.T) {
 	}
 
 	// A persistent missing file warns once even when many callers observe it.
-	callConcurrently("static-tok")
-	callConcurrently("static-tok")
+	callConcurrently("static-tok", nil)
+	callConcurrently("static-tok", nil)
 	if got := strings.Count(logs.String(), "attach token file unreadable"); got != 1 {
 		t.Fatalf("unreadable warning count=%d; want 1 before recovery\nlogs:\n%s", got, logs.String())
 	}
 
-	// A different failure condition gets its own warning.
+	// Present-but-invalid files fail explicitly under concurrent resolution.
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	callConcurrently("static-tok")
-	if got := strings.Count(logs.String(), "attach token file empty"); got != 1 {
-		t.Fatalf("empty warning count=%d; want 1\nlogs:\n%s", got, logs.String())
+	callConcurrently("", errAttachTokenFileEmpty)
+	if err := os.WriteFile(path, []byte("malformed-token"), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	callConcurrently("", errAttachTokenFileMalformed)
 
 	// A successful read clears the warning state. A later recurrence of the
 	// missing-file condition must therefore warn exactly once again.
-	if err := os.WriteFile(path, []byte("fresh-tok\n"), 0o600); err != nil {
+	fresh := mkInteractiveHostToken("sess-concurrent-refresh", 4)
+	if err := os.WriteFile(path, []byte(fresh+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	callConcurrently("fresh-tok")
+	callConcurrently(fresh, nil)
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	callConcurrently("static-tok")
+	callConcurrently("static-tok", nil)
 	if got := strings.Count(logs.String(), "attach token file unreadable"); got != 2 {
 		t.Fatalf("unreadable warning count=%d; want 2 after recovery and recurrence\nlogs:\n%s", got, logs.String())
 	}

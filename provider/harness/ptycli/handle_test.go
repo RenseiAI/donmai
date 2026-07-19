@@ -225,3 +225,18 @@ func TestEnvSlice_SortedDeterministic(t *testing.T) {
 		t.Errorf("envSlice(nil) = %v, want nil", got)
 	}
 }
+
+func TestEnvSlice_StripsRunnerOnlyControls(t *testing.T) {
+	t.Parallel()
+
+	got := envSlice(map[string]string{
+		"ATTACH_TOKEN":      "secret",
+		"ATTACH_TOKEN_FILE": "/tmp/token",
+		"ATTACH_URL":        "wss://relay.invalid/v1/rooms/room-1",
+		"SAFE":              "kept",
+	})
+	want := []string{"SAFE=kept"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("envSlice leaked runner-only controls: got %v, want %v", got, want)
+	}
+}

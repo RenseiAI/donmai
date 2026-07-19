@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // TS/JS reachability runs a baked ts-morph node script as a subprocess. The Go
@@ -119,6 +121,7 @@ func (execTSRunner) run(ctx context.Context, scriptPath, repoPath string, files 
 	// validated repo-relative paths + numeric constants above.
 	cmd := exec.CommandContext(ctx, nodeBin(), args...)
 	cmd.Dir = repoPath
+	cmd.Env = runtimeenv.FilterRunnerOnly(cmd.Environ())
 	out, err := cmd.Output()
 	return out, err
 }
@@ -139,7 +142,9 @@ func nodeToolchainVersion(ctx context.Context) string {
 		return ""
 	}
 	//nolint:gosec // G204: bin is a fixed/env-pinned node binary, no user args.
-	out, err := exec.CommandContext(ctx, bin, "--version").Output()
+	cmd := exec.CommandContext(ctx, bin, "--version")
+	cmd.Env = runtimeenv.FilterRunnerOnly(cmd.Environ())
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}

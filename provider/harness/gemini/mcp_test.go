@@ -1,16 +1,66 @@
 package gemini
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/mcp"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("GEMINI_MCP_FAKE_SERVER") == "1" {
+		runGeminiFakeMCPServer()
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+func runGeminiFakeMCPServer() {
+	if report := os.Getenv("GEMINI_MCP_ENV_REPORT"); report != "" {
+		status := "clean"
+		for _, key := range []string{"ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL"} {
+			if _, ok := os.LookupEnv(key); ok {
+				status = "leaked"
+			}
+		}
+		if os.Getenv("GEMINI_MCP_SAFE_ENV") != "present" {
+			status = "missing-safe-env"
+		}
+		_ = os.WriteFile(report, []byte(status), 0o600) //nolint:gosec // test re-exec writes its caller-owned temp report
+	}
+
+	scanner := bufio.NewScanner(os.Stdin)
+	encoder := json.NewEncoder(os.Stdout)
+	for scanner.Scan() {
+		var req struct {
+			ID     *int64 `json:"id"`
+			Method string `json:"method"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &req) != nil || req.ID == nil {
+			continue
+		}
+		result := any(map[string]any{})
+		switch req.Method {
+		case "initialize":
+			result = map[string]any{
+				"protocolVersion": mcp.ProtocolVersion,
+				"capabilities":    map[string]any{},
+				"serverInfo":      map[string]any{"name": "gemini-test", "version": "0"},
+			}
+		case "tools/list":
+			result = map[string]any{"tools": []map[string]any{{"name": "echo"}}}
+		}
+		_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": *req.ID, "result": result})
+	}
+}
 
 // fakeMCPClient is an in-memory mcp.Client for bridge unit tests.
 type fakeMCPClient struct {
@@ -114,6 +164,46 @@ func TestMCPBridge_DiscoveryDeclaresAndRoutes(t *testing.T) {
 	b.Close()
 	if !fake.closed {
 		t.Error("Close must close the underlying client")
+	}
+}
+
+func TestMCPBridge_RealStdioChildEnvSanitized(t *testing.T) {
+	t.Setenv("ATTACH_TOKEN", "parent-secret")
+	t.Setenv("ATTACH_TOKEN_FILE", "/parent/token")
+	t.Setenv("ATTACH_URL", "wss://parent.invalid/v1/rooms/room-1")
+
+	report := t.TempDir() + "/env-report.txt"
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	bridge := newMCPBridge(ctx, []agent.MCPServerConfig{{
+		Name:    "real-stdio",
+		Command: os.Args[0],
+		Env: map[string]string{
+			"GEMINI_MCP_FAKE_SERVER": "1",
+			"GEMINI_MCP_ENV_REPORT":  report,
+			"GEMINI_MCP_SAFE_ENV":    "present",
+			"ATTACH_TOKEN":           "explicit-secret",
+			"ATTACH_TOKEN_FILE":      "/explicit/token",
+			"ATTACH_URL":             "wss://explicit.invalid/v1/rooms/room-1",
+		},
+	}}, mcp.Dial)
+	if bridge == nil {
+		t.Fatal("bridge: want non-nil")
+	}
+	defer bridge.Close()
+	if err := bridge.failures["real-stdio"]; err != nil {
+		t.Fatalf("real stdio bridge failed: %v", err)
+	}
+	if _, ok := bridge.clients["real-stdio"]; !ok {
+		t.Fatalf("real stdio bridge did not retain connected client: %+v", bridge)
+	}
+
+	body, err := os.ReadFile(report) //nolint:gosec // report is a test-owned temp file
+	if err != nil {
+		t.Fatalf("read env report: %v", err)
+	}
+	if got, want := string(body), "clean"; got != want {
+		t.Fatalf("Gemini MCP child env report = %q, want %q", got, want)
 	}
 }
 

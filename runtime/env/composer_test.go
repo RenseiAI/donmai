@@ -165,6 +165,66 @@ func TestIsBlocked(t *testing.T) {
 	}
 }
 
+func TestComposeAlwaysBlocksRunnerOnlyControls(t *testing.T) {
+	t.Parallel()
+
+	c := &env.Composer{Blocklist: []string{}}
+	got := c.Compose(
+		map[string]string{
+			"ATTACH_TOKEN":      "host-token",
+			"ATTACH_TOKEN_FILE": "/host/token",
+			"PATH":              "/usr/bin",
+		},
+		agent.Spec{Env: map[string]string{
+			"ATTACH_TOKEN": "spec-token",
+			"ATTACH_URL":   "wss://relay.invalid/v1/rooms/room-1",
+			"SAFE":         "kept",
+		}},
+	)
+	want := []string{"PATH=/usr/bin", "SAFE=kept"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("runner-only controls reached composed provider env:\n got: %v\nwant: %v", got, want)
+	}
+}
+
+func TestFilterRunnerOnly(t *testing.T) {
+	t.Parallel()
+
+	got := env.FilterRunnerOnly([]string{
+		"PATH=/usr/bin",
+		"ATTACH_TOKEN=secret",
+		"ATTACH_TOKEN_FILE=/tmp/token",
+		"ATTACH_URL=wss://relay.invalid/v1/rooms/room-1",
+		"ATTACH_TOKEN",
+		"SAFE=a=b",
+	})
+	want := []string{"PATH=/usr/bin", "SAFE=a=b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("FilterRunnerOnly():\n got: %v\nwant: %v", got, want)
+	}
+}
+
+func TestComposeChildEnvFiltersEveryLayer(t *testing.T) {
+	t.Parallel()
+
+	got := env.ComposeChildEnv(
+		[]string{"PATH=/usr/bin", "SAFE=parent", "ATTACH_TOKEN=parent-secret"},
+		map[string]string{
+			"BASE_ONLY":         "base",
+			"SAFE":              "base",
+			"ATTACH_TOKEN_FILE": "/base/token",
+		},
+		map[string]string{
+			"SAFE":       "command",
+			"ATTACH_URL": "wss://command.invalid",
+		},
+	)
+	want := []string{"PATH=/usr/bin", "SAFE=parent", "BASE_ONLY=base", "SAFE=command"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ComposeChildEnv():\n got: %v\nwant: %v", got, want)
+	}
+}
+
 func TestLooksSensitive(t *testing.T) {
 	t.Parallel()
 
