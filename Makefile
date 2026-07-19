@@ -64,6 +64,7 @@ verify-generated:
 # skips publication but not custom sign pipes, so signing must be skipped
 # explicitly. The macOS signing/notarize path still fires on tag-pushed CI.
 # Use this to validate the build matrix and archive layout locally; for signed
-# binaries, push a tag.
+# binaries, push a tag. Snapshot runs are version-only and never publish a cask
+# or alter GitHub's Latest release.
 release-dry-run:
-	goreleaser release --snapshot --clean --skip=sign
+	GOWORK=off GOTOOLCHAIN=go1.25.12 GORELEASER_PUBLISH_HOMEBREW=false GORELEASER_MAKE_LATEST=false goreleaser release --snapshot --clean --skip=sign
