@@ -47,6 +47,7 @@ func TestFilter_RemovesBlockedKeys(t *testing.T) {
 		"DONMAI_DAEMON_JWT=secret-jwt-value",
 		"HOME=/Users/x",
 		"WORKER_API_KEY=rsk_abc",
+		"DONMAI_CREDENTIAL_CAPABILITY=per-session-secret",
 		"FOO=bar",
 		"M2M_JWT_SECRET=hmac",
 	}
@@ -128,6 +129,7 @@ func TestBlocklistContents(t *testing.T) {
 		"WORKER_API_KEY",
 		"DONMAI_DAEMON_TOKEN",
 		"DONMAI_ORCHESTRATOR_URL",
+		"DONMAI_CREDENTIAL_CAPABILITY",
 	}
 	got := append([]string{}, AgentEnvBlocklist...)
 	sort.Strings(got)

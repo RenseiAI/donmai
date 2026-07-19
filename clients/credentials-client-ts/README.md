@@ -25,7 +25,10 @@ npm install @renseiai/credentials-client
 ```ts
 import { createLoader } from '@renseiai/credentials-client';
 
-const loader = await createLoader({ sessionId: 'my-session' });
+const loader = await createLoader({
+  sessionId: 'my-session',
+  capability: process.env.DONMAI_CREDENTIAL_CAPABILITY,
+});
 const apiKey = loader.get('SOME_API_KEY');
 const unsubscribe = loader.subscribe((delta) => {
   console.log('credentials rotated:', Object.keys(delta));
@@ -38,6 +41,20 @@ await loader.close();
 `createLoader` never rejects: if daemon mode is configured but the
 handshake fails, the loader falls back to standalone mode and surfaces
 a single info-level log line.
+
+## Per-session capability
+
+Daemon-mode callers may authenticate the socket handshake with an optional
+per-session capability. A non-empty `options.capability` takes precedence;
+otherwise the loader reads `DONMAI_CREDENTIAL_CAPABILITY`. When neither is
+available, the loader omits `HELLO.capability` entirely, preserving the legacy
+`{"type":"HELLO","sessionId":"…"}` shape. Existing servers may ignore the
+additive JSON property during staged rollout.
+
+`DONMAI_CREDENTIAL_CAPABILITY` is part of the canonical agent env blocklist.
+The loader resolves it only for the HELLO frame: it is excluded from standalone
+reads, INITIAL snapshots, UPDATE deltas, and subscriber payloads, and its value
+is never included in diagnostic logs.
 
 ## Modes
 

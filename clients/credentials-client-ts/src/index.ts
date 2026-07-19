@@ -42,6 +42,14 @@ export interface Options {
   sessionId?: string;
 
   /**
+   * Optional per-session credential-socket capability. A non-empty value
+   * is sent as HELLO.capability. When empty or omitted, the loader reads
+   * `process.env.DONMAI_CREDENTIAL_CAPABILITY`; if that is also empty, the
+   * property is omitted to preserve the legacy HELLO shape.
+   */
+  capability?: string;
+
+  /**
    * Handshake timeout in milliseconds. Applies to both the socket
    * connect and the wait for the INITIAL reply. Default 5000.
    */
@@ -85,6 +93,7 @@ export interface Loader {
 }
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
+const CREDENTIAL_CAPABILITY_ENV_VAR = 'DONMAI_CREDENTIAL_CAPABILITY';
 
 function defaultLogger(): Logger {
   return {
@@ -115,6 +124,8 @@ export async function createLoader(options?: Options): Promise<Loader> {
     return makeStandaloneLoader(logger);
   }
 
+  const capability =
+    options?.capability || process.env[CREDENTIAL_CAPABILITY_ENV_VAR] || '';
   const handshakeTimeout =
     options?.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
 
@@ -122,6 +133,7 @@ export async function createLoader(options?: Options): Promise<Loader> {
     return await makeDaemonLoader({
       socketPath,
       sessionId,
+      capability,
       handshakeTimeoutMs: handshakeTimeout,
       logger,
     });
@@ -184,6 +196,7 @@ function makeStandaloneLoader(_logger: Logger): Loader {
 interface DaemonLoaderArgs {
   socketPath: string;
   sessionId: string;
+  capability: string;
   handshakeTimeoutMs: number;
   logger: Logger;
 }
@@ -197,7 +210,7 @@ function isStringMap(v: unknown): v is Record<string, string> {
 }
 
 async function makeDaemonLoader(args: DaemonLoaderArgs): Promise<Loader> {
-  const { socketPath, sessionId, handshakeTimeoutMs, logger } = args;
+  const { socketPath, sessionId, capability, handshakeTimeoutMs, logger } = args;
 
   const socket = net.createConnection({ path: socketPath });
 
@@ -315,7 +328,10 @@ async function makeDaemonLoader(args: DaemonLoaderArgs): Promise<Loader> {
     onInitial = (err?: Error) => settle(err);
 
     socket.once('connect', () => {
-      const hello = JSON.stringify({ type: 'HELLO', sessionId }) + '\n';
+      const helloFrame = capability
+        ? { type: 'HELLO', sessionId, capability }
+        : { type: 'HELLO', sessionId };
+      const hello = JSON.stringify(helloFrame) + '\n';
       socket.write(hello, (err) => {
         if (err) settle(err);
       });
