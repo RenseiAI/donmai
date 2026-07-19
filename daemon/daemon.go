@@ -984,9 +984,10 @@ func (d *Daemon) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 // process. Pass nil detail when the caller does not have one (legacy
 // tests); the spawner falls through to env-only inputs.
 //
-// Detail is stored before spawning and removed when the spawner emits
-// the corresponding SessionEventEnded event so stale credentials do
-// not linger in memory.
+// Detail is stored before spawning so the child can fetch it immediately.
+// It is removed when the spawner emits the corresponding SessionEventEnded
+// event, or synchronously when AcceptWork rejects/fails before a child owns the
+// session, so stale credentials never linger in memory.
 func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (*SessionHandle, error) {
 	if d.State() != StateRunning {
 		return nil, fmt.Errorf("daemon is not running (state %q)", d.State())
@@ -997,10 +998,19 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 	if detail != nil && detail.SessionID == "" {
 		detail.SessionID = spec.SessionID
 	}
+	storedDetailID := ""
 	if detail != nil && d.sessionDetails != nil {
 		d.sessionDetails.Set(detail)
+		storedDetailID = detail.SessionID
 	}
-	return d.spawner.AcceptWork(spec)
+	handle, err := d.spawner.AcceptWork(spec)
+	if err != nil {
+		if storedDetailID != "" {
+			d.sessionDetails.Delete(storedDetailID)
+		}
+		return nil, err
+	}
+	return handle, nil
 }
 
 // SessionDetail returns the stored per-session detail for the given

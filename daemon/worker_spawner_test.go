@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -944,6 +945,210 @@ func TestSpawner_OnPreSpawn_EnvMergeAndFailClosed(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("ANTHROPIC_API_KEY not merged into child env; got lines %v", lines)
+	}
+}
+
+func TestSpawner_OnSpawnAborted_StartFailureOwnsRollback(t *testing.T) {
+	missingWorker := filepath.Join(t.TempDir(), "missing-worker")
+	var (
+		order       []string
+		abortCalls  int
+		abortedSpec SessionSpec
+		abortedErr  error
+		events      int
+	)
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{missingWorker},
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			order = append(order, "pre-spawn")
+			return env, nil
+		},
+		OnSpawnAborted: func(spec SessionSpec, err error) {
+			order = append(order, "spawn-aborted")
+			abortCalls++
+			abortedSpec = spec
+			abortedErr = err
+		},
+	})
+	s.On(func(SessionEvent) { events++ })
+
+	_, err := s.AcceptWork(SessionSpec{SessionID: "start-fails", Repository: "github.com/a/b"})
+	order = append(order, "accept-returned")
+	if err == nil {
+		t.Fatal("AcceptWork: expected start failure, got nil")
+	}
+	if abortCalls != 1 {
+		t.Fatalf("OnSpawnAborted calls = %d, want 1", abortCalls)
+	}
+	if abortedSpec.SessionID != "start-fails" {
+		t.Errorf("OnSpawnAborted SessionID = %q, want start-fails", abortedSpec.SessionID)
+	}
+	if abortedErr != err {
+		t.Fatalf("OnSpawnAborted error = %v, want the exact returned error %v", abortedErr, err)
+	}
+	if !strings.HasPrefix(err.Error(), "start worker: ") {
+		t.Errorf("returned error = %q, want wrapped start worker error", err)
+	}
+	wantOrder := []string{"pre-spawn", "spawn-aborted", "accept-returned"}
+	if fmt.Sprint(order) != fmt.Sprint(wantOrder) {
+		t.Errorf("ordering = %v, want %v", order, wantOrder)
+	}
+	if events != 0 {
+		t.Errorf("lifecycle events = %d, want 0 for a process that never started", events)
+	}
+	if got := s.ActiveCount(); got != 0 {
+		t.Errorf("ActiveCount = %d, want 0", got)
+	}
+}
+
+func TestSpawner_OnSpawnAborted_PreSpawnFailureRetainsOwnership(t *testing.T) {
+	preSpawnErr := errors.New("pre-spawn refused")
+	var abortCalls int
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{filepath.Join(t.TempDir(), "missing-worker")},
+		OnPreSpawn: func(SessionSpec, []string) ([]string, error) {
+			return nil, preSpawnErr
+		},
+		OnSpawnAborted: func(SessionSpec, error) {
+			abortCalls++
+		},
+	})
+
+	_, err := s.AcceptWork(SessionSpec{SessionID: "pre-fails", Repository: "github.com/a/b"})
+	if !errors.Is(err, preSpawnErr) {
+		t.Fatalf("AcceptWork error = %v, want wrapped pre-spawn error", err)
+	}
+	if abortCalls != 0 {
+		t.Errorf("OnSpawnAborted calls = %d, want 0 when OnPreSpawn retained ownership", abortCalls)
+	}
+}
+
+func TestSpawner_OnSpawnAborted_SuccessTransfersToSessionEnded(t *testing.T) {
+	var abortCalls atomic.Int32
+	var endedCalls atomic.Int32
+	ended := make(chan struct{}, 1)
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			return env, nil
+		},
+		OnSpawnAborted: func(SessionSpec, error) {
+			abortCalls.Add(1)
+		},
+	})
+	s.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded {
+			endedCalls.Add(1)
+			ended <- struct{}{}
+		}
+	})
+
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "starts", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	waitSessionEnd(t, ended)
+	if got := abortCalls.Load(); got != 0 {
+		t.Errorf("OnSpawnAborted calls = %d, want 0 after successful start", got)
+	}
+	if got := endedCalls.Load(); got != 1 {
+		t.Errorf("SessionEventEnded calls = %d, want 1", got)
+	}
+}
+
+func TestSpawner_OnSpawnAborted_NilHooks(t *testing.T) {
+	t.Run("nil abort hook", func(t *testing.T) {
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+			MaxConcurrentSessions: 1,
+			WorkerCommand:         []string{filepath.Join(t.TempDir(), "missing-worker")},
+			OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+				return env, nil
+			},
+		})
+		if _, err := s.AcceptWork(SessionSpec{SessionID: "nil-abort", Repository: "github.com/a/b"}); err == nil {
+			t.Fatal("AcceptWork: expected start failure with nil abort hook")
+		}
+	})
+
+	t.Run("nil pre-spawn hook acquires no cleanup ownership", func(t *testing.T) {
+		var abortCalls int
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+			MaxConcurrentSessions: 1,
+			WorkerCommand:         []string{filepath.Join(t.TempDir(), "missing-worker")},
+			OnSpawnAborted: func(SessionSpec, error) {
+				abortCalls++
+			},
+		})
+		if _, err := s.AcceptWork(SessionSpec{SessionID: "nil-pre", Repository: "github.com/a/b"}); err == nil {
+			t.Fatal("AcceptWork: expected start failure with nil pre-spawn hook")
+		}
+		if abortCalls != 0 {
+			t.Errorf("OnSpawnAborted calls = %d, want 0 without OnPreSpawn ownership", abortCalls)
+		}
+	})
+}
+
+func TestSpawner_OnSpawnAborted_ConcurrentFailuresExactlyOnce(t *testing.T) {
+	const attempts = 32
+	missingWorker := filepath.Join(t.TempDir(), "missing-worker")
+	calls := make(map[string]int, attempts)
+	var callsMu sync.Mutex
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: attempts,
+		WorkerCommand:         []string{missingWorker},
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			return env, nil
+		},
+		OnSpawnAborted: func(spec SessionSpec, _ error) {
+			callsMu.Lock()
+			calls[spec.SessionID]++
+			callsMu.Unlock()
+		},
+	})
+
+	errCh := make(chan error, attempts)
+	var wg sync.WaitGroup
+	wg.Add(attempts)
+	for i := 0; i < attempts; i++ {
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("concurrent-%02d", i)
+			_, err := s.AcceptWork(SessionSpec{SessionID: id, Repository: "github.com/a/b"})
+			if err == nil {
+				errCh <- fmt.Errorf("%s: AcceptWork unexpectedly succeeded", id)
+				return
+			}
+			if !strings.HasPrefix(err.Error(), "start worker: ") {
+				errCh <- fmt.Errorf("%s: error = %q", id, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if len(calls) != attempts {
+		t.Fatalf("aborted session count = %d, want %d; calls=%v", len(calls), attempts, calls)
+	}
+	for id, count := range calls {
+		if count != 1 {
+			t.Errorf("OnSpawnAborted[%s] calls = %d, want exactly 1", id, count)
+		}
+	}
+	if got := s.ActiveCount(); got != 0 {
+		t.Errorf("ActiveCount = %d, want 0", got)
 	}
 }
 
