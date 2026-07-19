@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `donmai` (`af` binary) are documented here.
+All notable changes to the `donmai` binary are documented here.
 
 Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores`. Unreleased work goes under `## [Unreleased]`.
 
@@ -59,8 +59,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 - **Adaptive PTY firehose race gate.** Sizes the race-mode backpressure volume
   from a bounded warmup throughput probe instead of a machine-specific fixed
   byte count, retaining all existing pressure and memory assertions.
+- **Secret-safe credential metadata tests.** Verifies ordered credential
+  requirements directly instead of serializing session-detail fixtures that
+  also contain secret-bearing authentication fields.
 - **Faster hosted CI.** Migrates repository workflows to Blacksmith runners
   without changing their test, security, release, or image-build responsibilities.
+- **Reproducible release automation.** Pins the Blacksmith worker-image actions
+  to reviewed immutable commits, makes manual release reruns check out and
+  validate an explicit existing tag, and anchors GoReleaser publication to the
+  exact commit it built.
+- **Go 1.25.12 release floor.** Raises the module and worker-image toolchain to
+  Go 1.25.12 and makes every Go-using workflow consume the canonical `go.mod`
+  version instead of carrying independent floating or stale versions.
 
 ---
 
