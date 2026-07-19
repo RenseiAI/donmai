@@ -36,12 +36,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
-- **Aborted spawn cleanup.** Adds the public `SpawnerOptions.OnSpawnAborted`
-  rollback hook with exact ownership semantics: pre-spawn failures retain their
-  own cleanup, process-start failures roll back once with the returned wrapped
-  error, and successful starts transfer cleanup to `SessionEventEnded`.
-  `AcceptWorkWithDetail` now also removes pre-stored session details on every
-  spawner rejection or start failure without replacing the original error.
+- **Aborted spawn and session-detail cleanup.** Adds the public
+  `SpawnerOptions.OnSpawnAborted` rollback hook with exact ownership semantics:
+  pre-spawn failures retain their own cleanup, process-start failures roll back
+  once with the returned wrapped error, and successful starts transfer cleanup
+  to `SessionEventEnded`. `AcceptWorkWithDetail` validates matching session ids,
+  rejects duplicate active deliveries before replacing their detail, and uses
+  generation-owned rollback so a rejected attempt cannot delete a live or later
+  session's detail.
 - **Data-free credential frame diagnostics.** Wrong handshake frames and
   unknown post-handshake frames now produce fixed Go and TypeScript diagnostics
   that never interpolate peer-controlled frame types or reflected capability
