@@ -4,9 +4,61 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestGhPRCommandsSanitizeRunnerOnlyEnvironment(t *testing.T) {
+	binDir := t.TempDir()
+	fakeGh := filepath.Join(binDir, "gh")
+	const script = `#!/bin/sh
+set -eu
+if [ "${ATTACH_TOKEN+x}" = x ] || [ "${ATTACH_TOKEN_FILE+x}" = x ] || [ "${ATTACH_URL+x}" = x ]; then
+	printf 'runner-only environment leaked into gh %s %s\n' "$1" "$2" >&2
+	exit 97
+fi
+if [ "${SAFE_CHILD_ENV:-}" != "kept" ]; then
+	printf 'safe inherited environment missing from gh %s %s\n' "$1" "$2" >&2
+	exit 98
+fi
+case "$1 $2" in
+	"pr view") printf '%s\n' '{"title":"fake view","body":"","files":[]}' ;;
+	"pr diff") printf '%s\n' 'diff --git a/a.go b/a.go' ;;
+	*) printf 'unexpected gh arguments: %s\n' "$*" >&2; exit 99 ;;
+esac
+`
+	if err := os.WriteFile(fakeGh, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatalf("write fake gh: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ATTACH_TOKEN", "parent-secret")
+	t.Setenv("ATTACH_TOKEN_FILE", "/parent/token")
+	t.Setenv("ATTACH_URL", "wss://relay.invalid/v1/rooms/parent")
+	t.Setenv("SAFE_CHILD_ENV", "kept")
+
+	tests := []struct {
+		name string
+		run  func(context.Context, string) ([]byte, error)
+		want string
+	}{
+		{name: "pr view", run: runGhPRView, want: `"title":"fake view"`},
+		{name: "pr diff", run: runGhPRDiff, want: "diff --git a/a.go b/a.go"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tc.run(context.Background(), "owner/repo#1")
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if !strings.Contains(string(out), tc.want) {
+				t.Fatalf("%s output = %q, want substring %q", tc.name, out, tc.want)
+			}
+		})
+	}
+}
 
 func TestParseDiffGitPath(t *testing.T) {
 	tests := []struct {
