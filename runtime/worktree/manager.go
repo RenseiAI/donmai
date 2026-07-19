@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/internal/gitexec"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // MaxSpawnRetries is the maximum number of attempts Provision will
@@ -87,8 +88,8 @@ type CommandRunner func(ctx context.Context, name string, args ...string) ([]byt
 // manager built without the seam.
 //
 // extraEnv entries (each "KEY=VALUE") are appended to the inherited process
-// environment. The default implementation is exec.CommandContext +
-// cmd.CombinedOutput() with cmd.Env = os.Environ()+extraEnv.
+// environment after runner-only attach controls are removed from both layers.
+// The default implementation is exec.CommandContext + cmd.CombinedOutput().
 type EnvCommandRunner func(ctx context.Context, extraEnv []string, name string, args ...string) ([]byte, error)
 
 // GitAuth is the daemon-supplied, per-invocation git auth resolver. Given the
@@ -114,6 +115,7 @@ func defaultRunner(ctx context.Context, name string, args ...string) ([]byte, er
 	// nolint:gosec // G204: name is a hard-coded "git" binary; args are
 	// constructed from validated ProvisionSpec fields at this layer.
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = runtimeenv.FilterRunnerOnly(cmd.Environ())
 	return cmd.CombinedOutput()
 }
 
@@ -122,11 +124,7 @@ func defaultEnvRunner(ctx context.Context, extraEnv []string, name string, args 
 	// nolint:gosec // G204: name is a hard-coded "git" binary; args are
 	// constructed from validated ProvisionSpec fields at this layer.
 	cmd := exec.CommandContext(ctx, name, args...)
-	if len(extraEnv) > 0 {
-		// nil Env means inherit the parent's environment; materialize it
-		// before appending so the hardened entries do not replace it wholesale.
-		cmd.Env = append(cmd.Environ(), extraEnv...)
-	}
+	cmd.Env = append(runtimeenv.FilterRunnerOnly(cmd.Environ()), runtimeenv.FilterRunnerOnly(extraEnv)...)
 	return cmd.CombinedOutput()
 }
 

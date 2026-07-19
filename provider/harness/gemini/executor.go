@@ -262,19 +262,7 @@ func (e *toolExecutor) resolvePath(path string) string {
 // processEnv folds the per-session env onto the process environment for Bash
 // invocations while keeping runner-only attach controls on the host side.
 func (e *toolExecutor) processEnv() []string {
-	parent := runtimeenv.FilterRunnerOnly(os.Environ())
-	if len(e.env) == 0 {
-		return parent
-	}
-	out := make([]string, 0, len(parent)+len(e.env))
-	out = append(out, parent...)
-	for k, v := range e.env {
-		if runtimeenv.IsRunnerOnly(k) {
-			continue
-		}
-		out = append(out, k+"="+v)
-	}
-	return out
+	return runtimeenv.ComposeChildEnv(os.Environ(), e.env)
 }
 
 // stringArg reads a string-valued arg from a functionCall args map.

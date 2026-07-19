@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/mcp"
 )
 
 // mcpConfigFile is the JSON shape Claude CLI's `--mcp-config` flag
@@ -24,18 +25,7 @@ import (
 // Source: ../donmai-libraries/packages/core/src/providers/claude-provider.ts
 // (the `mcpServers` Object.fromEntries block) and the Claude CLI
 // `--mcp-config` documentation.
-type mcpConfigFile struct {
-	MCPServers map[string]mcpServerEntry `json:"mcpServers"`
-}
-
-type mcpServerEntry struct {
-	Type    string            `json:"type"`
-	Command string            `json:"command,omitempty"`
-	Args    []string          `json:"args,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	URL     string            `json:"url,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
-}
+type mcpConfigFile = mcp.ConfigFile
 
 // writeMCPConfig serializes Spec.MCPServers to a JSON tmpfile and
 // returns its absolute path. Returns "" with nil error when the spec
@@ -53,53 +43,9 @@ func writeMCPConfig(servers []agent.MCPServerConfig) (path string, err error) {
 		return "", nil
 	}
 
-	cfg := mcpConfigFile{MCPServers: make(map[string]mcpServerEntry, len(servers))}
-	for _, s := range servers {
-		if s.Name == "" {
-			return "", fmt.Errorf("provider/claude: MCP server with empty Name in spec")
-		}
-		typ := s.Type
-		if typ == "" {
-			typ = "stdio"
-		}
-		switch typ {
-		case "stdio":
-			if s.Command == "" {
-				return "", fmt.Errorf("provider/claude: MCP server %q (stdio) has empty Command", s.Name)
-			}
-			args := append([]string(nil), s.Args...)
-			var env map[string]string
-			if len(s.Env) > 0 {
-				env = make(map[string]string, len(s.Env))
-				for k, v := range s.Env {
-					env[k] = v
-				}
-			}
-			cfg.MCPServers[s.Name] = mcpServerEntry{
-				Type:    "stdio",
-				Command: s.Command,
-				Args:    args,
-				Env:     env,
-			}
-		case "http":
-			if s.URL == "" {
-				return "", fmt.Errorf("provider/claude: MCP server %q (http) has empty URL", s.Name)
-			}
-			var headers map[string]string
-			if len(s.Headers) > 0 {
-				headers = make(map[string]string, len(s.Headers))
-				for k, v := range s.Headers {
-					headers[k] = v
-				}
-			}
-			cfg.MCPServers[s.Name] = mcpServerEntry{
-				Type:    "http",
-				URL:     s.URL,
-				Headers: headers,
-			}
-		default:
-			return "", fmt.Errorf("provider/claude: MCP server %q has unknown type %q (want \"stdio\" or \"http\")", s.Name, typ)
-		}
+	cfg, err := mcp.BuildConfigFile(servers)
+	if err != nil {
+		return "", fmt.Errorf("provider/claude: build MCP config: %w", err)
 	}
 
 	body, err := json.MarshalIndent(cfg, "", "  ")

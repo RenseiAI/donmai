@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"golang.org/x/tools/go/callgraph/cha"
 	"golang.org/x/tools/go/callgraph/rta"
 	"golang.org/x/tools/go/packages"
@@ -312,7 +313,9 @@ func goToolchainVersion() string {
 	if v := runtime.Version(); v != "" {
 		return strings.TrimPrefix(v, "go")
 	}
-	out, err := exec.Command("go", "version").Output() //nolint:gosec // fixed binary
+	cmd := exec.Command("go", "version") //nolint:gosec // fixed binary
+	cmd.Env = runtimeenv.FilterRunnerOnly(cmd.Environ())
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}

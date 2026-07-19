@@ -37,6 +37,33 @@ func runnerWithFakeCode(t *testing.T) *Runner {
 	return New(t.TempDir())
 }
 
+func TestRunnerExecShim_ChildEnvSanitized(t *testing.T) {
+	t.Setenv("ATTACH_TOKEN", "parent-secret")
+	t.Setenv("ATTACH_TOKEN_FILE", "/parent/token")
+	t.Setenv("ATTACH_URL", "wss://parent.invalid/v1/rooms/room-1")
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "af-code")
+	script := `#!/bin/sh
+status=leaked
+if [ "${ATTACH_TOKEN+x}${ATTACH_TOKEN_FILE+x}${ATTACH_URL+x}" = "" ]; then status=clean; fi
+printf '{"env":"%s"}\n' "$status"
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
+		t.Fatalf("write fake af-code: %v", err)
+	}
+	t.Setenv("DONMAI_CODE_BIN", bin)
+
+	out, err := New(t.TempDir()).runCode("get-repo-map")
+	if err != nil {
+		t.Fatalf("runCode: %v", err)
+	}
+	got, _ := out.(map[string]any)["env"].(string)
+	if got != "clean" {
+		t.Fatalf("exec shim child env = %q, want clean", got)
+	}
+}
+
 // ── GetRepoMap ───────────────────────────────────────────────────────────────
 
 func TestGetRepoMap_DefaultOptions(t *testing.T) {

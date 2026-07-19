@@ -66,6 +66,50 @@ func FilterRunnerOnly(entries []string) []string {
 	return out
 }
 
+// FilterRunnerOnlyMap returns a defensive copy of entries with runner-owned
+// controls removed. It is the serialization counterpart to FilterRunnerOnly:
+// callers use it before placing explicit environment maps in child configs.
+func FilterRunnerOnlyMap(entries map[string]string) map[string]string {
+	if entries == nil {
+		return nil
+	}
+	out := make(map[string]string, len(entries))
+	for key, value := range entries {
+		if IsRunnerOnly(key) {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+// ComposeChildEnv merges an inherited KEY=VALUE environment with zero or more
+// explicit override layers while removing runner-owned controls from every
+// layer. Later explicit layers win. Explicit keys are sorted before appending so
+// they deterministically win over inherited duplicates under exec.Cmd's
+// last-entry-wins semantics.
+func ComposeChildEnv(parent []string, explicit ...map[string]string) []string {
+	filteredParent := FilterRunnerOnly(parent)
+	mergedExplicit := make(map[string]string)
+	for _, layer := range explicit {
+		for key, value := range FilterRunnerOnlyMap(layer) {
+			mergedExplicit[key] = value
+		}
+	}
+	out := make([]string, 0, len(filteredParent)+len(mergedExplicit))
+	out = append(out, filteredParent...)
+
+	keys := make([]string, 0, len(mergedExplicit))
+	for key := range mergedExplicit {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		out = append(out, fmt.Sprintf("%s=%s", key, mergedExplicit[key]))
+	}
+	return out
+}
+
 // Composer builds the KEY=VALUE slice handed to exec.Cmd.Env for an
 // agent provider subprocess.
 //

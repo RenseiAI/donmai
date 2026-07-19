@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // ClaudeExecutor is the LIVE-LLM Executor: it spawns the real `claude` CLI in
@@ -459,8 +461,9 @@ func toolResultText(raw json.RawMessage) string {
 // directory dir (the provisioned workarea — claude's Read/Grep/Bash tools run on
 // the process cwd). The binary is resolved against the ARM env PATH (BinaryOnPath)
 // so the invocation is driven entirely by the authoritative arm environment;
-// cmd.Env is set to that env verbatim (NOT merged with os.Environ) so the WITHOUT
-// arm's donmai-scrubbed PATH is honored. stdin is left unset (/dev/null → instant
+// cmd.Env is set from that env without merging os.Environ, after removing
+// runner-only attach controls, so the WITHOUT arm's donmai-scrubbed PATH is
+// honored without exposing host-role credentials. stdin is left unset (/dev/null → instant
 // EOF): the prompt is carried in argv by BuildClaudeInvocation. The context
 // deadline is enforced by exec.CommandContext, which kills the process when ctx
 // fires; cmd.WaitDelay bounds the post-exit I/O wait so a grandchild that
@@ -481,7 +484,7 @@ func spawnClaude(ctx context.Context, dir string, argv []string, env []string) (
 	}
 
 	cmd := exec.CommandContext(ctx, bin, argv[1:]...) // nolint:gosec // bin is the fixed claude CLI; argv = BuildClaudeInvocation + fixed stream flags.
-	cmd.Env = env
+	cmd.Env = runtimeenv.FilterRunnerOnly(env)
 	cmd.Dir = dir
 	// After ctx cancellation SIGKILLs claude, a grandchild that inherited the
 	// stdout/stderr pipe (an MCP stdio server, or a process the agent backgrounded)

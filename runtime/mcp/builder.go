@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // ConfigFile is the JSON shape Claude CLI's --mcp-config flag consumes
@@ -50,7 +51,8 @@ type StdioServer = Server
 // Returns an error when any entry has an empty Name, or when transport
 // fields are missing for the resolved Type (stdio → empty Command; http
 // → empty URL). Args/Env/Headers are defensively copied to prevent later
-// mutation through the JSON encoder.
+// mutation through the JSON encoder; runner-only attach controls are removed
+// from stdio Env before any provider serializes the child config.
 func BuildConfigFile(servers []agent.MCPServerConfig) (ConfigFile, error) {
 	cfg := ConfigFile{MCPServers: make(map[string]Server, len(servers))}
 	for i, s := range servers {
@@ -67,13 +69,7 @@ func BuildConfigFile(servers []agent.MCPServerConfig) (ConfigFile, error) {
 				return ConfigFile{}, fmt.Errorf("runtime/mcp: server %q (stdio) has empty Command", s.Name)
 			}
 			args := append([]string(nil), s.Args...)
-			var env map[string]string
-			if len(s.Env) > 0 {
-				env = make(map[string]string, len(s.Env))
-				for k, v := range s.Env {
-					env[k] = v
-				}
-			}
+			env := runtimeenv.FilterRunnerOnlyMap(s.Env)
 			cfg.MCPServers[s.Name] = Server{
 				Type:    "stdio",
 				Command: s.Command,

@@ -204,6 +204,27 @@ func TestFilterRunnerOnly(t *testing.T) {
 	}
 }
 
+func TestComposeChildEnvFiltersEveryLayer(t *testing.T) {
+	t.Parallel()
+
+	got := env.ComposeChildEnv(
+		[]string{"PATH=/usr/bin", "SAFE=parent", "ATTACH_TOKEN=parent-secret"},
+		map[string]string{
+			"BASE_ONLY":         "base",
+			"SAFE":              "base",
+			"ATTACH_TOKEN_FILE": "/base/token",
+		},
+		map[string]string{
+			"SAFE":       "command",
+			"ATTACH_URL": "wss://command.invalid",
+		},
+	)
+	want := []string{"PATH=/usr/bin", "SAFE=parent", "BASE_ONLY=base", "SAFE=command"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ComposeChildEnv():\n got: %v\nwant: %v", got, want)
+	}
+}
+
 func TestLooksSensitive(t *testing.T) {
 	t.Parallel()
 

@@ -1,7 +1,6 @@
 package agycli
 
 import (
-	"sort"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -83,19 +82,5 @@ func buildPrompt(prompt string, injectEnvelope bool) string {
 // Runner-only attach controls are removed from both layers even when this
 // provider is used directly outside the runner.
 func composeEnv(parentEnv []string, specEnv map[string]string) []string {
-	filteredParent := runtimeenv.FilterRunnerOnly(parentEnv)
-	out := make([]string, 0, len(filteredParent)+len(specEnv))
-	out = append(out, filteredParent...)
-	keys := make([]string, 0, len(specEnv))
-	for k := range specEnv {
-		if runtimeenv.IsRunnerOnly(k) {
-			continue
-		}
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		out = append(out, k+"="+specEnv[k])
-	}
-	return out
+	return runtimeenv.ComposeChildEnv(parentEnv, specEnv)
 }

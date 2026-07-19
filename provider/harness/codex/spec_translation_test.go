@@ -280,7 +280,12 @@ func TestNewSpawnPlan_MCPServers(t *testing.T) {
 	spec := agent.Spec{
 		Cwd: "/tmp",
 		MCPServers: []agent.MCPServerConfig{
-			{Name: "af-linear", Command: "node", Args: []string{"server.js"}, Env: map[string]string{"FOO": "bar"}},
+			{Name: "af-linear", Command: "node", Args: []string{"server.js"}, Env: map[string]string{
+				"FOO":               "bar",
+				"ATTACH_TOKEN":      "must-not-serialize",
+				"ATTACH_TOKEN_FILE": "/must/not/serialize",
+				"ATTACH_URL":        "wss://must-not-serialize.invalid",
+			}},
 			{Name: "af-code", Command: "node", Args: []string{"code.js"}},
 		},
 	}
@@ -299,6 +304,11 @@ func TestNewSpawnPlan_MCPServers(t *testing.T) {
 	envMap, ok := linear["env"].(map[string]interface{})
 	if !ok || envMap["FOO"] != "bar" {
 		t.Fatalf("expected env FOO=bar, got %v", linear["env"])
+	}
+	for _, key := range []string{"ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL"} {
+		if _, leaked := envMap[key]; leaked {
+			t.Fatalf("codex serialized runner-only %s: %v", key, envMap)
+		}
 	}
 	// type field should always be present and set to "stdio".
 	if linear["type"] != "stdio" {

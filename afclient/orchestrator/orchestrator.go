@@ -28,6 +28,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient/repoconfig"
 	"github.com/RenseiAI/donmai/internal/linear"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // DispatchStatus is the lifecycle status of a dispatched agent.
@@ -150,10 +151,10 @@ func (d *providerDispatcher) Dispatch(ctx context.Context, issue linear.Issue, c
 
 	args := buildProviderArgs(issue, cfg)
 	cmd := exec.CommandContext(ctx, providerBin, args...) //nolint:gosec
-	cmd.Env = append(os.Environ(),
-		"LINEAR_ISSUE_ID="+issue.ID,
-		"LINEAR_ISSUE_IDENTIFIER="+issue.Identifier,
-	)
+	cmd.Env = runtimeenv.ComposeChildEnv(os.Environ(), map[string]string{
+		"LINEAR_ISSUE_ID":         issue.ID,
+		"LINEAR_ISSUE_IDENTIFIER": issue.Identifier,
+	})
 
 	if err := cmd.Start(); err != nil {
 		ad.Status = DispatchFailed

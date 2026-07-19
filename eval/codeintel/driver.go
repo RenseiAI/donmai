@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -321,7 +322,7 @@ func (d *Driver) runOne(ctx context.Context, c Case, arm Arm, trial int) (RunRec
 
 // buildArmSpec assembles the per-arm env + advertisement + MCP config.
 func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, _ string) (ArmSpec, func(), error) {
-	base := os.Environ()
+	base := runtimeenv.FilterRunnerOnly(os.Environ())
 	spec := ArmSpec{
 		Arm: arm, Case: c, Workarea: wa, DonmaiBin: d.cfg.DonmaiBin,
 		Budget: d.cfg.Budget, AdvertiseMode: d.cfg.Advertise, SnapshotID: workareaLeaf(wa),
@@ -411,6 +412,7 @@ func (d *Driver) provision(ctx context.Context, c Case, arm Arm, trial int) (str
 // evaluated at exactly the SHA it was derived from.
 func checkoutRef(ctx context.Context, dir, ref string) error {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "checkout", "--detach", "--quiet", ref) // nolint:gosec // ref is a pinned SHA from the validated benchmark.
+	cmd.Env = runtimeenv.FilterRunnerOnly(cmd.Environ())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}

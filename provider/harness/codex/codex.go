@@ -434,32 +434,7 @@ func resolveCodexBinary(bin string) (string, error) {
 }
 
 func mergeEnv(extra map[string]string) []string {
-	parent := runtimeenv.FilterRunnerOnly(os.Environ())
-	if len(extra) == 0 {
-		return parent
-	}
-	// Build a map from the parent env so safe extra keys override existing
-	// values. Runner-only attach controls are never valid app-server inputs.
-	merged := make(map[string]string, len(parent)+len(extra))
-	for _, e := range parent {
-		for i := 0; i < len(e); i++ {
-			if e[i] == '=' {
-				merged[e[:i]] = e[i+1:]
-				break
-			}
-		}
-	}
-	for k, v := range extra {
-		if runtimeenv.IsRunnerOnly(k) {
-			continue
-		}
-		merged[k] = v
-	}
-	out := make([]string, 0, len(merged))
-	for k, v := range merged {
-		out = append(out, k+"="+v)
-	}
-	return out
+	return runtimeenv.ComposeChildEnv(os.Environ(), extra)
 }
 
 func drainStderr(r io.ReadCloser) {

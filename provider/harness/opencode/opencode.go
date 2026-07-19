@@ -791,16 +791,7 @@ func drainStderr(r io.ReadCloser, buf *boundedBuffer, logger *slog.Logger) {
 }
 
 func composeEnv(parentEnv []string, specEnv map[string]string) []string {
-	filteredParent := runtimeenv.FilterRunnerOnly(parentEnv)
-	out := make([]string, 0, len(filteredParent)+len(specEnv))
-	out = append(out, filteredParent...)
-	for k, v := range specEnv {
-		if runtimeenv.IsRunnerOnly(k) {
-			continue
-		}
-		out = append(out, k+"="+v)
-	}
-	return out
+	return runtimeenv.ComposeChildEnv(parentEnv, specEnv)
 }
 
 // boundedBuffer accumulates the last N bytes written, dropping the
