@@ -3,10 +3,9 @@ name: worker-image
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Image tag to publish (defaults to 'latest')"
-        required: false
-        default: latest
+      tag:
+        description: "Existing release tag to retry (for example, v1.2.3)"
+        required: true
   push:
     tags:
       - "v*"
@@ -19,8 +18,50 @@ jobs:
   build-and-push:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - name: Checkout
+      - name: Checkout release tag
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Verify immutable release ref
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Release ref must be an explicit version tag, not a branch or image label: ${RELEASE_TAG}"
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            echo "::error::Release ref must be an existing tag: ${RELEASE_TAG}"
+            exit 1
+          fi
+          if branch_ref="$(git symbolic-ref -q HEAD)"; then
+            echo "::error::Release checkout must be detached at ${RELEASE_TAG}, not branch ${branch_ref}"
+            exit 1
+          fi
+          tag_sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_sha="$(git rev-parse HEAD)"
+          if [ "${tag_sha}" != "${head_sha}" ]; then
+            echo "::error::Checked-out SHA ${head_sha} does not match ${RELEASE_TAG} (${tag_sha})"
+            exit 1
+          fi
+          printf 'tag=%s\n' "${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          {
+            echo 'image_tags<<EOF'
+            echo "ghcr.io/renseiai/donmai-worker:${RELEASE_TAG}"
+            if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+              echo "ghcr.io/renseiai/donmai-worker:latest"
+            fi
+            echo 'EOF'
+          } >> "${GITHUB_OUTPUT}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "::notice::Manual retry publishes only ${RELEASE_TAG}; latest is unchanged."
+          fi
+          echo "Publishing ${RELEASE_TAG} from immutable commit ${head_sha}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
@@ -43,7 +84,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            DONMAI_VERSION=${{ inputs.version || github.ref_name }}
-          tags: |
-            ghcr.io/renseiai/donmai-worker:${{ inputs.version || github.ref_name }}
-            ghcr.io/renseiai/donmai-worker:latest
+            DONMAI_VERSION=${{ steps.release.outputs.tag }}
+          tags: ${{ steps.release.outputs.image_tags }}
