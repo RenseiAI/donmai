@@ -29,8 +29,8 @@ type HeartbeatOptions struct {
 	Region          string
 
 	// GetActiveSessionCounts returns one coherent occupancy snapshot. active is
-	// the unclassed count across every run mode; activeInteractive is the exact
-	// PTY "interactive" subset, excluding interview mode. Both values are sampled
+	// the unclassed count across every run mode; activeInteractive is the union of
+	// PTY "interactive" and legacy "interview" sessions. Both values are sampled
 	// together so concurrent session lifecycle changes cannot split them across
 	// different instants. A configured callback classifies interactive occupancy,
 	// so the outbound body includes `activeInteractiveCount` even when its value
@@ -421,9 +421,10 @@ func (h *HeartbeatService) SetCredentials(workerID, jwt string) {
 //	{ activeCount, activeInteractiveCount?, maxSessions?, load?,
 //	  allowlistHash?, allowlist?, appliedMutations?, mutationFailures? }
 //
-// activeInteractiveCount is the PTY interactive-occupancy split of activeCount
-// (Mode == "interactive"; interview mode is excluded); allowlistHash + allowlist
-// are Phase 1d fields; appliedMutations + mutationFailures are Phase 2c ACK fields.
+// activeInteractiveCount is the interactive-occupancy split of activeCount:
+// live Mode == "interactive" or legacy Mode == "interview" sessions count,
+// while headless and unknown modes do not. allowlistHash + allowlist are Phase 1d
+// fields; appliedMutations + mutationFailures are Phase 2c ACK fields.
 type heartbeatRequestBody struct {
 	ActiveCount int `json:"activeCount"`
 	// ActiveInteractiveCount is a *int so a nil (unreported) value drops the

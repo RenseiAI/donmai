@@ -667,9 +667,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 			RuntimeJWT:      regResp.RuntimeToken,
 			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
 			GetActiveCount:  d.spawnerActiveCount,
-			// Interactive-occupancy split: sample the unclassed total and exact
-			// interview-mode subset under one spawner lock so lifecycle changes
-			// cannot serialize values from different instants.
+			// Interactive-occupancy split: sample the unclassed total and the
+			// interactive + legacy interview subset under one spawner lock so
+			// lifecycle changes cannot serialize values from different instants.
 			GetActiveSessionCounts: d.spawnerActiveSessionCounts,
 			GetMaxCount:            func() int { return d.maxConcurrentSessions() },
 			GetStatus:              d.RegistrationStatus,
@@ -1126,18 +1126,18 @@ func (d *Daemon) ActiveSessionCount() int {
 	return d.spawnerActiveCount()
 }
 
-// ActiveInteractiveSessionCount returns the number of exact PTY "interactive"
-// run-mode sessions currently running under the daemon's shared WorkerSpawner.
-// Interview-mode sessions are excluded. Callers that need a value paired with
-// total occupancy should use ActiveSessionCounts instead.
+// ActiveInteractiveSessionCount returns the interactive-occupancy subset under
+// the daemon's shared WorkerSpawner: PTY "interactive" plus legacy "interview"
+// run-mode sessions. Headless and unknown modes are excluded. Callers that need
+// a value paired with total occupancy should use ActiveSessionCounts instead.
 func (d *Daemon) ActiveInteractiveSessionCount() int {
 	return d.spawnerActiveInteractiveCount()
 }
 
 // ActiveSessionCounts returns a coherent machine-wide occupancy snapshot for a
 // shared-spawner multi-identity configuration. active includes every run mode;
-// activeInteractive is the exact PTY "interactive" subset and excludes interview
-// mode. Embedders should wire this method to a satellite heartbeat's
+// activeInteractive is the union of PTY "interactive" and legacy "interview"
+// sessions. Embedders should wire this method to a satellite heartbeat's
 // GetActiveSessionCounts callback so both fields are sampled under one spawner
 // lock.
 func (d *Daemon) ActiveSessionCounts() (active, activeInteractive int) {

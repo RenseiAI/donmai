@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/internal/interview"
 )
 
 func TestHeartbeatService_StartStop(t *testing.T) {
@@ -830,7 +832,7 @@ func TestHeartbeatService_ActiveSessionCountsCoherentUnderConcurrentLifecycle(t 
 	go func() {
 		defer wg.Done()
 		close(started)
-		present := false
+		phase := 0
 		for {
 			select {
 			case <-stop:
@@ -838,14 +840,32 @@ func TestHeartbeatService_ActiveSessionCountsCoherentUnderConcurrentLifecycle(t 
 			default:
 			}
 			spawner.mu.Lock()
-			if present {
-				delete(spawner.sessions, "interactive")
-			} else {
+			clear(spawner.sessions)
+			switch phase {
+			case 1:
+				spawner.sessions["headless"] = &spawnedSession{
+					spec: SessionSpec{SessionID: "headless"},
+				}
+			case 2:
+				spawner.sessions["interview"] = &spawnedSession{
+					spec: SessionSpec{SessionID: "interview", Mode: interview.InterviewRunMode},
+				}
+			case 3:
 				spawner.sessions["interactive"] = &spawnedSession{
 					spec: SessionSpec{SessionID: "interactive", Mode: interactiveRunMode},
 				}
+			case 4:
+				spawner.sessions["interactive"] = &spawnedSession{
+					spec: SessionSpec{SessionID: "interactive", Mode: interactiveRunMode},
+				}
+				spawner.sessions["interview"] = &spawnedSession{
+					spec: SessionSpec{SessionID: "interview", Mode: interview.InterviewRunMode},
+				}
+				spawner.sessions["unknown"] = &spawnedSession{
+					spec: SessionSpec{SessionID: "unknown", Mode: "interactive-preview"},
+				}
 			}
-			present = !present
+			phase = (phase + 1) % 5
 			spawner.mu.Unlock()
 		}
 	}()
@@ -868,17 +888,26 @@ func TestHeartbeatService_ActiveSessionCountsCoherentUnderConcurrentLifecycle(t 
 		GetStatus:      func() RegistrationStatus { return RegistrationIdle },
 	})
 
+	valid := map[[2]int]bool{
+		{0, 0}: true,
+		{1, 0}: true,
+		{1, 1}: true,
+		{3, 2}: true,
+	}
 	for range 10_000 {
 		hs.sendOne(context.Background())
 		payload := hs.LastPayload()
 		if payload.ActiveInteractiveSessions == nil {
 			t.Fatal("classified occupancy omitted activeInteractiveSessions")
 		}
-		// This synthetic lifecycle has either no sessions or one exact PTY
-		// interactive session, so only coherent snapshots (0,0) and (1,1) exist.
-		if payload.ActiveSessions != *payload.ActiveInteractiveSessions {
+		activeInteractive := *payload.ActiveInteractiveSessions
+		if activeInteractive > payload.ActiveSessions {
+			t.Fatalf("heartbeat interactive occupancy exceeds total: active=%d interactive=%d",
+				payload.ActiveSessions, activeInteractive)
+		}
+		if !valid[[2]int{payload.ActiveSessions, activeInteractive}] {
 			t.Fatalf("torn heartbeat occupancy: active=%d interactive=%d",
-				payload.ActiveSessions, *payload.ActiveInteractiveSessions)
+				payload.ActiveSessions, activeInteractive)
 		}
 	}
 }
