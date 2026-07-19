@@ -10,7 +10,8 @@ A `v*` tag push starts three independent workflows:
 
 - `.github/workflows/release.yml` signs, notarizes, packages, and publishes the
   `donmai` binary with GoReleaser. Every tag gets immutable release assets; only
-  an automatic stable tag push may advance GitHub Latest.
+  an automatic stable tag push may advance GitHub Latest or update the rolling
+  stable Homebrew cask.
 - `.github/workflows/worker-image.yml` publishes the immutable versioned worker
   image to GHCR. Only an automatic stable tag push also advances `latest`.
 - `.github/workflows/e2b-template.yml` publishes an E2B target named
@@ -21,7 +22,7 @@ A `v*` tag push starts three independent workflows:
 A prerelease tag such as `v1.2.3-rc.1` therefore publishes version-addressable
 GitHub assets, a `ghcr.io/renseiai/donmai-worker:v1.2.3-rc.1` image, and a
 `donmai-worker:v1.2.3-rc.1` E2B target without changing GitHub Latest, GHCR
-`latest`, or E2B `default`.
+`latest`, E2B `default`, or the stable Homebrew cask.
 
 GoReleaser publishes these archives plus `checksums.txt` and signature-provenance
 sidecars:
@@ -148,6 +149,15 @@ prerelease worker-image publication writes only the versioned image and leaves
 automatic stable tag pushes assign both the version tag and `default` to the new
 E2B build. Neither E2B path writes back to the repository.
 
+The staged GoReleaser configuration also consumes the verifier's explicit
+Homebrew policy through `homebrew_casks[].skip_upload`. Only an automatic stable
+tag push sets that policy to publish. Every manual retry, including a retry of
+the current highest stable tag, republishes immutable GitHub assets while
+skipping the Homebrew publisher; older-tag retries therefore cannot roll
+`Casks/donmai.rb` backward. Prereleases also skip the cask so they cannot replace
+the stable cask. If only the cask publication failed for the current stable
+release, use the focused tap-repair path below instead of replaying GoReleaser.
+
 Do not pass a branch name, `latest`, or any other mutable label as the `tag`
 input. Do not use a branch-derived `GITHUB_REF_NAME` as a release target.
 
@@ -183,11 +193,12 @@ shasum -a 256 -c checksums.txt
 
 ## Verify the Homebrew cask
 
-`.goreleaser.yaml` writes the generated cask directly to
-`RenseiAI/homebrew-tap/Casks/donmai.rb` using
-`HOMEBREW_TAP_GITHUB_TOKEN`. The normal release path does not open a tap pull
-request. The generated commit message is `Brew cask update for donmai version
-vX.Y.Z`.
+On an automatic stable tag push, `.goreleaser.yaml` writes the generated cask
+directly to `RenseiAI/homebrew-tap/Casks/donmai.rb` using
+`HOMEBREW_TAP_GITHUB_TOKEN`. Manual retries and prereleases set the supported
+`homebrew_casks[].skip_upload` policy and cannot modify the tap. The normal
+stable release path does not open a tap pull request. The generated commit
+message is `Brew cask update for donmai version vX.Y.Z`.
 
 ```bash
 brew update
@@ -259,13 +270,15 @@ Run on at least one supported macOS host and one Linux environment:
 [ ] Versioned GHCR worker image exists
 [ ] E2B target donmai-worker:vX.Y.Z exists for the release build
 [ ] Automatic stable release moved donmai-worker:default to that same E2B build
-[ ] Prerelease publication left GitHub Latest, GHCR latest, and E2B default unchanged
+[ ] Prerelease publication left GitHub Latest, GHCR latest, E2B default, and the stable Homebrew cask unchanged
 ```
 
 ## Failure and rollback
 
 - **Release workflow failed before publication:** fix the cause and manually
-  rerun the same existing tag. The tag still identifies the same commit.
+  rerun the same existing tag. The tag still identifies the same commit; the
+  retry intentionally skips the Homebrew publisher, so repair a missing current
+  stable cask through the focused tap path described above.
 - **Published binary is broken:** do not move or recreate the tag. Revert or fix
   on `main` and publish the next patch version.
 - **Generated Homebrew cask is broken:** revert the generated cask commit in

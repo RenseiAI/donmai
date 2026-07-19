@@ -31,6 +31,7 @@ verify_release_tag() {
   local head_commit
   local is_prerelease
   local publish_rolling_aliases
+  local publish_homebrew_cask
   local make_latest
   local e2b_additional_tags
 
@@ -60,6 +61,7 @@ verify_release_tag() {
   esac
 
   make_latest=${publish_rolling_aliases}
+  publish_homebrew_cask=${publish_rolling_aliases}
   if [[ "${publish_rolling_aliases}" == true ]]; then
     e2b_additional_tags=default
   else
@@ -88,6 +90,7 @@ verify_release_tag() {
     printf 'commit=%s\n' "${head_commit}"
     printf 'is_prerelease=%s\n' "${is_prerelease}"
     printf 'publish_rolling_aliases=%s\n' "${publish_rolling_aliases}"
+    printf 'publish_homebrew_cask=%s\n' "${publish_homebrew_cask}"
     printf 'goreleaser_make_latest=%s\n' "${make_latest}"
     printf 'e2b_template_ref=donmai-worker:%s\n' "${tag}"
     printf 'e2b_additional_tags=%s\n' "${e2b_additional_tags}"
@@ -104,6 +107,7 @@ verify_release_tag() {
     printf 'GORELEASER_MAKE_LATEST=%s\n' "${make_latest}"
     printf 'RELEASE_IS_PRERELEASE=%s\n' "${is_prerelease}"
     printf 'RELEASE_PUBLISH_ROLLING_ALIASES=%s\n' "${publish_rolling_aliases}"
+    printf 'GORELEASER_PUBLISH_HOMEBREW=%s\n' "${publish_homebrew_cask}"
   } >> "${env_file}"
 
   printf 'Verified %s at detached commit %s\n' "${tag}" "${head_commit}"

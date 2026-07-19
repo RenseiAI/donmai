@@ -72,8 +72,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   tag grammar and prove a detached checkout at the tag's peeled commit; passes
   the verified tag explicitly to GoReleaser; prevents manual retries and
   prerelease tags from moving GitHub Latest, the GHCR `latest` image, or E2B
-  `default`; publishes an E2B `donmai-worker:<version>` target for every release;
-  and anchors GoReleaser publication to the exact commit it built.
+  `default`; skips the Homebrew publisher for every prerelease and manual retry
+  so older tags cannot roll back the stable cask; publishes an E2B
+  `donmai-worker:<version>` target for every release; and anchors GoReleaser
+  publication to the exact commit it built.
 - **Go 1.25.12 release floor.** Raises the module and worker-image toolchain to
   Go 1.25.12 and makes every Go-using workflow consume the canonical `go.mod`
   version instead of carrying independent floating or stale versions.

@@ -1,7 +1,8 @@
 name: Release
 
 # All verified tags publish immutable release assets. Only an automatic stable
-# tag push may advance GitHub Latest; prereleases and manual retries may not.
+# tag push may advance GitHub Latest or update the rolling stable Homebrew cask;
+# prereleases and manual retries may not.
 
 on:
   push:
@@ -73,7 +74,7 @@ jobs:
             "${GITHUB_OUTPUT}" \
             "${GITHUB_ENV}"
           if [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
-            echo "::notice::Manual retry keeps the repository's current GitHub Latest release unchanged."
+            echo "::notice::Manual retry keeps GitHub Latest and the Homebrew cask unchanged."
           fi
 
       - uses: actions/setup-go@v6

@@ -70,6 +70,10 @@ signs:
 
 homebrew_casks:
   - name: donmai
+    # Only an automatic stable tag push may update the rolling stable cask.
+    # The staged verifier exports false for prereleases and every manual retry,
+    # so replaying an older tag cannot roll Casks/donmai.rb backward.
+    skip_upload: '{{ if eq .Env.GORELEASER_PUBLISH_HOMEBREW "true" }}false{{ else }}true{{ end }}'
     repository:
       owner: RenseiAI
       name: homebrew-tap
