@@ -137,6 +137,20 @@ type SessionSpec struct {
 	// per-session credential snapshots without a redundant allowlist lookup.
 	ProjectName string `json:"projectName,omitempty"`
 
+	// CredentialRequirements is the ordered, non-secret set of environment-
+	// variable name groups required by the resolved execution cell. OnPreSpawn
+	// consumers may validate the injected snapshot against these names without
+	// receiving credential values over the poll/session wire.
+	CredentialRequirements []CredentialEnvRequirement `json:"credentialRequirements,omitempty"`
+
+	// Harness is the resolved loop-driver identity copied from the poll item or
+	// resolved profile for spawn-time routing and validation.
+	Harness string `json:"harness,omitempty"`
+
+	// ServingHost is the resolved model-serving location copied opaquely for
+	// spawn-time routing and credential validation.
+	ServingHost string `json:"servingHost,omitempty"`
+
 	// ── P3 narrow-only gate inputs (ADR-2026-06-06 §5.3) ─────────────────
 	//
 	// Copied through by PollItemToSessionSpec from the platform-stamped
