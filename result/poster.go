@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // DefaultMaxAttempts is the legacy 3-attempt pattern from
@@ -235,6 +236,11 @@ type statusRequest struct {
 	// platform degrades to the scalars, an old runner against a new platform
 	// posts no manifest and the platform falls back to the scalars/marker scan.
 	Manifest *agent.TurnManifest `json:"manifest,omitempty"`
+
+	// TerminalWorkareaLease is the immutable path-free descriptor proving the
+	// successful workarea is durably retained before this status can trigger
+	// downstream verification.
+	TerminalWorkareaLease *workarea.TerminalLeaseDescriptor `json:"terminalWorkareaLease,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -242,6 +248,51 @@ type statusRequest struct {
 // status handler and intentionally omitted.
 type errorEnvelope struct {
 	Message string `json:"message"`
+}
+
+// PostOptions carries additive terminal-status fields that are not part of the
+// provider-owned agent.Result.
+type PostOptions struct {
+	TerminalWorkareaLease *workarea.TerminalLeaseDescriptor
+}
+
+// PostOutcome preserves which half of the completion/status exchange failed.
+// StatusObserved is the durable outbox observation signal; completion comments
+// are ancillary and may fail independently.
+type PostOutcome struct {
+	CompletionErr error
+	StatusErr     error
+}
+
+// StatusObserved reports whether the receiver durably accepted terminal status.
+func (o PostOutcome) StatusObserved() bool { return o.StatusErr == nil }
+
+// Err combines the two exchange errors using the legacy Post error shape.
+func (o PostOutcome) Err() error {
+	switch {
+	case o.CompletionErr == nil && o.StatusErr == nil:
+		return nil
+	case o.CompletionErr != nil && o.StatusErr != nil:
+		return errors.Join(
+			fmt.Errorf("completion: %w", o.CompletionErr),
+			fmt.Errorf("status: %w", o.StatusErr),
+		)
+	case o.CompletionErr != nil:
+		return fmt.Errorf("completion: %w", o.CompletionErr)
+	default:
+		return fmt.Errorf("status: %w", o.StatusErr)
+	}
+}
+
+// EncodeTerminalResultPayload serializes the provider-neutral logical result
+// stored atomically with a terminal lease. The path-free descriptor is rebuilt
+// from the durable lease during restart replay.
+func EncodeTerminalResultPayload(r agent.Result) (json.RawMessage, error) {
+	payload, err := json.Marshal(r)
+	if err != nil {
+		return nil, fmt.Errorf("marshal terminal result payload: %w", err)
+	}
+	return payload, nil
 }
 
 // Post sends the runner's terminal [agent.Result] to the platform.
@@ -267,29 +318,50 @@ type errorEnvelope struct {
 // When both calls return errors, [errors.Join] combines them so
 // downstream logs see the full picture.
 func (p *Poster) Post(ctx context.Context, sessionID string, r agent.Result) error {
+	return p.PostWithOptions(ctx, sessionID, r, PostOptions{})
+}
+
+// PostWithOptions sends a terminal result plus additive runner-owned status
+// fields. Existing callers should continue using Post.
+func (p *Poster) PostWithOptions(ctx context.Context, sessionID string, r agent.Result, opts PostOptions) error {
+	return p.PostWithOptionsOutcome(ctx, sessionID, r, opts).Err()
+}
+
+// PostWithOptionsOutcome sends the exchange while preserving durable status
+// observation independently from the ancillary completion comment.
+func (p *Poster) PostWithOptionsOutcome(ctx context.Context, sessionID string, r agent.Result, opts PostOptions) PostOutcome {
+	if strings.TrimSpace(sessionID) == "" {
+		return PostOutcome{StatusErr: errors.New("result: sessionID is required")}
+	}
+	if r.Status == "" {
+		return PostOutcome{StatusErr: errors.New("result: agent.Result.Status is required")}
+	}
+	return PostOutcome{
+		CompletionErr: p.postCompletion(ctx, sessionID, r),
+		StatusErr:     p.postStatus(ctx, sessionID, r, opts),
+	}
+}
+
+// ReplayTerminalStatus decodes one durable logical result and posts only the
+// terminal status. Completion comments are intentionally not replayed.
+func (p *Poster) ReplayTerminalStatus(ctx context.Context, sessionID string, payload json.RawMessage, descriptor workarea.TerminalLeaseDescriptor) error {
+	var r agent.Result
+	if err := json.Unmarshal(payload, &r); err != nil {
+		return fmt.Errorf("decode terminal result payload: %w", err)
+	}
 	if strings.TrimSpace(sessionID) == "" {
 		return errors.New("result: sessionID is required")
 	}
 	if r.Status == "" {
 		return errors.New("result: agent.Result.Status is required")
 	}
+	return p.postStatus(ctx, sessionID, r, PostOptions{TerminalWorkareaLease: &descriptor})
+}
 
-	completionErr := p.postCompletion(ctx, sessionID, r)
-	statusErr := p.postStatus(ctx, sessionID, r)
-
-	switch {
-	case completionErr == nil && statusErr == nil:
-		return nil
-	case completionErr != nil && statusErr != nil:
-		return errors.Join(
-			fmt.Errorf("completion: %w", completionErr),
-			fmt.Errorf("status: %w", statusErr),
-		)
-	case completionErr != nil:
-		return fmt.Errorf("completion: %w", completionErr)
-	default:
-		return fmt.Errorf("status: %w", statusErr)
-	}
+// ReplayTerminalResult matches workarea.TerminalResultPoster and rebuilds the
+// path-free descriptor from the durable lease.
+func (p *Poster) ReplayTerminalResult(ctx context.Context, lease workarea.TerminalLease, payload json.RawMessage) error {
+	return p.ReplayTerminalStatus(ctx, lease.SessionID, payload, lease.Descriptor())
 }
 
 func (p *Poster) credentials(ctx context.Context) RuntimeCredentials {
@@ -329,7 +401,7 @@ func (p *Poster) postCompletion(ctx context.Context, sessionID string, r agent.R
 	})
 }
 
-func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Result) error {
+func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Result, opts PostOptions) error {
 	path := fmt.Sprintf("/api/sessions/%s/status", sessionID)
 	return p.doRetried(ctx, path, func(creds RuntimeCredentials) any {
 		body := statusRequest{
@@ -345,7 +417,8 @@ func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Resul
 			PullRequestURL:    r.PullRequestURL,
 			// Structured turn-result manifest (W3) — posted verbatim when the
 			// agent wrote one. Additive; nil when absent.
-			Manifest: r.Manifest,
+			Manifest:              r.Manifest,
+			TerminalWorkareaLease: opts.TerminalWorkareaLease,
 		}
 		if r.Cost != nil {
 			body.TotalCostUsd = r.Cost.TotalCostUsd

@@ -898,7 +898,18 @@ func runWorktreeCleanup(_ context.Context, worktreePath string, dryRun, force bo
 		entryPath := filepath.Join(worktreePath, entry.Name())
 		result.Scanned++
 		if leaseStore != nil {
-			retained, retainErr := leaseStore.Retained(entryPath)
+			workareaID, idErr := workarea.IDForPath(entryPath)
+			if idErr != nil {
+				result.Errors = append(result.Errors, WorktreeError{Path: entryPath, Error: idErr.Error()})
+				result.Skipped++
+				continue
+			}
+			retained, retainErr := leaseStore.Retained(workareaID)
+			if retainErr == nil && !retained {
+				// Compatibility with records created by the unreleased path-id
+				// candidate before opaque workarea identities were introduced.
+				retained, retainErr = leaseStore.Retained(entryPath)
+			}
 			if retainErr != nil {
 				result.Errors = append(result.Errors, WorktreeError{
 					Path:  entryPath,

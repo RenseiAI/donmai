@@ -304,7 +304,7 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	if filepath.Clean(dst) == filepath.Clean(m.leases.Dir()) {
 		return "", errors.New("runtime/worktree: destination conflicts with terminal lease state directory")
 	}
-	retained, err := m.leases.Retained(dst)
+	retained, err := m.retainedPath(dst)
 	if err != nil {
 		return "", fmt.Errorf("runtime/worktree: check terminal lease before provision: %w", err)
 	}
@@ -385,7 +385,7 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 	if !ok {
 		return nil
 	}
-	retained, err := m.leases.RequestRelease(ctx, res.Path)
+	retained, err := m.requestReleasePath(ctx, res.Path)
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: check terminal lease before teardown: %w", err)
 	}
@@ -407,8 +407,8 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 }
 
 // AcquireTerminalLease persists a provider-neutral lease for a workarea already
-// owned by the session. WorkareaID defaults to the exact absolute path and
-// cannot name a different workarea than the manager provisioned.
+// owned by the session. WorkareaID is an opaque stable identity derived from the
+// exact local path; the path itself remains only in durable local state.
 func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.AcquireSpec) (*workarea.TerminalLease, error) {
 	unlock := m.lockSession(spec.SessionID)
 	defer unlock()
@@ -419,14 +419,18 @@ func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.Acquir
 	if res == nil {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownSession, spec.SessionID)
 	}
+	workareaID, err := workarea.IDForPath(res.Path)
+	if err != nil {
+		return nil, err
+	}
 	if spec.WorkareaPath == "" {
 		spec.WorkareaPath = res.Path
 	}
 	if spec.WorkareaID == "" {
-		spec.WorkareaID = res.Path
+		spec.WorkareaID = workareaID
 	}
-	if spec.WorkareaPath != res.Path || spec.WorkareaID != res.Path {
-		return nil, fmt.Errorf("%w: terminal lease must retain exact workarea %s", workarea.ErrLeaseConflict, res.Path)
+	if spec.WorkareaPath != res.Path || spec.WorkareaID != workareaID {
+		return nil, fmt.Errorf("%w: terminal lease must retain the manager-owned workarea", workarea.ErrLeaseConflict)
 	}
 	metadata := make(map[string]string, len(spec.ReleaseMetadata)+2)
 	for key, value := range spec.ReleaseMetadata {
@@ -445,6 +449,34 @@ func (m *Manager) RenewTerminalLease(ctx context.Context, renewal workarea.Renew
 	return m.leases.Renew(ctx, renewal)
 }
 
+// TerminalLease returns one durable local lease by its opaque id.
+func (m *Manager) TerminalLease(leaseID string) (*workarea.TerminalLease, error) {
+	return m.leases.Get(leaseID)
+}
+
+// ClaimTerminalLeaseExecution durably binds one invocation/claim pair as the
+// exclusive workarea-backed verifier for a lease.
+func (m *Manager) ClaimTerminalLeaseExecution(ctx context.Context, claim workarea.ExecutionClaimSpec) (*workarea.TerminalLease, error) {
+	return m.leases.ClaimExecution(ctx, claim)
+}
+
+// MarkTerminalResultObserved records durable receiver observation after the
+// initial terminal status post succeeds.
+func (m *Manager) MarkTerminalResultObserved(ctx context.Context, leaseID, sessionID, terminalResultID, workareaID string) (*workarea.TerminalLease, error) {
+	return m.leases.MarkTerminalResultObserved(ctx, leaseID, sessionID, terminalResultID, workareaID)
+}
+
+// ReplayTerminalResults performs one bounded durable outbox recovery pass.
+func (m *Manager) ReplayTerminalResults(ctx context.Context, batch int, attemptTimeout time.Duration, poster workarea.TerminalResultPoster) (int, error) {
+	return m.leases.ReplayTerminalResults(ctx, batch, attemptTimeout, poster)
+}
+
+// RunTerminalResultReplayer runs durable terminal status recovery until ctx is
+// cancelled. Embedders should wire the same receiver used for initial posting.
+func (m *Manager) RunTerminalResultReplayer(ctx context.Context, opts workarea.TerminalResultReplayOptions, poster workarea.TerminalResultPoster) {
+	m.leases.RunTerminalResultReplayer(ctx, opts, poster)
+}
+
 // AcknowledgeTerminalResult consumes explicit semantic acknowledgement and
 // invokes the manager's deferred ordinary teardown policy.
 func (m *Manager) AcknowledgeTerminalResult(ctx context.Context, ack workarea.TerminalResultAcknowledgement) (*workarea.TerminalLease, error) {
@@ -459,9 +491,18 @@ func (m *Manager) ReapExpiredTerminalLeases(ctx context.Context, batch int, atte
 	return m.leases.ReapExpired(ctx, batch, attemptTimeout, m.releaseLeasedWorkarea)
 }
 
+// RunTerminalLeaseReaper runs the bounded durable reaper until ctx is
+// cancelled. Embedders should start one for the daemon lifetime.
+func (m *Manager) RunTerminalLeaseReaper(ctx context.Context, opts workarea.ReaperOptions) {
+	m.leases.RunReaper(ctx, opts, m.releaseLeasedWorkarea)
+}
+
 func (m *Manager) releaseLeasedWorkarea(ctx context.Context, lease workarea.TerminalLease) error {
-	unlock := m.lockSession(lease.SessionID)
-	defer unlock()
+	// The lease store already holds the per-result/workarea lock while invoking
+	// this callback. Do not take the manager's session lock here: Acquire/Teardown
+	// take session then lease locks, so the reverse order would deadlock an
+	// acknowledgement or reaper racing those operations. release-pending durable
+	// state keeps Provision/Teardown fail-closed during provider disposition.
 	return m.releaseLeasedWorkareaUnlocked(ctx, lease)
 }
 
@@ -490,13 +531,52 @@ func (m *Manager) teardownResult(ctx context.Context, res ProvisionResult) error
 	if res.Strategy == StrategyWorktreeAdd && res.ParentRepoPath != "" {
 		out, err := m.runGit(ctx, "", "-C", res.ParentRepoPath, "worktree", "remove", "--force", res.Path)
 		if err != nil {
-			return fmt.Errorf("runtime/worktree: git worktree remove %q: %w (%s)", res.Path, err, strings.TrimSpace(string(out)))
+			removed, verifyErr := m.worktreeAlreadyRemoved(ctx, res.ParentRepoPath, res.Path)
+			if verifyErr != nil {
+				return fmt.Errorf("runtime/worktree: git worktree remove %q: %w (%s); verify prior removal: %v", res.Path, err, strings.TrimSpace(string(out)), verifyErr)
+			}
+			if !removed {
+				return fmt.Errorf("runtime/worktree: git worktree remove %q: %w (%s)", res.Path, err, strings.TrimSpace(string(out)))
+			}
 		}
 	}
 	if err := os.RemoveAll(res.Path); err != nil {
 		return fmt.Errorf("runtime/worktree: remove %q: %w", res.Path, err)
 	}
 	return nil
+}
+
+// worktreeAlreadyRemoved closes the release-pending crash window: a repeated
+// worktree removal is successful only when the exact leaf is absent from both
+// the filesystem and the parent repository's authoritative worktree registry.
+func (m *Manager) worktreeAlreadyRemoved(ctx context.Context, parentRepoPath, path string) (bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat worktree path: %w", err)
+	}
+	out, err := m.runGit(ctx, "", "-C", parentRepoPath, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, fmt.Errorf("git worktree list: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	wanted, err := filepath.Abs(path)
+	if err != nil {
+		return false, fmt.Errorf("resolve worktree path: %w", err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		const prefix = "worktree "
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		listed, resolveErr := filepath.Abs(strings.TrimSpace(strings.TrimPrefix(line, prefix)))
+		if resolveErr != nil {
+			return false, fmt.Errorf("resolve registered worktree path: %w", resolveErr)
+		}
+		if filepath.Clean(listed) == filepath.Clean(wanted) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // Path returns the worktree path for a previously-provisioned session.
@@ -605,11 +685,39 @@ func (m *Manager) runGit(ctx context.Context, repoURL string, args ...string) ([
 	return m.envRunner(ctx, env, "git", args...)
 }
 
+func (m *Manager) retainedPath(path string) (bool, error) {
+	workareaID, err := workarea.IDForPath(path)
+	if err != nil {
+		return false, err
+	}
+	retained, err := m.leases.Retained(workareaID)
+	if err != nil || retained {
+		return retained, err
+	}
+	// Compatibility with lease records created by the unreleased path-id
+	// candidate before opaque workarea identities were introduced.
+	return m.leases.Retained(path)
+}
+
+func (m *Manager) requestReleasePath(ctx context.Context, path string) (bool, error) {
+	workareaID, err := workarea.IDForPath(path)
+	if err != nil {
+		return false, err
+	}
+	retained, err := m.leases.RequestRelease(ctx, workareaID)
+	if err != nil || retained {
+		return retained, err
+	}
+	// Compatibility with lease records created by the unreleased path-id
+	// candidate before opaque workarea identities were introduced.
+	return m.leases.RequestRelease(ctx, path)
+}
+
 // cleanupConflict tries to remove a stale worktree entry left by a prior failed
 // Provision. It fails closed when lease state is unreadable and never removes a
 // terminal-leased exact workarea; ordinary stale cleanup remains best-effort.
 func (m *Manager) cleanupConflict(ctx context.Context, dst string, spec ProvisionSpec) error {
-	retained, err := m.leases.Retained(dst)
+	retained, err := m.retainedPath(dst)
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: check terminal lease before conflict cleanup: %w", err)
 	}

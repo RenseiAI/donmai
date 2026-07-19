@@ -353,14 +353,24 @@ func TestTerminalLeaseRetainsLeafUntilAcknowledgement(t *testing.T) {
 	if err != nil || !retained.ReleaseRequested || retained.State != workarea.LeaseActive {
 		t.Fatalf("teardown did not retain active lease: lease=%+v err=%v", retained, err)
 	}
-
-	ack := workarea.TerminalResultAcknowledgement{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		Acknowledged:     true,
+	recovered, err := worktree.NewManager(worktree.Options{
+		ParentDir:     dir,
+		CommandRunner: runner.run,
+		LeaseStore:    leaseStore,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	if _, err := recovered.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "s1",
+		RepoURL:   "x",
+		Strategy:  worktree.StrategyClone,
+	}); !errors.Is(err, workarea.ErrWorkareaLeased) {
+		t.Fatalf("retained workarea was reusable after restart: %v", err)
+	}
+
+	claimManagerLease(t, m, lease, "invocation-1", "claim-1")
+	ack := managerAcknowledgement(lease, "invocation-1", "claim-1")
 	for i := 0; i < 2; i++ {
 		released, ackErr := m.AcknowledgeTerminalResult(context.Background(), ack)
 		if ackErr != nil {
@@ -413,13 +423,8 @@ func TestTerminalLeaseAcknowledgementRecoversAfterManagerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = recovered.AcknowledgeTerminalResult(context.Background(), workarea.TerminalResultAcknowledgement{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		Acknowledged:     true,
-	})
+	claimManagerLease(t, recovered, lease, "invocation-1", "claim-1")
+	_, err = recovered.AcknowledgeTerminalResult(context.Background(), managerAcknowledgement(lease, "invocation-1", "claim-1"))
 	if err != nil {
 		t.Fatalf("recovered acknowledgement: %v", err)
 	}

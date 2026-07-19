@@ -1,7 +1,9 @@
 package workarea_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -11,6 +13,9 @@ import (
 
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
+
+// Preserve the task-#78 public source shape for downstream unkeyed literals.
+var _ = workarea.StoreOptions{"", nil}
 
 type testClock struct {
 	mu  sync.Mutex
@@ -49,6 +54,33 @@ func acquireSpec(sessionID, resultID, workareaID string) workarea.AcquireSpec {
 		WorkareaID:       workareaID,
 		WorkareaPath:     filepath.Join("/tmp", workareaID),
 		Policy:           testPolicy(),
+	}
+}
+
+func claimLease(t *testing.T, store *workarea.LeaseStore, lease *workarea.TerminalLease, invocationID, claimID string) {
+	t.Helper()
+	if _, err := store.ClaimExecution(context.Background(), workarea.ExecutionClaimSpec{
+		LeaseID:          lease.LeaseID,
+		SessionID:        lease.SessionID,
+		TerminalResultID: lease.TerminalResultID,
+		WorkareaID:       lease.WorkareaID,
+		InvocationID:     invocationID,
+		ClaimID:          claimID,
+	}); err != nil {
+		t.Fatalf("ClaimExecution: %v", err)
+	}
+}
+
+func acknowledgement(lease *workarea.TerminalLease, invocationID, claimID string) workarea.TerminalResultAcknowledgement {
+	return workarea.TerminalResultAcknowledgement{
+		SchemaVersion:    workarea.TerminalLeaseAcknowledgementSchemaV1,
+		LeaseID:          lease.LeaseID,
+		SessionID:        lease.SessionID,
+		TerminalResultID: lease.TerminalResultID,
+		WorkareaID:       lease.WorkareaID,
+		InvocationID:     invocationID,
+		ClaimID:          claimID,
+		Acknowledged:     true,
 	}
 }
 
@@ -139,18 +171,20 @@ func TestLeaseReleaseRequiresMatchingSemanticAcknowledgementAndIsIdempotent(t *t
 		t.Fatalf("RequestRelease retained=%v err=%v", retained, err)
 	}
 
+	claimLease(t, store, lease, "invocation-1", "claim-1")
 	var releases atomic.Int32
 	releaser := func(context.Context, workarea.TerminalLease) error {
 		releases.Add(1)
 		return nil
 	}
-	bad := workarea.TerminalResultAcknowledgement{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: "different-result",
-		WorkareaID:       lease.WorkareaID,
-		Acknowledged:     true,
+	missingSchema := acknowledgement(lease, "invocation-1", "claim-1")
+	missingSchema.SchemaVersion = ""
+	if _, err := store.Acknowledge(context.Background(), missingSchema, releaser); err == nil {
+		t.Fatal("missing acknowledgement schema was accepted")
 	}
+
+	bad := acknowledgement(lease, "invocation-1", "claim-1")
+	bad.TerminalResultID = "different-result"
 	if _, err := store.Acknowledge(context.Background(), bad, releaser); !errors.Is(err, workarea.ErrLeaseConflict) {
 		t.Fatalf("mismatched acknowledgement error = %v, want ErrLeaseConflict", err)
 	}
@@ -158,13 +192,7 @@ func TestLeaseReleaseRequiresMatchingSemanticAcknowledgementAndIsIdempotent(t *t
 		t.Fatal("mismatched acknowledgement invoked release")
 	}
 
-	ack := workarea.TerminalResultAcknowledgement{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		Acknowledged:     true,
-	}
+	ack := acknowledgement(lease, "invocation-1", "claim-1")
 	for i := 0; i < 2; i++ {
 		released, err := store.Acknowledge(context.Background(), ack, releaser)
 		if err != nil {
@@ -189,14 +217,9 @@ func TestLeaseAcknowledgementPersistsReleasePendingBeforeDisposition(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	claimLease(t, store, lease, "invocation-1", "claim-1")
 
-	ack := workarea.TerminalResultAcknowledgement{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		Acknowledged:     true,
-	}
+	ack := acknowledgement(lease, "invocation-1", "claim-1")
 	released, err := store.Acknowledge(context.Background(), ack, func(_ context.Context, pending workarea.TerminalLease) error {
 		if pending.State != workarea.LeaseReleasePending || pending.AcknowledgedAt == nil {
 			t.Fatalf("callback lease = %+v, want acknowledged release-pending", pending)
@@ -228,13 +251,8 @@ func TestConcurrentAcknowledgementReleasesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack := workarea.TerminalResultAcknowledgement{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		Acknowledged:     true,
-	}
+	claimLease(t, store, lease, "invocation-1", "claim-1")
+	ack := acknowledgement(lease, "invocation-1", "claim-1")
 
 	var releases atomic.Int32
 	releaseStarted := make(chan struct{})
@@ -264,6 +282,205 @@ func TestConcurrentAcknowledgementReleasesOnce(t *testing.T) {
 	}
 	if releases.Load() != 1 {
 		t.Fatalf("release calls = %d, want 1", releases.Load())
+	}
+}
+
+func TestLeaseExecutionClaimIsExclusiveAndAcknowledgementIdentityBound(t *testing.T) {
+	t.Parallel()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type claimResult struct {
+		invocationID string
+		claimID      string
+		err          error
+	}
+	start := make(chan struct{})
+	results := make(chan claimResult, 2)
+	for _, identity := range [][2]string{{"invocation-a", "claim-a"}, {"invocation-b", "claim-b"}} {
+		identity := identity
+		go func() {
+			<-start
+			_, claimErr := store.ClaimExecution(context.Background(), workarea.ExecutionClaimSpec{
+				LeaseID:          lease.LeaseID,
+				SessionID:        lease.SessionID,
+				TerminalResultID: lease.TerminalResultID,
+				WorkareaID:       lease.WorkareaID,
+				InvocationID:     identity[0],
+				ClaimID:          identity[1],
+			})
+			results <- claimResult{invocationID: identity[0], claimID: identity[1], err: claimErr}
+		}()
+	}
+	close(start)
+
+	var winner, loser claimResult
+	for i := 0; i < 2; i++ {
+		result := <-results
+		switch {
+		case result.err == nil:
+			winner = result
+		case errors.Is(result.err, workarea.ErrLeaseExecutionClaimed):
+			loser = result
+		default:
+			t.Fatalf("ClaimExecution: %v", result.err)
+		}
+	}
+	if winner.invocationID == "" || loser.invocationID == "" {
+		t.Fatalf("winner=%+v loser=%+v", winner, loser)
+	}
+	recovered, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: store.Dir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recovered.ClaimExecution(context.Background(), workarea.ExecutionClaimSpec{
+		LeaseID:          lease.LeaseID,
+		SessionID:        lease.SessionID,
+		TerminalResultID: lease.TerminalResultID,
+		WorkareaID:       lease.WorkareaID,
+		InvocationID:     winner.invocationID,
+		ClaimID:          winner.claimID,
+	}); err != nil {
+		t.Fatalf("recovered idempotent claim: %v", err)
+	}
+
+	var releases atomic.Int32
+	releaser := func(context.Context, workarea.TerminalLease) error {
+		releases.Add(1)
+		return nil
+	}
+	if _, err := recovered.Acknowledge(context.Background(), acknowledgement(lease, loser.invocationID, loser.claimID), releaser); !errors.Is(err, workarea.ErrLeaseExecutionConflict) {
+		t.Fatalf("losing acknowledgement error = %v", err)
+	}
+	if releases.Load() != 0 {
+		t.Fatal("losing verifier released the lease")
+	}
+	if _, err := recovered.Acknowledge(context.Background(), acknowledgement(lease, winner.invocationID, winner.claimID), releaser); err != nil {
+		t.Fatalf("winning acknowledgement: %v", err)
+	}
+	if releases.Load() != 1 {
+		t.Fatalf("release calls = %d, want 1", releases.Load())
+	}
+	if _, err := recovered.Acknowledge(context.Background(), acknowledgement(lease, loser.invocationID, loser.claimID), releaser); !errors.Is(err, workarea.ErrLeaseExecutionConflict) {
+		t.Fatalf("wrong duplicate acknowledgement error = %v", err)
+	}
+	if releases.Load() != 1 {
+		t.Fatalf("wrong duplicate acknowledgement repeated release: %d", releases.Load())
+	}
+}
+
+func TestTerminalResultOutboxReplaysAfterRestart(t *testing.T) {
+	t.Parallel()
+	clock := newTestClock()
+	dir := t.TempDir()
+	spec := acquireSpec("session-1", "result-1", "workarea-1")
+	spec.TerminalResultPayload = []byte(`{"status":"completed"}`)
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: dir, Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.TerminalResultPost == nil || lease.TerminalResultPost.State != workarea.TerminalResultPostPending {
+		t.Fatalf("outbox was not acquired atomically: %+v", lease.TerminalResultPost)
+	}
+
+	recovered, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: dir, Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recovered.Acquire(context.Background(), spec); err != nil {
+		t.Fatalf("idempotent outbox acquire after restart: %v", err)
+	}
+	var calls atomic.Int32
+	considered, err := recovered.ReplayTerminalResults(context.Background(), 1, time.Second, func(_ context.Context, got workarea.TerminalLease, payload json.RawMessage) error {
+		calls.Add(1)
+		var compact bytes.Buffer
+		if compactErr := json.Compact(&compact, payload); compactErr != nil {
+			return compactErr
+		}
+		if got.LeaseID != lease.LeaseID || compact.String() != string(spec.TerminalResultPayload) {
+			return errors.New("replayed terminal result identity or payload differs")
+		}
+		return nil
+	})
+	if err != nil || considered != 1 || calls.Load() != 1 {
+		t.Fatalf("ReplayTerminalResults considered=%d calls=%d err=%v", considered, calls.Load(), err)
+	}
+	observed, err := recovered.Get(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.TerminalResultPost.State != workarea.TerminalResultPostObserved || observed.TerminalResultPost.ObservedAt == nil {
+		t.Fatalf("observed outbox = %+v", observed.TerminalResultPost)
+	}
+}
+
+func TestTerminalResultOutboxExpiresWithoutReplay(t *testing.T) {
+	t.Parallel()
+	clock := newTestClock()
+	spec := acquireSpec("session-1", "result-1", "workarea-1")
+	spec.TerminalResultPayload = []byte(`{"status":"completed"}`)
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir(), Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(3 * time.Minute)
+	considered, err := store.ReplayTerminalResults(context.Background(), 1, time.Second, func(context.Context, workarea.TerminalLease, json.RawMessage) error {
+		t.Fatal("expired terminal result was replayed")
+		return nil
+	})
+	if err != nil || considered != 1 {
+		t.Fatalf("ReplayTerminalResults considered=%d err=%v", considered, err)
+	}
+	expired, err := store.Get(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expired.TerminalResultPost.State != workarea.TerminalResultPostExpired || expired.TerminalResultPost.ExpiredAt == nil {
+		t.Fatalf("expired outbox = %+v", expired.TerminalResultPost)
+	}
+}
+
+func TestExpiredExecutionClaimCannotAcknowledgeAndReaperReclaims(t *testing.T) {
+	t.Parallel()
+	clock := newTestClock()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir(), Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimLease(t, store, lease, "invocation-1", "claim-1")
+	clock.Advance(3 * time.Minute)
+	var releases atomic.Int32
+	releaser := func(context.Context, workarea.TerminalLease) error {
+		releases.Add(1)
+		return nil
+	}
+	if _, err := store.Acknowledge(context.Background(), acknowledgement(lease, "invocation-1", "claim-1"), releaser); !errors.Is(err, workarea.ErrLeaseExpired) {
+		t.Fatalf("expired acknowledgement error = %v", err)
+	}
+	if releases.Load() != 0 {
+		t.Fatal("expired acknowledgement released workarea")
+	}
+	considered, err := store.ReapExpired(context.Background(), 1, time.Second, releaser)
+	if err != nil || considered != 1 || releases.Load() != 1 {
+		t.Fatalf("ReapExpired considered=%d releases=%d err=%v", considered, releases.Load(), err)
 	}
 }
 
@@ -472,18 +689,13 @@ func TestDifferentWorkareasRemainParallelDuringRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = store.RequestRelease(context.Background(), leaseA.WorkareaID)
+	claimLease(t, store, leaseA, "invocation-a", "claim-a")
 
 	releaseStarted := make(chan struct{})
 	allowRelease := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		_, releaseErr := store.Acknowledge(context.Background(), workarea.TerminalResultAcknowledgement{
-			LeaseID:          leaseA.LeaseID,
-			SessionID:        leaseA.SessionID,
-			TerminalResultID: leaseA.TerminalResultID,
-			WorkareaID:       leaseA.WorkareaID,
-			Acknowledged:     true,
-		}, func(context.Context, workarea.TerminalLease) error {
+		_, releaseErr := store.Acknowledge(context.Background(), acknowledgement(leaseA, "invocation-a", "claim-a"), func(context.Context, workarea.TerminalLease) error {
 			close(releaseStarted)
 			<-allowRelease
 			return nil
