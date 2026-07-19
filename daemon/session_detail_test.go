@@ -4,8 +4,10 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestSessionDetailStore_BasicOps exercises Set/Get/Delete/Len.
@@ -45,6 +47,30 @@ func TestSessionDetailStore_IgnoresEmpty(t *testing.T) {
 	s.Set(&SessionDetail{}) // empty SessionID
 	if s.Len() != 0 {
 		t.Errorf("Set(nil)/Set(empty) leaked entries: Len=%d", s.Len())
+	}
+}
+
+func TestSessionDetailStore_DeleteIfOwnerRejectsStaleLease(t *testing.T) {
+	s := newSessionDetailStore()
+	staleLease, ok := s.StoreIfAbsent(&SessionDetail{SessionID: "same", AuthToken: "first"})
+	if !ok {
+		t.Fatal("first StoreIfAbsent rejected")
+	}
+	s.Delete("same")
+	currentLease, ok := s.StoreIfAbsent(&SessionDetail{SessionID: "same", AuthToken: "second"})
+	if !ok {
+		t.Fatal("second StoreIfAbsent rejected after delete")
+	}
+
+	if s.DeleteIfOwner(staleLease) {
+		t.Fatal("stale lease deleted a later generation")
+	}
+	got, ok := s.Get("same")
+	if !ok || got.AuthToken != "second" {
+		t.Fatalf("current detail after stale rollback = %#v, %t", got, ok)
+	}
+	if !s.DeleteIfOwner(currentLease) {
+		t.Fatal("current lease did not delete its own generation")
 	}
 }
 
@@ -113,6 +139,141 @@ func newSessionDetailLifecycleDaemon(spawnerOpts SpawnerOptions) *Daemon {
 	})
 	d.setState(StateRunning)
 	return d
+}
+
+func TestDaemon_AcceptWorkWithDetail_RejectsMismatchedSessionID(t *testing.T) {
+	d := newSessionDetailLifecycleDaemon(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+	})
+	detail := &SessionDetail{SessionID: "detail-id", AuthToken: "must-not-store"}
+
+	_, err := d.AcceptWorkWithDetail(SessionSpec{
+		SessionID:  "spec-id",
+		Repository: "github.com/a/b",
+	}, detail)
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("AcceptWorkWithDetail error = %v, want session-id mismatch", err)
+	}
+	if got := d.sessionDetails.Len(); got != 0 {
+		t.Fatalf("session detail count = %d, want 0 after mismatch", got)
+	}
+	if got := d.spawner.ActiveCount(); got != 0 {
+		t.Fatalf("active session count = %d, want 0 after mismatch", got)
+	}
+}
+
+func TestDaemon_AcceptWorkWithDetail_ActiveRetryPreservesOwner(t *testing.T) {
+	d := newSessionDetailLifecycleDaemon(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+		StdoutPrefixWriter:    discardPrefixWriter{},
+		StderrPrefixWriter:    discardPrefixWriter{},
+	})
+	t.Cleanup(func() { _ = d.spawner.Drain(time.Second) })
+
+	spec := SessionSpec{SessionID: "duplicate-delivery", Repository: "github.com/a/b"}
+	original := &SessionDetail{SessionID: spec.SessionID, AuthToken: "owner-token"}
+	if _, err := d.AcceptWorkWithDetail(spec, original); err != nil {
+		t.Fatalf("first accept: %v", err)
+	}
+
+	retry := &SessionDetail{SessionID: spec.SessionID, AuthToken: "retry-token"}
+	if _, err := d.AcceptWorkWithDetail(spec, retry); err == nil || !strings.Contains(err.Error(), "already has an active detail") {
+		t.Fatalf("retry error = %v, want active-detail rejection", err)
+	}
+
+	got, ok := d.SessionDetail(spec.SessionID)
+	if !ok {
+		t.Fatal("active session detail was deleted by rejected retry")
+	}
+	if got != original || got.AuthToken != "owner-token" {
+		t.Fatalf("active session detail = %#v, want original owner detail", got)
+	}
+	if got := d.spawner.ActiveCount(); got != 1 {
+		t.Fatalf("active session count = %d, want 1 after rejected retry", got)
+	}
+}
+
+func TestDaemon_AcceptWorkWithDetail_ConcurrentSameIDHasSingleOwner(t *testing.T) {
+	preSpawnEntered := make(chan struct{}, 1)
+	releasePreSpawn := make(chan struct{})
+	var releaseOnce sync.Once
+	d := newSessionDetailLifecycleDaemon(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 8,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+		StdoutPrefixWriter:    discardPrefixWriter{},
+		StderrPrefixWriter:    discardPrefixWriter{},
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			preSpawnEntered <- struct{}{}
+			<-releasePreSpawn
+			return env, nil
+		},
+	})
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releasePreSpawn) })
+		_ = d.spawner.Drain(time.Second)
+	})
+
+	const attempts = 16
+	type acceptResult struct {
+		attempt int
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan acceptResult, attempts)
+	for i := 0; i < attempts; i++ {
+		go func(attempt int) {
+			<-start
+			_, err := d.AcceptWorkWithDetail(
+				SessionSpec{SessionID: "concurrent-same-id", Repository: "github.com/a/b"},
+				&SessionDetail{SessionID: "concurrent-same-id", AuthToken: "attempt-" + idFor(attempt)},
+			)
+			results <- acceptResult{attempt: attempt, err: err}
+		}(i)
+	}
+	close(start)
+
+	select {
+	case <-preSpawnEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no same-id attempt reached pre-spawn")
+	}
+	for i := 0; i < attempts-1; i++ {
+		select {
+		case result := <-results:
+			if result.err == nil || !strings.Contains(result.err.Error(), "already has an active detail") {
+				t.Fatalf("attempt %d error = %v, want active-detail rejection", result.attempt, result.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("received %d/%d rejected same-id attempts", i, attempts-1)
+		}
+	}
+
+	releaseOnce.Do(func() { close(releasePreSpawn) })
+	var owner acceptResult
+	select {
+	case owner = <-results:
+		if owner.err != nil {
+			t.Fatalf("owner attempt %d failed: %v", owner.attempt, owner.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("owning same-id attempt did not finish")
+	}
+
+	got, ok := d.SessionDetail("concurrent-same-id")
+	if !ok {
+		t.Fatal("owning same-id detail is missing")
+	}
+	wantToken := "attempt-" + idFor(owner.attempt)
+	if got.AuthToken != wantToken {
+		t.Fatalf("stored token = %q, want owner token %q", got.AuthToken, wantToken)
+	}
+	if got := d.spawner.ActiveCount(); got != 1 {
+		t.Fatalf("active session count = %d, want exactly 1", got)
+	}
 }
 
 func TestDaemon_AcceptWorkWithDetail_AdmissionFailureRemovesDetail(t *testing.T) {

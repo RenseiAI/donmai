@@ -361,16 +361,28 @@ type SessionModelProfile struct {
 // writes on AcceptWork and the HTTP server reads on
 // /api/daemon/sessions/<id>.
 type sessionDetailStore struct {
-	mu      sync.RWMutex
-	details map[string]*SessionDetail
+	mu             sync.RWMutex
+	details        map[string]*SessionDetail
+	generations    map[string]uint64
+	nextGeneration uint64
+}
+
+type sessionDetailLease struct {
+	sessionID  string
+	generation uint64
 }
 
 // newSessionDetailStore returns an empty store.
 func newSessionDetailStore() *sessionDetailStore {
-	return &sessionDetailStore{details: make(map[string]*SessionDetail)}
+	return &sessionDetailStore{
+		details:     make(map[string]*SessionDetail),
+		generations: make(map[string]uint64),
+	}
 }
 
 // Set stores the detail under d.SessionID. Overwrites any prior entry.
+// Runtime admission uses StoreIfAbsent instead so a retry cannot replace an
+// already-running session's detail.
 func (s *sessionDetailStore) Set(d *SessionDetail) {
 	if d == nil || d.SessionID == "" {
 		return
@@ -378,6 +390,33 @@ func (s *sessionDetailStore) Set(d *SessionDetail) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.details[d.SessionID] = d
+	s.generations[d.SessionID] = s.nextGenerationLocked()
+}
+
+// StoreIfAbsent installs d only when its session id is not already owned. The
+// returned lease identifies this exact installation so a failed attempt can
+// roll itself back without deleting a later generation.
+func (s *sessionDetailStore) StoreIfAbsent(d *SessionDetail) (sessionDetailLease, bool) {
+	if d == nil || d.SessionID == "" {
+		return sessionDetailLease{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.details[d.SessionID]; exists {
+		return sessionDetailLease{}, false
+	}
+	generation := s.nextGenerationLocked()
+	s.details[d.SessionID] = d
+	s.generations[d.SessionID] = generation
+	return sessionDetailLease{sessionID: d.SessionID, generation: generation}, true
+}
+
+func (s *sessionDetailStore) nextGenerationLocked() uint64 {
+	s.nextGeneration++
+	if s.nextGeneration == 0 {
+		s.nextGeneration++
+	}
+	return s.nextGeneration
 }
 
 // Get returns the detail for the given session id, or (nil, false)
@@ -385,8 +424,8 @@ func (s *sessionDetailStore) Set(d *SessionDetail) {
 func (s *sessionDetailStore) Get(id string) (*SessionDetail, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	d, ok := s.details[id]
-	return d, ok
+	detail, ok := s.details[id]
+	return detail, ok
 }
 
 // UpdateRuntimeCredentials refreshes the worker credentials exposed to every
@@ -419,6 +458,24 @@ func (s *sessionDetailStore) Delete(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.details, id)
+	delete(s.generations, id)
+}
+
+// DeleteIfOwner removes only the generation installed by lease. It is the
+// rollback path for a rejected spawn attempt; a stale rollback must never
+// remove a detail installed by a later attempt for the same session id.
+func (s *sessionDetailStore) DeleteIfOwner(lease sessionDetailLease) bool {
+	if lease.sessionID == "" || lease.generation == 0 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.details[lease.sessionID]; !ok || s.generations[lease.sessionID] != lease.generation {
+		return false
+	}
+	delete(s.details, lease.sessionID)
+	delete(s.generations, lease.sessionID)
+	return true
 }
 
 // Len reports the number of currently-tracked sessions. Useful for

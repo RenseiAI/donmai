@@ -985,9 +985,11 @@ func (d *Daemon) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 // tests); the spawner falls through to env-only inputs.
 //
 // Detail is stored before spawning so the child can fetch it immediately.
-// It is removed when the spawner emits the corresponding SessionEventEnded
-// event, or synchronously when AcceptWork rejects/fails before a child owns the
-// session, so stale credentials never linger in memory.
+// The store rejects an already-owned session id before calling the spawner, and
+// failed admission rolls back only the exact generation installed by this
+// attempt. The detail is otherwise removed when the spawner emits the
+// corresponding SessionEventEnded event, so stale credentials never linger in
+// memory.
 func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (*SessionHandle, error) {
 	if d.State() != StateRunning {
 		return nil, fmt.Errorf("daemon is not running (state %q)", d.State())
@@ -995,18 +997,33 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 	if d.spawner == nil {
 		return nil, errors.New("spawner not initialised")
 	}
-	if detail != nil && detail.SessionID == "" {
-		detail.SessionID = spec.SessionID
+	if detail != nil {
+		if detail.SessionID == "" {
+			if spec.SessionID == "" {
+				return nil, errors.New("session id is required when detail is provided")
+			}
+			detail.SessionID = spec.SessionID
+		}
+		if detail.SessionID != spec.SessionID {
+			return nil, fmt.Errorf(
+				"session detail id %q does not match spec session id %q",
+				detail.SessionID,
+				spec.SessionID,
+			)
+		}
 	}
-	storedDetailID := ""
+	var detailLease sessionDetailLease
 	if detail != nil && d.sessionDetails != nil {
-		d.sessionDetails.Set(detail)
-		storedDetailID = detail.SessionID
+		var stored bool
+		detailLease, stored = d.sessionDetails.StoreIfAbsent(detail)
+		if !stored {
+			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
+		}
 	}
 	handle, err := d.spawner.AcceptWork(spec)
 	if err != nil {
-		if storedDetailID != "" {
-			d.sessionDetails.Delete(storedDetailID)
+		if detailLease.generation != 0 {
+			d.sessionDetails.DeleteIfOwner(detailLease)
 		}
 		return nil, err
 	}
