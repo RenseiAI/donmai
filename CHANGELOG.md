@@ -8,6 +8,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **Interactive session initial prompts.** Carries the optional `initialPrompt`
+  field through daemon polling into the runner and writes it exactly once as the
+  first PTY input for interactive sessions, without changing headless or
+  interview prompt construction.
+
 ---
 
 ## v0.52.1 — 2026-07-15

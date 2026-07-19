@@ -64,6 +64,10 @@ const (
 	// and the tail (results — e.g. the `gh pr create` PR URL the
 	// platform-side parser scans for).
 	DefaultMaxToolOutputChars = 2000
+
+	// initialPromptDeliveredContent is intentionally generic: the activity
+	// marker confirms runner delivery without forwarding prompt content.
+	initialPromptDeliveredContent = "interactive initial prompt delivered"
 )
 
 // RuntimeCredentials are the bearer-token credentials needed for an
@@ -336,7 +340,7 @@ func (p *Poster) Stop() error {
 
 // Send enqueues ev for async delivery. Non-blocking — if the queue is
 // full or the poster is stopped/never-started, the event is dropped
-// with a warn log. Events that map to nothing (Init / System /
+// with a warn log. Events that map to nothing (Init / most System /
 // ToolProgress) are filtered up-front so they never consume queue
 // capacity.
 func (p *Poster) Send(_ context.Context, ev agent.Event) {
@@ -600,13 +604,10 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 
 // mapEvent translates an agent.Event into the platform activity shape.
 // Returns ok=false for events that should not be forwarded
-// (Init / System / ToolProgress) — those are runner-internal lifecycle
-// signals the platform doesn't render. The single exception is
-// SystemEvent{Subtype: "reasoning"}: providers that surface model
-// reasoning as a system event (e.g. codex completed reasoning items)
-// have it forwarded as a "thought" activity so mid-run narrative reaches
-// the platform without polluting the AssistantTextEvent stream the
-// runner scans for verdict markers.
+// (Init / most System / ToolProgress) — those are runner-internal lifecycle
+// signals the platform doesn't render. Two SystemEvent subtypes are forwarded:
+// "reasoning" becomes a thought, and "interactive-initial-prompt-delivered"
+// becomes a generic context marker that never carries prompt content.
 //
 // timestamp is the wall-clock time at which the event was observed; the
 // platform server defaults to "now" when omitted, but emitting it here
@@ -701,17 +702,24 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 		return out, true
 
 	case agent.SystemEvent:
-		// Whitelist exactly one subtype: provider reasoning summaries
-		// become thoughts. Every other subtype (turn_started,
-		// command_progress, diff_updated, compaction, unknown, ...) stays
-		// runner-internal and is dropped.
-		if e.Subtype == "reasoning" {
+		switch e.Subtype {
+		case "reasoning":
 			if msg := strings.TrimSpace(e.Message); msg != "" {
 				out.Type = "thought"
 				out.Content = msg
 				return out, true
 			}
+		case "interactive-initial-prompt-delivered":
+			// This is an acknowledgement marker, not transcript content. Never
+			// forward e.Message because a caller may have populated it with the
+			// prompt itself.
+			out.Type = "context"
+			out.Content = initialPromptDeliveredContent
+			return out, true
 		}
+		// Every other subtype (including interactive start/end, turn_started,
+		// command_progress, diff_updated, compaction, and unknown values) stays
+		// runner-internal and is dropped.
 		return payload{}, false
 
 	case agent.InitEvent, agent.ToolProgressEvent:

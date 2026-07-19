@@ -77,6 +77,11 @@ const (
 	// well before the 2h MaxSessionDuration. A NEGATIVE
 	// Options.IdleTimeout disables the watchdog.
 	DefaultIdleTimeout = 12 * time.Minute
+
+	// terminalResultPostTimeout bounds the detached cleanup context used for
+	// terminal result delivery after the run context has expired or been
+	// cancelled. Posting remains ahead of worktree teardown.
+	terminalResultPostTimeout = 30 * time.Second
 )
 
 // Options carries the long-lived configuration a Runner needs.
@@ -384,6 +389,13 @@ func New(opts Options) (*Runner, error) {
 	return r, nil
 }
 
+// terminalResultPostContext preserves parent values while detaching terminal
+// result delivery from the run's cancellation/deadline. The replacement
+// deadline keeps cleanup bounded even when the platform is unavailable.
+func terminalResultPostContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), terminalResultPostTimeout)
+}
+
 // Run orchestrates one session end-to-end. It does not return until
 // the session has reached a terminal state (success, failure, or
 // cancellation) and the result has been posted.
@@ -419,8 +431,12 @@ func (r *Runner) Run(ctx context.Context, qw QueuedWork) (*Result, error) {
 		res.Status = "failed"
 		res.FailureMode = FailurePromptRender
 		res.Error = err.Error()
-		// Best-effort post; ignore errors on the failure path.
-		_ = r.poster.Post(runCtx, qw.SessionID, res.Result)
+		// Best-effort post; ignore errors on the failure path. Validation may
+		// observe an already-cancelled caller, so terminal delivery gets the same
+		// detached, bounded cleanup context as the normal post-run path.
+		postCtx, postCancel := terminalResultPostContext(runCtx)
+		_ = r.poster.Post(postCtx, qw.SessionID, res.Result)
+		postCancel()
 		return res, fmt.Errorf("runner: invalid QueuedWork: %w", err)
 	}
 
@@ -429,8 +445,13 @@ func (r *Runner) Run(ctx context.Context, qw QueuedWork) (*Result, error) {
 	res, runErr := r.runLoop(runCtx, qw, startedAt)
 
 	// Post the terminal Result. We do this before teardown so a
-	// teardown error does not lose the platform-side update.
-	if postErr := r.poster.Post(runCtx, qw.SessionID, res.Result); postErr != nil {
+	// teardown error does not lose the platform-side update. The run context is
+	// often the reason the session ended, so detach cancellation while preserving
+	// its values and apply a fresh cleanup bound.
+	postCtx, postCancel := terminalResultPostContext(runCtx)
+	postErr := r.poster.Post(postCtx, qw.SessionID, res.Result)
+	postCancel()
+	if postErr != nil {
 		// Log + record the post failure on the result. The Run
 		// itself does not fail because of a post failure — the
 		// platform has its own retry/poller for stale sessions.

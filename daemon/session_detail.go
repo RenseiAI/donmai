@@ -196,11 +196,17 @@ type SessionDetail struct {
 	// ── Interactive run-mode fields (Wave 2 donmai wire-plumbing) ─
 	//
 	// Mode forwards the run-mode discriminant from PollWorkItem onto the
-	// runner's QueuedWork. "" / absent = headless (unchanged behaviour).
-	// "interview" = non-terminating interactive loop. The daemon does not
-	// interpret this value — opaque forwarder only (same pattern as
+	// runner's QueuedWork. "" / absent = headless (unchanged behaviour),
+	// "interview" = non-terminating inject-driven loop, and "interactive" =
+	// live PTY session. The daemon does not interpret this value — opaque
+	// forwarder only (same pattern as
 	// SystemPromptOverride / Kits / DisallowedTools).
 	Mode string `json:"mode,omitempty"`
+
+	// InitialPrompt forwards the optional first terminal input for a
+	// mode:"interactive" session. It stays opaque through the daemon and is
+	// never incorporated into headless or interview prompt builders.
+	InitialPrompt string `json:"initialPrompt,omitempty"`
 
 	// InterviewBudget forwards the per-interview wall-clock + idle-grace
 	// budget from PollWorkItem onto the runner's QueuedWork. nil/absent
