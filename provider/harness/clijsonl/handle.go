@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // ErrInjectInFlight is returned by Handle.Inject when a previous Inject
@@ -829,23 +830,26 @@ func resumeArgv(sessionID, prompt string) (argv []string, stdinPrompt string) {
 	return argv, prompt
 }
 
-// composeEnv builds the child process environment by merging
-// parentEnv (typically os.Environ()) with specEnv. The caller (the
-// runner) is responsible for AGENT_ENV_BLOCKLIST filtering before
-// spawning — this driver trusts the env it receives.
+// composeEnv builds the child process environment by merging parentEnv
+// (typically os.Environ()) with specEnv. The runner applies its general agent
+// blocklist before spawning; this driver independently removes runner-only
+// attach controls from both layers so direct provider use cannot leak them.
 //
-// Order: parentEnv first, then specEnv entries appended; later
-// entries override earlier ones via standard exec.Cmd semantics
-// (the kernel uses the last occurrence of each name on Unix).
+// Order: parentEnv first, then specEnv entries appended; later entries override
+// earlier ones via standard exec.Cmd semantics.
 func composeEnv(parentEnv []string, specEnv map[string]string) []string {
-	out := make([]string, 0, len(parentEnv)+len(specEnv))
-	out = append(out, parentEnv...)
+	filteredParent := runtimeenv.FilterRunnerOnly(parentEnv)
+	out := make([]string, 0, len(filteredParent)+len(specEnv))
+	out = append(out, filteredParent...)
 	if len(specEnv) == 0 {
 		return out
 	}
 	// Sort keys for deterministic order — important for tests.
 	keys := make([]string, 0, len(specEnv))
 	for k := range specEnv {
+		if runtimeenv.IsRunnerOnly(k) {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // Provider is the agent.Provider implementation backed by a long-lived
@@ -433,12 +434,12 @@ func resolveCodexBinary(bin string) (string, error) {
 }
 
 func mergeEnv(extra map[string]string) []string {
-	parent := os.Environ()
+	parent := runtimeenv.FilterRunnerOnly(os.Environ())
 	if len(extra) == 0 {
 		return parent
 	}
-	// Build a map from the parent env so extra keys override
-	// existing values.
+	// Build a map from the parent env so safe extra keys override existing
+	// values. Runner-only attach controls are never valid app-server inputs.
 	merged := make(map[string]string, len(parent)+len(extra))
 	for _, e := range parent {
 		for i := 0; i < len(e); i++ {
@@ -449,6 +450,9 @@ func mergeEnv(extra map[string]string) []string {
 		}
 	}
 	for k, v := range extra {
+		if runtimeenv.IsRunnerOnly(k) {
+			continue
+		}
 		merged[k] = v
 	}
 	out := make([]string, 0, len(merged))

@@ -27,6 +27,20 @@ func TestComposeEnv_InteractiveDefaultsAndExplicitOverrides(t *testing.T) {
 			overrides: []string{"TERM=vt100", "COLORTERM=24bit", "KEEP=request"},
 			want:      map[string]string{"TERM": "vt100", "COLORTERM": "24bit", "KEEP": "request"},
 		},
+		{
+			name: "runner-only controls removed from parent and request",
+			parent: []string{
+				"ATTACH_TOKEN=parent-secret",
+				"ATTACH_URL=wss://parent.invalid",
+				"KEEP=parent",
+			},
+			overrides: []string{
+				"ATTACH_TOKEN=override-secret",
+				"ATTACH_TOKEN_FILE=/tmp/token",
+				"KEEP=request",
+			},
+			want: map[string]string{"TERM": "xterm-256color", "COLORTERM": "truecolor", "KEEP": "request"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -35,6 +49,11 @@ func TestComposeEnv_InteractiveDefaultsAndExplicitOverrides(t *testing.T) {
 			for key, want := range tt.want {
 				if got[key] != want {
 					t.Errorf("%s = %q, want %q (full env: %v)", key, got[key], want, got)
+				}
+			}
+			for _, blocked := range []string{"ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL"} {
+				if _, ok := got[blocked]; ok {
+					t.Errorf("runner-only control %s reached PTY environment", blocked)
 				}
 			}
 		})

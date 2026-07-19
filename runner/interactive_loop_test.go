@@ -1229,10 +1229,16 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 
 	platform := newRecordingPlatformServer(t)
 
-	// The composing daemon would inject these; the OSS runner reads them
-	// from its process env.
+	// The composing daemon would inject these; the OSS runner reads them from
+	// its process env but must not pass the runner-only controls to the PTY child.
+	hostToken := mkInteractiveHostToken(sessionID, 1)
+	tokenPath := filepath.Join(t.TempDir(), "attach-token")
+	if err := os.WriteFile(tokenPath, []byte(hostToken+"\n"), 0o600); err != nil {
+		t.Fatalf("write attach token file: %v", err)
+	}
 	t.Setenv(envAttachURL, relay.BaseWSURL())
-	t.Setenv(envAttachToken, mkInteractiveHostToken(sessionID, 1))
+	t.Setenv(envAttachToken, hostToken)
+	t.Setenv(envAttachTokenFile, tokenPath)
 
 	bareRepo := makeBareRepo(t)
 	wtParent := t.TempDir()
@@ -1252,11 +1258,11 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 	}
 
 	reg := NewRegistry()
-	// A shell that echoes each line as "got:<line>" and exits cleanly on
-	// "quit" — keeps the PTY alive across viewer joins, then exits 0.
+	// A shell first reports whether any runner-only attach control reached its
+	// real PTY environment, then echoes input until "quit".
 	prov := &interactivePTYProvider{command: []string{
 		"/bin/sh", "-c",
-		`while IFS= read -r line; do echo "got:$line"; [ "$line" = quit ] && break; done`,
+		`if [ "${ATTACH_TOKEN+x}${ATTACH_TOKEN_FILE+x}${ATTACH_URL+x}" = "" ]; then env_status=attach-env-clean; else env_status=attach-env-leaked; fi; while IFS= read -r line; do echo "$env_status:got:$line"; [ "$line" = quit ] && break; done`,
 	}}
 	if err := reg.Register(prov); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -1317,8 +1323,10 @@ func TestInteractive_FullStackAttachE2E(t *testing.T) {
 
 	// The seed was written before the relay host leg started, so it is the
 	// shell's first input and reaches a later viewer through the PTY ring replay.
-	if !waitForTerminalText(driver, "got:"+initialPrompt, 30*time.Second) {
-		t.Fatal("driver never observed the initial prompt as the PTY's first input")
+	// The prefix proves the runner kept all three controls for its own attach path
+	// while the real PTY child observed none of them.
+	if !waitForTerminalText(driver, "attach-env-clean:got:"+initialPrompt, 30*time.Second) {
+		t.Fatal("PTY child observed a runner-only attach control or missed the initial prompt")
 	}
 
 	// Resend-until-echo: §5's delivery contract is client resend from

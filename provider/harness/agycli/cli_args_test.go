@@ -89,6 +89,26 @@ func TestComposeEnv_NoKeyInjected(t *testing.T) {
 	}
 }
 
+func TestComposeEnv_StripsRunnerOnlyControls(t *testing.T) {
+	t.Parallel()
+
+	out := composeEnv(
+		[]string{"PATH=/usr/bin", "ATTACH_TOKEN=parent-secret", "ATTACH_URL=wss://parent.invalid"},
+		map[string]string{
+			"ATTACH_TOKEN":      "spec-secret",
+			"ATTACH_TOKEN_FILE": "/tmp/token",
+			"SAFE":              "kept",
+		},
+	)
+	joined := strings.Join(out, "\n")
+	if strings.Contains(joined, "ATTACH_") {
+		t.Fatalf("runner-only attach controls reached agy child: %v", out)
+	}
+	if !strings.Contains(joined, "PATH=/usr/bin") || !strings.Contains(joined, "SAFE=kept") {
+		t.Fatalf("composeEnv dropped safe entries: %v", out)
+	}
+}
+
 func indexOfPrefix(ss []string, prefix string) int {
 	for i, s := range ss {
 		if strings.HasPrefix(s, prefix) {

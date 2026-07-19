@@ -1,0 +1,51 @@
+package ptyhost
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestSpawnE2E_ChildCannotObserveRunnerOnlyAttachControls(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh unavailable: %v", err)
+	}
+
+	t.Setenv("ATTACH_TOKEN", "parent-secret")
+	t.Setenv("ATTACH_TOKEN_FILE", "/parent/token")
+	t.Setenv("ATTACH_URL", "wss://parent.invalid/v1/rooms/room-1")
+
+	resultPath := filepath.Join(t.TempDir(), "env-result")
+	sess, err := Spawn(Spec{
+		Command: []string{
+			"/bin/sh", "-c",
+			`if [ "${ATTACH_TOKEN+x}${ATTACH_TOKEN_FILE+x}${ATTACH_URL+x}" = "" ]; then printf clean > "$1"; else printf leaked > "$1"; fi`,
+			"sh", resultPath,
+		},
+		Env: []string{
+			"ATTACH_TOKEN=override-secret",
+			"ATTACH_TOKEN_FILE=/override/token",
+			"ATTACH_URL=wss://override.invalid/v1/rooms/room-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = sess.Stop(context.Background()) })
+
+	select {
+	case <-sess.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("PTY child did not exit")
+	}
+
+	got, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read child env result: %v", err)
+	}
+	if string(got) != "clean" {
+		t.Fatal("PTY child observed runner-only attach controls")
+	}
+}

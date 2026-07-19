@@ -31,6 +31,41 @@ var AgentEnvBlocklist = []string{
 	"OPENAI_API_KEY",
 }
 
+// IsRunnerOnly reports whether key is a host-side interactive attach control
+// that the runner consumes but must never expose to provider processes, PTY
+// children, or model-invoked tool subprocesses. Unlike AgentEnvBlocklist, this
+// boundary applies to every input layer: an explicit Spec.Env entry cannot
+// override it.
+func IsRunnerOnly(key string) bool {
+	switch key {
+	case "ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL":
+		return true
+	default:
+		return false
+	}
+}
+
+// FilterRunnerOnly returns a copy of entries with runner-owned controls
+// removed. entries use the os.Environ KEY=VALUE form; a bare blocked key is
+// removed as well so malformed input cannot bypass the boundary.
+func FilterRunnerOnly(entries []string) []string {
+	if len(entries) == 0 {
+		return entries
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		if IsRunnerOnly(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 // Composer builds the KEY=VALUE slice handed to exec.Cmd.Env for an
 // agent provider subprocess.
 //
@@ -66,11 +101,9 @@ func (c *Composer) effectiveBlocklist() []string {
 // Precedence (lowest to highest, last write wins):
 //
 //  1. base — typically os.Environ() parsed into a map. Entries whose
-//     key is in the blocklist are dropped before merge so a daemon
-//     operator's ANTHROPIC_API_KEY does not bleed into the agent
-//     subprocess.
-//  2. spec.Env — the per-session env map carried on agent.Spec. NOT
-//     subject to the blocklist (the runner sets these intentionally).
+//     key is in the agent-auth or runner-only blocklist are dropped.
+//  2. spec.Env — the per-session env map carried on agent.Spec. Agent-auth
+//     entries are trusted here, but runner-only controls are still dropped.
 //
 // Within each layer the merge is map-iteration-order-stable: keys are
 // sorted lexicographically to keep golden tests reproducible.
@@ -90,14 +123,20 @@ func (c *Composer) Compose(base map[string]string, spec agent.Spec) []string {
 
 	merged := make(map[string]string, len(base)+len(spec.Env))
 	for k, v := range base {
+		if IsRunnerOnly(k) {
+			continue
+		}
 		if _, blocked := blockSet[k]; blocked {
 			continue
 		}
 		merged[k] = v
 	}
-	// spec.Env wins — runner-set credentials and session metadata
-	// override anything inherited from the host.
+	// spec.Env wins for session credentials and metadata, except for
+	// runner-only attach controls: those remain host-side at every layer.
 	for k, v := range spec.Env {
+		if IsRunnerOnly(k) {
+			continue
+		}
 		merged[k] = v
 	}
 
