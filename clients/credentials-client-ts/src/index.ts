@@ -94,6 +94,10 @@ export interface Loader {
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const CREDENTIAL_CAPABILITY_ENV_VAR = 'DONMAI_CREDENTIAL_CAPABILITY';
+// A peer can reflect HELLO capability material into a frame type. Keep both
+// diagnostics fixed and never interpolate frame-controlled type/payload data.
+const UNEXPECTED_INITIAL_FRAME_ERROR = 'expected INITIAL frame';
+const UNKNOWN_FRAME_WARNING = 'credentials-client: unknown message type; ignored';
 
 function defaultLogger(): Logger {
   return {
@@ -269,7 +273,10 @@ async function makeDaemonLoader(args: DaemonLoaderArgs): Promise<Loader> {
       // Daemon-initiated close; do nothing extra — the socket will end.
       return;
     }
-    logger.warn(`credentials-client: unknown message type "${String(t)}"; ignored`);
+    if (!receivedInitial) {
+      throw new Error(UNEXPECTED_INITIAL_FRAME_ERROR);
+    }
+    logger.warn(UNKNOWN_FRAME_WARNING);
   };
 
   const flushBuffer = (): void => {

@@ -53,8 +53,10 @@ type fakeServer struct {
 	malformedInitial bool
 
 	// wrongTypeInitial, when true, sends a well-formed frame whose
-	// type is not "INITIAL".
-	wrongTypeInitial bool
+	// type is not "INITIAL". wrongTypeInitialValue overrides the default
+	// so redaction tests can reflect capability material into the type.
+	wrongTypeInitial      bool
+	wrongTypeInitialValue string
 
 	// legacyHelloOnly makes the server decode only the original
 	// type/sessionId fields, proving additive HELLO properties are ignored.
@@ -175,9 +177,13 @@ func (s *fakeServer) handle(conn net.Conn) {
 	}
 
 	if s.wrongTypeInitial {
+		wrongType := s.wrongTypeInitialValue
+		if wrongType == "" {
+			wrongType = "OOPS"
+		}
 		bad, _ := json.Marshal(struct {
 			Type string `json:"type"`
-		}{Type: "OOPS"})
+		}{Type: wrongType})
 		bad = append(bad, '\n')
 		_, _ = conn.Write(bad)
 		<-s.stopCh
@@ -614,15 +620,21 @@ func TestDaemonMalformedINITIALFallsBack(t *testing.T) {
 }
 
 func TestDaemonWrongTypeINITIALFallsBack(t *testing.T) {
+	const capability = "reflected-capability-must-stay-private"
 	t.Setenv(SocketEnvVar, "")
 	fs := newFakeServer(t, nil)
 	fs.wrongTypeInitial = true
+	fs.wrongTypeInitialValue = capability
 	fs.start()
+	var diagnostics bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&diagnostics, nil))
 
 	loader, err := New(t.Context(), Options{
 		SessionID:          "s",
+		Capability:         capability,
 		SocketPathOverride: fs.path,
 		HandshakeTimeout:   500 * time.Millisecond,
+		Logger:             logger,
 		environFn:          func() []string { return nil },
 	})
 	if err != nil {
@@ -632,6 +644,59 @@ func TestDaemonWrongTypeINITIALFallsBack(t *testing.T) {
 
 	if loader.Mode() != ModeStandalone {
 		t.Fatalf("expected standalone fallback on wrong-type INITIAL")
+	}
+	if got := diagnostics.String(); strings.Contains(got, capability) {
+		t.Fatalf("wrong-frame fallback diagnostic reflected capability material: %s", got)
+	} else if !strings.Contains(got, unexpectedInitialFrameError) {
+		t.Fatalf("wrong-frame fallback diagnostic = %q, want fixed %q", got, unexpectedInitialFrameError)
+	}
+}
+
+func TestDialAndHandshakeWrongTypeErrorIsFixedAndDataFree(t *testing.T) {
+	const capability = "reflected-capability-must-not-enter-error"
+	fs := newFakeServer(t, nil)
+	fs.wrongTypeInitial = true
+	fs.wrongTypeInitialValue = capability
+	fs.start()
+
+	loader, err := dialAndHandshake(t.Context(), fs.path, "s", capability, 500*time.Millisecond)
+	if loader != nil {
+		_ = loader.Close()
+		t.Fatal("dialAndHandshake returned a loader for a wrong INITIAL frame")
+	}
+	if err == nil {
+		t.Fatal("dialAndHandshake returned nil error for a wrong INITIAL frame")
+	}
+	if got := err.Error(); got != unexpectedInitialFrameError {
+		t.Fatalf("wrong-frame error = %q, want fixed %q", got, unexpectedInitialFrameError)
+	}
+	if strings.Contains(err.Error(), capability) {
+		t.Fatalf("wrong-frame error reflected capability material: %q", err)
+	}
+}
+
+func TestUnknownFrameDiagnosticIsFixedAndDataFree(t *testing.T) {
+	const capability = "reflected-capability-must-not-enter-warning"
+	var diagnostics bytes.Buffer
+	loader := &Loader{
+		logger: slog.New(slog.NewTextHandler(&diagnostics, nil)),
+		env:    make(map[string]string),
+	}
+	frame, err := json.Marshal(map[string]any{
+		"type":       capability,
+		"capability": capability,
+	})
+	if err != nil {
+		t.Fatalf("marshal reflected frame: %v", err)
+	}
+
+	loader.handleFrame(frame)
+	got := diagnostics.String()
+	if strings.Contains(got, capability) {
+		t.Fatalf("unknown-frame diagnostic reflected capability material: %s", got)
+	}
+	if !strings.Contains(got, unknownFrameWarning) {
+		t.Fatalf("unknown-frame diagnostic = %q, want fixed %q", got, unknownFrameWarning)
 	}
 }
 
