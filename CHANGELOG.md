@@ -8,12 +8,57 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.53.0 — 2026-07-19
+
 ### Features
 
+- **Per-session credential-socket capabilities.** The Go and TypeScript
+  credential clients can send an optional `HELLO.capability`, resolved from an
+  explicit option or `DONMAI_CREDENTIAL_CAPABILITY`, while continuing to omit
+  the field for legacy clients and servers. The capability control variable is
+  blocklisted from credential snapshots and updates.
+- **Credential requirement metadata.** Daemon poll, resolved-profile,
+  session-detail, and spawn-spec wires now carry ordered, non-secret
+  `credentialRequirements` groups plus the resolved `harness` and
+  `servingHost`. All fields are additive and omitted when absent; explicit
+  empty requirement lists and group/name ordering remain distinguishable while
+  decoding and are forwarded without normalization.
 - **Interactive session initial prompts.** Carries the optional `initialPrompt`
   field through daemon polling into the runner and writes it exactly once as the
-  first PTY input for interactive sessions, without changing headless or
-  interview prompt construction.
+  first PTY input for interactive sessions. Delivery remains cancellable on
+  ownership loss and does not change headless or interview prompt construction.
+- **Classified interactive occupancy.** Registration and heartbeat payloads can
+  report additive `activeInteractiveCount` alongside total active sessions,
+  counting both current interactive mode and its legacy interview alias while
+  preserving absent-versus-zero compatibility for older embedders.
+
+### Fixes
+
+- **Aborted spawn cleanup.** Adds the public `SpawnerOptions.OnSpawnAborted`
+  rollback hook with exact ownership semantics: pre-spawn failures retain their
+  own cleanup, process-start failures roll back once with the returned wrapped
+  error, and successful starts transfer cleanup to `SessionEventEnded`.
+  `AcceptWorkWithDetail` now also removes pre-stored session details on every
+  spawner rejection or start failure without replacing the original error.
+- **Data-free credential frame diagnostics.** Wrong handshake frames and
+  unknown post-handshake frames now produce fixed Go and TypeScript diagnostics
+  that never interpolate peer-controlled frame types or reflected capability
+  material.
+- **Interactive attach reconnection.** The runner can re-read a rotating attach
+  token from `ATTACH_TOKEN_FILE` for every relay dial attempt, so a reconnect is
+  not stranded after the initial short-lived token expires. Missing or empty
+  files degrade to the existing static token with deduplicated warnings, and
+  degraded auth refresh retries are bounded.
+
+### Chores
+
+- **Adaptive PTY firehose race gate.** Sizes the race-mode backpressure volume
+  from a bounded warmup throughput probe instead of a machine-specific fixed
+  byte count, retaining all existing pressure and memory assertions.
+- **Faster hosted CI.** Migrates repository workflows to Blacksmith runners
+  without changing their test, security, release, or image-build responsibilities.
 
 ---
 
