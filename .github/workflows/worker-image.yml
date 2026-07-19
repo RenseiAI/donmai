@@ -18,6 +18,17 @@ jobs:
   build-and-push:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
+      # Stage the current workflow's verifier before checking out an older tag
+      # that may not contain the shared release automation yet.
+      - name: Checkout release automation
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Stage release automation
+        run: install -m 0755 scripts/verify-release-tag.sh "${RUNNER_TEMP}/verify-release-tag.sh"
+
       - name: Checkout release tag
         uses: actions/checkout@v6
         with:
@@ -30,38 +41,14 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          set -euo pipefail
-          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
-            echo "::error::Release ref must be an explicit version tag, not a branch or image label: ${RELEASE_TAG}"
-            exit 1
-          fi
-          if ! git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
-            echo "::error::Release ref must be an existing tag: ${RELEASE_TAG}"
-            exit 1
-          fi
-          if branch_ref="$(git symbolic-ref -q HEAD)"; then
-            echo "::error::Release checkout must be detached at ${RELEASE_TAG}, not branch ${branch_ref}"
-            exit 1
-          fi
-          tag_sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
-          head_sha="$(git rev-parse HEAD)"
-          if [ "${tag_sha}" != "${head_sha}" ]; then
-            echo "::error::Checked-out SHA ${head_sha} does not match ${RELEASE_TAG} (${tag_sha})"
-            exit 1
-          fi
-          printf 'tag=%s\n' "${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
-          {
-            echo 'image_tags<<EOF'
-            echo "ghcr.io/renseiai/donmai-worker:${RELEASE_TAG}"
-            if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-              echo "ghcr.io/renseiai/donmai-worker:latest"
-            fi
-            echo 'EOF'
-          } >> "${GITHUB_OUTPUT}"
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+          "${RUNNER_TEMP}/verify-release-tag.sh" --verify \
+            "${RELEASE_TAG}" \
+            "${GITHUB_EVENT_NAME}" \
+            "${GITHUB_OUTPUT}" \
+            "${GITHUB_ENV}"
+          if [[ "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
             echo "::notice::Manual retry publishes only ${RELEASE_TAG}; latest is unchanged."
           fi
-          echo "Publishing ${RELEASE_TAG} from immutable commit ${head_sha}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
