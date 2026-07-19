@@ -39,7 +39,7 @@ wins. Align the local docs or open an ADR to amend the corpus.
 
 Prerequisites:
 
-- Go 1.25+; `go.mod` currently targets Go 1.25.10
+- Go 1.25.12+; `go.mod` is the canonical toolchain floor
 - `make`
 - `git`
 - `gofumpt`
