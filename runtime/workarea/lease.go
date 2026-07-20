@@ -23,23 +23,38 @@ import (
 )
 
 const (
-	// DefaultSettlementBudget and the related constants define the public terminal-workarea contract.
-	DefaultSettlementBudget                = time.Duration(SettlementBudgetMS) * time.Millisecond
-	DefaultLeaseSafetyMargin               = time.Duration(LeaseSafetyMarginMS) * time.Millisecond
-	DefaultLeaseDuration                   = time.Duration(LeaseDurationMS) * time.Millisecond
-	DefaultMaxLeaseDuration                = time.Duration(MaxLeaseDurationMS) * time.Millisecond
-	DefaultReaperInterval                  = 30 * time.Second
-	DefaultReaperBatchSize                 = 32
-	DefaultReaperConcurrency               = 4
-	DefaultReleaseAttemptTimeout           = 30 * time.Second
-	DefaultReleaseRetryBase                = 30 * time.Second
-	DefaultReleaseRetryMax                 = 5 * time.Minute
-	DefaultTerminalResultReplayInterval    = 5 * time.Second
-	DefaultTerminalResultReplayBatchSize   = 32
+	// DefaultSettlementBudget is the fixed v1 terminal settlement budget.
+	DefaultSettlementBudget = time.Duration(SettlementBudgetMS) * time.Millisecond
+	// DefaultLeaseSafetyMargin is the fixed v1 margin beyond settlement time.
+	DefaultLeaseSafetyMargin = time.Duration(LeaseSafetyMarginMS) * time.Millisecond
+	// DefaultLeaseDuration is the fixed v1 initial lease duration.
+	DefaultLeaseDuration = time.Duration(LeaseDurationMS) * time.Millisecond
+	// DefaultMaxLeaseDuration is the fixed v1 acquisition-relative maximum.
+	DefaultMaxLeaseDuration = time.Duration(MaxLeaseDurationMS) * time.Millisecond
+	// DefaultReaperInterval is the standard fixed-delay release scan interval.
+	DefaultReaperInterval = 30 * time.Second
+	// DefaultReaperBatchSize is the standard release scan batch capacity.
+	DefaultReaperBatchSize = 32
+	// DefaultReaperConcurrency is the standard provider-attempt concurrency.
+	DefaultReaperConcurrency = 4
+	// DefaultReleaseAttemptTimeout bounds one provider release attempt.
+	DefaultReleaseAttemptTimeout = 30 * time.Second
+	// DefaultReleaseRetryBase is the first provider release retry delay.
+	DefaultReleaseRetryBase = 30 * time.Second
+	// DefaultReleaseRetryMax caps provider release retry delay.
+	DefaultReleaseRetryMax = 5 * time.Minute
+	// DefaultTerminalResultReplayInterval is the standard outbox scan interval.
+	DefaultTerminalResultReplayInterval = 5 * time.Second
+	// DefaultTerminalResultReplayBatchSize is the standard outbox batch capacity.
+	DefaultTerminalResultReplayBatchSize = 32
+	// DefaultTerminalResultReplayConcurrency is the standard send concurrency.
 	DefaultTerminalResultReplayConcurrency = 4
-	DefaultTerminalResultReplayTimeout     = 30 * time.Second
-	DefaultTerminalResultReplayRetryBase   = time.Second
-	DefaultTerminalResultReplayRetryMax    = time.Minute
+	// DefaultTerminalResultReplayTimeout bounds one terminal-status send.
+	DefaultTerminalResultReplayTimeout = 30 * time.Second
+	// DefaultTerminalResultReplayRetryBase is the first outbox retry delay.
+	DefaultTerminalResultReplayRetryBase = time.Second
+	// DefaultTerminalResultReplayRetryMax caps outbox retry delay.
+	DefaultTerminalResultReplayRetryMax = time.Minute
 
 	lockRetryInterval = 10 * time.Millisecond
 	clockLockKey      = "store:logical-clock"
@@ -49,28 +64,43 @@ const (
 type LeaseState string
 
 const (
-	// LeaseActive and the related constants define the public terminal-workarea contract.
-	LeaseActive         LeaseState = "active"
+	// LeaseActive retains exclusive ownership while settlement remains possible.
+	LeaseActive LeaseState = "active"
+	// LeaseReleasePending retains ownership while provider release is retried.
 	LeaseReleasePending LeaseState = "release-pending"
-	LeaseReleased       LeaseState = "released"
+	// LeaseReleased records completed provider disposition and ends ownership.
+	LeaseReleased LeaseState = "released"
 )
 
 var (
-	// ErrWorkareaLeased and the related errors report terminal-workarea contract failures.
-	ErrWorkareaLeased          = errors.New("runtime/workarea: workarea already leased")
-	ErrWorkareaQuarantined     = errors.New("runtime/workarea: workarea quarantined")
-	ErrProviderRootUnready     = errors.New("runtime/workarea: provider root is unready")
-	ErrLeaseConflict           = errors.New("runtime/workarea: terminal lease identity conflict")
-	ErrLeaseNotFound           = errors.New("runtime/workarea: terminal lease not found")
+	// ErrWorkareaLeased reports that a non-released lease owns the workarea.
+	ErrWorkareaLeased = errors.New("runtime/workarea: workarea already leased")
+	// ErrWorkareaQuarantined reports independent quarantine exclusion.
+	ErrWorkareaQuarantined = errors.New("runtime/workarea: workarea quarantined")
+	// ErrProviderRootUnready reports a fail-closed durable authority.
+	ErrProviderRootUnready = errors.New("runtime/workarea: provider root is unready")
+	// ErrLeaseConflict reports identity or invariant disagreement.
+	ErrLeaseConflict = errors.New("runtime/workarea: terminal lease identity conflict")
+	// ErrLeaseNotFound reports an unknown terminal lease identity.
+	ErrLeaseNotFound = errors.New("runtime/workarea: terminal lease not found")
+	// ErrAcknowledgementRequired reports a non-semantic acknowledgement.
 	ErrAcknowledgementRequired = errors.New("runtime/workarea: explicit terminal result acknowledgement required")
-	ErrLeaseExpired            = errors.New("runtime/workarea: terminal lease expired")
-	ErrInsufficientLeaseTime   = errors.New("runtime/workarea: insufficient remaining lease time")
-	ErrReleaseRequired         = errors.New("runtime/workarea: workarea releaser required")
-	ErrLeaseExecutionRequired  = errors.New("runtime/workarea: terminal lease execution claim required")
-	ErrLeaseExecutionClaimed   = errors.New("runtime/workarea: terminal lease execution already claimed")
-	ErrLeaseExecutionConflict  = errors.New("runtime/workarea: terminal lease execution identity conflict")
-	ErrTerminalStatusNotFound  = errors.New("runtime/workarea: terminal status outbox not found")
-	ErrRenewalAfterBodySave    = errors.New("runtime/workarea: terminal status body already persisted")
+	// ErrLeaseExpired reports a lease that cannot accept the requested operation.
+	ErrLeaseExpired = errors.New("runtime/workarea: terminal lease expired")
+	// ErrInsufficientLeaseTime reports a strict remaining-time boundary failure.
+	ErrInsufficientLeaseTime = errors.New("runtime/workarea: insufficient remaining lease time")
+	// ErrReleaseRequired reports a missing provider release callback.
+	ErrReleaseRequired = errors.New("runtime/workarea: workarea releaser required")
+	// ErrLeaseExecutionRequired reports a missing durable local claim.
+	ErrLeaseExecutionRequired = errors.New("runtime/workarea: terminal lease execution claim required")
+	// ErrLeaseExecutionClaimed reports an existing claim owned by another invocation.
+	ErrLeaseExecutionClaimed = errors.New("runtime/workarea: terminal lease execution already claimed")
+	// ErrLeaseExecutionConflict reports claim identity disagreement.
+	ErrLeaseExecutionConflict = errors.New("runtime/workarea: terminal lease execution identity conflict")
+	// ErrTerminalStatusNotFound reports a lease without a retained outbox record.
+	ErrTerminalStatusNotFound = errors.New("runtime/workarea: terminal status outbox not found")
+	// ErrRenewalAfterBodySave reports immutable terminal-status body enforcement.
+	ErrRenewalAfterBodySave = errors.New("runtime/workarea: terminal status body already persisted")
 )
 
 // LeasePolicy implements the documented terminal-workarea contract.
@@ -779,14 +809,15 @@ func (s *LeaseStore) replayOneTerminalStatus(ctx context.Context, snapshot Termi
 		if err != nil {
 			return s.failClosed(err)
 		}
-		if sendErr == nil {
+		switch {
+		case sendErr == nil:
 			post.DeliveryState = TerminalStatusDelivered
 			post.LastError = nil
-		} else if nowMS >= post.DeadlineAt.UnixMilli() {
+		case nowMS >= post.DeadlineAt.UnixMilli():
 			post.DeliveryState = TerminalStatusDeadLetter
 			message := sendErr.Error()
 			post.LastError = &message
-		} else {
+		default:
 			post.DeliveryState = TerminalStatusPending
 			message := sendErr.Error()
 			post.LastError = &message
@@ -1428,6 +1459,7 @@ func (s *LeaseStore) writeActionableMarker(leaseID string) error {
 func (s *LeaseStore) recordPath(leaseID string) string {
 	return filepath.Join(s.records, leaseID+".json")
 }
+
 func (s *LeaseStore) actionablePath(leaseID string) string {
 	return filepath.Join(s.actionable, leaseID+".json")
 }
@@ -1783,7 +1815,15 @@ func (q *QuarantineStore) list() ([]TerminalWorkareaQuarantine, error) {
 }
 
 func (q *QuarantineStore) get(id string) (*TerminalWorkareaQuarantine, error) {
-	data, err := os.ReadFile(filepath.Join(q.records, id+".json"))
+	if err := validateGeneratedID(id, "twq_"); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(q.records)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(id + ".json")
 	if err != nil {
 		return nil, err
 	}
@@ -1831,7 +1871,12 @@ func writeFileAtomic(dirPath, finalPath, tempPattern string, data []byte) error 
 }
 
 func syncDir(path string) error {
-	dir, err := os.Open(path)
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return fmt.Errorf("open directory root for sync: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	dir, err := root.Open(".")
 	if err != nil {
 		return fmt.Errorf("open directory for sync: %w", err)
 	}
@@ -1859,10 +1904,14 @@ func (s *LeaseStore) withLocks(ctx context.Context, keys []string, fn func() err
 		ordered = append(ordered, key)
 	}
 	sort.Strings(ordered)
+	lockRoot, err := os.OpenRoot(s.locks)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lockRoot.Close() }()
 	held := make([]*os.File, 0, len(ordered))
 	for _, key := range ordered {
-		path := filepath.Join(s.locks, key+".lock")
-		lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		lock, err := lockRoot.OpenFile(key+".lock", os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
 			releaseLocks(held)
 			return err
