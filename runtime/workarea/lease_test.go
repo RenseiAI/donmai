@@ -250,11 +250,12 @@ func TestRenewalAndBodySaveUseCASAndBodyFreezesExpiry(t *testing.T) {
 	var success, conflict int
 	for range 2 {
 		err := <-results
-		if err == nil {
+		switch {
+		case err == nil:
 			success++
-		} else if errors.Is(err, workarea.ErrLeaseConflict) || errors.Is(err, workarea.ErrRenewalAfterBodySave) {
+		case errors.Is(err, workarea.ErrLeaseConflict) || errors.Is(err, workarea.ErrRenewalAfterBodySave):
 			conflict++
-		} else {
+		default:
 			t.Fatalf("race error = %v", err)
 		}
 	}

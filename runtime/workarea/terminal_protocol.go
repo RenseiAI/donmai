@@ -14,22 +14,35 @@ import (
 )
 
 const (
-	// TerminalLeaseRequestSchemaV1 and the related constants define the public terminal-workarea contract.
-	TerminalLeaseRequestSchemaV1         = "donmai.terminal-workarea-lease-request.v1"
-	TerminalLeaseSchemaV1                = "donmai.terminal-workarea-lease.v1"
-	TerminalLeaseClaimSchemaV1           = "donmai.terminal-workarea-lease-claim.v1"
+	// TerminalLeaseRequestSchemaV1 identifies the exact fixed-profile lease request.
+	TerminalLeaseRequestSchemaV1 = "donmai.terminal-workarea-lease-request.v1"
+	// TerminalLeaseSchemaV1 identifies the full path-free lease descriptor.
+	TerminalLeaseSchemaV1 = "donmai.terminal-workarea-lease.v1"
+	// TerminalLeaseClaimSchemaV1 identifies the durable local execution claim.
+	TerminalLeaseClaimSchemaV1 = "donmai.terminal-workarea-lease-claim.v1"
+	// TerminalLeaseAcknowledgementSchemaV1 identifies the semantic acknowledgement.
 	TerminalLeaseAcknowledgementSchemaV1 = "donmai.terminal-workarea-lease-ack.v1"
-	TerminalLeaseAckOutcomeSchemaV1      = "donmai.terminal-workarea-lease-ack-outcome.v1"
-	TerminalStatusOutboxSchemaV1         = "donmai.terminal-status-outbox.v1"
-	TerminalWorkareaQuarantineSchemaV1   = "donmai.terminal-workarea-quarantine.v1"
+	// TerminalLeaseAckOutcomeSchemaV1 identifies the durable local acknowledgement outcome.
+	TerminalLeaseAckOutcomeSchemaV1 = "donmai.terminal-workarea-lease-ack-outcome.v1"
+	// TerminalStatusOutboxSchemaV1 identifies the receiver-affine terminal outbox record.
+	TerminalStatusOutboxSchemaV1 = "donmai.terminal-status-outbox.v1"
+	// TerminalWorkareaQuarantineSchemaV1 identifies an acquisition quarantine record.
+	TerminalWorkareaQuarantineSchemaV1 = "donmai.terminal-workarea-quarantine.v1"
 
-	SettlementBudgetMS  int64 = 977_000
+	// SettlementBudgetMS is the fixed v1 settlement budget in milliseconds.
+	SettlementBudgetMS int64 = 977_000
+	// LeaseSafetyMarginMS is the separate fixed v1 lease safety margin.
 	LeaseSafetyMarginMS int64 = 60_000
-	LeaseDurationMS     int64 = 1_800_000
-	MaxLeaseDurationMS  int64 = 7_200_000
-	ClaimMinimumMS      int64 = SettlementBudgetMS + LeaseSafetyMarginMS
-	QueueMinimumMS      int64 = ClaimMinimumMS + 60_000
+	// LeaseDurationMS is the fixed v1 initial duration.
+	LeaseDurationMS int64 = 1_800_000
+	// MaxLeaseDurationMS is the fixed v1 acquisition-relative maximum duration.
+	MaxLeaseDurationMS int64 = 7_200_000
+	// ClaimMinimumMS is the strict claim remaining-time boundary.
+	ClaimMinimumMS int64 = SettlementBudgetMS + LeaseSafetyMarginMS
+	// QueueMinimumMS is the strict optional queue remaining-time boundary.
+	QueueMinimumMS int64 = ClaimMinimumMS + 60_000
 
+	// MaximumLeaseDuration exposes the fixed v1 maximum as a time.Duration.
 	MaximumLeaseDuration = time.Duration(MaxLeaseDurationMS) * time.Millisecond
 )
 
@@ -186,9 +199,13 @@ func (d TerminalLeaseDescriptor) MarshalJSON() ([]byte, error) {
 	out := []byte{'{'}
 	var err error
 	for i, field := range [][2]string{
-		{"schemaVersion", d.SchemaVersion}, {"leaseId", d.LeaseID}, {"sessionId", d.SessionID},
-		{"terminalResultId", d.TerminalResultID}, {"workareaId", d.WorkareaID},
-		{"acquiredAt", acquiredAt}, {"expiresAt", expiresAt},
+		{"schemaVersion", d.SchemaVersion},
+		{"leaseId", d.LeaseID},
+		{"sessionId", d.SessionID},
+		{"terminalResultId", d.TerminalResultID},
+		{"workareaId", d.WorkareaID},
+		{"acquiredAt", acquiredAt},
+		{"expiresAt", expiresAt},
 	} {
 		out, err = appendCanonicalStringField(out, field[0], field[1], i == 0)
 		if err != nil {
@@ -455,14 +472,19 @@ type AcknowledgementOutcomeValue string
 type AcknowledgementReason string
 
 const (
-	// AcknowledgementApplied and the related constants define the public terminal-workarea contract.
-	AcknowledgementApplied        AcknowledgementOutcomeValue = "applied"
+	// AcknowledgementApplied records the first exact semantic acknowledgement.
+	AcknowledgementApplied AcknowledgementOutcomeValue = "applied"
+	// AcknowledgementAlreadyApplied records an exact canonical replay.
 	AcknowledgementAlreadyApplied AcknowledgementOutcomeValue = "already-applied"
-	AcknowledgementRejected       AcknowledgementOutcomeValue = "rejected"
+	// AcknowledgementRejected records an acknowledgement that grants no release authority.
+	AcknowledgementRejected AcknowledgementOutcomeValue = "rejected"
 
-	AcknowledgementClaimMissing     AcknowledgementReason = "claim-missing"
+	// AcknowledgementClaimMissing rejects acknowledgement without a local claim.
+	AcknowledgementClaimMissing AcknowledgementReason = "claim-missing"
+	// AcknowledgementIdentityMismatch rejects disagreement with durable identities.
 	AcknowledgementIdentityMismatch AcknowledgementReason = "identity-mismatch"
-	AcknowledgementStateConflict    AcknowledgementReason = "state-conflict"
+	// AcknowledgementStateConflict rejects a conflicting replay or lease state.
+	AcknowledgementStateConflict AcknowledgementReason = "state-conflict"
 )
 
 // TerminalAcknowledgementOutcome implements the documented terminal-workarea contract.
@@ -587,16 +609,23 @@ type TerminalStatusDeliveryState string
 type TerminalStatusApplicationState string
 
 const (
-	// TerminalStatusPending and the related constants define the public terminal-workarea contract.
-	TerminalStatusPending    TerminalStatusDeliveryState = "pending"
+	// TerminalStatusPending is eligible for a future transport attempt.
+	TerminalStatusPending TerminalStatusDeliveryState = "pending"
+	// TerminalStatusAttempting records an in-flight durable transport attempt.
 	TerminalStatusAttempting TerminalStatusDeliveryState = "attempting"
-	TerminalStatusDelivered  TerminalStatusDeliveryState = "delivered"
+	// TerminalStatusDelivered records receiver transport acceptance.
+	TerminalStatusDelivered TerminalStatusDeliveryState = "delivered"
+	// TerminalStatusDeadLetter records exhausted transport policy.
 	TerminalStatusDeadLetter TerminalStatusDeliveryState = "dead-letter"
 
-	TerminalApplicationPending          TerminalStatusApplicationState = "pending"
-	TerminalApplicationApplied          TerminalStatusApplicationState = "applied"
+	// TerminalApplicationPending records no authoritative acknowledgement outcome.
+	TerminalApplicationPending TerminalStatusApplicationState = "pending"
+	// TerminalApplicationApplied records an applied or already-applied acknowledgement.
+	TerminalApplicationApplied TerminalStatusApplicationState = "applied"
+	// TerminalApplicationNotAuthoritative records delivery without a matching claim.
 	TerminalApplicationNotAuthoritative TerminalStatusApplicationState = "not-authoritative"
-	TerminalApplicationRejected         TerminalStatusApplicationState = "rejected"
+	// TerminalApplicationRejected records semantic acknowledgement conflict.
+	TerminalApplicationRejected TerminalStatusApplicationState = "rejected"
 )
 
 // TerminalStatusOutbox implements the documented terminal-workarea contract.
@@ -783,9 +812,11 @@ func (o *TerminalStatusOutbox) UnmarshalJSON(data []byte) error {
 type QuarantineState string
 
 const (
-	// QuarantineGuarded and the related constants define the public terminal-workarea contract.
-	QuarantineGuarded        QuarantineState = "guarded"
-	QuarantineQuarantined    QuarantineState = "quarantined"
+	// QuarantineGuarded excludes a workarea before lease persistence completes.
+	QuarantineGuarded QuarantineState = "guarded"
+	// QuarantineQuarantined excludes a workarea after acquisition failure.
+	QuarantineQuarantined QuarantineState = "quarantined"
+	// QuarantineCleanupPending records destroy-only cleanup in progress.
 	QuarantineCleanupPending QuarantineState = "cleanup-pending"
 )
 

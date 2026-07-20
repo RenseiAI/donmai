@@ -72,7 +72,12 @@ func (r *ReceiverRegistry) Resolve(receiverKey string) (string, error) {
 	if err := validateGeneratedID(receiverKey, "rcv_"); err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(filepath.Join(r.dir, receiverKey+".json"))
+	root, err := os.OpenRoot(r.dir)
+	if err != nil {
+		return "", fmt.Errorf("runtime/workarea: open receiver registry: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(receiverKey + ".json")
 	if err != nil {
 		return "", fmt.Errorf("runtime/workarea: resolve receiver %s: %w", receiverKey, err)
 	}
