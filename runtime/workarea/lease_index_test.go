@@ -221,29 +221,207 @@ func TestIndependentReleaseCallbacksDoNotHoldStoreLocks(t *testing.T) {
 	}
 }
 
-func TestReaperAndReplayerLoopsCancel(t *testing.T) {
+func TestReaperAndReplayerLoopsCancelUnderClockContention(t *testing.T) {
 	root := t.TempDir()
 	store, err := NewLeaseStore(StoreOptions{Dir: filepath.Join(root, "leases")})
 	if err != nil {
 		t.Fatal(err)
 	}
+	lease, err := store.Acquire(context.Background(), internalAcquireSpec(root, 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	releaseClock := holdLogicalClockLock(t, store)
+	defer releaseClock()
+
+	originalReadFile := store.readFile
+	bothScanned := make(chan struct{})
+	var recordReads atomic.Int32
+	store.readFile = func(path string) ([]byte, error) {
+		data, readErr := originalReadFile(path)
+		if path == store.recordPath(lease.LeaseID) && recordReads.Add(1) == 2 {
+			close(bothScanned)
+		}
+		return data, readErr
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	wg.Add(2)
+	reaperDone := make(chan struct{})
+	replayerDone := make(chan struct{})
+	loopErrors := make(chan error, 2)
 	go func() {
-		defer wg.Done()
-		store.RunReaper(ctx, ReaperOptions{Interval: time.Millisecond}, func(context.Context, TerminalLease) error { return nil })
+		defer close(reaperDone)
+		store.RunReaper(ctx, ReaperOptions{
+			Interval: time.Hour,
+			OnError:  func(err error) { loopErrors <- err },
+		}, func(context.Context, TerminalLease) error { return nil })
 	}()
 	go func() {
-		defer wg.Done()
-		store.RunTerminalResultReplayer(ctx, TerminalResultReplayOptions{Interval: time.Millisecond}, func(context.Context, string, []byte) error { return nil })
+		defer close(replayerDone)
+		store.RunTerminalResultReplayer(ctx, TerminalResultReplayOptions{
+			Interval: time.Hour,
+			OnError:  func(err error) { loopErrors <- err },
+		}, func(context.Context, string, []byte) error { return nil })
 	}()
+
+	select {
+	case <-bothScanned:
+	case <-time.After(time.Second):
+		t.Fatal("background loops did not reach the contended logical clock")
+	}
 	cancel()
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
+	waitForLoopExit(t, "terminal lease reaper", reaperDone)
+	waitForLoopExit(t, "terminal result replayer", replayerDone)
+	close(loopErrors)
+	for loopErr := range loopErrors {
+		t.Errorf("shutdown cancellation reached OnError: %v", loopErr)
+	}
+	if err := store.Ready(); err != nil {
+		t.Fatalf("shutdown cancellation poisoned store: %v", err)
+	}
+
+	releaseClock()
+	if _, err := store.Acquire(context.Background(), internalAcquireSpec(root, 41)); err != nil {
+		t.Fatalf("lease operation after shutdown cancellation: %v", err)
+	}
+}
+
+func TestSampleClockDeadlineWhileContendedDoesNotPoisonStore(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewLeaseStore(StoreOptions{Dir: filepath.Join(root, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseClock := holdLogicalClockLock(t, store)
+	defer releaseClock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := store.sampleClock(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("sample clock error = %v, want deadline exceeded", err)
+	}
+	if err := store.Ready(); err != nil {
+		t.Fatalf("deadline cancellation poisoned store: %v", err)
+	}
+
+	releaseClock()
+	if _, err := store.Acquire(context.Background(), internalAcquireSpec(root, 42)); err != nil {
+		t.Fatalf("lease operation after deadline cancellation: %v", err)
+	}
+}
+
+func TestOperationContextCancellationDoesNotHideJoinedAuthorityFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !isOnlyOperationContextCancellation(ctx, fmt.Errorf("wait for lock: %w", ctx.Err())) {
+		t.Fatal("wrapped operation cancellation was not recognized")
+	}
+	authorityErr := errors.New("durable authority failed")
+	if isOnlyOperationContextCancellation(ctx, errors.Join(ctx.Err(), authorityErr)) {
+		t.Fatal("operation cancellation hid a joined durable-authority failure")
+	}
+}
+
+func TestLogicalClockLockFailurePoisonsStoreAndCanceledLoopsReportIt(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewLeaseStore(StoreOptions{Dir: filepath.Join(root, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(store.locks); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.locks, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.sampleClock(context.Background()); !errors.Is(err, ErrProviderRootUnready) {
+		t.Fatalf("logical clock lock error = %v, want provider root unready", err)
+	}
+	if err := store.Ready(); !errors.Is(err, ErrProviderRootUnready) {
+		t.Fatalf("ready error = %v, want provider root unready", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reaperDone := make(chan struct{})
+	replayerDone := make(chan struct{})
+	loopErrors := make(chan error, 2)
+	go func() {
+		defer close(reaperDone)
+		store.RunReaper(ctx, ReaperOptions{
+			Interval: time.Hour,
+			OnError:  func(err error) { loopErrors <- err },
+		}, func(context.Context, TerminalLease) error { return nil })
+	}()
+	go func() {
+		defer close(replayerDone)
+		store.RunTerminalResultReplayer(ctx, TerminalResultReplayOptions{
+			Interval: time.Hour,
+			OnError:  func(err error) { loopErrors <- err },
+		}, func(context.Context, string, []byte) error { return nil })
+	}()
+	waitForLoopExit(t, "terminal lease reaper", reaperDone)
+	waitForLoopExit(t, "terminal result replayer", replayerDone)
+	close(loopErrors)
+
+	reported := 0
+	for loopErr := range loopErrors {
+		reported++
+		if !errors.Is(loopErr, ErrProviderRootUnready) {
+			t.Errorf("OnError = %v, want provider root unready", loopErr)
+		}
+	}
+	if reported != 2 {
+		t.Fatalf("OnError calls = %d, want 2 pre-existing authority failures", reported)
+	}
+	if _, err := store.Acquire(context.Background(), internalAcquireSpec(root, 43)); !errors.Is(err, ErrProviderRootUnready) {
+		t.Fatalf("lease operation after lock failure = %v, want provider root unready", err)
+	}
+}
+
+func holdLogicalClockLock(t *testing.T, store *LeaseStore) func() {
+	t.Helper()
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- store.withLocks(context.Background(), []string{clockLockKey}, func() error {
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-locked:
+	case err := <-done:
+		t.Fatalf("hold logical clock lock: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out acquiring logical clock lock")
+	}
+
+	var once sync.Once
+	return func() {
+		t.Helper()
+		once.Do(func() {
+			close(release)
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("release logical clock lock: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Error("timed out releasing logical clock lock")
+			}
+		})
+	}
+}
+
+func waitForLoopExit(t *testing.T, name string, done <-chan struct{}) {
+	t.Helper()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("background loops did not stop")
+		t.Fatalf("%s did not stop promptly", name)
 	}
 }

@@ -344,6 +344,35 @@ func (s *LeaseStore) failClosed(err error) error {
 	return fmt.Errorf("%w: %v", ErrProviderRootUnready, err)
 }
 
+func isOnlyOperationContextCancellation(ctx context.Context, err error) bool {
+	ctxErr := ctx.Err()
+	if err == nil || ctxErr == nil {
+		return false
+	}
+	return errorTreeOnlyMatches(err, ctxErr)
+}
+
+func errorTreeOnlyMatches(err, target error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return errors.Is(err, target)
+		}
+		for _, child := range children {
+			if child == nil || !errorTreeOnlyMatches(child, target) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if child := wrapped.Unwrap(); child != nil {
+			return errorTreeOnlyMatches(child, target)
+		}
+	}
+	return errors.Is(err, target)
+}
+
 // Acquire implements the documented terminal-workarea contract.
 func (s *LeaseStore) Acquire(ctx context.Context, spec AcquireSpec) (*TerminalLease, error) {
 	if err := s.Ready(); err != nil {
@@ -732,7 +761,7 @@ func (s *LeaseStore) RunTerminalResultReplayer(ctx context.Context, opts Termina
 		opts.AttemptTimeout = DefaultTerminalResultReplayTimeout
 	}
 	replay := func() {
-		if _, err := s.replayTerminalResults(ctx, opts.BatchSize, opts.Concurrency, opts.AttemptTimeout, sender); err != nil && opts.OnError != nil {
+		if _, err := s.replayTerminalResults(ctx, opts.BatchSize, opts.Concurrency, opts.AttemptTimeout, sender); err != nil && !isOnlyOperationContextCancellation(ctx, err) && opts.OnError != nil {
 			opts.OnError(err)
 		}
 	}
@@ -1049,7 +1078,7 @@ func (s *LeaseStore) RunReaper(ctx context.Context, opts ReaperOptions, releaser
 	}
 	reap := func() {
 		_, err := s.ReapSnapshot(ctx, SchedulerOptions{BatchSize: opts.BatchSize, Concurrency: opts.Concurrency, AdmissionDelay: opts.Interval, AttemptTimeout: opts.AttemptTimeout}, releaser)
-		if err != nil && opts.OnError != nil {
+		if err != nil && !isOnlyOperationContextCancellation(ctx, err) && opts.OnError != nil {
 			opts.OnError(err)
 		}
 	}
@@ -1484,6 +1513,9 @@ func (s *LeaseStore) sampleClock(ctx context.Context) (int64, error) {
 		return err
 	})
 	if err != nil {
+		if isOnlyOperationContextCancellation(ctx, err) {
+			return 0, ctx.Err()
+		}
 		return 0, s.failClosed(err)
 	}
 	return nowMS, nil
