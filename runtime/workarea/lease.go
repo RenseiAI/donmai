@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -100,7 +101,8 @@ var (
 	// ErrTerminalStatusNotFound reports a lease without a retained outbox record.
 	ErrTerminalStatusNotFound = errors.New("runtime/workarea: terminal status outbox not found")
 	// ErrRenewalAfterBodySave reports immutable terminal-status body enforcement.
-	ErrRenewalAfterBodySave = errors.New("runtime/workarea: terminal status body already persisted")
+	ErrRenewalAfterBodySave     = errors.New("runtime/workarea: terminal status body already persisted")
+	errFileDescriptorOutOfRange = errors.New("runtime/workarea: file descriptor out of int range")
 )
 
 // LeasePolicy implements the documented terminal-workarea contract.
@@ -1932,6 +1934,18 @@ func openLockFile(root *os.Root, name string) (*os.File, error) {
 	return lock, err
 }
 
+func intFileDescriptor(fd uintptr) (int, error) {
+	if fd > math.MaxInt {
+		return 0, errFileDescriptorOutOfRange
+	}
+	return int(fd), nil
+}
+
+type heldLock struct {
+	file *os.File
+	fd   int
+}
+
 func (s *LeaseStore) withLocks(ctx context.Context, keys []string, fn func() error) error {
 	unique := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
@@ -1949,17 +1963,23 @@ func (s *LeaseStore) withLocks(ctx context.Context, keys []string, fn func() err
 		return err
 	}
 	defer func() { _ = lockRoot.Close() }()
-	held := make([]*os.File, 0, len(ordered))
+	held := make([]heldLock, 0, len(ordered))
 	for _, key := range ordered {
 		lock, err := openLockFile(lockRoot, key+".lock")
 		if err != nil {
 			releaseLocks(held)
 			return err
 		}
+		fd, err := intFileDescriptor(lock.Fd())
+		if err != nil {
+			_ = lock.Close()
+			releaseLocks(held)
+			return err
+		}
 		for {
-			err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			err = syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
 			if err == nil {
-				held = append(held, lock)
+				held = append(held, heldLock{file: lock, fd: fd})
 				break
 			}
 			if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
@@ -1980,9 +2000,9 @@ func (s *LeaseStore) withLocks(ctx context.Context, keys []string, fn func() err
 	return fn()
 }
 
-func releaseLocks(locks []*os.File) {
+func releaseLocks(locks []heldLock) {
 	for i := len(locks) - 1; i >= 0; i-- {
-		_ = syscall.Flock(int(locks[i].Fd()), syscall.LOCK_UN)
-		_ = locks[i].Close()
+		_ = syscall.Flock(locks[i].fd, syscall.LOCK_UN)
+		_ = locks[i].file.Close()
 	}
 }

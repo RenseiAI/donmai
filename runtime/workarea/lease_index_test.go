@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -19,6 +20,32 @@ func internalAcquireSpec(root string, index int) AcquireSpec {
 		WorkareaID:       fmt.Sprintf("wa_%032x", index+1),
 		WorkareaPath:     filepath.Join(root, fmt.Sprintf("workarea-%d", index)),
 		Policy:           DefaultLeasePolicy(), ReleaseRequested: true, ReleaseDisposition: "destroy",
+	}
+}
+
+func TestIntFileDescriptorBounds(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		fd      uintptr
+		want    int
+		wantErr error
+	}{
+		{name: "zero", fd: 0, want: 0},
+		{name: "maximum int", fd: uintptr(math.MaxInt), want: math.MaxInt},
+		{name: "above maximum int", fd: uintptr(math.MaxInt) + 1, wantErr: errFileDescriptorOutOfRange},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := intFileDescriptor(tt.fd)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("intFileDescriptor(%d) error = %v, want %v", tt.fd, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("intFileDescriptor(%d) = %d, want %d", tt.fd, got, tt.want)
+			}
+		})
 	}
 }
 
