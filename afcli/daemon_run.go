@@ -2,9 +2,11 @@ package afcli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,13 +17,39 @@ import (
 
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/statehome"
+	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // logRotateCheckInterval is how often a long-lived `daemon run` process
 // re-checks the launchd-managed log files for rotation.
 const logRotateCheckInterval = 6 * time.Hour
+
+type terminalRuntimeCredentialSource interface {
+	RuntimeCredentials() (workerID, runtimeToken string)
+}
+
+// terminalReceiverAuthorization resolves the daemon's current ephemeral runtime
+// token for each outbox send. The token is returned only as an HTTP header value
+// and is never written into the receiver registry or immutable status body.
+func terminalReceiverAuthorization(source terminalRuntimeCredentialSource) workarea.ReceiverAuthorizationResolver {
+	return func(ctx context.Context, _ string) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		workerID, token := source.RuntimeCredentials()
+		if strings.TrimSpace(workerID) == "" && strings.TrimSpace(token) == "" {
+			return "", errors.New("daemon runtime credentials are not available yet")
+		}
+		if strings.TrimSpace(token) == "" {
+			return "", nil
+		}
+		return "Bearer " + token, nil
+	}
+}
 
 // rotateDaemonLogs size-checks the launchd-managed daemon log files
 // (daemon.log / daemon-error.log) and rotates any that exceed
@@ -120,7 +148,8 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			spawnerOpts := daemon.SpawnerOptions{}
 			if mode && localSource != nil {
 				spawnerOpts.BaseEnv = localSource.MergeIntoBaseEnv(nil)
-				_, _ = fmt.Fprintf(errOut,
+				_, _ = fmt.Fprintf(
+					errOut,
 					"[creds] standalone mode active — merging process env + %s into spawner BaseEnv\n",
 					displayEnvLocalPath(localSource),
 				)
@@ -128,7 +157,8 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 				// Diagnostic-only: load but don't seed. The daemon's
 				// own credential pipeline (rensei-tui driven) owns
 				// agent env in this mode.
-				slog.Debug("standalone creds disabled — LocalSource loaded read-only",
+				slog.Debug(
+					"standalone creds disabled — LocalSource loaded read-only",
 					"envLocalPath", localSource.EnvLocalPath(),
 					"fileEnvKeyCount", len(localSource.FileEnvKeys()),
 				)
@@ -146,6 +176,48 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			})
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
+
+			// Reconcile terminal authorities before the daemon admits work. Receiver
+			// endpoints are resolved from the separate registry on every replay;
+			// no bearer is persisted by this public implementation.
+			leaseManager, err := worktree.NewManager(worktree.Options{
+				ParentDir: statepath.Resolve("worktrees", "/tmp/.donmai/worktrees"),
+				Logger:    slog.Default(),
+			})
+			if err != nil {
+				return fmt.Errorf("terminal lease recovery authority: %w", err)
+			}
+			leaseSender := leaseManager.TerminalStatusHTTPSender(
+				&http.Client{Timeout: workarea.DefaultTerminalResultReplayTimeout},
+				terminalReceiverAuthorization(d),
+			)
+			go leaseManager.RunTerminalResultReplayer(ctx, workarea.TerminalResultReplayOptions{
+				OnError: func(err error) { slog.Warn("terminal status replay failed", "err", err) },
+			}, leaseSender)
+			go leaseManager.RunTerminalLeaseReaper(ctx, workarea.ReaperOptions{
+				OnError: func(err error) { slog.Warn("terminal lease reaping failed", "err", err) },
+			})
+			go func() {
+				cleanup := func() {
+					if _, err := leaseManager.CleanupTerminalQuarantines(ctx, workarea.SchedulerOptions{
+						BatchSize: workarea.DefaultReaperBatchSize, Concurrency: workarea.DefaultReaperConcurrency,
+						AttemptTimeout: workarea.DefaultReleaseAttemptTimeout,
+					}); err != nil && ctx.Err() == nil {
+						slog.Warn("terminal quarantine cleanup failed", "err", err)
+					}
+				}
+				cleanup()
+				ticker := time.NewTicker(workarea.DefaultReaperInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						cleanup()
+					}
+				}
+			}()
 
 			// Periodic rotation re-check for long-lived daemon processes —
 			// the boot-time rotation above only helps across restarts.

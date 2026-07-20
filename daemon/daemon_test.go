@@ -127,3 +127,18 @@ func TestEphemeralPortNoCollision(t *testing.T) {
 		})
 	}
 }
+
+func TestRuntimeCredentialsReturnsConsistentSnapshot(t *testing.T) {
+	t.Parallel()
+
+	d := New(Options{ConfigPath: "/dev/null"})
+	d.mu.Lock()
+	d.workerID = "wkr_test"
+	d.jwt = "runtime-token"
+	d.mu.Unlock()
+
+	workerID, token := d.RuntimeCredentials()
+	if workerID != "wkr_test" || token != "runtime-token" {
+		t.Fatalf("RuntimeCredentials() = (%q, %q), want (%q, %q)", workerID, token, "wkr_test", "runtime-token")
+	}
+}

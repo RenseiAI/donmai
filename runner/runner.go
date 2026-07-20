@@ -2,6 +2,9 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +19,7 @@ import (
 	"github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/mcp"
 	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -443,19 +447,94 @@ func (r *Runner) Run(ctx context.Context, qw QueuedWork) (*Result, error) {
 	// Drive the loop. loop.go owns the step sequence; the helpers
 	// here own the result envelope + post-Run teardown.
 	res, runErr := r.runLoop(runCtx, qw, startedAt)
+	teardownRequired := shouldTeardown(res, r.preserveOnFail, r.preserveAlways)
+	leaseAcquired := false
+	leasePrepared := false
+	var terminalResultID string
+	var leaseProjection *workarea.TerminalLeaseProjection
+	var preparedStatusBody []byte
 
-	// Post the terminal Result. We do this before teardown so a
-	// teardown error does not lose the platform-side update. The run context is
-	// often the reason the session ended, so detach cancellation while preserving
-	// its values and apply a fresh cleanup bound.
+	// A requested successful hold is established before every terminal HTTP
+	// exchange, including PreserveWorktreeAlways. Preservation selects the final
+	// disposition; it cannot suppress the descriptor or durable state machine.
+	if qw.TerminalWorkareaLease != nil && res.Status == "completed" {
+		policy, policyErr := qw.TerminalWorkareaLease.Policy()
+		if policyErr != nil {
+			leaseErr := fmt.Errorf("runner: terminal workarea lease policy: %w", policyErr)
+			markTerminalLeaseFailure(res, leaseErr)
+			runErr = errors.Join(runErr, leaseErr)
+		} else {
+			computedTerminalResultID, identityErr := stableTerminalResultID(qw.SessionID, res.Result)
+			if identityErr != nil {
+				leaseErr := fmt.Errorf("runner: terminal result identity: %w", identityErr)
+				markTerminalLeaseFailure(res, leaseErr)
+				runErr = errors.Join(runErr, leaseErr)
+			} else {
+				terminalResultID = computedTerminalResultID
+				disposition := "destroy"
+				if r.preserveAlways {
+					disposition = "archive"
+				}
+				lease, acquireErr := r.wt.AcquireTerminalLease(context.Background(), workarea.AcquireSpec{
+					SessionID: qw.SessionID, TerminalResultID: terminalResultID, Policy: policy,
+					ReleaseRequested: true, ReleaseDisposition: disposition,
+				})
+				if acquireErr != nil {
+					leaseErr := fmt.Errorf("runner: acquire terminal workarea lease and defer teardown: %w", acquireErr)
+					markTerminalLeaseFailure(res, leaseErr)
+					runErr = errors.Join(runErr, leaseErr)
+				} else {
+					leaseAcquired = true
+					projection := lease.Descriptor().Projection()
+					leaseProjection = &projection
+					body, bodyErr := r.poster.PrepareTerminalStatusBody(context.Background(), qw.SessionID, res.Result, leaseProjection)
+					if bodyErr != nil {
+						leaseErr := fmt.Errorf("runner: encode immutable terminal status body: %w", bodyErr)
+						markTerminalLeaseFailure(res, leaseErr)
+						runErr = errors.Join(runErr, leaseErr)
+					} else if registerErr := r.wt.RegisterTerminalReceiver(r.poster.ReceiverKey(), r.poster.TerminalStatusEndpoint(qw.SessionID)); registerErr != nil {
+						leaseErr := fmt.Errorf("runner: register terminal status receiver: %w", registerErr)
+						markTerminalLeaseFailure(res, leaseErr)
+						runErr = errors.Join(runErr, leaseErr)
+					} else if _, saveErr := r.wt.SaveTerminalStatus(context.Background(), workarea.TerminalStatusSaveSpec{
+						LeaseID: lease.LeaseID, SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID,
+						WorkareaID: lease.WorkareaID, ReceiverKey: r.poster.ReceiverKey(), Body: body,
+						ExpectedExpiresAt: lease.ExpiresAt, DeadlineAt: lease.ExpiresAt,
+					}); saveErr != nil {
+						leaseErr := fmt.Errorf("runner: persist immutable terminal status body: %w", saveErr)
+						markTerminalLeaseFailure(res, leaseErr)
+						runErr = errors.Join(runErr, leaseErr)
+					} else {
+						preparedStatusBody = body
+						res.TerminalWorkareaLease = leaseProjection
+						leasePrepared = true
+					}
+				}
+			}
+		}
+	}
+
+	// Terminal delivery must outlive run cancellation but remain bounded, including
+	// prepared leased statuses whose immutable outbox body may need replay.
 	postCtx, postCancel := terminalResultPostContext(runCtx)
-	postErr := r.poster.Post(postCtx, qw.SessionID, res.Result)
+	var postOutcome result.PostOutcome
+	if leasePrepared {
+		postOutcome = r.poster.PostPreparedOutcome(postCtx, qw.SessionID, res.Result, preparedStatusBody)
+	} else {
+		postOutcome = r.poster.PostWithOptionsOutcome(postCtx, qw.SessionID, res.Result, result.PostOptions{})
+	}
 	postCancel()
-	if postErr != nil {
-		// Log + record the post failure on the result. The Run
-		// itself does not fail because of a post failure — the
-		// platform has its own retry/poller for stale sessions.
-		r.logger.Warn("result post failed",
+	if leasePrepared && postOutcome.StatusObserved() {
+		if _, observeErr := r.wt.MarkTerminalStatusDelivered(context.Background(), leaseProjection.LeaseID, qw.SessionID, terminalResultID, leaseProjection.WorkareaID); observeErr != nil {
+			r.logger.Warn("terminal status delivery persistence failed; restart replay remains armed",
+				"sessionId", qw.SessionID, "terminalResultId", terminalResultID, "err", observeErr)
+		}
+	}
+	if postErr := postOutcome.Err(); postErr != nil {
+		// Log + record the post failure on the result. A prepared lease remains
+		// exclusive until semantic acknowledgement or bounded expiry/reaping.
+		r.logger.Warn(
+			"result post failed",
 			"sessionId", qw.SessionID,
 			"err", postErr,
 		)
@@ -464,10 +543,12 @@ func (r *Runner) Run(ctx context.Context, qw QueuedWork) (*Result, error) {
 		}
 	}
 
-	// Teardown worktree (unless preserving).
-	if shouldTeardown(res, r.preserveOnFail, r.preserveAlways) {
+	// The leased path already received its ordinary teardown request before the
+	// status post. Every other path retains the legacy post-then-teardown order.
+	if teardownRequired && !leaseAcquired {
 		if err := r.wt.Teardown(context.Background(), qw.SessionID); err != nil {
-			r.logger.Warn("worktree teardown failed",
+			r.logger.Warn(
+				"worktree teardown failed",
 				"sessionId", qw.SessionID,
 				"err", err,
 			)
@@ -476,6 +557,25 @@ func (r *Runner) Run(ctx context.Context, qw QueuedWork) (*Result, error) {
 
 	res.FinishedAt = r.now().UnixMilli()
 	return res, runErr
+}
+
+func stableTerminalResultID(sessionID string, terminal agent.Result) (string, error) {
+	encoded, err := json.Marshal(struct {
+		SessionID string       `json:"sessionId"`
+		Result    agent.Result `json:"result"`
+	}{SessionID: sessionID, Result: terminal})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return "tr_" + hex.EncodeToString(sum[:16]), nil
+}
+
+func markTerminalLeaseFailure(res *Result, err error) {
+	res.Status = "failed"
+	res.FailureMode = FailureTerminalWorkareaLease
+	res.Error = err.Error()
+	res.TerminalWorkareaLease = nil
 }
 
 // validateQueuedWork checks the minimum field set required for Run.
@@ -490,6 +590,11 @@ func validateQueuedWork(qw QueuedWork) error {
 		return errors.New("PlatformURL is required (for heartbeat refresh)")
 	case qw.WorkerID == "":
 		return errors.New("WorkerID is required")
+	}
+	if qw.TerminalWorkareaLease != nil {
+		if _, err := qw.TerminalWorkareaLease.Policy(); err != nil {
+			return fmt.Errorf("terminalWorkareaLease: %w", err)
+		}
 	}
 	return nil
 }
