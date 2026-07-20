@@ -22,15 +22,14 @@ func TestRunWorktreeCleanupPreservesLeaseStateAndRetainedWorkarea(t *testing.T) 
 	if err := os.MkdirAll(worktreePath, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	workareaID, err := workarea.IDForPath(worktreePath)
+	workareaID, err := workarea.NewWorkareaID()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Acquire(context.Background(), workarea.AcquireSpec{
-		SessionID:        "session-1",
-		TerminalResultID: "result-1",
-		WorkareaID:       workareaID,
-		WorkareaPath:     worktreePath,
+		SessionID: "11111111-1111-4111-8111-111111111111", TerminalResultID: "tr_11111111111111111111111111111111",
+		WorkareaID: workareaID, WorkareaPath: worktreePath, Policy: workarea.DefaultLeasePolicy(),
+		ReleaseRequested: true, ReleaseDisposition: "destroy",
 	}); err != nil {
 		t.Fatal(err)
 	}

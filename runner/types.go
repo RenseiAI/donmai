@@ -267,9 +267,9 @@ type Result struct {
 	// FailureMode=FailureBudgetExceeded.
 	BudgetReport *BudgetReport `json:"budgetReport,omitempty"`
 
-	// TerminalWorkareaLease is the path-free descriptor attached to the
-	// successful terminal status after durable acquire + deferred teardown.
-	TerminalWorkareaLease *workarea.TerminalLeaseDescriptor `json:"terminalWorkareaLease,omitempty"`
+	// TerminalWorkareaLease is the exact four-field external projection attached
+	// after the full descriptor and host-local path are durable.
+	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
 }
 
 // LinearStatusTransition records the runner's post-session attempt to

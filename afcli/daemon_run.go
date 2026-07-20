@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,8 +16,11 @@ import (
 
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/statehome"
+	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // logRotateCheckInterval is how often a long-lived `daemon run` process
@@ -146,6 +150,45 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			})
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
+
+			// Reconcile terminal authorities before the daemon admits work. Receiver
+			// endpoints are resolved from the separate registry on every replay;
+			// no bearer is persisted by this public implementation.
+			leaseManager, err := worktree.NewManager(worktree.Options{
+				ParentDir: statepath.Resolve("worktrees", "/tmp/.donmai/worktrees"),
+				Logger:    slog.Default(),
+			})
+			if err != nil {
+				return fmt.Errorf("terminal lease recovery authority: %w", err)
+			}
+			leaseSender := leaseManager.TerminalStatusHTTPSender(&http.Client{Timeout: workarea.DefaultTerminalResultReplayTimeout}, nil)
+			go leaseManager.RunTerminalResultReplayer(ctx, workarea.TerminalResultReplayOptions{
+				OnError: func(err error) { slog.Warn("terminal status replay failed", "err", err) },
+			}, leaseSender)
+			go leaseManager.RunTerminalLeaseReaper(ctx, workarea.ReaperOptions{
+				OnError: func(err error) { slog.Warn("terminal lease reaping failed", "err", err) },
+			})
+			go func() {
+				cleanup := func() {
+					if _, err := leaseManager.CleanupTerminalQuarantines(ctx, workarea.SchedulerOptions{
+						BatchSize: workarea.DefaultReaperBatchSize, Concurrency: workarea.DefaultReaperConcurrency,
+						AttemptTimeout: workarea.DefaultReleaseAttemptTimeout,
+					}); err != nil && ctx.Err() == nil {
+						slog.Warn("terminal quarantine cleanup failed", "err", err)
+					}
+				}
+				cleanup()
+				ticker := time.NewTicker(workarea.DefaultReaperInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						cleanup()
+					}
+				}
+			}()
 
 			// Periodic rotation re-check for long-lived daemon processes —
 			// the boot-time rotation above only helps across restarts.
