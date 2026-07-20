@@ -155,7 +155,8 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	defer cancel()
 
 	logger := slog.Default()
-	logger.Info("agent run: starting",
+	logger.Info(
+		"agent run: starting",
 		"sessionId", sessionID,
 		"daemonUrl", daemonURL,
 	)
@@ -165,7 +166,8 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if err != nil {
 		return preflightErr(fmt.Sprintf("fetch session detail: %v", err))
 	}
-	logger.Info("agent run: session detail fetched",
+	logger.Info(
+		"agent run: session detail fetched",
 		"sessionId", detail.SessionID,
 		"identifier", detail.IssueIdentifier,
 		"provider", providerNameFromDetail(detail),
@@ -664,7 +666,8 @@ func assertLegacyAlias(logger *slog.Logger, p agent.Provider) {
 		return
 	}
 	if got := hp.Manifest().Name; got != cell.Harness {
-		logger.Warn("donmai agent run: legacy-alias harness mismatch",
+		logger.Warn(
+			"donmai agent run: legacy-alias harness mismatch",
 			"provider", name,
 			"manifestHarness", got,
 			"matrixHarness", cell.Harness,

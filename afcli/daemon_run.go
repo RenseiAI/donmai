@@ -2,6 +2,7 @@ package afcli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,6 +27,29 @@ import (
 // logRotateCheckInterval is how often a long-lived `daemon run` process
 // re-checks the launchd-managed log files for rotation.
 const logRotateCheckInterval = 6 * time.Hour
+
+type terminalRuntimeCredentialSource interface {
+	RuntimeCredentials() (workerID, runtimeToken string)
+}
+
+// terminalReceiverAuthorization resolves the daemon's current ephemeral runtime
+// token for each outbox send. The token is returned only as an HTTP header value
+// and is never written into the receiver registry or immutable status body.
+func terminalReceiverAuthorization(source terminalRuntimeCredentialSource) workarea.ReceiverAuthorizationResolver {
+	return func(ctx context.Context, _ string) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		workerID, token := source.RuntimeCredentials()
+		if strings.TrimSpace(workerID) == "" && strings.TrimSpace(token) == "" {
+			return "", errors.New("daemon runtime credentials are not available yet")
+		}
+		if strings.TrimSpace(token) == "" {
+			return "", nil
+		}
+		return "Bearer " + token, nil
+	}
+}
 
 // rotateDaemonLogs size-checks the launchd-managed daemon log files
 // (daemon.log / daemon-error.log) and rotates any that exceed
@@ -124,7 +148,8 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			spawnerOpts := daemon.SpawnerOptions{}
 			if mode && localSource != nil {
 				spawnerOpts.BaseEnv = localSource.MergeIntoBaseEnv(nil)
-				_, _ = fmt.Fprintf(errOut,
+				_, _ = fmt.Fprintf(
+					errOut,
 					"[creds] standalone mode active — merging process env + %s into spawner BaseEnv\n",
 					displayEnvLocalPath(localSource),
 				)
@@ -132,7 +157,8 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 				// Diagnostic-only: load but don't seed. The daemon's
 				// own credential pipeline (rensei-tui driven) owns
 				// agent env in this mode.
-				slog.Debug("standalone creds disabled — LocalSource loaded read-only",
+				slog.Debug(
+					"standalone creds disabled — LocalSource loaded read-only",
 					"envLocalPath", localSource.EnvLocalPath(),
 					"fileEnvKeyCount", len(localSource.FileEnvKeys()),
 				)
@@ -161,7 +187,10 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("terminal lease recovery authority: %w", err)
 			}
-			leaseSender := leaseManager.TerminalStatusHTTPSender(&http.Client{Timeout: workarea.DefaultTerminalResultReplayTimeout}, nil)
+			leaseSender := leaseManager.TerminalStatusHTTPSender(
+				&http.Client{Timeout: workarea.DefaultTerminalResultReplayTimeout},
+				terminalReceiverAuthorization(d),
+			)
 			go leaseManager.RunTerminalResultReplayer(ctx, workarea.TerminalResultReplayOptions{
 				OnError: func(err error) { slog.Warn("terminal status replay failed", "err", err) },
 			}, leaseSender)

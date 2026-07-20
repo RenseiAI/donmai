@@ -19,8 +19,12 @@ func TestPollItemToSessionDetailForwardsTerminalWorkareaLease(t *testing.T) {
 	}
 	detail := PollItemToSessionDetail(PollWorkItem{
 		SessionID:             "session-1",
+		InitialPrompt:         "inspect the retained terminal",
 		TerminalWorkareaLease: request,
 	}, nil, "https://example.test", "token", "worker")
+	if detail.InitialPrompt != "inspect the retained terminal" {
+		t.Fatalf("initial prompt = %q", detail.InitialPrompt)
+	}
 	if detail.TerminalWorkareaLease != request {
 		t.Fatalf("terminal lease request = %+v", detail.TerminalWorkareaLease)
 	}
