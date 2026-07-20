@@ -1892,6 +1892,14 @@ func fileKey(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func openLockFile(root *os.Root, name string) (*os.File, error) {
+	lock, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return root.OpenFile(name, os.O_RDWR, 0)
+	}
+	return lock, err
+}
+
 func (s *LeaseStore) withLocks(ctx context.Context, keys []string, fn func() error) error {
 	unique := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
@@ -1911,7 +1919,7 @@ func (s *LeaseStore) withLocks(ctx context.Context, keys []string, fn func() err
 	defer func() { _ = lockRoot.Close() }()
 	held := make([]*os.File, 0, len(ordered))
 	for _, key := range ordered {
-		lock, err := lockRoot.OpenFile(key+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+		lock, err := openLockFile(lockRoot, key+".lock")
 		if err != nil {
 			releaseLocks(held)
 			return err
