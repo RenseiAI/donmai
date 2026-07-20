@@ -318,7 +318,7 @@ func TestTerminalLeaseRetainsLeafUntilAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{
-		SessionID: "s1",
+		SessionID: leaseTestSessionID,
 		RepoURL:   "x",
 		Strategy:  worktree.StrategyClone,
 	})
@@ -326,14 +326,8 @@ func TestTerminalLeaseRetainsLeafUntilAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease, err := m.AcquireTerminalLease(context.Background(), workarea.AcquireSpec{
-		SessionID:        "s1",
-		TerminalResultID: "result-1",
-		Policy: workarea.LeasePolicy{
-			SettlementBudget: time.Minute,
-			SafetyMargin:     time.Second,
-			LeaseDuration:    2 * time.Minute,
-			MaxLeaseDuration: 5 * time.Minute,
-		},
+		SessionID: leaseTestSessionID, TerminalResultID: leaseTestResultID,
+		Policy: workarea.DefaultLeasePolicy(), ReleaseRequested: true, ReleaseDisposition: "destroy",
 	})
 	if err != nil {
 		t.Fatalf("AcquireTerminalLease: %v", err)
@@ -343,7 +337,7 @@ func TestTerminalLeaseRetainsLeafUntilAcknowledgement(t *testing.T) {
 		t.Fatalf("lease not durable before teardown: lease=%+v err=%v", persisted, err)
 	}
 
-	if err := m.Teardown(context.Background(), "s1"); err != nil {
+	if err := m.Teardown(context.Background(), leaseTestSessionID); err != nil {
 		t.Fatalf("Teardown: %v", err)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -362,28 +356,30 @@ func TestTerminalLeaseRetainsLeafUntilAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := recovered.Provision(context.Background(), worktree.ProvisionSpec{
-		SessionID: "s1",
+		SessionID: leaseTestSessionID,
 		RepoURL:   "x",
 		Strategy:  worktree.StrategyClone,
 	}); !errors.Is(err, workarea.ErrWorkareaLeased) {
 		t.Fatalf("retained workarea was reusable after restart: %v", err)
 	}
 
-	claimManagerLease(t, m, lease, "invocation-1", "claim-1")
-	ack := managerAcknowledgement(lease, "invocation-1", "claim-1")
-	for i := 0; i < 2; i++ {
-		released, ackErr := m.AcknowledgeTerminalResult(context.Background(), ack)
-		if ackErr != nil {
-			t.Fatalf("AcknowledgeTerminalResult %d: %v", i+1, ackErr)
-		}
-		if released.State != workarea.LeaseReleased {
-			t.Fatalf("acknowledgement %d state = %q", i+1, released.State)
-		}
+	claimManagerLease(t, m, lease, leaseTestInvocationID, leaseTestClaimID)
+	ack := managerAcknowledgement(lease, leaseTestInvocationID, leaseTestClaimID)
+	applied, ackErr := m.AcknowledgeTerminalResult(context.Background(), ack)
+	if ackErr != nil || applied.Outcome != workarea.AcknowledgementApplied {
+		t.Fatalf("AcknowledgeTerminalResult: outcome=%+v err=%v", applied, ackErr)
+	}
+	if _, err := m.ReapExpiredTerminalLeases(context.Background(), 1, time.Second); err != nil {
+		t.Fatalf("release pending lease: %v", err)
+	}
+	duplicate, ackErr := m.AcknowledgeTerminalResult(context.Background(), ack)
+	if ackErr != nil || duplicate.Outcome != workarea.AcknowledgementAlreadyApplied {
+		t.Fatalf("duplicate acknowledgement: outcome=%+v err=%v", duplicate, ackErr)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("acknowledged leaf still exists: %v", err)
 	}
-	if _, err := m.Path("s1"); !errors.Is(err, worktree.ErrUnknownSession) {
+	if _, err := m.Path(leaseTestSessionID); !errors.Is(err, worktree.ErrUnknownSession) {
 		t.Fatalf("released session remained owned: %v", err)
 	}
 }
@@ -401,7 +397,7 @@ func TestTerminalLeaseAcknowledgementRecoversAfterManagerRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, err := first.Provision(context.Background(), worktree.ProvisionSpec{
-		SessionID: "s1",
+		SessionID: leaseTestSessionID,
 		RepoURL:   "x",
 		Strategy:  worktree.StrategyClone,
 	})
@@ -409,13 +405,13 @@ func TestTerminalLeaseAcknowledgementRecoversAfterManagerRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease, err := first.AcquireTerminalLease(context.Background(), workarea.AcquireSpec{
-		SessionID:        "s1",
-		TerminalResultID: "result-1",
+		SessionID: leaseTestSessionID, TerminalResultID: leaseTestResultID,
+		Policy: workarea.DefaultLeasePolicy(), ReleaseRequested: true, ReleaseDisposition: "destroy",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := first.Teardown(context.Background(), "s1"); err != nil {
+	if err := first.Teardown(context.Background(), leaseTestSessionID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -423,10 +419,13 @@ func TestTerminalLeaseAcknowledgementRecoversAfterManagerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claimManagerLease(t, recovered, lease, "invocation-1", "claim-1")
-	_, err = recovered.AcknowledgeTerminalResult(context.Background(), managerAcknowledgement(lease, "invocation-1", "claim-1"))
+	claimManagerLease(t, recovered, lease, leaseTestInvocationID, leaseTestClaimID)
+	_, err = recovered.AcknowledgeTerminalResult(context.Background(), managerAcknowledgement(lease, leaseTestInvocationID, leaseTestClaimID))
 	if err != nil {
 		t.Fatalf("recovered acknowledgement: %v", err)
+	}
+	if _, err := recovered.ReapExpiredTerminalLeases(context.Background(), 1, time.Second); err != nil {
+		t.Fatalf("recovered release: %v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("recovered release retained leaf: %v", err)
