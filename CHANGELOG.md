@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.54.0 — 2026-07-20
+
 ### Features
 
 - **Durable terminal-workarea leases.** Successful sessions can retain their
