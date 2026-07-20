@@ -9,7 +9,11 @@ import "golang.org/x/sys/unix"
 // concurrent Close and the read loop's poller is never disturbed (unlike
 // os.File.Fd, which pty.Setsize uses internally).
 func applyWinsize(fd uintptr, cols, rows, pxW, pxH uint16) error {
-	return unix.IoctlSetWinsize(fdToInt(fd), unix.TIOCSWINSZ, &unix.Winsize{
+	intFD, err := fdToInt(fd)
+	if err != nil {
+		return err
+	}
+	return unix.IoctlSetWinsize(intFD, unix.TIOCSWINSZ, &unix.Winsize{
 		Row:    rows,
 		Col:    cols,
 		Xpixel: pxW,

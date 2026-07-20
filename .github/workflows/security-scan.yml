@@ -40,7 +40,55 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
+      - name: Install semgrep
+        run: |
+          # Semgrep 1.97's OpenTelemetry dependency imports pkg_resources,
+          # which setuptools 81+ no longer ships.
+          python -m pip install --upgrade \
+            pip==25.3 \
+            setuptools==80.9.0 \
+            wheel==0.45.1
+          python -m pip install semgrep==1.97.0
+          semgrep --version
       - name: Run semgrep
         run: |
-          pip install semgrep==1.97.0
-          semgrep scan --config p/security-audit --config p/secrets --error || echo "::warning::semgrep reported findings (report-only)"
+          mkdir -p artifacts
+          set +e
+          semgrep scan \
+            --config p/security-audit \
+            --config p/secrets \
+            --error \
+            --sarif \
+            --output artifacts/semgrep.sarif
+          semgrep_status=$?
+          set -e
+
+          if [[ ! -s artifacts/semgrep.sarif ]]; then
+            echo "::error::semgrep did not produce a SARIF report"
+            exit 2
+          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("artifacts/semgrep.sarif").read_text())
+          if report.get("version") != "2.1.0" or not report.get("runs"):
+              raise SystemExit("semgrep produced an invalid SARIF report")
+          PY
+
+          case "$semgrep_status" in
+            0) ;;
+            1) echo "::warning::semgrep reported findings (report-only)" ;;
+            *)
+              echo "::error::semgrep execution failed with exit code $semgrep_status"
+              exit "$semgrep_status"
+              ;;
+          esac
+      - name: Upload semgrep report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-sarif
+          path: artifacts/semgrep.sarif
+          if-no-files-found: error
+          retention-days: 30
