@@ -113,6 +113,73 @@ func TestLeaseAcquireIsDurableInvariantCompleteAndExclusive(t *testing.T) {
 	}
 }
 
+func TestLeaseAcquireColdConcurrentIdenticalCalls(t *testing.T) {
+	t.Parallel()
+	clock := newTestClock()
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases"), Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks, err := os.ReadDir(filepath.Join(store.Dir(), "locks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("cold lock directory contains %d entries", len(locks))
+	}
+
+	const concurrency = 64
+	type acquireResult struct {
+		lease *workarea.TerminalLease
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan acquireResult, concurrency)
+	var ready sync.WaitGroup
+	var complete sync.WaitGroup
+	ready.Add(concurrency)
+	complete.Add(concurrency)
+	spec := acquireSpec(root, sessionA, resultA, workareaA)
+	for range concurrency {
+		go func() {
+			defer complete.Done()
+			ready.Done()
+			<-start
+			lease, err := store.Acquire(context.Background(), spec)
+			results <- acquireResult{lease: lease, err: err}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	complete.Wait()
+	close(results)
+
+	var first *workarea.TerminalLease
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("cold concurrent acquire: %v", result.err)
+		}
+		if first == nil {
+			first = result.lease
+			continue
+		}
+		if result.lease.LeaseID != first.LeaseID || !result.lease.AcquiredAt.Equal(first.AcquiredAt) {
+			t.Fatalf("cold concurrent acquire changed identity: first=%+v got=%+v", first, result.lease)
+		}
+	}
+	if first == nil {
+		t.Fatal("cold concurrent acquire returned no lease")
+	}
+	leases, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 1 || leases[0].LeaseID != first.LeaseID {
+		t.Fatalf("durable leases=%+v want one lease %s", leases, first.LeaseID)
+	}
+}
+
 func TestClaimUsesStrictBoundaryAndReturnsCommittedClockSample(t *testing.T) {
 	t.Parallel()
 	run := func(t *testing.T, remainingMS int64, wantAccepted bool) {
