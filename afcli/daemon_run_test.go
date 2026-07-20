@@ -1,6 +1,7 @@
 package afcli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,5 +137,52 @@ func TestStandaloneCredsMergeIntoSpawnerBaseEnv(t *testing.T) {
 	// tempted to copy values into the worktree.
 	if _, err := os.Stat(filepath.Join(worktree, ".env.local")); !os.IsNotExist(err) {
 		t.Errorf("LocalSource leaked .env.local into worktree path: err=%v", err)
+	}
+}
+
+type fakeTerminalRuntimeCredentialSource struct {
+	workerID string
+	token    string
+}
+
+func (f *fakeTerminalRuntimeCredentialSource) RuntimeCredentials() (string, string) {
+	return f.workerID, f.token
+}
+
+func TestTerminalReceiverAuthorizationResolvesFreshRuntimeToken(t *testing.T) {
+	t.Parallel()
+
+	source := &fakeTerminalRuntimeCredentialSource{}
+	resolve := terminalReceiverAuthorization(source)
+	if _, err := resolve(context.Background(), "rcv_00000000000000000000000000000000"); err == nil {
+		t.Fatal("authorization before daemon credentials = nil error, want unavailable error")
+	}
+
+	source.workerID = "wkr_test"
+	source.token = "first-token"
+	got, err := resolve(context.Background(), "rcv_00000000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("resolve first token: %v", err)
+	}
+	if got != "Bearer first-token" {
+		t.Fatalf("first authorization = %q, want %q", got, "Bearer first-token")
+	}
+
+	source.token = "rotated-token"
+	got, err = resolve(context.Background(), "rcv_00000000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("resolve rotated token: %v", err)
+	}
+	if got != "Bearer rotated-token" {
+		t.Fatalf("rotated authorization = %q, want %q", got, "Bearer rotated-token")
+	}
+
+	source.token = ""
+	got, err = resolve(context.Background(), "rcv_00000000000000000000000000000000")
+	if err != nil {
+		t.Fatalf("resolve unauthenticated configured daemon: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("unauthenticated authorization = %q, want empty", got)
 	}
 }

@@ -8,6 +8,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **Durable terminal-workarea leases.** Successful sessions can retain their
+  exact workarea under a bounded, crash-recoverable lease until semantic result
+  acknowledgement or expiry. The daemon persists canonical lease, receiver,
+  immutable status-outbox, release, reaper, and quarantine authority; status
+  payloads expose only a path-free four-field projection, and restart replay
+  resolves fresh ephemeral authorization without persisting bearer tokens.
+
 ---
 
 ## v0.53.0 — 2026-07-20

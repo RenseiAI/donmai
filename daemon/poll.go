@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // PollWorkItem mirrors one element of the platform's poll response `work[]`
@@ -186,6 +187,11 @@ type PollWorkItem struct {
 	// folds it into headless or interview prompt construction. Empty/absent is
 	// omitted and preserves the pre-field wire shape.
 	InitialPrompt string `json:"initialPrompt,omitempty"`
+
+	// TerminalWorkareaLease is the optional provider-neutral request to retain a
+	// successful terminal workarea until semantic acknowledgement or bounded
+	// expiry. Nil preserves the legacy immediate-teardown behavior.
+	TerminalWorkareaLease *workarea.TerminalLeaseRequest `json:"terminalWorkareaLease,omitempty"`
 
 	// InterviewBudget is the per-interview wall-clock + idle-grace cap.
 	// Forwarded opaquely onto SessionDetail. Nil/absent is safe and
@@ -1056,6 +1062,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		MemoryBlock:            item.MemoryBlock,
 		Mode:                   item.Mode,
 		InitialPrompt:          item.InitialPrompt,
+		TerminalWorkareaLease:  item.TerminalWorkareaLease,
 		InterviewBudget:        item.InterviewBudget,
 		InterviewDefinition:    item.InterviewDefinition,
 	}

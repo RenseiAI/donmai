@@ -127,4 +127,9 @@ const (
 	// FailureSpawn: the handle and event stream already exist. A cancelled
 	// delivery remains a stopped session and does not use this failure mode.
 	FailureInteractiveInput = "interactive-input"
+
+	// FailureTerminalWorkareaLease indicates the runner completed the agent work
+	// but could not durably acquire the requested bounded terminal-workarea hold
+	// or record ordinary teardown as deferred. A successful status is never sent.
+	FailureTerminalWorkareaLease = "terminal-workarea-lease"
 )

@@ -30,6 +30,7 @@ import (
 	"github.com/spf13/cobra"
 
 	adminqueue "github.com/RenseiAI/donmai/afclient/queue"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -855,8 +856,11 @@ func branchExists(name string) bool {
 // reservedDirs are infrastructure dirs inside the worktree root that should
 // never be treated as agent worktrees (same set as the TS runner).
 var reservedDirs = map[string]bool{
-	".patches":         true,
-	"__merge-worker__": true,
+	".patches":             true,
+	".terminal-leases":     true,
+	".terminal-quarantine": true,
+	".terminal-receivers":  true,
+	"__merge-worker__":     true,
 }
 
 // runWorktreeCleanup scans worktreePath and removes orphaned worktrees.
@@ -874,6 +878,17 @@ func runWorktreeCleanup(_ context.Context, worktreePath string, dryRun, force bo
 
 	knownWorktrees, _ := gitWorktrees()
 
+	var leaseStore *workarea.LeaseStore
+	leaseDir := filepath.Join(worktreePath, ".terminal-leases")
+	if info, statErr := os.Stat(leaseDir); statErr == nil && info.IsDir() {
+		leaseStore, err = workarea.NewLeaseStore(workarea.StoreOptions{Dir: leaseDir})
+		if err != nil {
+			return result, fmt.Errorf("open terminal lease store: %w", err)
+		}
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return result, fmt.Errorf("stat terminal lease store: %w", statErr)
+	}
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -884,6 +899,21 @@ func runWorktreeCleanup(_ context.Context, worktreePath string, dryRun, force bo
 
 		entryPath := filepath.Join(worktreePath, entry.Name())
 		result.Scanned++
+		if leaseStore != nil {
+			retained, retainErr := leaseStore.RetainedPath(entryPath)
+			if retainErr != nil {
+				result.Errors = append(result.Errors, WorktreeError{
+					Path:  entryPath,
+					Error: fmt.Sprintf("terminal lease check failed: %v", retainErr),
+				})
+				result.Skipped++
+				continue
+			}
+			if retained {
+				result.Skipped++
+				continue
+			}
+		}
 
 		// Determine orphan status
 		orphaned := false

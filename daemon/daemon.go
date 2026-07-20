@@ -347,6 +347,15 @@ func (d *Daemon) WorkerID() string {
 	return d.workerID
 }
 
+// RuntimeCredentials returns the daemon's current worker identity and ephemeral
+// runtime token as one lock-consistent snapshot. Callers must use the token only
+// for immediate authorization and must not persist it.
+func (d *Daemon) RuntimeCredentials() (workerID, runtimeToken string) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.workerID, d.jwt
+}
+
 // HostStatus returns the most recent hostStatus reported by the platform
 // in a heartbeat response. nil until at least one beat has been ACK'd
 // (or the platform predates Phase 2e). Phase 2e of
@@ -633,14 +642,16 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// a cache-write failure must never abort the refresh.
 			if regOpts.JWTPath != "" {
 				if serr := persistRefreshedToken(regOpts.JWTPath, result, regOpts.Now); serr != nil {
-					slog.Warn("[runtime-token] failed to persist refreshed token to cache",
+					slog.Warn(
+						"[runtime-token] failed to persist refreshed token to cache",
 						"event", "refresh.cache-write-failed",
 						"workerId", result.WorkerID,
 						"jwtPath", regOpts.JWTPath,
 						"err", serr.Error(),
 					)
 				} else {
-					slog.Info("[runtime-token]",
+					slog.Info(
+						"[runtime-token]",
 						"event", "refresh.cached",
 						"workerId", result.WorkerID,
 					)

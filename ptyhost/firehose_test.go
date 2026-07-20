@@ -68,36 +68,75 @@ func firehoseCommand(mib int) []string {
 	return []string{"sh", "-c", "dd if=/dev/zero bs=1048576 count=" + strconv.Itoa(mib) + " 2>/dev/null"}
 }
 
-// firehoseRaceVolume sizes the -race firehose producer volume from the REAL
-// end-to-end pipeline throughput measured on THIS host, replacing the old
-// hand-tuned fixed race-mode byte count.
+const firehoseMinimumDuration = 5 * time.Second
+
+type firehoseCalibration struct {
+	warmupMiB      int
+	targetDuration time.Duration
+	minMiB         int
+	maxMiB         int
+	fallbackMiB    int
+	floorMBs       float64
+}
+
+func firehoseCalibrationForMode(race bool) firehoseCalibration {
+	if race {
+		return firehoseCalibration{
+			warmupMiB:      8,
+			targetDuration: 8 * time.Second,
+			minMiB:         24,
+			maxMiB:         256,
+			fallbackMiB:    64,
+			floorMBs:       2.0,
+		}
+	}
+	return firehoseCalibration{
+		warmupMiB:      32,
+		targetDuration: 8 * time.Second,
+		minMiB:         256,
+		maxMiB:         384,
+		fallbackMiB:    384,
+		floorMBs:       10.0,
+	}
+}
+
+// calibratedFirehoseMiB projects a measured end-to-end sample over the target
+// duration, rounds up to a whole MiB for dd, and clamps the result. The lower
+// bound keeps the main run materially larger than the resume ring; the upper
+// bound prevents a fast host from turning the deliberately stalled subscriber
+// into runaway CI memory and I/O volume.
+func calibratedFirehoseMiB(bytes int64, elapsed time.Duration, calibration firehoseCalibration) int {
+	if bytes <= 0 || elapsed <= 0 {
+		return calibration.fallbackMiB
+	}
+
+	targetBytes := float64(bytes) * float64(calibration.targetDuration) / float64(elapsed)
+	mib := int(math.Ceil(targetBytes / (1 << 20)))
+	if mib < calibration.minMiB {
+		return calibration.minMiB
+	}
+	if mib > calibration.maxMiB {
+		return calibration.maxMiB
+	}
+	return mib
+}
+
+// firehoseWorkload sizes both normal and -race producers from the REAL
+// end-to-end pipeline throughput measured on this host. A fixed byte count is
+// host-speed-sensitive: 224 MiB now drains in roughly 4.0-4.9s on faster normal
+// hosts, while the test intentionally requires at least 5s of sustained PTY
+// production. Under -race, instrumentation produces the same problem at a much
+// lower and hardware-dependent rate.
 //
-// Why adaptive: under -race the detector's per-op bookkeeping throttles the
-// pipeline via ordinary PTY backpressure, and the observed rate is
-// hardware-dependent. A fixed volume cannot be machine-speed-immune — the prior
-// 18 MiB drained in ~3.7s at ~5 MB/s and tripped the >=5s "sustained
-// production" floor on hardware faster than the original T10 dev box; bumping it
-// to 64 MiB only moved the failing-machine class rather than eliminating it.
-// Measuring the actual rate and sizing the volume from it is the durable fix
-// (W14 chaos-soak report follow-up).
-//
-// It runs a short warmup firehose (warmupMiB), drains it through the SAME
-// Subscribe/Frames path the real subtests use while timing it, then sizes the
-// main volume for targetSecs of sustained production. Only ever called on the
-// -race path (raceEnabled); the plain build keeps the verbatim 224 MiB /
-// 10 MB/s plan bar and never invokes this.
-func firehoseRaceVolume(t *testing.T) int {
+// The warmup drains through the same Spawn -> Subscribe -> Frames path as the
+// main test. The projected eight-second workload leaves headroom above the
+// five-second floor without sleeping or pausing I/O, and mode-specific caps
+// bound worst-case CI output and slow-subscriber queue growth.
+func firehoseWorkload(t *testing.T) (int, float64) {
 	t.Helper()
 
-	const (
-		warmupMiB  = 8   // amortizes PTY/kernel-buffer spin-up; ~1-2s under -race
-		targetSecs = 8.0 // comfortably above the 5s floor, headroom for variance
-		minMiB     = 24  // 3x the 8 MiB ring; keeps volume above the ring bound
-		maxMiB     = 256 // cap worst-case runtime on a surprisingly-fast host
-		fallback   = 64  // conservative fixed volume if the probe is degenerate
-	)
-
-	s, err := Spawn(Spec{Command: firehoseCommand(warmupMiB)})
+	calibration := firehoseCalibrationForMode(raceEnabled)
+	s, err := Spawn(Spec{Command: firehoseCommand(calibration.warmupMiB)})
 	if err != nil {
 		t.Fatalf("warmup Spawn: %v", err)
 	}
@@ -115,7 +154,9 @@ func firehoseRaceVolume(t *testing.T) int {
 
 	start := time.Now()
 	var bytes int64
-	deadline := time.After(30 * time.Second)
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+
 drain:
 	for {
 		select {
@@ -131,32 +172,75 @@ drain:
 			case attachwire.TypeExit:
 				break drain
 			}
-		case <-deadline:
+		case <-deadline.C:
 			t.Fatalf("warmup firehose timed out; received %d bytes so far", bytes)
 		}
 	}
 	elapsed := time.Since(start)
 
-	// Degenerate guard: never divide by zero, and never weaken the gate with a
-	// too-small volume — fall back to a conservative fixed count instead of
-	// skipping (the gate must not be softened; AGENTS.md hard stop).
-	if elapsed <= 0 || bytes == 0 {
-		t.Logf("firehose warmup degenerate (bytes=%d elapsed=%v); using fixed fallback %d MiB", bytes, elapsed, fallback)
-		return fallback
+	wantWarmupBytes := int64(calibration.warmupMiB) << 20
+	if bytes != wantWarmupBytes {
+		t.Fatalf("warmup received %d bytes, want exactly %d (dd count)", bytes, wantWarmupBytes)
 	}
 
+	mib := calibratedFirehoseMiB(bytes, elapsed, calibration)
 	rateMBs := float64(bytes) / elapsed.Seconds() / 1e6
-	// MB/s * s = MB; convert to MiB (ceil to a whole dd count >=1) and clamp.
-	mib := int(math.Ceil(rateMBs * targetSecs * 1e6 / (1 << 20)))
-	if mib < minMiB {
-		mib = minMiB
+	t.Logf("firehose warmup: %d bytes in %v = %.2f MB/s (race=%v); sizing main volume to %d MiB for %v target (clamped to [%d,%d])",
+		bytes, elapsed, rateMBs, raceEnabled, mib, calibration.targetDuration, calibration.minMiB, calibration.maxMiB)
+	return mib, calibration.floorMBs
+}
+
+func TestCalibratedFirehoseMiB(t *testing.T) {
+	calibration := firehoseCalibration{
+		targetDuration: 8 * time.Second,
+		minMiB:         24,
+		maxMiB:         384,
+		fallbackMiB:    64,
 	}
-	if mib > maxMiB {
-		mib = maxMiB
+
+	tests := []struct {
+		name    string
+		bytes   int64
+		elapsed time.Duration
+		wantMiB int
+	}{
+		{name: "projects and rounds up", bytes: 10 << 20, elapsed: 3 * time.Second, wantMiB: 27},
+		{name: "minimum clamp", bytes: 8 << 20, elapsed: 8 * time.Second, wantMiB: 24},
+		{name: "maximum clamp", bytes: 64 << 20, elapsed: time.Second, wantMiB: 384},
+		{name: "zero bytes fallback", bytes: 0, elapsed: time.Second, wantMiB: 64},
+		{name: "non-positive elapsed fallback", bytes: 8 << 20, elapsed: 0, wantMiB: 64},
 	}
-	t.Logf("firehose warmup: %d bytes in %v = %.2f MB/s under -race; sizing main volume to %d MiB to target ~%.0fs sustained (clamped to [%d,%d])",
-		bytes, elapsed, rateMBs, mib, targetSecs, minMiB, maxMiB)
-	return mib
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := calibratedFirehoseMiB(tt.bytes, tt.elapsed, calibration); got != tt.wantMiB {
+				t.Fatalf("calibratedFirehoseMiB(%d, %v) = %d MiB, want %d MiB", tt.bytes, tt.elapsed, got, tt.wantMiB)
+			}
+		})
+	}
+}
+
+func TestFirehoseCalibrationBounds(t *testing.T) {
+	for _, race := range []bool{false, true} {
+		calibration := firehoseCalibrationForMode(race)
+		t.Run("race="+strconv.FormatBool(race), func(t *testing.T) {
+			if calibration.warmupMiB <= 0 {
+				t.Errorf("warmupMiB = %d, want positive", calibration.warmupMiB)
+			}
+			if calibration.targetDuration <= firehoseMinimumDuration {
+				t.Errorf("targetDuration = %v, want > sustained-production floor %v", calibration.targetDuration, firehoseMinimumDuration)
+			}
+			if calibration.minMiB<<20 <= DefaultRingBytes {
+				t.Errorf("min volume = %d MiB, want greater than %d-byte ring", calibration.minMiB, DefaultRingBytes)
+			}
+			if calibration.fallbackMiB < calibration.minMiB || calibration.fallbackMiB > calibration.maxMiB {
+				t.Errorf("fallbackMiB = %d, want within [%d,%d]", calibration.fallbackMiB, calibration.minMiB, calibration.maxMiB)
+			}
+			if calibration.maxMiB > 384 {
+				t.Errorf("maxMiB = %d, want <=384 to bound CI volume", calibration.maxMiB)
+			}
+		})
+	}
 }
 
 // testFirehoseFastSubscriber: a single fast-draining subscriber sees strictly
@@ -165,24 +249,10 @@ drain:
 // a GC runs — the ring (8 MiB default) plus one subscriber's transient queue
 // should never balloon when the consumer keeps up.
 func testFirehoseFastSubscriber(t *testing.T) {
-	// Volume and throughput floor are race-mode-aware: this lane's gate runs
-	// `go test -race`, and the race detector's per-op bookkeeping measurably
-	// slows the pipeline (empirically ~15 MiB/s plain -> ~3-5 MB/s under -race,
-	// hardware-dependent), which throttles the producer via ordinary PTY
-	// buffer backpressure (dd blocks on write once the kernel PTY buffer is
-	// full and our reader isn't draining fast enough to keep it empty). The
-	// race-mode volume must be large enough that the firehose SUSTAINS >=5s
-	// (the "sustained production" floor below) even on a fast host. A fixed
-	// byte count cannot be machine-speed-immune, so the volume is now sized
-	// adaptively from the throughput actually measured on THIS host — see
-	// firehoseRaceVolume for the warmup probe and its rationale. The floor
-	// stays 2.0 MB/s under -race (the correctness assertion — only the VOLUME
-	// is adaptive). The >=10 MB/s bar from the plan is enforced verbatim in the
-	// plain (non -race) build.
-	mib, floorMBs := 224, 10.0
-	if raceEnabled {
-		mib, floorMBs = firehoseRaceVolume(t), 2.0
-	}
+	// Both modes calibrate volume from this host's observed PTY pipeline rate.
+	// The throughput floor remains mode-specific and unchanged: >=10 MB/s in a
+	// plain build and >=2 MB/s under race-detector instrumentation.
+	mib, floorMBs := firehoseWorkload(t)
 	s, err := Spawn(Spec{Command: firehoseCommand(mib)})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -239,7 +309,7 @@ loop:
 	}
 	rateMBs := float64(total) / elapsed.Seconds() / 1e6
 	t.Logf("firehose: %d bytes in %v = %.2f MB/s (decimal, race=%v)", total, elapsed, rateMBs, raceEnabled)
-	if elapsed < 5*time.Second {
+	if elapsed < firehoseMinimumDuration {
 		t.Errorf("firehose ran for only %v, want >=5s of sustained production (increase volume)", elapsed)
 	}
 	if rateMBs < floorMBs {
@@ -265,16 +335,11 @@ loop:
 // byte-bounded regardless, the fast peer is unaffected by the slow one, and
 // the slow subscriber's own queue is NOT bounded (documented gap).
 func testFirehoseSlowVsFastSubscriber(t *testing.T) {
-	// See testFirehoseFastSubscriber for why volume/floor are race-mode-aware.
-	// The -race volume is sized adaptively by firehoseRaceVolume (warmup
-	// throughput probe); its minMiB clamp (24 MiB, 3x the 8 MiB default ring)
-	// keeps the produced volume comfortably above the ring bound so BOTH the
-	// ring-stays-bounded assertion and the slow-queue-EXCEEDS-ringMax assertion
-	// below stay meaningful regardless of timing variance.
-	mib, floorMBs := 224, 10.0
-	if raceEnabled {
-		mib, floorMBs = firehoseRaceVolume(t), 2.0
-	}
+	// Calibrate immediately before this run so host-load changes between
+	// subtests cannot inherit a stale rate. The configured minimum remains above
+	// the default ring so both bounded-ring and uncapped-queue assertions stay
+	// meaningful.
+	mib, floorMBs := firehoseWorkload(t)
 	s, err := Spawn(Spec{Command: firehoseCommand(mib)})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -333,9 +398,13 @@ loop:
 		}
 	}
 	elapsed := time.Since(start)
+	wantBytes := int64(mib) << 20
+	if total != wantBytes {
+		t.Errorf("fast peer received %d bytes, want exactly %d (dd count)", total, wantBytes)
+	}
 	rateMBs := float64(total) / elapsed.Seconds() / 1e6
 	t.Logf("fast peer: %d bytes in %v = %.2f MB/s despite a concurrent non-draining subscriber (race=%v)", total, elapsed, rateMBs, raceEnabled)
-	if elapsed < 5*time.Second {
+	if elapsed < firehoseMinimumDuration {
 		t.Errorf("fast peer ran for only %v, want >=5s of sustained production (increase volume)", elapsed)
 	}
 	if rateMBs < floorMBs {
