@@ -63,6 +63,9 @@ type Poster struct {
 	// now returns "now"; injectable for deterministic tests of the
 	// backoff sleep.
 	now func() time.Time
+
+	// receiverKey is the stable opaque identity stored in the Donmai outbox.
+	receiverKey string
 }
 
 // Options configure a [Poster].
@@ -97,6 +100,10 @@ type Options struct {
 
 	// Now overrides time.Now for deterministic tests. Optional.
 	Now func() time.Time
+
+	// ReceiverKey is the stable receiver configuration identity. Empty assigns a
+	// new opaque key; callers that need restart replay should persist and reuse it.
+	ReceiverKey string
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for platform
@@ -140,6 +147,15 @@ func NewPoster(opts Options) (*Poster, error) {
 	if now == nil {
 		now = time.Now
 	}
+	receiverKey := opts.ReceiverKey
+	if receiverKey == "" {
+		receiverKey, err = workarea.NewGeneratedID("rcv_")
+		if err != nil {
+			return nil, err
+		}
+	} else if !validReceiverKey(receiverKey) {
+		return nil, errors.New("result: ReceiverKey must use rcv_<32 lowercase hex>")
+	}
 	return &Poster{
 		platformURL:        u,
 		authToken:          opts.AuthToken,
@@ -149,7 +165,20 @@ func NewPoster(opts Options) (*Poster, error) {
 		maxAttempts:        maxAttempts,
 		baseDelay:          delay,
 		now:                now,
+		receiverKey:        receiverKey,
 	}, nil
+}
+
+func validReceiverKey(value string) bool {
+	if len(value) != len("rcv_")+32 || !strings.HasPrefix(value, "rcv_") {
+		return false
+	}
+	for _, char := range value[len("rcv_"):] {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // completionRequest is the wire body for POST /api/sessions/<id>/completion.
@@ -240,7 +269,7 @@ type statusRequest struct {
 	// TerminalWorkareaLease is the immutable path-free descriptor proving the
 	// successful workarea is durably retained before this status can trigger
 	// downstream verification.
-	TerminalWorkareaLease *workarea.TerminalLeaseDescriptor `json:"terminalWorkareaLease,omitempty"`
+	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -253,7 +282,7 @@ type errorEnvelope struct {
 // PostOptions carries additive terminal-status fields that are not part of the
 // provider-owned agent.Result.
 type PostOptions struct {
-	TerminalWorkareaLease *workarea.TerminalLeaseDescriptor
+	TerminalWorkareaLease *workarea.TerminalLeaseProjection
 }
 
 // PostOutcome preserves which half of the completion/status exchange failed.
@@ -284,15 +313,59 @@ func (o PostOutcome) Err() error {
 	}
 }
 
-// EncodeTerminalResultPayload serializes the provider-neutral logical result
-// stored atomically with a terminal lease. The path-free descriptor is rebuilt
-// from the durable lease during restart replay.
-func EncodeTerminalResultPayload(r agent.Result) (json.RawMessage, error) {
-	payload, err := json.Marshal(r)
+// ReceiverKey returns the stable opaque outbox receiver identity.
+func (p *Poster) ReceiverKey() string { return p.receiverKey }
+
+// TerminalStatusEndpoint returns the current endpoint registered separately
+// from the immutable outbox record.
+func (p *Poster) TerminalStatusEndpoint(sessionID string) string {
+	return p.urlFor(fmt.Sprintf("/api/sessions/%s/status", sessionID))
+}
+
+// PrepareTerminalStatusBody captures the complete immutable status body once.
+// Header authorization remains fresh per send, but replay never reconstructs or
+// changes body fields such as workerId.
+func (p *Poster) PrepareTerminalStatusBody(ctx context.Context, sessionID string, r agent.Result, projection *workarea.TerminalLeaseProjection) ([]byte, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, errors.New("result: sessionID is required")
+	}
+	if r.Status == "" {
+		return nil, errors.New("result: agent.Result.Status is required")
+	}
+	body := buildStatusRequest(p.credentials(ctx), r, projection)
+	payload, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("marshal terminal result payload: %w", err)
+		return nil, fmt.Errorf("marshal terminal status body: %w", err)
 	}
 	return payload, nil
+}
+
+// PostPreparedOutcome sends the ancillary completion request and the exact
+// retained terminal-status body.
+func (p *Poster) PostPreparedOutcome(ctx context.Context, sessionID string, r agent.Result, body []byte) PostOutcome {
+	if len(body) == 0 {
+		return PostOutcome{StatusErr: errors.New("result: prepared terminal status body is required")}
+	}
+	return PostOutcome{
+		CompletionErr: p.postCompletion(ctx, sessionID, r),
+		StatusErr:     p.doRetriedBytes(ctx, fmt.Sprintf("/api/sessions/%s/status", sessionID), body),
+	}
+}
+
+// ReplayTerminalStatus sends the exact retained bytes through this receiver's
+// current session endpoint while resolving fresh header credentials.
+func (p *Poster) ReplayTerminalStatus(ctx context.Context, sessionID, receiverKey string, body []byte) error {
+	if receiverKey != p.receiverKey {
+		return fmt.Errorf("result: receiver key %q is not configured", receiverKey)
+	}
+	return p.doRetriedBytes(ctx, fmt.Sprintf("/api/sessions/%s/status", sessionID), body)
+}
+
+// TerminalStatusSender binds a session route for the provider-neutral outbox.
+func (p *Poster) TerminalStatusSender(sessionID string) workarea.TerminalStatusSender {
+	return func(ctx context.Context, receiverKey string, body []byte) error {
+		return p.ReplayTerminalStatus(ctx, sessionID, receiverKey, body)
+	}
 }
 
 // Post sends the runner's terminal [agent.Result] to the platform.
@@ -342,28 +415,6 @@ func (p *Poster) PostWithOptionsOutcome(ctx context.Context, sessionID string, r
 	}
 }
 
-// ReplayTerminalStatus decodes one durable logical result and posts only the
-// terminal status. Completion comments are intentionally not replayed.
-func (p *Poster) ReplayTerminalStatus(ctx context.Context, sessionID string, payload json.RawMessage, descriptor workarea.TerminalLeaseDescriptor) error {
-	var r agent.Result
-	if err := json.Unmarshal(payload, &r); err != nil {
-		return fmt.Errorf("decode terminal result payload: %w", err)
-	}
-	if strings.TrimSpace(sessionID) == "" {
-		return errors.New("result: sessionID is required")
-	}
-	if r.Status == "" {
-		return errors.New("result: agent.Result.Status is required")
-	}
-	return p.postStatus(ctx, sessionID, r, PostOptions{TerminalWorkareaLease: &descriptor})
-}
-
-// ReplayTerminalResult matches workarea.TerminalResultPoster and rebuilds the
-// path-free descriptor from the durable lease.
-func (p *Poster) ReplayTerminalResult(ctx context.Context, lease workarea.TerminalLease, payload json.RawMessage) error {
-	return p.ReplayTerminalStatus(ctx, lease.SessionID, payload, lease.Descriptor())
-}
-
 func (p *Poster) credentials(ctx context.Context) RuntimeCredentials {
 	creds := RuntimeCredentials{
 		WorkerID:  p.workerID,
@@ -404,32 +455,32 @@ func (p *Poster) postCompletion(ctx context.Context, sessionID string, r agent.R
 func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Result, opts PostOptions) error {
 	path := fmt.Sprintf("/api/sessions/%s/status", sessionID)
 	return p.doRetried(ctx, path, func(creds RuntimeCredentials) any {
-		body := statusRequest{
-			WorkerID:          creds.WorkerID,
-			Status:            r.Status,
-			ProviderSessionID: r.ProviderSessionID,
-			WorktreePath:      r.WorktreePath,
-			FailureMode:       r.FailureMode,
-			Summary:           strings.TrimSpace(r.Summary),
-			Result:            r.WorkResult,
-			ResultMarker:      workResultMarker(r.WorkResult),
-			CommitSHA:         r.CommitSHA,
-			PullRequestURL:    r.PullRequestURL,
-			// Structured turn-result manifest (W3) — posted verbatim when the
-			// agent wrote one. Additive; nil when absent.
-			Manifest:              r.Manifest,
-			TerminalWorkareaLease: opts.TerminalWorkareaLease,
-		}
-		if r.Cost != nil {
-			body.TotalCostUsd = r.Cost.TotalCostUsd
-			body.InputTokens = r.Cost.InputTokens
-			body.OutputTokens = r.Cost.OutputTokens
-		}
-		if r.Error != "" {
-			body.Error = &errorEnvelope{Message: r.Error}
-		}
-		return body
+		return buildStatusRequest(creds, r, opts.TerminalWorkareaLease)
 	})
+}
+
+func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *workarea.TerminalLeaseProjection) statusRequest {
+	worktreePath := r.WorktreePath
+	if projection != nil {
+		// The terminal lease projection is the only externally visible workarea
+		// locator. The exact host-local path remains in durable local lease state.
+		worktreePath = ""
+	}
+	body := statusRequest{
+		WorkerID: creds.WorkerID, Status: r.Status, ProviderSessionID: r.ProviderSessionID,
+		WorktreePath: worktreePath, FailureMode: r.FailureMode, Summary: strings.TrimSpace(r.Summary),
+		Result: r.WorkResult, ResultMarker: workResultMarker(r.WorkResult), CommitSHA: r.CommitSHA,
+		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, TerminalWorkareaLease: projection,
+	}
+	if r.Cost != nil {
+		body.TotalCostUsd = r.Cost.TotalCostUsd
+		body.InputTokens = r.Cost.InputTokens
+		body.OutputTokens = r.Cost.OutputTokens
+	}
+	if r.Error != "" {
+		body.Error = &errorEnvelope{Message: r.Error}
+	}
+	return body
 }
 
 // doRetried executes a POST against path with a per-attempt body, retrying
@@ -482,6 +533,32 @@ func (p *Poster) doRetried(ctx context.Context, path string, buildBody func(Runt
 		Attempts: p.maxAttempts,
 		Last:     lastErr,
 	}
+}
+
+func (p *Poster) doRetriedBytes(ctx context.Context, path string, payload []byte) error {
+	endpoint := p.urlFor(path)
+	var lastErr error
+	for attempt := 1; attempt <= p.maxAttempts; attempt++ {
+		creds := p.credentials(ctx)
+		err := p.doOnce(ctx, endpoint, payload, creds.AuthToken)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		var permanent *PermanentError
+		if errors.As(err, &permanent) {
+			return err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if attempt < p.maxAttempts {
+			if err := p.sleep(ctx, attempt); err != nil {
+				return err
+			}
+		}
+	}
+	return &TransientError{Attempts: p.maxAttempts, Last: lastErr}
 }
 
 // doOnce performs a single POST against endpoint with payload. Returns

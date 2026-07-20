@@ -856,9 +856,11 @@ func branchExists(name string) bool {
 // reservedDirs are infrastructure dirs inside the worktree root that should
 // never be treated as agent worktrees (same set as the TS runner).
 var reservedDirs = map[string]bool{
-	".patches":         true,
-	".terminal-leases": true,
-	"__merge-worker__": true,
+	".patches":             true,
+	".terminal-leases":     true,
+	".terminal-quarantine": true,
+	".terminal-receivers":  true,
+	"__merge-worker__":     true,
 }
 
 // runWorktreeCleanup scans worktreePath and removes orphaned worktrees.
@@ -898,18 +900,7 @@ func runWorktreeCleanup(_ context.Context, worktreePath string, dryRun, force bo
 		entryPath := filepath.Join(worktreePath, entry.Name())
 		result.Scanned++
 		if leaseStore != nil {
-			workareaID, idErr := workarea.IDForPath(entryPath)
-			if idErr != nil {
-				result.Errors = append(result.Errors, WorktreeError{Path: entryPath, Error: idErr.Error()})
-				result.Skipped++
-				continue
-			}
-			retained, retainErr := leaseStore.Retained(workareaID)
-			if retainErr == nil && !retained {
-				// Compatibility with records created by the unreleased path-id
-				// candidate before opaque workarea identities were introduced.
-				retained, retainErr = leaseStore.Retained(entryPath)
-			}
+			retained, retainErr := leaseStore.RetainedPath(entryPath)
 			if retainErr != nil {
 				result.Errors = append(result.Errors, WorktreeError{
 					Path:  entryPath,

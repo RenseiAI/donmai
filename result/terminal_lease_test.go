@@ -12,6 +12,18 @@ import (
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
+func TestNewPosterRejectsNoncanonicalReceiverKey(t *testing.T) {
+	t.Parallel()
+
+	_, err := result.NewPoster(result.Options{
+		PlatformURL: "https://example.invalid",
+		ReceiverKey: "rcv_ABCDEF11111111111111111111111111",
+	})
+	if err == nil {
+		t.Fatal("uppercase receiver key accepted")
+	}
+}
+
 func TestPostWithOptionsAttachesPathFreeTerminalLeaseToStatusOnly(t *testing.T) {
 	t.Parallel()
 
@@ -35,15 +47,11 @@ func TestPostWithOptionsAttachesPathFreeTerminalLeaseToStatusOnly(t *testing.T) 
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	desc := &workarea.TerminalLeaseDescriptor{
-		SchemaVersion:      workarea.TerminalLeaseSchemaV1,
-		LeaseID:            "twl_1",
-		SessionID:          "session-1",
-		TerminalResultID:   "tr_1",
-		WorkareaID:         "wa_1",
-		AcquiredAt:         now,
-		ExpiresAt:          now.Add(30 * time.Minute),
-		SettlementBudgetMS: (17 * time.Minute).Milliseconds(),
+	desc := &workarea.TerminalLeaseProjection{
+		LeaseID:          "twl_11111111111111111111111111111111",
+		TerminalResultID: "tr_11111111111111111111111111111111",
+		WorkareaID:       "wa_11111111111111111111111111111111",
+		ExpiresAt:        now.Add(30 * time.Minute),
 	}
 	if err := poster.PostWithOptions(context.Background(), "session-1", goodResult(), result.PostOptions{
 		TerminalWorkareaLease: desc,
@@ -53,8 +61,11 @@ func TestPostWithOptionsAttachesPathFreeTerminalLeaseToStatusOnly(t *testing.T) 
 	if statusBody["terminalWorkareaLease"] == nil {
 		t.Fatalf("status body = %#v", statusBody)
 	}
+	if statusBody["worktreePath"] != nil {
+		t.Fatalf("status body leaked host-local worktree path: %#v", statusBody)
+	}
 	leaseBody := statusBody["terminalWorkareaLease"].(map[string]any)
-	if leaseBody["workareaId"] != "wa_1" || leaseBody["workareaPath"] != nil {
+	if leaseBody["workareaId"] != "wa_11111111111111111111111111111111" || leaseBody["workareaPath"] != nil || len(leaseBody) != 4 {
 		t.Fatalf("lease body = %#v", leaseBody)
 	}
 	if completionBody["terminalWorkareaLease"] != nil {
