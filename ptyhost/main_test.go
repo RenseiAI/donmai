@@ -32,7 +32,11 @@ func TestMain(m *testing.M) {
 // answered both correctly on the PTY master (§12: the host VT is the terminal-
 // query responder). Any failure exits non-zero.
 func cprChild() {
-	fd := fdToInt(os.Stdin.Fd())
+	fd, err := fdToInt(os.Stdin.Fd())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "file descriptor:", err)
+		os.Exit(3)
+	}
 	if _, err := term.MakeRaw(fd); err != nil {
 		fmt.Fprintln(os.Stderr, "makeraw:", err)
 		os.Exit(3)

@@ -13,7 +13,11 @@ import (
 // setting. Returns attachwire.EchoUnknown (0xFF) if the ioctl fails, biasing
 // predictive echo to SUPPRESSED (§10).
 func echoModeOfFd(fd uintptr) uint8 {
-	t, err := unix.IoctlGetTermios(int(fd), unix.TIOCGETA)
+	intFD, err := fdToInt(fd)
+	if err != nil {
+		return attachwire.EchoUnknown
+	}
+	t, err := unix.IoctlGetTermios(intFD, unix.TIOCGETA)
 	if err != nil {
 		return attachwire.EchoUnknown
 	}

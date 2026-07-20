@@ -238,19 +238,61 @@ Linux archives are not code-signed and receive a provenance sidecar explaining
 that fact.
 
 A `.tar.gz` archive cannot carry a stapled notarization ticket. Gatekeeper
-checks the accepted notarization ticket online when the binary first runs. Do
-not use `stapler validate` as an acceptance check for these release archives.
+checks the accepted notarization ticket online when a quarantined binary first
+runs. Do not use `stapler validate` as an acceptance check for these release
+archives.
 
-After extracting a Darwin release archive, verify it with:
+After extracting a Darwin release archive, verify its signature independently:
 
 ```bash
 codesign --verify --verbose=2 ./donmai
 codesign -dvvv ./donmai 2>&1 | grep '^Authority='
-spctl --assess --verbose ./donmai
 ```
 
-Expected evidence includes a Developer ID Application authority and
-`source=Notarized Developer ID`.
+Expected evidence includes a Developer ID Application authority. The release
+job's successful `notarytool submit --wait` result remains the direct
+notarization record.
+
+Exercise Gatekeeper with the same quarantined first-launch path a user gets from
+a browser download:
+
+1. Download the Darwin archive from the GitHub release in Safari or another
+   quarantine-aware browser, then extract it with Archive Utility. `gh release
+   download` and `curl` normally do not attach the quarantine metadata, so they
+   are useful for checksum verification but do not exercise Gatekeeper.
+2. Confirm the extracted binary still has quarantine metadata. If the chosen
+   browser or extractor did not propagate it, add equivalent test metadata
+   explicitly before installation:
+
+   ```bash
+   xattr -p com.apple.quarantine ./donmai || \
+     xattr -w com.apple.quarantine \
+       "0081;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" ./donmai
+   ```
+
+3. Move the binary into a clean versioned install directory without removing
+   that attribute, confirm it is still present, and launch it. Do not use
+   `xattr -d`, Finder's **Open Anyway**, or a prior allow decision for this copy.
+
+   ```bash
+   install_dir="$HOME/.local/libexec/donmai-${tag#v}"
+   mkdir -p "$install_dir"
+   mv ./donmai "$install_dir/donmai"
+   xattr -p com.apple.quarantine "$install_dir/donmai"
+   "$install_dir/donmai" --version
+   ```
+
+A successful first launch with network access is the consumer-side Gatekeeper
+check for this bare CLI artifact. Repeat with a freshly downloaded copy when
+retesting; Gatekeeper can remember a prior decision.
+
+`spctl --assess --type execute --verbose=4 "$install_dir/donmai"` is useful
+supplementary diagnostics, but it is not the acceptance gate. On current macOS
+versions, `spctl` can reject a valid signed and notarized bare Mach-O executable
+because it is not an app bundle, installer package, or disk image. If it does
+accept the binary, `source=Notarized Developer ID` is useful corroborating
+evidence; a bare-CLI rejection does not override successful `codesign`, the
+accepted `notarytool` submission, and the quarantined first launch.
 
 ## Smoke-test checklist
 
@@ -265,7 +307,7 @@ Run on at least one supported macOS host and one Linux environment:
 [ ] donmai linear --help renders usage
 [ ] donmai dashboard --help renders usage
 [ ] checksums.txt verifies all downloaded archives
-[ ] Darwin binary passes codesign and spctl checks
+[ ] Darwin binary passes codesign and a fresh quarantined first launch
 [ ] Homebrew cask installs the same version and SHA-256 values
 [ ] Versioned GHCR worker image exists
 [ ] E2B target donmai-worker:vX.Y.Z exists for the release build
