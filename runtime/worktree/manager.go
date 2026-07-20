@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -137,6 +138,9 @@ func defaultEnvRunner(ctx context.Context, extraEnv []string, name string, args 
 type ProvisionResult struct {
 	// Path is the absolute worktree path on disk.
 	Path string
+	// WorkareaID is generated for this acquisition and is never reused merely
+	// because a later acquisition occupies the same filesystem path.
+	WorkareaID string
 	// Strategy is the strategy that succeeded.
 	Strategy CloneStrategy
 	// ParentRepoPath is the parent clone used by StrategyWorktreeAdd.
@@ -334,8 +338,13 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 
 		err := m.provisionOnce(ctx, dst, spec)
 		if err == nil {
+			workareaID, identityErr := workarea.NewWorkareaID()
+			if identityErr != nil {
+				return "", identityErr
+			}
 			res := &ProvisionResult{
 				Path:           dst,
+				WorkareaID:     workareaID,
 				Strategy:       spec.Strategy,
 				ParentRepoPath: parentRepoPath,
 				Attempts:       attempts,
@@ -409,8 +418,8 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 }
 
 // AcquireTerminalLease persists a provider-neutral lease for a workarea already
-// owned by the session. WorkareaID is an opaque stable identity derived from the
-// exact local path; the path itself remains only in durable local state.
+// owned by the session. WorkareaID is an opaque acquisition-scoped identity; the
+// exact local path remains only in durable local state.
 func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.AcquireSpec) (*workarea.TerminalLease, error) {
 	unlock := m.lockSession(spec.SessionID)
 	defer unlock()
@@ -421,17 +430,13 @@ func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.Acquir
 	if res == nil {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownSession, spec.SessionID)
 	}
-	workareaID, err := workarea.IDForPath(res.Path)
-	if err != nil {
-		return nil, err
-	}
 	if spec.WorkareaPath == "" {
 		spec.WorkareaPath = res.Path
 	}
 	if spec.WorkareaID == "" {
-		spec.WorkareaID = workareaID
+		spec.WorkareaID = res.WorkareaID
 	}
-	if spec.WorkareaPath != res.Path || spec.WorkareaID != workareaID {
+	if spec.WorkareaPath != res.Path || spec.WorkareaID != res.WorkareaID {
 		return nil, fmt.Errorf("%w: terminal lease must retain the manager-owned workarea", workarea.ErrLeaseConflict)
 	}
 	metadata := make(map[string]string, len(spec.ReleaseMetadata)+2)
@@ -439,6 +444,9 @@ func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.Acquir
 		metadata[key] = value
 	}
 	metadata["strategy"] = strconv.Itoa(int(res.Strategy))
+	if spec.ReleaseDisposition == "" {
+		spec.ReleaseDisposition = "destroy"
+	}
 	if res.ParentRepoPath != "" {
 		metadata["parentRepoPath"] = res.ParentRepoPath
 	}
@@ -457,34 +465,52 @@ func (m *Manager) TerminalLease(leaseID string) (*workarea.TerminalLease, error)
 }
 
 // ClaimTerminalLeaseExecution durably binds one invocation/claim pair as the
-// exclusive workarea-backed verifier for a lease.
-func (m *Manager) ClaimTerminalLeaseExecution(ctx context.Context, claim workarea.ExecutionClaimSpec) (*workarea.TerminalLease, error) {
+// exclusive workarea-backed verifier for a lease and returns the committed
+// transaction clock sample as claimNowMs operation metadata.
+func (m *Manager) ClaimTerminalLeaseExecution(ctx context.Context, claim workarea.ExecutionClaimSpec) (*workarea.ExecutionClaimResult, error) {
 	return m.leases.ClaimExecution(ctx, claim)
 }
 
-// MarkTerminalResultObserved records durable receiver observation after the
-// initial terminal status post succeeds.
-func (m *Manager) MarkTerminalResultObserved(ctx context.Context, leaseID, sessionID, terminalResultID, workareaID string) (*workarea.TerminalLease, error) {
-	return m.leases.MarkTerminalResultObserved(ctx, leaseID, sessionID, terminalResultID, workareaID)
+// SaveTerminalStatus persists the immutable complete terminal-status body using
+// a compare-and-set against the authoritative lease expiry.
+func (m *Manager) SaveTerminalStatus(ctx context.Context, spec workarea.TerminalStatusSaveSpec) (*workarea.TerminalLease, error) {
+	return m.leases.SaveTerminalStatus(ctx, spec)
+}
+
+// RegisterTerminalReceiver implements the documented terminal-workarea contract.
+func (m *Manager) RegisterTerminalReceiver(receiverKey, endpoint string) error {
+	return m.leases.RegisterReceiver(receiverKey, endpoint)
+}
+
+// TerminalStatusHTTPSender implements the documented terminal-workarea contract.
+func (m *Manager) TerminalStatusHTTPSender(client *http.Client, auth workarea.ReceiverAuthorizationResolver) workarea.TerminalStatusSender {
+	return m.leases.TerminalStatusHTTPSender(client, auth)
+}
+
+// MarkTerminalStatusDelivered records transport acceptance without granting
+// acknowledgement-path release authority.
+func (m *Manager) MarkTerminalStatusDelivered(ctx context.Context, leaseID, sessionID, terminalResultID, workareaID string) (*workarea.TerminalLease, error) {
+	return m.leases.MarkTerminalStatusDelivered(ctx, leaseID, sessionID, terminalResultID, workareaID)
 }
 
 // ReplayTerminalResults performs one bounded durable outbox recovery pass.
-func (m *Manager) ReplayTerminalResults(ctx context.Context, batch int, attemptTimeout time.Duration, poster workarea.TerminalResultPoster) (int, error) {
-	return m.leases.ReplayTerminalResults(ctx, batch, attemptTimeout, poster)
+func (m *Manager) ReplayTerminalResults(ctx context.Context, batch int, attemptTimeout time.Duration, sender workarea.TerminalStatusSender) (int, error) {
+	return m.leases.ReplayTerminalResults(ctx, batch, attemptTimeout, sender)
 }
 
 // RunTerminalResultReplayer runs durable terminal status recovery until ctx is
-// cancelled. Embedders should wire the same receiver used for initial posting.
-func (m *Manager) RunTerminalResultReplayer(ctx context.Context, opts workarea.TerminalResultReplayOptions, poster workarea.TerminalResultPoster) {
-	m.leases.RunTerminalResultReplayer(ctx, opts, poster)
+// cancelled. The sender must resolve the stored receiver key on every attempt.
+func (m *Manager) RunTerminalResultReplayer(ctx context.Context, opts workarea.TerminalResultReplayOptions, sender workarea.TerminalStatusSender) {
+	m.leases.RunTerminalResultReplayer(ctx, opts, sender)
 }
 
-// AcknowledgeTerminalResult consumes explicit semantic acknowledgement and
-// invokes the manager's deferred ordinary teardown policy.
-func (m *Manager) AcknowledgeTerminalResult(ctx context.Context, ack workarea.TerminalResultAcknowledgement) (*workarea.TerminalLease, error) {
+// AcknowledgeTerminalResult atomically stores the exact acknowledgement outcome
+// and active -> release-pending transition. Provider disposition remains a
+// separate at-least-once reaper operation.
+func (m *Manager) AcknowledgeTerminalResult(ctx context.Context, ack workarea.TerminalResultAcknowledgement) (*workarea.TerminalAcknowledgementOutcome, error) {
 	unlock := m.lockSession(ack.SessionID)
 	defer unlock()
-	return m.leases.Acknowledge(ctx, ack, m.releaseLeasedWorkareaUnlocked)
+	return m.leases.Acknowledge(ctx, ack)
 }
 
 // ReapExpiredTerminalLeases performs one bounded reaper pass. Failures stay
@@ -499,16 +525,34 @@ func (m *Manager) RunTerminalLeaseReaper(ctx context.Context, opts workarea.Reap
 	m.leases.RunReaper(ctx, opts, m.releaseLeasedWorkarea)
 }
 
+// CleanupTerminalQuarantines destroys quarantined leaves only; it never applies
+// an ordinary return-to-pool or archive disposition.
+func (m *Manager) CleanupTerminalQuarantines(ctx context.Context, opts workarea.SchedulerOptions) (int, error) {
+	return m.leases.CleanupQuarantines(ctx, opts, func(_ context.Context, item workarea.TerminalWorkareaQuarantine) error {
+		return os.RemoveAll(item.WorkareaPath)
+	})
+}
+
 func (m *Manager) releaseLeasedWorkarea(ctx context.Context, lease workarea.TerminalLease) error {
-	// The lease store already holds the per-result/workarea lock while invoking
-	// this callback. Do not take the manager's session lock here: Acquire/Teardown
-	// take session then lease locks, so the reverse order would deadlock an
-	// acknowledgement or reaper racing those operations. release-pending durable
-	// state keeps Provision/Teardown fail-closed during provider disposition.
+	// The lease store persists release-pending before invoking this callback and
+	// does not hold its per-result/workarea locks during provider disposition.
+	// Avoid the manager's session lock so independent teardown can proceed while
+	// durable lease state keeps this exact path unavailable.
 	return m.releaseLeasedWorkareaUnlocked(ctx, lease)
 }
 
 func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease workarea.TerminalLease) error {
+	if lease.ReleaseDisposition == "archive" {
+		m.mu.Lock()
+		if current := m.sessions[lease.SessionID]; current != nil && current.Path == lease.WorkareaPath {
+			delete(m.sessions, lease.SessionID)
+		}
+		m.mu.Unlock()
+		return nil
+	}
+	if lease.ReleaseDisposition != "destroy" {
+		return fmt.Errorf("runtime/worktree: unsupported leased release disposition %q", lease.ReleaseDisposition)
+	}
 	strategyValue, err := strconv.Atoi(lease.ReleaseMetadata["strategy"])
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: decode leased release strategy: %w", err)
@@ -688,31 +732,11 @@ func (m *Manager) runGit(ctx context.Context, repoURL string, args ...string) ([
 }
 
 func (m *Manager) retainedPath(path string) (bool, error) {
-	workareaID, err := workarea.IDForPath(path)
-	if err != nil {
-		return false, err
-	}
-	retained, err := m.leases.Retained(workareaID)
-	if err != nil || retained {
-		return retained, err
-	}
-	// Compatibility with lease records created by the unreleased path-id
-	// candidate before opaque workarea identities were introduced.
-	return m.leases.Retained(path)
+	return m.leases.RetainedPath(path)
 }
 
 func (m *Manager) requestReleasePath(ctx context.Context, path string) (bool, error) {
-	workareaID, err := workarea.IDForPath(path)
-	if err != nil {
-		return false, err
-	}
-	retained, err := m.leases.RequestRelease(ctx, workareaID)
-	if err != nil || retained {
-		return retained, err
-	}
-	// Compatibility with lease records created by the unreleased path-id
-	// candidate before opaque workarea identities were introduced.
-	return m.leases.RequestRelease(ctx, path)
+	return m.leases.RequestReleasePath(ctx, path)
 }
 
 // cleanupConflict tries to remove a stale worktree entry left by a prior failed
