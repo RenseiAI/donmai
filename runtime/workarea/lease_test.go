@@ -1,10 +1,11 @@
 package workarea_test
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -14,8 +15,19 @@ import (
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
-// Preserve the task-#78 public source shape for downstream unkeyed literals.
-var _ = workarea.StoreOptions{"", nil}
+const (
+	sessionA    = "11111111-1111-4111-8111-111111111111"
+	sessionB    = "22222222-2222-4222-8222-222222222222"
+	invocationA = "33333333-3333-4333-8333-333333333333"
+	invocationB = "44444444-4444-4444-8444-444444444444"
+	claimA      = "55555555-5555-4555-8555-555555555555"
+	claimB      = "66666666-6666-4666-8666-666666666666"
+	resultA     = "tr_11111111111111111111111111111111"
+	resultB     = "tr_22222222222222222222222222222222"
+	workareaA   = "wa_11111111111111111111111111111111"
+	workareaB   = "wa_22222222222222222222222222222222"
+	receiverA   = "rcv_11111111111111111111111111111111"
+)
 
 type testClock struct {
 	mu  sync.Mutex
@@ -32,685 +44,522 @@ func (c *testClock) Now() time.Time {
 	return c.now
 }
 
-func (c *testClock) Advance(d time.Duration) {
+func (c *testClock) Set(now time.Time) {
 	c.mu.Lock()
-	c.now = c.now.Add(d)
+	c.now = now
 	c.mu.Unlock()
 }
 
-func testPolicy() workarea.LeasePolicy {
-	return workarea.LeasePolicy{
-		SettlementBudget: time.Minute,
-		SafetyMargin:     time.Second,
-		LeaseDuration:    2 * time.Minute,
-		MaxLeaseDuration: 5 * time.Minute,
-	}
-}
+func (c *testClock) Advance(delta time.Duration) { c.Set(c.Now().Add(delta)) }
 
-func acquireSpec(sessionID, resultID, workareaID string) workarea.AcquireSpec {
+func acquireSpec(root, sessionID, resultID, workareaID string) workarea.AcquireSpec {
 	return workarea.AcquireSpec{
-		SessionID:        sessionID,
-		TerminalResultID: resultID,
-		WorkareaID:       workareaID,
-		WorkareaPath:     filepath.Join("/tmp", workareaID),
-		Policy:           testPolicy(),
+		SessionID: sessionID, TerminalResultID: resultID, WorkareaID: workareaID,
+		WorkareaPath: filepath.Join(root, workareaID), Policy: workarea.DefaultLeasePolicy(),
+		ReleaseRequested: true, ReleaseDisposition: "destroy",
 	}
 }
 
-func claimLease(t *testing.T, store *workarea.LeaseStore, lease *workarea.TerminalLease, invocationID, claimID string) {
-	t.Helper()
-	if _, err := store.ClaimExecution(context.Background(), workarea.ExecutionClaimSpec{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		InvocationID:     invocationID,
-		ClaimID:          claimID,
-	}); err != nil {
-		t.Fatalf("ClaimExecution: %v", err)
+func claimSpec(lease *workarea.TerminalLease, invocationID, claimID string) workarea.ExecutionClaimSpec {
+	return workarea.ExecutionClaimSpec{
+		LeaseID: lease.LeaseID, SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID,
+		WorkareaID: lease.WorkareaID, InvocationID: invocationID, ClaimID: claimID,
 	}
 }
 
 func acknowledgement(lease *workarea.TerminalLease, invocationID, claimID string) workarea.TerminalResultAcknowledgement {
 	return workarea.TerminalResultAcknowledgement{
-		SchemaVersion:    workarea.TerminalLeaseAcknowledgementSchemaV1,
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		InvocationID:     invocationID,
-		ClaimID:          claimID,
-		Acknowledged:     true,
+		SchemaVersion: workarea.TerminalLeaseAcknowledgementSchemaV1, Acknowledged: true,
+		InvocationID: invocationID, ClaimID: claimID, LeaseID: lease.LeaseID,
+		SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID, WorkareaID: lease.WorkareaID,
 	}
 }
 
-func TestLeaseAcquireIsDurableAndIdempotent(t *testing.T) {
+func TestLeaseAcquireIsDurableInvariantCompleteAndExclusive(t *testing.T) {
 	t.Parallel()
 	clock := newTestClock()
-	dir := t.TempDir()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: dir, Now: clock.Now})
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases"), Now: clock.Now})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	first, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
+	spec := acquireSpec(root, sessionA, resultA, workareaA)
+	first, err := store.Acquire(context.Background(), spec)
 	if err != nil {
-		t.Fatalf("Acquire: %v", err)
+		t.Fatal(err)
 	}
-	second, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
+	second, err := store.Acquire(context.Background(), spec)
 	if err != nil {
-		t.Fatalf("Acquire replay: %v", err)
+		t.Fatal(err)
 	}
 	if first.LeaseID != second.LeaseID || !first.AcquiredAt.Equal(second.AcquiredAt) {
 		t.Fatalf("idempotent acquire changed lease: first=%+v second=%+v", first, second)
 	}
-
-	reopened, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: dir, Now: clock.Now})
-	if err != nil {
-		t.Fatalf("reopen store: %v", err)
+	changed := spec
+	changed.WorkareaPath = filepath.Join(root, "other")
+	if _, err := store.Acquire(context.Background(), changed); !errors.Is(err, workarea.ErrLeaseConflict) {
+		t.Fatalf("changed invariant error = %v", err)
 	}
-	recovered, err := reopened.Get(first.LeaseID)
-	if err != nil {
-		t.Fatalf("recover lease: %v", err)
+	competing := acquireSpec(root, sessionB, resultB, workareaA)
+	if _, err := store.Acquire(context.Background(), competing); !errors.Is(err, workarea.ErrWorkareaLeased) {
+		t.Fatalf("competing workarea error = %v", err)
 	}
-	if recovered.State != workarea.LeaseActive || recovered.WorkareaID != "workarea-1" {
-		t.Fatalf("recovered lease = %+v", recovered)
-	}
-}
-
-func TestLeaseSameWorkareaExcludesRacingSession(t *testing.T) {
-	t.Parallel()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir()})
+	reopened, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: store.Dir(), Now: clock.Now})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if retained, err := reopened.RetainedPath(spec.WorkareaPath); err != nil || !retained {
+		t.Fatalf("retained path=%v err=%v", retained, err)
+	}
+}
 
+func TestClaimUsesStrictBoundaryAndReturnsCommittedClockSample(t *testing.T) {
+	t.Parallel()
+	run := func(t *testing.T, remainingMS int64, wantAccepted bool) {
+		t.Helper()
+		clock := newTestClock()
+		root := t.TempDir()
+		store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases"), Now: clock.Now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock.Set(time.UnixMilli(lease.ExpiresAt.UnixMilli() - remainingMS).UTC())
+		got, err := store.ClaimExecution(context.Background(), claimSpec(lease, invocationA, claimA))
+		if !wantAccepted {
+			if !errors.Is(err, workarea.ErrInsufficientLeaseTime) {
+				t.Fatalf("remaining=%d error=%v", remainingMS, err)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ClaimNowMS != got.Claim.ClaimedAt.UnixMilli() || got.ClaimNowMS != clock.Now().UnixMilli() {
+			t.Fatalf("claim clock mismatch: %+v clock=%d", got, clock.Now().UnixMilli())
+		}
+		replayed, err := store.ClaimExecution(context.Background(), claimSpec(lease, invocationA, claimA))
+		if err != nil || replayed.ClaimNowMS != got.ClaimNowMS {
+			t.Fatalf("idempotent claim = %+v err=%v", replayed, err)
+		}
+	}
+	t.Run("1037000 rejected", func(t *testing.T) { run(t, 1_037_000, false) })
+	t.Run("1037001 accepted", func(t *testing.T) { run(t, 1_037_001, true) })
+}
+
+func TestQueueAdmissionUsesStrictOneMillisecondBoundary(t *testing.T) {
+	t.Parallel()
+	run := func(t *testing.T, remainingMS int64, wantAccepted bool) {
+		t.Helper()
+		clock := newTestClock()
+		root := t.TempDir()
+		store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases"), Now: clock.Now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock.Set(time.UnixMilli(lease.ExpiresAt.UnixMilli() - remainingMS).UTC())
+		_, err = store.CheckQueueAdmission(context.Background(), lease.LeaseID, lease.SessionID, lease.TerminalResultID, lease.WorkareaID)
+		if wantAccepted && err != nil {
+			t.Fatal(err)
+		}
+		if !wantAccepted && !errors.Is(err, workarea.ErrInsufficientLeaseTime) {
+			t.Fatalf("remaining=%d error=%v", remainingMS, err)
+		}
+	}
+	t.Run("1097000 rejected", func(t *testing.T) { run(t, 1_097_000, false) })
+	t.Run("1097001 accepted", func(t *testing.T) { run(t, 1_097_001, true) })
+}
+
+func TestClaimIsExclusiveAndCanonicalIdentityBound(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
+	if err != nil {
+		t.Fatal(err)
+	}
 	start := make(chan struct{})
-	results := make(chan error, 2)
-	for _, spec := range []workarea.AcquireSpec{
-		acquireSpec("session-1", "result-1", "shared-workarea"),
-		acquireSpec("session-2", "result-2", "shared-workarea"),
-	} {
+	errs := make(chan error, 2)
+	for _, spec := range []workarea.ExecutionClaimSpec{claimSpec(lease, invocationA, claimA), claimSpec(lease, invocationB, claimB)} {
 		spec := spec
 		go func() {
 			<-start
-			_, acquireErr := store.Acquire(context.Background(), spec)
-			results <- acquireErr
+			_, err := store.ClaimExecution(context.Background(), spec)
+			errs <- err
 		}()
 	}
 	close(start)
-
-	var acquired, excluded int
-	for i := 0; i < 2; i++ {
-		err := <-results
+	var accepted, conflicted int
+	for range 2 {
+		err := <-errs
 		switch {
 		case err == nil:
-			acquired++
-		case errors.Is(err, workarea.ErrWorkareaLeased):
-			excluded++
+			accepted++
+		case errors.Is(err, workarea.ErrLeaseExecutionClaimed):
+			conflicted++
 		default:
-			t.Fatalf("Acquire error = %v", err)
+			t.Fatalf("claim error = %v", err)
 		}
 	}
-	if acquired != 1 || excluded != 1 {
-		t.Fatalf("acquired=%d excluded=%d, want 1/1", acquired, excluded)
+	if accepted != 1 || conflicted != 1 {
+		t.Fatalf("accepted=%d conflicted=%d", accepted, conflicted)
 	}
 }
 
-func TestLeaseReleaseRequiresMatchingSemanticAcknowledgementAndIsIdempotent(t *testing.T) {
+func TestRenewalAndBodySaveUseCASAndBodyFreezesExpiry(t *testing.T) {
 	t.Parallel()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir()})
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
+	lease, err := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
 	if err != nil {
 		t.Fatal(err)
-	}
-	if retained, err := store.RequestRelease(context.Background(), lease.WorkareaID); err != nil || !retained {
-		t.Fatalf("RequestRelease retained=%v err=%v", retained, err)
-	}
-
-	claimLease(t, store, lease, "invocation-1", "claim-1")
-	var releases atomic.Int32
-	releaser := func(context.Context, workarea.TerminalLease) error {
-		releases.Add(1)
-		return nil
-	}
-	missingSchema := acknowledgement(lease, "invocation-1", "claim-1")
-	missingSchema.SchemaVersion = ""
-	if _, err := store.Acknowledge(context.Background(), missingSchema, releaser); err == nil {
-		t.Fatal("missing acknowledgement schema was accepted")
-	}
-
-	bad := acknowledgement(lease, "invocation-1", "claim-1")
-	bad.TerminalResultID = "different-result"
-	if _, err := store.Acknowledge(context.Background(), bad, releaser); !errors.Is(err, workarea.ErrLeaseConflict) {
-		t.Fatalf("mismatched acknowledgement error = %v, want ErrLeaseConflict", err)
-	}
-	if releases.Load() != 0 {
-		t.Fatal("mismatched acknowledgement invoked release")
-	}
-
-	ack := acknowledgement(lease, "invocation-1", "claim-1")
-	for i := 0; i < 2; i++ {
-		released, err := store.Acknowledge(context.Background(), ack, releaser)
-		if err != nil {
-			t.Fatalf("Acknowledge %d: %v", i+1, err)
-		}
-		if released.State != workarea.LeaseReleased {
-			t.Fatalf("Acknowledge %d state = %q", i+1, released.State)
-		}
-	}
-	if releases.Load() != 1 {
-		t.Fatalf("release calls = %d, want 1", releases.Load())
-	}
-}
-
-func TestLeaseAcknowledgementPersistsReleasePendingBeforeDisposition(t *testing.T) {
-	t.Parallel()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	claimLease(t, store, lease, "invocation-1", "claim-1")
-
-	ack := acknowledgement(lease, "invocation-1", "claim-1")
-	released, err := store.Acknowledge(context.Background(), ack, func(_ context.Context, pending workarea.TerminalLease) error {
-		if pending.State != workarea.LeaseReleasePending || pending.AcknowledgedAt == nil {
-			t.Fatalf("callback lease = %+v, want acknowledged release-pending", pending)
-		}
-		durable, getErr := store.Get(lease.LeaseID)
-		if getErr != nil {
-			return getErr
-		}
-		if durable.State != workarea.LeaseReleasePending || durable.AcknowledgedAt == nil {
-			t.Fatalf("durable lease during release = %+v", durable)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("Acknowledge: %v", err)
-	}
-	if released.State != workarea.LeaseReleased || released.ReleasedAt == nil {
-		t.Fatalf("released lease = %+v", released)
-	}
-}
-
-func TestConcurrentAcknowledgementReleasesOnce(t *testing.T) {
-	t.Parallel()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	claimLease(t, store, lease, "invocation-1", "claim-1")
-	ack := acknowledgement(lease, "invocation-1", "claim-1")
-
-	var releases atomic.Int32
-	releaseStarted := make(chan struct{})
-	allowRelease := make(chan struct{})
-	releaser := func(context.Context, workarea.TerminalLease) error {
-		if releases.Add(1) == 1 {
-			close(releaseStarted)
-		}
-		<-allowRelease
-		return nil
-	}
-	errs := make(chan error, 2)
-	go func() {
-		_, releaseErr := store.Acknowledge(context.Background(), ack, releaser)
-		errs <- releaseErr
-	}()
-	<-releaseStarted
-	go func() {
-		_, releaseErr := store.Acknowledge(context.Background(), ack, releaser)
-		errs <- releaseErr
-	}()
-	close(allowRelease)
-	for i := 0; i < 2; i++ {
-		if err := <-errs; err != nil {
-			t.Fatalf("Acknowledge %d: %v", i+1, err)
-		}
-	}
-	if releases.Load() != 1 {
-		t.Fatalf("release calls = %d, want 1", releases.Load())
-	}
-}
-
-func TestLeaseExecutionClaimIsExclusiveAndAcknowledgementIdentityBound(t *testing.T) {
-	t.Parallel()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	type claimResult struct {
-		invocationID string
-		claimID      string
-		err          error
 	}
 	start := make(chan struct{})
-	results := make(chan claimResult, 2)
-	for _, identity := range [][2]string{{"invocation-a", "claim-a"}, {"invocation-b", "claim-b"}} {
-		identity := identity
-		go func() {
-			<-start
-			_, claimErr := store.ClaimExecution(context.Background(), workarea.ExecutionClaimSpec{
-				LeaseID:          lease.LeaseID,
-				SessionID:        lease.SessionID,
-				TerminalResultID: lease.TerminalResultID,
-				WorkareaID:       lease.WorkareaID,
-				InvocationID:     identity[0],
-				ClaimID:          identity[1],
-			})
-			results <- claimResult{invocationID: identity[0], claimID: identity[1], err: claimErr}
-		}()
-	}
-	close(start)
-
-	var winner, loser claimResult
-	for i := 0; i < 2; i++ {
-		result := <-results
-		switch {
-		case result.err == nil:
-			winner = result
-		case errors.Is(result.err, workarea.ErrLeaseExecutionClaimed):
-			loser = result
-		default:
-			t.Fatalf("ClaimExecution: %v", result.err)
-		}
-	}
-	if winner.invocationID == "" || loser.invocationID == "" {
-		t.Fatalf("winner=%+v loser=%+v", winner, loser)
-	}
-	recovered, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: store.Dir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := recovered.ClaimExecution(context.Background(), workarea.ExecutionClaimSpec{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		InvocationID:     winner.invocationID,
-		ClaimID:          winner.claimID,
-	}); err != nil {
-		t.Fatalf("recovered idempotent claim: %v", err)
-	}
-
-	var releases atomic.Int32
-	releaser := func(context.Context, workarea.TerminalLease) error {
-		releases.Add(1)
-		return nil
-	}
-	if _, err := recovered.Acknowledge(context.Background(), acknowledgement(lease, loser.invocationID, loser.claimID), releaser); !errors.Is(err, workarea.ErrLeaseExecutionConflict) {
-		t.Fatalf("losing acknowledgement error = %v", err)
-	}
-	if releases.Load() != 0 {
-		t.Fatal("losing verifier released the lease")
-	}
-	if _, err := recovered.Acknowledge(context.Background(), acknowledgement(lease, winner.invocationID, winner.claimID), releaser); err != nil {
-		t.Fatalf("winning acknowledgement: %v", err)
-	}
-	if releases.Load() != 1 {
-		t.Fatalf("release calls = %d, want 1", releases.Load())
-	}
-	if _, err := recovered.Acknowledge(context.Background(), acknowledgement(lease, loser.invocationID, loser.claimID), releaser); !errors.Is(err, workarea.ErrLeaseExecutionConflict) {
-		t.Fatalf("wrong duplicate acknowledgement error = %v", err)
-	}
-	if releases.Load() != 1 {
-		t.Fatalf("wrong duplicate acknowledgement repeated release: %d", releases.Load())
-	}
-}
-
-func TestTerminalResultOutboxReplaysAfterRestart(t *testing.T) {
-	t.Parallel()
-	clock := newTestClock()
-	dir := t.TempDir()
-	spec := acquireSpec("session-1", "result-1", "workarea-1")
-	spec.TerminalResultPayload = []byte(`{"status":"completed"}`)
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: dir, Now: clock.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := store.Acquire(context.Background(), spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lease.TerminalResultPost == nil || lease.TerminalResultPost.State != workarea.TerminalResultPostPending {
-		t.Fatalf("outbox was not acquired atomically: %+v", lease.TerminalResultPost)
-	}
-
-	recovered, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: dir, Now: clock.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := recovered.Acquire(context.Background(), spec); err != nil {
-		t.Fatalf("idempotent outbox acquire after restart: %v", err)
-	}
-	var calls atomic.Int32
-	considered, err := recovered.ReplayTerminalResults(context.Background(), 1, time.Second, func(_ context.Context, got workarea.TerminalLease, payload json.RawMessage) error {
-		calls.Add(1)
-		var compact bytes.Buffer
-		if compactErr := json.Compact(&compact, payload); compactErr != nil {
-			return compactErr
-		}
-		if got.LeaseID != lease.LeaseID || compact.String() != string(spec.TerminalResultPayload) {
-			return errors.New("replayed terminal result identity or payload differs")
-		}
-		return nil
-	})
-	if err != nil || considered != 1 || calls.Load() != 1 {
-		t.Fatalf("ReplayTerminalResults considered=%d calls=%d err=%v", considered, calls.Load(), err)
-	}
-	observed, err := recovered.Get(lease.LeaseID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if observed.TerminalResultPost.State != workarea.TerminalResultPostObserved || observed.TerminalResultPost.ObservedAt == nil {
-		t.Fatalf("observed outbox = %+v", observed.TerminalResultPost)
-	}
-}
-
-func TestTerminalResultOutboxExpiresWithoutReplay(t *testing.T) {
-	t.Parallel()
-	clock := newTestClock()
-	spec := acquireSpec("session-1", "result-1", "workarea-1")
-	spec.TerminalResultPayload = []byte(`{"status":"completed"}`)
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir(), Now: clock.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := store.Acquire(context.Background(), spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(3 * time.Minute)
-	considered, err := store.ReplayTerminalResults(context.Background(), 1, time.Second, func(context.Context, workarea.TerminalLease, json.RawMessage) error {
-		t.Fatal("expired terminal result was replayed")
-		return nil
-	})
-	if err != nil || considered != 1 {
-		t.Fatalf("ReplayTerminalResults considered=%d err=%v", considered, err)
-	}
-	expired, err := store.Get(lease.LeaseID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if expired.TerminalResultPost.State != workarea.TerminalResultPostExpired || expired.TerminalResultPost.ExpiredAt == nil {
-		t.Fatalf("expired outbox = %+v", expired.TerminalResultPost)
-	}
-}
-
-func TestExpiredExecutionClaimCannotAcknowledgeAndReaperReclaims(t *testing.T) {
-	t.Parallel()
-	clock := newTestClock()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir(), Now: clock.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	claimLease(t, store, lease, "invocation-1", "claim-1")
-	clock.Advance(3 * time.Minute)
-	var releases atomic.Int32
-	releaser := func(context.Context, workarea.TerminalLease) error {
-		releases.Add(1)
-		return nil
-	}
-	if _, err := store.Acknowledge(context.Background(), acknowledgement(lease, "invocation-1", "claim-1"), releaser); !errors.Is(err, workarea.ErrLeaseExpired) {
-		t.Fatalf("expired acknowledgement error = %v", err)
-	}
-	if releases.Load() != 0 {
-		t.Fatal("expired acknowledgement released workarea")
-	}
-	considered, err := store.ReapExpired(context.Background(), 1, time.Second, releaser)
-	if err != nil || considered != 1 || releases.Load() != 1 {
-		t.Fatalf("ReapExpired considered=%d releases=%d err=%v", considered, releases.Load(), err)
-	}
-}
-
-func TestLeaseRenewHonorsAbsoluteMaximum(t *testing.T) {
-	t.Parallel()
-	clock := newTestClock()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir(), Now: clock.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(time.Minute)
-	renewed, err := store.Renew(context.Background(), workarea.RenewSpec{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		Duration:         2 * time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("Renew: %v", err)
-	}
-	if !renewed.ExpiresAt.Equal(clock.Now().Add(2 * time.Minute)) {
-		t.Fatalf("renewed expiry = %s", renewed.ExpiresAt)
-	}
-	_, err = store.Renew(context.Background(), workarea.RenewSpec{
-		LeaseID:          lease.LeaseID,
-		SessionID:        lease.SessionID,
-		TerminalResultID: lease.TerminalResultID,
-		WorkareaID:       lease.WorkareaID,
-		Duration:         5 * time.Minute,
-	})
-	if err == nil {
-		t.Fatal("renewal beyond max expiry succeeded")
-	}
-}
-
-func TestExpiredLeaseReaperReleasesAfterCrashBeforeTeardownRequest(t *testing.T) {
-	t.Parallel()
-	clock := newTestClock()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir(), Now: clock.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	clock.Advance(3 * time.Minute)
-
-	var releases atomic.Int32
-	considered, err := store.ReapExpired(context.Background(), 1, time.Second, func(context.Context, workarea.TerminalLease) error {
-		releases.Add(1)
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("ReapExpired: %v", err)
-	}
-	if considered != 1 || releases.Load() != 1 {
-		t.Fatalf("considered=%d releases=%d, want 1/1", considered, releases.Load())
-	}
-	reaped, err := store.Get(lease.LeaseID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reaped.State != workarea.LeaseReleased || reaped.AcknowledgedAt != nil {
-		t.Fatalf("reaped lease = %+v", reaped)
-	}
-}
-
-func TestReleaseFailureStaysUnavailableForRetry(t *testing.T) {
-	t.Parallel()
-	clock := newTestClock()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir(), Now: clock.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := store.Acquire(context.Background(), acquireSpec("session-1", "result-1", "workarea-1"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = store.RequestRelease(context.Background(), lease.WorkareaID)
-	clock.Advance(3 * time.Minute)
-
-	wantErr := errors.New("provider unavailable")
-	if _, err := store.ReapExpired(context.Background(), 1, time.Second, func(context.Context, workarea.TerminalLease) error {
-		return wantErr
-	}); !errors.Is(err, wantErr) {
-		t.Fatalf("ReapExpired error = %v, want provider error", err)
-	}
-	failed, err := store.Get(lease.LeaseID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if failed.State != workarea.LeaseReleasePending || !failed.RetainsWorkarea() || failed.LastReleaseError == "" || failed.NextReleaseAttempt == nil {
-		t.Fatalf("failed release did not remain unavailable with bounded retry: %+v", failed)
-	}
-	considered, err := store.ReapExpired(context.Background(), 1, time.Second, func(context.Context, workarea.TerminalLease) error {
-		t.Fatal("reaper retried before backoff elapsed")
-		return nil
-	})
-	if err != nil || considered != 0 {
-		t.Fatalf("backoff pass considered=%d err=%v", considered, err)
-	}
-}
-
-func TestFailedReapDoesNotStarveAnotherExpiredWorkarea(t *testing.T) {
-	t.Parallel()
-	clock := newTestClock()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir(), Now: clock.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	first, err := store.Acquire(context.Background(), acquireSpec("session-a", "result-a", "workarea-a"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := store.Acquire(context.Background(), acquireSpec("session-b", "result-b", "workarea-b"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second.LeaseID < first.LeaseID {
-		first, second = second, first
-	}
-	clock.Advance(3 * time.Minute)
-
-	providerErr := errors.New("provider unavailable")
-	if _, err := store.ReapExpired(context.Background(), 1, time.Second, func(_ context.Context, lease workarea.TerminalLease) error {
-		if lease.LeaseID == first.LeaseID {
-			return providerErr
-		}
-		return nil
-	}); !errors.Is(err, providerErr) {
-		t.Fatalf("first ReapExpired error = %v, want provider error", err)
-	}
-	considered, err := store.ReapExpired(context.Background(), 1, time.Second, func(_ context.Context, lease workarea.TerminalLease) error {
-		if lease.LeaseID != second.LeaseID {
-			t.Fatalf("second pass retried %s before untouched %s", lease.LeaseID, second.LeaseID)
-		}
-		return nil
-	})
-	if err != nil || considered != 1 {
-		t.Fatalf("second ReapExpired considered=%d err=%v", considered, err)
-	}
-	released, err := store.Get(second.LeaseID)
-	if err != nil || released.State != workarea.LeaseReleased {
-		t.Fatalf("second lease = %+v err=%v", released, err)
-	}
-}
-
-func TestReapExpiredStartsBatchReleaseAttemptsConcurrently(t *testing.T) {
-	t.Parallel()
-	clock := newTestClock()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir(), Now: clock.Now})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range []string{"a", "b"} {
-		lease, acquireErr := store.Acquire(context.Background(), acquireSpec("session-"+id, "result-"+id, "workarea-"+id))
-		if acquireErr != nil {
-			t.Fatal(acquireErr)
-		}
-		if retained, releaseErr := store.RequestRelease(context.Background(), lease.WorkareaID); releaseErr != nil || !retained {
-			t.Fatalf("RequestRelease %s retained=%v err=%v", id, retained, releaseErr)
-		}
-	}
-	clock.Advance(3 * time.Minute)
-
-	allStarted := make(chan struct{})
-	var started atomic.Int32
-	var timedOutBeforePeer atomic.Bool
-	considered, err := store.ReapExpired(context.Background(), 2, 2*time.Second, func(ctx context.Context, _ workarea.TerminalLease) error {
-		if started.Add(1) == 2 {
-			close(allStarted)
-		}
-		select {
-		case <-allStarted:
-			return nil
-		case <-ctx.Done():
-			timedOutBeforePeer.Store(true)
-			return ctx.Err()
-		}
-	})
-	if err != nil {
-		t.Fatalf("ReapExpired: %v", err)
-	}
-	if considered != 2 || started.Load() != 2 {
-		t.Fatalf("considered=%d started=%d", considered, started.Load())
-	}
-	if timedOutBeforePeer.Load() {
-		t.Fatal("reaper ran provider attempts sequentially")
-	}
-}
-
-func TestDifferentWorkareasRemainParallelDuringRelease(t *testing.T) {
-	t.Parallel()
-	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	leaseA, err := store.Acquire(context.Background(), acquireSpec("session-a", "result-a", "workarea-a"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = store.RequestRelease(context.Background(), leaseA.WorkareaID)
-	claimLease(t, store, leaseA, "invocation-a", "claim-a")
-
-	releaseStarted := make(chan struct{})
-	allowRelease := make(chan struct{})
-	done := make(chan error, 1)
+	results := make(chan error, 2)
 	go func() {
-		_, releaseErr := store.Acknowledge(context.Background(), acknowledgement(leaseA, "invocation-a", "claim-a"), func(context.Context, workarea.TerminalLease) error {
-			close(releaseStarted)
-			<-allowRelease
-			return nil
+		<-start
+		_, err := store.Renew(context.Background(), workarea.RenewSpec{
+			LeaseID: lease.LeaseID, SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID,
+			WorkareaID: lease.WorkareaID, Extension: time.Minute,
 		})
-		done <- releaseErr
+		results <- err
 	}()
-	<-releaseStarted
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if _, err := store.Acquire(ctx, acquireSpec("session-b", "result-b", "workarea-b")); err != nil {
-		t.Fatalf("independent Acquire blocked by another workarea release: %v", err)
+	go func() {
+		<-start
+		_, err := store.SaveTerminalStatus(context.Background(), workarea.TerminalStatusSaveSpec{
+			LeaseID: lease.LeaseID, SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID,
+			WorkareaID: lease.WorkareaID, ReceiverKey: receiverA, Body: []byte(`{"status":"completed"}`),
+			ExpectedExpiresAt: lease.ExpiresAt,
+		})
+		results <- err
+	}()
+	close(start)
+	var success, conflict int
+	for range 2 {
+		err := <-results
+		if err == nil {
+			success++
+		} else if errors.Is(err, workarea.ErrLeaseConflict) || errors.Is(err, workarea.ErrRenewalAfterBodySave) {
+			conflict++
+		} else {
+			t.Fatalf("race error = %v", err)
+		}
 	}
-	close(allowRelease)
-	if err := <-done; err != nil {
-		t.Fatalf("release A: %v", err)
+	if success != 1 || conflict != 1 {
+		t.Fatalf("success=%d conflict=%d", success, conflict)
+	}
+	persisted, err := store.Get(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.TerminalStatus != nil {
+		if _, err := store.Renew(context.Background(), workarea.RenewSpec{
+			LeaseID: lease.LeaseID, SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID,
+			WorkareaID: lease.WorkareaID, Extension: time.Minute,
+		}); !errors.Is(err, workarea.ErrRenewalAfterBodySave) {
+			t.Fatalf("renew after body save error = %v", err)
+		}
+	} else if !persisted.ExpiresAt.Equal(lease.ExpiresAt.Add(time.Minute)) {
+		t.Fatalf("renewal did not extend from prior expiry: %s", persisted.ExpiresAt)
+	}
+}
+
+func TestOutboxRetainsImmutableBytesAndReceiverAffinityAcrossRestart(t *testing.T) {
+	t.Parallel()
+	clock := newTestClock()
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases"), Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"workerId":"immutable-worker","terminalWorkareaLease":{"leaseId":"` + lease.LeaseID + `"}}`)
+	if _, err := store.SaveTerminalStatus(context.Background(), workarea.TerminalStatusSaveSpec{
+		LeaseID: lease.LeaseID, SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID,
+		WorkareaID: lease.WorkareaID, ReceiverKey: receiverA, Body: body, ExpectedExpiresAt: lease.ExpiresAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: store.Dir(), Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotKey string
+	var gotBody []byte
+	considered, err := reopened.ReplayTerminalResults(context.Background(), 1, time.Second, func(_ context.Context, key string, replay []byte) error {
+		gotKey = key
+		gotBody = append([]byte(nil), replay...)
+		return nil
+	})
+	if err != nil || considered != 1 {
+		t.Fatalf("replay considered=%d err=%v", considered, err)
+	}
+	if gotKey != receiverA || string(gotBody) != string(body) {
+		t.Fatalf("replay key=%q body=%q", gotKey, gotBody)
+	}
+	persisted, err := reopened.Get(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.TerminalStatus.DeliveryState != workarea.TerminalStatusDelivered {
+		t.Fatalf("delivery state = %s", persisted.TerminalStatus.DeliveryState)
+	}
+}
+
+func TestReceiverRotationPreservesAffinityAndMissingKeyNeverFallsBack(t *testing.T) {
+	t.Parallel()
+	var firstCalls atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer first.Close()
+	var secondCalls atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer second.Close()
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegisterReceiver(receiverA, first.URL); err != nil {
+		t.Fatal(err)
+	}
+	sender := store.TerminalStatusHTTPSender(first.Client(), nil)
+	if err := sender(context.Background(), receiverA, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegisterReceiver(receiverA, second.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender(context.Background(), receiverA, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if firstCalls.Load() != 1 || secondCalls.Load() != 1 {
+		t.Fatalf("receiver calls first=%d second=%d", firstCalls.Load(), secondCalls.Load())
+	}
+	missing := "rcv_99999999999999999999999999999999"
+	if err := sender(context.Background(), missing, []byte(`{}`)); err == nil {
+		t.Fatal("missing receiver key fell back")
+	}
+	if secondCalls.Load() != 1 {
+		t.Fatal("missing receiver key used configured fallback")
+	}
+}
+
+func TestNonSemanticAcknowledgementCannotAuthorizeRelease(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimExecution(context.Background(), claimSpec(lease, invocationA, claimA)); err != nil {
+		t.Fatal(err)
+	}
+	ack := acknowledgement(lease, invocationA, claimA)
+	ack.Acknowledged = false
+	if _, err := store.Acknowledge(context.Background(), ack); !errors.Is(err, workarea.ErrAcknowledgementRequired) {
+		t.Fatalf("non-semantic acknowledgement error = %v", err)
+	}
+	persisted, err := store.Get(lease.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != workarea.LeaseActive || len(persisted.AcknowledgementBytes) != 0 {
+		t.Fatalf("non-semantic acknowledgement changed lease: %+v", persisted)
+	}
+}
+
+func TestAcknowledgementOutcomesAreDurableAndReleaseIsSeparate(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing, err := store.Acknowledge(context.Background(), acknowledgement(lease, invocationA, claimA))
+	if err != nil || missing.Outcome != workarea.AcknowledgementRejected || *missing.Reason != workarea.AcknowledgementClaimMissing {
+		t.Fatalf("missing claim outcome=%+v err=%v", missing, err)
+	}
+	if _, err := store.ClaimExecution(context.Background(), claimSpec(lease, invocationA, claimA)); err != nil {
+		t.Fatal(err)
+	}
+	bad := acknowledgement(lease, invocationB, claimB)
+	mismatch, err := store.Acknowledge(context.Background(), bad)
+	if err != nil || mismatch.Outcome != workarea.AcknowledgementRejected || *mismatch.Reason != workarea.AcknowledgementIdentityMismatch {
+		t.Fatalf("mismatch outcome=%+v err=%v", mismatch, err)
+	}
+	ack := acknowledgement(lease, invocationA, claimA)
+	applied, err := store.Acknowledge(context.Background(), ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.Outcome != workarea.AcknowledgementApplied || applied.LeaseState != workarea.LeaseReleasePending || applied.ProviderReleaseComplete {
+		t.Fatalf("applied outcome=%+v", applied)
+	}
+	persisted, err := store.Get(lease.LeaseID)
+	if err != nil || persisted.State != workarea.LeaseReleasePending {
+		t.Fatalf("durable state=%+v err=%v", persisted, err)
+	}
+	duplicate, err := store.Acknowledge(context.Background(), ack)
+	if err != nil || duplicate.Outcome != workarea.AcknowledgementAlreadyApplied {
+		t.Fatalf("duplicate outcome=%+v err=%v", duplicate, err)
+	}
+	var releases atomic.Int32
+	considered, err := store.ReapExpired(context.Background(), 1, time.Second, func(context.Context, workarea.TerminalLease) error {
+		releases.Add(1)
+		return nil
+	})
+	if err != nil || considered != 1 || releases.Load() != 1 {
+		t.Fatalf("release considered=%d calls=%d err=%v", considered, releases.Load(), err)
+	}
+	completed, _ := store.Get(lease.LeaseID)
+	if completed.State != workarea.LeaseReleased || completed.AcknowledgementOutcome == nil || !completed.AcknowledgementOutcome.ProviderReleaseComplete {
+		t.Fatalf("completed lease=%+v", completed)
+	}
+}
+
+func TestExpiryAndRepeatedProviderReleaseRemainFailClosed(t *testing.T) {
+	t.Parallel()
+	clock := newTestClock()
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases"), Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(workarea.DefaultLeaseDuration + time.Millisecond)
+	providerErr := errors.New("provider unavailable")
+	if _, err := store.ReapExpired(context.Background(), 1, time.Second, func(context.Context, workarea.TerminalLease) error { return providerErr }); !errors.Is(err, providerErr) {
+		t.Fatalf("first release error=%v", err)
+	}
+	pending, _ := store.Get(lease.LeaseID)
+	if pending.State != workarea.LeaseReleasePending || pending.ReleaseReason != "expiry" || pending.NextReleaseAttempt == nil {
+		t.Fatalf("pending lease=%+v", pending)
+	}
+	if retained, err := store.Retained(workareaA); err != nil || !retained {
+		t.Fatalf("retained=%v err=%v", retained, err)
+	}
+	clock.Set(*pending.NextReleaseAttempt)
+	var calls atomic.Int32
+	if _, err := store.ReapExpired(context.Background(), 1, time.Second, func(context.Context, workarea.TerminalLease) error {
+		calls.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("retry calls=%d", calls.Load())
+	}
+}
+
+func TestLogicalClockClampsRollbackAndForwardJumpReaps(t *testing.T) {
+	t.Parallel()
+	clock := newTestClock()
+	root := t.TempDir()
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: filepath.Join(root, "leases"), Now: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(10 * time.Minute)
+	claim, err := store.ClaimExecution(context.Background(), claimSpec(lease, invocationA, claimA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Set(clock.Now().Add(-5 * time.Minute))
+	if _, err := store.Renew(context.Background(), workarea.RenewSpec{
+		LeaseID: lease.LeaseID, SessionID: lease.SessionID, TerminalResultID: lease.TerminalResultID,
+		WorkareaID: lease.WorkareaID, Extension: time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	persisted, _ := store.Get(lease.LeaseID)
+	if persisted.ClockHighWatermarkMS < claim.ClaimNowMS {
+		t.Fatalf("clock rolled back: %d < %d", persisted.ClockHighWatermarkMS, claim.ClaimNowMS)
+	}
+	clock.Set(lease.MaxExpiresAt.Add(time.Hour))
+	if _, err := store.ReapExpired(context.Background(), 1, time.Second, func(context.Context, workarea.TerminalLease) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	released, _ := store.Get(lease.LeaseID)
+	if released.State != workarea.LeaseReleased {
+		t.Fatalf("forward jump did not reap: %s", released.State)
+	}
+}
+
+func TestLeaseWriteFailureRetainsQuarantineAndFailsRootClosed(t *testing.T) {
+	root := t.TempDir()
+	leaseDir := filepath.Join(root, "leases")
+	store, err := workarea.NewLeaseStore(workarea.StoreOptions{Dir: leaseDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(leaseDir, "records")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(leaseDir, "records"), []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, acquireErr := store.Acquire(context.Background(), acquireSpec(root, sessionA, resultA, workareaA))
+	if !errors.Is(acquireErr, workarea.ErrProviderRootUnready) {
+		t.Fatalf("acquire error=%v", acquireErr)
+	}
+	items, err := store.Quarantines()
+	if err != nil || len(items) != 1 || items[0].State != workarea.QuarantineQuarantined {
+		t.Fatalf("quarantine=%+v err=%v acquireErr=%v", items, err, acquireErr)
+	}
+	if _, err := store.Acquire(context.Background(), acquireSpec(root, sessionB, resultB, workareaB)); !errors.Is(err, workarea.ErrProviderRootUnready) {
+		t.Fatalf("second acquire error=%v", err)
+	}
+}
+
+func TestNewWorkareaIdentityChangesAfterDestruction(t *testing.T) {
+	t.Parallel()
+	first, err := workarea.NewWorkareaID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := workarea.NewWorkareaID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("acquisition identities reused: %s", first)
 	}
 }
