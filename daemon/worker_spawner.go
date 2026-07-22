@@ -130,13 +130,26 @@ const (
 	SessionEventEnded   SessionEventKind = "ended"
 )
 
-// pumpDrainGrace bounds how long the session reaper waits for the stdout/
-// stderr pump goroutines to reach EOF before calling cmd.Wait (which closes
-// the pipes and discards anything still buffered). Normally-exiting children
-// close their pipe ends on exit, so the pumps finish in microseconds and the
-// grace never elapses; it only fires when a grandchild inherited a pipe end
-// and outlived the worker.
+// pumpDrainGrace bounds the post-exit interval during which the session reaper
+// lets stdout/stderr pumps drain naturally. It is armed only after cmd.Wait has
+// observed the direct child exit and a descendant may still hold an inherited
+// write end; an ordinary running worker never owns this deadline.
 const pumpDrainGrace = 10 * time.Second
+
+// pumpDrainTimer is the minimal stoppable timer the terminal pump-drain path
+// needs. Keeping it narrow lets lifecycle tests advance the deadline without
+// waiting for wall-clock time.
+type pumpDrainTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+type realPumpDrainTimer struct {
+	timer *time.Timer
+}
+
+func (t *realPumpDrainTimer) C() <-chan time.Time { return t.timer.C }
+func (t *realPumpDrainTimer) Stop() bool          { return t.timer.Stop() }
 
 // WorkerSpawner manages the lifecycle of worker child processes.
 type WorkerSpawner struct {
@@ -154,6 +167,13 @@ type WorkerSpawner struct {
 	killProcessGroup       func(*exec.Cmd) error
 	waitProcessGroup       func(*exec.Cmd, time.Duration) processGroupWaitResult
 	startCommand           func(*exec.Cmd) error
+
+	// These per-spawner lifecycle seams are nil in production. Tests inject a
+	// controllable drain timer and synchronize at the running and fully-joined
+	// pump boundaries without waiting for a wall-clock deadline.
+	pumpDrainTimerFactory func(time.Duration) pumpDrainTimer
+	reaperRunning         func()
+	afterPumpsJoined      func()
 
 	// drainBeforeContextSnapshot is a deterministic test seam for the narrow
 	// deadline edge where the final owner clears the last entry while DrainContext
@@ -197,6 +217,9 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 		killProcessGroup:       killSessionProcessGroup,
 		waitProcessGroup:       waitSessionProcessGroup,
 		startCommand:           func(cmd *exec.Cmd) error { return cmd.Start() },
+		pumpDrainTimerFactory: func(d time.Duration) pumpDrainTimer {
+			return &realPumpDrainTimer{timer: time.NewTimer(d)}
+		},
 	}
 }
 
@@ -675,6 +698,32 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		"DONMAI_PROJECT_ID":    project.ID,
 	})
 
+	// The daemon, rather than os/exec, owns these read ends. That lets a waiter
+	// observe direct-child exit without closing a pump mid-buffer, while still
+	// allowing the terminal reaper to close inherited-pipe readers on deadline.
+	// Create them before OnPreSpawn so a setup failure occurs before the hook can
+	// acquire resources whose rollback ownership it would transfer.
+	stdout, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("create worker stdout pipe: %w", err)
+	}
+	stderr, stderrWriter, err := os.Pipe()
+	if err != nil {
+		_ = stdout.Close()
+		_ = stdoutWriter.Close()
+		cancel()
+		return nil, fmt.Errorf("create worker stderr pipe: %w", err)
+	}
+	closeWorkerPipes := func() {
+		_ = stdout.Close()
+		_ = stdoutWriter.Close()
+		_ = stderr.Close()
+		_ = stderrWriter.Close()
+	}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
+
 	// OnPreSpawn is the extension point for callers that need to compute
 	// per-session env entries (e.g., credentials resolved at spawn time)
 	// the static BaseEnv map cannot express. It runs after composeEnv so
@@ -688,6 +737,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	if s.opts.OnPreSpawn != nil {
 		next, hookErr := s.opts.OnPreSpawn(spec, cmd.Env)
 		if hookErr != nil {
+			closeWorkerPipes()
 			cancel()
 			return nil, fmt.Errorf("pre-spawn hook: %w", hookErr)
 		}
@@ -697,10 +747,8 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		}
 	}
 
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
-
 	if err := s.startCommand(cmd); err != nil {
+		closeWorkerPipes()
 		cancel()
 		startErr := fmt.Errorf("start worker: %w", err)
 		if preSpawnOwnsCleanup && s.opts.OnSpawnAborted != nil {
@@ -708,6 +756,10 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		}
 		return nil, startErr
 	}
+	// Child-side duplicates are now installed. Keeping either daemon write end
+	// open would prevent EOF after the worker exits, so release both immediately.
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
 
 	pid := 0
 	if cmd.Process != nil {
@@ -748,60 +800,127 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	reservationTransferred = true
 	s.mu.Unlock()
 
-	// Stream stdout / stderr with worker-tagged prefix. Pump completion is
-	// tracked because os/exec's Wait CLOSES the pipe read ends: reaping
-	// before the pumps hit EOF silently discards buffered, not-yet-read
-	// child output (a loaded CI runner lost the child's only stderr record
-	// that way — 2026-07-06, run 28822266352).
-	var pumps sync.WaitGroup
-	pumps.Add(2)
-	go func() {
-		defer pumps.Done()
-		if s.opts.StdoutPrefixWriter != nil {
-			pumpLines(stdout, spec.SessionID, s.opts.StdoutPrefixWriter)
-		} else {
-			drain(stdout)
-		}
-	}()
-	go func() {
-		defer pumps.Done()
-		if s.opts.StderrPrefixWriter != nil {
-			pumpLines(stderr, spec.SessionID, s.opts.StderrPrefixWriter)
-		} else {
-			drain(stderr)
-		}
-	}()
+	// Stream stdout / stderr with worker-tagged prefix. The daemon owns the read
+	// ends, so cmd.Wait can observe direct-child exit without closing a pump and
+	// discarding buffered output. Each completion fits in this buffered channel
+	// while the direct child is still running; no bridge goroutine is needed.
+	pumpDone := make(chan struct{}, 2)
+	pump := func(reader *os.File, writer PrefixedWriter) {
+		go func() {
+			defer func() {
+				_ = reader.Close()
+				pumpDone <- struct{}{}
+			}()
+			if writer != nil {
+				pumpLines(reader, spec.SessionID, writer)
+				return
+			}
+			drain(reader)
+		}()
+	}
+	pump(stdout, s.opts.StdoutPrefixWriter)
+	pump(stderr, s.opts.StderrPrefixWriter)
+
+	// Wait observes only direct-process termination. Terminal classification,
+	// process-group cleanup, event delivery, and SessionID release remain owned
+	// by the reaper below.
+	waitResult := make(chan error, 1)
+	go func() { waitResult <- cmd.Wait() }()
 
 	s.emit(SessionEvent{Kind: SessionEventStarted, Handle: handle, Spec: spec})
 
 	go func() {
-		// Give the pumps a bounded grace to reach EOF before reaping. For a
-		// normally exiting child the pipe write ends close on exit and both
-		// pumps finish in microseconds, so this preserves every buffered
-		// line. The ceiling keeps the reaper hang-resistant in the
-		// degenerate case where a grandchild inherited a pipe end and
-		// outlives the worker — there we accept the pre-existing tail loss
-		// rather than never reaping the session.
-		pumpsDone := make(chan struct{})
-		go func() { pumps.Wait(); close(pumpsDone) }()
+		// This seam marks the running phase only after both pumps and the direct
+		// waiter are installed. Production leaves it nil.
+		if s.reaperRunning != nil {
+			s.reaperRunning()
+		}
+
+		pumpsRemaining := 2
 		cancelled := false
-		select {
-		case <-pumpsDone:
-		case <-ctx.Done():
-			// Cancellation has already sent SIGTERM under the exact session
-			// lock. Give the complete group its cooperative window before a
-			// TERM-ignoring tree is escalated to SIGKILL.
+		ctxDone := ctx.Done()
+		handleCancellation := func() {
+			// Cancellation has already sent SIGTERM under the exact session lock.
+			// Give the complete group its cooperative window before a TERM-ignoring
+			// tree is escalated to SIGKILL, whether the leader is still running or
+			// is in its terminal output-drain phase.
 			cancelled = true
+			ctxDone = nil
 			if outcome := s.waitProcessGroup(cmd, sessionTerminationGrace); outcome != processGroupGone {
 				s.forceKillGeneration(ss)
 			}
-		case <-time.After(pumpDrainGrace):
-			// A naturally exited leader can leave a descendant holding a pipe.
-			// There was no cooperative stop request in this path, so reclaim the
-			// dedicated group directly rather than retaining terminal capacity.
-			s.forceKillGeneration(ss)
 		}
-		err := cmd.Wait()
+
+		// A running worker has no output-drain deadline. Pump completion merely
+		// records that a stream reached EOF; direct-child termination is the only
+		// transition that can begin terminal cleanup.
+		var err error
+		for directChildRunning := true; directChildRunning; {
+			select {
+			case err = <-waitResult:
+				directChildRunning = false
+			case <-ctxDone:
+				handleCancellation()
+			case <-pumpDone:
+				pumpsRemaining--
+			}
+		}
+
+		// Account for EOF notifications that arrived concurrently with cmd.Wait
+		// before deciding whether a terminal drain timer is needed.
+	drainCompletedPumps:
+		for pumpsRemaining > 0 {
+			select {
+			case <-pumpDone:
+				pumpsRemaining--
+			default:
+				break drainCompletedPumps
+			}
+		}
+
+		if pumpsRemaining > 0 {
+			timerFactory := s.pumpDrainTimerFactory
+			if timerFactory == nil {
+				timerFactory = func(d time.Duration) pumpDrainTimer {
+					return &realPumpDrainTimer{timer: time.NewTimer(d)}
+				}
+			}
+			timer := timerFactory(pumpDrainGrace)
+			for pumpsRemaining > 0 {
+				select {
+				case <-pumpDone:
+					pumpsRemaining--
+				case <-ctxDone:
+					handleCancellation()
+				case <-timer.C():
+					// The leader has already exited, so reclaim a surviving group
+					// without rewriting an exit-0 session as an operator termination.
+					if killErr := s.reapRemainingProcessGroup(ss); killErr != nil && !errors.Is(killErr, errSessionProcessExited) {
+						slog.Warn("worker process group cleanup signal failed", "sessionId", spec.SessionID, "err", killErr)
+					}
+					// Descendants can retain inherited write ends after the group
+					// signal races with their exit. Closing daemon-owned reads makes
+					// pipe-read pumps finish, then wait synchronously for both.
+					_ = stdout.Close()
+					_ = stderr.Close()
+					for pumpsRemaining > 0 {
+						select {
+						case <-pumpDone:
+							pumpsRemaining--
+						case <-ctxDone:
+							handleCancellation()
+						}
+					}
+				}
+			}
+			_ = timer.Stop()
+		}
+
+		// Both pump completions have been consumed before terminal ownership moves
+		// to process-group cleanup and synchronous Ended delivery.
+		if s.afterPumpsJoined != nil {
+			s.afterPumpsJoined()
+		}
 
 		// cmd.Wait proves only that the direct child exited. If descendants
 		// remain, kill the daemon-owned group now: a normal leader exit must not

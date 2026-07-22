@@ -568,6 +568,180 @@ func TestSpawner_ReapSessionDoesNotDeleteReplacement(t *testing.T) {
 	}
 }
 
+func TestSpawner_PumpDrainLifecycle(t *testing.T) {
+	const repository = "github.com/a/b"
+
+	t.Run("running worker owns no drain grace", func(t *testing.T) {
+		const sessionID = "ordinary-worker"
+		clock := newFakePumpDrainClock()
+		running := make(chan struct{})
+		ended := make(chan SessionEvent, 1)
+		var killCalls atomic.Int32
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "x", Repository: repository}},
+			MaxConcurrentSessions: 1,
+			WorkerCommand:         []string{"sleep", "30"},
+		})
+		s.pumpDrainTimerFactory = clock.newTimer
+		s.reaperRunning = func() { close(running) }
+		s.killProcessGroup = func(cmd *exec.Cmd) error {
+			killCalls.Add(1)
+			return killSessionProcessGroup(cmd)
+		}
+		s.On(func(ev SessionEvent) {
+			if ev.Kind == SessionEventEnded {
+				ended <- ev
+			}
+		})
+		t.Cleanup(func() {
+			s.StopSession(sessionID)
+			_ = s.Drain(time.Second)
+		})
+
+		if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
+			t.Fatalf("AcceptWork: %v", err)
+		}
+		waitSpawnerSignal(t, running, "running reaper state")
+		clock.Advance(2 * pumpDrainGrace)
+
+		if got := clock.TimerCount(); got != 0 {
+			t.Fatalf("pump drain timers while worker is running = %d, want 0", got)
+		}
+		if got := killCalls.Load(); got != 0 {
+			t.Fatalf("process-group KILL calls while worker is running = %d, want 0", got)
+		}
+		s.mu.Lock()
+		ss := s.sessions[sessionID]
+		var (
+			state         SessionState
+			stopRequested bool
+		)
+		if ss != nil {
+			state = ss.handle.State
+			stopRequested = ss.stopRequested
+		}
+		s.mu.Unlock()
+		if ss == nil {
+			t.Fatal("running worker was removed from the session registry")
+		}
+		if state != SessionRunning {
+			t.Fatalf("running worker state = %q, want %q", state, SessionRunning)
+		}
+		if stopRequested {
+			t.Fatal("running worker unexpectedly has stopRequested set")
+		}
+		select {
+		case ev := <-ended:
+			t.Fatalf("running worker emitted Ended event: %+v", ev)
+		default:
+		}
+
+		if !s.StopSession(sessionID) {
+			t.Fatal("StopSession cleanup = false")
+		}
+		cleanupEvent := waitSpawnerEvent(t, ended, "ordinary worker Ended event")
+		if cleanupEvent.Handle.State != SessionTerminated {
+			t.Fatalf("StopSession Ended state = %q, want %q", cleanupEvent.Handle.State, SessionTerminated)
+		}
+		waitForActiveCount(t, s, 0)
+	})
+
+	t.Run("terminal leader with inherited pipe is bounded and joined", func(t *testing.T) {
+		const sessionID = "inherited-pipe"
+		clock := newFakePumpDrainClock()
+		pumpsJoined := make(chan struct{})
+		ended := make(chan SessionEvent, 1)
+		allowEnded := make(chan struct{})
+		listenerReturned := make(chan struct{})
+		var (
+			killCalls  atomic.Int32
+			joinedOnce sync.Once
+			endedOnce  sync.Once
+			release    sync.Once
+		)
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "x", Repository: repository}},
+			MaxConcurrentSessions: 2,
+			WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30 & exit 0"},
+		})
+		s.pumpDrainTimerFactory = clock.newTimer
+		s.afterPumpsJoined = func() { joinedOnce.Do(func() { close(pumpsJoined) }) }
+		s.killProcessGroup = func(cmd *exec.Cmd) error {
+			killCalls.Add(1)
+			return killSessionProcessGroup(cmd)
+		}
+		s.On(func(ev SessionEvent) {
+			if ev.Kind != SessionEventEnded {
+				return
+			}
+			endedOnce.Do(func() {
+				ended <- ev
+				<-allowEnded
+				close(listenerReturned)
+			})
+		})
+		releaseEnded := func() { release.Do(func() { close(allowEnded) }) }
+		t.Cleanup(func() {
+			releaseEnded()
+			s.StopSession(sessionID)
+			_ = s.Drain(time.Second)
+		})
+
+		if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
+			t.Fatalf("AcceptWork: %v", err)
+		}
+		timer := waitPumpDrainTimer(t, clock)
+		if timer.duration != pumpDrainGrace {
+			t.Fatalf("pump drain timer duration = %v, want %v", timer.duration, pumpDrainGrace)
+		}
+		if got := s.ActiveCount(); got != 1 {
+			t.Fatalf("active sessions before pump deadline = %d, want 1", got)
+		}
+		if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err == nil || !strings.Contains(err.Error(), "already active") {
+			t.Fatalf("same SessionID before pump deadline error = %v, want already active", err)
+		}
+		if got := killCalls.Load(); got != 0 {
+			t.Fatalf("process-group KILL calls before pump deadline = %d, want 0", got)
+		}
+		select {
+		case ev := <-ended:
+			t.Fatalf("terminal leader emitted Ended before pump deadline: %+v", ev)
+		default:
+		}
+
+		clock.Advance(2 * pumpDrainGrace)
+		ev := waitSpawnerEvent(t, ended, "bounded inherited-pipe Ended event")
+		select {
+		case <-pumpsJoined:
+		default:
+			t.Fatal("Ended event arrived before both pump completions")
+		}
+		if got := killCalls.Load(); got != 1 {
+			t.Fatalf("remaining-group KILL calls = %d, want 1", got)
+		}
+		if ev.Handle.State != SessionCompleted {
+			t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionCompleted)
+		}
+		if got := s.ActiveCount(); got != 1 {
+			t.Fatalf("active sessions during synchronous Ended listener = %d, want 1", got)
+		}
+		if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err == nil || !strings.Contains(err.Error(), "already active") {
+			t.Fatalf("same SessionID during Ended listener error = %v, want already active", err)
+		}
+
+		releaseEnded()
+		waitSpawnerSignal(t, listenerReturned, "Ended listener return")
+		waitForActiveCount(t, s, 0)
+		if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
+			t.Fatalf("same SessionID after Ended listener return: %v", err)
+		}
+		if !s.StopSession(sessionID) {
+			t.Fatal("StopSession replacement cleanup = false")
+		}
+		waitForActiveCount(t, s, 0)
+	})
+}
+
 func TestSpawner_DrainContextReturnsNilWhenDeadlineRacesFinalRelease(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{})
 	s.mu.Lock()
@@ -802,6 +976,117 @@ func TestSpawner_ActiveWorkareas_DeterministicOrdering(t *testing.T) {
 		if got[i].SessionID != w {
 			t.Errorf("entry %d: want %q, got %q", i, w, got[i].SessionID)
 		}
+	}
+}
+
+// fakePumpDrainClock drives per-spawner pump timers without wall-clock waits.
+// It intentionally implements only the timer behavior the lifecycle owns.
+type fakePumpDrainClock struct {
+	mu      sync.Mutex
+	now     time.Duration
+	timers  []*fakePumpDrainTimer
+	created chan *fakePumpDrainTimer
+}
+
+func newFakePumpDrainClock() *fakePumpDrainClock {
+	return &fakePumpDrainClock{created: make(chan *fakePumpDrainTimer, 4)}
+}
+
+func (c *fakePumpDrainClock) newTimer(duration time.Duration) pumpDrainTimer {
+	c.mu.Lock()
+	timer := &fakePumpDrainTimer{
+		deadline: c.now + duration,
+		duration: duration,
+		ch:       make(chan time.Time, 1),
+	}
+	c.timers = append(c.timers, timer)
+	c.mu.Unlock()
+	c.created <- timer
+	return timer
+}
+
+func (c *fakePumpDrainClock) Advance(elapsed time.Duration) {
+	c.mu.Lock()
+	c.now += elapsed
+	now := c.now
+	timers := append([]*fakePumpDrainTimer(nil), c.timers...)
+	c.mu.Unlock()
+	for _, timer := range timers {
+		timer.fireAt(now)
+	}
+}
+
+func (c *fakePumpDrainClock) TimerCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.timers)
+}
+
+type fakePumpDrainTimer struct {
+	mu       sync.Mutex
+	deadline time.Duration
+	duration time.Duration
+	ch       chan time.Time
+	stopped  bool
+	fired    bool
+}
+
+func (t *fakePumpDrainTimer) C() <-chan time.Time { return t.ch }
+
+func (t *fakePumpDrainTimer) Stop() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.fired {
+		return false
+	}
+	t.stopped = true
+	return true
+}
+
+func (t *fakePumpDrainTimer) fireAt(now time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.fired || now < t.deadline {
+		return
+	}
+	t.fired = true
+	t.ch <- time.Unix(0, int64(now))
+}
+
+func waitPumpDrainTimer(t *testing.T, clock *fakePumpDrainClock) *fakePumpDrainTimer {
+	t.Helper()
+	timer := time.NewTimer(spawnerWaitTimeout)
+	defer timer.Stop()
+	select {
+	case pumpTimer := <-clock.created:
+		return pumpTimer
+	case <-timer.C:
+		t.Fatalf("timed out after %v waiting for pump drain timer", spawnerWaitTimeout)
+		return nil
+	}
+}
+
+func waitSpawnerSignal(t *testing.T, signal <-chan struct{}, what string) {
+	t.Helper()
+	timer := time.NewTimer(spawnerWaitTimeout)
+	defer timer.Stop()
+	select {
+	case <-signal:
+	case <-timer.C:
+		t.Fatalf("timed out after %v waiting for %s", spawnerWaitTimeout, what)
+	}
+}
+
+func waitSpawnerEvent(t *testing.T, events <-chan SessionEvent, what string) SessionEvent {
+	t.Helper()
+	timer := time.NewTimer(spawnerWaitTimeout)
+	defer timer.Stop()
+	select {
+	case event := <-events:
+		return event
+	case <-timer.C:
+		t.Fatalf("timed out after %v waiting for %s", spawnerWaitTimeout, what)
+		return SessionEvent{}
 	}
 }
 
