@@ -46,9 +46,7 @@ func TestSpawner_ForceKillSessionProcessTree(t *testing.T) {
 		t.Fatalf("ForceKillSession: %v", err)
 	}
 	waitSessionEnd(t, ended)
-	if got := s.ActiveCount(); got != 0 {
-		t.Fatalf("ActiveCount = %d, want 0", got)
-	}
+	waitForActiveCount(t, s, 0)
 	// Ended is not delivered until the full daemon-owned group has gone away;
 	// checking the group itself catches a leader-exited descendant surviving the
 	// direct-child cmd.Wait path.

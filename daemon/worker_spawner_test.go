@@ -47,11 +47,9 @@ func TestSpawner_AcceptWork_ProjectAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected accept, got %v", err)
 	}
-	// Wait for the session to exit (stub exits quickly).
+	// Wait for terminal listener delivery and then registry release.
 	waitSessionEnd(t, ended)
-	if s.ActiveCount() != 0 {
-		t.Fatalf("expected sessions to drain, still %d active", s.ActiveCount())
-	}
+	waitForActiveCount(t, s, 0)
 }
 
 // TestSpawner_AcceptWork_MatchesByProjectID covers the case where the
@@ -73,9 +71,7 @@ func TestSpawner_AcceptWork_MatchesByProjectID(t *testing.T) {
 		t.Fatalf("expected accept by project id (slug), got %v", err)
 	}
 	waitSessionEnd(t, ended)
-	if s.ActiveCount() != 0 {
-		t.Fatalf("expected sessions to drain, still %d active", s.ActiveCount())
-	}
+	waitForActiveCount(t, s, 0)
 }
 
 func TestSpawner_RejectsUnknownProject(t *testing.T) {
@@ -667,10 +663,7 @@ func TestSpawner_StopSession_LeavesSiblingsRunning(t *testing.T) {
 		t.Fatal("StopSession(b) = false, want true")
 	}
 	waitSessionEnd(t, ended)
-
-	if s.ActiveCount() != 2 {
-		t.Fatalf("ActiveCount after stopping one = %d, want 2", s.ActiveCount())
-	}
+	waitForActiveCount(t, s, 2)
 	remaining := map[string]bool{}
 	for _, h := range s.ActiveSessions() {
 		remaining[h.SessionID] = true
@@ -895,15 +888,33 @@ func sessionEnds(s *WorkerSpawner) <-chan struct{} {
 	return ch
 }
 
-// waitSessionEnd blocks until one SessionEventEnded arrives on ch. The
-// ended event is emitted after the session is removed from the active
-// set, so ActiveCount has already been decremented when this returns.
+// waitSessionEnd blocks until one SessionEventEnded arrives on ch. Terminal
+// listeners run before the reaper releases the session, so callers that need
+// the post-release registry state must wait for it explicitly.
 func waitSessionEnd(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-ch:
 	case <-time.After(spawnerWaitTimeout):
 		t.Fatalf("timed out after %v waiting for session end", spawnerWaitTimeout)
+	}
+}
+
+func waitForActiveCount(t *testing.T, s *WorkerSpawner, want int) {
+	t.Helper()
+	deadline := time.NewTimer(spawnerWaitTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := s.ActiveCount(); got == want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("ActiveCount = %d after %v, want %d", s.ActiveCount(), spawnerWaitTimeout, want)
+		case <-ticker.C:
+		}
 	}
 }
 
