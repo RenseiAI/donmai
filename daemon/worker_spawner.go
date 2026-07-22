@@ -147,9 +147,11 @@ type WorkerSpawner struct {
 	sessionHistory         map[string]struct{}
 	sessionHistoryOrder    []string
 	accepting              bool
+	spawnReservations      int
 	extraProjects          []ProjectConfig // satellite/additional org projects; never clobbered by SetProjects
 	extraEnabledProjectIDs map[string]struct{}
 	killProcessGroup       func(*exec.Cmd) error
+	startCommand           func(*exec.Cmd) error
 
 	listenersMu sync.Mutex
 	listeners   []func(SessionEvent)
@@ -181,6 +183,7 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 		accepting:              true,
 		extraEnabledProjectIDs: make(map[string]struct{}),
 		killProcessGroup:       killSessionProcessGroup,
+		startCommand:           func(cmd *exec.Cmd) error { return cmd.Start() },
 	}
 }
 
@@ -470,7 +473,7 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 		s.mu.Unlock()
 		return nil, errors.New("not accepting new work (paused or draining)")
 	}
-	if active, capacity := len(s.sessions), s.opts.MaxConcurrentSessions; active >= capacity {
+	if active, capacity := len(s.sessions)+s.spawnReservations, s.opts.MaxConcurrentSessions; active >= capacity {
 		s.mu.Unlock()
 		// Snapshot the counts BEFORE unlocking — formatting them after
 		// release races with spawn.func1's delete on s.sessions when an
@@ -493,6 +496,7 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	if spec.RepositoryID == "" && project.RepositoryID != "" {
 		spec.RepositoryID = project.RepositoryID
 	}
+	s.spawnReservations++
 	s.mu.Unlock()
 
 	return s.spawn(spec, project)
@@ -611,6 +615,16 @@ func matchProject(p *ProjectConfig, repository string) *ProjectConfig {
 }
 
 func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*SessionHandle, error) {
+	reservationTransferred := false
+	defer func() {
+		if reservationTransferred {
+			return
+		}
+		s.mu.Lock()
+		s.spawnReservations--
+		s.mu.Unlock()
+	}()
+
 	command := s.opts.WorkerCommand
 	if len(command) == 0 {
 		// Stub worker — exits 0 immediately. Production code paths
@@ -661,7 +675,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 
-	if err := cmd.Start(); err != nil {
+	if err := s.startCommand(cmd); err != nil {
 		cancel()
 		startErr := fmt.Errorf("start worker: %w", err)
 		if preSpawnOwnsCleanup && s.opts.OnSpawnAborted != nil {
@@ -702,6 +716,8 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	s.mu.Lock()
 	s.sessions[spec.SessionID] = ss
 	s.rememberSessionLocked(spec.SessionID)
+	s.spawnReservations--
+	reservationTransferred = true
 	s.mu.Unlock()
 
 	// Stream stdout / stderr with worker-tagged prefix. Pump completion is
@@ -875,13 +891,14 @@ func (s *WorkerSpawner) rememberSessionLocked(id string) {
 	delete(s.sessionHistory, oldest)
 }
 
-// Drain waits for all in-flight sessions to exit, then resolves. After
-// timeout, remaining sessions receive SIGTERM via context cancellation and
-// the function returns an error indicating how many were forcibly stopped.
+// Drain waits for every admitted spawn to either register or abort and for all
+// in-flight sessions to exit. After timeout, remaining sessions receive SIGTERM
+// via context cancellation. Pre-start reservations cannot be signalled, so a
+// timeout while any remain is explicitly incomplete.
 func (s *WorkerSpawner) Drain(timeout time.Duration) error {
 	s.mu.Lock()
 	s.accepting = false
-	if len(s.sessions) == 0 {
+	if len(s.sessions) == 0 && s.spawnReservations == 0 {
 		s.mu.Unlock()
 		return nil
 	}
@@ -891,9 +908,9 @@ func (s *WorkerSpawner) Drain(timeout time.Duration) error {
 	pollInterval := 100 * time.Millisecond
 	for {
 		s.mu.Lock()
-		n := len(s.sessions)
+		pending := len(s.sessions) + s.spawnReservations
 		s.mu.Unlock()
-		if n == 0 {
+		if pending == 0 {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -902,18 +919,20 @@ func (s *WorkerSpawner) Drain(timeout time.Duration) error {
 		time.Sleep(pollInterval)
 	}
 
-	// Force-stop remaining sessions.
+	// Force-stop registered sessions. Reservations remain owned by their spawn
+	// path until hooks and synchronous abort cleanup finish.
 	s.mu.Lock()
 	stragglers := make([]*spawnedSession, 0, len(s.sessions))
 	for _, ss := range s.sessions {
 		stragglers = append(stragglers, ss)
 	}
+	reservations := s.spawnReservations
 	s.mu.Unlock()
 	for _, ss := range stragglers {
 		ss.cancel()
 	}
-	if len(stragglers) > 0 {
-		return fmt.Errorf("drain timeout — sigterm sent to %d session(s)", len(stragglers))
+	if len(stragglers) > 0 || reservations > 0 {
+		return fmt.Errorf("drain timeout — sigterm sent to %d session(s); %d spawn reservation(s) still pending", len(stragglers), reservations)
 	}
 	return nil
 }

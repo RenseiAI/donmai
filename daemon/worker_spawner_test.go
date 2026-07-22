@@ -257,6 +257,220 @@ func TestSpawner_Drain_RespectsTimeout(t *testing.T) {
 // remove it from the active map (freeing the capacity slot so a new accept
 // at the same cap succeeds), and emit SessionEventEnded — all without
 // disturbing the spawner's accepting state.
+func assertDrainStillBlocked(t *testing.T, done <-chan error, phase string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("Drain returned %s: %v", phase, err)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestSpawner_DrainWaitsForPreSpawnReservation(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn: func(SessionSpec, []string) ([]string, error) {
+			close(entered)
+			<-release
+			return nil, errors.New("pre-spawn stopped")
+		},
+	})
+
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := s.AcceptWork(SessionSpec{SessionID: "reserved", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	<-entered
+
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- s.Drain(time.Second) }()
+	deadline := time.After(time.Second)
+	for s.IsAccepting() {
+		select {
+		case <-deadline:
+			t.Fatal("Drain did not stop new admissions")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	assertDrainStillBlocked(t, drainDone, "while OnPreSpawn was blocked")
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "rejected", Repository: "github.com/a/b"}); err == nil {
+		t.Fatal("AcceptWork succeeded after Drain stopped admissions")
+	}
+
+	close(release)
+	if err := <-acceptDone; err == nil {
+		t.Fatal("blocked AcceptWork unexpectedly succeeded")
+	}
+	if err := <-drainDone; err != nil {
+		t.Fatalf("Drain after pre-spawn abort: %v", err)
+	}
+	s.mu.Lock()
+	reservations := s.spawnReservations
+	s.mu.Unlock()
+	if reservations != 0 {
+		t.Fatalf("spawn reservations = %d, want 0", reservations)
+	}
+}
+
+func TestSpawner_DrainWaitsForHookReturnToStartFailure(t *testing.T) {
+	startEntered := make(chan struct{})
+	releaseStart := make(chan struct{})
+	aborted := make(chan struct{})
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn:            func(_ SessionSpec, env []string) ([]string, error) { return env, nil },
+		OnSpawnAborted:        func(SessionSpec, error) { close(aborted) },
+	})
+	s.startCommand = func(*exec.Cmd) error {
+		close(startEntered)
+		<-releaseStart
+		return errors.New("controlled start failure")
+	}
+
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := s.AcceptWork(SessionSpec{SessionID: "start-gap", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	<-startEntered
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- s.Drain(time.Second) }()
+	assertDrainStillBlocked(t, drainDone, "between hook return and start")
+
+	close(releaseStart)
+	if err := <-acceptDone; err == nil {
+		t.Fatal("AcceptWork unexpectedly succeeded")
+	}
+	select {
+	case <-aborted:
+	case <-time.After(time.Second):
+		t.Fatal("OnSpawnAborted did not run")
+	}
+	if err := <-drainDone; err != nil {
+		t.Fatalf("Drain after start abort: %v", err)
+	}
+}
+
+func TestSpawner_DrainWaitsForChildStartToRegistration(t *testing.T) {
+	childStarted := make(chan struct{})
+	releaseStart := make(chan struct{})
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"sleep", "30"},
+	})
+	s.startCommand = func(cmd *exec.Cmd) error {
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		close(childStarted)
+		<-releaseStart
+		return nil
+	}
+
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := s.AcceptWork(SessionSpec{SessionID: "registration-gap", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	<-childStarted
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- s.Drain(time.Second) }()
+	assertDrainStillBlocked(t, drainDone, "before the started child registered")
+
+	close(releaseStart)
+	if err := <-acceptDone; err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	if got := s.ActiveCount(); got != 1 {
+		t.Fatalf("ActiveCount after registration = %d, want 1", got)
+	}
+	if !s.StopSession("registration-gap") {
+		t.Fatal("StopSession did not remove registered child")
+	}
+	if err := <-drainDone; err != nil {
+		t.Fatalf("Drain after session removal: %v", err)
+	}
+}
+
+func TestSpawner_DrainWaitsForSpawnAbortCleanup(t *testing.T) {
+	abortEntered := make(chan struct{})
+	releaseAbort := make(chan struct{})
+	var events atomic.Int32
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn:            func(_ SessionSpec, env []string) ([]string, error) { return env, nil },
+		OnSpawnAborted: func(SessionSpec, error) {
+			close(abortEntered)
+			<-releaseAbort
+		},
+	})
+	s.startCommand = func(*exec.Cmd) error { return errors.New("controlled start failure") }
+	s.On(func(SessionEvent) { events.Add(1) })
+
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := s.AcceptWork(SessionSpec{SessionID: "abort-cleanup", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	<-abortEntered
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- s.Drain(time.Second) }()
+	assertDrainStillBlocked(t, drainDone, "before OnSpawnAborted cleanup")
+	close(releaseAbort)
+	if err := <-acceptDone; err == nil {
+		t.Fatal("AcceptWork unexpectedly succeeded")
+	}
+	if err := <-drainDone; err != nil {
+		t.Fatalf("Drain after abort cleanup: %v", err)
+	}
+	if got := events.Load(); got != 0 {
+		t.Fatalf("lifecycle events = %d, want 0", got)
+	}
+}
+
+func TestSpawner_ReservationsConsumeCapacityAndHookFailureReleases(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	first := true
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			if first {
+				first = false
+				close(entered)
+				<-release
+				return nil, errors.New("hook failure")
+			}
+			return env, nil
+		},
+	})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := s.AcceptWork(SessionSpec{SessionID: "reserved", Repository: "github.com/a/b"})
+		firstDone <- err
+	}()
+	<-entered
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "over-capacity", Repository: "github.com/a/b"}); err == nil || !strings.Contains(err.Error(), "at capacity") {
+		t.Fatalf("second AcceptWork error = %v, want capacity rejection", err)
+	}
+	close(release)
+	if err := <-firstDone; err == nil {
+		t.Fatal("first AcceptWork unexpectedly succeeded")
+	}
+	if err := s.Drain(time.Second); err != nil {
+		t.Fatalf("Drain after hook failure: %v", err)
+	}
+}
+
 func TestSpawner_StopSession_RemovesSessionAndFreesSlot(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
