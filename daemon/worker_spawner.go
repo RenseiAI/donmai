@@ -147,11 +147,16 @@ type WorkerSpawner struct {
 	sessionHistory         map[string]struct{}
 	sessionHistoryOrder    []string
 	accepting              bool
-	spawnReservations      int
+	spawnReservations      map[string]struct{}
 	extraProjects          []ProjectConfig // satellite/additional org projects; never clobbered by SetProjects
 	extraEnabledProjectIDs map[string]struct{}
 	killProcessGroup       func(*exec.Cmd) error
 	startCommand           func(*exec.Cmd) error
+
+	// drainBeforeContextSnapshot is a deterministic test seam for the narrow
+	// deadline edge where the final owner clears the last entry while DrainContext
+	// is selecting ctx.Done. It is nil in production.
+	drainBeforeContextSnapshot func()
 
 	listenersMu sync.Mutex
 	listeners   []func(SessionEvent)
@@ -179,6 +184,7 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 	return &WorkerSpawner{
 		opts:                   opts,
 		sessions:               make(map[string]*spawnedSession),
+		spawnReservations:      make(map[string]struct{}),
 		sessionHistory:         make(map[string]struct{}),
 		accepting:              true,
 		extraEnabledProjectIDs: make(map[string]struct{}),
@@ -473,7 +479,15 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 		s.mu.Unlock()
 		return nil, errors.New("not accepting new work (paused or draining)")
 	}
-	if active, capacity := len(s.sessions)+s.spawnReservations, s.opts.MaxConcurrentSessions; active >= capacity {
+	if _, active := s.sessions[spec.SessionID]; active {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("session %q is already active", spec.SessionID)
+	}
+	if _, reserved := s.spawnReservations[spec.SessionID]; reserved {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("session %q is already being started", spec.SessionID)
+	}
+	if active, capacity := len(s.sessions)+len(s.spawnReservations), s.opts.MaxConcurrentSessions; active >= capacity {
 		s.mu.Unlock()
 		// Snapshot the counts BEFORE unlocking — formatting them after
 		// release races with spawn.func1's delete on s.sessions when an
@@ -496,7 +510,7 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	if spec.RepositoryID == "" && project.RepositoryID != "" {
 		spec.RepositoryID = project.RepositoryID
 	}
-	s.spawnReservations++
+	s.spawnReservations[spec.SessionID] = struct{}{}
 	s.mu.Unlock()
 
 	return s.spawn(spec, project)
@@ -621,7 +635,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			return
 		}
 		s.mu.Lock()
-		s.spawnReservations--
+		delete(s.spawnReservations, spec.SessionID)
 		s.mu.Unlock()
 	}()
 
@@ -714,9 +728,12 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	}
 
 	s.mu.Lock()
+	// Transfer this exact admission from its pre-spawn reservation to the live
+	// registry under one lock. AcceptWork reserves ids before leaving the lock,
+	// so a duplicate cannot overwrite this session while cmd.Start is in flight.
+	delete(s.spawnReservations, spec.SessionID)
 	s.sessions[spec.SessionID] = ss
 	s.rememberSessionLocked(spec.SessionID)
-	s.spawnReservations--
 	reservationTransferred = true
 	s.mu.Unlock()
 
@@ -762,27 +779,13 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		}
 		err := cmd.Wait()
 
-		s.mu.Lock()
-		entry := s.sessions[spec.SessionID]
-		if entry == nil {
-			s.mu.Unlock()
+		event, reaped := s.reapSession(spec.SessionID, ss, err, ctx.Err() != nil)
+		if !reaped {
 			cancel()
 			return
 		}
-		delete(s.sessions, spec.SessionID)
-		switch {
-		case err == nil:
-			entry.handle.State = SessionCompleted
-		case ctx.Err() != nil:
-			entry.handle.State = SessionTerminated
-		default:
-			entry.handle.State = SessionFailed
-		}
-		final := entry.handle
-		s.mu.Unlock()
-		entry.cancel()
-
-		s.emit(SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: spec, ExitErr: err})
+		ss.cancel()
+		s.emit(event)
 	}()
 
 	return &handle, nil
@@ -877,6 +880,30 @@ func (s *WorkerSpawner) ForceKillSession(id string) error {
 	return nil
 }
 
+// reapSession removes expected from the live registry and builds its terminal
+// event. A reaper must own the exact session it removes: even though admission
+// rejects duplicate IDs, a stale waiter must never be able to delete a newer
+// entry if a caller or future maintenance path replaces an ID.
+func (s *WorkerSpawner) reapSession(id string, expected *spawnedSession, err error, cancelled bool) (SessionEvent, bool) {
+	s.mu.Lock()
+	if s.sessions[id] != expected {
+		s.mu.Unlock()
+		return SessionEvent{}, false
+	}
+	delete(s.sessions, id)
+	switch {
+	case err == nil:
+		expected.handle.State = SessionCompleted
+	case cancelled:
+		expected.handle.State = SessionTerminated
+	default:
+		expected.handle.State = SessionFailed
+	}
+	final := expected.handle
+	s.mu.Unlock()
+	return SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: expected.spec, ExitErr: err}, true
+}
+
 func (s *WorkerSpawner) rememberSessionLocked(id string) {
 	if _, exists := s.sessionHistory[id]; exists {
 		return
@@ -927,7 +954,7 @@ func (s *WorkerSpawner) DrainContext(ctx context.Context) error {
 
 	s.mu.Lock()
 	s.accepting = false
-	if len(s.sessions) == 0 && s.spawnReservations == 0 {
+	if len(s.sessions) == 0 && len(s.spawnReservations) == 0 {
 		s.mu.Unlock()
 		return nil
 	}
@@ -939,7 +966,7 @@ func (s *WorkerSpawner) DrainContext(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		s.mu.Lock()
-		pending := len(s.sessions) + s.spawnReservations
+		pending := len(s.sessions) + len(s.spawnReservations)
 		s.mu.Unlock()
 		if pending == 0 {
 			return nil
@@ -947,15 +974,27 @@ func (s *WorkerSpawner) DrainContext(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
+			// A final locked snapshot is required here: the last owner may have
+			// completed after the optimistic pending check but before this select
+			// chose ctx.Done. Returning an incomplete error in that case would
+			// poison Daemon.Stop's cached result despite a fully drained pool.
+			if s.drainBeforeContextSnapshot != nil {
+				s.drainBeforeContextSnapshot()
+			}
 			s.mu.Lock()
 			stragglers := make([]*spawnedSession, 0, len(s.sessions))
 			for _, ss := range s.sessions {
 				stragglers = append(stragglers, ss)
 			}
+			reservations := len(s.spawnReservations)
+			if len(stragglers) == 0 && reservations == 0 {
+				s.mu.Unlock()
+				return nil
+			}
 			incomplete := &DrainIncompleteError{
 				Cause:             ctx.Err(),
 				ActiveSessions:    len(stragglers),
-				SpawnReservations: s.spawnReservations,
+				SpawnReservations: reservations,
 			}
 			s.mu.Unlock()
 

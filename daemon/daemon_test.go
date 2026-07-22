@@ -144,6 +144,30 @@ func TestRuntimeCredentialsReturnsConsistentSnapshot(t *testing.T) {
 	}
 }
 
+func TestDaemonStopDoesNotCacheIncompleteErrorAfterFinalDeadlineRelease(t *testing.T) {
+	spawner := NewWorkerSpawner(SpawnerOptions{})
+	spawner.mu.Lock()
+	spawner.sessions["last"] = &spawnedSession{handle: SessionHandle{SessionID: "last"}, spec: SessionSpec{SessionID: "last"}}
+	spawner.mu.Unlock()
+	spawner.drainBeforeContextSnapshot = func() {
+		spawner.mu.Lock()
+		delete(spawner.sessions, "last")
+		spawner.mu.Unlock()
+	}
+
+	d := New(Options{})
+	d.spawner = spawner
+	d.setState(StateRunning)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := d.Stop(ctx); err != nil {
+		t.Fatalf("Stop after final release = %v, want nil", err)
+	}
+	if err := d.Stop(context.Background()); err != nil {
+		t.Fatalf("repeated Stop cached error = %v, want nil", err)
+	}
+}
+
 func TestDaemonStopPropagatesReservationAwareDrainError(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})

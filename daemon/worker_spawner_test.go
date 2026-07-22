@@ -311,7 +311,7 @@ func TestSpawner_DrainWaitsForPreSpawnReservation(t *testing.T) {
 		t.Fatalf("Drain after pre-spawn abort: %v", err)
 	}
 	s.mu.Lock()
-	reservations := s.spawnReservations
+	reservations := len(s.spawnReservations)
 	s.mu.Unlock()
 	if reservations != 0 {
 		t.Fatalf("spawn reservations = %d, want 0", reservations)
@@ -511,6 +511,82 @@ func TestSpawner_DrainContextReportsPendingReservation(t *testing.T) {
 	}
 	if err := s.DrainContext(context.Background()); err != nil {
 		t.Fatalf("fresh DrainContext after reservation release: %v", err)
+	}
+}
+
+func TestSpawner_RejectsDuplicateSessionIDsAcrossReservationAndRegistration(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"sleep", "30"},
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			close(entered)
+			<-release
+			return env, nil
+		},
+	})
+	t.Cleanup(func() { _ = s.Drain(time.Second) })
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := s.AcceptWork(SessionSpec{SessionID: "duplicate", Repository: "github.com/a/b"})
+		firstDone <- err
+	}()
+	<-entered
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "duplicate", Repository: "github.com/a/b"}); err == nil || !strings.Contains(err.Error(), "already being started") {
+		t.Fatalf("duplicate reservation error = %v, want already being started", err)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first AcceptWork: %v", err)
+	}
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "duplicate", Repository: "github.com/a/b"}); err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("duplicate active error = %v, want already active", err)
+	}
+	if !s.StopSession("duplicate") {
+		t.Fatal("StopSession did not remove accepted duplicate-id session")
+	}
+	if err := s.Drain(time.Second); err != nil {
+		t.Fatalf("Drain after duplicate-id session stop: %v", err)
+	}
+}
+
+func TestSpawner_ReapSessionDoesNotDeleteReplacement(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{})
+	stale := &spawnedSession{handle: SessionHandle{SessionID: "same"}, spec: SessionSpec{SessionID: "same"}}
+	survivor := &spawnedSession{handle: SessionHandle{SessionID: "same"}, spec: SessionSpec{SessionID: "same"}}
+	s.mu.Lock()
+	s.sessions["same"] = survivor
+	s.mu.Unlock()
+
+	if _, reaped := s.reapSession("same", stale, nil, false); reaped {
+		t.Fatal("stale reaper removed a replacement session")
+	}
+	s.mu.Lock()
+	got := s.sessions["same"]
+	s.mu.Unlock()
+	if got != survivor {
+		t.Fatalf("session after stale reaper = %p, want surviving entry %p", got, survivor)
+	}
+}
+
+func TestSpawner_DrainContextReturnsNilWhenDeadlineRacesFinalRelease(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{})
+	s.mu.Lock()
+	s.sessions["last"] = &spawnedSession{handle: SessionHandle{SessionID: "last"}, spec: SessionSpec{SessionID: "last"}}
+	s.mu.Unlock()
+	s.drainBeforeContextSnapshot = func() {
+		s.mu.Lock()
+		delete(s.sessions, "last")
+		s.mu.Unlock()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.DrainContext(ctx); err != nil {
+		t.Fatalf("DrainContext after final release = %v, want nil", err)
 	}
 }
 
