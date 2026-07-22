@@ -467,6 +467,10 @@ func TestServer_StopEndpointRetainsCompletionOwnerAfterIncompleteDrain(t *testin
 	if d.State() != StateDraining {
 		t.Fatalf("state during incomplete endpoint stop = %q, want draining", d.State())
 	}
+	// The response only proves the goroutine entered Stop. Hold the reservation
+	// past the injected attempt deadline so this test exercises the retry path,
+	// rather than letting the first drain race to a successful completion.
+	time.Sleep(50 * time.Millisecond)
 	select {
 	case <-d.Done():
 		t.Fatal("Done closed while endpoint-owned drain remained incomplete")
