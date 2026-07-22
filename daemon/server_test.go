@@ -532,6 +532,38 @@ func TestServer_Compatibility_Endpoints_Match_Client(t *testing.T) {
 	}
 }
 
+type responseDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	writeDeadline time.Time
+}
+
+func (r *responseDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.writeDeadline = deadline
+	return nil
+}
+
+func TestServerDrainExtendsWriteDeadline(t *testing.T) {
+	d := New(Options{})
+	d.setState(StateRunning)
+	srv := NewServer(d)
+	recorder := &responseDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodPost, "/api/daemon/drain", strings.NewReader(`{"timeoutSeconds":1}`))
+	before := time.Now()
+
+	srv.handleDrain(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("drain status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if recorder.writeDeadline.IsZero() {
+		t.Fatal("drain handler did not set a response write deadline")
+	}
+	expected := time.Second + drainResponseWriteGrace
+	if recorder.writeDeadline.Before(before.Add(expected)) || recorder.writeDeadline.After(time.Now().Add(expected)) {
+		t.Fatalf("write deadline = %s, want now + %s", recorder.writeDeadline, expected)
+	}
+}
+
 // expecting these endpoint names to be registered (sanity guard).
 func TestServer_AllExpectedEndpointsRegistered(t *testing.T) {
 	_, srv, cleanup := mustStartDaemon(t)

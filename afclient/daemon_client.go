@@ -5,6 +5,7 @@ package afclient
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -221,13 +222,22 @@ func (c *DaemonClient) get(path string, target any) error {
 }
 
 func (c *DaemonClient) post(path string, body any, target any) error {
+	return c.postContext(context.Background(), c.httpClient, path, body, target)
+}
+
+func (c *DaemonClient) postContext(ctx context.Context, httpClient *http.Client, path string, body any, target any) error {
 	var reqBody bytes.Buffer
 	if body != nil {
 		if err := json.NewEncoder(&reqBody).Encode(body); err != nil {
 			return fmt.Errorf("encode body: %w", err)
 		}
 	}
-	resp, err := c.httpClient.Post(c.baseURL+path, "application/json", &reqBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, &reqBody)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
@@ -334,9 +344,18 @@ func (c *DaemonClient) Stop() (*DaemonActionResponse, error) {
 
 // Drain initiates a graceful drain. timeoutSeconds=0 uses the daemon default.
 func (c *DaemonClient) Drain(timeoutSeconds int) (*DaemonActionResponse, error) {
+	return c.DrainContext(context.Background(), timeoutSeconds)
+}
+
+// DrainContext initiates a graceful drain using ctx to bound transport waiting.
+// timeoutSeconds=0 uses the daemon's configured default.
+func (c *DaemonClient) DrainContext(ctx context.Context, timeoutSeconds int) (*DaemonActionResponse, error) {
+	httpClient := *c.httpClient
+	httpClient.Timeout = 0
+
 	var resp DaemonActionResponse
 	req := DaemonDrainRequest{TimeoutSeconds: timeoutSeconds}
-	if err := c.post("/api/daemon/drain", req, &resp); err != nil {
+	if err := c.postContext(ctx, &httpClient, "/api/daemon/drain", req, &resp); err != nil {
 		return nil, fmt.Errorf("daemon drain: %w", err)
 	}
 	return &resp, nil

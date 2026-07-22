@@ -19,6 +19,8 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 )
 
+const drainResponseWriteGrace = time.Second
+
 // Server is the daemon's HTTP control API. It wraps a Daemon and exposes
 // the endpoints consumed by `donmai daemon …` and `rensei daemon …`.
 type Server struct {
@@ -400,6 +402,7 @@ func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 			timeout = 30 * time.Second
 		}
 	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout + drainResponseWriteGrace))
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	if err := s.daemon.Drain(ctx); err != nil {
