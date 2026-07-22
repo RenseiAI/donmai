@@ -463,20 +463,34 @@ func (p *PollService) Start() {
 
 // Stop terminates the poll goroutine. Safe to call multiple times.
 func (p *PollService) Stop() {
-	p.mu.Lock()
-	if !p.running {
-		p.mu.Unlock()
-		return
+	_ = p.StopContext(context.Background())
+}
+
+// StopContext terminates the poll goroutine without allowing a blocked OnWork
+// callback to outlive the caller's shutdown deadline. The callback still owns
+// its own eventual return; a later caller can join the same done channel.
+func (p *PollService) StopContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	p.mu.Lock()
 	cancel := p.cancel
 	done := p.done
-	p.running = false
+	if p.running {
+		p.running = false
+	}
 	p.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	if done != nil {
-		<-done
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

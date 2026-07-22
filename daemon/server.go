@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -32,6 +33,13 @@ type Server struct {
 	// are test seams; zero values use the production defaults in stopTimeouts.
 	stopAttemptTimeout time.Duration
 	stopRetryDelay     time.Duration
+
+	// stopCompletionActive fences the one asynchronous completion owner for this
+	// daemon's single terminal generation. Concurrent /stop requests acknowledge
+	// the already-owned transition instead of starting competing retry loops.
+	stopCompletionActive bool
+	stopCompletionStarts uint64       // guarded by mu; lifecycle observability/test seam
+	stopAttemptResults   chan<- error // test seam; receives each completed attempt
 
 	// kitReg is the in-process Kit registry serving /api/daemon/kits*
 	// (Wave 9 A2). Lazily constructed via kitRegistryOrEmpty so test
@@ -298,38 +306,72 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePause(w http.ResponseWriter, _ *http.Request) {
-	s.daemon.Pause()
+	if !s.daemon.Pause() {
+		writeJSON(w, http.StatusConflict, &afclient.DaemonActionResponse{OK: false, Message: fmt.Sprintf("cannot pause while daemon is %s", s.daemon.State())})
+		return
+	}
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "paused"})
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, _ *http.Request) {
-	s.daemon.Resume()
+	if !s.daemon.Resume() {
+		writeJSON(w, http.StatusConflict, &afclient.DaemonActionResponse{OK: false, Message: fmt.Sprintf("cannot resume while daemon is %s", s.daemon.State())})
+		return
+	}
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "resumed"})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, _ *http.Request) {
-	// "stopping" acknowledges only transition ownership, not completed shutdown.
-	// The goroutine remains responsible for retrying bounded incomplete drains until
-	// Daemon.Stop publishes StateStopped and closes Done.
+	// "stopping" acknowledges transition ownership, not completed shutdown.
+	// There is exactly one completion goroutine per daemon terminal generation;
+	// duplicate requests observe that owner rather than starting racing retries.
+	s.mu.Lock()
+	if s.daemon.State() == StateStopped {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "stopped"})
+		return
+	}
+	if s.stopCompletionActive {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "stopping"})
+		return
+	}
+	s.stopCompletionActive = true
+	s.stopCompletionStarts++
+	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "stopping"})
 	attemptTimeout, retryDelay := s.stopTimeouts()
-	go func() {
-		for {
-			ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
-			err := s.daemon.Stop(ctx)
-			cancel()
-			if err == nil {
-				return
+	go s.completeStop(attemptTimeout, retryDelay)
+}
+
+func (s *Server) completeStop(attemptTimeout, retryDelay time.Duration) {
+	// stopCompletionActive intentionally remains set after this routine returns.
+	// A daemon has one terminal stop generation; even an unrecoverable attempt
+	// must not let a later request create a second completion owner for it.
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+		err := s.daemon.Stop(ctx)
+		cancel()
+		if s.stopAttemptResults != nil {
+			select {
+			case s.stopAttemptResults <- err:
+			default:
 			}
-			var incomplete *DrainIncompleteError
-			if !errors.As(err, &incomplete) {
-				slog.Warn("daemon stop failed; daemon remains draining", "err", err)
-				return
-			}
-			slog.Warn("daemon stop incomplete; retaining completion owner for retry", "activeSessions", incomplete.ActiveSessions, "spawnReservations", incomplete.SpawnReservations)
-			time.Sleep(retryDelay)
 		}
-	}()
+		if err == nil {
+			return
+		}
+		var incomplete *DrainIncompleteError
+		if errors.As(err, &incomplete) {
+			slog.Warn("daemon stop incomplete; retaining completion owner for retry", "activeSessions", incomplete.ActiveSessions, "spawnReservations", incomplete.SpawnReservations)
+		} else if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			slog.Warn("daemon stop failed; daemon remains draining", "err", err)
+			return
+		} else {
+			slog.Warn("daemon stop phase exceeded attempt deadline; retaining completion owner for retry", "err", err)
+		}
+		time.Sleep(retryDelay)
+	}
 }
 
 func (s *Server) stopTimeouts() (attempt, retry time.Duration) {
@@ -345,20 +387,25 @@ func (s *Server) stopTimeouts() (attempt, retry time.Duration) {
 
 func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 	var body afclient.DaemonDrainRequest
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, &afclient.DaemonActionResponse{OK: false, Message: "invalid drain request: " + err.Error()})
+		return
+	}
 	timeout := time.Duration(body.TimeoutSeconds) * time.Second
-	if timeout == 0 {
-		cfg := s.daemon.Config()
-		if cfg != nil {
+	if timeout <= 0 {
+		if cfg := s.daemon.Config(); cfg != nil && cfg.AutoUpdate.DrainTimeoutSeconds > 0 {
 			timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
+		} else {
+			timeout = 30 * time.Second
 		}
 	}
-	go func() {
-		if s.daemon.spawner != nil {
-			_ = s.daemon.spawner.Drain(timeout)
-		}
-	}()
-	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: fmt.Sprintf("drain initiated (timeout %s)", timeout)})
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	if err := s.daemon.Drain(ctx); err != nil {
+		writeJSON(w, http.StatusConflict, &afclient.DaemonActionResponse{OK: false, Message: "drain incomplete: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: fmt.Sprintf("drained (timeout %s)", timeout)})
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, _ *http.Request) {

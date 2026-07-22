@@ -251,8 +251,10 @@ type Daemon struct {
 	// Wave 9 / Track A3.
 	workareaArchive *WorkareaArchiveRegistry
 
-	// lifecycleMu serializes Start, Pause, Resume, Stop, and Update. A Daemon
-	// instance is single-run: once Stop begins no method may reopen admission.
+	// lifecycleMu protects lifecycle transitions. A Daemon instance is single-run:
+	// once Stop begins no method may reopen admission. Long-running shutdown work
+	// deliberately happens outside this lock so every caller's context remains a
+	// real bound and a later Stop can complete the same terminal generation.
 	lifecycleMu   sync.Mutex
 	stopInitiated bool
 	terminal      bool
@@ -266,6 +268,7 @@ type Daemon struct {
 	landingCtx      context.Context
 	landingCancel   context.CancelFunc
 	landingStopping bool
+	landingActive   int
 	landingWG       sync.WaitGroup
 }
 
@@ -844,50 +847,76 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 // Stop begins a one-way terminal transition. An incomplete drain leaves the
 // daemon in StateDraining with Done open so a later bounded Stop call can finish
 // the same transition. Only a fully drained daemon stops its loops, reports
-// StateStopped, and closes Done.
+// StateStopped, and closes Done. No shutdown wait outlives ctx: an uncooperative
+// poll callback or landing hook may delay completion, but cannot hold a caller
+// past its own deadline.
 func (d *Daemon) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	// Publish terminal admission before waiting. Do not retain lifecycleMu while
+	// joining work: a timed-out attempt must leave the same generation available
+	// to a later Stop caller.
 	d.lifecycleMu.Lock()
-	defer d.lifecycleMu.Unlock()
 	if d.terminal {
-		return d.stopErr
+		err := d.stopErr
+		d.lifecycleMu.Unlock()
+		return err
 	}
 	d.stopInitiated = true
 	d.setState(StateDraining)
+	poller := d.poller
+	spawner := d.spawner
+	heartbeat := d.heartbeat
+	refresher := d.tokenRefresher
+	d.lifecycleMu.Unlock()
 
 	// Prevent any new landing callback before draining session admission, then
-	// cancel and join every callback that already entered.
+	// cancel callbacks that already entered. Joining is explicitly deadline-bound.
 	d.landingMu.Lock()
 	d.landingStopping = true
 	if d.landingCancel != nil {
 		d.landingCancel()
 	}
 	d.landingMu.Unlock()
-	if d.poller != nil {
-		d.poller.Stop()
+	if poller != nil {
+		if err := poller.StopContext(ctx); err != nil {
+			return err
+		}
 	}
-	d.landingWG.Wait()
+	if err := d.waitLandingContext(ctx); err != nil {
+		return err
+	}
 
 	timeout := 30 * time.Second
 	if cfg := d.Config(); cfg != nil && cfg.AutoUpdate.DrainTimeoutSeconds > 0 {
 		timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
 	}
-	if d.spawner != nil {
+	if spawner != nil {
 		drainCtx, cancel := context.WithTimeout(ctx, timeout)
-		drainErr := d.spawner.DrainContext(drainCtx)
+		drainErr := spawner.DrainContext(drainCtx)
 		cancel()
 		if drainErr != nil {
+			d.lifecycleMu.Lock()
 			d.stopErr = drainErr
+			d.lifecycleMu.Unlock()
 			return drainErr
 		}
 	}
-	if d.heartbeat != nil {
-		d.heartbeat.Stop()
+	if heartbeat != nil {
+		heartbeat.Stop()
 	}
-	if d.tokenRefresher != nil {
-		d.tokenRefresher.Stop()
+	if refresher != nil {
+		refresher.Stop()
+	}
+
+	// Exactly one caller publishes terminal completion. Another caller may have
+	// completed while this one was draining, in which case Done was already closed.
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.terminal {
+		return d.stopErr
 	}
 	if d.yamlWatcherStop != nil {
 		d.yamlWatcherStop()
@@ -900,6 +929,56 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	d.setState(StateStopped)
 	close(d.doneCh)
 	return nil
+}
+
+// waitLandingContext joins entered landing callbacks without allowing an
+// uncooperative callback to hold a lifecycle caller beyond its context. The
+// active count avoids a cancelled context racing a zero-value WaitGroup.
+func (d *Daemon) waitLandingContext(ctx context.Context) error {
+	d.landingMu.Lock()
+	active := d.landingActive
+	d.landingMu.Unlock()
+	if active == 0 {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		d.landingWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Drain manually closes admission while retaining a resumable daemon. Unlike
+// Stop it does not cancel poll/landing infrastructure or make the lifecycle
+// terminal; Resume reopens the exact spawner once the requested drain completes.
+func (d *Daemon) Drain(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.lifecycleMu.Lock()
+	if d.terminal || d.stopInitiated {
+		state := d.State()
+		d.lifecycleMu.Unlock()
+		return fmt.Errorf("cannot drain — terminal stop has begun (state %q)", state)
+	}
+	if d.State() != StateRunning && d.State() != StatePaused && d.State() != StateDraining {
+		state := d.State()
+		d.lifecycleMu.Unlock()
+		return fmt.Errorf("cannot drain — current state %q", state)
+	}
+	spawner := d.spawner
+	d.setState(StateDraining)
+	d.lifecycleMu.Unlock()
+	if spawner == nil {
+		return nil
+	}
+	return spawner.DrainContext(ctx)
 }
 
 // handlePollWorkItem is the body of the primary poll loop's OnWork callback,
@@ -1014,9 +1093,15 @@ func (d *Daemon) runLandingWork(fn func(context.Context, PollWorkItem) error, it
 		return errors.New("daemon is stopping; landing work rejected")
 	}
 	ctx := d.landingCtx
+	d.landingActive++
 	d.landingWG.Add(1)
 	d.landingMu.Unlock()
-	defer d.landingWG.Done()
+	defer func() {
+		d.landingMu.Lock()
+		d.landingActive--
+		d.landingMu.Unlock()
+		d.landingWG.Done()
+	}()
 	return fn(ctx, item)
 }
 
@@ -1025,30 +1110,35 @@ func (d *Daemon) Done() <-chan struct{} {
 	return d.doneCh
 }
 
-// Pause stops accepting new work without draining.
-func (d *Daemon) Pause() {
+// Pause stops accepting new work without draining. It reports whether it
+// performed a transition, allowing control endpoints to avoid claiming a stale
+// pause request succeeded.
+func (d *Daemon) Pause() bool {
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
 	if d.stopInitiated || d.State() != StateRunning {
-		return
+		return false
 	}
 	if d.spawner != nil {
 		d.spawner.Pause()
 	}
 	d.setState(StatePaused)
+	return true
 }
 
-// Resume re-enables accepting work.
-func (d *Daemon) Resume() {
+// Resume re-enables accepting work after a manual pause or drain. A terminal
+// stop permanently fences admission, including a resume that races it.
+func (d *Daemon) Resume() bool {
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
-	if d.stopInitiated || d.State() != StatePaused {
-		return
+	if d.stopInitiated || (d.State() != StatePaused && d.State() != StateDraining) {
+		return false
 	}
 	if d.spawner != nil {
 		d.spawner.Resume()
 	}
 	d.setState(StateRunning)
+	return true
 }
 
 // AcceptWork dispatches a session spec to the spawner.

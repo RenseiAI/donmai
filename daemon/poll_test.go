@@ -89,6 +89,43 @@ func TestPollService_DispatchesWork(t *testing.T) {
 
 // TestPollService_EmptyWorkNoDispatch confirms that when work[] is empty,
 // OnWork is not invoked at all.
+func TestPollServiceStopContextBoundsBlockedCallbackAndLaterCallJoins(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(PollResponse{Work: []PollWorkItem{{SessionID: "blocked"}}})
+	}))
+	t.Cleanup(srv.Close)
+
+	p := NewPollService(PollOptions{
+		WorkerID:        "wkr-blocked",
+		OrchestratorURL: srv.URL,
+		RuntimeJWT:      "rt",
+		IntervalSeconds: 1,
+		OnWork: func(PollWorkItem) error {
+			close(entered)
+			<-release // deliberately ignores poll cancellation
+			return nil
+		},
+	})
+	p.Start()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("poll callback did not enter")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := p.StopContext(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("first StopContext = %v, want deadline exceeded", err)
+	}
+	close(release)
+	if err := p.StopContext(context.Background()); err != nil {
+		t.Fatalf("second StopContext did not join poll loop: %v", err)
+	}
+}
+
 func TestPollService_EmptyWorkNoDispatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(PollResponse{Work: []PollWorkItem{}})

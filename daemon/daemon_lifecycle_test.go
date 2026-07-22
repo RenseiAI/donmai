@@ -75,3 +75,76 @@ func TestDaemonStop_RejectsPostStopLandingWork(t *testing.T) {
 	default:
 	}
 }
+
+func TestDaemonStopDeadlineBoundsLandingAndLaterStopFinishesGeneration(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	d := New(Options{
+		OnLandingWork: func(context.Context, PollWorkItem) error {
+			close(entered)
+			<-release // deliberately ignores cancellation
+			return nil
+		},
+	})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{})
+	d.setState(StateRunning)
+	landingDone := make(chan error, 1)
+	go func() { landingDone <- d.handlePollWorkItem(PollWorkItem{WorkType: LandingWorkType}, "") }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("landing handler did not enter")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := d.Stop(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("first Stop = %v, want deadline exceeded", err)
+	}
+	if d.State() != StateDraining {
+		t.Fatalf("state after deadline = %q, want draining", d.State())
+	}
+	select {
+	case <-d.Done():
+		t.Fatal("Done closed while landing callback remained live")
+	default:
+	}
+
+	close(release)
+	if err := <-landingDone; err != nil {
+		t.Fatalf("landing handler: %v", err)
+	}
+	if err := d.Stop(context.Background()); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+	if d.State() != StateStopped {
+		t.Fatalf("state = %q, want stopped", d.State())
+	}
+	select {
+	case <-d.Done():
+	default:
+		t.Fatal("Done did not close after second Stop")
+	}
+}
+
+func TestDaemonDrainResumeReopensAdmissionUnlessTerminalStopBegan(t *testing.T) {
+	d := New(Options{})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{})
+	d.setState(StateRunning)
+	if err := d.Drain(context.Background()); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if d.State() != StateDraining || d.spawner.IsAccepting() {
+		t.Fatalf("manual drain state/admission = (%q, %v), want draining/false", d.State(), d.spawner.IsAccepting())
+	}
+	if !d.Resume() || d.State() != StateRunning || !d.spawner.IsAccepting() {
+		t.Fatalf("Resume did not reopen manual drain: state=%q accepting=%v", d.State(), d.spawner.IsAccepting())
+	}
+
+	if err := d.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if d.Resume() {
+		t.Fatal("Resume succeeded after terminal stop began")
+	}
+}
