@@ -362,12 +362,13 @@ func (s *Server) completeStop(attemptTimeout, retryDelay time.Duration) {
 			return
 		}
 		var incomplete *DrainIncompleteError
-		if errors.As(err, &incomplete) {
+		switch {
+		case errors.As(err, &incomplete):
 			slog.Warn("daemon stop incomplete; retaining completion owner for retry", "activeSessions", incomplete.ActiveSessions, "spawnReservations", incomplete.SpawnReservations)
-		} else if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		case !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled):
 			slog.Warn("daemon stop failed; daemon remains draining", "err", err)
 			return
-		} else {
+		default:
 			slog.Warn("daemon stop phase exceeded attempt deadline; retaining completion owner for retry", "err", err)
 		}
 		time.Sleep(retryDelay)
