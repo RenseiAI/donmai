@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -140,5 +141,51 @@ func TestRuntimeCredentialsReturnsConsistentSnapshot(t *testing.T) {
 	workerID, token := d.RuntimeCredentials()
 	if workerID != "wkr_test" || token != "runtime-token" {
 		t.Fatalf("RuntimeCredentials() = (%q, %q), want (%q, %q)", workerID, token, "wkr_test", "runtime-token")
+	}
+}
+
+func TestDaemonStopPropagatesReservationAwareDrainError(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	spawner := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn: func(SessionSpec, []string) ([]string, error) {
+			close(entered)
+			<-release
+			return nil, fmt.Errorf("pre-spawn stopped")
+		},
+	})
+	d := New(Options{})
+	d.spawner = spawner
+	d.setState(StateRunning)
+	d.mu.Lock()
+	d.config = &Config{AutoUpdate: AutoUpdateConfig{DrainTimeoutSeconds: 1}}
+	d.mu.Unlock()
+
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := spawner.AcceptWork(SessionSpec{SessionID: "reserved", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	<-entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := d.Stop(ctx)
+	var incomplete *DrainIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("Stop error = %v, want DrainIncompleteError", err)
+	}
+	if incomplete.SpawnReservations != 1 {
+		t.Fatalf("DrainIncompleteError reservations = %d, want 1", incomplete.SpawnReservations)
+	}
+
+	close(release)
+	if err := <-acceptDone; err == nil {
+		t.Fatal("AcceptWork unexpectedly succeeded")
+	}
+	if err := spawner.DrainContext(context.Background()); err != nil {
+		t.Fatalf("fresh final drain: %v", err)
 	}
 }

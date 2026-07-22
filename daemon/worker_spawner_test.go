@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -468,6 +469,48 @@ func TestSpawner_ReservationsConsumeCapacityAndHookFailureReleases(t *testing.T)
 	}
 	if err := s.Drain(time.Second); err != nil {
 		t.Fatalf("Drain after hook failure: %v", err)
+	}
+}
+
+func TestSpawner_DrainContextReportsPendingReservation(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn: func(SessionSpec, []string) ([]string, error) {
+			close(entered)
+			<-release
+			return nil, errors.New("pre-spawn stopped")
+		},
+	})
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := s.AcceptWork(SessionSpec{SessionID: "reserved", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	<-entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := s.DrainContext(ctx)
+	var incomplete *DrainIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("DrainContext error = %v, want DrainIncompleteError", err)
+	}
+	if incomplete.SpawnReservations != 1 || incomplete.ActiveSessions != 0 {
+		t.Fatalf("DrainIncompleteError = %+v, want one reservation and no sessions", incomplete)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DrainContext error = %v, want context.Canceled", err)
+	}
+
+	close(release)
+	if err := <-acceptDone; err == nil {
+		t.Fatal("AcceptWork unexpectedly succeeded")
+	}
+	if err := s.DrainContext(context.Background()); err != nil {
+		t.Fatalf("fresh DrainContext after reservation release: %v", err)
 	}
 }
 

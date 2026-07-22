@@ -252,6 +252,7 @@ type Daemon struct {
 	workareaArchive *WorkareaArchiveRegistry
 
 	stopOnce sync.Once
+	stopErr  error
 	doneCh   chan struct{}
 }
 
@@ -822,14 +823,16 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	}
 }
 
-// Stop performs a graceful shutdown: drain in-flight sessions, stop loops,
-// and transition to stopped. The context is currently unused but is retained
-// for future use (e.g. cancelling drain via ctx.Done).
-// Stop drains spawned work, halts the heartbeat/poller loops, closes the
-// yaml watcher, and transitions to StateStopped. Safe to call concurrently
-// or repeatedly — the whole body is gated by stopOnce so a deferred
-// Stop() in a test fixture racing with an HTTP /stop handler is benign.
-func (d *Daemon) Stop(_ context.Context) error {
+// Stop drains spawned work, halts the heartbeat/poller loops, closes the yaml
+// watcher, and transitions to StateStopped. The caller context bounds the
+// configured drain timeout. A DrainIncompleteError means the daemon core has
+// stopped but an admitted spawn still needs an external final drain barrier.
+// Safe to call concurrently or repeatedly — the whole body is gated by stopOnce
+// so a deferred Stop in a test fixture racing with an HTTP handler is benign.
+func (d *Daemon) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	d.stopOnce.Do(func() {
 		if d.State() == StateStopped {
 			return
@@ -841,7 +844,12 @@ func (d *Daemon) Stop(_ context.Context) error {
 			timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
 		}
 		if d.spawner != nil {
-			_ = d.spawner.Drain(timeout)
+			drainCtx, cancel := context.WithTimeout(ctx, timeout)
+			drainErr := d.spawner.DrainContext(drainCtx)
+			cancel()
+			d.mu.Lock()
+			d.stopErr = drainErr
+			d.mu.Unlock()
 		}
 		if d.heartbeat != nil {
 			d.heartbeat.Stop()
@@ -859,7 +867,10 @@ func (d *Daemon) Stop(_ context.Context) error {
 		close(d.doneCh)
 		d.setState(StateStopped)
 	})
-	return nil
+	d.mu.RLock()
+	err := d.stopErr
+	d.mu.RUnlock()
+	return err
 }
 
 // handlePollWorkItem is the body of the primary poll loop's OnWork callback,

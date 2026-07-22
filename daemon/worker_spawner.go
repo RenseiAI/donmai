@@ -891,11 +891,40 @@ func (s *WorkerSpawner) rememberSessionLocked(id string) {
 	delete(s.sessionHistory, oldest)
 }
 
+// DrainIncompleteError reports a drain that could not prove every admitted
+// spawn has either registered or completed its synchronous abort cleanup.
+// Callers should use errors.As and inspect the counts rather than parsing Error.
+type DrainIncompleteError struct {
+	Cause             error
+	ActiveSessions    int
+	SpawnReservations int
+}
+
+func (e *DrainIncompleteError) Error() string {
+	return fmt.Sprintf("drain incomplete: %v; SIGTERM sent to %d session(s); %d spawn reservation(s) still pending", e.Cause, e.ActiveSessions, e.SpawnReservations)
+}
+
+// Unwrap exposes the cancellation reason that ended this drain attempt.
+func (e *DrainIncompleteError) Unwrap() error { return e.Cause }
+
 // Drain waits for every admitted spawn to either register or abort and for all
-// in-flight sessions to exit. After timeout, remaining sessions receive SIGTERM
-// via context cancellation. Pre-start reservations cannot be signalled, so a
-// timeout while any remain is explicitly incomplete.
+// in-flight sessions to exit. It is retained for compatibility; callers that
+// need an independently bounded retry should use DrainContext.
 func (s *WorkerSpawner) Drain(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return s.DrainContext(ctx)
+}
+
+// DrainContext waits for every admitted spawn to either register or abort and
+// for all in-flight sessions to exit. When ctx ends, registered sessions are
+// cancelled outside the spawner lock, while pre-start reservations remain owned
+// by their spawn path until hooks and synchronous abort cleanup finish.
+func (s *WorkerSpawner) DrainContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	s.mu.Lock()
 	s.accepting = false
 	if len(s.sessions) == 0 && s.spawnReservations == 0 {
@@ -904,8 +933,10 @@ func (s *WorkerSpawner) Drain(timeout time.Duration) error {
 	}
 	s.mu.Unlock()
 
-	deadline := time.Now().Add(timeout)
-	pollInterval := 100 * time.Millisecond
+	// A ticker avoids holding the mutex while waiting, and context cancellation
+	// makes an explicit cancellation deterministic instead of polling a clock.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		s.mu.Lock()
 		pending := len(s.sessions) + s.spawnReservations
@@ -913,28 +944,29 @@ func (s *WorkerSpawner) Drain(timeout time.Duration) error {
 		if pending == 0 {
 			return nil
 		}
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(pollInterval)
-	}
 
-	// Force-stop registered sessions. Reservations remain owned by their spawn
-	// path until hooks and synchronous abort cleanup finish.
-	s.mu.Lock()
-	stragglers := make([]*spawnedSession, 0, len(s.sessions))
-	for _, ss := range s.sessions {
-		stragglers = append(stragglers, ss)
+		select {
+		case <-ctx.Done():
+			s.mu.Lock()
+			stragglers := make([]*spawnedSession, 0, len(s.sessions))
+			for _, ss := range s.sessions {
+				stragglers = append(stragglers, ss)
+			}
+			incomplete := &DrainIncompleteError{
+				Cause:             ctx.Err(),
+				ActiveSessions:    len(stragglers),
+				SpawnReservations: s.spawnReservations,
+			}
+			s.mu.Unlock()
+
+			// Process cancellation may block, so it must never happen under s.mu.
+			for _, ss := range stragglers {
+				ss.cancel()
+			}
+			return incomplete
+		case <-ticker.C:
+		}
 	}
-	reservations := s.spawnReservations
-	s.mu.Unlock()
-	for _, ss := range stragglers {
-		ss.cancel()
-	}
-	if len(stragglers) > 0 || reservations > 0 {
-		return fmt.Errorf("drain timeout — sigterm sent to %d session(s); %d spawn reservation(s) still pending", len(stragglers), reservations)
-	}
-	return nil
 }
 
 // composeEnv flattens the merged env into the os.Environ() form expected by

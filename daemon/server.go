@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -307,7 +308,14 @@ func (s *Server) handleStop(w http.ResponseWriter, _ *http.Request) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		_ = s.daemon.Stop(ctx)
+		if err := s.daemon.Stop(ctx); err != nil {
+			var incomplete *DrainIncompleteError
+			if errors.As(err, &incomplete) {
+				slog.Warn("daemon stop incomplete", "activeSessions", incomplete.ActiveSessions, "spawnReservations", incomplete.SpawnReservations)
+				return
+			}
+			slog.Warn("daemon stop failed")
+		}
 	}()
 }
 
