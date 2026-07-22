@@ -466,13 +466,11 @@ func (p *PollService) Stop() {
 	_ = p.StopContext(context.Background())
 }
 
-// StopContext terminates the poll goroutine without allowing a blocked OnWork
-// callback to outlive the caller's shutdown deadline. The callback still owns
-// its own eventual return; a later caller can join the same done channel.
-func (p *PollService) StopContext(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+// beginStop cancels polling and returns the current loop completion signal
+// without waiting for it. Repeated calls are idempotent and reuse the same done
+// channel, letting a shutdown start every barrier before joining any one of
+// them.
+func (p *PollService) beginStop() <-chan struct{} {
 	p.mu.Lock()
 	cancel := p.cancel
 	done := p.done
@@ -483,8 +481,26 @@ func (p *PollService) StopContext(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
+	return done
+}
+
+// StopContext terminates the poll goroutine without allowing a blocked OnWork
+// callback to outlive the caller's shutdown deadline. The callback still owns
+// its own eventual return; a later caller can join the same done channel.
+func (p *PollService) StopContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := p.beginStop()
 	if done == nil {
 		return nil
+	}
+	// A completed loop is a successful idempotent stop even when the caller's
+	// context was canceled before it asked to join it.
+	select {
+	case <-done:
+		return nil
+	default:
 	}
 	select {
 	case <-done:
