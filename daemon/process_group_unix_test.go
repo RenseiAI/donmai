@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -142,4 +143,126 @@ func waitPIDFile(t *testing.T, path string) int {
 		t.Fatalf("pid was not published at %s", path)
 	}
 	return pid
+}
+
+func TestSpawner_ReapsPipeSilentDescendantAfterLeaderExit(t *testing.T) {
+	childPath := filepath.Join(t.TempDir(), "pipe-silent-child.pid")
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand: []string{"/bin/sh", "-c", fmt.Sprintf(
+			`sleep 30 >/dev/null 2>&1 & echo $! > %q; exit 0`, childPath,
+		)},
+	})
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "pipe-silent", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	child := waitPIDFile(t, childPath)
+	waitSessionEnd(t, ended)
+	if err := syscall.Kill(child, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("pipe-silent descendant survived terminal reaping: %v", err)
+	}
+}
+
+func TestSpawner_StopSessionGrantsTERMFlushWindow(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "term-flushed")
+	ready := marker + ".ready"
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand: []string{"/bin/sh", "-c", fmt.Sprintf(
+			`trap 'printf flushed > %q; exit 0' TERM; printf ready > %q; while :; do :; done`, marker, ready,
+		)},
+	})
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "term-flush", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	waitFile(t, ready)
+	if !s.StopSession("term-flush") {
+		t.Fatal("StopSession = false")
+	}
+	waitSessionEnd(t, ended)
+	if raw, err := os.ReadFile(marker); err != nil || string(raw) != "flushed" {
+		t.Fatalf("TERM flush marker = %q, %v; want flushed", raw, err)
+	}
+}
+
+func TestSpawner_DrainGrantsTERMFlushWindow(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "drain-term-flushed")
+	ready := marker + ".ready"
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand: []string{"/bin/sh", "-c", fmt.Sprintf(
+			`trap 'printf flushed > %q; exit 0' TERM; printf ready > %q; while :; do :; done`, marker, ready,
+		)},
+	})
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "drain-term-flush", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	waitFile(t, ready)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := s.DrainContext(ctx)
+	var incomplete *DrainIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("DrainContext error = %v, want DrainIncompleteError", err)
+	}
+	waitSessionEnd(t, ended)
+	if raw, err := os.ReadFile(marker); err != nil || string(raw) != "flushed" {
+		t.Fatalf("TERM drain flush marker = %q, %v; want flushed", raw, err)
+	}
+	if err := s.DrainContext(context.Background()); err != nil {
+		t.Fatalf("final DrainContext: %v", err)
+	}
+}
+
+func TestSpawner_DrainEscalatesTERMIgnoringProcessTree(t *testing.T) {
+	childPath := filepath.Join(t.TempDir(), "term-ignoring-child.pid")
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand: []string{"/bin/sh", "-c", fmt.Sprintf(
+			`trap '' TERM; sleep 30 & echo $! > %q; wait`, childPath,
+		)},
+	})
+	ended := sessionEnds(s)
+	handle, err := s.AcceptWork(SessionSpec{SessionID: "term-ignore", Repository: "github.com/a/b"})
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	child := waitPIDFile(t, childPath)
+	start := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = s.DrainContext(ctx)
+	var incomplete *DrainIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("DrainContext error = %v, want DrainIncompleteError", err)
+	}
+	waitSessionEnd(t, ended)
+	if elapsed := time.Since(start); elapsed < sessionTerminationGrace/2 {
+		t.Fatalf("TERM-ignoring tree reaped in %s, before bounded graceful window", elapsed)
+	}
+	if err := syscall.Kill(child, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("TERM-ignoring child survived escalation: %v", err)
+	}
+	if err := syscall.Kill(-handle.PID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("TERM-ignoring process group survived escalation: %v", err)
+	}
+}
+
+func waitFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("file was not published at %s", path)
 }

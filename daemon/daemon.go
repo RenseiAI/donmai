@@ -895,8 +895,10 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	}
 	d.stopErr = nil
 	d.terminal = true
-	close(d.doneCh)
+	// State is the published completion fact; close Done only after readers can
+	// observe it, so a Done waiter never sees the stale StateDraining value.
 	d.setState(StateStopped)
+	close(d.doneCh)
 	return nil
 }
 

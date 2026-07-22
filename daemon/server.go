@@ -28,6 +28,11 @@ type Server struct {
 	started bool
 	addr    string
 
+	// stopAttemptTimeout and stopRetryDelay keep endpoint retries bounded. They
+	// are test seams; zero values use the production defaults in stopTimeouts.
+	stopAttemptTimeout time.Duration
+	stopRetryDelay     time.Duration
+
 	// kitReg is the in-process Kit registry serving /api/daemon/kits*
 	// (Wave 9 A2). Lazily constructed via kitRegistryOrEmpty so test
 	// servers built with NewServer get a default scan path automatically.
@@ -303,20 +308,39 @@ func (s *Server) handleResume(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, _ *http.Request) {
-	// Respond first so the client gets the 200, then schedule the stop.
+	// "stopping" acknowledges only transition ownership, not completed shutdown.
+	// The goroutine remains responsible for retrying bounded incomplete drains until
+	// Daemon.Stop publishes StateStopped and closes Done.
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "stopping"})
+	attemptTimeout, retryDelay := s.stopTimeouts()
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		if err := s.daemon.Stop(ctx); err != nil {
-			var incomplete *DrainIncompleteError
-			if errors.As(err, &incomplete) {
-				slog.Warn("daemon stop incomplete", "activeSessions", incomplete.ActiveSessions, "spawnReservations", incomplete.SpawnReservations)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+			err := s.daemon.Stop(ctx)
+			cancel()
+			if err == nil {
 				return
 			}
-			slog.Warn("daemon stop failed")
+			var incomplete *DrainIncompleteError
+			if !errors.As(err, &incomplete) {
+				slog.Warn("daemon stop failed; daemon remains draining", "err", err)
+				return
+			}
+			slog.Warn("daemon stop incomplete; retaining completion owner for retry", "activeSessions", incomplete.ActiveSessions, "spawnReservations", incomplete.SpawnReservations)
+			time.Sleep(retryDelay)
 		}
 	}()
+}
+
+func (s *Server) stopTimeouts() (attempt, retry time.Duration) {
+	attempt, retry = s.stopAttemptTimeout, s.stopRetryDelay
+	if attempt <= 0 {
+		attempt = 60 * time.Second
+	}
+	if retry <= 0 {
+		retry = time.Second
+	}
+	return attempt, retry
 }
 
 func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {

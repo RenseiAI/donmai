@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,5 +101,94 @@ func TestDaemonUpdate_PropagatesIncompleteDrain(t *testing.T) {
 	close(release)
 	if err := <-acceptDone; err == nil {
 		t.Fatal("reserved AcceptWork unexpectedly succeeded")
+	}
+}
+
+func TestSpawner_TerminalListenerMakesGenerationUnsignalable(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+	})
+	var termSignals atomic.Int32
+	var killSignals atomic.Int32
+	s.terminateProcessGroup = func(*exec.Cmd) error { termSignals.Add(1); return nil }
+	s.killProcessGroup = func(*exec.Cmd) error { killSignals.Add(1); return nil }
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded {
+			close(entered)
+			<-release
+		}
+	})
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "terminal", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal listener did not enter")
+	}
+	if s.StopSession("terminal") {
+		t.Fatal("StopSession accepted a terminal generation")
+	}
+	if err := s.ForceKillSession("terminal"); err != nil {
+		t.Fatalf("ForceKillSession terminal generation: %v", err)
+	}
+	if got := termSignals.Load(); got != 0 {
+		t.Fatalf("TERM signals after terminal classification = %d, want 0", got)
+	}
+	if got := killSignals.Load(); got != 0 {
+		t.Fatalf("SIGKILL signals after terminal classification = %d, want 0", got)
+	}
+	close(release)
+	waitForActiveCount(t, s, 0)
+}
+
+func TestSpawner_PostWaitPermissionClassificationReleasesTerminalGeneration(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+	})
+	var waits atomic.Int32
+	var kills atomic.Int32
+	s.waitProcessGroup = func(*exec.Cmd, time.Duration) processGroupWaitResult {
+		waits.Add(1)
+		return processGroupPermission
+	}
+	s.killProcessGroup = func(*exec.Cmd) error {
+		kills.Add(1)
+		return errSessionProcessExited
+	}
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "permission-only", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	waitSessionEnd(t, ended)
+	waitForActiveCount(t, s, 0)
+	if got := waits.Load(); got < 2 {
+		t.Fatalf("process-group classifications = %d, want initial and bounded post-Wait observations", got)
+	}
+	if got := kills.Load(); got != 1 {
+		t.Fatalf("descendant cleanup signals = %d, want one", got)
+	}
+}
+
+func TestDaemonDonePublishesStoppedState(t *testing.T) {
+	d := New(Options{})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{})
+	d.setState(StateRunning)
+	if err := d.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-d.Done():
+		if got := d.State(); got != StateStopped {
+			t.Fatalf("state observed after Done = %q, want stopped", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Done did not close")
 	}
 }

@@ -13,6 +13,27 @@ import (
 
 var errSessionProcessExited = errors.New("session process already exited")
 
+// sessionTerminationGrace is the bounded cooperative window given to a worker
+// process group after SIGTERM. It lets a worker flush its final state while
+// still guaranteeing that a TERM-ignoring tree cannot hold a session slot
+// indefinitely.
+const sessionTerminationGrace = 250 * time.Millisecond
+
+// processGroupPostWaitGrace bounds the defensive group-disappearance check
+// after cmd.Wait has reaped the direct child. A platform can report EPERM for
+// an unobservable/zombie-only group forever; that must not retain a terminal
+// SessionID or capacity forever.
+const processGroupPostWaitGrace = 2 * time.Second
+
+type processGroupWaitResult string
+
+const (
+	processGroupGone       processGroupWaitResult = "gone"
+	processGroupTimedOut   processGroupWaitResult = "timeout"
+	processGroupPermission processGroupWaitResult = "permission-denied"
+	processGroupUnknown    processGroupWaitResult = "unknown"
+)
+
 func configureSessionProcessGroup(cmd *exec.Cmd) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -20,7 +41,7 @@ func configureSessionProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr.Setpgid = true
 }
 
-func killSessionProcessGroup(cmd *exec.Cmd) error {
+func signalSessionProcessGroup(cmd *exec.Cmd, signal syscall.Signal) error {
 	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 1 {
 		return fmt.Errorf("session process is unavailable")
 	}
@@ -40,7 +61,7 @@ func killSessionProcessGroup(cmd *exec.Cmd) error {
 	if (err == nil && pgid != pid) || (selfErr == nil && pid == selfPGID) {
 		return fmt.Errorf("refusing unsafe process group %d for child %d", pgid, pid)
 	}
-	if err := syscall.Kill(-pid, syscall.SIGKILL); errors.Is(err, syscall.ESRCH) {
+	if err := syscall.Kill(-pid, signal); errors.Is(err, syscall.ESRCH) {
 		return errSessionProcessExited
 	} else if err != nil {
 		return err
@@ -48,22 +69,46 @@ func killSessionProcessGroup(cmd *exec.Cmd) error {
 	return nil
 }
 
-// waitSessionProcessGroup waits until the daemon-owned process group no
-// longer exists. The direct child may already be reaped while a descendant is
-// still alive, so cmd.Wait alone is not a terminal ownership boundary.
-func waitSessionProcessGroup(cmd *exec.Cmd) {
+func terminateSessionProcessGroup(cmd *exec.Cmd) error {
+	return signalSessionProcessGroup(cmd, syscall.SIGTERM)
+}
+
+func killSessionProcessGroup(cmd *exec.Cmd) error {
+	return signalSessionProcessGroup(cmd, syscall.SIGKILL)
+}
+
+// waitSessionProcessGroup waits at most maxWait for the daemon-owned process
+// group to disappear. cmd.Wait only proves the direct child is reaped; callers
+// use this result to distinguish a real surviving tree from an unobservable
+// EPERM/zombie-only group and can log a truthful classification instead of
+// looping forever while retaining capacity.
+func waitSessionProcessGroup(cmd *exec.Cmd, maxWait time.Duration) processGroupWaitResult {
 	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 1 {
-		return
+		return processGroupUnknown
 	}
 	pgid := cmd.Process.Pid
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	permissionDenied := false
 	for {
 		err := syscall.Kill(-pgid, 0)
-		if errors.Is(err, syscall.ESRCH) {
-			return
+		switch {
+		case errors.Is(err, syscall.ESRCH):
+			return processGroupGone
+		case errors.Is(err, syscall.EPERM):
+			permissionDenied = true
+		case err != nil:
+			return processGroupUnknown
 		}
-		if err != nil && !errors.Is(err, syscall.EPERM) {
-			return
+		select {
+		case <-deadline.C:
+			if permissionDenied {
+				return processGroupPermission
+			}
+			return processGroupTimedOut
+		case <-ticker.C:
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }

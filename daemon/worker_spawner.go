@@ -150,7 +150,9 @@ type WorkerSpawner struct {
 	spawnReservations      map[string]struct{}
 	extraProjects          []ProjectConfig // satellite/additional org projects; never clobbered by SetProjects
 	extraEnabledProjectIDs map[string]struct{}
+	terminateProcessGroup  func(*exec.Cmd) error
 	killProcessGroup       func(*exec.Cmd) error
+	waitProcessGroup       func(*exec.Cmd, time.Duration) processGroupWaitResult
 	startCommand           func(*exec.Cmd) error
 
 	// drainBeforeContextSnapshot is a deterministic test seam for the narrow
@@ -171,6 +173,7 @@ type spawnedSession struct {
 	spec               SessionSpec
 	stopRequested      bool // guarded by WorkerSpawner.mu
 	forceKillRequested bool // guarded by WorkerSpawner.mu
+	terminal           bool // guarded by WorkerSpawner.mu; Ended delivery owns this generation
 }
 
 // NewWorkerSpawner constructs a spawner. Workers will not be spawned until
@@ -190,7 +193,9 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 		sessionHistory:         make(map[string]struct{}),
 		accepting:              true,
 		extraEnabledProjectIDs: make(map[string]struct{}),
+		terminateProcessGroup:  terminateSessionProcessGroup,
 		killProcessGroup:       killSessionProcessGroup,
+		waitProcessGroup:       waitSessionProcessGroup,
 		startCommand:           func(cmd *exec.Cmd) error { return cmd.Start() },
 	}
 }
@@ -655,8 +660,12 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		command = []string{"/bin/sh", "-c", `printf 'session-started:%s\n' "$DONMAI_SESSION_ID"; exit 0`}
 	}
 
+	// Keep cancellation as a lifecycle signal only. CommandContext's default
+	// cancellation hard-kills the direct child before the process group receives
+	// its cooperative SIGTERM window, so use Command and let the reaper own the
+	// TERM -> bounded grace -> KILL escalation explicitly.
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...) //nolint:gosec
+	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec
 	configureSessionProcessGroup(cmd)
 	cmd.Env = composeEnv(s.opts.BaseEnv, spec.Env, map[string]string{
 		"DONMAI_SESSION_ID":    spec.SessionID,
@@ -775,25 +784,42 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		// rather than never reaping the session.
 		pumpsDone := make(chan struct{})
 		go func() { pumps.Wait(); close(pumpsDone) }()
+		cancelled := false
 		select {
 		case <-pumpsDone:
 		case <-ctx.Done():
-			// A stop/drain must not spend the normal output grace waiting on
-			// a descendant that inherited a pipe. Kill the complete dedicated
-			// group before Wait so the pumps can finish promptly.
-			_ = s.killProcessGroup(cmd)
+			// Cancellation has already sent SIGTERM under the exact session
+			// lock. Give the complete group its cooperative window before a
+			// TERM-ignoring tree is escalated to SIGKILL.
+			cancelled = true
+			if outcome := s.waitProcessGroup(cmd, sessionTerminationGrace); outcome != processGroupGone {
+				s.forceKillGeneration(ss)
+			}
 		case <-time.After(pumpDrainGrace):
+			// A naturally exited leader can leave a descendant holding a pipe.
+			// There was no cooperative stop request in this path, so reclaim the
+			// dedicated group directly rather than retaining terminal capacity.
+			s.forceKillGeneration(ss)
 		}
 		err := cmd.Wait()
 
-		// cmd.Wait proves only that the direct child has exited. A worker may
-		// have left descendants in its dedicated group, so terminate and reap
-		// that group before handing terminal ownership to listeners or freeing
-		// this SessionID for a new admission.
-		_ = s.killProcessGroup(cmd)
-		waitSessionProcessGroup(cmd)
+		// cmd.Wait proves only that the direct child exited. If descendants
+		// remain, kill the daemon-owned group now: a normal leader exit must not
+		// turn a surviving, pipe-silent child into a capacity leak. The zero
+		// duration probe performs one classification without adding a grace period.
+		if s.waitProcessGroup(cmd, 0) != processGroupGone {
+			if killErr := s.reapRemainingProcessGroup(ss); killErr != nil && !errors.Is(killErr, errSessionProcessExited) {
+				slog.Warn("worker process group cleanup signal failed", "sessionId", spec.SessionID, "err", killErr)
+			}
+		}
+		// A killed group can still be reported as EPERM or zombie-only. Bound that
+		// observation and release the terminal generation after logging the precise
+		// outcome; an unobservable group must not retain a SessionID forever.
+		if outcome := s.waitProcessGroup(cmd, processGroupPostWaitGrace); outcome != processGroupGone {
+			slog.Warn("worker process group did not disappear after direct-child reap", "sessionId", spec.SessionID, "outcome", outcome)
+		}
 
-		event, reaped := s.reapSession(spec.SessionID, ss, err, ctx.Err() != nil)
+		event, reaped := s.reapSession(spec.SessionID, ss, err, cancelled)
 		if !reaped {
 			cancel()
 			return
@@ -805,24 +831,59 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	return &handle, nil
 }
 
-// StopSession requests termination for one session without releasing its
-// admission key. The reaper remains the sole terminal owner: it waits for the
-// complete dedicated process group, synchronously notifies listeners, then
+// StopSession requests cooperative termination for one session without releasing
+// its admission key. The reaper remains the sole terminal owner: it waits for
+// the complete dedicated process group, synchronously notifies listeners, then
 // releases the exact registry entry. Keeping that order prevents same-ID
 // replacement and stale Ended cleanup from crossing generations.
 func (s *WorkerSpawner) StopSession(id string) bool {
 	s.mu.Lock()
 	ss := s.sessions[id]
-	if ss == nil {
+	if ss == nil || ss.terminal {
 		s.mu.Unlock()
 		return false
 	}
-	ss.stopRequested = true
+	// Signal initiation is intentionally serialized under the exact generation:
+	// the terminal reaper cannot release this id between ownership validation and
+	// SIGTERM. A repeated Stop remains a successful request without a second signal.
+	if !ss.stopRequested {
+		ss.stopRequested = true
+		_ = s.terminateProcessGroup(ss.cmd)
+	}
 	s.mu.Unlock()
-
-	_ = s.killProcessGroup(ss.cmd)
 	ss.cancel()
 	return true
+}
+
+// forceKillGeneration escalates one exact live generation while holding the
+// same lock that serializes terminal classification and registry release.
+func (s *WorkerSpawner) forceKillGeneration(expected *spawnedSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected || expected.forceKillRequested {
+		return
+	}
+	expected.stopRequested = true
+	if err := s.killProcessGroup(expected.cmd); err == nil || errors.Is(err, errSessionProcessExited) {
+		expected.forceKillRequested = true
+	}
+}
+
+// reapRemainingProcessGroup reclaims descendants left after cmd.Wait without
+// rewriting the direct child's completed outcome as an operator stop. It holds
+// the exact-generation lock across the signal so a released ID cannot receive a
+// stale signal from its predecessor.
+func (s *WorkerSpawner) reapRemainingProcessGroup(expected *spawnedSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected || expected.forceKillRequested {
+		return nil
+	}
+	if err := s.killProcessGroup(expected.cmd); err != nil {
+		return err
+	}
+	expected.forceKillRequested = true
+	return nil
 }
 
 // ForceKillSession sends SIGKILL to the daemon-created process group for one
@@ -833,7 +894,7 @@ func (s *WorkerSpawner) ForceKillSession(id string) error {
 	s.mu.Lock()
 	ss := s.sessions[id]
 	_, owned := s.sessionHistory[id]
-	if ss == nil {
+	if ss == nil || ss.terminal {
 		s.mu.Unlock()
 		if owned {
 			return nil
@@ -889,6 +950,10 @@ func (s *WorkerSpawner) reapSession(id string, expected *spawnedSession, err err
 	default:
 		expected.handle.State = SessionFailed
 	}
+	// Retain the exact map entry through synchronous Ended delivery, but make
+	// this generation terminal before listeners run. Stop/ForceKill can therefore
+	// never signal a process after classification while release is pending.
+	expected.terminal = true
 	return SessionEvent{Kind: SessionEventEnded, Handle: expected.handle, Spec: expected.spec, ExitErr: err}, true
 }
 
@@ -986,15 +1051,11 @@ func (s *WorkerSpawner) DrainContext(ctx context.Context) error {
 			}
 			s.mu.Unlock()
 
-			// Process cancellation may block, so it must never happen under s.mu.
+			// Request TERM outside the snapshot lock. StopSession serializes each
+			// signal with the exact live generation, then the reaper grants the
+			// bounded cooperative window before SIGKILL escalation.
 			for _, ss := range stragglers {
-				s.mu.Lock()
-				if s.sessions[ss.spec.SessionID] == ss {
-					ss.stopRequested = true
-				}
-				s.mu.Unlock()
-				_ = s.killProcessGroup(ss.cmd)
-				ss.cancel()
+				s.StopSession(ss.spec.SessionID)
 			}
 			return incomplete
 		case <-ticker.C:

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -416,6 +417,73 @@ func TestServer_StopEndpointTransitionsState(t *testing.T) {
 	}
 	if d.State() == StateRunning {
 		t.Errorf("expected state to leave 'running' after stop")
+	}
+}
+
+func TestServer_StopEndpointRetainsCompletionOwnerAfterIncompleteDrain(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	spawner := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn: func(SessionSpec, []string) ([]string, error) {
+			close(entered)
+			<-release
+			return nil, errors.New("pre-spawn released during shutdown")
+		},
+	})
+	d := New(Options{})
+	d.spawner = spawner
+	d.setState(StateRunning)
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := spawner.AcceptWork(SessionSpec{SessionID: "reserved", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pre-spawn hook did not enter")
+	}
+
+	s := NewServer(d)
+	s.stopAttemptTimeout = 5 * time.Millisecond
+	s.stopRetryDelay = time.Millisecond
+	httpServer := httptest.NewServer(s.httpd.Handler)
+	defer httpServer.Close()
+	res, err := http.Post(httpServer.URL+"/api/daemon/stop", "application/json", nil) //nolint:gosec
+	if err != nil {
+		t.Fatalf("POST stop: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("POST stop status = %d, want 200", res.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for d.State() != StateDraining && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if d.State() != StateDraining {
+		t.Fatalf("state during incomplete endpoint stop = %q, want draining", d.State())
+	}
+	select {
+	case <-d.Done():
+		t.Fatal("Done closed while endpoint-owned drain remained incomplete")
+	default:
+	}
+
+	close(release)
+	if err := <-acceptDone; err == nil {
+		t.Fatal("reserved AcceptWork unexpectedly succeeded")
+	}
+	select {
+	case <-d.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("endpoint completion owner did not retry to final stop")
+	}
+	if d.State() != StateStopped {
+		t.Fatalf("state after endpoint retry = %q, want stopped", d.State())
 	}
 }
 
