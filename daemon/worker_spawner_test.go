@@ -740,6 +740,74 @@ func TestSpawner_PumpDrainLifecycle(t *testing.T) {
 		}
 		waitForActiveCount(t, s, 0)
 	})
+
+	t.Run("blocked output writer does not retain terminal session", func(t *testing.T) {
+		const sessionID = "blocked-writer"
+		clock := newFakePumpDrainClock()
+		writer := &blockingPrefixWriter{
+			entered:  make(chan struct{}),
+			release:  make(chan struct{}),
+			returned: make(chan struct{}),
+		}
+		pumpsJoined := make(chan struct{})
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "x", Repository: repository}},
+			MaxConcurrentSessions: 1,
+			WorkerCommand:         []string{"/bin/sh", "-c", "printf blocked\\n"},
+			StdoutPrefixWriter:    writer,
+		})
+		s.pumpDrainTimerFactory = clock.newTimer
+		s.afterPumpsJoined = func() { close(pumpsJoined) }
+		ended := make(chan SessionEvent, 1)
+		s.On(func(ev SessionEvent) {
+			if ev.Kind == SessionEventEnded {
+				ended <- ev
+			}
+		})
+		writerEntered := false
+		t.Cleanup(func() {
+			close(writer.release)
+			if writerEntered {
+				waitSpawnerSignal(t, writer.returned, "blocked output writer return")
+			}
+			if err := s.Drain(time.Second); err != nil {
+				t.Errorf("Drain cleanup: %v", err)
+			}
+		})
+
+		if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
+			t.Fatalf("AcceptWork: %v", err)
+		}
+		waitSpawnerSignal(t, writer.entered, "blocking output writer")
+		writerEntered = true
+		pumpTimer := waitPumpDrainTimer(t, clock)
+		if pumpTimer.duration != pumpDrainGrace {
+			t.Fatalf("pump drain timer duration = %v, want %v", pumpTimer.duration, pumpDrainGrace)
+		}
+
+		clock.Advance(2 * pumpDrainGrace)
+		closeTimer := waitPumpDrainTimer(t, clock)
+		if closeTimer.duration != pumpCloseJoinGrace {
+			t.Fatalf("post-close pump join timer duration = %v, want %v", closeTimer.duration, pumpCloseJoinGrace)
+		}
+		clock.Advance(2 * pumpCloseJoinGrace)
+
+		ev := waitSpawnerEvent(t, ended, "blocked-writer Ended event")
+		if ev.Handle.State != SessionCompleted {
+			t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionCompleted)
+		}
+		waitForActiveCount(t, s, 0)
+		select {
+		case <-pumpsJoined:
+			t.Fatal("blocked writer was treated as a joined output pump")
+		default:
+		}
+		select {
+		case <-writer.returned:
+			t.Fatal("blocked writer returned before the test released it")
+		default:
+		}
+	})
 }
 
 func TestSpawner_DrainContextReturnsNilWhenDeadlineRacesFinalRelease(t *testing.T) {
@@ -977,6 +1045,23 @@ func TestSpawner_ActiveWorkareas_DeterministicOrdering(t *testing.T) {
 			t.Errorf("entry %d: want %q, got %q", i, w, got[i].SessionID)
 		}
 	}
+}
+
+// blockingPrefixWriter models an external output sink that has accepted a line
+// but cannot return. Its release channel lets the terminal lifecycle regression
+// prove that the session is released before the sink is unblocked.
+type blockingPrefixWriter struct {
+	entered      chan struct{}
+	release      chan struct{}
+	returned     chan struct{}
+	enteredOnce  sync.Once
+	returnedOnce sync.Once
+}
+
+func (w *blockingPrefixWriter) WriteWorkerLine(string, string) {
+	w.enteredOnce.Do(func() { close(w.entered) })
+	<-w.release
+	w.returnedOnce.Do(func() { close(w.returned) })
 }
 
 // fakePumpDrainClock drives per-spawner pump timers without wall-clock waits.
@@ -2017,6 +2102,7 @@ func TestSpawner_ActiveInteractiveCount(t *testing.T) {
 		t.Fatal("StopSession(headless) = false, want true")
 	}
 	waitSessionEnd(t, ended)
+	waitForActiveCount(t, s, 4)
 	active, interactive = s.ActiveSessionCounts()
 	if active != 4 || interactive != 3 {
 		t.Fatalf("ActiveSessionCounts after stopping headless session = (%d, %d), want (4, 3)", active, interactive)
@@ -2027,6 +2113,7 @@ func TestSpawner_ActiveInteractiveCount(t *testing.T) {
 		t.Fatal("StopSession(interview) = false, want true")
 	}
 	waitSessionEnd(t, ended)
+	waitForActiveCount(t, s, 3)
 	active, interactive = s.ActiveSessionCounts()
 	if active != 3 || interactive != 2 {
 		t.Fatalf("ActiveSessionCounts after stopping interview session = (%d, %d), want (3, 2)", active, interactive)
@@ -2037,6 +2124,7 @@ func TestSpawner_ActiveInteractiveCount(t *testing.T) {
 		t.Fatal("StopSession(pty-1) = false, want true")
 	}
 	waitSessionEnd(t, ended)
+	waitForActiveCount(t, s, 2)
 	active, interactive = s.ActiveSessionCounts()
 	if active != 2 || interactive != 1 {
 		t.Fatalf("ActiveSessionCounts after stopping PTY session = (%d, %d), want (2, 1)", active, interactive)

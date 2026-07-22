@@ -108,7 +108,9 @@ type SpawnerOptions struct {
 
 // PrefixedWriter is the minimal sink interface used by the spawner to emit
 // child stdout/stderr. Implementations are responsible for prefixing each
-// line with the worker tag.
+// line with the worker tag and must return promptly. After a terminal pipe-close
+// deadline, a blocked writer is detached from session ownership so it cannot
+// retain the worker slot indefinitely.
 type PrefixedWriter interface {
 	WriteWorkerLine(workerID, line string)
 }
@@ -135,6 +137,13 @@ const (
 // observed the direct child exit and a descendant may still hold an inherited
 // write end; an ordinary running worker never owns this deadline.
 const pumpDrainGrace = 10 * time.Second
+
+// pumpCloseJoinGrace bounds the final join after the terminal reaper closes its
+// pipe readers. A PrefixedWriter is external code and can block after a reader
+// has been closed; such a writer must not retain the terminal session or its
+// capacity forever. This interval is reachable only after direct-child exit and
+// the output-drain deadline, never while an ordinary worker is running.
+const pumpCloseJoinGrace = 250 * time.Millisecond
 
 // pumpDrainTimer is the minimal stoppable timer the terminal pump-drain path
 // needs. Keeping it narrow lets lifecycle tests advance the deadline without
@@ -878,6 +887,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			}
 		}
 
+		pumpsJoined := true
 		if pumpsRemaining > 0 {
 			timerFactory := s.pumpDrainTimerFactory
 			if timerFactory == nil {
@@ -900,25 +910,44 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 					}
 					// Descendants can retain inherited write ends after the group
 					// signal races with their exit. Closing daemon-owned reads makes
-					// pipe-read pumps finish, then wait synchronously for both.
+					// pipe-read pumps finish. A PrefixedWriter can itself be blocked,
+					// though, so only retain terminal ownership for a bounded final join.
 					_ = stdout.Close()
 					_ = stderr.Close()
+					closeTimer := timerFactory(pumpCloseJoinGrace)
 					for pumpsRemaining > 0 {
 						select {
 						case <-pumpDone:
 							pumpsRemaining--
 						case <-ctxDone:
 							handleCancellation()
+						case <-closeTimer.C():
+							// Consume notifications already ready at the deadline before
+							// allowing a non-cooperative external writer to outlive this
+							// terminal generation. pumpDone is sized for both later sends.
+							for pumpsRemaining > 0 {
+								select {
+								case <-pumpDone:
+									pumpsRemaining--
+								default:
+									pumpsJoined = false
+									slog.Warn("worker output pump did not stop after pipe close", "sessionId", spec.SessionID, "remainingPumps", pumpsRemaining)
+									pumpsRemaining = 0
+								}
+							}
 						}
 					}
+					_ = closeTimer.Stop()
 				}
 			}
 			_ = timer.Stop()
 		}
 
-		// Both pump completions have been consumed before terminal ownership moves
-		// to process-group cleanup and synchronous Ended delivery.
-		if s.afterPumpsJoined != nil {
+		// Responsive pumps are joined before terminal ownership moves to
+		// process-group cleanup and synchronous Ended delivery. A blocked external
+		// writer may outlive the bounded post-close join, but it cannot retain the
+		// session registry entry or capacity.
+		if pumpsJoined && s.afterPumpsJoined != nil {
 			s.afterPumpsJoined()
 		}
 
