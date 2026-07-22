@@ -205,11 +205,37 @@ func TestDaemonStopPropagatesReservationAwareDrainError(t *testing.T) {
 		t.Fatalf("DrainIncompleteError reservations = %d, want 1", incomplete.SpawnReservations)
 	}
 
+	select {
+	case <-d.Done():
+		t.Fatal("Done closed after incomplete drain")
+	default:
+	}
+	if got := d.State(); got != StateDraining {
+		t.Fatalf("State after incomplete Stop = %q, want %q", got, StateDraining)
+	}
+	// Lifecycle methods racing or following stop initiation must not reopen the
+	// admission barrier, even while a later Stop retry is still possible.
+	d.Resume()
+	if spawner.IsAccepting() {
+		t.Fatal("Resume reopened admission after Stop initiation")
+	}
+	if err := d.Start(context.Background()); err == nil {
+		t.Fatal("Start succeeded after Stop initiation")
+	}
+
 	close(release)
 	if err := <-acceptDone; err == nil {
 		t.Fatal("AcceptWork unexpectedly succeeded")
 	}
-	if err := spawner.DrainContext(context.Background()); err != nil {
-		t.Fatalf("fresh final drain: %v", err)
+	if err := d.Stop(context.Background()); err != nil {
+		t.Fatalf("retry Stop after reservation release: %v", err)
+	}
+	select {
+	case <-d.Done():
+	default:
+		t.Fatal("Done remained open after successful retry")
+	}
+	if got := d.State(); got != StateStopped {
+		t.Fatalf("State after successful retry = %q, want %q", got, StateStopped)
 	}
 }

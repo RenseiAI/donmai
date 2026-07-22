@@ -390,6 +390,7 @@ type PollService struct {
 
 	mu       sync.Mutex
 	cancel   context.CancelFunc
+	done     chan struct{}
 	running  bool
 	workerID string // mutable: refreshed by OnReregister
 	jwt      string // mutable: refreshed by OnReregister
@@ -449,23 +450,34 @@ func (p *PollService) Start() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
+	p.done = make(chan struct{})
+	done := p.done
 	p.running = true
 	p.mu.Unlock()
 
-	go p.loop(ctx)
+	go func() {
+		defer close(done)
+		p.loop(ctx)
+	}()
 }
 
 // Stop terminates the poll goroutine. Safe to call multiple times.
 func (p *PollService) Stop() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if !p.running {
+		p.mu.Unlock()
 		return
 	}
-	if p.cancel != nil {
-		p.cancel()
-	}
+	cancel := p.cancel
+	done := p.done
 	p.running = false
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
 }
 
 // IsRunning reports whether the poll goroutine is active.

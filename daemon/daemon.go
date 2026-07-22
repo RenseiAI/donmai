@@ -251,9 +251,22 @@ type Daemon struct {
 	// Wave 9 / Track A3.
 	workareaArchive *WorkareaArchiveRegistry
 
-	stopOnce sync.Once
-	stopErr  error
-	doneCh   chan struct{}
+	// lifecycleMu serializes Start, Pause, Resume, Stop, and Update. A Daemon
+	// instance is single-run: once Stop begins no method may reopen admission.
+	lifecycleMu   sync.Mutex
+	stopInitiated bool
+	terminal      bool
+	stopErr       error
+	doneCh        chan struct{}
+
+	// Landing callbacks are independent of worker spawning, so they have their
+	// own admission, cancellation, and join ownership. Done is never closed
+	// while an entered callback remains live.
+	landingMu       sync.Mutex
+	landingCtx      context.Context
+	landingCancel   context.CancelFunc
+	landingStopping bool
+	landingWG       sync.WaitGroup
 }
 
 // New constructs a Daemon. Call Start() to bring it online.
@@ -274,9 +287,12 @@ func New(opts Options) *Daemon {
 	// ephemeral here lets parallel tests bind 127.0.0.1:0 and have
 	// the kernel pick free ports, eliminating the port-7734 bind
 	// flake observed under -race when many tests share the default.
+	landingCtx, landingCancel := context.WithCancel(context.Background())
 	d := &Daemon{
 		opts:           opts,
 		doneCh:         make(chan struct{}),
+		landingCtx:     landingCtx,
+		landingCancel:  landingCancel,
 		sessionDetails: newSessionDetailStore(),
 		routingTraces:  NewRoutingTraceStore(DefaultRoutingRingBufferSize),
 	}
@@ -438,8 +454,10 @@ func (d *Daemon) maxConcurrentSessions() int {
 // heartbeat, and start the spawner. The HTTP server is NOT started here;
 // callers do that explicitly via Server.Start so they can pick the bind.
 func (d *Daemon) Start(ctx context.Context) error {
-	if s := d.State(); s != StateStopped {
-		return fmt.Errorf("cannot start — current state %q", s)
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopInitiated || d.terminal || d.State() != StateStopped {
+		return fmt.Errorf("cannot start — current state %q", d.State())
 	}
 	d.setState(StateStarting)
 
@@ -823,54 +841,63 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	}
 }
 
-// Stop drains spawned work, halts the heartbeat/poller loops, closes the yaml
-// watcher, and transitions to StateStopped. The caller context bounds the
-// configured drain timeout. A DrainIncompleteError means the daemon core has
-// stopped but an admitted spawn still needs an external final drain barrier.
-// Safe to call concurrently or repeatedly — the whole body is gated by stopOnce
-// so a deferred Stop in a test fixture racing with an HTTP handler is benign.
+// Stop begins a one-way terminal transition. An incomplete drain leaves the
+// daemon in StateDraining with Done open so a later bounded Stop call can finish
+// the same transition. Only a fully drained daemon stops its loops, reports
+// StateStopped, and closes Done.
 func (d *Daemon) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	d.stopOnce.Do(func() {
-		if d.State() == StateStopped {
-			return
-		}
-		d.setState(StateDraining)
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.terminal {
+		return d.stopErr
+	}
+	d.stopInitiated = true
+	d.setState(StateDraining)
 
-		timeout := 30 * time.Second
-		if cfg := d.Config(); cfg != nil && cfg.AutoUpdate.DrainTimeoutSeconds > 0 {
-			timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
-		}
-		if d.spawner != nil {
-			drainCtx, cancel := context.WithTimeout(ctx, timeout)
-			drainErr := d.spawner.DrainContext(drainCtx)
-			cancel()
-			d.mu.Lock()
+	// Prevent any new landing callback before draining session admission, then
+	// cancel and join every callback that already entered.
+	d.landingMu.Lock()
+	d.landingStopping = true
+	if d.landingCancel != nil {
+		d.landingCancel()
+	}
+	d.landingMu.Unlock()
+	if d.poller != nil {
+		d.poller.Stop()
+	}
+	d.landingWG.Wait()
+
+	timeout := 30 * time.Second
+	if cfg := d.Config(); cfg != nil && cfg.AutoUpdate.DrainTimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
+	}
+	if d.spawner != nil {
+		drainCtx, cancel := context.WithTimeout(ctx, timeout)
+		drainErr := d.spawner.DrainContext(drainCtx)
+		cancel()
+		if drainErr != nil {
 			d.stopErr = drainErr
-			d.mu.Unlock()
+			return drainErr
 		}
-		if d.heartbeat != nil {
-			d.heartbeat.Stop()
-		}
-		if d.poller != nil {
-			d.poller.Stop()
-		}
-		if d.tokenRefresher != nil {
-			d.tokenRefresher.Stop()
-		}
-		if d.yamlWatcherStop != nil {
-			d.yamlWatcherStop()
-			d.yamlWatcherStop = nil
-		}
-		close(d.doneCh)
-		d.setState(StateStopped)
-	})
-	d.mu.RLock()
-	err := d.stopErr
-	d.mu.RUnlock()
-	return err
+	}
+	if d.heartbeat != nil {
+		d.heartbeat.Stop()
+	}
+	if d.tokenRefresher != nil {
+		d.tokenRefresher.Stop()
+	}
+	if d.yamlWatcherStop != nil {
+		d.yamlWatcherStop()
+		d.yamlWatcherStop = nil
+	}
+	d.stopErr = nil
+	d.terminal = true
+	close(d.doneCh)
+	d.setState(StateStopped)
+	return nil
 }
 
 // handlePollWorkItem is the body of the primary poll loop's OnWork callback,
@@ -898,7 +925,7 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	// agent or counts toward the concurrency quota.
 	if item.WorkType == LandingWorkType {
 		if onLanding := d.onLandingWork(); onLanding != nil {
-			if lerr := onLanding(context.Background(), item); lerr != nil {
+			if lerr := d.runLandingWork(onLanding, item); lerr != nil {
 				slog.Warn("daemon poll: landing-run handler failed",
 					"repository", item.Repository, "err", lerr)
 			}
@@ -975,6 +1002,22 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	return nil
 }
 
+// runLandingWork owns one landing callback from admission through completion.
+// Stop fences additions under landingMu before canceling and waiting, so no
+// callback can begin after the stop barrier and Done cannot outrun its return.
+func (d *Daemon) runLandingWork(fn func(context.Context, PollWorkItem) error, item PollWorkItem) error {
+	d.landingMu.Lock()
+	if d.landingStopping {
+		d.landingMu.Unlock()
+		return errors.New("daemon is stopping; landing work rejected")
+	}
+	ctx := d.landingCtx
+	d.landingWG.Add(1)
+	d.landingMu.Unlock()
+	defer d.landingWG.Done()
+	return fn(ctx, item)
+}
+
 // Done returns a channel that is closed when the daemon has fully stopped.
 func (d *Daemon) Done() <-chan struct{} {
 	return d.doneCh
@@ -982,6 +1025,11 @@ func (d *Daemon) Done() <-chan struct{} {
 
 // Pause stops accepting new work without draining.
 func (d *Daemon) Pause() {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopInitiated || d.State() != StateRunning {
+		return
+	}
 	if d.spawner != nil {
 		d.spawner.Pause()
 	}
@@ -990,6 +1038,11 @@ func (d *Daemon) Pause() {
 
 // Resume re-enables accepting work.
 func (d *Daemon) Resume() {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopInitiated || d.State() != StatePaused {
+		return
+	}
 	if d.spawner != nil {
 		d.spawner.Resume()
 	}
@@ -1070,6 +1123,11 @@ func (d *Daemon) SessionDetail(sessionID string) (*SessionDetail, bool) {
 // error is returned. The caller (HTTP handler) typically returns the
 // outcome to the client and may then call Stop().
 func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopInitiated || d.State() != StateRunning {
+		return nil, fmt.Errorf("cannot update — current state %q", d.State())
+	}
 	cfg := d.Config()
 	if cfg == nil {
 		return nil, errors.New("no config loaded")
@@ -1093,7 +1151,9 @@ func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
 
 	timeout := time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
 	if d.spawner != nil {
-		_ = d.spawner.Drain(timeout)
+		if err := d.spawner.Drain(timeout); err != nil {
+			return nil, fmt.Errorf("drain before update: %w", err)
+		}
 	}
 
 	updater := NewUpdater(UpdaterOptions{

@@ -640,6 +640,7 @@ func TestServer_SessionDetail_MethodNotAllowed(t *testing.T) {
 func TestServer_SessionStop_HappyPath(t *testing.T) {
 	d, srv, cleanup := mustStartDaemon(t)
 	defer cleanup()
+	ended := sessionEnds(d.spawner)
 
 	// mustStartDaemon spawns `sleep 10`, so the session stays resident.
 	if _, err := d.AcceptWork(SessionSpec{
@@ -659,6 +660,7 @@ func TestServer_SessionStop_HappyPath(t *testing.T) {
 	if !resp.OK {
 		t.Errorf("resp.OK = false, want true (%+v)", resp)
 	}
+	waitSessionEnd(t, ended)
 	if d.ActiveSessionCount() != 0 {
 		t.Errorf("ActiveSessionCount after stop = %d, want 0", d.ActiveSessionCount())
 	}
@@ -697,6 +699,7 @@ func TestServer_SessionStop_MethodNotAllowed(t *testing.T) {
 func TestServer_SessionStop_LeavesSiblingRunning(t *testing.T) {
 	d, srv, cleanup := mustStartDaemon(t)
 	defer cleanup()
+	ended := sessionEnds(d.spawner)
 
 	for _, id := range []string{"keep", "drop"} {
 		if _, err := d.AcceptWork(SessionSpec{
@@ -712,6 +715,7 @@ func TestServer_SessionStop_LeavesSiblingRunning(t *testing.T) {
 	if status := requirePost(t, srv.Addr(), "/api/daemon/sessions/drop/stop", nil, nil); status != http.StatusOK {
 		t.Fatalf("stop status = %d, want 200", status)
 	}
+	waitSessionEnd(t, ended)
 	if d.ActiveSessionCount() != 1 {
 		t.Fatalf("ActiveSessionCount after stop = %d, want 1", d.ActiveSessionCount())
 	}

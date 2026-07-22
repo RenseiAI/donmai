@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -47,6 +48,12 @@ func TestSpawner_ForceKillSessionProcessTree(t *testing.T) {
 	waitSessionEnd(t, ended)
 	if got := s.ActiveCount(); got != 0 {
 		t.Fatalf("ActiveCount = %d, want 0", got)
+	}
+	// Ended is not delivered until the full daemon-owned group has gone away;
+	// checking the group itself catches a leader-exited descendant surviving the
+	// direct-child cmd.Wait path.
+	if err := syscall.Kill(-handle.PID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("process group still exists after Ended: %v", err)
 	}
 	if err := s.ForceKillSession("hard-kill"); err != nil {
 		t.Fatalf("duplicate force kill should be idempotent: %v", err)

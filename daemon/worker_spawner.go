@@ -165,10 +165,12 @@ type WorkerSpawner struct {
 const sessionHistoryLimit = 4096
 
 type spawnedSession struct {
-	handle SessionHandle
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-	spec   SessionSpec
+	handle             SessionHandle
+	cmd                *exec.Cmd
+	cancel             context.CancelFunc
+	spec               SessionSpec
+	stopRequested      bool // guarded by WorkerSpawner.mu
+	forceKillRequested bool // guarded by WorkerSpawner.mu
 }
 
 // NewWorkerSpawner constructs a spawner. Workers will not be spawned until
@@ -775,9 +777,21 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		go func() { pumps.Wait(); close(pumpsDone) }()
 		select {
 		case <-pumpsDone:
+		case <-ctx.Done():
+			// A stop/drain must not spend the normal output grace waiting on
+			// a descendant that inherited a pipe. Kill the complete dedicated
+			// group before Wait so the pumps can finish promptly.
+			_ = s.killProcessGroup(cmd)
 		case <-time.After(pumpDrainGrace):
 		}
 		err := cmd.Wait()
+
+		// cmd.Wait proves only that the direct child has exited. A worker may
+		// have left descendants in its dedicated group, so terminate and reap
+		// that group before handing terminal ownership to listeners or freeing
+		// this SessionID for a new admission.
+		_ = s.killProcessGroup(cmd)
+		waitSessionProcessGroup(cmd)
 
 		event, reaped := s.reapSession(spec.SessionID, ss, err, ctx.Err() != nil)
 		if !reaped {
@@ -785,38 +799,17 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			return
 		}
 		ss.cancel()
-		s.emit(event)
+		s.emitAndReleaseSession(spec.SessionID, ss, event)
 	}()
 
 	return &handle, nil
 }
 
-// StopSession terminates a single in-flight session by id without
-// disturbing its siblings or pausing the spawner (unlike Drain, which
-// stops accepting and force-kills the whole pool). It looks up the stored
-// spawnedSession, invokes its stored cancel (the same process-teardown
-// machinery Drain uses for stragglers), and deletes it from s.sessions so
-// the capacity slot frees immediately — even if the underlying provider is
-// wedged and the cmd.Wait goroutine has not yet observed the exit.
-//
-// This is the hard out-of-band leg of the deterministic cancel wire
-// (Guard 3): the platform's fast in-band path is the heartbeat stop signal
-// (immediate LostOwnership), and this gives head-of-line-blocking
-// isolation — one stuck session can be killed without a pool drain.
-//
-// Returns false when no session with the given id is currently active
-// (already exited or never spawned); true when a session was found and its
-// cancel invoked + slot freed. Deleting under the lock makes the slot-free
-// race-free against AcceptWork's capacity check; cancel() is invoked after
-// the lock is released so a slow process teardown never blocks AcceptWork.
-//
-// StopSession itself emits the SessionEventEnded lifecycle event (state
-// SessionTerminated) immediately, rather than relying on the spawn
-// goroutine's cmd.Wait → emit: a wedged provider may never let cmd.Wait
-// return, so deferring the event would strand listeners (and the slot-free
-// signal) indefinitely. The spawn goroutine's own cmd.Wait → delete/emit is
-// a no-op once StopSession has removed the entry — it guards on a nil lookup
-// — so the event fires exactly once and a double-free is impossible.
+// StopSession requests termination for one session without releasing its
+// admission key. The reaper remains the sole terminal owner: it waits for the
+// complete dedicated process group, synchronously notifies listeners, then
+// releases the exact registry entry. Keeping that order prevents same-ID
+// replacement and stale Ended cleanup from crossing generations.
 func (s *WorkerSpawner) StopSession(id string) bool {
 	s.mu.Lock()
 	ss := s.sessions[id]
@@ -824,60 +817,58 @@ func (s *WorkerSpawner) StopSession(id string) bool {
 		s.mu.Unlock()
 		return false
 	}
-	delete(s.sessions, id)
-	ss.handle.State = SessionTerminated
-	final := ss.handle
+	ss.stopRequested = true
 	s.mu.Unlock()
 
-	// Cancel outside the lock: the stored cancel tears the child process
-	// down (context cancellation → process kill), which can take longer
-	// than we want to hold s.mu (AcceptWork / capacity checks contend on
-	// it). The slot is already freed above.
+	_ = s.killProcessGroup(ss.cmd)
 	ss.cancel()
-	s.emit(SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: ss.spec})
 	return true
 }
 
 // ForceKillSession sends SIGKILL to the daemon-created process group for one
-// owned session. It is deliberately separate from StopSession so normal local
-// stop paths retain their existing context-cancellation behavior.
-//
-// A session seen by this daemon but already reaped is an idempotent success.
-// A never-seen id is rejected: that distinction prevents a mutation routed to
-// the wrong daemon from being falsely acknowledged. The bounded history is
-// process-local because ownership does not survive a daemon restart.
+// owned session. It deliberately leaves terminal ownership with the reaper;
+// callers receive a successful signal acknowledgement, not a premature
+// assertion that the process group has exited.
 func (s *WorkerSpawner) ForceKillSession(id string) error {
 	s.mu.Lock()
 	ss := s.sessions[id]
 	_, owned := s.sessionHistory[id]
-	s.mu.Unlock()
 	if ss == nil {
+		s.mu.Unlock()
 		if owned {
 			return nil
 		}
 		return fmt.Errorf("session %q is not owned by this daemon", id)
 	}
-
-	if err := s.killProcessGroup(ss.cmd); err != nil && !errors.Is(err, errSessionProcessExited) {
-		return fmt.Errorf("SIGKILL session %q process group: %w", id, err)
-	}
-
-	// The wait goroutine may have reaped the process after the signal. Only the
-	// goroutine that still owns this exact registry entry emits the terminal
-	// event; duplicates and races are successful no-ops.
-	s.mu.Lock()
-	if s.sessions[id] != ss {
+	if ss.forceKillRequested {
 		s.mu.Unlock()
 		return nil
 	}
-	delete(s.sessions, id)
-	ss.handle.State = SessionTerminated
-	final := ss.handle
-	s.mu.Unlock()
 
+	// Serialize a successful kill acknowledgement with the session generation.
+	// A duplicate mutation racing the reaper must be idempotent rather than
+	// observing a transient leader/process-group state as a failed command.
+	ss.stopRequested = true
+	if err := s.killProcessGroup(ss.cmd); err != nil && !errors.Is(err, errSessionProcessExited) {
+		s.mu.Unlock()
+		return fmt.Errorf("SIGKILL session %q process group: %w", id, err)
+	}
+	ss.forceKillRequested = true
+	s.mu.Unlock()
 	ss.cancel()
-	s.emit(SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: ss.spec})
 	return nil
+}
+
+// emitAndReleaseSession retains exact ownership through synchronous listener
+// delivery. Listener cleanup is therefore generation-safe: it cannot observe a
+// replacement under the same SessionID until the terminal event is complete.
+func (s *WorkerSpawner) emitAndReleaseSession(id string, expected *spawnedSession, event SessionEvent) {
+	s.emit(event)
+	s.mu.Lock()
+	if s.sessions[id] == expected {
+		delete(s.sessions, id)
+	}
+	s.mu.Unlock()
 }
 
 // reapSession removes expected from the live registry and builds its terminal
@@ -886,22 +877,19 @@ func (s *WorkerSpawner) ForceKillSession(id string) error {
 // entry if a caller or future maintenance path replaces an ID.
 func (s *WorkerSpawner) reapSession(id string, expected *spawnedSession, err error, cancelled bool) (SessionEvent, bool) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.sessions[id] != expected {
-		s.mu.Unlock()
 		return SessionEvent{}, false
 	}
-	delete(s.sessions, id)
 	switch {
-	case err == nil:
+	case err == nil && !expected.stopRequested:
 		expected.handle.State = SessionCompleted
-	case cancelled:
+	case expected.stopRequested || cancelled:
 		expected.handle.State = SessionTerminated
 	default:
 		expected.handle.State = SessionFailed
 	}
-	final := expected.handle
-	s.mu.Unlock()
-	return SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: expected.spec, ExitErr: err}, true
+	return SessionEvent{Kind: SessionEventEnded, Handle: expected.handle, Spec: expected.spec, ExitErr: err}, true
 }
 
 func (s *WorkerSpawner) rememberSessionLocked(id string) {
@@ -1000,6 +988,12 @@ func (s *WorkerSpawner) DrainContext(ctx context.Context) error {
 
 			// Process cancellation may block, so it must never happen under s.mu.
 			for _, ss := range stragglers {
+				s.mu.Lock()
+				if s.sessions[ss.spec.SessionID] == ss {
+					ss.stopRequested = true
+				}
+				s.mu.Unlock()
+				_ = s.killProcessGroup(ss.cmd)
 				ss.cancel()
 			}
 			return incomplete

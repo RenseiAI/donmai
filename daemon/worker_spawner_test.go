@@ -590,7 +590,7 @@ func TestSpawner_DrainContextReturnsNilWhenDeadlineRacesFinalRelease(t *testing.
 	}
 }
 
-func TestSpawner_StopSession_RemovesSessionAndFreesSlot(t *testing.T) {
+func TestSpawner_StopSession_ReleasesSlotOnlyAfterTerminalReap(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
 		MaxConcurrentSessions: 1,
@@ -603,7 +603,8 @@ func TestSpawner_StopSession_RemovesSessionAndFreesSlot(t *testing.T) {
 	if s.ActiveCount() != 1 {
 		t.Fatalf("ActiveCount after accept = %d, want 1", s.ActiveCount())
 	}
-	// At capacity — a second accept must be rejected until the slot frees.
+	// At capacity — a second accept must be rejected until the terminal owner
+	// has reaped the complete process group and delivered Ended.
 	if _, err := s.AcceptWork(SessionSpec{SessionID: "next", Repository: "github.com/a/b"}); err == nil {
 		t.Fatal("expected capacity rejection before StopSession")
 	}
@@ -611,16 +612,17 @@ func TestSpawner_StopSession_RemovesSessionAndFreesSlot(t *testing.T) {
 	if !s.StopSession("victim") {
 		t.Fatal("StopSession(victim) = false, want true for a live session")
 	}
-	if s.ActiveCount() != 0 {
-		t.Fatalf("ActiveCount after StopSession = %d, want 0 (slot freed)", s.ActiveCount())
+	if s.ActiveCount() != 1 {
+		t.Fatalf("ActiveCount after StopSession = %d, want active terminal owner", s.ActiveCount())
 	}
-	// The cmd.Wait goroutine still emits the ended event after the process
-	// is reaped; wait for it so the test does not leak a goroutine.
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "victim", Repository: "github.com/a/b"}); err == nil {
+		t.Fatal("same ID admitted before terminal reap")
+	}
 	waitSessionEnd(t, ended)
 
-	// Slot is free → the previously-rejected accept now succeeds.
+	// Slot is free only after the synchronous terminal listener path returns.
 	if _, err := s.AcceptWork(SessionSpec{SessionID: "next", Repository: "github.com/a/b"}); err != nil {
-		t.Fatalf("accept after StopSession freed the slot: %v", err)
+		t.Fatalf("accept after terminal reap: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Drain(time.Second) })
 
