@@ -26,9 +26,10 @@ import (
 const DefaultBinary = "opencode"
 
 // DefaultEndpoint is the URL probed at construction when no explicit
-// endpoint or env var is supplied. Mirrors the OpenCode CLI's default
-// server bind address.
-const DefaultEndpoint = "http://localhost:7700"
+// endpoint or env var is supplied. Mirrors opencode 1.x's default
+// `opencode serve` bind address (127.0.0.1:4096). Override with
+// $OPENCODE_ENDPOINT.
+const DefaultEndpoint = "http://localhost:4096"
 
 // EnvEndpoint overrides DefaultEndpoint when set.
 const EnvEndpoint = "OPENCODE_ENDPOINT"
@@ -213,11 +214,11 @@ func (*Provider) Capabilities() agent.Capabilities {
 //
 // In CLI mode (opencode binary on PATH):
 //
-//	opencode run --format json --dangerously-skip-permissions
-//	             [--dir <cwd>]
+//	opencode run --format json [--auto]
 //	             [--model <id>]
 //	             [--variant <effort>]
 //
+// The working directory is set via cmd.Dir (from Spec.Cwd), not a flag.
 // The prompt is delivered via stdin. OpenCode's --format json mode
 // streams NDJSON events that are translated to agent.Event values by
 // mapOpenCodeLine.
@@ -316,16 +317,24 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 // buildOpenCodeArgs translates an agent.Spec into argv for
 // `opencode run --format json`.
 //
-// OpenCode flag mapping:
+// opencode 1.x `run` flag mapping (verified against the installed
+// binary, opencode 1.17.18 — `opencode run --help`):
 //
-//	opencode run          → headless run subcommand
-//	--format json         → NDJSON output (required for event streaming)
-//	--dangerously-skip-permissions → auto-approve permissions
-//	--dir <cwd>           → working directory on the remote server
-//	--model <id>          → model in provider/model format
-//	--variant <effort>    → reasoning effort (high, low, etc.)
+//	opencode run   → headless run subcommand
+//	--format json  → NDJSON output (required for event streaming)
+//	--auto         → auto-approve permissions that are not explicitly
+//	                 denied (gated on Spec.Autonomous). Explicit deny
+//	                 rules stay enforced — strictly safer than the
+//	                 removed `--dangerously-skip-permissions` (a flag
+//	                 that does not exist on opencode 1.x).
+//	--model <id>   → model in provider/model format
+//	--variant <v>  → provider-specific reasoning effort (e.g. high, max,
+//	                 minimal); maps Spec.Effort.
 //
-// Prompt is delivered via stdin.
+// The working directory is NOT passed as a `--dir` flag: `--dir` targets
+// a remote server when attaching, whereas a locally spawned `opencode
+// run` inherits its cwd from cmd.Dir (set in spawnCLI from Spec.Cwd).
+// The prompt is delivered via stdin.
 func buildOpenCodeArgs(spec agent.Spec) []string {
 	argv := []string{
 		"run",
@@ -333,11 +342,7 @@ func buildOpenCodeArgs(spec agent.Spec) []string {
 	}
 
 	if spec.Autonomous {
-		argv = append(argv, "--dangerously-skip-permissions")
-	}
-
-	if spec.Cwd != "" {
-		argv = append(argv, "--dir", spec.Cwd)
+		argv = append(argv, "--auto")
 	}
 
 	if spec.Model != "" {
@@ -524,6 +529,15 @@ func (h *openCodeHandle) readStdout() {
 			if typed, ok := ev.(agent.InitEvent); ok && typed.SessionID != "" {
 				id := typed.SessionID
 				h.sessionID.Store(&id)
+			}
+			// A ResultEvent is the provider-contract terminal event
+			// (agent/provider.go): once it is emitted the session is
+			// complete, so the scanner-EOF path below must NOT append a
+			// spurious spawn_no_result ErrorEvent. Without this flag every
+			// successful run violated the "exactly one terminal event"
+			// contract (D-1).
+			if _, ok := ev.(agent.ResultEvent); ok {
+				terminal = true
 			}
 			h.sendEvent(ev)
 		}
