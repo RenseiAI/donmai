@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "p1.0",
+  "schemaVersion": "p1.1",
   "contractAbi": "capability-matrix/v1",
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "cells": [
@@ -363,6 +363,14 @@
         "endpoint": "stub",
         "host": "local"
       }
+    }
+  ],
+  "binaryPins": [
+    {
+      "harness": "opencode",
+      "minVersion": "1.17.18",
+      "pinnedVersion": "1.17.18",
+      "verifiedAgainst": "1.17.18"
     }
   ]
 }

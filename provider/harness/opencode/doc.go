@@ -33,6 +33,17 @@
 // optional OPENCODE_API_KEY env var is forwarded as a Bearer token on the
 // HTTP-server probe for future hosted variants.
 //
+// Version pin (07 §8): opencode ships ~2 releases/day, independently of
+// donmai. New() in CLI mode probes "<binary> --version" and enforces
+// MinVersion/PinnedVersion/VerifiedAgainst (probe.go) — a version below
+// MinVersion fails construction with agent.ErrProviderUnavailable; a
+// version above VerifiedAgainst (or one the probe couldn't determine)
+// proceeds but emits a SystemEvent{Subtype:"unverified_harness_version"}
+// once per session (DEC-2: label, don't block). These same three
+// constants back the generated matrix's binaryPins section
+// (matrix/cells.go) so the pin can never drift between enforcement and
+// documentation.
+//
 // Layout follows the provider/harness/claude convention (probe.go /
 // spec translation / event mapping / handle) as the Lane-B client lands.
 package opencode
