@@ -274,7 +274,9 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			shutCtx, shutCancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer shutCancel()
 			_ = srv.Shutdown(shutCtx)
-			_ = d.Stop(shutCtx)
+			if err := d.Stop(shutCtx); err != nil {
+				return fmt.Errorf("daemon stop: %w", err)
+			}
 			_, _ = fmt.Fprintln(out, "[daemon] stopped")
 			return nil
 		},
