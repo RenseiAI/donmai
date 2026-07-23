@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/agent/conformance"
 )
 
 // fakeEnv returns a Getenv stub that reads from the supplied map.
@@ -326,6 +327,86 @@ func TestProvider_Spawn_FakeCLI_NDJSON(t *testing.T) {
 	}
 }
 
+// TestProvider_Spawn_SuccessfulRun_ExactlyOneTerminal is the D-1
+// regression. On a successful run (step_finish reason=stop → ResultEvent)
+// the stdout reader must NOT append a spurious spawn_no_result ErrorEvent
+// on scanner EOF. Before the fix, readStdout declared `terminal := false`
+// and never set it, so every successful run emitted a second terminal
+// event — violating the Provider contract ("exactly one terminal
+// ResultEvent … then closes", agent/provider.go). This test drains past
+// the terminal event and asserts the shared terminal-event ordering
+// contract; it goes red on the pre-fix code and green after.
+func TestProvider_Spawn_SuccessfulRun_ExactlyOneTerminal(t *testing.T) {
+	t.Parallel()
+
+	scriptPath := writeFakeOpenCodeScript(t)
+	p := &Provider{binary: scriptPath}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "list files"})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+
+	// Drain ALL events the reader emits. The fixture stream is finite and
+	// the subprocess exits after step_finish; the handle keeps the events
+	// channel open until Stop, so we read past the terminal ResultEvent
+	// with a short idle window to capture any spurious post-terminal event
+	// (rather than let Stop's channel close race it away).
+	events := drainWithIdle(ctx, h, 2*time.Second)
+
+	if err := conformance.CheckTerminalContract(events); err != nil {
+		t.Errorf("terminal-event contract violated: %v\nevents: %s", err, kindsOf(events))
+	}
+	for _, ev := range events {
+		if er, ok := ev.(agent.ErrorEvent); ok && er.Code == "spawn_no_result" {
+			t.Errorf("D-1 regression: spurious spawn_no_result ErrorEvent after successful run; events: %s", kindsOf(events))
+		}
+	}
+}
+
+// drainWithIdle collects events from h until the events channel closes,
+// ctx fires, or no event arrives within idle. The opencode handle keeps
+// its channel open after the subprocess exits (Stop closes it), so an
+// idle gap is how the test observes that the reader has emitted everything
+// it will — including any erroneous post-terminal event.
+func drainWithIdle(ctx context.Context, h agent.Handle, idle time.Duration) []agent.Event {
+	var got []agent.Event
+	timer := time.NewTimer(idle)
+	defer timer.Stop()
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				return got
+			}
+			got = append(got, ev)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(idle)
+		case <-timer.C:
+			return got
+		case <-ctx.Done():
+			return got
+		}
+	}
+}
+
+func kindsOf(events []agent.Event) string {
+	kinds := make([]string, len(events))
+	for i, ev := range events {
+		kinds[i] = string(ev.Kind())
+	}
+	return strings.Join(kinds, ",")
+}
+
 // collectUntilResult drains events from h until a terminal ResultEvent
 // is observed, the events channel closes, or ctx fires. The fixture
 // NDJSON stream is deterministic — step_start, text, step_finish — and
@@ -537,28 +618,31 @@ func TestBuildOpenCodeArgs_CoreBits(t *testing.T) {
 func TestBuildOpenCodeArgs_Autonomous(t *testing.T) {
 	t.Parallel()
 	argv := buildOpenCodeArgs(agent.Spec{Autonomous: true})
-	if !contains(argv, "--dangerously-skip-permissions") {
-		t.Errorf("want --dangerously-skip-permissions in %v", argv)
+	// D-2: opencode 1.x has no --dangerously-skip-permissions; autonomy
+	// maps to --auto (explicit denies stay enforced).
+	if !contains(argv, "--auto") {
+		t.Errorf("want --auto in %v", argv)
+	}
+	if contains(argv, "--dangerously-skip-permissions") {
+		t.Errorf("want no --dangerously-skip-permissions (not a real opencode 1.x flag) in %v", argv)
 	}
 }
 
 func TestBuildOpenCodeArgs_NonAutonomous(t *testing.T) {
 	t.Parallel()
 	argv := buildOpenCodeArgs(agent.Spec{Autonomous: false})
-	if contains(argv, "--dangerously-skip-permissions") {
-		t.Errorf("want no --dangerously-skip-permissions in %v", argv)
+	if contains(argv, "--auto") {
+		t.Errorf("want no --auto in %v", argv)
 	}
 }
 
-func TestBuildOpenCodeArgs_Cwd(t *testing.T) {
+func TestBuildOpenCodeArgs_Cwd_NoDirFlag(t *testing.T) {
 	t.Parallel()
+	// D-2: cwd is delivered via cmd.Dir in spawnCLI, not a --dir flag
+	// (--dir targets a remote server when attaching).
 	argv := buildOpenCodeArgs(agent.Spec{Cwd: "/workspace"})
-	if !contains(argv, "--dir") {
-		t.Errorf("want --dir in %v", argv)
-	}
-	idx := indexOf(argv, "--dir")
-	if idx < 0 || idx+1 >= len(argv) || argv[idx+1] != "/workspace" {
-		t.Errorf("want --dir /workspace, got %v", argv)
+	if contains(argv, "--dir") {
+		t.Errorf("want no --dir flag (cwd handled via cmd.Dir), got %v", argv)
 	}
 }
 
