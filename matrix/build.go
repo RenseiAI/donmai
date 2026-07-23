@@ -55,6 +55,11 @@ type CapabilityMatrix struct {
 	Denylist      []CellKey             `json:"denylist"`
 	LegacyAliases []LegacyAlias         `json:"legacyAliases"`
 	PeerFamilies  PeerFamilies          `json:"peerFamilies"`
+	// BinaryPins is the p1.1 additive section (07 §8): version-pin
+	// metadata for harnesses whose external binary drifts independently
+	// of donmai releases. Sorted by Harness; empty (never omitted) when
+	// no harness declares a pin.
+	BinaryPins []BinaryPinRow `json:"binaryPins"`
 }
 
 // LegacyAlias is one (ProviderName → CellKey) row of the back-compat map,
@@ -106,6 +111,11 @@ func Build() (*Built, error) {
 	dl := append([]CellKey{}, denylist...)
 	sort.Slice(dl, func(i, j int) bool { return cellKeyLess(dl[i], dl[j]) })
 
+	pins, err := buildBinaryPins(harnessByName)
+	if err != nil {
+		return nil, err
+	}
+
 	m := CapabilityMatrix{
 		SchemaVersion: SchemaVersion,
 		ContractABI:   ContractABI,
@@ -120,6 +130,7 @@ func Build() (*Built, error) {
 			IssueTracker:   []any{},
 			VersionControl: []any{},
 		},
+		BinaryPins: pins,
 	}
 
 	return &Built{
@@ -292,6 +303,23 @@ func buildAliases(cells []HarnessEndpointCell) ([]LegacyAlias, error) {
 	}
 	sort.Slice(aliases, func(i, j int) bool { return aliases[i].ProviderName < aliases[j].ProviderName })
 	return aliases, nil
+}
+
+// buildBinaryPins converts the hand-authored harnessBinaryPins map into the
+// sorted, deterministic BinaryPinRow slice. Fails loudly (mirroring the rest
+// of Build()'s validation posture) if a pin names a harness the harvest
+// list never produced — a typo'd or removed harness name should never
+// silently vanish from the generated section.
+func buildBinaryPins(harnessByName map[agent.HarnessName]HarnessRow) ([]BinaryPinRow, error) {
+	rows := make([]BinaryPinRow, 0, len(harnessBinaryPins))
+	for name, pin := range harnessBinaryPins {
+		if _, ok := harnessByName[name]; !ok {
+			return nil, fmt.Errorf("binaryPins: harness %q is not a harvested harness", name)
+		}
+		rows = append(rows, BinaryPinRow{Harness: name, HarnessBinaryPin: pin})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Harness < rows[j].Harness })
+	return rows, nil
 }
 
 // ---------------------------------------------------------------------------

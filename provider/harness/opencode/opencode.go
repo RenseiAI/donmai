@@ -87,6 +87,18 @@ type Options struct {
 	// HTTP-server mode. Tests use this when the goal is to assert
 	// capability / Spawn behavior without standing up a server.
 	SkipProbe bool
+
+	// VersionProbe overrides how the resolved CLI binary's version is
+	// determined at construction (§8 probe-time pin enforcement, see
+	// probe.go). Defaults to running "<binary> --version". Tests inject
+	// a stub here to assert enforcement behavior without a real
+	// fake-CLI script.
+	VersionProbe func(ctx context.Context, binary string) (string, error)
+
+	// SkipVersionCheck disables the construction-time version-pin
+	// enforcement in CLI mode entirely (no probe call at all). Tests use
+	// this when the goal is unrelated to version enforcement.
+	SkipVersionCheck bool
 }
 
 // Provider is the agent.Provider implementation for OpenCode.
@@ -102,6 +114,15 @@ type Provider struct {
 	binary   string // resolved CLI path, or "" for HTTP-server mode
 	endpoint string // HTTP server endpoint (HTTP-server mode only)
 	apiKey   string
+
+	// versionUnverified is set at construction (CLI mode only) when the
+	// probed binary version could not be confirmed to fall within
+	// [MinVersion, VerifiedAgainst] — either because it is above
+	// VerifiedAgainst, or because the probe itself couldn't determine a
+	// version at all. A version confirmed BELOW MinVersion instead fails
+	// construction outright (see checkVersionPin in probe.go). Surfaced
+	// once per session as a SystemEvent from spawnCLI.
+	versionUnverified bool
 }
 
 // New constructs a Provider.
@@ -134,8 +155,25 @@ func New(opts Options) (*Provider, error) {
 	}
 	resolved, lookErr := lookup(binary)
 	if lookErr == nil {
-		// CLI binary is available — use CLI mode.
-		return &Provider{binary: resolved, apiKey: apiKey}, nil
+		// CLI binary is available — use CLI mode. Enforce the version
+		// pin (§8) before handing back a usable Provider: a confirmed
+		// below-MinVersion binary is rejected outright; anything else
+		// unconfirmed-but-plausible proceeds labeled (DEC-2).
+		unverified := false
+		if !opts.SkipVersionCheck {
+			probe := opts.VersionProbe
+			if probe == nil {
+				probe = defaultVersionProbe
+			}
+			vctx, cancel := context.WithTimeout(context.Background(), DefaultVersionProbeTimeout)
+			var err error
+			unverified, err = checkVersionPin(vctx, probe, resolved)
+			cancel()
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &Provider{binary: resolved, apiKey: apiKey, versionUnverified: unverified}, nil
 	}
 
 	// Fall back to HTTP-server mode.
@@ -304,6 +342,21 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 		stderrBuf:  stderrBuf,
 		shutdown:   make(chan struct{}),
 		done:       make(chan struct{}),
+	}
+
+	if p.versionUnverified {
+		// Observability, not gating (DEC-2): the events channel is
+		// buffered (eventBufferSize) and nothing has been sent yet, so
+		// this send never blocks. Emitted once per session, before any
+		// stream events, satisfying the "no direct emit ordering
+		// requirement beyond the terminal rule" conformance contract.
+		h.events <- agent.SystemEvent{
+			Subtype: unverifiedVersionSubtype,
+			Message: fmt.Sprintf(
+				"opencode binary version could not be confirmed within the verified range (pinned %s, verified through %s) — proceeding unverified",
+				PinnedVersion, VerifiedAgainst,
+			),
+		}
 	}
 
 	go writePromptStdin(stdin, spec.Prompt, h.logger)

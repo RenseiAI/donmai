@@ -16,10 +16,20 @@
 // deterministic JSON artifacts + registry_gen.go.
 package matrix
 
-import "github.com/RenseiAI/donmai/agent"
+import (
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/opencode"
+)
 
 // SchemaVersion is the committed schema version of the generated artifacts.
-const SchemaVersion = "p1.0"
+//
+// p1.0 -> p1.1 (07-design-opencode-spawn.md §8): additive — a new
+// top-level `binaryPins` section. Existing consumers (platform's
+// resolve-model.ts/providers.ts) ignore unknown keys, so this bump ships
+// with no consumer break; it exists purely so a future schema reader can
+// tell "binaryPins may be absent" (p1.0) from "binaryPins is present when
+// non-empty" (p1.1) apart.
+const SchemaVersion = "p1.1"
 
 // ContractABI pins the matrix-document contract version (distinct from the
 // per-manifest harness/v2 and model-endpoint/v1 ABIs).
@@ -266,6 +276,46 @@ var validCells = []HarnessEndpointCell{
 // explicit exclusions and is emitted (as an array) into the matrix for
 // completeness.
 var denylist = []CellKey{}
+
+// HarnessBinaryPin declares the version-pin metadata for a harness whose
+// external binary drifts independently of donmai releases (opencode ships
+// ~2 releases/day — 07-design-opencode-spawn.md §8). Net-new, additive
+// field (SchemaVersion p1.0 -> p1.1): no version metadata existed anywhere
+// in the generated matrix before this.
+type HarnessBinaryPin struct {
+	// MinVersion is the lowest version the harness's adapter is known to
+	// work against; the adapter's probe.go fails construction below it.
+	MinVersion string `json:"minVersion"`
+	// PinnedVersion is the exact version CI installs and smoke-tests
+	// against (donmai-smokes harness/<name>_install.go).
+	PinnedVersion string `json:"pinnedVersion"`
+	// VerifiedAgainst is the highest version anyone has actually run the
+	// adapter against; above it the adapter proceeds but labels the
+	// session unverified (DEC-2: label, don't block).
+	VerifiedAgainst string `json:"verifiedAgainst"`
+}
+
+// BinaryPinRow is one row of the generated binaryPins section — a
+// HarnessBinaryPin keyed by the harness it describes. A sorted slice (not
+// a map) so the generated JSON is deterministic independent of map
+// iteration order, matching every other generated section's convention.
+type BinaryPinRow struct {
+	Harness agent.HarnessName `json:"harness"`
+	HarnessBinaryPin
+}
+
+// harnessBinaryPins is the hand-authored version-pin map (07 §8). Values
+// are NOT re-typed literals: they read directly from the owning provider
+// package's exported constants (e.g. opencode.MinVersion) so probe-time
+// enforcement (provider/harness/opencode/probe.go) and this generated
+// documentation can never drift apart from each other.
+var harnessBinaryPins = map[agent.HarnessName]HarnessBinaryPin{
+	agent.HarnessOpenCode: {
+		MinVersion:      opencode.MinVersion,
+		PinnedVersion:   opencode.PinnedVersion,
+		VerifiedAgainst: opencode.VerifiedAgainst,
+	},
+}
 
 // ValidCells returns the hand-authored valid-cell list. Exported so the
 // parity test (same package) and the generator can both read it.
