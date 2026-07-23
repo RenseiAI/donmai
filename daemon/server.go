@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +19,8 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 )
 
+const drainResponseWriteGrace = time.Second
+
 // Server is the daemon's HTTP control API. It wraps a Daemon and exposes
 // the endpoints consumed by `donmai daemon …` and `rensei daemon …`.
 type Server struct {
@@ -26,6 +30,18 @@ type Server struct {
 	mu      sync.Mutex
 	started bool
 	addr    string
+
+	// stopAttemptTimeout and stopRetryDelay keep endpoint retries bounded. They
+	// are test seams; zero values use the production defaults in stopTimeouts.
+	stopAttemptTimeout time.Duration
+	stopRetryDelay     time.Duration
+
+	// stopCompletionActive fences the one asynchronous completion owner for this
+	// daemon's single terminal generation. Concurrent /stop requests acknowledge
+	// the already-owned transition instead of starting competing retry loops.
+	stopCompletionActive bool
+	stopCompletionStarts uint64       // guarded by mu; lifecycle observability/test seam
+	stopAttemptResults   chan<- error // test seam; receives each completed attempt
 
 	// kitReg is the in-process Kit registry serving /api/daemon/kits*
 	// (Wave 9 A2). Lazily constructed via kitRegistryOrEmpty so test
@@ -292,41 +308,108 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePause(w http.ResponseWriter, _ *http.Request) {
-	s.daemon.Pause()
+	if !s.daemon.Pause() {
+		writeJSON(w, http.StatusConflict, &afclient.DaemonActionResponse{OK: false, Message: fmt.Sprintf("cannot pause while daemon is %s", s.daemon.State())})
+		return
+	}
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "paused"})
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, _ *http.Request) {
-	s.daemon.Resume()
+	if !s.daemon.Resume() {
+		writeJSON(w, http.StatusConflict, &afclient.DaemonActionResponse{OK: false, Message: fmt.Sprintf("cannot resume while daemon is %s", s.daemon.State())})
+		return
+	}
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "resumed"})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, _ *http.Request) {
-	// Respond first so the client gets the 200, then schedule the stop.
+	// "stopping" acknowledges transition ownership, not completed shutdown.
+	// There is exactly one completion goroutine per daemon terminal generation;
+	// duplicate requests observe that owner rather than starting racing retries.
+	s.mu.Lock()
+	if s.daemon.State() == StateStopped {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "stopped"})
+		return
+	}
+	if s.stopCompletionActive {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "stopping"})
+		return
+	}
+	s.stopCompletionActive = true
+	s.stopCompletionStarts++
+	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "stopping"})
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		_ = s.daemon.Stop(ctx)
-	}()
+	attemptTimeout, retryDelay := s.stopTimeouts()
+	go s.completeStop(attemptTimeout, retryDelay)
+}
+
+func (s *Server) completeStop(attemptTimeout, retryDelay time.Duration) {
+	// stopCompletionActive intentionally remains set after this routine returns.
+	// A daemon has one terminal stop generation; even an unrecoverable attempt
+	// must not let a later request create a second completion owner for it.
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+		err := s.daemon.Stop(ctx)
+		cancel()
+		if s.stopAttemptResults != nil {
+			select {
+			case s.stopAttemptResults <- err:
+			default:
+			}
+		}
+		if err == nil {
+			return
+		}
+		var incomplete *DrainIncompleteError
+		switch {
+		case errors.As(err, &incomplete):
+			slog.Warn("daemon stop incomplete; retaining completion owner for retry", "activeSessions", incomplete.ActiveSessions, "spawnReservations", incomplete.SpawnReservations)
+		case !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled):
+			slog.Warn("daemon stop failed; daemon remains draining", "err", err)
+			return
+		default:
+			slog.Warn("daemon stop phase exceeded attempt deadline; retaining completion owner for retry", "err", err)
+		}
+		time.Sleep(retryDelay)
+	}
+}
+
+func (s *Server) stopTimeouts() (attempt, retry time.Duration) {
+	attempt, retry = s.stopAttemptTimeout, s.stopRetryDelay
+	if attempt <= 0 {
+		attempt = 60 * time.Second
+	}
+	if retry <= 0 {
+		retry = time.Second
+	}
+	return attempt, retry
 }
 
 func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 	var body afclient.DaemonDrainRequest
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, &afclient.DaemonActionResponse{OK: false, Message: "invalid drain request: " + err.Error()})
+		return
+	}
 	timeout := time.Duration(body.TimeoutSeconds) * time.Second
-	if timeout == 0 {
-		cfg := s.daemon.Config()
-		if cfg != nil {
+	if timeout <= 0 {
+		if cfg := s.daemon.Config(); cfg != nil && cfg.AutoUpdate.DrainTimeoutSeconds > 0 {
 			timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
+		} else {
+			timeout = 30 * time.Second
 		}
 	}
-	go func() {
-		if s.daemon.spawner != nil {
-			_ = s.daemon.spawner.Drain(timeout)
-		}
-	}()
-	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: fmt.Sprintf("drain initiated (timeout %s)", timeout)})
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout + drainResponseWriteGrace))
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	if err := s.daemon.Drain(ctx); err != nil {
+		writeJSON(w, http.StatusConflict, &afclient.DaemonActionResponse{OK: false, Message: "drain incomplete: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: fmt.Sprintf("drained (timeout %s)", timeout)})
 }
 
 func (s *Server) handleUpdate(w http.ResponseWriter, _ *http.Request) {
@@ -475,11 +558,14 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id 
 }
 
 // handleSessionStop handles POST /api/daemon/sessions/<id>/stop — the
-// deterministic per-session cancel route (Guard 3 hard out-of-band leg).
-// It kills exactly one in-flight session and frees its capacity slot,
-// leaving siblings untouched (unlike POST /api/daemon/drain). Returns 200
-// on stop, 404 when the id is unknown (already exited or never spawned),
-// 405 on non-POST methods. Localhost-only (the daemon binds to 127.0.0.1).
+// deterministic per-session cancel route (Guard 3 hard out-of-band leg). A 200
+// acknowledges an exact generation still owned by the daemon, including cleanup
+// in progress; capacity is released asynchronously only after process-group
+// reaping and synchronous Ended delivery. A 404 means the spawner is
+// uninitialised, the ID was never present, or its generation was already
+// released. The established JSON response shape and "stopped" message remain
+// unchanged for wire compatibility. Returns 405 on non-POST methods.
+// Localhost-only (the daemon binds to 127.0.0.1).
 func (s *Server) handleSessionStop(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

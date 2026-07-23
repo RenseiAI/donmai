@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -140,5 +141,139 @@ func TestRuntimeCredentialsReturnsConsistentSnapshot(t *testing.T) {
 	workerID, token := d.RuntimeCredentials()
 	if workerID != "wkr_test" || token != "runtime-token" {
 		t.Fatalf("RuntimeCredentials() = (%q, %q), want (%q, %q)", workerID, token, "wkr_test", "runtime-token")
+	}
+}
+
+func TestDaemonStopDoesNotCacheIncompleteErrorAfterFinalDeadlineRelease(t *testing.T) {
+	spawner := NewWorkerSpawner(SpawnerOptions{})
+	spawner.mu.Lock()
+	spawner.sessions["last"] = &spawnedSession{handle: SessionHandle{SessionID: "last"}, spec: SessionSpec{SessionID: "last"}}
+	spawner.mu.Unlock()
+	spawner.drainBeforeContextSnapshot = func() {
+		spawner.mu.Lock()
+		delete(spawner.sessions, "last")
+		spawner.mu.Unlock()
+	}
+
+	d := New(Options{})
+	d.spawner = spawner
+	d.setState(StateRunning)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := d.Stop(ctx); err != nil {
+		t.Fatalf("Stop after final release = %v, want nil", err)
+	}
+	if err := d.Stop(context.Background()); err != nil {
+		t.Fatalf("repeated Stop cached error = %v, want nil", err)
+	}
+}
+
+func TestDaemonStopPropagatesReservationAwareDrainError(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	spawner := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn: func(SessionSpec, []string) ([]string, error) {
+			close(entered)
+			<-release
+			return nil, fmt.Errorf("pre-spawn stopped")
+		},
+	})
+	d := New(Options{})
+	d.spawner = spawner
+	d.setState(StateRunning)
+	d.mu.Lock()
+	d.config = &Config{AutoUpdate: AutoUpdateConfig{DrainTimeoutSeconds: 1}}
+	d.mu.Unlock()
+
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := spawner.AcceptWork(SessionSpec{SessionID: "reserved", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	<-entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := d.Stop(ctx)
+	var incomplete *DrainIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("Stop error = %v, want DrainIncompleteError", err)
+	}
+	if incomplete.SpawnReservations != 1 {
+		t.Fatalf("DrainIncompleteError reservations = %d, want 1", incomplete.SpawnReservations)
+	}
+
+	select {
+	case <-d.Done():
+		t.Fatal("Done closed after incomplete drain")
+	default:
+	}
+	if got := d.State(); got != StateDraining {
+		t.Fatalf("State after incomplete Stop = %q, want %q", got, StateDraining)
+	}
+	// Lifecycle methods racing or following stop initiation must not reopen the
+	// admission barrier, even while a later Stop retry is still possible.
+	d.Resume()
+	if spawner.IsAccepting() {
+		t.Fatal("Resume reopened admission after Stop initiation")
+	}
+	if err := d.Start(context.Background()); err == nil {
+		t.Fatal("Start succeeded after Stop initiation")
+	}
+
+	close(release)
+	if err := <-acceptDone; err == nil {
+		t.Fatal("AcceptWork unexpectedly succeeded")
+	}
+	if err := d.Stop(context.Background()); err != nil {
+		t.Fatalf("retry Stop after reservation release: %v", err)
+	}
+	select {
+	case <-d.Done():
+	default:
+		t.Fatal("Done remained open after successful retry")
+	}
+	if got := d.State(); got != StateStopped {
+		t.Fatalf("State after successful retry = %q, want %q", got, StateStopped)
+	}
+}
+
+func TestDaemon_StopSessionAcknowledgesNaturalCleanupOwnership(t *testing.T) {
+	probe := newNaturalOwnershipProbe(t, "natural-daemon")
+	probe.wrapCancel(t)
+
+	d := New(Options{})
+	d.spawner = probe.spawner
+	d.setState(StateRunning)
+
+	probe.assertPublished(t, d.ActiveSessions())
+	if got := d.ActiveSessionCount(); got != 1 {
+		t.Fatalf("Daemon.ActiveSessionCount during natural cleanup = %d, want 1", got)
+	}
+	if !d.StopSession(probe.sessionID) {
+		t.Fatal("first Daemon.StopSession did not acknowledge naturally owned cleanup")
+	}
+	if !d.StopSession(probe.sessionID) {
+		t.Fatal("repeated Daemon.StopSession did not acknowledge naturally owned cleanup")
+	}
+	probe.assertPublished(t, d.ActiveSessions())
+	probe.assertNoTerminationOrCancellation(t)
+
+	probe.release()
+	ev := waitSpawnerEvent(t, probe.ended, "daemon natural ownership Ended event")
+	if ev.Handle.State != SessionCompleted {
+		t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionCompleted)
+	}
+	if got := probe.cancelCount(); got != 1 {
+		t.Fatalf("natural reaper cancellation count = %d, want 1", got)
+	}
+	waitForActiveCount(t, probe.spawner, 0)
+	if got := d.ActiveSessions(); len(got) != 0 {
+		t.Fatalf("Daemon.ActiveSessions after registry release = %+v, want empty", got)
+	}
+	if d.StopSession(probe.sessionID) {
+		t.Fatal("Daemon.StopSession acknowledged a released generation")
 	}
 }

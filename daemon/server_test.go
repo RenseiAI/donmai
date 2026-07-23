@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -419,6 +421,87 @@ func TestServer_StopEndpointTransitionsState(t *testing.T) {
 	}
 }
 
+func TestServer_StopEndpointRetainsCompletionOwnerAfterIncompleteDrain(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	spawner := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn: func(SessionSpec, []string) ([]string, error) {
+			close(entered)
+			<-release
+			return nil, errors.New("pre-spawn released during shutdown")
+		},
+	})
+	d := New(Options{})
+	d.spawner = spawner
+	d.setState(StateRunning)
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := spawner.AcceptWork(SessionSpec{SessionID: "reserved", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pre-spawn hook did not enter")
+	}
+
+	s := NewServer(d)
+	s.stopAttemptTimeout = 5 * time.Millisecond
+	s.stopRetryDelay = time.Millisecond
+	attempts := make(chan error, 2)
+	s.stopAttemptResults = attempts
+	httpServer := httptest.NewServer(s.httpd.Handler)
+	defer httpServer.Close()
+	res, err := http.Post(httpServer.URL+"/api/daemon/stop", "application/json", nil) //nolint:gosec
+	if err != nil {
+		t.Fatalf("POST stop: %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("POST stop status = %d, want 200", res.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for d.State() != StateDraining && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if d.State() != StateDraining {
+		t.Fatalf("state during incomplete endpoint stop = %q, want draining", d.State())
+	}
+	// The response only proves the goroutine entered Stop. Wait for the first
+	// completed attempt and classify it before releasing the reservation; a
+	// timing sleep here could accidentally turn this into a first-attempt success.
+	select {
+	case err := <-attempts:
+		var incomplete *DrainIncompleteError
+		if !errors.As(err, &incomplete) {
+			t.Fatalf("first endpoint stop attempt = %v, want DrainIncompleteError", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first endpoint stop attempt did not complete")
+	}
+	select {
+	case <-d.Done():
+		t.Fatal("Done closed while endpoint-owned drain remained incomplete")
+	default:
+	}
+
+	close(release)
+	if err := <-acceptDone; err == nil {
+		t.Fatal("reserved AcceptWork unexpectedly succeeded")
+	}
+	select {
+	case <-d.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("endpoint completion owner did not retry to final stop")
+	}
+	if d.State() != StateStopped {
+		t.Fatalf("state after endpoint retry = %q, want stopped", d.State())
+	}
+}
+
 // TestServer_Compatibility_Endpoints_Match_Client verifies the server speaks
 // the exact paths consumed by afclient.DaemonClient (contract).
 func TestServer_Compatibility_Endpoints_Match_Client(t *testing.T) {
@@ -446,6 +529,38 @@ func TestServer_Compatibility_Endpoints_Match_Client(t *testing.T) {
 	}
 	if _, err := c.SetCapacityConfig("capacity.poolMaxDiskGb", "10"); err != nil {
 		t.Errorf("SetCapacityConfig: %v", err)
+	}
+}
+
+type responseDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	writeDeadline time.Time
+}
+
+func (r *responseDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.writeDeadline = deadline
+	return nil
+}
+
+func TestServerDrainExtendsWriteDeadline(t *testing.T) {
+	d := New(Options{})
+	d.setState(StateRunning)
+	srv := NewServer(d)
+	recorder := &responseDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodPost, "/api/daemon/drain", strings.NewReader(`{"timeoutSeconds":1}`))
+	before := time.Now()
+
+	srv.handleDrain(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("drain status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if recorder.writeDeadline.IsZero() {
+		t.Fatal("drain handler did not set a response write deadline")
+	}
+	expected := time.Second + drainResponseWriteGrace
+	if recorder.writeDeadline.Before(before.Add(expected)) || recorder.writeDeadline.After(time.Now().Add(expected)) {
+		t.Fatalf("write deadline = %s, want now + %s", recorder.writeDeadline, expected)
 	}
 }
 
@@ -640,6 +755,7 @@ func TestServer_SessionDetail_MethodNotAllowed(t *testing.T) {
 func TestServer_SessionStop_HappyPath(t *testing.T) {
 	d, srv, cleanup := mustStartDaemon(t)
 	defer cleanup()
+	ended := sessionEnds(d.spawner)
 
 	// mustStartDaemon spawns `sleep 10`, so the session stays resident.
 	if _, err := d.AcceptWork(SessionSpec{
@@ -659,6 +775,7 @@ func TestServer_SessionStop_HappyPath(t *testing.T) {
 	if !resp.OK {
 		t.Errorf("resp.OK = false, want true (%+v)", resp)
 	}
+	waitSessionEnd(t, ended)
 	if d.ActiveSessionCount() != 0 {
 		t.Errorf("ActiveSessionCount after stop = %d, want 0", d.ActiveSessionCount())
 	}
@@ -672,6 +789,60 @@ func TestServer_SessionStop_NotFound(t *testing.T) {
 	status := requirePost(t, srv.Addr(), "/api/daemon/sessions/never-spawned/stop", nil, nil)
 	if status != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", status)
+	}
+}
+
+func TestServer_SessionStopAcknowledgesNaturalCleanupOwnership(t *testing.T) {
+	probe := newNaturalOwnershipProbe(t, "natural-http")
+	probe.wrapCancel(t)
+
+	d := New(Options{})
+	d.spawner = probe.spawner
+	d.setState(StateRunning)
+	server := NewServer(d)
+	postStop := func() (int, afclient.DaemonActionResponse) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/daemon/sessions/"+probe.sessionID+"/stop", nil)
+		recorder := httptest.NewRecorder()
+		server.httpd.Handler.ServeHTTP(recorder, req)
+
+		var response afclient.DaemonActionResponse
+		if recorder.Code == http.StatusOK {
+			if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+				t.Fatalf("decode stop response: %v", err)
+			}
+		}
+		return recorder.Code, response
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		status, response := postStop()
+		if status != http.StatusOK {
+			t.Fatalf("stop attempt %d status = %d, want 200", attempt, status)
+		}
+		if !response.OK || response.Message != "stopped" {
+			t.Fatalf("stop attempt %d response = %+v, want acknowledged stopped response", attempt, response)
+		}
+	}
+	probe.assertPublished(t, d.ActiveSessions())
+	if got := d.ActiveSessionCount(); got != 1 {
+		t.Fatalf("Daemon.ActiveSessionCount during natural cleanup = %d, want 1", got)
+	}
+	probe.assertNoTerminationOrCancellation(t)
+
+	probe.release()
+	ev := waitSpawnerEvent(t, probe.ended, "HTTP natural ownership Ended event")
+	if ev.Handle.State != SessionCompleted {
+		t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionCompleted)
+	}
+	if got := probe.cancelCount(); got != 1 {
+		t.Fatalf("natural reaper cancellation count = %d, want 1", got)
+	}
+	waitForActiveCount(t, probe.spawner, 0)
+
+	status, _ := postStop()
+	if status != http.StatusNotFound {
+		t.Fatalf("stop after registry release status = %d, want 404", status)
 	}
 }
 
@@ -697,6 +868,7 @@ func TestServer_SessionStop_MethodNotAllowed(t *testing.T) {
 func TestServer_SessionStop_LeavesSiblingRunning(t *testing.T) {
 	d, srv, cleanup := mustStartDaemon(t)
 	defer cleanup()
+	ended := sessionEnds(d.spawner)
 
 	for _, id := range []string{"keep", "drop"} {
 		if _, err := d.AcceptWork(SessionSpec{
@@ -712,6 +884,7 @@ func TestServer_SessionStop_LeavesSiblingRunning(t *testing.T) {
 	if status := requirePost(t, srv.Addr(), "/api/daemon/sessions/drop/stop", nil, nil); status != http.StatusOK {
 		t.Fatalf("stop status = %d, want 200", status)
 	}
+	waitSessionEnd(t, ended)
 	if d.ActiveSessionCount() != 1 {
 		t.Fatalf("ActiveSessionCount after stop = %d, want 1", d.ActiveSessionCount())
 	}
@@ -802,5 +975,98 @@ func TestServer_Status_ReportsPaused_WhenSpawnerDrainedButStateRunning(t *testin
 	}
 	if stats.Registration.Status != "paused" {
 		t.Errorf("registration status = %q, want paused", stats.Registration.Status)
+	}
+}
+
+func TestServer_StopEndpointHasOneCompletionOwnerUnderContention(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	spawner := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		OnPreSpawn: func(SessionSpec, []string) ([]string, error) {
+			close(entered)
+			<-release
+			return nil, errors.New("released shutdown reservation")
+		},
+	})
+	d := New(Options{})
+	d.spawner = spawner
+	d.setState(StateRunning)
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := spawner.AcceptWork(SessionSpec{SessionID: "reserved", Repository: "github.com/a/b"})
+		acceptDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("pre-spawn hook did not enter")
+	}
+
+	s := NewServer(d)
+	s.stopAttemptTimeout = 5 * time.Millisecond
+	s.stopRetryDelay = time.Millisecond
+	httpServer := httptest.NewServer(s.httpd.Handler)
+	defer httpServer.Close()
+
+	const callers = 64
+	errCh := make(chan error, callers)
+	for range callers {
+		go func() {
+			res, err := http.Post(httpServer.URL+"/api/daemon/stop", "application/json", nil) //nolint:gosec
+			if err == nil {
+				if res.StatusCode != http.StatusOK {
+					err = fmt.Errorf("stop status = %d", res.StatusCode)
+				}
+				_ = res.Body.Close()
+			}
+			errCh <- err
+		}()
+	}
+	for range callers {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for d.State() != StateDraining && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	s.mu.Lock()
+	starts := s.stopCompletionStarts
+	s.mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("stop completion starts = %d, want exactly one", starts)
+	}
+
+	close(release)
+	if err := <-acceptDone; err == nil {
+		t.Fatal("reserved AcceptWork unexpectedly succeeded")
+	}
+	select {
+	case <-d.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("single endpoint completion owner did not finish")
+	}
+}
+
+func TestServer_DrainAndResumeReportActualAdmissionState(t *testing.T) {
+	d, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+	var drained afclient.DaemonActionResponse
+	if status := requirePost(t, srv.Addr(), "/api/daemon/drain", afclient.DaemonDrainRequest{TimeoutSeconds: 1}, &drained); status != http.StatusOK || !drained.OK {
+		t.Fatalf("drain = (%d, %+v), want successful completed drain", status, drained)
+	}
+	if d.State() != StateDraining || d.spawner.IsAccepting() {
+		t.Fatalf("after drain state/admission = (%q, %v), want draining/false", d.State(), d.spawner.IsAccepting())
+	}
+	var resumed afclient.DaemonActionResponse
+	if status := requirePost(t, srv.Addr(), "/api/daemon/resume", nil, &resumed); status != http.StatusOK || !resumed.OK {
+		t.Fatalf("resume = (%d, %+v), want successful reopen", status, resumed)
+	}
+	if d.State() != StateRunning || !d.spawner.IsAccepting() {
+		t.Fatalf("after resume state/admission = (%q, %v), want running/true", d.State(), d.spawner.IsAccepting())
 	}
 }

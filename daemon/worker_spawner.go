@@ -108,7 +108,9 @@ type SpawnerOptions struct {
 
 // PrefixedWriter is the minimal sink interface used by the spawner to emit
 // child stdout/stderr. Implementations are responsible for prefixing each
-// line with the worker tag.
+// line with the worker tag and must return promptly. After a terminal pipe-close
+// deadline, a blocked writer is detached from session ownership so it cannot
+// retain the worker slot indefinitely.
 type PrefixedWriter interface {
 	WriteWorkerLine(workerID, line string)
 }
@@ -130,13 +132,33 @@ const (
 	SessionEventEnded   SessionEventKind = "ended"
 )
 
-// pumpDrainGrace bounds how long the session reaper waits for the stdout/
-// stderr pump goroutines to reach EOF before calling cmd.Wait (which closes
-// the pipes and discards anything still buffered). Normally-exiting children
-// close their pipe ends on exit, so the pumps finish in microseconds and the
-// grace never elapses; it only fires when a grandchild inherited a pipe end
-// and outlived the worker.
+// pumpDrainGrace bounds the post-exit interval during which the session reaper
+// lets stdout/stderr pumps drain naturally. It is armed only after cmd.Wait has
+// observed the direct child exit and a descendant may still hold an inherited
+// write end; an ordinary running worker never owns this deadline.
 const pumpDrainGrace = 10 * time.Second
+
+// pumpCloseJoinGrace bounds the final join after the terminal reaper closes its
+// pipe readers. A PrefixedWriter is external code and can block after a reader
+// has been closed; such a writer must not retain the terminal session or its
+// capacity forever. This interval is reachable only after direct-child exit and
+// the output-drain deadline, never while an ordinary worker is running.
+const pumpCloseJoinGrace = 250 * time.Millisecond
+
+// pumpDrainTimer is the minimal stoppable timer the terminal pump-drain path
+// needs. Keeping it narrow lets lifecycle tests advance the deadline without
+// waiting for wall-clock time.
+type pumpDrainTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+type realPumpDrainTimer struct {
+	timer *time.Timer
+}
+
+func (t *realPumpDrainTimer) C() <-chan time.Time { return t.timer.C }
+func (t *realPumpDrainTimer) Stop() bool          { return t.timer.Stop() }
 
 // WorkerSpawner manages the lifecycle of worker child processes.
 type WorkerSpawner struct {
@@ -147,9 +169,32 @@ type WorkerSpawner struct {
 	sessionHistory         map[string]struct{}
 	sessionHistoryOrder    []string
 	accepting              bool
+	spawnReservations      map[string]struct{}
 	extraProjects          []ProjectConfig // satellite/additional org projects; never clobbered by SetProjects
 	extraEnabledProjectIDs map[string]struct{}
+	terminateProcessGroup  func(*exec.Cmd) error
 	killProcessGroup       func(*exec.Cmd) error
+	waitProcessGroup       func(*exec.Cmd, time.Duration) processGroupWaitResult
+	startCommand           func(*exec.Cmd) error
+
+	// These per-spawner lifecycle seams are nil in production. Tests inject a
+	// controllable drain timer and synchronize at the running and fully-joined
+	// pump boundaries without waiting for a wall-clock deadline.
+	pumpDrainTimerFactory func(time.Duration) pumpDrainTimer
+	reaperRunning         func()
+	// runningPhaseContextDone may replace the cancellation arm immediately
+	// before the direct-child running select. It is nil in production.
+	runningPhaseContextDone func(context.Context, <-chan error, <-chan struct{}) <-chan struct{}
+	afterPumpsJoined        func()
+	// afterPumpDrainDeadlineSelected blocks the narrow terminal-drain edge after
+	// its timer wins but before the reaper claims process-group termination. It
+	// is nil in production.
+	afterPumpDrainDeadlineSelected func()
+
+	// drainBeforeContextSnapshot is a deterministic test seam for the narrow
+	// deadline edge where the final owner clears the last entry while DrainContext
+	// is selecting ctx.Done. It is nil in production.
+	drainBeforeContextSnapshot func()
 
 	listenersMu sync.Mutex
 	listeners   []func(SessionEvent)
@@ -157,11 +202,25 @@ type WorkerSpawner struct {
 
 const sessionHistoryLimit = 4096
 
+// groupTerminationOwner atomically resolves whether operator cancellation or
+// natural reaping owns process-group termination for one live generation.
+type groupTerminationOwner uint8
+
+const (
+	groupTerminationOpen groupTerminationOwner = iota
+	groupTerminationOperator
+	groupTerminationNatural
+)
+
 type spawnedSession struct {
-	handle SessionHandle
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-	spec   SessionSpec
+	handle                SessionHandle
+	cmd                   *exec.Cmd
+	cancel                context.CancelFunc
+	spec                  SessionSpec
+	stopRequested         bool                  // guarded by WorkerSpawner.mu
+	forceKillRequested    bool                  // guarded by WorkerSpawner.mu
+	groupTerminationOwner groupTerminationOwner // guarded by WorkerSpawner.mu
+	terminal              bool                  // guarded by WorkerSpawner.mu; Ended delivery owns this generation
 }
 
 // NewWorkerSpawner constructs a spawner. Workers will not be spawned until
@@ -177,10 +236,17 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 	return &WorkerSpawner{
 		opts:                   opts,
 		sessions:               make(map[string]*spawnedSession),
+		spawnReservations:      make(map[string]struct{}),
 		sessionHistory:         make(map[string]struct{}),
 		accepting:              true,
 		extraEnabledProjectIDs: make(map[string]struct{}),
+		terminateProcessGroup:  terminateSessionProcessGroup,
 		killProcessGroup:       killSessionProcessGroup,
+		waitProcessGroup:       waitSessionProcessGroup,
+		startCommand:           func(cmd *exec.Cmd) error { return cmd.Start() },
+		pumpDrainTimerFactory: func(d time.Duration) pumpDrainTimer {
+			return &realPumpDrainTimer{timer: time.NewTimer(d)}
+		},
 	}
 }
 
@@ -470,7 +536,15 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 		s.mu.Unlock()
 		return nil, errors.New("not accepting new work (paused or draining)")
 	}
-	if active, capacity := len(s.sessions), s.opts.MaxConcurrentSessions; active >= capacity {
+	if _, active := s.sessions[spec.SessionID]; active {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("session %q is already active", spec.SessionID)
+	}
+	if _, reserved := s.spawnReservations[spec.SessionID]; reserved {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("session %q is already being started", spec.SessionID)
+	}
+	if active, capacity := len(s.sessions)+len(s.spawnReservations), s.opts.MaxConcurrentSessions; active >= capacity {
 		s.mu.Unlock()
 		// Snapshot the counts BEFORE unlocking — formatting them after
 		// release races with spawn.func1's delete on s.sessions when an
@@ -493,6 +567,7 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	if spec.RepositoryID == "" && project.RepositoryID != "" {
 		spec.RepositoryID = project.RepositoryID
 	}
+	s.spawnReservations[spec.SessionID] = struct{}{}
 	s.mu.Unlock()
 
 	return s.spawn(spec, project)
@@ -611,6 +686,16 @@ func matchProject(p *ProjectConfig, repository string) *ProjectConfig {
 }
 
 func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*SessionHandle, error) {
+	reservationTransferred := false
+	defer func() {
+		if reservationTransferred {
+			return
+		}
+		s.mu.Lock()
+		delete(s.spawnReservations, spec.SessionID)
+		s.mu.Unlock()
+	}()
+
 	command := s.opts.WorkerCommand
 	if len(command) == 0 {
 		// Stub worker — exits 0 immediately. Production code paths
@@ -625,8 +710,12 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		command = []string{"/bin/sh", "-c", `printf 'session-started:%s\n' "$DONMAI_SESSION_ID"; exit 0`}
 	}
 
+	// Keep cancellation as a lifecycle signal only. CommandContext's default
+	// cancellation hard-kills the direct child before the process group receives
+	// its cooperative SIGTERM window, so use Command and let the reaper own the
+	// TERM -> bounded grace -> KILL escalation explicitly.
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...) //nolint:gosec
+	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec
 	configureSessionProcessGroup(cmd)
 	cmd.Env = composeEnv(s.opts.BaseEnv, spec.Env, map[string]string{
 		"DONMAI_SESSION_ID":    spec.SessionID,
@@ -635,6 +724,32 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		"DONMAI_REF":           spec.Ref,
 		"DONMAI_PROJECT_ID":    project.ID,
 	})
+
+	// The daemon, rather than os/exec, owns these read ends. That lets a waiter
+	// observe direct-child exit without closing a pump mid-buffer, while still
+	// allowing the terminal reaper to close inherited-pipe readers on deadline.
+	// Create them before OnPreSpawn so a setup failure occurs before the hook can
+	// acquire resources whose rollback ownership it would transfer.
+	stdout, stdoutWriter, err := os.Pipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("create worker stdout pipe: %w", err)
+	}
+	stderr, stderrWriter, err := os.Pipe()
+	if err != nil {
+		_ = stdout.Close()
+		_ = stdoutWriter.Close()
+		cancel()
+		return nil, fmt.Errorf("create worker stderr pipe: %w", err)
+	}
+	closeWorkerPipes := func() {
+		_ = stdout.Close()
+		_ = stdoutWriter.Close()
+		_ = stderr.Close()
+		_ = stderrWriter.Close()
+	}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 
 	// OnPreSpawn is the extension point for callers that need to compute
 	// per-session env entries (e.g., credentials resolved at spawn time)
@@ -649,6 +764,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	if s.opts.OnPreSpawn != nil {
 		next, hookErr := s.opts.OnPreSpawn(spec, cmd.Env)
 		if hookErr != nil {
+			closeWorkerPipes()
 			cancel()
 			return nil, fmt.Errorf("pre-spawn hook: %w", hookErr)
 		}
@@ -658,10 +774,8 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		}
 	}
 
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
-
-	if err := cmd.Start(); err != nil {
+	if err := s.startCommand(cmd); err != nil {
+		closeWorkerPipes()
 		cancel()
 		startErr := fmt.Errorf("start worker: %w", err)
 		if preSpawnOwnsCleanup && s.opts.OnSpawnAborted != nil {
@@ -669,6 +783,10 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		}
 		return nil, startErr
 	}
+	// Child-side duplicates are now installed. Keeping either daemon write end
+	// open would prevent EOF after the worker exits, so release both immediately.
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
 
 	pid := 0
 	if cmd.Process != nil {
@@ -700,104 +818,225 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	}
 
 	s.mu.Lock()
+	// Transfer this exact admission from its pre-spawn reservation to the live
+	// registry under one lock. AcceptWork reserves ids before leaving the lock,
+	// so a duplicate cannot overwrite this session while cmd.Start is in flight.
+	delete(s.spawnReservations, spec.SessionID)
 	s.sessions[spec.SessionID] = ss
 	s.rememberSessionLocked(spec.SessionID)
+	reservationTransferred = true
 	s.mu.Unlock()
 
-	// Stream stdout / stderr with worker-tagged prefix. Pump completion is
-	// tracked because os/exec's Wait CLOSES the pipe read ends: reaping
-	// before the pumps hit EOF silently discards buffered, not-yet-read
-	// child output (a loaded CI runner lost the child's only stderr record
-	// that way — 2026-07-06, run 28822266352).
-	var pumps sync.WaitGroup
-	pumps.Add(2)
-	go func() {
-		defer pumps.Done()
-		if s.opts.StdoutPrefixWriter != nil {
-			pumpLines(stdout, spec.SessionID, s.opts.StdoutPrefixWriter)
-		} else {
-			drain(stdout)
-		}
-	}()
-	go func() {
-		defer pumps.Done()
-		if s.opts.StderrPrefixWriter != nil {
-			pumpLines(stderr, spec.SessionID, s.opts.StderrPrefixWriter)
-		} else {
-			drain(stderr)
-		}
-	}()
+	// Stream stdout / stderr with worker-tagged prefix. The daemon owns the read
+	// ends, so cmd.Wait can observe direct-child exit without closing a pump and
+	// discarding buffered output. Each completion fits in this buffered channel
+	// while the direct child is still running; no bridge goroutine is needed.
+	pumpDone := make(chan struct{}, 2)
+	pump := func(reader *os.File, writer PrefixedWriter) {
+		go func() {
+			defer func() {
+				_ = reader.Close()
+				pumpDone <- struct{}{}
+			}()
+			if writer != nil {
+				pumpLines(reader, spec.SessionID, writer)
+				return
+			}
+			drain(reader)
+		}()
+	}
+	pump(stdout, s.opts.StdoutPrefixWriter)
+	pump(stderr, s.opts.StderrPrefixWriter)
+
+	// Wait observes only direct-process termination. Terminal classification,
+	// process-group cleanup, event delivery, and SessionID release remain owned
+	// by the reaper below.
+	waitResult := make(chan error, 1)
+	go func() { waitResult <- cmd.Wait() }()
 
 	s.emit(SessionEvent{Kind: SessionEventStarted, Handle: handle, Spec: spec})
 
 	go func() {
-		// Give the pumps a bounded grace to reach EOF before reaping. For a
-		// normally exiting child the pipe write ends close on exit and both
-		// pumps finish in microseconds, so this preserves every buffered
-		// line. The ceiling keeps the reaper hang-resistant in the
-		// degenerate case where a grandchild inherited a pipe end and
-		// outlives the worker — there we accept the pre-existing tail loss
-		// rather than never reaping the session.
-		pumpsDone := make(chan struct{})
-		go func() { pumps.Wait(); close(pumpsDone) }()
-		select {
-		case <-pumpsDone:
-		case <-time.After(pumpDrainGrace):
+		// This seam marks the running phase only after both pumps and the direct
+		// waiter are installed. Production leaves it nil.
+		if s.reaperRunning != nil {
+			s.reaperRunning()
 		}
-		err := cmd.Wait()
 
-		s.mu.Lock()
-		entry := s.sessions[spec.SessionID]
-		if entry == nil {
-			s.mu.Unlock()
+		pumpsRemaining := 2
+		cancelled := false
+		ctxDone := ctx.Done()
+		handleCancellation := func() {
+			// Cancellation has already sent SIGTERM under the exact session lock.
+			// Give the complete group its cooperative window before a TERM-ignoring
+			// tree is escalated to SIGKILL, whether the leader is still running or
+			// is in its terminal output-drain phase.
+			cancelled = true
+			ctxDone = nil
+			if outcome := s.waitProcessGroup(cmd, sessionTerminationGrace); outcome != processGroupGone {
+				s.forceKillGeneration(ss)
+			}
+		}
+		reconcileCancellation := func() {
+			// A select gives no priority to a ready cancellation arm. Reconcile the
+			// exact session context after every running-phase result so child exit
+			// or pump EOF cannot bypass the TERM grace already requested by Stop or
+			// Drain.
+			if !cancelled && ctx.Err() != nil {
+				handleCancellation()
+			}
+		}
+		if s.runningPhaseContextDone != nil {
+			ctxDone = s.runningPhaseContextDone(ctx, waitResult, pumpDone)
+		}
+
+		// A running worker has no output-drain deadline. Pump completion merely
+		// records that a stream reached EOF; direct-child termination is the only
+		// transition that can begin terminal cleanup.
+		var err error
+		for directChildRunning := true; directChildRunning; {
+			select {
+			case err = <-waitResult:
+				directChildRunning = false
+			case <-ctxDone:
+				handleCancellation()
+			case <-pumpDone:
+				pumpsRemaining--
+			}
+			reconcileCancellation()
+		}
+
+		// Account for EOF notifications that arrived concurrently with cmd.Wait
+		// before deciding whether a terminal drain timer is needed.
+	drainCompletedPumps:
+		for pumpsRemaining > 0 {
+			select {
+			case <-pumpDone:
+				pumpsRemaining--
+			default:
+				break drainCompletedPumps
+			}
+		}
+
+		pumpsJoined := true
+		if pumpsRemaining > 0 {
+			timerFactory := s.pumpDrainTimerFactory
+			if timerFactory == nil {
+				timerFactory = func(d time.Duration) pumpDrainTimer {
+					return &realPumpDrainTimer{timer: time.NewTimer(d)}
+				}
+			}
+			timer := timerFactory(pumpDrainGrace)
+			for pumpsRemaining > 0 {
+				select {
+				case <-pumpDone:
+					pumpsRemaining--
+				case <-ctxDone:
+					handleCancellation()
+				case <-timer.C():
+					if s.afterPumpDrainDeadlineSelected != nil {
+						s.afterPumpDrainDeadlineSelected()
+					}
+					switch s.claimReaperGroupTermination(ss) {
+					case reaperGroupTerminationOperatorGrace:
+						if !cancelled {
+							handleCancellation()
+						}
+					case reaperGroupTerminationNatural:
+						// The leader has already exited, so reclaim a surviving group
+						// without rewriting an exit-0 session as an operator termination.
+						if killErr := s.reapRemainingProcessGroup(ss); killErr != nil && !errors.Is(killErr, errSessionProcessExited) {
+							slog.Warn("worker process group cleanup signal failed", "sessionId", spec.SessionID, "err", killErr)
+						}
+					}
+					// Descendants can retain inherited write ends after the group
+					// signal races with their exit. Closing daemon-owned reads makes
+					// pipe-read pumps finish. A PrefixedWriter can itself be blocked,
+					// though, so only retain terminal ownership for a bounded final join.
+					_ = stdout.Close()
+					_ = stderr.Close()
+					closeTimer := timerFactory(pumpCloseJoinGrace)
+					for pumpsRemaining > 0 {
+						select {
+						case <-pumpDone:
+							pumpsRemaining--
+						case <-ctxDone:
+							handleCancellation()
+						case <-closeTimer.C():
+							// Consume notifications already ready at the deadline before
+							// allowing a non-cooperative external writer to outlive this
+							// terminal generation. pumpDone is sized for both later sends.
+							for pumpsRemaining > 0 {
+								select {
+								case <-pumpDone:
+									pumpsRemaining--
+								default:
+									pumpsJoined = false
+									slog.Warn("worker output pump did not stop after pipe close", "sessionId", spec.SessionID, "remainingPumps", pumpsRemaining)
+									pumpsRemaining = 0
+								}
+							}
+						}
+					}
+					_ = closeTimer.Stop()
+				}
+			}
+			_ = timer.Stop()
+		}
+
+		// Responsive pumps are joined before terminal ownership moves to
+		// process-group cleanup and synchronous Ended delivery. A blocked external
+		// writer may outlive the bounded post-close join, but it cannot retain the
+		// session registry entry or capacity.
+		if pumpsJoined && s.afterPumpsJoined != nil {
+			s.afterPumpsJoined()
+		}
+
+		// cmd.Wait proves only that the direct child exited. Claim process-group
+		// termination before the zero-duration probe so a late StopSession cannot
+		// race natural cleanup into an immediate KILL.
+		groupTermination := s.claimReaperGroupTermination(ss)
+		if groupTermination == reaperGroupTerminationOperatorGrace && !cancelled {
+			handleCancellation()
+		}
+		// A normal leader exit must not turn a surviving, pipe-silent child into a
+		// capacity leak. The zero-duration probe performs one classification without
+		// adding a grace period; operator-owned generations have already received
+		// their cooperative window and stale generations issue no group signal.
+		if groupTermination != reaperGroupTerminationStale && s.waitProcessGroup(cmd, 0) != processGroupGone && groupTermination == reaperGroupTerminationNatural {
+			if killErr := s.reapRemainingProcessGroup(ss); killErr != nil && !errors.Is(killErr, errSessionProcessExited) {
+				slog.Warn("worker process group cleanup signal failed", "sessionId", spec.SessionID, "err", killErr)
+			}
+		}
+		// A killed group can still be reported as EPERM or zombie-only. Bound that
+		// observation and release the terminal generation after logging the precise
+		// outcome; an unobservable group must not retain a SessionID forever.
+		if outcome := s.waitProcessGroup(cmd, processGroupPostWaitGrace); outcome != processGroupGone {
+			slog.Warn("worker process group did not disappear after direct-child reap", "sessionId", spec.SessionID, "outcome", outcome)
+		}
+
+		event, reaped := s.reapSession(spec.SessionID, ss, err, cancelled)
+		if !reaped {
 			cancel()
 			return
 		}
-		delete(s.sessions, spec.SessionID)
-		switch {
-		case err == nil:
-			entry.handle.State = SessionCompleted
-		case ctx.Err() != nil:
-			entry.handle.State = SessionTerminated
-		default:
-			entry.handle.State = SessionFailed
-		}
-		final := entry.handle
-		s.mu.Unlock()
-		entry.cancel()
-
-		s.emit(SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: spec, ExitErr: err})
+		ss.cancel()
+		s.emitAndReleaseSession(spec.SessionID, ss, event)
 	}()
 
 	return &handle, nil
 }
 
-// StopSession terminates a single in-flight session by id without
-// disturbing its siblings or pausing the spawner (unlike Drain, which
-// stops accepting and force-kills the whole pool). It looks up the stored
-// spawnedSession, invokes its stored cancel (the same process-teardown
-// machinery Drain uses for stragglers), and deletes it from s.sessions so
-// the capacity slot frees immediately — even if the underlying provider is
-// wedged and the cmd.Wait goroutine has not yet observed the exit.
-//
-// This is the hard out-of-band leg of the deterministic cancel wire
-// (Guard 3): the platform's fast in-band path is the heartbeat stop signal
-// (immediate LostOwnership), and this gives head-of-line-blocking
-// isolation — one stuck session can be killed without a pool drain.
-//
-// Returns false when no session with the given id is currently active
-// (already exited or never spawned); true when a session was found and its
-// cancel invoked + slot freed. Deleting under the lock makes the slot-free
-// race-free against AcceptWork's capacity check; cancel() is invoked after
-// the lock is released so a slow process teardown never blocks AcceptWork.
-//
-// StopSession itself emits the SessionEventEnded lifecycle event (state
-// SessionTerminated) immediately, rather than relying on the spawn
-// goroutine's cmd.Wait → emit: a wedged provider may never let cmd.Wait
-// return, so deferring the event would strand listeners (and the slot-free
-// signal) indefinitely. The spawn goroutine's own cmd.Wait → delete/emit is
-// a no-op once StopSession has removed the entry — it guards on a nil lookup
-// — so the event fires exactly once and a double-free is impossible.
+// StopSession requests cooperative termination for one session without releasing
+// its admission key. It returns true when this spawner still owns the exact
+// generation, including terminal listener delivery and naturally owned cleanup.
+// Those acknowledged states do not send a signal, cancel the session, change its
+// terminal classification, or transfer termination ownership. It returns false
+// only when the ID was never registered or has already been released. The reaper
+// remains the sole terminal owner: it waits for the complete dedicated process
+// group, synchronously notifies listeners, then releases the exact registry
+// entry. Keeping that order prevents same-ID replacement and stale Ended cleanup
+// from crossing generations.
 func (s *WorkerSpawner) StopSession(id string) bool {
 	s.mu.Lock()
 	ss := s.sessions[id]
@@ -805,60 +1044,176 @@ func (s *WorkerSpawner) StopSession(id string) bool {
 		s.mu.Unlock()
 		return false
 	}
-	delete(s.sessions, id)
-	ss.handle.State = SessionTerminated
-	final := ss.handle
+	if ss.terminal || ss.groupTerminationOwner == groupTerminationNatural {
+		// These owners still retain the registry entry and capacity, but a late
+		// Stop must acknowledge them without stealing ownership or mutating state.
+		s.mu.Unlock()
+		return true
+	}
+	if ss.groupTerminationOwner == groupTerminationOperator {
+		s.mu.Unlock()
+		return true
+	}
+	// Signal initiation is intentionally serialized under the exact generation:
+	// the reaper cannot claim natural process-group cleanup between ownership
+	// validation and SIGTERM. A repeated Stop remains a successful request
+	// without a second signal.
+	ss.groupTerminationOwner = groupTerminationOperator
+	ss.stopRequested = true
+	_ = s.terminateProcessGroup(ss.cmd)
 	s.mu.Unlock()
-
-	// Cancel outside the lock: the stored cancel tears the child process
-	// down (context cancellation → process kill), which can take longer
-	// than we want to hold s.mu (AcceptWork / capacity checks contend on
-	// it). The slot is already freed above.
 	ss.cancel()
-	s.emit(SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: ss.spec})
 	return true
 }
 
-// ForceKillSession sends SIGKILL to the daemon-created process group for one
-// owned session. It is deliberately separate from StopSession so normal local
-// stop paths retain their existing context-cancellation behavior.
-//
-// A session seen by this daemon but already reaped is an idempotent success.
-// A never-seen id is rejected: that distinction prevents a mutation routed to
-// the wrong daemon from being falsely acknowledged. The bounded history is
-// process-local because ownership does not survive a daemon restart.
+type reaperGroupTermination uint8
+
+const (
+	reaperGroupTerminationStale reaperGroupTermination = iota
+	reaperGroupTerminationOperatorGrace
+	reaperGroupTerminationOperatorForced
+	reaperGroupTerminationNatural
+)
+
+// claimReaperGroupTermination resolves process-group cleanup for the exact
+// live generation. Natural cleanup becomes visible under the same lock that
+// accepts operator cancellation, so only one path can own the first KILL.
+func (s *WorkerSpawner) claimReaperGroupTermination(expected *spawnedSession) reaperGroupTermination {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected {
+		return reaperGroupTerminationStale
+	}
+	switch expected.groupTerminationOwner {
+	case groupTerminationOperator:
+		if expected.forceKillRequested {
+			return reaperGroupTerminationOperatorForced
+		}
+		return reaperGroupTerminationOperatorGrace
+	case groupTerminationNatural:
+		return reaperGroupTerminationNatural
+	case groupTerminationOpen:
+		expected.groupTerminationOwner = groupTerminationNatural
+		return reaperGroupTerminationNatural
+	default:
+		return reaperGroupTerminationStale
+	}
+}
+
+// forceKillGeneration escalates an operator-owned exact live generation while
+// holding the same lock that serializes terminal classification and registry
+// release.
+func (s *WorkerSpawner) forceKillGeneration(expected *spawnedSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected || expected.groupTerminationOwner != groupTerminationOperator || expected.forceKillRequested {
+		return
+	}
+	expected.stopRequested = true
+	if err := s.killProcessGroup(expected.cmd); err == nil || errors.Is(err, errSessionProcessExited) {
+		expected.forceKillRequested = true
+	}
+}
+
+// reapRemainingProcessGroup reclaims descendants left after cmd.Wait without
+// rewriting the direct child's completed outcome as an operator stop. It holds
+// the exact-generation lock across the signal so a released ID cannot receive a
+// stale signal from its predecessor.
+func (s *WorkerSpawner) reapRemainingProcessGroup(expected *spawnedSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected || expected.groupTerminationOwner != groupTerminationNatural || expected.forceKillRequested {
+		return nil
+	}
+	if err := s.killProcessGroup(expected.cmd); err != nil {
+		return err
+	}
+	expected.forceKillRequested = true
+	return nil
+}
+
+// ForceKillSession handles a replayable SIGKILL mutation for one daemon-owned
+// session. For a live open or operator-owned generation it attempts SIGKILL and
+// returns an error only for an actual signal failure. Naturally owned, terminal,
+// and already force-killed generations return nil without another signal or
+// cancellation. Released IDs retained in bounded session history likewise return
+// nil to acknowledge a mutation replay; a never-owned or history-evicted ID
+// returns "not owned". Thus nil means this daemon recognizes the mutation as
+// successfully handled, not that this invocation sent SIGKILL. Terminal
+// ownership remains with the reaper throughout.
 func (s *WorkerSpawner) ForceKillSession(id string) error {
 	s.mu.Lock()
 	ss := s.sessions[id]
 	_, owned := s.sessionHistory[id]
-	s.mu.Unlock()
-	if ss == nil {
+	if ss == nil || ss.terminal {
+		s.mu.Unlock()
 		if owned {
 			return nil
 		}
 		return fmt.Errorf("session %q is not owned by this daemon", id)
 	}
-
-	if err := s.killProcessGroup(ss.cmd); err != nil && !errors.Is(err, errSessionProcessExited) {
-		return fmt.Errorf("SIGKILL session %q process group: %w", id, err)
-	}
-
-	// The wait goroutine may have reaped the process after the signal. Only the
-	// goroutine that still owns this exact registry entry emits the terminal
-	// event; duplicates and races are successful no-ops.
-	s.mu.Lock()
-	if s.sessions[id] != ss {
+	if ss.groupTerminationOwner == groupTerminationNatural || ss.forceKillRequested {
 		s.mu.Unlock()
 		return nil
 	}
-	delete(s.sessions, id)
-	ss.handle.State = SessionTerminated
-	final := ss.handle
-	s.mu.Unlock()
 
+	// Serialize a successful kill acknowledgement with the session generation.
+	// A duplicate mutation racing the reaper must be idempotent rather than
+	// observing a transient leader/process-group state as a failed command.
+	claimedOpen := ss.groupTerminationOwner == groupTerminationOpen
+	if claimedOpen {
+		ss.groupTerminationOwner = groupTerminationOperator
+	}
+	ss.stopRequested = true
+	if err := s.killProcessGroup(ss.cmd); err != nil && !errors.Is(err, errSessionProcessExited) {
+		if claimedOpen {
+			ss.groupTerminationOwner = groupTerminationOpen
+			ss.stopRequested = false
+		}
+		s.mu.Unlock()
+		return fmt.Errorf("SIGKILL session %q process group: %w", id, err)
+	}
+	ss.forceKillRequested = true
+	s.mu.Unlock()
 	ss.cancel()
-	s.emit(SessionEvent{Kind: SessionEventEnded, Handle: final, Spec: ss.spec})
 	return nil
+}
+
+// emitAndReleaseSession retains exact ownership through synchronous listener
+// delivery. Listener cleanup is therefore generation-safe: it cannot observe a
+// replacement under the same SessionID until the terminal event is complete.
+func (s *WorkerSpawner) emitAndReleaseSession(id string, expected *spawnedSession, event SessionEvent) {
+	s.emit(event)
+	s.mu.Lock()
+	if s.sessions[id] == expected {
+		delete(s.sessions, id)
+	}
+	s.mu.Unlock()
+}
+
+// reapSession removes expected from the live registry and builds its terminal
+// event. A reaper must own the exact session it removes: even though admission
+// rejects duplicate IDs, a stale waiter must never be able to delete a newer
+// entry if a caller or future maintenance path replaces an ID.
+func (s *WorkerSpawner) reapSession(id string, expected *spawnedSession, err error, cancelled bool) (SessionEvent, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessions[id] != expected {
+		return SessionEvent{}, false
+	}
+	switch {
+	case err == nil && !expected.stopRequested:
+		expected.handle.State = SessionCompleted
+	case expected.stopRequested || cancelled:
+		expected.handle.State = SessionTerminated
+	default:
+		expected.handle.State = SessionFailed
+	}
+	// Retain the exact map entry through synchronous Ended delivery, but make
+	// this generation terminal before listeners run. Stop/ForceKill can therefore
+	// never signal a process after classification while release is pending.
+	expected.terminal = true
+	return SessionEvent{Kind: SessionEventEnded, Handle: expected.handle, Spec: expected.spec, ExitErr: err}, true
 }
 
 func (s *WorkerSpawner) rememberSessionLocked(id string) {
@@ -875,47 +1230,96 @@ func (s *WorkerSpawner) rememberSessionLocked(id string) {
 	delete(s.sessionHistory, oldest)
 }
 
-// Drain waits for all in-flight sessions to exit, then resolves. After
-// timeout, remaining sessions receive SIGTERM via context cancellation and
-// the function returns an error indicating how many were forcibly stopped.
+// DrainIncompleteError reports a drain that could not prove every admitted
+// spawn has either registered or completed its synchronous abort cleanup.
+// Callers should use errors.As and inspect the counts rather than parsing Error.
+type DrainIncompleteError struct {
+	Cause             error
+	ActiveSessions    int
+	SpawnReservations int
+}
+
+func (e *DrainIncompleteError) Error() string {
+	return fmt.Sprintf("drain incomplete: %v; %d active session(s) observed; %d spawn reservation(s) still pending", e.Cause, e.ActiveSessions, e.SpawnReservations)
+}
+
+// Unwrap exposes the cancellation reason that ended this drain attempt.
+func (e *DrainIncompleteError) Unwrap() error { return e.Cause }
+
+// Drain waits for every admitted spawn to either register or abort and for all
+// in-flight sessions to exit. It is retained for compatibility; callers that
+// need an independently bounded retry should use DrainContext.
 func (s *WorkerSpawner) Drain(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return s.DrainContext(ctx)
+}
+
+// DrainContext waits for every admitted spawn to either register or abort and
+// for all in-flight sessions to exit. When ctx ends, registered sessions are
+// cancelled outside the spawner lock, while pre-start reservations remain owned
+// by their spawn path until hooks and synchronous abort cleanup finish.
+func (s *WorkerSpawner) DrainContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	s.mu.Lock()
 	s.accepting = false
-	if len(s.sessions) == 0 {
+	if len(s.sessions) == 0 && len(s.spawnReservations) == 0 {
 		s.mu.Unlock()
 		return nil
 	}
 	s.mu.Unlock()
 
-	deadline := time.Now().Add(timeout)
-	pollInterval := 100 * time.Millisecond
+	// A ticker avoids holding the mutex while waiting, and context cancellation
+	// makes an explicit cancellation deterministic instead of polling a clock.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		s.mu.Lock()
-		n := len(s.sessions)
+		pending := len(s.sessions) + len(s.spawnReservations)
 		s.mu.Unlock()
-		if n == 0 {
+		if pending == 0 {
 			return nil
 		}
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(pollInterval)
-	}
 
-	// Force-stop remaining sessions.
-	s.mu.Lock()
-	stragglers := make([]*spawnedSession, 0, len(s.sessions))
-	for _, ss := range s.sessions {
-		stragglers = append(stragglers, ss)
+		select {
+		case <-ctx.Done():
+			// A final locked snapshot is required here: the last owner may have
+			// completed after the optimistic pending check but before this select
+			// chose ctx.Done. Returning an incomplete error in that case would
+			// poison Daemon.Stop's cached result despite a fully drained pool.
+			if s.drainBeforeContextSnapshot != nil {
+				s.drainBeforeContextSnapshot()
+			}
+			s.mu.Lock()
+			stragglers := make([]*spawnedSession, 0, len(s.sessions))
+			for _, ss := range s.sessions {
+				stragglers = append(stragglers, ss)
+			}
+			reservations := len(s.spawnReservations)
+			if len(stragglers) == 0 && reservations == 0 {
+				s.mu.Unlock()
+				return nil
+			}
+			incomplete := &DrainIncompleteError{
+				Cause:             ctx.Err(),
+				ActiveSessions:    len(stragglers),
+				SpawnReservations: reservations,
+			}
+			s.mu.Unlock()
+
+			// Request TERM outside the snapshot lock. StopSession serializes each
+			// signal with the exact live generation, then the reaper grants the
+			// bounded cooperative window before SIGKILL escalation.
+			for _, ss := range stragglers {
+				s.StopSession(ss.spec.SessionID)
+			}
+			return incomplete
+		case <-ticker.C:
+		}
 	}
-	s.mu.Unlock()
-	for _, ss := range stragglers {
-		ss.cancel()
-	}
-	if len(stragglers) > 0 {
-		return fmt.Errorf("drain timeout — sigterm sent to %d session(s)", len(stragglers))
-	}
-	return nil
 }
 
 // composeEnv flattens the merged env into the os.Environ() form expected by

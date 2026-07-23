@@ -195,6 +195,35 @@ type ProviderRegistry interface {
 	Capabilities(name string) (caps map[string]any, ok bool)
 }
 
+type lifecycleKind uint8
+
+const (
+	lifecycleStart lifecycleKind = iota + 1
+	lifecycleUpdate
+	lifecycleDrain
+	lifecycleStop
+	lifecyclePause
+	lifecycleResume
+)
+
+// lifecycleLease identifies the one operation currently allowed to advance the
+// daemon lifecycle. Its done channel lets later callers wait without holding
+// lifecycleMu across any blocking work.
+type lifecycleLease struct {
+	id   uint64
+	kind lifecycleKind
+	done chan struct{}
+}
+
+// stopGeneration persists from the first Stop attempt until terminal
+// completion. Incomplete attempt errors deliberately do not belong here: a
+// later bounded Stop call may finish the same generation successfully.
+type stopGeneration struct {
+	id          uint64
+	terminal    bool
+	terminalErr error
+}
+
 // Daemon is the top-level supervisor. It owns the loaded Config, the
 // HeartbeatService, the WorkerSpawner, and (optionally) the AutoUpdater.
 type Daemon struct {
@@ -251,8 +280,31 @@ type Daemon struct {
 	// Wave 9 / Track A3.
 	workareaArchive *WorkareaArchiveRegistry
 
-	stopOnce sync.Once
-	doneCh   chan struct{}
+	// lifecycleMu is a metadata-only ownership registry. It must never be held
+	// across registration, draining, polling, callbacks, or update work: callers
+	// that encounter an active generation wait on its lease with their own context.
+	lifecycleMu     sync.Mutex
+	lifecycleOwner  *lifecycleLease
+	nextLifecycleID uint64
+	stopGen         *stopGeneration
+	doneCh          chan struct{}
+	doneOnce        sync.Once
+
+	// stopAttemptBeforeRelease is a package-private test seam. Production leaves
+	// it nil; tests use it to prove a completed incomplete attempt cannot race a
+	// later Stop attempt's terminal publication.
+	stopAttemptBeforeRelease func(error)
+
+	// Landing callbacks are independent of worker spawning, so they have their
+	// own admission, cancellation, and completion ownership. landingDone is the
+	// active callback generation's single completion signal; it starts closed and
+	// is replaced only on a 0 -> 1 admission transition.
+	landingMu       sync.Mutex
+	landingCtx      context.Context
+	landingCancel   context.CancelFunc
+	landingStopping bool
+	landingActive   int
+	landingDone     chan struct{}
 }
 
 // New constructs a Daemon. Call Start() to bring it online.
@@ -273,9 +325,15 @@ func New(opts Options) *Daemon {
 	// ephemeral here lets parallel tests bind 127.0.0.1:0 and have
 	// the kernel pick free ports, eliminating the port-7734 bind
 	// flake observed under -race when many tests share the default.
+	landingCtx, landingCancel := context.WithCancel(context.Background())
+	landingDone := make(chan struct{})
+	close(landingDone)
 	d := &Daemon{
 		opts:           opts,
 		doneCh:         make(chan struct{}),
+		landingCtx:     landingCtx,
+		landingCancel:  landingCancel,
+		landingDone:    landingDone,
 		sessionDetails: newSessionDetailStore(),
 		routingTraces:  NewRoutingTraceStore(DefaultRoutingRingBufferSize),
 	}
@@ -313,6 +371,78 @@ func (d *Daemon) EffectiveVersion() string {
 
 func (d *Daemon) setState(s State) {
 	d.state.Store(s)
+}
+
+// claimLifecycle waits for the current lifecycle owner to release its lease,
+// then installs a lease for kind. Context limits only waiting for an active
+// owner: when no owner exists, even a canceled Stop may claim the slot and run
+// its harmless zero-wait completion barriers.
+func (d *Daemon) claimLifecycle(ctx context.Context, kind lifecycleKind) (*lifecycleLease, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		d.lifecycleMu.Lock()
+		if d.lifecycleOwner == nil {
+			d.nextLifecycleID++
+			lease := &lifecycleLease{
+				id:   d.nextLifecycleID,
+				kind: kind,
+				done: make(chan struct{}),
+			}
+			d.lifecycleOwner = lease
+			d.lifecycleMu.Unlock()
+			return lease, nil
+		}
+		done := d.lifecycleOwner.done
+		d.lifecycleMu.Unlock()
+
+		select {
+		case <-done:
+			// The owner released its exact lease. Retry so installation remains
+			// serialized with every other contender.
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// tryClaimLifecycle installs a lease only when no lifecycle operation is
+// active. Pause and Resume deliberately use this nonblocking form because they
+// have no caller context with which to bound a wait.
+func (d *Daemon) tryClaimLifecycle(kind lifecycleKind) (*lifecycleLease, bool) {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.lifecycleOwner != nil {
+		return nil, false
+	}
+	d.nextLifecycleID++
+	lease := &lifecycleLease{
+		id:   d.nextLifecycleID,
+		kind: kind,
+		done: make(chan struct{}),
+	}
+	d.lifecycleOwner = lease
+	return lease, true
+}
+
+// releaseLifecycle clears and signals only the exact installed lease. It is
+// safe for a deferred cleanup to run more than once and never wakes waiters for
+// a newer lifecycle generation.
+func (d *Daemon) releaseLifecycle(lease *lifecycleLease) {
+	if lease == nil {
+		return
+	}
+	d.lifecycleMu.Lock()
+	if d.lifecycleOwner == lease {
+		d.lifecycleOwner = nil
+		close(lease.done)
+	}
+	d.lifecycleMu.Unlock()
+}
+
+func (d *Daemon) ownsLifecycleLocked(lease *lifecycleLease) bool {
+	return d.lifecycleOwner == lease
 }
 
 // workerCapabilitiesFunc returns the configured capability-flag provider, or
@@ -407,11 +537,14 @@ func (d *Daemon) Spawner() *WorkerSpawner {
 	return d.spawner
 }
 
-// StopSession terminates a single in-flight session by id and frees its
-// capacity slot. Returns false when the session is unknown (already exited
-// or never spawned) or the spawner is not yet initialised. Wired to the
-// POST /api/daemon/sessions/<id>/stop control-API route for the
-// deterministic per-session cancel path (Guard 3 hard out-of-band leg).
+// StopSession requests cooperative termination for one session id. A true
+// result acknowledges an exact generation still owned by this daemon, including
+// terminal or natural cleanup in progress; capacity is released asynchronously
+// only after process-group reaping and synchronous Ended delivery. False means
+// the spawner is uninitialised, the ID was never present, or its generation was
+// already released. Wired to the POST /api/daemon/sessions/<id>/stop control-API
+// route for the deterministic per-session cancel path (Guard 3 hard out-of-band
+// leg).
 func (d *Daemon) StopSession(id string) bool {
 	if d.spawner == nil {
 		return false
@@ -437,10 +570,23 @@ func (d *Daemon) maxConcurrentSessions() int {
 // heartbeat, and start the spawner. The HTTP server is NOT started here;
 // callers do that explicitly via Server.Start so they can pick the bind.
 func (d *Daemon) Start(ctx context.Context) error {
-	if s := d.State(); s != StateStopped {
-		return fmt.Errorf("cannot start — current state %q", s)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lease, err := d.claimLifecycle(ctx, lifecycleStart)
+	if err != nil {
+		return err
+	}
+	defer d.releaseLifecycle(lease)
+
+	d.lifecycleMu.Lock()
+	if d.stopGen != nil || d.State() != StateStopped {
+		state := d.State()
+		d.lifecycleMu.Unlock()
+		return fmt.Errorf("cannot start — current state %q", state)
 	}
 	d.setState(StateStarting)
+	d.lifecycleMu.Unlock()
 
 	cfg, err := LoadConfig(d.opts.ConfigPath)
 	if err != nil {
@@ -778,7 +924,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
-	d.setState(StateRunning)
+	d.lifecycleMu.Lock()
+	if d.ownsLifecycleLocked(lease) && d.stopGen == nil {
+		d.setState(StateRunning)
+	}
+	d.lifecycleMu.Unlock()
 	return nil
 }
 
@@ -822,44 +972,209 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	}
 }
 
-// Stop performs a graceful shutdown: drain in-flight sessions, stop loops,
-// and transition to stopped. The context is currently unused but is retained
-// for future use (e.g. cancelling drain via ctx.Done).
-// Stop drains spawned work, halts the heartbeat/poller loops, closes the
-// yaml watcher, and transitions to StateStopped. Safe to call concurrently
-// or repeatedly — the whole body is gated by stopOnce so a deferred
-// Stop() in a test fixture racing with an HTTP /stop handler is benign.
-func (d *Daemon) Stop(_ context.Context) error {
-	d.stopOnce.Do(func() {
-		if d.State() == StateStopped {
-			return
-		}
-		d.setState(StateDraining)
+// Stop begins a one-way terminal transition. An incomplete drain leaves the
+// daemon in StateDraining with Done open so a later bounded Stop call can finish
+// the same transition. Only a fully drained daemon stops its loops, reports
+// StateStopped, and closes Done. No shutdown wait outlives ctx: an uncooperative
+// poll callback or landing hook may delay completion, but cannot hold a caller
+// past its own deadline.
+func (d *Daemon) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-		timeout := 30 * time.Second
-		if cfg := d.Config(); cfg != nil && cfg.AutoUpdate.DrainTimeoutSeconds > 0 {
-			timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
+	// A completed generation has an immutable result, including for callers whose
+	// own context has already expired.
+	d.lifecycleMu.Lock()
+	if gen := d.stopGen; gen != nil && gen.terminal {
+		err := gen.terminalErr
+		d.lifecycleMu.Unlock()
+		return err
+	}
+	d.lifecycleMu.Unlock()
+
+	lease, err := d.claimLifecycle(ctx, lifecycleStop)
+	if err != nil {
+		// Prefer a terminal result that raced the caller's wait over its now-stale
+		// context error. This makes repeated Stop idempotent after completion.
+		d.lifecycleMu.Lock()
+		if gen := d.stopGen; gen != nil && gen.terminal {
+			err = gen.terminalErr
 		}
-		if d.spawner != nil {
-			_ = d.spawner.Drain(timeout)
+		d.lifecycleMu.Unlock()
+		return err
+	}
+	defer d.releaseLifecycle(lease)
+
+	d.lifecycleMu.Lock()
+	if gen := d.stopGen; gen != nil && gen.terminal {
+		err := gen.terminalErr
+		d.lifecycleMu.Unlock()
+		return err
+	}
+	if d.stopGen == nil {
+		d.stopGen = &stopGeneration{id: lease.id}
+	}
+	gen := d.stopGen
+	// Reassert draining on retries. Nothing may reopen admission once this
+	// generation exists, even if a previous attempt was incomplete.
+	d.setState(StateDraining)
+	poller := d.poller
+	spawner := d.spawner
+	heartbeat := d.heartbeat
+	refresher := d.tokenRefresher
+	d.lifecycleMu.Unlock()
+
+	// Start every shutdown barrier before waiting for any of them. In particular,
+	// an unjoinable poll or landing callback must not suppress worker admission
+	// closure or process-group termination.
+	if spawner != nil {
+		spawner.Pause()
+	}
+	var pollDone <-chan struct{}
+	if poller != nil {
+		pollDone = poller.beginStop()
+	}
+	landingDone := d.beginLandingStop()
+
+	drainCtx, cancel := context.WithTimeout(ctx, d.drainTimeout())
+	var drainErr error
+	if spawner != nil {
+		drainErr = spawner.DrainContext(drainCtx)
+	}
+	cancel()
+
+	pollErr := waitCompletionContext(ctx, pollDone)
+	landingErr := waitCompletionContext(ctx, landingDone)
+	attemptErr := drainErr
+	if attemptErr == nil {
+		attemptErr = pollErr
+	}
+	if attemptErr == nil {
+		attemptErr = landingErr
+	}
+	if attemptErr != nil {
+		if hook := d.stopAttemptBeforeRelease; hook != nil {
+			hook(attemptErr)
 		}
-		if d.heartbeat != nil {
-			d.heartbeat.Stop()
-		}
-		if d.poller != nil {
-			d.poller.Stop()
-		}
-		if d.tokenRefresher != nil {
-			d.tokenRefresher.Stop()
-		}
-		if d.yamlWatcherStop != nil {
-			d.yamlWatcherStop()
-			d.yamlWatcherStop = nil
-		}
-		close(d.doneCh)
-		d.setState(StateStopped)
-	})
-	return nil
+		return attemptErr
+	}
+
+	// Only a fully joined attempt owns terminal publication. The loop stoppers
+	// precede the terminal state and Done publication, but never run under the
+	// lifecycle metadata lock.
+	if heartbeat != nil {
+		heartbeat.Stop()
+	}
+	if refresher != nil {
+		refresher.Stop()
+	}
+
+	d.lifecycleMu.Lock()
+	if !d.ownsLifecycleLocked(lease) || d.stopGen != gen || d.stopGen.id != gen.id || gen.terminal {
+		err := gen.terminalErr
+		d.lifecycleMu.Unlock()
+		return err
+	}
+	watcherStop := d.yamlWatcherStop
+	d.yamlWatcherStop = nil
+	d.lifecycleMu.Unlock()
+	if watcherStop != nil {
+		watcherStop()
+	}
+
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if !d.ownsLifecycleLocked(lease) || d.stopGen != gen || d.stopGen.id != gen.id {
+		return nil
+	}
+	if gen.terminal {
+		return gen.terminalErr
+	}
+	gen.terminal = true
+	gen.terminalErr = nil
+	// State is the published completion fact; close Done only after readers can
+	// observe it, so a Done waiter never sees the stale StateDraining value.
+	d.setState(StateStopped)
+	d.doneOnce.Do(func() { close(d.doneCh) })
+	return gen.terminalErr
+}
+
+func (d *Daemon) drainTimeout() time.Duration {
+	timeout := 30 * time.Second
+	if cfg := d.Config(); cfg != nil && cfg.AutoUpdate.DrainTimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
+	}
+	return timeout
+}
+
+// beginLandingStop fences future callback admission, cancels entered callbacks,
+// and returns the one completion channel for the active landing generation. Once
+// stopping is true no callback can replace this channel.
+func (d *Daemon) beginLandingStop() <-chan struct{} {
+	d.landingMu.Lock()
+	d.landingStopping = true
+	if d.landingCancel != nil {
+		d.landingCancel()
+	}
+	done := d.landingDone
+	d.landingMu.Unlock()
+	return done
+}
+
+func waitCompletionContext(ctx context.Context, done <-chan struct{}) error {
+	if done == nil {
+		return nil
+	}
+	// Prefer an already-complete barrier over an already-canceled caller. This
+	// preserves idempotent Stop completion after the final worker/callback exits.
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Drain manually closes admission while retaining a resumable daemon. Unlike
+// Stop it does not cancel poll/landing infrastructure or make the lifecycle
+// terminal; Resume reopens the exact spawner once the requested drain completes.
+func (d *Daemon) Drain(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lease, err := d.claimLifecycle(ctx, lifecycleDrain)
+	if err != nil {
+		return err
+	}
+	defer d.releaseLifecycle(lease)
+
+	d.lifecycleMu.Lock()
+	if d.stopGen != nil {
+		state := d.State()
+		d.lifecycleMu.Unlock()
+		return fmt.Errorf("cannot drain — terminal stop has begun (state %q)", state)
+	}
+	if d.State() != StateRunning && d.State() != StatePaused && d.State() != StateDraining {
+		state := d.State()
+		d.lifecycleMu.Unlock()
+		return fmt.Errorf("cannot drain — current state %q", state)
+	}
+	spawner := d.spawner
+	d.setState(StateDraining)
+	d.lifecycleMu.Unlock()
+	if spawner == nil {
+		return nil
+	}
+	return spawner.DrainContext(ctx)
 }
 
 // handlePollWorkItem is the body of the primary poll loop's OnWork callback,
@@ -887,7 +1202,7 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	// agent or counts toward the concurrency quota.
 	if item.WorkType == LandingWorkType {
 		if onLanding := d.onLandingWork(); onLanding != nil {
-			if lerr := onLanding(context.Background(), item); lerr != nil {
+			if lerr := d.runLandingWork(onLanding, item); lerr != nil {
 				slog.Warn("daemon poll: landing-run handler failed",
 					"repository", item.Repository, "err", lerr)
 			}
@@ -964,25 +1279,95 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 	return nil
 }
 
+// runLandingWork owns one landing callback from admission through completion.
+// Stop fences additions under landingMu before canceling and waiting, so no
+// callback can begin after the stop barrier and Done cannot outrun its return.
+func (d *Daemon) runLandingWork(fn func(context.Context, PollWorkItem) error, item PollWorkItem) error {
+	d.landingMu.Lock()
+	if d.landingStopping {
+		d.landingMu.Unlock()
+		return errors.New("daemon is stopping; landing work rejected")
+	}
+	if d.landingActive == 0 {
+		// The prior generation is closed. A fresh callback generation gets one
+		// shared open completion channel, reclaimed when its final callback exits.
+		d.landingDone = make(chan struct{})
+	}
+	ctx := d.landingCtx
+	d.landingActive++
+	d.landingMu.Unlock()
+	defer func() {
+		d.landingMu.Lock()
+		d.landingActive--
+		if d.landingActive == 0 {
+			close(d.landingDone)
+		}
+		d.landingMu.Unlock()
+	}()
+	return fn(ctx, item)
+}
+
 // Done returns a channel that is closed when the daemon has fully stopped.
 func (d *Daemon) Done() <-chan struct{} {
 	return d.doneCh
 }
 
-// Pause stops accepting new work without draining.
-func (d *Daemon) Pause() {
-	if d.spawner != nil {
-		d.spawner.Pause()
+// Pause stops accepting new work without draining. It reports whether it
+// performed a transition, allowing control endpoints to avoid claiming a stale
+// pause request succeeded.
+func (d *Daemon) Pause() bool {
+	lease, ok := d.tryClaimLifecycle(lifecyclePause)
+	if !ok {
+		return false
+	}
+	defer d.releaseLifecycle(lease)
+
+	d.lifecycleMu.Lock()
+	if d.stopGen != nil || d.State() != StateRunning {
+		d.lifecycleMu.Unlock()
+		return false
+	}
+	spawner := d.spawner
+	d.lifecycleMu.Unlock()
+	if spawner != nil {
+		spawner.Pause()
+	}
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if !d.ownsLifecycleLocked(lease) || d.stopGen != nil || d.State() != StateRunning {
+		return false
 	}
 	d.setState(StatePaused)
+	return true
 }
 
-// Resume re-enables accepting work.
-func (d *Daemon) Resume() {
-	if d.spawner != nil {
-		d.spawner.Resume()
+// Resume re-enables accepting work after a completed manual pause or drain. A
+// terminal stop permanently fences admission, and an active drain retains its
+// lease, so Resume cannot reopen admission underneath it.
+func (d *Daemon) Resume() bool {
+	lease, ok := d.tryClaimLifecycle(lifecycleResume)
+	if !ok {
+		return false
+	}
+	defer d.releaseLifecycle(lease)
+
+	d.lifecycleMu.Lock()
+	if d.stopGen != nil || (d.State() != StatePaused && d.State() != StateDraining) {
+		d.lifecycleMu.Unlock()
+		return false
+	}
+	spawner := d.spawner
+	d.lifecycleMu.Unlock()
+	if spawner != nil {
+		spawner.Resume()
+	}
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if !d.ownsLifecycleLocked(lease) || d.stopGen != nil || (d.State() != StatePaused && d.State() != StateDraining) {
+		return false
 	}
 	d.setState(StateRunning)
+	return true
 }
 
 // AcceptWork dispatches a session spec to the spawner.
@@ -1059,30 +1444,54 @@ func (d *Daemon) SessionDetail(sessionID string) (*SessionDetail, bool) {
 // error is returned. The caller (HTTP handler) typically returns the
 // outcome to the client and may then call Stop().
 func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lease, err := d.claimLifecycle(ctx, lifecycleUpdate)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		// Restore admission before publishing StateRunning, but only while this
+		// exact update generation still owns lifecycle advancement. Stop cannot
+		// race through this lease, and a failed/canceled update never leaves the
+		// spawner silently NACKing while status reports ready.
+		d.lifecycleMu.Lock()
+		shouldResume := d.ownsLifecycleLocked(lease) && d.stopGen == nil && d.State() == StateUpdating
+		spawner := d.spawner
+		d.lifecycleMu.Unlock()
+		if shouldResume && spawner != nil {
+			spawner.Resume()
+		}
+		d.lifecycleMu.Lock()
+		if shouldResume && d.ownsLifecycleLocked(lease) && d.stopGen == nil && d.State() == StateUpdating {
+			d.setState(StateRunning)
+		}
+		d.lifecycleMu.Unlock()
+		d.releaseLifecycle(lease)
+	}()
+
+	d.lifecycleMu.Lock()
+	if d.stopGen != nil || d.State() != StateRunning {
+		state := d.State()
+		d.lifecycleMu.Unlock()
+		return nil, fmt.Errorf("cannot update — current state %q", state)
+	}
+	d.setState(StateUpdating)
+	spawner := d.spawner
+	d.lifecycleMu.Unlock()
+
 	cfg := d.Config()
 	if cfg == nil {
 		return nil, errors.New("no config loaded")
 	}
-	d.setState(StateUpdating)
-	defer func() {
-		// Restore running state if we did not actually exit. The
-		// spawner.Drain() below flips `accepting=false` directly without
-		// going through Daemon.Pause(), so resuming the state alone leaves
-		// the spawner stuck NACKing every claim with "not accepting new
-		// work" while status reports `ready`. Re-resume the spawner so the
-		// two stay in lockstep. Symptom (pre-fix): daemon uptime > drain
-		// timeout, status=ready, every claim NACKs.
-		if d.State() == StateUpdating {
-			if d.spawner != nil {
-				d.spawner.Resume()
-			}
-			d.setState(StateRunning)
+	if spawner != nil {
+		drainCtx, cancel := context.WithTimeout(ctx, d.drainTimeout())
+		err := spawner.DrainContext(drainCtx)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("drain before update: %w", err)
 		}
-	}()
-
-	timeout := time.Duration(cfg.AutoUpdate.DrainTimeoutSeconds) * time.Second
-	if d.spawner != nil {
-		_ = d.spawner.Drain(timeout)
 	}
 
 	updater := NewUpdater(UpdaterOptions{
