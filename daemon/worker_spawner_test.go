@@ -966,6 +966,310 @@ func TestSpawner_PumpDrainLifecycle(t *testing.T) {
 	})
 }
 
+func TestSpawner_StopSessionAfterPumpsJoinGrantsTerminationGrace(t *testing.T) {
+	const (
+		repository = "github.com/a/b"
+		sessionID  = "post-pump-stop"
+	)
+
+	afterPumpsJoined := make(chan struct{})
+	releaseReaper := make(chan struct{})
+	ended := make(chan SessionEvent, 1)
+	var (
+		terminateCalls atomic.Int32
+		killCalls      atomic.Int32
+		joinedOnce     sync.Once
+		releaseOnce    sync.Once
+		waitMu         sync.Mutex
+		waitDurations  []time.Duration
+	)
+	release := func() { releaseOnce.Do(func() { close(releaseReaper) }) }
+
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: repository}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+	})
+	s.afterPumpsJoined = func() {
+		joinedOnce.Do(func() {
+			close(afterPumpsJoined)
+			<-releaseReaper
+		})
+	}
+	s.terminateProcessGroup = func(*exec.Cmd) error {
+		terminateCalls.Add(1)
+		return nil
+	}
+	s.killProcessGroup = func(*exec.Cmd) error {
+		killCalls.Add(1)
+		return nil
+	}
+	s.waitProcessGroup = func(_ *exec.Cmd, duration time.Duration) processGroupWaitResult {
+		waitMu.Lock()
+		waitDurations = append(waitDurations, duration)
+		waitMu.Unlock()
+		return processGroupGone
+	}
+	s.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded {
+			ended <- ev
+		}
+	})
+	t.Cleanup(func() {
+		release()
+		_ = s.Drain(time.Second)
+	})
+
+	if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	waitSpawnerSignal(t, afterPumpsJoined, "reaper after output pumps join")
+	if !s.StopSession(sessionID) {
+		t.Fatal("StopSession = false")
+	}
+	if got := terminateCalls.Load(); got != 1 {
+		t.Fatalf("SIGTERM calls = %d, want 1", got)
+	}
+	if got := s.ActiveCount(); got != 1 {
+		t.Fatalf("active sessions before reaper release = %d, want 1", got)
+	}
+
+	release()
+	ev := waitSpawnerEvent(t, ended, "post-pump StopSession Ended event")
+	waitMu.Lock()
+	gotWaits := append([]time.Duration(nil), waitDurations...)
+	waitMu.Unlock()
+	if len(gotWaits) == 0 {
+		t.Fatal("process-group wait was not called")
+	}
+	if got := gotWaits[0]; got != sessionTerminationGrace {
+		t.Fatalf("first process-group wait = %v, want termination grace %v", got, sessionTerminationGrace)
+	}
+	if got := killCalls.Load(); got != 0 {
+		t.Fatalf("process-group KILL calls after cooperative termination = %d, want 0", got)
+	}
+	if ev.Handle.State != SessionTerminated {
+		t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionTerminated)
+	}
+	waitForActiveCount(t, s, 0)
+}
+
+func TestSpawner_DrainContextAfterPumpDeadlineGrantsTerminationGrace(t *testing.T) {
+	const (
+		repository = "github.com/a/b"
+		sessionID  = "pump-deadline-drain"
+	)
+
+	clock := newFakePumpDrainClock()
+	deadlineSelected := make(chan struct{})
+	releaseReaper := make(chan struct{})
+	ended := make(chan SessionEvent, 1)
+	var (
+		terminateCalls atomic.Int32
+		killCalls      atomic.Int32
+		deadlineOnce   sync.Once
+		releaseOnce    sync.Once
+		waitMu         sync.Mutex
+		waitDurations  []time.Duration
+	)
+	release := func() { releaseOnce.Do(func() { close(releaseReaper) }) }
+
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: repository}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30 & exit 0"},
+	})
+	s.pumpDrainTimerFactory = clock.newTimer
+	s.afterPumpDrainDeadlineSelected = func() {
+		deadlineOnce.Do(func() {
+			close(deadlineSelected)
+			<-releaseReaper
+		})
+	}
+	s.terminateProcessGroup = func(*exec.Cmd) error {
+		terminateCalls.Add(1)
+		return nil
+	}
+	s.killProcessGroup = func(cmd *exec.Cmd) error {
+		killCalls.Add(1)
+		return killSessionProcessGroup(cmd)
+	}
+	s.waitProcessGroup = func(_ *exec.Cmd, duration time.Duration) processGroupWaitResult {
+		waitMu.Lock()
+		waitDurations = append(waitDurations, duration)
+		waitMu.Unlock()
+		if duration == sessionTerminationGrace {
+			return processGroupTimedOut
+		}
+		return processGroupGone
+	}
+	s.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded {
+			ended <- ev
+		}
+	})
+	t.Cleanup(func() {
+		release()
+		_ = s.Drain(time.Second)
+	})
+
+	if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	pumpTimer := waitPumpDrainTimer(t, clock)
+	if pumpTimer.duration != pumpDrainGrace {
+		t.Fatalf("pump drain timer duration = %v, want %v", pumpTimer.duration, pumpDrainGrace)
+	}
+	clock.Advance(pumpDrainGrace)
+	waitSpawnerSignal(t, deadlineSelected, "pump-drain deadline selection")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := s.DrainContext(ctx)
+	var incomplete *DrainIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("DrainContext error = %v, want DrainIncompleteError", err)
+	}
+	if got := incomplete.ActiveSessions; got != 1 {
+		t.Fatalf("DrainIncompleteError active sessions = %d, want 1", got)
+	}
+	if got := terminateCalls.Load(); got != 1 {
+		t.Fatalf("SIGTERM calls = %d, want 1", got)
+	}
+	if got := s.ActiveCount(); got != 1 {
+		t.Fatalf("active sessions while the reaper is held = %d, want 1", got)
+	}
+
+	release()
+	closeTimer := waitPumpDrainTimer(t, clock)
+	if closeTimer.duration != pumpCloseJoinGrace {
+		t.Fatalf("post-close pump join timer duration = %v, want %v", closeTimer.duration, pumpCloseJoinGrace)
+	}
+	clock.Advance(pumpCloseJoinGrace)
+	ev := waitSpawnerEvent(t, ended, "pump-deadline DrainContext Ended event")
+	waitMu.Lock()
+	gotWaits := append([]time.Duration(nil), waitDurations...)
+	waitMu.Unlock()
+	if len(gotWaits) == 0 {
+		t.Fatal("process-group wait was not called")
+	}
+	if got := gotWaits[0]; got != sessionTerminationGrace {
+		t.Fatalf("first process-group wait = %v, want termination grace %v", got, sessionTerminationGrace)
+	}
+	if got := killCalls.Load(); got != 1 {
+		t.Fatalf("process-group KILL calls after TERM timeout = %d, want 1", got)
+	}
+	if ev.Handle.State != SessionTerminated {
+		t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionTerminated)
+	}
+	waitForActiveCount(t, s, 0)
+}
+
+func TestSpawner_NaturalGroupOwnershipRejectsLateStopAndDrain(t *testing.T) {
+	const repository = "github.com/a/b"
+
+	for _, test := range []struct {
+		name  string
+		drain bool
+	}{
+		{name: "StopSession", drain: false},
+		{name: "DrainContext", drain: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sessionID := "natural-" + strings.ToLower(test.name)
+			probeEntered := make(chan struct{})
+			releaseProbe := make(chan struct{})
+			ended := make(chan SessionEvent, 1)
+			var (
+				terminateCalls atomic.Int32
+				killCalls      atomic.Int32
+				probeOnce      sync.Once
+				releaseOnce    sync.Once
+				waitMu         sync.Mutex
+				waitDurations  []time.Duration
+			)
+			release := func() { releaseOnce.Do(func() { close(releaseProbe) }) }
+
+			s := NewWorkerSpawner(SpawnerOptions{
+				Projects:              []ProjectConfig{{ID: "x", Repository: repository}},
+				MaxConcurrentSessions: 1,
+				WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+			})
+			s.terminateProcessGroup = func(*exec.Cmd) error {
+				terminateCalls.Add(1)
+				return nil
+			}
+			s.killProcessGroup = func(*exec.Cmd) error {
+				killCalls.Add(1)
+				return nil
+			}
+			s.waitProcessGroup = func(_ *exec.Cmd, duration time.Duration) processGroupWaitResult {
+				waitMu.Lock()
+				waitDurations = append(waitDurations, duration)
+				waitMu.Unlock()
+				if duration == 0 {
+					probeOnce.Do(func() {
+						close(probeEntered)
+						<-releaseProbe
+					})
+				}
+				return processGroupGone
+			}
+			s.On(func(ev SessionEvent) {
+				if ev.Kind == SessionEventEnded {
+					ended <- ev
+				}
+			})
+			t.Cleanup(func() {
+				release()
+				_ = s.Drain(time.Second)
+			})
+
+			if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
+				t.Fatalf("AcceptWork: %v", err)
+			}
+			waitSpawnerSignal(t, probeEntered, "natural zero-duration group probe")
+
+			if test.drain {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				err := s.DrainContext(ctx)
+				var incomplete *DrainIncompleteError
+				if !errors.As(err, &incomplete) {
+					t.Fatalf("DrainContext error = %v, want DrainIncompleteError", err)
+				}
+				if !strings.Contains(err.Error(), "active session(s) observed") {
+					t.Fatalf("DrainContext error = %q, want active-session wording", err)
+				}
+			} else if s.StopSession(sessionID) {
+				t.Fatal("StopSession accepted a naturally owned generation")
+			}
+			if err := s.ForceKillSession(sessionID); err != nil {
+				t.Fatalf("ForceKillSession naturally owned generation: %v", err)
+			}
+			if got := terminateCalls.Load(); got != 0 {
+				t.Fatalf("SIGTERM calls after natural ownership = %d, want 0", got)
+			}
+			if got := killCalls.Load(); got != 0 {
+				t.Fatalf("SIGKILL calls after natural ownership = %d, want 0", got)
+			}
+			waitMu.Lock()
+			gotWaits := append([]time.Duration(nil), waitDurations...)
+			waitMu.Unlock()
+			if len(gotWaits) != 1 || gotWaits[0] != 0 {
+				t.Fatalf("group waits before natural probe release = %v, want only zero-duration probe", gotWaits)
+			}
+
+			release()
+			ev := waitSpawnerEvent(t, ended, "natural ownership Ended event")
+			if ev.Handle.State != SessionCompleted {
+				t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionCompleted)
+			}
+			waitForActiveCount(t, s, 0)
+		})
+	}
+}
+
 func TestSpawner_DrainContextReturnsNilWhenDeadlineRacesFinalRelease(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{})
 	s.mu.Lock()

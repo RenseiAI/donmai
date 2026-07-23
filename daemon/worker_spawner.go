@@ -186,6 +186,10 @@ type WorkerSpawner struct {
 	// before the direct-child running select. It is nil in production.
 	runningPhaseContextDone func(context.Context, <-chan error, <-chan struct{}) <-chan struct{}
 	afterPumpsJoined        func()
+	// afterPumpDrainDeadlineSelected blocks the narrow terminal-drain edge after
+	// its timer wins but before the reaper claims process-group termination. It
+	// is nil in production.
+	afterPumpDrainDeadlineSelected func()
 
 	// drainBeforeContextSnapshot is a deterministic test seam for the narrow
 	// deadline edge where the final owner clears the last entry while DrainContext
@@ -198,14 +202,25 @@ type WorkerSpawner struct {
 
 const sessionHistoryLimit = 4096
 
+// groupTerminationOwner atomically resolves whether operator cancellation or
+// natural reaping owns process-group termination for one live generation.
+type groupTerminationOwner uint8
+
+const (
+	groupTerminationOpen groupTerminationOwner = iota
+	groupTerminationOperator
+	groupTerminationNatural
+)
+
 type spawnedSession struct {
-	handle             SessionHandle
-	cmd                *exec.Cmd
-	cancel             context.CancelFunc
-	spec               SessionSpec
-	stopRequested      bool // guarded by WorkerSpawner.mu
-	forceKillRequested bool // guarded by WorkerSpawner.mu
-	terminal           bool // guarded by WorkerSpawner.mu; Ended delivery owns this generation
+	handle                SessionHandle
+	cmd                   *exec.Cmd
+	cancel                context.CancelFunc
+	spec                  SessionSpec
+	stopRequested         bool                  // guarded by WorkerSpawner.mu
+	forceKillRequested    bool                  // guarded by WorkerSpawner.mu
+	groupTerminationOwner groupTerminationOwner // guarded by WorkerSpawner.mu
+	terminal              bool                  // guarded by WorkerSpawner.mu; Ended delivery owns this generation
 }
 
 // NewWorkerSpawner constructs a spawner. Workers will not be spawned until
@@ -919,10 +934,20 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 				case <-ctxDone:
 					handleCancellation()
 				case <-timer.C():
-					// The leader has already exited, so reclaim a surviving group
-					// without rewriting an exit-0 session as an operator termination.
-					if killErr := s.reapRemainingProcessGroup(ss); killErr != nil && !errors.Is(killErr, errSessionProcessExited) {
-						slog.Warn("worker process group cleanup signal failed", "sessionId", spec.SessionID, "err", killErr)
+					if s.afterPumpDrainDeadlineSelected != nil {
+						s.afterPumpDrainDeadlineSelected()
+					}
+					switch s.claimReaperGroupTermination(ss) {
+					case reaperGroupTerminationOperatorGrace:
+						if !cancelled {
+							handleCancellation()
+						}
+					case reaperGroupTerminationNatural:
+						// The leader has already exited, so reclaim a surviving group
+						// without rewriting an exit-0 session as an operator termination.
+						if killErr := s.reapRemainingProcessGroup(ss); killErr != nil && !errors.Is(killErr, errSessionProcessExited) {
+							slog.Warn("worker process group cleanup signal failed", "sessionId", spec.SessionID, "err", killErr)
+						}
 					}
 					// Descendants can retain inherited write ends after the group
 					// signal races with their exit. Closing daemon-owned reads makes
@@ -967,11 +992,18 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			s.afterPumpsJoined()
 		}
 
-		// cmd.Wait proves only that the direct child exited. If descendants
-		// remain, kill the daemon-owned group now: a normal leader exit must not
-		// turn a surviving, pipe-silent child into a capacity leak. The zero
-		// duration probe performs one classification without adding a grace period.
-		if s.waitProcessGroup(cmd, 0) != processGroupGone {
+		// cmd.Wait proves only that the direct child exited. Claim process-group
+		// termination before the zero-duration probe so a late StopSession cannot
+		// race natural cleanup into an immediate KILL.
+		groupTermination := s.claimReaperGroupTermination(ss)
+		if groupTermination == reaperGroupTerminationOperatorGrace && !cancelled {
+			handleCancellation()
+		}
+		// A normal leader exit must not turn a surviving, pipe-silent child into a
+		// capacity leak. The zero-duration probe performs one classification without
+		// adding a grace period; operator-owned generations have already received
+		// their cooperative window and stale generations issue no group signal.
+		if groupTermination != reaperGroupTerminationStale && s.waitProcessGroup(cmd, 0) != processGroupGone && groupTermination == reaperGroupTerminationNatural {
 			if killErr := s.reapRemainingProcessGroup(ss); killErr != nil && !errors.Is(killErr, errSessionProcessExited) {
 				slog.Warn("worker process group cleanup signal failed", "sessionId", spec.SessionID, "err", killErr)
 			}
@@ -1003,28 +1035,67 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 func (s *WorkerSpawner) StopSession(id string) bool {
 	s.mu.Lock()
 	ss := s.sessions[id]
-	if ss == nil || ss.terminal {
+	if ss == nil || ss.terminal || ss.groupTerminationOwner == groupTerminationNatural {
 		s.mu.Unlock()
 		return false
 	}
-	// Signal initiation is intentionally serialized under the exact generation:
-	// the terminal reaper cannot release this id between ownership validation and
-	// SIGTERM. A repeated Stop remains a successful request without a second signal.
-	if !ss.stopRequested {
-		ss.stopRequested = true
-		_ = s.terminateProcessGroup(ss.cmd)
+	if ss.groupTerminationOwner == groupTerminationOperator {
+		s.mu.Unlock()
+		return true
 	}
+	// Signal initiation is intentionally serialized under the exact generation:
+	// the reaper cannot claim natural process-group cleanup between ownership
+	// validation and SIGTERM. A repeated Stop remains a successful request
+	// without a second signal.
+	ss.groupTerminationOwner = groupTerminationOperator
+	ss.stopRequested = true
+	_ = s.terminateProcessGroup(ss.cmd)
 	s.mu.Unlock()
 	ss.cancel()
 	return true
 }
 
-// forceKillGeneration escalates one exact live generation while holding the
-// same lock that serializes terminal classification and registry release.
+type reaperGroupTermination uint8
+
+const (
+	reaperGroupTerminationStale reaperGroupTermination = iota
+	reaperGroupTerminationOperatorGrace
+	reaperGroupTerminationOperatorForced
+	reaperGroupTerminationNatural
+)
+
+// claimReaperGroupTermination resolves process-group cleanup for the exact
+// live generation. Natural cleanup becomes visible under the same lock that
+// accepts operator cancellation, so only one path can own the first KILL.
+func (s *WorkerSpawner) claimReaperGroupTermination(expected *spawnedSession) reaperGroupTermination {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected {
+		return reaperGroupTerminationStale
+	}
+	switch expected.groupTerminationOwner {
+	case groupTerminationOperator:
+		if expected.forceKillRequested {
+			return reaperGroupTerminationOperatorForced
+		}
+		return reaperGroupTerminationOperatorGrace
+	case groupTerminationNatural:
+		return reaperGroupTerminationNatural
+	case groupTerminationOpen:
+		expected.groupTerminationOwner = groupTerminationNatural
+		return reaperGroupTerminationNatural
+	default:
+		return reaperGroupTerminationStale
+	}
+}
+
+// forceKillGeneration escalates an operator-owned exact live generation while
+// holding the same lock that serializes terminal classification and registry
+// release.
 func (s *WorkerSpawner) forceKillGeneration(expected *spawnedSession) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected || expected.forceKillRequested {
+	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected || expected.groupTerminationOwner != groupTerminationOperator || expected.forceKillRequested {
 		return
 	}
 	expected.stopRequested = true
@@ -1040,7 +1111,7 @@ func (s *WorkerSpawner) forceKillGeneration(expected *spawnedSession) {
 func (s *WorkerSpawner) reapRemainingProcessGroup(expected *spawnedSession) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected || expected.forceKillRequested {
+	if expected == nil || expected.terminal || s.sessions[expected.spec.SessionID] != expected || expected.groupTerminationOwner != groupTerminationNatural || expected.forceKillRequested {
 		return nil
 	}
 	if err := s.killProcessGroup(expected.cmd); err != nil {
@@ -1065,7 +1136,7 @@ func (s *WorkerSpawner) ForceKillSession(id string) error {
 		}
 		return fmt.Errorf("session %q is not owned by this daemon", id)
 	}
-	if ss.forceKillRequested {
+	if ss.groupTerminationOwner == groupTerminationNatural || ss.forceKillRequested {
 		s.mu.Unlock()
 		return nil
 	}
@@ -1073,8 +1144,16 @@ func (s *WorkerSpawner) ForceKillSession(id string) error {
 	// Serialize a successful kill acknowledgement with the session generation.
 	// A duplicate mutation racing the reaper must be idempotent rather than
 	// observing a transient leader/process-group state as a failed command.
+	claimedOpen := ss.groupTerminationOwner == groupTerminationOpen
+	if claimedOpen {
+		ss.groupTerminationOwner = groupTerminationOperator
+	}
 	ss.stopRequested = true
 	if err := s.killProcessGroup(ss.cmd); err != nil && !errors.Is(err, errSessionProcessExited) {
+		if claimedOpen {
+			ss.groupTerminationOwner = groupTerminationOpen
+			ss.stopRequested = false
+		}
 		s.mu.Unlock()
 		return fmt.Errorf("SIGKILL session %q process group: %w", id, err)
 	}
@@ -1145,7 +1224,7 @@ type DrainIncompleteError struct {
 }
 
 func (e *DrainIncompleteError) Error() string {
-	return fmt.Sprintf("drain incomplete: %v; SIGTERM sent to %d session(s); %d spawn reservation(s) still pending", e.Cause, e.ActiveSessions, e.SpawnReservations)
+	return fmt.Sprintf("drain incomplete: %v; %d active session(s) observed; %d spawn reservation(s) still pending", e.Cause, e.ActiveSessions, e.SpawnReservations)
 }
 
 // Unwrap exposes the cancellation reason that ended this drain attempt.
