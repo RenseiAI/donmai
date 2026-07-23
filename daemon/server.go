@@ -558,11 +558,14 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id 
 }
 
 // handleSessionStop handles POST /api/daemon/sessions/<id>/stop — the
-// deterministic per-session cancel route (Guard 3 hard out-of-band leg).
-// It kills exactly one in-flight session and frees its capacity slot,
-// leaving siblings untouched (unlike POST /api/daemon/drain). Returns 200
-// on stop, 404 when the id is unknown (already exited or never spawned),
-// 405 on non-POST methods. Localhost-only (the daemon binds to 127.0.0.1).
+// deterministic per-session cancel route (Guard 3 hard out-of-band leg). A 200
+// acknowledges an exact generation still owned by the daemon, including cleanup
+// in progress; capacity is released asynchronously only after process-group
+// reaping and synchronous Ended delivery. A 404 means the spawner is
+// uninitialised, the ID was never present, or its generation was already
+// released. The established JSON response shape and "stopped" message remain
+// unchanged for wire compatibility. Returns 405 on non-POST methods.
+// Localhost-only (the daemon binds to 127.0.0.1).
 func (s *Server) handleSessionStop(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

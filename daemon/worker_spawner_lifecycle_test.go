@@ -130,8 +130,8 @@ func TestSpawner_TerminalListenerMakesGenerationUnsignalable(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("terminal listener did not enter")
 	}
-	if s.StopSession("terminal") {
-		t.Fatal("StopSession accepted a terminal generation")
+	if !s.StopSession("terminal") {
+		t.Fatal("StopSession did not acknowledge a terminal generation")
 	}
 	if err := s.ForceKillSession("terminal"); err != nil {
 		t.Fatalf("ForceKillSession terminal generation: %v", err)
@@ -144,6 +144,9 @@ func TestSpawner_TerminalListenerMakesGenerationUnsignalable(t *testing.T) {
 	}
 	close(release)
 	waitForActiveCount(t, s, 0)
+	if s.StopSession("terminal") {
+		t.Fatal("StopSession acknowledged a released terminal generation")
+	}
 }
 
 func TestSpawner_PostWaitPermissionClassificationReleasesTerminalGeneration(t *testing.T) {

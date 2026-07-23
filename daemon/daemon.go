@@ -537,11 +537,14 @@ func (d *Daemon) Spawner() *WorkerSpawner {
 	return d.spawner
 }
 
-// StopSession terminates a single in-flight session by id and frees its
-// capacity slot. Returns false when the session is unknown (already exited
-// or never spawned) or the spawner is not yet initialised. Wired to the
-// POST /api/daemon/sessions/<id>/stop control-API route for the
-// deterministic per-session cancel path (Guard 3 hard out-of-band leg).
+// StopSession requests cooperative termination for one session id. A true
+// result acknowledges an exact generation still owned by this daemon, including
+// terminal or natural cleanup in progress; capacity is released asynchronously
+// only after process-group reaping and synchronous Ended delivery. False means
+// the spawner is uninitialised, the ID was never present, or its generation was
+// already released. Wired to the POST /api/daemon/sessions/<id>/stop control-API
+// route for the deterministic per-session cancel path (Guard 3 hard out-of-band
+// leg).
 func (d *Daemon) StopSession(id string) bool {
 	if d.spawner == nil {
 		return false

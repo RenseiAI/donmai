@@ -1028,16 +1028,27 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 }
 
 // StopSession requests cooperative termination for one session without releasing
-// its admission key. The reaper remains the sole terminal owner: it waits for
-// the complete dedicated process group, synchronously notifies listeners, then
-// releases the exact registry entry. Keeping that order prevents same-ID
-// replacement and stale Ended cleanup from crossing generations.
+// its admission key. It returns true when this spawner still owns the exact
+// generation, including terminal listener delivery and naturally owned cleanup.
+// Those acknowledged states do not send a signal, cancel the session, change its
+// terminal classification, or transfer termination ownership. It returns false
+// only when the ID was never registered or has already been released. The reaper
+// remains the sole terminal owner: it waits for the complete dedicated process
+// group, synchronously notifies listeners, then releases the exact registry
+// entry. Keeping that order prevents same-ID replacement and stale Ended cleanup
+// from crossing generations.
 func (s *WorkerSpawner) StopSession(id string) bool {
 	s.mu.Lock()
 	ss := s.sessions[id]
-	if ss == nil || ss.terminal || ss.groupTerminationOwner == groupTerminationNatural {
+	if ss == nil {
 		s.mu.Unlock()
 		return false
+	}
+	if ss.terminal || ss.groupTerminationOwner == groupTerminationNatural {
+		// These owners still retain the registry entry and capacity, but a late
+		// Stop must acknowledge them without stealing ownership or mutating state.
+		s.mu.Unlock()
+		return true
 	}
 	if ss.groupTerminationOwner == groupTerminationOperator {
 		s.mu.Unlock()
@@ -1121,10 +1132,15 @@ func (s *WorkerSpawner) reapRemainingProcessGroup(expected *spawnedSession) erro
 	return nil
 }
 
-// ForceKillSession sends SIGKILL to the daemon-created process group for one
-// owned session. It deliberately leaves terminal ownership with the reaper;
-// callers receive a successful signal acknowledgement, not a premature
-// assertion that the process group has exited.
+// ForceKillSession handles a replayable SIGKILL mutation for one daemon-owned
+// session. For a live open or operator-owned generation it attempts SIGKILL and
+// returns an error only for an actual signal failure. Naturally owned, terminal,
+// and already force-killed generations return nil without another signal or
+// cancellation. Released IDs retained in bounded session history likewise return
+// nil to acknowledge a mutation replay; a never-owned or history-evicted ID
+// returns "not owned". Thus nil means this daemon recognizes the mutation as
+// successfully handled, not that this invocation sent SIGKILL. Terminal
+// ownership remains with the reaper throughout.
 func (s *WorkerSpawner) ForceKillSession(id string) error {
 	s.mu.Lock()
 	ss := s.sessions[id]

@@ -239,3 +239,41 @@ func TestDaemonStopPropagatesReservationAwareDrainError(t *testing.T) {
 		t.Fatalf("State after successful retry = %q, want %q", got, StateStopped)
 	}
 }
+
+func TestDaemon_StopSessionAcknowledgesNaturalCleanupOwnership(t *testing.T) {
+	probe := newNaturalOwnershipProbe(t, "natural-daemon")
+	probe.wrapCancel(t)
+
+	d := New(Options{})
+	d.spawner = probe.spawner
+	d.setState(StateRunning)
+
+	probe.assertPublished(t, d.ActiveSessions())
+	if got := d.ActiveSessionCount(); got != 1 {
+		t.Fatalf("Daemon.ActiveSessionCount during natural cleanup = %d, want 1", got)
+	}
+	if !d.StopSession(probe.sessionID) {
+		t.Fatal("first Daemon.StopSession did not acknowledge naturally owned cleanup")
+	}
+	if !d.StopSession(probe.sessionID) {
+		t.Fatal("repeated Daemon.StopSession did not acknowledge naturally owned cleanup")
+	}
+	probe.assertPublished(t, d.ActiveSessions())
+	probe.assertNoTerminationOrCancellation(t)
+
+	probe.release()
+	ev := waitSpawnerEvent(t, probe.ended, "daemon natural ownership Ended event")
+	if ev.Handle.State != SessionCompleted {
+		t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionCompleted)
+	}
+	if got := probe.cancelCount(); got != 1 {
+		t.Fatalf("natural reaper cancellation count = %d, want 1", got)
+	}
+	waitForActiveCount(t, probe.spawner, 0)
+	if got := d.ActiveSessions(); len(got) != 0 {
+		t.Fatalf("Daemon.ActiveSessions after registry release = %+v, want empty", got)
+	}
+	if d.StopSession(probe.sessionID) {
+		t.Fatal("Daemon.StopSession acknowledged a released generation")
+	}
+}

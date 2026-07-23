@@ -792,6 +792,60 @@ func TestServer_SessionStop_NotFound(t *testing.T) {
 	}
 }
 
+func TestServer_SessionStopAcknowledgesNaturalCleanupOwnership(t *testing.T) {
+	probe := newNaturalOwnershipProbe(t, "natural-http")
+	probe.wrapCancel(t)
+
+	d := New(Options{})
+	d.spawner = probe.spawner
+	d.setState(StateRunning)
+	server := NewServer(d)
+	postStop := func() (int, afclient.DaemonActionResponse) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/daemon/sessions/"+probe.sessionID+"/stop", nil)
+		recorder := httptest.NewRecorder()
+		server.httpd.Handler.ServeHTTP(recorder, req)
+
+		var response afclient.DaemonActionResponse
+		if recorder.Code == http.StatusOK {
+			if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+				t.Fatalf("decode stop response: %v", err)
+			}
+		}
+		return recorder.Code, response
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		status, response := postStop()
+		if status != http.StatusOK {
+			t.Fatalf("stop attempt %d status = %d, want 200", attempt, status)
+		}
+		if !response.OK || response.Message != "stopped" {
+			t.Fatalf("stop attempt %d response = %+v, want acknowledged stopped response", attempt, response)
+		}
+	}
+	probe.assertPublished(t, d.ActiveSessions())
+	if got := d.ActiveSessionCount(); got != 1 {
+		t.Fatalf("Daemon.ActiveSessionCount during natural cleanup = %d, want 1", got)
+	}
+	probe.assertNoTerminationOrCancellation(t)
+
+	probe.release()
+	ev := waitSpawnerEvent(t, probe.ended, "HTTP natural ownership Ended event")
+	if ev.Handle.State != SessionCompleted {
+		t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionCompleted)
+	}
+	if got := probe.cancelCount(); got != 1 {
+		t.Fatalf("natural reaper cancellation count = %d, want 1", got)
+	}
+	waitForActiveCount(t, probe.spawner, 0)
+
+	status, _ := postStop()
+	if status != http.StatusNotFound {
+		t.Fatalf("stop after registry release status = %d, want 404", status)
+	}
+}
+
 // TestServer_SessionStop_MethodNotAllowed verifies a non-POST to the stop
 // route produces 405 (and is not mis-routed to the detail handler).
 func TestServer_SessionStop_MethodNotAllowed(t *testing.T) {

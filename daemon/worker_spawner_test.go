@@ -1165,109 +1165,179 @@ func TestSpawner_DrainContextAfterPumpDeadlineGrantsTerminationGrace(t *testing.
 	waitForActiveCount(t, s, 0)
 }
 
-func TestSpawner_NaturalGroupOwnershipRejectsLateStopAndDrain(t *testing.T) {
-	const repository = "github.com/a/b"
+func TestSpawner_NaturalGroupOwnershipAcknowledgesLateStopWithoutStealingOwnership(t *testing.T) {
+	probe := newNaturalOwnershipProbe(t, "natural-stop")
+	probe.wrapCancel(t)
+	s := probe.spawner
 
-	for _, test := range []struct {
-		name  string
-		drain bool
-	}{
-		{name: "StopSession", drain: false},
-		{name: "DrainContext", drain: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			sessionID := "natural-" + strings.ToLower(test.name)
-			probeEntered := make(chan struct{})
-			releaseProbe := make(chan struct{})
-			ended := make(chan SessionEvent, 1)
-			var (
-				terminateCalls atomic.Int32
-				killCalls      atomic.Int32
-				probeOnce      sync.Once
-				releaseOnce    sync.Once
-				waitMu         sync.Mutex
-				waitDurations  []time.Duration
-			)
-			release := func() { releaseOnce.Do(func() { close(releaseProbe) }) }
-
-			s := NewWorkerSpawner(SpawnerOptions{
-				Projects:              []ProjectConfig{{ID: "x", Repository: repository}},
-				MaxConcurrentSessions: 1,
-				WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
-			})
-			s.terminateProcessGroup = func(*exec.Cmd) error {
-				terminateCalls.Add(1)
-				return nil
-			}
-			s.killProcessGroup = func(*exec.Cmd) error {
-				killCalls.Add(1)
-				return nil
-			}
-			s.waitProcessGroup = func(_ *exec.Cmd, duration time.Duration) processGroupWaitResult {
-				waitMu.Lock()
-				waitDurations = append(waitDurations, duration)
-				waitMu.Unlock()
-				if duration == 0 {
-					probeOnce.Do(func() {
-						close(probeEntered)
-						<-releaseProbe
-					})
-				}
-				return processGroupGone
-			}
-			s.On(func(ev SessionEvent) {
-				if ev.Kind == SessionEventEnded {
-					ended <- ev
-				}
-			})
-			t.Cleanup(func() {
-				release()
-				_ = s.Drain(time.Second)
-			})
-
-			if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
-				t.Fatalf("AcceptWork: %v", err)
-			}
-			waitSpawnerSignal(t, probeEntered, "natural zero-duration group probe")
-
-			if test.drain {
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				err := s.DrainContext(ctx)
-				var incomplete *DrainIncompleteError
-				if !errors.As(err, &incomplete) {
-					t.Fatalf("DrainContext error = %v, want DrainIncompleteError", err)
-				}
-				if !strings.Contains(err.Error(), "active session(s) observed") {
-					t.Fatalf("DrainContext error = %q, want active-session wording", err)
-				}
-			} else if s.StopSession(sessionID) {
-				t.Fatal("StopSession accepted a naturally owned generation")
-			}
-			if err := s.ForceKillSession(sessionID); err != nil {
-				t.Fatalf("ForceKillSession naturally owned generation: %v", err)
-			}
-			if got := terminateCalls.Load(); got != 0 {
-				t.Fatalf("SIGTERM calls after natural ownership = %d, want 0", got)
-			}
-			if got := killCalls.Load(); got != 0 {
-				t.Fatalf("SIGKILL calls after natural ownership = %d, want 0", got)
-			}
-			waitMu.Lock()
-			gotWaits := append([]time.Duration(nil), waitDurations...)
-			waitMu.Unlock()
-			if len(gotWaits) != 1 || gotWaits[0] != 0 {
-				t.Fatalf("group waits before natural probe release = %v, want only zero-duration probe", gotWaits)
-			}
-
-			release()
-			ev := waitSpawnerEvent(t, ended, "natural ownership Ended event")
-			if ev.Handle.State != SessionCompleted {
-				t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionCompleted)
-			}
-			waitForActiveCount(t, s, 0)
-		})
+	probe.assertPublished(t, s.ActiveSessions())
+	if got := s.ActiveCount(); got != 1 {
+		t.Fatalf("ActiveCount while natural cleanup owns the generation = %d, want 1", got)
 	}
+	if _, err := s.AcceptWork(SessionSpec{SessionID: probe.sessionID, Repository: probe.repository}); err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("same-ID admission while natural cleanup owns the generation = %v, want active-ID rejection", err)
+	}
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "natural-second", Repository: probe.repository}); err == nil || !strings.Contains(err.Error(), "at capacity") {
+		t.Fatalf("second admission while natural cleanup owns capacity = %v, want capacity rejection", err)
+	}
+
+	if !s.StopSession(probe.sessionID) {
+		t.Fatal("first StopSession did not acknowledge a naturally owned generation")
+	}
+	if !s.StopSession(probe.sessionID) {
+		t.Fatal("repeated StopSession did not acknowledge a naturally owned generation")
+	}
+	if err := s.ForceKillSession(probe.sessionID); err != nil {
+		t.Fatalf("ForceKillSession naturally owned generation: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := s.DrainContext(ctx)
+	var incomplete *DrainIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("DrainContext error = %v, want DrainIncompleteError", err)
+	}
+	if got := incomplete.ActiveSessions; got != 1 {
+		t.Fatalf("DrainIncompleteError active sessions = %d, want 1", got)
+	}
+	if got := incomplete.SpawnReservations; got != 0 {
+		t.Fatalf("DrainIncompleteError spawn reservations = %d, want 0", got)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DrainContext error = %v, want context.Canceled", err)
+	}
+	if !strings.Contains(err.Error(), "active session(s) observed") {
+		t.Fatalf("DrainContext error = %q, want active-session wording", err)
+	}
+
+	probe.assertPublished(t, s.ActiveSessions())
+	probe.assertNoTerminationOrCancellation(t)
+
+	probe.release()
+	ev := waitSpawnerEvent(t, probe.ended, "natural ownership Ended event")
+	if ev.Handle.State != SessionCompleted {
+		t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionCompleted)
+	}
+	if got := probe.cancelCount(); got != 1 {
+		t.Fatalf("natural reaper cancellation count = %d, want 1", got)
+	}
+	waitForActiveCount(t, s, 0)
+	if s.StopSession(probe.sessionID) {
+		t.Fatal("StopSession acknowledged a released generation")
+	}
+}
+
+type naturalOwnershipProbe struct {
+	spawner      *WorkerSpawner
+	sessionID    string
+	repository   string
+	ended        chan SessionEvent
+	releaseProbe chan struct{}
+	releaseOnce  sync.Once
+
+	terminateCalls atomic.Int32
+	killCalls      atomic.Int32
+	cancelMu       sync.Mutex
+	cancelCalls    int
+}
+
+func newNaturalOwnershipProbe(t *testing.T, sessionID string) *naturalOwnershipProbe {
+	t.Helper()
+
+	probe := &naturalOwnershipProbe{
+		sessionID:    sessionID,
+		repository:   "github.com/a/b",
+		ended:        make(chan SessionEvent, 1),
+		releaseProbe: make(chan struct{}),
+	}
+	probe.spawner = NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: probe.repository}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+	})
+	probe.spawner.terminateProcessGroup = func(*exec.Cmd) error {
+		probe.terminateCalls.Add(1)
+		return nil
+	}
+	probe.spawner.killProcessGroup = func(*exec.Cmd) error {
+		probe.killCalls.Add(1)
+		return nil
+	}
+	probeEntered := make(chan struct{})
+	var probeOnce sync.Once
+	probe.spawner.waitProcessGroup = func(_ *exec.Cmd, duration time.Duration) processGroupWaitResult {
+		if duration == 0 {
+			probeOnce.Do(func() {
+				close(probeEntered)
+				<-probe.releaseProbe
+			})
+		}
+		return processGroupGone
+	}
+	probe.spawner.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded {
+			probe.ended <- ev
+		}
+	})
+	t.Cleanup(func() {
+		probe.release()
+		_ = probe.spawner.Drain(time.Second)
+	})
+
+	if _, err := probe.spawner.AcceptWork(SessionSpec{SessionID: probe.sessionID, Repository: probe.repository}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	waitSpawnerSignal(t, probeEntered, "natural zero-duration group probe")
+	return probe
+}
+
+func (p *naturalOwnershipProbe) release() {
+	p.releaseOnce.Do(func() { close(p.releaseProbe) })
+}
+
+func (p *naturalOwnershipProbe) wrapCancel(t *testing.T) {
+	t.Helper()
+
+	p.spawner.mu.Lock()
+	defer p.spawner.mu.Unlock()
+	ss := p.spawner.sessions[p.sessionID]
+	if ss == nil {
+		t.Fatal("natural ownership probe lost its session before cancel wrapping")
+	}
+	originalCancel := ss.cancel
+	ss.cancel = func() {
+		p.cancelMu.Lock()
+		p.cancelCalls++
+		p.cancelMu.Unlock()
+		originalCancel()
+	}
+}
+
+func (p *naturalOwnershipProbe) assertPublished(t *testing.T, sessions []SessionHandle) {
+	t.Helper()
+	if len(sessions) != 1 || sessions[0].SessionID != p.sessionID {
+		t.Fatalf("ActiveSessions = %+v, want only %q", sessions, p.sessionID)
+	}
+}
+
+func (p *naturalOwnershipProbe) assertNoTerminationOrCancellation(t *testing.T) {
+	t.Helper()
+	if got := p.terminateCalls.Load(); got != 0 {
+		t.Fatalf("SIGTERM calls before natural probe release = %d, want 0", got)
+	}
+	if got := p.killCalls.Load(); got != 0 {
+		t.Fatalf("SIGKILL calls before natural probe release = %d, want 0", got)
+	}
+	if got := p.cancelCount(); got != 0 {
+		t.Fatalf("cancellations before natural probe release = %d, want 0", got)
+	}
+}
+
+func (p *naturalOwnershipProbe) cancelCount() int {
+	p.cancelMu.Lock()
+	defer p.cancelMu.Unlock()
+	return p.cancelCalls
 }
 
 func TestSpawner_DrainContextReturnsNilWhenDeadlineRacesFinalRelease(t *testing.T) {
