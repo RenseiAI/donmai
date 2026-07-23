@@ -57,8 +57,12 @@ func (b *Built) Render() (*Artifacts, error) {
 		return nil, fmt.Errorf("marshal endpoints: %w", err)
 	}
 
-	// matrix.json carries the cells + denylist + legacy aliases (the
-	// runtime-routing-relevant slice of the full document).
+	// matrix.json carries the cells + denylist + legacy aliases + binary
+	// pins (the runtime-routing-relevant slice of the full document).
+	// binaryPins is p1.1 additive (07 §8): probe-time enforcement reads
+	// its own package constants directly, so this section exists for
+	// external consumers (platform, operators bumping a pin) rather than
+	// donmai's own runtime.
 	matrixDoc := struct {
 		SchemaVersion string                `json:"schemaVersion"`
 		ContractABI   string                `json:"contractAbi"`
@@ -66,7 +70,8 @@ func (b *Built) Render() (*Artifacts, error) {
 		Cells         []HarnessEndpointCell `json:"cells"`
 		Denylist      []CellKey             `json:"denylist"`
 		LegacyAliases []LegacyAlias         `json:"legacyAliases"`
-	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap}
+		BinaryPins    []BinaryPinRow        `json:"binaryPins"`
+	}{SchemaVersion, ContractABI, GeneratedFrom, b.Matrix.Cells, b.Matrix.Denylist, b.AliasMap, b.Matrix.BinaryPins}
 	matrixJSON, err := marshalJSON(matrixDoc)
 	if err != nil {
 		return nil, fmt.Errorf("marshal matrix: %w", err)
