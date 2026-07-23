@@ -15,6 +15,7 @@ jobs:
   secret-scan:
     name: Secret scan (trufflehog)
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
@@ -25,6 +26,7 @@ jobs:
   govulncheck:
     name: Go vuln scan (report-only)
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -36,6 +38,7 @@ jobs:
   semgrep:
     name: SAST (semgrep, report-only)
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

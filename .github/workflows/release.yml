@@ -23,6 +23,7 @@ jobs:
     # Cross-compile to linux/amd64 + linux/arm64 still works from darwin via
     # CGO_ENABLED=0 (set in .goreleaser.yaml).
     runs-on: blacksmith-6vcpu-macos-15
+    timeout-minutes: 45
     # Job-level env block, deliberately. Step-level env: blocks on
     # goreleaser/goreleaser-action@v7 (node24 action) did not propagate
     # APPLE_DEVELOPER_ID/APPLE_PASSWORD/APPLE_TEAM_ID to the goreleaser

@@ -20,6 +20,7 @@ permissions:
 jobs:
   build-and-push:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
     steps:
       # Stage the current workflow's verifier before checking out an older tag
       # that may not contain the shared release automation yet.
