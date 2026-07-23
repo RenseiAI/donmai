@@ -29,6 +29,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 ### Chores
 
 - CI: every job now sets `timeout-minutes`. (#200)
+- Security: bump indirect `google.golang.org/grpc` to 1.82.1
+  (GHSA xDS RBAC / HTTP/2 fixes; dependabot alert 18).
 
 ---
 
