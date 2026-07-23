@@ -10,6 +10,30 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.54.1 — 2026-07-23
+
+### Fixes
+
+- **Truthful stop acknowledgement during natural cleanup.** `StopSession` now
+  returns an idempotent acknowledgement for a generation still owned in the
+  registry during natural cleanup, instead of a false `404 session not found`
+  from the daemon and HTTP stop endpoint, without signaling, canceling, or
+  altering classification. Truly absent or released generations still return
+  not-found. (#198)
+- **opencode adapter contract and flag fixes.** Successful `opencode run`
+  sessions no longer emit a spurious `spawn_no_result` error after the terminal
+  result event; the unsupported permission-skip flag was replaced with
+  `--auto`; the default endpoint port now matches opencode's actual default
+  (4096). Adds a shared terminal-event conformance check. (#199)
+
+### Chores
+
+- CI: every job now sets `timeout-minutes`. (#200)
+- Security: bump indirect `google.golang.org/grpc` to 1.82.1
+  (GHSA xDS RBAC / HTTP/2 fixes; dependabot alert 18).
+
+---
+
 ## v0.54.0 — 2026-07-20
 
 ### Features
