@@ -646,6 +646,162 @@ func TestSpawner_PumpDrainLifecycle(t *testing.T) {
 		waitForActiveCount(t, s, 0)
 	})
 
+	t.Run("simultaneous cancellation child exit and pump EOF grants termination grace", func(t *testing.T) {
+		const sessionID = "simultaneous-cancellation"
+		clock := newFakePumpDrainClock()
+		reaperHeld := make(chan struct{})
+		allowReaper := make(chan struct{})
+		selectArmed := make(chan struct{})
+		seamTimedOut := make(chan struct{}, 1)
+		ended := make(chan SessionEvent, 1)
+		allowEnded := make(chan struct{})
+		listenerReturned := make(chan struct{})
+		var (
+			terminateCalls    atomic.Int32
+			killCalls         atomic.Int32
+			reaperOnce        sync.Once
+			selectCalls       atomic.Int32
+			endedOnce         sync.Once
+			releaseReaperOnce sync.Once
+			releaseEndedOnce  sync.Once
+			waitMu            sync.Mutex
+			waitDurations     []time.Duration
+			graceSeen         bool
+		)
+		releaseReaper := func() { releaseReaperOnce.Do(func() { close(allowReaper) }) }
+		releaseEnded := func() { releaseEndedOnce.Do(func() { close(allowEnded) }) }
+
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "x", Repository: repository}},
+			MaxConcurrentSessions: 1,
+			WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+		})
+		s.pumpDrainTimerFactory = clock.newTimer
+		s.reaperRunning = func() {
+			reaperOnce.Do(func() {
+				close(reaperHeld)
+				<-allowReaper
+			})
+		}
+		// This models the legal select outcome where a ready waitResult or
+		// pumpDone arm wins while the real context is already cancelled. The
+		// local queues remain buffered while the reaper is held, so their
+		// readiness is stable when this seam returns a nil context arm.
+		s.runningPhaseContextDone = func(ctx context.Context, waitResult <-chan error, pumpDone <-chan struct{}) <-chan struct{} {
+			if selectCalls.Add(1) != 1 {
+				return ctx.Done()
+			}
+			deadline := time.NewTimer(spawnerWaitTimeout)
+			defer deadline.Stop()
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			for {
+				if ctx.Err() != nil && len(waitResult) == 1 && len(pumpDone) == 2 {
+					close(selectArmed)
+					return nil
+				}
+				select {
+				case <-deadline.C:
+					seamTimedOut <- struct{}{}
+					return ctx.Done()
+				case <-ticker.C:
+				}
+			}
+		}
+		s.terminateProcessGroup = func(*exec.Cmd) error {
+			terminateCalls.Add(1)
+			return nil
+		}
+		s.killProcessGroup = func(*exec.Cmd) error {
+			killCalls.Add(1)
+			return nil
+		}
+		s.waitProcessGroup = func(_ *exec.Cmd, duration time.Duration) processGroupWaitResult {
+			waitMu.Lock()
+			defer waitMu.Unlock()
+			waitDurations = append(waitDurations, duration)
+			if duration == sessionTerminationGrace {
+				graceSeen = true
+				return processGroupGone
+			}
+			if !graceSeen {
+				return processGroupTimedOut
+			}
+			return processGroupGone
+		}
+		s.On(func(ev SessionEvent) {
+			if ev.Kind != SessionEventEnded {
+				return
+			}
+			endedOnce.Do(func() {
+				ended <- ev
+				<-allowEnded
+				close(listenerReturned)
+			})
+		})
+		t.Cleanup(func() {
+			releaseReaper()
+			releaseEnded()
+			_ = s.StopSession(sessionID)
+			if err := s.Drain(time.Second); err != nil {
+				t.Errorf("Drain cleanup: %v", err)
+			}
+		})
+
+		if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
+			t.Fatalf("AcceptWork: %v", err)
+		}
+		waitSpawnerSignal(t, reaperHeld, "reaper before running-phase select")
+		if !s.StopSession(sessionID) {
+			t.Fatal("StopSession = false")
+		}
+		if got := terminateCalls.Load(); got != 1 {
+			t.Fatalf("SIGTERM requests while reaper is held = %d, want 1", got)
+		}
+		releaseReaper()
+		select {
+		case <-selectArmed:
+		case <-seamTimedOut:
+			t.Fatal("running-phase seam did not observe cancelled context and queued completions")
+		case <-time.After(spawnerWaitTimeout):
+			t.Fatalf("timed out after %v waiting for running-phase seam", spawnerWaitTimeout)
+		}
+
+		ev := waitSpawnerEvent(t, ended, "simultaneous-cancellation Ended event")
+		waitMu.Lock()
+		gotWaits := append([]time.Duration(nil), waitDurations...)
+		waitMu.Unlock()
+		if len(gotWaits) == 0 {
+			t.Fatal("process-group wait was not called")
+		}
+		if got := gotWaits[0]; got != sessionTerminationGrace {
+			t.Fatalf("first process-group wait = %v, want termination grace %v (never zero-duration probe)", got, sessionTerminationGrace)
+		}
+		if got := killCalls.Load(); got != 0 {
+			t.Fatalf("process-group KILL calls after cooperative TERM flush = %d, want 0", got)
+		}
+		if got := clock.TimerCount(); got != 0 {
+			t.Fatalf("pump drain timers with both EOF notifications queued = %d, want 0", got)
+		}
+		if ev.Handle.State != SessionTerminated {
+			t.Fatalf("Ended state = %q, want %q", ev.Handle.State, SessionTerminated)
+		}
+		if got := s.ActiveCount(); got != 1 {
+			t.Fatalf("active sessions during synchronous Ended listener = %d, want 1", got)
+		}
+		if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err == nil || !strings.Contains(err.Error(), "already active") {
+			t.Fatalf("same SessionID during Ended listener error = %v, want already active", err)
+		}
+
+		releaseEnded()
+		waitSpawnerSignal(t, listenerReturned, "Ended listener return")
+		waitForActiveCount(t, s, 0)
+		if _, err := s.AcceptWork(SessionSpec{SessionID: sessionID, Repository: repository}); err != nil {
+			t.Fatalf("same SessionID after Ended listener return: %v", err)
+		}
+		waitForActiveCount(t, s, 0)
+	})
+
 	t.Run("terminal leader with inherited pipe is bounded and joined", func(t *testing.T) {
 		const sessionID = "inherited-pipe"
 		clock := newFakePumpDrainClock()

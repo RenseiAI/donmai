@@ -182,7 +182,10 @@ type WorkerSpawner struct {
 	// pump boundaries without waiting for a wall-clock deadline.
 	pumpDrainTimerFactory func(time.Duration) pumpDrainTimer
 	reaperRunning         func()
-	afterPumpsJoined      func()
+	// runningPhaseContextDone may replace the cancellation arm immediately
+	// before the direct-child running select. It is nil in production.
+	runningPhaseContextDone func(context.Context, <-chan error, <-chan struct{}) <-chan struct{}
+	afterPumpsJoined        func()
 
 	// drainBeforeContextSnapshot is a deterministic test seam for the narrow
 	// deadline edge where the final owner clears the last entry while DrainContext
@@ -859,6 +862,18 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 				s.forceKillGeneration(ss)
 			}
 		}
+		reconcileCancellation := func() {
+			// A select gives no priority to a ready cancellation arm. Reconcile the
+			// exact session context after every running-phase result so child exit
+			// or pump EOF cannot bypass the TERM grace already requested by Stop or
+			// Drain.
+			if !cancelled && ctx.Err() != nil {
+				handleCancellation()
+			}
+		}
+		if s.runningPhaseContextDone != nil {
+			ctxDone = s.runningPhaseContextDone(ctx, waitResult, pumpDone)
+		}
 
 		// A running worker has no output-drain deadline. Pump completion merely
 		// records that a stream reached EOF; direct-child termination is the only
@@ -873,6 +888,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 			case <-pumpDone:
 				pumpsRemaining--
 			}
+			reconcileCancellation()
 		}
 
 		// Account for EOF notifications that arrived concurrently with cmd.Wait
