@@ -31,6 +31,7 @@ permissions:
 jobs:
   build-template:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
     steps:
       # Keep the current workflow's verifier and tagged-build wrapper available
       # when a manual retry checks out a release that predates these scripts.
