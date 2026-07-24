@@ -15,6 +15,7 @@ import (
 	"github.com/RenseiAI/donmai/provider/harness/gemini"
 	"github.com/RenseiAI/donmai/provider/harness/ollama"
 	"github.com/RenseiAI/donmai/provider/harness/opencode"
+	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/provider/harness/shell"
 	stubprov "github.com/RenseiAI/donmai/provider/harness/stub"
 )
@@ -44,6 +45,7 @@ func HarnessHarvestList() []HarnessHarvest {
 		{Name: agent.HarnessAntigravity, Manifest: func() agent.HarnessManifest { return (&agycli.Provider{}).Manifest() }},
 		{Name: agent.HarnessRaw, Manifest: func() agent.HarnessManifest { return (&ollama.Provider{}).Manifest() }},
 		{Name: agent.HarnessOpenCode, Manifest: func() agent.HarnessManifest { return (&opencode.Provider{}).Manifest() }},
+		{Name: agent.HarnessPi, Manifest: func() agent.HarnessManifest { return (&pi.Provider{}).Manifest() }},
 		{Name: agent.HarnessAmp, Manifest: func() agent.HarnessManifest { return (&amp.Provider{}).Manifest() }},
 		{Name: agent.HarnessShell, Manifest: func() agent.HarnessManifest { return (&shell.Provider{}).Manifest() }},
 		{Name: agent.HarnessStub, Manifest: stubManifest},
@@ -89,6 +91,7 @@ func HarnessProvidersForParity() []agent.HarnessProvider {
 		&agycli.Provider{},
 		&ollama.Provider{},
 		&opencode.Provider{},
+		&pi.Provider{},
 		&amp.Provider{},
 		&shell.Provider{},
 		stubHP,

@@ -18,5 +18,6 @@ var LegacyAliasMap = map[agent.ProviderName]CellKey{
 	"gemini":   {Harness: "raw", Endpoint: "google", Host: "direct"},
 	"ollama":   {Harness: "raw", Endpoint: "local", Host: "local"},
 	"opencode": {Harness: "opencode", Endpoint: "openai", Host: "direct"},
+	"pi":       {Harness: "pi", Endpoint: "anthropic", Host: "direct"},
 	"stub":     {Harness: "stub", Endpoint: "stub", Host: "local"},
 }
