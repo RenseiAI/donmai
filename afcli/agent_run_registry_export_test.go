@@ -9,12 +9,14 @@ import (
 )
 
 // canonicalAgentRunProviders is the canonical provider set the agent-run
-// registry is the single source for: the eight legacy providers plus the
-// interactive-only shell harness (W4 interactive sessions). Kept here as the
-// test's independent oracle so a silent drop/rename of any ctor in the
-// production list (agentRunProviderCtors) fails loudly. Mirrors matrix's
-// harvested harness set. An intentional addition updates THIS list in the
-// same change that adds the ctor — that friction is the point.
+// registry is the single source for: the legacy providers, the pi harness
+// (greenfield, registration-only pending donmai-smokes step20 real-binary
+// coverage), and the interactive-only shell harness (W4 interactive
+// sessions). Kept here as the test's independent oracle so a silent
+// drop/rename of any ctor in the production list (agentRunProviderCtors)
+// fails loudly. Mirrors matrix's harvested harness set. An intentional
+// addition updates THIS list in the same change that adds the ctor — that
+// friction is the point.
 var canonicalAgentRunProviders = []agent.ProviderName{
 	agent.ProviderStub,
 	agent.ProviderClaude,
@@ -24,6 +26,7 @@ var canonicalAgentRunProviders = []agent.ProviderName{
 	agent.ProviderGemini,
 	agent.ProviderAGYCLI,
 	agent.ProviderOpenCode,
+	agent.ProviderPi,
 	agent.ProviderShell,
 }
 

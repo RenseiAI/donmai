@@ -32,6 +32,7 @@ import (
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
 	providerollama "github.com/RenseiAI/donmai/provider/harness/ollama"
 	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
+	providerpi "github.com/RenseiAI/donmai/provider/harness/pi"
 	providershell "github.com/RenseiAI/donmai/provider/harness/shell"
 	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
@@ -675,6 +676,18 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		{name: "opencode", new: func() (agent.Provider, error) {
 			return provideropencode.New(opencodeCtorOptions(h))
 		}},
+		// pi is registration-only today, mirroring amp/opencode: the
+		// constructor probes the binary + version pin and warns-and-skips
+		// when absent/below-pin (provider/harness/pi/probe.go). Greenfield
+		// harness (09-design-pi-adapter.md); real-binary smoke coverage is
+		// donmai-smokes step20 (12-work-breakdown.md W2b). Registering the
+		// ctor here is what lets a `donmai agent run` session (and the
+		// step20 black-box smoke, which only ever drives the compiled
+		// binary's CLI surface) reach pi.New()/Spawn() at all — it does not
+		// itself change matrix-level tier gating (cells stay
+		// experimental/untested/smoked:false until step20 proves a real
+		// run, DEC-2/DEC-3).
+		{name: "pi", new: func() (agent.Provider, error) { return providerpi.New(providerpi.Options{}) }},
 		// shell is the interactive-only PTY harness (W4 interactive
 		// sessions): spawns ${SHELL:-/bin/sh} under ptyhost. Headless
 		// Spawn (Spec.Interactive == nil) fails loudly by design.
