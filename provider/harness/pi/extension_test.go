@@ -1,7 +1,6 @@
 package pi
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,28 +28,39 @@ func TestHandshakeSHA_Verification(t *testing.T) {
 	}
 }
 
-// TestMaterializeExtension writes the boundary payload with the right modes and
-// content: the extension file matches the embedded SHA, models.json pins the
-// provider with an env-REFERENCE (never the secret), and settings deny
-// cycle_model (design §5.2/§6).
+// TestHandshakeToken_Verification pins the per-session token half of the
+// handshake: only the exact token verifies, and an empty token/claim fails
+// closed (a foreign extension cannot forge the token the harness set in env).
+func TestHandshakeToken_Verification(t *testing.T) {
+	t.Parallel()
+	const want = "session-token-xyz"
+	if !verifyHandshakeToken(want, want) {
+		t.Errorf("verifyHandshakeToken(want, want) = false, want true")
+	}
+	for _, claimed := range []string{"", "wrong", want + "x"} {
+		if verifyHandshakeToken(claimed, want) {
+			t.Errorf("verifyHandshakeToken(%q, want) = true, want false (fail closed)", claimed)
+		}
+	}
+	// An empty expected token never verifies — a session with no token set
+	// cannot be spoofed into "matching".
+	if verifyHandshakeToken(want, "") {
+		t.Errorf("verifyHandshakeToken(want, \"\") = true, want false")
+	}
+}
+
+// TestMaterializeExtension writes the boundary payload for `-e` loading with
+// the right mode and content: the extension file is 0600 and byte-identical to
+// the embedded source (so its self-hash matches the embedded SHA — a
+// materialized copy that drifted would fail the handshake).
 func TestMaterializeExtension(t *testing.T) {
 	t.Parallel()
 	cwd := t.TempDir()
-	ep := &agent.EndpointBinding{
-		Company:  agent.CompanyAnthropic,
-		Model:    "claude-x",
-		BaseURL:  "https://api.anthropic.com",
-		Protocol: agent.ProtoAnthropicMessages,
-		Host:     agent.HostDirect,
-		Env:      map[string]string{"ANTHROPIC_API_KEY": "sk-super-secret-canary"},
-	}
-	layout, err := materializeExtension(cwd, ep, "claude-x")
+	layout, err := materializeExtension(cwd)
 	if err != nil {
 		t.Fatalf("materializeExtension: %v", err)
 	}
 
-	// Extension file present, 0600, and byte-identical to the embed (so its
-	// SHA matches — a materialized copy that drifts would fail the handshake).
 	data, err := os.ReadFile(layout.extension)
 	if err != nil {
 		t.Fatalf("read extension: %v", err)
@@ -59,28 +69,54 @@ func TestMaterializeExtension(t *testing.T) {
 		t.Errorf("materialized extension differs from embedded source")
 	}
 	assertMode0600(t, layout.extension)
-	assertMode0600(t, layout.settings)
-	assertMode0600(t, layout.modelsJSON)
 
-	// models.json pins the provider via an env reference — the secret VALUE
-	// must never be on disk (design §6, §5.3).
-	models, _ := os.ReadFile(layout.modelsJSON)
-	if strings.Contains(string(models), "sk-super-secret-canary") {
-		t.Errorf("provider-pin config leaked the API key onto disk: %s", models)
+	// The extension lives at the state-dir ROOT (not under an auto-discovered
+	// extensions/ subdir), so the `-e --no-extensions` load is the only load.
+	if filepath.Dir(layout.extension) != layout.root {
+		t.Errorf("extension at %q, want it directly under the state root %q", layout.extension, layout.root)
 	}
-	var mj map[string]any
-	if err := json.Unmarshal(models, &mj); err != nil {
-		t.Fatalf("models.json is not valid JSON: %v", err)
+	if base := filepath.Base(filepath.Dir(layout.extension)); base != piStateDir {
+		t.Errorf("state root basename = %q, want %q", base, piStateDir)
 	}
-	if got, _ := mj["model"].(string); got != "donmai/claude-x" {
-		t.Errorf("models.json model = %q, want donmai/claude-x", got)
-	}
+}
 
-	// settings deny cycle_model so the session cannot wander off the cell.
-	settings, _ := os.ReadFile(layout.settings)
-	if !strings.Contains(string(settings), "cycle_model") {
-		t.Errorf("settings must deny cycle_model, got: %s", settings)
+// TestProviderPinEnv pins design §6: the routing pin rides ENV (baseUrl / api /
+// model) so the extension can register the "donmai" provider — and the API
+// key is NOT among these vars (it rides PiKeyEnvVar via applyEndpoint), so no
+// secret is placed on disk or in the pin env.
+func TestProviderPinEnv(t *testing.T) {
+	t.Parallel()
+	ep := &agent.EndpointBinding{
+		Company:  agent.CompanyAnthropic,
+		Model:    "claude-x",
+		BaseURL:  "https://api.anthropic.com",
+		Protocol: agent.ProtoAnthropicMessages,
+		Host:     agent.HostDirect,
+		Env:      map[string]string{"ANTHROPIC_API_KEY": "sk-super-secret-canary"},
 	}
+	env := providerPinEnv(ep, "claude-x")
+	joined := strings.Join(env, "\n")
+	if strings.Contains(joined, "sk-super-secret-canary") {
+		t.Errorf("provider-pin env leaked the API key: %q", joined)
+	}
+	if !containsEnv(env, piBaseURLEnvVar, "https://api.anthropic.com") {
+		t.Errorf("pin env missing base URL: %v", env)
+	}
+	if !containsEnv(env, piAPIEnvVar, "anthropic-messages") {
+		t.Errorf("pin env missing/incorrect api name: %v", env)
+	}
+	if !containsEnv(env, piModelEnvVar, "claude-x") {
+		t.Errorf("pin env missing model: %v", env)
+	}
+}
+
+func containsEnv(env []string, key, val string) bool {
+	for _, e := range env {
+		if e == key+"="+val {
+			return true
+		}
+	}
+	return false
 }
 
 func assertMode0600(t *testing.T, path string) {
