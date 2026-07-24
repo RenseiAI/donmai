@@ -1,4 +1,7 @@
-package afcli
+// Package linearcmd implements the `linear` command family (Linear
+// issue-tracker operations). It is composed into the CLI by
+// afcli.RegisterCommands via linearcmd.New; only New is exported.
+package linearcmd
 
 // donmai linear — Linear issue-tracker operations.
 //
@@ -35,7 +38,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -43,21 +45,22 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/donmai/afcli/internal/cli"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/linear"
 )
 
 // ─── top-level command factory ────────────────────────────────────────────────
 
-// newLinearCmd constructs the `linear` parent command with all sub-commands.
-// It is wired into RegisterCommands so that `<binary> linear <sub>` works.
+// New constructs the `linear` parent command with all sub-commands. It is
+// wired into afcli.RegisterCommands so that `<binary> linear <sub>` works. bin
+// is the user-facing binary name (afcli resolves it from Config.BinaryName).
 //
 // `ds` is the platform-DataSource factory; subcommands call it lazily to
 // pick up rsk_ credentials when running embedded under rensei. The factory
 // may be nil (e.g. minimal test embedders) — subcommands degrade to the
 // LINEAR_API_KEY env path.
-func newLinearCmd(ds func() afclient.DataSource, cfg Config) *cobra.Command {
-	bin := binaryName(cfg)
+func New(ds func() afclient.DataSource, bin string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "linear",
 		Short: "Linear issue-tracker operations",
@@ -102,15 +105,6 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-// apiKey resolves the Linear API key from the environment.
-// Accepts both LINEAR_API_KEY and LINEAR_ACCESS_TOKEN.
-func apiKey() string {
-	if v := os.Getenv("LINEAR_API_KEY"); v != "" {
-		return v
-	}
-	return os.Getenv("LINEAR_ACCESS_TOKEN")
-}
-
 // workerAuthProxyCredentials resolves the in-box worker proxy credentials from
 // the environment the runner exports for cloud agents: the worker runtime JWT
 // (WORKER_AUTH_TOKEN) plus the platform base URL (DONMAI_API_URL). Returns
@@ -143,7 +137,7 @@ func workerAuthProxyCredentials() (baseURL, token string, ok bool) {
 // BaseURL points at the test server.
 func newLinearClient(ds func() afclient.DataSource, bin string) (linear.Linear, error) {
 	// Path 1: env-var direct.
-	if key := apiKey(); key != "" {
+	if key := cli.APIKey(); key != "" {
 		c, err := linear.NewClient(key)
 		if err != nil {
 			return nil, err
@@ -175,18 +169,10 @@ func newLinearClient(ds func() afclient.DataSource, bin string) (linear.Linear, 
 	}
 
 	// Path 3: neither — actionable error.
-	return nil, userError(
+	return nil, cli.UserError(
 		"linear access requires either a LINEAR_API_KEY env var or a logged-in platform session",
 		"set the LINEAR_API_KEY env var, or run `"+bin+" auth add --user` then `"+bin+" project trackers connect-linear`",
 	)
-}
-
-// writeJSON writes v as indented JSON to w.
-// Use cmd.OutOrStdout() as w so tests can capture output.
-func writeJSON(w io.Writer, v any) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
 }
 
 // readFile reads the content of path. Used for --description-file / --body-file.
@@ -339,7 +325,7 @@ func newLinearGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Comm
 				"createdAt":   issue.CreatedAt,
 				"updatedAt":   issue.UpdatedAt,
 			}
-			return writeJSON(cmd.OutOrStdout(), out)
+			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
 	}
 }
@@ -371,7 +357,7 @@ func newLinearCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				team = os.Getenv("LINEAR_TEAM_NAME")
 			}
 			if title == "" || team == "" {
-				return userError(
+				return cli.UserError(
 					"--title and --team are required (or set LINEAR_TEAM_NAME)",
 					"Usage: "+cmd.UseLine()+" --title \"Title\" --team \"Team\"",
 				)
@@ -442,7 +428,7 @@ func newLinearCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				return fmt.Errorf("create issue: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"id":         issue.ID,
 				"identifier": issue.Identifier,
 				"title":      issue.Title,
@@ -566,7 +552,7 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				return fmt.Errorf("update issue: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"id":         updated.ID,
 				"identifier": updated.Identifier,
 				"title":      updated.Title,
@@ -615,7 +601,7 @@ func newLinearListCommentsCmd(ds func() afclient.DataSource, bin string) *cobra.
 					"createdAt": c.CreatedAt,
 				}
 			}
-			return writeJSON(cmd.OutOrStdout(), out)
+			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
 	}
 }
@@ -639,7 +625,7 @@ func newLinearCreateCommentCmd(ds func() afclient.DataSource, bin string) *cobra
 				return err
 			}
 			if resolvedBody == "" {
-				return userError(
+				return cli.UserError(
 					"--body or --body-file is required",
 					"Usage: "+cmd.UseLine()+" --body \"Comment text\" (or --body-file /path/to/file)",
 				)
@@ -654,7 +640,7 @@ func newLinearCreateCommentCmd(ds func() afclient.DataSource, bin string) *cobra
 				return fmt.Errorf("create comment: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"id":        comment.ID,
 				"body":      comment.Body,
 				"createdAt": comment.CreatedAt,
@@ -680,7 +666,7 @@ func newLinearAddRelationCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !isValidRelationType(relType) {
-				return userError(
+				return cli.UserError(
 					"--type is required and must be one of: related, blocks, duplicate",
 					"Usage: "+cmd.UseLine()+" --type <related|blocks|duplicate>",
 				)
@@ -709,7 +695,7 @@ func newLinearAddRelationCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				return fmt.Errorf("add relation: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"success":        success,
 				"relationId":     relationID,
 				"issueId":        issueID,
@@ -774,7 +760,7 @@ func newLinearListRelationsCmd(ds func() afclient.DataSource, bin string) *cobra
 				}
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"issueId":          args[0],
 				"relations":        relations,
 				"inverseRelations": inverseRelations,
@@ -800,7 +786,7 @@ func newLinearRemoveRelationCmd(ds func() afclient.DataSource, bin string) *cobr
 				return fmt.Errorf("remove relation: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"success":    true,
 				"relationId": args[0],
 			})
@@ -851,7 +837,7 @@ func newLinearListSubIssuesCmd(ds func() afclient.DataSource, bin string) *cobra
 				}
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"parentId":         parent.ID,
 				"parentIdentifier": parent.Identifier,
 				"subIssueCount":    len(children),
@@ -916,7 +902,7 @@ func newLinearListSubIssueStatusesCmd(ds func() afclient.DataSource, bin string)
 				incomplete = []map[string]any{}
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"parentIssue":        args[0],
 				"subIssueCount":      len(statuses),
 				"subIssues":          statuses,
@@ -942,7 +928,7 @@ func newLinearUpdateSubIssueCmd(ds func() afclient.DataSource, bin string) *cobr
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if state == "" && comment == "" {
-				return userError(
+				return cli.UserError(
 					"--state or --comment is required",
 					"Usage: "+cmd.UseLine()+" --state \"Finished\" [--comment \"...\"]",
 				)
@@ -981,7 +967,7 @@ func newLinearUpdateSubIssueCmd(ds func() afclient.DataSource, bin string) *cobr
 				return fmt.Errorf("get updated issue: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"id":         updated.ID,
 				"identifier": updated.Identifier,
 				"title":      updated.Title,
@@ -1136,7 +1122,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				}
 			}
 
-			return writeJSON(cmd.OutOrStdout(), out)
+			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
 	}
 
@@ -1182,7 +1168,7 @@ func newLinearCheckBlockedCmd(ds func() afclient.DataSource, bin string) *cobra.
 				blockers = []map[string]any{}
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"issueId":   args[0],
 				"blocked":   len(blockers) > 0,
 				"blockedBy": blockers,
@@ -1214,7 +1200,7 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 				team = os.Getenv("DONMAI_LINEAR_TEAM")
 			}
 			if project == "" {
-				return userError(
+				return cli.UserError(
 					"--project is required (or set DONMAI_LINEAR_PROJECT)",
 					"Usage: "+cmd.UseLine()+" --project \"ProjectName\"",
 				)
@@ -1264,7 +1250,7 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 				}
 			}
 
-			return writeJSON(cmd.OutOrStdout(), out)
+			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
 	}
 
@@ -1299,7 +1285,7 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 				team = os.Getenv("DONMAI_LINEAR_TEAM")
 			}
 			if project == "" {
-				return userError(
+				return cli.UserError(
 					"--project is required (or set DONMAI_LINEAR_PROJECT)",
 					"Usage: "+cmd.UseLine()+" --project \"ProjectName\"",
 				)
@@ -1370,7 +1356,7 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 				unblocked = []map[string]any{}
 			}
 
-			return writeJSON(cmd.OutOrStdout(), unblocked)
+			return cli.WriteJSON(cmd.OutOrStdout(), unblocked)
 		},
 	}
 
@@ -1400,7 +1386,7 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if title == "" {
-				return userError(
+				return cli.UserError(
 					"--title is required",
 					"Usage: "+cmd.UseLine()+" --title \"Title\" [--description \"...\"] [--team \"...\"] [--project \"...\"] [--assignee \"user@email.com\"]",
 				)
@@ -1452,7 +1438,7 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 							// +1 comment on duplicate
 							_, _ = client.CreateComment(ctx, c.ID,
 								fmt.Sprintf("+1 - Also needed by %s", sourceIssue.Identifier))
-							return writeJSON(cmd.OutOrStdout(), map[string]any{
+							return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 								"id":           c.ID,
 								"identifier":   c.Identifier,
 								"title":        c.Title,
@@ -1538,7 +1524,7 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 				// Non-critical: blocker still created without assignee
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"id":           blockerIssue.ID,
 				"identifier":   blockerIssue.Identifier,
 				"title":        blockerIssue.Title,
@@ -1582,7 +1568,7 @@ func newLinearCommentCmd(ds func() afclient.DataSource, bin string) *cobra.Comma
 				return err
 			}
 			if resolvedBody == "" {
-				return userError(
+				return cli.UserError(
 					"--body or --body-file is required",
 					"Usage: "+cmd.UseLine()+" --body \"Comment text\"",
 				)
@@ -1597,7 +1583,7 @@ func newLinearCommentCmd(ds func() afclient.DataSource, bin string) *cobra.Comma
 				return fmt.Errorf("create comment: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"id":        comment.ID,
 				"body":      comment.Body,
 				"createdAt": comment.CreatedAt,
@@ -1646,7 +1632,7 @@ func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 			}
 			sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 
-			return writeJSON(cmd.OutOrStdout(), out)
+			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
 	}
 
@@ -1674,7 +1660,7 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if labelName == "" {
-				return userError(
+				return cli.UserError(
 					"--label is required",
 					"Usage: "+cmd.UseLine()+" --label \"Bug\"",
 				)
@@ -1710,7 +1696,7 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				if !createFlag {
 					// Fail loud — do not silently no-op. The bot may lack label-create
 					// scope, so we require explicit opt-in via --create.
-					return userError(
+					return cli.UserError(
 						fmt.Sprintf("label %q not found in workspace; use --create to create it (requires label-create scope)", labelName),
 						"Available labels: run `"+bin+" linear list-labels` to see existing labels",
 					)
@@ -1718,7 +1704,7 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				// --create requested: fail loud with a clear message that creation is
 				// not yet implemented. This surfaces scope issues immediately rather
 				// than silently skipping the label.
-				return userError(
+				return cli.UserError(
 					"label creation (--create) is not yet implemented; ask a workspace admin to create the label first",
 					"After the label exists, run without --create: "+cmd.UseLine()+" --label \""+labelName+"\"",
 				)
@@ -1744,7 +1730,7 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				return fmt.Errorf("apply label: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"id":             updated.ID,
 				"identifier":     updated.Identifier,
 				"appliedLabel":   labelName,
@@ -1978,7 +1964,7 @@ Exit codes:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			prNumber := 0
 			if _, err := fmt.Sscanf(args[0], "%d", &prNumber); err != nil || prNumber <= 0 {
-				return userError(
+				return cli.UserError(
 					fmt.Sprintf("invalid PR number %q; must be a positive integer", args[0]),
 					"example: "+bin+" linear check-deployment 42",
 				)
@@ -1986,16 +1972,16 @@ Exit codes:
 
 			// Resolve owner/repo from flags or current git remote.
 			if owner == "" || repo == "" {
-				remote, err := runGitCommand("remote", "get-url", "origin")
+				remote, err := cli.RunGitCommand("remote", "get-url", "origin")
 				if err != nil {
-					return userError(
+					return cli.UserError(
 						"could not determine repository owner/repo",
 						"set them explicitly with --owner and --repo",
 					)
 				}
 				detectedOwner, detectedRepo, parseErr := parseGitRemote(remote)
 				if parseErr != nil {
-					return userError(
+					return cli.UserError(
 						fmt.Sprintf("could not parse git remote %q: %v", remote, parseErr),
 						"set them explicitly with --owner and --repo",
 					)

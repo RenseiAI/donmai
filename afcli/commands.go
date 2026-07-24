@@ -5,6 +5,7 @@ package afcli
 
 import (
 	"github.com/RenseiAI/donmai/afcli/credentials"
+	"github.com/RenseiAI/donmai/afcli/linearcmd"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/spf13/cobra"
 )
@@ -143,7 +144,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newMCPCmd(cfg))
 	root.AddCommand(newEvalCmd(cfg))
 	root.AddCommand(newArchCmd(cfg))
-	root.AddCommand(newLinearCmd(ds, cfg))
+	root.AddCommand(linearcmd.New(ds, binaryName(cfg)))
 	root.AddCommand(newGitHubCmd(ds, cfg))
 	root.AddCommand(newLogsCmd())
 	root.AddCommand(newAdminCmd())

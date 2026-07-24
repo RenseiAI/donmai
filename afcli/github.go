@@ -37,6 +37,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/donmai/afcli/internal/cli"
 	"github.com/RenseiAI/donmai/afclient"
 	gh "github.com/RenseiAI/donmai/internal/github"
 )
@@ -120,7 +121,7 @@ func newGitHubClient(ds func() afclient.DataSource, bin string) (gh.GitHub, erro
 	}
 
 	// Path 3: neither — actionable error.
-	return nil, userError(
+	return nil, cli.UserError(
 		"github access requires authentication",
 		"set GITHUB_TOKEN, or run `"+bin+" auth add --user` then connect a GitHub integration",
 	)
@@ -237,7 +238,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return userError(
+				return cli.UserError(
 					"--number is required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42",
 				)
@@ -254,7 +255,7 @@ Example:
 			if err != nil {
 				return fmt.Errorf("get issue: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), issueJSON(issue))
+			return cli.WriteJSON(cmd.OutOrStdout(), issueJSON(issue))
 		},
 	}
 
@@ -288,7 +289,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if title == "" {
-				return userError(
+				return cli.UserError(
 					"--title is required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --title \"Title\" [--body \"text\"]",
 				)
@@ -318,7 +319,7 @@ Example:
 			if err != nil {
 				return fmt.Errorf("create issue: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), issueJSON(issue))
+			return cli.WriteJSON(cmd.OutOrStdout(), issueJSON(issue))
 		},
 	}
 
@@ -357,7 +358,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return userError(
+				return cli.UserError(
 					"--number is required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 [--title ...] [--state open|closed]",
 				)
@@ -388,7 +389,7 @@ Example:
 			if err != nil {
 				return fmt.Errorf("update issue: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), issueJSON(issue))
+			return cli.WriteJSON(cmd.OutOrStdout(), issueJSON(issue))
 		},
 	}
 
@@ -465,7 +466,7 @@ Example:
 			for i, iss := range issues {
 				out[i] = issueJSON(&iss)
 			}
-			return writeJSON(cmd.OutOrStdout(), out)
+			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
 	}
 
@@ -502,7 +503,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return userError(
+				return cli.UserError(
 					"--number is required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42",
 				)
@@ -536,7 +537,7 @@ Example:
 					"updatedAt": c.UpdatedAt,
 				}
 			}
-			return writeJSON(cmd.OutOrStdout(), out)
+			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
 	}
 
@@ -567,7 +568,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return userError(
+				return cli.UserError(
 					"--number is required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 --body \"...\"",
 				)
@@ -577,7 +578,7 @@ Example:
 				return err
 			}
 			if resolvedBody == "" {
-				return userError(
+				return cli.UserError(
 					"--body or --body-file is required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 --body \"Comment text\"",
 				)
@@ -601,7 +602,7 @@ Example:
 			if comment.User != nil {
 				userLogin = comment.User.Login
 			}
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"id":        comment.ID,
 				"body":      comment.Body,
 				"author":    userLogin,
@@ -639,7 +640,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 || labels == "" {
-				return userError(
+				return cli.UserError(
 					"--number and --labels are required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 --labels \"label1,label2\"",
 				)
@@ -662,7 +663,7 @@ Example:
 			for i, l := range added {
 				names[i] = l.Name
 			}
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"number": number,
 				"labels": names,
 			})
@@ -697,7 +698,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return userError(
+				return cli.UserError(
 					"--number is required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 --assignees \"alice,bob\"",
 				)
@@ -715,7 +716,7 @@ Example:
 			if err != nil {
 				return fmt.Errorf("set assignees: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), issueJSON(issue))
+			return cli.WriteJSON(cmd.OutOrStdout(), issueJSON(issue))
 		},
 	}
 
@@ -746,7 +747,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return userError(
+				return cli.UserError(
 					"--number is required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 [--comment \"...\"]",
 				)
@@ -771,7 +772,7 @@ Example:
 			if err != nil {
 				return fmt.Errorf("close issue: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), issueJSON(issue))
+			return cli.WriteJSON(cmd.OutOrStdout(), issueJSON(issue))
 		},
 	}
 
@@ -802,7 +803,7 @@ Example:
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
-				return userError(
+				return cli.UserError(
 					"--number is required",
 					"Usage: "+cmd.UseLine()+" --repo owner/repo --number 42 [--comment \"...\"]",
 				)
@@ -827,7 +828,7 @@ Example:
 			if err != nil {
 				return fmt.Errorf("reopen issue: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), issueJSON(issue))
+			return cli.WriteJSON(cmd.OutOrStdout(), issueJSON(issue))
 		},
 	}
 
@@ -876,7 +877,7 @@ Example:
 					"description": l.Description,
 				}
 			}
-			return writeJSON(cmd.OutOrStdout(), out)
+			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
 	}
 
@@ -913,7 +914,7 @@ Example:
 			if err != nil {
 				return fmt.Errorf("get repo: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"fullName":    r.FullName,
 				"name":        r.Name,
 				"description": r.Description,

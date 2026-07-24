@@ -1,4 +1,4 @@
-package afcli
+package linearcmd
 
 // check_deployment_test.go — table-driven tests for the native
 // checkDeployment implementation (Part B of GO-3).

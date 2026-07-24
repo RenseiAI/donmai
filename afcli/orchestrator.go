@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/donmai/afcli/internal/cli"
 	"github.com/RenseiAI/donmai/afclient/orchestrator"
 	"github.com/RenseiAI/donmai/afclient/repoconfig"
 )
@@ -193,7 +194,7 @@ func runOrchestrator(_ *cobra.Command, flags *orchestratorFlags) error {
 // resolveGitRoot returns the git repository root via git rev-parse.
 // Returns the current working directory on failure (best-effort).
 func resolveGitRoot() string {
-	out, err := runGitCommand("rev-parse", "--show-toplevel")
+	out, err := cli.RunGitCommand("rev-parse", "--show-toplevel")
 	if err != nil {
 		wd, _ := os.Getwd()
 		return wd
