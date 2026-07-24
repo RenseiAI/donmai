@@ -53,12 +53,14 @@ clean:
 # the org-level go.work does not enumerate.
 generate:
 	GOWORK=off go generate ./matrix/...
+	GOWORK=off go generate ./internal/credentials/...
 
 # verify-generated runs only the matrix parity gate (the byte-identical check
-# plus the protocol/auth/blocklist/narrowing/manifest-agreement rules). Run
-# with GOWORK=off to mirror the OSS-standalone CI lane.
+# plus the protocol/auth/blocklist/narrowing/manifest-agreement rules) and the
+# canonical env-blocklist artifact freshness check (blocklist.json vs the Go
+# source of truth). Run with GOWORK=off to mirror the OSS-standalone CI lane.
 verify-generated:
-	GOWORK=off go test -race ./matrix/...
+	GOWORK=off go test -race ./matrix/... ./internal/credentials/...
 
 # Local snapshot release (no publish, no signing). GoReleaser v2 snapshot mode
 # skips publication but not custom sign pipes, so signing must be skipped
