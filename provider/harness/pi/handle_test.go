@@ -14,9 +14,16 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
+// testHandshakeToken is the per-session token the pipe-stub tests pin (via
+// Options.handshakeToken) so a scripted handshake fixture can echo the exact
+// value the handle expects. A real session generates a random token per Spawn
+// and sets it in the child env (piHandshakeEnvVar).
+const testHandshakeToken = "test-session-token-0123456789ab"
+
 // syncBuffer is a concurrency-safe io.Writer that captures every command the
 // handle writes to its stdin (the pump writes from its goroutine while the
-// test reads after). Non-blocking, so replyExtension never deadlocks the pump.
+// test reads after). Non-blocking, so the extension replies never deadlock the
+// pump.
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf strings.Builder
@@ -52,25 +59,57 @@ func event(fields map[string]any) string {
 	return string(b) + "\n"
 }
 
-// handshake builds a valid handshake event with the real embedded SHA.
-func handshakeEvent(reqID string) string {
+// uiRequest builds a real extension_ui_request (method:"input") carrying the
+// donmai marker placeholder and a JSON payload in `title` — the exact shape the
+// policy extension emits over `ctx.ui.input(payload, DONMAI_UI_MARKER)`.
+func uiRequest(reqID string, payload map[string]any) string {
+	title, _ := json.Marshal(payload)
 	return event(map[string]any{
-		"type": "extension_ui_request",
-		"id":   reqID,
-		"request": map[string]any{
-			"type":         handshakeType,
-			"nonce":        "ext-nonce-1",
-			"extensionSHA": extensionSHA(),
-		},
+		"type":        "extension_ui_request",
+		"id":          reqID,
+		"method":      "input",
+		"title":       string(title),
+		"placeholder": donmaiUIMarker,
+	})
+}
+
+// handshakeEvent builds a valid handshake request with the pinned test token and
+// the real embedded SHA.
+func handshakeEvent(reqID string) string {
+	return uiRequest(reqID, map[string]any{
+		"donmai": handshakeKind,
+		"token":  testHandshakeToken,
+		"sha":    extensionSHA(),
+	})
+}
+
+// adjudicateEvent builds an adjudication request for one tool call.
+func adjudicateEvent(reqID, toolName, toolCallID string, input map[string]any, cwd string) string {
+	return uiRequest(reqID, map[string]any{
+		"donmai":     adjudicateKind,
+		"token":      testHandshakeToken,
+		"toolName":   toolName,
+		"toolCallId": toolCallID,
+		"input":      input,
+		"cwd":        cwd,
+	})
+}
+
+// getStateResponse builds a real get_state command response carrying sessionId.
+func getStateResponse(sessionID string) string {
+	return event(map[string]any{
+		"type":    "response",
+		"command": "get_state",
+		"success": true,
+		"data":    map[string]any{"sessionId": sessionID},
 	})
 }
 
 // spawnScripted spawns a pi session over an io.Pipe stdout the test controls,
-// so the child cannot race to EOF before Spawn sends the prompt (a real child
-// would not emit agent_end before receiving the prompt). preSpawn is written
-// and must be fully consumed before Spawn's handshake gate resolves; body is
-// written after Spawn returns, then the stream is closed. Every command the
-// handle writes is captured.
+// so the child cannot race to EOF before Spawn sends the prompt. preSpawn is
+// written and must be consumed before Spawn's handshake gate resolves; body is
+// written after Spawn returns, then the stream is closed by t.Cleanup. Every
+// command the handle writes is captured.
 func spawnScripted(t *testing.T, spec agent.Spec, preSpawn, body string) (*syncBuffer, agent.Handle, error) {
 	t.Helper()
 	if spec.Cwd == "" {
@@ -83,6 +122,7 @@ func spawnScripted(t *testing.T, spec agent.Spec, preSpawn, body string) (*syncB
 		skipProcess:      true,
 		stdinOverride:    cmds,
 		stdoutOverride:   pr,
+		handshakeToken:   testHandshakeToken,
 		HandshakeTimeout: 2 * time.Second,
 	})
 	if err != nil {
@@ -93,15 +133,12 @@ func spawnScripted(t *testing.T, spec agent.Spec, preSpawn, body string) (*syncB
 	go func() { _, _ = io.WriteString(pw, preSpawn) }()
 	h, err := p.Spawn(context.Background(), spec)
 	if err != nil {
-		// On fail-closed the caller inspects cmds; close the stream so any
-		// pending reader unwinds.
 		_ = pw.Close()
 		return cmds, h, err
 	}
 	// Deliver the rest of the session. The stream is NOT closed here (a real
 	// child keeps stdout open across the session); t.Cleanup closes it. The
-	// pump terminates on the body's terminal event, not on EOF, so leaving the
-	// write side open keeps the client live for in-session extension replies.
+	// pump terminates on the body's terminal event, not on EOF.
 	go func() { _, _ = io.WriteString(pw, body) }()
 	return cmds, h, err
 }
@@ -125,12 +162,13 @@ func drain(t *testing.T, h agent.Handle) []agent.Event {
 	}
 }
 
-// --- Smoke 1: spawn + handshake verified; tampered SHA fails closed ---
+// --- Smoke 1: spawn + handshake verified; tampered SHA/token fails closed ---
 
 func TestSpawn_HandshakeVerified(t *testing.T) {
 	t.Parallel()
-	body := event(map[string]any{"type": "agent_start", "sessionId": "ses_ok"}) +
-		event(map[string]any{"type": "agent_end", "success": true})
+	body := getStateResponse("ses_ok") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "agent_settled"})
 	cmds, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), body)
 	if err != nil {
 		t.Fatalf("Spawn should succeed on a verified handshake: %v", err)
@@ -141,17 +179,20 @@ func TestSpawn_HandshakeVerified(t *testing.T) {
 	var sawHandshakeAck, sawPrompt bool
 	var ackIdx, promptIdx int
 	for i, c := range got {
-		if c["command"] == "extension_ui_response" {
+		if c["type"] == "extension_ui_response" && c["value"] == "ok" {
 			sawHandshakeAck = true
 			ackIdx = i
 		}
-		if c["command"] == "prompt" {
+		if c["type"] == "prompt" {
 			sawPrompt = true
 			promptIdx = i
+			if msg, _ := c["message"].(string); msg != "hi" {
+				t.Errorf("prompt message = %q, want the real `message` field carrying the prompt", msg)
+			}
 		}
 	}
 	if !sawHandshakeAck || !sawPrompt {
-		t.Fatalf("expected a handshake ack and a prompt command, got %v", got)
+		t.Fatalf("expected a handshake ack (value:ok) and a prompt command, got %v", got)
 	}
 	if ackIdx > promptIdx {
 		t.Errorf("prompt was sent BEFORE the handshake ack — fail-closed ordering violated")
@@ -160,17 +201,13 @@ func TestSpawn_HandshakeVerified(t *testing.T) {
 
 func TestSpawn_TamperedExtensionFailsClosed(t *testing.T) {
 	t.Parallel()
-	// Handshake with a WRONG SHA — the materialized extension is not ours.
-	tampered := event(map[string]any{
-		"type": "extension_ui_request",
-		"id":   "h1",
-		"request": map[string]any{
-			"type":         handshakeType,
-			"nonce":        "x",
-			"extensionSHA": strings.Repeat("a", 64),
-		},
+	// Handshake with a WRONG SHA (but the right token) — the materialized
+	// extension bytes are not ours.
+	tampered := uiRequest("h1", map[string]any{
+		"donmai": handshakeKind,
+		"token":  testHandshakeToken,
+		"sha":    strings.Repeat("a", 64),
 	})
-
 	cmds, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, tampered, "")
 	if !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Fatalf("tampered handshake must fail spawn with ErrSpawnFailed, got %v", err)
@@ -178,10 +215,32 @@ func TestSpawn_TamperedExtensionFailsClosed(t *testing.T) {
 	if h != nil {
 		t.Errorf("Spawn must return a nil Handle on fail-closed")
 	}
-	// The prompt must NEVER have been sent.
 	for _, c := range cmds.commands() {
-		if c["command"] == "prompt" {
+		if c["type"] == "prompt" {
 			t.Errorf("prompt was sent despite a tampered extension — trust boundary breached")
+		}
+	}
+}
+
+func TestSpawn_ForgedTokenFailsClosed(t *testing.T) {
+	t.Parallel()
+	// Right SHA, WRONG token — a foreign extension that copied our source but
+	// cannot know the per-session token the harness set in the child env.
+	forged := uiRequest("h1", map[string]any{
+		"donmai": handshakeKind,
+		"token":  "not-the-session-token",
+		"sha":    extensionSHA(),
+	})
+	cmds, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, forged, "")
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("forged-token handshake must fail spawn closed, got %v", err)
+	}
+	if h != nil {
+		t.Errorf("Spawn must return nil Handle on a forged token")
+	}
+	for _, c := range cmds.commands() {
+		if c["type"] == "prompt" {
+			t.Errorf("prompt sent despite a forged handshake token — trust boundary breached")
 		}
 	}
 }
@@ -191,8 +250,8 @@ func TestSpawn_TamperedExtensionFailsClosed(t *testing.T) {
 func TestSpawn_NoHandshakeFailsClosed(t *testing.T) {
 	t.Parallel()
 	// stdout emits session events but NEVER a handshake.
-	noHandshake := event(map[string]any{"type": "agent_start", "sessionId": "ses"}) +
-		event(map[string]any{"type": "agent_end", "success": true})
+	noHandshake := event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "agent_settled"})
 	cmds, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, noHandshake, "")
 	if !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Fatalf("missing handshake must fail spawn closed, got err=%v", err)
@@ -201,7 +260,7 @@ func TestSpawn_NoHandshakeFailsClosed(t *testing.T) {
 		t.Errorf("Spawn must return nil Handle when the handshake never arrives")
 	}
 	for _, c := range cmds.commands() {
-		if c["command"] == "prompt" {
+		if c["type"] == "prompt" {
 			t.Errorf("prompt sent without a verified policy extension — trust boundary breached")
 		}
 	}
@@ -211,12 +270,14 @@ func TestSpawn_NoHandshakeFailsClosed(t *testing.T) {
 
 func TestSpawn_EventStreamShape(t *testing.T) {
 	t.Parallel()
-	body := event(map[string]any{"type": "agent_start", "sessionId": "ses_stream"}) +
-		event(map[string]any{"type": "message_update", "text": "Hello "}) +
-		event(map[string]any{"type": "message_update", "text": "world"}) +
-		event(map[string]any{"type": "message_update", "part": "thinking", "text": "(secret reasoning)"}) +
+	body := getStateResponse("ses_stream") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Hello "}}) +
+		event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "world"}}) +
+		event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "(secret reasoning)"}}) +
 		event(map[string]any{"type": "message_end"}) +
-		event(map[string]any{"type": "agent_end", "success": true})
+		event(map[string]any{"type": "agent_end", "willRetry": false}) +
+		event(map[string]any{"type": "agent_settled"})
 
 	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), body)
 	if err != nil {
@@ -249,7 +310,7 @@ func TestSpawn_EventStreamShape(t *testing.T) {
 	if err := checkTerminalLast(evs); err != nil {
 		t.Error(err)
 	}
-	// SessionID resolved from agent_start.
+	// SessionID resolved from the get_state response.
 	if h.SessionID() != "ses_stream" {
 		t.Errorf("SessionID = %q, want ses_stream", h.SessionID())
 	}
@@ -261,22 +322,11 @@ func TestSpawn_PermissionDenialRoundTrip(t *testing.T) {
 	t.Parallel()
 	cwd := t.TempDir()
 	// Two adjudication requests: a dangerous bash and an out-of-tree write.
-	adjudicate := func(reqID, callID string, call map[string]any) string {
-		call["callId"] = callID
-		return event(map[string]any{
-			"type": "extension_ui_request",
-			"id":   reqID,
-			"request": map[string]any{
-				"type":  adjudicateType,
-				"nonce": "ext-nonce-1",
-				"call":  call,
-			},
-		})
-	}
-	body := event(map[string]any{"type": "agent_start", "sessionId": "ses_deny"}) +
-		adjudicate("r1", "c1", map[string]any{"tool": "bash", "command": "rm -rf /"}) +
-		adjudicate("r2", "c2", map[string]any{"tool": "write", "path": "/etc/passwd"}) +
-		event(map[string]any{"type": "agent_end", "success": true})
+	body := getStateResponse("ses_deny") +
+		event(map[string]any{"type": "agent_start"}) +
+		adjudicateEvent("r1", "bash", "c1", map[string]any{"command": "rm -rf /"}, cwd) +
+		adjudicateEvent("r2", "write", "c2", map[string]any{"path": "/etc/passwd"}, cwd) +
+		event(map[string]any{"type": "agent_settled"})
 
 	cmds, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: cwd, Autonomous: true}, handshakeEvent("h1"), body)
 	if err != nil {
@@ -284,19 +334,27 @@ func TestSpawn_PermissionDenialRoundTrip(t *testing.T) {
 	}
 	evs := drain(t, h)
 
-	// Both replies must be deny, carrying a visible reason (the model sees it).
+	// Both replies must be deny, carrying a visible reason (the model sees it)
+	// in the top-level `value` decision JSON.
 	denies := 0
 	for _, c := range cmds.commands() {
-		if c["command"] != "extension_ui_response" {
+		if c["type"] != "extension_ui_response" {
 			continue
 		}
-		resp, _ := c["response"].(map[string]any)
-		if resp == nil {
+		val, _ := c["value"].(string)
+		if val == "" {
 			continue
 		}
-		if allow, ok := resp["allow"].(bool); ok && !allow {
+		var d struct {
+			Allow  bool   `json:"allow"`
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal([]byte(val), &d) != nil {
+			continue
+		}
+		if !d.Allow {
 			denies++
-			if reason, _ := resp["reason"].(string); reason == "" {
+			if d.Reason == "" {
 				t.Errorf("deny reply carried no reason — the model cannot see why")
 			}
 		}
@@ -320,10 +378,12 @@ func TestSpawn_PermissionDenialRoundTrip(t *testing.T) {
 
 func TestSpawn_BypassMonitorAborts(t *testing.T) {
 	t.Parallel()
-	// A built-in tool_execution_start with NO preceding adjudication.
-	body := event(map[string]any{"type": "agent_start", "sessionId": "ses_bypass"}) +
-		event(map[string]any{"type": "tool_execution_start", "tool": "bash", "callId": "c-unadjudicated"}) +
-		event(map[string]any{"type": "agent_end", "success": true})
+	// A built-in tool_execution_END with NO preceding adjudication round-trip.
+	// (tool_execution_end — not _start — is the real bypass check point.)
+	body := getStateResponse("ses_bypass") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "tool_execution_end", "toolName": "bash", "toolCallId": "c-unadjudicated", "isError": false}) +
+		event(map[string]any{"type": "agent_settled"})
 
 	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true}, handshakeEvent("h1"), body)
 	if err != nil {
@@ -336,8 +396,6 @@ func TestSpawn_BypassMonitorAborts(t *testing.T) {
 		if ee, ok := e.(agent.ErrorEvent); ok && ee.Code == "policy_extension_failed" {
 			sawBypass = true
 		}
-		// The agent_end that followed must NOT have produced a ResultEvent:
-		// the session aborts at the bypass.
 		if _, ok := e.(agent.ResultEvent); ok {
 			t.Errorf("session emitted a ResultEvent after a policy bypass — must abort instead")
 		}
@@ -347,6 +405,49 @@ func TestSpawn_BypassMonitorAborts(t *testing.T) {
 	}
 	if err := checkTerminalLast(evs); err != nil {
 		t.Error(err)
+	}
+}
+
+// --- Smoke 6 (unit half): Inject routes steer vs follow_up ---
+
+func TestInject_SteerWhenInFlight_FollowUpWhenIdle(t *testing.T) {
+	t.Parallel()
+	cmds, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"},
+		handshakeEvent("h1"),
+		getStateResponse("ses_inject")+event(map[string]any{"type": "agent_start"}))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	ph := h.(*Handle)
+
+	ph.turnInFlight.Store(true)
+	if err := h.Inject(context.Background(), "steer me"); err != nil {
+		t.Fatalf("Inject (in flight): %v", err)
+	}
+	ph.turnInFlight.Store(false)
+	if err := h.Inject(context.Background(), "follow me"); err != nil {
+		t.Fatalf("Inject (idle): %v", err)
+	}
+	_ = h.Stop(context.Background())
+
+	var sawSteer, sawFollowUp bool
+	for _, c := range cmds.commands() {
+		switch c["type"] {
+		case "steer":
+			if c["message"] == "steer me" {
+				sawSteer = true
+			}
+		case "follow_up":
+			if c["message"] == "follow me" {
+				sawFollowUp = true
+			}
+		}
+	}
+	if !sawSteer {
+		t.Errorf("in-flight Inject did not map to a steer command with the real `message` field")
+	}
+	if !sawFollowUp {
+		t.Errorf("idle Inject did not map to a follow_up command with the real `message` field")
 	}
 }
 

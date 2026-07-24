@@ -15,11 +15,63 @@ import (
 // env var into the child process; it is never written to disk.
 const PiKeyEnvVar = "DONMAI_PI_KEY"
 
-// rpcArgs is the argv for the headless RPC lane: `pi --mode rpc`. The
-// single-shot structured lane (`pi --mode json`, StructuredVia:"spawn-collect",
-// design §7) is a deferred follow-up — SupportsOneShot is advertised but the
-// SpawnComplete projection is not wired in this cut.
-func rpcArgs() []string { return []string{"--mode", "rpc"} }
+// rpcArgs is the argv for the headless RPC lane. It loads ONLY the donmai
+// policy extension and nothing else:
+//
+//   - `-e <layout.extension>` loads the materialized policy extension. A CLI
+//     `-e` extension loads regardless of project trust (docs/extensions.md:
+//     project-local `.pi/extensions` copies only load after the project is
+//     trusted), which is why the harness passes the path here rather than
+//     relying on auto-discovery.
+//   - `--no-extensions` disables all OTHER extension discovery (explicit `-e`
+//     paths still load), so no user/global/project extension can shadow or
+//     race the trust boundary.
+//   - `--approve` trusts project-local files for this run (autonomous sessions
+//     have no user to answer a trust prompt).
+//   - `--session-dir <layout.root>` keeps session storage inside the worktree.
+//
+// The model + reasoning effort are pinned HERE, on the CLI, so the session
+// starts on the resolved cell's model (design §6). `--provider donmai --model
+// <id>[:<thinking>]` selects the "donmai" provider the policy extension
+// registers from env; because the pin is applied at startup, the first turn
+// cannot run on pi's default model (a runtime set_model races the prompt —
+// verified against the real binary). When no endpoint is bound (no baseURL for
+// the extension to register a provider), only `--model <id>` is passed and pi
+// resolves the provider from its own config.
+//
+// For a resume, `--session <id>` selects the session to reload; get_entries
+// then replays from the caller's cursor. The single-shot structured lane
+// (`pi --mode json`, StructuredVia:"spawn-collect", design §7) is a deferred
+// follow-up — SupportsOneShot is advertised but the SpawnComplete projection
+// is not wired in this cut.
+func rpcArgs(layout sessionLayout, mode launchMode, sessionID string, spec agent.Spec) []string {
+	args := []string{
+		"--mode", "rpc",
+		"-e", layout.extension,
+		"--no-extensions",
+		"--approve",
+		"--session-dir", layout.root,
+	}
+	if spec.Model != "" {
+		modelArg := spec.Model
+		if lvl := thinkingLevelForEffort(spec.Effort); lvl != "" {
+			modelArg += ":" + lvl
+		}
+		if spec.Endpoint != nil && spec.Endpoint.BaseURL != "" {
+			args = append(args, "--provider", pinnedProviderName, "--model", modelArg)
+		} else {
+			args = append(args, "--model", modelArg)
+		}
+	}
+	if mode == launchResume && sessionID != "" {
+		args = append(args, "--session", sessionID)
+	}
+	return args
+}
+
+// pinnedProviderName is the provider name the policy extension registers from
+// env and the harness pins the model against (design §6).
+const pinnedProviderName = "donmai"
 
 // composeChildEnv builds the child process env with the env-hygiene posture
 // design §5.3 requires: because pi runs tools with the FULL permissions of the
@@ -30,7 +82,11 @@ func rpcArgs() []string { return []string{"--mode", "rpc"} }
 // cell key onto PiKeyEnvVar). The PI_* redirect layer is appended last (wins)
 // so the child's pi config/auth/state home resolves inside the session
 // worktree — a fleet box's personal ~/.pi/agent/auth.json is never visible.
-func composeChildEnv(spec agent.Spec, layout sessionLayout) []string {
+//
+// It also carries the trust-boundary handshake token (piHandshakeEnvVar) and
+// the non-secret provider-pin vars (providerPinEnv) the policy extension reads
+// at load; the key itself already rides Spec.Env under PiKeyEnvVar.
+func composeChildEnv(spec agent.Spec, layout sessionLayout, token string) []string {
 	out := runtimeenv.NewComposer().Compose(envSliceToMap(os.Environ()), spec)
 	// Redirect pi's config/auth/state home into the session dir. Multiple
 	// candidate names are set because the exact PI_* home var is unverified
@@ -44,6 +100,10 @@ func composeChildEnv(spec agent.Spec, layout sessionLayout) []string {
 		"PI_STATE_DIR="+layout.root,
 		"XDG_CONFIG_HOME="+layout.root,
 	)
+	out = append(out, providerPinEnv(spec.Endpoint, spec.Model)...)
+	if token != "" {
+		out = append(out, piHandshakeEnvVar+"="+token)
+	}
 	return out
 }
 

@@ -60,10 +60,11 @@ func TestVersionPin_BelowMinFailsConstruction(t *testing.T) {
 // satisfy the terminal-event ordering invariant.
 func TestConformance_TerminalContract(t *testing.T) {
 	t.Parallel()
-	body := event(map[string]any{"type": "agent_start", "sessionId": "ses_conf"}) +
-		event(map[string]any{"type": "message_update", "text": "done"}) +
+	body := getStateResponse("ses_conf") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "done"}}) +
 		event(map[string]any{"type": "message_end"}) +
-		event(map[string]any{"type": "agent_end", "success": true})
+		event(map[string]any{"type": "agent_settled"})
 	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), body)
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)

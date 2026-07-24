@@ -40,7 +40,7 @@ func TestWriteCommand_Framing(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
 	c := newRPCClient(&buf, strings.NewReader(""))
-	if err := c.WriteCommand(map[string]any{"command": "prompt", "text": "hello\nworld"}); err != nil {
+	if err := c.WriteCommand(map[string]any{"type": "prompt", "message": "hello\nworld"}); err != nil {
 		t.Fatalf("WriteCommand: %v", err)
 	}
 	out := buf.String()

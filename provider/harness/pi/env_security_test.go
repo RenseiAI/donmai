@@ -19,7 +19,7 @@ func TestEnvHygiene_BlocklistedHostSecretNeverLeaks(t *testing.T) {
 	t.Setenv("DONMAI_HARMLESS_VAR", "keep") // non-blocklisted — should pass through
 
 	layout := newSessionLayout(t.TempDir())
-	env := composeChildEnv(agent.Spec{Cwd: t.TempDir()}, layout)
+	env := composeChildEnv(agent.Spec{Cwd: t.TempDir()}, layout, "sess-token")
 
 	for _, e := range env {
 		if strings.Contains(e, canary) {
@@ -34,6 +34,11 @@ func TestEnvHygiene_BlocklistedHostSecretNeverLeaks(t *testing.T) {
 	if !hasEnvVal(env, "PI_HOME", layout.root) {
 		t.Errorf("PI_HOME not redirected to the session state dir; a host ~/.pi could leak in")
 	}
+	// The per-session handshake token rides the child env (the extension reads
+	// it to prove liveness/identity on the handshake round-trip).
+	if !hasEnvVal(env, piHandshakeEnvVar, "sess-token") {
+		t.Errorf("handshake token not set on the child env under %s", piHandshakeEnvVar)
+	}
 }
 
 // TestEnvHygiene_ResolvedCellKeyRides confirms the resolved cell's key still
@@ -46,7 +51,7 @@ func TestEnvHygiene_ResolvedCellKeyRides(t *testing.T) {
 		Cwd: t.TempDir(),
 		Env: map[string]string{"ANTHROPIC_API_KEY": "cell-resolved-key"},
 	}
-	env := composeChildEnv(spec, layout)
+	env := composeChildEnv(spec, layout, "sess-token")
 	if !hasEnvVal(env, "ANTHROPIC_API_KEY", "cell-resolved-key") {
 		t.Errorf("resolved cell key did not ride Spec.Env into the child")
 	}

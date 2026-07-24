@@ -13,12 +13,14 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// newNonce returns a random hex nonce used to correlate the handshake and
-// subsequent adjudication round-trips.
-func newNonce() string {
+// newHandshakeToken returns a random hex secret the harness sets in the child
+// env (piHandshakeEnvVar) and the policy extension echoes on every trust-
+// boundary round-trip, so the handle can prove a request comes from the exact
+// child it spawned.
+func newHandshakeToken() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return "pi-nonce-fallback"
+		return "pi-token-fallback"
 	}
 	return hex.EncodeToString(b)
 }
@@ -62,6 +64,9 @@ type Options struct {
 	skipProcess    bool
 	stdinOverride  io.Writer
 	stdoutOverride io.Reader
+	// handshakeToken pins the per-session token in skipProcess tests so a
+	// scripted handshake fixture can echo it. Empty ⇒ a random token per Spawn.
+	handshakeToken string
 }
 
 // New probes the pi binary and enforces the version pin (probe-time, per
@@ -105,20 +110,23 @@ func New(opts Options) (*Provider, error) {
 func (p *Provider) Name() agent.ProviderName { return agent.ProviderPi }
 
 // Spawn starts a new pi session. The Handle's Events channel emits exactly one
-// InitEvent (from agent_start), then session events, then exactly one terminal
-// event, then closes. Fail-closed: the prompt is NEVER sent unless the policy
-// extension materialized AND its handshake verified (design §2 step 3).
+// InitEvent (from the get_state response), then session events, then exactly
+// one terminal event, then closes. Fail-closed: the prompt is NEVER sent unless
+// the policy extension materialized AND its handshake verified (design §2
+// step 3).
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	return p.launch(ctx, spec, launchPrompt, "")
 }
 
-// Resume re-execs `pi --mode rpc` against the persisted session file and
-// replays entries from the caller's cursor (design §4). Capability-gated on
+// Resume re-execs `pi --mode rpc` against the persisted session and replays
+// entries from the caller's cursor (design §4). Capability-gated on
 // SupportsSessionResume.
 //
-// NOTE (untested): the get_entries cursor replay + dedup path is implemented
-// but not verified against a real binary; the donmai-smokes step20 resume item
-// is its acceptance gate.
+// NOTE (untested): the get_entries cursor replay path is implemented against
+// the real command shape ({type:"get_entries", since:<entryId>} — no session
+// param; the session is selected via the --session CLI flag) but not verified
+// against a real model turn; the donmai-smokes step20 resume item is its
+// acceptance gate.
 func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
 	if sessionID == "" {
 		return nil, agent.ErrSessionNotFound
@@ -140,11 +148,16 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 
-	// Materialize the policy extension + provider pin BEFORE spawning. A
-	// materialization failure means no boundary — fail closed.
-	layout, err := materializeExtension(spec.Cwd, spec.Endpoint, spec.Model)
+	// Materialize the policy extension BEFORE spawning. A materialization
+	// failure means no boundary — fail closed.
+	layout, err := materializeExtension(spec.Cwd)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+
+	token := p.opts.handshakeToken
+	if token == "" {
+		token = newHandshakeToken()
 	}
 
 	var (
@@ -156,7 +169,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		stdin = p.opts.stdinOverride
 		stdout = p.opts.stdoutOverride
 	} else {
-		c, in, out, serr := p.spawnChild(spec, layout)
+		c, in, out, serr := p.spawnChild(spec, layout, token, mode, sessionID)
 		if serr != nil {
 			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
 		}
@@ -164,7 +177,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	}
 
 	client := newRPCClient(stdin, stdout)
-	h := newHandle(client, cmd, spec, newNonce())
+	h := newHandle(client, cmd, spec, token)
 	go h.run()
 
 	// Fail-closed handshake gate.
@@ -190,22 +203,26 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		})
 	}
 
-	// Pin the resolved model + reasoning effort, then bring up the turn.
-	if spec.Model != "" {
-		_ = client.WriteCommand(map[string]any{"command": "set_model", "model": "donmai/" + spec.Model})
-	}
-	if lvl := thinkingLevelForEffort(spec.Effort); lvl != "" {
-		_ = client.WriteCommand(map[string]any{"command": "set_thinking_level", "level": lvl})
-	}
+	// Resolve the session id (agent_start carries none in the real protocol),
+	// then bring up the turn. The model + reasoning effort are pinned on the
+	// CLI at startup (rpcArgs: --provider donmai --model <id>[:<thinking>]), NOT
+	// via a runtime set_model command — set_model and prompt race (verified
+	// against the real binary: the prompt response can arrive before set_model
+	// applies), so a runtime pin could let the first turn run on the default
+	// model. The CLI pin is deterministic: get_state reports donmai/<id> before
+	// any prompt is processed.
+	_ = client.WriteCommand(map[string]any{"type": "get_state", "id": "donmai-get-state"})
 
 	switch mode {
 	case launchResume:
-		if err := client.WriteCommand(map[string]any{"command": "get_entries", "session": sessionID, "since": sessionID}); err != nil {
+		// get_entries operates on the session already loaded (via --session);
+		// `since` is the caller's last-seen ENTRY id cursor (no session param).
+		if err := client.WriteCommand(map[string]any{"type": "get_entries", "since": sessionID}); err != nil {
 			_ = h.Stop(context.Background())
 			return nil, fmt.Errorf("%w: pi resume get_entries: %v", agent.ErrSpawnFailed, err)
 		}
 	default:
-		if err := client.WriteCommand(map[string]any{"command": "prompt", "text": spec.Prompt}); err != nil {
+		if err := client.WriteCommand(map[string]any{"type": "prompt", "message": spec.Prompt}); err != nil {
 			_ = h.Stop(context.Background())
 			return nil, fmt.Errorf("%w: pi prompt: %v", agent.ErrSpawnFailed, err)
 		}
@@ -217,13 +234,15 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	return h, nil
 }
 
-// spawnChild execs `pi --mode rpc` with cmd.Dir = spec.Cwd, an
-// allowlist-composed env, and its own process group.
-func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
-	// nolint:gosec // G204: binary resolved from Options/env, args are constant.
-	cmd := exec.Command(p.binary, rpcArgs()...)
+// spawnChild execs `pi --mode rpc …` with cmd.Dir = spec.Cwd, an allowlist-
+// composed env (incl. the per-session handshake token + provider-pin vars), and
+// its own process group.
+func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, token string, mode launchMode, sessionID string) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
+	// nolint:gosec // G204: binary resolved from Options/env; args are a fixed
+	// set plus paths/ids/model this package controls.
+	cmd := exec.Command(p.binary, rpcArgs(layout, mode, sessionID, spec)...)
 	cmd.Dir = spec.Cwd
-	cmd.Env = composeChildEnv(spec, layout)
+	cmd.Env = composeChildEnv(spec, layout, token)
 	configureProcessGroup(cmd)
 
 	stdin, err := cmd.StdinPipe()
