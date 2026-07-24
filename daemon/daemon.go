@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/gateway"
+	"github.com/RenseiAI/donmai/gateway/costfeed"
 	internaldaemon "github.com/RenseiAI/donmai/internal/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
 )
@@ -72,6 +74,14 @@ type Options struct {
 	// behaviour for a daemon that has not yet wired its runtime registry.
 	// Wave 9 / ADR-2026-05-07-daemon-http-control-api.md §D4.
 	ProviderRegistry ProviderRegistry
+
+	// EnableGateway starts the translating-gateway loopback host (the
+	// ModelEndpoint host kind "gateway", ADR-2026-07-24 / 08) alongside the
+	// daemon. Off by default: the gateway is experimental at M1 and is only
+	// reached once a resolver routes a gateway cell to it, so a pure-OSS daemon
+	// that never sets this is byte-identical to today. When off,
+	// GET /api/daemon/gateway reports enabled:false.
+	EnableGateway bool
 
 	// Version overrides the package-level `Version` for status reporting.
 	// Empty falls back to the package var (which itself defaults to "dev"
@@ -245,6 +255,12 @@ type Daemon struct {
 	heartbeat *HeartbeatService
 	poller    *PollService
 	spawner   *WorkerSpawner
+
+	// gateway is the translating-gateway loopback host, started in Start when
+	// Options.EnableGateway is set and torn down in Stop. Nil when disabled.
+	// gatewayLedger is the cost-ledger path reported by /api/daemon/gateway.
+	gateway       *gateway.Gateway
+	gatewayLedger string
 
 	// tokenRefresher proactively re-mints the runtime JWT before expiry
 	// so the reactive 401 paths in heartbeat/poll stay quiet backstops.
@@ -924,12 +940,63 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 	}
 
+	// Translating-gateway loopback host (opt-in; ADR-2026-07-24 / 08). Started
+	// after registration and the yaml watcher so a gateway failure never blocks
+	// the daemon coming online — it is a best-effort side service at M1.
+	if d.opts.EnableGateway {
+		d.startGateway(ctx)
+	}
+
 	d.lifecycleMu.Lock()
 	if d.ownsLifecycleLocked(lease) && d.stopGen == nil {
 		d.setState(StateRunning)
 	}
 	d.lifecycleMu.Unlock()
 	return nil
+}
+
+// startGateway constructs and starts the translating-gateway loopback host with
+// a local JSONL cost ledger under the brand state dir. Best-effort: a ledger or
+// listener failure logs a warning and leaves the gateway disabled rather than
+// failing daemon startup.
+func (d *Daemon) startGateway(ctx context.Context) {
+	ledgerPath := statepath.Resolve("gateway/cost-events.jsonl", "")
+	var sink costfeed.Sink
+	if ledgerPath != "" {
+		if l, err := costfeed.NewJSONLLedger(ledgerPath); err != nil {
+			slog.Warn("daemon: gateway cost ledger unavailable; using in-memory sink", "err", err.Error())
+			sink = &costfeed.MemorySink{}
+		} else {
+			sink = l
+		}
+	} else {
+		sink = &costfeed.MemorySink{}
+	}
+
+	g := gateway.New(gateway.Options{Sink: sink})
+	if err := g.Start(ctx); err != nil {
+		slog.Warn("daemon: translating gateway failed to start", "err", err.Error())
+		return
+	}
+	d.mu.Lock()
+	d.gateway = g
+	d.gatewayLedger = ledgerPath
+	d.mu.Unlock()
+	slog.Info("daemon: translating gateway started", "addr", g.Addr())
+}
+
+// GatewayStatus returns the current gateway status for the
+// /api/daemon/gateway surface. When the gateway is disabled it reports
+// enabled:false with the OSS-supported surface list.
+func (d *Daemon) GatewayStatus() gateway.Status {
+	d.mu.RLock()
+	g := d.gateway
+	ledger := d.gatewayLedger
+	d.mu.RUnlock()
+	if g == nil {
+		return gateway.Status{Enabled: false, Surfaces: gateway.SupportedSurfaces()}
+	}
+	return g.Status(ledger)
 }
 
 // onYamlChanged is the fsnotify callback wired in Start(). Called whenever
@@ -1081,6 +1148,16 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	d.lifecycleMu.Unlock()
 	if watcherStop != nil {
 		watcherStop()
+	}
+
+	// Tear the translating gateway down (releases its loopback listener and
+	// every session route). Best-effort, bounded by ctx.
+	d.mu.Lock()
+	gw := d.gateway
+	d.gateway = nil
+	d.mu.Unlock()
+	if gw != nil {
+		_ = gw.Stop(ctx)
 	}
 
 	d.lifecycleMu.Lock()

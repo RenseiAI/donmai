@@ -37,6 +37,14 @@ const (
 	HostAzure    ServingHost = "azure"
 	HostLocal    ServingHost = "local"     // ollama / on-box
 	HostOAuthCLI ServingHost = "oauth-cli" // host login (agy / claude-sub / codex-sub) — BringsOwnAuth
+	// HostGateway is the translating-gateway serving host: a company's model
+	// served from the local loopback gateway, which presents an existing wire
+	// protocol and translates to the chosen upstream (ADR-2026-07-24). A cell
+	// on this host is cross-protocol-legal iff the harness drives the protocol
+	// the gateway PRESENTS for the company (the HostDesc's Protocol) — the D2
+	// intersection rule is unchanged; the gateway HostDesc simply declares a
+	// protocol the direct host would not.
+	HostGateway ServingHost = "gateway"
 )
 
 // AuthMode — the canonical 5-mode set (no api-key mode; byok=user key,

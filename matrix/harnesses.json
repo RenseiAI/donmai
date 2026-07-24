@@ -170,6 +170,7 @@
         ],
         "drivesHosts": [
           "direct",
+          "gateway",
           "local",
           "oauth-cli"
         ],
@@ -180,6 +181,7 @@
       ],
       "drivesHosts": [
         "direct",
+        "gateway",
         "local",
         "oauth-cli"
       ]

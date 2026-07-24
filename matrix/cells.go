@@ -239,6 +239,22 @@ var validCells = []HarnessEndpointCell{
 		Stability: "beta", Smoked: false,
 	},
 
+	// opencode × OpenAI on the gateway (openai-chat surface) — the first
+	// gateway cell (M1; ADR-2026-07-24 / 08 §9). opencode drives openai-chat and
+	// the OpenAI gateway HostDesc PRESENTS openai-chat, so the D2 intersection
+	// rule passes unchanged. Same-protocol in M1 (the gateway's cross-protocol
+	// value proves out in M2); experimental/untested until the donmai-smokes
+	// step19 gateway lane accrues green history (DEC-2/DEC-3). Not a legacy
+	// anchor — the opencode default stays the direct cell above.
+	{
+		Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyOpenAI, Host: agent.HostGateway,
+		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportCLIInjection,
+		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
+		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
+		StructuredVia: "json-schema", LegacyProviderID: nil,
+		Stability: "experimental", Smoked: false,
+	},
+
 	// opencode × Google on local (/v1 openai-chat) — THE NORTH-STAR CELL ----
 	{
 		Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyGoogle, Host: agent.HostLocal,

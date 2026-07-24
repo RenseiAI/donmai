@@ -220,6 +220,26 @@
       "smoked": false
     },
     {
+      "harness": "opencode",
+      "endpoint": "openai",
+      "host": "gateway",
+      "protocol": "openai-chat",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "json-schema",
+      "legacyProviderId": null,
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
       "harness": "pi",
       "endpoint": "anthropic",
       "host": "direct",

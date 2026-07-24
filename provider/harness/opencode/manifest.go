@@ -37,8 +37,12 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			ToolPermissionFormat:    "claude",
 			StreamingTransport:      "ndjson",
 			// ONLY openai-chat — NOT anthropic-messages (cross-protocol cell not-yet-valid).
-			Drives:      []agent.WireProtocol{agent.ProtoOpenAIChat},
-			DrivesHosts: []agent.ServingHost{agent.HostOAuthCLI, agent.HostLocal, agent.HostDirect},
+			Drives: []agent.WireProtocol{agent.ProtoOpenAIChat},
+			// HostGateway added (08 §2 / ADR-2026-07-24): opencode is the M1
+			// gateway consumer, reaching an OpenAI model through the loopback
+			// gateway's openai-chat surface. Same-protocol in M1; the gateway
+			// makes cross-protocol reach legal for other harnesses in M2.
+			DrivesHosts: []agent.ServingHost{agent.HostOAuthCLI, agent.HostLocal, agent.HostDirect, agent.HostGateway},
 			Transport:   agent.TransportCLIInjection,
 		},
 	}

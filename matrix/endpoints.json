@@ -258,6 +258,21 @@
             "AZURE_OPENAI_API_KEY",
             "AZURE_OPENAI_ENDPOINT"
           ]
+        },
+        {
+          "host": "gateway",
+          "protocol": "openai-chat",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "http://127.0.0.1:{port}/v1",
+          "envKeys": [
+            "DONMAI_GW_TOKEN"
+          ]
         }
       ],
       "models": [
