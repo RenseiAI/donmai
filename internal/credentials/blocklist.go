@@ -1,10 +1,17 @@
 // Package credentials owns the env-forwarding blocklist that prevents the
 // daemon's own auth surface from leaking into agent subprocesses.
 //
-// Single source of truth. The rensei-tui daemon hardcodes the same list in
-// daemon/credentials/socket.go; keep them in sync until the OSS boundary
-// allows for a shared import or generated codepath.
-// See REN-FOLLOWUP: blocklist-sync.
+// Single source of truth. AgentEnvBlocklist below is the canonical list;
+// cross-repo consumers vendor the generated, language-neutral rendering in
+// blocklist.json (produced by `make generate`, verified by
+// `make verify-generated`) instead of hand-copying names:
+//   - rensei-tui renders a Go baseline from the same var
+//     (scripts/gen-blocklist.go → daemon/credentials/generated_blocklist.go);
+//   - platform vendors blocklist.json and checks it in CI.
+//
+// The JSON digest uses the identical sha256-over-newline-terminated-names
+// normalization as rensei-tui, so all three repos tie to one hash. A drift
+// on any side fails that repo's freshness check loudly.
 //
 // This list is intentionally distinct from
 // runtime/env.AgentEnvBlocklist — that one blocks the host operator's
@@ -15,6 +22,8 @@
 // password) so that even if those values are present in process env or
 // .env.local they are never forwarded into a child agent.
 package credentials
+
+//go:generate go run ./gen
 
 import "strings"
 
