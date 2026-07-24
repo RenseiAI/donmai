@@ -35,7 +35,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true,  // steer / follow_up
 			SupportsSessionResume:    true,  // session file + cursor replay (get_entries since=<id>)
-			SupportsToolPlugins:      true,  // defineTool via the donmai extension
+			SupportsToolPlugins:      true,  // pi.registerTool via the donmai extension
 			AcceptsMcpServerSpec:     false, // pi has no MCP by design; Spec.MCPServers is capability-gated-ignored
 			AcceptsAllowedToolsList:  true,  // enforced by OUR policy extension, not by pi
 			EmitsSubagentEvents:      false,
