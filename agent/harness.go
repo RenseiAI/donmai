@@ -24,6 +24,13 @@ const (
 	HarnessAmp         HarnessName = "amp"
 	HarnessRaw         HarnessName = "raw" // in-box net/http loop (gemini-direct + ollama)
 	HarnessStub        HarnessName = "stub"
+	// HarnessPi is the pi harness (provider/harness/pi): a `pi --mode rpc`
+	// JSONL-over-stdio subprocess, one child per session. pi ships no
+	// permission system, so the trust boundary (built-in-tool overrides +
+	// Go-side adjudication + handshake-verified policy extension) is entirely
+	// donmai-owned — see provider/harness/pi/doc.go §5. R2/DEC-3; cells start
+	// experimental/untested until the donmai-smokes gate passes.
+	HarnessPi HarnessName = "pi"
 	// HarnessShell is the bare interactive-only PTY spawn mode
 	// (provider/harness/shell): it drives no model endpoint at all, so it
 	// anchors no matrix cell (matrix/cells.go) — it exists purely as an

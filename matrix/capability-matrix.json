@@ -185,6 +185,51 @@
       ]
     },
     {
+      "name": "pi",
+      "humanLabel": "pi",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": true,
+        "tools": true,
+        "mcp": false,
+        "allowedToolsList": true,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "interactivePty": false,
+        "drives": [
+          "anthropic-messages",
+          "gemini-generate",
+          "openai-chat",
+          "openai-responses"
+        ],
+        "drivesHosts": [
+          "bedrock",
+          "direct",
+          "local",
+          "vertex"
+        ],
+        "transport": "subprocess-jsonrpc"
+      },
+      "drives": [
+        "anthropic-messages",
+        "gemini-generate",
+        "openai-chat",
+        "openai-responses"
+      ],
+      "drivesHosts": [
+        "bedrock",
+        "direct",
+        "local",
+        "vertex"
+      ]
+    },
+    {
       "name": "raw",
       "humanLabel": "Gemini (direct)",
       "family": "agent-runtime",
@@ -808,6 +853,46 @@
       "smoked": false
     },
     {
+      "harness": "pi",
+      "endpoint": "anthropic",
+      "host": "direct",
+      "protocol": "anthropic-messages",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": "pi",
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
+      "harness": "pi",
+      "endpoint": "openai",
+      "host": "direct",
+      "protocol": "openai-chat",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": null,
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
       "harness": "raw",
       "endpoint": "google",
       "host": "direct",
@@ -945,6 +1030,14 @@
       }
     },
     {
+      "providerName": "pi",
+      "cell": {
+        "harness": "pi",
+        "endpoint": "anthropic",
+        "host": "direct"
+      }
+    },
+    {
       "providerName": "stub",
       "cell": {
         "harness": "stub",
@@ -964,6 +1057,12 @@
       "minVersion": "1.17.18",
       "pinnedVersion": "1.17.18",
       "verifiedAgainst": "1.17.18"
+    },
+    {
+      "harness": "pi",
+      "minVersion": "0.80.10",
+      "pinnedVersion": "0.80.10",
+      "verifiedAgainst": "0.80.10"
     }
   ]
 }

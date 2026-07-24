@@ -25,10 +25,11 @@ func TestLegacyAlias_EightProvidersResolveToTheirHarness(t *testing.T) {
 
 	reg := runner.NewRegistry()
 	providers := matrix.HarnessProvidersForParity()
-	// 8 legacy-aliased providers + the interactive-only shell harness
-	// (W4; no legacy alias by definition — it is not a back-compat name).
-	if len(providers) != 9 {
-		t.Fatalf("expected 9 harness providers, got %d", len(providers))
+	// 9 legacy-aliased providers (pi joined as the R2/DEC-3 addition) + the
+	// interactive-only shell harness (W4; no legacy alias by definition — it
+	// is not a back-compat name).
+	if len(providers) != 10 {
+		t.Fatalf("expected 10 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if err := reg.Register(p); err != nil {
@@ -36,7 +37,8 @@ func TestLegacyAlias_EightProvidersResolveToTheirHarness(t *testing.T) {
 		}
 	}
 
-	// The eight back-compat ProviderNames P2 must keep resolving.
+	// The back-compat ProviderNames that must keep resolving (the eight P2
+	// names + pi).
 	wantNames := []agent.ProviderName{
 		agent.ProviderClaude,
 		agent.ProviderCodex,
@@ -44,6 +46,7 @@ func TestLegacyAlias_EightProvidersResolveToTheirHarness(t *testing.T) {
 		agent.ProviderAGYCLI,
 		agent.ProviderOllama,
 		agent.ProviderOpenCode,
+		agent.ProviderPi,
 		agent.ProviderAmp,
 		agent.ProviderStub,
 	}
@@ -99,6 +102,7 @@ func TestLegacyAliasMap_ExactlyTheEightLegacyNames(t *testing.T) {
 		agent.ProviderAGYCLI:   {Harness: agent.HarnessAntigravity, Endpoint: agent.CompanyGoogle, Host: "oauth-cli"},
 		agent.ProviderOllama:   {Harness: agent.HarnessRaw, Endpoint: agent.CompanyLocal, Host: "local"},
 		agent.ProviderOpenCode: {Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyOpenAI, Host: "direct"},
+		agent.ProviderPi:       {Harness: agent.HarnessPi, Endpoint: agent.CompanyAnthropic, Host: "direct"},
 		agent.ProviderAmp:      {Harness: agent.HarnessAmp, Endpoint: agent.CompanyAnthropic, Host: "direct"},
 		agent.ProviderStub:     {Harness: agent.HarnessStub, Endpoint: agent.CompanyStub, Host: "local"},
 	}
@@ -147,9 +151,9 @@ func TestAssertLegacyAlias_NoMismatchForRealProviders(t *testing.T) {
 				name, got, cell.Harness)
 		}
 	}
-	// The back-compat guarantee itself must not shrink: exactly the
-	// eight P2 legacy names carry cells.
-	if legacyCells != 8 {
-		t.Errorf("legacy-aliased shipped providers = %d; want 8", legacyCells)
+	// The back-compat guarantee itself must not shrink: the eight P2 legacy
+	// names plus pi (R2/DEC-3) carry cells.
+	if legacyCells != 9 {
+		t.Errorf("legacy-aliased shipped providers = %d; want 9", legacyCells)
 	}
 }

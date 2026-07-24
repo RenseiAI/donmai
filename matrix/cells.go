@@ -19,6 +19,7 @@ package matrix
 import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/opencode"
+	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
 
 // SchemaVersion is the committed schema version of the generated artifacts.
@@ -248,6 +249,29 @@ var validCells = []HarnessEndpointCell{
 		Stability: "experimental", Smoked: false,
 	},
 
+	// pi × Anthropic (direct) — deliberately narrow (09 §3): pi's Drive
+	// surface is the broadest in the fleet, but only two direct cells are
+	// authored, both experimental/untested, until the donmai-smokes step20
+	// gate accrues green history (DEC-2/DEC-3). Anchors ProviderName "pi".
+	{
+		Harness: agent.HarnessPi, Endpoint: agent.CompanyAnthropic, Host: agent.HostDirect,
+		Protocol: agent.ProtoAnthropicMessages, Transport: agent.TransportSubprocessRPC,
+		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
+		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
+		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderPi),
+		Stability: "experimental", Smoked: false,
+	},
+
+	// pi × OpenAI (direct) --------------------------------------------------
+	{
+		Harness: agent.HarnessPi, Endpoint: agent.CompanyOpenAI, Host: agent.HostDirect,
+		Protocol: agent.ProtoOpenAIChat, Transport: agent.TransportSubprocessRPC,
+		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
+		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
+		StructuredVia: "spawn-collect", LegacyProviderID: nil,
+		Stability: "experimental", Smoked: false,
+	},
+
 	// amp × Anthropic (direct, metered — cost-honest, key-needing) ----------
 	{
 		Harness: agent.HarnessAmp, Endpoint: agent.CompanyAnthropic, Host: agent.HostDirect,
@@ -314,6 +338,16 @@ var harnessBinaryPins = map[agent.HarnessName]HarnessBinaryPin{
 		MinVersion:      opencode.MinVersion,
 		PinnedVersion:   opencode.PinnedVersion,
 		VerifiedAgainst: opencode.VerifiedAgainst,
+	},
+	// pi ships multiple releases/day; the pin is enforced probe-time in
+	// provider/harness/pi/probe.go. VerifiedAgainst == MinVersion encodes that
+	// no pi version has been verified locally yet (pi was not installed on the
+	// authoring host) — every probed binary is labeled unverified until the
+	// donmai-smokes step20 lane exercises the pinned binary (09 §8).
+	agent.HarnessPi: {
+		MinVersion:      pi.MinVersion,
+		PinnedVersion:   pi.PinnedVersion,
+		VerifiedAgainst: pi.VerifiedAgainst,
 	},
 }
 

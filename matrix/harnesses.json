@@ -185,6 +185,51 @@
       ]
     },
     {
+      "name": "pi",
+      "humanLabel": "pi",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": true,
+        "tools": true,
+        "mcp": false,
+        "allowedToolsList": true,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": false,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "interactivePty": false,
+        "drives": [
+          "anthropic-messages",
+          "gemini-generate",
+          "openai-chat",
+          "openai-responses"
+        ],
+        "drivesHosts": [
+          "bedrock",
+          "direct",
+          "local",
+          "vertex"
+        ],
+        "transport": "subprocess-jsonrpc"
+      },
+      "drives": [
+        "anthropic-messages",
+        "gemini-generate",
+        "openai-chat",
+        "openai-responses"
+      ],
+      "drivesHosts": [
+        "bedrock",
+        "direct",
+        "local",
+        "vertex"
+      ]
+    },
+    {
       "name": "raw",
       "humanLabel": "Gemini (direct)",
       "family": "agent-runtime",
