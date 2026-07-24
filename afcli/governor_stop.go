@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RenseiAI/donmai/afcli/internal/cli"
 	"github.com/RenseiAI/donmai/internal/process"
 	"github.com/spf13/cobra"
 )
@@ -30,13 +31,13 @@ func newGovernorStopCmd(bin string) *cobra.Command {
 			pid, err := pf.Read()
 			switch {
 			case errors.Is(err, process.ErrNotRunning):
-				return userError(
+				return cli.UserError(
 					"governor is not running",
 					"start it with `"+bin+" governor start`",
 				)
 			case errors.Is(err, process.ErrStalePID):
 				_ = pf.Remove()
-				return userError(
+				return cli.UserError(
 					"governor is not running (stale pid file removed)",
 					"start it with `"+bin+" governor start`",
 				)
@@ -54,7 +55,7 @@ func newGovernorStopCmd(bin string) *cobra.Command {
 			// not probe (Windows) still need the stale check.
 			if err := proc.Signal(syscall.Signal(0)); err != nil {
 				_ = pf.Remove()
-				return userError(
+				return cli.UserError(
 					"governor is not running (stale pid file removed)",
 					"start it with `"+bin+" governor start`",
 				)

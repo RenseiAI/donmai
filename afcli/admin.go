@@ -29,6 +29,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/donmai/afcli/internal/cli"
 	adminqueue "github.com/RenseiAI/donmai/afclient/queue"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
@@ -133,7 +134,7 @@ func newAdminQueueListCmd() *cobra.Command {
 				return fmt.Errorf("list workers: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"items":    items,
 				"sessions": sessions,
 				"workers":  workers,
@@ -158,7 +159,7 @@ func newAdminQueuePeekCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("peek: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), item)
+			return cli.WriteJSON(cmd.OutOrStdout(), item)
 		},
 	}
 }
@@ -190,7 +191,7 @@ func newAdminQueueRequeueCmd() *cobra.Command {
 				return fmt.Errorf("requeue: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"requeued": n,
 				"selector": partialID,
 			})
@@ -227,7 +228,7 @@ func newAdminQueueDropCmd() *cobra.Command {
 				return fmt.Errorf("drop: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"dropped":  n,
 				"selector": partialID,
 			})
@@ -265,7 +266,7 @@ unblock sessions that were claimed but never completed.`,
 				return fmt.Errorf("clear claims: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"cleared": n,
 				"type":    "claims",
 			})
@@ -303,7 +304,7 @@ Sessions remain; only the pending work is removed.`,
 				return fmt.Errorf("clear queue: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"cleared": n,
 				"type":    "queue",
 			})
@@ -347,7 +348,7 @@ This is a nuclear reset — use in dev/test environments only.`,
 				return fmt.Errorf("clear all: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), result)
+			return cli.WriteJSON(cmd.OutOrStdout(), result)
 		},
 	}
 	cmd.Flags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
@@ -386,7 +387,7 @@ re-processed once a worker picks them up again.`,
 				return fmt.Errorf("reset work state: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), result)
+			return cli.WriteJSON(cmd.OutOrStdout(), result)
 		},
 	}
 	cmd.Flags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
@@ -435,7 +436,7 @@ func newAdminMergeQueueListCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("list merge-queue: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), snap)
+			return cli.WriteJSON(cmd.OutOrStdout(), snap)
 		},
 	}
 	cmd.Flags().StringVar(&repoID, "repo", "default", "Repository ID (e.g. my-org/my-repo)")
@@ -477,7 +478,7 @@ func newAdminMergeQueueDequeueCmd() *cobra.Command {
 				return fmt.Errorf("dequeue: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"dequeued": true,
 				"prNumber": prNum,
 				"repoId":   repoID,
@@ -524,7 +525,7 @@ func newAdminMergeQueueForceMergeCmd() *cobra.Command {
 				return fmt.Errorf("force-merge: %w", err)
 			}
 
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"retried":  true,
 				"prNumber": prNum,
 				"repoId":   repoID,
@@ -566,7 +567,7 @@ Outputs a JSON summary with:
 			if err != nil {
 				return fmt.Errorf("merge-queue status: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), status)
+			return cli.WriteJSON(cmd.OutOrStdout(), status)
 		},
 	}
 	cmd.Flags().StringVar(&repoID, "repo", "default", "Repository ID (e.g. my-org/my-repo)")
@@ -598,7 +599,7 @@ to stop processing new PRs. Existing in-flight work continues.`,
 			if err := client.PauseMergeQueue(cmd.Context(), repoID); err != nil {
 				return fmt.Errorf("pause merge queue: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"paused": true,
 				"repoId": repoID,
 			})
@@ -633,7 +634,7 @@ to resume processing PRs.`,
 			if err := client.ResumeMergeQueue(cmd.Context(), repoID); err != nil {
 				return fmt.Errorf("resume merge queue: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"paused": false,
 				"repoId": repoID,
 			})
@@ -677,7 +678,7 @@ Updates both the sorted-set score and the stored entry.`,
 			if err := client.SetMergeQueuePriority(cmd.Context(), repoID, prNum, priority); err != nil {
 				return fmt.Errorf("set priority: %w", err)
 			}
-			return writeJSON(cmd.OutOrStdout(), map[string]any{
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
 				"prNumber": prNum,
 				"priority": priority,
 				"repoId":   repoID,
@@ -799,7 +800,7 @@ Branch cleanup:
 				result.Branches = br
 			}
 
-			return writeJSON(cmd.OutOrStdout(), result)
+			return cli.WriteJSON(cmd.OutOrStdout(), result)
 		},
 	}
 

@@ -1,4 +1,4 @@
-package afcli
+package linearcmd
 
 // Tests for the `af linear` subcommand tree.
 //
@@ -66,7 +66,7 @@ func runLinearCmd(t *testing.T, _ string, args ...string) (string, error) {
 	// Build a fresh linear command tree. The DataSource factory is nil for
 	// these tests — they exercise the env-var path (setTestBaseURL +
 	// LINEAR_API_KEY) which short-circuits before the DataSource branch.
-	root := newLinearCmd(nil, Config{})
+	root := New(nil, "donmai")
 	root.SilenceErrors = true
 
 	// Capture stdout.
@@ -203,7 +203,8 @@ func TestLinearCreateIssue(t *testing.T) {
 
 	setupLinearTest(t, handler.ServeHTTP)
 
-	out, err := runLinearCmd(t, "", "create-issue",
+	out, err := runLinearCmd(
+		t, "", "create-issue",
 		"--title", "New Issue",
 		"--team", "Engineering",
 	)
@@ -287,7 +288,8 @@ func TestLinearCreateIssueDescriptionFile(t *testing.T) {
 
 	setupLinearTest(t, handler.ServeHTTP)
 
-	out, err := runLinearCmd(t, "", "create-issue",
+	out, err := runLinearCmd(
+		t, "", "create-issue",
 		"--title", "File Desc Issue",
 		"--team", "Engineering",
 		"--description-file", tmpFile.Name(),
@@ -819,7 +821,8 @@ func TestLinearListBacklogIssues_FlagsAndOutput(t *testing.T) {
 		}
 	})
 
-	out, err := runLinearCmd(t, "", "list-backlog-issues",
+	out, err := runLinearCmd(
+		t, "", "list-backlog-issues",
 		"--project", "TestProject",
 		"--team", teamUUID,
 		"--statuses", "Icebox,Backlog",
@@ -940,7 +943,7 @@ func TestLinearProxyModeViaDataSource(t *testing.T) {
 		return afclient.NewAuthenticatedClient(srv.URL, "rsk_test_token")
 	}
 
-	root := newLinearCmd(ds, Config{})
+	root := New(ds, "donmai")
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -982,7 +985,7 @@ func TestLinearWorkerAuthTokenProxyMode(t *testing.T) {
 	t.Setenv("WORKER_AUTH_TOKEN", jwt)
 	t.Setenv("DONMAI_API_URL", srv.URL)
 
-	root := newLinearCmd(nil, Config{})
+	root := New(nil, "donmai")
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -1043,7 +1046,7 @@ func TestLinearEnvWinsOverDataSource(t *testing.T) {
 		return afclient.NewAuthenticatedClient("https://platform.example.com", "rsk_should_not_be_used")
 	}
 
-	root := newLinearCmd(ds, Config{})
+	root := New(ds, "donmai")
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
@@ -1070,7 +1073,7 @@ func TestLinearNoAPIKey(t *testing.T) {
 
 	// Pass a nil DataSource factory — exercises path 3 (no env, no
 	// authenticated DataSource → friendly error).
-	root := newLinearCmd(nil, Config{})
+	root := New(nil, "donmai")
 	root.SilenceErrors = true
 	var buf bytes.Buffer
 	root.SetOut(&buf)
