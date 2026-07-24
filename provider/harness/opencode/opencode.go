@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,6 +100,17 @@ type Options struct {
 	// enforcement in CLI mode entirely (no probe call at all). Tests use
 	// this when the goal is unrelated to version enforcement.
 	SkipVersionCheck bool
+
+	// PreferServer forces Lane B (opencode serve + REST/SSE) even for
+	// sessions that would otherwise take the one-shot CLI lane. Exposed for
+	// tests and operators (07 §2). When the binary is absent and only an
+	// endpoint is reachable, Lane B (attach) is used regardless of this flag.
+	PreferServer bool
+
+	// ServerClientFactory overrides how the Lane-B serverClient is built for
+	// a resolved endpoint. Defaults to newClientV1. Tests inject a stub to
+	// exercise the handle against an httptest server without a real child.
+	ServerClientFactory func(endpoint, apiKey string) serverClient
 }
 
 // Provider is the agent.Provider implementation for OpenCode.
@@ -123,6 +135,42 @@ type Provider struct {
 	// construction outright (see checkVersionPin in probe.go). Surfaced
 	// once per session as a SystemEvent from spawnCLI.
 	versionUnverified bool
+
+	// preferServer forces Lane B (from Options.PreferServer).
+	preferServer bool
+
+	// clientFactory builds a Lane-B serverClient for a resolved endpoint.
+	clientFactory func(endpoint, apiKey string) serverClient
+
+	// children tracks live serve children so Shutdown can sweep any that
+	// outlived their handle (07 §9). Guarded by mu.
+	mu       sync.Mutex
+	children map[*serveChild]struct{}
+}
+
+// registerChild records a live serve child for Shutdown sweeping.
+func (p *Provider) registerChild(c *serveChild) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.children == nil {
+		p.children = make(map[*serveChild]struct{})
+	}
+	p.children[c] = struct{}{}
+}
+
+// unregisterChild drops a serve child once its handle has torn it down.
+func (p *Provider) unregisterChild(c *serveChild) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.children, c)
+}
+
+// newServerClient builds a Lane-B serverClient, honoring an injected factory.
+func (p *Provider) newServerClient(endpoint, apiKey string) serverClient {
+	if p.clientFactory != nil {
+		return p.clientFactory(endpoint, apiKey)
+	}
+	return newClientV1(endpoint, apiKey, nil)
 }
 
 // New constructs a Provider.
@@ -173,7 +221,13 @@ func New(opts Options) (*Provider, error) {
 				return nil, err
 			}
 		}
-		return &Provider{binary: resolved, apiKey: apiKey, versionUnverified: unverified}, nil
+		return &Provider{
+			binary:            resolved,
+			apiKey:            apiKey,
+			versionUnverified: unverified,
+			preferServer:      opts.PreferServer,
+			clientFactory:     opts.ServerClientFactory,
+		}, nil
 	}
 
 	// Fall back to HTTP-server mode.
@@ -199,7 +253,12 @@ func New(opts Options) (*Provider, error) {
 		}
 	}
 
-	return &Provider{endpoint: endpoint, apiKey: apiKey}, nil
+	return &Provider{
+		endpoint:      endpoint,
+		apiKey:        apiKey,
+		preferServer:  opts.PreferServer,
+		clientFactory: opts.ServerClientFactory,
+	}, nil
 }
 
 // probeLive issues a GET against the server's root and accepts any
@@ -233,45 +292,43 @@ func (*Provider) Name() agent.ProviderName { return agent.ProviderOpenCode }
 // CLI runner.
 func (*Provider) Capabilities() agent.Capabilities {
 	return agent.Capabilities{
-		SupportsMessageInjection:            false, // future: opencode run --session <id> --continue
-		SupportsSessionResume:               false, // future: same mechanism
-		SupportsToolPlugins:                 false, // opencode manages its own tools
+		SupportsMessageInjection:            true,  // Lane B: Prompt on a live session (07 §7)
+		SupportsSessionResume:               true,  // Lane B: create-with-session / Resume (07 §7, §9)
+		SupportsToolPlugins:                 false, // opencode plugins are not donmai tool plugins
 		NeedsBaseInstructions:               false,
 		NeedsPermissionConfig:               false,
 		SupportsCodeIntelligenceEnforcement: false,
 		EmitsSubagentEvents:                 false,
 		SupportsReasoningEffort:             true, // --variant flag maps to effort levels
 		ToolPermissionFormat:                "claude",
-		AcceptsAllowedToolsList:             false,
-		AcceptsMcpServerSpec:                false, // opencode uses its own plugin system
+		AcceptsAllowedToolsList:             true,  // Lane B: projected into opencode.json permission map (07 §5.2)
+		AcceptsMcpServerSpec:                false, // §5.3 MCP injection is implemented (config.go) but the cap waits on the AcceptsMcpServerSpec→SupportsToolPlugins invariant (manifest.go)
 		HumanLabel:                          "OpenCode",
 	}
 }
 
-// Spawn starts a new OpenCode session.
+// Spawn starts a new OpenCode session, selecting a lane (07 §2):
 //
-// In CLI mode (opencode binary on PATH):
+//   - Lane A — one-shot CLI (`opencode run --format json`): the default for a
+//     simple fire-and-forget spawn. cwd via cmd.Dir, prompt on stdin, NDJSON
+//     events mapped by mapOpenCodeLine.
+//   - Lane B — serve/HTTP (`opencode serve` + REST/SSE): chosen when the
+//     session needs injection / resume / permission mediation / MCP wiring, or
+//     when the operator forces it (Options.PreferServer), or when no binary is
+//     present and only an endpoint is reachable (attach mode).
 //
-//	opencode run --format json [--auto]
-//	             [--model <id>]
-//	             [--variant <effort>]
+// Endpoint routing (07 §9) is applied to both lanes first: a resolved
+// Spec.Endpoint whose company/host this harness cannot drive fails loudly.
 //
-// The working directory is set via cmd.Dir (from Spec.Cwd), not a flag.
-// The prompt is delivered via stdin. OpenCode's --format json mode
-// streams NDJSON events that are translated to agent.Event values by
-// mapOpenCodeLine.
-//
-// In HTTP-server mode: returns ErrSpawnFailed (not yet wired).
-//
-// On any pre-spawn failure (exec start) the provider returns an error
-// wrapping agent.ErrSpawnFailed.
+// On any pre-spawn failure the provider returns an error wrapping
+// agent.ErrSpawnFailed.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
-	if p.binary == "" {
-		return nil, fmt.Errorf(
-			"%w: opencode HTTP-server runner not yet implemented — "+
-				"install the opencode CLI binary (`npm i -g opencode-ai`) for CLI mode",
-			agent.ErrSpawnFailed,
-		)
+	spec, err := applyEndpoint(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	if p.useServerLane(spec) {
+		return p.spawnServer(ctx, spec, "")
 	}
 	h, err := p.spawnCLI(ctx, spec)
 	if err != nil {
@@ -281,6 +338,36 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return nil, err
 	}
 	return h, nil
+}
+
+// useServerLane decides Lane B vs Lane A.
+//
+// DRIFT NOTE (code wins over design §2): 07 §2 lists a bare "!Spec.Autonomous"
+// as a Lane-B trigger. Routing every non-autonomous spawn to Lane B would send
+// simple one-shot specs (Autonomous defaults to false) to the server lane and
+// change long-standing Lane-A one-shot behavior. Instead Lane B triggers on a
+// POSITIVE need signal — an explicit PreferServer, an MCP whitelist, a
+// non-allow permission default (live mediation), or attach-mode (no binary).
+// A runner that intends to Inject/Resume requests the server lane via
+// PreferServer (or by supplying MCP/permission config); the caps advertise the
+// support, this picks the lane that backs it.
+func (p *Provider) useServerLane(spec agent.Spec) bool {
+	if p.binary == "" {
+		return true // attach mode: only Lane B can serve
+	}
+	if p.preferServer {
+		return true
+	}
+	if len(spec.MCPServers) > 0 {
+		return true
+	}
+	if pc := spec.PermissionConfig; pc != nil {
+		d := strings.ToLower(pc.DefaultDecision)
+		if d != "" && d != "allow" {
+			return true // needs live permission round-trips
+		}
+	}
+	return false
 }
 
 // spawnCLI starts `opencode run --format json` as a subprocess and
@@ -409,13 +496,150 @@ func buildOpenCodeArgs(spec agent.Spec) []string {
 	return argv
 }
 
-// Resume always fails with agent.ErrUnsupported.
-func (*Provider) Resume(_ context.Context, _ string, _ agent.Spec) (agent.Handle, error) {
-	return nil, fmt.Errorf("provider/opencode: Resume: %w (SupportsSessionResume=false)", agent.ErrUnsupported)
+// spawnServer runs the Lane-B path: render + inject the per-session
+// opencode.json, bring up (or attach to) a serve endpoint, create-or-resume the
+// session, subscribe to events, admit the prompt, and return a live handle.
+// resumeSessionID is empty for a fresh spawn and set for Resume.
+func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessionID string) (agent.Handle, error) {
+	dir, err := configDir(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: opencode config dir: %v", agent.ErrSpawnFailed, err)
+	}
+	configPath, err := writeConfig(dir, spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+
+	child, endpoint, err := p.bringUpServer(ctx, spec, configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	client := p.newServerClient(endpoint, p.apiKey)
+
+	sessionID := resumeSessionID
+	if sessionID == "" {
+		sessionID, err = client.CreateSession(ctx, createSessionReq{
+			Model:    modelRef{ProviderID: OCProviderID, ID: resolvedModel(spec), Variant: string(spec.Effort)},
+			Location: locationRef{Directory: spec.Cwd},
+		})
+		if err != nil {
+			p.teardownChild(child)
+			return nil, fmt.Errorf("%w: create opencode session: %v", agent.ErrSpawnFailed, err)
+		}
+	}
+
+	logger := slog.With("provider", "opencode", "lane", "server", "session", sessionID)
+	h := newServerHandle(child, client, sessionID, spec, logger)
+	if child != nil {
+		c := child
+		h.onClose = func() { p.unregisterChild(c) }
+	}
+
+	// Subscribe to the event feed BEFORE admitting the prompt so no post-prompt
+	// frame is missed (the mapper synthesizes InitEvent from the first
+	// in-session frame regardless of ordering).
+	if err := h.start(ctx); err != nil {
+		p.teardownChild(child)
+		return nil, err
+	}
+
+	if p.versionUnverified {
+		h.emit(agent.SystemEvent{
+			Subtype: unverifiedVersionSubtype,
+			Message: fmt.Sprintf(
+				"opencode binary version could not be confirmed within the verified range (pinned %s, verified through %s) — proceeding unverified",
+				PinnedVersion, VerifiedAgainst,
+			),
+		})
+	}
+
+	if spec.Prompt != "" {
+		req := promptReq{Prompt: promptInput{Text: spec.Prompt}, Delivery: "steer", Resume: resumeSessionID != ""}
+		if err := client.Prompt(ctx, sessionID, req); err != nil {
+			stopCtx, cancel := context.WithTimeout(context.Background(), stopGracePeriod)
+			_ = h.Stop(stopCtx)
+			cancel()
+			return nil, fmt.Errorf("%w: admit opencode prompt: %v", agent.ErrSpawnFailed, err)
+		}
+	}
+	return h, nil
 }
 
-// Shutdown is a no-op. There are no long-lived resources.
-func (*Provider) Shutdown(_ context.Context) error { return nil }
+// bringUpServer either spawns a per-session serve child (CLI mode) or returns
+// the attached external endpoint (HTTP mode, the OPENCODE_ENDPOINT escape
+// hatch). In attach mode the injected config governs only children the
+// provider owns — an external server uses its own config.
+func (p *Provider) bringUpServer(ctx context.Context, spec agent.Spec, configPath string) (*serveChild, string, error) {
+	if p.binary == "" {
+		if p.endpoint == "" {
+			return nil, "", fmt.Errorf("%w: opencode has neither a binary nor an endpoint", agent.ErrSpawnFailed)
+		}
+		return nil, p.endpoint, nil
+	}
+	child, err := startServe(ctx, serveConfig{
+		binary:     p.binary,
+		cwd:        spec.Cwd,
+		configPath: configPath,
+		env:        spec.Env,
+		apiKey:     p.apiKey,
+		logger:     slog.Default(),
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	p.registerChild(child)
+	return child, child.endpoint, nil
+}
+
+func (p *Provider) teardownChild(child *serveChild) {
+	if child == nil {
+		return
+	}
+	child.stop()
+	p.unregisterChild(child)
+}
+
+// configDir returns the directory the session opencode.json is written to: a
+// worktree-local .donmai-opencode dir (removed by the runner's normal worktree
+// lifecycle, 07 §6) or a temp dir when the spec has no cwd (attach-mode tests).
+func configDir(spec agent.Spec) (string, error) {
+	if spec.Cwd != "" {
+		return filepath.Join(spec.Cwd, ".donmai-opencode"), nil
+	}
+	return os.MkdirTemp("", "donmai-opencode-")
+}
+
+// Resume reattaches to a persisted opencode session (Lane B). In attach mode it
+// reuses the running server that owns the session; in CLI mode a fresh serve
+// child reopens the on-disk session store. Was ErrUnsupported before Lane B.
+func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("provider/opencode: Resume: empty session id: %w", agent.ErrUnsupported)
+	}
+	spec, err := applyEndpoint(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	return p.spawnServer(ctx, spec, sessionID)
+}
+
+// Shutdown sweeps any serve children that outlived their handle (Lane B). Lane
+// A holds no long-lived resources, so this is a no-op when only CLI sessions
+// ran.
+func (p *Provider) Shutdown(_ context.Context) error {
+	p.mu.Lock()
+	children := make([]*serveChild, 0, len(p.children))
+	for c := range p.children {
+		children = append(children, c)
+	}
+	p.children = nil
+	p.mu.Unlock()
+	for _, c := range children {
+		c.stop()
+	}
+	return nil
+}
 
 // openCodeHandle is the agent.Handle implementation backed by an
 // `opencode run` subprocess.

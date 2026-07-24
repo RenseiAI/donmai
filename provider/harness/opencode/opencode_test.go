@@ -208,20 +208,24 @@ func TestProvider_Capabilities(t *testing.T) {
 	t.Parallel()
 	p := mustNew(t)
 	caps := p.Capabilities()
-	if caps.SupportsMessageInjection {
-		t.Error("SupportsMessageInjection: want false (inject not yet wired)")
+	// Lane B (07 §7) flips these four to true.
+	if !caps.SupportsMessageInjection {
+		t.Error("SupportsMessageInjection: want true (Lane B Inject)")
 	}
-	if caps.SupportsSessionResume {
-		t.Error("SupportsSessionResume: want false")
+	if !caps.SupportsSessionResume {
+		t.Error("SupportsSessionResume: want true (Lane B Resume)")
 	}
 	if caps.SupportsToolPlugins {
-		t.Error("SupportsToolPlugins: want false (opencode manages its own tools)")
+		t.Error("SupportsToolPlugins: want false (opencode plugins are not donmai tool plugins)")
 	}
-	if caps.AcceptsAllowedToolsList {
-		t.Error("AcceptsAllowedToolsList: want false")
+	if !caps.AcceptsAllowedToolsList {
+		t.Error("AcceptsAllowedToolsList: want true (Lane B opencode.json permission map)")
 	}
+	// AcceptsMcpServerSpec stays false: the §5.3 MCP config injection is
+	// implemented, but the cap advertisement waits on the cross-provider
+	// AcceptsMcpServerSpec→SupportsToolPlugins invariant (see manifest.go).
 	if caps.AcceptsMcpServerSpec {
-		t.Error("AcceptsMcpServerSpec: want false (opencode uses its own plugin system)")
+		t.Error("AcceptsMcpServerSpec: want false (cap deferred; see manifest.go drift note)")
 	}
 	// SupportsReasoningEffort: true — mapped to --variant.
 	if !caps.SupportsReasoningEffort {
@@ -234,15 +238,20 @@ func TestProvider_Capabilities(t *testing.T) {
 
 // ─── Spawn tests ─────────────────────────────────────────────────────────────
 
-// TestProvider_Spawn_HTTPMode_NotImplemented verifies that Spawn returns
-// ErrSpawnFailed in HTTP-server mode (not yet wired).
-func TestProvider_Spawn_HTTPMode_NotImplemented(t *testing.T) {
+// TestProvider_Spawn_HTTPMode_AttachUnreachable verifies that Spawn in
+// attach mode (binary empty, endpoint set) takes Lane B and fails with
+// ErrSpawnFailed when the attached server is unreachable (create-session
+// dial refused), rather than hanging.
+func TestProvider_Spawn_HTTPMode_AttachUnreachable(t *testing.T) {
 	t.Parallel()
-	// HTTP-server mode: binary is empty.
-	p := &Provider{endpoint: "http://localhost:7700", apiKey: ""}
-	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "anything"})
+	// Attach mode: binary is empty, endpoint points at a dead port.
+	p := &Provider{endpoint: "http://127.0.0.1:1", apiKey: ""}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{Prompt: "anything"})
 	if h != nil {
-		t.Fatal("Spawn: want nil handle for HTTP-server mode (not yet wired)")
+		_ = h.Stop(ctx)
+		t.Fatal("Spawn: want nil handle when attached server unreachable")
 	}
 	if !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Fatalf("Spawn err: want ErrSpawnFailed, got %v", err)
@@ -354,9 +363,13 @@ func TestProvider_Spawn_SuccessfulRun_ExactlyOneTerminal(t *testing.T) {
 	// Drain ALL events the reader emits. The fixture stream is finite and
 	// the subprocess exits after step_finish; the handle keeps the events
 	// channel open until Stop, so we read past the terminal ResultEvent
-	// with a short idle window to capture any spurious post-terminal event
-	// (rather than let Stop's channel close race it away).
-	events := drainWithIdle(ctx, h, 2*time.Second)
+	// with an idle window to capture any spurious post-terminal event
+	// (rather than let Stop's channel close race it away). The window is 5s
+	// (not 2s) so fork/exec + bufio.Scanner setup under -race + full-suite
+	// load cannot elapse the idle timer before the first line reaches the
+	// consumer — the W0-flagged flake this test shares with the claude
+	// conformance test (12-work-breakdown.md W0 item 2 completion note).
+	events := drainWithIdle(ctx, h, 5*time.Second)
 
 	if err := conformance.CheckTerminalContract(events); err != nil {
 		t.Errorf("terminal-event contract violated: %v\nevents: %s", err, kindsOf(events))
@@ -666,12 +679,42 @@ func TestBuildOpenCodeArgs_Effort_MapsToVariant(t *testing.T) {
 	}
 }
 
-func TestProvider_Resume_Unsupported(t *testing.T) {
+// TestProvider_Resume_EmptySessionUnsupported: Resume is real on Lane B (07 §9),
+// but an empty session id is still rejected with ErrUnsupported.
+func TestProvider_Resume_EmptySessionUnsupported(t *testing.T) {
 	t.Parallel()
 	p := mustNew(t)
-	_, err := p.Resume(context.Background(), "session", agent.Spec{})
+	_, err := p.Resume(context.Background(), "", agent.Spec{})
 	if !errors.Is(err, agent.ErrUnsupported) {
-		t.Fatalf("Resume err: want ErrUnsupported, got %v", err)
+		t.Fatalf("Resume(\"\") err: want ErrUnsupported, got %v", err)
+	}
+}
+
+// TestProvider_Resume_Wired: Resume brings up a Lane-B server and reattaches to
+// the given session id (no CreateSession call — the session already exists).
+func TestProvider_Resume_Wired(t *testing.T) {
+	t.Parallel()
+	fc := newFakeClient()
+	fc.sessionID = "ses_resumed"
+	p := &Provider{
+		endpoint:      "http://attached.invalid",
+		clientFactory: func(_, _ string) serverClient { return fc },
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	h, err := p.Resume(ctx, "ses_resumed", agent.Spec{Prompt: "continue", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	if h.SessionID() != "ses_resumed" {
+		t.Errorf("SessionID = %q, want ses_resumed", h.SessionID())
+	}
+	// Resume prompt carries Resume:true.
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.prompts) != 1 || !fc.prompts[0].Resume {
+		t.Errorf("resume prompts = %+v, want one with Resume=true", fc.prompts)
 	}
 }
 

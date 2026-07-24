@@ -123,8 +123,13 @@ func TestToolUseCapabilityMatrix(t *testing.T) {
 				}
 				return p
 			},
-			// Registration-only; no wire surface to honour.
-			want: want{supportsToolPlugins: false, acceptsAllowedToolsList: false, acceptsMcpServerSpec: false},
+			// Lane B (07 §5.2) projects Spec.AllowedTools into the injected
+			// opencode.json permission map → acceptsAllowedToolsList=true.
+			// acceptsMcpServerSpec stays false: opencode's MCP config injection
+			// is implemented but the cap advertisement is gated on the
+			// AcceptsMcpServerSpec→SupportsToolPlugins invariant below, and
+			// opencode's plugins are not donmai tool plugins (supportsToolPlugins=false).
+			want: want{supportsToolPlugins: false, acceptsAllowedToolsList: true, acceptsMcpServerSpec: false},
 		},
 	}
 
