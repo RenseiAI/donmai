@@ -44,6 +44,26 @@ func (*Endpoint) Manifest() agent.ModelEndpointManifest {
 				BaseURLTmpl:   "https://{resource}.openai.azure.com",
 				EnvKeys:       []string{"AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"},
 			},
+			// Gateway host (ADR-2026-07-24 / 08 §2). The translating gateway
+			// presents OpenAI models on an openai-chat surface served from the
+			// local loopback listener; the harness reaches them through a
+			// per-session bearer (DONMAI_GW_TOKEN) rather than a provider key —
+			// the actual upstream credential is the gateway's own pool
+			// credential, never injected into the harness. BaseURLTmpl documents
+			// the loopback shape; the concrete port is filled at Bind time
+			// (gateway.Gateway.Bind), which overrides this template. M1 wires the
+			// same-protocol opencode consumer; the cross-protocol anthropic-messages
+			// gateway HostDesc lands in M2.
+			{
+				Host:          agent.HostGateway,
+				Protocol:      agent.ProtoOpenAIChat,
+				AuthModes:     []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered},
+				BringsOwnAuth: false,
+				NeedsAPIKey:   true,
+				CostModel:     agent.CostMeteredPerToken,
+				BaseURLTmpl:   "http://127.0.0.1:{port}/v1",
+				EnvKeys:       []string{"DONMAI_GW_TOKEN"},
+			},
 		},
 		Models: []agent.ModelDesc{
 			{
