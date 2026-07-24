@@ -186,7 +186,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if agentBin == "" {
 		agentBin = "donmai"
 	}
-	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(), agentBin)
+	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(opencodeCtorHints(detail)), agentBin)
 	logger.Info("agent run: registry built", "providers", reg.Names())
 
 	wtParent := opts.worktree
@@ -570,13 +570,79 @@ func BuildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
 	return buildRegistryFromCtors(logger, agentRunProviderCtors(), "donmai")
 }
 
+// agentRunCtorHints carries per-session signals, derived from the fetched
+// SessionDetail's resolved profile, that alter how a hand-authored ctor
+// below constructs its provider Options. It is a struct (not a bare bool
+// parameter) so a future second signal doesn't force another positional-
+// argument change at every call site. The zero value reproduces the exact
+// historical, no-session-context construction every ctor used before this
+// existed.
+type agentRunCtorHints struct {
+	// PreferOpenCodeServer forces the opencode ctor onto Lane B (opencode
+	// serve + REST/SSE) for this session rather than the Lane-A one-shot
+	// CLI default. Derived by opencodeCtorHints from
+	// ResolvedProfile.ProviderConfig[opencodeCtorHintKey] — see there.
+	PreferOpenCodeServer bool
+}
+
+// opencodeCtorHintKey is the typed ResolvedProfile.ProviderConfig knob that
+// requests the opencode Lane-B (serve/HTTP) adapter for a session — e.g.
+// because it needs live permission mediation, MCP wiring, or resume/inject
+// support once those Spec-level triggers are wired (07 §2). It follows the
+// same opaque-ProviderConfig-typed-key pattern already used by
+// provider/harness/stub ("stub.behavior") and provider/harness/gemini
+// ("thinkingLevel"/"thinkingBudget"): namespaced by provider, round-trips
+// unmodified through daemon.SessionResolvedProfile.ProviderConfig's
+// map[string]any JSON wire shape.
+const opencodeCtorHintKey = "opencode.preferServer"
+
+// opencodeCtorHints derives agentRunCtorHints from a fetched SessionDetail.
+// A nil detail/ResolvedProfile, a missing key, or a non-bool value all
+// resolve to the zero value (Lane-A default, unchanged historical
+// behavior) — this is intentionally lenient rather than an error path: an
+// agent-run session must never fail preflight over an optional routing
+// hint.
+func opencodeCtorHints(d *daemon.SessionDetail) agentRunCtorHints {
+	var h agentRunCtorHints
+	if d == nil || d.ResolvedProfile == nil {
+		return h
+	}
+	if v, ok := d.ResolvedProfile.ProviderConfig[opencodeCtorHintKey]; ok {
+		if b, ok := v.(bool); ok {
+			h.PreferOpenCodeServer = b
+		}
+	}
+	return h
+}
+
+// opencodeCtorOptions builds the opencode provider's construction Options
+// from this call's agentRunCtorHints. Split out from the ctor closure in
+// agentRunProviderCtors so tests can assert the threaded PreferServer value
+// directly, without exercising provideropencode.New's real binary/version
+// probe (which is host-dependent).
+func opencodeCtorOptions(h agentRunCtorHints) provideropencode.Options {
+	return provideropencode.Options{PreferServer: h.PreferOpenCodeServer}
+}
+
 // agentRunProviderCtors returns the single hand-authored ctor list — the SoT
 // for the agent-run provider set. Pulled into its own function (returning a
 // fresh slice on each call) so [BuildAgentRunRegistry] and the no-behavior-
 // change parity test enumerate the SAME provider set without the test having
 // to re-declare it (which would itself become a fork). Order matches the
 // historical slice exactly; behaviour is unchanged.
-func agentRunProviderCtors() []providerCtor {
+//
+// hints is variadic and optional: [BuildAgentRunRegistry] and
+// [buildAgentRunRegistry] (the daemon-startup introspection registry, built
+// with no session context) call this with zero arguments, which yields the
+// zero-value agentRunCtorHints and therefore byte-for-byte the historical
+// per-provider Options{} construction. runAgentRun (the per-session `donmai
+// agent run` entry point) is the one call site that has a fetched
+// SessionDetail in hand and passes its derived hints.
+func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
+	var h agentRunCtorHints
+	if len(hints) > 0 {
+		h = hints[0]
+	}
 	return []providerCtor{
 		{name: "stub", new: func() (agent.Provider, error) { return providerstub.New() }},
 		{name: "claude", new: func() (agent.Provider, error) { return providerclaude.New(providerclaude.Options{}) }},
@@ -600,7 +666,15 @@ func agentRunProviderCtors() []providerCtor {
 		// own machine). Distinct from the API-direct "gemini" provider. Requires `agy` installed AND
 		// logged in on the host PATH. NOT for cloud sandboxes.
 		{name: "agy-cli", new: func() (agent.Provider, error) { return provideragycli.New(provideragycli.Options{}) }},
-		{name: "opencode", new: func() (agent.Provider, error) { return provideropencode.New(provideropencode.Options{}) }},
+		// opencode's PreferServer threads the resolved profile's Lane-B
+		// signal (opencodeCtorHints above) so a `donmai agent run` session
+		// can select the serve/HTTP adapter (07 §2 Lane B) instead of
+		// always defaulting to the Lane-A one-shot CLI. Every other call
+		// site (daemon-startup introspection, tests) gets h's zero value,
+		// i.e. PreferServer: false — unchanged historical behavior.
+		{name: "opencode", new: func() (agent.Provider, error) {
+			return provideropencode.New(opencodeCtorOptions(h))
+		}},
 		// shell is the interactive-only PTY harness (W4 interactive
 		// sessions): spawns ${SHELL:-/bin/sh} under ptyhost. Headless
 		// Spawn (Spec.Interactive == nil) fails loudly by design.
