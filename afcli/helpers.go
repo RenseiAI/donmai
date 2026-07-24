@@ -2,9 +2,7 @@ package afcli
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -18,15 +16,6 @@ func interruptContext() context.Context {
 	return ctx
 }
 
-// runGitCommand executes a git subcommand and returns its trimmed stdout.
-func runGitCommand(args ...string) (string, error) {
-	out, err := exec.Command("git", args...).Output() //nolint:gosec
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 // binaryName returns the configured binary name, defaulting to "donmai".
 // Prefer using this over hardcoding "donmai" in error strings so embedders
 // like rensei-tui get the correct binary name automatically.
@@ -35,15 +24,6 @@ func binaryName(cfg Config) string {
 		return cfg.BinaryName
 	}
 	return "donmai"
-}
-
-// userError returns an error with an optional remediation hint on a second line.
-// Use this for validation failures that should print a clean user-facing message.
-func userError(msg, hint string) error {
-	if hint != "" {
-		return fmt.Errorf("%s\n\nHint: %s", msg, hint)
-	}
-	return errors.New(msg)
 }
 
 // daemonDownErr returns a user-facing error for daemon connectivity failures.

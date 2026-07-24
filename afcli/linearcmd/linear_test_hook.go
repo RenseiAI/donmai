@@ -1,4 +1,4 @@
-package afcli
+package linearcmd
 
 // linearTestBaseURL, when non-empty, overrides the default Linear API base URL
 // used by newLinearClient(). Only used in tests — set via setTestBaseURL.

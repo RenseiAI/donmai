@@ -26,6 +26,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/donmai/afcli/internal/cli"
 	"github.com/RenseiAI/donmai/afclient/logsignatures"
 	"github.com/RenseiAI/donmai/internal/linear"
 )
@@ -233,7 +234,7 @@ func runLogsAnalyze(
 
 	// ── 7. Output ────────────────────────────────────────────────────────────
 	if jsonOutput {
-		return writeJSON(cmd.OutOrStdout(), result)
+		return cli.WriteJSON(cmd.OutOrStdout(), result)
 	}
 	printHumanResult(cmd.OutOrStdout(), result, dryRun)
 	return nil
@@ -392,7 +393,7 @@ func buildDescription(pm PatternMatch, pt logsignatures.PatternType, totalOccurr
 // postDrafts creates Linear issues for each draft.
 // Operates directly on the internal/linear package.
 func postDrafts(ctx context.Context, drafts []DraftedIssue, teamName, projectName string) error {
-	key := apiKey()
+	key := cli.APIKey()
 	if key == "" {
 		return fmt.Errorf(
 			"LINEAR_API_KEY environment variable is required for issue creation; use --dry-run to skip posting",
