@@ -185,9 +185,13 @@ func TestClientV1_Messages(t *testing.T) {
 func TestClientV1_Events_StreamsFrames(t *testing.T) {
 	t.Parallel()
 	f, c := newFakeServer(t)
+	// "data" is the real wire key (verified live against opencode 1.17.18) —
+	// see serverEvent's doc comment. This fixture previously (incorrectly)
+	// used "properties", which never appears on the wire and would decode
+	// Properties as empty on every real frame.
 	f.sseFrames = []string{
-		`{"id":"e1","type":"session.created","properties":{"sessionID":"ses1"}}`,
-		`{"id":"e2","type":"session.next.text.ended","properties":{"sessionID":"ses1","text":"hi"}}`,
+		`{"id":"e1","type":"session.created","data":{"sessionID":"ses1"}}`,
+		`{"id":"e2","type":"session.next.text.ended","data":{"sessionID":"ses1","text":"hi"}}`,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -208,6 +212,22 @@ func TestClientV1_Events_StreamsFrames(t *testing.T) {
 	}
 	if got[0].Type != "session.created" || got[1].Type != "session.next.text.ended" {
 		t.Errorf("frames = %q,%q; want session.created, text.ended", got[0].Type, got[1].Type)
+	}
+	// Properties must actually decode from the wire key ("data") — this is
+	// the assertion that would have failed before the fix: with the wrong
+	// json tag, Properties is always empty and eventSessionID always
+	// returns "".
+	if sid := eventSessionID(got[0]); sid != "ses1" {
+		t.Errorf("eventSessionID(session.created frame) = %q; want %q (Properties must decode from the real \"data\" wire key)", sid, "ses1")
+	}
+	var textProps struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(got[1].Properties, &textProps); err != nil {
+		t.Fatalf("decode got[1].Properties: %v", err)
+	}
+	if textProps.Text != "hi" {
+		t.Errorf("got[1].Properties text = %q; want \"hi\"", textProps.Text)
 	}
 }
 

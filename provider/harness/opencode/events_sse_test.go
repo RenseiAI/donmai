@@ -67,6 +67,72 @@ func TestSSEMapper_HappyPath_Conforms(t *testing.T) {
 	}
 }
 
+// TestServerEvent_RealWireShape_DecodesDataKey is a red-then-green regression
+// proof for the "data" vs "properties" wire-key bug: unlike evt() above
+// (which builds a serverEvent struct literal directly, bypassing JSON
+// unmarshal of the outer envelope entirely), these literals are full raw SSE
+// frame bodies exactly as captured from a live pinned opencode 1.17.18
+// `serve` process (donmai-smokes' Lane-B serve-lifecycle smoke,
+// runs/2026-07-21-open-harness-strategy/12-work-breakdown.md's W2a
+// follow-up). Before the fix (serverEvent.Properties tagged
+// json:"properties"), every one of these would decode Properties as empty
+// and eventSessionID would return "" — InitEvent never fires against a real
+// server. Decoding through json.Unmarshal end-to-end (not a hand-built
+// struct) is what makes this test exercise the actual wire-tag bug; skipping
+// straight to a struct literal (as the rest of this file's evt() helper
+// does, deliberately, for mapper-logic-only tests) would not have caught it.
+func TestServerEvent_RealWireShape_DecodesDataKey(t *testing.T) {
+	t.Parallel()
+
+	const sid = "ses_06afb8f09ffei3VXhyui01SINj"
+	raw := []byte(`{"id":"evt_f950470f8001I2VCDcfwZB1lcZ","type":"session.created","durable":{"aggregateID":"` + sid + `","seq":0,"version":1},"location":{"directory":"/tmp"},"data":{"sessionID":"` + sid + `","info":{"id":"` + sid + `","slug":"swift-nebula","projectID":"global"}}}`)
+
+	var ev serverEvent
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		t.Fatalf("unmarshal real session.created frame: %v", err)
+	}
+	if len(ev.Properties) == 0 {
+		t.Fatal("Properties is empty after unmarshaling a real frame — the wire-key tag regressed")
+	}
+	if got := eventSessionID(ev); got != sid {
+		t.Errorf("eventSessionID(real frame) = %q, want %q", got, sid)
+	}
+
+	m := newSSEMapper(sid)
+	out := m.Map(ev)
+	if len(out) != 1 {
+		t.Fatalf("Map(real session.created frame) produced %d events, want 1 (InitEvent)", len(out))
+	}
+	init, ok := out[0].(agent.InitEvent)
+	if !ok {
+		t.Fatalf("Map(real session.created frame)[0] = %#v, want agent.InitEvent", out[0])
+	}
+	if init.SessionID != sid {
+		t.Errorf("InitEvent.SessionID = %q, want %q", init.SessionID, sid)
+	}
+
+	// A real session.next.text.ended frame (same capture) must also decode
+	// its Text through the same "data" key.
+	rawText := []byte(`{"id":"evt_f9504753a999","type":"session.next.text.ended","location":{"directory":"/tmp"},"data":{"sessionID":"` + sid + `","text":"hello from a real frame"}}`)
+	var textEv serverEvent
+	if err := json.Unmarshal(rawText, &textEv); err != nil {
+		t.Fatalf("unmarshal real text.ended frame: %v", err)
+	}
+	textOut := m.Map(textEv)
+	var sawText bool
+	for _, e := range textOut {
+		if at, ok := e.(agent.AssistantTextEvent); ok {
+			sawText = true
+			if at.Text != "hello from a real frame" {
+				t.Errorf("AssistantTextEvent.Text = %q, want %q", at.Text, "hello from a real frame")
+			}
+		}
+	}
+	if !sawText {
+		t.Errorf("real text.ended frame did not produce an AssistantTextEvent; got %#v", textOut)
+	}
+}
+
 func TestSSEMapper_SessionFilter(t *testing.T) {
 	t.Parallel()
 	m := newSSEMapper("ses_mine")

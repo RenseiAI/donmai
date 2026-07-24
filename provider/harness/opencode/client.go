@@ -100,10 +100,26 @@ type permissionResponse struct {
 
 // serverEvent is one raw SSE frame from /api/event. Properties is decoded by
 // events_sse.go into the typed agent.Event vocabulary.
+//
+// BUG FIX (verified live against the real pinned opencode 1.17.18 server —
+// runs/2026-07-21-open-harness-strategy/12-work-breakdown.md's W2a serve-
+// lane-smoke follow-up): every real /api/event frame nests its payload under
+// the JSON key "data", e.g.
+// {"id":"evt_...","type":"session.created","data":{"sessionID":"...","info":{"id":"..."}}}
+// — NOT "properties". The field was previously tagged json:"properties",
+// a key that never appears on the wire, so Properties silently decoded as
+// empty JSON on every real frame: eventSessionID always returned "", the
+// synthetic InitEvent NEVER fired against a real server, and every other
+// event.Map() branch below decoded a zero-value payload. This was invisible
+// to the existing httptest-stub unit suite because every fixture (here and
+// in client_test.go) hand-authored frames using the same wrong "properties"
+// key, so the mismatch only surfaced against the real binary. The Go field
+// name stays Properties (the mapper's own vocabulary for "this frame's
+// payload") — only the wire tag changes.
 type serverEvent struct {
 	ID         string          `json:"id"`
 	Type       string          `json:"type"`
-	Properties json.RawMessage `json:"properties"`
+	Properties json.RawMessage `json:"data"`
 }
 
 // serverMessage is one durable session message (backfill). Kept intentionally
