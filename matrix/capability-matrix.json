@@ -170,6 +170,7 @@
         ],
         "drivesHosts": [
           "direct",
+          "gateway",
           "local",
           "oauth-cli"
         ],
@@ -180,6 +181,7 @@
       ],
       "drivesHosts": [
         "direct",
+        "gateway",
         "local",
         "oauth-cli"
       ]
@@ -583,6 +585,21 @@
             "AZURE_OPENAI_API_KEY",
             "AZURE_OPENAI_ENDPOINT"
           ]
+        },
+        {
+          "host": "gateway",
+          "protocol": "openai-chat",
+          "authModes": [
+            "byok",
+            "metered"
+          ],
+          "bringsOwnAuth": false,
+          "needsApiKey": true,
+          "costModel": "metered",
+          "baseUrlTmpl": "http://127.0.0.1:{port}/v1",
+          "envKeys": [
+            "DONMAI_GW_TOKEN"
+          ]
         }
       ],
       "models": [
@@ -850,6 +867,26 @@
       "structuredVia": "json-schema",
       "legacyProviderId": "opencode",
       "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "opencode",
+      "endpoint": "openai",
+      "host": "gateway",
+      "protocol": "openai-chat",
+      "transport": "cli-injection",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "json-schema",
+      "legacyProviderId": null,
+      "stability": "experimental",
       "smoked": false
     },
     {
