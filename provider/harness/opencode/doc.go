@@ -15,19 +15,42 @@
 //     SupportsOneShot dispatches and simple fleet legs; it has no
 //     session resume, message injection, or live permission round-trip.
 //
-//   - Lane B — serve/HTTP (not yet wired): when the binary is absent,
-//     New() falls back to probing an `opencode serve` HTTP server
-//     (default 127.0.0.1:4096, override with $OPENCODE_ENDPOINT). Spawn
-//     in this mode currently returns agent.ErrSpawnFailed with an
-//     actionable message. The REST + SSE client, per-session config
-//     injection, and permission mediation are follow-up work (design:
-//     runs/2026-07-21-open-harness-strategy/07-design-opencode-spawn.md).
+//   - Lane B — serve/HTTP (shipped): `opencode serve` + REST/SSE. One serve
+//     child per donmai session on an ephemeral loopback port the provider
+//     owns (server.go), or an attached external server via $OPENCODE_ENDPOINT
+//     when no binary is present. A per-session opencode.json is rendered and
+//     injected via $OPENCODE_CONFIG (config.go): a single custom
+//     OpenAI-compatible provider whose baseURL is the resolved endpoint, an
+//     enabled_providers + experimental.policies lockout so the worker can
+//     never fall back to an unresolved provider, the Spec's tool policy
+//     projected onto opencode's allow/ask/deny maps, and the Spec's MCP
+//     whitelist. The v2 /api/ REST surface and the SSE /api/event feed are
+//     spoken behind the serverClient interface (client.go) so an opencode API
+//     reshape is absorbed by one implementation swap; SSE frames map to
+//     agent.Events in events_sse.go; runtime "ask" verdicts are adjudicated by
+//     the provider's own permission pump (permission.go), never a human. Lane
+//     B backs SupportsMessageInjection (Inject → prompt POST), SupportsSessionResume
+//     (Resume → reattach), and AcceptsAllowedToolsList. The §5.3 MCP config
+//     injection is implemented, but AcceptsMcpServerSpec stays advertised false
+//     pending the cross-provider AcceptsMcpServerSpec→SupportsToolPlugins
+//     invariant (see manifest.go).
 //
-// Provider selection is by resolved profile; operators pointed at an
-// unwired lane see a deterministic agent.ErrSpawnFailed (not
-// agent.ErrNoProvider), keeping the daemon usable for the providers that
-// ARE wired (claude / codex / stub / gemini) — same UX as the amp
-// provider.
+// Lane selection is Spec-driven (07 §2): a fire-and-forget one-shot takes Lane
+// A; a session needing injection/resume/permission mediation/MCP wiring — or an
+// explicit Options.PreferServer, or attach-mode — takes Lane B.
+//
+// DRIFT (code wins over 07 §4/§4.2/§5): the pinned binary (opencode 1.17.18)
+// already ships the v2-style API — every route under /api/, session-scoped,
+// abort via /interrupt, an admission-model prompt lane, and a
+// session.next.* SSE event vocabulary. clientV1 + events_sse.go target THAT
+// surface (verified live against the binary's own OpenAPI at GET /doc), not
+// the older flat 1.x shapes the design named. Also: the v2 SessionRunner in
+// 1.17.18 does not resolve custom OpenAI-compatible providers into its model
+// catalog (v2 provider policy is "Proposed/unimplemented" upstream), so a
+// full real-model turn through the injected baseURL is not exercisable against
+// the pinned binary yet — the config-injection, serve-lifecycle, event-stream,
+// and permission wiring are verified in-repo against httptest stubs replaying
+// the real wire shapes.
 //
 // Auth model: opencode's local server is unauthenticated by default; the
 // optional OPENCODE_API_KEY env var is forwarded as a Bearer token on the
