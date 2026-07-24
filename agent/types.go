@@ -31,7 +31,12 @@ const (
 	ProviderAGYCLI   ProviderName = "agy-cli" // Antigravity `agy` CLI-wrap; OAuth/local/host-session, pty, no key.
 	ProviderOllama   ProviderName = "ollama"
 	ProviderOpenCode ProviderName = "opencode"
-	ProviderJules    ProviderName = "jules"
+	// ProviderPi is the legacy wire enum for the pi harness (HarnessPi).
+	// Required because the runner registry (runner/model_profile.go
+	// SelectProvider) and matrix.LegacyProviderID key on ProviderName, so the
+	// pi × anthropic × direct anchor cell needs a real ProviderName to alias.
+	ProviderPi    ProviderName = "pi"
+	ProviderJules ProviderName = "jules"
 	// ProviderShell is the bare interactive-only PTY harness
 	// (provider/harness/shell, W4). It drives no model endpoint and so is
 	// intentionally absent from the matrix's legacy-alias cell coverage

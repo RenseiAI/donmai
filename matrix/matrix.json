@@ -220,6 +220,46 @@
       "smoked": false
     },
     {
+      "harness": "pi",
+      "endpoint": "anthropic",
+      "host": "direct",
+      "protocol": "anthropic-messages",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": "pi",
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
+      "harness": "pi",
+      "endpoint": "openai",
+      "host": "direct",
+      "protocol": "openai-chat",
+      "transport": "subprocess-jsonrpc",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": false,
+      "structuredVia": "spawn-collect",
+      "legacyProviderId": null,
+      "stability": "experimental",
+      "smoked": false
+    },
+    {
       "harness": "raw",
       "endpoint": "google",
       "host": "direct",
@@ -357,6 +397,14 @@
       }
     },
     {
+      "providerName": "pi",
+      "cell": {
+        "harness": "pi",
+        "endpoint": "anthropic",
+        "host": "direct"
+      }
+    },
+    {
       "providerName": "stub",
       "cell": {
         "harness": "stub",
@@ -371,6 +419,12 @@
       "minVersion": "1.17.18",
       "pinnedVersion": "1.17.18",
       "verifiedAgainst": "1.17.18"
+    },
+    {
+      "harness": "pi",
+      "minVersion": "0.80.10",
+      "pinnedVersion": "0.80.10",
+      "verifiedAgainst": "0.80.10"
     }
   ]
 }

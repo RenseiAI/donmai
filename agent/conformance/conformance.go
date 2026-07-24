@@ -7,8 +7,8 @@
 // spurious spawn_no_result ErrorEvent after the terminal ResultEvent).
 // Provider test packages drain a Handle's Events channel into a
 // []agent.Event and pass it to CheckTerminalContract; each harness
-// (claude / codex / opencode / stub) can be wired to the same check as
-// the suite grows.
+// (claude / codex / opencode / pi / stub) can be wired to the same check
+// as the suite grows.
 //
 // The package deliberately imports only agent + the standard library so
 // it can be consumed from any provider's test package without a
