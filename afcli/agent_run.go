@@ -276,6 +276,20 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 	qw := detailToQueuedWork(detail)
 
+	// 5b. Worker-local gateway binding (08 §5/§9 M1). When the resolved cell is
+	// served by the translating-gateway host, start the gateway in THIS process,
+	// bind this session, and stamp the resulting EndpointBinding onto the
+	// resolved profile so the harness drives the loopback surface with a
+	// per-session bearer while the upstream credential stays here. A no-op for
+	// every non-gateway cell; a hard preflight failure when the cell IS
+	// gateway-served but the worker cannot honor it (never a silent fallback to
+	// some other endpoint — see afcli/gateway_bind.go).
+	gwSession, err := bindWorkerGateway(runCtx, logger, detail, &qw)
+	if err != nil {
+		return preflightErr(fmt.Sprintf("gateway binding: %v", err))
+	}
+	defer gwSession.Close(logger)
+
 	// Flip the session to 'running' eagerly, BEFORE runner.Run spawns the
 	// provider. The activity-gated maybePostRunning
 	// (runtime/activity/poster.go) only fires after the first successful
