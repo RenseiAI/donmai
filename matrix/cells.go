@@ -236,7 +236,7 @@ var validCells = []HarnessEndpointCell{
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
 		StructuredVia: "json-schema", LegacyProviderID: pn(agent.ProviderOpenCode),
-		Stability: "beta", Smoked: false,
+		Stability: "beta", Smoked: true,
 	},
 
 	// opencode × OpenAI on the gateway (openai-chat surface) — the first
