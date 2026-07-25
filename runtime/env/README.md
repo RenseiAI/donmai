@@ -27,6 +27,16 @@ ANTHROPIC_BASE_URL
 OPENCLAW_GATEWAY_TOKEN
 ```
 
+Plus donmai-native entries with no legacy counterpart:
+
+```
+DONMAI_GATEWAY_UPSTREAM_API_KEY   # worker-local gateway's upstream credential
+```
+
+The gateway entry is load-bearing for the translating-gateway host: the harness
+child must receive only the gateway's per-session loopback bearer, never the
+upstream provider key the worker dials with (`afcli/gateway_bind.go`).
+
 Source: `../../../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts` (and `agent-spawner.ts`). The legacy TS keeps the same 4-element list verbatim across both files; `TestAgentEnvBlocklistMatchesLegacyTS` asserts the Go port stays in sync.
 
 The blocklist applies **only to the `base` map** passed to `Compose`. `Spec.Env` is runner-set and intentionally trusted — that is how the daemon resolves `ANTHROPIC_API_KEY` from its credential store and injects it for the session.
