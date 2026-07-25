@@ -39,12 +39,13 @@ func TestComposeBlocksDefaultBlocklist(t *testing.T) {
 
 	c := env.NewComposer()
 	base := map[string]string{
-		"ANTHROPIC_API_KEY":               "leak-1",
-		"ANTHROPIC_AUTH_TOKEN":            "leak-2",
-		"ANTHROPIC_BASE_URL":              "leak-3",
-		"OPENCLAW_GATEWAY_TOKEN":          "leak-4",
-		"DONMAI_GATEWAY_UPSTREAM_API_KEY": "leak-5",
-		"PATH":                            "/usr/bin",
+		"ANTHROPIC_API_KEY":                "leak-1",
+		"ANTHROPIC_AUTH_TOKEN":             "leak-2",
+		"ANTHROPIC_BASE_URL":               "leak-3",
+		"OPENCLAW_GATEWAY_TOKEN":           "leak-4",
+		"DONMAI_GATEWAY_UPSTREAM_API_KEY":  "leak-5",
+		"DONMAI_GATEWAY_UPSTREAM_BASE_URL": "http://127.0.0.1:9999/v1",
+		"PATH":                             "/usr/bin",
 	}
 
 	got := c.Compose(base, agent.Spec{})
@@ -54,7 +55,8 @@ func TestComposeBlocksDefaultBlocklist(t *testing.T) {
 			"ANTHROPIC_AUTH_TOKEN=leak-2",
 			"ANTHROPIC_BASE_URL=leak-3",
 			"OPENCLAW_GATEWAY_TOKEN=leak-4",
-			"DONMAI_GATEWAY_UPSTREAM_API_KEY=leak-5":
+			"DONMAI_GATEWAY_UPSTREAM_API_KEY=leak-5",
+			"DONMAI_GATEWAY_UPSTREAM_BASE_URL=http://127.0.0.1:9999/v1":
 			t.Fatalf("blocked key leaked through: %q", kv)
 		}
 	}
@@ -210,18 +212,32 @@ func TestComposeChildEnvFiltersEveryLayer(t *testing.T) {
 	t.Parallel()
 
 	got := env.ComposeChildEnv(
-		[]string{"PATH=/usr/bin", "SAFE=parent", "ATTACH_TOKEN=parent-secret"},
+		[]string{
+			"PATH=/usr/bin",
+			"SAFE=parent",
+			"ATTACH_TOKEN=parent-secret",
+			"DONMAI_GATEWAY_UPSTREAM_API_KEY=worker-secret",
+			"DONMAI_GATEWAY_UPSTREAM_BASE_URL=https://worker.invalid/private",
+			"OPENAI_API_KEY=parent-provider-secret",
+		},
 		map[string]string{
 			"BASE_ONLY":         "base",
 			"SAFE":              "base",
 			"ATTACH_TOKEN_FILE": "/base/token",
+			"OPENAI_API_KEY":    "session-provider-secret",
 		},
 		map[string]string{
 			"SAFE":       "command",
 			"ATTACH_URL": "wss://command.invalid",
 		},
 	)
-	want := []string{"PATH=/usr/bin", "SAFE=parent", "BASE_ONLY=base", "SAFE=command"}
+	want := []string{
+		"PATH=/usr/bin",
+		"SAFE=parent",
+		"BASE_ONLY=base",
+		"OPENAI_API_KEY=session-provider-secret",
+		"SAFE=command",
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ComposeChildEnv():\n got: %v\nwant: %v", got, want)
 	}
@@ -254,8 +270,9 @@ func TestAgentEnvBlocklistMatchesLegacyTS(t *testing.T) {
 	// Verbatim port from
 	// ../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts
 	// AGENT_ENV_BLOCKLIST, plus the donmai-native entries that have no legacy
-	// counterpart (DONMAI_GATEWAY_UPSTREAM_API_KEY — the worker-local gateway's
-	// upstream credential, which must never reach a harness child; see the
+	// counterpart (DONMAI_GATEWAY_UPSTREAM_API_KEY and
+	// DONMAI_GATEWAY_UPSTREAM_BASE_URL — the worker-local gateway's upstream
+	// credential and route, which must never reach a harness child; see the
 	// AgentEnvBlocklist doc comment). If the legacy list grows, port the new
 	// entries AND update this test.
 	want := []string{
@@ -263,6 +280,7 @@ func TestAgentEnvBlocklistMatchesLegacyTS(t *testing.T) {
 		"ANTHROPIC_AUTH_TOKEN",
 		"ANTHROPIC_BASE_URL",
 		"DONMAI_GATEWAY_UPSTREAM_API_KEY",
+		"DONMAI_GATEWAY_UPSTREAM_BASE_URL",
 		"GEMINI_API_KEY",
 		"GOOGLE_API_KEY",
 		"OPENCLAW_GATEWAY_TOKEN",

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,12 @@ import (
 // asserts the Authorization bearer equals wantKey (proving the gateway dialed
 // with THIS session's credential, not another's) and replies streaming or not
 // per the request body.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func fakeUpstream(t *testing.T, wantKey string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -92,6 +99,51 @@ func bindSession(t *testing.T, g *gateway.Gateway, sessionID, harness, upstreamK
 		t.Fatalf("bind: %v", err)
 	}
 	return b
+}
+
+func TestGateway_UpstreamTransportErrorHidesRoute(t *testing.T) {
+	g := startGateway(t, &costfeed.MemorySink{})
+	const sensitiveRoute = "https://proxy.example/tenant/secret-token/v1"
+	upstreamClient := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return nil, errors.New("forced connection failure")
+	})}
+	b, err := g.Bind(gateway.BindConfig{
+		SessionID: "s-transport-error",
+		Harness:   "pi",
+		Company:   agent.CompanyOpenAI,
+		Model:     "gpt-test",
+		AuthMode:  agent.AuthMetered,
+		Surface:   agent.ProtoOpenAIChat,
+		Upstream: &upstream.OpenAICompat{
+			Company:    "openai",
+			BaseURL:    sensitiveRoute,
+			HTTPClient: upstreamClient,
+		},
+		Source: pool.SingleKey{Key: pool.Credential{ID: "k1", Secret: "worker-secret"}},
+	})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	resp := chatRequest(t, b, false)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", resp.StatusCode, body)
+	}
+	response := string(body)
+	for _, forbidden := range []string{"proxy.example", "/tenant/secret-token/v1"} {
+		if strings.Contains(response, forbidden) {
+			t.Fatalf("gateway response leaked upstream route %q: %s", forbidden, response)
+		}
+	}
+	if !strings.Contains(response, `"code":"upstream_error"`) ||
+		!strings.Contains(response, `"message":"upstream request failed"`) {
+		t.Fatalf("gateway response lost safe error classification: %s", response)
+	}
 }
 
 // chatRequest posts a chat-completions request to the gateway using the

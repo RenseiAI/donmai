@@ -22,18 +22,19 @@ import (
 // When the legacy TS adds a new entry, port it here and update the
 // inline comment in package env's README.
 //
-// DONMAI_GATEWAY_UPSTREAM_API_KEY has no legacy-TS counterpart: it is the
-// donmai-native upstream credential the worker-local translating gateway
-// dials with (afcli/gateway_bind.go). It MUST be blocked here, because the
-// entire point of a gateway cell is that the harness child receives only the
-// gateway's per-session loopback bearer while the provider credential stays
-// in the worker process. An inherited copy in the child would silently undo
-// that isolation.
+// DONMAI_GATEWAY_UPSTREAM_API_KEY and DONMAI_GATEWAY_UPSTREAM_BASE_URL have
+// no legacy-TS counterparts: they configure the donmai-native worker-local
+// translating gateway (afcli/gateway_bind.go). They MUST be blocked here,
+// because the entire point of a gateway cell is that the harness child
+// receives only the gateway's per-session loopback bearer while the upstream
+// credential and route stay in the worker process. An inherited copy in the
+// child would silently undo that isolation.
 var AgentEnvBlocklist = []string{
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_BASE_URL",
 	"DONMAI_GATEWAY_UPSTREAM_API_KEY",
+	"DONMAI_GATEWAY_UPSTREAM_BASE_URL",
 	"GEMINI_API_KEY",
 	"GOOGLE_API_KEY",
 	"OPENCLAW_GATEWAY_TOKEN",
@@ -92,13 +93,42 @@ func FilterRunnerOnlyMap(entries map[string]string) map[string]string {
 	return out
 }
 
+func filterInheritedChildEnv(entries []string) []string {
+	if len(entries) == 0 {
+		return entries
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		if IsRunnerOnly(key) || isAgentEnvBlocked(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func isAgentEnvBlocked(key string) bool {
+	for _, blocked := range AgentEnvBlocklist {
+		if key == blocked {
+			return true
+		}
+	}
+	return false
+}
+
 // ComposeChildEnv merges an inherited KEY=VALUE environment with zero or more
-// explicit override layers while removing runner-owned controls from every
-// layer. Later explicit layers win. Explicit keys are sorted before appending so
-// they deterministically win over inherited duplicates under exec.Cmd's
+// explicit override layers. Runner-owned controls are removed from every layer,
+// while agent-auth entries are removed only from the inherited parent. Trusted
+// explicit layers may inject the provider credential selected for this session.
+// Later explicit layers win. Explicit keys are sorted before appending so they
+// deterministically win over inherited duplicates under exec.Cmd's
 // last-entry-wins semantics.
 func ComposeChildEnv(parent []string, explicit ...map[string]string) []string {
-	filteredParent := FilterRunnerOnly(parent)
+	filteredParent := filterInheritedChildEnv(parent)
 	mergedExplicit := make(map[string]string)
 	for _, layer := range explicit {
 		for key, value := range FilterRunnerOnlyMap(layer) {
