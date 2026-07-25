@@ -69,6 +69,108 @@ func TestIsGatewayServed(t *testing.T) {
 
 // TestBindWorkerGateway_NonGatewayCellIsNoOp proves the overwhelmingly common
 // path is untouched: no listener, no endpoint stamped, no error.
+func TestResolveGatewayUpstreamBaseURL(t *testing.T) {
+	httptestUpstream := httptest.NewServer(http.NotFoundHandler())
+	defer httptestUpstream.Close()
+
+	tests := []struct {
+		name     string
+		raw      string
+		wantBase string
+		wantErr  bool
+	}{
+		{
+			name:     "default direct OpenAI route",
+			wantBase: defaultGatewayUpstreamBaseURL,
+		},
+		{
+			name:     "local httptest HTTP route",
+			raw:      httptestUpstream.URL + "/v1",
+			wantBase: httptestUpstream.URL + "/v1",
+		},
+		{
+			name:    "relative route",
+			raw:     "/v1",
+			wantErr: true,
+		},
+		{
+			name:    "unsupported scheme",
+			raw:     "ftp://upstream.example/v1",
+			wantErr: true,
+		},
+		{
+			name:    "missing host",
+			raw:     "https:///v1",
+			wantErr: true,
+		},
+		{
+			name:    "userinfo is rejected",
+			raw:     "https://secret@upstream.example/v1",
+			wantErr: true,
+		},
+		{
+			name:    "query is rejected",
+			raw:     "https://upstream.example/v1?api_key=secret",
+			wantErr: true,
+		},
+		{
+			name:    "empty query is rejected",
+			raw:     "https://upstream.example/v1?",
+			wantErr: true,
+		},
+		{
+			name:    "fragment is rejected",
+			raw:     "https://upstream.example/v1#secret",
+			wantErr: true,
+		},
+		{
+			name:    "empty fragment is rejected",
+			raw:     "https://upstream.example/v1#",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotBase, err := resolveGatewayUpstreamBaseURL(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveGatewayUpstreamBaseURL case %q succeeded; want an error", tc.name)
+				}
+				if strings.Contains(err.Error(), "secret") {
+					t.Errorf("validation error leaked part of the supplied route: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveGatewayUpstreamBaseURL case %q: %v", tc.name, err)
+			}
+			if gotBase != tc.wantBase {
+				t.Errorf("resolveGatewayUpstreamBaseURL case %q = %q, want %q", tc.name, gotBase, tc.wantBase)
+			}
+		})
+	}
+}
+
+func TestBindWorkerGateway_DoesNotLogUpstreamRoute(t *testing.T) {
+	var logs strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	t.Setenv(EnvGatewayUpstreamBaseURL, "https://secret-upstream.example/private/route")
+	t.Setenv(EnvGatewayUpstreamAPIKey, "sk-test")
+	t.Setenv("DONMAI_STATE_HOME", t.TempDir())
+
+	gw, err := bindWorkerGateway(context.Background(), logger, gatewayDetail("gateway", "pi"), gatewayQW())
+	if err != nil {
+		t.Fatalf("bindWorkerGateway: %v", err)
+	}
+	defer gw.Close(logger)
+
+	output := logs.String()
+	if strings.Contains(output, "secret-upstream.example") || strings.Contains(output, "/private/route") {
+		t.Errorf("gateway bind log leaked the upstream route: %s", output)
+	}
+}
+
 func TestBindWorkerGateway_NonGatewayCellIsNoOp(t *testing.T) {
 	t.Setenv(EnvGatewayUpstreamAPIKey, "sk-test")
 	qw := gatewayQW()
