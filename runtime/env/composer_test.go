@@ -39,11 +39,12 @@ func TestComposeBlocksDefaultBlocklist(t *testing.T) {
 
 	c := env.NewComposer()
 	base := map[string]string{
-		"ANTHROPIC_API_KEY":      "leak-1",
-		"ANTHROPIC_AUTH_TOKEN":   "leak-2",
-		"ANTHROPIC_BASE_URL":     "leak-3",
-		"OPENCLAW_GATEWAY_TOKEN": "leak-4",
-		"PATH":                   "/usr/bin",
+		"ANTHROPIC_API_KEY":               "leak-1",
+		"ANTHROPIC_AUTH_TOKEN":            "leak-2",
+		"ANTHROPIC_BASE_URL":              "leak-3",
+		"OPENCLAW_GATEWAY_TOKEN":          "leak-4",
+		"DONMAI_GATEWAY_UPSTREAM_API_KEY": "leak-5",
+		"PATH":                            "/usr/bin",
 	}
 
 	got := c.Compose(base, agent.Spec{})
@@ -52,7 +53,8 @@ func TestComposeBlocksDefaultBlocklist(t *testing.T) {
 		case "ANTHROPIC_API_KEY=leak-1",
 			"ANTHROPIC_AUTH_TOKEN=leak-2",
 			"ANTHROPIC_BASE_URL=leak-3",
-			"OPENCLAW_GATEWAY_TOKEN=leak-4":
+			"OPENCLAW_GATEWAY_TOKEN=leak-4",
+			"DONMAI_GATEWAY_UPSTREAM_API_KEY=leak-5":
 			t.Fatalf("blocked key leaked through: %q", kv)
 		}
 	}
@@ -251,12 +253,16 @@ func TestAgentEnvBlocklistMatchesLegacyTS(t *testing.T) {
 
 	// Verbatim port from
 	// ../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts
-	// AGENT_ENV_BLOCKLIST. If the legacy list grows, port the new entries
-	// AND update this test.
+	// AGENT_ENV_BLOCKLIST, plus the donmai-native entries that have no legacy
+	// counterpart (DONMAI_GATEWAY_UPSTREAM_API_KEY — the worker-local gateway's
+	// upstream credential, which must never reach a harness child; see the
+	// AgentEnvBlocklist doc comment). If the legacy list grows, port the new
+	// entries AND update this test.
 	want := []string{
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
 		"ANTHROPIC_BASE_URL",
+		"DONMAI_GATEWAY_UPSTREAM_API_KEY",
 		"GEMINI_API_KEY",
 		"GOOGLE_API_KEY",
 		"OPENCLAW_GATEWAY_TOKEN",

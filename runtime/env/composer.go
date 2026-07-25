@@ -21,10 +21,19 @@ import (
 //
 // When the legacy TS adds a new entry, port it here and update the
 // inline comment in package env's README.
+//
+// DONMAI_GATEWAY_UPSTREAM_API_KEY has no legacy-TS counterpart: it is the
+// donmai-native upstream credential the worker-local translating gateway
+// dials with (afcli/gateway_bind.go). It MUST be blocked here, because the
+// entire point of a gateway cell is that the harness child receives only the
+// gateway's per-session loopback bearer while the provider credential stays
+// in the worker process. An inherited copy in the child would silently undo
+// that isolation.
 var AgentEnvBlocklist = []string{
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_BASE_URL",
+	"DONMAI_GATEWAY_UPSTREAM_API_KEY",
 	"GEMINI_API_KEY",
 	"GOOGLE_API_KEY",
 	"OPENCLAW_GATEWAY_TOKEN",
