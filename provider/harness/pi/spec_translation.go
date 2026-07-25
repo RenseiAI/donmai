@@ -2,6 +2,8 @@ package pi
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -145,8 +147,9 @@ func thinkingLevelForEffort(e agent.EffortLevel) string {
 //
 // Routable surface = the pi manifest's Drives × DrivesHosts intersected with
 // the authored cells: anthropic-messages / openai-chat / openai-responses /
-// gemini-generate over direct/local/bedrock/vertex. Anything else is not
-// routable — silently spawning against a default would mis-bill and mis-route.
+// gemini-generate over direct/local/bedrock/vertex, plus validated worker-local
+// loopback gateway bindings. Anything else is not routable — silently spawning
+// against a default would mis-bill and mis-route.
 func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 	ep := spec.Endpoint
 	if ep == nil {
@@ -161,6 +164,10 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 	switch ep.Host {
 	case "", agent.HostDirect, agent.HostLocal, agent.HostBedrock, agent.HostVertex:
 		// routable
+	case agent.HostGateway:
+		if !isLoopbackHTTPURL(ep.BaseURL) {
+			return spec, fmt.Errorf("gateway endpoint BaseURL %q must be an absolute HTTP(S) URL with a loopback hostname", ep.BaseURL)
+		}
 	default:
 		return spec, fmt.Errorf("serving host %q is not routable by the pi harness", ep.Host)
 	}
@@ -192,6 +199,17 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 	}
 	spec.Env = env
 	return spec, nil
+}
+
+// isLoopbackHTTPURL reports whether rawURL is an absolute HTTP(S) URL whose
+// hostname is localhost or a loopback IP address.
+func isLoopbackHTTPURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || !u.IsAbs() || !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	hostname := u.Hostname()
+	return strings.EqualFold(hostname, "localhost") || net.ParseIP(hostname).IsLoopback()
 }
 
 // pickAPIKey selects the cell's API key from the binding env, preferring

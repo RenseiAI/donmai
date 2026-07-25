@@ -133,6 +133,9 @@ type ResolvedProfile struct {
 	// ProviderConfig carries provider-specific knobs from the matched
 	// model profile. Forwarded into agent.Spec.ProviderConfig.
 	ProviderConfig map[string]any `json:"providerConfig,omitempty"`
+
+	// Endpoint is the resolved serving binding forwarded to agent.Spec.
+	Endpoint *agent.EndpointBinding `json:"endpoint,omitempty"`
 }
 
 // interactiveRunMode is the QueuedWork.Mode value that activates the
