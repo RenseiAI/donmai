@@ -217,7 +217,7 @@
       "structuredVia": "json-schema",
       "legacyProviderId": "opencode",
       "stability": "beta",
-      "smoked": false
+      "smoked": true
     },
     {
       "harness": "opencode",
