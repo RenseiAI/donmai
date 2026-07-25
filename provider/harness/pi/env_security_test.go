@@ -61,14 +61,16 @@ func TestEnvHygiene_ResolvedCellKeyRides(t *testing.T) {
 }
 
 // TestApplyEndpoint_MirrorsKeyAndRejectsUnroutable covers the endpoint read
-// site: the cell key is mirrored onto PiKeyEnvVar (for the pin's env
-// reference), and a company/host outside pi's Drive surface is refused loudly.
+// site: gateway-hosted cells are admitted, the cell key is mirrored onto
+// PiKeyEnvVar (for the pin's env reference), and an unsupported host is
+// refused loudly.
 func TestApplyEndpoint_MirrorsKeyAndRejectsUnroutable(t *testing.T) {
 	t.Parallel()
 	spec, err := applyEndpoint(agent.Spec{
 		Endpoint: &agent.EndpointBinding{
 			Company:  agent.CompanyAnthropic,
-			Host:     agent.HostDirect,
+			BaseURL:  "http://127.0.0.1:8080/v1",
+			Host:     agent.HostGateway,
 			Protocol: agent.ProtoAnthropicMessages,
 			Model:    "claude-x",
 			Env:      map[string]string{"ANTHROPIC_API_KEY": "k-123"},
@@ -82,6 +84,31 @@ func TestApplyEndpoint_MirrorsKeyAndRejectsUnroutable(t *testing.T) {
 	}
 	if spec.Model != "claude-x" {
 		t.Errorf("Endpoint.Model not honored: %q", spec.Model)
+	}
+
+	for _, tt := range []struct {
+		name    string
+		baseURL string
+	}{
+		{name: "empty BaseURL", baseURL: ""},
+		{name: "relative BaseURL", baseURL: "127.0.0.1:8080/v1"},
+		{name: "missing hostname", baseURL: "http:///v1"},
+		{name: "non-loopback BaseURL", baseURL: "https://api.example.com/v1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := applyEndpoint(agent.Spec{
+				Endpoint: &agent.EndpointBinding{
+					Company:  agent.CompanyAnthropic,
+					BaseURL:  tt.baseURL,
+					Host:     agent.HostGateway,
+					Protocol: agent.ProtoAnthropicMessages,
+				},
+			})
+			if err == nil {
+				t.Errorf("gateway endpoint with %s should be refused", tt.name)
+			}
+		})
 	}
 
 	// Unroutable host must fail loudly (mis-routing would mis-bill).

@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -447,5 +448,96 @@ func TestCodeIntelFQToolNames_AllAndFiltered(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("filtered subset (unknown ignored, canonical order): got %v\nwant %v", got, want)
+	}
+}
+
+// TestTranslateSpec_EndpointBindingCopied verifies that all resolved endpoint
+// fields flow to Spec.Endpoint while provider-side mutation cannot alter queued
+// work or its credential map.
+func TestTranslateSpec_EndpointBindingCopied(t *testing.T) {
+	t.Parallel()
+	endpoint := &agent.EndpointBinding{
+		Company:       agent.CompanyOpenAI,
+		Model:         "model-a",
+		BaseURL:       "https://gateway.example.test/v1",
+		Protocol:      agent.ProtoOpenAIResponses,
+		Host:          agent.HostGateway,
+		Auth:          agent.AuthBYOK,
+		Region:        "us-east-1",
+		CostModel:     agent.CostMeteredPerToken,
+		BringsOwnAuth: true,
+		Env:           map[string]string{"API_KEY": "queued-key", "REGION": "us-east-1"},
+	}
+	qw := QueuedWork{ResolvedProfile: ResolvedProfile{Endpoint: endpoint}}
+
+	spec := translateSpec(qw, agent.Capabilities{}, SpecInputs{})
+	if spec.Endpoint == nil {
+		t.Fatal("Endpoint: expected resolved binding to propagate")
+	}
+	if spec.Endpoint == endpoint {
+		t.Fatal("Endpoint: binding aliases queued work")
+	}
+
+	type endpointFields struct {
+		company       agent.Company
+		model         string
+		baseURL       string
+		protocol      agent.WireProtocol
+		host          agent.ServingHost
+		auth          agent.AuthMode
+		region        string
+		costModel     agent.CostModel
+		bringsOwnAuth bool
+	}
+	got := endpointFields{
+		company:       spec.Endpoint.Company,
+		model:         spec.Endpoint.Model,
+		baseURL:       spec.Endpoint.BaseURL,
+		protocol:      spec.Endpoint.Protocol,
+		host:          spec.Endpoint.Host,
+		auth:          spec.Endpoint.Auth,
+		region:        spec.Endpoint.Region,
+		costModel:     spec.Endpoint.CostModel,
+		bringsOwnAuth: spec.Endpoint.BringsOwnAuth,
+	}
+	want := endpointFields{
+		company:       endpoint.Company,
+		model:         endpoint.Model,
+		baseURL:       endpoint.BaseURL,
+		protocol:      endpoint.Protocol,
+		host:          endpoint.Host,
+		auth:          endpoint.Auth,
+		region:        endpoint.Region,
+		costModel:     endpoint.CostModel,
+		bringsOwnAuth: endpoint.BringsOwnAuth,
+	}
+	if got != want {
+		t.Errorf("Endpoint structural fields = %+v, want %+v", got, want)
+	}
+	if !maps.Equal(spec.Endpoint.Env, endpoint.Env) {
+		t.Errorf("Endpoint.Env = %v, want %v", spec.Endpoint.Env, endpoint.Env)
+	}
+
+	spec.Endpoint.Model = "provider-mutated"
+	spec.Endpoint.Env["API_KEY"] = "provider-mutated"
+	if endpoint.Model != "model-a" {
+		t.Errorf("queued endpoint model mutated through Spec: %q", endpoint.Model)
+	}
+	if endpoint.Env["API_KEY"] != "queued-key" {
+		t.Errorf("queued endpoint env mutated through Spec: %q", endpoint.Env["API_KEY"])
+	}
+	endpoint.Env["REGION"] = "queued-mutated"
+	if spec.Endpoint.Env["REGION"] != "us-east-1" {
+		t.Errorf("Spec endpoint env mutated through queued work: %q", spec.Endpoint.Env["REGION"])
+	}
+}
+
+// TestTranslateSpec_NilEndpointRemainsNil keeps pre-endpoint queued work on
+// the legacy path without serializing or materializing a binding.
+func TestTranslateSpec_NilEndpointRemainsNil(t *testing.T) {
+	t.Parallel()
+	spec := translateSpec(QueuedWork{}, agent.Capabilities{}, SpecInputs{})
+	if spec.Endpoint != nil {
+		t.Errorf("Endpoint = %+v, want nil", spec.Endpoint)
 	}
 }

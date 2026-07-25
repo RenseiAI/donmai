@@ -87,6 +87,7 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		SystemPromptAppend: in.SystemPromptAppend,
 		InitialContext:     in.InitialContext,
 		ProviderConfig:     copyProviderConfig(qw.ResolvedProfile.ProviderConfig),
+		Endpoint:           copyEndpointBinding(qw.ResolvedProfile.Endpoint),
 	}
 
 	// Capability-gated fields — silently zeroed when the resolved
@@ -235,6 +236,22 @@ func copyProviderConfig(in map[string]any) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+// copyEndpointBinding returns an independent binding so provider-side mutation
+// cannot affect the queued work.
+func copyEndpointBinding(in *agent.EndpointBinding) *agent.EndpointBinding {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.Env != nil {
+		out.Env = make(map[string]string, len(in.Env))
+		for k, v := range in.Env {
+			out.Env[k] = v
+		}
+	}
+	return &out
 }
 
 // MCPConfigPath wraps the runtime/mcp.Builder output so the loop has a
