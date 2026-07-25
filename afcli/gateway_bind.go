@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -95,6 +96,24 @@ func isGatewayServed(d *daemon.SessionDetail) bool {
 	return strings.EqualFold(strings.TrimSpace(d.ResolvedProfile.ServingHost), string(agent.HostGateway))
 }
 
+// resolveGatewayUpstreamBaseURL validates the worker-local gateway's upstream
+// route before the gateway starts. The route is never logged because any URL
+// component may be operator-sensitive.
+func resolveGatewayUpstreamBaseURL(raw string) (string, error) {
+	baseURL := strings.TrimSpace(raw)
+	if baseURL == "" {
+		baseURL = defaultGatewayUpstreamBaseURL
+	}
+
+	parsed, parseErr := url.Parse(baseURL)
+	if parseErr != nil || !parsed.IsAbs() || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(baseURL, "#") {
+		return "", errors.New("gateway upstream base URL must be an absolute HTTP(S) URL with a non-empty host and no userinfo, query, or fragment")
+	}
+
+	return parsed.String(), nil
+}
+
 // bindWorkerGateway starts a worker-local gateway, binds this session to it,
 // and stamps the resulting EndpointBinding onto qw.ResolvedProfile.Endpoint so
 // runner.translateSpec forwards it into agent.Spec (donmai#216) and the harness
@@ -131,9 +150,9 @@ func bindWorkerGateway(ctx context.Context, logger *slog.Logger, d *daemon.Sessi
 			EnvGatewayUpstreamAPIKey)
 	}
 
-	upstreamBase := strings.TrimSpace(os.Getenv(EnvGatewayUpstreamBaseURL))
-	if upstreamBase == "" {
-		upstreamBase = defaultGatewayUpstreamBaseURL
+	upstreamBase, err := resolveGatewayUpstreamBaseURL(os.Getenv(EnvGatewayUpstreamBaseURL))
+	if err != nil {
+		return nil, err
 	}
 
 	g := gateway.New(gateway.Options{Sink: workerGatewaySink(logger)})
@@ -165,12 +184,12 @@ func bindWorkerGateway(ctx context.Context, logger *slog.Logger, d *daemon.Sessi
 
 	qw.ResolvedProfile.Endpoint = &binding
 	if logger != nil {
-		// The bearer is never logged; the address and the model are.
+		// The bearer and upstream route are never logged; only the gateway's own
+		// loopback address and the bound model are safe diagnostics.
 		logger.Info("agent run: bound worker-local gateway session",
 			"sessionId", qw.SessionID,
 			"addr", g.Addr(),
 			"model", model,
-			"upstream", upstreamBase,
 		)
 	}
 	return &workerGateway{gw: g, tok: token.Token(binding.Env[gateway.TokenEnvVar])}, nil

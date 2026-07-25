@@ -31,11 +31,13 @@ Plus donmai-native entries with no legacy counterpart:
 
 ```
 DONMAI_GATEWAY_UPSTREAM_API_KEY   # worker-local gateway's upstream credential
+DONMAI_GATEWAY_UPSTREAM_BASE_URL  # worker-local gateway's upstream route
 ```
 
-The gateway entry is load-bearing for the translating-gateway host: the harness
-child must receive only the gateway's per-session loopback bearer, never the
-upstream provider key the worker dials with (`afcli/gateway_bind.go`).
+The gateway entries are load-bearing for the translating-gateway host: the
+harness child must receive only the gateway's per-session loopback bearer,
+never the upstream provider key or route the worker dials with
+(`afcli/gateway_bind.go`).
 
 Source: `../../../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts` (and `agent-spawner.ts`). The legacy TS keeps the same 4-element list verbatim across both files; `TestAgentEnvBlocklistMatchesLegacyTS` asserts the Go port stays in sync.
 

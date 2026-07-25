@@ -250,7 +250,10 @@ func (g *Gateway) Dispatch(ctx context.Context, tok token.Token, req ir.Request)
 	out, err := rt.upstream.Invoke(ctx, req, cred)
 	rt.pool.Report(cred, out.Status)
 	if err != nil {
-		return surface.Outcome{}, &surface.HTTPError{Status: clientStatus(out.Status), Code: "upstream_error", Message: err.Error()}
+		// Transport errors can contain the complete request URL, and provider
+		// error bodies are not a safe client-facing surface. Preserve only the
+		// classified status and code across the gateway trust boundary.
+		return surface.Outcome{}, &surface.HTTPError{Status: clientStatus(out.Status), Code: "upstream_error", Message: "upstream request failed"}
 	}
 
 	model := rt.model
