@@ -1,7 +1,7 @@
 # P1 Spec — Two-family contract + ModelEndpoint family + `go generate` SoT + CI parity gate
 
 - **Date:** 2026-06-06
-- **Phase:** Phase 1 of the two-axis provider program (`runs/2026-06-06-provider-plugin-architecture` §7.1)
+- **Phase:** Phase 1 of the two-axis provider program (`runs/completed/2026-06-06-provider-plugin-architecture` §7.1)
 - **Repo:** `donmai` (OSS); consumed downstream by `rensei-tui` (regenerated registry, P1b) and `platform` (consumes `matrix.json`)
 - **Status:** Implementation spec (precise, additive). NO behavior change.
 - **Authoritative inputs:** `02-two-axis-architecture.md` §2/§3, `03-capability-matrix-spec.md`, `ADR-2026-06-06-two-axis-provider-model.md` D1–D3.
