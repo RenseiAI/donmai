@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -762,37 +763,93 @@ func indexOf(slice []string, s string) int {
 	return -1
 }
 
-// writeFakeOpenCodeScript creates a temporary shell script that emits
-// minimal OpenCode NDJSON events and returns its path.
-func writeFakeOpenCodeScript(t *testing.T) string {
-	t.Helper()
-
-	sh, err := exec.LookPath("sh")
-	if err != nil {
-		t.Skipf("sh not found on PATH — skipping fake-CLI test: %v", err)
-	}
-
-	const ndjsonFixture = `{"type":"step_start","sessionID":"ses_opencode_test_001","part":{"type":"step-start"}}
+const fakeOpenCodeNDJSON = `{"type":"step_start","sessionID":"ses_opencode_test_001","part":{"type":"step-start"}}
 {"type":"text","sessionID":"ses_opencode_test_001","part":{"type":"text","text":"Hello from opencode fake"}}
 {"type":"step_finish","sessionID":"ses_opencode_test_001","part":{"type":"step-finish","reason":"stop","tokens":{"total":50,"input":40,"output":10},"cost":0}}
 `
-	f, err := os.CreateTemp("", "fake-opencode-*.sh")
-	if err != nil {
-		t.Fatalf("create fake opencode script: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Remove(f.Name()) })
 
-	script := "#!" + sh + "\ncat > /dev/null\nprintf '%s' " + shellQuote(ndjsonFixture)
-	if _, err := f.WriteString(script); err != nil {
-		t.Fatalf("write fake opencode script: %v", err)
+// fakeOpenCodeScript is the path to the package-wide fake `opencode` CLI, and
+// fakeOpenCodeSkip is the reason it could not be built (empty when it was).
+// Both are written exactly once by TestMain and only read afterwards.
+var (
+	fakeOpenCodeScript string
+	fakeOpenCodeSkip   string
+)
+
+// TestMain builds the fake `opencode` CLI ONCE, before any test — and
+// therefore before any test forks a subprocess.
+//
+// The old per-test helper created a fresh script with os.CreateTemp and then
+// exec'd it, which made this package's -race CI run flaky:
+//
+//	--- FAIL: TestProvider_Spawn_SuccessfulRun_ExactlyOneTerminal (0.00s)
+//	    opencode_test.go:359: Spawn: agent: spawn failed:
+//	    cmd start: fork/exec /tmp/fake-opencode-2026265744.sh: text file busy
+//
+// (run 30117668435, merge_group for PR #215).
+//
+// ETXTBSY is the kernel refusing to execve a file that some process still
+// holds open for writing. The window is not the writing test's own descriptor
+// — that one is closed before the exec. It is that fork() copies the whole
+// descriptor table, and O_CLOEXEC only clears a descriptor at the child's
+// execve, not at fork. So while test A sits between CreateTemp and Close on
+// its script, any *other* test in this package that spawns a subprocess forks
+// a child that momentarily holds a writable descriptor to A's script. If A
+// reaches execve first, the kernel sees a writer and returns ETXTBSY. This
+// package has four test files that spawn subprocesses, and they run
+// t.Parallel(), so the interleaving is routine; -race widens the window
+// enough to hit it. Upstream: golang/go#22315.
+//
+// Writing the file with the exec bit off and chmod-ing after close (the
+// mitigation used in provider/harness/agycli) does not close this window —
+// ETXTBSY is decided by the writer count on the inode at execve time, not by
+// the mode bits at write time. Creating the script before any test starts
+// does close it: after TestMain returns, no writable descriptor to that inode
+// exists anywhere, so no fork can copy one. The script is read-only and
+// stateless, so every test can share the one file; concurrent execs of the
+// same read-only executable are fine.
+func TestMain(m *testing.M) {
+	code := func() int {
+		sh, err := exec.LookPath("sh")
+		if err != nil {
+			fakeOpenCodeSkip = "sh not found on PATH: " + err.Error()
+			return m.Run()
+		}
+
+		dir, err := os.MkdirTemp("", "opencode-fixtures-")
+		if err != nil {
+			fakeOpenCodeSkip = "create fixture dir: " + err.Error()
+			return m.Run()
+		}
+		defer func() { _ = os.RemoveAll(dir) }()
+
+		path := filepath.Join(dir, "fake-opencode.sh")
+		script := "#!" + sh + "\ncat > /dev/null\nprintf '%s' " + shellQuote(fakeOpenCodeNDJSON)
+		// Written without the exec bit, then chmod-ed after the descriptor is
+		// gone: belt-and-braces with the once-before-any-fork ordering above.
+		if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+			fakeOpenCodeSkip = "write fake opencode script: " + err.Error()
+			return m.Run()
+		}
+		if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
+			fakeOpenCodeSkip = "chmod fake opencode script: " + err.Error()
+			return m.Run()
+		}
+		fakeOpenCodeScript = path
+		return m.Run()
+	}()
+	os.Exit(code)
+}
+
+// writeFakeOpenCodeScript returns the path to the shared fake OpenCode CLI
+// that emits minimal OpenCode NDJSON events. The script is built once by
+// TestMain; see the ETXTBSY note there for why it is not built per test.
+func writeFakeOpenCodeScript(t *testing.T) string {
+	t.Helper()
+	if fakeOpenCodeScript == "" {
+		t.Skipf("fake opencode CLI unavailable — skipping fake-CLI test: %s", fakeOpenCodeSkip)
 	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close fake opencode script: %v", err)
-	}
-	if err := os.Chmod(f.Name(), 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
-		t.Fatalf("chmod fake opencode script: %v", err)
-	}
-	return f.Name()
+	return fakeOpenCodeScript
 }
 
 func shellQuote(s string) string {
