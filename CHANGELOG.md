@@ -10,6 +10,45 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.56.0 — 2026-07-27
+
+### Features
+
+- **Reusable prompt-experiment driver.** New OSS-pure `eval/experiment`
+  package: bounded arm/experiment identity, SHA-256-bound process-local
+  prompt variants, balanced-matrix preplanning, deterministic shared
+  perturbations, and a fail-closed context-reset seam. `eval/codeintel`
+  becomes a consumer of the shared matrix (#226).
+
+### Fixes
+
+- **Interactive sessions never receive the batch work prompt.** An
+  interactive-mode session with no seed prompt used to fall through to the
+  development work-type template ("Start work on …") against its synthetic
+  session anchor, so the hosted agent immediately self-reported blocked.
+  Interactive builds now produce an empty user prompt (harness starts idle
+  awaiting attached input); a provided seed prompt is delivered verbatim;
+  batch/interview prompts are byte-identical to before (#228).
+- **Interactive heartbeat loss degrades instead of killing (F1).** For
+  `sessionClass=interactive`, heartbeat strike-out and post-wake
+  `refreshed=false` no longer terminate the session: the pulser logs a loud
+  degrade, keeps ticking through the outage, and resumes cleanly on
+  recovery. Non-interactive sessions keep fail-fast behavior. The launchd
+  installer also emits the durability keys (`ExitTimeOut` covering the
+  drain window, `AbandonProcessGroup`, `KeepAlive{Crashed}`,
+  `LegacyTimers`) (#222).
+- **opencode ETXTBSY flake closed at the root**: the fake CLI fixture is
+  built once in `TestMain`, eliminating the fork/execve descriptor window
+  (#225).
+
+### Chores
+
+- CI: worker-image PR builds cut from ~7m35s to ~49s (cross-compile from
+  `BUILDPLATFORM`, docs path filters) (#224); skip counts reported and the
+  duplicate govulncheck run removed (#227).
+
+---
+
 ## v0.55.0 — 2026-07-26
 
 ### Features
