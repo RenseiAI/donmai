@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/eval/experiment"
 )
 
 func TestQueryFromCase(t *testing.T) {
@@ -87,8 +89,8 @@ func TestExecuteWithout_ControlCleanGuard_And_Grep(t *testing.T) {
 }
 
 // TestBuildClaudeInvocation_WiresArms proves the live-executor invocation seam:
-// the WITH arm gets --mcp-config/--strict-mcp-config + budget + allowedTools; the
-// WITHOUT arm gets neither; both carry the arm env verbatim (PATH strip intact).
+// the WITH arm gets --mcp-config/--strict-mcp-config + budget + allowedTools;
+// the WITHOUT arm gets strict zero-MCP isolation; both carry the arm env verbatim.
 func TestBuildClaudeInvocation_WiresArms(t *testing.T) {
 	withSpec := ArmSpec{
 		Arm:             ArmWith,
@@ -96,6 +98,7 @@ func TestBuildClaudeInvocation_WiresArms(t *testing.T) {
 		Env:             []string{"PATH=/with/bin"},
 		Budget:          Budget{MaxTurns: 5, MaxTokens: 10000},
 		AdvertiseMode:   AdvertiseMCP,
+		UseCodeIntel:    true,
 		MCPConfigPath:   "/tmp/mcp.json",
 		AdvertisedTools: []string{"mcp__af-code-intelligence__af_code_search_symbols"},
 	}
@@ -126,6 +129,48 @@ func TestBuildClaudeInvocation_WiresArms(t *testing.T) {
 	}
 	if !strings.Contains(wjoined, "--max-turns 5") {
 		t.Error("both arms must carry the equal budget")
+	}
+}
+
+func TestBuildClaudeInvocation_InjectsVariantWithoutChangingTask(t *testing.T) {
+	spec := ArmSpec{
+		Arm: "candidate", Case: fsCaseFor("legacy prompt"), Prompt: "shared benign task",
+		UseCodeIntel: true, MCPConfigPath: "/tmp/prompt-experiment-mcp.json",
+		PromptSuffix: "shared tool guidance", VariantSystemPrompt: "candidate clause",
+		Env: []string{"PATH=/bin"},
+	}
+	inv := BuildClaudeInvocation(spec)
+	joined := strings.Join(inv.Argv, " ")
+	if !strings.Contains(joined, "-p shared benign task") {
+		t.Fatalf("invocation did not use planned shared task: %v", inv.Argv)
+	}
+	if strings.Contains(joined, "legacy prompt") {
+		t.Fatalf("invocation leaked unplanned case prompt: %v", inv.Argv)
+	}
+	if !strings.Contains(joined, "--append-system-prompt shared tool guidance\n\ncandidate clause") {
+		t.Fatalf("invocation did not compose shared guidance + variant: %v", inv.Argv)
+	}
+	if !strings.Contains(joined, "--mcp-config /tmp/prompt-experiment-mcp.json") {
+		t.Fatalf("opaque treatment arm did not receive authored MCP config: %v", inv.Argv)
+	}
+}
+
+func TestPlumbingExecutor_ContextResetFailsClosed(t *testing.T) {
+	_, err := NewPlumbingExecutor().Execute(context.Background(), ArmSpec{
+		Arm:          "candidate",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "resume"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not implement context-reset") {
+		t.Fatalf("error = %v, want fail-closed unsupported perturbation", err)
+	}
+}
+
+func TestPlumbingExecutor_PromptVariantFailsClosed(t *testing.T) {
+	_, err := NewPlumbingExecutor().Execute(context.Background(), ArmSpec{
+		Arm: "candidate", Case: fsCaseFor("Target"), VariantSystemPrompt: "candidate clause",
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not implement prompt-variant") {
+		t.Fatalf("error = %v, want fail-closed unsupported prompt variant", err)
 	}
 }
 

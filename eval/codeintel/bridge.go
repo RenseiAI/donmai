@@ -32,8 +32,9 @@ const DefaultBridgePath = "/api/evals/ingest"
 // the platform graders. The driver's own Go graders still drive its local A/B
 // console rollup + efficiency-threshold verdict; the two are independent by design.
 type IngestRequest struct {
-	// Arm is which side of the A/B this trial belongs to ("with" | "without").
-	// The platform only auto-adds the tool-use-correctness grader on "with".
+	// Arm is the bounded opaque experiment arm. Legacy code-intel callers retain
+	// "with" | "without"; the platform only auto-adds tool-use-correctness on
+	// the exact legacy "with" value.
 	Arm Arm `json:"arm"`
 	// DatasetID is the evd_ id of the registered codeintel-benchmark dataset
 	// (validated by the platform for FK integrity + org visibility). Supplied via
@@ -66,6 +67,19 @@ type IngestRequest struct {
 	TokenCounts TokenCounts `json:"tokenCounts"`
 	// ProjectID is optional reporting context for the eval_runs row.
 	ProjectID string `json:"projectId,omitempty"`
+	// GraderIDs is required for generic experiment families without registered
+	// defaults. Omitted for legacy code-intel requests to preserve their wire.
+	GraderIDs []string `json:"graderIds,omitempty"`
+	// Experiment carries immutable prompt-variant identity, never raw prompt text.
+	Experiment *ExperimentReceipt `json:"experiment,omitempty"`
+}
+
+// ExperimentReceipt is the durable identity attached to a prompt-experiment
+// trial. VariantRef must already have passed experiment.Definition validation.
+type ExperimentReceipt struct {
+	ExperimentID string `json:"experimentId"`
+	SubjectRef   string `json:"subjectRef"`
+	VariantRef   string `json:"variantRef"`
 }
 
 // IngestResponse is the platform route's 201 body. The driver logs the

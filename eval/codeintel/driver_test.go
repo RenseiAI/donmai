@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/eval/experiment"
 )
 
 // initTempRepo creates a throwaway git repo with a known Go file and returns its
@@ -81,6 +85,185 @@ func (e *recordingExecutor) Execute(_ context.Context, spec ArmSpec) (Transcript
 		TurnCount: 1, TokenCounts: TokenCounts{Input: 400, Output: 80},
 		SnapshotRef: snap,
 	}, nil
+}
+
+type promptRecordingExecutor struct {
+	specs            []ArmSpec
+	donmaiResolvable []bool
+}
+
+func (e *promptRecordingExecutor) Name() string { return "prompt-recording" }
+
+func (e *promptRecordingExecutor) SupportsPromptExperiments() bool { return true }
+
+func (e *promptRecordingExecutor) Execute(_ context.Context, spec ArmSpec) (Transcript, error) {
+	if _, err := os.Stat(filepath.Join(spec.Workarea, "foo.go")); err != nil {
+		return Transcript{}, fmt.Errorf("pinned workarea missing foo.go: %w", err)
+	}
+	e.specs = append(e.specs, spec)
+	_, resolvable := BinaryOnPath("donmai", envPath(spec.Env))
+	e.donmaiResolvable = append(e.donmaiResolvable, resolvable)
+	return Transcript{
+		Arm: spec.Arm, FinalAnswer: "foo.go:3", TurnCount: 1,
+		TokenCounts: TokenCounts{Input: 10, Output: 2},
+		SnapshotRef: &SnapshotRef{Provider: "local", SnapshotID: spec.SnapshotID, Retain: RetainEvalPermanent},
+	}, nil
+}
+
+func TestDriver_PromptExperimentReusesPinnedExecutionLifecycle(t *testing.T) {
+	repoDir, sha := initTempRepo(t)
+	donmaiDir := writeFakeBinary(t, "donmai")
+	c := Case{
+		ID:             "prompt-experiment-case-001",
+		Input:          CaseInput{TaskType: TaskFindSymbol, Repo: "test/repo", Ref: sha, Prompt: "Complete the same benign task."},
+		ExpectedOutput: json.RawMessage(`{"file":"foo.go","lineRange":[1,10]}`),
+		Tags:           []string{tagSuite, "find-symbol", tagVersion},
+	}
+	exec := &promptRecordingExecutor{}
+	d, err := NewDriver(Config{
+		Trials: 2, DonmaiBin: filepath.Join(donmaiDir, "donmai"),
+		RepoRoots: map[string]string{"test/repo": repoDir}, WorkareaParent: t.TempDir(),
+		Executor: exec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := experiment.Definition{
+		ID: "injection-clause-v1",
+		Arms: []experiment.Arm{
+			{ID: "without", SubjectRef: "agent/development", VariantRef: experiment.SHA256VariantRef("incumbent clause"), SystemPrompt: "incumbent clause"},
+			{ID: "candidate", SubjectRef: "agent/development", VariantRef: experiment.SHA256VariantRef("candidate clause"), SystemPrompt: "candidate clause"},
+		},
+	}
+	report, err := d.RunPromptExperiment(context.Background(), []Case{c}, definition, []string{"safety/injection-follow-v1"})
+	if err != nil {
+		t.Fatalf("RunPromptExperiment: %v", err)
+	}
+	if len(report.Outcomes) != 4 || len(exec.specs) != 4 {
+		t.Fatalf("balanced 2 arms x 2 trials = 4 outcomes/specs, got %d/%d", len(report.Outcomes), len(exec.specs))
+	}
+	for i, spec := range exec.specs {
+		if !spec.UseCodeIntel {
+			t.Errorf("prompt arm %s did not receive the shared capability profile", spec.Arm)
+		}
+		if spec.Prompt != c.Input.Prompt {
+			t.Errorf("arm %s prompt = %q, want shared task %q", spec.Arm, spec.Prompt, c.Input.Prompt)
+		}
+		if !exec.donmaiResolvable[i] {
+			t.Errorf("prompt arm %s must receive the same treatment tool environment", spec.Arm)
+		}
+		if spec.MCPConfigPath == "" {
+			t.Errorf("prompt arm %s must receive an authored MCP config", spec.Arm)
+		}
+		switch spec.Arm {
+		case "without":
+			if spec.VariantSystemPrompt != "incumbent clause" {
+				t.Errorf("incumbent variant = %q", spec.VariantSystemPrompt)
+			}
+		case "candidate":
+			if spec.VariantSystemPrompt != "candidate clause" {
+				t.Errorf("candidate variant = %q", spec.VariantSystemPrompt)
+			}
+		default:
+			t.Errorf("unexpected arm %q", spec.Arm)
+		}
+	}
+}
+
+func TestDriver_PromptExperimentRequiresExplicitGraders(t *testing.T) {
+	d, err := NewDriver(Config{DonmaiBin: "/bin/true", RepoRoots: map[string]string{"test/repo": t.TempDir()}, Executor: &promptRecordingExecutor{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := experiment.Definition{
+		ID: "prompt-v1",
+		Arms: []experiment.Arm{
+			{ID: "incumbent", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("")},
+			{ID: "candidate", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("")},
+		},
+	}
+	_, err = d.RunPromptExperiment(context.Background(), []Case{{ID: "case", Input: CaseInput{Prompt: "task"}}}, definition, nil)
+	if err == nil || !strings.Contains(err.Error(), "explicit grader") {
+		t.Fatalf("error = %v, want explicit grader failure", err)
+	}
+}
+
+func TestDriver_PromptExperimentValidatesGradersBeforeExecution(t *testing.T) {
+	exec := &promptRecordingExecutor{}
+	d, err := NewDriver(Config{DonmaiBin: "/bin/true", RepoRoots: map[string]string{"test/repo": t.TempDir()}, Executor: exec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := experiment.Definition{
+		ID: "prompt-v1",
+		Arms: []experiment.Arm{
+			{ID: "incumbent", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("")},
+			{ID: "candidate", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("")},
+		},
+	}
+	for _, graders := range [][]string{{"not-a-path"}, {"safety/injection-follow-v1", "safety/injection-follow-v1"}} {
+		_, err := d.RunPromptExperiment(context.Background(), []Case{{ID: "case", Input: CaseInput{Prompt: "task"}}}, definition, graders)
+		if err == nil {
+			t.Fatalf("graders %v unexpectedly validated", graders)
+		}
+	}
+	if len(exec.specs) != 0 {
+		t.Fatalf("executor ran before grader validation: %d specs", len(exec.specs))
+	}
+}
+
+func TestDriver_PromptExperimentRequiresCapableExecutor(t *testing.T) {
+	d, err := NewDriver(Config{DonmaiBin: "/bin/true", RepoRoots: map[string]string{"test/repo": t.TempDir()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := experiment.Definition{
+		ID: "prompt-v1",
+		Arms: []experiment.Arm{
+			{ID: "incumbent", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("incumbent"), SystemPrompt: "incumbent"},
+			{ID: "candidate", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("candidate"), SystemPrompt: "candidate"},
+		},
+	}
+	_, err = d.RunPromptExperiment(context.Background(), []Case{{ID: "case", Input: CaseInput{Prompt: "task"}}}, definition, []string{"safety/injection-follow-v1"})
+	if err == nil || !strings.Contains(err.Error(), "does not support prompt experiments") {
+		t.Fatalf("error = %v, want executor capability failure", err)
+	}
+}
+
+func TestDriver_PromptExperimentPropagatesBridgeFailure(t *testing.T) {
+	repoDir, sha := initTempRepo(t)
+	donmaiDir := writeFakeBinary(t, "donmai")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "grader unavailable", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	exec := &promptRecordingExecutor{}
+	d, err := NewDriver(Config{
+		Trials: 1, DonmaiBin: filepath.Join(donmaiDir, "donmai"),
+		RepoRoots: map[string]string{"test/repo": repoDir}, WorkareaParent: t.TempDir(),
+		Executor: exec, Bridge: NewBridge(server.URL, "", ""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := experiment.Definition{
+		ID: "prompt-v1",
+		Arms: []experiment.Arm{
+			{ID: "incumbent", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("incumbent"), SystemPrompt: "incumbent"},
+			{ID: "candidate", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("candidate"), SystemPrompt: "candidate"},
+		},
+	}
+	cases := []Case{{
+		ID: "case", Input: CaseInput{TaskType: TaskFindSymbol, Repo: "test/repo", Ref: sha, Prompt: "Find Target."},
+		ExpectedOutput: json.RawMessage(`{"file":"foo.go","lineRange":[1,10]}`), Tags: []string{tagSuite, "find-symbol", tagVersion},
+	}}
+	_, err = d.RunPromptExperiment(context.Background(), cases, definition, []string{"safety/injection-follow-v1"})
+	if err == nil || !strings.Contains(err.Error(), "bridge post") {
+		t.Fatalf("error = %v, want fatal bridge failure", err)
+	}
+	if len(exec.specs) != 1 {
+		t.Fatalf("matrix continued after first failed receipt: %d specs", len(exec.specs))
+	}
 }
 
 func TestDriver_EndToEnd_ProvisionArmsGradeAggregate(t *testing.T) {

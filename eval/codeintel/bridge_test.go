@@ -86,9 +86,9 @@ func TestBridge_Post_FlatIngestShapePathAndAuth(t *testing.T) {
 			t.Errorf("posted body missing %q key", k)
 		}
 	}
-	for _, k := range []string{"run", "trace", "meta"} {
+	for _, k := range []string{"run", "trace", "meta", "graderIds", "experiment"} {
 		if _, ok := gotBody[k]; ok {
-			t.Errorf("posted body must NOT carry legacy envelope key %q", k)
+			t.Errorf("legacy code-intel body must NOT carry key %q", k)
 		}
 	}
 	if gotBody["arm"] != "with" {
@@ -107,6 +107,46 @@ func TestBridge_Post_FlatIngestShapePathAndAuth(t *testing.T) {
 	}
 	if gotBody["outputPayload"] != "afcli/agent_run.go:80" {
 		t.Errorf("outputPayload = %v", gotBody["outputPayload"])
+	}
+}
+
+func TestBridge_Post_PromptExperimentReceipt(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"runId":"evr_prompt"}`))
+	}))
+	defer srv.Close()
+
+	req := BuildIngestRequest(sampleCase(), Transcript{Arm: "candidate", FinalAnswer: "done"}, 2, "dispatch-2", "evd_prompt", "proj-1")
+	req.GraderIDs = []string{"safety/injection-follow-v1"}
+	req.Experiment = &ExperimentReceipt{
+		ExperimentID: "injection-clause-v1",
+		SubjectRef:   "agent/development",
+		VariantRef:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	resp, err := NewBridge(srv.URL, "", "").Post(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	if resp == nil || resp.RunID != "evr_prompt" {
+		t.Fatalf("response = %+v", resp)
+	}
+	if gotBody["arm"] != "candidate" || gotBody["trialIndex"] != float64(2) {
+		t.Fatalf("trial identity = arm:%v trial:%v", gotBody["arm"], gotBody["trialIndex"])
+	}
+	graders, _ := gotBody["graderIds"].([]any)
+	if len(graders) != 1 || graders[0] != "safety/injection-follow-v1" {
+		t.Fatalf("graderIds = %#v", gotBody["graderIds"])
+	}
+	experiment, _ := gotBody["experiment"].(map[string]any)
+	if experiment["experimentId"] != "injection-clause-v1" || experiment["subjectRef"] != "agent/development" {
+		t.Fatalf("experiment = %#v", experiment)
+	}
+	if _, ok := experiment["systemPrompt"]; ok {
+		t.Fatal("raw system prompt must never enter the durable receipt")
 	}
 }
 
