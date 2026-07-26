@@ -7,6 +7,14 @@ import (
 	"github.com/RenseiAI/donmai/internal/kit"
 )
 
+// InteractiveRunMode is the QueuedWork.Mode value for a live PTY-hosted
+// interactive session (spawn-under-PTY + relay attach). It is the single
+// canonical spelling of the wire literal: upstream dispatchers emit it on
+// the "mode" field, the daemon forwards it opaquely, and both the runner
+// (dispatch branching) and this package (prompt selection — interactive
+// sessions never receive a work-type-templated user prompt) consume it.
+const InteractiveRunMode = "interactive"
+
 // QueuedWork is the input contract for prompt rendering. It mirrors the
 // session payload the platform stores in Redis under
 // "agent:session:<sessionId>" and serves to the daemon via
@@ -258,7 +266,7 @@ type QueuedWork struct {
 	// internal/interview/wiretypes.go InterviewRunMode.
 	Mode string `json:"mode,omitempty"`
 
-	// InitialPrompt is opaque first-input data for Mode="interactive". The
+	// InitialPrompt is opaque first-input data for [InteractiveRunMode]. The
 	// interactive runner writes it verbatim plus one newline into the live PTY
 	// before relay attach. The prompt renderer MUST NOT include it in either
 	// headless or interview system/user prompts.
