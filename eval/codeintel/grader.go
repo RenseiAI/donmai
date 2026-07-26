@@ -258,10 +258,12 @@ func toolCallText(tc ToolCall) string {
 }
 
 func (g toolUseGrader) Grade(ctx context.Context, c Case, tr Transcript) GradeResult {
-	if tr.Arm != ArmWith {
+	// AdvertisedTools is the capability signal for opaque experiment arms. The
+	// ArmWith fallback preserves historical direct-grader callers and fixtures.
+	if len(tr.AdvertisedTools) == 0 && tr.Arm != ArmWith {
 		return GradeResult{
 			GraderID: g.ID(), Score: 0, Pass: false,
-			Reasoning: "tool-use grader is WITH-arm only; not applicable to the control arm",
+			Reasoning: "tool-use grader requires an advertised code-intel capability",
 			Metadata:  map[string]any{"applicable": false},
 		}
 	}

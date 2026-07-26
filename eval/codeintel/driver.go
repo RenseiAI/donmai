@@ -272,8 +272,8 @@ func (d *Driver) Run(ctx context.Context, cases []Case) (Report, error) {
 
 // RunPromptExperiment executes arbitrary prompt arms through the same pinned
 // workarea, real executor, transcript capture, and bridge path as code-intel.
-// Generic experiments require explicit platform graders; local code-intel
-// grades remain diagnostic only.
+// Generic experiments require explicit platform graders and MCP advertisement;
+// local code-intel grades remain diagnostic only.
 func (d *Driver) RunPromptExperiment(
 	ctx context.Context,
 	cases []Case,
@@ -282,6 +282,9 @@ func (d *Driver) RunPromptExperiment(
 ) (experiment.Report[RunRecord], error) {
 	if definition.ID == "" {
 		return experiment.Report[RunRecord]{}, fmt.Errorf("prompt experiment id is required")
+	}
+	if d.cfg.Advertise != AdvertiseMCP {
+		return experiment.Report[RunRecord]{}, fmt.Errorf("prompt experiments require MCP advertisement so the variant hash binds the complete appended system prompt")
 	}
 	if err := validateGraderIDs(graderIDs); err != nil {
 		return experiment.Report[RunRecord]{}, err
@@ -343,7 +346,7 @@ func (d *Driver) runPlannedOne(
 	}
 	d.cfg.Logf("provisioned %s arm=%s trial=%d at %s", c.ID, arm, trial.TrialIndex, wa)
 
-	spec, cleanup, err := d.buildPlannedArmSpec(ctx, c, arm, wa, sessionID, trial.Prompt, useCodeIntel)
+	spec, cleanup, err := d.buildPlannedArmSpec(ctx, c, arm, wa, sessionID, trial.Prompt, useCodeIntel, trial.ExperimentID == "")
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -354,6 +357,9 @@ func (d *Driver) runPlannedOne(
 	tr, err := d.cfg.Executor.Execute(ctx, spec)
 	if err != nil {
 		return RunRecord{}, fmt.Errorf("execute: %w", err)
+	}
+	if tr.Arm != arm {
+		return RunRecord{}, fmt.Errorf("execute: transcript arm %q does not match planned arm %q", tr.Arm, arm)
 	}
 
 	grades := d.grade(ctx, c, tr, useCodeIntel)
@@ -402,7 +408,7 @@ func (d *Driver) runPlannedOne(
 
 // buildArmSpec assembles the legacy per-arm env + advertisement + MCP config.
 func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, sessionID string) (ArmSpec, func(), error) {
-	return d.buildPlannedArmSpec(ctx, c, arm, wa, sessionID, experiment.PromptPlan{UserPrompt: c.Input.Prompt}, arm == ArmWith)
+	return d.buildPlannedArmSpec(ctx, c, arm, wa, sessionID, experiment.PromptPlan{UserPrompt: c.Input.Prompt}, arm == ArmWith, true)
 }
 
 func (d *Driver) buildPlannedArmSpec(
@@ -412,6 +418,7 @@ func (d *Driver) buildPlannedArmSpec(
 	wa, _ string,
 	plan experiment.PromptPlan,
 	useCodeIntel bool,
+	includePromptSuffix bool,
 ) (ArmSpec, func(), error) {
 	base := runtimeenv.FilterRunnerOnly(os.Environ())
 	spec := ArmSpec{
@@ -450,7 +457,11 @@ func (d *Driver) buildPlannedArmSpec(
 		return ArmSpec{}, nil, fmt.Errorf("advertise: %w", err)
 	}
 	spec.MCPServers = servers
-	spec.PromptSuffix = suffix
+	if includePromptSuffix {
+		spec.PromptSuffix = suffix
+	}
+	// Prompt experiments use MCP discovery without a separate shared system
+	// suffix, so VariantRef hashes the complete appended system-prompt bytes.
 	spec.AdvertisedTools = d.ad.AdvertisedToolNames(c.Family())
 	if len(servers) > 0 {
 		path, werr := clijsonl.WriteMCPConfig(servers)

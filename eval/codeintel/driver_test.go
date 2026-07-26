@@ -90,6 +90,7 @@ func (e *recordingExecutor) Execute(_ context.Context, spec ArmSpec) (Transcript
 type promptRecordingExecutor struct {
 	specs            []ArmSpec
 	donmaiResolvable []bool
+	returnArm        Arm
 }
 
 func (e *promptRecordingExecutor) Name() string { return "prompt-recording" }
@@ -103,9 +104,13 @@ func (e *promptRecordingExecutor) Execute(_ context.Context, spec ArmSpec) (Tran
 	e.specs = append(e.specs, spec)
 	_, resolvable := BinaryOnPath("donmai", envPath(spec.Env))
 	e.donmaiResolvable = append(e.donmaiResolvable, resolvable)
+	arm := spec.Arm
+	if e.returnArm != "" {
+		arm = e.returnArm
+	}
 	return Transcript{
-		Arm: spec.Arm, FinalAnswer: "foo.go:3", TurnCount: 1,
-		TokenCounts: TokenCounts{Input: 10, Output: 2},
+		Arm: arm, FinalAnswer: "foo.go:3", TurnCount: 1,
+		TokenCounts: TokenCounts{Input: 10, Output: 2}, AdvertisedTools: spec.AdvertisedTools,
 		SnapshotRef: &SnapshotRef{Provider: "local", SnapshotID: spec.SnapshotID, Retain: RetainEvalPermanent},
 	}, nil
 }
@@ -154,6 +159,9 @@ func TestDriver_PromptExperimentReusesPinnedExecutionLifecycle(t *testing.T) {
 		}
 		if spec.MCPConfigPath == "" {
 			t.Errorf("prompt arm %s must receive an authored MCP config", spec.Arm)
+		}
+		if spec.PromptSuffix != "" {
+			t.Errorf("prompt arm %s received unbound shared system text %q", spec.Arm, spec.PromptSuffix)
 		}
 		switch spec.Arm {
 		case "without":
@@ -230,11 +238,61 @@ func TestDriver_PromptExperimentRequiresCapableExecutor(t *testing.T) {
 	}
 }
 
+func TestDriver_PromptExperimentRequiresMCPAdvertisement(t *testing.T) {
+	d, err := NewDriver(Config{
+		Advertise: AdvertisePromptHelp, DonmaiBin: "/bin/true",
+		RepoRoots: map[string]string{"test/repo": t.TempDir()}, Executor: &promptRecordingExecutor{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := experiment.Definition{
+		ID: "prompt-v1",
+		Arms: []experiment.Arm{
+			{ID: "incumbent", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("incumbent"), SystemPrompt: "incumbent"},
+			{ID: "candidate", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("candidate"), SystemPrompt: "candidate"},
+		},
+	}
+	_, err = d.RunPromptExperiment(context.Background(), []Case{{ID: "case", Input: CaseInput{Prompt: "task"}}}, definition, []string{"safety/injection-follow-v1"})
+	if err == nil || !strings.Contains(err.Error(), "require MCP advertisement") {
+		t.Fatalf("error = %v, want MCP advertisement failure", err)
+	}
+}
+
+func TestDriver_PromptExperimentRejectsTranscriptArmMismatch(t *testing.T) {
+	repoDir, sha := initTempRepo(t)
+	donmaiDir := writeFakeBinary(t, "donmai")
+	exec := &promptRecordingExecutor{returnArm: ArmWith}
+	d, err := NewDriver(Config{
+		Trials: 1, DonmaiBin: filepath.Join(donmaiDir, "donmai"),
+		RepoRoots: map[string]string{"test/repo": repoDir}, WorkareaParent: t.TempDir(), Executor: exec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := experiment.Definition{
+		ID: "prompt-v1",
+		Arms: []experiment.Arm{
+			{ID: "incumbent", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("incumbent"), SystemPrompt: "incumbent"},
+			{ID: "candidate", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("candidate"), SystemPrompt: "candidate"},
+		},
+	}
+	cases := []Case{{
+		ID: "case", Input: CaseInput{TaskType: TaskFindSymbol, Repo: "test/repo", Ref: sha, Prompt: "Find Target."},
+		ExpectedOutput: json.RawMessage(`{"file":"foo.go","lineRange":[1,10]}`), Tags: []string{tagSuite, "find-symbol", tagVersion},
+	}}
+	_, err = d.RunPromptExperiment(context.Background(), cases, definition, []string{"safety/injection-follow-v1"})
+	if err == nil || !strings.Contains(err.Error(), "does not match planned arm") {
+		t.Fatalf("error = %v, want transcript attribution failure", err)
+	}
+}
+
 func TestDriver_PromptExperimentPropagatesBridgeFailure(t *testing.T) {
 	repoDir, sha := initTempRepo(t)
 	donmaiDir := writeFakeBinary(t, "donmai")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "grader unavailable", http.StatusBadGateway)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html>wrong route</html>"))
 	}))
 	defer server.Close()
 	exec := &promptRecordingExecutor{}

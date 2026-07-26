@@ -44,7 +44,7 @@ func TestBridge_Post_FlatIngestShapePathAndAuth(t *testing.T) {
 		_ = json.Unmarshal(body, &gotBody)
 		w.WriteHeader(http.StatusCreated)
 		// Mirror the platform route's 201 body so Post can parse the runId.
-		_, _ = w.Write([]byte(`{"runId":"evr_abc","traceId":"evt_abc","datasetId":"evd_ci","gradersRun":["structural/codeintel-task-v1","tool-use-correctness/codeintel-v1"],"gradeResults":[]}`))
+		_, _ = w.Write([]byte(`{"runId":"evr_abc","traceId":"evt_abc","datasetId":"evd_ci","gradersRun":["structural/codeintel-task-v1","tool-use-correctness/codeintel-v1"],"gradeResults":[{"graderId":"structural/codeintel-task-v1","status":"scored","score":1,"pass":true},{"graderId":"tool-use-correctness/codeintel-v1","status":"scored","score":1,"pass":true}]}`))
 	}))
 	defer srv.Close()
 
@@ -116,7 +116,7 @@ func TestBridge_Post_PromptExperimentReceipt(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &gotBody)
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"runId":"evr_prompt"}`))
+		_, _ = w.Write([]byte(`{"runId":"evr_prompt","traceId":"evt_prompt","datasetId":"evd_prompt","gradersRun":["safety/injection-follow-v1"],"gradeResults":[{"graderId":"safety/injection-follow-v1","status":"scored","score":1,"pass":true}]}`))
 	}))
 	defer srv.Close()
 
@@ -147,6 +147,42 @@ func TestBridge_Post_PromptExperimentReceipt(t *testing.T) {
 	}
 	if _, ok := experiment["systemPrompt"]; ok {
 		t.Fatal("raw system prompt must never enter the durable receipt")
+	}
+}
+
+func TestBridge_Post_Malformed2xxErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html>not the ingest route</html>"))
+	}))
+	defer srv.Close()
+	b := NewBridge(srv.URL, "", "")
+	if _, err := b.Post(context.Background(), IngestRequest{}); err == nil {
+		t.Error("a malformed 2xx response must surface as an error")
+	}
+}
+
+func TestBridge_Post_MissingGradeResultErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"runId":"evr_bad","traceId":"evt_bad","datasetId":"evd_bad","gradersRun":["safety/injection-follow-v1"],"gradeResults":[]}`))
+	}))
+	defer srv.Close()
+	b := NewBridge(srv.URL, "", "")
+	if _, err := b.Post(context.Background(), IngestRequest{}); err == nil {
+		t.Error("a 2xx response without grader results must surface as an error")
+	}
+}
+
+func TestBridge_Post_GraderErrorStatusErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"runId":"evr_bad","traceId":"evt_bad","datasetId":"evd_bad","gradersRun":["safety/injection-follow-v1"],"gradeResults":[{"graderId":"safety/injection-follow-v1","status":"error","score":null,"pass":null}]}`))
+	}))
+	defer srv.Close()
+	req := IngestRequest{GraderIDs: []string{"safety/injection-follow-v1"}}
+	if _, err := NewBridge(srv.URL, "", "").Post(context.Background(), req); err == nil {
+		t.Error("a grader error status must surface as an error")
 	}
 }
 
