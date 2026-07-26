@@ -131,7 +131,10 @@ func NewBuilder() *Builder {
 // back to the standard system_base.tmpl path unchanged.
 func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 	hasStagePrompt := strings.TrimSpace(qw.StagePrompt) != ""
-	if !hasStagePrompt && !hasIssueContext(qw) {
+	// Interactive sessions are exempt from the empty-work check: an idle
+	// PTY session awaiting terminal input is valid work even with no issue
+	// context at all (the anchor identifier is synthetic anyway).
+	if !hasStagePrompt && !qw.isInteractiveMode() && !hasIssueContext(qw) {
 		return "", "", fmt.Errorf("%w: sessionId=%q identifier=%q",
 			ErrEmptyWork, qw.SessionID, qw.IssueIdentifier)
 	}
@@ -170,6 +173,16 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 	// every dispatch path uniformly. Additive — empty/whitespace memory is
 	// a no-op.
 	systemBuf = appendMemoryBlock(systemBuf, qw.MemoryBlock)
+
+	// Interactive mode — NO templated user prompt, ever. The PTY REPL
+	// starts idle (harnesses treat an empty Spec.Prompt as "no seeded
+	// message") and any InitialPrompt seed is delivered verbatim through
+	// the runner's PTY first-input write, never through the renderer.
+	// Checked before the stage-prompt branch so a misconfigured dispatch
+	// carrying both never wraps the session in stage scaffolding either.
+	if qw.isInteractiveMode() {
+		return systemBuf, "", nil
+	}
 
 	if hasStagePrompt {
 		// Stage-prompt mode — use platform-rendered prompt verbatim
@@ -218,6 +231,11 @@ func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user
 
 	// Dispatch-time agent-memory fold (Wave 3 v1) — mirror the legacy path.
 	systemBuf = appendMemoryBlock(systemBuf, qw.MemoryBlock)
+
+	// Interactive mode — mirror the legacy path: no templated user prompt.
+	if qw.isInteractiveMode() {
+		return systemBuf, "", nil
+	}
 
 	if hasStagePrompt {
 		userBuf := renderStagePromptUser(qw)
@@ -427,6 +445,14 @@ func userTemplateName(w WorkType) string {
 	default:
 		return "user_development.tmpl"
 	}
+}
+
+// isInteractiveMode reports whether qw is a live PTY interactive-session
+// dispatch ([InteractiveRunMode]). The gate is an exact literal match —
+// batch ("" mode), interview, and any unknown mode values keep rendering
+// the work-type template byte-identically.
+func (q QueuedWork) isInteractiveMode() bool {
+	return q.Mode == InteractiveRunMode
 }
 
 func hasIssueContext(qw QueuedWork) bool {
