@@ -22,10 +22,11 @@
 //     would (or, when the advertisement mode is switched, the prompt text
 //     generated from live `donmai code --help` output).
 //
-// This package is a CONSUMER of the existing execution substrate. It reuses
-// runtime/worktree.Manager for provisioning, the frozen af-code-intelligence
-// MCP entry (runner/codeintel.go), and provider/harness/clijsonl.WriteMCPConfig
-// for authoring the exact --mcp-config a real claude session consumes. It does
+// This package is a concrete consumer of eval/experiment's balanced matrix and
+// prompt-variant planning seam. It reuses runtime/worktree.Manager for
+// provisioning, the frozen af-code-intelligence MCP entry (runner/codeintel.go),
+// and provider/harness/clijsonl.WriteMCPConfig for authoring the exact
+// --mcp-config a real claude session consumes. It does
 // NOT modify the afclient/codeintel engine or the runtime/mcp/server — those
 // shipped in v0.50.0 and are consumed as-is.
 //

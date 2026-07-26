@@ -145,15 +145,20 @@ func TestToolUseGrader(t *testing.T) {
 	c := fsCase()
 
 	// Correct tool for find-symbol (MCP FQ name) → pass.
-	withCorrect := Transcript{Arm: ArmWith, ToolCalls: []ToolCall{
+	withCorrect := Transcript{Arm: ArmWith, AdvertisedTools: []string{"mcp__af-code-intelligence__af_code_search_symbols"}, ToolCalls: []ToolCall{
 		{Name: "mcp__af-code-intelligence__af_code_search_symbols"},
 	}}
 	if got := g.Grade(ctx(), c, withCorrect); !got.Pass {
 		t.Errorf("correct tool should pass; got %+v", got)
 	}
+	genericCorrect := withCorrect
+	genericCorrect.Arm = "candidate"
+	if got := g.Grade(ctx(), c, genericCorrect); !got.Pass {
+		t.Errorf("opaque capability-enabled arm should pass; got %+v", got)
+	}
 
 	// Adoption but WRONG tool (called check_duplicate for a find-symbol task) → fail.
-	withWrong := Transcript{Arm: ArmWith, ToolCalls: []ToolCall{
+	withWrong := Transcript{Arm: ArmWith, AdvertisedTools: []string{"mcp__af-code-intelligence__af_code_search_symbols"}, ToolCalls: []ToolCall{
 		{Name: "mcp__af-code-intelligence__af_code_check_duplicate"},
 	}}
 	if got := g.Grade(ctx(), c, withWrong); got.Pass {
@@ -161,7 +166,7 @@ func TestToolUseGrader(t *testing.T) {
 	}
 
 	// NO adoption (only grep) → fail, adopted=false.
-	noAdopt := Transcript{Arm: ArmWith, ToolCalls: []ToolCall{{Name: "Bash", Arguments: json.RawMessage(`{"command":"grep -rn X"}`)}}}
+	noAdopt := Transcript{Arm: ArmWith, AdvertisedTools: []string{"mcp__af-code-intelligence__af_code_search_symbols"}, ToolCalls: []ToolCall{{Name: "Bash", Arguments: json.RawMessage(`{"command":"grep -rn X"}`)}}}
 	got := g.Grade(ctx(), c, noAdopt)
 	if got.Pass {
 		t.Errorf("no adoption must fail; got %+v", got)

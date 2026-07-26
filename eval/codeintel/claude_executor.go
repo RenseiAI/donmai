@@ -51,6 +51,10 @@ func newClaudeExecutorWithSpawner(s claudeSpawner) ClaudeExecutor { return Claud
 // Name identifies the executor in logs/reports.
 func (ClaudeExecutor) Name() string { return "claude" }
 
+// SupportsPromptExperiments reports that the live executor applies planned user
+// prompts and variant system prompts through BuildClaudeInvocation.
+func (ClaudeExecutor) SupportsPromptExperiments() bool { return true }
+
 // streamFlags are appended on top of the BuildClaudeInvocation argv when the
 // executor actually spawns claude: newline-delimited JSON events on stdout
 // (--output-format stream-json --verbose) and non-interactive tool use
@@ -67,10 +71,13 @@ var streamFlags = []string{"--output-format", "stream-json", "--verbose", "--dan
 // plus a clear wrapped error — never a panic. Whatever tool calls / answer were
 // parsed before the fault are preserved on the returned Transcript.
 func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, error) {
+	if spec.ContextReset != nil {
+		return Transcript{}, fmt.Errorf("claude executor does not implement context-reset perturbations")
+	}
 	// Control arm: mandatory contamination guard FIRST, before any spawn. The
 	// arm env is authoritative here (PATH scrubbed of donmai); a dirty control
 	// must fail the run, mirroring PlumbingExecutor.executeWithout.
-	if spec.Arm == ArmWithout {
+	if !spec.UseCodeIntel {
 		if err := VerifyControlClean(spec.Env, "donmai"); err != nil {
 			return Transcript{}, err
 		}
@@ -114,9 +121,9 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 		TokenCounts: ps.tokens,
 		SnapshotRef: snap,
 	}
-	if spec.Arm == ArmWith {
-		// Only the treatment arm was told about the code-intel tools; the grader
-		// needs the advertised set to score adoption.
+	if spec.UseCodeIntel {
+		// Only capability-enabled arms were told about the code-intel tools; the
+		// grader needs the advertised set to score adoption.
 		tr.AdvertisedTools = spec.AdvertisedTools
 	}
 

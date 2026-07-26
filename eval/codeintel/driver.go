@@ -10,13 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/RenseiAI/donmai/eval/experiment"
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
+
+var graderIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*(?:/[a-z][a-z0-9._-]*)+$`)
 
 // Config configures a Driver run.
 type Config struct {
@@ -52,7 +56,7 @@ type Config struct {
 	Logf func(string, ...any)
 }
 
-// Driver is the two-arm A/B eval orchestrator.
+// Driver is the code-intel A/B orchestrator and prompt-experiment execution adapter.
 type Driver struct {
 	cfg Config
 	wm  *worktree.Manager
@@ -233,48 +237,116 @@ type AggregateStat struct {
 	MeetsThreshold bool `json:"meetsThreshold"`
 }
 
-// Run executes the full A/B matrix over cases and returns the Report.
+// Run executes the full code-intel A/B matrix over cases and returns the Report.
+// Trial enumeration is delegated to the provider-neutral experiment package;
+// this package remains the concrete provisioning/execution/grading consumer.
 func (d *Driver) Run(ctx context.Context, cases []Case) (Report, error) {
 	rep := Report{Trials: d.cfg.Trials, Advertise: d.cfg.Advertise, Families: map[TaskType]*FamilyStat{}}
-	for _, c := range cases {
-		fam := rep.Families[c.Family()]
+	matrixCases, caseByID := experimentCases(cases)
+	matrix, err := experiment.Run(ctx, experiment.Definition{Arms: []experiment.Arm{{ID: ArmWithout}, {ID: ArmWith}}}, matrixCases, d.cfg.Trials,
+		func(ctx context.Context, trial experiment.Trial) (RunRecord, error) {
+			return d.runPlannedOne(ctx, caseByID[trial.CaseID], trial, trial.Arm.ID == ArmWith, nil, false)
+		})
+	if err != nil {
+		return rep, err
+	}
+	for _, outcome := range matrix.Outcomes {
+		rec := outcome.Result
+		fam := rep.Families[rec.Family]
 		if fam == nil {
 			fam = &FamilyStat{}
-			rep.Families[c.Family()] = fam
+			rep.Families[rec.Family] = fam
 		}
-		for trial := 1; trial <= d.cfg.Trials; trial++ {
-			for _, arm := range []Arm{ArmWithout, ArmWith} {
-				rec, err := d.runOne(ctx, c, arm, trial)
-				if err != nil {
-					return rep, fmt.Errorf("case %s arm %s trial %d: %w", c.ID, arm, trial, err)
-				}
-				accumulate(fam, rec)
-				if rec.Posted {
-					rep.PostedCount++
-				}
-				if rec.PostErr != "" {
-					rep.PostErrors++
-				}
-				rep.Records = append(rep.Records, rec)
-			}
+		accumulate(fam, rec)
+		if rec.Posted {
+			rep.PostedCount++
 		}
+		if rec.PostErr != "" {
+			rep.PostErrors++
+		}
+		rep.Records = append(rep.Records, rec)
 	}
 	rep.Aggregate = computeAggregate(rep.Families, rep.Records, cases, d.cfg.Trials)
 	return rep, nil
 }
 
-// runOne provisions one workarea, executes one arm, grades, posts, and tears down.
-func (d *Driver) runOne(ctx context.Context, c Case, arm Arm, trial int) (RunRecord, error) {
-	wa, sessionID, err := d.provision(ctx, c, arm, trial)
+// RunPromptExperiment executes arbitrary prompt arms through the same pinned
+// workarea, real executor, transcript capture, and bridge path as code-intel.
+// Generic experiments require explicit platform graders and MCP advertisement;
+// local code-intel grades remain diagnostic only.
+func (d *Driver) RunPromptExperiment(
+	ctx context.Context,
+	cases []Case,
+	definition experiment.Definition,
+	graderIDs []string,
+) (experiment.Report[RunRecord], error) {
+	if definition.ID == "" {
+		return experiment.Report[RunRecord]{}, fmt.Errorf("prompt experiment id is required")
+	}
+	if d.cfg.Advertise != AdvertiseMCP {
+		return experiment.Report[RunRecord]{}, fmt.Errorf("prompt experiments require MCP advertisement so the variant hash binds the complete appended system prompt")
+	}
+	if err := validateGraderIDs(graderIDs); err != nil {
+		return experiment.Report[RunRecord]{}, err
+	}
+	capable, ok := d.cfg.Executor.(promptExperimentExecutor)
+	if !ok || !capable.SupportsPromptExperiments() {
+		return experiment.Report[RunRecord]{}, fmt.Errorf("executor %q does not support prompt experiments", d.cfg.Executor.Name())
+	}
+	matrixCases, caseByID := experimentCases(cases)
+	return experiment.Run(ctx, definition, matrixCases, d.cfg.Trials,
+		func(ctx context.Context, trial experiment.Trial) (RunRecord, error) {
+			return d.runPlannedOne(ctx, caseByID[trial.CaseID], trial, true, graderIDs, true)
+		})
+}
+
+func validateGraderIDs(graderIDs []string) error {
+	if len(graderIDs) == 0 {
+		return fmt.Errorf("prompt experiments require at least one explicit grader id")
+	}
+	seen := make(map[string]struct{}, len(graderIDs))
+	for _, graderID := range graderIDs {
+		if len(graderID) > 160 || !graderIDPattern.MatchString(graderID) {
+			return fmt.Errorf("grader id %q must be a concrete registry path", graderID)
+		}
+		if _, ok := seen[graderID]; ok {
+			return fmt.Errorf("duplicate grader id %q", graderID)
+		}
+		seen[graderID] = struct{}{}
+	}
+	return nil
+}
+
+func experimentCases(cases []Case) ([]experiment.Case, map[string]Case) {
+	matrixCases := make([]experiment.Case, 0, len(cases))
+	caseByID := make(map[string]Case, len(cases))
+	for _, c := range cases {
+		matrixCases = append(matrixCases, experiment.Case{ID: c.ID, Prompt: c.Input.Prompt})
+		caseByID[c.ID] = c
+	}
+	return matrixCases, caseByID
+}
+
+// runPlannedOne provisions one workarea, executes one arm, grades, posts, and tears down.
+func (d *Driver) runPlannedOne(
+	ctx context.Context,
+	c Case,
+	trial experiment.Trial,
+	useCodeIntel bool,
+	graderIDs []string,
+	failOnPostError bool,
+) (RunRecord, error) {
+	arm := Arm(trial.Arm.ID)
+	wa, sessionID, err := d.provision(ctx, c, arm, trial.TrialIndex)
 	if err != nil {
 		return RunRecord{}, err
 	}
 	if !d.cfg.KeepWorkareas {
 		defer func() { _ = d.wm.Teardown(context.Background(), sessionID) }()
 	}
-	d.cfg.Logf("provisioned %s arm=%s trial=%d at %s", c.ID, arm, trial, wa)
+	d.cfg.Logf("provisioned %s arm=%s trial=%d at %s", c.ID, arm, trial.TrialIndex, wa)
 
-	spec, cleanup, err := d.buildArmSpec(ctx, c, arm, wa, sessionID)
+	spec, cleanup, err := d.buildPlannedArmSpec(ctx, c, arm, wa, sessionID, trial.Prompt, useCodeIntel, trial.ExperimentID == "")
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -286,30 +358,44 @@ func (d *Driver) runOne(ctx context.Context, c Case, arm Arm, trial int) (RunRec
 	if err != nil {
 		return RunRecord{}, fmt.Errorf("execute: %w", err)
 	}
+	if tr.Arm != arm {
+		return RunRecord{}, fmt.Errorf("execute: transcript arm %q does not match planned arm %q", tr.Arm, arm)
+	}
 
-	grades := d.grade(ctx, c, tr)
+	grades := d.grade(ctx, c, tr, useCodeIntel)
 	pass := taskSuccessPass(grades)
 
 	meta := ReportMeta{
 		CaseID: c.ID, Arm: arm, Family: string(c.Family()), Repo: c.Input.Repo, Ref: c.Input.Ref,
-		Trial: trial, Advertisement: string(d.cfg.Advertise), DatasetName: d.cfg.DatasetName,
+		Trial: trial.TrialIndex, Advertisement: string(d.cfg.Advertise), DatasetName: d.cfg.DatasetName,
 	}
 	env, err := BuildEnvelope(newID("run"), newID("trace"), sessionID, d.cfg.OrgID, d.cfg.ProjectID, d.cfg.DatasetID, c, tr, grades, meta)
 	if err != nil {
 		return RunRecord{}, err
 	}
 
-	rec := RunRecord{CaseID: c.ID, Family: c.Family(), Repo: c.Input.Repo, Arm: arm, Trial: trial, Pass: pass, Grades: grades, Envelope: env}
+	rec := RunRecord{CaseID: c.ID, Family: c.Family(), Repo: c.Input.Repo, Arm: arm, Trial: trial.TrialIndex, Pass: pass, Grades: grades, Envelope: env}
 	if d.cfg.Bridge != nil {
 		// The wire contract is the platform's flat per-trial /api/evals/ingest
 		// body (the route runs the registered graders inline). The local
 		// ReportEnvelope above stays the harness's canonical eval_runs+eval_traces
 		// capture (dumped by --dry and used for the offline record).
-		ingest := BuildIngestRequest(c, tr, trial, sessionID, d.cfg.DatasetID, d.cfg.ProjectID)
+		ingest := BuildIngestRequest(c, tr, trial.TrialIndex, sessionID, d.cfg.DatasetID, d.cfg.ProjectID)
+		if trial.ExperimentID != "" {
+			ingest.GraderIDs = append([]string(nil), graderIDs...)
+			ingest.Experiment = &ExperimentReceipt{
+				ExperimentID: trial.ExperimentID,
+				SubjectRef:   trial.Arm.SubjectRef,
+				VariantRef:   trial.Arm.VariantRef,
+			}
+		}
 		resp, perr := d.cfg.Bridge.Post(ctx, ingest)
 		if perr != nil {
 			rec.PostErr = perr.Error()
 			d.cfg.Logf("bridge post failed for %s/%s: %v", c.ID, arm, perr)
+			if failOnPostError {
+				return rec, fmt.Errorf("bridge post: %w", perr)
+			}
 		}
 		if resp != nil {
 			rec.Posted = true
@@ -320,12 +406,25 @@ func (d *Driver) runOne(ctx context.Context, c Case, arm Arm, trial int) (RunRec
 	return rec, nil
 }
 
-// buildArmSpec assembles the per-arm env + advertisement + MCP config.
-func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, _ string) (ArmSpec, func(), error) {
+// buildArmSpec assembles the legacy per-arm env + advertisement + MCP config.
+func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, sessionID string) (ArmSpec, func(), error) {
+	return d.buildPlannedArmSpec(ctx, c, arm, wa, sessionID, experiment.PromptPlan{UserPrompt: c.Input.Prompt}, arm == ArmWith, true)
+}
+
+func (d *Driver) buildPlannedArmSpec(
+	ctx context.Context,
+	c Case,
+	arm Arm,
+	wa, _ string,
+	plan experiment.PromptPlan,
+	useCodeIntel bool,
+	includePromptSuffix bool,
+) (ArmSpec, func(), error) {
 	base := runtimeenv.FilterRunnerOnly(os.Environ())
 	spec := ArmSpec{
 		Arm: arm, Case: c, Workarea: wa, DonmaiBin: d.cfg.DonmaiBin,
-		Budget: d.cfg.Budget, AdvertiseMode: d.cfg.Advertise, SnapshotID: workareaLeaf(wa),
+		Budget: d.cfg.Budget, AdvertiseMode: d.cfg.Advertise, UseCodeIntel: useCodeIntel, SnapshotID: workareaLeaf(wa),
+		Prompt: plan.UserPrompt, VariantSystemPrompt: plan.SystemPrompt, ContextReset: plan.ContextReset,
 	}
 	// Neutralize donmai on the SHARED base so BOTH arms resolve an identical set
 	// of non-donmai tools (rg/gh/git). Dropping the whole directory that holds
@@ -337,8 +436,8 @@ func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, _ string
 	if err != nil {
 		return ArmSpec{}, nil, fmt.Errorf("neutralize control PATH: %w", err)
 	}
-	if arm == ArmWithout {
-		// Control: the neutral base — same tools as WITH, minus donmai.
+	if !useCodeIntel {
+		// Control: the neutral base — same tools as treatment, minus donmai.
 		spec.Env = neutralBase
 		return spec, neutralCleanup, nil
 	}
@@ -358,7 +457,11 @@ func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, _ string
 		return ArmSpec{}, nil, fmt.Errorf("advertise: %w", err)
 	}
 	spec.MCPServers = servers
-	spec.PromptSuffix = suffix
+	if includePromptSuffix {
+		spec.PromptSuffix = suffix
+	}
+	// Prompt experiments use MCP discovery without a separate shared system
+	// suffix, so VariantRef hashes the complete appended system-prompt bytes.
 	spec.AdvertisedTools = d.ad.AdvertisedToolNames(c.Family())
 	if len(servers) > 0 {
 		path, werr := clijsonl.WriteMCPConfig(servers)
@@ -373,15 +476,16 @@ func (d *Driver) buildArmSpec(ctx context.Context, c Case, arm Arm, wa, _ string
 	return spec, cleanup, nil
 }
 
-// grade runs the task-success grader (+ tool-use grader on the WITH arm).
-func (d *Driver) grade(ctx context.Context, c Case, tr Transcript) []GradeResult {
+// grade runs the task-success grader plus the tool-use grader for every arm
+// that received the code-intel capability profile.
+func (d *Driver) grade(ctx context.Context, c Case, tr Transcript, useCodeIntel bool) []GradeResult {
 	var grades []GradeResult
 	if c.Family() == TaskRefactorAcrossFiles {
 		grades = append(grades, NewRubricGrader(d.cfg.Judge).Grade(ctx, c, tr))
 	} else if g := TaskGraderFor(c.Family()); g != nil {
 		grades = append(grades, g.Grade(ctx, c, tr))
 	}
-	if tr.Arm == ArmWith {
+	if useCodeIntel {
 		grades = append(grades, NewToolUseGrader().Grade(ctx, c, tr))
 	}
 	return grades
