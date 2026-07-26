@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/eval/experiment"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
@@ -35,6 +36,18 @@ type ArmSpec struct {
 	Env           []string // arm env: WITHOUT has donmai scrubbed from PATH
 	Budget        Budget
 	AdvertiseMode AdvertiseMode
+	// UseCodeIntel selects the capability profile independently of the opaque arm
+	// label. Legacy WITH sets it; generic prompt experiments set it for every arm.
+	UseCodeIntel bool
+	// Prompt is the exact user task after deterministic experiment planning.
+	// Empty preserves the legacy Case.Input.Prompt behavior.
+	Prompt string
+	// VariantSystemPrompt is process-local prompt-variant content. Durable
+	// receipts carry only the immutable variant ref, never this text.
+	VariantSystemPrompt string
+	// ContextReset is a deterministic perturbation plan. An executor that cannot
+	// implement it must fail closed rather than silently compare different trials.
+	ContextReset *experiment.ContextReset
 	// MCPServers is the authored af-code-intelligence entry set (WITH + mcp mode).
 	MCPServers []agent.MCPServerConfig
 	// MCPConfigPath is the written --mcp-config file a real agent harness would
@@ -54,6 +67,10 @@ type ArmSpec struct {
 type Executor interface {
 	Name() string
 	Execute(ctx context.Context, spec ArmSpec) (Transcript, error)
+}
+
+type promptExperimentExecutor interface {
+	SupportsPromptExperiments() bool
 }
 
 // PlumbingExecutor is a deterministic, no-LLM stand-in agent used by the
@@ -81,10 +98,20 @@ func NewPlumbingExecutor() PlumbingExecutor { return PlumbingExecutor{} }
 // Name identifies the executor in logs/reports.
 func (PlumbingExecutor) Name() string { return "plumbing" }
 
+// SupportsPromptExperiments reports that the scripted plumbing path cannot
+// faithfully apply arbitrary prompt variants.
+func (PlumbingExecutor) SupportsPromptExperiments() bool { return false }
+
 // Execute runs one arm of the plumbing agent and returns its transcript.
 func (e PlumbingExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, error) {
+	if spec.ContextReset != nil {
+		return Transcript{}, fmt.Errorf("plumbing executor does not implement context-reset perturbations")
+	}
+	if spec.VariantSystemPrompt != "" || (spec.Prompt != "" && spec.Prompt != spec.Case.Input.Prompt) {
+		return Transcript{}, fmt.Errorf("plumbing executor does not implement prompt-variant execution")
+	}
 	snap := &SnapshotRef{Provider: "local", SnapshotID: spec.SnapshotID, Retain: RetainEvalPermanent, CapturedAt: nowISO()}
-	if spec.Arm == ArmWithout {
+	if !spec.UseCodeIntel {
 		return e.executeWithout(ctx, spec, snap)
 	}
 	return e.executeWith(ctx, spec, snap)
@@ -101,7 +128,7 @@ func (e PlumbingExecutor) executeWithout(ctx context.Context, spec ArmSpec, snap
 	tc, resultText := e.grep(ctx, spec, query)
 	answer := deriveAnswerFromGrep(spec.Case, resultText)
 	return Transcript{
-		Arm:         ArmWithout,
+		Arm:         spec.Arm,
 		FinalAnswer: answer,
 		ToolCalls:   []ToolCall{tc},
 		TurnCount:   1,
@@ -137,7 +164,7 @@ func (e PlumbingExecutor) executeWithMCP(ctx context.Context, spec ArmSpec, snap
 	tc := ToolCall{Name: fq, Arguments: argsJSON, ResultText: truncate(res.Text, 4000), IsError: res.IsError}
 	answer := deriveAnswerFromTool(spec.Case, res.Text)
 	return Transcript{
-		Arm:             ArmWith,
+		Arm:             spec.Arm,
 		FinalAnswer:     answer,
 		ToolCalls:       []ToolCall{tc},
 		TurnCount:       1,
@@ -168,7 +195,7 @@ func (e PlumbingExecutor) executeWithCLI(ctx context.Context, spec ArmSpec, snap
 	tc := ToolCall{Name: "Bash", Arguments: argsJSON, ResultText: truncate(string(out), 4000)}
 	answer := deriveAnswerFromTool(spec.Case, string(out))
 	return Transcript{
-		Arm:             ArmWith,
+		Arm:             spec.Arm,
 		FinalAnswer:     answer,
 		ToolCalls:       []ToolCall{tc},
 		TurnCount:       1,
@@ -185,7 +212,7 @@ func (e PlumbingExecutor) placeholderWith(spec ArmSpec, snap *SnapshotRef, note 
 	args, _ := json.Marshal(map[string]any{})
 	tc := ToolCall{Name: "mcp__" + CodeIntelServerName + "__af_code_get_repo_map", Arguments: args, ResultText: note}
 	return Transcript{
-		Arm: ArmWith, FinalAnswer: note, ToolCalls: []ToolCall{tc}, TurnCount: 1,
+		Arm: spec.Arm, FinalAnswer: note, ToolCalls: []ToolCall{tc}, TurnCount: 1,
 		TokenCounts: synthTokens(len(spec.Case.Input.Prompt), len(note)), SnapshotRef: snap,
 		AdvertisedTools: spec.AdvertisedTools,
 	}, nil
@@ -535,14 +562,25 @@ type AgentInvocation struct {
 // --strict-mcp-config when the WITH arm has an authored MCP entry. It does NOT
 // run anything — it is the contract a live executor binds to.
 func BuildClaudeInvocation(spec ArmSpec) AgentInvocation {
-	argv := []string{"claude", "-p", spec.Case.Input.Prompt}
+	prompt := spec.Prompt
+	if prompt == "" {
+		prompt = spec.Case.Input.Prompt
+	}
+	argv := []string{"claude", "-p", prompt}
 	if spec.Budget.MaxTurns > 0 {
 		argv = append(argv, "--max-turns", fmt.Sprintf("%d", spec.Budget.MaxTurns))
 	}
+	var systemParts []string
 	if spec.PromptSuffix != "" {
-		argv = append(argv, "--append-system-prompt", spec.PromptSuffix)
+		systemParts = append(systemParts, spec.PromptSuffix)
 	}
-	if spec.Arm == ArmWith && spec.MCPConfigPath != "" {
+	if spec.VariantSystemPrompt != "" {
+		systemParts = append(systemParts, spec.VariantSystemPrompt)
+	}
+	if len(systemParts) > 0 {
+		argv = append(argv, "--append-system-prompt", strings.Join(systemParts, "\n\n"))
+	}
+	if spec.UseCodeIntel && spec.MCPConfigPath != "" {
 		argv = append(argv, "--mcp-config", spec.MCPConfigPath, "--strict-mcp-config")
 		for _, fq := range spec.AdvertisedTools {
 			argv = append(argv, "--allowedTools", fq)

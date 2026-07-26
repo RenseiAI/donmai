@@ -56,6 +56,7 @@ func TestClaudeExecutor_With_ParsesSymbolSearch(t *testing.T) {
 	waWith := t.TempDir()
 	spec := ArmSpec{
 		Arm:             ArmWith,
+		UseCodeIntel:    true,
 		Case:            fsCaseFor("BuildClaudeInvocation"),
 		Workarea:        waWith,
 		Env:             []string{"PATH=/with/bin"},
@@ -185,7 +186,7 @@ func TestClaudeExecutor_ZeroToolSession(t *testing.T) {
 	}, "\n")
 	fs := &fakeSpawn{stream: stream}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "z"})
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "z"})
 	if err != nil {
 		t.Fatalf("zero-tool execute: %v", err)
 	}
@@ -213,7 +214,7 @@ func TestClaudeExecutor_GarbledStream(t *testing.T) {
 	}, "\n")
 	fs := &fakeSpawn{stream: stream}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "g"})
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "g"})
 	if err == nil {
 		t.Fatal("garbled/truncated stream must yield an error")
 	}
@@ -228,7 +229,7 @@ func TestClaudeExecutor_GarbledStream(t *testing.T) {
 func TestClaudeExecutor_NonZeroExit(t *testing.T) {
 	fs := &fakeSpawn{stream: readFixture(t, "claude_without_grep.jsonl"), waitErr: &fakeExitErr{}, stderr: "boom"}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "e"})
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "e"})
 	if err == nil {
 		t.Fatal("non-zero claude exit must yield an error")
 	}
@@ -253,7 +254,7 @@ func TestClaudeExecutor_ErrorMaxTurns_RecordedNotAborted(t *testing.T) {
 	// (fakeSpawn waitErr defaults to nil) reproduces the exact headless scenario.
 	fs := &fakeSpawn{stream: readFixture(t, "claude_error_max_turns.jsonl")}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "emt"})
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "emt"})
 	if err != nil {
 		t.Fatalf("error_max_turns is a recorded task failure, not a harness error: %v", err)
 	}
@@ -287,7 +288,7 @@ func TestClaudeExecutor_ErrorDuringExecution_RecordedNotAborted(t *testing.T) {
 	}, "\n")
 	fs := &fakeSpawn{stream: stream}
 	exec := newClaudeExecutorWithSpawner(fs.spawn)
-	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "ede"})
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "ede"})
 	if err != nil {
 		t.Fatalf("error_during_execution is a recorded task failure, not a harness error: %v", err)
 	}

@@ -32,8 +32,9 @@ const DefaultBridgePath = "/api/evals/ingest"
 // the platform graders. The driver's own Go graders still drive its local A/B
 // console rollup + efficiency-threshold verdict; the two are independent by design.
 type IngestRequest struct {
-	// Arm is which side of the A/B this trial belongs to ("with" | "without").
-	// The platform only auto-adds the tool-use-correctness grader on "with".
+	// Arm is the bounded opaque experiment arm. Legacy code-intel callers retain
+	// "with" | "without"; the platform only auto-adds tool-use-correctness on
+	// the exact legacy "with" value.
 	Arm Arm `json:"arm"`
 	// DatasetID is the evd_ id of the registered codeintel-benchmark dataset
 	// (validated by the platform for FK integrity + org visibility). Supplied via
@@ -66,16 +67,39 @@ type IngestRequest struct {
 	TokenCounts TokenCounts `json:"tokenCounts"`
 	// ProjectID is optional reporting context for the eval_runs row.
 	ProjectID string `json:"projectId,omitempty"`
+	// GraderIDs is required for generic experiment families without registered
+	// defaults. Omitted for legacy code-intel requests to preserve their wire.
+	GraderIDs []string `json:"graderIds,omitempty"`
+	// Experiment carries immutable prompt-variant identity, never raw prompt text.
+	Experiment *ExperimentReceipt `json:"experiment,omitempty"`
+}
+
+// ExperimentReceipt is the durable identity attached to a prompt-experiment
+// trial. VariantRef must already have passed experiment.Definition validation.
+type ExperimentReceipt struct {
+	ExperimentID string `json:"experimentId"`
+	SubjectRef   string `json:"subjectRef"`
+	VariantRef   string `json:"variantRef"`
 }
 
 // IngestResponse is the platform route's 201 body. The driver logs the
 // platform-assigned runId so an operator can find the row in /admin/evals.
 type IngestResponse struct {
-	RunID        string        `json:"runId"`
-	TraceID      string        `json:"traceId"`
-	DatasetID    string        `json:"datasetId"`
-	GradersRun   []string      `json:"gradersRun"`
-	GradeResults []GradeResult `json:"gradeResults"`
+	RunID        string              `json:"runId"`
+	TraceID      string              `json:"traceId"`
+	DatasetID    string              `json:"datasetId"`
+	GradersRun   []string            `json:"gradersRun"`
+	GradeResults []IngestGradeResult `json:"gradeResults"`
+}
+
+// IngestGradeResult mirrors the platform's status-bearing grader response.
+// Pointer verdict fields preserve null for pending/skipped/error results so the
+// bridge cannot silently coerce an ungraded receipt into score=0/pass=false.
+type IngestGradeResult struct {
+	GraderID string   `json:"graderId"`
+	Status   string   `json:"status"`
+	Score    *float64 `json:"score"`
+	Pass     *bool    `json:"pass"`
 }
 
 // BuildIngestRequest assembles the per-trial ingest body from a graded arm
@@ -155,16 +179,54 @@ func (b *Bridge) Post(ctx context.Context, req IngestRequest) (*IngestResponse, 
 		return nil, fmt.Errorf("post ingest request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return nil, fmt.Errorf("read ingest response: %w", err)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("bridge POST %s: HTTP %d: %s", url, resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	out := &IngestResponse{}
-	if len(bytes.TrimSpace(respBody)) > 0 {
-		// Best-effort: the platform returns {runId, traceId, gradersRun,
-		// gradeResults}. A body we can't parse is not a post failure — the row
-		// was written (2xx); we just won't have the runId to log.
-		_ = json.Unmarshal(respBody, out)
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return nil, fmt.Errorf("decode ingest response: %w", err)
+	}
+	if strings.TrimSpace(out.RunID) == "" || strings.TrimSpace(out.TraceID) == "" || strings.TrimSpace(out.DatasetID) == "" || len(out.GradersRun) == 0 {
+		return nil, fmt.Errorf("decode ingest response: missing runId, traceId, datasetId, or gradersRun")
+	}
+	resultGraders := make(map[string]struct{}, len(out.GradeResults))
+	for _, result := range out.GradeResults {
+		if strings.TrimSpace(result.GraderID) == "" {
+			return nil, fmt.Errorf("decode ingest response: grade result missing graderId")
+		}
+		if result.Status != "scored" || result.Score == nil || result.Pass == nil {
+			return nil, fmt.Errorf("decode ingest response: grader %q returned non-scored status %q", result.GraderID, result.Status)
+		}
+		resultGraders[result.GraderID] = struct{}{}
+	}
+	for _, graderID := range out.GradersRun {
+		if _, ok := resultGraders[graderID]; !ok {
+			return nil, fmt.Errorf("decode ingest response: missing grade result for %q", graderID)
+		}
+	}
+	if len(req.GraderIDs) > 0 && !sameStrings(req.GraderIDs, out.GradersRun) {
+		return nil, fmt.Errorf("decode ingest response: gradersRun does not match requested graderIds")
 	}
 	return out, nil
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[string]int, len(left))
+	for _, value := range left {
+		counts[value]++
+	}
+	for _, value := range right {
+		counts[value]--
+		if counts[value] < 0 {
+			return false
+		}
+	}
+	return true
 }

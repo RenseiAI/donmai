@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/RenseiAI/donmai/eval/experiment"
 )
 
-// Arm identifies which side of the A/B comparison a run belongs to.
-type Arm string
+// Arm identifies an experiment arm. It aliases the provider-neutral arm type
+// so the code-intel A/B remains a concrete consumer of the generic matrix.
+type Arm = experiment.ArmID
 
 const (
 	// ArmWith is the treatment arm: baseline tools + the real code-intel MCP
