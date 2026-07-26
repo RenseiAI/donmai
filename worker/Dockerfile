@@ -26,15 +26,32 @@
 # (imagePullSecrets if the package is private).
 
 # --- build stage: compile donmai from source (matches .goreleaser build) ---
-FROM golang:1.25.12-bookworm AS build
+# Pinned to $BUILDPLATFORM and cross-compiled to $TARGETPLATFORM rather than
+# run under QEMU. CGO_ENABLED=0 makes this a pure Go cross-compile — the same
+# thing .goreleaser does to produce every published arch from one host — so the
+# emitted binary is byte-for-byte the arch we asked for, with no emulator in
+# the loop. Emulating this stage cost ~178s for the linux/arm64 leg versus
+# ~22s native (measured, worker-image-pr run 30196904421).
+FROM --platform=$BUILDPLATFORM golang:1.25.12-bookworm AS build
 ARG DONMAI_VERSION=dev
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ENV CGO_ENABLED=0
-RUN go build -trimpath -ldflags "-s -w -X main.version=${DONMAI_VERSION}" \
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags "-s -w -X main.version=${DONMAI_VERSION}" \
     -o /out/donmai ./cmd/donmai
+
+# --- go toolchain stage: the TARGET-arch Go toolchain for the runtime image ---
+# The runtime image ships a real Go toolchain for RW4 Go reachability, and that
+# toolchain must be native to the image's own arch — it cannot come from the
+# cross-compiling `build` stage above, which is always $BUILDPLATFORM. This
+# stage runs no commands; buildkit only pulls layers and COPYs out of it, so
+# naming it for $TARGETPLATFORM costs no emulation.
+FROM golang:1.25.12-bookworm AS gotoolchain
 
 # --- ts-morph deps stage: pre-install the code-survival TS reachability deps ---
 # RW4 reachability runs a baked ts-morph node script as a subprocess. Pre-install
@@ -68,7 +85,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Go toolchain for RW4 Go reachability (matches the build stage's 1.25).
-COPY --from=build /usr/local/go /usr/local/go
+# Sourced from the target-arch `gotoolchain` stage, NOT from `build`: `build`
+# cross-compiles from $BUILDPLATFORM and its /usr/local/go is the builder's
+# arch, which would be unrunnable inside a foreign-arch runtime image.
+COPY --from=gotoolchain /usr/local/go /usr/local/go
 ENV PATH="/usr/local/go/bin:${PATH}"
 # GOFLAGS/GOTOOLCHAIN: do not auto-download a newer toolchain at scan time (the
 # box is network-restricted to the clone remote); use the baked one as-is.

@@ -3,6 +3,17 @@ name: worker-image-pr
 on:
   pull_request:
     branches: [main]
+    # Prose-only changes cannot alter the image: the build stage compiles Go
+    # sources and the runtime stage installs pinned toolchains, neither of
+    # which reads a Markdown file. PR #223 (CHANGELOG.md, one file) still paid
+    # a full 8-minute multi-arch build. `paths-ignore` fails safe — a PR that
+    # touches ANY non-ignored file still builds — and this job is not a
+    # required status check on main (required: `test`, `Secret scan
+    # (trufflehog)`), so a skipped run cannot stall a PR or the merge queue.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
 
 permissions:
   contents: read
@@ -21,9 +32,20 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
 
+      # setup-docker-builder mounts a persistent buildkit state dir (a
+      # Blacksmith "sticky disk", keyed per Dockerfile) at /var/lib/buildkit and
+      # commits it back at end of job, so layers already persist across runs
+      # without any cache-from/cache-to. Blacksmith's own guidance: "Any
+      # external caching that was configured with cache-from and cache-to
+      # directives can now be removed."
       - name: Setup Blacksmith Builder
         uses: useblacksmith/setup-docker-builder@6ff44f8e5255f9d8aa31ef22f7e57a2d926b7da0 # v1.11.0
 
+      # The `type=gha` exporter that used to live here was pure overhead on top
+      # of that sticky disk: `exporting to GitHub Actions Cache` measured 247.7s
+      # of a 442s step in run 30196904421 — 56% of the job — re-uploading every
+      # layer of every stage (mode=max) over the network on each PR, to seed a
+      # cache the Blacksmith builder was not the one reading from.
       - name: Build worker image
         uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2.2.0
         with:
@@ -33,5 +55,3 @@ jobs:
           push: false
           build-args: |
             DONMAI_VERSION=pr-${{ github.event.pull_request.number }}-${{ github.sha }}
-          cache-from: type=gha,scope=worker-image-pr
-          cache-to: type=gha,mode=max,scope=worker-image-pr
