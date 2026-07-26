@@ -237,7 +237,7 @@
       "structuredVia": "json-schema",
       "legacyProviderId": null,
       "stability": "experimental",
-      "smoked": false
+      "smoked": true
     },
     {
       "harness": "pi",
