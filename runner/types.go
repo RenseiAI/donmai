@@ -147,8 +147,11 @@ type ResolvedProfile struct {
 // two must never be conflated — interactive must not trip the interview
 // branch or inherit its thinking-only tool lockdown. The platform emits
 // this literal on the wire (opaquely forwarded by the daemon SessionDetail
-// as QueuedWork.Mode); the runner is the consumer.
-const interactiveRunMode = "interactive"
+// as QueuedWork.Mode); the runner and the prompt renderer (which suppresses
+// the work-type user template for interactive sessions) are the consumers.
+// Aliased to the canonical prompt.InteractiveRunMode so the wire literal is
+// spelled exactly once.
+const interactiveRunMode = prompt.InteractiveRunMode
 
 // isInterview reports whether this QueuedWork runs the interactive
 // interview loop rather than the one-shot headless path. The
