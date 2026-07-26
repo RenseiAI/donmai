@@ -63,9 +63,15 @@ var (
 // wire's omitempty tag then keeps the body byte-identical for existing
 // headless / interview sessions). Named so the constant is written once and
 // the loop.go heartbeat wiring reads it declaratively (W4 amendment 4).
+//
+// Returns heartbeat.SessionClassInteractive (== interactiveRunMode) rather
+// than the local run-mode constant: the pulser keys its NON-FATAL loss
+// posture (degrade + keep beating instead of LostOwnership on heartbeat
+// loss / refreshed=false) off exact equality with that constant, so the
+// stamp and the gate must never drift apart.
 func interactiveSessionClass(qw QueuedWork) string {
 	if qw.isInteractive() {
-		return interactiveRunMode
+		return heartbeat.SessionClassInteractive
 	}
 	return ""
 }
@@ -174,9 +180,15 @@ func (r *Runner) dispatchInteractive(
 	r.postInteractiveActivity(interactiveCtx, worktreePath, sink, "interactive-session-started",
 		"interactive PTY session started")
 
-	// Operator-stop signal (lock-refresh stop=true / 3-strike hand-off). Resolve
-	// it before initial-prompt delivery so a PTY child that is not reading input
-	// cannot hide a deterministic stop behind a blocked write.
+	// Operator-stop signal. Because this session's heartbeat carries
+	// sessionClass=interactive, the pulser NEVER closes LostOwnership on
+	// heartbeat loss or a refused refresh — it degrades and keeps beating
+	// (see heartbeat.SessionClassInteractive). In practice this channel
+	// therefore fires only for the platform's explicit deterministic cancel
+	// ({"stop": true}); the FailureLostOwnership classification below is
+	// retained as defense in depth. Resolve it before initial-prompt
+	// delivery so a PTY child that is not reading input cannot hide a
+	// deterministic stop behind a blocked write.
 	var lost <-chan struct{}
 	if pulser != nil {
 		lost = pulser.LostOwnership()
