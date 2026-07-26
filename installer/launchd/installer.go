@@ -23,10 +23,18 @@
 //
 // Restart contract:
 //
-//	The plist sets KeepAlive=<dict><SuccessfulExit><false/></dict>: launchd
-//	restarts on a non-zero exit (crash, OOM, panic) but NOT after a clean
-//	`daemon run` returning 0 (operator-initiated stops stick). A 30s
+//	The plist sets KeepAlive=<dict><SuccessfulExit><false/><Crashed><true/></dict>:
+//	launchd restarts on a non-zero exit (crash, OOM, panic) but NOT after a
+//	clean `daemon run` returning 0 (operator-initiated stops stick). A 30s
 //	ThrottleInterval prevents rapid-restart storms on crash loops.
+//
+// Durability contract (session-hosting daemons):
+//
+//	ExitTimeOut (ExitTimeOutSeconds) covers the daemon's graceful session
+//	drain so launchd does not SIGKILL the job process group mid-drain;
+//	AbandonProcessGroup orphans hosted session children instead of killing
+//	them with the job; LegacyTimers keeps heartbeat/token-refresh timers
+//	from being deferred by launchd timer coalescing on battery.
 package launchd
 
 import (
@@ -57,6 +65,15 @@ const LaunchdLabel = "dev.donmai.daemon"
 // value without duplicating the string literal. Must never be used by the
 // OSS donmai installer — keep the two registrations disjoint.
 const RenseiDaemonLabel = "dev.rensei.daemon"
+
+// ExitTimeOutSeconds is the launchd ExitTimeOut written into the generated
+// plist: the window between launchd's SIGTERM and its SIGKILL of the whole
+// job process group. It must be at least the daemon's graceful session
+// drain — the config default is 600s (daemon config drainTimeoutSeconds) —
+// or every restart/upgrade/plist reload SIGKILLs hosted sessions mid-drain.
+// 630 = the 600s config-default drain + 30s escalation margin. If the drain
+// default ever grows, grow this with it (a pinning test asserts coverage).
+const ExitTimeOutSeconds = 630
 
 // DaemonSubcommand is the subcommand the host binary registers for the
 // LaunchAgent entrypoint. The locked decision is to register
@@ -274,17 +291,46 @@ func GeneratePlist(hostBinPath, logPath, errorLogPath string) (string, error) {
     (<true/>) respawned on any exit and turned a clean host stop into a
     no-op against the running process. SuccessfulExit=false means respawn
     only when the program exited unsuccessfully (crashes recover,
-    operator-initiated stops stick).
+    operator-initiated stops stick). Crashed=true makes the crash-respawn
+    half explicit rather than implied.
   -->
   <key>KeepAlive</key>
   <dict>
     <key>SuccessfulExit</key>
     <false/>
+    <key>Crashed</key>
+    <true/>
   </dict>
 
   <!-- Throttle crash-restarts to once per 30 seconds. -->
   <key>ThrottleInterval</key>
   <integer>30</integer>
+
+  <!--
+    Durability keys (see the pinning tests in installer_test.go):
+
+    ExitTimeOut must cover the daemon's session drain. launchd's default
+    exit window SIGKILLs the whole job process group long before the
+    daemon's graceful drain (config default 600s, daemon config
+    drainTimeoutSeconds) can finish, killing hosted sessions mid-drain on
+    every restart/upgrade/plist reload. 630 = the 600s config-default
+    drain + 30s escalation margin.
+
+    AbandonProcessGroup orphans hosted session children instead of
+    SIGKILLing them with the job — the prerequisite for any
+    orphan-and-re-adopt supervision design.
+
+    LegacyTimers stops launchd timer coalescing from deferring
+    heartbeat/token-refresh timers on battery.
+  -->
+  <key>ExitTimeOut</key>
+  <integer>` + strconv.Itoa(ExitTimeOutSeconds) + `</integer>
+
+  <key>AbandonProcessGroup</key>
+  <true/>
+
+  <key>LegacyTimers</key>
+  <true/>
 
   <key>StandardOutPath</key>
   <string>` + escapeXML(logPath) + `</string>
