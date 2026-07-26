@@ -846,3 +846,288 @@ func TestCredentialProviderOverridesCachedCredentials(t *testing.T) {
 		t.Fatalf("body = %v, want fresh worker id", got)
 	}
 }
+
+// ── Interactive non-fatal heartbeat-loss posture ─────────────────────────────
+//
+// For SessionClass=interactive, heartbeat loss must DEGRADE, never kill: the
+// pulser never closes LostOwnership on failed ticks or a refused refresh
+// (refreshed=false); it keeps beating and resumes on its own when the control
+// plane is reachable again. Only the explicit {"stop": true} operator cancel
+// stays fatal. Every other class keeps the fail-fast fuse. See
+// heartbeat.SessionClassInteractive.
+
+// waitFor polls cond every 2ms until it holds or the deadline passes.
+func waitFor(t *testing.T, d time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return cond()
+}
+
+// TestHeartbeatLossFatalityBySessionClass contrasts the two loss postures on
+// identical failing control planes: non-interactive classes trip the fatal
+// fuse (HTTP failure) or lose ownership immediately (refreshed=false), while
+// the interactive class survives BOTH — including strike counts well past
+// the threshold, the compressed-time equivalent of a >65s partition.
+func TestHeartbeatLossFatalityBySessionClass(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		sessionClass string
+		handler      http.HandlerFunc
+		wantLost     bool
+	}{
+		{
+			name:         "default class trips fuse on http failure",
+			sessionClass: "",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "unreachable", http.StatusInternalServerError)
+			},
+			wantLost: true,
+		},
+		{
+			name:         "default class dies immediately on refreshed=false",
+			sessionClass: "",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": false})
+			},
+			wantLost: true,
+		},
+		{
+			name:         "interactive survives http failure past the fuse",
+			sessionClass: heartbeat.SessionClassInteractive,
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "unreachable", http.StatusInternalServerError)
+			},
+			wantLost: false,
+		},
+		{
+			name:         "interactive survives refreshed=false past the fuse",
+			sessionClass: heartbeat.SessionClassInteractive,
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": false})
+			},
+			wantLost: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newServer(t, tt.handler)
+			p, err := heartbeat.New(heartbeat.Config{
+				SessionID:          "s1",
+				BaseURL:            srv.URL,
+				HTTPClient:         srv.Client(),
+				Interval:           5 * time.Millisecond,
+				MaxAttemptsPerTick: 1,
+				StrikesUntilLost:   3,
+				Sleep:              func(time.Duration) {},
+				SessionClass:       tt.sessionClass,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if err := p.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = p.Stop() })
+
+			if tt.wantLost {
+				select {
+				case <-p.LostOwnership():
+					// fail-fast preserved
+				case <-time.After(2 * time.Second):
+					t.Fatalf("LostOwnership did not fire (strikes=%d)", p.Strikes())
+				}
+				return
+			}
+
+			// Drive the failure well past the fuse threshold — the
+			// compressed-time equivalent of a >65s partition (>= 2x the
+			// 3-strike fuse) — and require ownership intact throughout.
+			if !waitFor(t, 2*time.Second, func() bool { return p.Strikes() >= 6 }) {
+				t.Fatalf("strikes did not accumulate past the fuse, got %d", p.Strikes())
+			}
+			select {
+			case <-p.LostOwnership():
+				t.Fatalf("LostOwnership fired for interactive class at %d strikes — heartbeat loss must be non-fatal", p.Strikes())
+			default:
+			}
+			if !p.Degraded() {
+				t.Error("Degraded() = false past the strike threshold; interactive loss state must be marked")
+			}
+			if p.StopRequested() {
+				t.Error("StopRequested = true; heartbeat loss is not an operator cancel")
+			}
+		})
+	}
+}
+
+// TestInteractivePartitionRecovery proves the resume half of the posture: a
+// simulated partition longer than the fuse window (>= 5 failed ticks vs the
+// 3-strike fuse — compressed-time stand-in for a >65s outage) neither kills
+// the session nor stops the loop, and once connectivity returns the pulser
+// resumes successful heartbeating on its own (strikes reset, degraded state
+// clears, LastTick advances).
+func TestInteractivePartitionRecovery(t *testing.T) {
+	t.Parallel()
+
+	const failedTicks = 5
+	var hits atomic.Int64
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) <= failedTicks {
+			http.Error(w, "partition", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+	})
+
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           5 * time.Millisecond,
+		MaxAttemptsPerTick: 1,
+		StrikesUntilLost:   3,
+		Sleep:              func(time.Duration) {},
+		SessionClass:       heartbeat.SessionClassInteractive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	// The partition heals only after the fuse would have tripped; the
+	// pulser must still get there and recover.
+	if !waitFor(t, 2*time.Second, func() bool { return p.LastTick() != 0 && p.Strikes() == 0 }) {
+		t.Fatalf("heartbeat did not resume after the partition healed (hits=%d strikes=%d lastTick=%d)",
+			hits.Load(), p.Strikes(), p.LastTick())
+	}
+	if p.Degraded() {
+		t.Error("Degraded() = true after recovery; must clear on the first successful tick")
+	}
+	select {
+	case <-p.LostOwnership():
+		t.Fatal("LostOwnership fired across a recoverable partition")
+	default:
+	}
+
+	// Beating continues at cadence after recovery — the loop did not exit.
+	after := hits.Load()
+	if !waitFor(t, 2*time.Second, func() bool { return hits.Load() > after }) {
+		t.Fatalf("heartbeat loop stopped ticking after recovery (hits stuck at %d)", after)
+	}
+}
+
+// TestInteractiveRefusedRefreshFirstTickRecovery pins the post-wake shape:
+// the FIRST tick (Start's synchronous one — the first tick after a host
+// wakes) answering refreshed=false must not kill an interactive session,
+// and a later accepted refresh restores normal heartbeating.
+func TestInteractiveRefusedRefreshFirstTickRecovery(t *testing.T) {
+	t.Parallel()
+
+	const refusedTicks = 4
+	var hits atomic.Int64
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		refreshed := hits.Add(1) > refusedTicks
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": refreshed})
+	})
+
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           5 * time.Millisecond,
+		MaxAttemptsPerTick: 1,
+		StrikesUntilLost:   3,
+		Sleep:              func(time.Duration) {},
+		SessionClass:       heartbeat.SessionClassInteractive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	// The synchronous first tick has already run and was refused: the old
+	// behavior called loseOwnershipNow right here (the first-post-wake-tick
+	// killer). Ownership must be intact.
+	select {
+	case <-p.LostOwnership():
+		t.Fatal("LostOwnership fired on first-tick refreshed=false for interactive class")
+	default:
+	}
+	if p.StopRequested() {
+		t.Error("StopRequested = true on refreshed=false; only stop:true may set it")
+	}
+
+	if !waitFor(t, 2*time.Second, func() bool { return p.LastTick() != 0 && p.Strikes() == 0 }) {
+		t.Fatalf("heartbeat did not resume after refresh was accepted again (hits=%d strikes=%d)",
+			hits.Load(), p.Strikes())
+	}
+	select {
+	case <-p.LostOwnership():
+		t.Fatal("LostOwnership fired despite recovery")
+	default:
+	}
+}
+
+// TestInteractiveStopTrueStillFatal guards the deliberate exception: the
+// platform's deterministic operator cancel ({"stop": true}) is honored for
+// interactive sessions exactly as for every other class — non-fatality
+// covers heartbeat LOSS, not explicit stops.
+func TestInteractiveStopTrueStillFatal(t *testing.T) {
+	t.Parallel()
+
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true, "stop": true})
+	})
+
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           24 * time.Hour, // the synchronous first tick must suffice
+		MaxAttemptsPerTick: 1,
+		Sleep:              func(time.Duration) {},
+		SessionClass:       heartbeat.SessionClassInteractive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	select {
+	case <-p.LostOwnership():
+		// good — explicit stop remains fatal for interactive
+	case <-time.After(2 * time.Second):
+		t.Fatal("LostOwnership did not fire on stop=true for interactive class")
+	}
+	if !p.StopRequested() {
+		t.Error("StopRequested = false; runner cannot classify the operator cancel")
+	}
+}

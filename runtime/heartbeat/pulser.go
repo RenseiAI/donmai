@@ -21,8 +21,24 @@ const DefaultInterval = 30 * time.Second
 
 // DefaultStrikesUntilLost is the consecutive-failure threshold that
 // triggers a LostOwnership event. Mirrors MAX_HEARTBEAT_FAILURES from
-// the legacy TS worker-runner.ts.
+// the legacy TS worker-runner.ts. Interactive sessions are exempt from
+// the fuse entirely — see SessionClassInteractive.
 const DefaultStrikesUntilLost = 3
+
+// SessionClassInteractive is the Config.SessionClass value for a PTY-hosted
+// interactive session. For this class heartbeat loss is NON-FATAL: the
+// pulser never closes LostOwnership on failed ticks or a refused refresh
+// (refreshed=false) — it degrades (logs loudly, reports Degraded) and keeps
+// beating so the heartbeat resumes on its own when connectivity returns.
+// Only the platform's explicit deterministic cancel ({"stop": true}) ends
+// an interactive session through the pulser. Rationale: an interactive
+// session hosts a human-attended PTY on a laptop — sleep/wake and network
+// partitions are ordinary events, and killing a healthy child on a ~65s
+// blip (or on the first post-wake tick's refreshed=false) destroys work
+// the control plane could not have preserved. Every other class keeps the
+// fail-fast fuse: a headless agent burning tokens without ownership should
+// stop promptly.
+const SessionClassInteractive = "interactive"
 
 // DefaultMaxAttemptsPerTick is the HTTP retry budget for one tick.
 // Mirrors apiRequestWithError in afclient/retry.go (3 attempts with
@@ -71,6 +87,11 @@ type Config struct {
 	// the omitempty tag keeps the wire byte-identical for existing
 	// (headless / interview) sessions, and an absent field reads as the
 	// unclassified default the platform already assumes.
+	//
+	// SessionClassInteractive additionally flips the pulser's OWN loss
+	// posture: heartbeat loss and refreshed=false become non-fatal
+	// (degrade + keep beating + auto-resume) instead of closing
+	// LostOwnership — see the SessionClassInteractive doc.
 	SessionClass string
 	// CredentialProvider returns the latest worker id + runtime token.
 	// When set, every heartbeat tick calls it before posting so child
@@ -182,6 +203,12 @@ func (c Config) maxAttempts() int {
 	return DefaultMaxAttemptsPerTick
 }
 
+// interactiveClass reports whether this pulser heartbeats an interactive
+// session — the class for which heartbeat loss must degrade, never kill.
+func (c Config) interactiveClass() bool {
+	return c.SessionClass == SessionClassInteractive
+}
+
 func (c Config) client() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
@@ -237,6 +264,15 @@ type Pulser struct {
 	lostCh   chan struct{}
 	strikes  atomic.Int64
 	lastTick atomic.Int64 // unix-millis
+
+	// degraded marks the interactive non-fatal heartbeat-loss state: the
+	// strike threshold was reached (or a refresh was refused) for a
+	// SessionClass=interactive pulser, which degrades instead of closing
+	// LostOwnership. Set on the crossing tick, cleared by the next
+	// successful tick. Read via Degraded so the runner / operator surface
+	// can mark the session "control plane unreachable" while it stays
+	// alive.
+	degraded atomic.Bool
 
 	// stopRequested records that the platform sent the deterministic
 	// operator-cancel signal ({"stop": true} on a lock-refresh response).
@@ -310,6 +346,15 @@ func (p *Pulser) StopRequested() bool {
 // tick. Zero when no tick has succeeded yet.
 func (p *Pulser) LastTick() int64 {
 	return p.lastTick.Load()
+}
+
+// Degraded reports whether an interactive pulser is in the non-fatal
+// heartbeat-loss state (control plane unreachable / refresh refused past
+// the strike threshold, session deliberately kept alive). Always false
+// for non-interactive classes — they trip the fatal fuse instead. Clears
+// automatically on the next successful tick.
+func (p *Pulser) Degraded() bool {
+	return p.degraded.Load()
 }
 
 // Start begins the heartbeat loop. The first tick fires synchronously
@@ -434,6 +479,14 @@ func (p *Pulser) run(ctx context.Context) {
 			// ownershipLost check the loop would keep posting heartbeats
 			// to a session the platform has already told us to stop until
 			// strikes happen to reach the threshold.
+			//
+			// Interactive sessions never exit here on heartbeat loss:
+			// tripped() is class-gated to false and refreshed=false does
+			// not call loseOwnershipNow for them, so the loop keeps
+			// ticking through a partition/sleep and the heartbeat resumes
+			// by itself when connectivity returns. Their only exit paths
+			// are ctx/Stop and the explicit operator stop ({"stop": true}
+			// → loseOwnershipNow → ownershipLost).
 			if p.tripped() || p.ownershipLost() {
 				return
 			}
@@ -467,7 +520,13 @@ func (p *Pulser) ownershipLost() bool {
 
 // tripped reports whether the strike counter has reached the lost
 // threshold. The first transition closes the LostOwnership channel.
+// Interactive sessions have no fuse: heartbeat loss degrades (see
+// SessionClassInteractive / Degraded) instead of closing LostOwnership,
+// so for them tripped always reports false regardless of strikes.
 func (p *Pulser) tripped() bool {
+	if p.cfg.interactiveClass() {
+		return false
+	}
 	if int(p.strikes.Load()) < p.cfg.strikesUntilLost() {
 		return false
 	}
@@ -517,8 +576,20 @@ func (p *Pulser) tick(ctx context.Context) {
 	for n := 1; n <= attempts; n++ {
 		err := p.doRefresh(ctx)
 		if err == nil {
-			p.strikes.Store(0)
+			prev := p.strikes.Swap(0)
 			p.lastTick.Store(p.cfg.now().UnixMilli())
+			if p.degraded.CompareAndSwap(true, false) {
+				// Interactive degraded → healthy transition: connectivity
+				// (or lock acceptance) returned and the heartbeat resumed
+				// on its own — the whole point of the non-fatal posture.
+				p.cfg.logger().Warn("heartbeat recovered: control plane reachable again — resuming normal heartbeat cadence",
+					"sessionId", p.cfg.SessionID,
+					"strikesCleared", prev)
+			} else if prev > 0 {
+				p.cfg.logger().Info("heartbeat recovered",
+					"sessionId", p.cfg.SessionID,
+					"strikesCleared", prev)
+			}
 			p.cfg.logger().Debug("heartbeat tick ok",
 				"sessionId", p.cfg.SessionID, "attempt", n)
 			return
@@ -543,6 +614,17 @@ func (p *Pulser) tick(ctx context.Context) {
 		"strike", strike,
 		"strikesUntilLost", p.cfg.strikesUntilLost(),
 		"err", lastErr)
+	if p.cfg.interactiveClass() && int(strike) >= p.cfg.strikesUntilLost() &&
+		p.degraded.CompareAndSwap(false, true) {
+		// The crossing that would trip the fatal fuse for any other class.
+		// Interactive sessions degrade instead: mark it, log it loudly
+		// once, and keep beating — the session (a human-attended PTY)
+		// stays alive and the heartbeat resumes when connectivity returns.
+		p.cfg.logger().Warn("heartbeat degraded: control plane unreachable — interactive session stays alive, heartbeating continues until connectivity returns",
+			"sessionId", p.cfg.SessionID,
+			"strike", strike,
+			"err", lastErr)
+	}
 }
 
 // refreshRequest is the body shape sent to /api/sessions/<id>/lock-refresh.
@@ -566,7 +648,9 @@ type refreshRequest struct {
 // refreshResponse is the body shape returned by lock-refresh. The
 // {"refreshed": false} case is treated as a strike-eligible failure
 // because it means the platform did not extend the lock — the session
-// has likely already been handed off.
+// has likely already been handed off. For non-interactive classes it
+// additionally closes LostOwnership immediately; interactive sessions
+// degrade instead (see SessionClassInteractive).
 type refreshResponse struct {
 	Refreshed bool `json:"refreshed"`
 	// Stop is the deterministic operator-cancel signal: when the platform
@@ -658,12 +742,24 @@ func (p *Pulser) doRefresh(ctx context.Context) error {
 	if !out.Refreshed {
 		// Ownership refused — do NOT apply any piggybacked inject. The
 		// platform only routes injects to the current lock holder; a
-		// refused refresh means we are no longer it. Close LostOwnership
-		// IMMEDIATELY (the session has already been handed off; there is
-		// nothing to gain from three more failed ticks) — but leave
-		// stopRequested unset so the runner classifies this as
-		// FailureLostOwnership, the correct mode for a hand-off, not an
-		// operator cancel.
+		// refused refresh means we are no longer it.
+		//
+		// Interactive sessions do NOT die on a refused refresh. The most
+		// likely cause is the first post-sleep/post-partition tick hitting
+		// a control plane that timed the session's liveness out while the
+		// host was asleep — killing the healthy human-attended PTY on that
+		// single response is exactly the fail mode this class exists to
+		// avoid. Degrade instead: return a strike-eligible error, keep
+		// beating, and let a later accepted refresh (or the explicit
+		// {"stop": true} cancel, which is still honored above) resolve it.
+		if p.cfg.interactiveClass() {
+			return errors.New("lock-refresh: platform refused (refreshed=false); interactive session degrades instead of stopping")
+		}
+		// Close LostOwnership IMMEDIATELY (the session has already been
+		// handed off; there is nothing to gain from three more failed
+		// ticks) — but leave stopRequested unset so the runner classifies
+		// this as FailureLostOwnership, the correct mode for a hand-off,
+		// not an operator cancel.
 		p.loseOwnershipNow()
 		return errors.New("lock-refresh: platform refused (refreshed=false)")
 	}
