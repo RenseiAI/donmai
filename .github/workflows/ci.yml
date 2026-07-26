@@ -37,8 +37,16 @@ jobs:
       - name: Build
         run: make build
 
+      # Piped through scripts/test-summary.py so the run reports how many
+      # tests SKIPPED. `go test ./...` reports a skipped test the same way it
+      # reports nothing at all — the package still says `ok` — so a test that
+      # quietly starts skipping stops protecting anything while CI stays
+      # green. pipefail keeps `go test`'s exit status authoritative.
       - name: Test
-        run: go test -race -coverprofile=coverage.out ./...
+        run: |
+          set -o pipefail
+          go test -race -coverprofile=coverage.out -json ./... \
+            | python3 scripts/test-summary.py
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out
@@ -48,6 +56,9 @@ jobs:
         with:
           version: v2.11.4
 
-      - name: Vulnerability check
-        continue-on-error: true
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
+      # No govulncheck step here: security-scan.yml already runs govulncheck
+      # as its own `Go vuln scan (report-only)` job on the same triggers, in
+      # parallel rather than serially behind the tests. The copy that used to
+      # sit here was continue-on-error, so it gated nothing, and it re-ran
+      # `go install ...@latest` on every build — a network fetch of an
+      # unpinned tool inside the one job that main requires.
