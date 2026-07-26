@@ -5,8 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/daemon"
 )
 
 // fakeRunner records calls and returns canned responses.
@@ -105,15 +108,16 @@ func TestGeneratePlist_KeepAliveOnlyOnFailure(t *testing.T) {
 		t.Fatalf("GeneratePlist: %v", err)
 	}
 
-	// The KeepAlive value must be a dict carrying SuccessfulExit=false,
-	// not the bare <true/> boolean form. We match the rendered substring
+	// The KeepAlive value must be a dict carrying SuccessfulExit=false plus
+	// the explicit Crashed=true crash-respawn half (durability keys), not
+	// the bare <true/> boolean form. We match the rendered substring
 	// including whitespace between the open tag and the dict body so a
 	// future refactor that splits these across lines still passes.
 	keepAliveDictRe := regexp.MustCompile(
-		`<key>KeepAlive</key>\s*<dict>\s*<key>SuccessfulExit</key>\s*<false/>\s*</dict>`,
+		`<key>KeepAlive</key>\s*<dict>\s*<key>SuccessfulExit</key>\s*<false/>\s*<key>Crashed</key>\s*<true/>\s*</dict>`,
 	)
 	if !keepAliveDictRe.MatchString(out) {
-		t.Errorf("expected KeepAlive dict with SuccessfulExit=false, got:\n%s", out)
+		t.Errorf("expected KeepAlive dict with SuccessfulExit=false and Crashed=true, got:\n%s", out)
 	}
 
 	// Belt-and-suspenders: the bare boolean form (`<key>KeepAlive</key>\s*<true/>`)
@@ -121,6 +125,54 @@ func TestGeneratePlist_KeepAliveOnlyOnFailure(t *testing.T) {
 	keepAliveTrueRe := regexp.MustCompile(`<key>KeepAlive</key>\s*<true/>`)
 	if keepAliveTrueRe.MatchString(out) {
 		t.Errorf("regressed to boolean KeepAlive=true (respawns on clean stop):\n%s", out)
+	}
+}
+
+// TestGeneratePlist_DurabilityKeys pins the four durability keys that stop
+// launchd from killing hosted sessions with the daemon job. Each row is a
+// rendered-fragment guard: ExitTimeOut must cover the graceful drain (or
+// launchd SIGKILLs the whole job process group mid-drain on every
+// restart/upgrade/plist reload), AbandonProcessGroup orphans session
+// children instead of killing them with the job, KeepAlive/Crashed makes
+// crash respawn explicit, and LegacyTimers keeps heartbeat/token-refresh
+// timers from being coalesced-deferred on battery.
+func TestGeneratePlist_DurabilityKeys(t *testing.T) {
+	out, err := GeneratePlist("/opt/af", "/tmp/o.log", "/tmp/e.log")
+	if err != nil {
+		t.Fatalf("GeneratePlist: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		re   string
+	}{
+		{"ExitTimeOut covers drain plus margin", `<key>ExitTimeOut</key>\s*<integer>` + strconv.Itoa(ExitTimeOutSeconds) + `</integer>`},
+		{"AbandonProcessGroup true", `<key>AbandonProcessGroup</key>\s*<true/>`},
+		{"KeepAlive Crashed true", `<key>Crashed</key>\s*<true/>`},
+		{"LegacyTimers true", `<key>LegacyTimers</key>\s*<true/>`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !regexp.MustCompile(tt.re).MatchString(out) {
+				t.Errorf("plist missing durability fragment %q, got:\n%s", tt.re, out)
+			}
+		})
+	}
+}
+
+// TestExitTimeOutCoversDrainDefault statically asserts the launchd exit
+// window is at least the daemon's config-default graceful drain (plus
+// margin), pinned against the real default rather than a mirrored literal —
+// if the drain default grows past the plist's exit window, launchd would
+// SIGKILL the job mid-drain again and this test fails first.
+func TestExitTimeOutCoversDrainDefault(t *testing.T) {
+	drain := daemon.DefaultConfig().AutoUpdate.DrainTimeoutSeconds
+	if drain <= 0 {
+		t.Fatalf("daemon config-default DrainTimeoutSeconds = %d, want > 0", drain)
+	}
+	if ExitTimeOutSeconds < drain+30 {
+		t.Errorf("ExitTimeOutSeconds = %d, want >= config-default drain %d + 30s escalation margin",
+			ExitTimeOutSeconds, drain)
 	}
 }
 
