@@ -10,6 +10,47 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.55.0 — 2026-07-26
+
+### Features
+
+- **Worker-local translating gateway (M1).** A `ModelEndpoint` host that
+  presents an openai-chat surface on a loopback-only bind (#212), now bound as
+  a per-agent-run gateway session by the worker (#219). The gateway executes a
+  chosen capability cell; it never chooses one. Upstream credentials stay with
+  the worker — `DONMAI_GATEWAY_UPSTREAM_API_KEY` and
+  `DONMAI_GATEWAY_UPSTREAM_BASE_URL` are blocklisted from child environments.
+- **pi harness.** Greenfield pi adapter with an explicit trust boundary (#206),
+  registered in the agent-run constructor list (#214).
+- **opencode Lane B.** Serve/HTTP adapter (#205) with the resolved-profile
+  `preferServer` hint threaded into the constructor (#209).
+- **Canonical credential blocklist.** `blocklist.json` is generated as the
+  cross-repo single source of truth for worker-only env names (#210).
+- **Matrix integrity.** `binaryPins` section with opencode version-pin
+  enforcement (#203); terminal-event conformance contract wired onto the
+  claude/codex/stub harnesses (#204).
+- **Cells smoked.** The opencode `openai×direct` (#218) and
+  `openai×gateway` (#221) capability cells flipped `smoked: true` on accrued
+  green smoke history.
+
+### Fixes
+
+- **Gateway hardening.** Upstream base-URL validation, inherited-environment
+  blocklist filtering at every `ComposeChildEnv` site, and classified upstream
+  error responses instead of raw transport/provider detail (#220).
+- **pi protocol.** Speak the real pi 0.80.10 RPC + extension protocol (#215);
+  thread the resolved endpoint into the runner spec (#216).
+- **opencode.** Lane-B SSE frames wrap payloads in `data` (#211).
+- **Prompt hardening.** Injection guards + stale runner-line removal in
+  `system_base.tmpl` (#207) and `system_base.yaml` (#208).
+
+### Chores
+
+- Linear command family extracted into `afcli/linearcmd` (#213); docs path
+  updates (#217).
+
+---
+
 ## v0.54.1 — 2026-07-23
 
 ### Fixes
