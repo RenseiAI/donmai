@@ -79,6 +79,16 @@ func TestBuildEnvelope_ShapeAndCrossLinks(t *testing.T) {
 	}
 }
 
+func TestToolCallJSONIncludesSuccessfulErrorFlag(t *testing.T) {
+	b, err := json.Marshal(ToolCall{Name: "Edit"})
+	if err != nil {
+		t.Fatalf("marshal tool call: %v", err)
+	}
+	if got, want := string(b), `{"name":"Edit","isError":false}`; got != want {
+		t.Errorf("tool call JSON = %s, want %s", got, want)
+	}
+}
+
 func TestHashPayload_DeterministicAndSensitive(t *testing.T) {
 	a, err := hashPayload(map[string]any{"x": 1, "y": "two"})
 	if err != nil {

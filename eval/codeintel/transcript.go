@@ -32,7 +32,7 @@ type ToolCall struct {
 	Name       string          `json:"name"`
 	Arguments  json.RawMessage `json:"arguments,omitempty"`
 	ResultText string          `json:"resultText,omitempty"`
-	IsError    bool            `json:"isError,omitempty"`
+	IsError    bool            `json:"isError"`
 	// Phase identifies the fresh-session phase for context-reset transcripts.
 	// Ordinary executions leave it zero, so the field is omitted from JSON.
 	Phase int `json:"phase,omitempty"`
