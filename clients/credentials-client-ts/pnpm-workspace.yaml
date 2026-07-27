@@ -7,7 +7,7 @@ allowBuilds:
   esbuild: true
 
 # Security: force minimum versions for DEV-only transitive deps with known CVEs.
-# These deps enter via vitest; there are no direct vite/esbuild dependencies.
+# These deps enter via vitest; there are no direct vite/esbuild/postcss dependencies.
 overrides:
   # HIGH + 2 MEDIUM: vite dev-server path traversal / fs.deny bypass - fixed in 6.4.3.
   # Pinned to the ^6 line to stay within vitest@3.2.6's vite peer range (^5 || ^6 || ^7);
@@ -16,3 +16,6 @@ overrides:
   # MEDIUM: esbuild dev-server enables any website to send requests and read the
   # response - fixed in 0.25.0. Transitive via vite/vitest (dev-only, not in any bundle).
   esbuild: '^0.25.0'
+  # HIGH: previous source-map auto-loading can disclose traversed-to .map files.
+  # Fixed in 8.5.18. Transitive via vite/vitest (dev-only, not in any bundle).
+  postcss: '^8.5.18'
