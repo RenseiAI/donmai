@@ -25,12 +25,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout pull request
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       # setup-docker-builder mounts a persistent buildkit state dir (a
       # Blacksmith "sticky disk", keyed per Dockerfile) at /var/lib/buildkit and
@@ -39,7 +39,7 @@ jobs:
       # external caching that was configured with cache-from and cache-to
       # directives can now be removed."
       - name: Setup Blacksmith Builder
-        uses: useblacksmith/setup-docker-builder@6ff44f8e5255f9d8aa31ef22f7e57a2d926b7da0 # v1.11.0
+        uses: useblacksmith/setup-docker-builder@33803e640bd9d674f2843a8c323aa2a7da478d23 # v2.0.0
 
       # The `type=gha` exporter that used to live here was pure overhead on top
       # of that sticky disk: `exporting to GitHub Actions Cache` measured 247.7s
