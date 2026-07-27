@@ -91,6 +91,12 @@ type promptRecordingExecutor struct {
 	specs            []ArmSpec
 	donmaiResolvable []bool
 	returnArm        Arm
+	omitCost         bool
+	incompleteCost   bool
+	costs            []float64
+	failAt           int
+	failWithCost     bool
+	onExecute        func(call int) error
 }
 
 func (e *promptRecordingExecutor) Name() string { return "prompt-recording" }
@@ -102,15 +108,36 @@ func (e *promptRecordingExecutor) Execute(_ context.Context, spec ArmSpec) (Tran
 		return Transcript{}, fmt.Errorf("pinned workarea missing foo.go: %w", err)
 	}
 	e.specs = append(e.specs, spec)
+	call := len(e.specs)
 	_, resolvable := BinaryOnPath("donmai", envPath(spec.Env))
 	e.donmaiResolvable = append(e.donmaiResolvable, resolvable)
+	if e.onExecute != nil {
+		if err := e.onExecute(call); err != nil {
+			return Transcript{}, err
+		}
+	}
+	if e.failAt == call {
+		if e.failWithCost {
+			return Transcript{
+				Arm: spec.Arm, FinalAnswer: "private partial output", TurnCount: 1,
+				TokenCounts: TokenCounts{Input: 10, Output: 2}, CostUSD: 0.125,
+				CostReported: true, CostComplete: !e.incompleteCost,
+			}, fmt.Errorf("scripted provider failure with private stderr at call %d", call)
+		}
+		return Transcript{}, fmt.Errorf("scripted provider failure at call %d", call)
+	}
 	arm := spec.Arm
 	if e.returnArm != "" {
 		arm = e.returnArm
 	}
+	cost := 0.01
+	if call <= len(e.costs) {
+		cost = e.costs[call-1]
+	}
 	return Transcript{
 		Arm: arm, FinalAnswer: "foo.go:3", TurnCount: 1,
 		TokenCounts: TokenCounts{Input: 10, Output: 2}, AdvertisedTools: spec.AdvertisedTools,
+		CostUSD: cost, CostReported: !e.omitCost, CostComplete: !e.omitCost && !e.incompleteCost,
 		SnapshotRef: &SnapshotRef{Provider: "local", SnapshotID: spec.SnapshotID, Retain: RetainEvalPermanent},
 	}, nil
 }
@@ -175,6 +202,37 @@ func TestDriver_PromptExperimentReusesPinnedExecutionLifecycle(t *testing.T) {
 		default:
 			t.Errorf("unexpected arm %q", spec.Arm)
 		}
+	}
+}
+
+func TestDriver_PromptExperimentRequiresProviderReportedCost(t *testing.T) {
+	repoDir, sha := initTempRepo(t)
+	donmaiDir := writeFakeBinary(t, "donmai")
+	exec := &promptRecordingExecutor{omitCost: true}
+	d, err := NewDriver(Config{
+		Trials: 1, DonmaiBin: filepath.Join(donmaiDir, "donmai"),
+		RepoRoots: map[string]string{"test/repo": repoDir}, WorkareaParent: t.TempDir(), Executor: exec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := experiment.Definition{
+		ID: "prompt-v1",
+		Arms: []experiment.Arm{
+			{ID: "incumbent", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("incumbent"), SystemPrompt: "incumbent"},
+			{ID: "candidate", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("candidate"), SystemPrompt: "candidate"},
+		},
+	}
+	cases := []Case{{
+		ID: "case", Input: CaseInput{TaskType: TaskFindSymbol, Repo: "test/repo", Ref: sha, Prompt: "Find Target."},
+		ExpectedOutput: json.RawMessage(`{"file":"foo.go","lineRange":[1,10]}`), Tags: []string{tagSuite, "find-symbol", tagVersion},
+	}}
+	_, err = d.RunPromptExperiment(context.Background(), cases, definition, []string{"safety/injection-follow-v1"})
+	if err == nil || !strings.Contains(err.Error(), "complete provider cost") {
+		t.Fatalf("error = %v, want incomplete provider cost failure", err)
+	}
+	if len(exec.specs) != 1 {
+		t.Fatalf("matrix continued after missing cost: %d specs", len(exec.specs))
 	}
 }
 

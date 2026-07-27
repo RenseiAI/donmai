@@ -33,6 +33,9 @@ type ToolCall struct {
 	Arguments  json.RawMessage `json:"arguments,omitempty"`
 	ResultText string          `json:"resultText,omitempty"`
 	IsError    bool            `json:"isError,omitempty"`
+	// Phase identifies the fresh-session phase for context-reset transcripts.
+	// Ordinary executions leave it zero, so the field is omitted from JSON.
+	Phase int `json:"phase,omitempty"`
 }
 
 // TokenCounts mirrors the platform tokenCounts shape
@@ -80,7 +83,17 @@ type Transcript struct {
 	ToolCalls   []ToolCall
 	TurnCount   int
 	TokenCounts TokenCounts
-	SnapshotRef *SnapshotRef
+	// CostUSD is the provider-reported actual execution cost for this trial.
+	// Context-reset trials sum both fresh sessions so spend ledgers can enforce
+	// their authorization cap from the same durable report as the receipts.
+	CostUSD float64
+	// CostReported distinguishes known provider cost, including a known partial
+	// amount, from entirely absent billing data.
+	CostReported bool
+	// CostComplete is true only when CostUSD covers every provider invocation in
+	// this execution. Prompt experiments may post only complete provider cost.
+	CostComplete bool
+	SnapshotRef  *SnapshotRef
 	// AdvertisedTools is the set of code-intel tool names advertised to this arm
 	// (empty for the WITHOUT arm). Retained so the tool-use grader knows what
 	// adoption was even possible.
