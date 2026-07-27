@@ -22,6 +22,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/prompt"
 )
 
 // quietLogger returns a slog.Logger that drops all output. Used by
@@ -62,6 +63,40 @@ func TestNewAgentRunCmd_Help(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing %q\n--- output ---\n%s", want, out)
 		}
+	}
+}
+
+func TestAgentRunMaxSessionDuration(t *testing.T) {
+	tests := []struct {
+		name   string
+		detail *daemon.SessionDetail
+		want   time.Duration
+	}{
+		{
+			name:   "interactive session disables runner timeout",
+			detail: &daemon.SessionDetail{Mode: prompt.InteractiveRunMode},
+			want:   -1,
+		},
+		{
+			name:   "headless session keeps runner default",
+			detail: &daemon.SessionDetail{},
+		},
+		{
+			name:   "interview session keeps runner default",
+			detail: &daemon.SessionDetail{Mode: "interview"},
+		},
+		{
+			name:   "unknown mode keeps runner default",
+			detail: &daemon.SessionDetail{Mode: "interactive-preview"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := agentRunMaxSessionDuration(tt.detail); got != tt.want {
+				t.Fatalf("agentRunMaxSessionDuration() = %s, want %s", got, tt.want)
+			}
+		})
 	}
 }
 
