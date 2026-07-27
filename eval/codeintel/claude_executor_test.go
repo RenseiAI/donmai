@@ -3,12 +3,15 @@ package codeintel
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/eval/experiment"
 )
 
 // fakeSpawn is the hermetic exec seam: it returns a scripted stream + wait
@@ -298,6 +301,123 @@ func TestClaudeExecutor_ErrorDuringExecution_RecordedNotAborted(t *testing.T) {
 	// Result usage is present, so it is authoritative (not the assistant fallback).
 	if tr.TokenCounts.Input != 500 || tr.TokenCounts.Output != 10 || tr.TokenCounts.CacheRead != 100 {
 		t.Errorf("TokenCounts = %+v, want {500 10 100} (from the result usage)", tr.TokenCounts)
+	}
+}
+
+type spawnStep struct {
+	stream  string
+	waitErr error
+	stderr  string
+}
+
+type queuedSpawn struct {
+	steps   []spawnStep
+	calls   int
+	gotArgv [][]string
+}
+
+func (q *queuedSpawn) spawn(_ context.Context, _ string, argv []string, _ []string) (io.ReadCloser, func() (string, error), error) {
+	q.gotArgv = append(q.gotArgv, append([]string(nil), argv...))
+	if q.calls >= len(q.steps) {
+		return nil, nil, fmt.Errorf("unexpected spawn %d", q.calls+1)
+	}
+	step := q.steps[q.calls]
+	q.calls++
+	return io.NopCloser(strings.NewReader(step.stream)), func() (string, error) {
+		return step.stderr, step.waitErr
+	}, nil
+}
+
+func TestClaudeExecutor_ContextResetStartsFreshContinuationAndAggregatesEvidence(t *testing.T) {
+	first := strings.Join([]string{
+		`{"type":"system","subtype":"init","session_id":"before-reset"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"STATE.md","content":"checkpoint"}}],"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":20}}}`,
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}`,
+	}, "\n")
+	second := strings.Join([]string{
+		`{"type":"system","subtype":"init","session_id":"after-reset"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"STATE.md"}}],"usage":{"input_tokens":200,"output_tokens":20,"cache_read_input_tokens":30}}}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"checkpoint","is_error":false}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Recovered from durable state and completed."}],"usage":{"input_tokens":50,"output_tokens":5,"cache_read_input_tokens":10}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"result":"Recovered from durable state and completed.","usage":{"input_tokens":250,"output_tokens":25,"cache_read_input_tokens":40}}`,
+	}, "\n")
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: first}, {stream: second}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	spec := ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "reset",
+		Budget: Budget{MaxTurns: 9}, Prompt: "complete the long task",
+		VariantSystemPrompt: "make progress durable",
+		ContextReset: &experiment.ContextReset{
+			AfterTurn: 4, ContinuationPrompt: "recover from durable state and finish",
+		},
+	}
+
+	tr, err := exec.Execute(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("context-reset execute: %v", err)
+	}
+	if spawner.calls != 2 {
+		t.Fatalf("spawn count = %d, want 2", spawner.calls)
+	}
+	firstArgv := strings.Join(spawner.gotArgv[0], " ")
+	secondArgv := strings.Join(spawner.gotArgv[1], " ")
+	if !strings.Contains(firstArgv, "--max-turns 4") || !strings.Contains(firstArgv, "complete the long task") {
+		t.Errorf("first phase argv = %s", firstArgv)
+	}
+	if !strings.Contains(secondArgv, "--max-turns 5") || !strings.Contains(secondArgv, "recover from durable state and finish") {
+		t.Errorf("continuation argv = %s", secondArgv)
+	}
+	if strings.Contains(secondArgv, "--resume") {
+		t.Errorf("context reset must start a fresh session, got %s", secondArgv)
+	}
+	if !strings.Contains(firstArgv, "make progress durable") || !strings.Contains(secondArgv, "make progress durable") {
+		t.Errorf("both phases must receive the same arm variant: first=%s second=%s", firstArgv, secondArgv)
+	}
+	if tr.FinalAnswer != "Recovered from durable state and completed." {
+		t.Errorf("FinalAnswer = %q", tr.FinalAnswer)
+	}
+	if tr.TurnCount != 3 || len(tr.ToolCalls) != 2 {
+		t.Errorf("aggregated transcript = %+v", tr)
+	}
+	if tr.TokenCounts.Input != 350 || tr.TokenCounts.Output != 35 || tr.TokenCounts.CacheRead != 60 {
+		t.Errorf("aggregated tokens = %+v", tr.TokenCounts)
+	}
+}
+
+func TestClaudeExecutor_ContextResetFailsIfTaskEndsBeforeCheckpoint(t *testing.T) {
+	stream := `{"type":"result","subtype":"success","is_error":false,"result":"finished early","usage":{"input_tokens":10,"output_tokens":2}}`
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: stream}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	_, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "early",
+		Budget: Budget{MaxTurns: 8}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "before context-reset checkpoint") {
+		t.Fatalf("error = %v, want early-completion reset failure", err)
+	}
+	if spawner.calls != 1 {
+		t.Fatalf("spawn count = %d, want 1", spawner.calls)
+	}
+}
+
+func TestClaudeExecutor_ContextResetFailsIfFirstPhaseErrorsBeforeCheckpoint(t *testing.T) {
+	stream := `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","usage":{"input_tokens":10,"output_tokens":2}}`
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: stream}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	_, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "phase-error",
+		Budget: Budget{MaxTurns: 8}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "failed before context-reset checkpoint") {
+		t.Fatalf("error = %v, want pre-checkpoint phase failure", err)
+	}
+	if spawner.calls != 1 {
+		t.Fatalf("spawn count = %d, want 1", spawner.calls)
 	}
 }
 

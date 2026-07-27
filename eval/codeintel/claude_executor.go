@@ -71,9 +71,6 @@ var streamFlags = []string{"--output-format", "stream-json", "--verbose", "--dan
 // plus a clear wrapped error — never a panic. Whatever tool calls / answer were
 // parsed before the fault are preserved on the returned Transcript.
 func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, error) {
-	if spec.ContextReset != nil {
-		return Transcript{}, fmt.Errorf("claude executor does not implement context-reset perturbations")
-	}
 	// Control arm: mandatory contamination guard FIRST, before any spawn. The
 	// arm env is authoritative here (PATH scrubbed of donmai); a dirty control
 	// must fail the run, mirroring PlumbingExecutor.executeWithout.
@@ -96,6 +93,64 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 		return Transcript{}, fmt.Errorf("claude %s arm: no workarea provisioned (driver bug)", spec.Arm)
 	}
 
+	if spec.ContextReset == nil {
+		tr, _, err := e.executePhase(ctx, spec)
+		return tr, err
+	}
+	return e.executeContextReset(ctx, spec)
+}
+
+func (e ClaudeExecutor) executeContextReset(ctx context.Context, spec ArmSpec) (Transcript, error) {
+	reset := spec.ContextReset
+	if reset.AfterTurn <= 0 {
+		return Transcript{}, fmt.Errorf("claude %s arm: context-reset after-turn must be positive", spec.Arm)
+	}
+	if strings.TrimSpace(reset.ContinuationPrompt) == "" {
+		return Transcript{}, fmt.Errorf("claude %s arm: context-reset continuation prompt is required", spec.Arm)
+	}
+	if spec.Budget.MaxTurns <= reset.AfterTurn {
+		return Transcript{}, fmt.Errorf(
+			"claude %s arm: context-reset after-turn %d must be below max-turns %d",
+			spec.Arm, reset.AfterTurn, spec.Budget.MaxTurns,
+		)
+	}
+
+	firstSpec := spec
+	firstSpec.ContextReset = nil
+	firstSpec.Budget.MaxTurns = reset.AfterTurn
+	first, firstResult, err := e.executePhase(ctx, firstSpec)
+	if err != nil {
+		return first, err
+	}
+	// The E3 perturbation is only valid when every trial actually reaches the
+	// declared checkpoint. Recording an early completion as reset evidence would
+	// compare unlike treatments across arms, so fail closed instead.
+	if !firstResult.resultErrored() {
+		return first, fmt.Errorf(
+			"claude %s arm: task completed before context-reset checkpoint at turn %d",
+			spec.Arm, reset.AfterTurn,
+		)
+	}
+	if firstResult.resultSubtype != "error_max_turns" {
+		return first, fmt.Errorf(
+			"claude %s arm: first phase failed before context-reset checkpoint: %s",
+			spec.Arm, firstResult.resultSubtype,
+		)
+	}
+
+	secondSpec := spec
+	secondSpec.ContextReset = nil
+	secondSpec.Prompt = reset.ContinuationPrompt
+	secondSpec.Budget.MaxTurns = spec.Budget.MaxTurns - reset.AfterTurn
+	second, _, err := e.executePhase(ctx, secondSpec)
+	combined := combineResetTranscripts(first, second)
+	if err != nil {
+		return combined, err
+	}
+	return combined, nil
+}
+
+func (e ClaudeExecutor) executePhase(ctx context.Context, spec ArmSpec) (Transcript, parsedStream, error) {
 	inv := BuildClaudeInvocation(spec)
 	argv := append(append([]string(nil), inv.Argv...), streamFlags...)
 
@@ -105,7 +160,7 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 	}
 	stdout, wait, err := spawn(ctx, spec.Workarea, argv, inv.Env)
 	if err != nil {
-		return Transcript{}, fmt.Errorf("claude %s arm: spawn: %w", spec.Arm, err)
+		return Transcript{}, parsedStream{}, fmt.Errorf("claude %s arm: spawn: %w", spec.Arm, err)
 	}
 
 	ps := parseClaudeStream(stdout)
@@ -128,9 +183,27 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 	}
 
 	if rerr := runError(ctx, ps, waitErr, stderrTail); rerr != nil {
-		return tr, fmt.Errorf("claude %s arm: %w", spec.Arm, rerr)
+		return tr, ps, fmt.Errorf("claude %s arm: %w", spec.Arm, rerr)
 	}
-	return tr, nil
+	return tr, ps, nil
+}
+
+func combineResetTranscripts(first, second Transcript) Transcript {
+	combined := second
+	combined.ToolCalls = append(append([]ToolCall(nil), first.ToolCalls...), second.ToolCalls...)
+	combined.TurnCount = first.TurnCount + second.TurnCount
+	combined.TokenCounts = TokenCounts{
+		Input:     first.TokenCounts.Input + second.TokenCounts.Input,
+		Output:    first.TokenCounts.Output + second.TokenCounts.Output,
+		CacheRead: first.TokenCounts.CacheRead + second.TokenCounts.CacheRead,
+	}
+	if combined.SnapshotRef == nil {
+		combined.SnapshotRef = first.SnapshotRef
+	}
+	if len(combined.AdvertisedTools) == 0 {
+		combined.AdvertisedTools = first.AdvertisedTools
+	}
+	return combined
 }
 
 // runError classifies the outcome of a completed (or aborted) run into a single
