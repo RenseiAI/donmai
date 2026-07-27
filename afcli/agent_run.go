@@ -119,6 +119,18 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 	return cmd
 }
 
+// agentRunMaxSessionDuration returns the runner timeout override for a
+// daemon-spawned agent session. Interactive sessions are human-driven and may
+// remain attached beyond the runner's two-hour default, so a negative duration
+// disables that runner-side cap. All other modes leave the option at zero and
+// retain runner.DefaultMaxSessionDuration.
+func agentRunMaxSessionDuration(detail *daemon.SessionDetail) time.Duration {
+	if detail != nil && detail.Mode == prompt.InteractiveRunMode {
+		return -1
+	}
+	return 0
+}
+
 // runAgentRun is the testable entry point for the `agent run` command.
 // Cobra-free; takes opts directly so tests can drive it with a fake
 // daemon HTTP server.
@@ -243,6 +255,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		Poster:                    poster,
 		CredentialProvider:        credentialCache.runnerCredentials,
 		Logger:                    logger,
+		MaxSessionDuration:        agentRunMaxSessionDuration(detail),
 		PreserveWorktreeOnFailure: opts.preserveWT,
 		// The library stays env-free; this binary is the operator boundary.
 		// Dispatch capability `llm-span-ingest` can also enable the pipeline
