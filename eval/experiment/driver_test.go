@@ -2,6 +2,7 @@ package experiment
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -10,6 +11,28 @@ import (
 
 func testArm(id ArmID, subject, prompt string) Arm {
 	return Arm{ID: id, SubjectRef: subject, VariantRef: SHA256VariantRef(prompt), SystemPrompt: prompt}
+}
+
+func TestReportJSONNeverSerializesSystemPrompt(t *testing.T) {
+	const secret = "raw operator prompt bytes must remain process-local"
+	arm := testArm("candidate", "agent/development", secret)
+	report := Report[struct{}]{
+		ExperimentID: "prompt-v1",
+		Outcomes: []Outcome[struct{}]{
+			{Trial: Trial{Arm: arm, Prompt: PromptPlan{SystemPrompt: secret}}},
+		},
+	}
+	body, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	encoded := string(body)
+	if strings.Contains(encoded, secret) || strings.Contains(encoded, "SystemPrompt") || strings.Contains(encoded, "systemPrompt") {
+		t.Fatalf("serialized report leaked raw system prompt: %s", encoded)
+	}
+	if !strings.Contains(encoded, arm.VariantRef) || !strings.Contains(encoded, arm.SubjectRef) {
+		t.Fatalf("serialized report omitted safe variant identity: %s", encoded)
+	}
 }
 
 func TestRunBalancedMatrixInjectsImmutableVariants(t *testing.T) {

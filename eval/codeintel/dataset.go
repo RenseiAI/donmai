@@ -159,12 +159,23 @@ func (c Case) DedupExpected() (DedupExpected, error) {
 // Loading + validation.
 // ---------------------------------------------------------------------------
 
-// LoadCases reads canonical JSONL (one Case per non-blank line) from r and
-// validates every row. It fails loud on the FIRST invalid case so a malformed
-// benchmark can never silently run a degenerate task.
+// LoadCases reads canonical code-intel JSONL (one Case per non-blank line)
+// and validates every row against the benchmark's four frozen task families.
 func LoadCases(r io.Reader) ([]Case, error) {
+	return loadCases(r, validateCase)
+}
+
+// LoadPromptExperimentCases reads the same platform-compatible Case envelope
+// but applies only the provider-neutral prompt-experiment invariants. This lets
+// reviewed E2/E3 fixtures carry experiment-specific task families and grader
+// probe contracts without weakening the canonical code-intel benchmark loader.
+func LoadPromptExperimentCases(r io.Reader) ([]Case, error) {
+	return loadCases(r, validatePromptExperimentCase)
+}
+
+func loadCases(r io.Reader, validate func(Case) error) ([]Case, error) {
 	sc := bufio.NewScanner(r)
-	// Cases can carry a long rubric / snippet; raise the line cap well above the
+	// Cases can carry a long rubric / prompt; raise the line cap well above the
 	// 64KiB default.
 	sc.Buffer(make([]byte, 0, 1<<16), 4<<20)
 
@@ -183,7 +194,14 @@ func LoadCases(r io.Reader) ([]Case, error) {
 		if err := dec.Decode(&c); err != nil {
 			return nil, fmt.Errorf("line %d: parse case: %w", line, err)
 		}
-		if err := validateCase(c); err != nil {
+		var extra any
+		if err := dec.Decode(&extra); err != io.EOF {
+			if err == nil {
+				err = fmt.Errorf("multiple JSON values are not allowed")
+			}
+			return nil, fmt.Errorf("line %d: parse case: %w", line, err)
+		}
+		if err := validate(c); err != nil {
 			return nil, fmt.Errorf("line %d: %w", line, err)
 		}
 		if _, dup := seen[c.ID]; dup {
@@ -216,21 +234,51 @@ func LoadCasesFile(path string) ([]Case, error) {
 // filename for deterministic order) and returns the concatenated, dedup-checked
 // case set.
 func LoadCasesDir(dir string) ([]Case, error) {
+	return loadCasesDir(dir, LoadCasesFile)
+}
+
+// LoadPromptExperimentCasesFile loads and validates one generic prompt-
+// experiment JSONL fixture.
+func LoadPromptExperimentCasesFile(path string) ([]Case, error) {
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("open prompt-experiment fixture directory for %q: %w", path, err)
+	}
+	defer func() { _ = root.Close() }()
+	f, err := root.Open(filepath.Base(path))
+	if err != nil {
+		return nil, fmt.Errorf("open prompt-experiment fixture %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	cases, err := LoadPromptExperimentCases(f)
+	if err != nil {
+		return nil, fmt.Errorf("prompt-experiment fixture %q: %w", path, err)
+	}
+	return cases, nil
+}
+
+// LoadPromptExperimentCasesDir loads every generic prompt-experiment *.jsonl
+// file in deterministic filename order.
+func LoadPromptExperimentCasesDir(dir string) ([]Case, error) {
+	return loadCasesDir(dir, LoadPromptExperimentCasesFile)
+}
+
+func loadCasesDir(dir string, loadFile func(string) ([]Case, error)) ([]Case, error) {
 	entries, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil {
-		return nil, fmt.Errorf("glob benchmark dir %q: %w", dir, err)
+		return nil, fmt.Errorf("glob fixture dir %q: %w", dir, err)
 	}
 	sort.Strings(entries)
 	var out []Case
 	seen := map[string]struct{}{}
 	for _, p := range entries {
-		cases, err := LoadCasesFile(p)
+		cases, err := loadFile(p)
 		if err != nil {
 			return nil, err
 		}
 		for _, c := range cases {
 			if _, dup := seen[c.ID]; dup {
-				return nil, fmt.Errorf("duplicate case id %q across benchmark files (in %s)", c.ID, filepath.Base(p))
+				return nil, fmt.Errorf("duplicate case id %q across fixture files (in %s)", c.ID, filepath.Base(p))
 			}
 			seen[c.ID] = struct{}{}
 			out = append(out, c)
@@ -307,6 +355,29 @@ func validateCase(c Case) error {
 		if e.IsDuplicate && strings.TrimSpace(e.File) == "" {
 			return fmt.Errorf("case %s: dedup expectedOutput.file is required when isDuplicate=true", c.ID)
 		}
+	}
+	return nil
+}
+
+func validatePromptExperimentCase(c Case) error {
+	if strings.TrimSpace(c.ID) == "" {
+		return fmt.Errorf("case has empty id")
+	}
+	if strings.TrimSpace(string(c.Input.TaskType)) == "" {
+		return fmt.Errorf("case %s: input.taskType is required", c.ID)
+	}
+	if strings.TrimSpace(c.Input.Repo) == "" {
+		return fmt.Errorf("case %s: input.repo is required", c.ID)
+	}
+	if strings.TrimSpace(c.Input.Ref) == "" {
+		return fmt.Errorf("case %s: input.ref (pinned SHA) is required for reproducibility", c.ID)
+	}
+	if strings.TrimSpace(c.Input.Prompt) == "" {
+		return fmt.Errorf("case %s: input.prompt is required", c.ID)
+	}
+	var expected map[string]json.RawMessage
+	if len(c.ExpectedOutput) == 0 || json.Unmarshal(c.ExpectedOutput, &expected) != nil || len(expected) == 0 {
+		return fmt.Errorf("case %s: expectedOutput must be a non-empty object containing grader probe contracts", c.ID)
 	}
 	return nil
 }

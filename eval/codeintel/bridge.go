@@ -65,6 +65,9 @@ type IngestRequest struct {
 	ToolCalls   []ToolCall  `json:"toolCalls"`
 	TurnCount   int         `json:"turnCount"`
 	TokenCounts TokenCounts `json:"tokenCounts"`
+	// ActualCostUSD is present only when the provider reported cost. A pointer
+	// preserves the wire distinction between an explicit zero and missing data.
+	ActualCostUSD *float64 `json:"actualCostUsd,omitempty"`
 	// ProjectID is optional reporting context for the eval_runs row.
 	ProjectID string `json:"projectId,omitempty"`
 	// GraderIDs is required for generic experiment families without registered
@@ -107,6 +110,11 @@ type IngestGradeResult struct {
 // its own graders, so this payload carries only the raw inputs the route needs:
 // the case, the arm, the captured transcript, and reporting context.
 func BuildIngestRequest(c Case, tr Transcript, trial int, dispatchID, datasetID, projectID string) IngestRequest {
+	var actualCostUSD *float64
+	if tr.CostReported && tr.CostComplete {
+		cost := tr.CostUSD
+		actualCostUSD = &cost
+	}
 	return IngestRequest{
 		Arm:           tr.Arm,
 		DatasetID:     datasetID,
@@ -119,6 +127,7 @@ func BuildIngestRequest(c Case, tr Transcript, trial int, dispatchID, datasetID,
 		ToolCalls:     tr.ToolCalls,
 		TurnCount:     tr.TurnCount,
 		TokenCounts:   tr.TokenCounts,
+		ActualCostUSD: actualCostUSD,
 		ProjectID:     projectID,
 	}
 }

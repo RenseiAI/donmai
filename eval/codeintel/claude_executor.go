@@ -71,9 +71,6 @@ var streamFlags = []string{"--output-format", "stream-json", "--verbose", "--dan
 // plus a clear wrapped error — never a panic. Whatever tool calls / answer were
 // parsed before the fault are preserved on the returned Transcript.
 func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, error) {
-	if spec.ContextReset != nil {
-		return Transcript{}, fmt.Errorf("claude executor does not implement context-reset perturbations")
-	}
 	// Control arm: mandatory contamination guard FIRST, before any spawn. The
 	// arm env is authoritative here (PATH scrubbed of donmai); a dirty control
 	// must fail the run, mirroring PlumbingExecutor.executeWithout.
@@ -96,6 +93,76 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 		return Transcript{}, fmt.Errorf("claude %s arm: no workarea provisioned (driver bug)", spec.Arm)
 	}
 
+	if spec.ContextReset == nil {
+		tr, _, err := e.executePhase(ctx, spec)
+		return tr, err
+	}
+	return e.executeContextReset(ctx, spec)
+}
+
+func (e ClaudeExecutor) executeContextReset(ctx context.Context, spec ArmSpec) (Transcript, error) {
+	reset := spec.ContextReset
+	if reset.AfterTurn <= 0 {
+		return Transcript{}, fmt.Errorf("claude %s arm: context-reset after-turn must be positive", spec.Arm)
+	}
+	if strings.TrimSpace(reset.ContinuationPrompt) == "" {
+		return Transcript{}, fmt.Errorf("claude %s arm: context-reset continuation prompt is required", spec.Arm)
+	}
+	if spec.Budget.MaxTurns <= reset.AfterTurn {
+		return Transcript{}, fmt.Errorf(
+			"claude %s arm: context-reset after-turn %d must be below max-turns %d",
+			spec.Arm, reset.AfterTurn, spec.Budget.MaxTurns,
+		)
+	}
+
+	firstSpec := spec
+	firstSpec.ContextReset = nil
+	firstSpec.Budget.MaxTurns = reset.AfterTurn
+	first, firstResult, err := e.executePhase(ctx, firstSpec)
+	if err != nil {
+		return first, err
+	}
+	// The E3 perturbation is only valid when every trial actually reaches the
+	// declared checkpoint. Recording an early completion as reset evidence would
+	// compare unlike treatments across arms, so fail closed instead.
+	if !firstResult.resultErrored() {
+		return first, fmt.Errorf(
+			"claude %s arm: task completed before context-reset checkpoint at turn %d",
+			spec.Arm, reset.AfterTurn,
+		)
+	}
+	if firstResult.resultSubtype != "error_max_turns" {
+		return first, fmt.Errorf(
+			"claude %s arm: first phase failed before context-reset checkpoint: %s",
+			spec.Arm, firstResult.resultSubtype,
+		)
+	}
+
+	secondSpec := spec
+	secondSpec.ContextReset = nil
+	secondSpec.Prompt = reset.ContinuationPrompt
+	secondSpec.Budget.MaxTurns = spec.Budget.MaxTurns - reset.AfterTurn
+	if spec.Budget.MaxTokens > 0 {
+		remaining := spec.Budget.MaxTokens - first.TokenCounts.Total()
+		if remaining <= 0 {
+			return first, fmt.Errorf(
+				"claude %s arm: max-tokens exhausted at context-reset checkpoint: consumed %d of %d",
+				spec.Arm, first.TokenCounts.Total(), spec.Budget.MaxTokens,
+			)
+		}
+		secondSpec.Budget.MaxTokens = remaining
+	}
+	second, _, err := e.executePhase(ctx, secondSpec)
+	combined := combineResetTranscripts(first, second)
+	if err != nil {
+		// Any known phase cost remains durable, while CostComplete stays false
+		// unless every started phase returned its terminal total.
+		return combined, err
+	}
+	return combined, nil
+}
+
+func (e ClaudeExecutor) executePhase(ctx context.Context, spec ArmSpec) (Transcript, parsedStream, error) {
 	inv := BuildClaudeInvocation(spec)
 	argv := append(append([]string(nil), inv.Argv...), streamFlags...)
 
@@ -103,23 +170,28 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 	if spawn == nil {
 		spawn = spawnClaude
 	}
-	stdout, wait, err := spawn(ctx, spec.Workarea, argv, inv.Env)
+	phaseCtx, cancelPhase := context.WithCancel(ctx)
+	defer cancelPhase()
+	stdout, wait, err := spawn(phaseCtx, spec.Workarea, argv, inv.Env)
 	if err != nil {
-		return Transcript{}, fmt.Errorf("claude %s arm: spawn: %w", spec.Arm, err)
+		return Transcript{}, parsedStream{}, fmt.Errorf("claude %s arm: spawn: %w", spec.Arm, err)
 	}
 
-	ps := parseClaudeStream(stdout)
+	ps := parseClaudeStreamWithBudget(stdout, spec.Budget.MaxTokens, cancelPhase)
 	_ = stdout.Close()
 	stderrTail, waitErr := wait()
 
 	snap := &SnapshotRef{Provider: "local", SnapshotID: spec.SnapshotID, Retain: RetainEvalPermanent, CapturedAt: nowISO()}
 	tr := Transcript{
-		Arm:         spec.Arm,
-		FinalAnswer: ps.finalAnswer,
-		ToolCalls:   ps.toolCalls,
-		TurnCount:   ps.turnCount,
-		TokenCounts: ps.tokens,
-		SnapshotRef: snap,
+		Arm:          spec.Arm,
+		FinalAnswer:  ps.finalAnswer,
+		ToolCalls:    ps.toolCalls,
+		TurnCount:    ps.turnCount,
+		TokenCounts:  ps.tokens,
+		CostUSD:      ps.costUSD,
+		CostReported: ps.costReported,
+		CostComplete: ps.costComplete,
+		SnapshotRef:  snap,
 	}
 	if spec.UseCodeIntel {
 		// Only capability-enabled arms were told about the code-intel tools; the
@@ -128,9 +200,38 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 	}
 
 	if rerr := runError(ctx, ps, waitErr, stderrTail); rerr != nil {
-		return tr, fmt.Errorf("claude %s arm: %w", spec.Arm, rerr)
+		return tr, ps, fmt.Errorf("claude %s arm: %w", spec.Arm, rerr)
 	}
-	return tr, nil
+	return tr, ps, nil
+}
+
+func combineResetTranscripts(first, second Transcript) Transcript {
+	combined := second
+	combined.ToolCalls = make([]ToolCall, 0, len(first.ToolCalls)+len(second.ToolCalls))
+	for _, call := range first.ToolCalls {
+		call.Phase = 1
+		combined.ToolCalls = append(combined.ToolCalls, call)
+	}
+	for _, call := range second.ToolCalls {
+		call.Phase = 2
+		combined.ToolCalls = append(combined.ToolCalls, call)
+	}
+	combined.TurnCount = first.TurnCount + second.TurnCount
+	combined.TokenCounts = TokenCounts{
+		Input:     first.TokenCounts.Input + second.TokenCounts.Input,
+		Output:    first.TokenCounts.Output + second.TokenCounts.Output,
+		CacheRead: first.TokenCounts.CacheRead + second.TokenCounts.CacheRead,
+	}
+	combined.CostUSD = first.CostUSD + second.CostUSD
+	combined.CostReported = first.CostReported || second.CostReported
+	combined.CostComplete = first.CostComplete && second.CostComplete
+	if combined.SnapshotRef == nil {
+		combined.SnapshotRef = first.SnapshotRef
+	}
+	if len(combined.AdvertisedTools) == 0 {
+		combined.AdvertisedTools = first.AdvertisedTools
+	}
+	return combined
 }
 
 // runError classifies the outcome of a completed (or aborted) run into a single
@@ -158,6 +259,9 @@ func (e ClaudeExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, 
 func runError(ctx context.Context, ps parsedStream, waitErr error, stderrTail string) error {
 	if cerr := ctx.Err(); cerr != nil {
 		return fmt.Errorf("run aborted: %w%s", cerr, stderrSuffix(stderrTail))
+	}
+	if ps.tokenLimitErr != nil {
+		return fmt.Errorf("%w%s", ps.tokenLimitErr, stderrSuffix(stderrTail))
 	}
 	if waitErr != nil {
 		return fmt.Errorf("claude exited non-zero: %w%s", waitErr, stderrSuffix(stderrTail))
@@ -188,10 +292,14 @@ type parsedStream struct {
 	toolCalls     []ToolCall
 	turnCount     int
 	tokens        TokenCounts
+	costUSD       float64
+	costReported  bool
+	costComplete  bool
 	finalAnswer   string
 	sawResult     bool
 	resultSubtype string // terminal result event's `subtype` (e.g. "success", "error_max_turns")
 	resultIsError bool   // terminal result event's `is_error`
+	tokenLimitErr error
 	parseErr      error
 	// assistantTokens is the running sum of per-turn usage across `assistant`
 	// events. The terminal result's own usage is authoritative when present, but
@@ -237,6 +345,10 @@ type claudeUsage struct {
 //   - everything else (system/init, rate_limit_event, tool_progress,
 //     stream_event, hook_*) is orientation noise and ignored.
 func parseClaudeStream(r io.Reader) parsedStream {
+	return parseClaudeStreamWithBudget(r, 0, nil)
+}
+
+func parseClaudeStreamWithBudget(r io.Reader, maxTokens int64, cancel func()) parsedStream {
 	sc := bufio.NewScanner(r)
 	// Assistant/result lines can be large (content arrays + full usage); raise
 	// the line cap well above the 64KiB default.
@@ -268,6 +380,14 @@ func parseClaudeStream(r io.Reader) parsedStream {
 			} else if txt == errSentinel {
 				badLines++
 			}
+			if maxTokens > 0 && ps.assistantTokens.Total() > maxTokens && ps.tokenLimitErr == nil {
+				ps.tokenLimitErr = fmt.Errorf("max-tokens exceeded: consumed %d tokens (limit %d)", ps.assistantTokens.Total(), maxTokens)
+				if cancel != nil {
+					cancel()
+				}
+				// Keep draining stdout after cancellation. A terminal result may
+				// already be queued and is the only authoritative total-cost source.
+			}
 		case "user":
 			if !parseUser(raw, &ps, idIndex) {
 				badLines++
@@ -276,12 +396,21 @@ func parseClaudeStream(r io.Reader) parsedStream {
 			if !parseResult(raw, &ps) {
 				badLines++
 			}
+			if maxTokens > 0 && ps.tokens.Total() > maxTokens && ps.tokenLimitErr == nil {
+				ps.tokenLimitErr = fmt.Errorf("max-tokens exceeded: consumed %d tokens (limit %d)", ps.tokens.Total(), maxTokens)
+				if cancel != nil {
+					cancel()
+				}
+			}
 		default:
 			// Orientation noise — deliberately ignored.
 		}
 	}
 	if err := sc.Err(); err != nil {
 		ps.parseErr = fmt.Errorf("scan claude stream: %w", err)
+	}
+	if ps.tokens == (TokenCounts{}) {
+		ps.tokens = ps.assistantTokens
 	}
 	// FinalAnswer prefers the terminal result text; fall back to the last
 	// assistant text block ONLY for a stream that produced no *successful*
@@ -389,10 +518,11 @@ func parseUser(raw []byte, ps *parsedStream, idIndex map[string]int) bool {
 // it is most likely to grow — is never reported as free (W5 review finding).
 func parseResult(raw []byte, ps *parsedStream) bool {
 	var res struct {
-		Result  string      `json:"result"`
-		Subtype string      `json:"subtype"`
-		IsError bool        `json:"is_error"`
-		Usage   claudeUsage `json:"usage"`
+		Result       string      `json:"result"`
+		Subtype      string      `json:"subtype"`
+		IsError      bool        `json:"is_error"`
+		TotalCostUSD *float64    `json:"total_cost_usd"`
+		Usage        claudeUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return false
@@ -401,6 +531,14 @@ func parseResult(raw []byte, ps *parsedStream) bool {
 		Input:     res.Usage.InputTokens + res.Usage.CacheCreationInputTokens,
 		Output:    res.Usage.OutputTokens,
 		CacheRead: res.Usage.CacheReadInputTokens,
+	}
+	if res.TotalCostUSD != nil {
+		if *res.TotalCostUSD < 0 {
+			return false
+		}
+		ps.costUSD = *res.TotalCostUSD
+		ps.costReported = true
+		ps.costComplete = true
 	}
 	// A terminal result may omit its usage object (observed on error_max_turns);
 	// fall back to the per-turn assistant usage sum so a failed session's real
