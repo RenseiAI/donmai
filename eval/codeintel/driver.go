@@ -27,6 +27,9 @@ type Config struct {
 	// Trials is the repeated-trial count per arm (brief 06 §4.3.4; default 3,
 	// allow 1 for a fast plumbing run).
 	Trials int
+	// TrialStart is the first one-based trial index for prompt experiments.
+	// Zero defaults to 1; ordinary code-intel runs always begin at 1.
+	TrialStart int
 	// Advertise selects the WITH-arm advertisement mechanism (default MCP).
 	Advertise AdvertiseMode
 	// AdvertiseAllTools disables the WS2 core-subset rule and advertises all
@@ -71,6 +74,12 @@ type Driver struct {
 func NewDriver(cfg Config) (*Driver, error) {
 	if cfg.Trials <= 0 {
 		cfg.Trials = 3
+	}
+	if cfg.TrialStart == 0 {
+		cfg.TrialStart = 1
+	}
+	if cfg.TrialStart < 0 {
+		return nil, fmt.Errorf("driver: TrialStart must be positive")
 	}
 	if cfg.Advertise == "" {
 		cfg.Advertise = AdvertiseMCP
@@ -301,7 +310,7 @@ func (d *Driver) RunPromptExperiment(
 		return experiment.Report[RunRecord]{}, fmt.Errorf("executor %q does not support prompt experiments", d.cfg.Executor.Name())
 	}
 	matrixCases, caseByID := experimentCases(cases)
-	return experiment.Run(ctx, definition, matrixCases, d.cfg.Trials,
+	return experiment.RunFromTrial(ctx, definition, matrixCases, d.cfg.TrialStart, d.cfg.Trials,
 		func(ctx context.Context, trial experiment.Trial) (RunRecord, error) {
 			return d.runPlannedOne(ctx, caseByID[trial.CaseID], trial, true, graderIDs, true)
 		})

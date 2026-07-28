@@ -66,6 +66,10 @@ func TestEvalPromptExperimentCommandIsHidden(t *testing.T) {
 
 func TestEvalPromptExperimentRequiresExplicitPaidRunScopeFlags(t *testing.T) {
 	cmd := newEvalPromptExperimentCmd(Config{})
+	trialStart := cmd.Flags().Lookup("trial-start")
+	if trialStart == nil || trialStart.DefValue != "1" {
+		t.Fatalf("--trial-start = %#v, want optional flag defaulting to 1", trialStart)
+	}
 	for _, name := range []string{"receipt-file", "case", "trials", "max-turns", "max-tokens"} {
 		flag := cmd.Flags().Lookup(name)
 		if flag == nil {
@@ -97,6 +101,18 @@ func TestSelectPromptExperimentCaseRequiresExactSingleMatch(t *testing.T) {
 	}
 }
 
+func TestEvalPromptExperimentRejectsNonPositiveTrialStart(t *testing.T) {
+	opts := &evalPromptExperimentOpts{
+		configPath: "config.json", casesDir: "cases", caseFilter: "case-1", trials: 1, trialStart: 0,
+		platformURL: "https://platform.invalid", platformTok: "test-token",
+		orgID: "org_test", projectID: "proj_test", datasetID: "evd_test",
+		receiptFile: "receipts.jsonl", maxTurns: 1, maxTokens: 1, timeout: time.Second,
+	}
+	if err := validatePromptExperimentOpts(opts); err == nil || !strings.Contains(err.Error(), "--trial-start must be positive") {
+		t.Fatalf("error = %v, want positive trial-start error", err)
+	}
+}
+
 func TestEvalPromptExperimentReceiptOpenFailureStopsBeforeDriver(t *testing.T) {
 	called := false
 	orig := evalNewDriver
@@ -107,7 +123,7 @@ func TestEvalPromptExperimentReceiptOpenFailureStopsBeforeDriver(t *testing.T) {
 	defer func() { evalNewDriver = orig }()
 
 	opts := &evalPromptExperimentOpts{
-		configPath: "must-not-be-read.json", casesDir: "must-not-be-read", caseFilter: "case-1", trials: 1,
+		configPath: "must-not-be-read.json", casesDir: "must-not-be-read", caseFilter: "case-1", trials: 1, trialStart: 1,
 		platformURL: "https://platform.invalid", platformTok: "test-token",
 		orgID: "org_test", projectID: "proj_test", datasetID: "evd_test",
 		receiptFile: t.TempDir(), maxTurns: 1, maxTokens: 1, timeout: time.Second,
@@ -186,6 +202,7 @@ func TestEvalPromptExperimentBuildsLiveReceiptDriverConfig(t *testing.T) {
 		"--dataset-id", "evd_test",
 		"--receipt-file", receiptPath,
 		"--case", "e2-simple-001",
+		"--trial-start", "2",
 		"--trials", "1",
 		"--max-turns", "12",
 		"--max-tokens", "200000",
@@ -199,8 +216,8 @@ func TestEvalPromptExperimentBuildsLiveReceiptDriverConfig(t *testing.T) {
 	if captured.Advertise != eval.AdvertiseMCP || !captured.AdvertiseAllTools {
 		t.Fatalf("advertisement config = %q all=%v", captured.Advertise, captured.AdvertiseAllTools)
 	}
-	if captured.Bridge == nil || !captured.Bridge.Enabled() || captured.PromptReceiptJournal == nil || captured.Trials != 1 {
-		t.Fatalf("receipt config = bridge:%v journal:%v trials:%d", captured.Bridge, captured.PromptReceiptJournal, captured.Trials)
+	if captured.Bridge == nil || !captured.Bridge.Enabled() || captured.PromptReceiptJournal == nil || captured.Trials != 1 || captured.TrialStart != 2 {
+		t.Fatalf("receipt config = bridge:%v journal:%v trials:%d trial-start:%d", captured.Bridge, captured.PromptReceiptJournal, captured.Trials, captured.TrialStart)
 	}
 }
 

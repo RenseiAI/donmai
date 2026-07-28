@@ -19,6 +19,7 @@ type evalPromptExperimentOpts struct {
 	casesDir     string
 	caseFilter   string
 	trials       int
+	trialStart   int
 	donmaiBin    string
 	repoRoots    []string
 	platformURL  string
@@ -84,6 +85,7 @@ before invoking it.`,
 	f.StringVar(&opts.casesDir, "cases-dir", "", "Directory containing experiment JSONL cases")
 	f.StringVar(&opts.caseFilter, "case", "", "Run exactly this case id")
 	f.IntVar(&opts.trials, "trials", 3, "Repeated trials per arm")
+	f.IntVar(&opts.trialStart, "trial-start", 1, "First one-based trial index")
 	f.StringVar(&opts.donmaiBin, "donmai-bin", "", "Path to the donmai binary used by the MCP capability profile")
 	f.StringArrayVar(&opts.repoRoots, "repo-root", nil, "Repo clone source as slug=path; repeatable")
 	f.StringVar(&opts.platformURL, "platform-url", "", "Platform base URL for durable eval receipts")
@@ -110,7 +112,7 @@ before invoking it.`,
 	_ = cmd.MarkFlagRequired("trials")
 	_ = cmd.MarkFlagRequired("max-turns")
 	_ = cmd.MarkFlagRequired("max-tokens")
-	cmd.Example = bin + " eval prompt-experiment --config experiment.json --cases-dir cases --trials 1 --case calibration-001 --repo-root owner/repo=. --platform-url https://... --platform-token rsk_... --org org_... --project proj_... --dataset-id evd_... --receipt-file receipts.jsonl --max-turns 12 --max-tokens 200000 --json"
+	cmd.Example = bin + " eval prompt-experiment --config experiment.json --cases-dir cases --trial-start 1 --trials 1 --case calibration-001 --repo-root owner/repo=. --platform-url https://... --platform-token rsk_... --org org_... --project proj_... --dataset-id evd_... --receipt-file receipts.jsonl --max-turns 12 --max-tokens 200000 --json"
 	return cmd
 }
 
@@ -136,6 +138,9 @@ func validatePromptExperimentOpts(opts *evalPromptExperimentOpts) error {
 	}
 	if opts.trials <= 0 {
 		return fmt.Errorf("--trials must be positive")
+	}
+	if opts.trialStart <= 0 {
+		return fmt.Errorf("--trial-start must be positive")
 	}
 	if opts.maxTurns <= 0 {
 		return fmt.Errorf("--max-turns must be positive")
@@ -202,6 +207,7 @@ func runEvalPromptExperiment(cmd *cobra.Command, opts *evalPromptExperimentOpts)
 	bridge := eval.NewBridge(opts.platformURL, opts.platformTok, opts.platformPath)
 	driver, err := evalNewDriver(eval.Config{
 		Trials:               opts.trials,
+		TrialStart:           opts.trialStart,
 		Advertise:            eval.AdvertiseMCP,
 		AdvertiseAllTools:    true,
 		DonmaiBin:            donmaiBin,
@@ -229,8 +235,8 @@ func runEvalPromptExperiment(cmd *cobra.Command, opts *evalPromptExperimentOpts)
 	ctx, cancel := context.WithTimeout(baseCtx, opts.timeout)
 	defer cancel()
 
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[eval] running experiment=%s cases=%d trials=%d arms=%d (live claude, durable receipts)\n",
-		loaded.Definition.ID, len(cases), opts.trials, len(loaded.Definition.Arms))
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "[eval] running experiment=%s cases=%d trial_start=%d trials=%d arms=%d (live claude, durable receipts)\n",
+		loaded.Definition.ID, len(cases), opts.trialStart, opts.trials, len(loaded.Definition.Arms))
 	report, err := driver.RunPromptExperiment(ctx, cases, loaded.Definition, loaded.GraderIDs)
 	if err != nil {
 		return fmt.Errorf("prompt experiment: %w", err)
