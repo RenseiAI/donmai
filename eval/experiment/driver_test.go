@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -68,6 +69,103 @@ func TestRunBalancedMatrixInjectsImmutableVariants(t *testing.T) {
 	}
 	if report.ExperimentID != definition.ID || report.TrialsPerArm != 2 || len(report.Outcomes) != len(want) {
 		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestRunFromTrialStartsAtExplicitIndex(t *testing.T) {
+	definition := Definition{
+		ID: "continued-v1",
+		Arms: []Arm{
+			testArm("incumbent", "agent/base", "incumbent prompt"),
+			testArm("candidate", "agent/base", "candidate prompt"),
+		},
+	}
+
+	var got []string
+	report, err := RunFromTrial(context.Background(), definition, []Case{{ID: "case-a", Prompt: "work"}}, 2, 2,
+		func(_ context.Context, trial Trial) (struct{}, error) {
+			got = append(got, fmt.Sprintf("%d/%s", trial.TrialIndex, trial.Arm.ID))
+			return struct{}{}, nil
+		})
+	if err != nil {
+		t.Fatalf("RunFromTrial: %v", err)
+	}
+	want := []string{"2/incumbent", "2/candidate", "3/incumbent", "3/candidate"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("trial order = %#v, want %#v", got, want)
+	}
+	if report.TrialsPerArm != 2 || len(report.Outcomes) != len(want) {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestRunFromTrialRejectsNonPositiveStartBeforeExecuting(t *testing.T) {
+	definition := Definition{
+		ID: "continued-v1",
+		Arms: []Arm{
+			testArm("incumbent", "agent/base", "incumbent prompt"),
+			testArm("candidate", "agent/base", "candidate prompt"),
+		},
+	}
+	for _, start := range []int{0, -1} {
+		t.Run(fmt.Sprintf("start_%d", start), func(t *testing.T) {
+			calls := 0
+			_, err := RunFromTrial(context.Background(), definition, []Case{{ID: "case-a", Prompt: "work"}}, start, 1,
+				func(context.Context, Trial) (struct{}, error) {
+					calls++
+					return struct{}{}, nil
+				})
+			if err == nil || !strings.Contains(err.Error(), "first trial index must be positive") {
+				t.Fatalf("error = %v, want positive first-trial-index error", err)
+			}
+			if calls != 0 {
+				t.Fatalf("callback ran %d times", calls)
+			}
+		})
+	}
+}
+
+func TestRunFromTrialRejectsIndexOverflowBeforeExecuting(t *testing.T) {
+	definition := Definition{
+		ID: "continued-v1",
+		Arms: []Arm{
+			testArm("incumbent", "agent/base", "incumbent prompt"),
+			testArm("candidate", "agent/base", "candidate prompt"),
+		},
+	}
+	calls := 0
+	_, err := RunFromTrial(context.Background(), definition, []Case{{ID: "case-a", Prompt: "work"}}, math.MaxInt, 2,
+		func(context.Context, Trial) (struct{}, error) {
+			calls++
+			return struct{}{}, nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "trial index range overflows") {
+		t.Fatalf("error = %v, want trial-index overflow error", err)
+	}
+	if calls != 0 {
+		t.Fatalf("callback ran %d times", calls)
+	}
+}
+
+func TestRunFromTrialRejectsPlannedMatrixCapacityOverflow(t *testing.T) {
+	definition := Definition{
+		ID: "continued-v1",
+		Arms: []Arm{
+			testArm("incumbent", "agent/base", "incumbent prompt"),
+			testArm("candidate", "agent/base", "candidate prompt"),
+		},
+	}
+	calls := 0
+	_, err := RunFromTrial(context.Background(), definition, []Case{{ID: "case-a", Prompt: "work"}}, 1, math.MaxInt/2+1,
+		func(context.Context, Trial) (struct{}, error) {
+			calls++
+			return struct{}{}, nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "planned trial count overflows") {
+		t.Fatalf("error = %v, want planned-trial-count overflow error", err)
+	}
+	if calls != 0 {
+		t.Fatalf("callback ran %d times", calls)
 	}
 }
 

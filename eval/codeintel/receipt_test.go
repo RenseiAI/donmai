@@ -235,6 +235,19 @@ func TestPromptExperimentReceiptIdentityBindsSafeInvocationScope(t *testing.T) {
 	if withoutToken != identity {
 		t.Fatalf("credential changed receipt identity: base=%+v changed=%+v", identity, withoutToken)
 	}
+
+	trialTwo := trial
+	trialTwo.TrialIndex = 2
+	continued, err := promptExperimentReceiptIdentity(base, c, trialTwo, graders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if continued.InvocationScopeDigest != identity.InvocationScopeDigest {
+		t.Fatalf("trial index changed invocation scope: base=%+v continued=%+v", identity, continued)
+	}
+	if continued.ReceiptID == identity.ReceiptID || continued.TrialIndex != 2 {
+		t.Fatalf("trial 2 did not receive a distinct deterministic receipt: base=%+v continued=%+v", identity, continued)
+	}
 }
 
 func TestPromptExperimentReceiptLedgerExcludesConcurrentProcessAndReleasesLock(t *testing.T) {
@@ -626,6 +639,76 @@ func TestDriverPromptExperimentUnpostedIdentityBlocksBeforeExecution(t *testing.
 	}
 	if len(second.specs) != 0 {
 		t.Fatalf("unposted retry executed provider %d time(s)", len(second.specs))
+	}
+}
+
+func TestDriverPromptExperimentCanContinueAtDistinctTrialAfterUnpostedFailure(t *testing.T) {
+	c, definition, roots, donmaiBin := promptExperimentDriverFixture(t)
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			http.Error(w, "failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"runId":"evr_prompt","traceId":"evt_prompt","datasetId":"evd_prompt","gradersRun":["safety/injection-follow-v1"],"gradeResults":[{"graderId":"safety/injection-follow-v1","status":"scored","score":1,"pass":true}]}`))
+	}))
+	defer server.Close()
+
+	ledger, err := OpenPromptExperimentReceiptLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &promptRecordingExecutor{costs: []float64{0.1}}
+	d, err := NewDriver(Config{
+		Trials: 1, DonmaiBin: donmaiBin, RepoRoots: roots, WorkareaParent: t.TempDir(), Executor: first,
+		Bridge: NewBridge(server.URL, "", ""), PromptReceiptJournal: ledger, DatasetID: "evd_prompt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.RunPromptExperiment(context.Background(), []Case{c}, definition, []string{"safety/injection-follow-v1"})
+	if err == nil || !strings.Contains(err.Error(), "bridge post") {
+		t.Fatalf("trial 1 error = %v, want bridge failure", err)
+	}
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := OpenPromptExperimentReceiptLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reloaded.Close() }()
+	continued := &promptRecordingExecutor{costs: []float64{0.2, 0.3}}
+	d, err = NewDriver(Config{
+		Trials: 1, TrialStart: 2, DonmaiBin: donmaiBin, RepoRoots: roots, WorkareaParent: t.TempDir(), Executor: continued,
+		Bridge: NewBridge(server.URL, "", ""), PromptReceiptJournal: reloaded, DatasetID: "evd_prompt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := d.RunPromptExperiment(context.Background(), []Case{c}, definition, []string{"safety/injection-follow-v1"})
+	if err != nil {
+		t.Fatalf("trial 2 continuation: %v", err)
+	}
+	if len(report.Outcomes) != 2 || len(continued.specs) != 2 {
+		t.Fatalf("trial 2 continuation outcomes=%d executions=%d, want 2/2", len(report.Outcomes), len(continued.specs))
+	}
+	for _, outcome := range report.Outcomes {
+		if outcome.Trial.TrialIndex != 2 {
+			t.Fatalf("continued trial index = %d, want 2", outcome.Trial.TrialIndex)
+		}
+	}
+	lines := readReceiptLines(t, path)
+	if len(lines) != 5 || lines[0]["trialIndex"] != float64(1) {
+		t.Fatalf("continued receipt ledger = %#v, want blocked trial 1 plus two trial-2 posted pairs", lines)
+	}
+	for _, line := range lines[1:] {
+		if line["trialIndex"] != float64(2) {
+			t.Fatalf("continuation mutated or replayed trial identity: %#v", lines)
+		}
 	}
 }
 

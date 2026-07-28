@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 )
@@ -173,9 +174,10 @@ func (d Definition) Validate() error {
 	return nil
 }
 
-// Run executes a balanced case × trial × arm matrix in deterministic order.
-// The complete matrix is planned before the first callback, so invalid or
-// asymmetric perturbation plans cannot leave partially executed evidence.
+// Run executes a balanced case × trial × arm matrix in deterministic order,
+// starting at trial index 1. The complete matrix is planned before the first
+// callback, so invalid or asymmetric perturbation plans cannot leave partially
+// executed evidence.
 func Run[T any](
 	ctx context.Context,
 	definition Definition,
@@ -183,7 +185,21 @@ func Run[T any](
 	trials int,
 	runTrial func(context.Context, Trial) (T, error),
 ) (Report[T], error) {
-	planned, err := planTrials(definition, cases, trials)
+	return RunFromTrial(ctx, definition, cases, 1, trials, runTrial)
+}
+
+// RunFromTrial executes a balanced matrix beginning at firstTrialIndex. This is
+// intended for reviewed continuation of an existing experiment while preserving
+// the immutable identities of earlier trials.
+func RunFromTrial[T any](
+	ctx context.Context,
+	definition Definition,
+	cases []Case,
+	firstTrialIndex int,
+	trials int,
+	runTrial func(context.Context, Trial) (T, error),
+) (Report[T], error) {
+	planned, err := planTrials(definition, cases, firstTrialIndex, trials)
 	if err != nil {
 		return Report[T]{}, err
 	}
@@ -202,12 +218,18 @@ func Run[T any](
 	return report, nil
 }
 
-func planTrials(definition Definition, cases []Case, trials int) ([]Trial, error) {
+func planTrials(definition Definition, cases []Case, firstTrialIndex, trials int) ([]Trial, error) {
 	if err := definition.Validate(); err != nil {
 		return nil, err
 	}
+	if firstTrialIndex <= 0 {
+		return nil, fmt.Errorf("first trial index must be positive")
+	}
 	if trials <= 0 {
 		return nil, fmt.Errorf("trials per arm must be positive")
+	}
+	if firstTrialIndex > math.MaxInt-(trials-1) {
+		return nil, fmt.Errorf("trial index range overflows int")
 	}
 	if len(cases) == 0 {
 		return nil, fmt.Errorf("at least one case is required")
@@ -227,9 +249,14 @@ func planTrials(definition Definition, cases []Case, trials int) ([]Trial, error
 		}
 	}
 
-	planned := make([]Trial, 0, len(cases)*trials*len(definition.Arms))
+	if trials > math.MaxInt/len(cases)/len(definition.Arms) {
+		return nil, fmt.Errorf("planned trial count overflows int")
+	}
+	plannedCount := len(cases) * trials * len(definition.Arms)
+	planned := make([]Trial, 0, plannedCount)
 	for _, c := range cases {
-		for trialIndex := 1; trialIndex <= trials; trialIndex++ {
+		for offset := 0; offset < trials; offset++ {
+			trialIndex := firstTrialIndex + offset
 			shared := PromptPlan{UserPrompt: c.Prompt}
 			for _, perturbation := range definition.Perturbations {
 				var err error
