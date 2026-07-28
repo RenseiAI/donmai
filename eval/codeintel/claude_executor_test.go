@@ -334,19 +334,26 @@ type spawnStep struct {
 }
 
 type queuedSpawn struct {
-	steps   []spawnStep
-	calls   int
-	gotArgv [][]string
+	steps          []spawnStep
+	calls          int
+	gotArgv        [][]string
+	canceledAtWait []bool
+	onWait         func(call int)
 }
 
-func (q *queuedSpawn) spawn(_ context.Context, _ string, argv []string, _ []string) (io.ReadCloser, func() (string, error), error) {
+func (q *queuedSpawn) spawn(ctx context.Context, _ string, argv []string, _ []string) (io.ReadCloser, func() (string, error), error) {
 	q.gotArgv = append(q.gotArgv, append([]string(nil), argv...))
 	if q.calls >= len(q.steps) {
 		return nil, nil, fmt.Errorf("unexpected spawn %d", q.calls+1)
 	}
 	step := q.steps[q.calls]
 	q.calls++
+	call := q.calls
 	return io.NopCloser(strings.NewReader(step.stream)), func() (string, error) {
+		if q.onWait != nil {
+			q.onWait(call)
+		}
+		q.canceledAtWait = append(q.canceledAtWait, ctx.Err() != nil)
 		return step.stderr, step.waitErr
 	}, nil
 }
@@ -479,7 +486,7 @@ func TestClaudeExecutor_MaxTokensTerminatesLiveStream(t *testing.T) {
 	}
 }
 
-func TestClaudeExecutor_ContextResetPhaseTwoUsesRemainingTokenBudget(t *testing.T) {
+func TestClaudeExecutor_ContextResetPhaseTwoTerminalTokenExhaustionIsGradeable(t *testing.T) {
 	first := strings.Join([]string{
 		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"checkpoint"}],"usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":20}}}`,
 		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.1}`,
@@ -496,14 +503,106 @@ func TestClaudeExecutor_ContextResetPhaseTwoUsesRemainingTokenBudget(t *testing.
 		Budget: Budget{MaxTurns: 8, MaxTokens: 100}, Prompt: "long task",
 		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
 	})
-	if err == nil || !strings.Contains(err.Error(), "max-tokens") {
-		t.Fatalf("error = %v, want phase-two remaining max-tokens failure (transcript=%+v)", err, tr)
+	if err != nil {
+		t.Fatalf("terminal complete-cost phase-two exhaustion must be gradeable: %v (transcript=%+v)", err, tr)
 	}
 	if spawner.calls != 2 {
 		t.Fatalf("spawn count = %d, want 2", spawner.calls)
 	}
+	if len(spawner.canceledAtWait) != 2 || !spawner.canceledAtWait[1] {
+		t.Fatalf("phase-two token breach must preserve provider cancellation; canceled-at-wait=%v", spawner.canceledAtWait)
+	}
+	if tr.TokenCounts.Total() <= 100 {
+		t.Fatalf("captured tokens = %+v, want over-budget evidence", tr.TokenCounts)
+	}
 	if tr.CostUSD != 0.2 || !tr.CostReported || !tr.CostComplete {
 		t.Fatalf("drained reset cost = %v reported=%v complete=%v, want 0.2/true/true", tr.CostUSD, tr.CostReported, tr.CostComplete)
+	}
+	if strings.TrimSpace(tr.FinalAnswer) != "" {
+		t.Fatalf("over-budget terminal answer must be cleared before grading; got %q", tr.FinalAnswer)
+	}
+}
+
+func TestClaudeExecutor_ContextResetPhaseOneTokenExhaustionRemainsFatal(t *testing.T) {
+	first := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still preparing checkpoint"}],"usage":{"input_tokens":80,"output_tokens":15,"cache_read_input_tokens":10}}}`,
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.1,"usage":{"input_tokens":80,"output_tokens":15,"cache_read_input_tokens":10}}`,
+	}, "\n")
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: first}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	tr, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "reset-phase-one-token-limit",
+		Budget: Budget{MaxTurns: 8, MaxTokens: 100}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "max-tokens") {
+		t.Fatalf("error = %v, want phase-one max-tokens harness failure (transcript=%+v)", err, tr)
+	}
+	if spawner.calls != 1 {
+		t.Fatalf("spawn count = %d, want 1", spawner.calls)
+	}
+	if len(spawner.canceledAtWait) != 1 || !spawner.canceledAtWait[0] {
+		t.Fatalf("phase-one token breach must cancel provider context; canceled-at-wait=%v", spawner.canceledAtWait)
+	}
+}
+
+func TestClaudeExecutor_ContextResetPhaseTwoParseFailureRemainsFatal(t *testing.T) {
+	first := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"checkpoint"}],"usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":20}}}`,
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.1}`,
+	}, "\n")
+	second := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"continuing"}],"usage":{"input_tokens":15,"output_tokens":4,"cache_read_input_tokens":2}}}`,
+		`not-json`,
+		`{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1,"usage":{"input_tokens":15,"output_tokens":4,"cache_read_input_tokens":2}}`,
+	}, "\n")
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: first}, {stream: second}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	tr, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "reset-token-parse-error",
+		Budget: Budget{MaxTurns: 8, MaxTokens: 100}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err == nil {
+		t.Fatalf("phase-two parse failure must remain harness-fatal (transcript=%+v)", tr)
+	}
+	if !tr.CostComplete {
+		t.Fatalf("test requires complete cost so parse failure is the fatal discriminator: %+v", tr)
+	}
+}
+
+func TestClaudeExecutor_ContextResetPhaseTwoParentCancellationRemainsFatal(t *testing.T) {
+	first := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"checkpoint"}],"usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":20}}}`,
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.1}`,
+	}, "\n")
+	second := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"continuing"}],"usage":{"input_tokens":15,"output_tokens":4,"cache_read_input_tokens":2}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1,"usage":{"input_tokens":15,"output_tokens":4,"cache_read_input_tokens":2}}`,
+	}, "\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	spawner := &queuedSpawn{
+		steps: []spawnStep{{stream: first}, {stream: second}},
+		onWait: func(call int) {
+			if call == 2 {
+				cancel()
+			}
+		},
+	}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	tr, err := exec.Execute(ctx, ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "reset-token-parent-cancel",
+		Budget: Budget{MaxTurns: 8, MaxTokens: 100}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "run aborted: context canceled") {
+		t.Fatalf("error = %v, want parent cancellation to remain fatal (transcript=%+v)", err, tr)
+	}
+	if !tr.CostComplete {
+		t.Fatalf("test requires complete cost so parent cancellation is the fatal discriminator: %+v", tr)
 	}
 }
 

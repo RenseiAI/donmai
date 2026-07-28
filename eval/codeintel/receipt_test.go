@@ -73,6 +73,20 @@ func readReceiptLines(t *testing.T, path string) []map[string]any {
 	return lines
 }
 
+type contextResetRecordingExecutor struct {
+	executor ClaudeExecutor
+	specs    []ArmSpec
+}
+
+func (e *contextResetRecordingExecutor) Name() string { return e.executor.Name() }
+
+func (*contextResetRecordingExecutor) SupportsPromptExperiments() bool { return true }
+
+func (e *contextResetRecordingExecutor) Execute(ctx context.Context, spec ArmSpec) (Transcript, error) {
+	e.specs = append(e.specs, spec)
+	return e.executor.Execute(ctx, spec)
+}
+
 func TestPromptExperimentReceiptLedgerSanitizedAppendAndReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
 	ledger, err := OpenPromptExperimentReceiptLedger(path)
@@ -506,6 +520,102 @@ func TestDriverPromptExperimentIncompleteCostIsDurableAndBlocksRetry(t *testing.
 				t.Fatalf("retry executed provider %d time(s)", len(retry.specs))
 			}
 		})
+	}
+}
+
+func TestDriverPromptExperimentPostsBothArmsAfterGradeableResetTokenExhaustion(t *testing.T) {
+	c, definition, roots, donmaiBin := promptExperimentDriverFixture(t)
+	definition.Perturbations = []experiment.Perturbation{
+		experiment.ContextResetAtTurn(4, "recover from durable state and finish"),
+	}
+	phaseOneIncumbent := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"checkpoint"}],"usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":20}}}`,
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.1}`,
+	}, "\n")
+	phaseTwoIncumbent := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"foo.go:3"}],"usage":{"input_tokens":15,"output_tokens":4,"cache_read_input_tokens":2}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"result":"foo.go:3","total_cost_usd":0.1,"usage":{"input_tokens":15,"output_tokens":4,"cache_read_input_tokens":2}}`,
+	}, "\n")
+	phaseOneCandidate := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"checkpoint"}],"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":3}}}`,
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.05}`,
+	}, "\n")
+	phaseTwoCandidate := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"foo.go:3"}],"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":3}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"result":"foo.go:3","total_cost_usd":0.05,"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":3}}`,
+	}, "\n")
+	spawner := &queuedSpawn{steps: []spawnStep{
+		{stream: phaseOneIncumbent},
+		{stream: phaseTwoIncumbent},
+		{stream: phaseOneCandidate},
+		{stream: phaseTwoCandidate},
+	}}
+	exec := &contextResetRecordingExecutor{executor: newClaudeExecutorWithSpawner(spawner.spawn)}
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	ledger, err := OpenPromptExperimentReceiptLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ledger.Close() }()
+	var postedOutputs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ingest IngestRequest
+		if err := json.NewDecoder(r.Body).Decode(&ingest); err != nil {
+			t.Errorf("decode ingest request: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		output, ok := ingest.OutputPayload.(string)
+		if !ok {
+			t.Errorf("output payload type = %T, want string", ingest.OutputPayload)
+		}
+		postedOutputs = append(postedOutputs, output)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"runId":"evr_prompt","traceId":"evt_prompt","datasetId":"evd_prompt","gradersRun":["safety/injection-follow-v1"],"gradeResults":[{"graderId":"safety/injection-follow-v1","status":"scored","score":1,"pass":true}]}`))
+	}))
+	defer server.Close()
+	d, err := NewDriver(Config{
+		Trials: 1, DonmaiBin: donmaiBin, RepoRoots: roots, WorkareaParent: t.TempDir(),
+		Executor: exec, Bridge: NewBridge(server.URL, "", ""), PromptReceiptJournal: ledger,
+		DatasetID: "evd_prompt", ProjectID: "proj_test", Budget: Budget{MaxTurns: 8, MaxTokens: 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := d.RunPromptExperiment(context.Background(), []Case{c}, definition, []string{"safety/injection-follow-v1"})
+	if err != nil {
+		t.Fatalf("prompt experiment: %v", err)
+	}
+	if len(report.Outcomes) != 2 || len(exec.specs) != 2 || spawner.calls != 4 {
+		t.Fatalf("outcomes=%d executions=%d phase spawns=%d, want 2/2/4", len(report.Outcomes), len(exec.specs), spawner.calls)
+	}
+	if report.Outcomes[0].Result.Pass {
+		t.Fatal("over-budget incumbent must be graded false after its terminal answer is cleared")
+	}
+	if !report.Outcomes[1].Result.Pass {
+		t.Fatal("candidate should still execute and pass")
+	}
+	if len(postedOutputs) != 2 {
+		t.Fatalf("bridge requests = %d, want 2", len(postedOutputs))
+	}
+	if postedOutputs[0] != "" {
+		t.Fatalf("over-budget incumbent output posted as %q, want empty", postedOutputs[0])
+	}
+	if postedOutputs[1] != "foo.go:3" {
+		t.Fatalf("candidate output posted as %q, want foo.go:3", postedOutputs[1])
+	}
+	lines := readReceiptLines(t, path)
+	if len(lines) != 4 {
+		t.Fatalf("receipt lines = %d, want two completed+posted pairs: %#v", len(lines), lines)
+	}
+	for i, line := range lines {
+		wantEvent := "execution_completed"
+		if i%2 == 1 {
+			wantEvent = "platform_posted"
+		}
+		if line["event"] != wantEvent || line["disposition"] != PromptExperimentDispositionCompleted || line["costCompleteness"] != string(PromptExperimentCostComplete) {
+			t.Fatalf("receipt line %d = %#v, want %s completed with complete cost", i, line, wantEvent)
+		}
 	}
 }
 
