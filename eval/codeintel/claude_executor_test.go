@@ -424,6 +424,35 @@ func TestClaudeExecutor_ContextResetStartsFreshContinuationAndAggregatesEvidence
 	}
 }
 
+func TestClaudeExecutor_ContextResetAcceptsNonzeroExitForMaxTurnsCheckpoint(t *testing.T) {
+	first := `{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.1,"usage":{"input_tokens":10,"output_tokens":2}}`
+	second := `{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.2,"usage":{"input_tokens":20,"output_tokens":3}}`
+	spawner := &queuedSpawn{steps: []spawnStep{
+		{stream: first, waitErr: fakeExitErr{}},
+		{stream: second},
+	}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+
+	tr, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "reset-nonzero-max-turns",
+		Budget: Budget{MaxTurns: 8}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err != nil {
+		t.Fatalf("terminal error_max_turns with process exit 1 must remain a gradeable checkpoint: %v", err)
+	}
+	if spawner.calls != 2 {
+		t.Fatalf("spawn count = %d, want 2", spawner.calls)
+	}
+	if tr.FinalAnswer != "done" {
+		t.Errorf("FinalAnswer = %q, want done", tr.FinalAnswer)
+	}
+	if tr.CostUSD < 0.299999 || tr.CostUSD > 0.300001 || !tr.CostReported || !tr.CostComplete {
+		t.Errorf("provider cost = %v reported=%v complete=%v, want 0.3/true/true", tr.CostUSD, tr.CostReported, tr.CostComplete)
+	}
+}
+
 func TestClaudeExecutor_MaxTokensTerminatesLiveStream(t *testing.T) {
 	stream := strings.Join([]string{
 		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still working"}],"usage":{"input_tokens":8,"output_tokens":3,"cache_read_input_tokens":2}}}`,

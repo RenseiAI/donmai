@@ -236,8 +236,10 @@ func combineResetTranscripts(first, second Transcript) Transcript {
 
 // runError classifies the outcome of a completed (or aborted) run into a single
 // HARNESS error, or nil when the run produced a well-formed terminal result.
-// Precedence: context cancellation (timeout) → non-zero exit → no terminal
-// result at all (truncated/crashed) → a partially-unparseable stream.
+// Precedence: context cancellation (timeout) → token limit → no terminal result
+// at all (truncated/crashed) → a partially-unparseable stream → a non-zero exit
+// accompanying a terminal success. A non-zero exit is tolerated only when a
+// well-formed terminal agent-error result was parsed.
 //
 // An agent-ERROR terminal result (subtype=error_max_turns / error_during_execution,
 // is_error=true) is deliberately NOT a harness error and must not be returned
@@ -263,10 +265,10 @@ func runError(ctx context.Context, ps parsedStream, waitErr error, stderrTail st
 	if ps.tokenLimitErr != nil {
 		return fmt.Errorf("%w%s", ps.tokenLimitErr, stderrSuffix(stderrTail))
 	}
-	if waitErr != nil {
-		return fmt.Errorf("claude exited non-zero: %w%s", waitErr, stderrSuffix(stderrTail))
-	}
 	if !ps.sawResult {
+		if waitErr != nil {
+			return fmt.Errorf("claude exited non-zero: %w%s", waitErr, stderrSuffix(stderrTail))
+		}
 		if ps.parseErr != nil {
 			return fmt.Errorf("claude stream ended before a terminal result event: %w%s", ps.parseErr, stderrSuffix(stderrTail))
 		}
@@ -274,6 +276,9 @@ func runError(ctx context.Context, ps parsedStream, waitErr error, stderrTail st
 	}
 	if ps.parseErr != nil {
 		return fmt.Errorf("claude stream partially unparseable: %w", ps.parseErr)
+	}
+	if waitErr != nil && !ps.resultErrored() {
+		return fmt.Errorf("claude exited non-zero: %w%s", waitErr, stderrSuffix(stderrTail))
 	}
 	return nil
 }
