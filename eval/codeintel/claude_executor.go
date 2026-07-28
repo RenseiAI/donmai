@@ -152,9 +152,22 @@ func (e ClaudeExecutor) executeContextReset(ctx context.Context, spec ArmSpec) (
 		}
 		secondSpec.Budget.MaxTokens = remaining
 	}
-	second, _, err := e.executePhase(ctx, secondSpec)
+	second, secondResult, err := e.executePhase(ctx, secondSpec)
 	combined := combineResetTranscripts(first, second)
 	if err != nil {
+		// A reset recovery that exhausts its remaining token envelope is a
+		// gradeable task failure only when phase two still produced a complete,
+		// parseable terminal outcome and every started phase reported provider
+		// cost. Preserve the over-budget evidence and cancellation, but clear the
+		// answer so work completed outside the frozen envelope cannot pass.
+		if ctx.Err() == nil &&
+			secondResult.tokenLimitErr != nil &&
+			secondResult.sawResult &&
+			secondResult.parseErr == nil &&
+			combined.CostComplete {
+			combined.FinalAnswer = ""
+			return combined, nil
+		}
 		// Any known phase cost remains durable, while CostComplete stays false
 		// unless every started phase returned its terminal total.
 		return combined, err
