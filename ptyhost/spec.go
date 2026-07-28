@@ -115,16 +115,19 @@ func (s Spec) logger() *slog.Logger {
 // composeEnv layers the interactive terminal defaults over the parent
 // environment, then applies Spec.Env last. Parent TERM/COLORTERM values describe
 // the process that launched donmai, not the child PTY contract; only explicit
-// per-request overrides may replace the interactive defaults.
+// per-request overrides may replace the interactive defaults. The existing
+// runtime blocklist also applies to the inherited parent so a previously
+// filtered runner environment cannot be undone by this final os.Environ merge.
 func composeEnv(parent, overrides []string) []string {
 	idx := make(map[string]int, len(parent)+len(overrides))
 	out := make([]string, 0, len(parent)+len(overrides)+2)
-	put := func(kv string) {
+	blocklist := runtimeenv.NewComposer()
+	put := func(kv string, inherited bool) {
 		key := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			key = kv[:i]
 		}
-		if runtimeenv.IsRunnerOnly(key) {
+		if runtimeenv.IsRunnerOnly(key) || (inherited && blocklist.IsBlocked(key)) {
 			return
 		}
 		if at, ok := idx[key]; ok {
@@ -135,12 +138,12 @@ func composeEnv(parent, overrides []string) []string {
 		out = append(out, kv)
 	}
 	for _, kv := range parent {
-		put(kv)
+		put(kv, true)
 	}
-	put("TERM=xterm-256color")
-	put("COLORTERM=truecolor")
+	put("TERM=xterm-256color", false)
+	put("COLORTERM=truecolor", false)
 	for _, kv := range overrides {
-		put(kv)
+		put(kv, false)
 	}
 	return out
 }
