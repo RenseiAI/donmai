@@ -110,6 +110,90 @@ func TestBridge_Post_FlatIngestShapePathAndAuth(t *testing.T) {
 	}
 }
 
+func TestBuildIngestRequest_PreservesResetPhasesAndActualCostSemantics(t *testing.T) {
+	reset := combineResetTranscripts(
+		Transcript{ToolCalls: []ToolCall{{Name: "Write"}}},
+		Transcript{ToolCalls: []ToolCall{{Name: "Read"}}},
+	)
+	reset.CostUSD = 0
+	reset.CostReported = true
+	reset.CostComplete = true
+	req := BuildIngestRequest(sampleCase(), reset, 1, "dispatch-reset", "evd_reset", "proj-1")
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got, ok := wire["actualCostUsd"]; !ok || got != float64(0) {
+		t.Fatalf("explicit zero actual cost = %v present=%v, want present zero (wire=%s)", got, ok, body)
+	}
+	calls, _ := wire["toolCalls"].([]any)
+	if len(calls) != 2 {
+		t.Fatalf("toolCalls = %#v", wire["toolCalls"])
+	}
+	for i, wantPhase := range []float64{1, 2} {
+		call, _ := calls[i].(map[string]any)
+		if call["phase"] != wantPhase {
+			t.Errorf("tool call %d phase = %v, want %v", i, call["phase"], wantPhase)
+		}
+	}
+
+	positive := BuildIngestRequest(sampleCase(), Transcript{CostUSD: 0.125, CostReported: true, CostComplete: true}, 1, "d", "evd", "p")
+	positiveBody, err := json.Marshal(positive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(positiveBody, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire["actualCostUsd"] != 0.125 {
+		t.Fatalf("positive actual cost = %v, want 0.125", wire["actualCostUsd"])
+	}
+
+	partial := BuildIngestRequest(sampleCase(), Transcript{CostUSD: 0.075, CostReported: true, CostComplete: false}, 1, "d", "evd", "p")
+	partialBody, err := json.Marshal(partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire = nil
+	if err := json.Unmarshal(partialBody, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wire["actualCostUsd"]; ok {
+		t.Fatalf("partial provider cost must not be labeled actualCostUsd, got %s", partialBody)
+	}
+
+	missing := BuildIngestRequest(sampleCase(), Transcript{CostUSD: 9.99, CostReported: false}, 1, "d", "evd", "p")
+	missingBody, err := json.Marshal(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire = nil
+	if err := json.Unmarshal(missingBody, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wire["actualCostUsd"]; ok {
+		t.Fatalf("missing provider cost must stay absent, got %s", missingBody)
+	}
+}
+
+func TestToolCallOrdinaryJSONOmitsResetPhase(t *testing.T) {
+	body, err := json.Marshal(ToolCall{Name: "Read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wire["phase"]; ok {
+		t.Fatalf("ordinary tool call unexpectedly carried phase: %s", body)
+	}
+}
+
 func TestBridge_Post_PromptExperimentReceipt(t *testing.T) {
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

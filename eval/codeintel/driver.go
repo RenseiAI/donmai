@@ -48,6 +48,10 @@ type Config struct {
 	Judge Judge
 	// Bridge posts results to the platform (nil / disabled → offline).
 	Bridge *Bridge
+	// PromptReceiptJournal durably records paid prompt-experiment executions
+	// before bridge posting and indexes them to prevent duplicate retry spend.
+	// Nil preserves ordinary code-intel and offline behavior.
+	PromptReceiptJournal PromptExperimentReceiptJournal
 	// Reporting context for the eval_runs rows.
 	OrgID, ProjectID, DatasetID, DatasetName string
 	// KeepWorkareas leaves provisioned workareas on disk (debugging).
@@ -92,15 +96,18 @@ func NewDriver(cfg Config) (*Driver, error) {
 
 // RunRecord is one (case, arm, trial) outcome.
 type RunRecord struct {
-	CaseID   string         `json:"caseId"`
-	Family   TaskType       `json:"family"`
-	Repo     string         `json:"repo"`
-	Arm      Arm            `json:"arm"`
-	Trial    int            `json:"trial"`
-	Pass     bool           `json:"pass"`
-	Grades   []GradeResult  `json:"grades"`
-	Envelope ReportEnvelope `json:"envelope"`
-	Posted   bool           `json:"posted"`
+	CaseID       string         `json:"caseId"`
+	Family       TaskType       `json:"family"`
+	Repo         string         `json:"repo"`
+	Arm          Arm            `json:"arm"`
+	Trial        int            `json:"trial"`
+	Pass         bool           `json:"pass"`
+	CostUSD      float64        `json:"costUsd"`
+	CostReported bool           `json:"costReported"`
+	CostComplete bool           `json:"costComplete"`
+	Grades       []GradeResult  `json:"grades"`
+	Envelope     ReportEnvelope `json:"envelope"`
+	Posted       bool           `json:"posted"`
 	// PostedRunID is the platform-assigned eval_runs id returned by the ingest
 	// route (empty when offline or on a post error) — the handle an operator uses
 	// to find this trial in /admin/evals.
@@ -337,6 +344,31 @@ func (d *Driver) runPlannedOne(
 	failOnPostError bool,
 ) (RunRecord, error) {
 	arm := Arm(trial.Arm.ID)
+	isPromptExperiment := trial.ExperimentID != ""
+	var receiptIdentity PromptExperimentReceiptIdentity
+	if isPromptExperiment && d.cfg.PromptReceiptJournal != nil {
+		var err error
+		receiptIdentity, err = promptExperimentReceiptIdentity(d.cfg, c, trial, graderIDs)
+		if err != nil {
+			return RunRecord{}, err
+		}
+		state, err := d.cfg.PromptReceiptJournal.Lookup(receiptIdentity)
+		if err != nil {
+			return RunRecord{}, fmt.Errorf("lookup prompt receipt: %w", err)
+		}
+		switch state.Status {
+		case PromptExperimentReceiptMissing:
+			// First attempt: proceed to provider execution.
+		case PromptExperimentReceiptPlatformPosted:
+			d.cfg.Logf("skipping already-posted prompt trial %s/%s/%d receipt=%s", c.ID, arm, trial.TrialIndex, receiptIdentity.ReceiptID)
+			return reconstructPostedPromptRun(c, arm, trial.TrialIndex, state.Receipt), nil
+		case PromptExperimentReceiptExecutionCompleted:
+			return RunRecord{}, fmt.Errorf("prompt receipt %s is execution_completed but not platform_posted; refusing duplicate provider execution", receiptIdentity.ReceiptID)
+		default:
+			return RunRecord{}, fmt.Errorf("prompt receipt %s has unknown state %q", receiptIdentity.ReceiptID, state.Status)
+		}
+	}
+
 	wa, sessionID, err := d.provision(ctx, c, arm, trial.TrialIndex)
 	if err != nil {
 		return RunRecord{}, err
@@ -346,7 +378,7 @@ func (d *Driver) runPlannedOne(
 	}
 	d.cfg.Logf("provisioned %s arm=%s trial=%d at %s", c.ID, arm, trial.TrialIndex, wa)
 
-	spec, cleanup, err := d.buildPlannedArmSpec(ctx, c, arm, wa, sessionID, trial.Prompt, useCodeIntel, trial.ExperimentID == "")
+	spec, cleanup, err := d.buildPlannedArmSpec(ctx, c, arm, wa, sessionID, trial.Prompt, useCodeIntel, !isPromptExperiment)
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -354,12 +386,26 @@ func (d *Driver) runPlannedOne(
 		defer cleanup()
 	}
 
-	tr, err := d.cfg.Executor.Execute(ctx, spec)
-	if err != nil {
-		return RunRecord{}, fmt.Errorf("execute: %w", err)
+	tr, executeErr := d.cfg.Executor.Execute(ctx, spec)
+	var promptReceipt PromptExperimentReceipt
+	if isPromptExperiment && d.cfg.PromptReceiptJournal != nil {
+		disposition := PromptExperimentDispositionCompleted
+		if executeErr != nil {
+			disposition = PromptExperimentDispositionExecutionError
+		}
+		promptReceipt = buildPromptExperimentReceipt(receiptIdentity, tr, disposition)
+		if err := d.cfg.PromptReceiptJournal.RecordExecutionCompleted(promptReceipt); err != nil {
+			return RunRecord{}, fmt.Errorf("write execution_completed receipt: %w", err)
+		}
+	}
+	if executeErr != nil {
+		return RunRecord{}, fmt.Errorf("execute: %w", executeErr)
 	}
 	if tr.Arm != arm {
 		return RunRecord{}, fmt.Errorf("execute: transcript arm %q does not match planned arm %q", tr.Arm, arm)
+	}
+	if isPromptExperiment && (!tr.CostReported || !tr.CostComplete) {
+		return RunRecord{}, fmt.Errorf("execute: provider did not report complete provider cost for prompt experiment trial")
 	}
 
 	grades := d.grade(ctx, c, tr, useCodeIntel)
@@ -374,14 +420,19 @@ func (d *Driver) runPlannedOne(
 		return RunRecord{}, err
 	}
 
-	rec := RunRecord{CaseID: c.ID, Family: c.Family(), Repo: c.Input.Repo, Arm: arm, Trial: trial.TrialIndex, Pass: pass, Grades: grades, Envelope: env}
+	rec := RunRecord{
+		CaseID: c.ID, Family: c.Family(), Repo: c.Input.Repo, Arm: arm,
+		Trial: trial.TrialIndex, Pass: pass, CostUSD: tr.CostUSD,
+		CostReported: tr.CostReported, CostComplete: tr.CostComplete,
+		Grades: grades, Envelope: env,
+	}
 	if d.cfg.Bridge != nil {
 		// The wire contract is the platform's flat per-trial /api/evals/ingest
 		// body (the route runs the registered graders inline). The local
 		// ReportEnvelope above stays the harness's canonical eval_runs+eval_traces
 		// capture (dumped by --dry and used for the offline record).
 		ingest := BuildIngestRequest(c, tr, trial.TrialIndex, sessionID, d.cfg.DatasetID, d.cfg.ProjectID)
-		if trial.ExperimentID != "" {
+		if isPromptExperiment {
 			ingest.GraderIDs = append([]string(nil), graderIDs...)
 			ingest.Experiment = &ExperimentReceipt{
 				ExperimentID: trial.ExperimentID,
@@ -398,12 +449,70 @@ func (d *Driver) runPlannedOne(
 			}
 		}
 		if resp != nil {
+			if isPromptExperiment && d.cfg.PromptReceiptJournal != nil {
+				postedReceipt := promptReceipt
+				postedReceipt.PostedRunID = resp.RunID
+				if err := d.cfg.PromptReceiptJournal.RecordPlatformPosted(postedReceipt); err != nil {
+					return rec, fmt.Errorf("write platform_posted receipt: %w", err)
+				}
+			}
 			rec.Posted = true
 			rec.PostedRunID = resp.RunID
 			d.cfg.Logf("posted %s/%s → eval_run %s (platform graders: %v)", c.ID, arm, resp.RunID, resp.GradersRun)
 		}
 	}
 	return rec, nil
+}
+
+func buildPromptExperimentReceipt(identity PromptExperimentReceiptIdentity, tr Transcript, disposition string) PromptExperimentReceipt {
+	knownCostUSD := tr.CostUSD
+	if !tr.CostReported {
+		knownCostUSD = 0
+	}
+	return PromptExperimentReceipt{
+		ExperimentID:          identity.ExperimentID,
+		CaseID:                identity.CaseID,
+		Arm:                   identity.Arm,
+		SubjectRef:            identity.SubjectRef,
+		VariantRef:            identity.VariantRef,
+		TrialIndex:            identity.TrialIndex,
+		InvocationScopeDigest: identity.InvocationScopeDigest,
+		ReceiptID:             identity.ReceiptID,
+		Disposition:           disposition,
+		CostUSD:               knownCostUSD,
+		CostCompleteness:      promptExperimentCostCompleteness(tr),
+		TurnCount:             tr.TurnCount,
+		TokenCounts:           tr.TokenCounts,
+	}
+}
+
+func promptExperimentCostCompleteness(tr Transcript) PromptExperimentCostCompleteness {
+	if tr.CostComplete {
+		return PromptExperimentCostComplete
+	}
+	if tr.CostReported {
+		return PromptExperimentCostPartial
+	}
+	return PromptExperimentCostMissing
+}
+
+func reconstructPostedPromptRun(c Case, arm Arm, trialIndex int, receipt PromptExperimentReceipt) RunRecord {
+	return RunRecord{
+		CaseID:       c.ID,
+		Family:       c.Family(),
+		Repo:         c.Input.Repo,
+		Arm:          arm,
+		Trial:        trialIndex,
+		CostUSD:      receipt.CostUSD,
+		CostReported: receipt.CostCompleteness != PromptExperimentCostMissing,
+		CostComplete: receipt.CostCompleteness == PromptExperimentCostComplete,
+		Envelope: ReportEnvelope{Trace: TraceInsert{
+			TurnCount:   receipt.TurnCount,
+			TokenCounts: receipt.TokenCounts,
+		}},
+		Posted:      true,
+		PostedRunID: receipt.PostedRunID,
+	}
 }
 
 // buildArmSpec assembles the legacy per-arm env + advertisement + MCP config.

@@ -44,7 +44,7 @@ type ArmSpec struct {
 	Prompt string
 	// VariantSystemPrompt is process-local prompt-variant content. Durable
 	// receipts carry only the immutable variant ref, never this text.
-	VariantSystemPrompt string
+	VariantSystemPrompt string `json:"-"`
 	// ContextReset is a deterministic perturbation plan. An executor that cannot
 	// implement it must fail closed rather than silently compare different trials.
 	ContextReset *experiment.ContextReset

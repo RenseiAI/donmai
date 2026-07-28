@@ -28,6 +28,7 @@ func newEvalCmd(cfg Config) *cobra.Command {
 		Hidden: true,
 	}
 	cmd.AddCommand(newEvalCodeIntelCmd(cfg))
+	cmd.AddCommand(newEvalPromptExperimentCmd(cfg))
 	return cmd
 }
 

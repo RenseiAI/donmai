@@ -13,6 +13,33 @@ import (
 // data per brief 06 §4.2.
 const benchmarkDir = "../../afclient/codeintel/testdata/eval-benchmark"
 
+func TestLoadPromptExperimentCasesAcceptsGenericTaskFamiliesAndProbeContracts(t *testing.T) {
+	input := `{"id":"e2-simple-donmai-001","input":{"taskType":"development-simple","repo":"RenseiAI/donmai","ref":"deadbeef","prompt":"Complete the fixture."},"expectedOutput":{"delegationProbe":{"requiredOutputIncludes":["fixture complete"],"delegationPolicy":"forbid","subagentToolNames":["Task"]}},"tags":["e2","simple"]}` + "\n"
+	cases, err := LoadPromptExperimentCases(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("LoadPromptExperimentCases: %v", err)
+	}
+	if len(cases) != 1 || cases[0].Input.TaskType != "development-simple" {
+		t.Fatalf("cases = %+v", cases)
+	}
+}
+
+func TestLoadPromptExperimentCasesRejectsTrailingJSONValue(t *testing.T) {
+	input := `{"id":"e2-simple-donmai-001","input":{"taskType":"development-simple","repo":"RenseiAI/donmai","ref":"deadbeef","prompt":"Complete the fixture."},"expectedOutput":{"probe":{"required":true}}} {}` + "\n"
+	_, err := LoadPromptExperimentCases(strings.NewReader(input))
+	if err == nil || !strings.Contains(err.Error(), "multiple JSON values") {
+		t.Fatalf("error = %v, want strict single-value failure", err)
+	}
+}
+
+func TestLoadPromptExperimentCasesRejectsMissingProbeContract(t *testing.T) {
+	input := `{"id":"e2-simple-donmai-001","input":{"taskType":"development-simple","repo":"RenseiAI/donmai","ref":"deadbeef","prompt":"Complete the fixture."},"expectedOutput":{}}` + "\n"
+	_, err := LoadPromptExperimentCases(strings.NewReader(input))
+	if err == nil || !strings.Contains(err.Error(), "expectedOutput") {
+		t.Fatalf("error = %v, want expectedOutput failure", err)
+	}
+}
+
 // TestBenchmark_Loads_AndMeetsMatrix loads the shipped benchmark and asserts the
 // family/repo matrix from brief 06 §4.1 + the locked power floor (>=8 tasks per
 // family, both dogfood repos represented in each family).

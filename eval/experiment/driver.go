@@ -26,10 +26,10 @@ type ArmID string
 // Arm defines one prompt variant. Prompt text remains process-local; durable
 // receipts carry only SubjectRef and VariantRef.
 type Arm struct {
-	ID           ArmID
-	SubjectRef   string
-	VariantRef   string
-	SystemPrompt string
+	ID           ArmID  `json:"id"`
+	SubjectRef   string `json:"subjectRef"`
+	VariantRef   string `json:"variantRef"`
+	SystemPrompt string `json:"-"`
 }
 
 // Case is the task input shared across every arm and repeated trial.
@@ -50,7 +50,7 @@ type Definition struct {
 // PromptPlan is the exact prompt/perturbation plan handed to a concrete harness.
 type PromptPlan struct {
 	UserPrompt    string
-	SystemPrompt  string
+	SystemPrompt  string `json:"-"`
 	ContextReset  *ContextReset
 	Perturbations []string
 }

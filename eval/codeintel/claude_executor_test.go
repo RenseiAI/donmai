@@ -3,12 +3,15 @@ package codeintel
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/eval/experiment"
 )
 
 // fakeSpawn is the hermetic exec seam: it returns a scripted stream + wait
@@ -20,13 +23,14 @@ type fakeSpawn struct {
 	stderr  string
 	spawnEr error
 
-	called  bool
-	gotDir  string
-	gotArgv []string
-	gotEnv  []string
+	called         bool
+	canceledAtWait bool
+	gotDir         string
+	gotArgv        []string
+	gotEnv         []string
 }
 
-func (f *fakeSpawn) spawn(_ context.Context, dir string, argv []string, env []string) (io.ReadCloser, func() (string, error), error) {
+func (f *fakeSpawn) spawn(ctx context.Context, dir string, argv []string, env []string) (io.ReadCloser, func() (string, error), error) {
 	f.called = true
 	f.gotDir = dir
 	f.gotArgv = append([]string(nil), argv...)
@@ -34,7 +38,10 @@ func (f *fakeSpawn) spawn(_ context.Context, dir string, argv []string, env []st
 	if f.spawnEr != nil {
 		return nil, nil, f.spawnEr
 	}
-	return io.NopCloser(strings.NewReader(f.stream)), func() (string, error) { return f.stderr, f.waitErr }, nil
+	return io.NopCloser(strings.NewReader(f.stream)), func() (string, error) {
+		f.canceledAtWait = ctx.Err() != nil
+		return f.stderr, f.waitErr
+	}, nil
 }
 
 func readFixture(t *testing.T, name string) string {
@@ -97,6 +104,9 @@ func TestClaudeExecutor_With_ParsesSymbolSearch(t *testing.T) {
 	// output 62, cache_read 4200. Cache-read MUST be counted (W5 finding).
 	if tr.TokenCounts.Input != 4280 || tr.TokenCounts.Output != 62 || tr.TokenCounts.CacheRead != 4200 {
 		t.Errorf("TokenCounts = %+v, want {4280 62 4200}", tr.TokenCounts)
+	}
+	if tr.CostUSD != 0.0123 || !tr.CostReported || !tr.CostComplete {
+		t.Errorf("provider cost = %v reported=%v complete=%v, want 0.0123/true/true", tr.CostUSD, tr.CostReported, tr.CostComplete)
 	}
 	if tr.TokenCounts.CacheRead == 0 {
 		t.Error("cache-read must be counted so WITH-arm context overhead is visible")
@@ -202,6 +212,22 @@ func TestClaudeExecutor_ZeroToolSession(t *testing.T) {
 	if tr.TokenCounts.Input != 100 || tr.TokenCounts.Output != 8 {
 		t.Errorf("TokenCounts = %+v", tr.TokenCounts)
 	}
+	if tr.CostReported || tr.CostComplete {
+		t.Error("missing total_cost_usd must not be treated as reported or complete")
+	}
+}
+
+func TestClaudeExecutor_ExplicitZeroCostIsReported(t *testing.T) {
+	stream := `{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0,"usage":{"input_tokens":1,"output_tokens":1}}`
+	fs := &fakeSpawn{stream: stream}
+	exec := newClaudeExecutorWithSpawner(fs.spawn)
+	tr, err := exec.Execute(context.Background(), ArmSpec{Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"), Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "zero"})
+	if err != nil {
+		t.Fatalf("zero-cost execute: %v", err)
+	}
+	if tr.CostUSD != 0 || !tr.CostReported || !tr.CostComplete {
+		t.Fatalf("provider cost = %v reported=%v complete=%v, want explicit zero/true/true", tr.CostUSD, tr.CostReported, tr.CostComplete)
+	}
 }
 
 // TestClaudeExecutor_GarbledStream proves a truncated/garbled stream returns a
@@ -298,6 +324,234 @@ func TestClaudeExecutor_ErrorDuringExecution_RecordedNotAborted(t *testing.T) {
 	// Result usage is present, so it is authoritative (not the assistant fallback).
 	if tr.TokenCounts.Input != 500 || tr.TokenCounts.Output != 10 || tr.TokenCounts.CacheRead != 100 {
 		t.Errorf("TokenCounts = %+v, want {500 10 100} (from the result usage)", tr.TokenCounts)
+	}
+}
+
+type spawnStep struct {
+	stream  string
+	waitErr error
+	stderr  string
+}
+
+type queuedSpawn struct {
+	steps   []spawnStep
+	calls   int
+	gotArgv [][]string
+}
+
+func (q *queuedSpawn) spawn(_ context.Context, _ string, argv []string, _ []string) (io.ReadCloser, func() (string, error), error) {
+	q.gotArgv = append(q.gotArgv, append([]string(nil), argv...))
+	if q.calls >= len(q.steps) {
+		return nil, nil, fmt.Errorf("unexpected spawn %d", q.calls+1)
+	}
+	step := q.steps[q.calls]
+	q.calls++
+	return io.NopCloser(strings.NewReader(step.stream)), func() (string, error) {
+		return step.stderr, step.waitErr
+	}, nil
+}
+
+func TestClaudeExecutor_ContextResetStartsFreshContinuationAndAggregatesEvidence(t *testing.T) {
+	first := strings.Join([]string{
+		`{"type":"system","subtype":"init","session_id":"before-reset"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"STATE.md","content":"checkpoint"}}],"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":20}}}`,
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.125}`,
+	}, "\n")
+	second := strings.Join([]string{
+		`{"type":"system","subtype":"init","session_id":"after-reset"}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"STATE.md"}}],"usage":{"input_tokens":200,"output_tokens":20,"cache_read_input_tokens":30}}}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"checkpoint","is_error":false}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Recovered from durable state and completed."}],"usage":{"input_tokens":50,"output_tokens":5,"cache_read_input_tokens":10}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"result":"Recovered from durable state and completed.","total_cost_usd":0.25,"usage":{"input_tokens":250,"output_tokens":25,"cache_read_input_tokens":40}}`,
+	}, "\n")
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: first}, {stream: second}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	spec := ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "reset",
+		Budget: Budget{MaxTurns: 9}, Prompt: "complete the long task",
+		VariantSystemPrompt: "make progress durable",
+		ContextReset: &experiment.ContextReset{
+			AfterTurn: 4, ContinuationPrompt: "recover from durable state and finish",
+		},
+	}
+
+	tr, err := exec.Execute(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("context-reset execute: %v", err)
+	}
+	if spawner.calls != 2 {
+		t.Fatalf("spawn count = %d, want 2", spawner.calls)
+	}
+	firstArgv := strings.Join(spawner.gotArgv[0], " ")
+	secondArgv := strings.Join(spawner.gotArgv[1], " ")
+	if !strings.Contains(firstArgv, "--max-turns 4") || !strings.Contains(firstArgv, "complete the long task") {
+		t.Errorf("first phase argv = %s", firstArgv)
+	}
+	if !strings.Contains(secondArgv, "--max-turns 5") || !strings.Contains(secondArgv, "recover from durable state and finish") {
+		t.Errorf("continuation argv = %s", secondArgv)
+	}
+	if strings.Contains(secondArgv, "--resume") {
+		t.Errorf("context reset must start a fresh session, got %s", secondArgv)
+	}
+	if !strings.Contains(firstArgv, "make progress durable") || !strings.Contains(secondArgv, "make progress durable") {
+		t.Errorf("both phases must receive the same arm variant: first=%s second=%s", firstArgv, secondArgv)
+	}
+	if tr.FinalAnswer != "Recovered from durable state and completed." {
+		t.Errorf("FinalAnswer = %q", tr.FinalAnswer)
+	}
+	if tr.TurnCount != 3 || len(tr.ToolCalls) != 2 {
+		t.Errorf("aggregated transcript = %+v", tr)
+	}
+	for i, wantPhase := range []float64{1, 2} {
+		body, marshalErr := json.Marshal(tr.ToolCalls[i])
+		if marshalErr != nil {
+			t.Fatalf("marshal tool call %d: %v", i, marshalErr)
+		}
+		var wire map[string]any
+		if unmarshalErr := json.Unmarshal(body, &wire); unmarshalErr != nil {
+			t.Fatalf("unmarshal tool call %d: %v", i, unmarshalErr)
+		}
+		if wire["phase"] != wantPhase {
+			t.Errorf("tool call %d phase = %v, want %v (wire=%s)", i, wire["phase"], wantPhase, body)
+		}
+	}
+	if tr.TokenCounts.Input != 350 || tr.TokenCounts.Output != 35 || tr.TokenCounts.CacheRead != 60 {
+		t.Errorf("aggregated tokens = %+v", tr.TokenCounts)
+	}
+	if tr.CostUSD != 0.375 || !tr.CostReported || !tr.CostComplete {
+		t.Errorf("aggregated provider cost = %v reported=%v complete=%v, want 0.375/true/true", tr.CostUSD, tr.CostReported, tr.CostComplete)
+	}
+}
+
+func TestClaudeExecutor_MaxTokensTerminatesLiveStream(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still working"}],"usage":{"input_tokens":8,"output_tokens":3,"cache_read_input_tokens":2}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.01,"usage":{"input_tokens":8,"output_tokens":3,"cache_read_input_tokens":2}}`,
+	}, "\n")
+	fs := &fakeSpawn{stream: stream}
+	exec := newClaudeExecutorWithSpawner(fs.spawn)
+	tr, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "token-limit",
+		Budget: Budget{MaxTurns: 8, MaxTokens: 12},
+	})
+	if err == nil || !strings.Contains(err.Error(), "max-tokens") {
+		t.Fatalf("error = %v, want max-tokens failure (transcript=%+v)", err, tr)
+	}
+	if tr.TokenCounts.Total() <= 12 {
+		t.Fatalf("captured tokens = %+v, want over-budget evidence", tr.TokenCounts)
+	}
+	if tr.CostUSD != 0.01 || !tr.CostReported || !tr.CostComplete {
+		t.Fatalf("queued terminal cost after cancellation = %v reported=%v complete=%v, want 0.01/true/true", tr.CostUSD, tr.CostReported, tr.CostComplete)
+	}
+	if !fs.canceledAtWait {
+		t.Fatal("max-tokens breach did not cancel the live provider context before wait")
+	}
+}
+
+func TestClaudeExecutor_ContextResetPhaseTwoUsesRemainingTokenBudget(t *testing.T) {
+	first := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"checkpoint"}],"usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":20}}}`,
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.1}`,
+	}, "\n")
+	second := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"continuing"}],"usage":{"input_tokens":15,"output_tokens":4,"cache_read_input_tokens":2}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1,"usage":{"input_tokens":15,"output_tokens":4,"cache_read_input_tokens":2}}`,
+	}, "\n")
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: first}, {stream: second}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	tr, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "reset-token-limit",
+		Budget: Budget{MaxTurns: 8, MaxTokens: 100}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "max-tokens") {
+		t.Fatalf("error = %v, want phase-two remaining max-tokens failure (transcript=%+v)", err, tr)
+	}
+	if spawner.calls != 2 {
+		t.Fatalf("spawn count = %d, want 2", spawner.calls)
+	}
+	if tr.CostUSD != 0.2 || !tr.CostReported || !tr.CostComplete {
+		t.Fatalf("drained reset cost = %v reported=%v complete=%v, want 0.2/true/true", tr.CostUSD, tr.CostReported, tr.CostComplete)
+	}
+}
+
+func TestClaudeExecutor_ContextResetTokenCancellationMarksUndrainedCostPartial(t *testing.T) {
+	first := strings.Join([]string{
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"checkpoint"}],"usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":20}}}`,
+		`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","total_cost_usd":0.1}`,
+	}, "\n")
+	second := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"continuing"}],"usage":{"input_tokens":15,"output_tokens":4,"cache_read_input_tokens":2}}}`
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: first}, {stream: second}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	tr, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "reset-partial-cost",
+		Budget: Budget{MaxTurns: 8, MaxTokens: 100}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "max-tokens") {
+		t.Fatalf("error = %v, want max-tokens failure", err)
+	}
+	if tr.CostUSD != 0.1 || !tr.CostReported || tr.CostComplete {
+		t.Fatalf("partial reset cost = %v reported=%v complete=%v, want 0.1/true/false", tr.CostUSD, tr.CostReported, tr.CostComplete)
+	}
+}
+
+func TestClaudeExecutor_ContextResetCostReportedRequiresBothPhases(t *testing.T) {
+	first := `{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","usage":{"input_tokens":10,"output_tokens":2}}`
+	second := `{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.25,"usage":{"input_tokens":20,"output_tokens":3}}`
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: first}, {stream: second}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	tr, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "missing-cost",
+		Budget: Budget{MaxTurns: 8}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err != nil {
+		t.Fatalf("context-reset execute: %v", err)
+	}
+	if tr.CostUSD != 0.25 || !tr.CostReported || tr.CostComplete {
+		t.Fatalf("provider cost = %v reported=%v complete=%v, want partial 0.25/true/false", tr.CostUSD, tr.CostReported, tr.CostComplete)
+	}
+}
+
+func TestClaudeExecutor_ContextResetFailsIfTaskEndsBeforeCheckpoint(t *testing.T) {
+	stream := `{"type":"result","subtype":"success","is_error":false,"result":"finished early","usage":{"input_tokens":10,"output_tokens":2}}`
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: stream}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	_, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "early",
+		Budget: Budget{MaxTurns: 8}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "before context-reset checkpoint") {
+		t.Fatalf("error = %v, want early-completion reset failure", err)
+	}
+	if spawner.calls != 1 {
+		t.Fatalf("spawn count = %d, want 1", spawner.calls)
+	}
+}
+
+func TestClaudeExecutor_ContextResetFailsIfFirstPhaseErrorsBeforeCheckpoint(t *testing.T) {
+	stream := `{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","usage":{"input_tokens":10,"output_tokens":2}}`
+	spawner := &queuedSpawn{steps: []spawnStep{{stream: stream}}}
+	exec := newClaudeExecutorWithSpawner(spawner.spawn)
+	_, err := exec.Execute(context.Background(), ArmSpec{
+		Arm: ArmWith, UseCodeIntel: true, Case: fsCaseFor("X"),
+		Workarea: t.TempDir(), Env: []string{"PATH=/x"}, SnapshotID: "phase-error",
+		Budget: Budget{MaxTurns: 8}, Prompt: "long task",
+		ContextReset: &experiment.ContextReset{AfterTurn: 4, ContinuationPrompt: "recover"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "failed before context-reset checkpoint") {
+		t.Fatalf("error = %v, want pre-checkpoint phase failure", err)
+	}
+	if spawner.calls != 1 {
+		t.Fatalf("spawn count = %d, want 1", spawner.calls)
 	}
 }
 
