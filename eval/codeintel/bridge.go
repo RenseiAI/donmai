@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -19,6 +20,10 @@ import (
 // the getCliOrSessionAuth bearer surface the rest of the eval API uses.
 // Overridable via --platform-path.
 const DefaultBridgePath = "/api/evals/ingest"
+
+// DefaultExperimentPath is the platform endpoint that reports the durable
+// receipts for one prompt experiment.
+const DefaultExperimentPath = "/api/evals/experiments"
 
 // IngestRequest is the per-trial body the platform /api/evals/ingest route
 // accepts (its zod ingestSchema, route.ts). One completed (case, arm, trial):
@@ -157,6 +162,85 @@ func NewBridge(baseURL, token, path string) *Bridge {
 
 // Enabled reports whether posts will actually be sent.
 func (b *Bridge) Enabled() bool { return b != nil && b.BaseURL != "" }
+
+// PromptExperimentTrialPosted reports whether the platform has already received
+// the budget-independent identity of one prompt experiment trial. A missing
+// experiment is an empty receipt set; malformed or failed reads return errors so
+// the caller cannot spend on an unverified trial.
+func (b *Bridge) PromptExperimentTrialPosted(ctx context.Context, experimentID, caseID string, arm Arm, trialIndex int) (bool, error) {
+	if !b.Enabled() {
+		return false, nil
+	}
+	requestURL := b.BaseURL + DefaultExperimentPath + "/" + url.PathEscape(experimentID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("build experiment receipt request: %w", err)
+	}
+	if b.Token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+b.Token)
+	}
+	client := b.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return false, fmt.Errorf("get experiment receipts: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		if readErr != nil {
+			return false, fmt.Errorf("read experiment receipt response: %w", readErr)
+		}
+		return false, fmt.Errorf("bridge GET %s: HTTP %d: %s", requestURL, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var payload struct {
+		Experiment *struct {
+			IntegrityInvalidArms         []json.RawMessage `json:"integrityInvalidArms"`
+			IntegrityInvalidDatasets     []string          `json:"integrityInvalidDatasets"`
+			IntegrityInvalidReceiptCount int               `json:"integrityInvalidReceiptCount"`
+			Cases                        []struct {
+				CaseID string `json:"caseId"`
+				Arms   []struct {
+					Arm          Arm   `json:"arm"`
+					TrialIndexes []int `json:"trialIndexes"`
+				} `json:"arms"`
+			} `json:"cases"`
+		} `json:"experiment"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&payload); err != nil {
+		return false, fmt.Errorf("decode experiment receipt response: %w", err)
+	}
+	if payload.Experiment == nil || payload.Experiment.Cases == nil {
+		return false, fmt.Errorf("decode experiment receipt response: missing experiment cases")
+	}
+	if len(payload.Experiment.IntegrityInvalidArms) > 0 || len(payload.Experiment.IntegrityInvalidDatasets) > 0 || payload.Experiment.IntegrityInvalidReceiptCount > 0 {
+		return false, fmt.Errorf("decode experiment receipt response: experiment receipt integrity is invalid")
+	}
+	for _, c := range payload.Experiment.Cases {
+		if c.CaseID != caseID {
+			continue
+		}
+		for _, candidate := range c.Arms {
+			if candidate.Arm != arm {
+				continue
+			}
+			if candidate.TrialIndexes == nil {
+				return false, fmt.Errorf("decode experiment receipt response: missing trial indexes for %s/%s", caseID, arm)
+			}
+			for _, index := range candidate.TrialIndexes {
+				if index == trialIndex {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
 
 // Post sends one per-trial ingest body. When the bridge is disabled it returns
 // (nil, nil): "not posted, not an error". On a successful 2xx it returns the

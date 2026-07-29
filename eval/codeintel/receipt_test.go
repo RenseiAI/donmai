@@ -39,7 +39,16 @@ func promptExperimentDriverFixture(t *testing.T) (Case, experiment.Definition, m
 
 func successfulPromptBridge(t *testing.T, requests *atomic.Int32, beforeResponse func()) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"experiment":{"cases":[]}}`))
+			return
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected bridge method %s", r.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		if requests != nil {
 			requests.Add(1)
 		}
@@ -330,7 +339,11 @@ func TestDriverPromptExperimentReceiptDurableBeforeBridgeFailure(t *testing.T) {
 	defer func() { _ = ledger.Close() }()
 
 	var sawDurableBeforePost atomic.Bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"experiment":{"cases":[]}}`))
+			return
+		}
 		lines := readReceiptLines(t, path)
 		if len(lines) == 1 && lines[0]["event"] == "execution_completed" {
 			sawDurableBeforePost.Store(true)
@@ -559,6 +572,10 @@ func TestDriverPromptExperimentPostsBothArmsAfterGradeableResetTokenExhaustion(t
 	defer func() { _ = ledger.Close() }()
 	var postedOutputs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"experiment":{"cases":[]}}`))
+			return
+		}
 		var ingest IngestRequest
 		if err := json.NewDecoder(r.Body).Decode(&ingest); err != nil {
 			t.Errorf("decode ingest request: %v", err)
@@ -711,7 +728,11 @@ func TestDriverPromptExperimentPostedIdentitySkipsProviderExecution(t *testing.T
 func TestDriverPromptExperimentUnpostedIdentityBlocksBeforeExecution(t *testing.T) {
 	c, definition, roots, donmaiBin := promptExperimentDriverFixture(t)
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
-	failedBridge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	failedBridge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"experiment":{"cases":[]}}`))
+			return
+		}
 		http.Error(w, "failed", http.StatusInternalServerError)
 	}))
 	ledger, err := OpenPromptExperimentReceiptLedger(path)
@@ -756,7 +777,11 @@ func TestDriverPromptExperimentCanContinueAtDistinctTrialAfterUnpostedFailure(t 
 	c, definition, roots, donmaiBin := promptExperimentDriverFixture(t)
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
 	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"experiment":{"cases":[]}}`))
+			return
+		}
 		if requests.Add(1) == 1 {
 			http.Error(w, "failed", http.StatusInternalServerError)
 			return

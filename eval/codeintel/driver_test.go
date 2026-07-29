@@ -205,6 +205,71 @@ func TestDriver_PromptExperimentReusesPinnedExecutionLifecycle(t *testing.T) {
 	}
 }
 
+// TestDriver_PromptExperimentSkipsPlatformPostedTrialBeforeExecution is the
+// paid-execution regression: a different local invocation digest (for example,
+// after raising max tokens) must not re-run a trial that the platform already
+// received under its budget-independent identity.
+func TestDriver_PromptExperimentSkipsPlatformPostedTrialBeforeExecution(t *testing.T) {
+	repoDir, sha := initTempRepo(t)
+	donmaiDir := writeFakeBinary(t, "donmai")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case http.MethodGet + " /api/evals/experiments/prompt-v1":
+			_, _ = w.Write([]byte(`{"experiment":{"cases":[{"caseId":"case","arms":[{"arm":"incumbent","trialIndexes":[1]},{"arm":"candidate","trialIndexes":[]}]}]}}`))
+		case http.MethodPost + " /api/evals/ingest":
+			_, _ = w.Write([]byte(`{"runId":"run-candidate","traceId":"trace-candidate","datasetId":"evd_test","gradersRun":["safety/injection-follow-v1"],"gradeResults":[{"graderId":"safety/injection-follow-v1","status":"scored","score":1,"pass":true}]}`))
+		default:
+			t.Fatalf("unexpected bridge request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	exec := &promptRecordingExecutor{}
+	var logs []string
+	d, err := NewDriver(Config{
+		Trials: 1, DonmaiBin: filepath.Join(donmaiDir, "donmai"),
+		RepoRoots: map[string]string{"test/repo": repoDir}, WorkareaParent: t.TempDir(),
+		Executor: exec, Bridge: NewBridge(server.URL, "test-token", ""), DatasetID: "evd_test",
+		Logf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := experiment.Definition{
+		ID: "prompt-v1",
+		Arms: []experiment.Arm{
+			{ID: "incumbent", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("incumbent"), SystemPrompt: "incumbent"},
+			{ID: "candidate", SubjectRef: "agent/base", VariantRef: experiment.SHA256VariantRef("candidate"), SystemPrompt: "candidate"},
+		},
+	}
+	cases := []Case{{
+		ID: "case", Input: CaseInput{TaskType: TaskFindSymbol, Repo: "test/repo", Ref: sha, Prompt: "Find Target."},
+		ExpectedOutput: json.RawMessage(`{"file":"foo.go","lineRange":[1,10]}`), Tags: []string{tagSuite, "find-symbol", tagVersion},
+	}}
+
+	report, err := d.RunPromptExperiment(context.Background(), cases, definition, []string{"safety/injection-follow-v1"})
+	if err != nil {
+		t.Fatalf("RunPromptExperiment: %v", err)
+	}
+	if len(report.Outcomes) != 2 {
+		t.Fatalf("outcomes = %d, want both planned arms", len(report.Outcomes))
+	}
+	if len(exec.specs) != 1 || exec.specs[0].Arm != "candidate" {
+		t.Fatalf("executed arms = %v, want candidate only", armSpecs(exec.specs))
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "platform-posted, skipping") {
+		t.Fatalf("logs = %q, want platform-posted skip notice", logs)
+	}
+}
+
+func armSpecs(specs []ArmSpec) []Arm {
+	arms := make([]Arm, 0, len(specs))
+	for _, spec := range specs {
+		arms = append(arms, spec.Arm)
+	}
+	return arms
+}
+
 func TestDriver_PromptExperimentRequiresProviderReportedCost(t *testing.T) {
 	repoDir, sha := initTempRepo(t)
 	donmaiDir := writeFakeBinary(t, "donmai")
@@ -348,7 +413,11 @@ func TestDriver_PromptExperimentRejectsTranscriptArmMismatch(t *testing.T) {
 func TestDriver_PromptExperimentPropagatesBridgeFailure(t *testing.T) {
 	repoDir, sha := initTempRepo(t)
 	donmaiDir := writeFakeBinary(t, "donmai")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"experiment":{"cases":[]}}`))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("<html>wrong route</html>"))
 	}))

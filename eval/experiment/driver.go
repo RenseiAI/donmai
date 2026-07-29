@@ -46,6 +46,42 @@ type Definition struct {
 	ID            string
 	Arms          []Arm
 	Perturbations []Perturbation
+	partialArms   bool
+}
+
+// SelectArms narrows a validated definition to named arms for reviewed matrix
+// completion. It preserves configured arm order and permits the resulting
+// definition to contain fewer than the normally required two arms.
+func (d Definition) SelectArms(ids []ArmID) (Definition, error) {
+	if len(ids) == 0 {
+		return d, nil
+	}
+	if err := d.Validate(); err != nil {
+		return Definition{}, err
+	}
+	available := make(map[ArmID]struct{}, len(d.Arms))
+	for _, arm := range d.Arms {
+		available[arm.ID] = struct{}{}
+	}
+	selectedIDs := make(map[ArmID]struct{}, len(ids))
+	for _, id := range ids {
+		if _, duplicate := selectedIDs[id]; duplicate {
+			return Definition{}, fmt.Errorf("duplicate arm selection %q", id)
+		}
+		if _, found := available[id]; !found {
+			return Definition{}, fmt.Errorf("unknown arm %q", id)
+		}
+		selectedIDs[id] = struct{}{}
+	}
+	selected := d
+	selected.Arms = make([]Arm, 0, len(ids))
+	for _, arm := range d.Arms {
+		if _, ok := selectedIDs[arm.ID]; ok {
+			selected.Arms = append(selected.Arms, arm)
+		}
+	}
+	selected.partialArms = true
+	return selected, nil
 }
 
 // PromptPlan is the exact prompt/perturbation plan handed to a concrete harness.
@@ -133,7 +169,7 @@ func (p contextResetPerturbation) Apply(_ string, _ int, plan PromptPlan) (Promp
 // Validate checks arm balance inputs and binds immutable prompt-variant identity
 // to the exact prompt bytes that the concrete executor will receive.
 func (d Definition) Validate() error {
-	if len(d.Arms) < 2 {
+	if len(d.Arms) == 0 || (len(d.Arms) < 2 && !d.partialArms) {
 		return fmt.Errorf("experiment requires at least two arms")
 	}
 	if d.ID != "" && !validSlug(d.ID) {
