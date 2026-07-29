@@ -14,9 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/afcli"
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	mcp "github.com/RenseiAI/donmai/runtime/mcp"
 	"github.com/RenseiAI/donmai/runtime/mcp/server"
+	"github.com/spf13/cobra"
 )
 
 // TestMain doubles the test binary as the code-intel MCP server: when
@@ -26,6 +29,10 @@ import (
 func TestMain(m *testing.M) {
 	if os.Getenv("MCP_CODEINTEL_SERVE") == "1" {
 		serveForTest()
+		return
+	}
+	if os.Getenv("MCP_CODEINTEL_AFCLI_SERVE") == "1" {
+		serveAFCLIForTest()
 		return
 	}
 	os.Exit(m.Run())
@@ -49,6 +56,25 @@ func serveForTest() {
 	}
 	if err := srv.Serve(context.Background(), os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "mcp code-intel serve:", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// serveAFCLIForTest drives the hidden MCP command through afcli's public
+// RegisterCommands entry point. The subprocess is otherwise a clean process:
+// it receives only the explicit root path and stdio JSON-RPC transport.
+func serveAFCLIForTest() {
+	root := &cobra.Command{Use: "donmai", SilenceUsage: true}
+	afcli.RegisterCommands(root, afcli.Config{
+		ClientFactory: func() afclient.DataSource { return afclient.NewMockClient() },
+	})
+	root.SetArgs([]string{"mcp", "code-intel", "--root", os.Getenv("MCP_CODEINTEL_ROOT")})
+	root.SetIn(os.Stdin)
+	root.SetOut(os.Stdout)
+	root.SetErr(os.Stderr)
+	if err := root.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, "afcli mcp code-intel:", err)
 		os.Exit(1)
 	}
 	os.Exit(0)
@@ -104,6 +130,25 @@ func dialServer(t *testing.T, root string, tools string) mcp.Client {
 	return c
 }
 
+func dialAFCLIServer(t *testing.T, root string) mcp.Client {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	c, err := mcp.Dial(ctx, agent.MCPServerConfig{
+		Name:    server.ServerName,
+		Command: os.Args[0],
+		Env: map[string]string{
+			"MCP_CODEINTEL_AFCLI_SERVE": "1",
+			"MCP_CODEINTEL_ROOT":        root,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Dial afcli mcp code-intel: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
 func TestConformance_ListAndCall(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -153,6 +198,230 @@ func TestConformance_ListAndCall(t *testing.T) {
 	}
 	if rm.IsError || !strings.Contains(rm.Content, "greet.go") {
 		t.Fatalf("get-repo-map should list greet.go, got: %s", rm.Content)
+	}
+}
+
+// TestConformance_AFCLIPublicContract is the externally-shaped contract gate.
+// It starts a clean subprocess through afcli.RegisterCommands, performs the
+// MCP handshake, lists exactly the canonical six tools, and calls every tool.
+func TestConformance_AFCLIPublicContract(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c := dialAFCLIServer(t, fixtureRepo(t))
+
+	type contract struct {
+		name        string
+		description string
+		properties  []string
+		required    []string
+		arguments   map[string]any
+		output      func(t *testing.T, content string)
+	}
+	contracts := []contract{
+		{
+			name:        "af_code_get_repo_map",
+			description: "Repo map ranked by import centrality: most important files + their symbols. Call FIRST to orient.",
+			properties:  []string{"maxFiles", "filePatterns"},
+			arguments:   map[string]any{},
+			output: func(t *testing.T, content string) {
+				requireObjectFields(t, "af_code_get_repo_map", content, "entries", "rootHash", "files")
+			},
+		},
+		{
+			name:        "af_code_search_symbols",
+			description: "Search symbols by name (functions, methods, types, ...); exact names return only the exact hits.",
+			properties:  []string{"query", "maxResults", "kinds", "filePattern", "includeDoc"},
+			required:    []string{"query"},
+			arguments:   map[string]any{"query": "Greeter"},
+			output: func(t *testing.T, content string) {
+				requireSearchResult(t, "af_code_search_symbols", content)
+			},
+		},
+		{
+			name:        "af_code_search_code",
+			description: "Keyword search over code content with code-aware tokenization (camelCase/snake_case).",
+			properties:  []string{"query", "maxResults", "language", "includeDoc"},
+			required:    []string{"query"},
+			arguments:   map[string]any{"query": "Greet"},
+			output: func(t *testing.T, content string) {
+				requireSearchResult(t, "af_code_search_code", content)
+			},
+		},
+		{
+			name:        "af_code_check_duplicate",
+			description: "Check whether code already exists (exact or near duplicate). Pass content OR contentFile.",
+			properties:  []string{"content", "contentFile", "maxResults"},
+			arguments:   map[string]any{"content": "func NotInFixture() {}"},
+			output: func(t *testing.T, content string) {
+				requireObjectFields(t, "af_code_check_duplicate", content, "isDuplicate", "matchType", "existingId", "hammingDistance")
+			},
+		},
+		{
+			name:        "af_code_find_type_usages",
+			description: "Find every usage site of a named type. Call BEFORE a cross-file rename/refactor to list all sites.",
+			properties:  []string{"typeName", "maxResults"},
+			required:    []string{"typeName"},
+			arguments:   map[string]any{"typeName": "Greeter"},
+			output: func(t *testing.T, content string) {
+				requireObjectFields(t, "af_code_find_type_usages", content, "typeName", "totalUsages", "usages", "switchStatements", "mappingObjects")
+			},
+		},
+		{
+			name:        "af_code_validate_cross_deps",
+			description: "Validate monorepo cross-package imports against package.json dependency declarations.",
+			properties:  []string{"path"},
+			arguments:   map[string]any{},
+			output: func(t *testing.T, content string) {
+				requireObjectFields(t, "af_code_validate_cross_deps", content, "valid", "missingDeps", "packagesChecked", "filesChecked")
+			},
+		},
+	}
+
+	tools, err := c.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("ListTools through afcli: %v", err)
+	}
+	if len(tools) != len(contracts) {
+		t.Fatalf("afcli tools/list returned %d tools, want %d: %+v", len(tools), len(contracts), tools)
+	}
+	for i, want := range contracts {
+		got := tools[i]
+		if got.Name != want.name {
+			t.Errorf("tools[%d].Name = %q, want %q", i, got.Name, want.name)
+		}
+		if got.Description != want.description {
+			t.Errorf("tool %s description = %q, want %q", want.name, got.Description, want.description)
+		}
+		var schema struct {
+			Type                 string                     `json:"type"`
+			Properties           map[string]json.RawMessage `json:"properties"`
+			Required             []string                   `json:"required"`
+			AdditionalProperties bool                       `json:"additionalProperties"`
+		}
+		if err := json.Unmarshal(got.InputSchema, &schema); err != nil {
+			t.Errorf("tool %s inputSchema is invalid JSON: %v", want.name, err)
+			continue
+		}
+		if schema.Type != "object" {
+			t.Errorf("tool %s inputSchema.type = %q, want object", want.name, schema.Type)
+		}
+		if schema.AdditionalProperties {
+			t.Errorf("tool %s inputSchema allows unknown properties", want.name)
+		}
+		for _, property := range want.properties {
+			if _, ok := schema.Properties[property]; !ok {
+				t.Errorf("tool %s inputSchema missing property %q", want.name, property)
+			}
+		}
+		if len(schema.Properties) != len(want.properties) {
+			t.Errorf("tool %s inputSchema has %d properties, want %d: %v", want.name, len(schema.Properties), len(want.properties), schema.Properties)
+		}
+		if strings.Join(schema.Required, ",") != strings.Join(want.required, ",") {
+			t.Errorf("tool %s inputSchema.required = %v, want %v", want.name, schema.Required, want.required)
+		}
+
+		res, err := c.CallTool(ctx, want.name, want.arguments)
+		if err != nil {
+			t.Errorf("CallTool %s through afcli: %v", want.name, err)
+			continue
+		}
+		if res.IsError {
+			t.Errorf("CallTool %s through afcli returned isError: %s", want.name, res.Content)
+			continue
+		}
+		want.output(t, res.Content)
+	}
+}
+
+func TestConformance_AFCLICapabilityDiscovery(t *testing.T) {
+	t.Parallel()
+	root := fixtureRepo(t)
+	cmd := exec.Command(os.Args[0]) //nolint:gosec // re-exec of the test binary
+	cmd.Env = append(os.Environ(), "MCP_CODEINTEL_AFCLI_SERVE=1", "MCP_CODEINTEL_ROOT="+root)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start afcli MCP server: %v", err)
+	}
+	if _, err := fmt.Fprintln(stdin, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"contract-test","version":"0"}}}`); err != nil {
+		t.Fatalf("write initialize: %v", err)
+	}
+
+	var response struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      int    `json:"id"`
+		Result  struct {
+			ProtocolVersion string `json:"protocolVersion"`
+			Capabilities    struct {
+				Tools map[string]json.RawMessage `json:"tools"`
+			} `json:"capabilities"`
+			ServerInfo struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"serverInfo"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(stdout).Decode(&response); err != nil {
+		t.Fatalf("decode initialize response: %v (stderr: %s)", err, stderr.String())
+	}
+	if response.JSONRPC != "2.0" || response.ID != 1 {
+		t.Errorf("initialize envelope = %+v, want jsonrpc 2.0 with id 1", response)
+	}
+	if response.Result.ProtocolVersion != "2025-03-26" {
+		t.Errorf("initialize protocolVersion = %q, want 2025-03-26", response.Result.ProtocolVersion)
+	}
+	if response.Result.ServerInfo.Name != "af-code-intelligence" {
+		t.Errorf("initialize serverInfo.name = %q, want af-code-intelligence", response.Result.ServerInfo.Name)
+	}
+	if response.Result.ServerInfo.Version != "0.1.0" {
+		t.Errorf("initialize serverInfo.version = %q, want 0.1.0", response.Result.ServerInfo.Version)
+	}
+	if response.Result.Capabilities.Tools == nil {
+		t.Error("initialize capabilities must advertise tools")
+	}
+
+	_ = stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("afcli MCP server exited with error: %v (stderr: %s)", err, stderr.String())
+	}
+}
+
+func requireObjectFields(t *testing.T, tool, content string, fields ...string) {
+	t.Helper()
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		t.Fatalf("%s output is not a JSON object: %v\n%s", tool, err, content)
+	}
+	for _, field := range fields {
+		if _, ok := result[field]; !ok {
+			t.Errorf("%s output missing required field %q: %s", tool, field, content)
+		}
+	}
+}
+
+func requireSearchResult(t *testing.T, tool, content string) {
+	t.Helper()
+	var result []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		t.Fatalf("%s output is not a JSON array: %v\n%s", tool, err, content)
+	}
+	if len(result) == 0 {
+		t.Fatalf("%s output is empty for the fixture: %s", tool, content)
+	}
+	for _, field := range []string{"symbol", "score", "matchType"} {
+		if _, ok := result[0][field]; !ok {
+			t.Errorf("%s output[0] missing required field %q: %s", tool, field, content)
+		}
 	}
 }
 
