@@ -18,6 +18,7 @@ type evalPromptExperimentOpts struct {
 	configPath   string
 	casesDir     string
 	caseFilter   string
+	arms         []string
 	trials       int
 	trialStart   int
 	donmaiBin    string
@@ -71,6 +72,7 @@ completed execution is append-written to a sanitized local JSONL journal and
 fsynced before platform posting. A successful post appends a second durable event,
 so retries skip already-posted trials and fail closed on uncertain paid executions.
 The final summary records provider-reported cost without emitting raw prompt text.
+Use --arm once per configured arm to complete only selected matrix cells; omit it to run every configured arm.
 
 This command is an operator harness. It does not promote prompt variants or
 mutate production cards. Apply the experiment's external spend authorization
@@ -84,6 +86,7 @@ before invoking it.`,
 	f.StringVar(&opts.configPath, "config", "", "Reviewed experiment JSON config")
 	f.StringVar(&opts.casesDir, "cases-dir", "", "Directory containing experiment JSONL cases")
 	f.StringVar(&opts.caseFilter, "case", "", "Run exactly this case id")
+	f.StringArrayVar(&opts.arms, "arm", nil, "Run only this configured arm id; repeatable")
 	f.IntVar(&opts.trials, "trials", 3, "Repeated trials per arm")
 	f.IntVar(&opts.trialStart, "trial-start", 1, "First one-based trial index")
 	f.StringVar(&opts.donmaiBin, "donmai-bin", "", "Path to the donmai binary used by the MCP capability profile")
@@ -167,6 +170,30 @@ func selectPromptExperimentCase(cases []eval.Case, caseID string) ([]eval.Case, 
 	return selected, nil
 }
 
+func selectPromptExperimentArms(definition experiment.Definition, armIDs []string) (experiment.Definition, error) {
+	selectedIDs := make([]experiment.ArmID, 0, len(armIDs))
+	for _, armID := range armIDs {
+		selectedIDs = append(selectedIDs, experiment.ArmID(armID))
+	}
+	selected, err := definition.SelectArms(selectedIDs)
+	if err == nil {
+		return selected, nil
+	}
+	for _, armID := range armIDs {
+		found := false
+		for _, arm := range definition.Arms {
+			if string(arm.ID) == armID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return experiment.Definition{}, fmt.Errorf("unknown --arm %q", armID)
+		}
+	}
+	return experiment.Definition{}, err
+}
+
 func runEvalPromptExperiment(cmd *cobra.Command, opts *evalPromptExperimentOpts) (runErr error) {
 	if err := validatePromptExperimentOpts(opts); err != nil {
 		return err
@@ -182,6 +209,10 @@ func runEvalPromptExperiment(cmd *cobra.Command, opts *evalPromptExperimentOpts)
 	}()
 
 	loaded, err := experiment.LoadConfigFile(opts.configPath)
+	if err != nil {
+		return err
+	}
+	loaded.Definition, err = selectPromptExperimentArms(loaded.Definition, opts.arms)
 	if err != nil {
 		return err
 	}
