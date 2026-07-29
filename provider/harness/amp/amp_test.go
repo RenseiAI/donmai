@@ -129,6 +129,40 @@ func TestNew_DefaultBinary_ProbesDefaultName(t *testing.T) {
 	}
 }
 
+// TestSpawnEnv_InjectsConstructionKey covers the #238 seam: AMP_API_KEY is
+// on runtime/env's AgentEnvBlocklist, so the host-inherited copy never
+// reaches the child. The construction-time key must therefore be injected
+// into the trusted explicit layer — while a per-session Spec.Env value
+// (BYOK / rotation) always wins and spec.Env is never mutated.
+func TestSpawnEnv_InjectsConstructionKey(t *testing.T) {
+	t.Parallel()
+
+	// No Spec.Env key → construction key injected, other entries kept.
+	spec := agent.Spec{Env: map[string]string{"FOO": "bar"}}
+	got := spawnEnv(spec, "construction-key")
+	if got[EnvAPIKey] != "construction-key" {
+		t.Errorf("spawnEnv: want construction key injected, got %q", got[EnvAPIKey])
+	}
+	if got["FOO"] != "bar" {
+		t.Errorf("spawnEnv: existing entry lost, got %q", got["FOO"])
+	}
+	if _, mutated := spec.Env[EnvAPIKey]; mutated {
+		t.Error("spawnEnv mutated spec.Env")
+	}
+
+	// Spec.Env key present → per-session value wins, map returned as-is.
+	spec = agent.Spec{Env: map[string]string{EnvAPIKey: "session-key"}}
+	if got := spawnEnv(spec, "construction-key"); got[EnvAPIKey] != "session-key" {
+		t.Errorf("spawnEnv: want session key to win, got %q", got[EnvAPIKey])
+	}
+
+	// Neither key → nil-safe passthrough (probe in New() normally prevents
+	// this; Spawn surfaces amp's own auth error in that case).
+	if got := spawnEnv(agent.Spec{}, ""); got != nil {
+		t.Errorf("spawnEnv: want nil passthrough, got %v", got)
+	}
+}
+
 func TestProvider_Name(t *testing.T) {
 	t.Parallel()
 	p := mustNew(t)

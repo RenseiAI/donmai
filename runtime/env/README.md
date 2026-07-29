@@ -30,6 +30,7 @@ OPENCLAW_GATEWAY_TOKEN
 Plus donmai-native entries with no legacy counterpart:
 
 ```
+AMP_API_KEY                       # amp harness personal access token (provider/harness/amp)
 DONMAI_GATEWAY_UPSTREAM_API_KEY   # worker-local gateway's upstream credential
 DONMAI_GATEWAY_UPSTREAM_BASE_URL  # worker-local gateway's upstream route
 ```

@@ -17,6 +17,7 @@ func TestSpawnE2E_RuntimeBlocklistSurvivesPTYSpawn(t *testing.T) {
 	}
 
 	t.Setenv("ANTHROPIC_API_KEY", "parent-secret")
+	t.Setenv("AMP_API_KEY", "parent-amp-secret")
 	t.Setenv("GITHUB_TOKEN", "github-token")
 	t.Setenv("HOME", "/tmp/ptyhost-home")
 	t.Setenv("PATH", "/test/bin")
@@ -25,6 +26,7 @@ func TestSpawnE2E_RuntimeBlocklistSurvivesPTYSpawn(t *testing.T) {
 	// the interactive harness passes the resulting env through to ptyhost.Spawn.
 	composedEnv := runtimeenv.NewComposer().Compose(map[string]string{
 		"ANTHROPIC_API_KEY": "parent-secret",
+		"AMP_API_KEY":       "parent-amp-secret",
 		"GITHUB_TOKEN":      "github-token",
 		"HOME":              "/tmp/ptyhost-home",
 		"PATH":              "/test/bin",
@@ -34,7 +36,7 @@ func TestSpawnE2E_RuntimeBlocklistSurvivesPTYSpawn(t *testing.T) {
 	sess, err := Spawn(Spec{
 		Command: []string{
 			"/bin/sh", "-c",
-			`if [ -z "$ANTHROPIC_API_KEY" ] && [ "$GITHUB_TOKEN" = github-token ] && [ "$HOME" = /tmp/ptyhost-home ] && [ "$PATH" = /test/bin ]; then printf clean > "$1"; else printf leaked > "$1"; fi`,
+			`if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$AMP_API_KEY" ] && [ "$GITHUB_TOKEN" = github-token ] && [ "$HOME" = /tmp/ptyhost-home ] && [ "$PATH" = /test/bin ]; then printf clean > "$1"; else printf leaked > "$1"; fi`,
 			"sh", resultPath,
 		},
 		Env: composedEnv,
