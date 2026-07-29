@@ -149,6 +149,13 @@ func (*Provider) Capabilities() agent.Capabilities {
 // event shape), so the clijsonl package's Handle and JSONL mapper are
 // reused via clijsonl.SpawnBinary — no parsing code is duplicated.
 //
+// The amp CLI authenticates via the AMP_API_KEY environment variable.
+// AMP_API_KEY is on runtime/env's AgentEnvBlocklist (#238), so the
+// host-inherited copy is stripped from the child; the credential must
+// ride the trusted explicit layer instead. spawnEnv injects it there:
+// a per-session Spec.Env value wins, else the construction-time key
+// captured by New() (which fails without one) is forwarded.
+//
 // On any pre-spawn failure (tmpfile write, exec start) the provider
 // returns an error wrapping agent.ErrSpawnFailed.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
@@ -166,13 +173,30 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		spec.Prompt, // stdinPrompt
 		mcpPath,
 		spec.Cwd,
-		spec.Env,
+		spawnEnv(spec, p.apiKey),
 		spec.OnProcessSpawned,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("provider/amp: %w", err)
 	}
 	return h, nil
+}
+
+// spawnEnv returns the explicit env layer for the amp child. Spec.Env is
+// runner-set and trusted; a per-session AMP_API_KEY there (BYOK / rotation)
+// wins. Otherwise the construction-time key is injected so the CLI can
+// authenticate even though the inherited host copy is blocklist-filtered
+// (runtime/env.AgentEnvBlocklist, #238). spec.Env is never mutated.
+func spawnEnv(spec agent.Spec, apiKey string) map[string]string {
+	if spec.Env[EnvAPIKey] != "" || apiKey == "" {
+		return spec.Env
+	}
+	env := make(map[string]string, len(spec.Env)+1)
+	for k, v := range spec.Env {
+		env[k] = v
+	}
+	env[EnvAPIKey] = apiKey
+	return env
 }
 
 // buildAmpArgs translates an agent.Spec into the argv array passed to

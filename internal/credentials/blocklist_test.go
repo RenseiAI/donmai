@@ -21,6 +21,7 @@ func TestIsBlocked_NonBlockedKeys(t *testing.T) {
 		"PATH",
 		"HOME",
 		"ANTHROPIC_API_KEY", // explicitly NOT in this list; it lives in runtime/env
+		"AMP_API_KEY",       // explicitly NOT in this list; it lives in runtime/env (#238)
 		"LINEAR_API_KEY",
 		"GITHUB_TOKEN",
 		"FOO_BAR",
