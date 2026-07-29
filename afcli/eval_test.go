@@ -1,10 +1,12 @@
 package afcli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -79,8 +81,11 @@ func TestEvalPromptExperimentRequiresExplicitPaidRunScopeFlags(t *testing.T) {
 			t.Fatalf("--%s required annotation = %#v", name, required)
 		}
 	}
-	if !strings.Contains(cmd.Long, "append") || !strings.Contains(cmd.Long, "fsync") {
-		t.Fatalf("command help must explain append+fsync durability, got:\n%s", cmd.Long)
+	if arm := cmd.Flags().Lookup("arm"); arm == nil || arm.Value.Type() != "stringArray" {
+		t.Fatalf("--arm = %#v, want repeatable stringArray flag", arm)
+	}
+	if !strings.Contains(cmd.Long, "append") || !strings.Contains(cmd.Long, "fsync") || !strings.Contains(cmd.Long, "--arm") {
+		t.Fatalf("command help must explain durable receipts and arm selection, got:\n%s", cmd.Long)
 	}
 }
 
@@ -98,6 +103,72 @@ func TestSelectPromptExperimentCaseRequiresExactSingleMatch(t *testing.T) {
 	}
 	if _, err := selectPromptExperimentCase([]eval.Case{{ID: "duplicate"}, {ID: "duplicate"}}, "duplicate"); err == nil || !strings.Contains(err.Error(), "exactly one") {
 		t.Fatalf("duplicate selection error = %v", err)
+	}
+}
+
+func TestSelectPromptExperimentArmsPlansOnlySelectedArm(t *testing.T) {
+	configPath, _ := writePromptExperimentFixture(t)
+	loaded, err := experiment.LoadConfigFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allArms, err := selectPromptExperimentArms(loaded.Definition, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(allArms.Arms), 2; got != want {
+		t.Fatalf("default arm count = %d, want %d", got, want)
+	}
+	selected, err := selectPromptExperimentArms(loaded.Definition, []string{"candidate"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var executed []experiment.ArmID
+	_, err = experiment.Run(context.Background(), selected, []experiment.Case{{ID: "case", Prompt: "task"}}, 1,
+		func(_ context.Context, trial experiment.Trial) (struct{}, error) {
+			executed = append(executed, trial.Arm.ID)
+			return struct{}{}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := executed, []experiment.ArmID{"candidate"}; !slices.Equal(got, want) {
+		t.Fatalf("planned/executed arms = %v, want %v", got, want)
+	}
+}
+
+func TestSelectPromptExperimentArmsRejectsUnknownBeforeExecution(t *testing.T) {
+	configPath, _ := writePromptExperimentFixture(t)
+	loaded, err := experiment.LoadConfigFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := selectPromptExperimentArms(loaded.Definition, []string{"unknown"}); err == nil || !strings.Contains(err.Error(), "unknown --arm") {
+		t.Fatalf("unknown arm error = %v", err)
+	}
+}
+
+func TestEvalPromptExperimentRejectsUnknownArmBeforeDriver(t *testing.T) {
+	configPath, casesDir := writePromptExperimentFixture(t)
+	called := false
+	orig := evalNewDriver
+	evalNewDriver = func(cfg eval.Config) (*eval.Driver, error) {
+		called = true
+		return orig(cfg)
+	}
+	defer func() { evalNewDriver = orig }()
+
+	opts := &evalPromptExperimentOpts{
+		configPath: configPath, casesDir: casesDir, caseFilter: "e2-simple-001", arms: []string{"unknown"},
+		trials: 1, trialStart: 1, platformURL: "https://platform.invalid", platformTok: "test-token",
+		orgID: "org_test", projectID: "proj_test", datasetID: "evd_test", receiptFile: filepath.Join(t.TempDir(), "receipts.jsonl"),
+		maxTurns: 1, maxTokens: 1, timeout: time.Second,
+	}
+	if err := runEvalPromptExperiment(&cobra.Command{}, opts); err == nil || !strings.Contains(err.Error(), "unknown --arm") {
+		t.Fatalf("unknown arm error = %v", err)
+	}
+	if called {
+		t.Fatal("driver was created for an unknown arm")
 	}
 }
 
@@ -202,6 +273,7 @@ func TestEvalPromptExperimentBuildsLiveReceiptDriverConfig(t *testing.T) {
 		"--dataset-id", "evd_test",
 		"--receipt-file", receiptPath,
 		"--case", "e2-simple-001",
+		"--arm", "candidate",
 		"--trial-start", "2",
 		"--trials", "1",
 		"--max-turns", "12",

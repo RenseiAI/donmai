@@ -367,14 +367,27 @@ func (d *Driver) runPlannedOne(
 		}
 		switch state.Status {
 		case PromptExperimentReceiptMissing:
-			// First attempt: proceed to provider execution.
+			// First attempt: continue to the platform receipt check below.
 		case PromptExperimentReceiptPlatformPosted:
+			// Two-layer idempotency contract: the local digest journal is replay
+			// safety for identical invocations; the platform pre-check below is
+			// spend safety across budget changes.
 			d.cfg.Logf("skipping already-posted prompt trial %s/%s/%d receipt=%s", c.ID, arm, trial.TrialIndex, receiptIdentity.ReceiptID)
 			return reconstructPostedPromptRun(c, arm, trial.TrialIndex, state.Receipt), nil
 		case PromptExperimentReceiptExecutionCompleted:
 			return RunRecord{}, fmt.Errorf("prompt receipt %s is execution_completed but not platform_posted; refusing duplicate provider execution", receiptIdentity.ReceiptID)
 		default:
 			return RunRecord{}, fmt.Errorf("prompt receipt %s has unknown state %q", receiptIdentity.ReceiptID, state.Status)
+		}
+	}
+	if isPromptExperiment && d.cfg.Bridge != nil && d.cfg.Bridge.Enabled() {
+		posted, err := d.cfg.Bridge.PromptExperimentTrialPosted(ctx, trial.ExperimentID, c.ID, arm, trial.TrialIndex)
+		if err != nil {
+			return RunRecord{}, fmt.Errorf("check platform prompt receipt: %w", err)
+		}
+		if posted {
+			d.cfg.Logf("platform-posted, skipping prompt trial %s/%s/%d", c.ID, arm, trial.TrialIndex)
+			return platformPostedPromptRun(c, arm, trial.TrialIndex), nil
 		}
 	}
 
@@ -503,6 +516,17 @@ func promptExperimentCostCompleteness(tr Transcript) PromptExperimentCostComplet
 		return PromptExperimentCostPartial
 	}
 	return PromptExperimentCostMissing
+}
+
+func platformPostedPromptRun(c Case, arm Arm, trialIndex int) RunRecord {
+	return RunRecord{
+		CaseID: c.ID,
+		Family: c.Family(),
+		Repo:   c.Input.Repo,
+		Arm:    arm,
+		Trial:  trialIndex,
+		Posted: true,
+	}
 }
 
 func reconstructPostedPromptRun(c Case, arm Arm, trialIndex int, receipt PromptExperimentReceipt) RunRecord {
