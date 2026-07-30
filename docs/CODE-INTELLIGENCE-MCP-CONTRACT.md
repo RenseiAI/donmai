@@ -8,11 +8,84 @@ This document freezes the public, local stdio contract served by:
 donmai mcp code-intel --root <absolute-repository-root>
 ```
 
-The command is intentionally hidden because it is a machine-facing subprocess
-entry point. Hidden does not change this wire contract. The server is free to
-use without an account and is self-contained in the `donmai` binary.
+The command is a documented first-class `donmai mcp` entry point. The server is
+free to use without an account and is self-contained in the `donmai` binary.
 
 **Contract version:** `0.1.0`.
+
+## Install and client configuration
+
+Install `donmai` by the [documented Homebrew, Go, release-download, or
+source-build route](../README.md#install). The configured command must resolve
+to that installed binary; do not point a client at a build artifact that is not
+on its machine.
+
+The server needs an absolute checkout root. From the repository or worktree to
+serve, verify the local journey before configuring a client:
+
+```bash
+donmai mcp code-intel --root "$(pwd -P)" --verify
+```
+
+`--verify` starts the real server in a local stdio session, sends `initialize`,
+checks that `tools/list` returns the frozen six-tool profile, and calls every
+tool with minimal valid arguments. It prints its human-readable summary only
+after that check exits successfully. Normal server mode is different: stdout is
+JSON-RPC only, while all warm-up and diagnostic logging stays on stderr.
+
+The following configuration blocks use the same absolute root. A client should
+start one server per repository or worktree; it must not rely on its own
+working directory to select the index root.
+
+### Claude Code
+
+Add this block to a project `.mcp.json` (or an equivalent Claude Code MCP
+scope):
+
+```json
+{
+  "mcpServers": {
+    "donmai-code-intelligence": {
+      "type": "stdio",
+      "command": "/absolute/path/to/donmai",
+      "args": ["mcp", "code-intel", "--root", "/absolute/path/to/repository"]
+    }
+  }
+}
+```
+
+### OpenCode
+
+Add this block to `opencode.json`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "donmai-code-intelligence": {
+        "type": "local",
+        "command": ["/absolute/path/to/donmai", "mcp", "code-intel", "--root", "/absolute/path/to/repository"]
+      }
+    }
+  }
+}
+```
+
+### Pi
+
+When using the Pi MCP adapter, add this block to `.pi/mcp.json` (or its global
+`~/.pi/agent/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "donmai-code-intelligence": {
+      "command": "/absolute/path/to/donmai",
+      "args": ["mcp", "code-intel", "--root", "/absolute/path/to/repository"]
+    }
+  }
+}
+```
 
 ## Transport and lifecycle
 
@@ -56,6 +129,13 @@ boundary.
 `--repo-path`, when present, must be an existing relative directory under
 `--root`; absolute paths and traversal outside the root are rejected. It
 becomes the effective index root.
+
+A Git worktree is an independent served root. Configure the absolute worktree
+path when the client edits that worktree rather than the main checkout; its
+index is built and persisted for that selected root. Start separate processes
+for distinct worktrees. The initial index warms at server startup and stays
+warm only for the lifetime of that server process; subsequent tool calls reuse
+that process-local index.
 
 The `contentFile` argument accepted by `af_code_check_duplicate` is also
 relative to the effective root. Absolute paths, traversal outside the root, and
