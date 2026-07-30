@@ -20,7 +20,7 @@ import (
 //     allow-list is mcp__af-code-intelligence__<tool>, matching the pre-typed
 //     example in agent/types.go (MCPToolNames doc) and the codex/gemini event
 //     mapping.
-//   - Subcommand: `donmai mcp code-intel` (hidden), owned by the sibling lane.
+//   - Subcommand: `donmai mcp code-intel`, owned by the sibling lane.
 //   - Command: os.Executable() — self-referential, portable across every
 //     execution target (local / docker / e2b / daytona / modal) with no
 //     platform coupling to the in-box binary name or path.
