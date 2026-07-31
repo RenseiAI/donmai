@@ -44,12 +44,22 @@ type GitFactory struct {
 	// Logf receives lifecycle/diagnostic log lines; nil discards them. It is
 	// also threaded into each workarea's mcpserver.Config.Logf.
 	Logf func(format string, args ...any)
+	// GitAuth resolves per-invocation authentication for clone and fetch
+	// operations. Nil preserves the static CatalogGit-only behavior.
+	GitAuth GitAuth
 
 	mirrorLocksMu sync.Mutex
 	mirrorLocks   map[string]*sync.Mutex
 }
 
 var _ Factory = (*GitFactory)(nil)
+
+// GitAuth resolves authorization for a remote Git operation. authHeader is
+// injected as an in-memory http.extraHeader; suppressHelper disables configured
+// OS credential helpers for this invocation. Returning an error aborts the Git
+// operation. Returning ("", false, nil) leaves the static catalogue Git config
+// as the only credential source.
+type GitAuth func(ctx context.Context, repoURL string) (authHeader string, suppressHelper bool, err error)
 
 func (f *GitFactory) logf(format string, args ...any) {
 	if f.Logf != nil {
@@ -71,18 +81,17 @@ func (f *GitFactory) Create(ctx context.Context, binding Binding) (ToolCaller, i
 			ErrProjectMismatch, binding.RepositoryPathID, repo.ProjectID, binding.ProjectID)
 	}
 
-	mirrorDir := filepath.Join(f.StateDir, "mirrors", mirrorDirName(repo.ID))
+	mirrorDir := filepath.Join(f.StateDir, "mirrors", mirrorDirName(repo.RepositoryPathID))
 
 	// Serialize ensureMirror+ensureRevision per repository: both mutate the
 	// same bare mirror directory, and git does not support two writers
 	// (clone/fetch) racing against it. Different repositories use different
 	// mutexes and proceed in parallel.
-	mirrorMu := f.lockFor(repo.ID)
+	mirrorMu := f.lockFor(repo.RepositoryPathID)
 	mirrorMu.Lock()
-	networkEnv := buildNetworkGitEnv(repo)
-	err = f.ensureMirror(ctx, repo, mirrorDir, networkEnv)
+	err = f.ensureMirror(ctx, repo, mirrorDir)
 	if err == nil {
-		err = f.ensureRevision(ctx, repo, mirrorDir, binding.Revision, networkEnv)
+		err = f.ensureRevision(ctx, repo, mirrorDir, binding.Revision)
 	}
 	mirrorMu.Unlock()
 	if err != nil {
@@ -109,11 +118,11 @@ func (f *GitFactory) Create(ctx context.Context, binding Binding) (ToolCaller, i
 // not already exist. An existing directory has its origin provenance
 // re-verified against repo.Source on every call (verifyMirrorOrigin) rather
 // than being trusted blindly — the mirror path is a SHA-256 digest of the
-// repository id, and an operator edit to daemon.yaml's source (or a
+// repository path ID, and an operator edit to daemon.yaml's source (or a
 // corrupted/foreign on-disk state) must fail closed instead of silently
 // serving the wrong repository's content. ensureRevision performs the
 // fetch-on-miss that keeps an existing, provenance-verified mirror current.
-func (f *GitFactory) ensureMirror(ctx context.Context, repo CatalogRepository, mirrorDir string, networkEnv []string) error {
+func (f *GitFactory) ensureMirror(ctx context.Context, repo CatalogRepository, mirrorDir string) error {
 	if info, err := os.Stat(mirrorDir); err == nil {
 		if !info.IsDir() {
 			return fmt.Errorf("mirror path %s exists and is not a directory", mirrorDir)
@@ -125,8 +134,12 @@ func (f *GitFactory) ensureMirror(ctx context.Context, repo CatalogRepository, m
 	if err := os.MkdirAll(filepath.Dir(mirrorDir), 0o750); err != nil {
 		return fmt.Errorf("create mirror parent dir: %w", err)
 	}
+	networkEnv, err := f.networkGitEnv(ctx, repo)
+	if err != nil {
+		return err
+	}
 	if _, err := runGit(ctx, networkEnv, "clone", "--mirror", "--", repo.Source, mirrorDir); err != nil {
-		return fmt.Errorf("clone mirror for repository %s: %w", repo.ID, err)
+		return fmt.Errorf("clone mirror for repository %s: %w", repo.RepositoryPathID, err)
 	}
 	return nil
 }
@@ -139,10 +152,10 @@ func (f *GitFactory) ensureMirror(ctx context.Context, repo CatalogRepository, m
 func (f *GitFactory) verifyMirrorOrigin(ctx context.Context, repo CatalogRepository, mirrorDir string) error {
 	out, err := runGit(ctx, buildLocalGitEnv(), "--git-dir", mirrorDir, "remote", "get-url", "origin")
 	if err != nil {
-		return fmt.Errorf("%w: repository %q: read existing mirror origin: %v", ErrMirrorOriginMismatch, repo.ID, err)
+		return fmt.Errorf("%w: repository %q: read existing mirror origin: %v", ErrMirrorOriginMismatch, repo.RepositoryPathID, err)
 	}
 	if strings.TrimSpace(string(out)) != repo.Source {
-		return fmt.Errorf("%w: repository %q", ErrMirrorOriginMismatch, repo.ID)
+		return fmt.Errorf("%w: repository %q", ErrMirrorOriginMismatch, repo.RepositoryPathID)
 	}
 	return nil
 }
@@ -150,15 +163,19 @@ func (f *GitFactory) verifyMirrorOrigin(ctx context.Context, repo CatalogReposit
 // ensureRevision verifies that revision resolves to an exact commit object
 // in mirrorDir, fetching once on a miss before failing with
 // ErrRevisionUnavailable. It never falls back to a branch or HEAD.
-func (f *GitFactory) ensureRevision(ctx context.Context, repo CatalogRepository, mirrorDir, revision string, networkEnv []string) error {
+func (f *GitFactory) ensureRevision(ctx context.Context, repo CatalogRepository, mirrorDir, revision string) error {
 	if f.revisionExists(ctx, mirrorDir, revision) {
 		return nil
 	}
+	networkEnv, err := f.networkGitEnv(ctx, repo)
+	if err != nil {
+		return err
+	}
 	if _, err := runGit(ctx, networkEnv, "--git-dir", mirrorDir, "fetch", "--prune", "--", "origin", "+refs/*:refs/*"); err != nil {
-		return fmt.Errorf("fetch repository %s: %w", repo.ID, err)
+		return fmt.Errorf("fetch repository %s: %w", repo.RepositoryPathID, err)
 	}
 	if !f.revisionExists(ctx, mirrorDir, revision) {
-		return fmt.Errorf("%w: revision %q not found in repository %q", ErrRevisionUnavailable, revision, repo.ID)
+		return fmt.Errorf("%w: revision %q not found in repository %q", ErrRevisionUnavailable, revision, repo.RepositoryPathID)
 	}
 	return nil
 }
@@ -256,7 +273,7 @@ func runGit(ctx context.Context, env []string, args ...string) ([]byte, error) {
 		// access '<url-with-credentials>'" diagnostics) or reveal other
 		// operational details. err's own Error() text (e.g. *exec.ExitError's
 		// "exit status N") carries no such content. Callers that need stable,
-		// non-secret context wrap this error with the repository id/operation
+		// non-secret context wrap this error with the repository path ID/operation
 		// name, never with args or out.
 		return out, fmt.Errorf("git command failed: %w", err)
 	}
@@ -273,14 +290,31 @@ func buildLocalGitEnv() []string {
 	return gitexec.HardenedEnv(base, false, "")
 }
 
+// networkGitEnv resolves the GitAuth callback immediately before a remote Git
+// operation, so short-lived credentials are never retained between clone/fetch
+// calls. The callback's header is passed to git through GIT_CONFIG_VALUE_n, not
+// argv or a persisted Git config.
+func (f *GitFactory) networkGitEnv(ctx context.Context, repo CatalogRepository) ([]string, error) {
+	var authHeader string
+	var suppressHelper bool
+	if f.GitAuth != nil {
+		var err error
+		authHeader, suppressHelper, err = f.GitAuth(ctx, repo.Source)
+		if err != nil {
+			return nil, fmt.Errorf("resolve git auth for repository %q: %w", repo.RepositoryPathID, err)
+		}
+	}
+	return buildNetworkGitEnv(repo, suppressHelper, authHeader), nil
+}
+
 // buildNetworkGitEnv returns the environment for a git invocation that
 // touches repo's remote (clone --mirror, fetch): the non-interactive
 // baseline plus the operator-configured credential helper and/or SSH key
-// for this specific repository, injected via GIT_CONFIG_COUNT/KEY/VALUE
-// (never argv, never persisted to .git/config), with the host's own auth
-// surface filtered out of the child environment exactly as
-// buildLocalGitEnv does.
-func buildNetworkGitEnv(repo CatalogRepository) []string {
+// for this specific repository and a per-invocation auth header. All values
+// are injected via GIT_CONFIG_COUNT/KEY/VALUE, never argv or .git/config,
+// with the host's own auth surface filtered out of the child environment
+// exactly as buildLocalGitEnv does.
+func buildNetworkGitEnv(repo CatalogRepository, suppressHelper bool, authHeader string) []string {
 	base := credentials.Filter(os.Environ())
 	var pairs [][2]string
 	if repo.Git != nil {
@@ -295,7 +329,7 @@ func buildNetworkGitEnv(repo CatalogRepository) []string {
 	// numbering from there — this is the composition contract its package
 	// doc describes for callers that pre-seed GIT_CONFIG_* keys.
 	seeded := appendGitConfigPairs(base, pairs...)
-	return gitexec.HardenedEnv(seeded, false, "")
+	return gitexec.HardenedEnv(seeded, suppressHelper, authHeader)
 }
 
 // appendGitConfigPairs appends pairs as GIT_CONFIG_KEY_n/VALUE_n entries
@@ -339,33 +373,33 @@ func gitConfigCount(env []string) int {
 }
 
 // mirrorDirName returns a collision-resistant, filesystem-safe directory
-// component for repository id: the SHA-256 hex digest of the raw id.
-// Two distinct ids can never sanitize/truncate down to the same directory
+// component for a repository path ID: the SHA-256 hex digest of the raw ID.
+// Two distinct path IDs can never sanitize/truncate down to the same directory
 // name (the failure mode a character-substituting sanitizer such as the
 // former sanitizeID could hit — e.g. "a/b" and "a_b" both sanitizing to
 // "a_b"), which would otherwise let two different repositories share, and
 // corrupt, one bare mirror.
-func mirrorDirName(id string) string {
-	sum := sha256.Sum256([]byte(id))
+func mirrorDirName(repositoryPathID string) string {
+	sum := sha256.Sum256([]byte(repositoryPathID))
 	return hex.EncodeToString(sum[:])
 }
 
-// lockFor returns the mutex serializing ensureMirror+ensureRevision for
-// repoID, creating it on first use. Distinct repository ids always get
+// lockFor returns the mutex serializing ensureMirror+ensureRevision for a
+// repository path ID, creating it on first use. Distinct repositories use
 // distinct mutexes, so warms for different repositories never block each
 // other; concurrent warms for the SAME repository (e.g. two different
 // revisions requested at once) are serialized end-to-end against the one
 // bare mirror they share.
-func (f *GitFactory) lockFor(repoID string) *sync.Mutex {
+func (f *GitFactory) lockFor(repositoryPathID string) *sync.Mutex {
 	f.mirrorLocksMu.Lock()
 	defer f.mirrorLocksMu.Unlock()
 	if f.mirrorLocks == nil {
 		f.mirrorLocks = make(map[string]*sync.Mutex)
 	}
-	l, ok := f.mirrorLocks[repoID]
+	l, ok := f.mirrorLocks[repositoryPathID]
 	if !ok {
 		l = &sync.Mutex{}
-		f.mirrorLocks[repoID] = l
+		f.mirrorLocks[repositoryPathID] = l
 	}
 	return l
 }

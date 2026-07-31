@@ -15,15 +15,16 @@ func TestNewCatalogValidation(t *testing.T) {
 		repos   []CatalogRepository
 		wantErr bool
 	}{
-		{"valid single", []CatalogRepository{{ID: "repo-1", ProjectID: "proj-1", Source: "https://example.test/repo.git"}}, false},
-		{"missing id", []CatalogRepository{{ProjectID: "proj-1", Source: "https://example.test/repo.git"}}, true},
-		{"missing projectId", []CatalogRepository{{ID: "repo-1", Source: "https://example.test/repo.git"}}, true},
-		{"missing source", []CatalogRepository{{ID: "repo-1", ProjectID: "proj-1"}}, true},
+		{"valid single", []CatalogRepository{{ID: "row-1", RepositoryPathID: "github:acme/widgets", ProjectID: "proj-1", Source: "https://example.test/repo.git"}}, false},
+		{"missing id", []CatalogRepository{{RepositoryPathID: "github:acme/widgets", ProjectID: "proj-1", Source: "https://example.test/repo.git"}}, true},
+		{"missing pathId", []CatalogRepository{{ID: "row-1", ProjectID: "proj-1", Source: "https://example.test/repo.git"}}, true},
+		{"missing projectId", []CatalogRepository{{ID: "row-1", RepositoryPathID: "github:acme/widgets", Source: "https://example.test/repo.git"}}, true},
+		{"missing source", []CatalogRepository{{ID: "row-1", RepositoryPathID: "github:acme/widgets", ProjectID: "proj-1"}}, true},
 		{
-			"duplicate id",
+			"duplicate pathId",
 			[]CatalogRepository{
-				{ID: "repo-1", ProjectID: "proj-1", Source: "https://example.test/a.git"},
-				{ID: "repo-1", ProjectID: "proj-2", Source: "https://example.test/b.git"},
+				{ID: "row-1", RepositoryPathID: "github:acme/widgets", ProjectID: "proj-1", Source: "https://example.test/a.git"},
+				{ID: "row-2", RepositoryPathID: "github:acme/widgets", ProjectID: "proj-2", Source: "https://example.test/b.git"},
 			},
 			true,
 		},
@@ -42,8 +43,9 @@ func TestNewCatalogValidation(t *testing.T) {
 
 func TestCatalogLookup(t *testing.T) {
 	t.Parallel()
+	const repositoryPathID = "github:acme/widgets"
 	cat, err := NewCatalog([]CatalogRepository{
-		{ID: "repo-1", ProjectID: "proj-1", Source: "https://example.test/repo.git", Git: &CatalogGit{SSHKey: "/keys/id_ed25519"}},
+		{ID: "row-1", RepositoryPathID: repositoryPathID, ProjectID: "proj-1", Source: "https://example.test/repo.git", Git: &CatalogGit{SSHKey: "/keys/id_ed25519"}},
 	})
 	if err != nil {
 		t.Fatalf("NewCatalog() error = %v", err)
@@ -52,12 +54,12 @@ func TestCatalogLookup(t *testing.T) {
 		t.Errorf("Len() = %d, want 1", cat.Len())
 	}
 
-	got, err := cat.Lookup("repo-1")
+	got, err := cat.Lookup(repositoryPathID)
 	if err != nil {
-		t.Fatalf("Lookup(%q) error = %v", "repo-1", err)
+		t.Fatalf("Lookup(%q) error = %v", repositoryPathID, err)
 	}
-	if got.Source != "https://example.test/repo.git" || got.Git == nil || got.Git.SSHKey != "/keys/id_ed25519" {
-		t.Errorf("Lookup(%q) = %+v, mismatch", "repo-1", got)
+	if got.ID != "row-1" || got.Source != "https://example.test/repo.git" || got.Git == nil || got.Git.SSHKey != "/keys/id_ed25519" {
+		t.Errorf("Lookup(%q) = %+v, mismatch", repositoryPathID, got)
 	}
 
 	_, err = cat.Lookup("missing-repo")
@@ -83,13 +85,15 @@ capacity:
 orchestrator:
   url: https://example.test/orchestrator
 repositories:
-  - id: repo-1
+  - id: row-1
+    pathId: github:acme/widgets
     projectId: proj-1
     source: https://example.test/repo.git
     git:
       credentialHelper: /usr/local/bin/my-helper
       sshKey: /keys/id_ed25519
-  - id: repo-2
+  - id: row-2
+    pathId: github:acme/gadgets
     projectId: proj-2
     source: git@example.test:org/repo2.git
 `
@@ -104,12 +108,12 @@ repositories:
 	if cat.Len() != 2 {
 		t.Fatalf("Len() = %d, want 2", cat.Len())
 	}
-	repo1, err := cat.Lookup("repo-1")
+	repo1, err := cat.Lookup("github:acme/widgets")
 	if err != nil {
-		t.Fatalf("Lookup(repo-1) error = %v", err)
+		t.Fatalf("Lookup(github:acme/widgets) error = %v", err)
 	}
-	if repo1.Git == nil || repo1.Git.CredentialHelper != "/usr/local/bin/my-helper" {
-		t.Errorf("repo-1 git config = %+v, mismatch", repo1.Git)
+	if repo1.ID != "row-1" || repo1.Git == nil || repo1.Git.CredentialHelper != "/usr/local/bin/my-helper" {
+		t.Errorf("github:acme/widgets config = %+v, mismatch", repo1)
 	}
 }
 
@@ -144,7 +148,7 @@ func TestNewCatalogRejectsEmbeddedCredentialsInSource(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := NewCatalog([]CatalogRepository{{ID: "repo-1", ProjectID: "proj-1", Source: tc.source}})
+			_, err := NewCatalog([]CatalogRepository{{ID: "row-1", RepositoryPathID: "github:acme/widgets", ProjectID: "proj-1", Source: tc.source}})
 			if (err != nil) != tc.wantErr {
 				t.Errorf("NewCatalog(source=%q) error = %v, wantErr %v", tc.source, err, tc.wantErr)
 			}
@@ -154,7 +158,7 @@ func TestNewCatalogRejectsEmbeddedCredentialsInSource(t *testing.T) {
 		})
 	}
 
-	_, err := NewCatalog([]CatalogRepository{{ID: "repo-1", ProjectID: "proj-1", Source: secretSource}})
+	_, err := NewCatalog([]CatalogRepository{{ID: "row-1", RepositoryPathID: "github:acme/widgets", ProjectID: "proj-1", Source: secretSource}})
 	if err == nil {
 		t.Fatal("NewCatalog() error = nil, want ErrInsecureSource")
 	}
@@ -173,7 +177,7 @@ func TestLoadCatalogRejectsEmbeddedCredentialsInSource(t *testing.T) {
 	const secretMarker = "sup3r-s3cr3t-token"
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.yaml")
-	doc := "repositories:\n  - id: repo-1\n    projectId: proj-1\n    source: https://svc-user:" + secretMarker + "@example.test/repo.git\n"
+	doc := "repositories:\n  - id: row-1\n    pathId: github:acme/widgets\n    projectId: proj-1\n    source: https://svc-user:" + secretMarker + "@example.test/repo.git\n"
 	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatalf("write catalog file: %v", err)
 	}

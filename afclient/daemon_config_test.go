@@ -290,3 +290,31 @@ projects:
 		t.Errorf("CloneStrategy not updated: %q", loaded.Projects[0].CloneStrategy)
 	}
 }
+
+func TestWriteDaemonYAMLRepositoryPathIDRoundTrips(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	cfg := &DaemonYAML{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{"project-1"},
+		Repositories: []RepositoryEntry{{
+			ID:        "repository-row-123",
+			PathID:    "github:acme/widgets",
+			ProjectID: "project-1",
+			Source:    "https://example.test/acme/widgets.git",
+		}},
+	}
+	if err := WriteDaemonYAML(path, cfg); err != nil {
+		t.Fatalf("WriteDaemonYAML: %v", err)
+	}
+	loaded, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatalf("ReadDaemonYAML: %v", err)
+	}
+	if len(loaded.Repositories) != 1 {
+		t.Fatalf("Repositories = %d, want 1", len(loaded.Repositories))
+	}
+	if got := loaded.Repositories[0].PathID; got != "github:acme/widgets" {
+		t.Errorf("Repositories[0].PathID = %q, want github:acme/widgets", got)
+	}
+}

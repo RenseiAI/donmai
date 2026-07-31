@@ -177,7 +177,7 @@ func requireSearchResult(t *testing.T, tool, content string) {
 func gitBackedFixture(t *testing.T) (*testHandlerFixture, Binding) {
 	t.Helper()
 	dir, sha := newGitFixtureRepo(t)
-	cat, err := NewCatalog([]CatalogRepository{{ID: "repo-1", ProjectID: "proj-1", Source: dir}})
+	cat, err := NewCatalog([]CatalogRepository{{ID: "row-1", RepositoryPathID: "repo-1", ProjectID: "proj-1", Source: dir}})
 	if err != nil {
 		t.Fatalf("NewCatalog() error = %v", err)
 	}
