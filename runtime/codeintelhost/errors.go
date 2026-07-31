@@ -48,7 +48,7 @@ var (
 
 	// ErrMirrorOriginMismatch reports that an already-on-disk bare mirror's
 	// recorded origin does not match the catalog's currently configured
-	// source for that repository id — a fail-closed refusal to silently
+	// source for that repository path ID — a fail-closed refusal to silently
 	// reuse/mix content from the wrong remote. Neither URL is echoed in the
 	// error text.
 	ErrMirrorOriginMismatch = errors.New("code intel host: existing mirror origin does not match configured repository source")

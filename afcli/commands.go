@@ -7,6 +7,7 @@ import (
 	"github.com/RenseiAI/donmai/afcli/credentials"
 	"github.com/RenseiAI/donmai/afcli/linearcmd"
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/runtime/codeintelhost"
 	"github.com/spf13/cobra"
 )
 
@@ -72,6 +73,10 @@ type Config struct {
 	// usage hints, and remediation instructions. Defaults to "donmai" when empty.
 	// Embedders (e.g. rensei-tui) set this to "rensei".
 	BinaryName string
+
+	// CodeHostGitAuth resolves per-invocation Git authorization for `code host`
+	// clone and fetch operations. Nil preserves static catalog Git configuration.
+	CodeHostGitAuth codeintelhost.GitAuth
 }
 
 // scopedClientFactory wraps cfg.ClientFactory so every produced Client

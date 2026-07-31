@@ -3,6 +3,7 @@ package codeintelhost
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -58,11 +59,147 @@ func newSourceRepo(t *testing.T) (dir, firstSHA, secondSHA string) {
 
 func newTestFactory(t *testing.T, repos ...CatalogRepository) *GitFactory {
 	t.Helper()
-	cat, err := NewCatalog(repos)
+	cat, err := NewCatalog(testRepositoriesWithPathIDs(repos))
 	if err != nil {
 		t.Fatalf("NewCatalog() error = %v", err)
 	}
 	return &GitFactory{Catalog: cat, StateDir: t.TempDir()}
+}
+
+// testRepositoriesWithPathIDs keeps pre-existing GitFactory fixtures focused on
+// their worktree behavior. Their ID values already model the bound path ID;
+// production catalogues must provide an explicit pathId.
+func testRepositoriesWithPathIDs(repos []CatalogRepository) []CatalogRepository {
+	for i := range repos {
+		if repos[i].RepositoryPathID == "" {
+			repos[i].RepositoryPathID = repos[i].ID
+		}
+	}
+	return repos
+}
+
+func gitEnvMap(env []string) map[string]string {
+	values := make(map[string]string, len(env))
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[key] = value
+		}
+	}
+	return values
+}
+
+func gitConfigValue(env []string, key string) (string, bool) {
+	values := gitEnvMap(env)
+	for envKey, envValue := range values {
+		if !strings.HasPrefix(envKey, "GIT_CONFIG_KEY_") || envValue != key {
+			continue
+		}
+		value, ok := values["GIT_CONFIG_VALUE_"+strings.TrimPrefix(envKey, "GIT_CONFIG_KEY_")]
+		return value, ok
+	}
+	return "", false
+}
+
+func TestBuildNetworkGitEnvPreservesStaticGitConfig(t *testing.T) {
+	t.Parallel()
+	const authHeader = "Authorization: Bearer callback-token"
+	repo := CatalogRepository{
+		ID:               "row-1",
+		RepositoryPathID: "github:acme/widgets",
+		Git: &CatalogGit{
+			CredentialHelper: "/usr/local/bin/operator-helper",
+			SSHKey:           "/keys/id_ed25519",
+		},
+	}
+	env := buildNetworkGitEnv(repo, false, authHeader)
+	if helper, ok := gitConfigValue(env, "credential.helper"); !ok || helper != "/usr/local/bin/operator-helper" {
+		t.Errorf("credential.helper = %q present=%v, want static helper", helper, ok)
+	}
+	if sshCommand, ok := gitConfigValue(env, "core.sshCommand"); !ok || sshCommand != "ssh -i /keys/id_ed25519 -o IdentitiesOnly=yes" {
+		t.Errorf("core.sshCommand = %q present=%v, want static SSH command", sshCommand, ok)
+	}
+	if header, ok := gitConfigValue(env, "http.extraHeader"); !ok || header != authHeader {
+		t.Errorf("http.extraHeader = %q present=%v, want callback header", header, ok)
+	}
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && strings.Contains(value, "callback-token") && !strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			t.Fatalf("callback token appeared outside GIT_CONFIG_VALUE_n: %s", key)
+		}
+	}
+}
+
+func TestBuildNetworkGitEnvSuppressesCredentialHelperAfterStaticConfig(t *testing.T) {
+	t.Parallel()
+	env := buildNetworkGitEnv(CatalogRepository{
+		ID:               "row-1",
+		RepositoryPathID: "github:acme/widgets",
+		Git:              &CatalogGit{CredentialHelper: "/usr/local/bin/operator-helper"},
+	}, true, "")
+	values := gitEnvMap(env)
+	if values["GIT_CONFIG_COUNT"] != "2" {
+		t.Fatalf("GIT_CONFIG_COUNT = %q, want 2", values["GIT_CONFIG_COUNT"])
+	}
+	if values["GIT_CONFIG_KEY_0"] != "credential.helper" || values["GIT_CONFIG_VALUE_0"] != "/usr/local/bin/operator-helper" {
+		t.Errorf("static credential helper pair = %q=%q, want operator helper", values["GIT_CONFIG_KEY_0"], values["GIT_CONFIG_VALUE_0"])
+	}
+	if values["GIT_CONFIG_KEY_1"] != "credential.helper" || values["GIT_CONFIG_VALUE_1"] != "" {
+		t.Errorf("suppression credential helper pair = %q=%q, want empty trailing helper", values["GIT_CONFIG_KEY_1"], values["GIT_CONFIG_VALUE_1"])
+	}
+}
+
+func TestGitFactoryGitAuthResolvesForCloneAndFetchWithoutPersistingToken(t *testing.T) {
+	t.Parallel()
+	srcDir, firstSHA, _ := newSourceRepo(t)
+	const repositoryPathID = "github:acme/widgets"
+	const authHeader = "Authorization: Bearer callback-token"
+	var gotURLs []string
+	factory := newTestFactory(t, CatalogRepository{
+		ID:               "row-1",
+		RepositoryPathID: repositoryPathID,
+		ProjectID:        "proj-1",
+		Source:           srcDir,
+	})
+	factory.GitAuth = func(_ context.Context, repoURL string) (string, bool, error) {
+		gotURLs = append(gotURLs, repoURL)
+		return authHeader, true, nil
+	}
+	firstBinding := Binding{
+		OrgID: "org-1", ProjectID: "proj-1", RepositoryPathID: repositoryPathID,
+		RevisionKind: RevisionResolvedRef, Revision: firstSHA,
+	}
+	_, closer, err := factory.Create(context.Background(), firstBinding)
+	if err != nil {
+		t.Fatalf("Create(first binding) error = %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+
+	if err := os.WriteFile(filepath.Join(srcDir, "c.go"), []byte("package a\n\nfunc C() {}\n"), 0o600); err != nil {
+		t.Fatalf("write fetch fixture: %v", err)
+	}
+	runGitT(t, srcDir, "add", "c.go")
+	runGitT(t, srcDir, "commit", "-q", "-m", "third")
+	nextSHA := runGitT(t, srcDir, "rev-parse", "HEAD")
+	nextBinding := firstBinding
+	nextBinding.Revision = nextSHA
+	_, nextCloser, err := factory.Create(context.Background(), nextBinding)
+	if err != nil {
+		t.Fatalf("Create(binding requiring fetch) error = %v", err)
+	}
+	t.Cleanup(func() { _ = nextCloser.Close() })
+
+	if len(gotURLs) != 2 || gotURLs[0] != srcDir || gotURLs[1] != srcDir {
+		t.Errorf("GitAuth URLs = %q, want clone and fetch for %q", gotURLs, srcDir)
+	}
+	configPath := filepath.Join(factory.StateDir, "mirrors", mirrorDirName(repositoryPathID), "config")
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read mirror config: %v", err)
+	}
+	if strings.Contains(string(config), "callback-token") {
+		t.Error("callback token persisted in mirror Git config")
+	}
 }
 
 func TestGitFactoryCreateExactRevision(t *testing.T) {
@@ -98,6 +235,42 @@ func TestGitFactoryCreateExactRevision(t *testing.T) {
 	}
 	if result.IsError {
 		t.Errorf("Call(af_code_get_repo_map) result.IsError = true: %+v", result)
+	}
+}
+
+// TestGitFactoryCreateUsesRepositoryPathID is the real GitFactory serving path:
+// it proves a generated catalogue retains a database row ID as metadata while
+// admitting the repositoryPathId carried by a warm call.
+func TestGitFactoryCreateUsesRepositoryPathID(t *testing.T) {
+	t.Parallel()
+	srcDir, firstSHA, _ := newSourceRepo(t)
+	catalogPath := filepath.Join(t.TempDir(), "daemon.yaml")
+	const repositoryPathID = "github:acme/widgets"
+	if err := os.WriteFile(catalogPath, []byte(fmt.Sprintf(`repositories:
+  - id: repository-row-123
+    pathId: %s
+    projectId: proj-1
+    source: %s
+`, repositoryPathID, srcDir)), 0o600); err != nil {
+		t.Fatalf("write catalog: %v", err)
+	}
+	catalog, err := LoadCatalog(catalogPath)
+	if err != nil {
+		t.Fatalf("LoadCatalog() error = %v", err)
+	}
+	factory := &GitFactory{Catalog: catalog, StateDir: t.TempDir()}
+	binding := Binding{
+		OrgID: "org-1", ProjectID: "proj-1", RepositoryPathID: repositoryPathID,
+		RevisionKind: RevisionResolvedRef, Revision: firstSHA,
+	}
+
+	caller, closer, err := factory.Create(context.Background(), binding)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	t.Cleanup(func() { _ = closer.Close() })
+	if err := caller.WaitReady(context.Background()); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
 	}
 }
 
@@ -316,7 +489,7 @@ func TestGitFactoryCollidingIDsProduceDistinctMirrors(t *testing.T) {
 }
 
 // TestGitFactoryExistingMirrorOriginMismatchFailsClosed proves that when a
-// repository id's on-disk mirror already exists but its recorded origin no
+// repository path ID's on-disk mirror already exists but its recorded origin no
 // longer matches the catalog's currently configured source (e.g. an operator
 // edited daemon.yaml without touching the mirror), Create fails closed with
 // ErrMirrorOriginMismatch rather than silently reusing/serving the wrong
@@ -354,8 +527,8 @@ func TestGitFactoryExistingMirrorOriginMismatchFailsClosed(t *testing.T) {
 }
 
 // TestGitFactoryLockForSerializesPerRepoNotGlobally proves lockFor returns
-// the same *sync.Mutex for repeat calls with the same repository id, a
-// different mutex for a different id, and that holding one repository's
+// the same *sync.Mutex for repeat calls with the same repository path ID, a
+// different mutex for a different path ID, and that holding one repository's
 // mutex never blocks another repository's.
 func TestGitFactoryLockForSerializesPerRepoNotGlobally(t *testing.T) {
 	t.Parallel()
@@ -438,7 +611,7 @@ func TestGitFactoryConcurrentWarmsSameRepoDoNotCorruptMirror(t *testing.T) {
 
 func mustCatalog(t *testing.T, repos ...CatalogRepository) *Catalog {
 	t.Helper()
-	cat, err := NewCatalog(repos)
+	cat, err := NewCatalog(testRepositoriesWithPathIDs(repos))
 	if err != nil {
 		t.Fatalf("NewCatalog() error = %v", err)
 	}

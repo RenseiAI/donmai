@@ -94,7 +94,13 @@ type ProjectEntry struct {
 // RepositoryEntry is one normalized repository resource. Its ProjectID link
 // does not grant project admission.
 type RepositoryEntry struct {
-	ID               string            `yaml:"id"                         json:"id"`
+	// ID is the durable repository-row identifier. It remains distinct from
+	// PathID so consumers retain database metadata without confusing it for the
+	// provider-opaque repository identity used by bound calls.
+	ID string `yaml:"id" json:"id"`
+	// PathID is the provider-opaque repository identity used to bind a resource
+	// to calls. For example, a GitHub repository may use "github:owner/repo".
+	PathID           string            `yaml:"pathId,omitempty"           json:"pathId,omitempty"`
 	ProjectID        string            `yaml:"projectId"                  json:"projectId"`
 	Source           string            `yaml:"source"                     json:"source"`
 	Primary          bool              `yaml:"primary,omitempty"          json:"primary,omitempty"`
@@ -360,7 +366,8 @@ func upsertMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
 			return
 		}
 	}
-	mapping.Content = append(mapping.Content,
+	mapping.Content = append(
+		mapping.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
 		value,
 	)
@@ -392,7 +399,8 @@ func mergeMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
 			return
 		}
 	}
-	mapping.Content = append(mapping.Content,
+	mapping.Content = append(
+		mapping.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
 		value,
 	)
