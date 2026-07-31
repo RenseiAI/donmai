@@ -462,16 +462,16 @@ func TestFileTokenProviderReloadsOnReconnectWithoutLeakingContents(t *testing.T)
 		t.Errorf("Run() error = %v, want context cancellation", err)
 	}
 
-	for _, missing := range []string{filepath.Join(t.TempDir(), "missing"), filepath.Join(t.TempDir(), "world-readable")} {
-		if strings.Contains(missing, "world-readable") {
-			if err := os.WriteFile(missing, []byte("never-leak"), 0o644); err != nil {
-				t.Fatalf("write insecure tunnel token: %v", err)
-			}
-		}
-		if _, err := FileTokenProvider(missing)(context.Background()); err == nil {
-			t.Errorf("FileTokenProvider(%q) error = nil, want rejection", missing)
+	missing := filepath.Join(t.TempDir(), "missing")
+	invalid := filepath.Join(t.TempDir(), "directory")
+	if err := os.Mkdir(invalid, 0o700); err != nil {
+		t.Fatalf("create invalid tunnel token path: %v", err)
+	}
+	for _, tokenPath := range []string{missing, invalid} {
+		if _, err := FileTokenProvider(tokenPath)(context.Background()); err == nil {
+			t.Errorf("FileTokenProvider(%q) error = nil, want rejection", tokenPath)
 		} else if strings.Contains(err.Error(), "never-leak") {
-			t.Errorf("FileTokenProvider(%q) leaked token in error %q", missing, err)
+			t.Errorf("FileTokenProvider(%q) leaked token in error %q", tokenPath, err)
 		}
 	}
 }

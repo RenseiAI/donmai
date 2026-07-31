@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +49,12 @@ func EnvironmentTokenProvider(name string) TokenProvider {
 // must be regular and owner-readable only; its contents are never logged.
 func FileTokenProvider(path string) TokenProvider {
 	return func(context.Context) (string, error) {
-		file, err := os.Open(path)
+		root, err := os.OpenRoot(filepath.Dir(path))
+		if err != nil {
+			return "", fmt.Errorf("hostrelayclient: open tunnel bearer directory for %q: %w", path, err)
+		}
+		defer root.Close() //nolint:errcheck // read outcome is authoritative
+		file, err := root.Open(filepath.Base(path))
 		if err != nil {
 			return "", fmt.Errorf("hostrelayclient: open tunnel bearer file %q: %w", path, err)
 		}
