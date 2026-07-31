@@ -10,6 +10,47 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.56.5 — 2026-07-31
+
+### Features
+
+- **Repository warm host (`donmai code host`).** A long-lived HTTP process mode
+  serving the frozen six-tool code-intelligence contract at
+  `POST /v1/tools/call` through the existing native engine. Workareas are keyed
+  by exact immutable bindings (`orgId`, `projectId`, `repositoryPathId`,
+  `revisionKind`, `revision`); the bounded pool single-flights warming, issues
+  ref-counted leases, and evicts only idle LRU/TTL entries. Opaque repository
+  IDs resolve solely through an operator-owned repository catalogue — clone
+  sources and Git credentials never arrive in request JSON or JWT claims, and
+  embedded HTTP(S) URL credentials are rejected. HS256 bearer JWTs are verified
+  fail-closed against configured issuer, audience, expiry, signature,
+  invocation subject, and every binding claim, with a defense-in-depth
+  held-lease binding equality check. `CODE_INTEL_HOST_JWT_SECRET` is blocked
+  from forwarded agent and Git child-process environments (#243).
+- **Path-ID warm-host catalogs and a Git auth seam.** Generated daemon
+  repository entries now carry `pathId`, and warm-host catalogs are required
+  and indexed by `pathId` — the database row `id` is retained as metadata only.
+  A new `GitFactory.GitAuth` seam forwards `afcli.Config.CodeHostGitAuth` into
+  clone and fetch operations, injecting credentials only as an in-memory
+  `http.extraHeader`; static credential-helper and SSH-key configuration
+  remains supported. Composing binaries must populate `RepositoryEntry.PathID`
+  and set `CodeHostGitAuth` from their runtime-JWT token resolver (#244).
+- **Outbound host relay tunnel client.** New public
+  `github.com/RenseiAI/donmai/hostrelay` host-relay-v1 wire codec plus a strict
+  outbound-only WSS client for a single workload connection, with bounded
+  forwarding, deadlines, cancellation, liveness pings, and no replay on
+  disconnect. Optionally wired into `donmai code host` behind identity flags and
+  exactly one of `--relay-token-env` or `--relay-token-file`; local host
+  signing-secret env names are rejected as tunnel-token inputs. No inbound
+  listener is introduced (#245).
+
+### Chores
+
+- Dependency maintenance: Go module `go-minor-patch` group bumped across 10
+  updates (#183) and the GitHub Actions group across 9 updates (#201).
+
+---
+
 ## v0.56.0 — 2026-07-27
 
 ### Features
