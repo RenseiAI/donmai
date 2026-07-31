@@ -87,7 +87,7 @@ func TestClientDeadlineAndCancellation(t *testing.T) {
 		relay := newRelay(t, "tunnel-secret", func(ctx context.Context, conn *websocket.Conn) {
 			mustHello(t, ctx, conn)
 			writeMessage(t, ctx, conn, request("expired", time.Now().Add(-time.Second)))
-			response <- *(readMessage(t, ctx, conn).(*hostrelay.Response))
+			response <- *readMessage(t, ctx, conn).(*hostrelay.Response)
 			<-ctx.Done()
 		})
 		defer relay.Close()
