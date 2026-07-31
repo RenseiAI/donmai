@@ -61,6 +61,7 @@ type Server struct {
 	// warmDone closes when the initial index build finishes (success or not).
 	// tools/call blocks on it so a call never races an unbuilt index.
 	warmDone chan struct{}
+	warmErr  error
 }
 
 // New validates the config, resolves the effective index root (optionally a
@@ -121,10 +122,24 @@ func (s *Server) warmUp() {
 	start := time.Now()
 	s.logf("warming code index at %s", s.root)
 	if err := s.runner.Refresh(); err != nil {
+		s.warmErr = err
 		s.logf("warm-up index build failed (will rebuild lazily on first call): %v", err)
 		return
 	}
 	s.logf("code index warm in %s", time.Since(start).Round(time.Millisecond))
+}
+
+// WaitReady blocks until the initial index warm-up completes. It returns the
+// warm-up error so repository-bearing hosts can fail acquisition rather than
+// admitting a workarea whose first call would rebuild lazily. The stdio server
+// intentionally keeps its existing lazy-rebuild behavior and does not call it.
+func (s *Server) WaitReady(ctx context.Context) error {
+	select {
+	case <-s.warmDone:
+		return s.warmErr
+	case <-ctx.Done():
+		return fmt.Errorf("wait for code index warm-up: %w", ctx.Err())
+	}
 }
 
 // ── JSON-RPC framing ─────────────────────────────────────────────────────────
@@ -312,15 +327,22 @@ func (s *Server) handleToolsList() toolsListResult {
 
 // ── tools/call ───────────────────────────────────────────────────────────────
 
-type callToolResult struct {
-	Content []contentItem `json:"content"`
+// ToolResult is the frozen v0.1.0 MCP operation-result shape. It is exported
+// so alternate transports can reuse the same dispatcher without re-encoding or
+// drifting from the stdio contract.
+type ToolResult struct {
+	Content []ContentItem `json:"content"`
 	IsError bool          `json:"isError,omitempty"`
 }
 
-type contentItem struct {
+// ContentItem is one text item in a ToolResult. v0.1.0 permits text only.
+type ContentItem struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
 }
+
+// ErrUnknownTool reports a tool name outside the frozen enabled profile.
+var ErrUnknownTool = errors.New("unknown or disabled tool")
 
 func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var p struct {
@@ -342,38 +364,48 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	return res, nil
 }
 
-// callTool resolves the tool (enforcing the enabled subset), blocks until
-// warm-up completes, and invokes it under panic recovery. An unknown/disabled
-// tool is a JSON-RPC error (protocol-level); a tool that runs but fails — or
-// panics — is an isError result (application-level) the model can recover from.
-func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage) (callToolResult, *rpcError) {
+// Call resolves a tool from the frozen enabled profile, blocks until warm-up
+// completes, and invokes it under panic recovery. Recognized operation failures
+// are returned as ToolResult{IsError:true}; protocol selection and cancellation
+// remain Go errors for the transport to classify.
+func (s *Server) Call(ctx context.Context, name string, args json.RawMessage) (ToolResult, error) {
 	td, ok := s.toolByName[name]
 	if !ok {
-		return callToolResult{}, &rpcError{
-			Code:    codeInvalidParams,
-			Message: fmt.Sprintf("unknown or disabled tool: %s", name),
-		}
+		return ToolResult{}, fmt.Errorf("%w: %s", ErrUnknownTool, name)
 	}
 
-	// Block until the index is warm so a call never races an unbuilt index.
 	select {
 	case <-s.warmDone:
 	case <-ctx.Done():
-		return callToolResult{}, &rpcError{
-			Code:    codeServerShuttingDown,
-			Message: "server shutting down before warm-up completed",
-		}
+		return ToolResult{}, fmt.Errorf("wait for code index warm-up: %w", ctx.Err())
 	}
 
 	out, err := safeInvoke(td, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	text, merr := json.MarshalIndent(out, "", "  ")
-	if merr != nil {
-		return toolErrorResult("encode result: " + merr.Error()), nil
+	text, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return toolErrorResult("encode result: " + err.Error()), nil
 	}
-	return callToolResult{Content: []contentItem{{Type: "text", Text: string(text)}}}, nil
+	return ToolResult{Content: []ContentItem{{Type: "text", Text: string(text)}}}, nil
+}
+
+// callTool preserves the stdio JSON-RPC distinction: an unknown tool is an
+// invalid-params protocol error, cancellation is a server-shutdown error, and
+// recognized operation failures stay normal isError results.
+func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage) (ToolResult, *rpcError) {
+	res, err := s.Call(ctx, name, args)
+	if err == nil {
+		return res, nil
+	}
+	if errors.Is(err, ErrUnknownTool) {
+		return ToolResult{}, &rpcError{Code: codeInvalidParams, Message: err.Error()}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return ToolResult{}, &rpcError{Code: codeServerShuttingDown, Message: "server shutting down before warm-up completed"}
+	}
+	return ToolResult{}, &rpcError{Code: codeInternalError, Message: err.Error()}
 }
 
 // safeInvoke runs a tool's invoke closure, converting a panic into an error so
@@ -389,9 +421,9 @@ func safeInvoke(td *toolDef, args json.RawMessage) (out any, err error) {
 }
 
 // toolErrorResult wraps a domain failure as an MCP isError content result.
-func toolErrorResult(msg string) callToolResult {
-	return callToolResult{
-		Content: []contentItem{{Type: "text", Text: msg}},
+func toolErrorResult(msg string) ToolResult {
+	return ToolResult{
+		Content: []ContentItem{{Type: "text", Text: msg}},
 		IsError: true,
 	}
 }
