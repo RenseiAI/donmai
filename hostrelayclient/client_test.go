@@ -308,6 +308,88 @@ func TestClientDisconnectCancelsWithoutReplay(t *testing.T) {
 	}
 }
 
+func TestClientLivenessKeepsHealthyTunnelConnected(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/readyz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		t.Errorf("unexpected local path %q", r.URL.Path)
+	}))
+	defer local.Close()
+
+	ponged := make(chan struct{})
+	relay := newRelay(t, "tunnel-secret", func(ctx context.Context, conn *websocket.Conn) {
+		mustHello(t, ctx, conn)
+		readCtx, cancel := context.WithTimeout(ctx, hostrelay.PingInterval+2*time.Second)
+		defer cancel()
+		typ, data, err := conn.Read(readCtx)
+		if err != nil {
+			t.Errorf("read client liveness ping: %v", err)
+			return
+		}
+		if typ != websocket.MessageBinary {
+			t.Errorf("liveness frame type = %v, want binary", typ)
+			return
+		}
+		message, err := hostrelay.Decode(data)
+		if err != nil {
+			t.Errorf("decode liveness frame: %v", err)
+			return
+		}
+		ping, ok := message.(*hostrelay.Ping)
+		if !ok {
+			t.Errorf("liveness message = %T, want *hostrelay.Ping", message)
+			return
+		}
+		writeMessage(t, ctx, conn, hostrelay.Pong{Nonce: ping.Nonce})
+		close(ponged)
+		<-ctx.Done()
+	})
+	defer relay.Close()
+
+	stop := runClient(t, relay.URL, local.URL, 1)
+	defer stop()
+	select {
+	case <-ponged:
+	case <-time.After(hostrelay.PingInterval + 3*time.Second):
+		t.Fatal("client did not complete a five-second liveness exchange")
+	}
+}
+
+func TestClientDoesNotAttachBeforeLocalReadiness(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/readyz" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		t.Errorf("unexpected local path %q", r.URL.Path)
+	}))
+	defer local.Close()
+
+	hello := make(chan struct{}, 1)
+	relay := newRelay(t, "tunnel-secret", func(ctx context.Context, conn *websocket.Conn) {
+		readCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		defer cancel()
+		if typ, data, err := conn.Read(readCtx); err == nil && typ == websocket.MessageBinary {
+			if message, decodeErr := hostrelay.Decode(data); decodeErr == nil {
+				if _, ok := message.(*hostrelay.Hello); ok {
+					hello <- struct{}{}
+				}
+			}
+		}
+	})
+	defer relay.Close()
+
+	stop := runClient(t, relay.URL, local.URL, 1)
+	defer stop()
+	select {
+	case <-hello:
+		t.Fatal("unready local host sent a tunnel hello")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 func TestEnvironmentTokenProviderKeepsSecretsIsolated(t *testing.T) {
 	t.Setenv("CODE_INTEL_HOST_JWT_SECRET", "host-signing-secret")
 	t.Setenv("HOST_RELAY_TUNNEL_TOKEN", "relay-tunnel-token")

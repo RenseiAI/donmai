@@ -160,10 +160,12 @@ func (c *Client) runLeg(parent context.Context) error {
 	legCtx, cancel := context.WithCancel(parent)
 	defer cancel()
 	writer := &lockedWriter{conn: conn}
-	ready := c.ready(legCtx)
+	if !c.ready(legCtx) {
+		return errors.New("hostrelayclient: local code host is not ready")
+	}
 	if err := writer.write(legCtx, hostrelay.Hello{
 		Workload: c.config.Workload, Version: hostrelay.Version, Generation: c.config.Generation,
-		LocalRoute: hostrelay.LocalRoute, MaxInFlight: c.config.MaxInFlight, Ready: ready,
+		LocalRoute: hostrelay.LocalRoute, MaxInFlight: c.config.MaxInFlight, Ready: true,
 	}); err != nil {
 		return fmt.Errorf("hostrelayclient: write hello: %w", err)
 	}
