@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -217,7 +218,7 @@ func decodeStrict(data []byte, dst any) error {
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}
-	if dec.More() {
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return errors.New("multiple JSON values")
 	}
 	return nil

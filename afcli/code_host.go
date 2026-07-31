@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/RenseiAI/donmai/hostrelay"
+	"github.com/RenseiAI/donmai/hostrelayclient"
 	"github.com/RenseiAI/donmai/runtime/codeintelhost"
 )
 
@@ -34,6 +37,13 @@ type codeHostOptions struct {
 	shutdownTimeout    time.Duration
 	warmTimeout        time.Duration
 	gitAuth            codeintelhost.GitAuth
+	relayURL           string
+	relayTokenEnv      string
+	relayOrgID         string
+	relayPoolID        string
+	relayWorkerHostID  string
+	relayWorkloadID    string
+	relayGeneration    uint64
 }
 
 // newCodeHostCmd constructs `donmai code host`: the long-lived warm-host
@@ -96,6 +106,13 @@ resident workareas — the persistent volume's warm cache survives a restart.`,
 		"Maximum time to wait for in-flight leases to drain on shutdown")
 	cmd.Flags().DurationVar(&opts.warmTimeout, "warm-timeout", 5*time.Minute,
 		"Maximum time allowed for a single-flight workarea warm (clone/fetch/checkout) to complete")
+	cmd.Flags().StringVar(&opts.relayURL, "relay-url", "", "Optional host-relay-v1 WebSocket origin or tunnel URL")
+	cmd.Flags().StringVar(&opts.relayTokenEnv, "relay-token-env", "", "Environment variable containing the host-relay tunnel bearer (required with --relay-url)")
+	cmd.Flags().StringVar(&opts.relayOrgID, "relay-org-id", "", "Host-relay workload organization identity (required with --relay-url)")
+	cmd.Flags().StringVar(&opts.relayPoolID, "relay-pool-id", "", "Host-relay workload pool identity (required with --relay-url)")
+	cmd.Flags().StringVar(&opts.relayWorkerHostID, "relay-worker-host-id", "", "Host-relay worker host identity (required with --relay-url)")
+	cmd.Flags().StringVar(&opts.relayWorkloadID, "relay-workload-id", "", "Host-relay workload identity (required with --relay-url)")
+	cmd.Flags().Uint64Var(&opts.relayGeneration, "relay-generation", 0, "Host-relay workload generation")
 	_ = cmd.MarkFlagRequired("catalog")
 	_ = cmd.MarkFlagRequired("state-dir")
 	_ = cmd.MarkFlagRequired("issuer")
@@ -191,14 +208,32 @@ func runCodeHost(cmd *cobra.Command, opts codeHostOptions) error {
 		})
 	}
 
+	listener, err := net.Listen("tcp", opts.listen)
+	if err != nil {
+		return fmt.Errorf("code host: listen on %s: %w", opts.listen, err)
+	}
 	srv := &http.Server{
-		Addr:              opts.listen,
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	var tunnel *hostrelayclient.Client
+	if opts.relayURL != "" {
+		tunnel, err = newCodeHostTunnel(opts, listener.Addr().String())
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+	}
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
-	logf("listening on %s", opts.listen)
+	go func() { errCh <- srv.Serve(listener) }()
+	logf("listening on %s", listener.Addr())
+	if tunnel != nil {
+		go func() {
+			if runErr := tunnel.Run(ctx); runErr != nil && !errors.Is(runErr, context.Canceled) {
+				logf("host relay tunnel stopped: %v", runErr)
+			}
+		}()
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -226,6 +261,36 @@ func runCodeHost(cmd *cobra.Command, opts codeHostOptions) error {
 	}
 	_, _ = fmt.Fprintln(out, "[code-host] stopped")
 	return nil
+}
+
+// newCodeHostTunnel builds the optional outbound host-relay-v1 client. The
+// tunnel bearer comes only from its named environment provider; neither the
+// code-host signing secret nor a raw bearer appears in flags or logs.
+func newCodeHostTunnel(opts codeHostOptions, listenAddr string) (*hostrelayclient.Client, error) {
+	if strings.TrimSpace(opts.relayTokenEnv) == "" || strings.TrimSpace(opts.relayOrgID) == "" ||
+		strings.TrimSpace(opts.relayPoolID) == "" || strings.TrimSpace(opts.relayWorkerHostID) == "" ||
+		strings.TrimSpace(opts.relayWorkloadID) == "" {
+		return nil, errors.New("code host: --relay-token-env, --relay-org-id, --relay-pool-id, --relay-worker-host-id, and --relay-workload-id are required with --relay-url")
+	}
+	for _, signingEnv := range codeHostJWTSecretEnvVars {
+		if opts.relayTokenEnv == signingEnv {
+			return nil, fmt.Errorf("code host: --relay-token-env must not name the code-host signing environment %q", signingEnv)
+		}
+	}
+	maxInFlight := opts.maxConcurrentCalls
+	if maxInFlight > hostrelay.DefaultMaxInFlight {
+		maxInFlight = hostrelay.DefaultMaxInFlight
+	}
+	return hostrelayclient.New(hostrelayclient.Config{
+		RelayURL:      opts.relayURL,
+		LocalURL:      "http://" + listenAddr,
+		TokenProvider: hostrelayclient.EnvironmentTokenProvider(opts.relayTokenEnv),
+		Workload: hostrelay.Workload{
+			OrgID: opts.relayOrgID, PoolID: opts.relayPoolID,
+			WorkerHostID: opts.relayWorkerHostID, WorkloadID: opts.relayWorkloadID,
+		},
+		Generation: opts.relayGeneration, MaxInFlight: maxInFlight,
+	})
 }
 
 // drainCodeHost shuts down srv and closes pool, both bounded by shutCtx, and
