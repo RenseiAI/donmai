@@ -47,6 +47,9 @@ func TestNewCodeHostCmdFlagDefaults(t *testing.T) {
 		"request-timeout":      "2m0s",
 		"shutdown-timeout":     "1m0s",
 		"warm-timeout":         "5m0s",
+		"relay-url":            "",
+		"relay-token-env":      "",
+		"relay-generation":     "0",
 	}
 	for name, want := range cases {
 		f := cmd.Flags().Lookup(name)
@@ -119,6 +122,31 @@ func TestNewCodeHostCmdRequiredFlags(t *testing.T) {
 				t.Errorf("Execute() error = %q, want it to mention missing flag %q", err.Error(), tc.omit)
 			}
 		})
+	}
+}
+
+func TestNewCodeHostTunnelRequiresIndependentRelayConfiguration(t *testing.T) {
+	opts := codeHostOptions{relayURL: "ws://127.0.0.1:9999"}
+	if _, err := newCodeHostTunnel(opts, "127.0.0.1:8085"); err == nil {
+		t.Fatal("newCodeHostTunnel() error = nil, want missing relay identity error")
+	}
+
+	opts = codeHostOptions{
+		relayURL: "ws://127.0.0.1:9999", relayTokenEnv: "HOST_RELAY_TUNNEL_TOKEN",
+		relayOrgID: "org", relayPoolID: "pool", relayWorkerHostID: "host", relayWorkloadID: "workload",
+		maxConcurrentCalls: 17,
+	}
+	tunnel, err := newCodeHostTunnel(opts, "127.0.0.1:8085")
+	if err != nil {
+		t.Fatalf("newCodeHostTunnel() error = %v", err)
+	}
+	if tunnel == nil {
+		t.Fatal("newCodeHostTunnel() = nil, want configured tunnel")
+	}
+
+	opts.relayTokenEnv = "CODE_INTEL_HOST_JWT_SECRET"
+	if _, err := newCodeHostTunnel(opts, "127.0.0.1:8085"); err == nil {
+		t.Fatal("newCodeHostTunnel() with code-host signing env error = nil, want isolation error")
 	}
 }
 

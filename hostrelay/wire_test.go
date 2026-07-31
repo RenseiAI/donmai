@@ -66,6 +66,9 @@ func TestDecodeRejectsUnknownFieldsAndTypes(t *testing.T) {
 	if _, err := Decode([]byte(`{"type":"replay","payload":{}}`)); !errors.Is(err, ErrInvalidMessage) {
 		t.Fatalf("Decode(unknown type) error = %v, want ErrInvalidMessage", err)
 	}
+	if _, err := Decode([]byte(`{"type":"ping","payload":{"nonce":1}} {}`)); !errors.Is(err, ErrInvalidMessage) {
+		t.Fatalf("Decode(trailing JSON) error = %v, want ErrInvalidMessage", err)
+	}
 }
 
 func TestHelloRequiresBoundedV1Contract(t *testing.T) {
