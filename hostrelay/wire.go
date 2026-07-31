@@ -33,14 +33,16 @@ const (
 	// DefaultMaxInFlight is the default cap advertised by a host tunnel.
 	DefaultMaxInFlight = 16
 
-	// Method and LocalRoute are the only loopback HTTP target admitted by v1.
-	Method     = "POST"
+	// Method is the only loopback HTTP method admitted by v1.
+	Method = "POST"
+	// LocalRoute is the only loopback HTTP route admitted by v1.
 	LocalRoute = "/v1/tools/call"
 )
 
 var (
-	// PingInterval and DeadPeerTimeout are the v1 liveness defaults.
-	PingInterval    = 5 * time.Second
+	// PingInterval is the v1 interval between host liveness probes.
+	PingInterval = 5 * time.Second
+	// DeadPeerTimeout is the v1 maximum elapsed time without a relay pong.
 	DeadPeerTimeout = 10 * time.Second
 )
 
@@ -55,12 +57,18 @@ var (
 type Type string
 
 const (
-	TypeHello    Type = "hello"
-	TypeRequest  Type = "request"
+	// TypeHello announces a workload connection.
+	TypeHello Type = "hello"
+	// TypeRequest carries a correlated relay-to-host request.
+	TypeRequest Type = "request"
+	// TypeResponse carries a correlated host-to-relay response.
 	TypeResponse Type = "response"
-	TypeCancel   Type = "cancel"
-	TypePing     Type = "ping"
-	TypePong     Type = "pong"
+	// TypeCancel asks the host to cancel a request.
+	TypeCancel Type = "cancel"
+	// TypePing probes liveness.
+	TypePing Type = "ping"
+	// TypePong acknowledges a liveness probe.
+	TypePong Type = "pong"
 )
 
 // Message is a typed host-relay-v1 envelope. Exactly one concrete message is
