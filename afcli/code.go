@@ -61,6 +61,7 @@ Optional env vars for enhanced search-code results:
 	cmd.AddCommand(newCodeCheckDuplicateCmd(bin, &repoPath))
 	cmd.AddCommand(newCodeFindTypeUsagesCmd(bin, &repoPath))
 	cmd.AddCommand(newCodeValidateCrossDepsCmd(bin, &repoPath))
+	cmd.AddCommand(newCodeHostCmd(cfg))
 
 	return cmd
 }
