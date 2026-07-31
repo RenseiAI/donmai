@@ -44,6 +44,7 @@ import "strings"
 //   - DONMAI_DAEMON_TOKEN          — orchestrator auth token (daemon registration / re-auth)
 //   - DONMAI_ORCHESTRATOR_URL      — orchestrator base URL (internal routing surface)
 //   - DONMAI_CREDENTIAL_CAPABILITY — per-session credential-socket capability
+//   - CODE_INTEL_HOST_JWT_SECRET   — code-intelligence warm-host HS256 JWT signing secret
 var AgentEnvBlocklist = []string{
 	"DONMAI_DAEMON_JWT",
 	"DONMAI_DAEMON_API_KEY",
@@ -57,6 +58,7 @@ var AgentEnvBlocklist = []string{
 	"DONMAI_DAEMON_TOKEN",
 	"DONMAI_ORCHESTRATOR_URL",
 	"DONMAI_CREDENTIAL_CAPABILITY",
+	"CODE_INTEL_HOST_JWT_SECRET",
 }
 
 // IsBlocked reports whether name is in AgentEnvBlocklist.

@@ -131,6 +131,7 @@ func TestBlocklistContents(t *testing.T) {
 		"DONMAI_DAEMON_TOKEN",
 		"DONMAI_ORCHESTRATOR_URL",
 		"DONMAI_CREDENTIAL_CAPABILITY",
+		"CODE_INTEL_HOST_JWT_SECRET",
 	}
 	got := append([]string{}, AgentEnvBlocklist...)
 	sort.Strings(got)
