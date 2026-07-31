@@ -37,13 +37,13 @@ func TestClientForwardsRoundTripAndPreservesAuthorization(t *testing.T) {
 
 	response := make(chan hostrelay.Response, 1)
 	relay := newRelay(t, "tunnel-secret", func(ctx context.Context, conn *websocket.Conn) {
-		mustHello(t, ctx, conn)
-		writeMessage(t, ctx, conn, hostrelay.Request{
+		mustHello(ctx, t, conn)
+		writeMessage(ctx, t, conn, hostrelay.Request{
 			RequestID: "request-1", Method: hostrelay.Method, Path: hostrelay.LocalRoute,
 			Headers: []hostrelay.Header{{Name: "Authorization", Values: []string{"Bearer warm.host.token"}}},
 			Body:    []byte(`{"tool":"repo_map"}`), DeadlineUnixMilli: time.Now().Add(time.Second).UnixMilli(),
 		})
-		message := readMessage(t, ctx, conn)
+		message := readMessage(ctx, t, conn)
 		got, ok := message.(*hostrelay.Response)
 		if !ok {
 			t.Errorf("response type = %T, want *hostrelay.Response", message)
@@ -85,9 +85,9 @@ func TestClientDeadlineAndCancellation(t *testing.T) {
 		defer local.Close()
 		response := make(chan hostrelay.Response, 1)
 		relay := newRelay(t, "tunnel-secret", func(ctx context.Context, conn *websocket.Conn) {
-			mustHello(t, ctx, conn)
-			writeMessage(t, ctx, conn, request("expired", time.Now().Add(-time.Second)))
-			response <- *readMessage(t, ctx, conn).(*hostrelay.Response)
+			mustHello(ctx, t, conn)
+			writeMessage(ctx, t, conn, request("expired", time.Now().Add(-time.Second)))
+			response <- *readMessage(ctx, t, conn).(*hostrelay.Response)
 			<-ctx.Done()
 		})
 		defer relay.Close()
@@ -123,15 +123,15 @@ func TestClientDeadlineAndCancellation(t *testing.T) {
 		defer local.Close()
 		response := make(chan hostrelay.Response, 1)
 		relay := newRelay(t, "tunnel-secret", func(ctx context.Context, conn *websocket.Conn) {
-			mustHello(t, ctx, conn)
-			writeMessage(t, ctx, conn, request("cancelled", time.Now().Add(time.Second)))
+			mustHello(ctx, t, conn)
+			writeMessage(ctx, t, conn, request("cancelled", time.Now().Add(time.Second)))
 			select {
 			case <-started:
 			case <-ctx.Done():
 				return
 			}
-			writeMessage(t, ctx, conn, hostrelay.Cancel{RequestID: "cancelled"})
-			message := readMessage(t, ctx, conn)
+			writeMessage(ctx, t, conn, hostrelay.Cancel{RequestID: "cancelled"})
+			message := readMessage(ctx, t, conn)
 			got, ok := message.(*hostrelay.Response)
 			if !ok {
 				t.Errorf("cancel response type = %T", message)
@@ -174,12 +174,12 @@ func TestClientBackpressureAndOversizeRejection(t *testing.T) {
 		defer func() { close(block); local.Close() }()
 		response := make(chan hostrelay.Response, 1)
 		relay := newRelay(t, "tunnel-secret", func(ctx context.Context, conn *websocket.Conn) {
-			mustHello(t, ctx, conn)
-			writeMessage(t, ctx, conn, request("one", time.Now().Add(time.Second)))
-			writeMessage(t, ctx, conn, request("two", time.Now().Add(time.Second)))
-			writeMessage(t, ctx, conn, request("three", time.Now().Add(time.Second)))
+			mustHello(ctx, t, conn)
+			writeMessage(ctx, t, conn, request("one", time.Now().Add(time.Second)))
+			writeMessage(ctx, t, conn, request("two", time.Now().Add(time.Second)))
+			writeMessage(ctx, t, conn, request("three", time.Now().Add(time.Second)))
 			for {
-				message := readMessage(t, ctx, conn)
+				message := readMessage(ctx, t, conn)
 				got, ok := message.(*hostrelay.Response)
 				if ok && got.RequestID == "three" {
 					response <- *got
@@ -223,7 +223,7 @@ func TestClientBackpressureAndOversizeRejection(t *testing.T) {
 				<-ctx.Done()
 				return
 			}
-			mustHello(t, ctx, conn)
+			mustHello(ctx, t, conn)
 			body := base64.StdEncoding.EncodeToString(make([]byte, hostrelay.MaxRequestBodyBytes+1))
 			frame := fmt.Sprintf(`{"type":"request","payload":{"requestId":"oversize","method":"POST","path":"/v1/tools/call","headers":[],"body":"%s","deadlineUnixMilli":%d}}`, body, time.Now().Add(time.Second).UnixMilli())
 			if err := conn.Write(ctx, websocket.MessageBinary, []byte(frame)); err != nil {
@@ -267,15 +267,15 @@ func TestClientDisconnectCancelsWithoutReplay(t *testing.T) {
 	var accepts atomic.Int32
 	relay := newRelay(t, "tunnel-secret", func(ctx context.Context, conn *websocket.Conn) {
 		leg := accepts.Add(1)
-		mustHello(t, ctx, conn)
+		mustHello(ctx, t, conn)
 		if leg == 1 {
-			writeMessage(t, ctx, conn, request("no-replay", time.Now().Add(time.Second)))
+			writeMessage(ctx, t, conn, request("no-replay", time.Now().Add(time.Second)))
 			select {
 			case <-started:
 			case <-ctx.Done():
 				return
 			}
-			conn.CloseNow()
+			_ = conn.CloseNow()
 			return
 		}
 		secondLegOnce.Do(func() { close(secondLeg) })
@@ -320,7 +320,7 @@ func TestClientLivenessKeepsHealthyTunnelConnected(t *testing.T) {
 
 	ponged := make(chan struct{})
 	relay := newRelay(t, "tunnel-secret", func(ctx context.Context, conn *websocket.Conn) {
-		mustHello(t, ctx, conn)
+		mustHello(ctx, t, conn)
 		readCtx, cancel := context.WithTimeout(ctx, hostrelay.PingInterval+2*time.Second)
 		defer cancel()
 		typ, data, err := conn.Read(readCtx)
@@ -342,7 +342,7 @@ func TestClientLivenessKeepsHealthyTunnelConnected(t *testing.T) {
 			t.Errorf("liveness message = %T, want *hostrelay.Ping", message)
 			return
 		}
-		writeMessage(t, ctx, conn, hostrelay.Pong{Nonce: ping.Nonce})
+		writeMessage(ctx, t, conn, hostrelay.Pong{Nonce: ping.Nonce})
 		close(ponged)
 		<-ctx.Done()
 	})
@@ -432,7 +432,7 @@ func newRelay(t *testing.T, tunnelToken string, serve func(context.Context, *web
 			t.Errorf("accept websocket: %v", err)
 			return
 		}
-		defer conn.CloseNow()
+		defer func() { _ = conn.CloseNow() }()
 		serve(r.Context(), conn)
 	}))
 }
@@ -464,9 +464,9 @@ func runClient(t *testing.T, relayURL, localURL string, maxInFlight int) func() 
 	}
 }
 
-func mustHello(t *testing.T, ctx context.Context, conn *websocket.Conn) {
+func mustHello(ctx context.Context, t *testing.T, conn *websocket.Conn) {
 	t.Helper()
-	message := readMessage(t, ctx, conn)
+	message := readMessage(ctx, t, conn)
 	hello, ok := message.(*hostrelay.Hello)
 	if !ok {
 		t.Fatalf("first message = %T, want *hostrelay.Hello", message)
@@ -476,7 +476,7 @@ func mustHello(t *testing.T, ctx context.Context, conn *websocket.Conn) {
 	}
 }
 
-func writeMessage(t *testing.T, ctx context.Context, conn *websocket.Conn, message hostrelay.Message) {
+func writeMessage(ctx context.Context, t *testing.T, conn *websocket.Conn, message hostrelay.Message) {
 	t.Helper()
 	data, err := hostrelay.Encode(message)
 	if err != nil {
@@ -487,7 +487,7 @@ func writeMessage(t *testing.T, ctx context.Context, conn *websocket.Conn, messa
 	}
 }
 
-func readMessage(t *testing.T, ctx context.Context, conn *websocket.Conn) hostrelay.Message {
+func readMessage(ctx context.Context, t *testing.T, conn *websocket.Conn) hostrelay.Message {
 	t.Helper()
 	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()

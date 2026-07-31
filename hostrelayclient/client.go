@@ -170,7 +170,7 @@ func (c *Client) runLeg(parent context.Context) error {
 		return fmt.Errorf("hostrelayclient: write hello: %w", err)
 	}
 
-	leg := newLeg(c, writer, legCtx)
+	leg := newLeg(legCtx, c, writer)
 	go leg.maintainLiveness()
 	return leg.read()
 }
@@ -218,7 +218,7 @@ type leg struct {
 	lastPong time.Time
 }
 
-func newLeg(client *Client, writer *lockedWriter, ctx context.Context) *leg {
+func newLeg(ctx context.Context, client *Client, writer *lockedWriter) *leg {
 	return &leg{
 		client: client, writer: writer, ctx: ctx, lastPong: time.Now(),
 		calls: make(map[string]context.CancelFunc), inFlight: make(chan struct{}, client.config.MaxInFlight),
@@ -277,7 +277,7 @@ func (l *leg) maintainLiveness() {
 			l.mu.Unlock()
 			if stale || l.writer.write(l.ctx, hostrelay.Ping{Nonce: uint64(now.UnixNano())}) != nil {
 				l.cancelAll()
-				l.writer.conn.CloseNow()
+				_ = l.writer.conn.CloseNow()
 				return
 			}
 		}
