@@ -39,6 +39,7 @@ type codeHostOptions struct {
 	gitAuth            codeintelhost.GitAuth
 	relayURL           string
 	relayTokenEnv      string
+	relayTokenFile     string
 	relayOrgID         string
 	relayPoolID        string
 	relayWorkerHostID  string
@@ -107,7 +108,8 @@ resident workareas — the persistent volume's warm cache survives a restart.`,
 	cmd.Flags().DurationVar(&opts.warmTimeout, "warm-timeout", 5*time.Minute,
 		"Maximum time allowed for a single-flight workarea warm (clone/fetch/checkout) to complete")
 	cmd.Flags().StringVar(&opts.relayURL, "relay-url", "", "Optional host-relay-v1 WebSocket origin or tunnel URL")
-	cmd.Flags().StringVar(&opts.relayTokenEnv, "relay-token-env", "", "Environment variable containing the host-relay tunnel bearer (required with --relay-url)")
+	cmd.Flags().StringVar(&opts.relayTokenEnv, "relay-token-env", "", "Environment variable containing the host-relay tunnel bearer (exclusive with --relay-token-file)")
+	cmd.Flags().StringVar(&opts.relayTokenFile, "relay-token-file", "", "Owner-readable-only file containing the host-relay tunnel bearer (exclusive with --relay-token-env)")
 	cmd.Flags().StringVar(&opts.relayOrgID, "relay-org-id", "", "Host-relay workload organization identity (required with --relay-url)")
 	cmd.Flags().StringVar(&opts.relayPoolID, "relay-pool-id", "", "Host-relay workload pool identity (required with --relay-url)")
 	cmd.Flags().StringVar(&opts.relayWorkerHostID, "relay-worker-host-id", "", "Host-relay worker host identity (required with --relay-url)")
@@ -264,18 +266,28 @@ func runCodeHost(cmd *cobra.Command, opts codeHostOptions) error {
 }
 
 // newCodeHostTunnel builds the optional outbound host-relay-v1 client. The
-// tunnel bearer comes only from its named environment provider; neither the
-// code-host signing secret nor a raw bearer appears in flags or logs.
+// tunnel bearer comes only from its named environment or a protected file;
+// neither the code-host signing secret nor a raw bearer appears in flags/logs.
 func newCodeHostTunnel(opts codeHostOptions, listenAddr string) (*hostrelayclient.Client, error) {
-	if strings.TrimSpace(opts.relayTokenEnv) == "" || strings.TrimSpace(opts.relayOrgID) == "" ||
-		strings.TrimSpace(opts.relayPoolID) == "" || strings.TrimSpace(opts.relayWorkerHostID) == "" ||
-		strings.TrimSpace(opts.relayWorkloadID) == "" {
-		return nil, errors.New("code host: --relay-token-env, --relay-org-id, --relay-pool-id, --relay-worker-host-id, and --relay-workload-id are required with --relay-url")
+	if strings.TrimSpace(opts.relayOrgID) == "" || strings.TrimSpace(opts.relayPoolID) == "" ||
+		strings.TrimSpace(opts.relayWorkerHostID) == "" || strings.TrimSpace(opts.relayWorkloadID) == "" {
+		return nil, errors.New("code host: --relay-org-id, --relay-pool-id, --relay-worker-host-id, and --relay-workload-id are required with --relay-url")
 	}
-	for _, signingEnv := range codeHostJWTSecretEnvVars {
-		if opts.relayTokenEnv == signingEnv {
-			return nil, fmt.Errorf("code host: --relay-token-env must not name the code-host signing environment %q", signingEnv)
+	envSet := strings.TrimSpace(opts.relayTokenEnv) != ""
+	fileSet := strings.TrimSpace(opts.relayTokenFile) != ""
+	if envSet == fileSet {
+		return nil, errors.New("code host: exactly one of --relay-token-env or --relay-token-file is required with --relay-url")
+	}
+	var tokenProvider hostrelayclient.TokenProvider
+	if envSet {
+		for _, signingEnv := range codeHostJWTSecretEnvVars {
+			if opts.relayTokenEnv == signingEnv {
+				return nil, fmt.Errorf("code host: --relay-token-env must not name the code-host signing environment %q", signingEnv)
+			}
 		}
+		tokenProvider = hostrelayclient.EnvironmentTokenProvider(opts.relayTokenEnv)
+	} else {
+		tokenProvider = hostrelayclient.FileTokenProvider(opts.relayTokenFile)
 	}
 	maxInFlight := opts.maxConcurrentCalls
 	if maxInFlight > hostrelay.DefaultMaxInFlight {
@@ -284,7 +296,7 @@ func newCodeHostTunnel(opts codeHostOptions, listenAddr string) (*hostrelayclien
 	return hostrelayclient.New(hostrelayclient.Config{
 		RelayURL:      opts.relayURL,
 		LocalURL:      "http://" + listenAddr,
-		TokenProvider: hostrelayclient.EnvironmentTokenProvider(opts.relayTokenEnv),
+		TokenProvider: tokenProvider,
 		Workload: hostrelay.Workload{
 			OrgID: opts.relayOrgID, PoolID: opts.relayPoolID,
 			WorkerHostID: opts.relayWorkerHostID, WorkloadID: opts.relayWorkloadID,

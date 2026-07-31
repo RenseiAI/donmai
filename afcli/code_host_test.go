@@ -49,6 +49,7 @@ func TestNewCodeHostCmdFlagDefaults(t *testing.T) {
 		"warm-timeout":         "5m0s",
 		"relay-url":            "",
 		"relay-token-env":      "",
+		"relay-token-file":     "",
 		"relay-generation":     "0",
 	}
 	for name, want := range cases {
@@ -147,6 +148,16 @@ func TestNewCodeHostTunnelRequiresIndependentRelayConfiguration(t *testing.T) {
 	opts.relayTokenEnv = "CODE_INTEL_HOST_JWT_SECRET"
 	if _, err := newCodeHostTunnel(opts, "127.0.0.1:8085"); err == nil {
 		t.Fatal("newCodeHostTunnel() with code-host signing env error = nil, want isolation error")
+	}
+
+	opts.relayTokenEnv = ""
+	opts.relayTokenFile = "/tmp/host-relay-token"
+	if _, err := newCodeHostTunnel(opts, "127.0.0.1:8085"); err != nil {
+		t.Fatalf("newCodeHostTunnel() with token file error = %v", err)
+	}
+	opts.relayTokenEnv = "HOST_RELAY_TUNNEL_TOKEN"
+	if _, err := newCodeHostTunnel(opts, "127.0.0.1:8085"); err == nil {
+		t.Fatal("newCodeHostTunnel() with both token inputs error = nil, want exclusivity error")
 	}
 }
 

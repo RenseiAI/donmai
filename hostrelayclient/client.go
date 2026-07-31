@@ -44,6 +44,33 @@ func EnvironmentTokenProvider(name string) TokenProvider {
 	}
 }
 
+// FileTokenProvider reads a raw tunnel bearer from path on every dial. The file
+// must be regular and owner-readable only; its contents are never logged.
+func FileTokenProvider(path string) TokenProvider {
+	return func(context.Context) (string, error) {
+		file, err := os.Open(path)
+		if err != nil {
+			return "", fmt.Errorf("hostrelayclient: open tunnel bearer file %q: %w", path, err)
+		}
+		defer file.Close() //nolint:errcheck // read outcome is authoritative
+		info, err := file.Stat()
+		if err != nil {
+			return "", fmt.Errorf("hostrelayclient: stat tunnel bearer file %q: %w", path, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return "", fmt.Errorf("hostrelayclient: tunnel bearer file %q must be owner-readable-only", path)
+		}
+		contents, err := io.ReadAll(io.LimitReader(file, 8193))
+		if err != nil {
+			return "", fmt.Errorf("hostrelayclient: read tunnel bearer file %q: %w", path, err)
+		}
+		if len(contents) > 8192 {
+			return "", fmt.Errorf("hostrelayclient: tunnel bearer file %q exceeds maximum size", path)
+		}
+		return string(contents), nil
+	}
+}
+
 // Config describes one workload's outbound tunnel. RelayURL may be either the
 // relay origin or the exact hostrelay.TunnelPath. LocalURL must point at a
 // loopback code host; the client never dials a non-loopback local target.

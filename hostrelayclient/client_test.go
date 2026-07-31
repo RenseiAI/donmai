@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -387,6 +389,90 @@ func TestClientDoesNotAttachBeforeLocalReadiness(t *testing.T) {
 	case <-hello:
 		t.Fatal("unready local host sent a tunnel hello")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestFileTokenProviderReloadsOnReconnectWithoutLeakingContents(t *testing.T) {
+	const oldToken = "old-tunnel-token"
+	const newToken = "new-tunnel-token"
+	path := filepath.Join(t.TempDir(), "tunnel-token")
+	if err := os.WriteFile(path, []byte(oldToken), 0o600); err != nil {
+		t.Fatalf("write initial tunnel token: %v", err)
+	}
+
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/readyz" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		t.Errorf("unexpected local path %q", r.URL.Path)
+	}))
+	defer local.Close()
+
+	secondLeg := make(chan struct{})
+	var accepts atomic.Int32
+	relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := accepts.Add(1)
+		want := oldToken
+		if attempt > 1 {
+			want = newToken
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+want {
+			t.Errorf("attempt %d tunnel bearer = %q, want %q", attempt, got, "Bearer "+want)
+		}
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{hostrelay.Subprotocol}})
+		if err != nil {
+			t.Errorf("accept websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		mustHello(r.Context(), t, conn)
+		if attempt == 1 {
+			if err := os.WriteFile(path, []byte(newToken), 0o600); err != nil {
+				t.Errorf("replace tunnel token: %v", err)
+			}
+			_ = conn.CloseNow()
+			return
+		}
+		close(secondLeg)
+		<-r.Context().Done()
+	}))
+	defer relay.Close()
+
+	client, err := New(Config{
+		RelayURL: strings.Replace(relay.URL, "http://", "ws://", 1), LocalURL: local.URL,
+		TokenProvider:  FileTokenProvider(path),
+		Workload:       hostrelay.Workload{OrgID: "org", PoolID: "pool", WorkerHostID: "host", WorkloadID: "workload"},
+		ReconnectDelay: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	select {
+	case <-secondLeg:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("client did not reconnect using the replacement tunnel token")
+	}
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Errorf("Run() error = %v, want context cancellation", err)
+	}
+
+	for _, missing := range []string{filepath.Join(t.TempDir(), "missing"), filepath.Join(t.TempDir(), "world-readable")} {
+		if strings.Contains(missing, "world-readable") {
+			if err := os.WriteFile(missing, []byte("never-leak"), 0o644); err != nil {
+				t.Fatalf("write insecure tunnel token: %v", err)
+			}
+		}
+		if _, err := FileTokenProvider(missing)(context.Background()); err == nil {
+			t.Errorf("FileTokenProvider(%q) error = nil, want rejection", missing)
+		} else if strings.Contains(err.Error(), "never-leak") {
+			t.Errorf("FileTokenProvider(%q) leaked token in error %q", missing, err)
+		}
 	}
 }
 
