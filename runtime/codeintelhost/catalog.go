@@ -20,15 +20,20 @@ type CatalogGit struct {
 }
 
 // CatalogRepository is one admitted repository resource. It reuses the
-// daemon's ~/.donmai/daemon.yaml `repositories[]` entry shape (id,
+// daemon's ~/.donmai/daemon.yaml `repositories[]` entry shape (id, pathId,
 // projectId, source, git.credentialHelper, git.sshKey) but is decoded
 // independently: this host requires none of daemon.yaml's machine,
 // capacity, or orchestrator fields.
 type CatalogRepository struct {
-	ID        string      `yaml:"id"`
-	ProjectID string      `yaml:"projectId"`
-	Source    string      `yaml:"source"`
-	Git       *CatalogGit `yaml:"git,omitempty"`
+	// ID is the durable repository-row identifier retained as catalogue
+	// metadata. It is never used to admit a bound call.
+	ID string `yaml:"id"`
+	// RepositoryPathID is the provider-opaque repository identity bound into
+	// warm-host calls and the only catalogue lookup key.
+	RepositoryPathID string      `yaml:"pathId"`
+	ProjectID        string      `yaml:"projectId"`
+	Source           string      `yaml:"source"`
+	Git              *CatalogGit `yaml:"git,omitempty"`
 }
 
 // catalogDocument is the minimal top-level shape this package decodes from
@@ -43,7 +48,7 @@ type catalogDocument struct {
 // Catalog is the resolved, validated set of repositories this host may
 // serve, indexed by repositoryPathId.
 type Catalog struct {
-	byID map[string]CatalogRepository
+	byRepositoryPathID map[string]CatalogRepository
 }
 
 // LoadCatalog reads and validates the repository catalog at path.
@@ -80,12 +85,15 @@ func readConfinedFile(path string) ([]byte, error) {
 }
 
 // NewCatalog validates repos and builds a Catalog. Each entry requires a
-// non-empty id, projectId, and source; ids must be unique.
+// non-empty id, pathId, projectId, and source; pathIds must be unique.
 func NewCatalog(repos []CatalogRepository) (*Catalog, error) {
-	byID := make(map[string]CatalogRepository, len(repos))
+	byRepositoryPathID := make(map[string]CatalogRepository, len(repos))
 	for i, r := range repos {
 		if r.ID == "" {
 			return nil, fmt.Errorf("repositories[%d]: id is required", i)
+		}
+		if r.RepositoryPathID == "" {
+			return nil, fmt.Errorf("repositories[%d]: pathId is required", i)
 		}
 		if r.ProjectID == "" {
 			return nil, fmt.Errorf("repositories[%d]: projectId is required", i)
@@ -98,12 +106,12 @@ func NewCatalog(repos []CatalogRepository) (*Catalog, error) {
 			// under suspicion of carrying an embedded credential.
 			return nil, fmt.Errorf("repositories[%d]: %w", i, err)
 		}
-		if _, dup := byID[r.ID]; dup {
-			return nil, fmt.Errorf("repositories[%d]: duplicate id %q", i, r.ID)
+		if _, dup := byRepositoryPathID[r.RepositoryPathID]; dup {
+			return nil, fmt.Errorf("repositories[%d]: duplicate pathId %q", i, r.RepositoryPathID)
 		}
-		byID[r.ID] = r
+		byRepositoryPathID[r.RepositoryPathID] = r
 	}
-	return &Catalog{byID: byID}, nil
+	return &Catalog{byRepositoryPathID: byRepositoryPathID}, nil
 }
 
 // validateSource rejects an http(s) source that embeds URL userinfo (e.g.
@@ -126,16 +134,16 @@ func validateSource(source string) error {
 }
 
 // Lookup resolves a repositoryPathId to its catalog entry. It returns
-// ErrRepositoryNotFound (wrapped) when id is not admitted.
-func (c *Catalog) Lookup(id string) (CatalogRepository, error) {
-	r, ok := c.byID[id]
+// ErrRepositoryNotFound (wrapped) when the pathId is not admitted.
+func (c *Catalog) Lookup(repositoryPathID string) (CatalogRepository, error) {
+	r, ok := c.byRepositoryPathID[repositoryPathID]
 	if !ok {
-		return CatalogRepository{}, fmt.Errorf("%w: %q", ErrRepositoryNotFound, id)
+		return CatalogRepository{}, fmt.Errorf("%w: %q", ErrRepositoryNotFound, repositoryPathID)
 	}
 	return r, nil
 }
 
 // Len reports the number of admitted repositories.
 func (c *Catalog) Len() int {
-	return len(c.byID)
+	return len(c.byRepositoryPathID)
 }

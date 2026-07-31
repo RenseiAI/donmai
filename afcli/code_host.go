@@ -33,6 +33,7 @@ type codeHostOptions struct {
 	requestTimeout     time.Duration
 	shutdownTimeout    time.Duration
 	warmTimeout        time.Duration
+	gitAuth            codeintelhost.GitAuth
 }
 
 // newCodeHostCmd constructs `donmai code host`: the long-lived warm-host
@@ -40,8 +41,9 @@ type codeHostOptions struct {
 // over HTTP (POST /v1/tools/call) instead of the stdio transport `donmai mcp
 // code-intel` uses, backed by a bounded pool of persistent Git-backed
 // workareas. See runtime/codeintelhost's package doc for the full contract.
-func newCodeHostCmd(_ Config) *cobra.Command {
+func newCodeHostCmd(cfg Config) *cobra.Command {
 	var opts codeHostOptions
+	opts.gitAuth = cfg.CodeHostGitAuth
 
 	cmd := &cobra.Command{
 		Use:   "host",
@@ -79,7 +81,7 @@ resident workareas — the persistent volume's warm cache survives a restart.`,
 
 	cmd.Flags().StringVar(&opts.listen, "listen", "127.0.0.1:8085", "HTTP listen address")
 	cmd.Flags().StringVar(&opts.catalogPath, "catalog", "",
-		"Path to the repository catalog YAML (repositories[]: id, projectId, source, git.credentialHelper/sshKey) (required)")
+		"Path to the repository catalog YAML (repositories[]: id, pathId, projectId, source, git.credentialHelper/sshKey) (required)")
 	cmd.Flags().StringVar(&opts.stateDir, "state-dir", "",
 		"Absolute path to the persistent state directory for Git mirrors and workareas (required)")
 	cmd.Flags().StringVar(&opts.issuer, "issuer", "", "Required JWT issuer this host verifies (no default)")
@@ -147,6 +149,7 @@ func runCodeHost(cmd *cobra.Command, opts codeHostOptions) error {
 		Catalog:  catalog,
 		StateDir: opts.stateDir,
 		Logf:     logf,
+		GitAuth:  opts.gitAuth,
 	}
 	pool, err := codeintelhost.NewPool(factory, codeintelhost.PoolConfig{
 		MaxWorkareas: opts.maxWorkareas,
