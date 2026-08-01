@@ -75,7 +75,7 @@ func gitNonInteractiveEnv(name string, extraEnv []string) []string {
 	if name != "git" {
 		return extraEnv
 	}
-	return gitexec.HardenedEnv(extraEnv, false, "")
+	return gitexec.HardenedEnv(extraEnv, false, gitexec.Auth{})
 }
 
 // defaultRunner is the package-wide production runner. Constructors default to

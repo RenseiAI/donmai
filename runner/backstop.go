@@ -435,7 +435,7 @@ func runGit(ctx context.Context, cwd string, id gitIdentity, args ...string) (st
 	// clone time). HardenedEnv with (false, "") appends only the two
 	// non-interactive vars, so the identity overrides remain the last identity
 	// entries and still win.
-	cmd.Env = gitexec.HardenedEnv(runtimeenv.FilterRunnerOnly(append(os.Environ(), id.envOverrides()...)), false, "")
+	cmd.Env = gitexec.HardenedEnv(runtimeenv.FilterRunnerOnly(append(os.Environ(), id.envOverrides()...)), false, gitexec.Auth{})
 	out, err := cmd.CombinedOutput()
 	return strings.TrimRight(string(out), " \n\t"), err
 }

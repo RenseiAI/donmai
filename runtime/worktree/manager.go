@@ -103,10 +103,18 @@ type EnvCommandRunner func(ctx context.Context, extraEnv []string, name string, 
 //
 // The seam is INERT by default: when GitAuth is nil the manager runs git
 // exactly as before — no env hardening, no URL rewriting. When set, each git
-// invocation that touches a remote applies gitexec.HardenedEnv(env, suppress,
-// header), and a clone of a URL carrying embedded userinfo clones the
-// userinfo-stripped URL so the token never persists in .git/config (auth flows
-// through the injected http.extraHeader instead).
+// invocation that touches a remote applies gitexec.HardenedEnv, and a clone of
+// a URL carrying embedded userinfo clones the userinfo-stripped URL so the
+// token never persists in .git/config (auth flows through the injected
+// http.extraHeader instead).
+//
+// The returned header is scoped to the repoURL it was resolved for —
+// `http.<repoURL>.extraHeader` — so it is offered ONLY to that remote. A
+// resolver that ignores repoURL and returns one blanket token still gets that
+// scoping; it does not get a credential that follows the process into every
+// other git remote it or its children touch. Correspondingly, a header
+// returned for a repoURL that is empty or not http(s) is dropped (and logged),
+// because there is no request it could correctly authenticate.
 //
 // Returning an error aborts the provisioning attempt with that error wrapped.
 // Returning ("", false, nil) is valid and means "no header, do not suppress" —
@@ -697,14 +705,6 @@ func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionS
 	}
 }
 
-// runGit runs a git invocation, applying the credential-hardening seam when a
-// GitAuth callback is configured. repoURL is the remote the operation targets;
-// it is passed to the GitAuth resolver and is "" for purely-local operations
-// (e.g. `worktree remove`), in which case GitAuth still runs and may suppress
-// the credential helper.
-//
-// When m.gitAuth is nil this routes straight through the env-free CommandRunner
-// — byte-identical to the pre-seam path.
 func (m *Manager) lockSession(sessionID string) func() {
 	m.mu.Lock()
 	lock := m.sessionLocks[sessionID]
@@ -717,6 +717,21 @@ func (m *Manager) lockSession(sessionID string) func() {
 	return lock.Unlock
 }
 
+// runGit runs a git invocation, applying the credential-hardening seam when a
+// GitAuth callback is configured. repoURL is the remote the operation targets;
+// it is passed to the GitAuth resolver and is "" for purely-local operations
+// (`worktree list`, `worktree remove`), in which case GitAuth still runs and
+// may suppress the credential helper.
+//
+// repoURL is also what any resolved auth header is SCOPED to: gitexec emits
+// `http.<repoURL>.extraHeader`, never the bare key, so the credential is not
+// offered to unrelated remotes by the git process or anything it spawns. A
+// purely-local operation therefore gets no header — correct, since it issues no
+// HTTP request — and a repoURL that is not an http(s) remote gets none either,
+// which is logged rather than silently swallowed.
+//
+// When m.gitAuth is nil this routes straight through the env-free CommandRunner
+// — byte-identical to the pre-seam path.
 func (m *Manager) runGit(ctx context.Context, repoURL string, args ...string) ([]byte, error) {
 	if m.gitAuth == nil {
 		return m.runner(ctx, "git", args...)
@@ -725,7 +740,18 @@ func (m *Manager) runGit(ctx context.Context, repoURL string, args ...string) ([
 	if err != nil {
 		return nil, fmt.Errorf("runtime/worktree: resolve git auth: %w", err)
 	}
-	env := gitexec.HardenedEnv(nil, suppress, header)
+	if header != "" && repoURL != "" {
+		if _, scoped := gitexec.ExtraHeaderConfigKey(repoURL); !scoped {
+			// The resolver produced a credential for a remote that cannot
+			// carry an HTTP header (SSH/scp-style, or a local path), so it is
+			// dropped. Say so here: the alternative is an unauthenticated
+			// operation that fails later at the remote with a message that
+			// does not name the cause. repoURL is not logged — it may embed
+			// the credential itself (CleanURL exists because of that).
+			m.logger.Warn("runtime/worktree: git auth header dropped, remote is not an http(s) URL so the header cannot be scoped to it")
+		}
+	}
+	env := gitexec.HardenedEnv(nil, suppress, gitexec.Auth{Header: header, RemoteURL: repoURL})
 	return m.envRunner(ctx, env, "git", args...)
 }
 
