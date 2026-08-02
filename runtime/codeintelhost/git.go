@@ -287,7 +287,7 @@ func runGit(ctx context.Context, env []string, args ...string) ([]byte, error) {
 // out of the child process environment.
 func buildLocalGitEnv() []string {
 	base := credentials.Filter(os.Environ())
-	return gitexec.HardenedEnv(base, false, "")
+	return gitexec.HardenedEnv(base, false, gitexec.Auth{})
 }
 
 // networkGitEnv resolves the GitAuth callback immediately before a remote Git
@@ -304,6 +304,18 @@ func (f *GitFactory) networkGitEnv(ctx context.Context, repo CatalogRepository) 
 			return nil, fmt.Errorf("resolve git auth for repository %q: %w", repo.RepositoryPathID, err)
 		}
 	}
+	if authHeader != "" {
+		if _, scoped := gitexec.ExtraHeaderConfigKey(repo.Source); !scoped {
+			// Fail loud, not silent: the callback minted a credential for a
+			// remote that can never carry an HTTP header (an SSH/scp-style
+			// source, or a local path), so gitexec drops it. Without this line
+			// the operation proceeds unauthenticated and only fails later, at
+			// the remote, with a message that does not name the cause.
+			// repo.Source is deliberately not logged — it may itself embed a
+			// credential (see verifyMirrorOrigin).
+			f.logf("code-intel host: git auth header for repository %s dropped: its configured source is not an http(s) URL, so the header cannot be scoped to it", repo.RepositoryPathID)
+		}
+	}
 	return buildNetworkGitEnv(repo, suppressHelper, authHeader), nil
 }
 
@@ -314,6 +326,11 @@ func (f *GitFactory) networkGitEnv(ctx context.Context, repo CatalogRepository) 
 // are injected via GIT_CONFIG_COUNT/KEY/VALUE, never argv or .git/config,
 // with the host's own auth surface filtered out of the child environment
 // exactly as buildLocalGitEnv does.
+//
+// authHeader is paired with repo.Source so gitexec scopes it to that one
+// remote: this environment is inherited by every descendant of the git process,
+// and an unscoped header would offer repo's credential to every other remote
+// any of them touch.
 func buildNetworkGitEnv(repo CatalogRepository, suppressHelper bool, authHeader string) []string {
 	base := credentials.Filter(os.Environ())
 	var pairs [][2]string
@@ -329,7 +346,7 @@ func buildNetworkGitEnv(repo CatalogRepository, suppressHelper bool, authHeader 
 	// numbering from there — this is the composition contract its package
 	// doc describes for callers that pre-seed GIT_CONFIG_* keys.
 	seeded := appendGitConfigPairs(base, pairs...)
-	return gitexec.HardenedEnv(seeded, suppressHelper, authHeader)
+	return gitexec.HardenedEnv(seeded, suppressHelper, gitexec.Auth{Header: authHeader, RemoteURL: repo.Source})
 }
 
 // appendGitConfigPairs appends pairs as GIT_CONFIG_KEY_n/VALUE_n entries

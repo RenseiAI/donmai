@@ -3,6 +3,7 @@ package worktree_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -533,15 +534,23 @@ func configValueForKey(env []string, key string) (string, bool) {
 			m[k] = v
 		}
 	}
-	for k, v := range m {
-		if !strings.HasPrefix(k, "GIT_CONFIG_KEY_") || v != key {
+	// Highest-numbered occurrence wins, matching git: a key may repeat (an
+	// inherited http.extraHeader plus our reset). Ranging over the map would
+	// pick an arbitrary one and flake.
+	var val string
+	var found bool
+	for i := 0; ; i++ {
+		k, ok := m[fmt.Sprintf("GIT_CONFIG_KEY_%d", i)]
+		if !ok {
+			return val, found
+		}
+		if k != key {
 			continue
 		}
-		n := strings.TrimPrefix(k, "GIT_CONFIG_KEY_")
-		val, ok := m["GIT_CONFIG_VALUE_"+n]
-		return val, ok
+		if v, ok := m[fmt.Sprintf("GIT_CONFIG_VALUE_%d", i)]; ok {
+			val, found = v, true
+		}
 	}
-	return "", false
 }
 
 // TestProvisionGitAuthEngaged asserts that when a GitAuth callback is set the
@@ -617,8 +626,15 @@ func TestProvisionGitAuthEngaged(t *testing.T) {
 	if v, ok := configValueForKey(gotEnv, "credential.helper"); !ok || v != "" {
 		t.Errorf("credential.helper = %q present=%v, want empty+present", v, ok)
 	}
-	if v, ok := configValueForKey(gotEnv, "http.extraHeader"); !ok || v != header {
-		t.Errorf("http.extraHeader = %q present=%v, want %q", v, ok, header)
+	// The header must be scoped to the remote it authenticates — derived from
+	// the userinfo-STRIPPED form, so one key covers both spellings of the URL —
+	// and the bare `http.extraHeader` (which would attach this credential to
+	// every remote the git process and its descendants touch) must never appear.
+	if v, ok := configValueForKey(gotEnv, "http."+cleanURL+".extraHeader"); !ok || v != header {
+		t.Errorf("scoped extraHeader for %s = %q present=%v, want %q", cleanURL, v, ok, header)
+	}
+	if v, ok := configValueForKey(gotEnv, "http.extraHeader"); !ok || v != "" {
+		t.Errorf("unscoped http.extraHeader = %q present=%v, want the empty-valued reset", v, ok)
 	}
 	// The cloned URL must be the CLEAN (userinfo-stripped) form, never the
 	// token-bearing one.
@@ -686,5 +702,62 @@ func TestProvisionGitAuthInertRegression(t *testing.T) {
 	clonedURL := gotArgs[len(gotArgs)-2]
 	if clonedURL != dirtyURL {
 		t.Errorf("inert clone URL = %q, want unchanged %q", clonedURL, dirtyURL)
+	}
+}
+
+// TestProvisionGitAuthHeaderNotEmittedForUnscopableRemote covers a resolver
+// that returns a blanket credential regardless of the remote it was asked
+// about. For an SSH remote there is no HTTP request to authenticate, so the
+// header must be dropped entirely rather than injected under the bare
+// `http.extraHeader` key — which would attach that credential to every https
+// remote this git process, and everything it spawns, subsequently touches.
+func TestProvisionGitAuthHeaderNotEmittedForUnscopableRemote(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const sshURL = "git@github.com:org/repo.git"
+	const header = "Authorization: Bearer ghp_blanket_secret"
+
+	var gotEnv []string
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir: dir,
+		CommandRunner: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			t.Error("plain CommandRunner called on GitAuth-engaged path")
+			return nil, nil
+		},
+		EnvCommandRunner: func(_ context.Context, extraEnv []string, _ string, args ...string) ([]byte, error) {
+			gotEnv = append([]string(nil), extraEnv...)
+			_ = os.MkdirAll(args[len(args)-1], 0o750)
+			return nil, nil
+		},
+		GitAuth: func(_ context.Context, _ string) (string, bool, error) {
+			return header, true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "s1",
+		RepoURL:   sshURL,
+		Strategy:  worktree.StrategyClone,
+	}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	if v, ok := configValueForKey(gotEnv, "http.extraHeader"); !ok || v != "" {
+		t.Errorf("unscoped http.extraHeader = %q present=%v, want the empty-valued reset for an SSH remote", v, ok)
+	}
+	for _, e := range gotEnv {
+		if strings.Contains(e, "ghp_blanket_secret") {
+			t.Fatalf("credential reached the env for an SSH remote via %q", strings.SplitN(e, "=", 2)[0])
+		}
+	}
+	// The rest of the hardening is unaffected.
+	if !envHas(gotEnv, "GIT_TERMINAL_PROMPT=0") {
+		t.Errorf("hardened env missing GIT_TERMINAL_PROMPT=0: %v", gotEnv)
+	}
+	if v, ok := configValueForKey(gotEnv, "credential.helper"); !ok || v != "" {
+		t.Errorf("credential.helper = %q present=%v, want empty+present", v, ok)
 	}
 }

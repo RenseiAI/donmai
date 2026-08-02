@@ -8,6 +8,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **Git auth headers are scoped to the remote they authenticate.**
+  `internal/gitexec.HardenedEnv` injected the per-invocation credential as a
+  bare `http.extraHeader`, which git applies to *every* HTTP(S) remote — and,
+  because it travels via `GIT_CONFIG_*`, to every descendant process too
+  (submodule fetches, `go mod download`, npm/pnpm git dependencies, pip VCS
+  installs, SwiftPM). Besides offering the credential to unrelated hosts, this
+  broke operations that should have succeeded: attaching *any* credential to an
+  anonymous clone of a *public* repository makes the forge authenticate it, so a
+  stale token turned a working clone into `remote: Invalid username or token`.
+  The header is now emitted as `http.<remote>.extraHeader`, and an inherited
+  unscoped `http.extraHeader` is reset to the empty list on every invocation so
+  a stale ambient credential can no longer outrank the one an operation intends
+  to use. A header that cannot be scoped (no remote, an SSH/scp-style remote, a
+  local path) is dropped and logged rather than broadcast. `HardenedEnv` now
+  takes a `gitexec.Auth{Header, RemoteURL}` in place of a bare header string;
+  the package is module-private, so no downstream embedder API changes.
+
 ---
 
 ## v0.56.5 — 2026-07-31
