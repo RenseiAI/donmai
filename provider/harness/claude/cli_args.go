@@ -134,7 +134,9 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 
 	// Permission mode: autonomous sessions get bypassPermissions so
 	// the CLI does not stall waiting for prompts when running in a
-	// fleet. Interactive sessions inherit the CLI default.
+	// fleet. Non-autonomous sessions inherit the CLI default. The
+	// interactive spawn mode applies the SAME mapping — see
+	// interactive.go's interactiveArgs; the two must not diverge.
 	if spec.Autonomous {
 		argv = append(argv, "--permission-mode", "bypassPermissions")
 	}
