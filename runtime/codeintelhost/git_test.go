@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -89,16 +90,27 @@ func gitEnvMap(env []string) map[string]string {
 	return values
 }
 
+// gitConfigValue returns the value of the HIGHEST-numbered GIT_CONFIG_KEY_n
+// holding key — the occurrence git itself resolves. A key may legitimately
+// repeat (a static credential helper plus its suppression, or an inherited
+// http.extraHeader plus our reset), so scanning in index order is required;
+// ranging over the map would pick an arbitrary occurrence and flake.
 func gitConfigValue(env []string, key string) (string, bool) {
 	values := gitEnvMap(env)
-	for envKey, envValue := range values {
-		if !strings.HasPrefix(envKey, "GIT_CONFIG_KEY_") || envValue != key {
+	var value string
+	var found bool
+	for i := 0; ; i++ {
+		envKey, ok := values[fmt.Sprintf("GIT_CONFIG_KEY_%d", i)]
+		if !ok {
+			return value, found
+		}
+		if envKey != key {
 			continue
 		}
-		value, ok := values["GIT_CONFIG_VALUE_"+strings.TrimPrefix(envKey, "GIT_CONFIG_KEY_")]
-		return value, ok
+		if v, ok := values[fmt.Sprintf("GIT_CONFIG_VALUE_%d", i)]; ok {
+			value, found = v, true
+		}
 	}
-	return "", false
 }
 
 func TestBuildNetworkGitEnvPreservesStaticGitConfig(t *testing.T) {
@@ -107,6 +119,7 @@ func TestBuildNetworkGitEnvPreservesStaticGitConfig(t *testing.T) {
 	repo := CatalogRepository{
 		ID:               "row-1",
 		RepositoryPathID: "github:acme/widgets",
+		Source:           "https://github.com/acme/widgets.git",
 		Git: &CatalogGit{
 			CredentialHelper: "/usr/local/bin/operator-helper",
 			SSHKey:           "/keys/id_ed25519",
@@ -119,8 +132,14 @@ func TestBuildNetworkGitEnvPreservesStaticGitConfig(t *testing.T) {
 	if sshCommand, ok := gitConfigValue(env, "core.sshCommand"); !ok || sshCommand != "ssh -i /keys/id_ed25519 -o IdentitiesOnly=yes" {
 		t.Errorf("core.sshCommand = %q present=%v, want static SSH command", sshCommand, ok)
 	}
-	if header, ok := gitConfigValue(env, "http.extraHeader"); !ok || header != authHeader {
-		t.Errorf("http.extraHeader = %q present=%v, want callback header", header, ok)
+	// The header must be scoped to repo.Source and must never appear under the
+	// bare key: this env is inherited by every descendant of the git process,
+	// and an unscoped credential would follow them to unrelated remotes.
+	if header, ok := gitConfigValue(env, "http.https://github.com/acme/widgets.git.extraHeader"); !ok || header != authHeader {
+		t.Errorf("scoped extraHeader = %q present=%v, want callback header", header, ok)
+	}
+	if header, ok := gitConfigValue(env, "http.extraHeader"); !ok || header != "" {
+		t.Errorf("unscoped http.extraHeader = %q present=%v, want the empty-valued reset", header, ok)
 	}
 	for _, entry := range env {
 		key, value, ok := strings.Cut(entry, "=")
@@ -130,6 +149,56 @@ func TestBuildNetworkGitEnvPreservesStaticGitConfig(t *testing.T) {
 	}
 }
 
+// TestBuildNetworkGitEnvDropsHeaderForNonHTTPSource covers the catalogue entry
+// whose Source is a local path or an SSH remote: no HTTP request will be made,
+// so there is no URL to scope an auth header to and the header is dropped
+// rather than broadcast under the bare key.
+func TestBuildNetworkGitEnvDropsHeaderForNonHTTPSource(t *testing.T) {
+	t.Parallel()
+	const authHeader = "Authorization: Bearer callback-token"
+	for _, source := range []string{"", "/srv/git/widgets.git", "git@github.com:acme/widgets.git"} {
+		t.Run("source="+source, func(t *testing.T) {
+			t.Parallel()
+			env := buildNetworkGitEnv(CatalogRepository{
+				ID:               "row-1",
+				RepositoryPathID: "github:acme/widgets",
+				Source:           source,
+			}, true, authHeader)
+			if header, ok := gitConfigValue(env, "http.extraHeader"); !ok || header != "" {
+				t.Errorf("unscoped http.extraHeader = %q present=%v, want the empty-valued reset", header, ok)
+			}
+			for _, entry := range env {
+				if strings.Contains(entry, "callback-token") {
+					t.Fatalf("credential reached the env for unscopable source %q", source)
+				}
+			}
+			// Helper suppression is orthogonal and must still apply.
+			if helper, ok := gitConfigValue(env, "credential.helper"); !ok || helper != "" {
+				t.Errorf("credential.helper = %q present=%v, want empty+present", helper, ok)
+			}
+		})
+	}
+}
+
+// gitConfigPairs returns the injected GIT_CONFIG_KEY_n/VALUE_n pairs in index
+// order, up to GIT_CONFIG_COUNT — i.e. exactly what git will read.
+func gitConfigPairs(t *testing.T, env []string) [][2]string {
+	t.Helper()
+	values := gitEnvMap(env)
+	count, err := strconv.Atoi(values["GIT_CONFIG_COUNT"])
+	if err != nil {
+		t.Fatalf("GIT_CONFIG_COUNT = %q: %v", values["GIT_CONFIG_COUNT"], err)
+	}
+	pairs := make([][2]string, 0, count)
+	for i := 0; i < count; i++ {
+		pairs = append(pairs, [2]string{
+			values[fmt.Sprintf("GIT_CONFIG_KEY_%d", i)],
+			values[fmt.Sprintf("GIT_CONFIG_VALUE_%d", i)],
+		})
+	}
+	return pairs
+}
+
 func TestBuildNetworkGitEnvSuppressesCredentialHelperAfterStaticConfig(t *testing.T) {
 	t.Parallel()
 	env := buildNetworkGitEnv(CatalogRepository{
@@ -137,15 +206,31 @@ func TestBuildNetworkGitEnvSuppressesCredentialHelperAfterStaticConfig(t *testin
 		RepositoryPathID: "github:acme/widgets",
 		Git:              &CatalogGit{CredentialHelper: "/usr/local/bin/operator-helper"},
 	}, true, "")
-	values := gitEnvMap(env)
-	if values["GIT_CONFIG_COUNT"] != "2" {
-		t.Fatalf("GIT_CONFIG_COUNT = %q, want 2", values["GIT_CONFIG_COUNT"])
+
+	// Assert on ORDER, not absolute indices: buildNetworkGitEnv numbers after
+	// whatever GIT_CONFIG_* the ambient environment already carries, so index 0
+	// is not ours to claim. The invariant that matters is that the suppression
+	// entry comes after the static helper it must override.
+	staticIdx, suppressIdx := -1, -1
+	for i, p := range gitConfigPairs(t, env) {
+		if p[0] != "credential.helper" {
+			continue
+		}
+		switch p[1] {
+		case "/usr/local/bin/operator-helper":
+			staticIdx = i
+		case "":
+			suppressIdx = i
+		}
 	}
-	if values["GIT_CONFIG_KEY_0"] != "credential.helper" || values["GIT_CONFIG_VALUE_0"] != "/usr/local/bin/operator-helper" {
-		t.Errorf("static credential helper pair = %q=%q, want operator helper", values["GIT_CONFIG_KEY_0"], values["GIT_CONFIG_VALUE_0"])
+	if staticIdx < 0 {
+		t.Fatal("static operator credential.helper pair absent")
 	}
-	if values["GIT_CONFIG_KEY_1"] != "credential.helper" || values["GIT_CONFIG_VALUE_1"] != "" {
-		t.Errorf("suppression credential helper pair = %q=%q, want empty trailing helper", values["GIT_CONFIG_KEY_1"], values["GIT_CONFIG_VALUE_1"])
+	if suppressIdx < 0 {
+		t.Fatal("credential.helper suppression pair absent")
+	}
+	if suppressIdx < staticIdx {
+		t.Errorf("suppression at index %d precedes static helper at %d; it must come after to reset the list", suppressIdx, staticIdx)
 	}
 }
 
