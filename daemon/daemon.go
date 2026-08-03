@@ -519,6 +519,30 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 	return &cp
 }
 
+// claimSuspended is the PollOptions.ClaimSuspended callback: it translates the
+// most recent host status the control plane reported into the poll loop's
+// claim gate. True means "do not claim new work this tick"; the reason is used
+// once, on the suspend transition, in the poll loop's log line.
+//
+// Absent status (no beat has carried one yet, or the server never sends the
+// field) reads as NOT suspended — see HostStatusDetail.SuspendsClaiming.
+//
+// Locking: HostStatus() takes and releases d.mu (read side) and returns a copy,
+// so nothing is held while the poll loop latches its own state, and the
+// heartbeat goroutine's setLastHostStatus (write side) can always make
+// progress. The two never nest.
+func (d *Daemon) claimSuspended() (bool, string) {
+	status := d.HostStatus()
+	if !status.SuspendsClaiming() {
+		return false, ""
+	}
+	reason := "host status " + status.Status
+	if status.RecommendedAction != "" {
+		reason += ": " + status.RecommendedAction
+	}
+	return true, reason
+}
+
 // setLastHostStatus is the OnHostStatus callback wired into HeartbeatService.
 // Called on every beat that carries a hostStatus payload (including
 // status='ok', so we always reflect the platform's latest view).
@@ -900,6 +924,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 					return d.handlePollWorkItem(item, cfg.Orchestrator.URL)
 				},
 				OnReregister: reregister,
+				// Honour the host-status signal the heartbeat already
+				// receives: when the bound capacity pool is deleted,
+				// draining, or disabled, stop claiming new work while
+				// leaving in-flight sessions alone.
+				ClaimSuspended: d.claimSuspended,
 			})
 			d.poller.Start()
 

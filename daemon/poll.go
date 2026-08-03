@@ -381,6 +381,22 @@ type PollOptions struct {
 	// — "worker-not-found" skips the JWT refresh probe and goes directly to
 	// full re-registration to create a new Redis entry.
 	OnReregister func(ctx context.Context, reason string) (workerID, runtimeJWT string, err error)
+
+	// ClaimSuspended reports whether this host must currently stop claiming
+	// NEW work, plus a short human-readable reason for the transition log.
+	// It is consulted once per tick, immediately before the poll request —
+	// the single point at which this daemon can take on work — so a true
+	// result means no work item can be handed to this host at all.
+	//
+	// Suspension is claim-side only: in-flight sessions keep running, the
+	// spawner keeps accepting nothing new but killing nothing either, and
+	// the heartbeat loop keeps beating (it carries the in-flight sessions'
+	// lock refresh and user-turn piggyback, so a suspended daemon still
+	// serves the work it already owns).
+	//
+	// Nil ⇒ never suspended, byte-identical to the pre-gate behaviour. The
+	// callback MUST NOT block: it runs on the poll goroutine.
+	ClaimSuspended func() (suspended bool, reason string)
 }
 
 // PollService manages the periodic poll goroutine. Like HeartbeatService it is
@@ -394,6 +410,9 @@ type PollService struct {
 	running  bool
 	workerID string // mutable: refreshed by OnReregister
 	jwt      string // mutable: refreshed by OnReregister
+	// claimsSuspended latches the last observed ClaimSuspended result so the
+	// loop logs one line per state TRANSITION rather than one per tick.
+	claimsSuspended bool
 }
 
 // NewPollService constructs a PollService from opts. OnWork must be non-nil.
@@ -533,12 +552,66 @@ func (p *PollService) loop(ctx context.Context) {
 	}
 }
 
+// ClaimsSuspended reports the latched claim-gate state: true between the tick
+// that observed a stop signal and the tick that observed its clearance. False
+// when no ClaimSuspended callback is wired.
+func (p *PollService) ClaimsSuspended() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.claimsSuspended
+}
+
+// claimGateBlocks consults the ClaimSuspended callback and returns true when
+// this tick must not claim. It logs exactly once per state transition —
+// entering suspension and leaving it — so a long outage costs two lines, not
+// one per tick.
+//
+// Lock discipline: the callback is invoked with NO PollService lock held (it
+// reaches into the daemon's own mutex-guarded status snapshot, and holding
+// p.mu across a foreign lock would invert lock order against any caller that
+// takes the daemon lock first). p.mu is taken only to compare-and-latch the
+// boolean afterwards.
+func (p *PollService) claimGateBlocks() bool {
+	if p.opts.ClaimSuspended == nil {
+		return false
+	}
+	suspended, reason := p.opts.ClaimSuspended()
+
+	p.mu.Lock()
+	changed := p.claimsSuspended != suspended
+	p.claimsSuspended = suspended
+	p.mu.Unlock()
+
+	if changed {
+		if suspended {
+			if reason == "" {
+				reason = "the control plane reports this host must stop claiming"
+			}
+			p.opts.LogWarn(
+				"daemon poll: suspending new-work claims (%s) — in-flight sessions continue; claiming resumes automatically",
+				reason,
+			)
+		} else {
+			p.opts.LogInfo("daemon poll: resuming new-work claims — host status is ok again")
+		}
+	}
+	return suspended
+}
+
 func (p *PollService) pollOnce(ctx context.Context) {
 	p.mu.Lock()
 	workerID := p.workerID
 	jwt := p.jwt
 	p.mu.Unlock()
 	if workerID == "" {
+		return
+	}
+	// Claim gate. Evaluated BEFORE the request goes out: the poll response is
+	// what binds a work item to this host, so skipping the request is the only
+	// way to decline work without a claim-then-NACK round trip. Nothing else is
+	// touched — running sessions, the spawner, and the heartbeat loop are
+	// unaffected, and the next tick re-evaluates, so recovery is automatic.
+	if p.claimGateBlocks() {
 		return
 	}
 	resp, err := callPollEndpoint(ctx, p.opts.HTTPClient, p.opts.OrchestratorURL, workerID, jwt)

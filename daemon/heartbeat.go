@@ -418,7 +418,7 @@ func (h *HeartbeatService) SetCredentials(workerID, jwt string) {
 // heartbeatRequestBody is the JSON body sent on POST
 // /api/workers/<id>/heartbeat. Matches the platform contract:
 //
-//	{ activeCount, activeInteractiveCount?, maxSessions?, load?,
+//	{ status?, activeCount, activeInteractiveCount?, maxSessions?, load?,
 //	  allowlistHash?, allowlist?, appliedMutations?, mutationFailures? }
 //
 // activeInteractiveCount is the interactive-occupancy split of activeCount:
@@ -426,7 +426,17 @@ func (h *HeartbeatService) SetCredentials(workerID, jwt string) {
 // while headless and unknown modes do not. allowlistHash + allowlist are Phase 1d
 // fields; appliedMutations + mutationFailures are Phase 2c ACK fields.
 type heartbeatRequestBody struct {
-	ActiveCount int `json:"activeCount"`
+	// Status is the daemon's own lifecycle status (idle | busy | draining),
+	// sourced from HeartbeatOptions.GetStatus via HeartbeatPayload.Status.
+	// The server uses it to exclude a draining host from dispatch, so it MUST
+	// reach the wire — this struct is the one that gets marshalled, and the
+	// value used to be computed every beat and then dropped here.
+	//
+	// omitempty is load-bearing: a daemon with nothing meaningful to report
+	// sends no key at all, leaving the server free to read "absent" as "no
+	// signal" rather than having to disambiguate an empty string.
+	Status      string `json:"status,omitempty"`
+	ActiveCount int    `json:"activeCount"`
 	// ActiveInteractiveCount is a *int so a nil (unreported) value drops the
 	// key via omitempty — an embedder that does not classify interactive
 	// occupancy must not send a misleading 0.
@@ -457,7 +467,7 @@ type HeartbeatMutationFailure struct {
 // 2026-05-18-daemon-config-sync-DESIGN.md.
 type PendingMutation struct {
 	ID          string          `json:"id"`
-	Op          string          `json:"op"` // session.kill | project.enable | project.disable | legacy project.add | project.remove
+	Op          string          `json:"op"` // session.kill | pool.deleted | project.enable | project.disable | legacy project.add | project.remove
 	Params      json.RawMessage `json:"params"`
 	RequestedAt string          `json:"requestedAt"`
 	RequestedBy string          `json:"requestedBy"`
@@ -470,6 +480,42 @@ type HostStatusDetail struct {
 	Status            string   `json:"status"` // ok | pool_deleted | pool_draining | pool_disabled | unauthorized
 	RecommendedAction string   `json:"recommendedAction,omitempty"`
 	CandidatePoolIDs  []string `json:"candidatePoolIds,omitempty"`
+}
+
+// HostStatusPoolPrefix is the wire prefix shared by every host status that
+// describes the state of the capacity pool this host is bound to
+// (pool_deleted, pool_draining, pool_disabled, and any pool_* state a newer
+// control plane introduces). A pool in any of those states will not accept
+// new sessions from this host, so the daemon stops claiming while one is in
+// force.
+const HostStatusPoolPrefix = "pool_"
+
+// SuspendsClaiming reports whether this status means the daemon must stop
+// claiming NEW work. It never says anything about work already in flight:
+// suspension is a claim-side gate only, and running sessions are left alone.
+//
+// The three-way distinction matters more than the predicate:
+//
+//   - nil receiver ⇒ NO status has been observed yet — the first heartbeat is
+//     still in flight, the daemon talks to a server that predates the
+//     hostStatus field, or it runs with no control plane at all. Absent
+//     status means claim normally. Failing closed here would silence every
+//     deployment whose server never sends the field.
+//   - "" or "ok" ⇒ the host is healthy; claim normally.
+//   - "pool_*" ⇒ the bound pool is deleted / draining / disabled / otherwise
+//     unavailable; stop claiming until the server says ok again.
+//
+// Any other value (today: "unauthorized", tomorrow: something we have not
+// seen) is deliberately NOT a claim gate. Credential failures already have
+// their own recovery rail — the 401/404 re-register path in the poll and
+// heartbeat loops — and an unrecognised status from a newer server must not
+// take a working daemon offline.
+func (h *HostStatusDetail) SuspendsClaiming() bool {
+	if h == nil {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(h.Status))
+	return strings.HasPrefix(status, HostStatusPoolPrefix)
 }
 
 // heartbeatResponseBody is the JSON the platform sends back from the
@@ -501,6 +547,7 @@ func (h *HeartbeatService) callEndpoint(
 	url := strings.TrimRight(h.opts.OrchestratorURL, "/") + "/api/workers/" + workerID + "/heartbeat"
 
 	body := heartbeatRequestBody{
+		Status:                 strings.TrimSpace(string(payload.Status)),
 		ActiveCount:            payload.ActiveSessions,
 		ActiveInteractiveCount: payload.ActiveInteractiveSessions,
 		MaxSessions:            payload.MaxSessions,
