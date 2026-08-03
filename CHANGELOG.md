@@ -6,10 +6,39 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
-## [Unreleased]
+## v0.56.6 — 2026-08-03
+
+### Features
+
+- **Daemon honours control-plane host status in the claim path.** The daemon
+  already received and stored the host-status signal on every heartbeat
+  response, but nothing consulted it before claiming new work. The poll loop
+  now suspends claiming the moment the control plane reports the bound pool
+  as paused, draining, disabled, or deleted; in-flight sessions and the
+  heartbeat loop are untouched, and claiming resumes automatically once
+  status returns to ok. An unrecognised status (including one that carries
+  its own re-registration path) is deliberately not treated as a claim gate,
+  so a newer server can never take a working daemon offline.
+- **Daemon reports its own lifecycle status on the heartbeat.** The daemon
+  computed its idle/busy/draining status on every heartbeat, but the value
+  was dropped before reaching the wire — the struct actually marshalled onto
+  the request body had no field for it. The heartbeat body now carries an
+  optional `status` field.
+- **`pool.deleted` is now handled** instead of falling through to the
+  unsupported-operation default and NACKing on every heartbeat. It now
+  records the host status immediately, so claiming suspends without waiting
+  for the next heartbeat, and ACKs applied.
 
 ### Fixes
 
+- **Interactive sessions honour `Spec.Autonomous`.** The interactive REPL
+  spawn path discarded every `agent.Spec` field except the prompt, so it
+  silently fell back to the CLI's default permission mode instead of mapping
+  `Autonomous` to the same permission flag the headless spawn path has always
+  used. Interactive and headless sessions built from an identical `Spec` now
+  agree on permission posture. **Behaviour change:** interactive sessions
+  dispatched with `Autonomous: true` now run under the same widened
+  permission mode headless sessions already used.
 - **Git auth headers are scoped to the remote they authenticate.**
   `internal/gitexec.HardenedEnv` injected the per-invocation credential as a
   bare `http.extraHeader`, which git applies to *every* HTTP(S) remote — and,
