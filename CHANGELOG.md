@@ -6,6 +6,51 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.57.0 — 2026-08-03
+
+### Features
+
+- **New top-level `host` noun — the commands for *this machine*.** `host` owns
+  the local daemon's lifecycle (`install`, `uninstall`, `setup`, `run`,
+  `status`, `logs`, `doctor`, `pause`, `resume`, `update`, `drain`, `stop`,
+  `stats`, `evict`, `set`) alongside this machine's workarea pool, the
+  providers and kits installed on it, project admission, and the local
+  live-session dashboard (`provider`, `kit`, `workarea`, `project`, `watch`) —
+  20 leaves, pinned by test so a future silent drop fails the build.
+- **`afcli.NewHostCmd(ds, cfg)` is exported.** A composing downstream binary
+  consumes one factory instead of hand-assembling an equivalent tree, and
+  later additions to `host` reach it without a second edit. Each parent gets a
+  fresh tree built from the same constructors: a `cobra.Command` carries a
+  single parent pointer, so one shared instance would corrupt `CommandPath()`
+  and every usage string rendered from it.
+- **`fleet-watch` is now `host watch`** — it has always been a this-host
+  dashboard. `fleet-watch` is retained as a hidden alias.
+
+### Chores
+
+- **`daemon` is now a hidden deprecated alias of `host`**, carrying the
+  identical lifecycle leaves, so every existing `daemon <verb>` invocation
+  keeps working. Its `Deprecated` string names a concrete removal version,
+  **v0.58.0**, rather than "the next release". Alias descendants are
+  deliberately not cobra-`Deprecated` — that would empty `daemon --help`;
+  instead each prints the notice to **stderr** naming the exact replacement
+  path, so `daemon status --json | jq` still parses.
+- **Upgrade hazard for the v0.58.0 alias removal.**
+  `installer/{launchd,systemd}.DaemonSubcommand` now registers
+  `<host-binary> host run` instead of `daemon run`. Service units written by
+  earlier builds still invoke `daemon run` and keep working for the whole alias
+  window, but a unit already on disk is only rewritten by a re-run of
+  `host install` — so the removal release must force (or verify) a re-install
+  first, or the service stops on every machine that has not re-installed. The
+  precondition is documented at the removal-version constant.
+- User-facing strings swept to the new noun: install/uninstall/pause/stop help,
+  the doctor "service is not installed" error, the daemon-unreachable hint
+  (which also pointed at a `daemon start` subcommand that has never existed),
+  the agent worker's provider-probe hint, `README.md`, `daemon/README.md`, and
+  the standalone credentials doc.
+
+---
+
 ## v0.56.6 — 2026-08-03
 
 ### Features
