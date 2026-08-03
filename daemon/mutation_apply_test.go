@@ -280,6 +280,107 @@ func TestApplyPendingMutations_BadOp(t *testing.T) {
 	}
 }
 
+// TestApplyPendingMutations_PoolDeleted covers the op that used to fall
+// through to the unsupported-op default and ACK failed forever. It is now
+// handled locally: the host-status snapshot flips to pool_deleted (which the
+// poll loop's claim gate reads), the candidate pool ids are recorded for the
+// operator, and the mutation ACKs applied.
+func TestApplyPendingMutations_PoolDeleted(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		params         any
+		wantApplied    bool
+		wantErrSubstr  string
+		wantCandidates []string
+		wantAction     string
+	}{
+		{
+			name: "records status and candidates",
+			params: map[string]any{
+				"poolId":           "pool-gone",
+				"candidatePoolIds": []string{"pool-a", " ", "pool-b"},
+				"reason":           "pool deleted by an administrator",
+			},
+			wantApplied:    true,
+			wantCandidates: []string{"pool-a", "pool-b"},
+			wantAction:     "pool deleted by an administrator",
+		},
+		{
+			name:        "no candidates is still applied",
+			params:      map[string]any{"poolId": "pool-gone"},
+			wantApplied: true,
+		},
+		{
+			name:          "missing poolId fails",
+			params:        map[string]any{"candidatePoolIds": []string{"pool-a"}},
+			wantErrSubstr: "requires poolId",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d, _ := newTestDaemonWithProjects(t, nil)
+
+			applied, failures := d.applyPendingMutations(context.Background(), []PendingMutation{
+				{ID: "dmut_pool", Op: "pool.deleted", Params: mustParams(t, tt.params)},
+			})
+
+			if !tt.wantApplied {
+				if len(applied) != 0 {
+					t.Errorf("applied = %v, want none", applied)
+				}
+				if len(failures) != 1 {
+					t.Fatalf("failures = %v, want one", failures)
+				}
+				if !strings.Contains(failures[0].Error, tt.wantErrSubstr) {
+					t.Errorf("failure.Error = %q, want it to contain %q", failures[0].Error, tt.wantErrSubstr)
+				}
+				return
+			}
+
+			for _, f := range failures {
+				if strings.Contains(f.Error, "unsupported mutation op") {
+					t.Fatalf("pool.deleted still ACKs failed as an unsupported op: %q", f.Error)
+				}
+			}
+			if len(failures) != 0 {
+				t.Fatalf("failures = %v, want none", failures)
+			}
+			if len(applied) != 1 || applied[0] != "dmut_pool" {
+				t.Fatalf("applied = %v, want [dmut_pool]", applied)
+			}
+
+			status := d.HostStatus()
+			if status == nil {
+				t.Fatal("host status not recorded")
+			}
+			if status.Status != "pool_deleted" {
+				t.Errorf("host status = %q, want pool_deleted", status.Status)
+			}
+			if !status.SuspendsClaiming() {
+				t.Error("recorded host status does not suspend claiming")
+			}
+			if tt.wantAction != "" && status.RecommendedAction != tt.wantAction {
+				t.Errorf("recommendedAction = %q, want %q", status.RecommendedAction, tt.wantAction)
+			}
+			if status.RecommendedAction == "" {
+				t.Error("recommendedAction is empty; operators need the re-bind guidance")
+			}
+			if len(status.CandidatePoolIDs) != len(tt.wantCandidates) {
+				t.Fatalf("candidatePoolIds = %v, want %v", status.CandidatePoolIDs, tt.wantCandidates)
+			}
+			for i, want := range tt.wantCandidates {
+				if status.CandidatePoolIDs[i] != want {
+					t.Errorf("candidatePoolIds[%d] = %q, want %q", i, status.CandidatePoolIDs[i], want)
+				}
+			}
+		})
+	}
+}
+
 func TestApplyPendingMutations_MissingParams(t *testing.T) {
 	t.Parallel()
 	d, _ := newTestDaemonWithProjects(t, nil)
