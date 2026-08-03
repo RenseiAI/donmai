@@ -27,18 +27,31 @@ type hostWatchSource interface {
 	GetStats(withPool, byMachine bool) (*afclient.DaemonStatsResponse, error)
 }
 
-// newHostWatchCmd constructs the generic `host watch`-style live fleet
-// dashboard command. It is the OSS engine; an embedding binary (which adds a
-// `host` parent + platform-aware framing) wires it under its own command
-// tree. As a standalone donmai command it is exposed as `fleet-watch`.
+// newHostWatchCmd constructs the `host watch` live dashboard command — the
+// live view of the agent sessions running on THIS host, which is why it belongs
+// under the `host` noun. A composing downstream binary grafts the same factory
+// under its own `host` parent.
 //
 // The dashboard is a PURE LOCAL READER: it polls the localhost daemon control
 // API for the live session index and tails each session's on-disk
-// `.agent/events.jsonl` for the stream — it never round-trips the platform,
+// `.agent/events.jsonl` for the stream — it never round-trips a control plane,
 // spawns no child, and its death is invisible to the daemon (out-of-band from
 // execution).
 func newHostWatchCmd() *cobra.Command {
 	return newHostWatchCmdWithSource(nil)
+}
+
+// newFleetWatchAliasCmd returns the hidden, deprecated top-level `fleet-watch`
+// alias of `host watch`. It is a fresh tree (cobra commands carry a single
+// parent), behaviourally identical to the `host watch` instance.
+func newFleetWatchAliasCmd(cfg Config) *cobra.Command {
+	bin := binaryName(cfg)
+	cmd := newHostWatchCmdWithSource(nil)
+	cmd.Use = "fleet-watch"
+	cmd.Short = "Deprecated alias for `" + bin + " host watch`"
+	cmd.Hidden = true
+	deprecateTree(cmd, bin+" host watch", hostAliasRemovalVersion)
+	return cmd
 }
 
 // newHostWatchCmdWithSource is the injectable variant. factory may be nil to
@@ -52,8 +65,8 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 		daemonURL   string
 	)
 	cmd := &cobra.Command{
-		Use:   "fleet-watch",
-		Short: "Live local fleet dashboard for this host's agent sessions",
+		Use:   "watch",
+		Short: "Live dashboard of the agent sessions running on this host",
 		Long: "Launch a per-project live dashboard of all agent work on this host, sourced\n" +
 			"entirely from LOCAL data: the local daemon's session index joined with each\n" +
 			"session's on-disk .agent/events.jsonl stream. It is a pure reader — killing it\n" +
@@ -198,7 +211,7 @@ func runHostWatch(opts hostwatch.Options) error {
 	model := hostwatch.New(opts)
 	p := tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
-		return fmt.Errorf("run fleet-watch: %w", err)
+		return fmt.Errorf("run host watch: %w", err)
 	}
 	return nil
 }

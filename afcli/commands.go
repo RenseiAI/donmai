@@ -29,8 +29,8 @@ type Config struct {
 
 	// EnableLegacyWorkerFleet registers the legacy worker/fleet process
 	// commands when true. These commands remain available to the standalone
-	// OSS af binary for local debugging, but embedders should usually expose
-	// daemon as the host lifecycle surface instead.
+	// OSS af binary for local debugging, but embedders should expose `host`
+	// as the lifecycle surface instead.
 	EnableLegacyWorkerFleet bool
 
 	// ProjectFunc returns the active project slug (or ID) used to scope
@@ -63,7 +63,7 @@ type Config struct {
 
 	// HostBinaryVersion is the version string the embedding binary
 	// reports (typically injected via -ldflags into the main package).
-	// When non-empty, `daemon run` passes it to daemon.Options.Version
+	// When non-empty, `host run` passes it to daemon.Options.Version
 	// so /api/daemon/status reports the running binary's version
 	// instead of donmai's vendored package default. Empty
 	// falls back to the daemon package's own Version var.
@@ -127,7 +127,7 @@ func (c Config) resolveURL() string {
 //
 // This is the primary integration point for downstream CLIs that want
 // to embed Donmai functionality under their own root command
-// (e.g. `mycli agent list`, `mycli daemon status`, etc.).
+// (e.g. `mycli agent list`, `mycli host status`, etc.).
 func RegisterCommands(root *cobra.Command, cfg Config) {
 	// Wrap ClientFactory so every produced client carries the active
 	// org/project scope as `X-Rensei-Org` / `X-Rensei-Project` headers.
@@ -142,6 +142,9 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 		root.AddCommand(newWorkerCmd(ds, cfg))
 		root.AddCommand(newFleetCmd(ds, cfg))
 	}
+	// `host` is the canonical noun for this machine; `daemon` is the hidden
+	// deprecated alias of its lifecycle surface (see host.go).
+	root.AddCommand(newHostCmd(ds, cfg))
 	root.AddCommand(newDaemonCmd(cfg))
 	root.AddCommand(newProjectCmd(cfg))
 	root.AddCommand(newOrchestratorCmd(cfg))
@@ -158,7 +161,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newKitCmd(ds))
 	root.AddCommand(newRoutingCmd(ds))
 	root.AddCommand(newWorkareaCmd(ds))
-	root.AddCommand(newHostWatchCmd())
+	root.AddCommand(newFleetWatchAliasCmd(cfg))
 	if cfg.EnableDashboard {
 		root.AddCommand(newDashboardCmd(cfg))
 	}

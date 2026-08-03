@@ -30,7 +30,7 @@ func binaryName(cfg Config) string {
 // binary is the calling binary name (from binaryName(cfg)).
 func daemonDownErr(binary string, underlying error) error {
 	if isConnectionRefused(underlying) {
-		return fmt.Errorf("daemon is not running — start it with `%s daemon install` then `%s daemon start`", binary, binary)
+		return fmt.Errorf("daemon is not running — install the service with `%s host install`, then verify with `%s host status`", binary, binary)
 	}
 	return fmt.Errorf("daemon unreachable: %w", underlying)
 }

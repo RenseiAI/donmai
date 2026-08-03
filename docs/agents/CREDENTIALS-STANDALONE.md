@@ -11,7 +11,7 @@ credentials from the donmai process per a fixed two-tier precedence:
 | 2          | `${gitRoot}/.env.local`             | Parsed once at donmai startup; never copied into spawned worktrees. |
 | Fail-open  | Redacted stderr warning             | `[creds] no source for KEY — agent may fail` per missing variable.  |
 
-Sources are merged at `daemon run` time into `SpawnerOptions.BaseEnv` so the
+Sources are merged at `host run` time into `SpawnerOptions.BaseEnv` so the
 standard child-spawn path picks them up. Process env wins over `.env.local`, and
 any caller-supplied `BaseEnv` entry (set by daemon code, not the operator) wins
 over both.
@@ -24,7 +24,7 @@ same list on their side; the copies stay in sync manually until the module
 boundary permits a shared import — treat any blocklist edit as a cross-repo
 change and say so in your report.
 
-Operators can pin the mode via `donmai daemon run --standalone-creds=<on|off|auto>`.
+Operators can pin the mode via `donmai host run --standalone-creds=<on|off|auto>`.
 Default `auto` selects `on` when `DONMAI_DAEMON_JWT` is unset (donmai is NOT
 being driven by an external credential socket) and `off` otherwise.
 
