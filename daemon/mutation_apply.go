@@ -83,6 +83,12 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 	if m.Op == "session.kill" {
 		return d.applySessionKill(m)
 	}
+	// pool.deleted is handled before the config lock is taken: it touches no
+	// yaml and it writes the host-status snapshot through setLastHostStatus,
+	// which takes d.mu itself (Go mutexes are not reentrant).
+	if m.Op == "pool.deleted" {
+		return d.applyPoolDeleted(m)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.config == nil {
@@ -148,6 +154,73 @@ func (d *Daemon) applySessionKill(m PendingMutation) error {
 	if err := d.spawner.ForceKillSession(params.SessionID); err != nil {
 		return fmt.Errorf("session.kill: %w", err)
 	}
+	return nil
+}
+
+// applyPoolDeleted handles the `pool.deleted` mutation: the capacity pool this
+// host was bound to has been deleted, and the op carries the pool id, a
+// human-readable reason, and the ids of other pools the host could be bound to
+// instead.
+//
+// What the daemon does: record the state (so the claim gate suspends new
+// claims immediately, without waiting for the next beat's hostStatus to say
+// the same thing), log it once with the candidates for the operator, and ACK
+// applied. In-flight sessions are untouched — a deleted pool means "take on
+// nothing new", never "abandon what you are running".
+//
+// What the daemon deliberately does NOT do: re-bind itself to one of the
+// candidate pools. Pool membership is assigned server-side; the registration
+// wire (RegisterRequest) has no pool-id field, so there is no request this
+// daemon could send that would move it to another pool. Re-binding would mean
+// inventing a client-side flow the server does not implement — exactly the
+// half-working client the layering rules forbid (`011-local-daemon-fleet.md`
+// keeps pool membership on the control-plane side of the daemon contract, and
+// its drain semantics already establish the correct local response to "this
+// host may not take new work": stop claiming, finish what is running).
+// The candidates are therefore reported, not acted on: an operator re-binds
+// the host, and the next heartbeat's hostStatus flips back to ok, which
+// resumes claiming automatically.
+//
+// ACKing applied (rather than failed) is the point of the change: the op is
+// understood and fully handled locally, and a failed ACK would leave the
+// control plane re-queueing a mutation forever.
+func (d *Daemon) applyPoolDeleted(m PendingMutation) error {
+	var params struct {
+		PoolID           string   `json:"poolId"`
+		CandidatePoolIDs []string `json:"candidatePoolIds"`
+		Reason           string   `json:"reason"`
+	}
+	if len(m.Params) > 0 {
+		if err := json.Unmarshal(m.Params, &params); err != nil {
+			return fmt.Errorf("pool.deleted decode params: %w", err)
+		}
+	}
+	params.PoolID = strings.TrimSpace(params.PoolID)
+	if params.PoolID == "" {
+		return fmt.Errorf("pool.deleted requires poolId")
+	}
+	candidates := make([]string, 0, len(params.CandidatePoolIDs))
+	for _, id := range params.CandidatePoolIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			candidates = append(candidates, id)
+		}
+	}
+	action := strings.TrimSpace(params.Reason)
+	if action == "" {
+		action = "This pool was deleted. Re-bind this host to another pool to resume claiming work."
+	}
+	// Same shape the heartbeat's hostStatus carries, so one snapshot serves
+	// both the claim gate and the operator-facing status surface.
+	d.setLastHostStatus(HostStatusDetail{
+		Status:            "pool_deleted",
+		RecommendedAction: action,
+		CandidatePoolIDs:  candidates,
+	})
+	slog.Warn("[daemon-sync] capacity pool deleted — suspending new-work claims",
+		"poolId", params.PoolID,
+		"candidatePoolIds", strings.Join(candidates, ","),
+		"reason", action,
+		"inFlightSessions", "unaffected")
 	return nil
 }
 

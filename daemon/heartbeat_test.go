@@ -949,3 +949,80 @@ func TestHeartbeatPayload_ActiveInteractiveSessionsJSONCompatibility(t *testing.
 		}
 	})
 }
+
+// TestHeartbeatRequestBody_CarriesStatusOnTheWire asserts on the SERIALIZED
+// request body, not on HeartbeatPayload. The daemon computes its lifecycle
+// status every beat, but the struct that is actually marshalled is
+// heartbeatRequestBody — a struct-level assertion on HeartbeatPayload would
+// pass while the value never left the process, which is exactly how the
+// status key came to be silently dropped.
+//
+// The server uses `status` to exclude a draining host from dispatch, and an
+// absent key must stay distinguishable from an empty one: a daemon with
+// nothing to report sends no key at all.
+func TestHeartbeatRequestBody_CarriesStatusOnTheWire(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		status      RegistrationStatus
+		wantPresent bool
+		wantValue   string
+	}{
+		{name: "idle", status: RegistrationIdle, wantPresent: true, wantValue: "idle"},
+		{name: "busy", status: RegistrationBusy, wantPresent: true, wantValue: "busy"},
+		{name: "draining", status: RegistrationDraining, wantPresent: true, wantValue: "draining"},
+		{name: "unreported status omits the key", status: "", wantPresent: false},
+		{name: "whitespace-only status omits the key", status: "   ", wantPresent: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var (
+				mu  sync.Mutex
+				raw []byte
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				buf, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				raw = buf
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+			}))
+			t.Cleanup(srv.Close)
+
+			hs := NewHeartbeatService(HeartbeatOptions{
+				WorkerID:        "wkr_status",
+				Hostname:        "h",
+				OrchestratorURL: srv.URL,
+				RuntimeJWT:      "runtime.jwt.value",
+				IntervalSeconds: 1,
+				GetActiveCount:  func() int { return 0 },
+				GetMaxCount:     func() int { return 1 },
+				GetStatus:       func() RegistrationStatus { return tt.status },
+			})
+			hs.sendOne(context.Background())
+
+			mu.Lock()
+			body := append([]byte(nil), raw...)
+			mu.Unlock()
+			if len(body) == 0 {
+				t.Fatal("heartbeat endpoint received no body")
+			}
+
+			var decoded map[string]any
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatalf("unmarshal request body: %v (%s)", err, body)
+			}
+			got, present := decoded["status"]
+			if present != tt.wantPresent {
+				t.Fatalf("status key present = %v, want %v (body: %s)", present, tt.wantPresent, body)
+			}
+			if tt.wantPresent && got != tt.wantValue {
+				t.Errorf("status = %v, want %q (body: %s)", got, tt.wantValue, body)
+			}
+		})
+	}
+}
