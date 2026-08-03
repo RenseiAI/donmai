@@ -24,7 +24,7 @@ import (
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
-// logRotateCheckInterval is how often a long-lived `daemon run` process
+// logRotateCheckInterval is how often a long-lived `host run` process
 // re-checks the launchd-managed log files for rotation.
 const logRotateCheckInterval = 6 * time.Hour
 
@@ -68,10 +68,10 @@ func rotateDaemonLogs(errOut io.Writer) {
 	}
 }
 
-// newDaemonRunCmd constructs the `daemon run` subcommand. This is the
+// newDaemonRunCmd constructs the `host run` subcommand. This is the
 // long-running entry point registered by the launchd plist / systemd unit.
 //
-// The installer registers `<host-binary> daemon run` as the service entrypoint; this
+// The installer registers `<host-binary> host run` as the service entrypoint; this
 // command is what runs on those service managers.
 func newDaemonRunCmd(hostVersion string) *cobra.Command {
 	var (
@@ -87,7 +87,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 		Use:   "run",
 		Short: "Run the daemon (long-running entry point)",
 		Long: "Start the long-running rensei daemon process.\n\n" +
-			"This is the service entry point registered by `daemon install` —\n" +
+			"This is the service entry point registered by `host install` —\n" +
 			"the launchd plist (macOS) and systemd unit (Linux) call this\n" +
 			"subcommand. It loads ~/.donmai/daemon.yaml, registers with the\n" +
 			"orchestrator, starts the heartbeat loop, and serves the local\n" +
@@ -117,9 +117,9 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// Substitute the well-known DefaultHTTPPort here when the
 			// operator did not pass `--port`. Leaving zero through to
 			// daemon.New would bind an ephemeral port — correct for
-			// tests but wrong for the service-managed `donmai daemon run`
+			// tests but wrong for the service-managed `donmai host run`
 			// entry point operators reach via launchd / systemd, which
-			// must bind 7734 so the `donmai daemon …` CLI surface (and the
+			// must bind 7734 so the `donmai host …` CLI surface (and the
 			// installed plist health checks) can find the daemon.
 			// (Wave 12 / C3 — port-7734 default lives in the cobra
 			// layer, not the runtime.)

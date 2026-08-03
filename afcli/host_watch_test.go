@@ -64,8 +64,8 @@ func TestResolveHostWatchURL(t *testing.T) {
 // cobra command with the expected flags (a thin smoke over the wiring).
 func TestNewHostWatchCmd_Wiring(t *testing.T) {
 	cmd := newHostWatchCmd()
-	if cmd.Use != "fleet-watch" {
-		t.Errorf("Use = %q, want fleet-watch", cmd.Use)
+	if cmd.Use != "watch" {
+		t.Errorf("Use = %q, want watch", cmd.Use)
 	}
 	for _, f := range []string{"project", "all", "replay", "plain", "daemon-url"} {
 		if cmd.Flags().Lookup(f) == nil {

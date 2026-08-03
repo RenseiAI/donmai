@@ -27,9 +27,11 @@ func TestInstall_SkipServiceManager(t *testing.T) {
 		t.Errorf("expected OS=%s, got %s", runtime.GOOS, res.OS)
 	}
 
-	// ServiceCommand must register `daemon run` against the host binary —
-	// the locked service-entrypoint decision.
-	want := "/usr/local/bin/af daemon run"
+	// ServiceCommand must register `host run` against the host binary —
+	// the locked service-entrypoint decision (a subcommand of the host
+	// binary, never a separate daemon binary). The noun moved from `daemon`
+	// to `host` when `daemon` became a deprecated alias.
+	want := "/usr/local/bin/af host run"
 	if !strings.Contains(res.ServiceCommand, want) {
 		t.Errorf("expected ServiceCommand to contain %q, got %q", want, res.ServiceCommand)
 	}

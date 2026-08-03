@@ -44,20 +44,21 @@ func (f *fakeRunner) Run(name string, args ...string) ([]byte, error) {
 	return nil, nil
 }
 
-func TestGeneratePlist_RegistersDaemonRunNotRenseiDaemon(t *testing.T) {
+func TestGeneratePlist_RegistersHostRunNotSeparateDaemonBinary(t *testing.T) {
 	out, err := GeneratePlist("/usr/local/bin/af", "/tmp/o.log", "/tmp/e.log")
 	if err != nil {
 		t.Fatalf("GeneratePlist: %v", err)
 	}
 
-	// Locked decision: ProgramArguments must register the host
-	// binary's `daemon run` subcommand (NOT a separate rensei-daemon
-	// binary, NOT the legacy `start` subcommand).
+	// Locked decision: ProgramArguments must register a subcommand of the
+	// host binary itself (NOT a separate daemon binary, NOT the legacy
+	// `start` subcommand). The noun moved from `daemon run` to `host run`
+	// when `daemon` became a deprecated alias of `host`.
 	if !strings.Contains(out, "<string>/usr/local/bin/af</string>") {
 		t.Errorf("expected host binary path in ProgramArguments, got:\n%s", out)
 	}
-	if !strings.Contains(out, "<string>daemon</string>") || !strings.Contains(out, "<string>run</string>") {
-		t.Errorf("expected `daemon run` subcommand in ProgramArguments, got:\n%s", out)
+	if !strings.Contains(out, "<string>host</string>") || !strings.Contains(out, "<string>run</string>") {
+		t.Errorf("expected `host run` subcommand in ProgramArguments, got:\n%s", out)
 	}
 	if strings.Contains(out, "<string>start</string>") {
 		t.Errorf("plist must NOT register the legacy `start` subcommand, got:\n%s", out)

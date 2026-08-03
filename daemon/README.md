@@ -1,7 +1,8 @@
 # `daemon/` — long-running rensei-daemon runtime
 
 > **Status:** Wave 6 / Phase F.2.8. Public package; the
-> `af daemon …` CLI surface is in `afcli/daemon.go`.
+> `af host …` CLI surface is in `afcli/host.go` (`af daemon …` is a hidden
+> deprecated alias, removed in v0.58.0).
 > **Architecture:** `donmai-architecture/004-sandbox-capability-matrix.md`
 > §Local daemon mode + `011-local-daemon-fleet.md`.
 
@@ -51,8 +52,8 @@ The daemon is a single-machine, multi-project supervisor that:
         └────────────────────┘
 ```
 
-The `af` binary registered by `daemon install` doubles as both the
-daemon supervisor (`af daemon run`) and the per-session worker
+The `af` binary registered by `host install` doubles as both the
+daemon supervisor (`af host run`) and the per-session worker
 (`af agent run`) — the same binary, different subcommands. The
 WorkerCommand defaults to `[<self-exe>, "agent", "run"]` resolved via
 `os.Executable()`; operators rarely override this.
@@ -259,7 +260,7 @@ atomic activation only; it does not imply catalog freshness.
 
 When a session appears wedged in the dashboard:
 
-1. **Daemon log** — `af daemon logs --follow` (default
+1. **Daemon log** — `af host logs --follow` (default
    `~/.rensei/daemon.log`). Look for the `worker spawner` lines
    showing `pid=…` and the matching `[child stdout sessionID=<id>]`
    (INFO) and `[child stderr sessionID=<id>]` (WARN) records from
@@ -274,7 +275,7 @@ When a session appears wedged in the dashboard:
 3. **`af agent run` log** — the worker child writes its own slog
    output to stderr. The daemon's spawner captures both streams
    under `[child stdout|stderr sessionID=<id>]`; the same lines
-   appear inline in `af daemon logs` and in the platform's
+   appear inline in `af host logs` and in the control plane's
    session-activity stream.
 4. **Provider logs** — when the runner reaches step 8 (`spawn
    provider`), the per-provider subprocess is the next layer
@@ -287,7 +288,7 @@ When a session appears wedged in the dashboard:
    to confirm the platform sees the session in the expected state.
    A divergence between the daemon's view (still active) and the
    platform's view (already terminal) usually indicates a missed
-   `result.Post` — re-run `af daemon stats` to see whether the
+   `result.Post` — re-run `af host stats` to see whether the
    poller has retried.
 6. **Worktree state** — `~/.rensei/worktrees/<sessionId>/.agent/`
    contains the per-session `state.json` snapshot and the

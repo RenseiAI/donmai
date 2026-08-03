@@ -80,8 +80,8 @@ make build        # produces bin/donmai
 export LINEAR_API_KEY=lin_api_...
 
 # 2. Start the local daemon (persists across reboots via launchd / systemd)
-donmai daemon install
-donmai daemon status
+donmai host install
+donmai host status
 
 # 3. Pick up Linear backlog issues and dispatch agents
 donmai orchestrator --project MyProject
@@ -205,39 +205,47 @@ donmai session stream <session-id>      # tail activity stream
 donmai session restore-workarea <session-id> --to <dir>
 ```
 
-### `donmai daemon`
+### `donmai host`
 
-Start and manage the local daemon. The daemon installs as a launchd agent
-(macOS) or systemd user unit (Linux) and manages the workarea pool, auto-
-updates, and session lifecycle.
+Manage this machine. `host` owns the local daemon's lifecycle, this machine's
+capacity envelope and workarea pool, the providers and kits installed on it, the
+projects it admits work for, and the live dashboard of sessions running on it.
+The daemon installs as a launchd agent (macOS) or systemd user unit (Linux) and
+manages the workarea pool, auto-updates, and session lifecycle.
+
+`donmai daemon …` still works as a hidden deprecated alias of the lifecycle
+subcommands; it prints a notice on stderr and is removed in v0.58.0.
 
 ```bash
-donmai daemon install [--user | --system]   # write and load the system service
-donmai daemon uninstall                     # remove the system service
-donmai daemon status                        # running / stopped / draining
-donmai daemon start
-donmai daemon stop
-donmai daemon restart
-donmai daemon pause                         # stop accepting new work
-donmai daemon resume
-donmai daemon drain                         # wait for in-flight sessions, then stop
-donmai daemon update                        # force-pull latest release
-donmai daemon doctor                        # health check: config, credentials, disk
-donmai daemon logs [--follow]              # tail daemon log (NDJSON / pretty)
-donmai daemon stats [--pool]               # capacity, sessions, pool state
-donmai daemon setup                        # first-run interactive wizard
-donmai daemon set <key> <value>            # mutate a single config key
-donmai daemon evict --repo <repo> [--older-than <duration>]
+donmai host install [--user | --system]   # write and load the system service
+donmai host uninstall                     # remove the system service
+donmai host status                        # running / stopped / draining
+donmai host stop
+donmai host pause                         # stop accepting new work
+donmai host resume
+donmai host drain                         # wait for in-flight sessions, then stop
+donmai host update                        # force-pull latest release
+donmai host doctor                        # health check: config, credentials, disk
+donmai host logs [--follow]               # tail daemon log (NDJSON / pretty)
+donmai host stats [--pool]                # capacity, sessions, pool state
+donmai host setup                         # first-run interactive wizard
+donmai host set <key> <value>             # mutate a single config key
+donmai host evict --repo <repo> [--older-than <duration>]
+donmai host watch [--all]                 # live dashboard of this host's sessions
+donmai host provider list                 # providers installed on this machine
+donmai host kit list                      # kits installed on this machine
+donmai host workarea list                 # this machine's workarea pool
+donmai host project list                  # projects this machine admits work for
 ```
 
 Supported capacity keys:
 
 ```bash
-donmai daemon set capacity.maxConcurrentSessions <sessions>
-donmai daemon set capacity.poolMaxDiskGb <gb>
+donmai host set capacity.maxConcurrentSessions <sessions>
+donmai host set capacity.poolMaxDiskGb <gb>
 ```
 
-Environment: `DONMAI_DAEMON_TOKEN` (optional — `donmai daemon install` provisions
+Environment: `DONMAI_DAEMON_TOKEN` (optional — `donmai host install` provisions
 this automatically when `~/.config/rensei/config.json` contains a platform key).
 
 ### `donmai governor`
