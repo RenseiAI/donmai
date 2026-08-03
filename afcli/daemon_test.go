@@ -87,11 +87,15 @@ func (m *mockDaemon) SetCapacityConfig(key, value string) (*afclient.SetCapacity
 	return m.setCapResp, m.setCapErr
 }
 
-// newTestDaemonCmd builds the daemon command tree with mock daemon injected.
-// Each call creates an independent command tree — safe for parallel tests.
-func newTestDaemonCmd(mock daemonDoer, args []string) (*bytes.Buffer, error) {
+// newTestHostCmd builds the canonical `host` command tree with a mock daemon
+// injected. Each call creates an independent command tree — safe for parallel
+// tests. The lifecycle leaves it exercises are the same instances the hidden
+// `daemon` alias builds (see addHostLifecycleCommands); host_test.go asserts
+// that parity separately.
+func newTestHostCmd(mock daemonDoer, args []string) (*bytes.Buffer, error) {
 	factory := func(_ afclient.DaemonConfig) daemonDoer { return mock }
-	cmd := newDaemonCmdWithFactory(factory, Config{HostBinaryVersion: "test"})
+	ds := func() afclient.DataSource { return afclient.NewMockClient() }
+	cmd := newHostCmdWithFactory(factory, ds, Config{HostBinaryVersion: "test"})
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
@@ -164,9 +168,9 @@ func TestDaemonInstallHelp(t *testing.T) {
 	}
 }
 
-// TestDaemonInstallInProcessRegistersDaemonRun verifies the install command
+// TestDaemonInstallInProcessRegistersHostRun verifies the install command
 // dispatches to the Go installer in-process — writing a unit/plist that
-// registers `<host-binary> daemon run`.
+// registers `<host-binary> host run`.
 //
 // IMPORTANT: this test passes --skip-service-manager so it never invokes
 // launchctl/systemctl. Without that flag, the underlying installer
@@ -180,7 +184,7 @@ func TestDaemonInstallHelp(t *testing.T) {
 // `~/Library/Logs/rensei/daemon.log`. The launchctl-bootstrap path
 // itself is exercised in installer/launchd/launchd_test.go with a
 // stubbed runner.
-func TestDaemonInstallInProcessRegistersDaemonRun(t *testing.T) {
+func TestDaemonInstallInProcessRegistersHostRun(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 	// Use a fake host binary path to make the assertions deterministic.
@@ -206,8 +210,8 @@ func TestDaemonInstallInProcessRegistersDaemonRun(t *testing.T) {
 	}
 
 	out := buf.String()
-	if !strings.Contains(out, hostBin+" daemon run") {
-		t.Errorf("expected install output to register `<bin> daemon run`, got:\n%s", out)
+	if !strings.Contains(out, hostBin+" host run") {
+		t.Errorf("expected install output to register `<bin> host run`, got:\n%s", out)
 	}
 	if strings.Contains(out, "rensei-daemon install") || strings.Contains(out, "brew install rensei") {
 		t.Errorf("install output should NOT reference the legacy rensei-daemon shell-out, got:\n%s", out)
@@ -487,7 +491,7 @@ func TestDaemonStatusHumanOutput(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{statusResp: fixtureStatusResp()}
-	buf, err := newTestDaemonCmd(mock, []string{"status"})
+	buf, err := newTestHostCmd(mock, []string{"status"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -512,7 +516,7 @@ func TestDaemonStatusJSONOutput(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{statusResp: fixtureStatusResp()}
-	buf, err := newTestDaemonCmd(mock, []string{"status", "--json"})
+	buf, err := newTestHostCmd(mock, []string{"status", "--json"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -532,7 +536,7 @@ func TestDaemonStatusError(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{statusErr: fmt.Errorf("connection refused")}
-	_, err := newTestDaemonCmd(mock, []string{"status"})
+	_, err := newTestHostCmd(mock, []string{"status"})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -548,7 +552,7 @@ func TestDaemonStatsHumanOutput(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{statsResp: fixtureStatsResp()}
-	buf, err := newTestDaemonCmd(mock, []string{"stats"})
+	buf, err := newTestHostCmd(mock, []string{"stats"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -570,7 +574,7 @@ func TestDaemonStatsJSONOutput(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{statsResp: fixtureStatsResp()}
-	buf, err := newTestDaemonCmd(mock, []string{"stats", "--json"})
+	buf, err := newTestHostCmd(mock, []string{"stats", "--json"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -596,7 +600,7 @@ func TestDaemonStatsWithPool(t *testing.T) {
 		TotalDiskUsageMb: 1024,
 	}
 	mock := &mockDaemon{statsResp: resp}
-	buf, err := newTestDaemonCmd(mock, []string{"stats", "--pool"})
+	buf, err := newTestHostCmd(mock, []string{"stats", "--pool"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -625,7 +629,7 @@ func TestDaemonStatsWithByMachine(t *testing.T) {
 		},
 	}
 	mock := &mockDaemon{statsResp: resp}
-	buf, err := newTestDaemonCmd(mock, []string{"stats", "--by-machine"})
+	buf, err := newTestHostCmd(mock, []string{"stats", "--by-machine"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -642,7 +646,7 @@ func TestDaemonStatsError(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{statsErr: fmt.Errorf("daemon unreachable")}
-	_, err := newTestDaemonCmd(mock, []string{"stats"})
+	_, err := newTestHostCmd(mock, []string{"stats"})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -657,7 +661,7 @@ func TestDaemonPauseSuccess(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{actionResp: fixtureActionResp()}
-	buf, err := newTestDaemonCmd(mock, []string{"pause"})
+	buf, err := newTestHostCmd(mock, []string{"pause"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -670,7 +674,7 @@ func TestDaemonPauseError(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{actionErr: fmt.Errorf("daemon offline")}
-	_, err := newTestDaemonCmd(mock, []string{"pause"})
+	_, err := newTestHostCmd(mock, []string{"pause"})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -683,7 +687,7 @@ func TestDaemonPauseRejected(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{actionResp: &afclient.DaemonActionResponse{OK: false, Message: "already paused"}}
-	_, err := newTestDaemonCmd(mock, []string{"pause"})
+	_, err := newTestHostCmd(mock, []string{"pause"})
 	if err == nil {
 		t.Fatal("expected error for rejected action, got nil")
 	}
@@ -698,7 +702,7 @@ func TestDaemonResumeSuccess(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{actionResp: fixtureActionResp()}
-	buf, err := newTestDaemonCmd(mock, []string{"resume"})
+	buf, err := newTestHostCmd(mock, []string{"resume"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -713,7 +717,7 @@ func TestDaemonUpdateSuccess(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{actionResp: fixtureActionResp()}
-	buf, err := newTestDaemonCmd(mock, []string{"update"})
+	buf, err := newTestHostCmd(mock, []string{"update"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -728,7 +732,7 @@ func TestDaemonDrainSuccess(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{actionResp: fixtureActionResp()}
-	buf, err := newTestDaemonCmd(mock, []string{"drain"})
+	buf, err := newTestHostCmd(mock, []string{"drain"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -744,7 +748,7 @@ func TestDaemonDrainTimeout(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{actionResp: fixtureActionResp()}
-	_, err := newTestDaemonCmd(mock, []string{"drain", "--timeout", "120"})
+	_, err := newTestHostCmd(mock, []string{"drain", "--timeout", "120"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -759,7 +763,7 @@ func TestDaemonStopSuccess(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{actionResp: fixtureActionResp()}
-	buf, err := newTestDaemonCmd(mock, []string{"stop"})
+	buf, err := newTestHostCmd(mock, []string{"stop"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -772,7 +776,7 @@ func TestDaemonStopError(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{actionErr: fmt.Errorf("not reachable")}
-	_, err := newTestDaemonCmd(mock, []string{"stop"})
+	_, err := newTestHostCmd(mock, []string{"stop"})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -1192,7 +1196,7 @@ func TestDaemonEvictSuccess(t *testing.T) {
 			CorrelationID: "corr-abc-123",
 		},
 	}
-	buf, err := newTestDaemonCmd(mock, []string{
+	buf, err := newTestHostCmd(mock, []string{
 		"evict", "--repo", "github.com/foo/bar", "--older-than", "24h",
 	})
 	if err != nil {
@@ -1227,7 +1231,7 @@ func TestDaemonEvictJSONOutput(t *testing.T) {
 			CorrelationID: "corr-xyz",
 		},
 	}
-	buf, err := newTestDaemonCmd(mock, []string{
+	buf, err := newTestHostCmd(mock, []string{
 		"evict", "--repo", "github.com/foo/bar", "--older-than", "1h", "--json",
 	})
 	if err != nil {
@@ -1246,7 +1250,7 @@ func TestDaemonEvictMissingRepo(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{}
-	_, err := newTestDaemonCmd(mock, []string{"evict", "--older-than", "1h"})
+	_, err := newTestHostCmd(mock, []string{"evict", "--older-than", "1h"})
 	if err == nil {
 		t.Fatal("expected error when --repo is missing")
 	}
@@ -1259,7 +1263,7 @@ func TestDaemonEvictMissingOlderThan(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{}
-	_, err := newTestDaemonCmd(mock, []string{"evict", "--repo", "github.com/foo/bar"})
+	_, err := newTestHostCmd(mock, []string{"evict", "--repo", "github.com/foo/bar"})
 	if err == nil {
 		t.Fatal("expected error when --older-than is missing")
 	}
@@ -1272,7 +1276,7 @@ func TestDaemonEvictNegativeDuration(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{}
-	_, err := newTestDaemonCmd(mock, []string{
+	_, err := newTestHostCmd(mock, []string{
 		"evict", "--repo", "github.com/foo/bar", "--older-than", "-1h",
 	})
 	if err == nil {
@@ -1284,7 +1288,7 @@ func TestDaemonEvictInvalidDuration(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{}
-	_, err := newTestDaemonCmd(mock, []string{
+	_, err := newTestHostCmd(mock, []string{
 		"evict", "--repo", "github.com/foo/bar", "--older-than", "notaduration",
 	})
 	if err == nil {
@@ -1296,7 +1300,7 @@ func TestDaemonEvictError(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{evictErr: fmt.Errorf("pool not available")}
-	_, err := newTestDaemonCmd(mock, []string{
+	_, err := newTestHostCmd(mock, []string{
 		"evict", "--repo", "github.com/foo/bar", "--older-than", "24h",
 	})
 	if err == nil {
@@ -1358,7 +1362,7 @@ func TestDaemonSetCapacitySuccess(t *testing.T) {
 	}
 	// Use a temp config path to avoid touching real ~/.donmai/daemon.yaml.
 	tmpDir := t.TempDir()
-	buf, err := newTestDaemonCmd(mock, []string{
+	buf, err := newTestHostCmd(mock, []string{
 		"set", "capacity.poolMaxDiskGb", "50",
 		"--config", tmpDir + "/daemon.yaml",
 	})
@@ -1389,7 +1393,7 @@ func TestDaemonSetMaxConcurrentSessionsSuccess(t *testing.T) {
 		},
 	}
 	tmpDir := t.TempDir()
-	buf, err := newTestDaemonCmd(mock, []string{
+	buf, err := newTestHostCmd(mock, []string{
 		"set", "capacity.maxConcurrentSessions", "6",
 		"--config", tmpDir + "/daemon.yaml",
 	})
@@ -1423,7 +1427,7 @@ func TestDaemonSetCapacityJSONOutput(t *testing.T) {
 		},
 	}
 	tmpDir := t.TempDir()
-	buf, err := newTestDaemonCmd(mock, []string{
+	buf, err := newTestHostCmd(mock, []string{
 		"set", "capacity.poolMaxDiskGb", "100",
 		"--config", tmpDir + "/daemon.yaml",
 		"--json",
@@ -1444,7 +1448,7 @@ func TestDaemonSetCapacityUnknownKey(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{}
-	_, err := newTestDaemonCmd(mock, []string{"set", "capacity.unknownField", "42"})
+	_, err := newTestHostCmd(mock, []string{"set", "capacity.unknownField", "42"})
 	if err == nil {
 		t.Fatal("expected error for unknown key")
 	}
@@ -1457,7 +1461,7 @@ func TestDaemonSetCapacityNegativeValue(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{}
-	_, err := newTestDaemonCmd(mock, []string{"set", "capacity.poolMaxDiskGb", "-5"})
+	_, err := newTestHostCmd(mock, []string{"set", "capacity.poolMaxDiskGb", "-5"})
 	if err == nil {
 		t.Fatal("expected error for negative value")
 	}
@@ -1467,7 +1471,7 @@ func TestDaemonSetCapacityNonIntegerValue(t *testing.T) {
 	t.Parallel()
 
 	mock := &mockDaemon{}
-	_, err := newTestDaemonCmd(mock, []string{"set", "capacity.poolMaxDiskGb", "notanumber"})
+	_, err := newTestHostCmd(mock, []string{"set", "capacity.poolMaxDiskGb", "notanumber"})
 	if err == nil {
 		t.Fatal("expected error for non-integer value")
 	}
@@ -1480,7 +1484,7 @@ func TestDaemonSetCapacityDaemonNotReachable(t *testing.T) {
 	// the command should succeed (YAML was already written).
 	mock := &mockDaemon{setCapErr: fmt.Errorf("connection refused")}
 	tmpDir := t.TempDir()
-	buf, err := newTestDaemonCmd(mock, []string{
+	buf, err := newTestHostCmd(mock, []string{
 		"set", "capacity.poolMaxDiskGb", "20",
 		"--config", tmpDir + "/daemon.yaml",
 	})
@@ -1504,7 +1508,7 @@ func TestDaemonSetCapacityRejected(t *testing.T) {
 		},
 	}
 	tmpDir := t.TempDir()
-	_, err := newTestDaemonCmd(mock, []string{
+	_, err := newTestHostCmd(mock, []string{
 		"set", "capacity.poolMaxDiskGb", "999",
 		"--config", tmpDir + "/daemon.yaml",
 	})
@@ -1595,7 +1599,7 @@ func TestDaemonStatsPoolPerKeyBreakdown(t *testing.T) {
 		},
 	}
 	mock := &mockDaemon{statsResp: resp}
-	buf, err := newTestDaemonCmd(mock, []string{"stats", "--pool"})
+	buf, err := newTestHostCmd(mock, []string{"stats", "--pool"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}

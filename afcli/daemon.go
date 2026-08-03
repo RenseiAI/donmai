@@ -62,10 +62,10 @@ func expandHomePath(path string) string {
 	return filepath.Join(home, path[2:])
 }
 
-// newDaemonCmd constructs the `daemon` parent command. It holds no logic of
-// its own; it dispatches to subcommands that manage the local donmai-daemon.
-// The factory parameter is the DaemonClient constructor; passing nil selects
-// the production default.
+// newDaemonCmd constructs the hidden, deprecated `daemon` alias of `host`.
+// It carries the identical lifecycle leaves so every existing
+// `<bin> daemon <verb>` invocation keeps working unchanged; only the
+// deprecation notice is new. The canonical noun is `host` (see host.go).
 //
 // cfg carries the embedding binary's config (HostBinaryVersion, BinaryName, etc.).
 func newDaemonCmd(cfg Config) *cobra.Command {
@@ -74,32 +74,20 @@ func newDaemonCmd(cfg Config) *cobra.Command {
 
 // newDaemonCmdWithFactory is the injectable variant used in tests.
 func newDaemonCmdWithFactory(factory daemonClientFactory, cfg Config) *cobra.Command {
-	hostVersion := cfg.HostBinaryVersion
 	bin := binaryName(cfg)
 	cmd := &cobra.Command{
 		Use:   "daemon",
-		Short: "Manage the local daemon",
-		Long: "Manage the local daemon process that supervises agent session pools.\n\n" +
-			"The daemon replaces the per-workspace `" + bin + " worker` / `" + bin + " fleet` approach.\n" +
-			"Install once, configure once, and sessions run automatically for allowed projects.",
+		Short: "Deprecated alias for `" + bin + " host`",
+		Long: "Deprecated alias for `" + bin + " host`.\n\n" +
+			"Every subcommand below behaves identically to its `" + bin + " host` equivalent.\n" +
+			"Switch to `" + bin + " host` — this alias is removed in " + hostAliasRemovalVersion + ".",
+		Hidden:       true,
 		SilenceUsage: true,
 	}
 
-	cmd.AddCommand(newDaemonInstallCmd(bin))
-	cmd.AddCommand(newDaemonUninstallCmd(bin))
-	cmd.AddCommand(newDaemonSetupCmd())
-	cmd.AddCommand(newDaemonRunCmd(hostVersion))
-	cmd.AddCommand(newDaemonStatusCmd(factory, bin))
-	cmd.AddCommand(newDaemonLogsCmd())
-	cmd.AddCommand(newDaemonDoctorCmd(bin))
-	cmd.AddCommand(newDaemonPauseCmd(factory, bin))
-	cmd.AddCommand(newDaemonResumeCmd(factory))
-	cmd.AddCommand(newDaemonUpdateCmd(factory))
-	cmd.AddCommand(newDaemonDrainCmd(factory))
-	cmd.AddCommand(newDaemonStopCmd(factory, bin))
-	cmd.AddCommand(newDaemonStatsCmd(factory, bin))
-	cmd.AddCommand(newDaemonEvictCmd(factory))
-	cmd.AddCommand(newDaemonSetCmd(factory))
+	addHostLifecycleCommands(cmd, factory, cfg)
+
+	deprecateTree(cmd, bin+" host", hostAliasRemovalVersion)
 
 	return cmd
 }
@@ -117,15 +105,15 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install the daemon as a system service",
-		Long: "Register the " + bin + " binary's `daemon run` subcommand as a launchd (macOS) or\n" +
+		Long: "Register the " + bin + " binary's `host run` subcommand as a launchd (macOS) or\n" +
 			"systemd (Linux) service so it starts automatically at login and survives\n" +
 			"reboots.\n\n" +
 			"This is implemented in-process — no subprocess shell-out.\n\n" +
 			"macOS:\n" +
-			"  " + bin + " daemon install [--bin-path /path/to/" + bin + "]\n\n" +
+			"  " + bin + " host install [--bin-path /path/to/" + bin + "]\n\n" +
 			"Linux:\n" +
-			"  " + bin + " daemon install --user    (user-scoped systemd unit, default)\n" +
-			"  " + bin + " daemon install --system  (system-scoped systemd unit, requires sudo)",
+			"  " + bin + " host install --user    (user-scoped systemd unit, default)\n" +
+			"  " + bin + " host install --system  (system-scoped systemd unit, requires sudo)",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			scope := installer.ScopeUser
@@ -184,7 +172,7 @@ func newDaemonInstallCmd(bin string) *cobra.Command {
 			_, _ = fmt.Fprintln(out)
 			_, _ = fmt.Fprintln(out,
 				"The Go daemon runtime is now in-binary: the registered\n"+
-					"service launches `daemon run` directly. Run `daemon status` to\n"+
+					"service launches `host run` directly. Run `host status` to\n"+
 					"verify the HTTP control API once the service has started.")
 			return nil
 		},
@@ -213,10 +201,10 @@ func newDaemonUninstallCmd(bin string) *cobra.Command {
 		Long: "Remove the launchd (macOS) or systemd (Linux) service registration.\n\n" +
 			"This is implemented in-process — no subprocess shell-out.\n\n" +
 			"macOS:\n" +
-			"  " + bin + " daemon uninstall\n\n" +
+			"  " + bin + " host uninstall\n\n" +
 			"Linux:\n" +
-			"  " + bin + " daemon uninstall --user    (user-scoped systemd unit, default)\n" +
-			"  " + bin + " daemon uninstall --system  (system-scoped systemd unit, requires sudo)",
+			"  " + bin + " host uninstall --user    (user-scoped systemd unit, default)\n" +
+			"  " + bin + " host uninstall --system  (system-scoped systemd unit, requires sudo)",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			scope := installer.ScopeUser
@@ -351,7 +339,7 @@ func newDaemonStatusCmd(factory daemonClientFactory, bin string) *cobra.Command 
 	return cmd
 }
 
-// writeDaemonStatusTable renders a simple ANSI status block for `donmai daemon status`.
+// writeDaemonStatusTable renders a simple ANSI status block for `donmai host status`.
 // Uses plain ANSI (not tui-components primitives — those arrive with the shared theming pass).
 func writeDaemonStatusTable(w io.Writer, r *afclient.DaemonStatusResponse) error {
 	statusColor := ansiColor(r.Status)
@@ -566,7 +554,7 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 				_, _ = fmt.Fprintln(out, report.Detail)
 			}
 			if !report.Installed {
-				return fmt.Errorf("service is not installed — run `%s daemon install`", bin)
+				return fmt.Errorf("service is not installed — run `%s host install`", bin)
 			}
 			return nil
 		},
@@ -580,7 +568,7 @@ func newDaemonDoctorCmd(bin string) *cobra.Command {
 }
 
 // resolveCurrentBinPath returns the absolute path of the currently running
-// executable, or "" if it cannot be resolved. Used by `daemon doctor` to
+// executable, or "" if it cannot be resolved. Used by `host doctor` to
 // report binary-presence based on the actual Go binary the installer
 // would register .
 func resolveCurrentBinPath() string {
@@ -609,7 +597,7 @@ func newDaemonPauseCmd(factory daemonClientFactory, bin string) *cobra.Command {
 		Use:   "pause",
 		Short: "Pause the daemon (stop accepting new sessions)",
 		Long: "Signal the daemon to stop accepting new session assignments while keeping\n" +
-			"currently running sessions alive. Use `" + bin + " daemon resume` to re-enable.",
+			"currently running sessions alive. Use `" + bin + " host resume` to re-enable.",
 		SilenceUsage: true,
 		RunE: daemonActionRunE("pause", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
 			return c.Pause()
@@ -723,7 +711,7 @@ func newDaemonStopCmd(factory daemonClientFactory, bin string) *cobra.Command {
 		Use:   "stop",
 		Short: "Stop the daemon process",
 		Long: "Signal the daemon to stop immediately. In-flight sessions are interrupted.\n" +
-			"Use `" + bin + " daemon drain` first for a graceful shutdown.",
+			"Use `" + bin + " host drain` first for a graceful shutdown.",
 		SilenceUsage: true,
 		RunE: daemonActionRunE("stop", &port, &host, factory, func(c daemonDoer) (*afclient.DaemonActionResponse, error) {
 			return c.Stop()
@@ -961,8 +949,8 @@ func writePoolStatsSection(w io.Writer, p *afclient.WorkareaPoolStats) error {
 
 // ── evict ─────────────────────────────────────────────────────────────────────
 
-// newDaemonEvictCmd returns the `donmai daemon evict` command.
-// Usage: donmai daemon evict --repo <url> --older-than <duration>
+// newDaemonEvictCmd returns the `donmai host evict` command.
+// Usage: donmai host evict --repo <url> --older-than <duration>
 func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 	var (
 		port      int
@@ -1040,14 +1028,14 @@ func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 
 // ── set ───────────────────────────────────────────────────────────────────────
 
-// allowedCapacityKeys is the set of dotted config keys accepted by `donmai daemon set`.
+// allowedCapacityKeys is the set of dotted config keys accepted by `donmai host set`.
 var allowedCapacityKeys = map[string]struct{}{
 	"capacity.maxConcurrentSessions": {},
 	"capacity.poolMaxDiskGb":         {},
 }
 
-// newDaemonSetCmd returns the `donmai daemon set` command.
-// Usage: donmai daemon set <capacity key> <N>
+// newDaemonSetCmd returns the `donmai host set` command.
+// Usage: donmai host set <capacity key> <N>
 func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 	var (
 		port    int
@@ -1245,7 +1233,7 @@ func padRight(s string, w int) string {
 	return s
 }
 
-// formatWorkerStat renders the "Worker:" row of `daemon stats`. Returns a
+// formatWorkerStat renders the "Worker:" row of `host stats`. Returns a
 // short description of the worker id with stub annotation when applicable.
 func formatWorkerStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || r.WorkerID == "" {
@@ -1257,7 +1245,7 @@ func formatWorkerStat(r *afclient.DaemonStatsResponse) string {
 	return r.WorkerID
 }
 
-// formatRegistrationStat renders the "Registration:" row of `daemon stats`.
+// formatRegistrationStat renders the "Registration:" row of `host stats`.
 func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 	if r == nil || r.Registration == nil {
 		return "(unknown)"
@@ -1284,7 +1272,7 @@ func formatRegistrationStat(r *afclient.DaemonStatsResponse) string {
 }
 
 // formatAllowedProjectsStat renders the "Allowed projects:" row of
-// `daemon stats`. The output is the count followed by a comma-separated
+// `host stats`. The output is the count followed by a comma-separated
 // list of applied project IDs (truncated for very long lists). Older daemons
 // that do not expose IDs fall back to repository URLs.
 // bin is the host binary name used in the remediation hint.

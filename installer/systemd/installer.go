@@ -55,9 +55,15 @@ const (
 	DefaultDescription = "Rensei local daemon — worker pool"
 
 	// DaemonSubcommand is the subcommand the host binary registers for the
-	// service entrypoint. The locked decision is to register
-	// `<host-binary> daemon run`, NOT a separate rensei-daemon binary.
-	DaemonSubcommand = "daemon run"
+	// service entrypoint. The locked decision is to register a subcommand of
+	// the host binary itself, NOT a separate daemon binary.
+	//
+	// The noun moved from `daemon run` to `host run` when `daemon` became a
+	// hidden deprecated alias of `host`. Units written by an earlier build
+	// still invoke `daemon run`; that keeps working until the alias is
+	// removed, so an operator must re-run `host install` before upgrading
+	// past that release.
+	DaemonSubcommand = "host run"
 )
 
 // Scope is the systemd unit scope: user or system.

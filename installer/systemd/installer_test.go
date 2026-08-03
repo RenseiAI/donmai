@@ -52,7 +52,7 @@ func TestGenerateUnitFile_User(t *testing.T) {
 		"After=network-online.target",
 		"[Service]",
 		"Type=simple",
-		"ExecStart=/usr/local/bin/af daemon run",
+		"ExecStart=/usr/local/bin/af host run",
 		"Restart=on-failure",
 		"SuccessExitStatus=3",
 		"StandardOutput=journal",
@@ -92,16 +92,16 @@ func TestGenerateUnitFile_System(t *testing.T) {
 	}
 }
 
-func TestGenerateUnitFile_RegistersDaemonRunNotRenseiDaemon(t *testing.T) {
+func TestGenerateUnitFile_RegistersHostRunNotSeparateDaemonBinary(t *testing.T) {
 	out, err := GenerateUnitFile(ScopeUser, "/opt/af", InstallOptions{})
 	if err != nil {
 		t.Fatalf("GenerateUnitFile: %v", err)
 	}
 
-	// Locked decision: ExecStart must be `<host-binary> daemon run`,
+	// Locked decision: ExecStart must be `<host-binary> host run`,
 	// NOT a separate rensei-daemon binary.
-	if !strings.Contains(out, "ExecStart=/opt/af daemon run") {
-		t.Errorf("ExecStart must register the host binary's daemon run subcommand. Got:\n%s", out)
+	if !strings.Contains(out, "ExecStart=/opt/af host run") {
+		t.Errorf("ExecStart must register the host binary's host run subcommand. Got:\n%s", out)
 	}
 	if strings.Contains(out, "ExecStart=/opt/af start") || strings.Contains(out, "rensei-daemon start") {
 		t.Errorf("ExecStart must NOT register the legacy rensei-daemon binary or start subcommand. Got:\n%s", out)
@@ -186,8 +186,8 @@ func TestInstall_WritesUnitFileToTempDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read unit file: %v", err)
 	}
-	if !strings.Contains(string(content), "ExecStart=/usr/local/bin/af daemon run") {
-		t.Errorf("unit file must register `daemon run`, got:\n%s", content)
+	if !strings.Contains(string(content), "ExecStart=/usr/local/bin/af host run") {
+		t.Errorf("unit file must register `host run`, got:\n%s", content)
 	}
 
 	// systemctl should have been called: daemon-reload then enable --now.

@@ -76,9 +76,14 @@ const RenseiDaemonLabel = "dev.rensei.daemon"
 const ExitTimeOutSeconds = 630
 
 // DaemonSubcommand is the subcommand the host binary registers for the
-// LaunchAgent entrypoint. The locked decision is to register
-// `<host-binary> daemon run`, NOT a separate rensei-daemon binary.
-const DaemonSubcommand = "daemon run"
+// LaunchAgent entrypoint. The locked decision is to register a subcommand of
+// the host binary itself, NOT a separate daemon binary.
+//
+// The noun moved from `daemon run` to `host run` when `daemon` became a hidden
+// deprecated alias of `host`. Units written by an earlier build still invoke
+// `daemon run`; that keeps working until the alias is removed, so an operator
+// must re-run `host install` before upgrading past that release.
+const DaemonSubcommand = "host run"
 
 // PlistPath returns the absolute path to the LaunchAgent plist:
 // ~/Library/LaunchAgents/dev.donmai.daemon.plist.
