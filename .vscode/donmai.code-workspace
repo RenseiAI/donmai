@@ -38,7 +38,7 @@
         "split": "Agent Fleet"
       },
       {
-        "name": "AF TUI Dev",
+        "name": "donmai Dev",
         "color": "terminal.ansiYellow",
         "icon": "sparkle",
         "commands": [
@@ -46,32 +46,32 @@
         ]
       },
       {
-        "name": "Claude AF-TUI #1",
+        "name": "Claude donmai #1",
         "color": "terminal.ansiBrightGreen",
         "icon": "squirrel",
         "commands": [
-          "WT=$(./scripts/create-worktree.sh af-tui-1) && cd $WT && claude --dangerously-skip-permissions --remote-control"
+          "WT=$(./scripts/create-worktree.sh donmai-1) && cd $WT && claude --dangerously-skip-permissions --remote-control"
         ]
       },
       {
-        "name": "Claude AF-TUI #2",
+        "name": "Claude donmai #2",
         "color": "terminal.ansiBrightCyan",
         "icon": "squirrel",
         "commands": [
-          "WT=$(./scripts/create-worktree.sh af-tui-2) && cd $WT && claude --dangerously-skip-permissions --remote-control"
+          "WT=$(./scripts/create-worktree.sh donmai-2) && cd $WT && claude --dangerously-skip-permissions --remote-control"
         ]
       },
       {
-        "name": "Codex AF-TUI #3",
+        "name": "Codex donmai #3",
         "color": "terminal.ansiBrightCyan",
         "icon": "squirrel",
-        "commands": ["WT=$(./scripts/create-worktree.sh af-tui-3) && cd $WT && ./scripts/refresh-worktree.sh && codex --dangerously-bypass-approvals-and-sandbox"],
+        "commands": ["WT=$(./scripts/create-worktree.sh donmai-3) && cd $WT && ./scripts/refresh-worktree.sh && codex --dangerously-bypass-approvals-and-sandbox"],
       },
       {
-        "name": "Codex AF-TUI #4",
+        "name": "Codex donmai #4",
         "color": "terminal.ansiBrightCyan",
         "icon": "squirrel",
-        "commands": ["WT=$(./scripts/create-worktree.sh af-tui-4) && cd $WT && ./scripts/refresh-worktree.sh && codex --dangerously-bypass-approvals-and-sandbox"],
+        "commands": ["WT=$(./scripts/create-worktree.sh donmai-4) && cd $WT && ./scripts/refresh-worktree.sh && codex --dangerously-bypass-approvals-and-sandbox"],
       },
     ]
   },

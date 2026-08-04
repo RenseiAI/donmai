@@ -1,4 +1,4 @@
-// Package afclient provides the AgentFactory coordinator API client and types.
+// Package afclient provides the donmai coordinator API client and types.
 package afclient
 
 import (

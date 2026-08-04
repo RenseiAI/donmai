@@ -18,7 +18,7 @@ preCheck:
 postCheck:
   - make build
 instructions: |
-  This is the OSS AgentFactory terminal dashboard built on Charm v2
+  This is the OSS donmai terminal dashboard built on Charm v2
   (bubbletea, lipgloss, bubbles) with Cobra CLI.
   Views are in internal/views/ (dashboard, detail, command palette).
   The root Bubble Tea model in internal/app/ routes between views.

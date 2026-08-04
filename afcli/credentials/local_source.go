@@ -16,7 +16,7 @@
 // in process env or a developer's .env.local.
 //
 // The LocalSource NEVER writes .env.local into the worktree — values stay
-// in the AF-TUI process and are merged into the child env at spawn time
+// in the donmai process and are merged into the child env at spawn time
 // only.
 package credentials
 
@@ -36,17 +36,17 @@ type sourceLabel string
 
 const (
 	// SourceProcess indicates the variable was inherited from
-	// AF-TUI's os.Environ() at LoadLocalSource time.
+	// donmai's os.Environ() at LoadLocalSource time.
 	SourceProcess sourceLabel = "process"
 	// SourceFile indicates the variable came from ${gitRoot}/.env.local.
 	SourceFile sourceLabel = "file"
 )
 
 // LocalSource is the in-memory, immutable view of the standalone-mode
-// credential surface. Construct via LoadLocalSource once at AF-TUI
+// credential surface. Construct via LoadLocalSource once at donmai
 // startup; do not mutate after construction.
 //
-// processEnv is the AF-TUI os.Environ() snapshot at load time.
+// processEnv is the donmai os.Environ() snapshot at load time.
 // fileEnv is the parsed ${gitRoot}/.env.local (may be empty).
 // sources maps each var name to its provenance for diagnostics.
 type LocalSource struct {
@@ -68,8 +68,8 @@ type LocalSource struct {
 //
 // gitRoot is the absolute path of the working directory's git root.
 // When empty, no .env.local lookup is performed; only process env is
-// captured. AF-TUI does NOT walk parent directories — secrets must not
-// bleed across project boundaries when `af` is invoked from a nested
+// captured. donmai does NOT walk parent directories — secrets must not
+// bleed across project boundaries when `donmai` is invoked from a nested
 // repo.
 //
 // Errors only on truly unrecoverable conditions (an os.Open returning a
@@ -137,7 +137,7 @@ func (s *LocalSource) loadEnvLocal(path string) error {
 	// World-readable bits — warn but don't refuse.
 	if info.Mode().Perm()&0o044 != 0 {
 		_, _ = fmt.Fprintf(s.stderr,
-			"AF-TUI: %s is world-readable. Recommend `chmod 600`. Continuing.\n",
+			"donmai: %s is world-readable. Recommend `chmod 600`. Continuing.\n",
 			path,
 		)
 	}
@@ -157,7 +157,7 @@ func (s *LocalSource) loadEnvLocal(path string) error {
 		if !ok {
 			// Strip the value side so a redacted assignment doesn't leak.
 			_, _ = fmt.Fprintf(s.stderr,
-				"AF-TUI: %s line %d malformed, skipping\n",
+				"donmai: %s line %d malformed, skipping\n",
 				path, lineNo,
 			)
 			continue

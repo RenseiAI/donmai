@@ -1,4 +1,4 @@
-// Package queue provides Redis-backed admin clients for the AgentFactory work
+// Package queue provides Redis-backed admin clients for the donmai work
 // queue and merge queue. It mirrors the data structures used by the TypeScript
 // packages/cli/src/lib/queue-admin-runner.ts and merge-queue-runner.ts so the
 // Go CLI can inspect and manipulate the same Redis state.
