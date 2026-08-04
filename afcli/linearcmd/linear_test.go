@@ -18,7 +18,9 @@ package linearcmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -137,6 +139,15 @@ type multiHandler struct {
 	fallback  string
 }
 
+type labelListStub struct {
+	labels map[string]string
+	err    error
+}
+
+func (s labelListStub) ListLabels(context.Context) (map[string]string, error) {
+	return s.labels, s.err
+}
+
 func (h *multiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Query string `json:"query"`
@@ -226,6 +237,151 @@ func TestLinearCreateIssue(t *testing.T) {
 	}
 	if result["title"] != "New Issue" {
 		t.Errorf("title = %v, want New Issue", result["title"])
+	}
+}
+
+func TestResolveLabelIDs(t *testing.T) {
+	tests := []struct {
+		name      string
+		labels    map[string]string
+		listErr   error
+		requested []string
+		wantIDs   []string
+		wantErr   string
+	}{
+		{
+			name:      "all known",
+			labels:    map[string]string{"Bug": "label-bug", "Feature": "label-feature"},
+			requested: []string{"Bug", "Feature"},
+			wantIDs:   []string{"label-bug", "label-feature"},
+		},
+		{
+			name:      "partial unknown fails without partial IDs",
+			labels:    map[string]string{"Bug": "label-bug"},
+			requested: []string{"Bug", "Missing"},
+			wantErr:   "unknown label names: Missing",
+		},
+		{
+			name:      "all unknown names are reported",
+			labels:    map[string]string{"Bug": "label-bug"},
+			requested: []string{"Missing", "Absent"},
+			wantErr:   "unknown label names: Missing, Absent",
+		},
+		{
+			name:      "case insensitive match",
+			labels:    map[string]string{"Needs Human": "label-human"},
+			requested: []string{"needs human"},
+			wantIDs:   []string{"label-human"},
+		},
+		{
+			name:      "unicode simple fold match",
+			labels:    map[string]string{"Σ": "label-sigma"},
+			requested: []string{"ς"},
+			wantIDs:   []string{"label-sigma"},
+		},
+		{
+			name:      "duplicate requested names are de-duplicated case insensitively",
+			labels:    map[string]string{"Bug": "label-bug"},
+			requested: []string{"Bug", "bug", "BUG"},
+			wantIDs:   []string{"label-bug"},
+		},
+		{
+			name:      "label list failure",
+			listErr:   errors.New("upstream unavailable"),
+			requested: []string{"Bug"},
+			wantErr:   "list labels: upstream unavailable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveLabelIDs(context.Background(), labelListStub{labels: tt.labels, err: tt.listErr}, tt.requested)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("resolveLabelIDs error = %v, want %q", err, tt.wantErr)
+				}
+				if got != nil {
+					t.Fatalf("resolveLabelIDs returned partial IDs: %v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveLabelIDs: %v", err)
+			}
+			if len(got) != len(tt.wantIDs) {
+				t.Fatalf("resolved IDs = %v, want %v", got, tt.wantIDs)
+			}
+			for i := range tt.wantIDs {
+				if got[i] != tt.wantIDs[i] {
+					t.Fatalf("resolved IDs = %v, want %v", got, tt.wantIDs)
+				}
+			}
+		})
+	}
+}
+
+func TestLinearCreateIssueDoesNotCreateWithUnknownLabels(t *testing.T) {
+	var createCalls int
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}]}}`)
+		case strings.Contains(req.Query, "ListLabels"):
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"}]}}`)
+		case strings.Contains(req.Query, "CreateIssue"):
+			createCalls++
+			writeLinearGQLData(w, `{}`)
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "create-issue", "--title", "New Issue", "--team", "ENG", "--labels", "Bug,Missing")
+	if err == nil || !strings.Contains(err.Error(), "unknown label names: Missing") {
+		t.Fatalf("create-issue error = %v, want unknown label failure (out: %q)", err, out)
+	}
+	if createCalls != 0 {
+		t.Fatalf("CreateIssue was called %d times after failed label resolution", createCalls)
+	}
+	if out != "" {
+		t.Fatalf("create-issue wrote output after failed label resolution: %q", out)
+	}
+}
+
+func TestLinearUpdateIssueDoesNotUpdateWithUnknownLabels(t *testing.T) {
+	var updateCalls int
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Existing Issue", "Backlog", "team-1", "ENG", "Engineering")
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListLabels"):
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"}]}}`)
+		case strings.Contains(req.Query, "UpdateIssue"):
+			updateCalls++
+			writeLinearGQLData(w, `{}`)
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--labels", "Bug,Missing")
+	if err == nil || !strings.Contains(err.Error(), "unknown label names: Missing") {
+		t.Fatalf("update-issue error = %v, want unknown label failure (out: %q)", err, out)
+	}
+	if updateCalls != 0 {
+		t.Fatalf("UpdateIssue was called %d times after failed label resolution", updateCalls)
+	}
+	if out != "" {
+		t.Fatalf("update-issue wrote output after failed label resolution: %q", out)
 	}
 }
 
