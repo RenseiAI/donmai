@@ -265,7 +265,7 @@ func getBlockingIssues(ctx context.Context, client linear.Linear, issueID string
 		}
 		blocker, err := client.GetIssue(ctx, rel.IssueID)
 		if err != nil {
-			continue // best-effort
+			return nil, fmt.Errorf("get blocking issue %q: %w", rel.IssueID, err)
 		}
 		if blocker.State.Name == "Accepted" {
 			continue
@@ -658,6 +658,9 @@ func newLinearCreateCommentCmd(ds func() afclient.DataSource, bin string) *cobra
 
 func newLinearAddRelationCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var relType string
+	relationTypes := linear.KnownIssueRelationTypes()
+	relationTypeList := strings.Join(relationTypes, ", ")
+	relationTypeUsage := strings.Join(relationTypes, "|")
 
 	cmd := &cobra.Command{
 		Use:          "add-relation <issue-id> <related-issue-id>",
@@ -665,10 +668,10 @@ func newLinearAddRelationCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		Args:         cobra.ExactArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !isValidRelationType(relType) {
+			if !linear.IsKnownIssueRelationType(relType) {
 				return cli.UserError(
-					"--type is required and must be one of: related, blocks, duplicate",
-					"Usage: "+cmd.UseLine()+" --type <related|blocks|duplicate>",
+					"--type is required and must be one of: "+relationTypeList,
+					"Usage: "+cmd.UseLine()+" --type <"+relationTypeUsage+">",
 				)
 			}
 
@@ -705,13 +708,9 @@ func newLinearAddRelationCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		},
 	}
 
-	cmd.Flags().StringVar(&relType, "type", "", "Relation type: related, blocks, or duplicate (required)")
+	cmd.Flags().StringVar(&relType, "type", "", "Relation type: "+relationTypeList+" (required)")
 
 	return cmd
-}
-
-func isValidRelationType(t string) bool {
-	return t == "related" || t == "blocks" || t == "duplicate"
 }
 
 // ─── list-relations ───────────────────────────────────────────────────────────
@@ -1311,7 +1310,7 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 			for _, iss := range issues {
 				blockers, err := getBlockingIssues(ctx, client, iss.ID)
 				if err != nil {
-					blockers = []map[string]any{}
+					return fmt.Errorf("resolve blockers for issue %s: %w", iss.Identifier, err)
 				}
 				if blockers == nil {
 					blockers = []map[string]any{}

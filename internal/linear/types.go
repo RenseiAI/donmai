@@ -174,8 +174,8 @@ type commentNode struct {
 
 // relationNode is the JSON structure for a single relation node.
 type relationNode struct {
-	ID    string `json:"id"`
-	Type  string `json:"type"`
+	ID    string  `json:"id"`
+	Type  *string `json:"type"`
 	Issue *struct {
 		ID         string `json:"id"`
 		Identifier string `json:"identifier"`
@@ -261,14 +261,20 @@ type updateIssueData struct {
 	} `json:"issueUpdate"`
 }
 
+type connectionPageInfo struct {
+	HasNextPage *bool   `json:"hasNextPage"`
+	EndCursor   *string `json:"endCursor"`
+}
+
+type relationConnection struct {
+	Nodes    *[]*relationNode    `json:"nodes"`
+	PageInfo *connectionPageInfo `json:"pageInfo"`
+}
+
 type listRelationsData struct {
-	Issue struct {
-		Relations struct {
-			Nodes []relationNode `json:"nodes"`
-		} `json:"relations"`
-		InverseRelations struct {
-			Nodes []relationNode `json:"nodes"`
-		} `json:"inverseRelations"`
+	Issue *struct {
+		Relations        *relationConnection `json:"relations"`
+		InverseRelations *relationConnection `json:"inverseRelations"`
 	} `json:"issue"`
 }
 
