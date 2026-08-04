@@ -66,6 +66,57 @@ signs:
     cmd: ./scripts/sign-and-notarize.sh
     args:
       - "${artifact}"
+    # Explicitly NOT `${artifact}.sig`. This block emits a human-readable
+    # notarization record, not a detached signature — codesign embeds the real
+    # signature inside the binary. Sigstore owns `.sig` (see cosign-keyless
+    # below), and before this rename both wrote the same path, so which file
+    # shipped depended on signs[] ordering: a reorder would have published a
+    # five-line text file reading "Signature: none" under a name that means
+    # "signature".
+    signature: "${artifact}.codesign.txt"
+    output: true
+
+  # Sigstore keyless signing — covers EVERY archive on EVERY platform, which is
+  # what the macOS signer above cannot do by construction: sign-and-notarize.sh
+  # short-circuits every non-darwin archive with `exit 0`, so before this block
+  # the only thing shipped for Linux was checksums.txt.
+  #
+  # Keyless (OIDC) on purpose: no private key exists to store, rotate, or leak.
+  # The GitHub Actions OIDC token identifies the workflow, cosign records the
+  # certificate in the public Rekor transparency log, and the signer identity is
+  # the workflow ref itself. This requires `id-token: write` on the job.
+  #
+  # Verify a release artifact with:
+  #   cosign verify-blob \
+  #     --certificate donmai_<ver>_linux_amd64.tar.gz.pem \
+  #     --signature   donmai_<ver>_linux_amd64.tar.gz.sig \
+  #     --certificate-identity-regexp '^https://github\.com/RenseiAI/donmai/' \
+  #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  #     donmai_<ver>_linux_amd64.tar.gz
+  - id: cosign-keyless
+    artifacts: archive
+    cmd: cosign
+    args:
+      - sign-blob
+      - "--yes"
+      - "--output-certificate=${signature}.pem"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+    signature: "${artifact}.sig"
+    output: true
+
+  # The checksum manifest is the root of trust for anyone verifying by digest,
+  # so it gets the same treatment as the archives.
+  - id: cosign-keyless-checksums
+    artifacts: checksum
+    cmd: cosign
+    args:
+      - sign-blob
+      - "--yes"
+      - "--output-certificate=${signature}.pem"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+    signature: "${artifact}.sig"
     output: true
 
 homebrew_casks:

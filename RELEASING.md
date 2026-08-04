@@ -178,8 +178,15 @@ Confirm:
 - After a prerelease publication or manual retry of an older tag,
   `/releases/latest` still returns the previously current stable release rather
   than the prerelease or retried tag.
-- All four archives, `checksums.txt`, and expected `.sig` provenance files are
-  attached.
+- All four archives and `checksums.txt` are attached, each with a Sigstore
+  `.sig` + `.pem` pair, plus a `.codesign.txt` notarization record for the
+  darwin archives.
+
+  Note the rename: `.sig` used to be a five-line text file — for linux it
+  literally read `Signature: none` — while being described as "provenance".
+  `.sig` is now a real detached Sigstore signature, and the human-readable
+  notarization record moved to `.codesign.txt`. Do not treat the two as
+  interchangeable.
 - Archive names follow the `donmai_<version>_<os>_<arch>.tar.gz` template.
 - Release notes cover the final `CHANGELOG.md` entry.
 
@@ -189,6 +196,36 @@ Download the assets and verify their checksums:
 gh release download "$tag" --repo RenseiAI/donmai --dir "dist/$tag"
 cd "dist/$tag"
 shasum -a 256 -c checksums.txt
+```
+
+### Verify the Sigstore signatures
+
+Every archive and `checksums.txt` is signed keyless: there is no private key to
+store or rotate. The signer identity is the release workflow itself, recorded in
+the public Rekor transparency log. Verify one with:
+
+```bash
+archive="donmai_${tag#v}_linux_amd64.tar.gz"
+cosign verify-blob \
+  --certificate "$archive.pem" \
+  --signature   "$archive.sig" \
+  --certificate-identity-regexp '^https://github\.com/RenseiAI/donmai/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$archive"
+```
+
+A signature that verifies against any *other* identity is a failure, not a pass —
+always pass both `--certificate-identity-regexp` and `--certificate-oidc-issuer`.
+Omitting them accepts a signature from anyone.
+
+### Verify build provenance
+
+Separate claim from the signature. The signature says "this workflow signed this
+blob"; the attestation says "this artifact was built from this source, at this
+commit, by this workflow":
+
+```bash
+gh attestation verify "$archive" --repo RenseiAI/donmai
 ```
 
 ## Verify the Homebrew cask
