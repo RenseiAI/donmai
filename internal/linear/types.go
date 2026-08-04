@@ -261,14 +261,20 @@ type updateIssueData struct {
 	} `json:"issueUpdate"`
 }
 
+type connectionPageInfo struct {
+	HasNextPage *bool   `json:"hasNextPage"`
+	EndCursor   *string `json:"endCursor"`
+}
+
+type relationConnection struct {
+	Nodes    []relationNode      `json:"nodes"`
+	PageInfo *connectionPageInfo `json:"pageInfo"`
+}
+
 type listRelationsData struct {
-	Issue struct {
-		Relations struct {
-			Nodes []relationNode `json:"nodes"`
-		} `json:"relations"`
-		InverseRelations struct {
-			Nodes []relationNode `json:"nodes"`
-		} `json:"inverseRelations"`
+	Issue *struct {
+		Relations        *relationConnection `json:"relations"`
+		InverseRelations *relationConnection `json:"inverseRelations"`
 	} `json:"issue"`
 }
 
