@@ -233,8 +233,18 @@ func resolveStateID(ctx context.Context, client linear.Linear, teamID, stateName
 	return id, nil
 }
 
-// resolveLabelIDs maps label names to their IDs.
-func resolveLabelIDs(ctx context.Context, client linear.Linear, names []string) ([]string, error) {
+// labelLister is the narrow read contract needed for label resolution.
+// Keeping it narrow makes the resolver independently testable while both
+// create-issue and update-issue continue to use their shared Linear client.
+type labelLister interface {
+	ListLabels(ctx context.Context) (map[string]string, error)
+}
+
+// resolveLabelIDs maps every requested label name to its ID. Resolution is
+// case-insensitive and de-duplicates repeated requested names. It fails closed
+// when any requested name is unavailable so a create or update never silently
+// applies only a subset of the user's labels.
+func resolveLabelIDs(ctx context.Context, client labelLister, names []string) ([]string, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
@@ -242,14 +252,37 @@ func resolveLabelIDs(ctx context.Context, client linear.Linear, names []string) 
 	if err != nil {
 		return nil, fmt.Errorf("list labels: %w", err)
 	}
-	var ids []string
+	ids := make([]string, 0, len(names))
+	unknown := make([]string, 0)
+	seen := make([]string, 0, len(names))
 	for _, name := range names {
-		for labelName, id := range allLabels {
-			if strings.EqualFold(labelName, name) {
-				ids = append(ids, id)
+		duplicate := false
+		for _, seenName := range seen {
+			if strings.EqualFold(seenName, name) {
+				duplicate = true
 				break
 			}
 		}
+		if duplicate {
+			continue
+		}
+		seen = append(seen, name)
+
+		var id string
+		for labelName, labelID := range allLabels {
+			if strings.EqualFold(labelName, name) {
+				id = labelID
+				break
+			}
+		}
+		if id == "" {
+			unknown = append(unknown, name)
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if len(unknown) > 0 {
+		return nil, fmt.Errorf("unknown label names: %s", strings.Join(unknown, ", "))
 	}
 	return ids, nil
 }
