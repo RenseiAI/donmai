@@ -94,13 +94,15 @@ const (
   }
 }`
 
-	queryListRelations = `query ListRelations($issueId: String!) {
+	queryListRelations = `query ListRelations($issueId: String!, $relationsAfter: String, $inverseRelationsAfter: String) {
   issue(id: $issueId) {
-    relations {
+    relations(first: 100, after: $relationsAfter) {
       nodes { id type relatedIssue { id identifier } createdAt }
+      pageInfo { hasNextPage endCursor }
     }
-    inverseRelations {
+    inverseRelations(first: 100, after: $inverseRelationsAfter) {
       nodes { id type issue { id identifier } createdAt }
+      pageInfo { hasNextPage endCursor }
     }
   }
 }`
@@ -195,6 +197,24 @@ type InverseRelationEntry struct {
 	IssueID         string
 	IssueIdentifier string
 	CreatedAt       *time.Time
+}
+
+var knownIssueRelationTypes = []string{"related", "blocks", "duplicate", "similar"}
+
+// KnownIssueRelationTypes returns Linear's supported IssueRelationType values.
+func KnownIssueRelationTypes() []string {
+	return append([]string(nil), knownIssueRelationTypes...)
+}
+
+// IsKnownIssueRelationType reports whether relationType is a supported Linear
+// IssueRelationType. Unknown values must fail closed when reading relations.
+func IsKnownIssueRelationType(relationType string) bool {
+	for _, known := range knownIssueRelationTypes {
+		if relationType == known {
+			return true
+		}
+	}
+	return false
 }
 
 // Client is a lightweight Linear GraphQL client backed by stdlib net/http.
@@ -484,38 +504,138 @@ func (c *Client) GetIssueComments(ctx context.Context, issueID string) ([]Commen
 
 // GetIssueRelations returns forward and inverse relations for the given issue ID.
 func (c *Client) GetIssueRelations(ctx context.Context, issueID string) (*RelationsResult, error) {
-	vars := map[string]any{"issueId": issueID}
-	var data listRelationsData
-	if err := c.do(ctx, queryListRelations, vars, &data); err != nil {
-		return nil, err
+	res := &RelationsResult{IssueID: issueID}
+	var relationsAfter, inverseRelationsAfter *string
+	relationsComplete, inverseRelationsComplete := false, false
+
+	const maxRelationPages = 100
+	for page := 0; page < maxRelationPages; page++ {
+		vars := map[string]any{
+			"issueId":               issueID,
+			"relationsAfter":        relationsAfter,
+			"inverseRelationsAfter": inverseRelationsAfter,
+		}
+		var data listRelationsData
+		if err := c.do(ctx, queryListRelations, vars, &data); err != nil {
+			return nil, err
+		}
+		if data.Issue == nil {
+			return nil, fmt.Errorf("incomplete relations response for issue %q: issue is null", issueID)
+		}
+		if data.Issue.Relations == nil {
+			return nil, fmt.Errorf("incomplete relations response for issue %q: relations connection is missing", issueID)
+		}
+		if data.Issue.InverseRelations == nil {
+			return nil, fmt.Errorf("incomplete relations response for issue %q: inverseRelations connection is missing", issueID)
+		}
+		if data.Issue.Relations.Nodes == nil {
+			return nil, fmt.Errorf("incomplete relations response for issue %q: relations nodes are missing", issueID)
+		}
+		if data.Issue.InverseRelations.Nodes == nil {
+			return nil, fmt.Errorf("incomplete relations response for issue %q: inverseRelations nodes are missing", issueID)
+		}
+
+		if !relationsComplete {
+			for i, n := range *data.Issue.Relations.Nodes {
+				if err := validateRelationNode("relations", i, n, false); err != nil {
+					return nil, fmt.Errorf("incomplete relations response for issue %q: %w", issueID, err)
+				}
+				e := RelationEntry{
+					ID:        n.ID,
+					Type:      *n.Type,
+					CreatedAt: n.CreatedAt,
+				}
+				e.RelatedIssueID = n.RelatedIssue.ID
+				e.RelatedIssueIdentifier = n.RelatedIssue.Identifier
+				res.Relations = append(res.Relations, e)
+			}
+			next, complete, err := nextRelationPage("relations", data.Issue.Relations.PageInfo, relationsAfter)
+			if err != nil {
+				return nil, fmt.Errorf("incomplete relations response for issue %q: %w", issueID, err)
+			}
+			relationsAfter, relationsComplete = next, complete
+		}
+
+		if !inverseRelationsComplete {
+			for i, n := range *data.Issue.InverseRelations.Nodes {
+				if err := validateRelationNode("inverseRelations", i, n, true); err != nil {
+					return nil, fmt.Errorf("incomplete relations response for issue %q: %w", issueID, err)
+				}
+				e := InverseRelationEntry{
+					ID:        n.ID,
+					Type:      *n.Type,
+					CreatedAt: n.CreatedAt,
+				}
+				e.IssueID = n.Issue.ID
+				e.IssueIdentifier = n.Issue.Identifier
+				res.InverseRelations = append(res.InverseRelations, e)
+			}
+			next, complete, err := nextRelationPage("inverseRelations", data.Issue.InverseRelations.PageInfo, inverseRelationsAfter)
+			if err != nil {
+				return nil, fmt.Errorf("incomplete relations response for issue %q: %w", issueID, err)
+			}
+			inverseRelationsAfter, inverseRelationsComplete = next, complete
+		}
+
+		if relationsComplete && inverseRelationsComplete {
+			return res, nil
+		}
 	}
 
-	res := &RelationsResult{IssueID: issueID}
-	for _, n := range data.Issue.Relations.Nodes {
-		e := RelationEntry{
-			ID:        n.ID,
-			Type:      n.Type,
-			CreatedAt: n.CreatedAt,
-		}
-		if n.RelatedIssue != nil {
-			e.RelatedIssueID = n.RelatedIssue.ID
-			e.RelatedIssueIdentifier = n.RelatedIssue.Identifier
-		}
-		res.Relations = append(res.Relations, e)
+	return nil, fmt.Errorf("incomplete relations response for issue %q: exceeded %d pages", issueID, maxRelationPages)
+}
+
+func validateRelationNode(connection string, index int, node *relationNode, inverse bool) error {
+	if node == nil {
+		return fmt.Errorf("%s node %d is null", connection, index)
 	}
-	for _, n := range data.Issue.InverseRelations.Nodes {
-		e := InverseRelationEntry{
-			ID:        n.ID,
-			Type:      n.Type,
-			CreatedAt: n.CreatedAt,
-		}
-		if n.Issue != nil {
-			e.IssueID = n.Issue.ID
-			e.IssueIdentifier = n.Issue.Identifier
-		}
-		res.InverseRelations = append(res.InverseRelations, e)
+	if node.Type == nil {
+		return fmt.Errorf("%s node %d type is missing", connection, index)
 	}
-	return res, nil
+	if *node.Type == "" {
+		return fmt.Errorf("%s node %d type is empty", connection, index)
+	}
+	if !IsKnownIssueRelationType(*node.Type) {
+		return fmt.Errorf("%s node %d has unknown type %q", connection, index, *node.Type)
+	}
+	if node.ID == "" {
+		return fmt.Errorf("%s node %d id is missing", connection, index)
+	}
+	if node.CreatedAt == nil {
+		return fmt.Errorf("%s node %d createdAt is missing", connection, index)
+	}
+	if inverse {
+		if node.Issue == nil {
+			return fmt.Errorf("%s node %d issue is missing", connection, index)
+		}
+		if node.Issue.ID == "" {
+			return fmt.Errorf("%s node %d issue id is missing", connection, index)
+		}
+		return nil
+	}
+	if node.RelatedIssue == nil {
+		return fmt.Errorf("%s node %d relatedIssue is missing", connection, index)
+	}
+	if node.RelatedIssue.ID == "" {
+		return fmt.Errorf("%s node %d relatedIssue id is missing", connection, index)
+	}
+	return nil
+}
+
+func nextRelationPage(name string, pageInfo *connectionPageInfo, current *string) (*string, bool, error) {
+	if pageInfo == nil || pageInfo.HasNextPage == nil {
+		return nil, false, fmt.Errorf("%s pageInfo is missing", name)
+	}
+	if !*pageInfo.HasNextPage {
+		return nil, true, nil
+	}
+	if pageInfo.EndCursor == nil || *pageInfo.EndCursor == "" {
+		return nil, false, fmt.Errorf("%s hasNextPage without endCursor", name)
+	}
+	if current != nil && *current == *pageInfo.EndCursor {
+		return nil, false, fmt.Errorf("%s cursor did not advance", name)
+	}
+	return pageInfo.EndCursor, false, nil
 }
 
 // ListWorkflowStates returns all workflow states for the given team ID.
@@ -748,7 +868,7 @@ func (c *Client) CreateComment(ctx context.Context, issueID, body string) (*Comm
 }
 
 // CreateRelation creates a relation between two issues.
-// relationType must be one of: "related", "blocks", "duplicate".
+// relationType must be one of the values returned by KnownIssueRelationTypes.
 func (c *Client) CreateRelation(ctx context.Context, issueID, relatedIssueID, relationType string) (string, bool, error) {
 	vars := map[string]any{
 		"issueId":        issueID,

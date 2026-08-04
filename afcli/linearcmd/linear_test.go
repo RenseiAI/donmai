@@ -39,6 +39,14 @@ func writeLinearGQLData(w http.ResponseWriter, dataJSON string) {
 	_, _ = fmt.Fprintf(w, `{"data":%s}`, dataJSON)
 }
 
+// writeLinearGQLError writes a GraphQL error envelope with no data payload.
+func writeLinearGQLError(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"errors": []map[string]string{{"message": message}},
+	})
+}
+
 // setupLinearTest sets up a test Linear server.
 // It sets LINEAR_API_KEY to a fixture value, overrides the client base URL,
 // and registers cleanup. Must NOT be called from a parallel test.
@@ -426,40 +434,48 @@ func TestLinearCreateCommentBodyFile(t *testing.T) {
 
 // ─── add-relation ─────────────────────────────────────────────────────────────
 
-func TestLinearAddRelation(t *testing.T) {
-	issue1 := issueNodeJSON("issue-1", "ENG-1", "Issue 1", "Backlog", "team-1", "ENG", "Engineering")
-	issue2 := issueNodeJSON("issue-2", "ENG-2", "Issue 2", "Backlog", "team-1", "ENG", "Engineering")
-	var callCount int
+func TestLinearAddRelationAcceptsEveryKnownType(t *testing.T) {
+	for _, relationType := range linear.KnownIssueRelationTypes() {
+		t.Run(relationType, func(t *testing.T) {
+			issue1 := issueNodeJSON("issue-1", "ENG-1", "Issue 1", "Backlog", "team-1", "ENG", "Engineering")
+			issue2 := issueNodeJSON("issue-2", "ENG-2", "Issue 2", "Backlog", "team-1", "ENG", "Engineering")
+			var callCount int
 
-	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Query string `json:"query"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+			setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
 
-		if strings.Contains(req.Query, "GetIssue") {
-			callCount++
-			if callCount == 1 {
-				writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issue1))
-			} else {
-				writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issue2))
+				if strings.Contains(req.Query, "GetIssue") {
+					callCount++
+					if callCount == 1 {
+						writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issue1))
+					} else {
+						writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issue2))
+					}
+					return
+				}
+				if got := req.Variables["type"]; got != relationType {
+					t.Fatalf("mutation relation type = %v, want %q", got, relationType)
+				}
+				writeLinearGQLData(w, `{"issueRelationCreate":{"success":true,"issueRelation":{"id":"rel-1"}}}`)
+			})
+
+			out, err := runLinearCmd(t, "", "add-relation", "ENG-1", "ENG-2", "--type", relationType)
+			if err != nil {
+				t.Fatalf("add-relation failed: %v\nout: %s", err, out)
 			}
-			return
-		}
-		writeLinearGQLData(w, `{"issueRelationCreate":{"success":true,"issueRelation":{"id":"rel-1","type":"blocks","relatedIssue":{"id":"issue-2","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"}}}`)
-	})
 
-	out, err := runLinearCmd(t, "", "add-relation", "ENG-1", "ENG-2", "--type", "blocks")
-	if err != nil {
-		t.Fatalf("add-relation failed: %v\nout: %s", err, out)
-	}
-
-	result := decodeJSON(t, out)
-	if result["success"] != true {
-		t.Errorf("success = %v, want true", result["success"])
-	}
-	if result["type"] != "blocks" {
-		t.Errorf("type = %v, want blocks", result["type"])
+			result := decodeJSON(t, out)
+			if result["success"] != true {
+				t.Errorf("success = %v, want true", result["success"])
+			}
+			if result["type"] != relationType {
+				t.Errorf("type = %v, want %s", result["type"], relationType)
+			}
+		})
 	}
 }
 
@@ -476,7 +492,7 @@ func TestLinearAddRelationInvalidType(t *testing.T) {
 func TestLinearListRelations(t *testing.T) {
 	relData := `{"issue":{"relations":{"nodes":[
 		{"id":"rel-1","type":"blocks","relatedIssue":{"id":"issue-2","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"}
-	]},"inverseRelations":{"nodes":[]}}}`
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`
 
 	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeLinearGQLData(w, relData)
@@ -501,6 +517,65 @@ func TestLinearListRelations(t *testing.T) {
 	}
 	if rel["relatedIssue"] != "ENG-2" {
 		t.Errorf("relatedIssue = %v, want ENG-2", rel["relatedIssue"])
+	}
+}
+
+func TestLinearListRelationsAcceptsEveryKnownRelationType(t *testing.T) {
+	relData := `{"issue":{"relations":{"nodes":[
+		{"id":"rel-1","type":"related","relatedIssue":{"id":"issue-2","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"rel-2","type":"blocks","relatedIssue":{"id":"issue-3","identifier":"ENG-3"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"rel-3","type":"duplicate","relatedIssue":{"id":"issue-4","identifier":"ENG-4"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"rel-4","type":"similar","relatedIssue":{"id":"issue-5","identifier":"ENG-5"},"createdAt":"2025-01-01T00:00:00Z"}
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[
+		{"id":"inverse-1","type":"related","issue":{"id":"issue-6","identifier":"ENG-6"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"inverse-2","type":"blocks","issue":{"id":"issue-7","identifier":"ENG-7"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"inverse-3","type":"duplicate","issue":{"id":"issue-8","identifier":"ENG-8"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"inverse-4","type":"similar","issue":{"id":"issue-9","identifier":"ENG-9"},"createdAt":"2025-01-01T00:00:00Z"}
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`
+
+	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeLinearGQLData(w, relData)
+	})
+
+	out, err := runLinearCmd(t, "", "list-relations", "ENG-1")
+	if err != nil {
+		t.Fatalf("list-relations failed: %v\nout: %s", err, out)
+	}
+	result := decodeJSON(t, out)
+	relations := result["relations"].([]any)
+	inverseRelations := result["inverseRelations"].([]any)
+	wantTypes := linear.KnownIssueRelationTypes()
+	if len(relations) != len(wantTypes) {
+		t.Fatalf("relations = %v, want all %d known types", relations, len(wantTypes))
+	}
+	if len(inverseRelations) != len(wantTypes) {
+		t.Fatalf("inverseRelations = %v, want all %d known types", inverseRelations, len(wantTypes))
+	}
+	for i, want := range wantTypes {
+		if got := relations[i].(map[string]any)["type"]; got != want {
+			t.Errorf("relations[%d].type = %v, want %q", i, got, want)
+		}
+		if got := inverseRelations[i].(map[string]any)["type"]; got != want {
+			t.Errorf("inverseRelations[%d].type = %v, want %q", i, got, want)
+		}
+	}
+}
+
+func TestLinearListRelationsAcceptsExplicitEmptyArrays(t *testing.T) {
+	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+	})
+
+	out, err := runLinearCmd(t, "", "list-relations", "ENG-1")
+	if err != nil {
+		t.Fatalf("list-relations failed: %v\nout: %s", err, out)
+	}
+	result := decodeJSON(t, out)
+	if relations, ok := result["relations"].([]any); !ok || len(relations) != 0 {
+		t.Fatalf("relations = %v, want []", result["relations"])
+	}
+	if inverse, ok := result["inverseRelations"].([]any); !ok || len(inverse) != 0 {
+		t.Fatalf("inverseRelations = %v, want []", result["inverseRelations"])
 	}
 }
 
@@ -686,7 +761,7 @@ func TestLinearCheckBlockedNotBlocked(t *testing.T) {
 	handler := &multiHandler{
 		responses: map[string]string{
 			"GetIssue":      fmt.Sprintf(`{"issue":%s}`, issueJSON),
-			"ListRelations": `{"issue":{"relations":{"nodes":[]},"inverseRelations":{"nodes":[]}}}`,
+			"ListRelations": `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
 		},
 	}
 
@@ -707,14 +782,44 @@ func TestLinearCheckBlockedNotBlocked(t *testing.T) {
 	}
 }
 
+func TestLinearCheckBlockedAcceptsKnownNonBlockingRelationTypes(t *testing.T) {
+	for _, relationType := range linear.KnownIssueRelationTypes() {
+		if relationType == "blocks" {
+			continue
+		}
+		t.Run(relationType, func(t *testing.T) {
+			issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+			relData := fmt.Sprintf(`{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[
+				{"id":"rel-1","type":%q,"issue":{"id":"related-1","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"}
+			],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`, relationType)
+			handler := &multiHandler{
+				responses: map[string]string{
+					"GetIssue":      fmt.Sprintf(`{"issue":%s}`, issueJSON),
+					"ListRelations": relData,
+				},
+			}
+			setupLinearTest(t, handler.ServeHTTP)
+
+			out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
+			if err != nil {
+				t.Fatalf("check-blocked failed: %v\nout: %s", err, out)
+			}
+			result := decodeJSON(t, out)
+			if result["blocked"] != false {
+				t.Errorf("blocked = %v, want false for %s relation", result["blocked"], relationType)
+			}
+		})
+	}
+}
+
 func TestLinearCheckBlockedIsBlocked(t *testing.T) {
 	mainIssue := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
 	blockerIssue := issueNodeJSON("blocker-1", "ENG-99", "Blocker", "In Progress", "team-1", "ENG", "Engineering")
 
 	// inverse relation: ENG-99 blocks ENG-1
-	relData := `{"issue":{"relations":{"nodes":[]},"inverseRelations":{"nodes":[
+	relData := `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[
 		{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}
-	]}}}`
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`
 
 	var callCount int
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
@@ -751,6 +856,324 @@ func TestLinearCheckBlockedIsBlocked(t *testing.T) {
 	b := blockedBy[0].(map[string]any)
 	if b["identifier"] != "ENG-99" {
 		t.Errorf("blocker identifier = %v, want ENG-99", b["identifier"])
+	}
+}
+
+func TestLinearCheckBlockedFailsClosedOnRelationReadError(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if strings.Contains(req.Query, "GetIssue") {
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+			return
+		}
+		writeLinearGQLError(w, "simulated relation read failure")
+	})
+
+	out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
+	if err == nil {
+		t.Fatalf("expected relation read error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), "check blockers: graphql error: simulated relation read failure") {
+		t.Fatalf("error = %q, want contextual relation read failure", err)
+	}
+	if strings.Contains(out, `"blocked":false`) {
+		t.Fatalf("check-blocked emitted a false unblocked result: %s", out)
+	}
+}
+
+func TestLinearCheckBlockedFailsClosedOnBlockerReadError(t *testing.T) {
+	mainIssue := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	relData := `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[
+		{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`
+
+	var getIssueCalls int
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			getIssueCalls++
+			if getIssueCalls == 1 {
+				writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, mainIssue))
+				return
+			}
+			writeLinearGQLError(w, "simulated blocker read failure")
+		case strings.Contains(req.Query, "ListRelations"):
+			writeLinearGQLData(w, relData)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
+	if err == nil {
+		t.Fatalf("expected blocker read error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), `check blockers: get blocking issue "blocker-1": graphql error: simulated blocker read failure`) {
+		t.Fatalf("error = %q, want contextual blocker read failure", err)
+	}
+	if strings.Contains(out, `"blocked":false`) {
+		t.Fatalf("check-blocked emitted a false unblocked result: %s", out)
+	}
+}
+
+type incompleteRelationPayload struct {
+	name string
+	data string
+}
+
+func incompleteRelationPayloads() []incompleteRelationPayload {
+	const createdAt = `"createdAt":"2025-01-01T00:00:00Z"`
+	return []incompleteRelationPayload{
+		{name: "null data", data: `null`},
+		{name: "empty data", data: `{}`},
+		{name: "null issue", data: `{"issue":null}`},
+		{
+			name: "missing relations connection",
+			data: `{"issue":{"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relations connection",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing relations nodes",
+			data: `{"issue":{"relations":{"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null relations nodes",
+			data: `{"issue":{"relations":{"nodes":null,"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relations nodes",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null inverse relations nodes",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":null,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null relation node",
+			data: `{"issue":{"relations":{"nodes":[null],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "empty relation node",
+			data: `{"issue":{"relations":{"nodes":[{}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing relation type",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null relation type",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":null,"relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "empty relation type",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"","relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "unknown relation type",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"future","relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing relation id",
+			data: `{"issue":{"relations":{"nodes":[{"type":"blocks","relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing relation createdAt",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"blocks","relatedIssue":{"id":"issue-2"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "blocks with missing relatedIssue",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"blocks",` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "blocks with null relatedIssue",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"blocks","relatedIssue":null,` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "blocks with missing relatedIssue id",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"blocks","relatedIssue":{"identifier":"ENG-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null inverse relation node",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[null],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "empty inverse relation node",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relation type",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null inverse relation type",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":null,"issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "empty inverse relation type",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"","issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "unknown inverse relation type",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"future","issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relation id",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relation createdAt",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"id":"issue-2"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "inverse blocks with missing issue",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks",` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "inverse blocks with null issue",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":null,` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "inverse blocks with missing issue id",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"identifier":"ENG-99"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+	}
+}
+
+func TestLinearListRelationsFailsClosedOnIncompleteRelationPayloads(t *testing.T) {
+	for _, tt := range incompleteRelationPayloads() {
+		t.Run(tt.name, func(t *testing.T) {
+			setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+				writeLinearGQLData(w, tt.data)
+			})
+
+			out, err := runLinearCmd(t, "", "list-relations", "ENG-1")
+			if err == nil {
+				t.Fatalf("expected incomplete relation response error; out: %s", out)
+			}
+			if !strings.Contains(err.Error(), "incomplete relations response") {
+				t.Fatalf("error = %q, want incomplete response context", err)
+			}
+			if strings.Contains(out, `"relations"`) {
+				t.Fatalf("list-relations emitted an incomplete result: %s", out)
+			}
+		})
+	}
+}
+
+func TestLinearCheckBlockedFailsClosedOnIncompleteRelationPayloads(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	tests := incompleteRelationPayloads()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Query string `json:"query"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				if strings.Contains(req.Query, "GetIssue") {
+					writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+					return
+				}
+				writeLinearGQLData(w, tt.data)
+			})
+
+			out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
+			if err == nil {
+				t.Fatalf("expected incomplete relation response error; out: %s", out)
+			}
+			if !strings.Contains(err.Error(), "incomplete relations response") {
+				t.Fatalf("error = %q, want incomplete response context", err)
+			}
+			if strings.Contains(out, `"blocked":false`) {
+				t.Fatalf("check-blocked emitted a false unblocked result: %s", out)
+			}
+		})
+	}
+}
+
+func TestLinearCheckBlockedFindsBlockerOnLaterRelationPage(t *testing.T) {
+	mainIssue := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	blockerIssue := issueNodeJSON("blocker-1", "ENG-99", "Blocker", "In Progress", "team-1", "ENG", "Engineering")
+	var relationCalls, getIssueCalls int
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			getIssueCalls++
+			if getIssueCalls == 1 {
+				writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, mainIssue))
+				return
+			}
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, blockerIssue))
+		case strings.Contains(req.Query, "ListRelations"):
+			relationCalls++
+			if req.Variables["inverseRelationsAfter"] == nil {
+				writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"inverse-page-1"}}}}`)
+				return
+			}
+			if req.Variables["inverseRelationsAfter"] != "inverse-page-1" {
+				t.Fatalf("inverseRelationsAfter = %v, want inverse-page-1", req.Variables["inverseRelationsAfter"])
+			}
+			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
+	if err != nil {
+		t.Fatalf("check-blocked failed: %v\nout: %s", err, out)
+	}
+	result := decodeJSON(t, out)
+	if result["blocked"] != true {
+		t.Fatalf("blocked = %v, want true", result["blocked"])
+	}
+	if relationCalls != 2 {
+		t.Fatalf("relation page calls = %d, want 2", relationCalls)
+	}
+}
+
+func TestLinearCheckBlockedFailsClosedOnTruncatedRelationPage(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if strings.Contains(req.Query, "GetIssue") {
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+			return
+		}
+		writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":null}}}}`)
+	})
+
+	out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
+	if err == nil {
+		t.Fatalf("expected truncated relation response error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), "inverseRelations hasNextPage without endCursor") {
+		t.Fatalf("error = %q, want unusable cursor context", err)
+	}
+	if strings.Contains(out, `"blocked":false`) {
+		t.Fatalf("check-blocked emitted a false unblocked result: %s", out)
 	}
 }
 
@@ -892,7 +1315,7 @@ func TestLinearListUnblockedBacklog(t *testing.T) {
 		responses: map[string]string{
 			"ListProjects":      proj,
 			"ListBacklogIssues": fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue1),
-			"ListRelations":     `{"issue":{"relations":{"nodes":[]},"inverseRelations":{"nodes":[]}}}`,
+			"ListRelations":     `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
 		},
 	}
 
@@ -910,6 +1333,222 @@ func TestLinearListUnblockedBacklog(t *testing.T) {
 	item := arr[0].(map[string]any)
 	if item["blocked"] != false {
 		t.Errorf("blocked = %v, want false", item["blocked"])
+	}
+}
+
+func TestLinearListUnblockedBacklogAcceptsKnownNonBlockingRelationTypes(t *testing.T) {
+	for _, relationType := range linear.KnownIssueRelationTypes() {
+		if relationType == "blocks" {
+			continue
+		}
+		t.Run(relationType, func(t *testing.T) {
+			proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
+			issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
+			relData := fmt.Sprintf(`{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[
+				{"id":"rel-1","type":%q,"issue":{"id":"related-1","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"}
+			],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`, relationType)
+			handler := &multiHandler{
+				responses: map[string]string{
+					"ListProjects":      proj,
+					"ListBacklogIssues": fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue),
+					"ListRelations":     relData,
+				},
+			}
+			setupLinearTest(t, handler.ServeHTTP)
+
+			out, err := runLinearCmd(t, "", "list-unblocked-backlog", "--project", "TestProject")
+			if err != nil {
+				t.Fatalf("list-unblocked-backlog failed: %v\nout: %s", err, out)
+			}
+			arr := decodeJSONArray(t, out)
+			if len(arr) != 1 || arr[0].(map[string]any)["identifier"] != "ENG-1" {
+				t.Fatalf("output = %v, want the candidate preserved", arr)
+			}
+		})
+	}
+}
+
+func TestLinearListUnblockedBacklogFailsClosedOnRelationReadError(t *testing.T) {
+	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
+	issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, proj)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue))
+		case strings.Contains(req.Query, "ListRelations"):
+			writeLinearGQLError(w, "simulated relation read failure")
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-unblocked-backlog", "--project", "TestProject")
+	if err == nil {
+		t.Fatalf("expected relation read error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), "resolve blockers for issue ENG-1: graphql error: simulated relation read failure") {
+		t.Fatalf("error = %q, want contextual relation read failure", err)
+	}
+	if strings.Contains(out, "ENG-1") {
+		t.Fatalf("list-unblocked-backlog emitted an unchecked candidate: %s", out)
+	}
+}
+
+func TestLinearListUnblockedBacklogFailsClosedOnBlockerReadError(t *testing.T) {
+	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
+	issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
+	relData := `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[
+		{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, proj)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue))
+		case strings.Contains(req.Query, "ListRelations"):
+			writeLinearGQLData(w, relData)
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLError(w, "simulated blocker read failure")
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-unblocked-backlog", "--project", "TestProject")
+	if err == nil {
+		t.Fatalf("expected blocker read error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), `resolve blockers for issue ENG-1: get blocking issue "blocker-1": graphql error: simulated blocker read failure`) {
+		t.Fatalf("error = %q, want contextual blocker read failure", err)
+	}
+	if strings.Contains(out, "ENG-1") {
+		t.Fatalf("list-unblocked-backlog emitted an unchecked candidate: %s", out)
+	}
+}
+
+func TestLinearListUnblockedBacklogFailsClosedOnIncompleteRelationPayloads(t *testing.T) {
+	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
+	issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
+	tests := incompleteRelationPayloads()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Query string `json:"query"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				switch {
+				case strings.Contains(req.Query, "ListProjects"):
+					writeLinearGQLData(w, proj)
+				case strings.Contains(req.Query, "ListBacklogIssues"):
+					writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue))
+				case strings.Contains(req.Query, "ListRelations"):
+					writeLinearGQLData(w, tt.data)
+				default:
+					writeLinearGQLData(w, `{}`)
+				}
+			})
+
+			out, err := runLinearCmd(t, "", "list-unblocked-backlog", "--project", "TestProject")
+			if err == nil {
+				t.Fatalf("expected incomplete relation response error; out: %s", out)
+			}
+			if !strings.Contains(err.Error(), "incomplete relations response") {
+				t.Fatalf("error = %q, want incomplete response context", err)
+			}
+			if strings.Contains(out, "ENG-1") {
+				t.Fatalf("list-unblocked-backlog emitted an unchecked candidate: %s", out)
+			}
+		})
+	}
+}
+
+func TestLinearListUnblockedBacklogFindsBlockerOnLaterRelationPage(t *testing.T) {
+	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
+	issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
+	blockerIssue := issueNodeJSON("blocker-1", "ENG-99", "Blocker", "In Progress", "team-1", "ENG", "Engineering")
+	var relationCalls int
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, proj)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue))
+		case strings.Contains(req.Query, "ListRelations"):
+			relationCalls++
+			if req.Variables["inverseRelationsAfter"] == nil {
+				writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"inverse-page-1"}}}}`)
+				return
+			}
+			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, blockerIssue))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-unblocked-backlog", "--project", "TestProject")
+	if err != nil {
+		t.Fatalf("list-unblocked-backlog failed: %v\nout: %s", err, out)
+	}
+	if arr := decodeJSONArray(t, out); len(arr) != 0 {
+		t.Fatalf("got unchecked candidate output %v, want []", arr)
+	}
+	if relationCalls != 2 {
+		t.Fatalf("relation page calls = %d, want 2", relationCalls)
+	}
+}
+
+func TestLinearListUnblockedBacklogFailsClosedOnTruncatedRelationPage(t *testing.T) {
+	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
+	issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, proj)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue))
+		case strings.Contains(req.Query, "ListRelations"):
+			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":null}}}}`)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-unblocked-backlog", "--project", "TestProject")
+	if err == nil {
+		t.Fatalf("expected truncated relation response error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), "inverseRelations hasNextPage without endCursor") {
+		t.Fatalf("error = %q, want unusable cursor context", err)
+	}
+	if strings.Contains(out, "ENG-1") {
+		t.Fatalf("list-unblocked-backlog emitted an unchecked candidate: %s", out)
 	}
 }
 
@@ -1595,7 +2234,7 @@ func TestLinearListUnblockedBacklogEnvDefaults(t *testing.T) {
 		case strings.Contains(req.Query, "ListBacklogIssues"):
 			writeLinearGQLData(w, `{"issues":{"nodes":[]}}`)
 		case strings.Contains(req.Query, "ListRelations"):
-			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[]},"inverseRelations":{"nodes":[]}}}`)
+			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
 		default:
 			writeLinearGQLData(w, `{}`)
 		}
