@@ -128,7 +128,7 @@ type QueuedWork struct {
 
 	// StageID is the canonical stage id (e.g. "research",
 	// "development", "qa", "acceptance"). Used for log correlation and
-	// surfaced into the agent's env via AGENTFACTORY_STAGE_ID.
+	// surfaced into the agent's env via DONMAI_STAGE_ID.
 	StageID string `json:"stageId,omitempty"`
 
 	// StageBudget is the per-stage runtime budget the runner enforces

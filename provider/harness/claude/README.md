@@ -37,7 +37,7 @@ claude -p \
    [optional: --model, --max-turns, --effort,
               --append-system-prompt, --permission-mode bypassPermissions,
               --allowedTools, --disallowedTools,
-              --mcp-config /tmp/agentfactory-claude-mcp-*.json --strict-mcp-config,
+              --mcp-config /tmp/donmai-claude-mcp-*.json --strict-mcp-config,
               --resume <session-id>]
 ```
 
@@ -123,7 +123,7 @@ attached via a **per-session JSON tmpfile** passed to `--mcp-config`.
 ```
 
 The file lives under `os.TempDir()` with the prefix
-`agentfactory-claude-mcp-`. `Handle.Stop()` removes the tmpfile as
+`donmai-claude-mcp-`. `Handle.Stop()` removes the tmpfile as
 part of cleanup (idempotent). `--strict-mcp-config` is passed
 alongside so the CLI ignores any other host-wide MCP configurations.
 

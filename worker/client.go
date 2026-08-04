@@ -15,7 +15,7 @@ import (
 // afclient because the coordinator's poll endpoint may long-poll.
 const defaultHTTPTimeout = 30 * time.Second
 
-// Client is the HTTP client for the AgentFactory worker protocol. A fresh
+// Client is the HTTP client for the donmai worker protocol. A fresh
 // Client is created with the long-lived provisioning token; after a
 // successful Register call the coordinator-assigned WorkerID and runtime
 // JWT are stored on the Client and used for subsequent Poll/Heartbeat

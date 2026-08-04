@@ -288,16 +288,16 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 	cmd.Flags().IntVar(&port, "port", 0, "HTTP bind port (default: 7734)")
 	cmd.Flags().BoolVar(&skipWizard, "skip-wizard", false, "Skip the first-run setup wizard")
 	cmd.Flags().StringVar(&standaloneCreds, "standalone-creds", "auto",
-		"Standalone credential mode (on|off|auto). When on, AF-TUI seeds child agent env from process env + ${gitRoot}/.env.local. When auto, on is selected when DONMAI_DAEMON_JWT is unset (i.e. not running under rensei-tui).")
+		"Standalone credential mode (on|off|auto). When on, donmai seeds child agent env from process env + ${gitRoot}/.env.local. When auto, on is selected when DONMAI_DAEMON_JWT is unset (i.e. not running under a downstream embedder's credential pipeline).")
 
 	return cmd
 }
 
-// resolveStandaloneCredsMode returns true when AF-TUI should seed agent
+// resolveStandaloneCredsMode returns true when donmai should seed agent
 // env from the LocalSource. Behaviour by flag value:
 //
 //   - "on"   → always seed.
-//   - "off"  → never seed (rensei-tui or other credential pipeline owns env).
+//   - "off"  → never seed (a downstream embedder or other credential pipeline owns env).
 //   - "auto" → seed iff !daemonJWTPresent (no DONMAI_DAEMON_JWT in env).
 //
 // Unknown values fall back to "auto" with a slog.Warn — operators get a
