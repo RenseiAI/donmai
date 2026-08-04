@@ -845,6 +845,22 @@ func TestLinearCheckBlockedFailsClosedOnIncompleteRelationPayloads(t *testing.T)
 			name: "missing inverse relations connection",
 			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
 		},
+		{
+			name: "missing relations nodes",
+			data: `{"issue":{"relations":{"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null relations nodes",
+			data: `{"issue":{"relations":{"nodes":null,"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relations nodes",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null inverse relations nodes",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":null,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1195,6 +1211,22 @@ func TestLinearListUnblockedBacklogFailsClosedOnIncompleteRelationPayloads(t *te
 		{
 			name: "missing inverse relations connection",
 			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing relations nodes",
+			data: `{"issue":{"relations":{"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null relations nodes",
+			data: `{"issue":{"relations":{"nodes":null,"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relations nodes",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null inverse relations nodes",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":null,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
 		},
 	}
 

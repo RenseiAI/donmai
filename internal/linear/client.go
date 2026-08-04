@@ -510,9 +510,15 @@ func (c *Client) GetIssueRelations(ctx context.Context, issueID string) (*Relati
 		if data.Issue.InverseRelations == nil {
 			return nil, fmt.Errorf("incomplete relations response for issue %q: inverseRelations connection is missing", issueID)
 		}
+		if data.Issue.Relations.Nodes == nil {
+			return nil, fmt.Errorf("incomplete relations response for issue %q: relations nodes are missing", issueID)
+		}
+		if data.Issue.InverseRelations.Nodes == nil {
+			return nil, fmt.Errorf("incomplete relations response for issue %q: inverseRelations nodes are missing", issueID)
+		}
 
 		if !relationsComplete {
-			for _, n := range data.Issue.Relations.Nodes {
+			for _, n := range *data.Issue.Relations.Nodes {
 				e := RelationEntry{
 					ID:        n.ID,
 					Type:      n.Type,
@@ -532,7 +538,7 @@ func (c *Client) GetIssueRelations(ctx context.Context, issueID string) (*Relati
 		}
 
 		if !inverseRelationsComplete {
-			for _, n := range data.Issue.InverseRelations.Nodes {
+			for _, n := range *data.Issue.InverseRelations.Nodes {
 				e := InverseRelationEntry{
 					ID:        n.ID,
 					Type:      n.Type,

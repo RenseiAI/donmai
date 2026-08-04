@@ -267,7 +267,7 @@ type connectionPageInfo struct {
 }
 
 type relationConnection struct {
-	Nodes    []relationNode      `json:"nodes"`
+	Nodes    *[]relationNode     `json:"nodes"`
 	PageInfo *connectionPageInfo `json:"pageInfo"`
 }
 
