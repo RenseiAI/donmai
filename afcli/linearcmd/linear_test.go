@@ -39,6 +39,14 @@ func writeLinearGQLData(w http.ResponseWriter, dataJSON string) {
 	_, _ = fmt.Fprintf(w, `{"data":%s}`, dataJSON)
 }
 
+// writeLinearGQLError writes a GraphQL error envelope with no data payload.
+func writeLinearGQLError(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"errors": []map[string]string{{"message": message}},
+	})
+}
+
 // setupLinearTest sets up a test Linear server.
 // It sets LINEAR_API_KEY to a fixture value, overrides the client base URL,
 // and registers cleanup. Must NOT be called from a parallel test.
@@ -754,6 +762,72 @@ func TestLinearCheckBlockedIsBlocked(t *testing.T) {
 	}
 }
 
+func TestLinearCheckBlockedFailsClosedOnRelationReadError(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if strings.Contains(req.Query, "GetIssue") {
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+			return
+		}
+		writeLinearGQLError(w, "simulated relation read failure")
+	})
+
+	out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
+	if err == nil {
+		t.Fatalf("expected relation read error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), "check blockers: graphql error: simulated relation read failure") {
+		t.Fatalf("error = %q, want contextual relation read failure", err)
+	}
+	if strings.Contains(out, `"blocked":false`) {
+		t.Fatalf("check-blocked emitted a false unblocked result: %s", out)
+	}
+}
+
+func TestLinearCheckBlockedFailsClosedOnBlockerReadError(t *testing.T) {
+	mainIssue := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	relData := `{"issue":{"relations":{"nodes":[]},"inverseRelations":{"nodes":[
+		{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}
+	]}}}`
+
+	var getIssueCalls int
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			getIssueCalls++
+			if getIssueCalls == 1 {
+				writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, mainIssue))
+				return
+			}
+			writeLinearGQLError(w, "simulated blocker read failure")
+		case strings.Contains(req.Query, "ListRelations"):
+			writeLinearGQLData(w, relData)
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
+	if err == nil {
+		t.Fatalf("expected blocker read error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), `check blockers: get blocking issue "blocker-1": graphql error: simulated blocker read failure`) {
+		t.Fatalf("error = %q, want contextual blocker read failure", err)
+	}
+	if strings.Contains(out, `"blocked":false`) {
+		t.Fatalf("check-blocked emitted a false unblocked result: %s", out)
+	}
+}
+
 // ─── list-backlog-issues ──────────────────────────────────────────────────────
 
 func TestLinearListBacklogIssues(t *testing.T) {
@@ -910,6 +984,77 @@ func TestLinearListUnblockedBacklog(t *testing.T) {
 	item := arr[0].(map[string]any)
 	if item["blocked"] != false {
 		t.Errorf("blocked = %v, want false", item["blocked"])
+	}
+}
+
+func TestLinearListUnblockedBacklogFailsClosedOnRelationReadError(t *testing.T) {
+	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
+	issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, proj)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue))
+		case strings.Contains(req.Query, "ListRelations"):
+			writeLinearGQLError(w, "simulated relation read failure")
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-unblocked-backlog", "--project", "TestProject")
+	if err == nil {
+		t.Fatalf("expected relation read error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), "resolve blockers for issue ENG-1: graphql error: simulated relation read failure") {
+		t.Fatalf("error = %q, want contextual relation read failure", err)
+	}
+	if strings.Contains(out, "ENG-1") {
+		t.Fatalf("list-unblocked-backlog emitted an unchecked candidate: %s", out)
+	}
+}
+
+func TestLinearListUnblockedBacklogFailsClosedOnBlockerReadError(t *testing.T) {
+	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
+	issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
+	relData := `{"issue":{"relations":{"nodes":[]},"inverseRelations":{"nodes":[
+		{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}
+	]}}}`
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, proj)
+		case strings.Contains(req.Query, "ListBacklogIssues"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue))
+		case strings.Contains(req.Query, "ListRelations"):
+			writeLinearGQLData(w, relData)
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLError(w, "simulated blocker read failure")
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-unblocked-backlog", "--project", "TestProject")
+	if err == nil {
+		t.Fatalf("expected blocker read error; out: %s", out)
+	}
+	if !strings.Contains(err.Error(), `resolve blockers for issue ENG-1: get blocking issue "blocker-1": graphql error: simulated blocker read failure`) {
+		t.Fatalf("error = %q, want contextual blocker read failure", err)
+	}
+	if strings.Contains(out, "ENG-1") {
+		t.Fatalf("list-unblocked-backlog emitted an unchecked candidate: %s", out)
 	}
 }
 

@@ -265,7 +265,7 @@ func getBlockingIssues(ctx context.Context, client linear.Linear, issueID string
 		}
 		blocker, err := client.GetIssue(ctx, rel.IssueID)
 		if err != nil {
-			continue // best-effort
+			return nil, fmt.Errorf("get blocking issue %q: %w", rel.IssueID, err)
 		}
 		if blocker.State.Name == "Accepted" {
 			continue
@@ -1311,7 +1311,7 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 			for _, iss := range issues {
 				blockers, err := getBlockingIssues(ctx, client, iss.ID)
 				if err != nil {
-					blockers = []map[string]any{}
+					return fmt.Errorf("resolve blockers for issue %s: %w", iss.Identifier, err)
 				}
 				if blockers == nil {
 					blockers = []map[string]any{}
