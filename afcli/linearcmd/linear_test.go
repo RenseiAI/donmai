@@ -2004,6 +2004,125 @@ func TestLinearListLabels(t *testing.T) {
 	}
 }
 
+func TestLinearListTeams(t *testing.T) {
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if !strings.Contains(req.Query, "ListTeams") {
+			t.Fatalf("query = %q, want ListTeams", req.Query)
+		}
+		writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-b","key":"B","name":"Beta"},{"id":"team-a","key":"A","name":"Alpha"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+	})
+
+	out, err := runLinearCmd(t, "", "list-teams")
+	if err != nil {
+		t.Fatalf("list-teams failed: %v\nout: %s", err, out)
+	}
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 2 {
+		t.Fatalf("teams = %v, want 2 entries", arr)
+	}
+	first := arr[0].(map[string]any)
+	if first["id"] != "team-a" || first["key"] != "A" || first["name"] != "Alpha" {
+		t.Fatalf("first team = %#v", first)
+	}
+}
+
+func TestLinearListProjectsFlattensMultiTeamMembership(t *testing.T) {
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if !strings.Contains(req.Query, "ListProjects") {
+			t.Fatalf("query = %q, want ListProjects", req.Query)
+		}
+		writeLinearGQLData(w, `{"projects":{"nodes":[
+			{"id":"project-b","name":"Beta","state":"planned","teams":{"nodes":[{"id":"team-2","key":"OPS","name":"Operations"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}},
+			{"id":"project-a","name":"Alpha","state":"started","teams":{"nodes":[{"id":"team-2","key":"OPS","name":"Operations"},{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}
+		],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+	})
+
+	out, err := runLinearCmd(t, "", "list-projects")
+	if err != nil {
+		t.Fatalf("list-projects failed: %v\nout: %s", err, out)
+	}
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 3 {
+		t.Fatalf("projects = %v, want one row per project-team membership", arr)
+	}
+	want := []struct{ id, name, teamKey, state string }{
+		{"project-a", "Alpha", "ENG", "started"},
+		{"project-a", "Alpha", "OPS", "started"},
+		{"project-b", "Beta", "OPS", "planned"},
+	}
+	for i, expected := range want {
+		got := arr[i].(map[string]any)
+		if got["id"] != expected.id || got["name"] != expected.name || got["teamKey"] != expected.teamKey || got["state"] != expected.state {
+			t.Fatalf("project row %d = %#v, want %#v", i, got, expected)
+		}
+	}
+}
+
+func TestLinearListProjectsTeamFilter(t *testing.T) {
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListProjects"):
+			filter, _ := req.Variables["filter"].(map[string]any)
+			accessible, _ := filter["accessibleTeams"].(map[string]any)
+			some, _ := accessible["some"].(map[string]any)
+			id, _ := some["id"].(map[string]any)
+			if id["eq"] != "team-1" {
+				t.Fatalf("project filter = %#v, want team-1", filter)
+			}
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"project-a","name":"Alpha","state":"started","teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"},{"id":"team-2","key":"OPS","name":"Operations"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-projects", "--team", "ENG")
+	if err != nil {
+		t.Fatalf("list-projects --team failed: %v\nout: %s", err, out)
+	}
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 1 {
+		t.Fatalf("projects = %v, want one team-filtered membership", arr)
+	}
+	if got := arr[0].(map[string]any); got["teamKey"] != "ENG" || got["state"] != "started" {
+		t.Fatalf("project = %#v", got)
+	}
+}
+
+func TestLinearListProjectsWritesNoPartialOutputOnFailure(t *testing.T) {
+	var calls int
+	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"project-a","name":"Alpha","state":"started","teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}`)
+			return
+		}
+		writeLinearGQLError(w, "upstream unavailable")
+	})
+
+	out, err := runLinearCmd(t, "", "list-projects")
+	if err == nil || !strings.Contains(err.Error(), "list projects") {
+		t.Fatalf("list-projects error = %v, want contextual failure", err)
+	}
+	if out != "" {
+		t.Fatalf("list-projects wrote partial output: %q", out)
+	}
+}
+
 // ─── apply-label (C4) ────────────────────────────────────────────────────────
 
 func TestLinearApplyLabel(t *testing.T) {
