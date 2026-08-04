@@ -331,7 +331,7 @@ func TestLinearCreateIssueDoesNotCreateWithUnknownLabels(t *testing.T) {
 		case strings.Contains(req.Query, "ListTeams"):
 			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}]}}`)
 		case strings.Contains(req.Query, "ListLabels"):
-			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"}]}}`)
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "CreateIssue"):
 			createCalls++
 			writeLinearGQLData(w, `{}`)
@@ -364,7 +364,7 @@ func TestLinearUpdateIssueDoesNotUpdateWithUnknownLabels(t *testing.T) {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 		case strings.Contains(req.Query, "ListLabels"):
-			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"}]}}`)
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "UpdateIssue"):
 			updateCalls++
 			writeLinearGQLData(w, `{}`)
@@ -1909,7 +1909,7 @@ func TestLinearCreateBlocker(t *testing.T) {
 		case strings.Contains(req.Query, "ListWorkflowStates"):
 			writeLinearGQLData(w, `{"workflowStates":{"nodes":[{"id":"state-icebox","name":"Icebox","type":"triage"}]}}`)
 		case strings.Contains(req.Query, "issueLabels"):
-			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-nh","name":"Needs Human"}]}}`)
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-nh","name":"Needs Human"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "CreateIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issueCreate":{"success":true,"issue":%s}}`, blockerIssue))
 		case strings.Contains(req.Query, "CreateRelation"):
@@ -2135,7 +2135,7 @@ func TestLinearListLabels(t *testing.T) {
 		{"id":"label-1","name":"Bug"},
 		{"id":"label-2","name":"Feature"},
 		{"id":"label-3","name":"Needs Human"}
-	]}}`
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`
 
 	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeLinearGQLData(w, labelsData)
@@ -2157,6 +2157,53 @@ func TestLinearListLabels(t *testing.T) {
 	}
 	if first["id"] != "label-1" {
 		t.Errorf("first label id = %v; want label-1", first["id"])
+	}
+}
+
+func TestLinearListLabelsScopesByTeam(t *testing.T) {
+	var sawLabelFilter map[string]any
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		switch {
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListLabels"):
+			sawLabelFilter, _ = req.Variables["filter"].(map[string]any)
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-1","name":"Bug"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-labels", "--team", "ENG")
+	if err != nil {
+		t.Fatalf("list-labels --team failed: %v\nout: %s", err, out)
+	}
+	if sawLabelFilter == nil {
+		t.Fatal("list-labels --team sent no label filter")
+	}
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 1 || arr[0].(map[string]any)["id"] != "label-1" {
+		t.Fatalf("output = %#v", arr)
+	}
+}
+
+func TestLinearListLabelsHelpDescribesTeamFilter(t *testing.T) {
+	out, err := runLinearCmd(t, "", "list-labels", "--help")
+	if err != nil {
+		t.Fatalf("list-labels --help: %v", err)
+	}
+	if !strings.Contains(out, "Canonical team key or UUID to filter labels") {
+		t.Fatalf("help = %q, want team filter description", out)
+	}
+	if strings.Contains(out, "currently unused") || strings.Contains(out, "labels are org-wide") {
+		t.Fatalf("help retains obsolete team-scope claim: %q", out)
 	}
 }
 
@@ -2285,7 +2332,7 @@ func TestLinearApplyLabel(t *testing.T) {
 	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
 	// Issue already has label "Feature" from issueNodeJSON fixture.
 	// We apply "Bug" which doesn't yet exist on the issue.
-	labelsData := `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"},{"id":"label-1","name":"Feature"}]}}`
+	labelsData := `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"},{"id":"label-1","name":"Feature"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`
 	updatedJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
 
 	var capturedLabelIDs []any
@@ -2337,7 +2384,7 @@ func TestLinearApplyLabelMissingLabel(t *testing.T) {
 
 func TestLinearApplyLabelNotFound(t *testing.T) {
 	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
-	labelsData := `{"issueLabels":{"nodes":[{"id":"label-1","name":"Feature"}]}}`
+	labelsData := `{"issueLabels":{"nodes":[{"id":"label-1","name":"Feature"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`
 
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
 		var req struct {

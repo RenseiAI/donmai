@@ -198,8 +198,8 @@ type workflowStateNode struct {
 
 // labelNode is the JSON structure for a label.
 type labelNode struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID   *string `json:"id"`
+	Name *string `json:"name"`
 }
 
 // userNode is the JSON structure for a user.
@@ -285,6 +285,11 @@ type projectConnection struct {
 	PageInfo *connectionPageInfo `json:"pageInfo"`
 }
 
+type labelConnection struct {
+	Nodes    *[]*labelNode       `json:"nodes"`
+	PageInfo *connectionPageInfo `json:"pageInfo"`
+}
+
 type listRelationsData struct {
 	Issue *struct {
 		Relations        *relationConnection `json:"relations"`
@@ -312,9 +317,7 @@ type listWorkflowStatesData struct {
 }
 
 type listLabelsData struct {
-	IssueLabels struct {
-		Nodes []labelNode `json:"nodes"`
-	} `json:"issueLabels"`
+	IssueLabels *labelConnection `json:"issueLabels"`
 }
 
 type listUsersData struct {
