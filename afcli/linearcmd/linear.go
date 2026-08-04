@@ -97,6 +97,8 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 	cmd.AddCommand(newLinearListUnblockedBacklogCmd(ds, bin))
 	cmd.AddCommand(newLinearCreateBlockerCmd(ds, bin))
 	cmd.AddCommand(newLinearListLabelsCmd(ds, bin))
+	cmd.AddCommand(newLinearListTeamsCmd(ds, bin))
+	cmd.AddCommand(newLinearListProjectsCmd(ds, bin))
 	cmd.AddCommand(newLinearApplyLabelCmd(ds, bin))
 	cmd.AddCommand(newLinearCheckDeploymentCmd(bin))
 
@@ -1597,6 +1599,94 @@ func newLinearCommentCmd(ds func() afclient.DataSource, bin string) *cobra.Comma
 }
 
 // ─── list-labels ──────────────────────────────────────────────────────────────
+
+// newLinearListTeamsCmd provides `list-teams`.
+// It returns a deterministic JSON array of {id, key, name} objects.
+func newLinearListTeamsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
+	return &cobra.Command{
+		Use:          "list-teams",
+		Short:        "List accessible teams",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			client, err := newLinearClient(ds, bin)
+			if err != nil {
+				return err
+			}
+			teams, err := client.ListTeams(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("list teams: %w", err)
+			}
+			sort.Slice(teams, func(i, j int) bool {
+				if teams[i].Key != teams[j].Key {
+					return teams[i].Key < teams[j].Key
+				}
+				if teams[i].Name != teams[j].Name {
+					return teams[i].Name < teams[j].Name
+				}
+				return teams[i].ID < teams[j].ID
+			})
+			return cli.WriteJSON(cmd.OutOrStdout(), teams)
+		},
+	}
+}
+
+// newLinearListProjectsCmd provides `list-projects [--team <key|id>]`.
+// Linear projects may belong to multiple teams, so output is deliberately
+// flattened: each {project, team} membership is one row. This repeats a
+// project ID when needed rather than selecting an arbitrary team key.
+func newLinearListProjectsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
+	var team string
+	type projectEntry struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		TeamKey string `json:"teamKey"`
+		State   string `json:"state"`
+	}
+
+	cmd := &cobra.Command{
+		Use:          "list-projects",
+		Short:        "List accessible projects",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			client, err := newLinearClient(ds, bin)
+			if err != nil {
+				return err
+			}
+			projects, err := client.ListProjects(cmd.Context(), team)
+			if err != nil {
+				return fmt.Errorf("list projects: %w", err)
+			}
+
+			out := make([]projectEntry, 0, len(projects))
+			for _, project := range projects {
+				if len(project.TeamKeys) == 0 {
+					out = append(out, projectEntry{ID: project.ID, Name: project.Name, State: project.State})
+					continue
+				}
+				for _, teamKey := range project.TeamKeys {
+					out = append(out, projectEntry{
+						ID:      project.ID,
+						Name:    project.Name,
+						TeamKey: teamKey,
+						State:   project.State,
+					})
+				}
+			}
+			sort.Slice(out, func(i, j int) bool {
+				if out[i].Name != out[j].Name {
+					return out[i].Name < out[j].Name
+				}
+				if out[i].TeamKey != out[j].TeamKey {
+					return out[i].TeamKey < out[j].TeamKey
+				}
+				return out[i].ID < out[j].ID
+			})
+			return cli.WriteJSON(cmd.OutOrStdout(), out)
+		},
+	}
+	cmd.Flags().StringVar(&team, "team", "", "Canonical team key or UUID to filter projects")
+	return cmd
+}
 
 // newLinearListLabelsCmd provides `list-labels [--team <id>]`.
 // Returns all issue labels as a JSON array of {id, name} objects.

@@ -127,12 +127,24 @@ const (
   users(filter: $filter) { nodes { id name email } }
 }`
 
-	queryListTeams = `query ListTeams($filter: TeamFilter) {
-  teams(filter: $filter) { nodes { id key name } }
+	queryListTeams = `query ListTeams($filter: TeamFilter, $after: String) {
+	  teams(filter: $filter, first: 100, after: $after) {
+	    nodes { id key name }
+	    pageInfo { hasNextPage endCursor }
+	  }
 }`
 
-	queryListProjects = `query ListProjects($filter: ProjectFilter) {
-  projects(filter: $filter) { nodes { id name } }
+	queryListProjects = `query ListProjects($filter: ProjectFilter, $after: String) {
+	  projects(filter: $filter, first: 100, after: $after) {
+	    nodes {
+	      id name state
+	      teams(first: 100) {
+	        nodes { id key name }
+	        pageInfo { hasNextPage endCursor }
+	      }
+	    }
+	    pageInfo { hasNextPage endCursor }
+	  }
 }`
 
 	queryViewer = `query Viewer { viewer { id name email } }`
@@ -622,7 +634,7 @@ func validateRelationNode(connection string, index int, node *relationNode, inve
 	return nil
 }
 
-func nextRelationPage(name string, pageInfo *connectionPageInfo, current *string) (*string, bool, error) {
+func nextConnectionPage(name string, pageInfo *connectionPageInfo, current *string) (*string, bool, error) {
 	if pageInfo == nil || pageInfo.HasNextPage == nil {
 		return nil, false, fmt.Errorf("%s pageInfo is missing", name)
 	}
@@ -636,6 +648,10 @@ func nextRelationPage(name string, pageInfo *connectionPageInfo, current *string
 		return nil, false, fmt.Errorf("%s cursor did not advance", name)
 	}
 	return pageInfo.EndCursor, false, nil
+}
+
+func nextRelationPage(name string, pageInfo *connectionPageInfo, current *string) (*string, bool, error) {
+	return nextConnectionPage(name, pageInfo, current)
 }
 
 // ListWorkflowStates returns all workflow states for the given team ID.
@@ -666,6 +682,206 @@ func (c *Client) ListLabels(ctx context.Context) (map[string]string, error) {
 	return out, nil
 }
 
+const maxCatalogPages = 100
+
+func requiredCatalogString(value *string, field string) (string, error) {
+	if value == nil {
+		return "", fmt.Errorf("%s is missing", field)
+	}
+	if *value == "" {
+		return "", fmt.Errorf("%s is empty", field)
+	}
+	return *value, nil
+}
+
+func catalogTeam(node *teamNode, index int) (Team, error) {
+	if node == nil {
+		return Team{}, fmt.Errorf("teams node %d is null", index)
+	}
+	id, err := requiredCatalogString(node.ID, fmt.Sprintf("teams node %d id", index))
+	if err != nil {
+		return Team{}, err
+	}
+	key, err := requiredCatalogString(node.Key, fmt.Sprintf("teams node %d key", index))
+	if err != nil {
+		return Team{}, err
+	}
+	name, err := requiredCatalogString(node.Name, fmt.Sprintf("teams node %d name", index))
+	if err != nil {
+		return Team{}, err
+	}
+	return Team{ID: id, Key: key, Name: name}, nil
+}
+
+func catalogTeams(connection *teamConnection) ([]Team, error) {
+	if connection == nil {
+		return nil, fmt.Errorf("teams connection is missing")
+	}
+	if connection.Nodes == nil {
+		return nil, fmt.Errorf("teams nodes are missing")
+	}
+	teams := make([]Team, 0, len(*connection.Nodes))
+	for i, node := range *connection.Nodes {
+		team, err := catalogTeam(node, i)
+		if err != nil {
+			return nil, err
+		}
+		teams = append(teams, team)
+	}
+	return teams, nil
+}
+
+func catalogProject(node *projectNode, index int, selectedTeamKey string) (Project, error) {
+	if node == nil {
+		return Project{}, fmt.Errorf("projects node %d is null", index)
+	}
+	id, err := requiredCatalogString(node.ID, fmt.Sprintf("projects node %d id", index))
+	if err != nil {
+		return Project{}, err
+	}
+	name, err := requiredCatalogString(node.Name, fmt.Sprintf("projects node %d name", index))
+	if err != nil {
+		return Project{}, err
+	}
+	state, err := requiredCatalogString(node.State, fmt.Sprintf("projects node %d state", index))
+	if err != nil {
+		return Project{}, err
+	}
+	if node.Teams == nil {
+		return Project{}, fmt.Errorf("project %q teams connection is missing", id)
+	}
+	if node.Teams.Nodes == nil {
+		return Project{}, fmt.Errorf("project %q teams nodes are missing", id)
+	}
+	if _, complete, err := nextConnectionPage("project "+id+" teams", node.Teams.PageInfo, nil); err != nil {
+		return Project{}, err
+	} else if !complete {
+		return Project{}, fmt.Errorf("project %q teams: pagination is not supported", id)
+	}
+
+	memberTeams, err := catalogTeams(node.Teams)
+	if err != nil {
+		return Project{}, fmt.Errorf("project %q: %w", id, err)
+	}
+	teamKeys := make([]string, 0, len(memberTeams))
+	for _, team := range memberTeams {
+		if selectedTeamKey == "" || team.Key == selectedTeamKey {
+			teamKeys = append(teamKeys, team.Key)
+		}
+	}
+	if selectedTeamKey != "" && len(teamKeys) == 0 {
+		return Project{}, fmt.Errorf("project %q is missing selected team %q", id, selectedTeamKey)
+	}
+	return Project{ID: id, Name: name, State: state, TeamKeys: teamKeys}, nil
+}
+
+// ListTeams returns every accessible team. The result is paginated so callers
+// never receive a silently truncated catalog.
+func (c *Client) ListTeams(ctx context.Context) ([]Team, error) {
+	var after *string
+	teams := make([]Team, 0)
+	for page := 0; page < maxCatalogPages; page++ {
+		var data listTeamsData
+		if err := c.do(ctx, queryListTeams, map[string]any{"after": after}, &data); err != nil {
+			return nil, err
+		}
+		pageTeams, err := catalogTeams(data.Teams)
+		if err != nil {
+			return nil, err
+		}
+		next, complete, err := nextConnectionPage("teams", data.Teams.PageInfo, after)
+		if err != nil {
+			return nil, err
+		}
+		teams = append(teams, pageTeams...)
+		if complete {
+			return teams, nil
+		}
+		after = next
+	}
+	return nil, fmt.Errorf("teams: exceeded %d pages", maxCatalogPages)
+}
+
+// ListProjects returns every accessible project. When teamRef is set, it must
+// be a canonical team key or UUID and the result is restricted to that team.
+func (c *Client) ListProjects(ctx context.Context, teamRef string) ([]Project, error) {
+	var (
+		after           *string
+		filter          map[string]any
+		selectedTeamKey string
+	)
+	if teamRef != "" {
+		team, err := c.resolveCatalogTeamKeyOrID(ctx, teamRef)
+		if err != nil {
+			return nil, fmt.Errorf("resolve team for project scope: %w", err)
+		}
+		selectedTeamKey = team.Key
+		filter = map[string]any{
+			"accessibleTeams": map[string]any{
+				"some": map[string]any{
+					"id": map[string]any{"eq": team.ID},
+				},
+			},
+		}
+	}
+
+	projects := make([]Project, 0)
+	for page := 0; page < maxCatalogPages; page++ {
+		var data listProjectsData
+		if err := c.do(ctx, queryListProjects, map[string]any{"filter": filter, "after": after}, &data); err != nil {
+			return nil, err
+		}
+		if data.Projects == nil {
+			return nil, fmt.Errorf("projects connection is missing")
+		}
+		if data.Projects.Nodes == nil {
+			return nil, fmt.Errorf("projects nodes are missing")
+		}
+		pageProjects := make([]Project, 0, len(*data.Projects.Nodes))
+		for i, node := range *data.Projects.Nodes {
+			project, err := catalogProject(node, i, selectedTeamKey)
+			if err != nil {
+				return nil, err
+			}
+			pageProjects = append(pageProjects, project)
+		}
+		next, complete, err := nextConnectionPage("projects", data.Projects.PageInfo, after)
+		if err != nil {
+			return nil, err
+		}
+		projects = append(projects, pageProjects...)
+		if complete {
+			return projects, nil
+		}
+		after = next
+	}
+	return nil, fmt.Errorf("projects: exceeded %d pages", maxCatalogPages)
+}
+
+// resolveCatalogTeamKeyOrID resolves only a canonical team key or UUID. It
+// intentionally excludes display names because names are not a stable routing
+// identifier and can be duplicated.
+func (c *Client) resolveCatalogTeamKeyOrID(ctx context.Context, ref string) (*Team, error) {
+	teams, err := c.ListTeams(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]Team, 0, 1)
+	for _, team := range teams {
+		if (looksLikeID(ref) && strings.EqualFold(team.ID, ref)) || (!looksLikeID(ref) && team.Key == ref) {
+			matches = append(matches, team)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("team key or id %q not found", ref)
+	case 1:
+		return &matches[0], nil
+	default:
+		return nil, fmt.Errorf("team key or id %q is ambiguous", ref)
+	}
+}
+
 // GetTeamByName returns the team identified by the given key, name
 // (case-insensitive), or id/UUID. The platform feeds a team UUID in
 // some dispatch paths, so the resolver matches an `id` predicate too
@@ -681,16 +897,26 @@ func (c *Client) GetTeamByName(ctx context.Context, nameOrKeyOrID string) (*Team
 	}
 	vars := map[string]any{
 		"filter": map[string]any{"or": or},
+		"after":  nil,
 	}
 	var data listTeamsData
 	if err := c.do(ctx, queryListTeams, vars, &data); err != nil {
 		return nil, err
 	}
-	if len(data.Teams.Nodes) == 0 {
+	if data.Teams == nil {
+		return nil, fmt.Errorf("incomplete teams response: teams connection is missing")
+	}
+	if data.Teams.Nodes == nil {
+		return nil, fmt.Errorf("incomplete teams response: teams nodes are missing")
+	}
+	if len(*data.Teams.Nodes) == 0 {
 		return nil, fmt.Errorf("%w: team %q", ErrNotFound, nameOrKeyOrID)
 	}
-	n := data.Teams.Nodes[0]
-	return &Team{ID: n.ID, Key: n.Key, Name: n.Name}, nil
+	team, err := catalogTeam((*data.Teams.Nodes)[0], 0)
+	if err != nil {
+		return nil, fmt.Errorf("incomplete teams response: %w", err)
+	}
+	return &team, nil
 }
 
 // GetProjectByName returns the project with the given name
@@ -727,16 +953,33 @@ func (c *Client) GetProjectByNameInTeam(ctx context.Context, name, teamID string
 			},
 		}
 	}
-	vars := map[string]any{"filter": filter}
+	vars := map[string]any{"filter": filter, "after": nil}
 	var data listProjectsData
 	if err := c.do(ctx, queryListProjects, vars, &data); err != nil {
 		return nil, err
 	}
-	if len(data.Projects.Nodes) == 0 {
+	if data.Projects == nil {
+		return nil, fmt.Errorf("incomplete projects response: projects connection is missing")
+	}
+	if data.Projects.Nodes == nil {
+		return nil, fmt.Errorf("incomplete projects response: projects nodes are missing")
+	}
+	if len(*data.Projects.Nodes) == 0 {
 		return nil, fmt.Errorf("%w: project %q", ErrNotFound, name)
 	}
-	n := data.Projects.Nodes[0]
-	return &Project{ID: n.ID, Name: n.Name}, nil
+	n := (*data.Projects.Nodes)[0]
+	if n == nil {
+		return nil, fmt.Errorf("incomplete projects response: projects node 0 is null")
+	}
+	id, err := requiredCatalogString(n.ID, "projects node 0 id")
+	if err != nil {
+		return nil, fmt.Errorf("incomplete projects response: %w", err)
+	}
+	projectName, err := requiredCatalogString(n.Name, "projects node 0 name")
+	if err != nil {
+		return nil, fmt.Errorf("incomplete projects response: %w", err)
+	}
+	return &Project{ID: id, Name: projectName}, nil
 }
 
 // GetUserByNameOrEmail returns the user matching the given name or email.
