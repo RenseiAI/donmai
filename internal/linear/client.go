@@ -168,6 +168,21 @@ const (
 }
 ` + issueFragment
 
+	mutationCreateIssueLabel = `mutation CreateIssueLabel($input: IssueLabelCreateInput!) {
+  issueLabelCreate(input: $input) {
+    success
+    issueLabel { id name }
+  }
+}`
+
+	mutationAddIssueLabel = `mutation AddIssueLabel($id: String!, $labelId: String!) {
+  issueAddLabel(id: $id, labelId: $labelId) {
+    success
+    issue { ...IssueFields }
+  }
+}
+` + issueFragment
+
 	mutationCreateComment = `mutation CreateComment($issueId: String!, $body: String!) {
   commentCreate(input: { issueId: $issueId, body: $body }) {
     success
@@ -1148,6 +1163,58 @@ func (c *Client) UpdateIssue(ctx context.Context, id string, input UpdateIssueIn
 		return nil, ErrMutationFailed
 	}
 	iss := nodeToIssue(data.IssueUpdate.Issue)
+	return &iss, nil
+}
+
+// CreateIssueLabel creates a label owned by the given team. A team ID is
+// required here because omitting it in Linear creates a workspace-wide label.
+func (c *Client) CreateIssueLabel(ctx context.Context, name, teamID string) (*Label, error) {
+	name = strings.TrimSpace(name)
+	teamID = strings.TrimSpace(teamID)
+	if name == "" {
+		return nil, fmt.Errorf("label name is required")
+	}
+	if teamID == "" {
+		return nil, fmt.Errorf("team id is required for label creation")
+	}
+
+	vars := map[string]any{"input": map[string]any{"name": name, "teamId": teamID}}
+	var data createIssueLabelData
+	if err := c.do(ctx, mutationCreateIssueLabel, vars, &data); err != nil {
+		return nil, err
+	}
+	if !data.IssueLabelCreate.Success {
+		return nil, ErrMutationFailed
+	}
+	if data.IssueLabelCreate.IssueLabel == nil {
+		return nil, fmt.Errorf("created issue label is missing")
+	}
+	id, err := requiredCatalogString(data.IssueLabelCreate.IssueLabel.ID, "created issue label id")
+	if err != nil {
+		return nil, err
+	}
+	createdName, err := requiredCatalogString(data.IssueLabelCreate.IssueLabel.Name, "created issue label name")
+	if err != nil {
+		return nil, err
+	}
+	return &Label{ID: id, Name: createdName}, nil
+}
+
+// AddIssueLabel atomically adds one label without replacing labels that may
+// have been attached concurrently by another actor.
+func (c *Client) AddIssueLabel(ctx context.Context, issueID, labelID string) (*Issue, error) {
+	vars := map[string]any{"id": issueID, "labelId": labelID}
+	var data addIssueLabelData
+	if err := c.do(ctx, mutationAddIssueLabel, vars, &data); err != nil {
+		return nil, err
+	}
+	if !data.IssueAddLabel.Success {
+		return nil, ErrMutationFailed
+	}
+	if data.IssueAddLabel.Issue == nil {
+		return nil, fmt.Errorf("updated issue is missing after adding label")
+	}
+	iss := nodeToIssue(*data.IssueAddLabel.Issue)
 	return &iss, nil
 }
 

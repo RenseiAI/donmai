@@ -2335,7 +2335,7 @@ func TestLinearApplyLabel(t *testing.T) {
 	labelsData := `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"},{"id":"label-1","name":"Feature"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`
 	updatedJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
 
-	var capturedLabelIDs []any
+	var capturedIssueID, capturedLabelID string
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Query     string         `json:"query"`
@@ -2345,12 +2345,14 @@ func TestLinearApplyLabel(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "issueLabels"):
 			writeLinearGQLData(w, labelsData)
-		case strings.Contains(req.Query, "UpdateIssue"):
-			inp, _ := req.Variables["input"].(map[string]any)
-			capturedLabelIDs, _ = inp["labelIds"].([]any)
-			writeLinearGQLData(w, fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, updatedJSON))
+		case strings.Contains(req.Query, "issueAddLabel"):
+			capturedIssueID, _ = req.Variables["id"].(string)
+			capturedLabelID, _ = req.Variables["labelId"].(string)
+			writeLinearGQLData(w, fmt.Sprintf(`{"issueAddLabel":{"success":true,"issue":%s}}`, updatedJSON))
 		default:
 			writeLinearGQLData(w, `{}`)
 		}
@@ -2368,9 +2370,11 @@ func TestLinearApplyLabel(t *testing.T) {
 	if result["alreadyApplied"] != false {
 		t.Errorf("alreadyApplied = %v; want false", result["alreadyApplied"])
 	}
-	// Should have merged: existing "label-1" (Feature) + new "label-bug" (Bug).
-	if len(capturedLabelIDs) != 2 {
-		t.Errorf("UpdateIssue labelIds = %v; want 2 entries (existing + new)", capturedLabelIDs)
+	if result["createdLabel"] != false {
+		t.Errorf("createdLabel = %v; want false", result["createdLabel"])
+	}
+	if capturedIssueID != "issue-1" || capturedLabelID != "label-bug" {
+		t.Errorf("issueAddLabel variables = (%q, %q)", capturedIssueID, capturedLabelID)
 	}
 }
 
@@ -2394,6 +2398,8 @@ func TestLinearApplyLabelNotFound(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "issueLabels"):
 			writeLinearGQLData(w, labelsData)
 		default:
@@ -2407,6 +2413,222 @@ func TestLinearApplyLabelNotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "NonExistentLabel") {
 		t.Errorf("error should mention the label name; got: %v", err)
+	}
+}
+
+func TestLinearApplyLabelCreateUsesIssueTeam(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	var createInput map[string]any
+	createCalls := 0
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListLabels"):
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "issueLabelCreate"):
+			createCalls++
+			createInput, _ = req.Variables["input"].(map[string]any)
+			writeLinearGQLData(w, `{"issueLabelCreate":{"success":true,"issueLabel":{"id":"label-security","name":"Security"}}}`)
+		case strings.Contains(req.Query, "issueAddLabel"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issueAddLabel":{"success":true,"issue":%s}}`, issueJSON))
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "apply-label", "ENG-1", "--label", "Security", "--create")
+	if err != nil {
+		t.Fatalf("apply-label --create failed: %v\nout: %s", err, out)
+	}
+	if createCalls != 1 || createInput["name"] != "Security" || createInput["teamId"] != "team-1" {
+		t.Fatalf("create calls/input = %d/%#v", createCalls, createInput)
+	}
+	if got := decodeJSON(t, out)["createdLabel"]; got != true {
+		t.Fatalf("createdLabel = %v, want true", got)
+	}
+}
+
+func TestLinearApplyLabelCreateDoesNotDuplicateApplicableLabel(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	createCalls, addCalls := 0, 0
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListLabels"):
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-1","name":"Feature"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "issueLabelCreate"):
+			createCalls++
+		case strings.Contains(req.Query, "issueAddLabel"):
+			addCalls++
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "apply-label", "ENG-1", "--label", "feature", "--create")
+	if err != nil {
+		t.Fatalf("apply-label existing label: %v", err)
+	}
+	result := decodeJSON(t, out)
+	if createCalls != 0 || addCalls != 0 {
+		t.Fatalf("create/add calls = %d/%d, want 0/0", createCalls, addCalls)
+	}
+	if result["alreadyApplied"] != true || result["createdLabel"] != false {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestLinearApplyLabelCreateFailureDoesNotMutateIssue(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	labelReads, issueMutations := 0, 0
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListLabels"):
+			labelReads++
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "issueLabelCreate"):
+			writeLinearGQLError(w, "label creation rejected")
+		case strings.Contains(req.Query, "issueAddLabel"), strings.Contains(req.Query, "issueUpdate"):
+			issueMutations++
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	_, err := runLinearCmd(t, "", "apply-label", "ENG-1", "--label", "Security", "--create")
+	if err == nil || !strings.Contains(err.Error(), "create label") {
+		t.Fatalf("error = %v, want contextual creation failure", err)
+	}
+	if labelReads != 2 || issueMutations != 0 {
+		t.Fatalf("label reads/issue mutations = %d/%d, want 2/0", labelReads, issueMutations)
+	}
+}
+
+func TestLinearApplyLabelCreateReportsAuthorizationFailure(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	labelReads, issueMutations := 0, 0
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListLabels"):
+			labelReads++
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "issueLabelCreate"):
+			w.WriteHeader(http.StatusForbidden)
+		case strings.Contains(req.Query, "issueAddLabel"), strings.Contains(req.Query, "issueUpdate"):
+			issueMutations++
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	_, err := runLinearCmd(t, "", "apply-label", "ENG-1", "--label", "Security", "--create")
+	if err == nil || !strings.Contains(err.Error(), "not authorized") || !strings.Contains(err.Error(), "workspace admin") {
+		t.Fatalf("error = %v, want actionable authorization failure", err)
+	}
+	if labelReads != 2 || issueMutations != 0 {
+		t.Fatalf("label reads/issue mutations = %d/%d, want 2/0", labelReads, issueMutations)
+	}
+}
+
+func TestLinearApplyLabelCreateRecoversDuplicateRace(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	labelReads, addCalls := 0, 0
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListLabels"):
+			labelReads++
+			if labelReads == 1 {
+				writeLinearGQLData(w, `{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+				return
+			}
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-winner","name":"Security"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "issueLabelCreate"):
+			writeLinearGQLError(w, "Label name must be unique")
+		case strings.Contains(req.Query, "issueAddLabel"):
+			addCalls++
+			writeLinearGQLData(w, fmt.Sprintf(`{"issueAddLabel":{"success":true,"issue":%s}}`, issueJSON))
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "apply-label", "ENG-1", "--label", "Security", "--create")
+	if err != nil {
+		t.Fatalf("apply-label race recovery: %v", err)
+	}
+	if labelReads != 2 || addCalls != 1 {
+		t.Fatalf("label reads/add calls = %d/%d, want 2/1", labelReads, addCalls)
+	}
+	if got := decodeJSON(t, out)["createdLabel"]; got != false {
+		t.Fatalf("createdLabel = %v, want false for race winner", got)
+	}
+}
+
+func TestLinearApplyLabelReportsCreateThenApplyPartialFailure(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+		case strings.Contains(req.Query, "ListTeams"):
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListLabels"):
+			writeLinearGQLData(w, `{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "issueLabelCreate"):
+			writeLinearGQLData(w, `{"issueLabelCreate":{"success":true,"issueLabel":{"id":"label-security","name":"Security"}}}`)
+		case strings.Contains(req.Query, "issueAddLabel"):
+			writeLinearGQLError(w, "issue update rejected")
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	_, err := runLinearCmd(t, "", "apply-label", "ENG-1", "--label", "Security", "--create")
+	if err == nil || !strings.Contains(err.Error(), "was created") || !strings.Contains(err.Error(), "could not be applied") {
+		t.Fatalf("error = %v, want explicit partial-state failure", err)
 	}
 }
 

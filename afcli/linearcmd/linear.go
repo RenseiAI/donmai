@@ -1771,9 +1771,8 @@ func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 // ─── apply-label ──────────────────────────────────────────────────────────────
 
 // newLinearApplyLabelCmd provides `apply-label <issue-id> --label <name>`.
-// Applies an EXISTING label to an issue by name (case-insensitive lookup).
-// Label creation is intentionally gated behind --create to avoid silent
-// failures when the bot identity lacks label-create scope on the Linear app.
+// It resolves labels only in the issue's applicable team/workspace scope and
+// creates a team-owned label when the caller explicitly passes --create.
 func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		labelName  string
@@ -1782,7 +1781,7 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 
 	cmd := &cobra.Command{
 		Use:          "apply-label <issue-id>",
-		Short:        "Apply an existing label to an issue",
+		Short:        "Apply a label to an issue",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1799,62 +1798,75 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 			}
 			ctx := cmd.Context()
 
-			// Fetch the issue to get its current label IDs.
+			// Fetch the issue first: its team defines both the applicable label
+			// catalog and the ownership scope for any newly created label.
 			issue, err := client.GetIssue(ctx, args[0])
 			if err != nil {
 				return fmt.Errorf("get issue: %w", err)
 			}
-
-			// Resolve the label name to an ID.
-			allLabels, err := client.ListLabels(ctx)
-			if err != nil {
-				return fmt.Errorf("list labels: %w", err)
+			if issue.Team.ID == "" || issue.Team.Key == "" {
+				return fmt.Errorf("get issue: team id and key are required to apply a label safely")
 			}
 
-			var targetID string
-			for name, id := range allLabels {
-				if strings.EqualFold(name, labelName) {
-					targetID = id
+			applicableLabels, err := client.ListLabelsForTeam(ctx, issue.Team.Key)
+			if err != nil {
+				return fmt.Errorf("list labels for team %q: %w", issue.Team.Key, err)
+			}
+
+			targetID := findLabelID(applicableLabels, labelName)
+			createdLabel := false
+
+			if targetID == "" {
+				if !createFlag {
+					return cli.UserError(
+						fmt.Sprintf("label %q is not applicable to team %q; use --create to create it for that team", labelName, issue.Team.Key),
+						"Available labels: run `"+bin+" linear list-labels --team "+issue.Team.Key+"`",
+					)
+				}
+
+				created, createErr := client.CreateIssueLabel(ctx, labelName, issue.Team.ID)
+				if createErr != nil {
+					// A concurrent invocation may have won the unique-name race. Re-read
+					// the applicable catalog before surfacing the original create error.
+					refreshed, refreshErr := client.ListLabelsForTeam(ctx, issue.Team.Key)
+					if refreshErr == nil {
+						targetID = findLabelID(refreshed, labelName)
+					}
+					if targetID == "" {
+						if errors.Is(createErr, linear.ErrUnauthorized) || errors.Is(createErr, linear.ErrForbidden) {
+							return cli.UserError(
+								fmt.Sprintf("not authorized to create label %q for team %q: %v", labelName, issue.Team.Key, createErr),
+								"Ask a Linear workspace admin to grant label creation access or create the label for this team",
+							)
+						}
+						if refreshErr != nil {
+							return fmt.Errorf("create label %q for team %q: %w (could not verify a concurrent creation: %v)", labelName, issue.Team.Key, createErr, refreshErr)
+						}
+						return fmt.Errorf("create label %q for team %q: %w", labelName, issue.Team.Key, createErr)
+					}
+				} else {
+					targetID = created.ID
+					createdLabel = true
+				}
+			}
+
+			alreadyApplied := false
+			for _, l := range issue.Labels {
+				if l.ID == targetID {
+					alreadyApplied = true
 					break
 				}
 			}
 
-			if targetID == "" {
-				if !createFlag {
-					// Fail loud — do not silently no-op. The bot may lack label-create
-					// scope, so we require explicit opt-in via --create.
-					return cli.UserError(
-						fmt.Sprintf("label %q not found in workspace; use --create to create it (requires label-create scope)", labelName),
-						"Available labels: run `"+bin+" linear list-labels` to see existing labels",
-					)
-				}
-				// --create requested: fail loud with a clear message that creation is
-				// not yet implemented. This surfaces scope issues immediately rather
-				// than silently skipping the label.
-				return cli.UserError(
-					"label creation (--create) is not yet implemented; ask a workspace admin to create the label first",
-					"After the label exists, run without --create: "+cmd.UseLine()+" --label \""+labelName+"\"",
-				)
-			}
-
-			// Build the merged label set: existing + new (de-duped).
-			labelIDs := make([]string, 0, len(issue.Labels)+1)
-			alreadyApplied := false
-			for _, l := range issue.Labels {
-				labelIDs = append(labelIDs, l.ID)
-				if l.ID == targetID {
-					alreadyApplied = true
-				}
-			}
+			updated := issue
 			if !alreadyApplied {
-				labelIDs = append(labelIDs, targetID)
-			}
-
-			updated, err := client.UpdateIssue(ctx, issue.ID, linear.UpdateIssueInput{
-				LabelIDs: labelIDs,
-			})
-			if err != nil {
-				return fmt.Errorf("apply label: %w", err)
+				updated, err = client.AddIssueLabel(ctx, issue.ID, targetID)
+				if err != nil {
+					if createdLabel {
+						return fmt.Errorf("label %q was created for team %q but could not be applied to issue %q: %w", labelName, issue.Team.Key, issue.Identifier, err)
+					}
+					return fmt.Errorf("apply label: %w", err)
+				}
 			}
 
 			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
@@ -1862,15 +1874,25 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				"identifier":     updated.Identifier,
 				"appliedLabel":   labelName,
 				"alreadyApplied": alreadyApplied,
+				"createdLabel":   createdLabel,
 				"labels":         labelNames(updated.Labels),
 			})
 		},
 	}
 
-	cmd.Flags().StringVar(&labelName, "label", "", "Label name to apply (case-insensitive; must already exist)")
+	cmd.Flags().StringVar(&labelName, "label", "", "Label name to apply (case-insensitive)")
 	cmd.Flags().BoolVar(&createFlag, "create", false, "Allow creating the label if it does not exist (requires label-create scope)")
 
 	return cmd
+}
+
+func findLabelID(labels map[string]string, name string) string {
+	for candidate, id := range labels {
+		if strings.EqualFold(candidate, name) {
+			return id
+		}
+	}
+	return ""
 }
 
 // ─── check-deployment (native Go via gh CLI) ─────────────────────────────────
