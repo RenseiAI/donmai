@@ -28,7 +28,7 @@ package credentials
 import "strings"
 
 // AgentEnvBlocklist is the canonical list of environment variable names
-// that must never propagate from AF-TUI's process env (or .env.local)
+// that must never propagate from donmai's process env (or .env.local)
 // into a child agent subprocess.
 //
 // Entries:

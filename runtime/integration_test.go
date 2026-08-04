@@ -77,7 +77,7 @@ func TestEndToEndRuntimeFlow(t *testing.T) {
 		"PATH":              "/usr/bin",
 		"ANTHROPIC_API_KEY": "leak", // must be filtered
 	}, agent.Spec{Env: map[string]string{
-		"AGENTFACTORY_SESSION_ID": "sess-e2e",
+		"DONMAI_SESSION_ID": "sess-e2e",
 	}})
 	hasAPI := false
 	hasSession := false
@@ -85,7 +85,7 @@ func TestEndToEndRuntimeFlow(t *testing.T) {
 		if kv == "ANTHROPIC_API_KEY=leak" {
 			hasAPI = true
 		}
-		if kv == "AGENTFACTORY_SESSION_ID=sess-e2e" {
+		if kv == "DONMAI_SESSION_ID=sess-e2e" {
 			hasSession = true
 		}
 	}

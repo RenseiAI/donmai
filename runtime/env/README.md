@@ -10,10 +10,10 @@ out := c.Compose(map[string]string{
     "PATH":              "/usr/bin",
     "ANTHROPIC_API_KEY": "operator-leak", // host shell var; will be filtered
 }, agent.Spec{Env: map[string]string{
-    "ANTHROPIC_API_KEY":      "runner-resolved", // override is allowed
-    "AGENTFACTORY_SESSION_ID": "sess-123",
+    "ANTHROPIC_API_KEY": "runner-resolved", // override is allowed
+    "DONMAI_SESSION_ID": "sess-123",
 }})
-// out: ["AGENTFACTORY_SESSION_ID=sess-123",
+// out: ["DONMAI_SESSION_ID=sess-123",
 //       "ANTHROPIC_API_KEY=runner-resolved",
 //       "PATH=/usr/bin"]
 ```

@@ -1,4 +1,4 @@
-// Package worker implements the AgentFactory worker protocol: registration
+// Package worker implements the donmai worker protocol: registration
 // with the platform, work polling, heartbeat reporting, and multi-worker
 // fleet process management.
 //
