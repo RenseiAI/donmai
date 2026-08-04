@@ -1721,16 +1721,16 @@ func newLinearListProjectsCmd(ds func() afclient.DataSource, bin string) *cobra.
 	return cmd
 }
 
-// newLinearListLabelsCmd provides `list-labels [--team <id>]`.
+// newLinearListLabelsCmd provides `list-labels [--team <key|id>]`.
 // Returns all issue labels as a JSON array of {id, name} objects.
-// The optional --team flag is accepted for forward-compatibility but Linear's
-// issueLabels query is org-wide; filtering client-side is a future extension.
+// When --team is set, the result contains only labels that can be applied to
+// issues in that team, including workspace-level labels.
 func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var team string
 
 	cmd := &cobra.Command{
 		Use:          "list-labels",
-		Short:        "List all issue labels in the workspace",
+		Short:        "List accessible issue labels",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			client, err := newLinearClient(ds, bin)
@@ -1738,7 +1738,12 @@ func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				return err
 			}
 
-			labels, err := client.ListLabels(cmd.Context())
+			var labels map[string]string
+			if team == "" {
+				labels, err = client.ListLabels(cmd.Context())
+			} else {
+				labels, err = client.ListLabelsForTeam(cmd.Context(), team)
+			}
 			if err != nil {
 				return fmt.Errorf("list labels: %w", err)
 			}
@@ -1758,7 +1763,7 @@ func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		},
 	}
 
-	cmd.Flags().StringVar(&team, "team", "", "Team id (accepted but currently unused; Linear labels are org-wide)")
+	cmd.Flags().StringVar(&team, "team", "", "Canonical team key or UUID to filter labels")
 
 	return cmd
 }

@@ -75,6 +75,10 @@ func (m *mockLinear) ListLabels(_ context.Context) (map[string]string, error) {
 	return nil, nil
 }
 
+func (m *mockLinear) ListLabelsForTeam(_ context.Context, _ string) (map[string]string, error) {
+	return nil, nil
+}
+
 func (m *mockLinear) ListTeams(_ context.Context) ([]linear.Team, error) {
 	return nil, nil
 }

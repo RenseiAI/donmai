@@ -119,8 +119,11 @@ const (
   }
 }`
 
-	queryListLabels = `query ListLabels {
-  issueLabels { nodes { id name } }
+	queryListLabels = `query ListLabels($filter: IssueLabelFilter, $after: String) {
+  issueLabels(filter: $filter, first: 100, after: $after) {
+    nodes { id name }
+    pageInfo { hasNextPage endCursor }
+  }
 }`
 
 	queryListUsers = `query ListUsers($filter: UserFilter) {
@@ -669,17 +672,69 @@ func (c *Client) ListWorkflowStates(ctx context.Context, teamID string) (map[str
 	return out, nil
 }
 
-// ListLabels returns all issue labels, as a map of label name → label ID.
+// ListLabels returns every accessible issue label, as a map of label name →
+// label ID. The catalog is paginated so callers never receive a silently
+// truncated result.
 func (c *Client) ListLabels(ctx context.Context) (map[string]string, error) {
-	var data listLabelsData
-	if err := c.do(ctx, queryListLabels, nil, &data); err != nil {
-		return nil, err
+	return c.listLabels(ctx, nil)
+}
+
+// ListLabelsForTeam returns labels that can be applied to issues in the team
+// identified by a canonical key or UUID. Linear workspace-level labels have a
+// null team and are valid for every team, so they are included alongside labels
+// owned by the selected team.
+func (c *Client) ListLabelsForTeam(ctx context.Context, teamRef string) (map[string]string, error) {
+	team, err := c.resolveCatalogTeamKeyOrID(ctx, teamRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve team for label scope: %w", err)
 	}
-	out := make(map[string]string, len(data.IssueLabels.Nodes))
-	for _, n := range data.IssueLabels.Nodes {
-		out[n.Name] = n.ID
+	filter := map[string]any{
+		"or": []map[string]any{
+			{"team": map[string]any{"id": map[string]any{"eq": team.ID}}},
+			{"team": map[string]any{"null": true}},
+		},
 	}
-	return out, nil
+	return c.listLabels(ctx, filter)
+}
+
+func (c *Client) listLabels(ctx context.Context, filter map[string]any) (map[string]string, error) {
+	var after *string
+	labels := make(map[string]string)
+	for page := 0; page < maxCatalogPages; page++ {
+		var data listLabelsData
+		if err := c.do(ctx, queryListLabels, map[string]any{"filter": filter, "after": after}, &data); err != nil {
+			return nil, err
+		}
+		if data.IssueLabels == nil {
+			return nil, fmt.Errorf("issue labels connection is missing")
+		}
+		if data.IssueLabels.Nodes == nil {
+			return nil, fmt.Errorf("issue labels nodes are missing")
+		}
+		for i, node := range *data.IssueLabels.Nodes {
+			if node == nil {
+				return nil, fmt.Errorf("issue labels node %d is null", i)
+			}
+			id, err := requiredCatalogString(node.ID, fmt.Sprintf("issue labels node %d id", i))
+			if err != nil {
+				return nil, err
+			}
+			name, err := requiredCatalogString(node.Name, fmt.Sprintf("issue labels node %d name", i))
+			if err != nil {
+				return nil, err
+			}
+			labels[name] = id
+		}
+		next, complete, err := nextConnectionPage("issue labels", data.IssueLabels.PageInfo, after)
+		if err != nil {
+			return nil, err
+		}
+		if complete {
+			return labels, nil
+		}
+		after = next
+	}
+	return nil, fmt.Errorf("issue labels: exceeded %d pages", maxCatalogPages)
 }
 
 const maxCatalogPages = 100

@@ -152,6 +152,135 @@ func TestListTeamsDistinguishesEmptyFromMalformedCatalog(t *testing.T) {
 	}
 }
 
+func TestListLabelsPaginates(t *testing.T) {
+	var cursors []any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if !strings.Contains(req.Query, "ListLabels") {
+			t.Fatalf("query = %q, want ListLabels", req.Query)
+		}
+		if req.Variables["filter"] != nil {
+			t.Fatalf("unscoped label filter = %#v, want nil", req.Variables["filter"])
+		}
+		cursors = append(cursors, req.Variables["after"])
+		if len(cursors) == 1 {
+			writeGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-b","name":"Bug"}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}`)
+			return
+		}
+		writeGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-f","name":"Feature"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+	})
+
+	labels, err := c.ListLabels(context.Background())
+	if err != nil {
+		t.Fatalf("ListLabels: %v", err)
+	}
+	if len(labels) != 2 || labels["Bug"] != "label-b" || labels["Feature"] != "label-f" {
+		t.Fatalf("labels = %#v", labels)
+	}
+	if len(cursors) != 2 || cursors[0] != nil || cursors[1] != "cursor-1" {
+		t.Fatalf("after cursors = %#v, want [nil cursor-1]", cursors)
+	}
+}
+
+func TestListLabelsForTeamIncludesTeamAndWorkspaceLabels(t *testing.T) {
+	var labelFilter map[string]any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		switch {
+		case strings.Contains(req.Query, "ListTeams"):
+			writeGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListLabels"):
+			labelFilter, _ = req.Variables["filter"].(map[string]any)
+			writeGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-team","name":"Team label"},{"id":"label-workspace","name":"Workspace label"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		default:
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+	})
+
+	labels, err := c.ListLabelsForTeam(context.Background(), "ENG")
+	if err != nil {
+		t.Fatalf("ListLabelsForTeam: %v", err)
+	}
+	if len(labels) != 2 {
+		t.Fatalf("labels = %#v", labels)
+	}
+	or, ok := labelFilter["or"].([]any)
+	if !ok || len(or) != 2 {
+		t.Fatalf("label filter = %#v, want two OR clauses", labelFilter)
+	}
+	var sawTeam, sawWorkspace bool
+	for _, rawClause := range or {
+		clause, _ := rawClause.(map[string]any)
+		team, _ := clause["team"].(map[string]any)
+		if team["null"] == true {
+			sawWorkspace = true
+		}
+		id, _ := team["id"].(map[string]any)
+		if id["eq"] == "team-1" {
+			sawTeam = true
+		}
+	}
+	if !sawTeam || !sawWorkspace {
+		t.Fatalf("label filter = %#v, want selected-team and workspace clauses", labelFilter)
+	}
+}
+
+func TestListLabelsFailsClosedOnMalformedCatalog(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    string
+		wantErr string
+	}{
+		{
+			name:    "missing connection",
+			data:    `{}`,
+			wantErr: "issue labels connection is missing",
+		},
+		{
+			name:    "missing nodes",
+			data:    `{"issueLabels":{"pageInfo":{"hasNextPage":false,"endCursor":null}}}`,
+			wantErr: "issue labels nodes are missing",
+		},
+		{
+			name:    "missing cursor",
+			data:    `{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":null}}}`,
+			wantErr: "issue labels hasNextPage without endCursor",
+		},
+		{
+			name:    "missing label name",
+			data:    `{"issueLabels":{"nodes":[{"id":"label-1"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`,
+			wantErr: "issue labels node 0 name is missing",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				writeGQLData(w, tc.data)
+			})
+			labels, err := c.ListLabels(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ListLabels error = %v, want %q", err, tc.wantErr)
+			}
+			if labels != nil {
+				t.Fatalf("ListLabels returned partial labels: %#v", labels)
+			}
+		})
+	}
+}
+
 func TestListProjectsFiltersByResolvedTeamAndPreservesState(t *testing.T) {
 	var sawProjectFilter map[string]any
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
