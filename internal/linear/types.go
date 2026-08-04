@@ -174,8 +174,8 @@ type commentNode struct {
 
 // relationNode is the JSON structure for a single relation node.
 type relationNode struct {
-	ID    string `json:"id"`
-	Type  string `json:"type"`
+	ID    string  `json:"id"`
+	Type  *string `json:"type"`
 	Issue *struct {
 		ID         string `json:"id"`
 		Identifier string `json:"identifier"`
@@ -267,7 +267,7 @@ type connectionPageInfo struct {
 }
 
 type relationConnection struct {
-	Nodes    *[]relationNode     `json:"nodes"`
+	Nodes    *[]*relationNode    `json:"nodes"`
 	PageInfo *connectionPageInfo `json:"pageInfo"`
 }
 

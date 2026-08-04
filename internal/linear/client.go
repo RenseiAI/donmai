@@ -518,16 +518,17 @@ func (c *Client) GetIssueRelations(ctx context.Context, issueID string) (*Relati
 		}
 
 		if !relationsComplete {
-			for _, n := range *data.Issue.Relations.Nodes {
+			for i, n := range *data.Issue.Relations.Nodes {
+				if err := validateRelationNode("relations", i, n, false); err != nil {
+					return nil, fmt.Errorf("incomplete relations response for issue %q: %w", issueID, err)
+				}
 				e := RelationEntry{
 					ID:        n.ID,
-					Type:      n.Type,
+					Type:      *n.Type,
 					CreatedAt: n.CreatedAt,
 				}
-				if n.RelatedIssue != nil {
-					e.RelatedIssueID = n.RelatedIssue.ID
-					e.RelatedIssueIdentifier = n.RelatedIssue.Identifier
-				}
+				e.RelatedIssueID = n.RelatedIssue.ID
+				e.RelatedIssueIdentifier = n.RelatedIssue.Identifier
 				res.Relations = append(res.Relations, e)
 			}
 			next, complete, err := nextRelationPage("relations", data.Issue.Relations.PageInfo, relationsAfter)
@@ -538,16 +539,17 @@ func (c *Client) GetIssueRelations(ctx context.Context, issueID string) (*Relati
 		}
 
 		if !inverseRelationsComplete {
-			for _, n := range *data.Issue.InverseRelations.Nodes {
+			for i, n := range *data.Issue.InverseRelations.Nodes {
+				if err := validateRelationNode("inverseRelations", i, n, true); err != nil {
+					return nil, fmt.Errorf("incomplete relations response for issue %q: %w", issueID, err)
+				}
 				e := InverseRelationEntry{
 					ID:        n.ID,
-					Type:      n.Type,
+					Type:      *n.Type,
 					CreatedAt: n.CreatedAt,
 				}
-				if n.Issue != nil {
-					e.IssueID = n.Issue.ID
-					e.IssueIdentifier = n.Issue.Identifier
-				}
+				e.IssueID = n.Issue.ID
+				e.IssueIdentifier = n.Issue.Identifier
 				res.InverseRelations = append(res.InverseRelations, e)
 			}
 			next, complete, err := nextRelationPage("inverseRelations", data.Issue.InverseRelations.PageInfo, inverseRelationsAfter)
@@ -563,6 +565,52 @@ func (c *Client) GetIssueRelations(ctx context.Context, issueID string) (*Relati
 	}
 
 	return nil, fmt.Errorf("incomplete relations response for issue %q: exceeded %d pages", issueID, maxRelationPages)
+}
+
+func validateRelationNode(connection string, index int, node *relationNode, inverse bool) error {
+	if node == nil {
+		return fmt.Errorf("%s node %d is null", connection, index)
+	}
+	if node.Type == nil {
+		return fmt.Errorf("%s node %d type is missing", connection, index)
+	}
+	if *node.Type == "" {
+		return fmt.Errorf("%s node %d type is empty", connection, index)
+	}
+	if !isKnownRelationType(*node.Type) {
+		return fmt.Errorf("%s node %d has unknown type %q", connection, index, *node.Type)
+	}
+	if node.ID == "" {
+		return fmt.Errorf("%s node %d id is missing", connection, index)
+	}
+	if node.CreatedAt == nil {
+		return fmt.Errorf("%s node %d createdAt is missing", connection, index)
+	}
+	if inverse {
+		if node.Issue == nil {
+			return fmt.Errorf("%s node %d issue is missing", connection, index)
+		}
+		if node.Issue.ID == "" {
+			return fmt.Errorf("%s node %d issue id is missing", connection, index)
+		}
+		return nil
+	}
+	if node.RelatedIssue == nil {
+		return fmt.Errorf("%s node %d relatedIssue is missing", connection, index)
+	}
+	if node.RelatedIssue.ID == "" {
+		return fmt.Errorf("%s node %d relatedIssue id is missing", connection, index)
+	}
+	return nil
+}
+
+func isKnownRelationType(relationType string) bool {
+	switch relationType {
+	case "related", "blocks", "duplicate":
+		return true
+	default:
+		return false
+	}
 }
 
 func nextRelationPage(name string, pageInfo *connectionPageInfo, current *string) (*string, bool, error) {

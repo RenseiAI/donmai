@@ -512,6 +512,50 @@ func TestLinearListRelations(t *testing.T) {
 	}
 }
 
+func TestLinearListRelationsAcceptsEveryKnownRelationType(t *testing.T) {
+	relData := `{"issue":{"relations":{"nodes":[
+		{"id":"rel-1","type":"related","relatedIssue":{"id":"issue-2","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"rel-2","type":"blocks","relatedIssue":{"id":"issue-3","identifier":"ENG-3"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"rel-3","type":"duplicate","relatedIssue":{"id":"issue-4","identifier":"ENG-4"},"createdAt":"2025-01-01T00:00:00Z"}
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`
+
+	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeLinearGQLData(w, relData)
+	})
+
+	out, err := runLinearCmd(t, "", "list-relations", "ENG-1")
+	if err != nil {
+		t.Fatalf("list-relations failed: %v\nout: %s", err, out)
+	}
+	relations := decodeJSON(t, out)["relations"].([]any)
+	if len(relations) != 3 {
+		t.Fatalf("relations = %v, want all 3 known types", relations)
+	}
+	for i, want := range []string{"related", "blocks", "duplicate"} {
+		if got := relations[i].(map[string]any)["type"]; got != want {
+			t.Errorf("relations[%d].type = %v, want %q", i, got, want)
+		}
+	}
+}
+
+func TestLinearListRelationsAcceptsExplicitEmptyArrays(t *testing.T) {
+	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+	})
+
+	out, err := runLinearCmd(t, "", "list-relations", "ENG-1")
+	if err != nil {
+		t.Fatalf("list-relations failed: %v\nout: %s", err, out)
+	}
+	result := decodeJSON(t, out)
+	if relations, ok := result["relations"].([]any); !ok || len(relations) != 0 {
+		t.Fatalf("relations = %v, want []", result["relations"])
+	}
+	if inverse, ok := result["inverseRelations"].([]any); !ok || len(inverse) != 0 {
+		t.Fatalf("inverseRelations = %v, want []", result["inverseRelations"])
+	}
+}
+
 // ─── remove-relation ──────────────────────────────────────────────────────────
 
 func TestLinearRemoveRelation(t *testing.T) {
@@ -828,12 +872,14 @@ func TestLinearCheckBlockedFailsClosedOnBlockerReadError(t *testing.T) {
 	}
 }
 
-func TestLinearCheckBlockedFailsClosedOnIncompleteRelationPayloads(t *testing.T) {
-	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
-	tests := []struct {
-		name string
-		data string
-	}{
+type incompleteRelationPayload struct {
+	name string
+	data string
+}
+
+func incompleteRelationPayloads() []incompleteRelationPayload {
+	const createdAt = `"createdAt":"2025-01-01T00:00:00Z"`
+	return []incompleteRelationPayload{
 		{name: "null data", data: `null`},
 		{name: "empty data", data: `{}`},
 		{name: "null issue", data: `{"issue":null}`},
@@ -861,7 +907,121 @@ func TestLinearCheckBlockedFailsClosedOnIncompleteRelationPayloads(t *testing.T)
 			name: "null inverse relations nodes",
 			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":null,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
 		},
+		{
+			name: "null relation node",
+			data: `{"issue":{"relations":{"nodes":[null],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "empty relation node",
+			data: `{"issue":{"relations":{"nodes":[{}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing relation type",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null relation type",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":null,"relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "empty relation type",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"","relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "unknown relation type",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"future","relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing relation id",
+			data: `{"issue":{"relations":{"nodes":[{"type":"blocks","relatedIssue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing relation createdAt",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"blocks","relatedIssue":{"id":"issue-2"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "blocks with missing relatedIssue",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"blocks",` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "blocks with null relatedIssue",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"blocks","relatedIssue":null,` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "blocks with missing relatedIssue id",
+			data: `{"issue":{"relations":{"nodes":[{"id":"rel-1","type":"blocks","relatedIssue":{"identifier":"ENG-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null inverse relation node",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[null],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "empty inverse relation node",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relation type",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "null inverse relation type",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":null,"issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "empty inverse relation type",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"","issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "unknown inverse relation type",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"future","issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relation id",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"issue-2"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "missing inverse relation createdAt",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"id":"issue-2"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "inverse blocks with missing issue",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks",` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "inverse blocks with null issue",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":null,` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
+		{
+			name: "inverse blocks with missing issue id",
+			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"identifier":"ENG-99"},` + createdAt + `}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
+		},
 	}
+}
+
+func TestLinearListRelationsFailsClosedOnIncompleteRelationPayloads(t *testing.T) {
+	for _, tt := range incompleteRelationPayloads() {
+		t.Run(tt.name, func(t *testing.T) {
+			setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+				writeLinearGQLData(w, tt.data)
+			})
+
+			out, err := runLinearCmd(t, "", "list-relations", "ENG-1")
+			if err == nil {
+				t.Fatalf("expected incomplete relation response error; out: %s", out)
+			}
+			if !strings.Contains(err.Error(), "incomplete relations response") {
+				t.Fatalf("error = %q, want incomplete response context", err)
+			}
+			if strings.Contains(out, `"relations"`) {
+				t.Fatalf("list-relations emitted an incomplete result: %s", out)
+			}
+		})
+	}
+}
+
+func TestLinearCheckBlockedFailsClosedOnIncompleteRelationPayloads(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+	tests := incompleteRelationPayloads()
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -919,7 +1079,7 @@ func TestLinearCheckBlockedFindsBlockerOnLaterRelationPage(t *testing.T) {
 			if req.Variables["inverseRelationsAfter"] != "inverse-page-1" {
 				t.Fatalf("inverseRelationsAfter = %v, want inverse-page-1", req.Variables["inverseRelationsAfter"])
 			}
-			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
 		default:
 			writeLinearGQLData(w, `{}`)
 		}
@@ -1197,38 +1357,7 @@ func TestLinearListUnblockedBacklogFailsClosedOnBlockerReadError(t *testing.T) {
 func TestLinearListUnblockedBacklogFailsClosedOnIncompleteRelationPayloads(t *testing.T) {
 	proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
 	issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
-	tests := []struct {
-		name string
-		data string
-	}{
-		{name: "null data", data: `null`},
-		{name: "empty data", data: `{}`},
-		{name: "null issue", data: `{"issue":null}`},
-		{
-			name: "missing relations connection",
-			data: `{"issue":{"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
-		},
-		{
-			name: "missing inverse relations connection",
-			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
-		},
-		{
-			name: "missing relations nodes",
-			data: `{"issue":{"relations":{"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
-		},
-		{
-			name: "null relations nodes",
-			data: `{"issue":{"relations":{"nodes":null,"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
-		},
-		{
-			name: "missing inverse relations nodes",
-			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
-		},
-		{
-			name: "null inverse relations nodes",
-			data: `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":null,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`,
-		},
-	}
+	tests := incompleteRelationPayloads()
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1286,7 +1415,7 @@ func TestLinearListUnblockedBacklogFindsBlockerOnLaterRelationPage(t *testing.T)
 				writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"inverse-page-1"}}}}`)
 				return
 			}
-			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+			writeLinearGQLData(w, `{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[{"id":"rel-1","type":"blocks","issue":{"id":"blocker-1","identifier":"ENG-99"},"createdAt":"2025-01-01T00:00:00Z"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, blockerIssue))
 		default:
