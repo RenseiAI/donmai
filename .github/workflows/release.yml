@@ -16,6 +16,13 @@ on:
 
 permissions:
   contents: write
+  # Sigstore keyless signing exchanges this OIDC token for a short-lived
+  # certificate — no private key is ever stored. Without it, `cosign sign-blob`
+  # cannot mint an identity and the release fails closed rather than shipping
+  # unsigned Linux archives.
+  id-token: write
+  # Required by actions/attest-build-provenance to write the attestation.
+  attestations: write
 
 jobs:
   release:
@@ -118,7 +125,21 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
           rm -f "$RUNNER_TEMP/cert.p12"
 
+      # Must precede GoReleaser: the `signs:` blocks shell out to `cosign`.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           version: "~> v2"
           args: release --clean --config ${{ runner.temp }}/goreleaser.yaml
+
+      # Build provenance for every published archive. This is a different claim
+      # from the cosign signature: the signature says "this workflow signed this
+      # blob", the attestation says "this artifact was built from this source at
+      # this commit by this workflow". Consumers verify with:
+      #   gh attestation verify <archive> --repo RenseiAI/donmai
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: dist/*.tar.gz
