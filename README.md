@@ -320,7 +320,7 @@ donmai linear update-issue <id> [--state "..."]
 donmai linear list-issues [--project "..."] [--status "..."]
 donmai linear create-comment <issue-id> --body "..."
 donmai linear list-comments <issue-id>
-donmai linear add-relation <issue-id> <related-id> --type <related|blocks|duplicate>
+donmai linear add-relation <issue-id> <related-id> --type <related|blocks|duplicate|similar>
 donmai linear list-relations <issue-id>
 donmai linear remove-relation <relation-id>
 donmai linear list-sub-issues <parent-id>

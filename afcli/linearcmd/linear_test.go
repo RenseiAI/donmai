@@ -434,40 +434,48 @@ func TestLinearCreateCommentBodyFile(t *testing.T) {
 
 // ─── add-relation ─────────────────────────────────────────────────────────────
 
-func TestLinearAddRelation(t *testing.T) {
-	issue1 := issueNodeJSON("issue-1", "ENG-1", "Issue 1", "Backlog", "team-1", "ENG", "Engineering")
-	issue2 := issueNodeJSON("issue-2", "ENG-2", "Issue 2", "Backlog", "team-1", "ENG", "Engineering")
-	var callCount int
+func TestLinearAddRelationAcceptsEveryKnownType(t *testing.T) {
+	for _, relationType := range linear.KnownIssueRelationTypes() {
+		t.Run(relationType, func(t *testing.T) {
+			issue1 := issueNodeJSON("issue-1", "ENG-1", "Issue 1", "Backlog", "team-1", "ENG", "Engineering")
+			issue2 := issueNodeJSON("issue-2", "ENG-2", "Issue 2", "Backlog", "team-1", "ENG", "Engineering")
+			var callCount int
 
-	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Query string `json:"query"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+			setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
 
-		if strings.Contains(req.Query, "GetIssue") {
-			callCount++
-			if callCount == 1 {
-				writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issue1))
-			} else {
-				writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issue2))
+				if strings.Contains(req.Query, "GetIssue") {
+					callCount++
+					if callCount == 1 {
+						writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issue1))
+					} else {
+						writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issue2))
+					}
+					return
+				}
+				if got := req.Variables["type"]; got != relationType {
+					t.Fatalf("mutation relation type = %v, want %q", got, relationType)
+				}
+				writeLinearGQLData(w, `{"issueRelationCreate":{"success":true,"issueRelation":{"id":"rel-1"}}}`)
+			})
+
+			out, err := runLinearCmd(t, "", "add-relation", "ENG-1", "ENG-2", "--type", relationType)
+			if err != nil {
+				t.Fatalf("add-relation failed: %v\nout: %s", err, out)
 			}
-			return
-		}
-		writeLinearGQLData(w, `{"issueRelationCreate":{"success":true,"issueRelation":{"id":"rel-1","type":"blocks","relatedIssue":{"id":"issue-2","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"}}}`)
-	})
 
-	out, err := runLinearCmd(t, "", "add-relation", "ENG-1", "ENG-2", "--type", "blocks")
-	if err != nil {
-		t.Fatalf("add-relation failed: %v\nout: %s", err, out)
-	}
-
-	result := decodeJSON(t, out)
-	if result["success"] != true {
-		t.Errorf("success = %v, want true", result["success"])
-	}
-	if result["type"] != "blocks" {
-		t.Errorf("type = %v, want blocks", result["type"])
+			result := decodeJSON(t, out)
+			if result["success"] != true {
+				t.Errorf("success = %v, want true", result["success"])
+			}
+			if result["type"] != relationType {
+				t.Errorf("type = %v, want %s", result["type"], relationType)
+			}
+		})
 	}
 }
 
@@ -516,8 +524,14 @@ func TestLinearListRelationsAcceptsEveryKnownRelationType(t *testing.T) {
 	relData := `{"issue":{"relations":{"nodes":[
 		{"id":"rel-1","type":"related","relatedIssue":{"id":"issue-2","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"},
 		{"id":"rel-2","type":"blocks","relatedIssue":{"id":"issue-3","identifier":"ENG-3"},"createdAt":"2025-01-01T00:00:00Z"},
-		{"id":"rel-3","type":"duplicate","relatedIssue":{"id":"issue-4","identifier":"ENG-4"},"createdAt":"2025-01-01T00:00:00Z"}
-	],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`
+		{"id":"rel-3","type":"duplicate","relatedIssue":{"id":"issue-4","identifier":"ENG-4"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"rel-4","type":"similar","relatedIssue":{"id":"issue-5","identifier":"ENG-5"},"createdAt":"2025-01-01T00:00:00Z"}
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[
+		{"id":"inverse-1","type":"related","issue":{"id":"issue-6","identifier":"ENG-6"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"inverse-2","type":"blocks","issue":{"id":"issue-7","identifier":"ENG-7"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"inverse-3","type":"duplicate","issue":{"id":"issue-8","identifier":"ENG-8"},"createdAt":"2025-01-01T00:00:00Z"},
+		{"id":"inverse-4","type":"similar","issue":{"id":"issue-9","identifier":"ENG-9"},"createdAt":"2025-01-01T00:00:00Z"}
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`
 
 	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeLinearGQLData(w, relData)
@@ -527,13 +541,22 @@ func TestLinearListRelationsAcceptsEveryKnownRelationType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list-relations failed: %v\nout: %s", err, out)
 	}
-	relations := decodeJSON(t, out)["relations"].([]any)
-	if len(relations) != 3 {
-		t.Fatalf("relations = %v, want all 3 known types", relations)
+	result := decodeJSON(t, out)
+	relations := result["relations"].([]any)
+	inverseRelations := result["inverseRelations"].([]any)
+	wantTypes := linear.KnownIssueRelationTypes()
+	if len(relations) != len(wantTypes) {
+		t.Fatalf("relations = %v, want all %d known types", relations, len(wantTypes))
 	}
-	for i, want := range []string{"related", "blocks", "duplicate"} {
+	if len(inverseRelations) != len(wantTypes) {
+		t.Fatalf("inverseRelations = %v, want all %d known types", inverseRelations, len(wantTypes))
+	}
+	for i, want := range wantTypes {
 		if got := relations[i].(map[string]any)["type"]; got != want {
 			t.Errorf("relations[%d].type = %v, want %q", i, got, want)
+		}
+		if got := inverseRelations[i].(map[string]any)["type"]; got != want {
+			t.Errorf("inverseRelations[%d].type = %v, want %q", i, got, want)
 		}
 	}
 }
@@ -756,6 +779,36 @@ func TestLinearCheckBlockedNotBlocked(t *testing.T) {
 	blockedBy, ok := result["blockedBy"].([]any)
 	if !ok || len(blockedBy) != 0 {
 		t.Errorf("blockedBy = %v, want []", result["blockedBy"])
+	}
+}
+
+func TestLinearCheckBlockedAcceptsKnownNonBlockingRelationTypes(t *testing.T) {
+	for _, relationType := range linear.KnownIssueRelationTypes() {
+		if relationType == "blocks" {
+			continue
+		}
+		t.Run(relationType, func(t *testing.T) {
+			issueJSON := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+			relData := fmt.Sprintf(`{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[
+				{"id":"rel-1","type":%q,"issue":{"id":"related-1","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"}
+			],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`, relationType)
+			handler := &multiHandler{
+				responses: map[string]string{
+					"GetIssue":      fmt.Sprintf(`{"issue":%s}`, issueJSON),
+					"ListRelations": relData,
+				},
+			}
+			setupLinearTest(t, handler.ServeHTTP)
+
+			out, err := runLinearCmd(t, "", "check-blocked", "ENG-1")
+			if err != nil {
+				t.Fatalf("check-blocked failed: %v\nout: %s", err, out)
+			}
+			result := decodeJSON(t, out)
+			if result["blocked"] != false {
+				t.Errorf("blocked = %v, want false for %s relation", result["blocked"], relationType)
+			}
+		})
 	}
 }
 
@@ -1280,6 +1333,38 @@ func TestLinearListUnblockedBacklog(t *testing.T) {
 	item := arr[0].(map[string]any)
 	if item["blocked"] != false {
 		t.Errorf("blocked = %v, want false", item["blocked"])
+	}
+}
+
+func TestLinearListUnblockedBacklogAcceptsKnownNonBlockingRelationTypes(t *testing.T) {
+	for _, relationType := range linear.KnownIssueRelationTypes() {
+		if relationType == "blocks" {
+			continue
+		}
+		t.Run(relationType, func(t *testing.T) {
+			proj := `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`
+			issue := issueNodeJSON("issue-1", "ENG-1", "Candidate", "Backlog", "team-1", "ENG", "Engineering")
+			relData := fmt.Sprintf(`{"issue":{"relations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}},"inverseRelations":{"nodes":[
+				{"id":"rel-1","type":%q,"issue":{"id":"related-1","identifier":"ENG-2"},"createdAt":"2025-01-01T00:00:00Z"}
+			],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`, relationType)
+			handler := &multiHandler{
+				responses: map[string]string{
+					"ListProjects":      proj,
+					"ListBacklogIssues": fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, issue),
+					"ListRelations":     relData,
+				},
+			}
+			setupLinearTest(t, handler.ServeHTTP)
+
+			out, err := runLinearCmd(t, "", "list-unblocked-backlog", "--project", "TestProject")
+			if err != nil {
+				t.Fatalf("list-unblocked-backlog failed: %v\nout: %s", err, out)
+			}
+			arr := decodeJSONArray(t, out)
+			if len(arr) != 1 || arr[0].(map[string]any)["identifier"] != "ENG-1" {
+				t.Fatalf("output = %v, want the candidate preserved", arr)
+			}
+		})
 	}
 }
 

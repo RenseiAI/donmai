@@ -199,6 +199,24 @@ type InverseRelationEntry struct {
 	CreatedAt       *time.Time
 }
 
+var knownIssueRelationTypes = []string{"related", "blocks", "duplicate", "similar"}
+
+// KnownIssueRelationTypes returns Linear's supported IssueRelationType values.
+func KnownIssueRelationTypes() []string {
+	return append([]string(nil), knownIssueRelationTypes...)
+}
+
+// IsKnownIssueRelationType reports whether relationType is a supported Linear
+// IssueRelationType. Unknown values must fail closed when reading relations.
+func IsKnownIssueRelationType(relationType string) bool {
+	for _, known := range knownIssueRelationTypes {
+		if relationType == known {
+			return true
+		}
+	}
+	return false
+}
+
 // Client is a lightweight Linear GraphQL client backed by stdlib net/http.
 type Client struct {
 	BaseURL    string
@@ -577,7 +595,7 @@ func validateRelationNode(connection string, index int, node *relationNode, inve
 	if *node.Type == "" {
 		return fmt.Errorf("%s node %d type is empty", connection, index)
 	}
-	if !isKnownRelationType(*node.Type) {
+	if !IsKnownIssueRelationType(*node.Type) {
 		return fmt.Errorf("%s node %d has unknown type %q", connection, index, *node.Type)
 	}
 	if node.ID == "" {
@@ -602,15 +620,6 @@ func validateRelationNode(connection string, index int, node *relationNode, inve
 		return fmt.Errorf("%s node %d relatedIssue id is missing", connection, index)
 	}
 	return nil
-}
-
-func isKnownRelationType(relationType string) bool {
-	switch relationType {
-	case "related", "blocks", "duplicate":
-		return true
-	default:
-		return false
-	}
 }
 
 func nextRelationPage(name string, pageInfo *connectionPageInfo, current *string) (*string, bool, error) {
@@ -859,7 +868,7 @@ func (c *Client) CreateComment(ctx context.Context, issueID, body string) (*Comm
 }
 
 // CreateRelation creates a relation between two issues.
-// relationType must be one of: "related", "blocks", "duplicate".
+// relationType must be one of the values returned by KnownIssueRelationTypes.
 func (c *Client) CreateRelation(ctx context.Context, issueID, relatedIssueID, relationType string) (string, bool, error) {
 	vars := map[string]any{
 		"issueId":        issueID,
