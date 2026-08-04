@@ -54,7 +54,7 @@ type HarnessCaps struct {
 	SupportsOneShot          bool   `json:"oneShot"`        // can satisfy a future SpawnComplete projection
 	NativeJSONMode           bool   `json:"nativeJsonMode"` // strict structured-out vs spawn-collect-validate
 	ToolPermissionFormat     string `json:"toolPermissionFormat"`
-	StreamingTransport       string `json:"streamingTransport"` // "sse"|"ndjson"|"websocket"|"none"
+	StreamingTransport       string `json:"streamingTransport"` // "sse"|"ndjson"|"none"
 
 	// SupportsInteractivePTY declares an ADDITIONAL spawn mode (W4,
 	// interactive-attach-v1): this harness can be spawned under a PTY

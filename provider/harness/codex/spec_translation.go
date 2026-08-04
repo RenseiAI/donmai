@@ -280,7 +280,13 @@ func NewSpawnPlan(spec agent.Spec) SpawnPlan {
 	threadStart := threadStartParams(spec)
 	// Carry SystemPromptAppend through baseInstructions so
 	// per-template additions (e.g. CLAUDE.md content) survive without
-	// a separate codex parameter — codex has only baseInstructions.
+	// a separate codex parameter: ThreadStartParams exposes no APPEND
+	// surface at all. Verified against the codex app-server v2 protocol
+	// dump (`codex app-server generate-json-schema --out <dir>`,
+	// codex-cli 0.146.0) the same way outputSchema is verified above —
+	// the only instruction-carrying params are `baseInstructions` and the
+	// sibling `developerInstructions`, and BOTH are whole-value
+	// overrides, so an append has to be folded in on our side.
 	//
 	// De-amplification note: routing Spec.InitialContext (recalled
 	// agent memory) to the per-turn input (see promptInput) removes ONLY
