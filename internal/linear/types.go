@@ -74,8 +74,10 @@ type WorkflowState struct {
 
 // Project represents a Linear project.
 type Project struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	State    string   `json:"state"`
+	TeamKeys []string `json:"teamKeys"`
 }
 
 // Team represents a Linear team.
@@ -209,15 +211,17 @@ type userNode struct {
 
 // teamNode is the JSON structure for a team.
 type teamNode struct {
-	ID   string `json:"id"`
-	Key  string `json:"key"`
-	Name string `json:"name"`
+	ID   *string `json:"id"`
+	Key  *string `json:"key"`
+	Name *string `json:"name"`
 }
 
 // projectNode is the JSON structure for a project.
 type projectNode struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID    *string         `json:"id"`
+	Name  *string         `json:"name"`
+	State *string         `json:"state"`
+	Teams *teamConnection `json:"teams"`
 }
 
 // ─── GraphQL response data shapes ────────────────────────────────────────────
@@ -271,6 +275,16 @@ type relationConnection struct {
 	PageInfo *connectionPageInfo `json:"pageInfo"`
 }
 
+type teamConnection struct {
+	Nodes    *[]*teamNode        `json:"nodes"`
+	PageInfo *connectionPageInfo `json:"pageInfo"`
+}
+
+type projectConnection struct {
+	Nodes    *[]*projectNode     `json:"nodes"`
+	PageInfo *connectionPageInfo `json:"pageInfo"`
+}
+
 type listRelationsData struct {
 	Issue *struct {
 		Relations        *relationConnection `json:"relations"`
@@ -310,15 +324,11 @@ type listUsersData struct {
 }
 
 type listTeamsData struct {
-	Teams struct {
-		Nodes []teamNode `json:"nodes"`
-	} `json:"teams"`
+	Teams *teamConnection `json:"teams"`
 }
 
 type listProjectsData struct {
-	Projects struct {
-		Nodes []projectNode `json:"nodes"`
-	} `json:"projects"`
+	Projects *projectConnection `json:"projects"`
 }
 
 type viewerData struct {

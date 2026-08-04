@@ -14,6 +14,8 @@ type Linear interface {
 	GetIssueRelations(ctx context.Context, issueID string) (*RelationsResult, error)
 	ListWorkflowStates(ctx context.Context, teamID string) (map[string]string, error)
 	ListLabels(ctx context.Context) (map[string]string, error)
+	ListTeams(ctx context.Context) ([]Team, error)
+	ListProjects(ctx context.Context, teamRef string) ([]Project, error)
 	GetTeamByName(ctx context.Context, nameOrKeyOrID string) (*Team, error)
 	GetProjectByName(ctx context.Context, name string) (*Project, error)
 	GetProjectByNameInTeam(ctx context.Context, name, teamID string) (*Project, error)

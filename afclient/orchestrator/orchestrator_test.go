@@ -75,6 +75,14 @@ func (m *mockLinear) ListLabels(_ context.Context) (map[string]string, error) {
 	return nil, nil
 }
 
+func (m *mockLinear) ListTeams(_ context.Context) ([]linear.Team, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) ListProjects(_ context.Context, _ string) ([]linear.Project, error) {
+	return nil, nil
+}
+
 func (m *mockLinear) GetTeamByName(_ context.Context, _ string) (*linear.Team, error) {
 	return nil, nil
 }
