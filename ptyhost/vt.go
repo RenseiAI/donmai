@@ -38,6 +38,7 @@ type vtHost struct {
 	emu    *vt.Emulator
 	resp   io.Writer // PTY master: query answers flow here synchronously (duty 2)
 	logger *slog.Logger
+	feed   oscTitleFilter
 
 	// modes tracked via SetCallbacks EnableMode/DisableMode (duty 1).
 	m modeState
@@ -107,7 +108,14 @@ func (v *vtHost) write(p []byte) {
 	if len(p) == 0 {
 		return
 	}
-	_, _ = v.emu.Write(p)
+	// OSC 0/1/2 changes terminal chrome rather than the cell grid. Neutralize
+	// those sequences before the snapshot authority sees them. x/vt currently
+	// leaks Unicode title payloads into its grid; keeping this filter on the VT
+	// feed (rather than Session.onOutput) preserves the byte-exact live stream.
+	filtered := v.feed.Write(p)
+	if len(filtered) > 0 {
+		_, _ = v.emu.Write(filtered)
+	}
 	// Drain any suppressed-mode re-feed queued by a handler during Write.
 	for len(v.pendingFeed) > 0 {
 		pf := v.pendingFeed
