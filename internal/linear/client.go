@@ -51,9 +51,10 @@ const (
 }
 ` + issueFragment
 
-	queryListIssues = `query ListIssues($filter: IssueFilter, $first: Int, $orderBy: PaginationOrderBy) {
-  issues(filter: $filter, first: $first, orderBy: $orderBy) {
+	queryListIssues = `query ListIssues($filter: IssueFilter, $first: Int, $after: String, $orderBy: PaginationOrderBy) {
+  issues(filter: $filter, first: $first, after: $after, orderBy: $orderBy) {
     nodes { ...IssueFields }
+    pageInfo { hasNextPage endCursor }
   }
 }
 ` + issueFragment
@@ -459,19 +460,88 @@ func (c *Client) ListIssuesByProject(ctx context.Context, projectName string, st
 	return nodesToIssues(data.Issues.Nodes), nil
 }
 
-// ListIssues returns issues matching the given filter map.
-// filter is sent verbatim as the GraphQL IssueFilter variable.
-func (c *Client) ListIssues(ctx context.Context, filter map[string]any, limit int, orderBy string) ([]Issue, error) {
-	vars := map[string]any{
-		"filter":  filter,
-		"first":   limit,
-		"orderBy": orderBy,
+const (
+	maxIssueListPageSize = 250
+	maxIssueListPages    = 100
+	// MaxIssueListLimit bounds automatic pagination to 100 Linear pages.
+	MaxIssueListLimit = maxIssueListPageSize * maxIssueListPages
+)
+
+// ValidateIssueListLimit reports whether limit is safe for bounded automatic
+// pagination. Commands should call it before resolving any network-backed
+// filters; ListIssues also calls it so non-CLI consumers receive the same
+// contract.
+func ValidateIssueListLimit(limit int) error {
+	if limit <= 0 {
+		return fmt.Errorf("issue list limit must be positive")
 	}
-	var data listIssuesData
-	if err := c.do(ctx, queryListIssues, vars, &data); err != nil {
+	if limit > MaxIssueListLimit {
+		return fmt.Errorf("issue list limit %d exceeds maximum %d", limit, MaxIssueListLimit)
+	}
+	return nil
+}
+
+// ListIssues returns up to limit unique issues matching the given filter map.
+// filter is sent verbatim as the GraphQL IssueFilter variable. Linear caps a
+// connection page at 250 nodes, so larger limits are fetched using cursors.
+// The page bound prevents a malformed or unexpectedly large connection from
+// causing unbounded network work.
+func (c *Client) ListIssues(ctx context.Context, filter map[string]any, limit int, orderBy string) ([]Issue, error) {
+	if err := ValidateIssueListLimit(limit); err != nil {
 		return nil, err
 	}
-	return nodesToIssues(data.Issues.Nodes), nil
+
+	var after *string
+	issues := make([]Issue, 0, limit)
+	seenIssueIDs := make(map[string]struct{}, limit)
+	seenCursors := make(map[string]struct{})
+	for page := 0; page < maxIssueListPages; page++ {
+		pageSize := min(limit-len(issues), maxIssueListPageSize)
+		vars := map[string]any{
+			"filter":  filter,
+			"first":   pageSize,
+			"after":   after,
+			"orderBy": orderBy,
+		}
+		var data paginatedListIssuesData
+		if err := c.do(ctx, queryListIssues, vars, &data); err != nil {
+			return nil, err
+		}
+		if data.Issues == nil {
+			return nil, fmt.Errorf("issues connection is missing")
+		}
+		if data.Issues.Nodes == nil {
+			return nil, fmt.Errorf("issues nodes are missing")
+		}
+		if len(*data.Issues.Nodes) > pageSize {
+			return nil, fmt.Errorf("issues returned %d nodes for page size %d", len(*data.Issues.Nodes), pageSize)
+		}
+
+		for i, node := range *data.Issues.Nodes {
+			if node.ID == "" {
+				return nil, fmt.Errorf("issues node %d id is missing", i)
+			}
+			if _, duplicate := seenIssueIDs[node.ID]; duplicate {
+				continue
+			}
+			seenIssueIDs[node.ID] = struct{}{}
+			issues = append(issues, nodeToIssue(node))
+		}
+
+		next, complete, err := nextConnectionPage("issues", data.Issues.PageInfo, after)
+		if err != nil {
+			return nil, err
+		}
+		if complete || len(issues) == limit {
+			return issues, nil
+		}
+		if _, repeated := seenCursors[*next]; repeated {
+			return nil, fmt.Errorf("issues cursor cycle detected at %q", *next)
+		}
+		seenCursors[*next] = struct{}{}
+		after = next
+	}
+	return nil, fmt.Errorf("issues: exceeded %d pages", maxIssueListPages)
 }
 
 // ListSubIssues returns the direct children of the given parent issue ID.

@@ -1037,6 +1037,9 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		Short:        "List issues with flexible filters",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := linear.ValidateIssueListLimit(limit); err != nil {
+				return err
+			}
 			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
@@ -1107,10 +1110,6 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				}
 			}
 
-			if limit == 0 {
-				limit = 50
-			}
-
 			gqlOrderBy := "createdAt"
 			if orderBy == "updatedAt" {
 				gqlOrderBy = "updatedAt"
@@ -1122,7 +1121,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 			}
 
 			// Sort by priority (0 = no priority → goes last, treated as 5)
-			sort.Slice(issues, func(i, j int) bool {
+			sort.SliceStable(issues, func(i, j int) bool {
 				pi := issues[i].Priority
 				if pi == 0 {
 					pi = 5
@@ -1167,7 +1166,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 	cmd.Flags().IntVar(&priority, "priority", 0, "Filter by priority (1-4)")
 	cmd.Flags().StringVar(&assignee, "assignee", "", "Filter by assignee name, email, or 'me'")
 	cmd.Flags().StringVar(&team, "team", "", "Filter by team name")
-	cmd.Flags().IntVar(&limit, "limit", 50, "Maximum number of issues to return")
+	cmd.Flags().IntVar(&limit, "limit", 50, fmt.Sprintf("Maximum number of issues to return (max %d)", linear.MaxIssueListLimit))
 	cmd.Flags().StringVar(&orderBy, "order-by", "createdAt", "Sort order: createdAt or updatedAt")
 	cmd.Flags().StringVar(&query, "query", "", "Text search query")
 
