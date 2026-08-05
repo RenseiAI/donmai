@@ -1,5 +1,7 @@
 package ptyhost
 
+import "bytes"
+
 // oscTitleFilter is a narrow streaming filter for OSC 0/1/2 title controls.
 // It protects the headless snapshot emulator from title payloads while leaving
 // every other terminal sequence available to the emulator, including queries
@@ -34,10 +36,15 @@ const (
 	oscTitleSelectorMax = 16
 )
 
-// Write returns bytes suitable for the snapshot emulator. The returned slice
-// never aliases p or internal storage. Partial ESC/OSC state carries across
-// calls so every split point is equivalent to a contiguous write.
+// Write returns bytes suitable for the snapshot emulator. Ordinary chunks with
+// no OSC introducer are returned directly; filtered chunks are newly allocated.
+// The filter never mutates p. Partial ESC/OSC state carries across calls so
+// every split point is equivalent to a contiguous write.
 func (f *oscTitleFilter) Write(p []byte) []byte {
+	if f.state == oscTitleGround && f.utf8Rem == 0 &&
+		bytes.IndexByte(p, oscTitleESC) < 0 && bytes.IndexByte(p, oscTitleC1OSC) < 0 {
+		return p
+	}
 	out := make([]byte, 0, len(p))
 	for i := 0; i < len(p); {
 		if f.step(p[i], &out) {
