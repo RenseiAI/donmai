@@ -34,8 +34,9 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 //
 // Spec → CLI mapping (interactive spawn mode):
 //
-//	Autonomous → --permission-mode bypassPermissions
-//	Prompt     → positional argument, ALWAYS LAST
+//	Autonomous         → --permission-mode bypassPermissions
+//	SystemPromptAppend → --append-system-prompt <text>
+//	Prompt             → positional argument, ALWAYS LAST
 //
 // The Autonomous mapping is deliberately byte-identical to buildArgs' (see
 // cli_args.go) — one convention, two spawn modes. Before it existed the
@@ -61,6 +62,13 @@ func interactiveArgs(spec agent.Spec) []string {
 	// buildArgs' identical branch.
 	if spec.Autonomous {
 		argv = append(argv, "--permission-mode", "bypassPermissions")
+	}
+
+	// SystemPromptAppend carries the composed session instructions assembled
+	// by the runner. The Claude REPL accepts the same flag as the headless CLI;
+	// omit it when empty so a bare interactive session stays bare.
+	if spec.SystemPromptAppend != "" {
+		argv = append(argv, "--append-system-prompt", spec.SystemPromptAppend)
 	}
 
 	// Positional prompt LAST — every flag-shaped argument precedes it.
