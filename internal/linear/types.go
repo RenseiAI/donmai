@@ -232,6 +232,15 @@ type listIssuesData struct {
 	} `json:"issues"`
 }
 
+type issueConnection struct {
+	Nodes    *[]issueNode        `json:"nodes"`
+	PageInfo *connectionPageInfo `json:"pageInfo"`
+}
+
+type paginatedListIssuesData struct {
+	Issues *issueConnection `json:"issues"`
+}
+
 type getIssueData struct {
 	Issue *issueNode `json:"issue"`
 }

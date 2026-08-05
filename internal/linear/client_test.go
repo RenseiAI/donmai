@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,6 +46,21 @@ func writeGQLError(w http.ResponseWriter, msg string) {
 		"errors": []map[string]any{{"message": msg}},
 	}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func writeIssuePage(w http.ResponseWriter, nodes []issueNode, hasNext bool, endCursor *string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"data": map[string]any{
+			"issues": map[string]any{
+				"nodes": nodes,
+				"pageInfo": map[string]any{
+					"hasNextPage": hasNext,
+					"endCursor":   endCursor,
+				},
+			},
+		},
+	})
 }
 
 func TestListTeamsPaginates(t *testing.T) {
@@ -589,6 +605,219 @@ func TestNewProxiedClient(t *testing.T) {
 }
 
 // --- ListIssuesByProject ---
+
+func TestListIssuesPaginatesAboveLinearPageLimit(t *testing.T) {
+	t.Parallel()
+
+	var requests []map[string]any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests = append(requests, req.Variables)
+		if !strings.Contains(req.Query, "$after: String") || !strings.Contains(req.Query, "pageInfo { hasNextPage endCursor }") {
+			t.Fatalf("query does not request cursor pagination: %s", req.Query)
+		}
+
+		start := 0
+		count := 250
+		hasNext := true
+		var cursor *string
+		if req.Variables["after"] != nil {
+			start = 250
+			count = 50
+			hasNext = false
+		} else {
+			value := "page-1"
+			cursor = &value
+		}
+		nodes := make([]issueNode, count)
+		for i := range nodes {
+			nodes[i].ID = fmt.Sprintf("issue-%03d", start+i)
+			nodes[i].Identifier = fmt.Sprintf("ENG-%d", start+i)
+			nodes[i].Title = fmt.Sprintf("Issue %d", start+i)
+		}
+		writeIssuePage(w, nodes, hasNext, cursor)
+	})
+
+	filter := map[string]any{"team": map[string]any{"id": map[string]any{"eq": "team-1"}}}
+	issues, err := c.ListIssues(context.Background(), filter, 300, "updatedAt")
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(issues) != 300 || issues[0].ID != "issue-000" || issues[299].ID != "issue-299" {
+		t.Fatalf("issues length/order = %d, first=%q last=%q", len(issues), issues[0].ID, issues[len(issues)-1].ID)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(requests))
+	}
+	if requests[0]["first"] != float64(250) || requests[0]["after"] != nil {
+		t.Fatalf("first request variables = %#v", requests[0])
+	}
+	if requests[1]["first"] != float64(50) || requests[1]["after"] != "page-1" {
+		t.Fatalf("second request variables = %#v", requests[1])
+	}
+	if requests[0]["orderBy"] != "updatedAt" {
+		t.Fatalf("orderBy = %#v, want updatedAt", requests[0]["orderBy"])
+	}
+}
+
+func TestListIssuesDeduplicatesAndPreservesFirstSeenOrder(t *testing.T) {
+	t.Parallel()
+
+	var afters []any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		afters = append(afters, req.Variables["after"])
+		issue := func(id string) issueNode {
+			return issueNode{ID: id, Identifier: strings.ToUpper(id), Title: id}
+		}
+		switch len(afters) {
+		case 1:
+			cursor := "page-1"
+			writeIssuePage(w, []issueNode{issue("a"), issue("b"), issue("c")}, true, &cursor)
+		case 2:
+			if req.Variables["first"] != float64(1) {
+				t.Fatalf("second page first = %#v, want 1", req.Variables["first"])
+			}
+			cursor := "page-2"
+			writeIssuePage(w, []issueNode{issue("c")}, true, &cursor)
+		default:
+			writeIssuePage(w, []issueNode{issue("d")}, false, nil)
+		}
+	})
+
+	issues, err := c.ListIssues(context.Background(), nil, 4, "createdAt")
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	got := make([]string, len(issues))
+	for i := range issues {
+		got[i] = issues[i].ID
+	}
+	if strings.Join(got, ",") != "a,b,c,d" {
+		t.Fatalf("issue order = %v, want [a b c d]", got)
+	}
+	if fmt.Sprint(afters) != "[<nil> page-1 page-2]" {
+		t.Fatalf("after cursors = %v", afters)
+	}
+}
+
+func TestListIssuesRejectsInvalidLimitsWithoutRequest(t *testing.T) {
+	t.Parallel()
+
+	requests := 0
+	c, _ := newTestClient(t, func(http.ResponseWriter, *http.Request) { requests++ })
+	for _, limit := range []int{0, -1, MaxIssueListLimit + 1} {
+		issues, err := c.ListIssues(context.Background(), nil, limit, "createdAt")
+		if err == nil {
+			t.Fatalf("limit %d: want error", limit)
+		}
+		if issues != nil {
+			t.Fatalf("limit %d: returned partial issues %#v", limit, issues)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("network requests = %d, want 0", requests)
+	}
+}
+
+func TestListIssuesFailsClosedOnMalformedConnection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		data    string
+		wantErr string
+	}{
+		{name: "missing connection", data: `{}`, wantErr: "issues connection is missing"},
+		{name: "missing nodes", data: `{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, wantErr: "issues nodes are missing"},
+		{name: "missing page info", data: `{"issues":{"nodes":[]}}`, wantErr: "issues pageInfo is missing"},
+		{name: "missing has next page", data: `{"issues":{"nodes":[],"pageInfo":{"endCursor":null}}}`, wantErr: "issues pageInfo is missing"},
+		{name: "missing cursor", data: `{"issues":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":null}}}`, wantErr: "issues hasNextPage without endCursor"},
+		{name: "missing issue id", data: `{"issues":{"nodes":[{"identifier":"ENG-1"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, wantErr: "issues node 0 id is missing"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				writeGQLData(w, tc.data)
+			})
+			issues, err := c.ListIssues(context.Background(), nil, 10, "createdAt")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ListIssues error = %v, want %q", err, tc.wantErr)
+			}
+			if issues != nil {
+				t.Fatalf("returned partial issues: %#v", issues)
+			}
+		})
+	}
+}
+
+func TestListIssuesRejectsPageLargerThanRequested(t *testing.T) {
+	t.Parallel()
+
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeIssuePage(w, []issueNode{{ID: "issue-1"}, {ID: "issue-2"}}, false, nil)
+	})
+	issues, err := c.ListIssues(context.Background(), nil, 1, "createdAt")
+	if err == nil || !strings.Contains(err.Error(), "issues returned 2 nodes for page size 1") {
+		t.Fatalf("ListIssues error = %v, want oversized-page error", err)
+	}
+	if issues != nil {
+		t.Fatalf("returned partial issues: %#v", issues)
+	}
+}
+
+func TestListIssuesFailsClosedOnCursorCycle(t *testing.T) {
+	t.Parallel()
+
+	request := 0
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		request++
+		cursor := "page-1"
+		if request == 2 {
+			cursor = "page-2"
+		}
+		writeIssuePage(w, []issueNode{}, true, &cursor)
+	})
+
+	issues, err := c.ListIssues(context.Background(), nil, 1, "createdAt")
+	if err == nil || !strings.Contains(err.Error(), `issues cursor cycle detected at "page-1"`) {
+		t.Fatalf("ListIssues error = %v, want cursor-cycle error", err)
+	}
+	if issues != nil {
+		t.Fatalf("returned partial issues: %#v", issues)
+	}
+}
+
+func TestListIssuesDiscardsPartialResultsWhenLaterPageFails(t *testing.T) {
+	t.Parallel()
+
+	request := 0
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		request++
+		if request == 1 {
+			cursor := "page-1"
+			writeIssuePage(w, []issueNode{{ID: "issue-1", Identifier: "ENG-1"}}, true, &cursor)
+			return
+		}
+		writeGQLError(w, "later page denied")
+	})
+
+	issues, err := c.ListIssues(context.Background(), nil, 2, "createdAt")
+	if !errors.Is(err, ErrGraphQLError) {
+		t.Fatalf("ListIssues error = %v, want ErrGraphQLError", err)
+	}
+	if issues != nil {
+		t.Fatalf("returned partial issues: %#v", issues)
+	}
+}
 
 func TestListIssuesByProjectSuccess(t *testing.T) {
 	t.Parallel()

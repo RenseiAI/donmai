@@ -892,7 +892,7 @@ func TestLinearListIssues(t *testing.T) {
 	handler := &multiHandler{
 		responses: map[string]string{
 			"ListProjects": proj,
-			"ListIssues":   fmt.Sprintf(`{"issues":{"nodes":[%s,%s]}}`, issue1, issue2),
+			"ListIssues":   fmt.Sprintf(`{"issues":{"nodes":[%s,%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, issue1, issue2),
 		},
 	}
 
@@ -906,6 +906,66 @@ func TestLinearListIssues(t *testing.T) {
 	arr := decodeJSONArray(t, out)
 	if len(arr) != 2 {
 		t.Fatalf("got %d issues, want 2", len(arr))
+	}
+	first := arr[0].(map[string]any)
+	second := arr[1].(map[string]any)
+	if first["id"] != "ENG-1" || second["id"] != "ENG-2" {
+		t.Fatalf("equal-priority issue order changed: %#v", arr)
+	}
+}
+
+func TestLinearListIssuesPaginatesLargeLimitWithoutChangingJSONArray(t *testing.T) {
+	request := 0
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if !strings.Contains(req.Query, "ListIssues") {
+			writeLinearGQLData(w, `{}`)
+			return
+		}
+		request++
+		if request == 1 {
+			if req.Variables["first"] != float64(250) || req.Variables["after"] != nil {
+				t.Fatalf("first-page variables = %#v", req.Variables)
+			}
+			cursor := "page-1"
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s],"pageInfo":{"hasNextPage":true,"endCursor":%q}}}`,
+				issueNodeJSON("issue-1", "ENG-1", "First", "Backlog", "team-1", "ENG", "Engineering"), cursor))
+			return
+		}
+		if req.Variables["first"] != float64(250) || req.Variables["after"] != "page-1" {
+			t.Fatalf("second-page variables = %#v", req.Variables)
+		}
+		writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`,
+			issueNodeJSON("issue-2", "ENG-2", "Second", "Backlog", "team-1", "ENG", "Engineering")))
+	})
+
+	out, err := runLinearCmd(t, "", "list-issues", "--limit", "300")
+	if err != nil {
+		t.Fatalf("list-issues failed: %v\nout: %s", err, out)
+	}
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 2 || request != 2 {
+		t.Fatalf("output/request count = %d/%d, want 2/2", len(arr), request)
+	}
+}
+
+func TestLinearListIssuesRejectsInvalidLimit(t *testing.T) {
+	requests := 0
+	setupLinearTest(t, func(http.ResponseWriter, *http.Request) { requests++ })
+	for _, limit := range []string{"0", "-1", "25001"} {
+		_, err := runLinearCmd(t, "", "list-issues", "--limit", limit, "--project", "would-require-network")
+		if err == nil || !strings.Contains(err.Error(), "issue list limit") {
+			t.Fatalf("limit %s: error = %v, want issue-list-limit error", limit, err)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("network requests = %d, want 0", requests)
 	}
 }
 
@@ -1903,7 +1963,7 @@ func TestLinearCreateBlocker(t *testing.T) {
 			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`)
 		case strings.Contains(req.Query, "ListIssues"):
 			// Dedup check — no duplicates
-			writeLinearGQLData(w, `{"issues":{"nodes":[]}}`)
+			writeLinearGQLData(w, `{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "ListTeams"):
 			writeLinearGQLData(w, teamJSON)
 		case strings.Contains(req.Query, "ListWorkflowStates"):
