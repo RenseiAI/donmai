@@ -43,7 +43,8 @@ version file to bump.
 - A clean, current `main` checkout.
 - Go 1.25.12 or newer. `go.mod` is the canonical toolchain floor used by CI,
   security scanning, E2B builds, and release builds.
-- GoReleaser v2 for local dry-runs.
+- GoReleaser v2.17.1 for local dry-runs. The release workflow pins this exact
+  version because its verified phase order is part of the signing contract.
 - GitHub CLI authenticated to `RenseiAI/donmai`.
 - Repository release secrets:
   - `HOMEBREW_TAP_GITHUB_TOKEN`, with write access to
@@ -81,8 +82,12 @@ version file to bump.
    ```
 
    `make release-dry-run` runs GoReleaser in snapshot mode and explicitly skips
-   the production signing pipe. It does not publish, tag, or modify the
-   Homebrew tap.
+   the production signing pipes. It does not publish, tag, or modify the
+   Homebrew tap. `bash scripts/test-release-workflows.sh` separately exercises
+   the signing script's fail-closed behavior with local test doubles. Before a
+   signing-pipeline change is merged, run `bash
+   scripts/test-sign-and-notarize.sh --goreleaser` to build a locally mocked
+   signed snapshot and prove the registered artifacts and final-input hashes.
 
 4. Commit the release preparation and merge it to `main`. Do not release from
    an unmerged branch or a dirty checkout.
@@ -131,11 +136,11 @@ gh workflow run e2b-template.yml --ref main -f tag=vX.Y.Z
 The `--ref` value selects the workflow definition. Each workflow's required
 `tag` input selects a namespace-qualified, detached checkout of
 `refs/tags/vX.Y.Z`, so a same-name branch cannot win ref resolution. The current
-workflow's verifier, E2B wrapper, and GoReleaser latest policy are staged outside
-the workspace before that tag checkout, allowing retries of tags that predate
-the hardening. Before signing, building, or publishing, the shared verifier
-enforces the release-tag grammar, proves detached `HEAD`, and proves that `HEAD`
-equals the tag's peeled commit. The verified tag is exported as
+workflow's verifier, signing script, E2B wrapper, and GoReleaser policy are
+staged outside the workspace before that tag checkout, allowing retries of tags
+that predate the hardening. Before signing, building, or publishing, the shared
+verifier enforces the release-tag grammar, proves detached `HEAD`, and proves
+that `HEAD` equals the tag's peeled commit. The verified tag is exported as
 `GORELEASER_CURRENT_TAG` and is also the only source for published image,
 template, and embedded binary versions.
 
@@ -181,6 +186,11 @@ Confirm:
 - All four archives and `checksums.txt` are attached, each with a Sigstore
   `.sig` + `.pem` pair, plus a `.codesign.txt` notarization record for the
   darwin archives.
+
+  The `.pem` files must appear as GitHub assets. `cosign
+  --output-certificate` creating a local file is insufficient on its own;
+  `.goreleaser.yaml` must declare `certificate:` so GoReleaser registers and
+  uploads each certificate.
 
   Note the rename: `.sig` used to be a five-line text file — for linux it
   literally read `Signature: none` — while being described as "provenance".
@@ -259,20 +269,33 @@ release assets. Do not hand-edit the generated cask in this repository.
 ## macOS signing and notarization
 
 The release job runs on macOS and imports the Developer ID Application
-certificate into an ephemeral keychain. GoReleaser invokes
-`scripts/sign-and-notarize.sh` for each archive.
+certificate into an ephemeral keychain. GoReleaser v2.17.1 runs the relevant
+phases in this order:
 
-For each Darwin archive, the script:
+```text
+build -> binary_signs -> archives -> checksums -> signs -> publish
+```
 
-1. Extracts the archive.
-2. Signs each executable with hardened runtime and a timestamp.
-3. Wraps each signed executable in a temporary ZIP accepted by `notarytool`.
-4. Requires `notarytool` to return `status: Accepted`.
-5. Repacks the signed executable into the original tarball.
-6. Verifies that the repacked binary has a Developer ID Application authority.
+The Darwin and Linux builds have separate IDs. `binary_signs` selects only the
+Darwin ID and invokes the staged current `scripts/sign-and-notarize.sh` before
+any archive exists. For each Darwin binary, the script:
 
-Linux archives are not code-signed and receive a provenance sidecar explaining
-that fact.
+1. Rejects archive or non-Darwin input.
+2. Signs the binary with hardened runtime and a timestamp.
+3. Verifies the embedded signature before the notary service round trip.
+4. Wraps the binary in a temporary ZIP accepted by `notarytool`.
+5. Requires `notarytool` to return `status: Accepted`.
+6. Verifies the exact binary GoReleaser will archive has a Developer ID
+   Application authority and is not only linker-signed.
+7. Emits the archive-named `.codesign.txt` record registered by `binary_signs`.
+
+GoReleaser then packages the already signed binaries and computes checksums over
+those final archives. The remaining `signs` entries only read their disjoint
+final inputs: one keyless-signs archives and one keyless-signs `checksums.txt`.
+Both declare `certificate:`, so their `.sig` and `.pem` outputs are registered
+for publication. Linux binaries are not Apple code-signed and do not receive a
+`.codesign.txt` record; their final archives still receive Sigstore signatures
+and certificates.
 
 A `.tar.gz` archive cannot carry a stapled notarization ticket. Gatekeeper
 checks the accepted notarization ticket online when a quarantined binary first

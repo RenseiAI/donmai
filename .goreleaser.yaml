@@ -3,7 +3,11 @@ version: 2
 project_name: donmai
 
 builds:
-  - id: donmai
+  # Keep Darwin and Linux as separate build IDs so the pre-archive signing
+  # pipe can select macOS binaries without relying on a Pro-only `if` filter.
+  # GoReleaser runs binary_signs after builds and before archives, so the
+  # archive and checksum pipes only ever observe the final signed binaries.
+  - id: donmai-darwin
     main: ./cmd/donmai
     binary: donmai
     ldflags:
@@ -16,8 +20,20 @@ builds:
     env:
       - CGO_ENABLED=0
     goos:
-      - linux
       - darwin
+    goarch:
+      - amd64
+      - arm64
+
+  - id: donmai-linux
+    main: ./cmd/donmai
+    binary: donmai
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
     goarch:
       - amd64
       - arm64
@@ -28,14 +44,17 @@ archives:
       - tar.gz
     name_template: "donmai_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
-# macOS code signing + notarization.
+# macOS code signing + notarization happens to each Darwin binary before the
+# archive pipe. This is deliberately a binary_signs entry rather than a signs
+# entry: GoReleaser calculates checksums before signs, and separate signs
+# entries run concurrently. A signs command must therefore never mutate an
+# archive that another signer or the checksum manifest is reading.
 #
-# Sign darwin binaries with the Apple Developer ID Application certificate
-# (Yuisei-iOS enrollment). Hardened runtime is enabled
-# (--options runtime) which is mandatory for notarization. After signing,
-# the archive is submitted to Apple's notarytool service for stapler-less
-# online notarization (.tar.gz can't be stapled; binaries get notarization
-# tickets via online check).
+# Sign Darwin binaries with the Apple Developer ID Application certificate.
+# Hardened runtime is enabled (--options runtime), which is mandatory for
+# notarization. After signing, each binary is wrapped in a temporary ZIP for
+# notarytool. The final tar.gz is created later and cannot be stapled; its
+# binary receives the accepted ticket through Gatekeeper's online check.
 #
 # Why we shell out to native `codesign` + `xcrun notarytool` instead of
 # GoReleaser's built-in `notarize:` block:
@@ -54,32 +73,28 @@ archives:
 #
 # Local dry-run note: use `make release-dry-run`, which passes `--skip=sign`
 # explicitly. Snapshot mode skips publication but GoReleaser v2 still runs
-# custom sign pipes unless told otherwise. Real signing fires on tag-pushed CI
-# runs that have the APPLE_* secrets set.
-signs:
+# custom binary_signs/signs pipes unless told otherwise. Real signing fires on
+# tag-pushed CI runs that have the APPLE_* secrets set.
+binary_signs:
   - id: macos-codesign-and-notarize
-    artifacts: archive
-    # No `ids:` filter — apply to all archives. The script's case statement
-    # filters by *_darwin_* and skips Linux archives. Previously this was
-    # `ids: [donmai]` but archive id is `default` (see archives block above), so
-    # the signs block silently skipped every artifact in v0.3.2.
-    cmd: ./scripts/sign-and-notarize.sh
+    artifacts: binary
+    ids:
+      - donmai-darwin
+    # The release workflow puts the staged current script on PATH before it
+    # checks out the requested tag. Manual retries therefore pair the current
+    # config with the current script instead of an older incompatible copy.
+    cmd: donmai-sign-and-notarize
     args:
       - "${artifact}"
-    # Explicitly NOT `${artifact}.sig`. This block emits a human-readable
-    # notarization record, not a detached signature — codesign embeds the real
-    # signature inside the binary. Sigstore owns `.sig` (see cosign-keyless
-    # below), and before this rename both wrote the same path, so which file
-    # shipped depended on signs[] ordering: a reorder would have published a
-    # five-line text file reading "Signature: none" under a name that means
-    # "signature".
-    signature: "${artifact}.codesign.txt"
+      - "${signature}"
+    # GoReleaser registers this as an uploadable signature artifact while the
+    # actual Apple signature remains embedded in the binary. The name matches
+    # the final archive produced later in the pipeline.
+    signature: "donmai_{{ .Version }}_{{ .Os }}_{{ .Arch }}.tar.gz.codesign.txt"
     output: true
 
-  # Sigstore keyless signing — covers EVERY archive on EVERY platform, which is
-  # what the macOS signer above cannot do by construction: sign-and-notarize.sh
-  # short-circuits every non-darwin archive with `exit 0`, so before this block
-  # the only thing shipped for Linux was checksums.txt.
+signs:
+  # Sigstore keyless signing covers every final archive on every platform.
   #
   # Keyless (OIDC) on purpose: no private key exists to store, rotate, or leak.
   # The GitHub Actions OIDC token identifies the workflow, cosign records the
@@ -99,10 +114,14 @@ signs:
     args:
       - sign-blob
       - "--yes"
-      - "--output-certificate=${signature}.pem"
+      - "--output-certificate=${certificate}"
       - "--output-signature=${signature}"
       - "${artifact}"
     signature: "${artifact}.sig"
+    # A file emitted only through cosign's --output-certificate flag is not an
+    # artifact GoReleaser knows to upload. Declaring it here registers it as a
+    # Certificate artifact and provides ${certificate} to the command.
+    certificate: "${artifact}.pem"
     output: true
 
   # The checksum manifest is the root of trust for anyone verifying by digest,
@@ -113,10 +132,11 @@ signs:
     args:
       - sign-blob
       - "--yes"
-      - "--output-certificate=${signature}.pem"
+      - "--output-certificate=${certificate}"
       - "--output-signature=${signature}"
       - "${artifact}"
     signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
     output: true
 
 homebrew_casks:

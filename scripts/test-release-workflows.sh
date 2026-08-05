@@ -211,6 +211,16 @@ grep -Fq 'GORELEASER_MAKE_LATEST' "${root_dir}/.goreleaser.yaml" || fail 'GoRele
 grep -Fq 'GORELEASER_PUBLISH_HOMEBREW' "${root_dir}/.goreleaser.yaml" || fail 'GoReleaser Homebrew policy is not wired to the verified release policy'
 grep -Fq 'skip_upload:' "${root_dir}/.goreleaser.yaml" || fail 'GoReleaser Homebrew publisher cannot be skipped for safe retries'
 grep -Fq 'runner.temp }}/goreleaser.yaml' "${root_dir}/.github/workflows/release.yml" || fail 'manual retries can fall back to an older GoReleaser publication policy'
+grep -Fq 'binary_signs:' "${root_dir}/.goreleaser.yaml" || fail 'Apple signing is not in the pre-archive binary signing pipe'
+grep -Fq 'cmd: donmai-sign-and-notarize' "${root_dir}/.goreleaser.yaml" || fail 'Apple signing does not use the staged current release script'
+grep -Fq 'donmai-darwin' "${root_dir}/.goreleaser.yaml" || fail 'Apple signing is not scoped to Darwin binaries'
+certificate_count=$(grep -Fc 'certificate: "${artifact}.pem"' "${root_dir}/.goreleaser.yaml")
+[[ "${certificate_count}" == 2 ]] || fail 'archive and checksum certificates are not both registered with GoReleaser'
+grep -Fq 'install -m 0755 scripts/sign-and-notarize.sh' "${root_dir}/.github/workflows/release.yml" || fail 'manual retries can pair the current config with an older signing script'
+grep -Fq 'version: "v2.17.1"' "${root_dir}/.github/workflows/release.yml" || fail 'release GoReleaser version is not pinned to the verified pipeline implementation'
+if awk '/^signs:/{in_signs=1} in_signs && /^[[:space:]]+cmd:.*sign-and-notarize/{found=1} END{exit found ? 0 : 1}' "${root_dir}/.goreleaser.yaml"; then
+  fail 'archive/checksum signs pipe still invokes the archive-mutating Apple signer'
+fi
 grep -Fq 'steps.release.outputs.image_tags' "${root_dir}/.github/workflows/worker-image.yml" || fail 'worker image tags do not come from verified release policy'
 grep -Fq 'steps.release.outputs.e2b_template_ref' "${root_dir}/.github/workflows/e2b-template.yml" || fail 'E2B build does not use the immutable version target'
 grep -Fq 'steps.release.outputs.e2b_additional_tags' "${root_dir}/.github/workflows/e2b-template.yml" || fail 'E2B rolling default policy is not event-scoped'
@@ -225,8 +235,9 @@ assert_line '  contents: read' "${pr_workflow}"
 assert_line '          platforms: linux/amd64,linux/arm64' "${pr_workflow}"
 assert_line '          push: false' "${pr_workflow}"
 assert_line "            DONMAI_VERSION=pr-\${{ github.event.pull_request.number }}-\${{ github.sha }}" "${pr_workflow}"
-assert_line '          cache-from: type=gha,scope=worker-image-pr' "${pr_workflow}"
-assert_line '          cache-to: type=gha,mode=max,scope=worker-image-pr' "${pr_workflow}"
+if grep -Eq '^[[:space:]]+cache-(from|to):' "${pr_workflow}"; then
+  fail 'PR worker workflow duplicates the Blacksmith builder cache'
+fi
 
 permission_count=$(grep -Ec '^  [a-z-]+: (read|write|none)$' "${pr_workflow}")
 [[ "${permission_count}" == 1 ]] || fail 'PR worker workflow permissions are not contents:read only'
@@ -304,5 +315,7 @@ Promise.resolve()
     process.exitCode = 1
   })
 NODE
+
+bash "${root_dir}/scripts/test-sign-and-notarize.sh"
 
 printf 'release workflow tests: PASS\n'

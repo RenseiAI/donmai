@@ -60,6 +60,10 @@ jobs:
         run: |
           install -m 0755 scripts/verify-release-tag.sh "${RUNNER_TEMP}/verify-release-tag.sh"
           install -m 0644 .goreleaser.yaml "${RUNNER_TEMP}/goreleaser.yaml"
+          install -d "${RUNNER_TEMP}/release-bin"
+          install -m 0755 scripts/sign-and-notarize.sh \
+            "${RUNNER_TEMP}/release-bin/donmai-sign-and-notarize"
+          echo "${RUNNER_TEMP}/release-bin" >> "${GITHUB_PATH}"
 
       - name: Checkout release tag
         uses: actions/checkout@v7
@@ -131,7 +135,9 @@ jobs:
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
-          version: "~> v2"
+          # Keep the verified pipeline order fixed: binary_signs -> archives ->
+          # checksums -> signs. Upgrade only with a source/docs re-verification.
+          version: "v2.17.1"
           args: release --clean --config ${{ runner.temp }}/goreleaser.yaml
 
       # Build provenance for every published archive. This is a different claim

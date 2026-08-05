@@ -1,63 +1,54 @@
 #!/usr/bin/env bash
 #
-# Sign + notarize a darwin tar.gz archive containing macOS binaries.
+# Sign + notarize one Darwin binary before GoReleaser archives it.
 #
-# Invoked by GoReleaser's `signs:` block (see .goreleaser.yaml). Replaces
-# the broken built-in `notarize:` block which fails with
-# `failed to verify certificate chain: x509: unhandled critical extension`
-# (Go's strict x509 parser rejects Apple's critical extension
-# 1.2.840.113635.100.6.1.13).
+# Invoked by GoReleaser's `binary_signs:` block (see .goreleaser.yaml). Native
+# codesign remains necessary because Go's strict x509 parser rejects Apple's
+# Developer ID critical extension; native notarytool also supports the Apple ID
+# credential shape used by this release workflow.
 #
-# Skips non-darwin archives. For darwin archives:
-#   1. Look up the Developer ID Application identity in the keychain
-#      (set up by the `Import Apple Developer ID cert to keychain` step
-#      in .github/workflows/release.yml).
-#   2. Extract the archive, codesign each executable inside with hardened
-#      runtime (--options=runtime, mandatory for notarization) and a stable
-#      bundle identifier (--identifier com.renseiai.<binary>).
-#   3. Wrap each signed binary in a temp .zip and submit to Apple's
-#      notarytool service. notarytool only accepts .zip / .pkg / .dmg —
-#      submitting a .tar.gz directly fails. Apple ID + app-specific
-#      password is used (matches our existing secret shape — not App Store
-#      Connect API keys).
-#   4. Assert notarytool reports `status: Accepted`. Anything else fails
-#      the script and the release job.
-#   5. Repack the signed binaries into the original .tar.gz path so
-#      downstream archive consumers (checksums.txt, GitHub release upload)
-#      see the signed artifact.
-#   6. Verify the final archive by extracting and running `codesign -dvvv`
-#      — must show a Developer ID Authority chain (NOT linker-signed).
+# The pipeline contract is deliberate and fail-closed:
+#   1. GoReleaser builds a Darwin binary.
+#   2. This command signs and notarizes that binary in place.
+#   3. This command verifies the exact binary that GoReleaser will package.
+#   4. GoReleaser creates the archive, calculates its final checksum, and only
+#      then keyless-signs the final archive and checksum manifest.
 #
-# Note: tar.gz archives can't be stapled. Binaries get notarization tickets
-# via online check on first run (Gatekeeper hits Apple's CDN).
-#
-# Required env vars (provided by .github/workflows/release.yml):
-#   APPLE_DEVELOPER_ID   — Apple ID email for the developer account
-#   APPLE_PASSWORD       — app-specific password (NOT the account password)
-#   APPLE_TEAM_ID        — Apple Developer team ID
+# Archive input is rejected. This prevents a future config regression from
+# reintroducing stale checksums or concurrent in-place archive mutation.
+# Tar archives cannot carry a stapled notarization ticket; Gatekeeper checks the
+# accepted ticket online when the quarantined binary first runs.
 
 set -euo pipefail
 
-archive="${1:?usage: $0 <archive-path>}"
+binary="${1:?usage: $0 <darwin-binary-path> <record-path>}"
+record="${2:?usage: $0 <darwin-binary-path> <record-path>}"
 
-case "$archive" in
-  *_darwin_*) ;;
+case "$binary" in
+  *.tar|*.tar.gz|*.tgz|*.zip)
+    echo "::error::sign-and-notarize requires a pre-archive Darwin binary, not $binary" >&2
+    exit 1
+    ;;
+  *_darwin_*/donmai) ;;
   *)
-    echo "sign-and-notarize: skipping non-darwin archive: $archive"
-    # Emit the notarization record GoReleaser's signs[] block expects.
-    # Non-darwin archives are not codesigned — they are signed by Sigstore
-    # (cosign keyless), which writes the real detached `.sig` + `.pem`.
-    # This file is a record, never a signature; the name says so.
-    {
-      echo "Signature: none"
-      echo "Reason: non-darwin archive — no codesigning required"
-      echo "Archive: $(basename "$archive")"
-    } > "$archive.codesign.txt"
-    exit 0
+    echo "::error::sign-and-notarize rejected non-Darwin build artifact: $binary" >&2
+    exit 1
     ;;
 esac
 
-echo "sign-and-notarize: processing $archive"
+case "$record" in
+  *.tar.gz.codesign.txt) ;;
+  *)
+    echo "::error::sign-and-notarize record must end in .tar.gz.codesign.txt: $record" >&2
+    exit 1
+    ;;
+esac
+
+: "${APPLE_DEVELOPER_ID:?APPLE_DEVELOPER_ID is required}"
+: "${APPLE_PASSWORD:?APPLE_PASSWORD is required}"
+: "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
+
+echo "sign-and-notarize: processing $binary"
 
 IDENTITY="$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/{print $2; exit}')"
 if [ -z "${IDENTITY:-}" ]; then
@@ -71,109 +62,71 @@ echo "sign-and-notarize: using identity: $IDENTITY"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-tar -xzf "$archive" -C "$tmpdir"
+binname="$(basename "$binary")"
+identifier="com.renseiai.${binname}"
 
-# Sign + notarize each executable inside the archive.
-#
-# notarytool only accepts .zip / .pkg / .dmg, so we zip each signed binary
-# individually for submission. The .tar.gz repack happens after notarization
-# completes (step 5). Bundle identifier is derived from the binary's basename
-# (e.g. `af` -> `com.renseiai.af`, `rensei` -> `com.renseiai.rensei`).
-while IFS= read -r -d '' bin; do
-  binname="$(basename "$bin")"
-  identifier="com.renseiai.${binname}"
+echo "sign-and-notarize: codesigning $binary (identifier=$identifier)"
+codesign --force \
+  --options=runtime \
+  --timestamp \
+  --identifier "$identifier" \
+  --sign "$IDENTITY" \
+  "$binary"
 
-  echo "sign-and-notarize: codesigning $bin (identifier=$identifier)"
-  codesign --force \
-    --options=runtime \
-    --timestamp \
-    --identifier "$identifier" \
-    --sign "$IDENTITY" \
-    "$bin"
+# Verify before paying for a notary service round trip.
+codesign --verify --verbose=2 "$binary"
 
-  # Sanity-check the signature locally before paying for a notarytool round trip.
-  codesign --verify --verbose=2 "$bin"
+zip_path="${tmpdir}/notarize-${binname}.zip"
+echo "sign-and-notarize: zipping $binary -> $zip_path for notarytool submit"
+(cd "$(dirname "$binary")" && zip -j -q "$zip_path" "$binname")
 
-  zip_path="$(mktemp -t "notarize-${binname}").zip"
-  rm -f "$zip_path"
-  echo "sign-and-notarize: zipping $bin -> $zip_path for notarytool submit"
-  (cd "$(dirname "$bin")" && zip -j -q "$zip_path" "$binname")
+echo "sign-and-notarize: submitting $zip_path to notarytool..."
+notarize_log="${tmpdir}/notarytool.log"
+if ! xcrun notarytool submit "$zip_path" \
+      --apple-id "$APPLE_DEVELOPER_ID" \
+      --password "$APPLE_PASSWORD" \
+      --team-id "$APPLE_TEAM_ID" \
+      --wait \
+      --timeout 20m 2>&1 | tee "$notarize_log"; then
+  echo "::error::notarytool submit failed for $binary"
+  exit 1
+fi
 
-  echo "sign-and-notarize: submitting $zip_path to notarytool..."
-  notarize_log="$(mktemp)"
-  if ! xcrun notarytool submit "$zip_path" \
-        --apple-id "$APPLE_DEVELOPER_ID" \
-        --password "$APPLE_PASSWORD" \
-        --team-id "$APPLE_TEAM_ID" \
-        --wait \
-        --timeout 20m 2>&1 | tee "$notarize_log"; then
-    echo "::error::notarytool submit failed for $bin"
-    rm -f "$zip_path" "$notarize_log"
-    exit 1
-  fi
+if ! grep -Eiq '^[[:space:]]*status:[[:space:]]*Accepted[[:space:]]*$' "$notarize_log"; then
+  echo "::error::notarytool did not report status: Accepted for $binary"
+  echo "----- notarytool output -----"
+  cat "$notarize_log"
+  echo "-----------------------------"
+  exit 1
+fi
 
-  # notarytool prints `  status: Accepted` on success. Anything else
-  # (Invalid, In Progress timeout, etc.) is a hard failure.
-  if ! grep -Eiq '^[[:space:]]*status:[[:space:]]*Accepted[[:space:]]*$' "$notarize_log"; then
-    echo "::error::notarytool did not report status: Accepted for $bin"
-    echo "----- notarytool output -----"
-    cat "$notarize_log"
-    echo "-----------------------------"
-    rm -f "$zip_path" "$notarize_log"
-    exit 1
-  fi
+echo "sign-and-notarize: notarization Accepted for $binary"
 
-  echo "sign-and-notarize: notarization Accepted for $bin"
-  rm -f "$zip_path" "$notarize_log"
-done < <(find "$tmpdir" -type f -perm -111 -print0)
+# Confirm the binary that GoReleaser will package carries a Developer ID
+# Application signature and is not only linker-signed. Capture output first so
+# pipefail cannot turn grep's early success into a spurious SIGPIPE failure.
+verify_log="${tmpdir}/codesign.log"
+echo "sign-and-notarize: verifying $binary"
+codesign -dvvv "$binary" > "$verify_log" 2>&1
+if ! grep -qE '^Authority=Developer ID Application:' "$verify_log"; then
+  echo "::error::signed binary $binary is missing Developer ID Application signature"
+  cat "$verify_log"
+  exit 1
+fi
+if grep -q 'linker-signed' "$verify_log"; then
+  echo "::error::signed binary $binary is still linker-signed"
+  cat "$verify_log"
+  exit 1
+fi
 
-# Repack with the original name now that the binaries are signed + notarized.
-# Capture absolute path before `cd "$tmpdir"` because $archive is relative
-# to goreleaser's cwd, not to $tmpdir (v0.3.5 bug fix).
-archive_abs="$(cd "$(dirname "$archive")" && pwd)/$(basename "$archive")"
-(cd "$tmpdir" && tar -czf "$archive_abs.signed" .)
-mv "$archive_abs.signed" "$archive_abs"
-
-# Final verification: re-extract the repacked archive and confirm the
-# binaries carry a Developer ID Application signature (NOT linker-signed).
-verify_dir="$(mktemp -d)"
-tar -xzf "$archive" -C "$verify_dir"
-verify_log="$(mktemp)"
-while IFS= read -r -d '' bin; do
-  echo "sign-and-notarize: verifying $bin"
-  # Write codesign output to a file first; piping `... | tee | grep -q`
-  # combined with `set -o pipefail` triggers a spurious failure because
-  # grep -q sends SIGPIPE to tee on first match (v0.3.5 bug fix).
-  codesign -dvvv "$bin" > "$verify_log" 2>&1
-  if ! grep -qE '^Authority=Developer ID Application:' "$verify_log"; then
-    echo "::error::repacked archive binary $bin is missing Developer ID Application signature"
-    cat "$verify_log"
-    rm -f "$verify_log"
-    rm -rf "$verify_dir"
-    exit 1
-  fi
-  if grep -q 'linker-signed' "$verify_log"; then
-    echo "::error::repacked archive binary $bin is still linker-signed"
-    cat "$verify_log"
-    rm -f "$verify_log"
-    rm -rf "$verify_dir"
-    exit 1
-  fi
-done < <(find "$verify_dir" -type f -perm -111 -print0)
-rm -f "$verify_log"
-rm -rf "$verify_dir"
-
-# Write a sidecar record describing the embedded signature.
-# GoReleaser's signs[] block expects ${artifact}.codesign.txt to exist (it uploads
-# it as a release asset). Codesign signatures are embedded in each Mach-O
-# binary inside the .tar.gz, so there's no detached signature artifact —
-# this file provides human-readable provenance.
+# binary_signs registers this archive-named record as an uploadable signature
+# artifact. The Apple signature itself remains embedded in the binary.
 {
   echo "Signature: embedded (codesign + notarytool)"
   echo "Identity: $IDENTITY"
   echo "Notarization: Accepted"
-  echo "Archive: $(basename "$archive")"
+  echo "Archive: $(basename "${record%.codesign.txt}")"
   echo "Verify: tar -xzf <archive>; codesign -dvvv <binary>"
-} > "$archive.codesign.txt"
+} > "$record"
 
-echo "sign-and-notarize: done — $archive"
+echo "sign-and-notarize: done — $binary"
