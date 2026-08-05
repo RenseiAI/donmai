@@ -154,10 +154,10 @@ type QueuedWork struct {
 	// replaces the runner's default system_base.tmpl content when
 	// non-empty. The override arrives opaquely from the platform's
 	// dispatch layer and is not interpreted by the runner beyond
-	// substituting the system prompt string. When empty or absent the
-	// runner falls back to the baseline system_base.tmpl rendering
-	// (backward-compatible; all existing dispatches without this field
-	// are unaffected).
+	// substituting the system prompt string. The runner always prefixes its
+	// immutable content-safety preamble. When empty or absent the runner falls
+	// back to the baseline system_base.tmpl rendering (backward-compatible; all
+	// existing dispatches without this field are unaffected).
 	//
 	// Wire shape: "systemPromptOverride" (camelCase, omitempty). Populated
 	// by the platform's agent.dispatch_stage action when the resolved

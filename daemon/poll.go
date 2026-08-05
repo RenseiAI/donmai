@@ -95,8 +95,9 @@ type PollWorkItem struct {
 
 	// SystemPromptOverride is the per-session platform-supplied system
 	// prompt that replaces the runner's default system_base.tmpl render
-	// when non-empty. The leaf consumer at `prompt/builder.go` already
-	// reads `qw.SystemPromptOverride`; this struct field is the wire-
+	// when non-empty, after the runner's immutable content-safety preamble.
+	// The leaf consumer at `prompt/builder.go` already reads
+	// `qw.SystemPromptOverride`; this struct field is the wire-
 	// shape forwarder. Without it Go's strict JSON decoder drops the
 	// platform's emit (unknown-field discard) — backlog-writer
 	// sessions fell through to system_base.tmpl and produced developer-
