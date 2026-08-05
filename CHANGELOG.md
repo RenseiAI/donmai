@@ -6,6 +6,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.57.2 — 2026-08-05
+
+### Fixes
+
+- **Reconnect snapshots no longer display terminal-title control payloads.**
+  Donmai now filters OSC 0, 1, and 2 title controls before bytes enter the
+  headless snapshot emulator, while preserving byte-exact live output,
+  recordings, non-title OSC controls, terminal query responses, Unicode, and
+  behavior across chunk boundaries.
+
+---
+
 ## v0.57.1 — 2026-08-04
 
 ### Features
