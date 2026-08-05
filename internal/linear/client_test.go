@@ -679,6 +679,78 @@ func TestGetIssueNullReturnsNotFound(t *testing.T) {
 	}
 }
 
+// --- Issue label mutations ---
+
+func TestCreateIssueLabelUsesExplicitTeamScope(t *testing.T) {
+	t.Parallel()
+	var gotInput map[string]any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if !strings.Contains(req.Query, "issueLabelCreate") {
+			t.Fatalf("query = %q, want issueLabelCreate", req.Query)
+		}
+		gotInput, _ = req.Variables["input"].(map[string]any)
+		writeGQLData(w, `{"issueLabelCreate":{"success":true,"issueLabel":{"id":"label-1","name":"Security"}}}`)
+	})
+
+	label, err := c.CreateIssueLabel(context.Background(), "Security", "team-1")
+	if err != nil {
+		t.Fatalf("CreateIssueLabel: %v", err)
+	}
+	if label.ID != "label-1" || label.Name != "Security" {
+		t.Fatalf("label = %#v", label)
+	}
+	if gotInput["name"] != "Security" || gotInput["teamId"] != "team-1" {
+		t.Fatalf("input = %#v, want name and teamId", gotInput)
+	}
+}
+
+func TestCreateIssueLabelRejectsMissingTeamWithoutRequest(t *testing.T) {
+	t.Parallel()
+	requests := 0
+	c, _ := newTestClient(t, func(http.ResponseWriter, *http.Request) {
+		requests++
+	})
+
+	label, err := c.CreateIssueLabel(context.Background(), "Security", "")
+	if err == nil || !strings.Contains(err.Error(), "team id is required") {
+		t.Fatalf("CreateIssueLabel error = %v", err)
+	}
+	if label != nil || requests != 0 {
+		t.Fatalf("label = %#v, requests = %d; want no request", label, requests)
+	}
+}
+
+func TestAddIssueLabelUsesAdditiveMutation(t *testing.T) {
+	t.Parallel()
+	var gotVars map[string]any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if !strings.Contains(req.Query, "issueAddLabel") || strings.Contains(req.Query, "issueUpdate") {
+			t.Fatalf("query = %q, want only issueAddLabel", req.Query)
+		}
+		gotVars = req.Variables
+		writeGQLData(w, `{"issueAddLabel":{"success":true,"issue":{"id":"issue-1","identifier":"ENG-1","title":"Issue","state":{"name":"Backlog"},"team":{"id":"team-1","key":"ENG","name":"Engineering"},"labels":{"nodes":[{"id":"label-1","name":"Security"}]}}}}`)
+	})
+
+	issue, err := c.AddIssueLabel(context.Background(), "issue-1", "label-1")
+	if err != nil {
+		t.Fatalf("AddIssueLabel: %v", err)
+	}
+	if gotVars["id"] != "issue-1" || gotVars["labelId"] != "label-1" {
+		t.Fatalf("variables = %#v", gotVars)
+	}
+	if issue.ID != "issue-1" || len(issue.Labels) != 1 || issue.Labels[0].ID != "label-1" {
+		t.Fatalf("issue = %#v", issue)
+	}
+}
+
 // --- ListSubIssues ---
 
 func TestListSubIssuesSuccess(t *testing.T) {

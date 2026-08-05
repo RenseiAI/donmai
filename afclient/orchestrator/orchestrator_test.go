@@ -115,6 +115,14 @@ func (m *mockLinear) UpdateIssue(_ context.Context, _ string, _ linear.UpdateIss
 	return nil, nil
 }
 
+func (m *mockLinear) CreateIssueLabel(_ context.Context, _, _ string) (*linear.Label, error) {
+	return nil, nil
+}
+
+func (m *mockLinear) AddIssueLabel(_ context.Context, _, _ string) (*linear.Issue, error) {
+	return nil, nil
+}
+
 func (m *mockLinear) CreateComment(_ context.Context, _, _ string) (*linear.Comment, error) {
 	return nil, nil
 }
