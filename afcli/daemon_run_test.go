@@ -4,11 +4,56 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
 )
+
+func TestDaemonRunControlBindPreflight(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		args     []string
+		wantHost string
+		wantPort int
+		wantErr  string
+	}{
+		{name: "default", wantHost: "127.0.0.1", wantPort: 0},
+		{name: "embedded loopback port", args: []string{"--host", "localhost:8123"}, wantHost: "localhost", wantPort: 8123},
+		{name: "matching ports", args: []string{"--host", "[::1]:8123", "--port", "8123"}, wantHost: "::1", wantPort: 8123},
+		{name: "reject wildcard", args: []string{"--host", "0.0.0.0"}, wantErr: "refusing non-loopback"},
+		{name: "reject conflict", args: []string{"--host", "127.0.0.1:8123", "--port", "8124"}, wantErr: "conflicts with explicit port"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cmd := newDaemonRunCmd("")
+			if err := cmd.Flags().Parse(tt.args); err != nil {
+				t.Fatalf("parse flags: %v", err)
+			}
+			err := cmd.PreRunE(cmd, nil)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("PreRunE() error = %v, want containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("PreRunE(): %v", err)
+			}
+			if got := cmd.Flags().Lookup("host").Value.String(); got != tt.wantHost {
+				t.Fatalf("host after preflight = %q, want %q", got, tt.wantHost)
+			}
+			if got := cmd.Flags().Lookup("port").Value.String(); got != strconv.Itoa(tt.wantPort) {
+				t.Fatalf("port after preflight = %q, want %d", got, tt.wantPort)
+			}
+		})
+	}
+}
 
 // TestFormatStartupWorkerLine covers the startup-line regression: the daemon startup log used to
 // print `[daemon] worker-id worker-test-machine-stub` in stub mode, which
