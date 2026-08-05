@@ -6,6 +6,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.57.3 — 2026-08-05
+
+### Fixes
+
+- **Linear project discovery stays within the upstream query complexity
+  budget.** Project catalogs now paginate in bounded batches while preserving
+  complete catalog traversal and team membership data. Structured GraphQL
+  errors returned with non-success HTTP statuses also retain their actionable
+  server message.
+
+---
+
 ## v0.57.2 — 2026-08-05
 
 ### Fixes
