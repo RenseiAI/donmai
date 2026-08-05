@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -138,8 +139,10 @@ const (
 	  }
 }`
 
+	// Keep the outer page at 25 because expanding 100 projects by 100 teams
+	// exceeds Linear's 10,000 point query complexity limit.
 	queryListProjects = `query ListProjects($filter: ProjectFilter, $after: String) {
-	  projects(filter: $filter, first: 100, after: $after) {
+	  projects(filter: $filter, first: 25, after: $after) {
 	    nodes {
 	      id name state
 	      teams(first: 100) {
@@ -335,17 +338,24 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if err := statusToError(resp.StatusCode); err != nil {
-		return err
-	}
-
 	// Decode the outer envelope; the generic "out" value carries the typed data.
 	var env struct {
 		Data   json.RawMessage `json:"data"`
 		Errors []graphqlError  `json:"errors,omitempty"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return fmt.Errorf("linear: decode response: %w", err)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("linear: read response: %w", err)
+	}
+	decodeErr := json.Unmarshal(body, &env)
+	if statusErr := statusToError(resp.StatusCode); statusErr != nil {
+		if decodeErr == nil && len(env.Errors) > 0 {
+			return fmt.Errorf("%w: %w: %s", statusErr, ErrGraphQLError, env.Errors[0].Message)
+		}
+		return statusErr
+	}
+	if decodeErr != nil {
+		return fmt.Errorf("linear: decode response: %w", decodeErr)
 	}
 	if len(env.Errors) > 0 {
 		return fmt.Errorf("%w: %s", ErrGraphQLError, env.Errors[0].Message)

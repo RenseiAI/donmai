@@ -339,6 +339,39 @@ func TestListProjectsFiltersByResolvedTeamAndPreservesState(t *testing.T) {
 	}
 }
 
+func TestListProjectsUsesComplexitySafePagesAndPaginates(t *testing.T) {
+	var cursors []any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if !strings.Contains(req.Query, "projects(filter: $filter, first: 25, after: $after)") {
+			t.Fatalf("project query does not use the complexity-safe page size: %s", req.Query)
+		}
+		if !strings.Contains(req.Query, "teams(first: 100)") {
+			t.Fatalf("project query no longer requests complete team membership: %s", req.Query)
+		}
+		cursors = append(cursors, req.Variables["after"])
+		if len(cursors) == 1 {
+			writeGQLData(w, `{"projects":{"nodes":[{"id":"project-1","name":"Launch","state":"started","teams":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}`)
+			return
+		}
+		writeGQLData(w, `{"projects":{"nodes":[{"id":"project-2","name":"Follow-up","state":"planned","teams":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+	})
+
+	projects, err := c.ListProjects(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if len(projects) != 2 || projects[0].ID != "project-1" || projects[1].ID != "project-2" {
+		t.Fatalf("projects = %#v, want both pages", projects)
+	}
+	if len(cursors) != 2 || cursors[0] != nil || cursors[1] != "cursor-1" {
+		t.Fatalf("after cursors = %#v, want [nil cursor-1]", cursors)
+	}
+}
+
 func TestListProjectsRejectsTruncatedTeamMembership(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeGQLData(w, `{"projects":{"nodes":[{"id":"project-1","name":"Launch","state":"started","teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":true,"endCursor":"more"}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
@@ -1051,6 +1084,22 @@ func TestGraphQLErrorInBody(t *testing.T) {
 	_, err := c.GetIssue(context.Background(), "bad-id")
 	if !errors.Is(err, ErrGraphQLError) {
 		t.Fatalf("got %v, want ErrGraphQLError", err)
+	}
+}
+
+func TestGraphQLErrorInHTTPErrorBody(t *testing.T) {
+	t.Parallel()
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"The query is too complex"}]}`))
+	})
+	_, err := c.GetIssue(context.Background(), "bad-id")
+	if !errors.Is(err, ErrGraphQLError) {
+		t.Fatalf("got %v, want ErrGraphQLError", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "The query is too complex") {
+		t.Fatalf("got %v, want GraphQL response detail", err)
 	}
 }
 
