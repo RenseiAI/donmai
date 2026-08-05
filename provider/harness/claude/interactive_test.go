@@ -41,6 +41,16 @@ func TestInteractiveArgs(t *testing.T) {
 			spec: agent.Spec{Autonomous: true},
 			want: []string{"--permission-mode", "bypassPermissions"},
 		},
+		{
+			name: "system prompt append precedes the positional prompt",
+			spec: agent.Spec{Prompt: "fix the bug", SystemPromptAppend: "use project conventions"},
+			want: []string{"--append-system-prompt", "use project conventions", "fix the bug"},
+		},
+		{
+			name: "empty system prompt append adds no flag",
+			spec: agent.Spec{Prompt: "fix the bug", SystemPromptAppend: ""},
+			want: []string{"fix the bug"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -51,6 +61,54 @@ func TestInteractiveArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInteractiveArgs_SystemPromptAppendMatchesHeadless is the regression
+// guard for the prompt-delivery defect: an interactive REPL must receive the
+// same composed system append as a headless invocation of the same Spec.
+func TestInteractiveArgs_SystemPromptAppendMatchesHeadless(t *testing.T) {
+	t.Parallel()
+
+	const flag = "--append-system-prompt"
+	flagValueOf := func(argv []string) (string, bool) {
+		i := slices.Index(argv, flag)
+		if i < 0 || i+1 >= len(argv) {
+			return "", false
+		}
+		return argv[i+1], true
+	}
+
+	t.Run("non-empty append", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Prompt: "ship it", SystemPromptAppend: "follow local conventions"}
+
+		headless, _ := buildArgs(spec, "", "")
+		headlessAppend, ok := flagValueOf(headless)
+		if !ok {
+			t.Fatalf("headless buildArgs dropped %s", flag)
+		}
+
+		interactiveAppend, ok := flagValueOf(interactiveArgs(spec))
+		if !ok {
+			t.Fatalf("interactiveArgs dropped %s", flag)
+		}
+		if interactiveAppend != headlessAppend {
+			t.Error("system prompt append divergence between interactive and headless argv")
+		}
+	})
+
+	t.Run("empty append", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Prompt: "ship it"}
+
+		headless, _ := buildArgs(spec, "", "")
+		if _, ok := flagValueOf(headless); ok {
+			t.Errorf("headless buildArgs emitted %s for an empty append", flag)
+		}
+		if _, ok := flagValueOf(interactiveArgs(spec)); ok {
+			t.Errorf("interactiveArgs emitted %s for an empty append", flag)
+		}
+	})
 }
 
 // TestInteractiveArgs_AutonomousMatchesHeadlessPermissionMode is the
