@@ -6,6 +6,48 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.57.1 — 2026-08-04
+
+### Features
+
+- **Keyless release signatures and build provenance for every shipped
+  archive.** Release artifacts and `checksums.txt` now receive Sigstore
+  keyless signatures with published certificates, while separate build
+  attestations record the source commit and workflow that built each artifact.
+- **Linear routing catalogs.** `linear list-teams` and `linear list-projects`
+  provide deterministic, exhaustively paginated routing data, including stable
+  membership rows for projects shared by multiple teams.
+
+### Fixes
+
+- **Blocker resolution fails closed.** Relation reads now reject malformed,
+  incomplete, unknown, or truncated data instead of treating an issue as
+  unblocked.
+- **Linear label operations are scoped and safe.** Unknown requested labels
+  stop create and update operations before mutation; team-scoped label catalogs
+  include only applicable team and workspace labels; and `apply-label --create`
+  creates an applicable team label, handles a concurrent duplicate safely, and
+  uses additive label updates.
+- **Interactive Claude sessions retain their composed system-prompt append,**
+  while content-as-data safety instructions are applied after base or override
+  prompt selection so a system override cannot replace them.
+- **Linear issue listings paginate beyond one upstream page** while preserving
+  output order and rejecting malformed, cyclic, oversized, or truncated page
+  data.
+- **Daemon control listeners reject non-loopback binds before opening a
+  socket,** including through direct library use.
+- **Release signing now operates on final artifacts deterministically.**
+  Developer ID signing and notarization happen before archive and checksum
+  creation, and signing certificates are registered for release publication.
+
+### Chores
+
+- Retired the obsolete AF-TUI and AgentFactory names from user-facing text,
+  while preserving compatibility-only identifiers and historical references
+  where they remain part of an existing contract.
+
+---
+
 ## v0.57.0 — 2026-08-03
 
 ### Features
