@@ -23,6 +23,9 @@ jobs:
       - name: Closed-source content guard
         run: bash scripts/leak-guard.sh --all
 
+      - name: Release workflow contract tests
+        run: bash scripts/test-release-workflows.sh
+
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
