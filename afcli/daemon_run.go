@@ -95,6 +95,15 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			"Run interactively for development with `--skip-wizard` to bypass\n" +
 			"the first-run setup. SIGTERM / SIGINT triggers a graceful drain.",
 		SilenceUsage: true,
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			bindHost, bindPort, err := daemon.ResolveControlBind(host, port, cmd.Flags().Changed("port"))
+			if err != nil {
+				return fmt.Errorf("daemon control listener: %w", err)
+			}
+			host = bindHost
+			port = bindPort
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Rotate the launchd-managed log files before anything writes
 			// to them this run, then re-check periodically for long-lived
@@ -284,7 +293,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 
 	cmd.Flags().StringVar(&configPath, "config", "", "Path to daemon.yaml (default: ~/.donmai/daemon.yaml)")
 	cmd.Flags().StringVar(&jwtPath, "jwt-path", "", "Path to cached JWT (default: ~/.donmai/daemon.jwt)")
-	cmd.Flags().StringVar(&host, "host", "", "HTTP bind host (default: 127.0.0.1)")
+	cmd.Flags().StringVar(&host, "host", "", "HTTP bind host or host:port (loopback only; default: 127.0.0.1)")
 	cmd.Flags().IntVar(&port, "port", 0, "HTTP bind port (default: 7734)")
 	cmd.Flags().BoolVar(&skipWizard, "skip-wizard", false, "Skip the first-run setup wizard")
 	cmd.Flags().StringVar(&standaloneCreds, "standalone-creds", "auto",

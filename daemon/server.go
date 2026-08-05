@@ -90,6 +90,11 @@ func (s *Server) Start() (<-chan error, error) {
 	if s.started {
 		return nil, errors.New("server already started")
 	}
+	host, port, err := ResolveControlBind(s.daemon.opts.HTTPHost, s.daemon.opts.HTTPPort, s.daemon.opts.HTTPPort != 0)
+	if err != nil {
+		return nil, fmt.Errorf("control listener configuration: %w", err)
+	}
+	s.httpd.Addr = net.JoinHostPort(host, strconv.Itoa(port))
 	listener, err := net.Listen("tcp", s.httpd.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen %q: %w", s.httpd.Addr, err)
