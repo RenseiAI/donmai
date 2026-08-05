@@ -265,6 +265,20 @@ type updateIssueData struct {
 	} `json:"issueUpdate"`
 }
 
+type createIssueLabelData struct {
+	IssueLabelCreate struct {
+		Success    bool       `json:"success"`
+		IssueLabel *labelNode `json:"issueLabel"`
+	} `json:"issueLabelCreate"`
+}
+
+type addIssueLabelData struct {
+	IssueAddLabel struct {
+		Success bool       `json:"success"`
+		Issue   *issueNode `json:"issue"`
+	} `json:"issueAddLabel"`
+}
+
 type connectionPageInfo struct {
 	HasNextPage *bool   `json:"hasNextPage"`
 	EndCursor   *string `json:"endCursor"`
