@@ -64,8 +64,8 @@ NOT apply to an interview session.
 // buildInterviewSystemPrompt prepends the hardened interview persona
 // (parameterised with the completion sentinel) to the upstream-supplied
 // system prompt override. The result is assigned back onto
-// QueuedWork.SystemPromptOverride so the prompt builder emits it verbatim
-// (the builder uses SystemPromptOverride as the entire system prompt).
+// QueuedWork.SystemPromptOverride so the prompt builder emits it immediately
+// after the runner-owned content-safety preamble.
 //
 // upstream is qw.SystemPromptOverride as received from the platform (which
 // already folds the compiled interview-definition phase guidance). The

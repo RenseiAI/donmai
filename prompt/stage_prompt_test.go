@@ -151,7 +151,7 @@ func TestBuilderBuild_StagePromptOverridesIssueContext(t *testing.T) {
 
 // TestBuilderBuild_SystemPromptOverride covers the upstream-supplied system
 // prompt override path. When QueuedWork.SystemPromptOverride is non-empty,
-// Build uses it verbatim as the system prompt instead of rendering
+// Build uses it after the immutable content-safety preamble instead of rendering
 // system_base.tmpl. The user prompt is unaffected by the override.
 func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 	t.Parallel()
@@ -172,9 +172,9 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Build returned err: %v", err)
 		}
-		// System prompt must be the override verbatim.
-		if system != overrideText {
-			t.Errorf("expected system=%q, got %q", overrideText, system)
+		// The override remains byte-identical after the immutable preamble.
+		if !strings.HasSuffix(system, "\n\n"+overrideText) {
+			t.Errorf("expected system to end with override %q, got %q", overrideText, system)
 		}
 		// User prompt must still contain the stage prompt body.
 		if !strings.Contains(user, "Implement the feature described in the issue.") {
@@ -203,8 +203,8 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Build returned err: %v", err)
 		}
-		if system != overrideText {
-			t.Errorf("expected system=%q, got %q", overrideText, system)
+		if !strings.HasSuffix(system, "\n\n"+overrideText) {
+			t.Errorf("expected system to end with override %q, got %q", overrideText, system)
 		}
 		// User prompt comes from the legacy template and must contain the identifier.
 		if !strings.Contains(user, "ENG-9002") {

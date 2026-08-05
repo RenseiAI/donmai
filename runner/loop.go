@@ -371,12 +371,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 
 	// Interview mode: prepend the hardened interview persona to
 	// the upstream-supplied system-prompt override BEFORE rendering so the
-	// prompt builder emits persona-first (the builder uses
-	// SystemPromptOverride verbatim as the entire system prompt). The
-	// persona pins the agent into one-question-per-turn / thinking-only
-	// behaviour and survives a cloned-repo CLAUDE.md (a live sandbox run proves the
-	// hostile-CLAUDE.md case in a live sandbox). Headless runs are
-	// untouched — this only fires when qw.Mode == interview.
+	// prompt builder emits it immediately after the runner-owned content-safety
+	// preamble. The persona pins the agent into one-question-per-turn /
+	// thinking-only behaviour and survives a cloned-repo CLAUDE.md (a live
+	// sandbox run proves the hostile-CLAUDE.md case in a live sandbox). Headless
+	// runs are untouched — this only fires when qw.Mode == interview.
 	if qw.isInterview() {
 		qw.SystemPromptOverride = buildInterviewSystemPrompt(
 			qw.SystemPromptOverride, interview.InterviewCompleteSentinel)
