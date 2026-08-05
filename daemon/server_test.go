@@ -766,6 +766,10 @@ func TestServer_SessionStop_HappyPath(t *testing.T) {
 	if d.ActiveSessionCount() != 1 {
 		t.Fatalf("ActiveSessionCount before stop = %d, want 1", d.ActiveSessionCount())
 	}
+	released, ok := d.spawner.sessionRelease("stop-me")
+	if !ok {
+		t.Fatal("stop-me release signal not found")
+	}
 
 	var resp afclient.DaemonActionResponse
 	status := requirePost(t, srv.Addr(), "/api/daemon/sessions/stop-me/stop", nil, &resp)
@@ -776,6 +780,7 @@ func TestServer_SessionStop_HappyPath(t *testing.T) {
 		t.Errorf("resp.OK = false, want true (%+v)", resp)
 	}
 	waitSessionEnd(t, ended)
+	waitSpawnerSignal(t, released, "stop-me registry release")
 	if d.ActiveSessionCount() != 0 {
 		t.Errorf("ActiveSessionCount after stop = %d, want 0", d.ActiveSessionCount())
 	}
@@ -880,11 +885,16 @@ func TestServer_SessionStop_LeavesSiblingRunning(t *testing.T) {
 	if d.ActiveSessionCount() != 2 {
 		t.Fatalf("ActiveSessionCount = %d, want 2", d.ActiveSessionCount())
 	}
+	released, ok := d.spawner.sessionRelease("drop")
+	if !ok {
+		t.Fatal("drop release signal not found")
+	}
 
 	if status := requirePost(t, srv.Addr(), "/api/daemon/sessions/drop/stop", nil, nil); status != http.StatusOK {
 		t.Fatalf("stop status = %d, want 200", status)
 	}
 	waitSessionEnd(t, ended)
+	waitSpawnerSignal(t, released, "drop registry release")
 	if d.ActiveSessionCount() != 1 {
 		t.Fatalf("ActiveSessionCount after stop = %d, want 1", d.ActiveSessionCount())
 	}

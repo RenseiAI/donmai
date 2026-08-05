@@ -216,6 +216,7 @@ type spawnedSession struct {
 	handle                SessionHandle
 	cmd                   *exec.Cmd
 	cancel                context.CancelFunc
+	released              chan struct{}
 	spec                  SessionSpec
 	stopRequested         bool                  // guarded by WorkerSpawner.mu
 	forceKillRequested    bool                  // guarded by WorkerSpawner.mu
@@ -811,10 +812,11 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	}
 
 	ss := &spawnedSession{
-		handle: handle,
-		cmd:    cmd,
-		cancel: cancel,
-		spec:   spec,
+		handle:   handle,
+		cmd:      cmd,
+		cancel:   cancel,
+		released: make(chan struct{}),
+		spec:     spec,
 	}
 
 	s.mu.Lock()
@@ -1187,8 +1189,23 @@ func (s *WorkerSpawner) emitAndReleaseSession(id string, expected *spawnedSessio
 	s.mu.Lock()
 	if s.sessions[id] == expected {
 		delete(s.sessions, id)
+		close(expected.released)
 	}
 	s.mu.Unlock()
+}
+
+// sessionRelease returns a signal for the exact currently owned generation.
+// It closes only after terminal listeners return and the generation is removed
+// from the active registry, so lifecycle tests can synchronize with release
+// without inferring it from the earlier Ended event.
+func (s *WorkerSpawner) sessionRelease(id string) (<-chan struct{}, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ss := s.sessions[id]
+	if ss == nil {
+		return nil, false
+	}
+	return ss.released, true
 }
 
 // reapSession removes expected from the live registry and builds its terminal
