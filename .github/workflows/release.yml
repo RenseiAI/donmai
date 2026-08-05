@@ -95,7 +95,7 @@ jobs:
 
       # Import the Apple Developer ID Application certificate into an
       # ephemeral RUNNER_TEMP keychain so `codesign` (invoked by
-      # scripts/sign-and-notarize.sh via GoReleaser's signs: block) can find
+      # scripts/sign-and-notarize.sh via GoReleaser's binary_signs: block) can find
       # the signing identity. RUNNER_TEMP is auto-cleaned up after the job,
       # so this never pollutes the runner's default keychain.
       #
