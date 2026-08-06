@@ -69,6 +69,8 @@ type Handle struct {
 	closed       chan struct{}
 	eventsMu     sync.RWMutex
 	eventsClosed atomic.Bool
+	mcpRelease   func()
+	mcpOnce      sync.Once
 
 	state *mapperState
 }
@@ -183,12 +185,26 @@ func (h *Handle) signalClosed() {
 // the closed channel.
 func (h *Handle) closeEvents() {
 	h.eventsMu.Lock()
-	defer h.eventsMu.Unlock()
 	if h.eventsClosed.Load() {
+		h.eventsMu.Unlock()
 		return
 	}
 	h.eventsClosed.Store(true)
 	close(h.events)
+	h.eventsMu.Unlock()
+
+	if h.provider != nil {
+		h.provider.unregisterHandle(h)
+	}
+	h.releaseMCPConfig()
+}
+
+func (h *Handle) releaseMCPConfig() {
+	h.mcpOnce.Do(func() {
+		if h.mcpRelease != nil {
+			h.mcpRelease()
+		}
+	})
 }
 
 // start performs the JSON-RPC bring-up: optional MCP config push,

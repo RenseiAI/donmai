@@ -2,7 +2,6 @@ package opencode
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -251,8 +250,8 @@ func TestServerHandle_StopIdempotentAndAborts(t *testing.T) {
 
 // TestProvider_SpawnServer_AttachWiring drives the full Provider.Spawn Lane-B
 // path (attach mode + injected client factory) end to end without a real
-// binary, and confirms the per-session opencode.json was written with the
-// provider lockout.
+// binary. Attach mode must not write or claim activation of a local project
+// config: the external server owns its own configuration.
 func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 	t.Parallel()
 	fc := newFakeClient()
@@ -264,9 +263,6 @@ func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 	spec := agent.Spec{
 		Prompt: "do it",
 		Cwd:    cwd,
-		Endpoint: &agent.EndpointBinding{
-			Company: agent.CompanyOpenAI, Model: "gpt-x", BaseURL: "http://compat/v1",
-		},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -284,21 +280,11 @@ func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 		t.Errorf("initial prompts = %d, want 1", nPrompts)
 	}
 
-	// The per-session config was written with the lockout.
+	// No local project config is written: an attached external server would
+	// not read it, so writing it would overstate the adapter's authority.
 	cfgPath := filepath.Join(cwd, ".donmai-opencode", "opencode.json")
-	data, err := os.ReadFile(cfgPath)
-	if err != nil {
-		t.Fatalf("read injected config: %v", err)
-	}
-	var cfg ocConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("config JSON: %v", err)
-	}
-	if len(cfg.EnabledProviders) != 1 || cfg.EnabledProviders[0] != OCProviderID {
-		t.Errorf("enabled_providers = %v, want [%s] (fallback lockout)", cfg.EnabledProviders, OCProviderID)
-	}
-	if cfg.Model != OCProviderID+"/gpt-x" {
-		t.Errorf("config model = %q, want %s/gpt-x", cfg.Model, OCProviderID)
+	if _, err := os.Stat(cfgPath); !os.IsNotExist(err) {
+		t.Fatalf("attach mode wrote an inactive project config: %v", err)
 	}
 
 	// Terminate cleanly through a terminal frame.

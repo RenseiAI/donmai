@@ -20,8 +20,10 @@ type fakeServer struct {
 	stdin  *io.PipeReader // server reads from here (provider's stdin write end)
 	stdout *io.PipeWriter // server writes here (provider's stdout read end)
 
-	mu      sync.Mutex
-	threads map[string]bool
+	mu        sync.Mutex
+	threads   map[string]bool
+	methods   []string
+	mcpWrites []string
 }
 
 func newFakeServer() (*fakeServer, *io.PipeWriter, *io.PipeReader) {
@@ -68,6 +70,13 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 		}
 		method, _ := msg["method"].(string)
 		idRaw, hasID := msg["id"]
+		fs.mu.Lock()
+		fs.methods = append(fs.methods, method)
+		if method == "config/batchWrite" {
+			encoded, _ := json.Marshal(msg["params"])
+			fs.mcpWrites = append(fs.mcpWrites, string(encoded))
+		}
+		fs.mu.Unlock()
 		switch {
 		case method == "initialize" && hasID:
 			fs.replyOK(t, idRaw)

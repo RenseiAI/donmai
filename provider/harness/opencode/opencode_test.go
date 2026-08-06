@@ -256,6 +256,111 @@ func TestProvider_Spawn_HTTPMode_AttachUnreachable(t *testing.T) {
 	}
 }
 
+func TestProvider_UseServerLane_ProjectConfigFieldsNeverReachLaneA(t *testing.T) {
+	t.Parallel()
+	p := &Provider{binary: "/tmp/opencode"}
+	tests := []struct {
+		name string
+		spec agent.Spec
+	}{
+		{"endpoint", agent.Spec{Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, BaseURL: "http://127.0.0.1:9/v1"}}},
+		{"allowed tools", agent.Spec{AllowedTools: []string{"Read"}}},
+		{"disallowed tools", agent.Spec{DisallowedTools: []string{"Write"}}},
+		{"empty permission config", agent.Spec{PermissionConfig: &agent.PermissionConfig{}}},
+		{"allow permission config", agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "allow"}}},
+		{"mcp servers", agent.Spec{MCPServers: []agent.MCPServerConfig{{Name: "tools", Command: "server"}}}},
+		{"mcp tool names", agent.Spec{MCPToolNames: []string{"mcp__tools__read"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if !p.useServerLane(tt.spec) {
+				t.Fatal("project-config-bearing spec routed to Lane A")
+			}
+		})
+	}
+	if p.useServerLane(agent.Spec{Prompt: "plain one-shot", Model: "provider/model"}) {
+		t.Fatal("plain one-shot unexpectedly routed away from Lane A")
+	}
+}
+
+func TestProvider_ExternalAttachPolicyAndMCPFailWithDeniedReceipt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		spec    agent.Spec
+		channel agent.ToolLifecycleChannel
+	}{
+		{"allowed tools", agent.Spec{AllowedTools: []string{"Read"}}, agent.ToolChannelAllowedTools},
+		{"disallowed tools", agent.Spec{DisallowedTools: []string{"Write"}}, agent.ToolChannelDisallowedTools},
+		{"permission config", agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "allow"}}, agent.ToolChannelPermissionConfig},
+		{"mcp servers", agent.Spec{MCPServers: []agent.MCPServerConfig{{Name: "tools", Command: "server"}}}, agent.ToolChannelMCPServer},
+		{"mcp tool names", agent.Spec{MCPToolNames: []string{"mcp__tools__read"}}, agent.ToolChannelMCPToolNames},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			clientBuilt := false
+			p := &Provider{
+				endpoint: "http://attached.invalid",
+				clientFactory: func(_, _ string) serverClient {
+					clientBuilt = true
+					return newFakeClient()
+				},
+			}
+			var receipts []agent.ToolLifecycleReceipt
+			spec := tt.spec
+			spec.OnToolLifecycleAdapted = func(receipt agent.ToolLifecycleReceipt) error {
+				receipts = append(receipts, receipt)
+				return nil
+			}
+			_, err := p.Spawn(t.Context(), spec)
+			if !errors.Is(err, agent.ErrSpawnFailed) {
+				t.Fatalf("Spawn error = %v, want ErrSpawnFailed", err)
+			}
+			var adaptationErr *agent.ToolAdaptationError
+			if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != tt.channel {
+				t.Fatalf("Spawn error = %v, want typed delivery denial on %s", err, tt.channel)
+			}
+			if len(receipts) != 1 || receipts[0].Decision != "denied" {
+				t.Fatalf("receipts = %+v, want one denied receipt", receipts)
+			}
+			if clientBuilt {
+				t.Fatal("external client was built before policy/MCP denial")
+			}
+		})
+	}
+}
+
+func TestProvider_ExternalAttachEndpointFailsBeforeAdaptationOrSession(t *testing.T) {
+	t.Parallel()
+	clientBuilt := false
+	p := &Provider{
+		endpoint: "http://attached.invalid",
+		clientFactory: func(_, _ string) serverClient {
+			clientBuilt = true
+			return newFakeClient()
+		},
+	}
+	receiptCalled := false
+	_, err := p.Spawn(t.Context(), agent.Spec{
+		Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "gpt-x", BaseURL: "http://compat/v1"},
+		OnToolLifecycleAdapted: func(agent.ToolLifecycleReceipt) error {
+			receiptCalled = true
+			return nil
+		},
+	})
+	if !errors.Is(err, agent.ErrSpawnFailed) || !errors.Is(err, errExternalAttachConfigUnproven) {
+		t.Fatalf("Spawn error = %v, want typed external-attach config denial", err)
+	}
+	if receiptCalled {
+		t.Fatal("tool lifecycle receipt emitted before endpoint authority denial")
+	}
+	if clientBuilt {
+		t.Fatal("external client was built before endpoint authority denial")
+	}
+}
+
 // TestProvider_Spawn_BinaryNotFound verifies that Spawn returns
 // ErrSpawnFailed when the binary path is invalid.
 func TestProvider_Spawn_BinaryNotFound(t *testing.T) {

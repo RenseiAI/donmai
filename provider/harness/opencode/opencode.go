@@ -40,6 +40,11 @@ const EnvEndpoint = "OPENCODE_ENDPOINT"
 // server.
 const EnvAPIKey = "OPENCODE_API_KEY" //nolint:gosec // G101: env-var name, not a credential
 
+// errExternalAttachConfigUnproven is returned before adaptation/session side
+// effects when an attached server would need a project config that this
+// Provider instance cannot prove is active.
+var errExternalAttachConfigUnproven = errors.New("opencode external attach project config is not provider-owned")
+
 // DefaultProbeTimeout caps the probe HTTP GET at construction when
 // not in CLI-binary mode.
 const DefaultProbeTimeout = 2 * time.Second
@@ -307,6 +312,26 @@ func (*Provider) Capabilities() agent.Capabilities {
 	}
 }
 
+// launchManifest narrows the static provider manifest to the delivery
+// boundary this Provider instance actually owns. An attached external server
+// has its own project config; writing a local opencode.json does not activate
+// it there. Mark project-config-backed channels unsupported so PrepareHarness
+// persists a typed denial before any external session or prompt side effect.
+func (p *Provider) launchManifest() agent.HarnessManifest {
+	manifest := p.Manifest()
+	if p.binary != "" {
+		return manifest
+	}
+	for i := range manifest.ToolLifecycle {
+		profile := &manifest.ToolLifecycle[i]
+		profile.MCPDelivery = agent.ToolDeliveryUnsupported
+		profile.NativeToolPolicyDelivery = agent.ToolDeliveryUnsupported
+		profile.PermissionConfigDelivery = agent.ToolDeliveryUnsupported
+		profile.MCPToolPolicyDelivery = agent.ToolDeliveryUnsupported
+	}
+	return manifest
+}
+
 // Spawn starts a new OpenCode session, selecting a lane (07 §2):
 //
 //   - Lane A — one-shot CLI (`opencode run --format json`): the default for a
@@ -323,8 +348,11 @@ func (*Provider) Capabilities() agent.Capabilities {
 // On any pre-spawn failure the provider returns an error wrapping
 // agent.ErrSpawnFailed.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	if err := p.validateLaunchAuthority(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	var err error
-	spec, err = agent.PrepareHarness(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.launchManifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
@@ -345,14 +373,26 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	return h, nil
 }
 
+// validateLaunchAuthority rejects endpoint binding on external attach. The
+// endpoint's base URL, credential indirection, model pin, and provider lockout
+// are all delivered through opencode.json; an attached server does not read
+// the local file. Tool/MCP policy fields are rejected separately by
+// launchManifest so their denial receipt keeps the precise lifecycle channel.
+func (p *Provider) validateLaunchAuthority(spec agent.Spec) error {
+	if p.binary == "" && spec.Endpoint != nil {
+		return fmt.Errorf("%w: cannot prove Spec.Endpoint is active on the attached server", errExternalAttachConfigUnproven)
+	}
+	return nil
+}
+
 // useServerLane decides Lane B vs Lane A.
 //
 // DRIFT NOTE (code wins over design §2): 07 §2 lists a bare "!Spec.Autonomous"
 // as a Lane-B trigger. Routing every non-autonomous spawn to Lane B would send
 // simple one-shot specs (Autonomous defaults to false) to the server lane and
 // change long-standing Lane-A one-shot behavior. Instead Lane B triggers on a
-// POSITIVE need signal — an explicit PreferServer, an MCP whitelist, a
-// non-allow permission default (live mediation), or attach-mode (no binary).
+// POSITIVE need signal — an explicit PreferServer, any field whose declared
+// delivery is the session-scoped project config, or attach-mode (no binary).
 // A runner that intends to Inject/Resume requests the server lane via
 // PreferServer (or by supplying MCP/permission config); the caps advertise the
 // support, this picks the lane that backs it.
@@ -363,16 +403,20 @@ func (p *Provider) useServerLane(spec agent.Spec) bool {
 	if p.preferServer {
 		return true
 	}
-	if len(spec.MCPServers) > 0 {
-		return true
-	}
-	if pc := spec.PermissionConfig; pc != nil {
-		d := strings.ToLower(pc.DefaultDecision)
-		if d != "" && d != "allow" {
-			return true // needs live permission round-trips
-		}
-	}
-	return false
+	return requiresProjectConfig(spec)
+}
+
+// requiresProjectConfig reports whether a spec carries any input that this
+// adapter delivers only through its session-scoped opencode.json. Lane A does
+// not set OPENCODE_CONFIG, so admitting any of these fields there would be a
+// silent no-op despite a ready tool-lifecycle receipt.
+func requiresProjectConfig(spec agent.Spec) bool {
+	return spec.Endpoint != nil ||
+		len(spec.AllowedTools) > 0 ||
+		len(spec.DisallowedTools) > 0 ||
+		spec.PermissionConfig != nil ||
+		len(spec.MCPServers) > 0 ||
+		len(spec.MCPToolNames) > 0
 }
 
 // spawnCLI starts `opencode run --format json` as a subprocess and
@@ -506,13 +550,16 @@ func buildOpenCodeArgs(spec agent.Spec) []string {
 // session, subscribe to events, admit the prompt, and return a live handle.
 // resumeSessionID is empty for a fresh spawn and set for Resume.
 func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessionID string) (agent.Handle, error) {
-	dir, err := configDir(spec)
-	if err != nil {
-		return nil, fmt.Errorf("%w: opencode config dir: %v", agent.ErrSpawnFailed, err)
-	}
-	configPath, err := writeConfig(dir, spec)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	var configPath string
+	if p.binary != "" {
+		dir, err := configDir(spec)
+		if err != nil {
+			return nil, fmt.Errorf("%w: opencode config dir: %v", agent.ErrSpawnFailed, err)
+		}
+		configPath, err = writeConfig(dir, spec)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+		}
 	}
 
 	child, endpoint, err := p.bringUpServer(ctx, spec, configPath)
@@ -622,8 +669,11 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if sessionID == "" {
 		return nil, fmt.Errorf("provider/opencode: Resume: empty session id: %w", agent.ErrUnsupported)
 	}
+	if err := p.validateLaunchAuthority(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	var err error
-	spec, err = agent.PrepareHarness(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.launchManifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}

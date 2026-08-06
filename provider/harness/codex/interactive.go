@@ -146,7 +146,7 @@ func codexCLIMCPOverride(servers []agent.MCPServerConfig, env map[string]string)
 				keys := sortedStringKeys(server.Env)
 				for _, key := range keys {
 					if !validProcessEnvKey(key) {
-						return "", nil, interactiveMCPApplicationError("stdio MCP environment contains an invalid variable name")
+						return "", nil, codexMCPApplicationError("stdio MCP environment contains an invalid variable name")
 					}
 					var err error
 					env, err = setInteractiveEnv(env, key, server.Env[key])
@@ -180,7 +180,7 @@ func codexCLIMCPOverride(servers []agent.MCPServerConfig, env map[string]string)
 				body.WriteByte('}')
 			}
 		default:
-			return "", nil, interactiveMCPApplicationError("MCP server type must be stdio or http")
+			return "", nil, codexMCPApplicationError("MCP server type must be stdio or http")
 		}
 		body.WriteByte('}')
 	}
@@ -191,7 +191,7 @@ func codexCLIMCPOverride(servers []agent.MCPServerConfig, env map[string]string)
 func setInteractiveEnv(env map[string]string, key, value string) (map[string]string, error) {
 	if existing, ok := env[key]; ok {
 		if existing != value {
-			return nil, interactiveMCPApplicationError("MCP environment conflicts with the inherited process variable " + key)
+			return nil, codexMCPApplicationError("MCP environment conflicts with the inherited process variable " + key)
 		}
 		return env, nil
 	}
@@ -216,12 +216,12 @@ func validateCodexCLIMCPServers(servers []agent.MCPServerConfig) error {
 	for _, server := range servers {
 		name := strings.TrimSpace(server.Name)
 		if _, exists := seen[name]; exists {
-			return interactiveMCPApplicationError("requested MCP server names must be unique")
+			return codexMCPApplicationError("requested MCP server names must be unique")
 		}
 		seen[name] = struct{}{}
 	}
 	if _, err := mcp.BuildConfigFile(servers); err != nil {
-		return interactiveMCPApplicationError("requested MCP server structure is invalid")
+		return codexMCPApplicationError("requested MCP server structure is invalid")
 	}
 	return nil
 }
@@ -253,14 +253,6 @@ func tomlStringArray(values []string) string {
 	return body.String()
 }
 
-func interactiveMCPApplicationError(detail string) *agent.ToolAdaptationError {
-	return &agent.ToolAdaptationError{
-		Code:    agent.ToolDenialApplicationFailed,
-		Channel: agent.ToolChannelMCPServer,
-		Detail:  detail,
-	}
-}
-
 func persistInteractiveMCPApplicationDenial(spec agent.Spec, applicationErr error) error {
 	receipt := agent.ToolLifecycleReceipt{
 		ContractVersion: agent.ToolLifecycleContractVersion,
@@ -277,7 +269,7 @@ func persistInteractiveMCPApplicationDenial(spec agent.Spec, applicationErr erro
 	}
 	if spec.OnToolLifecycleAdapted != nil {
 		if err := spec.OnToolLifecycleAdapted(receipt); err != nil {
-			return interactiveMCPApplicationError("persist denied Codex CLI MCP receipt: " + err.Error())
+			return codexMCPApplicationError("persist denied Codex CLI MCP receipt: " + err.Error())
 		}
 	}
 	return applicationErr

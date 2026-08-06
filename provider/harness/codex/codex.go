@@ -2,6 +2,8 @@ package codex
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,8 +33,14 @@ type Provider struct {
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 
-	mcpOnce      sync.Once
-	mcpConfigErr error
+	// mcpMu serializes app-server-global config changes. mcpUsers counts
+	// live handles holding the current config digest: equal configs may share
+	// it, while an incompatible config is denied until all prior handles have
+	// closed so no session can observe another session's MCP set.
+	mcpMu           sync.Mutex
+	mcpConfigDigest [sha256.Size]byte
+	mcpConfigKnown  bool
+	mcpUsers        int
 
 	// handlesMu / handles tracks live Handles so we can fail them
 	// all when the shared app-server crashes.
@@ -206,7 +214,7 @@ func (p *Provider) Capabilities() agent.Capabilities {
 }
 
 // Spawn implements agent.Provider. Translates the Spec to JSON-RPC
-// params, pushes MCP server config (once per Provider instance), opens
+// params, acquires the exact MCP server config for this session, opens
 // a thread, and starts the first turn.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	// Interactive spawn mode (W4): completely independent of the app-server
@@ -227,17 +235,20 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return nil, err
 	}
 	plan := NewSpawnPlan(spec)
-	if err := p.configureMCP(ctx, plan.MCPConfig); err != nil {
-		return nil, fmt.Errorf("codex: configure mcp servers: %w", err)
+	releaseMCP, err := p.acquireMCPConfig(ctx, plan.MCPConfig)
+	if err != nil {
+		return nil, fmt.Errorf("%w: codex configure mcp servers: %w", agent.ErrSpawnFailed, persistHeadlessMCPApplicationDenial(spec, err))
 	}
 
 	h := newHandle(p, p.client, spec, HandleOptions{
 		RPCTimeout: p.opts.RPCTimeout,
 	})
+	h.mcpRelease = releaseMCP
 	p.registerHandle(h)
 
 	if err := h.start(ctx, plan, ""); err != nil {
 		p.unregisterHandle(h)
+		h.releaseMCPConfig()
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 
@@ -261,17 +272,20 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 		return nil, agent.ErrSessionNotFound
 	}
 	plan := NewSpawnPlan(spec)
-	if err := p.configureMCP(ctx, plan.MCPConfig); err != nil {
-		return nil, fmt.Errorf("codex: configure mcp servers: %w", err)
+	releaseMCP, err := p.acquireMCPConfig(ctx, plan.MCPConfig)
+	if err != nil {
+		return nil, fmt.Errorf("%w: codex configure mcp servers: %w", agent.ErrSpawnFailed, persistHeadlessMCPApplicationDenial(spec, err))
 	}
 
 	h := newHandle(p, p.client, spec, HandleOptions{
 		RPCTimeout: p.opts.RPCTimeout,
 	})
+	h.mcpRelease = releaseMCP
 	p.registerHandle(h)
 
 	if err := h.start(ctx, plan, sessionID); err != nil {
 		p.unregisterHandle(h)
+		h.releaseMCPConfig()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 
@@ -286,33 +300,103 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 	return p.terminate(ctx)
 }
 
-// configureMCP pushes the MCP server config once per Provider via
-// `config/batchWrite`. Subsequent calls are no-ops; the first call's
-// error is cached (matches mcpConfigured semantics in the legacy TS).
-func (p *Provider) configureMCP(ctx context.Context, mcpConfig map[string]any) error {
-	if mcpConfig == nil {
-		return nil
+// acquireMCPConfig reserves the app-server-global MCP config for one handle.
+// config/batchWrite has no proven per-thread scope, so different configs must
+// never overlap. A different sequential config is applied after the previous
+// handle releases its lease. Method-not-found and every other write failure
+// are required-delivery failures; no thread starts after them.
+func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]any) (func(), error) {
+	desired := mcpConfig
+	if desired == nil {
+		desired = map[string]any{}
 	}
-	p.mcpOnce.Do(func() {
-		_, err := p.client.RequestWithRetry(ctx, "config/batchWrite", map[string]any{
+	encoded, err := json.Marshal(desired)
+	if err != nil {
+		return nil, codexMCPApplicationError("could not canonicalize requested MCP config")
+	}
+	digest := sha256.Sum256(encoded)
+
+	p.mcpMu.Lock()
+	defer p.mcpMu.Unlock()
+
+	changed := !p.mcpConfigKnown || digest != p.mcpConfigDigest
+	if changed && p.mcpUsers > 0 {
+		return nil, codexMCPApplicationError("requested MCP config conflicts with a live app-server session")
+	}
+
+	// An untouched provider with an empty request needs no batchWrite. Once a
+	// non-empty config has been installed, a later empty request is a real
+	// replace-to-empty write so the prior session's servers cannot leak.
+	if changed && (p.mcpConfigKnown || len(desired) > 0) {
+		if _, err := p.client.RequestWithRetry(ctx, "config/batchWrite", map[string]any{
 			"edits": []map[string]any{
-				{"keyPath": "mcpServers", "mergeStrategy": "replace", "value": mcpConfig},
+				{"keyPath": "mcpServers", "mergeStrategy": "replace", "value": desired},
 			},
-		}, p.opts.RPCTimeout)
-		// Some codex versions do not implement config/batchWrite.
-		// Treat -32601 (Method not found) as a soft failure so the
-		// Provider still works against older builds — sessions just
-		// run without tool plugins. The caller decides whether to
-		// hard-fail.
-		if err != nil {
-			var rpc *RPCError
-			if errors.As(err, &rpc) && rpc.Code == -32601 {
-				return
-			}
-			p.mcpConfigErr = err
+		}, p.opts.RPCTimeout); err != nil {
+			return nil, codexMCPApplicationError(codexMCPConfigFailureDetail(err))
 		}
-	})
-	return p.mcpConfigErr
+	}
+	p.mcpConfigDigest = digest
+	p.mcpConfigKnown = true
+	p.mcpUsers++
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mcpMu.Lock()
+			if p.mcpUsers > 0 {
+				p.mcpUsers--
+			}
+			p.mcpMu.Unlock()
+		})
+	}, nil
+}
+
+// codexMCPConfigFailureDetail intentionally excludes the server's message and
+// all request values. App servers may echo rejected configuration in an RPC
+// error; only a bounded code/class is safe to surface or persist.
+func codexMCPConfigFailureDetail(err error) string {
+	var rpc *RPCError
+	if errors.As(err, &rpc) {
+		return fmt.Sprintf("config/batchWrite rejected by JSON-RPC code %d", rpc.Code)
+	}
+	if errors.Is(err, context.Canceled) {
+		return "config/batchWrite canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "config/batchWrite deadline exceeded"
+	}
+	return "config/batchWrite transport failure"
+}
+
+func codexMCPApplicationError(detail string) *agent.ToolAdaptationError {
+	return &agent.ToolAdaptationError{
+		Code:    agent.ToolDenialApplicationFailed,
+		Channel: agent.ToolChannelMCPServer,
+		Detail:  detail,
+	}
+}
+
+func persistHeadlessMCPApplicationDenial(spec agent.Spec, applicationErr error) error {
+	receipt := agent.ToolLifecycleReceipt{
+		ContractVersion: agent.ToolLifecycleContractVersion,
+		ProfileID:       "codex/headless/tool-lifecycle-v1",
+		Decision:        "denied",
+		EvidenceTier:    "unit_verified",
+		Entries: []agent.ToolLifecycleEntry{{
+			ID:         "mcp-servers",
+			Channel:    agent.ToolChannelMCPServer,
+			Required:   true,
+			Outcome:    agent.ToolOutcomeDenied,
+			DenialCode: agent.ToolDenialApplicationFailed,
+		}},
+	}
+	if spec.OnToolLifecycleAdapted != nil {
+		if err := spec.OnToolLifecycleAdapted(receipt); err != nil {
+			return codexMCPApplicationError("persist denied Codex app-server MCP receipt: " + err.Error())
+		}
+	}
+	return applicationErr
 }
 
 func (p *Provider) registerHandle(h *Handle) {
