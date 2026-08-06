@@ -6,6 +6,30 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.57.4 — 2026-08-06
+
+### Features
+
+- **Harness admission is authoritative and fail closed.** Execution cells now
+  name an exact supported harness before work begins, split raw Gemini and
+  Ollama harness identities from provider endpoint selection, and pin OpenCode
+  to the selected generic endpoint.
+- **Harness adaptation follows the whole session lifecycle.** Tool, MCP,
+  prompt, and policy configuration is refreshed truthfully across interactive
+  and headless execution while preserving prompt safeguards and PTY command
+  authority.
+
+### Fixes
+
+- **Codex and OpenCode configuration is isolated per owned session.** Managed
+  configuration is created, refreshed, and removed without overwriting user
+  state or another concurrent session.
+- **Generated harness capability artifacts match the authoritative manifests.**
+  Admission, selection, and published matrix data now describe the same
+  supported harness contracts.
+
+---
+
 ## v0.57.3 — 2026-08-05
 
 ### Fixes
