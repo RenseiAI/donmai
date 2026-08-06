@@ -70,6 +70,17 @@ type HarnessAdmission struct {
 	consumed            atomic.Bool
 }
 
+// CanonicalHarnessRef returns a value copy of the canonical harness identity
+// from a successful explicit admission. Reading the projection does not
+// consume the one-shot admission and never exposes its mutable Provider. Nil,
+// legacy/absent, and denied admissions return false.
+func (a *HarnessAdmission) CanonicalHarnessRef() (executioncell.HarnessRef, bool) {
+	if a == nil || a.denial != nil || a.selection.Provider == nil || a.selection.Harness.ID == "" {
+		return executioncell.HarnessRef{}, false
+	}
+	return a.selection.Harness, true
+}
+
 // PreflightHarness admits explicit harness intent using only the in-memory
 // registry. It performs no posterior request, worktree operation, credential
 // delivery, gateway binding, provider Spawn, or result/status post. A nil

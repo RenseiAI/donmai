@@ -838,6 +838,72 @@ func (f *fakeProvider) Resume(_ context.Context, _ string, _ agent.Spec) (agent.
 
 func (f *fakeProvider) Shutdown(_ context.Context) error { return nil }
 
+type fakeAdmissionHarnessProvider struct {
+	fakeProvider
+	harness agent.HarnessName
+}
+
+func (f *fakeAdmissionHarnessProvider) Manifest() agent.HarnessManifest {
+	return agent.HarnessManifest{
+		Name: f.harness, HumanLabel: string(f.harness), Family: agent.FamilyHarness,
+		ContractABI: "harness/v2",
+	}
+}
+
+func TestGatewayHarnessIdentityUsesCanonicalAdmission(t *testing.T) {
+	t.Parallel()
+	registry := runner.NewRegistry()
+	for _, provider := range []*fakeAdmissionHarnessProvider{
+		{fakeProvider: fakeProvider{name: agent.ProviderClaude}, harness: agent.HarnessClaudeCode},
+		{fakeProvider: fakeProvider{name: agent.ProviderAGYCLI}, harness: agent.HarnessAntigravity},
+		{fakeProvider: fakeProvider{name: agent.ProviderGemini}, harness: agent.HarnessRaw},
+		{fakeProvider: fakeProvider{name: agent.ProviderOllama}, harness: agent.HarnessRaw},
+	} {
+		if err := registry.Register(provider); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		name, harness, provider, want string
+	}{
+		{name: "contradictory claude harness and gemini provider", harness: "claude", provider: "gemini", want: "claude-code"},
+		{name: "agy legacy wire", harness: "agy", provider: "gemini", want: "antigravity"},
+		{name: "native gemini wire", harness: "native", provider: "gemini", want: "raw"},
+		{name: "native ollama wire", harness: "native", provider: "ollama", want: "raw"},
+		{name: "absent harness keeps legacy projection", provider: "gemini", want: "gemini"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			detail := &daemon.SessionDetail{
+				SessionID: "session_gateway_identity",
+				ResolvedProfile: &daemon.SessionResolvedProfile{
+					Harness: tt.harness, Provider: tt.provider, Model: "test-model",
+				},
+			}
+			qw := detailToQueuedWork(detail)
+			admission, err := registry.PreflightHarness(qw)
+			if err != nil {
+				t.Fatalf("PreflightHarness: %v", err)
+			}
+			if got := gatewayHarnessIdentity(detail, admission); got != tt.want {
+				t.Fatalf("gatewayHarnessIdentity = %q, want %q", got, tt.want)
+			}
+			if tt.harness == "" {
+				if admission != nil {
+					t.Fatalf("absent harness admission = %+v, want nil legacy path", admission)
+				}
+				return
+			}
+			ref, ok := admission.CanonicalHarnessRef()
+			if !ok || ref.ID != tt.want {
+				t.Fatalf("CanonicalHarnessRef = %+v, %v; want %q", ref, ok, tt.want)
+			}
+		})
+	}
+}
+
 // TestRunAgentRun_PreflightMissingSessionID asserts a clear preflight
 // error when no session id is passed and DONMAI_SESSION_ID is unset.
 func TestRunAgentRun_PreflightMissingSessionID(t *testing.T) {
@@ -895,7 +961,7 @@ func TestRunAgentRun_UnknownExplicitHarnessPrecedesGatewayAndRunningPost(t *test
 	t.Setenv("PATH", t.TempDir())
 	var gatewayCalls atomic.Int32
 	originalBind := bindWorkerGatewayForAgentRun
-	bindWorkerGatewayForAgentRun = func(context.Context, *slog.Logger, *daemon.SessionDetail, *runner.QueuedWork) (*workerGateway, error) {
+	bindWorkerGatewayForAgentRun = func(context.Context, *slog.Logger, *daemon.SessionDetail, *runner.QueuedWork, string) (*workerGateway, error) {
 		gatewayCalls.Add(1)
 		return nil, errors.New("gateway binding must not run after harness denial")
 	}

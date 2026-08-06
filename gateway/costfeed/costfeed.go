@@ -30,7 +30,7 @@ type Event struct {
 	SessionID       string    `json:"sessionId,omitempty"`
 	ProviderID      string    `json:"providerId"` // model-endpoint company (primary attribution)
 	Host            string    `json:"host"`       // always "gateway"
-	Harness         string    `json:"harness"`    // sibling attribution column
+	Harness         string    `json:"harness"`    // canonical admitted loop-driver HarnessRef.ID
 	AuthMode        string    `json:"authMode"`   // byok | metered | host-session
 	Model           string    `json:"model"`
 	TokensIn        int       `json:"tokensIn"`

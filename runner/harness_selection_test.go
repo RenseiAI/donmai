@@ -184,6 +184,14 @@ func TestPreflightHarnessAdmissionIsConsumedWithoutReresolution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PreflightHarness: %v", err)
 	}
+	ref, ok := admission.CanonicalHarnessRef()
+	if !ok || ref.ID != string(agent.HarnessCodex) {
+		t.Fatalf("CanonicalHarnessRef = %+v, %v; want codex", ref, ok)
+	}
+	ref.ID = "mutated-copy"
+	if again, ok := admission.CanonicalHarnessRef(); !ok || again.ID != string(agent.HarnessCodex) {
+		t.Fatalf("CanonicalHarnessRef after copy mutation = %+v, %v; want codex", again, ok)
+	}
 
 	// Replacing the registry entry after preflight proves the admitted concrete
 	// implementation is carried, not looked up again. Endpoint/model mutations

@@ -61,7 +61,27 @@ type agentRunOpts struct {
 
 // bindWorkerGatewayForAgentRun is the production gateway-binding seam. Tests
 // replace it to prove harness preflight denial precedes gateway side effects.
-var bindWorkerGatewayForAgentRun = bindWorkerGateway
+var bindWorkerGatewayForAgentRun = func(
+	ctx context.Context,
+	logger *slog.Logger,
+	detail *daemon.SessionDetail,
+	work *runner.QueuedWork,
+	harnessID string,
+) (*workerGateway, error) {
+	return bindWorkerGateway(ctx, logger, detail, work, harnessID)
+}
+
+// gatewayHarnessIdentity projects the canonical loop-driver identity already
+// fixed by successful explicit admission. Absent-harness work has no preflight
+// admission, so it intentionally retains the legacy display/provider
+// projection until the separately scoped legacy/posterior admission path moves
+// ahead of gateway binding.
+func gatewayHarnessIdentity(detail *daemon.SessionDetail, admission *runner.HarnessAdmission) string {
+	if ref, ok := admission.CanonicalHarnessRef(); ok {
+		return ref.ID
+	}
+	return providerNameFromDetail(detail)
+}
 
 // newAgentRunCmd constructs the `agent run` subcommand. This is the
 // long-running entry point the daemon spawns for every claimed
@@ -315,7 +335,9 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// some other endpoint — see afcli/gateway_bind.go).
 	var gwSession *workerGateway
 	if admissionErr == nil {
-		gwSession, err = bindWorkerGatewayForAgentRun(runCtx, logger, detail, &qw)
+		gwSession, err = bindWorkerGatewayForAgentRun(
+			runCtx, logger, detail, &qw, gatewayHarnessIdentity(detail, admission),
+		)
 		if err != nil {
 			return preflightErr(fmt.Sprintf("gateway binding: %v", err))
 		}

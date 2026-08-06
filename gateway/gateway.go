@@ -147,10 +147,12 @@ func (g *Gateway) Started() bool {
 type BindConfig struct {
 	SessionID  string
 	DispatchID string
-	Harness    string
-	Company    agent.Company
-	Model      string
-	AuthMode   agent.AuthMode
+	// Harness is the canonical admitted loop-driver HarnessRef.ID. It is not
+	// the legacy provider/model family identifier.
+	Harness  string
+	Company  agent.Company
+	Model    string
+	AuthMode agent.AuthMode
 	// Upstream is the outbound backend to dial for this session.
 	Upstream upstream.Upstream
 	// Source yields the credential(s). OSS: pool.SingleKey.
