@@ -51,7 +51,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			ID: "shell/interactive/pty-seed-v1", Mode: agent.PromptModeHumanControlled,
 			SystemDelivery: agent.PromptDeliveryUnsupported, BaseAppendDelivery: agent.PromptDeliveryUnsupported,
 			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryUnsupported,
-			UserDelivery: agent.PromptDeliveryShellPTYSeed, AmendmentDelivery: agent.PromptDeliveryShellPTYSeed,
+			UserDelivery: agent.PromptDeliveryShellPTYSeed, AmendmentDelivery: agent.PromptDeliveryUnsupported,
 		}},
 	}
 }

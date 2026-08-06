@@ -422,23 +422,26 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	}
 	promptPlan := &agent.PromptPlan{
 		ContractVersion:  agent.PromptContractVersion,
-		HarnessProtocol:  &agent.PromptContent{ID: "runner-harness-protocol", Text: composition.HarnessProtocol, Required: true},
 		BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
 		UserPrompt:       agent.PromptContent{ID: "runner-user-task", Text: userPrompt, Required: userPrompt != ""},
-		// The runner owns these authorities and explicitly permits harnesses
-		// without native system/context surfaces to prepend them to the first
-		// user turn. The adapter receipt records each downgrade by ID.
-		AuthorizedDowngrades: []agent.PromptDowngradeAuthorization{
+	}
+	if provider.Name() != agent.ProviderShell {
+		// Model-driving harnesses receive the runner-owned operating protocol
+		// and its legacy policy-authorized user-turn fallbacks. A bare shell is
+		// intentionally excluded: its user surface executes commands, so no
+		// non-user authority may be projected onto shell_pty_seed.
+		promptPlan.HarnessProtocol = &agent.PromptContent{ID: "runner-harness-protocol", Text: composition.HarnessProtocol, Required: true}
+		promptPlan.AuthorizedDowngrades = []agent.PromptDowngradeAuthorization{
 			{ID: "runner-authorizes-protocol-to-user", Channel: agent.PromptChannelHarnessProtocol, To: agent.PromptChannelUserPrompt},
 			{ID: "runner-authorizes-role-to-user", Channel: agent.PromptChannelRoleIntent, To: agent.PromptChannelUserPrompt},
 			{ID: "runner-authorizes-context-to-user", Channel: agent.PromptChannelInitialContext, To: agent.PromptChannelUserPrompt},
-		},
-	}
-	if composition.RoleIntent != "" {
-		promptPlan.RoleIntent = &agent.PromptContent{ID: "agent-card-role-intent", Text: composition.RoleIntent, Required: true}
-	}
-	if composition.InitialContext != "" {
-		promptPlan.InitialContext = []agent.PromptContent{{ID: "agent-memory-context", Text: composition.InitialContext, Required: true}}
+		}
+		if composition.RoleIntent != "" {
+			promptPlan.RoleIntent = &agent.PromptContent{ID: "agent-card-role-intent", Text: composition.RoleIntent, Required: true}
+		}
+		if composition.InitialContext != "" {
+			promptPlan.InitialContext = []agent.PromptContent{{ID: "agent-memory-context", Text: composition.InitialContext, Required: true}}
+		}
 	}
 
 	// 6. Translate to agent.Spec.

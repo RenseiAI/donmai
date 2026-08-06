@@ -342,6 +342,21 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 	if detail := validatePromptPlan(plan); detail != "" {
 		return deny(PromptDenialMalformedPlan, "", "prompt-plan", true, detail)
 	}
+	// A bare shell's user surface is a command interpreter, not a model turn.
+	// Even an otherwise well-formed semantic downgrade would turn system,
+	// role, or context prose into commands when projected onto shell_pty_seed.
+	// Keep that sink user-authority-only; the exact profile cannot authorize a
+	// non-user channel merely because the caller supplied a downgrade token.
+	if profile.UserDelivery == PromptDeliveryShellPTYSeed && len(plan.AuthorizedDowngrades) > 0 {
+		auth := plan.AuthorizedDowngrades[0]
+		return deny(
+			PromptDenialDowngradeUnauthorized,
+			auth.Channel,
+			auth.ID,
+			true,
+			"shell PTY seed accepts only the explicit user task",
+		)
+	}
 
 	var systemParts, contextParts, downgradedPrepend []string
 	var baseInstructions string

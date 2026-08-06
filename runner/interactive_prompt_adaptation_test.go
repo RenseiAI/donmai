@@ -2,7 +2,11 @@ package runner
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -10,6 +14,7 @@ import (
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
+	shellprovider "github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/state"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -226,5 +231,125 @@ func TestRun_InteractiveInitialPromptOversizeFailsBeforeProviderSpawn(t *testing
 	}
 	if provider.raw.PromptPlan != nil || provider.session != nil {
 		t.Fatal("provider Spawn ran for oversized InitialPrompt")
+	}
+}
+
+func TestRun_ShellExecutesOnlyExplicitUserSeed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell PTY regression is unix-only")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not on PATH")
+	}
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+	t.Setenv("SHELL", "/bin/sh")
+
+	tests := []struct {
+		name       string
+		userSeed   bool
+		wantUserFX bool
+	}{
+		{name: "explicit user task executes", userSeed: true, wantUserFX: true},
+		{name: "empty initial prompt executes nothing"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			markerDir := t.TempDir()
+			userMarker := filepath.Join(markerDir, "user-executed")
+			protocolMarker := filepath.Join(markerDir, "protocol-executed")
+			roleMarker := filepath.Join(markerDir, "role-executed")
+			contextMarker := filepath.Join(markerDir, "context-executed")
+
+			server := mockPlatformServer(t)
+			defer server.Close()
+			manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+			if err != nil {
+				t.Fatalf("worktree.NewManager: %v", err)
+			}
+			poster, err := result.NewPoster(result.Options{
+				PlatformURL: server.URL,
+				WorkerID:    "worker-shell",
+				AuthToken:   "token",
+				HTTPClient:  server.Client(),
+				BaseDelay:   1,
+			})
+			if err != nil {
+				t.Fatalf("result.NewPoster: %v", err)
+			}
+			provider, err := shellprovider.New()
+			if err != nil {
+				t.Fatalf("shell.New: %v", err)
+			}
+			registry := NewRegistry()
+			if err := registry.Register(provider); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			runner, err := New(Options{
+				Registry:               registry,
+				WorktreeManager:        manager,
+				Poster:                 poster,
+				HTTPClient:             server.Client(),
+				PreserveWorktreeAlways: true,
+				MaxSessionDuration:     -1,
+				SkipBackstop:           true,
+				SkipSteering:           true,
+				SkipPostSession:        true,
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			initialPrompt := ""
+			if tt.userSeed {
+				initialPrompt = "printf user > " + strconv.Quote(userMarker) + "; exit"
+			}
+			qw := QueuedWork{
+				QueuedWork: prompt.QueuedWork{
+					SessionID:            "interactive-shell",
+					IssueID:              "issue-id",
+					IssueIdentifier:      "ISSUE-SHELL",
+					WorkType:             "development",
+					Mode:                 prompt.InteractiveRunMode,
+					InitialPrompt:        initialPrompt,
+					Repository:           makeBareRepo(t),
+					SystemPromptOverride: "touch " + strconv.Quote(roleMarker),
+					MemoryBlock:          "touch " + strconv.Quote(contextMarker),
+					Skills: []prompt.SkillSpec{{
+						ID: "forbidden-system-command", Body: "touch " + strconv.Quote(protocolMarker),
+					}},
+					InterviewBudget: &prompt.InterviewBudget{MaxWallClockSeconds: 1},
+				},
+				WorkerID:        "worker-shell",
+				AuthToken:       "token",
+				PlatformURL:     server.URL,
+				ResolvedProfile: ResolvedProfile{Provider: agent.ProviderShell},
+			}
+			got, runErr := runner.Run(context.Background(), qw)
+			if tt.userSeed {
+				if runErr != nil || got.Status != "completed" {
+					t.Fatalf("Run result=%+v err=%v, want completed user-seeded shell", got, runErr)
+				}
+			} else if got.WorktreePath == "" {
+				t.Fatalf("Run result=%+v err=%v, shell was not provisioned", got, runErr)
+			}
+
+			if _, err := os.Stat(userMarker); tt.wantUserFX && err != nil {
+				t.Fatalf("explicit user seed was not executed: %v", err)
+			} else if !tt.wantUserFX && err == nil {
+				t.Fatal("empty initial prompt caused a user command side effect")
+			}
+			for authority, marker := range map[string]string{
+				"harness protocol": protocolMarker,
+				"role intent":      roleMarker,
+				"initial context":  contextMarker,
+			} {
+				if _, err := os.Stat(marker); err == nil {
+					t.Fatalf("%s was executed by the bare shell", authority)
+				} else if !os.IsNotExist(err) {
+					t.Fatalf("stat %s marker: %v", authority, err)
+				}
+			}
+		})
 	}
 }

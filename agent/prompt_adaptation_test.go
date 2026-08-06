@@ -21,11 +21,12 @@ import (
 func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name           string
-		manifest       agent.HarnessManifest
-		mode           agent.PromptSessionMode
-		supportsSystem bool
-		contextInUser  bool
+		name              string
+		manifest          agent.HarnessManifest
+		mode              agent.PromptSessionMode
+		supportsSystem    bool
+		supportsDowngrade bool
+		contextInUser     bool
 	}{
 		{name: "claude/headless", manifest: (&claude.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "claude/interactive", manifest: (&claude.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true},
@@ -33,9 +34,9 @@ func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 		{name: "codex/interactive", manifest: (&codex.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true, contextInUser: true},
 		{name: "gemini/raw", manifest: (&gemini.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "ollama/raw", manifest: (&ollama.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
-		{name: "amp/headless", manifest: (&amp.Provider{}).Manifest(), mode: agent.PromptModeAutonomous},
-		{name: "agy/headless", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous},
-		{name: "opencode/headless", manifest: (&opencode.Provider{}).Manifest(), mode: agent.PromptModeAutonomous},
+		{name: "amp/headless", manifest: (&amp.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
+		{name: "agy/headless", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
+		{name: "opencode/headless", manifest: (&opencode.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "pi/headless", manifest: (&pi.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "shell/interactive", manifest: (&shell.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled},
 	}
@@ -71,6 +72,12 @@ func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 				}
 				spec.PromptPlan = &plan
 				adapted, deniedReceipt, err = agent.AdaptPrompt(spec, profile)
+				if !tt.supportsDowngrade {
+					if !agent.IsPromptAdaptationError(err, agent.PromptDenialDowngradeUnauthorized) {
+						t.Fatalf("forbidden user downgrade error = %v", err)
+					}
+					return
+				}
 				if err != nil {
 					t.Fatalf("authorized downgrade: %v", err)
 				}
