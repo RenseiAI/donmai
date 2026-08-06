@@ -354,6 +354,21 @@ func TestAdmissionFallbackRequiresOneCompleteNamedAlternative(t *testing.T) {
 		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
 	})
 
+	for _, kind := range []ResolverDecisionKind{DecisionExplicit, DecisionDefault, DecisionInheritance, DecisionLegacyInference} {
+		kind := kind
+		t.Run("duplicate non-fallback decision field/"+string(kind), func(t *testing.T) {
+			intent, receipt := base(t)
+			duplicate := ResolverDecision{
+				Kind:        kind,
+				Field:       "model",
+				SelectedRef: "model:openai/gpt-5.6",
+				Reason:      "Adversarial duplicate resolver provenance.",
+			}
+			receipt.ResolverDecisions = append(receipt.ResolverDecisions, duplicate)
+			requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+		})
+	}
+
 	t.Run("duplicate fallback alternative id", func(t *testing.T) {
 		intent, receipt := base(t)
 		intent.FallbackAlternatives = FallbackPolicy{

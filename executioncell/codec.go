@@ -724,11 +724,23 @@ func AssertAdmissionProvenance(intent DispatchIntent, receipt ImmutableAdmission
 		}
 		alternativesByID[alternative.ID] = alternative
 	}
+	// Every execution-cell axis has one authoritative resolver decision.  A
+	// receipt that names an axis twice is ambiguous even if neither decision is
+	// a fallback (for example, a default followed by legacy inference).  Reject
+	// that before interpreting decision kinds so callers cannot smuggle a
+	// competing provenance path alongside the effective one.
+	decisionFields := make(map[string]struct{})
 	fallbackDecisionFields := make(map[string]struct{})
 	nonFallbackFields := make(map[string]struct{})
 	for index, decision := range value.ResolverDecisions {
 		decisionPath := []string{"resolverDecisions", fmt.Sprintf("%d", index)}
 		expectedSelectedRef, knownField := fallbackDecisionSelectedRef(decision.Field, *value.Cell)
+		if knownField {
+			if _, duplicate := decisionFields[decision.Field]; duplicate {
+				return contractError(ErrorInvalidReference, append(decisionPath, "field"), "duplicate resolver decision for %s", decision.Field)
+			}
+			decisionFields[decision.Field] = struct{}{}
+		}
 		if knownField && decision.SelectedRef != expectedSelectedRef {
 			return contractError(ErrorInvalidReference, append(decisionPath, "selectedRef"), "resolver decision selectedRef %q does not match resolved %s %q", decision.SelectedRef, decision.Field, expectedSelectedRef)
 		}
