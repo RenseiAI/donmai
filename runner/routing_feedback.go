@@ -70,7 +70,10 @@ func (r *Runner) recordRoutingFeedback(parentCtx context.Context, qw QueuedWork,
 	if os.Getenv("ROUTING_RECORDER_ENABLED") == "false" {
 		return
 	}
-	provider := string(qw.resolvedProvider())
+	// Attribution follows the once-admitted runtime selection carried on the
+	// result. Re-reading legacy profile fallbacks here could disagree with a
+	// posterior-selected provider or a canonical explicit harness.
+	provider := string(res.ProviderName)
 	workType := qw.WorkType
 	// The arm key is (provider, workType); skip when either is missing, or when
 	// we lack the platform coordinates to post.

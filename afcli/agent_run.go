@@ -59,6 +59,10 @@ type agentRunOpts struct {
 	bin string
 }
 
+// bindWorkerGatewayForAgentRun is the production gateway-binding seam. Tests
+// replace it to prove harness preflight denial precedes gateway side effects.
+var bindWorkerGatewayForAgentRun = bindWorkerGateway
+
 // newAgentRunCmd constructs the `agent run` subcommand. This is the
 // long-running entry point the daemon spawns for every claimed
 // session: it reads the session detail from the daemon's local HTTP
@@ -201,6 +205,20 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	}
 	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(opencodeCtorHints(detail)), agentBin)
 	logger.Info("agent run: registry built", "providers", reg.Names())
+	defer func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutCancel()
+		if shutErr := reg.Shutdown(shutCtx); shutErr != nil {
+			logger.Warn("donmai agent run: registry shutdown returned errors", "err", shutErr)
+		}
+	}()
+
+	qw := detailToQueuedWork(detail)
+	admission, admissionErr := reg.PreflightHarness(qw)
+	if admissionErr != nil {
+		logger.Warn("donmai agent run: explicit harness denied before gateway/status side effects",
+			"sessionId", qw.SessionID, "err", admissionErr)
+	}
 
 	wtParent := opts.worktree
 	if wtParent == "" {
@@ -287,8 +305,6 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		return preflightErr(fmt.Sprintf("runner: %v", err))
 	}
 
-	qw := detailToQueuedWork(detail)
-
 	// 5b. Worker-local gateway binding (08 §5/§9 M1). When the resolved cell is
 	// served by the translating-gateway host, start the gateway in THIS process,
 	// bind this session, and stamp the resulting EndpointBinding onto the
@@ -297,9 +313,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// every non-gateway cell; a hard preflight failure when the cell IS
 	// gateway-served but the worker cannot honor it (never a silent fallback to
 	// some other endpoint — see afcli/gateway_bind.go).
-	gwSession, err := bindWorkerGateway(runCtx, logger, detail, &qw)
-	if err != nil {
-		return preflightErr(fmt.Sprintf("gateway binding: %v", err))
+	var gwSession *workerGateway
+	if admissionErr == nil {
+		gwSession, err = bindWorkerGatewayForAgentRun(runCtx, logger, detail, &qw)
+		if err != nil {
+			return preflightErr(fmt.Sprintf("gateway binding: %v", err))
+		}
 	}
 	defer gwSession.Close(logger)
 
@@ -314,25 +333,19 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// session is 'running'. Best-effort + idempotent with the later
 	// maybePostRunning: the platform treats a repeated running transition
 	// as a no-op, so racing the two posts is safe.
-	postSessionRunning(runCtx, &http.Client{Timeout: 5 * time.Second}, logger,
-		detail.PlatformURL, sessionID, detail.WorkerID, detail.AuthToken)
+	if admissionErr == nil {
+		postSessionRunning(runCtx, &http.Client{Timeout: 5 * time.Second}, logger,
+			detail.PlatformURL, sessionID, detail.WorkerID, detail.AuthToken)
+	}
 
-	logger.Info("donmai agent run: invoking runner.Run", "sessionId", qw.SessionID)
-	res, runErr := r.Run(runCtx, qw)
+	logger.Info("donmai agent run: invoking runner.RunAdmitted", "sessionId", qw.SessionID)
+	res, runErr := r.RunAdmitted(runCtx, qw, admission)
 
 	out := cmd.OutOrStdout()
 	if opts.jsonOut && res != nil {
 		if err := emitResultJSON(out, res); err != nil {
 			logger.Warn("donmai agent run: emit result json failed", "err", err)
 		}
-	}
-
-	// Shutdown providers (codex app-server is the load-bearing one;
-	// claude + stub are no-ops). Best-effort.
-	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutCancel()
-	if shutErr := reg.Shutdown(shutCtx); shutErr != nil {
-		logger.Warn("donmai agent run: registry shutdown returned errors", "err", shutErr)
 	}
 
 	if runErr != nil {
@@ -875,9 +888,9 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			Context:         d.ModelProfile.Context,
 			MaxOutputTokens: d.ModelProfile.MaxOutputTokens,
 		}
-		// ToResolvedProfile bridges into the legacy QueuedWork shape so
-		// the runner loop's existing resolvedProvider() + translateSpec()
-		// paths consume it without change.
+		// ToResolvedProfile bridges into the legacy QueuedWork shape so the
+		// runner's authoritative harness admission and Spec translation consume
+		// the same profile.
 		qw.ResolvedProfile = mp.ToResolvedProfile()
 		// Preserve CredentialID from ResolvedProfile when present — the
 		// platform may send it alongside ModelProfile.
@@ -940,16 +953,14 @@ func detailSkills(in []daemon.PollSkill) []prompt.SkillSpec {
 	return out
 }
 
-// providerNameFromDetail returns the provider name the runner will
-// resolve for this detail, falling back through the same chain
-// runner.QueuedWork.resolvedProvider uses. Only used for log lines —
-// the runner does the authoritative resolution itself.
+// providerNameFromDetail projects a non-authoritative compatibility name for
+// pre-run display and gateway metadata. The runner's harness admission remains
+// the only authoritative runtime selection.
 //
-// Lookup order: ModelProfile.ProviderID → ResolvedProfile.Harness (when
-// it maps to a known provider) → ResolvedProfile.Provider →
-// ResolvedProfile.Runner → default claude. The Harness branch mirrors the
-// runner's harness-native selection so this log line does not diverge from
-// the provider actually resolved; the runner remains authoritative.
+// Display order: ModelProfile.ProviderID → the historical `agy` projection →
+// ResolvedProfile.Provider → ResolvedProfile.Runner → default claude. Unknown
+// explicit harnesses may fall through here for display only; runner admission
+// still denies them and never follows this compatibility chain.
 func providerNameFromDetail(d *daemon.SessionDetail) string {
 	if d.ModelProfile != nil && d.ModelProfile.ProviderID != "" {
 		return d.ModelProfile.ProviderID
@@ -969,11 +980,10 @@ func providerNameFromDetail(d *daemon.SessionDetail) string {
 	return string(agent.ProviderClaude)
 }
 
-// harnessToProviderName mirrors the runner's harness→provider mapping for
-// the log-line path (runner.harnessToProvider is unexported). Authoritative
-// selection happens inside the runner; this only keeps the dispatch log
-// honest. An unrecognized token returns ("", false) so the caller falls
-// back to the Provider/Runner chain.
+// harnessToProviderName handles the one historical pre-run projection needed
+// for Antigravity logs/gateway metadata. It is not an admission selector: an
+// unrecognized token returns ("", false), while the runner independently
+// denies unknown explicit harness intent instead of following this fallback.
 func harnessToProviderName(harness string) (string, bool) {
 	switch harness {
 	case "agy":

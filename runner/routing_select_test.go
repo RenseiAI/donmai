@@ -85,6 +85,28 @@ func TestSelectProviderByPosterior_FlagOff_NoPost(t *testing.T) {
 	}
 }
 
+func TestSelectProviderByPosterior_ExplicitHarness_NoPost(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"selectedProvider":"codex","source":"mab-routing"}`))
+	}))
+	defer srv.Close()
+	t.Setenv("ROUTING_SELECTOR_ENABLED", "true")
+	r := selectRunner(t, srv.Client(), "claude", "codex")
+	qw := selectWork(srv.URL)
+	qw.ResolvedProfile.Harness = "claude"
+
+	name, ok := r.selectProviderByPosterior(context.Background(), qw)
+	if ok || name != "" {
+		t.Fatalf("explicit harness must not be overridden: got (%q,%v)", name, ok)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("explicit harness must POST nothing, got %d POSTs", hits.Load())
+	}
+}
+
 func TestSelectProviderByPosterior_FlagOn_Overrides(t *testing.T) {
 	var gotPath, gotAuth string
 	var gotBody routingSelectRequest

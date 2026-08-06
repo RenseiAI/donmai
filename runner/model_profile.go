@@ -38,8 +38,8 @@ type ResolvedModelProfile struct {
 	// the model identity (e.g. "agy" for the Antigravity `agy` CLI-wrap).
 	// When non-empty it is AUTHORITATIVE for provider selection over
 	// ProviderID: ToResolvedProfile copies it into ResolvedProfile.Harness,
-	// which the runner's resolvedProvider() reads first (see
-	// runner/types.go). This keeps the modelProfile dispatch path
+	// which the runner's authoritative harness selector reads first. This keeps
+	// the modelProfile dispatch path
 	// harness-aware in lock-step with the resolvedProfile path. Empty falls
 	// back to the ProviderID/default chain.
 	Harness string `json:"harness,omitempty"`
@@ -100,34 +100,27 @@ func (p ResolvedModelProfile) ToResolvedProfile() ResolvedProfile {
 // end-to-end; callers that only have a raw ProviderName should use
 // Registry.Resolve directly.
 //
-// Lookup order:
-//  1. profile.ProviderID (exact match against registered provider names)
-//  2. If unregistered, return a descriptive *ProviderNotRegisteredError
-//
-// An empty ProviderID falls back to agent.ProviderClaude for backwards
-// compatibility with dispatches that arrive before the platform ships
-// the enriched profile.
+// A non-empty Harness is authoritative and resolves against registered harness
+// manifests. With no Harness, the named legacy adapter preserves ProviderID or
+// the documented Claude default and receipts that inference.
 //
 // Returns (nil, *ProviderNotRegisteredError) when the requested provider is
 // not registered on this host. The error carries the ProviderID and the
 // names currently registered so the caller can log a useful diagnostic.
 func (r *Registry) SelectProvider(profile ResolvedModelProfile) (agent.Provider, error) {
-	providerID := strings.TrimSpace(profile.ProviderID)
-	if providerID == "" {
-		// Backwards-compat: empty profile means no platform enrichment
-		// was present; fall back to the same default as resolvedProvider().
-		providerID = string(agent.ProviderClaude)
-	}
-	name := agent.ProviderName(providerID)
-	p, err := r.Resolve(name)
+	selection, err := r.selectModelProfile(profile)
 	if err != nil {
-		// Wrap in a structured error so callers can inspect fields.
-		return nil, &ProviderNotRegisteredError{
-			RequestedID: providerID,
-			Registered:  r.registeredNames(),
-		}
+		return nil, err
 	}
-	return p, nil
+	return selection.Provider, nil
+}
+
+func (r *Registry) selectModelProfile(profile ResolvedModelProfile) (harnessSelection, error) {
+	resolved := profile.ToResolvedProfile()
+	if resolved.Harness != "" {
+		return r.selectExplicitHarness(resolved)
+	}
+	return r.legacyHarnessSelectionAdapter(resolved, "")
 }
 
 // ProviderNotRegisteredError is returned by SelectProvider when the
@@ -140,6 +133,10 @@ type ProviderNotRegisteredError struct {
 	// Registered is the snapshot of provider names at call time.
 	Registered []string
 }
+
+// Unwrap preserves the historical ErrNoProvider classification while callers
+// migrate to the richer typed provider/harness admission error.
+func (e *ProviderNotRegisteredError) Unwrap() error { return agent.ErrNoProvider }
 
 func (e *ProviderNotRegisteredError) Error() string {
 	if len(e.Registered) == 0 {

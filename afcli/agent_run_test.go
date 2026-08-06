@@ -22,7 +22,9 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/runner"
 )
 
 // quietLogger returns a slog.Logger that drops all output. Used by
@@ -508,8 +510,8 @@ func TestDetailToQueuedWork_ModelProfileEmptyProviderIDFallback(t *testing.T) {
 	}
 	qw := detailToQueuedWork(d)
 
-	// Empty ProviderID in ModelProfile → ToResolvedProfile → Provider=""
-	// → resolvedProvider() falls back to claude in the runner.
+	// Empty ProviderID in ModelProfile reaches the named legacy harness adapter,
+	// which visibly defaults to Claude during runner admission.
 	// We just assert the conversion did not panic and the profile is set.
 	if qw.ResolvedProfile.Model != "some-model" {
 		t.Errorf("Model = %q; want some-model", qw.ResolvedProfile.Model)
@@ -884,6 +886,88 @@ func TestRunAgentRun_PreflightSessionNotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "preflight") {
 		t.Errorf("error = %q, want preflight prefix", err.Error())
+	}
+}
+
+func TestRunAgentRun_UnknownExplicitHarnessPrecedesGatewayAndRunningPost(t *testing.T) {
+	// Keep production registry construction deterministic: only the bundled
+	// stub provider is needed to prove an unknown explicit selector is denied.
+	t.Setenv("PATH", t.TempDir())
+	var gatewayCalls atomic.Int32
+	originalBind := bindWorkerGatewayForAgentRun
+	bindWorkerGatewayForAgentRun = func(context.Context, *slog.Logger, *daemon.SessionDetail, *runner.QueuedWork) (*workerGateway, error) {
+		gatewayCalls.Add(1)
+		return nil, errors.New("gateway binding must not run after harness denial")
+	}
+	t.Cleanup(func() { bindWorkerGatewayForAgentRun = originalBind })
+
+	var (
+		completionPosts atomic.Int32
+		statusPosts     atomic.Int32
+		runningPosts    atomic.Int32
+		failedPosts     atomic.Int32
+	)
+	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/completion"):
+			completionPosts.Add(1)
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			statusPosts.Add(1)
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			switch body["status"] {
+			case "running":
+				runningPosts.Add(1)
+			case "failed":
+				failedPosts.Add(1)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer platform.Close()
+
+	detail := &daemon.SessionDetail{
+		SessionID: "session_unknown_explicit", IssueIdentifier: "issue-harness-denial",
+		Body: "deny before worker side effects", WorkerID: "worker_test",
+		AuthToken: "test-token", PlatformURL: platform.URL,
+		ResolvedProfile: &daemon.SessionResolvedProfile{
+			Harness: "future-harness", Provider: string(agent.ProviderStub),
+			ServingHost: string(agent.HostGateway), Model: "test-model",
+		},
+	}
+	daemonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/daemon/sessions/") {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(detail) // nolint:gosec // G117: test fixture
+	}))
+	defer daemonServer.Close()
+
+	cmd := &cobra.Command{}
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	err := runAgentRun(context.Background(), cmd, &agentRunOpts{
+		sessionID: detail.SessionID, daemonURL: daemonServer.URL,
+		worktree: t.TempDir(), jsonOut: true,
+	})
+	var denial *runner.HarnessAdmissionError
+	if !errors.As(err, &denial) || denial.Code != executioncell.DenialUnknownHarness {
+		t.Fatalf("runAgentRun error = %v, want typed unknown_harness denial", err)
+	}
+	if gatewayCalls.Load() != 0 {
+		t.Fatalf("gateway binding calls = %d, want 0", gatewayCalls.Load())
+	}
+	if runningPosts.Load() != 0 {
+		t.Fatalf("eager status=running posts = %d, want 0", runningPosts.Load())
+	}
+	if completionPosts.Load() != 1 || statusPosts.Load() != 1 || failedPosts.Load() != 1 {
+		t.Fatalf("terminal posts = completion:%d status:%d failed:%d, want one canonical failure delivery",
+			completionPosts.Load(), statusPosts.Load(), failedPosts.Load())
+	}
+	if !strings.Contains(stdout.String(), `"denialCode": "unknown_harness"`) {
+		t.Fatalf("result JSON missing canonical denial receipt: %s", stdout.String())
 	}
 }
 
