@@ -19,6 +19,7 @@ var _ agent.HarnessProvider = (*provider)(nil)
 // P1-SPEC §2.8.
 func (p *provider) Manifest() agent.HarnessManifest {
 	c := p.caps
+	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventToolProgress, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessStub,
 		HumanLabel:  "Test Stub",
@@ -40,5 +41,14 @@ func (p *provider) Manifest() agent.HarnessManifest {
 			DrivesHosts:              []agent.ServingHost{agent.HostLocal},
 			Transport:                agent.TransportDirectAPI,
 		},
+		ToolLifecycle: []agent.ToolLifecycleProfile{{
+			ID: "stub/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+			ToolPluginDelivery: agent.ToolDeliveryStubOracle, MCPDelivery: agent.ToolDeliveryStubOracle,
+			NativeToolPolicyDelivery: agent.ToolDeliveryStubOracle, PermissionConfigDelivery: agent.ToolDeliveryStubOracle,
+			MCPToolPolicyDelivery: agent.ToolDeliveryStubOracle, ToolHookDelivery: agent.ToolDeliveryStubOracle,
+			LifecycleDelivery: agent.ToolDeliveryStubOracle, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: events,
+			ReplayDelivery: agent.ToolDeliveryStubOracle, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: events,
+			CleanupDelivery: agent.ToolDeliveryStubOracle, EvidenceTier: "unit_verified",
+		}},
 	}
 }

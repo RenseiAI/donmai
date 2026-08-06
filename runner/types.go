@@ -2,6 +2,7 @@ package runner
 
 import (
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
@@ -20,9 +21,8 @@ type QueuedWork struct {
 	prompt.QueuedWork
 
 	// ResolvedProfile carries the model-profile knobs the platform
-	// resolved before queueing this work. The runner reads
-	// ResolvedProfile.Provider to select which provider implementation
-	// runs the session.
+	// resolved before queueing this work. An explicit Harness is authoritative;
+	// only the named legacy adapter may infer from Provider/Runner/defaults.
 	ResolvedProfile ResolvedProfile `json:"resolvedProfile,omitempty"`
 
 	// Branch is the working branch name the runner should use when
@@ -92,20 +92,20 @@ func (q *QueuedWork) hasCapability(name string) bool {
 // by the daemon poll handler).
 type ResolvedProfile struct {
 	// Harness is the loop-driver attribute the platform catalog models on
-	// the model identity (e.g. "agy" for the Antigravity `agy` CLI-wrap).
+	// the model identity (e.g. "antigravity", "gemini-direct", or "ollama";
+	// legacy wire aliases such as "agy", "native", and "raw" remain accepted).
 	// When present it is AUTHORITATIVE for binary/provider selection: the
 	// runner maps the harness token onto its concrete provider impl
 	// regardless of the Provider value (so a catalog that models the
 	// model as Provider="gemini" with Harness="agy" still resolves to the
-	// agy-cli provider). Empty falls back to the Provider/Runner/default
-	// chain — see [QueuedWork.resolvedProvider]. This lets the platform
-	// drop the transitional Provider="agy-cli" wire token once every
-	// runner reads Harness.
+	// agy-cli provider). Empty is handled only by the named legacy harness
+	// adapter. A non-empty value never falls through to Provider, Runner, a
+	// default, or posterior routing.
 	Harness string `json:"harness,omitempty"`
 
 	// Provider names the provider family that should run the session
-	// (claude/codex/stub for v0.5.0). When empty the runner falls
-	// back to the legacy `Runner` field, then to agent.ProviderClaude.
+	// (claude/codex/stub for v0.5.0). When empty, only the named legacy
+	// harness adapter falls back to `Runner`, then to agent.ProviderClaude.
 	// Superseded by Harness when Harness is non-empty.
 	Provider agent.ProviderName `json:"provider,omitempty"`
 
@@ -172,53 +172,6 @@ func (q *QueuedWork) isInteractive() bool {
 	return q.Mode == interactiveRunMode
 }
 
-// harnessToProvider maps a platform-wire harness token (the catalog's
-// loop-driver attribute) onto the concrete provider impl that drives it.
-// This is the harness-native selection seam: it lets the platform model a
-// model as e.g. Provider="gemini" with Harness="agy" and still resolve to
-// the agy-cli provider, so the platform can drop the transitional
-// Provider="agy-cli" wire token.
-//
-// The token is the lowercase catalog attribute (e.g. "agy"), NOT the
-// internal agent.HarnessName ("antigravity"); the two are deliberately
-// distinct. An unrecognized token returns ("", false) so the caller falls
-// back to the Provider/Runner/default chain — a forward-compatible default
-// (a new harness token a stale runner doesn't know maps cleanly to its
-// Provider field).
-func harnessToProvider(harness string) (agent.ProviderName, bool) {
-	switch harness {
-	case "agy":
-		return agent.ProviderAGYCLI, true
-	default:
-		return "", false
-	}
-}
-
-// resolvedProvider returns the effective provider name for this
-// QueuedWork.
-//
-// Selection order:
-//  1. ResolvedProfile.Harness (when it maps to a known provider) — the
-//     harness-native path; the catalog's loop-driver attribute is
-//     authoritative over Provider.
-//  2. ResolvedProfile.Provider — includes the legacy "agy-cli" alias the
-//     platform still emits today (kept for one release so an in-flight
-//     dispatch from a not-yet-updated platform cannot break a session).
-//  3. ResolvedProfile.Runner (legacy field name).
-//  4. agent.ProviderClaude (default).
-func (q *QueuedWork) resolvedProvider() agent.ProviderName {
-	if name, ok := harnessToProvider(q.ResolvedProfile.Harness); ok {
-		return name
-	}
-	if q.ResolvedProfile.Provider != "" {
-		return q.ResolvedProfile.Provider
-	}
-	if q.ResolvedProfile.Runner != "" {
-		return agent.ProviderName(q.ResolvedProfile.Runner)
-	}
-	return agent.ProviderClaude
-}
-
 // Result is the terminal output of a [Runner.Run] call.
 //
 // Today it is a thin alias around [agent.Result] with the addition of
@@ -229,6 +182,18 @@ func (q *QueuedWork) resolvedProvider() agent.ProviderName {
 // agent/types.go contract.
 type Result struct {
 	agent.Result
+
+	// HarnessRef is the independently admitted loop-driver identity. It is
+	// distinct from Result.ProviderName, the legacy concrete registry key.
+	HarnessRef *executioncell.HarnessRef `json:"harnessRef,omitempty"`
+
+	// ResolverDecisions carries canonical explicit/default/legacy provenance
+	// from the harness selector. The full admitted receipt remains upstream.
+	ResolverDecisions []executioncell.ResolverDecision `json:"resolverDecisions,omitempty"`
+
+	// AdmissionReceipt is populated on a local pre-spawn denial. It is the
+	// canonical v1alpha1 denied receipt, never a runner-specific lookalike.
+	AdmissionReceipt *executioncell.AdmissionReceipt `json:"admissionReceipt,omitempty"`
 
 	// SessionID is the platform-side session UUID this result
 	// belongs to. Echoed for caller convenience.

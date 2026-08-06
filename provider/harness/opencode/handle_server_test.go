@@ -2,10 +2,11 @@ package opencode
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -249,10 +250,160 @@ func TestServerHandle_StopIdempotentAndAborts(t *testing.T) {
 	}
 }
 
+func newOwnedConfigServerHandle(t *testing.T, spec agent.Spec) (*Provider, *openCodeConfigBoundary, *serverHandle, *fakeClient) {
+	t.Helper()
+	boundary, err := newOpenCodeConfigBoundary(t.TempDir(), spec)
+	if err != nil {
+		t.Fatalf("new config boundary: %v", err)
+	}
+	resource := &openCodeServerResource{config: boundary}
+	p := &Provider{}
+	if err := p.registerResource(resource); err != nil {
+		t.Fatalf("register resource: %v", err)
+	}
+	fc := newFakeClient()
+	h := newServerHandle(nil, fc, fc.sessionID, spec, slog.Default())
+	h.releaseOwned = func() error { return p.releaseResource(resource) }
+	return p, boundary, h, fc
+}
+
+func TestServerHandle_StopAndConcurrentShutdownRemoveOwnedConfig(t *testing.T) {
+	p, boundary, h, _ := newOwnedConfigServerHandle(t, agent.Spec{})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errs <- h.Stop(context.Background())
+	}()
+	go func() {
+		defer wg.Done()
+		errs <- p.Shutdown(context.Background())
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent teardown: %v", err)
+		}
+	}
+	if _, err := os.Stat(boundary.home); !os.IsNotExist(err) {
+		t.Fatalf("owned config survived Stop/Shutdown: %v", err)
+	}
+}
+
+func TestProvider_ShutdownRemovesOrphanedOwnedConfig(t *testing.T) {
+	boundary, err := newOpenCodeConfigBoundary(t.TempDir(), agent.Spec{})
+	if err != nil {
+		t.Fatalf("new config boundary: %v", err)
+	}
+	resource := &openCodeServerResource{config: boundary}
+	p := &Provider{}
+	if err := p.registerResource(resource); err != nil {
+		t.Fatalf("register resource: %v", err)
+	}
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if _, err := os.Stat(boundary.home); !os.IsNotExist(err) {
+		t.Fatalf("owned config survived Shutdown: %v", err)
+	}
+	if _, err := p.Spawn(t.Context(), agent.Spec{}); !errors.Is(err, errOpenCodeShutdown) {
+		t.Fatalf("Spawn after Shutdown error = %v, want provider shutdown denial", err)
+	}
+}
+
+func TestServerHandle_TerminalRemovesOwnedConfigBeforeResult(t *testing.T) {
+	p, boundary, h, fc := newOwnedConfigServerHandle(t, agent.Spec{})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fc.push(evt("terminal", evStepEnded, map[string]any{"sessionID": fc.sessionID, "finish": "stop"}))
+	events := drainHandle(ctx, h)
+	if err := conformance.CheckTerminalContract(events); err != nil {
+		t.Fatalf("terminal contract: %v", err)
+	}
+	if _, err := os.Stat(boundary.home); !os.IsNotExist(err) {
+		t.Fatalf("owned config survived terminal result: %v", err)
+	}
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown after terminal: %v", err)
+	}
+}
+
+func TestServerHandle_StreamCrashRemovesOwnedConfig(t *testing.T) {
+	_, boundary, h, fc := newOwnedConfigServerHandle(t, agent.Spec{})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	close(fc.evCh)
+	events := drainHandle(ctx, h)
+	if err := conformance.CheckTerminalContract(events); err != nil {
+		t.Fatalf("crash terminal contract: %v", err)
+	}
+	if _, err := os.Stat(boundary.home); !os.IsNotExist(err) {
+		t.Fatalf("owned config survived stream crash: %v", err)
+	}
+}
+
+func TestServerHandle_TerminalCleanupFailureIsObservableAndSecretSafe(t *testing.T) {
+	const secretSentinel = "opencode-terminal-cleanup-secret-must-not-surface"
+	spec := agent.Spec{MCPServers: []agent.MCPServerConfig{{
+		Name: "platform", Type: "http", URL: "https://example.invalid/mcp",
+		Headers: map[string]string{"Authorization": "Bearer " + secretSentinel},
+	}}}
+	p, boundary, h, fc := newOwnedConfigServerHandle(t, spec)
+	otherInfo, err := os.Stat(t.TempDir())
+	if err != nil {
+		t.Fatalf("stat replacement parent identity: %v", err)
+	}
+	boundary.parentInfo = otherInfo
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fc.push(evt("terminal", evStepEnded, map[string]any{"sessionID": fc.sessionID, "finish": "stop"}))
+	events := drainHandle(ctx, h)
+	if err := conformance.CheckTerminalContract(events); err != nil {
+		t.Fatalf("cleanup terminal contract: %v; events=%s", err, kindsOf(events))
+	}
+	if len(events) == 0 {
+		t.Fatal("cleanup emitted no terminal error")
+	}
+	cleanup, ok := events[len(events)-1].(agent.ErrorEvent)
+	if !ok || cleanup.Code != "config_cleanup_failed" {
+		t.Fatalf("cleanup terminal = %#v, want config_cleanup_failed", events[len(events)-1])
+	}
+	for _, event := range events {
+		if _, ok := event.(agent.ResultEvent); ok {
+			t.Fatalf("cleanup failure retained successful ResultEvent: %s", kindsOf(events))
+		}
+	}
+	if strings.Contains(cleanup.Message, secretSentinel) || strings.Contains(cleanup.Message, boundary.configPath) {
+		t.Fatalf("cleanup event leaked secret or path: %q", cleanup.Message)
+	}
+	if err := h.Stop(context.Background()); !errors.Is(err, errOpenCodeConfigCleanup) {
+		t.Fatalf("Stop error = %v, want bounded cleanup sentinel", err)
+	}
+	if err := p.Shutdown(context.Background()); !errors.Is(err, errOpenCodeConfigCleanup) {
+		t.Fatalf("Shutdown error = %v, want persistent cleanup sentinel", err)
+	}
+}
+
 // TestProvider_SpawnServer_AttachWiring drives the full Provider.Spawn Lane-B
 // path (attach mode + injected client factory) end to end without a real
-// binary, and confirms the per-session opencode.json was written with the
-// provider lockout.
+// binary. Attach mode must not write or claim activation of a local project
+// config: the external server owns its own configuration.
 func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 	t.Parallel()
 	fc := newFakeClient()
@@ -264,9 +415,6 @@ func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 	spec := agent.Spec{
 		Prompt: "do it",
 		Cwd:    cwd,
-		Endpoint: &agent.EndpointBinding{
-			Company: agent.CompanyOpenAI, Model: "gpt-x", BaseURL: "http://compat/v1",
-		},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -284,21 +432,11 @@ func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 		t.Errorf("initial prompts = %d, want 1", nPrompts)
 	}
 
-	// The per-session config was written with the lockout.
+	// No local project config is written: an attached external server would
+	// not read it, so writing it would overstate the adapter's authority.
 	cfgPath := filepath.Join(cwd, ".donmai-opencode", "opencode.json")
-	data, err := os.ReadFile(cfgPath)
-	if err != nil {
-		t.Fatalf("read injected config: %v", err)
-	}
-	var cfg ocConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("config JSON: %v", err)
-	}
-	if len(cfg.EnabledProviders) != 1 || cfg.EnabledProviders[0] != OCProviderID {
-		t.Errorf("enabled_providers = %v, want [%s] (fallback lockout)", cfg.EnabledProviders, OCProviderID)
-	}
-	if cfg.Model != OCProviderID+"/gpt-x" {
-		t.Errorf("config model = %q, want %s/gpt-x", cfg.Model, OCProviderID)
+	if _, err := os.Stat(cfgPath); !os.IsNotExist(err) {
+		t.Fatalf("attach mode wrote an inactive project config: %v", err)
 	}
 
 	// Terminate cleanly through a terminal frame.

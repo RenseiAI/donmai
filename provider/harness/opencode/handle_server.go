@@ -41,9 +41,11 @@ type serverHandle struct {
 	spec    agent.Spec
 	stopSSE func() error
 
-	// onClose runs once during teardown (after the child is stopped) — the
-	// Provider uses it to unregister the serve child from its sweep set.
-	onClose func()
+	// releaseOwned stops the provider-owned serve child and then destroys its
+	// isolated config. nil in external-attach mode.
+	releaseOwned func() error
+	releaseOnce  sync.Once
+	releaseErr   error
 
 	// permInterval is the pump poll cadence (defaults to permPollInterval;
 	// tests shorten it per-instance to avoid racing a shared var).
@@ -53,6 +55,12 @@ type serverHandle struct {
 
 	stopOnce sync.Once
 	stopErr  error
+	stopping atomic.Bool
+	// lifecycleMu orders permission observability batches before terminal
+	// cleanup so a terminal cannot split an already-adjudicated batch.
+	lifecycleMu sync.Mutex
+
+	cleanupReported atomic.Bool
 
 	shutdown chan struct{}
 	done     chan struct{} // closed when the forwarder exits
@@ -121,7 +129,9 @@ func (h *serverHandle) Stop(ctx context.Context) error {
 }
 
 func (h *serverHandle) doStop(ctx context.Context) error {
-	close(h.shutdown)
+	h.lifecycleMu.Lock()
+	h.stopping.Store(true)
+	h.lifecycleMu.Unlock()
 
 	// (1) best-effort abort so opencode finalizes its session file.
 	abortCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -133,13 +143,13 @@ func (h *serverHandle) doStop(ctx context.Context) error {
 		_ = h.stopSSE()
 	}
 
-	// (3) tear down the serve child (SIGTERM → grace → SIGKILL).
-	if h.child != nil {
-		h.child.stop()
+	// (3) tear down the serve child, then destroy its config. Cleanup errors
+	// are both returned and emitted before the event channel closes.
+	cleanupErr := h.releaseOwnedResource()
+	if cleanupErr != nil {
+		h.reportCleanupFailure()
 	}
-	if h.onClose != nil {
-		h.onClose()
-	}
+	close(h.shutdown)
 
 	// (4) wait for the forwarder to drain, then close events.
 	select {
@@ -147,7 +157,7 @@ func (h *serverHandle) doStop(ctx context.Context) error {
 	case <-time.After(stopGracePeriod):
 	}
 	h.closeEvents()
-	return nil
+	return cleanupErr
 }
 
 func (h *serverHandle) watchCtx(ctx context.Context) {
@@ -169,25 +179,69 @@ func (h *serverHandle) forward(ch <-chan serverEvent) {
 			return
 		case ev, ok := <-ch:
 			if !ok {
+				if h.stopping.Load() {
+					return
+				}
 				// SSE stream ended. If we already emitted a terminal, this is
 				// the clean end. Otherwise the child crashed or the stream
 				// dropped — surface a terminal so the runner is not left hanging.
-				h.emitAll(h.terminalOnStreamEnd())
+				h.finishWithCleanup(h.terminalOnStreamEnd())
+				return
+			}
+			if h.stopping.Load() {
 				return
 			}
 			out := h.mapper.Map(ev)
-			h.emitAll(out)
 			if h.mapper.terminal {
-				// Terminal emitted; tear down asynchronously so the runner sees
-				// the channel close after the terminal event.
-				go func() {
-					stopCtx, cancel := context.WithTimeout(context.Background(), stopGracePeriod)
-					defer cancel()
-					_ = h.Stop(stopCtx)
-				}()
+				h.finishWithCleanup(out)
 				return
 			}
+			h.emitAll(out)
 		}
+	}
+}
+
+// finishWithCleanup preserves the exactly-one-terminal contract: the owned
+// child/config is released before the mapped terminal is published. A cleanup
+// failure replaces that terminal with one bounded ErrorEvent.
+func (h *serverHandle) finishWithCleanup(events []agent.Event) {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	if !h.stopping.CompareAndSwap(false, true) {
+		return
+	}
+	cleanupErr := h.releaseOwnedResource()
+	for _, ev := range events {
+		switch ev.Kind() {
+		case agent.EventResult, agent.EventError:
+			if cleanupErr != nil {
+				h.reportCleanupFailure()
+			} else {
+				h.emit(ev)
+			}
+		default:
+			h.emit(ev)
+		}
+	}
+	go func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), stopGracePeriod)
+		defer cancel()
+		_ = h.Stop(stopCtx)
+	}()
+}
+
+func (h *serverHandle) releaseOwnedResource() error {
+	h.releaseOnce.Do(func() {
+		if h.releaseOwned != nil {
+			h.releaseErr = h.releaseOwned()
+		}
+	})
+	return h.releaseErr
+}
+
+func (h *serverHandle) reportCleanupFailure() {
+	if h.cleanupReported.CompareAndSwap(false, true) {
+		h.emit(openCodeConfigCleanupEvent())
 	}
 }
 
@@ -232,6 +286,11 @@ func (h *serverHandle) pumpLoop() {
 				h.logger.Debug("provider/opencode: permission adjudicate", "err", err)
 				continue
 			}
+			h.lifecycleMu.Lock()
+			if h.stopping.Load() {
+				h.lifecycleMu.Unlock()
+				return
+			}
 			for _, rec := range records {
 				h.emit(agent.SystemEvent{
 					Subtype: "permission_request",
@@ -244,6 +303,7 @@ func (h *serverHandle) pumpLoop() {
 					Raw:     rec.Request,
 				})
 			}
+			h.lifecycleMu.Unlock()
 		}
 	}
 }

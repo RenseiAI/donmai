@@ -20,8 +20,11 @@ type fakeServer struct {
 	stdin  *io.PipeReader // server reads from here (provider's stdin write end)
 	stdout *io.PipeWriter // server writes here (provider's stdout read end)
 
-	mu      sync.Mutex
-	threads map[string]bool
+	mu        sync.Mutex
+	threads   map[string]bool
+	methods   []string
+	mcpWrites []string
+	activeMCP map[string]any
 }
 
 func newFakeServer() (*fakeServer, *io.PipeWriter, *io.PipeReader) {
@@ -31,9 +34,10 @@ func newFakeServer() (*fakeServer, *io.PipeWriter, *io.PipeReader) {
 	stdinReader, stdinWriter := io.Pipe()
 	stdoutReader, stdoutWriter := io.Pipe()
 	fs := &fakeServer{
-		stdin:   stdinReader,
-		stdout:  stdoutWriter,
-		threads: map[string]bool{},
+		stdin:     stdinReader,
+		stdout:    stdoutWriter,
+		threads:   map[string]bool{},
+		activeMCP: map[string]any{},
 	}
 	return fs, stdinWriter, stdoutReader
 }
@@ -55,6 +59,7 @@ func (fs *fakeServer) close() {
 // run reads JSON-RPC requests from stdin and replies according to a
 // deterministic script. Specifically it:
 //   - replies to `initialize` with empty result
+//   - applies config/batchWrite and reports active mcp_servers via config/read
 //   - replies to `thread/start` with a fresh thread id
 //   - replies to `turn/start` with empty result, then emits a canned
 //     event sequence ending in turn/completed
@@ -68,9 +73,41 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 		}
 		method, _ := msg["method"].(string)
 		idRaw, hasID := msg["id"]
+		fs.mu.Lock()
+		fs.methods = append(fs.methods, method)
+		if method == "config/batchWrite" {
+			encoded, _ := json.Marshal(msg["params"])
+			fs.mcpWrites = append(fs.mcpWrites, string(encoded))
+		}
+		fs.mu.Unlock()
 		switch {
 		case method == "initialize" && hasID:
 			fs.replyOK(t, idRaw)
+		case method == "config/batchWrite" && hasID:
+			params, _ := msg["params"].(map[string]any)
+			edits, _ := params["edits"].([]any)
+			if len(edits) == 1 {
+				edit, _ := edits[0].(map[string]any)
+				if edit["keyPath"] == codexMCPConfigKeyPath {
+					if value, ok := edit["value"].(map[string]any); ok {
+						fs.mu.Lock()
+						fs.activeMCP = value
+						fs.mu.Unlock()
+					}
+				}
+			}
+			fs.write(t, map[string]any{
+				"jsonrpc": "2.0", "id": idRaw,
+				"result": map[string]any{"filePath": params["filePath"], "status": "ok", "version": "fake"},
+			})
+		case method == "config/read" && hasID:
+			fs.mu.Lock()
+			active := fs.activeMCP
+			fs.mu.Unlock()
+			fs.write(t, map[string]any{
+				"jsonrpc": "2.0", "id": idRaw,
+				"result": map[string]any{"config": map[string]any{codexMCPConfigKeyPath: active}, "origins": map[string]any{}},
+			})
 		case method == "thread/start" && hasID:
 			fs.mu.Lock()
 			fs.threads[threadID] = true
@@ -141,9 +178,10 @@ func newTestProvider(t *testing.T) (*Provider, *fakeServer) {
 	// already be running.
 	go fs.run(t, "thread-A")
 	p, err := New(Options{
-		skipProcess:    true,
-		stdinOverride:  stdinW,
-		stdoutOverride: stdoutR,
+		skipProcess:       true,
+		stdinOverride:     stdinW,
+		stdoutOverride:    stdoutR,
+		verifyMCPReadback: true,
 	})
 	if err != nil {
 		fs.close()

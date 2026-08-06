@@ -45,6 +45,7 @@ func FromManifest(m agent.ModelEndpointManifest, req agent.EndpointRequest) (age
 		BaseURL:       TemplateBaseURL(host.BaseURLTmpl, req.Region),
 		Protocol:      host.Protocol,
 		Host:          host.Host,
+		Mechanism:     req.Mechanism,
 		Auth:          req.Auth,
 		Region:        req.Region,
 		CostModel:     host.CostModel,

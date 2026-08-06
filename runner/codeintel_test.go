@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"os"
 	"reflect"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
+	shellprovider "github.com/RenseiAI/donmai/provider/harness/shell"
 )
 
 // mcpCaps / cliCaps model the two provider families the code-intel prompt
@@ -248,6 +250,59 @@ func TestDefaultMCPServers_AppendsCodeIntelAfterPlatformGate(t *testing.T) {
 	if got := argValue(servers[1].Args, "--root"); got != root {
 		t.Errorf("code-intel --root = %q, want threaded wpath %q", got, root)
 	}
+}
+
+func TestDefaultMCPServersForProvider_ShellOmitsOnlyImplicitGateway(t *testing.T) {
+	t.Parallel()
+
+	qw := QueuedWork{}
+	qw.SessionID = "sess_shell"
+	qw.PlatformURL = "https://platform.example.com"
+	qw.AuthToken = "rsk_test"
+	root := "/abs/worktrees/sess_shell"
+
+	if got := defaultMCPServersForProvider(qw, root, agent.ProviderShell); got != nil {
+		t.Fatalf("shell implicit defaults = %+v, want nil platform gateway", got)
+	}
+	if got := defaultMCPServersForProvider(qw, root, agent.ProviderClaude); len(got) != 1 || got[0].Name != "donmai-platform" {
+		t.Fatalf("non-shell implicit defaults = %+v, want platform gateway", got)
+	}
+
+	manifest := (&shellprovider.Provider{}).Manifest()
+	profile, ok := manifest.ToolLifecycleProfile(agent.PromptModeHumanControlled)
+	if !ok {
+		t.Fatal("shell manifest is missing its interactive tool/lifecycle profile")
+	}
+	assertMCPDenied := func(t *testing.T, servers []agent.MCPServerConfig, wantName string) {
+		t.Helper()
+		if len(servers) != 1 || servers[0].Name != wantName {
+			t.Fatalf("shell MCP requirements = %+v, want retained %q", servers, wantName)
+		}
+		_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{
+			Interactive: &agent.InteractiveSpec{},
+			MCPServers:  servers,
+		}, profile)
+		var adaptationErr *agent.ToolAdaptationError
+		if !errors.As(err, &adaptationErr) || adaptationErr.Channel != agent.ToolChannelMCPServer {
+			t.Fatalf("AdaptToolLifecycle error = %v, want typed MCP denial", err)
+		}
+		if receipt.Decision != "denied" || len(receipt.Entries) != 1 || receipt.Entries[0].Outcome != agent.ToolOutcomeDenied {
+			t.Fatalf("denial receipt = %+v, want one denied MCP entry", receipt)
+		}
+	}
+
+	t.Run("explicit card MCP remains required", func(t *testing.T) {
+		card := []agent.MCPServerConfig{{Name: "card-tools", Type: "stdio", Command: "card-mcp"}}
+		servers := mergeMCPServers(defaultMCPServersForProvider(qw, root, agent.ProviderShell), card)
+		assertMCPDenied(t, servers, "card-tools")
+	})
+
+	t.Run("explicit code intel MCP remains required", func(t *testing.T) {
+		withCodeIntel := qw
+		withCodeIntel.CodeIntel = &prompt.CodeIntelWork{Repo: "owner/repo"}
+		servers := defaultMCPServersForProvider(withCodeIntel, root, agent.ProviderShell)
+		assertMCPDenied(t, servers, "af-code-intelligence")
+	})
 }
 
 // TestDefaultMCPServers_CodeIntelInStandaloneMode verifies code-intel is a pure

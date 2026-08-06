@@ -33,7 +33,7 @@ func TestPromptAdaptation_ExactChatMessages(t *testing.T) {
 	if len(wire.Messages) != len(want) || wire.Messages[0] != want[0] || wire.Messages[1] != want[1] {
 		t.Fatalf("messages = %#v, want %#v", wire.Messages, want)
 	}
-	if receipt.ProfileID != "raw/ollama-chat/direct-api-v1" {
+	if receipt.ProfileID != "ollama/ollama-chat/direct-api-v1" {
 		t.Fatalf("profile = %q", receipt.ProfileID)
 	}
 }

@@ -144,7 +144,7 @@ const (
 
 func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode, sessionID string) (agent.Handle, error) {
 	var err error
-	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}

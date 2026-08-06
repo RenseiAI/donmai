@@ -3,8 +3,10 @@ package ptycli
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -204,6 +206,115 @@ func TestSpawn_MissingBinary_WrapsErrSpawnFailed(t *testing.T) {
 	})
 	if !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Errorf("error = %v, want wrapping agent.ErrSpawnFailed", err)
+	}
+}
+
+func TestSpawnWithCleanup_OwnsResourceAcrossEveryTerminalPath(t *testing.T) {
+	requireShell(t)
+
+	t.Run("child exit", func(t *testing.T) {
+		var calls atomic.Int32
+		h, err := SpawnWithCleanup(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
+			Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
+		}, func() error { calls.Add(1); return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		collectEvents(t, h)
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("cleanup calls = %d, want 1", got)
+		}
+		if err := h.Stop(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("cleanup calls after Stop = %d, want 1", got)
+		}
+	})
+
+	t.Run("explicit stop", func(t *testing.T) {
+		var calls atomic.Int32
+		h, err := SpawnWithCleanup(context.Background(), "sh", []string{"-c", "sleep 30"}, agent.Spec{
+			Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
+		}, func() error { calls.Add(1); return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := h.Stop(ctx); err != nil {
+			t.Fatal(err)
+		}
+		collectEvents(t, h)
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("cleanup calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("context cancellation", func(t *testing.T) {
+		var calls atomic.Int32
+		ctx, cancel := context.WithCancel(context.Background())
+		h, err := SpawnWithCleanup(ctx, "sh", []string{"-c", "sleep 30"}, agent.Spec{
+			Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
+		}, func() error { calls.Add(1); return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		collectEvents(t, h)
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("cleanup calls = %d, want 1", got)
+		}
+	})
+
+	t.Run("spawn failure", func(t *testing.T) {
+		var calls atomic.Int32
+		_, err := SpawnWithCleanup(context.Background(), "this-binary-does-not-exist-ptycli-cleanup-test", nil, agent.Spec{
+			Interactive: &agent.InteractiveSpec{},
+		}, func() error { calls.Add(1); return nil })
+		if !errors.Is(err, agent.ErrSpawnFailed) {
+			t.Fatalf("error = %v, want ErrSpawnFailed", err)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("cleanup calls = %d, want 1", got)
+		}
+	})
+}
+
+func TestSpawnWithCleanup_ErrorMakesTerminalResultFail(t *testing.T) {
+	requireShell(t)
+	want := errors.New("cleanup refused")
+	h, err := SpawnWithCleanup(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
+		Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
+	}, func() error { return want })
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(t, h)
+	result, ok := events[len(events)-1].(agent.ResultEvent)
+	if !ok || result.Success || result.ErrorSubtype != "cleanup_failed" {
+		t.Fatalf("terminal result = %#v, want cleanup_failed", events[len(events)-1])
+	}
+	if err := h.Stop(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("Stop error = %v, want cleanup error", err)
+	}
+}
+
+func TestSpawnWithCleanup_CanDeleteOwnedFile(t *testing.T) {
+	requireShell(t)
+	path := t.TempDir() + "/owned"
+	if err := os.WriteFile(path, []byte("owned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := SpawnWithCleanup(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
+		Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
+	}, func() error { return os.Remove(path) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	collectEvents(t, h)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned file still exists or stat failed: %v", err)
 	}
 }
 

@@ -125,7 +125,7 @@ func (*Provider) Capabilities() agent.Capabilities {
 // half-allocated resources.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	var err error
-	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}

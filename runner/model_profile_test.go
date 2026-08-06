@@ -156,9 +156,9 @@ func TestResolvedModelProfile_ToResolvedProfile(t *testing.T) {
 // TestResolvedModelProfile_ToResolvedProfile_CarriesHarness verifies that the
 // Harness loop-driver attribute survives the bridge into the legacy
 // ResolvedProfile shape. The platform may model a model as
-// ProviderID="gemini" with Harness="agy"; the runner's resolvedProvider()
-// reads ResolvedProfile.Harness first, so the modelProfile dispatch path must
-// produce the same harness-aware profile the resolvedProfile path does.
+// ProviderID="gemini" with Harness="agy"; the authoritative selector reads
+// ResolvedProfile.Harness first, so the modelProfile dispatch path must produce
+// the same harness-aware profile the resolvedProfile path does.
 func TestResolvedModelProfile_ToResolvedProfile_CarriesHarness(t *testing.T) {
 	profile := ResolvedModelProfile{
 		ID:         "mp_test_harness",
@@ -171,17 +171,23 @@ func TestResolvedModelProfile_ToResolvedProfile_CarriesHarness(t *testing.T) {
 	if rp.Harness != "agy" {
 		t.Errorf("Harness = %q; want %q", rp.Harness, "agy")
 	}
-	// Harness must not clobber Provider — both survive the bridge, and the
-	// runner's resolvedProvider() prefers Harness when it maps.
+	// Harness must not clobber Provider — both survive the bridge. Provider is
+	// compatibility/disambiguation context, not an explicit-harness fallback.
 	if rp.Provider != agent.ProviderGemini {
 		t.Errorf("Provider = %q; want %q (Harness must not clobber Provider)", rp.Provider, agent.ProviderGemini)
 	}
 
 	// The bridged profile must resolve to the agy-cli provider via the
 	// runner's harness-native selection, proving end-to-end carriage.
-	qw := &QueuedWork{ResolvedProfile: rp}
-	if got := qw.resolvedProvider(); got != agent.ProviderAGYCLI {
-		t.Errorf("resolvedProvider() = %q; want %q (harness=agy must select agy-cli)", got, agent.ProviderAGYCLI)
+	registry := selectorRegistry(t, &selectorFakeProvider{
+		name: agent.ProviderAGYCLI, harness: agent.HarnessAntigravity,
+	})
+	selection, err := registry.selectExplicitHarness(rp)
+	if err != nil {
+		t.Fatalf("selectExplicitHarness: %v", err)
+	}
+	if got := selection.Provider.Name(); got != agent.ProviderAGYCLI {
+		t.Errorf("selected provider = %q; want %q (harness=agy must select agy-cli)", got, agent.ProviderAGYCLI)
 	}
 }
 

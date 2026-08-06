@@ -14,9 +14,10 @@ func TestBuildConfig_ProviderPinAndLockout(t *testing.T) {
 	t.Parallel()
 	spec := agent.Spec{
 		Endpoint: &agent.EndpointBinding{
-			Company: agent.CompanyOpenAI,
-			Model:   "gpt-4o-mini",
-			BaseURL: "https://compat.example/v1",
+			Company:   agent.CompanyOpenAI,
+			Model:     "gpt-4o-mini",
+			BaseURL:   "https://compat.example/v1",
+			Mechanism: agent.AuthAPIKey,
 		},
 	}
 	cfg := buildConfig(spec)
@@ -70,7 +71,7 @@ func TestBuildConfig_KeyNeverInlined(t *testing.T) {
 	// Even when a spec carries a credential value in env, the rendered config
 	// must not inline it — the value rides the process env, never disk.
 	spec := agent.Spec{
-		Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "m", BaseURL: "http://x/v1"},
+		Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "m", BaseURL: "http://x/v1", Mechanism: agent.AuthAPIKey},
 		Env:      map[string]string{OCKeyEnvVar: "sk-super-secret-value"},
 	}
 	data, err := json.Marshal(buildConfig(spec))
@@ -116,9 +117,10 @@ func TestProjectPermissions_ClaudeGrammar(t *testing.T) {
 	if bash["git push*"] != "deny" {
 		t.Errorf("bash[git push*] = %q, want deny", bash["git push*"])
 	}
-	// DefaultDecision deny → bash catch-all deny.
-	if bash["*"] != "deny" {
-		t.Errorf("bash[*] = %q, want deny (default decision)", bash["*"])
+	// Structured regex policy is enforced by the permission pump, so unknown
+	// commands must reach it instead of being decided by the static map.
+	if bash["*"] != "ask" {
+		t.Errorf("bash[*] = %q, want ask (permission-pump boundary)", bash["*"])
 	}
 }
 
@@ -134,21 +136,40 @@ func TestProjectPermissions_DenyWinsOverAllow(t *testing.T) {
 	}
 }
 
-func TestProjectMCP_WhitelistOnly(t *testing.T) {
+func TestProjectPermissions_MCPToolNamesUseOpenCodeKeys(t *testing.T) {
+	t.Parallel()
+	spec := agent.Spec{
+		MCPToolNames: []string{"mcp__af-code-intelligence__af_code_search"},
+		MCPServers:   []agent.MCPServerConfig{{Name: "af-code-intelligence", Command: "donmai"}},
+	}
+	perm := projectPermissions(spec)
+	if perm["*"] != "deny" {
+		t.Fatalf("default permission = %v, want deny for an explicit allowlist", perm["*"])
+	}
+	if got := perm["af-code-intelligence_af_code_search"]; got != "allow" {
+		t.Errorf("MCP tool permission = %v, want allow", got)
+	}
+	if _, broad := perm["af-code-intelligence_*"]; broad {
+		t.Error("exact MCP tool allowlist unexpectedly admitted the whole server")
+	}
+}
+
+func TestProjectMCP_LocalAndPlatformRemote(t *testing.T) {
 	t.Parallel()
 	// No MCP servers → no mcp key at all (§5.3).
 	if got := projectMCP(agent.Spec{}); got != nil {
 		t.Errorf("projectMCP(empty) = %v, want nil", got)
 	}
-	// http-transport and command-less entries are skipped (local stdio only).
+	// Both code-intel/card stdio servers and the platform A2A HTTP gate are
+	// represented in the session-scoped project config.
 	spec := agent.Spec{MCPServers: []agent.MCPServerConfig{
 		{Name: "code", Command: "donmai", Args: []string{"mcp", "code"}, Env: map[string]string{"X": "1"}},
-		{Name: "remote", Type: "http", URL: "https://x/mcp"},
+		{Name: "platform", Type: "http", URL: "https://platform.example/api/mcp/session", Headers: map[string]string{"Authorization": "Bearer session"}},
 		{Name: "bad"}, // no command
 	}}
 	mcp := projectMCP(spec)
-	if len(mcp) != 1 {
-		t.Fatalf("mcp = %v, want exactly one (the local stdio entry)", mcp)
+	if len(mcp) != 2 {
+		t.Fatalf("mcp = %v, want local code-intel and remote platform entries", mcp)
 	}
 	code, ok := mcp["code"]
 	if !ok {
@@ -160,28 +181,43 @@ func TestProjectMCP_WhitelistOnly(t *testing.T) {
 	if !code.Enabled || code.Environment["X"] != "1" {
 		t.Errorf("mcp code entry env/enabled wrong: %+v", code)
 	}
+	remote, ok := mcp["platform"]
+	if !ok {
+		t.Fatalf("mcp missing platform remote entry: %v", mcp)
+	}
+	if remote.Type != "remote" || remote.URL != "https://platform.example/api/mcp/session" || remote.Headers["Authorization"] != "Bearer session" || remote.OAuth == nil || *remote.OAuth {
+		t.Errorf("mcp remote entry malformed: %+v", remote)
+	}
 }
 
-func TestWriteConfig_Perms0600(t *testing.T) {
+func TestOpenCodeConfigBoundary_PermsAndJSON(t *testing.T) {
 	t.Parallel()
-	dir := filepath.Join(t.TempDir(), "state")
-	spec := agent.Spec{Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "m", BaseURL: "http://x/v1"}}
-	path, err := writeConfig(dir, spec)
+	tempRoot := t.TempDir()
+	spec := agent.Spec{Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "m", BaseURL: "http://x/v1", Mechanism: agent.AuthAPIKey}}
+	boundary, err := newOpenCodeConfigBoundary(tempRoot, spec)
 	if err != nil {
-		t.Fatalf("writeConfig: %v", err)
+		t.Fatalf("new config boundary: %v", err)
 	}
-	info, err := os.Stat(path)
+	t.Cleanup(func() { _ = boundary.remove() })
+	homeInfo, err := os.Stat(boundary.home)
+	if err != nil {
+		t.Fatalf("stat home: %v", err)
+	}
+	if perm := homeInfo.Mode().Perm(); perm != 0o700 {
+		t.Errorf("config home mode = %o, want 0700", perm)
+	}
+	info, err := os.Stat(boundary.configPath)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("config file mode = %o, want 0600", perm)
 	}
-	if filepath.Base(path) != "opencode.json" {
-		t.Errorf("config file name = %q, want opencode.json", filepath.Base(path))
+	if filepath.Base(boundary.configPath) != "opencode.json" {
+		t.Errorf("config file name = %q, want opencode.json", filepath.Base(boundary.configPath))
 	}
 	// It must be valid JSON.
-	data, _ := os.ReadFile(path)
+	data, _ := os.ReadFile(boundary.configPath)
 	var cfg ocConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		t.Fatalf("written config is not valid JSON: %v", err)

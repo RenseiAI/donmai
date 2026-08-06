@@ -2,8 +2,10 @@ package claude
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 )
 
@@ -27,7 +29,13 @@ import (
 // through its JSONL headless-mode output, which the interactive REPL never
 // emits) and a single terminal ResultEvent when the CLI process exits.
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
-	return ptycli.Spawn(ctx, p.binary, interactiveArgs(spec), spec)
+	mcpPath, err := clijsonl.WriteMCPConfig(spec.MCPServers)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	return ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgsWithMCP(spec, mcpPath), spec, func() error {
+		return clijsonl.RemoveMCPConfig(mcpPath)
+	})
 }
 
 // interactiveArgs builds the argv for claude's own interactive REPL.
@@ -54,6 +62,10 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 // starts the REPL bare, with no seeded message. The positional prompt must
 // stay LAST so it is never consumed as the value of a preceding flag.
 func interactiveArgs(spec agent.Spec) []string {
+	return interactiveArgsWithMCP(spec, "")
+}
+
+func interactiveArgsWithMCP(spec agent.Spec, mcpConfigPath string) []string {
 	var argv []string
 
 	// Permission mode: autonomous sessions get bypassPermissions so the
@@ -69,6 +81,13 @@ func interactiveArgs(spec agent.Spec) []string {
 	// omit it when empty so a bare interactive session stays bare.
 	if spec.SystemPromptAppend != "" {
 		argv = append(argv, "--append-system-prompt", spec.SystemPromptAppend)
+	}
+
+	// Claude's interactive REPL accepts the same exact per-session MCP file as
+	// headless mode. Strict mode prevents ambient user MCP config from silently
+	// widening the session tool surface.
+	if mcpConfigPath != "" {
+		argv = append(argv, "--mcp-config", mcpConfigPath, "--strict-mcp-config")
 	}
 
 	// Positional prompt LAST — every flag-shaped argument precedes it.

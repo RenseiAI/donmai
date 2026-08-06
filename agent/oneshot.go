@@ -81,7 +81,8 @@ type OneShotResult struct {
 // direct-API completion (e.g. a future Anthropic Messages forced-tool one-shot).
 // It deliberately carries only the completion verb. Most harnesses do NOT
 // implement it: session harnesses (claude-code, codex, amp, antigravity,
-// opencode, stub) ride SpawnComplete, and the raw harnesses (gemini, ollama)
+// opencode, stub) ride SpawnComplete, and the direct in-box harnesses (Gemini,
+// Ollama)
 // deliver STRICT structured natively by honoring Spec.ResponseSchema inside
 // their existing Spawn — so SpawnComplete already yields native-strict output
 // for them without a separate Complete method.

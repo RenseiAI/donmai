@@ -123,13 +123,10 @@ func TestToolUseCapabilityMatrix(t *testing.T) {
 				}
 				return p
 			},
-			// Lane B (07 §5.2) projects Spec.AllowedTools into the injected
-			// opencode.json permission map → acceptsAllowedToolsList=true.
-			// acceptsMcpServerSpec stays false: opencode's MCP config injection
-			// is implemented but the cap advertisement is gated on the
-			// AcceptsMcpServerSpec→SupportsToolPlugins invariant below, and
-			// opencode's plugins are not donmai tool plugins (supportsToolPlugins=false).
-			want: want{supportsToolPlugins: false, acceptsAllowedToolsList: true, acceptsMcpServerSpec: false},
+			// OpenCode plugins, its permission map, and its per-session project
+			// MCP config are independent axes. The implemented MCP config path is
+			// declared even though OpenCode plugins are not Donmai tool plugins.
+			want: want{supportsToolPlugins: false, acceptsAllowedToolsList: true, acceptsMcpServerSpec: true},
 		},
 	}
 
@@ -148,12 +145,8 @@ func TestToolUseCapabilityMatrix(t *testing.T) {
 			if got := caps.AcceptsMcpServerSpec; got != tc.want.acceptsMcpServerSpec {
 				t.Errorf("AcceptsMcpServerSpec: want %v, got %v", tc.want.acceptsMcpServerSpec, got)
 			}
-			// Capability self-consistency: AcceptsMcpServerSpec=true
-			// implies SupportsToolPlugins=true (you can't honour MCP
-			// shape without supporting tool plugins at all).
-			if caps.AcceptsMcpServerSpec && !caps.SupportsToolPlugins {
-				t.Errorf("invariant: AcceptsMcpServerSpec=true requires SupportsToolPlugins=true")
-			}
+			// There is deliberately no cross-axis implication here: OpenCode
+			// proves a harness can accept MCP config without a plugin API.
 		})
 	}
 }

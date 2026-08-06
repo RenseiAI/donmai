@@ -47,34 +47,39 @@ type SpecInputs struct {
 	// agent sessions invoked from the work queue.
 	Autonomous bool
 
-	// Logger is the optional structured logger translateSpec uses to WARN
-	// when it drops a capability-gated field (e.g. the agent card's
-	// AllowedTools on a provider that does not accept a flat allowlist and
-	// has no PermissionConfig bridge). Nil is safe — the warn is skipped.
+	// Logger is reserved for structured translation diagnostics. Tool and MCP
+	// requirements are never logger-only drops: exact adapters apply or deny
+	// them before provider side effects. Nil is safe.
 	Logger *slog.Logger
 
-	// ProviderName names the resolved provider for the dropped-field WARN
-	// so operators can see which provider dropped the card's allowlist.
-	// Empty is safe.
+	// ProviderName names the resolved provider for structured translation
+	// diagnostics. Empty is safe.
 	ProviderName string
 }
 
 // translateSpec converts a QueuedWork plus per-session SpecInputs into
 // an agent.Spec ready for Provider.Spawn. Pure function; no I/O.
 //
-// Capability gating is applied here: fields the resolved provider does
-// not advertise are silently zeroed so providers do not have to
-// defensively ignore them. The runner does not error on
-// capability-mismatch — that path runs in the loop's recovery layer.
+// Capability translation is applied here only when the provider has an exact
+// alternate grammar (for example Codex PermissionConfig). Requested tool/MCP
+// fields are never zeroed: the exact harness adaptation profile either applies
+// them or returns a typed pre-spawn denial.
 func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.Spec {
 	// AllowedTools resolution: the agent card is AUTHORITATIVE when it
 	// supplies an explicit allowlist (WS5) — the runner uses it verbatim in
 	// place of its curated default. When the card sends none, the runner
 	// falls back to defaultAllowedTools() (backward-compatible). The
 	// DisallowedTools floor is applied below regardless.
-	allowedTools := defaultAllowedTools()
+	var allowedTools []string
+	if !qw.isInteractive() {
+		allowedTools = defaultAllowedTools()
+	}
 	if len(qw.AllowedTools) > 0 {
 		allowedTools = append([]string(nil), qw.AllowedTools...)
+	}
+	var disallowedTools []string
+	if !qw.isInteractive() {
+		disallowedTools = defaultDisallowedTools()
 	}
 
 	spec := agent.Spec{
@@ -85,22 +90,15 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		SandboxEnabled:     true,
 		SandboxLevel:       agent.SandboxWorkspaceWrite,
 		AllowedTools:       allowedTools,
-		DisallowedTools:    defaultDisallowedTools(),
+		DisallowedTools:    disallowedTools,
 		MCPServers:         in.MCPServers,
 		Model:              strings.TrimSpace(qw.ResolvedProfile.Model),
+		Effort:             qw.ResolvedProfile.Effort,
 		SystemPromptAppend: in.SystemPromptAppend,
 		PromptPlan:         in.PromptPlan,
 		InitialContext:     in.InitialContext,
 		ProviderConfig:     copyProviderConfig(qw.ResolvedProfile.ProviderConfig),
 		Endpoint:           copyEndpointBinding(qw.ResolvedProfile.Endpoint),
-	}
-
-	// Capability-gated fields — silently zeroed when the resolved
-	// provider does not declare support. The runner emits a Debug log
-	// in the loop when it strips a value the caller set, so operators
-	// can detect silently-ignored knobs.
-	if caps.SupportsReasoningEffort && qw.ResolvedProfile.Effort != "" {
-		spec.Effort = qw.ResolvedProfile.Effort
 	}
 
 	// InitialContext is a legacy compatibility field. The typed PromptPlan
@@ -109,15 +107,6 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	// rejects each context item before spawn.
 	if !caps.SupportsTurnInputContext {
 		spec.InitialContext = ""
-	}
-
-	// MCP tool plugins: only forward MCPServers when the provider
-	// declares SupportsToolPlugins AND honours the Spec field shape
-	// (AcceptsMcpServerSpec). Other providers ignore the field anyway,
-	// but zeroing it keeps the on-the-wire Spec faithful to what the
-	// provider will actually consume. Per 002 v2 §"Tool-use surface".
-	if !caps.SupportsToolPlugins || !caps.AcceptsMcpServerSpec {
-		spec.MCPServers = nil
 	}
 
 	// Platform-supplied disallowed-tool patterns (Option B).
@@ -144,12 +133,9 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	//      already consumes PermissionConfig, so the card's intent reaches
 	//      the agent instead of being dropped.
 	//
-	//   2. amp / agy-cli — accept neither a flat allowlist NOR a
-	//      PermissionConfig (NeedsPermissionConfig=false). The allowlist has
-	//      nowhere to go, so we drop it — but upgrade the historically
-	//      SILENT zero to a structured WARN naming the dropped field and the
-	//      provider so operators can see the agent card's allowlist did not
-	//      take effect.
+	// Providers without either exact surface retain the non-empty field. Their
+	// tool/lifecycle adaptation profile rejects it before spawn; there is no
+	// logger-only drop path.
 	if !caps.AcceptsAllowedToolsList {
 		if caps.NeedsPermissionConfig {
 			pc := spec.PermissionConfig
@@ -165,26 +151,18 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 			if len(pc.AllowPatterns) > 0 || len(pc.DisallowPatterns) > 0 {
 				spec.PermissionConfig = pc
 			}
-		} else if len(spec.AllowedTools) > 0 && in.Logger != nil {
-			in.Logger.Warn("translateSpec: provider does not accept an allowed-tools list and has no permission-config bridge; dropping the agent card's AllowedTools",
-				"droppedField", "AllowedTools",
-				"provider", in.ProviderName,
-				"droppedCount", len(spec.AllowedTools),
-			)
+			// The exact alternate grammar now owns the policy intent; retaining
+			// either flat list would incorrectly ask the harness to apply it twice.
+			spec.AllowedTools = nil
+			spec.DisallowedTools = nil
 		}
-		spec.AllowedTools = nil
 	}
 
 	// MCPToolNames: allow-list the fully-qualified code-intel tool names so
 	// autonomous agents may call them without a permission prompt. Gated on the
-	// SAME capability pair as the Spec.MCPServers forwarding above
-	// (SupportsToolPlugins && AcceptsMcpServerSpec) — a provider that ignores
-	// MCP specs (ollama/opencode/agycli) gets the CLI-fallback prompt guidance
-	// instead, so allow-listing MCP names there would be dead. Only populated
-	// when the CodeIntel block is present; a nil block leaves the list empty
-	// (byte-identical to pre-code-intel), and providers that consume it (codex)
-	// treat an empty list as "all tools allowed".
-	if qw.CodeIntel != nil && caps.SupportsToolPlugins && caps.AcceptsMcpServerSpec {
+	// The exact harness adapter, not a coupled boolean pair, now decides whether
+	// these names can be enforced. Unsupported names remain present and deny.
+	if qw.CodeIntel != nil {
 		spec.MCPToolNames = codeIntelFQToolNames(qw.CodeIntel)
 	}
 

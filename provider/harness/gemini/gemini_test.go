@@ -738,46 +738,18 @@ func TestProvider_Spawn_MCPToolRoundTrip(t *testing.T) {
 	}
 }
 
-// TestProvider_Spawn_MCPServerUnavailable_Degrades locks in the degraded
-// path: an unreachable MCP server must not fail Spawn; its catch-all
-// declaration stays in the plan and a call against it resolves to a
-// structured error functionResponse the model can recover from.
-func TestProvider_Spawn_MCPServerUnavailable_Degrades(t *testing.T) {
+// TestProvider_Spawn_MCPServerUnavailableFailsClosed proves a required MCP
+// service is connected and enumerated before the first model turn.
+func TestProvider_Spawn_MCPServerUnavailableFailsClosed(t *testing.T) {
 	t.Parallel()
 
 	var mu sync.Mutex
-	var turnNum int
-	geminiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var requests int
+	geminiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
-		turnNum++
-		n := turnNum
+		requests++
 		mu.Unlock()
-
-		body, _ := io.ReadAll(r.Body)
-		var req requestBody
-		_ = json.Unmarshal(body, &req)
-
-		switch n {
-		case 1:
-			names := sortedToolNames(req.Tools)
-			found := false
-			for _, name := range names {
-				found = found || name == "mcp__bad"
-			}
-			if !found {
-				t.Errorf("turn 1: failed server should keep its catch-all declaration, got %v", names)
-			}
-			writeJSON(w, `{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-1","name":"mcp__bad__sometool","args":{}}}]}}]}`)
-		default:
-			last := req.Contents[len(req.Contents)-1]
-			fr := last.Parts[0].FunctionResponse
-			if fr == nil {
-				t.Errorf("turn 2: want functionResponse, got %#v", last)
-			} else if msg, _ := fr.Response["error"].(string); !strings.Contains(msg, "unavailable") {
-				t.Errorf("turn 2: want unavailability error in functionResponse, got %#v", fr.Response)
-			}
-			writeJSON(w, `{"candidates":[{"content":{"parts":[{"text":"cannot reach the tool"}]},"finishReason":"STOP"}]}`)
-		}
+		http.Error(w, "model must not be called", http.StatusInternalServerError)
 	}))
 	defer geminiSrv.Close()
 
@@ -788,26 +760,16 @@ func TestProvider_Spawn_MCPServerUnavailable_Degrades(t *testing.T) {
 		Autonomous: true,
 		MCPServers: []agent.MCPServerConfig{{Name: "bad", Type: "http", URL: "http://127.0.0.1:1"}},
 	})
-	if err != nil {
-		t.Fatalf("Spawn must not fail on an unreachable MCP server: %v", err)
-	}
-	defer func() { _ = h.Stop(context.Background()) }()
-
-	events := drainUntilResult(t, h)
-	var sawErrResult bool
-	for _, ev := range events {
-		if e, ok := ev.(agent.ToolResultEvent); ok {
-			sawErrResult = true
-			if !e.IsError || !strings.Contains(e.Content, "unavailable") {
-				t.Errorf("ToolResult = %#v, want structured unavailability error", e)
-			}
+	if err == nil || !errors.Is(err, agent.ErrSpawnFailed) || !strings.Contains(err.Error(), "required MCP servers unavailable: bad") {
+		if h != nil {
+			_ = h.Stop(context.Background())
 		}
+		t.Fatalf("Spawn error = %v, want typed fail-closed MCP denial", err)
 	}
-	if !sawErrResult {
-		t.Fatal("never observed the degraded ToolResultEvent")
-	}
-	if res, ok := events[len(events)-1].(agent.ResultEvent); !ok || !res.Success {
-		t.Fatalf("session should still complete: %#v", events[len(events)-1])
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 0 {
+		t.Fatalf("model received %d requests after MCP admission failed", requests)
 	}
 }
 
