@@ -27,6 +27,7 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // — a local openai-compat pi cell needs either a local-openai host on the
 // local endpoint or routing via google × local, deferred as a follow-up.
 func (*Provider) Manifest() agent.HarnessManifest {
+	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventToolProgress, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessPi,
 		HumanLabel:  "pi",
@@ -63,6 +64,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			SystemDelivery: agent.PromptDeliveryPiSystemAppend, BaseAppendDelivery: agent.PromptDeliveryPiSystemAppend,
 			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryPiSystemAppend,
 			UserDelivery: agent.PromptDeliveryPiRPCPrompt, AmendmentDelivery: agent.PromptDeliveryPiRPCPrompt,
+		}},
+		ToolLifecycle: []agent.ToolLifecycleProfile{{
+			ID: "pi/headless/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+			ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
+			NativeToolPolicyDelivery: agent.ToolDeliveryPiInjectedBoundary, PermissionConfigDelivery: agent.ToolDeliveryPiInjectedBoundary,
+			MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+			LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: events,
+			ReplayDelivery: agent.ToolDeliveryStructuredEventReplay, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: events,
+			CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
 		}},
 	}
 }

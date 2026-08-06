@@ -12,6 +12,7 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // anthropic-messages against a keyed, metered direct host (AMP_API_KEY) — it
 // is NOT a host-subscription cell.
 func (*Provider) Manifest() agent.HarnessManifest {
+	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventToolProgress, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessAmp,
 		HumanLabel:  "Amp",
@@ -38,6 +39,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			SystemDelivery: agent.PromptDeliveryUnsupported, BaseAppendDelivery: agent.PromptDeliveryUnsupported,
 			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryUnsupported,
 			UserDelivery: agent.PromptDeliveryAmpStdin, AmendmentDelivery: agent.PromptDeliveryAmpStdin,
+		}},
+		ToolLifecycle: []agent.ToolLifecycleProfile{{
+			ID: "amp/headless/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+			ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryAmpMCPConfig,
+			NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+			MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+			LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: events,
+			ReplayDelivery: agent.ToolDeliveryStructuredEventReplay, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: events,
+			CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
 		}},
 	}
 }

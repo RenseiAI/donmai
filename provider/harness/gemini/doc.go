@@ -42,8 +42,9 @@
 // mcp__<server>__<tool> functionDeclarations (schemas sanitized to the
 // Gemini OpenAPI subset), and the session-local executor routes the
 // resulting mcp__* functionCalls to the live server. Connection failures
-// degrade per-server to structured tool errors — never a failed Spawn —
-// and Capabilities.AcceptsMcpServerSpec is true.
+// or discovery failures deny Spawn before a Handle is returned; runtime tool
+// call failures still surface as structured tool errors.
+// Capabilities.AcceptsMcpServerSpec is true.
 //
 // File layout (parallels provider/codex):
 //

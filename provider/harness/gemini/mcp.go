@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,8 +13,8 @@ import (
 )
 
 // mcpConnectTimeout bounds the Spawn-time connect + tools/list handshake
-// across all declared MCP servers. Connection failures degrade the session
-// (catch-all declaration + structured routing errors), never fail Spawn.
+// across all declared MCP servers. A required server that cannot connect or
+// enumerate tools makes Spawn fail closed.
 const mcpConnectTimeout = 15 * time.Second
 
 // mcpCallTimeout bounds a single bridged tools/call so a hung server cannot
@@ -40,10 +41,6 @@ type mcpRoute struct {
 // declarations, and routes the resulting mcp__* functionCalls to the live
 // server (toolExecutor → call). This is what makes
 // Capabilities.AcceptsMcpServerSpec=true honest end-to-end.
-//
-// Everything is best-effort: a server that fails to connect or list keeps
-// its catch-all declaration and resolves calls to a structured error the
-// model can recover from.
 type mcpBridge struct {
 	routes   map[string]mcpRoute              // declared function name → live route
 	clients  map[string]mcp.Client            // server name → client (name-parse fallback routing)
@@ -51,10 +48,22 @@ type mcpBridge struct {
 	decls    map[string][]functionDeclaration // server name → discovered declarations, in tools/list order
 }
 
+func (b *mcpBridge) connectionError() error {
+	if b == nil || len(b.failures) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(b.failures))
+	for name := range b.failures {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return fmt.Errorf("required MCP servers unavailable: %s", strings.Join(names, ", "))
+}
+
 // newMCPBridge dials the declared servers and discovers their tool
 // surfaces. Returns nil when no servers are declared. Never returns an
-// error: per-server failures are recorded on the bridge and surface as
-// structured tool errors at call time.
+// error directly: per-server failures are recorded for the caller's
+// connectionError admission check before the first model turn.
 func newMCPBridge(ctx context.Context, servers []agent.MCPServerConfig, dial mcpDialer) *mcpBridge {
 	if len(servers) == 0 || dial == nil {
 		return nil

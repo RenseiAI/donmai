@@ -96,7 +96,8 @@ const (
 // having to plumb every collaborator.
 type Options struct {
 	// Registry is the provider registry the runner consults on each
-	// Run to resolve QueuedWork.ResolvedProfile.Provider. Required.
+	// Run to admit one harness/provider pair from QueuedWork.ResolvedProfile.
+	// Required.
 	Registry *Registry
 
 	// WorktreeManager owns clone/teardown of per-session worktrees.
@@ -414,6 +415,19 @@ func terminalResultPostContext(parent context.Context) (context.Context, context
 // still attempts result.Post + teardown so platform state stays
 // consistent.
 func (r *Runner) Run(ctx context.Context, qw QueuedWork) (*Result, error) {
+	return r.run(ctx, qw, nil)
+}
+
+// RunAdmitted consumes a prior explicit-harness PreflightHarness result. The
+// opaque admission is checked against this Runner's registry and selector
+// intent, then its exact provider/harness pair is carried through the run
+// without a second registry resolution. Pass nil only for absent-harness legacy
+// work; that path retains posterior selection inside the named legacy adapter.
+func (r *Runner) RunAdmitted(ctx context.Context, qw QueuedWork, admission *HarnessAdmission) (*Result, error) {
+	return r.run(ctx, qw, admission)
+}
+
+func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmission) (*Result, error) {
 	startedAt := r.now().UnixMilli()
 
 	// Apply the runner-side upper-bound timeout if requested.
@@ -446,7 +460,7 @@ func (r *Runner) Run(ctx context.Context, qw QueuedWork) (*Result, error) {
 
 	// Drive the loop. loop.go owns the step sequence; the helpers
 	// here own the result envelope + post-Run teardown.
-	res, runErr := r.runLoop(runCtx, qw, startedAt)
+	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
 	teardownRequired := shouldTeardown(res, r.preserveOnFail, r.preserveAlways)
 	leaseAcquired := false
 	leasePrepared := false

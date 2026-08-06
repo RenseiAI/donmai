@@ -56,6 +56,7 @@ func feedbackWork(srvURL string) QueuedWork {
 
 func completedResult() *Result {
 	res := &Result{}
+	res.ProviderName = agent.ProviderClaude
 	res.Status = "completed"
 	res.WorkResult = "passed"
 	res.PullRequestURL = "https://github.com/x/y/pull/1"

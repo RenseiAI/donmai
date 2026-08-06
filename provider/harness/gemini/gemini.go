@@ -175,9 +175,9 @@ func (*Provider) Capabilities() agent.Capabilities {
 		// declared server (stdio or Streamable HTTP), discovers its tools,
 		// declares them to the model as mcp__<server>__<tool> function
 		// declarations, and the session-local executor routes the
-		// resulting mcp__* functionCalls to the live server. A server
-		// that fails to connect degrades to a structured tool error — the
-		// shape is consumed either way, satisfying the v2 contract.
+		// resulting mcp__* functionCalls to the live server. Connection or
+		// discovery failure is a typed pre-handle Spawn denial; a session
+		// never starts with a requested MCP server missing.
 		AcceptsMcpServerSpec: true,
 		HumanLabel:           "Gemini",
 	}
@@ -201,7 +201,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	var err error
-	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
@@ -255,13 +255,18 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	// In-box MCP bridge: dial the declared servers and discover their tool
 	// surfaces so the model sees real mcp__<server>__<tool> declarations
 	// (replacing the catch-all per-server placeholders in the plan). Best
-	// effort with a hard time budget — a failed server degrades to
-	// structured tool errors, never a failed Spawn.
+	// effort with a hard time budget. Because every non-empty MCP requirement
+	// is required, a connection/discovery failure denies Spawn and closes all
+	// successfully opened sibling clients.
 	var bridge *mcpBridge
 	if len(spec.MCPServers) > 0 {
 		dialCtx, cancel := context.WithTimeout(ctx, mcpConnectTimeout)
 		bridge = newMCPBridge(dialCtx, spec.MCPServers, p.dialMCP)
 		cancel()
+		if err := bridge.connectionError(); err != nil {
+			bridge.Close()
+			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+		}
 		bridge.amendPlan(&plan)
 	}
 
@@ -279,6 +284,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		cwd:      spec.Cwd,
 		env:      spec.Env,
 		mcp:      bridge,
+		policy:   newToolPolicy(spec),
 		maxTurns: maxTurns,
 	})
 }

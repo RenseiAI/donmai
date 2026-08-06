@@ -2,6 +2,7 @@ package ptycli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -26,7 +27,10 @@ type Handle struct {
 	sess   *ptyhost.Session
 	events chan agent.Event
 
-	closeOnce sync.Once
+	closeOnce   sync.Once
+	cleanupOnce sync.Once
+	cleanupFn   func() error
+	cleanupErr  error
 }
 
 // Spawn starts binary+argv under a PTY via ptyhost.Spawn and returns a
@@ -50,13 +54,20 @@ type Handle struct {
 // interactive session are not served by this driver today — a documented,
 // known gap rather than a silent no-op.
 func Spawn(ctx context.Context, binary string, argv []string, spec agent.Spec) (*Handle, error) {
+	return SpawnWithCleanup(ctx, binary, argv, spec, nil)
+}
+
+// SpawnWithCleanup starts an interactive PTY and transfers ownership of an
+// optional per-session resource cleanup function to the returned handle. The
+// cleanup runs exactly once on spawn failure, child exit, context cancellation,
+// or Stop, whichever happens first.
+func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec agent.Spec, cleanup func() error) (*Handle, error) {
 	ispec := spec.Interactive
 	if ispec == nil {
 		ispec = &agent.InteractiveSpec{}
 	}
 
-	command := make([]string, 0, len(argv)+1)
-	command = append(command, binary)
+	command := []string{binary}
 	command = append(command, argv...)
 
 	pspec := ptyhost.Spec{
@@ -71,7 +82,13 @@ func Spawn(ctx context.Context, binary string, argv []string, spec agent.Spec) (
 
 	sess, err := ptyhost.Spawn(pspec)
 	if err != nil {
-		return nil, fmt.Errorf("%w: interactive pty spawn: %v", agent.ErrSpawnFailed, err)
+		spawnErr := fmt.Errorf("%w: interactive pty spawn: %v", agent.ErrSpawnFailed, err)
+		if cleanup != nil {
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				return nil, errors.Join(spawnErr, fmt.Errorf("interactive resource cleanup: %w", cleanupErr))
+			}
+		}
+		return nil, spawnErr
 	}
 
 	h := &Handle{
@@ -79,7 +96,8 @@ func Spawn(ctx context.Context, binary string, argv []string, spec agent.Spec) (
 		// Buffered for exactly the two events this driver ever emits
 		// (InitEvent, terminal ResultEvent) so sendEvent never blocks on a
 		// slow/absent consumer.
-		events: make(chan agent.Event, 2),
+		events:    make(chan agent.Event, 2),
+		cleanupFn: cleanup,
 	}
 	// The session is up the instant ptyhost.Spawn returns (pty.StartWithSize
 	// blocks until fork+exec completes) — emit InitEvent synchronously,
@@ -100,8 +118,29 @@ func Spawn(ctx context.Context, binary string, argv []string, spec agent.Spec) (
 func (h *Handle) run() {
 	<-h.sess.Done()
 	exit, _ := h.sess.Exit()
-	h.events <- buildResult(exit)
+	result := buildResult(exit)
+	if err := h.cleanup(); err != nil {
+		result = cleanupFailureResult(err)
+	}
+	h.events <- result
 	h.closeOnce.Do(func() { close(h.events) })
+}
+
+func cleanupFailureResult(err error) agent.Event {
+	return agent.ResultEvent{
+		Success:      false,
+		ErrorSubtype: "cleanup_failed",
+		Errors:       []string{"interactive session resource cleanup: " + err.Error()},
+	}
+}
+
+func (h *Handle) cleanup() error {
+	h.cleanupOnce.Do(func() {
+		if h.cleanupFn != nil {
+			h.cleanupErr = h.cleanupFn()
+		}
+	})
+	return h.cleanupErr
 }
 
 // watchCtx Stops the session when ctx is cancelled, so a caller that only
@@ -159,7 +198,9 @@ func (h *Handle) Inject(context.Context, string) error {
 // Stop routes to the underlying ptyhost.Session's Stop (SIGTERM→grace→
 // SIGKILL escalation it already implements). Idempotent; safe after the
 // events channel has closed.
-func (h *Handle) Stop(ctx context.Context) error { return h.sess.Stop(ctx) }
+func (h *Handle) Stop(ctx context.Context) error {
+	return errors.Join(h.sess.Stop(ctx), h.cleanup())
+}
 
 // InteractiveSession returns the live PTY surface. Never nil for a Handle
 // returned by Spawn — satisfies agent.InteractiveCapable.

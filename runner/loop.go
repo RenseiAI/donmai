@@ -59,13 +59,42 @@ var kitLoadSkills = kit.LoadSkills
 // the step ordering that is the package's primary contract.
 //
 //nolint:gocyclo,funlen // intentional — see comment above.
-func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*Result, error) {
+func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, admission *HarnessAdmission) (*Result, error) {
 	res := &Result{
 		SessionID:       qw.SessionID,
 		IssueIdentifier: qw.IssueIdentifier,
 		StartedAt:       startedAt,
 	}
-	res.ProviderName = qw.resolvedProvider()
+
+	// 1. Resolve exactly one harness/provider pair before any posterior network
+	// request, worktree creation, credential delivery, or provider spawn.
+	selection, err := r.admittedHarnessSelection(ctx, qw, admission)
+	if err != nil {
+		err = attachDeniedHarnessReceipt(qw, err, r.now())
+		res.Status = "failed"
+		res.FailureMode = FailureProviderResolve
+		res.Error = err.Error()
+		var admissionErr *HarnessAdmissionError
+		if errors.As(err, &admissionErr) {
+			value := admissionErr.Receipt.Value()
+			res.AdmissionReceipt = &value
+			res.ResolverDecisions = append(res.ResolverDecisions, admissionErr.Decisions...)
+		}
+		return res, err
+	}
+	provider := selection.Provider
+	res.ProviderName = provider.Name()
+	harnessRef := selection.Harness
+	res.HarnessRef = &harnessRef
+	res.ResolverDecisions = append(res.ResolverDecisions, selection.Decisions...)
+	caps := provider.Capabilities()
+	r.logger.Info("provider resolved",
+		"sessionId", qw.SessionID,
+		"harness", selection.Harness.ID,
+		"provider", provider.Name(),
+		"injection", caps.SupportsMessageInjection,
+		"resume", caps.SupportsSessionResume,
+	)
 
 	// Log which dispatch path is in use
 	// so operators can grep one session end-to-end through the
@@ -99,41 +128,6 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 			"maxTokens", qw.StageBudget.MaxTokens,
 		)
 	}
-
-	// 1. Resolve provider.
-	//
-	// Router-learning A5b (read side). BEFORE resolving, consult the platform's
-	// posterior selector for the best provider for this work type. Self-gates on
-	// ROUTING_SELECTOR_ENABLED (default OFF) + required coordinates; the platform
-	// flag is the authoritative kill-switch and OWNS the explicit-choice guard.
-	// Hard static fallback (= qw.resolvedProvider()) on flag-off / proxy fail /
-	// provider-not-in-candidates — so flag-off is byte-for-byte today's behaviour.
-	selectedName := qw.resolvedProvider()
-	if name, ok := r.selectProviderByPosterior(ctx, qw); ok {
-		r.logger.Info("provider overridden by posterior selection",
-			"sessionId", qw.SessionID,
-			"static", string(qw.resolvedProvider()),
-			"selected", name,
-		)
-		selectedName = agent.ProviderName(name)
-	}
-	// Reflect the provider actually run so the A2-Go reward write attributes the
-	// observation to it (not the pre-selection static choice).
-	res.ProviderName = selectedName
-	provider, err := r.registry.Resolve(selectedName)
-	if err != nil {
-		res.Status = "failed"
-		res.FailureMode = FailureProviderResolve
-		res.Error = err.Error()
-		return res, err
-	}
-	caps := provider.Capabilities()
-	r.logger.Info("provider resolved",
-		"sessionId", qw.SessionID,
-		"provider", provider.Name(),
-		"injection", caps.SupportsMessageInjection,
-		"resume", caps.SupportsSessionResume,
-	)
 
 	// 2. Provision worktree. We clone at the remote default branch
 	// (typically main) and create the per-session work branch on
@@ -276,7 +270,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// with the default winning on collision (the platform gate is never
 	// shadowed by a card entry of the same name). Additive: no card servers
 	// → identical to the prior behaviour.
-	mcpServers := mergeMCPServers(defaultMCPServers(qw, wpath), qw.McpServers)
+	mcpServers := mergeMCPServers(defaultMCPServersForProvider(qw, wpath, provider.Name()), qw.McpServers)
 	mcpResult, err := buildMCPConfigPath(r.mcpb, mcpServers)
 	if err != nil {
 		res.Status = "failed"
@@ -533,6 +527,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		})
 		return err
 	}
+	spec.OnToolLifecycleAdapted = func(receipt agent.ToolLifecycleReceipt) error {
+		_, err := r.store.Update(wpath, func(s *state.State) error {
+			s.AppendToolLifecycleReceipt(receipt)
+			return nil
+		})
+		return err
+	}
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.
@@ -702,7 +703,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		// hook-bus bridge can build a faithful ProviderRef for the
 		// reconstructed Layer 6 hook events. Resolved earlier (the
 		// registry.Resolve call at line 93 used the same value).
-		ProviderName: string(qw.resolvedProvider()),
+		ProviderName: string(provider.Name()),
 	})
 	if actErr != nil {
 		r.logger.Warn("activity poster construct failed", "err", actErr)
@@ -746,7 +747,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 				OrgID:       qw.OrganizationID,
 				WorkspaceID: qw.OrganizationID,
 				WorkType:    qw.WorkType,
-				System:      spanruntime.ProviderSystem(qw.resolvedProvider()),
+				System:      spanruntime.ProviderSystem(provider.Name()),
 				Model:       qw.ResolvedProfile.Model,
 				Sender:      spanPoster,
 				Now:         r.now,
@@ -1193,7 +1194,7 @@ func (r *Runner) drainMemoryInjects(
 			// Re-consume the resume turn's events so the follow-up work
 			// (commit/PR/cost) is observed + mirrored.
 			injRes, _ := r.consumeEvents(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
-			injRes.applyTo(res, qw.resolvedProvider())
+			injRes.applyTo(res, res.ProviderName)
 			merged = injRes
 		default:
 			// No more buffered injects.
@@ -1792,11 +1793,20 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 // AFTER Provision so wpath exists. This function is the single place the runner
 // extends MCP defaults.
 func defaultMCPServers(qw QueuedWork, wpath string) []agent.MCPServerConfig {
+	return defaultMCPServersForProvider(qw, wpath, "")
+}
+
+// defaultMCPServersForProvider builds runner-owned MCP defaults for an exact
+// harness. A bare shell exposes no model/tool/service surface, so it does not
+// receive the implicit platform gateway. Explicit card MCP servers are merged
+// later, and explicit code-intel requests remain here, so both still reach the
+// shell adapter and fail closed instead of being silently stripped.
+func defaultMCPServersForProvider(qw QueuedWork, wpath string, providerName agent.ProviderName) []agent.MCPServerConfig {
 	var servers []agent.MCPServerConfig
 
 	// Platform per-session HTTP gate — omitted in standalone mode (no platform
 	// creds). Always leads the list so it is never shadowed by a later entry.
-	if qw.PlatformURL != "" && qw.AuthToken != "" && qw.SessionID != "" {
+	if providerName != agent.ProviderShell && qw.PlatformURL != "" && qw.AuthToken != "" && qw.SessionID != "" {
 		url := strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID
 		servers = append(servers, agent.MCPServerConfig{
 			// Brand-derived so OSS renders "donmai-platform" while the closed

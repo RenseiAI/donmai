@@ -6,16 +6,15 @@ import "github.com/RenseiAI/donmai/agent"
 var _ agent.HarnessProvider = (*Provider)(nil)
 
 // Manifest returns the harness-family declaration for the in-box net/http
-// "raw" loop as driven against a local Ollama server. Additive alongside
-// Capabilities(); the agent-loop bools project Capabilities() (parity-tested).
-//
-// gemini and ollama BOTH map to HarnessRaw; the matrix generator merges the
-// two raw manifests into one harness row (union of drives/hosts). This
-// package contributes the ollama drive over HostLocal, direct-api transport,
-// ndjson streaming, and whole-response native JSON mode (format:"json").
+// Ollama loop. Additive alongside Capabilities(); the agent-loop bools project
+// Capabilities() (parity-tested). Its identity and capability surface are
+// deliberately separate from Gemini direct: ollama drives only the Ollama
+// protocol over HostLocal with NDJSON streaming and whole-response native JSON
+// mode (format:"json").
 func (*Provider) Manifest() agent.HarnessManifest {
+	events := []agent.EventKind{agent.EventInit, agent.EventAssistantText, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
-		Name:        agent.HarnessRaw,
+		Name:        agent.HarnessOllama,
 		HumanLabel:  "Ollama (local)",
 		Family:      agent.FamilyHarness,
 		ContractABI: "harness/v2",
@@ -36,10 +35,19 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			Transport:                agent.TransportDirectAPI,
 		},
 		PromptDelivery: []agent.PromptDeliveryProfile{{
-			ID: "raw/ollama-chat/direct-api-v1", Mode: agent.PromptModeAutonomous,
+			ID: "ollama/ollama-chat/direct-api-v1", Mode: agent.PromptModeAutonomous,
 			SystemDelivery: agent.PromptDeliveryOllamaSystemMessage, BaseAppendDelivery: agent.PromptDeliveryOllamaSystemMessage,
 			BaseReplaceDelivery: agent.PromptDeliveryOllamaSystemMessage, ContextDelivery: agent.PromptDeliveryOllamaSystemMessage,
 			UserDelivery: agent.PromptDeliveryOllamaUserMessage, AmendmentDelivery: agent.PromptDeliveryOllamaUserMessage,
+		}},
+		ToolLifecycle: []agent.ToolLifecycleProfile{{
+			ID: "ollama/ollama-chat/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+			ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
+			NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+			MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+			LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: events,
+			ReplayDelivery: agent.ToolDeliveryStructuredEventReplay, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: events,
+			CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
 		}},
 	}
 }

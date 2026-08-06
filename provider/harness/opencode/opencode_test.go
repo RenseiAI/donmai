@@ -3,6 +3,7 @@ package opencode
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -222,11 +223,8 @@ func TestProvider_Capabilities(t *testing.T) {
 	if !caps.AcceptsAllowedToolsList {
 		t.Error("AcceptsAllowedToolsList: want true (Lane B opencode.json permission map)")
 	}
-	// AcceptsMcpServerSpec stays false: the §5.3 MCP config injection is
-	// implemented, but the cap advertisement waits on the cross-provider
-	// AcceptsMcpServerSpec→SupportsToolPlugins invariant (see manifest.go).
-	if caps.AcceptsMcpServerSpec {
-		t.Error("AcceptsMcpServerSpec: want false (cap deferred; see manifest.go drift note)")
+	if !caps.AcceptsMcpServerSpec {
+		t.Error("AcceptsMcpServerSpec: want true (per-session project MCP config)")
 	}
 	// SupportsReasoningEffort: true — mapped to --variant.
 	if !caps.SupportsReasoningEffort {
@@ -259,6 +257,170 @@ func TestProvider_Spawn_HTTPMode_AttachUnreachable(t *testing.T) {
 	}
 }
 
+func TestProvider_UseServerLane_ProjectConfigFieldsUseConfiguredCLI(t *testing.T) {
+	t.Parallel()
+	p := &Provider{binary: "/tmp/opencode"}
+	tests := []struct {
+		name string
+		spec agent.Spec
+	}{
+		{"endpoint", agent.Spec{Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, BaseURL: "http://127.0.0.1:9/v1"}}},
+		{"allowed tools", agent.Spec{AllowedTools: []string{"Read"}}},
+		{"disallowed tools", agent.Spec{DisallowedTools: []string{"Write"}}},
+		{"empty permission config", agent.Spec{PermissionConfig: &agent.PermissionConfig{}}},
+		{"allow permission config", agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "allow"}}},
+		{"mcp servers", agent.Spec{MCPServers: []agent.MCPServerConfig{{Name: "tools", Command: "server"}}}},
+		{"mcp tool names", agent.Spec{MCPToolNames: []string{"mcp__tools__read"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if p.useServerLane(tt.spec) {
+				t.Fatal("project-config-bearing one-shot unexpectedly routed to the incompatible v2 server lane")
+			}
+		})
+	}
+	if p.useServerLane(agent.Spec{Prompt: "plain one-shot", Model: "provider/model"}) {
+		t.Fatal("plain one-shot unexpectedly routed away from Lane A")
+	}
+}
+
+func TestProvider_ConfiguredCLIOwnsAndCleansProjectConfig(t *testing.T) {
+	bin := writeFakeOpenCodeScript(t)
+	configRoot := t.TempDir()
+	p := &Provider{binary: bin, configTempDir: configRoot}
+	h, err := p.Spawn(t.Context(), agent.Spec{
+		Prompt:          "configured one-shot",
+		Cwd:             t.TempDir(),
+		Autonomous:      true,
+		AllowedTools:    []string{"Read"},
+		DisallowedTools: []string{"Write"},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "tools", Command: "/usr/bin/false",
+		}},
+		MCPToolNames: []string{"mcp__tools__read"},
+		Endpoint: &agent.EndpointBinding{
+			Company: agent.CompanyLocal, Model: "fixture-model", BaseURL: "http://127.0.0.1:9/v1",
+			Protocol: agent.ProtoOpenAIChat, Host: agent.HostLocal, Mechanism: agent.AuthNone, Auth: agent.AuthLocal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	cliHandle, ok := h.(*openCodeHandle)
+	if !ok {
+		t.Fatalf("Spawn handle = %T, want *openCodeHandle", h)
+	}
+	configuredPath := ""
+	for _, entry := range cliHandle.cmd.Env {
+		if strings.HasPrefix(entry, OCConfigEnvVar+"=") {
+			configuredPath = strings.TrimPrefix(entry, OCConfigEnvVar+"=")
+			break
+		}
+	}
+	if configuredPath == "" {
+		t.Fatal("configured CLI child env omitted OPENCODE_CONFIG")
+	}
+	info, err := os.Stat(configuredPath)
+	if err != nil {
+		t.Fatalf("stat owned config before Stop: %v", err)
+	}
+	if got := info.Mode().Perm(); got != openCodeConfigMode {
+		t.Fatalf("owned config mode = %04o, want %04o", got, openCodeConfigMode)
+	}
+	parent := filepath.Dir(configuredPath)
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		t.Fatalf("stat owned config boundary: %v", err)
+	}
+	if got := parentInfo.Mode().Perm(); got != openCodeHomeMode {
+		t.Fatalf("owned config boundary mode = %04o, want %04o", got, openCodeHomeMode)
+	}
+	if err := h.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if _, err := os.Stat(parent); !os.IsNotExist(err) {
+		t.Fatalf("owned config boundary survived Stop: %v", err)
+	}
+}
+
+func TestProvider_ExternalAttachPolicyAndMCPFailWithDeniedReceipt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		spec    agent.Spec
+		channel agent.ToolLifecycleChannel
+	}{
+		{"allowed tools", agent.Spec{AllowedTools: []string{"Read"}}, agent.ToolChannelAllowedTools},
+		{"disallowed tools", agent.Spec{DisallowedTools: []string{"Write"}}, agent.ToolChannelDisallowedTools},
+		{"permission config", agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "allow"}}, agent.ToolChannelPermissionConfig},
+		{"mcp servers", agent.Spec{MCPServers: []agent.MCPServerConfig{{Name: "tools", Command: "server"}}}, agent.ToolChannelMCPServer},
+		{"mcp tool names", agent.Spec{MCPToolNames: []string{"mcp__tools__read"}}, agent.ToolChannelMCPToolNames},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			clientBuilt := false
+			p := &Provider{
+				endpoint: "http://attached.invalid",
+				clientFactory: func(_, _ string) serverClient {
+					clientBuilt = true
+					return newFakeClient()
+				},
+			}
+			var receipts []agent.ToolLifecycleReceipt
+			spec := tt.spec
+			spec.OnToolLifecycleAdapted = func(receipt agent.ToolLifecycleReceipt) error {
+				receipts = append(receipts, receipt)
+				return nil
+			}
+			_, err := p.Spawn(t.Context(), spec)
+			if !errors.Is(err, agent.ErrSpawnFailed) {
+				t.Fatalf("Spawn error = %v, want ErrSpawnFailed", err)
+			}
+			var adaptationErr *agent.ToolAdaptationError
+			if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != tt.channel {
+				t.Fatalf("Spawn error = %v, want typed delivery denial on %s", err, tt.channel)
+			}
+			if len(receipts) != 1 || receipts[0].Decision != "denied" {
+				t.Fatalf("receipts = %+v, want one denied receipt", receipts)
+			}
+			if clientBuilt {
+				t.Fatal("external client was built before policy/MCP denial")
+			}
+		})
+	}
+}
+
+func TestProvider_ExternalAttachEndpointFailsBeforeAdaptationOrSession(t *testing.T) {
+	t.Parallel()
+	clientBuilt := false
+	p := &Provider{
+		endpoint: "http://attached.invalid",
+		clientFactory: func(_, _ string) serverClient {
+			clientBuilt = true
+			return newFakeClient()
+		},
+	}
+	receiptCalled := false
+	_, err := p.Spawn(t.Context(), agent.Spec{
+		Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "gpt-x", BaseURL: "http://compat/v1"},
+		OnToolLifecycleAdapted: func(agent.ToolLifecycleReceipt) error {
+			receiptCalled = true
+			return nil
+		},
+	})
+	if !errors.Is(err, agent.ErrSpawnFailed) || !errors.Is(err, errExternalAttachConfigUnproven) {
+		t.Fatalf("Spawn error = %v, want typed external-attach config denial", err)
+	}
+	if receiptCalled {
+		t.Fatal("tool lifecycle receipt emitted before endpoint authority denial")
+	}
+	if clientBuilt {
+		t.Fatal("external client was built before endpoint authority denial")
+	}
+}
+
 // TestProvider_Spawn_BinaryNotFound verifies that Spawn returns
 // ErrSpawnFailed when the binary path is invalid.
 func TestProvider_Spawn_BinaryNotFound(t *testing.T) {
@@ -273,6 +435,62 @@ func TestProvider_Spawn_BinaryNotFound(t *testing.T) {
 	}
 	if !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Errorf("Spawn err: want ErrSpawnFailed, got %v", err)
+	}
+}
+
+func TestProvider_ConfiguredCLISpawnFailureRemovesSecretConfigWithoutWorktreeResidue(t *testing.T) {
+	const secretSentinel = "opencode-spawn-failure-bearer-must-not-surface"
+	repo := t.TempDir()
+	if output, err := testGitCommand(t, "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	tempRoot := t.TempDir()
+	p := &Provider{binary: "/nonexistent/opencode-fake-binary", configTempDir: tempRoot}
+	var receipts []agent.ToolLifecycleReceipt
+	_, err := p.Spawn(t.Context(), agent.Spec{
+		Prompt: "must not start",
+		Cwd:    repo,
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "platform", Type: "http", URL: "https://example.invalid/mcp",
+			Headers: map[string]string{"Authorization": "Bearer " + secretSentinel},
+		}},
+		OnToolLifecycleAdapted: func(receipt agent.ToolLifecycleReceipt) error {
+			receipts = append(receipts, receipt)
+			return nil
+		},
+	})
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("Spawn error = %v, want ErrSpawnFailed", err)
+	}
+	if strings.Contains(err.Error(), secretSentinel) {
+		t.Fatalf("Spawn error leaked MCP bearer: %v", err)
+	}
+	receiptJSON, marshalErr := json.Marshal(receipts)
+	if marshalErr != nil {
+		t.Fatalf("marshal receipts: %v", marshalErr)
+	}
+	if strings.Contains(string(receiptJSON), secretSentinel) {
+		t.Fatalf("tool lifecycle receipt leaked MCP bearer: %s", receiptJSON)
+	}
+	entries, readErr := os.ReadDir(tempRoot)
+	if readErr != nil {
+		t.Fatalf("read config temp root: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spawn failure left owned config entries: %v", entries)
+	}
+	status, statusErr := testGitCommand(t, "-C", repo, "status", "--porcelain", "--untracked-files=all").Output()
+	if statusErr != nil {
+		t.Fatalf("git status: %v", statusErr)
+	}
+	if len(status) != 0 {
+		t.Fatalf("spawn failure left worktree residue: %q", status)
+	}
+	p.mu.Lock()
+	resources := len(p.resources)
+	p.mu.Unlock()
+	if resources != 0 {
+		t.Fatalf("spawn failure left %d registered resources", resources)
 	}
 }
 
@@ -315,19 +533,20 @@ func TestProvider_Spawn_FakeCLI_NDJSON(t *testing.T) {
 	// goroutine.
 	events := collectUntilResult(ctx, t, h)
 
-	var gotInit, gotAssistant, gotResult bool
+	var initCount int
+	var gotAssistant, gotResult bool
 	for _, ev := range events {
 		switch ev.(type) {
 		case agent.InitEvent:
-			gotInit = true
+			initCount++
 		case agent.AssistantTextEvent:
 			gotAssistant = true
 		case agent.ResultEvent:
 			gotResult = true
 		}
 	}
-	if !gotInit {
-		t.Error("events: want InitEvent (from step_start)")
+	if initCount != 1 {
+		t.Errorf("events: want exactly one InitEvent across model/tool steps, got %d", initCount)
 	}
 	if !gotAssistant {
 		t.Error("events: want AssistantTextEvent (from text event)")
@@ -650,13 +869,12 @@ func TestBuildOpenCodeArgs_NonAutonomous(t *testing.T) {
 	}
 }
 
-func TestBuildOpenCodeArgs_Cwd_NoDirFlag(t *testing.T) {
+func TestBuildOpenCodeArgs_Cwd_UsesExplicitDirFlag(t *testing.T) {
 	t.Parallel()
-	// D-2: cwd is delivered via cmd.Dir in spawnCLI, not a --dir flag
-	// (--dir targets a remote server when attaching).
 	argv := buildOpenCodeArgs(agent.Spec{Cwd: "/workspace"})
-	if contains(argv, "--dir") {
-		t.Errorf("want no --dir flag (cwd handled via cmd.Dir), got %v", argv)
+	idx := indexOf(argv, "--dir")
+	if idx < 0 || idx+1 >= len(argv) || argv[idx+1] != "/workspace" {
+		t.Errorf("want --dir /workspace to override inherited PWD, got %v", argv)
 	}
 }
 
@@ -665,6 +883,21 @@ func TestBuildOpenCodeArgs_Model(t *testing.T) {
 	argv := buildOpenCodeArgs(agent.Spec{Model: "anthropic/claude-opus-4"})
 	if !contains(argv, "--model") {
 		t.Errorf("want --model in %v", argv)
+	}
+}
+
+func TestBuildOpenCodeArgs_EndpointModelUsesOwnedProviderRef(t *testing.T) {
+	t.Parallel()
+	argv := buildOpenCodeArgs(agent.Spec{
+		Model: "stale-model",
+		Endpoint: &agent.EndpointBinding{
+			Company: agent.CompanyLocal,
+			Model:   "resolved-model",
+		},
+	})
+	idx := indexOf(argv, "--model")
+	if idx < 0 || idx+1 >= len(argv) || argv[idx+1] != OCProviderID+"/resolved-model" {
+		t.Errorf("want --model %s/resolved-model, got %v", OCProviderID, argv)
 	}
 }
 
@@ -765,6 +998,7 @@ func indexOf(slice []string, s string) int {
 
 const fakeOpenCodeNDJSON = `{"type":"step_start","sessionID":"ses_opencode_test_001","part":{"type":"step-start"}}
 {"type":"text","sessionID":"ses_opencode_test_001","part":{"type":"text","text":"Hello from opencode fake"}}
+{"type":"step_start","sessionID":"ses_opencode_test_001","part":{"type":"step-start"}}
 {"type":"step_finish","sessionID":"ses_opencode_test_001","part":{"type":"step-finish","reason":"stop","tokens":{"total":50,"input":40,"output":10},"cost":0}}
 `
 

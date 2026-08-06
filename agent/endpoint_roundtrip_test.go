@@ -69,11 +69,12 @@ func TestSpec_EndpointEmittedWhenSet(t *testing.T) {
 	spec := Spec{
 		Prompt: "x",
 		Endpoint: &EndpointBinding{
-			Company:  CompanyAnthropic,
-			Model:    "claude-sonnet-4-5",
-			Protocol: ProtoAnthropicMessages,
-			Host:     HostDirect,
-			Auth:     AuthBYOK,
+			Company:   CompanyAnthropic,
+			Model:     "claude-sonnet-4-5",
+			Protocol:  ProtoAnthropicMessages,
+			Host:      HostDirect,
+			Mechanism: AuthAPIKey,
+			Auth:      AuthBYOK,
 		},
 	}
 	b, err := json.Marshal(spec)
@@ -83,6 +84,9 @@ func TestSpec_EndpointEmittedWhenSet(t *testing.T) {
 	if !strings.Contains(string(b), "\"endpoint\"") {
 		t.Errorf("set Endpoint was not serialized:\n%s", b)
 	}
+	if !strings.Contains(string(b), `"mechanism":"api_key"`) {
+		t.Errorf("set Endpoint mechanism was not serialized:\n%s", b)
+	}
 
 	if spec.Endpoint.IsZero() {
 		t.Errorf("a populated EndpointBinding reported IsZero")
@@ -90,5 +94,21 @@ func TestSpec_EndpointEmittedWhenSet(t *testing.T) {
 	var zero EndpointBinding
 	if !zero.IsZero() {
 		t.Errorf("a zero EndpointBinding did not report IsZero")
+	}
+	if (EndpointBinding{Mechanism: AuthNone}).IsZero() {
+		t.Errorf("a mechanism-only EndpointBinding reported IsZero")
+	}
+}
+
+func TestEndpointBinding_LegacyAuthRetainedWithoutMechanism(t *testing.T) {
+	b, err := json.Marshal(EndpointBinding{Auth: AuthBYOK})
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if strings.Contains(string(b), `"mechanism"`) {
+		t.Errorf("zero mechanism was not omitted: %s", b)
+	}
+	if !strings.Contains(string(b), `"auth":"byok"`) {
+		t.Errorf("legacy auth was not retained: %s", b)
 	}
 }

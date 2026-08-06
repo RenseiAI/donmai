@@ -1,10 +1,6 @@
 package opencode
 
 import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -13,12 +9,11 @@ import (
 
 // ─── Per-session opencode.json injection (07-design-opencode-spawn.md §5) ────
 //
-// Lane B stands up one `opencode serve` child per donmai session on a
-// loopback port the provider owns. Before the child starts, config.go
-// renders a session-scoped opencode.json and points the child at it via the
-// OPENCODE_CONFIG env var (a FILE, not OPENCODE_CONFIG_CONTENT: it survives
-// a subprocess re-exec and is auditable post-mortem). The file is written
-// 0600 inside the session state dir, regenerated per spawn, never reused.
+// Binary-backed configured sessions render a session-scoped opencode.json and
+// point the `opencode run` or `opencode serve` child at it via OPENCODE_CONFIG.
+// config_boundary.go writes that file into a unique provider-owned 0700 temp
+// boundary, never the worktree, and removes it after the child stops. The file
+// is 0600, regenerated per spawn, and never reused.
 //
 // The config enforces three Rensei routing guarantees:
 //
@@ -81,12 +76,14 @@ type ocProviderOptions struct {
 // custom OpenAI-compatible provider needs no per-model overrides.
 type ocModelEntry struct{}
 
-// ocMCPServer is opencode's local-stdio MCP entry shape (the only transport
-// §5.3 whitelists; remote HTTP MCP is out of scope for the injected config).
+// ocMCPServer is opencode's per-project local or remote MCP entry shape.
 type ocMCPServer struct {
 	Type        string            `json:"type"`
 	Command     []string          `json:"command,omitempty"`
 	Environment map[string]string `json:"environment,omitempty"`
+	URL         string            `json:"url,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	OAuth       *bool             `json:"oauth,omitempty"`
 	Enabled     bool              `json:"enabled"`
 }
 
@@ -104,8 +101,9 @@ type ocPolicy struct {
 }
 
 // buildConfig renders the session-scoped opencode.json from a resolved Spec.
-// It never reads or embeds credential values — apiKey is always the
-// {env:...} indirection.
+// The model-provider apiKey always uses {env:...} indirection. Remote MCP
+// headers may contain per-session credentials, so the rendered bytes are only
+// written to the owned boundary in config_boundary.go.
 func buildConfig(spec agent.Spec) ocConfig {
 	cfg := ocConfig{
 		Schema:           "https://opencode.ai/config.json",
@@ -125,14 +123,15 @@ func buildConfig(spec agent.Spec) ocConfig {
 
 	model := resolvedModel(spec)
 	if model != "" {
+		options := ocProviderOptions{BaseURL: resolvedBaseURL(spec)}
+		if spec.Endpoint == nil || spec.Endpoint.Mechanism == agent.AuthAPIKey {
+			options.APIKey = "{env:" + OCKeyEnvVar + "}"
+		}
 		cfg.Provider = map[string]ocProvider{
 			OCProviderID: {
-				NPM: "@ai-sdk/openai-compatible",
-				Options: ocProviderOptions{
-					BaseURL: resolvedBaseURL(spec),
-					APIKey:  "{env:" + OCKeyEnvVar + "}",
-				},
-				Models: map[string]ocModelEntry{model: {}},
+				NPM:     "@ai-sdk/openai-compatible",
+				Options: options,
+				Models:  map[string]ocModelEntry{model: {}},
 			},
 		}
 		cfg.Model = OCProviderID + "/" + model
@@ -164,24 +163,6 @@ func resolvedBaseURL(spec agent.Spec) string {
 	return ""
 }
 
-// writeConfig renders buildConfig(spec) and writes it 0600 into dir, returning
-// the file path. The caller points OPENCODE_CONFIG at it.
-func writeConfig(dir string, spec agent.Spec) (string, error) {
-	cfg := buildConfig(spec)
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("provider/opencode: marshal config: %w", err)
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("provider/opencode: config dir: %w", err)
-	}
-	path := filepath.Join(dir, "opencode.json")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return "", fmt.Errorf("provider/opencode: write config: %w", err)
-	}
-	return path, nil
-}
-
 // ─── §5.2 permission projection ──────────────────────────────────────────────
 //
 // Claude-grammar tool patterns ("Bash(git push:*)", "Edit", "WebFetch") project
@@ -191,23 +172,12 @@ func writeConfig(dir string, spec agent.Spec) (string, error) {
 // external_directory and doom_loop (both kept at "ask" so they route to the
 // pump).
 
-// ocDecision maps a donmai default-decision / verdict to an opencode value.
-func ocDecision(v string) string {
-	switch strings.ToLower(v) {
-	case "allow":
-		return "allow"
-	case "deny":
-		return "deny"
-	case "prompt", "ask":
-		return "ask"
-	default:
-		return "ask"
-	}
-}
-
 // claudeToolToOC maps a Claude tool name onto its opencode permission key.
 // Unknown tools return "" (skipped — opencode's own default applies).
 func claudeToolToOC(tool string) string {
+	if key := mcpToolToOC(tool); key != "" {
+		return key
+	}
 	switch tool {
 	case "Bash":
 		return "bash"
@@ -228,6 +198,30 @@ func claudeToolToOC(tool string) string {
 	default:
 		return ""
 	}
+}
+
+// mcpToolToOC maps Donmai's canonical mcp__<server>__<tool> name onto
+// OpenCode's <server>_<tool> permission key.
+func mcpToolToOC(tool string) string {
+	if !strings.HasPrefix(tool, "mcp__") {
+		return ""
+	}
+	rest := strings.TrimPrefix(tool, "mcp__")
+	server, name, ok := strings.Cut(rest, "__")
+	if !ok || server == "" || name == "" {
+		return ""
+	}
+	normalize := func(value string) string {
+		return strings.Map(func(r rune) rune {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+				return r
+			default:
+				return '_'
+			}
+		}, value)
+	}
+	return normalize(server) + "_" + normalize(name)
 }
 
 // parseClaudePattern splits "Tool(inner)" into (tool, inner). A bare "Tool"
@@ -272,9 +266,10 @@ func projectPermissions(spec agent.Spec) map[string]any {
 	// Default decision → per-tool catch-all. Empty defaults to "ask" so
 	// unmatched calls reach the pump rather than silently allowing.
 	def := "ask"
-	if spec.PermissionConfig != nil && spec.PermissionConfig.DefaultDecision != "" {
-		def = ocDecision(spec.PermissionConfig.DefaultDecision)
+	if spec.PermissionConfig == nil && (len(spec.AllowedTools) > 0 || len(spec.MCPToolNames) > 0) {
+		def = "deny"
 	}
+	perm["*"] = def
 
 	// bash accumulates a command-glob map; other tools accumulate a single
 	// whole-tool decision. denies are collected separately so they always
@@ -305,18 +300,18 @@ func projectPermissions(spec agent.Spec) map[string]any {
 	for _, p := range spec.AllowedTools {
 		apply(p, "allow")
 	}
-	if spec.PermissionConfig != nil {
-		for _, p := range spec.PermissionConfig.AllowPatterns {
-			apply(claudeFromRaw(p), "allow")
+	for _, p := range spec.MCPToolNames {
+		apply(p, "allow")
+	}
+	if len(spec.MCPToolNames) == 0 {
+		for _, server := range spec.MCPServers {
+			if key := mcpToolToOC("mcp__" + server.Name + "__*"); key != "" {
+				toolAllow[key] = true
+			}
 		}
 	}
 	for _, p := range spec.DisallowedTools {
 		apply(p, "deny")
-	}
-	if spec.PermissionConfig != nil {
-		for _, p := range spec.PermissionConfig.DisallowPatterns {
-			apply(claudeFromRaw(p), "deny")
-		}
 	}
 
 	for k := range toolDeny {
@@ -339,18 +334,11 @@ func projectPermissions(spec agent.Spec) map[string]any {
 	return perm
 }
 
-// claudeFromRaw normalizes a PermissionConfig pattern (which may already be a
-// Claude "Tool(inner)" string) — it is passed through unchanged; the helper
-// exists so the two pattern sources share one apply path and the intent is
-// explicit at the call site.
-func claudeFromRaw(p string) string { return p }
-
 // ─── §5.3 MCP whitelist ──────────────────────────────────────────────────────
 
-// projectMCP renders the mcp block from Spec.MCPServers. Only local stdio
-// servers are whitelisted; an http-transport MCP entry (platform per-session
-// route) is skipped here — the injected config is the OSS-local surface. An
-// empty result yields no mcp key at all (§5.3).
+// projectMCP renders the session-scoped mcp block from Spec.MCPServers. Local
+// stdio services carry command/environment; platform A2A and other Streamable
+// HTTP services carry a remote URL and headers with OpenCode OAuth disabled.
 func projectMCP(spec agent.Spec) map[string]ocMCPServer {
 	if len(spec.MCPServers) == 0 {
 		return nil
@@ -361,8 +349,15 @@ func projectMCP(spec agent.Spec) map[string]ocMCPServer {
 	servers := append([]agent.MCPServerConfig(nil), spec.MCPServers...)
 	sort.Slice(servers, func(i, j int) bool { return servers[i].Name < servers[j].Name })
 	for _, s := range servers {
-		if s.Name == "" || s.Type == "http" || s.Command == "" {
-			// http MCP and command-less entries are not local-stdio; skip.
+		if s.Name == "" {
+			continue
+		}
+		if strings.EqualFold(s.Type, "http") {
+			disabled := false
+			out[s.Name] = ocMCPServer{Type: "remote", URL: s.URL, Headers: s.Headers, OAuth: &disabled, Enabled: true}
+			continue
+		}
+		if s.Command == "" {
 			continue
 		}
 		cmd := append([]string{s.Command}, s.Args...)

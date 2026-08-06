@@ -2,11 +2,14 @@ package runner
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +60,91 @@ func (*promptCaptureInteractiveProvider) Resume(context.Context, string, agent.S
 	return nil, agent.ErrUnsupported
 }
 func (*promptCaptureInteractiveProvider) Shutdown(context.Context) error { return nil }
+
+// toolLifecycleInteractiveProvider exercises the production runner callback
+// through the same PrepareHarness entry point used by real harness providers.
+// It records whether receipt persistence completed before the first simulated
+// provider side effect.
+type toolLifecycleInteractiveProvider struct {
+	manifest                  agent.HarnessManifest
+	raw                       agent.Spec
+	seedToolReceipt           *agent.ToolLifecycleReceipt
+	breakToolReceiptStore     bool
+	persistedBeforeSideEffect bool
+	sideEffects               int
+}
+
+func (*toolLifecycleInteractiveProvider) Name() agent.ProviderName { return agent.ProviderClaude }
+func (*toolLifecycleInteractiveProvider) Capabilities() agent.Capabilities {
+	return (&claude.Provider{}).Capabilities()
+}
+
+func (p *toolLifecycleInteractiveProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.raw = spec
+	adapted, err := agent.PreparePrompt(spec, p.manifest)
+	if err != nil {
+		return nil, err
+	}
+	if p.seedToolReceipt != nil {
+		if _, err := state.NewStore().Update(spec.Cwd, func(st *state.State) error {
+			st.AppendToolLifecycleReceipt(*p.seedToolReceipt)
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("seed restored tool receipt: %w", err)
+		}
+	}
+	if p.breakToolReceiptStore {
+		agentDir := filepath.Join(spec.Cwd, state.AgentDirName)
+		if err := os.RemoveAll(agentDir); err != nil {
+			return nil, fmt.Errorf("remove agent dir: %w", err)
+		}
+		if err := os.WriteFile(agentDir, []byte("not-a-directory"), 0o600); err != nil {
+			return nil, fmt.Errorf("break receipt store: %w", err)
+		}
+	}
+	if _, err := agent.PrepareToolLifecycle(adapted, p.manifest); err != nil {
+		return nil, err
+	}
+	persisted, err := state.NewStore().Read(spec.Cwd)
+	if err != nil {
+		return nil, fmt.Errorf("verify pre-side-effect tool receipt: %w", err)
+	}
+	if persisted.ToolLifecycleReceipt == nil || persisted.ToolLifecycleReceipt.Decision != "ready" {
+		return nil, fmt.Errorf("verify pre-side-effect tool receipt: got %+v", persisted.ToolLifecycleReceipt)
+	}
+	p.persistedBeforeSideEffect = true
+	p.sideEffects++
+	session := completedRecordingInteractiveSession()
+	return &testInteractiveHandle{
+		Handle:  &fakeHandle{events: make(chan agent.Event)},
+		session: session,
+	}, nil
+}
+
+func (*toolLifecycleInteractiveProvider) Resume(context.Context, string, agent.Spec) (agent.Handle, error) {
+	return nil, agent.ErrUnsupported
+}
+func (*toolLifecycleInteractiveProvider) Shutdown(context.Context) error { return nil }
+
+type codexCLIInteractiveProvider struct {
+	binary string
+	raw    agent.Spec
+}
+
+func (*codexCLIInteractiveProvider) Name() agent.ProviderName { return agent.ProviderCodex }
+func (*codexCLIInteractiveProvider) Capabilities() agent.Capabilities {
+	return (&codex.Provider{}).Capabilities()
+}
+
+func (p *codexCLIInteractiveProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.raw = spec
+	return codex.SpawnInteractive(ctx, codex.Options{CodexBin: p.binary}, spec)
+}
+
+func (*codexCLIInteractiveProvider) Resume(context.Context, string, agent.Spec) (agent.Handle, error) {
+	return nil, agent.ErrUnsupported
+}
+func (*codexCLIInteractiveProvider) Shutdown(context.Context) error { return nil }
 
 func TestRun_InteractiveInitialPromptUsesTypedClaudeAndCodexNativeAuthority(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
@@ -174,6 +262,162 @@ func TestRun_InteractiveInitialPromptUsesTypedClaudeAndCodexNativeAuthority(t *t
 			}
 			assertInteractiveUserTaskReceipt(t, persisted.PromptReceipt, tt.wantDelivery)
 		})
+	}
+}
+
+func TestRun_ToolLifecycleAdmissionPersistsDenialAndFailsClosed(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	tests := []struct {
+		name        string
+		wantCode    agent.ToolAdaptationDenialCode
+		configure   func(*toolLifecycleInteractiveProvider)
+		assertState func(*testing.T, *toolLifecycleInteractiveProvider)
+	}{
+		{
+			name:     "restored ready projection becomes append-only denied projection",
+			wantCode: agent.ToolDenialDeliveryUnsupported,
+			configure: func(p *toolLifecycleInteractiveProvider) {
+				p.seedToolReceipt = &agent.ToolLifecycleReceipt{ContractVersion: agent.ToolLifecycleContractVersion, ProfileID: "prior/profile", Decision: "ready"}
+				for i := range p.manifest.ToolLifecycle {
+					p.manifest.ToolLifecycle[i].NativeToolPolicyDelivery = agent.ToolDeliveryUnsupported
+				}
+			},
+			assertState: func(t *testing.T, p *toolLifecycleInteractiveProvider) {
+				persisted, err := state.NewStore().Read(p.raw.Cwd)
+				if err != nil {
+					t.Fatalf("read denied state: %v", err)
+				}
+				if persisted.ToolLifecycleReceipt == nil || persisted.ToolLifecycleReceipt.Decision != "denied" {
+					t.Fatalf("current projection = %+v, want denied", persisted.ToolLifecycleReceipt)
+				}
+				if len(persisted.ToolLifecycleReceiptHistory) != 2 || persisted.ToolLifecycleReceiptHistory[0].Decision != "ready" || persisted.ToolLifecycleReceiptHistory[1].Decision != "denied" {
+					t.Fatalf("append-only history = %+v, want ready then denied", persisted.ToolLifecycleReceiptHistory)
+				}
+			},
+		},
+		{
+			name:     "receipt store failure",
+			wantCode: agent.ToolDenialApplicationFailed,
+			configure: func(p *toolLifecycleInteractiveProvider) {
+				p.breakToolReceiptStore = true
+			},
+			assertState: func(_ *testing.T, _ *toolLifecycleInteractiveProvider) {},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(envAttachURL, "")
+			t.Setenv(envAttachToken, "")
+			server := mockPlatformServer(t)
+			defer server.Close()
+			manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			poster, err := result.NewPoster(result.Options{PlatformURL: server.URL, WorkerID: "w", AuthToken: "t", HTTPClient: server.Client(), BaseDelay: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider := &toolLifecycleInteractiveProvider{manifest: (&claude.Provider{}).Manifest()}
+			tt.configure(provider)
+			registry := NewRegistry()
+			if err := registry.Register(provider); err != nil {
+				t.Fatal(err)
+			}
+			runner, err := New(Options{Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(), PreserveWorktreeAlways: true, MaxSessionDuration: -1, SkipBackstop: true, SkipSteering: true, SkipPostSession: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			qw := QueuedWork{
+				QueuedWork: prompt.QueuedWork{SessionID: "tool-lifecycle-" + tt.name, IssueID: "issue", IssueIdentifier: "ISSUE-TOOL", WorkType: "development", Mode: prompt.InteractiveRunMode, InitialPrompt: "test", Repository: makeBareRepo(t), AllowedTools: []string{"Read"}},
+				WorkerID:   "w", AuthToken: "t", PlatformURL: server.URL, ResolvedProfile: ResolvedProfile{Provider: agent.ProviderClaude},
+			}
+			got, runErr := runner.Run(context.Background(), qw)
+			if runErr == nil || got.FailureMode != FailureSpawn {
+				t.Fatalf("Run result=%+v err=%v, want spawn failure", got, runErr)
+			}
+			var adaptationErr *agent.ToolAdaptationError
+			if !errors.As(runErr, &adaptationErr) || adaptationErr.Code != tt.wantCode {
+				t.Fatalf("error = %v, want typed %s tool adaptation error", runErr, tt.wantCode)
+			}
+			if provider.sideEffects != 0 || provider.persistedBeforeSideEffect {
+				t.Fatalf("provider side effects=%d persisted-ready=%v, want zero", provider.sideEffects, provider.persistedBeforeSideEffect)
+			}
+			tt.assertState(t, provider)
+		})
+	}
+}
+
+func TestRun_InteractiveDefaultHTTPMCPReachesCodexCLI(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not on PATH")
+	}
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+	server := mockPlatformServer(t)
+	defer server.Close()
+	bin := filepath.Join(t.TempDir(), "fake-codex")
+	script := `#!/bin/bash
+printf '%s\n' "$@" > "$PWD/codex-argv"
+env | LC_ALL=C sort | grep '^DONMAI_MCP_HEADER_' > "$PWD/codex-mcp-env" || true
+`
+	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bin, 0o700); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatal(err)
+	}
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	poster, err := result.NewPoster(result.Options{PlatformURL: server.URL, WorkerID: "w", AuthToken: "t", HTTPClient: server.Client(), BaseDelay: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &codexCLIInteractiveProvider{binary: bin}
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	runner, err := New(Options{Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(), PreserveWorktreeAlways: true, MaxSessionDuration: -1, SkipBackstop: true, SkipSteering: true, SkipPostSession: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const token = "RUNNER_MCP_SECRET_DO_NOT_PUT_IN_ARGV"
+	qw := QueuedWork{
+		QueuedWork: prompt.QueuedWork{SessionID: "codex-default-mcp", IssueID: "issue", IssueIdentifier: "ISSUE-CODEX", WorkType: "development", Mode: prompt.InteractiveRunMode, InitialPrompt: "test", Repository: makeBareRepo(t)},
+		WorkerID:   "w", AuthToken: token, PlatformURL: server.URL, ResolvedProfile: ResolvedProfile{Provider: agent.ProviderCodex},
+	}
+	got, err := runner.Run(context.Background(), qw)
+	if err != nil || got.Status != "completed" {
+		t.Fatalf("Run result=%+v err=%v", got, err)
+	}
+	argv, err := os.ReadFile(filepath.Join(provider.raw.Cwd, "codex-argv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(argv), "mcp_servers=") || !strings.Contains(string(argv), "/api/mcp/codex-default-mcp") || strings.Contains(string(argv), token) {
+		t.Fatalf("Codex argv did not carry a secret-free default HTTP MCP override: %s", argv)
+	}
+	childEnv, err := os.ReadFile(filepath.Join(provider.raw.Cwd, "codex-mcp-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(childEnv), "Bearer "+token) {
+		t.Fatalf("Codex child env omitted HTTP header secret: %s", childEnv)
+	}
+	persisted, err := state.NewStore().Read(provider.raw.Cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ToolLifecycleReceipt == nil || persisted.ToolLifecycleReceipt.Decision != "ready" || len(persisted.ToolLifecycleReceiptHistory) != 1 {
+		t.Fatalf("tool lifecycle state = %+v history=%+v", persisted.ToolLifecycleReceipt, persisted.ToolLifecycleReceiptHistory)
 	}
 }
 

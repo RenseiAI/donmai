@@ -20,10 +20,10 @@ import (
 	stubprov "github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
-// HarnessHarvestList is the harvest list of the 9 harness providers. Each entry
+// HarnessHarvestList is the harvest list of the 10 harness providers. Each entry
 // returns the harness manifest from a constructed instance WITHOUT relying on
 // probe state:
-//   - The eight real providers expose a state-free Manifest() on (*Provider),
+//   - The nine real providers expose a state-free Manifest() on (*Provider),
 //     so a zero-value struct is sufficient and no New() probe runs.
 //   - The stub provider's Manifest() projects p.caps; it is harvested via
 //     New() so it picks up defaultCapabilities() (all-on) per §2.8.
@@ -41,9 +41,9 @@ func HarnessHarvestList() []HarnessHarvest {
 	return []HarnessHarvest{
 		{Name: agent.HarnessClaudeCode, Manifest: func() agent.HarnessManifest { return (&claude.Provider{}).Manifest() }},
 		{Name: agent.HarnessCodex, Manifest: func() agent.HarnessManifest { return (&codex.Provider{}).Manifest() }},
-		{Name: agent.HarnessRaw, Manifest: func() agent.HarnessManifest { return (&gemini.Provider{}).Manifest() }},
+		{Name: agent.HarnessGeminiDirect, Manifest: func() agent.HarnessManifest { return (&gemini.Provider{}).Manifest() }},
 		{Name: agent.HarnessAntigravity, Manifest: func() agent.HarnessManifest { return (&agycli.Provider{}).Manifest() }},
-		{Name: agent.HarnessRaw, Manifest: func() agent.HarnessManifest { return (&ollama.Provider{}).Manifest() }},
+		{Name: agent.HarnessOllama, Manifest: func() agent.HarnessManifest { return (&ollama.Provider{}).Manifest() }},
 		{Name: agent.HarnessOpenCode, Manifest: func() agent.HarnessManifest { return (&opencode.Provider{}).Manifest() }},
 		{Name: agent.HarnessPi, Manifest: func() agent.HarnessManifest { return (&pi.Provider{}).Manifest() }},
 		{Name: agent.HarnessAmp, Manifest: func() agent.HarnessManifest { return (&amp.Provider{}).Manifest() }},
@@ -77,7 +77,7 @@ func EndpointHarvestList() []EndpointHarvest {
 	}
 }
 
-// HarnessProvidersForParity returns the 9 harness providers as constructed
+// HarnessProvidersForParity returns the 10 harness providers as constructed
 // instances for the parity test's "manifest agrees with Capabilities()" rule.
 // Each is the same zero/New instance used for harvesting, so the comparison is
 // against the exact value the matrix is built from.

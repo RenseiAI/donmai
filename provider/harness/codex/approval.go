@@ -38,8 +38,7 @@ type ApprovalDecision struct {
 
 // ApprovalKind classifies the inbound request shape — "command"
 // (shell), "file_change" (write/edit), or "unknown" for shapes we have
-// not seen yet (those default to acceptForSession to avoid hangs, with
-// a SystemEvent surfacing the surprise).
+// not seen yet. Unknown shapes fail closed whenever a policy was supplied.
 type ApprovalKind string
 
 // ApprovalKind constants name the inbound approval-request shapes the
@@ -111,6 +110,9 @@ type ApprovalBridge struct {
 	// once on construction; evaluated in order.
 	allowRegexes []*regexp.Regexp
 	denyRegexes  []*regexp.Regexp
+	allowFiles   bool
+	denyFiles    bool
+	hasAllowlist bool
 
 	// autoApprove is the legacy "default to acceptForSession" flag.
 	// Per F.1.1 §10.5 the v0.5.0 bridge ships true by default — we
@@ -127,8 +129,9 @@ type ApprovalBridge struct {
 func NewApprovalBridge(cfg *agent.PermissionConfig) *ApprovalBridge {
 	br := &ApprovalBridge{config: cfg, autoApprove: true}
 	if cfg != nil {
-		br.allowRegexes = compilePatterns(cfg.AllowPatterns)
-		br.denyRegexes = compilePatterns(cfg.DisallowPatterns)
+		br.hasAllowlist = len(cfg.AllowPatterns) > 0
+		br.allowRegexes, br.allowFiles = compilePatterns(cfg.AllowPatterns)
+		br.denyRegexes, br.denyFiles = compilePatterns(cfg.DisallowPatterns)
 		switch strings.ToLower(cfg.DefaultDecision) {
 		case "deny":
 			br.autoApprove = false
@@ -161,9 +164,9 @@ func (b *ApprovalBridge) Evaluate(req ApprovalRequest) ApprovalDecision {
 	case ApprovalKindFileChange:
 		return b.evaluateFileChange(req.Path, req.Cwd)
 	default:
-		// Unknown shapes default to acceptForSession to avoid
-		// hangs; the caller emits a SystemEvent so the surprise is
-		// observable.
+		if b.config != nil {
+			return ApprovalDecision{Action: ActionDecline, Reason: "unknown approval request under an explicit policy"}
+		}
 		return ApprovalDecision{Action: ActionAcceptForSession}
 	}
 }
@@ -171,6 +174,9 @@ func (b *ApprovalBridge) Evaluate(req ApprovalRequest) ApprovalDecision {
 func (b *ApprovalBridge) evaluateCommand(cmd string) ApprovalDecision {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
+		if b.config != nil {
+			return ApprovalDecision{Action: ActionDecline, Reason: "empty command under an explicit policy"}
+		}
 		return ApprovalDecision{Action: ActionAcceptForSession}
 	}
 
@@ -219,6 +225,15 @@ func (b *ApprovalBridge) evaluateFileChange(path, cwd string) ApprovalDecision {
 	if strings.Contains(path, "/.git/") || strings.HasSuffix(path, "/.git") {
 		return ApprovalDecision{Action: ActionDecline, Reason: ".git directory modification blocked"}
 	}
+	if b.denyFiles {
+		return ApprovalDecision{Action: ActionDecline, Reason: "file changes match the configured disallow policy"}
+	}
+	if b.allowFiles {
+		return ApprovalDecision{Action: ActionAcceptForSession}
+	}
+	if b.hasAllowlist {
+		return ApprovalDecision{Action: ActionDecline, Reason: "file changes are not in the allowed tool list"}
+	}
 
 	if b.autoApprove {
 		return ApprovalDecision{Action: ActionAcceptForSession}
@@ -226,9 +241,18 @@ func (b *ApprovalBridge) evaluateFileChange(path, cwd string) ApprovalDecision {
 	return ApprovalDecision{Action: ActionDecline, Reason: "default decision is deny"}
 }
 
-func compilePatterns(patterns []string) []*regexp.Regexp {
+func compilePatterns(patterns []string) ([]*regexp.Regexp, bool) {
 	out := make([]*regexp.Regexp, 0, len(patterns))
+	files := false
 	for _, p := range patterns {
+		if isFileChangeTool(p) {
+			files = true
+			continue
+		}
+		if commandPattern, ok := bashPermissionPattern(p); ok {
+			out = append(out, regexp.MustCompile(commandPattern))
+			continue
+		}
 		// PermissionConfig patterns are user-supplied. Compile with
 		// Compile (not MustCompile) so a malformed pattern cannot
 		// crash the daemon; bad patterns are dropped silently — the
@@ -239,7 +263,32 @@ func compilePatterns(patterns []string) []*regexp.Regexp {
 		}
 		out = append(out, re)
 	}
-	return out
+	return out, files
+}
+
+func isFileChangeTool(pattern string) bool {
+	switch strings.TrimSpace(pattern) {
+	case "Edit", "Write", "MultiEdit", "NotebookEdit":
+		return true
+	default:
+		return false
+	}
+}
+
+func bashPermissionPattern(pattern string) (string, bool) {
+	pattern = strings.TrimSpace(pattern)
+	if !strings.HasPrefix(pattern, "Bash(") || !strings.HasSuffix(pattern, ")") {
+		return "", false
+	}
+	inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(pattern, "Bash("), ")"))
+	if inner == "" || inner == "*" {
+		return `(?s)^.*$`, true
+	}
+	if strings.HasSuffix(inner, ":*") {
+		prefix := strings.TrimSpace(strings.TrimSuffix(inner, ":*"))
+		return `^` + regexp.QuoteMeta(prefix) + `(?:\s|$)`, true
+	}
+	return `^` + regexp.QuoteMeta(inner) + `$`, true
 }
 
 // parseApprovalRequest extracts the kind+payload from a JSON-RPC

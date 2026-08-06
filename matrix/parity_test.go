@@ -106,8 +106,8 @@ func TestParity_LegacyProviderIDsResolve(t *testing.T) {
 }
 
 // TestParity_ProtocolIntersection is rule 3: for every cell, cell.protocol ∈
-// harness.drives AND cell.protocol == endpoint.host(cell.host).protocol. For
-// "raw", harness.drives is the union of the two raw packages.
+// harness.drives AND cell.protocol == endpoint.host(cell.host).protocol. Each
+// canonical harness has its own concrete drive surface; duplicate ids fail.
 func TestParity_ProtocolIntersection(t *testing.T) {
 	built, err := Build()
 	if err != nil {
@@ -269,8 +269,8 @@ func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
 }
 
 // TestParity_PromptDeliveryProfilesHarvested proves prompt semantics are part
-// of the generated manifest contract. The two raw providers intentionally
-// contribute distinct profiles to their shared matrix row.
+// of the generated manifest contract. Each provider contributes profiles only
+// to its own canonical harness row.
 func TestParity_PromptDeliveryProfilesHarvested(t *testing.T) {
 	built, err := Build()
 	if err != nil {
@@ -297,6 +297,39 @@ func TestParity_PromptDeliveryProfilesHarvested(t *testing.T) {
 		for _, profile := range manifest.PromptDelivery {
 			if !got[manifest.Name][profile.ID] {
 				t.Errorf("generated harness %q omits prompt profile %q", manifest.Name, profile.ID)
+			}
+		}
+	}
+}
+
+// TestParity_ToolLifecycleProfilesHarvested proves tool/MCP/policy/lifecycle
+// semantics are generated independently from the legacy capability booleans.
+func TestParity_ToolLifecycleProfilesHarvested(t *testing.T) {
+	built, err := Build()
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
+	got := make(map[agent.HarnessName]map[string]bool, len(built.Harnesses))
+	for _, row := range built.Harnesses {
+		got[row.Name] = make(map[string]bool, len(row.ToolLifecycle))
+		for _, profile := range row.ToolLifecycle {
+			if profile.ID == "" || profile.Mode == "" || profile.MCPDelivery == "" || profile.NativeToolPolicyDelivery == "" || profile.PermissionConfigDelivery == "" || profile.LifecycleDelivery == "" || profile.ReplayDelivery == "" || profile.CleanupDelivery == "" || profile.EvidenceTier == "" {
+				t.Errorf("harness %q has incomplete tool/lifecycle profile: %+v", row.Name, profile)
+			}
+			if got[row.Name][profile.ID] {
+				t.Errorf("harness %q has duplicate tool/lifecycle profile %q", row.Name, profile.ID)
+			}
+			got[row.Name][profile.ID] = true
+		}
+	}
+	for _, harvested := range HarnessHarvestList() {
+		manifest := harvested.Manifest()
+		if len(manifest.ToolLifecycle) == 0 {
+			t.Errorf("harness %q declares no tool/lifecycle profile", manifest.Name)
+		}
+		for _, profile := range manifest.ToolLifecycle {
+			if !got[manifest.Name][profile.ID] {
+				t.Errorf("generated harness %q omits tool/lifecycle profile %q", manifest.Name, profile.ID)
 			}
 		}
 	}

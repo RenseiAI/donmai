@@ -29,6 +29,8 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // agent/harness.go's HarnessCaps.SupportsInteractivePTY doc comment for the
 // general rule this and codex/manifest.go both follow.
 func (*Provider) Manifest() agent.HarnessManifest {
+	headlessEvents := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventToolProgress, agent.EventResult, agent.EventError}
+	ptyEvents := []agent.EventKind{agent.EventInit, agent.EventResult}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessClaudeCode,
 		HumanLabel:  "Claude Code",
@@ -65,6 +67,28 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				SystemDelivery: agent.PromptDeliveryClaudeSystemAppend, BaseAppendDelivery: agent.PromptDeliveryClaudeSystemAppend,
 				BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryClaudeSystemAppend,
 				UserDelivery: agent.PromptDeliveryClaudePTYSeed, AmendmentDelivery: agent.PromptDeliveryClaudePTYSeed,
+			},
+		},
+		ToolLifecycle: []agent.ToolLifecycleProfile{
+			{
+				ID: "claude-code/headless/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryClaudeMCPConfig,
+				NativeToolPolicyDelivery: agent.ToolDeliveryClaudeCLIAllowDeny, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+				MCPToolPolicyDelivery: agent.ToolDeliveryClaudeCLIAllowDeny, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+				LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: headlessEvents,
+				ReplayDelivery: agent.ToolDeliveryStructuredEventReplay, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: headlessEvents,
+				CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
+			},
+			{
+				ID: "claude-code/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
+				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryClaudeMCPConfig,
+				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+				LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
+				ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: ptyEvents,
+				CleanupDelivery:    agent.ToolDeliveryHandleCleanup,
+				FallbackDeliveries: []agent.ToolDeliveryKind{agent.ToolDeliveryCoarsePTYEvents, agent.ToolDeliveryTerminalCastReplay},
+				EvidenceTier:       "unit_verified",
 			},
 		},
 	}

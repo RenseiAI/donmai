@@ -11,9 +11,8 @@ import (
 // Output schema types (the committed JSON shape).
 // ---------------------------------------------------------------------------
 
-// HarnessRow is one harness in the generated harnesses[] section. For the two
-// "raw" packages (gemini + ollama) the generator MERGES them into one row with
-// union drives/hosts.
+// HarnessRow is one uniquely identified harness in the generated harnesses[]
+// section. Duplicate manifest ids are rejected rather than capability-merged.
 type HarnessRow struct {
 	Name           agent.HarnessName             `json:"name"`
 	HumanLabel     string                        `json:"humanLabel"`
@@ -23,6 +22,7 @@ type HarnessRow struct {
 	Drives         []agent.WireProtocol          `json:"drives"`
 	DrivesHosts    []agent.ServingHost           `json:"drivesHosts"`
 	PromptDelivery []agent.PromptDeliveryProfile `json:"promptDelivery"`
+	ToolLifecycle  []agent.ToolLifecycleProfile  `json:"toolLifecycle"`
 }
 
 // EndpointRow is one model-endpoint company in the generated endpoints[].
@@ -142,70 +142,51 @@ func Build() (*Built, error) {
 	}, nil
 }
 
-// buildHarnesses harvests + merges the harness manifests. The two "raw"
-// packages (gemini + ollama) merge into one row with union drives/hosts.
-// Returns the sorted rows and a lookup keyed by harness name. The merged raw
-// caps take the UNION (logical-OR) of the agent-loop bools across the two raw
-// packages so the matrix is permissive enough to validate either package's
-// cells; per-package caps still live on each provider's Manifest().
+// buildHarnesses harvests the harness manifests and requires one manifest per
+// canonical harness id. A duplicate id is a contract error: merging capability
+// rows would let one concrete runtime advertise another runtime's protocols,
+// hosts, or tool surface.
 func buildHarnesses() ([]HarnessRow, map[agent.HarnessName]HarnessRow, error) {
+	return buildHarnessesFrom(HarnessHarvestList())
+}
+
+func buildHarnessesFrom(harvests []HarnessHarvest) ([]HarnessRow, map[agent.HarnessName]HarnessRow, error) {
 	byName := map[agent.HarnessName]*HarnessRow{}
-	for _, h := range HarnessHarvestList() {
+	for _, h := range harvests {
 		mf := h.Manifest()
 		if mf.Name != h.Name {
 			return nil, nil, fmt.Errorf("harvest: harness %q returned manifest name %q", h.Name, mf.Name)
 		}
-		row, ok := byName[mf.Name]
-		if !ok {
-			r := HarnessRow{
-				Name:           mf.Name,
-				HumanLabel:     mf.HumanLabel,
-				Family:         mf.Family,
-				ContractABI:    mf.ContractABI,
-				Caps:           mf.Caps,
-				Drives:         dedupProtocols(mf.Caps.Drives),
-				DrivesHosts:    dedupHosts(mf.Caps.DrivesHosts),
-				PromptDelivery: append([]agent.PromptDeliveryProfile(nil), mf.PromptDelivery...),
-			}
-			byName[mf.Name] = &r
-			continue
+		if _, duplicate := byName[mf.Name]; duplicate {
+			return nil, nil, fmt.Errorf("harvest: duplicate harness id %q", mf.Name)
 		}
-		// Merge a second package into the same harness id (the raw case).
-		row.Drives = dedupProtocols(append(row.Drives, mf.Caps.Drives...))
-		row.DrivesHosts = dedupHosts(append(row.DrivesHosts, mf.Caps.DrivesHosts...))
-		row.Caps.Drives = row.Drives
-		row.Caps.DrivesHosts = row.DrivesHosts
-		row.Caps = unionCaps(row.Caps, mf.Caps)
-		row.PromptDelivery = mergePromptDelivery(row.PromptDelivery, mf.PromptDelivery)
+		r := HarnessRow{
+			Name:           mf.Name,
+			HumanLabel:     mf.HumanLabel,
+			Family:         mf.Family,
+			ContractABI:    mf.ContractABI,
+			Caps:           mf.Caps,
+			Drives:         dedupProtocols(mf.Caps.Drives),
+			DrivesHosts:    dedupHosts(mf.Caps.DrivesHosts),
+			PromptDelivery: append([]agent.PromptDeliveryProfile(nil), mf.PromptDelivery...),
+			ToolLifecycle:  append([]agent.ToolLifecycleProfile(nil), mf.ToolLifecycle...),
+		}
+		byName[mf.Name] = &r
 	}
 
 	rows := make([]HarnessRow, 0, len(byName))
 	out := map[agent.HarnessName]HarnessRow{}
 	for _, r := range byName {
-		// Ensure the row's Caps.Drives/Hosts mirror the merged union.
+		// Keep the flattened fields and Caps projection byte-identical.
 		r.Caps.Drives = r.Drives
 		r.Caps.DrivesHosts = r.DrivesHosts
 		sort.Slice(r.PromptDelivery, func(i, j int) bool { return r.PromptDelivery[i].ID < r.PromptDelivery[j].ID })
+		sort.Slice(r.ToolLifecycle, func(i, j int) bool { return r.ToolLifecycle[i].ID < r.ToolLifecycle[j].ID })
 		rows = append(rows, *r)
 		out[r.Name] = *r
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 	return rows, out, nil
-}
-
-func mergePromptDelivery(existing, incoming []agent.PromptDeliveryProfile) []agent.PromptDeliveryProfile {
-	out := append([]agent.PromptDeliveryProfile(nil), existing...)
-	seen := make(map[string]bool, len(out))
-	for _, profile := range out {
-		seen[profile.ID] = true
-	}
-	for _, profile := range incoming {
-		if !seen[profile.ID] {
-			out = append(out, profile)
-			seen[profile.ID] = true
-		}
-	}
-	return out
 }
 
 // buildEndpoints harvests the endpoint manifests into sorted rows + a lookup.
@@ -444,30 +425,6 @@ func dedupHosts(in []agent.ServingHost) []agent.ServingHost {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
-}
-
-// unionCaps OR-merges the agent-loop bools of two harness caps (the raw merge).
-// Drives/DrivesHosts are merged separately by the caller. ToolPermissionFormat
-// / StreamingTransport keep the first non-empty value (a's), since the two raw
-// packages declare the same family-level framing intent.
-func unionCaps(a, b agent.HarnessCaps) agent.HarnessCaps {
-	out := a
-	out.SupportsMessageInjection = a.SupportsMessageInjection || b.SupportsMessageInjection
-	out.SupportsSessionResume = a.SupportsSessionResume || b.SupportsSessionResume
-	out.SupportsToolPlugins = a.SupportsToolPlugins || b.SupportsToolPlugins
-	out.AcceptsMcpServerSpec = a.AcceptsMcpServerSpec || b.AcceptsMcpServerSpec
-	out.AcceptsAllowedToolsList = a.AcceptsAllowedToolsList || b.AcceptsAllowedToolsList
-	out.EmitsSubagentEvents = a.EmitsSubagentEvents || b.EmitsSubagentEvents
-	out.SupportsReasoningEffort = a.SupportsReasoningEffort || b.SupportsReasoningEffort
-	out.SupportsOneShot = a.SupportsOneShot || b.SupportsOneShot
-	out.NativeJSONMode = a.NativeJSONMode || b.NativeJSONMode
-	if out.ToolPermissionFormat == "" {
-		out.ToolPermissionFormat = b.ToolPermissionFormat
-	}
-	if out.StreamingTransport == "" {
-		out.StreamingTransport = b.StreamingTransport
-	}
 	return out
 }
 

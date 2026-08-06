@@ -86,6 +86,34 @@ func TestApprovalBridge_AllowPatternsOnlyMatchAccepted(t *testing.T) {
 	}
 }
 
+func TestApprovalBridge_ClaudeGrammarMapsCommandsAndFiles(t *testing.T) {
+	t.Parallel()
+	br := NewApprovalBridge(&agent.PermissionConfig{
+		AllowPatterns:    []string{"Bash(git:*)", "Edit"},
+		DisallowPatterns: []string{"Bash(git push:*)"},
+	})
+	if got := br.Evaluate(ApprovalRequest{Kind: ApprovalKindCommand, Command: "git status"}).Action; got != ActionAcceptForSession {
+		t.Errorf("git status = %s, want accept", got)
+	}
+	if got := br.Evaluate(ApprovalRequest{Kind: ApprovalKindCommand, Command: "git push origin main"}).Action; got != ActionDecline {
+		t.Errorf("git push = %s, want decline", got)
+	}
+	if got := br.Evaluate(ApprovalRequest{Kind: ApprovalKindCommand, Command: "gitty status"}).Action; got != ActionDecline {
+		t.Errorf("gitty status = %s, want decline (token boundary)", got)
+	}
+	if got := br.Evaluate(ApprovalRequest{Kind: ApprovalKindFileChange, Path: "/tmp/wt/a", Cwd: "/tmp/wt"}).Action; got != ActionAcceptForSession {
+		t.Errorf("file edit = %s, want accept", got)
+	}
+}
+
+func TestApprovalBridge_FileAllowlistFailsClosedWithoutEdit(t *testing.T) {
+	t.Parallel()
+	br := NewApprovalBridge(&agent.PermissionConfig{AllowPatterns: []string{"Bash(git:*)"}})
+	if got := br.Evaluate(ApprovalRequest{Kind: ApprovalKindFileChange, Path: "/tmp/wt/a", Cwd: "/tmp/wt"}).Action; got != ActionDecline {
+		t.Errorf("unlisted file edit = %s, want decline", got)
+	}
+}
+
 func TestApprovalBridge_DefaultDecisionDeny(t *testing.T) {
 	t.Parallel()
 	cfg := &agent.PermissionConfig{DefaultDecision: "deny"}
@@ -145,16 +173,16 @@ func TestApprovalBridge_GitDirectoryBlocked(t *testing.T) {
 	}
 }
 
-func TestApprovalBridge_UnknownKindAcceptsToAvoidHang(t *testing.T) {
+func TestApprovalBridge_UnknownKindFailsClosedWithPolicy(t *testing.T) {
 	t.Parallel()
-	br := NewApprovalBridge(nil)
+	br := NewApprovalBridge(&agent.PermissionConfig{DefaultDecision: "allow"})
 	d := br.Evaluate(ApprovalRequest{Kind: ApprovalKindUnknown})
-	if d.Action != ActionAcceptForSession {
-		t.Fatalf("expected acceptForSession to avoid codex hang, got %s", d.Action)
+	if d.Action != ActionDecline {
+		t.Fatalf("expected decline for unknown policy shape, got %s", d.Action)
 	}
 }
 
-func TestApprovalBridge_BadRegexPatternIsSilentlyDropped(t *testing.T) {
+func TestApprovalBridge_BadRegexPatternDoesNotCrashDirectConstruction(t *testing.T) {
 	t.Parallel()
 	cfg := &agent.PermissionConfig{
 		AllowPatterns: []string{`(`, `^echo\s`},

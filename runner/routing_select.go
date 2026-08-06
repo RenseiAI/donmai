@@ -67,6 +67,13 @@ type routingSelectResponse struct {
 // returns ("", false) so the caller keeps the statically-resolved provider.
 // It never returns an error: a routing-store blip must never affect the run.
 func (r *Runner) selectProviderByPosterior(parentCtx context.Context, qw QueuedWork) (string, bool) {
+	// An explicit harness has already fixed the loop driver. Defense-in-depth:
+	// never make the network request even if a future caller invokes this helper
+	// outside resolveHarnessSelection.
+	if qw.ResolvedProfile.Harness != "" {
+		return "", false
+	}
+
 	// Local DARK gate (default OFF). The platform flag is authoritative; this
 	// just avoids a needless round-trip when nobody opted in.
 	if os.Getenv("ROUTING_SELECTOR_ENABLED") != "true" {

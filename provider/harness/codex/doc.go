@@ -28,7 +28,7 @@
 //   - SupportsMessageInjection : false (Codex CLI lacks mid-session
 //     user-message injection per legacy TS comment)
 //   - SupportsSessionResume    : true (thread/resume)
-//   - SupportsToolPlugins      : true (config/batchWrite mcpServers)
+//   - SupportsToolPlugins      : true (isolated config/batchWrite mcp_servers)
 //   - NeedsBaseInstructions    : true (thread/start.baseInstructions)
 //   - NeedsPermissionConfig    : true (approval bridge consumes it)
 //   - SupportsCodeIntelligenceEnforcement : false (no canUseTool callback)
@@ -64,12 +64,13 @@
 //
 // # MCP servers
 //
-// Stdio MCP server configs from Spec.MCPServers are pushed to the
-// app-server via JSON-RPC `config/batchWrite` immediately after the
-// initialize handshake (the legacy TS calls this once per process and
-// caches with mcpConfigured). The app-server's own subprocess machinery
-// then runs each MCP server as a child of the app-server, not of this
-// provider; the provider just hands it the configs.
+// Each Provider owns an isolated CODEX_HOME and never targets the operator's
+// persistent config or auth files. Before thread/start or thread/resume, the
+// exact Spec.MCPServers set is written to the owned config.toml via
+// config/batchWrite and proved active via config/read at the session cwd.
+// Equal concurrent sets share a lease; incompatible live sets are denied; the
+// final release clears and re-verifies the set. Application or cleanup failure
+// is a hard typed denial, never a session-without-tools soft fallback.
 //
 // # Failure modes (F.1.1 §5)
 //

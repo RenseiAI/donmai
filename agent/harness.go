@@ -1,6 +1,9 @@
 package agent
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // This file declares Family A — the harness (loop-driver) family — for the
 // two-axis provider model (Phase 1). It is purely additive: HarnessProvider
@@ -17,13 +20,21 @@ type HarnessName string
 
 // HarnessName constants name each loop-driver identity.
 const (
-	HarnessClaudeCode  HarnessName = "claude-code"
-	HarnessCodex       HarnessName = "codex"
-	HarnessOpenCode    HarnessName = "opencode"
-	HarnessAntigravity HarnessName = "antigravity"
-	HarnessAmp         HarnessName = "amp"
-	HarnessRaw         HarnessName = "raw" // in-box net/http loop (gemini-direct + ollama)
-	HarnessStub        HarnessName = "stub"
+	HarnessClaudeCode   HarnessName = "claude-code"
+	HarnessCodex        HarnessName = "codex"
+	HarnessOpenCode     HarnessName = "opencode"
+	HarnessAntigravity  HarnessName = "antigravity"
+	HarnessAmp          HarnessName = "amp"
+	HarnessGeminiDirect HarnessName = "gemini-direct" // in-box Gemini generateContent loop
+	HarnessOllama       HarnessName = "ollama"        // in-box Ollama /api/chat loop
+	// HarnessRaw is the deprecated pre-split wire token for the two in-box
+	// net/http loops. It is accepted only by the runner's explicit compatibility
+	// adapter when Provider disambiguates gemini versus ollama; no manifest or
+	// execution cell may use it as a canonical identity.
+	//
+	// Deprecated: use HarnessGeminiDirect or HarnessOllama.
+	HarnessRaw  HarnessName = "raw"
+	HarnessStub HarnessName = "stub"
 	// HarnessPi is the pi harness (provider/harness/pi): a `pi --mode rpc`
 	// JSONL-over-stdio subprocess, one child per session. pi ships no
 	// permission system, so the trust boundary (built-in-tool overrides +
@@ -87,6 +98,50 @@ type HarnessManifest struct {
 	ContractABI    string                  `json:"contractAbi"` // "harness/v2"
 	Caps           HarnessCaps             `json:"capabilities"`
 	PromptDelivery []PromptDeliveryProfile `json:"promptDelivery"`
+	ToolLifecycle  []ToolLifecycleProfile  `json:"toolLifecycle"`
+}
+
+// SpecAdmissionDenialCode classifies a typed denial of a requested Spec
+// capability before the harness creates any provider-side resource.
+type SpecAdmissionDenialCode string
+
+// SpecDenialCapabilityUnsupported identifies a stable capability denial across
+// harness implementations.
+const SpecDenialCapabilityUnsupported SpecAdmissionDenialCode = "capability_unsupported"
+
+// SpecAdmissionError identifies the exact unsupported field. It deliberately
+// carries no field value: model names, endpoint data, and prompt content must
+// not leak through an admission error.
+type SpecAdmissionError struct {
+	Code   SpecAdmissionDenialCode
+	Field  string
+	Detail string
+}
+
+func (e *SpecAdmissionError) Error() string {
+	return fmt.Sprintf("spec admission denied (%s, field=%s): %s", e.Code, e.Field, e.Detail)
+}
+
+// ValidateSpecCapabilities rejects flat Spec fields whose exact selected
+// harness manifest does not support them. Structured prompt and tool fields
+// are validated separately by their receipted adapters, where explicit caller
+// downgrade policies can be applied and recorded.
+func ValidateSpecCapabilities(spec Spec, manifest HarnessManifest) error {
+	if spec.Effort != "" && !manifest.Caps.SupportsReasoningEffort {
+		return &SpecAdmissionError{
+			Code:   SpecDenialCapabilityUnsupported,
+			Field:  "effort",
+			Detail: "the exact selected harness does not support reasoning effort",
+		}
+	}
+	if spec.Interactive != nil && !manifest.Caps.SupportsInteractivePTY {
+		return &SpecAdmissionError{
+			Code:   SpecDenialCapabilityUnsupported,
+			Field:  "interactive",
+			Detail: "the exact selected harness does not support interactive PTY sessions",
+		}
+	}
+	return nil
 }
 
 // Base projects the harness manifest onto the family-agnostic ProviderBase

@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +38,11 @@ const EnvEndpoint = "OPENCODE_ENDPOINT"
 // future hosted variants; not required for the default localhost
 // server.
 const EnvAPIKey = "OPENCODE_API_KEY" //nolint:gosec // G101: env-var name, not a credential
+
+// errExternalAttachConfigUnproven is returned before adaptation/session side
+// effects when an attached server would need a project config that this
+// Provider instance cannot prove is active.
+var errExternalAttachConfigUnproven = errors.New("opencode external attach project config is not provider-owned")
 
 // DefaultProbeTimeout caps the probe HTTP GET at construction when
 // not in CLI-binary mode.
@@ -111,6 +115,10 @@ type Options struct {
 	// a resolved endpoint. Defaults to newClientV1. Tests inject a stub to
 	// exercise the handle against an httptest server without a real child.
 	ServerClientFactory func(endpoint, apiKey string) serverClient
+
+	// configTempDir is a test seam for the binary-backed config boundary.
+	// Production always uses the resolved system temp directory.
+	configTempDir string
 }
 
 // Provider is the agent.Provider implementation for OpenCode.
@@ -142,27 +150,45 @@ type Provider struct {
 	// clientFactory builds a Lane-B serverClient for a resolved endpoint.
 	clientFactory func(endpoint, apiKey string) serverClient
 
-	// children tracks live serve children so Shutdown can sweep any that
-	// outlived their handle (07 §9). Guarded by mu.
-	mu       sync.Mutex
-	children map[*serveChild]struct{}
+	// resources tracks each provider-owned Lane-B child together with its
+	// isolated config. Registration happens before process start so Shutdown
+	// cannot miss an in-flight spawn. Guarded by mu.
+	mu            sync.Mutex
+	resources     map[*openCodeServerResource]struct{}
+	shuttingDown  bool
+	configTempDir string
 }
 
-// registerChild records a live serve child for Shutdown sweeping.
-func (p *Provider) registerChild(c *serveChild) {
+func (p *Provider) registerResource(resource *openCodeServerResource) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.children == nil {
-		p.children = make(map[*serveChild]struct{})
+	if p.shuttingDown {
+		return errOpenCodeShutdown
 	}
-	p.children[c] = struct{}{}
+	if p.resources == nil {
+		p.resources = make(map[*openCodeServerResource]struct{})
+	}
+	p.resources[resource] = struct{}{}
+	return nil
 }
 
-// unregisterChild drops a serve child once its handle has torn it down.
-func (p *Provider) unregisterChild(c *serveChild) {
+func (p *Provider) releaseResource(resource *openCodeServerResource) error {
+	err := resource.close()
+	p.mu.Lock()
+	if err == nil {
+		delete(p.resources, resource)
+	}
+	p.mu.Unlock()
+	return err
+}
+
+func (p *Provider) checkOpen() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.children, c)
+	if p.shuttingDown {
+		return errOpenCodeShutdown
+	}
+	return nil
 }
 
 // newServerClient builds a Lane-B serverClient, honoring an injected factory.
@@ -227,6 +253,7 @@ func New(opts Options) (*Provider, error) {
 			versionUnverified: unverified,
 			preferServer:      opts.PreferServer,
 			clientFactory:     opts.ServerClientFactory,
+			configTempDir:     opts.configTempDir,
 		}, nil
 	}
 
@@ -258,6 +285,7 @@ func New(opts Options) (*Provider, error) {
 		apiKey:        apiKey,
 		preferServer:  opts.PreferServer,
 		clientFactory: opts.ServerClientFactory,
+		configTempDir: opts.configTempDir,
 	}, nil
 }
 
@@ -301,21 +329,41 @@ func (*Provider) Capabilities() agent.Capabilities {
 		EmitsSubagentEvents:                 false,
 		SupportsReasoningEffort:             true, // --variant flag maps to effort levels
 		ToolPermissionFormat:                "claude",
-		AcceptsAllowedToolsList:             true,  // Lane B: projected into opencode.json permission map (07 §5.2)
-		AcceptsMcpServerSpec:                false, // §5.3 MCP injection is implemented (config.go) but the cap waits on the AcceptsMcpServerSpec→SupportsToolPlugins invariant (manifest.go)
+		AcceptsAllowedToolsList:             true, // projected into the owned opencode.json permission map (07 §5.2)
+		AcceptsMcpServerSpec:                true, // §5.3 owned per-session MCP config is independent of OpenCode plugin support.
 		HumanLabel:                          "OpenCode",
 	}
+}
+
+// launchManifest narrows the static provider manifest to the delivery
+// boundary this Provider instance actually owns. An attached external server
+// has its own project config; writing a local opencode.json does not activate
+// it there. Mark project-config-backed channels unsupported so PrepareHarness
+// persists a typed denial before any external session or prompt side effect.
+func (p *Provider) launchManifest() agent.HarnessManifest {
+	manifest := p.Manifest()
+	if p.binary != "" {
+		return manifest
+	}
+	for i := range manifest.ToolLifecycle {
+		profile := &manifest.ToolLifecycle[i]
+		profile.MCPDelivery = agent.ToolDeliveryUnsupported
+		profile.NativeToolPolicyDelivery = agent.ToolDeliveryUnsupported
+		profile.PermissionConfigDelivery = agent.ToolDeliveryUnsupported
+		profile.MCPToolPolicyDelivery = agent.ToolDeliveryUnsupported
+	}
+	return manifest
 }
 
 // Spawn starts a new OpenCode session, selecting a lane (07 §2):
 //
 //   - Lane A — one-shot CLI (`opencode run --format json`): the default for a
-//     simple fire-and-forget spawn. cwd via cmd.Dir, prompt on stdin, NDJSON
-//     events mapped by mapOpenCodeLine.
+//     binary-backed fire-and-forget spawn. cwd via --dir plus cmd.Dir, prompt on stdin,
+//     NDJSON events mapped by mapOpenCodeLine, and any endpoint/tool/MCP policy
+//     delivered through the same owned temporary config boundary as Lane B.
 //   - Lane B — serve/HTTP (`opencode serve` + REST/SSE): chosen when the
-//     session needs injection / resume / permission mediation / MCP wiring, or
-//     when the operator forces it (Options.PreferServer), or when no binary is
-//     present and only an endpoint is reachable (attach mode).
+//     operator explicitly requests it (Options.PreferServer), or when no
+//     binary is present and only an endpoint is reachable (attach mode).
 //
 // Endpoint routing (07 §9) is applied to both lanes first: a resolved
 // Spec.Endpoint whose company/host this harness cannot drive fails loudly.
@@ -323,8 +371,14 @@ func (*Provider) Capabilities() agent.Capabilities {
 // On any pre-spawn failure the provider returns an error wrapping
 // agent.ErrSpawnFailed.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	if err := p.checkOpen(); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	if err := p.validateLaunchAuthority(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	var err error
-	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.launchManifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
@@ -345,39 +399,69 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	return h, nil
 }
 
-// useServerLane decides Lane B vs Lane A.
-//
-// DRIFT NOTE (code wins over design §2): 07 §2 lists a bare "!Spec.Autonomous"
-// as a Lane-B trigger. Routing every non-autonomous spawn to Lane B would send
-// simple one-shot specs (Autonomous defaults to false) to the server lane and
-// change long-standing Lane-A one-shot behavior. Instead Lane B triggers on a
-// POSITIVE need signal — an explicit PreferServer, an MCP whitelist, a
-// non-allow permission default (live mediation), or attach-mode (no binary).
-// A runner that intends to Inject/Resume requests the server lane via
-// PreferServer (or by supplying MCP/permission config); the caps advertise the
-// support, this picks the lane that backs it.
-func (p *Provider) useServerLane(spec agent.Spec) bool {
+// validateLaunchAuthority rejects endpoint binding on external attach. The
+// endpoint's base URL, credential indirection, model pin, and provider lockout
+// are all delivered through opencode.json; an attached server does not read
+// the local file. Tool/MCP policy fields are rejected separately by
+// launchManifest so their denial receipt keeps the precise lifecycle channel.
+func (p *Provider) validateLaunchAuthority(spec agent.Spec) error {
+	if p.binary == "" && spec.Endpoint != nil {
+		return fmt.Errorf("%w: cannot prove Spec.Endpoint is active on the attached server", errExternalAttachConfigUnproven)
+	}
+	return nil
+}
+
+// useServerLane decides Lane B vs Lane A. The pinned binary's v2 server can
+// list custom OpenAI-compatible models but its SessionRunner cannot resolve
+// them, while `opencode run` executes the same owned config successfully.
+// Project-config-bearing one-shot work therefore stays on Lane A; only an
+// explicit server request or attach-only provider selects Lane B.
+func (p *Provider) useServerLane(_ agent.Spec) bool {
 	if p.binary == "" {
 		return true // attach mode: only Lane B can serve
 	}
-	if p.preferServer {
-		return true
-	}
-	if len(spec.MCPServers) > 0 {
-		return true
-	}
-	if pc := spec.PermissionConfig; pc != nil {
-		d := strings.ToLower(pc.DefaultDecision)
-		if d != "" && d != "allow" {
-			return true // needs live permission round-trips
-		}
-	}
-	return false
+	return p.preferServer
+}
+
+// requiresProjectConfig reports whether a spec carries any input that this
+// adapter must deliver through its session-scoped opencode.json. Both owned
+// binary lanes set OPENCODE_CONFIG when this returns true.
+func requiresProjectConfig(spec agent.Spec) bool {
+	return spec.Endpoint != nil ||
+		len(spec.AllowedTools) > 0 ||
+		len(spec.DisallowedTools) > 0 ||
+		spec.PermissionConfig != nil ||
+		len(spec.MCPServers) > 0 ||
+		len(spec.MCPToolNames) > 0
 }
 
 // spawnCLI starts `opencode run --format json` as a subprocess and
 // returns a Handle backed by the running process.
 func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHandle, error) {
+	var boundary *openCodeConfigBoundary
+	if requiresProjectConfig(spec) {
+		var err error
+		boundary, err = newOpenCodeConfigBoundary(p.configTempDir, spec)
+		if err != nil {
+			return nil, fmt.Errorf("%w: create owned opencode config: %v", agent.ErrSpawnFailed, err)
+		}
+		if err := boundary.validate(); err != nil {
+			cleanupErr := boundary.remove()
+			return nil, errors.Join(fmt.Errorf("%w: validate owned opencode config: %v", agent.ErrSpawnFailed, err), cleanupErr)
+		}
+		env := make(map[string]string, len(spec.Env)+1)
+		for key, value := range spec.Env {
+			env[key] = value
+		}
+		env[OCConfigEnvVar] = boundary.configPath
+		spec.Env = env
+	}
+	fail := func(primary error) (*openCodeHandle, error) {
+		if boundary == nil {
+			return nil, primary
+		}
+		return nil, errors.Join(primary, boundary.remove())
+	}
 	argv := buildOpenCodeArgs(spec)
 
 	// nolint:gosec // p.binary is resolved at provider construction
@@ -387,7 +471,11 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 	if spec.Cwd != "" {
 		cmd.Dir = spec.Cwd
 	}
-	cmd.Env = composeEnv(os.Environ(), spec.Env)
+	parentEnv := os.Environ()
+	if spec.Endpoint != nil {
+		parentEnv = filterEndpointControls(parentEnv)
+	}
+	cmd.Env = composeEnv(parentEnv, spec.Env)
 	configureProcessGroup(cmd)
 	cmd.Cancel = func() error {
 		signalProcessGroup(cmd, syscall.SIGKILL)
@@ -396,25 +484,25 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, fmt.Errorf("%w: stdin pipe: %v", agent.ErrSpawnFailed, err)
+		return fail(fmt.Errorf("%w: stdin pipe: %v", agent.ErrSpawnFailed, err))
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = stdin.Close()
-		return nil, fmt.Errorf("%w: stdout pipe: %v", agent.ErrSpawnFailed, err)
+		return fail(fmt.Errorf("%w: stdout pipe: %v", agent.ErrSpawnFailed, err))
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
-		return nil, fmt.Errorf("%w: stderr pipe: %v", agent.ErrSpawnFailed, err)
+		return fail(fmt.Errorf("%w: stderr pipe: %v", agent.ErrSpawnFailed, err))
 	}
 
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()
-		return nil, fmt.Errorf("%w: cmd start: %v", agent.ErrSpawnFailed, err)
+		return fail(fmt.Errorf("%w: cmd start: %v", agent.ErrSpawnFailed, err))
 	}
 
 	if spec.OnProcessSpawned != nil && cmd.Process != nil {
@@ -434,6 +522,9 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 		stderrBuf:  stderrBuf,
 		shutdown:   make(chan struct{}),
 		done:       make(chan struct{}),
+	}
+	if boundary != nil {
+		h.releaseOwned = boundary.remove
 	}
 
 	if p.versionUnverified {
@@ -476,22 +567,27 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 //	--variant <v>  → provider-specific reasoning effort (e.g. high, max,
 //	                 minimal); maps Spec.Effort.
 //
-// The working directory is NOT passed as a `--dir` flag: `--dir` targets
-// a remote server when attaching, whereas a locally spawned `opencode
-// run` inherits its cwd from cmd.Dir (set in spawnCLI from Spec.Cwd).
+// The working directory is delivered through both `--dir` and cmd.Dir.
+// OpenCode consults the inherited PWD when `--dir` is absent, and Go does not
+// rewrite PWD when exec.Cmd.Dir is set. The explicit flag therefore prevents a
+// stale parent PWD from selecting a different project while cmd.Dir preserves
+// the operating-system process boundary.
 // The prompt is delivered via stdin.
 func buildOpenCodeArgs(spec agent.Spec) []string {
 	argv := []string{
 		"run",
 		"--format", "json",
 	}
+	if spec.Cwd != "" {
+		argv = append(argv, "--dir", spec.Cwd)
+	}
 
 	if spec.Autonomous {
 		argv = append(argv, "--auto")
 	}
 
-	if spec.Model != "" {
-		argv = append(argv, "--model", spec.Model)
+	if model := openCodeModel(spec); model != "" {
+		argv = append(argv, "--model", model)
 	}
 
 	if spec.Effort != "" {
@@ -501,23 +597,67 @@ func buildOpenCodeArgs(spec agent.Spec) []string {
 	return argv
 }
 
+func openCodeModel(spec agent.Spec) string {
+	if spec.Endpoint != nil {
+		return OCProviderID + "/" + spec.Endpoint.Model
+	}
+	return spec.Model
+}
+
+func filterEndpointControls(entries []string) []string {
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		if isEndpointControlEnv(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 // spawnServer runs the Lane-B path: render + inject the per-session
 // opencode.json, bring up (or attach to) a serve endpoint, create-or-resume the
 // session, subscribe to events, admit the prompt, and return a live handle.
 // resumeSessionID is empty for a fresh spawn and set for Resume.
 func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessionID string) (agent.Handle, error) {
-	dir, err := configDir(spec)
-	if err != nil {
-		return nil, fmt.Errorf("%w: opencode config dir: %v", agent.ErrSpawnFailed, err)
+	var configPath string
+	var resource *openCodeServerResource
+	if p.binary != "" {
+		boundary, err := newOpenCodeConfigBoundary(p.configTempDir, spec)
+		if err != nil {
+			return nil, fmt.Errorf("%w: create owned opencode config: %v", agent.ErrSpawnFailed, err)
+		}
+		resource = &openCodeServerResource{config: boundary}
+		if err := p.registerResource(resource); err != nil {
+			cleanupErr := resource.close()
+			return nil, errors.Join(fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err), cleanupErr)
+		}
+		configPath = boundary.configPath
 	}
-	configPath, err := writeConfig(dir, spec)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	fail := func(primary error) (agent.Handle, error) {
+		if resource == nil {
+			return nil, primary
+		}
+		return nil, errors.Join(primary, p.releaseResource(resource))
+	}
+	if resource != nil {
+		if err := resource.config.validate(); err != nil {
+			return fail(fmt.Errorf("%w: validate owned opencode config: %v", agent.ErrSpawnFailed, err))
+		}
 	}
 
 	child, endpoint, err := p.bringUpServer(ctx, spec, configPath)
 	if err != nil {
-		return nil, err
+		return fail(err)
+	}
+	if resource != nil {
+		if err := resource.attachChild(child); err != nil {
+			return fail(fmt.Errorf("%w: attach owned opencode child: %v", agent.ErrSpawnFailed, err))
+		}
 	}
 
 	client := p.newServerClient(endpoint, p.apiKey)
@@ -529,24 +669,21 @@ func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessi
 			Location: locationRef{Directory: spec.Cwd},
 		})
 		if err != nil {
-			p.teardownChild(child)
-			return nil, fmt.Errorf("%w: create opencode session: %v", agent.ErrSpawnFailed, err)
+			return fail(fmt.Errorf("%w: create opencode session: %v", agent.ErrSpawnFailed, err))
 		}
 	}
 
 	logger := slog.With("provider", "opencode", "lane", "server", "session", sessionID)
 	h := newServerHandle(child, client, sessionID, spec, logger)
-	if child != nil {
-		c := child
-		h.onClose = func() { p.unregisterChild(c) }
+	if resource != nil {
+		h.releaseOwned = func() error { return p.releaseResource(resource) }
 	}
 
 	// Subscribe to the event feed BEFORE admitting the prompt so no post-prompt
 	// frame is missed (the mapper synthesizes InitEvent from the first
 	// in-session frame regardless of ordering).
 	if err := h.start(ctx); err != nil {
-		p.teardownChild(child)
-		return nil, err
+		return fail(err)
 	}
 
 	if p.versionUnverified {
@@ -563,9 +700,9 @@ func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessi
 		req := promptReq{Prompt: promptInput{Text: spec.Prompt}, Delivery: "steer", Resume: resumeSessionID != ""}
 		if err := client.Prompt(ctx, sessionID, req); err != nil {
 			stopCtx, cancel := context.WithTimeout(context.Background(), stopGracePeriod)
-			_ = h.Stop(stopCtx)
+			cleanupErr := h.Stop(stopCtx)
 			cancel()
-			return nil, fmt.Errorf("%w: admit opencode prompt: %v", agent.ErrSpawnFailed, err)
+			return nil, errors.Join(fmt.Errorf("%w: admit opencode prompt: %v", agent.ErrSpawnFailed, err), cleanupErr)
 		}
 	}
 	return h, nil
@@ -583,36 +720,18 @@ func (p *Provider) bringUpServer(ctx context.Context, spec agent.Spec, configPat
 		return nil, p.endpoint, nil
 	}
 	child, err := startServe(ctx, serveConfig{
-		binary:     p.binary,
-		cwd:        spec.Cwd,
-		configPath: configPath,
-		env:        spec.Env,
-		apiKey:     p.apiKey,
-		logger:     slog.Default(),
+		binary:        p.binary,
+		cwd:           spec.Cwd,
+		configPath:    configPath,
+		env:           spec.Env,
+		endpointBound: spec.Endpoint != nil,
+		apiKey:        p.apiKey,
+		logger:        slog.Default(),
 	})
 	if err != nil {
 		return nil, "", err
 	}
-	p.registerChild(child)
 	return child, child.endpoint, nil
-}
-
-func (p *Provider) teardownChild(child *serveChild) {
-	if child == nil {
-		return
-	}
-	child.stop()
-	p.unregisterChild(child)
-}
-
-// configDir returns the directory the session opencode.json is written to: a
-// worktree-local .donmai-opencode dir (removed by the runner's normal worktree
-// lifecycle, 07 §6) or a temp dir when the spec has no cwd (attach-mode tests).
-func configDir(spec agent.Spec) (string, error) {
-	if spec.Cwd != "" {
-		return filepath.Join(spec.Cwd, ".donmai-opencode"), nil
-	}
-	return os.MkdirTemp("", "donmai-opencode-")
 }
 
 // Resume reattaches to a persisted opencode session (Lane B). In attach mode it
@@ -622,8 +741,14 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if sessionID == "" {
 		return nil, fmt.Errorf("provider/opencode: Resume: empty session id: %w", agent.ErrUnsupported)
 	}
+	if err := p.checkOpen(); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	if err := p.validateLaunchAuthority(spec); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	var err error
-	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.launchManifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
@@ -634,37 +759,41 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	return p.spawnServer(ctx, spec, sessionID)
 }
 
-// Shutdown sweeps any serve children that outlived their handle (Lane B). Lane
-// A holds no long-lived resources, so this is a no-op when only CLI sessions
-// ran.
+// Shutdown sweeps every registered Lane-B child and owned config, including
+// resources registered by a spawn that is still in flight.
 func (p *Provider) Shutdown(_ context.Context) error {
 	p.mu.Lock()
-	children := make([]*serveChild, 0, len(p.children))
-	for c := range p.children {
-		children = append(children, c)
+	p.shuttingDown = true
+	resources := make([]*openCodeServerResource, 0, len(p.resources))
+	for resource := range p.resources {
+		resources = append(resources, resource)
 	}
-	p.children = nil
 	p.mu.Unlock()
-	for _, c := range children {
-		c.stop()
+	var cleanupErr error
+	for _, resource := range resources {
+		cleanupErr = errors.Join(cleanupErr, p.releaseResource(resource))
 	}
-	return nil
+	return cleanupErr
 }
 
 // openCodeHandle is the agent.Handle implementation backed by an
 // `opencode run` subprocess.
 type openCodeHandle struct {
-	binary     string
-	cwd        string
-	cmd        *exec.Cmd
-	events     chan agent.Event
-	logger     *slog.Logger
-	stdoutPipe io.ReadCloser
-	stderrPipe io.ReadCloser
-	stderrBuf  *boundedBuffer
+	binary       string
+	cwd          string
+	cmd          *exec.Cmd
+	events       chan agent.Event
+	logger       *slog.Logger
+	stdoutPipe   io.ReadCloser
+	stderrPipe   io.ReadCloser
+	stderrBuf    *boundedBuffer
+	releaseOwned func() error
+	cleanupOnce  sync.Once
+	cleanupErr   error
 
 	// sessionID captured from the first step_start event.
 	sessionID atomic.Pointer[string]
+	initSent  atomic.Bool
 
 	stopOnce sync.Once
 	stopErr  error
@@ -712,7 +841,7 @@ func (h *openCodeHandle) doStop(ctx context.Context) error {
 
 	select {
 	case <-h.done:
-		return nil
+		return h.cleanupOwned()
 	default:
 	}
 
@@ -736,7 +865,16 @@ func (h *openCodeHandle) doStop(ctx context.Context) error {
 		}
 		<-h.done
 	}
-	return nil
+	return h.cleanupOwned()
+}
+
+func (h *openCodeHandle) cleanupOwned() error {
+	h.cleanupOnce.Do(func() {
+		if h.releaseOwned != nil {
+			h.cleanupErr = h.releaseOwned()
+		}
+	})
+	return h.cleanupErr
 }
 
 func (h *openCodeHandle) sendEvent(ev agent.Event) {
@@ -780,6 +918,11 @@ func (h *openCodeHandle) watchCtx(ctx context.Context) {
 func (h *openCodeHandle) readStdout() {
 	defer close(h.done)
 	defer func() {
+		if err := h.cleanupOwned(); err != nil {
+			h.logger.Warn("provider/opencode: clean owned config after child exit", "err", err)
+		}
+	}()
+	defer func() {
 		err := h.cmd.Wait()
 		if err != nil {
 			h.waitErr.Store(&err)
@@ -812,10 +955,17 @@ func (h *openCodeHandle) readStdout() {
 			if ev == nil {
 				continue
 			}
-			// Capture session ID from the first InitEvent that carries it.
-			if typed, ok := ev.(agent.InitEvent); ok && typed.SessionID != "" {
-				id := typed.SessionID
-				h.sessionID.Store(&id)
+			// OpenCode emits step_start for every model/tool step. The provider
+			// contract permits exactly one InitEvent per run, so capture and
+			// forward only the first one.
+			if typed, ok := ev.(agent.InitEvent); ok {
+				if !h.initSent.CompareAndSwap(false, true) {
+					continue
+				}
+				if typed.SessionID != "" {
+					id := typed.SessionID
+					h.sessionID.Store(&id)
+				}
 			}
 			// A ResultEvent is the provider-contract terminal event
 			// (agent/provider.go): once it is emitted the session is
@@ -897,16 +1047,6 @@ type tokens struct {
 	Input  int64 `json:"input"`
 	Output int64 `json:"output"`
 }
-
-// initSent tracks per-session whether we have emitted a synthetic
-// InitEvent for this handle. Since mapOpenCodeLine is a package-level
-// function (not a method), the openCodeHandle itself injects this via
-// a closure in readStdout.
-//
-// Because mapOpenCodeLine is stateless (it doesn't know about the
-// handle), we track the session-id-seen flag in the readStdout caller
-// and emit InitEvent inline there instead. The function returns a
-// sentinel initSentinel type that readStdout recognises.
 
 // mapOpenCodeLine decodes one NDJSON line from `opencode run --format json`
 // and returns the corresponding agent.Event slice.

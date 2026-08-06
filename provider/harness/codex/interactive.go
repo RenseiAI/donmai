@@ -2,11 +2,17 @@ package codex
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
+	"github.com/RenseiAI/donmai/runtime/mcp"
 )
 
 // SpawnInteractive opens the codex CLI's OWN interactive TUI — bare
@@ -43,11 +49,28 @@ func SpawnInteractive(ctx context.Context, opts Options, spec agent.Spec) (agent
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	if err := validateCodexCLIMCPServers(spec.MCPServers); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, persistInteractiveMCPApplicationDenial(spec, err))
+	}
+	spec, err = agent.PrepareToolLifecycle(spec, (&Provider{}).Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	launch, err := buildInteractiveLaunch(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, persistInteractiveMCPApplicationDenial(spec, err))
+	}
 	bin, err := resolveCodexBinary(opts.CodexBin)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	return ptycli.Spawn(ctx, bin, interactiveArgs(spec), spec)
+	spec.Env = launch.env
+	return ptycli.Spawn(ctx, bin, launch.argv, spec)
+}
+
+type interactiveLaunch struct {
+	argv []string
+	env  map[string]string
 }
 
 // interactiveArgs builds the argv for codex's own interactive TUI. The codex
@@ -58,12 +81,196 @@ func SpawnInteractive(ctx context.Context, opts Options, spec agent.Spec) (agent
 // stdout and exits) which this package never uses for the interactive
 // spawn mode. An empty prompt starts the TUI bare, with no seeded message.
 func interactiveArgs(spec agent.Spec) []string {
+	launch, _ := buildInteractiveLaunch(spec)
+	return launch.argv
+}
+
+// buildInteractiveLaunch projects requested MCP servers into one process-local
+// Codex CLI override. Codex recursively merges ambient user MCP configuration
+// and bare interactive mode has no ignore-user-config switch, so this proves
+// requested per-process delivery but deliberately does not claim exclusive MCP
+// isolation.
+func buildInteractiveLaunch(spec agent.Spec) (interactiveLaunch, error) {
+	env := cloneInteractiveEnv(spec.Env)
 	var args []string
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--config", "developer_instructions="+strconv.Quote(spec.SystemPromptAppend))
 	}
+	if len(spec.MCPServers) > 0 {
+		override, nextEnv, err := codexCLIMCPOverride(spec.MCPServers, env)
+		if err != nil {
+			return interactiveLaunch{}, err
+		}
+		env = nextEnv
+		args = append(args, "--config", override, "--strict-config")
+	}
 	if spec.Prompt != "" {
 		args = append(args, spec.Prompt)
 	}
-	return args
+	return interactiveLaunch{argv: args, env: env}, nil
+}
+
+func cloneInteractiveEnv(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func codexCLIMCPOverride(servers []agent.MCPServerConfig, env map[string]string) (string, map[string]string, error) {
+	if err := validateCodexCLIMCPServers(servers); err != nil {
+		return "", nil, err
+	}
+	ordered := append([]agent.MCPServerConfig(nil), servers...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
+
+	var body strings.Builder
+	body.WriteString("mcp_servers={")
+	for i, server := range ordered {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(tomlBasicString(server.Name))
+		body.WriteString("={")
+		switch strings.ToLower(strings.TrimSpace(server.Type)) {
+		case "", "stdio":
+			body.WriteString("\"command\"=")
+			body.WriteString(tomlBasicString(server.Command))
+			body.WriteString(",\"args\"=")
+			body.WriteString(tomlStringArray(server.Args))
+			if len(server.Env) > 0 {
+				keys := sortedStringKeys(server.Env)
+				for _, key := range keys {
+					if !validProcessEnvKey(key) {
+						return "", nil, codexMCPApplicationError("stdio MCP environment contains an invalid variable name")
+					}
+					var err error
+					env, err = setInteractiveEnv(env, key, server.Env[key])
+					if err != nil {
+						return "", nil, err
+					}
+				}
+				body.WriteString(",\"env_vars\"=")
+				body.WriteString(tomlStringArray(keys))
+			}
+		case "http":
+			body.WriteString("\"url\"=")
+			body.WriteString(tomlBasicString(server.URL))
+			if len(server.Headers) > 0 {
+				headers := sortedStringKeys(server.Headers)
+				body.WriteString(",\"env_http_headers\"={")
+				for j, header := range headers {
+					if j > 0 {
+						body.WriteByte(',')
+					}
+					envName := codexHTTPHeaderEnvName(server.Name, header)
+					var err error
+					env, err = setInteractiveEnv(env, envName, server.Headers[header])
+					if err != nil {
+						return "", nil, err
+					}
+					body.WriteString(tomlBasicString(header))
+					body.WriteByte('=')
+					body.WriteString(tomlBasicString(envName))
+				}
+				body.WriteByte('}')
+			}
+		default:
+			return "", nil, codexMCPApplicationError("MCP server type must be stdio or http")
+		}
+		body.WriteByte('}')
+	}
+	body.WriteByte('}')
+	return body.String(), env, nil
+}
+
+func setInteractiveEnv(env map[string]string, key, value string) (map[string]string, error) {
+	if existing, ok := env[key]; ok {
+		if existing != value {
+			return nil, codexMCPApplicationError("MCP environment conflicts with the inherited process variable " + key)
+		}
+		return env, nil
+	}
+	if env == nil {
+		env = make(map[string]string)
+	}
+	env[key] = value
+	return env, nil
+}
+
+func validProcessEnvKey(key string) bool {
+	return key != "" && !strings.ContainsAny(key, "=\x00")
+}
+
+func codexHTTPHeaderEnvName(server, header string) string {
+	sum := sha256.Sum256([]byte(server + "\x00" + header))
+	return "DONMAI_MCP_HEADER_" + strings.ToUpper(hex.EncodeToString(sum[:]))
+}
+
+func validateCodexCLIMCPServers(servers []agent.MCPServerConfig) error {
+	seen := make(map[string]struct{}, len(servers))
+	for _, server := range servers {
+		name := strings.TrimSpace(server.Name)
+		if _, exists := seen[name]; exists {
+			return codexMCPApplicationError("requested MCP server names must be unique")
+		}
+		seen[name] = struct{}{}
+	}
+	if _, err := mcp.BuildConfigFile(servers); err != nil {
+		return codexMCPApplicationError("requested MCP server structure is invalid")
+	}
+	return nil
+}
+
+func sortedStringKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func tomlBasicString(value string) string {
+	body, _ := json.Marshal(value)
+	return string(body)
+}
+
+func tomlStringArray(values []string) string {
+	var body strings.Builder
+	body.WriteByte('[')
+	for i, value := range values {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(tomlBasicString(value))
+	}
+	body.WriteByte(']')
+	return body.String()
+}
+
+func persistInteractiveMCPApplicationDenial(spec agent.Spec, applicationErr error) error {
+	receipt := agent.ToolLifecycleReceipt{
+		ContractVersion: agent.ToolLifecycleContractVersion,
+		ProfileID:       "codex/interactive/tool-lifecycle-v1",
+		Decision:        "denied",
+		EvidenceTier:    "unit_verified",
+		Entries: []agent.ToolLifecycleEntry{{
+			ID:         "mcp-servers",
+			Channel:    agent.ToolChannelMCPServer,
+			Required:   true,
+			Outcome:    agent.ToolOutcomeDenied,
+			DenialCode: agent.ToolDenialApplicationFailed,
+		}},
+	}
+	if spec.OnToolLifecycleAdapted != nil {
+		if err := spec.OnToolLifecycleAdapted(receipt); err != nil {
+			return codexMCPApplicationError("persist denied Codex CLI MCP receipt: " + err.Error())
+		}
+	}
+	return applicationErr
 }

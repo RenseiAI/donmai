@@ -25,6 +25,7 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // declared Transport" case, and agent/harness.go's
 // HarnessCaps.SupportsInteractivePTY doc comment for the general rule.
 func (*Provider) Manifest() agent.HarnessManifest {
+	events := []agent.EventKind{agent.EventInit, agent.EventResult}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessShell,
 		HumanLabel:  "Shell",
@@ -52,6 +53,17 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			SystemDelivery: agent.PromptDeliveryUnsupported, BaseAppendDelivery: agent.PromptDeliveryUnsupported,
 			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryUnsupported,
 			UserDelivery: agent.PromptDeliveryShellPTYSeed, AmendmentDelivery: agent.PromptDeliveryUnsupported,
+		}},
+		ToolLifecycle: []agent.ToolLifecycleProfile{{
+			ID: "shell/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
+			ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
+			NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+			MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+			LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: events,
+			ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: events,
+			CleanupDelivery:    agent.ToolDeliveryHandleCleanup,
+			FallbackDeliveries: []agent.ToolDeliveryKind{agent.ToolDeliveryCoarsePTYEvents, agent.ToolDeliveryTerminalCastReplay},
+			EvidenceTier:       "unit_verified",
 		}},
 	}
 }

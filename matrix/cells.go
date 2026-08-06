@@ -191,9 +191,9 @@ var validCells = []HarnessEndpointCell{
 		Stability: "beta", Smoked: false,
 	},
 
-	// raw × Google (gemini-direct) ------------------------------------------
+	// gemini-direct × Google -----------------------------------------------
 	{
-		Harness: agent.HarnessRaw, Endpoint: agent.CompanyGoogle, Host: agent.HostDirect,
+		Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: agent.HostDirect,
 		Protocol: agent.ProtoGeminiGenerate, Transport: agent.TransportDirectAPI,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
@@ -201,7 +201,7 @@ var validCells = []HarnessEndpointCell{
 		Stability: "stable", Smoked: true,
 	},
 	{
-		Harness: agent.HarnessRaw, Endpoint: agent.CompanyGoogle, Host: agent.HostVertex,
+		Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: agent.HostVertex,
 		Protocol: agent.ProtoGeminiGenerate, Transport: agent.TransportDirectAPI,
 		AuthModes: []agent.AuthMode{agent.AuthBYOK, agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
 		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: true,
@@ -219,9 +219,9 @@ var validCells = []HarnessEndpointCell{
 		Stability: "stable", Smoked: true,
 	},
 
-	// raw × Local (ollama) --------------------------------------------------
+	// ollama × Local --------------------------------------------------------
 	{
-		Harness: agent.HarnessRaw, Endpoint: agent.CompanyLocal, Host: agent.HostLocal,
+		Harness: agent.HarnessOllama, Endpoint: agent.CompanyLocal, Host: agent.HostLocal,
 		Protocol: agent.ProtoOllama, Transport: agent.TransportDirectAPI,
 		AuthModes: []agent.AuthMode{agent.AuthLocal}, BringsOwnAuth: true, NeedsAPIKey: false,
 		CostModel: agent.CostLocalFree, OneShot: true, NativeJSONMode: true,

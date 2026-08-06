@@ -98,9 +98,9 @@ func TestLegacyAliasMap_ExactlyTheEightLegacyNames(t *testing.T) {
 	want := map[agent.ProviderName]matrix.CellKey{
 		agent.ProviderClaude:   {Harness: agent.HarnessClaudeCode, Endpoint: agent.CompanyAnthropic, Host: "oauth-cli"},
 		agent.ProviderCodex:    {Harness: agent.HarnessCodex, Endpoint: agent.CompanyOpenAI, Host: "oauth-cli"},
-		agent.ProviderGemini:   {Harness: agent.HarnessRaw, Endpoint: agent.CompanyGoogle, Host: "direct"},
+		agent.ProviderGemini:   {Harness: agent.HarnessGeminiDirect, Endpoint: agent.CompanyGoogle, Host: "direct"},
 		agent.ProviderAGYCLI:   {Harness: agent.HarnessAntigravity, Endpoint: agent.CompanyGoogle, Host: "oauth-cli"},
-		agent.ProviderOllama:   {Harness: agent.HarnessRaw, Endpoint: agent.CompanyLocal, Host: "local"},
+		agent.ProviderOllama:   {Harness: agent.HarnessOllama, Endpoint: agent.CompanyLocal, Host: "local"},
 		agent.ProviderOpenCode: {Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyOpenAI, Host: "direct"},
 		agent.ProviderPi:       {Harness: agent.HarnessPi, Endpoint: agent.CompanyAnthropic, Host: "direct"},
 		agent.ProviderAmp:      {Harness: agent.HarnessAmp, Endpoint: agent.CompanyAnthropic, Host: "direct"},
