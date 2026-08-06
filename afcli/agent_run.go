@@ -21,6 +21,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/matrix"
@@ -214,6 +215,13 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		"provider", providerNameFromDetail(detail),
 		"workType", detail.WorkType,
 	)
+	if len(detail.AdmissionReceipt) > 0 {
+		hostReceipt, err := executioncell.DecodeHostAdaptationReceipt(detail.HostAdaptationReceipt)
+		if err != nil || hostReceipt.RequestID != detail.SessionID ||
+			hostReceipt.WorkerID != detail.WorkerID || hostReceipt.Decision != "ready" {
+			return fmt.Errorf("receipt-bearing session has no valid daemon adaptation-ready receipt")
+		}
+	}
 	credentialCache := newAgentRunCredentialCache(
 		&http.Client{Timeout: 5 * time.Second},
 		daemonURL,
@@ -847,6 +855,12 @@ func kitScanPaths() []string {
 // into the runner's QueuedWork. Pure function; no I/O.
 func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 	qw := runner.QueuedWork{
+		AdmissionReceipt:        bytes.Clone(d.AdmissionReceipt),
+		ClaimReceipt:            bytes.Clone(d.ClaimReceipt),
+		EffectiveCell:           bytes.Clone(d.EffectiveCell),
+		ExecutionRuntimeBinding: bytes.Clone(d.ExecutionRuntimeBinding),
+		OperationalPayload:      bytes.Clone(d.OperationalPayload),
+		HostAdaptationReceipt:   bytes.Clone(d.HostAdaptationReceipt),
 		QueuedWork: prompt.QueuedWork{
 			SessionID:            d.SessionID,
 			IssueID:              d.IssueID,
@@ -885,6 +899,19 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 		TerminalWorkareaLease: d.TerminalWorkareaLease,
 		Capabilities:          d.Capabilities,
 	}
+	if len(d.OperationalPayload) > 0 {
+		// Restore the source projection after the compatibility mirror. This is
+		// the lossless path for recursively present-empty collections.
+		_ = json.Unmarshal(d.OperationalPayload, &qw)
+		qw.AdmissionReceipt = bytes.Clone(d.AdmissionReceipt)
+		qw.ClaimReceipt = bytes.Clone(d.ClaimReceipt)
+		qw.EffectiveCell = bytes.Clone(d.EffectiveCell)
+		qw.ExecutionRuntimeBinding = bytes.Clone(d.ExecutionRuntimeBinding)
+		qw.OperationalPayload = bytes.Clone(d.OperationalPayload)
+		qw.HostAdaptationReceipt = bytes.Clone(d.HostAdaptationReceipt)
+		qw.WorkerID, qw.AuthToken, qw.PlatformURL = d.WorkerID, d.AuthToken, d.PlatformURL
+		qw.Capabilities = d.Capabilities
+	}
 	if d.StageBudget != nil {
 		qw.StageBudget = &prompt.StageBudget{
 			MaxDurationSeconds: d.StageBudget.MaxDurationSeconds,
@@ -920,8 +947,14 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 		qw.ResolvedProfile = mp.ToResolvedProfile()
 		// Preserve CredentialID from ResolvedProfile when present — the
 		// platform may send it alongside ModelProfile.
-		if d.ResolvedProfile != nil && d.ResolvedProfile.CredentialID != "" {
-			qw.ResolvedProfile.CredentialID = d.ResolvedProfile.CredentialID
+		if d.ResolvedProfile != nil {
+			if d.ResolvedProfile.CredentialID != "" {
+				qw.ResolvedProfile.CredentialID = d.ResolvedProfile.CredentialID
+			}
+			if d.ResolvedProfile.ProviderConfig != nil {
+				qw.ResolvedProfile.ProviderConfig = d.ResolvedProfile.ProviderConfig
+			}
+			qw.ResolvedProfile.Endpoint = detailEndpointBinding(d.ResolvedProfile.Endpoint)
 		}
 	} else if d.ResolvedProfile != nil {
 		qw.ResolvedProfile = runner.ResolvedProfile{
@@ -932,9 +965,33 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			Effort:         agent.EffortLevel(d.ResolvedProfile.Effort),
 			CredentialID:   d.ResolvedProfile.CredentialID,
 			ProviderConfig: d.ResolvedProfile.ProviderConfig,
+			Endpoint:       detailEndpointBinding(d.ResolvedProfile.Endpoint),
 		}
 	}
 	return qw
+}
+
+func detailEndpointBinding(in *daemon.SessionEndpointBinding) *agent.EndpointBinding {
+	if in == nil {
+		return nil
+	}
+	return &agent.EndpointBinding{
+		Company:            agent.Company(in.Company),
+		Model:              in.Model,
+		Protocol:           agent.WireProtocol(in.Protocol),
+		Host:               agent.ServingHost(in.Host),
+		EndpointID:         in.EndpointID,
+		EndpointOperator:   in.EndpointOperator,
+		EndpointRevision:   in.EndpointRevision,
+		ModelAuthor:        in.ModelAuthor,
+		AuthBindingID:      in.AuthBindingID,
+		AuthAuthority:      in.AuthAuthority,
+		AuthCommercialMode: in.AuthCommercialMode,
+		AuthBindingScope:   in.AuthBindingScope,
+		AuthPortability:    in.AuthPortability,
+		AuthDelivery:       in.AuthDelivery,
+		Mechanism:          agent.AuthMechanism(in.Mechanism),
+	}
 }
 
 // detailMCPServers re-types the daemon's PollMCPServer mirror slice into the

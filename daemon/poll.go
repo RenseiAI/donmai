@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
@@ -40,7 +41,22 @@ import (
 // number into Go struct field PollWorkItem.work.queuedAt of type string") and
 // silently drop pre-claimed sessions.
 type PollWorkItem struct {
-	SessionID          string            `json:"sessionId"`
+	SessionID string `json:"sessionId"`
+
+	// AdmissionReceipt is forwarded opaquely to the per-session runner payload.
+	// The daemon does not interpret or reconstruct this closed contract.
+	AdmissionReceipt json.RawMessage `json:"admissionReceipt,omitempty"`
+	ClaimReceipt     json.RawMessage `json:"claimReceipt,omitempty"`
+	EffectiveCell    json.RawMessage `json:"effectiveCell,omitempty"`
+	// ExecutionRuntimeBinding is authenticated poll/claim state, independent
+	// of duplicated receipt evidence. Receipt-bearing work must bind to this
+	// request, the current daemon worker, its placement, and active claim.
+	ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding,omitempty"`
+
+	// OperationalPayload is the byte-stable, canonical projection captured
+	// from raw poll JSON before typed mirrors can erase present-empty state.
+	OperationalPayload json.RawMessage `json:"operationalPayload,omitempty"`
+
 	ProjectID          string            `json:"projectId,omitempty"`
 	RepositoryID       string            `json:"repositoryId,omitempty"`
 	ProjectName        string            `json:"projectName,omitempty"`
@@ -204,6 +220,34 @@ type PollWorkItem struct {
 	// Forwarded opaquely as json.RawMessage so the strict decoder never
 	// drops it. Opaque forwarder only.
 	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
+}
+
+// UnmarshalJSON captures the operational projection at the authenticated poll
+// boundary. This is intentionally the only place source JSON is projected.
+func (item *PollWorkItem) UnmarshalJSON(raw []byte) error {
+	type pollWorkItemAlias PollWorkItem
+	var decoded pollWorkItemAlias
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return err
+	}
+	*item = PollWorkItem(decoded)
+	projected, err := executioncell.ProjectOperationalPayload(raw)
+	if err != nil {
+		return err
+	}
+	if len(item.OperationalPayload) > 0 {
+		canonical, err := executioncell.NormalizeOperationalPayload(item.OperationalPayload)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(canonical, projected) {
+			return errors.New("daemon poll: operationalPayload does not match raw poll item")
+		}
+		item.OperationalPayload = canonical
+		return nil
+	}
+	item.OperationalPayload = projected
+	return nil
 }
 
 // PollInterviewBudget mirrors prompt.InterviewBudget for the daemon
@@ -1114,6 +1158,12 @@ func WithMergeQueueLanding(flag *bool) SessionDetailOption {
 // SessionDetailOption args customise the result without breaking existing
 // callers (the donmai-internal loop passes none).
 func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platformURL, authToken, workerID string, opts ...SessionDetailOption) *SessionDetail {
+	if len(item.OperationalPayload) == 0 {
+		type pollWorkItemAlias PollWorkItem
+		if raw, err := json.Marshal(pollWorkItemAlias(item)); err == nil {
+			item.OperationalPayload, _ = executioncell.ProjectOperationalPayload(raw)
+		}
+	}
 	repo, matched := resolveAllowlistedRepo(item, projects)
 	credentialRequirements, harness, servingHost := pollItemCredentialMetadata(item)
 	projectName := item.ProjectName
@@ -1137,50 +1187,55 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		)
 	}
 	detail := &SessionDetail{
-		SessionID:              item.SessionID,
-		IssueID:                item.IssueID,
-		IssueIdentifier:        item.IssueIdentifier,
-		LinearSessionID:        item.LinearSessionID,
-		ProviderSessionID:      item.ProviderSessionID,
-		ProjectName:            projectName,
-		ProjectID:              projectID,
-		RepositoryID:           item.RepositoryID,
-		OrganizationID:         item.OrganizationID,
-		Repository:             repo,
-		Ref:                    item.Ref,
-		WorkType:               item.WorkType,
-		PromptContext:          item.PromptContext,
-		Body:                   item.Body,
-		Title:                  item.Title,
-		MentionContext:         item.MentionContext,
-		ParentContext:          item.ParentContext,
-		Branch:                 item.Branch,
-		ResolvedProfile:        item.ResolvedProfile,
-		ModelProfile:           item.ModelProfile,
-		CredentialRequirements: credentialRequirements,
-		Harness:                harness,
-		ServingHost:            servingHost,
-		WorkerID:               workerID,
-		AuthToken:              authToken,
-		PlatformURL:            platformURL,
-		CredentialPoolID:       item.InjectedPoolID,
-		StagePrompt:            item.StagePrompt,
-		StageID:                item.StageID,
-		StageBudget:            item.StageBudget,
-		StageLifecycle:         item.StageLifecycle,
-		StageSourceEventID:     item.StageSourceEventID,
-		SystemPromptOverride:   item.SystemPromptOverride,
-		Kits:                   item.Kits,
-		DisallowedTools:        item.DisallowedTools,
-		AllowedTools:           item.AllowedTools,
-		McpServers:             item.McpServers,
-		Skills:                 item.Skills,
-		MemoryBlock:            item.MemoryBlock,
-		Mode:                   item.Mode,
-		InitialPrompt:          item.InitialPrompt,
-		TerminalWorkareaLease:  item.TerminalWorkareaLease,
-		InterviewBudget:        item.InterviewBudget,
-		InterviewDefinition:    item.InterviewDefinition,
+		SessionID:               item.SessionID,
+		AdmissionReceipt:        bytes.Clone(item.AdmissionReceipt),
+		ClaimReceipt:            bytes.Clone(item.ClaimReceipt),
+		EffectiveCell:           bytes.Clone(item.EffectiveCell),
+		ExecutionRuntimeBinding: bytes.Clone(item.ExecutionRuntimeBinding),
+		OperationalPayload:      bytes.Clone(item.OperationalPayload),
+		IssueID:                 item.IssueID,
+		IssueIdentifier:         item.IssueIdentifier,
+		LinearSessionID:         item.LinearSessionID,
+		ProviderSessionID:       item.ProviderSessionID,
+		ProjectName:             projectName,
+		ProjectID:               projectID,
+		RepositoryID:            item.RepositoryID,
+		OrganizationID:          item.OrganizationID,
+		Repository:              repo,
+		Ref:                     item.Ref,
+		WorkType:                item.WorkType,
+		PromptContext:           item.PromptContext,
+		Body:                    item.Body,
+		Title:                   item.Title,
+		MentionContext:          item.MentionContext,
+		ParentContext:           item.ParentContext,
+		Branch:                  item.Branch,
+		ResolvedProfile:         item.ResolvedProfile,
+		ModelProfile:            item.ModelProfile,
+		CredentialRequirements:  credentialRequirements,
+		Harness:                 harness,
+		ServingHost:             servingHost,
+		WorkerID:                workerID,
+		AuthToken:               authToken,
+		PlatformURL:             platformURL,
+		CredentialPoolID:        item.InjectedPoolID,
+		StagePrompt:             item.StagePrompt,
+		StageID:                 item.StageID,
+		StageBudget:             item.StageBudget,
+		StageLifecycle:          item.StageLifecycle,
+		StageSourceEventID:      item.StageSourceEventID,
+		SystemPromptOverride:    item.SystemPromptOverride,
+		Kits:                    item.Kits,
+		DisallowedTools:         item.DisallowedTools,
+		AllowedTools:            item.AllowedTools,
+		McpServers:              item.McpServers,
+		Skills:                  item.Skills,
+		MemoryBlock:             item.MemoryBlock,
+		Mode:                    item.Mode,
+		InitialPrompt:           item.InitialPrompt,
+		TerminalWorkareaLease:   item.TerminalWorkareaLease,
+		InterviewBudget:         item.InterviewBudget,
+		InterviewDefinition:     item.InterviewDefinition,
 	}
 	for _, opt := range opts {
 		opt(detail)

@@ -109,10 +109,11 @@ type ToolHookRequirement struct {
 
 // LifecycleRequirement names one normalized event and its minimum fidelity.
 type LifecycleRequirement struct {
-	ID              string           `json:"id"`
-	Event           EventKind        `json:"event"`
-	Required        bool             `json:"required"`
-	MinimumFidelity EvidenceFidelity `json:"minimumFidelity"`
+	ID               string           `json:"id"`
+	Event            EventKind        `json:"event"`
+	Required         bool             `json:"required"`
+	MinimumFidelity  EvidenceFidelity `json:"minimumFidelity"`
+	ParametersDigest string           `json:"parametersDigest,omitempty"`
 }
 
 // ToolLifecycleFallback is a caller-authorized alternate. The selected
@@ -127,13 +128,17 @@ type ToolLifecycleFallback struct {
 // fields. Legacy non-empty fields are projected as required entries and cannot
 // be made optional through this plan.
 type ToolLifecyclePlan struct {
-	ContractVersion     string                  `json:"contractVersion"`
-	RequireToolPlugins  bool                    `json:"requireToolPlugins,omitempty"`
-	ToolHooks           []ToolHookRequirement   `json:"toolHooks,omitempty"`
-	Lifecycle           []LifecycleRequirement  `json:"lifecycle,omitempty"`
-	Replay              *LifecycleRequirement   `json:"replay,omitempty"`
-	RequireCleanup      bool                    `json:"requireCleanup,omitempty"`
-	AuthorizedFallbacks []ToolLifecycleFallback `json:"authorizedFallbacks,omitempty"`
+	ContractVersion          string                  `json:"contractVersion"`
+	AdmissionReceiptID       string                  `json:"admissionReceiptId,omitempty"`
+	ClaimReceiptID           string                  `json:"claimReceiptId,omitempty"`
+	OperationalPayloadDigest string                  `json:"operationalPayloadDigest,omitempty"`
+	RequireToolPlugins       bool                    `json:"requireToolPlugins,omitempty"`
+	ToolHooks                []ToolHookRequirement   `json:"toolHooks,omitempty"`
+	Lifecycle                []LifecycleRequirement  `json:"lifecycle,omitempty"`
+	Replay                   *LifecycleRequirement   `json:"replay,omitempty"`
+	RequireCleanup           bool                    `json:"requireCleanup,omitempty"`
+	CleanupParametersDigest  string                  `json:"cleanupParametersDigest,omitempty"`
+	AuthorizedFallbacks      []ToolLifecycleFallback `json:"authorizedFallbacks,omitempty"`
 }
 
 // ToolAdaptationOutcome is the immutable pre-spawn result for one entry.
@@ -180,12 +185,15 @@ type ToolLifecycleEntry struct {
 // ToolLifecycleReceipt is persisted before provider side effects. Evidence
 // tier and production eligibility are separate from declared capability.
 type ToolLifecycleReceipt struct {
-	ContractVersion    string               `json:"contractVersion"`
-	ProfileID          string               `json:"profileId"`
-	Decision           string               `json:"decision"`
-	EvidenceTier       string               `json:"evidenceTier"`
-	ProductionEligible bool                 `json:"productionEligible"`
-	Entries            []ToolLifecycleEntry `json:"entries"`
+	ContractVersion          string               `json:"contractVersion"`
+	AdmissionReceiptID       string               `json:"admissionReceiptId,omitempty"`
+	ClaimReceiptID           string               `json:"claimReceiptId,omitempty"`
+	OperationalPayloadDigest string               `json:"operationalPayloadDigest,omitempty"`
+	ProfileID                string               `json:"profileId"`
+	Decision                 string               `json:"decision"`
+	EvidenceTier             string               `json:"evidenceTier"`
+	ProductionEligible       bool                 `json:"productionEligible"`
+	Entries                  []ToolLifecycleEntry `json:"entries"`
 }
 
 // ToolAdaptationError is returned before any provider process starts.
@@ -234,7 +242,14 @@ func PrepareHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 func PrepareToolLifecycle(spec Spec, manifest HarnessManifest) (Spec, error) {
 	profile, ok := manifest.ToolLifecycleProfile(PromptModeForSpec(spec))
 	if !ok {
-		receipt := ToolLifecycleReceipt{ContractVersion: ToolLifecycleContractVersion, Decision: "denied"}
+		plan := EnsureToolLifecyclePlan(spec)
+		receipt := ToolLifecycleReceipt{
+			ContractVersion:          ToolLifecycleContractVersion,
+			AdmissionReceiptID:       plan.AdmissionReceiptID,
+			ClaimReceiptID:           plan.ClaimReceiptID,
+			OperationalPayloadDigest: plan.OperationalPayloadDigest,
+			Decision:                 "denied",
+		}
 		err := &ToolAdaptationError{Code: ToolDenialDeliveryUnsupported, Detail: "manifest has no tool/lifecycle profile for requested session mode"}
 		if receiptErr := emitToolLifecycleReceipt(spec, receipt); receiptErr != nil {
 			return spec, receiptPersistenceError(receiptErr)
@@ -279,11 +294,14 @@ type toolRequirement struct {
 func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLifecycleReceipt, error) {
 	plan := EnsureToolLifecyclePlan(spec)
 	receipt := ToolLifecycleReceipt{
-		ContractVersion:    ToolLifecycleContractVersion,
-		ProfileID:          profile.ID,
-		Decision:           "denied",
-		EvidenceTier:       profile.EvidenceTier,
-		ProductionEligible: profile.ProductionEligible,
+		ContractVersion:          ToolLifecycleContractVersion,
+		AdmissionReceiptID:       plan.AdmissionReceiptID,
+		ClaimReceiptID:           plan.ClaimReceiptID,
+		OperationalPayloadDigest: plan.OperationalPayloadDigest,
+		ProfileID:                profile.ID,
+		Decision:                 "denied",
+		EvidenceTier:             profile.EvidenceTier,
+		ProductionEligible:       profile.ProductionEligible,
 	}
 	deny := func(code ToolAdaptationDenialCode, channel ToolLifecycleChannel, id, digest, detail string) (Spec, ToolLifecycleReceipt, error) {
 		receipt.Entries = append(receipt.Entries, ToolLifecycleEntry{ID: id, Channel: channel, Required: true, Outcome: ToolOutcomeDenied, InputDigest: digest, DenialCode: code})
@@ -314,13 +332,13 @@ func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLife
 		// The runner does not yet promote admission receipts from actual runtime
 		// events. A declaration alone is not evidence, so demand is denied until
 		// a durable post-runtime verification path exists.
-		requirements = append(requirements, toolRequirement{id: lifecycle.ID, channel: ToolChannelLifecycle, required: lifecycle.Required, delivery: ToolDeliveryUnsupported, digest: digestToolInput(lifecycle), fallbackDenied: true})
+		requirements = append(requirements, toolRequirement{id: lifecycle.ID, channel: ToolChannelLifecycle, required: lifecycle.Required, delivery: ToolDeliveryUnsupported, digest: requirementInputDigest(lifecycle.ParametersDigest, lifecycle), fallbackDenied: true})
 	}
 	if plan.Replay != nil {
-		requirements = append(requirements, toolRequirement{id: plan.Replay.ID, channel: ToolChannelReplay, required: plan.Replay.Required, delivery: ToolDeliveryUnsupported, digest: digestToolInput(plan.Replay), fallbackDenied: true})
+		requirements = append(requirements, toolRequirement{id: plan.Replay.ID, channel: ToolChannelReplay, required: plan.Replay.Required, delivery: ToolDeliveryUnsupported, digest: requirementInputDigest(plan.Replay.ParametersDigest, plan.Replay), fallbackDenied: true})
 	}
 	if plan.RequireCleanup {
-		requirements = append(requirements, toolRequirement{id: "cleanup", channel: ToolChannelCleanup, required: true, delivery: ToolDeliveryUnsupported, digest: digestToolInput(true), fallbackDenied: true})
+		requirements = append(requirements, toolRequirement{id: "cleanup", channel: ToolChannelCleanup, required: true, delivery: ToolDeliveryUnsupported, digest: requirementInputDigest(plan.CleanupParametersDigest, true), fallbackDenied: true})
 	}
 
 	for _, requirement := range requirements {
@@ -487,6 +505,24 @@ func isKnownEvent(event EventKind) bool {
 }
 
 func validateToolLifecyclePlan(plan ToolLifecyclePlan) string {
+	if (plan.AdmissionReceiptID == "") != (plan.OperationalPayloadDigest == "") {
+		return "admission receipt id and operational payload digest must be present together"
+	}
+	if plan.AdmissionReceiptID != "" && !contractReferencePattern.MatchString(plan.AdmissionReceiptID) {
+		return "admission receipt id is malformed"
+	}
+	if plan.ClaimReceiptID != "" && plan.AdmissionReceiptID == "" {
+		return "claim receipt id requires an admission receipt id"
+	}
+	if plan.ClaimReceiptID != "" && !contractReferencePattern.MatchString(plan.ClaimReceiptID) {
+		return "claim receipt id is malformed"
+	}
+	if plan.OperationalPayloadDigest != "" && !sha256DigestPattern.MatchString(plan.OperationalPayloadDigest) {
+		return "operational payload digest must be a lowercase SHA-256 digest"
+	}
+	if plan.CleanupParametersDigest != "" && !sha256DigestPattern.MatchString(plan.CleanupParametersDigest) {
+		return "cleanup parameters digest must be a lowercase SHA-256 digest"
+	}
 	seen := map[string]bool{}
 	for _, hook := range plan.ToolHooks {
 		if hook.ID == "" || hook.Kind == "" || seen[hook.ID] {
@@ -495,13 +531,13 @@ func validateToolLifecyclePlan(plan ToolLifecyclePlan) string {
 		seen[hook.ID] = true
 	}
 	for _, lifecycle := range plan.Lifecycle {
-		if lifecycle.ID == "" || !isKnownEvent(lifecycle.Event) || seen[lifecycle.ID] || fidelityRank(lifecycle.MinimumFidelity) < 0 {
+		if lifecycle.ID == "" || !isKnownEvent(lifecycle.Event) || seen[lifecycle.ID] || fidelityRank(lifecycle.MinimumFidelity) < 0 || !validParametersDigest(lifecycle.ParametersDigest) {
 			return "lifecycle requirements require unique ids, events, and known fidelity"
 		}
 		seen[lifecycle.ID] = true
 	}
 	if replay := plan.Replay; replay != nil {
-		if replay.ID == "" || !isKnownEvent(replay.Event) || seen[replay.ID] || fidelityRank(replay.MinimumFidelity) < 0 {
+		if replay.ID == "" || !isKnownEvent(replay.Event) || seen[replay.ID] || fidelityRank(replay.MinimumFidelity) < 0 || !validParametersDigest(replay.ParametersDigest) {
 			return "replay requires a unique id and known fidelity"
 		}
 	}
@@ -574,4 +610,20 @@ func digestToolInput(value any) string {
 	}
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
+}
+
+var (
+	contractReferencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$`)
+	sha256DigestPattern      = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+func validParametersDigest(digest string) bool {
+	return digest == "" || sha256DigestPattern.MatchString(digest)
+}
+
+func requirementInputDigest(parametersDigest string, value any) string {
+	if parametersDigest != "" {
+		return parametersDigest
+	}
+	return digestToolInput(value)
 }

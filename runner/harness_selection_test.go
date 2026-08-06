@@ -31,6 +31,10 @@ func (p *selectorFakeProvider) Manifest() agent.HarnessManifest {
 	return agent.HarnessManifest{
 		Name: p.harness, HumanLabel: string(p.harness), Family: agent.FamilyHarness,
 		ContractABI: "harness/v2",
+		Caps: agent.HarnessCaps{
+			Drives:      []agent.WireProtocol{agent.ProtoOpenAIResponses},
+			DrivesHosts: []agent.ServingHost{agent.HostDirect},
+		},
 	}
 }
 

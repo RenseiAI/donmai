@@ -534,6 +534,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		})
 		return err
 	}
+	if len(selection.receipt.Bytes()) > 0 {
+		spec, err = bindAdmissionToolLifecyclePlan(spec, selection.receipt, selection.claimReceipt)
+		if err != nil {
+			res.Status = "failed"
+			res.FailureMode = FailureSpawn
+			res.Error = err.Error()
+			return res, err
+		}
+	}
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.

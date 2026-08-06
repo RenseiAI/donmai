@@ -244,6 +244,36 @@ func TestToolLifecycleReceiptIsDigestOnlyAndPersistenceFailsClosed(t *testing.T)
 	}
 }
 
+func TestToolLifecycleReceiptLinksAdmissionWithoutCopyingInputs(t *testing.T) {
+	t.Parallel()
+	secret := "RECEIPT_LINK_DO_NOT_COPY"
+	command := "RECEIPT_LINK_COMMAND_DO_NOT_COPY"
+	plan := agent.ToolLifecyclePlan{
+		ContractVersion:          agent.ToolLifecycleContractVersion,
+		AdmissionReceiptID:       "admission_test",
+		OperationalPayloadDigest: strings.Repeat("a", 64),
+	}
+	spec := agent.Spec{
+		Autonomous:        true,
+		MCPServers:        []agent.MCPServerConfig{{Name: "linked", Command: command, Env: map[string]string{"TOKEN": secret}}},
+		ToolLifecyclePlan: &plan,
+	}
+	_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, (&claude.Provider{}).Manifest(), agent.PromptModeAutonomous))
+	if err != nil {
+		t.Fatalf("AdaptToolLifecycle: %v", err)
+	}
+	if receipt.Decision != "ready" || receipt.AdmissionReceiptID != plan.AdmissionReceiptID || receipt.OperationalPayloadDigest != plan.OperationalPayloadDigest {
+		t.Fatalf("linked receipt = %+v", receipt)
+	}
+	raw, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), secret) || strings.Contains(string(raw), command) {
+		t.Fatalf("receipt copied MCP secret or command: %s", raw)
+	}
+}
+
 func TestToolLifecycleDeniedReceiptPersistenceFailsClosed(t *testing.T) {
 	t.Parallel()
 	spec := agent.Spec{

@@ -34,6 +34,73 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+func TestOperationalPayloadRawPollThroughRealDetailHTTPIsLossless(t *testing.T) {
+	t.Parallel()
+	variants := []struct {
+		id, collections string
+	}{
+		{id: "wire-omitted", collections: ""},
+		{id: "wire-empty", collections: `,"allowedTools":[],"disallowedTools":[],"stageLifecycle":{},"mcpServers":[{"name":"tools","args":[],"env":{},"headers":{}}],"skills":[{"id":"s","disallowedTools":[]}],"kits":{"kits":[],"os":"linux","toolchain_install":[],"post_acquire":[],"pre_release":[],"env":{},"commands":[],"command_bindings":[]},"resolvedProfile":{"harness":"codex","providerConfig":{}},"terminalWorkareaLease":{"schemaVersion":"donmai.terminal-workarea-lease-request.v1","settlementBudgetMs":977000,"safetyMarginMs":60000,"leaseDurationMs":1800000,"maxLeaseDurationMs":7200000}`},
+	}
+	digests := make([]string, 0, len(variants))
+	for _, variant := range variants {
+		variant := variant
+		t.Run(variant.id, func(t *testing.T) {
+			tmp := t.TempDir()
+			cfg := daemon.DefaultConfig()
+			cfg.Orchestrator.URL = "http://127.0.0.1:1"
+			cfg.Projects = []daemon.ProjectConfig{{ID: "wire-project", Repository: "github.com/foo/bar"}}
+			if err := daemon.WriteConfig(filepath.Join(tmp, "daemon.yaml"), cfg); err != nil {
+				t.Fatal(err)
+			}
+			d := daemon.New(daemon.Options{
+				ConfigPath: filepath.Join(tmp, "daemon.yaml"), JWTPath: filepath.Join(tmp, "daemon.jwt"),
+				HTTPHost: "127.0.0.1", HTTPPort: 0, SkipWizard: true, SkipRegistration: true,
+				SpawnerOptions: daemon.SpawnerOptions{WorkerCommand: []string{"/bin/sh", "-c", "sleep 2"}},
+			})
+			if err := d.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = d.Stop(context.Background()) })
+			srv := daemon.NewServer(d)
+			if _, err := srv.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+
+			raw := []byte(fmt.Sprintf(`{"sessionId":%q,"projectId":"wire-project","repository":"github.com/foo/bar","body":"wire"%s}`, variant.id, variant.collections))
+			var item daemon.PollWorkItem
+			if err := json.Unmarshal(raw, &item); err != nil {
+				t.Fatal(err)
+			}
+			producerDigest, err := executioncell.DigestOperationalPayload(item.OperationalPayload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			detail := daemon.PollItemToSessionDetail(item, nil, "https://platform.example", "token", "worker-1")
+			if _, err := d.AcceptWorkWithDetail(daemon.SessionSpec{SessionID: variant.id, ProjectID: "wire-project", Repository: "github.com/foo/bar"}, detail); err != nil {
+				t.Fatal(err)
+			}
+			fetched, err := fetchSessionDetail(context.Background(), &http.Client{Timeout: 2 * time.Second}, "http://"+srv.Addr(), variant.id, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			qw := detailToQueuedWork(fetched)
+			consumerDigest, err := runner.DigestOperationalPayload(qw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if consumerDigest != producerDigest {
+				t.Fatalf("digest after detail HTTP = %q, producer = %q", consumerDigest, producerDigest)
+			}
+			digests = append(digests, consumerDigest)
+		})
+	}
+	if len(digests) == 2 && digests[0] == digests[1] {
+		t.Fatalf("omitted and recursively present-empty poll fixtures produced one digest: %q", digests[0])
+	}
+}
+
 // codexOnPath reports whether the `codex` binary resolves on $PATH.
 // Used by the happy-path test to skip when the codex provider would
 // be probed (and trigger the codex startup/shutdown race).
@@ -314,20 +381,32 @@ func TestFetchSessionDetail_DaemonUnreachable(t *testing.T) {
 // TestDetailToQueuedWork verifies the wire-shape translation copies
 // every field through.
 func TestDetailToQueuedWork(t *testing.T) {
+	admissionReceipt := json.RawMessage(`{"contractVersion":"future-version","opaque":true}`)
+	claimReceipt := json.RawMessage(`{"contractVersion":"future-version","claim":true}`)
+	effectiveCell := json.RawMessage(`{"contractVersion":"future-version","cell":true}`)
 	d := &daemon.SessionDetail{
-		SessionID:       "sess-3",
-		IssueID:         "lin-1",
-		IssueIdentifier: "ENG-1",
-		Repository:      "github.com/foo/bar",
-		Branch:          "agent/sess-3",
-		WorkType:        "development",
-		WorkerID:        "wkr_1",
-		AuthToken:       "tok",
-		PlatformURL:     "https://app.example.com",
+		SessionID:        "sess-3",
+		AdmissionReceipt: admissionReceipt,
+		ClaimReceipt:     claimReceipt,
+		EffectiveCell:    effectiveCell,
+		IssueID:          "lin-1",
+		IssueIdentifier:  "ENG-1",
+		Repository:       "github.com/foo/bar",
+		Branch:           "agent/sess-3",
+		WorkType:         "development",
+		WorkerID:         "wkr_1",
+		AuthToken:        "tok",
+		PlatformURL:      "https://app.example.com",
 		ResolvedProfile: &daemon.SessionResolvedProfile{
 			Provider: "stub",
 			Model:    "claude-sonnet-4-5",
 			Effort:   "high",
+			Endpoint: &daemon.SessionEndpointBinding{
+				Company: "openai", Model: "gpt-test", Protocol: "openai-responses", Host: "direct",
+				EndpointID: "endpoint-id", EndpointOperator: "openai", EndpointRevision: "r1", ModelAuthor: "openai",
+				AuthBindingID: "auth-id", AuthAuthority: "openai", AuthCommercialMode: "usage_billed",
+				AuthBindingScope: "process", AuthPortability: "portable", AuthDelivery: "environment", Mechanism: "api_key",
+			},
 		},
 	}
 	qw := detailToQueuedWork(d)
@@ -342,6 +421,21 @@ func TestDetailToQueuedWork(t *testing.T) {
 	}
 	if qw.ResolvedProfile.Effort != agent.EffortHigh {
 		t.Errorf("effort = %q, want high", qw.ResolvedProfile.Effort)
+	}
+	if !bytes.Equal(qw.AdmissionReceipt, admissionReceipt) {
+		t.Errorf("admission receipt = %s, want byte-identical %s", qw.AdmissionReceipt, admissionReceipt)
+	}
+	if !bytes.Equal(qw.ClaimReceipt, claimReceipt) || !bytes.Equal(qw.EffectiveCell, effectiveCell) {
+		t.Fatalf("claim/effective evidence mismatch: claim=%s cell=%s", qw.ClaimReceipt, qw.EffectiveCell)
+	}
+	if endpoint := qw.ResolvedProfile.Endpoint; endpoint == nil || endpoint.EndpointID != "endpoint-id" || endpoint.AuthBindingID != "auth-id" || endpoint.Host != agent.HostDirect {
+		t.Fatalf("endpoint projection = %+v", endpoint)
+	}
+	qw.AdmissionReceipt[0] = '['
+	qw.ClaimReceipt[0] = '['
+	qw.EffectiveCell[0] = '['
+	if admissionReceipt[0] != '{' || claimReceipt[0] != '{' || effectiveCell[0] != '{' {
+		t.Fatal("QueuedWork aliases SessionDetail execution evidence bytes")
 	}
 }
 
@@ -957,6 +1051,41 @@ func TestRunAgentRun_PreflightSessionNotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "preflight") {
 		t.Errorf("error = %q, want preflight prefix", err.Error())
+	}
+}
+
+func TestRunAgentRunNonReadyHostReceiptHasZeroChildSideEffects(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	var gatewayCalls, daemonCalls, platformCalls atomic.Int32
+	originalBind := bindWorkerGatewayForAgentRun
+	bindWorkerGatewayForAgentRun = func(context.Context, *slog.Logger, *daemon.SessionDetail, *runner.QueuedWork, string) (*workerGateway, error) {
+		gatewayCalls.Add(1)
+		return nil, errors.New("unreachable gateway")
+	}
+	t.Cleanup(func() { bindWorkerGatewayForAgentRun = originalBind })
+	platform := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { platformCalls.Add(1) }))
+	defer platform.Close()
+	detail := &daemon.SessionDetail{
+		SessionID: "host-denied", WorkerID: "worker-1", PlatformURL: platform.URL,
+		AdmissionReceipt:      json.RawMessage(`{"contractVersion":"execution-cell/v1alpha1"}`),
+		HostAdaptationReceipt: json.RawMessage(`{"contractVersion":"host-adaptation/v1","requestId":"host-denied","workerId":"worker-1","decision":"denied"}`),
+	}
+	daemonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		daemonCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(detail) //nolint:gosec // G117: test fixture uses an intentionally empty auth token
+	}))
+	defer daemonServer.Close()
+	worktreeRoot := t.TempDir()
+	err := runAgentRun(context.Background(), &cobra.Command{}, &agentRunOpts{sessionID: detail.SessionID, daemonURL: daemonServer.URL, worktree: worktreeRoot})
+	if err == nil || !strings.Contains(err.Error(), "no valid daemon adaptation-ready receipt") {
+		t.Fatalf("error = %v", err)
+	}
+	entries, readErr := os.ReadDir(worktreeRoot)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if daemonCalls.Load() != 1 || gatewayCalls.Load() != 0 || platformCalls.Load() != 0 || len(entries) != 0 {
+		t.Fatalf("detail=%d gateway=%d status/result/credential=%d worktreeEntries=%d", daemonCalls.Load(), gatewayCalls.Load(), platformCalls.Load(), len(entries))
 	}
 }
 

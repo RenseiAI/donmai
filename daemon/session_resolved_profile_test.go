@@ -19,6 +19,12 @@ func TestSessionResolvedProfile_HarnessRoundTrips(t *testing.T) {
 		Harness:  "agy",
 		Provider: "gemini",
 		Model:    "gemini-3.1-pro",
+		Endpoint: &SessionEndpointBinding{
+			Company: "google", Model: "gemini-3.1-pro", Protocol: "google-genai", Host: "vertex",
+			EndpointID: "endpoint-google", EndpointOperator: "google", EndpointRevision: "r1", ModelAuthor: "google",
+			AuthBindingID: "auth-google", AuthAuthority: "google", AuthCommercialMode: "usage_billed",
+			AuthBindingScope: "process", AuthPortability: "portable", AuthDelivery: "environment", Mechanism: "service_account",
+		},
 	}
 
 	buf, err := json.Marshal(in)
@@ -40,6 +46,12 @@ func TestSessionResolvedProfile_HarnessRoundTrips(t *testing.T) {
 	}
 	if got := out.Provider; got != "gemini" {
 		t.Errorf("Provider round-trip = %q; want %q", got, "gemini")
+	}
+	if out.Endpoint == nil || out.Endpoint.EndpointID != "endpoint-google" || out.Endpoint.AuthBindingID != "auth-google" {
+		t.Errorf("Endpoint round-trip = %+v", out.Endpoint)
+	}
+	if strings.Contains(string(buf), `"env"`) || strings.Contains(string(buf), "credentialValue") {
+		t.Fatalf("endpoint wire projection is not secret-free: %s", buf)
 	}
 }
 

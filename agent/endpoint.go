@@ -113,6 +113,21 @@ type EndpointBinding struct {
 	BaseURL  string       `json:"baseUrl"`
 	Protocol WireProtocol `json:"protocol"`
 	Host     ServingHost  `json:"host"`
+
+	// Execution-cell identity fields are stable, secret-free references. They
+	// are required for receipt-bearing work so a concrete endpoint/auth binding
+	// can be compared without inferring identity from Company, Host, BaseURL, or
+	// ambient CLI state.
+	EndpointID         string `json:"endpointId,omitempty"`
+	EndpointOperator   string `json:"endpointOperator,omitempty"`
+	EndpointRevision   string `json:"endpointRevision,omitempty"`
+	ModelAuthor        string `json:"modelAuthor,omitempty"`
+	AuthBindingID      string `json:"authBindingId,omitempty"`
+	AuthAuthority      string `json:"authAuthority,omitempty"`
+	AuthCommercialMode string `json:"authCommercialMode,omitempty"`
+	AuthBindingScope   string `json:"authBindingScope,omitempty"`
+	AuthPortability    string `json:"authPortability,omitempty"`
+	AuthDelivery       string `json:"authDelivery,omitempty"`
 	// Mechanism is the exact endpoint authentication protocol. Auth remains
 	// alongside it for backwards-compatible commercial/access policy.
 	Mechanism AuthMechanism `json:"mechanism,omitempty"`

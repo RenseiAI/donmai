@@ -33,6 +33,22 @@ type SessionDetail struct {
 	// SessionID is the platform session UUID. Always populated.
 	SessionID string `json:"sessionId"`
 
+	// AdmissionReceipt is the opaque, immutable execution-cell admission
+	// evidence produced before enqueue. The runner owns strict decoding.
+	AdmissionReceipt json.RawMessage `json:"admissionReceipt,omitempty"`
+
+	// ClaimReceipt and EffectiveCell carry claim-time narrowing and the exact
+	// secret-free runtime identity opaquely. The runner owns strict decoding.
+	ClaimReceipt            json.RawMessage `json:"claimReceipt,omitempty"`
+	EffectiveCell           json.RawMessage `json:"effectiveCell,omitempty"`
+	ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding,omitempty"`
+	// OperationalPayload is forwarded without typed reconstruction. Its nested
+	// omitted versus present-empty states are part of admission identity.
+	OperationalPayload json.RawMessage `json:"operationalPayload,omitempty"`
+	// HostAdaptationReceipt is the immutable ready receipt persisted by the
+	// daemon before credentials are resolved or the child is started.
+	HostAdaptationReceipt json.RawMessage `json:"hostAdaptationReceipt,omitempty"`
+
 	// IssueID is the Linear issue UUID this session was triggered for.
 	IssueID string `json:"issueId,omitempty"`
 
@@ -289,6 +305,11 @@ type SessionResolvedProfile struct {
 	CredentialID   string         `json:"credentialId,omitempty"`
 	ProviderConfig map[string]any `json:"providerConfig,omitempty"`
 
+	// Endpoint is the complete secret-free serving/auth projection selected at
+	// admission. Receipt-bearing work must carry it explicitly; the runner does
+	// not reconstruct an endpoint identity from ambient CLI or host defaults.
+	Endpoint *SessionEndpointBinding `json:"endpoint,omitempty"`
+
 	// AuthMode is the credential auth mode the platform resolved for this
 	// session: "byok" | "metered" | "shared" | "host-session" | "local".
 	// Used by the daemon's credential injection hook to decide whether a
@@ -317,6 +338,27 @@ type SessionResolvedProfile struct {
 	// platform stamps); the daemon never edits it. Absent/empty on pre-P3
 	// dispatches; the gate (S3) treats it as the ceiling.
 	PlatformAllowed []access.AuthMode `json:"platformAllowed,omitempty"`
+}
+
+// SessionEndpointBinding mirrors agent.EndpointBinding without credential
+// values. String fields keep the daemon independent of the agent package while
+// preserving every execution-cell axis across the poll/detail boundary.
+type SessionEndpointBinding struct {
+	Company            string `json:"company"`
+	Model              string `json:"model"`
+	Protocol           string `json:"protocol"`
+	Host               string `json:"host"`
+	EndpointID         string `json:"endpointId"`
+	EndpointOperator   string `json:"endpointOperator"`
+	EndpointRevision   string `json:"endpointRevision"`
+	ModelAuthor        string `json:"modelAuthor"`
+	AuthBindingID      string `json:"authBindingId"`
+	AuthAuthority      string `json:"authAuthority"`
+	AuthCommercialMode string `json:"authCommercialMode"`
+	AuthBindingScope   string `json:"authBindingScope"`
+	AuthPortability    string `json:"authPortability"`
+	AuthDelivery       string `json:"authDelivery"`
+	Mechanism          string `json:"mechanism"`
 }
 
 // SessionModelProfile mirrors runner.ResolvedModelProfile but lives in

@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -38,10 +39,14 @@ func (e *HarnessAdmissionError) Unwrap() error { return e.cause }
 // vocabulary so they can be attached to the full upstream receipt when the
 // dispatch contract is threaded end-to-end.
 type harnessSelection struct {
-	Provider  agent.Provider
-	Harness   executioncell.HarnessRef
-	Decisions []executioncell.ResolverDecision
-	Explicit  bool
+	Provider      agent.Provider
+	Harness       executioncell.HarnessRef
+	Decisions     []executioncell.ResolverDecision
+	Explicit      bool
+	receipt       executioncell.ImmutableAdmissionReceipt
+	claimReceipt  executioncell.ImmutableClaimReceipt
+	effectiveCell executioncell.ResolvedExecutionCell
+	effectiveJSON []byte
 }
 
 type harnessSelectorIntent struct {
@@ -65,6 +70,7 @@ type HarnessAdmission struct {
 	requestID           string
 	intent              harnessSelectorIntent
 	selection           harnessSelection
+	receipt             executioncell.ImmutableAdmissionReceipt
 	denial              error
 	denialPayloadDigest string
 	consumed            atomic.Bool
@@ -88,13 +94,16 @@ func (a *HarnessAdmission) CanonicalHarnessRef() (executioncell.HarnessRef, bool
 // the named legacy adapter inside Run. Explicit denials carry a canonical
 // immutable denied receipt on HarnessAdmissionError.
 func (r *Registry) PreflightHarness(qw QueuedWork) (*HarnessAdmission, error) {
+	if len(qw.AdmissionReceipt) > 0 {
+		return r.preflightAdmissionReceipt(qw, true)
+	}
 	if qw.ResolvedProfile.Harness == "" {
 		return nil, nil
 	}
 	selection, err := r.selectExplicitHarness(qw.ResolvedProfile)
 	if err != nil {
 		denial := attachDeniedHarnessReceipt(qw, err, time.Now())
-		payloadDigest, _ := executioncell.DigestContractValue(qw)
+		payloadDigest, _ := DigestOperationalPayload(qw)
 		return &HarnessAdmission{
 			registry: r, requestID: qw.SessionID,
 			intent: selectorIntent(qw.ResolvedProfile), denial: denial,
@@ -105,6 +114,314 @@ func (r *Registry) PreflightHarness(qw QueuedWork) (*HarnessAdmission, error) {
 		registry: r, requestID: qw.SessionID,
 		intent: selectorIntent(qw.ResolvedProfile), selection: selection,
 	}, nil
+}
+
+func (r *Registry) preflightAdmissionReceipt(qw QueuedWork, requireHostAdaptation bool) (*HarnessAdmission, error) {
+	immutable, err := executioncell.DecodeAdmissionReceipt(qw.AdmissionReceipt)
+	if err != nil {
+		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, err), err
+	}
+	receipt := immutable.Value()
+	if receipt.RequestID != qw.SessionID {
+		denial := receiptHarnessDenial(receipt, executioncell.DenialFallbackNotAllowed,
+			"admission receipt request does not match queued session")
+		attached := attachDeniedHarnessReceipt(qw, denial, time.Now())
+		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, attached), attached
+	}
+	payloadDigest, digestErr := DigestOperationalPayload(qw)
+	if digestErr != nil {
+		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, digestErr), digestErr
+	}
+	if payloadDigest != receipt.OperationalPayloadDigest {
+		denial := receiptHarnessDenial(receipt, executioncell.DenialFallbackNotAllowed,
+			"queued operational payload does not match admitted digest")
+		attached := attachDeniedHarnessReceipt(qw, denial, time.Now())
+		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, attached), attached
+	}
+	if receipt.Decision == executioncell.AdmissionDenied {
+		denial := &HarnessAdmissionError{
+			Code:      receipt.DenialCode,
+			Detail:    receipt.DenialDetail,
+			Decisions: append([]executioncell.ResolverDecision(nil), receipt.ResolverDecisions...),
+			Receipt:   immutable,
+		}
+		return deniedHarnessAdmissionToken(r, qw, immutable, denial), denial
+	}
+
+	effectiveCell, effectiveJSON, claimReceipt, cellErr := resolveReceiptEffectiveCell(qw, immutable, requireHostAdaptation)
+	if cellErr != nil {
+		cellErr = attachDeniedHarnessReceipt(qw, cellErr, time.Now())
+		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, cellErr), cellErr
+	}
+	selection, selectionErr := r.selectReceiptHarness(qw, receipt, effectiveCell)
+	if selectionErr != nil {
+		selectionErr = attachDeniedHarnessReceipt(qw, selectionErr, time.Now())
+		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, selectionErr), selectionErr
+	}
+	selection.receipt = immutable
+	selection.claimReceipt = claimReceipt
+	selection.effectiveCell = effectiveCell
+	selection.effectiveJSON = effectiveJSON
+	return &HarnessAdmission{
+		registry: r, requestID: qw.SessionID,
+		intent: selectorIntent(qw.ResolvedProfile), selection: selection, receipt: immutable,
+	}, nil
+}
+
+func deniedHarnessAdmissionToken(r *Registry, qw QueuedWork, receipt executioncell.ImmutableAdmissionReceipt, denial error) *HarnessAdmission {
+	payloadDigest, _ := DigestOperationalPayload(qw)
+	return &HarnessAdmission{
+		registry: r, requestID: qw.SessionID,
+		intent: selectorIntent(qw.ResolvedProfile), receipt: receipt, denial: denial,
+		denialPayloadDigest: payloadDigest,
+	}
+}
+
+// resolveReceiptEffectiveCell closes the admission-to-runtime placement gap.
+// An exact admission is already effective and must not carry claim evidence. A
+// claim-bound pool must carry one claimed, narrow-only receipt. In both cases
+// the worker independently supplies the secret-free EffectiveCell bytes it is
+// about to execute, and those bytes must canonically equal the expected cell.
+func resolveReceiptEffectiveCell(qw QueuedWork, admission executioncell.ImmutableAdmissionReceipt, requireHostAdaptation bool) (executioncell.ResolvedExecutionCell, []byte, executioncell.ImmutableClaimReceipt, error) {
+	receipt := admission.Value()
+	if receipt.Cell == nil {
+		return executioncell.ResolvedExecutionCell{}, nil, executioncell.ImmutableClaimReceipt{},
+			receiptHarnessDenial(receipt, executioncell.DenialHarnessUnavailable, "admitted receipt does not contain a resolved execution cell")
+	}
+
+	expected := *receipt.Cell
+	binding, bindingErr := executioncell.DecodeRuntimeBinding(qw.ExecutionRuntimeBinding)
+	if bindingErr != nil {
+		return executioncell.ResolvedExecutionCell{}, nil, executioncell.ImmutableClaimReceipt{},
+			receiptHarnessDenial(receipt, executioncell.DenialPlacementUnsatisfied, "receipt-bearing work requires a valid daemon runtime binding")
+	}
+	if binding.RequestID != qw.SessionID || binding.WorkerID != qw.WorkerID {
+		return executioncell.ResolvedExecutionCell{}, nil, executioncell.ImmutableClaimReceipt{},
+			receiptHarnessDenial(receipt, executioncell.DenialPlacementUnsatisfied, "runtime binding is not owned by this request and worker")
+	}
+	var claim executioncell.ImmutableClaimReceipt
+	claimBound := expected.Placement.Kind == executioncell.PlacementPool && expected.Placement.Resolution == executioncell.PlacementClaimBound
+	switch {
+	case claimBound:
+		if len(qw.ClaimReceipt) == 0 {
+			return executioncell.ResolvedExecutionCell{}, nil, claim,
+				receiptHarnessDenial(receipt, executioncell.DenialPlacementUnsatisfied, "claim-bound admission requires a claim receipt")
+		}
+		decoded, err := executioncell.DecodeClaimReceipt(qw.ClaimReceipt)
+		if err != nil {
+			return executioncell.ResolvedExecutionCell{}, nil, claim, &HarnessAdmissionError{
+				Code: executioncell.DenialPlacementUnsatisfied, Harness: receiptCellHarnessID(receipt),
+				Detail: "claim receipt is not a valid closed execution-cell contract", cause: err,
+			}
+		}
+		if err := executioncell.AssertNarrowClaim(admission, decoded); err != nil {
+			return executioncell.ResolvedExecutionCell{}, nil, claim, &HarnessAdmissionError{
+				Code: executioncell.DenialPlacementUnsatisfied, Harness: receiptCellHarnessID(receipt),
+				Detail: "claim receipt does not narrow the admitted cell", cause: err,
+			}
+		}
+		claimValue := decoded.Value()
+		if claimValue.Decision != executioncell.ClaimClaimed || claimValue.EffectiveCell == nil {
+			return executioncell.ResolvedExecutionCell{}, nil, claim,
+				receiptHarnessDenial(receipt, executioncell.DenialPlacementUnsatisfied, "claim receipt did not produce an effective cell")
+		}
+		claim = decoded
+		expected = *claimValue.EffectiveCell
+		if binding.ClaimID != claimValue.ClaimID {
+			return executioncell.ResolvedExecutionCell{}, nil, claim,
+				receiptHarnessDenial(receipt, executioncell.DenialPlacementUnsatisfied, "claim receipt is not the active claim for this worker")
+		}
+	case len(qw.ClaimReceipt) != 0:
+		return executioncell.ResolvedExecutionCell{}, nil, claim,
+			receiptHarnessDenial(receipt, executioncell.DenialUnknownPlacement, "exact admission must not carry a claim receipt")
+	case binding.ClaimID != "":
+		return executioncell.ResolvedExecutionCell{}, nil, claim,
+			receiptHarnessDenial(receipt, executioncell.DenialUnknownPlacement, "exact admission must not carry an active claim id")
+	}
+	if binding.PlacementID != expected.Placement.ID {
+		return executioncell.ResolvedExecutionCell{}, nil, claim,
+			receiptHarnessDenial(receipt, executioncell.DenialPlacementUnsatisfied, "effective placement is not the target assigned to this worker")
+	}
+
+	if len(qw.EffectiveCell) == 0 {
+		return executioncell.ResolvedExecutionCell{}, nil, claim,
+			receiptHarnessDenial(receipt, executioncell.DenialPlacementUnsatisfied, "receipt-bearing work requires an explicit effective cell")
+	}
+	effective, err := executioncell.DecodeResolvedExecutionCell(qw.EffectiveCell)
+	if err != nil {
+		return executioncell.ResolvedExecutionCell{}, nil, claim, &HarnessAdmissionError{
+			Code: executioncell.DenialPlacementUnsatisfied, Harness: receiptCellHarnessID(receipt),
+			Detail: "effective cell is not a valid closed execution-cell contract", cause: err,
+		}
+	}
+	effectiveJSON, err := executioncell.CanonicalJSON(effective)
+	if err != nil {
+		return executioncell.ResolvedExecutionCell{}, nil, claim, err
+	}
+	expectedJSON, err := executioncell.CanonicalJSON(expected)
+	if err != nil {
+		return executioncell.ResolvedExecutionCell{}, nil, claim, err
+	}
+	if !bytes.Equal(effectiveJSON, expectedJSON) {
+		return executioncell.ResolvedExecutionCell{}, nil, claim,
+			receiptHarnessDenial(receipt, executioncell.DenialFallbackNotAllowed, "runtime effective cell does not equal the admitted or claimed cell")
+	}
+	if requireHostAdaptation {
+		if err := validateHostAdaptationReceipt(qw, receipt, claim, binding); err != nil {
+			return executioncell.ResolvedExecutionCell{}, nil, claim,
+				receiptHarnessDenial(receipt, executioncell.DenialPlacementUnsatisfied, err.Error())
+		}
+	}
+	return effective, effectiveJSON, claim, nil
+}
+
+func validateHostAdaptationReceipt(qw QueuedWork, admission executioncell.AdmissionReceipt, claim executioncell.ImmutableClaimReceipt, binding executioncell.RuntimeBinding) error {
+	host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
+	if err != nil {
+		return fmt.Errorf("daemon adaptation-ready receipt is invalid: %w", err)
+	}
+	if host.RequestID != qw.SessionID || host.WorkerID != qw.WorkerID || host.PlacementID != binding.PlacementID || host.ClaimID != binding.ClaimID || host.Decision != "ready" {
+		return errors.New("daemon adaptation-ready receipt does not match the active runtime binding")
+	}
+	var promptReceipt agent.PromptDeliveryReceipt
+	if err := json.Unmarshal(host.PromptReceipt, &promptReceipt); err != nil || promptReceipt.Decision != "ready" {
+		return errors.New("daemon prompt adaptation receipt is not ready")
+	}
+	var toolReceipt agent.ToolLifecycleReceipt
+	if err := json.Unmarshal(host.ToolLifecycleReceipt, &toolReceipt); err != nil || toolReceipt.Decision != "ready" {
+		return errors.New("daemon tool/lifecycle adaptation receipt is not ready")
+	}
+	if toolReceipt.AdmissionReceiptID != admission.ReceiptID || toolReceipt.OperationalPayloadDigest != admission.OperationalPayloadDigest {
+		return errors.New("daemon tool/lifecycle receipt is not linked to this admission and operational payload")
+	}
+	wantClaimID := ""
+	if len(claim.Bytes()) > 0 {
+		wantClaimID = claim.Value().ClaimReceiptID
+	}
+	if toolReceipt.ClaimReceiptID != wantClaimID {
+		return errors.New("daemon tool/lifecycle receipt is not linked to this claim")
+	}
+	return nil
+}
+
+func (r *Registry) selectReceiptHarness(qw QueuedWork, receipt executioncell.AdmissionReceipt, cell executioncell.ResolvedExecutionCell) (harnessSelection, error) {
+	if receipt.Cell == nil {
+		return harnessSelection{}, receiptHarnessDenial(receipt, executioncell.DenialHarnessUnavailable,
+			"admitted receipt does not contain a resolved execution cell")
+	}
+
+	profile := qw.ResolvedProfile
+	if profile.Harness == "" {
+		profile.Harness = cell.Harness.ID
+	}
+	selection, err := r.selectExplicitHarness(profile)
+	if err != nil {
+		return harnessSelection{}, err
+	}
+	if selection.Harness.ID != cell.Harness.ID {
+		return harnessSelection{}, receiptHarnessDenial(receipt, executioncell.DenialUnknownHarness,
+			fmt.Sprintf("queued harness resolves to %q but admission receipt pins %q", selection.Harness.ID, cell.Harness.ID))
+	}
+	if selection.Harness.Version != cell.Harness.Version {
+		return harnessSelection{}, receiptHarnessDenial(receipt, executioncell.DenialUnsupportedHarnessVersion,
+			fmt.Sprintf("registered harness %q has version %q but admission receipt pins %q", selection.Harness.ID, selection.Harness.Version, cell.Harness.Version))
+	}
+	if err := validateReceiptCell(qw, receipt, selection, cell); err != nil {
+		return harnessSelection{}, err
+	}
+	selection.Decisions = append([]executioncell.ResolverDecision(nil), receipt.ResolverDecisions...)
+	selection.Explicit = true
+	return selection, nil
+}
+
+func validateReceiptCell(qw QueuedWork, receipt executioncell.AdmissionReceipt, selection harnessSelection, cell executioncell.ResolvedExecutionCell) error {
+	if strings.TrimSpace(qw.ResolvedProfile.Model) != cell.Model.ID {
+		return receiptHarnessDenial(receipt, executioncell.DenialUnknownModel,
+			fmt.Sprintf("queued model %q does not match admitted model %q", strings.TrimSpace(qw.ResolvedProfile.Model), cell.Model.ID))
+	}
+	wantMode := executioncell.SessionAutonomous
+	if qw.isInteractive() || qw.isInterview() {
+		wantMode = executioncell.SessionHumanControlled
+	}
+	if cell.SessionMode != wantMode {
+		return receiptHarnessDenial(receipt, executioncell.DenialUnsupportedSessionMode,
+			fmt.Sprintf("queued mode %q resolves to %q but admission receipt pins %q", qw.Mode, wantMode, cell.SessionMode))
+	}
+	if selection.Harness.ID != cell.Harness.ID || selection.Harness.Version != cell.Harness.Version {
+		return receiptHarnessDenial(receipt, executioncell.DenialUnsupportedHarnessVersion, "selected harness identity changed after admission")
+	}
+	endpoint := qw.ResolvedProfile.Endpoint
+	if endpoint == nil {
+		return receiptHarnessDenial(receipt, executioncell.DenialUnknownEndpoint, "receipt-bearing work requires an explicit endpoint binding")
+	}
+	if endpoint.EndpointID != cell.Endpoint.ID || endpoint.EndpointOperator != cell.Endpoint.Operator ||
+		endpoint.EndpointRevision != cell.Endpoint.Revision || string(endpoint.Protocol) != cell.Endpoint.Protocol ||
+		endpoint.Model != cell.Model.ID || endpoint.ModelAuthor != cell.Model.Author || string(endpoint.Company) != cell.Model.Author {
+		return receiptHarnessDenial(receipt, executioncell.DenialUnknownEndpoint, "resolved endpoint/model identity does not match the effective cell")
+	}
+	if endpoint.AuthBindingID != cell.AuthBinding.ID || endpoint.Mechanism != cell.AuthBinding.Mechanism ||
+		endpoint.AuthCommercialMode != string(cell.AuthBinding.CommercialMode) || endpoint.AuthAuthority != cell.AuthBinding.Authority ||
+		endpoint.AuthBindingScope != string(cell.AuthBinding.BindingScope) || endpoint.AuthPortability != string(cell.AuthBinding.Portability) ||
+		endpoint.AuthDelivery != string(cell.AuthBinding.Delivery) {
+		return receiptHarnessDenial(receipt, executioncell.DenialUnknownAuthBinding, "resolved authentication binding does not match the effective cell")
+	}
+	manifestProvider, ok := selection.Provider.(agent.HarnessProvider)
+	if !ok {
+		return receiptHarnessDenial(receipt, executioncell.DenialHarnessUnavailable, "selected runtime does not expose an exact harness manifest")
+	}
+	manifest := manifestProvider.Manifest()
+	if !containsWireProtocol(manifest.Caps.Drives, endpoint.Protocol) || !containsServingHost(manifest.Caps.DrivesHosts, endpoint.Host) {
+		return receiptHarnessDenial(receipt, executioncell.DenialUnknownEndpoint, "selected harness does not drive the admitted endpoint protocol and host")
+	}
+	seenCapabilities := make(map[string]struct{}, len(cell.GrantedCapabilities))
+	for _, capability := range cell.GrantedCapabilities {
+		if _, duplicate := seenCapabilities[capability.Name]; duplicate {
+			return receiptHarnessDenial(receipt, executioncell.DenialCapabilityUnsupported,
+				fmt.Sprintf("admitted capability %q is duplicated", capability.Name))
+		}
+		seenCapabilities[capability.Name] = struct{}{}
+		switch capability.Name {
+		case "watch", "replay", "cancel":
+			// These capabilities are projected onto the existing exact
+			// tool/lifecycle plan immediately before provider spawn.
+		default:
+			return receiptHarnessDenial(receipt, executioncell.DenialCapabilityUnsupported,
+				fmt.Sprintf("admitted capability %q has no current exact pre-spawn adapter", capability.Name))
+		}
+	}
+	return nil
+}
+
+func containsWireProtocol(values []agent.WireProtocol, want agent.WireProtocol) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsServingHost(values []agent.ServingHost, want agent.ServingHost) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func receiptHarnessDenial(receipt executioncell.AdmissionReceipt, code executioncell.AdmissionDenialCode, detail string) *HarnessAdmissionError {
+	return &HarnessAdmissionError{
+		Code: code, Harness: receiptCellHarnessID(receipt), Detail: detail,
+		Decisions: append([]executioncell.ResolverDecision(nil), receipt.ResolverDecisions...),
+	}
+}
+
+func receiptCellHarnessID(receipt executioncell.AdmissionReceipt) string {
+	if receipt.Cell == nil {
+		return ""
+	}
+	return receipt.Cell.Harness.ID
 }
 
 const (
@@ -390,6 +707,13 @@ func legacyUnresolvedDecision(source legacyHarnessSource) executioncell.Resolver
 // may retain posterior behavior, but the final posterior/static provider is
 // handed once to the explicit legacy adapter.
 func (r *Runner) resolveHarnessSelection(ctx context.Context, qw QueuedWork) (harnessSelection, error) {
+	if len(qw.AdmissionReceipt) > 0 {
+		admission, err := r.registry.PreflightHarness(qw)
+		if err != nil {
+			return harnessSelection{}, err
+		}
+		return r.admittedHarnessSelection(ctx, qw, admission)
+	}
 	if qw.ResolvedProfile.Harness != "" {
 		return r.registry.selectExplicitHarness(qw.ResolvedProfile)
 	}
@@ -413,8 +737,37 @@ func (r *Runner) admittedHarnessSelection(ctx context.Context, qw QueuedWork, ad
 	if admission.intent != selectorIntent(qw.ResolvedProfile) {
 		return harnessSelection{}, errors.New("runner: harness selector intent changed after preflight admission")
 	}
+	if len(admission.receipt.Bytes()) > 0 {
+		payloadDigest, err := DigestOperationalPayload(qw)
+		if err != nil {
+			return harnessSelection{}, fmt.Errorf("runner: digest operational payload after preflight: %w", err)
+		}
+		if payloadDigest != admission.receipt.Value().OperationalPayloadDigest {
+			return harnessSelection{}, errors.New("runner: operational payload changed after preflight admission")
+		}
+		currentReceipt, err := executioncell.DecodeAdmissionReceipt(qw.AdmissionReceipt)
+		if err != nil {
+			return harnessSelection{}, fmt.Errorf("runner: decode admission receipt after preflight: %w", err)
+		}
+		if !bytes.Equal(currentReceipt.Bytes(), admission.receipt.Bytes()) {
+			return harnessSelection{}, errors.New("runner: admission receipt changed after preflight")
+		}
+		if admission.denial == nil {
+			effectiveCell, effectiveJSON, claimReceipt, err := resolveReceiptEffectiveCell(qw, currentReceipt, true)
+			if err != nil {
+				return harnessSelection{}, err
+			}
+			if !bytes.Equal(effectiveJSON, admission.selection.effectiveJSON) ||
+				!bytes.Equal(claimReceipt.Bytes(), admission.selection.claimReceipt.Bytes()) {
+				return harnessSelection{}, errors.New("runner: claim receipt or effective cell changed after preflight")
+			}
+			if err := validateReceiptCell(qw, currentReceipt.Value(), admission.selection, effectiveCell); err != nil {
+				return harnessSelection{}, err
+			}
+		}
+	}
 	if admission.denial != nil {
-		payloadDigest, err := executioncell.DigestContractValue(qw)
+		payloadDigest, err := DigestOperationalPayload(qw)
 		if err != nil {
 			return harnessSelection{}, fmt.Errorf("runner: digest denied harness payload: %w", err)
 		}
@@ -458,7 +811,7 @@ func deniedHarnessAdmissionReceipt(qw QueuedWork, denial *HarnessAdmissionError,
 	if err != nil {
 		return executioncell.ImmutableAdmissionReceipt{}, err
 	}
-	payloadDigest, err := executioncell.DigestContractValue(qw)
+	payloadDigest, err := DigestOperationalPayload(qw)
 	if err != nil {
 		return executioncell.ImmutableAdmissionReceipt{}, err
 	}

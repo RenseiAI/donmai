@@ -9,14 +9,109 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/executioncell"
 )
 
 // ProviderView wraps a *Registry and satisfies daemon.ProviderRegistry.
 // Construct via NewProviderView. Read-only and safe for concurrent use.
 type ProviderView struct {
 	reg *Registry
+}
+
+type hostAdaptationReceipt struct {
+	ContractVersion string                       `json:"contractVersion"`
+	RequestID       string                       `json:"requestId"`
+	WorkerID        string                       `json:"workerId"`
+	PlacementID     string                       `json:"placementId"`
+	ClaimID         string                       `json:"claimId,omitempty"`
+	Decision        string                       `json:"decision"`
+	Prompt          *agent.PromptDeliveryReceipt `json:"promptReceipt,omitempty"`
+	ToolLifecycle   *agent.ToolLifecycleReceipt  `json:"toolLifecycleReceipt,omitempty"`
+	Denial          string                       `json:"denial,omitempty"`
+}
+
+// PreflightExecution is the host-process compiler used by daemon before its
+// credential hook. It consumes the same raw operational projection and closed
+// execution-cell contracts as the child runner.
+func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawMessage, error) {
+	var wire struct {
+		SessionID               string          `json:"sessionId"`
+		WorkerID                string          `json:"workerId"`
+		AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
+		ClaimReceipt            json.RawMessage `json:"claimReceipt"`
+		EffectiveCell           json.RawMessage `json:"effectiveCell"`
+		ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
+		OperationalPayload      json.RawMessage `json:"operationalPayload"`
+	}
+	if err := json.Unmarshal(detailJSON, &wire); err != nil {
+		return nil, err
+	}
+	var qw QueuedWork
+	if err := json.Unmarshal(wire.OperationalPayload, &qw); err != nil {
+		return nil, fmt.Errorf("decode host operational payload: %w", err)
+	}
+	qw.SessionID, qw.WorkerID = wire.SessionID, wire.WorkerID
+	qw.AdmissionReceipt, qw.ClaimReceipt, qw.EffectiveCell = wire.AdmissionReceipt, wire.ClaimReceipt, wire.EffectiveCell
+	qw.ExecutionRuntimeBinding, qw.OperationalPayload = wire.ExecutionRuntimeBinding, wire.OperationalPayload
+	binding, err := executioncell.DecodeRuntimeBinding(wire.ExecutionRuntimeBinding)
+	if err != nil {
+		return nil, err
+	}
+	receipt := hostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion, RequestID: binding.RequestID,
+		WorkerID: binding.WorkerID, PlacementID: binding.PlacementID,
+		ClaimID: binding.ClaimID, Decision: "denied",
+	}
+	encode := func(cause error) (json.RawMessage, error) {
+		if cause != nil {
+			receipt.Denial = cause.Error()
+		}
+		raw, marshalErr := json.Marshal(receipt)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		return raw, cause
+	}
+	admission, err := v.reg.preflightAdmissionReceipt(qw, false)
+	if err != nil {
+		return encode(err)
+	}
+	if admission == nil || admission.selection.Provider == nil {
+		return encode(fmt.Errorf("host adaptation requires explicit receipt admission"))
+	}
+	harness, ok := admission.selection.Provider.(agent.HarnessProvider)
+	if !ok {
+		return encode(fmt.Errorf("selected provider has no closed harness manifest"))
+	}
+	spec := translateSpec(qw, admission.selection.Provider.Capabilities(), SpecInputs{
+		Autonomous: true, MCPServers: qw.McpServers,
+		ProviderName: string(admission.selection.Provider.Name()),
+	})
+	spec, err = bindAdmissionToolLifecyclePlan(spec, admission.receipt, admission.selection.claimReceipt)
+	if err != nil {
+		return encode(err)
+	}
+	spec.OnPromptAdapted = func(value agent.PromptDeliveryReceipt) error {
+		snapshot := value
+		receipt.Prompt = &snapshot
+		return nil
+	}
+	spec.OnToolLifecycleAdapted = func(value agent.ToolLifecycleReceipt) error {
+		snapshot := value
+		receipt.ToolLifecycle = &snapshot
+		return nil
+	}
+	if _, err = agent.PrepareHarness(spec, harness.Manifest()); err != nil {
+		return encode(err)
+	}
+	if receipt.Prompt == nil || receipt.Prompt.Decision != "ready" || receipt.ToolLifecycle == nil || receipt.ToolLifecycle.Decision != "ready" {
+		return encode(fmt.Errorf("host adaptation did not produce complete ready receipts"))
+	}
+	receipt.Decision = "ready"
+	return encode(nil)
 }
 
 // NewProviderView returns a ProviderView backed by reg. Pass the result

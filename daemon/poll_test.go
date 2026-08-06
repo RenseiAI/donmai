@@ -983,6 +983,25 @@ func TestPollItemToSessionDetail_InitialPromptForwarded(t *testing.T) {
 	}
 }
 
+func TestPollItemToSessionDetailForwardsExecutionEvidenceOpaquely(t *testing.T) {
+	t.Parallel()
+	admission := json.RawMessage(`{"contractVersion":"future-version","opaque":{"admission":true}}`)
+	claim := json.RawMessage(`{"contractVersion":"future-version","opaque":{"claim":true}}`)
+	effective := json.RawMessage(`{"contractVersion":"future-version","opaque":{"cell":true}}`)
+	detail := PollItemToSessionDetail(PollWorkItem{
+		SessionID: "receipted", AdmissionReceipt: admission, ClaimReceipt: claim, EffectiveCell: effective,
+	}, nil, "", "", "")
+	if !bytes.Equal(detail.AdmissionReceipt, admission) || !bytes.Equal(detail.ClaimReceipt, claim) || !bytes.Equal(detail.EffectiveCell, effective) {
+		t.Fatalf("execution evidence was not forwarded byte-identically: %+v", detail)
+	}
+	detail.AdmissionReceipt[0] = '['
+	detail.ClaimReceipt[0] = '['
+	detail.EffectiveCell[0] = '['
+	if admission[0] != '{' || claim[0] != '{' || effective[0] != '{' {
+		t.Fatal("SessionDetail aliases PollWorkItem execution evidence bytes")
+	}
+}
+
 // TestPollItemToSessionSpec_DoesNotWarn confirms that the spec
 // builder runs silently — the warn surfaces from the SessionDetail
 // builder so the same poll item can't produce two identical warns

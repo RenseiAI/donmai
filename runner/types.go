@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"encoding/json"
+
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/interview"
@@ -19,6 +21,28 @@ import (
 // during F.2.7 drive the field set.
 type QueuedWork struct {
 	prompt.QueuedWork
+
+	// AdmissionReceipt is the platform-produced, immutable execution-cell
+	// admission evidence. The daemon forwards it opaquely; the runner's closed
+	// decoder validates it before selecting a harness. Keeping the raw bytes at
+	// the wire boundary prevents an intermediate mirror from silently accepting
+	// or dropping fields from a newer contract version.
+	AdmissionReceipt json.RawMessage `json:"admissionReceipt,omitempty"`
+
+	// ClaimReceipt is required when AdmissionReceipt pins a claim-bound pool.
+	// It remains raw until the runner's closed decoder proves that the claim is
+	// a narrow-only transition to the effective host cell.
+	ClaimReceipt json.RawMessage `json:"claimReceipt,omitempty"`
+
+	// EffectiveCell is the secret-free runtime projection that the worker says
+	// it will actually execute. Receipt-bearing work must supply it even for an
+	// exact admission; inference from ambient provider, endpoint, auth, or host
+	// state is forbidden.
+	EffectiveCell json.RawMessage `json:"effectiveCell,omitempty"`
+
+	ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding,omitempty"`
+	OperationalPayload      json.RawMessage `json:"operationalPayload,omitempty"`
+	HostAdaptationReceipt   json.RawMessage `json:"hostAdaptationReceipt,omitempty"`
 
 	// ResolvedProfile carries the model-profile knobs the platform
 	// resolved before queueing this work. An explicit Harness is authoritative;
