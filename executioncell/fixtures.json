@@ -23,7 +23,8 @@
         "commercialMode": "subscription",
         "authority": "anthropic",
         "bindingScope": "host",
-        "portability": "host_bound"
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -68,7 +69,8 @@
         "commercialMode": "subscription",
         "authority": "openai",
         "bindingScope": "host",
-        "portability": "host_bound"
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -116,7 +118,8 @@
         "commercialMode": "subscription",
         "authority": "google-antigravity",
         "bindingScope": "harness",
-        "portability": "harness_bound"
+        "portability": "harness_bound",
+        "delivery": "host_cli_home_reference"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -161,7 +164,8 @@
         "commercialMode": "subscription",
         "authority": "google-antigravity",
         "bindingScope": "harness",
-        "portability": "harness_bound"
+        "portability": "harness_bound",
+        "delivery": "host_cli_home_reference"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -206,7 +210,8 @@
         "commercialMode": "subscription",
         "authority": "opencode",
         "bindingScope": "harness",
-        "portability": "harness_bound"
+        "portability": "harness_bound",
+        "delivery": "host_cli_home_reference"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -251,7 +256,8 @@
         "commercialMode": "subscription",
         "authority": "ollama",
         "bindingScope": "endpoint",
-        "portability": "endpoint_bound"
+        "portability": "endpoint_bound",
+        "delivery": "endpoint_header"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -296,7 +302,8 @@
         "commercialMode": "self_hosted",
         "authority": "local-user",
         "bindingScope": "endpoint",
-        "portability": "endpoint_bound"
+        "portability": "endpoint_bound",
+        "delivery": "none"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -341,7 +348,8 @@
         "commercialMode": "self_hosted",
         "authority": "local-user",
         "bindingScope": "endpoint",
-        "portability": "endpoint_bound"
+        "portability": "endpoint_bound",
+        "delivery": "endpoint_header"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -386,7 +394,8 @@
         "commercialMode": "subscription",
         "authority": "openai",
         "bindingScope": "host",
-        "portability": "host_bound"
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
       },
       "placement": {
         "id": "pool_host_subscriptions",
@@ -434,7 +443,8 @@
         "commercialMode": "subscription",
         "authority": "openai",
         "bindingScope": "host",
-        "portability": "host_bound"
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
       },
       "placement": {
         "id": "pool_host_subscriptions",
@@ -460,7 +470,7 @@
       "contractVersion": "donmai.execution-cell/v1alpha1",
       "receiptId": "admission_claim_bound_pool",
       "requestId": "request_claim_bound_pool",
-      "intentDigest": "da5fa2653e2a2860c2c24adecb014a541c601888810978348f46ff3542a60390",
+      "intentDigest": "6ad989bda7cc3eb4e2e6ebed1570322be6f9147aa08bc24a9c1a7846131bd778",
       "operationalPayloadDigest": "8afb6a40446fd0df848ff59b67801b01404ee2bb224f2f31599965ed97a84dd9",
       "resolverDecisions": [
         {
@@ -518,7 +528,8 @@
           "commercialMode": "subscription",
           "authority": "openai",
           "bindingScope": "host",
-          "portability": "host_bound"
+          "portability": "host_bound",
+          "delivery": "host_cli_home_reference"
         },
         "placement": {
           "id": "pool_host_subscriptions",
@@ -571,7 +582,8 @@
           "commercialMode": "subscription",
           "authority": "openai",
           "bindingScope": "host",
-          "portability": "host_bound"
+          "portability": "host_bound",
+          "delivery": "host_cli_home_reference"
         },
         "placement": {
           "id": "host_mac_studio_claimed",
@@ -617,7 +629,8 @@
         "commercialMode": "subscription",
         "authority": "openai",
         "bindingScope": "host",
-        "portability": "host_bound"
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
       },
       "placement": {
         "id": "host_mac_studio_claimed",
@@ -677,7 +690,8 @@
         "commercialMode": "self_hosted",
         "authority": "local-user",
         "bindingScope": "endpoint",
-        "portability": "endpoint_bound"
+        "portability": "endpoint_bound",
+        "delivery": "none"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -721,7 +735,8 @@
         "commercialMode": "self_hosted",
         "authority": "local-user",
         "bindingScope": "endpoint",
-        "portability": "endpoint_bound"
+        "portability": "endpoint_bound",
+        "delivery": "none"
       },
       "placement": {
         "id": "host_mac_studio",
@@ -748,7 +763,7 @@
       "contractVersion": "donmai.execution-cell/v1alpha1",
       "receiptId": "admission_delegated_child",
       "requestId": "request_delegated_child",
-      "intentDigest": "449fdd09455ca19fb803bcc0dbddb94365c40fc96b98997b77bfec6808ac1bb1",
+      "intentDigest": "763b67d89bf40953d48fa3fc26002ba128be6a4e47dc5e07f9cd9b2aee8b0512",
       "operationalPayloadDigest": "b38f5d7bea1c7bfc36beb6619fe4bf7203cb2ee0a980ad5562ca95354a81ba6f",
       "resolverDecisions": [
         {
@@ -806,7 +821,8 @@
           "commercialMode": "self_hosted",
           "authority": "local-user",
           "bindingScope": "endpoint",
-          "portability": "endpoint_bound"
+          "portability": "endpoint_bound",
+          "delivery": "none"
         },
         "placement": {
           "id": "host_mac_studio",

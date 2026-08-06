@@ -134,6 +134,48 @@ func TestClosedDecoderTypedFailures(t *testing.T) {
 	}), nil)
 	requireContractError(t, err, ErrorUnknownDiscriminator)
 
+	deliveries := []AuthDelivery{
+		DeliveryEnvironment,
+		DeliveryEndpointHeader,
+		DeliveryBrokeredToken,
+		DeliveryHostCLIHomeReference,
+		DeliveryPlatformGateway,
+		DeliveryNone,
+	}
+	for _, delivery := range deliveries {
+		delivery := delivery
+		t.Run("delivery_"+string(delivery), func(t *testing.T) {
+			raw := mutate(func(value map[string]any) {
+				auth := value["authBinding"].(map[string]any)
+				auth["delivery"] = delivery
+			})
+			decoded, decodeErr := DecodeDispatchIntent(raw, nil)
+			if decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if decoded.AuthBinding == nil || decoded.AuthBinding.Delivery != delivery {
+				t.Fatalf("auth delivery = %+v, want %q", decoded.AuthBinding, delivery)
+			}
+			roundTrip, marshalErr := json.Marshal(decoded)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			roundTripped, decodeErr := DecodeDispatchIntent(roundTrip, nil)
+			if decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if !sameValue(roundTripped, decoded) {
+				t.Fatalf("delivery round trip changed value\n got: %+v\nwant: %+v", roundTripped, decoded)
+			}
+		})
+	}
+
+	_, err = DecodeDispatchIntent(mutate(func(value map[string]any) {
+		auth := value["authBinding"].(map[string]any)
+		auth["delivery"] = "clipboard"
+	}), nil)
+	requireContractError(t, err, ErrorUnknownDiscriminator)
+
 	duplicate := bytes.Replace(fixtures.ClaimBound.Intent,
 		[]byte(`"requestId": "request_claim_bound_pool"`),
 		[]byte(`"requestId": "request_claim_bound_pool", "requestId": "second"`), 1)
@@ -153,6 +195,220 @@ func TestClosedDecoderTypedFailures(t *testing.T) {
 		auth["id"] = "sk-FAKEFAKEFAKE"
 	}), nil)
 	requireContractError(t, err, ErrorSecretMaterialForbidden)
+}
+
+func TestAdmissionFallbackRequiresOneCompleteNamedAlternative(t *testing.T) {
+	t.Parallel()
+	fixtures := loadFixtures(t)
+	fallbackModel := ModelRef{ID: "gpt-5.6-mini", Author: "openai"}
+	fallbackEndpoint := ServingEndpointRef{
+		ID: "openai-responses-secondary", Protocol: "openai-responses",
+		Operator: "openai", Revision: "2026-08-05",
+	}
+	fallbackAuth := AuthBindingRef{
+		ID: "auth_brokered_fallback", Mechanism: AuthFederated,
+		CommercialMode: CommercialPlatformMetered, Authority: "broker",
+		BindingScope: ScopeSession, Portability: Portable, Delivery: DeliveryBrokeredToken,
+	}
+	base := func(t *testing.T) (DispatchIntent, AdmissionReceipt) {
+		t.Helper()
+		intent, err := DecodeDispatchIntent(fixtures.ClaimBound.Intent, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		admission, err := DecodeAdmissionReceipt(fixtures.ClaimBound.AdmissionReceipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt := admission.Value()
+		if receipt.Cell == nil {
+			t.Fatal("fixture must be admitted")
+		}
+		return intent, receipt
+	}
+	withoutDecisions := func(receipt AdmissionReceipt, fields ...string) []ResolverDecision {
+		excluded := make(map[string]bool, len(fields))
+		for _, field := range fields {
+			excluded[field] = true
+		}
+		decisions := make([]ResolverDecision, 0, len(receipt.ResolverDecisions))
+		for _, decision := range receipt.ResolverDecisions {
+			if !excluded[decision.Field] {
+				decisions = append(decisions, decision)
+			}
+		}
+		return decisions
+	}
+	immutable := func(t *testing.T, intent DispatchIntent, receipt AdmissionReceipt) ImmutableAdmissionReceipt {
+		t.Helper()
+		var err error
+		receipt.IntentDigest, err = DigestContractValue(intent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(receipt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := DecodeAdmissionReceipt(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+	decision := func(field, selectedRef, sourceRef string) ResolverDecision {
+		return ResolverDecision{
+			Kind: DecisionFallback, Field: field, SelectedRef: selectedRef,
+			SourceRef: sourceRef, Reason: "Selected a caller-declared fallback.",
+		}
+	}
+
+	t.Run("missing sourceRef", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.FallbackAlternatives = FallbackPolicy{{ID: "model_alt", Model: &fallbackModel}}
+		receipt.Cell.Model = fallbackModel
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model"),
+			decision("model", "model:openai/gpt-5.6-mini", ""))
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
+
+	t.Run("unknown sourceRef", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.FallbackAlternatives = FallbackPolicy{{ID: "model_alt", Model: &fallbackModel}}
+		receipt.Cell.Model = fallbackModel
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model"),
+			decision("model", "model:openai/gpt-5.6-mini", "unknown_alt"))
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
+
+	t.Run("selectedRef must match resolved field", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.FallbackAlternatives = FallbackPolicy{{ID: "model_alt", Model: &fallbackModel}}
+		receipt.Cell.Model = fallbackModel
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model"),
+			decision("model", "model:openai/forged", "model_alt"))
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
+
+	t.Run("duplicate fallback decision field", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.FallbackAlternatives = FallbackPolicy{{ID: "model_alt", Model: &fallbackModel}}
+		receipt.Cell.Model = fallbackModel
+		fallbackDecision := decision("model", "model:openai/gpt-5.6-mini", "model_alt")
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model"), fallbackDecision, fallbackDecision)
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
+
+	t.Run("duplicate fallback alternative id", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.FallbackAlternatives = FallbackPolicy{
+			{ID: "duplicate_alt", Model: &fallbackModel},
+			{ID: "duplicate_alt", Endpoint: &fallbackEndpoint},
+		}
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
+
+	t.Run("mixed sourceRef ids", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.FallbackAlternatives = FallbackPolicy{
+			{ID: "model_alt", Model: &fallbackModel},
+			{ID: "endpoint_alt", Endpoint: &fallbackEndpoint},
+		}
+		receipt.Cell.Model = fallbackModel
+		receipt.Cell.Endpoint = fallbackEndpoint
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model", "endpoint"),
+			decision("model", "model:openai/gpt-5.6-mini", "model_alt"),
+			decision("endpoint", "endpoint:openai-responses-secondary", "endpoint_alt"))
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
+
+	t.Run("cross product under one sourceRef", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.FallbackAlternatives = FallbackPolicy{
+			{ID: "model_alt", Model: &fallbackModel},
+			{ID: "endpoint_alt", Endpoint: &fallbackEndpoint},
+		}
+		receipt.Cell.Model = fallbackModel
+		receipt.Cell.Endpoint = fallbackEndpoint
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model", "endpoint"),
+			decision("model", "model:openai/gpt-5.6-mini", "model_alt"),
+			decision("endpoint", "endpoint:openai-responses-secondary", "model_alt"))
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
+
+	t.Run("optional primary axis cannot come from another fallback", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.AuthBinding = nil
+		intent.FallbackAlternatives = FallbackPolicy{
+			{ID: "model_alt", Model: &fallbackModel},
+			{ID: "auth_alt", AuthBinding: &fallbackAuth},
+		}
+		receipt.Cell.Model = fallbackModel
+		receipt.Cell.AuthBinding = fallbackAuth
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model", "authBinding"),
+			decision("model", "model:openai/gpt-5.6-mini", "model_alt"),
+			decision("authBinding", "auth-binding:auth_brokered_fallback", "model_alt"))
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
+
+	t.Run("fallback plus legitimate non-fallback default", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.AuthBinding = nil
+		intent.FallbackAlternatives = FallbackPolicy{{ID: "model_alt", Model: &fallbackModel}}
+		receipt.Cell.Model = fallbackModel
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model", "authBinding"),
+			decision("model", "model:openai/gpt-5.6-mini", "model_alt"),
+			ResolverDecision{
+				Kind: DecisionDefault, Field: "authBinding",
+				SelectedRef: "auth-binding:auth_codex_host_subscription",
+				Reason:      "Selected the documented default auth binding.",
+			})
+		if err := AssertAdmissionProvenance(intent, immutable(t, intent, receipt)); err != nil {
+			t.Fatalf("fallback with legitimate default resolution: %v", err)
+		}
+	})
+
+	t.Run("exact one-alternative success", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.AuthBinding = nil
+		intent.FallbackAlternatives = FallbackPolicy{{
+			ID: "complete_alt", Model: &fallbackModel, Endpoint: &fallbackEndpoint, AuthBinding: &fallbackAuth,
+		}}
+		receipt.Cell.Model = fallbackModel
+		receipt.Cell.Endpoint = fallbackEndpoint
+		receipt.Cell.AuthBinding = fallbackAuth
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model", "endpoint", "authBinding"),
+			decision("model", "model:openai/gpt-5.6-mini", "complete_alt"),
+			decision("endpoint", "endpoint:openai-responses-secondary", "complete_alt"),
+			decision("authBinding", "auth-binding:auth_brokered_fallback", "complete_alt"))
+		if err := AssertAdmissionProvenance(intent, immutable(t, intent, receipt)); err != nil {
+			t.Fatalf("complete named fallback alternative: %v", err)
+		}
+	})
+
+	t.Run("legitimate non-fallback default", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.AuthBinding = nil
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "authBinding"), ResolverDecision{
+			Kind: DecisionDefault, Field: "authBinding",
+			SelectedRef: "auth-binding:auth_codex_host_subscription",
+			Reason:      "Selected the documented default auth binding.",
+		})
+		if err := AssertAdmissionProvenance(intent, immutable(t, intent, receipt)); err != nil {
+			t.Fatalf("legitimate default resolution: %v", err)
+		}
+	})
+
+	t.Run("non-fallback selectedRef must match resolved field", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.AuthBinding = nil
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "authBinding"), ResolverDecision{
+			Kind: DecisionDefault, Field: "authBinding",
+			SelectedRef: "auth-binding:forged",
+			Reason:      "Selected the documented default auth binding.",
+		})
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
 }
 
 func TestImmutableReceiptsSecretRejectionAndNarrowClaim(t *testing.T) {

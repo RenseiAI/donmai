@@ -4,6 +4,6 @@
 package executioncell
 
 const (
-	ContractSchemaSHA256 = "91aaca7bd56d43d825b7b57cc4cf15fcf30423df15d9e16153acf457b8f964cc"
-	FixtureSuiteSHA256   = "4d58fc29f3397627b3f663773ee77d62ffb4eb298928c952ac5623a6b016518d"
+	ContractSchemaSHA256 = "61d275fc84a3c06b49e1d5a0ed72ce89afc986fb63d88697961dfa2bf61e5d80"
+	FixtureSuiteSHA256   = "cbf2f9c487500730ff523afd99a9ba33d750580e4b47a51f03324dc43fedeefd"
 )

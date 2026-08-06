@@ -28,6 +28,7 @@ func legacyContext() LegacyAdapterContext {
 				ID: "auth_claude_host_subscription", Mechanism: AuthCLISession,
 				CommercialMode: CommercialSubscription, Authority: "anthropic",
 				BindingScope: ScopeHost, Portability: HostBound,
+				Delivery: DeliveryHostCLIHomeReference,
 			},
 		},
 		Placement: PlacementRef{ID: "pool_host_subscriptions", Kind: PlacementPool, Resolution: PlacementClaimBound},
@@ -72,6 +73,9 @@ func TestQueuedWorkJSONAdapterRoundTripsEveryOperationalByte(t *testing.T) {
 	}
 	if adapted.Intent.AuthBinding == nil || adapted.Intent.AuthBinding.Mechanism != AuthCLISession || adapted.Intent.AuthBinding.CommercialMode != CommercialSubscription {
 		t.Fatalf("auth binding = %+v", adapted.Intent.AuthBinding)
+	}
+	if adapted.Intent.AuthBinding.Delivery != DeliveryHostCLIHomeReference {
+		t.Fatalf("auth delivery = %q, want %q", adapted.Intent.AuthBinding.Delivery, DeliveryHostCLIHomeReference)
 	}
 	if adapted.Intent.Placement == nil || adapted.Intent.Placement.Resolution != PlacementClaimBound {
 		t.Fatalf("placement = %+v", adapted.Intent.Placement)

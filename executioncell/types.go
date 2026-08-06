@@ -87,6 +87,20 @@ const (
 	HostBound     AuthPortability = "host_bound"
 )
 
+// AuthDelivery identifies the runtime boundary used to deliver an auth binding
+// without carrying credential material in the execution-cell contract.
+type AuthDelivery string
+
+// Supported authentication delivery boundaries.
+const (
+	DeliveryEnvironment          AuthDelivery = "environment"
+	DeliveryEndpointHeader       AuthDelivery = "endpoint_header"
+	DeliveryBrokeredToken        AuthDelivery = "brokered_token"
+	DeliveryHostCLIHomeReference AuthDelivery = "host_cli_home_reference"
+	DeliveryPlatformGateway      AuthDelivery = "platform_gateway"
+	DeliveryNone                 AuthDelivery = "none"
+)
+
 // AuthBindingRef identifies non-secret authentication and entitlement metadata.
 type AuthBindingRef struct {
 	ID             string           `json:"id"`
@@ -95,6 +109,7 @@ type AuthBindingRef struct {
 	Authority      string           `json:"authority"`
 	BindingScope   AuthBindingScope `json:"bindingScope"`
 	Portability    AuthPortability  `json:"portability"`
+	Delivery       AuthDelivery     `json:"delivery"`
 }
 
 // PlacementKind identifies the class of execution placement.

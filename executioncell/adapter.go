@@ -166,7 +166,7 @@ func inferAuthBinding(profile LegacyResolvedProfile, context LegacyAdapterContex
 		Kind: DecisionLegacyInference, Field: "authBinding",
 		SelectedRef: selectedRef("auth-binding", ref.ID),
 		SourceRef:   selectedRef("legacy-auth-mode", profile.AuthMode),
-		Reason:      "Legacy auth mode conflated mechanism and commercial mode; non-secret metadata supplied authority, scope, and portability.",
+		Reason:      "Legacy auth mode conflated mechanism and commercial mode; non-secret metadata supplied authority, scope, portability, and delivery.",
 	}, nil
 }
 

@@ -109,7 +109,7 @@ func schemaFor(name string) (*jsonschema.Schema, error) {
 
 var discriminatorFields = []string{
 	"decision", "mechanism", "commercialMode", "bindingScope", "portability",
-	"kind", "resolution", "sessionMode", "mode", "evidenceTier", "transport",
+	"delivery", "kind", "resolution", "sessionMode", "mode", "evidenceTier", "transport",
 }
 
 func classifyValidationError(err error) *ContractError {
@@ -580,26 +580,44 @@ func AssertNarrowClaim(admission ImmutableAdmissionReceipt, claim ImmutableClaim
 	return nil
 }
 
-func fallbackContains(intent DispatchIntent, field string, selected any) bool {
-	for _, alternative := range intent.FallbackAlternatives {
-		var candidate any
-		switch field {
-		case "harness":
-			candidate = alternative.Harness
-		case "model":
-			candidate = alternative.Model
-		case "endpoint":
-			candidate = alternative.Endpoint
-		case "authBinding":
-			candidate = alternative.AuthBinding
-		case "placement":
-			candidate = alternative.Placement
-		}
-		if candidate != nil && sameValue(candidate, selected) {
-			return true
-		}
+func fallbackContains(intent DispatchIntent, alternative FallbackAlternative, selected ResolvedExecutionCell, nonFallbackFields map[string]struct{}) bool {
+	return fallbackAxisContains(alternative.Harness, intent.Harness, selected.Harness, hasField(nonFallbackFields, "harness")) &&
+		fallbackAxisContains(alternative.Model, &intent.Model, selected.Model, hasField(nonFallbackFields, "model")) &&
+		fallbackAxisContains(alternative.Endpoint, intent.Endpoint, selected.Endpoint, hasField(nonFallbackFields, "endpoint")) &&
+		fallbackAxisContains(alternative.AuthBinding, intent.AuthBinding, selected.AuthBinding, hasField(nonFallbackFields, "authBinding")) &&
+		fallbackAxisContains(alternative.Placement, intent.Placement, selected.Placement, hasField(nonFallbackFields, "placement"))
+}
+
+func fallbackAxisContains[T any](fallback, requested *T, selected T, hasNonFallbackProvenance bool) bool {
+	if fallback != nil {
+		return sameValue(fallback, selected)
 	}
-	return false
+	if requested != nil {
+		return sameValue(requested, selected)
+	}
+	return hasNonFallbackProvenance
+}
+
+func hasField(fields map[string]struct{}, field string) bool {
+	_, ok := fields[field]
+	return ok
+}
+
+func fallbackDecisionSelectedRef(field string, cell ResolvedExecutionCell) (string, bool) {
+	switch field {
+	case "harness":
+		return "harness:" + cell.Harness.ID + "@" + cell.Harness.Version, true
+	case "model":
+		return "model:" + cell.Model.Author + "/" + cell.Model.ID, true
+	case "endpoint":
+		return "endpoint:" + cell.Endpoint.ID, true
+	case "authBinding":
+		return "auth-binding:" + cell.AuthBinding.ID, true
+	case "placement":
+		return "placement:" + cell.Placement.ID, true
+	default:
+		return "", false
+	}
 }
 
 // AssertAdmissionProvenance requires every default, inheritance, fallback, or
@@ -626,17 +644,65 @@ func AssertAdmissionProvenance(intent DispatchIntent, receipt ImmutableAdmission
 		return contractError(ErrorInvalidReference, []string{"cell", "sessionMode"}, "session mode changed during admission")
 	}
 	fields := []struct {
-		name                string
-		requested, selected any
+		name             string
+		requestedPresent bool
+		requested        any
+		selected         any
 	}{
-		{"harness", intent.Harness, value.Cell.Harness},
-		{"model", intent.Model, value.Cell.Model},
-		{"endpoint", intent.Endpoint, value.Cell.Endpoint},
-		{"authBinding", intent.AuthBinding, value.Cell.AuthBinding},
-		{"placement", intent.Placement, value.Cell.Placement},
+		{"harness", intent.Harness != nil, intent.Harness, value.Cell.Harness},
+		{"model", true, intent.Model, value.Cell.Model},
+		{"endpoint", intent.Endpoint != nil, intent.Endpoint, value.Cell.Endpoint},
+		{"authBinding", intent.AuthBinding != nil, intent.AuthBinding, value.Cell.AuthBinding},
+		{"placement", intent.Placement != nil, intent.Placement, value.Cell.Placement},
+	}
+	var selectedFallback *FallbackAlternative
+	selectedFallbackID := ""
+	alternativesByID := make(map[string]*FallbackAlternative, len(intent.FallbackAlternatives))
+	for index := range intent.FallbackAlternatives {
+		alternative := &intent.FallbackAlternatives[index]
+		if _, duplicate := alternativesByID[alternative.ID]; duplicate {
+			return contractError(ErrorInvalidReference, []string{"fallbackAlternatives", fmt.Sprintf("%d", index), "id"}, "duplicate fallbackAlternative id %q", alternative.ID)
+		}
+		alternativesByID[alternative.ID] = alternative
+	}
+	fallbackDecisionFields := make(map[string]struct{})
+	nonFallbackFields := make(map[string]struct{})
+	for index, decision := range value.ResolverDecisions {
+		decisionPath := []string{"resolverDecisions", fmt.Sprintf("%d", index)}
+		expectedSelectedRef, knownField := fallbackDecisionSelectedRef(decision.Field, *value.Cell)
+		if knownField && decision.SelectedRef != expectedSelectedRef {
+			return contractError(ErrorInvalidReference, append(decisionPath, "selectedRef"), "resolver decision selectedRef %q does not match resolved %s %q", decision.SelectedRef, decision.Field, expectedSelectedRef)
+		}
+		if knownField && decision.Kind != DecisionFallback && decision.Kind != DecisionExplicit {
+			nonFallbackFields[decision.Field] = struct{}{}
+		}
+		if decision.Kind != DecisionFallback {
+			continue
+		}
+		if !knownField {
+			return contractError(ErrorInvalidReference, append(decisionPath, "field"), "fallback resolver decision names unknown execution-cell axis %q", decision.Field)
+		}
+		if _, duplicate := fallbackDecisionFields[decision.Field]; duplicate {
+			return contractError(ErrorInvalidReference, append(decisionPath, "field"), "duplicate fallback resolver decision for %s", decision.Field)
+		}
+		fallbackDecisionFields[decision.Field] = struct{}{}
+		path := slices.Clone(decisionPath)
+		path = append(path, "sourceRef")
+		if decision.SourceRef == "" {
+			return contractError(ErrorInvalidReference, path, "fallback resolver decision must name its fallbackAlternative id in sourceRef")
+		}
+		alternative := alternativesByID[decision.SourceRef]
+		if alternative == nil {
+			return contractError(ErrorInvalidReference, path, "fallback resolver decision names unknown fallbackAlternative %q", decision.SourceRef)
+		}
+		if selectedFallbackID != "" && selectedFallbackID != decision.SourceRef {
+			return contractError(ErrorInvalidReference, path, "fallback resolver decisions name mixed alternatives %q and %q", selectedFallbackID, decision.SourceRef)
+		}
+		selectedFallbackID = decision.SourceRef
+		selectedFallback = alternative
 	}
 	for _, field := range fields {
-		if field.requested != nil && sameValue(field.requested, field.selected) {
+		if field.requestedPresent && sameValue(field.requested, field.selected) {
 			continue
 		}
 		found := false
@@ -644,7 +710,7 @@ func AssertAdmissionProvenance(intent DispatchIntent, receipt ImmutableAdmission
 			if decision.Field != field.name || decision.Kind == DecisionExplicit {
 				continue
 			}
-			if field.requested != nil && decision.Kind != DecisionFallback {
+			if field.requestedPresent && decision.Kind != DecisionFallback {
 				continue
 			}
 			found = true
@@ -653,9 +719,9 @@ func AssertAdmissionProvenance(intent DispatchIntent, receipt ImmutableAdmission
 		if !found {
 			return contractError(ErrorInvalidReference, []string{"resolverDecisions"}, "resolved %s lacks resolver provenance", field.name)
 		}
-		if field.requested != nil && !fallbackContains(intent, field.name, field.selected) {
-			return contractError(ErrorInvalidReference, []string{"cell", field.name}, "resolved %s was not a named fallback", field.name)
-		}
+	}
+	if selectedFallback != nil && !fallbackContains(intent, *selectedFallback, *value.Cell, nonFallbackFields) {
+		return contractError(ErrorInvalidReference, []string{"cell"}, "resolved execution cell was not wholly named by fallbackAlternative %q", selectedFallbackID)
 	}
 	for _, required := range intent.RequiredCapabilities {
 		granted := false

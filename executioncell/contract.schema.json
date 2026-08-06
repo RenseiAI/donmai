@@ -140,6 +140,17 @@
             "harness_bound",
             "host_bound"
           ]
+        },
+        "delivery": {
+          "type": "string",
+          "enum": [
+            "environment",
+            "endpoint_header",
+            "brokered_token",
+            "host_cli_home_reference",
+            "platform_gateway",
+            "none"
+          ]
         }
       },
       "required": [
@@ -148,7 +159,8 @@
         "commercialMode",
         "authority",
         "bindingScope",
-        "portability"
+        "portability",
+        "delivery"
       ],
       "additionalProperties": false
     },
@@ -350,6 +362,17 @@
                 "harness_bound",
                 "host_bound"
               ]
+            },
+            "delivery": {
+              "type": "string",
+              "enum": [
+                "environment",
+                "endpoint_header",
+                "brokered_token",
+                "host_cli_home_reference",
+                "platform_gateway",
+                "none"
+              ]
             }
           },
           "required": [
@@ -358,7 +381,8 @@
             "commercialMode",
             "authority",
             "bindingScope",
-            "portability"
+            "portability",
+            "delivery"
           ],
           "additionalProperties": false
         },
@@ -550,6 +574,17 @@
                   "harness_bound",
                   "host_bound"
                 ]
+              },
+              "delivery": {
+                "type": "string",
+                "enum": [
+                  "environment",
+                  "endpoint_header",
+                  "brokered_token",
+                  "host_cli_home_reference",
+                  "platform_gateway",
+                  "none"
+                ]
               }
             },
             "required": [
@@ -558,7 +593,8 @@
               "commercialMode",
               "authority",
               "bindingScope",
-              "portability"
+              "portability",
+              "delivery"
             ],
             "additionalProperties": false
           },
@@ -752,6 +788,17 @@
                 "harness_bound",
                 "host_bound"
               ]
+            },
+            "delivery": {
+              "type": "string",
+              "enum": [
+                "environment",
+                "endpoint_header",
+                "brokered_token",
+                "host_cli_home_reference",
+                "platform_gateway",
+                "none"
+              ]
             }
           },
           "required": [
@@ -760,7 +807,8 @@
             "commercialMode",
             "authority",
             "bindingScope",
-            "portability"
+            "portability",
+            "delivery"
           ],
           "additionalProperties": false
         },
@@ -999,6 +1047,17 @@
                       "harness_bound",
                       "host_bound"
                     ]
+                  },
+                  "delivery": {
+                    "type": "string",
+                    "enum": [
+                      "environment",
+                      "endpoint_header",
+                      "brokered_token",
+                      "host_cli_home_reference",
+                      "platform_gateway",
+                      "none"
+                    ]
                   }
                 },
                 "required": [
@@ -1007,7 +1066,8 @@
                   "commercialMode",
                   "authority",
                   "bindingScope",
-                  "portability"
+                  "portability",
+                  "delivery"
                 ],
                 "additionalProperties": false
               },
@@ -1207,6 +1267,17 @@
                 "harness_bound",
                 "host_bound"
               ]
+            },
+            "delivery": {
+              "type": "string",
+              "enum": [
+                "environment",
+                "endpoint_header",
+                "brokered_token",
+                "host_cli_home_reference",
+                "platform_gateway",
+                "none"
+              ]
             }
           },
           "required": [
@@ -1215,7 +1286,8 @@
             "commercialMode",
             "authority",
             "bindingScope",
-            "portability"
+            "portability",
+            "delivery"
           ],
           "additionalProperties": false
         },
@@ -1593,6 +1665,17 @@
                         "harness_bound",
                         "host_bound"
                       ]
+                    },
+                    "delivery": {
+                      "type": "string",
+                      "enum": [
+                        "environment",
+                        "endpoint_header",
+                        "brokered_token",
+                        "host_cli_home_reference",
+                        "platform_gateway",
+                        "none"
+                      ]
                     }
                   },
                   "required": [
@@ -1601,7 +1684,8 @@
                     "commercialMode",
                     "authority",
                     "bindingScope",
-                    "portability"
+                    "portability",
+                    "delivery"
                   ],
                   "additionalProperties": false
                 },
@@ -2023,6 +2107,17 @@
                         "harness_bound",
                         "host_bound"
                       ]
+                    },
+                    "delivery": {
+                      "type": "string",
+                      "enum": [
+                        "environment",
+                        "endpoint_header",
+                        "brokered_token",
+                        "host_cli_home_reference",
+                        "platform_gateway",
+                        "none"
+                      ]
                     }
                   },
                   "required": [
@@ -2031,7 +2126,8 @@
                     "commercialMode",
                     "authority",
                     "bindingScope",
-                    "portability"
+                    "portability",
+                    "delivery"
                   ],
                   "additionalProperties": false
                 },
