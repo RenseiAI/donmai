@@ -9,40 +9,114 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// newFakeProvider builds a Provider whose binary is a fake-agy script. The
-// script is run under a real pty by the handle, so this exercises the genuine
-// pty lifecycle without consuming agy's OAuth quota.
+const fakeAgyScriptEnv = "DONMAI_TEST_AGY_SCRIPT"
+
+var (
+	fakeAgyBinary         string
+	fakeAgyNoAddDirBinary string
+	fakeAgySkip           string
+	fakeAgyScripts        sync.Map // map[*Provider]string
+)
+
+// TestMain builds the fake agy binaries once, before any parallel test can
+// fork. Per-test executable files are unsafe here: while test A writes one,
+// a child forked by test B can inherit that writable descriptor and make
+// execve return ETXTBSY (golang/go#22315). The shared wrappers are immutable
+// after TestMain returns; each Provider supplies its test-specific body through
+// a private environment variable at Spawn time.
+func TestMain(m *testing.M) {
+	code := func() int {
+		bash, err := exec.LookPath("bash")
+		if err != nil {
+			fakeAgySkip = "bash not available: " + err.Error()
+			return m.Run()
+		}
+		dir, err := os.MkdirTemp("", "agy-fixtures-")
+		if err != nil {
+			fakeAgySkip = "create fixture directory: " + err.Error()
+			return m.Run()
+		}
+		defer func() { _ = os.RemoveAll(dir) }()
+
+		fakeAgyBinary, err = writeFakeAgyWrapper(dir, "fake-agy", bash, true)
+		if err != nil {
+			fakeAgySkip = "write fake agy wrapper: " + err.Error()
+			return m.Run()
+		}
+		fakeAgyNoAddDirBinary, err = writeFakeAgyWrapper(dir, "fake-agy-no-add-dir", bash, false)
+		if err != nil {
+			fakeAgySkip = "write fake agy no-add-dir wrapper: " + err.Error()
+			return m.Run()
+		}
+		return m.Run()
+	}()
+	os.Exit(code)
+}
+
+// writeFakeAgyWrapper is intentionally used only from TestMain. It writes
+// without execute permission, syncs and closes the descriptor, then enables
+// execution. TestMain's before-any-fork ordering is the actual ETXTBSY fix;
+// the mode ordering is a defensive second line.
+func writeFakeAgyWrapper(dir, name, bash string, addDir bool) (string, error) {
+	path := filepath.Join(dir, name)
+	help := "Usage: fake-agy\\n"
+	if addDir {
+		help += "  --add-dir  Add a directory to the workspace\\n"
+	}
+	script := "#!" + bash + "\n" +
+		"if [[ \"$1\" == \"--help\" ]]; then\n" +
+		"  printf '%b' '" + help + "'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exec \"" + bash + "\" -c \"$" + fakeAgyScriptEnv + "\" fake-agy \"$@\"\n"
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // isolated test fixture
+	if err != nil {
+		return "", err
+	}
+	if _, err := file.WriteString(script); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(path, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
+		return "", err
+	}
+	return path, nil
+}
+
+func fakeAgyBinaryForHelp(t *testing.T, addDir bool) string {
+	t.Helper()
+	if fakeAgySkip != "" {
+		t.Skipf("fake agy CLI unavailable — skipping fake-CLI test: %s", fakeAgySkip)
+	}
+	if addDir {
+		return fakeAgyBinary
+	}
+	return fakeAgyNoAddDirBinary
+}
+
+// newFakeProvider builds a Provider whose binary is the package-wide fake agy
+// wrapper. The wrapper is run under a real pty by the handle, so this exercises
+// the genuine pty lifecycle without consuming agy's OAuth quota.
 func newFakeProvider(t *testing.T, script string, opts Options) *Provider {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("pty spawn tests are unix-only")
 	}
-	if _, err := exec.LookPath("bash"); err != nil {
-		t.Skip("bash not available")
-	}
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "fake-agy")
-	// Write WITHOUT the exec bit, then chmod-add it after close.
-	// Linux can throw ETXTBSY on fork+exec when a writable FD is open on an
-	// executable inode — writing 0o600 then chmodding to 0o755 post-close
-	// means the file never carries the exec bit while any writable FD exists.
-	fixture := "#!/bin/bash\n" +
-		"if [[ \"$1\" == \"--help\" ]]; then\n" +
-		"  printf '%s\\n' '  --add-dir  Add a directory to the workspace'\n" +
-		"  exit 0\n" +
-		"fi\n" + script
-	if err := os.WriteFile(bin, []byte(fixture), 0o600); err != nil { //nolint:gosec // test fixture
-		t.Fatal(err)
-	}
-	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
-		t.Fatal(err)
-	}
+	bin := fakeAgyBinaryForHelp(t, true)
 	opts.Binary = bin
 	opts.LookPath = func(string) (string, error) { return bin, nil }
 	if opts.StateHome == "" {
@@ -52,6 +126,8 @@ func newFakeProvider(t *testing.T, script string, opts Options) *Provider {
 	if err != nil {
 		t.Fatalf("New(fake): %v", err)
 	}
+	fakeAgyScripts.Store(p, script)
+	t.Cleanup(func() { fakeAgyScripts.Delete(p) })
 	return p
 }
 
@@ -61,6 +137,14 @@ func newFakeProvider(t *testing.T, script string, opts Options) *Provider {
 // Amp harness tests.
 func spawnFake(ctx context.Context, t *testing.T, p *Provider, spec agent.Spec) (agent.Handle, error) {
 	t.Helper()
+	if script, ok := fakeAgyScripts.Load(p); ok {
+		env := make(map[string]string, len(spec.Env)+1)
+		for key, value := range spec.Env {
+			env[key] = value
+		}
+		env[fakeAgyScriptEnv] = script.(string)
+		spec.Env = env
+	}
 	for attempt := 0; ; attempt++ {
 		h, err := p.Spawn(ctx, spec)
 		if err == nil || attempt >= 3 || !strings.Contains(err.Error(), "text file busy") {

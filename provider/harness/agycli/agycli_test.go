@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -13,7 +11,7 @@ import (
 
 func TestNew_ProbeSuccess(t *testing.T) {
 	t.Parallel()
-	binary := newHelpOnlyAgy(t, true)
+	binary := fakeAgyBinaryForHelp(t, true)
 	p, err := New(Options{
 		Binary:   binary,
 		LookPath: func(string) (string, error) { return binary, nil },
@@ -45,9 +43,24 @@ func TestNew_ProbeFailureWrapsUnavailable(t *testing.T) {
 	}
 }
 
+// The immutable package fixture deliberately has a no-add-dir sibling so
+// this invokes the real constructor probe (rather than only a mocked runner)
+// while parallel fake-provider tests are executing.
+func TestNew_ProbeRejectsMissingAddDir(t *testing.T) {
+	t.Parallel()
+	binary := fakeAgyBinaryForHelp(t, false)
+	_, err := New(Options{
+		Binary:   binary,
+		LookPath: func(string) (string, error) { return binary, nil },
+	})
+	if !errors.Is(err, agent.ErrProviderUnavailable) {
+		t.Fatalf("New missing --add-dir error = %v, want ErrProviderUnavailable", err)
+	}
+}
+
 func TestNew_TogglesDisable(t *testing.T) {
 	t.Parallel()
-	binary := newHelpOnlyAgy(t, true)
+	binary := fakeAgyBinaryForHelp(t, true)
 	p, err := New(Options{
 		Binary:                      binary,
 		LookPath:                    func(string) (string, error) { return binary, nil },
@@ -80,20 +93,6 @@ func TestVerifyAddDirSupport_FailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("advertised --add-dir should be accepted: %v", err)
 	}
-}
-
-func newHelpOnlyAgy(t *testing.T, addDir bool) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "fake-agy")
-	help := "Usage: fake-agy\\n"
-	if addDir {
-		help += "  --add-dir  Add a directory to the workspace\\n"
-	}
-	script := "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n  printf '%b' '" + help + "'\nfi\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
-		t.Fatal(err)
-	}
-	return path
 }
 
 func TestName(t *testing.T) {
