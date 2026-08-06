@@ -11,14 +11,15 @@ import (
 
 func TestNew_ProbeSuccess(t *testing.T) {
 	t.Parallel()
+	binary := fakeAgyBinaryForHelp(t, true)
 	p, err := New(Options{
-		Binary:   "agy",
-		LookPath: func(string) (string, error) { return "/fake/bin/agy", nil },
+		Binary:   binary,
+		LookPath: func(string) (string, error) { return binary, nil },
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if p.binary != "/fake/bin/agy" {
+	if p.binary != binary {
 		t.Errorf("binary = %q", p.binary)
 	}
 	if !p.injectEnvelope {
@@ -42,10 +43,27 @@ func TestNew_ProbeFailureWrapsUnavailable(t *testing.T) {
 	}
 }
 
+// The immutable package fixture deliberately has a no-add-dir sibling so
+// this invokes the real constructor probe (rather than only a mocked runner)
+// while parallel fake-provider tests are executing.
+func TestNew_ProbeRejectsMissingAddDir(t *testing.T) {
+	t.Parallel()
+	binary := fakeAgyBinaryForHelp(t, false)
+	_, err := New(Options{
+		Binary:   binary,
+		LookPath: func(string) (string, error) { return binary, nil },
+	})
+	if !errors.Is(err, agent.ErrProviderUnavailable) {
+		t.Fatalf("New missing --add-dir error = %v, want ErrProviderUnavailable", err)
+	}
+}
+
 func TestNew_TogglesDisable(t *testing.T) {
 	t.Parallel()
+	binary := fakeAgyBinaryForHelp(t, true)
 	p, err := New(Options{
-		LookPath:                    func(string) (string, error) { return "/fake/agy", nil },
+		Binary:                      binary,
+		LookPath:                    func(string) (string, error) { return binary, nil },
 		DisableResultEnvelope:       true,
 		DisableTranscriptEnrichment: true,
 	})
@@ -57,6 +75,23 @@ func TestNew_TogglesDisable(t *testing.T) {
 	}
 	if p.enrichTranscript {
 		t.Errorf("DisableTranscriptEnrichment not honored")
+	}
+}
+
+func TestVerifyAddDirSupport_FailsClosed(t *testing.T) {
+	t.Parallel()
+	err := verifyAddDirSupport("fake-agy", func(context.Context, string) ([]byte, error) {
+		return []byte("Usage: fake-agy\n"), nil
+	})
+	if err == nil {
+		t.Fatal("expected missing --add-dir to be rejected")
+	}
+
+	err = verifyAddDirSupport("fake-agy", func(context.Context, string) ([]byte, error) {
+		return []byte("  --add-dir  Add a directory to the workspace\n"), nil
+	})
+	if err != nil {
+		t.Fatalf("advertised --add-dir should be accepted: %v", err)
 	}
 }
 

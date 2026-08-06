@@ -45,8 +45,8 @@ var batchScaffoldingMarkers = []string{
 // in-session agent correctly self-reported as blocked. Interactive sessions
 // must receive NO templated user prompt at all: the harness starts the
 // PTY REPL idle (claude/codex interactiveArgs treat an empty Spec.Prompt as
-// "no seeded message") and any seed text is delivered verbatim through the
-// runner's PTY first-input write, not through the renderer.
+// "no seeded message"). Any seed is promoted after rendering into the typed
+// user-task authority and delivered by the selected harness adapter.
 func TestBuilderBuild_InteractiveNeverRendersBatchTemplate(t *testing.T) {
 	t.Parallel()
 
@@ -88,11 +88,10 @@ func TestBuilderBuild_InteractiveNeverRendersBatchTemplate(t *testing.T) {
 }
 
 // TestBuilderBuild_InteractiveSeedStaysOutOfPrompts pins the InitialPrompt
-// contract on the renderer side: the seed is opaque first-INPUT data
-// delivered verbatim (plus one newline) into the live PTY by the runner's
-// writeInitialPromptInput hop — the prompt renderer must not fold it into
-// either prompt, and the user prompt stays empty so the seed is the
-// session's only first message (no wrapping, no template).
+// contract on the renderer side: the seed is opaque first-input data promoted
+// to a typed user task by the runner after rendering. The renderer must not
+// fold it into either batch prompt; the exact harness adapter owns its native
+// first-turn delivery.
 func TestBuilderBuild_InteractiveSeedStaysOutOfPrompts(t *testing.T) {
 	t.Parallel()
 	const seed = "please take a look at the flaky auth test on this branch"
@@ -104,7 +103,7 @@ func TestBuilderBuild_InteractiveSeedStaysOutOfPrompts(t *testing.T) {
 		t.Fatalf("Build error: %v", err)
 	}
 	if user != "" {
-		t.Errorf("user prompt must stay empty (seed rides the PTY write, not the renderer); got:\n%s", user)
+		t.Errorf("user prompt must stay empty (runner promotes the seed after rendering); got:\n%s", user)
 	}
 	if strings.Contains(system, seed) {
 		t.Error("system prompt must not embed the interactive seed prompt")

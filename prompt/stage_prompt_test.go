@@ -149,16 +149,15 @@ func TestBuilderBuild_StagePromptOverridesIssueContext(t *testing.T) {
 	}
 }
 
-// TestBuilderBuild_SystemPromptOverride covers the upstream-supplied system
-// prompt override path. When QueuedWork.SystemPromptOverride is non-empty,
-// Build uses it after the immutable content-safety preamble instead of rendering
-// system_base.tmpl. The user prompt is unaffected by the override.
+// TestBuilderBuild_SystemPromptOverride covers the legacy upstream wire field.
+// Its content is role intent: Build appends it after the immutable operating
+// protocol rather than allowing it to replace that higher authority.
 func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 	t.Parallel()
 
 	const overrideText = "You are the upstream-supplied override agent. Custom identity active."
 
-	t.Run("override_replaces_system_base_tmpl", func(t *testing.T) {
+	t.Run("legacy_override_appends_role_intent", func(t *testing.T) {
 		t.Parallel()
 		b := prompt.NewBuilder()
 		work := prompt.QueuedWork{
@@ -180,11 +179,11 @@ func TestBuilderBuild_SystemPromptOverride(t *testing.T) {
 		if !strings.Contains(user, "Implement the feature described in the issue.") {
 			t.Errorf("user prompt missing stage body: %q", user)
 		}
-		// system_base.tmpl sentinel text must NOT appear when overridden.
-		// Brand-agnostic substring (the brand token varies by binary via the
-		// statehome seam — "Donmai"/"Rensei"); the trailing clause is fixed.
-		if strings.Contains(system, "agent operating without an interactive user") {
-			t.Errorf("system_base.tmpl content leaked into overridden system prompt: %q", system)
+		// The harness operating protocol must remain ahead of role intent.
+		baseIndex := strings.Index(system, "agent operating without an interactive user")
+		roleIndex := strings.Index(system, overrideText)
+		if baseIndex < 0 || roleIndex <= baseIndex {
+			t.Errorf("operating protocol must precede role intent: %q", system)
 		}
 	})
 

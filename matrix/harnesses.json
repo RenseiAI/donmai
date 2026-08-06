@@ -34,6 +34,18 @@
       ],
       "drivesHosts": [
         "direct"
+      ],
+      "promptDelivery": [
+        {
+          "id": "amp/headless/execute-v1",
+          "mode": "autonomous",
+          "systemDelivery": "unsupported",
+          "baseAppendDelivery": "unsupported",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "unsupported",
+          "userDelivery": "amp_stdin",
+          "amendmentDelivery": "amp_stdin"
+        }
       ]
     },
     {
@@ -67,6 +79,18 @@
       ],
       "drivesHosts": [
         "oauth-cli"
+      ],
+      "promptDelivery": [
+        {
+          "id": "antigravity/headless/agy-pty-v1",
+          "mode": "autonomous",
+          "systemDelivery": "unsupported",
+          "baseAppendDelivery": "unsupported",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "unsupported",
+          "userDelivery": "agy_prompt_flag",
+          "amendmentDelivery": "agy_prompt_flag"
+        }
       ]
     },
     {
@@ -106,6 +130,28 @@
         "direct",
         "oauth-cli",
         "vertex"
+      ],
+      "promptDelivery": [
+        {
+          "id": "claude-code/headless/cli-v1",
+          "mode": "autonomous",
+          "systemDelivery": "claude_cli_append_system_prompt",
+          "baseAppendDelivery": "claude_cli_append_system_prompt",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "claude_cli_append_system_prompt",
+          "userDelivery": "claude_cli_stdin",
+          "amendmentDelivery": "claude_cli_stdin"
+        },
+        {
+          "id": "claude-code/interactive/pty-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "claude_cli_append_system_prompt",
+          "baseAppendDelivery": "claude_cli_append_system_prompt",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "claude_cli_append_system_prompt",
+          "userDelivery": "claude_cli_pty_seed",
+          "amendmentDelivery": "claude_cli_pty_seed"
+        }
       ]
     },
     {
@@ -145,6 +191,28 @@
         "azure",
         "direct",
         "oauth-cli"
+      ],
+      "promptDelivery": [
+        {
+          "id": "codex/headless/app-server-v2",
+          "mode": "autonomous",
+          "systemDelivery": "codex_app_server_developer_instructions",
+          "baseAppendDelivery": "codex_app_server_developer_instructions",
+          "baseReplaceDelivery": "codex_app_server_base_instructions",
+          "contextDelivery": "codex_app_server_turn_input",
+          "userDelivery": "codex_app_server_turn_input",
+          "amendmentDelivery": "codex_app_server_turn_input"
+        },
+        {
+          "id": "codex/interactive/pty-developer-instructions-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "codex_cli_developer_instructions",
+          "baseAppendDelivery": "codex_cli_developer_instructions",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "codex_cli_pty_seed",
+          "userDelivery": "codex_cli_pty_seed",
+          "amendmentDelivery": "codex_cli_pty_seed"
+        }
       ]
     },
     {
@@ -184,6 +252,18 @@
         "gateway",
         "local",
         "oauth-cli"
+      ],
+      "promptDelivery": [
+        {
+          "id": "opencode/headless/prompt-v1",
+          "mode": "autonomous",
+          "systemDelivery": "unsupported",
+          "baseAppendDelivery": "unsupported",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "unsupported",
+          "userDelivery": "opencode_prompt",
+          "amendmentDelivery": "opencode_prompt"
+        }
       ]
     },
     {
@@ -229,6 +309,18 @@
         "direct",
         "local",
         "vertex"
+      ],
+      "promptDelivery": [
+        {
+          "id": "pi/headless/rpc-v1",
+          "mode": "autonomous",
+          "systemDelivery": "pi_cli_append_system_prompt",
+          "baseAppendDelivery": "pi_cli_append_system_prompt",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "pi_cli_append_system_prompt",
+          "userDelivery": "pi_rpc_prompt",
+          "amendmentDelivery": "pi_rpc_prompt"
+        }
       ]
     },
     {
@@ -268,6 +360,28 @@
         "direct",
         "local",
         "vertex"
+      ],
+      "promptDelivery": [
+        {
+          "id": "raw/gemini-generate/direct-api-v1",
+          "mode": "autonomous",
+          "systemDelivery": "gemini_system_instruction",
+          "baseAppendDelivery": "gemini_system_instruction",
+          "baseReplaceDelivery": "gemini_system_instruction",
+          "contextDelivery": "gemini_system_instruction",
+          "userDelivery": "gemini_user_content",
+          "amendmentDelivery": "gemini_user_content"
+        },
+        {
+          "id": "raw/ollama-chat/direct-api-v1",
+          "mode": "autonomous",
+          "systemDelivery": "ollama_system_message",
+          "baseAppendDelivery": "ollama_system_message",
+          "baseReplaceDelivery": "ollama_system_message",
+          "contextDelivery": "ollama_system_message",
+          "userDelivery": "ollama_user_message",
+          "amendmentDelivery": "ollama_user_message"
+        }
       ]
     },
     {
@@ -293,7 +407,19 @@
         "transport": "pty"
       },
       "drives": [],
-      "drivesHosts": []
+      "drivesHosts": [],
+      "promptDelivery": [
+        {
+          "id": "shell/interactive/pty-seed-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "unsupported",
+          "baseAppendDelivery": "unsupported",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "unsupported",
+          "userDelivery": "shell_pty_seed",
+          "amendmentDelivery": "unsupported"
+        }
+      ]
     },
     {
       "name": "stub",
@@ -326,7 +452,8 @@
       ],
       "drivesHosts": [
         "local"
-      ]
+      ],
+      "promptDelivery": null
     }
   ]
 }

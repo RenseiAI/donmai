@@ -267,9 +267,10 @@ type QueuedWork struct {
 	Mode string `json:"mode,omitempty"`
 
 	// InitialPrompt is opaque first-input data for [InteractiveRunMode]. The
-	// interactive runner writes it verbatim plus one newline into the live PTY
-	// before relay attach. The prompt renderer MUST NOT include it in either
-	// headless or interview system/user prompts.
+	// prompt renderer keeps it out of batch scaffolding; the runner promotes it
+	// to the typed user-task authority before spawn, and the selected harness
+	// delivers it exactly once through its declared native first-turn surface.
+	// It MUST NOT appear in headless or interview system/user prompts.
 	//
 	// Wire shape: "initialPrompt" (camelCase, omitempty). Empty/absent is a
 	// no-op and preserves the pre-field wire shape.

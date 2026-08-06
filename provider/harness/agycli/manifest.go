@@ -32,5 +32,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			DrivesHosts:              []agent.ServingHost{agent.HostOAuthCLI},
 			Transport:                agent.TransportPTY,
 		},
+		PromptDelivery: []agent.PromptDeliveryProfile{{
+			ID: "antigravity/headless/agy-pty-v1", Mode: agent.PromptModeAutonomous,
+			SystemDelivery: agent.PromptDeliveryUnsupported, BaseAppendDelivery: agent.PromptDeliveryUnsupported,
+			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryUnsupported,
+			UserDelivery: agent.PromptDeliveryAgyPromptFlag, AmendmentDelivery: agent.PromptDeliveryAgyPromptFlag,
+		}},
 	}
 }

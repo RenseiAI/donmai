@@ -76,6 +76,11 @@ type State struct {
 
 	// WorkerID is the daemon worker that owns this session.
 	WorkerID string `json:"workerId,omitempty"`
+
+	// PromptReceipt is the digest-only pre-spawn prompt adaptation record.
+	// The runner persists it before the provider may start a process or send
+	// prompt bytes; a persistence failure denies spawn.
+	PromptReceipt *agent.PromptDeliveryReceipt `json:"promptAdaptationReceipt,omitempty"`
 }
 
 // Sentinel errors. Callers may type-check these via errors.Is.

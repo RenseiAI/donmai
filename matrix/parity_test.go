@@ -268,6 +268,40 @@ func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
 	}
 }
 
+// TestParity_PromptDeliveryProfilesHarvested proves prompt semantics are part
+// of the generated manifest contract. The two raw providers intentionally
+// contribute distinct profiles to their shared matrix row.
+func TestParity_PromptDeliveryProfilesHarvested(t *testing.T) {
+	built, err := Build()
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
+	got := make(map[agent.HarnessName]map[string]bool, len(built.Harnesses))
+	for _, row := range built.Harnesses {
+		got[row.Name] = make(map[string]bool, len(row.PromptDelivery))
+		for _, profile := range row.PromptDelivery {
+			if profile.ID == "" || profile.Mode == "" || profile.SystemDelivery == "" || profile.BaseAppendDelivery == "" || profile.BaseReplaceDelivery == "" || profile.ContextDelivery == "" || profile.UserDelivery == "" || profile.AmendmentDelivery == "" {
+				t.Errorf("harness %q has incomplete prompt profile: %+v", row.Name, profile)
+			}
+			if got[row.Name][profile.ID] {
+				t.Errorf("harness %q has duplicate prompt profile %q", row.Name, profile.ID)
+			}
+			got[row.Name][profile.ID] = true
+		}
+	}
+	for _, harvested := range HarnessHarvestList() {
+		manifest := harvested.Manifest()
+		if manifest.Name != agent.HarnessStub && len(manifest.PromptDelivery) == 0 {
+			t.Errorf("concrete harness %q declares no prompt delivery profile", manifest.Name)
+		}
+		for _, profile := range manifest.PromptDelivery {
+			if !got[manifest.Name][profile.ID] {
+				t.Errorf("generated harness %q omits prompt profile %q", manifest.Name, profile.ID)
+			}
+		}
+	}
+}
+
 // TestParity_AliasCoverageCompleteness covers §6's alias-coverage obligation:
 // every real provider's ProviderName maps to a cell, and the platform-reserved
 // name (jules) is intentionally absent.

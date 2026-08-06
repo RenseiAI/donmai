@@ -23,9 +23,10 @@ import (
 	"github.com/RenseiAI/donmai/attachclient/attachtest"
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/provider/harness/ptycli"
+	"github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/result"
-	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 	"github.com/coder/websocket"
 )
@@ -49,7 +50,11 @@ func (p *interactivePTYProvider) Resume(context.Context, string, agent.Spec) (ag
 }
 func (p *interactivePTYProvider) Shutdown(context.Context) error { return nil }
 
-func (p *interactivePTYProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
+func (p *interactivePTYProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	adapted, err := agent.PreparePrompt(spec, (&shell.Provider{}).Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	ph := ptyhost.Spec{Command: p.command, Cwd: spec.Cwd}
 	if spec.Interactive != nil {
 		// Geometry stays at ptyhost defaults (80×24); the runner sets only
@@ -61,7 +66,11 @@ func (p *interactivePTYProvider) Spawn(_ context.Context, spec agent.Spec) (agen
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	return newInteractivePTYHandle(sess), nil
+	handle := newInteractivePTYHandle(sess)
+	if err := ptycli.DeliverSeed(ctx, handle, sess, adapted.Prompt); err != nil {
+		return nil, fmt.Errorf("%w: test PTY seed: %v", agent.ErrSpawnFailed, err)
+	}
+	return handle, nil
 }
 
 // interactivePTYHandle is agent.Handle + agent.InteractiveCapable over a live
@@ -95,17 +104,6 @@ type testInteractiveHandle struct {
 
 func (h *testInteractiveHandle) InteractiveSession() agent.InteractiveSession {
 	return h.session
-}
-
-type stopCallbackHandle struct {
-	agent.Handle
-	stopOnce sync.Once
-	stop     func()
-}
-
-func (h *stopCallbackHandle) Stop(context.Context) error {
-	h.stopOnce.Do(h.stop)
-	return nil
 }
 
 // recordingInteractiveSession records every accepted input byte. It embeds the
@@ -170,19 +168,6 @@ func (s *recordingInteractiveSession) writeCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.writes)
-}
-
-type blockingInteractiveSession struct {
-	agent.InteractiveSession
-	startedOnce sync.Once
-	started     chan struct{}
-	release     chan struct{}
-}
-
-func (s *blockingInteractiveSession) WriteInput([]byte) (int, error) {
-	s.startedOnce.Do(func() { close(s.started) })
-	<-s.release
-	return 0, errors.New("PTY stopped")
 }
 
 func completedRecordingInteractiveSession() *recordingInteractiveSession {
@@ -390,10 +375,10 @@ func TestInteractive_CapabilityFailure(t *testing.T) {
 	}
 }
 
-// TestInteractive_InitialPromptContract locks the leaf-consumer semantics:
-// absent/explicit-empty inputs are no-ops, non-empty data is written verbatim
-// plus one newline, and headless/interview modes never receive it even when a
-// direct caller reaches dispatchInteractive.
+// TestInteractive_InitialPromptContract locks the supervisor boundary:
+// dispatchInteractive never writes task bytes after Provider.Spawn. A
+// non-empty interactive seed is reported as already delivered by the native
+// harness surface, while headless/interview direct calls remain no-ops.
 func TestInteractive_InitialPromptContract(t *testing.T) {
 	t.Setenv(envAttachURL, "")
 	t.Setenv(envAttachToken, "")
@@ -402,13 +387,12 @@ func TestInteractive_InitialPromptContract(t *testing.T) {
 		name          string
 		mode          string
 		initialPrompt string
-		wantInput     string
 		wantDelivered bool
 	}{
 		{name: "absent", mode: interactiveRunMode},
 		{name: "explicit empty", mode: interactiveRunMode, initialPrompt: ""},
-		{name: "whitespace preserved", mode: interactiveRunMode, initialPrompt: "  ", wantInput: "  \n", wantDelivered: true},
-		{name: "unicode multiline", mode: interactiveRunMode, initialPrompt: "こんにちは 🌱\nsecond line", wantInput: "こんにちは 🌱\nsecond line\n", wantDelivered: true},
+		{name: "whitespace native delivery", mode: interactiveRunMode, initialPrompt: "  ", wantDelivered: true},
+		{name: "unicode multiline native delivery", mode: interactiveRunMode, initialPrompt: "こんにちは 🌱\nsecond line", wantDelivered: true},
 		{name: "headless excluded", mode: "", initialPrompt: "headless seed must not run"},
 		{name: "interview excluded", mode: "interview", initialPrompt: "interview seed must not run"},
 	}
@@ -436,15 +420,11 @@ func TestInteractive_InitialPromptContract(t *testing.T) {
 			if out.Status != "completed" {
 				t.Fatalf("status=%q error=%q; want completed", out.Status, out.Error)
 			}
-			if got := string(session.inputBytes()); got != tt.wantInput {
-				t.Errorf("PTY input = %q, want %q", got, tt.wantInput)
+			if got := string(session.inputBytes()); got != "" {
+				t.Errorf("dispatchInteractive replayed PTY input %q", got)
 			}
-			wantWrites := 0
-			if tt.wantDelivered {
-				wantWrites = 1
-			}
-			if got := session.writeCount(); got != wantWrites {
-				t.Errorf("WriteInput calls = %d, want %d", got, wantWrites)
+			if got := session.writeCount(); got != 0 {
+				t.Errorf("dispatchInteractive WriteInput calls = %d, want 0", got)
 			}
 
 			var subtypes []string
@@ -466,382 +446,6 @@ func TestInteractive_InitialPromptContract(t *testing.T) {
 				t.Errorf("activity subtypes = %q, want %q", got, wantSubtypes)
 			}
 		})
-	}
-}
-
-// TestWriteInitialPromptInput_RetriesShortWrites makes the exact-byte contract
-// sensitive to a mutation that assumes one WriteInput call always consumes the
-// full Unicode payload.
-func TestWriteInitialPromptInput_RetriesShortWrites(t *testing.T) {
-	session := completedRecordingInteractiveSession()
-	session.maxWrite = 3
-	const seed = "雪だるま\nline two"
-	if err := writeInitialPromptInput(context.Background(), nil, &fakeHandle{}, session, seed); err != nil {
-		t.Fatalf("writeInitialPromptInput: %v", err)
-	}
-	if got, want := string(session.inputBytes()), seed+"\n"; got != want {
-		t.Fatalf("PTY input = %q, want %q", got, want)
-	}
-	if session.writeCount() < 2 {
-		t.Fatalf("short-write fixture recorded %d call(s), want multiple", session.writeCount())
-	}
-}
-
-func TestWriteInitialPromptInput_ByteLimit(t *testing.T) {
-	tests := []struct {
-		name      string
-		prompt    string
-		wantWrite bool
-		multibyte bool
-	}{
-		{
-			name:      "1023 ASCII bytes accepted",
-			prompt:    strings.Repeat("a", maxInitialPromptBytes),
-			wantWrite: true,
-		},
-		{
-			name:   "1024 ASCII bytes rejected",
-			prompt: strings.Repeat("b", maxInitialPromptBytes+1),
-		},
-		{
-			name:      "1023 multibyte UTF-8 bytes accepted",
-			prompt:    strings.Repeat("雪", maxInitialPromptBytes/len("雪")),
-			wantWrite: true,
-			multibyte: true,
-		},
-		{
-			name:      "multibyte rune count below limit but byte count rejected",
-			prompt:    strings.Repeat("雪", maxInitialPromptBytes/len("雪")+1),
-			multibyte: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			session := completedRecordingInteractiveSession()
-			err := writeInitialPromptInput(context.Background(), nil, &fakeHandle{}, session, tt.prompt)
-			if tt.wantWrite {
-				if err != nil {
-					t.Fatalf("writeInitialPromptInput: %v", err)
-				}
-				if got, want := string(session.inputBytes()), tt.prompt+"\n"; got != want {
-					t.Fatalf("PTY input length = %d, want %d", len(got), len(want))
-				}
-				if got := session.writeCount(); got == 0 {
-					t.Fatal("accepted prompt did not call WriteInput")
-				}
-				return
-			}
-
-			if err == nil {
-				t.Fatal("oversize prompt was accepted")
-			}
-			if got := session.writeCount(); got != 0 {
-				t.Fatalf("oversize prompt wrote %d time(s), want 0", got)
-			}
-			if !strings.Contains(err.Error(), fmt.Sprintf("%d UTF-8 bytes", len(tt.prompt))) ||
-				!strings.Contains(err.Error(), fmt.Sprintf("limit is %d bytes", maxInitialPromptBytes)) {
-				t.Fatalf("error = %q, want actual byte count and limit", err)
-			}
-			if strings.Contains(err.Error(), tt.prompt) {
-				t.Fatalf("error leaked prompt content: %q", err)
-			}
-			if tt.multibyte && len([]rune(tt.prompt)) > maxInitialPromptBytes {
-				t.Fatalf("fixture rune count = %d, want <= byte limit %d", len([]rune(tt.prompt)), maxInitialPromptBytes)
-			}
-		})
-	}
-}
-
-// TestWriteInitialPromptInput_CanonicalModeBoundary proves the accepted maximum
-// reaches a real canonical-mode PTY reader. A successful master write alone is
-// insufficient evidence; the child must consume the complete line and exit 0.
-func TestWriteInitialPromptInput_CanonicalModeBoundary(t *testing.T) {
-	requireSh(t)
-	command := fmt.Sprintf(
-		`stty icanon || exit 3; IFS= read -r line || exit 2; [ "${#line}" -eq %d ]`,
-		maxInitialPromptBytes,
-	)
-	session, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{"/bin/sh", "-c", command}})
-	if err != nil {
-		t.Fatalf("ptyhost.Spawn: %v", err)
-	}
-	handle := newInteractivePTYHandle(session)
-	t.Cleanup(func() { _ = handle.Stop(context.Background()) })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := writeInitialPromptInput(
-		ctx,
-		nil,
-		handle,
-		session,
-		strings.Repeat("x", maxInitialPromptBytes),
-	); err != nil {
-		t.Fatalf("writeInitialPromptInput: %v", err)
-	}
-
-	select {
-	case <-session.Done():
-		exit, ok := session.Exit()
-		if !ok {
-			t.Fatal("canonical reader exited without an Exit payload")
-		}
-		if exit.BySignal() || exit.ExitCode != 0 {
-			t.Fatalf("canonical reader exit = %+v, want normal exit 0", exit)
-		}
-	case <-ctx.Done():
-		t.Fatalf("canonical reader did not receive %d-byte line: %v", maxInitialPromptBytes, ctx.Err())
-	}
-}
-
-func TestWriteInitialPromptInput_PreCanceledDoesNotWrite(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	session := completedRecordingInteractiveSession()
-	if err := writeInitialPromptInput(ctx, nil, &fakeHandle{}, session, "must not run"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("writeInitialPromptInput error = %v, want context.Canceled", err)
-	}
-	if got := session.writeCount(); got != 0 {
-		t.Fatalf("pre-cancelled initial prompt wrote %d time(s), want 0", got)
-	}
-}
-
-// TestWriteInitialPromptInput_PreLostOwnershipDoesNotWrite locks the ordering
-// guarantee: an ownership signal already present when delivery begins must win
-// before the write goroutine can race it and inject input into a handed-off PTY.
-func TestWriteInitialPromptInput_PreLostOwnershipDoesNotWrite(t *testing.T) {
-	lost := make(chan struct{})
-	close(lost)
-	var stops atomic.Int64
-	handle := &stopCallbackHandle{
-		Handle: &fakeHandle{},
-		stop:   func() { stops.Add(1) },
-	}
-	session := completedRecordingInteractiveSession()
-
-	err := writeInitialPromptInput(context.Background(), lost, handle, session, "must not run")
-	if !errors.Is(err, heartbeat.ErrLostOwnership) {
-		t.Fatalf("writeInitialPromptInput error = %v, want ErrLostOwnership", err)
-	}
-	if got := session.writeCount(); got != 0 {
-		t.Fatalf("pre-lost initial prompt wrote %d time(s), want 0", got)
-	}
-	if got := stops.Load(); got != 1 {
-		t.Fatalf("handle Stop calls = %d, want 1", got)
-	}
-}
-
-// TestWaitInitialPromptWrite_ReadyOwnershipOutranksCompletion pins the
-// concurrent-ready case without probabilistic select repetition: both channels
-// are ready before arbitration starts, and ownership loss must stop the handle
-// and win over the successful write result.
-func TestWaitInitialPromptWrite_ReadyOwnershipOutranksCompletion(t *testing.T) {
-	writeDone := make(chan error, 1)
-	writeDone <- nil
-	lost := make(chan struct{})
-	close(lost)
-	var stops atomic.Int64
-	handle := &stopCallbackHandle{
-		Handle: &fakeHandle{},
-		stop:   func() { stops.Add(1) },
-	}
-
-	err := waitInitialPromptWrite(context.Background(), lost, handle, writeDone)
-	if !errors.Is(err, heartbeat.ErrLostOwnership) {
-		t.Fatalf("waitInitialPromptWrite error = %v, want ErrLostOwnership", err)
-	}
-	if got := stops.Load(); got != 1 {
-		t.Fatalf("handle Stop calls = %d, want 1", got)
-	}
-}
-
-// TestInteractive_InitialPromptBlockedOwnershipLoss covers the dispatch-level
-// race where ownership changes while the PTY child is not reading its seed.
-// The lost-ownership signal must stop the handle, unblock the write, preserve
-// the terminal classification, and emit no false delivery activity.
-func TestInteractive_InitialPromptBlockedOwnershipLoss(t *testing.T) {
-	t.Setenv(envAttachURL, "")
-	t.Setenv(envAttachToken, "")
-
-	tests := []struct {
-		name            string
-		response        map[string]any
-		wantFailureMode string
-		wantError       string
-	}{
-		{
-			name:            "handoff",
-			response:        map[string]any{"refreshed": false},
-			wantFailureMode: FailureLostOwnership,
-			wantError:       heartbeat.ErrLostOwnership.Error(),
-		},
-		{
-			name:            "operator cancel",
-			response:        map[string]any{"refreshed": true, "stop": true},
-			wantFailureMode: FailureOperatorCancelled,
-			wantError:       "operator cancelled interactive session (lock-refresh stop=true)",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var loseOwnership atomic.Bool
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				response := map[string]any{"refreshed": true}
-				if loseOwnership.Load() {
-					response = tt.response
-				}
-				_ = json.NewEncoder(w).Encode(response)
-			}))
-			t.Cleanup(srv.Close)
-
-			pulser, err := heartbeat.New(heartbeat.Config{
-				SessionID:          "seed-ownership-loss",
-				BaseURL:            srv.URL,
-				HTTPClient:         srv.Client(),
-				Interval:           time.Millisecond,
-				MaxAttemptsPerTick: 1,
-				StrikesUntilLost:   3,
-				Logger:             slog.New(slog.DiscardHandler),
-			})
-			if err != nil {
-				t.Fatalf("heartbeat.New: %v", err)
-			}
-			pulseCtx, pulseCancel := context.WithCancel(context.Background())
-			if err := pulser.Start(pulseCtx); err != nil {
-				pulseCancel()
-				t.Fatalf("pulser.Start: %v", err)
-			}
-			t.Cleanup(func() {
-				pulseCancel()
-				_ = pulser.Stop()
-			})
-
-			started := make(chan struct{})
-			release := make(chan struct{})
-			session := &blockingInteractiveSession{
-				InteractiveSession: completedRecordingInteractiveSession(),
-				started:            started,
-				release:            release,
-			}
-			var stops atomic.Int64
-			baseHandle := &stopCallbackHandle{
-				Handle: &fakeHandle{events: make(chan agent.Event)},
-				stop: func() {
-					stops.Add(1)
-					close(release)
-				},
-			}
-			handle := &testInteractiveHandle{Handle: baseHandle, session: session}
-			sink := &recordingSink{}
-			qw := QueuedWork{QueuedWork: prompt.QueuedWork{
-				SessionID:     "seed-ownership-loss",
-				Mode:          interactiveRunMode,
-				InitialPrompt: "blocked seed must never be reported delivered",
-			}}
-			worktreePath := t.TempDir()
-			runner := minimalRunner(t)
-			resultCh := make(chan struct {
-				res *Result
-				err error
-			}, 1)
-			go func() {
-				out, err := runner.dispatchInteractive(
-					context.Background(), handle, worktreePath, qw,
-					&Result{SessionID: qw.SessionID}, sink, pulser,
-				)
-				resultCh <- struct {
-					res *Result
-					err error
-				}{res: out, err: err}
-			}()
-
-			select {
-			case <-started:
-				loseOwnership.Store(true)
-			case <-time.After(time.Second):
-				t.Fatal("initial prompt write never blocked")
-			}
-
-			var got struct {
-				res *Result
-				err error
-			}
-			select {
-			case got = <-resultCh:
-			case <-time.After(2 * time.Second):
-				t.Fatal("ownership loss did not unblock initial prompt delivery")
-			}
-			if !errors.Is(got.err, heartbeat.ErrLostOwnership) {
-				t.Fatalf("dispatch error = %v, want ErrLostOwnership", got.err)
-			}
-			if got.res.Status != "failed" || got.res.FailureMode != tt.wantFailureMode {
-				t.Fatalf("status=%q mode=%q; want failed/%s", got.res.Status, got.res.FailureMode, tt.wantFailureMode)
-			}
-			if got.res.Error != tt.wantError {
-				t.Fatalf("result error = %q, want %q", got.res.Error, tt.wantError)
-			}
-			if got := stops.Load(); got != 1 {
-				t.Fatalf("handle Stop calls = %d, want 1", got)
-			}
-
-			sink.mu.Lock()
-			events := append([]agent.Event(nil), sink.events...)
-			sink.mu.Unlock()
-			var subtypes []string
-			var terminalMessage string
-			for _, ev := range events {
-				system, ok := ev.(agent.SystemEvent)
-				if !ok {
-					continue
-				}
-				subtypes = append(subtypes, system.Subtype)
-				if system.Subtype == "interactive-session-ended" {
-					terminalMessage = system.Message
-				}
-				if strings.Contains(system.Message, qw.InitialPrompt) {
-					t.Fatalf("activity message leaked initialPrompt content: %q", system.Message)
-				}
-			}
-			if got, want := strings.Join(subtypes, ","), "interactive-session-started,interactive-session-ended"; got != want {
-				t.Fatalf("activity subtypes = %q, want %q", got, want)
-			}
-			if got, want := terminalMessage, "interactive session ownership lost: "+tt.wantFailureMode; got != want {
-				t.Fatalf("terminal activity = %q, want %q", got, want)
-			}
-		})
-	}
-}
-
-func TestInteractive_InitialPromptWriteFailure(t *testing.T) {
-	t.Setenv(envAttachURL, "")
-	t.Setenv(envAttachToken, "")
-
-	session := completedRecordingInteractiveSession()
-	session.writeErr = fmt.Errorf("PTY closed")
-	handle := &testInteractiveHandle{
-		Handle:  &fakeHandle{events: make(chan agent.Event)},
-		session: session,
-	}
-	sink := &recordingSink{}
-	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
-		SessionID:     "seed-failure",
-		Mode:          interactiveRunMode,
-		InitialPrompt: "must be delivered",
-	}}
-	out, err := minimalRunner(t).dispatchInteractive(
-		context.Background(), handle, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, sink, nil,
-	)
-	if err == nil {
-		t.Fatal("expected initial-prompt write failure")
-	}
-	if out.Status != "failed" || out.FailureMode != FailureInteractiveInput {
-		t.Fatalf("status=%q mode=%q; want failed/%s", out.Status, out.FailureMode, FailureInteractiveInput)
-	}
-	for _, ev := range sink.events {
-		if system, ok := ev.(agent.SystemEvent); ok && system.Subtype == "interactive-initial-prompt-delivered" {
-			t.Fatal("delivery activity emitted after failed PTY write")
-		}
 	}
 }
 
@@ -888,74 +492,6 @@ func TestInteractive_InitialPromptOversizeFailsBeforeWrite(t *testing.T) {
 	for _, ev := range sink.events {
 		if system, ok := ev.(agent.SystemEvent); ok && system.Subtype == "interactive-initial-prompt-delivered" {
 			t.Fatal("delivery activity emitted for rejected oversize prompt")
-		}
-	}
-}
-
-// TestInteractive_InitialPromptCancellation proves a child that never reads
-// from its bounded PTY input queue cannot wedge runner cancellation while the
-// initial prompt write is blocked.
-func TestInteractive_InitialPromptCancellation(t *testing.T) {
-	t.Setenv(envAttachURL, "")
-	t.Setenv(envAttachToken, "")
-
-	started := make(chan struct{})
-	release := make(chan struct{})
-	session := &blockingInteractiveSession{
-		InteractiveSession: completedRecordingInteractiveSession(),
-		started:            started,
-		release:            release,
-	}
-	baseHandle := &stopCallbackHandle{
-		Handle: &fakeHandle{events: make(chan agent.Event)},
-		stop:   func() { close(release) },
-	}
-	handle := &testInteractiveHandle{Handle: baseHandle, session: session}
-	sink := &recordingSink{}
-	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
-		SessionID:     "seed-cancel",
-		Mode:          interactiveRunMode,
-		InitialPrompt: strings.Repeat("b", maxInitialPromptBytes),
-	}}
-	ctx, cancel := context.WithCancel(context.Background())
-	runner := minimalRunner(t)
-	worktreePath := t.TempDir()
-	resultCh := make(chan struct {
-		res *Result
-		err error
-	}, 1)
-	go func() {
-		out, err := runner.dispatchInteractive(
-			ctx, handle, worktreePath, qw, &Result{SessionID: qw.SessionID}, sink, nil,
-		)
-		resultCh <- struct {
-			res *Result
-			err error
-		}{res: out, err: err}
-	}()
-
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("initial prompt write never started")
-	}
-	cancel()
-
-	select {
-	case got := <-resultCh:
-		if !errors.Is(got.err, context.Canceled) {
-			t.Fatalf("dispatch error = %v, want context.Canceled", got.err)
-		}
-		if got.res.Status != "stopped" || got.res.FailureMode != "" {
-			t.Fatalf("status=%q mode=%q; want stopped with no failure mode", got.res.Status, got.res.FailureMode)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("runner cancellation remained wedged on initial prompt input")
-	}
-
-	for _, ev := range sink.events {
-		if system, ok := ev.(agent.SystemEvent); ok && system.Subtype == "interactive-initial-prompt-delivered" {
-			t.Fatal("delivery activity emitted after cancelled PTY write")
 		}
 	}
 }
@@ -1178,11 +714,11 @@ func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("relay reconnect did not re-read ATTACH_TOKEN_FILE")
 	}
-	if got, want := string(recordedSession.inputBytes()), initialPrompt+"\n"; got != want {
-		t.Fatalf("initial prompt after reconnect = %q, want %q", got, want)
+	if got := string(recordedSession.inputBytes()); got != "" {
+		t.Fatalf("dispatch replayed initial prompt after reconnect: %q", got)
 	}
-	if got := recordedSession.writeCount(); got != 1 {
-		t.Fatalf("initial prompt WriteInput calls after reconnect = %d, want 1", got)
+	if got := recordedSession.writeCount(); got != 0 {
+		t.Fatalf("dispatch WriteInput calls after reconnect = %d, want 0", got)
 	}
 
 	if err := os.WriteFile(donePath, []byte("done"), 0o600); err != nil {

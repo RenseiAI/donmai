@@ -323,9 +323,14 @@ func (*Provider) Capabilities() agent.Capabilities {
 // On any pre-spawn failure the provider returns an error wrapping
 // agent.ErrSpawnFailed.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
-	spec, err := applyEndpoint(spec)
+	var err error
+	spec, err = agent.PreparePrompt(spec, p.Manifest())
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	spec, err = applyEndpoint(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	if p.useServerLane(spec) {
 		return p.spawnServer(ctx, spec, "")
@@ -617,7 +622,12 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if sessionID == "" {
 		return nil, fmt.Errorf("provider/opencode: Resume: empty session id: %w", agent.ErrUnsupported)
 	}
-	spec, err := applyEndpoint(spec)
+	var err error
+	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	spec, err = applyEndpoint(spec)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}

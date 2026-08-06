@@ -25,6 +25,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,3 +90,71 @@ func TestIntegration_RealCodexAppServer_SmokeLifecycle(t *testing.T) {
 }
 
 func intPtr(i int) *int { return &i }
+
+func TestIntegration_RealCodexAppServer_PromptProvenance(t *testing.T) {
+	if _, err := exec.LookPath("codex"); err != nil {
+		t.Skip("codex binary not on PATH")
+	}
+	cwd := t.TempDir()
+	p, err := New(Options{Cwd: cwd, HandshakeTimeout: 30 * time.Second})
+	if err != nil {
+		t.Skipf("codex unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+
+	plan := agent.PromptPlan{
+		ContractVersion:  agent.PromptContractVersion,
+		HarnessProtocol:  &agent.PromptContent{ID: "system", Text: "Remember system marker REN2040DXS3. Report it when asked. Do not use tools.", Required: true},
+		BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+		InitialContext:   []agent.PromptContent{{ID: "context", Text: "Initial-context marker REN2040DXC5.", Required: true}},
+		UserPrompt:       agent.PromptContent{ID: "user", Text: "User-task marker REN2040DXU7. Reply with all four opaque markers and do not use tools.", Required: true},
+		UserAmendments: []agent.UserPromptAmendment{{
+			ID: "amendment", Position: agent.UserPromptAppend,
+			Content: agent.PromptContent{ID: "amendment-content", Text: "Trailing amendment marker REN2040DXA9.", Required: true},
+		}},
+	}
+	var receipt agent.PromptDeliveryReceipt
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{
+		PromptPlan: &plan, Cwd: cwd, Autonomous: true, SandboxEnabled: true, SandboxLevel: agent.SandboxReadOnly,
+		Model:           "gpt-5.6-terra",
+		OnPromptAdapted: func(got agent.PromptDeliveryReceipt) error { receipt = got; return nil },
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+
+	var transcript strings.Builder
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				goto done
+			}
+			switch event := ev.(type) {
+			case agent.AssistantTextEvent:
+				transcript.WriteString(event.Text)
+			case agent.ResultEvent:
+				transcript.WriteString(event.Message)
+				goto done
+			case agent.ErrorEvent:
+				t.Fatalf("provider error: %s", event.Message)
+			}
+		case <-ctx.Done():
+			t.Fatalf("prompt provenance smoke timed out: %v", ctx.Err())
+		}
+	}
+
+done:
+	if receipt.Decision != "ready" || receipt.ProfileID != "codex/headless/app-server-v2" {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	for _, marker := range []string{"REN2040DXS3", "REN2040DXC5", "REN2040DXU7", "REN2040DXA9"} {
+		if !strings.Contains(transcript.String(), marker) {
+			t.Fatalf("transcript missing %s: %q", marker, transcript.String())
+		}
+	}
+	t.Logf("receipt=%+v transcript=%q", receipt, transcript.String())
+}

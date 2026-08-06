@@ -58,6 +58,12 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			},
 			Transport: agent.TransportSubprocessRPC,
 		},
+		PromptDelivery: []agent.PromptDeliveryProfile{{
+			ID: "pi/headless/rpc-v1", Mode: agent.PromptModeAutonomous,
+			SystemDelivery: agent.PromptDeliveryPiSystemAppend, BaseAppendDelivery: agent.PromptDeliveryPiSystemAppend,
+			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryPiSystemAppend,
+			UserDelivery: agent.PromptDeliveryPiRPCPrompt, AmendmentDelivery: agent.PromptDeliveryPiRPCPrompt,
+		}},
 	}
 }
 

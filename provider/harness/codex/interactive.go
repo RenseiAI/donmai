@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
@@ -37,6 +38,11 @@ import (
 // through the app-server's JSON-RPC notifications, which the interactive TUI
 // never emits) and a single terminal ResultEvent when the CLI process exits.
 func SpawnInteractive(ctx context.Context, opts Options, spec agent.Spec) (agent.Handle, error) {
+	var err error
+	spec, err = agent.PreparePrompt(spec, (&Provider{}).Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	bin, err := resolveCodexBinary(opts.CodexBin)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
@@ -52,8 +58,12 @@ func SpawnInteractive(ctx context.Context, opts Options, spec agent.Spec) (agent
 // stdout and exits) which this package never uses for the interactive
 // spawn mode. An empty prompt starts the TUI bare, with no seeded message.
 func interactiveArgs(spec agent.Spec) []string {
-	if spec.Prompt == "" {
-		return nil
+	var args []string
+	if spec.SystemPromptAppend != "" {
+		args = append(args, "--config", "developer_instructions="+strconv.Quote(spec.SystemPromptAppend))
 	}
-	return []string{spec.Prompt}
+	if spec.Prompt != "" {
+		args = append(args, spec.Prompt)
+	}
+	return args
 }
