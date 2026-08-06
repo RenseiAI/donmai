@@ -67,8 +67,7 @@ func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec ag
 		ispec = &agent.InteractiveSpec{}
 	}
 
-	command := make([]string, 0, len(argv)+1)
-	command = append(command, binary)
+	command := []string{binary}
 	command = append(command, argv...)
 
 	pspec := ptyhost.Spec{
