@@ -62,6 +62,9 @@ func TestSpecFieldCoverage(t *testing.T) {
 		"ProviderConfig",
 		"SubAgentProvider",
 		"OnProcessSpawned", // documented as honored at spawn time
+		"PromptPlan",       // consumed by agent.PreparePrompt before NewSpawnPlan
+		"PromptReceipt",    // populated by agent.PreparePrompt; not a JSON-RPC param
+		"OnPromptAdapted",  // invoked by agent.PreparePrompt before NewSpawnPlan
 		// Endpoint is the additive two-axis model-endpoint binding. The claude
 		// and gemini harnesses read it (serving-host env knobs / URL routing);
 		// codex takes its cardinal-rule-10 position here: Endpoint is
@@ -125,8 +128,8 @@ func TestNewSpawnPlan_Defaults(t *testing.T) {
 // TestNewSpawnPlan_InitialContextRidesTurnInput is the token-amplification
 // guard: Spec.InitialContext (e.g. recalled agent memory) must be
 // delivered ONCE via the first turn's input array and must NOT appear in
-// thread/start.baseInstructions — which codex re-includes in the model
-// system prompt on every turn. Folding it into baseInstructions would
+// thread/start developer instructions — which Codex re-includes in the model
+// prompt on every turn. Folding it into that session-level field would
 // produce O(turns × prefix) input-token blowup on long sessions.
 func TestNewSpawnPlan_InitialContextRidesTurnInput(t *testing.T) {
 	t.Parallel()
@@ -138,14 +141,14 @@ func TestNewSpawnPlan_InitialContextRidesTurnInput(t *testing.T) {
 	}
 	plan := NewSpawnPlan(spec)
 
-	// baseInstructions carries ONLY the session-constant identity, never
+	// developerInstructions carries ONLY the session-constant identity, never
 	// the volatile InitialContext.
-	base, _ := plan.ThreadStart["baseInstructions"].(string)
-	if !strings.Contains(base, "AGENT IDENTITY") {
-		t.Fatalf("baseInstructions should carry identity, got %q", base)
+	developer, _ := plan.ThreadStart["developerInstructions"].(string)
+	if !strings.Contains(developer, "AGENT IDENTITY") {
+		t.Fatalf("developerInstructions should carry identity, got %q", developer)
 	}
-	if strings.Contains(base, "MEMORY: prior decisions about X") {
-		t.Fatalf("baseInstructions must NOT carry InitialContext (per-turn re-send), got %q", base)
+	if strings.Contains(developer, "MEMORY: prior decisions about X") {
+		t.Fatalf("developerInstructions must NOT carry InitialContext, got %q", developer)
 	}
 
 	// turn/start input carries InitialContext as the FIRST part, then the
@@ -269,9 +272,11 @@ func TestNewSpawnPlan_BaseInstructionsAndSystemPromptAppend(t *testing.T) {
 		BaseInstructions:   "RULES",
 		SystemPromptAppend: "EXTRA",
 	})
-	got, _ := plan.ThreadStart["baseInstructions"].(string)
-	if got != "RULES\n\nEXTRA" {
-		t.Fatalf("expected RULES\\n\\nEXTRA, got %q", got)
+	if got := plan.ThreadStart["baseInstructions"]; got != "RULES" {
+		t.Fatalf("baseInstructions = %#v, want RULES", got)
+	}
+	if got := plan.ThreadStart["developerInstructions"]; got != "EXTRA" {
+		t.Fatalf("developerInstructions = %#v, want EXTRA", got)
 	}
 }
 

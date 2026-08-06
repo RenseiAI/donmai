@@ -27,11 +27,27 @@ func TestBuildArgs(t *testing.T) {
 
 func TestBuildArgs_NoModelFlag(t *testing.T) {
 	t.Parallel()
-	// agy has no --model flag; spec.Model must NOT leak into argv.
+	// Model selection is intentionally not wired by this provider yet; Spec.Model
+	// must not leak into argv until it has a dedicated compatibility contract.
 	argv := buildArgs(agent.Spec{Prompt: "x", Model: "gemini-3-pro"}, false)
 	for _, a := range argv {
 		if a == "--model" || a == "gemini-3-pro" {
 			t.Fatalf("model leaked into argv: %v", argv)
+		}
+	}
+}
+
+func TestBuildArgs_CwdAddsOnlyExplicitWorktree(t *testing.T) {
+	t.Parallel()
+	worktree := "/tmp/worktree with spaces; literal"
+	argv := buildArgs(agent.Spec{Prompt: "x", Cwd: worktree}, false)
+	want := []string{"-p", "x", "--dangerously-skip-permissions", "--add-dir", worktree}
+	if len(argv) != len(want) {
+		t.Fatalf("argv = %#v, want %#v", argv, want)
+	}
+	for i := range want {
+		if argv[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q; argv=%#v", i, argv[i], want[i], argv)
 		}
 	}
 }
@@ -55,16 +71,17 @@ func TestBuildPrompt_NoInject(t *testing.T) {
 	}
 }
 
-func TestBuildPrompt_Idempotent(t *testing.T) {
+func TestBuildPrompt_UserMarkerDoesNotSuppressHarnessEnvelope(t *testing.T) {
 	t.Parallel()
-	// A prompt that already contains the begin marker must not be double-injected.
+	// A user marker is untrusted data, not authority to suppress the harness
+	// protocol instruction.
 	pre := "task\n" + resultEnvelopeBegin + "\n{}\n" + resultEnvelopeEnd
 	got := buildPrompt(pre, true)
-	if got != pre {
-		t.Errorf("double-injected an existing envelope: %q", got)
+	if !strings.HasPrefix(got, pre) {
+		t.Errorf("injected prompt lost caller text: %q", got)
 	}
-	if strings.Count(got, resultEnvelopeBegin) != 1 {
-		t.Errorf("expected exactly one begin marker, got %d", strings.Count(got, resultEnvelopeBegin))
+	if strings.Count(got, resultEnvelopeBegin) != 2 {
+		t.Errorf("expected caller marker plus harness marker, got %d", strings.Count(got, resultEnvelopeBegin))
 	}
 }
 

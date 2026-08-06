@@ -24,6 +24,10 @@ type SpecInputs struct {
 	// providers that consume it.
 	SystemPromptAppend string
 
+	// PromptPlan preserves prompt authority/provenance until the exact
+	// harness/mode adapter compiles it onto native wire/config surfaces.
+	PromptPlan *agent.PromptPlan
+
 	// InitialContext is large/volatile session context (e.g. recalled
 	// agent memory) the runner routes through Spec.InitialContext so it
 	// rides the first turn's input rather than the re-sent system-prompt
@@ -85,6 +89,7 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		MCPServers:         in.MCPServers,
 		Model:              strings.TrimSpace(qw.ResolvedProfile.Model),
 		SystemPromptAppend: in.SystemPromptAppend,
+		PromptPlan:         in.PromptPlan,
 		InitialContext:     in.InitialContext,
 		ProviderConfig:     copyProviderConfig(qw.ResolvedProfile.ProviderConfig),
 		Endpoint:           copyEndpointBinding(qw.ResolvedProfile.Endpoint),
@@ -98,11 +103,10 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		spec.Effort = qw.ResolvedProfile.Effort
 	}
 
-	// InitialContext: only forward when the provider can deliver context
-	// via the first turn's input (SupportsTurnInputContext). Providers
-	// without that split receive the same content folded into the system
-	// prompt by the caller, so zeroing here keeps the on-the-wire Spec
-	// faithful and prevents accidental duplication.
+	// InitialContext is a legacy compatibility field. The typed PromptPlan
+	// remains authoritative and is deliberately not capability-gated here;
+	// its exact harness profile either delivers, explicitly downgrades, or
+	// rejects each context item before spawn.
 	if !caps.SupportsTurnInputContext {
 		spec.InitialContext = ""
 	}

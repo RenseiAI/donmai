@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -36,6 +37,32 @@ const scanBufferMax = 4 * 1024 * 1024
 // ansiRE strips terminal escape sequences a pty may interleave. agy's `-p`
 // output is plain text in practice, so this is defensive normalization.
 var ansiRE = regexp.MustCompile("\x1b\\[[0-9;?=]*[ -/]*[@-~]|\x1b\\][^\x07]*(\x07|\x1b\\\\)|\x1b[@-Z\\\\-_]")
+
+// canonicalWorktree validates and canonicalizes the one filesystem root this
+// provider grants to agy for a run. A blank Cwd keeps legacy no-workarea
+// callers working; a non-empty Cwd must name an existing directory so an agy
+// scratch fallback can never silently change the run's authority.
+func canonicalWorktree(cwd string) (string, error) {
+	if cwd == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", fmt.Errorf("resolve worktree %q: %w", cwd, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("stat worktree %q: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("worktree %q is not a directory", abs)
+	}
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize worktree %q: %w", abs, err)
+	}
+	return canonical, nil
+}
 
 // Handle is the agent.Handle implementation backed by an `agy` subprocess
 // attached to a pty.
@@ -120,6 +147,12 @@ func (h *Handle) closePTY() {
 
 // spawn is the internal Provider.Spawn implementation.
 func (p *Provider) spawn(ctx context.Context, spec agent.Spec) (*Handle, error) {
+	worktree, err := canonicalWorktree(spec.Cwd)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	spec.Cwd = worktree
+
 	stateHome := resolveStateHome(p.stateHome)
 
 	// Opt-in workspace trust (default off; best-effort). Untrusted cwds run
@@ -136,7 +169,7 @@ func (p *Provider) spawn(ctx context.Context, spec agent.Spec) (*Handle, error) 
 		brainBefore = snapshotConvIDs(stateHome)
 	}
 
-	argv := buildArgs(spec, p.injectEnvelope)
+	argv := buildArgs(spec, false)
 
 	//nolint:gosec // binary resolved via exec.LookPath at construction; argv is
 	// a closed flag set plus the prompt value.

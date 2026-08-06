@@ -47,5 +47,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			DrivesHosts:              nil,
 			Transport:                agent.TransportPTY,
 		},
+		PromptDelivery: []agent.PromptDeliveryProfile{{
+			ID: "shell/interactive/pty-seed-v1", Mode: agent.PromptModeHumanControlled,
+			SystemDelivery: agent.PromptDeliveryUnsupported, BaseAppendDelivery: agent.PromptDeliveryUnsupported,
+			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryUnsupported,
+			UserDelivery: agent.PromptDeliveryShellPTYSeed, AmendmentDelivery: agent.PromptDeliveryUnsupported,
+		}},
 	}
 }

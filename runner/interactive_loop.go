@@ -120,6 +120,17 @@ func (r *Runner) dispatchInteractive(
 	if sink == nil {
 		sink = noopSink{}
 	}
+	if promptBytes := len(qw.InitialPrompt); qw.isInteractive() && promptBytes > maxInitialPromptBytes {
+		err := fmt.Errorf(
+			"interactive initial prompt is %d UTF-8 bytes; limit is %d bytes",
+			promptBytes,
+			maxInitialPromptBytes,
+		)
+		res.Status = "failed"
+		res.FailureMode = FailureInteractiveInput
+		res.Error = err.Error()
+		return res, err
+	}
 
 	// The spawned handle MUST expose a live PTY surface. A harness without
 	// PTY transport ignores Spec.Interactive and returns an ordinary handle;
@@ -186,51 +197,21 @@ func (r *Runner) dispatchInteractive(
 	// (see heartbeat.SessionClassInteractive). In practice this channel
 	// therefore fires only for the platform's explicit deterministic cancel
 	// ({"stop": true}); the FailureLostOwnership classification below is
-	// retained as defense in depth. Resolve it before initial-prompt
-	// delivery so a PTY child that is not reading input cannot hide a
-	// deterministic stop behind a blocked write.
+	// retained as defense in depth. Prompt delivery already completed inside
+	// Provider.Spawn, so this channel governs only the live attached session.
 	var lost <-chan struct{}
 	if pulser != nil {
 		lost = pulser.LostOwnership()
 	}
 
-	// Deliver the optional seed as the PTY's first runner-owned input. The
-	// gate stays explicit even though dispatchInteractive is reached only from
-	// the interactive branch: direct callers and future refactors must not leak
-	// this field into headless or interview sessions. Do not trim or otherwise
-	// normalize the payload — the upstream dispatch owns normalization, while
-	// this hop preserves Unicode, multiline content, and whitespace verbatim
-	// before appending the contract-required newline.
-	//
-	// This happens before relay attach starts, so local-only sessions receive
-	// the same seed and carrier reconnects can never replay it.
+	// Provider.Spawn has already compiled and delivered any InitialPrompt from
+	// the typed prompt plan onto the profile's native first-turn surface. This
+	// branch records that successful precondition but intentionally writes no
+	// bytes: replaying QueuedWork.InitialPrompt here would bypass the receipt
+	// and duplicate Claude/Codex positional seeds and shell's PTY seed.
 	if qw.isInteractive() && qw.InitialPrompt != "" {
-		if err := writeInitialPromptInput(interactiveCtx, lost, handle, isess, qw.InitialPrompt); err != nil {
-			if errors.Is(err, heartbeat.ErrLostOwnership) {
-				return r.finishInteractiveOwnershipLoss(worktreePath, qw, res, sink, pulser)
-			}
-			if interactiveCtx.Err() != nil {
-				res.Status = "stopped"
-				res.Error = interactiveStopReason(interactiveCtx, ctx)
-				r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
-					"interactive session stopped during initial prompt delivery: "+res.Error)
-				r.logger.Info("[interactive] initial prompt delivery cancelled",
-					"sessionId", qw.SessionID, "reason", res.Error)
-				return res, interactiveCtx.Err()
-			}
-
-			wrapped := fmt.Errorf("interactive initial prompt delivery: %w", err)
-			res.Status = "failed"
-			res.FailureMode = FailureInteractiveInput
-			res.Error = wrapped.Error()
-			r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
-				"interactive session failed during initial prompt delivery")
-			r.logger.Error("[interactive] initial prompt delivery failed",
-				"sessionId", qw.SessionID, "err", err)
-			return res, wrapped
-		}
 		r.postInteractiveActivity(interactiveCtx, worktreePath, sink, "interactive-initial-prompt-delivered",
-			"interactive initial prompt delivered")
+			"interactive initial prompt delivered by native harness surface")
 	}
 
 	// Start the outbound relay attach when configured. RunHost dials OUT only
@@ -404,108 +385,6 @@ func (r *Runner) postInteractiveActivity(ctx context.Context, worktreePath strin
 	if body, err := agent.MarshalEvent(ev); err == nil {
 		r.appendJSONLLine(filepath.Join(worktreePath, state.AgentDirName, "events.jsonl"), body)
 	}
-}
-
-// writeInitialPromptInput writes prompt plus exactly one newline to the live
-// PTY, retrying short writes until the whole logical input is accepted. PTY
-// writes can block when the child has not started reading its bounded input
-// queue, so the write runs separately and cancellation stops the handle to
-// close the PTY and unblock it. The caller owns the mode/non-empty gate.
-func writeInitialPromptInput(
-	ctx context.Context,
-	lost <-chan struct{},
-	handle agent.Handle,
-	isess agent.InteractiveSession,
-	initialPrompt string,
-) error {
-	if initialPromptOwnershipLost(lost) {
-		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if promptBytes := len(initialPrompt); promptBytes > maxInitialPromptBytes {
-		return fmt.Errorf(
-			"interactive initial prompt is %d UTF-8 bytes; limit is %d bytes",
-			promptBytes,
-			maxInitialPromptBytes,
-		)
-	}
-
-	writeDone := make(chan error, 1)
-	go func() {
-		writeDone <- writeInitialPromptBytes(isess, initialPrompt)
-	}()
-
-	return waitInitialPromptWrite(ctx, lost, handle, writeDone)
-}
-
-// waitInitialPromptWrite arbitrates write completion, caller cancellation, and
-// ownership loss. Ownership is probed before blocking and again after either
-// competing arm wins so an already-ready hand-off deterministically outranks a
-// successful write or cancelled parent.
-func waitInitialPromptWrite(
-	ctx context.Context,
-	lost <-chan struct{},
-	handle agent.Handle,
-	writeDone <-chan error,
-) error {
-	if initialPromptOwnershipLost(lost) {
-		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
-	}
-
-	select {
-	case err := <-writeDone:
-		if initialPromptOwnershipLost(lost) {
-			return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
-		}
-		return err
-	case <-ctx.Done():
-		if initialPromptOwnershipLost(lost) {
-			return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
-		}
-		return stopBlockedInitialPrompt(handle, ctx.Err())
-	case <-lost:
-		return stopBlockedInitialPrompt(handle, heartbeat.ErrLostOwnership)
-	}
-}
-
-func initialPromptOwnershipLost(lost <-chan struct{}) bool {
-	select {
-	case <-lost:
-		return true
-	default:
-		return false
-	}
-}
-
-func stopBlockedInitialPrompt(handle agent.Handle, cause error) error {
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer stopCancel()
-	if err := handle.Stop(stopCtx); err != nil {
-		return fmt.Errorf("%w: stop handle after blocked PTY input: %v", cause, err)
-	}
-	return cause
-}
-
-func writeInitialPromptBytes(isess agent.InteractiveSession, initialPrompt string) error {
-	remaining := append([]byte(initialPrompt), '\n')
-	for len(remaining) > 0 {
-		n, err := isess.WriteInput(remaining)
-		if n < 0 || n > len(remaining) {
-			return fmt.Errorf("PTY input returned invalid write count %d for %d bytes", n, len(remaining))
-		}
-		if n > 0 {
-			remaining = remaining[n:]
-		}
-		if err != nil {
-			return fmt.Errorf("write PTY input: %w", err)
-		}
-		if n == 0 {
-			return errors.New("write PTY input: zero-byte write")
-		}
-	}
-	return nil
 }
 
 // attachTokenSource builds the host leg's attachclient.TokenSource. RunHost
