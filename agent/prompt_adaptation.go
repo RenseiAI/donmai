@@ -133,7 +133,9 @@ type BaseInstructionPlan struct {
 	ReplacementAuthorizationID string                  `json:"replacementAuthorizationId,omitempty"`
 }
 
-// UserPromptAmendment is ordered deterministically by Order then ID.
+// UserPromptAmendment is ordered deterministically by Order then ID. ID is
+// the receipt entry identity; Content.ID is a source-content reference and is
+// deliberately not part of the receipt-entry namespace.
 type UserPromptAmendment struct {
 	ID       string             `json:"id"`
 	Position UserPromptPosition `json:"position"`
@@ -341,6 +343,21 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 	}
 	if detail := validatePromptPlan(plan); detail != "" {
 		return deny(PromptDenialMalformedPlan, "", "prompt-plan", true, detail)
+	}
+	// A bare shell's user surface is a command interpreter, not a model turn.
+	// Even an otherwise well-formed semantic downgrade would turn system,
+	// role, or context prose into commands when projected onto shell_pty_seed.
+	// Keep that sink user-authority-only; the exact profile cannot authorize a
+	// non-user channel merely because the caller supplied a downgrade token.
+	if profile.UserDelivery == PromptDeliveryShellPTYSeed && len(plan.AuthorizedDowngrades) > 0 {
+		auth := plan.AuthorizedDowngrades[0]
+		return deny(
+			PromptDenialDowngradeUnauthorized,
+			auth.Channel,
+			auth.ID,
+			true,
+			"shell PTY seed accepts only the explicit user task",
+		)
 	}
 
 	var systemParts, contextParts, downgradedPrepend []string
@@ -560,6 +577,19 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 }
 
 func validatePromptPlan(plan PromptPlan) string {
+	// PromptDeliveryReceipt uses plan entry IDs as its durable provenance keys.
+	// A key must therefore name exactly one authority across the whole effective
+	// plan, not merely within one channel. In particular, providers may append
+	// their own amendment before this validation runs; callers cannot be allowed
+	// to claim the same ID from a different channel.
+	seenEntryIDs := make(map[string]string)
+	registerEntryID := func(id, label string) string {
+		if prior, exists := seenEntryIDs[id]; exists {
+			return fmt.Sprintf("%s stable id %q duplicates %s", label, id, prior)
+		}
+		seenEntryIDs[id] = label
+		return ""
+	}
 	validateContent := func(content *PromptContent, label string) string {
 		if content == nil {
 			return ""
@@ -575,14 +605,32 @@ func validatePromptPlan(plan PromptPlan) string {
 	if detail := validateContent(plan.HarnessProtocol, "harness protocol"); detail != "" {
 		return detail
 	}
+	if plan.HarnessProtocol != nil {
+		if detail := registerEntryID(plan.HarnessProtocol.ID, "harness protocol"); detail != "" {
+			return detail
+		}
+	}
 	if detail := validateContent(plan.BaseInstructions.Content, "base instructions"); detail != "" {
 		return detail
+	}
+	if plan.BaseInstructions.Content != nil {
+		if detail := registerEntryID(plan.BaseInstructions.Content.ID, "base instructions"); detail != "" {
+			return detail
+		}
 	}
 	if detail := validateContent(plan.RoleIntent, "role intent"); detail != "" {
 		return detail
 	}
+	if plan.RoleIntent != nil {
+		if detail := registerEntryID(plan.RoleIntent.ID, "role intent"); detail != "" {
+			return detail
+		}
+	}
 	for i := range plan.InitialContext {
 		if detail := validateContent(&plan.InitialContext[i], "initial context"); detail != "" {
+			return detail
+		}
+		if detail := registerEntryID(plan.InitialContext[i].ID, "initial context"); detail != "" {
 			return detail
 		}
 	}
@@ -592,18 +640,35 @@ func validatePromptPlan(plan PromptPlan) string {
 	if plan.UserPrompt.Text == "" && plan.UserPrompt.Required {
 		return "user prompt is required but empty"
 	}
+	if detail := registerEntryID(plan.UserPrompt.ID, "user prompt"); detail != "" {
+		return detail
+	}
 
-	seenAmendments := make(map[string]bool, len(plan.UserAmendments))
 	for i := range plan.UserAmendments {
 		amendment := &plan.UserAmendments[i]
-		if amendment.ID == "" || seenAmendments[amendment.ID] {
-			return "user amendments require unique stable ids"
+		if amendment.ID == "" {
+			return "user amendments require stable ids"
 		}
-		seenAmendments[amendment.ID] = true
+		if detail := registerEntryID(amendment.ID, "user amendment"); detail != "" {
+			return detail
+		}
 		if amendment.Position != UserPromptPrepend && amendment.Position != UserPromptAppend {
 			return "user amendment has an unknown position"
 		}
+		// A user amendment's receipt is keyed by amendment.ID (see the
+		// deliveredEntry call in AdaptPrompt), not amendment.Content.ID. Content
+		// references can legitimately be shared by separately ordered entries,
+		// or spell another entry's ID, so validate the reference shape without
+		// registering it in the receipt-entry namespace.
 		if detail := validateContent(&amendment.Content, "user amendment content"); detail != "" {
+			return detail
+		}
+	}
+	// Preserve has a receipt-bearing synthetic baseline entry. Reserve it here
+	// as well so a caller cannot make a successful receipt ambiguous by using
+	// its stable ID in a different channel.
+	if plan.BaseInstructions.Strategy == BaseInstructionsPreserve {
+		if detail := registerEntryID("base-instructions", "preserved base instructions"); detail != "" {
 			return detail
 		}
 	}

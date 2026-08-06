@@ -21,11 +21,12 @@ import (
 func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name           string
-		manifest       agent.HarnessManifest
-		mode           agent.PromptSessionMode
-		supportsSystem bool
-		contextInUser  bool
+		name              string
+		manifest          agent.HarnessManifest
+		mode              agent.PromptSessionMode
+		supportsSystem    bool
+		supportsDowngrade bool
+		contextInUser     bool
 	}{
 		{name: "claude/headless", manifest: (&claude.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "claude/interactive", manifest: (&claude.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true},
@@ -33,9 +34,9 @@ func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 		{name: "codex/interactive", manifest: (&codex.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true, contextInUser: true},
 		{name: "gemini/raw", manifest: (&gemini.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "ollama/raw", manifest: (&ollama.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
-		{name: "amp/headless", manifest: (&amp.Provider{}).Manifest(), mode: agent.PromptModeAutonomous},
-		{name: "agy/headless", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous},
-		{name: "opencode/headless", manifest: (&opencode.Provider{}).Manifest(), mode: agent.PromptModeAutonomous},
+		{name: "amp/headless", manifest: (&amp.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
+		{name: "agy/headless", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
+		{name: "opencode/headless", manifest: (&opencode.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "pi/headless", manifest: (&pi.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "shell/interactive", manifest: (&shell.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled},
 	}
@@ -71,6 +72,12 @@ func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 				}
 				spec.PromptPlan = &plan
 				adapted, deniedReceipt, err = agent.AdaptPrompt(spec, profile)
+				if !tt.supportsDowngrade {
+					if !agent.IsPromptAdaptationError(err, agent.PromptDenialDowngradeUnauthorized) {
+						t.Fatalf("forbidden user downgrade error = %v", err)
+					}
+					return
+				}
 				if err != nil {
 					t.Fatalf("authorized downgrade: %v", err)
 				}
@@ -205,6 +212,103 @@ func TestPromptAdaptation_RejectsUnknownDeliveryAndMalformedIdentity(t *testing.
 	_, _, err = agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
 	if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
 		t.Fatalf("missing stable id error = %v", err)
+	}
+}
+
+func TestPromptAdaptation_RejectsCrossChannelDuplicateStableIDs(t *testing.T) {
+	t.Parallel()
+	profile, _ := (&claude.Provider{}).Manifest().PromptProfile(agent.PromptModeAutonomous)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agent.PromptPlan)
+	}{
+		{
+			name: "harness protocol",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.HarnessProtocol.ID = "user"
+			},
+		},
+		{
+			name: "base append",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.BaseInstructions = agent.BaseInstructionPlan{
+					Strategy: agent.BaseInstructionsAppend,
+					Content:  &agent.PromptContent{ID: "user", Text: "append", Required: true},
+				}
+			},
+		},
+		{
+			name: "base replace",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.BaseInstructions = agent.BaseInstructionPlan{
+					Strategy:                   agent.BaseInstructionsReplace,
+					Content:                    &agent.PromptContent{ID: "user", Text: "replace", Required: true},
+					ReplacementAuthorizationID: "policy-auth",
+				}
+			},
+		},
+		{
+			name: "role intent",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.RoleIntent.ID = "user"
+			},
+		},
+		{
+			name: "initial context",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.InitialContext[0].ID = "user"
+			},
+		},
+		{
+			name: "user amendment identity",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.UserAmendments[0].ID = "user"
+			},
+		},
+		{
+			name: "preserved base receipt identity",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.BaseInstructions = agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve}
+				plan.UserPrompt.ID = "base-instructions"
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			plan := fullPromptPlan()
+			tc.mutate(&plan)
+			_, receipt, err := agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
+			if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
+				t.Fatalf("AdaptPrompt error = %v, want malformed prompt plan denial", err)
+			}
+			if receipt.Decision != "denied" || len(receipt.Entries) != 1 || receipt.Entries[0].ID != "prompt-plan" {
+				t.Fatalf("denied receipt = %#v, want one prompt-plan denial", receipt)
+			}
+		})
+	}
+}
+
+func TestPromptAdaptation_AmendmentContentRefsDoNotCollideWithReceiptIDs(t *testing.T) {
+	t.Parallel()
+	profile, _ := (&claude.Provider{}).Manifest().PromptProfile(agent.PromptModeAutonomous)
+	plan := fullPromptPlan()
+
+	// Amendment entry identities remain distinct even when their source content
+	// references are shared or happen to spell another receipt entry ID.
+	plan.UserAmendments[0].Content.ID = "shared-content-ref"
+	plan.UserAmendments[1].Content.ID = "shared-content-ref"
+	plan.UserAmendments[2].Content.ID = plan.UserPrompt.ID
+
+	_, receipt, err := agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
+	if err != nil {
+		t.Fatalf("reused amendment content refs should be valid: %v", err)
+	}
+	seen := make(map[string]struct{}, len(receipt.Entries))
+	for _, entry := range receipt.Entries {
+		if _, duplicate := seen[entry.ID]; duplicate {
+			t.Fatalf("receipt has duplicate entry ID %q: %#v", entry.ID, receipt)
+		}
+		seen[entry.ID] = struct{}{}
 	}
 }
 

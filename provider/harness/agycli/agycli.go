@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -17,6 +18,8 @@ const ProviderName agent.ProviderName = "agy-cli"
 // DefaultBinary is the executable name probed on $PATH at construction.
 // Override via Options.Binary for tests or non-standard installs.
 const DefaultBinary = "agy"
+
+const agyHelpTimeout = 5 * time.Second
 
 // Options configure a Provider. The zero value is valid: it probes $PATH
 // for `agy`, injects the result envelope, and enables transcript enrichment.
@@ -94,6 +97,9 @@ func New(opts Options) (*Provider, error) {
 			agent.ErrProviderUnavailable, binary, err,
 		)
 	}
+	if err := verifyAddDirSupport(resolved, runAgyHelp); err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
+	}
 
 	return &Provider{
 		binary:           resolved,
@@ -102,6 +108,31 @@ func New(opts Options) (*Provider, error) {
 		trustWorkspace:   opts.TrustWorkspace,
 		stateHome:        opts.StateHome,
 	}, nil
+}
+
+// agyHelpRunner is deliberately narrow so the compatibility check is easy to
+// test without weakening the production constructor's fail-closed behavior.
+type agyHelpRunner func(context.Context, string) ([]byte, error)
+
+func runAgyHelp(ctx context.Context, binary string) ([]byte, error) {
+	//nolint:gosec // binary was resolved with exec.LookPath before this probe.
+	return exec.CommandContext(ctx, binary, "--help").CombinedOutput()
+}
+
+// verifyAddDirSupport rejects CLI builds that cannot bind a run to its
+// requested worktree. cmd.Dir alone is insufficient because agy may create a
+// scratch project and ignore the process directory for workspace tool calls.
+func verifyAddDirSupport(binary string, help agyHelpRunner) error {
+	ctx, cancel := context.WithTimeout(context.Background(), agyHelpTimeout)
+	defer cancel()
+	out, err := help(ctx, binary)
+	if err != nil {
+		return fmt.Errorf("agy CLI %q cannot verify required --add-dir support: %w", binary, err)
+	}
+	if !strings.Contains(string(out), "--add-dir") {
+		return fmt.Errorf("agy CLI %q does not advertise required --add-dir worktree binding", binary)
+	}
+	return nil
 }
 
 // Name returns ProviderName ("agy-cli").
@@ -137,12 +168,15 @@ func (*Provider) Capabilities() agent.Capabilities {
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	if p.injectEnvelope {
 		plan := agent.EnsurePromptPlan(spec)
-		if !planContainsResultEnvelope(plan) {
-			plan.UserAmendments = append(plan.UserAmendments, agent.UserPromptAmendment{
-				ID: "agy-result-envelope", Position: agent.UserPromptAppend, Order: 1000,
-				Content: agent.PromptContent{ID: "agy-result-envelope-content", Text: resultEnvelopeInstruction, Required: true},
-			})
-		}
+		// The result envelope is provider-owned protocol, not a caller opt-out.
+		// In particular, untrusted user task/amendment text can contain the
+		// markers verbatim and must never suppress the provider's instruction.
+		// Keep the stable typed ID: a caller attempting to supply that ID creates
+		// a duplicate and is rejected by PromptPlan validation before spawn.
+		plan.UserAmendments = append(plan.UserAmendments, agent.UserPromptAmendment{
+			ID: "agy-result-envelope", Position: agent.UserPromptAppend, Order: 1000,
+			Content: agent.PromptContent{ID: "agy-result-envelope-content", Text: resultEnvelopeInstruction, Required: true},
+		})
 		spec.PromptPlan = &plan
 	}
 	var err error
@@ -151,18 +185,6 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	return p.spawn(ctx, spec)
-}
-
-func planContainsResultEnvelope(plan agent.PromptPlan) bool {
-	if strings.Contains(plan.UserPrompt.Text, resultEnvelopeBegin) {
-		return true
-	}
-	for _, amendment := range plan.UserAmendments {
-		if strings.Contains(amendment.Content.Text, resultEnvelopeBegin) {
-			return true
-		}
-	}
-	return false
 }
 
 // Resume returns agent.ErrUnsupported. `agy --conversation <id>` resumes by id
