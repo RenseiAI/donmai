@@ -381,23 +381,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 			qw.SystemPromptOverride, interview.InterviewCompleteSentinel)
 	}
 
-	// Token-amplification guard: when the provider can deliver session
-	// context via the first turn's input (codex re-sends baseInstructions
-	// on every model turn), keep the large/volatile agent-memory block
-	// OUT of the system-prompt prefix. We render the prompt with an empty
-	// MemoryBlock so the builder does not fold it into the system prompt,
-	// then thread the memory through Spec.InitialContext instead — it is
-	// delivered once and then lives in cached conversation history. For
-	// providers without that split the memory stays folded into the system
-	// prompt exactly as before (additive — no behaviour change).
-	buildQW := qw.QueuedWork
-	var initialContext string
-	if caps.SupportsTurnInputContext && strings.TrimSpace(buildQW.MemoryBlock) != "" {
-		initialContext = buildQW.MemoryBlock
-		buildQW.MemoryBlock = ""
-	}
-
-	systemPrompt, userPrompt, err := r.promptBuilder.Build(buildQW)
+	// Render source-addressed prompt authorities. The exact harness profile,
+	// not a coarse provider capability, decides whether memory/context rides a
+	// native system surface or the first turn.
+	composition, err := r.promptBuilder.BuildComposition(qw.QueuedWork)
 	if err != nil {
 		res.Status = "failed"
 		res.FailureMode = FailurePromptRender
@@ -410,7 +397,29 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	// composed system prompt — FQ MCP tool names for MCP-capable providers,
 	// Bash-CLI fallback guidance for providers that ignore MCP specs. Strict
 	// no-op when the block is absent (byte-identical prompt to today).
-	systemPrompt = injectCodeIntelPartial(systemPrompt, caps, qw.CodeIntel)
+	composition.HarnessProtocol = injectCodeIntelPartial(composition.HarnessProtocol, caps, qw.CodeIntel)
+	systemPrompt := composition.SystemPrompt()
+	userPrompt := composition.UserPrompt
+	promptPlan := &agent.PromptPlan{
+		ContractVersion:  agent.PromptContractVersion,
+		HarnessProtocol:  &agent.PromptContent{ID: "runner-harness-protocol", Text: composition.HarnessProtocol, Required: true},
+		BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+		UserPrompt:       agent.PromptContent{ID: "runner-user-task", Text: userPrompt, Required: strings.TrimSpace(userPrompt) != ""},
+		// The runner owns these authorities and explicitly permits harnesses
+		// without native system/context surfaces to prepend them to the first
+		// user turn. The adapter receipt records each downgrade by ID.
+		AuthorizedDowngrades: []agent.PromptDowngradeAuthorization{
+			{ID: "runner-authorizes-protocol-to-user", Channel: agent.PromptChannelHarnessProtocol, To: agent.PromptChannelUserPrompt},
+			{ID: "runner-authorizes-role-to-user", Channel: agent.PromptChannelRoleIntent, To: agent.PromptChannelUserPrompt},
+			{ID: "runner-authorizes-context-to-user", Channel: agent.PromptChannelInitialContext, To: agent.PromptChannelUserPrompt},
+		},
+	}
+	if composition.RoleIntent != "" {
+		promptPlan.RoleIntent = &agent.PromptContent{ID: "agent-card-role-intent", Text: composition.RoleIntent, Required: true}
+	}
+	if composition.InitialContext != "" {
+		promptPlan.InitialContext = []agent.PromptContent{{ID: "agent-memory-context", Text: composition.InitialContext, Required: true}}
+	}
 
 	// 6. Translate to agent.Spec.
 	composedEnv := envToMap(r.envc.Compose(hostEnv(), agent.Spec{Env: specEnv}))
@@ -418,7 +427,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		Cwd:                wpath,
 		Prompt:             userPrompt,
 		SystemPromptAppend: systemPrompt,
-		InitialContext:     initialContext,
+		PromptPlan:         promptPlan,
+		InitialContext:     composition.InitialContext,
 		MCPServers:         mcpServers,
 		Env:                composedEnv,
 		Autonomous:         true,
@@ -492,6 +502,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		spec.Interactive = &agent.InteractiveSpec{
 			RecordPath: filepath.Join(wpath, state.AgentDirName, "term.cast"),
 		}
+	}
+	spec.OnPromptAdapted = func(receipt agent.PromptDeliveryReceipt) error {
+		_, err := r.store.Update(wpath, func(s *state.State) error {
+			s.PromptReceipt = &receipt
+			return nil
+		})
+		return err
 	}
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn

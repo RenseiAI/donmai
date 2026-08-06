@@ -136,7 +136,7 @@ func (p *Provider) spawn(ctx context.Context, spec agent.Spec) (*Handle, error) 
 		brainBefore = snapshotConvIDs(stateHome)
 	}
 
-	argv := buildArgs(spec, p.injectEnvelope)
+	argv := buildArgs(spec, false)
 
 	//nolint:gosec // binary resolved via exec.LookPath at construction; argv is
 	// a closed flag set plus the prompt value.

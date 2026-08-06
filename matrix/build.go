@@ -15,13 +15,14 @@ import (
 // "raw" packages (gemini + ollama) the generator MERGES them into one row with
 // union drives/hosts.
 type HarnessRow struct {
-	Name        agent.HarnessName    `json:"name"`
-	HumanLabel  string               `json:"humanLabel"`
-	Family      agent.Family         `json:"family"`
-	ContractABI string               `json:"contractAbi"`
-	Caps        agent.HarnessCaps    `json:"capabilities"`
-	Drives      []agent.WireProtocol `json:"drives"`
-	DrivesHosts []agent.ServingHost  `json:"drivesHosts"`
+	Name           agent.HarnessName             `json:"name"`
+	HumanLabel     string                        `json:"humanLabel"`
+	Family         agent.Family                  `json:"family"`
+	ContractABI    string                        `json:"contractAbi"`
+	Caps           agent.HarnessCaps             `json:"capabilities"`
+	Drives         []agent.WireProtocol          `json:"drives"`
+	DrivesHosts    []agent.ServingHost           `json:"drivesHosts"`
+	PromptDelivery []agent.PromptDeliveryProfile `json:"promptDelivery"`
 }
 
 // EndpointRow is one model-endpoint company in the generated endpoints[].
@@ -157,13 +158,14 @@ func buildHarnesses() ([]HarnessRow, map[agent.HarnessName]HarnessRow, error) {
 		row, ok := byName[mf.Name]
 		if !ok {
 			r := HarnessRow{
-				Name:        mf.Name,
-				HumanLabel:  mf.HumanLabel,
-				Family:      mf.Family,
-				ContractABI: mf.ContractABI,
-				Caps:        mf.Caps,
-				Drives:      dedupProtocols(mf.Caps.Drives),
-				DrivesHosts: dedupHosts(mf.Caps.DrivesHosts),
+				Name:           mf.Name,
+				HumanLabel:     mf.HumanLabel,
+				Family:         mf.Family,
+				ContractABI:    mf.ContractABI,
+				Caps:           mf.Caps,
+				Drives:         dedupProtocols(mf.Caps.Drives),
+				DrivesHosts:    dedupHosts(mf.Caps.DrivesHosts),
+				PromptDelivery: append([]agent.PromptDeliveryProfile(nil), mf.PromptDelivery...),
 			}
 			byName[mf.Name] = &r
 			continue
@@ -174,6 +176,7 @@ func buildHarnesses() ([]HarnessRow, map[agent.HarnessName]HarnessRow, error) {
 		row.Caps.Drives = row.Drives
 		row.Caps.DrivesHosts = row.DrivesHosts
 		row.Caps = unionCaps(row.Caps, mf.Caps)
+		row.PromptDelivery = mergePromptDelivery(row.PromptDelivery, mf.PromptDelivery)
 	}
 
 	rows := make([]HarnessRow, 0, len(byName))
@@ -182,11 +185,27 @@ func buildHarnesses() ([]HarnessRow, map[agent.HarnessName]HarnessRow, error) {
 		// Ensure the row's Caps.Drives/Hosts mirror the merged union.
 		r.Caps.Drives = r.Drives
 		r.Caps.DrivesHosts = r.DrivesHosts
+		sort.Slice(r.PromptDelivery, func(i, j int) bool { return r.PromptDelivery[i].ID < r.PromptDelivery[j].ID })
 		rows = append(rows, *r)
 		out[r.Name] = *r
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 	return rows, out, nil
+}
+
+func mergePromptDelivery(existing, incoming []agent.PromptDeliveryProfile) []agent.PromptDeliveryProfile {
+	out := append([]agent.PromptDeliveryProfile(nil), existing...)
+	seen := make(map[string]bool, len(out))
+	for _, profile := range out {
+		seen[profile.ID] = true
+	}
+	for _, profile := range incoming {
+		if !seen[profile.ID] {
+			out = append(out, profile)
+			seen[profile.ID] = true
+		}
+	}
+	return out
 }
 
 // buildEndpoints harvests the endpoint manifests into sorted rows + a lookup.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -134,7 +135,34 @@ func (*Provider) Capabilities() agent.Capabilities {
 // merged onto the environment (after AGENT_ENV_BLOCKLIST filtering by the
 // runner) but no *_API_KEY is required.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	if p.injectEnvelope {
+		plan := agent.EnsurePromptPlan(spec)
+		if !planContainsResultEnvelope(plan) {
+			plan.UserAmendments = append(plan.UserAmendments, agent.UserPromptAmendment{
+				ID: "agy-result-envelope", Position: agent.UserPromptAppend, Order: 1000,
+				Content: agent.PromptContent{ID: "agy-result-envelope-content", Text: resultEnvelopeInstruction, Required: true},
+			})
+		}
+		spec.PromptPlan = &plan
+	}
+	var err error
+	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	return p.spawn(ctx, spec)
+}
+
+func planContainsResultEnvelope(plan agent.PromptPlan) bool {
+	if strings.Contains(plan.UserPrompt.Text, resultEnvelopeBegin) {
+		return true
+	}
+	for _, amendment := range plan.UserAmendments {
+		if strings.Contains(amendment.Content.Text, resultEnvelopeBegin) {
+			return true
+		}
+	}
+	return false
 }
 
 // Resume returns agent.ErrUnsupported. `agy --conversation <id>` resumes by id

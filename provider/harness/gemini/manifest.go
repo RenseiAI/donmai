@@ -35,5 +35,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			DrivesHosts:              []agent.ServingHost{agent.HostDirect, agent.HostVertex},
 			Transport:                agent.TransportDirectAPI,
 		},
+		PromptDelivery: []agent.PromptDeliveryProfile{{
+			ID: "raw/gemini-generate/direct-api-v1", Mode: agent.PromptModeAutonomous,
+			SystemDelivery: agent.PromptDeliveryGeminiSystemInstruction, BaseAppendDelivery: agent.PromptDeliveryGeminiSystemInstruction,
+			BaseReplaceDelivery: agent.PromptDeliveryGeminiSystemInstruction, ContextDelivery: agent.PromptDeliveryGeminiSystemInstruction,
+			UserDelivery: agent.PromptDeliveryGeminiUserContent, AmendmentDelivery: agent.PromptDeliveryGeminiUserContent,
+		}},
 	}
 }

@@ -35,5 +35,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			DrivesHosts:              []agent.ServingHost{agent.HostLocal},
 			Transport:                agent.TransportDirectAPI,
 		},
+		PromptDelivery: []agent.PromptDeliveryProfile{{
+			ID: "raw/ollama-chat/direct-api-v1", Mode: agent.PromptModeAutonomous,
+			SystemDelivery: agent.PromptDeliveryOllamaSystemMessage, BaseAppendDelivery: agent.PromptDeliveryOllamaSystemMessage,
+			BaseReplaceDelivery: agent.PromptDeliveryOllamaSystemMessage, ContextDelivery: agent.PromptDeliveryOllamaSystemMessage,
+			UserDelivery: agent.PromptDeliveryOllamaUserMessage, AmendmentDelivery: agent.PromptDeliveryOllamaUserMessage,
+		}},
 	}
 }

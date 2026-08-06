@@ -148,6 +148,11 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	var err error
+	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	model := spec.Model
 	if model == "" {
 		model = DefaultModel

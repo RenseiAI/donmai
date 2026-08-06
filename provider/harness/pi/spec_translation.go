@@ -65,6 +65,9 @@ func rpcArgs(layout sessionLayout, mode launchMode, sessionID string, spec agent
 			args = append(args, "--model", modelArg)
 		}
 	}
+	if spec.SystemPromptAppend != "" {
+		args = append(args, "--append-system-prompt", spec.SystemPromptAppend)
+	}
 	if mode == launchResume && sessionID != "" {
 		args = append(args, "--session", sessionID)
 	}

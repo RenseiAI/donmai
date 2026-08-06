@@ -33,5 +33,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			DrivesHosts:              []agent.ServingHost{agent.HostDirect},
 			Transport:                agent.TransportCLIInjection,
 		},
+		PromptDelivery: []agent.PromptDeliveryProfile{{
+			ID: "amp/headless/execute-v1", Mode: agent.PromptModeAutonomous,
+			SystemDelivery: agent.PromptDeliveryUnsupported, BaseAppendDelivery: agent.PromptDeliveryUnsupported,
+			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryUnsupported,
+			UserDelivery: agent.PromptDeliveryAmpStdin, AmendmentDelivery: agent.PromptDeliveryAmpStdin,
+		}},
 	}
 }

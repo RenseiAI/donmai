@@ -143,7 +143,12 @@ const (
 )
 
 func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode, sessionID string) (agent.Handle, error) {
-	spec, err := applyEndpoint(spec)
+	var err error
+	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	spec, err = applyEndpoint(spec)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}

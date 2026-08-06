@@ -45,5 +45,19 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			DrivesHosts:              []agent.ServingHost{agent.HostOAuthCLI, agent.HostDirect, agent.HostAzure},
 			Transport:                agent.TransportSubprocessRPC,
 		},
+		PromptDelivery: []agent.PromptDeliveryProfile{
+			{
+				ID: "codex/headless/app-server-v2", Mode: agent.PromptModeAutonomous,
+				SystemDelivery: agent.PromptDeliveryCodexDeveloperInstructions, BaseAppendDelivery: agent.PromptDeliveryCodexDeveloperInstructions,
+				BaseReplaceDelivery: agent.PromptDeliveryCodexBaseInstructions, ContextDelivery: agent.PromptDeliveryCodexTurnInput,
+				UserDelivery: agent.PromptDeliveryCodexTurnInput, AmendmentDelivery: agent.PromptDeliveryCodexTurnInput,
+			},
+			{
+				ID: "codex/interactive/pty-developer-instructions-v1", Mode: agent.PromptModeHumanControlled,
+				SystemDelivery: agent.PromptDeliveryCodexCLIInstructions, BaseAppendDelivery: agent.PromptDeliveryCodexCLIInstructions,
+				BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryCodexPTYSeed,
+				UserDelivery: agent.PromptDeliveryCodexPTYSeed, AmendmentDelivery: agent.PromptDeliveryCodexPTYSeed,
+			},
+		},
 	}
 }

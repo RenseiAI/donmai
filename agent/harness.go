@@ -81,11 +81,12 @@ type HarnessCaps struct {
 // HarnessManifest — pre-load, readable WITHOUT constructing the provider
 // (closes 002 §manifest-separation). ContractABI = "harness/v2".
 type HarnessManifest struct {
-	Name        HarnessName `json:"name"`
-	HumanLabel  string      `json:"humanLabel"`
-	Family      Family      `json:"family"`      // FamilyHarness
-	ContractABI string      `json:"contractAbi"` // "harness/v2"
-	Caps        HarnessCaps `json:"capabilities"`
+	Name           HarnessName             `json:"name"`
+	HumanLabel     string                  `json:"humanLabel"`
+	Family         Family                  `json:"family"`      // FamilyHarness
+	ContractABI    string                  `json:"contractAbi"` // "harness/v2"
+	Caps           HarnessCaps             `json:"capabilities"`
+	PromptDelivery []PromptDeliveryProfile `json:"promptDelivery"`
 }
 
 // Base projects the harness manifest onto the family-agnostic ProviderBase

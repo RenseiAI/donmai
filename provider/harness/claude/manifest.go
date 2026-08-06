@@ -53,5 +53,19 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			},
 			Transport: agent.TransportCLIInjection,
 		},
+		PromptDelivery: []agent.PromptDeliveryProfile{
+			{
+				ID: "claude-code/headless/cli-v1", Mode: agent.PromptModeAutonomous,
+				SystemDelivery: agent.PromptDeliveryClaudeSystemAppend, BaseAppendDelivery: agent.PromptDeliveryClaudeSystemAppend,
+				BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryClaudeSystemAppend,
+				UserDelivery: agent.PromptDeliveryClaudeUserStdin, AmendmentDelivery: agent.PromptDeliveryClaudeUserStdin,
+			},
+			{
+				ID: "claude-code/interactive/pty-v1", Mode: agent.PromptModeHumanControlled,
+				SystemDelivery: agent.PromptDeliveryClaudeSystemAppend, BaseAppendDelivery: agent.PromptDeliveryClaudeSystemAppend,
+				BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryClaudeSystemAppend,
+				UserDelivery: agent.PromptDeliveryClaudePTYSeed, AmendmentDelivery: agent.PromptDeliveryClaudePTYSeed,
+			},
+		},
 	}
 }

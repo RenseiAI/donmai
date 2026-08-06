@@ -194,13 +194,13 @@ func (p *Provider) Capabilities() agent.Capabilities {
 		AcceptsAllowedToolsList: false,
 		AcceptsMcpServerSpec:    true,
 		HumanLabel:              "Codex",
-		// Codex re-includes baseInstructions (thread/start) in the model
-		// system prompt on every internal turn; turn/start input is sent
+		// Codex re-includes thread-level developer/base instructions in the
+		// model prompt on every internal turn; turn/start input is sent
 		// once and then lives in cached conversation history. Declaring
 		// SupportsTurnInputContext lets the runner route large, volatile
 		// context (recalled agent memory) through Spec.InitialContext so
 		// it rides the first turn's input instead of inflating the
-		// re-sent baseInstructions prefix.
+		// re-sent instruction prefix.
 		SupportsTurnInputContext: true,
 	}
 }
@@ -216,6 +216,11 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	// headless app-server path instead of a hardcoded branch always firing.
 	if spec.Interactive != nil && p.Manifest().Caps.SupportsInteractivePTY {
 		return SpawnInteractive(ctx, p.opts, spec)
+	}
+	var err error
+	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 
 	if err := p.checkAlive(); err != nil {
@@ -233,7 +238,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 
 	if err := h.start(ctx, plan, ""); err != nil {
 		p.unregisterHandle(h)
-		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 
 	if spec.OnProcessSpawned != nil && p.cmd != nil && p.cmd.Process != nil {
@@ -244,6 +249,11 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 
 // Resume implements agent.Provider.
 func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
+	var err error
+	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
 	if err := p.checkAlive(); err != nil {
 		return nil, err
 	}

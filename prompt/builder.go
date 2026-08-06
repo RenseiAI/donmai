@@ -143,13 +143,10 @@ func NewBuilder() *Builder {
 // The legacy template path is preserved when StagePrompt is empty
 // (cardinal rule 1 — additive, no break).
 //
-// System-prompt override: when qw.SystemPromptOverride is non-empty it
-// replaces the system_base.tmpl rendering entirely. The runner-owned content
-// safety preamble still prefixes the override; [Builder.SystemAppend] and
-// [Builder.SkillAppend] are NOT appended (the upstream-supplied override is
-// assumed to be self-contained). When SystemPromptOverride is empty the
-// builder falls back to the standard system_base.tmpl path. The same immutable
-// safety preamble prefixes that rendered base prompt.
+// Legacy system-prompt override: the wire field retains its historical name,
+// but its content is role intent and therefore appends after the runner-owned
+// operating protocol. It never replaces the content-safety invariant,
+// system_base.tmpl, repository instructions, or Kit skills.
 func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 	hasStagePrompt := strings.TrimSpace(qw.StagePrompt) != ""
 	// Interactive sessions are exempt from the empty-work check: an idle
@@ -176,24 +173,18 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 		return "", "", err
 	}
 
-	// Resolve the system prompt. When SystemPromptOverride is set by the
-	// upstream dispatch layer, use it as the override body. Otherwise fall
-	// through to the embedded system_base.tmpl render (standard path). The
-	// runner-owned preamble is composed onto either body below.
-	var systemBuf string
-	if override := strings.TrimSpace(qw.SystemPromptOverride); override != "" {
-		systemBuf = override
-	} else {
-		systemBuf, err = renderTemplate(tmpls, "system_base.tmpl", systemTemplateData(qw, b.SystemAppend, b.SkillAppend))
-		if err != nil {
-			return "", "", fmt.Errorf("render system prompt: %w", err)
-		}
+	// The base operating protocol is always rendered. Role intent is a
+	// separate authority and cannot select a replacement path.
+	systemBuf, err := renderTemplate(tmpls, "system_base.tmpl", systemTemplateData(qw, b.SystemAppend, b.SkillAppend))
+	if err != nil {
+		return "", "", fmt.Errorf("render system prompt: %w", err)
 	}
 
 	// The content-safety boundary is runner-owned, so caller-supplied overrides
 	// cannot remove it. Apply it after resolving either system-prompt path and
 	// before any additive memory context.
 	systemBuf = prependContentSafetyPreamble(systemBuf)
+	systemBuf = appendRoleIntent(systemBuf, qw.SystemPromptOverride)
 
 	// Dispatch-time agent-memory fold (Wave 3 v1). Appended after the
 	// resolved system prompt (override OR system_base.tmpl) so it lands on
@@ -233,32 +224,27 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 // (same inputs, same stage-prompt shortcircuit, same fallback for unknown
 // work types) while delegating template execution to raymond.
 func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user string, err error) {
-	// Honour SystemPromptOverride on the raymond path as well.
-	var systemBuf string
-	if override := strings.TrimSpace(qw.SystemPromptOverride); override != "" {
-		systemBuf = override
-	} else {
-		brand := ResolveBrand()
-		sysCTX := map[string]interface{}{
-			"brandDisplay":   brand.BrandDisplay,
-			"brandCLI":       brand.BrandCLI,
-			"sessionID":      strings.TrimSpace(qw.SessionID),
-			"organizationID": strings.TrimSpace(qw.OrganizationID),
-			"projectName":    strings.TrimSpace(qw.ProjectName),
-			"repository":     strings.TrimSpace(qw.Repository),
-			"ref":            strings.TrimSpace(qw.Ref),
-			"append":         strings.TrimSpace(b.SystemAppend),
-			"skillAppend":    strings.TrimSpace(b.SkillAppend),
-		}
-		systemBuf, err = b.Registry.Render("system_base", sysCTX)
-		if err != nil {
-			return "", "", fmt.Errorf("raymond: render system prompt: %w", err)
-		}
+	brand := ResolveBrand()
+	sysCTX := map[string]interface{}{
+		"brandDisplay":   brand.BrandDisplay,
+		"brandCLI":       brand.BrandCLI,
+		"sessionID":      strings.TrimSpace(qw.SessionID),
+		"organizationID": strings.TrimSpace(qw.OrganizationID),
+		"projectName":    strings.TrimSpace(qw.ProjectName),
+		"repository":     strings.TrimSpace(qw.Repository),
+		"ref":            strings.TrimSpace(qw.Ref),
+		"append":         strings.TrimSpace(b.SystemAppend),
+		"skillAppend":    strings.TrimSpace(b.SkillAppend),
+	}
+	systemBuf, err := b.Registry.Render("system_base", sysCTX)
+	if err != nil {
+		return "", "", fmt.Errorf("raymond: render system prompt: %w", err)
 	}
 
 	// Mirror the legacy path: caller-supplied overrides and custom registry
 	// templates cannot remove the runner-owned content-safety boundary.
 	systemBuf = prependContentSafetyPreamble(systemBuf)
+	systemBuf = appendRoleIntent(systemBuf, qw.SystemPromptOverride)
 
 	// Dispatch-time agent-memory fold (Wave 3 v1) — mirror the legacy path.
 	systemBuf = appendMemoryBlock(systemBuf, qw.MemoryBlock)
@@ -401,6 +387,60 @@ func appendMemoryBlock(systemBuf, memoryBlock string) string {
 		return "# Agent Memory\n\n" + mem
 	}
 	return systemBuf + "\n\n# Agent Memory\n\n" + mem
+}
+
+func appendRoleIntent(systemBuf, roleIntent string) string {
+	role := strings.TrimSpace(roleIntent)
+	if role == "" {
+		return systemBuf
+	}
+	if strings.TrimSpace(systemBuf) == "" {
+		return role
+	}
+	return systemBuf + "\n\n" + role
+}
+
+// Composition exposes source authorities without changing Build's stable
+// (system, user) convenience API.
+type Composition struct {
+	HarnessProtocol string
+	RoleIntent      string
+	InitialContext  string
+	UserPrompt      string
+}
+
+// SystemPrompt returns the legacy combined system string in authority order.
+func (c Composition) SystemPrompt() string {
+	parts := []string{c.HarnessProtocol, c.RoleIntent}
+	if strings.TrimSpace(c.InitialContext) != "" {
+		parts = append(parts, "# Agent Memory\n\n"+strings.TrimSpace(c.InitialContext))
+	}
+	var clean []string
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			clean = append(clean, strings.TrimSpace(part))
+		}
+	}
+	return strings.Join(clean, "\n\n")
+}
+
+// BuildComposition renders once, then losslessly separates the role and
+// memory suffixes that Build appends in deterministic order.
+func (b *Builder) BuildComposition(qw QueuedWork) (Composition, error) {
+	system, user, err := b.Build(qw)
+	if err != nil {
+		return Composition{}, err
+	}
+	role := strings.TrimSpace(qw.SystemPromptOverride)
+	memory := strings.TrimSpace(qw.MemoryBlock)
+	protocol := system
+	if memory != "" {
+		protocol = strings.TrimSuffix(protocol, "\n\n# Agent Memory\n\n"+memory)
+	}
+	if role != "" {
+		protocol = strings.TrimSuffix(protocol, "\n\n"+role)
+	}
+	return Composition{HarnessProtocol: protocol, RoleIntent: role, InitialContext: memory, UserPrompt: user}, nil
 }
 
 // prependContentSafetyPreamble composes the immutable runner-owned safety

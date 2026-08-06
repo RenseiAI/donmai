@@ -466,6 +466,23 @@ type Spec struct {
 	// provider has spawned its underlying process; used by the runner
 	// to capture PIDs for metrics. Not serialized.
 	OnProcessSpawned func(pid int) `json:"-"`
+
+	// PromptPlan keeps harness protocol, base-instruction authority, role
+	// intent, initial context, user task, and ordered harness amendments
+	// distinct until the exact harness/mode adapter compiles them. A nil plan
+	// uses the lossless legacy projection of Prompt, BaseInstructions,
+	// SystemPromptAppend, and InitialContext.
+	PromptPlan *PromptPlan `json:"promptPlan,omitempty"`
+
+	// PromptReceipt is the immutable, digest-only result of pre-spawn prompt
+	// adaptation. It is populated by the provider adapter and intentionally
+	// omitted from the spawn wire.
+	PromptReceipt *PromptDeliveryReceipt `json:"-"`
+
+	// OnPromptAdapted observes both ready and denied receipts before the
+	// provider starts a process or delivers prompt bytes. Returning an error
+	// fails closed, allowing the runner to require durable receipt storage.
+	OnPromptAdapted func(PromptDeliveryReceipt) error `json:"-"`
 }
 
 // CostData mirrors AgentCostData from the legacy TS providers/types.ts.

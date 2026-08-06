@@ -159,6 +159,11 @@ func (*Provider) Capabilities() agent.Capabilities {
 // On any pre-spawn failure (tmpfile write, exec start) the provider
 // returns an error wrapping agent.ErrSpawnFailed.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	var err error
+	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Write the per-session MCP config tmpfile (same format as claude).
 	mcpPath, err := clijsonl.WriteMCPConfig(spec.MCPServers)
 	if err != nil {

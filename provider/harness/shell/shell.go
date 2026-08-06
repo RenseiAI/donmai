@@ -41,6 +41,11 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 			agent.ErrUnsupported,
 		)
 	}
+	var err error
+	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Minimal per the wave scope: Spec carries no command-override slot
 	// today (agent/types.go), so shell always spawns $SHELL — never a
 	// Spec-provided command.

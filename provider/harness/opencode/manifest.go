@@ -45,5 +45,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			DrivesHosts: []agent.ServingHost{agent.HostOAuthCLI, agent.HostLocal, agent.HostDirect, agent.HostGateway},
 			Transport:   agent.TransportCLIInjection,
 		},
+		PromptDelivery: []agent.PromptDeliveryProfile{{
+			ID: "opencode/headless/prompt-v1", Mode: agent.PromptModeAutonomous,
+			SystemDelivery: agent.PromptDeliveryUnsupported, BaseAppendDelivery: agent.PromptDeliveryUnsupported,
+			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryUnsupported,
+			UserDelivery: agent.PromptDeliveryOpenCodePrompt, AmendmentDelivery: agent.PromptDeliveryOpenCodePrompt,
+		}},
 	}
 }
