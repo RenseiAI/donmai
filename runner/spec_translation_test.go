@@ -126,6 +126,24 @@ func TestTranslateSpec_InitialContext_GatedByCapability(t *testing.T) {
 	}
 }
 
+func TestTranslateSpec_ReasoningEffortReachesExactHarnessAdmission(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{ResolvedProfile: ResolvedProfile{Effort: agent.EffortHigh}}
+
+	// The runner must not erase the request based on a broad capability bit.
+	// The exact selected harness manifest either accepts it or returns the typed
+	// pre-spawn denial exercised by agent.TestPrepareHarnessRejectsUnsupportedFlatSpecCapabilities.
+	for _, caps := range []agent.Capabilities{
+		{},
+		{SupportsReasoningEffort: true},
+	} {
+		spec := translateSpec(qw, caps, SpecInputs{})
+		if spec.Effort != agent.EffortHigh {
+			t.Fatalf("translated effort = %q, want %q", spec.Effort, agent.EffortHigh)
+		}
+	}
+}
+
 // TestTranslateSpec_ToolUse_Honored verifies that AllowedTools and
 // MCPServers flow through to the produced agent.Spec when the resolved
 // provider declares the matching v2 tool-use accept flags.
@@ -439,6 +457,7 @@ func TestTranslateSpec_EndpointBindingCopied(t *testing.T) {
 		BaseURL:       "https://gateway.example.test/v1",
 		Protocol:      agent.ProtoOpenAIResponses,
 		Host:          agent.HostGateway,
+		Mechanism:     agent.AuthAPIKey,
 		Auth:          agent.AuthBYOK,
 		Region:        "us-east-1",
 		CostModel:     agent.CostMeteredPerToken,
@@ -461,6 +480,7 @@ func TestTranslateSpec_EndpointBindingCopied(t *testing.T) {
 		baseURL       string
 		protocol      agent.WireProtocol
 		host          agent.ServingHost
+		mechanism     agent.AuthMechanism
 		auth          agent.AuthMode
 		region        string
 		costModel     agent.CostModel
@@ -472,6 +492,7 @@ func TestTranslateSpec_EndpointBindingCopied(t *testing.T) {
 		baseURL:       spec.Endpoint.BaseURL,
 		protocol:      spec.Endpoint.Protocol,
 		host:          spec.Endpoint.Host,
+		mechanism:     spec.Endpoint.Mechanism,
 		auth:          spec.Endpoint.Auth,
 		region:        spec.Endpoint.Region,
 		costModel:     spec.Endpoint.CostModel,
@@ -483,6 +504,7 @@ func TestTranslateSpec_EndpointBindingCopied(t *testing.T) {
 		baseURL:       endpoint.BaseURL,
 		protocol:      endpoint.Protocol,
 		host:          endpoint.Host,
+		mechanism:     endpoint.Mechanism,
 		auth:          endpoint.Auth,
 		region:        endpoint.Region,
 		costModel:     endpoint.CostModel,

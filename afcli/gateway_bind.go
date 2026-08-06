@@ -117,14 +117,17 @@ func resolveGatewayUpstreamBaseURL(raw string) (string, error) {
 // bindWorkerGateway starts a worker-local gateway, binds this session to it,
 // and stamps the resulting EndpointBinding onto qw.ResolvedProfile.Endpoint so
 // runner.translateSpec forwards it into agent.Spec (donmai#216) and the harness
-// applies it (pi/opencode endpoint read sites).
+// applies it (pi/opencode endpoint read sites). harnessID is the canonical
+// loop-driver identity supplied by admission; this function must not infer it
+// again from provider/model detail because that could split execution and cost
+// attribution.
 //
 // Returns (nil, nil) when the session is not gateway-served — the overwhelming
 // majority of dispatches — leaving qw untouched. Returns an error only when the
 // cell IS gateway-served and the worker cannot honor it; the caller surfaces
 // that as a preflight failure rather than silently running the session on some
 // other endpoint, which is the whole point of this file.
-func bindWorkerGateway(ctx context.Context, logger *slog.Logger, d *daemon.SessionDetail, qw *runner.QueuedWork) (*workerGateway, error) {
+func bindWorkerGateway(ctx context.Context, logger *slog.Logger, d *daemon.SessionDetail, qw *runner.QueuedWork, harnessID string, sinkOverride ...costfeed.Sink) (*workerGateway, error) {
 	if !isGatewayServed(d) || qw == nil {
 		return nil, nil
 	}
@@ -137,6 +140,9 @@ func bindWorkerGateway(ctx context.Context, logger *slog.Logger, d *daemon.Sessi
 	model := strings.TrimSpace(qw.ResolvedProfile.Model)
 	if model == "" {
 		return nil, errors.New("gateway-served cell carries no model: the gateway serves exactly the bound model, so an unpinned cell cannot be bound")
+	}
+	if harnessID == "" || harnessID != strings.TrimSpace(harnessID) {
+		return nil, errors.New("gateway-served cell carries no valid admitted harness identity")
 	}
 
 	key := strings.TrimSpace(os.Getenv(EnvGatewayUpstreamAPIKey))
@@ -155,7 +161,13 @@ func bindWorkerGateway(ctx context.Context, logger *slog.Logger, d *daemon.Sessi
 		return nil, err
 	}
 
-	g := gateway.New(gateway.Options{Sink: workerGatewaySink(logger)})
+	var sink costfeed.Sink
+	if len(sinkOverride) > 0 && sinkOverride[0] != nil {
+		sink = sinkOverride[0]
+	} else {
+		sink = workerGatewaySink(logger)
+	}
+	g := gateway.New(gateway.Options{Sink: sink})
 	if err := g.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start worker-local gateway: %w", err)
 	}
@@ -163,7 +175,7 @@ func bindWorkerGateway(ctx context.Context, logger *slog.Logger, d *daemon.Sessi
 	binding, err := g.Bind(gateway.BindConfig{
 		SessionID:  qw.SessionID,
 		DispatchID: qw.SessionID,
-		Harness:    providerNameFromDetail(d),
+		Harness:    harnessID,
 		Company:    agent.CompanyOpenAI,
 		Model:      model,
 		AuthMode:   agent.AuthBYOK,

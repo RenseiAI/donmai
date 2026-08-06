@@ -65,6 +65,32 @@ func TestToolLifecycleAdapterMatrix(t *testing.T) {
 	}
 }
 
+func TestPrepareHarnessRejectsUnsupportedFlatSpecCapabilities(t *testing.T) {
+	t.Parallel()
+	manifest := (&ollama.Provider{}).Manifest()
+	tests := []struct {
+		name  string
+		spec  agent.Spec
+		field string
+	}{
+		{name: "reasoning effort", spec: agent.Spec{Effort: agent.EffortHigh}, field: "effort"},
+		{name: "interactive PTY", spec: agent.Spec{Interactive: &agent.InteractiveSpec{}}, field: "interactive"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := agent.PrepareHarness(tc.spec, manifest)
+			var denial *agent.SpecAdmissionError
+			if !errors.As(err, &denial) {
+				t.Fatalf("PrepareHarness error = %v, want typed SpecAdmissionError", err)
+			}
+			if denial.Code != agent.SpecDenialCapabilityUnsupported || denial.Field != tc.field {
+				t.Fatalf("denial = %+v, want capability_unsupported for %q", denial, tc.field)
+			}
+		})
+	}
+}
+
 func TestToolLifecycleAdapterPositivePolicies(t *testing.T) {
 	t.Parallel()
 	stdio := agent.MCPServerConfig{Name: "tools", Command: "donmai", Args: []string{"mcp", "serve"}}

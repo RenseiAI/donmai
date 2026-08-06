@@ -27,7 +27,7 @@ func TestPromptAdaptation_ExactGenerateContentWire(t *testing.T) {
 	if got, want := wire.initialContents[0].Parts[0].Text, "user\n\namend"; got != want {
 		t.Fatalf("user content = %q, want %q", got, want)
 	}
-	if receipt.ProfileID != "raw/gemini-generate/direct-api-v1" {
+	if receipt.ProfileID != "gemini-direct/gemini-generate/direct-api-v1" {
 		t.Fatalf("profile = %q", receipt.ProfileID)
 	}
 }

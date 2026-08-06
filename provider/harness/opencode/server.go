@@ -35,12 +35,13 @@ const serveHealthInterval = 100 * time.Millisecond
 
 // serveConfig carries everything startServe needs to bring up a child.
 type serveConfig struct {
-	binary     string            // resolved opencode binary path
-	cwd        string            // session worktree
-	configPath string            // owned OPENCODE_CONFIG target (may be empty)
-	env        map[string]string // additional env (spec env + resolved key)
-	apiKey     string            // bearer for health/probe (usually empty locally)
-	logger     *slog.Logger
+	binary        string            // resolved opencode binary path
+	cwd           string            // session worktree
+	configPath    string            // owned OPENCODE_CONFIG target (may be empty)
+	env           map[string]string // additional env (spec env + resolved key)
+	endpointBound bool              // exact endpoint/model/auth controls must not inherit
+	apiKey        string            // bearer for health/probe (usually empty locally)
+	logger        *slog.Logger
 }
 
 // serveChild is a running `opencode serve` process the provider owns.
@@ -90,7 +91,11 @@ func startServe(ctx context.Context, cfg serveConfig) (*serveChild, error) {
 	if cfg.configPath != "" {
 		env[OCConfigEnvVar] = cfg.configPath
 	}
-	cmd.Env = runtimeenv.ComposeChildEnv(os.Environ(), env)
+	parentEnv := os.Environ()
+	if cfg.endpointBound {
+		parentEnv = filterEndpointControls(parentEnv)
+	}
+	cmd.Env = runtimeenv.ComposeChildEnv(parentEnv, env)
 	configureProcessGroup(cmd)
 
 	logger := cfg.logger

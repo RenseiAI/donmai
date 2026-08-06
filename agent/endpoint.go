@@ -21,6 +21,22 @@ const (
 	CompanyStub      Company = "stub" // test-only, both axes
 )
 
+// AuthMechanism identifies how a runtime authenticates to an exact endpoint
+// without carrying commercial-policy meaning. It is deliberately separate
+// from the legacy AuthMode axis, which remains the accounting/entitlement
+// selector used by existing model-access callers.
+type AuthMechanism string
+
+// Canonical endpoint authentication mechanisms.
+const (
+	AuthAPIKey         AuthMechanism = "api_key"
+	AuthOAuth          AuthMechanism = "oauth"
+	AuthCLISession     AuthMechanism = "cli_session"
+	AuthServiceAccount AuthMechanism = "service_account"
+	AuthFederated      AuthMechanism = "federated"
+	AuthNone           AuthMechanism = "none"
+)
+
 // HostDesc — one (serving-host × auth × cost × protocol) cell within a company.
 type HostDesc struct {
 	Host          ServingHost  `json:"host"`
@@ -83,6 +99,7 @@ var _ BaseManifest = ModelEndpointManifest{}
 type EndpointRequest struct {
 	Model       string            `json:"model"`
 	Host        ServingHost       `json:"host"`
+	Mechanism   AuthMechanism     `json:"mechanism"`
 	Auth        AuthMode          `json:"auth"`
 	Region      string            `json:"region,omitempty"`
 	EnvProvided map[string]string `json:"-"`
@@ -96,7 +113,10 @@ type EndpointBinding struct {
 	BaseURL  string       `json:"baseUrl"`
 	Protocol WireProtocol `json:"protocol"`
 	Host     ServingHost  `json:"host"`
-	Auth     AuthMode     `json:"auth"`
+	// Mechanism is the exact endpoint authentication protocol. Auth remains
+	// alongside it for backwards-compatible commercial/access policy.
+	Mechanism AuthMechanism `json:"mechanism,omitempty"`
+	Auth      AuthMode      `json:"auth"`
 	// Region is the serving region the binding was resolved for (the same
 	// value templated into BaseURL). Harness read sites that must hand the
 	// region to a CLI env knob (bedrock → AWS_REGION, vertex →
@@ -117,7 +137,7 @@ type EndpointBinding struct {
 // IsZero reports whether the binding is unset (today's behavior). Used by
 // Spawn read sites to decide between Spec.Model and Endpoint.Model.
 func (b EndpointBinding) IsZero() bool {
-	return b.Company == "" && b.Model == "" && b.Protocol == ""
+	return b.Company == "" && b.Model == "" && b.Protocol == "" && b.Mechanism == ""
 }
 
 // ModelEndpointProvider — Family B. Declare + resolve. No existing

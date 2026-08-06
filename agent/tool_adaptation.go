@@ -220,6 +220,9 @@ func EnsureToolLifecyclePlan(spec Spec) ToolLifecyclePlan {
 // PrepareHarness applies prompt adaptation first, then the independent
 // tool/MCP/lifecycle contract. Both complete before provider side effects.
 func PrepareHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
+	if err := ValidateSpecCapabilities(spec, manifest); err != nil {
+		return spec, err
+	}
 	adapted, err := PreparePrompt(spec, manifest)
 	if err != nil {
 		return spec, err

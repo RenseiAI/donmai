@@ -147,10 +147,12 @@ func (g *Gateway) Started() bool {
 type BindConfig struct {
 	SessionID  string
 	DispatchID string
-	Harness    string
-	Company    agent.Company
-	Model      string
-	AuthMode   agent.AuthMode
+	// Harness is the canonical admitted loop-driver HarnessRef.ID. It is not
+	// the legacy provider/model family identifier.
+	Harness  string
+	Company  agent.Company
+	Model    string
+	AuthMode agent.AuthMode
 	// Upstream is the outbound backend to dial for this session.
 	Upstream upstream.Upstream
 	// Source yields the credential(s). OSS: pool.SingleKey.
@@ -208,6 +210,7 @@ func (g *Gateway) Bind(cfg BindConfig) (agent.EndpointBinding, error) {
 		BaseURL:   fmt.Sprintf("http://%s/v1", addr),
 		Protocol:  agent.ProtoOpenAIChat,
 		Host:      agent.HostGateway,
+		Mechanism: agent.AuthAPIKey,
 		Auth:      cfg.AuthMode,
 		CostModel: agent.CostMeteredPerToken,
 		Env:       map[string]string{TokenEnvVar: string(tok)},

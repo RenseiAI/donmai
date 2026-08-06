@@ -181,6 +181,65 @@
       "smoked": true
     },
     {
+      "harness": "gemini-direct",
+      "endpoint": "google",
+      "host": "direct",
+      "protocol": "gemini-generate",
+      "transport": "direct-api",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "response-schema",
+      "legacyProviderId": "gemini",
+      "stability": "stable",
+      "smoked": true
+    },
+    {
+      "harness": "gemini-direct",
+      "endpoint": "google",
+      "host": "vertex",
+      "protocol": "gemini-generate",
+      "transport": "direct-api",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "response-schema",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "ollama",
+      "endpoint": "local",
+      "host": "local",
+      "protocol": "ollama",
+      "transport": "direct-api",
+      "authModes": [
+        "local"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "local",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "format-json",
+      "legacyProviderId": "ollama",
+      "stability": "beta",
+      "smoked": false
+    },
+    {
       "harness": "opencode",
       "endpoint": "google",
       "host": "local",
@@ -280,65 +339,6 @@
       "smoked": false
     },
     {
-      "harness": "raw",
-      "endpoint": "google",
-      "host": "direct",
-      "protocol": "gemini-generate",
-      "transport": "direct-api",
-      "authModes": [
-        "byok",
-        "metered"
-      ],
-      "bringsOwnAuth": false,
-      "needsApiKey": true,
-      "costModel": "metered",
-      "oneShot": true,
-      "nativeJsonMode": true,
-      "structuredVia": "response-schema",
-      "legacyProviderId": "gemini",
-      "stability": "stable",
-      "smoked": true
-    },
-    {
-      "harness": "raw",
-      "endpoint": "google",
-      "host": "vertex",
-      "protocol": "gemini-generate",
-      "transport": "direct-api",
-      "authModes": [
-        "byok",
-        "metered"
-      ],
-      "bringsOwnAuth": false,
-      "needsApiKey": true,
-      "costModel": "metered",
-      "oneShot": true,
-      "nativeJsonMode": true,
-      "structuredVia": "response-schema",
-      "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
-    },
-    {
-      "harness": "raw",
-      "endpoint": "local",
-      "host": "local",
-      "protocol": "ollama",
-      "transport": "direct-api",
-      "authModes": [
-        "local"
-      ],
-      "bringsOwnAuth": true,
-      "needsApiKey": false,
-      "costModel": "local",
-      "oneShot": true,
-      "nativeJsonMode": true,
-      "structuredVia": "format-json",
-      "legacyProviderId": "ollama",
-      "stability": "beta",
-      "smoked": false
-    },
-    {
       "harness": "stub",
       "endpoint": "stub",
       "host": "local",
@@ -395,7 +395,7 @@
     {
       "providerName": "gemini",
       "cell": {
-        "harness": "raw",
+        "harness": "gemini-direct",
         "endpoint": "google",
         "host": "direct"
       }
@@ -403,7 +403,7 @@
     {
       "providerName": "ollama",
       "cell": {
-        "harness": "raw",
+        "harness": "ollama",
         "endpoint": "local",
         "host": "local"
       }

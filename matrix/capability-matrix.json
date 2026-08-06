@@ -423,6 +423,166 @@
       ]
     },
     {
+      "name": "gemini-direct",
+      "humanLabel": "Gemini (direct)",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": true,
+        "resume": false,
+        "tools": true,
+        "mcp": true,
+        "allowedToolsList": true,
+        "subagents": false,
+        "reasoningEffort": true,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "gemini",
+        "streamingTransport": "sse",
+        "interactivePty": false,
+        "drives": [
+          "gemini-generate"
+        ],
+        "drivesHosts": [
+          "direct",
+          "vertex"
+        ],
+        "transport": "direct-api"
+      },
+      "drives": [
+        "gemini-generate"
+      ],
+      "drivesHosts": [
+        "direct",
+        "vertex"
+      ],
+      "promptDelivery": [
+        {
+          "id": "gemini-direct/gemini-generate/direct-api-v1",
+          "mode": "autonomous",
+          "systemDelivery": "gemini_system_instruction",
+          "baseAppendDelivery": "gemini_system_instruction",
+          "baseReplaceDelivery": "gemini_system_instruction",
+          "contextDelivery": "gemini_system_instruction",
+          "userDelivery": "gemini_user_content",
+          "amendmentDelivery": "gemini_user_content"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "gemini-direct/gemini-generate/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "gemini_in_box_mcp_bridge",
+          "nativeToolPolicyDelivery": "gemini_in_box_native_boundary",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "gemini_in_box_native_boundary",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
+    },
+    {
+      "name": "ollama",
+      "humanLabel": "Ollama (local)",
+      "family": "agent-runtime",
+      "contractAbi": "harness/v2",
+      "capabilities": {
+        "inject": false,
+        "resume": false,
+        "tools": false,
+        "mcp": false,
+        "allowedToolsList": false,
+        "subagents": false,
+        "reasoningEffort": false,
+        "oneShot": true,
+        "nativeJsonMode": true,
+        "toolPermissionFormat": "claude",
+        "streamingTransport": "ndjson",
+        "interactivePty": false,
+        "drives": [
+          "ollama"
+        ],
+        "drivesHosts": [
+          "local"
+        ],
+        "transport": "direct-api"
+      },
+      "drives": [
+        "ollama"
+      ],
+      "drivesHosts": [
+        "local"
+      ],
+      "promptDelivery": [
+        {
+          "id": "ollama/ollama-chat/direct-api-v1",
+          "mode": "autonomous",
+          "systemDelivery": "ollama_system_message",
+          "baseAppendDelivery": "ollama_system_message",
+          "baseReplaceDelivery": "ollama_system_message",
+          "contextDelivery": "ollama_system_message",
+          "userDelivery": "ollama_user_message",
+          "amendmentDelivery": "ollama_user_message"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "ollama/ollama-chat/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "assistant_text",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "assistant_text",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
+    },
+    {
       "name": "opencode",
       "humanLabel": "OpenCode",
       "family": "agent-runtime",
@@ -601,133 +761,6 @@
             "tool_use",
             "tool_result",
             "tool_progress",
-            "result",
-            "error"
-          ],
-          "cleanupDelivery": "handle_stop_and_resource_cleanup",
-          "evidenceTier": "unit_verified",
-          "productionEligible": false
-        }
-      ]
-    },
-    {
-      "name": "raw",
-      "humanLabel": "Gemini (direct)",
-      "family": "agent-runtime",
-      "contractAbi": "harness/v2",
-      "capabilities": {
-        "inject": true,
-        "resume": false,
-        "tools": true,
-        "mcp": true,
-        "allowedToolsList": true,
-        "subagents": false,
-        "reasoningEffort": true,
-        "oneShot": true,
-        "nativeJsonMode": true,
-        "toolPermissionFormat": "gemini",
-        "streamingTransport": "sse",
-        "interactivePty": false,
-        "drives": [
-          "gemini-generate",
-          "ollama"
-        ],
-        "drivesHosts": [
-          "direct",
-          "local",
-          "vertex"
-        ],
-        "transport": "direct-api"
-      },
-      "drives": [
-        "gemini-generate",
-        "ollama"
-      ],
-      "drivesHosts": [
-        "direct",
-        "local",
-        "vertex"
-      ],
-      "promptDelivery": [
-        {
-          "id": "raw/gemini-generate/direct-api-v1",
-          "mode": "autonomous",
-          "systemDelivery": "gemini_system_instruction",
-          "baseAppendDelivery": "gemini_system_instruction",
-          "baseReplaceDelivery": "gemini_system_instruction",
-          "contextDelivery": "gemini_system_instruction",
-          "userDelivery": "gemini_user_content",
-          "amendmentDelivery": "gemini_user_content"
-        },
-        {
-          "id": "raw/ollama-chat/direct-api-v1",
-          "mode": "autonomous",
-          "systemDelivery": "ollama_system_message",
-          "baseAppendDelivery": "ollama_system_message",
-          "baseReplaceDelivery": "ollama_system_message",
-          "contextDelivery": "ollama_system_message",
-          "userDelivery": "ollama_user_message",
-          "amendmentDelivery": "ollama_user_message"
-        }
-      ],
-      "toolLifecycle": [
-        {
-          "id": "raw/gemini-generate/tool-lifecycle-v1",
-          "mode": "autonomous",
-          "toolPluginDelivery": "unsupported",
-          "mcpDelivery": "gemini_in_box_mcp_bridge",
-          "nativeToolPolicyDelivery": "gemini_in_box_native_boundary",
-          "permissionConfigDelivery": "unsupported",
-          "mcpToolPolicyDelivery": "gemini_in_box_native_boundary",
-          "toolHookDelivery": "unsupported",
-          "lifecycleDelivery": "structured_provider_events",
-          "lifecycleFidelity": "structured",
-          "lifecycleEvents": [
-            "init",
-            "assistant_text",
-            "llm_call",
-            "tool_use",
-            "tool_result",
-            "result",
-            "error"
-          ],
-          "replayDelivery": "structured_event_replay",
-          "replayFidelity": "structured",
-          "replayEvents": [
-            "init",
-            "assistant_text",
-            "llm_call",
-            "tool_use",
-            "tool_result",
-            "result",
-            "error"
-          ],
-          "cleanupDelivery": "handle_stop_and_resource_cleanup",
-          "evidenceTier": "unit_verified",
-          "productionEligible": false
-        },
-        {
-          "id": "raw/ollama-chat/tool-lifecycle-v1",
-          "mode": "autonomous",
-          "toolPluginDelivery": "unsupported",
-          "mcpDelivery": "unsupported",
-          "nativeToolPolicyDelivery": "unsupported",
-          "permissionConfigDelivery": "unsupported",
-          "mcpToolPolicyDelivery": "unsupported",
-          "toolHookDelivery": "unsupported",
-          "lifecycleDelivery": "structured_provider_events",
-          "lifecycleFidelity": "structured",
-          "lifecycleEvents": [
-            "init",
-            "assistant_text",
-            "result",
-            "error"
-          ],
-          "replayDelivery": "structured_event_replay",
-          "replayFidelity": "structured",
-          "replayEvents": [
-            "init",
-            "assistant_text",
             "result",
             "error"
           ],
@@ -1383,6 +1416,65 @@
       "smoked": true
     },
     {
+      "harness": "gemini-direct",
+      "endpoint": "google",
+      "host": "direct",
+      "protocol": "gemini-generate",
+      "transport": "direct-api",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "response-schema",
+      "legacyProviderId": "gemini",
+      "stability": "stable",
+      "smoked": true
+    },
+    {
+      "harness": "gemini-direct",
+      "endpoint": "google",
+      "host": "vertex",
+      "protocol": "gemini-generate",
+      "transport": "direct-api",
+      "authModes": [
+        "byok",
+        "metered"
+      ],
+      "bringsOwnAuth": false,
+      "needsApiKey": true,
+      "costModel": "metered",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "response-schema",
+      "legacyProviderId": null,
+      "stability": "beta",
+      "smoked": false
+    },
+    {
+      "harness": "ollama",
+      "endpoint": "local",
+      "host": "local",
+      "protocol": "ollama",
+      "transport": "direct-api",
+      "authModes": [
+        "local"
+      ],
+      "bringsOwnAuth": true,
+      "needsApiKey": false,
+      "costModel": "local",
+      "oneShot": true,
+      "nativeJsonMode": true,
+      "structuredVia": "format-json",
+      "legacyProviderId": "ollama",
+      "stability": "beta",
+      "smoked": false
+    },
+    {
       "harness": "opencode",
       "endpoint": "google",
       "host": "local",
@@ -1482,65 +1574,6 @@
       "smoked": false
     },
     {
-      "harness": "raw",
-      "endpoint": "google",
-      "host": "direct",
-      "protocol": "gemini-generate",
-      "transport": "direct-api",
-      "authModes": [
-        "byok",
-        "metered"
-      ],
-      "bringsOwnAuth": false,
-      "needsApiKey": true,
-      "costModel": "metered",
-      "oneShot": true,
-      "nativeJsonMode": true,
-      "structuredVia": "response-schema",
-      "legacyProviderId": "gemini",
-      "stability": "stable",
-      "smoked": true
-    },
-    {
-      "harness": "raw",
-      "endpoint": "google",
-      "host": "vertex",
-      "protocol": "gemini-generate",
-      "transport": "direct-api",
-      "authModes": [
-        "byok",
-        "metered"
-      ],
-      "bringsOwnAuth": false,
-      "needsApiKey": true,
-      "costModel": "metered",
-      "oneShot": true,
-      "nativeJsonMode": true,
-      "structuredVia": "response-schema",
-      "legacyProviderId": null,
-      "stability": "beta",
-      "smoked": false
-    },
-    {
-      "harness": "raw",
-      "endpoint": "local",
-      "host": "local",
-      "protocol": "ollama",
-      "transport": "direct-api",
-      "authModes": [
-        "local"
-      ],
-      "bringsOwnAuth": true,
-      "needsApiKey": false,
-      "costModel": "local",
-      "oneShot": true,
-      "nativeJsonMode": true,
-      "structuredVia": "format-json",
-      "legacyProviderId": "ollama",
-      "stability": "beta",
-      "smoked": false
-    },
-    {
       "harness": "stub",
       "endpoint": "stub",
       "host": "local",
@@ -1597,7 +1630,7 @@
     {
       "providerName": "gemini",
       "cell": {
-        "harness": "raw",
+        "harness": "gemini-direct",
         "endpoint": "google",
         "host": "direct"
       }
@@ -1605,7 +1638,7 @@
     {
       "providerName": "ollama",
       "cell": {
-        "harness": "raw",
+        "harness": "ollama",
         "endpoint": "local",
         "host": "local"
       }

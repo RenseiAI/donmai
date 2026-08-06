@@ -471,7 +471,11 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 	if spec.Cwd != "" {
 		cmd.Dir = spec.Cwd
 	}
-	cmd.Env = composeEnv(os.Environ(), spec.Env)
+	parentEnv := os.Environ()
+	if spec.Endpoint != nil {
+		parentEnv = filterEndpointControls(parentEnv)
+	}
+	cmd.Env = composeEnv(parentEnv, spec.Env)
 	configureProcessGroup(cmd)
 	cmd.Cancel = func() error {
 		signalProcessGroup(cmd, syscall.SIGKILL)
@@ -582,11 +586,7 @@ func buildOpenCodeArgs(spec agent.Spec) []string {
 		argv = append(argv, "--auto")
 	}
 
-	model := spec.Model
-	if spec.Endpoint != nil && resolvedModel(spec) != "" {
-		model = OCProviderID + "/" + resolvedModel(spec)
-	}
-	if model != "" {
+	if model := openCodeModel(spec); model != "" {
 		argv = append(argv, "--model", model)
 	}
 
@@ -595,6 +595,28 @@ func buildOpenCodeArgs(spec agent.Spec) []string {
 	}
 
 	return argv
+}
+
+func openCodeModel(spec agent.Spec) string {
+	if spec.Endpoint != nil {
+		return OCProviderID + "/" + spec.Endpoint.Model
+	}
+	return spec.Model
+}
+
+func filterEndpointControls(entries []string) []string {
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		if isEndpointControlEnv(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // spawnServer runs the Lane-B path: render + inject the per-session
@@ -698,12 +720,13 @@ func (p *Provider) bringUpServer(ctx context.Context, spec agent.Spec, configPat
 		return nil, p.endpoint, nil
 	}
 	child, err := startServe(ctx, serveConfig{
-		binary:     p.binary,
-		cwd:        spec.Cwd,
-		configPath: configPath,
-		env:        spec.Env,
-		apiKey:     p.apiKey,
-		logger:     slog.Default(),
+		binary:        p.binary,
+		cwd:           spec.Cwd,
+		configPath:    configPath,
+		env:           spec.Env,
+		endpointBound: spec.Endpoint != nil,
+		apiKey:        p.apiKey,
+		logger:        slog.Default(),
 	})
 	if err != nil {
 		return nil, "", err
@@ -894,6 +917,11 @@ func (h *openCodeHandle) watchCtx(ctx context.Context) {
 // channel via sendEvent.
 func (h *openCodeHandle) readStdout() {
 	defer close(h.done)
+	defer func() {
+		if err := h.cleanupOwned(); err != nil {
+			h.logger.Warn("provider/opencode: clean owned config after child exit", "err", err)
+		}
+	}()
 	defer func() {
 		err := h.cmd.Wait()
 		if err != nil {

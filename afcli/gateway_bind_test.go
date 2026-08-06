@@ -13,6 +13,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/gateway"
+	"github.com/RenseiAI/donmai/gateway/costfeed"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runner"
 )
@@ -159,7 +160,7 @@ func TestBindWorkerGateway_DoesNotLogUpstreamRoute(t *testing.T) {
 	t.Setenv(EnvGatewayUpstreamAPIKey, "sk-test")
 	t.Setenv("DONMAI_STATE_HOME", t.TempDir())
 
-	gw, err := bindWorkerGateway(context.Background(), logger, gatewayDetail("gateway", "pi"), gatewayQW())
+	gw, err := bindWorkerGateway(context.Background(), logger, gatewayDetail("gateway", "pi"), gatewayQW(), "pi")
 	if err != nil {
 		t.Fatalf("bindWorkerGateway: %v", err)
 	}
@@ -174,7 +175,7 @@ func TestBindWorkerGateway_DoesNotLogUpstreamRoute(t *testing.T) {
 func TestBindWorkerGateway_NonGatewayCellIsNoOp(t *testing.T) {
 	t.Setenv(EnvGatewayUpstreamAPIKey, "sk-test")
 	qw := gatewayQW()
-	gw, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("direct", "pi"), qw)
+	gw, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("direct", "pi"), qw, "pi")
 	if err != nil {
 		t.Fatalf("bindWorkerGateway: %v", err)
 	}
@@ -196,7 +197,7 @@ func TestBindWorkerGateway_MissingUpstreamCredentialFailsClosed(t *testing.T) {
 	t.Setenv(EnvGatewayUpstreamAPIKey, "")
 	t.Setenv("OPENAI_API_KEY", "")
 	qw := gatewayQW()
-	gw, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("gateway", "pi"), qw)
+	gw, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("gateway", "pi"), qw, "pi")
 	if err == nil {
 		gw.Close(slog.Default())
 		t.Fatal("want an error when a gateway-served cell has no upstream credential; got nil")
@@ -215,8 +216,29 @@ func TestBindWorkerGateway_UnpinnedModelFailsClosed(t *testing.T) {
 	t.Setenv(EnvGatewayUpstreamAPIKey, "sk-test")
 	qw := gatewayQW()
 	qw.ResolvedProfile.Model = "  "
-	if _, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("gateway", "pi"), qw); err == nil {
+	if _, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("gateway", "pi"), qw, "pi"); err == nil {
 		t.Fatal("want an error when a gateway-served cell carries no model; got nil")
+	}
+}
+
+func TestBindWorkerGateway_MissingHarnessIdentityFailsBeforeListener(t *testing.T) {
+	t.Setenv(EnvGatewayUpstreamAPIKey, "sk-test")
+	for _, harnessID := range []string{"", "   ", " claude-code"} {
+		qw := gatewayQW()
+		gw, err := bindWorkerGateway(
+			context.Background(), slog.Default(), gatewayDetail("gateway", "gemini"), qw, harnessID,
+		)
+		if err == nil {
+			gw.Close(slog.Default())
+			t.Fatalf("harness identity %q unexpectedly bound a gateway", harnessID)
+		}
+		if gw != nil {
+			gw.Close(slog.Default())
+			t.Fatalf("harness identity %q started a gateway before denial", harnessID)
+		}
+		if qw.ResolvedProfile.Endpoint != nil {
+			t.Fatalf("harness identity %q stamped endpoint before denial: %+v", harnessID, qw.ResolvedProfile.Endpoint)
+		}
 	}
 }
 
@@ -227,7 +249,7 @@ func TestBindWorkerGateway_ExistingBindingWins(t *testing.T) {
 	qw := gatewayQW()
 	existing := &agent.EndpointBinding{BaseURL: "http://127.0.0.1:9/v1", Host: agent.HostGateway}
 	qw.ResolvedProfile.Endpoint = existing
-	gw, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("gateway", "pi"), qw)
+	gw, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("gateway", "pi"), qw, "pi")
 	if err != nil {
 		t.Fatalf("bindWorkerGateway: %v", err)
 	}
@@ -263,10 +285,11 @@ func TestBindWorkerGateway_BindsLoopbackAndForwardsToUpstream(t *testing.T) {
 
 	t.Setenv(EnvGatewayUpstreamBaseURL, upstreamSrv.URL+"/v1")
 	t.Setenv(EnvGatewayUpstreamAPIKey, "sk-worker-only")
-	t.Setenv("DONMAI_STATE_HOME", t.TempDir())
-
 	qw := gatewayQW()
-	gw, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("gateway", "pi"), qw)
+	costSink := &costfeed.MemorySink{}
+	gw, err := bindWorkerGateway(
+		context.Background(), slog.Default(), gatewayDetail("gateway", "pi"), qw, "claude-code", costSink,
+	)
 	if err != nil {
 		t.Fatalf("bindWorkerGateway: %v", err)
 	}
@@ -329,6 +352,10 @@ func TestBindWorkerGateway_BindsLoopbackAndForwardsToUpstream(t *testing.T) {
 	}
 	if strings.Contains(gotBody, bearer) {
 		t.Error("the session bearer leaked into the upstream request body")
+	}
+	costEvents := costSink.Events()
+	if len(costEvents) != 1 || costEvents[0].Harness != "claude-code" {
+		t.Fatalf("gateway cost events = %+v, want one row for admitted canonical claude-code", costEvents)
 	}
 
 	// A foreign token cannot use this session's route.

@@ -301,7 +301,7 @@ func TestProvider_ConfiguredCLIOwnsAndCleansProjectConfig(t *testing.T) {
 		MCPToolNames: []string{"mcp__tools__read"},
 		Endpoint: &agent.EndpointBinding{
 			Company: agent.CompanyLocal, Model: "fixture-model", BaseURL: "http://127.0.0.1:9/v1",
-			Protocol: agent.ProtoOpenAIChat, Host: agent.HostLocal, Auth: agent.AuthLocal,
+			Protocol: agent.ProtoOpenAIChat, Host: agent.HostLocal, Mechanism: agent.AuthNone, Auth: agent.AuthLocal,
 		},
 	})
 	if err != nil {

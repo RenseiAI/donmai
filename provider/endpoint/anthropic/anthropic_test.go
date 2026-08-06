@@ -36,9 +36,10 @@ func TestManifest_Shape(t *testing.T) {
 func TestResolve_Direct(t *testing.T) {
 	e := New()
 	got, err := e.Resolve(context.Background(), agent.EndpointRequest{
-		Model: "claude-sonnet-4-5",
-		Host:  agent.HostDirect,
-		Auth:  agent.AuthBYOK,
+		Model:     "claude-sonnet-4-5",
+		Host:      agent.HostDirect,
+		Mechanism: agent.AuthAPIKey,
+		Auth:      agent.AuthBYOK,
 		EnvProvided: map[string]string{
 			"ANTHROPIC_API_KEY": "sk-test",
 			"UNRELATED":         "leak", // must NOT be copied
@@ -55,6 +56,9 @@ func TestResolve_Direct(t *testing.T) {
 	}
 	if got.Protocol != agent.ProtoAnthropicMessages {
 		t.Errorf("protocol = %q", got.Protocol)
+	}
+	if got.Mechanism != agent.AuthAPIKey {
+		t.Errorf("mechanism = %q, want api_key", got.Mechanism)
 	}
 	if got.CostModel != agent.CostMeteredPerToken {
 		t.Errorf("costModel = %q", got.CostModel)

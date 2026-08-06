@@ -123,14 +123,15 @@ func buildConfig(spec agent.Spec) ocConfig {
 
 	model := resolvedModel(spec)
 	if model != "" {
+		options := ocProviderOptions{BaseURL: resolvedBaseURL(spec)}
+		if spec.Endpoint == nil || spec.Endpoint.Mechanism == agent.AuthAPIKey {
+			options.APIKey = "{env:" + OCKeyEnvVar + "}"
+		}
 		cfg.Provider = map[string]ocProvider{
 			OCProviderID: {
-				NPM: "@ai-sdk/openai-compatible",
-				Options: ocProviderOptions{
-					BaseURL: resolvedBaseURL(spec),
-					APIKey:  "{env:" + OCKeyEnvVar + "}",
-				},
-				Models: map[string]ocModelEntry{model: {}},
+				NPM:     "@ai-sdk/openai-compatible",
+				Options: options,
+				Models:  map[string]ocModelEntry{model: {}},
 			},
 		}
 		cfg.Model = OCProviderID + "/" + model

@@ -93,19 +93,12 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		DisallowedTools:    disallowedTools,
 		MCPServers:         in.MCPServers,
 		Model:              strings.TrimSpace(qw.ResolvedProfile.Model),
+		Effort:             qw.ResolvedProfile.Effort,
 		SystemPromptAppend: in.SystemPromptAppend,
 		PromptPlan:         in.PromptPlan,
 		InitialContext:     in.InitialContext,
 		ProviderConfig:     copyProviderConfig(qw.ResolvedProfile.ProviderConfig),
 		Endpoint:           copyEndpointBinding(qw.ResolvedProfile.Endpoint),
-	}
-
-	// Capability-gated fields — silently zeroed when the resolved
-	// provider does not declare support. The runner emits a Debug log
-	// in the loop when it strips a value the caller set, so operators
-	// can detect silently-ignored knobs.
-	if caps.SupportsReasoningEffort && qw.ResolvedProfile.Effort != "" {
-		spec.Effort = qw.ResolvedProfile.Effort
 	}
 
 	// InitialContext is a legacy compatibility field. The typed PromptPlan

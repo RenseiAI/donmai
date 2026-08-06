@@ -33,7 +33,7 @@ func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 		{name: "codex/headless", manifest: (&codex.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "codex/interactive", manifest: (&codex.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true, contextInUser: true},
 		{name: "gemini/raw", manifest: (&gemini.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
-		{name: "ollama/raw", manifest: (&ollama.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
+		{name: "ollama", manifest: (&ollama.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "amp/headless", manifest: (&amp.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "agy/headless", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "opencode/headless", manifest: (&opencode.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
