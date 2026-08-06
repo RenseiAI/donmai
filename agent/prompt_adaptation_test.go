@@ -266,12 +266,6 @@ func TestPromptAdaptation_RejectsCrossChannelDuplicateStableIDs(t *testing.T) {
 			},
 		},
 		{
-			name: "user amendment content identity",
-			mutate: func(plan *agent.PromptPlan) {
-				plan.UserAmendments[0].Content.ID = "user"
-			},
-		},
-		{
 			name: "preserved base receipt identity",
 			mutate: func(plan *agent.PromptPlan) {
 				plan.BaseInstructions = agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve}
@@ -291,6 +285,30 @@ func TestPromptAdaptation_RejectsCrossChannelDuplicateStableIDs(t *testing.T) {
 				t.Fatalf("denied receipt = %#v, want one prompt-plan denial", receipt)
 			}
 		})
+	}
+}
+
+func TestPromptAdaptation_AmendmentContentRefsDoNotCollideWithReceiptIDs(t *testing.T) {
+	t.Parallel()
+	profile, _ := (&claude.Provider{}).Manifest().PromptProfile(agent.PromptModeAutonomous)
+	plan := fullPromptPlan()
+
+	// Amendment entry identities remain distinct even when their source content
+	// references are shared or happen to spell another receipt entry ID.
+	plan.UserAmendments[0].Content.ID = "shared-content-ref"
+	plan.UserAmendments[1].Content.ID = "shared-content-ref"
+	plan.UserAmendments[2].Content.ID = plan.UserPrompt.ID
+
+	_, receipt, err := agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
+	if err != nil {
+		t.Fatalf("reused amendment content refs should be valid: %v", err)
+	}
+	seen := make(map[string]struct{}, len(receipt.Entries))
+	for _, entry := range receipt.Entries {
+		if _, duplicate := seen[entry.ID]; duplicate {
+			t.Fatalf("receipt has duplicate entry ID %q: %#v", entry.ID, receipt)
+		}
+		seen[entry.ID] = struct{}{}
 	}
 }
 

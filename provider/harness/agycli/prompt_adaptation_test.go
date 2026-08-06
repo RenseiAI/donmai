@@ -197,9 +197,9 @@ func TestSpawn_ResultEnvelopeIDIsReservedAcrossCallerAuthorities(t *testing.T) {
 			},
 		},
 		{
-			name: "user amendment content identity",
+			name: "preserved base receipt identity",
 			mutate: func(plan *agent.PromptPlan) {
-				plan.UserAmendments[0].Content.ID = "agy-result-envelope"
+				plan.UserPrompt.ID = "base-instructions"
 			},
 		},
 	} {
@@ -217,6 +217,53 @@ func TestSpawn_ResultEnvelopeIDIsReservedAcrossCallerAuthorities(t *testing.T) {
 				t.Fatalf("caller collision started provider process: stat error = %v", statErr)
 			}
 		})
+	}
+}
+
+func TestSpawn_ResultEnvelopeAllowsReusableAmendmentContentRefs(t *testing.T) {
+	t.Parallel()
+	p := newFakeProvider(t, `echo '<<<DONMAI_RESULT>>>'
+echo '{"status":"passed","summary":"done"}'
+echo '<<<END_DONMAI_RESULT>>>'
+`, Options{DisableTranscriptEnrichment: true})
+	plan := agyPromptPlan(true)
+	plan.UserAmendments[0].Content.ID = "shared-content-ref"
+	plan.UserAmendments = append(plan.UserAmendments, agent.UserPromptAmendment{
+		ID:       "caller-shared-content",
+		Position: agent.UserPromptAppend,
+		Order:    2,
+		Content:  agent.PromptContent{ID: "shared-content-ref", Text: "second shared source", Required: true},
+	}, agent.UserPromptAmendment{
+		ID:       "caller-content-matches-envelope-entry",
+		Position: agent.UserPromptAppend,
+		Order:    3,
+		Content:  agent.PromptContent{ID: "agy-result-envelope", Text: "source ref only", Required: true},
+	})
+
+	var receipt agent.PromptDeliveryReceipt
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{
+		PromptPlan: &plan,
+		Cwd:        t.TempDir(),
+		OnPromptAdapted: func(got agent.PromptDeliveryReceipt) error {
+			receipt = got
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn with reusable amendment content refs: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	_ = collectEvents(t, h)
+
+	seen := make(map[string]struct{}, len(receipt.Entries))
+	for _, entry := range receipt.Entries {
+		if _, duplicate := seen[entry.ID]; duplicate {
+			t.Fatalf("receipt has duplicate entry ID %q: %#v", entry.ID, receipt)
+		}
+		seen[entry.ID] = struct{}{}
+	}
+	if _, ok := seen["agy-result-envelope"]; !ok {
+		t.Fatalf("provider-owned envelope entry missing from receipt: %#v", receipt)
 	}
 }
 

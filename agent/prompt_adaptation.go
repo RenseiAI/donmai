@@ -133,7 +133,9 @@ type BaseInstructionPlan struct {
 	ReplacementAuthorizationID string                  `json:"replacementAuthorizationId,omitempty"`
 }
 
-// UserPromptAmendment is ordered deterministically by Order then ID.
+// UserPromptAmendment is ordered deterministically by Order then ID. ID is
+// the receipt entry identity; Content.ID is a source-content reference and is
+// deliberately not part of the receipt-entry namespace.
 type UserPromptAmendment struct {
 	ID       string             `json:"id"`
 	Position UserPromptPosition `json:"position"`
@@ -653,10 +655,12 @@ func validatePromptPlan(plan PromptPlan) string {
 		if amendment.Position != UserPromptPrepend && amendment.Position != UserPromptAppend {
 			return "user amendment has an unknown position"
 		}
+		// A user amendment's receipt is keyed by amendment.ID (see the
+		// deliveredEntry call in AdaptPrompt), not amendment.Content.ID. Content
+		// references can legitimately be shared by separately ordered entries,
+		// or spell another entry's ID, so validate the reference shape without
+		// registering it in the receipt-entry namespace.
 		if detail := validateContent(&amendment.Content, "user amendment content"); detail != "" {
-			return detail
-		}
-		if detail := registerEntryID(amendment.Content.ID, "user amendment content"); detail != "" {
 			return detail
 		}
 	}
