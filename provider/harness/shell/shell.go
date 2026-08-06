@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
@@ -13,7 +14,9 @@ import (
 const DefaultShell = "/bin/sh"
 
 // Provider is the bare interactive-only PTY harness. See doc.go.
-type Provider struct{}
+type Provider struct {
+	deliverSeed func(context.Context, agent.Handle, agent.InteractiveSession, string) error
+}
 
 // New constructs the shell Provider. Construction never fails: unlike
 // claude/codex there is no CLI to probe at construction time — the shell
@@ -49,7 +52,47 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	// Minimal per the wave scope: Spec carries no command-override slot
 	// today (agent/types.go), so shell always spawns $SHELL — never a
 	// Spec-provided command.
-	return ptycli.Spawn(ctx, shellBinary(), nil, spec)
+	handle, err := ptycli.Spawn(ctx, shellBinary(), nil, spec)
+	if err != nil {
+		return nil, err
+	}
+	deliverSeed := p.deliverSeed
+	if deliverSeed == nil {
+		deliverSeed = ptycli.DeliverSeed
+	}
+	if err := deliverSeed(ctx, handle, handle.InteractiveSession(), spec.Prompt); err != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = handle.Stop(stopCtx)
+		stopCancel()
+		// PreparePrompt already persisted a ready adaptation decision. Replace
+		// it with an application-failed denial so a failed PTY write never
+		// leaves a success receipt or usable session behind.
+		if receiptErr := emitShellSeedFailure(spec); receiptErr != nil {
+			return nil, fmt.Errorf("%w: shell PTY seed delivery: %w; persist denial receipt: %w", agent.ErrSpawnFailed, err, receiptErr)
+		}
+		return nil, fmt.Errorf("%w: shell PTY seed delivery: %w", agent.ErrSpawnFailed, err)
+	}
+	return handle, nil
+}
+
+func emitShellSeedFailure(spec agent.Spec) error {
+	if spec.OnPromptAdapted == nil || spec.PromptReceipt == nil {
+		return nil
+	}
+	receipt := *spec.PromptReceipt
+	receipt.Decision = "denied"
+	receipt.Entries = append([]agent.PromptDeliveryEntry(nil), receipt.Entries...)
+	for i := range receipt.Entries {
+		entry := &receipt.Entries[i]
+		if entry.Outcome != agent.PromptOutcomeDelivered && entry.Outcome != agent.PromptOutcomeDowngraded {
+			continue
+		}
+		entry.Outcome = agent.PromptOutcomeDenied
+		entry.Delivery = ""
+		entry.DowngradeAuthID = ""
+		entry.DenialCode = agent.PromptDenialApplicationFailed
+	}
+	return spec.OnPromptAdapted(receipt)
 }
 
 // Resume returns agent.ErrUnsupported: a bare shell has no session identity

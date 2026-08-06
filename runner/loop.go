@@ -400,11 +400,31 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 	composition.HarnessProtocol = injectCodeIntelPartial(composition.HarnessProtocol, caps, qw.CodeIntel)
 	systemPrompt := composition.SystemPrompt()
 	userPrompt := composition.UserPrompt
+	if qw.isInteractive() {
+		// Interactive rendering deliberately suppresses batch task scaffolding,
+		// but InitialPrompt is still the caller's required first user task. Put
+		// that authority into the pre-spawn plan so the exact harness profile
+		// must deliver or deny it and the receipt covers the real input. The
+		// provider owns native delivery; dispatchInteractive must never replay
+		// these bytes after spawn.
+		userPrompt = qw.InitialPrompt
+		if promptBytes := len(userPrompt); promptBytes > maxInitialPromptBytes {
+			err = fmt.Errorf(
+				"interactive initial prompt is %d UTF-8 bytes; limit is %d bytes",
+				promptBytes,
+				maxInitialPromptBytes,
+			)
+			res.Status = "failed"
+			res.FailureMode = FailureInteractiveInput
+			res.Error = err.Error()
+			return res, err
+		}
+	}
 	promptPlan := &agent.PromptPlan{
 		ContractVersion:  agent.PromptContractVersion,
 		HarnessProtocol:  &agent.PromptContent{ID: "runner-harness-protocol", Text: composition.HarnessProtocol, Required: true},
 		BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
-		UserPrompt:       agent.PromptContent{ID: "runner-user-task", Text: userPrompt, Required: strings.TrimSpace(userPrompt) != ""},
+		UserPrompt:       agent.PromptContent{ID: "runner-user-task", Text: userPrompt, Required: userPrompt != ""},
 		// The runner owns these authorities and explicitly permits harnesses
 		// without native system/context surfaces to prepend them to the first
 		// user turn. The adapter receipt records each downgrade by ID.

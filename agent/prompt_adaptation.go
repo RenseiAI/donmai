@@ -429,10 +429,10 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 		}
 	}
 
-	if strings.TrimSpace(plan.UserPrompt.Text) == "" && plan.UserPrompt.Required {
+	if plan.UserPrompt.Text == "" && plan.UserPrompt.Required {
 		return deny(PromptDenialMalformedPlan, PromptChannelUserPrompt, plan.UserPrompt.ID, true, "required user prompt is empty")
 	}
-	if profile.UserDelivery == PromptDeliveryUnsupported && strings.TrimSpace(plan.UserPrompt.Text) != "" {
+	if profile.UserDelivery == PromptDeliveryUnsupported && plan.UserPrompt.Text != "" {
 		return deny(PromptDenialDeliveryUnsupported, PromptChannelUserPrompt, plan.UserPrompt.ID, plan.UserPrompt.Required, "user prompt delivery is unsupported")
 	}
 
@@ -464,10 +464,7 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 	}
 
 	prepends = append(downgradedPrepend, prepends...)
-	userParts := append([]string{}, prepends...)
-	userParts = append(userParts, plan.UserPrompt.Text)
-	userParts = append(userParts, appends...)
-	userText := joinPromptParts(userParts)
+	userText := joinUserPromptParts(prepends, plan.UserPrompt.Text, appends)
 
 	if len(contextParts) > 0 {
 		spec.InitialContext = joinPromptParts(contextParts)
@@ -478,7 +475,7 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 	spec.BaseInstructions = baseInstructions
 	spec.Prompt = userText
 	spec.PromptPlan = &plan
-	if strings.TrimSpace(plan.UserPrompt.Text) != "" {
+	if plan.UserPrompt.Text != "" {
 		receipt.Entries = append(receipt.Entries, deliveredEntry(plan.UserPrompt, PromptChannelUserPrompt, profile.UserDelivery))
 	}
 	receipt.Decision = "ready"
@@ -589,8 +586,11 @@ func validatePromptPlan(plan PromptPlan) string {
 			return detail
 		}
 	}
-	if detail := validateContent(&plan.UserPrompt, "user prompt"); detail != "" {
-		return detail
+	if plan.UserPrompt.ID == "" {
+		return "user prompt requires a stable id"
+	}
+	if plan.UserPrompt.Text == "" && plan.UserPrompt.Required {
+		return "user prompt is required but empty"
 	}
 
 	seenAmendments := make(map[string]bool, len(plan.UserAmendments))
@@ -637,6 +637,28 @@ func downgradedEntry(content PromptContent, channel PromptChannel, authID string
 func joinPromptParts(parts []string) string {
 	clean := make([]string, 0, len(parts))
 	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			clean = append(clean, strings.TrimSpace(part))
+		}
+	}
+	return strings.Join(clean, "\n\n")
+}
+
+// joinUserPromptParts preserves the caller-owned user task byte-for-byte.
+// Adapter-authored/downgraded surrounding parts are normalized independently,
+// but an opaque interactive seed may intentionally contain leading/trailing
+// whitespace and still needs a digest and native-delivery receipt.
+func joinUserPromptParts(prepends []string, user string, appends []string) string {
+	clean := make([]string, 0, len(prepends)+len(appends)+1)
+	for _, part := range prepends {
+		if strings.TrimSpace(part) != "" {
+			clean = append(clean, strings.TrimSpace(part))
+		}
+	}
+	if user != "" {
+		clean = append(clean, user)
+	}
+	for _, part := range appends {
 		if strings.TrimSpace(part) != "" {
 			clean = append(clean, strings.TrimSpace(part))
 		}

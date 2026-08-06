@@ -193,9 +193,9 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 	systemBuf = appendMemoryBlock(systemBuf, qw.MemoryBlock)
 
 	// Interactive mode — NO templated user prompt, ever. The PTY REPL
-	// starts idle (harnesses treat an empty Spec.Prompt as "no seeded
-	// message") and any InitialPrompt seed is delivered verbatim through
-	// the runner's PTY first-input write, never through the renderer.
+	// starts idle at the renderer boundary. Any InitialPrompt remains opaque
+	// here and is promoted by the runner into the typed user-task authority;
+	// the exact harness adapter, not the renderer, owns native delivery.
 	// Checked before the stage-prompt branch so a misconfigured dispatch
 	// carrying both never wraps the session in stage scaffolding either.
 	if qw.isInteractiveMode() {
