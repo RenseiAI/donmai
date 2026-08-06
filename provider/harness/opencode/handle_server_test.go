@@ -251,7 +251,7 @@ func TestServerHandle_StopIdempotentAndAborts(t *testing.T) {
 
 // TestProvider_SpawnServer_AttachWiring drives the full Provider.Spawn Lane-B
 // path (attach mode + injected client factory) end to end without a real
-// binary, and confirms the per-session opencode.json was written with the
+// binary, and confirms the per-spawn opencode.json was written with the
 // provider lockout.
 func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 	t.Parallel()
@@ -284,8 +284,15 @@ func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 		t.Errorf("initial prompts = %d, want 1", nPrompts)
 	}
 
-	// The per-session config was written with the lockout.
-	cfgPath := filepath.Join(cwd, ".donmai-opencode", "opencode.json")
+	// The unique per-spawn config was written with the lockout.
+	paths, err := filepath.Glob(filepath.Join(cwd, ".donmai-opencode", "spawn-*", "opencode.json"))
+	if err != nil {
+		t.Fatalf("glob injected config: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("injected config paths = %v, want exactly one", paths)
+	}
+	cfgPath := paths[0]
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		t.Fatalf("read injected config: %v", err)
@@ -306,5 +313,8 @@ func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 	events := drainHandle(ctx, h)
 	if err := conformance.CheckTerminalContract(events); err != nil {
 		t.Errorf("terminal contract: %v", err)
+	}
+	if _, err := os.Stat(cfgPath); !os.IsNotExist(err) {
+		t.Errorf("per-spawn config still exists after terminal teardown: err=%v", err)
 	}
 }

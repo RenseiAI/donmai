@@ -505,13 +505,20 @@ func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessi
 	if err != nil {
 		return nil, fmt.Errorf("%w: opencode config dir: %v", agent.ErrSpawnFailed, err)
 	}
+	cleanupConfig := func() {
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Warn("provider/opencode: remove per-spawn config dir", "path", dir, "err", err)
+		}
+	}
 	configPath, err := writeConfig(dir, spec)
 	if err != nil {
+		cleanupConfig()
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 
 	child, endpoint, err := p.bringUpServer(ctx, spec, configPath)
 	if err != nil {
+		cleanupConfig()
 		return nil, err
 	}
 
@@ -525,15 +532,19 @@ func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessi
 		})
 		if err != nil {
 			p.teardownChild(child)
+			cleanupConfig()
 			return nil, fmt.Errorf("%w: create opencode session: %v", agent.ErrSpawnFailed, err)
 		}
 	}
 
 	logger := slog.With("provider", "opencode", "lane", "server", "session", sessionID)
 	h := newServerHandle(child, client, sessionID, spec, logger)
-	if child != nil {
-		c := child
-		h.onClose = func() { p.unregisterChild(c) }
+	c := child
+	h.onClose = func() {
+		if c != nil {
+			p.unregisterChild(c)
+		}
+		cleanupConfig()
 	}
 
 	// Subscribe to the event feed BEFORE admitting the prompt so no post-prompt
@@ -541,6 +552,7 @@ func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessi
 	// in-session frame regardless of ordering).
 	if err := h.start(ctx); err != nil {
 		p.teardownChild(child)
+		cleanupConfig()
 		return nil, err
 	}
 
@@ -600,12 +612,18 @@ func (p *Provider) teardownChild(child *serveChild) {
 	p.unregisterChild(child)
 }
 
-// configDir returns the directory the session opencode.json is written to: a
-// worktree-local .donmai-opencode dir (removed by the runner's normal worktree
-// lifecycle, 07 §6) or a temp dir when the spec has no cwd (attach-mode tests).
+// configDir creates the unique directory one Lane-B spawn owns. Spawns sharing
+// a working directory receive distinct 0700 children beneath
+// .donmai-opencode; callers without a cwd receive a system temp directory.
+// The returned handle removes this directory during Stop rather than relying
+// on the runner's eventual worktree teardown.
 func configDir(spec agent.Spec) (string, error) {
 	if spec.Cwd != "" {
-		return filepath.Join(spec.Cwd, ".donmai-opencode"), nil
+		base := filepath.Join(spec.Cwd, ".donmai-opencode")
+		if err := os.MkdirAll(base, 0o700); err != nil {
+			return "", err
+		}
+		return os.MkdirTemp(base, "spawn-")
 	}
 	return os.MkdirTemp("", "donmai-opencode-")
 }

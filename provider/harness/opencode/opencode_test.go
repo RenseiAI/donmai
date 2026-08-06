@@ -719,6 +719,69 @@ func TestProvider_Resume_Wired(t *testing.T) {
 	}
 }
 
+func TestProvider_SpawnServer_ConfigUniqueSameCwdAndHandleCleanup(t *testing.T) {
+	sharedCwd := t.TempDir()
+	clients := []*fakeClient{newFakeClient(), newFakeClient()}
+	clients[0].sessionID = "ses_first"
+	clients[1].sessionID = "ses_second"
+	nextClient := 0
+	p := &Provider{
+		endpoint: "http://attached.invalid",
+		clientFactory: func(_, _ string) serverClient {
+			client := clients[nextClient]
+			nextClient++
+			return client
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	h1, err := p.Spawn(ctx, agent.Spec{Cwd: sharedCwd})
+	if err != nil {
+		t.Fatalf("Spawn first Lane-B session: %v", err)
+	}
+	t.Cleanup(func() { _ = h1.Stop(context.Background()) })
+	h2, err := p.Spawn(ctx, agent.Spec{Cwd: sharedCwd})
+	if err != nil {
+		t.Fatalf("Spawn second Lane-B session: %v", err)
+	}
+	t.Cleanup(func() { _ = h2.Stop(context.Background()) })
+
+	pattern := filepath.Join(sharedCwd, ".donmai-opencode", "spawn-*", "opencode.json")
+	paths, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("Glob config paths: %v", err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("live config paths = %v, want two distinct per-spawn files", paths)
+	}
+	if paths[0] == paths[1] {
+		t.Fatalf("Lane-B sessions shared config path %q", paths[0])
+	}
+
+	if err := h1.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop first Lane-B session: %v", err)
+	}
+	paths, err = filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("Glob after first Stop: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("config paths after first Stop = %v, want only second session config", paths)
+	}
+
+	if err := h2.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop second Lane-B session: %v", err)
+	}
+	paths, err = filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("Glob after second Stop: %v", err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("config paths after both handles stopped = %v, want none", paths)
+	}
+}
+
 func TestProvider_Shutdown_NoOp(t *testing.T) {
 	t.Parallel()
 	p := mustNew(t)

@@ -15,10 +15,11 @@ import (
 //
 // Lane B stands up one `opencode serve` child per donmai session on a
 // loopback port the provider owns. Before the child starts, config.go
-// renders a session-scoped opencode.json and points the child at it via the
+// renders a spawn-scoped opencode.json and points the child at it via the
 // OPENCODE_CONFIG env var (a FILE, not OPENCODE_CONFIG_CONTENT: it survives
 // a subprocess re-exec and is auditable post-mortem). The file is written
-// 0600 inside the session state dir, regenerated per spawn, never reused.
+// 0600 inside a unique 0700 directory, regenerated per spawn, never reused,
+// and removed by the Lane-B handle during teardown.
 //
 // The config enforces three Rensei routing guarantees:
 //
