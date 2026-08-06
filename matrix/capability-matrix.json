@@ -770,7 +770,7 @@
           "baseReplaceDelivery": "unsupported",
           "contextDelivery": "unsupported",
           "userDelivery": "shell_pty_seed",
-          "amendmentDelivery": "shell_pty_seed"
+          "amendmentDelivery": "unsupported"
         }
       ],
       "toolLifecycle": [
