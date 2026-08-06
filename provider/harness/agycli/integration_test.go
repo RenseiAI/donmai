@@ -37,15 +37,31 @@ func TestLive_AgyEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
+	prompt := "Read the file NOTES.txt in the current working directory and report the secret word it contains. " +
+		"Then print WORK_RESULT:passed on its own line."
 	h, err := p.Spawn(ctx, agent.Spec{
-		Prompt: "Read the file NOTES.txt in the current working directory and report the secret word it contains. " +
-			"Then print WORK_RESULT:passed on its own line.",
-		Cwd: cwd,
+		Prompt: prompt,
+		Cwd:    cwd,
 	})
 	if err != nil {
 		t.Fatalf("Spawn(real agy): %v", err)
 	}
 	defer func() { _ = h.Stop(context.Background()) }()
+	concrete, ok := h.(*Handle)
+	if !ok {
+		t.Fatalf("real Spawn handle = %T, want *Handle", h)
+	}
+	canonical, err := canonicalWorktree(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgv := []string{p.binary, "-p", prompt + strings.TrimSuffix(resultEnvelopeInstruction, "\n"), "--dangerously-skip-permissions", "--add-dir", canonical}
+	if strings.Join(concrete.cmd.Args, "\x00") != strings.Join(wantArgv, "\x00") {
+		t.Fatalf("real agy argv = %#v, want %#v", concrete.cmd.Args, wantArgv)
+	}
+	if concrete.cmd.Dir != canonical {
+		t.Fatalf("real agy cmd.Dir = %q, want %q", concrete.cmd.Dir, canonical)
+	}
 
 	var (
 		text    strings.Builder

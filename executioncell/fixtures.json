@@ -1,0 +1,944 @@
+{
+  "contractVersion": "donmai.execution-cell/v1alpha1",
+  "cells": {
+    "claudeSubscription": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "claude-code",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "claude-opus-4-7",
+        "author": "anthropic"
+      },
+      "endpoint": {
+        "id": "anthropic-direct",
+        "protocol": "anthropic-messages",
+        "operator": "anthropic",
+        "revision": "2026-08-05"
+      },
+      "authBinding": {
+        "id": "auth_claude_host_subscription",
+        "mechanism": "cli_session",
+        "commercialMode": "subscription",
+        "authority": "anthropic",
+        "bindingScope": "host",
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "f5ff090746400e874b2deaddd748d01277df356bda113448745777f734403b7a",
+      "runtimeInventoryDigest": "f3788609604c435477f8b100b1bf18ed9d4f7f95da6ded480a41952428c78212"
+    },
+    "codexSubscription": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "codex",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "gpt-5.6",
+        "author": "openai"
+      },
+      "endpoint": {
+        "id": "openai-codex-subscription",
+        "protocol": "openai-responses",
+        "operator": "openai",
+        "revision": "2026-08-05"
+      },
+      "authBinding": {
+        "id": "auth_codex_host_subscription",
+        "mechanism": "cli_session",
+        "commercialMode": "subscription",
+        "authority": "openai",
+        "bindingScope": "host",
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "human_controlled",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        },
+        {
+          "name": "take_control"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "353e23e5c2fc865fadfa4f5f3de7da994cf057bfc11d3774aa8a4a52b1d4dc8b",
+      "runtimeInventoryDigest": "1910d53cd6714f539f457157aeac2a14e20845adacb0489ec014c03908bb04aa"
+    },
+    "antigravityGemini": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "antigravity",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "gemini-3.1-pro",
+        "author": "google"
+      },
+      "endpoint": {
+        "id": "antigravity-entitlement",
+        "protocol": "antigravity-cli",
+        "operator": "google-antigravity",
+        "revision": "2026-08-05"
+      },
+      "authBinding": {
+        "id": "auth_antigravity_multi_vendor_subscription",
+        "mechanism": "cli_session",
+        "commercialMode": "subscription",
+        "authority": "google-antigravity",
+        "bindingScope": "harness",
+        "portability": "harness_bound",
+        "delivery": "host_cli_home_reference"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "9b0ff969637907079ebc44ade55a8d6b04afc1d5e672b3b932be4bc788efccce",
+      "runtimeInventoryDigest": "cd2e92013f398f610d12b1879e06731449c1b01b07b0b255369d05474005cb52"
+    },
+    "antigravityAnthropic": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "antigravity",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "claude-sonnet-legacy",
+        "author": "anthropic"
+      },
+      "endpoint": {
+        "id": "antigravity-entitlement",
+        "protocol": "antigravity-cli",
+        "operator": "google-antigravity",
+        "revision": "2026-08-05"
+      },
+      "authBinding": {
+        "id": "auth_antigravity_multi_vendor_subscription",
+        "mechanism": "cli_session",
+        "commercialMode": "subscription",
+        "authority": "google-antigravity",
+        "bindingScope": "harness",
+        "portability": "harness_bound",
+        "delivery": "host_cli_home_reference"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "d627ce2e80171ea5b13647571a9592ab799abbc75e14b5a9002d61f059bb4733",
+      "runtimeInventoryDigest": "09ded630e32a7533c4bf4b3514a1889805b388936e98c65dfca17fcaa5caf036"
+    },
+    "openCodeSubscription": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "opencode",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "subscription-dynamic-model",
+        "author": "opencode-catalog"
+      },
+      "endpoint": {
+        "id": "opencode-subscription",
+        "protocol": "openai-chat",
+        "operator": "opencode",
+        "revision": "2026-08-05"
+      },
+      "authBinding": {
+        "id": "auth_opencode_subscription",
+        "mechanism": "oauth",
+        "commercialMode": "subscription",
+        "authority": "opencode",
+        "bindingScope": "harness",
+        "portability": "harness_bound",
+        "delivery": "host_cli_home_reference"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "855c5d3ae0862f1c18171415fda0f4ef0078c84dc50b79952bb05de2675912bd",
+      "runtimeInventoryDigest": "5eaecd9d38805e5af3a6668099d53d0e2ad92fff19acde498b7f4bd2f87143a3"
+    },
+    "ollamaSubscription": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "ollama",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "llama-subscription-model",
+        "author": "meta"
+      },
+      "endpoint": {
+        "id": "ollama-subscription-cloud",
+        "protocol": "ollama",
+        "operator": "ollama",
+        "revision": "2026-08-05"
+      },
+      "authBinding": {
+        "id": "auth_ollama_subscription",
+        "mechanism": "oauth",
+        "commercialMode": "subscription",
+        "authority": "ollama",
+        "bindingScope": "endpoint",
+        "portability": "endpoint_bound",
+        "delivery": "endpoint_header"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "949ff27371eee68f7dabe80d95a757e4bbfb4a5e5bf29861e7b150a93a34092e",
+      "runtimeInventoryDigest": "08e73f1d465355b5e05177b986d071b83c60398b1b5726856212ac897b96ddaa"
+    },
+    "lmStudioNoAuth": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "opencode",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "llama-large",
+        "author": "meta"
+      },
+      "endpoint": {
+        "id": "lmstudio-main",
+        "protocol": "openai-chat",
+        "operator": "local-operator",
+        "revision": "rev-7"
+      },
+      "authBinding": {
+        "id": "auth_lmstudio_none",
+        "mechanism": "none",
+        "commercialMode": "self_hosted",
+        "authority": "local-user",
+        "bindingScope": "endpoint",
+        "portability": "endpoint_bound",
+        "delivery": "none"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "a1a3c7d3d7e2e977979fac778dd0ea837933d7c90399e093c77fad124463be18",
+      "runtimeInventoryDigest": "5443ef567b4f73f1fda70cc059fcdad45369b313e6c991e0ec605e808272e44b"
+    },
+    "lmStudioApiKey": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "opencode",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "llama-large",
+        "author": "meta"
+      },
+      "endpoint": {
+        "id": "lmstudio-main",
+        "protocol": "openai-chat",
+        "operator": "local-operator",
+        "revision": "rev-7"
+      },
+      "authBinding": {
+        "id": "auth_lmstudio_optional_key",
+        "mechanism": "api_key",
+        "commercialMode": "self_hosted",
+        "authority": "local-user",
+        "bindingScope": "endpoint",
+        "portability": "endpoint_bound",
+        "delivery": "endpoint_header"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "6052974b6c9e4437e6c97577128cc778653fe4dd60c250ea9fa704cda18d1f64",
+      "runtimeInventoryDigest": "6d5fa67be1de5a83d662f25a0db7d6518cc9d0259f82274bcdb8d10549b6502e"
+    },
+    "claimBoundPool": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "codex",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "gpt-5.6",
+        "author": "openai"
+      },
+      "endpoint": {
+        "id": "openai-codex-subscription",
+        "protocol": "openai-responses",
+        "operator": "openai",
+        "revision": "2026-08-05"
+      },
+      "authBinding": {
+        "id": "auth_codex_host_subscription",
+        "mechanism": "cli_session",
+        "commercialMode": "subscription",
+        "authority": "openai",
+        "bindingScope": "host",
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
+      },
+      "placement": {
+        "id": "pool_host_subscriptions",
+        "kind": "pool",
+        "resolution": "claim_bound"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "d3c76c5affc06ebbd72754dbfba25d38e37eebf6db16be0a94842a725954f0bc",
+      "runtimeInventoryDigest": "0258e7b2aeb622c6c29fb19abdac0c10e582aa19b4ca95b41ad9bba7af89a481"
+    }
+  },
+  "claimBound": {
+    "intent": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "requestId": "request_claim_bound_pool",
+      "harness": {
+        "id": "codex",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "gpt-5.6",
+        "author": "openai"
+      },
+      "endpoint": {
+        "id": "openai-codex-subscription",
+        "protocol": "openai-responses",
+        "operator": "openai",
+        "revision": "2026-08-05"
+      },
+      "authBinding": {
+        "id": "auth_codex_host_subscription",
+        "mechanism": "cli_session",
+        "commercialMode": "subscription",
+        "authority": "openai",
+        "bindingScope": "host",
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
+      },
+      "placement": {
+        "id": "pool_host_subscriptions",
+        "kind": "pool",
+        "resolution": "claim_bound"
+      },
+      "sessionMode": "autonomous",
+      "requiredCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "optionalCapabilities": [],
+      "fallbackAlternatives": []
+    },
+    "admissionReceipt": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "receiptId": "admission_claim_bound_pool",
+      "requestId": "request_claim_bound_pool",
+      "intentDigest": "6ad989bda7cc3eb4e2e6ebed1570322be6f9147aa08bc24a9c1a7846131bd778",
+      "operationalPayloadDigest": "8afb6a40446fd0df848ff59b67801b01404ee2bb224f2f31599965ed97a84dd9",
+      "resolverDecisions": [
+        {
+          "kind": "explicit",
+          "field": "harness",
+          "selectedRef": "harness:codex@pinned-1",
+          "reason": "Fixture dispatch explicitly selected harness."
+        },
+        {
+          "kind": "explicit",
+          "field": "model",
+          "selectedRef": "model:openai/gpt-5.6",
+          "reason": "Fixture dispatch explicitly selected model."
+        },
+        {
+          "kind": "explicit",
+          "field": "endpoint",
+          "selectedRef": "endpoint:openai-codex-subscription",
+          "reason": "Fixture dispatch explicitly selected endpoint."
+        },
+        {
+          "kind": "explicit",
+          "field": "authBinding",
+          "selectedRef": "auth-binding:auth_codex_host_subscription",
+          "reason": "Fixture dispatch explicitly selected authBinding."
+        },
+        {
+          "kind": "explicit",
+          "field": "placement",
+          "selectedRef": "placement:pool_host_subscriptions",
+          "reason": "Fixture dispatch explicitly selected placement."
+        }
+      ],
+      "recordedAt": "2026-08-05T12:00:00.000Z",
+      "decision": "admitted",
+      "cell": {
+        "contractVersion": "donmai.execution-cell/v1alpha1",
+        "harness": {
+          "id": "codex",
+          "version": "pinned-1"
+        },
+        "model": {
+          "id": "gpt-5.6",
+          "author": "openai"
+        },
+        "endpoint": {
+          "id": "openai-codex-subscription",
+          "protocol": "openai-responses",
+          "operator": "openai",
+          "revision": "2026-08-05"
+        },
+        "authBinding": {
+          "id": "auth_codex_host_subscription",
+          "mechanism": "cli_session",
+          "commercialMode": "subscription",
+          "authority": "openai",
+          "bindingScope": "host",
+          "portability": "host_bound",
+          "delivery": "host_cli_home_reference"
+        },
+        "placement": {
+          "id": "pool_host_subscriptions",
+          "kind": "pool",
+          "resolution": "claim_bound"
+        },
+        "sessionMode": "autonomous",
+        "grantedCapabilities": [
+          {
+            "name": "watch"
+          },
+          {
+            "name": "replay"
+          },
+          {
+            "name": "cancel"
+          }
+        ],
+        "evidenceTier": "smoked",
+        "compatibilityDigest": "d3c76c5affc06ebbd72754dbfba25d38e37eebf6db16be0a94842a725954f0bc",
+        "runtimeInventoryDigest": "0258e7b2aeb622c6c29fb19abdac0c10e582aa19b4ca95b41ad9bba7af89a481"
+      }
+    },
+    "claimReceipt": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "claimReceiptId": "claim_receipt_host_mac_studio",
+      "admissionReceiptId": "admission_claim_bound_pool",
+      "claimId": "claim_host_mac_studio",
+      "recordedAt": "2026-08-05T12:00:00.000Z",
+      "decision": "claimed",
+      "effectiveCell": {
+        "contractVersion": "donmai.execution-cell/v1alpha1",
+        "harness": {
+          "id": "codex",
+          "version": "pinned-1"
+        },
+        "model": {
+          "id": "gpt-5.6",
+          "author": "openai"
+        },
+        "endpoint": {
+          "id": "openai-codex-subscription",
+          "protocol": "openai-responses",
+          "operator": "openai",
+          "revision": "2026-08-05"
+        },
+        "authBinding": {
+          "id": "auth_codex_host_subscription",
+          "mechanism": "cli_session",
+          "commercialMode": "subscription",
+          "authority": "openai",
+          "bindingScope": "host",
+          "portability": "host_bound",
+          "delivery": "host_cli_home_reference"
+        },
+        "placement": {
+          "id": "host_mac_studio_claimed",
+          "kind": "host",
+          "resolution": "exact"
+        },
+        "sessionMode": "autonomous",
+        "grantedCapabilities": [
+          {
+            "name": "watch"
+          },
+          {
+            "name": "replay"
+          },
+          {
+            "name": "cancel"
+          }
+        ],
+        "evidenceTier": "smoked",
+        "compatibilityDigest": "d3c76c5affc06ebbd72754dbfba25d38e37eebf6db16be0a94842a725954f0bc",
+        "runtimeInventoryDigest": "da818c932697d8b3b52d3d4b8002e7a537e12a3d58e95f4f486adfa6f7cb1f13"
+      }
+    },
+    "effectiveCell": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "codex",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "gpt-5.6",
+        "author": "openai"
+      },
+      "endpoint": {
+        "id": "openai-codex-subscription",
+        "protocol": "openai-responses",
+        "operator": "openai",
+        "revision": "2026-08-05"
+      },
+      "authBinding": {
+        "id": "auth_codex_host_subscription",
+        "mechanism": "cli_session",
+        "commercialMode": "subscription",
+        "authority": "openai",
+        "bindingScope": "host",
+        "portability": "host_bound",
+        "delivery": "host_cli_home_reference"
+      },
+      "placement": {
+        "id": "host_mac_studio_claimed",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "d3c76c5affc06ebbd72754dbfba25d38e37eebf6db16be0a94842a725954f0bc",
+      "runtimeInventoryDigest": "da818c932697d8b3b52d3d4b8002e7a537e12a3d58e95f4f486adfa6f7cb1f13"
+    }
+  },
+  "delegation": {
+    "parentSession": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "sessionId": "session_delegating_parent",
+      "admissionReceiptId": "admission_delegating_parent",
+      "mode": "autonomous",
+      "capabilities": {
+        "watch": true,
+        "replay": true,
+        "cancel": true,
+        "takeControl": false
+      }
+    },
+    "childIntent": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "requestId": "request_delegated_child",
+      "harness": {
+        "id": "opencode",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "llama-large",
+        "author": "meta"
+      },
+      "endpoint": {
+        "id": "lmstudio-main",
+        "protocol": "openai-chat",
+        "operator": "local-operator",
+        "revision": "rev-7"
+      },
+      "authBinding": {
+        "id": "auth_lmstudio_none",
+        "mechanism": "none",
+        "commercialMode": "self_hosted",
+        "authority": "local-user",
+        "bindingScope": "endpoint",
+        "portability": "endpoint_bound",
+        "delivery": "none"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "requiredCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "optionalCapabilities": [],
+      "fallbackAlternatives": []
+    },
+    "childCell": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "harness": {
+        "id": "opencode",
+        "version": "pinned-1"
+      },
+      "model": {
+        "id": "llama-large",
+        "author": "meta"
+      },
+      "endpoint": {
+        "id": "lmstudio-main",
+        "protocol": "openai-chat",
+        "operator": "local-operator",
+        "revision": "rev-7"
+      },
+      "authBinding": {
+        "id": "auth_lmstudio_none",
+        "mechanism": "none",
+        "commercialMode": "self_hosted",
+        "authority": "local-user",
+        "bindingScope": "endpoint",
+        "portability": "endpoint_bound",
+        "delivery": "none"
+      },
+      "placement": {
+        "id": "host_mac_studio",
+        "kind": "host",
+        "resolution": "exact"
+      },
+      "sessionMode": "autonomous",
+      "grantedCapabilities": [
+        {
+          "name": "watch"
+        },
+        {
+          "name": "replay"
+        },
+        {
+          "name": "cancel"
+        }
+      ],
+      "evidenceTier": "smoked",
+      "compatibilityDigest": "a1a3c7d3d7e2e977979fac778dd0ea837933d7c90399e093c77fad124463be18",
+      "runtimeInventoryDigest": "5443ef567b4f73f1fda70cc059fcdad45369b313e6c991e0ec605e808272e44b"
+    },
+    "childAdmissionReceipt": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "receiptId": "admission_delegated_child",
+      "requestId": "request_delegated_child",
+      "intentDigest": "763b67d89bf40953d48fa3fc26002ba128be6a4e47dc5e07f9cd9b2aee8b0512",
+      "operationalPayloadDigest": "b38f5d7bea1c7bfc36beb6619fe4bf7203cb2ee0a980ad5562ca95354a81ba6f",
+      "resolverDecisions": [
+        {
+          "kind": "explicit",
+          "field": "harness",
+          "selectedRef": "harness:opencode@pinned-1",
+          "reason": "Fixture dispatch explicitly selected harness."
+        },
+        {
+          "kind": "explicit",
+          "field": "model",
+          "selectedRef": "model:meta/llama-large",
+          "reason": "Fixture dispatch explicitly selected model."
+        },
+        {
+          "kind": "explicit",
+          "field": "endpoint",
+          "selectedRef": "endpoint:lmstudio-main",
+          "reason": "Fixture dispatch explicitly selected endpoint."
+        },
+        {
+          "kind": "explicit",
+          "field": "authBinding",
+          "selectedRef": "auth-binding:auth_lmstudio_none",
+          "reason": "Fixture dispatch explicitly selected authBinding."
+        },
+        {
+          "kind": "explicit",
+          "field": "placement",
+          "selectedRef": "placement:host_mac_studio",
+          "reason": "Fixture dispatch explicitly selected placement."
+        }
+      ],
+      "recordedAt": "2026-08-05T12:00:00.000Z",
+      "decision": "admitted",
+      "cell": {
+        "contractVersion": "donmai.execution-cell/v1alpha1",
+        "harness": {
+          "id": "opencode",
+          "version": "pinned-1"
+        },
+        "model": {
+          "id": "llama-large",
+          "author": "meta"
+        },
+        "endpoint": {
+          "id": "lmstudio-main",
+          "protocol": "openai-chat",
+          "operator": "local-operator",
+          "revision": "rev-7"
+        },
+        "authBinding": {
+          "id": "auth_lmstudio_none",
+          "mechanism": "none",
+          "commercialMode": "self_hosted",
+          "authority": "local-user",
+          "bindingScope": "endpoint",
+          "portability": "endpoint_bound",
+          "delivery": "none"
+        },
+        "placement": {
+          "id": "host_mac_studio",
+          "kind": "host",
+          "resolution": "exact"
+        },
+        "sessionMode": "autonomous",
+        "grantedCapabilities": [
+          {
+            "name": "watch"
+          },
+          {
+            "name": "replay"
+          },
+          {
+            "name": "cancel"
+          }
+        ],
+        "evidenceTier": "smoked",
+        "compatibilityDigest": "a1a3c7d3d7e2e977979fac778dd0ea837933d7c90399e093c77fad124463be18",
+        "runtimeInventoryDigest": "5443ef567b4f73f1fda70cc059fcdad45369b313e6c991e0ec605e808272e44b"
+      }
+    },
+    "childSession": {
+      "contractVersion": "donmai.execution-cell/v1alpha1",
+      "sessionId": "session_delegated_child",
+      "admissionReceiptId": "admission_delegated_child",
+      "mode": "autonomous",
+      "capabilities": {
+        "watch": true,
+        "replay": true,
+        "cancel": true,
+        "takeControl": false
+      }
+    },
+    "edges": [
+      {
+        "contractVersion": "donmai.execution-cell/v1alpha1",
+        "edgeId": "edge_native_harness",
+        "parent": {
+          "contractVersion": "donmai.execution-cell/v1alpha1",
+          "sessionId": "session_delegating_parent",
+          "admissionReceiptId": "admission_delegating_parent",
+          "mode": "autonomous",
+          "capabilities": {
+            "watch": true,
+            "replay": true,
+            "cancel": true,
+            "takeControl": false
+          }
+        },
+        "childRequestId": "request_delegated_child",
+        "transport": "native_harness",
+        "inheritedFields": [],
+        "detached": false
+      },
+      {
+        "contractVersion": "donmai.execution-cell/v1alpha1",
+        "edgeId": "edge_platform_dispatch",
+        "parent": {
+          "contractVersion": "donmai.execution-cell/v1alpha1",
+          "sessionId": "session_delegating_parent",
+          "admissionReceiptId": "admission_delegating_parent",
+          "mode": "autonomous",
+          "capabilities": {
+            "watch": true,
+            "replay": true,
+            "cancel": true,
+            "takeControl": false
+          }
+        },
+        "childRequestId": "request_delegated_child",
+        "transport": "platform_dispatch",
+        "inheritedFields": [],
+        "detached": false
+      },
+      {
+        "contractVersion": "donmai.execution-cell/v1alpha1",
+        "edgeId": "edge_a2a",
+        "parent": {
+          "contractVersion": "donmai.execution-cell/v1alpha1",
+          "sessionId": "session_delegating_parent",
+          "admissionReceiptId": "admission_delegating_parent",
+          "mode": "autonomous",
+          "capabilities": {
+            "watch": true,
+            "replay": true,
+            "cancel": true,
+            "takeControl": false
+          }
+        },
+        "childRequestId": "request_delegated_child",
+        "transport": "a2a",
+        "inheritedFields": [],
+        "detached": false
+      },
+      {
+        "contractVersion": "donmai.execution-cell/v1alpha1",
+        "edgeId": "edge_host_cli",
+        "parent": {
+          "contractVersion": "donmai.execution-cell/v1alpha1",
+          "sessionId": "session_delegating_parent",
+          "admissionReceiptId": "admission_delegating_parent",
+          "mode": "autonomous",
+          "capabilities": {
+            "watch": true,
+            "replay": true,
+            "cancel": true,
+            "takeControl": false
+          }
+        },
+        "childRequestId": "request_delegated_child",
+        "transport": "host_cli",
+        "inheritedFields": [],
+        "detached": false
+      }
+    ]
+  }
+}

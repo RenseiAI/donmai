@@ -100,7 +100,7 @@ func Build() (*Built, error) {
 	}
 	endpoints, endpointByCompany := buildEndpoints()
 
-	cells, err := buildCells(harnessByName, endpointByCompany)
+	cells, err := buildCells(validCells, harnessByName, endpointByCompany)
 	if err != nil {
 		return nil, err
 	}
@@ -253,10 +253,12 @@ func buildEndpoints() ([]EndpointRow, map[agent.Company]EndpointRow) {
 // and returns the sorted cell list. Validation enforces:
 //   - protocol intersection: cell.protocol ∈ harness.drives AND
 //     cell.protocol == endpoint.host(cell.host).protocol
+//   - serving-host membership: cell.host ∈ harness.drivesHosts
 //   - authMode subset: cell.authModes ⊆ endpoint.host(cell.host).authModes
 //   - caps narrowing-only: any override only narrows (false where harness=true)
 //   - not denylisted
 func buildCells(
+	cells []HarnessEndpointCell,
 	harnessByName map[agent.HarnessName]HarnessRow,
 	endpointByCompany map[agent.Company]EndpointRow,
 ) ([]HarnessEndpointCell, error) {
@@ -265,8 +267,8 @@ func buildCells(
 		denied[k] = true
 	}
 
-	out := make([]HarnessEndpointCell, 0, len(validCells))
-	for _, c := range validCells {
+	out := make([]HarnessEndpointCell, 0, len(cells))
+	for _, c := range cells {
 		key := c.Key()
 		if denied[key] {
 			return nil, fmt.Errorf("cell %+v is on the denylist", key)
@@ -291,6 +293,9 @@ func buildCells(
 		}
 		if host.Protocol != c.Protocol {
 			return nil, fmt.Errorf("cell %+v: protocol %q != endpoint host protocol %q", key, c.Protocol, host.Protocol)
+		}
+		if !containsHost(h.DrivesHosts, c.Host) {
+			return nil, fmt.Errorf("cell %+v: host %q not in harness %q drivesHosts %v", key, c.Host, c.Harness, h.DrivesHosts)
 		}
 
 		// AuthMode subset + enum membership.
@@ -376,6 +381,15 @@ func findHost(ep EndpointRow, host agent.ServingHost) (agent.HostDesc, bool) {
 func containsProtocol(s []agent.WireProtocol, p agent.WireProtocol) bool {
 	for _, x := range s {
 		if x == p {
+			return true
+		}
+	}
+	return false
+}
+
+func containsHost(s []agent.ServingHost, host agent.ServingHost) bool {
+	for _, candidate := range s {
+		if candidate == host {
 			return true
 		}
 	}

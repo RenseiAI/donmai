@@ -86,6 +86,7 @@ type State struct {
 	// projection. ToolLifecycleReceiptHistory is its append-only audit trail;
 	// both ready and denied decisions are persisted before provider side effects.
 	ToolLifecycleReceipt        *agent.ToolLifecycleReceipt  `json:"toolLifecycleAdaptationReceipt,omitempty"`
+
 	ToolLifecycleReceiptHistory []agent.ToolLifecycleReceipt `json:"toolLifecycleAdaptationReceiptHistory,omitempty"`
 }
 
