@@ -318,9 +318,9 @@ func TestNewSpawnPlan_MCPServers(t *testing.T) {
 			t.Fatalf("codex serialized runner-only %s: %v", key, envMap)
 		}
 	}
-	// type field should always be present and set to "stdio".
-	if linear["type"] != "stdio" {
-		t.Fatalf("expected type=stdio, got %v", linear["type"])
+	// Native Codex config infers stdio transport from command.
+	if _, exists := linear["type"]; exists {
+		t.Fatalf("native Codex stdio config must omit type, got %v", linear)
 	}
 }
 
@@ -342,13 +342,13 @@ func TestMCPServersConfig_NoArgsStdio(t *testing.T) {
 	if entry["command"] != "mybinary" {
 		t.Fatalf("expected command=mybinary, got %v", entry["command"])
 	}
-	if entry["type"] != "stdio" {
-		t.Fatalf("expected type=stdio, got %v", entry["type"])
+	if _, exists := entry["type"]; exists {
+		t.Fatalf("native Codex stdio config must omit type, got %v", entry)
 	}
 }
 
 // TestMCPServersConfig_HTTPTransport verifies that an http-type server
-// produces an entry with type/url/headers and no command/args fields.
+// produces an entry with url/http_headers and no type/command/args fields.
 func TestMCPServersConfig_HTTPTransport(t *testing.T) {
 	t.Parallel()
 	servers := []agent.MCPServerConfig{
@@ -364,15 +364,18 @@ func TestMCPServersConfig_HTTPTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected map entry for af-linear-proxy, got %T: %v", cfg["af-linear-proxy"], cfg["af-linear-proxy"])
 	}
-	if entry["type"] != "http" {
-		t.Fatalf("expected type=http, got %v", entry["type"])
+	if _, exists := entry["type"]; exists {
+		t.Fatalf("native Codex HTTP config must omit type, got %v", entry)
 	}
 	if entry["url"] != "https://example.com/mcp" {
 		t.Fatalf("expected url=https://example.com/mcp, got %v", entry["url"])
 	}
-	headers, ok := entry["headers"].(map[string]interface{})
+	headers, ok := entry["http_headers"].(map[string]interface{})
 	if !ok || headers["Authorization"] != "Bearer tok" {
-		t.Fatalf("expected Authorization header, got %v", entry["headers"])
+		t.Fatalf("expected Authorization header, got %v", entry["http_headers"])
+	}
+	if _, exists := entry["headers"]; exists {
+		t.Fatalf("shared JSON headers key is invalid in native Codex config: %v", entry)
 	}
 	if _, hasCmd := entry["command"]; hasCmd {
 		t.Fatalf("http entry must not contain 'command', got entry=%v", entry)

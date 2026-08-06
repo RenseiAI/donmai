@@ -79,16 +79,33 @@ bridge, not default-allow — autonomous fleets need real safety rules).
 
 ## MCP servers
 
-`Spec.MCPServers` is pushed to the app-server via JSON-RPC
-`config/batchWrite` (`mcpServers` keyPath, `replace` merge strategy)
-exactly once per Provider lifetime, on the first `Spawn`. The
-app-server then runs each MCP server as its own subprocess; the codex
-side discovers and routes tools without further help from this
-provider.
+Each headless Provider creates a private `CODEX_HOME` (directory mode
+`0700`) with its own `config.toml` (mode `0600`). The owned home overrides
+both the inherited environment and `Options.Env`; the initialize response
+must confirm that exact home before the Provider is usable. The provider
+does not read, link, copy, or write the operator's persistent Codex config
+or auth files. If a session needs process-scoped authentication, its caller
+must supply that explicitly through `Options.Env`.
 
-If the codex version returns `-32601 Method not found` for
-`config/batchWrite`, the call is treated as a soft failure — the
-provider still works, sessions just run without tool plugins.
+Before every `thread/start` or `thread/resume`, the Provider acquires a
+lease for the exact `Spec.MCPServers` set. It writes the native Codex shape
+to the `mcp_servers` key with `replace`, an explicit owned `filePath`, and
+`reloadUserConfig: true`, then proves activation with `config/read` at the
+session working directory. The first session performs this write/read even
+for an empty set, so any undeclared server visible in effective readback is
+rejected before a thread starts rather than silently entering the session.
+Stdio and HTTP entries are translated to Codex's native fields, including
+`http_headers`.
+
+Concurrent sessions may share an identical MCP set. An incompatible set is
+denied while a lease is live; sequential sessions rewrite and re-verify it.
+The last release replaces the set with empty and verifies that readback.
+Failure to apply, read back, or clear is a typed MCP application denial, not
+a soft degradation. A failed clear removes the private home, poisons the
+Provider against later sessions, and is returned from `Handle.Stop` or
+emitted as `mcp_cleanup_failed` on terminal/crash paths. Process exit and
+`Shutdown` also remove the owned home. `-32601 Method not found` is therefore
+a hard pre-thread failure.
 
 ## Failure modes (F.1.1 §5)
 
@@ -98,6 +115,9 @@ provider still works, sessions just run without tool plugins.
 - **App-server crash** → the JSON-RPC client's read loop sees EOF /
   pipe-closed, fires `onClose`, and the Provider marks every live
   Handle terminal with `agent.ErrorEvent{Code: "app_server_crashed"}`.
+  If destruction of the isolated config fails, the terminal event is
+  instead `agent.ErrorEvent{Code: "mcp_cleanup_failed"}`, and a later
+  `Shutdown` returns the persistent cleanup error.
 - **`ctx.Done()` on a Handle** → forwarder sends `turn/interrupt` +
   `thread/unsubscribe`, emits `agent.ErrorEvent{Code: "context_cancelled"}`,
   closes events.
@@ -145,6 +165,7 @@ surfacing as a spurious `client stopped` Spawn failure.
 | --------------------- | ------------------------------------------------- |
 | `doc.go`              | Package overview                                  |
 | `codex.go`            | `Provider` lifecycle (New / Spawn / Resume / Shutdown) |
+| `config_boundary.go`  | Isolated `CODEX_HOME` ownership and cleanup            |
 | `jsonrpc.go`          | Bidirectional JSON-RPC 2.0 client over stdio      |
 | `handle.go`           | Per-session `Handle` + forwarder goroutine        |
 | `approval.go`         | Approval bridge (Spec.PermissionConfig → decision) |
@@ -161,10 +182,10 @@ surfacing as a spurious `client stopped` Spawn failure.
 
 ```bash
 # Unit tests (default)
-go test -race ./provider/codex/
+go test -race ./provider/harness/codex/
 
 # Integration tests (requires codex + OPENAI_API_KEY)
-go test -tags codex_integration -timeout 120s ./provider/codex/
+go test -tags codex_integration -timeout 120s ./provider/harness/codex/
 ```
 
 ## What was intentionally dropped vs legacy TS

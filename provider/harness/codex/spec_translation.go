@@ -185,10 +185,9 @@ func promptInput(spec agent.Spec) []map[string]any {
 	return parts
 }
 
-// mcpServersConfig builds the value passed to `config/batchWrite` for
-// the `mcpServers` keyPath. Codex expects a map keyed by server name,
-// not the flat array we hold in Spec.MCPServers. The mapping mirrors
-// configureMcpServers in the legacy TS.
+// mcpServersConfig builds the value passed to `config/batchWrite` for the
+// native `mcp_servers` keyPath. Codex expects a map keyed by server name, not
+// the flat array we hold in Spec.MCPServers.
 //
 // It delegates to mcp.BuildConfigFile so the stdio/http transport logic
 // and omitempty field rules live in exactly one place. Servers that
@@ -229,6 +228,16 @@ func mcpServersConfig(servers []agent.MCPServerConfig) map[string]any {
 				"server", s.Name, "err", err)
 			continue
 		}
+		// runtime/mcp's shared JSON shape includes a transport discriminator
+		// and calls HTTP headers "headers". Codex's config.toml layer infers
+		// transport from command/url and names the latter "http_headers".
+		// The app-server accepts the shared stdio shape, but rejects the shared
+		// HTTP shape and silently ignores the old camel-case key path.
+		delete(entry, "type")
+		if headers, ok := entry["headers"]; ok {
+			entry["http_headers"] = headers
+			delete(entry, "headers")
+		}
 		out[s.Name] = entry
 	}
 	if len(out) == 0 {
@@ -242,7 +251,7 @@ func mcpServersConfig(servers []agent.MCPServerConfig) map[string]any {
 // table-test the full Spec → params translation without touching live
 // stdio.
 type SpawnPlan struct {
-	// MCPConfig is the value for `config/batchWrite` mcpServers, or
+	// MCPConfig is the value for `config/batchWrite` mcp_servers, or
 	// nil when Spec.MCPServers is empty.
 	MCPConfig map[string]any
 
@@ -325,11 +334,11 @@ func ignoredSpecFields(spec agent.Spec) []SpecFieldNote {
 	}
 
 	// MCPToolNames: only meaningful for Claude's --allowedTools list.
-	// Codex auto-discovers tools from registered mcpServers.
+	// Codex auto-discovers tools from registered mcp_servers.
 	if len(spec.MCPToolNames) > 0 {
 		notes = append(notes, SpecFieldNote{
 			Field:  "MCPToolNames",
-			Reason: "codex auto-discovers MCP tools from configured mcpServers; explicit names are ignored",
+			Reason: "codex auto-discovers MCP tools from configured mcp_servers; explicit names are ignored",
 		})
 	}
 

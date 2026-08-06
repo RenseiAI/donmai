@@ -69,8 +69,9 @@ type Handle struct {
 	closed       chan struct{}
 	eventsMu     sync.RWMutex
 	eventsClosed atomic.Bool
-	mcpRelease   func()
+	mcpRelease   func() error
 	mcpOnce      sync.Once
+	mcpErr       error
 
 	state *mapperState
 }
@@ -144,12 +145,16 @@ func (h *Handle) Stop(ctx context.Context) error {
 			h.client.Unsubscribe(threadID)
 		}
 	})
+	cleanupErr := h.releaseMCPConfig()
+	if cleanupErr != nil {
+		h.emit(mcpCleanupErrorEvent())
+	}
 	// Broadcast shutdown + close events; both are idempotent guards
 	// (closedOnce / eventsClosed) so the call is safe even if the
 	// forwarder defer or failNow has already run.
 	h.signalClosed()
 	h.closeEvents()
-	return nil
+	return cleanupErr
 }
 
 // failNow marks the handle terminal with an ErrorEvent and closes the
@@ -157,13 +162,18 @@ func (h *Handle) Stop(ctx context.Context) error {
 // crashes. Safe to call concurrently with Stop / forward; close
 // ordering is enforced by the eventsClosed flag (see emit / closeEvents).
 func (h *Handle) failNow(err error) {
+	cleanupErr := h.releaseMCPConfig()
 	// emit is safe under concurrent close: it short-circuits when
 	// eventsClosed is already set. Posting BEFORE we close lets the
 	// runner observe the failure rather than racing with closure.
-	h.emit(agent.ErrorEvent{
-		Message: fmt.Sprintf("codex provider failure: %s", err.Error()),
-		Code:    "app_server_crashed",
-	})
+	if cleanupErr != nil {
+		h.emit(mcpCleanupErrorEvent())
+	} else {
+		h.emit(agent.ErrorEvent{
+			Message: fmt.Sprintf("codex provider failure: %s", err.Error()),
+			Code:    "app_server_crashed",
+		})
+	}
 	threadID := h.SessionID()
 	if h.client != nil && threadID != "" {
 		h.client.Unsubscribe(threadID)
@@ -196,15 +206,16 @@ func (h *Handle) closeEvents() {
 	if h.provider != nil {
 		h.provider.unregisterHandle(h)
 	}
-	h.releaseMCPConfig()
+	_ = h.releaseMCPConfig()
 }
 
-func (h *Handle) releaseMCPConfig() {
+func (h *Handle) releaseMCPConfig() error {
 	h.mcpOnce.Do(func() {
 		if h.mcpRelease != nil {
-			h.mcpRelease()
+			h.mcpErr = h.mcpRelease()
 		}
 	})
+	return h.mcpErr
 }
 
 // start performs the JSON-RPC bring-up: optional MCP config push,
@@ -331,13 +342,25 @@ func (h *Handle) handleNotification(n notification) bool {
 
 	events := mapNotification(n.Method, n.Params, h.state, rawObj)
 	for _, ev := range events {
-		h.emit(ev)
 		switch ev.Kind() {
 		case agent.EventResult, agent.EventError:
+			if err := h.releaseMCPConfig(); err != nil {
+				h.emit(mcpCleanupErrorEvent())
+			} else {
+				h.emit(ev)
+			}
 			return true
 		}
+		h.emit(ev)
 	}
 	return false
+}
+
+func mcpCleanupErrorEvent() agent.ErrorEvent {
+	return agent.ErrorEvent{
+		Message: "codex isolated MCP configuration cleanup failed",
+		Code:    "mcp_cleanup_failed",
+	}
 }
 
 // handleServerRequest evaluates an approval request via the bridge
