@@ -54,13 +54,13 @@ clean:
 generate:
 	GOWORK=off go generate ./matrix/...
 	GOWORK=off go generate ./internal/credentials/...
+	GOWORK=off go generate ./executioncell
 
-# verify-generated runs only the matrix parity gate (the byte-identical check
-# plus the protocol/auth/blocklist/narrowing/manifest-agreement rules) and the
-# canonical env-blocklist artifact freshness check (blocklist.json vs the Go
-# source of truth). Run with GOWORK=off to mirror the OSS-standalone CI lane.
+# verify-generated runs the matrix parity gate, canonical env-blocklist
+# freshness check, and execution-cell schema/fixture digest + conformance gate.
+# Run with GOWORK=off to mirror the OSS-standalone CI lane.
 verify-generated:
-	GOWORK=off go test -race ./matrix/... ./internal/credentials/...
+	GOWORK=off go test -race ./matrix/... ./internal/credentials/... ./executioncell/...
 
 # Local snapshot release (no publish, no signing). GoReleaser v2 snapshot mode
 # skips publication but not custom sign pipes, so signing must be skipped
