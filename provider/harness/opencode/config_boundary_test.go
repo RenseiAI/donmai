@@ -163,6 +163,53 @@ func TestOpenCodeServerResource_ConcurrentCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestOpenCodeConfigBoundary_SessionsSharingCwdStayIsolated(t *testing.T) {
+	repo := t.TempDir()
+	tempRoot := t.TempDir()
+	spec := agent.Spec{Cwd: repo}
+	first, err := newOpenCodeConfigBoundary(tempRoot, spec)
+	if err != nil {
+		t.Fatalf("new first config boundary: %v", err)
+	}
+	second, err := newOpenCodeConfigBoundary(tempRoot, spec)
+	if err != nil {
+		_ = first.remove()
+		t.Fatalf("new second config boundary: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = first.remove()
+		_ = second.remove()
+	})
+	if first.home == second.home || first.configPath == second.configPath {
+		t.Fatalf("sessions sharing cwd reused config boundary: first=%q second=%q", first.home, second.home)
+	}
+
+	p := &Provider{}
+	firstResource := &openCodeServerResource{config: first}
+	secondResource := &openCodeServerResource{config: second}
+	if err := p.registerResource(firstResource); err != nil {
+		t.Fatalf("register first resource: %v", err)
+	}
+	if err := p.registerResource(secondResource); err != nil {
+		t.Fatalf("register second resource: %v", err)
+	}
+	if err := p.releaseResource(firstResource); err != nil {
+		t.Fatalf("release first resource: %v", err)
+	}
+	if _, err := os.Stat(first.home); !os.IsNotExist(err) {
+		t.Fatalf("first config survived release: %v", err)
+	}
+	if _, err := os.Stat(second.configPath); err != nil {
+		t.Fatalf("releasing first config disturbed second: %v", err)
+	}
+	if err := p.releaseResource(secondResource); err != nil {
+		t.Fatalf("release second resource: %v", err)
+	}
+	if _, err := os.Stat(second.home); !os.IsNotExist(err) {
+		t.Fatalf("second config survived release: %v", err)
+	}
+}
+
 func TestOpenCodeConfigBoundary_ParentSubstitutionFailurePersists(t *testing.T) {
 	boundary, err := newOpenCodeConfigBoundary(t.TempDir(), agent.Spec{})
 	if err != nil {
