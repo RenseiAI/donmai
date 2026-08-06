@@ -1,7 +1,12 @@
 package agycli
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -38,15 +43,127 @@ func TestPromptAdaptation_RequiredSystemDeniedWithoutAuthority(t *testing.T) {
 	}
 }
 
-func TestPromptAdaptation_ResultEnvelopeDetectionUsesTypedAmendments(t *testing.T) {
+func TestSpawn_ResultEnvelopeIsHarnessOwned(t *testing.T) {
 	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		plan func() agent.PromptPlan
+	}{
+		{
+			name: "user prompt marker",
+			plan: func() agent.PromptPlan {
+				plan := agyPromptPlan(true)
+				plan.UserPrompt.Text = "caller text " + resultEnvelopeBegin + " must not opt out"
+				return plan
+			},
+		},
+		{
+			name: "user amendment marker",
+			plan: func() agent.PromptPlan {
+				plan := agyPromptPlan(true)
+				plan.UserAmendments = append(plan.UserAmendments, agent.UserPromptAmendment{
+					ID: "caller-marker", Position: agent.UserPromptAppend,
+					Content: agent.PromptContent{ID: "caller-marker-content", Text: resultEnvelopeBegin + " caller data", Required: true},
+				})
+				return plan
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			capture := filepath.Join(t.TempDir(), "prompt.txt")
+			plan := tc.plan()
+			p := newFakeProvider(t, fmt.Sprintf(`printf '%%s' "$2" > %q
+echo '<<<DONMAI_RESULT>>>'
+echo '{"status":"passed","summary":"done"}'
+echo '<<<END_DONMAI_RESULT>>>'
+`, capture), Options{DisableTranscriptEnrichment: true})
+
+			var receipt agent.PromptDeliveryReceipt
+			h, err := spawnFake(context.Background(), t, p, agent.Spec{
+				PromptPlan: &plan,
+				Cwd:        t.TempDir(),
+				OnPromptAdapted: func(got agent.PromptDeliveryReceipt) error {
+					receipt = got
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			defer func() { _ = h.Stop(context.Background()) }()
+			_ = collectEvents(t, h)
+
+			prompt, err := os.ReadFile(capture)
+			if err != nil {
+				t.Fatalf("read captured prompt: %v", err)
+			}
+			if got := strings.Count(string(prompt), strings.TrimSpace(resultEnvelopeInstruction)); got != 1 {
+				t.Fatalf("harness-owned envelope instruction count = %d, want 1; prompt=%q", got, prompt)
+			}
+			entries := 0
+			for _, entry := range receipt.Entries {
+				if entry.ID != "agy-result-envelope" {
+					continue
+				}
+				entries++
+				if entry.Channel != agent.PromptChannelUserAmendment || entry.Outcome != agent.PromptOutcomeDelivered {
+					t.Fatalf("envelope receipt = %#v, want delivered user amendment", entry)
+				}
+			}
+			if entries != 1 {
+				t.Fatalf("harness-owned envelope receipt entries = %d, want 1; receipt=%#v", entries, receipt)
+			}
+		})
+	}
+}
+
+func TestSpawn_ResultEnvelopeDuplicateTypedIDFailsClosed(t *testing.T) {
+	t.Parallel()
+	p := newFakeProvider(t, "exit 99\n", Options{DisableTranscriptEnrichment: true})
 	plan := agyPromptPlan(true)
 	plan.UserAmendments = append(plan.UserAmendments, agent.UserPromptAmendment{
-		ID: "existing-envelope", Position: agent.UserPromptAppend,
-		Content: agent.PromptContent{ID: "existing-envelope-content", Text: resultEnvelopeInstruction, Required: true},
+		ID: "agy-result-envelope", Position: agent.UserPromptAppend,
+		Content: agent.PromptContent{ID: "caller-owned-envelope", Text: "caller text", Required: true},
 	})
-	if !planContainsResultEnvelope(plan) {
-		t.Fatal("typed result-envelope amendment was not detected")
+	_, err := spawnFake(context.Background(), t, p, agent.Spec{PromptPlan: &plan, Cwd: t.TempDir()})
+	if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
+		t.Fatalf("Spawn error = %v, want malformed prompt plan denial", err)
+	}
+}
+
+func TestSpawn_DisableResultEnvelopePreservesOptOut(t *testing.T) {
+	t.Parallel()
+	capture := filepath.Join(t.TempDir(), "prompt.txt")
+	p := newFakeProvider(t, fmt.Sprintf(`printf '%%s' "$2" > %q
+echo done
+`, capture), Options{DisableResultEnvelope: true, DisableTranscriptEnrichment: true})
+	var receipt agent.PromptDeliveryReceipt
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{
+		Prompt: "task",
+		Cwd:    t.TempDir(),
+		OnPromptAdapted: func(got agent.PromptDeliveryReceipt) error {
+			receipt = got
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	_ = collectEvents(t, h)
+	prompt, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatalf("read captured prompt: %v", err)
+	}
+	if strings.Contains(string(prompt), strings.TrimSpace(resultEnvelopeInstruction)) {
+		t.Fatalf("DisableResultEnvelope still injected provider instruction: %q", prompt)
+	}
+	for _, entry := range receipt.Entries {
+		if entry.ID == "agy-result-envelope" {
+			t.Fatalf("DisableResultEnvelope produced envelope receipt: %#v", receipt)
+		}
 	}
 }
 

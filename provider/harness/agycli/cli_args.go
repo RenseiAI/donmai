@@ -1,8 +1,6 @@
 package agycli
 
 import (
-	"strings"
-
 	"github.com/RenseiAI/donmai/agent"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
@@ -63,14 +61,10 @@ func buildArgs(spec agent.Spec, injectEnvelope bool) []string {
 }
 
 // buildPrompt returns the prompt to hand to `agy -p`, optionally appending the
-// result-envelope instruction. A prompt that already contains the begin marker
-// is returned unchanged (idempotent — avoids double-injection if the platform
-// template already asks for the envelope).
+// result-envelope instruction. The envelope is harness-owned: caller text that
+// happens to contain its marker is data, never an opt-out of injection.
 func buildPrompt(prompt string, injectEnvelope bool) string {
 	if !injectEnvelope {
-		return prompt
-	}
-	if strings.Contains(prompt, resultEnvelopeBegin) {
 		return prompt
 	}
 	return prompt + resultEnvelopeInstruction

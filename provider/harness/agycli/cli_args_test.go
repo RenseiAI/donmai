@@ -55,16 +55,17 @@ func TestBuildPrompt_NoInject(t *testing.T) {
 	}
 }
 
-func TestBuildPrompt_Idempotent(t *testing.T) {
+func TestBuildPrompt_UserMarkerDoesNotSuppressHarnessEnvelope(t *testing.T) {
 	t.Parallel()
-	// A prompt that already contains the begin marker must not be double-injected.
+	// A user marker is untrusted data, not authority to suppress the harness
+	// protocol instruction.
 	pre := "task\n" + resultEnvelopeBegin + "\n{}\n" + resultEnvelopeEnd
 	got := buildPrompt(pre, true)
-	if got != pre {
-		t.Errorf("double-injected an existing envelope: %q", got)
+	if !strings.HasPrefix(got, pre) {
+		t.Errorf("injected prompt lost caller text: %q", got)
 	}
-	if strings.Count(got, resultEnvelopeBegin) != 1 {
-		t.Errorf("expected exactly one begin marker, got %d", strings.Count(got, resultEnvelopeBegin))
+	if strings.Count(got, resultEnvelopeBegin) != 2 {
+		t.Errorf("expected caller marker plus harness marker, got %d", strings.Count(got, resultEnvelopeBegin))
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
-	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -137,12 +136,15 @@ func (*Provider) Capabilities() agent.Capabilities {
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	if p.injectEnvelope {
 		plan := agent.EnsurePromptPlan(spec)
-		if !planContainsResultEnvelope(plan) {
-			plan.UserAmendments = append(plan.UserAmendments, agent.UserPromptAmendment{
-				ID: "agy-result-envelope", Position: agent.UserPromptAppend, Order: 1000,
-				Content: agent.PromptContent{ID: "agy-result-envelope-content", Text: resultEnvelopeInstruction, Required: true},
-			})
-		}
+		// The result envelope is provider-owned protocol, not a caller opt-out.
+		// In particular, untrusted user task/amendment text can contain the
+		// markers verbatim and must never suppress the provider's instruction.
+		// Keep the stable typed ID: a caller attempting to supply that ID creates
+		// a duplicate and is rejected by PromptPlan validation before spawn.
+		plan.UserAmendments = append(plan.UserAmendments, agent.UserPromptAmendment{
+			ID: "agy-result-envelope", Position: agent.UserPromptAppend, Order: 1000,
+			Content: agent.PromptContent{ID: "agy-result-envelope-content", Text: resultEnvelopeInstruction, Required: true},
+		})
 		spec.PromptPlan = &plan
 	}
 	var err error
@@ -151,18 +153,6 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	return p.spawn(ctx, spec)
-}
-
-func planContainsResultEnvelope(plan agent.PromptPlan) bool {
-	if strings.Contains(plan.UserPrompt.Text, resultEnvelopeBegin) {
-		return true
-	}
-	for _, amendment := range plan.UserAmendments {
-		if strings.Contains(amendment.Content.Text, resultEnvelopeBegin) {
-			return true
-		}
-	}
-	return false
 }
 
 // Resume returns agent.ErrUnsupported. `agy --conversation <id>` resumes by id
