@@ -87,6 +87,7 @@ type HarnessManifest struct {
 	ContractABI    string                  `json:"contractAbi"` // "harness/v2"
 	Caps           HarnessCaps             `json:"capabilities"`
 	PromptDelivery []PromptDeliveryProfile `json:"promptDelivery"`
+	ToolLifecycle  []ToolLifecycleProfile  `json:"toolLifecycle"`
 }
 
 // Base projects the harness manifest onto the family-agnostic ProviderBase

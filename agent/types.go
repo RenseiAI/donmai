@@ -483,6 +483,24 @@ type Spec struct {
 	// provider starts a process or delivers prompt bytes. Returning an error
 	// fails closed, allowing the runner to require durable receipt storage.
 	OnPromptAdapted func(PromptDeliveryReceipt) error `json:"-"`
+
+	// ToolLifecyclePlan carries explicit tool-plugin, hook, lifecycle, replay,
+	// and cleanup requirements that are not expressible through the legacy
+	// Spec fields above. Non-empty AllowedTools, DisallowedTools,
+	// PermissionConfig, MCPServers, and MCPToolNames are always required inputs
+	// even when this plan is nil; the exact harness adapter must apply or deny
+	// them before spawn.
+	ToolLifecyclePlan *ToolLifecyclePlan `json:"toolLifecyclePlan,omitempty"`
+
+	// ToolLifecycleReceipt is the immutable, digest-only result of pre-spawn
+	// tool/MCP/lifecycle admission. Runtime and cleanup requirements are denied
+	// until a durable runtime-evidence promotion path can prove them; it is
+	// never sent over the legacy spawn wire.
+	ToolLifecycleReceipt *ToolLifecycleReceipt `json:"-"`
+
+	// OnToolLifecycleAdapted observes both ready and denied receipts before
+	// credential delivery or process spawn. Returning an error fails closed.
+	OnToolLifecycleAdapted func(ToolLifecycleReceipt) error `json:"-"`
 }
 
 // CostData mirrors AgentCostData from the legacy TS providers/types.ts.

@@ -301,8 +301,8 @@ func (*Provider) Capabilities() agent.Capabilities {
 		EmitsSubagentEvents:                 false,
 		SupportsReasoningEffort:             true, // --variant flag maps to effort levels
 		ToolPermissionFormat:                "claude",
-		AcceptsAllowedToolsList:             true,  // Lane B: projected into opencode.json permission map (07 §5.2)
-		AcceptsMcpServerSpec:                false, // §5.3 MCP injection is implemented (config.go) but the cap waits on the AcceptsMcpServerSpec→SupportsToolPlugins invariant (manifest.go)
+		AcceptsAllowedToolsList:             true, // Lane B: projected into opencode.json permission map (07 §5.2)
+		AcceptsMcpServerSpec:                true, // §5.3 per-session project MCP config is independent of OpenCode plugin support.
 		HumanLabel:                          "OpenCode",
 	}
 }
@@ -324,7 +324,7 @@ func (*Provider) Capabilities() agent.Capabilities {
 // agent.ErrSpawnFailed.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	var err error
-	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
@@ -623,7 +623,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 		return nil, fmt.Errorf("provider/opencode: Resume: empty session id: %w", agent.ErrUnsupported)
 	}
 	var err error
-	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}

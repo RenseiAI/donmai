@@ -61,10 +61,13 @@ func TestSpecFieldCoverage(t *testing.T) {
 		"CodeIntelEnforcement",
 		"ProviderConfig",
 		"SubAgentProvider",
-		"OnProcessSpawned", // documented as honored at spawn time
-		"PromptPlan",       // consumed by agent.PreparePrompt before NewSpawnPlan
-		"PromptReceipt",    // populated by agent.PreparePrompt; not a JSON-RPC param
-		"OnPromptAdapted",  // invoked by agent.PreparePrompt before NewSpawnPlan
+		"OnProcessSpawned",       // documented as honored at spawn time
+		"PromptPlan",             // consumed by agent.PreparePrompt before NewSpawnPlan
+		"PromptReceipt",          // populated by agent.PreparePrompt; not a JSON-RPC param
+		"OnPromptAdapted",        // invoked by agent.PreparePrompt before NewSpawnPlan
+		"ToolLifecyclePlan",      // consumed by agent.PrepareHarness before NewSpawnPlan
+		"ToolLifecycleReceipt",   // populated by agent.PrepareHarness; not a JSON-RPC param
+		"OnToolLifecycleAdapted", // invoked before provider side effects
 		// Endpoint is the additive two-axis model-endpoint binding. The claude
 		// and gemini harnesses read it (serving-host env knobs / URL routing);
 		// codex takes its cardinal-rule-10 position here: Endpoint is

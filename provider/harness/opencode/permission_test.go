@@ -62,6 +62,14 @@ func TestPermEngine_NilConfigAutoApproves(t *testing.T) {
 	}
 }
 
+func TestPermEngine_UnknownActionFailsClosedWithPolicy(t *testing.T) {
+	t.Parallel()
+	e := newPermEngine(agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "allow"}})
+	if got := e.Evaluate(permReq("future-tool", "opaque")).Reply; got != replyReject {
+		t.Errorf("unknown policy action → %q, want reject", got)
+	}
+}
+
 func TestPermEngine_FileContainment(t *testing.T) {
 	t.Parallel()
 	e := newPermEngine(agent.Spec{Cwd: "/work/tree"})

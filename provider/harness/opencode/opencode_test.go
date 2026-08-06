@@ -222,11 +222,8 @@ func TestProvider_Capabilities(t *testing.T) {
 	if !caps.AcceptsAllowedToolsList {
 		t.Error("AcceptsAllowedToolsList: want true (Lane B opencode.json permission map)")
 	}
-	// AcceptsMcpServerSpec stays false: the §5.3 MCP config injection is
-	// implemented, but the cap advertisement waits on the cross-provider
-	// AcceptsMcpServerSpec→SupportsToolPlugins invariant (see manifest.go).
-	if caps.AcceptsMcpServerSpec {
-		t.Error("AcceptsMcpServerSpec: want false (cap deferred; see manifest.go drift note)")
+	if !caps.AcceptsMcpServerSpec {
+		t.Error("AcceptsMcpServerSpec: want true (per-session project MCP config)")
 	}
 	// SupportsReasoningEffort: true — mapped to --variant.
 	if !caps.SupportsReasoningEffort {

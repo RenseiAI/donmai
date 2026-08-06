@@ -23,6 +23,7 @@ type HarnessRow struct {
 	Drives         []agent.WireProtocol          `json:"drives"`
 	DrivesHosts    []agent.ServingHost           `json:"drivesHosts"`
 	PromptDelivery []agent.PromptDeliveryProfile `json:"promptDelivery"`
+	ToolLifecycle  []agent.ToolLifecycleProfile  `json:"toolLifecycle"`
 }
 
 // EndpointRow is one model-endpoint company in the generated endpoints[].
@@ -166,6 +167,7 @@ func buildHarnesses() ([]HarnessRow, map[agent.HarnessName]HarnessRow, error) {
 				Drives:         dedupProtocols(mf.Caps.Drives),
 				DrivesHosts:    dedupHosts(mf.Caps.DrivesHosts),
 				PromptDelivery: append([]agent.PromptDeliveryProfile(nil), mf.PromptDelivery...),
+				ToolLifecycle:  append([]agent.ToolLifecycleProfile(nil), mf.ToolLifecycle...),
 			}
 			byName[mf.Name] = &r
 			continue
@@ -177,6 +179,7 @@ func buildHarnesses() ([]HarnessRow, map[agent.HarnessName]HarnessRow, error) {
 		row.Caps.DrivesHosts = row.DrivesHosts
 		row.Caps = unionCaps(row.Caps, mf.Caps)
 		row.PromptDelivery = mergePromptDelivery(row.PromptDelivery, mf.PromptDelivery)
+		row.ToolLifecycle = mergeToolLifecycle(row.ToolLifecycle, mf.ToolLifecycle)
 	}
 
 	rows := make([]HarnessRow, 0, len(byName))
@@ -186,6 +189,7 @@ func buildHarnesses() ([]HarnessRow, map[agent.HarnessName]HarnessRow, error) {
 		r.Caps.Drives = r.Drives
 		r.Caps.DrivesHosts = r.DrivesHosts
 		sort.Slice(r.PromptDelivery, func(i, j int) bool { return r.PromptDelivery[i].ID < r.PromptDelivery[j].ID })
+		sort.Slice(r.ToolLifecycle, func(i, j int) bool { return r.ToolLifecycle[i].ID < r.ToolLifecycle[j].ID })
 		rows = append(rows, *r)
 		out[r.Name] = *r
 	}
@@ -195,6 +199,21 @@ func buildHarnesses() ([]HarnessRow, map[agent.HarnessName]HarnessRow, error) {
 
 func mergePromptDelivery(existing, incoming []agent.PromptDeliveryProfile) []agent.PromptDeliveryProfile {
 	out := append([]agent.PromptDeliveryProfile(nil), existing...)
+	seen := make(map[string]bool, len(out))
+	for _, profile := range out {
+		seen[profile.ID] = true
+	}
+	for _, profile := range incoming {
+		if !seen[profile.ID] {
+			out = append(out, profile)
+			seen[profile.ID] = true
+		}
+	}
+	return out
+}
+
+func mergeToolLifecycle(existing, incoming []agent.ToolLifecycleProfile) []agent.ToolLifecycleProfile {
+	out := append([]agent.ToolLifecycleProfile(nil), existing...)
 	seen := make(map[string]bool, len(out))
 	for _, profile := range out {
 		seen[profile.ID] = true

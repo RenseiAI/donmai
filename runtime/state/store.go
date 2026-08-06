@@ -81,6 +81,23 @@ type State struct {
 	// The runner persists it before the provider may start a process or send
 	// prompt bytes; a persistence failure denies spawn.
 	PromptReceipt *agent.PromptDeliveryReceipt `json:"promptAdaptationReceipt,omitempty"`
+
+	// ToolLifecycleReceipt is the current digest-only tool/lifecycle admission
+	// projection. ToolLifecycleReceiptHistory is its append-only audit trail;
+	// both ready and denied decisions are persisted before provider side effects.
+	ToolLifecycleReceipt        *agent.ToolLifecycleReceipt  `json:"toolLifecycleAdaptationReceipt,omitempty"`
+	ToolLifecycleReceiptHistory []agent.ToolLifecycleReceipt `json:"toolLifecycleAdaptationReceiptHistory,omitempty"`
+}
+
+// AppendToolLifecycleReceipt appends a digest-only admission decision and
+// replaces the current projection with an independent copy. Existing history
+// loaded from state.json is never rewritten or discarded.
+func (s *State) AppendToolLifecycleReceipt(receipt agent.ToolLifecycleReceipt) {
+	receipt.Entries = append([]agent.ToolLifecycleEntry(nil), receipt.Entries...)
+	s.ToolLifecycleReceiptHistory = append(s.ToolLifecycleReceiptHistory, receipt)
+	current := receipt
+	current.Entries = append([]agent.ToolLifecycleEntry(nil), receipt.Entries...)
+	s.ToolLifecycleReceipt = &current
 }
 
 // Sentinel errors. Callers may type-check these via errors.Is.

@@ -14,6 +14,7 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // package contributes the ollama drive over HostLocal, direct-api transport,
 // ndjson streaming, and whole-response native JSON mode (format:"json").
 func (*Provider) Manifest() agent.HarnessManifest {
+	events := []agent.EventKind{agent.EventInit, agent.EventAssistantText, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessRaw,
 		HumanLabel:  "Ollama (local)",
@@ -40,6 +41,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			SystemDelivery: agent.PromptDeliveryOllamaSystemMessage, BaseAppendDelivery: agent.PromptDeliveryOllamaSystemMessage,
 			BaseReplaceDelivery: agent.PromptDeliveryOllamaSystemMessage, ContextDelivery: agent.PromptDeliveryOllamaSystemMessage,
 			UserDelivery: agent.PromptDeliveryOllamaUserMessage, AmendmentDelivery: agent.PromptDeliveryOllamaUserMessage,
+		}},
+		ToolLifecycle: []agent.ToolLifecycleProfile{{
+			ID: "raw/ollama-chat/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+			ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
+			NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+			MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+			LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: events,
+			ReplayDelivery: agent.ToolDeliveryStructuredEventReplay, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: events,
+			CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
 		}},
 	}
 }

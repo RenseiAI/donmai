@@ -218,7 +218,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return SpawnInteractive(ctx, p.opts, spec)
 	}
 	var err error
-	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
@@ -250,7 +250,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // Resume implements agent.Provider.
 func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
 	var err error
-	spec, err = agent.PreparePrompt(spec, p.Manifest())
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}

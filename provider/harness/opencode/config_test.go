@@ -116,9 +116,10 @@ func TestProjectPermissions_ClaudeGrammar(t *testing.T) {
 	if bash["git push*"] != "deny" {
 		t.Errorf("bash[git push*] = %q, want deny", bash["git push*"])
 	}
-	// DefaultDecision deny → bash catch-all deny.
-	if bash["*"] != "deny" {
-		t.Errorf("bash[*] = %q, want deny (default decision)", bash["*"])
+	// Structured regex policy is enforced by the permission pump, so unknown
+	// commands must reach it instead of being decided by the static map.
+	if bash["*"] != "ask" {
+		t.Errorf("bash[*] = %q, want ask (permission-pump boundary)", bash["*"])
 	}
 }
 
@@ -134,21 +135,40 @@ func TestProjectPermissions_DenyWinsOverAllow(t *testing.T) {
 	}
 }
 
-func TestProjectMCP_WhitelistOnly(t *testing.T) {
+func TestProjectPermissions_MCPToolNamesUseOpenCodeKeys(t *testing.T) {
+	t.Parallel()
+	spec := agent.Spec{
+		MCPToolNames: []string{"mcp__af-code-intelligence__af_code_search"},
+		MCPServers:   []agent.MCPServerConfig{{Name: "af-code-intelligence", Command: "donmai"}},
+	}
+	perm := projectPermissions(spec)
+	if perm["*"] != "deny" {
+		t.Fatalf("default permission = %v, want deny for an explicit allowlist", perm["*"])
+	}
+	if got := perm["af-code-intelligence_af_code_search"]; got != "allow" {
+		t.Errorf("MCP tool permission = %v, want allow", got)
+	}
+	if _, broad := perm["af-code-intelligence_*"]; broad {
+		t.Error("exact MCP tool allowlist unexpectedly admitted the whole server")
+	}
+}
+
+func TestProjectMCP_LocalAndPlatformRemote(t *testing.T) {
 	t.Parallel()
 	// No MCP servers → no mcp key at all (§5.3).
 	if got := projectMCP(agent.Spec{}); got != nil {
 		t.Errorf("projectMCP(empty) = %v, want nil", got)
 	}
-	// http-transport and command-less entries are skipped (local stdio only).
+	// Both code-intel/card stdio servers and the platform A2A HTTP gate are
+	// represented in the session-scoped project config.
 	spec := agent.Spec{MCPServers: []agent.MCPServerConfig{
 		{Name: "code", Command: "donmai", Args: []string{"mcp", "code"}, Env: map[string]string{"X": "1"}},
-		{Name: "remote", Type: "http", URL: "https://x/mcp"},
+		{Name: "platform", Type: "http", URL: "https://platform.example/api/mcp/session", Headers: map[string]string{"Authorization": "Bearer session"}},
 		{Name: "bad"}, // no command
 	}}
 	mcp := projectMCP(spec)
-	if len(mcp) != 1 {
-		t.Fatalf("mcp = %v, want exactly one (the local stdio entry)", mcp)
+	if len(mcp) != 2 {
+		t.Fatalf("mcp = %v, want local code-intel and remote platform entries", mcp)
 	}
 	code, ok := mcp["code"]
 	if !ok {
@@ -159,6 +179,13 @@ func TestProjectMCP_WhitelistOnly(t *testing.T) {
 	}
 	if !code.Enabled || code.Environment["X"] != "1" {
 		t.Errorf("mcp code entry env/enabled wrong: %+v", code)
+	}
+	remote, ok := mcp["platform"]
+	if !ok {
+		t.Fatalf("mcp missing platform remote entry: %v", mcp)
+	}
+	if remote.Type != "remote" || remote.URL != "https://platform.example/api/mcp/session" || remote.Headers["Authorization"] != "Bearer session" || remote.OAuth == nil || *remote.OAuth {
+		t.Errorf("mcp remote entry malformed: %+v", remote)
 	}
 }
 

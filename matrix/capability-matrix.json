@@ -46,6 +46,47 @@
           "userDelivery": "amp_stdin",
           "amendmentDelivery": "amp_stdin"
         }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "amp/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "amp_cli_mcp_config",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
       ]
     },
     {
@@ -90,6 +131,34 @@
           "contextDelivery": "unsupported",
           "userDelivery": "agy_prompt_flag",
           "amendmentDelivery": "agy_prompt_flag"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "antigravity/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "assistant_text",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "unsupported",
+          "replayFidelity": "unsupported",
+          "replayEvents": null,
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
         }
       ]
     },
@@ -152,6 +221,76 @@
           "userDelivery": "claude_cli_pty_seed",
           "amendmentDelivery": "claude_cli_pty_seed"
         }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "claude-code/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "claude_cli_mcp_config",
+          "nativeToolPolicyDelivery": "claude_cli_allow_deny",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "claude_cli_allow_deny",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
+        {
+          "id": "claude-code/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "claude_cli_mcp_config",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
       ]
     },
     {
@@ -213,6 +352,74 @@
           "userDelivery": "codex_cli_pty_seed",
           "amendmentDelivery": "codex_cli_pty_seed"
         }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "codex/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "codex_app_server_mcp",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "codex_approval_bridge",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
+        {
+          "id": "codex/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "codex_cli_mcp_config",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
       ]
     },
     {
@@ -224,7 +431,7 @@
         "inject": true,
         "resume": true,
         "tools": false,
-        "mcp": false,
+        "mcp": true,
         "allowedToolsList": true,
         "subagents": false,
         "reasoningEffort": true,
@@ -263,6 +470,45 @@
           "contextDelivery": "unsupported",
           "userDelivery": "opencode_prompt",
           "amendmentDelivery": "opencode_prompt"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "opencode/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "opencode_project_mcp_config",
+          "nativeToolPolicyDelivery": "opencode_permission_map",
+          "permissionConfigDelivery": "opencode_permission_map",
+          "mcpToolPolicyDelivery": "opencode_permission_map",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
         }
       ]
     },
@@ -320,6 +566,47 @@
           "contextDelivery": "pi_cli_append_system_prompt",
           "userDelivery": "pi_rpc_prompt",
           "amendmentDelivery": "pi_rpc_prompt"
+        }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "pi/headless/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "pi_handshake_policy_extension",
+          "permissionConfigDelivery": "pi_handshake_policy_extension",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
         }
       ]
     },
@@ -382,6 +669,72 @@
           "userDelivery": "ollama_user_message",
           "amendmentDelivery": "ollama_user_message"
         }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "raw/gemini-generate/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "gemini_in_box_mcp_bridge",
+          "nativeToolPolicyDelivery": "gemini_in_box_native_boundary",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "gemini_in_box_native_boundary",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
+        {
+          "id": "raw/ollama-chat/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "structured_provider_events",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "assistant_text",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "structured_event_replay",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "assistant_text",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
       ]
     },
     {
@@ -419,6 +772,37 @@
           "userDelivery": "shell_pty_seed",
           "amendmentDelivery": "shell_pty_seed"
         }
+      ],
+      "toolLifecycle": [
+        {
+          "id": "shell/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
       ]
     },
     {
@@ -453,7 +837,48 @@
       "drivesHosts": [
         "local"
       ],
-      "promptDelivery": null
+      "promptDelivery": null,
+      "toolLifecycle": [
+        {
+          "id": "stub/tool-lifecycle-v1",
+          "mode": "autonomous",
+          "toolPluginDelivery": "stub_oracle",
+          "mcpDelivery": "stub_oracle",
+          "nativeToolPolicyDelivery": "stub_oracle",
+          "permissionConfigDelivery": "stub_oracle",
+          "mcpToolPolicyDelivery": "stub_oracle",
+          "toolHookDelivery": "stub_oracle",
+          "lifecycleDelivery": "stub_oracle",
+          "lifecycleFidelity": "structured",
+          "lifecycleEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "replayDelivery": "stub_oracle",
+          "replayFidelity": "structured",
+          "replayEvents": [
+            "init",
+            "system",
+            "assistant_text",
+            "llm_call",
+            "tool_use",
+            "tool_result",
+            "tool_progress",
+            "result",
+            "error"
+          ],
+          "cleanupDelivery": "stub_oracle",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        }
+      ]
     }
   ],
   "endpoints": [

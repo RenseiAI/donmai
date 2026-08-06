@@ -530,6 +530,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64) (*
 		})
 		return err
 	}
+	spec.OnToolLifecycleAdapted = func(receipt agent.ToolLifecycleReceipt) error {
+		_, err := r.store.Update(wpath, func(s *state.State) error {
+			s.AppendToolLifecycleReceipt(receipt)
+			return nil
+		})
+		return err
+	}
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.

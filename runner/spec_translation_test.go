@@ -1,11 +1,8 @@
 package runner
 
 import (
-	"bytes"
-	"log/slog"
 	"maps"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -156,12 +153,10 @@ func TestTranslateSpec_ToolUse_Honored(t *testing.T) {
 	}
 }
 
-// TestTranslateSpec_ToolUse_Stripped_NoMCP verifies that MCPServers is
-// silently dropped when the provider does not advertise
-// SupportsToolPlugins OR AcceptsMcpServerSpec — either gate trips the
-// strip. AllowedTools is independently gated on
-// AcceptsAllowedToolsList.
-func TestTranslateSpec_ToolUse_Stripped(t *testing.T) {
+// TestTranslateSpec_ToolUse_RetainedForExactAdapter verifies unsupported
+// requirements survive translation so the exact harness adapter can reject
+// them before spawn. Capability booleans never authorize stripping.
+func TestTranslateSpec_ToolUse_RetainedForExactAdapter(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name           string
@@ -176,8 +171,8 @@ func TestTranslateSpec_ToolUse_Stripped(t *testing.T) {
 				AcceptsAllowedToolsList: false,
 				AcceptsMcpServerSpec:    false,
 			},
-			wantAllowed:    false,
-			wantMCPServers: false,
+			wantAllowed:    true,
+			wantMCPServers: true,
 		},
 		{
 			name: "tools-supported-but-mcp-shape-not-accepted",
@@ -187,7 +182,7 @@ func TestTranslateSpec_ToolUse_Stripped(t *testing.T) {
 				AcceptsMcpServerSpec:    false,
 			},
 			wantAllowed:    true,
-			wantMCPServers: false,
+			wantMCPServers: true,
 		},
 		{
 			name: "mcp-shape-accepted-but-allowed-not",
@@ -196,7 +191,7 @@ func TestTranslateSpec_ToolUse_Stripped(t *testing.T) {
 				AcceptsAllowedToolsList: false,
 				AcceptsMcpServerSpec:    true,
 			},
-			wantAllowed:    false,
+			wantAllowed:    true,
 			wantMCPServers: true,
 		},
 	}
@@ -281,6 +276,9 @@ func TestTranslateSpec_Codex_RoutesAllowedToolsToPermissionConfig(t *testing.T) 
 	if spec.PermissionConfig == nil {
 		t.Fatal("PermissionConfig must be set for codex when the card supplies an allowlist")
 	}
+	if spec.DisallowedTools != nil {
+		t.Errorf("DisallowedTools must be zeroed for codex (routed to PermissionConfig); got %v", spec.DisallowedTools)
+	}
 	for _, want := range card {
 		if !slices.Contains(spec.PermissionConfig.AllowPatterns, want) {
 			t.Errorf("AllowPatterns missing %q; got %v", want, spec.PermissionConfig.AllowPatterns)
@@ -294,55 +292,36 @@ func TestTranslateSpec_Codex_RoutesAllowedToolsToPermissionConfig(t *testing.T) 
 	}
 }
 
-// TestTranslateSpec_AmpAgyCli_WarnAndDrop verifies that for providers that
-// accept neither a flat allowlist NOR a PermissionConfig (amp / agy-cli), the
-// card's AllowedTools are dropped — but the previously-silent zero is now a
-// structured WARN naming the dropped field + provider.
-func TestTranslateSpec_AmpAgyCli_WarnAndDrop(t *testing.T) {
+// TestTranslateSpec_AmpAgyCli_RetainsUnsupportedPolicy verifies a requested
+// policy is preserved for the exact adapter's typed pre-spawn denial.
+func TestTranslateSpec_AmpAgyCli_RetainsUnsupportedPolicy(t *testing.T) {
 	t.Parallel()
 	for _, provider := range []string{"amp", "agy-cli"} {
 		t.Run(provider, func(t *testing.T) {
 			t.Parallel()
-			var buf bytes.Buffer
-			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 			caps := agent.Capabilities{
 				NeedsPermissionConfig:   false,
 				AcceptsAllowedToolsList: false,
 			}
 			qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Bash(cargo:*)"}}}
-			spec := translateSpec(qw, caps, SpecInputs{
-				Cwd:          "/tmp/wt",
-				Prompt:       "do",
-				Logger:       logger,
-				ProviderName: provider,
-			})
-			if spec.AllowedTools != nil {
-				t.Errorf("AllowedTools must be dropped for %s; got %v", provider, spec.AllowedTools)
+			spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do", ProviderName: provider})
+			if !slices.Equal(spec.AllowedTools, []string{"Bash(cargo:*)"}) {
+				t.Errorf("AllowedTools must remain for %s adapter denial; got %v", provider, spec.AllowedTools)
 			}
 			if spec.PermissionConfig != nil {
 				t.Errorf("%s must NOT get a PermissionConfig; got %+v", provider, spec.PermissionConfig)
-			}
-			logs := buf.String()
-			if !strings.Contains(logs, "dropping the agent card's AllowedTools") {
-				t.Errorf("expected WARN about dropped AllowedTools; got logs:\n%s", logs)
-			}
-			if !strings.Contains(logs, provider) {
-				t.Errorf("WARN must name the provider %q; got logs:\n%s", provider, logs)
 			}
 		})
 	}
 }
 
-// TestTranslateSpec_AllowedToolsDrop_NoWarnWhenNoLogger verifies the WARN path
-// is nil-safe: with no logger and no card allowlist, the drop is silent and no
-// panic occurs.
-func TestTranslateSpec_AllowedToolsDrop_NoWarnWhenNoLogger(t *testing.T) {
+func TestTranslateSpec_UnsupportedAllowedToolsRemainWithoutLogger(t *testing.T) {
 	t.Parallel()
 	caps := agent.Capabilities{NeedsPermissionConfig: false, AcceptsAllowedToolsList: false}
 	qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Edit"}}}
 	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt", Prompt: "do"})
-	if spec.AllowedTools != nil {
-		t.Errorf("AllowedTools must be dropped; got %v", spec.AllowedTools)
+	if !slices.Equal(spec.AllowedTools, []string{"Edit"}) {
+		t.Errorf("AllowedTools must remain for adapter denial; got %v", spec.AllowedTools)
 	}
 }
 
@@ -412,19 +391,17 @@ func TestTranslateSpec_CodeIntelMCPToolNames_NilBlockEmpty(t *testing.T) {
 	}
 }
 
-// TestTranslateSpec_CodeIntelMCPToolNames_NonMCPProviderEmpty verifies that a
-// provider that ignores MCP specs (ollama/opencode/agycli shape:
-// SupportsToolPlugins=false) never gets the FQ allow-list — the gate matches
-// the Spec.MCPServers forwarding gate.
-func TestTranslateSpec_CodeIntelMCPToolNames_NonMCPProviderEmpty(t *testing.T) {
+// TestTranslateSpec_CodeIntelMCPToolNames_NonMCPProviderRetained verifies the
+// required names survive to the exact adapter, which denies unsupported MCP.
+func TestTranslateSpec_CodeIntelMCPToolNames_NonMCPProviderRetained(t *testing.T) {
 	t.Parallel()
 	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
 		CodeIntel: &prompt.CodeIntelWork{Repo: "owner/repo"},
 	}}
 	caps := agent.Capabilities{SupportsToolPlugins: false, AcceptsMcpServerSpec: false}
 	spec := translateSpec(qw, caps, SpecInputs{Cwd: "/tmp/wt"})
-	if len(spec.MCPToolNames) != 0 {
-		t.Errorf("non-MCP provider MCPToolNames must be empty, got %v", spec.MCPToolNames)
+	if !slices.Equal(spec.MCPToolNames, wantCodeIntelFQ) {
+		t.Errorf("non-MCP provider must retain MCPToolNames for denial, got %v", spec.MCPToolNames)
 	}
 }
 

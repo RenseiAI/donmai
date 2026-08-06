@@ -11,6 +11,7 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // (host login channel) speaking the antigravity-oauth protocol; it brings its
 // own auth (host-session) and exposes no streaming framing or tool grammar.
 func (*Provider) Manifest() agent.HarnessManifest {
+	events := []agent.EventKind{agent.EventInit, agent.EventAssistantText, agent.EventToolUse, agent.EventToolResult, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessAntigravity,
 		HumanLabel:  "Antigravity",
@@ -37,6 +38,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			SystemDelivery: agent.PromptDeliveryUnsupported, BaseAppendDelivery: agent.PromptDeliveryUnsupported,
 			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryUnsupported,
 			UserDelivery: agent.PromptDeliveryAgyPromptFlag, AmendmentDelivery: agent.PromptDeliveryAgyPromptFlag,
+		}},
+		ToolLifecycle: []agent.ToolLifecycleProfile{{
+			ID: "antigravity/headless/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+			ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
+			NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+			MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+			LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: events,
+			ReplayDelivery: agent.ToolDeliveryUnsupported, ReplayFidelity: agent.EvidenceUnsupported,
+			CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
 		}},
 	}
 }

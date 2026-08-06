@@ -302,6 +302,39 @@ func TestParity_PromptDeliveryProfilesHarvested(t *testing.T) {
 	}
 }
 
+// TestParity_ToolLifecycleProfilesHarvested proves tool/MCP/policy/lifecycle
+// semantics are generated independently from the legacy capability booleans.
+func TestParity_ToolLifecycleProfilesHarvested(t *testing.T) {
+	built, err := Build()
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
+	got := make(map[agent.HarnessName]map[string]bool, len(built.Harnesses))
+	for _, row := range built.Harnesses {
+		got[row.Name] = make(map[string]bool, len(row.ToolLifecycle))
+		for _, profile := range row.ToolLifecycle {
+			if profile.ID == "" || profile.Mode == "" || profile.MCPDelivery == "" || profile.NativeToolPolicyDelivery == "" || profile.PermissionConfigDelivery == "" || profile.LifecycleDelivery == "" || profile.ReplayDelivery == "" || profile.CleanupDelivery == "" || profile.EvidenceTier == "" {
+				t.Errorf("harness %q has incomplete tool/lifecycle profile: %+v", row.Name, profile)
+			}
+			if got[row.Name][profile.ID] {
+				t.Errorf("harness %q has duplicate tool/lifecycle profile %q", row.Name, profile.ID)
+			}
+			got[row.Name][profile.ID] = true
+		}
+	}
+	for _, harvested := range HarnessHarvestList() {
+		manifest := harvested.Manifest()
+		if len(manifest.ToolLifecycle) == 0 {
+			t.Errorf("harness %q declares no tool/lifecycle profile", manifest.Name)
+		}
+		for _, profile := range manifest.ToolLifecycle {
+			if !got[manifest.Name][profile.ID] {
+				t.Errorf("generated harness %q omits tool/lifecycle profile %q", manifest.Name, profile.ID)
+			}
+		}
+	}
+}
+
 // TestParity_AliasCoverageCompleteness covers §6's alias-coverage obligation:
 // every real provider's ProviderName maps to a cell, and the platform-reserved
 // name (jules) is intentionally absent.

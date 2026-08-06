@@ -23,6 +23,8 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // agent/harness.go's HarnessCaps.SupportsInteractivePTY doc comment for the
 // general rule this and claude/manifest.go both follow.
 func (*Provider) Manifest() agent.HarnessManifest {
+	headlessEvents := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventResult, agent.EventError}
+	ptyEvents := []agent.EventKind{agent.EventInit, agent.EventResult}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessCodex,
 		HumanLabel:  "Codex",
@@ -57,6 +59,28 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				SystemDelivery: agent.PromptDeliveryCodexCLIInstructions, BaseAppendDelivery: agent.PromptDeliveryCodexCLIInstructions,
 				BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryCodexPTYSeed,
 				UserDelivery: agent.PromptDeliveryCodexPTYSeed, AmendmentDelivery: agent.PromptDeliveryCodexPTYSeed,
+			},
+		},
+		ToolLifecycle: []agent.ToolLifecycleProfile{
+			{
+				ID: "codex/headless/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryCodexAppServerMCP,
+				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryCodexApprovalBridge,
+				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+				LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: headlessEvents,
+				ReplayDelivery: agent.ToolDeliveryStructuredEventReplay, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: headlessEvents,
+				CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
+			},
+			{
+				ID: "codex/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
+				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryCodexCLIMCPConfig,
+				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+				LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
+				ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: ptyEvents,
+				CleanupDelivery:    agent.ToolDeliveryHandleCleanup,
+				FallbackDeliveries: []agent.ToolDeliveryKind{agent.ToolDeliveryCoarsePTYEvents, agent.ToolDeliveryTerminalCastReplay},
+				EvidenceTier:       "unit_verified",
 			},
 		},
 	}

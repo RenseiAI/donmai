@@ -56,6 +56,58 @@ func TestWriteReadRoundtrip(t *testing.T) {
 	}
 }
 
+func TestToolLifecycleReceiptProjectionAndHistorySurviveRestore(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	s := state.NewStore()
+	ready := agent.ToolLifecycleReceipt{
+		ContractVersion: agent.ToolLifecycleContractVersion,
+		ProfileID:       "test/profile-v1",
+		Decision:        "ready",
+		Entries: []agent.ToolLifecycleEntry{{
+			ID: "allowed-tools", Channel: agent.ToolChannelAllowedTools,
+			Outcome: agent.ToolOutcomeAdmitted,
+		}},
+	}
+	if _, err := s.Update(dir, func(st *state.State) error {
+		st.AppendToolLifecycleReceipt(ready)
+		return nil
+	}); err != nil {
+		t.Fatalf("append ready: %v", err)
+	}
+
+	// A distinct store forces the next append through the on-disk restore path.
+	denied := agent.ToolLifecycleReceipt{
+		ContractVersion: agent.ToolLifecycleContractVersion,
+		ProfileID:       "test/profile-v1",
+		Decision:        "denied",
+		Entries: []agent.ToolLifecycleEntry{{
+			ID: "allowed-tools", Channel: agent.ToolChannelAllowedTools,
+			Outcome: agent.ToolOutcomeDenied, DenialCode: agent.ToolDenialDeliveryUnsupported,
+		}},
+	}
+	if _, err := state.NewStore().Update(dir, func(st *state.State) error {
+		st.AppendToolLifecycleReceipt(denied)
+		return nil
+	}); err != nil {
+		t.Fatalf("append denied after restore: %v", err)
+	}
+
+	got, err := state.NewStore().Read(dir)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got.ToolLifecycleReceipt == nil || got.ToolLifecycleReceipt.Decision != "denied" {
+		t.Fatalf("current projection = %+v, want denied", got.ToolLifecycleReceipt)
+	}
+	if len(got.ToolLifecycleReceiptHistory) != 2 ||
+		got.ToolLifecycleReceiptHistory[0].Decision != "ready" ||
+		got.ToolLifecycleReceiptHistory[1].Decision != "denied" {
+		t.Fatalf("append-only history = %+v, want ready then denied", got.ToolLifecycleReceiptHistory)
+	}
+}
+
 func TestUpdateCreatesAndIncrements(t *testing.T) {
 	t.Parallel()
 

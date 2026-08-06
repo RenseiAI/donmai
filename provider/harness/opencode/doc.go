@@ -30,10 +30,8 @@
 //     agent.Events in events_sse.go; runtime "ask" verdicts are adjudicated by
 //     the provider's own permission pump (permission.go), never a human. Lane
 //     B backs SupportsMessageInjection (Inject → prompt POST), SupportsSessionResume
-//     (Resume → reattach), and AcceptsAllowedToolsList. The §5.3 MCP config
-//     injection is implemented, but AcceptsMcpServerSpec stays advertised false
-//     pending the cross-provider AcceptsMcpServerSpec→SupportsToolPlugins
-//     invariant (see manifest.go).
+//     (Resume → reattach), AcceptsAllowedToolsList, and independently
+//     AcceptsMcpServerSpec through the §5.3 project config path.
 //
 // Lane selection is Spec-driven (07 §2): a fire-and-forget one-shot takes Lane
 // A; a session needing injection/resume/permission mediation/MCP wiring — or an

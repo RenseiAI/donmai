@@ -14,6 +14,7 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // package contributes the gemini-generate drive over HostDirect/HostVertex,
 // direct-api transport, SSE streaming, and native JSON mode (responseSchema).
 func (*Provider) Manifest() agent.HarnessManifest {
+	events := []agent.EventKind{agent.EventInit, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessRaw,
 		HumanLabel:  "Gemini (direct)",
@@ -40,6 +41,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			SystemDelivery: agent.PromptDeliveryGeminiSystemInstruction, BaseAppendDelivery: agent.PromptDeliveryGeminiSystemInstruction,
 			BaseReplaceDelivery: agent.PromptDeliveryGeminiSystemInstruction, ContextDelivery: agent.PromptDeliveryGeminiSystemInstruction,
 			UserDelivery: agent.PromptDeliveryGeminiUserContent, AmendmentDelivery: agent.PromptDeliveryGeminiUserContent,
+		}},
+		ToolLifecycle: []agent.ToolLifecycleProfile{{
+			ID: "raw/gemini-generate/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+			ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryGeminiMCPBridge,
+			NativeToolPolicyDelivery: agent.ToolDeliveryGeminiNativeBoundary, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+			MCPToolPolicyDelivery: agent.ToolDeliveryGeminiNativeBoundary, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+			LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: events,
+			ReplayDelivery: agent.ToolDeliveryStructuredEventReplay, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: events,
+			CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
 		}},
 	}
 }

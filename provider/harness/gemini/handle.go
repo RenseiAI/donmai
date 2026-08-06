@@ -49,6 +49,8 @@ type sessionParams struct {
 	// MCP servers). The executor routes mcp__* calls through it; the
 	// driver closes it on exit.
 	mcp *mcpBridge
+	// policy is the exact in-box allow/deny boundary compiled from Spec.
+	policy *toolPolicy
 	// maxTurns is the maximum number of generateContent round-trips
 	// (agentic turns) allowed before the driver terminates with an
 	// error_max_turns result. 0 means uncapped.
@@ -151,6 +153,7 @@ func startSession(ctx context.Context, p sessionParams) (*Handle, error) {
 		shutdown:  make(chan struct{}),
 		state:     &turnState{model: p.model},
 	}
+	h.executor.policy = p.policy
 
 	// Init event first; channel is buffered so this never blocks.
 	h.events <- agent.InitEvent{SessionID: p.sessionID}

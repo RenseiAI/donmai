@@ -53,6 +53,7 @@ type permEngine struct {
 	allowRegexes []*regexp.Regexp
 	denyRegexes  []*regexp.Regexp
 	autoApprove  bool
+	hasPolicy    bool
 	cwd          string
 }
 
@@ -64,6 +65,7 @@ func newPermEngine(spec agent.Spec) *permEngine {
 	e := &permEngine{autoApprove: true, cwd: spec.Cwd}
 	cfg := spec.PermissionConfig
 	if cfg != nil {
+		e.hasPolicy = true
 		e.allowRegexes = compilePermPatterns(cfg.AllowPatterns)
 		e.denyRegexes = compilePermPatterns(cfg.DisallowPatterns)
 		switch strings.ToLower(cfg.DefaultDecision) {
@@ -155,8 +157,9 @@ func (e *permEngine) Evaluate(req permissionRequest) permDecision {
 	case strings.Contains(action, "edit") || strings.Contains(action, "write") || strings.Contains(action, "patch"):
 		return e.evalFileChange(permPathOf(req))
 	default:
-		// Unknown action shapes default to a single allow to avoid hangs; the
-		// caller surfaces a SystemEvent so the surprise is observable.
+		if e.hasPolicy {
+			return permDecision{Reply: replyReject, Reason: "unknown action under an explicit policy"}
+		}
 		if e.autoApprove {
 			return permDecision{Reply: replyOnce}
 		}

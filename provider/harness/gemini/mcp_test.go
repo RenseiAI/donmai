@@ -207,7 +207,7 @@ func TestMCPBridge_RealStdioChildEnvSanitized(t *testing.T) {
 	}
 }
 
-func TestMCPBridge_FailuresDegrade(t *testing.T) {
+func TestMCPBridge_FailuresAreTypedForAdmission(t *testing.T) {
 	t.Parallel()
 	listFail := &fakeMCPClient{listErr: errors.New("list exploded")}
 	dialer := dialerFor(t,
@@ -225,6 +225,9 @@ func TestMCPBridge_FailuresDegrade(t *testing.T) {
 	}
 	if !listFail.closed {
 		t.Error("a client whose tools/list failed must be closed")
+	}
+	if err := b.connectionError(); err == nil || !strings.Contains(err.Error(), "down, half") {
+		t.Errorf("connectionError = %v, want deterministic failed-server list", err)
 	}
 
 	// Calls against failed servers carry the cause.

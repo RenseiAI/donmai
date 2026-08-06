@@ -63,6 +63,15 @@ func TestInteractiveArgs(t *testing.T) {
 	}
 }
 
+func TestInteractiveArgs_MCPConfigPrecedesPositionalPrompt(t *testing.T) {
+	t.Parallel()
+	got := interactiveArgsWithMCP(agent.Spec{Prompt: "fix the bug"}, "/tmp/session-mcp.json")
+	want := []string{"--mcp-config", "/tmp/session-mcp.json", "--strict-mcp-config", "fix the bug"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("interactiveArgsWithMCP = %q, want %q", got, want)
+	}
+}
+
 // TestInteractiveArgs_SystemPromptAppendMatchesHeadless is the regression
 // guard for the prompt-delivery defect: an interactive REPL must receive the
 // same composed system append as a headless invocation of the same Spec.
@@ -268,5 +277,63 @@ func TestSpawn_Interactive_RoutesThroughPTYNotHeadlessJSONL(t *testing.T) {
 	}
 	if !gotInit {
 		t.Error("never observed an InitEvent")
+	}
+}
+
+func TestSpawn_Interactive_MCPConfigIsDeliveredAndCleanedOnChildExit(t *testing.T) {
+	t.Parallel()
+	workdir := t.TempDir()
+	p := newFakeInteractiveProvider(t, `
+set -e
+while (($#)); do
+  if [[ "$1" == "--mcp-config" ]]; then
+    printf '%s' "$2" > "$PWD/mcp-path"
+    cp "$2" "$PWD/mcp-seen.json"
+    shift 2
+    continue
+  fi
+  shift
+done
+`)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt: "hello",
+		Cwd:    workdir,
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "platform", Type: "http", URL: "https://platform.invalid/mcp",
+			Headers: map[string]string{"Authorization": "Bearer test-token"},
+		}},
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case _, ok := <-h.Events():
+			if !ok {
+				goto exited
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for fake Claude exit")
+		}
+	}
+
+exited:
+	pathBody, err := os.ReadFile(filepath.Join(workdir, "mcp-path"))
+	if err != nil {
+		t.Fatalf("read observed MCP path: %v", err)
+	}
+	if _, err := os.Stat(string(pathBody)); !os.IsNotExist(err) { //nolint:gosec // test-owned fake child emits its generated temp path
+		t.Fatalf("per-session MCP config was not removed on child exit: %v", err)
+	}
+	seen, err := os.ReadFile(filepath.Join(workdir, "mcp-seen.json"))
+	if err != nil {
+		t.Fatalf("read copied MCP config: %v", err)
+	}
+	for _, want := range []string{"platform", "https://platform.invalid/mcp", "Bearer test-token"} {
+		if !strings.Contains(string(seen), want) {
+			t.Fatalf("interactive MCP config omitted %q: %s", want, seen)
+		}
 	}
 }

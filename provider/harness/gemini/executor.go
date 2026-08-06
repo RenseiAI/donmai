@@ -42,6 +42,9 @@ type toolExecutor struct {
 	// mcp routes mcp__* calls to the live servers. nil when the session
 	// declared no MCP servers.
 	mcp *mcpBridge
+	// policy is nil only in narrow executor unit tests. Production Spawn always
+	// supplies the precompiled in-box boundary.
+	policy *toolPolicy
 }
 
 // newToolExecutor builds an executor from the spawn spec. nil-safe: a
@@ -66,6 +69,11 @@ type execResult struct {
 // isError=true so the model receives a functionResponse and can recover.
 func (e *toolExecutor) execute(ctx context.Context, call candidateFuncCall) execResult {
 	name := call.Name
+	if e.policy != nil {
+		if allowed, reason := e.policy.allow(call); !allowed {
+			return e.errResult("tool policy denied " + fmt.Sprintf("%q: %s", name, reason))
+		}
+	}
 
 	// MCP tools route through the session's bridge to the live server.
 	if strings.HasPrefix(name, "mcp__") {
