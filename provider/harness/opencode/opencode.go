@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -116,6 +115,10 @@ type Options struct {
 	// a resolved endpoint. Defaults to newClientV1. Tests inject a stub to
 	// exercise the handle against an httptest server without a real child.
 	ServerClientFactory func(endpoint, apiKey string) serverClient
+
+	// configTempDir is a test seam for the Lane-B config boundary. Production
+	// always uses the resolved system temp directory.
+	configTempDir string
 }
 
 // Provider is the agent.Provider implementation for OpenCode.
@@ -147,27 +150,45 @@ type Provider struct {
 	// clientFactory builds a Lane-B serverClient for a resolved endpoint.
 	clientFactory func(endpoint, apiKey string) serverClient
 
-	// children tracks live serve children so Shutdown can sweep any that
-	// outlived their handle (07 §9). Guarded by mu.
-	mu       sync.Mutex
-	children map[*serveChild]struct{}
+	// resources tracks each provider-owned Lane-B child together with its
+	// isolated config. Registration happens before process start so Shutdown
+	// cannot miss an in-flight spawn. Guarded by mu.
+	mu            sync.Mutex
+	resources     map[*openCodeServerResource]struct{}
+	shuttingDown  bool
+	configTempDir string
 }
 
-// registerChild records a live serve child for Shutdown sweeping.
-func (p *Provider) registerChild(c *serveChild) {
+func (p *Provider) registerResource(resource *openCodeServerResource) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.children == nil {
-		p.children = make(map[*serveChild]struct{})
+	if p.shuttingDown {
+		return errOpenCodeShutdown
 	}
-	p.children[c] = struct{}{}
+	if p.resources == nil {
+		p.resources = make(map[*openCodeServerResource]struct{})
+	}
+	p.resources[resource] = struct{}{}
+	return nil
 }
 
-// unregisterChild drops a serve child once its handle has torn it down.
-func (p *Provider) unregisterChild(c *serveChild) {
+func (p *Provider) releaseResource(resource *openCodeServerResource) error {
+	err := resource.close()
+	p.mu.Lock()
+	if err == nil {
+		delete(p.resources, resource)
+	}
+	p.mu.Unlock()
+	return err
+}
+
+func (p *Provider) checkOpen() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.children, c)
+	if p.shuttingDown {
+		return errOpenCodeShutdown
+	}
+	return nil
 }
 
 // newServerClient builds a Lane-B serverClient, honoring an injected factory.
@@ -232,6 +253,7 @@ func New(opts Options) (*Provider, error) {
 			versionUnverified: unverified,
 			preferServer:      opts.PreferServer,
 			clientFactory:     opts.ServerClientFactory,
+			configTempDir:     opts.configTempDir,
 		}, nil
 	}
 
@@ -263,6 +285,7 @@ func New(opts Options) (*Provider, error) {
 		apiKey:        apiKey,
 		preferServer:  opts.PreferServer,
 		clientFactory: opts.ServerClientFactory,
+		configTempDir: opts.configTempDir,
 	}, nil
 }
 
@@ -306,8 +329,8 @@ func (*Provider) Capabilities() agent.Capabilities {
 		EmitsSubagentEvents:                 false,
 		SupportsReasoningEffort:             true, // --variant flag maps to effort levels
 		ToolPermissionFormat:                "claude",
-		AcceptsAllowedToolsList:             true, // Lane B: projected into opencode.json permission map (07 §5.2)
-		AcceptsMcpServerSpec:                true, // §5.3 per-session project MCP config is independent of OpenCode plugin support.
+		AcceptsAllowedToolsList:             true, // Lane B: projected into the owned opencode.json permission map (07 §5.2)
+		AcceptsMcpServerSpec:                true, // §5.3 owned per-session MCP config is independent of OpenCode plugin support.
 		HumanLabel:                          "OpenCode",
 	}
 }
@@ -348,6 +371,9 @@ func (p *Provider) launchManifest() agent.HarnessManifest {
 // On any pre-spawn failure the provider returns an error wrapping
 // agent.ErrSpawnFailed.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	if err := p.checkOpen(); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	if err := p.validateLaunchAuthority(spec); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
@@ -551,20 +577,39 @@ func buildOpenCodeArgs(spec agent.Spec) []string {
 // resumeSessionID is empty for a fresh spawn and set for Resume.
 func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessionID string) (agent.Handle, error) {
 	var configPath string
+	var resource *openCodeServerResource
 	if p.binary != "" {
-		dir, err := configDir(spec)
+		boundary, err := newOpenCodeConfigBoundary(p.configTempDir, spec)
 		if err != nil {
-			return nil, fmt.Errorf("%w: opencode config dir: %v", agent.ErrSpawnFailed, err)
+			return nil, fmt.Errorf("%w: create owned opencode config: %v", agent.ErrSpawnFailed, err)
 		}
-		configPath, err = writeConfig(dir, spec)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+		resource = &openCodeServerResource{config: boundary}
+		if err := p.registerResource(resource); err != nil {
+			cleanupErr := resource.close()
+			return nil, errors.Join(fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err), cleanupErr)
+		}
+		configPath = boundary.configPath
+	}
+	fail := func(primary error) (agent.Handle, error) {
+		if resource == nil {
+			return nil, primary
+		}
+		return nil, errors.Join(primary, p.releaseResource(resource))
+	}
+	if resource != nil {
+		if err := resource.config.validate(); err != nil {
+			return fail(fmt.Errorf("%w: validate owned opencode config: %v", agent.ErrSpawnFailed, err))
 		}
 	}
 
 	child, endpoint, err := p.bringUpServer(ctx, spec, configPath)
 	if err != nil {
-		return nil, err
+		return fail(err)
+	}
+	if resource != nil {
+		if err := resource.attachChild(child); err != nil {
+			return fail(fmt.Errorf("%w: attach owned opencode child: %v", agent.ErrSpawnFailed, err))
+		}
 	}
 
 	client := p.newServerClient(endpoint, p.apiKey)
@@ -576,24 +621,21 @@ func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessi
 			Location: locationRef{Directory: spec.Cwd},
 		})
 		if err != nil {
-			p.teardownChild(child)
-			return nil, fmt.Errorf("%w: create opencode session: %v", agent.ErrSpawnFailed, err)
+			return fail(fmt.Errorf("%w: create opencode session: %v", agent.ErrSpawnFailed, err))
 		}
 	}
 
 	logger := slog.With("provider", "opencode", "lane", "server", "session", sessionID)
 	h := newServerHandle(child, client, sessionID, spec, logger)
-	if child != nil {
-		c := child
-		h.onClose = func() { p.unregisterChild(c) }
+	if resource != nil {
+		h.releaseOwned = func() error { return p.releaseResource(resource) }
 	}
 
 	// Subscribe to the event feed BEFORE admitting the prompt so no post-prompt
 	// frame is missed (the mapper synthesizes InitEvent from the first
 	// in-session frame regardless of ordering).
 	if err := h.start(ctx); err != nil {
-		p.teardownChild(child)
-		return nil, err
+		return fail(err)
 	}
 
 	if p.versionUnverified {
@@ -610,9 +652,9 @@ func (p *Provider) spawnServer(ctx context.Context, spec agent.Spec, resumeSessi
 		req := promptReq{Prompt: promptInput{Text: spec.Prompt}, Delivery: "steer", Resume: resumeSessionID != ""}
 		if err := client.Prompt(ctx, sessionID, req); err != nil {
 			stopCtx, cancel := context.WithTimeout(context.Background(), stopGracePeriod)
-			_ = h.Stop(stopCtx)
+			cleanupErr := h.Stop(stopCtx)
 			cancel()
-			return nil, fmt.Errorf("%w: admit opencode prompt: %v", agent.ErrSpawnFailed, err)
+			return nil, errors.Join(fmt.Errorf("%w: admit opencode prompt: %v", agent.ErrSpawnFailed, err), cleanupErr)
 		}
 	}
 	return h, nil
@@ -640,26 +682,7 @@ func (p *Provider) bringUpServer(ctx context.Context, spec agent.Spec, configPat
 	if err != nil {
 		return nil, "", err
 	}
-	p.registerChild(child)
 	return child, child.endpoint, nil
-}
-
-func (p *Provider) teardownChild(child *serveChild) {
-	if child == nil {
-		return
-	}
-	child.stop()
-	p.unregisterChild(child)
-}
-
-// configDir returns the directory the session opencode.json is written to: a
-// worktree-local .donmai-opencode dir (removed by the runner's normal worktree
-// lifecycle, 07 §6) or a temp dir when the spec has no cwd (attach-mode tests).
-func configDir(spec agent.Spec) (string, error) {
-	if spec.Cwd != "" {
-		return filepath.Join(spec.Cwd, ".donmai-opencode"), nil
-	}
-	return os.MkdirTemp("", "donmai-opencode-")
 }
 
 // Resume reattaches to a persisted opencode session (Lane B). In attach mode it
@@ -668,6 +691,9 @@ func configDir(spec agent.Spec) (string, error) {
 func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
 	if sessionID == "" {
 		return nil, fmt.Errorf("provider/opencode: Resume: empty session id: %w", agent.ErrUnsupported)
+	}
+	if err := p.checkOpen(); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	if err := p.validateLaunchAuthority(spec); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
@@ -684,21 +710,21 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	return p.spawnServer(ctx, spec, sessionID)
 }
 
-// Shutdown sweeps any serve children that outlived their handle (Lane B). Lane
-// A holds no long-lived resources, so this is a no-op when only CLI sessions
-// ran.
+// Shutdown sweeps every registered Lane-B child and owned config, including
+// resources registered by a spawn that is still in flight.
 func (p *Provider) Shutdown(_ context.Context) error {
 	p.mu.Lock()
-	children := make([]*serveChild, 0, len(p.children))
-	for c := range p.children {
-		children = append(children, c)
+	p.shuttingDown = true
+	resources := make([]*openCodeServerResource, 0, len(p.resources))
+	for resource := range p.resources {
+		resources = append(resources, resource)
 	}
-	p.children = nil
 	p.mu.Unlock()
-	for _, c := range children {
-		c.stop()
+	var cleanupErr error
+	for _, resource := range resources {
+		cleanupErr = errors.Join(cleanupErr, p.releaseResource(resource))
 	}
-	return nil
+	return cleanupErr
 }
 
 // openCodeHandle is the agent.Handle implementation backed by an

@@ -37,7 +37,7 @@ const serveHealthInterval = 100 * time.Millisecond
 type serveConfig struct {
 	binary     string            // resolved opencode binary path
 	cwd        string            // session worktree
-	configPath string            // OPENCODE_CONFIG target (may be empty)
+	configPath string            // owned OPENCODE_CONFIG target (may be empty)
 	env        map[string]string // additional env (spec env + resolved key)
 	apiKey     string            // bearer for health/probe (usually empty locally)
 	logger     *slog.Logger

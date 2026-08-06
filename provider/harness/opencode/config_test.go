@@ -189,26 +189,34 @@ func TestProjectMCP_LocalAndPlatformRemote(t *testing.T) {
 	}
 }
 
-func TestWriteConfig_Perms0600(t *testing.T) {
+func TestOpenCodeConfigBoundary_PermsAndJSON(t *testing.T) {
 	t.Parallel()
-	dir := filepath.Join(t.TempDir(), "state")
+	tempRoot := t.TempDir()
 	spec := agent.Spec{Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "m", BaseURL: "http://x/v1"}}
-	path, err := writeConfig(dir, spec)
+	boundary, err := newOpenCodeConfigBoundary(tempRoot, spec)
 	if err != nil {
-		t.Fatalf("writeConfig: %v", err)
+		t.Fatalf("new config boundary: %v", err)
 	}
-	info, err := os.Stat(path)
+	t.Cleanup(func() { _ = boundary.remove() })
+	homeInfo, err := os.Stat(boundary.home)
+	if err != nil {
+		t.Fatalf("stat home: %v", err)
+	}
+	if perm := homeInfo.Mode().Perm(); perm != 0o700 {
+		t.Errorf("config home mode = %o, want 0700", perm)
+	}
+	info, err := os.Stat(boundary.configPath)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("config file mode = %o, want 0600", perm)
 	}
-	if filepath.Base(path) != "opencode.json" {
-		t.Errorf("config file name = %q, want opencode.json", filepath.Base(path))
+	if filepath.Base(boundary.configPath) != "opencode.json" {
+		t.Errorf("config file name = %q, want opencode.json", filepath.Base(boundary.configPath))
 	}
 	// It must be valid JSON.
-	data, _ := os.ReadFile(path)
+	data, _ := os.ReadFile(boundary.configPath)
 	var cfg ocConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		t.Fatalf("written config is not valid JSON: %v", err)

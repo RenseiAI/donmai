@@ -3,6 +3,7 @@ package opencode
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -375,6 +376,62 @@ func TestProvider_Spawn_BinaryNotFound(t *testing.T) {
 	}
 	if !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Errorf("Spawn err: want ErrSpawnFailed, got %v", err)
+	}
+}
+
+func TestProvider_SpawnServerFailureRemovesSecretConfigWithoutWorktreeResidue(t *testing.T) {
+	const secretSentinel = "opencode-spawn-failure-bearer-must-not-surface"
+	repo := t.TempDir()
+	if output, err := testGitCommand(t, "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	tempRoot := t.TempDir()
+	p := &Provider{binary: "/nonexistent/opencode-fake-binary", configTempDir: tempRoot}
+	var receipts []agent.ToolLifecycleReceipt
+	_, err := p.Spawn(t.Context(), agent.Spec{
+		Prompt: "must not start",
+		Cwd:    repo,
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "platform", Type: "http", URL: "https://example.invalid/mcp",
+			Headers: map[string]string{"Authorization": "Bearer " + secretSentinel},
+		}},
+		OnToolLifecycleAdapted: func(receipt agent.ToolLifecycleReceipt) error {
+			receipts = append(receipts, receipt)
+			return nil
+		},
+	})
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("Spawn error = %v, want ErrSpawnFailed", err)
+	}
+	if strings.Contains(err.Error(), secretSentinel) {
+		t.Fatalf("Spawn error leaked MCP bearer: %v", err)
+	}
+	receiptJSON, marshalErr := json.Marshal(receipts)
+	if marshalErr != nil {
+		t.Fatalf("marshal receipts: %v", marshalErr)
+	}
+	if strings.Contains(string(receiptJSON), secretSentinel) {
+		t.Fatalf("tool lifecycle receipt leaked MCP bearer: %s", receiptJSON)
+	}
+	entries, readErr := os.ReadDir(tempRoot)
+	if readErr != nil {
+		t.Fatalf("read config temp root: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spawn failure left owned config entries: %v", entries)
+	}
+	status, statusErr := testGitCommand(t, "-C", repo, "status", "--porcelain", "--untracked-files=all").Output()
+	if statusErr != nil {
+		t.Fatalf("git status: %v", statusErr)
+	}
+	if len(status) != 0 {
+		t.Fatalf("spawn failure left worktree residue: %q", status)
+	}
+	p.mu.Lock()
+	resources := len(p.resources)
+	p.mu.Unlock()
+	if resources != 0 {
+		t.Fatalf("spawn failure left %d registered resources", resources)
 	}
 }
 

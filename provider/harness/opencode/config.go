@@ -1,10 +1,6 @@
 package opencode
 
 import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -16,9 +12,9 @@ import (
 // Lane B stands up one `opencode serve` child per donmai session on a
 // loopback port the provider owns. Before the child starts, config.go
 // renders a session-scoped opencode.json and points the child at it via the
-// OPENCODE_CONFIG env var (a FILE, not OPENCODE_CONFIG_CONTENT: it survives
-// a subprocess re-exec and is auditable post-mortem). The file is written
-// 0600 inside the session state dir, regenerated per spawn, never reused.
+// OPENCODE_CONFIG env var. config_boundary.go writes that file into a unique
+// provider-owned 0700 temp boundary, never the worktree, and removes it after
+// the child stops. The file is 0600, regenerated per spawn, and never reused.
 //
 // The config enforces three Rensei routing guarantees:
 //
@@ -106,8 +102,9 @@ type ocPolicy struct {
 }
 
 // buildConfig renders the session-scoped opencode.json from a resolved Spec.
-// It never reads or embeds credential values — apiKey is always the
-// {env:...} indirection.
+// The model-provider apiKey always uses {env:...} indirection. Remote MCP
+// headers may contain per-session credentials, so the rendered bytes are only
+// written to the owned boundary in config_boundary.go.
 func buildConfig(spec agent.Spec) ocConfig {
 	cfg := ocConfig{
 		Schema:           "https://opencode.ai/config.json",
@@ -164,24 +161,6 @@ func resolvedBaseURL(spec agent.Spec) string {
 		return spec.Endpoint.BaseURL
 	}
 	return ""
-}
-
-// writeConfig renders buildConfig(spec) and writes it 0600 into dir, returning
-// the file path. The caller points OPENCODE_CONFIG at it.
-func writeConfig(dir string, spec agent.Spec) (string, error) {
-	cfg := buildConfig(spec)
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("provider/opencode: marshal config: %w", err)
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("provider/opencode: config dir: %w", err)
-	}
-	path := filepath.Join(dir, "opencode.json")
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return "", fmt.Errorf("provider/opencode: write config: %w", err)
-	}
-	return path, nil
 }
 
 // ─── §5.2 permission projection ──────────────────────────────────────────────

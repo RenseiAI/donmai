@@ -22,7 +22,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			SupportsMessageInjection: true,  // Lane B: Prompt on a live session (07 §7)
 			SupportsSessionResume:    true,  // Lane B: Resume / create-with-session (07 §7, §9)
 			SupportsToolPlugins:      false, // OpenCode plugins are independent of MCP config acceptance.
-			AcceptsMcpServerSpec:     true,  // per-session project config; see config.go projectMCP.
+			AcceptsMcpServerSpec:     true,  // provider-owned per-session config; see config.go projectMCP.
 			AcceptsAllowedToolsList:  true,  // Lane B: opencode.json permission map (07 §5.2)
 			EmitsSubagentEvents:      false,
 			SupportsReasoningEffort:  true,

@@ -175,9 +175,9 @@ func (*Provider) Capabilities() agent.Capabilities {
 		// declared server (stdio or Streamable HTTP), discovers its tools,
 		// declares them to the model as mcp__<server>__<tool> function
 		// declarations, and the session-local executor routes the
-		// resulting mcp__* functionCalls to the live server. A server
-		// that fails to connect degrades to a structured tool error — the
-		// shape is consumed either way, satisfying the v2 contract.
+		// resulting mcp__* functionCalls to the live server. Connection or
+		// discovery failure is a typed pre-handle Spawn denial; a session
+		// never starts with a requested MCP server missing.
 		AcceptsMcpServerSpec: true,
 		HumanLabel:           "Gemini",
 	}

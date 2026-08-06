@@ -19,9 +19,14 @@
 //     child per donmai session on an ephemeral loopback port the provider
 //     owns (server.go), or an attached external server via $OPENCODE_ENDPOINT
 //     when no binary is present. A per-session opencode.json is rendered and
-//     injected via $OPENCODE_CONFIG (config.go): a single custom
-//     OpenAI-compatible provider whose baseURL is the resolved endpoint, an
-//     enabled_providers + experimental.policies lockout so the worker can
+//     written 0600 into a unique provider-owned 0700 temp boundary outside the
+//     worktree, then injected via $OPENCODE_CONFIG (config_boundary.go). The
+//     boundary is removed after the child stops on spawn failure, Stop,
+//     terminal, crash, or Provider.Shutdown; cleanup failure is returned and
+//     replaces a successful terminal with a bounded ErrorEvent. The config
+//     contains a single custom OpenAI-compatible provider whose baseURL is the
+//     resolved endpoint, and an enabled_providers + experimental.policies
+//     lockout so the worker can
 //     never fall back to an unresolved provider, the Spec's tool policy
 //     projected onto opencode's allow/ask/deny maps, and the Spec's MCP
 //     whitelist. The v2 /api/ REST surface and the SSE /api/event feed are

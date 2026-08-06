@@ -386,8 +386,8 @@ func TestToolExecutor_MCPDomainErrorKeepsServerText(t *testing.T) {
 	}
 }
 
-// failingDialer always errors — used to assert Spawn degrades instead of
-// failing when no MCP server is reachable.
+// failingDialer always errors — used to assert fail-closed Spawn denial when
+// a declared MCP server is unreachable.
 func failingDialer(_ context.Context, s agent.MCPServerConfig) (mcp.Client, error) {
 	return nil, fmt.Errorf("dial %s: connection refused", s.Name)
 }
