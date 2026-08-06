@@ -2,10 +2,12 @@ package agycli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +32,12 @@ func newFakeProvider(t *testing.T, script string, opts Options) *Provider {
 	// Linux can throw ETXTBSY on fork+exec when a writable FD is open on an
 	// executable inode — writing 0o600 then chmodding to 0o755 post-close
 	// means the file never carries the exec bit while any writable FD exists.
-	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o600); err != nil { //nolint:gosec // test fixture
+	fixture := "#!/bin/bash\n" +
+		"if [[ \"$1\" == \"--help\" ]]; then\n" +
+		"  printf '%s\\n' '  --add-dir  Add a directory to the workspace'\n" +
+		"  exit 0\n" +
+		"fi\n" + script
+	if err := os.WriteFile(bin, []byte(fixture), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatal(err)
 	}
 	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs exec bit
@@ -60,6 +67,75 @@ func spawnFake(ctx context.Context, t *testing.T, p *Provider, spec agent.Spec) 
 			return h, err
 		}
 		time.Sleep(time.Duration(25*(attempt+1)) * time.Millisecond)
+	}
+}
+
+func TestSpawn_BindsOnlyCanonicalWorktree(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree with spaces; $(literal)")
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(worktree, 0o700); err != nil { //nolint:gosec // isolated test worktree
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(outside, 0o700); err != nil { //nolint:gosec // isolated test sibling
+		t.Fatal(err)
+	}
+	argvPath := filepath.Join(root, "argv.bin")
+	pwdPath := filepath.Join(root, "pwd.txt")
+	p := newFakeProvider(t, `printf '%s\0' "$@" > "$ARGV_CAPTURE"
+printf '%s' "$PWD" > "$PWD_CAPTURE"
+echo '<<<DONMAI_RESULT>>>'
+echo '{"status":"passed","summary":"done"}'
+echo '<<<END_DONMAI_RESULT>>>'
+`, Options{DisableTranscriptEnrichment: true})
+
+	h, err := spawnFake(context.Background(), t, p, agent.Spec{
+		Prompt: "read NOTES.txt",
+		Cwd:    worktree,
+		Env: map[string]string{
+			"ARGV_CAPTURE": argvPath,
+			"PWD_CAPTURE":  pwdPath,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	_ = collectEvents(t, h)
+
+	canonical, err := canonicalWorktree(worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawArgv, err := os.ReadFile(argvPath)
+	if err != nil {
+		t.Fatalf("read argv capture: %v", err)
+	}
+	argv := strings.Split(strings.TrimSuffix(string(rawArgv), "\x00"), "\x00")
+	want := []string{"-p", "read NOTES.txt" + strings.TrimSuffix(resultEnvelopeInstruction, "\n"), "--dangerously-skip-permissions", "--add-dir", canonical}
+	if !slices.Equal(argv, want) {
+		t.Fatalf("argv = %#v, want %#v", argv, want)
+	}
+	if strings.Contains(string(rawArgv), outside) {
+		t.Fatalf("outside sibling was granted in argv: %q", rawArgv)
+	}
+	pwd, err := os.ReadFile(pwdPath)
+	if err != nil {
+		t.Fatalf("read child PWD: %v", err)
+	}
+	if string(pwd) != canonical {
+		t.Fatalf("child PWD = %q, want canonical worktree %q", pwd, canonical)
+	}
+}
+
+func TestSpawn_RejectsInvalidWorktree(t *testing.T) {
+	t.Parallel()
+	p := newFakeProvider(t, "exit 0\n", Options{DisableTranscriptEnrichment: true})
+	_, err := spawnFake(context.Background(), t, p, agent.Spec{Prompt: "x", Cwd: filepath.Join(t.TempDir(), "missing")})
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("Spawn error = %v, want ErrSpawnFailed", err)
 	}
 }
 

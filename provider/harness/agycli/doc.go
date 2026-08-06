@@ -23,9 +23,17 @@
 //
 //   - `agy -p "<prompt>"` MUST run under a pty — plain stdin/stdout pipes hang
 //     with zero output. We allocate a pseudo-terminal via github.com/creack/pty.
+//   - `agy` v1.1.10 advertises `--add-dir <worktree>`. We require that flag at
+//     construction and pass the canonical Spec.Cwd as its sole value on every
+//     workarea-bound spawn. `cmd.Dir` alone is not sufficient: agy may create a
+//     scratch project and use that as its tool workspace. An older or otherwise
+//     incompatible CLI fails unavailable instead of silently widening or
+//     changing the requested worktree authority.
 //   - There is NO structured output mode. `--output-format json` hard-errors in
 //     v1.0.4. stdout is plain-text agentic prose (terse narration + final
-//     answer). There is NO `--model` and NO `--skip-trust` flag.
+//     answer). v1.1.10 advertises `--model`, but this provider intentionally
+//     does not forward Spec.Model until that behavior has its own compatibility
+//     contract. There is no `--skip-trust` flag.
 //
 // # How this package recovers structure anyway
 //

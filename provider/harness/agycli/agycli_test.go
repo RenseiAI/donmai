@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -11,14 +13,15 @@ import (
 
 func TestNew_ProbeSuccess(t *testing.T) {
 	t.Parallel()
+	binary := newHelpOnlyAgy(t, true)
 	p, err := New(Options{
-		Binary:   "agy",
-		LookPath: func(string) (string, error) { return "/fake/bin/agy", nil },
+		Binary:   binary,
+		LookPath: func(string) (string, error) { return binary, nil },
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if p.binary != "/fake/bin/agy" {
+	if p.binary != binary {
 		t.Errorf("binary = %q", p.binary)
 	}
 	if !p.injectEnvelope {
@@ -44,8 +47,10 @@ func TestNew_ProbeFailureWrapsUnavailable(t *testing.T) {
 
 func TestNew_TogglesDisable(t *testing.T) {
 	t.Parallel()
+	binary := newHelpOnlyAgy(t, true)
 	p, err := New(Options{
-		LookPath:                    func(string) (string, error) { return "/fake/agy", nil },
+		Binary:                      binary,
+		LookPath:                    func(string) (string, error) { return binary, nil },
 		DisableResultEnvelope:       true,
 		DisableTranscriptEnrichment: true,
 	})
@@ -58,6 +63,37 @@ func TestNew_TogglesDisable(t *testing.T) {
 	if p.enrichTranscript {
 		t.Errorf("DisableTranscriptEnrichment not honored")
 	}
+}
+
+func TestVerifyAddDirSupport_FailsClosed(t *testing.T) {
+	t.Parallel()
+	err := verifyAddDirSupport("fake-agy", func(context.Context, string) ([]byte, error) {
+		return []byte("Usage: fake-agy\n"), nil
+	})
+	if err == nil {
+		t.Fatal("expected missing --add-dir to be rejected")
+	}
+
+	err = verifyAddDirSupport("fake-agy", func(context.Context, string) ([]byte, error) {
+		return []byte("  --add-dir  Add a directory to the workspace\n"), nil
+	})
+	if err != nil {
+		t.Fatalf("advertised --add-dir should be accepted: %v", err)
+	}
+}
+
+func newHelpOnlyAgy(t *testing.T, addDir bool) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-agy")
+	help := "Usage: fake-agy\\n"
+	if addDir {
+		help += "  --add-dir  Add a directory to the workspace\\n"
+	}
+	script := "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n  printf '%b' '" + help + "'\nfi\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestName(t *testing.T) {

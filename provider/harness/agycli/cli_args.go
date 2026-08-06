@@ -46,18 +46,25 @@ const resultEnvelopeInstruction = "\n\n" +
 //
 // Spec fields NOT honored (capability-gated drop, CONTRACT.md §4/§5):
 //
-//	Model               — no --model flag; model is a persisted agy setting.
+//	Model               — deliberately not forwarded. Recent agy builds
+//	                      advertise --model, but selection needs its own
+//	                      compatibility contract before this provider relies on it.
 //	MCPServers          — global-only mcpServers; deferred.
 //	AllowedTools/Disallowed/MaxTurns/Effort/PermissionConfig — no headless flag.
 //
 // The full prompt (with the optional result-envelope instruction) is returned
 // as the -p value. agy has no stdin-prompt mode; the prompt is always a flag value.
+// When Spec.Cwd is set, it is appended as the only --add-dir authority grant.
 func buildArgs(spec agent.Spec, injectEnvelope bool) []string {
 	prompt := buildPrompt(spec.Prompt, injectEnvelope)
-	return []string{
+	argv := []string{
 		"-p", prompt,
 		"--dangerously-skip-permissions",
 	}
+	if spec.Cwd != "" {
+		argv = append(argv, "--add-dir", spec.Cwd)
+	}
+	return argv
 }
 
 // buildPrompt returns the prompt to hand to `agy -p`, optionally appending the
