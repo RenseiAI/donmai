@@ -7,6 +7,16 @@
 - **Authoritative inputs:** `02-two-axis-architecture.md` §2/§3, `03-capability-matrix-spec.md`, `ADR-2026-06-06-two-axis-provider-model.md` D1–D3.
 - **Hard constraint:** every existing caller, provider, and test compiles and passes **unchanged**. The runtime Spawn path is byte-for-byte identical when `Spec.Endpoint` is the zero value (which it always is until Phase 3 wires resolution). This phase only *adds* types, manifests, generated artifacts, and a CI gate.
 
+> **Superseded identity note (2026-08-06).** This document remains the
+> historical Phase-1 implementation spec, but its shared `raw` harness identity
+> and capability-union requirements are no longer current. The live contract
+> uses two canonical identities: `gemini-direct` for the Gemini SSE/direct loop
+> and `ollama` for the local Ollama NDJSON loop. Matrix generation rejects
+> duplicate harness ids instead of unioning capabilities. `raw` and `native`
+> survive only as provider-paired, receipted runner compatibility aliases; an
+> ambiguous or invalid pairing denies. The live manifests, matrix generator,
+> and runner admission tests are authoritative for this post-P1 split.
+
 ---
 
 ## 0. The additive strategy in one paragraph (how v1 stays compiling)

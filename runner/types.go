@@ -92,7 +92,8 @@ func (q *QueuedWork) hasCapability(name string) bool {
 // by the daemon poll handler).
 type ResolvedProfile struct {
 	// Harness is the loop-driver attribute the platform catalog models on
-	// the model identity (e.g. "agy" for the Antigravity `agy` CLI-wrap).
+	// the model identity (e.g. "antigravity", "gemini-direct", or "ollama";
+	// legacy wire aliases such as "agy", "native", and "raw" remain accepted).
 	// When present it is AUTHORITATIVE for binary/provider selection: the
 	// runner maps the harness token onto its concrete provider impl
 	// regardless of the Provider value (so a catalog that models the

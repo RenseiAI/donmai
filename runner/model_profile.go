@@ -28,14 +28,15 @@ type ResolvedModelProfile struct {
 	// cross-referencing the platform's profile management API.
 	ID string `json:"id"`
 
-	// ProviderID is the canonical provider family identifier
+	// ProviderID is the legacy concrete-provider identifier
 	// (e.g. "claude", "codex", "gemini", "ollama"). Matches the
 	// agent.ProviderName enum; the daemon calls SelectProvider(profile)
 	// which converts this to agent.ProviderName internally.
 	ProviderID string `json:"providerId"`
 
 	// Harness is the loop-driver attribute the platform catalog models on
-	// the model identity (e.g. "agy" for the Antigravity `agy` CLI-wrap).
+	// the model identity (e.g. "antigravity", "gemini-direct", or "ollama";
+	// legacy wire aliases such as "agy", "native", and "raw" remain accepted).
 	// When non-empty it is AUTHORITATIVE for provider selection over
 	// ProviderID: ToResolvedProfile copies it into ResolvedProfile.Harness,
 	// which the runner's authoritative harness selector reads first. This keeps

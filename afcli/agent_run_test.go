@@ -856,8 +856,8 @@ func TestGatewayHarnessIdentityUsesCanonicalAdmission(t *testing.T) {
 	for _, provider := range []*fakeAdmissionHarnessProvider{
 		{fakeProvider: fakeProvider{name: agent.ProviderClaude}, harness: agent.HarnessClaudeCode},
 		{fakeProvider: fakeProvider{name: agent.ProviderAGYCLI}, harness: agent.HarnessAntigravity},
-		{fakeProvider: fakeProvider{name: agent.ProviderGemini}, harness: agent.HarnessRaw},
-		{fakeProvider: fakeProvider{name: agent.ProviderOllama}, harness: agent.HarnessRaw},
+		{fakeProvider: fakeProvider{name: agent.ProviderGemini}, harness: agent.HarnessGeminiDirect},
+		{fakeProvider: fakeProvider{name: agent.ProviderOllama}, harness: agent.HarnessOllama},
 	} {
 		if err := registry.Register(provider); err != nil {
 			t.Fatal(err)
@@ -869,9 +869,14 @@ func TestGatewayHarnessIdentityUsesCanonicalAdmission(t *testing.T) {
 	}{
 		{name: "contradictory claude harness and gemini provider", harness: "claude", provider: "gemini", want: "claude-code"},
 		{name: "agy legacy wire", harness: "agy", provider: "gemini", want: "antigravity"},
-		{name: "native gemini wire", harness: "native", provider: "gemini", want: "raw"},
-		{name: "native ollama wire", harness: "native", provider: "ollama", want: "raw"},
-		{name: "absent harness keeps legacy projection", provider: "gemini", want: "gemini"},
+		{name: "native gemini wire", harness: "native", provider: "gemini", want: "gemini-direct"},
+		{name: "native ollama wire", harness: "native", provider: "ollama", want: "ollama"},
+		{name: "raw gemini wire", harness: "raw", provider: "gemini", want: "gemini-direct"},
+		{name: "raw ollama wire", harness: "raw", provider: "ollama", want: "ollama"},
+		{name: "canonical gemini direct ignores contradictory provider", harness: "gemini-direct", provider: "ollama", want: "gemini-direct"},
+		{name: "canonical ollama ignores contradictory provider", harness: "ollama", provider: "gemini", want: "ollama"},
+		{name: "absent gemini harness uses canonical legacy alias", provider: "gemini", want: "gemini-direct"},
+		{name: "absent ollama harness uses canonical legacy alias", provider: "ollama", want: "ollama"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

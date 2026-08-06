@@ -17,13 +17,21 @@ type HarnessName string
 
 // HarnessName constants name each loop-driver identity.
 const (
-	HarnessClaudeCode  HarnessName = "claude-code"
-	HarnessCodex       HarnessName = "codex"
-	HarnessOpenCode    HarnessName = "opencode"
-	HarnessAntigravity HarnessName = "antigravity"
-	HarnessAmp         HarnessName = "amp"
-	HarnessRaw         HarnessName = "raw" // in-box net/http loop (gemini-direct + ollama)
-	HarnessStub        HarnessName = "stub"
+	HarnessClaudeCode   HarnessName = "claude-code"
+	HarnessCodex        HarnessName = "codex"
+	HarnessOpenCode     HarnessName = "opencode"
+	HarnessAntigravity  HarnessName = "antigravity"
+	HarnessAmp          HarnessName = "amp"
+	HarnessGeminiDirect HarnessName = "gemini-direct" // in-box Gemini generateContent loop
+	HarnessOllama       HarnessName = "ollama"        // in-box Ollama /api/chat loop
+	// HarnessRaw is the deprecated pre-split wire token for the two in-box
+	// net/http loops. It is accepted only by the runner's explicit compatibility
+	// adapter when Provider disambiguates gemini versus ollama; no manifest or
+	// execution cell may use it as a canonical identity.
+	//
+	// Deprecated: use HarnessGeminiDirect or HarnessOllama.
+	HarnessRaw  HarnessName = "raw"
+	HarnessStub HarnessName = "stub"
 	// HarnessPi is the pi harness (provider/harness/pi): a `pi --mode rpc`
 	// JSONL-over-stdio subprocess, one child per session. pi ships no
 	// permission system, so the trust boundary (built-in-tool overrides +

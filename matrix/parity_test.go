@@ -106,8 +106,8 @@ func TestParity_LegacyProviderIDsResolve(t *testing.T) {
 }
 
 // TestParity_ProtocolIntersection is rule 3: for every cell, cell.protocol ∈
-// harness.drives AND cell.protocol == endpoint.host(cell.host).protocol. For
-// "raw", harness.drives is the union of the two raw packages.
+// harness.drives AND cell.protocol == endpoint.host(cell.host).protocol. Each
+// canonical harness has its own concrete drive surface; duplicate ids fail.
 func TestParity_ProtocolIntersection(t *testing.T) {
 	built, err := Build()
 	if err != nil {
@@ -269,8 +269,8 @@ func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
 }
 
 // TestParity_PromptDeliveryProfilesHarvested proves prompt semantics are part
-// of the generated manifest contract. The two raw providers intentionally
-// contribute distinct profiles to their shared matrix row.
+// of the generated manifest contract. Each provider contributes profiles only
+// to its own canonical harness row.
 func TestParity_PromptDeliveryProfilesHarvested(t *testing.T) {
 	built, err := Build()
 	if err != nil {

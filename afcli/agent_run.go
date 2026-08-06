@@ -73,14 +73,18 @@ var bindWorkerGatewayForAgentRun = func(
 
 // gatewayHarnessIdentity projects the canonical loop-driver identity already
 // fixed by successful explicit admission. Absent-harness work has no preflight
-// admission, so it intentionally retains the legacy display/provider
-// projection until the separately scoped legacy/posterior admission path moves
-// ahead of gateway binding.
+// admission, so it projects the legacy provider through the generated matrix
+// alias. This keeps gateway and cost attribution on canonical harness ids even
+// while the legacy/posterior admission path still runs later in Runner.
 func gatewayHarnessIdentity(detail *daemon.SessionDetail, admission *runner.HarnessAdmission) string {
 	if ref, ok := admission.CanonicalHarnessRef(); ok {
 		return ref.ID
 	}
-	return providerNameFromDetail(detail)
+	legacyProvider := agent.ProviderName(providerNameFromDetail(detail))
+	if cell, ok := matrix.LegacyCell(legacyProvider); ok {
+		return string(cell.Harness)
+	}
+	return string(legacyProvider)
 }
 
 // newAgentRunCmd constructs the `agent run` subcommand. This is the

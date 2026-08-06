@@ -63,8 +63,8 @@ func TestExplicitHarnessSelectionWireAndCanonicalMatrix(t *testing.T) {
 		{name: agent.ProviderAmp, harness: agent.HarnessAmp},
 		{name: agent.ProviderAGYCLI, harness: agent.HarnessAntigravity},
 		{name: agent.ProviderOpenCode, harness: agent.HarnessOpenCode},
-		{name: agent.ProviderGemini, harness: agent.HarnessRaw},
-		{name: agent.ProviderOllama, harness: agent.HarnessRaw},
+		{name: agent.ProviderGemini, harness: agent.HarnessGeminiDirect},
+		{name: agent.ProviderOllama, harness: agent.HarnessOllama},
 	}
 	registry := selectorRegistry(t, providers...)
 	tests := []struct {
@@ -72,16 +72,21 @@ func TestExplicitHarnessSelectionWireAndCanonicalMatrix(t *testing.T) {
 		provider      agent.ProviderName
 		wantProvider  agent.ProviderName
 		wantHarness   string
+		wantSource    string
 	}{
 		{name: "legacy claude wire", harness: "claude", provider: agent.ProviderClaude, wantProvider: agent.ProviderClaude, wantHarness: "claude-code"},
 		{name: "legacy codex wire", harness: "codex", provider: agent.ProviderCodex, wantProvider: agent.ProviderCodex, wantHarness: "codex"},
 		{name: "legacy amp wire", harness: "amp", provider: agent.ProviderAmp, wantProvider: agent.ProviderAmp, wantHarness: "amp"},
 		{name: "legacy agy wire", harness: "agy", provider: agent.ProviderGemini, wantProvider: agent.ProviderAGYCLI, wantHarness: "antigravity"},
 		{name: "legacy opencode wire", harness: "opencode", provider: agent.ProviderOpenCode, wantProvider: agent.ProviderOpenCode, wantHarness: "opencode"},
-		{name: "legacy native gemini wire", harness: "native", provider: agent.ProviderGemini, wantProvider: agent.ProviderGemini, wantHarness: "raw"},
-		{name: "legacy native ollama wire", harness: "native", provider: agent.ProviderOllama, wantProvider: agent.ProviderOllama, wantHarness: "raw"},
-		{name: "canonical raw disambiguated to gemini", harness: "raw", provider: agent.ProviderGemini, wantProvider: agent.ProviderGemini, wantHarness: "raw"},
-		{name: "canonical raw disambiguated to ollama", harness: "raw", provider: agent.ProviderOllama, wantProvider: agent.ProviderOllama, wantHarness: "raw"},
+		{name: "legacy native gemini wire", harness: "native", provider: agent.ProviderGemini, wantProvider: agent.ProviderGemini, wantHarness: "gemini-direct", wantSource: "legacy-harness:native"},
+		{name: "legacy native ollama wire", harness: "native", provider: agent.ProviderOllama, wantProvider: agent.ProviderOllama, wantHarness: "ollama", wantSource: "legacy-harness:native"},
+		{name: "legacy raw gemini wire", harness: "raw", provider: agent.ProviderGemini, wantProvider: agent.ProviderGemini, wantHarness: "gemini-direct", wantSource: "legacy-harness:raw"},
+		{name: "legacy raw ollama wire", harness: "raw", provider: agent.ProviderOllama, wantProvider: agent.ProviderOllama, wantHarness: "ollama", wantSource: "legacy-harness:raw"},
+		{name: "canonical gemini direct needs no provider hint", harness: "gemini-direct", wantProvider: agent.ProviderGemini, wantHarness: "gemini-direct"},
+		{name: "canonical ollama needs no provider hint", harness: "ollama", wantProvider: agent.ProviderOllama, wantHarness: "ollama"},
+		{name: "canonical gemini direct ignores contradictory provider", harness: "gemini-direct", provider: agent.ProviderOllama, wantProvider: agent.ProviderGemini, wantHarness: "gemini-direct"},
+		{name: "canonical ollama ignores contradictory provider", harness: "ollama", provider: agent.ProviderGemini, wantProvider: agent.ProviderOllama, wantHarness: "ollama"},
 		{name: "canonical claude manifest id", harness: "claude-code", provider: agent.ProviderGemini, wantProvider: agent.ProviderClaude, wantHarness: "claude-code"},
 		{name: "canonical antigravity manifest id", harness: "antigravity", provider: agent.ProviderGemini, wantProvider: agent.ProviderAGYCLI, wantHarness: "antigravity"},
 	}
@@ -98,6 +103,9 @@ func TestExplicitHarnessSelectionWireAndCanonicalMatrix(t *testing.T) {
 			if !selection.Explicit || len(selection.Decisions) != 1 || selection.Decisions[0].Kind != executioncell.DecisionExplicit {
 				t.Fatalf("explicit resolver evidence = %+v", selection)
 			}
+			if tt.wantSource != "" && selection.Decisions[0].SourceRef != tt.wantSource {
+				t.Fatalf("resolver source = %q, want %q", selection.Decisions[0].SourceRef, tt.wantSource)
+			}
 		})
 	}
 }
@@ -106,8 +114,8 @@ func TestExplicitHarnessSelectionTypedDenials(t *testing.T) {
 	t.Parallel()
 	registry := selectorRegistry(t,
 		&selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex},
-		&selectorFakeProvider{name: agent.ProviderGemini, harness: agent.HarnessRaw},
-		&selectorFakeProvider{name: agent.ProviderOllama, harness: agent.HarnessRaw},
+		&selectorFakeProvider{name: agent.ProviderGemini, harness: agent.HarnessGeminiDirect},
+		&selectorFakeProvider{name: agent.ProviderOllama, harness: agent.HarnessOllama},
 	)
 	tests := []struct {
 		name, harness string
@@ -116,9 +124,9 @@ func TestExplicitHarnessSelectionTypedDenials(t *testing.T) {
 	}{
 		{name: "syntactically unknown", harness: "future-harness", provider: agent.ProviderCodex, wantCode: executioncell.DenialUnknownHarness},
 		{name: "invalid whitespace", harness: " codex", provider: agent.ProviderCodex, wantCode: executioncell.DenialUnknownHarness},
-		{name: "legacy ollama token is not a harness", harness: "ollama", provider: agent.ProviderOllama, wantCode: executioncell.DenialUnknownHarness},
 		{name: "known canonical but unavailable", harness: "claude-code", provider: agent.ProviderClaude, wantCode: executioncell.DenialHarnessUnavailable},
-		{name: "known raw remains ambiguous without provider", harness: "raw", wantCode: executioncell.DenialHarnessUnavailable},
+		{name: "known raw compatibility alias remains ambiguous without provider", harness: "raw", wantCode: executioncell.DenialHarnessUnavailable},
+		{name: "known raw compatibility alias has invalid provider", harness: "raw", provider: agent.ProviderAmp, wantCode: executioncell.DenialHarnessUnavailable},
 		{name: "known native missing provider pairing", harness: "native", wantCode: executioncell.DenialHarnessUnavailable},
 		{name: "known native has unsupported provider pairing", harness: "native", provider: agent.ProviderAmp, wantCode: executioncell.DenialHarnessUnavailable},
 		{name: "native must not conflate claude API and CLI", harness: "native", provider: agent.ProviderClaude, wantCode: executioncell.DenialHarnessUnavailable},
@@ -301,15 +309,15 @@ func TestExplicitHarnessDenialPrecedesAllSideEffects(t *testing.T) {
 		},
 		{
 			name: "native missing provider", profile: ResolvedProfile{Harness: "native"},
-			providers: []*selectorFakeProvider{{name: agent.ProviderGemini, harness: agent.HarnessRaw}}, wantCode: executioncell.DenialHarnessUnavailable,
+			providers: []*selectorFakeProvider{{name: agent.ProviderGemini, harness: agent.HarnessGeminiDirect}}, wantCode: executioncell.DenialHarnessUnavailable,
 		},
 		{
 			name: "native claude is not claude code", profile: ResolvedProfile{Harness: "native", Provider: agent.ProviderClaude},
 			providers: []*selectorFakeProvider{{name: agent.ProviderClaude, harness: agent.HarnessClaudeCode}}, wantCode: executioncell.DenialHarnessUnavailable,
 		},
 		{
-			name: "ollama literal is unknown", profile: ResolvedProfile{Harness: "ollama", Provider: agent.ProviderOllama},
-			providers: []*selectorFakeProvider{{name: agent.ProviderOllama, harness: agent.HarnessRaw}}, wantCode: executioncell.DenialUnknownHarness,
+			name: "canonical ollama is known but unregistered", profile: ResolvedProfile{Harness: "ollama", Provider: agent.ProviderGemini},
+			providers: []*selectorFakeProvider{{name: agent.ProviderGemini, harness: agent.HarnessGeminiDirect}}, wantCode: executioncell.DenialHarnessUnavailable,
 		},
 	}
 	for _, tt := range tests {

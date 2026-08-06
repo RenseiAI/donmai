@@ -107,12 +107,15 @@ func (r *Registry) PreflightHarness(qw QueuedWork) (*HarnessAdmission, error) {
 	}, nil
 }
 
-const legacyNativeHarness = agent.HarnessName("native")
+const (
+	legacyNativeHarness = agent.HarnessName("native")
+	legacyRawHarness    = agent.HarnessName("raw")
+)
 
 // recognizedHarnessToken recognizes canonical execution-cell harness ids plus
 // the documented legacy Platform wire aliases. Recognition is deliberately
-// separate from native/provider pair validation: `native` is always a known
-// wire token, even when its provider pair cannot be admitted.
+// separate from raw/native provider-pair validation: both compatibility tokens
+// are known even when their provider pair cannot be admitted.
 func recognizedHarnessToken(token string) (agent.HarnessName, bool) {
 	if token == "" || token != strings.TrimSpace(token) {
 		return "", false
@@ -128,8 +131,12 @@ func recognizedHarnessToken(token string) (agent.HarnessName, bool) {
 		return agent.HarnessAntigravity, true
 	case string(agent.HarnessAmp):
 		return agent.HarnessAmp, true
-	case string(agent.HarnessRaw):
-		return agent.HarnessRaw, true
+	case string(agent.HarnessGeminiDirect):
+		return agent.HarnessGeminiDirect, true
+	case string(agent.HarnessOllama):
+		return agent.HarnessOllama, true
+	case string(legacyRawHarness):
+		return legacyRawHarness, true
 	case "native":
 		return legacyNativeHarness, true
 	case string(agent.HarnessStub):
@@ -143,13 +150,16 @@ func recognizedHarnessToken(token string) (agent.HarnessName, bool) {
 	}
 }
 
-// canonicalNativeHarness validates the only native/provider pairs present on
-// the live Platform wire. Claude and Codex have dedicated CLI harness tokens;
-// accepting native for them would conflate direct/API and CLI execution.
-func canonicalNativeHarness(provider agent.ProviderName) (agent.HarnessName, bool) {
+// canonicalInBoxHarness validates the provider-paired raw/native compatibility
+// aliases present on the live Platform wire. Claude and Codex have dedicated
+// CLI harness tokens; accepting raw/native for them would conflate direct/API
+// and CLI execution.
+func canonicalInBoxHarness(provider agent.ProviderName) (agent.HarnessName, bool) {
 	switch provider {
-	case agent.ProviderGemini, agent.ProviderOllama:
-		return agent.HarnessRaw, true
+	case agent.ProviderGemini:
+		return agent.HarnessGeminiDirect, true
+	case agent.ProviderOllama:
+		return agent.HarnessOllama, true
 	default:
 		return "", false
 	}
@@ -176,8 +186,10 @@ func legacyHarnessNameForProvider(name agent.ProviderName) agent.HarnessName {
 		return agent.HarnessAntigravity
 	case agent.ProviderOpenCode:
 		return agent.HarnessOpenCode
-	case agent.ProviderGemini, agent.ProviderOllama:
-		return agent.HarnessRaw
+	case agent.ProviderGemini:
+		return agent.HarnessGeminiDirect
+	case agent.ProviderOllama:
+		return agent.HarnessOllama
 	case agent.ProviderStub:
 		return agent.HarnessStub
 	case agent.ProviderPi:
@@ -200,7 +212,7 @@ func legacyHarnessRef(provider agent.Provider) executioncell.HarnessRef {
 
 func explicitHarnessSourceRef(token string) string {
 	switch token {
-	case "claude", "agy", "native":
+	case "claude", "agy", "native", string(legacyRawHarness):
 		return "legacy-harness:" + token
 	default:
 		// codex, amp, and opencode are both live Platform wire values and
@@ -221,9 +233,8 @@ func explicitHarnessDecision(token string, ref executioncell.HarnessRef) executi
 
 // selectExplicitHarness resolves only the requested harness. It never consults
 // Provider, Runner, a default, or posterior routing as a fallback. Provider is
-// used solely to disambiguate multiple registered implementations that expose
-// the same current harness identity (raw Gemini/Ollama); that temporary
-// ambiguity disappears in the separately scoped identity-split slice.
+// consulted only by the receipted raw/native compatibility adapter; a canonical
+// harness id is authoritative even when Provider contradicts it.
 func (r *Registry) selectExplicitHarness(profile ResolvedProfile) (harnessSelection, error) {
 	canonical, known := recognizedHarnessToken(profile.Harness)
 	if !known {
@@ -233,21 +244,21 @@ func (r *Registry) selectExplicitHarness(profile ResolvedProfile) (harnessSelect
 			Detail:  "selector is not a known canonical harness or documented legacy harness alias",
 		}
 	}
-	if canonical == legacyNativeHarness {
+	if canonical == legacyNativeHarness || canonical == legacyRawHarness {
 		var compatible bool
-		canonical, compatible = canonicalNativeHarness(profile.Provider)
+		canonical, compatible = canonicalInBoxHarness(profile.Provider)
 		if !compatible {
 			decision := executioncell.ResolverDecision{
 				Kind:        executioncell.DecisionExplicit,
 				Field:       "harness",
-				SelectedRef: "harness:native",
+				SelectedRef: "harness:" + profile.Harness,
 				SourceRef:   explicitHarnessSourceRef(profile.Harness),
-				Reason:      "Legacy ResolvedProfile explicitly selected the known native wire harness, but its provider was not one of the documented gemini or ollama pairings.",
+				Reason:      "Legacy ResolvedProfile explicitly selected a known raw/native compatibility alias, but its provider was not one of the documented gemini or ollama pairings.",
 			}
 			return harnessSelection{}, &HarnessAdmissionError{
 				Code:      executioncell.DenialHarnessUnavailable,
 				Harness:   profile.Harness,
-				Detail:    "known native harness requires provider gemini or ollama",
+				Detail:    "known raw/native compatibility alias requires provider gemini or ollama",
 				Decisions: []executioncell.ResolverDecision{decision},
 			}
 		}
@@ -265,19 +276,10 @@ func (r *Registry) selectExplicitHarness(profile ResolvedProfile) (harnessSelect
 		}
 	}
 
-	if len(matches) > 1 && profile.Provider != "" {
-		filtered := matches[:0]
-		for _, candidate := range matches {
-			if candidate.Name() == profile.Provider {
-				filtered = append(filtered, candidate)
-			}
-		}
-		matches = filtered
-	}
 	if len(matches) != 1 {
 		detail := "known harness has no registered runtime implementation"
 		if len(matches) > 1 {
-			detail = "known harness maps to multiple registered runtime implementations and the legacy provider identity did not disambiguate it"
+			detail = "known canonical harness maps to multiple registered runtime implementations"
 		}
 		decision := executioncell.ResolverDecision{
 			Kind:        executioncell.DecisionExplicit,
