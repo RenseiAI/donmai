@@ -105,7 +105,8 @@ type HarnessManifest struct {
 // capability before the harness creates any provider-side resource.
 type SpecAdmissionDenialCode string
 
-// Spec admission denial codes are stable across harness implementations.
+// SpecDenialCapabilityUnsupported identifies a stable capability denial across
+// harness implementations.
 const SpecDenialCapabilityUnsupported SpecAdmissionDenialCode = "capability_unsupported"
 
 // SpecAdmissionError identifies the exact unsupported field. It deliberately
