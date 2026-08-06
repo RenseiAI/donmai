@@ -7,7 +7,9 @@
 //
 //   - Lane A — one-shot CLI (shipped): New() probes for the `opencode`
 //     binary on $PATH; when found, Spawn execs `opencode run --format
-//     json` with the prompt delivered on stdin. The NDJSON event stream
+//     json` with the prompt delivered on stdin. Endpoint, tool-policy, and
+//     MCP inputs are delivered through the same provider-owned temporary
+//     opencode.json boundary as Lane B. The NDJSON event stream
 //     is translated to agent.Event values by mapOpenCodeLine
 //     (step_start→InitEvent, text→AssistantTextEvent, tool_use→ToolUse/
 //     ToolResult, step_finish→LlmCallEvent+ResultEvent). Teardown is
@@ -38,9 +40,10 @@
 //     (Resume → reattach), AcceptsAllowedToolsList, and independently
 //     AcceptsMcpServerSpec through the §5.3 project config path.
 //
-// Lane selection is Spec-driven (07 §2): a fire-and-forget one-shot takes Lane
-// A; a session needing injection/resume/permission mediation/MCP wiring — or an
-// explicit Options.PreferServer, or attach-mode — takes Lane B.
+// Lane selection follows lifecycle needs: binary-backed Spawn uses Lane A,
+// including endpoint, permission, and MCP inputs delivered by its owned config.
+// An explicit Options.PreferServer or attach mode uses Lane B; Resume always
+// uses Lane B because it needs the server API.
 //
 // DRIFT (code wins over 07 §4/§4.2/§5): the pinned binary (opencode 1.17.18)
 // already ships the v2-style API — every route under /api/, session-scoped,
@@ -50,10 +53,12 @@
 // the older flat 1.x shapes the design named. Also: the v2 SessionRunner in
 // 1.17.18 does not resolve custom OpenAI-compatible providers into its model
 // catalog (v2 provider policy is "Proposed/unimplemented" upstream), so a
-// full real-model turn through the injected baseURL is not exercisable against
-// the pinned binary yet — the config-injection, serve-lifecycle, event-stream,
-// and permission wiring are verified in-repo against httptest stubs replaying
-// the real wire shapes.
+// full real-model turn through the injected baseURL is not exercisable through
+// the pinned server API. Binary-backed one-shot work therefore uses Lane A,
+// where the same owned config is live and the pinned CLI resolves custom
+// OpenAI-compatible providers. Lane B remains available for explicit server
+// probes and attach mode; its config-injection, serve-lifecycle, event-stream,
+// and permission wiring are verified in-repo against real wire shapes.
 //
 // Auth model: opencode's local server is unauthenticated by default; the
 // optional OPENCODE_API_KEY env var is forwarded as a Bearer token on the

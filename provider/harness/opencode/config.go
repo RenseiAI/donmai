@@ -9,12 +9,11 @@ import (
 
 // ─── Per-session opencode.json injection (07-design-opencode-spawn.md §5) ────
 //
-// Lane B stands up one `opencode serve` child per donmai session on a
-// loopback port the provider owns. Before the child starts, config.go
-// renders a session-scoped opencode.json and points the child at it via the
-// OPENCODE_CONFIG env var. config_boundary.go writes that file into a unique
-// provider-owned 0700 temp boundary, never the worktree, and removes it after
-// the child stops. The file is 0600, regenerated per spawn, and never reused.
+// Binary-backed configured sessions render a session-scoped opencode.json and
+// point the `opencode run` or `opencode serve` child at it via OPENCODE_CONFIG.
+// config_boundary.go writes that file into a unique provider-owned 0700 temp
+// boundary, never the worktree, and removes it after the child stops. The file
+// is 0600, regenerated per spawn, and never reused.
 //
 // The config enforces three Rensei routing guarantees:
 //

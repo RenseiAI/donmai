@@ -24,9 +24,9 @@ var (
 	errOpenCodeShutdown       = errors.New("provider/opencode: provider is shut down")
 )
 
-// openCodeConfigBoundary owns one Lane-B config outside the session worktree.
+// openCodeConfigBoundary owns one binary-backed config outside the session worktree.
 // The file may contain remote MCP headers, so it is never placed in the repo,
-// reused by another session, or retained after its serve child stops.
+// reused by another session, or retained after its run/serve handle stops.
 type openCodeConfigBoundary struct {
 	home       string
 	homeInfo   os.FileInfo

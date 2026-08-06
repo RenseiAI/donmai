@@ -257,7 +257,7 @@ func TestProvider_Spawn_HTTPMode_AttachUnreachable(t *testing.T) {
 	}
 }
 
-func TestProvider_UseServerLane_ProjectConfigFieldsNeverReachLaneA(t *testing.T) {
+func TestProvider_UseServerLane_ProjectConfigFieldsUseConfiguredCLI(t *testing.T) {
 	t.Parallel()
 	p := &Provider{binary: "/tmp/opencode"}
 	tests := []struct {
@@ -275,13 +275,72 @@ func TestProvider_UseServerLane_ProjectConfigFieldsNeverReachLaneA(t *testing.T)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if !p.useServerLane(tt.spec) {
-				t.Fatal("project-config-bearing spec routed to Lane A")
+			if p.useServerLane(tt.spec) {
+				t.Fatal("project-config-bearing one-shot unexpectedly routed to the incompatible v2 server lane")
 			}
 		})
 	}
 	if p.useServerLane(agent.Spec{Prompt: "plain one-shot", Model: "provider/model"}) {
 		t.Fatal("plain one-shot unexpectedly routed away from Lane A")
+	}
+}
+
+func TestProvider_ConfiguredCLIOwnsAndCleansProjectConfig(t *testing.T) {
+	bin := writeFakeOpenCodeScript(t)
+	configRoot := t.TempDir()
+	p := &Provider{binary: bin, configTempDir: configRoot}
+	h, err := p.Spawn(t.Context(), agent.Spec{
+		Prompt:          "configured one-shot",
+		Cwd:             t.TempDir(),
+		Autonomous:      true,
+		AllowedTools:    []string{"Read"},
+		DisallowedTools: []string{"Write"},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "tools", Command: "/usr/bin/false",
+		}},
+		MCPToolNames: []string{"mcp__tools__read"},
+		Endpoint: &agent.EndpointBinding{
+			Company: agent.CompanyLocal, Model: "fixture-model", BaseURL: "http://127.0.0.1:9/v1",
+			Protocol: agent.ProtoOpenAIChat, Host: agent.HostLocal, Auth: agent.AuthLocal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	cliHandle, ok := h.(*openCodeHandle)
+	if !ok {
+		t.Fatalf("Spawn handle = %T, want *openCodeHandle", h)
+	}
+	configuredPath := ""
+	for _, entry := range cliHandle.cmd.Env {
+		if strings.HasPrefix(entry, OCConfigEnvVar+"=") {
+			configuredPath = strings.TrimPrefix(entry, OCConfigEnvVar+"=")
+			break
+		}
+	}
+	if configuredPath == "" {
+		t.Fatal("configured CLI child env omitted OPENCODE_CONFIG")
+	}
+	info, err := os.Stat(configuredPath)
+	if err != nil {
+		t.Fatalf("stat owned config before Stop: %v", err)
+	}
+	if got := info.Mode().Perm(); got != openCodeConfigMode {
+		t.Fatalf("owned config mode = %04o, want %04o", got, openCodeConfigMode)
+	}
+	parent := filepath.Dir(configuredPath)
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		t.Fatalf("stat owned config boundary: %v", err)
+	}
+	if got := parentInfo.Mode().Perm(); got != openCodeHomeMode {
+		t.Fatalf("owned config boundary mode = %04o, want %04o", got, openCodeHomeMode)
+	}
+	if err := h.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if _, err := os.Stat(parent); !os.IsNotExist(err) {
+		t.Fatalf("owned config boundary survived Stop: %v", err)
 	}
 }
 
@@ -379,7 +438,7 @@ func TestProvider_Spawn_BinaryNotFound(t *testing.T) {
 	}
 }
 
-func TestProvider_SpawnServerFailureRemovesSecretConfigWithoutWorktreeResidue(t *testing.T) {
+func TestProvider_ConfiguredCLISpawnFailureRemovesSecretConfigWithoutWorktreeResidue(t *testing.T) {
 	const secretSentinel = "opencode-spawn-failure-bearer-must-not-surface"
 	repo := t.TempDir()
 	if output, err := testGitCommand(t, "init", "-q", repo).CombinedOutput(); err != nil {
@@ -474,19 +533,20 @@ func TestProvider_Spawn_FakeCLI_NDJSON(t *testing.T) {
 	// goroutine.
 	events := collectUntilResult(ctx, t, h)
 
-	var gotInit, gotAssistant, gotResult bool
+	var initCount int
+	var gotAssistant, gotResult bool
 	for _, ev := range events {
 		switch ev.(type) {
 		case agent.InitEvent:
-			gotInit = true
+			initCount++
 		case agent.AssistantTextEvent:
 			gotAssistant = true
 		case agent.ResultEvent:
 			gotResult = true
 		}
 	}
-	if !gotInit {
-		t.Error("events: want InitEvent (from step_start)")
+	if initCount != 1 {
+		t.Errorf("events: want exactly one InitEvent across model/tool steps, got %d", initCount)
 	}
 	if !gotAssistant {
 		t.Error("events: want AssistantTextEvent (from text event)")
@@ -809,13 +869,12 @@ func TestBuildOpenCodeArgs_NonAutonomous(t *testing.T) {
 	}
 }
 
-func TestBuildOpenCodeArgs_Cwd_NoDirFlag(t *testing.T) {
+func TestBuildOpenCodeArgs_Cwd_UsesExplicitDirFlag(t *testing.T) {
 	t.Parallel()
-	// D-2: cwd is delivered via cmd.Dir in spawnCLI, not a --dir flag
-	// (--dir targets a remote server when attaching).
 	argv := buildOpenCodeArgs(agent.Spec{Cwd: "/workspace"})
-	if contains(argv, "--dir") {
-		t.Errorf("want no --dir flag (cwd handled via cmd.Dir), got %v", argv)
+	idx := indexOf(argv, "--dir")
+	if idx < 0 || idx+1 >= len(argv) || argv[idx+1] != "/workspace" {
+		t.Errorf("want --dir /workspace to override inherited PWD, got %v", argv)
 	}
 }
 
@@ -824,6 +883,21 @@ func TestBuildOpenCodeArgs_Model(t *testing.T) {
 	argv := buildOpenCodeArgs(agent.Spec{Model: "anthropic/claude-opus-4"})
 	if !contains(argv, "--model") {
 		t.Errorf("want --model in %v", argv)
+	}
+}
+
+func TestBuildOpenCodeArgs_EndpointModelUsesOwnedProviderRef(t *testing.T) {
+	t.Parallel()
+	argv := buildOpenCodeArgs(agent.Spec{
+		Model: "stale-model",
+		Endpoint: &agent.EndpointBinding{
+			Company: agent.CompanyLocal,
+			Model:   "resolved-model",
+		},
+	})
+	idx := indexOf(argv, "--model")
+	if idx < 0 || idx+1 >= len(argv) || argv[idx+1] != OCProviderID+"/resolved-model" {
+		t.Errorf("want --model %s/resolved-model, got %v", OCProviderID, argv)
 	}
 }
 
@@ -924,6 +998,7 @@ func indexOf(slice []string, s string) int {
 
 const fakeOpenCodeNDJSON = `{"type":"step_start","sessionID":"ses_opencode_test_001","part":{"type":"step-start"}}
 {"type":"text","sessionID":"ses_opencode_test_001","part":{"type":"text","text":"Hello from opencode fake"}}
+{"type":"step_start","sessionID":"ses_opencode_test_001","part":{"type":"step-start"}}
 {"type":"step_finish","sessionID":"ses_opencode_test_001","part":{"type":"step-finish","reason":"stop","tokens":{"total":50,"input":40,"output":10},"cost":0}}
 `
 
