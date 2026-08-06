@@ -1,0 +1,2398 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "contractVersion": "donmai.execution-cell/v1alpha1",
+  "generatedFrom": "donmai/executioncell/v1alpha1",
+  "schemas": {
+    "HarnessRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
+      "additionalProperties": false
+    },
+    "ModelRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "author": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        }
+      },
+      "required": [
+        "id",
+        "author"
+      ],
+      "additionalProperties": false
+    },
+    "ServingEndpointRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "protocol": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "operator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        }
+      },
+      "required": [
+        "id",
+        "protocol",
+        "operator",
+        "revision"
+      ],
+      "additionalProperties": false
+    },
+    "AuthBindingRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "mechanism": {
+          "type": "string",
+          "enum": [
+            "api_key",
+            "oauth",
+            "cli_session",
+            "service_account",
+            "federated",
+            "none"
+          ]
+        },
+        "commercialMode": {
+          "type": "string",
+          "enum": [
+            "usage_billed",
+            "subscription",
+            "platform_metered",
+            "self_hosted",
+            "free"
+          ]
+        },
+        "authority": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "bindingScope": {
+          "type": "string",
+          "enum": [
+            "process",
+            "session",
+            "harness",
+            "endpoint",
+            "host",
+            "pool",
+            "project",
+            "org"
+          ]
+        },
+        "portability": {
+          "type": "string",
+          "enum": [
+            "portable",
+            "endpoint_bound",
+            "harness_bound",
+            "host_bound"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "mechanism",
+        "commercialMode",
+        "authority",
+        "bindingScope",
+        "portability"
+      ],
+      "additionalProperties": false
+    },
+    "PlacementRef": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "host",
+            "pool",
+            "sandbox",
+            "remote_peer"
+          ]
+        },
+        "resolution": {
+          "type": "string",
+          "enum": [
+            "exact",
+            "claim_bound"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "resolution"
+      ],
+      "additionalProperties": false
+    },
+    "CapabilityRequest": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "parametersDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "FallbackAlternative": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "harness": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            }
+          },
+          "required": [
+            "id",
+            "version"
+          ],
+          "additionalProperties": false
+        },
+        "model": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "author": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            }
+          },
+          "required": [
+            "id",
+            "author"
+          ],
+          "additionalProperties": false
+        },
+        "endpoint": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "protocol": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "operator": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            }
+          },
+          "required": [
+            "id",
+            "protocol",
+            "operator",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "authBinding": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "api_key",
+                "oauth",
+                "cli_session",
+                "service_account",
+                "federated",
+                "none"
+              ]
+            },
+            "commercialMode": {
+              "type": "string",
+              "enum": [
+                "usage_billed",
+                "subscription",
+                "platform_metered",
+                "self_hosted",
+                "free"
+              ]
+            },
+            "authority": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "bindingScope": {
+              "type": "string",
+              "enum": [
+                "process",
+                "session",
+                "harness",
+                "endpoint",
+                "host",
+                "pool",
+                "project",
+                "org"
+              ]
+            },
+            "portability": {
+              "type": "string",
+              "enum": [
+                "portable",
+                "endpoint_bound",
+                "harness_bound",
+                "host_bound"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "mechanism",
+            "commercialMode",
+            "authority",
+            "bindingScope",
+            "portability"
+          ],
+          "additionalProperties": false
+        },
+        "placement": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "host",
+                "pool",
+                "sandbox",
+                "remote_peer"
+              ]
+            },
+            "resolution": {
+              "type": "string",
+              "enum": [
+                "exact",
+                "claim_bound"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "resolution"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "FallbackPolicy": {
+      "maxItems": 64,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+          },
+          "harness": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              }
+            },
+            "required": [
+              "id",
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          "model": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "author": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              }
+            },
+            "required": [
+              "id",
+              "author"
+            ],
+            "additionalProperties": false
+          },
+          "endpoint": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "protocol": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "operator": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "revision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              }
+            },
+            "required": [
+              "id",
+              "protocol",
+              "operator",
+              "revision"
+            ],
+            "additionalProperties": false
+          },
+          "authBinding": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "mechanism": {
+                "type": "string",
+                "enum": [
+                  "api_key",
+                  "oauth",
+                  "cli_session",
+                  "service_account",
+                  "federated",
+                  "none"
+                ]
+              },
+              "commercialMode": {
+                "type": "string",
+                "enum": [
+                  "usage_billed",
+                  "subscription",
+                  "platform_metered",
+                  "self_hosted",
+                  "free"
+                ]
+              },
+              "authority": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "bindingScope": {
+                "type": "string",
+                "enum": [
+                  "process",
+                  "session",
+                  "harness",
+                  "endpoint",
+                  "host",
+                  "pool",
+                  "project",
+                  "org"
+                ]
+              },
+              "portability": {
+                "type": "string",
+                "enum": [
+                  "portable",
+                  "endpoint_bound",
+                  "harness_bound",
+                  "host_bound"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "mechanism",
+              "commercialMode",
+              "authority",
+              "bindingScope",
+              "portability"
+            ],
+            "additionalProperties": false
+          },
+          "placement": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "host",
+                  "pool",
+                  "sandbox",
+                  "remote_peer"
+                ]
+              },
+              "resolution": {
+                "type": "string",
+                "enum": [
+                  "exact",
+                  "claim_bound"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "kind",
+              "resolution"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "DispatchIntent": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "type": "string",
+          "const": "donmai.execution-cell/v1alpha1"
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "harness": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            }
+          },
+          "required": [
+            "id",
+            "version"
+          ],
+          "additionalProperties": false
+        },
+        "model": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "author": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            }
+          },
+          "required": [
+            "id",
+            "author"
+          ],
+          "additionalProperties": false
+        },
+        "endpoint": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "protocol": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "operator": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            }
+          },
+          "required": [
+            "id",
+            "protocol",
+            "operator",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "authBinding": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "api_key",
+                "oauth",
+                "cli_session",
+                "service_account",
+                "federated",
+                "none"
+              ]
+            },
+            "commercialMode": {
+              "type": "string",
+              "enum": [
+                "usage_billed",
+                "subscription",
+                "platform_metered",
+                "self_hosted",
+                "free"
+              ]
+            },
+            "authority": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "bindingScope": {
+              "type": "string",
+              "enum": [
+                "process",
+                "session",
+                "harness",
+                "endpoint",
+                "host",
+                "pool",
+                "project",
+                "org"
+              ]
+            },
+            "portability": {
+              "type": "string",
+              "enum": [
+                "portable",
+                "endpoint_bound",
+                "harness_bound",
+                "host_bound"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "mechanism",
+            "commercialMode",
+            "authority",
+            "bindingScope",
+            "portability"
+          ],
+          "additionalProperties": false
+        },
+        "placement": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "host",
+                "pool",
+                "sandbox",
+                "remote_peer"
+              ]
+            },
+            "resolution": {
+              "type": "string",
+              "enum": [
+                "exact",
+                "claim_bound"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "resolution"
+          ],
+          "additionalProperties": false
+        },
+        "sessionMode": {
+          "type": "string",
+          "enum": [
+            "autonomous",
+            "human_controlled"
+          ]
+        },
+        "requiredCapabilities": {
+          "maxItems": 256,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "parametersDigest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "optionalCapabilities": {
+          "maxItems": 256,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "parametersDigest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "fallbackAlternatives": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "harness": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  }
+                },
+                "required": [
+                  "id",
+                  "version"
+                ],
+                "additionalProperties": false
+              },
+              "model": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "author": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  }
+                },
+                "required": [
+                  "id",
+                  "author"
+                ],
+                "additionalProperties": false
+              },
+              "endpoint": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "protocol": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "operator": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  }
+                },
+                "required": [
+                  "id",
+                  "protocol",
+                  "operator",
+                  "revision"
+                ],
+                "additionalProperties": false
+              },
+              "authBinding": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "mechanism": {
+                    "type": "string",
+                    "enum": [
+                      "api_key",
+                      "oauth",
+                      "cli_session",
+                      "service_account",
+                      "federated",
+                      "none"
+                    ]
+                  },
+                  "commercialMode": {
+                    "type": "string",
+                    "enum": [
+                      "usage_billed",
+                      "subscription",
+                      "platform_metered",
+                      "self_hosted",
+                      "free"
+                    ]
+                  },
+                  "authority": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "bindingScope": {
+                    "type": "string",
+                    "enum": [
+                      "process",
+                      "session",
+                      "harness",
+                      "endpoint",
+                      "host",
+                      "pool",
+                      "project",
+                      "org"
+                    ]
+                  },
+                  "portability": {
+                    "type": "string",
+                    "enum": [
+                      "portable",
+                      "endpoint_bound",
+                      "harness_bound",
+                      "host_bound"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "mechanism",
+                  "commercialMode",
+                  "authority",
+                  "bindingScope",
+                  "portability"
+                ],
+                "additionalProperties": false
+              },
+              "placement": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "host",
+                      "pool",
+                      "sandbox",
+                      "remote_peer"
+                    ]
+                  },
+                  "resolution": {
+                    "type": "string",
+                    "enum": [
+                      "exact",
+                      "claim_bound"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "kind",
+                  "resolution"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "contractVersion",
+        "requestId",
+        "model",
+        "sessionMode",
+        "requiredCapabilities",
+        "optionalCapabilities",
+        "fallbackAlternatives"
+      ],
+      "additionalProperties": false
+    },
+    "ResolvedExecutionCell": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "type": "string",
+          "const": "donmai.execution-cell/v1alpha1"
+        },
+        "harness": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            }
+          },
+          "required": [
+            "id",
+            "version"
+          ],
+          "additionalProperties": false
+        },
+        "model": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "author": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            }
+          },
+          "required": [
+            "id",
+            "author"
+          ],
+          "additionalProperties": false
+        },
+        "endpoint": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "protocol": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "operator": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            }
+          },
+          "required": [
+            "id",
+            "protocol",
+            "operator",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "authBinding": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "mechanism": {
+              "type": "string",
+              "enum": [
+                "api_key",
+                "oauth",
+                "cli_session",
+                "service_account",
+                "federated",
+                "none"
+              ]
+            },
+            "commercialMode": {
+              "type": "string",
+              "enum": [
+                "usage_billed",
+                "subscription",
+                "platform_metered",
+                "self_hosted",
+                "free"
+              ]
+            },
+            "authority": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "bindingScope": {
+              "type": "string",
+              "enum": [
+                "process",
+                "session",
+                "harness",
+                "endpoint",
+                "host",
+                "pool",
+                "project",
+                "org"
+              ]
+            },
+            "portability": {
+              "type": "string",
+              "enum": [
+                "portable",
+                "endpoint_bound",
+                "harness_bound",
+                "host_bound"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "mechanism",
+            "commercialMode",
+            "authority",
+            "bindingScope",
+            "portability"
+          ],
+          "additionalProperties": false
+        },
+        "placement": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "host",
+                "pool",
+                "sandbox",
+                "remote_peer"
+              ]
+            },
+            "resolution": {
+              "type": "string",
+              "enum": [
+                "exact",
+                "claim_bound"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "resolution"
+          ],
+          "additionalProperties": false
+        },
+        "sessionMode": {
+          "type": "string",
+          "enum": [
+            "autonomous",
+            "human_controlled"
+          ]
+        },
+        "grantedCapabilities": {
+          "maxItems": 256,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+              },
+              "parametersDigest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "evidenceTier": {
+          "type": "string",
+          "enum": [
+            "declared",
+            "implemented",
+            "unit_verified",
+            "integration_verified",
+            "smoked",
+            "production_eligible"
+          ]
+        },
+        "compatibilityDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "runtimeInventoryDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "contractVersion",
+        "harness",
+        "model",
+        "endpoint",
+        "authBinding",
+        "placement",
+        "sessionMode",
+        "grantedCapabilities",
+        "evidenceTier",
+        "compatibilityDigest",
+        "runtimeInventoryDigest"
+      ],
+      "additionalProperties": false
+    },
+    "ResolverDecision": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "explicit",
+            "default",
+            "inheritance",
+            "fallback",
+            "legacy_inference"
+          ]
+        },
+        "field": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "selectedRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "sourceRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
+      },
+      "required": [
+        "kind",
+        "field",
+        "selectedRef",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "AdmissionReceipt": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "contractVersion": {
+              "type": "string",
+              "const": "donmai.execution-cell/v1alpha1"
+            },
+            "receiptId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "intentDigest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "operationalPayloadDigest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "resolverDecisions": {
+              "maxItems": 512,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "explicit",
+                      "default",
+                      "inheritance",
+                      "fallback",
+                      "legacy_inference"
+                    ]
+                  },
+                  "field": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "selectedRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "sourceRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048
+                  }
+                },
+                "required": [
+                  "kind",
+                  "field",
+                  "selectedRef",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "recordedAt": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+            },
+            "decision": {
+              "type": "string",
+              "const": "admitted"
+            },
+            "cell": {
+              "type": "object",
+              "properties": {
+                "contractVersion": {
+                  "type": "string",
+                  "const": "donmai.execution-cell/v1alpha1"
+                },
+                "harness": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "version": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "version"
+                  ],
+                  "additionalProperties": false
+                },
+                "model": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "author": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "author"
+                  ],
+                  "additionalProperties": false
+                },
+                "endpoint": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "protocol": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "operator": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "protocol",
+                    "operator",
+                    "revision"
+                  ],
+                  "additionalProperties": false
+                },
+                "authBinding": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "mechanism": {
+                      "type": "string",
+                      "enum": [
+                        "api_key",
+                        "oauth",
+                        "cli_session",
+                        "service_account",
+                        "federated",
+                        "none"
+                      ]
+                    },
+                    "commercialMode": {
+                      "type": "string",
+                      "enum": [
+                        "usage_billed",
+                        "subscription",
+                        "platform_metered",
+                        "self_hosted",
+                        "free"
+                      ]
+                    },
+                    "authority": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "bindingScope": {
+                      "type": "string",
+                      "enum": [
+                        "process",
+                        "session",
+                        "harness",
+                        "endpoint",
+                        "host",
+                        "pool",
+                        "project",
+                        "org"
+                      ]
+                    },
+                    "portability": {
+                      "type": "string",
+                      "enum": [
+                        "portable",
+                        "endpoint_bound",
+                        "harness_bound",
+                        "host_bound"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "mechanism",
+                    "commercialMode",
+                    "authority",
+                    "bindingScope",
+                    "portability"
+                  ],
+                  "additionalProperties": false
+                },
+                "placement": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "host",
+                        "pool",
+                        "sandbox",
+                        "remote_peer"
+                      ]
+                    },
+                    "resolution": {
+                      "type": "string",
+                      "enum": [
+                        "exact",
+                        "claim_bound"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "kind",
+                    "resolution"
+                  ],
+                  "additionalProperties": false
+                },
+                "sessionMode": {
+                  "type": "string",
+                  "enum": [
+                    "autonomous",
+                    "human_controlled"
+                  ]
+                },
+                "grantedCapabilities": {
+                  "maxItems": 256,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                      },
+                      "parametersDigest": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "evidenceTier": {
+                  "type": "string",
+                  "enum": [
+                    "declared",
+                    "implemented",
+                    "unit_verified",
+                    "integration_verified",
+                    "smoked",
+                    "production_eligible"
+                  ]
+                },
+                "compatibilityDigest": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "runtimeInventoryDigest": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "required": [
+                "contractVersion",
+                "harness",
+                "model",
+                "endpoint",
+                "authBinding",
+                "placement",
+                "sessionMode",
+                "grantedCapabilities",
+                "evidenceTier",
+                "compatibilityDigest",
+                "runtimeInventoryDigest"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "contractVersion",
+            "receiptId",
+            "requestId",
+            "intentDigest",
+            "operationalPayloadDigest",
+            "resolverDecisions",
+            "recordedAt",
+            "decision",
+            "cell"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contractVersion": {
+              "type": "string",
+              "const": "donmai.execution-cell/v1alpha1"
+            },
+            "receiptId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "requestId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "intentDigest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "operationalPayloadDigest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "resolverDecisions": {
+              "maxItems": 512,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "explicit",
+                      "default",
+                      "inheritance",
+                      "fallback",
+                      "legacy_inference"
+                    ]
+                  },
+                  "field": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "selectedRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "sourceRef": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048
+                  }
+                },
+                "required": [
+                  "kind",
+                  "field",
+                  "selectedRef",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "recordedAt": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+            },
+            "decision": {
+              "type": "string",
+              "const": "denied"
+            },
+            "denialCode": {
+              "type": "string",
+              "enum": [
+                "unsupported_contract_version",
+                "unknown_harness",
+                "unsupported_harness_version",
+                "unknown_model",
+                "unknown_endpoint",
+                "unknown_auth_binding",
+                "unknown_placement",
+                "unsupported_session_mode",
+                "harness_unavailable",
+                "endpoint_unreachable",
+                "auth_unavailable",
+                "placement_unsatisfied",
+                "capability_unsupported",
+                "evidence_insufficient",
+                "fallback_not_allowed"
+              ]
+            },
+            "denialDetail": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            }
+          },
+          "required": [
+            "contractVersion",
+            "receiptId",
+            "requestId",
+            "intentDigest",
+            "operationalPayloadDigest",
+            "resolverDecisions",
+            "recordedAt",
+            "decision",
+            "denialCode"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ClaimReceipt": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "contractVersion": {
+              "type": "string",
+              "const": "donmai.execution-cell/v1alpha1"
+            },
+            "claimReceiptId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "admissionReceiptId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "claimId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "recordedAt": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+            },
+            "decision": {
+              "type": "string",
+              "const": "claimed"
+            },
+            "effectiveCell": {
+              "type": "object",
+              "properties": {
+                "contractVersion": {
+                  "type": "string",
+                  "const": "donmai.execution-cell/v1alpha1"
+                },
+                "harness": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "version": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "version"
+                  ],
+                  "additionalProperties": false
+                },
+                "model": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "author": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "author"
+                  ],
+                  "additionalProperties": false
+                },
+                "endpoint": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "protocol": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "operator": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "protocol",
+                    "operator",
+                    "revision"
+                  ],
+                  "additionalProperties": false
+                },
+                "authBinding": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "mechanism": {
+                      "type": "string",
+                      "enum": [
+                        "api_key",
+                        "oauth",
+                        "cli_session",
+                        "service_account",
+                        "federated",
+                        "none"
+                      ]
+                    },
+                    "commercialMode": {
+                      "type": "string",
+                      "enum": [
+                        "usage_billed",
+                        "subscription",
+                        "platform_metered",
+                        "self_hosted",
+                        "free"
+                      ]
+                    },
+                    "authority": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "bindingScope": {
+                      "type": "string",
+                      "enum": [
+                        "process",
+                        "session",
+                        "harness",
+                        "endpoint",
+                        "host",
+                        "pool",
+                        "project",
+                        "org"
+                      ]
+                    },
+                    "portability": {
+                      "type": "string",
+                      "enum": [
+                        "portable",
+                        "endpoint_bound",
+                        "harness_bound",
+                        "host_bound"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "mechanism",
+                    "commercialMode",
+                    "authority",
+                    "bindingScope",
+                    "portability"
+                  ],
+                  "additionalProperties": false
+                },
+                "placement": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                    },
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "host",
+                        "pool",
+                        "sandbox",
+                        "remote_peer"
+                      ]
+                    },
+                    "resolution": {
+                      "type": "string",
+                      "enum": [
+                        "exact",
+                        "claim_bound"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "kind",
+                    "resolution"
+                  ],
+                  "additionalProperties": false
+                },
+                "sessionMode": {
+                  "type": "string",
+                  "enum": [
+                    "autonomous",
+                    "human_controlled"
+                  ]
+                },
+                "grantedCapabilities": {
+                  "maxItems": 256,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+                      },
+                      "parametersDigest": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "evidenceTier": {
+                  "type": "string",
+                  "enum": [
+                    "declared",
+                    "implemented",
+                    "unit_verified",
+                    "integration_verified",
+                    "smoked",
+                    "production_eligible"
+                  ]
+                },
+                "compatibilityDigest": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "runtimeInventoryDigest": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "required": [
+                "contractVersion",
+                "harness",
+                "model",
+                "endpoint",
+                "authBinding",
+                "placement",
+                "sessionMode",
+                "grantedCapabilities",
+                "evidenceTier",
+                "compatibilityDigest",
+                "runtimeInventoryDigest"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "contractVersion",
+            "claimReceiptId",
+            "admissionReceiptId",
+            "claimId",
+            "recordedAt",
+            "decision",
+            "effectiveCell"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "contractVersion": {
+              "type": "string",
+              "const": "donmai.execution-cell/v1alpha1"
+            },
+            "claimReceiptId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "admissionReceiptId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "claimId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "recordedAt": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+            },
+            "decision": {
+              "type": "string",
+              "const": "denied"
+            },
+            "denialCode": {
+              "type": "string",
+              "enum": [
+                "claim_conflict",
+                "host_ineligible",
+                "inventory_changed",
+                "auth_unavailable",
+                "capability_regressed",
+                "evidence_regressed"
+              ]
+            },
+            "denialDetail": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            }
+          },
+          "required": [
+            "contractVersion",
+            "claimReceiptId",
+            "admissionReceiptId",
+            "claimId",
+            "recordedAt",
+            "decision",
+            "denialCode"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SessionRef": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "type": "string",
+          "const": "donmai.execution-cell/v1alpha1"
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "admissionReceiptId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "claimReceiptId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "autonomous",
+            "human_controlled"
+          ]
+        },
+        "capabilities": {
+          "type": "object",
+          "properties": {
+            "watch": {
+              "type": "boolean"
+            },
+            "replay": {
+              "type": "boolean"
+            },
+            "cancel": {
+              "type": "boolean"
+            },
+            "takeControl": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "watch",
+            "replay",
+            "cancel",
+            "takeControl"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "contractVersion",
+        "sessionId",
+        "admissionReceiptId",
+        "mode",
+        "capabilities"
+      ],
+      "additionalProperties": false
+    },
+    "DelegationEdgeIntent": {
+      "type": "object",
+      "properties": {
+        "contractVersion": {
+          "type": "string",
+          "const": "donmai.execution-cell/v1alpha1"
+        },
+        "edgeId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "parent": {
+          "type": "object",
+          "properties": {
+            "contractVersion": {
+              "type": "string",
+              "const": "donmai.execution-cell/v1alpha1"
+            },
+            "sessionId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "admissionReceiptId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "claimReceiptId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "autonomous",
+                "human_controlled"
+              ]
+            },
+            "capabilities": {
+              "type": "object",
+              "properties": {
+                "watch": {
+                  "type": "boolean"
+                },
+                "replay": {
+                  "type": "boolean"
+                },
+                "cancel": {
+                  "type": "boolean"
+                },
+                "takeControl": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "watch",
+                "replay",
+                "cancel",
+                "takeControl"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "contractVersion",
+            "sessionId",
+            "admissionReceiptId",
+            "mode",
+            "capabilities"
+          ],
+          "additionalProperties": false
+        },
+        "childRequestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "native_harness",
+            "platform_dispatch",
+            "a2a",
+            "host_cli"
+          ]
+        },
+        "inheritedFields": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._@+-]*(?:[:/][A-Za-z0-9._@+-]+)*$"
+          }
+        },
+        "detached": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "contractVersion",
+        "edgeId",
+        "parent",
+        "childRequestId",
+        "transport",
+        "inheritedFields",
+        "detached"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
