@@ -215,6 +215,85 @@ func TestPromptAdaptation_RejectsUnknownDeliveryAndMalformedIdentity(t *testing.
 	}
 }
 
+func TestPromptAdaptation_RejectsCrossChannelDuplicateStableIDs(t *testing.T) {
+	t.Parallel()
+	profile, _ := (&claude.Provider{}).Manifest().PromptProfile(agent.PromptModeAutonomous)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agent.PromptPlan)
+	}{
+		{
+			name: "harness protocol",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.HarnessProtocol.ID = "user"
+			},
+		},
+		{
+			name: "base append",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.BaseInstructions = agent.BaseInstructionPlan{
+					Strategy: agent.BaseInstructionsAppend,
+					Content:  &agent.PromptContent{ID: "user", Text: "append", Required: true},
+				}
+			},
+		},
+		{
+			name: "base replace",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.BaseInstructions = agent.BaseInstructionPlan{
+					Strategy:                   agent.BaseInstructionsReplace,
+					Content:                    &agent.PromptContent{ID: "user", Text: "replace", Required: true},
+					ReplacementAuthorizationID: "policy-auth",
+				}
+			},
+		},
+		{
+			name: "role intent",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.RoleIntent.ID = "user"
+			},
+		},
+		{
+			name: "initial context",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.InitialContext[0].ID = "user"
+			},
+		},
+		{
+			name: "user amendment identity",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.UserAmendments[0].ID = "user"
+			},
+		},
+		{
+			name: "user amendment content identity",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.UserAmendments[0].Content.ID = "user"
+			},
+		},
+		{
+			name: "preserved base receipt identity",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.BaseInstructions = agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve}
+				plan.UserPrompt.ID = "base-instructions"
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			plan := fullPromptPlan()
+			tc.mutate(&plan)
+			_, receipt, err := agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
+			if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
+				t.Fatalf("AdaptPrompt error = %v, want malformed prompt plan denial", err)
+			}
+			if receipt.Decision != "denied" || len(receipt.Entries) != 1 || receipt.Entries[0].ID != "prompt-plan" {
+				t.Fatalf("denied receipt = %#v, want one prompt-plan denial", receipt)
+			}
+		})
+	}
+}
+
 func TestPromptAdaptation_ReceiptContainsDigestsNotBodies(t *testing.T) {
 	t.Parallel()
 	profile, _ := (&ollama.Provider{}).Manifest().PromptProfile(agent.PromptModeAutonomous)

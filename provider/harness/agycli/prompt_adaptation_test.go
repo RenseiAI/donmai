@@ -2,6 +2,7 @@ package agycli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -115,6 +116,13 @@ echo '<<<END_DONMAI_RESULT>>>'
 			if entries != 1 {
 				t.Fatalf("harness-owned envelope receipt entries = %d, want 1; receipt=%#v", entries, receipt)
 			}
+			seen := make(map[string]struct{}, len(receipt.Entries))
+			for _, entry := range receipt.Entries {
+				if _, duplicate := seen[entry.ID]; duplicate {
+					t.Fatalf("receipt has duplicate stable ID %q: %#v", entry.ID, receipt)
+				}
+				seen[entry.ID] = struct{}{}
+			}
 		})
 	}
 }
@@ -130,6 +138,85 @@ func TestSpawn_ResultEnvelopeDuplicateTypedIDFailsClosed(t *testing.T) {
 	_, err := spawnFake(context.Background(), t, p, agent.Spec{PromptPlan: &plan, Cwd: t.TempDir()})
 	if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
 		t.Fatalf("Spawn error = %v, want malformed prompt plan denial", err)
+	}
+}
+
+func TestSpawn_ResultEnvelopeIDIsReservedAcrossCallerAuthorities(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agent.PromptPlan)
+	}{
+		{
+			name: "harness protocol",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.HarnessProtocol.ID = "agy-result-envelope"
+			},
+		},
+		{
+			name: "base append",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.BaseInstructions = agent.BaseInstructionPlan{
+					Strategy: agent.BaseInstructionsAppend,
+					Content:  &agent.PromptContent{ID: "agy-result-envelope", Text: "append", Required: true},
+				}
+			},
+		},
+		{
+			name: "base replace",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.BaseInstructions = agent.BaseInstructionPlan{
+					Strategy:                   agent.BaseInstructionsReplace,
+					Content:                    &agent.PromptContent{ID: "agy-result-envelope", Text: "replace", Required: true},
+					ReplacementAuthorizationID: "caller-authorized-replace",
+				}
+			},
+		},
+		{
+			name: "role intent",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.RoleIntent.ID = "agy-result-envelope"
+			},
+		},
+		{
+			name: "initial context",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.InitialContext[0].ID = "agy-result-envelope"
+			},
+		},
+		{
+			name: "user prompt",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.UserPrompt.ID = "agy-result-envelope"
+			},
+		},
+		{
+			name: "user amendment identity",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.UserAmendments[0].ID = "agy-result-envelope"
+			},
+		},
+		{
+			name: "user amendment content identity",
+			mutate: func(plan *agent.PromptPlan) {
+				plan.UserAmendments[0].Content.ID = "agy-result-envelope"
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			started := filepath.Join(t.TempDir(), "spawned")
+			p := newFakeProvider(t, fmt.Sprintf("printf started > %q\n", started), Options{DisableTranscriptEnrichment: true})
+			plan := agyPromptPlan(true)
+			tc.mutate(&plan)
+			_, err := spawnFake(context.Background(), t, p, agent.Spec{PromptPlan: &plan, Cwd: t.TempDir()})
+			if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
+				t.Fatalf("Spawn error = %v, want malformed prompt plan denial", err)
+			}
+			if _, statErr := os.Stat(started); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("caller collision started provider process: stat error = %v", statErr)
+			}
+		})
 	}
 }
 

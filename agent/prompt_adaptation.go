@@ -575,6 +575,19 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 }
 
 func validatePromptPlan(plan PromptPlan) string {
+	// PromptDeliveryReceipt uses plan entry IDs as its durable provenance keys.
+	// A key must therefore name exactly one authority across the whole effective
+	// plan, not merely within one channel. In particular, providers may append
+	// their own amendment before this validation runs; callers cannot be allowed
+	// to claim the same ID from a different channel.
+	seenEntryIDs := make(map[string]string)
+	registerEntryID := func(id, label string) string {
+		if prior, exists := seenEntryIDs[id]; exists {
+			return fmt.Sprintf("%s stable id %q duplicates %s", label, id, prior)
+		}
+		seenEntryIDs[id] = label
+		return ""
+	}
 	validateContent := func(content *PromptContent, label string) string {
 		if content == nil {
 			return ""
@@ -590,14 +603,32 @@ func validatePromptPlan(plan PromptPlan) string {
 	if detail := validateContent(plan.HarnessProtocol, "harness protocol"); detail != "" {
 		return detail
 	}
+	if plan.HarnessProtocol != nil {
+		if detail := registerEntryID(plan.HarnessProtocol.ID, "harness protocol"); detail != "" {
+			return detail
+		}
+	}
 	if detail := validateContent(plan.BaseInstructions.Content, "base instructions"); detail != "" {
 		return detail
+	}
+	if plan.BaseInstructions.Content != nil {
+		if detail := registerEntryID(plan.BaseInstructions.Content.ID, "base instructions"); detail != "" {
+			return detail
+		}
 	}
 	if detail := validateContent(plan.RoleIntent, "role intent"); detail != "" {
 		return detail
 	}
+	if plan.RoleIntent != nil {
+		if detail := registerEntryID(plan.RoleIntent.ID, "role intent"); detail != "" {
+			return detail
+		}
+	}
 	for i := range plan.InitialContext {
 		if detail := validateContent(&plan.InitialContext[i], "initial context"); detail != "" {
+			return detail
+		}
+		if detail := registerEntryID(plan.InitialContext[i].ID, "initial context"); detail != "" {
 			return detail
 		}
 	}
@@ -607,18 +638,33 @@ func validatePromptPlan(plan PromptPlan) string {
 	if plan.UserPrompt.Text == "" && plan.UserPrompt.Required {
 		return "user prompt is required but empty"
 	}
+	if detail := registerEntryID(plan.UserPrompt.ID, "user prompt"); detail != "" {
+		return detail
+	}
 
-	seenAmendments := make(map[string]bool, len(plan.UserAmendments))
 	for i := range plan.UserAmendments {
 		amendment := &plan.UserAmendments[i]
-		if amendment.ID == "" || seenAmendments[amendment.ID] {
-			return "user amendments require unique stable ids"
+		if amendment.ID == "" {
+			return "user amendments require stable ids"
 		}
-		seenAmendments[amendment.ID] = true
+		if detail := registerEntryID(amendment.ID, "user amendment"); detail != "" {
+			return detail
+		}
 		if amendment.Position != UserPromptPrepend && amendment.Position != UserPromptAppend {
 			return "user amendment has an unknown position"
 		}
 		if detail := validateContent(&amendment.Content, "user amendment content"); detail != "" {
+			return detail
+		}
+		if detail := registerEntryID(amendment.Content.ID, "user amendment content"); detail != "" {
+			return detail
+		}
+	}
+	// Preserve has a receipt-bearing synthetic baseline entry. Reserve it here
+	// as well so a caller cannot make a successful receipt ambiguous by using
+	// its stable ID in a different channel.
+	if plan.BaseInstructions.Strategy == BaseInstructionsPreserve {
+		if detail := registerEntryID("base-instructions", "preserved base instructions"); detail != "" {
 			return detail
 		}
 	}
