@@ -439,6 +439,7 @@ func TestTranslateSpec_EndpointBindingCopied(t *testing.T) {
 		BaseURL:       "https://gateway.example.test/v1",
 		Protocol:      agent.ProtoOpenAIResponses,
 		Host:          agent.HostGateway,
+		Mechanism:     agent.AuthAPIKey,
 		Auth:          agent.AuthBYOK,
 		Region:        "us-east-1",
 		CostModel:     agent.CostMeteredPerToken,
@@ -461,6 +462,7 @@ func TestTranslateSpec_EndpointBindingCopied(t *testing.T) {
 		baseURL       string
 		protocol      agent.WireProtocol
 		host          agent.ServingHost
+		mechanism     agent.AuthMechanism
 		auth          agent.AuthMode
 		region        string
 		costModel     agent.CostModel
@@ -472,6 +474,7 @@ func TestTranslateSpec_EndpointBindingCopied(t *testing.T) {
 		baseURL:       spec.Endpoint.BaseURL,
 		protocol:      spec.Endpoint.Protocol,
 		host:          spec.Endpoint.Host,
+		mechanism:     spec.Endpoint.Mechanism,
 		auth:          spec.Endpoint.Auth,
 		region:        spec.Endpoint.Region,
 		costModel:     spec.Endpoint.CostModel,
@@ -483,6 +486,7 @@ func TestTranslateSpec_EndpointBindingCopied(t *testing.T) {
 		baseURL:       endpoint.BaseURL,
 		protocol:      endpoint.Protocol,
 		host:          endpoint.Host,
+		mechanism:     endpoint.Mechanism,
 		auth:          endpoint.Auth,
 		region:        endpoint.Region,
 		costModel:     endpoint.CostModel,

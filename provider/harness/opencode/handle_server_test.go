@@ -266,6 +266,7 @@ func TestProvider_SpawnServer_AttachWiring(t *testing.T) {
 		Cwd:    cwd,
 		Endpoint: &agent.EndpointBinding{
 			Company: agent.CompanyOpenAI, Model: "gpt-x", BaseURL: "http://compat/v1",
+			Protocol: agent.ProtoOpenAIChat, Host: agent.HostDirect, Mechanism: agent.AuthNone,
 		},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

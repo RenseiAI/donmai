@@ -210,6 +210,7 @@ func (g *Gateway) Bind(cfg BindConfig) (agent.EndpointBinding, error) {
 		BaseURL:   fmt.Sprintf("http://%s/v1", addr),
 		Protocol:  agent.ProtoOpenAIChat,
 		Host:      agent.HostGateway,
+		Mechanism: agent.AuthAPIKey,
 		Auth:      cfg.AuthMode,
 		CostModel: agent.CostMeteredPerToken,
 		Env:       map[string]string{TokenEnvVar: string(tok)},

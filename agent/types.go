@@ -381,10 +381,10 @@ type Spec struct {
 	// projects the binding onto the CLI's serving-host env knobs
 	// (direct/bedrock/vertex — provider/harness/claude/endpoint.go) and
 	// the gemini harness routes the per-session generateContent URL
-	// (direct/vertex — spawnURL in provider/harness/gemini/gemini.go).
-	// Both honor Endpoint.Model over Spec.Model when set, the same rule as
-	// the one-shot lane. Harnesses without a read site (codex / opencode /
-	// amp / agycli) still intentionally ignore the field.
+	// (direct/vertex — spawnURL in provider/harness/gemini/gemini.go), and
+	// OpenCode injects a session-scoped generic openai-chat config. All three
+	// honor Endpoint.Model over Spec.Model when set. Harnesses without a read
+	// site (codex / amp / agycli) still intentionally ignore the field.
 	//
 	// Declared as a POINTER (not a value) so the json:"endpoint,omitempty"
 	// tag actually omits the field for pre-P1 producers — Go's encoding/json

@@ -379,6 +379,15 @@ func (p *Provider) useServerLane(spec agent.Spec) bool {
 // returns a Handle backed by the running process.
 func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHandle, error) {
 	argv := buildOpenCodeArgs(spec)
+	cleanupConfig := func() {}
+	if spec.Endpoint != nil {
+		configPath, cleanup, err := writeSessionConfig(spec)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+		}
+		cleanupConfig = cleanup
+		spec.Env[OCConfigEnvVar] = configPath
+	}
 
 	// nolint:gosec // p.binary is resolved at provider construction
 	// from exec.LookPath; argv values come from a typed agent.Spec
@@ -387,7 +396,11 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 	if spec.Cwd != "" {
 		cmd.Dir = spec.Cwd
 	}
-	cmd.Env = composeEnv(os.Environ(), spec.Env)
+	parentEnv := os.Environ()
+	if spec.Endpoint != nil {
+		parentEnv = filterEndpointControls(parentEnv)
+	}
+	cmd.Env = composeEnv(parentEnv, spec.Env)
 	configureProcessGroup(cmd)
 	cmd.Cancel = func() error {
 		signalProcessGroup(cmd, syscall.SIGKILL)
@@ -396,17 +409,20 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		cleanupConfig()
 		return nil, fmt.Errorf("%w: stdin pipe: %v", agent.ErrSpawnFailed, err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = stdin.Close()
+		cleanupConfig()
 		return nil, fmt.Errorf("%w: stdout pipe: %v", agent.ErrSpawnFailed, err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
+		cleanupConfig()
 		return nil, fmt.Errorf("%w: stderr pipe: %v", agent.ErrSpawnFailed, err)
 	}
 
@@ -414,6 +430,7 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()
+		cleanupConfig()
 		return nil, fmt.Errorf("%w: cmd start: %v", agent.ErrSpawnFailed, err)
 	}
 
@@ -434,6 +451,7 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 		stderrBuf:  stderrBuf,
 		shutdown:   make(chan struct{}),
 		done:       make(chan struct{}),
+		cleanup:    cleanupConfig,
 	}
 
 	if p.versionUnverified {
@@ -490,8 +508,8 @@ func buildOpenCodeArgs(spec agent.Spec) []string {
 		argv = append(argv, "--auto")
 	}
 
-	if spec.Model != "" {
-		argv = append(argv, "--model", spec.Model)
+	if model := openCodeModel(spec); model != "" {
+		argv = append(argv, "--model", model)
 	}
 
 	if spec.Effort != "" {
@@ -499,6 +517,44 @@ func buildOpenCodeArgs(spec agent.Spec) []string {
 	}
 
 	return argv
+}
+
+func openCodeModel(spec agent.Spec) string {
+	if spec.Endpoint != nil {
+		return OCProviderID + "/" + spec.Endpoint.Model
+	}
+	return spec.Model
+}
+
+// writeSessionConfig creates one private config directory per endpoint-bound
+// Lane-A session. Ownership transfers to the returned handle after spawn.
+func writeSessionConfig(spec agent.Spec) (string, func(), error) {
+	dir, err := os.MkdirTemp("", "donmai-opencode-session-")
+	if err != nil {
+		return "", nil, fmt.Errorf("provider/opencode: create session config dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	path, err := writeConfig(dir, spec)
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
+}
+
+func filterEndpointControls(entries []string) []string {
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		if isEndpointControlEnv(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // spawnServer runs the Lane-B path: render + inject the per-session
@@ -676,6 +732,7 @@ type openCodeHandle struct {
 
 	done    chan struct{}
 	waitErr atomic.Pointer[error]
+	cleanup func()
 }
 
 // SessionID returns the provider-native session id captured from the
@@ -779,6 +836,7 @@ func (h *openCodeHandle) watchCtx(ctx context.Context) {
 // channel via sendEvent.
 func (h *openCodeHandle) readStdout() {
 	defer close(h.done)
+	defer h.cleanupConfig()
 	defer func() {
 		err := h.cmd.Wait()
 		if err != nil {
@@ -849,6 +907,12 @@ func (h *openCodeHandle) readStdout() {
 		Message: msg,
 		Code:    "spawn_no_result",
 	})
+}
+
+func (h *openCodeHandle) cleanupConfig() {
+	if h.cleanup != nil {
+		h.cleanup()
+	}
 }
 
 // ─── OpenCode NDJSON event mapping ──────────────────────────────────────────

@@ -1,5 +1,7 @@
 package executioncell
 
+import "github.com/RenseiAI/donmai/agent"
+
 // ContractVersion is the only version accepted by this package's decoders.
 const ContractVersion = "donmai.execution-cell/v1alpha1"
 
@@ -36,17 +38,19 @@ type ServingEndpointRef struct {
 	Revision string `json:"revision"`
 }
 
-// AuthMechanism identifies how a runtime authenticates without carrying credentials.
-type AuthMechanism string
+// AuthMechanism identifies how a runtime authenticates without carrying
+// credentials. The endpoint package owns the canonical type; this alias keeps
+// the execution-cell contract source-compatible.
+type AuthMechanism = agent.AuthMechanism
 
 // Supported authentication mechanisms.
 const (
-	AuthAPIKey         AuthMechanism = "api_key"
-	AuthOAuth          AuthMechanism = "oauth"
-	AuthCLISession     AuthMechanism = "cli_session"
-	AuthServiceAccount AuthMechanism = "service_account"
-	AuthFederated      AuthMechanism = "federated"
-	AuthNone           AuthMechanism = "none"
+	AuthAPIKey         = agent.AuthAPIKey
+	AuthOAuth          = agent.AuthOAuth
+	AuthCLISession     = agent.AuthCLISession
+	AuthServiceAccount = agent.AuthServiceAccount
+	AuthFederated      = agent.AuthFederated
+	AuthNone           = agent.AuthNone
 )
 
 // CommercialMode identifies how use of a binding is commercially accounted.

@@ -14,9 +14,10 @@ func TestBuildConfig_ProviderPinAndLockout(t *testing.T) {
 	t.Parallel()
 	spec := agent.Spec{
 		Endpoint: &agent.EndpointBinding{
-			Company: agent.CompanyOpenAI,
-			Model:   "gpt-4o-mini",
-			BaseURL: "https://compat.example/v1",
+			Company:   agent.CompanyOpenAI,
+			Model:     "gpt-4o-mini",
+			BaseURL:   "https://compat.example/v1",
+			Mechanism: agent.AuthAPIKey,
 		},
 	}
 	cfg := buildConfig(spec)
@@ -70,7 +71,7 @@ func TestBuildConfig_KeyNeverInlined(t *testing.T) {
 	// Even when a spec carries a credential value in env, the rendered config
 	// must not inline it — the value rides the process env, never disk.
 	spec := agent.Spec{
-		Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "m", BaseURL: "http://x/v1"},
+		Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "m", BaseURL: "http://x/v1", Mechanism: agent.AuthAPIKey},
 		Env:      map[string]string{OCKeyEnvVar: "sk-super-secret-value"},
 	}
 	data, err := json.Marshal(buildConfig(spec))
@@ -192,7 +193,7 @@ func TestProjectMCP_LocalAndPlatformRemote(t *testing.T) {
 func TestWriteConfig_Perms0600(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "state")
-	spec := agent.Spec{Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "m", BaseURL: "http://x/v1"}}
+	spec := agent.Spec{Endpoint: &agent.EndpointBinding{Company: agent.CompanyOpenAI, Model: "m", BaseURL: "http://x/v1", Mechanism: agent.AuthAPIKey}}
 	path, err := writeConfig(dir, spec)
 	if err != nil {
 		t.Fatalf("writeConfig: %v", err)
