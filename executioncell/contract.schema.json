@@ -162,7 +162,31 @@
         "portability",
         "delivery"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mechanism": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "mechanism"
+            ]
+          },
+          "then": {
+            "properties": {
+              "delivery": {
+                "const": "none"
+              }
+            },
+            "required": [
+              "delivery"
+            ]
+          }
+        }
+      ]
     },
     "PlacementRef": {
       "type": "object",
@@ -384,7 +408,31 @@
             "portability",
             "delivery"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mechanism": {
+                    "const": "none"
+                  }
+                },
+                "required": [
+                  "mechanism"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "delivery": {
+                    "const": "none"
+                  }
+                },
+                "required": [
+                  "delivery"
+                ]
+              }
+            }
+          ]
         },
         "placement": {
           "type": "object",
@@ -596,7 +644,31 @@
               "portability",
               "delivery"
             ],
-            "additionalProperties": false
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "mechanism": {
+                      "const": "none"
+                    }
+                  },
+                  "required": [
+                    "mechanism"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "delivery": {
+                      "const": "none"
+                    }
+                  },
+                  "required": [
+                    "delivery"
+                  ]
+                }
+              }
+            ]
           },
           "placement": {
             "type": "object",
@@ -810,7 +882,31 @@
             "portability",
             "delivery"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mechanism": {
+                    "const": "none"
+                  }
+                },
+                "required": [
+                  "mechanism"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "delivery": {
+                    "const": "none"
+                  }
+                },
+                "required": [
+                  "delivery"
+                ]
+              }
+            }
+          ]
         },
         "placement": {
           "type": "object",
@@ -1069,7 +1165,31 @@
                   "portability",
                   "delivery"
                 ],
-                "additionalProperties": false
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "mechanism": {
+                          "const": "none"
+                        }
+                      },
+                      "required": [
+                        "mechanism"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "delivery": {
+                          "const": "none"
+                        }
+                      },
+                      "required": [
+                        "delivery"
+                      ]
+                    }
+                  }
+                ]
               },
               "placement": {
                 "type": "object",
@@ -1289,7 +1409,31 @@
             "portability",
             "delivery"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mechanism": {
+                    "const": "none"
+                  }
+                },
+                "required": [
+                  "mechanism"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "delivery": {
+                    "const": "none"
+                  }
+                },
+                "required": [
+                  "delivery"
+                ]
+              }
+            }
+          ]
         },
         "placement": {
           "type": "object",
@@ -1687,7 +1831,31 @@
                     "portability",
                     "delivery"
                   ],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "mechanism": {
+                            "const": "none"
+                          }
+                        },
+                        "required": [
+                          "mechanism"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "delivery": {
+                            "const": "none"
+                          }
+                        },
+                        "required": [
+                          "delivery"
+                        ]
+                      }
+                    }
+                  ]
                 },
                 "placement": {
                   "type": "object",
@@ -2129,7 +2297,31 @@
                     "portability",
                     "delivery"
                   ],
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "mechanism": {
+                            "const": "none"
+                          }
+                        },
+                        "required": [
+                          "mechanism"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "delivery": {
+                            "const": "none"
+                          }
+                        },
+                        "required": [
+                          "delivery"
+                        ]
+                      }
+                    }
+                  ]
                 },
                 "placement": {
                   "type": "object",

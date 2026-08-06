@@ -95,6 +95,18 @@ func TestOwnershipAxesAndGenericEndpointStayIndependent(t *testing.T) {
 	if keyed.Endpoint.Protocol != "openai-chat" {
 		t.Fatalf("endpoint protocol = %q, want openai-chat", keyed.Endpoint.Protocol)
 	}
+
+	var invalidNoAuthCell map[string]any
+	if err := json.Unmarshal(fixtures.Cells["lmStudioNoAuth"], &invalidNoAuthCell); err != nil {
+		t.Fatal(err)
+	}
+	invalidNoAuthCell["authBinding"].(map[string]any)["delivery"] = DeliveryEnvironment
+	invalidNoAuthRaw, err := json.Marshal(invalidNoAuthCell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = DecodeResolvedExecutionCell(invalidNoAuthRaw)
+	requireContractError(t, err, ErrorInvalidReference)
 }
 
 func TestClosedDecoderTypedFailures(t *testing.T) {
@@ -169,6 +181,49 @@ func TestClosedDecoderTypedFailures(t *testing.T) {
 			}
 		})
 	}
+
+	for _, delivery := range deliveries[:len(deliveries)-1] {
+		delivery := delivery
+		t.Run("no_auth_rejects_"+string(delivery), func(t *testing.T) {
+			raw := mutate(func(value map[string]any) {
+				auth := value["authBinding"].(map[string]any)
+				auth["mechanism"] = AuthNone
+				auth["delivery"] = delivery
+			})
+			_, decodeErr := DecodeDispatchIntent(raw, nil)
+			requireContractError(t, decodeErr, ErrorInvalidReference)
+		})
+	}
+
+	_, err = DecodeDispatchIntent(mutate(func(value map[string]any) {
+		auth := value["authBinding"].(map[string]any)
+		auth["mechanism"] = AuthNone
+		auth["delivery"] = DeliveryNone
+	}), nil)
+	if err != nil {
+		t.Fatalf("no-auth delivery none: %v", err)
+	}
+
+	_, err = DecodeDispatchIntent(mutate(func(value map[string]any) {
+		auth := value["authBinding"].(map[string]any)
+		auth["mechanism"] = AuthAPIKey
+		auth["delivery"] = DeliveryNone
+	}), nil)
+	if err != nil {
+		t.Fatalf("credentialed mechanism with no delivery remains a valid intent: %v", err)
+	}
+
+	_, err = DecodeDispatchIntent(mutate(func(value map[string]any) {
+		value["fallbackAlternatives"] = []any{map[string]any{
+			"id": "invalid_no_auth_fallback",
+			"authBinding": map[string]any{
+				"id": "auth_none_ambient", "mechanism": "none", "commercialMode": "free",
+				"authority": "none", "bindingScope": "endpoint", "portability": "endpoint_bound",
+				"delivery": "environment",
+			},
+		}}
+	}), nil)
+	requireContractError(t, err, ErrorInvalidReference)
 
 	_, err = DecodeDispatchIntent(mutate(func(value map[string]any) {
 		auth := value["authBinding"].(map[string]any)
@@ -351,6 +406,24 @@ func TestAdmissionFallbackRequiresOneCompleteNamedAlternative(t *testing.T) {
 		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
 	})
 
+	t.Run("default cannot mask selected alternative axis", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.AuthBinding = nil
+		intent.FallbackAlternatives = FallbackPolicy{{
+			ID: "complete_alt", Model: &fallbackModel, AuthBinding: &fallbackAuth,
+		}}
+		receipt.Cell.Model = fallbackModel
+		receipt.Cell.AuthBinding = fallbackAuth
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model", "authBinding"),
+			decision("model", "model:openai/gpt-5.6-mini", "complete_alt"),
+			ResolverDecision{
+				Kind: DecisionDefault, Field: "authBinding",
+				SelectedRef: "auth-binding:auth_brokered_fallback",
+				Reason:      "Incorrectly masked fallback auth as a default.",
+			})
+		requireContractError(t, AssertAdmissionProvenance(intent, immutable(t, intent, receipt)), ErrorInvalidReference)
+	})
+
 	t.Run("fallback plus legitimate non-fallback default", func(t *testing.T) {
 		intent, receipt := base(t)
 		intent.AuthBinding = nil
@@ -383,6 +456,30 @@ func TestAdmissionFallbackRequiresOneCompleteNamedAlternative(t *testing.T) {
 			decision("authBinding", "auth-binding:auth_brokered_fallback", "complete_alt"))
 		if err := AssertAdmissionProvenance(intent, immutable(t, intent, receipt)); err != nil {
 			t.Fatalf("complete named fallback alternative: %v", err)
+		}
+	})
+
+	t.Run("selected alternative preserves omitted requested axes", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.FallbackAlternatives = FallbackPolicy{{ID: "model_alt", Model: &fallbackModel}}
+		receipt.Cell.Model = fallbackModel
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model"),
+			decision("model", "model:openai/gpt-5.6-mini", "model_alt"))
+		if err := AssertAdmissionProvenance(intent, immutable(t, intent, receipt)); err != nil {
+			t.Fatalf("selected fallback changed an omitted requested axis: %v", err)
+		}
+	})
+
+	t.Run("selected alternative may repeat unchanged primary axis", func(t *testing.T) {
+		intent, receipt := base(t)
+		intent.FallbackAlternatives = FallbackPolicy{{
+			ID: "model_alt", Model: &fallbackModel, Endpoint: intent.Endpoint,
+		}}
+		receipt.Cell.Model = fallbackModel
+		receipt.ResolverDecisions = append(withoutDecisions(receipt, "model"),
+			decision("model", "model:openai/gpt-5.6-mini", "model_alt"))
+		if err := AssertAdmissionProvenance(intent, immutable(t, intent, receipt)); err != nil {
+			t.Fatalf("unchanged primary axis required false fallback provenance: %v", err)
 		}
 	})
 

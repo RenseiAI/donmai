@@ -121,6 +121,9 @@ func classifyValidationError(err error) *ContractError {
 	if strings.Contains(lower, "required") {
 		return contractError(ErrorMissingRequiredField, nil, "%s", message)
 	}
+	if strings.Contains(lower, "'allof' failed") {
+		return contractError(ErrorInvalidReference, nil, "%s", message)
+	}
 	for _, field := range discriminatorFields {
 		if strings.Contains(message, field) {
 			return contractError(ErrorUnknownDiscriminator, []string{field}, "%s", message)
@@ -282,6 +285,34 @@ func hasSelector(values []string, value string) bool {
 	return values == nil || slices.Contains(values, value)
 }
 
+func assertAuthBindingDelivery(binding *AuthBindingRef, path []string) *ContractError {
+	if binding != nil && binding.Mechanism == AuthNone && binding.Delivery != DeliveryNone {
+		return contractError(
+			ErrorInvalidReference,
+			append(slices.Clone(path), "delivery"),
+			"auth mechanism %q requires delivery %q; no-auth bindings never authorize ambient credentials",
+			AuthNone,
+			DeliveryNone,
+		)
+	}
+	return nil
+}
+
+func assertDispatchAuthBindings(intent DispatchIntent) *ContractError {
+	if err := assertAuthBindingDelivery(intent.AuthBinding, []string{"authBinding"}); err != nil {
+		return err
+	}
+	for index := range intent.FallbackAlternatives {
+		if err := assertAuthBindingDelivery(
+			intent.FallbackAlternatives[index].AuthBinding,
+			[]string{"fallbackAlternatives", fmt.Sprintf("%d", index), "authBinding"},
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func assertKnownSelectors(intent DispatchIntent, registry *ExecutionSelectorRegistry) *ContractError {
 	type candidate struct {
 		harness     *HarnessRef
@@ -339,6 +370,9 @@ func DecodeDispatchIntent(raw []byte, registry *ExecutionSelectorRegistry) (Disp
 	if err != nil {
 		return DispatchIntent{}, err
 	}
+	if err := assertDispatchAuthBindings(intent); err != nil {
+		return DispatchIntent{}, err
+	}
 	if err := AssertSecretFreeReceipt(intent); err != nil {
 		return DispatchIntent{}, err
 	}
@@ -353,10 +387,13 @@ func DecodeDispatchIntent(raw []byte, registry *ExecutionSelectorRegistry) (Disp
 // DecodeResolvedExecutionCell strictly decodes one resolved cell.
 func DecodeResolvedExecutionCell(raw []byte) (ResolvedExecutionCell, error) {
 	cell, err := decodeVersioned[ResolvedExecutionCell](raw, "ResolvedExecutionCell")
-	if err == nil {
-		err = AssertSecretFreeReceipt(cell)
+	if err != nil {
+		return cell, err
 	}
-	return cell, err
+	if contractErr := assertAuthBindingDelivery(&cell.AuthBinding, []string{"authBinding"}); contractErr != nil {
+		return cell, contractErr
+	}
+	return cell, AssertSecretFreeReceipt(cell)
 }
 
 // DecodeDelegationEdgeIntent strictly decodes one parent-child edge intent.
@@ -436,6 +473,11 @@ func DecodeAdmissionReceipt(raw []byte) (ImmutableAdmissionReceipt, error) {
 	if err != nil {
 		return ImmutableAdmissionReceipt{}, err
 	}
+	if receipt.Cell != nil {
+		if err := assertAuthBindingDelivery(&receipt.Cell.AuthBinding, []string{"cell", "authBinding"}); err != nil {
+			return ImmutableAdmissionReceipt{}, err
+		}
+	}
 	if err := AssertSecretFreeReceipt(receipt); err != nil {
 		return ImmutableAdmissionReceipt{}, err
 	}
@@ -469,6 +511,11 @@ func DecodeClaimReceipt(raw []byte) (ImmutableClaimReceipt, error) {
 	receipt, err := decodeVersioned[ClaimReceipt](raw, "ClaimReceipt")
 	if err != nil {
 		return ImmutableClaimReceipt{}, err
+	}
+	if receipt.EffectiveCell != nil {
+		if err := assertAuthBindingDelivery(&receipt.EffectiveCell.AuthBinding, []string{"effectiveCell", "authBinding"}); err != nil {
+			return ImmutableClaimReceipt{}, err
+		}
 	}
 	if err := AssertSecretFreeReceipt(receipt); err != nil {
 		return ImmutableClaimReceipt{}, err
@@ -580,17 +627,26 @@ func AssertNarrowClaim(admission ImmutableAdmissionReceipt, claim ImmutableClaim
 	return nil
 }
 
-func fallbackContains(intent DispatchIntent, alternative FallbackAlternative, selected ResolvedExecutionCell, nonFallbackFields map[string]struct{}) bool {
-	return fallbackAxisContains(alternative.Harness, intent.Harness, selected.Harness, hasField(nonFallbackFields, "harness")) &&
-		fallbackAxisContains(alternative.Model, &intent.Model, selected.Model, hasField(nonFallbackFields, "model")) &&
-		fallbackAxisContains(alternative.Endpoint, intent.Endpoint, selected.Endpoint, hasField(nonFallbackFields, "endpoint")) &&
-		fallbackAxisContains(alternative.AuthBinding, intent.AuthBinding, selected.AuthBinding, hasField(nonFallbackFields, "authBinding")) &&
-		fallbackAxisContains(alternative.Placement, intent.Placement, selected.Placement, hasField(nonFallbackFields, "placement"))
+func fallbackContains(intent DispatchIntent, alternative FallbackAlternative, selected ResolvedExecutionCell, fallbackFields, nonFallbackFields map[string]struct{}) bool {
+	return fallbackAxisContains(alternative.Harness, intent.Harness, selected.Harness, hasField(fallbackFields, "harness"), hasField(nonFallbackFields, "harness")) &&
+		fallbackAxisContains(alternative.Model, &intent.Model, selected.Model, hasField(fallbackFields, "model"), hasField(nonFallbackFields, "model")) &&
+		fallbackAxisContains(alternative.Endpoint, intent.Endpoint, selected.Endpoint, hasField(fallbackFields, "endpoint"), hasField(nonFallbackFields, "endpoint")) &&
+		fallbackAxisContains(alternative.AuthBinding, intent.AuthBinding, selected.AuthBinding, hasField(fallbackFields, "authBinding"), hasField(nonFallbackFields, "authBinding")) &&
+		fallbackAxisContains(alternative.Placement, intent.Placement, selected.Placement, hasField(fallbackFields, "placement"), hasField(nonFallbackFields, "placement"))
 }
 
-func fallbackAxisContains[T any](fallback, requested *T, selected T, hasNonFallbackProvenance bool) bool {
+func fallbackAxisContains[T any](fallback, requested *T, selected T, hasFallbackProvenance, hasNonFallbackProvenance bool) bool {
 	if fallback != nil {
-		return sameValue(fallback, selected)
+		if !sameValue(fallback, selected) {
+			return false
+		}
+		if requested == nil || !sameValue(requested, selected) {
+			return hasFallbackProvenance
+		}
+		return true
+	}
+	if hasFallbackProvenance {
+		return false
 	}
 	if requested != nil {
 		return sameValue(requested, selected)
@@ -623,6 +679,9 @@ func fallbackDecisionSelectedRef(field string, cell ResolvedExecutionCell) (stri
 // AssertAdmissionProvenance requires every default, inheritance, fallback, or
 // legacy inference to remain visible in the immutable receipt.
 func AssertAdmissionProvenance(intent DispatchIntent, receipt ImmutableAdmissionReceipt) error {
+	if err := assertDispatchAuthBindings(intent); err != nil {
+		return err
+	}
 	value := receipt.Value()
 	if value.RequestID != intent.RequestID {
 		return contractError(ErrorInvalidReference, []string{"requestId"}, "receipt request does not match intent")
@@ -720,7 +779,7 @@ func AssertAdmissionProvenance(intent DispatchIntent, receipt ImmutableAdmission
 			return contractError(ErrorInvalidReference, []string{"resolverDecisions"}, "resolved %s lacks resolver provenance", field.name)
 		}
 	}
-	if selectedFallback != nil && !fallbackContains(intent, *selectedFallback, *value.Cell, nonFallbackFields) {
+	if selectedFallback != nil && !fallbackContains(intent, *selectedFallback, *value.Cell, fallbackDecisionFields, nonFallbackFields) {
 		return contractError(ErrorInvalidReference, []string{"cell"}, "resolved execution cell was not wholly named by fallbackAlternative %q", selectedFallbackID)
 	}
 	for _, required := range intent.RequiredCapabilities {
