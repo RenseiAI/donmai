@@ -27,7 +27,7 @@ import (
 // runLogsCmd builds a fresh `logs` cobra tree, sets args, and returns stdout.
 func runLogsCmd(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	root := newLogsCmd()
+	root := newLogsCmd(Config{})
 	root.SilenceErrors = true
 
 	var buf bytes.Buffer

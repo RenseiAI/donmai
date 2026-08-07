@@ -33,19 +33,19 @@ import (
 
 // ─── top-level logs command ────────────────────────────────────────────────────
 
-func newLogsCmd() *cobra.Command {
+func newLogsCmd(cfg Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "logs",
 		Short:        "Agent log operations",
 		SilenceUsage: true,
 	}
-	cmd.AddCommand(newLogsAnalyzeCmd())
+	cmd.AddCommand(newLogsAnalyzeCmd(binaryName(cfg)))
 	return cmd
 }
 
 // ─── analyze subcommand ────────────────────────────────────────────────────────
 
-func newLogsAnalyzeCmd() *cobra.Command {
+func newLogsAnalyzeCmd(bin string) *cobra.Command {
 	var (
 		inputPath   string
 		configPath  string
@@ -70,19 +70,19 @@ Signature catalog:
 
 Examples:
   # Analyze a log file (human-readable output)
-  donmai logs analyze --input /path/to/agent.log
+  ` + bin + ` logs analyze --input /path/to/agent.log
 
   # Pipe from stdin
-  cat agent.log | donmai logs analyze
+  cat agent.log | ` + bin + ` logs analyze
 
   # Dry-run: print what would be filed without posting
-  donmai logs analyze --input agent.log --dry-run
+  ` + bin + ` logs analyze --input agent.log --dry-run
 
   # Machine-readable JSON output
-  donmai logs analyze --input agent.log --json
+  ` + bin + ` logs analyze --input agent.log --json
 
   # Post a Linear issue to a specific team
-  donmai logs analyze --input agent.log --team "Engineering" --project "Agent"`,
+  ` + bin + ` logs analyze --input agent.log --team "Engineering" --project "Agent"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runLogsAnalyze(cmd, inputPath, configPath, dryRun, jsonOutput, teamName, projectName)

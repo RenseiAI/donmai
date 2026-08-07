@@ -234,7 +234,7 @@ func newGitHubGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Comm
 		Long: `Get details of a GitHub issue.
 
 Example:
-  donmai github get-issue --repo owner/repo --number 42`,
+  ` + bin + ` github get-issue --repo owner/repo --number 42`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
@@ -284,7 +284,7 @@ func newGitHubCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		Long: `Create a new GitHub issue.
 
 Example:
-  donmai github create-issue --repo owner/repo --title "Bug: something broken" \
+  ` + bin + ` github create-issue --repo owner/repo --title "Bug: something broken" \
     --body "Description" --labels "bug,needs-triage"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -354,7 +354,7 @@ func newGitHubUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		Long: `Update an existing GitHub issue.
 
 Example:
-  donmai github update-issue --repo owner/repo --number 42 --state closed`,
+  ` + bin + ` github update-issue --repo owner/repo --number 42 --state closed`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
@@ -428,7 +428,7 @@ func newGitHubListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		Long: `List GitHub issues with optional filters.
 
 Example:
-  donmai github list-issues --repo owner/repo --state open --labels "bug" --limit 20`,
+  ` + bin + ` github list-issues --repo owner/repo --state open --labels "bug" --limit 20`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			client, err := newGitHubClient(ds, bin)
@@ -499,7 +499,7 @@ func newGitHubListCommentsCmd(ds func() afclient.DataSource, bin string) *cobra.
 		Long: `List comments on a GitHub issue.
 
 Example:
-  donmai github list-comments --repo owner/repo --number 42`,
+  ` + bin + ` github list-comments --repo owner/repo --number 42`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
@@ -564,7 +564,7 @@ func newGitHubCreateCommentCmd(ds func() afclient.DataSource, bin string) *cobra
 		Long: `Post a comment on a GitHub issue.
 
 Example:
-  donmai github create-comment --repo owner/repo --number 42 --body "Looks good!"`,
+  ` + bin + ` github create-comment --repo owner/repo --number 42 --body "Looks good!"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
@@ -636,7 +636,7 @@ func newGitHubAddLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Com
 		Long: `Add labels to a GitHub issue. Existing labels are preserved.
 
 Example:
-  donmai github add-labels --repo owner/repo --number 42 --labels "bug,priority:high"`,
+  ` + bin + ` github add-labels --repo owner/repo --number 42 --labels "bug,priority:high"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 || labels == "" {
@@ -694,7 +694,7 @@ func newGitHubSetAssigneesCmd(ds func() afclient.DataSource, bin string) *cobra.
 Passing an empty --assignees clears all assignees.
 
 Example:
-  donmai github set-assignees --repo owner/repo --number 42 --assignees "alice,bob"`,
+  ` + bin + ` github set-assignees --repo owner/repo --number 42 --assignees "alice,bob"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
@@ -743,7 +743,7 @@ func newGitHubCloseIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		Long: `Close a GitHub issue, optionally posting a closing comment.
 
 Example:
-  donmai github close-issue --repo owner/repo --number 42 --comment "Resolved in v2.0"`,
+  ` + bin + ` github close-issue --repo owner/repo --number 42 --comment "Resolved in v2.0"`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
@@ -799,7 +799,7 @@ func newGitHubReopenIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		Long: `Reopen a closed GitHub issue, optionally posting a comment.
 
 Example:
-  donmai github reopen-issue --repo owner/repo --number 42`,
+  ` + bin + ` github reopen-issue --repo owner/repo --number 42`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if number <= 0 {
@@ -851,7 +851,7 @@ func newGitHubListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		Long: `List all labels defined in a GitHub repository.
 
 Example:
-  donmai github list-labels --repo owner/repo`,
+  ` + bin + ` github list-labels --repo owner/repo`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			client, err := newGitHubClient(ds, bin)
@@ -898,7 +898,7 @@ func newGitHubGetRepoCmd(ds func() afclient.DataSource, bin string) *cobra.Comma
 		Long: `Get metadata about a GitHub repository.
 
 Example:
-  donmai github get-repo --repo owner/repo`,
+  ` + bin + ` github get-repo --repo owner/repo`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			client, err := newGitHubClient(ds, bin)
