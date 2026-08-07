@@ -14,8 +14,22 @@ linters:
     - gocritic
     - revive
     - gosec
+    # tparallel catches the "lifecycle ordering" shape of the unfailable-test
+    # gate (donmai-architecture/agents/PROTOCOL.md § V V19): a parent test whose
+    # `defer` teardown fires while a `t.Parallel()` subtest is still paused, so
+    # the subtest runs against torn-down state and can never legitimately pass.
+    # Zero violations today — it is a forward guard, not a cleanup.
+    - tparallel
   exclusions:
     rules:
+      # tparallel bundles one correctness check with one style nag. Keep the
+      # correctness half ("should use t.Cleanup instead of defer" — the real
+      # torn-down-state bug) and drop the nag: "subtests should call
+      # t.Parallel" fires 33 times on tests that are perfectly correct, and a
+      # guard people learn to scroll past stops guarding anything.
+      - linters:
+          - tparallel
+        text: "subtests should call t.Parallel"
       # Quickfix suggestions (QF*) are style hints, not bug indicators.
       - linters:
           - staticcheck

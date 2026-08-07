@@ -42,6 +42,7 @@ any commercial control plane.
 | touch credential or env handling | `docs/agents/CREDENTIALS-STANDALONE.md` |
 | edit README, docs, help text, or anything shipped | §Boundary below + run `make guard` |
 | are about to write "done"/"fixed" or open a PR | Gates below + `../donmai-architecture/agents/PROTOCOL.md` §V |
+| are about to claim a behaviour is covered / "I added a test" | `../donmai-architecture/agents/PROTOCOL.md` §V V16–V21 (revert → RED → restore → GREEN) |
 | hit a failing test or a `-race` flake | `../donmai-architecture/agents/PROTOCOL.md` §D |
 | cut or dry-run a release | `PROTOCOL.md` §R + `.goreleaser.yaml` |
 
@@ -50,10 +51,11 @@ When a row matches, read that doc before your next edit and follow it literally.
 ## Gates — "done" means these passed
 
 ```bash
-make test       # go test -race ./...   (the race flag is mandatory)
-make lint       # golangci-lint run
-make guard      # leak-guard: closed-source reference linter (CI blocks on it)
-make build      # type/compile gate — lint and test alone do not prove linkage
+make test        # go test -race ./...   (the race flag is mandatory)
+make test-tagged # type-check the build-tag-gated test files ./... cannot see
+make lint        # golangci-lint run
+make guard       # leak-guard: closed-source reference linter (CI blocks on it)
+make build       # type/compile gate — lint and test alone do not prove linkage
 ```
 
 Also available and CI-relevant: `make fmt` (gofumpt), `make vuln`
@@ -61,6 +63,29 @@ Also available and CI-relevant: `make fmt` (gofumpt), `make vuln`
 after `make generate`), `make release-dry-run`. CI's parallel `-race` run
 exposes flakes a local serial run hides — treat them as real bugs, not noise.
 Quote each gate's result line in your completion report.
+
+**Adding a test does not make a behaviour covered — the red does.** Before you
+write "covered", "pinned", or "I added a test", revert the production change,
+run the test, confirm it goes RED, restore, confirm GREEN, and quote both. A
+green suite proves what ran, passed — not that your change ran. The rule and its
+seven failure shapes are `../donmai-architecture/agents/PROTOCOL.md` §V V16–V21.
+Two shapes are mechanized here:
+
+- **Unregistered suite.** A `_test.go` behind `//go:build sometag` is excluded
+  from `go build ./...` and `go test ./...` outright — not run, not compiled,
+  not even syntax-checked. Six such files sat unbuilt in this repo. Every tag on
+  disk must appear in `make test-tagged`'s literal tag list (never behind a
+  `$(VAR)` — the guard reads the text the toolchain really receives);
+  `internal/testregistration` fails `make test` if one is missing.
+- **Lifecycle ordering.** `tparallel` (in `.golangci.yml`) catches a parent test
+  whose `defer` teardown fires while a `t.Parallel()` subtest is still paused —
+  the subtest then runs against torn-down state and can never legitimately pass.
+  Use `t.Cleanup` in the subtest, not a parent `defer`.
+
+The other five shapes need behavioural knowledge no cheap check has; they stay
+on the V16 red. Note also that `go test` reports a SKIPPED test exactly like a
+passing one (`ok`) — CI pipes through `scripts/test-summary.py` for the skip
+count, and a suite that quietly starts skipping protects nothing.
 
 ## Package architecture
 
