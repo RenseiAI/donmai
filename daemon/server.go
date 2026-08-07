@@ -135,8 +135,20 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/drain", s.method(http.MethodPost, s.handleDrain))
 	mux.HandleFunc("/api/daemon/update", s.method(http.MethodPost, s.handleUpdate))
 	mux.HandleFunc("/api/daemon/capacity", s.method(http.MethodPost, s.handleSetCapacity))
-	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet, s.handlePoolStats))
-	mux.HandleFunc("/api/daemon/pool/evict", s.method(http.MethodPost, s.handlePoolEvict))
+	// Workarea cache control surface. `pool` named four different things
+	// across this codebase; it now names only the org-owned capacity pool, so
+	// the daemon's warm-workarea surface moved to the `workarea` noun.
+	mux.HandleFunc("/api/daemon/workarea/stats", s.method(http.MethodGet, s.handleWorkareaStats))
+	mux.HandleFunc("/api/daemon/workarea/evict", s.method(http.MethodPost, s.handleWorkareaEvict))
+	// Deprecated aliases of the two lines above, removed in
+	// afclient.WorkareaAliasRemovalVersion. They serve the identical handler
+	// and additionally announce themselves (Deprecation/Warning headers plus a
+	// daemon log line) so a caller pinned to an older release keeps working and
+	// finds out why it should not stay there.
+	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet,
+		deprecatedSurface("GET /api/daemon/pool/stats", "GET /api/daemon/workarea/stats", s.handleWorkareaStats)))
+	mux.HandleFunc("/api/daemon/pool/evict", s.method(http.MethodPost,
+		deprecatedSurface("POST /api/daemon/pool/evict", "POST /api/daemon/workarea/evict", s.handleWorkareaEvict)))
 	mux.HandleFunc("/api/daemon/sessions", s.handleSessions) // GET=list, POST=accept
 	// Per-session sub-routes. Spawned `donmai agent run` processes fetch
 	// their full QueuedWork shape via GET <id>; the deterministic cancel
@@ -176,6 +188,36 @@ func (s *Server) register(mux *http.ServeMux) {
 }
 
 // method wraps a handler with a method check.
+// deprecatedSurface wraps next so every response served through a deprecated
+// alias carries the standard deprecation signal before the handler writes its
+// status line. Behaviour is otherwise identical — the alias is a second door
+// onto the same handler, never a reimplementation of it.
+func deprecatedSurface(alias, replacement string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		announceDeprecatedSurface(w, alias, replacement)
+		next(w, r)
+	}
+}
+
+// announceDeprecatedSurface marks a response as served by a deprecated alias.
+// It MUST run before the handler writes a status line, because headers set
+// after WriteHeader are discarded.
+//
+// The signal is threefold: RFC 8594 `Deprecation`, a `Link` to the successor,
+// and an RFC 7234 `Warning: 299` carrying the human sentence — none of which
+// disturb a client that only decodes the JSON body.
+func announceDeprecatedSurface(w http.ResponseWriter, alias, replacement string) {
+	notice := afclient.DeprecatedSurfaceNotice(alias, replacement)
+	w.Header().Set("Deprecation", "true")
+	w.Header().Set("Link", `<`+replacement+`>; rel="successor-version"`)
+	w.Header().Set("Warning", `299 - "`+notice+`"`)
+	slog.Warn("deprecated daemon control surface used",
+		"alias", alias,
+		"replacement", replacement,
+		"removedIn", afclient.WorkareaAliasRemovalVersion,
+	)
+}
+
 func (s *Server) method(want string, fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != want {
@@ -271,7 +313,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	cfg := s.daemon.Config()
 	enabledProjectIDs := safeEnabledProjectIDs(cfg)
 	appliedIDs := appliedProjectIDs(s.daemon, cfg)
-	withPool := r.URL.Query().Get("pool") == "true"
+	withWorkarea := r.URL.Query().Get("workarea") == "true"
+	if !withWorkarea && r.URL.Query().Get("pool") == "true" {
+		// Deprecated alias of ?workarea=true, removed in
+		// afclient.WorkareaAliasRemovalVersion. Without it a CLI pinned to an
+		// older release would silently receive no workarea section rather than
+		// an error — the worst failure shape a rename can have.
+		withWorkarea = true
+		announceDeprecatedSurface(w, "GET /api/daemon/stats?pool=true", "GET /api/daemon/stats?workarea=true")
+	}
 	byMachine := r.URL.Query().Get("byMachine") == "true"
 
 	resp := afclient.DaemonStatsResponse{
@@ -292,8 +342,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		EnabledProjectIDs: enabledProjectIDs,
 		AppliedProjectIDs: appliedIDs,
 	}
-	if withPool {
-		stats, err := s.poolStats(r.Context())
+	if withWorkarea {
+		stats, err := s.workareaStats(r.Context())
 		if err == nil {
 			resp.Pool = stats
 		}
@@ -447,8 +497,16 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch body.Key {
-	case "capacity.poolMaxDiskGb":
+	key := body.Key
+	if key == afclient.LegacyWorkareaMaxDiskGbKey {
+		// Deprecated alias of capacity.workareaMaxDiskGb, removed in
+		// afclient.WorkareaAliasRemovalVersion.
+		announceDeprecatedSurface(w, afclient.LegacyWorkareaMaxDiskGbKey, afclient.WorkareaMaxDiskGbKey)
+		key = afclient.WorkareaMaxDiskGbKey
+	}
+
+	switch key {
+	case afclient.WorkareaMaxDiskGbKey:
 		// Persist to in-memory config; the CLI also writes daemon.yaml directly.
 		s.daemon.mu.Lock()
 		if s.daemon.config != nil {
@@ -482,8 +540,8 @@ func (s *Server) handleSetCapacity(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handlePoolStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.poolStats(r.Context())
+func (s *Server) handleWorkareaStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.workareaStats(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusOK, &afclient.WorkareaPoolStats{
 			Members:   []afclient.WorkareaPoolMember{},
@@ -494,11 +552,11 @@ func (s *Server) handlePoolStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
-func (s *Server) handlePoolEvict(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleWorkareaEvict(w http.ResponseWriter, r *http.Request) {
 	if s.daemon.opts.EvictHandler == nil {
 		writeJSON(w, http.StatusNotImplemented, &afclient.EvictPoolResponse{
 			Evicted: 0,
-			Message: "pool eviction handler not wired (WorkareaProvider wiring pending)",
+			Message: "workarea eviction handler not wired (WorkareaProvider wiring pending)",
 		})
 		return
 	}
@@ -644,7 +702,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-func (s *Server) poolStats(ctx context.Context) (*afclient.WorkareaPoolStats, error) {
+func (s *Server) workareaStats(ctx context.Context) (*afclient.WorkareaPoolStats, error) {
 	if s.daemon.opts.PoolStatsProvider == nil {
 		return &afclient.WorkareaPoolStats{
 			Members:   []afclient.WorkareaPoolMember{},

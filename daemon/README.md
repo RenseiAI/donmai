@@ -129,9 +129,9 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `POST   /api/daemon/stop`              | Graceful stop |
 | `POST   /api/daemon/drain`             | Drain in-flight work |
 | `POST   /api/daemon/update`            | Trigger manual update check |
-| `POST   /api/daemon/capacity`          | Update a config key (e.g. `capacity.poolMaxDiskGb`) |
-| `GET    /api/daemon/pool/stats`        | Workarea pool snapshot |
-| `POST   /api/daemon/pool/evict`        | Evict pool members |
+| `POST   /api/daemon/capacity`          | Update a config key (e.g. `capacity.workareaMaxDiskGb`) |
+| `GET    /api/daemon/workarea/stats`    | Workarea cache snapshot |
+| `POST   /api/daemon/workarea/evict`    | Evict workarea cache members |
 | `GET    /api/daemon/sessions`          | List active session handles (incl. `worktreePath`/`projectName`/`repository` enrichment) |
 | `POST   /api/daemon/sessions`          | Accept a session (test entrypoint) |
 | `GET    /api/daemon/sessions/<id>`     | **F.2.8** — per-session detail for the spawned worker |
@@ -139,6 +139,32 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `GET    /api/daemon/heartbeat`         | Most-recent heartbeat payload |
 | `GET    /api/daemon/doctor`            | Aggregated health snapshot |
 | `GET    /healthz`                      | Liveness probe |
+
+### Deprecated aliases (removed in v0.59.0)
+
+`pool` used to name four different things. It now names only the org-owned
+capacity pool, so the daemon's warm-workarea surface moved to the `workarea`
+noun. The previous spellings still work, unchanged in behaviour, and announce
+themselves with `Deprecation: true`, a `Link` to the successor, and an RFC 7234
+`Warning: 299` naming the removal release.
+
+| Deprecated | Replacement |
+|---|---|
+| `GET    /api/daemon/pool/stats`        | `GET    /api/daemon/workarea/stats` |
+| `POST   /api/daemon/pool/evict`        | `POST   /api/daemon/workarea/evict` |
+| `GET    /api/daemon/stats?pool=true`   | `GET    /api/daemon/stats?workarea=true` |
+| `capacity.poolMaxDiskGb`               | `capacity.workareaMaxDiskGb` |
+| `<bin> host stats --pool`              | `<bin> host stats --workarea` |
+
+`capacity.poolMaxDiskGb` is also still read out of an existing `daemon.yaml`
+and rewritten under the current name on the next write. That alias is
+load-bearing rather than cosmetic: the config decoder is non-strict, so a
+dropped key would default the field to `0`, which this setting defines as *no
+limit* — silently disabling LRU eviction on every machine whose file predates
+the rename.
+
+The single source for the removal version is
+`afclient.WorkareaAliasRemovalVersion`.
 
 ## Auto-update signing
 

@@ -737,12 +737,13 @@ func newDaemonStatsCmd(factory daemonClientFactory, bin string) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "stats",
-		Short: "Show daemon capacity, pool, and session statistics",
+		Short: "Show daemon capacity, workarea-cache, and session statistics",
 		Long: "Display the daemon's capacity envelope, active sessions, queue depth, and\n" +
-			"optionally the workarea pool stats (--pool) or per-machine breakdown (--by-machine).\n" +
+			"optionally the workarea cache stats (--workarea) or per-machine breakdown (--by-machine).\n" +
 			"Renders a human-readable ANSI table by default, or raw JSON with --json.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			warnDeprecatedFlag(cmd, "pool", "--pool", "--workarea")
 			cfg := afclient.DefaultDaemonConfig()
 			if host != "" {
 				cfg.Host = host
@@ -767,7 +768,18 @@ func newDaemonStatsCmd(factory daemonClientFactory, bin string) *cobra.Command {
 
 	cmd.Flags().IntVar(&port, "port", 0, "Daemon HTTP port (default from daemon.yaml: 7734)")
 	cmd.Flags().StringVar(&host, "host", "", "Daemon HTTP host (default: 127.0.0.1)")
-	cmd.Flags().BoolVar(&withPool, "pool", false, "Include workarea pool stats")
+	cmd.Flags().BoolVar(&withPool, "workarea", false, "Include workarea cache stats")
+	// Deprecated alias of --workarea, removed in
+	// afclient.WorkareaAliasRemovalVersion. Both flags write the same variable,
+	// so the alias is a second name for one behaviour rather than a second code
+	// path that can drift.
+	//
+	// MarkHidden + an explicit notice, not pflag's MarkDeprecated: pflag prints
+	// its deprecation line to the command's *out* writer, which would land the
+	// notice in the middle of `--json` output. Announcing on stderr is the same
+	// discipline warnDeprecatedAlias applies to the `daemon` command alias.
+	cmd.Flags().BoolVar(&withPool, "pool", false, "Include workarea cache stats")
+	_ = cmd.Flags().MarkHidden("pool")
 	cmd.Flags().BoolVar(&byMachine, "by-machine", false, "Include per-machine breakdown")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output raw JSON (indented)")
 
@@ -1030,8 +1042,37 @@ func newDaemonEvictCmd(factory daemonClientFactory) *cobra.Command {
 
 // allowedCapacityKeys is the set of dotted config keys accepted by `donmai host set`.
 var allowedCapacityKeys = map[string]struct{}{
-	"capacity.maxConcurrentSessions": {},
-	"capacity.poolMaxDiskGb":         {},
+	"capacity.maxConcurrentSessions":    {},
+	afclient.WorkareaMaxDiskGbKey:       {},
+	afclient.LegacyWorkareaMaxDiskGbKey: {}, // deprecated alias, see canonicalCapacityKey
+}
+
+// warnDeprecatedFlag announces a deprecated flag alias on stderr, but only when
+// the alias was actually supplied — a notice on every invocation trains
+// operators to ignore it.
+//
+// Stderr, not stdout: these leaves support `--json`, and a notice written to
+// the out stream would break the caller's parser. pflag's own MarkDeprecated
+// printer writes to the command's out writer, which is why it is not used here.
+func warnDeprecatedFlag(cmd *cobra.Command, name, alias, replacement string) {
+	if !cmd.Flags().Changed(name) {
+		return
+	}
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s\n",
+		afclient.DeprecatedSurfaceNotice(alias, replacement))
+}
+
+// canonicalCapacityKey resolves a caller-supplied capacity key to the current
+// spelling, announcing the substitution on stderr when a deprecated alias was
+// used. The alias is removed in afclient.WorkareaAliasRemovalVersion.
+func canonicalCapacityKey(errOut io.Writer, key string) string {
+	if key == afclient.LegacyWorkareaMaxDiskGbKey {
+		_, _ = fmt.Fprintf(errOut, "warning: %s\n",
+			afclient.DeprecatedSurfaceNotice(
+				afclient.LegacyWorkareaMaxDiskGbKey, afclient.WorkareaMaxDiskGbKey))
+		return afclient.WorkareaMaxDiskGbKey
+	}
+	return key
 }
 
 // newDaemonSetCmd returns the `donmai host set` command.
@@ -1051,8 +1092,8 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			"Supported keys:\n" +
 			"  capacity.maxConcurrentSessions  Maximum concurrently accepted sessions\n" +
 			"                                  for this local daemon (0 = accept none).\n" +
-			"  capacity.poolMaxDiskGb          Maximum total pool disk usage in GiB before\n" +
-			"                                  LRU eviction triggers (0 = no limit).\n\n" +
+			"  capacity.workareaMaxDiskGb      Maximum total workarea-cache disk usage in GiB\n" +
+			"                                  before LRU eviction triggers (0 = no limit).\n\n" +
 			"The change is written atomically to ~/.donmai/daemon.yaml and the daemon\n" +
 			"reloads the affected subsystem without a restart.",
 		Args:         cobra.ExactArgs(2),
@@ -1062,12 +1103,14 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 			value := args[1]
 
 			if _, ok := allowedCapacityKeys[key]; !ok {
-				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, capacity.poolMaxDiskGb", key)
+				return fmt.Errorf("unknown config key %q — supported keys: capacity.maxConcurrentSessions, %s",
+					key, afclient.WorkareaMaxDiskGbKey)
 			}
+			key = canonicalCapacityKey(cmd.ErrOrStderr(), key)
 
 			// Validate integer capacity keys locally so we give a clear error
 			// before hitting the daemon.
-			if key == "capacity.poolMaxDiskGb" || key == "capacity.maxConcurrentSessions" {
+			if key == afclient.WorkareaMaxDiskGbKey || key == "capacity.maxConcurrentSessions" {
 				n, err := strconv.Atoi(value)
 				if err != nil || n < 0 {
 					return fmt.Errorf("%s must be a non-negative integer, got %q", key, value)
@@ -1086,7 +1129,7 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 				switch key {
 				case "capacity.maxConcurrentSessions":
 					cfg.Capacity.MaxConcurrentSessions = n
-				case "capacity.poolMaxDiskGb":
+				case afclient.WorkareaMaxDiskGbKey:
 					cfg.Capacity.PoolMaxDiskGb = n
 				}
 				if writeErr := afclient.WriteDaemonYAML(yamlPath, cfg); writeErr != nil {

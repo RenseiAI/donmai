@@ -281,12 +281,17 @@ func (c *DaemonClient) GetStatus() (*DaemonStatusResponse, error) {
 	return &resp, nil
 }
 
-// GetStats fetches the daemon's capacity and pool statistics.
-func (c *DaemonClient) GetStats(withPool, byMachine bool) (*DaemonStatsResponse, error) {
+// GetStats fetches the daemon's capacity and workarea-cache statistics.
+//
+// withWorkarea is sent as the current `workarea=true` parameter. Daemons older
+// than the rename only understand `pool=true` and will silently omit the
+// section; that direction is the operator's "upgrade the binary, restart the
+// service" gap, not something an alias on the daemon can cover.
+func (c *DaemonClient) GetStats(withWorkarea, byMachine bool) (*DaemonStatsResponse, error) {
 	path := "/api/daemon/stats"
 	params := []string{}
-	if withPool {
-		params = append(params, "pool=true")
+	if withWorkarea {
+		params = append(params, "workarea=true")
 	}
 	if byMachine {
 		params = append(params, "byMachine=true")
@@ -370,31 +375,36 @@ func (c *DaemonClient) Update() (*DaemonActionResponse, error) {
 	return &resp, nil
 }
 
-// GetPoolStats fetches the full workarea pool state, including per-member
+// GetPoolStats fetches the full workarea-cache state, including per-member
 // detail and aggregate counts.  The daemon response includes Layer 6
 // correlation IDs so observability subscribers can correlate events.
+//
+// The method name is retained deliberately: downstream embedders declare it on
+// their own daemon-client interfaces, and the rename is of the wire surface,
+// not of Go identifiers.
 func (c *DaemonClient) GetPoolStats() (*WorkareaPoolStats, error) {
 	var resp WorkareaPoolStats
-	if err := c.get("/api/daemon/pool/stats", &resp); err != nil {
-		return nil, fmt.Errorf("daemon pool stats: %w", err)
+	if err := c.get("/api/daemon/workarea/stats", &resp); err != nil {
+		return nil, fmt.Errorf("daemon workarea stats: %w", err)
 	}
 	return &resp, nil
 }
 
-// EvictPool posts an eviction request to the daemon.  Pool members matching
-// repoURL and older than the threshold in req are scheduled for destruction.
-// The daemon emits a Layer 6 hook event whose correlation ID is echoed back.
+// EvictPool posts an eviction request to the daemon.  Workarea-cache members
+// matching repoURL and older than the threshold in req are scheduled for
+// destruction.  The daemon emits a Layer 6 hook event whose correlation ID is
+// echoed back.
 func (c *DaemonClient) EvictPool(req EvictPoolRequest) (*EvictPoolResponse, error) {
 	var resp EvictPoolResponse
-	if err := c.post("/api/daemon/pool/evict", req, &resp); err != nil {
-		return nil, fmt.Errorf("daemon pool evict: %w", err)
+	if err := c.post("/api/daemon/workarea/evict", req, &resp); err != nil {
+		return nil, fmt.Errorf("daemon workarea evict: %w", err)
 	}
 	return &resp, nil
 }
 
 // SetCapacityConfig posts a capacity key-value update to the daemon.  The
 // daemon writes the change to ~/.donmai/daemon.yaml atomically and reloads the
-// affected subsystem (e.g. the LRU eviction trigger for poolMaxDiskGb).
+// affected subsystem (e.g. the LRU eviction trigger for workareaMaxDiskGb).
 func (c *DaemonClient) SetCapacityConfig(key, value string) (*SetCapacityResponse, error) {
 	body := map[string]string{"key": key, "value": value}
 	var resp SetCapacityResponse

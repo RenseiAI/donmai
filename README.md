@@ -227,14 +227,14 @@ donmai host drain                         # wait for in-flight sessions, then st
 donmai host update                        # force-pull latest release
 donmai host doctor                        # health check: config, credentials, disk
 donmai host logs [--follow]               # tail daemon log (NDJSON / pretty)
-donmai host stats [--pool]                # capacity, sessions, pool state
+donmai host stats [--workarea]            # capacity, sessions, workarea cache
 donmai host setup                         # first-run interactive wizard
 donmai host set <key> <value>             # mutate a single config key
 donmai host evict --repo <repo> [--older-than <duration>]
 donmai host watch [--all]                 # live dashboard of this host's sessions
 donmai host provider list                 # providers installed on this machine
 donmai host kit list                      # kits installed on this machine
-donmai host workarea list                 # this machine's workarea pool
+donmai host workarea list                 # this machine's workarea cache
 donmai host project list                  # projects this machine admits work for
 ```
 
@@ -242,7 +242,7 @@ Supported capacity keys:
 
 ```bash
 donmai host set capacity.maxConcurrentSessions <sessions>
-donmai host set capacity.poolMaxDiskGb <gb>
+donmai host set capacity.workareaMaxDiskGb <gb>
 ```
 
 Environment: `DONMAI_DAEMON_TOKEN` (optional — `donmai host install` provisions

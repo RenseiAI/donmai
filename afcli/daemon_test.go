@@ -23,30 +23,39 @@ import (
 
 // mockDaemon implements daemonDoer with configurable responses for testing.
 type mockDaemon struct {
-	statusResp    *afclient.DaemonStatusResponse
-	statusErr     error
-	statsResp     *afclient.DaemonStatsResponse
-	statsErr      error
-	actionResp    *afclient.DaemonActionResponse
-	actionErr     error
-	drainCalls    int
-	drainSecs     int
-	poolStatsResp *afclient.WorkareaPoolStats
-	poolStatsErr  error
-	evictResp     *afclient.EvictPoolResponse
-	evictErr      error
-	evictReq      *afclient.EvictPoolRequest
-	setCapResp    *afclient.SetCapacityResponse
-	setCapErr     error
-	setCapKey     string
-	setCapValue   string
+	statusResp *afclient.DaemonStatusResponse
+	statusErr  error
+	statsResp  *afclient.DaemonStatsResponse
+	// statsWithPool / statsByMachine record the arguments GetStats was
+	// called with.
+	statsWithPool  bool
+	statsByMachine bool
+	statsErr       error
+	actionResp     *afclient.DaemonActionResponse
+	actionErr      error
+	drainCalls     int
+	drainSecs      int
+	poolStatsResp  *afclient.WorkareaPoolStats
+	poolStatsErr   error
+	evictResp      *afclient.EvictPoolResponse
+	evictErr       error
+	evictReq       *afclient.EvictPoolRequest
+	setCapResp     *afclient.SetCapacityResponse
+	setCapErr      error
+	setCapKey      string
+	setCapValue    string
 }
 
 func (m *mockDaemon) GetStatus() (*afclient.DaemonStatusResponse, error) {
 	return m.statusResp, m.statusErr
 }
 
-func (m *mockDaemon) GetStats(_, _ bool) (*afclient.DaemonStatsResponse, error) {
+// GetStats records withWorkarea so a test can prove a CLI flag actually
+// reached the client rather than merely parsing. A mock that discards its
+// arguments cannot distinguish a wired flag from a dead one.
+func (m *mockDaemon) GetStats(withWorkarea, byMachine bool) (*afclient.DaemonStatsResponse, error) {
+	m.statsWithPool = withWorkarea
+	m.statsByMachine = byMachine
 	return m.statsResp, m.statsErr
 }
 
@@ -1322,7 +1331,7 @@ func TestDaemonEvictHTTPMock(t *testing.T) {
 		CorrelationID: "corr-http-test",
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/daemon/pool/evict" {
+		if r.URL.Path != "/api/daemon/workarea/evict" {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -1355,7 +1364,7 @@ func TestDaemonSetCapacitySuccess(t *testing.T) {
 	mock := &mockDaemon{
 		setCapResp: &afclient.SetCapacityResponse{
 			OK:      true,
-			Key:     "capacity.poolMaxDiskGb",
+			Key:     afclient.WorkareaMaxDiskGbKey,
 			Value:   "50",
 			Message: "updated",
 		},
@@ -1363,18 +1372,18 @@ func TestDaemonSetCapacitySuccess(t *testing.T) {
 	// Use a temp config path to avoid touching real ~/.donmai/daemon.yaml.
 	tmpDir := t.TempDir()
 	buf, err := newTestHostCmd(mock, []string{
-		"set", "capacity.poolMaxDiskGb", "50",
+		"set", afclient.WorkareaMaxDiskGbKey, "50",
 		"--config", tmpDir + "/daemon.yaml",
 	})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "capacity.poolMaxDiskGb") {
+	if !strings.Contains(out, afclient.WorkareaMaxDiskGbKey) {
 		t.Errorf("output missing key; got:\n%s", out)
 	}
-	if mock.setCapKey != "capacity.poolMaxDiskGb" {
-		t.Errorf("SetCapacityConfig key = %q, want %q", mock.setCapKey, "capacity.poolMaxDiskGb")
+	if mock.setCapKey != afclient.WorkareaMaxDiskGbKey {
+		t.Errorf("SetCapacityConfig key = %q, want %q", mock.setCapKey, afclient.WorkareaMaxDiskGbKey)
 	}
 	if mock.setCapValue != "50" {
 		t.Errorf("SetCapacityConfig value = %q, want %q", mock.setCapValue, "50")
@@ -1421,14 +1430,14 @@ func TestDaemonSetCapacityJSONOutput(t *testing.T) {
 	mock := &mockDaemon{
 		setCapResp: &afclient.SetCapacityResponse{
 			OK:      true,
-			Key:     "capacity.poolMaxDiskGb",
+			Key:     afclient.WorkareaMaxDiskGbKey,
 			Value:   "100",
 			Message: "updated",
 		},
 	}
 	tmpDir := t.TempDir()
 	buf, err := newTestHostCmd(mock, []string{
-		"set", "capacity.poolMaxDiskGb", "100",
+		"set", afclient.WorkareaMaxDiskGbKey, "100",
 		"--config", tmpDir + "/daemon.yaml",
 		"--json",
 	})
@@ -1661,7 +1670,7 @@ func TestGetPoolStatsHTTPMock(t *testing.T) {
 		Timestamp:        "2026-04-27T12:00:00Z",
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/daemon/pool/stats" {
+		if r.URL.Path != "/api/daemon/workarea/stats" {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}

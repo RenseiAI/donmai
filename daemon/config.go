@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runner/access"
 
@@ -86,9 +87,53 @@ type CapacityConfig struct {
 	MaxVCpuPerSession     int                `yaml:"maxVCpuPerSession"         json:"maxVCpuPerSession"`
 	MaxMemoryMbPerSession int                `yaml:"maxMemoryMbPerSession"     json:"maxMemoryMbPerSession"`
 	ReservedForSystem     ReservedSystemSpec `yaml:"reservedForSystem"         json:"reservedForSystem"`
-	// PoolMaxDiskGb is the LRU-eviction trigger for the workarea pool.
+	// PoolMaxDiskGb is the LRU-eviction trigger for the warm workarea cache.
 	// 0 means no limit.
-	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
+	//
+	// The Go field name is retained deliberately (the rename is of the
+	// serialized key, not of Go identifiers); the deprecated `poolMaxDiskGb`
+	// key is still read by UnmarshalYAML.
+	PoolMaxDiskGb int `yaml:"workareaMaxDiskGb,omitempty" json:"workareaMaxDiskGb,omitempty"`
+}
+
+// UnmarshalYAML reads the workarea disk envelope from either the current
+// `workareaMaxDiskGb` key or the deprecated `poolMaxDiskGb` alias, removed in
+// afclient.WorkareaAliasRemovalVersion.
+//
+// LoadConfig decodes non-strictly, so without this alias an unrecognised
+// `poolMaxDiskGb` would be dropped in silence and the field would default to 0
+// — which this setting defines as "no limit", silently disabling LRU eviction
+// on every machine whose daemon.yaml predates the rename.
+func (c *CapacityConfig) UnmarshalYAML(node *yaml.Node) error {
+	var raw struct {
+		MaxConcurrentSessions int                `yaml:"maxConcurrentSessions"`
+		MaxVCpuPerSession     int                `yaml:"maxVCpuPerSession"`
+		MaxMemoryMbPerSession int                `yaml:"maxMemoryMbPerSession"`
+		ReservedForSystem     ReservedSystemSpec `yaml:"reservedForSystem"`
+		WorkareaMaxDiskGb     int                `yaml:"workareaMaxDiskGb"`
+		PoolMaxDiskGb         int                `yaml:"poolMaxDiskGb"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	c.MaxConcurrentSessions = raw.MaxConcurrentSessions
+	c.MaxVCpuPerSession = raw.MaxVCpuPerSession
+	c.MaxMemoryMbPerSession = raw.MaxMemoryMbPerSession
+	c.ReservedForSystem = raw.ReservedForSystem
+	switch {
+	case raw.WorkareaMaxDiskGb != 0:
+		c.PoolMaxDiskGb = raw.WorkareaMaxDiskGb
+	case raw.PoolMaxDiskGb != 0:
+		c.PoolMaxDiskGb = raw.PoolMaxDiskGb
+		slog.Warn(
+			"daemon.yaml: "+afclient.DeprecatedSurfaceNotice("poolMaxDiskGb", "workareaMaxDiskGb")+
+				" It is rewritten on the next write.",
+			"poolMaxDiskGb", raw.PoolMaxDiskGb,
+		)
+	default:
+		c.PoolMaxDiskGb = 0
+	}
+	return nil
 }
 
 // ReservedSystemSpec describes resources reserved for the host OS.

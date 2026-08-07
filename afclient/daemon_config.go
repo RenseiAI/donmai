@@ -140,15 +140,58 @@ func (p *ProjectEntry) UnmarshalYAML(node *yaml.Node) error {
 }
 
 // CapacityConfig holds the configurable capacity limits written into
-// daemon.yaml under the `capacity` key. `poolMaxDiskGb` drives
-// automatic LRU eviction of the workarea pool once the disk threshold is hit.
+// daemon.yaml under the `capacity` key. `workareaMaxDiskGb` drives
+// automatic LRU eviction of the warm workarea cache once the disk threshold is
+// hit.
 type CapacityConfig struct {
 	// MaxConcurrentSessions is the maximum number of sessions the local
 	// daemon accepts concurrently. 0 means do not accept new sessions.
 	MaxConcurrentSessions int `yaml:"maxConcurrentSessions,omitempty" json:"maxConcurrentSessions,omitempty"`
-	// PoolMaxDiskGb is the maximum total disk usage (in GiB) for the workarea
-	// pool before the daemon starts LRU-evicting cold members.  0 means no limit.
-	PoolMaxDiskGb int `yaml:"poolMaxDiskGb,omitempty" json:"poolMaxDiskGb,omitempty"`
+	// PoolMaxDiskGb is the maximum total disk usage (in GiB) for the warm
+	// workarea cache before the daemon starts LRU-evicting cold members.
+	// 0 means no limit.
+	//
+	// The Go field name is retained deliberately — downstream embedders
+	// assign to it — while the serialized key is the renamed
+	// `workareaMaxDiskGb`. The previous `poolMaxDiskGb` key is still read;
+	// see UnmarshalYAML.
+	PoolMaxDiskGb int `yaml:"workareaMaxDiskGb,omitempty" json:"workareaMaxDiskGb,omitempty"`
+}
+
+// UnmarshalYAML reads the workarea disk envelope from either the current
+// `workareaMaxDiskGb` key or the deprecated `poolMaxDiskGb` alias, removed in
+// WorkareaAliasRemovalVersion.
+//
+// This alias has to live on the struct rather than in a CLI key table: the
+// decoder is non-strict, so an unrecognised key is dropped in silence, and the
+// dropped field defaults to 0 — which this setting defines as "no limit".
+// A CLI-level-only alias would therefore turn LRU eviction off on every machine
+// whose daemon.yaml predates the rename, and fill the disk.
+func (c *CapacityConfig) UnmarshalYAML(node *yaml.Node) error {
+	var raw struct {
+		MaxConcurrentSessions int `yaml:"maxConcurrentSessions"`
+		WorkareaMaxDiskGb     int `yaml:"workareaMaxDiskGb"`
+		PoolMaxDiskGb         int `yaml:"poolMaxDiskGb"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	c.MaxConcurrentSessions = raw.MaxConcurrentSessions
+	switch {
+	case raw.WorkareaMaxDiskGb != 0:
+		c.PoolMaxDiskGb = raw.WorkareaMaxDiskGb
+	case raw.PoolMaxDiskGb != 0:
+		c.PoolMaxDiskGb = raw.PoolMaxDiskGb
+		slog.Warn(
+			"daemon.yaml: "+DeprecatedSurfaceNotice(
+				legacyWorkareaMaxDiskGbYAMLKey, workareaMaxDiskGbYAMLKey)+
+				" It is rewritten on the next write.",
+			legacyWorkareaMaxDiskGbYAMLKey, raw.PoolMaxDiskGb,
+		)
+	default:
+		c.PoolMaxDiskGb = 0
+	}
+	return nil
 }
 
 // DaemonYAML is the in-memory representation of ~/.donmai/daemon.yaml.
@@ -326,9 +369,16 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
 	}
 	upsertMappingKey(doc, "projects", projectsNode)
 	// Capacity is preserved as a partial overlay — only the cfg-modelled
-	// fields (e.g. poolMaxDiskGb) are merged into the existing capacity
+	// fields (e.g. workareaMaxDiskGb) are merged into the existing capacity
 	// mapping. If no capacity key exists yet a new one is added.
 	mergeMappingKey(doc, "capacity", capacityNode)
+	// Migrate the deprecated `poolMaxDiskGb` spelling off disk, but only once
+	// its value has actually been re-emitted under the current name. Deleting
+	// it unconditionally would discard the operator's disk cap whenever the
+	// value happens to be absent from cfg.
+	if mappingHasKey(findMappingValue(doc, "capacity"), workareaMaxDiskGbYAMLKey) {
+		deleteMappingKey(findMappingValue(doc, "capacity"), legacyWorkareaMaxDiskGbYAMLKey)
+	}
 
 	out, err := yaml.Marshal(&root)
 	if err != nil {
@@ -371,6 +421,37 @@ func upsertMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
 		value,
 	)
+}
+
+// findMappingValue returns the value node stored at key in mapping, or nil.
+func findMappingValue(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// mappingHasKey reports whether mapping carries key.
+func mappingHasKey(mapping *yaml.Node, key string) bool {
+	return findMappingValue(mapping, key) != nil
+}
+
+// deleteMappingKey removes the {key, value} pair from mapping if present.
+func deleteMappingKey(mapping *yaml.Node, key string) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
+			return
+		}
+	}
 }
 
 // mergeMappingKey merges fields from value into the existing mapping at key.
