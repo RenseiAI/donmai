@@ -880,10 +880,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 			return result.WorkerID, result.RuntimeToken, nil
 		}
 
-		// Heartbeat. OnReregister handles reactive runtime-token expiry (the
-		// backstop behind the proactive refresher below): on a 401, or the
-		// worker falling out of Redis after the 5-min heartbeat TTL (returned
-		// as 404), we re-mint via RefreshRuntimeToken.
+		// Heartbeat. OnReregister handles reactive credential rejection (the
+		// backstop behind the proactive refresher below): on a 401, or on a
+		// 404 saying the orchestrator does not recognise this worker, we
+		// re-mint via RefreshRuntimeToken — which re-presents the existing
+		// registration wherever it still exists rather than replacing it.
 		d.heartbeat = NewHeartbeatService(HeartbeatOptions{
 			WorkerID:        regResp.WorkerID,
 			Hostname:        cfg.Machine.ID,

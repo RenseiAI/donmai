@@ -12,7 +12,7 @@ package daemon
 // is one quiet scheduled refresh per TTL window and zero auth failures. The
 // reactive paths in HeartbeatService / PollService remain as the backstop for
 // what a schedule cannot predict — clock skew, token revocation, and the
-// worker's Redis registration entry expiring ("worker-not-found").
+// orchestrator ceasing to recognise the worker ("worker-not-found").
 
 import (
 	"context"

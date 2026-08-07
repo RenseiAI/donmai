@@ -99,7 +99,7 @@ type HeartbeatOptions struct {
 	HTTPClient *http.Client
 	// LogWarn is called when the real-endpoint call fails (transient
 	// failures are non-fatal — the platform will detect via missed
-	// heartbeats and Redis TTL expiry).
+	// heartbeats and a worker the orchestrator no longer recognises).
 	LogWarn func(format string, args ...any)
 	// LogInfo is called for routine, self-healing events (e.g. a token
 	// rejection that immediately triggers a refresh). Defaults to no-op.
@@ -347,7 +347,7 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		h.handleHeartbeatResponse(ctx, resp)
 		return
 	}
-	// On 401 (token expired/invalid) or 404 (worker fell out of Redis),
+	// On 401 (token expired/invalid) or 404 (worker not recognised),
 	// re-register and retry once with fresh credentials. Any other error
 	// is logged and left for the platform to detect via missed heartbeats.
 	if isAuthFailure(err) && h.opts.OnReregister != nil {
