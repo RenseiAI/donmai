@@ -144,7 +144,9 @@ func ComposeChildEnv(parent []string, explicit ...map[string]string) []string {
 			mergedExplicit[key] = value
 		}
 	}
-	out := make([]string, 0, len(filteredParent)+len(mergedExplicit))
+	// Explicit entries grow through append's checked runtime path; avoid an
+	// overflow-prone capacity sum over independently controlled collections.
+	out := make([]string, 0, len(filteredParent))
 	out = append(out, filteredParent...)
 
 	keys := make([]string, 0, len(mergedExplicit))

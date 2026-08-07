@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/gateway"
 	"github.com/RenseiAI/donmai/gateway/costfeed"
 	internaldaemon "github.com/RenseiAI/donmai/internal/daemon"
@@ -74,6 +76,10 @@ type Options struct {
 	// behaviour for a daemon that has not yet wired its runtime registry.
 	// Wave 9 / ADR-2026-05-07-daemon-http-control-api.md §D4.
 	ProviderRegistry ProviderRegistry
+	// ExecutionPreflightStore durably records the initial ready receipt before
+	// credential hooks or worker spawn. Receipt-bearing work fails closed when
+	// either the compiler or this store is absent.
+	ExecutionPreflightStore ExecutionPreflightStore
 
 	// EnableGateway starts the translating-gateway loopback host (the
 	// ModelEndpoint host kind "gateway", ADR-2026-07-24 / 08) alongside the
@@ -205,6 +211,18 @@ type ProviderRegistry interface {
 	Capabilities(name string) (caps map[string]any, ok bool)
 }
 
+// ExecutionPreflightProvider is optionally implemented by ProviderRegistry.
+// The raw SessionDetail JSON lets the runner adapter consume the same immutable
+// operational bytes without introducing a daemon -> runner dependency.
+type ExecutionPreflightProvider interface {
+	PreflightExecution(detailJSON json.RawMessage) (json.RawMessage, error)
+}
+
+// ExecutionPreflightStore durably persists immutable host adaptation receipts.
+type ExecutionPreflightStore interface {
+	Persist(sessionID string, receipt json.RawMessage) error
+}
+
 type lifecycleKind uint8
 
 const (
@@ -333,6 +351,11 @@ func New(opts Options) *Daemon {
 	}
 	if opts.HTTPHost == "" {
 		opts.HTTPHost = DefaultHTTPHost
+	}
+	if opts.ExecutionPreflightStore == nil {
+		opts.ExecutionPreflightStore = NewFileExecutionPreflightStore(
+			statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts"),
+		)
 	}
 	// Note: HTTPPort=0 is intentionally NOT auto-filled to
 	// DefaultHTTPPort here — callers that want the well-known 7734
@@ -1513,6 +1536,59 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				spec.SessionID,
 			)
 		}
+		if len(detail.AdmissionReceipt) > 0 {
+			if err := d.validateExecutionRuntimeBinding(detail); err != nil {
+				return nil, err
+			}
+			compiler, ok := d.opts.ProviderRegistry.(ExecutionPreflightProvider)
+			if !ok || d.opts.ExecutionPreflightStore == nil {
+				return nil, errors.New("receipt-bearing work requires daemon execution preflight and durable receipt store")
+			}
+			preflightInput := struct {
+				SessionID               string          `json:"sessionId"`
+				WorkerID                string          `json:"workerId"`
+				AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
+				ClaimReceipt            json.RawMessage `json:"claimReceipt,omitempty"`
+				EffectiveCell           json.RawMessage `json:"effectiveCell"`
+				ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
+				OperationalPayload      json.RawMessage `json:"operationalPayload"`
+			}{
+				SessionID: detail.SessionID, WorkerID: detail.WorkerID,
+				AdmissionReceipt: detail.AdmissionReceipt, ClaimReceipt: detail.ClaimReceipt,
+				EffectiveCell: detail.EffectiveCell, ExecutionRuntimeBinding: detail.ExecutionRuntimeBinding,
+				OperationalPayload: detail.OperationalPayload,
+			}
+			detailJSON, err := json.Marshal(preflightInput)
+			if err != nil {
+				return nil, fmt.Errorf("marshal execution preflight detail: %w", err)
+			}
+			receipt, err := compiler.PreflightExecution(detailJSON)
+			if len(receipt) == 0 {
+				if err != nil {
+					return nil, fmt.Errorf("execution adaptation preflight returned no receipt: %w", err)
+				}
+				return nil, errors.New("execution adaptation preflight returned no receipt")
+			}
+			hostReceipt, decodeErr := executioncell.DecodeHostAdaptationReceipt(receipt)
+			if decodeErr != nil {
+				return nil, fmt.Errorf("execution adaptation receipt: %w", decodeErr)
+			}
+			binding, _ := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding)
+			if hostReceipt.RequestID != binding.RequestID || hostReceipt.WorkerID != binding.WorkerID ||
+				hostReceipt.PlacementID != binding.PlacementID || hostReceipt.ClaimID != binding.ClaimID {
+				return nil, errors.New("execution adaptation receipt does not match daemon runtime binding")
+			}
+			if (err == nil && hostReceipt.Decision != "ready") || (err != nil && hostReceipt.Decision != "denied") {
+				return nil, errors.New("execution adaptation result and receipt decision disagree")
+			}
+			if err := d.opts.ExecutionPreflightStore.Persist(spec.SessionID, receipt); err != nil {
+				return nil, fmt.Errorf("persist execution adaptation receipt: %w", err)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("execution adaptation preflight: %w", err)
+			}
+			detail.HostAdaptationReceipt = append(json.RawMessage(nil), receipt...)
+		}
 	}
 	var detailLease sessionDetailLease
 	if detail != nil && d.sessionDetails != nil {
@@ -1530,6 +1606,40 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 		return nil, err
 	}
 	return handle, nil
+}
+
+func (d *Daemon) validateExecutionRuntimeBinding(detail *SessionDetail) error {
+	binding, err := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding)
+	if err != nil {
+		return fmt.Errorf("execution runtime binding: %w", err)
+	}
+	if binding.RequestID != detail.SessionID || binding.WorkerID != detail.WorkerID {
+		return errors.New("execution runtime binding is not owned by this request and worker")
+	}
+	if currentWorkerID := strings.TrimSpace(d.WorkerID()); currentWorkerID != "" && binding.WorkerID != currentWorkerID {
+		return errors.New("execution runtime binding is not owned by the daemon's current worker registration")
+	}
+	effective, err := executioncell.DecodeResolvedExecutionCell(detail.EffectiveCell)
+	if err != nil {
+		return fmt.Errorf("execution effective cell: %w", err)
+	}
+	if binding.PlacementID != effective.Placement.ID {
+		return errors.New("execution runtime placement does not match effective cell")
+	}
+	if len(detail.ClaimReceipt) == 0 {
+		if binding.ClaimID != "" {
+			return errors.New("exact execution runtime binding must not carry claim id")
+		}
+		return nil
+	}
+	claim, err := executioncell.DecodeClaimReceipt(detail.ClaimReceipt)
+	if err != nil {
+		return fmt.Errorf("execution claim receipt: %w", err)
+	}
+	if binding.ClaimID != claim.Value().ClaimID {
+		return errors.New("execution claim receipt is not the active claim for this request and worker")
+	}
+	return nil
 }
 
 // SessionDetail returns the stored per-session detail for the given

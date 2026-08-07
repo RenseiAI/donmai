@@ -261,7 +261,10 @@ func TestPosterPost_UsesCredentialProvider(t *testing.T) {
 
 	var auths []string
 	var bodies []string
+	var requestsMu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestsMu.Lock()
+		defer requestsMu.Unlock()
 		auths = append(auths, r.Header.Get("Authorization"))
 		body, _ := io.ReadAll(r.Body)
 		bodies = append(bodies, string(body))

@@ -180,8 +180,10 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 				HTTPPort:         port,
 				SkipWizard:       skipWizard,
 				ProviderRegistry: runner.NewProviderView(providerReg),
-				SpawnerOptions:   spawnerOpts,
-				Version:          hostVersion,
+				ExecutionPreflightStore: daemon.NewFileExecutionPreflightStore(
+					statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts")),
+				SpawnerOptions: spawnerOpts,
+				Version:        hostVersion,
 			})
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()

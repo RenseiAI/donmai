@@ -1,6 +1,9 @@
 package ptyhost
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestComposeEnv_InteractiveDefaultsAndExplicitOverrides(t *testing.T) {
 	t.Parallel()
@@ -57,6 +60,18 @@ func TestComposeEnv_InteractiveDefaultsAndExplicitOverrides(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestComposeEnv_ManyOverridesGrowWithoutCapacitySum(t *testing.T) {
+	t.Parallel()
+	overrides := make([]string, 4096)
+	for i := range overrides {
+		overrides[i] = fmt.Sprintf("KEY_%04d=value", i)
+	}
+	got := envMap(composeEnv([]string{"PATH=/bin"}, overrides))
+	if len(got) != 4099 || got["PATH"] != "/bin" || got["KEY_4095"] != "value" {
+		t.Fatalf("large composed environment boundaries: len=%d PATH=%q last=%q", len(got), got["PATH"], got["KEY_4095"])
 	}
 }
 

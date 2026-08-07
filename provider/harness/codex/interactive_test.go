@@ -222,7 +222,7 @@ func TestSpawnInteractive_EnvConflictPersistsDenialBeforeZeroPTYSideEffects(t *t
 	}
 }
 
-func TestSpawnInteractive_MalformedMCPPersistsApplicationDenialBeforeZeroPTYSideEffects(t *testing.T) {
+func TestSpawnInteractive_MalformedMCPDeniedByUnifiedPreparationBeforeZeroPTYSideEffects(t *testing.T) {
 	t.Parallel()
 	workdir := t.TempDir()
 	marker := filepath.Join(workdir, "spawned")
@@ -238,14 +238,14 @@ func TestSpawnInteractive_MalformedMCPPersistsApplicationDenialBeforeZeroPTYSide
 		},
 	})
 	var adaptationErr *agent.ToolAdaptationError
-	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialApplicationFailed {
-		t.Fatalf("error = %v, want typed application failure", err)
+	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialMalformedPlan {
+		t.Fatalf("error = %v, want typed malformed-plan denial", err)
 	}
 	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
 		t.Fatalf("Codex PTY side effect occurred: %v", statErr)
 	}
-	if len(receipts) != 1 || receipts[0].Decision != "denied" || len(receipts[0].Entries) != 1 || receipts[0].Entries[0].DenialCode != agent.ToolDenialApplicationFailed {
-		t.Fatalf("persisted receipts = %+v, want one application-denied receipt", receipts)
+	if len(receipts) != 1 || receipts[0].Decision != "denied" || len(receipts[0].Entries) != 1 || receipts[0].Entries[0].DenialCode != agent.ToolDenialMalformedPlan {
+		t.Fatalf("persisted receipts = %+v, want one malformed-plan receipt", receipts)
 	}
 }
 
@@ -388,5 +388,94 @@ func TestProvider_Spawn_Interactive_NeverTouchesAppServer(t *testing.T) {
 
 	if _, ok := h.(agent.InteractiveCapable); !ok {
 		t.Fatal("handle does not implement agent.InteractiveCapable")
+	}
+}
+
+func TestProvider_Spawn_PreparedInteractiveConsumesSoleAuthorityBeforePTY(t *testing.T) {
+	t.Parallel()
+	for _, mutate := range []bool{false, true} {
+		mutate := mutate
+		name := "ready"
+		if mutate {
+			name = "authority-mismatch"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fs, stdinW, stdoutR := newFakeServer()
+			go fs.run(t, "thread-prepared-interactive")
+			workdir := t.TempDir()
+			marker := filepath.Join(workdir, "spawned")
+			bin := writeFakeCodexScript(t, `touch "$PWD/spawned"; echo "tui up"; sleep 0.1`)
+			p, err := New(Options{skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR, CodexBin: bin})
+			if err != nil {
+				fs.close()
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() {
+				_ = p.Shutdown(context.Background())
+				fs.close()
+			})
+
+			source := agent.Spec{
+				PromptMode:  agent.PromptModeHumanControlled,
+				Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+				Model:       "gpt-test",
+				PromptPlan: &agent.PromptPlan{
+					ContractVersion:  agent.PromptContractVersion,
+					BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+					UserPrompt:       agent.PromptContent{ID: "prepared-human", Text: "actual human seed", Required: true},
+				},
+			}
+			const operationalDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			var materializations []agent.HarnessMaterialization
+			for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+				materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+			}
+			prepared, err := agent.CompilePreparedHarness(source, p.Manifest(), operationalDigest, nil, materializations)
+			if err != nil {
+				t.Fatalf("CompilePreparedHarness: %v", err)
+			}
+			materialized := source
+			materialized.Cwd = workdir
+			materialized.PreparedHarness = prepared
+			promptCallbacks, toolCallbacks := 0, 0
+			materialized.OnPromptAdapted = func(agent.PromptDeliveryReceipt) error {
+				promptCallbacks++
+				return errors.New("second prompt authority")
+			}
+			materialized.OnToolLifecycleAdapted = func(agent.ToolLifecycleReceipt) error { toolCallbacks++; return errors.New("second tool authority") }
+			if mutate {
+				materialized.Model = "authority-mismatch"
+			}
+
+			h, err := p.Spawn(context.Background(), materialized)
+			if mutate {
+				if err == nil {
+					_ = h.Stop(context.Background())
+					t.Fatal("authority mismatch reached PTY spawn")
+				}
+				if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+					t.Fatalf("PTY marker exists after authority mismatch: %v", statErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("prepared interactive Spawn: %v", err)
+				}
+				t.Cleanup(func() { _ = h.Stop(context.Background()) })
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					if _, statErr := os.Stat(marker); statErr == nil {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("prepared interactive PTY marker was not created")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if promptCallbacks != 0 || toolCallbacks != 0 {
+				t.Fatalf("provider minted a second authority: prompt=%d tool=%d", promptCallbacks, toolCallbacks)
+			}
+		})
 	}
 }

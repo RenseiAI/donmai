@@ -9,14 +9,96 @@ package runner
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/executioncell"
 )
 
 // ProviderView wraps a *Registry and satisfies daemon.ProviderRegistry.
 // Construct via NewProviderView. Read-only and safe for concurrent use.
 type ProviderView struct {
 	reg *Registry
+}
+
+type hostAdaptationReceipt struct {
+	ContractVersion string                       `json:"contractVersion"`
+	RequestID       string                       `json:"requestId"`
+	WorkerID        string                       `json:"workerId"`
+	PlacementID     string                       `json:"placementId"`
+	ClaimID         string                       `json:"claimId,omitempty"`
+	Decision        string                       `json:"decision"`
+	Plan            *agent.PreparedHarness       `json:"plan,omitempty"`
+	PlanDigest      string                       `json:"planDigest,omitempty"`
+	Prompt          *agent.PromptDeliveryReceipt `json:"promptReceipt,omitempty"`
+	ToolLifecycle   *agent.ToolLifecycleReceipt  `json:"toolLifecycleReceipt,omitempty"`
+	Denial          string                       `json:"denial,omitempty"`
+}
+
+// PreflightExecution is the host-process compiler used by daemon before its
+// credential hook. It consumes the same raw operational projection and closed
+// execution-cell contracts as the child runner.
+func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawMessage, error) {
+	var wire struct {
+		SessionID               string          `json:"sessionId"`
+		WorkerID                string          `json:"workerId"`
+		AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
+		ClaimReceipt            json.RawMessage `json:"claimReceipt"`
+		EffectiveCell           json.RawMessage `json:"effectiveCell"`
+		ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
+		OperationalPayload      json.RawMessage `json:"operationalPayload"`
+	}
+	if err := json.Unmarshal(detailJSON, &wire); err != nil {
+		return nil, err
+	}
+	var qw QueuedWork
+	if err := json.Unmarshal(wire.OperationalPayload, &qw); err != nil {
+		return nil, fmt.Errorf("decode host operational payload: %w", err)
+	}
+	qw.SessionID, qw.WorkerID = wire.SessionID, wire.WorkerID
+	qw.AdmissionReceipt, qw.ClaimReceipt, qw.EffectiveCell = wire.AdmissionReceipt, wire.ClaimReceipt, wire.EffectiveCell
+	qw.ExecutionRuntimeBinding, qw.OperationalPayload = wire.ExecutionRuntimeBinding, wire.OperationalPayload
+	binding, err := executioncell.DecodeRuntimeBinding(wire.ExecutionRuntimeBinding)
+	if err != nil {
+		return nil, err
+	}
+	receipt := hostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion, RequestID: binding.RequestID,
+		WorkerID: binding.WorkerID, PlacementID: binding.PlacementID,
+		ClaimID: binding.ClaimID, Decision: "denied",
+	}
+	encode := func(cause error) (json.RawMessage, error) {
+		if cause != nil {
+			receipt.Denial = cause.Error()
+		}
+		raw, marshalErr := json.Marshal(receipt)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		return raw, cause
+	}
+	admission, err := v.reg.preflightAdmissionReceipt(qw, false)
+	if err != nil {
+		return encode(err)
+	}
+	if admission == nil || admission.selection.Provider == nil {
+		return encode(fmt.Errorf("host adaptation requires explicit receipt admission"))
+	}
+	plan, _, err := compilePreparedHarness(qw, admission.selection)
+	if plan != nil {
+		receipt.Plan = plan
+		receipt.PlanDigest = agent.DigestPreparedHarness(plan)
+		receipt.Prompt = &plan.PromptReceipt
+		receipt.ToolLifecycle = &plan.ToolLifecycleReceipt
+	}
+	if err != nil {
+		return encode(err)
+	}
+	if err := agent.ValidatePreparedHarness(plan, admission.receipt.Value().OperationalPayloadDigest); err != nil {
+		return encode(err)
+	}
+	receipt.Decision = "ready"
+	return encode(nil)
 }
 
 // NewProviderView returns a ProviderView backed by reg. Pass the result

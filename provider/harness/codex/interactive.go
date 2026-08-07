@@ -45,16 +45,19 @@ import (
 // never emits) and a single terminal ResultEvent when the CLI process exits.
 func SpawnInteractive(ctx context.Context, opts Options, spec agent.Spec) (agent.Handle, error) {
 	var err error
-	spec, err = agent.PreparePrompt(spec, (&Provider{}).Manifest())
+	spec, err = agent.PrepareHarness(spec, (&Provider{}).Manifest())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	return spawnInteractivePrepared(ctx, opts, spec)
+}
+
+// spawnInteractivePrepared receives the one Spec already admitted by
+// PrepareHarness. Keeping all PTY/config/process work below this boundary
+// prevents interactive mode from minting a second prompt or tool authority.
+func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec) (agent.Handle, error) {
 	if err := validateCodexCLIMCPServers(spec.MCPServers); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, persistInteractiveMCPApplicationDenial(spec, err))
-	}
-	spec, err = agent.PrepareToolLifecycle(spec, (&Provider{}).Manifest())
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
 	launch, err := buildInteractiveLaunch(spec)
 	if err != nil {

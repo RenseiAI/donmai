@@ -1,0 +1,73 @@
+package agent_test
+
+import (
+	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/codex"
+)
+
+func TestPreparedHarnessIsSoleCallbackFreeProviderAuthority(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	source := agent.Spec{
+		PromptMode:     agent.PromptModeHumanControlled,
+		Autonomous:     false,
+		SandboxEnabled: true,
+		SandboxLevel:   agent.SandboxWorkspaceWrite,
+		Model:          "gpt-test",
+		PromptPlan: &agent.PromptPlan{
+			ContractVersion:  agent.PromptContractVersion,
+			BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+			UserPrompt:       agent.PromptContent{ID: "actual-user-task", Text: "inspect the actual input", Required: true},
+		},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "rensei-session", Type: "http", URL: "https://runtime.invalid",
+		}},
+		Interactive: &agent.InteractiveSpec{},
+	}
+	const operationalDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var materializations []agent.HarnessMaterialization
+	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+	}
+	plan, err := agent.CompilePreparedHarness(source, manifest, operationalDigest, []string{"rensei-session"}, materializations)
+	if err != nil {
+		t.Fatalf("CompilePreparedHarness: %v", err)
+	}
+	if plan.Mode != agent.PromptModeHumanControlled || plan.PromptReceipt.Decision != "ready" || plan.ToolLifecycleReceipt.Decision != "ready" {
+		t.Fatalf("prepared plan = %+v", plan)
+	}
+
+	promptCallbacks, toolCallbacks := 0, 0
+	materialized := source
+	materialized.Cwd = "/actual/worktree"
+	materialized.Env = map[string]string{"RUNTIME_SECRET": "not persisted by host"}
+	materialized.MCPServers = []agent.MCPServerConfig{{
+		Name: "rensei-session", Type: "http", URL: "https://platform.example/api/mcp/session", Headers: map[string]string{"Authorization": "Bearer runtime"},
+	}}
+	materialized.Interactive = &agent.InteractiveSpec{RecordPath: "/actual/worktree/.donmai/term.cast"}
+	materialized.PreparedHarness = plan
+	materialized.OnPromptAdapted = func(agent.PromptDeliveryReceipt) error { promptCallbacks++; return nil }
+	materialized.OnToolLifecycleAdapted = func(agent.ToolLifecycleReceipt) error { toolCallbacks++; return nil }
+
+	adapted, err := agent.PrepareHarness(materialized, manifest)
+	if err != nil {
+		t.Fatalf("provider PrepareHarness application: %v", err)
+	}
+	if promptCallbacks != 0 || toolCallbacks != 0 {
+		t.Fatalf("provider minted a second authority: prompt callbacks=%d tool callbacks=%d", promptCallbacks, toolCallbacks)
+	}
+	if adapted.PromptReceipt == nil || adapted.ToolLifecycleReceipt == nil || adapted.PromptReceipt.Decision != "ready" || adapted.ToolLifecycleReceipt.Decision != "ready" {
+		t.Fatalf("provider did not consume host receipts: prompt=%+v tool=%+v", adapted.PromptReceipt, adapted.ToolLifecycleReceipt)
+	}
+	if adapted.Cwd != materialized.Cwd || adapted.Env["RUNTIME_SECRET"] == "" || adapted.MCPServers[0].URL != materialized.MCPServers[0].URL {
+		t.Fatalf("runtime materializations were not preserved: %+v", adapted)
+	}
+
+	mutated := materialized
+	mutated.Model = "different-model"
+	if _, err := agent.PrepareHarness(mutated, manifest); err == nil {
+		t.Fatal("authority-changing child mutation was accepted")
+	}
+}

@@ -247,6 +247,9 @@ func (e *PromptAdaptationError) Error() string {
 
 // PromptModeForSpec derives the mode without hard-coding harness identities.
 func PromptModeForSpec(spec Spec) PromptSessionMode {
+	if spec.PromptMode != "" {
+		return spec.PromptMode
+	}
 	if spec.Interactive != nil {
 		return PromptModeHumanControlled
 	}
@@ -714,7 +717,10 @@ func joinPromptParts(parts []string) string {
 // but an opaque interactive seed may intentionally contain leading/trailing
 // whitespace and still needs a digest and native-delivery receipt.
 func joinUserPromptParts(prepends []string, user string, appends []string) string {
-	clean := make([]string, 0, len(prepends)+len(appends)+1)
+	// Preallocate from one already-valid slice length only. append grows this
+	// safely for the user and trailing parts without overflow-prone summed
+	// attacker-controlled lengths.
+	clean := make([]string, 0, len(prepends))
 	for _, part := range prepends {
 		if strings.TrimSpace(part) != "" {
 			clean = append(clean, strings.TrimSpace(part))

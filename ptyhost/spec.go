@@ -119,8 +119,11 @@ func (s Spec) logger() *slog.Logger {
 // runtime blocklist also applies to the inherited parent so a previously
 // filtered runner environment cannot be undone by this final os.Environ merge.
 func composeEnv(parent, overrides []string) []string {
-	idx := make(map[string]int, len(parent)+len(overrides))
-	out := make([]string, 0, len(parent)+len(overrides)+2)
+	// Preallocate from one validated slice length. Overrides and the two fixed
+	// terminal defaults grow through Go's checked map/slice runtime instead of
+	// overflow-prone summed lengths.
+	idx := make(map[string]int, len(parent))
+	out := make([]string, 0, len(parent))
 	blocklist := runtimeenv.NewComposer()
 	put := func(kv string, inherited bool) {
 		key := kv

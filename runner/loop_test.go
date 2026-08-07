@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -845,6 +846,19 @@ func TestMergeMCPServers_NoCardEntries_IsIdentity(t *testing.T) {
 	// Standalone mode: nil defaults + nil card => nil.
 	if got := mergeMCPServers(nil, nil); got != nil {
 		t.Errorf("nil+nil merge must be nil; got %+v", got)
+	}
+}
+
+func TestMergeMCPServers_ManyCardEntriesGrowWithoutCapacitySum(t *testing.T) {
+	t.Parallel()
+	defaults := []agent.MCPServerConfig{{Name: "default", Command: "default-server"}}
+	card := make([]agent.MCPServerConfig, 4096)
+	for i := range card {
+		card[i] = agent.MCPServerConfig{Name: fmt.Sprintf("card-%04d", i), Command: "card-server"}
+	}
+	merged := mergeMCPServers(defaults, card)
+	if len(merged) != 4097 || merged[0].Name != "default" || merged[len(merged)-1].Name != "card-4095" {
+		t.Fatalf("large merge boundaries: len=%d first=%q last=%q", len(merged), merged[0].Name, merged[len(merged)-1].Name)
 	}
 }
 
