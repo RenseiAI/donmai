@@ -6,11 +6,11 @@ package afcli
 // `bin` parameter every command factory in this package receives for exactly
 // this purpose (see binaryName() in helpers.go).
 //
-// afcli is embedded downstream under a DIFFERENT binary name — rensei-tui
-// wires it in via afcli.RegisterCommands(root, Config{BinaryName: "rensei",
-// ...}). A hardcoded "donmai" example in a command's --help output then
-// tells a rensei user to run a binary they don't have; the closest thing on
-// their PATH is either nothing ("donmai: command not found") or, worse, a
+// afcli is designed to be embedded downstream under a DIFFERENT binary name
+// via afcli.RegisterCommands(root, Config{BinaryName: "<embedder>", ...}). A
+// hardcoded "donmai" example in a command's --help output then tells a user
+// of the embedding binary to run a binary they don't have; the closest thing
+// on their PATH is either nothing ("donmai: command not found") or, worse, a
 // different install of the OSS donmai binary running against the wrong
 // context.
 //
@@ -34,11 +34,10 @@ import (
 	"testing"
 )
 
-// embedderBinaryName stands in for a downstream embedder's binary — e.g.
-// rensei-tui's "rensei". Deliberately does NOT contain the substring
-// "donmai" (unlike "not-donmai" or "non-donmai"), so a plain
-// strings.Contains(text, "donmai") check cannot false-positive on the
-// embedder's own name.
+// embedderBinaryName stands in for a downstream embedder's binary name.
+// Deliberately does NOT contain the substring "donmai" (unlike "not-donmai"
+// or "non-donmai"), so a plain strings.Contains(text, "donmai") check cannot
+// false-positive on the embedder's own name.
 const embedderBinaryName = "acme-cli"
 
 // TestEmbeddedBinaryName_GitHubExamplesUseTemplatedBinary is the regression
