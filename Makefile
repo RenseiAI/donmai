@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test lint fmt vuln coverage clean release-dry-run generate verify-generated guard
+.PHONY: build run run-mock run-status run-status-mock test test-tagged lint fmt vuln coverage clean release-dry-run generate verify-generated guard
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -20,6 +20,27 @@ run-status-mock: build
 
 test:
 	go test -race ./...
+
+# test-tagged type-checks every build-tag-gated test file in the repo.
+#
+# A `_test.go` behind `//go:build sometag` is invisible to `go test ./...` and
+# `go build ./...` — not run, not compiled, not even syntax-checked. Without
+# this target the suite stays green while those files rot.
+#
+# Compilation is the honest bar: these suites need live harnesses/services CI
+# cannot provide, but bit-rot (a renamed symbol, a changed signature) is what
+# actually kills them, and that surfaces the moment they are type-checked.
+#
+# The tag list is spelled out literally, never behind a $(VAR): the guard in
+# `internal/testregistration` reads the text the toolchain will really receive,
+# so an indirection is exactly where drift would hide. That guard runs under
+# `make test` and fails the moment a tag appears on disk without appearing
+# here — so this list cannot silently fall behind.
+#
+# GOWORK=off mirrors the OSS-standalone lane and keeps this runnable from a
+# linked worktree the org go.work does not enumerate.
+test-tagged:
+	GOWORK=off go vet -tags "f28_integration,runner_integration,runtime_integration,integration,codex_integration" ./...
 
 lint:
 	golangci-lint run

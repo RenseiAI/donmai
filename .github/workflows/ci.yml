@@ -40,6 +40,14 @@ jobs:
       - name: Build
         run: make build
 
+      # Build-tag-gated `_test.go` files are excluded from `go build ./...` and
+      # `go test ./...` entirely — not run, not compiled, not syntax-checked —
+      # so they rot silently behind a green pipeline. This type-checks them.
+      # `internal/testregistration` fails the Test step below if a tag on disk
+      # is missing from this target's list, so registration cannot lapse.
+      - name: Type-check build-tag-gated tests
+        run: make test-tagged
+
       # Piped through scripts/test-summary.py so the run reports how many
       # tests SKIPPED. `go test ./...` reports a skipped test the same way it
       # reports nothing at all — the package still says `ok` — so a test that
