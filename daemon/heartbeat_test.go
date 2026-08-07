@@ -206,7 +206,7 @@ func TestHeartbeatService_ReregisterOn401(t *testing.T) {
 }
 
 // TestHeartbeatService_ReregisterOn404 covers the case where the worker
-// itself fell out of Redis (5-min TTL): the platform returns 404 and the
+// itself is no longer recognised: the platform returns 404 and the
 // daemon must re-register. Same recovery path as 401.
 func TestHeartbeatService_ReregisterOn404(t *testing.T) {
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")

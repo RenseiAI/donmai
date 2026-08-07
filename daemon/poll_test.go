@@ -203,13 +203,14 @@ func TestPollService_401TriggersReregister(t *testing.T) {
 
 // TestPollService_404TriggersReregisterWithWorkerNotFoundReason confirms
 // that an HTTP 404 "Worker not found" from the poll endpoint triggers
-// OnReregister and passes reason="worker-not-found" so the caller can
-// skip the JWT-refresh probe and go directly to full re-registration.
-// This is the regression test for the Redis-TTL loop documented in the
-// bug report: previously, 404 also called OnReregister, but the reason
-// was passed as "auth-failure", causing RefreshRuntimeToken to probe the
-// refresh endpoint first — which returned a fresh JWT for the SAME
-// workerId, sending the daemon into an infinite 404 loop.
+// OnReregister and passes the distinct reason "worker-not-found" rather
+// than the generic "auth-failure", so the recovery path can tell a
+// missing-worker rejection from an expired-token one and log it as such.
+//
+// The reason is a CLASSIFICATION, not an instruction: RefreshRuntimeToken
+// still probes the refresh endpoint to find out whether the registration
+// actually exists. See RefreshRuntimeToken for why acting on this reason
+// alone put the daemon into a re-registration loop.
 func TestPollService_404TriggersReregisterWithWorkerNotFoundReason(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -253,7 +254,7 @@ func TestPollService_404TriggersReregisterWithWorkerNotFoundReason(t *testing.T)
 	reasonMu.Lock()
 	defer reasonMu.Unlock()
 	if gotReason != "worker-not-found" {
-		t.Errorf("OnReregister reason = %q, want %q (must be worker-not-found so RefreshRuntimeToken skips the JWT-refresh probe)", gotReason, "worker-not-found")
+		t.Errorf("OnReregister reason = %q, want %q (a 404 must be classified distinctly from a 401 so the recovery path and the logs can tell them apart)", gotReason, "worker-not-found")
 	}
 }
 
