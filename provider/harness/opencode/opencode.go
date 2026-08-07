@@ -449,7 +449,9 @@ func (p *Provider) spawnCLI(ctx context.Context, spec agent.Spec) (*openCodeHand
 			cleanupErr := boundary.remove()
 			return nil, errors.Join(fmt.Errorf("%w: validate owned opencode config: %v", agent.ErrSpawnFailed, err), cleanupErr)
 		}
-		env := make(map[string]string, len(spec.Env)+1)
+		// Adding the owned config entry may grow the map naturally; avoid an
+		// overflow-prone capacity sum derived from caller-controlled input.
+		env := make(map[string]string, len(spec.Env))
 		for key, value := range spec.Env {
 			env[key] = value
 		}

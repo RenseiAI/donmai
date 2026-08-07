@@ -3,6 +3,7 @@ package agent_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -365,6 +366,42 @@ func TestPreparePrompt_ReceiptPersistenceFailureDenies(t *testing.T) {
 	}, (&claude.Provider{}).Manifest())
 	if !agent.IsPromptAdaptationError(err, agent.PromptDenialApplicationFailed) {
 		t.Fatalf("receipt persistence error = %v", err)
+	}
+}
+
+func TestPromptAdaptation_ManyUserAmendmentsGrowWithoutCapacitySum(t *testing.T) {
+	t.Parallel()
+	plan := agent.PromptPlan{
+		ContractVersion:  agent.PromptContractVersion,
+		BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+		UserPrompt:       agent.PromptContent{ID: "user", Text: "user-center", Required: true},
+	}
+	for i := 0; i < 2048; i++ {
+		position := agent.UserPromptPrepend
+		if i%2 != 0 {
+			position = agent.UserPromptAppend
+		}
+		marker := fmt.Sprintf("amendment-%04d", i)
+		plan.UserAmendments = append(plan.UserAmendments, agent.UserPromptAmendment{
+			ID: marker, Position: position, Order: i,
+			Content: agent.PromptContent{ID: marker + "-content", Text: marker, Required: true},
+		})
+	}
+	profile, ok := (&codex.Provider{}).Manifest().PromptProfile(agent.PromptModeHumanControlled)
+	if !ok {
+		t.Fatal("codex human prompt profile missing")
+	}
+	adapted, receipt, err := agent.AdaptPrompt(agent.Spec{PromptMode: agent.PromptModeHumanControlled, PromptPlan: &plan}, profile)
+	if err != nil {
+		t.Fatalf("AdaptPrompt: %v", err)
+	}
+	for _, marker := range []string{"amendment-0000", "amendment-2047", "user-center"} {
+		if !strings.Contains(adapted.Prompt, marker) {
+			t.Fatalf("adapted prompt omitted %q", marker)
+		}
+	}
+	if receipt.Decision != "ready" || len(receipt.Entries) != 2050 {
+		t.Fatalf("receipt decision=%q entries=%d", receipt.Decision, len(receipt.Entries))
 	}
 }
 

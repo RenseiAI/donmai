@@ -323,6 +323,13 @@ type CodeIntelEnforcement struct {
 // Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentSpawnConfig).
 type Spec struct {
+	// PromptMode is the admitted session mode. Empty retains the legacy
+	// Interactive-derived mode for non-receipted callers.
+	PromptMode PromptSessionMode `json:"promptMode,omitempty"`
+
+	// PreparedHarness is the host-persisted sole adaptation authority. Provider
+	// PrepareHarness calls become idempotent application/equality checks.
+	PreparedHarness *PreparedHarness `json:"-"`
 	// Prompt is the task-specific directive.
 	Prompt string `json:"prompt"`
 

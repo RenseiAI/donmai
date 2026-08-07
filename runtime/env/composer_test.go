@@ -1,6 +1,7 @@
 package env_test
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -242,6 +243,18 @@ func TestComposeChildEnvFiltersEveryLayer(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ComposeChildEnv():\n got: %v\nwant: %v", got, want)
+	}
+}
+
+func TestComposeChildEnvManyExplicitEntriesGrowWithoutCapacitySum(t *testing.T) {
+	t.Parallel()
+	explicit := make(map[string]string, 4096)
+	for i := 0; i < 4096; i++ {
+		explicit[fmt.Sprintf("KEY_%04d", i)] = "value"
+	}
+	got := env.ComposeChildEnv([]string{"PATH=/usr/bin"}, explicit)
+	if len(got) != 4097 || got[0] != "PATH=/usr/bin" || got[len(got)-1] != "KEY_4095=value" {
+		t.Fatalf("large child environment boundaries: len=%d first=%q last=%q", len(got), got[0], got[len(got)-1])
 	}
 }
 

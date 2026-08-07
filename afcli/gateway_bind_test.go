@@ -261,6 +261,31 @@ func TestBindWorkerGateway_ExistingBindingWins(t *testing.T) {
 	}
 }
 
+func TestBindWorkerGateway_PreservesAdmittedIdentityWhileAddingLocalDelivery(t *testing.T) {
+	t.Setenv(EnvGatewayUpstreamAPIKey, "sk-test")
+	qw := gatewayQW()
+	admitted := &agent.EndpointBinding{
+		Company: agent.CompanyOpenAI, Model: "gpt-5.5", Protocol: agent.ProtoOpenAIChat, Host: agent.HostGateway,
+		EndpointID: "gateway-openai", EndpointOperator: "rensei", EndpointRevision: "r1", ModelAuthor: "openai",
+		AuthBindingID: "auth-platform", AuthAuthority: "rensei", AuthCommercialMode: "platform_metered",
+		AuthBindingScope: "session", AuthPortability: "host_bound", AuthDelivery: "platform_gateway", Mechanism: agent.AuthAPIKey,
+	}
+	qw.ResolvedProfile.Endpoint = admitted
+	gw, err := bindWorkerGateway(context.Background(), slog.Default(), gatewayDetail("gateway", "pi"), qw, "claude-code")
+	if err != nil {
+		t.Fatalf("bindWorkerGateway: %v", err)
+	}
+	defer gw.Close(slog.Default())
+	if qw.ResolvedProfile.Endpoint.EndpointID != admitted.EndpointID ||
+		qw.ResolvedProfile.Endpoint.AuthBindingID != admitted.AuthBindingID ||
+		qw.ResolvedProfile.Endpoint.AuthDelivery != admitted.AuthDelivery {
+		t.Fatalf("gateway replaced admitted identity: %+v", qw.ResolvedProfile.Endpoint)
+	}
+	if qw.ResolvedProfile.Endpoint.BaseURL == "" || qw.ResolvedProfile.Endpoint.Env[gateway.TokenEnvVar] == "" {
+		t.Fatalf("gateway did not add local delivery material: %+v", qw.ResolvedProfile.Endpoint)
+	}
+}
+
 // TestBindWorkerGateway_BindsLoopbackAndForwardsToUpstream is the load-bearing
 // unit test: a gateway-served cell yields a loopback binding carrying a
 // per-session bearer, an OpenAI-chat request to that binding reaches the
