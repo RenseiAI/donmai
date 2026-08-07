@@ -6,6 +6,45 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.57.5 — 2026-08-07
+
+### Fixes
+
+- **A machine now has one stable identity.** The daemon resolves the
+  `machineId` it registers with from an operator override, else a
+  domain-separated hash of the OS-native machine identifier, else a value
+  persisted in the machine-local state directory — never from the hostname.
+  The hostname travels as a human-readable label only. A machine whose name
+  resolves differently depending on the network it is attached to previously
+  presented itself as a separate host per name form, splitting its capacity
+  across duplicate registrations; it now presents one identity that survives
+  renames, network changes, and reinstalls.
+- **Concurrent worker registrations no longer evict one another.** A rejected
+  heartbeat or poll (HTTP 401 or 404) now refreshes credentials and
+  re-presents the EXISTING registration wherever the orchestrator still has
+  it, instead of treating "worker not found" as proof the registration is gone
+  and minting a replacement. A daemon serving several organizations had each
+  lane's fresh registration retire the previous one, producing a new
+  registration every heartbeat interval and stranding sessions owned by the
+  retired one. Full re-registration is now a last resort and is rate-limited
+  by a minimum interval; transport failures, timeouts, and 5xx responses are
+  retried and never re-register.
+- **Embedded command examples name the binary that is running.** Twelve leaf
+  commands hardcoded a literal binary name in their `Example` blocks while
+  their descriptions correctly used the templated name each factory is given,
+  so a CLI embedding these commands printed copy-pasteable examples naming a
+  binary its users do not have.
+
+### Chores
+
+- **A scheduler concurrency test no longer depends on wall-clock luck.** It
+  inferred concurrency from whether two sleeps overlapped in real time and
+  failed 20 of 50 isolated runs; it now synchronizes on a rendezvous the
+  scheduler actually guarantees, and additionally asserts the in-flight bound
+  and exactly-once attempt accounting. No production code changed.
+
+---
+
 ## v0.57.4 — 2026-08-06
 
 ### Features
