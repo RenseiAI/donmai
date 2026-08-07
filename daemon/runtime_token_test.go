@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -215,15 +216,26 @@ func TestRefreshRuntimeToken_FallsBackToReregisterOn404(t *testing.T) {
 	}
 }
 
-// TestRefreshRuntimeToken_WorkerNotFound_SkipsRefreshProbe asserts that
-// when the reason is "worker-not-found" (HTTP 404 on poll/heartbeat),
-// RefreshRuntimeToken skips the JWT-refresh probe entirely and goes
-// directly to full re-registration. This prevents the infinite 404 loop
-// where the refresh probe returns a fresh JWT for the same (Redis-expired)
-// workerId, causing the next poll to 404 again immediately.
-func TestRefreshRuntimeToken_WorkerNotFound_SkipsRefreshProbe(t *testing.T) {
+// TestRefreshRuntimeToken_WorkerNotFound_RePresentsLiveRegistration is the
+// regression test for the re-registration loop.
+//
+// A rejection carrying reason "worker-not-found" (HTTP 404 on poll or
+// heartbeat) is NOT proof that the durable registration is gone. The daemon
+// used to treat it as proof and re-register immediately, which minted a new
+// identity, retired the previous one, and 404ed whichever lane still held it —
+// a self-perpetuating loop that produced a new registration every tick for as
+// long as the process lived.
+//
+// The refresh endpoint answers from the durable record, so it is the
+// discriminator. When it answers 200 the registration is alive: the daemon
+// MUST keep the worker id and MUST NOT register again.
+//
+// Against the pre-fix code this test fails on the very first assertion — the
+// refresh probe is never called at all — and `registerHits` is 1 with a
+// brand-new worker id.
+func TestRefreshRuntimeToken_WorkerNotFound_RePresentsLiveRegistration(t *testing.T) {
 	t.Parallel()
-	const oldWorker = "wkr_redis_expired"
+	const liveWorker = "wkr_still_registered"
 	var refreshHits, registerHits int
 	var mu sync.Mutex
 
@@ -231,25 +243,29 @@ func TestRefreshRuntimeToken_WorkerNotFound_SkipsRefreshProbe(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/api/workers/"+oldWorker+"/refresh-token":
+		case r.Method == http.MethodPost && r.URL.Path == "/api/workers/"+liveWorker+"/refresh-token":
 			refreshHits++
-			// This endpoint would return 200 with a fresh JWT for the same
-			// workerId — but we must never be called for worker-not-found.
+			// The durable registration is alive; a fresh JWT is minted for
+			// the SAME worker id.
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"runtimeToken": "fresh-but-useless.jwt",
+				"runtimeToken":      "fresh.jwt.same-worker",
+				"heartbeatInterval": 30000,
+				"pollInterval":      5000,
 			})
 		case r.Method == http.MethodPost && r.URL.Path == RegisterEndpoint:
 			registerHits++
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"workerId":     "wkr_new_redis_entry",
+				"workerId":     "wkr_should_never_be_minted",
 				"runtimeToken": "new.registration.jwt",
 			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
 		}
 	}))
 	defer srv.Close()
 
-	tmpDir := t.TempDir()
 	regOpts := RegistrationOptions{
 		OrchestratorURL: srv.URL,
 		// #nosec G101 -- test fixture
@@ -257,28 +273,368 @@ func TestRefreshRuntimeToken_WorkerNotFound_SkipsRefreshProbe(t *testing.T) {
 		Hostname:          "h",
 		Version:           Version,
 		MaxAgents:         1,
-		JWTPath:           tmpDir + "/jwt.json",
-		ForceReregister:   true,
+		JWTPath:           t.TempDir() + "/jwt.json",
 		HTTPClient:        &http.Client{Timeout: 5 * time.Second},
 	}
-	result, err := RefreshRuntimeToken(context.Background(), regOpts, oldWorker, "worker-not-found")
+	result, err := RefreshRuntimeToken(context.Background(), regOpts, liveWorker, "worker-not-found")
 	if err != nil {
 		t.Fatalf("RefreshRuntimeToken err: %v", err)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if refreshHits != 0 {
-		t.Errorf("refresh probe must NOT be called for worker-not-found; got %d calls (would produce infinite 404 loop)", refreshHits)
+	if refreshHits != 1 {
+		t.Errorf("refresh probe must be attempted for worker-not-found (it is the only way to tell an evicted cache entry from a retired registration); got %d calls", refreshHits)
+	}
+	if registerHits != 0 {
+		t.Errorf("a live durable registration must NEVER be replaced; got %d registrations", registerHits)
+	}
+	if result.Mode != "refresh" {
+		t.Errorf("expected Mode=refresh, got %q", result.Mode)
+	}
+	if result.WorkerID != liveWorker {
+		t.Errorf("worker identity must survive the refresh: got %q, want %q", result.WorkerID, liveWorker)
+	}
+	if result.RegistrationTokenSwapped {
+		t.Error("RegistrationTokenSwapped must be false when the identity was preserved")
+	}
+}
+
+// TestRefreshRuntimeToken_WorkerNotFound_ReregistersOnlyWhenRecordIsGone is
+// the other half of the contract: when the refresh endpoint also 404s, the
+// durable registration really is gone and minting a new identity is correct.
+func TestRefreshRuntimeToken_WorkerNotFound_ReregistersOnlyWhenRecordIsGone(t *testing.T) {
+	t.Parallel()
+	const retiredWorker = "wkr_retired"
+	var refreshHits, registerHits int
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/workers/"+retiredWorker+"/refresh-token":
+			refreshHits++
+			http.Error(w, `{"error":"Worker not found"}`, http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == RegisterEndpoint:
+			registerHits++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workerId":     "wkr_new_identity",
+				"runtimeToken": "new.registration.jwt",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	regOpts := RegistrationOptions{
+		OrchestratorURL: srv.URL,
+		// #nosec G101 -- test fixture
+		RegistrationToken: "rsp_live_x",
+		Hostname:          "h",
+		Version:           Version,
+		MaxAgents:         1,
+		JWTPath:           t.TempDir() + "/jwt.json",
+		HTTPClient:        &http.Client{Timeout: 5 * time.Second},
+	}
+	result, err := RefreshRuntimeToken(context.Background(), regOpts, retiredWorker, "worker-not-found")
+	if err != nil {
+		t.Fatalf("RefreshRuntimeToken err: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if refreshHits != 1 {
+		t.Errorf("expected exactly one refresh probe, got %d", refreshHits)
 	}
 	if registerHits != 1 {
-		t.Errorf("expected register to be called exactly once; got %d", registerHits)
+		t.Errorf("expected exactly one re-registration, got %d", registerHits)
 	}
 	if result.Mode != "reregister" {
 		t.Errorf("expected Mode=reregister, got %q", result.Mode)
 	}
-	if result.WorkerID != "wkr_new_redis_entry" {
-		t.Errorf("expected new workerId from registration, got %q", result.WorkerID)
+	if result.WorkerID != "wkr_new_identity" {
+		t.Errorf("expected the newly minted identity, got %q", result.WorkerID)
+	}
+	if !result.RegistrationTokenSwapped {
+		t.Error("expected RegistrationTokenSwapped=true when the identity changed")
+	}
+}
+
+// TestRefreshRuntimeToken_AdoptsSiblingRegistrationInsteadOfCompeting pins the
+// cross-lane repair.
+//
+// Two lanes (heartbeat and poll) share one registration. Lane A refreshed and
+// wrote the result to the shared credential cache; lane B is still holding the
+// superseded id and gets rejected. Lane B must ADOPT lane A's live
+// registration, not mint a third one — minting is what turns two lanes into a
+// mutual-eviction loop, because each new registration retires the other lane's
+// record.
+//
+// Against the pre-fix code lane B re-registers unconditionally: registerHits
+// is 1 and the process ends up on an identity neither lane agreed on.
+func TestRefreshRuntimeToken_AdoptsSiblingRegistrationInsteadOfCompeting(t *testing.T) {
+	t.Parallel()
+	const staleWorker = "wkr_lane_b_stale"
+	const siblingWorker = "wkr_lane_a_live"
+	var registerHits int
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/api/workers/" + staleWorker + "/refresh-token":
+			// Lane B's id was retired when lane A re-registered.
+			http.Error(w, `{"error":"Worker not found"}`, http.StatusNotFound)
+		case "/api/workers/" + siblingWorker + "/refresh-token":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"runtimeToken":      "sibling.fresh.jwt",
+				"heartbeatInterval": 30000,
+				"pollInterval":      5000,
+			})
+		case RegisterEndpoint:
+			registerHits++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workerId":     "wkr_third_competing_identity",
+				"runtimeToken": "third.jwt",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	jwtPath := t.TempDir() + "/jwt.json"
+	// Lane A's refresh already landed in the shared cache.
+	if err := SaveCachedJWT(jwtPath, &RegisterResponse{
+		WorkerID:     siblingWorker,
+		RuntimeToken: "lane.a.jwt",
+	}, time.Unix(1_700_000_000, 0)); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	regOpts := RegistrationOptions{
+		OrchestratorURL: srv.URL,
+		// #nosec G101 -- test fixture
+		RegistrationToken: "rsp_live_x",
+		Hostname:          "h",
+		Version:           Version,
+		MaxAgents:         1,
+		JWTPath:           jwtPath,
+		HTTPClient:        &http.Client{Timeout: 5 * time.Second},
+	}
+	result, err := RefreshRuntimeToken(context.Background(), regOpts, staleWorker, "worker-not-found")
+	if err != nil {
+		t.Fatalf("RefreshRuntimeToken err: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if registerHits != 0 {
+		t.Errorf("a lane must adopt its sibling's live registration, never mint a competing one; got %d registrations", registerHits)
+	}
+	if result.WorkerID != siblingWorker {
+		t.Errorf("expected the sibling's worker id %q, got %q", siblingWorker, result.WorkerID)
+	}
+	if result.Mode != "refresh" {
+		t.Errorf("expected Mode=refresh on adoption, got %q", result.Mode)
+	}
+	if result.RuntimeToken != "sibling.fresh.jwt" {
+		t.Errorf("expected the freshly minted sibling token, got %q", result.RuntimeToken)
+	}
+}
+
+// TestRefreshRuntimeToken_TransientProbeFailureKeepsIdentity asserts that a
+// 5xx / transport failure on the refresh probe is a RETRY, never a reason to
+// abandon the worker identity. Only 404 and 405 mean "there is nothing to
+// re-present".
+func TestRefreshRuntimeToken_TransientProbeFailureKeepsIdentity(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		probeStatus   int
+		wantErr       bool
+		wantRegisters int
+	}{
+		{name: "server error retries", probeStatus: http.StatusInternalServerError, wantErr: true, wantRegisters: 0},
+		{name: "bad gateway retries", probeStatus: http.StatusBadGateway, wantErr: true, wantRegisters: 0},
+		{name: "unauthorized retries", probeStatus: http.StatusUnauthorized, wantErr: true, wantRegisters: 0},
+		{name: "not found reregisters", probeStatus: http.StatusNotFound, wantErr: false, wantRegisters: 1},
+		{name: "method not allowed reregisters", probeStatus: http.StatusMethodNotAllowed, wantErr: false, wantRegisters: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var registerHits int
+			var mu sync.Mutex
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				if r.URL.Path == RegisterEndpoint {
+					registerHits++
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"workerId":     "wkr_new",
+						"runtimeToken": "new.jwt",
+					})
+					return
+				}
+				http.Error(w, `{"error":"probe"}`, tc.probeStatus)
+			}))
+			defer srv.Close()
+
+			regOpts := RegistrationOptions{
+				OrchestratorURL: srv.URL,
+				// #nosec G101 -- test fixture
+				RegistrationToken: "rsp_live_x",
+				Hostname:          "h",
+				Version:           Version,
+				MaxAgents:         1,
+				JWTPath:           t.TempDir() + "/jwt.json",
+				HTTPClient:        &http.Client{Timeout: 5 * time.Second},
+			}
+			_, err := RefreshRuntimeToken(context.Background(), regOpts, "wkr_current", "worker-not-found")
+			if tc.wantErr && err == nil {
+				t.Fatal("expected an error so the caller retries on its next tick")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if registerHits != tc.wantRegisters {
+				t.Errorf("registrations = %d, want %d", registerHits, tc.wantRegisters)
+			}
+		})
+	}
+}
+
+// TestRefreshRuntimeToken_ThrottlesRepeatedReregistration pins the safeguard
+// behind the fix: even when every path legitimately concludes "re-register",
+// the daemon refuses to mint identities faster than
+// MinReregisterInterval. This is what bounds the blast radius of any future
+// rejection mode that escapes the re-presentation logic.
+func TestRefreshRuntimeToken_ThrottlesRepeatedReregistration(t *testing.T) {
+	t.Parallel()
+	var registerHits int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path == RegisterEndpoint {
+			registerHits++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workerId":     fmt.Sprintf("wkr_minted_%d", registerHits),
+				"runtimeToken": "minted.jwt",
+			})
+			return
+		}
+		http.Error(w, `{"error":"Worker not found"}`, http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	regOpts := RegistrationOptions{
+		OrchestratorURL: srv.URL,
+		// #nosec G101 -- test fixture
+		RegistrationToken: "rsp_live_x",
+		Hostname:          "h",
+		Version:           Version,
+		MaxAgents:         1,
+		JWTPath:           t.TempDir() + "/jwt.json",
+		HTTPClient:        &http.Client{Timeout: 5 * time.Second},
+	}
+
+	first, err := RefreshRuntimeToken(context.Background(), regOpts, "wkr_a", "worker-not-found")
+	if err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+	// A DIFFERENT stale id, so the single-flight adoption path does not
+	// short-circuit: this is a genuine second re-registration attempt.
+	if _, err := RefreshRuntimeToken(context.Background(), regOpts, first.WorkerID, "worker-not-found"); err == nil {
+		t.Fatal("expected the second re-registration inside the cooldown to be refused")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if registerHits != 1 {
+		t.Errorf("expected the cooldown to cap registrations at 1, got %d", registerHits)
+	}
+}
+
+// TestRefreshRuntimeToken_ConcurrentLanesProduceOneRegistration asserts that
+// two lanes reacting to the same rejection at the same instant collapse into a
+// single refresh. Without the single-flight each lane registers, and each
+// registration retires the other's record — the loop, in miniature.
+func TestRefreshRuntimeToken_ConcurrentLanesProduceOneRegistration(t *testing.T) {
+	resetRefreshersForTest()
+	t.Cleanup(resetRefreshersForTest)
+
+	var registerHits int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == RegisterEndpoint {
+			mu.Lock()
+			registerHits++
+			id := fmt.Sprintf("wkr_minted_%d", registerHits)
+			mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workerId":     id,
+				"runtimeToken": "minted.jwt",
+			})
+			return
+		}
+		http.Error(w, `{"error":"Worker not found"}`, http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	regOpts := RegistrationOptions{
+		OrchestratorURL: srv.URL,
+		// #nosec G101 -- test fixture
+		RegistrationToken: "rsp_live_x",
+		Hostname:          "h",
+		Version:           Version,
+		MaxAgents:         1,
+		JWTPath:           t.TempDir() + "/jwt.json",
+		HTTPClient:        &http.Client{Timeout: 5 * time.Second},
+	}
+
+	const lanes = 2
+	var wg sync.WaitGroup
+	results := make([]*RefreshTokenResult, lanes)
+	errs := make([]error, lanes)
+	start := make(chan struct{})
+	for i := range lanes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = RefreshRuntimeToken(
+				context.Background(), regOpts, "wkr_shared_stale", "worker-not-found")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("lane %d: %v", i, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if registerHits != 1 {
+		t.Errorf("concurrent lanes must coalesce into ONE registration; got %d", registerHits)
+	}
+	if results[0].WorkerID != results[1].WorkerID {
+		t.Errorf("lanes converged on different identities: %q vs %q", results[0].WorkerID, results[1].WorkerID)
 	}
 }
 

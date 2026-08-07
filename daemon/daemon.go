@@ -707,9 +707,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 			regCaps = []string{"local", "sandbox", "workarea"}
 		}
 		regOpts = RegistrationOptions{
-			OrchestratorURL:         cfg.Orchestrator.URL,
-			RegistrationToken:       token,
-			MachineID:               cfg.Machine.ID,
+			OrchestratorURL:   cfg.Orchestrator.URL,
+			RegistrationToken: token,
+			// MachineID is deliberately left empty so Register resolves the
+			// STABLE machine identity (MachineID()). cfg.Machine.ID is a
+			// hostname-derived label — keying host identity on it forked one
+			// machine into one host per hostname form it had ever resolved
+			// to. Operators who must pin identity set DONMAI_MACHINE_ID.
 			Hostname:                cfg.Machine.ID,
 			Version:                 d.EffectiveVersion(),
 			MaxAgents:               cfg.Capacity.MaxConcurrentSessions,

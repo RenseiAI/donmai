@@ -110,21 +110,20 @@ type HeartbeatOptions struct {
 	// (whether or not the network call succeeded). Used by tests and
 	// observability.
 	OnHeartbeat func(payload HeartbeatPayload)
-	// OnReregister is called when the runtime token is rejected (HTTP 401)
-	// or the worker is reported missing (HTTP 404 — likely Redis TTL
-	// expired). Implementations re-issue Register() against the platform
-	// and return the fresh worker id + runtime token. Returning a non-nil
-	// error leaves the heartbeat in its prior state and logs via LogWarn;
-	// the next tick retries the heartbeat with the stale token (which will
-	// fail again and re-trigger this path).
+	// OnReregister is called when the orchestrator rejects a heartbeat:
+	// HTTP 401 (runtime token expired/invalid) or HTTP 404 (worker not
+	// recognised). Implementations return the worker id + runtime token to
+	// continue with — USUALLY THE SAME worker id, because the recovery path
+	// re-presents the existing registration rather than replacing it.
+	// Returning a non-nil error leaves the heartbeat in its prior state and
+	// logs via LogWarn; the next tick retries and re-triggers this path.
 	//
 	// reason is the structured failure reason ("worker-not-found",
 	// "runtime-token-expired", "unauthorized", "auth-failure"). Callers
-	// should pass it through to RefreshRuntimeToken so the correct
-	// recovery path is taken — in particular, "worker-not-found" skips
-	// the JWT refresh probe and goes directly to full re-registration
-	// (creating a new Redis entry), while "runtime-token-expired" tries
-	// the refresh probe first to preserve the workerId.
+	// should pass it through to RefreshRuntimeToken, which owns the recovery
+	// decision. In particular "worker-not-found" is NOT evidence that the
+	// registration is gone — see RefreshRuntimeToken for what treating it
+	// that way cost.
 	//
 	// Required when the daemon runs against a real platform; tests that
 	// only exercise the local stub path can leave it nil.
@@ -664,9 +663,10 @@ func (e *heartbeatHTTPError) Error() string {
 	return fmt.Sprintf("HTTP %d", e.status)
 }
 
-// isAuthFailure returns true for the HTTP statuses that indicate the runtime
-// token must be refreshed via re-register: 401 (Unauthorized — JWT expired
-// or invalid) and 404 (Worker not found — fell out of Redis after TTL).
+// isAuthFailure returns true for the HTTP statuses that mean "this heartbeat
+// was rejected on identity/credential grounds and the credentials must be
+// refreshed": 401 (Unauthorized — JWT expired or invalid) and 404 (Worker not
+// found). Refreshing does not imply re-registering — see RefreshRuntimeToken.
 func isAuthFailure(err error) bool {
 	var hErr *heartbeatHTTPError
 	if errors.As(err, &hErr) {
@@ -690,7 +690,7 @@ func authFailureReason(err error) string {
 			}
 			return "unauthorized"
 		case http.StatusNotFound:
-			return "worker-not-found"
+			return reasonWorkerNotFound
 		}
 	}
 	return "auth-failure"

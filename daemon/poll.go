@@ -415,16 +415,20 @@ type PollOptions struct {
 	// per CONTRACT-FREEZE §3, so a nil OnInbox is not a hard drop). Errors are
 	// logged at warn and do not stop the loop.
 	OnInbox func(sessionID string, msg InboxMessage) error
-	// OnReregister is called on HTTP 401 (runtime JWT expired) or 404 (worker
-	// fell out of Redis). Implementations re-issue Register() and return the
-	// fresh worker id + runtime token. The poll loop swaps credentials and
-	// continues. Returning an error logs and the loop retries on the next tick.
+	// OnReregister is called when the orchestrator rejects a poll: HTTP 401
+	// (runtime JWT expired) or HTTP 404 (worker not recognised).
+	// Implementations return the worker id + runtime token to continue with —
+	// USUALLY THE SAME worker id, because the recovery path re-presents the
+	// existing registration rather than replacing it. The poll loop swaps
+	// credentials and continues. Returning an error logs and the loop retries
+	// on the next tick.
 	//
 	// reason is the structured failure reason ("worker-not-found",
 	// "runtime-token-expired", "unauthorized", "auth-failure"). Pass it
-	// through to RefreshRuntimeToken so the correct recovery path is taken
-	// — "worker-not-found" skips the JWT refresh probe and goes directly to
-	// full re-registration to create a new Redis entry.
+	// through to RefreshRuntimeToken, which decides recovery. Note that
+	// "worker-not-found" does NOT by itself mean the registration is gone —
+	// see RefreshRuntimeToken for why treating it that way made the daemon
+	// re-register on every tick.
 	OnReregister func(ctx context.Context, reason string) (workerID, runtimeJWT string, err error)
 
 	// ClaimSuspended reports whether this host must currently stop claiming
@@ -868,9 +872,10 @@ func callNackEndpoint(
 	return nil
 }
 
-// isPollAuthFailure returns true for HTTP statuses that indicate the runtime
-// token must be refreshed via re-register: 401 (Unauthorized) and 404 (Worker
-// not found — fell out of Redis after TTL).
+// isPollAuthFailure returns true for the HTTP statuses that mean "this poll
+// was rejected on identity/credential grounds and the credentials must be
+// refreshed": 401 (Unauthorized) and 404 (Worker not found). Refreshing does
+// not imply re-registering — see RefreshRuntimeToken.
 func isPollAuthFailure(err error) bool {
 	var hErr *PollHTTPError
 	if errors.As(err, &hErr) {
@@ -894,7 +899,7 @@ func pollAuthFailureReason(err error) string {
 			}
 			return "unauthorized"
 		case http.StatusNotFound:
-			return "worker-not-found"
+			return reasonWorkerNotFound
 		}
 	}
 	return "auth-failure"
