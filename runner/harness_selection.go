@@ -283,6 +283,23 @@ func validateHostAdaptationReceipt(qw QueuedWork, admission executioncell.Admiss
 	if host.RequestID != qw.SessionID || host.WorkerID != qw.WorkerID || host.PlacementID != binding.PlacementID || host.ClaimID != binding.ClaimID || host.Decision != "ready" {
 		return errors.New("daemon adaptation-ready receipt does not match the active runtime binding")
 	}
+	var prepared agent.PreparedHarness
+	if err := json.Unmarshal(host.Plan, &prepared); err != nil {
+		return errors.New("daemon harness adaptation plan is malformed")
+	}
+	if agent.DigestPreparedHarness(&prepared) != host.PlanDigest {
+		return errors.New("daemon harness adaptation plan digest mismatch")
+	}
+	if err := agent.ValidatePreparedHarness(&prepared, admission.OperationalPayloadDigest); err != nil {
+		return err
+	}
+	wantMode := agent.PromptModeAutonomous
+	if admission.Cell != nil && admission.Cell.SessionMode == executioncell.SessionHumanControlled {
+		wantMode = agent.PromptModeHumanControlled
+	}
+	if prepared.Mode != wantMode || (admission.Cell != nil && prepared.Harness != admission.Cell.Harness.ID) {
+		return errors.New("daemon harness adaptation plan does not match admitted harness and mode")
+	}
 	var promptReceipt agent.PromptDeliveryReceipt
 	if err := json.Unmarshal(host.PromptReceipt, &promptReceipt); err != nil || promptReceipt.Decision != "ready" {
 		return errors.New("daemon prompt adaptation receipt is not ready")
@@ -301,7 +318,27 @@ func validateHostAdaptationReceipt(qw QueuedWork, admission executioncell.Admiss
 	if toolReceipt.ClaimReceiptID != wantClaimID {
 		return errors.New("daemon tool/lifecycle receipt is not linked to this claim")
 	}
+	if !bytes.Equal(host.PromptReceipt, mustJSON(prepared.PromptReceipt)) || !bytes.Equal(host.ToolLifecycleReceipt, mustJSON(prepared.ToolLifecycleReceipt)) {
+		return errors.New("daemon receipt projections differ from sole prepared harness authority")
+	}
 	return nil
+}
+
+func mustJSON(value any) []byte {
+	raw, _ := json.Marshal(value)
+	return raw
+}
+
+func preparedHarnessFromWork(qw QueuedWork) (*agent.PreparedHarness, error) {
+	host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
+	if err != nil {
+		return nil, err
+	}
+	var prepared agent.PreparedHarness
+	if err := json.Unmarshal(host.Plan, &prepared); err != nil {
+		return nil, err
+	}
+	return &prepared, nil
 }
 
 func (r *Registry) selectReceiptHarness(qw QueuedWork, receipt executioncell.AdmissionReceipt, cell executioncell.ResolvedExecutionCell) (harnessSelection, error) {

@@ -62,6 +62,8 @@ func TestSpecFieldCoverage(t *testing.T) {
 		"ProviderConfig",
 		"SubAgentProvider",
 		"OnProcessSpawned",       // documented as honored at spawn time
+		"PromptMode",             // selects the exact profile before NewSpawnPlan
+		"PreparedHarness",        // consumed as sole authority by agent.PrepareHarness
 		"PromptPlan",             // consumed by agent.PreparePrompt before NewSpawnPlan
 		"PromptReceipt",          // populated by agent.PreparePrompt; not a JSON-RPC param
 		"OnPromptAdapted",        // invoked by agent.PreparePrompt before NewSpawnPlan

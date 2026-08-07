@@ -1,12 +1,15 @@
 package daemon
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
+
+	"github.com/RenseiAI/donmai/executioncell"
 )
 
 // FileExecutionPreflightStore is an append-only, fsync-backed receipt store.
@@ -23,37 +26,54 @@ func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.Raw
 	if s == nil || strings.TrimSpace(s.dir) == "" {
 		return errors.New("execution preflight receipt directory is required")
 	}
-	if strings.TrimSpace(sessionID) == "" || filepath.Base(sessionID) != sessionID {
+	if strings.TrimSpace(sessionID) == "" {
 		return errors.New("invalid execution preflight session id")
 	}
-	if !json.Valid(receipt) {
-		return errors.New("execution preflight receipt is not valid JSON")
+	decoded, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		return fmt.Errorf("validate execution preflight receipt: %w", err)
+	}
+	if decoded.RequestID != sessionID {
+		return errors.New("execution preflight receipt request does not match session id")
 	}
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return fmt.Errorf("create execution preflight receipt directory: %w", err)
 	}
-	path := filepath.Join(s.dir, sessionID+".json")
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // sessionID is a validated basename under the configured store root
+	root, err := os.OpenRoot(s.dir)
 	if err != nil {
-		return err
+		return fmt.Errorf("open execution preflight receipt root: %w", err)
 	}
-	written := false
-	defer func() {
-		_ = file.Close()
-		if !written {
-			_ = os.Remove(path)
-		}
-	}()
+	defer func() { _ = root.Close() }()
+
+	finalName := executionPreflightReceiptName(sessionID)
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("generate execution preflight receipt nonce: %w", err)
+	}
+	pendingName := fmt.Sprintf(".%x.pending", nonce)
+	file, err := root.OpenFile(pendingName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create execution preflight pending receipt: %w", err)
+	}
+	defer func() { _ = root.Remove(pendingName) }()
 	if _, err := file.Write(receipt); err != nil {
+		_ = file.Close()
 		return err
 	}
 	if err := file.Sync(); err != nil {
+		_ = file.Close()
 		return err
 	}
 	if err := file.Close(); err != nil {
 		return err
 	}
-	dir, err := os.Open(s.dir)
+	// A hard link publishes the fully fsynced inode atomically and, unlike a
+	// rename, cannot replace an existing receipt or follow a destination
+	// symlink. Both names are constrained by os.Root.
+	if err := root.Link(pendingName, finalName); err != nil {
+		return fmt.Errorf("publish immutable execution preflight receipt: %w", err)
+	}
+	dir, err := root.Open(".")
 	if err != nil {
 		return err
 	}
@@ -64,6 +84,10 @@ func (s *FileExecutionPreflightStore) Persist(sessionID string, receipt json.Raw
 	if err := dir.Close(); err != nil {
 		return err
 	}
-	written = true
 	return nil
+}
+
+func executionPreflightReceiptName(sessionID string) string {
+	digest := sha256.Sum256([]byte(sessionID))
+	return fmt.Sprintf("%x.json", digest)
 }

@@ -39,6 +39,8 @@ type HostAdaptationReceipt struct {
 	PlacementID          string          `json:"placementId"`
 	ClaimID              string          `json:"claimId,omitempty"`
 	Decision             string          `json:"decision"`
+	Plan                 json.RawMessage `json:"plan,omitempty"`
+	PlanDigest           string          `json:"planDigest,omitempty"`
 	PromptReceipt        json.RawMessage `json:"promptReceipt,omitempty"`
 	ToolLifecycleReceipt json.RawMessage `json:"toolLifecycleReceipt,omitempty"`
 	Denial               string          `json:"denial,omitempty"`
@@ -61,10 +63,14 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 	if receipt.Decision != "ready" && receipt.Decision != "denied" {
 		return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation decision must be ready or denied")
 	}
-	if receipt.Decision == "ready" && (len(receipt.PromptReceipt) == 0 || len(receipt.ToolLifecycleReceipt) == 0 || receipt.Denial != "") {
+	if receipt.Decision == "ready" && (len(receipt.Plan) == 0 || receipt.PlanDigest == "" || len(receipt.PromptReceipt) == 0 || len(receipt.ToolLifecycleReceipt) == 0 || receipt.Denial != "") {
 		return HostAdaptationReceipt{}, errors.New("executioncell: ready host adaptation requires complete receipts and no denial")
 	}
 	if receipt.Decision == "ready" {
+		sum := sha256.Sum256(receipt.Plan)
+		if hex.EncodeToString(sum[:]) != receipt.PlanDigest {
+			return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation plan digest mismatch")
+		}
 		for name, nested := range map[string]json.RawMessage{"promptReceipt": receipt.PromptReceipt, "toolLifecycleReceipt": receipt.ToolLifecycleReceipt} {
 			var projection struct {
 				Decision string `json:"decision"`

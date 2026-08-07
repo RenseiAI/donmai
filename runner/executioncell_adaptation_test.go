@@ -105,9 +105,24 @@ func attachReadyHostAdaptation(t *testing.T, qw QueuedWork, claimReceiptID strin
 	}
 	promptReceipt := agent.PromptDeliveryReceipt{ContractVersion: agent.PromptContractVersion, ProfileID: "test-prompt", Decision: "ready", Entries: []agent.PromptDeliveryEntry{}}
 	toolReceipt := agent.ToolLifecycleReceipt{ContractVersion: agent.ToolLifecycleContractVersion, AdmissionReceiptID: admission.Value().ReceiptID, ClaimReceiptID: claimReceiptID, OperationalPayloadDigest: admission.Value().OperationalPayloadDigest, ProfileID: "test-tools", Decision: "ready", EvidenceTier: string(agent.EvidenceStructured), ProductionEligible: true, Entries: []agent.ToolLifecycleEntry{}}
+	mode := agent.PromptModeAutonomous
+	if admission.Value().Cell != nil && admission.Value().Cell.SessionMode == executioncell.SessionHumanControlled {
+		mode = agent.PromptModeHumanControlled
+	}
+	plan := &agent.PreparedHarness{
+		ContractVersion: agent.HarnessAdaptationContractVersion, Harness: admission.Value().Cell.Harness.ID,
+		Mode: mode, OperationalPayloadDigest: admission.Value().OperationalPayloadDigest, AuthorityDigest: "test-authority",
+		PromptReceipt: promptReceipt, ToolLifecycleReceipt: toolReceipt,
+	}
+	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+		plan.Materializations = append(plan.Materializations, agent.HarnessMaterialization{
+			Channel: channel, SourceDigest: admission.Value().OperationalPayloadDigest, Required: true,
+		})
+	}
 	host := map[string]any{
 		"contractVersion": executioncell.HostAdaptationContractVersion, "requestId": binding.RequestID,
 		"workerId": binding.WorkerID, "placementId": binding.PlacementID, "decision": "ready",
+		"plan": plan, "planDigest": agent.DigestPreparedHarness(plan),
 		"promptReceipt": promptReceipt, "toolLifecycleReceipt": toolReceipt,
 	}
 	if binding.ClaimID != "" {
@@ -664,6 +679,7 @@ func TestHostProviderViewCompilesAdmissionLifecycleBeforeChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	qw := exactReceiptQueuedWork("host-preflight-watch")
+	qw.Body = "exercise lifecycle preflight"
 	qw = attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, []executioncell.CapabilityRequirement{{Name: "watch"}}))
 	operational, err := CanonicalOperationalPayload(qw)
 	if err != nil {
@@ -690,6 +706,71 @@ func TestHostProviderViewCompilesAdmissionLifecycleBeforeChild(t *testing.T) {
 	if provider.spawnCalls.Load() != 0 {
 		t.Fatalf("provider spawned during host compile: %d", provider.spawnCalls.Load())
 	}
+}
+
+func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
+	provider := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
+	providerWithManifest := &manifestSelectorProvider{selectorFakeProvider: provider, manifest: codexManifestForTest()}
+	registry := NewRegistry()
+	if err := registry.Register(providerWithManifest); err != nil {
+		t.Fatal(err)
+	}
+	qw := exactReceiptQueuedWork("host-preflight-human")
+	qw.Mode = interactiveRunMode
+	qw.InitialPrompt = "actual human-controlled initial turn"
+	qw.McpServers = []agent.MCPServerConfig{{Name: "card-server", Command: "card-mcp", Args: []string{"--stdio"}}}
+	qw = attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionHumanControlled, nil))
+	operational, err := CanonicalOperationalPayload(qw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw.OperationalPayload = operational
+	detail := map[string]any{
+		"sessionId": qw.SessionID, "workerId": qw.WorkerID, "admissionReceipt": qw.AdmissionReceipt,
+		"effectiveCell": qw.EffectiveCell, "executionRuntimeBinding": qw.ExecutionRuntimeBinding,
+		"operationalPayload": qw.OperationalPayload,
+	}
+	receipt, err := NewProviderView(registry).PreflightExecution(rawJSONForRunner(t, detail))
+	if err != nil {
+		t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan agent.PreparedHarness
+	if err := json.Unmarshal(host.Plan, &plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Mode != agent.PromptModeHumanControlled || plan.Harness != string(agent.HarnessCodex) {
+		t.Fatalf("host compiled wrong identity: %+v", plan)
+	}
+	source, _, err := buildPreparedSourceSpec(qw, harnessSelection{
+		Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, qw.AdmissionReceipt),
+		effectiveCell: exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionHumanControlled, nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Prompt != qw.InitialPrompt || source.Autonomous || source.Interactive == nil || len(source.MCPServers) != 2 {
+		t.Fatalf("host source was not actual human input: prompt=%q autonomous=%v interactive=%v mcp=%+v", source.Prompt, source.Autonomous, source.Interactive != nil, source.MCPServers)
+	}
+	source.PreparedHarness = &plan
+	if _, err := agent.PrepareHarness(source, providerWithManifest.Manifest()); err != nil {
+		t.Fatalf("host plan cannot be consumed as sole provider authority: %v", err)
+	}
+	if provider.spawnCalls.Load() != 0 {
+		t.Fatalf("provider spawned during host compile: %d", provider.spawnCalls.Load())
+	}
+}
+
+func mustAdmissionReceipt(t *testing.T, raw json.RawMessage) executioncell.ImmutableAdmissionReceipt {
+	t.Helper()
+	receipt, err := executioncell.DecodeAdmissionReceipt(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receipt
 }
 
 type manifestSelectorProvider struct {

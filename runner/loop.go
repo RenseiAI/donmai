@@ -83,6 +83,31 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	provider := selection.Provider
+	var preparedPlan *agent.PreparedHarness
+	var preparedSource agent.Spec
+	if len(selection.receipt.Bytes()) > 0 {
+		preparedPlan, err = preparedHarnessFromWork(qw)
+		if err != nil {
+			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
+			return res, err
+		}
+		preparedSource, _, err = buildPreparedSourceSpec(qw, selection)
+		if err != nil {
+			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
+			return res, err
+		}
+		preparedSource.PreparedHarness = preparedPlan
+		harness, ok := provider.(agent.HarnessProvider)
+		if !ok {
+			err = errors.New("runner: selected provider has no exact harness manifest")
+			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
+			return res, err
+		}
+		if _, err = agent.ApplyPreparedHarness(preparedSource, harness.Manifest()); err != nil {
+			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
+			return res, err
+		}
+	}
 	res.ProviderName = provider.Name()
 	harnessRef := selection.Harness
 	res.HarnessRef = &harnessRef
@@ -190,7 +215,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	//      be wired (set at runner construction in afcli/agent_run.go).
 	// Zero-kit sessions (no platform demand AND no detector / no match) skip
 	// this entirely (additive — pre-K1 behaviour preserved).
-	if demand := r.resolveKitDemand(qw, wpath, res); demand != nil {
+	var demand *kit.ToolchainDemand
+	if len(selection.receipt.Bytes()) == 0 || qw.Kits != nil {
+		demand = r.resolveKitDemand(qw, wpath, res)
+	}
+	if demand != nil {
 		if res.Status == "failed" {
 			// resolveKitDemand classified a detect/compose error onto res.
 			return res, fmt.Errorf("kit demand: %s", res.Error)
@@ -225,8 +254,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// When KitSkillDetector is wired, replace the pre-computed sources with a
 	// fresh scan against wpath. Additive: nil KitSkillDetector keeps the
 	// existing KitSkillSources (pre-K1-bootstrap behaviour).
-	kitSkillSources := r.kitSkillSources // default: daemon-CWD pre-compute
-	if r.kitSkillDetector != nil {
+	var kitSkillSources []kit.KitSkillSource
+	if len(selection.receipt.Bytes()) == 0 {
+		kitSkillSources = r.kitSkillSources // default: daemon-CWD pre-compute
+	}
+	if len(selection.receipt.Bytes()) == 0 && r.kitSkillDetector != nil {
 		targetOS := r.kitTargetOS
 		detected, detectErr := r.kitSkillDetector(wpath, targetOS)
 		if detectErr != nil {
@@ -242,7 +274,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Detect prompt-fragment sources from the cloned worktree when the detector
 	// is wired. nil = no fragment injection (additive).
 	var kitPromptFragSources []kit.KitPromptFragmentSource
-	if r.kitPromptFragDetector != nil {
+	if len(selection.receipt.Bytes()) == 0 && r.kitPromptFragDetector != nil {
 		targetOS := r.kitTargetOS
 		frags, fragErr := r.kitPromptFragDetector(wpath, targetOS)
 		if fragErr != nil {
@@ -520,27 +552,22 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			RecordPath: filepath.Join(wpath, state.AgentDirName, "term.cast"),
 		}
 	}
-	spec.OnPromptAdapted = func(receipt agent.PromptDeliveryReceipt) error {
-		_, err := r.store.Update(wpath, func(s *state.State) error {
-			s.PromptReceipt = &receipt
-			return nil
-		})
-		return err
-	}
-	spec.OnToolLifecycleAdapted = func(receipt agent.ToolLifecycleReceipt) error {
-		_, err := r.store.Update(wpath, func(s *state.State) error {
-			s.AppendToolLifecycleReceipt(receipt)
-			return nil
-		})
-		return err
-	}
 	if len(selection.receipt.Bytes()) > 0 {
-		spec, err = bindAdmissionToolLifecyclePlan(spec, selection.receipt, selection.claimReceipt)
-		if err != nil {
-			res.Status = "failed"
-			res.FailureMode = FailureSpawn
-			res.Error = err.Error()
-			return res, err
+		spec = applyPreparedSourceAuthority(spec, preparedSource, preparedPlan)
+	} else {
+		spec.OnPromptAdapted = func(receipt agent.PromptDeliveryReceipt) error {
+			_, err := r.store.Update(wpath, func(s *state.State) error {
+				s.PromptReceipt = &receipt
+				return nil
+			})
+			return err
+		}
+		spec.OnToolLifecycleAdapted = func(receipt agent.ToolLifecycleReceipt) error {
+			_, err := r.store.Update(wpath, func(s *state.State) error {
+				s.AppendToolLifecycleReceipt(receipt)
+				return nil
+			})
+			return err
 		}
 	}
 

@@ -247,6 +247,9 @@ func (e *PromptAdaptationError) Error() string {
 
 // PromptModeForSpec derives the mode without hard-coding harness identities.
 func PromptModeForSpec(spec Spec) PromptSessionMode {
+	if spec.PromptMode != "" {
+		return spec.PromptMode
+	}
 	if spec.Interactive != nil {
 		return PromptModeHumanControlled
 	}

@@ -28,6 +28,8 @@ type hostAdaptationReceipt struct {
 	PlacementID     string                       `json:"placementId"`
 	ClaimID         string                       `json:"claimId,omitempty"`
 	Decision        string                       `json:"decision"`
+	Plan            *agent.PreparedHarness       `json:"plan,omitempty"`
+	PlanDigest      string                       `json:"planDigest,omitempty"`
 	Prompt          *agent.PromptDeliveryReceipt `json:"promptReceipt,omitempty"`
 	ToolLifecycle   *agent.ToolLifecycleReceipt  `json:"toolLifecycleReceipt,omitempty"`
 	Denial          string                       `json:"denial,omitempty"`
@@ -82,33 +84,18 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if admission == nil || admission.selection.Provider == nil {
 		return encode(fmt.Errorf("host adaptation requires explicit receipt admission"))
 	}
-	harness, ok := admission.selection.Provider.(agent.HarnessProvider)
-	if !ok {
-		return encode(fmt.Errorf("selected provider has no closed harness manifest"))
+	plan, _, err := compilePreparedHarness(qw, admission.selection)
+	if plan != nil {
+		receipt.Plan = plan
+		receipt.PlanDigest = agent.DigestPreparedHarness(plan)
+		receipt.Prompt = &plan.PromptReceipt
+		receipt.ToolLifecycle = &plan.ToolLifecycleReceipt
 	}
-	spec := translateSpec(qw, admission.selection.Provider.Capabilities(), SpecInputs{
-		Autonomous: true, MCPServers: qw.McpServers,
-		ProviderName: string(admission.selection.Provider.Name()),
-	})
-	spec, err = bindAdmissionToolLifecyclePlan(spec, admission.receipt, admission.selection.claimReceipt)
 	if err != nil {
 		return encode(err)
 	}
-	spec.OnPromptAdapted = func(value agent.PromptDeliveryReceipt) error {
-		snapshot := value
-		receipt.Prompt = &snapshot
-		return nil
-	}
-	spec.OnToolLifecycleAdapted = func(value agent.ToolLifecycleReceipt) error {
-		snapshot := value
-		receipt.ToolLifecycle = &snapshot
-		return nil
-	}
-	if _, err = agent.PrepareHarness(spec, harness.Manifest()); err != nil {
+	if err := agent.ValidatePreparedHarness(plan, admission.receipt.Value().OperationalPayloadDigest); err != nil {
 		return encode(err)
-	}
-	if receipt.Prompt == nil || receipt.Prompt.Decision != "ready" || receipt.ToolLifecycle == nil || receipt.ToolLifecycle.Decision != "ready" {
-		return encode(fmt.Errorf("host adaptation did not produce complete ready receipts"))
 	}
 	receipt.Decision = "ready"
 	return encode(nil)

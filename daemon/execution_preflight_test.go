@@ -131,11 +131,11 @@ func TestAdaptationDeniedIsPersistedBeforeCredentialOrChildSideEffects(t *testin
 func TestFileExecutionPreflightStoreIsDurableAndAppendOnly(t *testing.T) {
 	dir := t.TempDir()
 	store := NewFileExecutionPreflightStore(dir)
-	receipt := json.RawMessage(`{"contractVersion":"host-adaptation/v1","decision":"denied"}`)
+	receipt := json.RawMessage(`{"contractVersion":"host-adaptation/v1","requestId":"session-1","workerId":"worker-1","placementId":"host-local","decision":"denied","denial":"unsupported"}`)
 	if err := store.Persist("session-1", receipt); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(dir, "session-1.json"))
+	got, err := os.ReadFile(filepath.Join(dir, executionPreflightReceiptName("session-1")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,5 +144,59 @@ func TestFileExecutionPreflightStoreIsDurableAndAppendOnly(t *testing.T) {
 	}
 	if err := store.Persist("session-1", receipt); err == nil {
 		t.Fatal("immutable receipt was overwritten")
+	}
+}
+
+func TestFileExecutionPreflightStoreHashesUntrustedSessionIDInsideRoot(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileExecutionPreflightStore(dir)
+	sessionID := "../../outside"
+	receipt := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	if err := store.Persist(sessionID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != executionPreflightReceiptName(sessionID) {
+		t.Fatalf("receipt entries = %v", entries)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "outside.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("receipt escaped configured root: %v", err)
+	}
+}
+
+func TestFileExecutionPreflightStoreRefusesDestinationSymlink(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(outside, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := "session-symlink"
+	if err := os.Symlink(outside, filepath.Join(dir, executionPreflightReceiptName(sessionID))); err != nil {
+		t.Fatal(err)
+	}
+	receipt := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID,
+		WorkerID:        "worker-1",
+		PlacementID:     "host-local",
+		Decision:        "denied",
+		Denial:          "unsupported",
+	})
+	if err := NewFileExecutionPreflightStore(dir).Persist(sessionID, receipt); err == nil {
+		t.Fatal("symlink destination was replaced")
+	}
+	got, err := os.ReadFile(outside)
+	if err != nil || string(got) != "unchanged" {
+		t.Fatalf("outside target changed: %q err=%v", got, err)
 	}
 }
