@@ -145,6 +145,54 @@ func TestIntegration_RealCodexAppServer_PreparedHarnessReadyPath(t *testing.T) {
 	}
 }
 
+func TestIntegration_RealCodexPTY_PreparedHumanReadyPath(t *testing.T) {
+	if _, err := exec.LookPath("codex"); err != nil {
+		t.Skip("codex binary not on PATH")
+	}
+	cwd := t.TempDir()
+	p, err := New(Options{Cwd: cwd, HandshakeTimeout: 30 * time.Second})
+	if err != nil {
+		t.Skipf("codex unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	source := agent.Spec{
+		PromptMode:  agent.PromptModeHumanControlled,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+		PromptPlan: &agent.PromptPlan{
+			ContractVersion:  agent.PromptContractVersion,
+			BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+			UserPrompt:       agent.PromptContent{ID: "prepared-human-smoke", Text: "Reply only with ready.", Required: true},
+		},
+	}
+	const operationalDigest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	var materializations []agent.HarnessMaterialization
+	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+	}
+	prepared, err := agent.CompilePreparedHarness(source, p.Manifest(), operationalDigest, nil, materializations)
+	if err != nil {
+		t.Fatalf("host CompilePreparedHarness: %v", err)
+	}
+	materialized := source
+	materialized.Cwd = cwd
+	materialized.PreparedHarness = prepared
+	materialized.OnPromptAdapted = func(agent.PromptDeliveryReceipt) error { return errors.New("second prompt authority") }
+	materialized.OnToolLifecycleAdapted = func(agent.ToolLifecycleReceipt) error { return errors.New("second tool authority") }
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, materialized)
+	if err != nil {
+		t.Fatalf("Spawn prepared human PTY path: %v", err)
+	}
+	if _, ok := h.(agent.InteractiveCapable); !ok {
+		_ = h.Stop(context.Background())
+		t.Fatal("prepared human path did not return an interactive handle")
+	}
+	if err := h.Stop(context.Background()); err != nil {
+		t.Fatalf("stop prepared human PTY handle: %v", err)
+	}
+}
+
 func intPtr(i int) *int { return &i }
 
 func TestIntegration_RealCodexAppServer_PromptProvenance(t *testing.T) {

@@ -249,18 +249,18 @@ func (p *Provider) Capabilities() agent.Capabilities {
 // params, acquires the exact MCP server config for this session, opens
 // a thread, and starts the first turn.
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	var err error
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	// Interactive spawn mode (W4): completely independent of the app-server
 	// JSON-RPC subprocess this Provider otherwise drives — see interactive.go.
 	// Capability-gated on the live manifest so a future edit that flips
 	// SupportsInteractivePTY back to false silently falls through to the
 	// headless app-server path instead of a hardcoded branch always firing.
 	if spec.Interactive != nil && p.Manifest().Caps.SupportsInteractivePTY {
-		return SpawnInteractive(ctx, p.opts, spec)
-	}
-	var err error
-	spec, err = agent.PrepareHarness(spec, p.Manifest())
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+		return spawnInteractivePrepared(ctx, p.opts, spec)
 	}
 
 	if err := p.checkAlive(); err != nil {

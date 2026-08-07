@@ -1910,8 +1910,10 @@ func mergeMCPServers(defaults, cardServers []agent.MCPServerConfig) []agent.MCPS
 	if len(cardServers) == 0 {
 		return defaults
 	}
-	seen := make(map[string]struct{}, len(defaults)+len(cardServers))
-	merged := make([]agent.MCPServerConfig, 0, len(defaults)+len(cardServers))
+	// A single source length is a safe initial hint. The append/map runtimes
+	// grow for card entries without an overflow-prone sum of wire lengths.
+	seen := make(map[string]struct{}, len(defaults))
+	merged := make([]agent.MCPServerConfig, 0, len(defaults))
 	for _, s := range defaults {
 		seen[s.Name] = struct{}{}
 		merged = append(merged, s)

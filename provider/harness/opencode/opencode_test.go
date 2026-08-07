@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -341,6 +342,30 @@ func TestProvider_ConfiguredCLIOwnsAndCleansProjectConfig(t *testing.T) {
 	}
 	if _, err := os.Stat(parent); !os.IsNotExist(err) {
 		t.Fatalf("owned config boundary survived Stop: %v", err)
+	}
+}
+
+func TestProvider_ConfiguredCLIManyEnvEntriesGrowWithoutCapacitySum(t *testing.T) {
+	t.Parallel()
+	p := &Provider{binary: writeFakeOpenCodeScript(t), configTempDir: t.TempDir()}
+	specEnv := make(map[string]string, 4096)
+	for i := 0; i < 4096; i++ {
+		specEnv[fmt.Sprintf("SAFE_%04d", i)] = "value"
+	}
+	h, err := p.spawnCLI(t.Context(), agent.Spec{
+		Prompt: "large env", Cwd: t.TempDir(), Env: specEnv,
+		Endpoint: &agent.EndpointBinding{
+			Company: agent.CompanyLocal, Model: "fixture-model", BaseURL: "http://127.0.0.1:9/v1",
+			Protocol: agent.ProtoOpenAIChat, Host: agent.HostLocal, Mechanism: agent.AuthNone, Auth: agent.AuthLocal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("spawnCLI: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	joined := strings.Join(h.cmd.Env, "\x00")
+	if !strings.Contains(joined, "SAFE_4095=value") || !strings.Contains(joined, OCConfigEnvVar+"=") {
+		t.Fatal("large configured CLI environment omitted tail or owned config entry")
 	}
 }
 
