@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -134,6 +135,10 @@ func TestActionableIndexReapBatchScalesWithActionableRecords(t *testing.T) {
 	}
 }
 
+// errAttemptsNeverOverlapped marks a provider attempt that waited out its whole
+// attempt budget without the scheduler ever dispatching a peer alongside it.
+var errAttemptsNeverOverlapped = errors.New("scheduler never dispatched concurrent provider attempts")
+
 func TestBoundedSchedulerUsesSerialFullBatchesAndConcurrency(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -142,7 +147,12 @@ func TestBoundedSchedulerUsesSerialFullBatchesAndConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const total = 7
+	const (
+		total       = 7
+		batchSize   = 3
+		concurrency = 2
+	)
+	leaseIDs := make([]string, 0, total)
 	for i := 0; i < total; i++ {
 		lease, err := store.Acquire(context.Background(), internalAcquireSpec(root, i))
 		if err != nil {
@@ -152,30 +162,91 @@ func TestBoundedSchedulerUsesSerialFullBatchesAndConcurrency(t *testing.T) {
 		if err := store.saveUnlocked(*lease); err != nil {
 			t.Fatal(err)
 		}
+		leaseIDs = append(leaseIDs, lease.LeaseID)
 	}
-	var inFlight atomic.Int32
-	var maxInFlight atomic.Int32
-	var calls atomic.Int32
+	// The scheduler drains its snapshot in declared order: release attempts
+	// ascending, then lease ID. Every lease's dispatch position is known up front.
+	slices.Sort(leaseIDs)
+	positionOf := make(map[string]int, total)
+	for i, id := range leaseIDs {
+		positionOf[id] = i
+	}
+
+	// Closing overlapped is the synchronization point that proves concurrency:
+	// the first attempt cannot return until the scheduler dispatches a peer
+	// alongside it. A scheduler that serialized burns its attempt budget instead,
+	// so the property is decided by a rendezvous rather than by whether two
+	// attempt windows happened to overlap in wall-clock time.
+	//
+	// The seven leases still span three batches, but the batch boundary itself is
+	// deliberately not asserted here: a releaser can observe that batch k+1 began
+	// early, yet it can never observe that the scheduler declined to start it, so
+	// the drain-before-advance half of the contract has no positive signal to wait
+	// on. Cover that on the batch arithmetic instead of by observing attempts.
+	overlapped := make(chan struct{})
+	var entered, inFlight, maxInFlight atomic.Int32
+	var mu sync.Mutex
+	var order []string
 	considered, err := store.ReapSnapshot(context.Background(), SchedulerOptions{
-		BatchSize: 3, Concurrency: 2, AttemptTimeout: time.Second,
-	}, func(context.Context, TerminalLease) error {
+		BatchSize: batchSize, Concurrency: concurrency,
+		// Bounds how long the rendezvous may stall before the test reports
+		// serialization. It paces no assertion: the pass path never waits on it.
+		AttemptTimeout: 5 * time.Second,
+	}, func(ctx context.Context, lease TerminalLease) error {
 		current := inFlight.Add(1)
+		defer inFlight.Add(-1)
 		for {
 			maximum := maxInFlight.Load()
 			if current <= maximum || maxInFlight.CompareAndSwap(maximum, current) {
 				break
 			}
 		}
-		calls.Add(1)
-		time.Sleep(5 * time.Millisecond)
-		inFlight.Add(-1)
-		return nil
+		mu.Lock()
+		order = append(order, lease.LeaseID)
+		mu.Unlock()
+
+		if entered.Add(1) == concurrency {
+			close(overlapped)
+		}
+		select {
+		case <-overlapped:
+			return nil
+		case <-ctx.Done():
+			return fmt.Errorf("%w: lease %s: %w", errAttemptsNeverOverlapped, lease.LeaseID, ctx.Err())
+		}
 	})
-	if err != nil || considered != total || calls.Load() != total {
-		t.Fatalf("considered=%d calls=%d err=%v", considered, calls.Load(), err)
+	if errors.Is(err, errAttemptsNeverOverlapped) {
+		t.Fatalf("concurrency=%d requested but attempts serialized: %v", concurrency, err)
 	}
-	if maxInFlight.Load() != 2 {
-		t.Fatalf("max concurrency=%d", maxInFlight.Load())
+	mu.Lock()
+	defer mu.Unlock()
+	if err != nil || considered != total || len(order) != total {
+		t.Fatalf("considered=%d attempts=%d err=%v", considered, len(order), err)
+	}
+	// Bounded above by the worker count and reached exactly: the rendezvous
+	// forces the floor, so a surplus can only be an over-dispatch.
+	if got := maxInFlight.Load(); got != concurrency {
+		t.Fatalf("max in-flight attempts=%d, want the requested bound %d", got, concurrency)
+	}
+	// Every actionable lease is attempted exactly once, and the scheduler never
+	// runs ahead of its declared order by more than the concurrency window.
+	seen := make(map[string]bool, total)
+	for position, id := range order {
+		declared, ok := positionOf[id]
+		if !ok {
+			t.Fatalf("attempt %d released unknown lease %s", position, id)
+		}
+		if seen[id] {
+			t.Fatalf("lease %s was attempted more than once", id)
+		}
+		seen[id] = true
+		if declared-position >= concurrency || position-declared >= concurrency {
+			t.Fatalf("lease %s declared at position %d was attempted at position %d, outside the concurrency window %d",
+				id, declared, position, concurrency)
+		}
+	}
+	if len(seen) != total {
+		t.Fatalf("attempted %d distinct leases, want %d", len(seen), total)
 	}
 }
 
