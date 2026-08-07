@@ -97,7 +97,16 @@ type DaemonStatsResponse struct {
 	ActiveSessions int `json:"activeSessions"`
 	// QueueDepth is the number of tasks waiting for a session slot.
 	QueueDepth int `json:"queueDepth"`
-	// Pool is the workarea pool snapshot (populated with --pool).
+	// Workarea is the workarea-cache snapshot (populated with
+	// ?workarea=true / --workarea). This is the current spelling of the key.
+	Workarea *WorkareaPoolStats `json:"workarea,omitempty"`
+	// Pool carries the identical snapshot under the deprecated `pool` key,
+	// removed in WorkareaAliasRemovalVersion. Both keys are emitted for the
+	// life of the alias: the field is `omitempty`, so a client pinned to
+	// either spelling that found the other one missing would render no
+	// workarea section rather than fail. Populate the pair through
+	// SetWorkareaStats and read it back through WorkareaStats — never assign
+	// one of them alone.
 	Pool *WorkareaPoolStats `json:"pool,omitempty"`
 	// ByMachine is the per-machine breakdown (populated with --by-machine).
 	ByMachine []MachineStats `json:"byMachine,omitempty"`
@@ -118,6 +127,38 @@ type DaemonStatsResponse struct {
 	EnabledProjectIDs []string `json:"enabledProjectIds,omitempty"`
 	// AppliedProjectIDs is the project set currently applied by the runtime.
 	AppliedProjectIDs []string `json:"appliedProjectIds,omitempty"`
+}
+
+// SetWorkareaStats populates the workarea-cache snapshot under both the current
+// `workarea` key and its deprecated `pool` alias, keeping the two in lock-step
+// until WorkareaAliasRemovalVersion.
+//
+// Assigning either field directly is the defect this method exists to prevent:
+// both are `omitempty`, so a reader pinned to the spelling that was left unset
+// decodes a nil section and renders nothing instead of erroring.
+func (r *DaemonStatsResponse) SetWorkareaStats(stats *WorkareaPoolStats) {
+	if r == nil {
+		return
+	}
+	r.Workarea = stats
+	// Deprecated alias of Workarea, removed in WorkareaAliasRemovalVersion.
+	r.Pool = stats
+}
+
+// WorkareaStats returns the workarea-cache snapshot from whichever key the
+// serving daemon populated, preferring the current `workarea` spelling.
+//
+// The fallback is what lets a client built after the rename read a daemon built
+// before it — the "upgrade the binary, restart the service" skew, in which only
+// the deprecated `pool` key is on the wire.
+func (r *DaemonStatsResponse) WorkareaStats() *WorkareaPoolStats {
+	if r == nil {
+		return nil
+	}
+	if r.Workarea != nil {
+		return r.Workarea
+	}
+	return r.Pool
 }
 
 // DaemonRegistrationStats summarises the daemon's connection to the platform

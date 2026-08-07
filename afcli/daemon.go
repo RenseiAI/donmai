@@ -816,9 +816,10 @@ func writeDaemonStatsTable(w io.Writer, r *afclient.DaemonStatsResponse, bin str
 		return fmt.Errorf("flush table: %w", err)
 	}
 
-	// Pool section.
-	if r.Pool != nil {
-		if err := writePoolStatsSection(w, r.Pool); err != nil {
+	// Workarea-cache section. Read through the accessor so a daemon that
+	// still emits only the deprecated `pool` key still renders.
+	if workarea := r.WorkareaStats(); workarea != nil {
+		if err := writePoolStatsSection(w, workarea); err != nil {
 			return err
 		}
 	}

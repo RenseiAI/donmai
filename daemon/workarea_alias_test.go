@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -171,6 +172,91 @@ func TestDeprecatedPoolStatsQueryParamStillServes(t *testing.T) {
 	offRes := doGet(t, srv.Addr(), "/api/daemon/stats")
 	if off := decode(offRes); off.Pool != nil {
 		t.Error("stats without either parameter carried a workarea section; the flag is not selecting anything")
+	}
+}
+
+// TestStatsResponseCarriesBothWorkareaAndPoolKeys proves the workarea-cache
+// section is emitted under the current `workarea` key *and* the deprecated
+// `pool` alias, whichever query spelling selected it.
+//
+// This is the response-field half of the same hazard the query-parameter alias
+// covers, one level down. Both keys are `omitempty`, so a client that decodes
+// only the spelling the daemon did not emit sees a nil section and renders
+// nothing — no error, no status code, nothing to notice. Emitting only `pool`
+// leaves the alias table scheduling the sole field that exists for deletion;
+// emitting only `workarea` breaks every client pinned to a release before the
+// rename.
+func TestStatsResponseCarriesBothWorkareaAndPoolKeys(t *testing.T) {
+	_, srv, cleanup := mustStartDaemon(t)
+	defer cleanup()
+
+	// The two shapes a pinned client can hold. Neither models the other key,
+	// so each one decoding a section proves that key is really on the wire.
+	type currentClient struct {
+		Workarea *afclient.WorkareaPoolStats `json:"workarea"`
+	}
+	type preRenameClient struct {
+		Pool *afclient.WorkareaPoolStats `json:"pool"`
+	}
+
+	cases := []struct {
+		name         string
+		query        string
+		wantWorkarea bool
+	}{
+		{name: "current query parameter", query: "?workarea=true", wantWorkarea: true},
+		{name: "deprecated query parameter", query: "?pool=true", wantWorkarea: true},
+		{name: "section not selected", query: "", wantWorkarea: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := doGet(t, srv.Addr(), "/api/daemon/stats"+tc.query)
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatalf("read stats body: %v", err)
+			}
+
+			var current currentClient
+			if err := json.Unmarshal(body, &current); err != nil {
+				t.Fatalf("decode as a post-rename client: %v", err)
+			}
+			var legacy preRenameClient
+			if err := json.Unmarshal(body, &legacy); err != nil {
+				t.Fatalf("decode as a pre-rename client: %v", err)
+			}
+
+			if !tc.wantWorkarea {
+				if current.Workarea != nil || legacy.Pool != nil {
+					t.Errorf("stats carried a workarea section with query %q; the parameter is not selecting anything", tc.query)
+				}
+				return
+			}
+
+			if current.Workarea == nil {
+				t.Errorf("no `workarea` key on the wire for %q; the current spelling in 011's alias table does not exist", tc.query)
+			}
+			if legacy.Pool == nil {
+				t.Errorf("no `pool` key on the wire for %q; a client pinned before %s renders no workarea section",
+					tc.query, afclient.WorkareaAliasRemovalVersion)
+			}
+			if current.Workarea == nil || legacy.Pool == nil {
+				return
+			}
+			// The pair must not be allowed to drift: a reader picking either
+			// spelling has to get the same snapshot.
+			gotCurrent, err := json.Marshal(current.Workarea)
+			if err != nil {
+				t.Fatalf("re-marshal workarea: %v", err)
+			}
+			gotLegacy, err := json.Marshal(legacy.Pool)
+			if err != nil {
+				t.Fatalf("re-marshal pool: %v", err)
+			}
+			if !bytes.Equal(gotCurrent, gotLegacy) {
+				t.Errorf("the two spellings disagree:\n workarea = %s\n     pool = %s", gotCurrent, gotLegacy)
+			}
+		})
 	}
 }
 

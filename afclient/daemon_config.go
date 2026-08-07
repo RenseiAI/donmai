@@ -185,13 +185,54 @@ func (c *CapacityConfig) UnmarshalYAML(node *yaml.Node) error {
 		slog.Warn(
 			"daemon.yaml: "+DeprecatedSurfaceNotice(
 				legacyWorkareaMaxDiskGbYAMLKey, workareaMaxDiskGbYAMLKey)+
-				" It is rewritten on the next write.",
+				" The next write adds the current key alongside it; both are"+
+				" kept until the removal release so a rollback still reads a cap.",
 			legacyWorkareaMaxDiskGbYAMLKey, raw.PoolMaxDiskGb,
 		)
 	default:
 		c.PoolMaxDiskGb = 0
 	}
 	return nil
+}
+
+// MarshalYAML writes the workarea disk envelope under BOTH the current
+// `workareaMaxDiskGb` key and the deprecated `poolMaxDiskGb` alias, keeping the
+// two in lock-step until WorkareaAliasRemovalVersion.
+//
+// Emitting only the current key would make the migration one-way. A daemon
+// built before the rename models only `poolMaxDiskGb`, decodes non-strictly,
+// and so drops the unknown `workareaMaxDiskGb` in silence and lands on 0 —
+// which this field defines as "no limit", switching LRU eviction off and
+// filling the disk with no error anywhere. That is not an exotic case: it fires
+// on ordinary version skew, either a unit still running the previous build or a
+// rollback to a pre-rename release.
+//
+// Two alternatives were weighed and rejected:
+//
+//   - Redefining 0 to mean something other than "no limit" cannot help. The
+//     reader at risk is a binary that already shipped; its interpretation of 0
+//     is compiled in and no change here reaches it.
+//   - Retaining the legacy key untouched (writing only the current one and
+//     never deleting the old) leaves a stale value behind the moment an
+//     operator changes the cap, so a rolled-back daemon silently enforces the
+//     wrong number. That trades a silent disable for a silent disagreement.
+//
+// Writing both is the only option under which a pre-rename reader sees the
+// operator's actual, current cap. The alias emission is removed together with
+// every other entry in this generation at WorkareaAliasRemovalVersion.
+//
+// A zero envelope emits neither key, which is what `omitempty` did before and
+// what leaves an unmodelled on-disk value untouched by mergeDaemonYAML.
+func (c CapacityConfig) MarshalYAML() (any, error) {
+	return struct {
+		MaxConcurrentSessions int `yaml:"maxConcurrentSessions,omitempty"`
+		WorkareaMaxDiskGb     int `yaml:"workareaMaxDiskGb,omitempty"`
+		PoolMaxDiskGb         int `yaml:"poolMaxDiskGb,omitempty"`
+	}{
+		MaxConcurrentSessions: c.MaxConcurrentSessions,
+		WorkareaMaxDiskGb:     c.PoolMaxDiskGb,
+		PoolMaxDiskGb:         c.PoolMaxDiskGb,
+	}, nil
 }
 
 // DaemonYAML is the in-memory representation of ~/.donmai/daemon.yaml.
@@ -371,14 +412,14 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
 	// Capacity is preserved as a partial overlay — only the cfg-modelled
 	// fields (e.g. workareaMaxDiskGb) are merged into the existing capacity
 	// mapping. If no capacity key exists yet a new one is added.
+	//
+	// CapacityConfig.MarshalYAML emits `workareaMaxDiskGb` and the deprecated
+	// `poolMaxDiskGb` together, so this merge refreshes both spellings on disk
+	// to the same value. The legacy key is deliberately NOT deleted while the
+	// alias is live: a pre-rename daemon reading a file that carried only the
+	// current key drops it non-strictly and falls to 0, which means "no
+	// limit". Both go at WorkareaAliasRemovalVersion, together.
 	mergeMappingKey(doc, "capacity", capacityNode)
-	// Migrate the deprecated `poolMaxDiskGb` spelling off disk, but only once
-	// its value has actually been re-emitted under the current name. Deleting
-	// it unconditionally would discard the operator's disk cap whenever the
-	// value happens to be absent from cfg.
-	if mappingHasKey(findMappingValue(doc, "capacity"), workareaMaxDiskGbYAMLKey) {
-		deleteMappingKey(findMappingValue(doc, "capacity"), legacyWorkareaMaxDiskGbYAMLKey)
-	}
 
 	out, err := yaml.Marshal(&root)
 	if err != nil {
@@ -421,37 +462,6 @@ func upsertMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
 		value,
 	)
-}
-
-// findMappingValue returns the value node stored at key in mapping, or nil.
-func findMappingValue(mapping *yaml.Node, key string) *yaml.Node {
-	if mapping == nil || mapping.Kind != yaml.MappingNode {
-		return nil
-	}
-	for i := 0; i+1 < len(mapping.Content); i += 2 {
-		if mapping.Content[i].Value == key {
-			return mapping.Content[i+1]
-		}
-	}
-	return nil
-}
-
-// mappingHasKey reports whether mapping carries key.
-func mappingHasKey(mapping *yaml.Node, key string) bool {
-	return findMappingValue(mapping, key) != nil
-}
-
-// deleteMappingKey removes the {key, value} pair from mapping if present.
-func deleteMappingKey(mapping *yaml.Node, key string) {
-	if mapping == nil || mapping.Kind != yaml.MappingNode {
-		return
-	}
-	for i := 0; i+1 < len(mapping.Content); i += 2 {
-		if mapping.Content[i].Value == key {
-			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
-			return
-		}
-	}
 }
 
 // mergeMappingKey merges fields from value into the existing mapping at key.

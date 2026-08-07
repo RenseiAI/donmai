@@ -345,7 +345,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if withWorkarea {
 		stats, err := s.workareaStats(r.Context())
 		if err == nil {
-			resp.Pool = stats
+			// Emits both `workarea` and the deprecated `pool` key; see
+			// afclient.DaemonStatsResponse.SetWorkareaStats.
+			resp.SetWorkareaStats(stats)
 		}
 	}
 	if byMachine {

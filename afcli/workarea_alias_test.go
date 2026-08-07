@@ -177,3 +177,88 @@ func TestWorkareaAliasRemovalVersionIsConcrete(t *testing.T) {
 		}
 	}
 }
+
+// TestStatsRendersWorkareaSectionFromEitherResponseKey covers the response-field
+// alias at the surface that consumes it: the renderer.
+//
+// `DaemonStatsResponse` carries the workarea-cache snapshot under the current
+// `workarea` key and the deprecated `pool` key for the life of the alias, and a
+// given daemon may send either or both depending on its build. Both fields are
+// `omitempty`, so a renderer that reads one struct field directly prints
+// nothing at all against a daemon that populated the other — the section simply
+// vanishes, with a zero exit status and no diagnostic. Reading through
+// DaemonStatsResponse.WorkareaStats is what makes the invocation survive the
+// skew in both directions.
+func TestStatsRendersWorkareaSectionFromEitherResponseKey(t *testing.T) {
+	t.Parallel()
+
+	snapshot := func() *afclient.WorkareaPoolStats {
+		return &afclient.WorkareaPoolStats{
+			TotalMembers:     5,
+			ReadyMembers:     3,
+			AcquiredMembers:  2,
+			TotalDiskUsageMb: 1024,
+		}
+	}
+
+	cases := []struct {
+		name string
+		// shape mutates the canned response into the wire shape a particular
+		// daemon build emits.
+		shape       func(*afclient.DaemonStatsResponse)
+		wantSection bool
+	}{
+		{
+			name: "daemon built before the rename sends only `pool`",
+			shape: func(r *afclient.DaemonStatsResponse) {
+				r.Pool = snapshot()
+			},
+			wantSection: true,
+		},
+		{
+			name: "daemon in the alias window sends both keys",
+			shape: func(r *afclient.DaemonStatsResponse) {
+				r.SetWorkareaStats(snapshot())
+			},
+			wantSection: true,
+		},
+		{
+			name: "daemon after the alias is removed sends only `workarea`",
+			shape: func(r *afclient.DaemonStatsResponse) {
+				r.Workarea = snapshot()
+			},
+			wantSection: true,
+		},
+		{
+			name:        "section not requested",
+			shape:       func(*afclient.DaemonStatsResponse) {},
+			wantSection: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			resp := fixtureStatsResp()
+			tc.shape(resp)
+			mock := &mockDaemon{statsResp: resp}
+			stdout, _, err := runHostCmdSplit(t, mock, []string{"stats", "--workarea"})
+			if err != nil {
+				t.Fatalf("execute `stats --workarea`: %v", err)
+			}
+			if !tc.wantSection {
+				if strings.Contains(stdout, "Workarea pool:") {
+					t.Errorf("rendered a workarea section from an empty response:\n%s", stdout)
+				}
+				return
+			}
+			if !strings.Contains(stdout, "Workarea pool:") {
+				t.Errorf("no workarea section rendered; the section silently vanishes against this daemon:\n%s", stdout)
+			}
+			if !strings.Contains(stdout, "1024") {
+				t.Errorf("workarea section is missing the disk usage from the response:\n%s", stdout)
+			}
+		})
+	}
+}
