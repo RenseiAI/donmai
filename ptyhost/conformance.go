@@ -8,5 +8,6 @@ import "github.com/RenseiAI/donmai/agent"
 // only attachwire, never ptyhost.
 var (
 	_ agent.InteractiveSession      = (*Session)(nil)
+	_ agent.InteractiveNotifier     = (*Session)(nil)
 	_ agent.InteractiveSubscription = (*subscription)(nil)
 )

@@ -15,6 +15,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -86,6 +87,29 @@ type recordingPlatformServer struct {
 	mu           sync.Mutex
 	sessionClass string
 	refreshes    int
+	// pendingInjects are piggybacked onto successive successful
+	// lock-refresh responses (one per refresh, in order) exactly the way the
+	// platform delivers a runtime inject. Empty by default, so every existing
+	// caller sees the unchanged {"refreshed":true,"ok":true} body.
+	pendingInjects []heartbeat.InjectPayload
+}
+
+// queueInject arms the double to piggyback p onto the next lock-refresh.
+func (s *recordingPlatformServer) queueInject(p heartbeat.InjectPayload) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingInjects = append(s.pendingInjects, p)
+}
+
+// takeInject pops the next queued inject, or nil when none is armed.
+// Called with s.mu held.
+func (s *recordingPlatformServer) takeInjectLocked() *heartbeat.InjectPayload {
+	if len(s.pendingInjects) == 0 {
+		return nil
+	}
+	next := s.pendingInjects[0]
+	s.pendingInjects = s.pendingInjects[1:]
+	return &next
 }
 
 // lastSessionClass returns the sessionClass most recently observed on a
@@ -110,7 +134,18 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 			if body.SessionClass != "" {
 				rec.sessionClass = body.SessionClass
 			}
+			inject := rec.takeInjectLocked()
 			rec.mu.Unlock()
+
+			if inject != nil {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(struct {
+					Refreshed bool                     `json:"refreshed"`
+					OK        bool                     `json:"ok"`
+					Inject    *heartbeat.InjectPayload `json:"inject"`
+				}{Refreshed: true, OK: true, Inject: inject})
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))

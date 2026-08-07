@@ -108,6 +108,11 @@ func (a sessAdapter) Subscribe(from attachwire.HostSeq) (attachclient.Subscripti
 // sub-agent caps" budget shape); zero/absent means no runner-side wall cap
 // (the enclosing ctx, which already carries Options.MaxSessionDuration,
 // remains the backstop).
+//
+// injectCh is the runtime-inject rail (the same channel the interview loop
+// parks on). An interactive session CONSUMES it: each payload is rendered as
+// one atomic PTY notice (interactive_inject.go). Passing nil is valid and
+// simply disables the rail — a nil channel never becomes ready.
 func (r *Runner) dispatchInteractive(
 	ctx context.Context,
 	handle agent.Handle,
@@ -116,6 +121,7 @@ func (r *Runner) dispatchInteractive(
 	res *Result,
 	sink activitySink,
 	pulser *heartbeat.Pulser,
+	injectCh <-chan heartbeat.InjectPayload,
 ) (*Result, error) {
 	if sink == nil {
 		sink = noopSink{}
@@ -248,8 +254,61 @@ func (r *Runner) dispatchInteractive(
 		go func() { attachDone <- attachclient.RunHost(attachCtx, hostCfg) }()
 	}
 
+	// Runtime-inject consumer. One held notice at a time (see
+	// interactiveNoticeQueue): while a notice is pending the supervisor stops
+	// reading injectCh, which preserves order and pushes back on the producer
+	// instead of accepting messages it cannot deliver.
+	//
+	// The retry timer is created armed (the clock contract has no "disabled"
+	// constructor that can later be re-armed) and immediately stopped; it is
+	// reset only while a notice is held, so an idle session never wakes up.
+	notices := &interactiveNoticeQueue{}
+	retry := r.noticeRetryClock().NewTimer(interactiveNoticeRetry)
+	retry.Stop()
+	defer retry.Stop()
+	defer func() {
+		if held := notices.undelivered(len(injectCh)); held > 0 {
+			r.logger.Warn("[interactive] session ended with buffered notices undelivered",
+				"sessionId", qw.SessionID, "count", held)
+		}
+	}()
+
 	for {
+		// A nil source parks the inject case while a notice is held.
+		var noticeSrc <-chan heartbeat.InjectPayload
+		if notices.idle() {
+			noticeSrc = injectCh
+		}
+
 		select {
+		case p, ok := <-noticeSrc:
+			if !ok {
+				// The heartbeat tore the channel down — stop listening, keep
+				// supervising the PTY (the human owns this session's life).
+				injectCh = nil
+				continue
+			}
+			notice := formatInteractiveNotice(p)
+			if notice == nil {
+				r.logger.Debug("[interactive] dropping empty inject payload",
+					"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
+				continue
+			}
+			notices.hold(notice, p.DeliveryID)
+			if !notices.attempt(r, qw, res, isess) {
+				retry.Reset(interactiveNoticeRetry)
+			}
+			continue
+
+		case <-retry.Chan():
+			if notices.idle() {
+				continue
+			}
+			if !notices.attempt(r, qw, res, isess) {
+				retry.Reset(interactiveNoticeRetry)
+			}
+			continue
+
 		case <-isess.Done():
 			// Child exited and the PTY drained to EOF (Exit emitted).
 			return r.finishInteractive(worktreePath, qw, res, sink, isess), nil

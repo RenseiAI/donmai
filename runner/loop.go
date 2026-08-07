@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -639,42 +640,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}, err
 		}
 	}
-	// Wave 3 runtime memory-inject: wire OnInject only when the feature is
-	// enabled AND the provider can accept injects. The closure runs on the
-	// heartbeat goroutine; it owns seenInject (dedup-by-DeliveryID lives
-	// here exclusively so the map is never touched off this goroutine) and
-	// performs a non-blocking send onto injectCh — a full buffer REJECTS
-	// the inject (returns false) rather than stalling the heartbeat loop,
-	// so the pulser leaves it unacked and the platform re-delivers it on a
-	// later refresh (ack-or-requeue). A DeliveryID is marked seen only
-	// AFTER a successful buffer so a re-delivery of a rejected inject is
-	// not dedup-blocked. The runner goroutine drains injectCh at the
-	// post-terminal seam and is the only caller of handle.Inject (claude's
-	// single-in-flight contract).
+	// Wave 3 runtime memory-inject: wire OnInject only when the provider can
+	// accept injects. See newInjectAcceptor for the dedup + ack-or-requeue
+	// contract it implements.
 	var onInject func(heartbeat.InjectPayload) bool
 	if runtimeInjectEnabled {
-		onInject = func(p heartbeat.InjectPayload) bool {
-			if p.DeliveryID != "" {
-				if _, ok := seenInject[p.DeliveryID]; ok {
-					r.logger.Debug("memory inject: skipping already-seen delivery",
-						"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
-					// Already buffered earlier in this Run — safe to ack
-					// so the platform stops re-sending it.
-					return true
-				}
-			}
-			select {
-			case injectCh <- p:
-				if p.DeliveryID != "" {
-					seenInject[p.DeliveryID] = struct{}{}
-				}
-				return true
-			default:
-				r.logger.Warn("memory inject: channel full, leaving unacked for re-delivery",
-					"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
-				return false
-			}
-		}
+		onInject = newInjectAcceptor(injectCh, seenInject, r.logger, qw.SessionID)
 	}
 	pulser, err := heartbeat.New(heartbeat.Config{
 		SessionID: qw.SessionID,
@@ -870,8 +841,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// for the same reason interviews skip them: an interactive session
 	// produces no PR and drives no issue-tracker state transition — the
 	// lifecycle is owned by the human at the terminal, not the runner.
+	//
+	// injectCh is handed over the same way dispatchInterview receives it: an
+	// interactive session is a LIVE consumer of the runtime-inject rail, not
+	// a session that happens to have one wired. Without this argument every
+	// buffered payload is accepted by OnInject, acked to the producer, and
+	// then never read by anyone — silent loss that reports success.
 	if qw.isInteractive() {
-		return r.dispatchInteractive(ctx, handle, wpath, qw, res, sink, pulser)
+		return r.dispatchInteractive(ctx, handle, wpath, qw, res, sink, pulser, injectCh)
 	}
 
 	// 10. Stream events; wait for terminal.
@@ -1172,6 +1149,60 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	return res, nil
+}
+
+// newInjectAcceptor builds the heartbeat's OnInject callback: the PRODUCTION
+// implementation of the runtime-inject accept contract, extracted so tests
+// exercise this function rather than a hand-copied replica of it (a mirrored
+// copy in a test keeps passing after the real closure is deleted).
+//
+// The returned func runs on the heartbeat goroutine. It owns seenInject —
+// dedup-by-DeliveryID lives here exclusively, so the map is never touched off
+// that goroutine — and performs a NON-BLOCKING send onto injectCh:
+//
+//   - already-seen DeliveryID → dropped from the buffer but still ACKED, so
+//     the producer stops re-sending something already queued once.
+//   - buffered → marked seen, then acked.
+//   - buffer full → REJECTED (returns false) rather than stalling the
+//     heartbeat loop; the pulser leaves it unacked and the producer re-offers
+//     it on a later refresh. The DeliveryID is deliberately NOT marked seen,
+//     so the re-delivery is accepted once capacity frees up (ack-or-requeue,
+//     never ack-and-drop).
+//
+// Consumers differ by run mode: headless drains at the post-terminal seam,
+// interview parks on the channel per turn, interactive writes each payload
+// into the live PTY as a notice.
+func newInjectAcceptor(
+	injectCh chan<- heartbeat.InjectPayload,
+	seenInject map[string]struct{},
+	logger *slog.Logger,
+	sessionID string,
+) func(heartbeat.InjectPayload) bool {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	return func(p heartbeat.InjectPayload) bool {
+		if p.DeliveryID != "" {
+			if _, ok := seenInject[p.DeliveryID]; ok {
+				logger.Debug("memory inject: skipping already-seen delivery",
+					"sessionId", sessionID, "deliveryId", p.DeliveryID)
+				// Already buffered earlier in this Run — safe to ack so the
+				// platform stops re-sending it.
+				return true
+			}
+		}
+		select {
+		case injectCh <- p:
+			if p.DeliveryID != "" {
+				seenInject[p.DeliveryID] = struct{}{}
+			}
+			return true
+		default:
+			logger.Warn("memory inject: channel full, leaving unacked for re-delivery",
+				"sessionId", sessionID, "deliveryId", p.DeliveryID)
+			return false
+		}
+	}
 }
 
 // drainMemoryInjects delivers every memory block the heartbeat transport

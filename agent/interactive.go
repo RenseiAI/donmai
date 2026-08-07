@@ -129,6 +129,44 @@ type InteractiveSession interface {
 	Exit() (exit attachwire.ExitPayload, ok bool)
 }
 
+// InteractiveNotifier is the OPTIONAL capability an InteractiveSession
+// implements when it can accept a RUNTIME NOTICE: a complete,
+// self-contained line of text authored by the runner itself (not by a
+// human at a terminal and not by the relay) and delivered into the live
+// PTY as one submitted input turn.
+//
+// It is a third input author alongside the two the spec's §5 trust
+// posture already names (relay-stamped input and the local attach). The
+// runner is a stamper in exactly the same sense: it originates the bytes,
+// so nothing unstamped reaches the PTY through this method either.
+//
+// Contract implementations must honor:
+//
+//   - ATOMIC. The whole notice is delivered in exactly ONE write to the
+//     PTY master, so it can never interleave byte-wise with a concurrent
+//     human keystroke. Callers pass a complete notice; there is no
+//     chunked/short-write resume path.
+//   - REFUSABLE. While the human has unsubmitted bytes outstanding in the
+//     line editor, the implementation returns (false, nil) and writes
+//     NOTHING — appending to a half-typed line would corrupt the human's
+//     input. A refusal is not an error: the caller retries later.
+//   - SELF-SUBMITTING. The caller supplies the trailing newline; the
+//     implementation writes the bytes verbatim and never re-frames them.
+//
+// A session that does not implement this interface cannot accept notices;
+// callers must treat that as "hold and surface", never as a silent drop.
+type InteractiveNotifier interface {
+	// TryWriteNotice writes p as one atomic PTY input, or refuses.
+	//
+	// written == true  → the notice reached the PTY (err is nil, or a
+	// non-nil err describing a partial/failed write of bytes that did
+	// leave).
+	// written == false, err == nil → REFUSED because the human is
+	// mid-composition; nothing was written and the caller should retry.
+	// written == false, err != nil → the write failed outright.
+	TryWriteNotice(p []byte) (written bool, err error)
+}
+
 // InteractiveSubscription is one live frame feed from an
 // InteractiveSession.
 type InteractiveSubscription interface {

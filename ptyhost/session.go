@@ -1,6 +1,7 @@
 package ptyhost
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -40,6 +41,24 @@ type Session struct {
 
 	vt  terminal
 	rec *recorder
+
+	// writeMu serializes EVERY author of PTY-master input and guards
+	// pendingCompose. Deliberately NOT s.mu: mu guards seq/ring/subscription/
+	// VT/recorder state fed from run(), and the input path must not contend
+	// with the output path (a child that stops reading stdin would otherwise
+	// couple input latency to frame emission).
+	//
+	// Because every input author funnels through WriteInput (the relay leg,
+	// the local attach, the harness seed) and notices funnel through
+	// TryWriteNotice, this one mutex is the single arbitration point between
+	// them: one write is one uninterruptible unit, and a notice is refused
+	// outright while the human's line is half-typed.
+	writeMu sync.Mutex
+	// pendingCompose is true when the last accepted input left unsubmitted
+	// bytes in the child's line editor (§5: the host never parses input, so
+	// this is a deliberately coarse byte-level heuristic, not terminal-state
+	// tracking). Guarded by writeMu.
+	pendingCompose bool
 
 	// mu guards all sequence/ring/subscription/VT/recorder state below. The VT
 	// is fed only from run() and snapshotted only under mu, so feeding and
@@ -289,17 +308,87 @@ func (s *Session) lastSeqLocked() attachwire.HostSeq { return s.nextSeq - 1 }
 
 // ---- agent.InteractiveSession ----------------------------------------------
 
+// composeBreakBytes are the input bytes that END a line-editor composition:
+// the two submit keys (CR / LF) and the two whole-line discards (Ctrl-C
+// interrupt, Ctrl-U kill-line). Anything else is assumed to leave characters
+// pending in the child's line editor.
+const composeBreakBytes = "\r\n\x03\x15"
+
 // WriteInput writes already-encoded terminal input bytes verbatim to the PTY
 // master (§5: input is never re-sanitized).
+//
+// This is the ONLY path human keystrokes take — the relay leg
+// (attachclient/inbound.go, attachclient/degraded.go), the standalone local
+// attach (local.go) and the harness seed all funnel here — so it is also
+// where the session observes whether a composition is outstanding. The write
+// itself is unchanged and still verbatim; only the bookkeeping is new.
 func (s *Session) WriteInput(p []byte) (int, error) {
 	if s.closedFlag.Load() {
 		return 0, errExited
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	n, err := s.ptmx.Write(p)
+	if n > 0 && n <= len(p) {
+		s.trackComposeLocked(p[:n])
+	}
 	if err != nil {
 		return n, fmt.Errorf("ptyhost: write input: %w", err)
 	}
 	return n, nil
+}
+
+// trackComposeLocked updates pendingCompose from the bytes the PTY actually
+// accepted. A payload whose LAST composeBreakByte is its final byte leaves
+// the line editor empty; anything after that break (or a payload with no
+// break at all) leaves characters pending. Called with writeMu held.
+func (s *Session) trackComposeLocked(written []byte) {
+	if len(written) == 0 {
+		return
+	}
+	if i := bytes.LastIndexAny(written, composeBreakBytes); i >= 0 {
+		s.pendingCompose = i != len(written)-1
+		return
+	}
+	s.pendingCompose = true
+}
+
+// TryWriteNotice delivers a runner-authored notice as ONE atomic PTY write,
+// or refuses it — the agent.InteractiveNotifier half of the input-author
+// arbitration described on writeMu.
+//
+// Refusal (false, nil) is the normal, expected outcome whenever the human has
+// unsubmitted bytes in the line editor: appending a notice there would splice
+// runner text into whatever they are typing. The caller holds the notice and
+// retries after the human submits or discards the line.
+//
+// The single ptmx.Write is what makes the accepted case safe: os.File's
+// internal write lock makes one Write call uninterruptible with respect to a
+// concurrent keystroke write, so the notice can never be interleaved
+// byte-wise. That guarantee is per-call ONLY, which is why a notice is never
+// chunked — a short write is reported as an error rather than resumed.
+func (s *Session) TryWriteNotice(p []byte) (bool, error) {
+	if len(p) == 0 {
+		return false, nil
+	}
+	if s.closedFlag.Load() {
+		return false, errExited
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.pendingCompose {
+		return false, nil
+	}
+	n, err := s.ptmx.Write(p)
+	if err != nil {
+		return n > 0, fmt.Errorf("ptyhost: write notice: %w", err)
+	}
+	if n != len(p) {
+		return true, fmt.Errorf("ptyhost: write notice: short write (%d of %d bytes)", n, len(p))
+	}
+	// A notice is self-submitting (the caller appends the newline), so the
+	// line editor is left exactly as empty as it was found.
+	return true, nil
 }
 
 // Resize applies geometry verbatim to the PTY (TIOCSWINSZ, §8), resizes the VT,
