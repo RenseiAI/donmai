@@ -26,6 +26,10 @@ type terminal interface {
 	resize(cols, rows int)
 	// setScrollbackSize bounds the scrollback tail (§12.1).
 	setScrollbackSize(maxLines int)
+	// altScreen reports whether the child has switched to the alternate
+	// screen buffer (DECSET ?1049/?1047/?47) — i.e. it is driving a
+	// full-screen UI where input bytes are commands, not line-editor text.
+	altScreen() bool
 	// raw materializes the current screen state for snapshot serialization.
 	raw() vtRaw
 }
@@ -135,6 +139,8 @@ func (v *vtHost) resize(cols, rows int) {
 }
 
 func (v *vtHost) setScrollbackSize(maxLines int) { v.emu.SetScrollbackSize(maxLines) }
+
+func (v *vtHost) altScreen() bool { return v.emu.IsAltScreen() }
 
 // ---- reflection binding (duty 4) -------------------------------------------
 

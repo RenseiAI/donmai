@@ -125,8 +125,68 @@ func TestDrainMemoryInjects_SkipsEmptyText(t *testing.T) {
 // newInjectAcceptor — the exact function runLoop wires into the heartbeat).
 // These tests deliberately call the real thing: the previous local mirror of
 // this closure meant deleting the production code left them green.
+// ackOnBuffer=true is the headless/interview wiring these tests cover;
+// TestInjectAcceptor_AckMode covers both modes side by side.
 func newTestInjectAcceptor(seenInject map[string]struct{}, injectCh chan heartbeat.InjectPayload) func(heartbeat.InjectPayload) bool {
-	return newInjectAcceptor(injectCh, seenInject, slog.New(slog.DiscardHandler), "test-session")
+	return newInjectAcceptor(injectCh, seenInject, slog.New(slog.DiscardHandler), "test-session", true)
+}
+
+// TestInjectAcceptor_AckMode pins WHERE the ack belongs, per run mode.
+//
+// The regression: the acceptor acked the instant a payload landed on the
+// 8-slot channel. For an interactive session — whose write waits on a human
+// and whose session can end at any moment — that stamped up to nine payloads
+// delivered while nothing had been written; the platform then never re-offered
+// them. ackOnBuffer=false is the fix: take custody, do NOT claim delivery, and
+// let the consumer confirm with AckInject once the bytes land.
+func TestInjectAcceptor_AckMode(t *testing.T) {
+	tests := []struct {
+		name        string
+		ackOnBuffer bool
+		wantFresh   bool // ack for a first-time delivery that buffers fine
+		wantSeen    bool // ack for a re-offer of something already buffered
+	}{
+		{name: "headless and interview ack on buffer", ackOnBuffer: true, wantFresh: true, wantSeen: true},
+		{name: "interactive acks on delivery, not on buffer", ackOnBuffer: false, wantFresh: false, wantSeen: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			injectCh := make(chan heartbeat.InjectPayload, 2)
+			seen := map[string]struct{}{}
+			onInject := newInjectAcceptor(
+				injectCh, seen, slog.New(slog.DiscardHandler), "test-session", tc.ackOnBuffer,
+			)
+
+			p := heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "hello"}
+			if got := onInject(p); got != tc.wantFresh {
+				t.Fatalf("first offer acked=%v; want %v", got, tc.wantFresh)
+			}
+			// Custody is unconditional: the payload must be readable by the
+			// consumer whichever ack mode is in force.
+			if got := len(injectCh); got != 1 {
+				t.Fatalf("payload was not buffered (len=%d); custody must not depend on the ack mode", got)
+			}
+			// A re-offer of the same delivery must not double-buffer, and
+			// must not be acked in ack-on-delivery mode either — it has still
+			// not been delivered.
+			if got := onInject(p); got != tc.wantSeen {
+				t.Fatalf("re-offer acked=%v; want %v", got, tc.wantSeen)
+			}
+			if got := len(injectCh); got != 1 {
+				t.Fatalf("re-offer was double-buffered (len=%d)", got)
+			}
+
+			// A full buffer is never acked, in either mode.
+			<-injectCh
+			for i := 0; i < 2; i++ {
+				onInject(heartbeat.InjectPayload{DeliveryID: "fill-" + string(rune('a'+i))})
+			}
+			if onInject(heartbeat.InjectPayload{DeliveryID: "dlv-overflow"}) {
+				t.Fatal("a payload rejected for lack of buffer space must never be acked")
+			}
+		})
+	}
 }
 
 // TestMemoryInjectOnInject_DedupesByDeliveryID exercises the dedup-by-

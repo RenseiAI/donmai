@@ -97,6 +97,23 @@ func TestSession_TryWriteNoticeRespectsPendingCompose(t *testing.T) {
 		{name: "killed line with ctrl-u", humanInput: "abcdef\x15", wantWrite: true},
 		{name: "typed again after submitting", humanInput: "abc\rdef", wantWrite: false},
 		{name: "whitespace still counts as composing", humanInput: "  ", wantWrite: false},
+
+		// The latch cases. Every one of these left the previous gate shut for
+		// the remainder of the session even though the line editor was empty:
+		// a single arrow key reinstated the head-of-line block this rail
+		// exists to remove.
+		{name: "backspaced back to empty", humanInput: "abc\x7f\x7f\x7f", wantWrite: true},
+		{name: "backspaced only partway", humanInput: "abc\x7f", wantWrite: false},
+		{name: "bare escape", humanInput: "\x1b", wantWrite: true},
+		{name: "arrow key", humanInput: "\x1b[C", wantWrite: true},
+		{name: "application-mode arrow key", humanInput: "\x1bOC", wantWrite: true},
+		{name: "tab", humanInput: "\t", wantWrite: true},
+		{name: "ctrl-w on the only word", humanInput: "hello\x17", wantWrite: true},
+		{name: "ctrl-w leaving an earlier word", humanInput: "hello world\x17", wantWrite: false},
+		{name: "SGR mouse report", humanInput: "\x1b[<35;10;5M", wantWrite: true},
+		{name: "focus-in report", humanInput: "\x1b[I", wantWrite: true},
+		{name: "focus-out report", humanInput: "\x1b[O", wantWrite: true},
+		{name: "type, erase, then walk away", humanInput: "abc\x7f\x7f\x7f\x1b[C\t", wantWrite: true},
 	}
 
 	for _, tc := range tests {
@@ -156,6 +173,49 @@ func TestSession_TryWriteNoticeUnblocksAfterSubmit(t *testing.T) {
 	}
 	if !written {
 		t.Fatal("notice still refused after the human submitted the line")
+	}
+	waitForBytes(t, sub, notice, 10*time.Second)
+}
+
+// TestSession_TryWriteNoticeRefusedOnAlternateScreen covers the one class of
+// "Enter is destructive here" the terminal can actually observe: the child has
+// switched to the alternate screen buffer, so it is driving a full-screen UI
+// (pager, editor, full-screen dialog) where every notice byte is a command
+// keystroke and the submit byte picks whatever is highlighted.
+//
+// The refusal must LIFT when the child returns to the primary screen — an
+// alt-screen excursion may not latch the gate any more than a composition may.
+func TestSession_TryWriteNoticeRefusedOnAlternateScreen(t *testing.T) {
+	const notice = "NOTICE-ALTSCREEN\n"
+	s, sub := spawnRawCat(t)
+
+	// The raw echo child sends everything straight back, so writing the
+	// DEC private mode set makes the VT observe the child entering the
+	// alternate screen exactly as a real full-screen app would.
+	if _, err := s.WriteInput([]byte("\x1b[?1049h")); err != nil {
+		t.Fatalf("WriteInput alt-screen enter: %v", err)
+	}
+	waitForBytes(t, sub, "\x1b[?1049h", 10*time.Second)
+
+	written, err := s.TryWriteNotice([]byte(notice))
+	if err != nil {
+		t.Fatalf("TryWriteNotice on the alternate screen: %v", err)
+	}
+	if written {
+		t.Fatal("notice was written while the child was on the alternate screen")
+	}
+
+	if _, err := s.WriteInput([]byte("\x1b[?1049l")); err != nil {
+		t.Fatalf("WriteInput alt-screen leave: %v", err)
+	}
+	waitForBytes(t, sub, "\x1b[?1049l", 10*time.Second)
+
+	written, err = s.TryWriteNotice([]byte(notice))
+	if err != nil {
+		t.Fatalf("TryWriteNotice after leaving the alternate screen: %v", err)
+	}
+	if !written {
+		t.Fatal("notice still refused after the child returned to the primary screen")
 	}
 	waitForBytes(t, sub, notice, 10*time.Second)
 }

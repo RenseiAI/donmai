@@ -146,15 +146,31 @@ type InteractiveSession interface {
 //     PTY master, so it can never interleave byte-wise with a concurrent
 //     human keystroke. Callers pass a complete notice; there is no
 //     chunked/short-write resume path.
-//   - REFUSABLE. While the human has unsubmitted bytes outstanding in the
-//     line editor, the implementation returns (false, nil) and writes
-//     NOTHING — appending to a half-typed line would corrupt the human's
-//     input. A refusal is not an error: the caller retries later.
-//   - SELF-SUBMITTING. The caller supplies the trailing newline; the
+//   - REFUSABLE. Whenever the implementation can see that the write would
+//     be unsafe, it returns (false, nil) and writes NOTHING. A refusal is
+//     not an error: the caller holds the notice and retries later. Two
+//     conditions are host-observable and MUST refuse: an outstanding line
+//     composition (appending to a half-typed line corrupts the human's
+//     input), and the alternate screen buffer (the child is driving a
+//     full-screen UI where every byte is a command).
+//   - SELF-SUBMITTING. The caller supplies the trailing submit byte; the
 //     implementation writes the bytes verbatim and never re-frames them.
+//     The submit key a terminal sends for Return is CR, not LF — a raw-mode
+//     application reads them as different keys.
 //
 // A session that does not implement this interface cannot accept notices;
 // callers must treat that as "hold and surface", never as a silent drop.
+//
+// # Known limit, stated so callers do not assume more than is delivered
+//
+// Refusal cannot cover an INLINE modal — an application-level prompt drawn
+// as ordinary text on the primary screen where Enter selects a highlighted
+// option and digits pick menu entries. Nothing at the terminal layer changes
+// when an application starts interpreting keys that way, so a notice CAN
+// select such a prompt's default. Eliminating that needs an application-side
+// inject API (the harness's own message-injection capability), not a smarter
+// terminal; implementations should not pretend otherwise by guessing at
+// rendered screen contents.
 type InteractiveNotifier interface {
 	// TryWriteNotice writes p as one atomic PTY input, or refuses.
 	//

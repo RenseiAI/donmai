@@ -705,6 +705,76 @@ func TestInjectRejectedByConsumerStaysUnacked(t *testing.T) {
 	}
 }
 
+// TestInjectWithNoConsumerIsNeverAcked covers the worst ack-and-drop case: a
+// pulser configured WITHOUT an OnInject consumer.
+//
+// It used to ack unconditionally in that state, so the payload was destroyed
+// with no log line while the producer recorded a successful delivery. A
+// transport whose entire contract is ack-or-requeue must never ack what it
+// cannot deliver: with no consumer the inject stays unacked and the producer
+// requeues it for a session that can actually take it.
+func TestInjectWithNoConsumerIsNeverAcked(t *testing.T) {
+	t.Parallel()
+
+	var (
+		offers atomic.Int64
+		sawAck atomic.Bool
+	)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			AckedInject string `json:"ackedInject"`
+		}
+		_ = json.Unmarshal(body, &req)
+		if req.AckedInject != "" {
+			sawAck.Store(true)
+		}
+		offers.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"refreshed": true,
+			"inject": map[string]any{
+				"deliveryId": "dlv-no-consumer",
+				"text":       "must not be destroyed",
+			},
+		})
+	})
+
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:  "s1",
+		WorkerID:   "w1",
+		IssueID:    "i1",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		Interval:   5 * time.Millisecond,
+		// OnInject deliberately nil: no consumer is wired.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && offers.Load() < 3 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := offers.Load(); got < 3 {
+		t.Fatalf("only %d refreshes observed; the test needs the inject re-offered", got)
+	}
+	if sawAck.Load() {
+		t.Fatal("an inject with no consumer was acked — the payload is destroyed and never requeued")
+	}
+
+	// Stop must not sneak the ack out through the final flush either.
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if sawAck.Load() {
+		t.Fatal("the Stop-time ack flush acked an inject that was never delivered")
+	}
+}
+
 // TestStopFlushesPendingInjectAck covers the short-session ack gap (the
 // delivered=true/acked=false strand): an inject accepted on the synchronous
 // first tick whose ack would only ride the NEXT tick must be flushed by

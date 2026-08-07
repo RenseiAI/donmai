@@ -37,6 +37,25 @@ const (
 	// interactiveNoticeTruncated marks a notice clipped to the canonical-mode
 	// input bound. The full text remains wherever it was durably queued.
 	interactiveNoticeTruncated = " …[truncated]"
+
+	// interactiveNoticeSubmit is the byte that makes a notice arrive as a
+	// SUBMITTED TURN rather than as text sitting in an input box. It is CR
+	// (0x0D), not LF, and the distinction is load-bearing:
+	//
+	//   - A terminal emulator sends CR for the Return key. LF is what the
+	//     Ctrl-J chord sends. They are different keys on the wire.
+	//   - A raw-mode TUI reads the PTY slave with ICRNL off, so it sees the
+	//     byte verbatim and its keypress parser maps CR and LF to DIFFERENT
+	//     key names. Sending LF there types a distinct, usually inert key:
+	//     the text lands in the input box and no turn is ever taken, while
+	//     every layer above reports success.
+	//   - A line-oriented child in the default (cooked) discipline gets CR
+	//     translated to NL by ICRNL, so its read still terminates.
+	//
+	// CR is therefore correct in BOTH modes; LF is correct only in cooked
+	// mode. See TestInteractiveNotice_SubmitByteDistinguishesReturnFromCtrlJ,
+	// which drives a raw-mode fixture that tells the two apart.
+	interactiveNoticeSubmit = '\r'
 )
 
 // formatInteractiveNotice renders one inject payload as the exact byte slice
@@ -46,17 +65,20 @@ const (
 // Three rules, each load-bearing:
 //
 //  1. FLATTENED. Every CR/LF (and VT/FF) becomes a single space. An
-//     interactive REPL submits on newline, so an unflattened multi-line
+//     interactive REPL submits on a line break, so an unflattened multi-line
 //     payload would submit its first line as one turn and type the rest into
 //     the next prompt as separate turns. Bracketed paste is the only correct
 //     multi-line framing and this layer emits none, so flattening is the
 //     honest option.
 //  2. BOUNDED. The complete write stays within the conservative 1,024-byte
 //     canonical-mode boundary shared by the supported host environments
-//     (maxInitialPromptBytes leaves the byte for the newline), and the clip
+//     (maxInitialPromptBytes leaves the byte for the submit key), and the clip
 //     lands on a UTF-8 boundary so no partial rune reaches the terminal.
-//  3. SELF-SUBMITTING. Exactly one trailing newline, so the notice arrives as
-//     its own submitted turn and never merges with anything else.
+//  3. SELF-SUBMITTING. Exactly one trailing interactiveNoticeSubmit (CR), so
+//     the notice arrives as its own submitted TURN — not as text parked in an
+//     input box — and never merges with anything else. Read that constant's
+//     doc before changing this byte; CR vs LF is the difference between the
+//     peer taking a turn and the peer never seeing the message.
 func formatInteractiveNotice(p heartbeat.InjectPayload) []byte {
 	text := strings.TrimSpace(flattenNoticeText(p.Text))
 	if text == "" {
@@ -68,7 +90,7 @@ func formatInteractiveNotice(p heartbeat.InjectPayload) []byte {
 	}
 	notice := make([]byte, 0, len(text)+1)
 	notice = append(notice, text...)
-	return append(notice, '\n')
+	return append(notice, interactiveNoticeSubmit)
 }
 
 // flattenNoticeText maps every line-breaking byte to a space (see rule 1).
@@ -121,6 +143,28 @@ func deliverInteractiveNotice(isess agent.InteractiveSession, notice []byte) (bo
 	return written, nil
 }
 
+// injectAcker is the delivery-confirmation half of the ack-or-requeue
+// contract: the interactive consumer takes custody of a payload WITHOUT
+// acking it (see newInjectAcceptor's ackOnBuffer) and calls AckInject only
+// once the bytes have actually reached the PTY. *heartbeat.Pulser implements
+// it, and does so nil-safely, so a supervisor running without a pulser (some
+// tests) needs no special case.
+type injectAcker interface {
+	AckInject(deliveryID string)
+}
+
+// interactivePulser is the narrow slice of *heartbeat.Pulser the interactive
+// supervisor consumes: the two ownership signals plus delivery
+// acknowledgement. Taking the interface rather than the struct is what lets
+// the ack-on-delivery contract be driven by a double in tests instead of only
+// through a live HTTP heartbeat; a nil value disables all three, which is the
+// pre-existing "no pulser wired" case.
+type interactivePulser interface {
+	injectAcker
+	LostOwnership() <-chan struct{}
+	StopRequested() bool
+}
+
 // interactiveNoticeQueue holds AT MOST ONE formatted notice awaiting
 // delivery. One slot, not a queue of many, on purpose:
 //
@@ -130,7 +174,12 @@ func deliverInteractiveNotice(isess agent.InteractiveSession, notice []byte) (bo
 //     fills, the heartbeat rejects further deliveries instead of acking them,
 //     which is the "leave it unacked and re-offer it" contract the producer
 //     already implements. Nothing is accepted-then-lost.
+//   - NO PREMATURE ACK. Nothing in this path acks; the ack is issued by
+//     attempt() at the instant the PTY takes the write. A notice held here
+//     when the session ends was never acked, so the platform re-offers it to
+//     the next session instead of stranding it acked-and-undelivered.
 type interactiveNoticeQueue struct {
+	ack         injectAcker
 	pending     []byte
 	deliveryID  string
 	warned      bool // hard write error surfaced on the Result once
@@ -190,6 +239,12 @@ func (q *interactiveNoticeQueue) attempt(r *Runner, qw QueuedWork, res *Result, 
 	}
 	r.logger.Info("[interactive] notice delivered to the live PTY",
 		"sessionId", qw.SessionID, "deliveryId", q.deliveryID, "bytes", len(q.pending))
+	// ACK ON DELIVERY, not on buffer: this is the first instant at which the
+	// payload has demonstrably reached its destination surface, so it is the
+	// first instant at which it may be marked delivered upstream.
+	if q.ack != nil {
+		q.ack.AckInject(q.deliveryID)
+	}
 	q.pending, q.deliveryID = nil, ""
 	return true
 }

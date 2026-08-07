@@ -120,7 +120,7 @@ func (r *Runner) dispatchInteractive(
 	qw QueuedWork,
 	res *Result,
 	sink activitySink,
-	pulser *heartbeat.Pulser,
+	pulser interactivePulser,
 	injectCh <-chan heartbeat.InjectPayload,
 ) (*Result, error) {
 	if sink == nil {
@@ -262,7 +262,7 @@ func (r *Runner) dispatchInteractive(
 	// The retry timer is created armed (the clock contract has no "disabled"
 	// constructor that can later be re-armed) and immediately stopped; it is
 	// reset only while a notice is held, so an idle session never wakes up.
-	notices := &interactiveNoticeQueue{}
+	notices := &interactiveNoticeQueue{ack: pulser}
 	retry := r.noticeRetryClock().NewTimer(interactiveNoticeRetry)
 	retry.Stop()
 	defer retry.Stop()
@@ -350,7 +350,7 @@ func (r *Runner) finishInteractiveOwnershipLoss(
 	qw QueuedWork,
 	res *Result,
 	sink activitySink,
-	pulser *heartbeat.Pulser,
+	pulser interactivePulser,
 ) (*Result, error) {
 	// Operator cancel ({"stop":true}) is terminal and non-retryable; a
 	// heartbeat fuse or hand-off retains the generic lost-ownership mode.

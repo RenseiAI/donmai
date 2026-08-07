@@ -104,16 +104,24 @@ type Config struct {
 	// goroutine; implementations must be cheap + non-blocking (the runner
 	// wires this to a non-blocking send onto its inject channel).
 	//
-	// The return value reports whether the consumer ACCEPTED the payload.
-	// Only accepted injects are acked back to the platform (via the next
-	// request's AckedInject echo, or the Stop-time flush); a rejected
-	// inject (e.g. the runner's buffer was full) stays unacked so the
-	// platform re-delivers it on a later refresh — ack-or-requeue, never
-	// ack-and-drop. Nil-safe: when OnInject is nil the inject is decoded
-	// and acked but otherwise dropped (no consumer will ever appear, so
-	// leaving it unacked would re-deliver forever). Wave 3 runtime
-	// memory-inject transport — the pulser already runs inside the worker
-	// process that owns the live agent.Handle, so it is the only
+	// The return value reports whether the payload is now the consumer's
+	// responsibility AND acknowledgeable. True acks it back to the platform
+	// (via the next request's AckedInject echo, or the Stop-time flush).
+	// False leaves it unacked so the platform re-delivers it on a later
+	// refresh — ack-or-requeue, never ack-and-drop. Returning false is the
+	// correct answer for BOTH "my buffer is full" and "I have buffered it
+	// but not yet delivered it"; a consumer in the second case confirms
+	// later with [Pulser.AckInject].
+	//
+	// Nil OnInject means the session has NO consumer: the payload is left
+	// unacked (so the platform requeues it) and the arrival is logged at
+	// error level. It is deliberately NOT acked — a pulser that acks what it
+	// cannot deliver destroys the message and reports success, which is the
+	// worst possible failure mode for a transport whose whole contract is
+	// ack-or-requeue.
+	//
+	// Wave 3 runtime memory-inject transport — the pulser already runs inside
+	// the worker process that owns the live agent.Handle, so it is the only
 	// authenticated channel that can reach Handle.Inject (the daemon poll
 	// path is in the wrong process).
 	OnInject func(InjectPayload) bool
@@ -283,13 +291,18 @@ type Pulser struct {
 	// after LostOwnership fires.
 	stopRequested atomic.Bool
 
-	// lastAckedInject is the DeliveryID of the most recent inject the
-	// pulser delivered to OnInject AND the consumer accepted. It is echoed
-	// back to the platform on every subsequent request via
-	// [refreshRequest.AckedInject] so the platform can mark the inject
-	// acked and stop re-sending it. Read/written on the single heartbeat
-	// goroutine (tick → doRefresh); Stop reads it only after the loop has
-	// exited (synchronised via doneCh), so it needs no lock.
+	// ackMu guards lastAckedInject / lastEchoedAck. They used to be
+	// heartbeat-goroutine-only, but [Pulser.AckInject] lets a CONSUMER
+	// goroutine record an ack at the moment it actually delivers a payload
+	// (see its doc), so the pair is now cross-goroutine state.
+	ackMu sync.Mutex
+
+	// lastAckedInject is the DeliveryID of the most recent inject known to
+	// have reached its destination — either because OnInject accepted it
+	// outright, or because the consumer later confirmed delivery through
+	// [Pulser.AckInject]. It is echoed back to the platform on every
+	// subsequent request via [refreshRequest.AckedInject] so the platform can
+	// mark the inject acked and stop re-sending it. Guarded by ackMu.
 	lastAckedInject string
 
 	// lastEchoedAck is the AckedInject value most recently carried on a
@@ -298,9 +311,46 @@ type Pulser struct {
 	// never rode a tick (short sessions exit before the next heartbeat
 	// interval elapses) and flushPendingAck fires one best-effort
 	// ack-only request so the platform does not strand the inject
-	// delivered-but-unacked. Same synchronisation regime as
-	// lastAckedInject.
+	// delivered-but-unacked. Guarded by ackMu.
 	lastEchoedAck string
+}
+
+// AckInject records that deliveryID has actually been DELIVERED to its
+// destination surface, so the next request acks it and the platform stops
+// re-offering it.
+//
+// It exists because "accepted onto a buffer" and "delivered" are different
+// events for consumers whose delivery is gated on something outside the
+// runner's control. An interactive PTY session is the extreme case: a notice
+// waits for the human to finish typing, which may be minutes, and the session
+// can end first. Acking at buffer time would stamp those payloads delivered
+// and they would never be re-offered — accepted-and-lost. Such a consumer
+// returns false from OnInject (leaving the payload unacked and re-offerable)
+// and calls this once the write has landed.
+//
+// Safe to call from any goroutine, and a no-op on a nil Pulser or an empty
+// deliveryID so callers need no nil dance.
+func (p *Pulser) AckInject(deliveryID string) {
+	if p == nil || deliveryID == "" {
+		return
+	}
+	p.ackMu.Lock()
+	p.lastAckedInject = deliveryID
+	p.ackMu.Unlock()
+}
+
+// ackState snapshots the ack pair under ackMu.
+func (p *Pulser) ackState() (acked, echoed string) {
+	p.ackMu.Lock()
+	defer p.ackMu.Unlock()
+	return p.lastAckedInject, p.lastEchoedAck
+}
+
+// noteAckEchoed records that ack rode a request the platform answered 2xx.
+func (p *Pulser) noteAckEchoed(ack string) {
+	p.ackMu.Lock()
+	p.lastEchoedAck = ack
+	p.ackMu.Unlock()
 }
 
 // New returns a Pulser configured for the given session. Returns an
@@ -426,29 +476,31 @@ func (p *Pulser) Stop() error {
 const finalAckFlushTimeout = 5 * time.Second
 
 // flushPendingAck fires one best-effort ack-only lock-refresh when the
-// most recently accepted inject's ack has not yet ridden a successful
+// most recently delivered inject's ack has not yet ridden a successful
 // request. Called from Stop strictly after the heartbeat loop has exited
-// (happens-before via doneCh), so reading the ack fields is race-free.
+// (happens-before via doneCh); the ack pair is still read under ackMu
+// because a consumer goroutine may call AckInject at any point up to then.
 // The response is deliberately ignored: the session is over, so any NEW
 // inject the platform might piggyback must stay unacked for the platform
 // to requeue elsewhere.
 func (p *Pulser) flushPendingAck() {
-	if p.lastAckedInject == "" || p.lastAckedInject == p.lastEchoedAck {
+	acked, echoed := p.ackState()
+	if acked == "" || acked == echoed {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalAckFlushTimeout)
 	defer cancel()
-	if _, err := p.postRefresh(ctx, p.lastAckedInject); err != nil {
+	if _, err := p.postRefresh(ctx, acked); err != nil {
 		p.cfg.logger().Warn("final inject ack flush failed",
 			"sessionId", p.cfg.SessionID,
-			"deliveryId", p.lastAckedInject,
+			"deliveryId", acked,
 			"err", err)
 		return
 	}
-	p.lastEchoedAck = p.lastAckedInject
+	p.noteAckEchoed(acked)
 	p.cfg.logger().Debug("final inject ack flushed",
 		"sessionId", p.cfg.SessionID,
-		"deliveryId", p.lastAckedInject)
+		"deliveryId", acked)
 }
 
 // run is the inner loop driving subsequent ticks.
@@ -714,14 +766,14 @@ func (p *Pulser) postRefresh(ctx context.Context, ack string) (*refreshResponse,
 // doRefresh issues one POST to /api/sessions/<id>/lock-refresh and
 // returns nil only when the platform reports the lock was extended.
 func (p *Pulser) doRefresh(ctx context.Context) error {
-	ack := p.lastAckedInject
+	ack, _ := p.ackState()
 	out, err := p.postRefresh(ctx, ack)
 	if err != nil {
 		return err
 	}
 	// The request landed (2xx) — the ack echo it carried is now known to
 	// the platform, regardless of the refresh verdict below.
-	p.lastEchoedAck = ack
+	p.noteAckEchoed(ack)
 	if out == nil {
 		// Empty-body 204-style response: accepted, nothing to decode.
 		return nil
@@ -770,14 +822,25 @@ func (p *Pulser) doRefresh(ctx context.Context) error {
 	// delivery (consumer buffer full) stays unacked so the platform
 	// re-delivers on a later refresh — ack-or-requeue, never ack-and-drop.
 	if out.Inject != nil {
-		accepted := true
-		if p.cfg.OnInject != nil {
-			accepted = p.cfg.OnInject(*out.Inject)
-		}
-		if accepted {
-			p.lastAckedInject = out.Inject.DeliveryID
-		} else {
-			p.cfg.logger().Warn("memory inject rejected by consumer; leaving unacked for re-delivery",
+		switch {
+		case p.cfg.OnInject == nil:
+			// NO CONSUMER. This used to ack unconditionally, which destroyed
+			// the payload silently and told the platform it had been
+			// delivered. A pulser with no consumer cannot deliver anything,
+			// so it must not claim to: leave it unacked (the platform
+			// requeues it) and say so loudly, because a session reaching
+			// this branch is misconfigured — the runner wires OnInject for
+			// every run mode that has a reader.
+			p.cfg.logger().Error("runtime inject arrived with no consumer wired; leaving unacked for requeue",
+				"sessionId", p.cfg.SessionID,
+				"deliveryId", out.Inject.DeliveryID)
+		case p.cfg.OnInject(*out.Inject):
+			p.AckInject(out.Inject.DeliveryID)
+		default:
+			// Either the consumer's buffer is full, or the consumer acks on
+			// DELIVERY rather than on buffer and will call AckInject itself
+			// once the payload lands. Both mean: do not ack here.
+			p.cfg.logger().Debug("memory inject not acked by consumer; leaving unacked for re-delivery",
 				"sessionId", p.cfg.SessionID,
 				"deliveryId", out.Inject.DeliveryID)
 		}

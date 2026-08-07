@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -82,10 +83,56 @@ func (c *noticeRetryClock) fire(t *testing.T) {
 
 // ─── supervisor harness ────────────────────────────────────────────────────
 
+// fakeInteractivePulser is an interactivePulser double that records every
+// delivery acknowledgement the supervisor issues, so a test can assert WHEN
+// an ack happens rather than merely that one eventually did.
+type fakeInteractivePulser struct {
+	mu   sync.Mutex
+	acks []string
+	lost chan struct{}
+}
+
+func newFakeInteractivePulser() *fakeInteractivePulser {
+	return &fakeInteractivePulser{lost: make(chan struct{})}
+}
+
+func (p *fakeInteractivePulser) AckInject(deliveryID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.acks = append(p.acks, deliveryID)
+}
+
+func (p *fakeInteractivePulser) LostOwnership() <-chan struct{} { return p.lost }
+func (p *fakeInteractivePulser) StopRequested() bool            { return false }
+
+func (p *fakeInteractivePulser) acked() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.acks...)
+}
+
+// waitAcked polls until deliveryID has been acked, or fails.
+func (p *fakeInteractivePulser) waitAcked(t *testing.T, deliveryID string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		for _, got := range p.acked() {
+			if got == deliveryID {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivery %q was written to the PTY but never acked; got %v", deliveryID, p.acked())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 type interactiveDispatch struct {
 	session  *recordingInteractiveSession
 	injectCh chan heartbeat.InjectPayload
 	clock    *noticeRetryClock
+	pulser   *fakeInteractivePulser
 	res      *Result
 	done     chan error
 	stop     sync.Once
@@ -103,6 +150,7 @@ func startInteractiveDispatch(t *testing.T, sessionID string) *interactiveDispat
 		session:  liveRecordingInteractiveSession(),
 		injectCh: make(chan heartbeat.InjectPayload, 8),
 		clock:    newNoticeRetryClock(),
+		pulser:   newFakeInteractivePulser(),
 		res:      &Result{SessionID: sessionID},
 		done:     make(chan error, 1),
 	}
@@ -119,7 +167,7 @@ func startInteractiveDispatch(t *testing.T, sessionID string) *interactiveDispat
 	}}
 	go func() {
 		_, err := r.dispatchInteractive(
-			context.Background(), handle, t.TempDir(), qw, d.res, &recordingSink{}, nil, d.injectCh,
+			context.Background(), handle, t.TempDir(), qw, d.res, &recordingSink{}, d.pulser, d.injectCh,
 		)
 		d.done <- err
 	}()
@@ -175,10 +223,10 @@ func TestFormatInteractiveNotice(t *testing.T) {
 	}{
 		{name: "empty", text: "", wantNil: true},
 		{name: "whitespace only", text: "   \n\t ", wantNil: true},
-		{name: "simple line gains one newline", text: "hello there", want: "hello there\n"},
-		{name: "surrounding whitespace trimmed", text: "  hello  ", want: "hello\n"},
-		{name: "newlines flattened to spaces", text: "line one\nline two\r\nline three", want: "line one line two  line three\n"},
-		{name: "vertical whitespace flattened", text: "a\vb\fc", want: "a b c\n"},
+		{name: "simple line gains one submit byte", text: "hello there", want: "hello there\r"},
+		{name: "surrounding whitespace trimmed", text: "  hello  ", want: "hello\r"},
+		{name: "newlines flattened to spaces", text: "line one\nline two\r\nline three", want: "line one line two  line three\r"},
+		{name: "vertical whitespace flattened", text: "a\vb\fc", want: "a b c\r"},
 		{name: "oversize line truncated", text: longLine},
 		{name: "oversize multibyte truncated on a rune boundary", text: multibyte},
 	}
@@ -200,11 +248,14 @@ func TestFormatInteractiveNotice(t *testing.T) {
 			}
 
 			// Invariants that hold for EVERY non-nil notice.
-			if n := bytes.Count(got, []byte("\n")); n != 1 {
-				t.Fatalf("notice carries %d newlines; want exactly 1 (self-submitting, one turn)", n)
+			if n := bytes.Count(got, []byte{interactiveNoticeSubmit}); n != 1 {
+				t.Fatalf("notice carries %d submit bytes; want exactly 1 (self-submitting, one turn)", n)
 			}
-			if got[len(got)-1] != '\n' {
-				t.Fatalf("notice must end with the submitting newline; got %q", got)
+			if n := bytes.Count(got, []byte("\n")); n != 0 {
+				t.Fatalf("notice carries %d LF bytes; a raw-mode TUI reads LF as a key that is NOT Return", n)
+			}
+			if got[len(got)-1] != interactiveNoticeSubmit {
+				t.Fatalf("notice must end with the submit byte; got %q", got)
 			}
 			if len(got) > maxInitialPromptBytes+1 {
 				t.Fatalf("notice is %d bytes; the canonical-mode bound is %d", len(got), maxInitialPromptBytes+1)
@@ -214,6 +265,103 @@ func TestFormatInteractiveNotice(t *testing.T) {
 			}
 			if len(tc.text) > maxInitialPromptBytes && !bytes.Contains(got, []byte(interactiveNoticeTruncated)) {
 				t.Fatalf("an oversize notice must be marked truncated; got %q", got)
+			}
+		})
+	}
+}
+
+// ─── the submit byte, against a raw-mode reader ────────────────────────────
+
+// spawnRawKeys re-execs this test binary as the raw-mode key reader (see
+// main_test.go) under a real PTY and returns it with a subscription
+// positioned after the readiness marker.
+func spawnRawKeys(t *testing.T) (*ptyhost.Session, agent.InteractiveSubscription) {
+	t.Helper()
+	sess, err := ptyhost.Spawn(ptyhost.Spec{
+		Command: []string{os.Args[0]},
+		Env:     []string{testRoleEnv + "=rawkeys"},
+	})
+	if err != nil {
+		t.Fatalf("ptyhost.Spawn(raw key reader): %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = sess.Stop(ctx)
+	})
+	sub, err := sess.Subscribe(0)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+	if !waitForTerminalOutput(sub, rawKeysReady, 30*time.Second) {
+		t.Fatal("the raw-mode key reader never signalled readiness")
+	}
+	return sess, sub
+}
+
+// TestInteractiveNotice_SubmitByteDistinguishesReturnFromCtrlJ closes the gap
+// the reviewers named: every other harness in this suite is an environment
+// where LF works trivially (a cooked-mode `read` loop, or `stty raw -echo;
+// exec cat`, which echoes and interprets nothing), so none of them can tell
+// "the bytes reached the PTY" from "the message arrived as a TURN".
+//
+// This one drives a raw-mode reader that treats CR and LF as DIFFERENT KEYS —
+// which is what a raw-mode TUI's keypress parser does — and asserts that the
+// notice the runner actually builds commits a line there, while the previously
+// shipped LF-terminated form does not.
+//
+// STILL UNVERIFIED, stated plainly: this proves the byte we send is the byte
+// the application receives and that the two are separable. It does not, and
+// in this environment cannot, prove any specific third-party REPL's key
+// bindings. The argument for CR is that a terminal emulator emits CR for the
+// Return key (LF is Ctrl-J), so CR is what a Return-bound app is waiting for,
+// and ICRNL makes CR work for cooked-mode children too — which the sibling
+// runLoop test exercises end to end.
+func TestInteractiveNotice_SubmitByteDistinguishesReturnFromCtrlJ(t *testing.T) {
+	const text = "PING-4c1e from chief-of-staff"
+
+	tests := []struct {
+		name       string
+		notice     []byte
+		wantMarker string
+		wantSubmit bool
+	}{
+		{
+			name:       "the notice the runner builds submits a turn",
+			notice:     formatInteractiveNotice(heartbeat.InjectPayload{DeliveryID: "d1", Text: text}),
+			wantMarker: rawKeysSubmit + text,
+			wantSubmit: true,
+		},
+		{
+			name:       "an LF-terminated notice is a different key and never submits",
+			notice:     append([]byte(text), '\n'),
+			wantMarker: rawKeysNotSubmit + "0x0a",
+			wantSubmit: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sess, sub := spawnRawKeys(t)
+
+			written, err := sess.TryWriteNotice(tc.notice)
+			if err != nil {
+				t.Fatalf("TryWriteNotice: %v", err)
+			}
+			if !written {
+				t.Fatal("the raw-mode reader refused the notice at an idle prompt")
+			}
+			if !waitForTerminalOutput(sub, tc.wantMarker, 30*time.Second) {
+				t.Fatalf("the raw-mode reader never reported %q", tc.wantMarker)
+			}
+			if tc.wantSubmit {
+				return
+			}
+			// The non-submit marker is emitted only AFTER every text byte has
+			// been consumed, so its arrival proves no turn was committed.
+			if waitForTerminalOutput(sub, rawKeysSubmit, 500*time.Millisecond) {
+				t.Fatal("an LF-terminated notice committed a turn; the fixture cannot tell CR from LF")
 			}
 		})
 	}
@@ -235,8 +383,8 @@ func TestInteractive_InjectDeliveredAsSingleWrite(t *testing.T) {
 	if !strings.Contains(got, "PING-9f2a from chief-of-staff") {
 		t.Fatalf("PTY write %q does not carry the inject text", got)
 	}
-	if !strings.HasSuffix(got, "\n") {
-		t.Fatalf("PTY write %q must end with the submitting newline", got)
+	if !strings.HasSuffix(got, string(interactiveNoticeSubmit)) {
+		t.Fatalf("PTY write %q must end with the submit byte", got)
 	}
 	if len(writes[0]) > maxInitialPromptBytes+1 {
 		t.Fatalf("PTY write is %d bytes; bound is %d", len(writes[0]), maxInitialPromptBytes+1)
@@ -286,6 +434,60 @@ func TestInteractive_InjectRefusedWhileHumanComposing(t *testing.T) {
 	writes := d.waitWrites(t, 1)
 	if !strings.Contains(string(writes[0]), "message during typing") {
 		t.Fatalf("held notice did not land after the human submitted: %q", writes[0])
+	}
+}
+
+// TestInteractive_AckHappensOnDeliveryNotOnBuffer is the ack-or-requeue
+// contract, at the only instant that can honour it.
+//
+// The regression: the payload was acked the moment it landed on the inject
+// channel. A notice held for a composing human is not delivered, so acking
+// there told the producer "delivered" about bytes that had not left the
+// process — and once the producer stamps it acked, it is never re-offered.
+func TestInteractive_AckHappensOnDeliveryNotOnBuffer(t *testing.T) {
+	d := startInteractiveDispatch(t, "sess-ack-on-delivery")
+	d.session.setRefuseNotice(true)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-ack", Text: "message during typing"}
+
+	// Attempted, refused, held — and NOT acked.
+	d.clock.waitArmed(t)
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("payload acked while it was only buffered/held: %v", got)
+	}
+	d.clock.fire(t)
+	d.clock.waitArmed(t)
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("payload acked on a retry that still wrote nothing: %v", got)
+	}
+
+	// The human submits; the write lands; NOW it may be acked.
+	d.session.setRefuseNotice(false)
+	d.clock.fire(t)
+	d.waitWrites(t, 1)
+	d.pulser.waitAcked(t, "dlv-ack")
+}
+
+// TestInteractive_UndeliveredNoticeIsNeverAckedAtSessionEnd is the other half
+// of the same contract: a notice the session never managed to write must stay
+// unacked so the producer re-offers it somewhere else. Acking it here is
+// exactly how nine messages were destroyed with a success reported to each
+// sender.
+func TestInteractive_UndeliveredNoticeIsNeverAckedAtSessionEnd(t *testing.T) {
+	d := startInteractiveDispatch(t, "sess-ack-session-end")
+	d.session.setRefuseNotice(true)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-lost-1", Text: "never delivered"}
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-lost-2", Text: "also never delivered"}
+	d.clock.waitArmed(t)
+
+	d.finish(t)
+
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("undelivered notices were acked at session end: %v — the producer will never re-offer them", got)
+	}
+	if got := d.session.recordedWrites(); len(got) != 0 {
+		t.Fatalf("expected no PTY writes at all; got %q", got)
 	}
 }
 
@@ -426,7 +628,30 @@ func TestInteractive_InjectHeldWhenSurfaceCannotNotify(t *testing.T) {
 // This is the seam the production defect lived on — runLoop returned via
 // dispatchInteractive without passing injectCh — so it fails outright if the
 // channel is not handed over, no matter how correct the drain itself is.
+//
+// It runs over BOTH provider injection capabilities. An interactive session
+// never calls Handle.Inject; it writes into its PTY, and every interactive
+// session has one. Gating the rail on the provider capability silently
+// disabled it for the harnesses that declare SupportsMessageInjection=false
+// (codex, shell, amp, agycli, ollama) while the platform still reported the
+// message delivered — so the capability=false row is the regression.
 func TestInteractive_RunLoopHandsInjectChToDispatch(t *testing.T) {
+	tests := []struct {
+		name          string
+		supportsInjec bool
+	}{
+		{name: "provider supports message injection", supportsInjec: true},
+		{name: "provider does NOT support message injection", supportsInjec: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runInteractiveInjectViaRunLoop(t, tc.supportsInjec)
+		})
+	}
+}
+
+func runInteractiveInjectViaRunLoop(t *testing.T, supportsInjection bool) {
+	t.Helper()
 	requireSh(t)
 
 	const (
@@ -464,9 +689,11 @@ func TestInteractive_RunLoopHandsInjectChToDispatch(t *testing.T) {
 			"/bin/sh", "-c",
 			`while IFS= read -r line; do echo "got:$line"; [ "$line" = quit ] && break; done`,
 		},
-		// The capability is what makes runLoop wire the heartbeat's OnInject;
-		// it is provider-level and mode-independent, exactly as in production.
-		caps:    agent.Capabilities{SupportsMessageInjection: true},
+		// The PROVIDER capability answers "can Handle.Inject deliver a
+		// message?", which an interactive session never asks: its delivery
+		// surface is the PTY. Both values must therefore behave identically
+		// here.
+		caps:    agent.Capabilities{SupportsMessageInjection: supportsInjection},
 		spawned: spawned,
 	}
 	if err := reg.Register(prov); err != nil {

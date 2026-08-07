@@ -617,15 +617,28 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// platform also acks to stop re-sending, but a re-delivery in the
 	// heartbeat-interval window before the ack lands must not double-inject).
 	//
-	// The channel is wired to OnInject whenever the provider supports message
-	// injection. Whether any block is actually delivered is decided ENTIRELY by
-	// the platform (it only returns an `inject` on the lock-refresh response
-	// when the project's memory config has runtime-inject enabled) — so the
-	// worker needs no env var or local config. Providers without injection
-	// support rely on the dispatch-time fold (v1).
+	// Whether any block is actually delivered is decided ENTIRELY by the
+	// platform (it only returns an `inject` on the lock-refresh response when
+	// the project's memory config has runtime-inject enabled) — so the worker
+	// needs no env var or local config.
+	//
+	// The rail is wired when a CONSUMER EXISTS, which is not the same question
+	// as "does the provider support message injection":
+	//
+	//   - Headless and interview runs deliver through Handle.Inject, so they
+	//     genuinely need caps.SupportsMessageInjection. Providers without it
+	//     rely on the dispatch-time fold (v1).
+	//   - An INTERACTIVE run never calls Handle.Inject at all. It writes the
+	//     payload into the live PTY as a notice, and every interactive session
+	//     has a PTY by construction — that is what makes it interactive. Gating
+	//     it on the provider capability disabled the rail for the codex, shell,
+	//     amp, agycli and ollama harnesses even though the delivery surface was
+	//     right there, and the messages were destroyed rather than requeued.
+	//     The right question for this mode is "is this a PTY-interactive
+	//     session", so that is the question asked.
 	injectCh := make(chan heartbeat.InjectPayload, 8)
 	seenInject := map[string]struct{}{}
-	runtimeInjectEnabled := caps.SupportsMessageInjection
+	runtimeInjectEnabled := caps.SupportsMessageInjection || qw.isInteractive()
 
 	// 9. Start heartbeat pulser (in a goroutine — Pulser.Start fires
 	// the first tick synchronously then runs the loop in its own
@@ -640,12 +653,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}, err
 		}
 	}
-	// Wave 3 runtime memory-inject: wire OnInject only when the provider can
-	// accept injects. See newInjectAcceptor for the dedup + ack-or-requeue
-	// contract it implements.
+	// Wave 3 runtime memory-inject: wire OnInject only when a consumer exists.
+	// See newInjectAcceptor for the dedup + ack-or-requeue contract, and for
+	// why the interactive mode acks on DELIVERY rather than on buffer.
 	var onInject func(heartbeat.InjectPayload) bool
 	if runtimeInjectEnabled {
-		onInject = newInjectAcceptor(injectCh, seenInject, r.logger, qw.SessionID)
+		onInject = newInjectAcceptor(
+			injectCh, seenInject, r.logger, qw.SessionID, !qw.isInteractive(),
+		)
 	}
 	pulser, err := heartbeat.New(heartbeat.Config{
 		SessionID: qw.SessionID,
@@ -1160,23 +1175,36 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 // dedup-by-DeliveryID lives here exclusively, so the map is never touched off
 // that goroutine — and performs a NON-BLOCKING send onto injectCh:
 //
-//   - already-seen DeliveryID → dropped from the buffer but still ACKED, so
-//     the producer stops re-sending something already queued once.
-//   - buffered → marked seen, then acked.
-//   - buffer full → REJECTED (returns false) rather than stalling the
+//   - buffered → marked seen; acked only if ackOnBuffer.
+//   - already-seen DeliveryID → not re-buffered; acked only if ackOnBuffer.
+//   - buffer full → ALWAYS rejected (returns false) rather than stalling the
 //     heartbeat loop; the pulser leaves it unacked and the producer re-offers
 //     it on a later refresh. The DeliveryID is deliberately NOT marked seen,
-//     so the re-delivery is accepted once capacity frees up (ack-or-requeue,
-//     never ack-and-drop).
+//     so the re-delivery is accepted once capacity frees up.
+//
+// # ackOnBuffer: where the ack belongs
 //
 // Consumers differ by run mode: headless drains at the post-terminal seam,
 // interview parks on the channel per turn, interactive writes each payload
-// into the live PTY as a notice.
+// into the live PTY as a notice. The first two consume the buffer within the
+// same Run, at a seam the runner itself reaches — buffering there is a good
+// proxy for delivery, so they pass ackOnBuffer=true.
+//
+// The interactive consumer is different in kind: its write is gated on the
+// human at the terminal (a notice is refused while they are mid-composition)
+// and the session can end at any moment. Acking at buffer time stamped up to
+// nine payloads delivered, the session ended, they were logged as a count and
+// dropped, and the platform never re-offered them because acked_at was set.
+// So interactive passes ackOnBuffer=false: the acceptor takes custody without
+// claiming delivery, and the consumer calls [heartbeat.Pulser.AckInject] once
+// the bytes are actually on the PTY. Until then the payload stays unacked and
+// requeueable — ack-or-requeue rather than ack-and-hope.
 func newInjectAcceptor(
 	injectCh chan<- heartbeat.InjectPayload,
 	seenInject map[string]struct{},
 	logger *slog.Logger,
 	sessionID string,
+	ackOnBuffer bool,
 ) func(heartbeat.InjectPayload) bool {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -1185,10 +1213,9 @@ func newInjectAcceptor(
 		if p.DeliveryID != "" {
 			if _, ok := seenInject[p.DeliveryID]; ok {
 				logger.Debug("memory inject: skipping already-seen delivery",
-					"sessionId", sessionID, "deliveryId", p.DeliveryID)
-				// Already buffered earlier in this Run — safe to ack so the
-				// platform stops re-sending it.
-				return true
+					"sessionId", sessionID, "deliveryId", p.DeliveryID,
+					"ackOnBuffer", ackOnBuffer)
+				return ackOnBuffer
 			}
 		}
 		select {
@@ -1196,7 +1223,7 @@ func newInjectAcceptor(
 			if p.DeliveryID != "" {
 				seenInject[p.DeliveryID] = struct{}{}
 			}
-			return true
+			return ackOnBuffer
 		default:
 			logger.Warn("memory inject: channel full, leaving unacked for re-delivery",
 				"sessionId", sessionID, "deliveryId", p.DeliveryID)

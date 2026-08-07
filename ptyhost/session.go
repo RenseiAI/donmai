@@ -1,7 +1,6 @@
 package ptyhost
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -43,7 +42,7 @@ type Session struct {
 	rec *recorder
 
 	// writeMu serializes EVERY author of PTY-master input and guards
-	// pendingCompose. Deliberately NOT s.mu: mu guards seq/ring/subscription/
+	// compose. Deliberately NOT s.mu: mu guards seq/ring/subscription/
 	// VT/recorder state fed from run(), and the input path must not contend
 	// with the output path (a child that stops reading stdin would otherwise
 	// couple input latency to frame emission).
@@ -54,11 +53,18 @@ type Session struct {
 	// them: one write is one uninterruptible unit, and a notice is refused
 	// outright while the human's line is half-typed.
 	writeMu sync.Mutex
-	// pendingCompose is true when the last accepted input left unsubmitted
-	// bytes in the child's line editor (§5: the host never parses input, so
-	// this is a deliberately coarse byte-level heuristic, not terminal-state
-	// tracking). Guarded by writeMu.
-	pendingCompose bool
+	// compose models the child's line editor from the accepted input bytes
+	// (§5: the host never asks the child about its state). See compose.go —
+	// it is a deliberately coarse model, but one that can report an empty
+	// line again after an edit rather than latching shut. Guarded by writeMu.
+	compose composeTracker
+
+	// altActive mirrors the VT's alternate-screen flag for the notice gate.
+	// An atomic rather than a field under s.mu so TryWriteNotice (which holds
+	// writeMu) never has to take s.mu — that would order the input path
+	// behind the output path, the exact coupling writeMu exists to avoid.
+	// Written only from onOutput, immediately after the VT is fed.
+	altActive atomic.Bool
 
 	// mu guards all sequence/ring/subscription/VT/recorder state below. The VT
 	// is fed only from run() and snapshotted only under mu, so feeding and
@@ -171,6 +177,10 @@ func (s *Session) onOutput(data []byte) {
 		return
 	}
 	s.vt.write(data)
+	// Publish the alternate-screen flag before the frame that carries the
+	// switch, so a subscriber that has seen the frame is guaranteed to see
+	// the updated flag (the notice gate reads it, see TryWriteNotice).
+	s.altActive.Store(s.vt.altScreen())
 	for len(data) > 0 {
 		chunk := data
 		if len(chunk) > maxOutputFrame {
@@ -308,12 +318,6 @@ func (s *Session) lastSeqLocked() attachwire.HostSeq { return s.nextSeq - 1 }
 
 // ---- agent.InteractiveSession ----------------------------------------------
 
-// composeBreakBytes are the input bytes that END a line-editor composition:
-// the two submit keys (CR / LF) and the two whole-line discards (Ctrl-C
-// interrupt, Ctrl-U kill-line). Anything else is assumed to leave characters
-// pending in the child's line editor.
-const composeBreakBytes = "\r\n\x03\x15"
-
 // WriteInput writes already-encoded terminal input bytes verbatim to the PTY
 // master (§5: input is never re-sanitized).
 //
@@ -330,27 +334,12 @@ func (s *Session) WriteInput(p []byte) (int, error) {
 	defer s.writeMu.Unlock()
 	n, err := s.ptmx.Write(p)
 	if n > 0 && n <= len(p) {
-		s.trackComposeLocked(p[:n])
+		s.compose.feed(p[:n])
 	}
 	if err != nil {
 		return n, fmt.Errorf("ptyhost: write input: %w", err)
 	}
 	return n, nil
-}
-
-// trackComposeLocked updates pendingCompose from the bytes the PTY actually
-// accepted. A payload whose LAST composeBreakByte is its final byte leaves
-// the line editor empty; anything after that break (or a payload with no
-// break at all) leaves characters pending. Called with writeMu held.
-func (s *Session) trackComposeLocked(written []byte) {
-	if len(written) == 0 {
-		return
-	}
-	if i := bytes.LastIndexAny(written, composeBreakBytes); i >= 0 {
-		s.pendingCompose = i != len(written)-1
-		return
-	}
-	s.pendingCompose = true
 }
 
 // TryWriteNotice delivers a runner-authored notice as ONE atomic PTY write,
@@ -367,6 +356,36 @@ func (s *Session) trackComposeLocked(written []byte) {
 // concurrent keystroke write, so the notice can never be interleaved
 // byte-wise. That guarantee is per-call ONLY, which is why a notice is never
 // chunked — a short write is reported as an error rather than resumed.
+//
+// # What the host CAN and CANNOT know about "is this a safe moment"
+//
+// Two refusal conditions are host-observable and are enforced here:
+//
+//  1. An outstanding COMPOSITION (compose.go). Appending to a half-typed line
+//     would splice runner text into the human's input.
+//  2. The ALTERNATE SCREEN. A child on the alt screen is running a full-screen
+//     UI — a pager, an editor, a full-screen dialog — where every byte of a
+//     notice is a command keystroke and the submit key is destructive. The
+//     terminal genuinely sees this transition (DECSET ?1049/?1047/?47), so it
+//     is refused.
+//
+// What the host CANNOT see is an INLINE modal: an application-level prompt
+// ("1. Yes  2. No", Enter selects the highlighted option) rendered as ordinary
+// text on the primary screen. Nothing at the terminal layer changes when an
+// application starts interpreting keys as menu choices instead of as text —
+// modes, screen buffer, cursor and line discipline are all identical to an
+// idle prompt. So the host cannot distinguish "Enter submits my line" from
+// "Enter picks the default", and equally cannot distinguish a printable byte
+// that types a character from one that selects option 2. Screen-scraping the
+// VT for known prompt shapes would make a generic host application-specific
+// and would still miss every prompt it had not been taught.
+//
+// Fallback, stated plainly: a notice delivered during an inline modal CAN
+// select that modal's default. The residual risk is bounded, not eliminated —
+// the notice is a single, whole, logged write, never a fragment, and the two
+// refusal conditions above remove the cases the terminal can actually see.
+// Removing the rest needs an application-side inject API (the harness's own
+// message-injection capability), not a smarter terminal.
 func (s *Session) TryWriteNotice(p []byte) (bool, error) {
 	if len(p) == 0 {
 		return false, nil
@@ -374,9 +393,12 @@ func (s *Session) TryWriteNotice(p []byte) (bool, error) {
 	if s.closedFlag.Load() {
 		return false, errExited
 	}
+	if s.altActive.Load() {
+		return false, nil
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.pendingCompose {
+	if s.compose.pending() {
 		return false, nil
 	}
 	n, err := s.ptmx.Write(p)
@@ -386,8 +408,9 @@ func (s *Session) TryWriteNotice(p []byte) (bool, error) {
 	if n != len(p) {
 		return true, fmt.Errorf("ptyhost: write notice: short write (%d of %d bytes)", n, len(p))
 	}
-	// A notice is self-submitting (the caller appends the newline), so the
-	// line editor is left exactly as empty as it was found.
+	// A notice is self-submitting (the caller appends the submit byte), so
+	// the line editor is left exactly as empty as it was found — the compose
+	// model needs no update here.
 	return true, nil
 }
 
