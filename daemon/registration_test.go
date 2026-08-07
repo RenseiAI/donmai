@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1068,5 +1069,75 @@ func TestRegister_OmitsRegionAndHostInfoWhenUnset(t *testing.T) {
 	}
 	if _, present := raw["hostInfo"]; present {
 		t.Errorf("expected hostInfo key absent when nil, got %v", raw["hostInfo"])
+	}
+}
+
+// TestRegister_MachineIdIsStableIdentityNotHostname is the wire-level
+// regression test for host-identity forking.
+//
+// The `machineId` field is what an orchestrator keys host identity on. It used
+// to default to the hostname, so the SAME machine registered as a different
+// host every time the resolver handed back a different hostname form —
+// "<name>.local" on one network, "<name>.localdomain" on another, a bare name
+// on a third. One box, several hosts, capacity counted several times.
+//
+// The wire value must be the resolved machine identity and must not move when
+// the hostname label does.
+//
+// Against the pre-fix code (`req.MachineID = opts.Hostname`) the two
+// registrations below report two different machine ids.
+func TestRegister_MachineIdIsStableIdentityNotHostname(t *testing.T) {
+	var mu sync.Mutex
+	var seen []map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		seen = append(seen, body)
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"workerId":     "wkr_x",
+			"runtimeToken": "jwt",
+		})
+	}))
+	defer srv.Close()
+
+	// Two boots of one machine, seen under two hostname forms.
+	for _, hostname := range []string{"box-local", "box-localdomain"} {
+		if _, err := Register(context.Background(), RegistrationOptions{
+			OrchestratorURL: srv.URL,
+			// #nosec G101 -- test fixture
+			RegistrationToken: "rsk_live_stable",
+			Hostname:          hostname,
+			Version:           "1.0.0",
+			MaxAgents:         1,
+			JWTPath:           filepath.Join(t.TempDir(), "daemon.jwt"),
+			ForceReregister:   true,
+		}); err != nil {
+			t.Fatalf("Register(%q): %v", hostname, err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 {
+		t.Fatalf("expected 2 registrations, got %d", len(seen))
+	}
+	first, _ := seen[0]["machineId"].(string)
+	second, _ := seen[1]["machineId"].(string)
+	if first == "" {
+		t.Fatal("registration must always report a machineId")
+	}
+	if first != second {
+		t.Errorf("machineId moved with the hostname: %q -> %q; one machine must be one host identity", first, second)
+	}
+	if first == "box-local" || first == "box-localdomain" {
+		t.Errorf("machineId is the hostname (%q); it must be the resolved machine identity", first)
+	}
+	// The hostname still rides the wire — as a label.
+	if got, _ := seen[0]["hostname"].(string); got != "box-local" {
+		t.Errorf("hostname label = %q, want %q", got, "box-local")
 	}
 }

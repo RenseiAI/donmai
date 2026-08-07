@@ -707,9 +707,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 			regCaps = []string{"local", "sandbox", "workarea"}
 		}
 		regOpts = RegistrationOptions{
-			OrchestratorURL:         cfg.Orchestrator.URL,
-			RegistrationToken:       token,
-			MachineID:               cfg.Machine.ID,
+			OrchestratorURL:   cfg.Orchestrator.URL,
+			RegistrationToken: token,
+			// MachineID is deliberately left empty so Register resolves the
+			// STABLE machine identity (MachineID()). cfg.Machine.ID is a
+			// hostname-derived label — keying host identity on it forked one
+			// machine into one host per hostname form it had ever resolved
+			// to. Operators who must pin identity set DONMAI_MACHINE_ID.
 			Hostname:                cfg.Machine.ID,
 			Version:                 d.EffectiveVersion(),
 			MaxAgents:               cfg.Capacity.MaxConcurrentSessions,
@@ -807,79 +811,37 @@ func (d *Daemon) Start(ctx context.Context) error {
 	})
 
 	if regResp != nil {
-		// Heartbeat + poll + the proactive token refresher share ONE refresh
-		// implementation so a refresh on any path re-mints the runtime JWT
-		// once and fans the fresh credentials out to every consumer.
+		// Heartbeat, poll and the proactive refresher share ONE refresher, so a
+		// refresh triggered anywhere re-mints the runtime credentials once and
+		// every lane comes out of it on the same worker identity.
 		//
-		// Token-refresh fix: route through RefreshRuntimeToken which probes a
-		// real refresh endpoint first (preserving the workerId) and only
-		// falls back to a full Register() — minting a fresh workerId — if
-		// the platform side has not yet shipped the refresh handler. The
-		// `[runtime-token]` log line attests which path was taken.
-		refreshCreds := func(rctx context.Context, reason string) (*RefreshTokenResult, error) {
-			d.mu.RLock()
-			currentWorker := d.workerID
-			d.mu.RUnlock()
-			result, err := RefreshRuntimeToken(rctx, regOpts, currentWorker, reason)
-			if err != nil {
-				return nil, err
-			}
-			d.mu.Lock()
-			d.workerID = result.WorkerID
-			d.jwt = result.RuntimeToken
-			d.mu.Unlock()
-			if d.sessionDetails != nil {
-				d.sessionDetails.UpdateRuntimeCredentials(result.WorkerID, result.RuntimeToken)
-			}
-			// Fan the fresh credentials out to both long-running loops. The
-			// loop that triggered the refresh re-applies its own copy too —
-			// harmlessly idempotent — but the OTHER loop now picks up the new
-			// token without burning a 401 round-trip (and a duplicate refresh
-			// + log cycle) of its own.
-			if d.heartbeat != nil {
-				d.heartbeat.SetCredentials(result.WorkerID, result.RuntimeToken)
-			}
-			if d.poller != nil {
-				d.poller.SetCredentials(result.WorkerID, result.RuntimeToken)
-			}
-			// Persist the refreshed credentials to the on-disk cache so other
-			// readers of daemon.jwt pick up the new token instead of the now-
-			// stale one. Heartbeat/poll use the in-memory swap above, but the
-			// per-session credential resolver and the runner's platform client
-			// read the token from disk — without this write they keep using the
-			// expired token (snapshot 307→HTML, status-update 401). Best-effort:
-			// a cache-write failure must never abort the refresh.
-			if regOpts.JWTPath != "" {
-				if serr := persistRefreshedToken(regOpts.JWTPath, result, regOpts.Now); serr != nil {
-					slog.Warn(
-						"[runtime-token] failed to persist refreshed token to cache",
-						"event", "refresh.cache-write-failed",
-						"workerId", result.WorkerID,
-						"jwtPath", regOpts.JWTPath,
-						"err", serr.Error(),
-					)
-				} else {
-					slog.Info(
-						"[runtime-token]",
-						"event", "refresh.cached",
-						"workerId", result.WorkerID,
-					)
+		// Fan-out is the refresher's job, not this call site's: a lane left on a
+		// superseded worker id is rejected on its next tick and re-registers,
+		// which retires the registration the refresh just settled on. See
+		// CredentialRefresher for what that cost when a call site had to
+		// remember it by hand.
+		credentials := NewCredentialRefresher(CredentialRefresherOptions{
+			Registration: regOpts,
+			WorkerID:     regResp.WorkerID,
+			RuntimeJWT:   regResp.RuntimeToken,
+			OnRefreshed: func(result *RefreshTokenResult) {
+				d.mu.Lock()
+				d.workerID = result.WorkerID
+				d.jwt = result.RuntimeToken
+				d.mu.Unlock()
+				if d.sessionDetails != nil {
+					d.sessionDetails.UpdateRuntimeCredentials(result.WorkerID, result.RuntimeToken)
 				}
-			}
-			return result, nil
-		}
-		reregister := func(rctx context.Context, reason string) (string, string, error) {
-			result, err := refreshCreds(rctx, reason)
-			if err != nil {
-				return "", "", err
-			}
-			return result.WorkerID, result.RuntimeToken, nil
-		}
+			},
+		})
+		refreshCreds := credentials.Refresh
+		reregister := credentials.OnReregister
 
-		// Heartbeat. OnReregister handles reactive runtime-token expiry (the
-		// backstop behind the proactive refresher below): on a 401, or the
-		// worker falling out of Redis after the 5-min heartbeat TTL (returned
-		// as 404), we re-mint via RefreshRuntimeToken.
+		// Heartbeat. OnReregister handles reactive credential rejection (the
+		// backstop behind the proactive refresher below): on a 401, or on a
+		// 404 saying the orchestrator does not recognise this worker, we
+		// re-mint via RefreshRuntimeToken — which re-presents the existing
+		// registration wherever it still exists rather than replacing it.
 		d.heartbeat = NewHeartbeatService(HeartbeatOptions{
 			WorkerID:        regResp.WorkerID,
 			Hostname:        cfg.Machine.ID,
@@ -918,6 +880,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// in d.hostStatus; callers read via Daemon.HostStatus().
 			OnHostStatus: d.setLastHostStatus,
 		})
+		credentials.Attach(d.heartbeat)
 		d.heartbeat.Start()
 
 		// Poll loop — the binding constraint that makes the daemon actually
@@ -953,6 +916,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 				// leaving in-flight sessions alone.
 				ClaimSuspended: d.claimSuspended,
 			})
+			credentials.Attach(d.poller)
 			d.poller.Start()
 
 			// Proactive token refresh — re-mint the runtime JWT shortly

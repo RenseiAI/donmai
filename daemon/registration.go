@@ -19,14 +19,28 @@ import (
 type RegistrationOptions struct {
 	OrchestratorURL   string
 	RegistrationToken string
-	MachineID         string
-	Hostname          string
-	Version           string
-	MaxAgents         int
-	Capabilities      []string
-	Region            string
-	JWTPath           string
-	ForceReregister   bool
+
+	// MachineID is the STABLE identity of the physical machine, and the only
+	// field an orchestrator should key host identity on. Leave it empty and
+	// Register fills it from MachineID() — the resolved, memoized machine
+	// identity (see machine_id.go). Set it explicitly only to override.
+	//
+	// Do NOT pass a hostname here. Hostnames are labels: they differ by
+	// lookup source, change with the network, and are user-editable, so a
+	// hostname-keyed host identity forks one machine into several.
+	MachineID string
+
+	// Hostname is the human-readable LABEL for this machine — what an
+	// operator reads in a host list. It is not an identity and callers must
+	// not treat it as one.
+	Hostname string
+
+	Version         string
+	MaxAgents       int
+	Capabilities    []string
+	Region          string
+	JWTPath         string
+	ForceReregister bool
 
 	// Provides is the substrate capability set the daemon advertises to the
 	// platform at registration time. Each entry corresponds to a
@@ -60,6 +74,13 @@ type RegistrationOptions struct {
 	HTTPClient *http.Client
 	// Now lets tests deterministically clock the cached-at timestamp.
 	Now func() time.Time
+
+	// MinReregisterInterval floors the gap between two FULL re-registrations
+	// (each of which mints a new worker identity) driven by
+	// RefreshRuntimeToken. Zero uses DefaultMinReregisterInterval; negative
+	// disables the floor. See DefaultMinReregisterInterval for why this is a
+	// safeguard rather than the fix.
+	MinReregisterInterval time.Duration
 }
 
 // RegisterRequest is the JSON body sent on POST /api/workers/register.
@@ -386,7 +407,13 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		HostInfo:                opts.HostInfo,
 	}
 	if req.MachineID == "" {
-		req.MachineID = opts.Hostname
+		// The stable machine identity, NOT the hostname. Falling back to the
+		// hostname is what let one machine present itself under every
+		// hostname form it had ever resolved to — "<name>.local",
+		// "<name>.localdomain", a router-supplied generic name — each of
+		// which became a separate host upstream. MachineID() resolves once
+		// per process and never varies with the network.
+		req.MachineID = MachineID()
 	}
 
 	var resp *RegisterResponse

@@ -637,19 +637,45 @@ func substituteEnvVars(value string) string {
 	})
 }
 
-// DeriveDefaultMachineID returns a hostname-derived identifier suitable for
-// machine.id when the user has not set one.
+// DeriveDefaultMachineID returns a hostname-derived LABEL for machine.id when
+// the operator has not set one.
+//
+// This is a display label, not an identity. Host identity is MachineID()
+// (machine_id.go) — see RegistrationOptions.MachineID for why a hostname must
+// never be keyed on.
+//
+// Even as a label it is normalized to ONE value per machine: the DNS domain is
+// stripped before sanitizing, so a machine whose hostname resolves as
+// "<name>.local" on one network and "<name>.localdomain" on another produces
+// the same label instead of two.
 func DeriveDefaultMachineID() string {
 	host, err := os.Hostname()
-	if err != nil || host == "" {
-		host = "local-machine"
+	if err != nil {
+		host = ""
 	}
-	host = strings.ToLower(host)
+	return normalizeMachineLabel(host)
+}
+
+var (
+	machineLabelCleanRE  = regexp.MustCompile(`[^a-z0-9-]`)
+	machineLabelRepeatRE = regexp.MustCompile(`-+`)
+)
+
+// normalizeMachineLabel turns a raw hostname into the canonical machine label.
+// Pure, so the normalization can be pinned by tests independently of whatever
+// the test host happens to be called.
+func normalizeMachineLabel(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	// Keep the leading label only. os.Hostname() returns whatever the
+	// resolver currently supplies, which on macOS alternates between the
+	// mDNS "<name>.local" form and a DHCP-supplied "<name>.localdomain"
+	// form for the same machine — two labels, one box.
+	if idx := strings.Index(host, "."); idx > 0 {
+		host = host[:idx]
+	}
 	// Collapse anything not in [a-z0-9-] to "-" then squash repeats.
-	cleanRE := regexp.MustCompile(`[^a-z0-9-]`)
-	host = cleanRE.ReplaceAllString(host, "-")
-	repeatRE := regexp.MustCompile(`-+`)
-	host = repeatRE.ReplaceAllString(host, "-")
+	host = machineLabelCleanRE.ReplaceAllString(host, "-")
+	host = machineLabelRepeatRE.ReplaceAllString(host, "-")
 	host = strings.Trim(host, "-")
 	if host == "" {
 		host = "local-machine"
