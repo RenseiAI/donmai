@@ -576,7 +576,7 @@ func Doctor(opts DoctorOptions) (DoctorResult, error) {
 			if plistExists {
 				return "Found at " + plistPath
 			}
-			return "Not found at " + plistPath + " — run 'donmai daemon install'"
+			return "Not found at " + plistPath + " — run 'donmai host install'"
 		}(),
 	})
 

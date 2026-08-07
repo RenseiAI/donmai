@@ -154,7 +154,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newArchCmd(cfg))
 	root.AddCommand(linearcmd.New(ds, binaryName(cfg)))
 	root.AddCommand(newGitHubCmd(ds, cfg))
-	root.AddCommand(newLogsCmd())
+	root.AddCommand(newLogsCmd(cfg))
 	root.AddCommand(newAdminCmd())
 	root.AddCommand(credentials.NewCmd())
 	root.AddCommand(newProviderCmd(ds))
