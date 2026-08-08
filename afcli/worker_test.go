@@ -27,6 +27,35 @@ func TestWorkerParentHelp(t *testing.T) {
 	}
 }
 
+// TestWorkerIsDeprecated is the D3 acceptance for `worker`: the parent
+// command carries a Cobra Deprecated marker naming `host` as the replacement
+// and a concrete removal version, never an unfalsifiable "next release"
+// promise — see legacyWorkerFleetRemovalVersion's comment (fleet.go) for why
+// that promise failed the previous alias generation.
+func TestWorkerIsDeprecated(t *testing.T) {
+	t.Parallel()
+
+	cmd := newWorkerCmd(func() afclient.DataSource { return afclient.NewMockClient() }, Config{BinaryName: "donmai"})
+
+	if cmd.Deprecated == "" {
+		t.Fatal("worker must carry a Deprecated string")
+	}
+	if !strings.Contains(cmd.Deprecated, legacyWorkerFleetRemovalVersion) {
+		t.Errorf("Deprecated %q must name the removal version %q", cmd.Deprecated, legacyWorkerFleetRemovalVersion)
+	}
+	if !strings.Contains(cmd.Deprecated, "host") {
+		t.Errorf("Deprecated %q must point at `host`", cmd.Deprecated)
+	}
+	for _, banned := range []string{"next release", "a future release", "soon"} {
+		if strings.Contains(strings.ToLower(cmd.Deprecated), banned) {
+			t.Errorf("Deprecated %q must not say %q — name a version", cmd.Deprecated, banned)
+		}
+	}
+	if !strings.HasPrefix(legacyWorkerFleetRemovalVersion, "v") {
+		t.Errorf("removal version %q must be a concrete vX.Y.Z tag", legacyWorkerFleetRemovalVersion)
+	}
+}
+
 // TestWorkerStartDefaults verifies the flag defaults on `worker start`
 // match the documented contract.
 func TestWorkerStartDefaults(t *testing.T) {

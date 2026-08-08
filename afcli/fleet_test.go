@@ -7,11 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/worker"
 )
 
-// TestFleetParentHelp verifies the fleet parent command exposes all four
+// TestFleetParentHelp verifies the fleet parent command exposes all three
 // subcommands via --help.
 func TestFleetParentHelp(t *testing.T) {
 	t.Parallel()
@@ -24,10 +26,72 @@ func TestFleetParentHelp(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	for _, want := range []string{"start", "stop", "status", "scale"} {
+	for _, want := range []string{"start", "stop", "status"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("fleet --help missing subcommand %q; got:\n%s", want, buf.String())
 		}
+	}
+}
+
+// TestFleetScaleRemoved is the D3 acceptance: `fleet scale` — a subcommand
+// that only ever returned an error, never a capability with a deprecation
+// cost — is deleted outright, not deprecated. `donmai fleet scale` must fail
+// cobra's own subcommand resolution rather than reach a stub RunE.
+func TestFleetScaleRemoved(t *testing.T) {
+	t.Parallel()
+
+	root := &cobra.Command{Use: "donmai"}
+	root.AddCommand(newFleetCmd(func() afclient.DataSource { return afclient.NewMockClient() }, Config{}))
+
+	// cobra's Find does not error on an unmatched trailing arg — it just
+	// stops descending and hands the extra arg back as a positional to the
+	// deepest command it DID match. So the meaningful assertion is which
+	// command Find stopped at, not whether it errored.
+	found, _, err := root.Find([]string{"fleet", "scale"})
+	if err != nil {
+		t.Fatalf("Find(fleet scale): %v", err)
+	}
+	if found.Name() == "scale" {
+		t.Fatal("`fleet scale` still resolves to a leaf command — it must be deleted, not merely undocumented")
+	}
+	if found.Name() != "fleet" {
+		t.Fatalf("Find(fleet scale) resolved to %q, want it to stop at \"fleet\"", found.Name())
+	}
+
+	cmd := newFleetCmd(func() afclient.DataSource { return afclient.NewMockClient() }, Config{})
+	for _, c := range cmd.Commands() {
+		if c.Name() == "scale" {
+			t.Fatalf("fleet still registers a %q child command", c.Name())
+		}
+	}
+}
+
+// TestFleetIsDeprecated is the D3 acceptance for `fleet`: the parent command
+// carries a Cobra Deprecated marker naming `host` as the replacement and a
+// concrete removal version, never an unfalsifiable "next release" promise —
+// see legacyWorkerFleetRemovalVersion's comment for why that promise failed
+// the previous alias generation.
+func TestFleetIsDeprecated(t *testing.T) {
+	t.Parallel()
+
+	cmd := newFleetCmd(func() afclient.DataSource { return afclient.NewMockClient() }, Config{BinaryName: "donmai"})
+
+	if cmd.Deprecated == "" {
+		t.Fatal("fleet must carry a Deprecated string")
+	}
+	if !strings.Contains(cmd.Deprecated, legacyWorkerFleetRemovalVersion) {
+		t.Errorf("Deprecated %q must name the removal version %q", cmd.Deprecated, legacyWorkerFleetRemovalVersion)
+	}
+	if !strings.Contains(cmd.Deprecated, "host") {
+		t.Errorf("Deprecated %q must point at `host`", cmd.Deprecated)
+	}
+	for _, banned := range []string{"next release", "a future release", "soon"} {
+		if strings.Contains(strings.ToLower(cmd.Deprecated), banned) {
+			t.Errorf("Deprecated %q must not say %q — name a version", cmd.Deprecated, banned)
+		}
+	}
+	if !strings.HasPrefix(legacyWorkerFleetRemovalVersion, "v") {
+		t.Errorf("removal version %q must be a concrete vX.Y.Z tag", legacyWorkerFleetRemovalVersion)
 	}
 }
 
@@ -172,43 +236,5 @@ func TestFleetStatusWithPIDs(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("status output missing %q; got:\n%s", want, out)
 		}
-	}
-}
-
-// TestFleetScaleNotSupported verifies scale returns the documented stub
-// error rather than silently succeeding.
-func TestFleetScaleNotSupported(t *testing.T) {
-	t.Parallel()
-
-	cmd := newFleetScaleCmd()
-	buf := &bytes.Buffer{}
-	cmd.SetOut(buf)
-	cmd.SetErr(buf)
-	cmd.SetArgs([]string{"--count", "3"})
-	err := cmd.Execute()
-	if err == nil {
-		t.Fatal("expected error from unsupported scale")
-	}
-	if !strings.Contains(err.Error(), "not yet supported") {
-		t.Errorf("error missing expected phrase: %v", err)
-	}
-}
-
-// TestFleetScaleInvalidCount verifies --count <= 0 errors before the
-// stub message.
-func TestFleetScaleInvalidCount(t *testing.T) {
-	t.Parallel()
-
-	cmd := newFleetScaleCmd()
-	buf := &bytes.Buffer{}
-	cmd.SetOut(buf)
-	cmd.SetErr(buf)
-	cmd.SetArgs([]string{"--count", "0"})
-	err := cmd.Execute()
-	if err == nil {
-		t.Fatal("expected error from --count=0")
-	}
-	if !strings.Contains(err.Error(), "count must be > 0") {
-		t.Errorf("error missing expected phrase: %v", err)
 	}
 }

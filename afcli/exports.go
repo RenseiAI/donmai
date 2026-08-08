@@ -1,6 +1,6 @@
 // Package afcli exports.go — public factory functions for the `host`
-// parent and for the four daemon-targeted command trees it contains
-// (provider, kit, workarea, routing).
+// parent and for the five daemon-targeted command trees it contains
+// (provider, kit, workarea, routing, watch).
 //
 // Most afcli factories stay unexported and reach root via
 // RegisterCommands. These need public factories so a composing
@@ -13,13 +13,15 @@
 // (e.g. both at top-level via RegisterCommands and nested under
 // `host`) without sharing mutable command state.
 //
-// All four trees target the local daemon's HTTP control API per
+// All five trees target the local daemon's HTTP control API per
 // ADR-2026-05-07-daemon-http-control-api.md. They never hit the SaaS
 // platform and never attach an Authorization header (D2 —
-// localhost-only). The ds argument is accepted for signature
-// consistency with the rest of afcli but is unused — daemon-targeted
-// commands resolve their client via DONMAI_DAEMON_URL or the
-// 127.0.0.1:7734 default.
+// localhost-only). Where a factory takes a ds argument it is accepted
+// for signature consistency with the rest of afcli but is unused —
+// daemon-targeted commands resolve their client via DONMAI_DAEMON_URL
+// or the 127.0.0.1:7734 default. NewHostWatchCmd takes no ds argument
+// at all: the dashboard's data source is the daemon session index, not
+// afclient.DataSource.
 package afcli
 
 import (
@@ -74,4 +76,19 @@ func NewWorkareaCmd(ds func() afclient.DataSource) *cobra.Command {
 // per-subcommand documentation.
 func NewRoutingCmd(ds func() afclient.DataSource) *cobra.Command {
 	return newRoutingCmd(ds)
+}
+
+// NewHostWatchCmd returns a fresh `watch` Cobra command tree — the local
+// live-session dashboard — targeting the local daemon. See host_watch.go
+// for the dashboard's data sourcing (a pure local reader: daemon session
+// index + on-disk .agent/events.jsonl, no control-plane round trip).
+//
+// A composing downstream binary constructs this to graft the dashboard
+// under its own parent (e.g. `rensei host watch`) instead of relocating
+// the alias-registered `fleet-watch` command off root — relocating would
+// drag along that command's Hidden and Deprecated fields, which retire
+// the OSS `fleet-watch` alias and would misattribute a deprecation notice
+// to the downstream binary's own first-class command.
+func NewHostWatchCmd() *cobra.Command {
+	return newHostWatchCmd()
 }
