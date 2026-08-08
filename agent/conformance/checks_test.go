@@ -35,7 +35,7 @@ func mustResult(t *testing.T, r *Report, id CheckID) CheckResult {
 func TestRunConformantHarnessEarnsTiers(t *testing.T) {
 	t.Parallel()
 	subject := conformantSubject(fakeConfig{
-		notice:        agent.NoticeDeliveryHook,
+		notice:        agent.NoticeDeliveryInBoxLoop,
 		supportInject: true,
 		supportResume: true,
 		inject:        injectDeliver,
@@ -125,7 +125,7 @@ func TestRunRejectsNonConformantHarness(t *testing.T) {
 		},
 		{
 			name:       "an injected notice is accepted and dropped",
-			cfg:        fakeConfig{notice: agent.NoticeDeliveryHook, supportInject: true, inject: injectDrop},
+			cfg:        fakeConfig{notice: agent.NoticeDeliveryInBoxLoop, supportInject: true, inject: injectDrop},
 			wantFail:   IDNoticeLiveDelivery,
 			wantReason: "never appeared",
 			deniedTier: TierLiveNotice,
@@ -185,7 +185,7 @@ func TestDeclaredNoticeDeliveryEarnsNothingWithoutDelivery(t *testing.T) {
 	}{
 		{
 			name:       "declared, driven, delivered: the tier is earned",
-			cfg:        fakeConfig{notice: agent.NoticeDeliveryHook, supportInject: true, inject: injectDeliver},
+			cfg:        fakeConfig{notice: agent.NoticeDeliveryInBoxLoop, supportInject: true, inject: injectDeliver},
 			wantStatus: StatusPass,
 		},
 		{
@@ -198,7 +198,7 @@ func TestDeclaredNoticeDeliveryEarnsNothingWithoutDelivery(t *testing.T) {
 			name:       "declared but this build does not drive it: unproven, never a pass",
 			cfg:        fakeConfig{notice: agent.NoticeDeliveryMCPRPC, supportInject: false},
 			wantStatus: StatusNotApplicable,
-			wantReason: "does not drive it",
+			wantReason: "does not drive the Handle.Inject rail",
 		},
 		{
 			name:       "declared none: an honest answer with nothing to certify",
@@ -211,6 +211,15 @@ func TestDeclaredNoticeDeliveryEarnsNothingWithoutDelivery(t *testing.T) {
 			cfg:        fakeConfig{notice: agent.NoticeDeliveryResumeInject},
 			wantStatus: StatusNotApplicable,
 			wantReason: "does not deliver into a running process",
+		},
+		{
+			// The inversion, as a table row: an adapter that declares the hook
+			// channel and drives a WORKING Handle.Inject still earns nothing,
+			// because Inject is not what carries a hook.
+			name:       "declared hook with a working Inject rail: still unproven",
+			cfg:        fakeConfig{notice: agent.NoticeDeliveryHook, supportInject: true, inject: injectDeliver},
+			wantStatus: StatusNotApplicable,
+			wantReason: "nothing in this build pushes over mechanism \"hook\"",
 		},
 	}
 	for _, tc := range cases {
@@ -242,7 +251,7 @@ func TestDeclaredNoticeDeliveryEarnsNothingWithoutDelivery(t *testing.T) {
 func TestSubjectDeclaredSkipNeverEarnsATier(t *testing.T) {
 	t.Parallel()
 	subject := conformantSubject(fakeConfig{
-		notice: agent.NoticeDeliveryHook, supportInject: true, inject: injectDrop,
+		notice: agent.NoticeDeliveryInBoxLoop, supportInject: true, inject: injectDrop,
 	})
 	subject.NotApplicable = map[CheckID]string{
 		IDNoticeLiveDelivery: "our harness binary is not installable on this runner",

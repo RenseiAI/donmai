@@ -45,7 +45,7 @@ func headlessProfiles() ([]agent.PromptDeliveryProfile, []agent.ToolLifecyclePro
 }
 
 func adaptableConfig() fakeConfig {
-	return fakeConfig{notice: agent.NoticeDeliveryHook, supportInject: true, inject: injectDeliver}
+	return fakeConfig{notice: agent.NoticeDeliveryInBoxLoop, supportInject: true, inject: injectDeliver}
 }
 
 // TestRequiredMaterializationChannelsMatchAgentPackage pins this package's

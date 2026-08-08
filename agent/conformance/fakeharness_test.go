@@ -29,7 +29,23 @@ const (
 	injectDrop
 	// injectUnsupported refuses the notice the manifest declared.
 	injectUnsupported
+	// injectSlowUnsupported refuses too, but only AFTER the session has
+	// finished draining. It is the shape the probe used to lose: the
+	// injecting goroutine's error was read with a non-blocking select the
+	// instant the drain returned, so a late answer was discarded.
+	injectSlowUnsupported
+	// injectHang never answers at all.
+	injectHang
 )
+
+// injectSlowDelay outlasts fakeConfig.noticeGrace, so a fake using
+// injectSlowUnsupported reliably returns after the drain has ended.
+const injectSlowDelay = 900 * time.Millisecond
+
+// injectHangDelay is effectively forever for a test: long enough that the
+// suite's own grace expires first, short enough that the goroutine is not
+// parked for the life of the binary.
+const injectHangDelay = 30 * time.Second
 
 // fakeConfig configures a fake adapter. The zero value is conformant.
 type fakeConfig struct {
@@ -66,8 +82,12 @@ type fakeConfig struct {
 }
 
 func newFake(cfg fakeConfig) *fakeHarness {
+	// The default is in-box-loop, not hook: in-box-loop is carried by
+	// Handle.Inject, which is the rail these fakes implement. Defaulting to a
+	// channel nothing drives would make every unrelated fake exercise the
+	// undriven path instead of the one under test.
 	if cfg.notice == "" && !cfg.undeclaredNotice {
-		cfg.notice = agent.NoticeDeliveryHook
+		cfg.notice = agent.NoticeDeliveryInBoxLoop
 	}
 	if cfg.noticeGrace == 0 {
 		cfg.noticeGrace = 500 * time.Millisecond
@@ -213,6 +233,16 @@ func (h *fakeHandle) Inject(_ context.Context, text string) error {
 		default:
 		}
 		return agent.ErrUnsupported
+	case injectSlowUnsupported:
+		time.Sleep(injectSlowDelay)
+		select {
+		case h.injectSeen <- struct{}{}:
+		default:
+		}
+		return agent.ErrUnsupported
+	case injectHang:
+		time.Sleep(injectHangDelay)
+		return nil
 	}
 	return nil
 }

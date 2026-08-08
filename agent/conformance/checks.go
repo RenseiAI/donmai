@@ -8,27 +8,137 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// liveInjectMechanisms are the declared NoticeDelivery mechanisms that promise
-// delivery INTO a session that is still running, through Handle.Inject.
+// noticeRail names the SEAM a declared notice channel is carried over, and
+// therefore which rail this suite has to drive to prove delivery over THAT
+// channel.
 //
-// The two declared mechanisms deliberately absent are not lesser: they simply
-// do not deliver into a live process. NoticeDeliveryResumeInject requires the
-// running session to have finished (a second writer otherwise), and
-// NoticeDeliveryPTYNotice writes at a terminal with no agent behind it. This
-// suite has nothing to certify for either, and says so rather than failing
-// them for a promise they never made.
-var liveInjectMechanisms = map[agent.NoticeDelivery]struct{}{
-	agent.NoticeDeliveryHook:        {},
-	agent.NoticeDeliveryMCPRPC:      {},
-	agent.NoticeDeliveryHTTPSession: {},
-	agent.NoticeDeliveryACP:         {},
-	agent.NoticeDeliveryRPCSteer:    {},
-	agent.NoticeDeliveryInBoxLoop:   {},
+// # Why the rail, and not a single injection flag
+//
+// Capabilities().SupportsMessageInjection is a fact about ONE rail:
+// Handle.Inject. It is evidence about a declared channel only when that
+// channel is the one Inject carries. Reading it as a general driven-ness proxy
+// is how this suite came to certify live delivery over a channel nothing in
+// this repo drives: a harness can declare `hook`, implement Handle.Inject over
+// an entirely different mechanism (a fresh `--resume` invocation, which the
+// axis calls resume-inject precisely because it is NOT delivery into the live
+// process), and collect the live-notice tier for the channel it never wired.
+//
+// So driven-ness is asked per channel. The notion is the runner's — see
+// noticeChannelDrivenByRunner in runner/interactive_inject.go, which answers
+// "does THIS BUILD push over THIS channel" and deliberately keeps that apart
+// from what the harness exposes.
+type noticeRail string
+
+const (
+	// railNotLive is a legitimate declaration that does not deliver into a
+	// running process at all: NoticeDeliveryNone (the durable mailbox is the
+	// path) and NoticeDeliveryResumeInject (real delivery, but the running
+	// session must be finished or the resumed one is a second writer). There
+	// is no live channel here to certify and none is failed for it.
+	railNotLive noticeRail = "not-live"
+
+	// railInject is an application-level channel the host reaches through
+	// Handle.Inject. For these — and only these — SupportsMessageInjection is
+	// evidence about the declared channel, because Inject is what carries it.
+	railInject noticeRail = "handle-inject"
+
+	// railPTYNotice is a write at the terminal, reached through
+	// agent.InteractiveCapable → agent.InteractiveNotifier.TryWriteNotice.
+	// This build drives it: runner/interactive_inject.go is that
+	// implementation, and it is the ONLY notice channel this repo drives.
+	railPTYNotice noticeRail = "pty-notice"
+
+	// railUndriven is a channel whose injection point is not on agent.Handle
+	// at all, so nothing here can push over it and no probe can observe one.
+	// NoticeDeliveryHook is the case: the HARNESS calls out at a lifecycle
+	// point and the hook's response is the injection point, which means a
+	// host-side hook responder — a thing this build does not have (see
+	// noticeChannelDrivenByRunner's comment, and the claude manifest's own
+	// "Nothing in this repo drives the hook yet"). Reported unproven, never
+	// failed: the manifest is honest, the build is the gap.
+	//
+	// This placement is a statement about the BUILD, not about the mechanism,
+	// and it is the one entry an outside author may find too strict: a host
+	// that grows a hook responder genuinely drives the channel, and this table
+	// would still call it unproven. Moving the entry is that lane's job, in
+	// the same change that lands the responder — the same coupling
+	// noticeChannelDrivenByRunner already imposes, so a declaration and the
+	// capability behind it never drift apart. Until then, unproven is the
+	// honest verdict and a borrowed pass from another rail is not.
+	railUndriven noticeRail = "undriven"
+)
+
+// noticeRails places every declarable mechanism on its rail.
+//
+// A mechanism missing from this table is a FAILURE, not a default — see
+// checkNoticeBuildDrives. TestNoticeRailIsAssignedForEveryDeclaredMechanism
+// keeps the table and agent's declarable set in step.
+var noticeRails = map[agent.NoticeDelivery]noticeRail{
+	agent.NoticeDeliveryNone:         railNotLive,
+	agent.NoticeDeliveryResumeInject: railNotLive,
+
+	agent.NoticeDeliveryMCPRPC:      railInject,
+	agent.NoticeDeliveryHTTPSession: railInject,
+	agent.NoticeDeliveryACP:         railInject,
+	agent.NoticeDeliveryRPCSteer:    railInject,
+	agent.NoticeDeliveryInBoxLoop:   railInject,
+
+	agent.NoticeDeliveryPTYNotice: railPTYNotice,
+
+	agent.NoticeDeliveryHook: railUndriven,
 }
+
+// Timings for the two live notice rails.
+const (
+	// injectResultGrace bounds how long the suite waits for Handle.Inject to
+	// return AFTER the session has drained and been stopped twice. Inject was
+	// called at the InitEvent, so by then it has had the whole session to
+	// answer; anything still outstanding is a stalled call, and the report
+	// says so rather than dropping the outcome on the floor.
+	injectResultGrace = 2 * time.Second
+
+	// ptyNoticeRetry / ptyNoticeMaxAttempts mirror the runner's refusal
+	// handling: TryWriteNotice answering (false, nil) means "not now, hold and
+	// retry", never "cannot". A probe that gave up on the first refusal would
+	// fail honest surfaces, and one that never gave up would hang.
+	ptyNoticeRetry       = 100 * time.Millisecond
+	ptyNoticeMaxAttempts = 20
+
+	// ptyEchoPoll / ptyEchoWait bound the wait for the session's own output
+	// to appear on the terminal after the notice was written.
+	ptyEchoPoll = 100 * time.Millisecond
+	ptyEchoWait = 10 * time.Second
+)
+
+// noticeSubmit is the byte that makes a terminal notice arrive as a SUBMITTED
+// turn rather than text parked in a line editor. CR (0x0D) is what a terminal
+// sends for Return; LF is the Ctrl-J chord, and a raw-mode reader maps the two
+// to different keys. The runner's interactive supervisor writes CR for exactly
+// this reason (interactiveNoticeSubmit in runner/interactive_inject.go) and a
+// probe that framed it differently would not be exercising the same rail.
+const noticeSubmit = '\r'
+
+// ptyEchoOccurrences is how many times the nonce must appear on the terminal
+// before the PTY rail counts as DELIVERED.
+//
+// Writing the notice puts the nonce on screen once all by itself: a terminal
+// at a prompt echoes what is typed at it, so one occurrence proves only that
+// bytes left this process. The second occurrence is the session's own output —
+// the thing that proves it ACTED on the line rather than merely displaying it.
+// Requiring two is the same distinction the Handle.Inject rail draws by
+// demanding the nonce back out of the event stream: "we wrote" is not
+// "it arrived".
+//
+// It is conservative in one direction on purpose. A session running with
+// terminal echo off produces one occurrence for a delivery that really
+// happened, and this check calls that unproven rather than passing on it. The
+// failure names the case so the reader is not left guessing.
+const ptyEchoOccurrences = 2
 
 // requiredMaterializationChannels mirrors the closed channel set
 // agent.ValidatePreparedHarness requires of any adaptation authority. The
@@ -137,17 +247,23 @@ type run struct {
 
 	base    *probe
 	notice  *noticeProbe
+	pty     *ptyProbe
 	resumed *probe
 	receipt *receiptProbe
 }
 
 // probe is one spawn-and-drain observation.
 type probe struct {
-	events    []agent.Event
-	closed    bool // the events channel was observed closed
-	spawnErr  error
-	stopErrs  []error
-	sessionID string
+	events []agent.Event
+	closed bool // the events channel was observed closed
+	// initObserved records that the drain saw an InitEvent, and therefore that
+	// an onInit callback was launched. It is recorded by the drain rather than
+	// inferred from whether the callback answered, so a callback that answers
+	// late is never mistaken for one that never ran.
+	initObserved bool
+	spawnErr     error
+	stopErrs     []error
+	sessionID    string
 }
 
 // spawnFailure renders the shared reason every event-contract check reports
@@ -184,7 +300,6 @@ func (r *run) spawn(ctx context.Context, spec agent.Spec, onInit func(context.Co
 		return &probe{spawnErr: fmt.Errorf("Spawn returned a nil Handle and a nil error")}
 	}
 	p := &probe{}
-	fired := false
 drain:
 	for {
 		select {
@@ -194,9 +309,11 @@ drain:
 				break drain
 			}
 			p.events = append(p.events, ev)
-			if _, isInit := ev.(agent.InitEvent); isInit && onInit != nil && !fired {
-				fired = true
-				go onInit(pctx, handle)
+			if _, isInit := ev.(agent.InitEvent); isInit && !p.initObserved {
+				p.initObserved = true
+				if onInit != nil {
+					go onInit(pctx, handle)
+				}
 			}
 		case <-pctx.Done():
 			break drain
@@ -282,40 +399,96 @@ func checkNoticeMechanism(_ context.Context, r *run) (Status, string) {
 	return StatusPass, ""
 }
 
+// railFor resolves the declared mechanism onto its rail, failing closed. A
+// mechanism the agent package declares but this table has not placed is a gap
+// in the SUITE, and the suite says so rather than falling through to a verdict
+// it has no basis for.
+func railFor(nd agent.NoticeDelivery) (noticeRail, Status, string) {
+	if !nd.Declared() {
+		return "", StatusFail, "the manifest declares no known notice-delivery mechanism"
+	}
+	rail, ok := noticeRails[nd]
+	if !ok {
+		return "", StatusFail, fmt.Sprintf(
+			"mechanism %q is declarable but this suite has placed it on no delivery rail, so it has no way to judge whether the channel is driven; the rail table (noticeRails) has to name it before any verdict here means anything",
+			string(nd))
+	}
+	return rail, StatusPass, ""
+}
+
+// checkNoticeBuildDrives asks the per-channel question: does THIS BUILD push
+// over the channel the manifest declares?
+//
+// The answer differs by rail, and that is the whole point. For a channel
+// Handle.Inject carries, Capabilities().SupportsMessageInjection is the right
+// evidence. For the terminal channel the runner drives it directly. For a
+// channel whose injection point is not on agent.Handle at all, nothing here
+// can push over it and the honest answer is "unproven" — never a pass borrowed
+// from a different channel's rail.
 func checkNoticeBuildDrives(_ context.Context, r *run) (Status, string) {
 	nd := r.manifest.Caps.NoticeDelivery
-	if !nd.Declared() {
-		return StatusFail, "the manifest declares no known notice-delivery mechanism"
+	rail, status, reason := railFor(nd)
+	if status != StatusPass {
+		return status, reason
 	}
-	if _, live := liveInjectMechanisms[nd]; !live {
+	switch rail {
+	case railNotLive:
 		return StatusNotApplicable, fmt.Sprintf(
 			"mechanism %q does not deliver into a running process (it is a legitimate declaration, and there is no live channel here to certify)",
 			string(nd))
-	}
-	// A declaration says the HARNESS exposes the channel; SupportsMessageInjection
-	// says THIS BUILD drives it. They are separate facts on purpose, and this
-	// is where the pair is judged: a manifest naming a live mechanism that the
-	// build cannot drive leaves an upstream caller holding an unreachable
-	// session, so it earns nothing.
-	if !r.subject.Provider.Capabilities().SupportsMessageInjection {
+
+	case railUndriven:
 		return StatusNotApplicable, fmt.Sprintf(
-			"the manifest declares live mechanism %q but this build does not drive it (Capabilities().SupportsMessageInjection is false), so live delivery is unproven and the live-notice tier is not earned",
-			string(nd))
+			"the manifest declares live mechanism %q, whose injection point is the harness calling out to a host-side responder — not anything on agent.Handle. This build has no such responder, so it does not drive %q and live delivery over it is unproven. Capabilities().SupportsMessageInjection is NOT evidence here: it is a fact about the Handle.Inject rail, which for this channel carries some other mechanism entirely",
+			string(nd), string(nd))
+
+	case railPTYNotice:
+		// This build drives the terminal channel — runner/interactive_inject.go
+		// is that implementation. Whether the subject's own session accepts one
+		// is a separate question, and notice/live-delivery answers it.
+		return StatusPass, ""
+
+	case railInject:
+		if !r.subject.Provider.Capabilities().SupportsMessageInjection {
+			return StatusNotApplicable, fmt.Sprintf(
+				"the manifest declares live mechanism %q, which is carried by Handle.Inject, but this build does not drive that rail (Capabilities().SupportsMessageInjection is false), so live delivery is unproven and the live-notice tier is not earned",
+				string(nd))
+		}
+		return StatusPass, ""
+
+	default:
+		return StatusFail, fmt.Sprintf("mechanism %q resolved to unknown rail %q", string(nd), string(rail))
 	}
-	return StatusPass, ""
 }
 
 func checkNoticeLiveDelivery(ctx context.Context, r *run) (Status, string) {
 	nd := r.manifest.Caps.NoticeDelivery
-	if !nd.Declared() {
-		return StatusFail, "the manifest declares no known notice-delivery mechanism"
+	rail, status, reason := railFor(nd)
+	if status != StatusPass {
+		return status, reason
 	}
-	if _, live := liveInjectMechanisms[nd]; !live {
+	switch rail {
+	case railNotLive:
 		return StatusNotApplicable, fmt.Sprintf("mechanism %q does not deliver into a running process", string(nd))
+	case railUndriven:
+		return StatusNotApplicable, fmt.Sprintf(
+			"nothing in this build pushes over mechanism %q, so there is no delivery to observe; a probe that injected on some other rail would be certifying a channel it never touched",
+			string(nd))
+	case railPTYNotice:
+		return checkPTYNoticeDelivery(ctx, r, nd)
+	case railInject:
+		return checkInjectNoticeDelivery(ctx, r, nd)
+	default:
+		return StatusFail, fmt.Sprintf("mechanism %q resolved to unknown rail %q", string(nd), string(rail))
 	}
+}
+
+// checkInjectNoticeDelivery certifies the Handle.Inject rail: a nonce injected
+// mid-session has to come back out of the event stream.
+func checkInjectNoticeDelivery(ctx context.Context, r *run, nd agent.NoticeDelivery) (Status, string) {
 	if !r.subject.Provider.Capabilities().SupportsMessageInjection {
 		return StatusNotApplicable, fmt.Sprintf(
-			"the manifest declares live mechanism %q but this build does not drive it (Capabilities().SupportsMessageInjection is false)",
+			"the manifest declares live mechanism %q but this build does not drive the Handle.Inject rail that carries it (Capabilities().SupportsMessageInjection is false)",
 			string(nd))
 	}
 
@@ -323,15 +496,20 @@ func checkNoticeLiveDelivery(ctx context.Context, r *run) (Status, string) {
 	if reason, failed := np.probe.spawnFailure(); failed {
 		return StatusFail, reason
 	}
+	if !np.probe.initObserved {
+		return StatusFail, fmt.Sprintf(
+			"the session never emitted an InitEvent, so there was no live session to inject into (%d events drained)",
+			len(np.probe.events))
+	}
+	if np.injectStalled {
+		return StatusFail, fmt.Sprintf(
+			"Handle.Inject had not returned %s after the session drained and was stopped; a caller that queued this notice can never learn whether it was accepted, which is the acked-and-never-delivered shape this tier exists to catch",
+			injectResultGrace)
+	}
 	if np.injectErr != nil {
 		return StatusFail, fmt.Sprintf(
 			"the manifest declares live mechanism %q but Handle.Inject returned %v",
 			string(nd), np.injectErr)
-	}
-	if !np.injectCalled {
-		return StatusFail, fmt.Sprintf(
-			"the session never emitted an InitEvent, so there was no live session to inject into (%d events drained)",
-			len(np.probe.events))
 	}
 	if !containsText(np.probe.events, np.nonce) {
 		return StatusFail, fmt.Sprintf(
@@ -341,12 +519,54 @@ func checkNoticeLiveDelivery(ctx context.Context, r *run) (Status, string) {
 	return StatusPass, ""
 }
 
+// checkPTYNoticeDelivery certifies the terminal rail: the notice goes in
+// through agent.InteractiveNotifier.TryWriteNotice — the same seam the runner
+// uses, and one the host refuses outright for any harness that has not
+// declared pty-notice — and the session's own output has to come back on the
+// screen.
+func checkPTYNoticeDelivery(ctx context.Context, r *run, nd agent.NoticeDelivery) (Status, string) {
+	pp := r.ptyProbe(ctx)
+	if pp.spawnErr != nil {
+		return StatusFail, "spawn failed: " + pp.spawnErr.Error()
+	}
+	if pp.surfaceReason != "" {
+		return StatusFail, pp.surfaceReason
+	}
+	if pp.writeErr != nil {
+		return StatusFail, fmt.Sprintf(
+			"the manifest declares %q but TryWriteNotice failed: %v", string(nd), pp.writeErr)
+	}
+	if !pp.written {
+		if pp.writeAborted {
+			return StatusFail, fmt.Sprintf(
+				"the probe budget (%s) ran out while the live surface was still refusing the notice, after %d attempts over %s; nothing was delivered and a longer Subject.ProbeTimeout is the only thing that could change that verdict",
+				r.subject.timeout(), pp.attempts, pp.writeWaited.Round(time.Millisecond))
+		}
+		return StatusFail, fmt.Sprintf(
+			"the live surface refused the notice on all %d attempts over %s and never took it; a refusal is the surface saying \"not now\", and a session that says that forever has no live channel however the manifest reads",
+			pp.attempts, pp.writeWaited.Round(time.Millisecond))
+	}
+	if pp.occurrences >= ptyEchoOccurrences {
+		return StatusPass, ""
+	}
+	if pp.occurrences == 0 {
+		return StatusFail, fmt.Sprintf(
+			"TryWriteNotice reported the notice written but nonce %q never reached the terminal at all in %s",
+			pp.nonce, pp.echoWaited.Round(time.Millisecond))
+	}
+	return StatusFail, fmt.Sprintf(
+		"nonce %q appeared on the terminal exactly once in %s — that occurrence is the line this suite typed being echoed back, not the session acting on it, so nothing was delivered. (A session running with terminal echo OFF would look the same; this check calls that unproven rather than passing on one occurrence.)",
+		pp.nonce, pp.echoWaited.Round(time.Millisecond))
+}
+
 // noticeProbe is a spawn whose InitEvent triggers a mid-session injection.
 type noticeProbe struct {
-	probe        *probe
-	nonce        string
-	injectErr    error
-	injectCalled bool
+	probe     *probe
+	nonce     string
+	injectErr error
+	// injectStalled records that Handle.Inject had still not returned
+	// injectResultGrace after the drain ended.
+	injectStalled bool
 }
 
 func (r *run) noticeProbe(ctx context.Context) *noticeProbe {
@@ -354,8 +574,8 @@ func (r *run) noticeProbe(ctx context.Context) *noticeProbe {
 		return r.notice
 	}
 	np := &noticeProbe{nonce: newNonce()}
-	// Buffered so the injecting goroutine never blocks on a drain that has
-	// already finished, and so nothing is written after this function returns.
+	// Buffered so the injecting goroutine never blocks, whatever this function
+	// does with the result.
 	results := make(chan error, 1)
 	spec := r.subject.BaseSpec
 	spec.Prompt = r.subject.EchoPrompt(newNonce())
@@ -364,14 +584,213 @@ func (r *run) noticeProbe(ctx context.Context) *noticeProbe {
 	np.probe = r.spawn(ctx, spec, func(ictx context.Context, h agent.Handle) {
 		results <- h.Inject(ictx, r.subject.EchoPrompt(np.nonce))
 	})
-	select {
-	case err := <-results:
-		np.injectCalled = true
-		np.injectErr = err
-	default:
+	// Whether Inject was CALLED is a fact the drain recorded (initObserved);
+	// whether it ANSWERED is this wait. Reading the result with a non-blocking
+	// select instead — the shape this probe shipped with — silently discards
+	// the error of any Inject that outlives the drain, and then misreports the
+	// failure as a session that never announced itself.
+	if np.probe.initObserved {
+		select {
+		case err := <-results:
+			np.injectErr = err
+		case <-time.After(injectResultGrace):
+			np.injectStalled = true
+		}
 	}
 	r.notice = np
 	return np
+}
+
+// ptyProbe is one terminal-rail observation: spawn interactively, hand the
+// live surface a notice, and watch the screen for the session's answer.
+type ptyProbe struct {
+	nonce    string
+	spawnErr error
+	// surfaceReason is set when the spawned session exposes no surface that
+	// could take a notice. It is a defect of the adapter, not of the suite:
+	// the manifest declared a terminal channel and the session has no terminal
+	// to write into.
+	surfaceReason string
+	writeErr      error
+	written       bool
+	// writeAborted marks that the probe budget expired mid-retry rather than
+	// the surface exhausting its attempts. The two look identical in the
+	// written flag and read very differently in a report.
+	writeAborted bool
+	attempts     int
+	writeWaited  time.Duration
+	occurrences  int
+	echoWaited   time.Duration
+}
+
+func (r *run) ptyProbe(ctx context.Context) *ptyProbe {
+	if r.pty != nil {
+		return r.pty
+	}
+	pp := &ptyProbe{nonce: newNonce()}
+	r.pty = pp
+
+	pctx, cancel := context.WithTimeout(ctx, r.subject.timeout())
+	defer cancel()
+
+	spec := r.subject.BaseSpec
+	spec.Prompt = r.subject.EchoPrompt(newNonce())
+	spec.RequiresLiveNotice = true
+
+	handle, err := r.subject.Provider.Spawn(pctx, spec)
+	if err != nil {
+		pp.spawnErr = err
+		return pp
+	}
+	if handle == nil {
+		pp.spawnErr = fmt.Errorf("Spawn returned a nil Handle and a nil error")
+		return pp
+	}
+	defer func() {
+		// An interactive session has no terminal event of its own to wait for
+		// — the child sits at a prompt until something stops it — so the probe
+		// owns the teardown.
+		sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), stopTimeout)
+		defer scancel()
+		_ = handle.Stop(sctx)
+	}()
+
+	sess, notifier, reason := noticeSurface(handle)
+	if reason != "" {
+		pp.surfaceReason = reason
+		return pp
+	}
+
+	notice := formatNotice(r.subject.EchoPrompt(pp.nonce))
+	if len(notice) == 0 {
+		pp.surfaceReason = "Subject.EchoPrompt rendered an empty notice, so there was nothing to deliver"
+		return pp
+	}
+	started := time.Now()
+	pp.written, pp.attempts, pp.writeAborted, pp.writeErr = writeNoticeWithRetry(pctx, notifier, notice)
+	pp.writeWaited = time.Since(started)
+	if !pp.written || pp.writeErr != nil {
+		return pp
+	}
+	started = time.Now()
+	pp.occurrences = awaitTerminalEcho(pctx, sess, pp.nonce)
+	pp.echoWaited = time.Since(started)
+	return pp
+}
+
+// noticeSurface narrows a Handle to the live terminal that can take a notice,
+// naming precisely which link in the chain is missing. Both structural
+// refusals here are the runner's own — its noticeDeadSurfaceNotNotifier
+// dead-letter is this second one.
+func noticeSurface(handle agent.Handle) (agent.InteractiveSession, agent.InteractiveNotifier, string) {
+	capable, ok := handle.(agent.InteractiveCapable)
+	if !ok {
+		return nil, nil, "the manifest declares the terminal notice channel but Spawn returned a Handle that is not agent.InteractiveCapable, so there is no live terminal to write a notice into"
+	}
+	sess := capable.InteractiveSession()
+	if sess == nil {
+		return nil, nil, "the manifest declares the terminal notice channel but InteractiveSession() is nil, so there is no live terminal to write a notice into"
+	}
+	notifier, ok := sess.(agent.InteractiveNotifier)
+	if !ok {
+		return nil, nil, "the manifest declares the terminal notice channel but the live surface does not implement agent.InteractiveNotifier, so it cannot accept TryWriteNotice at all"
+	}
+	return sess, notifier, ""
+}
+
+// writeNoticeWithRetry makes the refusable write, retrying a (false, nil)
+// refusal the way the runner's supervisor does. A refusal is the surface
+// saying "not now"; only an error or an exhausted budget is an answer. The
+// aborted return separates "the budget ran out" from "the surface said no
+// every time", which the report must not conflate.
+func writeNoticeWithRetry(ctx context.Context, notifier agent.InteractiveNotifier, notice []byte) (written bool, attempts int, aborted bool, err error) {
+	for attempt := 1; attempt <= ptyNoticeMaxAttempts; attempt++ {
+		ok, writeErr := notifier.TryWriteNotice(notice)
+		if writeErr != nil {
+			return ok, attempt, false, writeErr
+		}
+		if ok {
+			return true, attempt, false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, attempt, true, nil
+		case <-time.After(ptyNoticeRetry):
+		}
+	}
+	return false, ptyNoticeMaxAttempts, false, nil
+}
+
+// awaitTerminalEcho polls the screen until the nonce has appeared often enough
+// to prove the session acted on the notice, and reports how many occurrences
+// it ever saw so the failure can distinguish "nothing arrived" from "only the
+// echo of what we typed".
+func awaitTerminalEcho(ctx context.Context, sess agent.InteractiveSession, nonce string) int {
+	deadline := time.Now().Add(ptyEchoWait)
+	best := 0
+	for {
+		if text, err := snapshotText(sess); err == nil {
+			if n := strings.Count(text, nonce); n > best {
+				best = n
+			}
+		}
+		if best >= ptyEchoOccurrences || time.Now().After(deadline) {
+			return best
+		}
+		select {
+		case <-ctx.Done():
+			return best
+		case <-time.After(ptyEchoPoll):
+		}
+	}
+}
+
+// snapshotText renders the current screen as searchable text: the scrollback
+// tail first, then the visible grid split on the reported column count.
+//
+// It reads the snapshot through type inference rather than naming the frame
+// types, which keeps this package's import set at agent + the standard library
+// — the property that lets any provider test package consume it without a
+// dependency cycle.
+func snapshotText(sess agent.InteractiveSession) (string, error) {
+	screen, _, err := sess.Snapshot()
+	if err != nil {
+		return "", fmt.Errorf("snapshot the terminal: %w", err)
+	}
+	var b strings.Builder
+	for _, line := range screen.Scrollback {
+		for _, cell := range line {
+			b.Write(cell.RuneBytes)
+		}
+		b.WriteByte('\n')
+	}
+	cols := int(screen.Cols) //nolint:gosec // a terminal column count is small and host-reported
+	for i, cell := range screen.Primary {
+		if cols > 0 && i > 0 && i%cols == 0 {
+			b.WriteByte('\n')
+		}
+		b.Write(cell.RuneBytes)
+	}
+	return b.String(), nil
+}
+
+// formatNotice renders one notice as the exact bytes to hand to
+// TryWriteNotice. It follows the runner's framing rules (flattened to a single
+// line, self-submitting with a trailing CR) because a probe that framed the
+// bytes differently would not be exercising the rail the runner drives.
+func formatNotice(text string) []byte {
+	flat := strings.TrimSpace(strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', '\n', '\v', '\f':
+			return ' '
+		default:
+			return r
+		}
+	}, text))
+	if flat == "" {
+		return nil
+	}
+	return append([]byte(flat), noticeSubmit)
 }
 
 func checkResumeContinues(ctx context.Context, r *run) (Status, string) {

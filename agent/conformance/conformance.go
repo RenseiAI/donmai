@@ -43,7 +43,21 @@
 //
 // Report.Unverified goes further and names, on every run, the claims this
 // suite does NOT check — so a green report cannot be mistaken for full
-// certification against the harness-addition checklist.
+// certification against the harness-addition checklist. Its first entry is
+// this suite's own central blind spot: on the Handle.Inject rail it proves a
+// nonce came back out of the event stream, not that it came back over the
+// DECLARED notice channel, and from in-process those are indistinguishable.
+//
+// # Driven-ness is per channel
+//
+// The notice-delivery axis (agent/notice_delivery.go) separates what the
+// HARNESS exposes from what THIS BUILD drives. The suite keeps them separate
+// too, and asks the second question per channel rather than through a single
+// injection flag: see noticeRail in checks.go. Capabilities().
+// SupportsMessageInjection describes ONE rail — Handle.Inject — and is
+// evidence about a declared channel only when Inject is what carries it. Read
+// as a general proxy it certifies live delivery over channels nothing drives,
+// which is the failure this suite exists to catch rather than commit.
 //
 // # Relationship to the harness-addition checklist
 //

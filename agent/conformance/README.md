@@ -36,7 +36,11 @@ requires.
 func TestMyHarnessConformance(t *testing.T) {
     provider, err := myharness.New()
     if err != nil {
-        t.Skipf("harness binary unavailable: %v", err)
+        // NOT t.Skipf. `go test` prints `ok` for a package whose tests all
+        // skipped, so a certification test that skips when the binary is
+        // missing reports the same thing as one that certified — which is the
+        // skip-reads-as-success failure this whole package exists to prevent.
+        t.Fatalf("harness binary unavailable, so NOTHING was certified: %v", err)
     }
 
     report, err := conformance.Run(t.Context(), conformance.Subject{
@@ -67,6 +71,17 @@ checks yields a nil error and a `Report` whose `Err()` lists the failures — so
 "you configured the suite wrong" stays distinct from "your harness is not
 conformant".
 
+### Do not make the certification test skippable
+
+A lane where the harness binary is never installed and the certification test
+skips is a lane that prints `ok` and certifies nothing. If you need a fast unit
+lane that does not install binaries, put the certification test behind a build
+tag or an explicit opt-in (`CERTIFY=1`) and make the certifying lane assert it
+**ran** — count the skips, or check for the tier line in the log. Never let the
+absence of a run render as a pass. `go test` gives a skipped test and a passing
+test the same one-word summary; the only defence is a lane that fails when the
+test did not execute.
+
 ### `EchoPrompt` is the one thing you must write
 
 The suite proves a message **arrived** rather than trusting that `Inject`
@@ -79,16 +94,39 @@ given. Two obligations:
    instructions". A session that already terminated cannot receive a notice,
    and the suite cannot tell that apart from an adapter that dropped one.
 
+If your manifest declares `pty-notice`, `EchoPrompt` renders a **command** the
+session runs (`"echo " + nonce`), your `BaseSpec` must set `Spec.Interactive`,
+and the proof is the nonce appearing on the terminal *twice* — once as the line
+being echoed back at you, once as the session's own output. See the rail table
+below.
+
 ## Tiers
 
 | Tier | Earned by |
 |---|---|
 | `event-contract` | one `InitEvent` first, complete (never per-token) assistant texts, one terminal event last, the channel closes, `Stop` after close is idempotent |
-| `live-notice` | a message injected mid-session actually reaches the agent |
+| `live-notice` | a message pushed into a running session over the rail that carries the **declared** channel actually arrives |
 | `resume` | a resumed session re-announces and re-terminates conformantly |
 | `adaptation-receipt` | the manifest declares an adaptation profile for every mode it claims, the pre-spawn authority compiles and validates ready, and no declared secret survives into it |
 
 A tier is earned only when **every** check in it passed.
+
+### The live-notice rails
+
+Driven-ness is asked **per channel**, because
+`Capabilities().SupportsMessageInjection` is a fact about one rail —
+`Handle.Inject` — and is evidence about a declared channel only when that rail
+is what carries it.
+
+| Declared `noticeDelivery` | Rail | How the suite certifies it |
+|---|---|---|
+| `mcp-rpc`, `http-session`, `acp`, `rpc-steer`, `in-box-loop` | `Handle.Inject` | injects a nonce at the `InitEvent` and requires it back out of the event stream |
+| `pty-notice` | `InteractiveCapable` → `InteractiveNotifier.TryWriteNotice` | writes the notice at the live terminal (the seam the runner's interactive supervisor uses) and requires the session's own output back on screen |
+| `hook` | none in this build | the injection point is the harness calling out to a host-side responder, which this build does not have — reported **unproven**, never passed on the strength of `Handle.Inject` |
+| `none`, `resume-inject` | not live | honest declarations with no live channel to certify — reported not-applicable, never failed |
+
+A mechanism that is declarable but missing from the rail table is a **failure**,
+not a default: the suite says it cannot judge the channel rather than guessing.
 
 ## Honest output
 
@@ -104,7 +142,10 @@ mode this program keeps rediscovering:
    honest report, not a pass.
 3. **Every report names what it did not check.** `Report.Unverified` lists the
    checklist rows and manifest claims this suite has no check for, so a green
-   report cannot be mistaken for full certification.
+   report cannot be mistaken for full certification. The first entry is this
+   suite's own central blind spot: on the `Handle.Inject` rail it proves a nonce
+   came back out of the event stream, **not** that it came back over the
+   declared channel — from in-process the two are indistinguishable.
 
 `CheckResult.Decider` records whether a skip was derived by the suite from the
 manifest or requested by the harness author — a reader can tell the two apart.
@@ -121,7 +162,9 @@ Grounded in the harness-addition checklist
   and resume continuity from the `Handle` contract.
 - **Row 9/10 (notice-delivery declaration)** — the manifest must answer the
   notice-delivery question, and a declared live channel must be driven by this
-  build and demonstrably deliver.
+  build *on the rail that carries that channel* and demonstrably deliver over
+  it. Channel attribution on the `Handle.Inject` rail is out of reach from
+  in-process and is named in `Report.Unverified`.
 - **Row 10 (applied receipt fixtures)** — the part observable from the adapter
   and its host-compiled authority: profiles for every claimed session mode, an
   authority that compiles and validates ready, and secret-ref-only

@@ -29,6 +29,15 @@ type Claim struct {
 func UnverifiedClaims(m agent.HarnessManifest) []Claim {
 	out := []Claim{
 		{
+			// The suite's own central blind spot, named first and named on
+			// every run. Unverified exists to say what was not checked, and
+			// the thing most easily mistaken for checked is the one this tier
+			// is about.
+			Claim: "that a delivered notice arrived over the DECLARED notice channel",
+			Row:   9,
+			Why:   "on the Handle.Inject rail the suite proves a nonce it injected came back out of the event stream — it cannot see which channel carried it there, and the two are indistinguishable from in-process. An adapter whose Inject reaches the agent by some mechanism other than the one its manifest declares (a fresh --resume invocation, say, where the manifest declares a hook) passes notice/live-delivery all the same. Attribution needs observation at the harness's own wire — its hook endpoint, its RPC socket, its HTTP session — which is a smoke-lane capability. The one exception is the terminal rail, where the host refuses TryWriteNotice outright for any harness that has not declared pty-notice, so an accepted write is attributable by construction",
+		},
+		{
 			Claim: "binary pin (min / pinned / verified-against)",
 			Row:   1,
 			Why:   "the suite never learns which harness binary it ran against; pin enforcement is a matrix-metadata and provider-probe concern",

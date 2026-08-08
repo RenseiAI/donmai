@@ -71,9 +71,11 @@ const (
 
 	// IDNoticeMechanism — the manifest answers the notice-delivery question.
 	IDNoticeMechanism CheckID = "notice/mechanism-declared"
-	// IDNoticeBuildDrives — this build drives the declared channel.
+	// IDNoticeBuildDrives — this build drives THE DECLARED channel, asked per
+	// channel against the rail that carries it (see noticeRails in checks.go).
 	IDNoticeBuildDrives CheckID = "notice/build-drives-channel"
-	// IDNoticeLiveDelivery — a message injected mid-session actually arrives.
+	// IDNoticeLiveDelivery — a message pushed into a running session over that
+	// same rail actually arrives.
 	IDNoticeLiveDelivery CheckID = "notice/live-delivery"
 
 	// IDResumeContinues — a resumed session re-announces and re-terminates.
@@ -112,8 +114,10 @@ const (
 	// TierEventContract is the floor every production harness must reach:
 	// the Provider event contract holds end to end on a live session.
 	TierEventContract Tier = "event-contract"
-	// TierLiveNotice is earned by delivering a message INTO a running
-	// session — not by declaring a mechanism that could.
+	// TierLiveNotice is earned by delivering a message INTO a running session
+	// over the rail that carries the channel the manifest DECLARED — not by
+	// declaring a mechanism that could, and not by delivering over some other
+	// rail the adapter happens to implement.
 	TierLiveNotice Tier = "live-notice"
 	// TierResume is earned by continuing a prior session.
 	TierResume Tier = "resume"
@@ -219,9 +223,14 @@ type Subject struct {
 	Provider agent.HarnessProvider
 
 	// BaseSpec is the Spec template every live probe clones. The suite
-	// overwrites Prompt; everything else (Cwd, Env, model, endpoint, tool
-	// policy) is the author's. Keep it as close to a production Spec as the
-	// certification environment allows.
+	// overwrites Prompt (and sets RequiresLiveNotice on the notice probe);
+	// everything else (Cwd, Env, model, endpoint, tool policy) is the
+	// author's. Keep it as close to a production Spec as the certification
+	// environment allows.
+	//
+	// A harness declaring agent.NoticeDeliveryPTYNotice must set
+	// Spec.Interactive here: that channel lives at the terminal, and a
+	// PTY-only harness has no headless mode to fall back on.
 	BaseSpec agent.Spec
 
 	// EchoPrompt renders a prompt instructing this harness's agent to
@@ -235,6 +244,11 @@ type Subject struct {
 	// then wait for further instructions), because a session that has already
 	// terminated cannot receive a notice and the check cannot tell that apart
 	// from an adapter that dropped one.
+	//
+	// On the terminal rail (agent.NoticeDeliveryPTYNotice) the rendered string
+	// is submitted at the live terminal as one line, so it must be a COMMAND
+	// the session runs and whose output repeats the nonce — `"echo " + nonce`
+	// for a shell. There is no agent behind that terminal to instruct.
 	EchoPrompt func(nonce string) string
 
 	// Adaptation is the optional row-10 fixture. Without it the
