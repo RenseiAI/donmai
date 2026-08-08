@@ -8,6 +8,29 @@ import (
 	"github.com/RenseiAI/donmai/prompt"
 )
 
+// runtimeMaterializedCredential is the placeholder the prepared-source lane
+// substitutes for every runtime credential. The lane computes the shape of the
+// session's MCP set without holding real credentials, so the placeholder only
+// has to be non-empty — its value never reaches a request.
+const runtimeMaterializedCredential = "runtime-materialized"
+
+// materializeRuntimeAuthority returns a copy of qw with placeholder runtime
+// credentials, so the prepared-source lane derives the same implicit MCP server
+// set the spawn lane will.
+//
+// BOTH bearers are materialized. The gateway's bearer is mcpGatewayBearer(qw),
+// which prefers the session-scoped token, so materializing only the worker one
+// would let the two lanes disagree the moment the platform starts stamping a
+// session-scoped bearer. Only the server NAMES are carried out of this lane
+// today, but keeping the two inputs symmetric costs one line and removes a
+// future divergence.
+func materializeRuntimeAuthority(qw QueuedWork) QueuedWork {
+	qw.PlatformURL = "https://runtime.invalid"
+	qw.AuthToken = runtimeMaterializedCredential
+	qw.McpAuthToken = runtimeMaterializedCredential
+	return qw
+}
+
 func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection) (agent.Spec, []string, error) {
 	provider := selection.Provider
 	if provider == nil {
@@ -49,10 +72,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection) (agent.S
 		}
 	}
 	mode := sessionPromptMode(working, selection.effectiveCell)
-	authorityWork := working
-	authorityWork.PlatformURL = "https://runtime.invalid"
-	authorityWork.AuthToken = "runtime-materialized"
-	defaults := defaultMCPServersForHarness(authorityWork, "/runtime/worktree", provider, mode)
+	defaults := defaultMCPServersForHarness(materializeRuntimeAuthority(working), "/runtime/worktree", provider, mode)
 	runtimeNames := make([]string, 0, len(defaults))
 	for _, server := range defaults {
 		runtimeNames = append(runtimeNames, server.Name)
