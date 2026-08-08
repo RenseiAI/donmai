@@ -53,7 +53,7 @@ func TestSpawn_SuccessExit_EmitsInitThenSuccessResult(t *testing.T) {
 	h, err := Spawn(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
 		Cwd:         t.TempDir(),
 		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
-	})
+	}, ptyNoticeManifest())
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestSpawn_NonZeroExit_EmitsFailureResult(t *testing.T) {
 	h, err := Spawn(context.Background(), "sh", []string{"-c", "exit 7"}, agent.Spec{
 		Cwd:         t.TempDir(),
 		Interactive: &agent.InteractiveSpec{},
-	})
+	}, ptyNoticeManifest())
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestHandle_SessionID_AlwaysEmpty(t *testing.T) {
 
 	h, err := Spawn(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
 		Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
-	})
+	}, ptyNoticeManifest())
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestHandle_Inject_ReturnsErrUnsupported(t *testing.T) {
 
 	h, err := Spawn(context.Background(), "sh", []string{"-c", "sleep 5"}, agent.Spec{
 		Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
-	})
+	}, ptyNoticeManifest())
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestHandle_Stop_Idempotent(t *testing.T) {
 
 	h, err := Spawn(context.Background(), "sh", []string{"-c", "sleep 30"}, agent.Spec{
 		Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
-	})
+	}, ptyNoticeManifest())
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestHandle_InteractiveSession_AndEmitMarker(t *testing.T) {
 	h, err := Spawn(context.Background(), "sh", []string{"-c", "sleep 5"}, agent.Spec{
 		Cwd:         t.TempDir(),
 		Interactive: &agent.InteractiveSpec{Cols: 100, Rows: 40},
-	})
+	}, ptyNoticeManifest())
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestSpawn_MissingBinary_WrapsErrSpawnFailed(t *testing.T) {
 
 	_, err := Spawn(context.Background(), "this-binary-does-not-exist-ptycli-test", nil, agent.Spec{
 		Interactive: &agent.InteractiveSpec{},
-	})
+	}, ptyNoticeManifest())
 	if !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Errorf("error = %v, want wrapping agent.ErrSpawnFailed", err)
 	}
@@ -216,7 +216,7 @@ func TestSpawnWithCleanup_OwnsResourceAcrossEveryTerminalPath(t *testing.T) {
 		var calls atomic.Int32
 		h, err := SpawnWithCleanup(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
 			Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
-		}, func() error { calls.Add(1); return nil })
+		}, ptyNoticeManifest(), func() error { calls.Add(1); return nil })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -236,7 +236,7 @@ func TestSpawnWithCleanup_OwnsResourceAcrossEveryTerminalPath(t *testing.T) {
 		var calls atomic.Int32
 		h, err := SpawnWithCleanup(context.Background(), "sh", []string{"-c", "sleep 30"}, agent.Spec{
 			Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
-		}, func() error { calls.Add(1); return nil })
+		}, ptyNoticeManifest(), func() error { calls.Add(1); return nil })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,7 +256,7 @@ func TestSpawnWithCleanup_OwnsResourceAcrossEveryTerminalPath(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		h, err := SpawnWithCleanup(ctx, "sh", []string{"-c", "sleep 30"}, agent.Spec{
 			Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
-		}, func() error { calls.Add(1); return nil })
+		}, ptyNoticeManifest(), func() error { calls.Add(1); return nil })
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -271,7 +271,7 @@ func TestSpawnWithCleanup_OwnsResourceAcrossEveryTerminalPath(t *testing.T) {
 		var calls atomic.Int32
 		_, err := SpawnWithCleanup(context.Background(), "this-binary-does-not-exist-ptycli-cleanup-test", nil, agent.Spec{
 			Interactive: &agent.InteractiveSpec{},
-		}, func() error { calls.Add(1); return nil })
+		}, ptyNoticeManifest(), func() error { calls.Add(1); return nil })
 		if !errors.Is(err, agent.ErrSpawnFailed) {
 			t.Fatalf("error = %v, want ErrSpawnFailed", err)
 		}
@@ -286,7 +286,7 @@ func TestSpawnWithCleanup_ErrorMakesTerminalResultFail(t *testing.T) {
 	want := errors.New("cleanup refused")
 	h, err := SpawnWithCleanup(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
 		Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
-	}, func() error { return want })
+	}, ptyNoticeManifest(), func() error { return want })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,7 @@ func TestSpawnWithCleanup_CanDeleteOwnedFile(t *testing.T) {
 	}
 	h, err := SpawnWithCleanup(context.Background(), "sh", []string{"-c", "exit 0"}, agent.Spec{
 		Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{},
-	}, func() error { return os.Remove(path) })
+	}, ptyNoticeManifest(), func() error { return os.Remove(path) })
 	if err != nil {
 		t.Fatal(err)
 	}

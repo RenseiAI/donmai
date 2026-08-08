@@ -15,6 +15,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -86,6 +87,49 @@ type recordingPlatformServer struct {
 	mu           sync.Mutex
 	sessionClass string
 	refreshes    int
+	// pendingInjects are piggybacked onto successive successful
+	// lock-refresh responses (one per refresh, in order) exactly the way the
+	// platform delivers a runtime inject. Empty by default, so every existing
+	// caller sees the unchanged {"refreshed":true,"ok":true} body.
+	pendingInjects []heartbeat.InjectPayload
+	// acks / deadLetters are the two terminal facts the worker reports back
+	// about an inject. Recorded SEPARATELY on purpose: "delivered" and "never
+	// delivered, here is why" are different answers, and a rail that cannot
+	// tell them apart is how a message gets destroyed with a success reported.
+	acks        []string
+	deadLetters []struct {
+		DeliveryID string `json:"deliveryId"`
+		Reason     string `json:"reason"`
+	}
+}
+
+// injectReports returns every ack and dead-letter the worker echoed.
+func (s *recordingPlatformServer) injectReports() (acks []string, dead []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acks = append(acks, s.acks...)
+	for _, d := range s.deadLetters {
+		dead = append(dead, d.DeliveryID+":"+d.Reason)
+	}
+	return acks, dead
+}
+
+// queueInject arms the double to piggyback p onto the next lock-refresh.
+func (s *recordingPlatformServer) queueInject(p heartbeat.InjectPayload) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingInjects = append(s.pendingInjects, p)
+}
+
+// takeInject pops the next queued inject, or nil when none is armed.
+// Called with s.mu held.
+func (s *recordingPlatformServer) takeInjectLocked() *heartbeat.InjectPayload {
+	if len(s.pendingInjects) == 0 {
+		return nil
+	}
+	next := s.pendingInjects[0]
+	s.pendingInjects = s.pendingInjects[1:]
+	return &next
 }
 
 // lastSessionClass returns the sessionClass most recently observed on a
@@ -102,7 +146,12 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 	rec.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/lock-refresh") {
 			var body struct {
-				SessionClass string `json:"sessionClass"`
+				SessionClass        string `json:"sessionClass"`
+				AckedInject         string `json:"ackedInject"`
+				DeadLetteredInjects []struct {
+					DeliveryID string `json:"deliveryId"`
+					Reason     string `json:"reason"`
+				} `json:"deadLetteredInjects"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			rec.mu.Lock()
@@ -110,7 +159,22 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 			if body.SessionClass != "" {
 				rec.sessionClass = body.SessionClass
 			}
+			if body.AckedInject != "" {
+				rec.acks = append(rec.acks, body.AckedInject)
+			}
+			rec.deadLetters = append(rec.deadLetters, body.DeadLetteredInjects...)
+			inject := rec.takeInjectLocked()
 			rec.mu.Unlock()
+
+			if inject != nil {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(struct {
+					Refreshed bool                     `json:"refreshed"`
+					OK        bool                     `json:"ok"`
+					Inject    *heartbeat.InjectPayload `json:"inject"`
+				}{Refreshed: true, OK: true, Inject: inject})
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))

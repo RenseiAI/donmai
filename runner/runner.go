@@ -310,6 +310,12 @@ type Runner struct {
 	kitDetector           KitDetector
 	kitComposer           KitComposer
 	kitTargetOS           string
+
+	// interactiveNoticeClock overrides the interactive supervisor's
+	// notice-retry clock. Nil in production (real time); tests substitute a
+	// fake so a refused notice's retry is driven deterministically instead of
+	// by sleeping. See Runner.noticeRetryClock.
+	interactiveNoticeClock interviewClock
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session

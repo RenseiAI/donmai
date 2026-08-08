@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -120,28 +121,71 @@ func TestDrainMemoryInjects_SkipsEmptyText(t *testing.T) {
 	}
 }
 
-// runLoopOnInject mirrors the OnInject closure built in runLoop (kept
-// identical so these tests guard the real dedup + ack-or-requeue contract):
-// already-seen deliveries are acked without re-buffering, a successful
-// buffer marks the DeliveryID seen and acks, and a full channel REJECTS the
-// delivery (returns false → stays unacked → platform re-delivers) without
-// marking it seen.
-func runLoopOnInject(seenInject map[string]struct{}, injectCh chan heartbeat.InjectPayload) func(heartbeat.InjectPayload) bool {
-	return func(p heartbeat.InjectPayload) bool {
-		if p.DeliveryID != "" {
-			if _, ok := seenInject[p.DeliveryID]; ok {
-				return true
+// newTestInjectAcceptor builds the PRODUCTION accept callback (loop.go's
+// newInjectAcceptor — the exact function runLoop wires into the heartbeat).
+// These tests deliberately call the real thing: the previous local mirror of
+// this closure meant deleting the production code left them green.
+// ackOnBuffer=true is the headless/interview wiring these tests cover;
+// TestInjectAcceptor_AckMode covers both modes side by side.
+func newTestInjectAcceptor(seenInject map[string]struct{}, injectCh chan heartbeat.InjectPayload) func(heartbeat.InjectPayload) bool {
+	return newInjectAcceptor(injectCh, seenInject, slog.New(slog.DiscardHandler), "test-session", true)
+}
+
+// TestInjectAcceptor_AckMode pins WHERE the ack belongs, per run mode.
+//
+// The regression: the acceptor acked the instant a payload landed on the
+// 8-slot channel. For an interactive session — whose write waits on a human
+// and whose session can end at any moment — that stamped up to nine payloads
+// delivered while nothing had been written; the platform then never re-offered
+// them. ackOnBuffer=false is the fix: take custody, do NOT claim delivery, and
+// let the consumer confirm with AckInject once the bytes land.
+func TestInjectAcceptor_AckMode(t *testing.T) {
+	tests := []struct {
+		name        string
+		ackOnBuffer bool
+		wantFresh   bool // ack for a first-time delivery that buffers fine
+		wantSeen    bool // ack for a re-offer of something already buffered
+	}{
+		{name: "headless and interview ack on buffer", ackOnBuffer: true, wantFresh: true, wantSeen: true},
+		{name: "interactive acks on delivery, not on buffer", ackOnBuffer: false, wantFresh: false, wantSeen: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			injectCh := make(chan heartbeat.InjectPayload, 2)
+			seen := map[string]struct{}{}
+			onInject := newInjectAcceptor(
+				injectCh, seen, slog.New(slog.DiscardHandler), "test-session", tc.ackOnBuffer,
+			)
+
+			p := heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "hello"}
+			if got := onInject(p); got != tc.wantFresh {
+				t.Fatalf("first offer acked=%v; want %v", got, tc.wantFresh)
 			}
-		}
-		select {
-		case injectCh <- p:
-			if p.DeliveryID != "" {
-				seenInject[p.DeliveryID] = struct{}{}
+			// Custody is unconditional: the payload must be readable by the
+			// consumer whichever ack mode is in force.
+			if got := len(injectCh); got != 1 {
+				t.Fatalf("payload was not buffered (len=%d); custody must not depend on the ack mode", got)
 			}
-			return true
-		default:
-			return false
-		}
+			// A re-offer of the same delivery must not double-buffer, and
+			// must not be acked in ack-on-delivery mode either — it has still
+			// not been delivered.
+			if got := onInject(p); got != tc.wantSeen {
+				t.Fatalf("re-offer acked=%v; want %v", got, tc.wantSeen)
+			}
+			if got := len(injectCh); got != 1 {
+				t.Fatalf("re-offer was double-buffered (len=%d)", got)
+			}
+
+			// A full buffer is never acked, in either mode.
+			<-injectCh
+			for i := 0; i < 2; i++ {
+				onInject(heartbeat.InjectPayload{DeliveryID: "fill-" + string(rune('a'+i))})
+			}
+			if onInject(heartbeat.InjectPayload{DeliveryID: "dlv-overflow"}) {
+				t.Fatal("a payload rejected for lack of buffer space must never be acked")
+			}
+		})
 	}
 }
 
@@ -153,7 +197,7 @@ func runLoopOnInject(seenInject map[string]struct{}, injectCh chan heartbeat.Inj
 func TestMemoryInjectOnInject_DedupesByDeliveryID(t *testing.T) {
 	seenInject := map[string]struct{}{}
 	injectCh := make(chan heartbeat.InjectPayload, 8)
-	onInject := runLoopOnInject(seenInject, injectCh)
+	onInject := newTestInjectAcceptor(seenInject, injectCh)
 
 	if !onInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "first"}) {
 		t.Fatal("first delivery must be accepted")
@@ -186,7 +230,7 @@ func TestMemoryInjectOnInject_DedupesByDeliveryID(t *testing.T) {
 func TestMemoryInjectOnInject_RejectsWhenChannelFull(t *testing.T) {
 	seenInject := map[string]struct{}{}
 	injectCh := make(chan heartbeat.InjectPayload, 1) // tiny buffer
-	onInject := runLoopOnInject(seenInject, injectCh)
+	onInject := newTestInjectAcceptor(seenInject, injectCh)
 
 	if !onInject(heartbeat.InjectPayload{DeliveryID: "dlv-1", Text: "fits"}) {
 		t.Fatal("first inject must be accepted")
@@ -209,33 +253,22 @@ func TestMemoryInjectOnInject_RejectsWhenChannelFull(t *testing.T) {
 	}
 }
 
-// TestRuntimeInjectGate_CapGate confirms the gate is the provider capability
-// ALONE: the runner wires OnInject whenever SupportsMessageInjection is true,
-// otherwise never. There is no worker-side enable flag — the PLATFORM is the
-// sole authority over whether a block is actually delivered (it only returns an
-// inject on the lock-refresh response when the project's memory config has
-// runtime-inject on). We assert the gate condition directly since it is the
-// single source of truth wired in runLoop.
-func TestRuntimeInjectGate_CapGate(t *testing.T) {
-	cases := []struct {
-		name        string
-		supportsInj bool
-		want        bool
-	}{
-		{"no cap", false, false},
-		{"cap", true, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			caps := agent.Capabilities{SupportsMessageInjection: tc.supportsInj}
-			// Mirrors runLoop: runtimeInjectEnabled := caps.SupportsMessageInjection
-			got := caps.SupportsMessageInjection
-			if got != tc.want {
-				t.Fatalf("runtimeInjectEnabled = %v; want %v", got, tc.want)
-			}
-		})
-	}
-}
+// The runtime-inject gate is the provider capability ALONE
+// (runtimeInjectEnabled := caps.SupportsMessageInjection in runLoop): there is
+// no worker-side enable flag, because the PLATFORM decides whether a block is
+// delivered at all. That gate used to be "covered" by a test that constructed
+// an agent.Capabilities value and asserted the field equalled itself — it
+// touched no runner code and could not fail.
+//
+// What actually needed covering is the seam BELOW the gate: that runLoop hands
+// the channel to the dispatcher for the run mode in play. Both live consumers
+// are exercised end to end instead:
+//
+//   - interactive → TestInteractive_RunLoopHandsInjectChToDispatch
+//     (interactive_inject_test.go) drives the full runner and asserts the
+//     inject reaches the live PTY as a submitted line.
+//   - interview   → TestInterviewLoop_* (interview_loop_test.go) park on the
+//     same channel per turn.
 
 // recordInjectHandle is an agent.Handle that records Inject calls and never
 // emits events. Used to assert which blocks are delivered.

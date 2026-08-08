@@ -30,6 +30,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:           true, // /v1 honors response_format
 			ToolPermissionFormat:     "claude",
 			StreamingTransport:       "ndjson",
+			// Lane B (`opencode serve`) owns named sessions behind a local
+			// HTTP surface, so a message into a live session is a POST:
+			// serverHandle.Inject → POST /api/session/:id/prompt with
+			// delivery "steer" (client.go). Shipped and driven.
+			NoticeDelivery: agent.NoticeDeliveryHTTPSession,
 			// ONLY openai-chat — NOT anthropic-messages (cross-protocol cell not-yet-valid).
 			Drives: []agent.WireProtocol{agent.ProtoOpenAIChat},
 			// HostGateway added (08 §2 / ADR-2026-07-24): opencode is the M1

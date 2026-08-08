@@ -45,6 +45,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:           false, // no server-constrained structured output ⇒ spawn-collect
 			ToolPermissionFormat:     "claude",
 			StreamingTransport:       "ndjson",
+			// `pi --mode rpc` carries an explicit steering verb on the same
+			// JSONL channel that drives the session: Handle.Inject maps to
+			// steer while a turn is in flight and follow_up while idle
+			// (handle.go). Shipped and driven.
+			NoticeDelivery: agent.NoticeDeliveryRPCSteer,
 			Drives: []agent.WireProtocol{
 				agent.ProtoAnthropicMessages,
 				agent.ProtoOpenAIChat,

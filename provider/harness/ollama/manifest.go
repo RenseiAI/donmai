@@ -30,9 +30,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:           true, // format:"json" (whole-response)
 			ToolPermissionFormat:     "claude",
 			StreamingTransport:       "ndjson",
-			Drives:                   []agent.WireProtocol{agent.ProtoOllama},
-			DrivesHosts:              []agent.ServingHost{agent.HostLocal},
-			Transport:                agent.TransportDirectAPI,
+			// A chat turn is one HTTP exchange with no session the server
+			// keeps open, so there is nothing to deliver INTO: Handle.Inject
+			// returns ErrUnsupported (handle.go). Declared none rather than
+			// silently best-effort — the durable mailbox is this harness's
+			// delivery path.
+			NoticeDelivery: agent.NoticeDeliveryNone,
+			Drives:         []agent.WireProtocol{agent.ProtoOllama},
+			DrivesHosts:    []agent.ServingHost{agent.HostLocal},
+			Transport:      agent.TransportDirectAPI,
 		},
 		PromptDelivery: []agent.PromptDeliveryProfile{{
 			ID: "ollama/ollama-chat/direct-api-v1", Mode: agent.PromptModeAutonomous,

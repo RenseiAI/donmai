@@ -53,15 +53,21 @@ type Handle struct {
 // there is no PID to report. Callers that need PID-based metrics for an
 // interactive session are not served by this driver today — a documented,
 // known gap rather than a silent no-op.
-func Spawn(ctx context.Context, binary string, argv []string, spec agent.Spec) (*Handle, error) {
-	return SpawnWithCleanup(ctx, binary, argv, spec, nil)
+// manifest is the harness's own live declaration. Only one field is read
+// today — Caps.NoticeDelivery, which decides whether this PTY may accept a
+// runner-authored notice — but the whole manifest is taken rather than that one
+// value so the driver keeps reading the harness's declaration instead of
+// growing a parameter (and a call-site decision) per capability. Passing a zero
+// manifest declares nothing, which refuses notices.
+func Spawn(ctx context.Context, binary string, argv []string, spec agent.Spec, manifest agent.HarnessManifest) (*Handle, error) {
+	return SpawnWithCleanup(ctx, binary, argv, spec, manifest, nil)
 }
 
 // SpawnWithCleanup starts an interactive PTY and transfers ownership of an
 // optional per-session resource cleanup function to the returned handle. The
 // cleanup runs exactly once on spawn failure, child exit, context cancellation,
 // or Stop, whichever happens first.
-func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec agent.Spec, cleanup func() error) (*Handle, error) {
+func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec agent.Spec, manifest agent.HarnessManifest, cleanup func() error) (*Handle, error) {
 	ispec := spec.Interactive
 	if ispec == nil {
 		ispec = &agent.InteractiveSpec{}
@@ -78,6 +84,11 @@ func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec ag
 		Rows:       uint16(ispec.Rows), //nolint:gosec // terminal geometry never exceeds uint16
 		RingBytes:  ispec.RingBytes,
 		RecordPath: ispec.RecordPath,
+		// Read from the LIVE manifest, never from the harness's name: the
+		// permission to write a notice into this terminal belongs to whichever
+		// harnesses declare it, and that set must stay derivable from the
+		// registry rather than restated here as a literal.
+		NoticeDelivery: manifest.Caps.NoticeDelivery,
 	}
 
 	sess, err := ptyhost.Spawn(pspec)
