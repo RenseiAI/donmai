@@ -61,7 +61,10 @@ func rawKeysChild() {
 		fmt.Fprintln(os.Stderr, "stdin fd out of range:", raw)
 		os.Exit(3)
 	}
-	fd := int(raw)
+	// The guard above is the actual fix — the directive only tells gosec the
+	// guard exists, which its uintptr→int taint analysis does not follow. Same
+	// pattern as the geometry conversion in provider/harness/ptycli/handle.go.
+	fd := int(raw) //nolint:gosec // G115: bounds-checked against math.MaxInt immediately above
 	restore, err := term.MakeRaw(fd)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "raw mode:", err)
