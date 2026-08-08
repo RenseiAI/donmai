@@ -54,7 +54,7 @@ When a row matches, read that doc before your next edit and follow it literally.
 make test        # go test -race ./...   (the race flag is mandatory)
 make test-tagged # type-check the build-tag-gated test files ./... cannot see
 make lint        # golangci-lint run
-make guard       # leak-guard: closed-source reference linter (CI blocks on it)
+make guard       # guard-b: closed-source reference linter, self-test + --staged
 make build       # type/compile gate — lint and test alone do not prove linkage
 ```
 
@@ -120,9 +120,17 @@ count, and a suite that quietly starts skipping protects nothing.
 
 - Nothing closed-source leaks in: no commercial-platform brand words, no
   internal tracker IDs, no private repo links, no internal hostnames or
-  workspace paths, no closed env-var names. `make guard` runs
-  `scripts/leak-guard.sh --self-test` + `--all` (allowlist:
-  `.leak-guard-allowlist`); CI blocks on it.
+  workspace paths, no closed env-var names. `scripts/guard-b-lint.sh` is
+  vendored from `donmai-architecture` (provenance header names the pinned
+  commit; `scripts/check-guard-b-vendor-drift.sh` fails CI if this copy
+  drifts from it). `make guard` runs its self-test + `--staged`; CI
+  (`.github/workflows/guard-b.yml`) additionally scans this PR's commits,
+  the squash-merge message GitHub will compose, and whatever just landed on
+  main — all BLOCKING. The tracked-tree `--all` scan runs separately and
+  NON-BLOCKING (`make guard-report`, or the `guard-b-tree-residue` CI job):
+  this repo carries a pre-existing residue `--all` surfaces that predates
+  guard-b (disclosed in `.guard-allowlist`'s header) and was never curated
+  against it — allowlist: `.guard-allowlist`.
 - Platform-needing features do not ship half-working clients here: OSS defines
   interfaces AND ships a working implementation of each; commercial extensions
   live downstream. When only a downstream implementation would exist, split the

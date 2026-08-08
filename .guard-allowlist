@@ -1,0 +1,24 @@
+# guard-b allowlist for donmai — same grammar as the engine's own header
+# (scripts/guard-b-lint.sh), three or four ' :: '-separated fields:
+#
+#     <RULE_ID>[,<RULE_ID>...] :: <location-regex> :: <match-regex>[ :: <line-regex>]
+#
+# See scripts/guard-b-lint.sh for the full grammar and refusal rules.
+#
+# This repo's --all tree scan currently reports a large pre-existing residue
+# (disclosed in the PR that introduced this guard, and in
+# scripts/guard-b-lint.sh's own CI job) that predates guard-b and was never
+# curated against it — the previous scripts/leak-guard.sh this replaces used a
+# narrower rule set that missed it. That residue is NOT allowlisted here: an
+# allowlist entry is an asserted, reviewed "this is legitimate," and asserting
+# that at bulk without reading each hit would be worse than the residue itself.
+# --all therefore runs report-only in CI for now (see .github/workflows/guard-b.yml)
+# until it is curated file-by-file, the same way tui-components' and
+# donmai-smokes' were. New content is still fully covered: self-test,
+# --commits (this PR's own commits), --stdin (the squash message), and
+# --commits (what just landed on main) all run BLOCKING.
+#
+# NOTE ON THE [BRACKETS]: this file is itself scanned, so any entry added here
+# must spell a banned literal with one bracketed letter (`Rens[e]i`,
+# `/api/cl[i]/`) — the same convention scripts/guard-b-lint.sh and its own
+# .guard-allowlist use.

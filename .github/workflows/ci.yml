@@ -11,17 +11,16 @@ on:
   merge_group:
 
 jobs:
-  leak-guard:
+  # The closed-source content guard (self-test, vendor-drift check, and the
+  # commit/squash-message scans) lives in its own workflow now:
+  # .github/workflows/guard-b.yml — it needs PR `edited`/`ready_for_review`
+  # triggers this workflow's `on:` block doesn't carry, since a PR body edit
+  # is the squash-merge message and can introduce a leak no commit contains.
+  release-contracts:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-
-      - name: Leak guard self-test
-        run: bash scripts/leak-guard.sh --self-test
-
-      - name: Closed-source content guard
-        run: bash scripts/leak-guard.sh --all
 
       - name: Release workflow contract tests
         run: bash scripts/test-release-workflows.sh
