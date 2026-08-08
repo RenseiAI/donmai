@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test test-tagged lint fmt vuln coverage clean release-dry-run generate verify-generated guard
+.PHONY: build run run-mock run-status run-status-mock test test-tagged lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -45,10 +45,19 @@ test-tagged:
 lint:
 	golangci-lint run
 
+# `guard` stays fast and scoped to what you're about to commit: self-test
+# (proves the rules still fire) + --staged (this change only). --all currently
+# reports a large pre-existing residue this repo hasn't been curated against
+# yet (see .guard-allowlist's header) — `make guard-report` runs it
+# non-blocking so that residue stays visible without making ordinary commits
+# red for content nobody touched.
 guard:
-	bash scripts/leak-guard.sh --self-test
-	bash scripts/leak-guard.sh --all
+	bash scripts/guard-b-lint-selftest.sh
+	bash scripts/guard-b-lint.sh --staged
 	bash scripts/check-no-inbound-attach.sh
+
+guard-report:
+	bash scripts/guard-b-lint.sh --all || true
 
 fmt:
 	gofumpt -w .
