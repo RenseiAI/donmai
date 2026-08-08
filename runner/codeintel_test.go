@@ -4,13 +4,30 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/prompt"
+	agycliprovider "github.com/RenseiAI/donmai/provider/harness/agycli"
+	ampprovider "github.com/RenseiAI/donmai/provider/harness/amp"
+	claudeprovider "github.com/RenseiAI/donmai/provider/harness/claude"
+	codexprovider "github.com/RenseiAI/donmai/provider/harness/codex"
+	geminiprovider "github.com/RenseiAI/donmai/provider/harness/gemini"
+	ollamaprovider "github.com/RenseiAI/donmai/provider/harness/ollama"
+	opencodeprovider "github.com/RenseiAI/donmai/provider/harness/opencode"
+	piprovider "github.com/RenseiAI/donmai/provider/harness/pi"
 	shellprovider "github.com/RenseiAI/donmai/provider/harness/shell"
+	stubprovider "github.com/RenseiAI/donmai/provider/harness/stub"
 )
+
+// mcpDeliveringHarness is a harness whose tool/lifecycle profile declares a
+// real MCP delivery channel (claude: claude_cli_mcp_config), i.e. one the
+// runner's implicit platform gateway is deliverable on. Tests that only need
+// "some MCP-capable harness" use it instead of restating the predicate.
+func mcpDeliveringHarness() agent.Provider { return &claudeprovider.Provider{} }
 
 // mcpCaps / cliCaps model the two provider families the code-intel prompt
 // partial branches on: MCP-capable (claude/codex/gemini) vs providers that
@@ -101,7 +118,7 @@ func TestCodeIntel_AbsentBlock_SpecByteIdentical(t *testing.T) {
 	gated.SessionID = "s"
 	gated.PlatformURL = "https://p.test"
 	gated.AuthToken = "rsk"
-	if servers := defaultMCPServers(gated, "/tmp/wt"); len(servers) != 1 {
+	if servers := defaultMCPServersForHarness(gated, "/tmp/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous); len(servers) != 1 {
 		t.Errorf("absent block must not append a code-intel MCP entry; got %+v", servers)
 	}
 
@@ -237,7 +254,7 @@ func TestDefaultMCPServers_AppendsCodeIntelAfterPlatformGate(t *testing.T) {
 	qw.CodeIntel = &prompt.CodeIntelWork{Repo: "owner/repo"}
 
 	root := "/abs/worktrees/sess_abc"
-	servers := defaultMCPServers(qw, root)
+	servers := defaultMCPServersForHarness(qw, root, mcpDeliveringHarness(), agent.PromptModeAutonomous)
 	if len(servers) != 2 {
 		t.Fatalf("len(servers) = %d, want 2 (platform gate + code-intel)", len(servers))
 	}
@@ -252,57 +269,196 @@ func TestDefaultMCPServers_AppendsCodeIntelAfterPlatformGate(t *testing.T) {
 	}
 }
 
-func TestDefaultMCPServersForProvider_ShellOmitsOnlyImplicitGateway(t *testing.T) {
+// harnessMCPCase is one row of the exact-harness MCP admission table: a
+// harness, the session mode it declares a tool/lifecycle profile for, and
+// whether that profile declares a real MCP delivery channel.
+//
+// deliversMCP is written out by hand rather than read off the manifest so the
+// row is falsifiable: the test cross-checks it against the live manifest and
+// fails on drift instead of agreeing with whatever the manifest happens to say.
+type harnessMCPCase struct {
+	name        string
+	provider    agent.Provider
+	mode        agent.PromptSessionMode
+	deliversMCP bool
+}
+
+// harnessMCPCases enumerates every harness in the fleet. Coverage of the whole
+// fleet is enforced by TestHarnessMCPCases_CoverEveryRegisteredHarness.
+func harnessMCPCases(t *testing.T) []harnessMCPCase {
+	t.Helper()
+	stubProvider, err := stubprovider.New()
+	if err != nil {
+		t.Fatalf("stub provider: %v", err)
+	}
+	return []harnessMCPCase{
+		{"claude", &claudeprovider.Provider{}, agent.PromptModeAutonomous, true},
+		{"codex", &codexprovider.Provider{}, agent.PromptModeAutonomous, true},
+		{"gemini", &geminiprovider.Provider{}, agent.PromptModeAutonomous, true},
+		{"amp", &ampprovider.Provider{}, agent.PromptModeAutonomous, true},
+		{"opencode", &opencodeprovider.Provider{}, agent.PromptModeAutonomous, true},
+		{"stub", stubProvider, agent.PromptModeAutonomous, true},
+		{"pi", &piprovider.Provider{}, agent.PromptModeAutonomous, false},
+		{"ollama", &ollamaprovider.Provider{}, agent.PromptModeAutonomous, false},
+		{"agy-cli", &agycliprovider.Provider{}, agent.PromptModeAutonomous, false},
+		{"shell", &shellprovider.Provider{}, agent.PromptModeHumanControlled, false},
+	}
+}
+
+// mcpServerNames lists the server names in order, for readable failures.
+func mcpServerNames(servers []agent.MCPServerConfig) []string {
+	names := make([]string, 0, len(servers))
+	for _, s := range servers {
+		names = append(names, s.Name)
+	}
+	return names
+}
+
+// TestDefaultMCPServersForHarness_ImplicitGatewayFollowsDeclaredMCPDelivery is
+// the regression guard for the spawn-denial defect: the runner used to exempt
+// its own implicit platform MCP gateway by hardcoded provider NAME (shell), so
+// every OTHER harness that declares no MCP delivery — pi, ollama, agy-cli —
+// was handed a gateway its adapter could never mount and denied the spawn
+// outright ("cannot apply required entry \"mcp-servers\"") for a capability the
+// caller never requested.
+//
+// The exemption is now the DECLARED MCPDelivery of the harness's tool/lifecycle
+// profile — the same field agent.AdaptToolLifecycle reads — so it holds for
+// every harness, present and future.
+//
+// The converse is equally load-bearing and is asserted per row: an MCP server
+// the CALLER requested (an agent-card entry, or the code-intel plugin) is never
+// filtered. It stays in the spec and denies loudly on a harness that cannot
+// deliver it, rather than being silently stripped.
+func TestDefaultMCPServersForHarness_ImplicitGatewayFollowsDeclaredMCPDelivery(t *testing.T) {
 	t.Parallel()
 
-	qw := QueuedWork{}
-	qw.SessionID = "sess_shell"
-	qw.PlatformURL = "https://platform.example.com"
-	qw.AuthToken = "rsk_test"
-	root := "/abs/worktrees/sess_shell"
+	for _, tc := range harnessMCPCases(t) {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if got := defaultMCPServersForProvider(qw, root, agent.ProviderShell); got != nil {
-		t.Fatalf("shell implicit defaults = %+v, want nil platform gateway", got)
-	}
-	if got := defaultMCPServersForProvider(qw, root, agent.ProviderClaude); len(got) != 1 || got[0].Name != "donmai-platform" {
-		t.Fatalf("non-shell implicit defaults = %+v, want platform gateway", got)
-	}
+			harness, ok := tc.provider.(agent.HarnessProvider)
+			if !ok {
+				t.Fatalf("%s exposes no exact harness manifest", tc.name)
+			}
+			profile, ok := harness.Manifest().ToolLifecycleProfile(tc.mode)
+			if !ok {
+				t.Fatalf("%s declares no %s tool/lifecycle profile", tc.name, tc.mode)
+			}
+			if got := profile.MCPDelivery != agent.ToolDeliveryUnsupported; got != tc.deliversMCP {
+				t.Fatalf("table is stale: %s profile %q declares MCPDelivery=%q (delivers=%v), table says %v",
+					tc.name, profile.ID, profile.MCPDelivery, got, tc.deliversMCP)
+			}
+			if got := harnessDeliversMCP(tc.provider, tc.mode); got != tc.deliversMCP {
+				t.Fatalf("harnessDeliversMCP(%s, %s) = %v, want %v", tc.name, tc.mode, got, tc.deliversMCP)
+			}
 
-	manifest := (&shellprovider.Provider{}).Manifest()
-	profile, ok := manifest.ToolLifecycleProfile(agent.PromptModeHumanControlled)
-	if !ok {
-		t.Fatal("shell manifest is missing its interactive tool/lifecycle profile")
+			qw := QueuedWork{}
+			qw.SessionID = "sess_" + tc.name
+			qw.PlatformURL = "https://platform.example.com"
+			qw.AuthToken = "rsk_test"
+			root := "/abs/worktrees/" + qw.SessionID
+
+			adapt := func(servers []agent.MCPServerConfig) (agent.ToolLifecycleReceipt, error) {
+				spec := agent.Spec{PromptMode: tc.mode, MCPServers: servers}
+				if tc.mode == agent.PromptModeHumanControlled {
+					spec.Interactive = &agent.InteractiveSpec{}
+				}
+				_, receipt, err := agent.AdaptToolLifecycle(spec, profile)
+				return receipt, err
+			}
+			assertDenied := func(t *testing.T, servers []agent.MCPServerConfig) {
+				t.Helper()
+				receipt, err := adapt(servers)
+				var adaptationErr *agent.ToolAdaptationError
+				if !errors.As(err, &adaptationErr) || adaptationErr.Channel != agent.ToolChannelMCPServer {
+					t.Fatalf("AdaptToolLifecycle(%v) error = %v, want typed MCP denial",
+						mcpServerNames(servers), err)
+				}
+				if receipt.Decision != "denied" || len(receipt.Entries) != 1 || receipt.Entries[0].Outcome != agent.ToolOutcomeDenied {
+					t.Fatalf("denial receipt = %+v, want one denied MCP entry", receipt)
+				}
+			}
+
+			implicit := defaultMCPServersForHarness(qw, root, tc.provider, tc.mode)
+			if tc.deliversMCP {
+				if len(implicit) != 1 || implicit[0].Name != "donmai-platform" {
+					t.Fatalf("implicit defaults = %v, want the platform gateway", mcpServerNames(implicit))
+				}
+			} else if implicit != nil {
+				t.Fatalf("implicit defaults = %v, want no gateway on a harness declaring no MCP delivery",
+					mcpServerNames(implicit))
+			}
+
+			// THE defect: this spawn used to be denied before the agent ever
+			// started, on a set the runner injected all by itself.
+			if receipt, err := adapt(implicit); err != nil {
+				t.Fatalf("runner-injected MCP set denied the spawn: %v (receipt %+v)", err, receipt)
+			}
+
+			t.Run("caller-requested card MCP is never filtered", func(t *testing.T) {
+				t.Parallel()
+				card := []agent.MCPServerConfig{{Name: "card-tools", Type: "stdio", Command: "card-mcp"}}
+				servers := mergeMCPServers(defaultMCPServersForHarness(qw, root, tc.provider, tc.mode), card)
+				if !slices.Contains(mcpServerNames(servers), "card-tools") {
+					t.Fatalf("merged MCP set = %v, want the card entry retained", mcpServerNames(servers))
+				}
+				if tc.deliversMCP {
+					if receipt, err := adapt(servers); err != nil {
+						t.Fatalf("deliverable card MCP denied: %v (receipt %+v)", err, receipt)
+					}
+					return
+				}
+				if len(servers) != 1 {
+					t.Fatalf("merged MCP set = %v, want exactly the caller's entry", mcpServerNames(servers))
+				}
+				assertDenied(t, servers)
+			})
+
+			t.Run("caller-requested code-intel MCP is never filtered", func(t *testing.T) {
+				t.Parallel()
+				withCodeIntel := qw
+				withCodeIntel.CodeIntel = &prompt.CodeIntelWork{Repo: "owner/repo"}
+				servers := defaultMCPServersForHarness(withCodeIntel, root, tc.provider, tc.mode)
+				if !slices.Contains(mcpServerNames(servers), codeIntelServerName) {
+					t.Fatalf("defaults = %v, want the code-intel entry retained", mcpServerNames(servers))
+				}
+				if tc.deliversMCP {
+					if receipt, err := adapt(servers); err != nil {
+						t.Fatalf("deliverable code-intel MCP denied: %v (receipt %+v)", err, receipt)
+					}
+					return
+				}
+				if len(servers) != 1 {
+					t.Fatalf("defaults = %v, want exactly the code-intel entry", mcpServerNames(servers))
+				}
+				assertDenied(t, servers)
+			})
+		})
 	}
-	assertMCPDenied := func(t *testing.T, servers []agent.MCPServerConfig, wantName string) {
-		t.Helper()
-		if len(servers) != 1 || servers[0].Name != wantName {
-			t.Fatalf("shell MCP requirements = %+v, want retained %q", servers, wantName)
+}
+
+// TestHarnessMCPCases_CoverEveryRegisteredHarness keeps "every harness that
+// declares no MCP delivery" honest: a harness added to the fleet without a row
+// in harnessMCPCases fails here rather than silently escaping the table above.
+func TestHarnessMCPCases_CoverEveryRegisteredHarness(t *testing.T) {
+	t.Parallel()
+
+	covered := make(map[agent.HarnessName]bool)
+	for _, tc := range harnessMCPCases(t) {
+		harness, ok := tc.provider.(agent.HarnessProvider)
+		if !ok {
+			t.Fatalf("%s exposes no exact harness manifest", tc.name)
 		}
-		_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{
-			Interactive: &agent.InteractiveSpec{},
-			MCPServers:  servers,
-		}, profile)
-		var adaptationErr *agent.ToolAdaptationError
-		if !errors.As(err, &adaptationErr) || adaptationErr.Channel != agent.ToolChannelMCPServer {
-			t.Fatalf("AdaptToolLifecycle error = %v, want typed MCP denial", err)
-		}
-		if receipt.Decision != "denied" || len(receipt.Entries) != 1 || receipt.Entries[0].Outcome != agent.ToolOutcomeDenied {
-			t.Fatalf("denial receipt = %+v, want one denied MCP entry", receipt)
+		covered[harness.Manifest().Name] = true
+	}
+	for _, harness := range matrix.HarnessProvidersForParity() {
+		if name := harness.Manifest().Name; !covered[name] {
+			t.Errorf("harness %q has no harnessMCPCases row; add one declaring whether its "+
+				"tool/lifecycle profile delivers MCP", name)
 		}
 	}
-
-	t.Run("explicit card MCP remains required", func(t *testing.T) {
-		card := []agent.MCPServerConfig{{Name: "card-tools", Type: "stdio", Command: "card-mcp"}}
-		servers := mergeMCPServers(defaultMCPServersForProvider(qw, root, agent.ProviderShell), card)
-		assertMCPDenied(t, servers, "card-tools")
-	})
-
-	t.Run("explicit code intel MCP remains required", func(t *testing.T) {
-		withCodeIntel := qw
-		withCodeIntel.CodeIntel = &prompt.CodeIntelWork{Repo: "owner/repo"}
-		servers := defaultMCPServersForProvider(withCodeIntel, root, agent.ProviderShell)
-		assertMCPDenied(t, servers, "af-code-intelligence")
-	})
 }
 
 // TestDefaultMCPServers_CodeIntelInStandaloneMode verifies code-intel is a pure
@@ -315,7 +471,7 @@ func TestDefaultMCPServers_CodeIntelInStandaloneMode(t *testing.T) {
 	qw.CodeIntel = &prompt.CodeIntelWork{Repo: "owner/repo"}
 
 	root := "/abs/worktrees/standalone"
-	servers := defaultMCPServers(qw, root)
+	servers := defaultMCPServersForHarness(qw, root, mcpDeliveringHarness(), agent.PromptModeAutonomous)
 	if len(servers) != 1 {
 		t.Fatalf("len(servers) = %d, want 1 (code-intel only, no platform gate)", len(servers))
 	}
@@ -338,13 +494,13 @@ func TestDefaultMCPServers_NoBlockIsUnchanged(t *testing.T) {
 	gated.SessionID = "sess_x"
 	gated.PlatformURL = "https://platform.example.com"
 	gated.AuthToken = "rsk_test"
-	servers := defaultMCPServers(gated, "/abs/wt")
+	servers := defaultMCPServersForHarness(gated, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous)
 	if len(servers) != 1 || servers[0].Name != "donmai-platform" {
 		t.Errorf("no-block platform session must emit only the gate; got %+v", servers)
 	}
 
 	// Standalone, no block: nil (back-compat path preserved).
-	if got := defaultMCPServers(QueuedWork{}, "/abs/wt"); got != nil {
+	if got := defaultMCPServersForHarness(QueuedWork{}, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous); got != nil {
 		t.Errorf("no-block standalone must be nil; got %+v", got)
 	}
 }
@@ -368,7 +524,7 @@ func TestMergeMCPServers_CodeIntelDefaultWinsOnCollision(t *testing.T) {
 	}
 
 	root := "/abs/worktrees/sess_abc"
-	merged := mergeMCPServers(defaultMCPServers(qw, root), qw.McpServers)
+	merged := mergeMCPServers(defaultMCPServersForHarness(qw, root, mcpDeliveringHarness(), agent.PromptModeAutonomous), qw.McpServers)
 	if len(merged) != 3 {
 		t.Fatalf("merged len = %d, want 3 (gate + runner code-intel + card-extra; collision dropped)", len(merged))
 	}
@@ -427,5 +583,36 @@ func TestCodeIntelPartial_TaskConditionalLanguageNeutral(t *testing.T) {
 		if !strings.Contains(low, "rename or refactor") {
 			t.Errorf("%s partial should anchor find_type_usages to pre-edit cross-file rename/refactor:\n%s", name, got)
 		}
+	}
+}
+
+// TestBuildPreparedSourceSpec_OmitsImplicitGatewayWithoutMCPDelivery is the
+// prepared-harness twin of the loop guard. buildPreparedSourceSpec materializes
+// the runtime platform credentials itself (authorityWork), so the implicit
+// gateway is injected there regardless of what the caller sent — which made a
+// harness declaring no MCP delivery deny its own compiled plan. The compiled
+// source spec must carry no MCP requirement, name no runtime MCP server, and
+// survive the exact harness gate every provider runs in Spawn.
+func TestBuildPreparedSourceSpec_OmitsImplicitGatewayWithoutMCPDelivery(t *testing.T) {
+	t.Parallel()
+
+	provider := &piprovider.Provider{}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("PREPARED-NO-MCP")}
+	qw.PlatformURL = "https://platform.example.com"
+	qw.AuthToken = "rsk_test"
+
+	spec, runtimeNames, err := buildPreparedSourceSpec(qw, harnessSelection{Provider: provider})
+	if err != nil {
+		t.Fatalf("buildPreparedSourceSpec: %v", err)
+	}
+	if len(spec.MCPServers) != 0 {
+		t.Fatalf("prepared source MCP servers = %v, want none on a harness declaring no MCP delivery",
+			mcpServerNames(spec.MCPServers))
+	}
+	if len(runtimeNames) != 0 {
+		t.Fatalf("prepared runtime MCP names = %v, want none", runtimeNames)
+	}
+	if _, err := agent.PrepareHarness(spec, provider.Manifest()); err != nil {
+		t.Fatalf("prepared source spec cannot be admitted by its own harness: %v", err)
 	}
 }
