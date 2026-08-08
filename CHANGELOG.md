@@ -8,6 +8,126 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.57.6 — 2026-08-08
+
+### Features
+
+- **Every harness now DECLARES how a message reaches a session that is already
+  running.** `agent.NoticeDelivery` names the mechanism per harness — `hook`,
+  `mcp-rpc`, `http-session`, `acp`, `rpc-steer`, `resume-inject`,
+  `in-box-loop`, `pty-notice`, or `none` — and every in-tree manifest answers,
+  each verified against that harness's own CLI rather than assumed. The zero
+  value is UNDECLARED, deliberately not `none`, so a new harness cannot inherit
+  an answer by omission in either direction. A session that something upstream
+  must be able to reach (`Spec.RequiresLiveNotice`) is now REFUSED at admission
+  on a harness that declares `none` or declares nothing, with a typed
+  `SpecAdmissionError`, instead of launching an agent nobody can reach whose
+  messages a lower layer drops while reporting success. The PTY notice was
+  retargeted onto the same axis: `TryWriteNotice` is permitted only where the
+  harness declared `pty-notice`, acks fire when bytes reach the terminal rather
+  than on buffer, and an un-placeable payload now dead-letters observably
+  (rides back on the lock refresh with a reason token) instead of holding the
+  single in-flight slot for the life of the session.
+- **Messages can be delivered into a LIVE Claude turn, over the harness's
+  declared `hook` channel.** Until now live delivery was implemented for
+  exactly one harness — `shell`, via the PTY notice — and `shell` has no agent
+  behind its terminal, so for the harness interactive sessions actually run,
+  live delivery was dead by construction and every runtime inject aimed at it
+  was dead-lettered as channel-not-driven. The harness now gets a private drop
+  directory and a five-line POSIX hook installed via `--settings` as a JSON
+  string, so nothing lands in a tree the agent could read, edit, or commit; the
+  claim on a pending message is a rename, and that rename is itself the
+  forced-continuation loop guard. Routing is keyed on the manifest's declared
+  mechanism, never on a harness name.
+
+  **What is and is not proven.** The transport is deterministic and was
+  re-verified independently: `{"decision":"block"}` forces a continuation on
+  the real CLI, the reason text enters the conversation, the re-fire carries
+  `stop_hook_active=true`, and the loop guard suppresses it. What is NOT
+  deterministic is what the agent then does with the delivered text — that is
+  model behaviour, and an independent re-run of the live acceptance assertion
+  passed 1 of 2. Treat this as a working channel, not as a guarantee that an
+  injected instruction is acted on.
+
+  Two further limits, stated rather than papered over. A Stop hook fires when a
+  turn ENDS, so this reaches a session that is WORKING; a session idle at an
+  empty prompt has already fired its last Stop and is reached by the durable
+  mailbox instead. And the mailbox remains the floor — a message offered and
+  never collected, or offered to a session that exposed no channel, dead-letters
+  with an actionable reason, while one held when the session ends is left
+  unacked for requeue. `agent.NoticeChannel.Consumed` answers from the
+  recipient's own transcript record, so a hook that overruns its timeout (whose
+  output the CLI discards silently) is never reported as delivered.
+- **`agent/conformance` is now a runnable certification suite, not a 63-line
+  seed.** A harness author can run their own adapter against it: it imports
+  `agent` plus the standard library, needs no network and no credentials beyond
+  the author's own harness binary. The pure event-sequence checks
+  (`CheckSingleInit`, `CheckTerminalContract`, `CheckCompleteAssistantTexts`,
+  and the `CheckEventContract` composite) still take a drained `[]agent.Event`
+  and are unchanged for existing callers; on top sits `Run(ctx, Subject)
+  -> Report`, which drives a live adapter and awards capability tiers.
+
+  Tiers are earned, never declared, and honesty is mechanized rather than
+  documented: a not-applicable result without a reason is rewritten into a
+  failure, a not-applicable never earns its tier, and every report carries
+  `Report.Unverified` naming the rows the suite has no check for — so a green
+  report cannot be read as full certification. Driven-ness is asked PER CHANNEL
+  against the seam that actually carries it, so a harness cannot be credited
+  for a channel it does not drive: the `Handle.Inject` rail is evidence for
+  `mcp-rpc`/`http-session`/`acp`/`rpc-steer`/`in-box-loop` only, `pty-notice`
+  is proven through the same interactive seam the runner drives, and a
+  declarable mechanism missing from the table is a failure rather than a
+  default.
+- **The runner prefers a session-scoped bearer for the platform MCP gateway.**
+  That gateway's `Authorization` header is written ONCE into an MCP config file
+  at spawn and nothing ever rewrites it — not the daemon's runtime-credential
+  refresh, not the harness — so when the chosen bearer's lifetime is shorter
+  than the session's, the harness's platform tools silently vanish mid-session
+  with no error surfaced. The work item now carries optional `mcpAuthToken` /
+  `mcpAuthTokenExpiresAt` fields (additive and `omitempty` on both
+  `daemon.PollWorkItem` and `daemon.SessionDetail`; the daemon is a pure
+  forwarder and never parses, validates, or logs the value), and the gateway
+  header prefers that token when present.
+
+  **What this version alone changes: nothing, unless the server you connect to
+  stamps the field.** The worker bearer remains the fallback, that fallback is
+  PERMANENT rather than a migration shim — it is what keeps a self-hosted
+  platform that mints no session token working — and a platform that sends
+  nothing gets byte-identical behaviour to v0.57.5. Equally, a downstream
+  binary that embeds `donmai` only starts honouring the field once it ships a
+  build embedding THIS version; until then its sessions keep receiving the
+  worker bearer. The expiry hint is advisory only: the runner logs it once at
+  spawn when a gateway is actually mounted and never branches on it. The token
+  is used for the gateway header and nothing else — heartbeat, result-post,
+  activity-post, and the session preflight fetch still use `AuthToken`.
+
+### Fixes
+
+- **Three harnesses could not spawn at all in a platform-connected session, and
+  WHICH harnesses mount the implicit MCP gateway has changed.** The runner
+  injects a per-session platform MCP gateway on the caller's behalf whenever
+  platform credentials are present. Since the unified-admission work, an MCP
+  entry a harness cannot deliver DENIES the spawn rather than being silently
+  stripped — correct for a server the caller asked for, wrong for one the
+  runner added by itself — and the gateway's exemption was written against a
+  hardcoded harness NAME (`shell`). Every other harness whose tool/lifecycle
+  profile declares no MCP delivery was therefore handed a gateway its own
+  adapter then refused: `pi`, `ollama`, and `agy-cli` failed with `spawn
+  failed: tool/lifecycle adaptation denied (delivery_unsupported,
+  channel=mcp_server)`.
+
+  The exemption is now the DECLARED `MCPDelivery` of the harness's mode-scoped
+  tool/lifecycle profile, read off the live manifest — the same field the
+  adapter consults to admit or deny the `mcp-servers` requirement, so the runner
+  can no longer ask for a channel the adapter will refuse. Measured across the
+  whole fleet in autonomous mode, the gateway is now emitted for **claude,
+  codex, gemini, amp, opencode and stub**, and omitted for **agy-cli, ollama,
+  pi and shell**. Read this as a change in gateway coverage, not only as a
+  crash fix. Deliberately not over-corrected: an MCP server the CALLER
+  requested — an agent-card entry, or the code-intel plugin — is still never
+  filtered; it stays in the spec and denies loudly on a harness that cannot
+  deliver it.
+
 ### Chores
 
 - **`worker` and `fleet` are now marked deprecated, and `fleet scale` is
@@ -22,6 +142,59 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   directly instead of relocating the alias-registered `fleet-watch` command
   off root, which previously dragged that command's `Hidden` and
   `Deprecated` fields along with it.
+- **The hidden `daemon` and `fleet-watch` aliases are still present and still
+  work.** Their removal remains scheduled for **v0.58.0** and this patch
+  release does not perform it, because the precondition recorded at
+  `hostAliasRemovalVersion` is still unmet: service units written by earlier
+  builds invoke `<host-binary> daemon run`, a unit already on disk is only
+  rewritten by re-running `host install`, and no release path yet forces or
+  verifies that re-install. Deleting the aliases first would stop the service
+  on every machine that has not re-installed.
+- **The closed-source-reference guard is now the vendored `guard-b` linter.**
+  It replaces `scripts/leak-guard.sh`, whose own self-test fixtures were
+  literal banned strings (the file tripped its own rules and needed a
+  whole-file allowlist entry). `scripts/guard-b-lint.sh` and its self-test are
+  vendored byte-for-byte from the architecture corpus with a provenance header
+  pinning the source commit, and `scripts/check-guard-b-vendor-drift.sh` fails
+  CI if this copy drifts. The blocking scans are scoped to NEW content only
+  (staged changes, a pull request's commits, the squash message, the push
+  range); the full tracked-tree `--all` scan runs separately and NON-BLOCKING
+  as `make guard-report`, because the rules surface a large pre-existing
+  residue across dozens of files that predates the guard — 209 hits when it
+  was vendored, 201 as of this release. `.guard-allowlist`'s header documents
+  that residue and the path to curating it to zero.
+- **Five closed-source references were curated out of this file's own
+  history.** Because `--staged` scans whole staged files, `CHANGELOG.md`'s
+  pre-guard residue failed `make guard` the moment the file was touched at
+  all, so no release edit could pass the gate until they were dealt with. A
+  closed control-plane endpoint path, a closed environment-variable name, and
+  three references to a closed downstream repository are rewritten to describe
+  the behaviour instead. None is allowlisted: an allowlist entry asserts the
+  hit is legitimate, and these are exactly the content this repository must
+  not carry.
+- **Build-tag-gated test files can no longer rot unnoticed.** Six `_test.go`
+  files sat behind `//go:build` tags no target ever supplied, which excludes
+  them from `go build ./...` and `go test ./...` outright — not run, not
+  compiled, not even syntax-checked. `internal/testregistration` now walks
+  every `_test.go` for custom build tags and fails `make test` unless each tag
+  appears in a literal `-tags` flag in the Makefile or a workflow (literal, not
+  behind a variable, because the guard must read the text the toolchain really
+  receives), and `make test-tagged` type-checks all six. `tparallel` is also
+  enabled, catching a parent test whose `defer` teardown fires while a
+  `t.Parallel()` subtest is still paused; its style half is excluded because it
+  fires on correct tests and a guard people learn to scroll past stops
+  guarding.
+- **Stop-hook steering of an interactive Claude session is now measured rather
+  than assumed.** A build-tagged PTY spike drives the same `ptyhost.Spawn` path
+  interactive sessions use, with the negative control wired in as a peer test:
+  an identical session whose hook returns nothing must produce no artefact and
+  must still show the hook fired, so the green run is believable. It records
+  that `decision:block` does force a continuation, that `stop_hook_active`
+  flips true on the re-fire so the loop is guardable, that a per-hook `timeout`
+  is enforced and the block discarded silently, that `--settings` accepts a
+  JSON string and merges with the base sources, and that the workspace-trust
+  modal still parks a session on an untrusted directory even under
+  `--dangerously-skip-permissions`.
 
 ## v0.57.5 — 2026-08-07
 
@@ -696,7 +869,7 @@ donmai-architecture/ADR-2026-05-12-cli-linear-proxy.
   is true the `Authorization` header switches from raw `<APIKey>` (Linear-
   direct semantics) to `Bearer <APIKey>` (platform proxy semantics), and
   `NewProxiedClient` composes a `BaseURL` that targets the embedder's
-  `/api/cli/linear/graphql` proxy route. All query/mutation strings and
+  own GraphQL proxy route. All query/mutation strings and
   response decoders are unchanged — `linear.Linear` callers don't care
   which mode they got.
 - **`afcli.newLinearCmd(ds)` accepts a DataSource factory.** Matches every
@@ -780,8 +953,8 @@ instead of silently dropped.
   WARN that read like a fatal error has been clarified.
 - **Daemon wipes cached JWT on install/uninstall** — removes
   `~/.rensei/daemon.jwt` so a re-install on a stale machine doesn't loop on
-  a JWT minted for a worker_id the platform no longer knows. rensei-tui's
-  `host install` already had this behaviour; the upstream `af daemon
+  a JWT minted for a worker_id the platform no longer knows. A downstream
+  embedder's `host install` already had this behaviour; the upstream `af daemon
   install` now matches.
 
 ### Tests
@@ -806,7 +979,7 @@ instead of silently dropped.
 ### Features
 
 - **Daemon HTTP control API for the four operator surfaces (Wave 9)** — Provider, Kit, Workarea, and Routing surfaces now ship as canonical OSS endpoints under `/api/daemon/*`, joining the pre-existing seven daemon lifecycle routes. New endpoints: `GET /api/daemon/providers`, `GET /api/daemon/providers/<id>`, `GET /api/daemon/kits`, `GET /api/daemon/kits/<id>`, `GET /api/daemon/kits/<id>/verify-signature`, `POST /api/daemon/kits/<id>/{install,enable,disable}`, `GET /api/daemon/kit-sources`, `POST /api/daemon/kit-sources/<name>/{enable,disable}`, `GET /api/daemon/workareas`, `GET /api/daemon/workareas/<id>`, `POST /api/daemon/workareas/<archiveID>/restore`, `GET /api/daemon/workareas/<idA>/diff/<idB>`, `GET /api/daemon/routing/config`, `GET /api/daemon/routing/explain/<sessionID>`. Localhost-only auth model (no bearer). Contract locked in `donmai-architecture/ADR-2026-05-07-daemon-http-control-api.md`.
-- **`af provider` / `af kit` / `af workarea` / `af routing` Cobra command trees** — First-class top-level commands on the `af` binary, sourced from the new daemon HTTP surface. `provider list/show`, `kit list/show/install/enable/disable/verify/sources`, `workarea list/show/restore/diff`, `routing show/explain`. Each delegates to the local daemon at `127.0.0.1:7734` (overridable via `RENSEI_DAEMON_URL`) and renders through the new `afview/` package.
+- **`af provider` / `af kit` / `af workarea` / `af routing` Cobra command trees** — First-class top-level commands on the `af` binary, sourced from the new daemon HTTP surface. `provider list/show`, `kit list/show/install/enable/disable/verify/sources`, `workarea list/show/restore/diff`, `routing show/explain`. Each delegates to the local daemon at `127.0.0.1:7734` (overridable via the daemon-URL environment variable) and renders through the new `afview/` package.
 - **New public package `afview/`** — Houses surface-specific composed renderers (`afview/provider`, `afview/kit`, `afview/workarea`, `afview/routing`). Joins `afclient`/`afcli`/`worker` as the fourth public package. Both binaries (af and rensei) import the same renderers; no forks. Plain-text fallbacks for each surface's list/detail views are what `rensei-smokes` pins against.
 - **21 new `afclient` types** — Provider/Kit/Workarea/Routing wire types live in `afclient/{provider,kit,workarea,routing}_types.go` matching the daemon's `/api/daemon/*` namespace. Notable shapes: `ListProvidersResponse.PartialCoverage` flag (honest about agent-runtime-only coverage in this wave), `WorkareaSummary.Kind` discriminating active pool members vs on-disk archives, structured `WorkareaDiffEntry` with per-path SHA-256 hashes + size + mode + symlink target, `RoutingDecision` + `RoutingTraceStep` for per-session decision explain.
 - **8 new exported `afcli` factories** — `NewProviderCmd`, `NewKitCmd`, `NewWorkareaCmd`, `NewRoutingCmd` and their backing private helpers, exported via `afcli/exports.go` so downstream binaries can graft the canonical command trees under their own parent commands. The rensei binary uses these to expose `rensei host {provider,kit,workarea}` and `rensei routing` without forking.
@@ -818,7 +991,7 @@ instead of silently dropped.
 
 ### Fixes
 
-- **None specific to this release.** Wave 9 was a structural refactor; earlier observability bug (`auditClientFromConfig` delegating to the daemon-targeted client) was caught in rensei-tui's parallel cleanup and is fixed there.
+- **None specific to this release.** Wave 9 was a structural refactor; earlier observability bug (`auditClientFromConfig` delegating to the daemon-targeted client) was caught in a downstream embedder's parallel cleanup and is fixed there.
 
 ### Chores
 
@@ -967,5 +1140,5 @@ _Earlier cycle-1 releases. See git log for full history._
 ### Features
 
 - **Initial release** — `af` binary scaffolded with Cobra CLI framework, Bubble Tea TUI, and `afclient` API client. Covers `dashboard`, `status`, and `agent` commands against the AgentFactory coordinator API.
-- **Public library surface** — `afclient`, `afcli`, and `worker` packages are importable by downstream consumers (e.g., `rensei-tui`).
+- **Public library surface** — `afclient`, `afcli`, and `worker` packages are importable by downstream consumers.
 - **Cross-platform builds** — darwin/amd64, darwin/arm64, linux/amd64, linux/arm64 via goreleaser.
