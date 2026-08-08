@@ -144,6 +144,24 @@ type SessionDetail struct {
 	// PlatformURL is the base URL of the platform.
 	PlatformURL string `json:"platformUrl,omitempty"`
 
+	// McpAuthToken is an opaque platform-supplied bearer for the platform's
+	// per-session MCP gateway, and for nothing else. The daemon never parses,
+	// validates, or logs its value — it forwards the string from PollWorkItem
+	// exactly as received.
+	//
+	// It is deliberately NOT refreshed by UpdateRuntimeCredentials: that path
+	// exists because the worker bearer can be swapped under a running child,
+	// whereas this one is written once into an MCP config file the harness
+	// reads at spawn and nothing rewrites. Absent (a platform that mints none)
+	// is normal and safe — the runner falls back to AuthToken.
+	McpAuthToken string `json:"mcpAuthToken,omitempty"`
+
+	// McpAuthTokenExpiresAt is the RFC3339 UTC instant McpAuthToken stops being
+	// accepted. ADVISORY ONLY — log fodder so an operator can see the cliff
+	// coming. No consumer may gate behaviour on it. Absent whenever
+	// McpAuthToken is absent.
+	McpAuthTokenExpiresAt string `json:"mcpAuthTokenExpiresAt,omitempty"`
+
 	// CredentialPoolID is the non-secret pool accounting sentinel for
 	// metered and shared auth modes: "metered_pool_<provider>" or
 	// "shared_pool_<provider>". Absent for byok/host-session/local.
