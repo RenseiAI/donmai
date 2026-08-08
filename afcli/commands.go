@@ -29,8 +29,17 @@ type Config struct {
 
 	// EnableLegacyWorkerFleet registers the legacy worker/fleet process
 	// commands when true. These commands remain available to the standalone
-	// OSS af binary for local debugging, but embedders should expose `host`
-	// as the lifecycle surface instead.
+	// OSS donmai binary for local debugging, but embedders should expose
+	// `host` as the lifecycle surface instead — and per
+	// ADR-2026-08-03-cli-noun-tree-fleet-retirement.md D3, no embedder should
+	// ever set this true; it stays default-off for embedders.
+	//
+	// Both trees carry a Cobra Deprecated marker naming `host` as the
+	// replacement and a concrete removal version
+	// (legacyWorkerFleetRemovalVersion, fleet.go) — set at v0.59.0. Nothing
+	// in this repo yet fails a build when an alias/deprecated tree outlives
+	// its declared removal version (D5.4's release-gate check is unbuilt
+	// here; see the doc comment above legacyWorkerFleetRemovalVersion).
 	EnableLegacyWorkerFleet bool
 
 	// ProjectFunc returns the active project slug (or ID) used to scope

@@ -6,6 +6,23 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Chores
+
+- **`worker` and `fleet` are now marked deprecated, and `fleet scale` is
+  gone.** Both legacy process-supervision command trees (only ever registered
+  in the standalone binary, never by an embedder) now carry a Cobra
+  `Deprecated` marker naming `host` as the replacement and a concrete removal
+  version (`v0.59.0`) rather than an unfalsifiable "next release" promise.
+  `fleet scale` — a subcommand that has only ever returned an error — is
+  deleted outright rather than deprecated.
+- **The host-watch dashboard now has an exported constructor,
+  `afcli.NewHostWatchCmd`.** A composing downstream binary can construct it
+  directly instead of relocating the alias-registered `fleet-watch` command
+  off root, which previously dragged that command's `Hidden` and
+  `Deprecated` fields along with it.
+
 ## v0.57.5 — 2026-08-07
 
 ### Fixes
