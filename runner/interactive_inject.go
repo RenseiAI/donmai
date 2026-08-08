@@ -8,7 +8,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/runtime/heartbeat"
 )
 
 // This file is the interactive half of the runtime-inject rail.
@@ -23,14 +22,19 @@ import (
 // # What this leg may and may not do
 //
 // Delivering a message into a live session is a DECLARED per-harness
-// capability (agent.NoticeDelivery), never an assumed one. This leg implements
-// exactly ONE of the declared mechanisms — agent.NoticeDeliveryPTYNotice — and
-// that mechanism is correct for exactly one harness: `shell`, where there is no
-// agent behind the terminal to route around. A line written at an idle shell
-// prompt is a command the shell runs.
+// capability (agent.NoticeDelivery), never an assumed one, and never a
+// decision keyed off a harness's NAME. This leg implements TWO of the declared
+// mechanisms, which are opposite in shape:
 //
-// For every other interactive harness the same write is a KEYSTROKE into
-// whatever that harness's UI is currently drawing — a permission prompt, a plan
+//   - agent.NoticeDeliveryPTYNotice — PUSH. Correct for exactly one harness,
+//     `shell`, where there is no agent behind the terminal to route around: a
+//     line written at an idle shell prompt is a command the shell runs.
+//   - agent.NoticeDeliveryHook — PULL. The harness itself calls out at a
+//     lifecycle point and the message is delivered by answering that call
+//     (Claude Code's Stop hook). Nothing is typed at the terminal.
+//
+// For every OTHER interactive harness a PTY write is a KEYSTROKE into whatever
+// that harness's UI is currently drawing — a permission prompt, a plan
 // confirmation, a trust dialog — and a submit byte there selects the
 // highlighted option. So this leg REFUSES those outright and says why. It does
 // not best-effort them, and a refusal never acks: the message stays with its
@@ -39,11 +43,22 @@ import (
 // # Nothing here acks what it did not deliver
 //
 // The acceptor takes custody without claiming delivery (newInjectAcceptor's
-// ackOnBuffer=false for this mode) and the ack is issued at the instant the
-// bytes reach the PTY. A payload this session cannot place is either held for
-// retry, or DEAD-LETTERED — reported back to the producer with a reason so a
-// sender that was told "queued" can learn it died — never silently dropped and
-// never acked.
+// ackOnBuffer=false for this mode). A payload this session cannot place is
+// either held for retry, or DEAD-LETTERED — reported back to the producer with
+// a reason so a sender that was told "queued" can learn it died — never
+// silently dropped and never acked.
+//
+// Where the ack falls differs by shape, and the difference is the whole point
+// of separating them:
+//
+//   - PUSH acks when the bytes reach the PTY. For a shell there is nothing
+//     behind the terminal to consult; the write IS the arrival.
+//   - PULL acks only when the RECIPIENT'S OWN record shows the message entered
+//     its conversation (agent.NoticeChannel.Consumed). Placing a message where
+//     a harness will look is not delivery, and the interval between the two is
+//     unbounded: it ends when the current turn ends. A pull channel that acked
+//     on placement would report every silently-discarded message as delivered,
+//     which is the failure this axis exists to prevent.
 const (
 	// interactiveNoticeRetry is how long the supervisor waits before
 	// re-attempting a notice that was refused (human mid-composition, child on
@@ -67,6 +82,25 @@ const (
 	// "finish typing your line" and short enough that a queue behind it is not
 	// meaningfully delayed.
 	interactiveNoticeMaxAttempts = 30
+
+	// interactiveNoticePullMaxPolls bounds how long ONE notice may sit on a
+	// PULL channel, offered but not yet consumed, before it is dead-lettered.
+	//
+	// It is a SEPARATE bound from interactiveNoticeMaxAttempts, and separating
+	// them is not tidiness. An attempt is a refusal — the session was asked and
+	// said no — and thirty of those is decisive. A poll is not a refusal: it is
+	// the runner asking "has the turn ended yet?", and the honest answer can be
+	// "no" for as long as the agent keeps working. Spending the refusal budget
+	// on waiting would dead-letter every message sent to a session doing a
+	// minute of real work, which is most of them.
+	//
+	// It is still bounded, because the rail allows one notice in flight per
+	// session: a channel nobody ever collects from would otherwise hold the
+	// slot for the life of the session and starve everything behind it. 450 ×
+	// interactiveNoticeRetry = 15 minutes, which is longer than an agent turn
+	// and short enough that the producer gets its payload back while the fact
+	// still matters.
+	interactiveNoticePullMaxPolls = 450
 
 	// interactiveNoticeTruncated marks a notice clipped to the canonical-mode
 	// input bound. The full text remains wherever it was durably queued.
@@ -108,6 +142,25 @@ const (
 	// noticeDeadAttemptCap — the notice was legitimately deliverable but the
 	// session refused it interactiveNoticeMaxAttempts times running.
 	noticeDeadAttemptCap = "attempt-cap-exceeded"
+
+	// noticeDeadChannelAbsent — the harness declares a PULL channel this build
+	// drives, but THIS session exposed none (the handle is not
+	// agent.NoticeChannelCapable, or its channel is nil). Structural for the
+	// life of the session: a channel is established at spawn or not at all.
+	//
+	// This is the fallback seam. A Claude session whose Stop-hook drop could
+	// not be created still runs — it just has no live-turn delivery — and every
+	// message aimed at it is reported here rather than accepted into a channel
+	// that does not exist. The durable mailbox remains the delivery path.
+	noticeDeadChannelAbsent = "harness-exposed-no-channel"
+
+	// noticeDeadNotConsumed — the notice was offered on a pull channel and the
+	// recipient never took it within interactiveNoticePullMaxPolls. The three
+	// measured ways this happens on a Stop hook are all silent from the
+	// session's side: the hook overran its timeout and its output was
+	// discarded, the session was parked on a modal so no turn ever ended, or
+	// the session went idle at an empty prompt where Stop has already fired.
+	noticeDeadNotConsumed = "not-consumed"
 )
 
 // noticeChannelDrivenByRunner reports whether THIS build can actually push a
@@ -120,20 +173,34 @@ const (
 // are checked.
 //
 // This is the SEAM the per-channel lanes land on. Adding a channel means
-// implementing its push and adding it here — in the same change, so the
+// implementing its delivery and adding it here — in the same change, so the
 // declaration and the capability move together:
 //
-//   - agent.NoticeDeliveryHook (claude-code, interactive) is owned by a
-//     separate lane and gated on an empirical spike; it is deliberately absent
-//     here, so a claude interactive session refuses and requeues rather than
-//     typing at a live agent UI.
+//   - agent.NoticeDeliveryPTYNotice (shell) is driven as a PUSH, straight at
+//     the terminal, because for that harness the terminal is the recipient.
+//   - agent.NoticeDeliveryHook (claude-code, interactive) is driven as a PULL
+//     through agent.NoticeChannel: the runner offers, the harness's Stop hook
+//     collects, and the ack waits on the harness's own transcript. Nothing is
+//     typed at the terminal on this path.
 //   - agent.NoticeDeliveryMCPRPC (codex app-server), NoticeDeliveryHTTPSession
 //     (opencode serve), NoticeDeliveryRPCSteer (pi), NoticeDeliveryACP,
-//     NoticeDeliveryResumeInject and NoticeDeliveryInBoxLoop are likewise not
-//     driven by THIS leg — the headless/interview legs reach some of them
-//     through Handle.Inject, which is a different rail with a different seam.
+//     NoticeDeliveryResumeInject and NoticeDeliveryInBoxLoop are not driven by
+//     THIS leg — the headless/interview legs reach some of them through
+//     Handle.Inject, which is a different rail with a different seam.
 func noticeChannelDrivenByRunner(nd agent.NoticeDelivery) bool {
-	return nd == agent.NoticeDeliveryPTYNotice
+	return nd == agent.NoticeDeliveryPTYNotice || nd == agent.NoticeDeliveryHook
+}
+
+// noticeChannelIsPull reports whether the declared mechanism delivers by being
+// COLLECTED FROM rather than written to — i.e. whether this leg drives it
+// through agent.NoticeChannel instead of agent.InteractiveNotifier.
+//
+// Keyed off the declared mechanism, never off the harness's name. A hardcoded
+// provider-name exemption on this rail has already caused one live regression
+// (three harnesses could not spawn at all in a connected session), so the only
+// input allowed here is the manifest's own answer.
+func noticeChannelIsPull(nd agent.NoticeDelivery) bool {
+	return nd == agent.NoticeDeliveryHook
 }
 
 // formatInteractiveNotice renders one inject payload as the exact byte slice
@@ -157,8 +224,14 @@ func noticeChannelDrivenByRunner(nd agent.NoticeDelivery) bool {
 //     input box — and never merges with anything else. Read that constant's
 //     doc before changing this byte; CR vs LF is the difference between the
 //     peer taking a turn and the peer never seeing the message.
-func formatInteractiveNotice(p heartbeat.InjectPayload) []byte {
-	text := strings.TrimSpace(flattenNoticeText(p.Text))
+//
+// It is the PUSH path's formatter only. A pull channel carries the message as
+// a structured field to the harness's own API, where none of these three rules
+// applies: flattening would destroy a multi-line message the harness can carry
+// perfectly well, and a trailing CR would be a stray character in a JSON
+// string, not a submit key.
+func formatInteractiveNotice(text string) []byte {
+	text = strings.TrimSpace(flattenNoticeText(text))
 	if text == "" {
 		return nil
 	}
@@ -289,39 +362,56 @@ const (
 // starved behind it.
 type interactiveNoticeQueue struct {
 	// channel is the harness's DECLARED notice-delivery mechanism. It decides
-	// whether this leg may write at all; see noticeChannelDrivenByRunner.
+	// whether this leg may deliver at all, and by which shape; see
+	// noticeChannelDrivenByRunner and noticeChannelIsPull.
 	channel agent.NoticeDelivery
 	sink    noticeSink
 
-	pending    []byte
+	// text is the held payload as the PRODUCER wrote it — unflattened,
+	// untruncated, no submit byte. Each transport renders it for its own
+	// surface at attempt time, because the renderings are incompatible: the
+	// PTY needs one flattened self-submitting line, a pull channel needs the
+	// message intact.
+	text       string
 	deliveryID string
-	attempts   int
+
+	// attempts counts REFUSALS and errors (the push path's bound).
+	attempts int
+	// polls counts waits on a pull channel that has taken the offer but not
+	// yet been collected from. Deliberately not the same counter as attempts —
+	// see interactiveNoticePullMaxPolls.
+	polls int
+	// offered records that the pull channel has custody, so the offer is not
+	// rewritten on every poll.
+	offered bool
 
 	warned bool // hard write error surfaced on the Result once
 }
 
 // idle reports whether the slot is free (the supervisor may read injectCh).
-func (q *interactiveNoticeQueue) idle() bool { return q.pending == nil }
+func (q *interactiveNoticeQueue) idle() bool { return q.text == "" }
 
 // undelivered reports how many notices this session never got onto the PTY:
 // the one still held plus everything left buffered upstream. Reported at
 // session end so an operator sees the shortfall instead of inferring it.
 // Dead-lettered payloads are NOT counted — they were reported individually.
 func (q *interactiveNoticeQueue) undelivered(buffered int) int {
-	if q.pending != nil {
+	if !q.idle() {
 		return buffered + 1
 	}
 	return buffered
 }
 
-// hold parks a formatted notice in the slot.
-func (q *interactiveNoticeQueue) hold(notice []byte, deliveryID string) {
-	q.pending, q.deliveryID, q.attempts = notice, deliveryID, 0
+// hold parks a payload in the slot.
+func (q *interactiveNoticeQueue) hold(text, deliveryID string) {
+	q.text, q.deliveryID = text, deliveryID
+	q.attempts, q.polls, q.offered = 0, 0, false
 }
 
 // clear frees the slot.
 func (q *interactiveNoticeQueue) clear() {
-	q.pending, q.deliveryID, q.attempts = nil, "", 0
+	q.text, q.deliveryID = "", ""
+	q.attempts, q.polls, q.offered = 0, 0, false
 }
 
 // deadLetter reports the held payload as undeliverable and frees the slot.
@@ -351,8 +441,11 @@ func (q *interactiveNoticeQueue) deadLetter(r *Runner, qw QueuedWork, res *Resul
 // implements the notifier. Only genuinely transient conditions (the human is
 // mid-composition, the child is on the alternate screen, a write failed) earn a
 // retry, and even those are bounded.
-func (q *interactiveNoticeQueue) attempt(r *Runner, qw QueuedWork, res *Result, isess agent.InteractiveSession) noticeOutcome {
-	if q.pending == nil {
+func (q *interactiveNoticeQueue) attempt(
+	r *Runner, qw QueuedWork, res *Result,
+	isess agent.InteractiveSession, nch agent.NoticeChannel,
+) noticeOutcome {
+	if q.idle() {
 		return noticeDelivered
 	}
 
@@ -366,19 +459,113 @@ func (q *interactiveNoticeQueue) attempt(r *Runner, qw QueuedWork, res *Result, 
 				declaredOrUndeclared(q.channel)))
 	}
 
+	if noticeChannelIsPull(q.channel) {
+		return q.attemptPull(r, qw, res, nch)
+	}
+	return q.attemptPush(r, qw, res, isess)
+}
+
+// attemptPull drives one poll of a collect-from channel: offer once, then ask
+// the recipient's own record whether it has been taken.
+//
+// The ack is issued on CONSUMPTION and nowhere else. Offer succeeding means the
+// message is where the harness will look; it does not mean the harness looked,
+// and on a Stop hook the two can be separated by an entire agent turn — or
+// forever, if the turn never ends.
+func (q *interactiveNoticeQueue) attemptPull(
+	r *Runner, qw QueuedWork, res *Result, nch agent.NoticeChannel,
+) noticeOutcome {
+	// STRUCTURAL: the mechanism is declared and driven, but THIS session has
+	// no channel. Established at spawn or not at all, so retrying is theatre.
+	// The message goes back to its producer and waits in the durable mailbox
+	// for the agent to pull it.
+	if nch == nil {
+		return q.deadLetter(r, qw, res, noticeDeadChannelAbsent,
+			fmt.Sprintf("harness declares notice delivery %q but this session exposed no channel; "+
+				"live-turn delivery is unavailable for its lifetime and the message stays with its producer",
+				declaredOrUndeclared(q.channel)))
+	}
+
+	if !q.offered {
+		if err := nch.Offer(q.deliveryID, q.text); err != nil {
+			q.attempts++
+			q.warnOnce(res, fmt.Sprintf("notice channel offer failed (held for retry): %v", err))
+			r.logger.Warn("[interactive] notice offer failed — holding for retry",
+				"sessionId", qw.SessionID, "deliveryId", q.deliveryID,
+				"noticeDelivery", string(q.channel), "attempt", q.attempts, "err", err)
+			return q.holdOrDeadLetter(r, qw, res, err.Error())
+		}
+		q.offered = true
+		r.logger.Info("[interactive] notice offered on the harness's declared channel — awaiting consumption",
+			"sessionId", qw.SessionID, "deliveryId", q.deliveryID,
+			"noticeDelivery", string(q.channel), "bytes", len(q.text))
+		// Fall through rather than returning: the harness can collect between
+		// the offer and the next tick, and asking costs one read.
+	}
+
+	consumed, err := nch.Consumed()
+	if err != nil {
+		q.attempts++
+		q.warnOnce(res, fmt.Sprintf("notice consumption check failed (held for retry): %v", err))
+		r.logger.Warn("[interactive] notice consumption check failed — holding for retry",
+			"sessionId", qw.SessionID, "deliveryId", q.deliveryID,
+			"attempt", q.attempts, "err", err)
+		return q.holdOrDeadLetter(r, qw, res, err.Error())
+	}
+	if consumed {
+		r.logger.Info("[interactive] notice consumed by the live session",
+			"sessionId", qw.SessionID, "deliveryId", q.deliveryID,
+			"noticeDelivery", string(q.channel), "polls", q.polls)
+		// ACK ON CONSUMPTION: the recipient's own record now shows the message
+		// in its conversation. This is the first instant at which upstream may
+		// call it delivered, and no earlier instant is honest.
+		if q.sink != nil {
+			q.sink.AckInject(q.deliveryID)
+		}
+		q.clear()
+		return noticeDelivered
+	}
+
+	q.polls++
+	if q.polls < interactiveNoticePullMaxPolls {
+		return noticeHeld
+	}
+
+	// The wait is spent. Withdraw the offer first so a late collection cannot
+	// deliver a message we are about to report as dead — and note that a
+	// failed withdrawal is not a reason to keep waiting: retracted == false
+	// means the harness already claimed it and produced no record of it
+	// landing, which is exactly the discarded-output case.
+	retracted, rerr := nch.Retract()
+	detail := fmt.Sprintf("offered but not consumed after %d polls over ~%s (retracted=%v)",
+		q.polls, time.Duration(interactiveNoticePullMaxPolls)*interactiveNoticeRetry, retracted)
+	if rerr != nil {
+		detail += fmt.Sprintf("; retract failed: %v", rerr)
+	}
+	return q.deadLetter(r, qw, res, noticeDeadNotConsumed, detail)
+}
+
+// attemptPush drives one write of a write-to channel (pty-notice).
+func (q *interactiveNoticeQueue) attemptPush(
+	r *Runner, qw QueuedWork, res *Result, isess agent.InteractiveSession,
+) noticeOutcome {
+	notice := formatInteractiveNotice(q.text)
+	if notice == nil {
+		// Unreachable: the supervisor drops blank payloads before holding
+		// them. Settling it here rather than looping keeps the slot free.
+		q.clear()
+		return noticeDelivered
+	}
+
 	q.attempts++
-	written, err := deliverInteractiveNotice(isess, q.pending)
+	written, err := deliverInteractiveNotice(isess, notice)
 	switch {
 	// STRUCTURAL 2: pty-notice is declared but this surface cannot take one.
 	case err != nil && errors.Is(err, agent.ErrUnsupported):
 		return q.deadLetter(r, qw, res, noticeDeadSurfaceNotNotifier, err.Error())
 
 	case err != nil:
-		if !q.warned {
-			q.warned = true
-			res.PostSessionWarnings = append(res.PostSessionWarnings,
-				fmt.Sprintf("interactive notice delivery failed (held for retry): %v", err))
-		}
+		q.warnOnce(res, fmt.Sprintf("interactive notice delivery failed (held for retry): %v", err))
 		r.logger.Warn("[interactive] notice write failed — holding for retry",
 			"sessionId", qw.SessionID, "deliveryId", q.deliveryID,
 			"attempt", q.attempts, "err", err)
@@ -392,15 +579,26 @@ func (q *interactiveNoticeQueue) attempt(r *Runner, qw QueuedWork, res *Result, 
 	}
 
 	r.logger.Info("[interactive] notice delivered to the live PTY",
-		"sessionId", qw.SessionID, "deliveryId", q.deliveryID, "bytes", len(q.pending))
-	// ACK ON DELIVERY, not on buffer: this is the first instant at which the
-	// payload has demonstrably reached its destination surface, so it is the
-	// first instant at which it may be marked delivered upstream.
+		"sessionId", qw.SessionID, "deliveryId", q.deliveryID, "bytes", len(notice))
+	// ACK ON DELIVERY, not on buffer: for a harness with no agent behind the
+	// terminal, the PTY write IS the arrival — there is nothing further to
+	// consult. Contrast attemptPull, where the same instant proves nothing.
 	if q.sink != nil {
 		q.sink.AckInject(q.deliveryID)
 	}
 	q.clear()
 	return noticeDelivered
+}
+
+// warnOnce records the first hard failure of a held notice on the Result. Later
+// failures of the same notice are logged but not repeated on the Result, which
+// would otherwise carry one warning per retry.
+func (q *interactiveNoticeQueue) warnOnce(res *Result, msg string) {
+	if q.warned {
+		return
+	}
+	q.warned = true
+	res.PostSessionWarnings = append(res.PostSessionWarnings, msg)
 }
 
 // holdOrDeadLetter keeps a transiently-refused notice for another try, or
