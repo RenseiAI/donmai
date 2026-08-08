@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/prompt"
@@ -303,16 +304,21 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// metadata.
 	specEnv := buildSessionEnv(qw)
 
-	// 4. Build MCP config (capability-gated by translateSpec later).
+	// 4. Build MCP config. The exact harness adapter applies or denies the
+	// resulting set before spawn; nothing here is silently dropped.
 	//
-	// The platform per-session HTTP gate (defaultMCPServers) ALWAYS leads:
+	// The platform per-session HTTP gate leads whenever it is emitted at all:
 	// it is the A2A capability-bundle + tool-call allow-list enforcement
-	// point, so it must remain in the set. The agent card's MCP servers
-	// (qw.McpServers, WS5) are APPENDED after it; dedup is by server name
-	// with the default winning on collision (the platform gate is never
-	// shadowed by a card entry of the same name). Additive: no card servers
-	// → identical to the prior behaviour.
-	mcpServers := mergeMCPServers(defaultMCPServersForProvider(qw, wpath, provider.Name()), qw.McpServers)
+	// point, so it must never be shadowed. It is emitted only for a harness
+	// that declares MCP delivery for this session mode — see
+	// defaultMCPServersForHarness. The agent card's MCP servers (qw.McpServers,
+	// WS5) are APPENDED after it, unfiltered: they are caller-requested, so an
+	// undeliverable one must deny loudly. Dedup is by server name with the
+	// default winning on collision.
+	mcpServers := mergeMCPServers(
+		defaultMCPServersForHarness(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell)),
+		qw.McpServers,
+	)
 	mcpResult, err := buildMCPConfigPath(r.mcpb, mcpServers)
 	if err != nil {
 		res.Status = "failed"
@@ -1799,14 +1805,14 @@ func envOrDefault(key, def string) string {
 // the agent) a traceable author identity rather than whatever the git global
 // config happens to contain inside the cloud sandbox or local worktree.
 //
-// Single-source precedence: a provisioner-stamped identity wins. The cloud box
-// provisioner injects the canonical "Rensei Agent" GIT_AUTHOR_*/GIT_COMMITTER_*
-// into the box env; when present it is authoritative here, so the runner's
-// backstop commits carry the SAME identity as the agent's own in-box commits
-// instead of overriding them with a divergent "Donmai Agent" persona. Absent a
-// provisioner value (standalone / local worktree), fall back to a
-// session-derived default: the issue identifier as the display name and the
-// session id as the email so every commit is unambiguously linked to its
+// Single-source precedence: a provisioner-stamped identity wins. A cloud box
+// provisioner may inject its own canonical agent identity as
+// GIT_AUTHOR_*/GIT_COMMITTER_* in the box env; when present it is authoritative
+// here, so the runner's backstop commits carry the SAME identity as the agent's
+// own in-box commits instead of overriding them with a divergent "Donmai Agent"
+// persona. Absent a provisioner value (standalone / local worktree), fall back
+// to a session-derived default: the issue identifier as the display name and
+// the session id as the email so every commit is unambiguously linked to its
 // originating session.
 func buildSessionEnv(qw QueuedWork) map[string]string {
 	// Derive a stable display name: prefer the issue identifier, fall back
@@ -1880,8 +1886,53 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	return envMap
 }
 
-// defaultMCPServers returns the list of MCP servers every session ships
-// with by default.
+// sessionPromptMode returns the session mode the exact harness adapter will
+// resolve for the spec this run produces, so every runner-owned decision that
+// depends on a mode-scoped profile reads the SAME mode the adapter will.
+//
+// agent.PromptModeForSpec prefers Spec.PromptMode and falls back to
+// Spec.Interactive. Receipt-bearing runs stamp Spec.PromptMode from the
+// admitted execution cell (buildPreparedSourceSpec), and validateReceiptCell
+// already pins that cell to human-controlled exactly when the work is
+// interactive or an interview — so the OR below is faithful to both lanes:
+// the cell decides when there is one, and Spec.Interactive decides otherwise.
+func sessionPromptMode(qw QueuedWork, cell executioncell.ResolvedExecutionCell) agent.PromptSessionMode {
+	if cell.SessionMode == executioncell.SessionHumanControlled || qw.isInteractive() {
+		return agent.PromptModeHumanControlled
+	}
+	return agent.PromptModeAutonomous
+}
+
+// harnessDeliversMCP reports whether the exact harness selected for a session
+// can deliver Spec.MCPServers AT ALL in the given session mode.
+//
+// The predicate is the DECLARED tool/lifecycle profile's MCPDelivery, read off
+// the live manifest — never inferred from the harness's name. That field is
+// precisely what agent.AdaptToolLifecycle consults to admit or deny the
+// "mcp-servers" requirement, so reading the same field the adapter reads is
+// what keeps the runner from ever injecting a channel the adapter will refuse.
+//
+// Capabilities().AcceptsMcpServerSpec is only the FLAT projection: nothing ties
+// it structurally to MCPDelivery (matrix/parity_test.go pins it against
+// Manifest().Caps alone), and the adapter never reads it. It is therefore the
+// fallback for a runtime that exposes no manifest, not the authority.
+//
+// A harness that declares no profile for the mode cannot deliver anything in
+// that mode — agent.PrepareToolLifecycle denies the whole spawn — so it reports
+// false rather than adding a requirement that is guaranteed to be denied.
+func harnessDeliversMCP(provider agent.Provider, mode agent.PromptSessionMode) bool {
+	if provider == nil {
+		return false
+	}
+	if harness, ok := provider.(agent.HarnessProvider); ok {
+		profile, found := harness.Manifest().ToolLifecycleProfile(mode)
+		return found && profile.MCPDelivery != agent.ToolDeliveryUnsupported
+	}
+	return provider.Capabilities().AcceptsMcpServerSpec
+}
+
+// defaultMCPServersForHarness returns the list of MCP servers a session ships
+// with by default, for one exact harness in one session mode.
 //
 // Leads with one HTTP entry per session pointing at the platform's
 // per-session MCP endpoint (/api/mcp/<sessionId>). The platform applies
@@ -1893,31 +1944,31 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 // without a platform), the gate entry is omitted: the agent runs without any
 // platform MCP gate, which matches the legacy back-compat path.
 //
+// The gate is ALSO omitted when the selected harness declares no MCP delivery
+// for this mode (harnessDeliversMCP). This entry is the runner's own implicit
+// injection, made on the caller's behalf and never requested by them: asking a
+// harness that has no MCP channel to mount it denies the spawn outright for a
+// capability the session never asked for. An MCP server the CALLER did request
+// — an agent-card entry, or the code-intel plugin below — is deliberately NOT
+// filtered here: it stays in the spec, reaches the adapter, and fails loudly
+// rather than being silently stripped.
+//
 // F.5 code-intel: when qw.CodeIntel is set the runner appends the in-box
 // af-code-intelligence stdio plugin (os.Executable() + `mcp code-intel --root
 // <wpath>`) AFTER the platform gate. root is the provisioned worktree path
 // (loop.go step 2) and MUST be passed explicitly — the caller builds this list
 // AFTER Provision so wpath exists. This function is the single place the runner
 // extends MCP defaults.
-func defaultMCPServers(qw QueuedWork, wpath string) []agent.MCPServerConfig {
-	return defaultMCPServersForProvider(qw, wpath, "")
-}
-
-// defaultMCPServersForProvider builds runner-owned MCP defaults for an exact
-// harness. A bare shell exposes no model/tool/service surface, so it does not
-// receive the implicit platform gateway. Explicit card MCP servers are merged
-// later, and explicit code-intel requests remain here, so both still reach the
-// shell adapter and fail closed instead of being silently stripped.
-func defaultMCPServersForProvider(qw QueuedWork, wpath string, providerName agent.ProviderName) []agent.MCPServerConfig {
+func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Provider, mode agent.PromptSessionMode) []agent.MCPServerConfig {
 	var servers []agent.MCPServerConfig
 
 	// Platform per-session HTTP gate — omitted in standalone mode (no platform
 	// creds). Always leads the list so it is never shadowed by a later entry.
-	if providerName != agent.ProviderShell && qw.PlatformURL != "" && qw.AuthToken != "" && qw.SessionID != "" {
+	if harnessDeliversMCP(provider, mode) && qw.PlatformURL != "" && qw.AuthToken != "" && qw.SessionID != "" {
 		url := strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID
 		servers = append(servers, agent.MCPServerConfig{
-			// Brand-derived so OSS renders "donmai-platform" while the closed
-			// rensei binary (statehome brand "rensei") renders "rensei-platform"
+			// Brand-derived: the label is statehome.Brand()+"-platform", so a
+			// rebranded build of this same code renders its own brand's label
 			// byte-identically. The platform reports its own serverInfo.name
 			// independently; this is the client-side label only.
 			Name: statehome.Brand() + "-platform",
