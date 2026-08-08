@@ -30,9 +30,16 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:           false,
 			ToolPermissionFormat:     "claude",
 			StreamingTransport:       "ndjson", // reuses claude JSONL mapper
-			Drives:                   []agent.WireProtocol{agent.ProtoAnthropicMessages},
-			DrivesHosts:              []agent.ServingHost{agent.HostDirect},
-			Transport:                agent.TransportCLIInjection,
+			// `amp threads continue <threadId>` is a real amp subcommand
+			// (`amp threads --help` lists continue/c) and is the only door
+			// back into an existing conversation — a fresh invocation, not a
+			// message into the live process. Named in amp.go's Capabilities
+			// comment as the deferred mechanism; the CHANNEL is declared
+			// here, driving it is a separate lane.
+			NoticeDelivery: agent.NoticeDeliveryResumeInject,
+			Drives:         []agent.WireProtocol{agent.ProtoAnthropicMessages},
+			DrivesHosts:    []agent.ServingHost{agent.HostDirect},
+			Transport:      agent.TransportCLIInjection,
 		},
 		PromptDelivery: []agent.PromptDeliveryProfile{{
 			ID: "amp/headless/execute-v1", Mode: agent.PromptModeAutonomous,

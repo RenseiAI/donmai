@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/RenseiAI/donmai/agent"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
@@ -71,6 +72,25 @@ type Spec struct {
 	// anchors its host sequence and rel_time to its own process lifetime and
 	// stamps this value. Zero is a valid default.
 	Epoch uint64
+
+	// NoticeDelivery is the DECLARED notice-delivery mechanism of the harness
+	// whose child this PTY is running (agent.HarnessCaps.NoticeDelivery,
+	// plumbed through by the spawning driver from the live manifest).
+	//
+	// It exists to make Session.TryWriteNotice structurally refusable rather
+	// than caller-disciplined. Writing a self-submitting line into a PTY is
+	// the CORRECT primitive only when nothing is interpreting keystrokes on
+	// the other side — i.e. only for agent.NoticeDeliveryPTYNotice, which the
+	// shell harness declares because there is no agent behind its terminal.
+	// For a harness running its own UI the same bytes are a keystroke into
+	// whatever that UI is drawing, and the submit byte picks the highlighted
+	// option; the fact that the terminal cannot SEE that state is exactly why
+	// the permission to write has to be declared up front instead of guessed
+	// at write time.
+	//
+	// The zero value is "undeclared", which refuses. A session that means to
+	// accept notices must say so.
+	NoticeDelivery agent.NoticeDelivery
 
 	// Logger receives non-fatal diagnostics (e.g. escape-unsafe snapshot cells
 	// replaced with U+FFFD). Nil uses slog.Default().

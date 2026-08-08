@@ -40,10 +40,33 @@ import (
 // viewer), and the focused tests reuse its handle directly.
 type interactivePTYProvider struct {
 	command []string
+	// caps is what the provider declares. Zero value = no capabilities, which
+	// is what most interactive tests want; the runtime-inject tests declare
+	// SupportsMessageInjection so runLoop wires the heartbeat's OnInject.
+	caps agent.Capabilities
+	// spawned, when non-nil, receives every live ptyhost.Session this
+	// provider creates, so a test driving the FULL runner can subscribe to
+	// the real PTY stream without an attach leg.
+	spawned chan *ptyhost.Session
+	// noticeDelivery is what this provider DECLARES on its manifest, and the
+	// permission its PTY session is spawned with. Deliberately NOT defaulted:
+	// the whole axis exists because the answer differs per harness, so a test
+	// that wants notices delivered has to say so, exactly as a manifest does.
+	noticeDelivery agent.NoticeDelivery
 }
 
 func (p *interactivePTYProvider) Name() agent.ProviderName         { return agent.ProviderShell }
-func (p *interactivePTYProvider) Capabilities() agent.Capabilities { return agent.Capabilities{} }
+func (p *interactivePTYProvider) Capabilities() agent.Capabilities { return p.caps }
+
+// Manifest makes this an agent.HarnessProvider, which is how the runner reads
+// the declared notice-delivery channel. It borrows the real shell manifest so
+// everything else about the fixture stays faithful, and overrides only the
+// axis under test.
+func (p *interactivePTYProvider) Manifest() agent.HarnessManifest {
+	m := (&shell.Provider{}).Manifest()
+	m.Caps.NoticeDelivery = p.noticeDelivery
+	return m
+}
 
 func (p *interactivePTYProvider) Resume(context.Context, string, agent.Spec) (agent.Handle, error) {
 	return nil, agent.ErrUnsupported
@@ -55,7 +78,7 @@ func (p *interactivePTYProvider) Spawn(ctx context.Context, spec agent.Spec) (ag
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	ph := ptyhost.Spec{Command: p.command, Cwd: spec.Cwd}
+	ph := ptyhost.Spec{Command: p.command, Cwd: spec.Cwd, NoticeDelivery: p.noticeDelivery}
 	if spec.Interactive != nil {
 		// Geometry stays at ptyhost defaults (80×24); the runner sets only
 		// RecordPath (loop.go), which we honor so the cast lands in the
@@ -65,6 +88,12 @@ func (p *interactivePTYProvider) Spawn(ctx context.Context, spec agent.Spec) (ag
 	sess, err := ptyhost.Spawn(ph)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	if p.spawned != nil {
+		select {
+		case p.spawned <- sess:
+		default:
+		}
 	}
 	handle := newInteractivePTYHandle(sess)
 	if err := ptycli.DeliverSeed(ctx, handle, sess, adapted.Prompt); err != nil {
@@ -118,6 +147,47 @@ type recordingInteractiveSession struct {
 	done     chan struct{}
 	exit     attachwire.ExitPayload
 	exitOK   bool
+	// refuseNotice models a human mid-composition: TryWriteNotice refuses
+	// (false, nil) and writes nothing, exactly like ptyhost's gate.
+	refuseNotice bool
+	// noticeErr makes TryWriteNotice fail outright (a dead PTY master).
+	noticeErr error
+}
+
+// TryWriteNotice makes the recorder an agent.InteractiveNotifier: an accepted
+// notice is recorded as ONE write (so tests can assert single-write
+// atomicity), a refused one records nothing.
+func (s *recordingInteractiveSession) TryWriteNotice(p []byte) (bool, error) {
+	s.mu.Lock()
+	refuse, noticeErr := s.refuseNotice, s.noticeErr
+	s.mu.Unlock()
+	if noticeErr != nil {
+		return false, noticeErr
+	}
+	if refuse {
+		return false, nil
+	}
+	n, err := s.WriteInput(p)
+	return n > 0, err
+}
+
+// setRefuseNotice flips the mid-composition gate.
+func (s *recordingInteractiveSession) setRefuseNotice(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refuseNotice = v
+}
+
+// recordedWrites returns a copy of every recorded write, one entry per
+// WriteInput/TryWriteNotice call that accepted bytes.
+func (s *recordingInteractiveSession) recordedWrites() [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([][]byte, len(s.writes))
+	for i, w := range s.writes {
+		out[i] = append([]byte(nil), w...)
+	}
+	return out
 }
 
 func (s *recordingInteractiveSession) WriteInput(p []byte) (int, error) {
@@ -170,6 +240,17 @@ func (s *recordingInteractiveSession) writeCount() int {
 	return len(s.writes)
 }
 
+// liveRecordingInteractiveSession stays ALIVE until the test closes done —
+// the shape every supervisor-loop test needs (a session that has already
+// exited returns from dispatchInteractive before the loop runs once).
+func liveRecordingInteractiveSession() *recordingInteractiveSession {
+	return &recordingInteractiveSession{
+		done:   make(chan struct{}),
+		exit:   attachwire.NewNormalExit(0),
+		exitOK: true,
+	}
+}
+
 func completedRecordingInteractiveSession() *recordingInteractiveSession {
 	done := make(chan struct{})
 	close(done)
@@ -177,6 +258,25 @@ func completedRecordingInteractiveSession() *recordingInteractiveSession {
 		done:   done,
 		exit:   attachwire.NewNormalExit(0),
 		exitOK: true,
+	}
+}
+
+// assertNoInitialPromptReplay fails when any byte dispatchInteractive wrote
+// to the PTY carries the initial prompt. An empty prompt asserts nothing was
+// written at all (there is no content to look for).
+func assertNoInitialPromptReplay(t *testing.T, session *recordingInteractiveSession, initialPrompt string) {
+	t.Helper()
+	writes := session.recordedWrites()
+	if initialPrompt == "" {
+		if len(writes) != 0 {
+			t.Errorf("dispatchInteractive wrote %q with no initial prompt to replay", session.inputBytes())
+		}
+		return
+	}
+	for i, w := range writes {
+		if bytes.Contains(w, []byte(initialPrompt)) {
+			t.Errorf("dispatchInteractive replayed the initial prompt in write %d: %q", i, w)
+		}
 	}
 }
 
@@ -363,7 +463,7 @@ func TestInteractive_CapabilityFailure(t *testing.T) {
 
 	qw := QueuedWork{}
 	qw.SessionID = "s"
-	out, err := r.dispatchInteractive(context.Background(), h, t.TempDir(), qw, res, noopSink{}, nil)
+	out, err := r.dispatchInteractive(context.Background(), h, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
 	if err == nil {
 		t.Fatal("expected a terminal error for a non-interactive handle")
 	}
@@ -412,7 +512,7 @@ func TestInteractive_InitialPromptContract(t *testing.T) {
 			res := &Result{SessionID: qw.SessionID}
 
 			out, err := minimalRunner(t).dispatchInteractive(
-				context.Background(), handle, t.TempDir(), qw, res, sink, nil,
+				context.Background(), handle, t.TempDir(), qw, res, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
 			)
 			if err != nil {
 				t.Fatalf("dispatchInteractive: %v", err)
@@ -420,12 +520,17 @@ func TestInteractive_InitialPromptContract(t *testing.T) {
 			if out.Status != "completed" {
 				t.Fatalf("status=%q error=%q; want completed", out.Status, out.Error)
 			}
-			if got := string(session.inputBytes()); got != "" {
-				t.Errorf("dispatchInteractive replayed PTY input %q", got)
-			}
-			if got := session.writeCount(); got != 0 {
-				t.Errorf("dispatchInteractive WriteInput calls = %d, want 0", got)
-			}
+			// The contract (interactive_loop.go) is that dispatchInteractive
+			// never REPLAYS QueuedWork.InitialPrompt: Provider.Spawn already
+			// delivered it on the harness's native first-turn surface, so a
+			// replay would duplicate the seed and bypass the receipt.
+			//
+			// Asserted on CONTENT, not on a write count of zero. The same
+			// supervisor now also writes runtime notices into the live PTY,
+			// so a zero-write assertion would forbid the feature instead of
+			// the defect — while a content assertion still fails the instant
+			// the seed is replayed.
+			assertNoInitialPromptReplay(t, session, tt.initialPrompt)
 
 			var subtypes []string
 			for _, ev := range sink.events {
@@ -468,7 +573,7 @@ func TestInteractive_InitialPromptOversizeFailsBeforeWrite(t *testing.T) {
 
 	started := time.Now()
 	out, err := minimalRunner(t).dispatchInteractive(
-		context.Background(), handle, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, sink, nil,
+		context.Background(), handle, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
 	)
 	if err == nil {
 		t.Fatal("expected oversize initial-prompt failure")
@@ -514,7 +619,7 @@ func TestInteractive_HalfConfiguredAttachFails(t *testing.T) {
 	res := &Result{SessionID: "s"}
 	qw := QueuedWork{}
 	qw.SessionID = "s"
-	out, err := r.dispatchInteractive(context.Background(), h, t.TempDir(), qw, res, noopSink{}, nil)
+	out, err := r.dispatchInteractive(context.Background(), h, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
 	if err == nil {
 		t.Fatal("expected a config failure for a half-configured attach")
 	}
@@ -542,7 +647,7 @@ func TestInteractive_LocalOnlyCompletes(t *testing.T) {
 	qw.SessionID = "s"
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil)
+	out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
 	if err != nil {
 		t.Fatalf("dispatchInteractive: unexpected err %v", err)
 	}
@@ -570,7 +675,7 @@ func TestInteractive_LocalOnlyNonzeroExitFails(t *testing.T) {
 	qw.SessionID = "s"
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	out, _ := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil)
+	out, _ := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
 	if out.Status != "failed" {
 		t.Fatalf("status=%q; want failed", out.Status)
 	}
@@ -677,7 +782,7 @@ func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
 		qw.SessionID = sessionID
 		qw.Mode = interactiveRunMode
 		qw.InitialPrompt = initialPrompt
-		out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil)
+		out, err := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
 		resultCh <- dispatchResult{res: out, err: err}
 	}()
 
@@ -714,12 +819,10 @@ func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("relay reconnect did not re-read ATTACH_TOKEN_FILE")
 	}
-	if got := string(recordedSession.inputBytes()); got != "" {
-		t.Fatalf("dispatch replayed initial prompt after reconnect: %q", got)
-	}
-	if got := recordedSession.writeCount(); got != 0 {
-		t.Fatalf("dispatch WriteInput calls after reconnect = %d, want 0", got)
-	}
+	// Same contract as TestInteractive_InitialPromptContract, asserted on
+	// content rather than on a write count so a runtime notice is allowed
+	// through while a seed replay still fails.
+	assertNoInitialPromptReplay(t, recordedSession, initialPrompt)
 
 	if err := os.WriteFile(donePath, []byte("done"), 0o600); err != nil {
 		t.Fatal(err)

@@ -38,8 +38,38 @@ type Session struct {
 	epoch   uint64
 	logger  *slog.Logger
 
+	// notice is the harness's DECLARED notice-delivery mechanism, copied from
+	// Spec at spawn and never mutated. TryWriteNotice refuses structurally
+	// unless it is agent.NoticeDeliveryPTYNotice. Immutable, so no lock.
+	notice agent.NoticeDelivery
+
 	vt  terminal
 	rec *recorder
+
+	// writeMu serializes EVERY author of PTY-master input and guards
+	// compose. Deliberately NOT s.mu: mu guards seq/ring/subscription/
+	// VT/recorder state fed from run(), and the input path must not contend
+	// with the output path (a child that stops reading stdin would otherwise
+	// couple input latency to frame emission).
+	//
+	// Because every input author funnels through WriteInput (the relay leg,
+	// the local attach, the harness seed) and notices funnel through
+	// TryWriteNotice, this one mutex is the single arbitration point between
+	// them: one write is one uninterruptible unit, and a notice is refused
+	// outright while the human's line is half-typed.
+	writeMu sync.Mutex
+	// compose models the child's line editor from the accepted input bytes
+	// (§5: the host never asks the child about its state). See compose.go —
+	// it is a deliberately coarse model, but one that can report an empty
+	// line again after an edit rather than latching shut. Guarded by writeMu.
+	compose composeTracker
+
+	// altActive mirrors the VT's alternate-screen flag for the notice gate.
+	// An atomic rather than a field under s.mu so TryWriteNotice (which holds
+	// writeMu) never has to take s.mu — that would order the input path
+	// behind the output path, the exact coupling writeMu exists to avoid.
+	// Written only from onOutput, immediately after the VT is fed.
+	altActive atomic.Bool
 
 	// mu guards all sequence/ring/subscription/VT/recorder state below. The VT
 	// is fed only from run() and snapshotted only under mu, so feeding and
@@ -103,6 +133,7 @@ func Spawn(spec Spec) (*Session, error) {
 		replyW:   replyW,
 		spawnAt:  spawnAt,
 		epoch:    spec.Epoch,
+		notice:   spec.NoticeDelivery,
 		logger:   spec.logger(),
 		vt:       newVTHost(int(cols), int(rows), spec.scrollback(), replyW, spec.logger()),
 		rec:      rec,
@@ -152,6 +183,10 @@ func (s *Session) onOutput(data []byte) {
 		return
 	}
 	s.vt.write(data)
+	// Publish the alternate-screen flag before the frame that carries the
+	// switch, so a subscriber that has seen the frame is guaranteed to see
+	// the updated flag (the notice gate reads it, see TryWriteNotice).
+	s.altActive.Store(s.vt.altScreen())
 	for len(data) > 0 {
 		chunk := data
 		if len(chunk) > maxOutputFrame {
@@ -291,15 +326,129 @@ func (s *Session) lastSeqLocked() attachwire.HostSeq { return s.nextSeq - 1 }
 
 // WriteInput writes already-encoded terminal input bytes verbatim to the PTY
 // master (§5: input is never re-sanitized).
+//
+// This is the ONLY path human keystrokes take — the relay leg
+// (attachclient/inbound.go, attachclient/degraded.go), the standalone local
+// attach (local.go) and the harness seed all funnel here — so it is also
+// where the session observes whether a composition is outstanding. The write
+// itself is unchanged and still verbatim; only the bookkeeping is new.
 func (s *Session) WriteInput(p []byte) (int, error) {
 	if s.closedFlag.Load() {
 		return 0, errExited
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	n, err := s.ptmx.Write(p)
+	if n > 0 && n <= len(p) {
+		s.compose.feed(p[:n])
+	}
 	if err != nil {
 		return n, fmt.Errorf("ptyhost: write input: %w", err)
 	}
 	return n, nil
+}
+
+// TryWriteNotice delivers a runner-authored notice as ONE atomic PTY write,
+// or refuses it — the agent.InteractiveNotifier half of the input-author
+// arbitration described on writeMu.
+//
+// Refusal (false, nil) is the normal, expected outcome whenever the human has
+// unsubmitted bytes in the line editor: appending a notice there would splice
+// runner text into whatever they are typing. The caller holds the notice and
+// retries after the human submits or discards the line.
+//
+// The single ptmx.Write is what makes the accepted case safe: os.File's
+// internal write lock makes one Write call uninterruptible with respect to a
+// concurrent keystroke write, so the notice can never be interleaved
+// byte-wise. That guarantee is per-call ONLY, which is why a notice is never
+// chunked — a short write is reported as an error rather than resumed.
+//
+// # What the host CAN and CANNOT know about "is this a safe moment"
+//
+// Two refusal conditions are host-observable and are enforced here:
+//
+//  1. An outstanding COMPOSITION (compose.go). Appending to a half-typed line
+//     would splice runner text into the human's input.
+//  2. The ALTERNATE SCREEN. A child on the alt screen is running a full-screen
+//     UI — a pager, an editor, a full-screen dialog — where every byte of a
+//     notice is a command keystroke and the submit key is destructive. The
+//     terminal genuinely sees this transition (DECSET ?1049/?1047/?47), so it
+//     is refused.
+//
+// What the host CANNOT see is an INLINE modal: an application-level prompt
+// ("1. Yes  2. No", Enter selects the highlighted option) rendered as ordinary
+// text on the primary screen. Nothing at the terminal layer changes when an
+// application starts interpreting keys as menu choices instead of as text —
+// modes, screen buffer, cursor and line discipline are all identical to an
+// idle prompt. So the host cannot distinguish "Enter submits my line" from
+// "Enter picks the default", and equally cannot distinguish a printable byte
+// that types a character from one that selects option 2. Screen-scraping the
+// VT for known prompt shapes would make a generic host application-specific
+// and would still miss every prompt it had not been taught.
+//
+// Fallback, stated plainly: a notice delivered during an inline modal CAN
+// select that modal's default. The residual risk is bounded, not eliminated —
+// the notice is a single, whole, logged write, never a fragment, and the two
+// refusal conditions above remove the cases the terminal can actually see.
+// Removing the rest needs an application-side inject API (the harness's own
+// message-injection capability), not a smarter terminal.
+//
+// # Which is why the permission is DECLARED, not inferred
+//
+// Because that residual risk cannot be observed from here, it is not managed
+// here: this method refuses outright unless the harness whose child owns this
+// PTY declared agent.NoticeDeliveryPTYNotice (Spec.NoticeDelivery). That
+// declaration is true for exactly one harness — `shell` — because it is the
+// only one with no agent behind the terminal, so an inline modal cannot exist
+// to be selected. Every harness that runs its own UI declares its own
+// application-level channel instead, and gets ErrNoticeUnsupported here.
+//
+// The refusal is a structural error, not the (false, nil) "try again later":
+// nothing about it changes for the life of the session, so a caller that
+// retries it is spinning, and a caller that treats it as delivered is lying.
+func (s *Session) TryWriteNotice(p []byte) (bool, error) {
+	if len(p) == 0 {
+		return false, nil
+	}
+	if s.notice != agent.NoticeDeliveryPTYNotice {
+		return false, fmt.Errorf(
+			"ptyhost: write notice: %w: this session's harness declares notice delivery %q, not %q — "+
+				"a PTY write here is a keystroke into the child's own UI, not a message to the agent",
+			agent.ErrUnsupported, s.declaredNotice(), agent.NoticeDeliveryPTYNotice,
+		)
+	}
+	if s.closedFlag.Load() {
+		return false, errExited
+	}
+	if s.altActive.Load() {
+		return false, nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.compose.pending() {
+		return false, nil
+	}
+	n, err := s.ptmx.Write(p)
+	if err != nil {
+		return n > 0, fmt.Errorf("ptyhost: write notice: %w", err)
+	}
+	if n != len(p) {
+		return true, fmt.Errorf("ptyhost: write notice: short write (%d of %d bytes)", n, len(p))
+	}
+	// A notice is self-submitting (the caller appends the submit byte), so
+	// the line editor is left exactly as empty as it was found — the compose
+	// model needs no update here.
+	return true, nil
+}
+
+// declaredNotice renders the session's declared mechanism for an error
+// message, distinguishing "the manifest said none" from "the manifest said
+// nothing" — an omission and a refusal are different defects to chase.
+func (s *Session) declaredNotice() string {
+	if s.notice == "" {
+		return "<undeclared>"
+	}
+	return string(s.notice)
 }
 
 // Resize applies geometry verbatim to the PTY (TIOCSWINSZ, §8), resizes the VT,

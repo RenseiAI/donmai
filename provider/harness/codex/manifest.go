@@ -43,9 +43,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			ToolPermissionFormat:     "codex",
 			StreamingTransport:       "none", // app-server JSON-RPC, not SSE/ndjson over the wire surface
 			SupportsInteractivePTY:   true,
-			Drives:                   []agent.WireProtocol{agent.ProtoOpenAIResponses, agent.ProtoOpenAIChat},
-			DrivesHosts:              []agent.ServingHost{agent.HostOAuthCLI, agent.HostDirect, agent.HostAzure},
-			Transport:                agent.TransportSubprocessRPC,
+			// `codex app-server` (and its `codex mcp-server` sibling) is a
+			// JSON-RPC control surface over a live session, so a message is a
+			// method call rather than a keystroke. Handle.Inject deliberately
+			// returns ErrUnsupported today (handle.go) — the CHANNEL is
+			// declared here; driving it is a separate lane.
+			NoticeDelivery: agent.NoticeDeliveryMCPRPC,
+			Drives:         []agent.WireProtocol{agent.ProtoOpenAIResponses, agent.ProtoOpenAIChat},
+			DrivesHosts:    []agent.ServingHost{agent.HostOAuthCLI, agent.HostDirect, agent.HostAzure},
+			Transport:      agent.TransportSubprocessRPC,
 		},
 		PromptDelivery: []agent.PromptDeliveryProfile{
 			{

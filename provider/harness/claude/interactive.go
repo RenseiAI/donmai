@@ -33,7 +33,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	return ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgsWithMCP(spec, mcpPath), spec, func() error {
+	return ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgsWithMCP(spec, mcpPath), spec, p.Manifest(), func() error {
 		return clijsonl.RemoveMCPConfig(mcpPath)
 	})
 }

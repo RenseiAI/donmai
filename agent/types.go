@@ -426,6 +426,23 @@ type Spec struct {
 	// every existing producer.
 	Interactive *InteractiveSpec `json:"interactive,omitempty"`
 
+	// RequiresLiveNotice declares that this session must be REACHABLE while
+	// it runs: something upstream holds a handle to it and may need to
+	// deliver a message into the live session (peer coordination, an operator
+	// steer, a recalled memory block).
+	//
+	// It is validated, not honored: ValidateSpecCapabilities denies the Spec
+	// when the selected harness declares no notice-delivery mechanism (or has
+	// not declared one at all), so an unreachable agent is refused at
+	// admission instead of launched and quietly written off. Harnesses do not
+	// read this field; the composing layer sets it from whether a coordination
+	// handle exists, and the harness's own
+	// HarnessCaps.NoticeDelivery answers whether that is satisfiable.
+	//
+	// false == today's behavior for every existing producer (additive,
+	// omitempty, wire round-trip unchanged).
+	RequiresLiveNotice bool `json:"requiresLiveNotice,omitempty"`
+
 	// BaseInstructions are persistent system instructions
 	// (Codex thread/start ‘instructions'). Honored only when
 	// Capabilities.NeedsBaseInstructions is true.

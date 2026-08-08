@@ -705,6 +705,76 @@ func TestInjectRejectedByConsumerStaysUnacked(t *testing.T) {
 	}
 }
 
+// TestInjectWithNoConsumerIsNeverAcked covers the worst ack-and-drop case: a
+// pulser configured WITHOUT an OnInject consumer.
+//
+// It used to ack unconditionally in that state, so the payload was destroyed
+// with no log line while the producer recorded a successful delivery. A
+// transport whose entire contract is ack-or-requeue must never ack what it
+// cannot deliver: with no consumer the inject stays unacked and the producer
+// requeues it for a session that can actually take it.
+func TestInjectWithNoConsumerIsNeverAcked(t *testing.T) {
+	t.Parallel()
+
+	var (
+		offers atomic.Int64
+		sawAck atomic.Bool
+	)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			AckedInject string `json:"ackedInject"`
+		}
+		_ = json.Unmarshal(body, &req)
+		if req.AckedInject != "" {
+			sawAck.Store(true)
+		}
+		offers.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"refreshed": true,
+			"inject": map[string]any{
+				"deliveryId": "dlv-no-consumer",
+				"text":       "must not be destroyed",
+			},
+		})
+	})
+
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:  "s1",
+		WorkerID:   "w1",
+		IssueID:    "i1",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		Interval:   5 * time.Millisecond,
+		// OnInject deliberately nil: no consumer is wired.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && offers.Load() < 3 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := offers.Load(); got < 3 {
+		t.Fatalf("only %d refreshes observed; the test needs the inject re-offered", got)
+	}
+	if sawAck.Load() {
+		t.Fatal("an inject with no consumer was acked — the payload is destroyed and never requeued")
+	}
+
+	// Stop must not sneak the ack out through the final flush either.
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if sawAck.Load() {
+		t.Fatal("the Stop-time ack flush acked an inject that was never delivered")
+	}
+}
+
 // TestStopFlushesPendingInjectAck covers the short-session ack gap (the
 // delivered=true/acked=false strand): an inject accepted on the synchronous
 // first tick whose ack would only ride the NEXT tick must be flushed by
@@ -1129,5 +1199,158 @@ func TestInteractiveStopTrueStillFatal(t *testing.T) {
 	}
 	if !p.StopRequested() {
 		t.Error("StopRequested = false; runner cannot classify the operator cancel")
+	}
+}
+
+// TestDeadLetterInjectReachesTheProducerAndNeverAcks is the observability half
+// of ack-or-requeue.
+//
+// A consumer that gives up on a payload used to have exactly two ways to say
+// so, and both were bad: ack it (destroying it while reporting success), or say
+// nothing (leaving the sender waiting on a delivery that will never happen,
+// with the single in-flight slot held forever behind it). The dead letter is
+// the third: it rides back on the lock-refresh so the producer learns the push
+// died AND why, while the delivery stays UNACKED so a durable producer can
+// route it somewhere that can take it.
+//
+// Both halves are asserted, because either one alone is the old bug wearing a
+// new name.
+func TestDeadLetterInjectReachesTheProducerAndNeverAcks(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu       sync.Mutex
+		reported []struct {
+			DeliveryID string `json:"deliveryId"`
+			Reason     string `json:"reason"`
+		}
+		sawAck atomic.Bool
+		hits   atomic.Int64
+	)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			AckedInject         string `json:"ackedInject"`
+			DeadLetteredInjects []struct {
+				DeliveryID string `json:"deliveryId"`
+				Reason     string `json:"reason"`
+			} `json:"deadLetteredInjects"`
+		}
+		_ = json.Unmarshal(body, &req)
+		if req.AckedInject != "" {
+			sawAck.Store(true)
+		}
+		if len(req.DeadLetteredInjects) > 0 {
+			mu.Lock()
+			reported = append(reported, req.DeadLetteredInjects...)
+			mu.Unlock()
+		}
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+	})
+
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:  "s1",
+		WorkerID:   "w1",
+		IssueID:    "i1",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		Interval:   5 * time.Millisecond,
+		OnInject:   func(heartbeat.InjectPayload) bool { return false },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	p.DeadLetterInject("dlv-undeliverable", "channel-not-driven")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := len(reported)
+		mu.Unlock()
+		if got > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reported) == 0 {
+		t.Fatal("the dead letter never reached the producer — a sender told 'queued' cannot learn it died")
+	}
+	if reported[0].DeliveryID != "dlv-undeliverable" || reported[0].Reason != "channel-not-driven" {
+		t.Fatalf("dead letter = %+v; want the delivery id and reason verbatim", reported[0])
+	}
+	if sawAck.Load() {
+		t.Fatal("a dead-lettered delivery was also acked — a dead letter reports a FAILURE, " +
+			"so acking it destroys exactly the message it was meant to rescue")
+	}
+	// Once echoed on a 2xx it stops riding every subsequent request.
+	if got := len(reported); got > int(hits.Load()) {
+		t.Fatalf("dead letter reported %d times across %d requests — it must clear once echoed", got, hits.Load())
+	}
+}
+
+// TestDeadLetterInjectIsFlushedAtStop covers the short-session gap: a session
+// that gives up on a payload and then exits before the next heartbeat interval
+// must still tell the producer, or the report dies with the process — the
+// silent case all over again.
+func TestDeadLetterInjectIsFlushedAtStop(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu       sync.Mutex
+		reported []string
+	)
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			DeadLetteredInjects []struct {
+				DeliveryID string `json:"deliveryId"`
+			} `json:"deadLetteredInjects"`
+		}
+		_ = json.Unmarshal(body, &req)
+		mu.Lock()
+		for _, d := range req.DeadLetteredInjects {
+			reported = append(reported, d.DeliveryID)
+		}
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+	})
+
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:  "s1",
+		WorkerID:   "w1",
+		IssueID:    "i1",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+		// An hour: nothing but the synchronous first tick and the Stop flush
+		// can carry the report, which is the case under test.
+		Interval: time.Hour,
+		OnInject: func(heartbeat.InjectPayload) bool { return false },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	p.DeadLetterInject("dlv-short-session", "attempt-cap-exceeded")
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reported) == 0 || reported[len(reported)-1] != "dlv-short-session" {
+		t.Fatalf("dead letters reported = %v; want the Stop-time flush to carry dlv-short-session", reported)
 	}
 }

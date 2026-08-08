@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -113,12 +114,21 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	res.HarnessRef = &harnessRef
 	res.ResolverDecisions = append(res.ResolverDecisions, selection.Decisions...)
 	caps := provider.Capabilities()
+	// The DECLARED notice-delivery mechanism for this harness, read off the
+	// live manifest — never inferred from the harness's name, and never
+	// assumed. A provider with no manifest leaves it empty, which every
+	// consumer treats as "undeclared" and therefore as "do not deliver".
+	noticeDelivery := agent.NoticeDelivery("")
+	if hp, ok := provider.(agent.HarnessProvider); ok {
+		noticeDelivery = hp.Manifest().Caps.NoticeDelivery
+	}
 	r.logger.Info("provider resolved",
 		"sessionId", qw.SessionID,
 		"harness", selection.Harness.ID,
 		"provider", provider.Name(),
 		"injection", caps.SupportsMessageInjection,
 		"resume", caps.SupportsSessionResume,
+		"noticeDelivery", declaredOrUndeclared(noticeDelivery),
 	)
 
 	// Log which dispatch path is in use
@@ -616,15 +626,28 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// platform also acks to stop re-sending, but a re-delivery in the
 	// heartbeat-interval window before the ack lands must not double-inject).
 	//
-	// The channel is wired to OnInject whenever the provider supports message
-	// injection. Whether any block is actually delivered is decided ENTIRELY by
-	// the platform (it only returns an `inject` on the lock-refresh response
-	// when the project's memory config has runtime-inject enabled) — so the
-	// worker needs no env var or local config. Providers without injection
-	// support rely on the dispatch-time fold (v1).
+	// Whether any block is actually delivered is decided ENTIRELY by the
+	// platform (it only returns an `inject` on the lock-refresh response when
+	// the project's memory config has runtime-inject enabled) — so the worker
+	// needs no env var or local config.
+	//
+	// The rail is wired when a CONSUMER EXISTS, which is not the same question
+	// as "does the provider support message injection":
+	//
+	//   - Headless and interview runs deliver through Handle.Inject, so they
+	//     genuinely need caps.SupportsMessageInjection. Providers without it
+	//     rely on the dispatch-time fold (v1).
+	//   - An INTERACTIVE run never calls Handle.Inject at all — its delivery
+	//     surface is whatever the harness DECLARES (agent.NoticeDelivery), so
+	//     the provider's message-injection capability is simply the wrong
+	//     question here. The rail is wired for every interactive run, including
+	//     the ones whose declared channel this build cannot drive, because the
+	//     consumer's job is not only to deliver: it is also to say truthfully
+	//     that it could not, by dead-lettering with a reason instead of letting
+	//     the payload rot in a buffer nobody reads. Nothing on that path acks.
 	injectCh := make(chan heartbeat.InjectPayload, 8)
 	seenInject := map[string]struct{}{}
-	runtimeInjectEnabled := caps.SupportsMessageInjection
+	runtimeInjectEnabled := caps.SupportsMessageInjection || qw.isInteractive()
 
 	// 9. Start heartbeat pulser (in a goroutine — Pulser.Start fires
 	// the first tick synchronously then runs the loop in its own
@@ -639,42 +662,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			}, err
 		}
 	}
-	// Wave 3 runtime memory-inject: wire OnInject only when the feature is
-	// enabled AND the provider can accept injects. The closure runs on the
-	// heartbeat goroutine; it owns seenInject (dedup-by-DeliveryID lives
-	// here exclusively so the map is never touched off this goroutine) and
-	// performs a non-blocking send onto injectCh — a full buffer REJECTS
-	// the inject (returns false) rather than stalling the heartbeat loop,
-	// so the pulser leaves it unacked and the platform re-delivers it on a
-	// later refresh (ack-or-requeue). A DeliveryID is marked seen only
-	// AFTER a successful buffer so a re-delivery of a rejected inject is
-	// not dedup-blocked. The runner goroutine drains injectCh at the
-	// post-terminal seam and is the only caller of handle.Inject (claude's
-	// single-in-flight contract).
+	// Wave 3 runtime memory-inject: wire OnInject only when a consumer exists.
+	// See newInjectAcceptor for the dedup + ack-or-requeue contract, and for
+	// why the interactive mode acks on DELIVERY rather than on buffer.
 	var onInject func(heartbeat.InjectPayload) bool
 	if runtimeInjectEnabled {
-		onInject = func(p heartbeat.InjectPayload) bool {
-			if p.DeliveryID != "" {
-				if _, ok := seenInject[p.DeliveryID]; ok {
-					r.logger.Debug("memory inject: skipping already-seen delivery",
-						"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
-					// Already buffered earlier in this Run — safe to ack
-					// so the platform stops re-sending it.
-					return true
-				}
-			}
-			select {
-			case injectCh <- p:
-				if p.DeliveryID != "" {
-					seenInject[p.DeliveryID] = struct{}{}
-				}
-				return true
-			default:
-				r.logger.Warn("memory inject: channel full, leaving unacked for re-delivery",
-					"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
-				return false
-			}
-		}
+		onInject = newInjectAcceptor(
+			injectCh, seenInject, r.logger, qw.SessionID, !qw.isInteractive(),
+		)
 	}
 	pulser, err := heartbeat.New(heartbeat.Config{
 		SessionID: qw.SessionID,
@@ -870,8 +865,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// for the same reason interviews skip them: an interactive session
 	// produces no PR and drives no issue-tracker state transition — the
 	// lifecycle is owned by the human at the terminal, not the runner.
+	//
+	// injectCh is handed over the same way dispatchInterview receives it: an
+	// interactive session is a LIVE consumer of the runtime-inject rail, not
+	// a session that happens to have one wired. Without this argument every
+	// buffered payload is accepted by OnInject, acked to the producer, and
+	// then never read by anyone — silent loss that reports success.
+	//
+	// noticeDelivery rides along because the consumer must know what the
+	// harness DECLARED before it writes anything: a PTY write is the correct
+	// primitive only where no agent sits behind the terminal.
 	if qw.isInteractive() {
-		return r.dispatchInteractive(ctx, handle, wpath, qw, res, sink, pulser)
+		return r.dispatchInteractive(ctx, handle, wpath, qw, res, sink, pulser, injectCh, noticeDelivery)
 	}
 
 	// 10. Stream events; wait for terminal.
@@ -1172,6 +1177,72 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	return res, nil
+}
+
+// newInjectAcceptor builds the heartbeat's OnInject callback: the PRODUCTION
+// implementation of the runtime-inject accept contract, extracted so tests
+// exercise this function rather than a hand-copied replica of it (a mirrored
+// copy in a test keeps passing after the real closure is deleted).
+//
+// The returned func runs on the heartbeat goroutine. It owns seenInject —
+// dedup-by-DeliveryID lives here exclusively, so the map is never touched off
+// that goroutine — and performs a NON-BLOCKING send onto injectCh:
+//
+//   - buffered → marked seen; acked only if ackOnBuffer.
+//   - already-seen DeliveryID → not re-buffered; acked only if ackOnBuffer.
+//   - buffer full → ALWAYS rejected (returns false) rather than stalling the
+//     heartbeat loop; the pulser leaves it unacked and the producer re-offers
+//     it on a later refresh. The DeliveryID is deliberately NOT marked seen,
+//     so the re-delivery is accepted once capacity frees up.
+//
+// # ackOnBuffer: where the ack belongs
+//
+// Consumers differ by run mode: headless drains at the post-terminal seam,
+// interview parks on the channel per turn, interactive writes each payload
+// into the live PTY as a notice. The first two consume the buffer within the
+// same Run, at a seam the runner itself reaches — buffering there is a good
+// proxy for delivery, so they pass ackOnBuffer=true.
+//
+// The interactive consumer is different in kind: its write is gated on the
+// human at the terminal (a notice is refused while they are mid-composition)
+// and the session can end at any moment. Acking at buffer time stamped up to
+// nine payloads delivered, the session ended, they were logged as a count and
+// dropped, and the platform never re-offered them because acked_at was set.
+// So interactive passes ackOnBuffer=false: the acceptor takes custody without
+// claiming delivery, and the consumer calls [heartbeat.Pulser.AckInject] once
+// the bytes are actually on the PTY. Until then the payload stays unacked and
+// requeueable — ack-or-requeue rather than ack-and-hope.
+func newInjectAcceptor(
+	injectCh chan<- heartbeat.InjectPayload,
+	seenInject map[string]struct{},
+	logger *slog.Logger,
+	sessionID string,
+	ackOnBuffer bool,
+) func(heartbeat.InjectPayload) bool {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	return func(p heartbeat.InjectPayload) bool {
+		if p.DeliveryID != "" {
+			if _, ok := seenInject[p.DeliveryID]; ok {
+				logger.Debug("memory inject: skipping already-seen delivery",
+					"sessionId", sessionID, "deliveryId", p.DeliveryID,
+					"ackOnBuffer", ackOnBuffer)
+				return ackOnBuffer
+			}
+		}
+		select {
+		case injectCh <- p:
+			if p.DeliveryID != "" {
+				seenInject[p.DeliveryID] = struct{}{}
+			}
+			return ackOnBuffer
+		default:
+			logger.Warn("memory inject: channel full, leaving unacked for re-delivery",
+				"sessionId", sessionID, "deliveryId", p.DeliveryID)
+			return false
+		}
+	}
 }
 
 // drainMemoryInjects delivers every memory block the heartbeat transport
