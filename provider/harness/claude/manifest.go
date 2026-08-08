@@ -58,11 +58,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// path (provider/harness/clijsonl/handle.go Inject), which starts
 			// a SECOND invocation continuing a finished conversation — real
 			// delivery, but not delivery into the live process, which is why
-			// the axis distinguishes them. Nothing in this repo drives the
-			// hook yet; see noticeChannelDrivenByRunner in runner/
-			// interactive_inject.go for the seam that lane lands on, and note
-			// that a declared-but-undriven channel is refused (never acked)
-			// rather than best-efforted.
+			// the axis distinguishes them.
+			//
+			// This declaration is DRIVEN: an interactive spawn establishes the
+			// channel (stophook.go) and exposes it as agent.NoticeChannel on
+			// the handle, which the runner's interactive supervisor collects
+			// through. The declaration and the channel are separate facts on
+			// purpose — a session whose channel could not be established still
+			// runs, and every message aimed at it is dead-lettered rather than
+			// accepted into a door that does not exist.
 			NoticeDelivery: agent.NoticeDeliveryHook,
 			Drives:         []agent.WireProtocol{agent.ProtoAnthropicMessages},
 			DrivesHosts: []agent.ServingHost{

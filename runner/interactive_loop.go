@@ -117,11 +117,17 @@ func (a sessAdapter) Subscribe(from attachwire.HostSeq) (attachclient.Subscripti
 //
 // noticeDelivery is the selected harness's DECLARED notice-delivery mechanism
 // (agent.HarnessCaps.NoticeDelivery), read from the live manifest — never
-// inferred from the harness's name. It decides whether a payload may be
-// written into this PTY at all: only agent.NoticeDeliveryPTYNotice may, because
-// only there is the terminal the agent's actual input surface. Everything else
-// is refused, reported to the producer, and left for a channel that can carry
-// it. See interactive_inject.go's noticeChannelDrivenByRunner.
+// inferred from the harness's name. It decides both WHETHER a payload may be
+// delivered and BY WHICH SHAPE:
+//
+//   - agent.NoticeDeliveryPTYNotice writes into this PTY, because only there is
+//     the terminal the agent's actual input surface.
+//   - agent.NoticeDeliveryHook is collected from the harness's own channel
+//     (agent.NoticeChannel on the handle) and never touches the terminal.
+//   - everything else is refused, reported to the producer, and left for a
+//     channel that can carry it.
+//
+// See interactive_inject.go's noticeChannelDrivenByRunner / noticeChannelIsPull.
 func (r *Runner) dispatchInteractive(
 	ctx context.Context,
 	handle agent.Handle,
@@ -272,6 +278,17 @@ func (r *Runner) dispatchInteractive(
 	// The retry timer is created armed (the clock contract has no "disabled"
 	// constructor that can later be re-armed) and immediately stopped; it is
 	// reset only while a notice is held, so an idle session never wakes up.
+	//
+	// The PULL channel, when the harness exposes one, comes off the HANDLE and
+	// not off the PTY surface: a channel like Claude Code's Stop hook belongs
+	// to the spawned session as a whole (its drop, its hook script, its
+	// transcript), and delivery over it never touches the terminal. A harness
+	// that declares a pull mechanism but exposes no channel yields nil here,
+	// which the queue reports per message instead of silently downgrading.
+	var noticeChannel agent.NoticeChannel
+	if nc, ok := handle.(agent.NoticeChannelCapable); ok {
+		noticeChannel = nc.NoticeChannel()
+	}
 	notices := &interactiveNoticeQueue{channel: noticeDelivery, sink: pulser}
 	retry := r.noticeRetryClock().NewTimer(interactiveNoticeRetry)
 	retry.Stop()
@@ -301,14 +318,17 @@ func (r *Runner) dispatchInteractive(
 				injectCh = nil
 				continue
 			}
-			notice := formatInteractiveNotice(p)
-			if notice == nil {
+			// Blank payloads are dropped BEFORE the slot is taken, and the
+			// emptiness test is on the producer's raw text rather than on any
+			// one transport's rendering: what is worth delivering cannot
+			// depend on which harness happens to be running.
+			if strings.TrimSpace(p.Text) == "" {
 				r.logger.Debug("[interactive] dropping empty inject payload",
 					"sessionId", qw.SessionID, "deliveryId", p.DeliveryID)
 				continue
 			}
-			notices.hold(notice, p.DeliveryID)
-			if notices.attempt(r, qw, res, isess) == noticeHeld {
+			notices.hold(p.Text, p.DeliveryID)
+			if notices.attempt(r, qw, res, isess, noticeChannel) == noticeHeld {
 				retry.Reset(interactiveNoticeRetry)
 			}
 			continue
@@ -317,7 +337,7 @@ func (r *Runner) dispatchInteractive(
 			if notices.idle() {
 				continue
 			}
-			if notices.attempt(r, qw, res, isess) == noticeHeld {
+			if notices.attempt(r, qw, res, isess, noticeChannel) == noticeHeld {
 				retry.Reset(interactiveNoticeRetry)
 			}
 			continue

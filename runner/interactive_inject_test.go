@@ -193,6 +193,16 @@ func startInteractiveDispatch(t *testing.T, sessionID string) *interactiveDispat
 // driven as directly as the delivery path.
 func startInteractiveDispatchOn(t *testing.T, sessionID string, channel agent.NoticeDelivery) *interactiveDispatch {
 	t.Helper()
+	return startInteractiveDispatchWith(t, sessionID, channel, nil)
+}
+
+// startInteractiveDispatchWith adds a PULL channel to the harness. Passing nil
+// models a session whose harness declares a pull mechanism but which exposed no
+// channel — the fallback case, not an impossible one.
+func startInteractiveDispatchWith(
+	t *testing.T, sessionID string, channel agent.NoticeDelivery, nch agent.NoticeChannel,
+) *interactiveDispatch {
+	t.Helper()
 	t.Setenv(envAttachURL, "")
 	t.Setenv(envAttachToken, "")
 
@@ -207,9 +217,12 @@ func startInteractiveDispatchOn(t *testing.T, sessionID string, channel agent.No
 	r := minimalRunner(t)
 	r.interactiveNoticeClock = d.clock
 
-	handle := &testInteractiveHandle{
+	var handle agent.InteractiveCapable = &testInteractiveHandle{
 		Handle:  &fakeHandle{events: make(chan agent.Event)},
 		session: d.session,
+	}
+	if nch != nil {
+		handle = &testNoticeChannelHandle{InteractiveCapable: handle, channel: nch}
 	}
 	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
 		SessionID: sessionID,
@@ -283,7 +296,7 @@ func TestFormatInteractiveNotice(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := formatInteractiveNotice(heartbeat.InjectPayload{DeliveryID: "d1", Text: tc.text})
+			got := formatInteractiveNotice(tc.text)
 			if tc.wantNil {
 				if got != nil {
 					t.Fatalf("formatInteractiveNotice = %q; want nil", got)
@@ -382,7 +395,7 @@ func TestInteractiveNotice_SubmitByteDistinguishesReturnFromCtrlJ(t *testing.T) 
 	}{
 		{
 			name:       "the notice the runner builds submits a turn",
-			notice:     formatInteractiveNotice(heartbeat.InjectPayload{DeliveryID: "d1", Text: text}),
+			notice:     formatInteractiveNotice(text),
 			wantMarker: rawKeysSubmit + text,
 			wantSubmit: true,
 		},
@@ -695,7 +708,6 @@ func TestInteractive_SurfaceThatCannotNotifyIsDeadLetteredNotHeld(t *testing.T) 
 // is durable.
 func TestInteractive_UndrivenChannelRefusesWithoutWritingOrAcking(t *testing.T) {
 	channels := []agent.NoticeDelivery{
-		agent.NoticeDeliveryHook,        // claude-code
 		agent.NoticeDeliveryMCPRPC,      // codex
 		agent.NoticeDeliveryHTTPSession, // opencode
 		agent.NoticeDeliveryRPCSteer,    // pi
@@ -795,12 +807,12 @@ func TestInteractive_RunLoopHandsInjectChToDispatch(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			runInteractiveInjectViaRunLoop(t, tc.supportsInjec, agent.NoticeDeliveryPTYNotice)
+			runInteractiveInjectViaRunLoop(t, tc.supportsInjec, agent.NoticeDeliveryPTYNotice, "")
 		})
 	}
 }
 
-func runInteractiveInjectViaRunLoop(t *testing.T, supportsInjection bool, channel agent.NoticeDelivery) {
+func runInteractiveInjectViaRunLoop(t *testing.T, supportsInjection bool, channel agent.NoticeDelivery, wantReason string) {
 	t.Helper()
 	requireSh(t)
 
@@ -926,8 +938,8 @@ func runInteractiveInjectViaRunLoop(t *testing.T, supportsInjection bool, channe
 			t.Fatalf("an undeliverable inject was acked to the platform: %v — it is now destroyed, "+
 				"because acked_at is what stops it being re-offered", acks)
 		}
-		if dead[0] != "dlv-runloop-1:"+noticeDeadChannelNotDriven {
-			t.Fatalf("dead letter = %q; want the delivery id and the channel-not-driven reason", dead[0])
+		if dead[0] != "dlv-runloop-1:"+wantReason {
+			t.Fatalf("dead letter = %q; want the delivery id and the %s reason", dead[0], wantReason)
 		}
 	}
 
@@ -995,5 +1007,394 @@ func waitFor(t *testing.T, d time.Duration, msg string, cond func() bool) {
 // wire) are three separate places a regression can hide, and only a test that
 // crosses all three catches a change to any one of them.
 func TestInteractive_RunLoopNeverAcksAnUndeliverableInject(t *testing.T) {
-	runInteractiveInjectViaRunLoop(t, true, agent.NoticeDeliveryHook)
+	runInteractiveInjectViaRunLoop(t, true, agent.NoticeDeliveryMCPRPC, noticeDeadChannelNotDriven)
+}
+
+// TestInteractive_RunLoopDeadLettersAChannelThisSessionLacks is the FALLBACK
+// proof, end-to-end over the real heartbeat.
+//
+// A harness can declare a live-turn channel this build drives and still fail to
+// establish one for a given session — the Stop-hook drop directory could not be
+// created, or the session was spawned by a path that does not build one. That
+// is a degraded session, not a broken one: the durable mailbox is the floor and
+// the agent can still pull.
+//
+// What must NOT happen is the runner treating a declared mechanism as proof a
+// channel exists. Here the harness declares `hook` and the spawned session
+// exposes no agent.NoticeChannel, so the platform must see a dead letter naming
+// exactly that, and never an ack — an acked message is a destroyed message,
+// because acked_at is what stops it being re-offered to a session that can take
+// it.
+func TestInteractive_RunLoopDeadLettersAChannelThisSessionLacks(t *testing.T) {
+	runInteractiveInjectViaRunLoop(t, true, agent.NoticeDeliveryHook, noticeDeadChannelAbsent)
+}
+
+// ─── pull channels (agent.NoticeChannel) ───────────────────────────────────
+
+// testNoticeChannelHandle adds a pull channel to an interactive handle,
+// mirroring what a harness like claude does at spawn.
+type testNoticeChannelHandle struct {
+	agent.InteractiveCapable
+	channel agent.NoticeChannel
+}
+
+func (h *testNoticeChannelHandle) NoticeChannel() agent.NoticeChannel { return h.channel }
+
+// fakeNoticeChannel is an agent.NoticeChannel double whose CONSUMPTION is under
+// the test's control, separately from whether the offer succeeded.
+//
+// Keeping those two facts on separate switches is the entire point of the
+// double: the defect this rail exists to prevent is a channel that reports a
+// message delivered because the OFFER succeeded. A double that could not
+// express "offered but not consumed" could not detect it.
+type fakeNoticeChannel struct {
+	mu sync.Mutex
+
+	offers    []fakeOffer
+	offerErr  error
+	consumed  bool
+	consumErr error
+	retracts  int
+	retractOK bool
+}
+
+type fakeOffer struct {
+	deliveryID string
+	text       string
+}
+
+func (c *fakeNoticeChannel) Offer(deliveryID, text string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.offerErr != nil {
+		return c.offerErr
+	}
+	c.offers = append(c.offers, fakeOffer{deliveryID: deliveryID, text: text})
+	return nil
+}
+
+func (c *fakeNoticeChannel) Consumed() (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.consumed, c.consumErr
+}
+
+func (c *fakeNoticeChannel) Retract() (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.retracts++
+	return c.retractOK, nil
+}
+
+func (c *fakeNoticeChannel) setConsumed(v bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.consumed = v
+}
+
+func (c *fakeNoticeChannel) offered() []fakeOffer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]fakeOffer(nil), c.offers...)
+}
+
+func (c *fakeNoticeChannel) retractCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.retracts
+}
+
+// waitOffers blocks until the channel has taken exactly n offers.
+func (c *fakeNoticeChannel) waitOffers(t *testing.T, n int) []fakeOffer {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got := c.offered()
+		switch {
+		case len(got) == n:
+			return got
+		case len(got) > n:
+			t.Fatalf("expected %d offer(s), got %d: %+v", n, len(got), got)
+		case time.Now().After(deadline):
+			t.Fatalf("timed out waiting for %d offer(s); got %d", n, len(got))
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestInteractive_PullChannelAcksOnlyOnConsumption is the WP-12 core.
+//
+// 53 of 53 real interactive sessions run a harness whose manifest declares
+// agent.NoticeDeliveryHook, and this rail used to dead-letter every one of
+// their messages as channel-not-driven. Driving the channel is only half the
+// fix; the other half is WHERE the ack falls.
+//
+// A pull channel's offer succeeding proves the message is somewhere the harness
+// will look. It does not prove the harness looked, and on a Stop hook the gap
+// between the two is an entire agent turn — or forever. So the assertion is
+// two-sided and both sides are load-bearing:
+//
+//   - while the channel reports NOT consumed, however many polls elapse, there
+//     must be no ack. An ack here destroys the message: acked_at is what stops
+//     the producer re-offering it.
+//   - the instant the channel reports consumed, there must be exactly one.
+func TestInteractive_PullChannelAcksOnlyOnConsumption(t *testing.T) {
+	nch := &fakeNoticeChannel{}
+	d := startInteractiveDispatchWith(t, "sess-pull-ack", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-pull", Text: "the build is green"}
+	nch.waitOffers(t, 1)
+
+	// Poll while the recipient has not taken it. The channel keeps custody and
+	// upstream is told nothing.
+	for range 5 {
+		d.clock.waitArmed(t)
+		if got := d.pulser.acked(); len(got) != 0 {
+			t.Fatalf("an offered-but-unconsumed notice was acked: %v", got)
+		}
+		if got := d.pulser.deadLettered(); len(got) != 0 {
+			t.Fatalf("a notice still awaiting collection was dead-lettered: %+v", got)
+		}
+		d.clock.fire(t)
+	}
+
+	nch.setConsumed(true)
+	d.pulser.waitAcked(t, "dlv-pull")
+
+	if got := d.session.recordedWrites(); len(got) != 0 {
+		t.Fatalf("a pull channel wrote %d byte-sequence(s) into the terminal: %q — "+
+			"a PTY write on a harness with an agent behind it is a keystroke into its UI", len(got), got)
+	}
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a consumed notice was also dead-lettered: %+v", got)
+	}
+}
+
+// TestInteractive_PullChannelOffersOnceAndPreservesTheMessage pins two
+// properties of the offer that a retry loop is very good at breaking.
+//
+// ONCE: every poll re-offering the same payload would, on a real Stop-hook
+// drop, rewrite the file the harness is at that moment reading.
+//
+// VERBATIM: the PTY renderer flattens newlines to spaces and appends a CR,
+// because a terminal submits on a line break and the trailing byte IS the
+// submit key. Neither is true of a channel that carries the message as a
+// structured field — there the CR is a stray character and the flattening
+// destroys a multi-line message the harness could have carried intact.
+func TestInteractive_PullChannelOffersOnceAndPreservesTheMessage(t *testing.T) {
+	const text = "line one\nline two\n\n  indented three"
+
+	nch := &fakeNoticeChannel{}
+	d := startInteractiveDispatchWith(t, "sess-pull-verbatim", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-verbatim", Text: text}
+	offers := nch.waitOffers(t, 1)
+
+	for range 4 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+	if got := nch.offered(); len(got) != 1 {
+		t.Fatalf("the payload was offered %d times across polls; want exactly 1", len(got))
+	}
+
+	if offers[0].text != text {
+		t.Fatalf("offered text = %q; want the producer's text verbatim %q", offers[0].text, text)
+	}
+	if strings.ContainsRune(offers[0].text, interactiveNoticeSubmit) {
+		t.Fatalf("offered text carries the PTY submit byte: %q", offers[0].text)
+	}
+	if offers[0].deliveryID != "dlv-verbatim" {
+		t.Fatalf("offered deliveryID = %q; want dlv-verbatim", offers[0].deliveryID)
+	}
+}
+
+// TestInteractive_PullChannelWaitsPastTheRefusalCap separates the two bounds.
+//
+// The refusal cap (interactiveNoticeMaxAttempts, ~1 minute) answers "the
+// session keeps saying no". Waiting for a turn to end is not the session saying
+// no — it is the session working. Spending the refusal budget on that would
+// dead-letter every message sent to a session doing more than a minute of work,
+// which is most of them, and the failure would look exactly like a broken
+// channel.
+func TestInteractive_PullChannelWaitsPastTheRefusalCap(t *testing.T) {
+	nch := &fakeNoticeChannel{}
+	d := startInteractiveDispatchWith(t, "sess-pull-patient", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-patient", Text: "still working?"}
+	nch.waitOffers(t, 1)
+
+	for range interactiveNoticeMaxAttempts + 10 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a notice awaiting collection was dead-lettered at the REFUSAL cap: %+v — "+
+			"waiting for a turn to end is not a refusal", got)
+	}
+
+	nch.setConsumed(true)
+	d.pulser.waitAcked(t, "dlv-patient")
+}
+
+// TestInteractive_PullChannelDeadLettersAtThePollCap is the other half: bounded
+// is not the same as patient.
+//
+// The rail allows ONE notice in flight per session, so a channel nobody ever
+// collects from would hold the slot for the life of the session and starve
+// every later payload invisibly. At the cap the offer is WITHDRAWN first — a
+// message reported dead must not still be collectable — and only then reported,
+// so the producer gets it back instead of watching it stay eternally in flight.
+func TestInteractive_PullChannelDeadLettersAtThePollCap(t *testing.T) {
+	nch := &fakeNoticeChannel{retractOK: true}
+	d := startInteractiveDispatchWith(t, "sess-pull-cap", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-stuck", Text: "never collected"}
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-behind", Text: "starved behind it"}
+	nch.waitOffers(t, 1)
+
+	// The first poll happens on receipt; the rest ride the retry timer.
+	for range interactiveNoticePullMaxPolls - 1 {
+		d.clock.waitArmed(t)
+		d.clock.fire(t)
+	}
+
+	if reason := d.pulser.waitDeadLettered(t, "dlv-stuck"); reason != noticeDeadNotConsumed {
+		t.Fatalf("dead-letter reason = %q; want %q", reason, noticeDeadNotConsumed)
+	}
+	if got := nch.retractCount(); got != 1 {
+		t.Fatalf("Retract called %d times; want exactly 1 — a message reported dead must not stay collectable", got)
+	}
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("a never-consumed notice was acked: %v", got)
+	}
+
+	// The slot freed, so the payload behind it got its own offer.
+	offers := nch.waitOffers(t, 2)
+	if offers[1].deliveryID != "dlv-behind" {
+		t.Fatalf("second offer = %+v; want the payload that was queued behind the stuck one", offers[1])
+	}
+}
+
+// TestInteractive_PullChannelUnconsumedAtSessionEndIsNeverAcked covers the exit
+// the cap never reaches: the session simply ends first.
+//
+// Left unacked is the CORRECT outcome — the producer still holds the durable
+// record and re-offers it to a session that can take it. A dead letter here
+// would be wrong for the opposite reason to an ack: it tells the producer the
+// message failed when nothing established that.
+func TestInteractive_PullChannelUnconsumedAtSessionEndIsNeverAcked(t *testing.T) {
+	nch := &fakeNoticeChannel{}
+	d := startInteractiveDispatchWith(t, "sess-pull-end", agent.NoticeDeliveryHook, nch)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-orphan", Text: "arrived too late"}
+	nch.waitOffers(t, 1)
+	d.clock.waitArmed(t)
+
+	d.finish(t)
+
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("a notice the session never consumed was acked at session end: %v", got)
+	}
+	if got := d.pulser.deadLettered(); len(got) != 0 {
+		t.Fatalf("a notice left for requeue was dead-lettered at session end: %+v", got)
+	}
+}
+
+// TestInteractive_PullChannelSurfacesOfferAndConsumeErrors keeps genuinely
+// transient plumbing failures on the RETRY path — a full disk clears, an
+// unreadable transcript becomes readable — while still bounding them with the
+// refusal cap so they cannot hold the slot forever.
+func TestInteractive_PullChannelSurfacesOfferAndConsumeErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		ch   *fakeNoticeChannel
+	}{
+		{name: "offer fails", ch: &fakeNoticeChannel{offerErr: errors.New("drop dir is read-only")}},
+		{name: "consumption check fails", ch: &fakeNoticeChannel{consumErr: errors.New("transcript unreadable")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := startInteractiveDispatchWith(t, "sess-pull-err", agent.NoticeDeliveryHook, tc.ch)
+
+			d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-err", Text: "hello"}
+			for range interactiveNoticeMaxAttempts - 1 {
+				d.clock.waitArmed(t)
+				if got := d.pulser.acked(); len(got) != 0 {
+					t.Fatalf("a failing channel acked: %v", got)
+				}
+				d.clock.fire(t)
+			}
+			if reason := d.pulser.waitDeadLettered(t, "dlv-err"); reason != noticeDeadAttemptCap {
+				t.Fatalf("dead-letter reason = %q; want %q", reason, noticeDeadAttemptCap)
+			}
+			if got := d.pulser.acked(); len(got) != 0 {
+				t.Fatalf("a failing channel acked: %v", got)
+			}
+		})
+	}
+}
+
+// TestInteractive_DeclaredPullChannelWithNoSessionChannelIsDeadLettered is the
+// FALLBACK contract at the unit seam (its end-to-end twin is
+// TestInteractive_RunLoopDeadLettersAChannelThisSessionLacks).
+//
+// A manifest declaration describes the HARNESS; a channel describes one running
+// SESSION. Treating the first as proof of the second is how a message gets
+// accepted into a door that was never built. The session keeps running — the
+// durable mailbox is the floor — and every message aimed at it is reported.
+func TestInteractive_DeclaredPullChannelWithNoSessionChannelIsDeadLettered(t *testing.T) {
+	d := startInteractiveDispatchWith(t, "sess-pull-absent", agent.NoticeDeliveryHook, nil)
+
+	d.injectCh <- heartbeat.InjectPayload{DeliveryID: "dlv-absent", Text: "hello"}
+
+	if reason := d.pulser.waitDeadLettered(t, "dlv-absent"); reason != noticeDeadChannelAbsent {
+		t.Fatalf("dead-letter reason = %q; want %q", reason, noticeDeadChannelAbsent)
+	}
+	if got := d.pulser.acked(); len(got) != 0 {
+		t.Fatalf("a message aimed at a session with no channel was acked: %v", got)
+	}
+	if got := d.session.recordedWrites(); len(got) != 0 {
+		t.Fatalf("the absent channel fell back to typing at the terminal: %q", got)
+	}
+}
+
+// TestNoticeRoutingIsKeyedOnTheDeclarationNotTheHarness pins the routing table
+// itself, exhaustively over the declared mechanisms.
+//
+// A hardcoded provider-name exemption on this rail has already caused one live
+// regression, where three harnesses could not spawn at all in a connected
+// session. The defence is that the ONLY input to routing is the manifest's own
+// answer — so this asserts on the mechanism, and the registry test below
+// asserts that every real harness's mechanism comes from its manifest.
+func TestNoticeRoutingIsKeyedOnTheDeclarationNotTheHarness(t *testing.T) {
+	tests := []struct {
+		channel    agent.NoticeDelivery
+		wantDriven bool
+		wantPull   bool
+	}{
+		{channel: agent.NoticeDeliveryPTYNotice, wantDriven: true, wantPull: false},
+		{channel: agent.NoticeDeliveryHook, wantDriven: true, wantPull: true},
+		{channel: agent.NoticeDeliveryMCPRPC},
+		{channel: agent.NoticeDeliveryHTTPSession},
+		{channel: agent.NoticeDeliveryRPCSteer},
+		{channel: agent.NoticeDeliveryACP},
+		{channel: agent.NoticeDeliveryResumeInject},
+		{channel: agent.NoticeDeliveryInBoxLoop},
+		{channel: agent.NoticeDeliveryNone},
+		{channel: ""},
+	}
+	for _, tc := range tests {
+		t.Run(declaredOrUndeclared(tc.channel), func(t *testing.T) {
+			if got := noticeChannelDrivenByRunner(tc.channel); got != tc.wantDriven {
+				t.Fatalf("noticeChannelDrivenByRunner(%q) = %v; want %v", tc.channel, got, tc.wantDriven)
+			}
+			if got := noticeChannelIsPull(tc.channel); got != tc.wantPull {
+				t.Fatalf("noticeChannelIsPull(%q) = %v; want %v", tc.channel, got, tc.wantPull)
+			}
+			if tc.wantPull && !tc.wantDriven {
+				t.Fatal("a mechanism cannot be pull-driven without being driven")
+			}
+		})
+	}
 }
