@@ -98,3 +98,40 @@ func TestPublicFactoriesReturnIndependentTrees(t *testing.T) {
 		t.Fatal("subcommand pointers shared between two NewProviderCmd calls — graft would leak state")
 	}
 }
+
+// TestNewHostWatchCmd_NotHiddenNotDeprecated is the export-gap regression: a
+// downstream embedder that previously had no clean constructor for the
+// host-watch dashboard had to relocate the alias-registered `fleet-watch`
+// command off root instead, which silently dragged along that command's
+// Hidden and Deprecated fields — so the embedder's own first-class command
+// inherited a deprecation notice pointing at itself. NewHostWatchCmd must
+// return a plain, non-deprecated, visible tree so constructing it can never
+// reproduce that defect.
+func TestNewHostWatchCmd_NotHiddenNotDeprecated(t *testing.T) {
+	t.Parallel()
+
+	cmd := NewHostWatchCmd()
+
+	if cmd.Use != "watch" {
+		t.Errorf("Use = %q, want %q", cmd.Use, "watch")
+	}
+	if cmd.Hidden {
+		t.Error("NewHostWatchCmd must not be Hidden — it is the first-class dashboard command")
+	}
+	if cmd.Deprecated != "" {
+		t.Errorf("NewHostWatchCmd must carry no Deprecated notice, got %q", cmd.Deprecated)
+	}
+}
+
+// TestNewHostWatchCmd_ReturnsFreshTrees mirrors the other exported
+// factories' independence guarantee: a caller may graft the same logical
+// surface under more than one parent.
+func TestNewHostWatchCmd_ReturnsFreshTrees(t *testing.T) {
+	t.Parallel()
+
+	a := NewHostWatchCmd()
+	b := NewHostWatchCmd()
+	if a == b {
+		t.Fatal("NewHostWatchCmd returned the same *cobra.Command pointer twice")
+	}
+}

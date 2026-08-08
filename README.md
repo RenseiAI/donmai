@@ -258,20 +258,23 @@ donmai governor stop
 donmai governor status
 ```
 
-### `donmai worker` and `donmai fleet`
+### `donmai worker` and `donmai fleet` (deprecated)
 
-Legacy local process-manager commands for standalone OSS debugging. `donmai daemon`
-is the primary host lifecycle surface for normal operation, while these commands
-remain available in the `donmai` binary for users who need the older foreground
-worker host or PID-file fleet flow.
+Legacy local process-manager commands for standalone OSS debugging. `donmai host`
+is the primary lifecycle surface for normal operation (a persistent local daemon);
+`worker`/`fleet` remain available in the `donmai` binary — never in an embedding
+binary — for users who need the older foreground worker process or PID-file fleet
+flow. Both are marked deprecated and are removed in v0.59.0.
 
 ```bash
 donmai worker start [--base-url <url>] [--provisioning-token <token>]
 donmai fleet start --count <n>
 donmai fleet status
 donmai fleet stop
-donmai fleet scale --count <n>
 ```
+
+`fleet scale` has been removed outright (it only ever returned a
+not-yet-supported error): stop and restart the fleet with a new `--count`.
 
 ### `donmai orchestrator`
 
