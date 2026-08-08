@@ -176,13 +176,19 @@ make guard
 
 Run `make vuln` when dependency changes or release work is involved.
 
-`make guard` runs `scripts/leak-guard.sh`, which blocks content that must
-never ship in this open-source repository: internal tracker issue IDs,
-private repo references, internal platform hostnames, closed-source
-environment variable names, and developer workspace paths. CI enforces it
-on every push and pull request. Describe behavior in comments instead of
-citing internal trackers; use neutral fixture identifiers (`ENG-123`)
-in tests and docs.
+`make guard` runs `scripts/guard-b-lint.sh` (vendored from the
+`donmai-architecture` corpus), which blocks content that must never ship in
+this open-source repository: the closed product brand, internal tracker
+issue IDs, private repo references, internal platform hostnames, internal
+monorepo paths, developer workspace paths, and closed-source environment
+variable names. CI (`.github/workflows/guard-b.yml`) scans this PR's own
+commits, the squash-merge message GitHub will compose from the PR title +
+body, and whatever just landed on `main` — describe behavior in comments
+instead of citing internal trackers; use neutral fixture identifiers
+(`ENG-123`) in tests and docs. A hit that's actually legitimate (naming a
+banned token in order to forbid it, or documenting the OSS/closed boundary)
+gets a narrow, identifier-scoped exemption in `.guard-allowlist`, not a
+rewrite — see that file's header for the grammar.
 
 ## Terminal UI Work
 

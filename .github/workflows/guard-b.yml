@@ -1,0 +1,101 @@
+name: Closed-source content guard
+
+# Runs guard-b-lint.sh (vendored from RenseiAI/donmai-architecture; see the
+# provenance header in scripts/guard-b-lint.sh) to catch content that must
+# never ship in this public repo: the closed product brand, internal tracker
+# issue IDs (prose, branch/worktree slugs, title case, and tracker deep
+# links), closed control-plane CLI endpoints, private-repo references,
+# internal domains, internal monorepo paths, developer absolute paths,
+# closed-source environment variable names, and production measurements of
+# the closed control plane.
+#
+# Five checks:
+#   1. self-test    — proves each rule and engine path still fires. BLOCKING.
+#   2. vendor drift  — this repo's copy of guard-b-lint.sh /
+#                      guard-b-lint-selftest.sh still matches the pinned
+#                      donmai-architecture commit. BLOCKING.
+#   3. commits       — the commit messages this PR adds, merge commits
+#                      included. BLOCKING.
+#   4. squash msg     — the message GitHub composes from the PR title + body
+#                      when squash-merged — that text becomes a published
+#                      commit no branch commit contains. BLOCKING.
+#   5. push range     — commit messages just pushed to main, as a backstop
+#                      for anything that bypassed a pull request. BLOCKING.
+#
+# `--all` (the tracked-tree scan) is a SEPARATE, NON-BLOCKING job below. This
+# repo carries a large pre-existing residue that predates guard-b and was
+# never curated against it (see .guard-allowlist's header) — making --all
+# blocking today would redden every PR for content nobody touched. It still
+# runs, every push and PR, so the residue count stays visible in CI rather
+# than silently forgotten; curate it file-by-file (allowlist the legitimate
+# hits, rewrite the rest) the same way tui-components' and donmai-smokes'
+# were, then fold it into the blocking job above.
+#
+# No `paths:` filter: a leak in a .txt, .json, or .go file is still a leak,
+# and a filtered trigger reports "green" by not running.
+
+on:
+  pull_request:
+    # `edited` matters: the PR title and body ARE the squash-merge message, so
+    # a body edit after the last push can introduce a leak no commit contains.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  guard-b:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Self-test — prove every rule and engine path still fires
+        run: bash scripts/guard-b-lint-selftest.sh
+
+      - name: Vendor drift — vendored guard-b matches its pinned upstream commit
+        run: bash scripts/check-guard-b-vendor-drift.sh
+
+      - name: Run guard-b-lint (commit messages added by this PR, merges included)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          bash scripts/guard-b-lint.sh --commits "origin/${{ github.base_ref }}..HEAD"
+
+      - name: Run guard-b-lint (the squash-merge message GitHub will compose)
+        if: github.event_name == 'pull_request'
+        env:
+          # Via env, never inlined into the script body: a PR title or body is
+          # attacker-controlled text and must not be interpolated into bash.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" \
+            | bash scripts/guard-b-lint.sh --stdin pr-squash-message
+
+      - name: Run guard-b-lint (commit messages just pushed to main)
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -z "$BEFORE" ] \
+            || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+            || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            RANGE="HEAD~1..HEAD"
+          else
+            RANGE="${BEFORE}..HEAD"
+          fi
+          echo "scanning commit messages in $RANGE"
+          bash scripts/guard-b-lint.sh --commits "$RANGE"
+
+  guard-b-tree-residue:
+    name: guard-b tree scan (report-only — see guard-b.yml header)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run guard-b-lint --all (non-blocking; tracks pre-existing residue)
+        run: bash scripts/guard-b-lint.sh --all || true
