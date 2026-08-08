@@ -44,9 +44,17 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			ToolPermissionFormat:     "",
 			StreamingTransport:       "none",
 			SupportsInteractivePTY:   true,
-			Drives:                   nil,
-			DrivesHosts:              nil,
-			Transport:                agent.TransportPTY,
+			// The ONLY harness for which writing into the PTY is the correct
+			// primitive, and for the reason that makes it correct: there is no
+			// agent behind this terminal. A line written at an idle shell
+			// prompt is a command the shell runs; the same line written at an
+			// agent UI is a keystroke into whatever that UI is drawing. Every
+			// other interactive-capable harness therefore declares its own
+			// application-level channel instead (see claude/codex manifests).
+			NoticeDelivery: agent.NoticeDeliveryPTYNotice,
+			Drives:         nil,
+			DrivesHosts:    nil,
+			Transport:      agent.TransportPTY,
 		},
 		PromptDelivery: []agent.PromptDeliveryProfile{{
 			ID: "shell/interactive/pty-seed-v1", Mode: agent.PromptModeHumanControlled,

@@ -37,9 +37,14 @@ func (p *provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:           true,
 			ToolPermissionFormat:     c.ToolPermissionFormat,
 			StreamingTransport:       "none",
-			Drives:                   []agent.WireProtocol{agent.ProtoStub},
-			DrivesHosts:              []agent.ServingHost{agent.HostLocal},
-			Transport:                agent.TransportDirectAPI,
+			// The stub's scripted loop lives in this process and its
+			// Handle.Inject appends to it directly (handle.go), so the honest
+			// declaration is the in-box one — the same answer the real in-box
+			// harness (gemini-direct) gives.
+			NoticeDelivery: agent.NoticeDeliveryInBoxLoop,
+			Drives:         []agent.WireProtocol{agent.ProtoStub},
+			DrivesHosts:    []agent.ServingHost{agent.HostLocal},
+			Transport:      agent.TransportDirectAPI,
 		},
 		ToolLifecycle: []agent.ToolLifecycleProfile{{
 			ID: "stub/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,

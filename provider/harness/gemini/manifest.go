@@ -30,9 +30,21 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:           true, // responseSchema
 			ToolPermissionFormat:     ToolPermissionFormatGemini,
 			StreamingTransport:       "sse",
-			Drives:                   []agent.WireProtocol{agent.ProtoGeminiGenerate},
-			DrivesHosts:              []agent.ServingHost{agent.HostDirect, agent.HostVertex},
-			Transport:                agent.TransportDirectAPI,
+			// The agent loop runs in THIS process, so a message needs no
+			// external channel: Handle.Inject hands it to the driver, which
+			// appends it as a user turn after the current one completes
+			// (handle.go Inject → h.inject → drive).
+			//
+			// NOT acp. The `gemini` CLI does expose ACP (`gemini --acp`,
+			// formerly `--experimental-acp`), but this harness is the in-box
+			// generateContent loop, not a wrap of that CLI — there is no
+			// `gemini` subprocess here to speak ACP to. agent.NoticeDeliveryACP
+			// stays reserved for a CLI-wrapping harness that does not exist
+			// yet.
+			NoticeDelivery: agent.NoticeDeliveryInBoxLoop,
+			Drives:         []agent.WireProtocol{agent.ProtoGeminiGenerate},
+			DrivesHosts:    []agent.ServingHost{agent.HostDirect, agent.HostVertex},
+			Transport:      agent.TransportDirectAPI,
 		},
 		PromptDelivery: []agent.PromptDeliveryProfile{{
 			ID: "gemini-direct/gemini-generate/direct-api-v1", Mode: agent.PromptModeAutonomous,

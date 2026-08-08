@@ -68,7 +68,7 @@ func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	spec.Env = launch.env
-	return ptycli.Spawn(ctx, bin, launch.argv, spec)
+	return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
 }
 
 type interactiveLaunch struct {

@@ -29,9 +29,15 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:           false,
 			ToolPermissionFormat:     "",
 			StreamingTransport:       "none", // pty plaintext
-			Drives:                   []agent.WireProtocol{agent.ProtoAntigravityOAuth},
-			DrivesHosts:              []agent.ServingHost{agent.HostOAuthCLI},
-			Transport:                agent.TransportPTY,
+			// `agy -p` is single-shot: the session ends with the answer, so
+			// there is no live session to reach and Handle.Inject returns
+			// ErrUnsupported (handle.go). The pty transport above is the LOGIN
+			// channel, not an input surface — a write there lands in agy's own
+			// UI, which is exactly the mistake pty-notice is fenced off from.
+			NoticeDelivery: agent.NoticeDeliveryNone,
+			Drives:         []agent.WireProtocol{agent.ProtoAntigravityOAuth},
+			DrivesHosts:    []agent.ServingHost{agent.HostOAuthCLI},
+			Transport:      agent.TransportPTY,
 		},
 		PromptDelivery: []agent.PromptDeliveryProfile{{
 			ID: "antigravity/headless/agy-pty-v1", Mode: agent.PromptModeAutonomous,

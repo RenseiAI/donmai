@@ -49,7 +49,22 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			ToolPermissionFormat:     "claude",
 			StreamingTransport:       "ndjson", // claude CLI JSONL = ndjson framing
 			SupportsInteractivePTY:   true,
-			Drives:                   []agent.WireProtocol{agent.ProtoAnthropicMessages},
+			// The claude CLI invokes its own lifecycle hooks (`--bare`'s help
+			// text enumerates hooks among the things it skips), and the Stop
+			// hook is the point at which a message can be handed to a session
+			// that is already running. That is the declared channel.
+			//
+			// It is NOT the same thing as the shipped `claude --resume <id>`
+			// path (provider/harness/clijsonl/handle.go Inject), which starts
+			// a SECOND invocation continuing a finished conversation — real
+			// delivery, but not delivery into the live process, which is why
+			// the axis distinguishes them. Nothing in this repo drives the
+			// hook yet; see noticeChannelDrivenByRunner in runner/
+			// interactive_inject.go for the seam that lane lands on, and note
+			// that a declared-but-undriven channel is refused (never acked)
+			// rather than best-efforted.
+			NoticeDelivery: agent.NoticeDeliveryHook,
+			Drives:         []agent.WireProtocol{agent.ProtoAnthropicMessages},
 			DrivesHosts: []agent.ServingHost{
 				agent.HostOAuthCLI, agent.HostDirect, agent.HostBedrock, agent.HostVertex,
 			},

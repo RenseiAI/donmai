@@ -88,6 +88,14 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// NewSpawnPlan's own translation table is correctly untouched by
 		// Interactive; the field just never reaches it.
 		"Interactive",
+		// RequiresLiveNotice (the notice-delivery axis) is an ADMISSION input,
+		// not a translation input: agent.ValidateSpecCapabilities refuses the
+		// Spec before Spawn when the selected harness declares no way to be
+		// reached, so by the time NewSpawnPlan runs the question is already
+		// settled. codex's own answer lives on its manifest
+		// (agent.NoticeDeliveryMCPRPC — the app-server JSON-RPC surface), not
+		// in this per-turn param table.
+		"RequiresLiveNotice",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)

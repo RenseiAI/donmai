@@ -83,6 +83,12 @@ type HarnessCaps struct {
 	// helper.
 	SupportsInteractivePTY bool `json:"interactivePty"`
 
+	// NoticeDelivery declares the mechanism — if any — by which a message
+	// can be delivered INTO an already-running session on this harness.
+	// It is a DECLARATION, never an assumption: see the NoticeDelivery type
+	// for the whole contract and for why the zero value is not "none".
+	NoticeDelivery NoticeDelivery `json:"noticeDelivery"`
+
 	// the DRIVE surface (the axis link)
 	Drives      []WireProtocol `json:"drives"`
 	DrivesHosts []ServingHost  `json:"drivesHosts"`
@@ -105,9 +111,20 @@ type HarnessManifest struct {
 // capability before the harness creates any provider-side resource.
 type SpecAdmissionDenialCode string
 
-// SpecDenialCapabilityUnsupported identifies a stable capability denial across
-// harness implementations.
-const SpecDenialCapabilityUnsupported SpecAdmissionDenialCode = "capability_unsupported"
+// Stable denial codes, shared across harness implementations.
+const (
+	// SpecDenialCapabilityUnsupported identifies a flat Spec field the exact
+	// selected harness cannot honor.
+	SpecDenialCapabilityUnsupported SpecAdmissionDenialCode = "capability_unsupported"
+
+	// SpecDenialNoticeDeliveryUnavailable identifies the one denial that is
+	// about REACHABILITY rather than about a feature: the Spec says something
+	// may need to deliver a message into this session while it runs, and the
+	// harness declares no mechanism for that (or has not declared one at all).
+	// Refusing here is the point — launching anyway produces an agent nobody
+	// can reach, whose messages are dropped by a layer that reports success.
+	SpecDenialNoticeDeliveryUnavailable SpecAdmissionDenialCode = "notice_delivery_unavailable"
+)
 
 // SpecAdmissionError identifies the exact unsupported field. It deliberately
 // carries no field value: model names, endpoint data, and prompt content must
@@ -139,6 +156,26 @@ func ValidateSpecCapabilities(spec Spec, manifest HarnessManifest) error {
 			Code:   SpecDenialCapabilityUnsupported,
 			Field:  "interactive",
 			Detail: "the exact selected harness does not support interactive PTY sessions",
+		}
+	}
+	if spec.RequiresLiveNotice {
+		switch nd := manifest.Caps.NoticeDelivery; {
+		case !nd.Declared():
+			// Undeclared is denied, not defaulted. A harness that has never
+			// answered the question must not inherit a yes OR a no by
+			// omission — the whole axis exists because the answer differs
+			// per harness and only the manifest author knows it.
+			return &SpecAdmissionError{
+				Code:   SpecDenialNoticeDeliveryUnavailable,
+				Field:  "requiresLiveNotice",
+				Detail: "the exact selected harness declares no notice-delivery mechanism",
+			}
+		case nd == NoticeDeliveryNone:
+			return &SpecAdmissionError{
+				Code:   SpecDenialNoticeDeliveryUnavailable,
+				Field:  "requiresLiveNotice",
+				Detail: "the exact selected harness declares notice delivery: none",
+			}
 		}
 	}
 	return nil

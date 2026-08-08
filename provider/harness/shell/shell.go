@@ -52,7 +52,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	// Minimal per the wave scope: Spec carries no command-override slot
 	// today (agent/types.go), so shell always spawns $SHELL — never a
 	// Spec-provided command.
-	handle, err := ptycli.Spawn(ctx, shellBinary(), nil, spec)
+	handle, err := ptycli.Spawn(ctx, shellBinary(), nil, spec, p.Manifest())
 	if err != nil {
 		return nil, err
 	}
