@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -704,14 +705,14 @@ func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
 	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
 
-	servers := defaultMCPServers(qw, "/abs/wt")
+	servers := defaultMCPServersForHarness(qw, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous)
 	if len(servers) != 1 {
 		t.Fatalf("len(servers)=%d, want 1", len(servers))
 	}
 	got := servers[0]
-	// Name is brand-derived (statehome.Brand()+"-platform"): OSS default brand
-	// "donmai" -> "donmai-platform"; the closed rensei binary (brand "rensei")
-	// renders "rensei-platform". This parallel test uses the default brand.
+	// Name is brand-derived (statehome.Brand()+"-platform"): the OSS default
+	// brand "donmai" -> "donmai-platform"; a rebranded build renders its own
+	// brand's label. This parallel test uses the default brand.
 	if got.Name != "donmai-platform" {
 		t.Errorf("name=%q, want donmai-platform", got.Name)
 	}
@@ -736,7 +737,7 @@ func TestDefaultMCPServers_TrimsTrailingSlash(t *testing.T) {
 	qw.PlatformURL = "https://platform.example.com/"
 	qw.AuthToken = "rsk_test"
 
-	servers := defaultMCPServers(qw, "/abs/wt")
+	servers := defaultMCPServersForHarness(qw, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous)
 	if len(servers) != 1 {
 		t.Fatalf("len(servers)=%d, want 1", len(servers))
 	}
@@ -774,7 +775,7 @@ func TestDefaultMCPServers_OmitsWhenStandalone(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := defaultMCPServers(tc.qw, "/abs/wt"); got != nil {
+			if got := defaultMCPServersForHarness(tc.qw, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous); got != nil {
 				t.Errorf("got %+v; want nil", got)
 			}
 		})
@@ -796,7 +797,7 @@ func TestMergeMCPServers_RetainsPlatformGate(t *testing.T) {
 		{Name: "card-remote", Type: "http", URL: "https://card.test/mcp"},
 	}
 
-	merged := mergeMCPServers(defaultMCPServers(qw, "/abs/wt"), qw.McpServers)
+	merged := mergeMCPServers(defaultMCPServersForHarness(qw, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous), qw.McpServers)
 	if len(merged) != 3 {
 		t.Fatalf("merged len = %d, want 3 (platform gate + 2 card)", len(merged))
 	}
@@ -1298,4 +1299,74 @@ func kindsOf(evs []agent.Event) []agent.EventKind {
 		out = append(out, e.Kind())
 	}
 	return out
+}
+
+// exactHarnessStubProvider drives the real stub event loop while declaring
+// ANOTHER harness's exact manifest and capabilities, and runs the same
+// agent.PrepareHarness gate every real harness runs in Spawn (e.g.
+// provider/harness/pi/pi.go). A Spec the runner over-injected therefore denies
+// here exactly as it does in production, before any agent starts.
+type exactHarnessStubProvider struct {
+	agent.Provider
+	name     agent.ProviderName
+	caps     agent.Capabilities
+	manifest agent.HarnessManifest
+}
+
+func (p *exactHarnessStubProvider) Name() agent.ProviderName         { return p.name }
+func (p *exactHarnessStubProvider) Capabilities() agent.Capabilities { return p.caps }
+func (p *exactHarnessStubProvider) Manifest() agent.HarnessManifest  { return p.manifest }
+
+func (p *exactHarnessStubProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	prepared, err := agent.PrepareHarness(spec, p.manifest)
+	if err != nil {
+		return nil, err
+	}
+	return p.Provider.Spawn(ctx, prepared)
+}
+
+// TestLoop_SpawnsOnHarnessDeclaringNoMCPDelivery is the end-to-end guard for
+// the loop's own MCP composition (loop.go step 4). The runner injects the
+// per-session platform MCP gateway on the caller's behalf whenever platform
+// credentials are present; on a harness whose tool/lifecycle profile declares
+// no MCP delivery that injection used to reach the exact adapter and deny the
+// whole spawn ("cannot apply required entry \"mcp-servers\"") for a capability
+// the session never requested. The session must run instead.
+func TestLoop_SpawnsOnHarnessDeclaringNoMCPDelivery(t *testing.T) {
+	h := newRunnerHarness(t)
+
+	inner, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	provider := &exactHarnessStubProvider{
+		Provider: inner,
+		name:     agent.ProviderPi,
+		caps:     (&pi.Provider{}).Capabilities(),
+		manifest: (&pi.Provider{}).Manifest(),
+	}
+	if profile, ok := provider.manifest.ToolLifecycleProfile(agent.PromptModeAutonomous); !ok ||
+		profile.MCPDelivery != agent.ToolDeliveryUnsupported {
+		t.Fatalf("fixture harness must declare no MCP delivery; got profile %+v (found=%v)", profile, ok)
+	}
+	if err := h.runner.registry.Register(provider); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	qw := h.queuedWork("LOOP-NO-MCP-DELIVERY")
+	qw.ResolvedProfile.Provider = agent.ProviderPi
+	if qw.PlatformURL == "" || qw.AuthToken == "" {
+		t.Fatal("fixture must be a platform-connected session; that is what triggers the injection")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v (failureMode=%q error=%q)", err, res.FailureMode, res.Error)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("Run status = %q (failureMode=%q error=%q), want completed",
+			res.Status, res.FailureMode, res.Error)
+	}
 }

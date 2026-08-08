@@ -61,7 +61,7 @@ func TestIntegration_QueuedWorkJSON_ComposesCodeIntelSpec(t *testing.T) {
 
 	// ── Replicate the loop.go composition exactly ──────────────────────────────
 	// loop.go:270
-	mcpServers := mergeMCPServers(defaultMCPServers(qw, wpath), qw.McpServers)
+	mcpServers := mergeMCPServers(defaultMCPServersForHarness(qw, wpath, mcpDeliveringHarness(), agent.PromptModeAutonomous), qw.McpServers)
 	// loop.go:405
 	systemPrompt := injectCodeIntelPartial("BASE SYSTEM PROMPT", caps, qw.CodeIntel)
 	// loop.go builds the Spec from these inputs.
@@ -159,7 +159,7 @@ func TestIntegration_QueuedWorkJSON_MinimalBlockAllSixTools(t *testing.T) {
 
 	const wpath = "/abs/worktrees/sess_min"
 	caps := mcpCaps()
-	mcpServers := mergeMCPServers(defaultMCPServers(qw, wpath), qw.McpServers)
+	mcpServers := mergeMCPServers(defaultMCPServersForHarness(qw, wpath, mcpDeliveringHarness(), agent.PromptModeAutonomous), qw.McpServers)
 	spec := translateSpec(qw, caps, SpecInputs{Cwd: wpath, MCPServers: mcpServers})
 
 	var ciArgs []string

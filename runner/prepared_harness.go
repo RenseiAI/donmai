@@ -4,7 +4,6 @@ import (
 	"errors"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/prompt"
 )
@@ -49,19 +48,16 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection) (agent.S
 			promptPlan.InitialContext = []agent.PromptContent{{ID: "agent-memory-context", Text: composition.InitialContext, Required: true}}
 		}
 	}
+	mode := sessionPromptMode(working, selection.effectiveCell)
 	authorityWork := working
 	authorityWork.PlatformURL = "https://runtime.invalid"
 	authorityWork.AuthToken = "runtime-materialized"
-	defaults := defaultMCPServersForProvider(authorityWork, "/runtime/worktree", provider.Name())
+	defaults := defaultMCPServersForHarness(authorityWork, "/runtime/worktree", provider, mode)
 	runtimeNames := make([]string, 0, len(defaults))
 	for _, server := range defaults {
 		runtimeNames = append(runtimeNames, server.Name)
 	}
 	mcpServers := mergeMCPServers(defaults, working.McpServers)
-	mode := agent.PromptModeAutonomous
-	if selection.effectiveCell.SessionMode == executioncell.SessionHumanControlled {
-		mode = agent.PromptModeHumanControlled
-	}
 	spec := translateSpec(working, provider.Capabilities(), SpecInputs{
 		Prompt: userPrompt, SystemPromptAppend: composition.SystemPrompt(), PromptPlan: promptPlan,
 		InitialContext: composition.InitialContext, MCPServers: mcpServers,
