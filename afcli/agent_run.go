@@ -895,6 +895,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 		Branch:                d.Branch,
 		WorkerID:              d.WorkerID,
 		AuthToken:             d.AuthToken,
+		McpAuthToken:          d.McpAuthToken,
+		McpAuthTokenExpiresAt: d.McpAuthTokenExpiresAt,
 		PlatformURL:           d.PlatformURL,
 		TerminalWorkareaLease: d.TerminalWorkareaLease,
 		Capabilities:          d.Capabilities,
@@ -910,6 +912,13 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 		qw.OperationalPayload = bytes.Clone(d.OperationalPayload)
 		qw.HostAdaptationReceipt = bytes.Clone(d.HostAdaptationReceipt)
 		qw.WorkerID, qw.AuthToken, qw.PlatformURL = d.WorkerID, d.AuthToken, d.PlatformURL
+		// Restored beside the worker credentials for the same reason they are:
+		// the detail is authoritative for runtime credentials, so whatever the
+		// payload projection did to these fields must not survive. Today the
+		// `json:"-"` tags already keep the decoder off them, which makes this
+		// line a no-op — it is the tag change, not the decoder, that this
+		// guards against, exactly as for AuthToken/PlatformURL above.
+		qw.McpAuthToken, qw.McpAuthTokenExpiresAt = d.McpAuthToken, d.McpAuthTokenExpiresAt
 		qw.Capabilities = d.Capabilities
 	}
 	if d.StageBudget != nil {

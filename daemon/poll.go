@@ -182,6 +182,24 @@ type PollWorkItem struct {
 	// the accounting sentinel rides the queue.
 	InjectedPoolID string `json:"injectedPoolId,omitempty"`
 
+	// McpAuthToken is an opaque platform-supplied bearer for the platform's
+	// per-session MCP gateway, and for nothing else. The daemon never parses,
+	// validates, or logs its value — it forwards the string onto SessionDetail
+	// exactly as received.
+	//
+	// It is scoped and lived by the platform that minted it; the daemon must
+	// not assume any relationship to AuthToken, which stays the bearer for
+	// heartbeat, result-post, and the rest of the worker surface. Absent (a
+	// platform that mints none — self-hosted or older) is normal and safe: the
+	// runner falls back to the worker bearer, which is the standalone contract.
+	McpAuthToken string `json:"mcpAuthToken,omitempty"`
+
+	// McpAuthTokenExpiresAt is the RFC3339 UTC instant McpAuthToken stops being
+	// accepted. ADVISORY ONLY: it exists so an operator can see the cliff
+	// coming in the logs. Nothing may gate behaviour on it. Absent whenever
+	// McpAuthToken is absent.
+	McpAuthTokenExpiresAt string `json:"mcpAuthTokenExpiresAt,omitempty"`
+
 	// MemoryBlock is the dispatch-time agent-memory context the platform
 	// folds into the system prompt (Wave 3 memory-inject v1). The daemon
 	// forwards it opaquely onto SessionDetail; the runner's prompt builder
@@ -1223,6 +1241,8 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		WorkerID:                workerID,
 		AuthToken:               authToken,
 		PlatformURL:             platformURL,
+		McpAuthToken:            item.McpAuthToken,
+		McpAuthTokenExpiresAt:   item.McpAuthTokenExpiresAt,
 		CredentialPoolID:        item.InjectedPoolID,
 		StagePrompt:             item.StagePrompt,
 		StageID:                 item.StageID,

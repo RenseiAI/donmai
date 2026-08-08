@@ -63,6 +63,28 @@ type QueuedWork struct {
 	// the registration store; the runner just forwards it.
 	AuthToken string `json:"-"`
 
+	// McpAuthToken is the platform-supplied bearer for the platform's
+	// per-session MCP gateway, and for NOTHING else. AuthToken remains the
+	// bearer for heartbeat, result-post, activity-post, and the session
+	// preflight fetch; the two are not interchangeable in either direction.
+	//
+	// Empty means the platform minted none (self-hosted, or one that predates
+	// the field), in which case the gateway falls back to AuthToken — see
+	// mcpGatewayBearer. That fallback is the standalone contract, not a
+	// migration shim.
+	//
+	// `json:"-"` mirrors AuthToken deliberately: QueuedWork is re-unmarshalled
+	// from OperationalPayload and serialized onto other payloads, and a bearer
+	// must not round-trip through those paths.
+	McpAuthToken string `json:"-"`
+
+	// McpAuthTokenExpiresAt is the RFC3339 UTC instant McpAuthToken stops being
+	// accepted. ADVISORY ONLY — the runner logs it once at spawn so the cliff
+	// is visible in advance, and never branches on it: it must not refuse a
+	// spawn, shorten a session, or suppress the gateway. Excluded from JSON for
+	// the same round-trip reason as the bearer it describes.
+	McpAuthTokenExpiresAt string `json:"-"`
+
 	// PlatformURL is the base URL of the platform (e.g.
 	// "https://platform.example.com" or "http://127.0.0.1:3010"). The runner
 	// forwards this to result.Poster + heartbeat.Pulser. Required.

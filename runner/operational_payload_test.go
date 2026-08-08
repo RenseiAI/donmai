@@ -94,6 +94,11 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 		"AdmissionReceipt": "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
 		"ExecutionRuntimeBinding": "execution-sidecar", "OperationalPayload": "execution-sidecar", "HostAdaptationReceipt": "execution-sidecar",
 		"WorkerID": "daemon-runtime", "AuthToken": "daemon-runtime", "PlatformURL": "daemon-runtime", "Capabilities": "daemon-runtime",
+		// The session-scoped MCP bearer and its advisory expiry are runtime
+		// credentials, classified beside AuthToken: the daemon supplies them
+		// per spawn and they must stay OUT of the canonical projection, which
+		// is digested and compared across the wire.
+		"McpAuthToken": "daemon-runtime", "McpAuthTokenExpiresAt": "daemon-runtime",
 	}
 	typeOfQueuedWork := reflect.TypeOf(QueuedWork{})
 	for index := 0; index < typeOfQueuedWork.NumField(); index++ {

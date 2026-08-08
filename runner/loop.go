@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -315,10 +316,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// WS5) are APPENDED after it, unfiltered: they are caller-requested, so an
 	// undeliverable one must deny loudly. Dedup is by server name with the
 	// default winning on collision.
-	mcpServers := mergeMCPServers(
-		defaultMCPServersForHarness(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell)),
-		qw.McpServers,
-	)
+	mcpDefaults := defaultMCPServersForHarness(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell))
+	// Advisory only — see logMCPGatewayBearerExpiry. The bearer below is
+	// written into a config file nothing rewrites, so this line is the only
+	// warning an operator gets that the session's tools have a horizon.
+	logMCPGatewayBearerExpiry(r.logger, qw, mcpDefaults, time.Now())
+	mcpServers := mergeMCPServers(mcpDefaults, qw.McpServers)
 	mcpResult, err := buildMCPConfigPath(r.mcpb, mcpServers)
 	if err != nil {
 		res.Status = "failed"
@@ -1931,6 +1934,71 @@ func harnessDeliversMCP(provider agent.Provider, mode agent.PromptSessionMode) b
 	return provider.Capabilities().AcceptsMcpServerSpec
 }
 
+// platformMCPServerName is the client-side label for the platform per-session
+// MCP gateway entry.
+//
+// Brand-derived: a rebranded build of this same code renders its own brand's
+// label byte-identically. The platform reports its own serverInfo.name
+// independently; this is the client-side label only.
+func platformMCPServerName() string { return statehome.Brand() + "-platform" }
+
+// mcpGatewayBearer returns the bearer for the platform per-session MCP gateway.
+//
+// Prefers the session-scoped, session-lifetime token the platform stamps on the
+// work item; falls back to the worker bearer for platforms that do not mint one
+// (self-hosted / older) — that fallback is the standalone contract, not a shim,
+// and must never be removed.
+//
+// Why the preference matters: the header this bearer lands in is written ONCE
+// into an MCP config file at spawn, and nothing — not the daemon's runtime-
+// credential refresh, not the harness — ever rewrites it. So the gateway keeps
+// presenting whichever bearer was chosen here for the session's whole life, and
+// the moment it expires the harness's tools disappear with no error surfaced.
+// The session-scoped token is minted to outlive the session for exactly that
+// reason.
+//
+// The value is opaque to this repo: never parsed, validated, or logged.
+func mcpGatewayBearer(qw QueuedWork) string {
+	if t := strings.TrimSpace(qw.McpAuthToken); t != "" {
+		return t
+	}
+	return strings.TrimSpace(qw.AuthToken)
+}
+
+// logMCPGatewayBearerExpiry emits one advisory INFO line naming when the
+// gateway's bearer dies, so the one case this design does not close — a session
+// that outlives its bearer still loses its tools silently — is at least visible
+// in the logs beforehand.
+//
+// Strictly advisory. It returns nothing and the caller must not branch on it:
+// the runner never refuses a spawn, shortens a session, or drops the gateway
+// because of an expiry. It stays quiet unless there is something to say — an
+// expiry hint AND a gateway actually mounted.
+//
+// Logs WHEN the bearer dies, never WHAT it is.
+func logMCPGatewayBearerExpiry(logger *slog.Logger, qw QueuedWork, servers []agent.MCPServerConfig, now time.Time) {
+	expiresAt := strings.TrimSpace(qw.McpAuthTokenExpiresAt)
+	if logger == nil || expiresAt == "" {
+		return
+	}
+	gatewayName := platformMCPServerName()
+	if !slices.ContainsFunc(servers, func(s agent.MCPServerConfig) bool { return s.Name == gatewayName }) {
+		return
+	}
+	expiry, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		logger.Warn("[runner] platform MCP gateway bearer expiry is not RFC3339; ignoring the hint",
+			"sessionId", qw.SessionID,
+			"value", expiresAt,
+		)
+		return
+	}
+	logger.Info(fmt.Sprintf("[runner] platform MCP gateway bearer expires at %s (%dm from now)",
+		expiry.UTC().Format(time.RFC3339),
+		int(expiry.Sub(now).Round(time.Minute).Minutes()),
+	), "sessionId", qw.SessionID)
+}
+
 // defaultMCPServersForHarness returns the list of MCP servers a session ships
 // with by default, for one exact harness in one session mode.
 //
@@ -1940,9 +2008,11 @@ func harnessDeliversMCP(provider agent.Provider, mode agent.PromptSessionMode) b
 // defense-in-depth allow-list check at tool-call time — see the A2A ADR
 // at runs/2026-05-20-adr-a2a-per-session-mcp.md.
 //
-// When PlatformURL or AuthToken are missing (standalone-mode sessions
+// When PlatformURL or a usable bearer is missing (standalone-mode sessions
 // without a platform), the gate entry is omitted: the agent runs without any
-// platform MCP gate, which matches the legacy back-compat path.
+// platform MCP gate, which matches the legacy back-compat path. "Usable
+// bearer" is mcpGatewayBearer's answer, not qw.AuthToken specifically — a
+// platform that stamps only the session-scoped token must still get a gate.
 //
 // The gate is ALSO omitted when the selected harness declares no MCP delivery
 // for this mode (harnessDeliversMCP). This entry is the runner's own implicit
@@ -1964,18 +2034,14 @@ func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Pro
 
 	// Platform per-session HTTP gate — omitted in standalone mode (no platform
 	// creds). Always leads the list so it is never shadowed by a later entry.
-	if harnessDeliversMCP(provider, mode) && qw.PlatformURL != "" && qw.AuthToken != "" && qw.SessionID != "" {
+	if bearer := mcpGatewayBearer(qw); harnessDeliversMCP(provider, mode) && qw.PlatformURL != "" && bearer != "" && qw.SessionID != "" {
 		url := strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID
 		servers = append(servers, agent.MCPServerConfig{
-			// Brand-derived: the label is statehome.Brand()+"-platform", so a
-			// rebranded build of this same code renders its own brand's label
-			// byte-identically. The platform reports its own serverInfo.name
-			// independently; this is the client-side label only.
-			Name: statehome.Brand() + "-platform",
+			Name: platformMCPServerName(),
 			Type: "http",
 			URL:  url,
 			Headers: map[string]string{
-				"Authorization": "Bearer " + qw.AuthToken,
+				"Authorization": "Bearer " + bearer,
 			},
 		})
 	}
