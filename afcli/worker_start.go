@@ -14,11 +14,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/codesurvival"
 	"github.com/RenseiAI/donmai/internal/envcompat"
 	"github.com/RenseiAI/donmai/kgextract"
-	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/worker"
 )
 
@@ -37,26 +35,6 @@ type workerStartFlags struct {
 	capabilities      []string
 	debug             bool
 	quiet             bool
-}
-
-// mergeCapabilities returns the operator-supplied capability tags with the
-// required tags appended, preserving order and removing duplicates. Used to
-// guarantee `af worker start` always advertises the code-survival-scan
-// capability regardless of operator --capabilities flags.
-func mergeCapabilities(operator []string, required ...string) []string {
-	seen := make(map[string]struct{}, len(operator)+len(required))
-	out := make([]string, 0, len(operator)+len(required))
-	for _, c := range append(append([]string{}, operator...), required...) {
-		if c == "" {
-			continue
-		}
-		if _, dup := seen[c]; dup {
-			continue
-		}
-		seen[c] = struct{}{}
-		out = append(out, c)
-	}
-	return out
 }
 
 // resolveWorkerToken picks the provisioning token from the --provisioning-token
@@ -159,17 +137,26 @@ func runWorkerStart(flags *workerStartFlags) error {
 
 	c := worker.NewClient(baseURL, token)
 
-	// `af worker start` ALWAYS runs the in-process batch executors (the batch
-	// lane below) — code-survival-scan AND kg-extraction — so it must advertise
-	// BOTH capabilities at registration. The platform poll route gates the
-	// batchWork[]/kgExtractWork[] CLAIM on the matching capability: only a worker
-	// advertising it is handed (and can decode) a staged item. The in-box daemon
-	// does NOT run this binary and does NOT advertise these capabilities, so the
-	// platform never hands it batch work it would silently drop. Merge with any
+	// The kg-extraction lane: the capability tag and the executor come from ONE
+	// value, so this process can never advertise the tag without running the
+	// work (see kgextract.Lane). The resident daemon builds the same lane from
+	// its own poll path, which is why both can advertise it safely.
+	kgLane := kgextract.NewLane(kgextract.Options{
+		WorkerVersion:   version,
+		PlatformBaseURL: baseURL,
+	})
+
+	// `donmai worker start` ALWAYS runs the in-process batch executors (the
+	// batch lane below) — code-survival-scan AND kg-extraction — so it must
+	// advertise BOTH capabilities at registration. The coordinator poll route
+	// gates the batchWork[]/kgExtractWork[] CLAIM on the matching capability:
+	// only a worker advertising it is handed (and can decode) a staged item, and
+	// the claim POPS the item off the org queue — so advertising a lane this
+	// process does not run would drop the work outright. Merge with any
 	// operator-supplied --capabilities, deduped.
-	capabilities := mergeCapabilities(flags.capabilities,
+	capabilities := worker.MergeCapabilities(flags.capabilities,
 		codesurvival.WorkTypeCodeSurvivalScan,
-		kgextract.WorkTypeKGExtraction,
+		kgLane.Capability,
 	)
 
 	resp, err := c.Register(ctx, worker.RegisterRequest{
@@ -216,14 +203,9 @@ func runWorkerStart(flags *workerStartFlags) error {
 	survivalExec := codesurvival.NewExecutor(codesurvival.Options{
 		WorkerVersion: version,
 	})
-	kgExec := kgextract.NewExecutor(kgextract.Options{
-		WorkerVersion:   version,
-		PlatformBaseURL: baseURL,
-		EmitterFactory:  defaultKGEmitterFactory,
-	})
 	batchHandler := batchHandlerMux(
 		codesurvival.BatchHandler(survivalExec),
-		kgextract.BatchHandler(kgExec),
+		kgLane.Handler,
 	)
 
 	wg.Add(1)
@@ -306,35 +288,5 @@ func batchHandlerMux(survival, kg worker.BatchHandler) worker.BatchHandler {
 				"batchJobId", item.BatchJobID, "workType", item.WorkType)
 			return nil
 		}
-	}
-}
-
-// defaultKGEmitterFactory is the production kgextract.EmitterFactory. It builds a
-// constrained, single-shot Emitter per work item from a best-effort claude
-// provider (the provider named in the kg-extraction contract example). The
-// provider probes the host `claude` CLI at construction; when it is missing the
-// factory returns an error and the executor reports a status:"error" result for
-// the item (the platform learns the host could not run the emit) rather than
-// crashing the poll loop.
-//
-// host-session vs local: both authModes flow through the same provider-emit seam
-// today — the claude CLI invocation IS the host-session transport, and a future
-// local-completion provider plugs in here without changing the executor. The
-// item's provider/model selection is honored via the per-item factory signature.
-func defaultKGEmitterFactory(_ context.Context, item kgextract.KgExtractWorkItem) (kgextract.Emitter, error) {
-	// Only "claude" is wired today; other providers are a follow-up. An unknown
-	// provider surfaces as an emitter error → status:"error" for the item.
-	switch item.Provider {
-	case "", string(agent.ProviderClaude):
-		prov, err := providerclaude.New(providerclaude.Options{})
-		if err != nil {
-			return nil, fmt.Errorf("worker start: kg-extraction claude provider unavailable: %w", err)
-		}
-		return kgextract.NewProviderEmitter(kgextract.ProviderEmitterConfig{
-			Provider: prov,
-			Model:    item.Model,
-		})
-	default:
-		return nil, fmt.Errorf("worker start: kg-extraction provider %q not wired on this worker", item.Provider)
 	}
 }

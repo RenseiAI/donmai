@@ -2,11 +2,15 @@ package afcli
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/codesurvival"
+	"github.com/RenseiAI/donmai/kgextract"
+	"github.com/RenseiAI/donmai/worker"
 )
 
 // TestWorkerParentHelp verifies the worker parent command exposes the
@@ -184,26 +188,70 @@ func TestConfigureWorkerLogging(t *testing.T) {
 	}
 }
 
-// TestMergeCapabilities verifies `af worker start` always advertises the
-// code-survival-scan capability (BLOCKER 3) and dedupes operator-supplied tags.
-func TestMergeCapabilities(t *testing.T) {
+// TestWorkerStartCapabilities verifies `donmai worker start` always advertises
+// BOTH batch capabilities it runs in-process — the code-survival scan and the
+// kg-extraction lane — on top of whatever the operator passed, deduped. A lane
+// this process executes but does not advertise never receives work; a lane it
+// advertises but does not execute has its work claimed and dropped.
+func TestWorkerStartCapabilities(t *testing.T) {
+	kgLane := kgextract.NewLane(kgextract.Options{})
+
 	cases := []struct {
 		name     string
 		operator []string
-		required []string
 		want     []string
 	}{
-		{"empty_operator_gets_required", nil, []string{"code-survival-scan"}, []string{"code-survival-scan"}},
-		{"operator_preserved_required_appended", []string{"gpu"}, []string{"code-survival-scan"}, []string{"gpu", "code-survival-scan"}},
-		{"dedupe_when_operator_already_has_it", []string{"code-survival-scan"}, []string{"code-survival-scan"}, []string{"code-survival-scan"}},
-		{"drops_empty_tags", []string{"", "gpu", ""}, []string{"code-survival-scan"}, []string{"gpu", "code-survival-scan"}},
+		{"empty_operator_gets_both_lanes", nil, []string{codesurvival.WorkTypeCodeSurvivalScan, kgLane.Capability}},
+		{"operator_preserved_lanes_appended", []string{"gpu"}, []string{"gpu", codesurvival.WorkTypeCodeSurvivalScan, kgLane.Capability}},
+		{
+			"dedupe_when_operator_already_has_them",
+			[]string{codesurvival.WorkTypeCodeSurvivalScan, kgLane.Capability},
+			[]string{codesurvival.WorkTypeCodeSurvivalScan, kgLane.Capability},
+		},
+		{"drops_empty_tags", []string{"", "gpu", ""}, []string{"gpu", codesurvival.WorkTypeCodeSurvivalScan, kgLane.Capability}},
 	}
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			got := mergeCapabilities(tc.operator, tc.required...)
+			got := worker.MergeCapabilities(tc.operator, codesurvival.WorkTypeCodeSurvivalScan, kgLane.Capability)
 			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
-				t.Fatalf("mergeCapabilities(%v, %v) = %v, want %v", tc.operator, tc.required, got, tc.want)
+				t.Fatalf("capabilities(%v) = %v, want %v", tc.operator, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBatchHandlerMux_RoutesByWorkType pins the fan-out `donmai worker start`
+// wires: each batch lane reaches its OWN executor, and an item for a work-type
+// this binary does not know is skipped instead of being handed to the wrong
+// decoder (or crashing the poll loop).
+func TestBatchHandlerMux_RoutesByWorkType(t *testing.T) {
+	cases := []struct {
+		name         string
+		workType     string
+		wantSurvival bool
+		wantKG       bool
+	}{
+		{"survival_item", codesurvival.WorkTypeCodeSurvivalScan, true, false},
+		{"kg_item", kgextract.WorkTypeKGExtraction, false, true},
+		{"unknown_item", "some-future-work-type", false, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var survivalHits, kgHits int
+			mux := batchHandlerMux(
+				func(context.Context, worker.BatchWorkItem) error { survivalHits++; return nil },
+				func(context.Context, worker.BatchWorkItem) error { kgHits++; return nil },
+			)
+			if err := mux(context.Background(), worker.BatchWorkItem{WorkType: tc.workType}); err != nil {
+				t.Fatalf("mux(%q) = %v, want nil", tc.workType, err)
+			}
+			if got := survivalHits > 0; got != tc.wantSurvival {
+				t.Errorf("survival handler called = %v, want %v", got, tc.wantSurvival)
+			}
+			if got := kgHits > 0; got != tc.wantKG {
+				t.Errorf("kg handler called = %v, want %v", got, tc.wantKG)
 			}
 		})
 	}
