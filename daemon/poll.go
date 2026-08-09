@@ -15,7 +15,9 @@ import (
 
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/kgextract"
 	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/worker"
 )
 
 // PollWorkItem mirrors one element of the platform's poll response `work[]`
@@ -370,6 +372,18 @@ type PollResponse struct {
 	// never started — that gap is what this field closes. Absent/empty is
 	// safe (no producer emits it unless landing triggers are staged).
 	LandingWork []LandingWorkItem `json:"landingWork,omitempty"`
+
+	// KgExtractWork is the non-agent kg-extraction lane, a sibling of work[]
+	// and landingWork[] on the same poll response. Each item is a batch job,
+	// never a session: it is not admitted to the spawner, does not count toward
+	// the agent quota, and never reaches runner.Run.
+	//
+	// The coordinator only emits it to a worker whose registration advertised
+	// the kg-extraction capability, and emitting it POPS the item off the org
+	// queue — so decoding this field without executing it destroys the work.
+	// That is why NewPollService fills a nil OnKgExtractWork with the default
+	// executor lane: no poll path can decode an item it is unable to run.
+	KgExtractWork []worker.BatchWorkItem `json:"kgExtractWork,omitempty"`
 }
 
 // InboxMessage is one queued message for a running session, delivered in
@@ -464,7 +478,29 @@ type PollOptions struct {
 	// Nil ⇒ never suspended, byte-identical to the pre-gate behaviour. The
 	// callback MUST NOT block: it runs on the poll goroutine.
 	ClaimSuspended func() (suspended bool, reason string)
+
+	// OnKgExtractWork executes ONE claimed kgExtractWork[] item. It runs on its
+	// own goroutine (bounded by maxConcurrentKgExtract), never on the poll
+	// goroutine, so a long extraction cannot stall session claiming or inbox
+	// routing. Errors are logged at warn and never stop the loop.
+	//
+	// Nil is NOT "drop the item": NewPollService substitutes the default
+	// kgextract lane, because a claimed item has already been popped off the
+	// coordinator's queue and would otherwise be lost. Set it only to override
+	// the executor (tests, or an embedder with its own emitter wiring).
+	OnKgExtractWork worker.BatchHandler
+
+	// WorkerVersion stamps the kg-extraction executor's log/result context.
+	// Empty falls back to the executor default ("dev").
+	WorkerVersion string
 }
+
+// maxConcurrentKgExtract bounds how many claimed kg-extraction items one poll
+// service executes at a time. The coordinator hands out at most a couple per
+// tick; anything above the bound waits on the semaphore inside its own
+// goroutine (cheap) instead of spawning provider processes without limit. A
+// waiting item is abandoned only when the service is shutting down.
+const maxConcurrentKgExtract = 2
 
 // PollService manages the periodic poll goroutine. Like HeartbeatService it is
 // safe to Start / Stop multiple times; consecutive Starts are idempotent.
@@ -480,6 +516,12 @@ type PollService struct {
 	// claimsSuspended latches the last observed ClaimSuspended result so the
 	// loop logs one line per state TRANSITION rather than one per tick.
 	claimsSuspended bool
+
+	// kgWG tracks in-flight kg-extraction executions so Stop joins them before
+	// publishing completion (the loop goroutine waits on it before closing
+	// done). kgSem bounds their concurrency.
+	kgWG  sync.WaitGroup
+	kgSem chan struct{}
 }
 
 // NewPollService constructs a PollService from opts. OnWork must be non-nil.
@@ -496,10 +538,23 @@ func NewPollService(opts PollOptions) *PollService {
 	if opts.LogInfo == nil {
 		opts.LogInfo = func(string, ...any) {}
 	}
+	// A poll response that carries kgExtractWork[] has already had those items
+	// popped off the coordinator's queue for this worker. Decoding them without
+	// an executor would destroy the work, so the lane is filled in here rather
+	// than left to each embedder: every PollService that can DECODE an item can
+	// also RUN it. (The coordinator still only sends items to a worker whose
+	// registration advertised kgextract's capability tag.)
+	if opts.OnKgExtractWork == nil {
+		opts.OnKgExtractWork = kgextract.NewLane(kgextract.Options{
+			WorkerVersion:   opts.WorkerVersion,
+			PlatformBaseURL: opts.OrchestratorURL,
+		}).Handler
+	}
 	return &PollService{
 		opts:     opts,
 		workerID: opts.WorkerID,
 		jwt:      opts.RuntimeJWT,
+		kgSem:    make(chan struct{}, maxConcurrentKgExtract),
 	}
 }
 
@@ -544,6 +599,12 @@ func (p *PollService) Start() {
 	go func() {
 		defer close(done)
 		p.loop(ctx)
+		// Join in-flight kg-extraction executions before publishing completion:
+		// each one owns a claimed item and posts its result, so a stop that
+		// reported "done" while they ran would look like a clean shutdown that
+		// silently abandoned claimed work. Callers are still never held past
+		// their own deadline — StopContext selects on the caller's context.
+		p.kgWG.Wait()
 	}()
 }
 
@@ -716,6 +777,18 @@ func (p *PollService) pollOnce(ctx context.Context) {
 				p.opts.LogWarn("poll handler error for landing-trigger %s/%s: %v", lw.OrgID, lw.RepoID, herr)
 			}
 		}
+		// Route the kg-extraction lane. These items are batch jobs, not
+		// sessions: they never reach the spawner, never count toward the agent
+		// quota, and never touch runner.Run. The coordinator popped them off
+		// the org queue to hand them here, so each one MUST be executed —
+		// dispatchKgExtract runs it on its own goroutine so a multi-minute
+		// extraction cannot stall session claiming on this loop.
+		if len(resp.KgExtractWork) > 0 {
+			p.opts.LogInfo("daemon poll: %d kg-extraction item(s) received", len(resp.KgExtractWork))
+		}
+		for _, kw := range resp.KgExtractWork {
+			p.dispatchKgExtract(ctx, kw)
+		}
 		// Route any inbox messages (interactive-interview user turns +
 		// memory blocks) to the running sessions. Previously the
 		// inboxMessages map was not even decoded, so a kind="user" turn
@@ -752,6 +825,39 @@ func (p *PollService) pollOnce(ctx context.Context) {
 		return
 	}
 	p.opts.LogWarn("daemon poll failed: %v", err)
+}
+
+// dispatchKgExtract executes one claimed kg-extraction item off the poll
+// goroutine. The item is already claimed, so it is never skipped for load: when
+// the concurrency bound is saturated the goroutine waits on the semaphore and
+// runs as soon as a slot frees. Only shutdown abandons a waiting item, and that
+// is logged at warn — the coordinator's claim lease expires and the item is
+// re-staged for a later poll.
+func (p *PollService) dispatchKgExtract(ctx context.Context, item worker.BatchWorkItem) {
+	handler := p.opts.OnKgExtractWork
+	if handler == nil {
+		// Unreachable through NewPollService (it fills the default lane). Kept
+		// as a loud guard: a zero-value PollService must complain rather than
+		// silently drop a claimed item.
+		p.opts.LogWarn("daemon poll: kg-extraction item %q received with no executor wired; item dropped",
+			item.BatchJobID)
+		return
+	}
+	p.kgWG.Add(1)
+	go func() {
+		defer p.kgWG.Done()
+		select {
+		case p.kgSem <- struct{}{}:
+			defer func() { <-p.kgSem }()
+		case <-ctx.Done():
+			p.opts.LogWarn("daemon poll: kg-extraction item %q abandoned before execution (poll service stopping)",
+				item.BatchJobID)
+			return
+		}
+		if herr := handler(ctx, item); herr != nil {
+			p.opts.LogWarn("daemon poll: kg-extraction item %q failed: %v", item.BatchJobID, herr)
+		}
+	}()
 }
 
 // routeInbox forwards every decoded inbox message to OnInbox, keyed by the
