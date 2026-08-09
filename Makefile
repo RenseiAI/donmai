@@ -1,10 +1,24 @@
-.PHONY: build run run-mock run-status run-status-mock test test-tagged lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report
+.PHONY: build run run-mock run-status run-status-mock test test-tagged lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
 
 build:
 	go build $(LDFLAGS) -o $(BUILD_DIR)/donmai ./cmd/donmai
+
+# hooks wires this repo's git hooks (currently: .githooks/pre-commit, the
+# main-commit guard) via core.hooksPath. Also runs automatically from
+# scripts/create-worktree.sh and the SessionStart refresh-worktree.sh hook —
+# this target is for a manual/explicit install (e.g. a fresh clone that
+# hasn't run either of those yet).
+hooks:
+	bash scripts/install-git-hooks.sh
+
+# hooks-test exercises scripts/create-worktree.sh + .githooks/pre-commit
+# against a throwaway sandbox repo (never this one). Not part of `make test`
+# (Go) — this is a bash/git integration suite for the worktree tooling.
+hooks-test:
+	bash scripts/create-worktree.test.sh
 
 run: build
 	./$(BUILD_DIR)/donmai dashboard
