@@ -19,18 +19,22 @@ import (
 
 func TestInteractiveArgs(t *testing.T) {
 	t.Parallel()
+	workspace := t.TempDir()
+	// Every launch carries the startup-trust seed (trust.go) ahead of the
+	// prompt; these cases pin what the PROMPT adds on top of it.
+	trust := trustPrefixFor(t, workspace)
 	tests := []struct {
 		name   string
 		prompt string
 		want   []string
 	}{
-		{name: "empty prompt starts bare TUI", prompt: "", want: nil},
-		{name: "non-empty prompt seeds the TUI", prompt: "fix the failing tests", want: []string{"fix the failing tests"}},
+		{name: "empty prompt starts bare TUI", prompt: "", want: trust},
+		{name: "non-empty prompt seeds the TUI", prompt: "fix the failing tests", want: append(slices.Clone(trust), "fix the failing tests")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := interactiveArgs(agent.Spec{Prompt: tt.prompt})
+			got := interactiveArgs(agent.Spec{Cwd: workspace, Prompt: tt.prompt})
 			if len(got) != len(tt.want) {
 				t.Fatalf("interactiveArgs(%q) = %v, want %v", tt.prompt, got, tt.want)
 			}
@@ -128,13 +132,15 @@ func TestBuildInteractiveLaunch_MixedMCPIsDeterministicSemanticAndSecretFree(t *
 
 func TestBuildInteractiveLaunch_EmptyMCPAddsNoOverride(t *testing.T) {
 	t.Parallel()
-	spec := agent.Spec{Prompt: "hello", Env: map[string]string{"A": "1"}}
+	workspace := t.TempDir()
+	spec := agent.Spec{Cwd: workspace, Prompt: "hello", Env: map[string]string{"A": "1"}}
 	launch, err := buildInteractiveLaunch(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(launch.argv, []string{"hello"}) || slices.Contains(launch.argv, "--strict-config") {
-		t.Fatalf("empty MCP launch = %q", launch.argv)
+	want := append(trustPrefixFor(t, workspace), "hello")
+	if !slices.Equal(launch.argv, want) || slices.Contains(launch.argv, "--strict-config") {
+		t.Fatalf("empty MCP launch = %q, want %q", launch.argv, want)
 	}
 	launch.env["A"] = "changed"
 	if spec.Env["A"] != "1" {

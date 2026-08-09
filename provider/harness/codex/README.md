@@ -107,6 +107,39 @@ emitted as `mcp_cleanup_failed` on terminal/crash paths. Process exit and
 `Shutdown` also remove the owned home. `-32601 Method not found` is therefore
 a hard pre-thread failure.
 
+## Startup trust (interactive spawn mode)
+
+The codex TUI holds modal startup reviews before it reads a keystroke, and a
+session launched into a freshly provisioned workspace meets two of them:
+its directory review ("Do you trust the contents of this directory?") and its
+hook review ("N hooks are new or changed"). Neither times out, so an
+unattended session parks on them until its wall clock kills it.
+
+`trust.go` removes both by seeding process-local `--config` overrides on the
+interactive launch — never by writing to the operator's own codex home:
+
+| Seed | Value | Why it may be seeded |
+| --- | --- | --- |
+| `projects."<workspace>".trust_level` | `trusted` | The runner provisioned that directory. Both the given path and its symlink-resolved form are seeded, because codex matches a project entry by exact path. |
+| `features.hooks` | `false` | Hooks found in the workspace are repo content, not platform-provisioned, and trusting one grants command execution outside the sandbox. This takes codex's own third option — continue without trusting, hooks do not run — deterministically. Set `DONMAI_CODEX_HOOKS=inherit` to leave codex's hook handling alone (an attended terminal can then review them; an unattended one can block). |
+
+Requested MCP servers need no seed: codex starts every server in effective
+configuration with no approval step, and one that fails to start (including a
+`401`) degrades to a warning line rather than a prompt.
+
+The `projects` override SHADOWS the ambient projects table for the child
+process, so a session's trusted set is exactly the workspace the platform
+provisioned — narrower than the operator's own configuration may grant, never
+broader. A workspace that cannot be resolved to an absolute path fails the
+spawn with an error naming the missing trust, because hanging on the review
+is the worse outcome.
+
+The **headless app-server lane is deliberately not seeded**: it has no UI to
+block on (approvals ride the bridge in `approval.go`), and trusting its
+working directory would make codex load that directory's `.codex/config.toml`
+as a project configuration layer, admitting `mcp_servers` the isolated
+`CODEX_HOME` boundary exists to exclude.
+
 ## Failure modes (F.1.1 §5)
 
 - **Transient JSON-RPC error** → `RequestWithRetry` does 3 attempts
@@ -169,6 +202,8 @@ surfacing as a spurious `client stopped` Spawn failure.
 | `jsonrpc.go`          | Bidirectional JSON-RPC 2.0 client over stdio      |
 | `handle.go`           | Per-session `Handle` + forwarder goroutine        |
 | `approval.go`         | Approval bridge (Spec.PermissionConfig → decision) |
+| `interactive.go`      | Interactive PTY spawn mode (bare `codex` TUI)     |
+| `trust.go`            | Startup trust seeding for the interactive mode    |
 | `spec_translation.go` | `agent.Spec` → JSON-RPC param mapping             |
 | `event_mapping.go`    | JSON-RPC notification → `agent.Event` mapping     |
 | `signal_unix.go`      | `SIGTERM` lookup (unix)                           |

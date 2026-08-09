@@ -34,15 +34,18 @@ func TestPromptAdaptation_ExactAppServerAndInteractiveWire(t *testing.T) {
 		t.Fatalf("profile = %q", receipt.ProfileID)
 	}
 
-	interactiveSpec := agent.Spec{PromptPlan: &plan, Interactive: &agent.InteractiveSpec{}}
+	workspace := t.TempDir()
+	interactiveSpec := agent.Spec{Cwd: workspace, PromptPlan: &plan, Interactive: &agent.InteractiveSpec{}}
 	interactive, interactiveReceipt, err := agent.AdaptPrompt(interactiveSpec, mustCodexPromptProfile(t, agent.PromptModeHumanControlled))
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantArgs := []string{
-		"--config", "developer_instructions=" + strconv.Quote(wantSystem),
+	// The startup-trust seed (trust.go) leads every interactive argv; the
+	// prompt wire this test pins is what follows it.
+	wantArgs := append(trustPrefixFor(t, workspace),
+		"--config", "developer_instructions="+strconv.Quote(wantSystem),
 		"context\n\nuser\n\namend",
-	}
+	)
 	if got := interactiveArgs(interactive); !reflect.DeepEqual(got, wantArgs) {
 		t.Fatalf("interactive argv = %#v, want %#v", got, wantArgs)
 	}
