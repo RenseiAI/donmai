@@ -8,6 +8,33 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **The resident daemon can now claim and run kg-extraction work.** Until now
+  only the standalone `donmai worker start` process advertised the
+  kg-extraction capability and ran its executor; the daemon poll path did
+  neither, so an operator running the daemon had no way to serve that lane. The
+  daemon now decodes the `kgExtractWork[]` lane, executes each claimed item off
+  the poll goroutine (bounded concurrency, joined on shutdown), and advertises
+  the capability at registration.
+
+  Advertisement and execution are welded together: the capability tag and the
+  handler come from one value (`kgextract.NewLane`), `NewPollService` fills a
+  nil handler with the default lane, and the registration tag list is derived
+  from the lanes the poll service runs. A worker can no longer advertise a lane
+  it cannot execute — which would be worse than silence, since claiming pops
+  the item off the coordinator's queue and no other worker would ever see it.
+
+### Fixes
+
+- **An interactive session no longer reports its exit line as a summary.**
+  `Result.Summary` carried a synthesized "interactive session ended (exit N)"
+  for every interactive session — a lifecycle fact in a field consumers read as
+  the agent's account of the work, which downstream readers then had to
+  recognise and discard. The exit detail still travels on `Result.Error`, the
+  session-ended activity event, and the log line; a session with nothing
+  substantive to say now leaves `Summary` empty.
+
 ## v0.57.6 — 2026-08-08
 
 ### Features

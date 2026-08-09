@@ -115,15 +115,18 @@ type Options struct {
 
 	// RegistrationCapabilities is the flat capability-tag list advertised at
 	// REGISTRATION time (distinct from WorkerCapabilitiesFunc, which is the
-	// typed per-session map). It is sent verbatim as RegisterRequest.capabilities
-	// and the platform persists it on workers.capabilities, where it gates the
-	// capability-keyed claim lanes (KG-extraction, FD-4 landing's "merge-queue").
+	// typed per-session map). The coordinator persists it and gates its
+	// capability-keyed claim lanes against it (kg-extraction, the landing
+	// lane's "merge-queue").
 	//
-	// Nil ⇒ the primary daemon falls back to the base substrate set
-	// ({local,sandbox,workarea}) — byte-identical to today's behaviour — so a
-	// pure-OSS embedder that never sets this is unaffected. Embedders that want
-	// the worker to receive a capability-gated lane supply the full tag list
-	// here (e.g. rensei-tui appends "merge-queue").
+	// Nil ⇒ the base substrate set ({local,sandbox,workarea}). Embedders that
+	// want the worker to receive another capability-gated lane supply the full
+	// tag list here (e.g. a downstream embedder appends "merge-queue").
+	//
+	// Either way the tags for the lanes the poll service itself executes are
+	// appended on top (see effectiveRegistrationCapabilities) — an embedder can
+	// neither forget them nor advertise them without the executor, because the
+	// executor is wired by the poll service, not by the embedder.
 	RegistrationCapabilities []string
 
 	// OnLandingWork handles a landing-run poll item (WorkType ==
@@ -699,13 +702,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		for i, c := range detected {
 			provides[i] = ProvideCapability{Kind: string(c.Kind)}
 		}
-		// Registration capabilities: the embedder-supplied list when set
-		// (rensei-tui appends "merge-queue" for the FD-4 landing lane), else the
-		// base substrate set so a pure-OSS daemon is unchanged.
-		regCaps := d.opts.RegistrationCapabilities
-		if regCaps == nil {
-			regCaps = []string{"local", "sandbox", "workarea"}
-		}
+		regCaps := effectiveRegistrationCapabilities(d.opts.RegistrationCapabilities)
 		regOpts = RegistrationOptions{
 			OrchestratorURL:   cfg.Orchestrator.URL,
 			RegistrationToken: token,
@@ -900,6 +897,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 				OrchestratorURL: cfg.Orchestrator.URL,
 				RuntimeJWT:      regResp.RuntimeToken,
 				IntervalSeconds: interval,
+				// Stamps the non-agent lane executors' result/log context with
+				// the running binary's version rather than the library default.
+				WorkerVersion: d.EffectiveVersion(),
 				LogWarn: func(format string, args ...any) {
 					slog.Warn(fmt.Sprintf(format, args...))
 				},

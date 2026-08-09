@@ -684,6 +684,59 @@ func TestInteractive_LocalOnlyNonzeroExitFails(t *testing.T) {
 	}
 }
 
+// TestInteractive_ExitDetailIsNotASummary: the terminal Result's Summary field
+// carries the AGENT's account of the work, and consumers read it as content. A
+// session that ends without one leaves it EMPTY rather than synthesizing a
+// lifecycle line ("the process exited") that downstream readers then have to
+// recognise and filter back out. The exit detail still travels on the channels
+// built for it — Error on the failure path, plus the session-ended activity
+// event and the log line.
+func TestInteractive_ExitDetailIsNotASummary(t *testing.T) {
+	requireSh(t)
+
+	cases := []struct {
+		name       string
+		command    string
+		wantStatus string
+		wantErr    string
+	}{
+		{"clean_exit", "exit 0", "completed", ""},
+		{"nonzero_exit", "exit 7", "failed", "exit 7"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envAttachURL, "")
+			t.Setenv(envAttachToken, "")
+
+			r := minimalRunner(t)
+			sess, err := ptyhost.Spawn(ptyhost.Spec{Command: []string{"/bin/sh", "-c", tc.command}})
+			if err != nil {
+				t.Fatalf("ptyhost.Spawn: %v", err)
+			}
+			h := newInteractivePTYHandle(sess)
+
+			res := &Result{SessionID: "s"}
+			qw := QueuedWork{}
+			qw.SessionID = "s"
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			t.Cleanup(cancel)
+
+			out, _ := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
+			if out.Status != tc.wantStatus {
+				t.Fatalf("status = %q, want %q (error=%q)", out.Status, tc.wantStatus, out.Error)
+			}
+			if out.Summary != "" {
+				t.Errorf("Summary = %q, want empty: a session lifecycle line is not a summary", out.Summary)
+			}
+			if tc.wantErr != "" && !strings.Contains(out.Error, tc.wantErr) {
+				t.Errorf("Error = %q, want it to carry the exit detail %q", out.Error, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
 	requireSh(t)
 

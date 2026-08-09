@@ -434,7 +434,14 @@ func (r *Runner) finishInteractive(
 			res.Error = "interactive session ended: " + detail
 		}
 	}
-	res.Summary = "interactive session ended (" + detail + ")"
+	// Summary is deliberately NOT synthesized here. It carries the AGENT's
+	// account of the work done, and consumers treat it as such — a synthesized
+	// "the process exited" line is a lifecycle fact masquerading as content,
+	// which downstream readers then have to recognise and filter out. The exit
+	// detail already travels on the channels built for it: res.Error on the
+	// failure path, the session-ended activity event below, and the log line.
+	// An interactive session with nothing substantive to say leaves Summary
+	// empty rather than filling it with noise.
 	r.postInteractiveActivity(context.Background(), worktreePath, sink, "interactive-session-ended",
 		"interactive session ended: "+detail)
 	r.logger.Info("[interactive] session end",
