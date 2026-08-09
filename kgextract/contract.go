@@ -38,7 +38,17 @@ package kgextract
 // platform. The executor echoes the version it was built against; the platform
 // ingestion rejects unknown majors so a stale worker image cannot silently write
 // malformed rows.
-const KGExtractionContractVersion = 1
+//
+// v2: edges carry an optional confidence label + discrete confidenceScore, and
+// the emit prompt asks for a `semantically_similar_to` relation. Both edge
+// fields are OPTIONAL on the platform schema, so the addition is purely
+// additive; the relation name needs no constant here because RelationshipName is
+// a free string and the prompt + JSON-Schema ride on the wire from the platform.
+// The canonical fixture of a real v2 work item is
+// testdata/platform_v2_work_item.json (generated from the platform's own
+// dispatcher) — the decode test reads it, so a future contract move that the Go
+// side does not follow fails here rather than in a daemon log.
+const KGExtractionContractVersion = 2
 
 // WorkTypeKGExtraction is the kgExtractWork[].workType this package handles.
 const WorkTypeKGExtraction = "kg-extraction"
@@ -86,6 +96,8 @@ const (
 	NodeTypeDatabase   NodeType = "Database"
 	NodeTypeDecision   NodeType = "Decision"
 	NodeTypePattern    NodeType = "Pattern"
+	NodeTypeConvention NodeType = "Convention"
+	NodeTypeDeviation  NodeType = "Deviation"
 	NodeTypePerson     NodeType = "Person"
 	NodeTypeConfig     NodeType = "Config"
 	NodeTypeDependency NodeType = "Dependency"
@@ -100,6 +112,8 @@ var validNodeTypes = map[NodeType]struct{}{
 	NodeTypeDatabase:   {},
 	NodeTypeDecision:   {},
 	NodeTypePattern:    {},
+	NodeTypeConvention: {},
+	NodeTypeDeviation:  {},
 	NodeTypePerson:     {},
 	NodeTypeConfig:     {},
 	NodeTypeDependency: {},
@@ -134,11 +148,36 @@ type ExtractedNode struct {
 	Description string   `json:"description"`
 }
 
+// EdgeConfidence is the v2 confidence label carried on an extracted edge.
+// Mirrors the platform EDGE_CONFIDENCE_LEVELS union. It is OPTIONAL on the
+// platform schema, so an emit that omits it is still valid — the platform
+// defaults a missing label when it persists the edge.
+type EdgeConfidence string
+
+// EdgeConfidence values mirror the platform union EXACTLY.
+const (
+	// EdgeConfidenceExtracted — the relationship is explicit in the source.
+	EdgeConfidenceExtracted EdgeConfidence = "EXTRACTED"
+	// EdgeConfidenceInferred — a reasonable inference from the source.
+	EdgeConfidenceInferred EdgeConfidence = "INFERRED"
+	// EdgeConfidenceAmbiguous — uncertain; surfaced for review, never omitted.
+	EdgeConfidenceAmbiguous EdgeConfidence = "AMBIGUOUS"
+)
+
 // ExtractedEdge mirrors the platform ExtractedEdge shape field-for-field.
+//
+// v2 added Confidence + ConfidenceScore. Both are PASSTHROUGH: the worker does
+// NOT validate or default them (the platform's schema marks both optional and
+// owns the defaulting), it only carries the model's labels through so they are
+// not silently dropped on the way back. omitempty on both keeps a v1-shaped emit
+// serializing exactly as it did before. ConfidenceScore is a pointer so a
+// legitimate 0 score is distinguishable from "absent".
 type ExtractedEdge struct {
-	SourceNodeID     string `json:"sourceNodeId"`
-	TargetNodeID     string `json:"targetNodeId"`
-	RelationshipName string `json:"relationshipName"`
+	SourceNodeID     string         `json:"sourceNodeId"`
+	TargetNodeID     string         `json:"targetNodeId"`
+	RelationshipName string         `json:"relationshipName"`
+	Confidence       EdgeConfidence `json:"confidence,omitempty"`
+	ConfidenceScore  *float64       `json:"confidenceScore,omitempty"`
 }
 
 // ExtractedGraph is the {nodes,edges} object the model is instructed to emit and

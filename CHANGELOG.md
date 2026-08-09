@@ -8,6 +8,41 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.57.8 — 2026-08-09
+
+### Fixes
+
+- **The kg-extraction executor now speaks contract v2, so staged work actually
+  runs.** The coordinator has staged `contractVersion: 2` items since
+  2026-06-13; this worker still declared 1 and refused every item at the version
+  gate before doing any work. Nothing noticed for two months because no worker
+  advertised the capability, so no item was ever handed over — the first host to
+  advertise it rejected every batch it claimed. The worker now decodes the real
+  v2 shape end to end:
+
+  - edges carry the optional `confidence` label and discrete `confidenceScore`
+    through to the posted result instead of dropping them on unmarshal (both are
+    passthrough — the coordinator owns that vocabulary and its defaulting);
+  - the `Convention` and `Deviation` node types are accepted, so nodes the emit
+    schema asks the model for are no longer silently dropped by the worker's
+    closed-set validation;
+  - `semantically_similar_to` needs no change here — the relation name is a free
+    string, and the emit prompt and JSON-Schema ride on the wire.
+
+  A real work item, generated from the coordinator's own dispatcher, is checked
+  in as `kgextract/testdata/platform_v2_work_item.json` and decoded by the test
+  suite, so the next contract move fails in CI rather than in one host's log.
+
+- **A refused kg-extraction item now becomes a visible failed result instead of
+  disappearing.** On a contract-version rejection the executor returned an error
+  and POSTed nothing, so the coordinator's row for that batch stayed `pending`
+  forever while its claim key suppressed every re-stage of the same stable batch
+  id for an hour — the failure was visible only in the host's log file. The
+  executor now POSTs a terminal `status:"error"` result before returning, so the
+  refusal is reported where it can be seen. The cross-tenant org-claim rejection
+  deliberately still posts nothing: that guard fires precisely because the item's
+  result-auth token does not claim the item's org, so it must not be used.
+
 ## v0.57.7 — 2026-08-09
 
 ### Features

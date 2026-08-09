@@ -21,10 +21,16 @@ type rawNode struct {
 	Description string `json:"description"`
 }
 
+// rawEdge reads the v2 edge shape. Confidence is read as a string (not the
+// EdgeConfidence type) for the same reason node Type is: an out-of-set label
+// must not fail the decode. It is carried through unvalidated — the platform
+// owns the confidence vocabulary and its defaulting.
 type rawEdge struct {
-	SourceNodeID     string `json:"sourceNodeId"`
-	TargetNodeID     string `json:"targetNodeId"`
-	RelationshipName string `json:"relationshipName"`
+	SourceNodeID     string   `json:"sourceNodeId"`
+	TargetNodeID     string   `json:"targetNodeId"`
+	RelationshipName string   `json:"relationshipName"`
+	Confidence       string   `json:"confidence"`
+	ConfidenceScore  *float64 `json:"confidenceScore"`
 }
 
 // parseGraph parses a model emit into a validated ExtractedGraph.
@@ -38,7 +44,10 @@ type rawEdge struct {
 //   - a node is kept only when id+name are non-empty AND type is one of the
 //     closed NodeType set; invalid nodes are dropped.
 //   - an edge is kept only when sourceNodeId+targetNodeId+relationshipName are
-//     non-empty; invalid edges are dropped.
+//     non-empty; invalid edges are dropped. The v2 confidence/confidenceScore
+//     fields are carried through UNVALIDATED — both are optional platform-side
+//     and the platform owns the vocabulary and the defaulting, so validating
+//     them here could only drop a label the platform would have accepted.
 //
 // Returns an error only when NO top-level JSON object can be located/decoded at
 // all (an unparseable emit). A successfully-decoded-but-empty graph is NOT an
@@ -73,7 +82,15 @@ func parseGraph(raw string) (ExtractedGraph, error) {
 		if e.SourceNodeID == "" || e.TargetNodeID == "" || e.RelationshipName == "" {
 			continue // drop invalid edge (defense-in-depth)
 		}
-		out.Edges = append(out.Edges, ExtractedEdge(e))
+		// v2 confidence fields are PASSTHROUGH — carried, never validated or
+		// defaulted here (the platform owns both).
+		out.Edges = append(out.Edges, ExtractedEdge{
+			SourceNodeID:     e.SourceNodeID,
+			TargetNodeID:     e.TargetNodeID,
+			RelationshipName: e.RelationshipName,
+			Confidence:       EdgeConfidence(e.Confidence),
+			ConfidenceScore:  e.ConfidenceScore,
+		})
 	}
 	return out, nil
 }

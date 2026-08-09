@@ -97,7 +97,9 @@ func NewExecutor(opts Options) *Executor {
 // poll loop NEVER crashes and NEVER touches the agent path. It returns a non-nil
 // error only when the work item is rejected before any work begins (org-claim
 // mismatch / unknown contract version) so the poll loop can log the rejection —
-// the loop still continues.
+// the loop still continues. A contract-version rejection ALSO POSTs a terminal
+// status:"error" result first (see postRejection), so the refusal is visible on
+// the platform instead of only in this host's log.
 func (e *Executor) Handle(ctx context.Context, item KgExtractWorkItem) error {
 	log := e.logger.With(
 		"batchJobId", item.BatchJobID,
@@ -110,9 +112,20 @@ func (e *Executor) Handle(ctx context.Context, item KgExtractWorkItem) error {
 	)
 
 	// Reject an unknown contract major before doing any work.
+	//
+	// A rejection is POSTed as a TERMINAL FAILURE before returning. The platform
+	// popped this item off the org queue and holds a claim key on it; if the
+	// worker returns silently the item is destroyed, the FSM row stays 'pending'
+	// forever, and the claim key suppresses every re-stage of the same stable
+	// batchJobId until it expires. A visible failed row is the difference between
+	// "the lane is idle" and "the lane is fenced out" — the exact ambiguity that
+	// hid a two-month contract drift.
 	if item.ContractVersion != KGExtractionContractVersion {
 		log.Warn("kg-extraction: contract version mismatch; rejecting",
 			"itemVersion", item.ContractVersion, "workerVersion", KGExtractionContractVersion)
+		e.postRejection(ctx, log, item, fmt.Sprintf(
+			"unsupported contract version %d (worker speaks %d)",
+			item.ContractVersion, KGExtractionContractVersion))
 		return fmt.Errorf("kgextract: unsupported contract version %d (worker speaks %d)",
 			item.ContractVersion, KGExtractionContractVersion)
 	}
@@ -132,6 +145,35 @@ func (e *Executor) Handle(ctx context.Context, item KgExtractWorkItem) error {
 		log.Warn("kg-extraction: result POST failed (non-fatal)", "err", err)
 	}
 	return nil
+}
+
+// postRejection POSTs a terminal status:"error" result for an item the executor
+// refused before doing any work, so the platform's FSM row flips to 'failed'
+// with the reason instead of sitting 'pending' forever.
+//
+// It echoes the ITEM's contractVersion rather than the worker's. That is the one
+// deliberate exception to "the executor echoes the version it was built
+// against": the platform pins contractVersion with a literal, so a result
+// stamped with the worker's older version is rejected at ingest with a 400 —
+// which would leave the failure just as invisible as posting nothing. Echoing
+// the item's version is safe precisely because a rejection carries `results: []`
+// — there is no graph payload that a version mismatch could malform.
+//
+// Deliberately NOT called for the org-claim rejection below: that guard fires
+// when the item's resultAuth does not claim the item's org, so the only bearer
+// token available to POST with is the suspect one. A cross-tenant guard must not
+// then turn around and use it.
+func (e *Executor) postRejection(ctx context.Context, log *slog.Logger, item KgExtractWorkItem, reason string) {
+	res := KGExtractionResult{
+		BatchJobID:      item.BatchJobID,
+		ContractVersion: item.ContractVersion,
+		Results:         []KGExtractionResultEntry{}, // never nil → serializes as []
+		Status:          StatusError,
+		Error:           "kgextract: " + reason,
+	}
+	if err := e.postResult(ctx, log, item, res); err != nil {
+		log.Warn("kg-extraction: terminal-failure POST failed (non-fatal)", "err", err)
+	}
 }
 
 // extract runs the per-observation emit→parse→validate loop and assembles the
