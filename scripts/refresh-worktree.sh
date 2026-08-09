@@ -46,6 +46,17 @@ if [ -f "$REPO/.refresh-worktree.env" ]; then
   . "$REPO/.refresh-worktree.env"
 fi
 
+# --- Repo-local addition (not part of the canonical agent-scripts source) --
+# Ensure the main-commit guard (.githooks/pre-commit) is wired via
+# core.hooksPath. Deliberately UNCONDITIONAL — runs even in the main
+# checkout, which is the one context the "only act inside a linked worktree"
+# rule below would otherwise skip, and core.hooksPath is repo-wide config
+# shared by every worktree anyway. Best-effort: never blocks the rest of
+# this script, and does not touch the working tree.
+if [ -x "$REPO/scripts/install-git-hooks.sh" ]; then
+  "$REPO/scripts/install-git-hooks.sh" || true
+fi
+
 # --- Detect worktree status -------------------------------------------------
 GIT_DIR="$(git rev-parse --git-dir 2>/dev/null || echo '')"
 GIT_COMMON="$(git rev-parse --git-common-dir 2>/dev/null || echo '')"

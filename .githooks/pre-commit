@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — refuse a direct `git commit` onto main/master from
+# the PRIMARY checkout. Worktrees (scripts/create-worktree.sh) and commits on
+# any other branch are unaffected.
+#
+# Why this exists: a caller that ends up back in the primary checkout — a
+# failed `cd "$(scripts/create-worktree.sh name)"`, a stale terminal tab, a
+# script bug upstream — has historically been able to commit straight to
+# main with nothing in the way. This hook is that backstop.
+#
+# Wiring: `git config core.hooksPath .githooks`, set by
+# scripts/install-git-hooks.sh, which runs from scripts/create-worktree.sh,
+# scripts/refresh-worktree.sh (the SessionStart hook), and `make hooks`. If
+# `git config --get core.hooksPath` isn't `.githooks`, this hook is not
+# wired and will not fire — run `scripts/install-git-hooks.sh` (or
+# `make hooks`) to fix that.
+#
+# Escape hatch (rare — e.g. emergency repo recovery):
+#   DONMAI_ALLOW_MAIN_COMMIT=1 git commit ...
+
+set -euo pipefail
+
+GIT_DIR="$(git rev-parse --git-dir)"
+GIT_COMMON_DIR="$(git rev-parse --git-common-dir)"
+GIT_DIR_ABS="$(cd "$GIT_DIR" && pwd)"
+GIT_COMMON_ABS="$(cd "$GIT_COMMON_DIR" && pwd)"
+
+# A linked worktree's git-dir lives under <common>/worktrees/<name>, so this
+# equality holds ONLY in the primary checkout.
+if [ "$GIT_DIR_ABS" != "$GIT_COMMON_ABS" ]; then
+  exit 0
+fi
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+case "$BRANCH" in
+  main|master) ;;
+  *) exit 0 ;;
+esac
+
+if [ "${DONMAI_ALLOW_MAIN_COMMIT:-0}" = "1" ]; then
+  exit 0
+fi
+
+REPO_ROOT="$(cd "$GIT_COMMON_ABS/.." && pwd)"
+REPO_NAME="$(basename "$REPO_ROOT")"
+
+{
+  echo "REFUSED: direct commit to '$BRANCH' in the primary checkout ($REPO_ROOT)."
+  echo ""
+  echo "This repo's convention is branch + worktree + PR — never a commit onto"
+  echo "$BRANCH straight in the primary clone. Create a worktree instead:"
+  echo ""
+  echo "  scripts/create-worktree.sh <name>"
+  echo "  cd ../${REPO_NAME}.wt/<name>"
+  echo ""
+  echo "If you genuinely need to commit to $BRANCH here (rare — e.g. emergency"
+  echo "repo recovery), set the escape hatch for this one commit:"
+  echo ""
+  echo "  DONMAI_ALLOW_MAIN_COMMIT=1 git commit ..."
+} >&2
+
+exit 1
