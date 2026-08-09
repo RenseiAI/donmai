@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -93,9 +94,31 @@ func interactiveArgs(spec agent.Spec) []string {
 // and bare interactive mode has no ignore-user-config switch, so this proves
 // requested per-process delivery but deliberately does not claim exclusive MCP
 // isolation.
+//
+// It also seeds the startup trust codex would otherwise raise a modal review
+// for — see trust.go, which owns that decision and the rule for what may be
+// pre-answered at all. Without it the TUI parks on "Do you trust the contents
+// of this directory?" before reading the seeded prompt, and an unattended
+// session never gets past it.
 func buildInteractiveLaunch(spec agent.Spec) (interactiveLaunch, error) {
+	return buildInteractiveLaunchEnv(spec, os.Getenv)
+}
+
+// buildInteractiveLaunchEnv is buildInteractiveLaunch with the environment
+// lookup injected, so the hooks policy can be table-tested without mutating
+// process state (t.Setenv forbids the t.Parallel this package uses throughout).
+func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (interactiveLaunch, error) {
 	env := cloneInteractiveEnv(spec.Env)
 	var args []string
+	hooks, err := codexHooksPolicy(getenv)
+	if err != nil {
+		return interactiveLaunch{}, err
+	}
+	trustArgs, err := interactiveTrustArgs(spec.Cwd, hooks, os.Getwd)
+	if err != nil {
+		return interactiveLaunch{}, err
+	}
+	args = append(args, trustArgs...)
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--config", "developer_instructions="+strconv.Quote(spec.SystemPromptAppend))
 	}

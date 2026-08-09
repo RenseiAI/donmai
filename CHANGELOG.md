@@ -34,6 +34,31 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   recognise and discard. The exit detail still travels on `Result.Error`, the
   session-ended activity event, and the log line; a session with nothing
   substantive to say now leaves `Summary` empty.
+- **A codex interactive session no longer parks on startup reviews nobody is
+  there to answer.** The codex TUI holds modal reviews before it reads a
+  keystroke — "Do you trust the contents of this directory?" for a workspace
+  it has not seen, and "N hooks are new or changed" for hooks the checked-out
+  repo ships — and neither times out, so an unattended session sat on them
+  until its wall clock killed it, having produced nothing that explained why.
+  The interactive launch now seeds the answers the platform is entitled to
+  give as process-local `--config` overrides: the session workspace is
+  pre-trusted (both the given path and its symlink-resolved form, since codex
+  matches a project entry by exact path), and the hooks feature is turned off
+  for the process. Hooks are deliberately NOT marked trusted — they are repo
+  content, not platform-provisioned, and trusting one grants command execution
+  outside the sandbox — so this takes codex's own third option, continue
+  without trusting, deterministically instead of by an unmade keystroke. Set
+  `DONMAI_CODEX_HOOKS=inherit` to restore codex's hook handling for an
+  attended terminal. Nothing writes to the operator's codex home, and the
+  seeded `projects` table shadows rather than widens ambient trust, so a
+  session's trusted set is exactly the workspace it was given. A workspace
+  that cannot be resolved to an absolute path now fails the spawn with an
+  error naming the missing trust rather than hanging on the review. Requested
+  MCP servers need no seed (codex starts configured servers with no approval
+  step), and the headless app-server lane is deliberately untouched: it has no
+  modal to block on, and trusting its working directory would admit a
+  project-level `.codex/config.toml` into the effective configuration the
+  isolated `CODEX_HOME` boundary exists to keep exclusive.
 
 ## v0.57.6 — 2026-08-08
 
