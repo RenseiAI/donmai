@@ -8,6 +8,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.57.7 — 2026-08-09
+
 ### Features
 
 - **The resident daemon can now claim and run kg-extraction work.** Until now
