@@ -193,6 +193,10 @@ type SessionSpec struct {
 	// the platform stamps it explicitly; otherwise the embedder derives it
 	// from WorkType/Mode.
 	Workload string `json:"workload,omitempty"`
+
+	// detailLease is daemon-private attempt ownership carried through the
+	// spawner's SessionEvent.Spec copy. It never appears on the JSON wire.
+	detailLease sessionDetailLease
 }
 
 // SessionResources is the optional resource request on a SessionSpec.

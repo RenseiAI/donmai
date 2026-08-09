@@ -233,6 +233,132 @@ func TestSpawner_SetMaxConcurrentSessions(t *testing.T) {
 	}
 }
 
+func TestSpawner_RejectsDuplicateSessionIDForDirectCallers(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+		StdoutPrefixWriter:    discardPrefixWriter{},
+		StderrPrefixWriter:    discardPrefixWriter{},
+	})
+	t.Cleanup(func() { _ = s.Drain(time.Second) })
+
+	spec := SessionSpec{SessionID: "direct-duplicate", Repository: "github.com/a/b"}
+	if _, err := s.AcceptWork(spec); err != nil {
+		t.Fatalf("first accept: %v", err)
+	}
+	if _, err := s.AcceptWork(spec); !errors.Is(err, ErrSessionAlreadyActive) {
+		t.Fatalf("duplicate accept error = %v, want ErrSessionAlreadyActive", err)
+	}
+	if got := s.ActiveCount(); got != 1 {
+		t.Fatalf("ActiveCount = %d, want 1", got)
+	}
+}
+
+func TestSpawner_ConcurrentSameIDReservesBeforePreSpawn(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+		StdoutPrefixWriter:    discardPrefixWriter{},
+		StderrPrefixWriter:    discardPrefixWriter{},
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			close(entered)
+			<-release
+			return env, nil
+		},
+	})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		_ = s.Drain(time.Second)
+	})
+
+	spec := SessionSpec{SessionID: "pending-duplicate", Repository: "github.com/a/b"}
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := s.AcceptWork(spec)
+		firstResult <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first attempt did not reach OnPreSpawn")
+	}
+	if got := s.ActiveCount(); got != 1 {
+		t.Fatalf("ActiveCount while pending = %d, want 1", got)
+	}
+	if _, err := s.AcceptWork(spec); !errors.Is(err, ErrSessionAlreadyActive) {
+		t.Fatalf("concurrent duplicate error = %v, want ErrSessionAlreadyActive", err)
+	}
+	close(release)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("owning attempt: %v", err)
+	}
+	if got := s.ActiveCount(); got != 1 {
+		t.Fatalf("ActiveCount after start = %d, want 1", got)
+	}
+}
+
+func TestSpawner_OldReaperCannotDeleteSameIDReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		end  func(*WorkerSpawner, string) error
+	}{
+		{
+			name: "stop",
+			end: func(s *WorkerSpawner, id string) error {
+				if !s.StopSession(id) {
+					return errors.New("StopSession returned false")
+				}
+				return nil
+			},
+		},
+		{name: "force-kill", end: (*WorkerSpawner).ForceKillSession},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var spawnCount atomic.Int32
+			s := NewWorkerSpawner(SpawnerOptions{
+				Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+				MaxConcurrentSessions: 1,
+				WorkerCommand: []string{
+					"/bin/sh",
+					"-c",
+					`if [ "$TEST_SPAWN_ATTEMPT" = "1" ]; then sleep 1 & exit 0; fi; exec sleep 30`,
+				},
+				StdoutPrefixWriter: discardPrefixWriter{},
+				StderrPrefixWriter: discardPrefixWriter{},
+				OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+					attempt := spawnCount.Add(1)
+					return append(env, fmt.Sprintf("TEST_SPAWN_ATTEMPT=%d", attempt)), nil
+				},
+			})
+			t.Cleanup(func() { _ = s.Drain(time.Second) })
+
+			spec := SessionSpec{SessionID: "reused-id", Repository: "github.com/a/b"}
+			if _, err := s.AcceptWork(spec); err != nil {
+				t.Fatalf("first accept: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond) // let the first worker's grandchild inherit the pipes
+			if err := test.end(s, spec.SessionID); err != nil {
+				t.Fatalf("end first session: %v", err)
+			}
+			if _, err := s.AcceptWork(spec); err != nil {
+				t.Fatalf("replacement accept: %v", err)
+			}
+			time.Sleep(1500 * time.Millisecond)
+			if got := s.ActiveCount(); got != 1 {
+				t.Fatalf("ActiveCount after old reaper = %d, want replacement to remain active", got)
+			}
+		})
+	}
+}
+
 func TestSpawner_Drain_RespectsTimeout(t *testing.T) {
 	s := NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},

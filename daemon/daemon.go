@@ -570,8 +570,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// Cleanup the per-session detail store when sessions end so
 	// stale auth tokens do not linger.
 	d.spawner.On(func(ev SessionEvent) {
-		if ev.Kind == SessionEventEnded && d.sessionDetails != nil {
-			d.sessionDetails.Delete(ev.Spec.SessionID)
+		if ev.Kind == SessionEventEnded && d.sessionDetails != nil && ev.Spec.detailLease.generation != 0 {
+			d.sessionDetails.DeleteIfOwner(ev.Spec.detailLease)
 		}
 	})
 	// Record a routing decision for every session-start so the
@@ -913,6 +913,13 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 		opts...,
 	)
 	if _, err := d.AcceptWorkWithDetail(spec, detail); err != nil {
+		if errors.Is(err, ErrSessionAlreadyActive) {
+			slog.Info(
+				"daemon poll: duplicate delivery already active",
+				"sessionId", item.SessionID,
+			)
+			return nil
+		}
 		// Local accept-work failure means the orchestrator's claim of this
 		// session is stale on first contact — the session is in `claimed`
 		// state with this worker, but no `donmai agent run` subprocess will
@@ -1017,8 +1024,9 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 		var stored bool
 		detailLease, stored = d.sessionDetails.StoreIfAbsent(detail)
 		if !stored {
-			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
+			return nil, fmt.Errorf("%w: %q", ErrSessionAlreadyActive, spec.SessionID)
 		}
+		spec.detailLease = detailLease
 	}
 	handle, err := d.spawner.AcceptWork(spec)
 	if err != nil {

@@ -144,6 +144,8 @@ type WorkerSpawner struct {
 
 	mu                     sync.Mutex
 	sessions               map[string]*spawnedSession
+	pendingSessions        map[string]*spawnAttempt
+	nextAttemptID          uint64
 	sessionHistory         map[string]struct{}
 	sessionHistoryOrder    []string
 	accepting              bool
@@ -157,11 +159,21 @@ type WorkerSpawner struct {
 
 const sessionHistoryLimit = 4096
 
+// ErrSessionAlreadyActive reports a duplicate active or in-progress SessionID.
+// Callers may treat it as an idempotent redelivery rather than a failed claim.
+var ErrSessionAlreadyActive = errors.New("session already active")
+
+type spawnAttempt struct {
+	id   uint64
+	spec SessionSpec
+}
+
 type spawnedSession struct {
-	handle SessionHandle
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-	spec   SessionSpec
+	handle  SessionHandle
+	cmd     *exec.Cmd
+	cancel  context.CancelFunc
+	spec    SessionSpec
+	attempt *spawnAttempt
 }
 
 // NewWorkerSpawner constructs a spawner. Workers will not be spawned until
@@ -177,6 +189,7 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 	return &WorkerSpawner{
 		opts:                   opts,
 		sessions:               make(map[string]*spawnedSession),
+		pendingSessions:        make(map[string]*spawnAttempt),
 		sessionHistory:         make(map[string]struct{}),
 		accepting:              true,
 		extraEnabledProjectIDs: make(map[string]struct{}),
@@ -212,7 +225,7 @@ func (s *WorkerSpawner) emit(ev SessionEvent) {
 func (s *WorkerSpawner) ActiveCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.sessions)
+	return len(s.sessions) + len(s.pendingSessions)
 }
 
 // ActiveInteractiveCount returns the number of in-flight interactive-occupancy
@@ -231,9 +244,15 @@ func (s *WorkerSpawner) ActiveInteractiveCount() int {
 func (s *WorkerSpawner) ActiveSessionCounts() (active, activeInteractive int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	active = len(s.sessions)
+	active = len(s.sessions) + len(s.pendingSessions)
 	for _, ss := range s.sessions {
 		switch ss.spec.Mode {
+		case interactiveRunMode, interview.InterviewRunMode:
+			activeInteractive++
+		}
+	}
+	for _, attempt := range s.pendingSessions {
+		switch attempt.spec.Mode {
 		case interactiveRunMode, interview.InterviewRunMode:
 			activeInteractive++
 		}
@@ -463,19 +482,27 @@ func (s *WorkerSpawner) AllEnabledProjectIDs() []string {
 	return normalizeProjectIDs(ids)
 }
 
-// AcceptWork validates the spec, spawns a worker, and returns its handle.
+// AcceptWork validates the spec, reserves its SessionID, spawns a worker, and
+// returns its handle. The reservation spans OnPreSpawn and cmd.Start so direct,
+// nil-detail, and mixed callers cannot start two attempts for the same id.
 func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	s.mu.Lock()
 	if !s.accepting {
 		s.mu.Unlock()
 		return nil, errors.New("not accepting new work (paused or draining)")
 	}
-	if active, capacity := len(s.sessions), s.opts.MaxConcurrentSessions; active >= capacity {
+	if _, active := s.sessions[spec.SessionID]; active {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("%w: %q", ErrSessionAlreadyActive, spec.SessionID)
+	}
+	if _, pending := s.pendingSessions[spec.SessionID]; pending {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("%w: %q", ErrSessionAlreadyActive, spec.SessionID)
+	}
+	if active, capacity := len(s.sessions)+len(s.pendingSessions), s.opts.MaxConcurrentSessions; active >= capacity {
 		s.mu.Unlock()
 		// Snapshot the counts BEFORE unlocking — formatting them after
-		// release races with spawn.func1's delete on s.sessions when an
-		// in-flight session exits. (Caught under -race during Wave 11
-		// S5 work; pre-existing.)
+		// release races with the reaper's delete on s.sessions.
 		return nil, fmt.Errorf("at capacity (%d/%d sessions)", active, capacity)
 	}
 	project, admissionErr := s.resolveProjectForSpecLocked(spec)
@@ -493,9 +520,30 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	if spec.RepositoryID == "" && project.RepositoryID != "" {
 		spec.RepositoryID = project.RepositoryID
 	}
+	attempt := &spawnAttempt{id: s.nextAttemptIDLocked(), spec: spec}
+	s.pendingSessions[spec.SessionID] = attempt
 	s.mu.Unlock()
 
-	return s.spawn(spec, project)
+	return s.spawn(spec, project, attempt)
+}
+
+func (s *WorkerSpawner) nextAttemptIDLocked() uint64 {
+	s.nextAttemptID++
+	if s.nextAttemptID == 0 {
+		s.nextAttemptID++
+	}
+	return s.nextAttemptID
+}
+
+func (s *WorkerSpawner) releasePendingAttempt(attempt *spawnAttempt) {
+	if attempt == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingSessions[attempt.spec.SessionID] == attempt {
+		delete(s.pendingSessions, attempt.spec.SessionID)
+	}
 }
 
 func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectConfig, error) {
@@ -610,7 +658,9 @@ func matchProject(p *ProjectConfig, repository string) *ProjectConfig {
 	return nil
 }
 
-func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*SessionHandle, error) {
+func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig, attempt *spawnAttempt) (*SessionHandle, error) {
+	defer s.releasePendingAttempt(attempt)
+
 	command := s.opts.WorkerCommand
 	if len(command) == 0 {
 		// Stub worker — exits 0 immediately. Production code paths
@@ -693,13 +743,21 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	}
 
 	ss := &spawnedSession{
-		handle: handle,
-		cmd:    cmd,
-		cancel: cancel,
-		spec:   spec,
+		handle:  handle,
+		cmd:     cmd,
+		cancel:  cancel,
+		spec:    spec,
+		attempt: attempt,
 	}
 
 	s.mu.Lock()
+	if s.pendingSessions[spec.SessionID] != attempt {
+		s.mu.Unlock()
+		cancel()
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("spawn reservation lost for session %q", spec.SessionID)
+	}
+	delete(s.pendingSessions, spec.SessionID)
 	s.sessions[spec.SessionID] = ss
 	s.rememberSessionLocked(spec.SessionID)
 	s.mu.Unlock()
@@ -748,7 +806,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 
 		s.mu.Lock()
 		entry := s.sessions[spec.SessionID]
-		if entry == nil {
+		if entry != ss {
 			s.mu.Unlock()
 			cancel()
 			return
@@ -796,8 +854,9 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 // goroutine's cmd.Wait → emit: a wedged provider may never let cmd.Wait
 // return, so deferring the event would strand listeners (and the slot-free
 // signal) indefinitely. The spawn goroutine's own cmd.Wait → delete/emit is
-// a no-op once StopSession has removed the entry — it guards on a nil lookup
-// — so the event fires exactly once and a double-free is impossible.
+// a no-op once StopSession has removed or replaced the exact entry — it compares
+// pointer ownership — so the event fires exactly once and a double-free is
+// impossible.
 func (s *WorkerSpawner) StopSession(id string) bool {
 	s.mu.Lock()
 	ss := s.sessions[id]
@@ -881,7 +940,7 @@ func (s *WorkerSpawner) rememberSessionLocked(id string) {
 func (s *WorkerSpawner) Drain(timeout time.Duration) error {
 	s.mu.Lock()
 	s.accepting = false
-	if len(s.sessions) == 0 {
+	if len(s.sessions)+len(s.pendingSessions) == 0 {
 		s.mu.Unlock()
 		return nil
 	}
@@ -891,7 +950,7 @@ func (s *WorkerSpawner) Drain(timeout time.Duration) error {
 	pollInterval := 100 * time.Millisecond
 	for {
 		s.mu.Lock()
-		n := len(s.sessions)
+		n := len(s.sessions) + len(s.pendingSessions)
 		s.mu.Unlock()
 		if n == 0 {
 			return nil
@@ -902,18 +961,25 @@ func (s *WorkerSpawner) Drain(timeout time.Duration) error {
 		time.Sleep(pollInterval)
 	}
 
-	// Force-stop remaining sessions.
+	// Force-stop remaining started sessions. Pending pre-spawn hooks retain their
+	// own cancellation contract; report them explicitly rather than pretending
+	// the drain completed.
 	s.mu.Lock()
 	stragglers := make([]*spawnedSession, 0, len(s.sessions))
 	for _, ss := range s.sessions {
 		stragglers = append(stragglers, ss)
 	}
+	pending := len(s.pendingSessions)
 	s.mu.Unlock()
 	for _, ss := range stragglers {
 		ss.cancel()
 	}
-	if len(stragglers) > 0 {
-		return fmt.Errorf("drain timeout — sigterm sent to %d session(s)", len(stragglers))
+	if len(stragglers) > 0 || pending > 0 {
+		return fmt.Errorf(
+			"drain timeout — sigterm sent to %d session(s); %d spawn(s) still pending",
+			len(stragglers),
+			pending,
+		)
 	}
 	return nil
 }

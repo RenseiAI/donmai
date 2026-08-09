@@ -3,7 +3,11 @@ package daemon
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // discardPrefixWriter swallows worker stdout/stderr so spawn tests stay quiet.
@@ -37,6 +41,48 @@ func newRunningTestDaemon(t *testing.T, opts Options, projects []ProjectConfig, 
 	d.mu.Unlock()
 	d.setState(StateRunning)
 	return d
+}
+
+func TestHandlePollWorkItem_DuplicateActiveSessionIsNotNacked(t *testing.T) {
+	var nackCalls atomic.Int32
+	orchestrator := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		nackCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer orchestrator.Close()
+
+	d := New(Options{ConfigPath: "/dev/null"})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 2,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+		StdoutPrefixWriter:    discardPrefixWriter{},
+		StderrPrefixWriter:    discardPrefixWriter{},
+	})
+	d.spawner.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded && ev.Spec.detailLease.generation != 0 {
+			d.sessionDetails.DeleteIfOwner(ev.Spec.detailLease)
+		}
+	})
+	d.mu.Lock()
+	d.workerID = "wkr-test"
+	d.mu.Unlock()
+	d.setState(StateRunning)
+	t.Cleanup(func() { _ = d.spawner.Drain(time.Second) })
+
+	item := PollWorkItem{SessionID: "poll-duplicate", ProjectName: "x", Repository: "github.com/a/b"}
+	if err := d.handlePollWorkItem(item, orchestrator.URL); err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+	if err := d.handlePollWorkItem(item, orchestrator.URL); err != nil {
+		t.Fatalf("duplicate delivery: %v", err)
+	}
+	if got := nackCalls.Load(); got != 0 {
+		t.Fatalf("NACK calls = %d, want 0 for an active duplicate", got)
+	}
+	if got := d.spawner.ActiveCount(); got != 1 {
+		t.Fatalf("ActiveCount = %d, want 1", got)
+	}
 }
 
 // TestHandlePollWorkItem_LandingRunRoutesToHook verifies a landing-run poll

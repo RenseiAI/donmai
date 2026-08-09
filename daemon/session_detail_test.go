@@ -133,8 +133,8 @@ func newSessionDetailLifecycleDaemon(spawnerOpts SpawnerOptions) *Daemon {
 	d := New(Options{})
 	d.spawner = NewWorkerSpawner(spawnerOpts)
 	d.spawner.On(func(ev SessionEvent) {
-		if ev.Kind == SessionEventEnded {
-			d.sessionDetails.Delete(ev.Spec.SessionID)
+		if ev.Kind == SessionEventEnded && ev.Spec.detailLease.generation != 0 {
+			d.sessionDetails.DeleteIfOwner(ev.Spec.detailLease)
 		}
 	})
 	d.setState(StateRunning)
@@ -180,7 +180,7 @@ func TestDaemon_AcceptWorkWithDetail_ActiveRetryPreservesOwner(t *testing.T) {
 	}
 
 	retry := &SessionDetail{SessionID: spec.SessionID, AuthToken: "retry-token"}
-	if _, err := d.AcceptWorkWithDetail(spec, retry); err == nil || !strings.Contains(err.Error(), "already has an active detail") {
+	if _, err := d.AcceptWorkWithDetail(spec, retry); !errors.Is(err, ErrSessionAlreadyActive) {
 		t.Fatalf("retry error = %v, want active-detail rejection", err)
 	}
 
@@ -193,6 +193,94 @@ func TestDaemon_AcceptWorkWithDetail_ActiveRetryPreservesOwner(t *testing.T) {
 	}
 	if got := d.spawner.ActiveCount(); got != 1 {
 		t.Fatalf("active session count = %d, want 1 after rejected retry", got)
+	}
+}
+
+func TestDaemon_AcceptWorkWithDetail_MixedNilDetailCallersShareSpawnerOwnership(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		firstDetail   *SessionDetail
+		secondDetail  *SessionDetail
+		wantDetail    bool
+		wantAuthToken string
+	}{
+		{name: "legacy owner rejects detail retry", secondDetail: &SessionDetail{SessionID: "mixed-id", AuthToken: "retry-token"}},
+		{
+			name:          "detail owner rejects legacy retry",
+			firstDetail:   &SessionDetail{SessionID: "mixed-id", AuthToken: "owner-token"},
+			wantDetail:    true,
+			wantAuthToken: "owner-token",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d := newSessionDetailLifecycleDaemon(SpawnerOptions{
+				Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+				MaxConcurrentSessions: 2,
+				WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+				StdoutPrefixWriter:    discardPrefixWriter{},
+				StderrPrefixWriter:    discardPrefixWriter{},
+			})
+			t.Cleanup(func() { _ = d.spawner.Drain(time.Second) })
+
+			spec := SessionSpec{SessionID: "mixed-id", Repository: "github.com/a/b"}
+			if _, err := d.AcceptWorkWithDetail(spec, test.firstDetail); err != nil {
+				t.Fatalf("first accept: %v", err)
+			}
+			if _, err := d.AcceptWorkWithDetail(spec, test.secondDetail); !errors.Is(err, ErrSessionAlreadyActive) {
+				t.Fatalf("mixed duplicate error = %v, want ErrSessionAlreadyActive", err)
+			}
+			got, ok := d.SessionDetail(spec.SessionID)
+			if ok != test.wantDetail {
+				t.Fatalf("SessionDetail present = %t, want %t", ok, test.wantDetail)
+			}
+			if ok && got.AuthToken != test.wantAuthToken {
+				t.Fatalf("SessionDetail token = %q, want %q", got.AuthToken, test.wantAuthToken)
+			}
+			if got := d.spawner.ActiveCount(); got != 1 {
+				t.Fatalf("ActiveCount = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestDaemon_SameIDReplacementKeepsOwnedDetailAfterOldReaper(t *testing.T) {
+	var spawnCount atomic.Int32
+	d := newSessionDetailLifecycleDaemon(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		WorkerCommand: []string{
+			"/bin/sh",
+			"-c",
+			`if [ "$TEST_SPAWN_ATTEMPT" = "1" ]; then sleep 1 & exit 0; fi; exec sleep 30`,
+		},
+		StdoutPrefixWriter: discardPrefixWriter{},
+		StderrPrefixWriter: discardPrefixWriter{},
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			attempt := spawnCount.Add(1)
+			return append(env, "TEST_SPAWN_ATTEMPT="+intToStr(int(attempt))), nil
+		},
+	})
+	t.Cleanup(func() { _ = d.spawner.Drain(time.Second) })
+
+	spec := SessionSpec{SessionID: "reused-detail-id", Repository: "github.com/a/b"}
+	if _, err := d.AcceptWorkWithDetail(spec, &SessionDetail{SessionID: spec.SessionID, AuthToken: "old-token"}); err != nil {
+		t.Fatalf("first accept: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !d.spawner.StopSession(spec.SessionID) {
+		t.Fatal("StopSession returned false")
+	}
+	newDetail := &SessionDetail{SessionID: spec.SessionID, AuthToken: "new-token"}
+	if _, err := d.AcceptWorkWithDetail(spec, newDetail); err != nil {
+		t.Fatalf("replacement accept: %v", err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	got, ok := d.SessionDetail(spec.SessionID)
+	if !ok || got != newDetail || got.AuthToken != "new-token" {
+		t.Fatalf("replacement detail after old reaper = %#v, %t", got, ok)
+	}
+	if got := d.spawner.ActiveCount(); got != 1 {
+		t.Fatalf("ActiveCount after old reaper = %d, want 1", got)
 	}
 }
 
@@ -244,8 +332,8 @@ func TestDaemon_AcceptWorkWithDetail_ConcurrentSameIDHasSingleOwner(t *testing.T
 	for i := 0; i < attempts-1; i++ {
 		select {
 		case result := <-results:
-			if result.err == nil || !strings.Contains(result.err.Error(), "already has an active detail") {
-				t.Fatalf("attempt %d error = %v, want active-detail rejection", result.attempt, result.err)
+			if !errors.Is(result.err, ErrSessionAlreadyActive) {
+				t.Fatalf("attempt %d error = %v, want active-session rejection", result.attempt, result.err)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("received %d/%d rejected same-id attempts", i, attempts-1)
