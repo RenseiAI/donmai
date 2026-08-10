@@ -71,6 +71,11 @@ type DaemonStatusResponse struct {
 	EnabledProjectIDs []string `json:"enabledProjectIds,omitempty"`
 	// AppliedProjectIDs is the project set currently applied by the runtime.
 	AppliedProjectIDs []string `json:"appliedProjectIds,omitempty"`
+	// ProjectAdmissionMode is the machine owner's standing consent mode:
+	// "enumerated" (only EnabledProjectIDs run here) or "all-routed" (any
+	// project the orchestrator routes here runs). Empty reads as "enumerated".
+	ProjectAdmissionMode string `json:"projectAdmissionMode,omitempty"`
+
 	// Projects carries desired/applied/connection/repository state per project.
 	Projects []DaemonProjectStatus `json:"projects,omitempty"`
 	// Timestamp is the RFC3339 time of this snapshot.
@@ -118,6 +123,10 @@ type DaemonStatsResponse struct {
 	EnabledProjectIDs []string `json:"enabledProjectIds,omitempty"`
 	// AppliedProjectIDs is the project set currently applied by the runtime.
 	AppliedProjectIDs []string `json:"appliedProjectIds,omitempty"`
+	// ProjectAdmissionMode is the machine owner's standing consent mode:
+	// "enumerated" (only EnabledProjectIDs run here) or "all-routed" (any
+	// project the orchestrator routes here runs). Empty reads as "enumerated".
+	ProjectAdmissionMode string `json:"projectAdmissionMode,omitempty"`
 }
 
 // DaemonRegistrationStats summarises the daemon's connection to the platform

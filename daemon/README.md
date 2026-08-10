@@ -89,10 +89,56 @@ repositories:
 a repository, the daemon verifies that resource belongs to the same project;
 it never chooses the first configured repository implicitly.
 
+#### Admission mode — the machine owner's standing consent
+
+`projectAdmissionMode` decides how `enabledProjectIds` is read:
+
+```yaml
+projectAdmissionVersion: 2
+projectAdmissionMode: all-routed
+```
+
+| Mode | Meaning |
+| --- | --- |
+| `enumerated` (default) | Admit exactly the projects in `enabledProjectIds`. The owner consents once **per project**. |
+| `all-routed` | Admit any project the orchestrator dispatches here. The owner consents **once**, to the routing itself. |
+
+Absent, blank, and misspelled all read as `enumerated`, so admission only ever
+widens on a correctly spelled opt-in; an unrecognized value additionally fails
+config validation rather than being silently narrowed in place. Set it with
+`donmai project mode all-routed`, or answer the setup wizard's project-admission
+question.
+
+`all-routed` does not weaken the trust boundary. The daemon's registration token
+is org-scoped, so the only work that can reach `AcceptWork` is work the
+operator's own control plane routed to a pool this machine belongs to. What the
+mode removes is the *second* enumeration of an intent the operator already
+declared upstream when they routed the project here — not the consent itself.
+
+The mode is hot-reloaded by the yaml watcher (`SetProjectAdmissionMode`), so a
+change applies to the running daemon without a restart.
+
 For one compatibility window, a config without `projectAdmissionVersion`
 migrates legacy `projects[].{id,repository}` tuples into the enabled set and
 normalized repository resources. V2 writes retain a legacy projection only for
 enabled, repository-bearing projects.
+
+#### Reporting admission upstream
+
+Registration (`POST /api/workers/register`) carries `projectAdmissionVersion`,
+`projectIds`, `daemonProjects`, and `projectAdmissionMode`.
+
+The heartbeat carries the same admission state under one change-detector hash:
+`allowlistHash` every beat, and `allowlist` + `enabledProjectIds` +
+`projectAdmissionMode` only on the beats where that hash moves.
+
+Reporting the enabled set and mode on the heartbeat — not registration alone —
+is what lets an admission edit reach the orchestrator on the next beat. The
+earlier contract hashed only the repository projection, so enabling a project
+that had no repository resource produced an identical hash and an identical
+payload; the orchestrator kept its stale copy until the daemon re-registered,
+which only happens at process start. That is the "enable the project, then
+restart the daemon" step, and it no longer exists.
 
 `SessionDetail.repository` is resolved from normalized repository resources by
 `PollItemToSessionDetail` (in `poll.go`). The runner uses this URL for `git clone`.

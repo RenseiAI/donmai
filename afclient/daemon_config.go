@@ -162,6 +162,11 @@ type DaemonYAML struct {
 	// independent of repository resources so a project can be enabled before
 	// any repository is configured. It is authoritative only in v2.
 	EnabledProjectIDs []string `yaml:"enabledProjectIds,omitempty"`
+	// ProjectAdmissionMode is the machine owner's standing consent decision:
+	// ProjectAdmissionModeEnumerated (default — admit only EnabledProjectIDs)
+	// or ProjectAdmissionModeAllRouted (admit any project the orchestrator
+	// routes to this machine). Empty reads as enumerated.
+	ProjectAdmissionMode string `yaml:"projectAdmissionMode,omitempty"`
 	// Repositories is the normalized zero-to-many repository-resource set.
 	Repositories []RepositoryEntry `yaml:"repositories,omitempty"`
 	// Projects contains repository resources. Multiple entries may share a
@@ -173,6 +178,28 @@ type DaemonYAML struct {
 
 // ProjectAdmissionVersionV2 marks enabledProjectIds as authoritative.
 const ProjectAdmissionVersionV2 = 2
+
+// Project admission modes. Mirrors daemon.ProjectAdmissionMode* — this package
+// cannot import daemon (daemon imports afclient), so the two constant pairs are
+// pinned equal by TestProjectAdmissionModeConstantsMatchDaemon in the daemon
+// package.
+const (
+	// ProjectAdmissionModeEnumerated admits only the enabled project ids.
+	ProjectAdmissionModeEnumerated = "enumerated"
+	// ProjectAdmissionModeAllRouted admits any project the orchestrator routes
+	// to this machine, with no per-project entry.
+	ProjectAdmissionModeAllRouted = "all-routed"
+)
+
+// NormalizeProjectAdmissionMode canonicalizes a mode string. Anything that is
+// not recognizably "all-routed" reads as "enumerated": admission widens only on
+// an explicit, correctly spelled opt-in.
+func NormalizeProjectAdmissionMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), ProjectAdmissionModeAllRouted) {
+		return ProjectAdmissionModeAllRouted
+	}
+	return ProjectAdmissionModeEnumerated
+}
 
 // ── default path ─────────────────────────────────────────────────────────────
 
@@ -323,6 +350,17 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
 	if cfg.ProjectAdmissionVersion == ProjectAdmissionVersionV2 {
 		upsertMappingKey(doc, "enabledProjectIds", enabledProjectIDsNode)
 		upsertMappingKey(doc, "repositories", repositoriesNode)
+		// Only write the mode key when it is the non-default choice, so a file
+		// that never opted in stays byte-identical to what it was.
+		if cfg.AdmitsAnyRoutedProject() {
+			modeNode, modeErr := encodeYAMLNode(ProjectAdmissionModeAllRouted)
+			if modeErr != nil {
+				return nil, fmt.Errorf("encode project admission mode: %w", modeErr)
+			}
+			upsertMappingKey(doc, "projectAdmissionMode", modeNode)
+		} else {
+			deleteMappingKey(doc, "projectAdmissionMode")
+		}
 	}
 	upsertMappingKey(doc, "projects", projectsNode)
 	// Capacity is preserved as a partial overlay — only the cfg-modelled
@@ -371,6 +409,22 @@ func upsertMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"},
 		value,
 	)
+}
+
+// deleteMappingKey removes the given key (and its value) from the mapping node
+// if present. Used to clear an opt-in key when the operator opts back out —
+// leaving a stale `projectAdmissionMode: all-routed` behind would keep granting
+// consent the operator just withdrew.
+func deleteMappingKey(mapping *yaml.Node, key string) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
+			return
+		}
+	}
 }
 
 // mergeMappingKey merges fields from value into the existing mapping at key.
@@ -534,6 +588,25 @@ func (d *DaemonYAML) DisableProject(id string) {
 	}
 	d.EnabledProjectIDs = filtered
 	d.syncLegacyProjectProjection()
+}
+
+// SetProjectAdmissionMode records the standing consent mode. Setting it also
+// migrates the file to admission v2, because the mode is only meaningful once
+// enabledProjectIds is authoritative.
+func (d *DaemonYAML) SetProjectAdmissionMode(mode string) {
+	d.migrateProjectAdmissionV2()
+	d.ProjectAdmissionMode = NormalizeProjectAdmissionMode(mode)
+}
+
+// EffectiveProjectAdmissionMode returns the normalized standing consent mode.
+func (d *DaemonYAML) EffectiveProjectAdmissionMode() string {
+	return NormalizeProjectAdmissionMode(d.ProjectAdmissionMode)
+}
+
+// AdmitsAnyRoutedProject reports whether every routed project is admitted
+// without a per-project entry.
+func (d *DaemonYAML) AdmitsAnyRoutedProject() bool {
+	return d.EffectiveProjectAdmissionMode() == ProjectAdmissionModeAllRouted
 }
 
 // IsProjectEnabled reports whether id is in the project-admission set.

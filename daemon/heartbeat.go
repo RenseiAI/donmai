@@ -73,6 +73,18 @@ type HeartbeatOptions struct {
 	// Phase 1d of 2026-05-18-daemon-config-sync-DESIGN.md.
 	GetAllowlist func() []ProjectAllowlistEntry
 
+	// GetProjectAdmission returns the daemon's complete admission state —
+	// consent mode, enabled project ids, and repository entries. When set it
+	// SUPERSEDES GetAllowlist, and the beat reports all three fields under one
+	// hash.
+	//
+	// Prefer this over GetAllowlist. The entries-only report cannot express a
+	// project admitted without a repository, nor the all-routed consent mode,
+	// so an orchestrator fed by GetAllowlist alone can only learn about an
+	// admission change when the daemon re-registers — i.e. on restart.
+	// Optional, for the same reason GetAllowlist is.
+	GetProjectAdmission func() ProjectAdmissionReport
+
 	// OnPendingMutations is invoked when the platform attaches one or more
 	// queued daemon-config mutations to a heartbeat response. The callback
 	// is expected to apply each mutation against daemon.yaml and return
@@ -289,14 +301,18 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		SentAt:                    h.opts.Now().UTC().Format(time.RFC3339),
 	}
 
-	// Phase 1d: attach allowlist hash every beat, full list only on change.
-	if h.opts.GetAllowlist != nil {
-		entries := h.opts.GetAllowlist()
-		hash := allowlistHash(entries)
+	// Phase 1d: attach the admission hash every beat, the full report only on
+	// change. GetProjectAdmission is the complete report (mode + enabled ids +
+	// entries); GetAllowlist is the entries-only legacy shape kept for
+	// embedders that have not moved over.
+	if report, ok := h.projectAdmissionReport(); ok {
+		hash := admissionHash(report)
 		payload.AllowlistHash = hash
 		h.mu.Lock()
 		if hash != h.lastAllowlistHash {
-			payload.Allowlist = entries
+			payload.Allowlist = report.Entries
+			payload.EnabledProjectIDs = report.EnabledProjectIDs
+			payload.ProjectAdmissionMode = normalizeProjectAdmissionMode(report.Mode)
 			h.lastAllowlistHash = hash
 		}
 		h.mu.Unlock()
@@ -414,6 +430,26 @@ func (h *HeartbeatService) SetCredentials(workerID, jwt string) {
 	}
 }
 
+// projectAdmissionReport resolves the beat's admission report from whichever
+// callback the embedder wired. GetProjectAdmission wins; GetAllowlist is
+// lifted into the same shape so both paths share one hash and one wire format.
+// ok=false means the embedder reports no admission state at all, and the beat
+// omits every admission key.
+func (h *HeartbeatService) projectAdmissionReport() (ProjectAdmissionReport, bool) {
+	if h.opts.GetProjectAdmission != nil {
+		report := h.opts.GetProjectAdmission()
+		report.Mode = normalizeProjectAdmissionMode(report.Mode)
+		return report, true
+	}
+	if h.opts.GetAllowlist != nil {
+		return ProjectAdmissionReport{
+			Mode:    ProjectAdmissionModeEnumerated,
+			Entries: h.opts.GetAllowlist(),
+		}, true
+	}
+	return ProjectAdmissionReport{}, false
+}
+
 // heartbeatRequestBody is the JSON body sent on POST
 // /api/workers/<id>/heartbeat. Matches the platform contract:
 //
@@ -444,6 +480,8 @@ type heartbeatRequestBody struct {
 	Load                   *heartbeatLoadFields       `json:"load,omitempty"`
 	AllowlistHash          string                     `json:"allowlistHash,omitempty"`
 	Allowlist              []ProjectAllowlistEntry    `json:"allowlist,omitempty"`
+	EnabledProjectIDs      []string                   `json:"enabledProjectIds,omitempty"`
+	ProjectAdmissionMode   string                     `json:"projectAdmissionMode,omitempty"`
 	AppliedMutations       []string                   `json:"appliedMutations,omitempty"`
 	MutationFailures       []HeartbeatMutationFailure `json:"mutationFailures,omitempty"`
 }
@@ -553,6 +591,8 @@ func (h *HeartbeatService) callEndpoint(
 		Load:                   payload.Load,
 		AllowlistHash:          payload.AllowlistHash,
 		Allowlist:              payload.Allowlist,
+		EnabledProjectIDs:      payload.EnabledProjectIDs,
+		ProjectAdmissionMode:   payload.ProjectAdmissionMode,
 		AppliedMutations:       ackApplied,
 		MutationFailures:       ackFailures,
 	}

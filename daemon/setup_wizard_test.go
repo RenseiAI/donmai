@@ -38,6 +38,7 @@ func TestRunSetupWizard_Interactive_HappyPath(t *testing.T) {
 		"2",          // Choice 2 — local file queue
 		"y",          // Continue?
 		"n",          // Add another project? (no detected remote in test)
+		"y",          // Accept any project routed to this machine?
 		"y",          // Continue?
 		"stable",     // Channel
 		"manual",     // Schedule
@@ -78,6 +79,54 @@ func TestRunSetupWizard_Interactive_HappyPath(t *testing.T) {
 	}
 	if cfg.AutoUpdate.DrainTimeoutSeconds != 30 {
 		t.Errorf("DrainTimeoutSeconds = %d", cfg.AutoUpdate.DrainTimeoutSeconds)
+	}
+	if !cfg.AdmitsAnyRoutedProject() {
+		t.Errorf("ProjectAdmissionMode = %q, want the accepted all-routed consent", cfg.EffectiveProjectAdmissionMode())
+	}
+}
+
+// TestRunSetupWizard_Interactive_DeclinedAdmissionStaysEnumerated pins that the
+// wizard's admission question is a real choice, not a formality: answering "n"
+// must leave the machine on the narrow per-project mode.
+func TestRunSetupWizard_Interactive_DeclinedAdmissionStaysEnumerated(t *testing.T) {
+	tru := true
+	in := strings.NewReader(strings.Join([]string{
+		"my-machine", // Machine ID
+		"home-net",   // Region
+		"y",          // Continue?
+		"2",          // Reserve cores
+		"1024",       // Reserve memory
+		"4",          // Max sessions
+		"y",          // Continue?
+		"2",          // Choice 2 — local file queue
+		"y",          // Continue?
+		"n",          // Add another project?
+		"n",          // Accept any project routed to this machine?
+		"y",          // Continue?
+		"stable",     // Channel
+		"manual",     // Schedule
+		"30",         // Drain timeout
+	}, "\n") + "\n")
+	var out bytes.Buffer
+
+	cfgPath := filepath.Join(t.TempDir(), "daemon.yaml")
+	cfg, err := RunSetupWizard(WizardOptions{
+		ConfigPath:      cfgPath,
+		Stdin:           in,
+		Stdout:          &out,
+		IsTTY:           &tru,
+		CPUCount:        4,
+		MemoryMB:        8192,
+		DetectGitRemote: func() string { return "" },
+	})
+	if err != nil {
+		t.Fatalf("RunSetupWizard: %v", err)
+	}
+	if cfg.AdmitsAnyRoutedProject() {
+		t.Fatal("declining the admission question still granted all-routed consent")
+	}
+	if got := cfg.EffectiveProjectAdmissionMode(); got != ProjectAdmissionModeEnumerated {
+		t.Fatalf("mode = %q, want %q", got, ProjectAdmissionModeEnumerated)
 	}
 }
 

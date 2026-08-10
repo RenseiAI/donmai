@@ -65,9 +65,78 @@ func newProjectCmdWithRW(rw configReaderWriter, cfg Config) *cobra.Command {
 	cmd.AddCommand(newProjectAllowCmd(rw, bin))
 	cmd.AddCommand(newProjectCredentialsCmd(rw, bin))
 	cmd.AddCommand(newProjectListCmd(rw, bin))
+	cmd.AddCommand(newProjectModeCmd(rw, bin))
 	cmd.AddCommand(newProjectRemoveCmd(rw))
 
 	return cmd
+}
+
+// ── mode ──────────────────────────────────────────────────────────────────────
+
+func newProjectModeCmd(rw configReaderWriter, bin string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "mode [enumerated|all-routed]",
+		Short: "Show or set how this machine admits projects",
+		Long: "Show or set the machine owner's standing consent for project admission.\n\n" +
+			"  enumerated  (default) Only the projects you have explicitly allowed run\n" +
+			"              on this machine. You consent once per project.\n" +
+			"  all-routed  Any project your orchestrator routes to this machine runs\n" +
+			"              here. You consent once, to the routing itself, and never\n" +
+			"              maintain a per-project list again.\n\n" +
+			"Consent is not weakened by all-routed: this machine still only ever sees\n" +
+			"work from the organization its registration token belongs to. What changes\n" +
+			"is that you stop re-declaring, machine by machine, an intent you already\n" +
+			"declared when you routed the project here.\n\n" +
+			"Run with no argument to print the current mode.\n" +
+			"Written to ~/.donmai/daemon.yaml; the daemon picks it up on reload — no\n" +
+			"restart required.",
+		Args:         cobra.MaximumNArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := rw.ReadConfig()
+			if err != nil {
+				return fmt.Errorf("read daemon config: %w", err)
+			}
+			out := cmd.OutOrStdout()
+
+			if len(args) == 0 {
+				_, _ = fmt.Fprintf(out, "%s\n", cfg.EffectiveProjectAdmissionMode())
+				return nil
+			}
+
+			requested := strings.ToLower(strings.TrimSpace(args[0]))
+			switch requested {
+			case afclient.ProjectAdmissionModeEnumerated, afclient.ProjectAdmissionModeAllRouted:
+			default:
+				return fmt.Errorf(
+					"unknown mode %q: want %q or %q",
+					args[0], afclient.ProjectAdmissionModeEnumerated, afclient.ProjectAdmissionModeAllRouted,
+				)
+			}
+
+			cfg.SetProjectAdmissionMode(requested)
+			if err := rw.WriteConfig(cfg); err != nil {
+				return fmt.Errorf("write daemon config: %w", err)
+			}
+
+			switch requested {
+			case afclient.ProjectAdmissionModeAllRouted:
+				_, _ = fmt.Fprintln(out,
+					"Project admission mode: all-routed.\n"+
+						"  This machine now accepts any project your organization routes to it.\n"+
+						"  Undo with: "+bin+" project mode enumerated",
+				)
+			default:
+				_, _ = fmt.Fprintf(out,
+					"Project admission mode: enumerated.\n"+
+						"  This machine now accepts only the %d explicitly allowed project(s).\n"+
+						"  Allow one with: %s project allow <repo-url>\n",
+					len(cfg.EnabledProjectIDs), bin,
+				)
+			}
+			return nil
+		},
+	}
 }
 
 // ── allow ─────────────────────────────────────────────────────────────────────

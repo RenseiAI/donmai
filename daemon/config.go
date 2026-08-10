@@ -32,8 +32,29 @@ type Config struct {
 	// Legacy projects[] entries are projected only when
 	// ProjectAdmissionVersion is absent. Version 2 makes this set authoritative,
 	// including when it is empty.
-	EnabledProjectIDs []string           `yaml:"enabledProjectIds,omitempty" json:"enabledProjectIds,omitempty"`
-	Repositories      []RepositoryConfig `yaml:"repositories,omitempty"      json:"repositories,omitempty"`
+	EnabledProjectIDs []string `yaml:"enabledProjectIds,omitempty" json:"enabledProjectIds,omitempty"`
+	// ProjectAdmissionMode selects HOW EnabledProjectIDs is interpreted, and is
+	// the machine owner's standing consent decision rather than a per-project
+	// one.
+	//
+	//	"enumerated" (default, and the semantics every pre-existing config keeps)
+	//	    admit exactly the projects in EnabledProjectIDs and nothing else. The
+	//	    owner re-consents once per project.
+	//	"all-routed"
+	//	    admit any project the orchestrator dispatches to this machine. The
+	//	    owner consents ONCE — "I trust my organization's routing to decide
+	//	    what runs here" — and never edits this list again.
+	//
+	// The org boundary still holds under "all-routed": the daemon's
+	// registration token is org-scoped, so the only work that can ever reach
+	// AcceptWork is work the operator's own control plane routed to a pool this
+	// machine belongs to. What the mode drops is the SECOND enumeration of an
+	// intent the operator already declared upstream — not the consent itself.
+	//
+	// Empty string means "enumerated"; EffectiveProjectAdmissionMode() is the
+	// only correct reader.
+	ProjectAdmissionMode string             `yaml:"projectAdmissionMode,omitempty" json:"projectAdmissionMode,omitempty"`
+	Repositories         []RepositoryConfig `yaml:"repositories,omitempty"      json:"repositories,omitempty"`
 	// Projects is the legacy compatibility projection. Version 2 readers use
 	// Repositories; writers retain enabled repository-bearing entries here for
 	// one mixed-version window.
@@ -73,6 +94,40 @@ type Config struct {
 // ProjectAdmissionVersionV2 marks enabledProjectIds as the sole project
 // admission authority. Zero is the legacy repository-derived contract.
 const ProjectAdmissionVersionV2 = 2
+
+// Project admission modes. See Config.ProjectAdmissionMode.
+const (
+	// ProjectAdmissionModeEnumerated admits only the projects listed in
+	// enabledProjectIds. This is the default and the behaviour every config
+	// written before this field existed keeps.
+	ProjectAdmissionModeEnumerated = "enumerated"
+	// ProjectAdmissionModeAllRouted admits any project the orchestrator routes
+	// to this machine, without a per-project entry.
+	ProjectAdmissionModeAllRouted = "all-routed"
+)
+
+// EffectiveProjectAdmissionMode returns the normalized admission mode. An
+// absent, blank, or unrecognized value reads as "enumerated" — admission never
+// widens by accident, only by an explicit, spelled-out opt-in.
+func (c *Config) EffectiveProjectAdmissionMode() string {
+	if c == nil {
+		return ProjectAdmissionModeEnumerated
+	}
+	return normalizeProjectAdmissionMode(c.ProjectAdmissionMode)
+}
+
+// AdmitsAnyRoutedProject reports whether this config consents to every project
+// the orchestrator dispatches, rather than an enumerated set.
+func (c *Config) AdmitsAnyRoutedProject() bool {
+	return c.EffectiveProjectAdmissionMode() == ProjectAdmissionModeAllRouted
+}
+
+func normalizeProjectAdmissionMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), ProjectAdmissionModeAllRouted) {
+		return ProjectAdmissionModeAllRouted
+	}
+	return ProjectAdmissionModeEnumerated
+}
 
 // MachineConfig captures the machine identity block from daemon.yaml.
 type MachineConfig struct {
@@ -396,6 +451,12 @@ func normalizeProjectContract(c *Config) {
 		return
 	}
 	c.EnabledProjectIDs = c.EffectiveEnabledProjectIDs()
+	// Canonicalize a mode the operator actually wrote (so "All-Routed" is
+	// stored as "all-routed"), but never materialize the default into a file
+	// that had no opinion — that would rewrite every config on every save.
+	if strings.TrimSpace(c.ProjectAdmissionMode) != "" {
+		c.ProjectAdmissionMode = c.EffectiveProjectAdmissionMode()
+	}
 	c.Repositories = normalizeRepositories(c.Repositories, c.Projects)
 }
 
@@ -550,6 +611,17 @@ func validateConfig(c *Config) error {
 	}
 	if c.ProjectAdmissionVersion != 0 && c.ProjectAdmissionVersion != ProjectAdmissionVersionV2 {
 		return fmt.Errorf("projectAdmissionVersion invalid: %d (want 2)", c.ProjectAdmissionVersion)
+	}
+	// A typo here must be loud, not silent: normalizeProjectAdmissionMode is
+	// deliberately fail-closed, so an operator who wrote "all_routed" and was
+	// never told would get deny-all and blame the platform.
+	if raw := strings.TrimSpace(c.ProjectAdmissionMode); raw != "" &&
+		!strings.EqualFold(raw, ProjectAdmissionModeEnumerated) &&
+		!strings.EqualFold(raw, ProjectAdmissionModeAllRouted) {
+		return fmt.Errorf(
+			"projectAdmissionMode invalid: %q (want %q or %q)",
+			raw, ProjectAdmissionModeEnumerated, ProjectAdmissionModeAllRouted,
+		)
 	}
 	for i, id := range c.EnabledProjectIDs {
 		if strings.TrimSpace(id) == "" {
