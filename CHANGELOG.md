@@ -6,6 +6,24 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.57.11 — 2026-08-10
+
+### Fixes
+
+- **MCP tool-name requirement now follows mount-channel deliverability.**
+  Tool names narrow the tool surface of the mounted servers. When a harness
+  delivers the mount boundary itself but auto-discovers tools (so a name
+  filter is undeliverable), the adaptation walk previously fail-closed the
+  whole spawn with `delivery_unsupported` — blocking headless dispatch on
+  such harnesses one gate after the v0.57.10 designator fix. Such harnesses
+  now record a truthful denied entry on the adaptation receipt and proceed:
+  the surface stays bounded by the mounts. Harnesses that cannot deliver the
+  mount channel either (external-attach providers, where nothing is
+  controlled) keep the fatal denial — an unapplicable name policy there
+  means zero MCP control.
+
+---
+
 ## v0.57.10 — 2026-08-10
 
 ### Fixes
