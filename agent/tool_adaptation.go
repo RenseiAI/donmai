@@ -475,7 +475,16 @@ func legacyToolRequirements(spec Spec, profile ToolLifecycleProfile) []toolRequi
 		out = append(out, toolRequirement{id: "mcp-servers", channel: ToolChannelMCPServer, required: true, delivery: profile.MCPDelivery, digest: digestToolInput(spec.MCPServers)})
 	}
 	if len(spec.MCPToolNames) > 0 {
-		out = append(out, toolRequirement{id: "mcp-tool-names", channel: ToolChannelMCPToolNames, required: true, delivery: profile.MCPToolPolicyDelivery, digest: digestToolInput(spec.MCPToolNames)})
+		// MCP tool names are a NARROWING hint over the tools of the mounted
+		// servers, not the mount boundary itself (mcp-servers above stays
+		// required). Harnesses that auto-discover tools from their configured
+		// servers (codex documents exactly this in its spec translation:
+		// "explicit names are ignored") cannot apply a name filter — denying
+		// the whole spawn for an undeliverable ergonomic hint blocked every
+		// headless codex dispatch. Non-required: undeliverable name policies
+		// are recorded on the receipt as denied entries instead of failing
+		// the run; harnesses that CAN deliver the channel still admit it.
+		out = append(out, toolRequirement{id: "mcp-tool-names", channel: ToolChannelMCPToolNames, required: false, delivery: profile.MCPToolPolicyDelivery, digest: digestToolInput(spec.MCPToolNames)})
 	}
 	return out
 }
