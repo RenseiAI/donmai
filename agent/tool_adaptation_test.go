@@ -367,6 +367,31 @@ func TestToolLifecycleMalformedPermissionRegexFailsBeforeDelivery(t *testing.T) 
 	}
 }
 
+// REN-2188: agent cards express permissions as tool designators
+// ("Bash(git *)", "Bash(*)", "Read"), the runner's AllowedTools bridge
+// forwards them into PermissionConfig verbatim, and the codex approval
+// bridge consumes that grammar natively — so adaptation must accept
+// designators even where they are not valid regexes ("*" after "(" made
+// every headless codex spawn fail closed before delivery).
+func TestToolLifecycleDesignatorPermissionPatternsSpawn(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{
+		Autonomous: true,
+		PermissionConfig: &agent.PermissionConfig{
+			AllowPatterns:    []string{"Bash(git *)", "Bash(*)", "Read", "mcp__linear__list_issues", "^git status$"},
+			DisallowPatterns: []string{"Write", "Bash(rm *)"},
+			DefaultDecision:  "deny",
+		},
+	}, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	if err != nil {
+		t.Fatalf("designator permission patterns must adapt cleanly, got %v", err)
+	}
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+	}
+}
+
 func mustProfile(t *testing.T, manifest agent.HarnessManifest, mode agent.PromptSessionMode) agent.ToolLifecycleProfile {
 	t.Helper()
 	profile, ok := manifest.ToolLifecycleProfile(mode)
