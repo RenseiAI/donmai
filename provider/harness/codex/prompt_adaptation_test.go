@@ -42,7 +42,7 @@ func TestPromptAdaptation_ExactAppServerAndInteractiveWire(t *testing.T) {
 	}
 	// The startup-trust seed (trust.go) leads every interactive argv; the
 	// prompt wire this test pins is what follows it.
-	wantArgs := append(trustPrefixFor(t, workspace),
+	wantArgs := append(launchSeedPrefixFor(t, workspace),
 		"--config", "developer_instructions="+strconv.Quote(wantSystem),
 		"context\n\nuser\n\namend",
 	)

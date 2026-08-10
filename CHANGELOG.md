@@ -8,6 +8,44 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **A dispatched codex interactive session no longer stops on approval
+  prompts.** Seeding startup trust got the session past its opening modals; it
+  then parked on the next one. Three review classes were still live, and a
+  session with nobody at the keyboard cannot answer any of them: the command
+  approval ("Would you like to run the following command?"), the sandbox's own
+  escalation review for a command that touches the network or writes outside
+  the workspace, and one MCP review per distinct tool name ("Allow the
+  `<server>` MCP server to run tool `"<tool>"`?"). The second is the one that
+  cost the most to find — it survives switching the session to full access from
+  inside the TUI, because the SANDBOX, not the approval policy, is what raises
+  it.
+
+  The interactive launch now seeds all three as process-local `--config`
+  overrides, alongside the existing trust seeds and on the same terms — nothing
+  is read from or written to the operator's codex home:
+
+  - `approval_policy = "never"`,
+  - `sandbox_mode = "danger-full-access"`,
+  - `mcp_servers."<name>".default_tools_approval_mode = "approve"`, for the
+    servers this spawn itself requested and no others.
+
+  Config keys rather than the equivalent `--yolo` /
+  `--dangerously-bypass-approvals-and-sandbox` flags, for the reason the hooks
+  seed avoids `--disable`: a renamed flag would turn into a harness that cannot
+  spawn at all. Note `"auto"` is not the auto-approving variant of
+  `default_tools_approval_mode` — a session configured with it still stopped on
+  the tool review; `"approve"` is the one that pre-answers it.
+
+  Isolation for a dispatched session belongs to the environment the platform
+  provisioned around it, not to a second sandbox inside the CLI that only knows
+  how to ask a human. `DONMAI_CODEX_APPROVALS=inherit` restores codex's own
+  prompting for an attended terminal; an unrecognized value fails the spawn
+  rather than silently guessing. The headless app-server lane, whose approvals
+  ride the JSON-RPC bridge, is untouched. Measured against codex-cli 0.146.0
+  under a PTY with a fresh codex home.
+
 ## v0.57.8 — 2026-08-09
 
 ### Fixes
