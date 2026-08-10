@@ -123,9 +123,10 @@ interactive launch — never by writing to the operator's own codex home:
 | `projects."<workspace>".trust_level` | `trusted` | The runner provisioned that directory. Both the given path and its symlink-resolved form are seeded, because codex matches a project entry by exact path. |
 | `features.hooks` | `false` | Hooks found in the workspace are repo content, not platform-provisioned, and trusting one grants command execution outside the sandbox. This takes codex's own third option — continue without trusting, hooks do not run — deterministically. Set `DONMAI_CODEX_HOOKS=inherit` to leave codex's hook handling alone (an attended terminal can then review them; an unattended one can block). |
 
-Requested MCP servers need no seed: codex starts every server in effective
-configuration with no approval step, and one that fails to start (including a
-`401`) degrades to a warning line rather than a prompt.
+Requested MCP servers need no *startup* seed: codex starts every server in
+effective configuration with no approval step, and one that fails to start
+(including a `401`) degrades to a warning line rather than a prompt. Their
+per-tool-CALL approval is a separate matter — see the next section.
 
 The `projects` override SHADOWS the ambient projects table for the child
 process, so a session's trusted set is exactly the workspace the platform
@@ -139,6 +140,41 @@ block on (approvals ride the bridge in `approval.go`), and trusting its
 working directory would make codex load that directory's `.codex/config.toml`
 as a project configuration layer, admitting `mcp_servers` the isolated
 `CODEX_HOME` boundary exists to exclude.
+
+## Approvals (interactive spawn mode)
+
+Getting past the startup reviews is not enough: a *running* session raises
+three further blocking reviews, and each one parks an unattended session the
+same way. `approvals_seed.go` pre-answers all three with process-local
+`--config` overrides on the same launch:
+
+| Seed | Value | Closes |
+| --- | --- | --- |
+| `approval_policy` | `never` | "Would you like to run the following command?" before an ordinary command. |
+| `sandbox_mode` | `danger-full-access` | The sandbox's own escalation review for a command that touches the network or writes outside the workspace. This class **survives** turning approvals off from inside the TUI, which is what makes it expensive to diagnose. |
+| `mcp_servers."<name>".default_tools_approval_mode` | `approve` | "Allow the `<server>` MCP server to run tool `"<tool>"`?", raised once per distinct tool name. Seeded only for the servers this spawn requested. |
+
+Measured against codex-cli 0.146.0, with a fresh `CODEX_HOME` and a PTY:
+
+- A `touch` outside the workspace root under the trust seeds alone stops on
+  *"Would you like to run the following command? … Reason: Allow creating the
+  requested file outside the writable workspace root?"*. With the two command
+  seeds it runs, and `codex doctor` reports `sandbox: filesystem unrestricted ·
+  network enabled`.
+- An MCP tool call under the trust seeds alone stops on *"Allow the probe MCP
+  server to run tool "…"?"* (Allow / Allow for this session / Always allow).
+  It runs with `default_tools_approval_mode = "approve"`, and it runs with
+  `approval_policy = "never"`. Note `"auto"` is **not** the auto-approve
+  variant — a session configured with it still stopped on the review.
+
+Both mechanisms independently close the MCP class today; both are seeded
+because codex exposes them as separate settings and only the per-server one is
+scoped to the servers the platform requested.
+
+`DONMAI_CODEX_APPROVALS=inherit` restores codex's own approval handling for an
+attended terminal. An unrecognized value fails the spawn rather than guessing
+which of "cannot hang" and "may hang" was meant — the same rule
+`DONMAI_CODEX_HOOKS` follows. The headless app-server lane is untouched.
 
 ## Failure modes (F.1.1 §5)
 
