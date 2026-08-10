@@ -248,6 +248,25 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 			projects = append(projects, ProjectConfig{ID: id, Repository: repoURL, CloneStrategy: CloneShallow})
 		}
 	}
+	// Standing consent, asked ONCE, at the only moment the machine owner is
+	// already thinking about what this machine is for. The alternative — the
+	// enumerated default — means re-answering this same question for every
+	// project, forever, on every machine.
+	//
+	// An existing config keeps whatever it already chose: a re-run of the
+	// wizard must never silently widen a machine the owner deliberately
+	// narrowed.
+	admissionDefaultAllRouted := true
+	if opts.Existing != nil {
+		admissionDefaultAllRouted = opts.Existing.AdmitsAnyRoutedProject()
+	}
+	wln("\n  Project admission")
+	wln("    all-routed  any project your organization routes to this machine runs here")
+	wln("    enumerated  only projects you allow on this machine, one by one")
+	admissionMode := ProjectAdmissionModeEnumerated
+	if confirmYes(r, out, "  Accept any project routed to this machine?", admissionDefaultAllRouted) {
+		admissionMode = ProjectAdmissionModeAllRouted
+	}
 	if !confirmYes(r, out, "  Continue?", true) {
 		return nil, errors.New("setup wizard cancelled by user")
 	}
@@ -298,6 +317,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		APIVersion:              "donmai.dev/v1",
 		Kind:                    "LocalDaemon",
 		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		ProjectAdmissionMode:    admissionMode,
 		EnabledProjectIDs:       projectIDsFromRepositories(projects),
 		Repositories:            normalizeRepositories(nil, projects),
 		Machine:                 MachineConfig{ID: machineID, Region: region},

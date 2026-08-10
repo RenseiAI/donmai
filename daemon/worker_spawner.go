@@ -30,7 +30,13 @@ type SpawnerOptions struct {
 	Projects []ProjectConfig
 	// EnabledProjectIDs is the authoritative project-admission set. When nil,
 	// IDs are derived from Projects for legacy callers.
-	EnabledProjectIDs     []string
+	EnabledProjectIDs []string
+	// ProjectAdmissionMode is the machine owner's standing consent decision:
+	// ProjectAdmissionModeEnumerated (default) admits only EnabledProjectIDs;
+	// ProjectAdmissionModeAllRouted admits any project the orchestrator routes
+	// here. Empty reads as enumerated, so an embedder that never sets it keeps
+	// today's behaviour exactly.
+	ProjectAdmissionMode  string
 	MaxConcurrentSessions int
 	// WorkerCommand is the command to run for each accepted session. The
 	// caller may pass arbitrary args; the session-specific environment is
@@ -234,6 +240,7 @@ func NewWorkerSpawner(opts SpawnerOptions) *WorkerSpawner {
 		opts.MaxConcurrentSessions = 8
 	}
 	opts.EnabledProjectIDs = normalizeSpawnerEnabledIDs(opts.EnabledProjectIDs, opts.Projects)
+	opts.ProjectAdmissionMode = normalizeProjectAdmissionMode(opts.ProjectAdmissionMode)
 	return &WorkerSpawner{
 		opts:                   opts,
 		sessions:               make(map[string]*spawnedSession),
@@ -434,6 +441,25 @@ func (s *WorkerSpawner) SetProjectConfiguration(projects []ProjectConfig, enable
 	s.opts.EnabledProjectIDs = enabledCopy
 }
 
+// SetProjectAdmissionMode replaces the standing consent mode. Called by the
+// yaml watcher so an operator who flips projectAdmissionMode gets the new
+// semantics on the next reload — no daemon restart.
+func (s *WorkerSpawner) SetProjectAdmissionMode(mode string) {
+	normalized := normalizeProjectAdmissionMode(mode)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opts.ProjectAdmissionMode = normalized
+}
+
+// ProjectAdmissionMode returns the spawner's current normalized consent mode.
+// Reported to the orchestrator so it can tell "this host has not enabled your
+// project" apart from "this host admits anything routed to it".
+func (s *WorkerSpawner) ProjectAdmissionMode() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return normalizeProjectAdmissionMode(s.opts.ProjectAdmissionMode)
+}
+
 // AddProjects appends additional project configurations (e.g. satellite-org
 // projects in a shared-spawner topology) to the spawner's allowlist. The new
 // entries are held in a separate slice from the base set managed by
@@ -623,6 +649,12 @@ func (s *WorkerSpawner) findPrimaryProjectRepositoryLocked(projectID string) *Pr
 }
 
 func (s *WorkerSpawner) isProjectAllowedLocked(id string) bool {
+	// all-routed: the machine owner consented once to "whatever my org routes
+	// here", so there is no per-project list to consult. A blank id is still
+	// refused — it is a malformed spec, not a routing decision.
+	if id != "" && normalizeProjectAdmissionMode(s.opts.ProjectAdmissionMode) == ProjectAdmissionModeAllRouted {
+		return true
+	}
 	for _, allowed := range s.opts.EnabledProjectIDs {
 		if allowed == id {
 			return true

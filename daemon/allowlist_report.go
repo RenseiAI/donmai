@@ -47,10 +47,67 @@ func AllowlistEntriesFromConfig(projects []ProjectConfig) []ProjectAllowlistEntr
 	return out
 }
 
-// allowlistHash returns a stable SHA-256 hex digest of the allowlist
-// entries (already sorted). Used on every heartbeat as a cheap change
-// detector — the full entry list is included on the wire only when the
-// hash differs from the platform's last-known value.
+// ProjectAdmissionReport is the daemon's COMPLETE project-admission state as
+// reported to an orchestrator.
+//
+// The repository-derived Entries alone are not that state, and reporting only
+// them was a real defect: a project admitted with no repository resource
+// produced identical entries and an identical hash, so the orchestrator never
+// learned about it and kept routing work the daemon would then refuse. Because
+// the enabled set was otherwise only sent at registration — which happens once,
+// at process start — the operator-visible symptom was "enable the project, then
+// restart the daemon before the platform believes you". Carrying Mode and
+// EnabledProjectIDs in the hashed report removes the restart.
+type ProjectAdmissionReport struct {
+	// Mode is ProjectAdmissionModeEnumerated or ProjectAdmissionModeAllRouted.
+	Mode string
+	// EnabledProjectIDs is the authoritative admission set under the enumerated
+	// mode. Meaningless (and typically empty) under all-routed.
+	EnabledProjectIDs []string
+	// Entries is the repository projection retained for the orchestrator's
+	// repository mirror.
+	Entries []ProjectAllowlistEntry
+}
+
+// admissionHash returns a stable SHA-256 hex digest of the whole admission
+// report. Used on every heartbeat as a cheap change detector — the full report
+// is put on the wire only when the hash differs from the last transmitted one.
+//
+// Returns "" only for a report that says nothing at all (enumerated mode, no
+// enabled projects, no entries), preserving the established "" = "daemon did
+// not report" signal. Any non-default mode or any enabled project yields a
+// digest, which is the whole point: those are exactly the states the old
+// entries-only hash rendered invisible.
+func admissionHash(report ProjectAdmissionReport) string {
+	mode := normalizeProjectAdmissionMode(report.Mode)
+	ids := normalizeProjectIDs(report.EnabledProjectIDs)
+	if mode == ProjectAdmissionModeEnumerated && len(ids) == 0 && len(report.Entries) == 0 {
+		return ""
+	}
+	h := sha256.New()
+	// Domain-separate each section so a mode string can never collide with a
+	// project id, nor an id with a repository URL.
+	h.Write([]byte("mode\x00"))
+	h.Write([]byte(mode))
+	h.Write([]byte{0, 0})
+	h.Write([]byte("enabled\x00"))
+	for _, id := range ids {
+		h.Write([]byte(id))
+		h.Write([]byte{0})
+	}
+	h.Write([]byte{0, 0})
+	h.Write([]byte("entries\x00"))
+	for _, e := range report.Entries {
+		h.Write([]byte(e.ID))
+		h.Write([]byte{0}) // field separator — id vs repository must not collide
+		h.Write([]byte(e.Repository))
+		h.Write([]byte{0, 0}) // record separator
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// allowlistHash is the entries-only digest retained for callers that report
+// nothing but the repository projection.
 //
 // Returns "" for nil/empty input. The platform interprets "" as
 // "daemon did not report" rather than "explicit empty allowlist".
@@ -58,14 +115,7 @@ func allowlistHash(entries []ProjectAllowlistEntry) string {
 	if len(entries) == 0 {
 		return ""
 	}
-	h := sha256.New()
-	for _, e := range entries {
-		h.Write([]byte(e.ID))
-		h.Write([]byte{0}) // field separator — id vs repository must not collide
-		h.Write([]byte(e.Repository))
-		h.Write([]byte{0, 0}) // record separator
-	}
-	return hex.EncodeToString(h.Sum(nil))
+	return admissionHash(ProjectAdmissionReport{Entries: entries})
 }
 
 // normalizeAllowlistKey returns a hash-friendly canonical form of an
