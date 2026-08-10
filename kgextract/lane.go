@@ -58,10 +58,12 @@ func NewLane(opts Options) Lane {
 // the item (the platform learns the host could not run the emit) rather than
 // crashing the poll loop.
 //
-// host-session vs local: both authModes flow through the same provider-emit seam
-// today — the claude CLI invocation IS the host-session transport, and a future
-// local-completion provider plugs in here without changing the executor. The
-// item's provider/model selection is honored via the per-item factory signature.
+// host-session vs local: both authModes flow through the same provider-emit
+// seam, and NEITHER runs an agent. The emitter resolves to the provider's
+// non-agentic completion lane (agent.Complete → OneShotProvider), which for
+// claude is `claude -p --output-format json --tools ""` on the host's own
+// login — no API key is introduced on either path. The item's provider/model
+// selection is honored via the per-item factory signature.
 func DefaultEmitterFactory(_ context.Context, item KgExtractWorkItem) (Emitter, error) {
 	// Only "claude" is wired today; other providers are a follow-up. An unknown
 	// provider surfaces as an emitter error → status:"error" for the item.

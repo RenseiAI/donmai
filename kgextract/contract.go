@@ -54,15 +54,21 @@ const KGExtractionContractVersion = 2
 const WorkTypeKGExtraction = "kg-extraction"
 
 // AuthMode is the credential mode the platform dispatched the item under.
-// Mirrors the platform `authMode` union. host-session runs the agentic claude
-// CLI (provider emit); local runs a raw completion. Both flow through the same
-// provider-emit seam — the provider implementation decides the transport.
+// Mirrors the platform `authMode` union.
+//
+// BOTH modes are a raw, non-agentic completion — that is the whole shape of this
+// work-type. What the mode names is WHOSE CREDENTIAL PAYS, not how much harness
+// runs: host-session uses the host's own login/subscription (the reason KG
+// extraction rides the fleet rather than running server-side at all), local uses
+// a locally-resolved completion. Neither requires an API key, and neither boots
+// an agent: both flow through the same provider-emit seam, which resolves to the
+// provider's non-agentic completion lane (agent.Complete → OneShotProvider).
 type AuthMode string
 
 // AuthMode values mirror the platform union.
 const (
-	// AuthModeHostSession runs the constrained turn under the agentic claude CLI
-	// (host-session credentials).
+	// AuthModeHostSession runs the constrained turn on the host's own
+	// login/subscription credentials.
 	AuthModeHostSession AuthMode = "host-session"
 	// AuthModeLocal runs the constrained turn as a raw local completion.
 	AuthModeLocal AuthMode = "local"
