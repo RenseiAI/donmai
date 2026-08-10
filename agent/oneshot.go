@@ -76,16 +76,26 @@ type OneShotResult struct {
 	TransportUsed TransportKind   `json:"transportUsed,omitempty"`
 }
 
-// OneShotProvider is the schema-constrained completion lane for providers that
-// satisfy a one-shot request WITHOUT driving an interactive session — a pure
-// direct-API completion (e.g. a future Anthropic Messages forced-tool one-shot).
-// It deliberately carries only the completion verb. Most harnesses do NOT
-// implement it: session harnesses (claude-code, codex, amp, antigravity,
-// opencode, stub) ride SpawnComplete, and the direct in-box harnesses (Gemini,
-// Ollama)
-// deliver STRICT structured natively by honoring Spec.ResponseSchema inside
-// their existing Spawn — so SpawnComplete already yields native-strict output
-// for them without a separate Complete method.
+// OneShotProvider is the completion lane for providers that satisfy a one-shot
+// request WITHOUT driving an agent session. It deliberately carries only the
+// completion verb.
+//
+// Two shapes qualify:
+//
+//   - a pure direct-API completion (e.g. a future Anthropic Messages
+//     forced-tool one-shot), and
+//   - a CLI harness that has a genuinely NON-AGENTIC print mode — the claude
+//     CLI's `-p --output-format json --tools "" --max-turns 1` invocation is
+//     one process, no tools, no workspace, no agent loop. That is a different
+//     thing from SpawnComplete's MaxTurns=1 projection, which still boots the
+//     full agent harness (tool definitions, MCP servers, project memory) and
+//     merely caps its turns. See provider/harness/claude/oneshot.go.
+//
+// The remaining session harnesses (codex, amp, antigravity, opencode, stub) do
+// NOT implement it and ride SpawnComplete; the direct in-box harnesses (Gemini,
+// Ollama) deliver STRICT structured natively by honoring Spec.ResponseSchema
+// inside their existing Spawn — so SpawnComplete already yields native-strict
+// output for them without a separate Complete method.
 type OneShotProvider interface {
 	Complete(ctx context.Context, req OneShotRequest) (OneShotResult, error)
 }
@@ -174,15 +184,7 @@ drain:
 		return OneShotResult{}, fmt.Errorf("oneshot: session ended without a terminal result event")
 	}
 
-	out := OneShotResult{
-		Text:          text.String(),
-		Cost:          cost,
-		TransportUsed: h.Manifest().Caps.Transport,
-	}
-	if len(req.ResponseSchema) > 0 {
-		out.Structured, out.SchemaOK = extractAndValidate(out.Text, req.ResponseSchema)
-	}
-	return out, nil
+	return ProjectOneShot(req, text.String(), cost, h.Manifest().Caps.Transport), nil
 }
 
 // specFromOneShot translates a OneShotRequest into the interactive Spec
@@ -195,13 +197,7 @@ drain:
 // harness ignores Spec.ResponseSchema and relies on the instruction. MaxTurns is
 // pinned to 1: a one-shot is a single completion, not an agent loop.
 func specFromOneShot(req OneShotRequest) Spec {
-	prompt := flattenMessages(req.Messages)
-	if len(req.ResponseSchema) > 0 {
-		if prompt != "" {
-			prompt += "\n\n"
-		}
-		prompt += schemaInstruction(req.ResponseSchema)
-	}
+	prompt := OneShotPrompt(req)
 	one := 1
 	spec := Spec{
 		Prompt:             prompt,
@@ -219,6 +215,49 @@ func specFromOneShot(req OneShotRequest) Spec {
 		}
 	}
 	return spec
+}
+
+// OneShotPrompt renders a OneShotRequest into the single prompt string a
+// one-shot delivers to the model: the flattened turn list, plus the soft
+// schema instruction when ResponseSchema is set.
+//
+// It is EXPORTED because there are now two lanes that must produce byte-identical
+// prompts for the same request: SpawnComplete (via specFromOneShot) drives an
+// interactive harness, and a harness that implements OneShotProvider over its
+// own non-agentic CLI mode (provider/harness/claude/oneshot.go) builds argv +
+// stdin directly. Sharing this function is what keeps the two from drifting —
+// a prompt difference between the lanes would silently change model behavior
+// depending on which lane a caller happened to resolve to.
+func OneShotPrompt(req OneShotRequest) string {
+	prompt := flattenMessages(req.Messages)
+	if len(req.ResponseSchema) > 0 {
+		if prompt != "" {
+			prompt += "\n\n"
+		}
+		prompt += schemaInstruction(req.ResponseSchema)
+	}
+	return prompt
+}
+
+// ProjectOneShot builds the OneShotResult for a completed one-shot from its raw
+// assistant text. It carries text/cost/transport through and, when
+// req.ResponseSchema is set, runs the validate-repair-drop extraction that
+// populates Structured + SchemaOK.
+//
+// Exported for the same reason as OneShotPrompt: an OneShotProvider
+// implementation must project its output exactly as SpawnComplete does, so a
+// caller sees the same OneShotResult semantics no matter which lane ran. A
+// !SchemaOK result is NOT an error — it is the documented drop signal.
+func ProjectOneShot(req OneShotRequest, text string, cost *CostData, transport TransportKind) OneShotResult {
+	out := OneShotResult{
+		Text:          text,
+		Cost:          cost,
+		TransportUsed: transport,
+	}
+	if len(req.ResponseSchema) > 0 {
+		out.Structured, out.SchemaOK = extractAndValidate(out.Text, req.ResponseSchema)
+	}
+	return out
 }
 
 // flattenMessages renders a turn list into a single prompt string. A single

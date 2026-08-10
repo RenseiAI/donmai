@@ -27,6 +27,15 @@ type stubEmitter struct {
 	idx  int
 	mu   atomicCounter
 	last string
+	// calls records every (systemPrompt, userContent) the executor emitted with,
+	// in order — the repair-retry assertions need the SECOND call's content.
+	calls []stubEmitCall
+}
+
+// stubEmitCall is one recorded Emit invocation.
+type stubEmitCall struct {
+	systemPrompt string
+	userContent  string
 }
 
 type stubEmitResp struct {
@@ -37,9 +46,10 @@ type stubEmitResp struct {
 // atomicCounter is a tiny race-safe call counter.
 type atomicCounter struct{ n atomic.Int32 }
 
-func (e *stubEmitter) Emit(_ context.Context, _ /*systemPrompt*/, userContent string) (string, error) {
+func (e *stubEmitter) Emit(_ context.Context, systemPrompt, userContent string) (string, error) {
 	e.mu.n.Add(1)
 	e.last = userContent
+	e.calls = append(e.calls, stubEmitCall{systemPrompt: systemPrompt, userContent: userContent})
 	if r, ok := e.byContent[userContent]; ok {
 		return r.out, r.err
 	}
@@ -438,5 +448,193 @@ func TestExecutor_PostResolvesRelativeEndpoint(t *testing.T) {
 	}
 	if got.Status != StatusOK {
 		t.Errorf("status = %q, want ok", got.Status)
+	}
+}
+
+// ── malformed-emit repair retry ──────────────────────────────────────────────
+
+// TestExecutor_MalformedEmit_RepairedOnRetry proves the ONE bounded repair
+// retry: a first emit the parser cannot read is followed by exactly one more
+// emit, carrying the same system prompt and a user turn that quotes the parse
+// error and the offending output — and a model that then emits valid JSON
+// produces a normal, successful graph. No silent drop, no second retry.
+func TestExecutor_MalformedEmit_RepairedOnRetry(t *testing.T) {
+	em := &stubEmitter{seq: []stubEmitResp{
+		{out: "I'm sorry, I can't produce that."}, // no JSON object at all
+		{out: goodGraphJSON},                      // repaired
+	}}
+
+	var hits atomic.Int32
+	var gotAuth string
+	var got KGExtractionResult
+	srv := captureServer(t, &hits, &gotAuth, &got)
+	defer srv.Close()
+
+	exec := NewExecutor(Options{
+		EmitterFactory: stubFactory(em),
+		HTTPClient:     srv.Client(),
+		Logger:         discardLogger(),
+	})
+	item := fixtureItem(srv.URL, Observation{ID: "obs-A", Type: "code", Content: "content-A"})
+
+	if err := exec.Handle(context.Background(), item); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Status != StatusOK {
+		t.Fatalf("status = %q (error %q), want ok — a repaired emit is a success", got.Status, got.Error)
+	}
+	if len(got.Results) != 1 || len(got.Results[0].Graph.Nodes) != 2 {
+		t.Fatalf("results = %+v, want the repaired graph's 2 nodes", got.Results)
+	}
+	if n := em.mu.n.Load(); n != 2 {
+		t.Fatalf("emit calls = %d, want exactly 2 (first attempt + ONE repair retry)", n)
+	}
+
+	// The repair turn must carry the original observation, the parse error, and
+	// the offending output — showing the model its own output is what makes the
+	// second attempt converge.
+	repair := em.calls[1]
+	if repair.systemPrompt != item.ExtractionSystemPrompt {
+		t.Errorf("repair systemPrompt = %q, want the unchanged extraction prompt", repair.systemPrompt)
+	}
+	for _, want := range []string{
+		"content-A",
+		"I'm sorry, I can't produce that.",
+		"no JSON object found",
+	} {
+		if !strings.Contains(repair.userContent, want) {
+			t.Errorf("repair prompt missing %q; got %q", want, repair.userContent)
+		}
+	}
+	if repair.userContent == item.Observations[0].Content {
+		t.Error("repair prompt is identical to the first attempt — a bare re-ask is not a repair")
+	}
+}
+
+// TestExecutor_MalformedTwice_TerminalWithParseError proves the retry is BOUNDED
+// at one and that the terminal failure CARRIES THE PARSE ERROR. A count without
+// a reason is the failure shape that let this lane sit broken; the platform must
+// receive enough in KGExtractionResult.Error to tell "the model refused" from
+// "the model emitted truncated JSON".
+func TestExecutor_MalformedTwice_TerminalWithParseError(t *testing.T) {
+	em := &stubEmitter{seq: []stubEmitResp{
+		{out: "not json at all"},
+		{out: "still not json"},
+	}}
+
+	var hits atomic.Int32
+	var gotAuth string
+	var got KGExtractionResult
+	srv := captureServer(t, &hits, &gotAuth, &got)
+	defer srv.Close()
+
+	exec := NewExecutor(Options{
+		EmitterFactory: stubFactory(em),
+		HTTPClient:     srv.Client(),
+		Logger:         discardLogger(),
+	})
+	item := fixtureItem(srv.URL, Observation{ID: "obs-A", Type: "code", Content: "content-A"})
+
+	if err := exec.Handle(context.Background(), item); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if n := em.mu.n.Load(); n != 2 {
+		t.Fatalf("emit calls = %d, want exactly 2 — the repair retry must be bounded at one", n)
+	}
+	if got.Status != StatusError {
+		t.Fatalf("status = %q, want error", got.Status)
+	}
+	if !strings.Contains(got.Error, "obs-A") {
+		t.Errorf("error %q must name the failing observation", got.Error)
+	}
+	for _, want := range []string{"repair retry", "no JSON object found"} {
+		if !strings.Contains(got.Error, want) {
+			t.Errorf("error %q must carry %q so the failure is diagnosable at the platform", got.Error, want)
+		}
+	}
+}
+
+// TestExecutor_MalformedThenEmitError_TerminalKeepsParseError proves that when
+// the repair retry's EMIT fails (provider error, deadline), the terminal error
+// still reports the ORIGINAL parse failure as the cause rather than replacing it
+// with the retry's transport error — the parse failure is what the model did.
+func TestExecutor_MalformedThenEmitError_TerminalKeepsParseError(t *testing.T) {
+	em := &stubEmitter{seq: []stubEmitResp{
+		{out: "prose, no object"},
+		{err: errors.New("kgextract: emit context: context deadline exceeded")},
+	}}
+
+	var hits atomic.Int32
+	var gotAuth string
+	var got KGExtractionResult
+	srv := captureServer(t, &hits, &gotAuth, &got)
+	defer srv.Close()
+
+	exec := NewExecutor(Options{
+		EmitterFactory: stubFactory(em),
+		HTTPClient:     srv.Client(),
+		Logger:         discardLogger(),
+	})
+	item := fixtureItem(srv.URL, Observation{ID: "obs-A", Type: "code", Content: "content-A"})
+
+	if err := exec.Handle(context.Background(), item); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if got.Status != StatusError {
+		t.Fatalf("status = %q, want error", got.Status)
+	}
+	for _, want := range []string{"no JSON object found", "repair retry emit failed", "context deadline exceeded"} {
+		if !strings.Contains(got.Error, want) {
+			t.Errorf("error %q must carry %q (both the parse cause and the retry's failure)", got.Error, want)
+		}
+	}
+}
+
+// TestExecutor_EmitError_NoRepairRetry proves a FIRST-attempt emit error is NOT
+// retried. A repair retry exists to fix the model's output shape; re-running a
+// provider that just timed out only spends the batch's remaining budget.
+func TestExecutor_EmitError_NoRepairRetry(t *testing.T) {
+	em := &stubEmitter{seq: []stubEmitResp{
+		{err: errors.New("provider exploded")},
+		{out: goodGraphJSON}, // must never be consumed
+	}}
+
+	var hits atomic.Int32
+	var gotAuth string
+	var got KGExtractionResult
+	srv := captureServer(t, &hits, &gotAuth, &got)
+	defer srv.Close()
+
+	exec := NewExecutor(Options{
+		EmitterFactory: stubFactory(em),
+		HTTPClient:     srv.Client(),
+		Logger:         discardLogger(),
+	})
+	item := fixtureItem(srv.URL, Observation{ID: "obs-A", Type: "code", Content: "content-A"})
+
+	if err := exec.Handle(context.Background(), item); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if n := em.mu.n.Load(); n != 1 {
+		t.Fatalf("emit calls = %d, want exactly 1 — an emit error is not a parse error", n)
+	}
+	if got.Status != StatusError || !strings.Contains(got.Error, "provider exploded") {
+		t.Errorf("status/error = %q/%q, want error carrying the provider failure", got.Status, got.Error)
+	}
+}
+
+// TestRepairPrompt_BoundsQuotedOutput proves a runaway emit cannot be quoted
+// back verbatim into the repair prompt (which would double an already-oversized
+// turn and can push the retry past the model's context).
+func TestRepairPrompt_BoundsQuotedOutput(t *testing.T) {
+	t.Parallel()
+
+	huge := strings.Repeat("x", emitRawErrExcerpt*3)
+	got := repairPrompt("obs", huge, errors.New("boom"))
+	if strings.Contains(got, huge) {
+		t.Error("repair prompt quoted the full oversized emit; want it truncated")
+	}
+	if !strings.Contains(got, "…(truncated)") {
+		t.Errorf("repair prompt must mark the truncation; got tail %q", got[len(got)-120:])
 	}
 }

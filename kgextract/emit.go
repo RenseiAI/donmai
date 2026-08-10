@@ -28,8 +28,8 @@ type Emitter interface {
 // ProviderEmitterConfig configures a providerEmitter.
 type ProviderEmitterConfig struct {
 	// Provider is the agent harness the emit runs on (claude, etc.). It must be
-	// a HarnessProvider so the shared one-shot lane (agent.SpawnComplete) can
-	// read its manifest; every real provider satisfies this after the two-axis
+	// a HarnessProvider so the shared one-shot lane (agent.Complete) can read
+	// its manifest; every real provider satisfies this after the two-axis
 	// harness split.
 	Provider agent.HarnessProvider
 	// Model is the optional model id; empty falls back to the provider default.
@@ -37,19 +37,29 @@ type ProviderEmitterConfig struct {
 }
 
 // providerEmitter is the production Emitter. It runs ONE constrained completion
-// through the shared one-shot lane (agent.SpawnComplete) and returns the final
+// through the shared one-shot lane (agent.Complete) and returns the final
 // assistant text.
 //
-// A KG emit IS a one-shot: an autonomous, tool-less, single-turn completion with
-// the platform extractionSystemPrompt as the system instruction and the
-// observation as the user turn. SpawnComplete builds exactly that Spec
-// (Autonomous, MaxTurns=1, no tools), drives the session to its terminal
-// ResultEvent, accumulates the assistant text (complete-message chunks; the JSON
-// arrives as assistant_text, never the CLI completion banner), and returns it —
-// replacing the hand-rolled spawn+drain this package used to carry. Under
-// host-session this is an agentic `claude -p` invocation; under a native harness
-// (gemini/ollama) it is a raw completion. The executor parses + validates the
-// returned text.
+// A KG emit IS a one-shot: a tool-less, single-turn completion with the platform
+// extractionSystemPrompt as the system instruction and the observation as the
+// user turn. agent.Complete is the STRATEGY RESOLVER for that shape — it routes
+// to a harness's own non-agentic completion mode (agent.OneShotProvider) when
+// the harness has one, and only falls back to agent.SpawnComplete's
+// agent-harness projection when it does not.
+//
+// The distinction is the whole point of this seam and it is not academic. This
+// emitter called SpawnComplete DIRECTLY, which pinned every emit to the agentic
+// path: for the claude harness that meant booting the full Claude Code agent —
+// tool definitions, every configured MCP server, project-memory discovery — to
+// produce one JSON object. MaxTurns=1 capped the loop without avoiding the cost
+// of standing it up, and in the fleet the resulting cold start blew the 120s
+// per-observation deadline on EVERY observation: `succeeded=0 failed=N`, zero
+// graph nodes written, `kgextract: emit context: context deadline exceeded` in
+// every terminal row. Routing through Complete puts the claude emit on
+// `claude -p --output-format json --tools "" --max-turns 1` (one process, no
+// tools, no workspace) which measures ~1.3–8s per observation. Native harnesses
+// (gemini/ollama) are unaffected: they have no OneShotProvider and keep riding
+// SpawnComplete, where they already deliver native-strict output.
 //
 // We deliberately do NOT pass ResponseSchema: kgextract owns the {nodes,edges}
 // shape and validates it in parse.go (the double-parse-then-drop posture), and
@@ -76,7 +86,7 @@ func NewProviderEmitter(cfg ProviderEmitterConfig) (Emitter, error) {
 // or empty output is folded into an error the executor records as a
 // per-observation failure.
 func (e *providerEmitter) Emit(ctx context.Context, systemPrompt, userContent string) (string, error) {
-	res, err := agent.SpawnComplete(ctx, e.provider, agent.OneShotRequest{
+	res, err := agent.Complete(ctx, e.provider, agent.OneShotRequest{
 		System:   systemPrompt,
 		Messages: []agent.Message{{Role: "user", Content: userContent}},
 		Model:    e.model,
