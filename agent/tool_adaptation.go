@@ -475,7 +475,18 @@ func legacyToolRequirements(spec Spec, profile ToolLifecycleProfile) []toolRequi
 		out = append(out, toolRequirement{id: "mcp-servers", channel: ToolChannelMCPServer, required: true, delivery: profile.MCPDelivery, digest: digestToolInput(spec.MCPServers)})
 	}
 	if len(spec.MCPToolNames) > 0 {
-		out = append(out, toolRequirement{id: "mcp-tool-names", channel: ToolChannelMCPToolNames, required: true, delivery: profile.MCPToolPolicyDelivery, digest: digestToolInput(spec.MCPToolNames)})
+		// MCP tool names are a NARROWING hint over the tools of the mounted
+		// servers — load-bearing only when the harness cannot deliver the
+		// mount boundary itself. When the profile delivers mcp-servers (the
+		// codex shape: it mounts exactly the configured servers but
+		// auto-discovers their tools, so a name filter is undeliverable),
+		// an unapplicable name policy is bounded by the mounts we control:
+		// record a truthful denied entry on the receipt and proceed. When
+		// the profile cannot deliver mounts either (external-attach
+		// harnesses like opencode, where the platform controls nothing on
+		// the attached server), an unapplicable name policy means zero MCP
+		// control and MUST stay a fatal denial.
+		out = append(out, toolRequirement{id: "mcp-tool-names", channel: ToolChannelMCPToolNames, required: profile.MCPDelivery == ToolDeliveryUnsupported, delivery: profile.MCPToolPolicyDelivery, digest: digestToolInput(spec.MCPToolNames)})
 	}
 	return out
 }
