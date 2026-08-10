@@ -114,16 +114,21 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	if err != nil {
 		return interactiveLaunch{}, err
 	}
+	approvals, err := codexApprovalsPolicy(getenv)
+	if err != nil {
+		return interactiveLaunch{}, err
+	}
 	trustArgs, err := interactiveTrustArgs(spec.Cwd, hooks, os.Getwd)
 	if err != nil {
 		return interactiveLaunch{}, err
 	}
 	args = append(args, trustArgs...)
+	args = append(args, interactiveApprovalArgs(approvals)...)
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--config", "developer_instructions="+strconv.Quote(spec.SystemPromptAppend))
 	}
 	if len(spec.MCPServers) > 0 {
-		override, nextEnv, err := codexCLIMCPOverride(spec.MCPServers, env)
+		override, nextEnv, err := codexCLIMCPOverride(spec.MCPServers, env, mcpToolsApprovalMode(approvals))
 		if err != nil {
 			return interactiveLaunch{}, err
 		}
@@ -147,7 +152,13 @@ func cloneInteractiveEnv(in map[string]string) map[string]string {
 	return out
 }
 
-func codexCLIMCPOverride(servers []agent.MCPServerConfig, env map[string]string) (string, map[string]string, error) {
+// codexCLIMCPOverride renders the requested MCP servers as one process-local
+// `mcp_servers` override. toolsApprovalMode, when non-empty, is written into
+// every requested server's table as `default_tools_approval_mode` so the
+// session does not stop on codex's one-review-per-tool-name approval; see
+// approvals_seed.go. It is scoped to the servers named here, so a server the
+// operator's ambient configuration defines keeps whatever posture it had.
+func codexCLIMCPOverride(servers []agent.MCPServerConfig, env map[string]string, toolsApprovalMode string) (string, map[string]string, error) {
 	if err := validateCodexCLIMCPServers(servers); err != nil {
 		return "", nil, err
 	}
@@ -162,6 +173,11 @@ func codexCLIMCPOverride(servers []agent.MCPServerConfig, env map[string]string)
 		}
 		body.WriteString(tomlBasicString(server.Name))
 		body.WriteString("={")
+		if toolsApprovalMode != "" {
+			body.WriteString("\"default_tools_approval_mode\"=")
+			body.WriteString(tomlBasicString(toolsApprovalMode))
+			body.WriteByte(',')
+		}
 		switch strings.ToLower(strings.TrimSpace(server.Type)) {
 		case "", "stdio":
 			body.WriteString("\"command\"=")

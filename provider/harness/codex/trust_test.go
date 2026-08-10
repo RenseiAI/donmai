@@ -13,16 +13,17 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// trustPrefixFor renders the argv prefix every interactive launch now carries:
-// the pre-seeded workspace trust plus the default hooks posture. Tests that pin
+// launchSeedPrefixFor renders the argv prefix every interactive launch now
+// carries: the pre-seeded workspace trust and default hooks posture (trust.go)
+// followed by the default approval posture (approvals_seed.go). Tests that pin
 // a FULL argv use it so the pin stays about the thing they are testing.
-func trustPrefixFor(t *testing.T, cwd string) []string {
+func launchSeedPrefixFor(t *testing.T, cwd string) []string {
 	t.Helper()
 	args, err := interactiveTrustArgs(cwd, codexHooksOff, os.Getwd)
 	if err != nil {
 		t.Fatalf("interactiveTrustArgs(%q): %v", cwd, err)
 	}
-	return args
+	return append(args, interactiveApprovalArgs(codexApprovalsOff)...)
 }
 
 // decodeTrustOverride parses the `projects=…` value out of an argv slice and
