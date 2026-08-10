@@ -371,6 +371,19 @@ func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLife
 	return spec, receipt, nil
 }
 
+// toolDesignatorRe matches the tool-designator permission grammar:
+// a tool name (`Read`, `mcp__linear__list_issues`) optionally followed by a
+// single parenthesized argument glob (`Bash(git *)`, `Bash(*)`). This is the
+// grammar agent cards express AllowedTools/DisallowedTools in and the grammar
+// the codex approval bridge's compilePatterns consumes ahead of its raw-regex
+// fallback. Kept deliberately narrow: one leading identifier, one optional
+// trailing "(...)" group spanning the rest of the string.
+var toolDesignatorRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\(.*\))?$`)
+
+func isToolDesignatorPattern(pattern string) bool {
+	return toolDesignatorRe.MatchString(strings.TrimSpace(pattern))
+}
+
 func validateLegacyToolInputs(spec Spec) (ToolLifecycleChannel, string) {
 	for _, named := range []struct {
 		channel ToolLifecycleChannel
@@ -392,8 +405,20 @@ func validateLegacyToolInputs(spec Spec) (ToolLifecycleChannel, string) {
 			if strings.TrimSpace(pattern) == "" {
 				return ToolChannelPermissionConfig, "permission patterns must not be blank"
 			}
+			// Tool designators ("Read", "Bash(git *)") are a first-class
+			// pattern grammar here, not just regexes: the codex approval
+			// bridge's compilePatterns consumes designators natively
+			// (file-change designators flip its file gate, Bash(...)
+			// designators become command regexes), and the runner's
+			// AllowedTools→PermissionConfig bridge forwards card
+			// designators verbatim. Requiring regexp validity for them
+			// fail-closed every headless codex spawn whose card allowed
+			// e.g. "Bash(*)" ("*" after "(" is not a valid regex).
+			if isToolDesignatorPattern(pattern) {
+				continue
+			}
 			if _, err := regexp.Compile(pattern); err != nil {
-				return ToolChannelPermissionConfig, "permission patterns must be valid regular expressions"
+				return ToolChannelPermissionConfig, "permission patterns must be valid regular expressions or tool designators"
 			}
 		}
 		switch strings.ToLower(strings.TrimSpace(spec.PermissionConfig.DefaultDecision)) {
