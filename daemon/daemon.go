@@ -721,6 +721,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			DaemonProjects:          AllowlistEntriesFromConfig(cfg.EffectiveProjectConfigs()),
 			ProjectIDs:              cfg.EffectiveEnabledProjectIDs(),
 			ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+			ProjectAdmissionMode:    cfg.EffectiveProjectAdmissionMode(),
 			// Item 8 (fleet host-info): gather best-effort machine telemetry
 			// once at startup and thread it onto RegisterRequest.HostInfo so
 			// the platform populates the worker_hosts host-info columns. All
@@ -744,6 +745,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	spawnerOpts := d.opts.SpawnerOptions
 	spawnerOpts.Projects = cfg.EffectiveProjectConfigs()
 	spawnerOpts.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
+	spawnerOpts.ProjectAdmissionMode = cfg.EffectiveProjectAdmissionMode()
 	spawnerOpts.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
 	if spawnerOpts.BaseEnv == nil {
 		spawnerOpts.BaseEnv = map[string]string{}
@@ -863,12 +865,19 @@ func (d *Daemon) Start(ctx context.Context) error {
 			LogInfo: func(format string, args ...any) {
 				slog.Info(fmt.Sprintf(format, args...))
 			},
-			GetAllowlist: func() []ProjectAllowlistEntry {
-				// Use d.spawner.AllProjects() so that satellite-org
-				// projects registered via AddProjects are included in
-				// the heartbeat's reported allowlist. d.spawner is set
-				// before the heartbeat is constructed (see above).
-				return AllowlistEntriesFromConfig(d.spawner.AllProjects())
+			GetProjectAdmission: func() ProjectAdmissionReport {
+				// Read through the spawner, not the config snapshot: the
+				// spawner is what the yaml watcher and the platform
+				// mutations update, and it also carries satellite-org
+				// identities registered via AddProjects/AddEnabledProjectIDs.
+				// Reporting the LIVE set is what lets an admission edit reach
+				// the platform on the next beat instead of the next restart.
+				// d.spawner is set before the heartbeat is constructed.
+				return ProjectAdmissionReport{
+					Mode:              d.spawner.ProjectAdmissionMode(),
+					EnabledProjectIDs: d.spawner.AllEnabledProjectIDs(),
+					Entries:           AllowlistEntriesFromConfig(d.spawner.AllProjects()),
+				}
 			},
 			// Phase 2c: handle platform-queued mutations.
 			OnPendingMutations: d.applyPendingMutations,
@@ -1052,6 +1061,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 		"beforeCount", len(before), "afterCount", len(after))
 	if d.spawner != nil {
 		d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
+		d.spawner.SetProjectAdmissionMode(cfg.EffectiveProjectAdmissionMode())
 	}
 }
 

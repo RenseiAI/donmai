@@ -276,6 +276,20 @@ type HeartbeatPayload struct {
 	// beat is the 64-byte hash + ~8 bytes of JSON framing.
 	Allowlist []ProjectAllowlistEntry `json:"allowlist,omitempty"`
 
+	// EnabledProjectIDs is the authoritative project-admission set, sent
+	// alongside Allowlist whenever AllowlistHash changes. Without it a project
+	// admitted with no repository resource is invisible to the orchestrator
+	// until the daemon re-registers, which only happens at process start — the
+	// "enable the project, then restart the daemon" dance.
+	EnabledProjectIDs []string `json:"enabledProjectIds,omitempty"`
+
+	// ProjectAdmissionMode is the machine owner's standing consent mode
+	// ("enumerated" or "all-routed"), sent on the same change trigger. It lets
+	// the orchestrator distinguish "this host has not enabled your project"
+	// from "this host admits anything routed to it", and so report an
+	// actionable reason instead of dispatching work nothing will claim.
+	ProjectAdmissionMode string `json:"projectAdmissionMode,omitempty"`
+
 	// Load carries the per-beat CPU/memory utilisation sample (0–100).
 	// Populated from HeartbeatOptions.GetLoad when it returns ok; nil (and
 	// thus omitted from the wire body) otherwise. The platform's heartbeat

@@ -515,6 +515,7 @@ func (d *Daemon) persistAndRefreshLocked() error {
 	}
 	if d.spawner != nil {
 		d.spawner.SetProjectConfiguration(d.config.EffectiveProjectConfigs(), d.config.EffectiveEnabledProjectIDs())
+		d.spawner.SetProjectAdmissionMode(d.config.EffectiveProjectAdmissionMode())
 	}
 	return nil
 }

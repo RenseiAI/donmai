@@ -205,6 +205,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		ProjectsAllowed:         len(appliedIDs),
 		EnabledProjectIDs:       enabledProjectIDs,
 		AppliedProjectIDs:       appliedIDs,
+		ProjectAdmissionMode:    cfg.EffectiveProjectAdmissionMode(),
 		Projects:                buildProjectStatusRows(s.daemon, cfg, enabledProjectIDs, appliedIDs),
 		Timestamp:               time.Now().UTC().Format(time.RFC3339),
 	}
@@ -283,14 +284,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			ReservedVCpu:          safeReservedVCPU(cfg),
 			ReservedMemoryMb:      safeReservedMem(cfg),
 		},
-		ActiveSessions:    countActive(s.daemon),
-		QueueDepth:        0,
-		Timestamp:         time.Now().UTC().Format(time.RFC3339),
-		WorkerID:          s.daemon.WorkerID(),
-		Registration:      buildRegistrationStats(s.daemon),
-		AllowedProjects:   safeProjectRepos(cfg),
-		EnabledProjectIDs: enabledProjectIDs,
-		AppliedProjectIDs: appliedIDs,
+		ActiveSessions:       countActive(s.daemon),
+		QueueDepth:           0,
+		Timestamp:            time.Now().UTC().Format(time.RFC3339),
+		WorkerID:             s.daemon.WorkerID(),
+		Registration:         buildRegistrationStats(s.daemon),
+		AllowedProjects:      safeProjectRepos(cfg),
+		EnabledProjectIDs:    enabledProjectIDs,
+		AppliedProjectIDs:    appliedIDs,
+		ProjectAdmissionMode: cfg.EffectiveProjectAdmissionMode(),
 	}
 	if withPool {
 		stats, err := s.poolStats(r.Context())

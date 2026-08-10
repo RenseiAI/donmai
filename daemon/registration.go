@@ -61,6 +61,9 @@ type RegistrationOptions struct {
 	// ProjectAdmissionVersion distinguishes an explicit empty v2 set from a
 	// legacy registration that omitted project identity.
 	ProjectAdmissionVersion int
+	// ProjectAdmissionMode is the standing consent mode reported at
+	// registration. Empty reads as "enumerated".
+	ProjectAdmissionMode string
 
 	// HostInfo is the best-effort machine telemetry gathered once at daemon
 	// startup (see hostinfo.go / GatherHostInfo). Threaded onto the wire
@@ -168,6 +171,13 @@ type RegisterRequest struct {
 	// the tracker keys across all claimed projects. Omitempty — older daemon
 	// versions that omit this field are treated as single-project workers.
 	ProjectIDs []string `json:"projectIds,omitempty"`
+
+	// ProjectAdmissionMode is the machine owner's standing consent mode:
+	// "enumerated" (admit only ProjectIDs) or "all-routed" (admit any project
+	// the orchestrator routes to this machine's pools). Omitted by daemons
+	// predating the field, which the platform must read as "enumerated" so an
+	// old daemon never widens by upgrade.
+	ProjectAdmissionMode string `json:"projectAdmissionMode,omitempty"`
 }
 
 // ProjectAllowlistEntry is the wire shape for a single allowlisted project
@@ -404,6 +414,7 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		DaemonProjects:          opts.DaemonProjects,
 		ProjectIDs:              normalizeProjectIDs(opts.ProjectIDs),
 		ProjectAdmissionVersion: opts.ProjectAdmissionVersion,
+		ProjectAdmissionMode:    normalizeProjectAdmissionMode(opts.ProjectAdmissionMode),
 		HostInfo:                opts.HostInfo,
 	}
 	if req.MachineID == "" {
