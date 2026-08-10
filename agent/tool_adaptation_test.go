@@ -392,6 +392,42 @@ func TestToolLifecycleDesignatorPermissionPatternsSpawn(t *testing.T) {
 	}
 }
 
+// MCP tool names are a narrowing hint, not the mount boundary: a harness
+// whose profile cannot deliver the name-policy channel (codex auto-discovers
+// tools from mounted servers) must record the drop on the receipt and spawn,
+// not fail the whole run for an undeliverable ergonomic hint.
+func TestToolLifecycleMCPToolNamesUndeliverableIsRecordedNotFatal(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	stdio := agent.MCPServerConfig{Name: "tools", Command: "mcp-tools"}
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{
+		Autonomous:   true,
+		MCPServers:   []agent.MCPServerConfig{stdio},
+		MCPToolNames: []string{"mcp__tools__read"},
+	}, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	if err != nil {
+		t.Fatalf("undeliverable MCP tool names must not fail the spawn, got %v", err)
+	}
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+	}
+	var found bool
+	for _, entry := range receipt.Entries {
+		if entry.ID == "mcp-tool-names" {
+			found = true
+			if entry.Outcome != agent.ToolOutcomeDenied {
+				t.Fatalf("mcp-tool-names outcome = %q, want denied-but-recorded", entry.Outcome)
+			}
+			if entry.Required {
+				t.Fatalf("mcp-tool-names entry must be non-required")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("receipt must still record the mcp-tool-names entry")
+	}
+}
+
 func mustProfile(t *testing.T, manifest agent.HarnessManifest, mode agent.PromptSessionMode) agent.ToolLifecycleProfile {
 	t.Helper()
 	profile, ok := manifest.ToolLifecycleProfile(mode)
