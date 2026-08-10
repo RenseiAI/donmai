@@ -6,7 +6,37 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
-## [Unreleased]
+## v0.57.9 — 2026-08-09
+
+### Features
+
+- **A pool can now admit "every project routed here" as a single consent
+  decision, and admission state travels on every heartbeat.** Admission is
+  enforced once, in `WorkerSpawner.isProjectAllowedLocked`
+  (`resolveProjectForSpecLocked` → `AcceptWork`); until now the only knob was
+  `enabledProjectIds`, a pure enumeration with no "all" semantics, so an
+  operator who wanted a pool to serve every one of their projects still had to
+  retype that project list a second time, per machine, forever — invisible
+  until dispatch landed on a host that had not enumerated it, silently
+  re-queued, and reported the daemon as offline. A new `daemon.yaml`
+  `projectAdmissionMode` adds `all-routed` alongside the default `enumerated`:
+  absent, blank, or misspelled all still read as `enumerated`, and an
+  unrecognized value now fails config validation outright rather than
+  silently deny-all. `all-routed` does not widen the trust boundary — the
+  daemon's registration token is already org-scoped, so only work the
+  operator's own control plane routed to a pool this machine belongs to can
+  reach `AcceptWork`; the mode only removes the second enumeration of an
+  intent already declared upstream.
+
+  Separately, admission state used to reach the orchestrator only at
+  registration: the heartbeat hashed just the repository projection, so
+  enabling a project with no repository resource left that hash
+  byte-identical, and the orchestrator kept a stale admission set until the
+  daemon's next process restart — the "enable the project, then restart the
+  daemon" step operators kept hitting. `admissionHash` now covers mode +
+  `enabledProjectIds` + entries under one change detector and travels on
+  every heartbeat. SMOKE-GAP: the all-routed admission path has no coverage
+  in `donmai-smokes` yet.
 
 ### Fixes
 
