@@ -6,6 +6,26 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.57.10 — 2026-08-10
+
+### Fixes
+
+- **Headless codex sessions no longer die at spawn when an agent card's
+  permissions use tool designators.** Codex consumes a structured
+  `PermissionConfig` rather than a flat allowlist, so the runner bridges card
+  `AllowedTools`/`DisallowedTools` designators (`Bash(git *)`, `Bash(*)`,
+  `Read`) into `AllowPatterns`/`DisallowPatterns` verbatim — and the codex
+  approval bridge consumes that grammar natively. Tool/lifecycle adaptation
+  validation, however, required every pattern to compile as a raw regular
+  expression; `Bash(*)` does not (`*` immediately after `(`), so adaptation
+  fail-closed EVERY headless codex spawn with `malformed_tool_lifecycle_plan`
+  before delivery (measured 5/5 on a fleet host, 2026-08-10). Validation now
+  recognizes the tool-designator grammar ahead of its regex fallback —
+  accepting exactly what the consumer accepts. Input that is neither a
+  designator nor a valid regex still fails closed. (#309)
+
+---
+
 ## v0.57.9 — 2026-08-09
 
 ### Features
