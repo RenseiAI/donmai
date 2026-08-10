@@ -10,6 +10,54 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
+- **KG extraction no longer boots an agent to produce one JSON object.** The
+  fleet's constrained triple extraction ran on the harness's AGENTIC invocation
+  — `claude -p --output-format stream-json --verbose
+  --dangerously-skip-permissions --add-dir <cwd> --permission-mode
+  bypassPermissions --append-system-prompt` — which loads the full built-in tool
+  set, starts every MCP server the host has configured, discovers project memory
+  up from the working directory, and keeps the agent's own system prompt with
+  the extraction instructions merely appended to it. `--max-turns 1` capped the
+  loop; it did not avoid paying to stand it up. In the fleet that cold start
+  exceeded the 120-second per-observation deadline on EVERY observation: each
+  batch ended `succeeded=0 failed=N` with `emit context: context deadline
+  exceeded`, and no graph nodes were ever written.
+
+  The claude harness now implements the one-shot completion lane directly
+  (`agent.OneShotProvider`), and the emitter routes through `agent.Complete` —
+  the strategy resolver — instead of calling `agent.SpawnComplete`, the
+  agent-harness projection, by hand. A one-shot is now one process, one
+  completion: `claude -p --output-format json --max-turns 1 --strict-mcp-config
+  --no-session-persistence --system-prompt <text> --tools ""`, run in a
+  temporary directory. No tools (so no agent step is reachable), no MCP servers,
+  no project memory, and the caller's text REPLACES the agent system prompt
+  rather than appending to it. Measured end to end against the real CLI: **~7–8s
+  per observation**, versus a blown 120s deadline before.
+
+  Three details are load-bearing beyond the speed:
+
+  - **The timeout was not the bug and was not raised.** 120s stays, now as a
+    ceiling for a stuck process rather than a budget the happy path approaches.
+  - **No new credential requirement.** The lane passes no `--bare` (which would
+    force an API key and refuse to read a login) and no `--setting-sources`
+    override, so a host authenticated by its own subscription — the reason
+    extraction runs on the fleet at all — keeps working unchanged.
+  - **Success is read from `is_error`, nothing else.** A completion against a
+    nonexistent model exits 0 with `subtype:"success"` and `is_error:true`; a
+    reader trusting the exit code or the subtype would hand the caller an
+    apology sentence as a successful extraction.
+
+- **A malformed extraction emit now gets one bounded repair retry instead of
+  failing straight to a hole in the graph.** An emit the parser cannot read is
+  re-asked ONCE, with the parse error and the offending output quoted back —
+  showing a model its own output is what makes the second attempt converge. A
+  second failure is terminal for that observation and carries BOTH attempts'
+  parse errors into the posted result, so the reason travels with the count. The
+  retry is bounded at one on purpose: a model failing twice is failing
+  structurally, and looping would spend the whole batch's budget on one
+  observation. A first-attempt EMIT error (provider fault, deadline) is not
+  retried at all — a repair retry fixes output shape, not transport.
+
 - **A dispatched codex interactive session no longer stops on approval
   prompts.** Seeding startup trust got the session past its opening modals; it
   then parked on the next one. Three review classes were still live, and a

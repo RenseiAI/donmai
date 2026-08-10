@@ -137,3 +137,115 @@ func TestNewProviderEmitter_NilProvider(t *testing.T) {
 		t.Fatal("expected error for nil provider")
 	}
 }
+
+// ── non-agentic routing ──────────────────────────────────────────────────────
+
+// fakeOneShotProvider is a fakeProvider that ALSO implements
+// agent.OneShotProvider — i.e. a harness with its own non-agentic completion
+// mode, which is what the real claude harness became.
+type fakeOneShotProvider struct {
+	fakeProvider
+	completeN   int
+	lastReq     agent.OneShotRequest
+	text        string
+	completeErr error
+}
+
+func (p *fakeOneShotProvider) Complete(_ context.Context, req agent.OneShotRequest) (agent.OneShotResult, error) {
+	p.completeN++
+	p.lastReq = req
+	if p.completeErr != nil {
+		return agent.OneShotResult{}, p.completeErr
+	}
+	return agent.OneShotResult{Text: p.text}, nil
+}
+
+// TestProviderEmitter_RoutesToNonAgenticOneShotLane is the kgextract-side red
+// for defect #4.
+//
+// The emitter used to call agent.SpawnComplete DIRECTLY, which pins every emit
+// to the agent-harness projection: for the claude harness that means booting the
+// full Claude Code agent (tools, MCP servers, project memory) to produce one JSON
+// object. MaxTurns=1 caps the loop without avoiding the cost of standing it up,
+// and in the fleet that cold start blew the 120s per-observation deadline on
+// EVERY observation — zero graph nodes written.
+//
+// Going through agent.Complete instead lets a harness that HAS a non-agentic
+// completion mode serve the emit from it. This test proves the routing: with a
+// provider that implements OneShotProvider, Complete must be called and Spawn
+// must NOT be — reverting to SpawnComplete inverts both counters.
+func TestProviderEmitter_RoutesToNonAgenticOneShotLane(t *testing.T) {
+	prov := &fakeOneShotProvider{text: `{"nodes":[],"edges":[]}`}
+	em, err := NewProviderEmitter(ProviderEmitterConfig{Provider: prov, Model: "claude-x"})
+	if err != nil {
+		t.Fatalf("NewProviderEmitter: %v", err)
+	}
+
+	out, err := em.Emit(context.Background(), "sys prompt", "observation content")
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if out != `{"nodes":[],"edges":[]}` {
+		t.Errorf("emit text = %q, want the one-shot completion", out)
+	}
+	if prov.completeN != 1 {
+		t.Errorf("OneShotProvider.Complete calls = %d, want 1 — the emit must take the non-agentic lane", prov.completeN)
+	}
+	if prov.spawnedN != 0 {
+		t.Errorf("Spawn calls = %d, want 0 — a constrained triple extraction must not boot an agent session", prov.spawnedN)
+	}
+	// The request must still carry the platform's extraction prompt as SYSTEM and
+	// the observation as the single user turn.
+	if prov.lastReq.System != "sys prompt" {
+		t.Errorf("System = %q, want sys prompt", prov.lastReq.System)
+	}
+	if len(prov.lastReq.Messages) != 1 || prov.lastReq.Messages[0].Content != "observation content" {
+		t.Errorf("Messages = %+v, want a single user turn with the observation", prov.lastReq.Messages)
+	}
+	if prov.lastReq.Model != "claude-x" {
+		t.Errorf("Model = %q, want claude-x", prov.lastReq.Model)
+	}
+	// kgextract owns the {nodes,edges} shape and validates it in parse.go, so it
+	// deliberately passes no ResponseSchema (the parse-or-drop posture).
+	if len(prov.lastReq.ResponseSchema) != 0 {
+		t.Errorf("ResponseSchema = %q, want none (kgextract validates in parse.go)", prov.lastReq.ResponseSchema)
+	}
+}
+
+// TestProviderEmitter_OneShotLaneErrorSurfaces proves a failure on the
+// non-agentic lane becomes a per-observation emit error rather than empty text
+// the executor would parse as "the model found no triples".
+func TestProviderEmitter_OneShotLaneErrorSurfaces(t *testing.T) {
+	prov := &fakeOneShotProvider{completeErr: errors.New("one-shot failed (api_error status=404)")}
+	em, _ := NewProviderEmitter(ProviderEmitterConfig{Provider: prov})
+	_, err := em.Emit(context.Background(), "s", "c")
+	if err == nil {
+		t.Fatal("expected an error when the one-shot lane fails")
+	}
+	if prov.spawnedN != 0 {
+		t.Errorf("Spawn calls = %d, want 0 — a one-shot failure must not fall back to an agent session", prov.spawnedN)
+	}
+}
+
+// TestProviderEmitter_HarnessWithoutOneShotStillWorks proves the fallback is
+// intact: a harness with no non-agentic mode (the native gemini/ollama shape,
+// which already delivers structured output inside Spawn) keeps riding
+// agent.SpawnComplete. The fix must not strand those providers.
+func TestProviderEmitter_HarnessWithoutOneShotStillWorks(t *testing.T) {
+	prov := &fakeProvider{events: []agent.Event{
+		agent.InitEvent{SessionID: "fake-session"},
+		agent.AssistantTextEvent{Text: `{"nodes":[],"edges":[]}`},
+		agent.ResultEvent{Success: true},
+	}}
+	em, _ := NewProviderEmitter(ProviderEmitterConfig{Provider: prov})
+	out, err := em.Emit(context.Background(), "s", "c")
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if out != `{"nodes":[],"edges":[]}` {
+		t.Errorf("emit text = %q, want the accumulated assistant text", out)
+	}
+	if prov.spawnedN != 1 {
+		t.Errorf("Spawn calls = %d, want 1 — a harness without a one-shot lane still rides SpawnComplete", prov.spawnedN)
+	}
+}

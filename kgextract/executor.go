@@ -18,9 +18,22 @@ import (
 const resultPostTimeout = 30 * time.Second
 
 // emitTimeout bounds a single constrained provider emit. A hung provider must
-// not wedge the batch handler (and thus the poll loop) indefinitely; each
-// observation gets its own deadline.
+// not wedge the batch handler (and thus the poll loop) indefinitely; each emit
+// ATTEMPT gets its own deadline (an observation may take two — see the repair
+// retry in extractOne).
+//
+// 120s is generous against the measured shape: a single-shot claude completion
+// for one observation lands in ~1.3–8s (CLI 2.1.226). It was NOT generous
+// against the agentic shape this lane used to run on, which blew it on every
+// observation — the fix was to stop booting an agent for a completion, not to
+// raise this number. Keep it a ceiling for a stuck process, not a budget the
+// happy path is expected to approach.
 const emitTimeout = 120 * time.Second
+
+// emitRawErrExcerpt bounds how much of an unparseable emit is quoted back to the
+// model in the repair instruction (and, truncated further, into the error the
+// platform records).
+const emitRawErrExcerpt = 2000
 
 // EmitterFactory builds the Emitter used for one work item. It is a factory
 // (not a single Emitter) because the provider/model/authMode are per-item: each
@@ -250,21 +263,75 @@ func (e *Executor) extract(ctx context.Context, log *slog.Logger, item KgExtract
 }
 
 // extractOne runs ONE observation: a constrained provider emit, then parse +
-// validate into a graph. Each emit is bounded by emitTimeout so a hung provider
-// cannot wedge the loop.
+// validate into a graph. A malformed emit gets exactly ONE bounded repair retry
+// — the same system prompt, with a user turn that quotes the failure and the
+// offending output back to the model — before the observation fails terminally.
+//
+// The retry is bounded at one on purpose. A single-shot completion that emits
+// prose or a truncated object usually recovers when shown its own output; a
+// model that fails twice is failing structurally, and looping would burn the
+// whole batch's deadline on one observation. Every terminal failure carries the
+// PARSE ERROR (and, on a second parse failure, both attempts' errors) into
+// KGExtractionResult.Error, so the platform records WHY rather than a bare
+// count — this lane's standing lesson is that an invisible failure is worse
+// than a loud one.
+//
+// Each emit attempt is bounded by its own emitTimeout so a hung provider cannot
+// wedge the loop; a retry therefore costs at most one additional emitTimeout.
 func (e *Executor) extractOne(parentCtx context.Context, emitter Emitter, item KgExtractWorkItem, obs Observation) (ExtractedGraph, error) {
-	ctx, cancel := context.WithTimeout(parentCtx, emitTimeout)
-	defer cancel()
-
-	raw, err := emitter.Emit(ctx, item.ExtractionSystemPrompt, obs.Content)
+	raw, err := e.emitOnce(parentCtx, emitter, item.ExtractionSystemPrompt, obs.Content)
 	if err != nil {
 		return ExtractedGraph{}, err
 	}
-	graph, err := parseGraph(raw)
-	if err != nil {
-		return ExtractedGraph{}, fmt.Errorf("parse emit: %w", err)
+	graph, parseErr := parseGraph(raw)
+	if parseErr == nil {
+		return graph, nil
+	}
+
+	// One bounded repair retry.
+	repaired, retryErr := e.emitOnce(parentCtx, emitter, item.ExtractionSystemPrompt, repairPrompt(obs.Content, raw, parseErr))
+	if retryErr != nil {
+		return ExtractedGraph{}, fmt.Errorf("parse emit: %w (repair retry emit failed: %v)", parseErr, retryErr)
+	}
+	graph, retryParseErr := parseGraph(repaired)
+	if retryParseErr != nil {
+		return ExtractedGraph{}, fmt.Errorf("parse emit after repair retry: %w (first attempt: %v)", retryParseErr, parseErr)
 	}
 	return graph, nil
+}
+
+// emitOnce runs a single emit attempt under its own emitTimeout.
+func (e *Executor) emitOnce(parentCtx context.Context, emitter Emitter, systemPrompt, userContent string) (string, error) {
+	ctx, cancel := context.WithTimeout(parentCtx, emitTimeout)
+	defer cancel()
+	return emitter.Emit(ctx, systemPrompt, userContent)
+}
+
+// repairPrompt builds the repair retry's user turn: the original observation,
+// the output that failed to parse, and the parse error — with an explicit
+// instruction to re-emit ONLY the JSON object. The bad output is quoted (rather
+// than merely described) because the common failure is a wrapper the model added
+// around otherwise-correct JSON, and showing it is what makes the second attempt
+// converge.
+func repairPrompt(observation, badOutput string, parseErr error) string {
+	var b strings.Builder
+	b.WriteString(observation)
+	b.WriteString("\n\n---\nYour previous response could not be parsed as the required JSON object.\n")
+	b.WriteString("Parse error: ")
+	b.WriteString(parseErr.Error())
+	b.WriteString("\n\nYour previous response was:\n")
+	b.WriteString(truncateForPrompt(badOutput, emitRawErrExcerpt))
+	b.WriteString("\n\nRespond again with ONLY the JSON object — no prose, no explanation, no Markdown code fences.")
+	return b.String()
+}
+
+// truncateForPrompt bounds a model-supplied string embedded in a prompt or an
+// error message.
+func truncateForPrompt(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "…(truncated)"
 }
 
 // emitterFor builds the Emitter for an item via the configured factory. When no
