@@ -129,6 +129,22 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	// Project the resolved model-endpoint binding (when set) onto the spec
+	// BEFORE the interactive/headless split below, so both spawn modes see
+	// the identical routing knobs: serving-host env vars (direct/bedrock/
+	// vertex per endpoint.go), binding credentials, and Endpoint.Model
+	// overriding Spec.Model. This used to run only inside the headless
+	// spawn() path (see below) — AFTER the interactive branch had already
+	// forked off with the raw, unprojected spec — so a resolved endpoint
+	// binding was silently dropped on the interactive PTY floor. Interactive
+	// endpoint projection, sibling of the model-projection fix (#323): #323
+	// taught the interactive REPL to read Spec.Model, but the endpoint's own
+	// model override (and every other binding-derived knob) never reached it
+	// because applyEndpoint itself never ran ahead of spawnInteractive.
+	spec, err = applyEndpoint(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
 	// Interactive spawn mode (W4): capability-gated on the live manifest, not
 	// a static branch — a future edit that flips SupportsInteractivePTY back
 	// to false makes this a silent no-op fallthrough to the headless path
@@ -144,18 +160,13 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // CLI args, and starts the subprocess via the shared clijsonl driver,
 // returning a fully-wired Handle.
 //
+// The endpoint-binding projection (applyEndpoint) already ran in Spawn,
+// before the interactive/headless split — spec arrives here with it applied.
+//
 // On any failure prior to the subprocess being started, the driver
 // cleans up the MCP tmpfile and returns an error wrapping
 // agent.ErrSpawnFailed.
 func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID string) (agent.Handle, error) {
-	// Project the resolved model-endpoint binding (when set) onto the
-	// spec the CLI sees: serving-host env knobs (direct/bedrock/vertex),
-	// binding credentials, and the binding's model. See endpoint.go.
-	spec, err := applyEndpoint(spec)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
-	}
-
 	mcpPath, err := clijsonl.WriteMCPConfig(spec.MCPServers)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
