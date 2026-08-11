@@ -96,6 +96,7 @@ func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel { return h.notic
 //
 // Spec → CLI mapping (interactive spawn mode):
 //
+//	Model              → --model <id>
 //	Autonomous         → --permission-mode bypassPermissions
 //	SystemPromptAppend → --append-system-prompt <text>
 //	Prompt             → positional argument, ALWAYS LAST
@@ -108,6 +109,19 @@ func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel { return h.notic
 // --permission-mode is a session-level flag the REPL honors exactly as the
 // headless invocation does, so the divergence was never capability gating
 // (the CLI can honor it) — the CLI simply was not being asked.
+//
+// Model was the same class of bug: a work order dispatched under
+// host-session/local auth with a platform-resolved model
+// (QueuedWork.ResolvedProfile.Model → Spec.Model via translateSpec) reached
+// the headless spawn mode's --model flag (buildArgs, cli_args.go) but the
+// interactive REPL never read Spec.Model at all, so an interactive session
+// silently ran under the CLI's OWN default model regardless of what the
+// platform composer selected. There is no local mechanism to validate a
+// model id before spawn — the CLI is the sole authority — so this mapping
+// is a pure pass-through: an id the CLI rejects surfaces as the CLI's own
+// nonzero exit, which ptycli.buildResult turns into a failed
+// agent.ResultEvent (see runner.TestInteractive_ExitDetailIsNotASummary),
+// not a silent fallback to the wrong model.
 //
 // The claude CLI accepts a positional prompt to seed the first message of
 // an interactive session — `claude "fix the bug"` launches the REPL with
@@ -143,6 +157,14 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// flag-shaped argument must precede the positional prompt.
 	if settingsJSON != "" {
 		argv = append(argv, "--settings", settingsJSON)
+	}
+
+	// Model: mirrors buildArgs' identical branch (cli_args.go) so a
+	// platform-resolved model reaches the interactive REPL the same way it
+	// reaches a headless run of the same Spec. Empty leaves the REPL on the
+	// CLI's own default — no flag emitted.
+	if spec.Model != "" {
+		argv = append(argv, "--model", spec.Model)
 	}
 
 	// Permission mode: autonomous sessions get bypassPermissions so the

@@ -48,6 +48,77 @@ func TestInteractiveArgs(t *testing.T) {
 	}
 }
 
+// TestBuildInteractiveLaunch_Model is the regression guard for the
+// platform-model-selection defect: the interactive TUI launch never read
+// Spec.Model at all (unlike the headless app-server lane's
+// threadStartParams/turnStartParams, which always set "model" via
+// resolveModel), so a work order dispatched with a platform-resolved model
+// (QueuedWork.ResolvedProfile.Model → Spec.Model via translateSpec) launched
+// the TUI under whatever model codex's own config.toml/CLI default
+// resolved to. There is no local mechanism to validate a model id before
+// spawn, so this mapping is a pure pass-through: a rejected id surfaces as
+// codex's own nonzero exit (ptycli.buildResult → a failed
+// agent.ResultEvent), not a silent fallback. Deliberately NOT resolveModel:
+// that helper also defaults to DefaultCodexModel / CODEX_MODEL(_TIER) when
+// Spec.Model is empty, which would always emit an override and mask the
+// "no platform selection" case the required no-flag behavior below pins.
+func TestBuildInteractiveLaunch_Model(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+
+	t.Run("model selected emits a config override", func(t *testing.T) {
+		t.Parallel()
+		launch, err := buildInteractiveLaunch(agent.Spec{Cwd: workspace, Model: "gpt-5.6-sol"})
+		if err != nil {
+			t.Fatalf("buildInteractiveLaunch: %v", err)
+		}
+		got, ok := decodeModelOverride(t, launch.argv)
+		if !ok {
+			t.Fatalf("argv omitted a model override: %q", launch.argv)
+		}
+		if got != "gpt-5.6-sol" {
+			t.Errorf("model override = %q, want %q", got, "gpt-5.6-sol")
+		}
+	})
+
+	t.Run("no model selected emits no override", func(t *testing.T) {
+		t.Parallel()
+		launch, err := buildInteractiveLaunch(agent.Spec{Cwd: workspace})
+		if err != nil {
+			t.Fatalf("buildInteractiveLaunch: %v", err)
+		}
+		// The TUI must be left to its own config.toml/CLI default model, not
+		// silently widened — no model override of any shape.
+		if _, ok := decodeModelOverride(t, launch.argv); ok {
+			t.Errorf("argv carries a model override with no platform-selected model: %q", launch.argv)
+		}
+	})
+}
+
+// decodeModelOverride parses the `model=…` value out of an argv slice as
+// real TOML, mirroring decodeTrustOverride (trust_test.go) and
+// mcpOverrideFromArgs above so the assertion is about the semantic value,
+// not a string match on quoting.
+func decodeModelOverride(t *testing.T, argv []string) (string, bool) {
+	t.Helper()
+	for i, arg := range argv {
+		if !strings.HasPrefix(arg, "model=") {
+			continue
+		}
+		if i == 0 || argv[i-1] != "--config" {
+			t.Fatalf("model override is not introduced by --config: %q", argv)
+		}
+		var decoded struct {
+			Model string `toml:"model"`
+		}
+		if err := toml.Unmarshal([]byte(arg), &decoded); err != nil {
+			t.Fatalf("model override is not semantic TOML: %v\n%s", err, arg)
+		}
+		return decoded.Model, true
+	}
+	return "", false
+}
+
 func TestBuildInteractiveLaunch_MixedMCPIsDeterministicSemanticAndSecretFree(t *testing.T) {
 	t.Parallel()
 	const (

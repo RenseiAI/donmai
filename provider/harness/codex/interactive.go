@@ -100,6 +100,37 @@ func interactiveArgs(spec agent.Spec) []string {
 // pre-answered at all. Without it the TUI parks on "Do you trust the contents
 // of this directory?" before reading the seeded prompt, and an unattended
 // session never gets past it.
+//
+// It also projects Spec.Model, when the platform resolved one
+// (QueuedWork.ResolvedProfile.Model → Spec.Model via translateSpec), onto the
+// same `--config key=value` mechanism this launch already uses for every
+// other session-scoped knob (approval_policy, sandbox_mode,
+// developer_instructions, mcp_servers, projects.*, features.hooks) —
+// `model` is codex's own top-level config.toml key, mirrored here as a
+// process-local override rather than a write to the operator's persistent
+// config, exactly like every other seed in this file. This closes the same
+// class of defect trust.go and approvals_seed.go closed for their own knobs:
+// before this mapping existed the interactive TUI silently ran under
+// whatever model codex's own config.toml/CLI default resolved to, even when
+// the platform had already resolved a specific one for headless dispatch of
+// the identical Spec (spec_translation.go's threadStartParams/
+// turnStartParams, which always set "model" via resolveModel).
+//
+// Unlike AllowedTools/PermissionConfig (which get a typed pre-spawn denial
+// receipt when a harness structurally cannot deliver them — see
+// persistInteractiveMCPApplicationDenial below), Model IS mechanically
+// deliverable here: codex has no upfront way to validate a model id, so
+// there is nothing to deny in advance. The honest contract is pass-through:
+// an id codex rejects surfaces as codex's own nonzero exit, which
+// ptycli.buildResult turns into a failed agent.ResultEvent (see
+// runner.TestInteractive_ExitDetailIsNotASummary) — never a silent retry
+// under a different model and never swallowed as a false "completed".
+// Empty Spec.Model emits no override at all, leaving codex on its own
+// default — this deliberately does NOT call resolveModel (spec_translation.go),
+// which defaults to DefaultCodexModel / CODEX_MODEL(_TIER) env fallbacks for
+// the headless JSON-RPC lane; those fallbacks are a separate legacy
+// compatibility shim, not part of the platform-selection contract this
+// mapping restores.
 func buildInteractiveLaunch(spec agent.Spec) (interactiveLaunch, error) {
 	return buildInteractiveLaunchEnv(spec, os.Getenv)
 }
@@ -124,6 +155,9 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	}
 	args = append(args, trustArgs...)
 	args = append(args, interactiveApprovalArgs(approvals)...)
+	if model := strings.TrimSpace(spec.Model); model != "" {
+		args = append(args, "--config", "model="+tomlBasicString(model))
+	}
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--config", "developer_instructions="+strconv.Quote(spec.SystemPromptAppend))
 	}
