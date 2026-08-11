@@ -110,7 +110,10 @@ func interactiveArgs(spec agent.Spec, layout sessionLayout) []string {
 // artifact renders in the TUI. This is the ONE difference from headless
 // composeChildEnv, and it is the whole point of the interactive posture.
 func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]string {
-	env := make(map[string]string, len(spec.Env)+len(providerPinEnv(spec.Endpoint, spec.Model))+4)
+	// No capacity hint: a Go map grows on demand, so pre-sizing it buys nothing
+	// here, and summing len()s as an allocation size is exactly the shape a
+	// static scanner (go/allocation-size-overflow) flags as a potential overflow.
+	env := make(map[string]string)
 	for k, v := range spec.Env {
 		env[k] = v
 	}
