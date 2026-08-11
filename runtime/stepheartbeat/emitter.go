@@ -305,6 +305,21 @@ func (e *Emitter) beat(ctx context.Context) {
 	}
 	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			// Auth-shaped failure: the credentials this beat presented were
+			// rejected — almost always a worker runtime token that expired
+			// or rotated out from under a still-running child holding a
+			// stale snapshot. Still swallowed (a step-heartbeat outage must
+			// never fail the session), but surfaced at WARN with a distinct
+			// message instead of folding into the routine Debug line below,
+			// so credential expiry is actually visible in daemon logs
+			// rather than vanishing into "beats fail sometimes, that's
+			// fine" silence.
+			e.cfg.logger().Warn("step-heartbeat auth rejected — runtime credentials likely expired or rotated out from under this session",
+				"sessionId", e.cfg.SessionID,
+				"status", resp.StatusCode)
+			return
+		}
 		// Best-effort: a 404 (platform build without the companion route
 		// yet) or any other non-2xx is logged and swallowed. The daemon
 		// emitter sits inert against an unmodified platform without ever
