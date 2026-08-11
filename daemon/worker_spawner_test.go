@@ -108,11 +108,16 @@ func TestSpawner_ProjectAdmissionIndependentOfRepositories(t *testing.T) {
 			spec: SessionSpec{SessionID: "second-repo", ProjectID: "alpha", Repository: "example.com/acme/two"},
 		},
 		{
+			// No "alpha" entry is loaded at all here (only "beta" is), so this
+			// exercises the not-admitted path rather than a repository
+			// mismatch on an existing "alpha" entry — see the dedicated
+			// "unknown project id" and "repository mismatch on loaded
+			// project" cases below for that distinction.
 			name:     "repository cannot override project identity",
 			allowed:  []string{"alpha", "beta"},
 			projects: []ProjectConfig{{ID: "beta", Repository: "example.com/acme/beta"}},
 			spec:     SessionSpec{SessionID: "mismatch", ProjectID: "alpha", Repository: "example.com/acme/beta"},
-			wantErr:  "not configured for project",
+			wantErr:  "not admitted or loaded",
 		},
 		{
 			name:     "repository resource does not imply admission in v2",
@@ -131,13 +136,41 @@ func TestSpawner_ProjectAdmissionIndependentOfRepositories(t *testing.T) {
 			spec: SessionSpec{SessionID: "repo-id", ProjectID: "alpha", RepositoryID: "repo-two", RequiresRepository: true},
 		},
 		{
+			// Same reasoning as "repository cannot override project
+			// identity" above: no "alpha" entry is loaded, so this is the
+			// not-admitted path, not a repository mismatch.
 			name:    "repository id cannot override project identity",
 			allowed: []string{"alpha", "beta"},
 			projects: []ProjectConfig{
 				{ID: "beta", RepositoryID: "repo-beta", Repository: "example.com/acme/beta"},
 			},
 			spec:    SessionSpec{SessionID: "repo-id-mismatch", ProjectID: "alpha", RepositoryID: "repo-beta", RequiresRepository: true},
+			wantErr: "not admitted or loaded",
+		},
+		{
+			// "alpha" IS loaded (a real entry with that ID exists), but with a
+			// different repository than the spec asks for — this must keep
+			// the repository-mismatch message, not the not-admitted one.
+			name:    "repository mismatch on a loaded project keeps the repository-mismatch message",
+			allowed: []string{"alpha"},
+			projects: []ProjectConfig{
+				{ID: "alpha", Repository: "example.com/acme/one"},
+			},
+			spec:    SessionSpec{SessionID: "repo-mismatch-loaded", ProjectID: "alpha", Repository: "example.com/acme/two"},
 			wantErr: "not configured for project",
+		},
+		{
+			// No entry for "ghost" exists anywhere and it is not even in the
+			// enabled set, so this actually trips the earlier "not allowed"
+			// admission check — included here to document the boundary
+			// between admission-mode gating and the not-admitted/loaded
+			// message above, which fires once a project passes admission but
+			// still has no matching project entry.
+			name:     "unknown project id is rejected by the admission gate first",
+			allowed:  []string{},
+			projects: nil,
+			spec:     SessionSpec{SessionID: "ghost", ProjectID: "ghost", Repository: "example.com/acme/ghost"},
+			wantErr:  "is not allowed",
 		},
 		{
 			name:    "repository-required work selects configured primary",
@@ -2508,27 +2541,148 @@ func TestSpawner_AddProjects_Dedup(t *testing.T) {
 	waitSessionEnd(t, ended)
 }
 
-// TestSpawner_AddProjects_DedupByRepository verifies that an entry whose
-// Repository already exists in the base set is not added to extraProjects.
-func TestSpawner_AddProjects_DedupByRepository(t *testing.T) {
-	s := NewWorkerSpawner(SpawnerOptions{
-		Projects: []ProjectConfig{
-			{ID: "primary", Repository: "github.com/org/primary"},
-		},
-		MaxConcurrentSessions: 2,
+// TestSpawner_AddProjects_EmptyIDSameRepositoryStillDeduped verifies that an
+// unattributed (empty-ID) candidate sharing a repository with an existing
+// entry still collapses into it in either direction — this is the real
+// double-AddProjects protection the repository-only leg of the dedup exists
+// for, and it must survive the fix that stops deduping distinct project IDs.
+func TestSpawner_AddProjects_EmptyIDSameRepositoryStillDeduped(t *testing.T) {
+	t.Run("empty-ID candidate against an attributed existing entry", func(t *testing.T) {
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}},
+			MaxConcurrentSessions: 2,
+		})
+		s.AddProjects([]ProjectConfig{{Repository: "github.com/org/primary"}})
+		if got := len(s.AllProjects()); got != 1 {
+			t.Fatalf("AllProjects() len = %d, want 1 (empty-ID candidate deduped by repository)", got)
+		}
 	})
 
-	// Attempt to add an entry that shares the same Repository as the base entry
-	// but with a different ID.
-	s.AddProjects([]ProjectConfig{{ID: "primary-alias", Repository: "github.com/org/primary"}})
+	t.Run("attributed candidate against an empty-ID existing entry", func(t *testing.T) {
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{Repository: "github.com/org/primary"}},
+			MaxConcurrentSessions: 2,
+		})
+		s.AddProjects([]ProjectConfig{{ID: "primary", Repository: "github.com/org/primary"}})
+		if got := len(s.AllProjects()); got != 1 {
+			t.Fatalf("AllProjects() len = %d, want 1 (candidate deduped against empty-ID existing entry)", got)
+		}
+	})
+}
 
-	// The dedup-by-Repository path should have rejected the duplicate; there
-	// should only be the base entry. The primary repo must still be accepted.
+// TestSpawner_AddProjects_DistinctIDsSameRepositoryBothAdmitted is the
+// regression guard for the monorepo-topology bug: two projects that share one
+// repository (e.g. two apps built from the same repo checkout) must BOTH
+// load via AddProjects, and AcceptWork must resolve each independently by
+// (projectID, repository) instead of the first one in silently shadowing the
+// second.
+func TestSpawner_AddProjects_DistinctIDsSameRepositoryBothAdmitted(t *testing.T) {
+	s := NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 4})
+
+	s.AddProjects([]ProjectConfig{
+		{ID: "monorepo-app-one", Repository: "github.com/example/monorepo"},
+		{ID: "monorepo-app-two", Repository: "github.com/example/monorepo"},
+	})
+
+	if got := len(s.AllProjects()); got != 2 {
+		t.Fatalf("AllProjects() len = %d, want 2 (both same-repository projects admitted)", got)
+	}
+
 	ended := sessionEnds(s)
-	if _, err := s.AcceptWork(SessionSpec{SessionID: "dedup-repo-1", Repository: "github.com/org/primary"}); err != nil {
-		t.Fatalf("primary repo rejected after duplicate-repo AddProjects: %v", err)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "first", ProjectID: "monorepo-app-one", Repository: "github.com/example/monorepo"}); err != nil {
+		t.Fatalf("AcceptWork for monorepo-app-one: %v", err)
 	}
 	waitSessionEnd(t, ended)
+
+	ended = sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "second", ProjectID: "monorepo-app-two", Repository: "github.com/example/monorepo"}); err != nil {
+		t.Fatalf("AcceptWork for monorepo-app-two (previously dropped by the same-repository dedup bug): %v", err)
+	}
+	waitSessionEnd(t, ended)
+}
+
+// TestSpawner_AddProjects_RepeatedSameOrgListNoDoubleEntries is the
+// regression guard for the original AddProjects dedup intent: reconciling
+// the same org's project list more than once (e.g. a periodic satellite-org
+// resync) must not accumulate duplicate entries, even when that list itself
+// contains multiple projects sharing one repository.
+func TestSpawner_AddProjects_RepeatedSameOrgListNoDoubleEntries(t *testing.T) {
+	orgList := []ProjectConfig{
+		{ID: "monorepo-app-one", Repository: "github.com/example/monorepo"},
+		{ID: "monorepo-app-two", Repository: "github.com/example/monorepo"},
+	}
+
+	s := NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 4})
+
+	s.AddProjects(orgList)
+	s.AddProjects(orgList)
+	s.AddProjects(orgList)
+
+	if got := len(s.AllProjects()); got != 2 {
+		t.Fatalf("AllProjects() len = %d, want 2 after repeated AddProjects with the same list", got)
+	}
+}
+
+// TestSpawner_IsDuplicateLocked pins the isDuplicateLocked truth table
+// directly: same ID+repository dedups, an empty ID on either side against a
+// shared repository dedups, but two distinct non-empty IDs sharing a
+// repository do NOT dedup against each other.
+func TestSpawner_IsDuplicateLocked(t *testing.T) {
+	tests := []struct {
+		name      string
+		existing  []ProjectConfig
+		candidate ProjectConfig
+		want      bool
+	}{
+		{
+			name:      "same ID and repository is a duplicate",
+			existing:  []ProjectConfig{{ID: "a", Repository: "repo"}},
+			candidate: ProjectConfig{ID: "a", Repository: "repo"},
+			want:      true,
+		},
+		{
+			name:      "different non-empty IDs sharing a repository are NOT duplicates",
+			existing:  []ProjectConfig{{ID: "a", Repository: "repo"}},
+			candidate: ProjectConfig{ID: "b", Repository: "repo"},
+			want:      false,
+		},
+		{
+			name:      "empty-ID candidate sharing a repository is a duplicate",
+			existing:  []ProjectConfig{{ID: "a", Repository: "repo"}},
+			candidate: ProjectConfig{Repository: "repo"},
+			want:      true,
+		},
+		{
+			name:      "empty-ID existing entry sharing a repository is a duplicate",
+			existing:  []ProjectConfig{{Repository: "repo"}},
+			candidate: ProjectConfig{ID: "a", Repository: "repo"},
+			want:      true,
+		},
+		{
+			name:      "same ID but different repositories is not a duplicate",
+			existing:  []ProjectConfig{{ID: "a", Repository: "repo-one"}},
+			candidate: ProjectConfig{ID: "a", Repository: "repo-two"},
+			want:      false,
+		},
+		{
+			name:      "no overlap at all is not a duplicate",
+			existing:  []ProjectConfig{{ID: "a", Repository: "repo"}},
+			candidate: ProjectConfig{ID: "b", Repository: "other"},
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewWorkerSpawner(SpawnerOptions{Projects: tt.existing, MaxConcurrentSessions: 1})
+			s.mu.Lock()
+			got := s.isDuplicateLocked(tt.candidate)
+			s.mu.Unlock()
+			if got != tt.want {
+				t.Fatalf("isDuplicateLocked(%+v) = %v, want %v", tt.candidate, got, tt.want)
+			}
+		})
+	}
 }
 
 // TestSpawner_AddProjects_Concurrency exercises AddProjects and AcceptWork
