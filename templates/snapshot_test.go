@@ -1,13 +1,19 @@
-// Package snapshot_test verifies that the raymond-rendered YAML templates
-// produce output that is semantically equivalent to the legacy text/template
-// .tmpl files in prompt/templates/.
+// This external test package (templates_test) verifies that the
+// raymond-rendered YAML templates produce output that is semantically
+// equivalent to the legacy text/template .tmpl files in prompt/templates/.
+//
+// It lived in templates/__tests__/ until 2026-08: the Go tool IGNORES
+// directories whose name starts with an underscore, so `go test ./...`
+// (make test, CI) never ran this suite — it only executed when someone
+// named the directory path explicitly. Keep it directly in the package
+// directory so the snapshot equivalence stays continuously enforced.
 //
 // "Equivalent" means the same structural sections appear, the same variable
 // values are interpolated, and conditional blocks behave identically. We do
 // not assert byte-identical output because the Handlebars syntax differs
 // cosmetically from Go text/template syntax (e.g. {{or .X "def"}} vs
 // {{#if x}}{{x}}{{else}}def{{/if}}).
-package snapshot_test
+package templates_test
 
 import (
 	"strings"
