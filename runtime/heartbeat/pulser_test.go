@@ -1,9 +1,11 @@
 package heartbeat_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,6 +24,32 @@ func newServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	s := httptest.NewServer(h)
 	t.Cleanup(s.Close)
 	return s
+}
+
+// threadSafeBuffer wraps bytes.Buffer with a mutex so a test goroutine can
+// read while the pulser's logger goroutine writes. Mirrors
+// runtime/activity/poster_test.go's helper.
+type threadSafeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *threadSafeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *threadSafeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureLogger returns an slog.Logger writing JSON lines to buf for later
+// assertion. Mirrors runtime/activity/poster_test.go's helper.
+func captureLogger(buf *threadSafeBuffer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
 func TestStartFiresFirstTickSynchronously(t *testing.T) {
@@ -1352,5 +1380,167 @@ func TestDeadLetterInjectIsFlushedAtStop(t *testing.T) {
 	defer mu.Unlock()
 	if len(reported) == 0 || reported[len(reported)-1] != "dlv-short-session" {
 		t.Fatalf("dead letters reported = %v; want the Stop-time flush to carry dlv-short-session", reported)
+	}
+}
+
+// ── Session-mortality: credentials must stay live across the pulser's whole
+// lifetime, and an auth-shaped rejection must be loud ─────────────────────
+
+// TestCredentialProviderReflectsRotationAcrossTicks proves the pulser calls
+// CredentialProvider fresh on EVERY tick rather than caching the value from
+// construction: the first tick must carry the pre-rotation token and a LATER
+// tick — after the daemon's proactive/reactive refresh has rotated the
+// worker's runtime JWT mid-session — must carry the rotated one. This is the
+// ownership-pulser half of the seam that keeps a session from dying when it
+// crosses an hourly token-rotation boundary.
+func TestCredentialProviderReflectsRotationAcrossTicks(t *testing.T) {
+	t.Parallel()
+
+	var auths []string
+	var mu sync.Mutex
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"refreshed": true})
+	})
+
+	var rotated atomic.Bool
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID: "s1",
+		WorkerID:  "wkr_1",
+		IssueID:   "issue-1",
+		BaseURL:   srv.URL,
+		CredentialProvider: func(context.Context) (heartbeat.RuntimeCredentials, error) {
+			if rotated.Load() {
+				return heartbeat.RuntimeCredentials{WorkerID: "wkr_1", AuthToken: "post-rotation-token"}, nil
+			}
+			return heartbeat.RuntimeCredentials{WorkerID: "wkr_1", AuthToken: "pre-rotation-token"}, nil
+		},
+		HTTPClient: srv.Client(),
+		Interval:   5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	// The first (synchronous) tick must have carried the PRE-rotation
+	// token — proving the assertion below is a genuine before/after, not
+	// an artifact of the provider always returning the same value.
+	mu.Lock()
+	firstAuth := auths[0]
+	mu.Unlock()
+	if firstAuth != "Bearer pre-rotation-token" {
+		t.Fatalf("first tick Authorization = %q, want Bearer pre-rotation-token", firstAuth)
+	}
+
+	// Simulate the daemon-side rotation landing mid-session.
+	rotated.Store(true)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		latest := auths[len(auths)-1]
+		mu.Unlock()
+		if latest == "Bearer post-rotation-token" {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("no tick after rotation carried the post-rotation token — a session crossing the rotation boundary would keep refusing on the stale snapshot")
+}
+
+// TestTickLogsAuthRejectionDistinctlyOnStatus401Or403 asserts that a 401/403
+// on the lock-refresh POST — the wire-shape of a rotated-out worker token —
+// produces a WARN log line an operator can distinguish from a generic
+// outage at a glance. The pulser's normal failure handling (strike counting,
+// eventual LostOwnership) is unchanged; only the log message's specificity
+// is under test here.
+func TestTickLogsAuthRejectionDistinctlyOnStatus401Or403(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		status int
+	}{
+		{"unauthorized", http.StatusUnauthorized},
+		{"forbidden", http.StatusForbidden},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "no", tc.status)
+			})
+
+			buf := &threadSafeBuffer{}
+			p, err := heartbeat.New(heartbeat.Config{
+				SessionID:          "s1",
+				BaseURL:            srv.URL,
+				HTTPClient:         srv.Client(),
+				Interval:           24 * time.Hour, // one tick only
+				MaxAttemptsPerTick: 1,              // no retry backoff to wait out
+				Logger:             captureLogger(buf),
+				Sleep:              func(time.Duration) {},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Start(context.Background()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			t.Cleanup(func() { _ = p.Stop() })
+
+			logs := buf.String()
+			if !strings.Contains(logs, "auth rejected") {
+				t.Fatalf("expected a distinct auth-rejected log line for status %d, got: %s", tc.status, logs)
+			}
+			if !strings.Contains(logs, `"level":"WARN"`) {
+				t.Fatalf("expected the auth-rejected line at WARN level, got: %s", logs)
+			}
+		})
+	}
+}
+
+// TestTickLogsGenericStatusForNonAuthFailures is the control: a non-auth
+// failure (500) keeps its generic status-coded message, unchanged by the
+// 401/403 special-case above.
+func TestTickLogsGenericStatusForNonAuthFailures(t *testing.T) {
+	t.Parallel()
+
+	srv := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no", http.StatusInternalServerError)
+	})
+
+	buf := &threadSafeBuffer{}
+	p, err := heartbeat.New(heartbeat.Config{
+		SessionID:          "s1",
+		BaseURL:            srv.URL,
+		HTTPClient:         srv.Client(),
+		Interval:           24 * time.Hour,
+		MaxAttemptsPerTick: 1,
+		Logger:             captureLogger(buf),
+		Sleep:              func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Stop() })
+
+	logs := buf.String()
+	if !strings.Contains(logs, "status 500") {
+		t.Fatalf("expected the generic status-coded line for a 500, got: %s", logs)
+	}
+	if strings.Contains(logs, "auth rejected") {
+		t.Fatalf("a 500 must not be classified as an auth rejection: %s", logs)
 	}
 }

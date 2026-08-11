@@ -855,6 +855,16 @@ func (p *Pulser) postRefresh(ctx context.Context, ack string, dead []DeadLettere
 	}
 	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			// Auth-shaped failure: the credentials this tick presented were
+			// rejected — almost always a worker runtime token that expired
+			// or rotated out from under a still-running session holding a
+			// stale snapshot. The strike/LostOwnership handling above this
+			// call is unchanged; this only makes the error text an operator
+			// greps for distinct from a generic outage (network blip,
+			// platform 500) in tick()'s "heartbeat tick failed" log line.
+			return nil, fmt.Errorf("lock-refresh: auth rejected (status %d) — runtime token likely expired or rotated out from under this session", resp.StatusCode)
+		}
 		return nil, fmt.Errorf("lock-refresh: status %d", resp.StatusCode)
 	}
 	var out refreshResponse
