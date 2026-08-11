@@ -56,10 +56,21 @@ func (fs *fakeServer) close() {
 	_ = fs.stdout.Close()
 }
 
+func fakeMCPStatusData(active map[string]any) []map[string]any {
+	data := make([]map[string]any, 0, len(active))
+	for name := range active {
+		data = append(data, map[string]any{
+			"name":       name,
+			"serverInfo": map[string]any{"name": name, "version": "fake"},
+		})
+	}
+	return data
+}
+
 // run reads JSON-RPC requests from stdin and replies according to a
 // deterministic script. Specifically it:
 //   - replies to `initialize` with empty result
-//   - applies config/batchWrite and reports active mcp_servers via config/read
+//   - applies config/batchWrite and reports config plus initialized MCP status
 //   - replies to `thread/start` with a fresh thread id
 //   - replies to `turn/start` with empty result, then emits a canned
 //     event sequence ending in turn/completed
@@ -107,6 +118,14 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 			fs.write(t, map[string]any{
 				"jsonrpc": "2.0", "id": idRaw,
 				"result": map[string]any{"config": map[string]any{codexMCPConfigKeyPath: active}, "origins": map[string]any{}},
+			})
+		case method == "mcpServerStatus/list" && hasID:
+			fs.mu.Lock()
+			active := fs.activeMCP
+			fs.mu.Unlock()
+			fs.write(t, map[string]any{
+				"jsonrpc": "2.0", "id": idRaw,
+				"result": map[string]any{"data": fakeMCPStatusData(active)},
 			})
 		case method == "thread/start" && hasID:
 			fs.mu.Lock()
@@ -470,8 +489,8 @@ func TestHandle_StopIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestHandle_EventChannelCloseRace_REN1460 is the regression test for
-// Prior to the close-protocol fix, the events channel had
+// TestHandle_EventChannelCloseRace is the regression test for the event-channel
+// close protocol. Prior to the fix, the events channel had
 // multiple potential closers (failNow via onClientClose, forward's
 // defer, Stop) and multiple senders (emit / forward) with no shared
 // guard. Under -race -count=N, a forward goroutine could be in the
@@ -485,7 +504,7 @@ func TestHandle_StopIsIdempotent(t *testing.T) {
 // the same Handle. With the fix in place, eventsClosed + eventsMu
 // serialize the close vs send and the test passes cleanly under
 // -race -count=10.
-func TestHandle_EventChannelCloseRace_REN1460(t *testing.T) {
+func TestHandle_EventChannelCloseRace(t *testing.T) {
 	t.Parallel()
 	const handleCount = 8
 

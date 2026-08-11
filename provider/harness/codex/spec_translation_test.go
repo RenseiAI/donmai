@@ -332,6 +332,13 @@ func TestNewSpawnPlan_MCPServers(t *testing.T) {
 	if _, exists := linear["type"]; exists {
 		t.Fatalf("native Codex stdio config must omit type, got %v", linear)
 	}
+	if linear["default_tools_approval_mode"] != codexMCPToolsApprovalApprove {
+		t.Fatalf("headless MCP approval mode = %v, want %q", linear["default_tools_approval_mode"], codexMCPToolsApprovalApprove)
+	}
+	code, ok := plan.MCPConfig["af-code"].(map[string]any)
+	if !ok || code["default_tools_approval_mode"] != codexMCPToolsApprovalApprove {
+		t.Fatalf("every requested MCP server must carry the unattended approval seed: %v", plan.MCPConfig)
+	}
 }
 
 // TestMCPServersConfig_NoArgsStdio verifies that a stdio server with no

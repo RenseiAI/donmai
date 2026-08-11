@@ -27,13 +27,18 @@ import (
 type Provider struct {
 	opts Options
 
-	cmd         *exec.Cmd
-	client      *Client
-	stdin       io.WriteCloser
-	stdout      io.ReadCloser
-	stderr      io.ReadCloser
-	config      *codexConfigBoundary
-	processDone chan error
+	cmd          *exec.Cmd
+	codexBin     string
+	client       *Client
+	stdin        io.WriteCloser
+	stdout       io.ReadCloser
+	stderr       io.ReadCloser
+	config       *codexConfigBoundary
+	hostAuthFile string
+	processDone  chan error
+	startMu      sync.Mutex
+	startErr     error
+	started      bool
 
 	// mcpMu serializes app-server-global config changes. mcpUsers counts
 	// live handles holding the current config digest: equal configs may share
@@ -42,6 +47,7 @@ type Provider struct {
 	mcpMu           sync.Mutex
 	mcpConfigDigest [sha256.Size]byte
 	mcpConfigKnown  bool
+	mcpManagedNames map[string]struct{}
 	mcpUsers        int
 	mcpPoisoned     bool
 
@@ -77,6 +83,14 @@ type Options struct {
 	// subprocess. Use to inject OPENAI_API_KEY.
 	Env map[string]string
 
+	// HostSessionAuth permits a selected headless Codex host-session route to
+	// project the host's existing CLI login into the otherwise isolated
+	// CODEX_HOME. Construction pins file-backed auth but does not deliver the
+	// credential or start app-server; Spawn/Resume hard-links auth.json only
+	// after harness preparation, then initializes app-server, while config.toml
+	// and MCP servers remain private.
+	HostSessionAuth bool
+
 	// HandshakeTimeout caps the JSON-RPC initialize handshake.
 	// Defaults to 30s.
 	HandshakeTimeout time.Duration
@@ -92,15 +106,18 @@ type Options struct {
 	stderrOverride io.ReadCloser
 	skipProcess    bool // when true, no real codex is spawned (tests)
 	// verifyMCPReadback makes protocol fakes exercise the production
-	// config/read activation proof. Real processes always verify it.
+	// config/read and initialized-inventory activation proof. Real processes
+	// always verify it.
 	verifyMCPReadback bool
 	configTempDir     string
 }
 
-// New constructs the Provider, spawning the codex app-server
-// subprocess and completing the JSON-RPC initialize handshake. Returns
-// agent.ErrProviderUnavailable wrapped with context if the binary is
-// missing or the handshake fails.
+// New constructs the Provider and normally starts the codex app-server.
+// HostSessionAuth is the narrow exception: binary availability is still
+// checked here, but process start and the initialize handshake are deferred
+// until a prepared headless Spawn/Resume can project the selected credential
+// first. Returns agent.ErrProviderUnavailable wrapped with context if the
+// binary is missing or an eager handshake fails.
 func New(opts Options) (_ *Provider, resultErr error) {
 	if opts.HandshakeTimeout == 0 {
 		opts.HandshakeTimeout = 30 * time.Second
@@ -112,58 +129,109 @@ func New(opts Options) (_ *Provider, resultErr error) {
 		opts.Args = []string{"app-server"}
 	}
 
-	p := &Provider{
-		opts:     opts,
-		shutdown: make(chan struct{}),
-		handles:  make(map[*Handle]struct{}),
+	hostAuthFile := ""
+	if opts.HostSessionAuth {
+		var err error
+		hostAuthFile, err = resolveHostSessionAuthFile()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
+		}
 	}
-	boundary, err := newCodexConfigBoundary(opts.configTempDir)
+	codexBin := ""
+	if !opts.skipProcess {
+		var err error
+		codexBin, err = resolveCodexBinary(opts.CodexBin)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
+		}
+	}
+	p := &Provider{
+		opts:         opts,
+		codexBin:     codexBin,
+		shutdown:     make(chan struct{}),
+		handles:      make(map[*Handle]struct{}),
+		hostAuthFile: hostAuthFile,
+	}
+	boundary, err := newCodexConfigBoundary(opts.configTempDir, opts.HostSessionAuth)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 	}
 	p.config = boundary
 	constructed := false
 	defer func() {
-		if !constructed {
+		if !constructed && p.startErr == nil {
 			resultErr = errors.Join(resultErr, boundary.remove())
 		}
 	}()
 
-	if opts.skipProcess {
-		// Test path: caller wired stdin/stdout via overrides.
-		p.stdin = opts.stdinOverride
-		p.stdout = opts.stdoutOverride
-		p.stderr = opts.stderrOverride
-	} else {
-		full, err := resolveCodexBinary(opts.CodexBin)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
+	if !opts.HostSessionAuth {
+		if err := p.ensureStarted(); err != nil {
+			return nil, err
 		}
+	}
+	constructed = true
+	return p, nil
+}
+
+// ensureStarted serializes app-server initialization with Shutdown. The
+// caller-independent form is used by New for ordinary eager providers.
+func (p *Provider) ensureStarted() error {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	return p.startLocked()
+}
+
+// startLocked starts and initializes the app-server. startMu must be held.
+func (p *Provider) startLocked() error {
+	if p.startErr != nil {
+		return p.startErr
+	}
+	if p.started {
+		return nil
+	}
+	select {
+	case <-p.shutdown:
+		return fmt.Errorf("%w: codex provider already shut down", agent.ErrProviderUnavailable)
+	default:
+	}
+
+	if p.opts.skipProcess {
+		// Test path: caller wired stdin/stdout via overrides.
+		p.stdin = p.opts.stdinOverride
+		p.stdout = p.opts.stdoutOverride
+		p.stderr = p.opts.stderrOverride
+	} else {
 		// nolint:gosec // bin is sourced from explicit Options/env, not user input.
-		cmd := exec.Command(full, opts.Args...)
-		cmd.Dir = opts.Cwd
-		cmd.Env = mergeEnv(opts.Env, boundary.home)
+		cmd := exec.Command(p.codexBin, p.opts.Args...)
+		cmd.Dir = p.opts.Cwd
+		cmd.Env = mergeEnv(p.opts.Env, p.config.home)
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
-			return nil, fmt.Errorf("%w: codex stdin pipe: %v", agent.ErrProviderUnavailable, err)
+			return p.failStartLocked(fmt.Errorf("%w: codex stdin pipe: %v", agent.ErrProviderUnavailable, err))
 		}
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			return nil, fmt.Errorf("%w: codex stdout pipe: %v", agent.ErrProviderUnavailable, err)
+			_ = stdin.Close()
+			return p.failStartLocked(fmt.Errorf("%w: codex stdout pipe: %v", agent.ErrProviderUnavailable, err))
 		}
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
-			return nil, fmt.Errorf("%w: codex stderr pipe: %v", agent.ErrProviderUnavailable, err)
+			_ = stdin.Close()
+			_ = stdout.Close()
+			return p.failStartLocked(fmt.Errorf("%w: codex stderr pipe: %v", agent.ErrProviderUnavailable, err))
 		}
 		if err := cmd.Start(); err != nil {
-			return nil, fmt.Errorf("%w: codex spawn: %v", agent.ErrProviderUnavailable, err)
+			_ = stdin.Close()
+			_ = stdout.Close()
+			_ = stderr.Close()
+			return p.failStartLocked(fmt.Errorf("%w: codex spawn: %v", agent.ErrProviderUnavailable, err))
 		}
 		p.cmd = cmd
 		p.stdin = stdin
 		p.stdout = stdout
 		p.stderr = stderr
-		// Drain stderr to a sink so the child does not deadlock
-		// when the buffer fills. Logs go to the parent's stderr.
+		// Drain stderr to a sink so the child does not deadlock when the
+		// buffer fills. Logs go to the parent's stderr.
 		p.processDone = make(chan error, 1)
 		go drainStderr(stderr)
 	}
@@ -174,8 +242,7 @@ func New(opts Options) (_ *Provider, resultErr error) {
 		go p.watchExit()
 	}
 
-	// Initialize handshake.
-	hctx, cancel := context.WithTimeout(context.Background(), opts.HandshakeTimeout)
+	hctx, cancel := context.WithTimeout(context.Background(), p.opts.HandshakeTimeout)
 	defer cancel()
 	initRaw, err := p.client.Request(hctx, "initialize", map[string]any{
 		"clientInfo": map[string]any{
@@ -186,26 +253,28 @@ func New(opts Options) (_ *Provider, resultErr error) {
 		"capabilities": map[string]any{
 			"experimentalApi": true,
 		},
-	}, opts.HandshakeTimeout)
+	}, p.opts.HandshakeTimeout)
 	if err != nil {
-		_ = p.terminate(context.Background())
-		return nil, fmt.Errorf("%w: codex initialize handshake: %v", agent.ErrProviderUnavailable, err)
+		return p.failStartLocked(fmt.Errorf("%w: codex initialize handshake: %v", agent.ErrProviderUnavailable, err))
 	}
-	if !opts.skipProcess {
+	if !p.opts.skipProcess {
 		var initResp struct {
 			CodexHome string `json:"codexHome"`
 		}
-		if err := json.Unmarshal(initRaw, &initResp); err != nil || initResp.CodexHome == "" || !sameResolvedPath(initResp.CodexHome, boundary.home) {
-			_ = p.terminate(context.Background())
-			return nil, fmt.Errorf("%w: codex app-server did not confirm its isolated config home", agent.ErrProviderUnavailable)
+		if err := json.Unmarshal(initRaw, &initResp); err != nil || initResp.CodexHome == "" || !sameResolvedPath(initResp.CodexHome, p.config.home) {
+			return p.failStartLocked(fmt.Errorf("%w: codex app-server did not confirm its isolated config home", agent.ErrProviderUnavailable))
 		}
 	}
 	if err := p.client.Notify("initialized", map[string]any{}); err != nil {
-		_ = p.terminate(context.Background())
-		return nil, fmt.Errorf("%w: codex initialized notification: %v", agent.ErrProviderUnavailable, err)
+		return p.failStartLocked(fmt.Errorf("%w: codex initialized notification: %v", agent.ErrProviderUnavailable, err))
 	}
-	constructed = true
-	return p, nil
+	p.started = true
+	return nil
+}
+
+func (p *Provider) failStartLocked(err error) error {
+	p.startErr = errors.Join(err, p.terminateLocked(context.Background()))
+	return p.startErr
 }
 
 // Name implements agent.Provider.
@@ -263,6 +332,9 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return spawnInteractivePrepared(ctx, p.opts, spec)
 	}
 
+	if err := p.ensureHeadlessReady(); err != nil {
+		return nil, err
+	}
 	if err := p.checkAlive(); err != nil {
 		return nil, err
 	}
@@ -300,6 +372,9 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	if err := p.ensureHeadlessReady(); err != nil {
+		return nil, err
+	}
 	if err := p.checkAlive(); err != nil {
 		return nil, err
 	}
@@ -333,6 +408,29 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	return h, nil
 }
 
+// ensureHeadlessReady performs credential delivery at the selected headless
+// spawn boundary, never while the registry is merely probing constructors.
+// App-server initialization shares the same lifecycle lock and happens after
+// the link so Codex cannot cache an unauthenticated startup state.
+func (p *Provider) ensureHeadlessReady() error {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	select {
+	case <-p.shutdown:
+		return fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
+	default:
+	}
+	if p.hostAuthFile != "" {
+		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
+			return fmt.Errorf("%w: codex host-session auth: %w", agent.ErrSpawnFailed, err)
+		}
+	}
+	if err := p.startLocked(); err != nil {
+		return fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	return nil
+}
+
 // Shutdown implements agent.Provider. Idempotent.
 func (p *Provider) Shutdown(ctx context.Context) error {
 	return p.terminate(ctx)
@@ -340,8 +438,10 @@ func (p *Provider) Shutdown(ctx context.Context) error {
 
 // acquireMCPConfig reserves the app-server-global MCP config for one handle.
 // The write targets only this Provider's private CODEX_HOME/config.toml and is
-// read back before thread/start. Different configs never overlap; the last
-// release replaces the config with an empty baseline.
+// read back and proved initialized before thread/start. Different configs
+// never overlap; the last release replaces the config with an empty baseline
+// and waits for every server previously managed by this Provider to leave the
+// inventory. Codex-owned ambient servers are outside this config's authority.
 func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]any, cwd string) (func() error, error) {
 	desired := mcpConfig
 	if desired == nil {
@@ -365,16 +465,18 @@ func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]an
 	}
 
 	// The first request always writes, even when empty. That explicit baseline
-	// plus read-back is what proves ambient MCP did not enter this process.
+	// plus exact read-back proves the process's user-config MCP set; the status
+	// inventory may separately include Codex-owned ambient servers.
 	if changed {
 		if err := p.applyMCPConfig(ctx, desired, cwd, true); err != nil {
 			return nil, p.poisonMCPApplication(err)
 		}
-	} else if err := p.verifyMCPConfig(ctx, desired, cwd); err != nil {
+	} else if err := p.verifyMCPConfig(ctx, desired, cwd, nil); err != nil {
 		return nil, p.poisonMCPApplication(err)
 	}
 	p.mcpConfigDigest = digest
 	p.mcpConfigKnown = true
+	p.mcpManagedNames = mcpServerNames(desired)
 	p.mcpUsers++
 
 	var once sync.Once
@@ -407,6 +509,7 @@ func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]an
 					empty, _ := json.Marshal(map[string]any{})
 					p.mcpConfigDigest = sha256.Sum256(empty)
 					p.mcpConfigKnown = true
+					p.mcpManagedNames = map[string]struct{}{}
 				}
 			}
 		})
@@ -451,10 +554,10 @@ func (p *Provider) applyMCPConfig(ctx context.Context, desired map[string]any, c
 	if !verify || (p.opts.skipProcess && !p.opts.verifyMCPReadback) {
 		return nil
 	}
-	return p.verifyMCPConfig(ctx, desired, cwd)
+	return p.verifyMCPConfig(ctx, desired, cwd, retiredMCPServerNames(p.mcpManagedNames, desired))
 }
 
-func (p *Provider) verifyMCPConfig(ctx context.Context, desired map[string]any, cwd string) error {
+func (p *Provider) verifyMCPConfig(ctx context.Context, desired map[string]any, cwd string, retired map[string]struct{}) error {
 	if p.opts.skipProcess && !p.opts.verifyMCPReadback {
 		return nil
 	}
@@ -469,7 +572,7 @@ func (p *Provider) verifyMCPConfig(ctx context.Context, desired map[string]any, 
 	if !mcpConfigReadbackMatches(raw, desired) {
 		return errors.New("config/read did not confirm the requested MCP set")
 	}
-	return nil
+	return p.waitForMCPActivation(ctx, desired, retired)
 }
 
 func mcpConfigReadbackMatches(raw json.RawMessage, desired map[string]any) bool {
@@ -497,7 +600,7 @@ func mcpConfigReadbackMatches(raw json.RawMessage, desired map[string]any) bool 
 }
 
 func mcpServerReadbackMatches(got, want map[string]any) bool {
-	for _, key := range []string{"command", "url"} {
+	for _, key := range []string{"command", "url", "default_tools_approval_mode"} {
 		if value, exists := want[key]; exists && got[key] != value {
 			return false
 		}
@@ -520,10 +623,14 @@ func jsonValuesEqual(a, b any) bool {
 // all request values. App servers may echo rejected configuration in an RPC
 // error; only a bounded code/class is safe to surface or persist.
 func codexMCPConfigFailureDetail(err error) string {
+	var activationDeadline *mcpActivationDeadlineError
+	if errors.As(err, &activationDeadline) {
+		return activationDeadline.Error()
+	}
 	var rpc *RPCError
 	if errors.As(err, &rpc) {
 		method := "config RPC"
-		if rpc.Method == "config/batchWrite" || rpc.Method == "config/read" {
+		if rpc.Method == "config/batchWrite" || rpc.Method == "config/read" || rpc.Method == "mcpServerStatus/list" {
 			method = rpc.Method
 		}
 		return fmt.Sprintf("%s rejected by JSON-RPC code %d", method, rpc.Code)
@@ -622,6 +729,14 @@ func (p *Provider) watchExit() {
 
 // terminate is the internal shutdown path. Idempotent.
 func (p *Provider) terminate(ctx context.Context) error {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	return p.terminateLocked(ctx)
+}
+
+// terminateLocked serializes cleanup with deferred app-server startup.
+// startMu must be held.
+func (p *Provider) terminateLocked(ctx context.Context) error {
 	var rerr error
 	p.closeOnce.Do(func() {
 		close(p.shutdown)

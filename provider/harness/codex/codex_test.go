@@ -71,6 +71,101 @@ func TestNew_HandshakeFailureReturnsProviderUnavailable(t *testing.T) {
 	}
 }
 
+func TestHostSessionAuthDefersCredentialAndAppServerUntilPreparedSpawn(t *testing.T) {
+	root := t.TempDir()
+	hostHome := filepath.Join(root, "host")
+	boundaryParent := filepath.Join(root, "boundaries")
+	for _, dir := range []string{hostHome, boundaryParent} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Base(dir), err)
+		}
+	}
+	hostAuth := filepath.Join(hostHome, codexAuthFileName)
+	if err := os.WriteFile(hostAuth, []byte(`{"auth_mode":"chatgpt"}`), 0o600); err != nil {
+		t.Fatalf("write host auth: %v", err)
+	}
+	t.Setenv("CODEX_HOME", hostHome)
+
+	fs, stdinW, stdoutR := newFakeServer()
+	p, err := New(Options{
+		HostSessionAuth:  true,
+		skipProcess:      true,
+		stdinOverride:    stdinW,
+		stdoutOverride:   stdoutR,
+		configTempDir:    boundaryParent,
+		HandshakeTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New deferred host-session provider: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	})
+	if p.client != nil || p.started {
+		t.Fatal("host-session provider started app-server during constructor probing")
+	}
+	if _, err := os.Lstat(filepath.Join(p.config.home, codexAuthFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("host credential was projected during constructor probing: %v", err)
+	}
+
+	go fs.run(t, "thread-host-session-deferred")
+	h, err := p.Spawn(t.Context(), agent.Spec{Prompt: "deferred auth", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("prepared host-session Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	if p.client == nil || !p.started {
+		t.Fatal("prepared headless Spawn did not initialize app-server")
+	}
+	hostInfo, err := os.Stat(hostAuth)
+	if err != nil {
+		t.Fatalf("stat host auth: %v", err)
+	}
+	linkedInfo, err := os.Stat(p.config.authPath)
+	if err != nil {
+		t.Fatalf("stat isolated auth: %v", err)
+	}
+	if !os.SameFile(hostInfo, linkedInfo) {
+		t.Fatal("prepared Spawn did not project the pinned host credential inode")
+	}
+}
+
+func TestHostSessionAuthShutdownBeforeSpawnDoesNotProjectCredential(t *testing.T) {
+	hostHome := t.TempDir()
+	hostAuth := filepath.Join(hostHome, codexAuthFileName)
+	if err := os.WriteFile(hostAuth, []byte(`{"auth_mode":"chatgpt"}`), 0o600); err != nil {
+		t.Fatalf("write host auth: %v", err)
+	}
+	t.Setenv("CODEX_HOME", hostHome)
+
+	fs, stdinW, stdoutR := newFakeServer()
+	p, err := New(Options{
+		HostSessionAuth: true,
+		skipProcess:     true,
+		stdinOverride:   stdinW,
+		stdoutOverride:  stdoutR,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New deferred host-session provider: %v", err)
+	}
+	if err := p.Shutdown(t.Context()); err != nil {
+		fs.close()
+		t.Fatalf("Shutdown before Spawn: %v", err)
+	}
+	defer fs.close()
+
+	_, err = p.Spawn(t.Context(), agent.Spec{Prompt: "must not start", Cwd: t.TempDir()})
+	if !errors.Is(err, agent.ErrSpawnFailed) || !errors.Is(err, agent.ErrProviderUnavailable) {
+		t.Fatalf("Spawn after Shutdown error = %v, want spawn and unavailable sentinels", err)
+	}
+	if p.client != nil || p.config.authPath != "" {
+		t.Fatal("Spawn after Shutdown initialized app-server or projected a credential")
+	}
+}
+
 func TestProvider_NameAndCapabilities(t *testing.T) {
 	t.Parallel()
 	fs, stdinW, stdoutR := newFakeServer()
@@ -333,15 +428,270 @@ func TestProvider_EmptyMCPBaselineIsWrittenAndVerifiedBeforeThreadStart(t *testi
 		}
 		return -1
 	}
-	writeAt, readAt, threadAt := index("config/batchWrite"), index("config/read"), index("thread/start")
-	if writeAt < 0 || readAt <= writeAt || threadAt <= readAt {
-		t.Fatalf("method order = %v, want batchWrite -> config/read -> thread/start", methods)
+	writeAt := index("config/batchWrite")
+	readAt := index("config/read")
+	statusAt := index("mcpServerStatus/list")
+	threadAt := index("thread/start")
+	if writeAt < 0 || readAt <= writeAt || statusAt <= readAt || threadAt <= statusAt {
+		t.Fatalf("method order = %v, want batchWrite -> config/read -> mcpServerStatus/list -> thread/start", methods)
 	}
 	if len(writes) != 2 {
 		t.Fatalf("empty session writes = %d, want explicit apply + terminal clear", len(writes))
 	}
 	if len(active) != 0 {
 		t.Fatalf("active MCP after terminal cleanup = %v, want empty", active)
+	}
+}
+
+func TestProvider_WaitsForMCPInventoryBeforeThreadStart(t *testing.T) {
+	fs, stdinW, stdoutR := newFakeServer()
+	var active map[string]any
+	var statusCalls atomic.Int32
+	var statusCallsAtThreadStart atomic.Int32
+	var cleanupStatusCalls atomic.Int32
+	var clearing atomic.Bool
+
+	go func() {
+		dec := json.NewDecoder(fs.stdin)
+		for {
+			var msg map[string]any
+			if err := dec.Decode(&msg); err != nil {
+				return
+			}
+			method, _ := msg["method"].(string)
+			idRaw, hasID := msg["id"]
+			switch {
+			case method == "initialize" && hasID:
+				fs.replyOK(t, idRaw)
+			case method == "config/batchWrite" && hasID:
+				params, _ := msg["params"].(map[string]any)
+				edits, _ := params["edits"].([]any)
+				edit, _ := edits[0].(map[string]any)
+				active, _ = edit["value"].(map[string]any)
+				clearing.Store(len(active) == 0)
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
+					"filePath": params["filePath"], "status": "ok", "version": "fake",
+				}})
+			case method == "config/read" && hasID:
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
+					"config": map[string]any{codexMCPConfigKeyPath: active}, "origins": map[string]any{},
+				}})
+			case method == "mcpServerStatus/list" && hasID:
+				if clearing.Load() {
+					call := cleanupStatusCalls.Add(1)
+					data := fakeMCPStatusData(map[string]any{"ambient": map[string]any{}})
+					if call == 1 {
+						// A removed provider-managed server may briefly remain in
+						// Codex's status cache after the config reload.
+						data = append(data, fakeMCPStatusData(map[string]any{"required": map[string]any{}})...)
+					}
+					fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{"data": data}})
+					continue
+				}
+				call := statusCalls.Add(1)
+				data := fakeMCPStatusData(active)
+				for _, server := range data {
+					if server["name"] == "required" && call == 1 {
+						// Codex can list a configured server before its initialize
+						// handshake has supplied serverInfo. That is not ready yet.
+						server["serverInfo"] = nil
+					}
+				}
+				// The status inventory can also include Codex-owned servers that
+				// are not part of the isolated mcp_servers configuration.
+				data = append(data, fakeMCPStatusData(map[string]any{"ambient": map[string]any{}})...)
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{"data": data}})
+			case method == "thread/start" && hasID:
+				statusCallsAtThreadStart.Store(statusCalls.Load())
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
+					"thread": map[string]any{"id": "thread-mcp-ready"},
+				}})
+			case hasID:
+				fs.replyOK(t, idRaw)
+			}
+		}
+	}()
+
+	p, err := New(Options{
+		skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR,
+		verifyMCPReadback: true, RPCTimeout: 125 * time.Millisecond,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	})
+
+	h, err := p.Spawn(t.Context(), agent.Spec{
+		Prompt: "wait for MCP", Cwd: t.TempDir(),
+		MCPServers: []agent.MCPServerConfig{{Name: "required", Command: "server"}},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if got := statusCallsAtThreadStart.Load(); got != 2 {
+		t.Fatalf("mcpServerStatus/list calls before thread/start = %d, want 2 (starting then ready)", got)
+	}
+	if err := h.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if got := cleanupStatusCalls.Load(); got != 2 {
+		t.Fatalf("cleanup status calls = %d, want 2 (retired server present then absent)", got)
+	}
+}
+
+func TestProvider_MCPStartupTimeoutFailsBeforeThreadStart(t *testing.T) {
+	fs, stdinW, stdoutR := newFakeServer()
+	var active map[string]any
+	var statusCalls atomic.Int32
+	var threadStarted atomic.Bool
+	const secret = "mcp-activation-secret-must-not-leak"
+	go func() {
+		dec := json.NewDecoder(fs.stdin)
+		for {
+			var msg map[string]any
+			if err := dec.Decode(&msg); err != nil {
+				return
+			}
+			method, _ := msg["method"].(string)
+			idRaw, hasID := msg["id"]
+			switch {
+			case method == "initialize" && hasID:
+				fs.replyOK(t, idRaw)
+			case method == "config/batchWrite" && hasID:
+				params, _ := msg["params"].(map[string]any)
+				edits, _ := params["edits"].([]any)
+				edit, _ := edits[0].(map[string]any)
+				active, _ = edit["value"].(map[string]any)
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
+					"filePath": params["filePath"], "status": "ok", "version": "fake",
+				}})
+			case method == "config/read" && hasID:
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
+					"config": map[string]any{codexMCPConfigKeyPath: active}, "origins": map[string]any{},
+				}})
+			case method == "mcpServerStatus/list" && hasID:
+				statusCalls.Add(1)
+				data := fakeMCPStatusData(map[string]any{
+					"ready":      map[string]any{},
+					"waiting":    map[string]any{},
+					"unexpected": map[string]any{},
+				})
+				for _, server := range data {
+					if server["name"] == "waiting" {
+						server["serverInfo"] = nil
+					}
+				}
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{"data": data}})
+			case method == "thread/start" && hasID:
+				threadStarted.Store(true)
+				fs.replyOK(t, idRaw)
+			case hasID:
+				fs.replyOK(t, idRaw)
+			}
+		}
+	}()
+
+	p, err := New(Options{
+		skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR,
+		verifyMCPReadback: true, RPCTimeout: 125 * time.Millisecond,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	})
+
+	_, err = p.Spawn(t.Context(), agent.Spec{
+		Prompt: "must not start", Cwd: t.TempDir(),
+		MCPServers: []agent.MCPServerConfig{
+			{Name: "ready", Command: "server"},
+			{Name: "waiting", Command: "server", Env: map[string]string{"TOKEN": secret}},
+			{Name: "absent", Command: "server"},
+		},
+	})
+	var adaptationErr *agent.ToolAdaptationError
+	if !errors.Is(err, agent.ErrSpawnFailed) || !errors.As(err, &adaptationErr) {
+		t.Fatalf("Spawn error = %v, want typed pre-thread MCP denial", err)
+	}
+	wantDetail := `isolated config activation deadline exceeded; ready=["ready"]; uninitialized=["waiting"]; absent=["absent"]; unexpected=1`
+	if adaptationErr.Detail != wantDetail {
+		t.Fatalf("adaptation detail = %q, want %q", adaptationErr.Detail, wantDetail)
+	}
+	if strings.Contains(adaptationErr.Detail, secret) {
+		t.Fatalf("adaptation detail leaked MCP configuration secret: %q", adaptationErr.Detail)
+	}
+	if threadStarted.Load() {
+		t.Fatal("thread/start was sent before the required MCP server initialized")
+	}
+	if statusCalls.Load() < 2 {
+		t.Fatalf("mcpServerStatus/list calls = %d, want polling before timeout", statusCalls.Load())
+	}
+}
+
+func TestListActiveMCPServers_PaginatesReadyInventory(t *testing.T) {
+	fs, stdinW, stdoutR := newFakeServer()
+	var calls atomic.Int32
+	go func() {
+		dec := json.NewDecoder(fs.stdin)
+		for {
+			var msg map[string]any
+			if err := dec.Decode(&msg); err != nil {
+				return
+			}
+			method, _ := msg["method"].(string)
+			idRaw, hasID := msg["id"]
+			switch {
+			case method == "initialize" && hasID:
+				fs.replyOK(t, idRaw)
+			case method == "mcpServerStatus/list" && hasID:
+				call := calls.Add(1)
+				params, _ := msg["params"].(map[string]any)
+				if params["detail"] != "full" {
+					t.Errorf("status inventory detail = %v, want full initialize metadata", params["detail"])
+				}
+				if call == 1 {
+					if _, exists := params["cursor"]; exists {
+						t.Errorf("first status page unexpectedly carried a cursor: %v", params)
+					}
+					fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
+						"data": fakeMCPStatusData(map[string]any{"alpha": map[string]any{}}), "nextCursor": "page-2",
+					}})
+					continue
+				}
+				if params["cursor"] != "page-2" {
+					t.Errorf("second status page cursor = %v, want page-2", params["cursor"])
+				}
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
+					"data": fakeMCPStatusData(map[string]any{"beta": map[string]any{}}),
+				}})
+			case hasID:
+				fs.replyOK(t, idRaw)
+			}
+		}
+	}()
+
+	p, err := New(Options{skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	})
+	active, err := p.listActiveMCPServers(t.Context())
+	if err != nil {
+		t.Fatalf("listActiveMCPServers: %v", err)
+	}
+	if !sameMCPServerNames(active, map[string]struct{}{"alpha": {}, "beta": {}}) || calls.Load() != 2 {
+		t.Fatalf("active=%v calls=%d, want alpha+beta across two pages", active, calls.Load())
 	}
 }
 
@@ -419,6 +769,10 @@ func TestHandle_StopReportsMCPReadbackCleanupFailureAndPoisonsProvider(t *testin
 				}
 				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
 					"config": map[string]any{codexMCPConfigKeyPath: readback}, "origins": map[string]any{},
+				}})
+			case method == "mcpServerStatus/list" && hasID:
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
+					"data": fakeMCPStatusData(active),
 				}})
 			case method == "thread/start" && hasID:
 				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
@@ -531,9 +885,10 @@ func TestLiveCodex_IsolatedConfigReadWriteClearAndAmbientDigestUnchanged(t *test
 		t.Fatalf("owned boundary validation: %v", err)
 	}
 
+	httpFixture := newCodexFakeMCPHTTP(t)
 	desired := mcpServersConfig([]agent.MCPServerConfig{
-		{Name: "live_stdio", Command: "/usr/bin/false", Args: []string{"nonce"}},
-		{Name: "live_http", Type: "http", URL: "http://127.0.0.1:9/mcp", Headers: map[string]string{"X-Probe": "nonce"}},
+		{Name: "live_stdio", Command: os.Args[0], Env: map[string]string{codexFakeMCPStdioEnv: "1"}},
+		{Name: "live_http", Type: "http", URL: httpFixture.server.URL, Headers: map[string]string{"X-Probe": "nonce"}},
 	})
 	release, err := p.acquireMCPConfig(t.Context(), desired, root)
 	if err != nil {
@@ -546,6 +901,9 @@ func TestLiveCodex_IsolatedConfigReadWriteClearAndAmbientDigestUnchanged(t *test
 	}
 	if !strings.Contains(string(body), "[mcp_servers.live_stdio]") || !strings.Contains(string(body), "[mcp_servers.live_http.http_headers]") {
 		t.Fatalf("owned config omitted proven native stdio/HTTP shapes: %s", body)
+	}
+	if httpFixture.initialized.Load() == 0 || !httpFixture.headerSeen.Load() {
+		t.Fatal("live HTTP MCP fixture was not initialized with its configured header")
 	}
 	if err := release(); err != nil {
 		t.Fatalf("live clear/readback: %v", err)
@@ -778,6 +1136,13 @@ func TestProvider_StartFailureClearsAppliedMCPBeforeReturning(t *testing.T) {
 				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
 					"config": map[string]any{codexMCPConfigKeyPath: active}, "origins": map[string]any{},
 				}})
+			case method == "mcpServerStatus/list" && hasID:
+				fs.mu.Lock()
+				active := fs.activeMCP
+				fs.mu.Unlock()
+				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "result": map[string]any{
+					"data": fakeMCPStatusData(active),
+				}})
 			case method == "thread/start" && hasID:
 				fs.write(t, map[string]any{"jsonrpc": "2.0", "id": idRaw, "error": map[string]any{
 					"code": -32600, "message": "synthetic thread failure",
@@ -822,5 +1187,16 @@ func TestMCPConfigReadbackRejectsUnexpectedExtraServer(t *testing.T) {
 	}
 	if mcpConfigReadbackMatches(json.RawMessage(`{"config":{}}`), map[string]any{}) {
 		t.Fatal("readback without an explicit mcp_servers value proved an empty baseline")
+	}
+}
+
+func TestMCPConfigReadbackRequiresHeadlessMCPApprovalSeed(t *testing.T) {
+	raw := json.RawMessage(`{"config":{"mcp_servers":{"requested":{"command":"server"}}}}`)
+	desired := map[string]any{"requested": map[string]any{
+		"command":                     "server",
+		"default_tools_approval_mode": codexMCPToolsApprovalApprove,
+	}}
+	if mcpConfigReadbackMatches(raw, desired) {
+		t.Fatal("readback without the requested MCP approval seed was accepted")
 	}
 }

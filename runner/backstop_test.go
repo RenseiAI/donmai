@@ -69,8 +69,8 @@ func TestCaptureHeadSHA(t *testing.T) {
 }
 
 // TestShouldExcludeFromBackstop_Table table-tests the path-exclude
-// decision against the data tables. The rows mirror the legacy TS
-// shouldExcludeFromBackstop test cases verbatim.
+// decision against the data tables. The rows cover the legacy TS cases plus
+// Donmai's Go-native code-intel cache.
 func TestShouldExcludeFromBackstop_Table(t *testing.T) {
 	cases := []struct {
 		path string
@@ -114,6 +114,9 @@ func TestShouldExcludeFromBackstop_Table(t *testing.T) {
 		{"target/release/main", true},
 		{"target/debug", true},
 		{"target/test/x", false},
+		{".donmai/code-index/index.json", true},
+		{".donmai/code-index", true},
+		{".donmai/config.yaml", false},
 
 		// Empty / safe.
 		{"", false},
@@ -214,6 +217,7 @@ func TestRunBackstop_FiltersBuildArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, repo, "node_modules/index.js", "// build artifact")
+	writeFile(t, repo, ".donmai/code-index/index.json", `{"generated":true}`)
 	writeFile(t, repo, "src/main.go", "package main\nfunc main(){}\n")
 
 	r := minimalRunner(t)
@@ -239,6 +243,9 @@ func TestRunBackstop_FiltersBuildArtifacts(t *testing.T) {
 	}
 	if strings.Contains(logOut, "node_modules/index.js") {
 		t.Errorf("node_modules/index.js should have been excluded; got %q", logOut)
+	}
+	if strings.Contains(logOut, ".donmai/code-index/index.json") {
+		t.Errorf("generated code-intel index should have been excluded; got %q", logOut)
 	}
 	// Push diagnostics expected (no real remote).
 	if report.PRCreated {
@@ -369,12 +376,11 @@ func unsetGitIdentityEnv(t *testing.T) {
 
 // TestRunBackstop_CommitIdentity confirms the backstop commit's author/committer
 // is single-sourced through buildSessionEnv (rank 15f): a provisioner-supplied
-// GIT_AUTHOR_*/GIT_COMMITTER_* identity — the canonical "Rensei Agent" the cloud
-// box stamps into the env — is HONORED so backstop commits match the agent's
-// own in-box commits; absent one, the session-derived "Donmai Agent (<issue>)"
-// default is used. runGit appends the chosen identity AFTER os.Environ() so it
-// wins for the commit subprocess (regression test for the earlier NO-OP where
-// cmd.Env = os.Environ() appended no identity at all).
+// GIT_AUTHOR_*/GIT_COMMITTER_* identity is HONORED so backstop commits match the
+// agent's own in-box commits; absent one, the session-derived "Donmai Agent
+// (<issue>)" default is used. runGit appends the chosen identity AFTER
+// os.Environ() so it wins for the commit subprocess (regression test for the
+// earlier NO-OP where cmd.Env = os.Environ() appended no identity at all).
 func TestRunBackstop_CommitIdentity(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")
@@ -403,15 +409,15 @@ func TestRunBackstop_CommitIdentity(t *testing.T) {
 	}
 
 	t.Run("honors provisioner-supplied identity", func(t *testing.T) {
-		// The cloud box provisioner stamps this into the env.
-		t.Setenv("GIT_AUTHOR_NAME", "Rensei Agent")
+		// The runtime provisioner stamps this into the environment.
+		t.Setenv("GIT_AUTHOR_NAME", "Provisioned Agent")
 		t.Setenv("GIT_AUTHOR_EMAIL", "agent@example.com")
-		t.Setenv("GIT_COMMITTER_NAME", "Rensei Agent")
+		t.Setenv("GIT_COMMITTER_NAME", "Provisioned Agent")
 		t.Setenv("GIT_COMMITTER_EMAIL", "agent@example.com")
 
 		authorOut := commitAuthor(t)
-		if !strings.Contains(authorOut, "Rensei Agent") || !strings.Contains(authorOut, "agent@example.com") {
-			t.Errorf("commit author = %q; want provisioner identity \"Rensei Agent <agent@example.com>\"", authorOut)
+		if !strings.Contains(authorOut, "Provisioned Agent") || !strings.Contains(authorOut, "agent@example.com") {
+			t.Errorf("commit author = %q; want provisioner identity \"Provisioned Agent <agent@example.com>\"", authorOut)
 		}
 		if strings.Contains(authorOut, "Donmai Agent") {
 			t.Errorf("commit author = %q; provisioner identity should win over the session default", authorOut)

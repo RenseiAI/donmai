@@ -18,11 +18,10 @@ import (
 // donmai-libraries/packages/core/src/orchestrator/session-backstop.ts:57-95).
 // ============================================================================
 //
-// The lists below are the data the legacy TS shouldExcludeFromBackstop
-// function consults when deciding whether a staged path should be
-// unstaged before the auto-commit. Keep order/contents byte-identical
-// to the legacy file; when an entry is added there, port it here in
-// the same wave.
+// Most entries below mirror the legacy TS shouldExcludeFromBackstop tables.
+// Donmai's Go-native code-intel MCP adds one Go-only generated-cache path;
+// unlike source-owned .donmai configuration, that index must never enter a
+// backstop commit merely because the MCP server warmed at session startup.
 
 // excludeDirAnyDepth lists directory names that disqualify a path at
 // any depth. Mirrors EXCLUDE_DIR_ANY_DEPTH from the legacy TS.
@@ -69,6 +68,7 @@ var excludeBasenamePrefixes = []string{"__debug_bin"}
 var excludePathPrefixes = []string{
 	"target/debug/",
 	"target/release/",
+	".donmai/code-index/",
 }
 
 // backstopMaxFiles is the upper bound on the number of files the
@@ -226,8 +226,8 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 
 	// Single-source the git identity through buildSessionEnv so backstop
 	// commits carry the SAME author as the agent's own in-box commits: a
-	// provisioner-stamped "Rensei Agent" GIT_AUTHOR_*/GIT_COMMITTER_* wins
-	// when present, otherwise the session-derived default is used. Either way
+	// provisioner-stamped GIT_AUTHOR_*/GIT_COMMITTER_* identity wins when
+	// present, otherwise the session-derived default is used. Either way
 	// this beats whatever the cloud sandbox's git global config says (often
 	// absent). runGit appends these overrides AFTER os.Environ() so the chosen
 	// identity is authoritative for the commit subprocess.
