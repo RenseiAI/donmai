@@ -50,6 +50,46 @@ func mapNotification(method string, params json.RawMessage, state *mapperState, 
 	case "thread/closed", "thread/status/changed":
 		return []agent.Event{agent.SystemEvent{Subtype: subtypeFromMethod(method), Raw: raw}}
 
+	// Codex 0.147 emits settings synchronization and one startup-status
+	// notification per configured MCP server. Successful lifecycle sync is
+	// protocol bookkeeping, not agent activity. Keep terminal startup problems
+	// visible, but do not promote Codex's free-form error text into the activity
+	// stream; the raw notification remains attached for diagnostics.
+	case "thread/settings/updated":
+		return nil
+
+	case "mcpServer/startupStatus/updated":
+		var p struct {
+			Name          string `json:"name"`
+			Status        string `json:"status"`
+			FailureReason string `json:"failureReason"`
+		}
+		_ = json.Unmarshal(params, &p)
+		switch p.Status {
+		case "starting", "ready":
+			return nil
+		case "failed", "cancelled":
+			name := p.Name
+			if name == "" {
+				name = "unknown"
+			}
+			message := fmt.Sprintf("Codex MCP server %q startup %s", name, p.Status)
+			if p.FailureReason != "" {
+				message += ": " + p.FailureReason
+			}
+			return []agent.Event{agent.SystemEvent{
+				Subtype: "mcp_server_startup_" + p.Status,
+				Message: message,
+				Raw:     raw,
+			}}
+		default:
+			return []agent.Event{agent.SystemEvent{
+				Subtype: "mcp_server_startup_status",
+				Message: fmt.Sprintf("Codex MCP server %q reported startup status %q", p.Name, p.Status),
+				Raw:     raw,
+			}}
+		}
+
 	// ─── Turn lifecycle ───────────────────────────────────────────
 	case "turn/started":
 		state.turnCount++
@@ -280,6 +320,11 @@ func mapItem(method string, params json.RawMessage, raw any) []agent.Event {
 	isCompleted := method == "item/completed"
 
 	switch p.Item.Type {
+	case "userMessage":
+		// The caller already owns this input. Codex echoes it as a thread item;
+		// forwarding it would duplicate the prompt in the activity stream.
+		return nil
+
 	case "agentMessage":
 		if isCompleted && p.Item.Text != "" {
 			return []agent.Event{agent.AssistantTextEvent{Text: p.Item.Text, Raw: raw}}

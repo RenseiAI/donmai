@@ -66,9 +66,11 @@ import (
 //
 // # Scope
 //
-// Interactive spawn mode only, exactly like trust.go. The headless app-server
-// lane computes its approval decisions on the JSON-RPC approval bridge
-// (approval.go) where nothing blocks on a keystroke, and it stays untouched.
+// The global approval-policy and sandbox seeds below are interactive-only,
+// exactly like trust.go. Headless command and file decisions travel over the
+// JSON-RPC approval bridge (approval.go). MCP tool approval is the exception:
+// Codex handles it internally, so spec_translation.go reuses the scoped
+// per-server approval value below in the isolated headless config.
 const (
 	// codexApprovalPolicyNever is codex's `approval_policy` variant that stops
 	// it asking before it runs a command. Accepted variants in 0.146:

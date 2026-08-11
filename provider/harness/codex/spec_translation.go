@@ -238,6 +238,11 @@ func mcpServersConfig(servers []agent.MCPServerConfig) map[string]any {
 			entry["http_headers"] = headers
 			delete(entry, "headers")
 		}
+		// MCP tool approvals are handled inside Codex and do not travel over
+		// the app-server command/file approval bridge. Headless sessions have
+		// no user to answer that prompt, so pre-approve tools only on the exact
+		// server entries this spawn requested.
+		entry["default_tools_approval_mode"] = codexMCPToolsApprovalApprove
 		out[s.Name] = entry
 	}
 	if len(out) == 0 {

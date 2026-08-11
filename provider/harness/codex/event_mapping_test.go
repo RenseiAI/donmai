@@ -309,6 +309,77 @@ func TestMapNotification_AgentMessageCompleted_EmitsFullText(t *testing.T) {
 	}
 }
 
+func TestMapNotification_Codex0147LifecycleNoiseDropped(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		method string
+		params map[string]any
+	}{
+		{
+			method: "mcpServer/startupStatus/updated",
+			params: map[string]any{"name": "af-code", "status": "starting", "threadId": "thread-1"},
+		},
+		{
+			method: "mcpServer/startupStatus/updated",
+			params: map[string]any{"name": "af-code", "status": "ready", "threadId": "thread-1"},
+		},
+		{
+			method: "thread/settings/updated",
+			params: map[string]any{"threadId": "thread-1", "threadSettings": map[string]any{}},
+		},
+	}
+	for _, tt := range tests {
+		if got := mapNotification(tt.method, mustJSON(t, tt.params), &mapperState{}, nil); len(got) != 0 {
+			t.Fatalf("%s: expected lifecycle sync to be consumed, got %#v", tt.method, got)
+		}
+	}
+}
+
+func TestMapNotification_MCPStartupFailureRemainsVisibleWithoutRawErrorText(t *testing.T) {
+	t.Parallel()
+	const rawError = "transport rejected secret-bearing details"
+	params := mustJSON(t, map[string]any{
+		"name":          "af-code",
+		"status":        "failed",
+		"failureReason": "reauthenticationRequired",
+		"error":         rawError,
+		"threadId":      "thread-1",
+	})
+	got := mapNotification("mcpServer/startupStatus/updated", params, &mapperState{}, nil)
+	if len(got) != 1 {
+		t.Fatalf("expected one visible MCP startup failure, got %#v", got)
+	}
+	event, ok := got[0].(agent.SystemEvent)
+	if !ok {
+		t.Fatalf("expected SystemEvent, got %T", got[0])
+	}
+	if event.Subtype != "mcp_server_startup_failed" {
+		t.Fatalf("subtype = %q, want mcp_server_startup_failed", event.Subtype)
+	}
+	if !strings.Contains(event.Message, "af-code") || !strings.Contains(event.Message, "reauthenticationRequired") {
+		t.Fatalf("failure message omitted bounded server/reason detail: %q", event.Message)
+	}
+	if strings.Contains(event.Message, rawError) {
+		t.Fatalf("failure message leaked raw MCP error text: %q", event.Message)
+	}
+}
+
+func TestMapItem_UserMessageEchoDropped(t *testing.T) {
+	t.Parallel()
+	params := mustJSON(t, map[string]any{
+		"item": map[string]any{
+			"id":      "user-1",
+			"type":    "userMessage",
+			"content": []map[string]any{{"type": "text", "text": "already-known input"}},
+		},
+	})
+	for _, method := range []string{"item/started", "item/completed"} {
+		if got := mapNotification(method, params, &mapperState{}, nil); len(got) != 0 {
+			t.Fatalf("%s: expected user-message echo to be dropped, got %#v", method, got)
+		}
+	}
+}
+
 func TestMapItem_CommandExecutionStartedAndCompleted(t *testing.T) {
 	t.Parallel()
 	startedParams := mustJSON(t, map[string]any{

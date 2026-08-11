@@ -235,7 +235,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if agentBin == "" {
 		agentBin = "donmai"
 	}
-	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(opencodeCtorHints(detail)), agentBin)
+	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(agentRunHints(detail)), agentBin)
 	logger.Info("agent run: registry built", "providers", reg.Names())
 	defer func() {
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -601,11 +601,11 @@ type providerCtor struct {
 
 // BuildAgentRunRegistry constructs the runner.Registry of the providers
 // compiled into this binary — the SINGLE SOURCE for the agent-run provider
-// set. It is the public, importable entry point downstream Go binaries (e.g.
-// the closed-source `rensei` TUI) call so they do NOT have to fork the
-// hand-authored ctor list; calling this builder keeps every embedder on the
-// exact same eight providers donmai resolves, eliminating the documented
-// fork-rot between donmai and rensei-tui.
+// set. It is the public, importable entry point downstream Go binaries call so
+// they do NOT have to fork the hand-authored ctor list; calling this builder
+// keeps every embedder on the exact same eight providers donmai resolves,
+// eliminating constructor-list drift between donmai and downstream CLI
+// consumers.
 //
 // Stub is always registered; the others register on best-effort (their probes
 // return errors when the underlying CLI / app-server / API key is missing — we
@@ -658,6 +658,46 @@ type agentRunCtorHints struct {
 	// CLI default. Derived by opencodeCtorHints from
 	// ResolvedProfile.ProviderConfig[opencodeCtorHintKey] — see there.
 	PreferOpenCodeServer bool
+
+	// CodexHostSessionAuth tells the codex ctor to project the host's existing
+	// CLI login into its isolated config home. It is true only when this exact
+	// session selected the codex provider and resolved authMode=host-session.
+	CodexHostSessionAuth bool
+}
+
+// agentRunHints collects every per-session constructor signal in one pass.
+// BuildAgentRunRegistry deliberately does not call this: its zero-context
+// introspection registry must retain the historical zero-value behavior.
+func agentRunHints(d *daemon.SessionDetail) agentRunCtorHints {
+	h := opencodeCtorHints(d)
+	h.CodexHostSessionAuth = codexHostSessionCtorHint(d)
+	return h
+}
+
+func codexHostSessionCtorHint(d *daemon.SessionDetail) bool {
+	if d == nil || d.ResolvedProfile == nil ||
+		d.ResolvedProfile.AuthMode != string(agent.AuthHostSession) {
+		return false
+	}
+
+	// Mirror the runner's authoritative selector order without using
+	// providerNameFromDetail: that helper is display-only and deliberately
+	// falls through an unknown explicit harness to the legacy provider. Secret
+	// projection must instead fail closed whenever explicit harness intent is
+	// not exactly Codex.
+	if d.ModelProfile != nil {
+		if d.ModelProfile.Harness != "" {
+			return d.ModelProfile.Harness == string(agent.HarnessCodex)
+		}
+		return d.ModelProfile.ProviderID == string(agent.ProviderCodex)
+	}
+	if d.ResolvedProfile.Harness != "" {
+		return d.ResolvedProfile.Harness == string(agent.HarnessCodex)
+	}
+	if d.ResolvedProfile.Provider != "" {
+		return d.ResolvedProfile.Provider == string(agent.ProviderCodex)
+	}
+	return d.ResolvedProfile.Runner == string(agent.ProviderCodex)
 }
 
 // opencodeCtorHintKey is the typed ResolvedProfile.ProviderConfig knob that
@@ -699,6 +739,10 @@ func opencodeCtorOptions(h agentRunCtorHints) provideropencode.Options {
 	return provideropencode.Options{PreferServer: h.PreferOpenCodeServer}
 }
 
+func codexCtorOptions(h agentRunCtorHints) providercodex.Options {
+	return providercodex.Options{HostSessionAuth: h.CodexHostSessionAuth}
+}
+
 // agentRunProviderCtors returns the single hand-authored ctor list — the SoT
 // for the agent-run provider set. Pulled into its own function (returning a
 // fresh slice on each call) so [BuildAgentRunRegistry] and the no-behavior-
@@ -721,7 +765,7 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 	return []providerCtor{
 		{name: "stub", new: func() (agent.Provider, error) { return providerstub.New() }},
 		{name: "claude", new: func() (agent.Provider, error) { return providerclaude.New(providerclaude.Options{}) }},
-		{name: "codex", new: func() (agent.Provider, error) { return providercodex.New(providercodex.Options{}) }},
+		{name: "codex", new: func() (agent.Provider, error) { return providercodex.New(codexCtorOptions(h)) }},
 		// Ollama is local-first: probe is a quick GET /api/tags against
 		// http://localhost:11434. If `ollama serve` is not running on
 		// this host the probe wraps agent.ErrProviderUnavailable and
