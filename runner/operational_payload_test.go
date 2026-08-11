@@ -99,6 +99,11 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 		// per spawn and they must stay OUT of the canonical projection, which
 		// is digested and compared across the wire.
 		"McpAuthToken": "daemon-runtime", "McpAuthTokenExpiresAt": "daemon-runtime",
+		// RetainRecording is a LOCAL OPERATOR decision (the standalone
+		// --keep-recording flag) with json:"-" — it never rides the wire and
+		// must never influence admission evidence, so it stays out of the
+		// canonical projection alongside the other daemon-runtime annotations.
+		"RetainRecording": "daemon-runtime",
 	}
 	typeOfQueuedWork := reflect.TypeOf(QueuedWork{})
 	for index := 0; index < typeOfQueuedWork.NumField(); index++ {

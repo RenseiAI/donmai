@@ -103,6 +103,17 @@ type QueuedWork struct {
 	// capability is false, which is the mixed-version-safe default (an older
 	// daemon that does not advertise capabilities keeps the prior behaviour).
 	Capabilities map[string]bool `json:"capabilities,omitempty"`
+
+	// RetainRecording suppresses the runner's end-of-session best-effort
+	// deletion of an interactive session's on-disk asciinema-v2 cast. This is
+	// a LOCAL OPERATOR decision only — it never rides the wire (json:"-") and
+	// has no platform-side counterpart: QueuedWork.RecordingEnabled decides
+	// whether the cast is written at all, while this field decides only
+	// whether a standalone `donmai agent run --keep-recording` invocation
+	// keeps the file the session already wrote. A platform-dispatched session
+	// always gets cleanup regardless of this field — see
+	// interactive_loop.go's dispatchInteractive.
+	RetainRecording bool `json:"-"`
 }
 
 // Capability keys advertised by the daemon on QueuedWork.Capabilities. Kept as

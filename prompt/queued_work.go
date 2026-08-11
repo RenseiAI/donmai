@@ -276,6 +276,21 @@ type QueuedWork struct {
 	// no-op and preserves the pre-field wire shape.
 	InitialPrompt string `json:"initialPrompt,omitempty"`
 
+	// RecordingEnabled is the platform's host-side recording policy decision
+	// for an interactive (Mode == InteractiveRunMode) session. nil/absent =
+	// no platform decision (standalone run, or a platform older than this
+	// field) — the runner defaults to allowed, matching every other opaque
+	// forwarder's mixed-version-safe default. Explicit false disables the
+	// on-disk asciinema-v2 cast for the session (the PTY surface itself is
+	// unaffected — only the recorder's RecordPath is gated); explicit true
+	// allows it. Platform-dispatched sessions always get end-of-session
+	// cleanup of the cast regardless of this value; the separate, local-
+	// operator-only decision to keep the file is runner.QueuedWork's
+	// RetainRecording field, which never rides the wire.
+	//
+	// Wire shape: "recordingEnabled" (camelCase, omitempty).
+	RecordingEnabled *bool `json:"recordingEnabled,omitempty"`
+
 	// InterviewBudget is the per-interview runtime budget the runner
 	// enforces when Mode="interview". nil = no caps. Carried through
 	// every wire hop so the strict JSON decoder never drops it.

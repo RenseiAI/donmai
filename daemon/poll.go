@@ -225,6 +225,16 @@ type PollWorkItem struct {
 	// omitted and preserves the pre-field wire shape.
 	InitialPrompt string `json:"initialPrompt,omitempty"`
 
+	// RecordingEnabled is the platform's host-side recording policy decision
+	// for a mode:"interactive" session. nil/absent means the platform made no
+	// decision (a standalone run, or a platform that predates this field) —
+	// the runner defaults to allowed, the same mixed-version-safe default as
+	// every other opaque forwarder here. Explicit false disables the on-disk
+	// asciinema-v2 cast for the session; explicit true allows it. The daemon
+	// does not interpret this value — opaque forwarder only (same pattern as
+	// Mode / InitialPrompt / MemoryBlock).
+	RecordingEnabled *bool `json:"recordingEnabled,omitempty"`
+
 	// TerminalWorkareaLease is the optional provider-neutral request to retain a
 	// successful terminal workarea until semantic acknowledgement or bounded
 	// expiry. Nil preserves the legacy immediate-teardown behavior.
@@ -1364,6 +1374,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		MemoryBlock:             item.MemoryBlock,
 		Mode:                    item.Mode,
 		InitialPrompt:           item.InitialPrompt,
+		RecordingEnabled:        item.RecordingEnabled,
 		TerminalWorkareaLease:   item.TerminalWorkareaLease,
 		InterviewBudget:         item.InterviewBudget,
 		InterviewDefinition:     item.InterviewDefinition,
