@@ -40,10 +40,33 @@
 //     (Resume → reattach), AcceptsAllowedToolsList, and independently
 //     AcceptsMcpServerSpec through the §5.3 project config path.
 //
-// Lane selection follows lifecycle needs: binary-backed Spawn uses Lane A,
-// including endpoint, permission, and MCP inputs delivered by its owned config.
-// An explicit Options.PreferServer or attach mode uses Lane B; Resume always
-// uses Lane B because it needs the server API.
+// Lane selection follows lifecycle needs (useServerLane, opencode.go):
+// binary-backed Spawn uses Lane A by default, including endpoint, permission,
+// and MCP inputs delivered by its owned config. Lane B is selected instead —
+// even with a binary present — by attach mode (no binary), an explicit
+// Options.PreferServer, or a positive need signal Lane A's exited-with-the-
+// turn process structurally cannot satisfy: an MCP-bearing spec
+// (Spec.MCPServers), a non-allow permission default
+// (Spec.PermissionConfig.DefaultDecision "deny"/"prompt" — Lane A has no
+// channel to answer a live "ask"), or a steer-capable requirement
+// (Spec.RequiresLiveNotice, which admission already accepted against this
+// manifest's declared NoticeDeliveryHTTPSession — only Lane B backs it).
+// Resume always uses Lane B because it needs the server API.
+//
+// The opencode.preferServer producer contract: Options.PreferServer is
+// wired at construction time by whatever composes this package (donmai's own
+// `agent run` entry point threads it from a fetched session's
+// ResolvedProfile.ProviderConfig["opencode.preferServer"], a bool-typed,
+// provider-namespaced key on the generic map[string]any wire shape shared by
+// every provider's ctor hints — see afcli/agent_run.go's opencodeCtorHintKey/
+// opencodeCtorHints/opencodeCtorOptions for the concrete donmai-side
+// consumer). This package places NO requirement on who sets that key or how
+// a session's resolved profile is produced; a missing key, a non-bool value,
+// or a nil profile all resolve to the zero value (Lane-A default, unchanged
+// behavior) rather than an error — an optional routing hint must never fail
+// preflight. Callers that need Lane B unconditionally (tests, an operator
+// override) should still prefer the positive need signals above over forcing
+// PreferServer, so the routing decision stays legible from the Spec alone.
 //
 // DRIFT (code wins over 07 §4/§4.2/§5): the pinned binary (opencode 1.17.18)
 // already ships the v2-style API — every route under /api/, session-scoped,
