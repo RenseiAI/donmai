@@ -208,6 +208,18 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		})
 	}
 
+	// Typed pre-spawn denial for Spec fields this provider cannot honor: named
+	// on the event stream, before the turn is dispatched, rather than the
+	// silent drop agent.Spec's own doc comment concedes ("unsupported fields
+	// are silently ignored"). Today's only entry is CodeIntelEnforcement; see
+	// codeIntelEnforcementNote.
+	if note := codeIntelEnforcementNote(spec); note != nil {
+		h.emit(agent.SystemEvent{
+			Subtype: codeIntelEnforcementUnsupportedSubtype,
+			Message: note.Reason,
+		})
+	}
+
 	// Resolve the session id (agent_start carries none in the real protocol),
 	// then bring up the turn. The model + reasoning effort are pinned on the
 	// CLI at startup (rpcArgs: --provider donmai --model <id>[:<thinking>]), NOT

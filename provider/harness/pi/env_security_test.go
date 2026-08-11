@@ -41,6 +41,32 @@ func TestEnvHygiene_BlocklistedHostSecretNeverLeaks(t *testing.T) {
 	}
 }
 
+// TestConfigHomeIsolation_AllHomeVarsRedirected is the "config-home
+// isolation" fixture (ADR-2026-08-06 D8, pi row): composeChildEnv redirects
+// FOUR candidate home vars into the session dir (PI_HOME, PI_CONFIG_DIR,
+// PI_STATE_DIR, XDG_CONFIG_HOME — the exact pi home var is unverified against
+// a real binary per doc.go, so all four are set), and the redirect must win
+// over whatever a fleet box's own shell profile set, not merely be present
+// alongside it. TestEnvHygiene_BlocklistedHostSecretNeverLeaks above checks
+// PI_HOME alone; this fixture is the complete one across all four candidates,
+// each proven to override a host value.
+func TestConfigHomeIsolation_AllHomeVarsRedirected(t *testing.T) {
+	// Not parallel: mutates process env.
+	t.Setenv("PI_HOME", "/home/fleetuser/.pi")
+	t.Setenv("PI_CONFIG_DIR", "/home/fleetuser/.config/pi")
+	t.Setenv("PI_STATE_DIR", "/home/fleetuser/.local/state/pi")
+	t.Setenv("XDG_CONFIG_HOME", "/home/fleetuser/.config")
+
+	layout := newSessionLayout(t.TempDir())
+	env := composeChildEnv(agent.Spec{Cwd: t.TempDir()}, layout, "sess-token")
+
+	for _, key := range []string{"PI_HOME", "PI_CONFIG_DIR", "PI_STATE_DIR", "XDG_CONFIG_HOME"} {
+		if !hasEnvVal(env, key, layout.root) {
+			t.Errorf("%s not redirected to the session state dir %q; a fleet box's personal pi home could leak in", key, layout.root)
+		}
+	}
+}
+
 // TestEnvHygiene_ResolvedCellKeyRides confirms the resolved cell's key still
 // reaches the child via Spec.Env (trusted layer) even though the same key name
 // is blocklisted from the host env — the cell must be able to authenticate.
