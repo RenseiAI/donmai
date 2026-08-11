@@ -47,8 +47,25 @@ WT_NAME="${1:?Usage: create-worktree.sh <name>}"
 # exact-match check below spuriously miss real matches whenever this repo (or
 # a tmp sandbox exercising this script) sits under a symlinked path.
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-REPO_NAME="$(basename "$REPO_ROOT")"
-WT_ROOT="$(dirname "$REPO_ROOT")/${REPO_NAME}.wt"
+
+# Derive the worktree root from the PRIMARY checkout, not from whatever checkout
+# this copy of the script happens to live in.
+#
+# Every worktree gets a full copy of scripts/, so running
+# ../donmai.wt/foo/scripts/create-worktree.sh bar made REPO_NAME "foo" and
+# WT_ROOT "donmai.wt/foo.wt" — a worktree nested inside a worktree, one level
+# deeper on each hop. `--git-common-dir` resolves to the main repo's .git even
+# when invoked from a worktree, so PRIMARY_ROOT is the real checkout either way
+# and every worktree lands as a sibling in ONE donmai.wt/.
+GIT_COMMON="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null || echo "")"
+case "$GIT_COMMON" in
+  "") PRIMARY_ROOT="$REPO_ROOT" ;;
+  /*) PRIMARY_ROOT="$(cd "$GIT_COMMON/.." && pwd -P)" ;;
+  *)  PRIMARY_ROOT="$(cd "$REPO_ROOT/$GIT_COMMON/.." && pwd -P)" ;;
+esac
+
+REPO_NAME="$(basename "$PRIMARY_ROOT")"
+WT_ROOT="$(dirname "$PRIMARY_ROOT")/${REPO_NAME}.wt"
 WT_PATH="$WT_ROOT/$WT_NAME"
 BRANCH="worktree-${WT_NAME}"
 
@@ -59,6 +76,19 @@ err() { printf '%s\n' "$*" >&2; }
 if [ -x "$REPO_ROOT/scripts/install-git-hooks.sh" ]; then
   "$REPO_ROOT/scripts/install-git-hooks.sh" || true
 fi
+
+# Belt-and-braces on the resolution above: never place a worktree inside the
+# repo. Nested checkouts get swept into build-tool globs — on 2026-08-03 that
+# turned a sibling repo's type-check into an OOM SIGABRT. With PRIMARY_ROOT
+# resolved this cannot trigger on a normal run, so if it ever fires the
+# resolution itself is wrong.
+case "$WT_ROOT/" in
+  "$PRIMARY_ROOT"/*)
+    err "REFUSED: worktree root ($WT_ROOT) resolves INSIDE the repo ($PRIMARY_ROOT)."
+    err "  Nested worktrees break build tooling. This indicates the primary-root"
+    err "  resolution failed — report it rather than working around it."
+    exit 1 ;;
+esac
 
 mkdir -p "$WT_ROOT"
 
