@@ -1,6 +1,12 @@
 package agent
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/url"
+	"strings"
+)
 
 // This file declares Family B — the model-endpoint family — for the two-axis
 // provider model (Phase 1). ModelEndpointProvider is a brand-new interface
@@ -153,6 +159,83 @@ type EndpointBinding struct {
 // Spawn read sites to decide between Spec.Model and Endpoint.Model.
 func (b EndpointBinding) IsZero() bool {
 	return b.Company == "" && b.Model == "" && b.Protocol == "" && b.Mechanism == ""
+}
+
+// EndpointBindingDenialCode classifies why an inbound EndpointBinding field
+// was rejected before it could reach the runner's Spec.
+type EndpointBindingDenialCode string
+
+// EndpointBindingDenialMalformedBaseURL identifies a BaseURL that failed the
+// dispatch-wire boundary's fail-closed shape check: it does not parse as an
+// absolute http(s) URL with a host, carries userinfo, or serves a
+// non-loopback host over plain http.
+const EndpointBindingDenialMalformedBaseURL EndpointBindingDenialCode = "malformed_base_url"
+
+// EndpointBindingError identifies a malformed EndpointBinding field rejected
+// at the dispatch-wire boundary. It deliberately carries no field value —
+// mirroring SpecAdmissionError, endpoint data must not leak through a
+// rejection.
+type EndpointBindingError struct {
+	Code   EndpointBindingDenialCode
+	Field  string
+	Detail string
+}
+
+func (e *EndpointBindingError) Error() string {
+	return fmt.Sprintf("endpoint binding rejected (%s, field=%s): %s", e.Code, e.Field, e.Detail)
+}
+
+// ValidateEndpointBindingBaseURL applies the fail-closed shape check the
+// dispatch-wire boundary requires for EndpointBinding.BaseURL / the daemon
+// wire's mirrored SessionEndpointBinding.BaseURL: when present, it MUST be an
+// absolute http(s) URL with a host and no userinfo, and non-loopback hosts
+// MUST be https. An empty BaseURL is valid — the field is additive/omitempty,
+// and absence means "no override", the prior (pre-baseUrl) behavior.
+// Malformed input is rejected here, never silently stripped, so a bad
+// dispatch fails loudly before it reaches the runner's Spec.
+//
+// This is independent of, and does not replace, the narrower per-harness
+// loopback-only rule a harness's own applyEndpoint may enforce for a
+// Host: gateway binding (e.g. pi's provider/harness/pi/spec_translation.go) —
+// that rule stays in force for that case; this check runs earlier, for every
+// BaseURL regardless of Host.
+func ValidateEndpointBindingBaseURL(baseURL string) error {
+	if baseURL == "" {
+		return nil
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		return &EndpointBindingError{
+			Code:   EndpointBindingDenialMalformedBaseURL,
+			Field:  "baseUrl",
+			Detail: "must be an absolute URL with a host",
+		}
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return &EndpointBindingError{
+			Code:   EndpointBindingDenialMalformedBaseURL,
+			Field:  "baseUrl",
+			Detail: "scheme must be http or https",
+		}
+	}
+	if u.User != nil {
+		return &EndpointBindingError{
+			Code:   EndpointBindingDenialMalformedBaseURL,
+			Field:  "baseUrl",
+			Detail: "must not carry userinfo",
+		}
+	}
+	hostname := u.Hostname()
+	loopback := strings.EqualFold(hostname, "localhost") || net.ParseIP(hostname).IsLoopback()
+	if !loopback && scheme != "https" {
+		return &EndpointBindingError{
+			Code:   EndpointBindingDenialMalformedBaseURL,
+			Field:  "baseUrl",
+			Detail: "non-loopback host must use https",
+		}
+	}
+	return nil
 }
 
 // ModelEndpointProvider — Family B. Declare + resolve. No existing

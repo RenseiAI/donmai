@@ -38,8 +38,10 @@ func TestDetailToQueuedWork_CarriesSessionMCPBearer(t *testing.T) {
 				OperationalPayload:    tc.operationalPayload,
 				ResolvedProfile:       &daemon.SessionResolvedProfile{Provider: "stub"},
 			}
-			qw := detailToQueuedWork(d)
-
+			qw, err := detailToQueuedWork(d)
+			if err != nil {
+				t.Fatalf("detailToQueuedWork: %v", err)
+			}
 			if qw.McpAuthToken != sessionBearer {
 				t.Errorf("McpAuthToken = %q, want %q", qw.McpAuthToken, sessionBearer)
 			}
@@ -63,7 +65,10 @@ func TestDetailToQueuedWork_SessionMCPBearerAbsent(t *testing.T) {
 		AuthToken:       "worker-runtime-bearer",
 		ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
 	}
-	qw := detailToQueuedWork(d)
+	qw, err := detailToQueuedWork(d)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
 	if qw.McpAuthToken != "" || qw.McpAuthTokenExpiresAt != "" {
 		t.Errorf("want both empty when the platform stamps none; got %q / %q",
 			qw.McpAuthToken, qw.McpAuthTokenExpiresAt)
