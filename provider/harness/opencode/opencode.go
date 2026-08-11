@@ -413,14 +413,48 @@ func (p *Provider) validateLaunchAuthority(spec agent.Spec) error {
 
 // useServerLane decides Lane B vs Lane A. The pinned binary's v2 server can
 // list custom OpenAI-compatible models but its SessionRunner cannot resolve
-// them, while `opencode run` executes the same owned config successfully.
-// Project-config-bearing one-shot work therefore stays on Lane A; only an
-// explicit server request or attach-only provider selects Lane B.
-func (p *Provider) useServerLane(_ agent.Spec) bool {
+// them, while `opencode run` executes the same owned config successfully —
+// this is why plain one-shot work stays on Lane A by default and why a
+// completed turn against a custom OpenAI-compatible provider is only
+// provable on Lane A at the current pin (see doc.go DRIFT).
+//
+// Lane B is also selected — even with a binary present — by a positive need
+// signal: something the spec requires that Lane A's process cannot deliver
+// because it exits with the turn and has no live channel back into a
+// running session:
+//
+//   - An MCP-bearing spec (Spec.MCPServers non-empty): real MCP delivery
+//     receipts need a live session to attach mount/replay evidence to, not
+//     just the static config projection both lanes already write.
+//   - A non-allow permission default (Spec.PermissionConfig.DefaultDecision
+//     "deny" or "prompt" — see permissionDefaultNeedsLivePump in
+//     permission.go, shared with newPermEngine so the two can never drift):
+//     runtime "ask" verdicts are adjudicated by Lane B's permission pump
+//     (GET/POST /api/permission/...); Lane A's headless process has no
+//     channel to surface or answer one mid-turn.
+//   - A steer-capable requirement (Spec.RequiresLiveNotice): admission
+//     already accepted this Spec against the manifest's declared
+//     NoticeDeliveryHTTPSession (agent/harness.go ValidateSpecCapabilities),
+//     which only Lane B backs (serverHandle.Inject → POST .../prompt,
+//     manifest.go) — Lane A must not silently accept a promise it cannot
+//     keep.
+//
+// Plain one-shot work — none of the above, and no explicit
+// Options.PreferServer — stays on Lane A.
+func (p *Provider) useServerLane(spec agent.Spec) bool {
 	if p.binary == "" {
 		return true // attach mode: only Lane B can serve
 	}
-	return p.preferServer
+	if p.preferServer {
+		return true
+	}
+	if len(spec.MCPServers) > 0 {
+		return true
+	}
+	if permissionDefaultNeedsLivePump(spec.PermissionConfig) {
+		return true
+	}
+	return spec.RequiresLiveNotice
 }
 
 // requiresProjectConfig reports whether a spec carries any input that this

@@ -774,10 +774,14 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		// runner.Resolve with agent.ErrNoProvider — which is the
 		// correct loud failure when the local runtime is missing.
 		{name: "ollama", new: func() (agent.Provider, error) { return providerollama.New(providerollama.Options{}) }},
-		// Amp / OpenCode are registration-only today (no public stable runner
-		// API); the constructor probes env vars / endpoints and warns-and-
-		// skips when missing. Gemini is a full streaming impl against
-		// generativelanguage.googleapis.com.
+		// Amp is registration-only today (no public stable runner API); the
+		// constructor probes env vars / endpoints and warns-and-skips when
+		// missing. OpenCode (registered below) no longer belongs in this
+		// bucket: it ships two real managed-spawn lanes (CLI one-shot,
+		// serve/HTTP with real tool/MCP policy delivery) plus a fail-closed
+		// external-attach posture — see its own ctor comment for how
+		// PreferServer routes between them. Gemini is a full streaming impl
+		// against generativelanguage.googleapis.com.
 		{name: "amp", new: func() (agent.Provider, error) { return provideramp.New(provideramp.Options{}) }},
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
 		// agy-cli is a LOCAL/HOST-SESSION/OAUTH provider wrapping the Antigravity `agy` CLI under a pty.

@@ -270,7 +270,8 @@ func TestProvider_UseServerLane_ProjectConfigFieldsUseConfiguredCLI(t *testing.T
 		{"disallowed tools", agent.Spec{DisallowedTools: []string{"Write"}}},
 		{"empty permission config", agent.Spec{PermissionConfig: &agent.PermissionConfig{}}},
 		{"allow permission config", agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "allow"}}},
-		{"mcp servers", agent.Spec{MCPServers: []agent.MCPServerConfig{{Name: "tools", Command: "server"}}}},
+		// MCPServers moved to TestProvider_UseServerLane_PositiveNeedSignals:
+		// it is now a positive Lane-B need signal, not a Lane-A case.
 		{"mcp tool names", agent.Spec{MCPToolNames: []string{"mcp__tools__read"}}},
 	}
 	for _, tt := range tests {
@@ -286,11 +287,58 @@ func TestProvider_UseServerLane_ProjectConfigFieldsUseConfiguredCLI(t *testing.T
 	}
 }
 
+// TestProvider_UseServerLane_PositiveNeedSignals covers the three positive
+// need signals: an MCP-bearing spec, a non-allow permission default, and a
+// steer-capable requirement all select Lane B even though a binary is
+// present and Options.PreferServer is unset — because Lane A's one-shot
+// process exits with the turn and has no live channel to satisfy any of the
+// three (see useServerLane's doc comment, opencode.go).
+func TestProvider_UseServerLane_PositiveNeedSignals(t *testing.T) {
+	t.Parallel()
+	p := &Provider{binary: "/tmp/opencode"}
+	tests := []struct {
+		name string
+		spec agent.Spec
+	}{
+		{"mcp servers", agent.Spec{MCPServers: []agent.MCPServerConfig{{Name: "tools", Command: "server"}}}},
+		{"permission default deny", agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "deny"}}},
+		{"permission default Deny mixed case", agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "Deny"}}},
+		{"permission default prompt", agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "prompt"}}},
+		{"requires live notice", agent.Spec{RequiresLiveNotice: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if !p.useServerLane(tt.spec) {
+				t.Fatalf("%s: want Lane B (positive need signal), stayed on Lane A", tt.name)
+			}
+		})
+	}
+}
+
+// TestProvider_UseServerLane_PreferServerOverridesPlainOneShot pins the
+// pre-existing explicit-request path (Options.PreferServer) as distinct from
+// the newer positive-need-signal paths above: it alone forces Lane B even
+// for a spec with none of the three signals.
+func TestProvider_UseServerLane_PreferServerOverridesPlainOneShot(t *testing.T) {
+	t.Parallel()
+	p := &Provider{binary: "/tmp/opencode", preferServer: true}
+	if !p.useServerLane(agent.Spec{Prompt: "plain one-shot", Model: "provider/model"}) {
+		t.Fatal("PreferServer: want Lane B even for a plain one-shot spec")
+	}
+}
+
 func TestProvider_ConfiguredCLIOwnsAndCleansProjectConfig(t *testing.T) {
 	bin := writeFakeOpenCodeScript(t)
 	configRoot := t.TempDir()
 	p := &Provider{binary: bin, configTempDir: configRoot}
-	h, err := p.Spawn(t.Context(), agent.Spec{
+	// spawnCLI directly, not Spawn: this test is about the CLI lane's owned-
+	// config lifecycle (mode/perms/cleanup), not lane selection — and the
+	// spec below is MCP-bearing, which useServerLane now routes to Lane B
+	// (a positive need signal). Going through spawnCLI keeps this test
+	// exercising Lane A's config boundary regardless of which lane a real
+	// Spawn call with this spec would choose.
+	cliHandle, err := p.spawnCLI(t.Context(), agent.Spec{
 		Prompt:          "configured one-shot",
 		Cwd:             t.TempDir(),
 		Autonomous:      true,
@@ -306,11 +354,7 @@ func TestProvider_ConfiguredCLIOwnsAndCleansProjectConfig(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-	cliHandle, ok := h.(*openCodeHandle)
-	if !ok {
-		t.Fatalf("Spawn handle = %T, want *openCodeHandle", h)
+		t.Fatalf("spawnCLI: %v", err)
 	}
 	configuredPath := ""
 	for _, entry := range cliHandle.cmd.Env {
@@ -337,7 +381,7 @@ func TestProvider_ConfiguredCLIOwnsAndCleansProjectConfig(t *testing.T) {
 	if got := parentInfo.Mode().Perm(); got != openCodeHomeMode {
 		t.Fatalf("owned config boundary mode = %04o, want %04o", got, openCodeHomeMode)
 	}
-	if err := h.Stop(t.Context()); err != nil {
+	if err := cliHandle.Stop(t.Context()); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	if _, err := os.Stat(parent); !os.IsNotExist(err) {
