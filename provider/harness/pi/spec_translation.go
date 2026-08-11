@@ -88,17 +88,7 @@ func rpcArgs(layout sessionLayout, mode launchMode, sessionID string, spec agent
 		"--approve",
 		"--session-dir", layout.root,
 	}
-	if spec.Model != "" {
-		modelArg := spec.Model
-		if lvl := thinkingLevelForEffort(spec.Effort); lvl != "" {
-			modelArg += ":" + lvl
-		}
-		if spec.Endpoint != nil && spec.Endpoint.BaseURL != "" {
-			args = append(args, "--provider", pinnedProviderName, "--model", modelArg)
-		} else {
-			args = append(args, "--model", modelArg)
-		}
-	}
+	args = append(args, modelPinArgs(spec)...)
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--append-system-prompt", spec.SystemPromptAppend)
 	}
@@ -106,6 +96,32 @@ func rpcArgs(layout sessionLayout, mode launchMode, sessionID string, spec agent
 		args = append(args, "--session", sessionID)
 	}
 	return args
+}
+
+// modelPinArgs builds the `--model` / `--provider donmai --model` pin shared by
+// the headless RPC lane (rpcArgs) and the interactive PTY lane (interactive.go
+// interactiveArgs), so both spawn modes select the resolved cell's model — and,
+// when the cell binds an endpoint, ONLY that endpoint — through one code path.
+//
+// The provider pin fires iff the endpoint binding names a BaseURL: the embedded
+// policy extension registers the single "donmai" provider from env only when a
+// baseURL is present (extensions/donmai-policy.ts), so `--provider donmai` is
+// resolvable exactly in that case. An unbound session passes plain `--model` and
+// lets pi resolve the provider from its own config. Empty Spec.Model emits
+// nothing, leaving pi on its own default. The reasoning-effort suffix mirrors
+// pi's `--model <id>[:<thinking>]` grammar.
+func modelPinArgs(spec agent.Spec) []string {
+	if spec.Model == "" {
+		return nil
+	}
+	modelArg := spec.Model
+	if lvl := thinkingLevelForEffort(spec.Effort); lvl != "" {
+		modelArg += ":" + lvl
+	}
+	if spec.Endpoint != nil && spec.Endpoint.BaseURL != "" {
+		return []string{"--provider", pinnedProviderName, "--model", modelArg}
+	}
+	return []string{"--model", modelArg}
 }
 
 // pinnedProviderName is the provider name the policy extension registers from

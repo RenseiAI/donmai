@@ -111,6 +111,9 @@ const (
 	PromptDeliveryPiSystemAppend PromptDeliveryKind = "pi_cli_append_system_prompt"
 	// PromptDeliveryPiRPCPrompt uses pi's RPC prompt message.
 	PromptDeliveryPiRPCPrompt PromptDeliveryKind = "pi_rpc_prompt"
+	// PromptDeliveryPiPTYSeed seeds pi's interactive TUI via its positional
+	// prompt argument (the bare `pi` spawn mode has no RPC prompt frame).
+	PromptDeliveryPiPTYSeed PromptDeliveryKind = "pi_cli_pty_seed"
 	// PromptDeliveryShellPTYSeed uses the shell PTY seed.
 	PromptDeliveryShellPTYSeed PromptDeliveryKind = "shell_pty_seed"
 	// PromptDeliveryAuthorizedUserDowngrade records explicit user fallback.
@@ -429,7 +432,7 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 		case PromptDeliveryCodexTurnInput:
 			contextParts = append(contextParts, content.Text)
 			receipt.Entries = append(receipt.Entries, deliveredEntry(content, PromptChannelInitialContext, profile.ContextDelivery))
-		case PromptDeliveryCodexPTYSeed:
+		case PromptDeliveryCodexPTYSeed, PromptDeliveryPiPTYSeed:
 			downgradedPrepend = append(downgradedPrepend, content.Text)
 			receipt.Entries = append(receipt.Entries, deliveredEntry(content, PromptChannelInitialContext, profile.ContextDelivery))
 		case PromptDeliveryUnsupported:
@@ -571,6 +574,7 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 		PromptDeliveryOpenCodePrompt,
 		PromptDeliveryPiSystemAppend,
 		PromptDeliveryPiRPCPrompt,
+		PromptDeliveryPiPTYSeed,
 		PromptDeliveryShellPTYSeed,
 		PromptDeliveryAuthorizedUserDowngrade:
 		return true

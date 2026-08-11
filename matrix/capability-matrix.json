@@ -696,7 +696,7 @@
         "nativeJsonMode": false,
         "toolPermissionFormat": "claude",
         "streamingTransport": "ndjson",
-        "interactivePty": false,
+        "interactivePty": true,
         "noticeDelivery": "rpc-steer",
         "drives": [
           "anthropic-messages",
@@ -734,6 +734,16 @@
           "contextDelivery": "pi_cli_append_system_prompt",
           "userDelivery": "pi_rpc_prompt",
           "amendmentDelivery": "pi_rpc_prompt"
+        },
+        {
+          "id": "pi/interactive/pty-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "pi_cli_append_system_prompt",
+          "baseAppendDelivery": "pi_cli_append_system_prompt",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "pi_cli_pty_seed",
+          "userDelivery": "pi_cli_pty_seed",
+          "amendmentDelivery": "pi_cli_pty_seed"
         }
       ],
       "toolLifecycle": [
@@ -773,6 +783,35 @@
             "error"
           ],
           "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
+        {
+          "id": "pi/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
           "evidenceTier": "unit_verified",
           "productionEligible": false
         }
