@@ -285,12 +285,74 @@ func emitToolLifecycleReceipt(spec Spec, receipt ToolLifecycleReceipt) error {
 }
 
 type toolRequirement struct {
-	id             string
-	channel        ToolLifecycleChannel
-	required       bool
-	delivery       ToolDeliveryKind
-	digest         string
+	id       string
+	channel  ToolLifecycleChannel
+	required bool
+	delivery ToolDeliveryKind
+	digest   string
+	// fallbackDenied blocks the downgrade lane for a requirement no alternate
+	// delivery could satisfy — an authorized downgrade selects a different
+	// boundary, it never invents evidence the exact profile does not declare.
 	fallbackDenied bool
+	// pendingOutcome is the admitted outcome for a requirement whose delivery
+	// boundary is proved pre-spawn but whose evidence only exists at runtime or
+	// cleanup. Pre-spawn channels leave it empty and record `admitted`.
+	pendingOutcome ToolAdaptationOutcome
+}
+
+// admittedOutcome names the receipt outcome for a requirement whose delivery
+// boundary the exact profile declares. Per
+// ADR-2026-08-06-harness-adaptation-plan-and-receipt.md D4, pre-spawn entries
+// must already be terminal, while runtime and cleanup entries are explicitly
+// pending and transition through append-only outcome records.
+func (r toolRequirement) admittedOutcome() ToolAdaptationOutcome {
+	if r.pendingOutcome != "" {
+		return r.pendingOutcome
+	}
+	return ToolOutcomeAdmitted
+}
+
+// runtimeEvidenceRequirement answers one lifecycle or replay requirement
+// against the exact profile's declared surface, per harness rather than per
+// channel. The profile is the executor-attested inventory
+// (ADR-2026-08-08-harness-authority-admission-plane-parked.md D3.2: the
+// attestation derives from the same generated artifact the executor reads), so
+// a harness that declares the event at the demanded fidelity delivers it and
+// one that does not degrades through the contract's named lanes:
+//
+//   - an event the profile never emits cannot be rescued by an alternate
+//     delivery, so the downgrade lane is closed and a required entry denies;
+//   - a fidelity shortfall is exactly what an authorized downgrade names, so the
+//     downgrade lane stays open — a coarse profile never inherits a structured
+//     claim (ADR-2026-08-06 D6) but may still be accepted as coarse when the
+//     caller authorized that alternate before admission.
+func runtimeEvidenceRequirement(requirement LifecycleRequirement, channel ToolLifecycleChannel, delivery ToolDeliveryKind, fidelity EvidenceFidelity, events []EventKind) toolRequirement {
+	out := toolRequirement{
+		id:             requirement.ID,
+		channel:        channel,
+		required:       requirement.Required,
+		delivery:       delivery,
+		digest:         requirementInputDigest(requirement.ParametersDigest, requirement),
+		pendingOutcome: ToolOutcomePendingRuntime,
+	}
+	if !declaresEvent(events, requirement.Event) {
+		out.delivery = ToolDeliveryUnsupported
+		out.fallbackDenied = true
+		return out
+	}
+	if fidelityRank(fidelity) < fidelityRank(requirement.MinimumFidelity) {
+		out.delivery = ToolDeliveryUnsupported
+	}
+	return out
+}
+
+func declaresEvent(events []EventKind, event EventKind) bool {
+	for _, declared := range events {
+		if declared == event {
+			return true
+		}
+	}
+	return false
 }
 
 // AdaptToolLifecycle is the pure pre-spawn compiler.
@@ -331,23 +393,29 @@ func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLife
 	for _, hook := range plan.ToolHooks {
 		requirements = append(requirements, toolRequirement{id: hook.ID, channel: ToolChannelToolHook, required: hook.Required, delivery: profile.ToolHookDelivery, digest: digestToolInput(hook)})
 	}
+	// Lifecycle, replay, and cleanup are runtime and cleanup phase channels:
+	// the pre-spawn compiler proves the exact profile declares the delivery
+	// boundary, and the evidence itself arrives later. Answering them per
+	// harness from the profile — rather than denying every harness alike — is
+	// what keeps the receipt truthful in both directions: a profile that
+	// declares the boundary admits it as pending, and one that does not records
+	// a denied entry naming the channel.
 	for _, lifecycle := range plan.Lifecycle {
-		// The runner does not yet promote admission receipts from actual runtime
-		// events. A declaration alone is not evidence, so demand is denied until
-		// a durable post-runtime verification path exists.
-		requirements = append(requirements, toolRequirement{id: lifecycle.ID, channel: ToolChannelLifecycle, required: lifecycle.Required, delivery: ToolDeliveryUnsupported, digest: requirementInputDigest(lifecycle.ParametersDigest, lifecycle), fallbackDenied: true})
+		requirements = append(requirements, runtimeEvidenceRequirement(lifecycle, ToolChannelLifecycle, profile.LifecycleDelivery, profile.LifecycleFidelity, profile.LifecycleEvents))
 	}
 	if plan.Replay != nil {
-		requirements = append(requirements, toolRequirement{id: plan.Replay.ID, channel: ToolChannelReplay, required: plan.Replay.Required, delivery: ToolDeliveryUnsupported, digest: requirementInputDigest(plan.Replay.ParametersDigest, plan.Replay), fallbackDenied: true})
+		requirements = append(requirements, runtimeEvidenceRequirement(*plan.Replay, ToolChannelReplay, profile.ReplayDelivery, profile.ReplayFidelity, profile.ReplayEvents))
 	}
 	if plan.RequireCleanup {
-		requirements = append(requirements, toolRequirement{id: "cleanup", channel: ToolChannelCleanup, required: true, delivery: ToolDeliveryUnsupported, digest: requirementInputDigest(plan.CleanupParametersDigest, true), fallbackDenied: true})
+		// Cleanup carries no event or fidelity axis: the profile either declares
+		// a teardown boundary for its handles and resources or it does not.
+		requirements = append(requirements, toolRequirement{id: "cleanup", channel: ToolChannelCleanup, required: true, delivery: profile.CleanupDelivery, digest: requirementInputDigest(plan.CleanupParametersDigest, true), pendingOutcome: ToolOutcomePendingCleanup})
 	}
 
 	for _, requirement := range requirements {
 		entry := ToolLifecycleEntry{ID: requirement.id, Channel: requirement.channel, Required: requirement.required, InputDigest: requirement.digest}
 		if requirement.delivery != ToolDeliveryUnsupported {
-			entry.Outcome = ToolOutcomeAdmitted
+			entry.Outcome = requirement.admittedOutcome()
 			entry.Delivery = requirement.delivery
 			receipt.Entries = append(receipt.Entries, entry)
 			continue
