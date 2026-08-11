@@ -466,10 +466,18 @@ func (s *WorkerSpawner) ProjectAdmissionMode() string {
 // SetProjects, so a subsequent yaml-watcher reload that calls SetProjects does
 // NOT evict them.
 //
-// Deduplication is by ProjectConfig.ID and ProjectConfig.Repository — a
-// candidate entry is skipped if an entry with the same ID or the same non-empty
-// Repository already exists in either the base or extra set, preventing
-// double-entries when AddProjects is called repeatedly for the same org.
+// Deduplication is by ProjectConfig.ID and ProjectConfig.Repository: a
+// candidate is skipped when it matches an existing entry's ID and Repository
+// exactly, or when the two share a non-empty Repository AND at least one of
+// them carries no ID (an unattributed repository-only entry always collapses
+// into whatever else already claims that repository). This still prevents
+// double-entries when AddProjects is called repeatedly for the same org's
+// project list.
+//
+// Two entries that share a non-empty Repository but carry DIFFERENT non-empty
+// IDs are NOT deduplicated — both are admitted. A monorepo can host more than
+// one project, and each must load independently so AcceptWork can resolve it
+// by (projectID, repository).
 //
 // The call is safe for concurrent use: it acquires the same mutex that
 // AcceptWork and SetProjects use.
@@ -503,20 +511,29 @@ func (s *WorkerSpawner) AddEnabledProjectIDs(ids []string) {
 
 // isDuplicateLocked reports whether candidate is already represented in either
 // the base or extra project sets. Must be called with s.mu held.
+//
+// A repository-only match (same non-empty Repository, different ID pair) is a
+// duplicate ONLY when the candidate carries no ID, the existing entry carries
+// no ID, or the two IDs are equal. Two entries with distinct non-empty IDs
+// that happen to share a repository — a monorepo hosting more than one
+// project — are NOT duplicates of each other; both must load.
 func (s *WorkerSpawner) isDuplicateLocked(candidate ProjectConfig) bool {
-	for _, existing := range s.opts.Projects {
+	matches := func(existing ProjectConfig) bool {
 		if candidate.ID == existing.ID && candidate.Repository == existing.Repository {
 			return true
 		}
-		if candidate.Repository != "" && candidate.Repository == existing.Repository {
+		if candidate.Repository == "" || candidate.Repository != existing.Repository {
+			return false
+		}
+		return candidate.ID == "" || existing.ID == "" || candidate.ID == existing.ID
+	}
+	for _, existing := range s.opts.Projects {
+		if matches(existing) {
 			return true
 		}
 	}
 	for _, existing := range s.extraProjects {
-		if candidate.ID == existing.ID && candidate.Repository == existing.Repository {
-			return true
-		}
-		if candidate.Repository != "" && candidate.Repository == existing.Repository {
+		if matches(existing) {
 			return true
 		}
 	}
@@ -616,6 +633,14 @@ func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectC
 		}
 		project := s.findProjectForSpecLocked(spec)
 		if project == nil {
+			// Distinguish "this project was never loaded by this spawner" from
+			// "it was loaded, but not for this repository" — conflating the two
+			// under one repository-flavored message sends whoever is debugging
+			// straight at the wrong layer (the repository config) when the real
+			// gap is the project's admission/config entry itself.
+			if !s.hasProjectEntryLocked(spec.ProjectID) {
+				return nil, fmt.Errorf("project %q is not admitted or loaded by this spawner", spec.ProjectID)
+			}
 			if spec.RepositoryID != "" {
 				return nil, fmt.Errorf("repository %q is not configured for project %q", spec.RepositoryID, spec.ProjectID)
 			}
@@ -684,6 +709,23 @@ func (s *WorkerSpawner) findProjectForSpecLocked(spec SessionSpec) *ProjectConfi
 		return project
 	}
 	return find(s.extraProjects)
+}
+
+// hasProjectEntryLocked reports whether any entry with the given project ID
+// exists in either the base or extra project sets, independent of whether its
+// repository matches any particular spec. Must be called with s.mu held.
+func (s *WorkerSpawner) hasProjectEntryLocked(id string) bool {
+	for i := range s.opts.Projects {
+		if s.opts.Projects[i].ID == id {
+			return true
+		}
+	}
+	for i := range s.extraProjects {
+		if s.extraProjects[i].ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // findProjectLocked searches the union of the base project set (opts.Projects)
