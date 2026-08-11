@@ -17,6 +17,40 @@ import (
 // env var into the child process; it is never written to disk.
 const PiKeyEnvVar = "DONMAI_PI_KEY"
 
+// SpecFieldNote names an agent.Spec field the pi provider does not honor and
+// the reason — the codex/spec_translation.go pattern (its ignoredSpecFields):
+// a field the provider cannot deliver is named explicitly rather than
+// silently dropped, so a caller who set it is told instead of left to
+// discover the gap by absence.
+type SpecFieldNote struct {
+	Field  string
+	Reason string
+}
+
+// codeIntelEnforcementUnsupportedSubtype is the SystemEvent.Subtype pi.go
+// emits, once per session and before the turn is dispatched, when
+// Spec.CodeIntelEnforcement is set. See codeIntelEnforcementNote.
+const codeIntelEnforcementUnsupportedSubtype = "code_intel_enforcement_unsupported"
+
+// codeIntelEnforcementNote returns the typed drop note for
+// Spec.CodeIntelEnforcement, or nil when the field is unset. pi has no
+// canUseTool-equivalent callback: the injected policy extension's tool_call
+// hook adjudicates allow/deny against the compiled PermissionConfig, but it
+// has no hook for redirecting a native Grep/Glob call to af_code_* tools
+// first. Every other in-tree harness drops this field the same way (see
+// codex/spec_translation.go's own CodeIntelEnforcement note, and the
+// SupportsCodeIntelligenceEnforcement:false comments on claude/gemini/amp/
+// ollama/opencode/agycli); pi previously dropped it with no note at all.
+func codeIntelEnforcementNote(spec agent.Spec) *SpecFieldNote {
+	if spec.CodeIntelEnforcement == nil {
+		return nil
+	}
+	return &SpecFieldNote{
+		Field:  "CodeIntelEnforcement",
+		Reason: "pi has no canUseTool-equivalent callback; the injected policy extension adjudicates tool_call allow/deny only, not a Grep/Glob af_code_* redirect",
+	}
+}
+
 // rpcArgs is the argv for the headless RPC lane. It loads ONLY the donmai
 // policy extension and nothing else:
 //

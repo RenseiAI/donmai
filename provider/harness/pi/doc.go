@@ -45,8 +45,8 @@
 // # The trust boundary (§5 of the design — load-bearing)
 //
 // pi runs tools with the full permissions of the spawning user and ships NO
-// permission system, no sandbox, no MCP. Any Rensei-side trust boundary must
-// be built and owned entirely by Rensei. This package builds it as an
+// permission system, no sandbox, no MCP. Any trust boundary here must be
+// built and owned entirely by donmai. This package builds it as an
 // in-process policy boundary with three layers, all fail-closed, against pi's
 // REAL extension API (pi.on("tool_call") blocking + ctx.ui round-trips):
 //
@@ -95,6 +95,39 @@
 // runs as the user. OS/sandbox-family enforcement stays the sandbox provider
 // family's job (E2B/container cells), unchanged. Do not mistake this
 // extension for a sandbox.
+//
+// # D8 fixture family
+//
+// ADR-2026-08-06 D8 requires a named positive/negative fixture family per
+// harness. pi's row names: "RPC policy-handshake boundary, config-home
+// isolation, tool registration, no-MCP truth, replay/resume" (plus D8's
+// cross-cutting item 7, cleanup idempotence, which every family owes). Tool
+// registration is out of scope until a registerTool follow-up wires real
+// ToolPluginDelivery (see the Caps.SupportsToolPlugins comment in
+// manifest.go); the rest are proved here:
+//
+//   - RPC policy-handshake boundary (positive + tampered/forged negatives):
+//     handle_test.go — TestSpawn_HandshakeVerified,
+//     TestSpawn_TamperedExtensionFailsClosed, TestSpawn_ForgedTokenFailsClosed,
+//     TestSpawn_NoHandshakeFailsClosed.
+//   - config-home isolation: env_security_test.go —
+//     TestConfigHomeIsolation_AllHomeVarsRedirected (all four PI_*/XDG_*
+//     candidate home vars, not PI_HOME alone).
+//   - no-MCP truth (a required mcp_server channel is denied by name, and the
+//     mcp-tool-names name filter is fatal — not merely recorded — because pi
+//     has no mount boundary to narrow): agent/tool_adaptation_test.go —
+//     TestToolLifecycleMCPServerRequiredDeniesPiByName,
+//     TestToolLifecycleMCPToolNamesFatalWherePiHasNoMountBoundary.
+//   - replay/resume: pi_test.go —
+//     TestResume_DrivesGetEntriesCursorNotAFreshPrompt.
+//   - cleanup idempotence: handle_test.go —
+//     TestStop_IdempotentAfterChannelClose.
+//
+// Each is generated from the exact manifest profile (the delivery kinds and
+// channels above are read off ToolLifecycleProfile / HarnessCaps, not
+// re-typed), and every negative in this list was watched RED before the
+// behavior it pins (or, where the behavior predates this labeling, RED
+// against a deliberately reintroduced regression — see each PR's proof).
 //
 // # Package layout
 //

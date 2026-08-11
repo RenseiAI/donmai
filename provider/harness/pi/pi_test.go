@@ -55,10 +55,15 @@ func TestVersionPin_BelowMinFailsConstruction(t *testing.T) {
 	}
 }
 
-// TestConformance_TerminalContract wires the pi harness into the shared
-// cross-harness conformance suite (ADR-C row 6): a drained pi session must
-// satisfy the terminal-event ordering invariant.
-func TestConformance_TerminalContract(t *testing.T) {
+// TestConformance_EventContract wires the pi harness into the shared
+// cross-harness conformance suite's full composite (ADR-C row 6): a drained
+// pi session must satisfy every pure event-sequence invariant —
+// CheckSingleInit, CheckTerminalContract, and CheckCompleteAssistantTexts —
+// not the terminal-ordering rule alone. The fixture below exercises all
+// three: get_state resolves exactly one InitEvent (first), message_update/
+// message_end buffer into one complete AssistantTextEvent, and agent_settled
+// is the sole terminal event (last).
+func TestConformance_EventContract(t *testing.T) {
 	t.Parallel()
 	body := getStateResponse("ses_conf") +
 		event(map[string]any{"type": "agent_start"}) +
@@ -70,7 +75,61 @@ func TestConformance_TerminalContract(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 	evs := drain(t, h)
-	if err := conformance.CheckTerminalContract(evs); err != nil {
-		t.Errorf("pi session violates the terminal-event contract: %v", err)
+	if err := conformance.CheckEventContract(evs); err != nil {
+		t.Errorf("pi session violates the event contract: %v", err)
 	}
+}
+
+// TestResume_DrivesGetEntriesCursorNotAFreshPrompt is the "replay/resume"
+// fixture (ADR-2026-08-06 D8, pi row): Resume must select the persisted
+// session on the CLI (`--session <id>`, asserted directly against rpcArgs
+// below) and replay from the caller's cursor over `get_entries since=<id>`
+// (design §4) — never a fresh `prompt` command, which would start a new turn
+// instead of continuing the old one. The resumed stream must still satisfy
+// the full event contract (single init, one terminal, closed channel).
+func TestResume_DrivesGetEntriesCursorNotAFreshPrompt(t *testing.T) {
+	t.Parallel()
+
+	const resumeCursor = "ses_original_cursor"
+	layout := sessionLayout{root: "/session", extension: "/session/policy.ts"}
+	if got, want := rpcArgs(layout, launchResume, resumeCursor, agent.Spec{}), "--session"; !argvContains(got, want) {
+		t.Fatalf("rpcArgs(resume) = %#v, want it to include %q", got, want)
+	}
+
+	body := getStateResponse("ses_resumed") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "agent_settled"})
+	cmds, h, err := resumeScripted(t, resumeCursor, agent.Spec{Prompt: "continue"}, handshakeEvent("h1"), body)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	evs := drain(t, h)
+	if err := conformance.CheckEventContract(evs); err != nil {
+		t.Errorf("resumed pi session violates the event contract: %v", err)
+	}
+
+	var sawGetEntries bool
+	for _, cmd := range cmds.commands() {
+		switch cmd["type"] {
+		case "get_entries":
+			sawGetEntries = true
+			if cmd["since"] != resumeCursor {
+				t.Errorf(`get_entries "since" = %v, want the resume cursor %q`, cmd["since"], resumeCursor)
+			}
+		case "prompt":
+			t.Errorf("Resume must not send a fresh prompt command (would start a new turn instead of continuing the old one)")
+		}
+	}
+	if !sawGetEntries {
+		t.Fatalf("Resume never sent get_entries; the replay cursor was never driven onto the wire")
+	}
+}
+
+func argvContains(argv []string, want string) bool {
+	for _, a := range argv {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }

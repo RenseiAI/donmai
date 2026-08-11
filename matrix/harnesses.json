@@ -687,7 +687,7 @@
       "capabilities": {
         "inject": true,
         "resume": true,
-        "tools": true,
+        "tools": false,
         "mcp": false,
         "allowedToolsList": true,
         "subagents": false,
