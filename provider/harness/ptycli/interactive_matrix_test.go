@@ -1,7 +1,7 @@
 // Package ptycli_test is the registry-driven cross-harness interactive
 // spawn-mode test (W4 deliverable 5). It lives here — outside package
 // ptycli, as an external test package — because it needs to import every
-// interactive-capable harness (claude, codex, shell) to exercise their own
+// interactive-capable harness (claude, codex, shell, pi) to exercise their own
 // production Spawn/SpawnInteractive call sites, while ptycli itself (the
 // shared driver those harnesses route through) never imports any of them.
 // This creates no import cycle: matrix and the harness packages already
@@ -24,6 +24,7 @@ import (
 	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
+	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/provider/harness/shell"
 )
 
@@ -136,6 +137,20 @@ func spawnTable() map[agent.HarnessName]spawnFn {
 			p, err := shell.New()
 			if err != nil {
 				t.Fatalf("shell.New: %v", err)
+			}
+			return p.Spawn(context.Background(), spec)
+		},
+		agent.HarnessPi: func(t *testing.T, bin string, spec agent.Spec) (agent.Handle, error) {
+			// Point pi at the fake shim via PiBin and stub the version probe
+			// (the shim is not a real pi, so `--version` would not satisfy the
+			// pin). pi.Spawn routes Spec.Interactive to its own spawnInteractive,
+			// which drives this same shared ptycli driver.
+			p, err := pi.New(pi.Options{
+				PiBin:        bin,
+				VersionProbe: func(context.Context, string) (string, error) { return pi.PinnedVersion, nil },
+			})
+			if err != nil {
+				t.Fatalf("pi.New(fake): %v", err)
 			}
 			return p.Spawn(context.Background(), spec)
 		},
