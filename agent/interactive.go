@@ -46,7 +46,10 @@ type InteractiveSpec struct {
 
 	// RecordPath is the asciinema-v2 cast destination. Empty disables
 	// the parallel recording (spec § 16; the cast and the wire share
-	// the process-spawn rel_time anchor).
+	// the process-spawn rel_time anchor). The cast is sanitized, not a
+	// byte-exact copy of the wire: its output events pass through the
+	// recorder's own §9 escape-sequence sanitizer before being written,
+	// since the cast is a persistent artifact rather than a live stream.
 	RecordPath string `json:"recordPath,omitempty"`
 
 	// RingBytes bounds the host output-frame ring buffer. Zero falls

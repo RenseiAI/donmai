@@ -23,6 +23,7 @@ import (
 	"github.com/RenseiAI/donmai/attachclient/attachtest"
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 	"github.com/RenseiAI/donmai/provider/harness/shell"
 	"github.com/RenseiAI/donmai/ptyhost"
@@ -653,6 +654,164 @@ func TestInteractive_LocalOnlyCompletes(t *testing.T) {
 	}
 	if out.Status != "completed" {
 		t.Fatalf("status=%q error=%q; want completed", out.Status, out.Error)
+	}
+}
+
+// boolPtr returns a pointer to b, for constructing the *bool
+// RecordingEnabled wire value in table-driven tests.
+func boolPtr(b bool) *bool { return &b }
+
+// TestRun_InteractiveRecordPathGatedByRecordingEnabled proves the runner's
+// spec-construction step (runner/loop.go) gates
+// agent.InteractiveSpec.RecordPath on QueuedWork.RecordingEnabled: nil
+// (absent, standalone or a pre-field platform) and explicit true both leave
+// the cast destination populated (the mixed-version-safe default is
+// "allowed"); explicit false leaves it empty so ptyhost's recorder becomes a
+// no-op (see newRecorder) while the interactive PTY surface itself
+// (Spec.Interactive) is still constructed either way — recording is gated,
+// the terminal is not.
+func TestRun_InteractiveRecordPathGatedByRecordingEnabled(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	cases := []struct {
+		name             string
+		recordingEnabled *bool
+		wantRecording    bool
+	}{
+		{"nil — no platform decision — default allowed", nil, true},
+		{"explicit true — allowed", boolPtr(true), true},
+		{"explicit false — disabled", boolPtr(false), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envAttachURL, "")
+			t.Setenv(envAttachToken, "")
+			server := mockPlatformServer(t)
+			t.Cleanup(server.Close)
+			manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+			if err != nil {
+				t.Fatalf("worktree.NewManager: %v", err)
+			}
+			poster, err := result.NewPoster(result.Options{
+				PlatformURL: server.URL, WorkerID: "worker-1", AuthToken: "token",
+				HTTPClient: server.Client(), BaseDelay: 1,
+			})
+			if err != nil {
+				t.Fatalf("result.NewPoster: %v", err)
+			}
+			provider := &promptCaptureInteractiveProvider{
+				name:     agent.ProviderClaude,
+				caps:     (&claude.Provider{}).Capabilities(),
+				manifest: (&claude.Provider{}).Manifest(),
+			}
+			registry := NewRegistry()
+			if err := registry.Register(provider); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			r, err := New(Options{
+				Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(),
+				MaxSessionDuration: -1, SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			qw := QueuedWork{
+				QueuedWork: prompt.QueuedWork{
+					SessionID:        "record-gate-" + strings.ReplaceAll(tc.name, " ", "-"),
+					IssueID:          "issue-id",
+					IssueIdentifier:  "ISSUE-REC",
+					WorkType:         "development",
+					Mode:             prompt.InteractiveRunMode,
+					InitialPrompt:    "seed",
+					Repository:       makeBareRepo(t),
+					RecordingEnabled: tc.recordingEnabled,
+				},
+				WorkerID:        "worker-1",
+				AuthToken:       "token",
+				PlatformURL:     server.URL,
+				ResolvedProfile: ResolvedProfile{Provider: agent.ProviderClaude},
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			got, err := r.Run(ctx, qw)
+			if err != nil || got.Status != "completed" {
+				t.Fatalf("Run result=%+v err=%v", got, err)
+			}
+			if provider.raw.Interactive == nil {
+				t.Fatal("Spec.Interactive was nil — every interactive session must get a PTY surface regardless of recording policy")
+			}
+			gotPath := provider.raw.Interactive.RecordPath
+			if tc.wantRecording {
+				wantPath := termCastPath(provider.raw.Cwd)
+				if gotPath != wantPath {
+					t.Errorf("RecordPath = %q, want %q (recording allowed)", gotPath, wantPath)
+				}
+			} else if gotPath != "" {
+				t.Errorf("RecordPath = %q, want empty (recording disabled by policy)", gotPath)
+			}
+		})
+	}
+}
+
+// TestInteractive_RecordingCleanup proves dispatchInteractive best-effort
+// deletes the on-disk cast once the session reaches a terminal state, on
+// both the success and the failure exit path, UNLESS QueuedWork.RetainRecording
+// suppresses it (the standalone --keep-recording flag). The cast file is
+// created (via a real ptyhost.Session, so newRecorder actually runs) at the
+// same path termCastPath would compute for the workarea, mirroring how
+// runner/loop.go wires agent.InteractiveSpec.RecordPath in production.
+func TestInteractive_RecordingCleanup(t *testing.T) {
+	requireSh(t)
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	cases := []struct {
+		name            string
+		command         []string
+		retainRecording bool
+		wantExists      bool
+	}{
+		{"success — cleaned up", []string{"/bin/sh", "-c", "exit 0"}, false, false},
+		{"failure — cleaned up", []string{"/bin/sh", "-c", "exit 3"}, false, false},
+		{"success — retained", []string{"/bin/sh", "-c", "exit 0"}, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := minimalRunner(t)
+			worktreePath := t.TempDir()
+			castPath := termCastPath(worktreePath)
+			if err := os.MkdirAll(filepath.Dir(castPath), 0o750); err != nil {
+				t.Fatalf("mkdir workarea dir: %v", err)
+			}
+			sess, err := ptyhost.Spawn(ptyhost.Spec{Command: tc.command, RecordPath: castPath})
+			if err != nil {
+				t.Fatalf("ptyhost.Spawn: %v", err)
+			}
+			h := newInteractivePTYHandle(sess)
+
+			if _, err := os.Stat(castPath); err != nil {
+				t.Fatalf("cast file was not created before dispatch: %v", err)
+			}
+
+			res := &Result{SessionID: "s"}
+			qw := QueuedWork{RetainRecording: tc.retainRecording}
+			qw.SessionID = "s"
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if _, err := r.dispatchInteractive(ctx, h, worktreePath, qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice); err != nil {
+				// The nonzero-exit case returns a nil error from
+				// dispatchInteractive (the failure rides Result.Status), so
+				// only fail here if it's genuinely unexpected.
+				t.Logf("dispatchInteractive returned err=%v (status=%q)", err, res.Status)
+			}
+
+			_, statErr := os.Stat(castPath)
+			exists := statErr == nil
+			if exists != tc.wantExists {
+				t.Errorf("cast exists=%v after dispatch, want %v (statErr=%v)", exists, tc.wantExists, statErr)
+			}
+		})
 	}
 }
 

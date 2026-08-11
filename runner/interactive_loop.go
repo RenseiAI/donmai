@@ -142,6 +142,31 @@ func (r *Runner) dispatchInteractive(
 	if sink == nil {
 		sink = noopSink{}
 	}
+
+	// End-of-session cast cleanup (best-effort): once this dispatch returns —
+	// success, failure, ownership loss, or ctx-cancel; every return path in
+	// this function — remove the on-disk asciinema-v2 cast unless the LOCAL
+	// operator asked to keep it (QueuedWork.RetainRecording, wired only from
+	// the standalone `donmai agent run --keep-recording` flag; this is never a
+	// platform decision — see QueuedWork.RecordingEnabled for that one). A
+	// platform-dispatched session gets this cleanup regardless of how
+	// RecordingEnabled resolved: when recording was allowed, the cast existed
+	// sanitized for the live/local session and is removed here so raw
+	// artifacts never accumulate on worker hosts (the platform's relay-side
+	// recording is the retained, retention-managed artifact); when recording
+	// was disabled, termCastPath never had a file to begin with and os.Remove
+	// is a harmless no-op. Registered as the FIRST defer so it runs LAST —
+	// after every other teardown below — once the session Result is final.
+	if !qw.RetainRecording {
+		defer func() {
+			castPath := termCastPath(worktreePath)
+			if err := os.Remove(castPath); err != nil && !os.IsNotExist(err) {
+				r.logger.Warn("[interactive] failed to remove session cast",
+					"sessionId", qw.SessionID, "path", castPath, "err", err)
+			}
+		}()
+	}
+
 	if promptBytes := len(qw.InitialPrompt); qw.isInteractive() && promptBytes > maxInitialPromptBytes {
 		err := fmt.Errorf(
 			"interactive initial prompt is %d UTF-8 bytes; limit is %d bytes",

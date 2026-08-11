@@ -19,7 +19,11 @@
 // in-process viewer/driver used for the OSS-standalone case (§5, §12
 // local-attach scope). All viewer-bound Output bytes on that surface pass the
 // §9 sanitizer (attachwire/sanitize); the host→relay leg (produced here) carries
-// raw PTY bytes (§3.1).
+// raw PTY bytes (§3.1). The one exception is the parallel on-disk cast (§16,
+// recorder.go): because it is a persistent artifact rather than a live,
+// ephemeral stream, its "o" events pass through their own dedicated §9
+// sanitizer instance before being written, so the cast is never a byte-exact
+// copy of the relay leg.
 //
 // # Concurrency
 //

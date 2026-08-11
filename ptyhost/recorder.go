@@ -7,16 +7,28 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/RenseiAI/donmai/attachwire/sanitize"
 )
 
 // recorder writes a parallel asciinema v2 cast of the session (§16): a header
 // line followed by [time, code, data] event lines. It shares the process-spawn
 // rel_time anchor with the wire (§2), so the cast and the live stream stay
 // aligned. All methods are called under the Session mutex (write-through).
+//
+// Output ("o") events are NOT a verbatim copy of the PTY bytes: they pass
+// through this recorder's own §9 escape-sequence sanitizer (attachwire/
+// sanitize) before being written to disk, because the cast is a persistent
+// artifact rather than a live, ephemeral stream. This is a SEPARATE sanitizer
+// instance from any viewer/relay leg — Sanitizer is stateful and must never be
+// shared across legs (see ptyhost/local.go's AttachLocal for the analogous
+// viewer-side instance). resize/marker/header events carry no PTY bytes and
+// are unaffected.
 type recorder struct {
-	mu sync.Mutex
-	f  *os.File
-	w  *bufio.Writer
+	mu  sync.Mutex
+	f   *os.File
+	w   *bufio.Writer
+	san *sanitize.Sanitizer
 }
 
 // castHeader is the asciinema v2 header object.
@@ -38,7 +50,7 @@ func newRecorder(path string, cols, rows int, termEnv, shell string) (*recorder,
 	if err != nil {
 		return nil, err
 	}
-	r := &recorder{f: f, w: bufio.NewWriter(f)}
+	r := &recorder{f: f, w: bufio.NewWriter(f), san: sanitize.New()}
 	hdr := castHeader{
 		Version:   2,
 		Width:     cols,
@@ -64,6 +76,14 @@ func (r *recorder) writeEvent(relMicros uint64, code, data string) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.writeEventLocked(relMicros, code, data)
+}
+
+// writeEventLocked is writeEvent's body, assuming r.mu is already held. Split
+// out so output() can run the sanitizer and append the resulting event inside
+// one critical section — the sanitizer is stateful, so its Write call and the
+// resulting event's position in the file must never race a concurrent event.
+func (r *recorder) writeEventLocked(relMicros uint64, code, data string) {
 	// Build the JSON array manually so the float time keeps full precision and
 	// data is JSON-escaped.
 	secs := float64(relMicros) / 1e6
@@ -79,9 +99,22 @@ func (r *recorder) writeEvent(relMicros uint64, code, data string) {
 	_, _ = r.w.Write(line)
 }
 
-// output records terminal output ("o").
+// output records terminal output ("o"). data is raw PTY bytes; they pass
+// through this recorder's dedicated §9 sanitizer before being written, so a
+// disallowed escape/OSC sequence (e.g. an OSC 52 clipboard write) never lands
+// in the on-disk cast even though it rides the live host→relay leg unaltered
+// (that leg is sanitized only at the viewer, per ptyhost/doc.go's Boundary
+// section). The sanitize call and the resulting writeEventLocked happen under
+// one mu.Lock so the stateful sanitizer can never be raced by a concurrent
+// resize/marker/output call.
 func (r *recorder) output(relMicros uint64, data []byte) {
-	r.writeEvent(relMicros, "o", string(data))
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sanitized := r.san.Write(data)
+	r.writeEventLocked(relMicros, "o", string(sanitized))
 }
 
 // resize records an applied resize ("r") as "COLSxROWS" (cast v2.1).
