@@ -727,6 +727,42 @@ func TestDetailToQueuedWork_InitialPromptForwarded(t *testing.T) {
 	}
 }
 
+// TestDetailToQueuedWork_RecordingEnabledForwarded verifies the daemon's
+// SessionDetail → runner.QueuedWork hop preserves the host-side recording
+// policy decision exactly (nil/true/false), matching the InitialPrompt /
+// MemoryBlock opaque-forwarder precedent.
+func TestDetailToQueuedWork_RecordingEnabledForwarded(t *testing.T) {
+	trueVal, falseVal := true, false
+	cases := []struct {
+		name             string
+		recordingEnabled *bool
+	}{
+		{"nil — no platform decision", nil},
+		{"explicit true", &trueVal},
+		{"explicit false", &falseVal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &daemon.SessionDetail{
+				SessionID:        "sess-rec",
+				RecordingEnabled: tc.recordingEnabled,
+				ResolvedProfile:  &daemon.SessionResolvedProfile{Provider: "stub"},
+			}
+			qw := detailToQueuedWork(d)
+			switch {
+			case tc.recordingEnabled == nil:
+				if qw.RecordingEnabled != nil {
+					t.Errorf("RecordingEnabled = %v, want nil", *qw.RecordingEnabled)
+				}
+			case qw.RecordingEnabled == nil:
+				t.Errorf("RecordingEnabled = nil, want %v", *tc.recordingEnabled)
+			case *qw.RecordingEnabled != *tc.recordingEnabled:
+				t.Errorf("RecordingEnabled = %v, want %v", *qw.RecordingEnabled, *tc.recordingEnabled)
+			}
+		})
+	}
+}
+
 // TestDetailToQueuedWork_WS5FidelityForwarded verifies the WS5 agent-card
 // fields (AllowedTools, McpServers, Skills) survive the SessionDetail →
 // runner.QueuedWork translation (the third + final wire hop), including the
@@ -1168,6 +1204,62 @@ func TestRunAgentRun_UnknownExplicitHarnessPrecedesGatewayAndRunningPost(t *test
 	}
 	if !strings.Contains(stdout.String(), `"denialCode": "unknown_harness"`) {
 		t.Fatalf("result JSON missing canonical denial receipt: %s", stdout.String())
+	}
+}
+
+// TestRunAgentRun_KeepRecordingSetsRetainRecording proves the standalone
+// `--keep-recording` flag (agentRunOpts.keepRecording) reaches
+// runner.QueuedWork.RetainRecording — the local-operator-only retention
+// decision that suppresses the runner's end-of-session cast cleanup. It
+// captures the QueuedWork snapshot at the worker-gateway-binding seam (the
+// same one TestRunAgentRun_UnknownExplicitHarnessPrecedesGatewayAndRunningPost
+// uses) and forces an error there so the test never needs a real spawn.
+func TestRunAgentRun_KeepRecordingSetsRetainRecording(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	for _, keepRecording := range []bool{false, true} {
+		t.Run(fmt.Sprintf("keepRecording=%v", keepRecording), func(t *testing.T) {
+			var captured *runner.QueuedWork
+			originalBind := bindWorkerGatewayForAgentRun
+			bindWorkerGatewayForAgentRun = func(_ context.Context, _ *slog.Logger, _ *daemon.SessionDetail, work *runner.QueuedWork, _ string) (*workerGateway, error) {
+				captured = work
+				return nil, errors.New("stop before spawn — this test only inspects the QueuedWork snapshot")
+			}
+			t.Cleanup(func() { bindWorkerGatewayForAgentRun = originalBind })
+
+			platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer platform.Close()
+
+			detail := &daemon.SessionDetail{
+				SessionID: "sess-keep-recording", WorkerID: "worker-1", AuthToken: "tok",
+				PlatformURL: platform.URL, Mode: prompt.InteractiveRunMode,
+				ResolvedProfile: &daemon.SessionResolvedProfile{Provider: string(agent.ProviderStub)},
+			}
+			daemonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, "/api/daemon/sessions/") {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(detail) //nolint:gosec // G117: test fixture
+			}))
+			defer daemonServer.Close()
+
+			err := runAgentRun(context.Background(), &cobra.Command{}, &agentRunOpts{
+				sessionID: detail.SessionID, daemonURL: daemonServer.URL, worktree: t.TempDir(),
+				keepRecording: keepRecording,
+			})
+			if err == nil {
+				t.Fatal("expected the forced gateway-binding error to propagate")
+			}
+			if captured == nil {
+				t.Fatal("bindWorkerGatewayForAgentRun was never called — cannot inspect QueuedWork")
+			}
+			if captured.RetainRecording != keepRecording {
+				t.Errorf("RetainRecording = %v, want %v (from --keep-recording=%v)", captured.RetainRecording, keepRecording, keepRecording)
+			}
+		})
 	}
 }
 

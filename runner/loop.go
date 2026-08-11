@@ -33,6 +33,18 @@ import (
 // can verify integration without a real KitRegistry on disk.
 var kitLoadSkills = kit.LoadSkills
 
+// termCastPath returns the on-disk asciinema-v2 cast location for a
+// session's workarea (spec § 16), next to events.jsonl in the
+// state.AgentDirName convention. Single source of truth shared by the
+// interactive spec builder below (which populates
+// agent.InteractiveSpec.RecordPath when recording is allowed) and the
+// end-of-session cleanup in interactive_loop.go's dispatchInteractive
+// (which removes the file at this same path once the session reaches a
+// terminal state).
+func termCastPath(wpath string) string {
+	return filepath.Join(wpath, state.AgentDirName, "term.cast")
+}
+
 // runLoop drives the per-session orchestration steps in F.1.1 §4
 // order. Returns the in-progress Result (always non-nil) plus a
 // terminal err the caller may surface.
@@ -563,12 +575,22 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// 80×24 default (agent.InteractiveSpec § Cols/Rows): QueuedWork carries
 	// no viewport hint today, and the relay resizes the PTY authoritatively
 	// once the first viewer joins (spec § 8, applied verbatim), so a fixed
-	// initial geometry is not load-bearing. The asciinema-v2 recording lands
-	// in the session workarea next to events.jsonl, matching the workarea
-	// convention (state.AgentDirName).
+	// initial geometry is not load-bearing.
+	//
+	// RecordPath (the asciinema-v2 cast destination) is populated only when
+	// host-side recording is allowed by policy: QueuedWork.RecordingEnabled
+	// nil (no platform decision — standalone, or a platform predating the
+	// field) or true both default to allowed; explicit false leaves
+	// RecordPath empty, which ptyhost's newRecorder treats as a valid no-op
+	// (no cast file is ever created). Spec.Interactive itself is still built
+	// unconditionally — the PTY surface is needed regardless of recording
+	// policy; only the parallel recording is gated. When a cast IS written it
+	// lands in the session workarea next to events.jsonl, matching the
+	// workarea convention (state.AgentDirName) — see termCastPath.
 	if qw.isInteractive() {
-		spec.Interactive = &agent.InteractiveSpec{
-			RecordPath: filepath.Join(wpath, state.AgentDirName, "term.cast"),
+		spec.Interactive = &agent.InteractiveSpec{}
+		if qw.RecordingEnabled == nil || *qw.RecordingEnabled {
+			spec.Interactive.RecordPath = termCastPath(wpath)
 		}
 	}
 	if len(selection.receipt.Bytes()) > 0 {

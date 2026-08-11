@@ -267,6 +267,14 @@ type SessionDetail struct {
 	// never incorporated into headless or interview prompt builders.
 	InitialPrompt string `json:"initialPrompt,omitempty"`
 
+	// RecordingEnabled forwards the platform's host-side recording policy
+	// decision from PollWorkItem onto the runner's QueuedWork. nil/absent
+	// defaults to allowed (mixed-version-safe); explicit false/true is the
+	// platform's decision to disable/allow the on-disk asciinema-v2 cast for
+	// this interactive session. Opaque forwarder only — same pattern as
+	// Mode / InitialPrompt.
+	RecordingEnabled *bool `json:"recordingEnabled,omitempty"`
+
 	// InterviewBudget forwards the per-interview wall-clock + idle-grace
 	// budget from PollWorkItem onto the runner's QueuedWork. nil/absent
 	// is safe and backward-compatible. Opaque forwarder only.

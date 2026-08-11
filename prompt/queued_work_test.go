@@ -128,6 +128,55 @@ func TestQueuedWork_InitialPromptWireSemantics(t *testing.T) {
 	}
 }
 
+// TestQueuedWork_RecordingEnabledWireSemantics locks the host-side recording
+// policy field's wire contract: camelCase, omitempty for the nil default, and
+// exact true/false round-trip when the platform has made a decision. nil vs.
+// false must stay distinguishable across the hop (mirrors the mergeQueueLanding
+// *bool precedent) since they mean different things: "no platform decision"
+// vs. "the platform explicitly disabled recording".
+func TestQueuedWork_RecordingEnabledWireSemantics(t *testing.T) {
+	t.Parallel()
+
+	trueVal, falseVal := true, false
+	tests := []struct {
+		name       string
+		input      *bool
+		wantOnWire bool
+	}{
+		{name: "nil — no platform decision", input: nil, wantOnWire: false},
+		{name: "explicit true", input: &trueVal, wantOnWire: true},
+		{name: "explicit false", input: &falseVal, wantOnWire: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			qw := QueuedWork{SessionID: "rec-wire", RecordingEnabled: tt.input}
+			body, err := json.Marshal(qw)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			hasKey := strings.Contains(string(body), `"recordingEnabled"`)
+			if hasKey != tt.wantOnWire {
+				t.Fatalf("recordingEnabled key presence = %v, want %v: %s", hasKey, tt.wantOnWire, body)
+			}
+			var back QueuedWork
+			if err := json.Unmarshal(body, &back); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			switch {
+			case tt.input == nil:
+				if back.RecordingEnabled != nil {
+					t.Errorf("round-trip RecordingEnabled = %v, want nil", *back.RecordingEnabled)
+				}
+			case back.RecordingEnabled == nil:
+				t.Errorf("round-trip RecordingEnabled = nil, want %v", *tt.input)
+			case *back.RecordingEnabled != *tt.input:
+				t.Errorf("round-trip RecordingEnabled = %v, want %v", *back.RecordingEnabled, *tt.input)
+			}
+		})
+	}
+}
+
 // TestQueuedWork_CodeIntel_UnknownFieldTolerance proves BOTH mixed-version
 // directions decode without error:
 //

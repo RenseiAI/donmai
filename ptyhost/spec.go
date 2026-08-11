@@ -63,7 +63,11 @@ type Spec struct {
 	Scrollback int
 
 	// RecordPath is the asciinema-v2 cast destination (§16). Empty disables
-	// recording. The cast shares the process-spawn rel_time anchor with the wire.
+	// recording. The cast shares the process-spawn rel_time anchor with the
+	// wire, but is NOT a byte-exact copy of it: output events pass through
+	// the recorder's own §9 escape-sequence sanitizer before being written to
+	// disk (recorder.go), because the cast is a persistent artifact rather
+	// than a live, ephemeral stream.
 	RecordPath string
 
 	// Epoch is the host stream epoch (§4.1) stamped into every serialized

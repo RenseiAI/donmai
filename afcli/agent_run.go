@@ -55,6 +55,12 @@ type agentRunOpts struct {
 	worktree   string
 	preserveWT bool
 	jsonOut    bool
+	// keepRecording is the standalone --keep-recording flag: a LOCAL OPERATOR
+	// decision to suppress the runner's end-of-session deletion of an
+	// interactive session's on-disk asciinema-v2 cast. It sets
+	// runner.QueuedWork.RetainRecording, which never rides the wire and has
+	// no platform-side counterpart — see that field's doc comment.
+	keepRecording bool
 	// bin is the host binary name (from binaryName(cfg)) used in error hints.
 	// Defaults to "donmai" when empty.
 	bin string
@@ -145,6 +151,8 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 		"Preserve the worktree on disk after the session ends (debugging)")
 	cmd.Flags().BoolVar(&opts.jsonOut, "json", true,
 		"Emit a single JSON line describing the terminal Result (default true)")
+	cmd.Flags().BoolVar(&opts.keepRecording, "keep-recording", false,
+		"Keep the interactive session's on-disk asciinema-v2 cast after the session ends (default: deleted)")
 	return cmd
 }
 
@@ -246,6 +254,10 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	}()
 
 	qw := detailToQueuedWork(detail)
+	// RetainRecording is a LOCAL OPERATOR decision only (never a platform
+	// one — see the field's doc comment on runner.QueuedWork): it rides in
+	// from --keep-recording, not from the daemon's SessionDetail.
+	qw.RetainRecording = opts.keepRecording
 	admission, admissionErr := reg.PreflightHarness(qw)
 	if admissionErr != nil {
 		logger.Warn("donmai agent run: explicit harness denied before gateway/status side effects",
@@ -938,6 +950,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			MemoryBlock:          d.MemoryBlock,
 			Mode:                 d.Mode,
 			InitialPrompt:        d.InitialPrompt,
+			RecordingEnabled:     d.RecordingEnabled,
 			InterviewDefinition:  d.InterviewDefinition,
 		},
 		Branch:                d.Branch,

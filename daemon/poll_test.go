@@ -984,6 +984,97 @@ func TestPollItemToSessionDetail_InitialPromptForwarded(t *testing.T) {
 	}
 }
 
+// TestPollResponse_DecodesRecordingEnabled proves the host-side recording
+// policy decision survives strict poll-wire decoding: nil/absent stays a nil
+// pointer (mixed-version-safe default), and explicit true/false decode to the
+// exact value with no normalization. Mirrors the mergeQueueLanding *bool
+// precedent.
+func TestPollResponse_DecodesRecordingEnabled(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want *bool // nil ⇒ absent
+	}{
+		{
+			name: "true",
+			body: `{"work":[{"sessionId":"rec-t","recordingEnabled":true}]}`,
+			want: boolPtr(true),
+		},
+		{
+			name: "false",
+			body: `{"work":[{"sessionId":"rec-f","recordingEnabled":false}]}`,
+			want: boolPtr(false),
+		},
+		{
+			name: "absent",
+			body: `{"work":[{"sessionId":"rec-a"}]}`,
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resp PollResponse
+			if err := json.Unmarshal([]byte(tt.body), &resp); err != nil {
+				t.Fatalf("decode recordingEnabled wire shape: %v", err)
+			}
+			if len(resp.Work) != 1 {
+				t.Fatalf("Work len = %d, want 1", len(resp.Work))
+			}
+			got := resp.Work[0].RecordingEnabled
+			switch {
+			case tt.want == nil:
+				if got != nil {
+					t.Errorf("RecordingEnabled = %v, want nil (absent must stay nil)", *got)
+				}
+			case got == nil:
+				t.Errorf("RecordingEnabled = nil, want %v", *tt.want)
+			case *got != *tt.want:
+				t.Errorf("RecordingEnabled = %v, want %v", *got, *tt.want)
+			}
+		})
+	}
+
+	absentBody, err := json.Marshal(PollWorkItem{SessionID: "rec-absent"})
+	if err != nil {
+		t.Fatalf("marshal empty PollWorkItem: %v", err)
+	}
+	if bytes.Contains(absentBody, []byte(`"recordingEnabled"`)) {
+		t.Fatalf("nil RecordingEnabled must stay omitted, got %s", absentBody)
+	}
+}
+
+// TestPollItemToSessionDetail_RecordingEnabledForwarded verifies the
+// PollWorkItem → SessionDetail forwarding hop preserves the exact pointer
+// value (nil/true/false) without reinterpretation — the daemon does not
+// decide policy, it only forwards the platform's decision opaquely.
+func TestPollItemToSessionDetail_RecordingEnabledForwarded(t *testing.T) {
+	cases := []struct {
+		name             string
+		recordingEnabled *bool
+	}{
+		{"nil — no platform decision", nil},
+		{"explicit true", boolPtr(true)},
+		{"explicit false", boolPtr(false)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item := PollWorkItem{SessionID: "sess-rec", RecordingEnabled: tc.recordingEnabled}
+			detail := PollItemToSessionDetail(item, nil, "", "", "")
+			switch {
+			case tc.recordingEnabled == nil:
+				if detail.RecordingEnabled != nil {
+					t.Errorf("RecordingEnabled = %v, want nil", *detail.RecordingEnabled)
+				}
+			case detail.RecordingEnabled == nil:
+				t.Errorf("RecordingEnabled = nil, want %v", *tc.recordingEnabled)
+			case *detail.RecordingEnabled != *tc.recordingEnabled:
+				t.Errorf("RecordingEnabled = %v, want %v", *detail.RecordingEnabled, *tc.recordingEnabled)
+			}
+		})
+	}
+}
+
 func TestPollItemToSessionDetailForwardsExecutionEvidenceOpaquely(t *testing.T) {
 	t.Parallel()
 	admission := json.RawMessage(`{"contractVersion":"future-version","opaque":{"admission":true}}`)
