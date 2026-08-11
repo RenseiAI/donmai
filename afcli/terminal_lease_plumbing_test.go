@@ -18,11 +18,14 @@ func TestDetailToQueuedWorkForwardsTerminalWorkareaLease(t *testing.T) {
 		LeaseDurationMS:    (30 * time.Minute).Milliseconds(),
 		MaxLeaseDurationMS: (2 * time.Hour).Milliseconds(),
 	}
-	queued := detailToQueuedWork(&daemon.SessionDetail{
+	queued, err := detailToQueuedWork(&daemon.SessionDetail{
 		SessionID:             "session-1",
 		InitialPrompt:         "inspect the retained terminal",
 		TerminalWorkareaLease: request,
 	})
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
 	if queued.InitialPrompt != "inspect the retained terminal" {
 		t.Fatalf("initial prompt = %q", queued.InitialPrompt)
 	}

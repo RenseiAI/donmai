@@ -85,7 +85,10 @@ func TestOperationalPayloadRawPollThroughRealDetailHTTPIsLossless(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			qw := detailToQueuedWork(fetched)
+			qw, err := detailToQueuedWork(fetched)
+			if err != nil {
+				t.Fatalf("detailToQueuedWork: %v", err)
+			}
 			consumerDigest, err := runner.DigestOperationalPayload(qw)
 			if err != nil {
 				t.Fatal(err)
@@ -409,7 +412,10 @@ func TestDetailToQueuedWork(t *testing.T) {
 			},
 		},
 	}
-	qw := detailToQueuedWork(d)
+	qw, err := detailToQueuedWork(d)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
 	if qw.SessionID != "sess-3" || qw.IssueIdentifier != "ENG-1" {
 		t.Errorf("session/identifier mismatch: %+v", qw)
 	}
@@ -439,6 +445,77 @@ func TestDetailToQueuedWork(t *testing.T) {
 	}
 }
 
+// sessionDetailWithEndpoint builds a minimal SessionDetail whose
+// ResolvedProfile.Endpoint carries the given BaseURL, for the
+// TestDetailToQueuedWork_EndpointBindingBaseURL table below.
+func sessionDetailWithEndpoint(baseURL string) *daemon.SessionDetail {
+	return &daemon.SessionDetail{
+		SessionID: "sess-baseurl",
+		ResolvedProfile: &daemon.SessionResolvedProfile{
+			Provider: "stub",
+			Endpoint: &daemon.SessionEndpointBinding{
+				Company: "openai", Model: "openai/gpt-test", Protocol: "openai-chat", Host: "direct",
+				BaseURL: baseURL,
+			},
+		},
+	}
+}
+
+// TestDetailToQueuedWork_EndpointBindingBaseURL is the runner-path entry
+// point for the dispatch-wire endpoint-baseurl ADR: this is where an
+// inbound daemon.SessionEndpointBinding.BaseURL either propagates onto
+// agent.EndpointBinding.BaseURL or is rejected before it reaches the
+// runner's Spec (never silently stripped).
+func TestDetailToQueuedWork_EndpointBindingBaseURL(t *testing.T) {
+	t.Run("well-formed external https propagates", func(t *testing.T) {
+		qw, err := detailToQueuedWork(sessionDetailWithEndpoint("https://ai-gateway.example.com/v1"))
+		if err != nil {
+			t.Fatalf("detailToQueuedWork: %v", err)
+		}
+		if got := qw.ResolvedProfile.Endpoint.BaseURL; got != "https://ai-gateway.example.com/v1" {
+			t.Errorf("BaseURL = %q, want the aggregator URL to propagate", got)
+		}
+	})
+
+	t.Run("http on loopback accepted", func(t *testing.T) {
+		qw, err := detailToQueuedWork(sessionDetailWithEndpoint("http://127.0.0.1:7734"))
+		if err != nil {
+			t.Fatalf("detailToQueuedWork: %v", err)
+		}
+		if got := qw.ResolvedProfile.Endpoint.BaseURL; got != "http://127.0.0.1:7734" {
+			t.Errorf("BaseURL = %q, want the loopback URL to propagate", got)
+		}
+	})
+
+	t.Run("http on external host rejected", func(t *testing.T) {
+		_, err := detailToQueuedWork(sessionDetailWithEndpoint("http://ai-gateway.example.com/v1"))
+		if err == nil {
+			t.Fatal("want a rejection for plain-http on a non-loopback host, got nil error")
+		}
+	})
+
+	t.Run("malformed BaseURL rejected, not silently stripped", func(t *testing.T) {
+		qw, err := detailToQueuedWork(sessionDetailWithEndpoint("not a url"))
+		if err == nil {
+			t.Fatalf("want a rejection for a malformed BaseURL, got qw=%+v", qw)
+		}
+	})
+
+	t.Run("absent BaseURL is unchanged prior behavior", func(t *testing.T) {
+		d := &daemon.SessionDetail{
+			SessionID:       "sess-no-baseurl",
+			ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
+		}
+		qw, err := detailToQueuedWork(d)
+		if err != nil {
+			t.Fatalf("detailToQueuedWork: %v", err)
+		}
+		if qw.ResolvedProfile.Endpoint != nil {
+			t.Errorf("Endpoint = %+v, want nil when the wire never sends one", qw.ResolvedProfile.Endpoint)
+		}
+	})
+}
+
 // TestDetailToQueuedWork_ThreadsHarness verifies the daemon's
 // ResolvedProfile.Harness (the platform catalog loop-driver attribute) is
 // threaded onto the runner's QueuedWork so the runner's harness-native
@@ -453,7 +530,10 @@ func TestDetailToQueuedWork_ThreadsHarness(t *testing.T) {
 			Model:    "gemini-3.1-pro",
 		},
 	}
-	qw := detailToQueuedWork(d)
+	qw, err := detailToQueuedWork(d)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
 	if qw.ResolvedProfile.Harness != "agy" {
 		t.Errorf("Harness = %q; want agy", qw.ResolvedProfile.Harness)
 	}
@@ -530,8 +610,10 @@ func TestDetailToQueuedWork_ModelProfileSupersedesResolvedProfile(t *testing.T) 
 			MaxOutputTokens: 32_000,
 		},
 	}
-	qw := detailToQueuedWork(d)
-
+	qw, err := detailToQueuedWork(d)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
 	if qw.ResolvedProfile.Provider != agent.ProviderStub {
 		t.Errorf("Provider = %q; want %q (ModelProfile should supersede ResolvedProfile)", qw.ResolvedProfile.Provider, agent.ProviderStub)
 	}
@@ -572,8 +654,10 @@ func TestDetailToQueuedWork_FallsBackToResolvedProfileWhenNoModelProfile(t *test
 		},
 		// ModelProfile intentionally absent.
 	}
-	qw := detailToQueuedWork(d)
-
+	qw, err := detailToQueuedWork(d)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
 	if qw.ResolvedProfile.Provider != agent.ProviderStub {
 		t.Errorf("Provider = %q; want stub", qw.ResolvedProfile.Provider)
 	}
@@ -602,8 +686,10 @@ func TestDetailToQueuedWork_ModelProfileEmptyProviderIDFallback(t *testing.T) {
 			// ProviderID intentionally empty.
 		},
 	}
-	qw := detailToQueuedWork(d)
-
+	qw, err := detailToQueuedWork(d)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
 	// Empty ProviderID in ModelProfile reaches the named legacy harness adapter,
 	// which visibly defaults to Claude during runner admission.
 	// We just assert the conversion did not panic and the profile is set.
@@ -636,8 +722,10 @@ func TestDetailToQueuedWork_ModelProfileOnlyThreadsHarness(t *testing.T) {
 			Model:      "gemini-3.1-pro",
 		},
 	}
-	qw := detailToQueuedWork(d)
-
+	qw, err := detailToQueuedWork(d)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
 	if qw.ResolvedProfile.Harness != "agy" {
 		t.Errorf("Harness = %q; want agy (modelProfile path must carry harness)", qw.ResolvedProfile.Harness)
 	}
@@ -668,7 +756,10 @@ func TestDetailToQueuedWork_DisallowedToolsForwarded(t *testing.T) {
 				DisallowedTools: tc.disallowedTools,
 				ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
 			}
-			qw := detailToQueuedWork(d)
+			qw, err := detailToQueuedWork(d)
+			if err != nil {
+				t.Fatalf("detailToQueuedWork: %v", err)
+			}
 			if got := len(qw.DisallowedTools); got != tc.wantLen {
 				t.Errorf("DisallowedTools len = %d, want %d; got %v", got, tc.wantLen, qw.DisallowedTools)
 			}
@@ -700,7 +791,10 @@ func TestDetailToQueuedWork_MemoryBlockForwarded(t *testing.T) {
 				MemoryBlock:     tc.memoryBlock,
 				ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
 			}
-			qw := detailToQueuedWork(d)
+			qw, err := detailToQueuedWork(d)
+			if err != nil {
+				t.Fatalf("detailToQueuedWork: %v", err)
+			}
 			if qw.MemoryBlock != tc.memoryBlock {
 				t.Errorf("MemoryBlock = %q, want %q", qw.MemoryBlock, tc.memoryBlock)
 			}
@@ -719,7 +813,10 @@ func TestDetailToQueuedWork_InitialPromptForwarded(t *testing.T) {
 				InitialPrompt:   initialPrompt,
 				ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
 			}
-			qw := detailToQueuedWork(d)
+			qw, err := detailToQueuedWork(d)
+			if err != nil {
+				t.Fatalf("detailToQueuedWork: %v", err)
+			}
 			if qw.InitialPrompt != initialPrompt {
 				t.Errorf("InitialPrompt = %q, want %q", qw.InitialPrompt, initialPrompt)
 			}
@@ -748,7 +845,10 @@ func TestDetailToQueuedWork_RecordingEnabledForwarded(t *testing.T) {
 				RecordingEnabled: tc.recordingEnabled,
 				ResolvedProfile:  &daemon.SessionResolvedProfile{Provider: "stub"},
 			}
-			qw := detailToQueuedWork(d)
+			qw, err := detailToQueuedWork(d)
+			if err != nil {
+				t.Fatalf("detailToQueuedWork: %v", err)
+			}
 			switch {
 			case tc.recordingEnabled == nil:
 				if qw.RecordingEnabled != nil {
@@ -781,7 +881,10 @@ func TestDetailToQueuedWork_WS5FidelityForwarded(t *testing.T) {
 			},
 			ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
 		}
-		qw := detailToQueuedWork(d)
+		qw, err := detailToQueuedWork(d)
+		if err != nil {
+			t.Fatalf("detailToQueuedWork: %v", err)
+		}
 		if len(qw.AllowedTools) != 2 || qw.AllowedTools[0] != "Bash(go:*)" {
 			t.Errorf("AllowedTools = %v, want [Bash(go:*) Read]", qw.AllowedTools)
 		}
@@ -806,7 +909,10 @@ func TestDetailToQueuedWork_WS5FidelityForwarded(t *testing.T) {
 			SessionID:       "bare",
 			ResolvedProfile: &daemon.SessionResolvedProfile{Provider: "stub"},
 		}
-		qw := detailToQueuedWork(d)
+		qw, err := detailToQueuedWork(d)
+		if err != nil {
+			t.Fatalf("detailToQueuedWork: %v", err)
+		}
 		if qw.AllowedTools != nil || qw.McpServers != nil || qw.Skills != nil {
 			t.Errorf("WS5 fields must be nil when absent: allowed=%v mcp=%v skills=%v",
 				qw.AllowedTools, qw.McpServers, qw.Skills)
@@ -1017,7 +1123,10 @@ func TestGatewayHarnessIdentityUsesCanonicalAdmission(t *testing.T) {
 					Harness: tt.harness, Provider: tt.provider, Model: "test-model",
 				},
 			}
-			qw := detailToQueuedWork(detail)
+			qw, err := detailToQueuedWork(detail)
+			if err != nil {
+				t.Fatalf("detailToQueuedWork: %v", err)
+			}
 			admission, err := registry.PreflightHarness(qw)
 			if err != nil {
 				t.Fatalf("PreflightHarness: %v", err)

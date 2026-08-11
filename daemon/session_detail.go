@@ -72,7 +72,7 @@ type SessionDetail struct {
 	// RepositoryID is the stable selected repository-resource identity.
 	RepositoryID string `json:"repositoryId,omitempty"`
 
-	// OrganizationID is the Rensei tenant UUID.
+	// OrganizationID is the platform's tenant UUID.
 	OrganizationID string `json:"organizationId,omitempty"`
 
 	// Repository is the git URL (or owner/name slug) the agent should
@@ -347,7 +347,7 @@ type SessionResolvedProfile struct {
 
 	// ── P3 narrow-only gate inputs (ADR-2026-06-06 §5.3) ─────────────────
 	//
-	// These are the values the rensei-tui fail-closed gate (S3) hands to
+	// These are the values a closed-source embedder's fail-closed gate (S3) hands to
 	// access.ResolveMachineCell, one step before the credential hop. The
 	// daemon does NOT enforce here — it only carries them through onto the
 	// SessionSpec so the embedder's OnPreSpawn closure can read them. All
@@ -370,8 +370,18 @@ type SessionResolvedProfile struct {
 // values. String fields keep the daemon independent of the agent package while
 // preserving every execution-cell axis across the poll/detail boundary.
 type SessionEndpointBinding struct {
-	Company            string `json:"company"`
-	Model              string `json:"model"`
+	Company string `json:"company"`
+	Model   string `json:"model"`
+	// BaseURL is the endpoint-driven harness's aggregator/base URL (the "same
+	// protocol, different base URL" seam — e.g. a Host: direct binding onto an
+	// OpenAI-compat aggregator reached over openai-chat). Additive; absent on
+	// every dispatch that predates it, which is byte-identical to today's
+	// behavior (mixed-version-safe both directions). When present it MUST pass
+	// the fail-closed shape check the runner-path boundary applies
+	// (agent.ValidateEndpointBindingBaseURL): an absolute http(s) URL with no
+	// userinfo, https for any non-loopback host. Never carries credentials —
+	// those stay off the wire on agent.EndpointBinding.Env (json:"-").
+	BaseURL            string `json:"baseUrl,omitempty"`
 	Protocol           string `json:"protocol"`
 	Host               string `json:"host"`
 	EndpointID         string `json:"endpointId"`

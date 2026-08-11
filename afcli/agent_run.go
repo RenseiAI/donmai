@@ -253,7 +253,10 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		}
 	}()
 
-	qw := detailToQueuedWork(detail)
+	qw, err := detailToQueuedWork(detail)
+	if err != nil {
+		return preflightErr(fmt.Sprintf("endpoint binding: %v", err))
+	}
 	// RetainRecording is a LOCAL OPERATOR decision only (never a platform
 	// one — see the field's doc comment on runner.QueuedWork): it rides in
 	// from --keep-recording, not from the daemon's SessionDetail.
@@ -912,8 +915,11 @@ func kitScanPaths() []string {
 }
 
 // detailToQueuedWork translates the daemon's SessionDetail wire shape
-// into the runner's QueuedWork. Pure function; no I/O.
-func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
+// into the runner's QueuedWork. Pure function; no I/O. This is the seam
+// where a dispatched endpoint binding enters the runner path — a malformed
+// BaseURL is rejected here (see agent.ValidateEndpointBindingBaseURL via
+// detailEndpointBinding) rather than reaching the runner's Spec.
+func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 	qw := runner.QueuedWork{
 		AdmissionReceipt:        bytes.Clone(d.AdmissionReceipt),
 		ClaimReceipt:            bytes.Clone(d.ClaimReceipt),
@@ -1024,9 +1030,17 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			if d.ResolvedProfile.ProviderConfig != nil {
 				qw.ResolvedProfile.ProviderConfig = d.ResolvedProfile.ProviderConfig
 			}
-			qw.ResolvedProfile.Endpoint = detailEndpointBinding(d.ResolvedProfile.Endpoint)
+			endpoint, err := detailEndpointBinding(d.ResolvedProfile.Endpoint)
+			if err != nil {
+				return runner.QueuedWork{}, err
+			}
+			qw.ResolvedProfile.Endpoint = endpoint
 		}
 	} else if d.ResolvedProfile != nil {
+		endpoint, err := detailEndpointBinding(d.ResolvedProfile.Endpoint)
+		if err != nil {
+			return runner.QueuedWork{}, err
+		}
 		qw.ResolvedProfile = runner.ResolvedProfile{
 			Harness:        d.ResolvedProfile.Harness,
 			Provider:       agent.ProviderName(d.ResolvedProfile.Provider),
@@ -1035,19 +1049,29 @@ func detailToQueuedWork(d *daemon.SessionDetail) runner.QueuedWork {
 			Effort:         agent.EffortLevel(d.ResolvedProfile.Effort),
 			CredentialID:   d.ResolvedProfile.CredentialID,
 			ProviderConfig: d.ResolvedProfile.ProviderConfig,
-			Endpoint:       detailEndpointBinding(d.ResolvedProfile.Endpoint),
+			Endpoint:       endpoint,
 		}
 	}
-	return qw
+	return qw, nil
 }
 
-func detailEndpointBinding(in *daemon.SessionEndpointBinding) *agent.EndpointBinding {
+// detailEndpointBinding converts the daemon's wire-safe SessionEndpointBinding
+// into the runner-consumable agent.EndpointBinding. This is where a dispatched
+// BaseURL enters the runner path: agent.ValidateEndpointBindingBaseURL applies
+// the fail-closed shape check (absolute http(s), no userinfo, https for any
+// non-loopback host) before the value is trusted — malformed input is
+// rejected here, never silently stripped.
+func detailEndpointBinding(in *daemon.SessionEndpointBinding) (*agent.EndpointBinding, error) {
 	if in == nil {
-		return nil
+		return nil, nil
+	}
+	if err := agent.ValidateEndpointBindingBaseURL(in.BaseURL); err != nil {
+		return nil, fmt.Errorf("session endpoint binding: %w", err)
 	}
 	return &agent.EndpointBinding{
 		Company:            agent.Company(in.Company),
 		Model:              in.Model,
+		BaseURL:            in.BaseURL,
 		Protocol:           agent.WireProtocol(in.Protocol),
 		Host:               agent.ServingHost(in.Host),
 		EndpointID:         in.EndpointID,
@@ -1061,7 +1085,7 @@ func detailEndpointBinding(in *daemon.SessionEndpointBinding) *agent.EndpointBin
 		AuthPortability:    in.AuthPortability,
 		AuthDelivery:       in.AuthDelivery,
 		Mechanism:          agent.AuthMechanism(in.Mechanism),
-	}
+	}, nil
 }
 
 // detailMCPServers re-types the daemon's PollMCPServer mirror slice into the
