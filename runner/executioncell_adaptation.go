@@ -7,6 +7,30 @@ import (
 	"github.com/RenseiAI/donmai/executioncell"
 )
 
+// watchLifecycleEvents projects one admitted `watch` capability onto normalized
+// lifecycle events. The session boundary — the init event and the terminal
+// result — is the floor every declared harness profile carries, so it stays
+// required: a mode that cannot evidence even that is not watchable and denies.
+// The richer per-turn and per-tool evidence is requested but optional, because
+// harness profiles carry genuinely different event vocabularies and a mode "may
+// not inherit headless evidence"
+// (ADR-2026-08-06-harness-adaptation-plan-and-receipt.md D6). Requiring the full
+// structured vocabulary of every mode would deny admission to interactive PTY
+// and completion-only profiles for evidence they never claimed, instead of
+// recording the gap where the contract puts it: an optional denial on the
+// receipt, which stays truthful and visible (D4).
+var watchLifecycleEvents = []struct {
+	kind     agent.EventKind
+	required bool
+}{
+	{agent.EventInit, true},
+	{agent.EventResult, true},
+	{agent.EventAssistantText, false},
+	{agent.EventToolUse, false},
+	{agent.EventToolResult, false},
+	{agent.EventError, false},
+}
+
 // bindAdmissionToolLifecyclePlan links the upstream execution-cell admission
 // to the existing exact-harness tool/lifecycle compiler. Receipt-bearing work
 // is additive: legacy work without a receipt keeps the pre-existing plan.
@@ -61,18 +85,11 @@ func bindAdmissionToolLifecyclePlan(spec agent.Spec, receipt executioncell.Immut
 	for _, capability := range value.Cell.GrantedCapabilities {
 		switch capability.Name {
 		case "watch":
-			for _, event := range []agent.EventKind{
-				agent.EventInit,
-				agent.EventAssistantText,
-				agent.EventToolUse,
-				agent.EventToolResult,
-				agent.EventResult,
-				agent.EventError,
-			} {
+			for _, event := range watchLifecycleEvents {
 				plan.Lifecycle = append(plan.Lifecycle, agent.LifecycleRequirement{
-					ID:               fmt.Sprintf("execution-cell-watch-%s", event),
-					Event:            event,
-					Required:         true,
+					ID:               fmt.Sprintf("execution-cell-watch-%s", event.kind),
+					Event:            event.kind,
+					Required:         event.required,
 					MinimumFidelity:  minimumFidelity,
 					ParametersDigest: capability.ParametersDigest,
 				})
