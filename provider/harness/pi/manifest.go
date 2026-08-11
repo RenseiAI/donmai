@@ -34,17 +34,23 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		Family:      agent.FamilyHarness,
 		ContractABI: "harness/v2",
 		Caps: agent.HarnessCaps{
-			SupportsMessageInjection: true,  // steer / follow_up
-			SupportsSessionResume:    true,  // session file + cursor replay (get_entries since=<id>)
-			SupportsToolPlugins:      true,  // pi.registerTool via the donmai extension
-			AcceptsMcpServerSpec:     false, // pi has no MCP by design; Spec.MCPServers is capability-gated-ignored
-			AcceptsAllowedToolsList:  true,  // enforced by OUR policy extension, not by pi
-			EmitsSubagentEvents:      false,
-			SupportsReasoningEffort:  true,  // set_thinking_level off…max
-			SupportsOneShot:          true,  // pi --mode json single-shot lane
-			NativeJSONMode:           false, // no server-constrained structured output ⇒ spawn-collect
-			ToolPermissionFormat:     "claude",
-			StreamingTransport:       "ndjson",
+			SupportsMessageInjection: true, // steer / follow_up
+			SupportsSessionResume:    true, // session file + cursor replay (get_entries since=<id>)
+			// SupportsToolPlugins is false: pi.registerTool exists on the real
+			// extension API, but no donmai code path calls it yet — the
+			// ToolLifecycle profile below already answers this truthfully
+			// (ToolPluginDelivery: Unsupported). This flag used to disagree
+			// with that answer; a registerTool follow-up wires real delivery
+			// and flips both back to true together.
+			SupportsToolPlugins:     false,
+			AcceptsMcpServerSpec:    false, // pi has no MCP by design; Spec.MCPServers is capability-gated-ignored
+			AcceptsAllowedToolsList: true,  // enforced by OUR policy extension, not by pi
+			EmitsSubagentEvents:     false,
+			SupportsReasoningEffort: true,  // set_thinking_level off…max
+			SupportsOneShot:         true,  // pi --mode json single-shot lane
+			NativeJSONMode:          false, // no server-constrained structured output ⇒ spawn-collect
+			ToolPermissionFormat:    "claude",
+			StreamingTransport:      "ndjson",
 			// `pi --mode rpc` carries an explicit steering verb on the same
 			// JSONL channel that drives the session: Handle.Inject maps to
 			// steer while a turn is in flight and follow_up while idle
@@ -88,7 +94,10 @@ func (p *Provider) Capabilities() agent.Capabilities {
 	return agent.Capabilities{
 		SupportsMessageInjection: true,
 		SupportsSessionResume:    true,
-		SupportsToolPlugins:      true,
+		// SupportsToolPlugins is false — see the matching comment on
+		// Manifest().Caps; TestParity_ManifestAgreesWithCapabilities pins
+		// the two together.
+		SupportsToolPlugins: false,
 		// pi has NO permission system of its own — the donmai policy
 		// extension IS the permission config consumer, so the provider
 		// requires a structured policy to adjudicate against.

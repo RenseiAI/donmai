@@ -143,6 +143,36 @@ func spawnScripted(t *testing.T, spec agent.Spec, preSpawn, body string) (*syncB
 	return cmds, h, err
 }
 
+// resumeScripted mirrors spawnScripted but drives Resume(sessionID, spec)
+// instead of Spawn — the replay/resume half of the D8 pi fixture family.
+func resumeScripted(t *testing.T, sessionID string, spec agent.Spec, preSpawn, body string) (*syncBuffer, agent.Handle, error) {
+	t.Helper()
+	if spec.Cwd == "" {
+		spec.Cwd = t.TempDir()
+	}
+	cmds := &syncBuffer{}
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	p, err := New(Options{
+		skipProcess:      true,
+		stdinOverride:    cmds,
+		stdoutOverride:   pr,
+		handshakeToken:   testHandshakeToken,
+		HandshakeTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	go func() { _, _ = io.WriteString(pw, preSpawn) }()
+	h, err := p.Resume(context.Background(), sessionID, spec)
+	if err != nil {
+		_ = pw.Close()
+		return cmds, h, err
+	}
+	go func() { _, _ = io.WriteString(pw, body) }()
+	return cmds, h, err
+}
+
 // drain reads every event from h until the channel closes (bounded by t
 // timeout).
 func drain(t *testing.T, h agent.Handle) []agent.Event {
@@ -162,7 +192,10 @@ func drain(t *testing.T, h agent.Handle) []agent.Event {
 	}
 }
 
-// --- Smoke 1: spawn + handshake verified; tampered SHA/token fails closed ---
+// --- Smoke 1 / D8 "RPC policy-handshake boundary" fixture family (positive +
+// tampered/forged negatives): spawn + handshake verified; tampered SHA or
+// forged token fails closed. See doc.go's "D8 fixture family" section for
+// the full family roster across files. ---
 
 func TestSpawn_HandshakeVerified(t *testing.T) {
 	t.Parallel()
@@ -448,6 +481,33 @@ func TestInject_SteerWhenInFlight_FollowUpWhenIdle(t *testing.T) {
 	}
 	if !sawFollowUp {
 		t.Errorf("idle Inject did not map to a follow_up command with the real `message` field")
+	}
+}
+
+// --- Cleanup idempotence (D8 pi row: "cleanup is idempotent and evidenced") ---
+
+// TestStop_IdempotentAfterChannelClose is the "cleanup idempotence" fixture:
+// Handle.Stop's doc comment claims "Idempotent", and the runner relies on
+// that (a caller may race Stop against the pump's own terminal-triggered
+// teardown). This proves it against a session that already reached its
+// terminal event and closed the events channel on its own — the case where
+// a second Stop has the least left to do and the most latent risk (a second
+// close(channel) panics if the internal guards ever regress).
+func TestStop_IdempotentAfterChannelClose(t *testing.T) {
+	t.Parallel()
+	body := getStateResponse("ses_cleanup") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "agent_settled"})
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	drain(t, h) // drains to the channel's own close, ahead of any Stop call
+
+	for i := 1; i <= 3; i++ {
+		if err := h.Stop(context.Background()); err != nil {
+			t.Errorf("Stop call %d after channel close = %v, want nil (Idempotent per the doc comment)", i, err)
+		}
 	}
 }
 

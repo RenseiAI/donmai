@@ -627,6 +627,82 @@ func TestToolLifecycleMCPToolNamesUndeliverableIsRecordedNotFatal(t *testing.T) 
 	}
 }
 
+// --- pi's "no-MCP truth" fixtures (ADR-2026-08-06 D8, pi row) ---
+//
+// pi ships no MCP by design (manifest.go: AcceptsMcpServerSpec is false,
+// ToolLifecycleProfile.MCPDelivery is Unsupported). The two tests below are
+// the negative half of that truth: a caller who asks pi for MCP anyway is
+// denied loudly and by name, never silently downgraded or ignored. Contrast
+// TestToolLifecycleMCPToolNamesUndeliverableIsRecordedNotFatal above, where
+// codex — which DOES deliver MCP servers but not a name filter over them —
+// records the same channel as denied-but-non-fatal instead: the fatal/
+// non-fatal split is decided by MCPDelivery, exactly per
+// legacyToolRequirements' comment in tool_adaptation.go.
+
+// TestToolLifecycleMCPServerRequiredDeniesPiByName is the "required
+// mcp_server ⇒ denied receipt naming the channel" fixture: a populated
+// Spec.MCPServers is always a required entry (legacyToolRequirements), and
+// pi's profile has no delivery for it, so adaptation must deny before spawn
+// and the receipt must name ToolChannelMCPServer — not merely fail with an
+// opaque error.
+func TestToolLifecycleMCPServerRequiredDeniesPiByName(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	stdio := agent.MCPServerConfig{Name: "tools", Command: "donmai", Args: []string{"mcp", "serve"}}
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{
+		Autonomous: true,
+		MCPServers: []agent.MCPServerConfig{stdio},
+	}, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	var adaptationErr *agent.ToolAdaptationError
+	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != agent.ToolChannelMCPServer {
+		t.Fatalf("error = %v, want a typed mcp_server denial (pi has no MCP by design)", err)
+	}
+	if receipt.Decision != "denied" {
+		t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+	}
+	var found bool
+	for _, entry := range receipt.Entries {
+		if entry.Channel == agent.ToolChannelMCPServer {
+			found = true
+			if entry.Outcome != agent.ToolOutcomeDenied {
+				t.Errorf("mcp_server entry outcome = %q, want denied", entry.Outcome)
+			}
+			if !entry.Required {
+				t.Errorf("mcp_server entry must be required (a populated MCPServers is never optional)")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("receipt must name the mcp_server channel, not merely fail")
+	}
+}
+
+// TestToolLifecycleMCPToolNamesFatalWherePiHasNoMountBoundary is the
+// "mcp-tool-names fatality" fixture: legacyToolRequirements marks
+// mcp-tool-names required exactly when profile.MCPDelivery is Unsupported —
+// there is no mount boundary the harness controls for the name filter to
+// narrow, so an unapplicable name policy means zero MCP control and must
+// stay fatal (tool_adaptation.go's legacyToolRequirements comment). pi is
+// the case that comment describes structurally, not just as an example:
+// contrast TestToolLifecycleMCPToolNamesUndeliverableIsRecordedNotFatal,
+// where codex's MCPDelivery IS deliverable and the same input is recorded
+// but non-fatal.
+func TestToolLifecycleMCPToolNamesFatalWherePiHasNoMountBoundary(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{
+		Autonomous:   true,
+		MCPToolNames: []string{"mcp__tools__read"},
+	}, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	var adaptationErr *agent.ToolAdaptationError
+	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != agent.ToolChannelMCPToolNames {
+		t.Fatalf("error = %v, want a typed mcp_tool_names denial (pi has no MCP mount boundary to narrow)", err)
+	}
+	if receipt.Decision != "denied" {
+		t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+	}
+}
+
 func mustProfile(t *testing.T, manifest agent.HarnessManifest, mode agent.PromptSessionMode) agent.ToolLifecycleProfile {
 	t.Helper()
 	profile, ok := manifest.ToolLifecycleProfile(mode)
