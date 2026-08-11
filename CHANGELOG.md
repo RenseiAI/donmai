@@ -6,6 +6,50 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.57.12 — 2026-08-11
+
+### Fixes
+
+- **Headless Codex host-session routes now inherit the authenticated CLI
+  session without weakening MCP isolation.** The app-server intentionally
+  runs under a private `CODEX_HOME`, but that also hid the host's ChatGPT login
+  and made every subscription-backed model call fail with a 401. A
+  per-session constructor hint now enables host auth only when the
+  authoritative harness is Codex and `authMode=host-session`; the private home
+  pins file auth but defers both the host credential link and app-server start
+  until the selected headless spawn path, while retaining its own
+  `config.toml` and exact MCP activation proof. Keyed routes,
+  unknown/non-Codex explicit
+  harnesses, and daemon introspection keep the credential-free default.
+
+- **Codex 0.147 lifecycle synchronization no longer floods agent activity.**
+  Routine MCP startup and thread-settings notifications, plus echoed user
+  message items, are consumed as protocol bookkeeping. Failed or cancelled
+  MCP startups remain visible as bounded system events without publishing the
+  app-server's free-form error text.
+
+- **Headless Codex waits for capability MCPs before the first turn.** Codex
+  reloads `mcp_servers` asynchronously, so a successful config write/read could
+  race `thread/start` and leave A2A, memory, knowledge-graph, and code-intel
+  tools unavailable for that turn. Donmai now polls Codex's paginated MCP
+  inventory and requires every requested server's completed initialize metadata
+  before opening or resuming a thread. A server removed from the preceding
+  Donmai-managed set must also leave the inventory; Codex-owned ambient entries
+  outside the isolated config do not block activation. Startup timeout or
+  inventory failure is a bounded, typed pre-thread denial.
+
+- **Headless Codex MCP calls no longer cancel for lack of a user response.**
+  MCP tool approval is internal to Codex rather than part of the app-server's
+  command/file JSON-RPC approval bridge. Each requested server now carries
+  `default_tools_approval_mode = "approve"` in the isolated config, and exact
+  config readback must preserve that seed before the first turn.
+
+- **Code-intel MCP warm-up no longer creates cache-only backstop PRs.** The
+  generated `.donmai/code-index/` tree is excluded from deterministic
+  backstop commits while source-owned `.donmai` configuration remains eligible.
+
+---
+
 ## v0.57.11 — 2026-08-10
 
 ### Fixes

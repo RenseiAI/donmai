@@ -83,29 +83,52 @@ Each headless Provider creates a private `CODEX_HOME` (directory mode
 `0700`) with its own `config.toml` (mode `0600`). The owned home overrides
 both the inherited environment and `Options.Env`; the initialize response
 must confirm that exact home before the Provider is usable. The provider
-does not read, link, copy, or write the operator's persistent Codex config
-or auth files. If a session needs process-scoped authentication, its caller
-must supply that explicitly through `Options.Env`.
+never loads or writes the operator's persistent Codex configuration. By
+default it also carries no host credentials; API-key callers supply those
+explicitly through `Options.Env`.
+
+For a route that has already resolved `authMode=host-session`, the caller sets
+`Options.HostSessionAuth`. Construction pins Codex to its file-backed auth
+store but does not deliver a credential or start app-server. After the
+selected headless harness passes preparation, `Spawn`/`Resume` narrowly
+hard-links the host's
+`$CODEX_HOME/auth.json` (or `~/.codex/auth.json`) into the private home. The
+app-server is started and initialized only after that link exists. The
+credential contents never enter Donmai memory or logs, in-place token refreshes
+update the same inode as the normal CLI login, and the operator's `config.toml`
+remains outside the boundary. The source must be a private regular file and
+share a filesystem with the isolated home; otherwise the session fails before
+a thread starts. Donmai's per-session `agent run` path enables this option only
+for an authoritatively selected Codex + `host-session` profile. Keyed lanes,
+unknown/non-Codex explicit harnesses, and the zero-context introspection
+registry retain the credential-free default.
 
 Before every `thread/start` or `thread/resume`, the Provider acquires a
 lease for the exact `Spec.MCPServers` set. It writes the native Codex shape
 to the `mcp_servers` key with `replace`, an explicit owned `filePath`, and
 `reloadUserConfig: true`, then proves activation with `config/read` at the
-session working directory. The first session performs this write/read even
-for an empty set, so any undeclared server visible in effective readback is
-rejected before a thread starts rather than silently entering the session.
-Stdio and HTTP entries are translated to Codex's native fields, including
-`http_headers`.
+session working directory. Because Codex reloads those servers asynchronously,
+readback proves the effective configuration but not client readiness. The
+Provider therefore polls paginated `mcpServerStatus/list` results until the
+inventory gives every requested name `serverInfo` from a completed MCP
+initialize handshake. Any name removed from the preceding Provider-managed set
+must also leave the inventory. Codex-owned ambient entries that are outside the
+isolated `mcp_servers` readback do not block activation. This does not require a
+non-empty tool list, so resource-only servers remain valid. The first session
+performs the config proof even for an empty set, so an undeclared server in
+effective readback is rejected before a thread starts. Stdio and HTTP entries
+are translated to Codex's native fields, including `http_headers`.
 
 Concurrent sessions may share an identical MCP set. An incompatible set is
 denied while a lease is live; sequential sessions rewrite and re-verify it.
-The last release replaces the set with empty and verifies that readback.
-Failure to apply, read back, or clear is a typed MCP application denial, not
-a soft degradation. A failed clear removes the private home, poisons the
-Provider against later sessions, and is returned from `Handle.Stop` or
-emitted as `mcp_cleanup_failed` on terminal/crash paths. Process exit and
-`Shutdown` also remove the owned home. `-32601 Method not found` is therefore
-a hard pre-thread failure.
+The last release replaces the set with empty and waits for both empty readback
+and every Provider-managed name to leave the active inventory. Failure to
+apply, read back, initialize within the RPC timeout, or clear is a typed MCP
+application denial, not a soft degradation. A failed clear removes the private
+home, poisons the Provider against later sessions, and is returned from
+`Handle.Stop` or emitted as `mcp_cleanup_failed` on terminal/crash paths.
+Process exit and `Shutdown` also remove the owned home. `-32601 Method not
+found` is therefore a hard pre-thread failure.
 
 ## Startup trust (interactive spawn mode)
 
@@ -135,13 +158,16 @@ broader. A workspace that cannot be resolved to an absolute path fails the
 spawn with an error naming the missing trust, because hanging on the review
 is the worse outcome.
 
-The **headless app-server lane is deliberately not seeded**: it has no UI to
-block on (approvals ride the bridge in `approval.go`), and trusting its
-working directory would make codex load that directory's `.codex/config.toml`
-as a project configuration layer, admitting `mcp_servers` the isolated
-`CODEX_HOME` boundary exists to exclude.
+The **headless app-server lane does not receive project-trust, global approval,
+or sandbox seeds**: command/file approvals ride the bridge in `approval.go`,
+and trusting its working directory would make codex load that directory's
+`.codex/config.toml` as a project configuration layer, admitting `mcp_servers`
+the isolated `CODEX_HOME` boundary exists to exclude. MCP tool approval is the
+exception because Codex does not expose it on that bridge. Each requested
+server receives only the scoped `default_tools_approval_mode = "approve"` key
+inside the Provider-owned config.
 
-## Approvals (interactive spawn mode)
+## Approvals (interactive and headless spawn modes)
 
 Getting past the startup reviews is not enough: a *running* session raises
 three further blocking reviews, and each one parks an unattended session the
@@ -171,10 +197,16 @@ Both mechanisms independently close the MCP class today; both are seeded
 because codex exposes them as separate settings and only the per-server one is
 scoped to the servers the platform requested.
 
+The headless lane uses that per-server seed as well. Its isolated config
+readback must preserve the key before activation succeeds; without it, Codex
+0.147 initializes and advertises the native MCP tools but cancels every call as
+though the absent user had declined the review.
+
 `DONMAI_CODEX_APPROVALS=inherit` restores codex's own approval handling for an
 attended terminal. An unrecognized value fails the spawn rather than guessing
 which of "cannot hang" and "may hang" was meant — the same rule
-`DONMAI_CODEX_HOOKS` follows. The headless app-server lane is untouched.
+`DONMAI_CODEX_HOOKS` follows. It does not alter the headless lane's scoped MCP
+seed.
 
 ## Failure modes (F.1.1 §5)
 

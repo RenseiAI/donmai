@@ -89,6 +89,70 @@ func TestIntegration_RealCodexAppServer_SmokeLifecycle(t *testing.T) {
 	}
 }
 
+func TestIntegration_RealCodexAppServer_HostSessionAuth(t *testing.T) {
+	if os.Getenv("DONMAI_CODEX_HOST_SESSION_INTEGRATION") != "1" {
+		t.Skip("set DONMAI_CODEX_HOST_SESSION_INTEGRATION=1 to spend a live host-session turn")
+	}
+	if _, err := exec.LookPath("codex"); err != nil {
+		t.Skip("codex binary not on PATH")
+	}
+
+	cwd := t.TempDir()
+	p, err := New(Options{
+		Cwd:              cwd,
+		HandshakeTimeout: 30 * time.Second,
+		HostSessionAuth:  true,
+	})
+	if err != nil {
+		t.Fatalf("New host-session provider: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	const marker = "HOST-SESSION-APP-SERVER-OK"
+	h, err := p.Spawn(ctx, agent.Spec{
+		Prompt:         "Reply with exactly " + marker + " and do not use tools.",
+		Cwd:            cwd,
+		Autonomous:     true,
+		SandboxEnabled: true,
+		SandboxLevel:   agent.SandboxReadOnly,
+		Model:          "gpt-5.6-sol",
+		Effort:         agent.EffortLow,
+	})
+	if err != nil {
+		t.Fatalf("Spawn host-session turn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+
+	var transcript strings.Builder
+	for {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				t.Fatalf("events closed before a successful result; transcript=%q", transcript.String())
+			}
+			switch event := ev.(type) {
+			case agent.AssistantTextEvent:
+				transcript.WriteString(event.Text)
+			case agent.ResultEvent:
+				transcript.WriteString(event.Message)
+				if !event.Success {
+					t.Fatalf("host-session result failed: errors=%v subtype=%s", event.Errors, event.ErrorSubtype)
+				}
+				if !strings.Contains(transcript.String(), marker) {
+					t.Fatalf("host-session transcript missing %s: %q", marker, transcript.String())
+				}
+				return
+			case agent.ErrorEvent:
+				t.Fatalf("host-session provider error: %s (%s)", event.Message, event.Code)
+			}
+		case <-ctx.Done():
+			t.Fatalf("host-session turn timed out: %v; transcript=%q", ctx.Err(), transcript.String())
+		}
+	}
+}
+
 func TestIntegration_RealCodexAppServer_PreparedHarnessReadyPath(t *testing.T) {
 	if _, err := exec.LookPath("codex"); err != nil {
 		t.Skip("codex binary not on PATH")

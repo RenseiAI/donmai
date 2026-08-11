@@ -55,22 +55,31 @@
 //
 // # Approval bridge
 //
-// The codex app-server fires JSON-RPC server-requests (id + method) for
-// every tool execution when `approvalPolicy: "on-request"` is set on the
-// thread. The bridge in approval.go consumes Spec.PermissionConfig and
-// replies with an accept / decline / acceptForSession decision. v0.5.0
-// ships the bridge so autonomous fleets do not have to default-allow
-// every command (per F.1.1 open-question #5: ship the bridge).
+// The codex app-server fires JSON-RPC server-requests (id + method) for command
+// and file-change approvals when `approvalPolicy: "on-request"` is set on the
+// thread. The bridge in approval.go consumes Spec.PermissionConfig and replies
+// with an accept / decline / acceptForSession decision. MCP tool approval stays
+// internal to Codex, so each requested server instead carries the scoped
+// default_tools_approval_mode seed in the isolated config. v0.5.0 ships the
+// bridge so autonomous fleets do not have to default-allow every command (per
+// F.1.1 open-question #5: ship the bridge).
 //
 // # MCP servers
 //
 // Each Provider owns an isolated CODEX_HOME and never targets the operator's
-// persistent config or auth files. Before thread/start or thread/resume, the
-// exact Spec.MCPServers set is written to the owned config.toml via
-// config/batchWrite and proved active via config/read at the session cwd.
-// Equal concurrent sets share a lease; incompatible live sets are denied; the
-// final release clears and re-verifies the set. Application or cleanup failure
-// is a hard typed denial, never a session-without-tools soft fallback.
+// persistent config. An explicitly selected host-session route may hard-link
+// only the host auth.json into that home at headless Spawn/Resume, after
+// harness preparation and without admitting ambient MCP/project
+// configuration. Before thread/start or thread/resume, the exact
+// Spec.MCPServers set is written to the owned config.toml via
+// config/batchWrite, checked via config/read at the session cwd, then held
+// until mcpServerStatus/list reports every requested server initialized and
+// every retired Provider-managed server absent. Codex-owned ambient inventory
+// entries are outside that comparison. Equal concurrent sets share a lease;
+// incompatible live sets are denied; the final release clears and re-verifies
+// both config and the absence of Provider-managed servers. Application,
+// initialization, or cleanup failure is a hard typed denial, never a
+// session-without-tools soft fallback.
 //
 // # Failure modes (F.1.1 §5)
 //
