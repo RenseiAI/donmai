@@ -116,6 +116,8 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 		argv = append(argv, "--resume", resumeSessionID)
 	}
 
+	// The interactive spawn mode applies the SAME mapping — see
+	// interactive.go's interactiveArgsWith; the two must not diverge.
 	if spec.Model != "" {
 		argv = append(argv, "--model", spec.Model)
 	}

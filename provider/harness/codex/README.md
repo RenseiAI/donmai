@@ -130,6 +130,32 @@ home, poisons the Provider against later sessions, and is returned from
 Process exit and `Shutdown` also remove the owned home. `-32601 Method not
 found` is therefore a hard pre-thread failure.
 
+## Model selection
+
+Both spawn modes honor `Spec.Model` when the platform resolved one for the
+work order (`QueuedWork.ResolvedProfile.Model` on the wire), and leave codex
+on its own default when it did not:
+
+- **Headless app-server lane** — `spec_translation.go`'s `resolveModel`
+  always sets `thread/start`/`turn/start`'s `"model"` param, falling back
+  through `Spec.Env["CODEX_MODEL_TIER"]` / `Spec.Env["CODEX_MODEL"]` /
+  `DefaultCodexModel` when `Spec.Model` is empty.
+- **Interactive TUI lane** — `interactive.go`'s `buildInteractiveLaunchEnv`
+  seeds a process-local `--config model="<id>"` override, the same
+  mechanism used for every other session-scoped knob here (approval policy,
+  sandbox mode, developer instructions, MCP servers). Unlike the headless
+  lane it does NOT default: an empty `Spec.Model` emits no override at all,
+  so an unselected interactive session runs under whatever `model` the
+  TUI's own config.toml/CLI default resolves to — a platform-side "no
+  selection" and a standalone `donmai agent run --interactive` invocation
+  both stay on the codex CLI's own default rather than being pinned to
+  `DefaultCodexModel`.
+
+Neither lane validates a model id before spawn — codex is the sole
+authority. A rejected id surfaces as codex's own nonzero exit (or, for the
+headless lane, a JSON-RPC error), never a silent fallback to a different
+model.
+
 ## Startup trust (interactive spawn mode)
 
 The codex TUI holds modal startup reviews before it reads a keystroke, and a

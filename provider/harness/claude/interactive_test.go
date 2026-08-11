@@ -184,6 +184,67 @@ func TestInteractiveArgs_AutonomousMatchesHeadlessPermissionMode(t *testing.T) {
 	})
 }
 
+// TestInteractiveArgs_ModelMatchesHeadless is the regression guard for the
+// platform-model-selection defect: the interactive REPL used to DROP
+// Spec.Model entirely, so a session dispatched with a platform-resolved
+// model (ResolvedProfile.Model on the wire, projected onto Spec.Model by
+// translateSpec) launched under the CLI's own default model in interactive
+// mode while the headless run built from the identical Spec honored the
+// selection via buildArgs' "--model" flag (cli_args.go). It asserts the two
+// spawn modes agree by comparing against buildArgs' own output rather than a
+// hard-coded string, mirroring
+// TestInteractiveArgs_AutonomousMatchesHeadlessPermissionMode above.
+func TestInteractiveArgs_ModelMatchesHeadless(t *testing.T) {
+	t.Parallel()
+
+	const flag = "--model"
+	modelOf := func(argv []string) (string, bool) {
+		i := slices.Index(argv, flag)
+		if i < 0 || i+1 >= len(argv) {
+			return "", false
+		}
+		return argv[i+1], true
+	}
+
+	t.Run("model selected", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Prompt: "ship it", Model: "gpt-5.6-sol"}
+
+		headless, _ := buildArgs(spec, "", "")
+		headlessModel, ok := modelOf(headless)
+		if !ok {
+			t.Fatalf("headless buildArgs dropped %s", flag)
+		}
+
+		interactiveModel, ok := modelOf(interactiveArgs(spec))
+		if !ok {
+			t.Fatalf("interactiveArgs dropped %s for a selected model: %q", flag, interactiveArgs(spec))
+		}
+		if interactiveModel != headlessModel {
+			t.Errorf("model divergence: interactive=%q headless=%q", interactiveModel, headlessModel)
+		}
+	})
+
+	t.Run("no model selected", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Prompt: "ship it"}
+
+		headless, _ := buildArgs(spec, "", "")
+		if _, ok := modelOf(headless); ok {
+			t.Errorf("headless buildArgs emitted %s with no model selected: %q", flag, headless)
+		}
+		got := interactiveArgs(spec)
+		if _, ok := modelOf(got); ok {
+			t.Errorf("interactiveArgs emitted %s with no model selected: %q", flag, got)
+		}
+		// The REPL must be left to the CLI's own default model, not silently
+		// widened — no --model flag of any shape.
+		if slices.Contains(got, flag) {
+			t.Errorf("non-selected interactive argv carries a %s flag: %q", flag, got)
+		}
+	})
+}
+
 // TestInteractiveArgs_PromptIsAlwaysLast pins the positional-argument
 // invariant: claude parses a bare prompt positionally, so any flag emitted
 // after it would swallow it (or the prompt would be read as a flag value).
