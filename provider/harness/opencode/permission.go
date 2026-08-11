@@ -68,14 +68,29 @@ func newPermEngine(spec agent.Spec) *permEngine {
 		e.hasPolicy = true
 		e.allowRegexes = compilePermPatterns(cfg.AllowPatterns)
 		e.denyRegexes = compilePermPatterns(cfg.DisallowPatterns)
-		switch strings.ToLower(cfg.DefaultDecision) {
-		case "deny", "prompt":
-			e.autoApprove = false
-		case "allow", "":
-			e.autoApprove = true
-		}
+		e.autoApprove = !permissionDefaultNeedsLivePump(cfg)
 	}
 	return e
+}
+
+// permissionDefaultNeedsLivePump reports whether cfg's DefaultDecision
+// requires a live adjudicator rather than auto-approve. Shared by
+// newPermEngine (which live pump this drives, Lane B only) and
+// useServerLane's non-allow-default need signal (opencode.go), so a spec
+// whose default needs a live pump is always routed to the lane that has one
+// — the two checks can never drift apart. A nil cfg, "allow", "", or any
+// value this switch does not recognize all auto-approve (mirrors the prior
+// inline switch's fallthrough-to-initial-true behavior exactly).
+func permissionDefaultNeedsLivePump(cfg *agent.PermissionConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	switch strings.ToLower(cfg.DefaultDecision) {
+	case "deny", "prompt":
+		return true
+	default:
+		return false
+	}
 }
 
 func compilePermPatterns(patterns []string) []*regexp.Regexp {
