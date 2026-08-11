@@ -660,20 +660,122 @@ func TestAdmissionReceiptProjectsLifecycleRequirementsAndReceiptLink(t *testing.
 	if !ok {
 		t.Fatal("claude autonomous profile missing")
 	}
+	// A cell that was admitted with watch, replay, and cancel must adapt
+	// against a harness whose profile declares all three. This whole class of
+	// admitted cell used to be unspawnable: the lifecycle, replay, and cleanup
+	// lanes denied for every harness alike regardless of what its manifest
+	// declared, so admission granted capabilities the executor always refused.
 	_, receipt, err := agent.AdaptToolLifecycle(spec, profile)
-	var adaptationErr *agent.ToolAdaptationError
-	if !errors.As(err, &adaptationErr) || adaptationErr.Channel != agent.ToolChannelLifecycle {
-		t.Fatalf("AdaptToolLifecycle error = %v, want typed lifecycle denial", err)
+	if err != nil {
+		t.Fatalf("AdaptToolLifecycle: %v", err)
+	}
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready: %+v", receipt.Decision, receipt.Entries)
 	}
 	if receipt.AdmissionReceiptID != plan.AdmissionReceiptID || receipt.OperationalPayloadDigest != plan.OperationalPayloadDigest || receipt.Entries[0].InputDigest != parametersDigest {
-		t.Fatalf("linked denial receipt = %+v", receipt)
+		t.Fatalf("linked ready receipt = %+v", receipt)
 	}
+	lanes := map[agent.ToolLifecycleChannel]agent.ToolAdaptationOutcome{
+		agent.ToolChannelLifecycle: agent.ToolOutcomePendingRuntime,
+		agent.ToolChannelReplay:    agent.ToolOutcomePendingRuntime,
+		agent.ToolChannelCleanup:   agent.ToolOutcomePendingCleanup,
+	}
+	seen := map[agent.ToolLifecycleChannel]int{}
+	for _, entry := range receipt.Entries {
+		want, ok := lanes[entry.Channel]
+		if !ok {
+			t.Fatalf("unexpected channel %q on entry %+v", entry.Channel, entry)
+		}
+		seen[entry.Channel]++
+		if entry.Outcome != want || entry.Delivery == "" {
+			t.Errorf("entry %q = outcome %q via %q, want %q with a declared delivery", entry.ID, entry.Outcome, entry.Delivery, want)
+		}
+	}
+	if seen[agent.ToolChannelLifecycle] != len(plan.Lifecycle) || seen[agent.ToolChannelReplay] != 1 || seen[agent.ToolChannelCleanup] != 1 {
+		t.Fatalf("receipt lane coverage = %+v, want every projected requirement", seen)
+	}
+}
+
+// TestAdmissionWatchProjectionRequiresOnlyTheSessionBoundary pins which part of
+// a watch grant every mode must evidence. The session boundary stays required
+// so a mode that cannot report start and terminal result is not watchable at
+// all; the richer per-turn and per-tool evidence is optional, because a PTY
+// mode carries genuinely fewer event kinds and must record that gap on the
+// receipt rather than lose the whole session to it.
+func TestAdmissionWatchProjectionRequiresOnlyTheSessionBoundary(t *testing.T) {
+	t.Parallel()
+	qw := attachAdmittedExecutionCell(t, exactReceiptQueuedWork("session_watch_projection"),
+		exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionHumanControlled, []executioncell.CapabilityRequirement{{Name: "watch"}}))
+	immutable, err := executioncell.DecodeAdmissionReceipt(qw.AdmissionReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := bindAdmissionToolLifecyclePlan(agent.Spec{Interactive: &agent.InteractiveSpec{}}, immutable, executioncell.ImmutableClaimReceipt{})
+	if err != nil {
+		t.Fatalf("bindAdmissionToolLifecyclePlan: %v", err)
+	}
+	required := map[agent.EventKind]bool{}
+	for _, requirement := range spec.ToolLifecyclePlan.Lifecycle {
+		required[requirement.Event] = requirement.Required
+		if requirement.MinimumFidelity != agent.EvidenceCoarse {
+			t.Errorf("human-controlled watch %s fidelity = %q, want coarse", requirement.Event, requirement.MinimumFidelity)
+		}
+	}
+	want := map[agent.EventKind]bool{
+		agent.EventInit: true, agent.EventResult: true,
+		agent.EventAssistantText: false, agent.EventToolUse: false,
+		agent.EventToolResult: false, agent.EventError: false,
+	}
+	if len(required) != len(want) {
+		t.Fatalf("watch projected %d events, want %d", len(required), len(want))
+	}
+	for event, wantRequired := range want {
+		got, ok := required[event]
+		if !ok {
+			t.Fatalf("watch projection omitted %s", event)
+		}
+		if got != wantRequired {
+			t.Errorf("watch %s required = %v, want %v", event, got, wantRequired)
+		}
+	}
+	// The interactive profile then adapts: the boundary is delivered as
+	// terminal bytes and the undeliverable tool evidence is recorded, not fatal.
+	_, receipt, err := agent.AdaptToolLifecycle(spec, mustClaudeProfile(t, agent.PromptModeHumanControlled))
+	if err != nil {
+		t.Fatalf("interactive watch adaptation: %v", err)
+	}
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready: %+v", receipt.Decision, receipt.Entries)
+	}
+	var pending, denied int
+	for _, entry := range receipt.Entries {
+		switch entry.Outcome {
+		case agent.ToolOutcomePendingRuntime:
+			pending++
+		case agent.ToolOutcomeDenied:
+			denied++
+		default:
+			t.Errorf("entry %q outcome = %q", entry.ID, entry.Outcome)
+		}
+	}
+	if pending != 2 || denied != 4 {
+		t.Fatalf("interactive watch receipt = %d pending / %d denied, want 2/4", pending, denied)
+	}
+}
+
+func mustClaudeProfile(t *testing.T, mode agent.PromptSessionMode) agent.ToolLifecycleProfile {
+	t.Helper()
+	profile, ok := (&claude.Provider{}).Manifest().ToolLifecycleProfile(mode)
+	if !ok {
+		t.Fatalf("claude %s profile missing", mode)
+	}
+	return profile
 }
 
 func TestHostProviderViewCompilesAdmissionLifecycleBeforeChild(t *testing.T) {
 	provider := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
 	// Supply the real closed profiles while retaining a spawn counter.
-	providerWithManifest := &manifestSelectorProvider{selectorFakeProvider: provider, manifest: codexManifestForTest()}
+	providerWithManifest := &manifestSelectorProvider{selectorFakeProvider: provider, manifest: codexManifestForTest(), capabilities: codexCapabilitiesForTest()}
 	registry := NewRegistry()
 	if err := registry.Register(providerWithManifest); err != nil {
 		t.Fatal(err)
@@ -693,16 +795,29 @@ func TestHostProviderViewCompilesAdmissionLifecycleBeforeChild(t *testing.T) {
 	}
 	raw := rawJSONForRunner(t, detail)
 	receipt, err := NewProviderView(registry).PreflightExecution(raw)
-	if err == nil {
-		t.Fatal("watch adaptation unexpectedly ready")
+	if err != nil {
+		t.Fatalf("host compile of an admitted watch grant: %v receipt=%s", err, receipt)
 	}
-	var decoded struct {
-		Decision string                      `json:"decision"`
-		Tool     *agent.ToolLifecycleReceipt `json:"toolLifecycleReceipt"`
+	host, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if json.Unmarshal(receipt, &decoded) != nil || decoded.Decision != "denied" || decoded.Tool == nil || decoded.Tool.Decision != "denied" {
-		t.Fatalf("host denial receipt = %s err=%v", receipt, err)
+	var tool agent.ToolLifecycleReceipt
+	if err := json.Unmarshal(host.ToolLifecycleReceipt, &tool); err != nil {
+		t.Fatal(err)
 	}
+	if tool.Decision != "ready" {
+		t.Fatalf("host tool receipt = %+v, want ready", tool)
+	}
+	for _, entry := range tool.Entries {
+		if entry.Channel != agent.ToolChannelLifecycle {
+			continue
+		}
+		if entry.Required && entry.Outcome != agent.ToolOutcomePendingRuntime {
+			t.Errorf("required watch entry %q = %+v, want pending runtime evidence", entry.ID, entry)
+		}
+	}
+	// Compiling the adaptation is still a pre-spawn act: nothing runs yet.
 	if provider.spawnCalls.Load() != 0 {
 		t.Fatalf("provider spawned during host compile: %d", provider.spawnCalls.Load())
 	}
@@ -710,7 +825,7 @@ func TestHostProviderViewCompilesAdmissionLifecycleBeforeChild(t *testing.T) {
 
 func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 	provider := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
-	providerWithManifest := &manifestSelectorProvider{selectorFakeProvider: provider, manifest: codexManifestForTest()}
+	providerWithManifest := &manifestSelectorProvider{selectorFakeProvider: provider, manifest: codexManifestForTest(), capabilities: codexCapabilitiesForTest()}
 	registry := NewRegistry()
 	if err := registry.Register(providerWithManifest); err != nil {
 		t.Fatal(err)
@@ -775,11 +890,22 @@ func mustAdmissionReceipt(t *testing.T, raw json.RawMessage) executioncell.Immut
 
 type manifestSelectorProvider struct {
 	*selectorFakeProvider
-	manifest agent.HarnessManifest
+	manifest     agent.HarnessManifest
+	capabilities agent.Capabilities
 }
 
 func (p *manifestSelectorProvider) Manifest() agent.HarnessManifest { return p.manifest }
 
+// Capabilities must come from the same harness the manifest describes: spec
+// translation reads them to decide whether tool policy travels as a flat
+// allow-list or through the approval bridge, and a mismatch denies on the tool
+// channel before the lane under test is ever reached.
+func (p *manifestSelectorProvider) Capabilities() agent.Capabilities { return p.capabilities }
+
 func codexManifestForTest() agent.HarnessManifest {
 	return (&codex.Provider{}).Manifest()
+}
+
+func codexCapabilitiesForTest() agent.Capabilities {
+	return (&codex.Provider{}).Capabilities()
 }

@@ -152,50 +152,249 @@ func TestToolLifecycleAdapterUnsupportedPoliciesDeny(t *testing.T) {
 	}
 }
 
-func TestToolLifecycleRuntimeEvidenceRequirementsDenyWithoutPromotion(t *testing.T) {
+// runtimeEvidenceCase is one harness/mode answer for the three runtime-evidence
+// lanes. Every value is the exact delivery the harness profile declares, so a
+// manifest that stops declaring a boundary fails here rather than silently
+// downgrading what an admitted session is promised.
+type runtimeEvidenceCase struct {
+	name string
+	// wantLifecycle and wantReplay are the deliveries for the session-boundary
+	// events (init + terminal result); empty means the lane denies.
+	wantLifecycle agent.ToolDeliveryKind
+	wantReplay    agent.ToolDeliveryKind
+	wantCleanup   agent.ToolDeliveryKind
+	// wantToolEvents is the delivery for per-tool lifecycle evidence; empty
+	// means the profile declares no tool_use/tool_result event.
+	wantToolEvents agent.ToolDeliveryKind
+}
+
+// TestToolLifecycleRuntimeEvidenceIsPerHarness pins the truthful answer for
+// every shipped harness on the lifecycle, replay, and cleanup lanes. These
+// three channels used to be constructed unsupported-and-undowngradable for
+// every harness alike, so a session whose admitted cell granted watch, replay,
+// or cancel could never spawn anywhere — the executor refused a capability its
+// own manifests declared. The delivery boundary now comes from the exact
+// profile, which is the executor-attested inventory generated in this repo.
+func TestToolLifecycleRuntimeEvidenceIsPerHarness(t *testing.T) {
 	t.Parallel()
-	manifest := (&claude.Provider{}).Manifest()
+	const (
+		structured = agent.ToolDeliveryStructuredProviderEvents
+		replayed   = agent.ToolDeliveryStructuredEventReplay
+		coarse     = agent.ToolDeliveryCoarsePTYEvents
+		cast       = agent.ToolDeliveryTerminalCastReplay
+		cleanup    = agent.ToolDeliveryHandleCleanup
+	)
 	tests := []struct {
-		name    string
-		channel agent.ToolLifecycleChannel
-		plan    agent.ToolLifecyclePlan
+		manifest agent.HarnessManifest
+		mode     agent.PromptSessionMode
+		fidelity agent.EvidenceFidelity
+		runtimeEvidenceCase
 	}{
-		{"lifecycle", agent.ToolChannelLifecycle, agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, Lifecycle: []agent.LifecycleRequirement{{ID: "watch", Event: agent.EventInit, Required: true, MinimumFidelity: agent.EvidenceStructured}}}},
-		{"replay", agent.ToolChannelReplay, agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, Replay: &agent.LifecycleRequirement{ID: "replay", Event: agent.EventResult, Required: true, MinimumFidelity: agent.EvidenceStructured}}},
-		{"cleanup", agent.ToolChannelCleanup, agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, RequireCleanup: true}},
+		{(&claude.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"claude-headless", structured, replayed, cleanup, structured}},
+		{(&codex.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"codex-headless", structured, replayed, cleanup, structured}},
+		{(&amp.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"amp", structured, replayed, cleanup, structured}},
+		{(&pi.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"pi", structured, replayed, cleanup, structured}},
+		{(&opencode.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"opencode", structured, replayed, cleanup, structured}},
+		{(&gemini.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"gemini", structured, replayed, cleanup, structured}},
+		// A completion-only endpoint watches its own session boundary but runs
+		// no tools, so the per-tool events are truthfully absent.
+		{(&ollama.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"ollama", structured, replayed, cleanup, ""}},
+		// A PTY mode carries the session boundary as terminal bytes and may not
+		// inherit the headless mode's structured tool evidence.
+		{(&claude.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"claude-interactive", coarse, cast, cleanup, ""}},
+		{(&codex.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"codex-interactive", coarse, cast, cleanup, ""}},
+		{(&shell.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"shell", coarse, cast, cleanup, ""}},
+		// Antigravity drives a PTY with no replay adapter at all: coarse
+		// lifecycle evidence is deliverable, replay is not, and neither is a
+		// structured claim over the same bytes.
+		{(&agycli.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceCoarse, runtimeEvidenceCase{"agy-cli-coarse", coarse, "", cleanup, coarse}},
+		{(&agycli.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"agy-cli-structured", "", "", cleanup, ""}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{Autonomous: true, ToolLifecyclePlan: &tc.plan}, mustProfile(t, manifest, agent.PromptModeAutonomous))
-			var adaptationErr *agent.ToolAdaptationError
-			if !errors.As(err, &adaptationErr) || adaptationErr.Channel != tc.channel || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported {
-				t.Fatalf("error = %v, want typed %s denial", err, tc.channel)
+			t.Parallel()
+			spec := agent.Spec{Autonomous: true}
+			if tc.mode == agent.PromptModeHumanControlled {
+				spec = agent.Spec{Interactive: &agent.InteractiveSpec{}}
 			}
-			if len(receipt.Entries) != 1 || receipt.Entries[0].Outcome != agent.ToolOutcomeDenied {
-				t.Fatalf("receipt = %+v, want explicit denied entry", receipt)
+			// Every requirement is optional so one lane's honest refusal cannot
+			// mask another lane's answer; the required-entry denial is pinned
+			// by TestToolLifecycleUndeliverableRequiredRuntimeEvidenceDenies.
+			plan := agent.ToolLifecyclePlan{
+				ContractVersion: agent.ToolLifecycleContractVersion,
+				Lifecycle: []agent.LifecycleRequirement{
+					{ID: "boundary-init", Event: agent.EventInit, MinimumFidelity: tc.fidelity},
+					{ID: "boundary-result", Event: agent.EventResult, MinimumFidelity: tc.fidelity},
+					{ID: "tool-use", Event: agent.EventToolUse, MinimumFidelity: tc.fidelity},
+				},
+				Replay:         &agent.LifecycleRequirement{ID: "replay", Event: agent.EventResult, MinimumFidelity: tc.fidelity},
+				RequireCleanup: true,
+			}
+			spec.ToolLifecyclePlan = &plan
+			_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, tc.manifest, tc.mode))
+			if err != nil {
+				t.Fatalf("AdaptToolLifecycle: %v", err)
+			}
+			if receipt.Decision != "ready" {
+				t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+			}
+			want := map[string]struct {
+				delivery agent.ToolDeliveryKind
+				pending  agent.ToolAdaptationOutcome
+			}{
+				"boundary-init":   {tc.wantLifecycle, agent.ToolOutcomePendingRuntime},
+				"boundary-result": {tc.wantLifecycle, agent.ToolOutcomePendingRuntime},
+				"tool-use":        {tc.wantToolEvents, agent.ToolOutcomePendingRuntime},
+				"replay":          {tc.wantReplay, agent.ToolOutcomePendingRuntime},
+				"cleanup":         {tc.wantCleanup, agent.ToolOutcomePendingCleanup},
+			}
+			if len(receipt.Entries) != len(want) {
+				t.Fatalf("receipt entries = %d, want %d: %+v", len(receipt.Entries), len(want), receipt.Entries)
+			}
+			for _, entry := range receipt.Entries {
+				expected, ok := want[entry.ID]
+				if !ok {
+					t.Fatalf("unexpected receipt entry %q", entry.ID)
+				}
+				delete(want, entry.ID)
+				if expected.delivery == "" {
+					if entry.Outcome != agent.ToolOutcomeDenied || entry.DenialCode != agent.ToolDenialDeliveryUnsupported || entry.Delivery != "" {
+						t.Errorf("entry %q = %+v, want a truthful undeliverable denial", entry.ID, entry)
+					}
+					continue
+				}
+				if entry.Outcome != expected.pending || entry.Delivery != expected.delivery {
+					t.Errorf("entry %q = outcome %q via %q, want %q via %q", entry.ID, entry.Outcome, entry.Delivery, expected.pending, expected.delivery)
+				}
+			}
+			if len(want) != 0 {
+				t.Fatalf("receipt omitted entries %+v", want)
 			}
 		})
 	}
 }
 
-func TestToolLifecycleOptionalRuntimeEvidenceIsExplicitlyDeniedNotPending(t *testing.T) {
+// A required runtime-evidence entry the exact profile cannot deliver still
+// denies before any provider side effect: the contract has no warn-and-strip
+// path for a required entry, and an admitted watch/replay grant the executor
+// cannot honour must fail here rather than be silently dropped at runtime.
+func TestToolLifecycleUndeliverableRequiredRuntimeEvidenceDenies(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		manifest agent.HarnessManifest
+		mode     agent.PromptSessionMode
+		plan     agent.ToolLifecyclePlan
+		channel  agent.ToolLifecycleChannel
+	}{
+		{
+			name: "replay adapter absent", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous,
+			plan: agent.ToolLifecyclePlan{
+				ContractVersion: agent.ToolLifecycleContractVersion,
+				Replay:          &agent.LifecycleRequirement{ID: "replay", Event: agent.EventResult, Required: true, MinimumFidelity: agent.EvidenceCoarse},
+			},
+			channel: agent.ToolChannelReplay,
+		},
+		{
+			name: "coarse profile cannot answer a structured demand", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous,
+			plan: agent.ToolLifecyclePlan{
+				ContractVersion: agent.ToolLifecycleContractVersion,
+				Lifecycle:       []agent.LifecycleRequirement{{ID: "watch-init", Event: agent.EventInit, Required: true, MinimumFidelity: agent.EvidenceStructured}},
+			},
+			channel: agent.ToolChannelLifecycle,
+		},
+		{
+			name: "pty mode never emits tool events", manifest: (&shell.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled,
+			plan: agent.ToolLifecyclePlan{
+				ContractVersion: agent.ToolLifecycleContractVersion,
+				Lifecycle:       []agent.LifecycleRequirement{{ID: "watch-tool", Event: agent.EventToolUse, Required: true, MinimumFidelity: agent.EvidenceCoarse}},
+			},
+			channel: agent.ToolChannelLifecycle,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			spec := agent.Spec{Autonomous: true}
+			if tc.mode == agent.PromptModeHumanControlled {
+				spec = agent.Spec{Interactive: &agent.InteractiveSpec{}}
+			}
+			plan := tc.plan
+			spec.ToolLifecyclePlan = &plan
+			_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, tc.manifest, tc.mode))
+			var adaptationErr *agent.ToolAdaptationError
+			if !errors.As(err, &adaptationErr) || adaptationErr.Channel != tc.channel || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported {
+				t.Fatalf("error = %v, want typed %s denial", err, tc.channel)
+			}
+			if receipt.Decision != "denied" || receipt.Entries[len(receipt.Entries)-1].Outcome != agent.ToolOutcomeDenied {
+				t.Fatalf("receipt = %+v, want denied entry", receipt)
+			}
+		})
+	}
+}
+
+// A fidelity shortfall is what an authorized downgrade names: the caller
+// authorized coarse evidence before admission and the exact profile declares
+// that alternate, so the entry is recorded downgraded against its
+// authorization rather than denied. Without that authorization the same demand
+// denies, so a coarse profile never inherits a structured claim by default.
+func TestToolLifecycleFidelityShortfallTakesOnlyAnAuthorizedDowngrade(t *testing.T) {
+	t.Parallel()
+	profile := mustProfile(t, (&claude.Provider{}).Manifest(), agent.PromptModeHumanControlled)
+	newPlan := func() agent.ToolLifecyclePlan {
+		return agent.ToolLifecyclePlan{
+			ContractVersion: agent.ToolLifecycleContractVersion,
+			Lifecycle:       []agent.LifecycleRequirement{{ID: "watch-init", Event: agent.EventInit, Required: true, MinimumFidelity: agent.EvidenceStructured}},
+		}
+	}
+	authorized := newPlan()
+	authorized.AuthorizedFallbacks = []agent.ToolLifecycleFallback{
+		{ID: "operator-authorized-coarse", Channel: agent.ToolChannelLifecycle, To: agent.ToolDeliveryCoarsePTYEvents},
+	}
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{Interactive: &agent.InteractiveSpec{}, ToolLifecyclePlan: &authorized}, profile)
+	if err != nil {
+		t.Fatalf("authorized downgrade must adapt cleanly, got %v", err)
+	}
+	if len(receipt.Entries) != 1 {
+		t.Fatalf("receipt = %+v, want one entry", receipt)
+	}
+	entry := receipt.Entries[0]
+	if entry.Outcome != agent.ToolOutcomeDowngraded || entry.Delivery != agent.ToolDeliveryCoarsePTYEvents || entry.FallbackAuthID != "operator-authorized-coarse" {
+		t.Fatalf("entry = %+v, want a downgrade naming its authorization", entry)
+	}
+
+	unauthorized := newPlan()
+	_, _, err = agent.AdaptToolLifecycle(agent.Spec{Interactive: &agent.InteractiveSpec{}, ToolLifecyclePlan: &unauthorized}, profile)
+	var adaptationErr *agent.ToolAdaptationError
+	if !errors.As(err, &adaptationErr) || adaptationErr.Channel != agent.ToolChannelLifecycle {
+		t.Fatalf("error = %v, want typed lifecycle denial without an authorized downgrade", err)
+	}
+}
+
+// An optional runtime-evidence entry the profile cannot deliver stays visible
+// on the receipt and does not fail the session: optional denial is truthful
+// and visible, and only a required entry denies admission.
+func TestToolLifecycleOptionalUndeliverableRuntimeEvidenceIsRecordedNotFatal(t *testing.T) {
 	t.Parallel()
 	plan := agent.ToolLifecyclePlan{
 		ContractVersion: agent.ToolLifecycleContractVersion,
-		Lifecycle:       []agent.LifecycleRequirement{{ID: "watch", Event: agent.EventInit, MinimumFidelity: agent.EvidenceStructured}},
-		Replay:          &agent.LifecycleRequirement{ID: "replay", Event: agent.EventResult, MinimumFidelity: agent.EvidenceStructured},
+		Lifecycle: []agent.LifecycleRequirement{
+			{ID: "watch-init", Event: agent.EventInit, Required: true, MinimumFidelity: agent.EvidenceCoarse},
+			{ID: "watch-tool-use", Event: agent.EventToolUse, MinimumFidelity: agent.EvidenceCoarse},
+		},
 	}
-	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{Autonomous: true, ToolLifecyclePlan: &plan}, mustProfile(t, (&claude.Provider{}).Manifest(), agent.PromptModeAutonomous))
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{Interactive: &agent.InteractiveSpec{}, ToolLifecyclePlan: &plan}, mustProfile(t, (&claude.Provider{}).Manifest(), agent.PromptModeHumanControlled))
 	if err != nil {
-		t.Fatalf("AdaptToolLifecycle: %v", err)
+		t.Fatalf("optional undeliverable evidence must not fail the spawn, got %v", err)
 	}
 	if receipt.Decision != "ready" || len(receipt.Entries) != 2 {
-		t.Fatalf("receipt = %+v", receipt)
+		t.Fatalf("receipt = %+v, want a ready receipt with both entries", receipt)
 	}
-	for _, entry := range receipt.Entries {
-		if entry.Outcome != agent.ToolOutcomeDenied {
-			t.Fatalf("entry = %+v, want explicit denial rather than pending", entry)
-		}
+	if receipt.Entries[0].Outcome != agent.ToolOutcomePendingRuntime || receipt.Entries[0].Delivery != agent.ToolDeliveryCoarsePTYEvents {
+		t.Fatalf("required boundary entry = %+v, want pending coarse delivery", receipt.Entries[0])
+	}
+	if receipt.Entries[1].Outcome != agent.ToolOutcomeDenied || receipt.Entries[1].DenialCode != agent.ToolDenialDeliveryUnsupported {
+		t.Fatalf("optional tool entry = %+v, want a recorded denial", receipt.Entries[1])
 	}
 }
 
@@ -218,7 +417,7 @@ func TestToolLifecycleFallbackCannotInventMissingEvent(t *testing.T) {
 
 func TestToolLifecycleReceiptIsDigestOnlyAndPersistenceFailsClosed(t *testing.T) {
 	t.Parallel()
-	secret := "REN2041_DO_NOT_LEAK"
+	secret := "MCP_SERVER_TOKEN_DO_NOT_LEAK"
 	manifest := (&claude.Provider{}).Manifest()
 	spec := agent.Spec{
 		Autonomous: true,
@@ -367,7 +566,7 @@ func TestToolLifecycleMalformedPermissionRegexFailsBeforeDelivery(t *testing.T) 
 	}
 }
 
-// REN-2188: agent cards express permissions as tool designators
+// Agent cards express permissions as tool designators
 // ("Bash(git *)", "Bash(*)", "Read"), the runner's AllowedTools bridge
 // forwards them into PermissionConfig verbatim, and the codex approval
 // bridge consumes that grammar natively — so adaptation must accept
