@@ -71,14 +71,27 @@ function selfSHA256(): string {
 }
 
 export default function activate(pi: ExtensionAPI) {
+  // The harness sets DONMAI_PI_HANDSHAKE only for the headless RPC lane. Its
+  // PRESENCE is what distinguishes the two spawn modes to this extension:
+  //
+  //   - RPC mode (token set): the Go harness drives pi over `--mode rpc` and
+  //     consumes ctx.ui round-trips as extension_ui_request/response frames on
+  //     stdio. The handshake + per-call adjudication below run, and the boundary
+  //     is fail-closed (no tool executes until the Go side verifies us).
+  //
+  //   - Interactive PTY mode (token absent): the bare `pi` TUI is attached to a
+  //     human, there is NO Go RPC consumer, and a ctx.ui round-trip would render
+  //     a raw JSON prompt AT the human's terminal — a UI artifact — while
+  //     blocking every tool on a verdict that can never arrive. So the handshake
+  //     and adjudication are SKIPPED; the human at the terminal plus pi's own
+  //     native approval UI is the tool authority. The pi/interactive
+  //     tool-lifecycle profile declares exactly this injected-boundary gap.
+  //
+  // Provider registration below is UNCONDITIONAL either way — it needs no RPC,
+  // and it is what points the session at the resolved cell endpoint in BOTH
+  // modes.
   const token = process.env.DONMAI_PI_HANDSHAKE ?? "";
-  const sha = selfSHA256();
-
-  // verified flips true only once the Go side acknowledges the handshake. Until
-  // then every tool call is blocked — the boundary is fail-closed even if the
-  // Go side is slow to answer or the handshake is rejected.
-  let verified = false;
-  let handshakeSettled = false;
+  const rpcMode = token !== "";
 
   // Provider pin: register the single "donmai" provider from env so the session
   // can only route to the resolved cell. Key is read at runtime, never inlined.
@@ -105,11 +118,25 @@ export default function activate(pi: ExtensionAPI) {
         ],
       });
     } catch {
-      // A registration failure must not run the session unguarded; the Go side
-      // still gates on the handshake, and tool calls stay blocked until
-      // verified.
+      // A registration failure must not run the session unguarded; in RPC mode
+      // the Go side still gates on the handshake, and tool calls stay blocked
+      // until verified.
     }
   }
+
+  // Interactive PTY mode: no handshake, no blocking adjudication (see above).
+  // Provider registration already ran, which is all this mode needs from us.
+  if (!rpcMode) {
+    return;
+  }
+
+  const sha = selfSHA256();
+
+  // verified flips true only once the Go side acknowledges the handshake. Until
+  // then every tool call is blocked — the boundary is fail-closed even if the
+  // Go side is slow to answer or the handshake is rejected.
+  let verified = false;
+  let handshakeSettled = false;
 
   // Handshake at session_start. Fire-and-forget: awaiting a ctx.ui round-trip
   // inside the awaited session_start handler stalls pi's startup, so the

@@ -115,7 +115,41 @@ func (p *Provider) Name() agent.ProviderName { return agent.ProviderPi }
 // the policy extension materialized AND its handshake verified (design §2
 // step 3).
 func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	// Admit + endpoint-project the spec BEFORE the interactive/headless split so
+	// a gateway-backed binding (model override, DONMAI_PI_KEY mirror, provider-
+	// pin env) reaches BOTH spawn modes from birth. This bakes in the lesson the
+	// claude interactive-endpoint fix had to RETROFIT (sibling of #323, whose
+	// interactive spawn forked off before applyEndpoint ran) rather than
+	// repeating it: pi's interactive path consumes the binding from the start.
+	spec, err := p.prepare(spec)
+	if err != nil {
+		return nil, err
+	}
+	// Interactive PTY spawn mode: capability-gated on the LIVE manifest (mirrors
+	// claude.go / codex.go), so an edit that flips SupportsInteractivePTY back to
+	// false silently falls through to the headless RPC lane instead of crashing.
+	if spec.Interactive != nil && p.Manifest().Caps.SupportsInteractivePTY {
+		return p.spawnInteractive(ctx, spec)
+	}
 	return p.launch(ctx, spec, launchPrompt, "")
+}
+
+// prepare admits the spec against the pi manifest and projects the resolved
+// endpoint binding onto it. It runs in Spawn/Resume, ahead of any spawn-mode
+// split, so launch and spawnInteractive both receive one admitted,
+// endpoint-projected spec — the interactive lane never sees a raw, unprojected
+// binding.
+func (p *Provider) prepare(spec agent.Spec) (agent.Spec, error) {
+	var err error
+	spec, err = agent.PrepareHarness(spec, p.Manifest())
+	if err != nil {
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	spec, err = applyEndpoint(spec)
+	if err != nil {
+		return spec, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	return spec, nil
 }
 
 // Resume re-execs `pi --mode rpc` against the persisted session and replays
@@ -131,6 +165,10 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if sessionID == "" {
 		return nil, agent.ErrSessionNotFound
 	}
+	spec, err := p.prepare(spec)
+	if err != nil {
+		return nil, err
+	}
 	return p.launch(ctx, spec, launchResume, sessionID)
 }
 
@@ -143,16 +181,9 @@ const (
 )
 
 func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode, sessionID string) (agent.Handle, error) {
-	var err error
-	spec, err = agent.PrepareHarness(spec, p.Manifest())
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
-	}
-	spec, err = applyEndpoint(spec)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
-	}
-
+	// spec is already admitted + endpoint-projected by prepare() (called in
+	// Spawn/Resume before the spawn-mode split).
+	//
 	// Materialize the policy extension BEFORE spawning. A materialization
 	// failure means no boundary — fail closed.
 	layout, err := materializeExtension(spec.Cwd)

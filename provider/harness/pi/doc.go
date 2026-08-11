@@ -142,4 +142,31 @@
 //   - extension.go      — materialize + token/SHA-verify the embedded policy extension (§5.2)
 //   - extensions/donmai-policy.ts — the embedded extension (tool_call hook + handshake)
 //   - spec_translation.go — agent.Spec → argv/env/config
+//   - interactive.go    — bare-`pi` PTY spawn mode via the shared ptycli driver (see below)
+//
+// # Interactive PTY spawn mode (the endpoint-driven cell)
+//
+// Spawn routes Spec.Interactive != nil to spawnInteractive (interactive.go),
+// which execs the bare `pi` TUI under the shared ptycli driver — the same PTY
+// spawn-mode shape claude/codex/shell use. It is a per-Spawn MODE, not a
+// Transport change: the manifest keeps Transport subprocess-jsonrpc for the
+// headless loop and additionally declares SupportsInteractivePTY.
+//
+// The endpoint binding is consumed FROM BIRTH: Spawn runs prepare()
+// (PrepareHarness + applyEndpoint) BEFORE the interactive/headless split, so the
+// provider pin argv (`--provider donmai --model <id>`) and the DONMAI_PI_* pin
+// env are minted from the same projected spec both modes see — a gateway-backed
+// pi interactive session reaches the resolved endpoint exactly as headless does.
+// This is the preventive form of the retrofit claude's interactive spawn needed
+// (its spawnInteractive forked off before applyEndpoint ran).
+//
+// The SAME embedded extension loads (never a second file). Its provider
+// registration from env is unconditional; the handshake + Go adjudication
+// round-trip below are RPC-mode-only — the extension skips them when
+// DONMAI_PI_HANDSHAKE is absent, which the interactive spawn deliberately never
+// sets. In PTY mode the human at the attached terminal plus pi's own native
+// approval UI is the tool authority, and the pi/interactive tool-lifecycle
+// profile declares that injected-boundary GAP rather than inheriting the
+// headless profile's evidence (ADR-2026-08-06 D6). The A5 seam contract is
+// unchanged: one embedded file, one handshake, one adjudication channel.
 package pi

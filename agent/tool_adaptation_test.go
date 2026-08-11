@@ -35,7 +35,7 @@ func TestToolLifecycleAdapterMatrix(t *testing.T) {
 		{"amp", (&amp.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, true, false, true},
 		{"agy-cli", (&agycli.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, false, false, false},
 		{"opencode", (&opencode.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, true, true, true},
-		{"pi", (&pi.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, false, true, true},
+		{"pi", (&pi.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}, false, true, true},
 		{"shell", (&shell.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeHumanControlled}, false, false, false},
 	}
 	for _, tc := range tests {
@@ -203,6 +203,10 @@ func TestToolLifecycleRuntimeEvidenceIsPerHarness(t *testing.T) {
 		// inherit the headless mode's structured tool evidence.
 		{(&claude.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"claude-interactive", coarse, cast, cleanup, ""}},
 		{(&codex.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"codex-interactive", coarse, cast, cleanup, ""}},
+		// pi interactive carries the SAME coarse PTY boundary as claude/codex —
+		// terminal-cast replay, no structured per-tool evidence — proving the
+		// interactive profile does not inherit pi's structured headless evidence.
+		{(&pi.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"pi-interactive", coarse, cast, cleanup, ""}},
 		{(&shell.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.EvidenceCoarse, runtimeEvidenceCase{"shell", coarse, cast, cleanup, ""}},
 		// Antigravity drives a PTY with no replay adapter at all: coarse
 		// lifecycle evidence is deliverable, replay is not, and neither is a

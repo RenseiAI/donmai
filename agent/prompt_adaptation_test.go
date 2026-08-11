@@ -39,6 +39,7 @@ func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 		{name: "agy/headless", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "opencode/headless", manifest: (&opencode.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "pi/headless", manifest: (&pi.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
+		{name: "pi/interactive", manifest: (&pi.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true, contextInUser: true},
 		{name: "shell/interactive", manifest: (&shell.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled},
 	}
 

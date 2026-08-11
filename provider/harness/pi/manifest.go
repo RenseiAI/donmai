@@ -28,6 +28,11 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // local endpoint or routing via google × local, deferred as a follow-up.
 func (*Provider) Manifest() agent.HarnessManifest {
 	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventToolProgress, agent.EventResult, agent.EventError}
+	// The interactive PTY spawn mode observes only the coarse Init/terminal
+	// boundary the shared ptycli driver emits (byte-accurate terminal stream is
+	// the product; program decision D4) — never the structured per-tool events
+	// the headless RPC lane carries.
+	ptyEvents := []agent.EventKind{agent.EventInit, agent.EventResult}
 	return agent.HarnessManifest{
 		Name:        agent.HarnessPi,
 		HumanLabel:  "pi",
@@ -51,6 +56,14 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			NativeJSONMode:          false, // no server-constrained structured output ⇒ spawn-collect
 			ToolPermissionFormat:    "claude",
 			StreamingTransport:      "ndjson",
+			// SupportsInteractivePTY declares an ADDITIONAL spawn mode (the bare
+			// `pi` TUI under the shared ptycli driver — see interactive.go), NOT
+			// a change to the declared Transport: Transport (subprocess-jsonrpc,
+			// below) still names how the DEFAULT headless loop runs. The two are
+			// orthogonal, exactly as claude/manifest.go and codex/manifest.go
+			// document; PTY is selected per Spawn call by Spec.Interactive != nil,
+			// never by a Transport value.
+			SupportsInteractivePTY: true,
 			// `pi --mode rpc` carries an explicit steering verb on the same
 			// JSONL channel that drives the session: Handle.Inject maps to
 			// steer while a turn is in flight and follow_up while idle
@@ -70,21 +83,59 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			},
 			Transport: agent.TransportSubprocessRPC,
 		},
-		PromptDelivery: []agent.PromptDeliveryProfile{{
-			ID: "pi/headless/rpc-v1", Mode: agent.PromptModeAutonomous,
-			SystemDelivery: agent.PromptDeliveryPiSystemAppend, BaseAppendDelivery: agent.PromptDeliveryPiSystemAppend,
-			BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryPiSystemAppend,
-			UserDelivery: agent.PromptDeliveryPiRPCPrompt, AmendmentDelivery: agent.PromptDeliveryPiRPCPrompt,
-		}},
-		ToolLifecycle: []agent.ToolLifecycleProfile{{
-			ID: "pi/headless/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
-			ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
-			NativeToolPolicyDelivery: agent.ToolDeliveryPiInjectedBoundary, PermissionConfigDelivery: agent.ToolDeliveryPiInjectedBoundary,
-			MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
-			LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: events,
-			ReplayDelivery: agent.ToolDeliveryStructuredEventReplay, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: events,
-			CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
-		}},
+		PromptDelivery: []agent.PromptDeliveryProfile{
+			{
+				ID: "pi/headless/rpc-v1", Mode: agent.PromptModeAutonomous,
+				SystemDelivery: agent.PromptDeliveryPiSystemAppend, BaseAppendDelivery: agent.PromptDeliveryPiSystemAppend,
+				BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryPiSystemAppend,
+				UserDelivery: agent.PromptDeliveryPiRPCPrompt, AmendmentDelivery: agent.PromptDeliveryPiRPCPrompt,
+			},
+			{
+				// Interactive PTY: system instructions still ride pi's
+				// `--append-system-prompt` CLI flag (a global flag the bare TUI
+				// honors exactly as the headless lane does), but the user prompt
+				// and initial context are seeded as pi's positional prompt
+				// argument — the coarse PTY-seed channel, not an RPC prompt frame
+				// (there is no RPC channel in this spawn mode). Mirrors the
+				// codex/interactive PromptDelivery shape.
+				ID: "pi/interactive/pty-v1", Mode: agent.PromptModeHumanControlled,
+				SystemDelivery: agent.PromptDeliveryPiSystemAppend, BaseAppendDelivery: agent.PromptDeliveryPiSystemAppend,
+				BaseReplaceDelivery: agent.PromptDeliveryUnsupported, ContextDelivery: agent.PromptDeliveryPiPTYSeed,
+				UserDelivery: agent.PromptDeliveryPiPTYSeed, AmendmentDelivery: agent.PromptDeliveryPiPTYSeed,
+			},
+		},
+		ToolLifecycle: []agent.ToolLifecycleProfile{
+			{
+				ID: "pi/headless/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
+				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
+				NativeToolPolicyDelivery: agent.ToolDeliveryPiInjectedBoundary, PermissionConfigDelivery: agent.ToolDeliveryPiInjectedBoundary,
+				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+				LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: events,
+				ReplayDelivery: agent.ToolDeliveryStructuredEventReplay, ReplayFidelity: agent.EvidenceStructured, ReplayEvents: events,
+				CleanupDelivery: agent.ToolDeliveryHandleCleanup, EvidenceTier: "unit_verified",
+			},
+			{
+				// Interactive PTY tells the D6 truth (ADR-2026-08-06): the coarse
+				// terminal boundary the shared ptycli driver emits, replayed as a
+				// terminal cast — NOT the headless lane's structured per-tool
+				// events. It deliberately does NOT claim
+				// pi_handshake_policy_extension: in PTY mode the Go adjudication
+				// round-trip has no RPC channel, so the HUMAN at the attached
+				// terminal plus pi's own native approval UI is the tool authority.
+				// Declaring the injected-boundary GAP (Unsupported) rather than
+				// inheriting the headless profile's evidence is D6's exact
+				// requirement — interactive evidence never inherits headless.
+				ID: "pi/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
+				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
+				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+				LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
+				ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: ptyEvents,
+				CleanupDelivery:    agent.ToolDeliveryHandleCleanup,
+				FallbackDeliveries: []agent.ToolDeliveryKind{agent.ToolDeliveryCoarsePTYEvents, agent.ToolDeliveryTerminalCastReplay},
+				EvidenceTier:       "unit_verified",
+			},
+		},
 	}
 }
 
