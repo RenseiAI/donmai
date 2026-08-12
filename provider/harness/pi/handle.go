@@ -67,12 +67,28 @@ type Handle struct {
 	// while idle.
 	turnInFlight atomic.Bool
 
+	// settled mirrors mapperState.settled for cross-goroutine reads: true
+	// once agent_settled has been processed (mutated only from dispatch, on
+	// h.run's goroutine, right after mapEvent updates h.state.settled on the
+	// same goroutine — this field is the atomic copy Inject reads from a
+	// different goroutine). Per docs/rpc.md, agent_settled means "Pi will not
+	// continue automatically through ... queued follow-up messages" — so once
+	// settled, Inject must send a fresh `prompt` (starts a new low-level run
+	// within the SAME session) rather than `follow_up` (which would queue
+	// into a run that no longer exists and never be delivered).
+	settled atomic.Bool
+
 	idMu      sync.RWMutex
 	sessionID string // resolved from the get_state response; guarded by idMu
 
-	// Close protocol (identical discipline to codex/handle.go): eventsMu +
-	// eventsClosed gate every send; closeEvents is the single idempotent
-	// closer; h.closed broadcasts teardown to unblock a slow send.
+	// Close protocol (same locking discipline as codex/handle.go: eventsMu +
+	// eventsClosed gate every send, closeEvents is the single idempotent
+	// closer, h.closed broadcasts teardown to unblock a slow send) — but a
+	// DIFFERENT trigger: codex closes on every terminal event, pi closes
+	// only on a fatal one (see dispatch/run). An ordinary completed turn
+	// leaves both channels open so a later Handle.Inject still has a live
+	// pump to deliver into; only Stop, a fatal abort, or the underlying
+	// stream's own EOF actually close them.
 	events       chan agent.Event
 	closeOnce    sync.Once
 	closedOnce   sync.Once
@@ -104,12 +120,43 @@ func (h *Handle) SessionID() string {
 	return h.sessionID
 }
 
-// Events returns the read-only event channel; closed after the terminal event.
+// Events returns the read-only event channel. Closed once the session is
+// truly over: a fatal abort (handshake/policy failure, a policy-bypass
+// abort, or an unrecoverable stream error) closes it immediately; an
+// ordinary completed turn (agent_settled) does NOT — the pump stays up so a
+// later Handle.Inject can still land and drive a follow-up turn. Stop
+// always closes it, whichever path got there first.
 func (h *Handle) Events() <-chan agent.Event { return h.events }
 
-// Inject sends a follow-up user message. It maps to steer when a turn is in
-// flight, else follow_up (design §7). The queue_update events pi emits in
-// response are surfaced as SystemEvents by the pump.
+// Inject sends a follow-up user message, routed by session state (design §7,
+// corrected against docs/rpc.md's agent_settled semantics — see the settled
+// field's comment):
+//
+//   - Turn in flight (turnInFlight) → "steer": delivered after the current
+//     assistant turn finishes its tool calls, before the next LLM call.
+//   - Idle but not yet settled (a run is active server-side even though this
+//     Handle has not observed a streaming event yet — e.g. immediately after
+//     Spawn, before the first event arrives) → "follow_up": queued and
+//     delivered once that active run has no more tool calls or steering
+//     messages.
+//   - Already settled (agent_settled observed) → "prompt": pi's own docs are
+//     explicit that a settled run does NOT automatically drain a queued
+//     follow_up ("Pi will not continue automatically through ... queued
+//     follow-up messages"), so a follow_up sent here would sit in the queue
+//     forever. A fresh `prompt` command starts a new low-level agent run
+//     within the SAME RPC session (conversation history intact) — unlike
+//     new_session, which would discard it — so it is the correct way to
+//     resume a session the runner wants to steer or memory-inject into after
+//     it has already completed a turn (runner/loop.go's drainMemoryInjects
+//     and runner/steering.go's attemptSteering both call Inject at exactly
+//     this post-terminal seam).
+//
+// The queue_update / turn_start / ... events pi emits in response are
+// surfaced as SystemEvents by the pump.
+//
+// Injecting after a FATAL close (handshake/policy failure, a policy-bypass
+// abort, or Stop) fails with "session closed": there is no live session left
+// to send any of the three commands to.
 func (h *Handle) Inject(_ context.Context, text string) error {
 	select {
 	case <-h.closed:
@@ -117,8 +164,11 @@ func (h *Handle) Inject(_ context.Context, text string) error {
 	default:
 	}
 	cmd := "follow_up"
-	if h.turnInFlight.Load() {
+	switch {
+	case h.turnInFlight.Load():
 		cmd = "steer"
+	case h.settled.Load():
+		cmd = "prompt"
 	}
 	return h.client.WriteCommand(map[string]any{"type": cmd, "message": text})
 }
@@ -164,8 +214,18 @@ func (h *Handle) killChild(ctx context.Context) {
 }
 
 // run is the event pump. It consumes rawEvents from the client, routes
-// extension requests to the trust boundary, maps the rest to agent.Events, and
-// closes on terminal/EOF. Started by Spawn.
+// extension requests to the trust boundary, maps the rest to agent.Events,
+// and closes on a FATAL abort or EOF. Started by Spawn.
+//
+// A completed turn (agent_settled → ResultEvent) does NOT stop the pump: pi
+// accepts a follow_up/steer command after a turn finishes and drives another
+// one, so returning here would strand a later Handle.Inject with nothing
+// listening on the RPC stream. dispatch distinguishes this ordinary,
+// non-fatal terminal from a genuine abort (handshake/policy failure, a
+// policy-bypass abort) — only the latter makes it return true. The loop
+// then simply goes back to waiting on h.client.Events() for either the
+// follow-up turn's events or h.closed (Stop, or the process exiting once
+// idle).
 func (h *Handle) run() {
 	defer func() {
 		// If the pump exits before the handshake resolved, that is itself a
@@ -181,9 +241,16 @@ func (h *Handle) run() {
 			return
 		case ev, ok := <-h.client.Events():
 			if !ok {
-				// Stream closed. If the session cleanly reached a non-retrying
+				// Stream closed. If agent_settled already ran, its ResultEvent
+				// was the session's one terminal — a later stream close (Stop's
+				// teardown, or the child exiting once idle) carries no new
+				// terminal information and must not produce a second one.
+				if h.state.settled {
+					return
+				}
+				// Otherwise: if the session cleanly reached a non-retrying
 				// agent_end but the terminal agent_settled never arrived, emit a
-				// clean ResultEvent; otherwise, if nothing terminal was emitted,
+				// clean ResultEvent; if nothing terminal was emitted at all,
 				// surface a crash ErrorEvent so the runner sees the failure.
 				if h.state.sawAgentEnd && h.state.endSuccess {
 					h.emit(agent.ResultEvent{Success: true})
@@ -199,8 +266,15 @@ func (h *Handle) run() {
 	}
 }
 
-// dispatch handles one rawEvent. Returns true when the session has reached its
-// terminal event and the pump should exit.
+// dispatch handles one rawEvent. Returns true only when the session has
+// reached a FATAL terminal (a policy bypass or a fatal ErrorEvent from the
+// mapper — see mapEvent's extension_error case) and the pump must exit.
+// An ordinary completed-turn terminal (agent_settled → ResultEvent) returns
+// false: the caller (run) keeps the pump alive so a later Handle.Inject has
+// somewhere to land. The fatal/non-fatal split is read off the emitted
+// event's Kind() rather than mapEvent's own terminal bool, because that bool
+// answers "is this turn/session over" for BOTH cases; only the emitted
+// event's kind says whether it is safe to keep going.
 func (h *Handle) dispatch(ev rawEvent) bool {
 	// Extension requests are intercepted before the mapper.
 	if ev.Type == "extension_ui_request" {
@@ -223,7 +297,7 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 				Code:    "policy_extension_failed",
 				Raw:     raw(ev),
 			})
-			return true
+			return true // fatal: the trust boundary was violated, abort now.
 		}
 	}
 
@@ -235,17 +309,27 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		h.turnInFlight.Store(false)
 	}
 
-	out, terminal := mapEvent(ev, h.state)
+	out, _ := mapEvent(ev, h.state)
 	// Keep SessionID() in sync with whatever the mapper resolved (get_state).
 	if h.state.sessionID != "" {
 		h.idMu.Lock()
 		h.sessionID = h.state.sessionID
 		h.idMu.Unlock()
 	}
+	// Mirror mapperState.settled (mutated only here, on this goroutine) onto
+	// the atomic h.settled so Inject — called from a different goroutine —
+	// can read it without racing h.state.
+	if h.state.settled {
+		h.settled.Store(true)
+	}
+	fatal := false
 	for _, e := range out {
 		h.emit(e)
+		if e.Kind() == agent.EventError {
+			fatal = true
+		}
 	}
-	return terminal
+	return fatal
 }
 
 // handleExtensionRequest verifies the handshake or adjudicates a tool call,

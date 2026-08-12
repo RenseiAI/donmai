@@ -17,7 +17,12 @@ import (
 //     ResultEvent's CostData (agent_settled carries no usage inline);
 //   - sawAgentEnd/endSuccess, so a clean EOF after a non-retrying agent_end
 //     that was somehow not followed by agent_settled still terminates cleanly
-//     rather than as a crash.
+//     rather than as a crash;
+//   - settled, so a stream close that arrives AFTER agent_settled (the
+//     child process exiting once idle, or Stop's teardown) is recognized as
+//     carrying no new terminal information — the ResultEvent was already
+//     emitted when agent_settled was processed, and the sawAgentEnd/
+//     endSuccess EOF-fallback below must not emit a second one.
 type mapperState struct {
 	sessionID   string
 	textBuf     strings.Builder
@@ -31,6 +36,7 @@ type mapperState struct {
 
 	sawAgentEnd bool
 	endSuccess  bool
+	settled     bool
 }
 
 // mapEvent translates one pi event (or command response) into zero or more
@@ -164,7 +170,13 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 
 	case "agent_settled":
 		// The true session terminal: no automatic retry, compaction retry, or
-		// queued continuation remains.
+		// queued continuation remains. This ends the CURRENT turn, not
+		// necessarily the RPC session — pi accepts a follow_up/steer command
+		// after a completed turn and will drive another one, so the caller
+		// (handle.go's dispatch/run) treats this as a non-fatal terminal:
+		// the pump keeps consuming events so a later Handle.Inject has
+		// somewhere to land.
+		st.settled = true
 		res := agent.ResultEvent{Success: true, Raw: raw(ev)}
 		if cost := st.accumulatedCost(); cost != nil {
 			res.Cost = cost
