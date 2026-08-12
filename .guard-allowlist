@@ -32,3 +32,15 @@
 # out of scope here. Curated file-by-file per this header's remediation
 # path, scoped to the two exact call sites so a NEW unscoped hit still fails.
 BRAND_NAME :: ^daemon/kit_registry\.go :: Rens[e]i :: (toml:"rens[e]i"|m\.Requires\.Rens[e]i)
+
+# afcli/commands.go: Config.OrgFunc/ProjectFunc's doc comments name the real
+# wire headers the closed platform's CLI user-token auth reads
+# (`X-Rens[e]i-Org` / `X-Rens[e]i-Project`), and BinaryName's doc comment cites
+# the closed downstream repo that sets it — all pre-existing, unrelated to
+# the change that first staged this file's other edits (a new Config field
+# appended further down the struct); --staged scans the whole file, not
+# just the diff. Rewriting the doc comments to omit the real header/repo
+# names they document would make the documentation false. Scoped to the
+# five exact pre-existing lines so a NEW unscoped hit still fails.
+BRAND_NAME :: ^afcli/commands\.go :: Rens[e]i :: (`X-Rens[e]i-Project` header on every request|sent as `X-Rens[e]i-Org` on every|`X-Rens[e]i-Org` per invocation makes the scope authoritative|org/project scope as `X-Rens[e]i-Org` . `X-Rens[e]i-Project` headers)
+CLOSED_TUI_REPO :: ^afcli/commands\.go :: rens[e]i-tui :: Embedders \(e\.g\. rens[e]i-tui\) set this to "rensei"
