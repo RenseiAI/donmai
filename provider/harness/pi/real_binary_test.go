@@ -473,16 +473,16 @@ func TestRealBinary_Inject_AfterTerminal_FailsClosed(t *testing.T) {
 //     directory and completes a FRESH handshake (proven: a second InitEvent
 //     arrives, and get_state's messageCount reflects the prior session's
 //     history, so the right session file was found and loaded).
-//   - The `get_entries` reply pi sends back is silently dropped by this
-//     package's own event mapper (event_mapping.go's `case "response":`
-//     branch only special-cases command=="get_state"; every other command
-//     response, get_entries included, returns `nil, false`). So "replayed
-//     entries" never reach the caller as agent.Events today, and a bare
-//     Resume (no follow-up prompt/steer/follow_up after it) never reaches a
-//     terminal on its own — this test bounds its drain and asserts that
-//     absence explicitly, so a future change to event_mapping.go that starts
-//     surfacing get_entries will fail this test loudly instead of the gap
-//     re-hiding.
+//   - The `get_entries` reply pi sends back is routed by the event mapper
+//     (event_mapping.go's `case "response":` branch) as a SystemEvent —
+//     observable, but NOT decoded into replayed Assistant/Tool/etc. history.
+//     So "replayed entries" still don't reach the caller as reconstructed
+//     session events today, and a bare Resume (no follow-up
+//     prompt/steer/follow_up after it) still never reaches a terminal on its
+//     own — this test bounds its drain and asserts that absence explicitly,
+//     so a future change to event_mapping.go that starts decoding get_entries
+//     into full historical replay will fail this test loudly instead of the
+//     gap re-hiding.
 func TestRealBinary_Resume_StructuralReplay(t *testing.T) {
 	realBinaryAvailable(t)
 
