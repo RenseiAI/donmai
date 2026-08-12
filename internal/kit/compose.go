@@ -59,6 +59,9 @@ type ManifestView struct {
 	Order string
 	// SupportedOS is [supports].os; empty means "any".
 	SupportedOS []string
+	// SupportedArch is [supports].arch; empty means "any" (the same
+	// permissive-empty convention as SupportedOS).
+	SupportedArch []string
 	// PackageDigest is the immutable package digest used in command identity.
 	PackageDigest string
 	// LegacyManifestDigest is used only when no package digest exists; keeping
@@ -83,6 +86,12 @@ type ManifestView struct {
 	// The runtime loader (kit.LoadPromptFragments) applies workType filtering
 	// and resolves file paths.
 	PromptFragments []PromptFragmentEntry
+	// Lanes is the slice of [[provide.lanes]] declarations — OS/arch-locked
+	// command lanes that exist only on a subset of this kit's own
+	// SupportedOS (see demand.go's package doc for the proposed manifest
+	// shape). Empty for every kit shipped as of this field's introduction —
+	// no manifest declares [[provide.lanes]] yet.
+	Lanes []LaneView
 }
 
 // PromptFragmentEntry mirrors one [[provide.prompt_fragments]] TOML
