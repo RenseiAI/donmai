@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -165,7 +167,17 @@ func materializeExtension(cwd string) (sessionLayout, error) {
 	if err := os.MkdirAll(layout.root, 0o700); err != nil {
 		return layout, fmt.Errorf("pi: create state dir: %w", err)
 	}
-	if err := os.WriteFile(layout.extension, extensionSource(), 0o600); err != nil {
+	// The boundary extension's bytes are BYTE-IDENTICAL across every session
+	// this process spawns (it is compiled into the binary — extensionSource()
+	// never varies), so every concurrent spawn is writing the same content to
+	// a different session-local path. writeViaCache reuses a shared,
+	// content-addressed blob via hardlink instead of re-encoding+writing the
+	// same bytes per spawn (a cold-start optimization — see writeViaCache's
+	// doc comment for why this changes nothing about correctness): the digest
+	// verification below reads back whatever actually landed at
+	// layout.extension and is unaffected by whether the write took the cache
+	// path or the fresh-write fallback.
+	if err := writeViaCache(extensionSHA(), extensionSource(), layout.extension, 0o600); err != nil {
 		return layout, fmt.Errorf("pi: write policy extension: %w", err)
 	}
 	return layout, nil
@@ -212,7 +224,15 @@ func materializeAdditionalExtensions(layout sessionLayout, deliveries []agent.Ex
 				return nil, fmt.Errorf("pi: additional extension %q: create injected-extensions dir: %w", d.ID, err)
 			}
 			loadPath = filepath.Join(layout.injected, sanitizeInjectedBasename(d.ID, d.Basename))
-			if err := os.WriteFile(loadPath, d.Source, 0o600); err != nil {
+			// A capability pack admitted for one cell is typically byte-
+			// identical across every session the fleet spawns under that
+			// admission — the exact fan-out shape this cache targets. Reuse
+			// the shared content-addressed cache the same way the boundary
+			// extension does (writeViaCache), keyed on the ALREADY-VALIDATED
+			// digest (agent.ValidateExtensionDeliveries ran above and
+			// guarantees d.Digest is a well-formed lowercase sha256 hex
+			// string, so it is safe to use directly as a cache filename).
+			if err := writeViaCache(d.Digest, d.Source, loadPath, 0o600); err != nil {
 				return nil, fmt.Errorf("pi: additional extension %q: materialize: %w", d.ID, err)
 			}
 		}
@@ -242,6 +262,138 @@ func materializeAdditionalExtensions(layout sessionLayout, deliveries []agent.Ex
 // requires unique ids).
 func sanitizeInjectedBasename(id, basename string) string {
 	return id + "-" + filepath.Base(basename)
+}
+
+// --- Content-addressed materialization cache (cold-start hardening) ---
+//
+// A fleet spawns many sessions whose extension bytes are digest-IDENTICAL:
+// the boundary extension always is (one embedded file, one binary), and an
+// admitted capability pack usually is (the same grant produces the same
+// tool list across every session it is admitted for). Rewriting the same
+// bytes to a fresh per-session path on every single spawn is pure overhead
+// at N-instance scale. The workarea cleanup rules (ADR-2026-08-12 D1.3) let a
+// shared, content-addressed cache sit outside any one session's workarea —
+// nothing about D1.3 requires the SOURCE of a session's materialized bytes to
+// be a fresh write, only that the session-owned copy exists, is cleaned up by
+// the session's own lifecycle, and is digest-verified before load. This cache
+// changes ONLY the first of those (a hardlink from a shared blob instead of a
+// fresh encode+write); the session-local file, its cleanup, and the
+// mandatory post-materialization digest read-back (D2(b)'s TOCTOU rule) are
+// completely unchanged — a cache hit and a cache miss produce an
+// indistinguishable session-local file from the verifier's point of view.
+//
+// Digest, not content, is the cache key: agent.ExtensionDelivery.Digest is
+// validated to be a well-formed lowercase sha256 hex string before this ever
+// runs (agent.ValidateExtensionDeliveries), and the boundary extension's key
+// is extensionSHA() — a value this package computes, never caller input. A
+// hash collision producing a false cache hit is not a threat this cache
+// introduces: even a poisoned or corrupted cache entry is caught by the
+// unchanged post-write digest verification in the caller, because that
+// verification reads back the session-local file, not the cache blob.
+
+// piExtCacheDirEnvVar overrides the shared materialization cache directory —
+// primarily for tests; operators who want it elsewhere (e.g. a tmpfs) may set
+// it too. Unset defaults to a fixed subdirectory of os.TempDir(), deliberately
+// OUTSIDE every session's workarea so no single session's cleanup removes
+// bytes another live session may still be linking against.
+const piExtCacheDirEnvVar = "DONMAI_PI_EXT_CACHE_DIR"
+
+// extensionCache is a content-addressed store of materialized extension
+// bytes, keyed by sha256 hex digest. Safe for concurrent use by any number of
+// goroutines spawning sessions in parallel. It deliberately does NOT memoize
+// its directory (no sync.Once): the env override is re-read and MkdirAll
+// re-run on every call, both idempotent and cheap relative to a process
+// spawn, which keeps DONMAI_PI_EXT_CACHE_DIR honest for a caller that sets it
+// per-test rather than at process start (a memoized directory would make the
+// override race the first caller instead of always winning).
+type extensionCache struct{}
+
+var globalExtensionCache = &extensionCache{}
+
+// dirPath resolves (and ensures) the cache directory.
+func (c *extensionCache) dirPath() (string, error) {
+	dir := os.Getenv(piExtCacheDirEnvVar)
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), "donmai-pi-ext-cache")
+	}
+	//nolint:gosec // G703: dir is an operator/test-configured cache-directory
+	// override (DONMAI_PI_EXT_CACHE_DIR), not request- or session-derived
+	// input; unset defaults to a fixed os.TempDir() subpath this package
+	// controls.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// blobPath returns the cache blob path for digest, and whether a regular
+// file already exists there.
+func (c *extensionCache) blobPath(digest string) (path string, hit bool) {
+	dir, err := c.dirPath()
+	if err != nil || digest == "" {
+		return "", false
+	}
+	// digest is always caller-validated (sha256 hex, fixed charset/length)
+	// before reaching here; filepath.Base is cheap defense-in-depth, not the
+	// only guard.
+	path = filepath.Join(dir, filepath.Base(digest))
+	fi, statErr := os.Stat(path)
+	return path, statErr == nil && fi.Mode().IsRegular()
+}
+
+// populate best-effort publishes destPath's just-written bytes into the
+// cache under digest, via hardlink-then-atomic-rename so a concurrent reader
+// never observes a partially-written blob. Every failure is swallowed: the
+// per-session materialization this backs up has ALREADY succeeded by the
+// time populate runs, so a cache-population failure can only cost a future
+// spawn's fast path, never today's correctness.
+func (c *extensionCache) populate(digest, destPath string) {
+	dir, err := c.dirPath()
+	if err != nil || digest == "" {
+		return
+	}
+	blob := filepath.Join(dir, filepath.Base(digest))
+	if fi, statErr := os.Stat(blob); statErr == nil && fi.Mode().IsRegular() {
+		return // already populated (by this call or a concurrent one)
+	}
+	tmp := blob + ".tmp-" + strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.Itoa(os.Getpid())
+	if err := os.Link(destPath, tmp); err != nil {
+		return // best-effort: e.g. cross-device; the fresh write already succeeded
+	}
+	if err := os.Rename(tmp, blob); err != nil {
+		_ = os.Remove(tmp)
+	}
+}
+
+// writeViaCache materializes content at destPath, reusing the shared cache
+// when a byte-identical blob already exists under digest: a hardlink
+// replaces a full write. On any cache miss or cache-path failure it falls
+// back to a normal write and best-effort populates the cache for the next
+// caller. Correctness NEVER depends on the cache — only the caller's
+// mandatory post-write digest verification (unchanged by this function) does
+// — so a hardlink failure, a missing/corrupt blob, or a disabled cache
+// directory degrade to "no caching", never to a wrong result.
+//
+// destPath must not exist, or must be safe to overwrite (matches
+// os.WriteFile's overwrite semantics): any pre-existing file at destPath is
+// removed first so os.Link (which fails on an existing target) behaves the
+// same as os.WriteFile would have.
+func writeViaCache(digest string, content []byte, destPath string, perm os.FileMode) error {
+	if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("pi: replace %s: %w", destPath, err)
+	}
+	if blob, hit := globalExtensionCache.blobPath(digest); hit {
+		if err := os.Link(blob, destPath); err == nil {
+			return nil
+		}
+		// Fall through to a fresh write on any link failure (cross-device,
+		// blob vanished between Stat and Link, permission, …).
+	}
+	if err := os.WriteFile(destPath, content, perm); err != nil {
+		return err
+	}
+	globalExtensionCache.populate(digest, destPath)
+	return nil
 }
 
 // providerPinEnv builds the non-secret routing-pin env the child extension

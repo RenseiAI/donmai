@@ -252,6 +252,14 @@ func (h *Handle) run() {
 				// agent_end but the terminal agent_settled never arrived, emit a
 				// clean ResultEvent; if nothing terminal was emitted at all,
 				// surface a crash ErrorEvent so the runner sees the failure.
+				// This whole branch is followed unconditionally by `return`
+				// (the stream is already closed — there is no pump left to
+				// come back to), so signalClosed() must precede whichever
+				// emit() fires: the same happens-before argument as
+				// dispatch()'s fatal paths applies here too, since the
+				// deferred signalClosed() below would otherwise race a
+				// caller reacting to this terminal event.
+				h.signalClosed()
 				if h.state.sawAgentEnd && h.state.endSuccess {
 					h.emit(agent.ResultEvent{Success: true})
 				} else if cause := h.client.CloseErr(); cause != nil {
@@ -292,6 +300,18 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		tool := stringField(ev.Fields, "toolName", "tool", "name")
 		callID := stringField(ev.Fields, "toolCallId", "callId", "call_id", "id")
 		if isBuiltInTool(tool) && !h.wasAdjudicated(callID) {
+			// signalClosed BEFORE emit: a caller that observes this event on
+			// h.Events() and immediately calls Inject must find h.closed
+			// already closed. Go's memory model only guarantees the SEND
+			// half of a channel op happens-before the corresponding RECEIVE
+			// completes — nothing about what the sender does afterward is
+			// ordered against what the receiver does next. Closing h.closed
+			// here, strictly before the emit() that makes this event
+			// observable, puts the close on the happens-before side of that
+			// edge instead of racing it (closeEvents() still runs later, in
+			// run()'s deferred teardown — only the closed-signal needs to
+			// lead the fatal event, not the channel close itself).
+			h.signalClosed()
 			h.emit(agent.ErrorEvent{
 				Message: fmt.Sprintf("policy bypass: built-in tool %q (call %q) executed without a policy adjudication round-trip", tool, callID),
 				Code:    "policy_extension_failed",
@@ -324,10 +344,15 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 	}
 	fatal := false
 	for _, e := range out {
-		h.emit(e)
+		// Same ordering rule as the bypass-monitor branch above: a fatal
+		// event's h.signalClosed() must precede the h.emit() that makes it
+		// observable, not follow it via run()'s deferred teardown — see that
+		// branch's comment for the happens-before argument in full.
 		if e.Kind() == agent.EventError {
 			fatal = true
+			h.signalClosed()
 		}
+		h.emit(e)
 	}
 	return fatal
 }
@@ -475,9 +500,19 @@ func (h *Handle) emit(ev agent.Event) {
 	if h.eventsClosed.Load() {
 		return
 	}
+	// Deliberately does NOT select on <-h.closed. h.events is buffered
+	// (256), so the send below is already non-blocking regardless — default
+	// covers the one case that matters, a genuinely full buffer. Racing
+	// h.closed here as a second ready case would make Go's select pick
+	// between "deliver ev" and "notice closed and drop it" pseudo-randomly
+	// whenever both are simultaneously ready, which is exactly the case for
+	// a fatal event: dispatch()/run() now close h.closed BEFORE emitting a
+	// fatal terminal (so a racing Inject reliably observes "closed"), and
+	// that same close would otherwise be racing THIS send for the terminal
+	// event itself — silently dropping the one event callers most need to
+	// see, on no predictable schedule.
 	select {
 	case h.events <- ev:
-	case <-h.closed:
 	default:
 	}
 }
