@@ -7,6 +7,7 @@ import (
 	"github.com/RenseiAI/donmai/afcli/credentials"
 	"github.com/RenseiAI/donmai/afcli/linearcmd"
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/codeintelhost"
 	"github.com/spf13/cobra"
 )
@@ -86,6 +87,23 @@ type Config struct {
 	// CodeHostGitAuth resolves per-invocation Git authorization for `code host`
 	// clone and fetch operations. Nil preserves static catalog Git configuration.
 	CodeHostGitAuth codeintelhost.GitAuth
+
+	// AgentSpecExtensionDecorator, when set, is applied via
+	// agent.DecorateProvider to every provider the `agent run` subcommand
+	// registers (afcli/agent_run.go's buildRegistryFromCtors output) — the
+	// registration hook per donmai-architecture's
+	// 002-provider-base-contract.md §E "Additional-extension delivery" for an
+	// embedding binary that composes this package as a library and needs to
+	// append its own agent.ExtensionDelivery entries onto specs `agent run`
+	// orchestration constructs internally. It runs on the Spec argument of
+	// EVERY Spawn and Resume call reachable through the registered provider —
+	// not just the ones this binary's own orchestration happens to invoke —
+	// because decoration wraps the Provider itself, not a single call site.
+	// Appends only: the harness's own trust-boundary extension (where one
+	// exists) still loads first and digest verification is unchanged.
+	// Optional; nil registers every provider exactly as before (no wrapping,
+	// no behavior change).
+	AgentSpecExtensionDecorator agent.ExtensionDecorator
 }
 
 // scopedClientFactory wraps cfg.ClientFactory so every produced Client
