@@ -215,7 +215,10 @@ func (c *Composer) Compose(base map[string]string, spec agent.Spec) []string {
 		blockSet[k] = struct{}{}
 	}
 
-	merged := make(map[string]string, len(base)+len(spec.Env))
+	// No capacity hint: a Go map grows on demand, so pre-sizing buys nothing
+	// here, and summing len()s as an allocation size is exactly the shape a
+	// static scanner (go/allocation-size-overflow) flags as a potential overflow.
+	merged := make(map[string]string)
 	for k, v := range base {
 		if IsRunnerOnly(k) {
 			continue

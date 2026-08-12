@@ -146,7 +146,10 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 	// Allowed tools = Spec.AllowedTools ∪ Spec.MCPToolNames. The
 	// MCPToolNames merge mirrors the legacy provider so headless
 	// agents can call MCP tools without explicit allowlisting.
-	allowed := make([]string, 0, len(spec.AllowedTools)+len(spec.MCPToolNames))
+	// No capacity hint: summed len()s as an allocation size is the exact
+	// shape a static scanner (go/allocation-size-overflow) flags as a
+	// potential overflow; append grows the slice on demand just fine.
+	allowed := make([]string, 0)
 	allowed = append(allowed, spec.AllowedTools...)
 	allowed = append(allowed, spec.MCPToolNames...)
 	allowed = dedupAndSort(allowed)

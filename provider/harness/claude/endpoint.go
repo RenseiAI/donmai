@@ -73,7 +73,10 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 		return spec, fmt.Errorf("serving host %q is not routable by the claude harness", ep.Host)
 	}
 
-	env := make(map[string]string, len(spec.Env)+len(ep.Env)+2)
+	// No capacity hint: a Go map grows on demand, so pre-sizing buys nothing
+	// here, and summing len()s as an allocation size is exactly the shape a
+	// static scanner (go/allocation-size-overflow) flags as a potential overflow.
+	env := make(map[string]string)
 	for k, v := range spec.Env {
 		env[k] = v
 	}
