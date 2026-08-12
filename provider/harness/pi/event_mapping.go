@@ -46,10 +46,12 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 	f := ev.Fields
 	switch ev.Type {
 	case "response":
-		// Command responses carry the session id (get_state) and otherwise are
-		// acks the mapper does not surface. get_state is the only id source in
-		// the real protocol (agent_start has none).
-		if stringField(f, "command") == "get_state" {
+		// Command responses carry the session id (get_state) or the resume
+		// cursor-replay payload (get_entries); every other command response
+		// is an ack the mapper does not surface. get_state is the only id
+		// source in the real protocol (agent_start has none).
+		switch stringField(f, "command") {
+		case "get_state":
 			data := mapField(f, "data")
 			if id := stringField(data, "sessionId", "session_id"); id != "" {
 				st.sessionID = id
@@ -58,8 +60,23 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 				st.initEmitted = true
 				return []agent.Event{agent.InitEvent{SessionID: st.sessionID, Raw: raw(ev)}}, false
 			}
+			return nil, false
+
+		case "get_entries":
+			// Resume's cursor replay (pi.go Resume → get_entries since=<id>)
+			// lands here. Routed explicitly as a SystemEvent rather than
+			// silently dropped like a plain ack: a bare Resume with no
+			// follow-up prompt/steer previously produced only an InitEvent
+			// and then went quiet forever, so the caller had no way to tell
+			// the replay reply had even arrived. This does NOT decode the
+			// entries into replayed Assistant/Tool/etc. events — that is a
+			// separate, larger feature (see the Resume doc comment in
+			// pi.go); it only stops the reply from vanishing unobserved.
+			return []agent.Event{agent.SystemEvent{Subtype: "get_entries", Raw: raw(ev)}}, false
+
+		default:
+			return nil, false
 		}
-		return nil, false
 
 	case "agent_start":
 		// The real agent_start carries no session id; if get_state already

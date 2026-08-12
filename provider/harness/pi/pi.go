@@ -161,6 +161,23 @@ func (p *Provider) prepare(spec agent.Spec) (agent.Spec, error) {
 // param; the session is selected via the --session CLI flag) but not verified
 // against a real model turn; the donmai-smokes step20 resume item is its
 // acceptance gate.
+//
+// Production status (conformance-only, verified repo-wide, not a pi-specific
+// gap): Resume's only call site outside this package's own tests is
+// agent/conformance/checks.go, which nothing in `donmai agent run` drives for
+// any harness. runner/steering.go's shouldSteer/attemptSteering is the one
+// place a production Resume call was designed in, and it still only ever
+// calls Handle.Inject — the "stop and resume" fallback it names in its doc
+// comment was never built, for ANY provider, not just pi (codex and
+// opencode.go's create-with-session lane declare SupportsSessionResume:true
+// and ship real (non-ErrUnsupported) Resume implementations with the exact
+// same zero-production-caller shape). So wiring Resume into a real path here
+// would not be following an established pattern — no harness has one; it
+// would mean designing the runner's stop/resume steering leg for the first
+// time, a cross-harness runner change out of this package's scope. get_entries
+// is now routed as an observable SystemEvent (event_mapping.go) rather than
+// silently dropped, but is not decoded into replayed history — see this
+// package's real_binary_test.go TestRealBinary_Resume_StructuralReplay.
 func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
 	if sessionID == "" {
 		return nil, agent.ErrSessionNotFound
