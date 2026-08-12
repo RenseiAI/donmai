@@ -64,6 +64,10 @@ type agentRunOpts struct {
 	// bin is the host binary name (from binaryName(cfg)) used in error hints.
 	// Defaults to "donmai" when empty.
 	bin string
+	// specDecorator is cfg.AgentSpecExtensionDecorator, threaded through from
+	// newAgentRunCmd exactly like bin above. nil preserves historical
+	// behavior (no provider wrapping).
+	specDecorator agent.ExtensionDecorator
 }
 
 // bindWorkerGatewayForAgentRun is the production gateway-binding seam. Tests
@@ -117,7 +121,7 @@ func gatewayHarnessIdentity(detail *daemon.SessionDetail, admission *runner.Harn
 // (F.2.8 — daemon wire-up.)
 func newAgentRunCmd(cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
-	opts := &agentRunOpts{bin: bin}
+	opts := &agentRunOpts{bin: bin, specDecorator: cfg.AgentSpecExtensionDecorator}
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run a single agent session (invoked by the daemon spawner).",
@@ -245,6 +249,9 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	}
 	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(agentRunHints(detail)), agentBin)
 	logger.Info("agent run: registry built", "providers", reg.Names())
+	if opts.specDecorator != nil {
+		decorateRegistryProviders(reg, opts.specDecorator)
+	}
 	defer func() {
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutCancel()
@@ -864,6 +871,34 @@ func buildRegistryFromCtors(logger *slog.Logger, ctors []providerCtor, bin strin
 		logger.Error("agent run: no providers available. Every provider probe failed; the worker cannot resolve any session. Check claude/codex install on PATH or run `" + bin + " host doctor`.")
 	}
 	return reg
+}
+
+// decorateRegistryProviders re-registers every provider currently in reg,
+// each wrapped via agent.DecorateProvider(p, decorate) — the embedder
+// registration hook for the additional-extension delivery seam (Config.
+// AgentSpecExtensionDecorator's doc comment). Registry.Register documents
+// that registering under an existing name overwrites the earlier entry, so
+// this mutates reg's contents in place without a second registry.
+//
+// Called once, immediately after buildRegistryFromCtors, so every provider
+// this `agent run` invocation could dispatch to — not just the one the
+// session's resolved profile happens to select — carries the decorator.
+// decorate is guaranteed non-nil by the caller (runAgentRun checks
+// opts.specDecorator != nil before calling this), matching
+// agent.DecorateProvider's own nil-decorate passthrough contract.
+func decorateRegistryProviders(reg *runner.Registry, decorate agent.ExtensionDecorator) {
+	for _, name := range reg.Names() {
+		p, err := reg.Resolve(name)
+		if err != nil {
+			// Names() only returns names Resolve can look up; a failure here
+			// would mean a concurrent mutation this single-goroutine
+			// construction path never performs. Skip defensively rather than
+			// panic on an invariant violation that isn't this function's to
+			// diagnose.
+			continue
+		}
+		_ = reg.Register(agent.DecorateProvider(p, decorate))
+	}
 }
 
 // assertLegacyAlias consumes the generated matrix.LegacyAliasMap as a
