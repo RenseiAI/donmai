@@ -44,3 +44,13 @@ BRAND_NAME :: ^daemon/kit_registry\.go :: Rens[e]i :: (toml:"rens[e]i"|m\.Requir
 # five exact pre-existing lines so a NEW unscoped hit still fails.
 BRAND_NAME :: ^afcli/commands\.go :: Rens[e]i :: (`X-Rens[e]i-Project` header on every request|sent as `X-Rens[e]i-Org` on every|`X-Rens[e]i-Org` per invocation makes the scope authoritative|org/project scope as `X-Rens[e]i-Org` . `X-Rens[e]i-Project` headers)
 CLOSED_TUI_REPO :: ^afcli/commands\.go :: rens[e]i-tui :: Embedders \(e\.g\. rens[e]i-tui\) set this to "rensei"
+
+# runner/README.md: the package Status header and lifecycle-diagram ASCII art
+# name the closed downstream TUI repo (`rens[e]i-tui`) that embeds this
+# package as a library — both pre-existing, unrelated to the change that
+# first staged this file's other edits (a Stage-1 steering paragraph further
+# down describing the stop-and-resume fallback); --staged scans the whole
+# file, not just the diff. Rewriting the doc to omit the real embedder name
+# would make the documentation false. Scoped to the two exact pre-existing
+# lines so a NEW unscoped hit still fails.
+CLOSED_TUI_REPO :: ^runner/README\.md :: rens[e]i-tui :: (importable by .rens[e]i-tui. without depending on the rest|rens[e]i-tui daemon \(F\.2\.8\))

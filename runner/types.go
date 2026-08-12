@@ -271,6 +271,13 @@ type Result struct {
 	// SteeringTriggered reports whether tail-recovery stage 1 fired.
 	SteeringTriggered bool `json:"steeringTriggered,omitempty"`
 
+	// SteeringResumeFallback reports whether stage 1 delivered its
+	// directive via the stop-and-resume fallback (Provider.Resume) rather
+	// than Handle.Inject — true only when the live handle rejected the
+	// inject as unsupported and the harness declared
+	// Capabilities.SupportsSessionResume. See runner/steering.go.
+	SteeringResumeFallback bool `json:"steeringResumeFallback,omitempty"`
+
 	// PostSessionWarnings collects non-fatal warnings raised by the
 	// post-session block — e.g. "Linear updateIssueStatus
 	// failed: …" or "diagnostic comment post failed: …". These are
