@@ -51,6 +51,15 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	// Materialize + digest-verify spec.AdditionalExtensions the SAME way the
+	// headless lane does (ADR-2026-08-12 D1 is host-agnostic across spawn
+	// modes): a required delivery that cannot be materialized or verified
+	// denies spawn closed, before the child ever starts.
+	extraPaths, err := materializeAdditionalExtensions(layout, spec.AdditionalExtensions)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	extensionPaths := append([]string{layout.extension}, extraPaths...)
 
 	// The child env carries the same routing pin + config-home isolation the
 	// headless lane composes, MINUS the handshake token. ptyhost layers these
@@ -60,32 +69,37 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// an explicit override.
 	spec.Env = interactiveChildEnv(spec, layout)
 
-	return ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgs(spec, layout), spec, p.Manifest(), nil)
+	return ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgs(spec, layout, extensionPaths), spec, p.Manifest(), nil)
 }
 
 // interactiveArgs builds the argv for pi's own interactive TUI.
 //
 // Base posture mirrors the headless rpcArgs' session-isolation flags MINUS
-// `--mode rpc`: `-e <ext>` loads the embedded policy extension explicitly (so
-// its provider pin registers regardless of project trust), `--no-extensions`
-// disables all OTHER extension discovery so nothing can shadow the "donmai"
-// provider registration, `--approve` trusts the fleet-provisioned worktree for
-// this run (so a launched-then-attached session does not park on a trust modal
-// before the human attaches), and `--session-dir` keeps session storage inside
-// the worktree the runner's lifecycle owns.
+// `--mode rpc`: one `-e <path>` per entry in extensionPaths (the embedded
+// policy extension first, then spec.AdditionalExtensions in order —
+// ADR-2026-08-12 D1) loads each explicitly (so the provider pin and any
+// additional extension's tools register regardless of project trust),
+// `--no-extensions` disables all OTHER extension discovery so nothing can
+// shadow them, `--approve` trusts the fleet-provisioned worktree for this run
+// (so a launched-then-attached session does not park on a trust modal before
+// the human attaches), and `--session-dir` keeps session storage inside the
+// worktree the runner's lifecycle owns.
 //
 // The provider pin (`--provider donmai --model <id>` when the cell binds an
 // endpoint, plain `--model` otherwise) is the SAME modelPinArgs the headless
 // lane uses. spec.Prompt seeds the first message as pi's positional prompt
 // argument, kept LAST so it is never consumed as the value of a preceding flag;
 // `--append-system-prompt` carries the composed session instructions.
-func interactiveArgs(spec agent.Spec, layout sessionLayout) []string {
-	args := []string{
-		"-e", layout.extension,
+func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []string) []string {
+	var args []string
+	for _, path := range extensionPaths {
+		args = append(args, "-e", path)
+	}
+	args = append(args,
 		"--no-extensions",
 		"--approve",
 		"--session-dir", layout.root,
-	}
+	)
 	args = append(args, modelPinArgs(spec)...)
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--append-system-prompt", spec.SystemPromptAppend)
@@ -99,10 +113,11 @@ func interactiveArgs(spec agent.Spec, layout sessionLayout) []string {
 
 // interactiveChildEnv builds the ptycli override env for an interactive spawn.
 // It carries the already-projected spec.Env (the resolved cell credentials,
-// including PiKeyEnvVar), the four config-home redirect vars headless also sets
-// (the exact PI_* home var is unverified against a real binary — see doc.go — so
-// all candidates are set and win under ptyhost's last-entry precedence), and the
-// non-secret provider-pin vars the embedded extension reads at load.
+// including PiKeyEnvVar), the two documented config/session-home redirect vars
+// headless also sets (piCodingAgentDirEnvVar/piCodingAgentSessionDirEnvVar —
+// ADR-2026-08-12 D4.1), the offline-posture defaults (D4.3 — the interactive
+// lane is explicitly in scope, not just headless), and the non-secret
+// provider-pin vars the embedded extension reads at load.
 //
 // It deliberately omits piHandshakeEnvVar: interactive PTY mode runs no Go
 // handshake round-trip, and the extension skips the handshake (and does not
@@ -117,10 +132,13 @@ func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]strin
 	for k, v := range spec.Env {
 		env[k] = v
 	}
-	env["PI_HOME"] = layout.root
-	env["PI_CONFIG_DIR"] = layout.root
-	env["PI_STATE_DIR"] = layout.root
-	env["XDG_CONFIG_HOME"] = layout.root
+	env[piCodingAgentDirEnvVar] = layout.agentHome
+	env[piCodingAgentSessionDirEnvVar] = layout.root
+	for _, kv := range offlinePostureEnv(spec) {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			env[kv[:i]] = kv[i+1:]
+		}
+	}
 	for _, kv := range providerPinEnv(spec.Endpoint, spec.Model) {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			env[kv[:i]] = kv[i+1:]

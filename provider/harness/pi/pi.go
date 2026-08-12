@@ -207,6 +207,20 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	// Materialize + digest-verify spec.AdditionalExtensions (ADR-2026-08-12
+	// D1). This runs on EVERY call to launch — both Spawn and Resume funnel
+	// through here — so a resumed session re-verifies every injected artifact
+	// rather than trusting a prior verification (D2(c)): the directory has
+	// been agent-writable for the whole intervening period. A required
+	// delivery that fails to materialize or verify denies spawn closed,
+	// before any credential reaches the child (D1.2 — no warn-and-strip).
+	extraExtensionPaths, err := materializeAdditionalExtensions(layout, spec.AdditionalExtensions)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	// The boundary extension always loads first and is never displaced,
+	// reordered, or disabled by a delivery (D1).
+	extensionPaths := append([]string{layout.extension}, extraExtensionPaths...)
 
 	token := p.opts.handshakeToken
 	if token == "" {
@@ -222,7 +236,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		stdin = p.opts.stdinOverride
 		stdout = p.opts.stdoutOverride
 	} else {
-		c, in, out, serr := p.spawnChild(spec, layout, token, mode, sessionID)
+		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, token, mode, sessionID)
 		if serr != nil {
 			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
 		}
@@ -301,11 +315,13 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 
 // spawnChild execs `pi --mode rpc …` with cmd.Dir = spec.Cwd, an allowlist-
 // composed env (incl. the per-session handshake token + provider-pin vars), and
-// its own process group.
-func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, token string, mode launchMode, sessionID string) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
+// its own process group. extensionPaths is the boundary extension followed by
+// every materialized+verified spec.AdditionalExtensions entry, in order
+// (ADR-2026-08-12 D1).
+func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths []string, token string, mode launchMode, sessionID string) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
 	// nolint:gosec // G204: binary resolved from Options/env; args are a fixed
 	// set plus paths/ids/model this package controls.
-	cmd := exec.Command(p.binary, rpcArgs(layout, mode, sessionID, spec)...)
+	cmd := exec.Command(p.binary, rpcArgs(layout, extensionPaths, mode, sessionID, spec)...)
 	cmd.Dir = spec.Cwd
 	cmd.Env = composeChildEnv(spec, layout, token)
 	configureProcessGroup(cmd)

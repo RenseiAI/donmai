@@ -286,8 +286,18 @@ func TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless(t *testing.T) {
 	if inter[PiKeyEnvVar] != "k" {
 		t.Errorf("interactive child env dropped the resolved cell key: %v", inter)
 	}
-	if inter["PI_HOME"] != layout.root {
-		t.Errorf("interactive child env missing the config-home redirect: %v", inter)
+	if inter[piCodingAgentDirEnvVar] != layout.agentHome {
+		t.Errorf("interactive child env missing the agent-home redirect: %v", inter)
+	}
+	if inter[piCodingAgentSessionDirEnvVar] != layout.root {
+		t.Errorf("interactive child env missing the session-dir redirect: %v", inter)
+	}
+	// D4.3 covers the interactive lane too, not just headless.
+	if inter[piOfflineEnvVar] != "1" {
+		t.Errorf("interactive child env missing the PI_OFFLINE default: %v", inter)
+	}
+	if inter[piSkipVersionCheckEnvVar] != "1" {
+		t.Errorf("interactive child env missing the PI_SKIP_VERSION_CHECK default: %v", inter)
 	}
 }
 
