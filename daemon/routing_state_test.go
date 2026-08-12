@@ -2,11 +2,13 @@ package daemon
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/internal/kit"
 )
 
 // makeDecision builds a RoutingDecision with deterministic timestamps so
@@ -256,5 +258,208 @@ func TestRoutingTraceStore_ConcurrentRecordExplain(t *testing.T) {
 	// Just assert no panic and bounded ring.
 	if got := s.Len(); got > 100 {
 		t.Errorf("Len() = %d, want ≤ 100", got)
+	}
+}
+
+// swiftDemandWithIOSLane mirrors what KitRegistry.DemandForRepo derives for
+// a repo whose only matching kit is the swift foundation kit (supports
+// linux+macos) declaring the iOS-app-build lane (macos only) — the
+// swift-kit pattern named in 005-kit-manifest-spec.md § "Platform
+// compatibility".
+func swiftDemandWithIOSLane() kit.PlacementDemand {
+	return kit.DeriveDemand([]kit.ManifestView{
+		{
+			ID:          "default/swift",
+			SupportedOS: []string{kit.OSLinux, kit.OSMacOS},
+			Lanes: []kit.LaneView{
+				{Name: "ios-app-build", OS: []string{kit.OSMacOS}},
+			},
+		},
+	})
+}
+
+func TestRoutingTraceStore_SetDemand_ReflectedInCapabilityFilters(t *testing.T) {
+	t.Parallel()
+	s := NewRoutingTraceStore(10)
+
+	// Before SetDemand: no filters (identical to every session before this
+	// signal existed).
+	cfg := s.GetConfig(nil, time.Now())
+	if len(cfg.CapabilityFilters) != 0 {
+		t.Fatalf("CapabilityFilters before SetDemand = %+v, want none", cfg.CapabilityFilters)
+	}
+
+	s.SetDemand(kit.PlacementDemand{OS: []string{kit.OSMacOS}, Arch: []string{kit.ArchARM64, kit.ArchX86_64}})
+	cfg = s.GetConfig(nil, time.Now())
+	if len(cfg.CapabilityFilters) != 1 {
+		t.Fatalf("CapabilityFilters after narrowed SetDemand = %+v, want 1 (os only; arch unconstrained)", cfg.CapabilityFilters)
+	}
+	want := afclient.CapabilityFilter{Field: "os", Op: "in", Value: "macos"}
+	if cfg.CapabilityFilters[0] != want {
+		t.Errorf("CapabilityFilters[0] = %+v, want %+v", cfg.CapabilityFilters[0], want)
+	}
+
+	if got := s.Demand(); !reflect.DeepEqual(got.OS, []string{kit.OSMacOS}) {
+		t.Errorf("Demand().OS = %v, want [macos]", got.OS)
+	}
+}
+
+// TestFilterCandidatesByDemand_MacOSLockedLaneExcludesLinuxProvider is the
+// acceptance test named in the issue: a composition including a
+// macOS-locked lane (the swift-kit iOS-app-build pattern) yields a demand
+// the local scheduler honors by filtering out a Linux-only provider.
+func TestFilterCandidatesByDemand_MacOSLockedLaneExcludesLinuxProvider(t *testing.T) {
+	t.Parallel()
+	demand := swiftDemandWithIOSLane()
+
+	candidates := []RoutingCandidate{
+		{ProviderID: "mac-pool", OS: []string{kit.OSMacOS}},
+		{ProviderID: "linux-pool", OS: []string{kit.OSLinux}},
+	}
+
+	survivors, excluded := FilterCandidatesByDemand(candidates, demand, "ios-app-build")
+
+	if len(survivors) != 1 || survivors[0].ProviderID != "mac-pool" {
+		t.Fatalf("survivors = %+v, want [mac-pool]", survivors)
+	}
+	if len(excluded) != 1 || excluded[0].ProviderID != "linux-pool" {
+		t.Fatalf("excluded = %+v, want [linux-pool]", excluded)
+	}
+	if excluded[0].Reason == "" {
+		t.Error("excluded[0].Reason is empty, want a named stage-2 exclusion rule")
+	}
+}
+
+func TestFilterCandidatesByDemand(t *testing.T) {
+	t.Parallel()
+
+	macCandidate := RoutingCandidate{ProviderID: "mac-pool", OS: []string{kit.OSMacOS}}
+	linuxCandidate := RoutingCandidate{ProviderID: "linux-pool", OS: []string{kit.OSLinux}}
+	hostAgnosticCandidate := RoutingCandidate{ProviderID: "any-pool"} // declares no OS restriction
+
+	tests := []struct {
+		name          string
+		candidates    []RoutingCandidate
+		demand        kit.PlacementDemand
+		engagedLanes  []string
+		wantSurvivors []string
+		wantExcluded  []string
+	}{
+		{
+			name:          "zero-value demand (never derived) filters nothing",
+			candidates:    []RoutingCandidate{macCandidate, linuxCandidate},
+			demand:        kit.PlacementDemand{},
+			wantSurvivors: []string{"mac-pool", "linux-pool"},
+		},
+		{
+			name:          "unconstrained demand (full known universe) filters nothing",
+			candidates:    []RoutingCandidate{macCandidate, linuxCandidate},
+			demand:        kit.DeriveDemand(nil),
+			wantSurvivors: []string{"mac-pool", "linux-pool"},
+		},
+		{
+			name:          "macos-locked lane engaged excludes the linux-only candidate",
+			candidates:    []RoutingCandidate{macCandidate, linuxCandidate},
+			demand:        swiftDemandWithIOSLane(),
+			engagedLanes:  []string{"ios-app-build"},
+			wantSurvivors: []string{"mac-pool"},
+			wantExcluded:  []string{"linux-pool"},
+		},
+		{
+			name:          "macos-locked lane NOT engaged: composition-wide demand stays broad",
+			candidates:    []RoutingCandidate{macCandidate, linuxCandidate},
+			demand:        swiftDemandWithIOSLane(),
+			wantSurvivors: []string{"mac-pool", "linux-pool"},
+		},
+		{
+			name:          "host-agnostic candidate always survives an OS filter",
+			candidates:    []RoutingCandidate{hostAgnosticCandidate, linuxCandidate},
+			demand:        swiftDemandWithIOSLane(),
+			engagedLanes:  []string{"ios-app-build"},
+			wantSurvivors: []string{"any-pool"},
+			wantExcluded:  []string{"linux-pool"},
+		},
+		{
+			name:          "unsatisfiable demand excludes every restricted candidate",
+			candidates:    []RoutingCandidate{macCandidate, linuxCandidate, hostAgnosticCandidate},
+			demand:        kit.PlacementDemand{OS: []string{}},
+			wantSurvivors: []string{"any-pool"},
+			wantExcluded:  []string{"mac-pool", "linux-pool"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			survivors, excluded := FilterCandidatesByDemand(tt.candidates, tt.demand, tt.engagedLanes...)
+
+			var gotSurvivors []string
+			for _, c := range survivors {
+				gotSurvivors = append(gotSurvivors, c.ProviderID)
+			}
+			if !reflect.DeepEqual(gotSurvivors, orNilIfEmpty(tt.wantSurvivors)) {
+				t.Errorf("survivors = %v, want %v", gotSurvivors, tt.wantSurvivors)
+			}
+
+			var gotExcluded []string
+			for _, c := range excluded {
+				gotExcluded = append(gotExcluded, c.ProviderID)
+			}
+			if !reflect.DeepEqual(gotExcluded, orNilIfEmpty(tt.wantExcluded)) {
+				t.Errorf("excluded = %v, want %v", gotExcluded, tt.wantExcluded)
+			}
+		})
+	}
+}
+
+// orNilIfEmpty normalizes an empty-but-non-nil want slice to nil so it
+// compares equal to the nil built up by a for-range append loop that never
+// executes (survivors or excluded is empty).
+func orNilIfEmpty(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	return s
+}
+
+func TestDemandCapabilityFilters(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		demand kit.PlacementDemand
+		want   []afclient.CapabilityFilter
+	}{
+		{
+			name:   "zero value: no filters",
+			demand: kit.PlacementDemand{},
+			want:   []afclient.CapabilityFilter{},
+		},
+		{
+			name:   "unconstrained (full universe): no filters",
+			demand: kit.DeriveDemand(nil),
+			want:   []afclient.CapabilityFilter{},
+		},
+		{
+			name:   "os narrowed only",
+			demand: kit.PlacementDemand{OS: []string{kit.OSMacOS}, Arch: []string{kit.ArchARM64, kit.ArchX86_64}},
+			want:   []afclient.CapabilityFilter{{Field: "os", Op: "in", Value: "macos"}},
+		},
+		{
+			name:   "both narrowed",
+			demand: kit.PlacementDemand{OS: []string{kit.OSMacOS}, Arch: []string{kit.ArchARM64}},
+			want: []afclient.CapabilityFilter{
+				{Field: "os", Op: "in", Value: "macos"},
+				{Field: "arch", Op: "in", Value: "arm64"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := demandCapabilityFilters(tt.demand)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("demandCapabilityFilters(%+v) = %+v, want %+v", tt.demand, got, tt.want)
+			}
+		})
 	}
 }
