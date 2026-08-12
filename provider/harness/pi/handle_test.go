@@ -112,6 +112,17 @@ func getStateResponse(sessionID string) string {
 // command the handle writes is captured.
 func spawnScripted(t *testing.T, spec agent.Spec, preSpawn, body string) (*syncBuffer, agent.Handle, error) {
 	t.Helper()
+	cmds, h, _, err := spawnScriptedLive(t, spec, preSpawn, body)
+	return cmds, h, err
+}
+
+// spawnScriptedLive is spawnScripted's sibling for tests that need to keep
+// writing to the scripted stdout AFTER Spawn returns — e.g. to prove a
+// post-terminal Inject drives a real follow-up turn's events onto the same
+// channel. It returns the pipe writer so the caller can send more scripted
+// lines at will; t.Cleanup still closes it.
+func spawnScriptedLive(t *testing.T, spec agent.Spec, preSpawn, body string) (*syncBuffer, agent.Handle, *io.PipeWriter, error) {
+	t.Helper()
 	if spec.Cwd == "" {
 		spec.Cwd = t.TempDir()
 	}
@@ -134,13 +145,17 @@ func spawnScripted(t *testing.T, spec agent.Spec, preSpawn, body string) (*syncB
 	h, err := p.Spawn(context.Background(), spec)
 	if err != nil {
 		_ = pw.Close()
-		return cmds, h, err
+		return cmds, h, pw, err
 	}
 	// Deliver the rest of the session. The stream is NOT closed here (a real
-	// child keeps stdout open across the session); t.Cleanup closes it. The
-	// pump terminates on the body's terminal event, not on EOF.
+	// child keeps stdout open across the session); t.Cleanup closes it. A
+	// body ending in a FATAL event (a policy-bypass abort, extension_error)
+	// makes the pump exit on its own; a body ending in an ordinary completed
+	// turn (agent_settled) does NOT — the pump stays up past it (so a later
+	// Handle.Inject still has somewhere to land) until t.Cleanup's EOF or an
+	// explicit Stop().
 	go func() { _, _ = io.WriteString(pw, body) }()
-	return cmds, h, err
+	return cmds, h, pw, err
 }
 
 // resumeScripted mirrors spawnScripted but drives Resume(sessionID, spec)
@@ -173,8 +188,16 @@ func resumeScripted(t *testing.T, sessionID string, spec agent.Spec, preSpawn, b
 	return cmds, h, err
 }
 
-// drain reads every event from h until the channel closes (bounded by t
-// timeout).
+// drain reads events from h until the first terminal event (ResultEvent or
+// ErrorEvent) or the channel closes, whichever comes first (bounded by t
+// timeout). It mirrors the production consumer, runner.consumeEvents, which
+// returns as soon as it observes a ResultEvent rather than waiting for the
+// channel to also close — that distinction matters here because an ordinary
+// completed turn (agent_settled) no longer closes the channel on its own
+// (handle.go's dispatch/run keep the pump alive so a later Handle.Inject has
+// somewhere to land); only a fatal abort or Stop does. A fatal-terminal body
+// still closes the channel right after its ErrorEvent, so this helper
+// returns the same way it always did for those cases.
 func drain(t *testing.T, h agent.Handle) []agent.Event {
 	t.Helper()
 	var out []agent.Event
@@ -186,6 +209,10 @@ func drain(t *testing.T, h agent.Handle) []agent.Event {
 				return out
 			}
 			out = append(out, ev)
+			switch ev.(type) {
+			case agent.ResultEvent, agent.ErrorEvent:
+				return out
+			}
 		case <-timeout:
 			t.Fatalf("timed out draining events; got %d so far", len(out))
 		}
@@ -484,15 +511,134 @@ func TestInject_SteerWhenInFlight_FollowUpWhenIdle(t *testing.T) {
 	}
 }
 
+// --- Post-terminal Inject: soft (agent_settled) keeps the pump alive and
+// routes to prompt; fatal (policy bypass / extension_error) still fails
+// closed. This is the regression coverage for the fix: runner/loop.go's
+// drainMemoryInjects and runner/steering.go's attemptSteering both call
+// Inject at exactly the post-terminal seam these scripted transcripts drive.
+
+// TestInject_AfterSoftTerminal_RoutesPromptAndDrivesFollowUp proves that
+// injecting after an ordinary completed turn (agent_settled) succeeds, is
+// sent as a `prompt` command — not `follow_up`, which docs/rpc.md says pi
+// will never auto-drain once settled — and that the pump keeps consuming the
+// RPC stream so the follow-up turn's own events (including a second terminal
+// ResultEvent) reach the caller on the SAME channel.
+func TestInject_AfterSoftTerminal_RoutesPromptAndDrivesFollowUp(t *testing.T) {
+	t.Parallel()
+	firstTurn := getStateResponse("ses_followup") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "agent_settled"})
+	cmds, h, pw, err := spawnScriptedLive(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), firstTurn)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	first := drain(t, h)
+	if err := checkTerminalLast(first); err != nil {
+		t.Fatalf("first turn: %v", err)
+	}
+
+	if err := h.Inject(context.Background(), "keep going"); err != nil {
+		t.Fatalf("Inject after agent_settled: %v", err)
+	}
+
+	followUpTurn := event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "done"}}) +
+		event(map[string]any{"type": "message_end"}) +
+		event(map[string]any{"type": "agent_settled"})
+	go func() { _, _ = io.WriteString(pw, followUpTurn) }()
+
+	second := drain(t, h)
+	if err := checkTerminalLast(second); err != nil {
+		t.Fatalf("follow-up turn: %v", err)
+	}
+	var sawFollowUpText bool
+	for _, e := range second {
+		if at, ok := e.(agent.AssistantTextEvent); ok && at.Text == "done" {
+			sawFollowUpText = true
+		}
+	}
+	if !sawFollowUpText {
+		t.Errorf("follow-up turn's events never reached the caller; got %+v", second)
+	}
+
+	var sawPrompt, sawFollowUpCmd bool
+	for _, c := range cmds.commands() {
+		if c["type"] == "prompt" && c["message"] == "keep going" {
+			sawPrompt = true
+		}
+		if c["type"] == "follow_up" {
+			sawFollowUpCmd = true
+		}
+	}
+	if !sawPrompt {
+		t.Errorf("expected a prompt command carrying %q after agent_settled, got %v", "keep going", cmds.commands())
+	}
+	if sawFollowUpCmd {
+		t.Errorf("post-settled Inject must route to prompt, not follow_up — pi does not auto-drain a follow_up once settled (docs/rpc.md agent_settled)")
+	}
+}
+
+// TestInject_AfterFatalTerminal_FailsClosed is the table-driven negative
+// half: unlike an ordinary completed turn, a FATAL terminal (the trust
+// boundary aborting the session) must still refuse Inject — there is no live
+// session left for steer/follow_up/prompt to land on.
+func TestInject_AfterFatalTerminal_FailsClosed(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "policy bypass abort",
+			body: getStateResponse("ses_fatal_bypass") +
+				event(map[string]any{"type": "agent_start"}) +
+				event(map[string]any{"type": "tool_execution_end", "toolName": "bash", "toolCallId": "c-unadjudicated", "isError": false}),
+		},
+		{
+			name: "extension_error abort",
+			body: getStateResponse("ses_fatal_ext") +
+				event(map[string]any{"type": "agent_start"}) +
+				event(map[string]any{"type": "extension_error", "error": "donmai policy extension threw"}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true},
+				handshakeEvent("h1"), tc.body)
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			evs := drain(t, h)
+			var sawFatal bool
+			for _, e := range evs {
+				if _, ok := e.(agent.ErrorEvent); ok {
+					sawFatal = true
+				}
+			}
+			if !sawFatal {
+				t.Fatalf("expected a fatal ErrorEvent, got %+v", evs)
+			}
+			if err := h.Inject(context.Background(), "should not land"); err == nil {
+				t.Error("Inject after a fatal terminal returned nil error; want a closed-session error")
+			}
+		})
+	}
+}
+
 // --- Cleanup idempotence (D8 pi row: "cleanup is idempotent and evidenced") ---
 
 // TestStop_IdempotentAfterChannelClose is the "cleanup idempotence" fixture:
 // Handle.Stop's doc comment claims "Idempotent", and the runner relies on
-// that (a caller may race Stop against the pump's own terminal-triggered
-// teardown). This proves it against a session that already reached its
-// terminal event and closed the events channel on its own — the case where
-// a second Stop has the least left to do and the most latent risk (a second
-// close(channel) panics if the internal guards ever regress).
+// that. A completed turn (agent_settled) no longer closes the events channel
+// on its own — the pump stays up past it so a later Handle.Inject still has
+// somewhere to land (see handle.go's dispatch/run) — so the FIRST Stop call
+// below is the one doing the real teardown here, not a race against the
+// pump's own terminal-triggered close. The second and third prove
+// idempotency on top of that, including the case with the least left to do
+// and the most latent risk: a second close(channel) panicking if the
+// internal guards ever regress.
 func TestStop_IdempotentAfterChannelClose(t *testing.T) {
 	t.Parallel()
 	body := getStateResponse("ses_cleanup") +
@@ -502,11 +648,11 @@ func TestStop_IdempotentAfterChannelClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	drain(t, h) // drains to the channel's own close, ahead of any Stop call
+	drain(t, h) // drains to the turn's terminal ResultEvent; the pump is still alive
 
 	for i := 1; i <= 3; i++ {
 		if err := h.Stop(context.Background()); err != nil {
-			t.Errorf("Stop call %d after channel close = %v, want nil (Idempotent per the doc comment)", i, err)
+			t.Errorf("Stop call %d = %v, want nil (Idempotent per the doc comment)", i, err)
 		}
 	}
 }

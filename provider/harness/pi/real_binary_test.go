@@ -317,20 +317,20 @@ func TestRealBinary_Endpoint_CompletedTurn(t *testing.T) {
 // Two real-binary findings shaped this test (both load-bearing, not
 // incidental):
 //
-//  1. "Idle" only has a reachable window BEFORE the turn Spawn() already
-//     kicked off produces its first streaming event — turnInFlight is a
-//     zero-value (false) atomic.Bool at Handle construction, and Spawn's
-//     final step writes the initial `prompt` command to the child but
-//     returns to the caller before any RPC event has come back. Injecting
-//     THEN is genuinely idle and pi queues it as `follow_up`, exactly the
-//     design's intent ("Inject while idle").
-//  2. Injecting AFTER a terminal ResultEvent is NOT a second idle window —
-//     it fails with "pi: session closed". The Handle's event pump (run in
-//     handle.go) closes h.closed/h.events in the same goroutine that
-//     processes the terminal event, before any caller can plausibly race it.
-//     So "idle" cannot mean "after the session already completed" for THIS
-//     Handle implementation; it means "before/between turns while the
-//     session is still open" — see TestRealBinary_Inject_AfterTerminal_FailsClosed.
+//  1. "Idle" has a reachable window BEFORE the turn Spawn() already kicked
+//     off produces its first streaming event — turnInFlight is a zero-value
+//     (false) atomic.Bool at Handle construction, and Spawn's final step
+//     writes the initial `prompt` command to the child but returns to the
+//     caller before any RPC event has come back. Injecting THEN is genuinely
+//     idle and pi queues it as `follow_up`, exactly the design's intent
+//     ("Inject while idle").
+//  2. Injecting AFTER a terminal ResultEvent is ALSO an idle window: the
+//     Handle's event pump (run in handle.go) keeps consuming the RPC stream
+//     past a non-fatal agent_settled terminal specifically so a later Inject
+//     has somewhere to land — see TestRealBinary_Inject_AfterTerminal_DeliversFollowUp,
+//     which proves the post-terminal follow_up actually reaches the model.
+//     Only a FATAL terminal (a policy-bypass abort, an extension_error) ends
+//     the pump for good; Inject after one still fails closed.
 func TestRealBinary_Inject_SteerMidTurn_FollowUpIdle(t *testing.T) {
 	realBinaryAvailable(t)
 
@@ -413,18 +413,20 @@ const (
 	followUpNonce = "real-binary-followup-nonce-4d5e6f"
 )
 
-// TestRealBinary_Inject_AfterTerminal_FailsClosed pins the finding described
-// in TestRealBinary_Inject_SteerMidTurn_FollowUpIdle's doc comment: Inject
-// after a terminal ResultEvent is refused, not silently accepted as a
-// "follow_up." This matters beyond this package — runner/loop.go's
+// TestRealBinary_Inject_AfterTerminal_DeliversFollowUp pins the FIX for the
+// finding TestRealBinary_Inject_SteerMidTurn_FollowUpIdle's doc comment
+// describes: Inject after a terminal ResultEvent now succeeds and reaches
+// the model as a follow_up turn, instead of failing with "pi: session
+// closed". This matters beyond this package — runner/loop.go's
 // drainMemoryInjects (the ONLY production call site of Handle.Inject for a
-// headless session) fires exactly at this post-terminal seam, so for pi
-// specifically a platform-delivered memory-inject arriving after the turn
-// already completed has nowhere to land: the Handle is already closed. That
-// is a real production consequence of this Handle's "exactly one terminal"
-// design (event_mapping.go), not a smoke-fixture artifact — flagged here so
-// it is not silently rediscovered as a mystery drop later.
-func TestRealBinary_Inject_AfterTerminal_FailsClosed(t *testing.T) {
+// headless session) fires exactly at this post-terminal seam, and
+// runner/steering.go's attemptSteering calls Inject at the very same seam
+// when a completed turn produced no PR. Both need a live rail to deliver
+// into once a pi turn has completed — the Handle's event pump (run in
+// handle.go) now keeps consuming the RPC stream past a non-fatal
+// agent_settled terminal for exactly that reason (dispatch's fatal/
+// non-fatal split in event_mapping.go / handle.go).
+func TestRealBinary_Inject_AfterTerminal_DeliversFollowUp(t *testing.T) {
 	realBinaryAvailable(t)
 
 	stub := newRealBinaryStub(t, realBinaryModel)
@@ -434,7 +436,7 @@ func TestRealBinary_Inject_AfterTerminal_FailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	h, err := p.Spawn(ctx, spec)
 	if err != nil {
@@ -454,10 +456,37 @@ func TestRealBinary_Inject_AfterTerminal_FailsClosed(t *testing.T) {
 		t.Fatal("session never reached a terminal event — cannot test post-terminal Inject behavior")
 	}
 
-	if err := h.Inject(ctx, "post-terminal-inject-should-fail"); err == nil {
-		t.Error("Inject after a terminal ResultEvent returned nil error; want a closed-session error — " +
-			"if this now succeeds, the Handle's post-terminal behavior changed and drainMemoryInjects' " +
-			"pi-specific dead zone (see this test's doc comment) may be resolved; update both")
+	const postTerminalNonce = "real-binary-post-terminal-nonce-7g8h9i"
+	if err := h.Inject(ctx, postTerminalNonce); err != nil {
+		t.Fatalf("Inject after a terminal ResultEvent = %v; want nil — the pump must stay alive past "+
+			"agent_settled so a post-terminal memory-inject or steering follow-up has somewhere to land", err)
+	}
+
+	followUpEvs := drainToResult(t, h, 30*time.Second)
+	var sawFollowUpTerminal bool
+	for _, ev := range followUpEvs {
+		if e, ok := ev.(agent.ErrorEvent); ok {
+			t.Fatalf("follow-up turn ended with an ErrorEvent: %+v", e)
+		}
+		if _, ok := ev.(agent.ResultEvent); ok {
+			sawFollowUpTerminal = true
+		}
+	}
+	if !sawFollowUpTerminal {
+		t.Fatal("post-terminal Inject was accepted but produced no follow-up turn (no second ResultEvent observed)")
+	}
+
+	var sawNonce bool
+	for _, turn := range stub.recordedTurns() {
+		for _, text := range turn.stubUserTexts() {
+			if strings.Contains(text, postTerminalNonce) {
+				sawNonce = true
+			}
+		}
+	}
+	if !sawNonce {
+		t.Errorf("the post-terminal inject nonce %q never reached the stub as conversation content — "+
+			"Inject returned nil but the follow_up never reached the model", postTerminalNonce)
 	}
 }
 
