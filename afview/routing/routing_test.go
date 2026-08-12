@@ -168,6 +168,39 @@ func TestRenderShow_ANSIColorPath(t *testing.T) {
 	}
 }
 
+// TestRenderShow_RulesetSnapshotOmittedWhenUnconfigured pins that no
+// "Ruleset snapshot" line appears when RulesetSnapshot is nil — the
+// default for every daemon that never configures a snapshot source.
+func TestRenderShow_RulesetSnapshotOmittedWhenUnconfigured(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := routing.RenderShow(&buf, sampleConfig(), true); err != nil {
+		t.Fatalf("RenderShow: %v", err)
+	}
+	if strings.Contains(buf.String(), "Ruleset snapshot") {
+		t.Errorf("unexpected ruleset-snapshot line with RulesetSnapshot=nil:\n%s", buf.String())
+	}
+}
+
+func TestRenderShow_RulesetSnapshot(t *testing.T) {
+	t.Parallel()
+	cfg := sampleConfig()
+	cfg.RulesetSnapshot = &afclient.RulesetSnapshotStatus{
+		Rev: "org1@42", AgeMs: 90_000, Degraded: true,
+		CompiledAt: time.Date(2026, 5, 7, 11, 58, 30, 0, time.UTC),
+	}
+	var buf bytes.Buffer
+	if err := routing.RenderShow(&buf, cfg, true); err != nil {
+		t.Fatalf("RenderShow: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"Ruleset snapshot", "org1@42", "age=1m30s", "degraded"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in RenderShow output:\n%s", want, out)
+		}
+	}
+}
+
 // ─── RenderExplain ────────────────────────────────────────────────────────────
 
 func TestRenderExplain_Basic(t *testing.T) {
@@ -276,6 +309,45 @@ func TestRenderExplain_EstimatedCostAndLatency(t *testing.T) {
 	}
 }
 
+func TestRenderExplain_RulesetSnapshot(t *testing.T) {
+	t.Parallel()
+	resp := &afclient.RoutingExplainResponse{
+		SessionID: "sess-snapshot",
+		Decision:  afclient.RoutingDecision{ChosenSandbox: "local", ChosenLLM: "claude", Score: 0.1},
+		RulesetSnapshot: &afclient.RulesetSnapshotStatus{
+			Rev: "org1@7", AgeMs: 5_000, Degraded: false,
+		},
+	}
+	var buf bytes.Buffer
+	if err := routing.RenderExplain(&buf, resp, true); err != nil {
+		t.Fatalf("RenderExplain: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"Ruleset snapshot", "org1@7", "age=5s"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in RenderExplain output:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "degraded") {
+		t.Errorf("unexpected degraded marker for a fresh snapshot:\n%s", out)
+	}
+}
+
+func TestRenderExplain_RulesetSnapshotOmittedWhenUnconfigured(t *testing.T) {
+	t.Parallel()
+	resp := &afclient.RoutingExplainResponse{
+		SessionID: "sess-no-snapshot",
+		Decision:  afclient.RoutingDecision{ChosenSandbox: "local", ChosenLLM: "claude", Score: 0.1},
+	}
+	var buf bytes.Buffer
+	if err := routing.RenderExplain(&buf, resp, true); err != nil {
+		t.Fatalf("RenderExplain: %v", err)
+	}
+	if strings.Contains(buf.String(), "Ruleset snapshot") {
+		t.Errorf("unexpected ruleset-snapshot line with RulesetSnapshot=nil:\n%s", buf.String())
+	}
+}
+
 // ─── Plain rendering (smoke pin point) ───────────────────────────────────────
 
 func TestPlainShow_Snapshot(t *testing.T) {
@@ -309,6 +381,25 @@ func TestPlainShow_Snapshot(t *testing.T) {
 	// No ANSI escapes should leak into plain output.
 	if strings.Contains(got, "\033[") {
 		t.Errorf("plain output must not contain ANSI escapes:\n%s", got)
+	}
+	// No ruleset-snapshot line for a config that never set the field —
+	// existing rensei-smokes pins recorded before this field existed must
+	// stay byte-identical.
+	if strings.Contains(got, "ruleset-snapshot:") {
+		t.Errorf("unexpected ruleset-snapshot line with RulesetSnapshot=nil:\n%s", got)
+	}
+}
+
+func TestPlainShow_RulesetSnapshot(t *testing.T) {
+	t.Parallel()
+	cfg := sampleConfig()
+	cfg.RulesetSnapshot = &afclient.RulesetSnapshotStatus{Rev: "org1@42", AgeMs: 90_000, Degraded: true}
+	var buf bytes.Buffer
+	if err := routing.PlainShow(&buf, cfg); err != nil {
+		t.Fatalf("PlainShow: %v", err)
+	}
+	if !strings.Contains(buf.String(), "ruleset-snapshot: rev=org1@42 age=1m30s degraded=true\n") {
+		t.Errorf("expected pinned ruleset-snapshot line:\n%s", buf.String())
 	}
 }
 
@@ -390,6 +481,27 @@ func TestPlainExplain_EmptyTrace(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "trace: (empty)") {
 		t.Errorf("expected empty-trace marker:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "ruleset-snapshot:") {
+		t.Errorf("unexpected ruleset-snapshot line with RulesetSnapshot=nil:\n%s", buf.String())
+	}
+}
+
+func TestPlainExplain_RulesetSnapshot(t *testing.T) {
+	t.Parallel()
+	resp := &afclient.RoutingExplainResponse{
+		SessionID: "sess-snapshot",
+		Decision:  afclient.RoutingDecision{ChosenSandbox: "local", ChosenLLM: "claude", Score: 0.5},
+		RulesetSnapshot: &afclient.RulesetSnapshotStatus{
+			Rev: "org1@7", AgeMs: 5_000, Degraded: false,
+		},
+	}
+	var buf bytes.Buffer
+	if err := routing.PlainExplain(&buf, resp); err != nil {
+		t.Fatalf("PlainExplain: %v", err)
+	}
+	if !strings.Contains(buf.String(), "ruleset-snapshot: rev=org1@7 age=5s degraded=false\n") {
+		t.Errorf("expected pinned ruleset-snapshot line:\n%s", buf.String())
 	}
 }
 

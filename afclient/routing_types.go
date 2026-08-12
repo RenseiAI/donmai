@@ -37,6 +37,30 @@ type RoutingConfig struct {
 
 	// CapturedAt is when this snapshot was taken.
 	CapturedAt time.Time `json:"capturedAt"`
+
+	// RulesetSnapshot is the daemon's CURRENT cached ruleset-snapshot
+	// staleness signal for fail-static claim evaluation (Consul `Age` /
+	// Envoy TTL precedent, 05-sota-research.md §A5) — nil when no snapshot
+	// source is configured, matching every daemon before this field
+	// existed.
+	RulesetSnapshot *RulesetSnapshotStatus `json:"rulesetSnapshot,omitempty"`
+}
+
+// RulesetSnapshotStatus is the point-in-time staleness signal for a
+// daemon's cached ruleset snapshot: revision, age, and whether age has
+// crossed the configured degraded bound. Mirrors
+// rulesetsnapshot.Status one-for-one on the wire.
+type RulesetSnapshotStatus struct {
+	// Rev is the publisher's revision string (e.g. "{orgId}@{revision}").
+	Rev string `json:"rev"`
+	// AgeMs is milliseconds since the snapshot was compiled, computed at
+	// response time — not frozen at fetch time.
+	AgeMs int64 `json:"ageMs"`
+	// Degraded is true once Age has crossed the configured DegradedAfter
+	// bound; the snapshot is still served (fail-static) until RefuseAfter.
+	Degraded bool `json:"degraded"`
+	// CompiledAt is when the publisher compiled this snapshot.
+	CompiledAt time.Time `json:"compiledAt"`
 }
 
 // CapabilityFilter is a single hard constraint applied before scoring.
@@ -116,6 +140,11 @@ type RoutingExplainResponse struct {
 	SessionID string             `json:"sessionId"`
 	Decision  RoutingDecision    `json:"decision"`
 	Trace     []RoutingTraceStep `json:"trace"`
+
+	// RulesetSnapshot is the cached ruleset-snapshot status recorded
+	// alongside this specific decision — nil when no snapshot source was
+	// configured at decision time.
+	RulesetSnapshot *RulesetSnapshotStatus `json:"rulesetSnapshot,omitempty"`
 }
 
 // RoutingTraceStep is a single step in the scheduler's decision trace.

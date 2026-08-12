@@ -18,6 +18,7 @@ import (
 	"github.com/RenseiAI/donmai/gateway/costfeed"
 	internaldaemon "github.com/RenseiAI/donmai/internal/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/rulesetsnapshot"
 )
 
 // LandingWorkType is the poll WorkType wire value for a landing-run trigger:
@@ -80,6 +81,21 @@ type Options struct {
 	// credential hooks or worker spawn. Receipt-bearing work fails closed when
 	// either the compiler or this store is absent.
 	ExecutionPreflightStore ExecutionPreflightStore
+
+	// RulesetSnapshot, when non-nil, wires the daemon to a configured
+	// ruleset-snapshot source: a signed, versioned bundle the daemon
+	// polls, verifies (Ed25519 + content hash), and caches to disk,
+	// consulted by the claim path when a live ClaimGateProvider is unset or
+	// fails — fail-static within the client's configured TTL, a loud typed
+	// refusal past it (see FailStaticClaimGateProvider). Nil (the default)
+	// keeps every existing single-machine/self-hosted deployment
+	// byte-identical: no snapshot source, no behaviour change. An
+	// embedding platform constructs a *rulesetsnapshot.Client with its OWN
+	// Endpoint URL / trusted key(s) / JWKS and injects it here — this
+	// package never hardcodes or guesses a platform URL. The embedder also
+	// owns keeping it warm (rulesetsnapshot.Client.Start or its own
+	// periodic Refresh); the daemon only ever reads Current().
+	RulesetSnapshot *rulesetsnapshot.Client
 
 	// EnableGateway starts the translating-gateway loopback host (the
 	// ModelEndpoint host kind "gateway", ADR-2026-07-24 / 08) alongside the
@@ -392,6 +408,12 @@ func New(opts Options) *Daemon {
 		landingDone:    landingDone,
 		sessionDetails: newSessionDetailStore(),
 		routingTraces:  NewRoutingTraceStore(DefaultRoutingRingBufferSize),
+	}
+	if opts.RulesetSnapshot != nil {
+		snapshotClient := opts.RulesetSnapshot
+		d.routingTraces.SetSnapshotStatusFunc(func() (afclient.RulesetSnapshotStatus, bool) {
+			return rulesetSnapshotWireStatus(snapshotClient)
+		})
 	}
 	d.state.Store(StateStopped)
 	return d
@@ -1689,7 +1711,7 @@ func (d *Daemon) evaluateNarrowOnlyClaim(detail *SessionDetail) error {
 		return nil
 	}
 
-	provider, ok := d.opts.ProviderRegistry.(ClaimGateProvider)
+	provider, ok := d.claimGateProvider()
 	if !ok {
 		return nil
 	}
@@ -1708,6 +1730,14 @@ func (d *Daemon) evaluateNarrowOnlyClaim(detail *SessionDetail) error {
 		return fmt.Errorf("canonicalize admitted cell: %w", err)
 	}
 	realityJSON, err := provider.ResolveClaimLocalReality(cellJSON)
+	// Record the cached ruleset-snapshot status this claim
+	// decision was evaluated against, regardless of whether it succeeds or
+	// is denied/refused below — a refusal is exactly the case
+	// `routing explain` most needs to show rev/age/degraded for. A nil-safe
+	// no-op when no snapshot source is configured (d.opts.RulesetSnapshot
+	// == nil), preserving today's behaviour for every deployment that never
+	// wires one.
+	d.recordClaimGateSnapshotDecision(detail.SessionID)
 	if err != nil {
 		return fmt.Errorf("resolve claim local reality: %w", err)
 	}
