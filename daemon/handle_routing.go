@@ -71,7 +71,7 @@ func (s *Server) handleExplainRouting(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	decision, trace, ok := store.Explain(id)
+	decision, trace, snapshotStatus, ok := store.ExplainWithSnapshot(id)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error":     "routing decision not found",
@@ -80,8 +80,9 @@ func (s *Server) handleExplainRouting(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, &afclient.RoutingExplainResponse{
-		SessionID: id,
-		Decision:  decision,
-		Trace:     trace,
+		SessionID:       id,
+		Decision:        decision,
+		Trace:           trace,
+		RulesetSnapshot: snapshotStatus,
 	})
 }

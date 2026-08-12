@@ -40,6 +40,13 @@ var DefaultRoutingWeights = afclient.RoutingWeights{Cost: 0.7, Latency: 0.3}
 type recordedDecision struct {
 	decision afclient.RoutingDecision
 	trace    []afclient.RoutingTraceStep
+	// snapshotStatus is the cached ruleset-snapshot status AT RECORD TIME,
+	// nil when no snapshot source was configured when this decision was
+	// recorded. Historical — unlike GetConfig's ambient
+	// RulesetSnapshot field (always current), this is frozen at
+	// RecordDecisionWithSnapshot time so `routing explain <session>` shows
+	// what the decision was actually evaluated against.
+	snapshotStatus *afclient.RulesetSnapshotStatus
 }
 
 // RoutingTraceStore is the in-process record of routing decisions. The
@@ -59,6 +66,14 @@ type RoutingTraceStore struct {
 	// reports no capability filters, identical to every session before
 	// this signal existed.
 	demand kit.PlacementDemand
+	// snapshotStatusFn, when set via SetSnapshotStatusFunc, reports the
+	// daemon's CURRENT cached ruleset-snapshot staleness — read fresh on
+	// every GetConfig call (never cached here) so Age reflects
+	// "now", exactly like an HTTP Age response header. nil (the default)
+	// means no snapshot source is configured; GetConfig then reports no
+	// RulesetSnapshot field, identical to every daemon before this signal
+	// existed.
+	snapshotStatusFn func() (afclient.RulesetSnapshotStatus, bool)
 }
 
 // NewRoutingTraceStore constructs a store with the given ring-buffer size.
@@ -80,13 +95,43 @@ func NewRoutingTraceStore(ringSize int) *RoutingTraceStore {
 // allowed (the ring still tracks it) but the explain lookup is keyed by
 // SessionID, so an unkeyed entry is invisible to Explain.
 func (s *RoutingTraceStore) RecordDecision(decision afclient.RoutingDecision, trace []afclient.RoutingTraceStep) {
+	s.recordDecision(decision, trace, nil)
+}
+
+// RecordDecisionWithSnapshot is RecordDecision plus the cached
+// ruleset-snapshot status in effect when this decision was made — nil when
+// no snapshot source is configured. The claim-gate path
+// (daemon.FailStaticClaimGateProvider, via evaluateNarrowOnlyClaim) calls
+// this so `routing explain <sessionId>` shows the rev/age/degraded state a
+// fail-static claim decision was actually evaluated against, not just the
+// daemon's current ambient state (which GetConfig already surfaces).
+func (s *RoutingTraceStore) RecordDecisionWithSnapshot(decision afclient.RoutingDecision, trace []afclient.RoutingTraceStep, status *afclient.RulesetSnapshotStatus) {
+	s.recordDecision(decision, trace, status)
+}
+
+func (s *RoutingTraceStore) recordDecision(decision afclient.RoutingDecision, trace []afclient.RoutingTraceStep, status *afclient.RulesetSnapshotStatus) {
 	// Defensive copy: callers may continue to mutate trace after recording.
 	traceCopy := make([]afclient.RoutingTraceStep, len(trace))
 	copy(traceCopy, trace)
-	rec := recordedDecision{decision: decision, trace: traceCopy}
+	rec := recordedDecision{decision: decision, trace: traceCopy, snapshotStatus: status}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A session can be recorded through two independent call sites — the
+	// pre-existing OSS routing-decision recorder (RecordDecision, no
+	// snapshot status) and the claim-gate path (RecordDecisionWithSnapshot)
+	// — and either may fire second for the same SessionID. Whichever fires
+	// second must not silently ERASE a
+	// snapshot status the other already recorded: a caller that has no
+	// opinion about the snapshot (status == nil) inherits whatever this
+	// session's most recent recorded status already was, rather than
+	// clobbering it to nil.
+	if status == nil && decision.SessionID != "" {
+		if existing, ok := s.bySession[decision.SessionID]; ok && existing.snapshotStatus != nil {
+			inherited := *existing.snapshotStatus
+			rec.snapshotStatus = &inherited
+		}
+	}
 	if len(s.ring) >= s.ringSize {
 		evicted := s.ring[0]
 		s.ring = s.ring[1:]
@@ -118,16 +163,40 @@ func (s *RoutingTraceStore) recentDecisions() []afclient.RoutingDecision {
 // false when the session has no recorded decision (or the decision has
 // been evicted from the ring).
 func (s *RoutingTraceStore) Explain(sessionID string) (afclient.RoutingDecision, []afclient.RoutingTraceStep, bool) {
+	decision, trace, _, ok := s.ExplainWithSnapshot(sessionID)
+	return decision, trace, ok
+}
+
+// ExplainWithSnapshot is Explain plus the ruleset-snapshot status recorded
+// alongside the decision, if any — see RecordDecisionWithSnapshot.
+func (s *RoutingTraceStore) ExplainWithSnapshot(sessionID string) (afclient.RoutingDecision, []afclient.RoutingTraceStep, *afclient.RulesetSnapshotStatus, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rec, ok := s.bySession[sessionID]
 	if !ok {
-		return afclient.RoutingDecision{}, nil, false
+		return afclient.RoutingDecision{}, nil, nil, false
 	}
 	// Defensive copy of trace so the caller cannot mutate the stored slice.
 	traceCopy := make([]afclient.RoutingTraceStep, len(rec.trace))
 	copy(traceCopy, rec.trace)
-	return rec.decision, traceCopy, true
+	var status *afclient.RulesetSnapshotStatus
+	if rec.snapshotStatus != nil {
+		copied := *rec.snapshotStatus
+		status = &copied
+	}
+	return rec.decision, traceCopy, status, true
+}
+
+// SetSnapshotStatusFunc wires the daemon's ambient cached-ruleset-snapshot
+// status source — typically a *rulesetsnapshot.Client's Current() adapted
+// to the wire shape. GetConfig calls fn fresh on every read (never
+// memoized here) so the reported Age always reflects "now". Passing nil
+// (the default) omits RulesetSnapshot entirely, identical to every daemon
+// before this signal existed.
+func (s *RoutingTraceStore) SetSnapshotStatusFunc(fn func() (afclient.RulesetSnapshotStatus, bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snapshotStatusFn = fn
 }
 
 // Len returns the current number of recorded decisions in the ring buffer.
@@ -177,10 +246,18 @@ func (s *RoutingTraceStore) GetConfig(providerNames []string, capturedAt time.Ti
 	s.mu.RLock()
 	recent := s.recentDecisions()
 	demand := s.demand
+	snapshotFn := s.snapshotStatusFn
 	s.mu.RUnlock()
 
 	llmProviders := buildLLMProviderState(providerNames, recent)
 	sandboxProviders := buildSandboxProviderState(recent)
+
+	var snapshotStatus *afclient.RulesetSnapshotStatus
+	if snapshotFn != nil {
+		if status, ok := snapshotFn(); ok {
+			snapshotStatus = &status
+		}
+	}
 
 	return afclient.RoutingConfig{
 		CapabilityFilters: demandCapabilityFilters(demand),
@@ -189,6 +266,7 @@ func (s *RoutingTraceStore) GetConfig(providerNames []string, capturedAt time.Ti
 		LLMProviders:      llmProviders,
 		RecentDecisions:   recent,
 		CapturedAt:        capturedAt,
+		RulesetSnapshot:   snapshotStatus,
 	}
 }
 

@@ -1,22 +1,20 @@
-// Package routing hosts the canonical renderers for the af /
-// rensei `routing` command tree, sourced from afclient.RoutingConfig
-// and afclient.RoutingExplainResponse wire types. Lifted from the
-// previous rensei-tui resident copy under
-// rensei-tui/internal/views/routing per ADR-2026-05-07-daemon-http-
-// control-api.md §D3.
+// Package routing hosts the canonical renderers for the `routing` command
+// tree, sourced from afclient.RoutingConfig and
+// afclient.RoutingExplainResponse wire types, per
+// ADR-2026-05-07-daemon-http-control-api.md §D3.
 //
 // Two output paths:
 //
 //   - RenderShow / RenderExplain — ANSI rendering for TTY users.
 //   - PlainShow / PlainExplain — deterministic plain-text rendering used
-//     by rensei-smokes integration tests and by `--plain` mode. No ANSI
+//     by integration-test suites and by `--plain` mode. No ANSI
 //     escapes, no emoji. The explain plain-text emits a numbered trace
 //     so smoke pins are stable across renderer churn.
 //
-// Wave 9 / A4 — read-only this wave; the `tail` subcommand from the
-// previous rensei-tui placement is intentionally NOT lifted (the daemon
-// does not expose a streaming endpoint per ADR D1; consumers should use
-// `rensei observability events tail --filter kind=routing-decision`).
+// Wave 9 / A4 — read-only this wave; a streaming `tail` subcommand is
+// intentionally NOT shipped here (the daemon does not expose a streaming
+// endpoint per ADR D1; consumers should use
+// `observability events tail --filter kind=routing-decision`).
 package routing
 
 import (
@@ -118,15 +116,40 @@ type ExplainView struct {
 
 // ─── RenderShow ──────────────────────────────────────────────────────────────
 
+// renderRulesetSnapshotLine writes the daemon's cached ruleset-snapshot
+// staleness line — rev, age, and a degraded warning once age crosses the
+// configured bound (Consul `Age` / Envoy TTL precedent). status is nil for
+// every daemon that has never configured a snapshot source: the line is
+// simply omitted, so existing output (and existing rensei-smokes pins) are
+// byte-identical when the feature is off.
+func renderRulesetSnapshotLine(out io.Writer, status *afclient.RulesetSnapshotStatus, noColor bool) {
+	if status == nil {
+		return
+	}
+	age := time.Duration(status.AgeMs) * time.Millisecond
+	degraded := ""
+	if status.Degraded {
+		degraded = " " + warnStr("(degraded)", noColor)
+	}
+	_, _ = fmt.Fprintf(out, "  %s %s %s%s\n",
+		muted("Ruleset snapshot:", noColor),
+		bold(status.Rev, noColor),
+		muted("age="+age.Round(time.Second).String(), noColor),
+		degraded,
+	)
+}
+
 // RenderShow writes the `routing show` output: current Thompson-Sampling
 // state across both dimensions, capability filters, weights, and a
 // recent decisions table.
 func RenderShow(out io.Writer, cfg *afclient.RoutingConfig, noColor bool) error {
 	_, _ = fmt.Fprintln(out, sectionHeader("Routing Configuration", noColor))
-	_, _ = fmt.Fprintf(out, "  %s %s\n\n",
+	_, _ = fmt.Fprintf(out, "  %s %s\n",
 		muted("Captured:", noColor),
 		bold(cfg.CapturedAt.UTC().Format(time.RFC3339), noColor),
 	)
+	renderRulesetSnapshotLine(out, cfg.RulesetSnapshot, noColor)
+	_, _ = fmt.Fprintln(out)
 
 	// Scoring weights
 	_, _ = fmt.Fprintln(out, bold("Scoring Weights", noColor))
@@ -381,10 +404,12 @@ func renderDecisionsTable(out io.Writer, decisions []afclient.RoutingDecision, n
 // RenderExplain writes the full decision trace for `routing explain`.
 func RenderExplain(out io.Writer, resp *afclient.RoutingExplainResponse, noColor bool) error {
 	_, _ = fmt.Fprintln(out, sectionHeader("Routing Decision Trace", noColor))
-	_, _ = fmt.Fprintf(out, "  %s %s\n\n",
+	_, _ = fmt.Fprintf(out, "  %s %s\n",
 		muted("Session:", noColor),
 		bold(resp.SessionID, noColor),
 	)
+	renderRulesetSnapshotLine(out, resp.RulesetSnapshot, noColor)
+	_, _ = fmt.Fprintln(out)
 
 	_, _ = fmt.Fprintln(out, bold("Chosen", noColor))
 	_, _ = fmt.Fprintf(out, "  %s %s\n",
@@ -488,6 +513,19 @@ func RenderExplain(out io.Writer, resp *afclient.RoutingExplainResponse, noColor
 
 // ─── Plain-text fallback (rensei-smokes pin point) ───────────────────────────
 
+// plainRulesetSnapshotLine is renderRulesetSnapshotLine's plain-text
+// counterpart: no ANSI, fixed key=value shape. Omitted entirely when
+// status is nil, keeping every pin recorded before this field existed
+// byte-identical.
+func plainRulesetSnapshotLine(out io.Writer, status *afclient.RulesetSnapshotStatus) {
+	if status == nil {
+		return
+	}
+	age := time.Duration(status.AgeMs) * time.Millisecond
+	_, _ = fmt.Fprintf(out, "ruleset-snapshot: rev=%s age=%s degraded=%t\n",
+		status.Rev, age.Round(time.Second), status.Degraded)
+}
+
 // PlainShow writes a deterministic plain-text rendering of the routing
 // configuration. No ANSI escapes, no emoji, fixed column ordering. This
 // is what rensei-smokes pins against — keep the format stable across
@@ -495,6 +533,7 @@ func RenderExplain(out io.Writer, resp *afclient.RoutingExplainResponse, noColor
 // pin atomically.
 func PlainShow(out io.Writer, cfg *afclient.RoutingConfig) error {
 	_, _ = fmt.Fprintf(out, "captured: %s\n", cfg.CapturedAt.UTC().Format(time.RFC3339))
+	plainRulesetSnapshotLine(out, cfg.RulesetSnapshot)
 	_, _ = fmt.Fprintf(out, "weights: cost=%.2f latency=%.2f\n", cfg.Weights.Cost, cfg.Weights.Latency)
 
 	if len(cfg.CapabilityFilters) > 0 {
@@ -536,6 +575,7 @@ func PlainShow(out io.Writer, cfg *afclient.RoutingConfig) error {
 // position. No ANSI, no emoji.
 func PlainExplain(out io.Writer, resp *afclient.RoutingExplainResponse) error {
 	_, _ = fmt.Fprintf(out, "session: %s\n", resp.SessionID)
+	plainRulesetSnapshotLine(out, resp.RulesetSnapshot)
 	_, _ = fmt.Fprintf(out, "chosen-sandbox: %s\n", resp.Decision.ChosenSandbox)
 	_, _ = fmt.Fprintf(out, "chosen-llm: %s\n", resp.Decision.ChosenLLM)
 	_, _ = fmt.Fprintf(out, "score: %.3f\n", resp.Decision.Score)
