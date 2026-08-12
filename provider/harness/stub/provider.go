@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -113,13 +114,22 @@ func (p *provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // callers can correlate.
 //
 // When Capabilities.SupportsSessionResume is false Resume returns
-// agent.ErrUnsupported.
+// agent.ErrUnsupported. When Spec.ProviderConfig["stub.resumeFailure"] is
+// true Resume returns a generic (non-ErrUnsupported) error regardless of
+// capability — tests use this to exercise a caller's hard-failure path
+// (e.g. runner/steering.go's attemptSteeringResume) distinctly from the
+// soft-fail ErrUnsupported path.
 func (p *provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
 	if !p.caps.SupportsSessionResume {
 		return nil, agent.ErrUnsupported
 	}
 	if sessionID == "" {
 		return nil, fmt.Errorf("%w: empty session id", agent.ErrSessionNotFound)
+	}
+	if v, ok := spec.ProviderConfig["stub.resumeFailure"]; ok {
+		if b, ok := v.(bool); ok && b {
+			return nil, errors.New("stub: forced resume failure")
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)

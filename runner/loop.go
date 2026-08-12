@@ -1089,10 +1089,17 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	nonVCPassed := !isResultSensitive(qw.WorkType) && res.WorkResult == "passed"
 	if !r.skipSteering && !streamRes.blocked && !nonVCPassed && shouldSteer(streamRes, caps, qw.WorkType) {
 		res.SteeringTriggered = true
-		if err := r.attemptSteering(ctx, handle, qw, streamRes); err != nil {
+		newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, streamRes, res)
+		if err != nil {
 			r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
 		} else {
-			// Re-consume any events the steering inject produced.
+			// attemptSteering returns the handle to keep draining: unchanged
+			// on inject success/soft-fail, or the new Handle Provider.Resume
+			// returned on the stop-and-resume fallback. The deferred Stop
+			// above closes over this variable, so reassigning it here also
+			// makes teardown target whichever handle is now live.
+			handle = newHandle
+			// Re-consume any events the steering inject/resume produced.
 			tailRes, _ := r.consumeEvents(ctx, handle, wpath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
 		}

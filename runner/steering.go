@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
@@ -58,34 +59,152 @@ func shouldSteer(obs streamObservation, caps agent.Capabilities, workType string
 }
 
 // attemptSteering injects a per-provider templated steering prompt
-// asking the agent to commit, push, and open a PR. The injection
-// path is preferred (no subprocess overhead); when only Resume is
-// available the runner stops the current handle and resumes (today
-// the runner does not exercise that path — providers must implement
-// Resume separately, and v0.5.0 ships with all three providers
-// returning ErrUnsupported on Resume by design — see F.1.1 §3).
+// asking the agent to commit, push, and open a PR. The injection path
+// is preferred (no subprocess overhead). When the live handle rejects
+// the inject as unsupported — either because the harness never
+// supports message injection (e.g. Codex) or because THIS handle
+// doesn't even though the provider's capability matrix allows it on
+// another lane (e.g. OpenCode's one-shot handle) — and the harness
+// declares session resume (Capabilities.SupportsSessionResume),
+// attemptSteering falls back to stop-and-resume: it stops the current
+// turn, then calls Provider.Resume on the SAME provider-native session
+// with the steering prompt riding Spec.Prompt as the resumed turn's
+// directive. This is the fallback this file has documented since
+// F.1.1 §3 but never wired for any provider until now.
 //
-// Returns nil when the steering inject was accepted by the provider;
-// the caller is responsible for re-consuming events to capture any
-// new tool calls. Returns an error when the inject path is
-// unsupported or the provider rejected it — the caller falls through
-// to backstop.
-func (r *Runner) attemptSteering(ctx context.Context, handle agent.Handle, qw QueuedWork, obs streamObservation) error {
+// Returns the Handle the caller should keep draining events from: the
+// SAME handle on the inject-success and soft-fail paths (no behavior
+// change), or the NEW Handle Provider.Resume returned on the fallback
+// path. A non-nil error means steering could not be delivered through
+// either rail; the returned Handle is still safe to use (Stop is
+// idempotent) and the caller falls through to the deterministic
+// backstop instead of re-consuming events.
+func (r *Runner) attemptSteering(
+	ctx context.Context,
+	provider agent.Provider,
+	handle agent.Handle,
+	spec agent.Spec,
+	caps agent.Capabilities,
+	qw QueuedWork,
+	obs streamObservation,
+	res *Result,
+) (agent.Handle, error) {
 	if obs.terminalSuccess && obs.pullRequestURL != "" {
 		// Sanity guard — shouldSteer already returned false in this
 		// case but keep the post-condition explicit so future calls
-		// don't accidentally double-inject.
-		return nil
+		// don't accidentally double-steer.
+		return handle, nil
 	}
-	prompt := buildSteeringPrompt(qw, obs)
+	steerText := buildSteeringPrompt(qw, obs)
 	r.logger.Info("steering: injecting follow-up prompt",
 		"sessionId", qw.SessionID,
-		"len", len(prompt),
+		"len", len(steerText),
 	)
-	if err := r.injectDirective(ctx, handle, prompt); err != nil {
-		return fmt.Errorf("steering: inject failed: %w", err)
+
+	// Deliberately NOT routed through the shared injectDirective helper:
+	// that helper's contract (used by the Wave 3 memory drain too) swallows
+	// ErrUnsupported into a silent nil so a soft-failed inject looks
+	// identical to a delivered one. Steering needs the raw classification
+	// to decide whether an ErrUnsupported is a dead end or a resume
+	// opportunity, so it inspects handle.Inject's error directly.
+	switch err := handle.Inject(ctx, steerText); {
+	case err == nil:
+		return handle, nil
+	case errors.Is(err, clijsonl.ErrSessionNotReady):
+		// Transient — no InitEvent observed yet. There is nothing to
+		// resume from either; same soft no-op contract as injectDirective.
+		r.logger.Debug("steering: inject skipped: session not ready (no InitEvent yet)")
+		return handle, nil
+	case errors.Is(err, clijsonl.ErrInjectInFlight):
+		// Transient — a previous inject subprocess is still running.
+		// Falling back to resume here would race that subprocess; same
+		// soft no-op contract as injectDirective.
+		r.logger.Debug("steering: inject skipped: a previous inject is still in flight")
+		return handle, nil
+	case errors.Is(err, agent.ErrUnsupported):
+		if !caps.SupportsSessionResume {
+			r.logger.Debug("steering: inject unsupported and harness declares no resume fallback")
+			return handle, nil
+		}
+		return r.attemptSteeringResume(ctx, provider, handle, spec, qw, steerText, res)
+	default:
+		return handle, fmt.Errorf("steering: inject failed: %w", err)
 	}
-	return nil
+}
+
+// attemptSteeringResume performs the stop-and-resume fallback documented
+// in attemptSteering's doc comment: stop the current turn, then resume
+// the SAME provider-native session with the steering directive as the
+// resumed turn's Spec.Prompt.
+//
+// Routing through the SAME provider reference the caller used for Spawn
+// preserves session continuity end to end: an embedder's DecorateProvider
+// wrapper (agent/spec_decorator.go) and any harness's additional-extension
+// materialize+digest-verify seam (e.g. pi's launch()) both re-run for the
+// resumed session exactly as they would for any other Resume call — this
+// fallback adds no bypass of either, it just gives Resume a real caller.
+//
+// Returns the new Handle on success — the caller re-consumes its events
+// exactly like a successful inject. On any other failure it returns the
+// ORIGINAL (now-stopped) handle plus an error, except when Provider.Resume
+// itself rejects with agent.ErrUnsupported: that is the same soft no-op
+// contract as the inject path above (nil error, caller falls through to
+// backstop untouched).
+func (r *Runner) attemptSteeringResume(
+	ctx context.Context,
+	provider agent.Provider,
+	handle agent.Handle,
+	spec agent.Spec,
+	qw QueuedWork,
+	steerText string,
+	res *Result,
+) (agent.Handle, error) {
+	sessionID := handle.SessionID()
+	if sessionID == "" {
+		// No InitEvent was ever observed on this handle, so there is no
+		// provider-native session id to resume. Same soft no-op shape as
+		// the transient inject failures in attemptSteering.
+		r.logger.Debug("steering: resume fallback skipped: no session id captured")
+		return handle, nil
+	}
+	r.logger.Info("steering: inject unsupported, falling back to stop-and-resume",
+		"sessionId", qw.SessionID,
+		"providerSessionId", sessionID,
+	)
+
+	// Stop the turn safely before resuming. attemptSteering only runs
+	// after the runner has already drained the handle to its terminal
+	// event (F.1.1 §4 step 11 fires after step 10's terminal wait), so
+	// this Stop releases provider-side resources deterministically
+	// rather than aborting in-flight work.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	stopErr := handle.Stop(stopCtx)
+	stopCancel()
+	if stopErr != nil {
+		return handle, fmt.Errorf("steering: resume fallback: stop failed: %w", stopErr)
+	}
+
+	// The resumed turn's directive is the same steering prompt Inject
+	// would have delivered — only the transport changes. Copying spec
+	// (a value type) preserves every other field the session was spawned
+	// with (Cwd, Env, MCPServers, tool permissions, AdditionalExtensions, …).
+	resumeSpec := spec
+	resumeSpec.Prompt = steerText
+
+	newHandle, err := provider.Resume(ctx, sessionID, resumeSpec)
+	if err != nil {
+		if errors.Is(err, agent.ErrUnsupported) {
+			r.logger.Debug("steering: resume fallback rejected as unsupported",
+				"sessionId", qw.SessionID,
+			)
+			return handle, nil
+		}
+		return handle, fmt.Errorf("steering: resume fallback: resume failed: %w", err)
+	}
+	if res != nil {
+		res.SteeringResumeFallback = true
+	}
+	return newHandle, nil
 }
 
 // injectDirective delivers text into a live session as a follow-up user

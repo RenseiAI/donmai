@@ -54,6 +54,19 @@ const (
 	// inject also emits the terminal ResultEvent and closes the
 	// channel. Exercises the SupportsMessageInjection path.
 	BehaviorInjectTest Behavior = "inject-test"
+
+	// BehaviorResumeSteer models a resume-only harness (Codex,
+	// OpenCode's one-shot lane): the FIRST turn (h.resumed == false)
+	// completes successfully but WITHOUT a PR, so the runner's
+	// shouldSteer fires. A RESUMED handle (h.resumed == true, i.e. one
+	// returned from Provider.Resume) instead echoes the resumed Spec's
+	// Prompt as an AssistantTextEvent before completing with a PR —
+	// exactly what a real harness does with the steering directive
+	// runner/steering.go's stop-and-resume fallback delivers via
+	// Spec.Prompt on Resume. Pair with
+	// ProviderConfig["stub.injectUnsupported"] = true so Handle.Inject
+	// rejects the runner's first attempt and forces the fallback.
+	BehaviorResumeSteer Behavior = "resume-steer"
 )
 
 // behaviorEnvKey is the legacy F.1.1 §3.3 environment knob.
@@ -81,7 +94,8 @@ func IsKnown(b Behavior) bool {
 		BehaviorSlowTool,
 		BehaviorCostOverrun,
 		BehaviorMidStreamError,
-		BehaviorInjectTest:
+		BehaviorInjectTest,
+		BehaviorResumeSteer:
 		return true
 	default:
 		return false

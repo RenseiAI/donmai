@@ -146,6 +146,8 @@ func (h *handle) run(ctx context.Context) {
 		h.scriptMidStreamError(ctx)
 	case BehaviorInjectTest:
 		h.scriptInjectTest(ctx)
+	case BehaviorResumeSteer:
+		h.scriptResumeSteer(ctx)
 	default:
 		// Unknown behaviors should have been remapped at Spawn; if
 		// one slipped through, fall back to the canonical success path
@@ -181,6 +183,33 @@ func (h *handle) maybeEmitStoppedResult(ctx context.Context) {
 	}:
 	case <-ctx.Done():
 	}
+}
+
+// scriptResumeSteer models a resume-only harness. On the FIRST turn
+// (h.resumed == false) it finishes successfully but without a PR, so the
+// runner's shouldSteer fires. On a RESUMED handle (h.resumed == true — the
+// Handle Provider.Resume returned) it echoes the resumed Spec's Prompt,
+// which is exactly where runner/steering.go's stop-and-resume fallback
+// rides the queued steer content, then completes with a PR so the caller
+// observes the steer as delivered.
+func (h *handle) scriptResumeSteer(ctx context.Context) {
+	if h.resumed {
+		if !h.emit(ctx, agent.AssistantTextEvent{Text: "resumed: " + h.spec.Prompt}) {
+			return
+		}
+		h.emit(ctx, agent.ResultEvent{
+			Success: true,
+			Message: fmt.Sprintf("Stub resumed run complete (PR: %s)", stubPullRequestURL),
+		})
+		return
+	}
+	if !h.emit(ctx, agent.AssistantTextEvent{Text: "Stub agent: finished without opening a PR."}) {
+		return
+	}
+	h.emit(ctx, agent.ResultEvent{
+		Success: true,
+		Message: "Stub run complete (no PR)",
+	})
 }
 
 // closeEvents closes the events channel exactly once. Safe to call
