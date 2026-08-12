@@ -92,7 +92,7 @@ func TestResume_DrivesGetEntriesCursorNotAFreshPrompt(t *testing.T) {
 
 	const resumeCursor = "ses_original_cursor"
 	layout := sessionLayout{root: "/session", extension: "/session/policy.ts"}
-	if got, want := rpcArgs(layout, launchResume, resumeCursor, agent.Spec{}), "--session"; !argvContains(got, want) {
+	if got, want := rpcArgs(layout, []string{layout.extension}, launchResume, resumeCursor, agent.Spec{}), "--session"; !argvContains(got, want) {
 		t.Fatalf("rpcArgs(resume) = %#v, want it to include %q", got, want)
 	}
 

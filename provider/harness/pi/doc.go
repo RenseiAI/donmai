@@ -102,17 +102,24 @@
 // harness. pi's row names: "RPC policy-handshake boundary, config-home
 // isolation, tool registration, no-MCP truth, replay/resume" (plus D8's
 // cross-cutting item 7, cleanup idempotence, which every family owes). Tool
-// registration is out of scope until a registerTool follow-up wires real
-// ToolPluginDelivery (see the Caps.SupportsToolPlugins comment in
-// manifest.go); the rest are proved here:
+// registration THROUGH THE CLOSED TOOL-LIFECYCLE PLAN (ToolPluginDelivery /
+// Caps.SupportsToolPlugins — see manifest.go) is still out of scope pending a
+// follow-up that projects Spec.AdditionalExtensions onto that generic,
+// cross-harness-compiled channel; the ADDITIONAL-EXTENSION DELIVERY SEAM
+// itself (ADR-2026-08-12) ships in this cut and gets its own row below,
+// proving real registerTool delivery through a DIFFERENT, harness-owned
+// mechanism (Spec.AdditionalExtensions, not the tool-lifecycle compiler). The
+// rest of the original family is proved here:
 //
 //   - RPC policy-handshake boundary (positive + tampered/forged negatives):
 //     handle_test.go — TestSpawn_HandshakeVerified,
 //     TestSpawn_TamperedExtensionFailsClosed, TestSpawn_ForgedTokenFailsClosed,
 //     TestSpawn_NoHandshakeFailsClosed.
 //   - config-home isolation: env_security_test.go —
-//     TestConfigHomeIsolation_AllHomeVarsRedirected (all four PI_*/XDG_*
-//     candidate home vars, not PI_HOME alone).
+//     TestConfigHomeIsolation_DocumentedVarsRedirected (the two DOCUMENTED
+//     PI_CODING_AGENT_DIR/PI_CODING_AGENT_SESSION_DIR vars — ADR-2026-08-12
+//     D4.1 retired the four undocumented PI_HOME/PI_CONFIG_DIR/PI_STATE_DIR/
+//     XDG_CONFIG_HOME candidates the prior cut guessed at).
 //   - no-MCP truth (a required mcp_server channel is denied by name, and the
 //     mcp-tool-names name filter is fatal — not merely recorded — because pi
 //     has no mount boundary to narrow): agent/tool_adaptation_test.go —
@@ -122,6 +129,50 @@
 //     TestResume_DrivesGetEntriesCursorNotAFreshPrompt.
 //   - cleanup idempotence: handle_test.go —
 //     TestStop_IdempotentAfterChannelClose.
+//
+// # Additional-extension delivery seam (ADR-2026-08-12 D1-D4)
+//
+// A second family, scoped to the seam that ADR adds. Fixtures split scripted
+// (extension_delivery_test.go — Go-side mechanics, no real binary needed)
+// from real-binary (extension_delivery_real_binary_test.go — proves the
+// mechanics against the real pinned pi process; see that file's own doc
+// comment for CI-scope caveats identical to real_binary_test.go's):
+//
+//   - materialization + TOCTOU-closing digest verification (D1/D2(b)), both
+//     delivery kinds, fail-closed on mismatch/missing-path/malformed input:
+//     extension_delivery_test.go —
+//     TestMaterializeAdditionalExtensions_PathDelivery,
+//     TestMaterializeAdditionalExtensions_InlineDelivery,
+//     TestMaterializeAdditionalExtensions_DigestMismatchFailsClosed,
+//     TestMaterializeAdditionalExtensions_MissingPathFailsClosed,
+//     TestMaterializeAdditionalExtensions_MalformedDeliveryFailsClosedBeforeIO.
+//   - boundary-first, undisplaceable ordering (D1), both spawn modes:
+//     extension_delivery_test.go —
+//     TestRPCArgs_BoundaryFirstThenAdditionalExtensionsInOrder,
+//     TestInteractiveArgs_BoundaryFirstThenAdditionalExtensionsInOrder.
+//   - required-delivery denial reaches Spawn itself, before any process
+//     starts (D1.2): extension_delivery_test.go —
+//     TestSpawn_RequiredExtensionDeliveryDenialFailsBeforeProcessSpawn,
+//     TestSpawn_ValidAdditionalExtension_HandshakeStillVerifiesNormally.
+//   - real registerTool delivery + the headless-UI guarantee (D3: an
+//     unrecognized extension's own UI round-trip resolves promptly as a
+//     refusal, never hangs) against the real binary, both delivery kinds:
+//     extension_delivery_real_binary_test.go —
+//     TestRealBinary_AdditionalExtension_ToolRegistersAndHeadlessUIRefusesPromptly.
+//   - the trust rule (D2), both halves, against the real binary:
+//     extension_delivery_real_binary_test.go —
+//     TestRealBinary_WorkspaceDiscovery_StaysDisabled (workspace-discovered
+//     extensions never load, autonomous session),
+//     TestRealBinary_TrustBypass_OperatorInjectedExtensionLoadsWithoutApprove
+//     (operator-injected `-e` loads even when trust is explicitly declined).
+//   - state isolation (D4.3 offline defaults, both lanes) and the
+//     PI_CODING_AGENT_DIR/PI_CODING_AGENT_SESSION_DIR collision this cut
+//     found and fixed (see sessionLayout.agentHome): env_security_test.go —
+//     TestOfflinePostureEnv_DefaultsOnUnlessExplicit; interactive_test.go —
+//     TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless; pinned
+//     end-to-end by TestRealBinary_Resume_StructuralReplay in
+//     real_binary_test.go, which reproduces the collision if agentHome and
+//     the session-storage root are ever collapsed back into one path.
 //
 // Each is generated from the exact manifest profile (the delivery kinds and
 // channels above are read off ToolLifecycleProfile / HarnessCaps, not
@@ -139,10 +190,15 @@
 //   - handle.go         — per-session Handle: event pump, extension round-trips, Inject, Stop
 //   - event_mapping.go  — pi event union → agent.Event (§4)
 //   - policy.go         — trust-boundary adjudicator (generalized codex approval.go)
-//   - extension.go      — materialize + token/SHA-verify the embedded policy extension (§5.2)
+//   - extension.go      — materialize + token/SHA-verify the embedded policy extension (§5.2);
+//     also materializeAdditionalExtensions for the ADR-2026-08-12 seam
 //   - extensions/donmai-policy.ts — the embedded extension (tool_call hook + handshake)
 //   - spec_translation.go — agent.Spec → argv/env/config
 //   - interactive.go    — bare-`pi` PTY spawn mode via the shared ptycli driver (see below)
+//   - testdata/conformance-fixture.ts, testdata/workspace-discovery-canary.ts —
+//     real-binary conformance fixtures for the additional-extension delivery
+//     seam (extension_delivery_real_binary_test.go); never embedded into the
+//     binary, test-only
 //
 // # Interactive PTY spawn mode (the endpoint-driven cell)
 //

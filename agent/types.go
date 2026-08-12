@@ -525,6 +525,20 @@ type Spec struct {
 	// OnToolLifecycleAdapted observes both ready and denied receipts before
 	// credential delivery or process spawn. Returning an error fails closed.
 	OnToolLifecycleAdapted func(ToolLifecycleReceipt) error `json:"-"`
+
+	// AdditionalExtensions is an ORDERED list of additional extensions
+	// delivered to a harness whose spawn surface loads host-side extensions
+	// (currently pi; provider/harness/pi). Per
+	// ADR-2026-08-12-pi-extension-delivery-seam-and-capability-pack-boundary.md
+	// D1, this generalizes the mechanism pi's own embedded trust-boundary
+	// extension already used for its one consumer: absolute-path or
+	// inline-source delivery, both digest-verified AFTER materialization
+	// (see ExtensionDelivery), with the harness's own trust-boundary
+	// extension always loading first. A harness without a host-side
+	// extension API ignores this field, like every other capability-gated
+	// Spec field. nil/empty is today's behavior for every existing producer
+	// (additive, omitempty, wire round-trip unchanged).
+	AdditionalExtensions []ExtensionDelivery `json:"additionalExtensions,omitempty"`
 }
 
 // CostData mirrors AgentCostData from the legacy TS providers/types.ts.

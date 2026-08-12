@@ -30,9 +30,12 @@ func TestEnvHygiene_BlocklistedHostSecretNeverLeaks(t *testing.T) {
 	if !hasEnvKey(env, "DONMAI_HARMLESS_VAR") {
 		t.Errorf("non-blocklisted host var was dropped; env composition is too aggressive")
 	}
-	// pi state home is redirected into the session dir (auth isolation).
-	if !hasEnvVal(env, "PI_HOME", layout.root) {
-		t.Errorf("PI_HOME not redirected to the session state dir; a host ~/.pi could leak in")
+	// pi's documented agent/config home is redirected into the per-session
+	// subdirectory (auth isolation), NEVER the session root itself — see
+	// sessionLayout.agentHome for why collapsing the two breaks pi's own
+	// resume lookup.
+	if !hasEnvVal(env, piCodingAgentDirEnvVar, layout.agentHome) {
+		t.Errorf("%s not redirected to the session agent-home dir; a host ~/.pi/agent could leak in", piCodingAgentDirEnvVar)
 	}
 	// The per-session handshake token rides the child env (the extension reads
 	// it to prove liveness/identity on the handshake round-trip).
@@ -41,17 +44,28 @@ func TestEnvHygiene_BlocklistedHostSecretNeverLeaks(t *testing.T) {
 	}
 }
 
-// TestConfigHomeIsolation_AllHomeVarsRedirected is the "config-home
-// isolation" fixture (ADR-2026-08-06 D8, pi row): composeChildEnv redirects
-// FOUR candidate home vars into the session dir (PI_HOME, PI_CONFIG_DIR,
-// PI_STATE_DIR, XDG_CONFIG_HOME — the exact pi home var is unverified against
-// a real binary per doc.go, so all four are set), and the redirect must win
-// over whatever a fleet box's own shell profile set, not merely be present
-// alongside it. TestEnvHygiene_BlocklistedHostSecretNeverLeaks above checks
-// PI_HOME alone; this fixture is the complete one across all four candidates,
-// each proven to override a host value.
-func TestConfigHomeIsolation_AllHomeVarsRedirected(t *testing.T) {
+// TestConfigHomeIsolation_DocumentedVarsRedirected is the "config-home
+// isolation" fixture (ADR-2026-08-06 D8, pi row; ADR-2026-08-12 D4.1/D4.2):
+// composeChildEnv redirects the TWO documented pi variables
+// (docs/environment-variables.md — PI_CODING_AGENT_DIR for the config/agent
+// home, PI_CODING_AGENT_SESSION_DIR for session storage) into the session
+// dir, and the redirect must win over whatever a fleet box's own shell
+// profile set, not merely be present alongside it.
+//
+// A prior cut set four UNDOCUMENTED candidate names instead (PI_HOME,
+// PI_CONFIG_DIR, PI_STATE_DIR, XDG_CONFIG_HOME) because the exact variable
+// was unverified against a real binary; none of them were load-bearing
+// (ADR-2026-08-12 F3). Per that ADR's Implementation notes, "the candidate
+// set is deleted in the same change that names the real one — not left
+// standing beside it" — this test replaces
+// TestConfigHomeIsolation_AllHomeVarsRedirected rather than joining it.
+func TestConfigHomeIsolation_DocumentedVarsRedirected(t *testing.T) {
 	// Not parallel: mutates process env.
+	t.Setenv(piCodingAgentDirEnvVar, "/home/fleetuser/.pi/agent")
+	t.Setenv(piCodingAgentSessionDirEnvVar, "/home/fleetuser/.pi/agent/sessions")
+	// The four RETIRED candidate names are set on the host too, to prove this
+	// package no longer ATTACHES any significance to them — it never reads
+	// or redirects them; whatever value the host happens to have is inert.
 	t.Setenv("PI_HOME", "/home/fleetuser/.pi")
 	t.Setenv("PI_CONFIG_DIR", "/home/fleetuser/.config/pi")
 	t.Setenv("PI_STATE_DIR", "/home/fleetuser/.local/state/pi")
@@ -60,10 +74,41 @@ func TestConfigHomeIsolation_AllHomeVarsRedirected(t *testing.T) {
 	layout := newSessionLayout(t.TempDir())
 	env := composeChildEnv(agent.Spec{Cwd: t.TempDir()}, layout, "sess-token")
 
-	for _, key := range []string{"PI_HOME", "PI_CONFIG_DIR", "PI_STATE_DIR", "XDG_CONFIG_HOME"} {
-		if !hasEnvVal(env, key, layout.root) {
-			t.Errorf("%s not redirected to the session state dir %q; a fleet box's personal pi home could leak in", key, layout.root)
-		}
+	if !hasEnvVal(env, piCodingAgentDirEnvVar, layout.agentHome) {
+		t.Errorf("%s not redirected to the session agent-home dir %q; a fleet box's personal pi agent dir could leak in", piCodingAgentDirEnvVar, layout.agentHome)
+	}
+	if !hasEnvVal(env, piCodingAgentSessionDirEnvVar, layout.root) {
+		t.Errorf("%s not redirected to the session dir %q", piCodingAgentSessionDirEnvVar, layout.root)
+	}
+}
+
+// TestOfflinePostureEnv_DefaultsOnUnlessExplicit pins ADR-2026-08-12 D4.3:
+// PI_OFFLINE and PI_SKIP_VERSION_CHECK default to "1" for every
+// execution-layer-spawned session, but an explicit spec.Env binding always
+// wins over the default — "a session may re-enable either, recorded as an
+// explicit environment-binding entry rather than acquired by omission."
+func TestOfflinePostureEnv_DefaultsOnUnlessExplicit(t *testing.T) {
+	t.Parallel()
+
+	layout := newSessionLayout(t.TempDir())
+	env := composeChildEnv(agent.Spec{Cwd: t.TempDir()}, layout, "sess-token")
+	if !hasEnvVal(env, piOfflineEnvVar, "1") {
+		t.Errorf("%s not defaulted to 1", piOfflineEnvVar)
+	}
+	if !hasEnvVal(env, piSkipVersionCheckEnvVar, "1") {
+		t.Errorf("%s not defaulted to 1", piSkipVersionCheckEnvVar)
+	}
+
+	explicit := agent.Spec{
+		Cwd: t.TempDir(),
+		Env: map[string]string{piOfflineEnvVar: "0", piSkipVersionCheckEnvVar: "0"},
+	}
+	env2 := composeChildEnv(explicit, layout, "sess-token")
+	if !hasEnvVal(env2, piOfflineEnvVar, "0") {
+		t.Errorf("explicit %s=0 was overridden by the default", piOfflineEnvVar)
+	}
+	if !hasEnvVal(env2, piSkipVersionCheckEnvVar, "0") {
+		t.Errorf("explicit %s=0 was overridden by the default", piSkipVersionCheckEnvVar)
 	}
 }
 

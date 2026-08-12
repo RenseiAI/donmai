@@ -96,6 +96,18 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// (agent.NoticeDeliveryMCPRPC — the app-server JSON-RPC surface), not
 		// in this per-turn param table.
 		"RequiresLiveNotice",
+		// AdditionalExtensions (ADR-2026-08-12-pi-extension-delivery-seam-and-
+		// capability-pack-boundary.md D1) is INTENTIONALLY IGNORED by codex:
+		// the seam it carries is for harnesses with a host-side extension API
+		// that loads by explicit runner-owned path (pi's `-e`/`--no-extensions`
+		// mechanism — provider/harness/pi). codex has no such surface — its
+		// tool/MCP delivery is the app-server JSON-RPC thread/turn machinery
+		// this file already translates — so a populated
+		// Spec.AdditionalExtensions reaching codex has nothing to attach to.
+		// Per D5.5 there is no cross-harness "supports extensions" capability;
+		// this is codex's own cardinal-rule-10 position, taken here rather than
+		// inferred from silence.
+		"AdditionalExtensions",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)
