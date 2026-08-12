@@ -221,6 +221,20 @@ type ExecutionPreflightProvider interface {
 	PreflightExecution(detailJSON json.RawMessage) (json.RawMessage, error)
 }
 
+// ClaimGateProvider is optionally implemented by ProviderRegistry. It lets the
+// daemon re-run the execution-cell narrow-only claim gate
+// (ADR-2026-08-05-versioned-execution-cell-and-session-reference.md D4)
+// against THIS host's own local reality before accepting a claim-bound
+// admission, instead of trusting an upstream-supplied ClaimReceipt at face
+// value. cellJSON is the canonical bytes of the admitted, claim-bound
+// ResolvedExecutionCell; the returned bytes must decode into an
+// executioncell.ClaimLocalReality. The daemon — not the provider — runs
+// executioncell.EvaluateClaim over the result, so the narrow-only invariant is
+// enforced in exactly one place regardless of which provider is wired.
+type ClaimGateProvider interface {
+	ResolveClaimLocalReality(cellJSON json.RawMessage) (json.RawMessage, error)
+}
+
 // ExecutionPreflightStore durably persists immutable host adaptation receipts.
 type ExecutionPreflightStore interface {
 	Persist(sessionID string, receipt json.RawMessage) error
@@ -1511,6 +1525,15 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			)
 		}
 		if len(detail.AdmissionReceipt) > 0 {
+			// The narrow-only claim gate runs first: for a claim-bound
+			// admission it either validates an already-supplied ClaimReceipt
+			// or computes one from this host's local reality, populating
+			// detail.ClaimReceipt/EffectiveCell before the binding
+			// cross-check below reads them. For every other admission it is
+			// a no-op.
+			if err := d.evaluateNarrowOnlyClaim(detail); err != nil {
+				return nil, err
+			}
 			if err := d.validateExecutionRuntimeBinding(detail); err != nil {
 				return nil, err
 			}
@@ -1613,6 +1636,99 @@ func (d *Daemon) validateExecutionRuntimeBinding(detail *SessionDetail) error {
 	if binding.ClaimID != claim.Value().ClaimID {
 		return errors.New("execution claim receipt is not the active claim for this request and worker")
 	}
+	return nil
+}
+
+// evaluateNarrowOnlyClaim is the daemon claim path's narrow-only gate
+// (ADR-2026-08-05-versioned-execution-cell-and-session-reference.md D4/D5).
+// It is deliberately additive and best-effort at the shallow layer: the
+// admission receipt's full semantic validity is the ExecutionPreflightProvider
+// compiler's job (already wired below), so a receipt this function cannot even
+// decode is left untouched here and denied downstream exactly as before this
+// change. Two things it DOES enforce, both new:
+//
+//  1. A pre-supplied ClaimReceipt for a claim-bound admission must narrow the
+//     admission (executioncell.AssertNarrowClaim) — previously this invariant
+//     was only checked inside the runner process the compiler seam spawns, so
+//     a daemon wired without a real compiler never checked it at all.
+//  2. When no ClaimReceipt has been supplied yet and a ClaimGateProvider is
+//     wired, the daemon computes one itself from this host's own local
+//     reality (executioncell.EvaluateClaim) and attaches the result — never
+//     widening the admitted cell, and never assembling a fallback when local
+//     reality falls short (D3): a failed predicate is a typed refusal that
+//     propagates as an error, which the existing poll-loop caller turns into a
+//     NACK exactly like any other local accept-work failure.
+//
+// A nil-safe no-op when no ClaimGateProvider is wired and no ClaimReceipt was
+// supplied keeps every existing deployment byte-identical.
+func (d *Daemon) evaluateNarrowOnlyClaim(detail *SessionDetail) error {
+	admission, err := executioncell.DecodeAdmissionReceipt(detail.AdmissionReceipt)
+	if err != nil {
+		// Not this function's concern: the compiler below is the authoritative
+		// validator of admission-receipt content and already fails closed on a
+		// malformed receipt.
+		return nil
+	}
+	value := admission.Value()
+	if value.Decision != executioncell.AdmissionAdmitted || value.Cell == nil {
+		return nil
+	}
+	cell := *value.Cell
+	if cell.Placement.Kind != executioncell.PlacementPool || cell.Placement.Resolution != executioncell.PlacementClaimBound {
+		return nil
+	}
+
+	if len(detail.ClaimReceipt) != 0 {
+		claim, err := executioncell.DecodeClaimReceipt(detail.ClaimReceipt)
+		if err != nil {
+			return fmt.Errorf("execution claim receipt: %w", err)
+		}
+		if err := executioncell.AssertNarrowClaim(admission, claim); err != nil {
+			return fmt.Errorf("execution claim receipt does not narrow admission: %w", err)
+		}
+		return nil
+	}
+
+	provider, ok := d.opts.ProviderRegistry.(ClaimGateProvider)
+	if !ok {
+		return nil
+	}
+	binding, err := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding)
+	if err != nil {
+		return fmt.Errorf("execution runtime binding: %w", err)
+	}
+	if strings.TrimSpace(binding.ClaimID) == "" {
+		// No claim attempt has been assigned to this host yet — nothing to
+		// gate. The existing downstream compiler already denies a claim-bound
+		// admission with no claim receipt.
+		return nil
+	}
+	cellJSON, err := executioncell.CanonicalJSON(cell)
+	if err != nil {
+		return fmt.Errorf("canonicalize admitted cell: %w", err)
+	}
+	realityJSON, err := provider.ResolveClaimLocalReality(cellJSON)
+	if err != nil {
+		return fmt.Errorf("resolve claim local reality: %w", err)
+	}
+	var local executioncell.ClaimLocalReality
+	if err := json.Unmarshal(realityJSON, &local); err != nil {
+		return fmt.Errorf("decode claim local reality: %w", err)
+	}
+	claim, err := executioncell.EvaluateClaim(admission, binding.ClaimID, local, time.Now())
+	if err != nil {
+		return fmt.Errorf("evaluate narrow-only claim: %w", err)
+	}
+	claimValue := claim.Value()
+	if claimValue.Decision == executioncell.ClaimDenied {
+		return fmt.Errorf("execution claim denied: %s: %s", claimValue.DenialCode, claimValue.DenialDetail)
+	}
+	effectiveJSON, err := executioncell.CanonicalJSON(*claimValue.EffectiveCell)
+	if err != nil {
+		return fmt.Errorf("canonicalize claimed effective cell: %w", err)
+	}
+	detail.ClaimReceipt = claim.Bytes()
+	detail.EffectiveCell = effectiveJSON
 	return nil
 }
 
