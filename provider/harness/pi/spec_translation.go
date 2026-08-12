@@ -51,17 +51,21 @@ func codeIntelEnforcementNote(spec agent.Spec) *SpecFieldNote {
 	}
 }
 
-// rpcArgs is the argv for the headless RPC lane. It loads ONLY the donmai
-// policy extension and nothing else:
+// rpcArgs is the argv for the headless RPC lane. It loads the donmai policy
+// extension FIRST, then every entry in extensionPaths (spec.AdditionalExtensions,
+// already materialized and digest-verified by materializeAdditionalExtensions;
+// ADR-2026-08-12 D1) in caller order, and nothing else:
 //
-//   - `-e <layout.extension>` loads the materialized policy extension. A CLI
-//     `-e` extension loads regardless of project trust (docs/extensions.md:
+//   - `-e <path>`, once per extension (boundary first, undisplaceable — D1). A
+//     CLI `-e` extension loads regardless of project trust (docs/extensions.md:
 //     project-local `.pi/extensions` copies only load after the project is
-//     trusted), which is why the harness passes the path here rather than
-//     relying on auto-discovery.
+//     trusted), which is why the harness passes explicit paths here rather
+//     than relying on auto-discovery — this is the operator-injected trust
+//     bypass D2 formalizes, and it applies identically to every `-e` entry.
 //   - `--no-extensions` disables all OTHER extension discovery (explicit `-e`
 //     paths still load), so no user/global/project extension can shadow or
-//     race the trust boundary.
+//     race the trust boundary — the other half of D2: workspace-discovered
+//     extensions never load in an autonomous session.
 //   - `--approve` trusts project-local files for this run (autonomous sessions
 //     have no user to answer a trust prompt).
 //   - `--session-dir <layout.root>` keeps session storage inside the worktree.
@@ -80,14 +84,16 @@ func codeIntelEnforcementNote(spec agent.Spec) *SpecFieldNote {
 // (`pi --mode json`, StructuredVia:"spawn-collect", design §7) is a deferred
 // follow-up — SupportsOneShot is advertised but the SpawnComplete projection
 // is not wired in this cut.
-func rpcArgs(layout sessionLayout, mode launchMode, sessionID string, spec agent.Spec) []string {
-	args := []string{
-		"--mode", "rpc",
-		"-e", layout.extension,
+func rpcArgs(layout sessionLayout, extensionPaths []string, mode launchMode, sessionID string, spec agent.Spec) []string {
+	args := []string{"--mode", "rpc"}
+	for _, path := range extensionPaths {
+		args = append(args, "-e", path)
+	}
+	args = append(args,
 		"--no-extensions",
 		"--approve",
 		"--session-dir", layout.root,
-	}
+	)
 	args = append(args, modelPinArgs(spec)...)
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--append-system-prompt", spec.SystemPromptAppend)
@@ -134,30 +140,79 @@ const pinnedProviderName = "donmai"
 // drops every AgentEnvBlocklist key (ANTHROPIC_API_KEY, OPENAI_API_KEY, …) and
 // every runner-only control from the PARENT env, while still trusting the
 // resolved cell's credentials delivered on Spec.Env (applyEndpoint mirrors the
-// cell key onto PiKeyEnvVar). The PI_* redirect layer is appended last (wins)
-// so the child's pi config/auth/state home resolves inside the session
-// worktree — a fleet box's personal ~/.pi/agent/auth.json is never visible.
+// cell key onto PiKeyEnvVar). The PI_CODING_AGENT_DIR/_SESSION_DIR redirect
+// layer is appended last (wins) so the child's pi config/auth/session home
+// resolves inside the session worktree — a fleet box's personal
+// ~/.pi/agent/auth.json is never visible.
 //
 // It also carries the trust-boundary handshake token (piHandshakeEnvVar) and
 // the non-secret provider-pin vars (providerPinEnv) the policy extension reads
 // at load; the key itself already rides Spec.Env under PiKeyEnvVar.
 func composeChildEnv(spec agent.Spec, layout sessionLayout, token string) []string {
 	out := runtimeenv.NewComposer().Compose(envSliceToMap(os.Environ()), spec)
-	// Redirect pi's config/auth/state home into the session dir. Multiple
-	// candidate names are set because the exact PI_* home var is unverified
-	// against a real binary (see doc.go); the smokes lane canonicalizes this
-	// to the one pi actually honors. Appended last ⇒ these win under exec's
-	// last-entry-wins semantics even if the host set them.
+	// Redirect pi's config/agent home and session home into the session dir
+	// using the EXACT documented variable names (docs/environment-variables.md:
+	// PI_CODING_AGENT_DIR overrides the config directory, default
+	// ~/.pi/agent; PI_CODING_AGENT_SESSION_DIR overrides session storage,
+	// itself overridden by --session-dir which rpcArgs already passes). This
+	// replaces the four undocumented candidate names (PI_HOME, PI_CONFIG_DIR,
+	// PI_STATE_DIR, XDG_CONFIG_HOME) a prior cut set on the unverified
+	// assumption that one of them was load-bearing — none of them were
+	// (ADR-2026-08-12 F3/D4.1). The two documented vars point at DIFFERENT
+	// subdirectories (layout.agentHome vs layout.root) rather than the same
+	// path — see sessionLayout.agentHome's doc comment for why collapsing
+	// them breaks pi's own `--session <id>` resume lookup. Appended last ⇒
+	// these win under exec's last-entry-wins semantics even if the host set
+	// them.
 	out = append(
 		out,
-		"PI_HOME="+layout.root,
-		"PI_CONFIG_DIR="+layout.root,
-		"PI_STATE_DIR="+layout.root,
-		"XDG_CONFIG_HOME="+layout.root,
+		piCodingAgentDirEnvVar+"="+layout.agentHome,
+		piCodingAgentSessionDirEnvVar+"="+layout.root,
 	)
+	out = append(out, offlinePostureEnv(spec)...)
 	out = append(out, providerPinEnv(spec.Endpoint, spec.Model)...)
 	if token != "" {
 		out = append(out, piHandshakeEnvVar+"="+token)
+	}
+	return out
+}
+
+const (
+	// piCodingAgentDirEnvVar overrides pi's config directory (default
+	// ~/.pi/agent). This is the ONE documented agent-directory variable
+	// (docs/environment-variables.md), replacing four undocumented guesses
+	// per ADR-2026-08-12 D4.1.
+	piCodingAgentDirEnvVar = "PI_CODING_AGENT_DIR"
+	// piCodingAgentSessionDirEnvVar overrides pi's session storage directory;
+	// --session-dir (rpcArgs/interactiveArgs) already wins over it, but D4.1
+	// names both the agent-directory AND session-directory variables, and
+	// setting it defends any nested pi invocation a tool might make that the
+	// CLI flag would not reach.
+	piCodingAgentSessionDirEnvVar = "PI_CODING_AGENT_SESSION_DIR"
+	// piOfflineEnvVar disables pi's startup network operations (update
+	// checks, package updates, install/update telemetry) — documented in
+	// docs/environment-variables.md, and equivalent to the --offline flag.
+	piOfflineEnvVar = "PI_OFFLINE"
+	// piSkipVersionCheckEnvVar disables pi's pi.dev latest-version request.
+	piSkipVersionCheckEnvVar = "PI_SKIP_VERSION_CHECK"
+)
+
+// offlinePostureEnv returns the PI_OFFLINE / PI_SKIP_VERSION_CHECK default
+// bindings (ADR-2026-08-12 D4.3: defaulted on for every execution-layer-
+// spawned session, headless and interactive alike — the binary pin and the
+// resolved model catalog are already the spawning side's to own, so a spawn
+// that reaches pi.dev to refresh either is a second, unpinned source of
+// truth). An entry the caller already bound explicitly on spec.Env is left
+// alone: per D4.3 "a session may re-enable either, recorded as an explicit
+// environment-binding entry rather than acquired by omission" — the default
+// must never override an explicit choice.
+func offlinePostureEnv(spec agent.Spec) []string {
+	var out []string
+	if _, explicit := spec.Env[piOfflineEnvVar]; !explicit {
+		out = append(out, piOfflineEnvVar+"=1")
+	}
+	if _, explicit := spec.Env[piSkipVersionCheckEnvVar]; !explicit {
+		out = append(out, piSkipVersionCheckEnvVar+"=1")
 	}
 	return out
 }

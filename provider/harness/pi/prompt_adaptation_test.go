@@ -21,7 +21,7 @@ func TestPromptAdaptation_ExactCLIAndRPCWire(t *testing.T) {
 		"--mode", "rpc", "-e", "/session/policy.ts", "--no-extensions", "--approve", "--session-dir", "/session",
 		"--append-system-prompt", wantSystem,
 	}
-	if got := rpcArgs(layout, launchPrompt, "", adapted); !reflect.DeepEqual(got, wantArgs) {
+	if got := rpcArgs(layout, []string{layout.extension}, launchPrompt, "", adapted); !reflect.DeepEqual(got, wantArgs) {
 		t.Fatalf("pi argv = %#v, want %#v", got, wantArgs)
 	}
 	if got, want := adapted.Prompt, "user\n\namend"; got != want {
