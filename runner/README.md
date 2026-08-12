@@ -79,7 +79,7 @@ Verbatim from F.1.1 §5; classification owned by `runner/failure.go`.
 
 Two-stage post-completion recovery (F.0.1 §1):
 
-1. **Stage 1 — steering.** Fires when the provider supports `SupportsMessageInjection` *or* `SupportsSessionResume` AND the session ended successfully but without a PR URL. The runner injects a templated follow-up prompt asking the agent to commit/push/PR. Skipped via `Options.SkipSteering`.
+1. **Stage 1 — steering.** Fires when the provider supports `SupportsMessageInjection` *or* `SupportsSessionResume` AND the session ended successfully but without a PR URL. The runner delivers a templated follow-up prompt asking the agent to commit/push/PR — via `Handle.Inject` when the live handle accepts it, falling back to a stop-and-resume (`Handle.Stop` then `Provider.Resume` with the prompt riding the resumed `Spec.Prompt`) when the handle rejects the inject as unsupported and the harness declares `SupportsSessionResume` (Codex; OpenCode's one-shot lane). `Result.SteeringResumeFallback` records when the fallback path fired. Skipped via `Options.SkipSteering`.
 2. **Stage 2 — backstop.** Deterministic git workflow when steering didn't produce a PR (or the provider doesn't support steering). Skipped via `Options.SkipBackstop` for tests that don't have a real remote.
 
 The backstop's path-exclude list is ported verbatim from `donmai-libraries/packages/core/src/orchestrator/session-backstop.ts:57-95`. The list lives at the top of `backstop.go` as Go data tables (`excludeDirAnyDepth`, `excludeDirTopLevel`, `excludeExtensions`, `excludeBasenamePrefixes`, `excludePathPrefixes`). When the legacy TS adds an entry, port it here in the same wave.

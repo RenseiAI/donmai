@@ -141,18 +141,27 @@ func TestAttemptSteering_InjectStub(t *testing.T) {
 
 	ctx, cancel := withCtx(t)
 	defer cancel()
-	handle, err := p.Spawn(ctx, agent.Spec{
+	spec := agent.Spec{
 		ProviderConfig: map[string]any{
 			"stub.behavior": string(stub.BehaviorInjectTest),
 		},
-	})
+	}
+	handle, err := p.Spawn(ctx, spec)
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
 
 	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-S-1")}
-	if err := r.attemptSteering(ctx, handle, qw, streamObservation{terminalSuccess: true}); err != nil {
+	res := &Result{}
+	newHandle, err := r.attemptSteering(ctx, p, handle, spec, p.Capabilities(), qw, streamObservation{terminalSuccess: true}, res)
+	if err != nil {
 		t.Fatalf("attemptSteering: %v", err)
+	}
+	if newHandle != handle {
+		t.Fatal("expected the same handle back on the inject-success path")
+	}
+	if res.SteeringResumeFallback {
+		t.Fatal("expected no resume fallback recorded on the inject-success path")
 	}
 
 	// Drain events; expect at least one AssistantTextEvent containing
@@ -188,19 +197,27 @@ func TestAttemptSteering_UnsupportedIsSoftFail(t *testing.T) {
 
 	ctx, cancel := withCtx(t)
 	defer cancel()
-	handle, err := p.Spawn(ctx, agent.Spec{
+	spec := agent.Spec{
 		ProviderConfig: map[string]any{
 			"stub.injectUnsupported": true,
 		},
-	})
+	}
+	handle, err := p.Spawn(ctx, spec)
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
 	defer func() { _ = handle.Stop(context.Background()) }()
 
-	err = r.attemptSteering(ctx, handle, QueuedWork{QueuedWork: queuedWorkBase("REN-S-2")}, streamObservation{terminalSuccess: true})
+	res := &Result{}
+	newHandle, err := r.attemptSteering(ctx, p, handle, spec, p.Capabilities(), QueuedWork{QueuedWork: queuedWorkBase("REN-S-2")}, streamObservation{terminalSuccess: true}, res)
 	if err != nil {
 		t.Fatalf("expected nil (soft-fail) from attemptSteering with unsupported provider, got %v", err)
+	}
+	if newHandle != handle {
+		t.Fatal("expected the same handle back when neither inject nor resume is supported")
+	}
+	if res.SteeringResumeFallback {
+		t.Fatal("expected no resume fallback recorded when the provider does not support resume")
 	}
 }
 
@@ -229,5 +246,236 @@ func TestInjectDirective_SoftFails(t *testing.T) {
 
 	if err := r.injectDirective(ctx, handle, "remember this"); err != nil {
 		t.Fatalf("injectDirective should soft-fail on ErrUnsupported, got %v", err)
+	}
+}
+
+// TestAttemptSteering_ResumeFallback_Table is the stop-and-resume steering
+// fallback's acceptance table: it drives attemptSteering against three fake
+// harness shapes — inject-capable, resume-only, and neither-capable — via
+// the stub provider's BehaviorResumeSteer script, and asserts the fallback
+// fires exactly where it should.
+//
+// The resume-only case additionally proves the stop-and-resume fallback's
+// three load-bearing properties end to end: session continuity (the
+// resumed Handle carries the SAME provider-native session id), terminal-
+// event invariants (the resumed Handle's own stream still emits exactly
+// one InitEvent and exactly one terminal ResultEvent before closing — the
+// same Handle contract every Spawn/Resume caller relies on), and that the
+// queued steer content actually arrives (echoed from the resumed Spec's
+// Prompt, exactly where runner/steering.go's attemptSteeringResume places
+// it).
+func TestAttemptSteering_ResumeFallback_Table(t *testing.T) {
+	cases := []struct {
+		name               string
+		caps               agent.Capabilities
+		injectUnsupported  bool
+		wantResumeFallback bool
+		wantHandleChanged  bool
+	}{
+		{
+			name:               "inject-capable harness steers via Inject and never falls back",
+			caps:               agent.Capabilities{SupportsMessageInjection: true, SupportsSessionResume: true},
+			injectUnsupported:  false,
+			wantResumeFallback: false,
+			wantHandleChanged:  false,
+		},
+		{
+			name:               "resume-only harness falls back to stop-and-resume",
+			caps:               agent.Capabilities{SupportsMessageInjection: false, SupportsSessionResume: true},
+			injectUnsupported:  true,
+			wantResumeFallback: true,
+			wantHandleChanged:  true,
+		},
+		{
+			name:               "neither-capable harness soft-fails without touching the handle",
+			caps:               agent.Capabilities{},
+			injectUnsupported:  true,
+			wantResumeFallback: false,
+			wantHandleChanged:  false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := minimalRunner(t)
+			p, err := stub.New(stub.WithCapabilities(tc.caps))
+			if err != nil {
+				t.Fatalf("stub.New: %v", err)
+			}
+			if err := r.registry.Register(p); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+
+			ctx, cancel := withCtx(t)
+			defer cancel()
+
+			providerConfig := map[string]any{
+				"stub.behavior": string(stub.BehaviorResumeSteer),
+			}
+			if tc.injectUnsupported {
+				providerConfig["stub.injectUnsupported"] = true
+			}
+			spec := agent.Spec{ProviderConfig: providerConfig}
+
+			handle, err := p.Spawn(ctx, spec)
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+
+			// Drain the first turn to its terminal event — attemptSteering
+			// is only ever called post-terminal (F.1.1 §4 step 11 fires
+			// after step 10's terminal wait) — and capture the session id
+			// InitEvent carried for the continuity assertion below.
+			var origSessionID string
+			for ev := range handle.Events() {
+				if ie, ok := ev.(agent.InitEvent); ok {
+					origSessionID = ie.SessionID
+				}
+			}
+			if origSessionID == "" {
+				t.Fatal("expected an InitEvent with a session id")
+			}
+
+			qw := QueuedWork{QueuedWork: queuedWorkBase("REN-RF-1")}
+			res := &Result{}
+			newHandle, err := r.attemptSteering(ctx, p, handle, spec, tc.caps, qw, streamObservation{terminalSuccess: true}, res)
+			if err != nil {
+				t.Fatalf("attemptSteering: %v", err)
+			}
+			if res.SteeringResumeFallback != tc.wantResumeFallback {
+				t.Fatalf("SteeringResumeFallback = %v, want %v", res.SteeringResumeFallback, tc.wantResumeFallback)
+			}
+			if handleChanged := newHandle != handle; handleChanged != tc.wantHandleChanged {
+				t.Fatalf("handle changed = %v, want %v", handleChanged, tc.wantHandleChanged)
+			}
+
+			if !tc.wantResumeFallback {
+				return
+			}
+
+			// Session continuity.
+			if got := newHandle.SessionID(); got != origSessionID {
+				t.Fatalf("resumed session id = %q, want %q (continuity)", got, origSessionID)
+			}
+
+			// Terminal-event invariants + steer-content delivery.
+			var inits, terminals int
+			var sawSteerContent bool
+			for ev := range newHandle.Events() {
+				switch e := ev.(type) {
+				case agent.InitEvent:
+					inits++
+				case agent.ResultEvent:
+					terminals++
+				case agent.AssistantTextEvent:
+					if strings.Contains(e.Text, "pull request") {
+						sawSteerContent = true
+					}
+				}
+			}
+			if inits != 1 {
+				t.Fatalf("resumed handle InitEvent count = %d, want 1", inits)
+			}
+			if terminals != 1 {
+				t.Fatalf("resumed handle terminal ResultEvent count = %d, want 1", terminals)
+			}
+			if !sawSteerContent {
+				t.Fatal("resumed handle did not receive the queued steer content via Spec.Prompt")
+			}
+		})
+	}
+}
+
+// TestAttemptSteering_ResumeFallbackHardError confirms a genuine
+// Provider.Resume failure (not agent.ErrUnsupported) surfaces as an error
+// from attemptSteering — the caller falls through to the deterministic
+// backstop instead of re-consuming events — while still handing back a
+// usable (already-stopped) Handle rather than nil.
+func TestAttemptSteering_ResumeFallbackHardError(t *testing.T) {
+	r := minimalRunner(t)
+	caps := agent.Capabilities{SupportsSessionResume: true}
+	p, err := stub.New(stub.WithCapabilities(caps))
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	if err := r.registry.Register(p); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx, cancel := withCtx(t)
+	defer cancel()
+	spec := agent.Spec{
+		ProviderConfig: map[string]any{
+			"stub.behavior":          string(stub.BehaviorResumeSteer),
+			"stub.injectUnsupported": true,
+			"stub.resumeFailure":     true,
+		},
+	}
+	handle, err := p.Spawn(ctx, spec)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	// Drain to terminal, matching the post-terminal call site.
+	for range handle.Events() { //nolint:revive // draining is the whole point; nothing to do per event
+	}
+
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-S-5")}
+	res := &Result{}
+	newHandle, err := r.attemptSteering(ctx, p, handle, spec, caps, qw, streamObservation{terminalSuccess: true}, res)
+	if err == nil {
+		t.Fatal("expected an error when Provider.Resume hard-fails")
+	}
+	if newHandle != handle {
+		t.Fatal("expected the original (now-stopped) handle back on a hard resume failure")
+	}
+	if res.SteeringResumeFallback {
+		t.Fatal("expected no resume fallback recorded on a hard resume failure")
+	}
+}
+
+// fakeNoSessionHandle is a minimal agent.Handle whose SessionID is always
+// empty, modeling a real provider's Handle before its InitEvent has fired.
+// Unlike the stub package's own handle (which assigns its session id
+// eagerly at construction for caller convenience — see stub/handle.go), this
+// lets the test exercise attemptSteeringResume's "no session id captured"
+// guard directly.
+type fakeNoSessionHandle struct {
+	events chan agent.Event
+}
+
+func (h *fakeNoSessionHandle) SessionID() string          { return "" }
+func (h *fakeNoSessionHandle) Events() <-chan agent.Event { return h.events }
+func (h *fakeNoSessionHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+func (h *fakeNoSessionHandle) Stop(context.Context) error { return nil }
+
+// TestAttemptSteeringResume_NoSessionIDIsSoftFail confirms the fallback
+// treats a missing provider-native session id as a soft no-op (nil error,
+// same handle back, no fallback recorded) rather than a hard failure —
+// there is nothing to resume from, and it is not the caller's fault.
+func TestAttemptSteeringResume_NoSessionIDIsSoftFail(t *testing.T) {
+	r := minimalRunner(t)
+	p, err := stub.New(stub.WithCapabilities(agent.Capabilities{SupportsSessionResume: true}))
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+
+	handle := &fakeNoSessionHandle{events: make(chan agent.Event)}
+	close(handle.events)
+
+	ctx, cancel := withCtx(t)
+	defer cancel()
+
+	res := &Result{}
+	newHandle, err := r.attemptSteeringResume(ctx, p, handle, agent.Spec{}, QueuedWork{QueuedWork: queuedWorkBase("REN-S-6")}, "steer text", res)
+	if err != nil {
+		t.Fatalf("expected nil (soft-fail) when no session id was captured, got %v", err)
+	}
+	if newHandle != handle {
+		t.Fatal("expected the same handle back")
+	}
+	if res.SteeringResumeFallback {
+		t.Fatal("expected no resume fallback recorded")
 	}
 }

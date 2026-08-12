@@ -162,22 +162,27 @@ func (p *Provider) prepare(spec agent.Spec) (agent.Spec, error) {
 // against a real model turn; the donmai-smokes step20 resume item is its
 // acceptance gate.
 //
-// Production status (conformance-only, verified repo-wide, not a pi-specific
-// gap): Resume's only call site outside this package's own tests is
-// agent/conformance/checks.go, which nothing in `donmai agent run` drives for
-// any harness. runner/steering.go's shouldSteer/attemptSteering is the one
-// place a production Resume call was designed in, and it still only ever
-// calls Handle.Inject — the "stop and resume" fallback it names in its doc
-// comment was never built, for ANY provider, not just pi (codex and
-// opencode.go's create-with-session lane declare SupportsSessionResume:true
-// and ship real (non-ErrUnsupported) Resume implementations with the exact
-// same zero-production-caller shape). So wiring Resume into a real path here
-// would not be following an established pattern — no harness has one; it
-// would mean designing the runner's stop/resume steering leg for the first
-// time, a cross-harness runner change out of this package's scope. get_entries
-// is now routed as an observable SystemEvent (event_mapping.go) rather than
-// silently dropped, but is not decoded into replayed history — see this
-// package's real_binary_test.go TestRealBinary_Resume_StructuralReplay.
+// Production status: runner/steering.go's attemptSteering now has a real
+// stop-and-resume fallback — when a live Handle.Inject call returns
+// agent.ErrUnsupported and the harness declares SupportsSessionResume, the
+// runner stops the turn and calls Provider.Resume with the queued steer
+// content riding the resumed Spec.Prompt. That closes the gap for codex and
+// opencode.go's create-with-session lane, both of whose Inject
+// implementations return agent.ErrUnsupported outright.
+//
+// pi does NOT take that branch today: pi's own Handle.Inject (handle.go)
+// classifies a post-terminal call as a closed session ("pi: session
+// closed"), not agent.ErrUnsupported — the state attemptSteering actually
+// observes at its post-terminal call site (F.1.1 §4 step 11 fires after
+// step 10's terminal wait, so the pump has already settled and h.closed has
+// fired). That error hits attemptSteering's default branch (hard fail →
+// backstop), same as before this fallback existed. So this package's Resume
+// still gets its only non-test call site from agent/conformance/checks.go
+// unless a future change teaches pi's post-terminal Inject to return
+// agent.ErrUnsupported instead of a bespoke closed-session error.
+// get_entries is now routed as an observable SystemEvent (event_mapping.go)
+// rather than silently dropped, but is not decoded into replayed history —
+// see this package's real_binary_test.go TestRealBinary_Resume_StructuralReplay.
 func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
 	if sessionID == "" {
 		return nil, agent.ErrSessionNotFound
