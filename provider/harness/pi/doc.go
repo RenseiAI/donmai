@@ -225,4 +225,91 @@
 // profile declares that injected-boundary GAP rather than inheriting the
 // headless profile's evidence (ADR-2026-08-06 D6). The A5 seam contract is
 // unchanged: one embedded file, one handshake, one adjudication channel.
+//
+// # Scale hardening
+//
+// Four properties beyond correctness matter once a fleet spawns many pi
+// sessions concurrently, per ADR-2026-08-12 (the pi extension-delivery seam
+// ADR — D4's state-isolation defaults, and 013-orchestrator-and-governor.md's
+// pre-spawn sequence, which permits a content-addressed shared cache for
+// materialized deliveries as long as every spawn still digest-verifies its
+// own session-local copy).
+//
+//  1. Cold-start budget. materializeExtension and the INLINE branch of
+//     materializeAdditionalExtensions go through writeViaCache
+//     (extension.go): a content-addressed cache OUTSIDE any single session's
+//     workarea, keyed by sha256 digest, that hardlinks a session's
+//     materialized copy from a shared blob instead of re-encoding+writing
+//     byte-identical bytes on every spawn. This is safe by construction — the
+//     mandatory post-write digest verification (D2(b)'s TOCTOU rule) is
+//     completely unchanged and reads back the session-local file regardless
+//     of whether the cache was hit; a corrupted/poisoned/missing blob simply
+//     falls back to a fresh write. Measured against testdata/fakepi (a
+//     zero-compile stub — see scale_load_test.go, tag pi_scale_load): N=100
+//     concurrent real-subprocess spawns, p50 in the 47-70ms range, p95 in the
+//     63-92ms range, max under 100ms across repeated local runs (machine-load
+//     dependent, always well inside spawnLatencyBudget). Measured against the
+//     REAL pinned pi binary when available on PATH
+//     (TestScaleLoad_RealBinary_OptionalSample, skips cleanly otherwise): a
+//     3-sample cold-start including jiti's TS compile of the boundary
+//     extension and node process startup, p50 in the 550ms-1.1s range across
+//     repeated local runs. The documented budget
+//     is therefore two-part and NOT conflated: donmai's own per-spawn
+//     overhead (materialization + argv/env composition + process fork/exec +
+//     the handshake round trip) is bounded well under 100ms at N=100
+//     concurrent — spawnLatencyBudget in scale_load_test.go pins this as a
+//     regression guard; the real binary's jiti-compile + node-startup cost
+//     (~500ms, single-digit-sample measurement, machine-dependent) is a
+//     THIRD-PARTY cost this package does not control and cannot cache away
+//     (jiti compiles the extension's TypeScript inside the child process,
+//     after donmai's own materialization has already finished) — it is
+//     documented here as an external cost, not folded into the budget this
+//     package tests against.
+//
+//  2. Per-session state isolation at N-concurrent scale. sessionLayout gives
+//     every session a unique root/agentHome/injected triple under its own
+//     workarea (D4.1); composeChildEnv redirects the two DOCUMENTED pi
+//     variables (PI_CODING_AGENT_DIR/PI_CODING_AGENT_SESSION_DIR) to it.
+//     isolation_scale_test.go proves this is observably true, not merely
+//     env-asserted (D4.2's standard): N=100 concurrently-prepared sessions
+//     resolve pairwise-distinct paths AND pairwise-distinct env bindings
+//     (TestStateIsolation_NConcurrentSessions_DistinctRootsAndAgentHomes),
+//     concurrent real filesystem writes into each session's agentHome never
+//     cross-contaminate, and the pi CredentialStore's auth.json lockfile path
+//     — the documented shared-state bottleneck (D4.4) — is proven to have no
+//     shared value across any two of the N sessions
+//     (TestStateIsolation_AuthLockfileBottleneckIsBypassed): per-session
+//     agentHome means no two donmai-spawned pi sessions can ever contend the
+//     same lock, because there is no path left for them to share.
+//
+//  3. N-instance load validation. scale_load_test.go (tag pi_scale_load, not
+//     part of the default `make test` gate — see that file's own doc comment
+//     for why and how to run it) spins N concurrent REAL subprocess sessions
+//     against testdata/fakepi and measures spawn-latency and inject/steer
+//     round-trip-latency distributions; N=100 locally by default,
+//     DONMAI_PI_LOAD_N overrides explicitly, CI=1/-short bounds to N=10. The
+//     real `pi` binary is exercised opportunistically
+//     (TestScaleLoad_RealBinary_OptionalSample) and skips cleanly when
+//     unavailable — donmai's own hosted CI does not install node/pi, mirroring
+//     real_binary_test.go's existing scope note.
+//
+//  4. Wake-poll fail-quiet invariant. pi has no polling loop of its own — it
+//     is subprocess-push (event-driven over stdout), never poll-driven — so
+//     the "wake-poll" pattern lives one layer up: runner/loop.go's
+//     drainMemoryInjects (a background-poll wakeup delivering buffered
+//     memory injects) and runner/steering.go's attemptSteering (a
+//     post-terminal check) both call Handle.Inject at the post-terminal seam,
+//     and runner.injectDirective's documented contract is soft-fail
+//     (ErrUnsupported / provider-specific "not ready"/"in flight" sentinels
+//     are swallowed; any other error is returned once and NOT retried in a
+//     loop — the caller logs and defers the remainder to the next scheduled
+//     wake, the same bounded-retry-then-signal shape
+//     013-orchestrator-and-governor.md states for an unreachable session).
+//     This package's obligation is mechanical: Inject must never hang.
+//     TestInject_AfterStop_ReturnsPromptlyAndDoesNotHang (handle_test.go)
+//     proves Inject called on an already-Stopped, non-fatally-terminated
+//     session — the race a wake-poll caller can actually hit — returns a
+//     plain, non-panicking error within a bounded window, so the generic
+//     runner-level fail-quiet wrapper always has something well-behaved to
+//     log-and-defer on.
 package pi

@@ -627,6 +627,77 @@ func TestInject_AfterFatalTerminal_FailsClosed(t *testing.T) {
 	}
 }
 
+// --- Wake-poll fail-quiet invariant ---
+//
+// runner/loop.go's drainMemoryInjects and runner/steering.go's attemptSteering
+// are the "wake-poll" call sites: a background poll (the heartbeat transport's
+// buffered memory injects) or a post-terminal check (steering) wakes a
+// completed-but-still-live session by calling Handle.Inject. Both route
+// through runner.injectDirective, whose documented contract (steering.go) is
+// "soft-fail": ErrUnsupported / clijsonl.ErrSessionNotReady /
+// clijsonl.ErrInjectInFlight are swallowed as benign, and — critically for the
+// invariant this test pins — ANY OTHER error is returned to the caller rather
+// than retried in a loop; drainMemoryInjects's own handling of that returned
+// error is to log once and stop draining, deferring the remaining buffered
+// blocks to the NEXT heartbeat cycle (loop.go: "the remaining blocks ride the
+// next heartbeat re-delivery"). That is this architecture's bounded-retry-
+// then-signal shape (013-orchestrator-and-governor.md: "An unreachable
+// session does not hold capacity indefinitely... bounded-retry-then-signal")
+// applied to steering/memory-inject: no tight retry loop, no hang, a signal
+// (the logged Warn) instead of silence, and forward progress via the next
+// scheduled wake rather than an immediate re-attempt.
+//
+// pi has no wake-poll of its own (it is subprocess-push, not poll-driven —
+// see doc.go's "Scale hardening" section), so the invariant this package owns
+// is narrower and mechanical: Handle.Inject called after Stop (the runner's
+// deterministic backstop, or a ctx-cancel teardown, can race a wake-poll
+// call landing at the same seam described above) must return QUICKLY with a
+// plain, non-panicking error — never hang, never block past a bounded
+// window — so the generic runner-level fail-quiet contract has something
+// well-behaved to wrap.
+
+// TestInject_AfterStop_ReturnsPromptlyAndDoesNotHang proves Handle.Inject on
+// an ALREADY-STOPPED (not merely fatally-terminated) session returns within a
+// bounded window rather than hanging — the property the wake-poll fail-quiet
+// contract depends on. Unlike TestInject_AfterFatalTerminal_FailsClosed
+// (which pins the trust-boundary abort path), this drives the ordinary,
+// non-fatal shutdown path: a healthy, settled session that Stop() then tears
+// down out from under a racing wake-poll caller.
+func TestInject_AfterStop_ReturnsPromptlyAndDoesNotHang(t *testing.T) {
+	t.Parallel()
+	body := getStateResponse("ses_wake_poll") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "agent_settled"})
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	drain(t, h)
+	// A short-deadline ctx (rather than context.Background()) makes Stop
+	// return via its ctx.Done() branch instead of waiting out the full
+	// abortGrace: nothing in this scripted, no-real-process fixture will ever
+	// close h.closed on its own (the stubbed stdout pipe stays open until
+	// t.Cleanup), so an unbounded Stop call here would otherwise block for
+	// the full abort grace window on every run for no correctness reason.
+	stopCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := h.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- h.Inject(context.Background(), "wake-poll racing Stop") }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Inject after Stop returned nil error; want a closed-session error so the runner's fail-quiet wrapper has something to log-and-defer on")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Inject after Stop did not return within 2s — a wake-poll caller (runner/loop.go drainMemoryInjects, runner/steering.go attemptSteering) would hang instead of deferring to the next scheduled wake")
+	}
+}
+
 // --- Cleanup idempotence (D8 pi row: "cleanup is idempotent and evidenced") ---
 
 // TestStop_IdempotentAfterChannelClose is the "cleanup idempotence" fixture:
