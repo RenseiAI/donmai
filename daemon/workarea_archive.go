@@ -210,8 +210,8 @@ func (r *WorkareaArchiveRegistry) listArchives() ([]afclient.WorkareaSummary, er
 // Kind field is set to WorkareaKindArchived. Returns ErrArchiveNotFound
 // when the id is absent.
 func (r *WorkareaArchiveRegistry) Get(id string) (*afclient.Workarea, error) {
-	if id == "" {
-		return nil, fmt.Errorf("get archive: id is required: %w", ErrArchiveNotFound)
+	if err := requireValidArchiveID("get archive", id); err != nil {
+		return nil, err
 	}
 	manifest, err := r.readManifest(id)
 	if err != nil {
@@ -228,8 +228,8 @@ func (r *WorkareaArchiveRegistry) Get(id string) (*afclient.Workarea, error) {
 // excluded.
 func (r *WorkareaArchiveRegistry) Diff(idA, idB string) (*afclient.WorkareaDiffResult, error) {
 	for _, id := range []string{idA, idB} {
-		if id == "" {
-			return nil, fmt.Errorf("diff: archive id is required: %w", ErrArchiveNotFound)
+		if err := requireValidArchiveID("diff", id); err != nil {
+			return nil, err
 		}
 	}
 	treeA := r.treeDir(idA)
@@ -270,8 +270,8 @@ func (r *WorkareaArchiveRegistry) DiffStream(
 	emit func(afclient.WorkareaDiffEntry) error,
 ) (*afclient.WorkareaDiffSummary, error) {
 	for _, id := range []string{idA, idB} {
-		if id == "" {
-			return nil, fmt.Errorf("diff: archive id is required: %w", ErrArchiveNotFound)
+		if err := requireValidArchiveID("diff", id); err != nil {
+			return nil, err
 		}
 	}
 	treeA := r.treeDir(idA)
@@ -314,6 +314,11 @@ func (r *WorkareaArchiveRegistry) DiffStream(
 // archives without buffering or streaming them. The handler uses this
 // to pick JSON vs NDJSON before opening the response stream.
 func (r *WorkareaArchiveRegistry) CountDiff(idA, idB string) (int, error) {
+	for _, id := range []string{idA, idB} {
+		if err := requireValidArchiveID("diff", id); err != nil {
+			return 0, err
+		}
+	}
 	treeA := r.treeDir(idA)
 	treeB := r.treeDir(idB)
 	for _, p := range []string{treeA, treeB} {
@@ -349,8 +354,8 @@ func (r *WorkareaArchiveRegistry) Restore(
 	archiveID string,
 	req afclient.WorkareaRestoreRequest,
 ) (*afclient.Workarea, time.Duration, error) {
-	if archiveID == "" {
-		return nil, 0, fmt.Errorf("restore: archive id is required: %w", ErrArchiveNotFound)
+	if err := requireValidArchiveID("restore", archiveID); err != nil {
+		return nil, 0, err
 	}
 
 	// Read the source manifest first — fast-fails on missing archive
@@ -456,7 +461,40 @@ func (r *WorkareaArchiveRegistry) Restore(
 	return &wa, 0, nil
 }
 
-// archiveDir returns the absolute path to a single archive directory.
+// validArchiveID reports whether id is a safe single-component archive id:
+// non-empty, carrying no path separator, and not a "." / ".." traversal
+// component. Archive ids index directly into the archive root via
+// filepath.Join (archiveDir), so an id carrying a separator or a traversal
+// segment would let a read/diff/restore escape the root. The local control API
+// hands the id straight from the request path, and net/http only redirects a
+// LITERAL ".." segment — a percent-encoded one ("%2e%2e") decodes to ".." and
+// reaches here intact — so this must be enforced at the registry, not left to
+// the HTTP router. Callers treat a rejected id as a missing archive.
+func validArchiveID(id string) bool {
+	if id == "" || id == "." || id == ".." {
+		return false
+	}
+	if strings.ContainsAny(id, `/\`) {
+		return false
+	}
+	// A well-formed single component is unchanged by Clean; anything Clean
+	// rewrites (embedded traversal, redundant separators) is rejected.
+	return filepath.Clean(id) == id
+}
+
+// requireValidArchiveID returns an ErrArchiveNotFound-wrapped error when id is
+// not a safe single-component archive id (see validArchiveID). Rejected ids are
+// reported as not-found so an escape attempt is indistinguishable from a miss.
+func requireValidArchiveID(op, id string) error {
+	if !validArchiveID(id) {
+		return fmt.Errorf("%s: invalid archive id: %w", op, ErrArchiveNotFound)
+	}
+	return nil
+}
+
+// archiveDir returns the absolute path to a single archive directory. Callers
+// MUST have validated id through requireValidArchiveID first — id is joined to
+// the root with no further sanitisation.
 func (r *WorkareaArchiveRegistry) archiveDir(id string) string {
 	return filepath.Join(r.root, id)
 }
