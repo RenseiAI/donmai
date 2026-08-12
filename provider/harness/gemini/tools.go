@@ -45,7 +45,10 @@ const (
 // the wire payload compact and the ordering deterministic.
 func toolsFromSpec(spec agent.Spec) []requestTool {
 	seen := make(map[string]struct{})
-	decls := make([]functionDeclaration, 0, len(spec.AllowedTools)+len(spec.MCPToolNames))
+	// No capacity hint: summed len()s as an allocation size is the exact
+	// shape a static scanner (go/allocation-size-overflow) flags as a
+	// potential overflow; append grows the slice on demand just fine.
+	decls := make([]functionDeclaration, 0)
 
 	add := func(name, desc string) {
 		name = sanitizeToolName(name)

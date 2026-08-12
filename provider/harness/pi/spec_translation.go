@@ -236,7 +236,10 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 
 	// Merge the cell's resolved credential values onto a COPY of spec.Env and
 	// mirror the API key onto PiKeyEnvVar for the pin's env reference.
-	env := make(map[string]string, len(spec.Env)+len(ep.Env)+1)
+	// No capacity hint: a Go map grows on demand, so pre-sizing buys nothing
+	// here, and summing len()s as an allocation size is exactly the shape a
+	// static scanner (go/allocation-size-overflow) flags as a potential overflow.
+	env := make(map[string]string)
 	for k, v := range spec.Env {
 		env[k] = v
 	}
