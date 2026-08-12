@@ -196,6 +196,68 @@ func TestWorkareaArchiveRegistry_Get_HappyPath(t *testing.T) {
 	}
 }
 
+// TestWorkareaArchiveRegistry_RejectsPathTraversalIDs pins that an archive id
+// carrying a path separator or a traversal component cannot read, diff, or
+// restore outside the archive root. Archive ids reach the registry straight
+// from the local control-API request path, and net/http only redirects a
+// LITERAL ".." segment — a percent-encoded one ("%2e%2e") decodes to ".." and
+// arrives intact — so the guard must live at the registry, not the router.
+func TestWorkareaArchiveRegistry_RejectsPathTraversalIDs(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "workareas")
+
+	// A legitimate archive inside the root.
+	writeFixtureArchive(t, root, fixtureArchive{
+		id:       "wa-ok",
+		manifest: archiveManifest{SessionID: "sess-inside"},
+		tree:     map[string]string{"a.txt": "hi"},
+	})
+
+	// A "secret" manifest ONE LEVEL ABOVE the root, reachable only by escaping:
+	// archiveDir("..") == parent, so an unguarded readManifest("..") reads it.
+	secret, err := json.Marshal(archiveManifest{ID: "..", SessionID: "sess-ESCAPED"})
+	if err != nil {
+		t.Fatalf("marshal secret manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "manifest.json"), secret, 0o600); err != nil {
+		t.Fatalf("plant parent manifest: %v", err)
+	}
+
+	reg := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+
+	// A normal id still resolves.
+	if wa, err := reg.Get("wa-ok"); err != nil || wa.SessionID != "sess-inside" {
+		t.Fatalf("valid id must resolve: wa=%+v err=%v", wa, err)
+	}
+
+	// Every separator / traversal / non-single-component id is rejected as
+	// not-found by each externally reachable read path.
+	malicious := []string{"", ".", "..", "../..", "wa-ok/../..", "/etc", `..\..`, "sub/child"}
+	for _, id := range malicious {
+		if _, err := reg.Get(id); !errors.Is(err, ErrArchiveNotFound) {
+			t.Errorf("Get(%q): want ErrArchiveNotFound, got %v", id, err)
+		}
+		if _, _, err := reg.Restore(id, afclient.WorkareaRestoreRequest{}); !errors.Is(err, ErrArchiveNotFound) {
+			t.Errorf("Restore(%q): want ErrArchiveNotFound, got %v", id, err)
+		}
+		if _, err := reg.Diff(id, "wa-ok"); !errors.Is(err, ErrArchiveNotFound) {
+			t.Errorf("Diff(%q, ok): want ErrArchiveNotFound, got %v", id, err)
+		}
+		if _, err := reg.CountDiff("wa-ok", id); !errors.Is(err, ErrArchiveNotFound) {
+			t.Errorf("CountDiff(ok, %q): want ErrArchiveNotFound, got %v", id, err)
+		}
+		if _, err := reg.DiffStream(id, "wa-ok", func(afclient.WorkareaDiffEntry) error { return nil }); !errors.Is(err, ErrArchiveNotFound) {
+			t.Errorf("DiffStream(%q, ok): want ErrArchiveNotFound, got %v", id, err)
+		}
+	}
+
+	// Concrete escape proof: ".." must never surface the parent (sess-ESCAPED)
+	// manifest. Without the registry guard, Get("..") reads it and returns nil.
+	if wa, err := reg.Get(".."); err == nil {
+		t.Fatalf("Get(\"..\") escaped the root and read %q", wa.SessionID)
+	}
+}
+
 func TestWorkareaArchiveRegistry_Get_NotFound(t *testing.T) {
 	root := t.TempDir()
 	reg := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
