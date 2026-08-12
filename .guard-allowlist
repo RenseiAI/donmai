@@ -22,3 +22,13 @@
 # must spell a banned literal with one bracketed letter (`Rens[e]i`,
 # `/api/cl[i]/`) — the same convention scripts/guard-b-lint.sh and its own
 # .guard-allowlist use.
+
+# daemon/kit_registry.go: the parsed-manifest `Requires` struct carries a
+# `[requires].rens[e]i` version-compatibility field, pre-existing and
+# unrelated to any change that touches this file incidentally (e.g. adding
+# an unrelated field to the neighbouring `Provide` struct) — --staged scans
+# the whole file, not just the diff. Renaming the manifest-schema field is a
+# breaking change to 005-kit-manifest-spec.md and every shipped kit.toml;
+# out of scope here. Curated file-by-file per this header's remediation
+# path, scoped to the two exact call sites so a NEW unscoped hit still fails.
+BRAND_NAME :: ^daemon/kit_registry\.go :: Rens[e]i :: (toml:"rens[e]i"|m\.Requires\.Rens[e]i)

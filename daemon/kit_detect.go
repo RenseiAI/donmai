@@ -43,7 +43,33 @@ func (r *KitRegistry) DetectForRepo(repoRoot, targetOS string) ([]kit.ManifestVi
 	if targetOS == "" {
 		targetOS = kit.MustResolveOS()
 	}
+	// [supports].os short-circuit (005:296) — never run detect on an
+	// incompatible platform.
+	return r.detectForRepo(repoRoot, func(supported []string) bool {
+		return osSupported(supported, targetOS)
+	})
+}
 
+// DetectForRepoAnyOS mirrors DetectForRepo but returns every kit whose
+// declarative [detect] matchers pass, regardless of [supports].os.
+//
+// DetectForRepo's short-circuit is a placement-time correctness check: it
+// answers "does this kit apply to the OS I already chose". Deriving the
+// pre-placement PlacementDemand (kit_demand.go) needs the opposite —
+// EVERY candidate kit's declared support, so DeriveDemand can intersect
+// them itself. Pre-filtering by one OS before detection would bias the
+// derived demand toward whatever OS happened to be passed in (typically
+// the local host's), which is exactly the "gates run after placement"
+// defect this signal exists to fix (005 § "Platform compatibility").
+func (r *KitRegistry) DetectForRepoAnyOS(repoRoot string) ([]kit.ManifestView, error) {
+	return r.detectForRepo(repoRoot, func([]string) bool { return true })
+}
+
+// detectForRepo is the shared implementation behind DetectForRepo and
+// DetectForRepoAnyOS. osFilter receives each candidate manifest's
+// [supports].os slice and decides whether it's even considered for
+// declarative detection.
+func (r *KitRegistry) detectForRepo(repoRoot string, osFilter func(supported []string) bool) ([]kit.ManifestView, error) {
 	manifests, manifestPaths := r.scanWithPaths()
 	state := r.loadState()
 	disabled := make(map[string]struct{}, len(state.DisabledIDs))
@@ -56,9 +82,7 @@ func (r *KitRegistry) DetectForRepo(repoRoot, targetOS string) ([]kit.ManifestVi
 		if _, off := disabled[m.Kit.ID]; off {
 			continue
 		}
-		// [supports].os short-circuit (005:296) — never run detect on an
-		// incompatible platform.
-		if !osSupported(m.Supports.OS, targetOS) {
+		if !osFilter(m.Supports.OS) {
 			continue
 		}
 		if !detectMatches(m, repoRoot) {
@@ -156,6 +180,7 @@ func manifestToView(m kitManifestTOML, packageDigest, legacyDigest string) kit.M
 		Priority:             m.Kit.Priority,
 		Order:                m.Composition.Order,
 		SupportedOS:          copyStrings(m.Supports.OS),
+		SupportedArch:        copyStrings(m.Supports.Arch),
 		PackageDigest:        packageDigest,
 		LegacyManifestDigest: legacyDigest,
 		PathScope:            ".",
@@ -185,6 +210,16 @@ func manifestToView(m kitManifestTOML, packageDigest, legacyDigest string) kit.M
 				Partial: pf.Partial,
 				When:    copyStrings(pf.When),
 				File:    pf.File,
+			})
+		}
+	}
+	if len(m.Provide.Lanes) > 0 {
+		v.Lanes = make([]kit.LaneView, 0, len(m.Provide.Lanes))
+		for _, lane := range m.Provide.Lanes {
+			v.Lanes = append(v.Lanes, kit.LaneView{
+				Name: lane.Name,
+				OS:   copyStrings(lane.OS),
+				Arch: copyStrings(lane.Arch),
 			})
 		}
 	}

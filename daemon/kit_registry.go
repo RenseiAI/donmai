@@ -201,6 +201,19 @@ type kitManifestTOML struct {
 			Name     string `toml:"name"`
 			Language string `toml:"language"`
 		} `toml:"intelligence_extractors"`
+		// Lanes is [[provide.lanes]] — a proposed manifest-schema addition
+		// (not yet emitted by any shipped kit.toml) for a NAMED command
+		// lane gated to a subset of the kit's own [supports].os/.arch (the
+		// swift-kit iOS-app-build pattern, currently only prose). See
+		// internal/kit/demand.go's package doc for the full proposed
+		// shape and DeriveDemand for the engine-side consumer. Parsed here
+		// (permissively — unknown fields are ignored) so the demand
+		// pipeline works the moment a manifest starts declaring it.
+		Lanes []struct {
+			Name string   `toml:"name"`
+			OS   []string `toml:"os"`
+			Arch []string `toml:"arch"`
+		} `toml:"lanes"`
 	} `toml:"provide"`
 
 	Composition struct {
