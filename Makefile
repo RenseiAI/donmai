@@ -54,7 +54,7 @@ test:
 # GOWORK=off mirrors the OSS-standalone lane and keeps this runnable from a
 # linked worktree the org go.work does not enumerate.
 test-tagged:
-	GOWORK=off go vet -tags "f28_integration,runner_integration,runtime_integration,integration,codex_integration,stophookspike" ./...
+	GOWORK=off go vet -tags "f28_integration,runner_integration,runtime_integration,integration,codex_integration,stophookspike,pi_scale_load" ./...
 
 lint:
 	golangci-lint run
