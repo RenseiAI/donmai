@@ -860,6 +860,135 @@ func TestToolLifecyclePlanRequireToolPluginsNowAdmitsOnPi(t *testing.T) {
 	}
 }
 
+// TestToolLifecyclePiInteractiveAllowedDisallowedToolsAdmitLocally is the
+// generic-plan half of the interactive tool-lifecycle profile's declared
+// allowed/disallowed-tools delivery (sibling of a platform stamp-tier fix): a
+// stamped AllowedTools/DisallowedTools list now admits on pi's interactive
+// PTY profile with agent.ToolDeliveryPiInteractiveLocalToolPolicy — the SAME
+// embedded policy extension headless loads also loads via `-e` in PTY mode
+// (provider/harness/pi/interactive.go), but matches the stamped list LOCALLY
+// against every guarded tool_call with no RPC round trip (the handshake
+// token is never set on that lane). This is deliberately a DIFFERENT
+// delivery value from agent.ToolDeliveryPiInjectedBoundary (the RPC-backed
+// handshake+adjudication boundary headless uses and the interactive profile
+// still does not claim — see provider/harness/pi's
+// TestInteractiveProfiles_TellCoarseTruthNoInjectedBoundary). RED proof: set
+// the interactive profile's NativeToolPolicyDelivery back to Unsupported and
+// this admission fails closed again, exactly like
+// TestToolLifecycleAdapterUnsupportedPoliciesDeny's shell/codex/amp/agy-cli/
+// ollama cases above.
+func TestToolLifecyclePiInteractiveAllowedDisallowedToolsAdmitLocally(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	spec := agent.Spec{
+		Interactive:     &agent.InteractiveSpec{},
+		AllowedTools:    []string{"Read"},
+		DisallowedTools: []string{"Bash"},
+	}
+	_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeHumanControlled))
+	if err != nil {
+		t.Fatalf("AdaptToolLifecycle: %v", err)
+	}
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+	}
+	wantChannels := map[agent.ToolLifecycleChannel]bool{
+		agent.ToolChannelAllowedTools:    false,
+		agent.ToolChannelDisallowedTools: false,
+	}
+	for _, entry := range receipt.Entries {
+		if _, ok := wantChannels[entry.Channel]; !ok {
+			continue
+		}
+		wantChannels[entry.Channel] = true
+		if entry.Outcome != agent.ToolOutcomeAdmitted {
+			t.Errorf("%s outcome = %q, want admitted", entry.Channel, entry.Outcome)
+		}
+		if entry.Delivery != agent.ToolDeliveryPiInteractiveLocalToolPolicy {
+			t.Errorf("%s delivery = %q, want %q", entry.Channel, entry.Delivery, agent.ToolDeliveryPiInteractiveLocalToolPolicy)
+		}
+	}
+	for ch, seen := range wantChannels {
+		if !seen {
+			t.Errorf("receipt missing channel %q; entries=%+v", ch, receipt.Entries)
+		}
+	}
+}
+
+// --- toolSurfaceRequired: the platform's optional-delivery wire flag ---
+//
+// Spec.ToolSurfaceRequired governs what happens when the allowed/disallowed-
+// tools entries are undeliverable on the exact profile: nil/true (unchanged
+// default) still denies the whole spawn; explicit false drops the entries
+// with a recorded (non-fatal) receipt instead — the SAME "recorded, not
+// fatal" shape TestToolLifecycleMCPToolNamesUndeliverableIsRecordedNotFatal
+// already establishes for the mcp-tool-names channel, now reachable for
+// allowed/disallowed-tools too via a caller-stamped flag rather than a
+// profile-derived rule.
+
+// TestToolLifecycleOptionalToolSurfaceDropsWithReceiptInsteadOfDenying proves
+// both halves: codex's headless profile has no NativeToolPolicyDelivery
+// (TestToolLifecycleAdapterUnsupportedPoliciesDeny's "codex-flat-list" case
+// pins the unchanged-default denial), so it is the exact fixture to prove the
+// flag actually flips the outcome rather than merely being ignored.
+func TestToolLifecycleOptionalToolSurfaceDropsWithReceiptInsteadOfDenying(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+
+	t.Run("optional undeliverable surface admits with a recorded drop", func(t *testing.T) {
+		t.Parallel()
+		optional := false
+		spec := agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}, ToolSurfaceRequired: &optional}
+		_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeAutonomous))
+		if err != nil {
+			t.Fatalf("optional undeliverable tool surface must not deny the spawn, got %v", err)
+		}
+		if receipt.Decision != "ready" {
+			t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+		}
+		var found bool
+		for _, entry := range receipt.Entries {
+			if entry.Channel != agent.ToolChannelAllowedTools {
+				continue
+			}
+			found = true
+			if entry.Required {
+				t.Errorf("allowed-tools entry must be non-required once the wire flag marks it optional")
+			}
+			if entry.Outcome != agent.ToolOutcomeDenied || entry.DenialCode != agent.ToolDenialDeliveryUnsupported {
+				t.Errorf("allowed-tools entry = %+v, want a recorded (non-fatal) denial", entry)
+			}
+		}
+		if !found {
+			t.Fatalf("receipt must still name the allowed-tools channel; entries=%+v", receipt.Entries)
+		}
+	})
+
+	t.Run("explicit true is unchanged: still denies", func(t *testing.T) {
+		t.Parallel()
+		required := true
+		spec := agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}, ToolSurfaceRequired: &required}
+		_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeAutonomous))
+		var adaptationErr *agent.ToolAdaptationError
+		if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != agent.ToolChannelAllowedTools {
+			t.Fatalf("error = %v, want typed allowed-tools denial (explicit true must not weaken the default)", err)
+		}
+		if receipt.Decision != "denied" {
+			t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+		}
+	})
+
+	t.Run("nil (absent wire flag) matches the pre-existing default", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}
+		_, _, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeAutonomous))
+		var adaptationErr *agent.ToolAdaptationError
+		if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported {
+			t.Fatalf("error = %v, want typed allowed-tools denial (an absent wire flag must not change the default)", err)
+		}
+	})
+}
+
 func mustProfile(t *testing.T, manifest agent.HarnessManifest, mode agent.PromptSessionMode) agent.ToolLifecycleProfile {
 	t.Helper()
 	profile, ok := manifest.ToolLifecycleProfile(mode)

@@ -108,6 +108,16 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// this is codex's own cardinal-rule-10 position, taken here rather than
 		// inferred from silence.
 		"AdditionalExtensions",
+		// ToolSurfaceRequired (sibling of a platform stamp-tier fix) is the
+		// platform's optional-delivery wire flag: it governs
+		// whether an undeliverable allowed/disallowed-tools entry denies the
+		// whole spawn or drops with a recorded, non-fatal receipt
+		// (agent/tool_adaptation.go's toolSurfaceRequired /
+		// legacyToolRequirements). It is consumed entirely inside
+		// agent.PrepareHarness, before NewSpawnPlan ever runs — same
+		// treatment as ToolLifecyclePlan/ToolLifecycleReceipt above, not a
+		// JSON-RPC param this file's translation table ever sees.
+		"ToolSurfaceRequired",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)
