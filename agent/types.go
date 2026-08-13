@@ -534,10 +534,17 @@ type Spec struct {
 	// extension already used for its one consumer: absolute-path or
 	// inline-source delivery, both digest-verified AFTER materialization
 	// (see ExtensionDelivery), with the harness's own trust-boundary
-	// extension always loading first. A harness without a host-side
-	// extension API ignores this field, like every other capability-gated
-	// Spec field. nil/empty is today's behavior for every existing producer
-	// (additive, omitempty, wire round-trip unchanged).
+	// extension always loading first. nil/empty is inert for every producer
+	// (additive, omitempty, wire round-trip unchanged) — a harness without a
+	// host-side extension API is untouched by an absent list, exactly like
+	// every other capability-gated Spec field. A NON-empty list is no longer
+	// silently ignored by a harness that lacks the surface: it is routed
+	// through the same generic tool-lifecycle plan every other tool/MCP/
+	// policy channel uses (legacyToolRequirements, ToolChannelToolPlugin) —
+	// admitted and receipted when the exact profile declares
+	// ToolPluginDelivery, denied closed before spawn when it does not. Per
+	// D5.5 there is still no cross-harness "supports extensions" boolean;
+	// only the exact profile's ToolPluginDelivery answers the question.
 	AdditionalExtensions []ExtensionDelivery `json:"additionalExtensions,omitempty"`
 }
 
