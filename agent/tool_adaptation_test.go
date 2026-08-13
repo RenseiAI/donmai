@@ -529,7 +529,13 @@ func TestToolLifecycleUnusedPluginAndHookRequirementsDeny(t *testing.T) {
 		plan     agent.ToolLifecyclePlan
 		channel  agent.ToolLifecycleChannel
 	}{
-		{"pi plugin", (&pi.Provider{}).Manifest(), agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, RequireToolPlugins: true}, agent.ToolChannelToolPlugin},
+		// pi's headless profile now declares a real ToolPluginDelivery (see
+		// TestToolLifecyclePiAdditionalExtensionsRouteThroughGenericToolPluginChannel),
+		// so it moved out of this deny-list and into the positive fixtures
+		// below; claude — whose ToolPluginDelivery stays Unsupported because
+		// its tool-plugin surface is MCP-shaped, a different channel — takes
+		// its place here.
+		{"claude plugin", (&claude.Provider{}).Manifest(), agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, RequireToolPlugins: true}, agent.ToolChannelToolPlugin},
 		{"gemini plugin", (&gemini.Provider{}).Manifest(), agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, RequireToolPlugins: true}, agent.ToolChannelToolPlugin},
 		{"pi hook", (&pi.Provider{}).Manifest(), agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, ToolHooks: []agent.ToolHookRequirement{{ID: "audit", Kind: "pre_tool", Required: true}}}, agent.ToolChannelToolHook},
 	}
@@ -704,6 +710,153 @@ func TestToolLifecycleMCPToolNamesFatalWherePiHasNoMountBoundary(t *testing.T) {
 	}
 	if receipt.Decision != "denied" {
 		t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+	}
+}
+
+// --- Spec.AdditionalExtensions routed through the generic tool_plugin
+// channel (ADR-2026-08-12 D1/D6, ADR-2026-08-06 D1.1) ---
+//
+// AdditionalExtensions predates this compiler and, before this fixture, was
+// applied directly by the exact harness adapter with no plan/receipt entry
+// at all: silently inert on every harness lacking the seam, silently
+// effective on pi with no truthful record either way. These fixtures prove
+// it now goes through the SAME legacyToolRequirements projection every other
+// tool/MCP/policy Spec field uses, so a populated list is admitted and
+// receipted where the exact profile declares ToolPluginDelivery and denied
+// closed — never silently dropped — where it does not.
+
+// extensionDelivery builds a structurally well-formed agent.ExtensionDelivery
+// for these fixtures. The digest need only satisfy the compiler's shape
+// check (ValidateExtensionDeliveries) — content verification against actual
+// bytes is the exact harness adapter's job (pi's materializeAdditionalExtensions),
+// out of scope for the generic plan layer these fixtures exercise.
+func extensionDelivery(id string) agent.ExtensionDelivery {
+	return agent.ExtensionDelivery{ID: id, Kind: agent.ExtensionDeliveryInline, Source: []byte("export default function activate(pi) {}\n"), Basename: id + ".ts", Digest: strings.Repeat("a", 64), Required: true}
+}
+
+// TestToolLifecyclePiAdditionalExtensionsRouteThroughGenericToolPluginChannel
+// is the positive half: a populated Spec.AdditionalExtensions against pi's
+// headless profile is admitted and receipted on ToolChannelToolPlugin with
+// the exact ToolDeliveryPiAdditionalExtension boundary the manifest declares
+// — proving the generic plan describes the delivery and the receipt attests
+// it, the same path every other harness's tool/MCP/policy channels use.
+func TestToolLifecyclePiAdditionalExtensionsRouteThroughGenericToolPluginChannel(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	spec := agent.Spec{Autonomous: true, AdditionalExtensions: []agent.ExtensionDelivery{extensionDelivery("pack-1")}}
+
+	_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	if err != nil {
+		t.Fatalf("AdaptToolLifecycle: %v", err)
+	}
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+	}
+	var found bool
+	for _, entry := range receipt.Entries {
+		if entry.Channel != agent.ToolChannelToolPlugin {
+			continue
+		}
+		found = true
+		if entry.Outcome != agent.ToolOutcomeAdmitted {
+			t.Errorf("tool_plugin entry outcome = %q, want admitted", entry.Outcome)
+		}
+		if entry.Delivery != agent.ToolDeliveryPiAdditionalExtension {
+			t.Errorf("tool_plugin entry delivery = %q, want %q", entry.Delivery, agent.ToolDeliveryPiAdditionalExtension)
+		}
+		if !entry.Required {
+			t.Errorf("tool_plugin entry must be required (D1.2: every accepted delivery is required)")
+		}
+	}
+	if !found {
+		t.Fatalf("receipt must name the tool_plugin channel for a populated AdditionalExtensions list; entries=%+v", receipt.Entries)
+	}
+}
+
+// TestToolLifecyclePiAdditionalExtensionsDenyOnInteractiveProfile is the
+// per-mode negative half: pi's interactive PTY profile still declares
+// ToolPluginDelivery: Unsupported (no fixture proves tool registration
+// through that lane), so the SAME spec that admits cleanly headless must
+// deny by name on the interactive profile — ADR-2026-08-06 D6's "interactive
+// evidence never inherits headless," enforced at the generic plan layer
+// rather than left to whatever the exact adapter happens to do with an
+// unevidenced capability.
+func TestToolLifecyclePiAdditionalExtensionsDenyOnInteractiveProfile(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	spec := agent.Spec{
+		Interactive:          &agent.InteractiveSpec{},
+		AdditionalExtensions: []agent.ExtensionDelivery{extensionDelivery("pack-1")},
+	}
+	_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeHumanControlled))
+	var adaptationErr *agent.ToolAdaptationError
+	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != agent.ToolChannelToolPlugin {
+		t.Fatalf("error = %v, want a typed tool_plugin denial (pi's interactive profile has no proven extension-tool-registration evidence)", err)
+	}
+	if receipt.Decision != "denied" {
+		t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+	}
+}
+
+// TestToolLifecycleAdditionalExtensionsDenyOnHarnessWithoutTheSeam is the
+// per-D5.5 negative half: there is still no cross-harness "supports
+// extensions" boolean. A caller that hands codex — a harness with no
+// host-side extension API at all — a populated AdditionalExtensions list
+// must deny by name at this generic layer, not fall through to a harness
+// that has nothing to attach the field to.
+func TestToolLifecycleAdditionalExtensionsDenyOnHarnessWithoutTheSeam(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	spec := agent.Spec{Autonomous: true, AdditionalExtensions: []agent.ExtensionDelivery{extensionDelivery("pack-1")}}
+	_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	var adaptationErr *agent.ToolAdaptationError
+	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != agent.ToolChannelToolPlugin {
+		t.Fatalf("error = %v, want a typed tool_plugin denial (codex has no additional-extension seam)", err)
+	}
+	if receipt.Decision != "denied" {
+		t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+	}
+}
+
+// TestToolLifecycleMalformedAdditionalExtensionsFailsBeforeDelivery proves
+// the structural gate: a malformed delivery (bad digest shape) denies with
+// ToolDenialMalformedPlan naming ToolChannelToolPlugin, before the
+// requirement loop ever runs — mirroring
+// TestToolLifecycleMalformedMCPFailsBeforeDelivery /
+// TestToolLifecycleMalformedPermissionRegexFailsBeforeDelivery for the other
+// legacy-field channels.
+func TestToolLifecycleMalformedAdditionalExtensionsFailsBeforeDelivery(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	spec := agent.Spec{
+		Autonomous: true,
+		AdditionalExtensions: []agent.ExtensionDelivery{
+			{ID: "bad", Kind: agent.ExtensionDeliveryInline, Source: []byte("x"), Basename: "bad.ts", Digest: "not-a-sha256"},
+		},
+	}
+	_, _, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	var adaptationErr *agent.ToolAdaptationError
+	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialMalformedPlan || adaptationErr.Channel != agent.ToolChannelToolPlugin {
+		t.Fatalf("error = %v, want malformed tool_plugin denial", err)
+	}
+}
+
+// TestToolLifecyclePlanRequireToolPluginsNowAdmitsOnPi is the direct
+// plan-authored counterpart (as opposed to the legacy AdditionalExtensions
+// projection above): plan.RequireToolPlugins now succeeds against pi's
+// headless profile too, since ToolPluginDelivery answers truthfully —
+// contrast TestToolLifecycleUnusedPluginAndHookRequirementsDeny, which pins
+// the harnesses that still deny it.
+func TestToolLifecyclePlanRequireToolPluginsNowAdmitsOnPi(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	plan := agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, RequireToolPlugins: true}
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{Autonomous: true, ToolLifecyclePlan: &plan}, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	if err != nil {
+		t.Fatalf("AdaptToolLifecycle: %v", err)
+	}
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
 	}
 }
 

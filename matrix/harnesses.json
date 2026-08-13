@@ -687,7 +687,7 @@
       "capabilities": {
         "inject": true,
         "resume": true,
-        "tools": false,
+        "tools": true,
         "mcp": false,
         "allowedToolsList": true,
         "subagents": false,
@@ -748,9 +748,9 @@
       ],
       "toolLifecycle": [
         {
-          "id": "pi/headless/tool-lifecycle-v1",
+          "id": "pi/headless/tool-lifecycle-v2",
           "mode": "autonomous",
-          "toolPluginDelivery": "unsupported",
+          "toolPluginDelivery": "pi_additional_extension_registration",
           "mcpDelivery": "unsupported",
           "nativeToolPolicyDelivery": "pi_handshake_policy_extension",
           "permissionConfigDelivery": "pi_handshake_policy_extension",
