@@ -362,6 +362,26 @@ type Spec struct {
 	// must reject.
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
 
+	// ToolSurfaceRequired governs what happens when AllowedTools/
+	// DisallowedTools cannot be delivered on the exact harness/mode profile
+	// selected (agent/tool_adaptation.go legacyToolRequirements' "allowed-
+	// tools"/"disallowed-tools" entries, keyed on
+	// ToolLifecycleProfile.NativeToolPolicyDelivery). nil and true are the
+	// SAME, unchanged behavior: an undeliverable tool surface is a required
+	// entry, and AdaptToolLifecycle denies the whole spawn closed
+	// (ToolDenialDeliveryUnsupported) naming the channel. Explicit false
+	// marks the tool surface OPTIONAL: an undeliverable entry is still
+	// receipted (Outcome: denied, Required: false — the existing "recorded,
+	// not fatal" shape agent/tool_adaptation_test.go's
+	// TestToolLifecycleMCPToolNamesUndeliverableIsRecordedNotFatal already
+	// establishes for other legacy channels) but never fails admission — a
+	// drop-with-receipt, never a deny. A caller that stamped
+	// AllowedTools/DisallowedTools as a nice-to-have rather than a load-
+	// bearing boundary sets this false so a harness/mode with no delivery for
+	// it still spawns, honestly missing the surface rather than denied
+	// outright.
+	ToolSurfaceRequired *bool `json:"toolSurfaceRequired,omitempty"`
+
 	// MCPServers is the list of stdio MCP servers the provider should
 	// configure on session start.
 	MCPServers []MCPServerConfig `json:"mcpStdioServers,omitempty"`

@@ -322,6 +322,16 @@ func TestSpawn_Interactive_AdmissionFlipsDenyToAccept(t *testing.T) {
 // (the human at the terminal + pi's native approval UI is the authority in PTY
 // mode). The headless profile's injected-boundary claim is unchanged, proving
 // the interactive profile does not inherit headless evidence.
+//
+// NativeToolPolicyDelivery is the one exception, and a deliberate one (sibling
+// of a platform stamp-tier fix): the interactive profile now answers
+// the allowed/disallowed-tools channel with ToolDeliveryPiInteractiveLocalToolPolicy
+// — a LOCAL, no-RPC match inside the same loaded extension, never the RPC-backed
+// handshake+adjudication boundary ToolDeliveryPiInjectedBoundary names. The
+// assertion below still pins that the interactive profile does NOT claim the
+// injected/handshake boundary itself, and PermissionConfigDelivery still stays
+// Unsupported (the richer regex/containment/default-decision engine still needs
+// the Go round trip this lane does not run).
 func TestInteractiveProfiles_TellCoarseTruthNoInjectedBoundary(t *testing.T) {
 	t.Parallel()
 	m := (&Provider{}).Manifest()
@@ -336,8 +346,11 @@ func TestInteractiveProfiles_TellCoarseTruthNoInjectedBoundary(t *testing.T) {
 	if tl.ReplayDelivery != agent.ToolDeliveryTerminalCastReplay || tl.ReplayFidelity != agent.EvidenceCoarse {
 		t.Errorf("interactive replay = %q/%q, want coarse terminal-cast replay", tl.ReplayDelivery, tl.ReplayFidelity)
 	}
-	if tl.NativeToolPolicyDelivery != agent.ToolDeliveryUnsupported || tl.PermissionConfigDelivery != agent.ToolDeliveryUnsupported {
-		t.Errorf("interactive profile must NOT claim an injected policy boundary; got native=%q permission=%q", tl.NativeToolPolicyDelivery, tl.PermissionConfigDelivery)
+	if tl.NativeToolPolicyDelivery != agent.ToolDeliveryPiInteractiveLocalToolPolicy {
+		t.Errorf("interactive native policy = %q, want the local (no-RPC) tool-policy delivery", tl.NativeToolPolicyDelivery)
+	}
+	if tl.PermissionConfigDelivery != agent.ToolDeliveryUnsupported {
+		t.Errorf("interactive profile must still NOT claim an injected permission-config boundary; got %q", tl.PermissionConfigDelivery)
 	}
 
 	// The headless profile keeps its injected-boundary claim — the interactive

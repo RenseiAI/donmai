@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -111,13 +112,52 @@ func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []str
 	return args
 }
 
+// piAllowedToolsEnvVar / piDisallowedToolsEnvVar carry a JSON-encoded
+// Spec.AllowedTools / Spec.DisallowedTools array onto the interactive PTY
+// child so the SAME embedded policy extension can answer the allowed/
+// disallowed-tools channel LOCALLY (agent.ToolDeliveryPiInteractiveLocalToolPolicy
+// — manifest.go, agent/tool_adaptation.go). This is deliberately an
+// INTERACTIVE-ONLY mechanism: composeChildEnv (headless) never sets these —
+// the headless lane already answers the same two Spec fields through the
+// full RPC-backed policy.go engine (NativeToolPolicyDelivery:
+// ToolDeliveryPiInjectedBoundary), and running a second, narrower local gate
+// alongside it would risk the two disagreeing over the same fields.
+const (
+	piAllowedToolsEnvVar    = "DONMAI_PI_ALLOWED_TOOLS"
+	piDisallowedToolsEnvVar = "DONMAI_PI_DISALLOWED_TOOLS"
+)
+
+// interactiveToolPolicyEnv JSON-encodes the stamped tool-designator lists for
+// the extension's local matcher (extensions/donmai-policy.ts). A list is
+// omitted entirely when empty, so a session that stamped neither field
+// carries no local gate at all — mirroring
+// agent/tool_adaptation.go legacyToolRequirements, which only ever projects
+// ToolChannelAllowedTools/DisallowedTools requirements when the Spec field is
+// non-empty.
+func interactiveToolPolicyEnv(spec agent.Spec) []string {
+	var out []string
+	if len(spec.AllowedTools) > 0 {
+		if b, err := json.Marshal(spec.AllowedTools); err == nil {
+			out = append(out, piAllowedToolsEnvVar+"="+string(b))
+		}
+	}
+	if len(spec.DisallowedTools) > 0 {
+		if b, err := json.Marshal(spec.DisallowedTools); err == nil {
+			out = append(out, piDisallowedToolsEnvVar+"="+string(b))
+		}
+	}
+	return out
+}
+
 // interactiveChildEnv builds the ptycli override env for an interactive spawn.
 // It carries the already-projected spec.Env (the resolved cell credentials,
 // including PiKeyEnvVar), the two documented config/session-home redirect vars
 // headless also sets (piCodingAgentDirEnvVar/piCodingAgentSessionDirEnvVar —
 // ADR-2026-08-12 D4.1), the offline-posture defaults (D4.3 — the interactive
-// lane is explicitly in scope, not just headless), and the non-secret
-// provider-pin vars the embedded extension reads at load.
+// lane is explicitly in scope, not just headless), the non-secret
+// provider-pin vars the embedded extension reads at load, and the stamped
+// allowed/disallowed-tools lists the SAME extension matches locally
+// (interactiveToolPolicyEnv above).
 //
 // It deliberately omits piHandshakeEnvVar: interactive PTY mode runs no Go
 // handshake round-trip, and the extension skips the handshake (and does not
@@ -140,6 +180,11 @@ func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]strin
 		}
 	}
 	for _, kv := range providerPinEnv(spec.Endpoint, spec.Model) {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			env[kv[:i]] = kv[i+1:]
+		}
+	}
+	for _, kv := range interactiveToolPolicyEnv(spec) {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			env[kv[:i]] = kv[i+1:]
 		}

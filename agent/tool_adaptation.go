@@ -68,12 +68,31 @@ const (
 	// native_tool_definition entries delivered as a materialized artifact
 	// selected by an explicit load path — no new channel name, just this
 	// harness's own answer on the existing tool_plugin channel).
-	ToolDeliveryPiAdditionalExtension    ToolDeliveryKind = "pi_additional_extension_registration"
-	ToolDeliveryStructuredProviderEvents ToolDeliveryKind = "structured_provider_events"
-	ToolDeliveryCoarsePTYEvents          ToolDeliveryKind = "coarse_pty_events"
-	ToolDeliveryStructuredEventReplay    ToolDeliveryKind = "structured_event_replay"
-	ToolDeliveryTerminalCastReplay       ToolDeliveryKind = "terminal_cast_replay"
-	ToolDeliveryHandleCleanup            ToolDeliveryKind = "handle_stop_and_resource_cleanup"
+	ToolDeliveryPiAdditionalExtension ToolDeliveryKind = "pi_additional_extension_registration"
+	// ToolDeliveryPiInteractiveLocalToolPolicy is pi's INTERACTIVE-lane answer
+	// on the allowed/disallowed-tools channel. The same embedded policy
+	// extension headless loads is also loaded via `-e` in PTY mode
+	// (extension.go materializes it for both spawn modes; interactive.go
+	// never displaces it) — but the RPC-mode handshake and Go-adjudication
+	// round trip ToolDeliveryPiInjectedBoundary names is unconditionally
+	// skipped there (extensions/donmai-policy.ts: no DONMAI_PI_HANDSHAKE in
+	// the child env, so rpcMode is false and no ctx.ui round trip is ever
+	// attempted). This delivery names a DIFFERENT mechanism the same loaded
+	// extension provides instead: a stamped Spec.AllowedTools/DisallowedTools
+	// list is carried onto the child env and matched LOCALLY, in-process,
+	// against every guarded tool_call — no RPC, no handshake, no Go-side
+	// round trip. It is deliberately a distinct value from
+	// ToolDeliveryPiInjectedBoundary (which still names only the RPC-backed
+	// boundary) and narrower than the full policy.go engine that boundary
+	// answers with: PermissionConfigDelivery stays Unsupported on the
+	// interactive profile, because the richer regex/containment/default-
+	// decision behavior still needs the Go round trip this lane does not run.
+	ToolDeliveryPiInteractiveLocalToolPolicy ToolDeliveryKind = "pi_interactive_local_tool_policy"
+	ToolDeliveryStructuredProviderEvents     ToolDeliveryKind = "structured_provider_events"
+	ToolDeliveryCoarsePTYEvents              ToolDeliveryKind = "coarse_pty_events"
+	ToolDeliveryStructuredEventReplay        ToolDeliveryKind = "structured_event_replay"
+	ToolDeliveryTerminalCastReplay           ToolDeliveryKind = "terminal_cast_replay"
+	ToolDeliveryHandleCleanup                ToolDeliveryKind = "handle_stop_and_resource_cleanup"
 )
 
 // EvidenceFidelity makes headless structured events and PTY byte/coarse
@@ -552,13 +571,27 @@ func validateLegacyToolInputs(spec Spec) (ToolLifecycleChannel, string) {
 	return "", ""
 }
 
+// toolSurfaceRequired reads Spec.ToolSurfaceRequired with the documented
+// default: nil (the wire flag absent — an older or non-platform caller) and
+// explicit true both mean "required, unchanged behavior"; only explicit false
+// marks the allowed/disallowed-tools entries optional. This is the ONLY read
+// site for the flag — legacyToolRequirements is the sole producer of the
+// "allowed-tools"/"disallowed-tools" toolRequirement entries the flag governs.
+func toolSurfaceRequired(spec Spec) bool {
+	if spec.ToolSurfaceRequired == nil {
+		return true
+	}
+	return *spec.ToolSurfaceRequired
+}
+
 func legacyToolRequirements(spec Spec, profile ToolLifecycleProfile) []toolRequirement {
 	var out []toolRequirement
+	surfaceRequired := toolSurfaceRequired(spec)
 	if len(spec.AllowedTools) > 0 {
-		out = append(out, toolRequirement{id: "allowed-tools", channel: ToolChannelAllowedTools, required: true, delivery: profile.NativeToolPolicyDelivery, digest: digestToolInput(spec.AllowedTools)})
+		out = append(out, toolRequirement{id: "allowed-tools", channel: ToolChannelAllowedTools, required: surfaceRequired, delivery: profile.NativeToolPolicyDelivery, digest: digestToolInput(spec.AllowedTools)})
 	}
 	if len(spec.DisallowedTools) > 0 {
-		out = append(out, toolRequirement{id: "disallowed-tools", channel: ToolChannelDisallowedTools, required: true, delivery: profile.NativeToolPolicyDelivery, digest: digestToolInput(spec.DisallowedTools)})
+		out = append(out, toolRequirement{id: "disallowed-tools", channel: ToolChannelDisallowedTools, required: surfaceRequired, delivery: profile.NativeToolPolicyDelivery, digest: digestToolInput(spec.DisallowedTools)})
 	}
 	if spec.PermissionConfig != nil {
 		out = append(out, toolRequirement{id: "permission-config", channel: ToolChannelPermissionConfig, required: true, delivery: profile.PermissionConfigDelivery, digest: digestToolInput(spec.PermissionConfig)})
@@ -736,7 +769,7 @@ func isKnownToolDelivery(delivery ToolDeliveryKind) bool {
 		ToolDeliveryCodexCLIMCPConfig,
 		ToolDeliveryGeminiNativeBoundary, ToolDeliveryGeminiMCPBridge, ToolDeliveryAmpMCPConfig,
 		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryPiInjectedBoundary,
-		ToolDeliveryPiAdditionalExtension,
+		ToolDeliveryPiAdditionalExtension, ToolDeliveryPiInteractiveLocalToolPolicy,
 		ToolDeliveryStructuredProviderEvents, ToolDeliveryCoarsePTYEvents, ToolDeliveryStructuredEventReplay,
 		ToolDeliveryTerminalCastReplay, ToolDeliveryHandleCleanup:
 		return true

@@ -161,9 +161,38 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				// mode an AdditionalExtensions list denies closed at the
 				// generic plan layer instead of loading unevidenced — the
 				// headless profile's flip does not carry over.
-				ID: "pi/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
+				//
+				// NativeToolPolicyDelivery is REAL, though, and for a different
+				// reason than the injected-boundary claim above stays a gap. The
+				// SAME embedded extension this lane loads (never a second file)
+				// also matches a stamped AllowedTools/DisallowedTools list LOCALLY
+				// against every guarded tool_call, entirely in-process, with no RPC
+				// and no handshake (extensions/donmai-policy.ts's !rpcMode branch;
+				// interactive.go's interactiveChildEnv carries the stamped list onto
+				// DONMAI_PI_ALLOWED_TOOLS/DONMAI_PI_DISALLOWED_TOOLS). That is a
+				// genuinely different mechanism from ToolDeliveryPiInjectedBoundary
+				// (which still names only the RPC-backed handshake+adjudication
+				// round trip headless uses), so it gets its own delivery value —
+				// ToolDeliveryPiInteractiveLocalToolPolicy — instead of reusing or
+				// inheriting the headless claim. Scoped deliberately narrow:
+				// PermissionConfigDelivery stays Unsupported, because the richer
+				// regex/containment/default-decision engine (policy.go) still needs
+				// the Go round trip this lane does not run.
+				//
+				// Bumped v1 -> v2 per the seam ADR's adapter-version rule
+				// (ADR-2026-08-12 D1.3a / D6: a profile whose declared surface moves
+				// bumps the ADAPTER version; the family ABI and binary pin do not).
+				// A receipt pinned to "pi/interactive/tool-lifecycle-v1" now denies
+				// at spawn rather than silently reusing a stale profile identity.
+				// Conformance: agent/tool_adaptation_test.go
+				// TestToolLifecyclePiInteractiveAllowedDisallowedToolsAdmitLocally
+				// (generic-plan admission) and this package's scripted
+				// interactive-local-tool-policy fixtures (the extension's actual
+				// enforcement, against the real production source, no pi binary
+				// needed).
+				ID: "pi/interactive/tool-lifecycle-v2", Mode: agent.PromptModeHumanControlled,
 				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
-				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+				NativeToolPolicyDelivery: agent.ToolDeliveryPiInteractiveLocalToolPolicy, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
 				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
 				LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
 				ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: ptyEvents,
