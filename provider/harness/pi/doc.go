@@ -103,13 +103,35 @@
 // isolation, tool registration, no-MCP truth, replay/resume" (plus D8's
 // cross-cutting item 7, cleanup idempotence, which every family owes). Tool
 // registration THROUGH THE CLOSED TOOL-LIFECYCLE PLAN (ToolPluginDelivery /
-// Caps.SupportsToolPlugins — see manifest.go) is still out of scope pending a
-// follow-up that projects Spec.AdditionalExtensions onto that generic,
-// cross-harness-compiled channel; the ADDITIONAL-EXTENSION DELIVERY SEAM
-// itself (ADR-2026-08-12) ships in this cut and gets its own row below,
-// proving real registerTool delivery through a DIFFERENT, harness-owned
-// mechanism (Spec.AdditionalExtensions, not the tool-lifecycle compiler). The
-// rest of the original family is proved here:
+// Caps.SupportsToolPlugins — see manifest.go) now lands: Spec.
+// AdditionalExtensions projects onto agent/tool_adaptation.go's generic
+// tool_plugin channel (legacyToolRequirements), the headless profile's
+// ToolPluginDelivery answers ToolDeliveryPiAdditionalExtension truthfully
+// (manifest.go's ID bumped tool-lifecycle-v1 → v2 per ADR-2026-08-12 D6/
+// D1.3a — the adapter version moves, the family ABI and binary pin do not),
+// and Caps.SupportsToolPlugins now agrees. The ADDITIONAL-EXTENSION DELIVERY
+// SEAM itself (ADR-2026-08-12) shipped separately and gets its own row below
+// — that row proves real registerTool delivery against the pinned binary;
+// this row proves the SAME AdditionalExtensions list is admitted and
+// receipted through the generic cross-harness-compiled plan/receipt path
+// before it ever reaches pi's own materializer, and denies closed on a
+// harness/mode whose profile does not declare the channel (interactive PTY
+// stays Unsupported — no fixture proves tool registration through that lane
+// yet, so it declares the gap per D6 rather than inheriting headless
+// evidence). Generic-path fixtures:
+// agent/tool_adaptation_test.go —
+// TestToolLifecyclePiAdditionalExtensionsRouteThroughGenericToolPluginChannel
+// (positive: headless admits + receipts; negative: interactive denies by
+// name; negative: a malformed batch denies before the requirement loop runs;
+// negative: another harness with AdditionalExtensions populated denies —
+// there is still no cross-harness "supports extensions" boolean, D5.5).
+// pi-package integration fixture: extension_delivery_test.go —
+// TestSpawn_AdditionalExtensions_ProducesToolPluginReceiptEntry (a real
+// Spawn call's ToolLifecycleReceipt names the tool_plugin channel, admitted,
+// with the ToolDeliveryPiAdditionalExtension delivery) and
+// TestSpawn_Interactive_AdditionalExtensionsDeniesBeforePTYWork (the
+// interactive-mode denial fires inside prepare(), before spawnInteractive
+// ever runs). The rest of the original family is proved here:
 //
 //   - RPC policy-handshake boundary (positive + tampered/forged negatives):
 //     handle_test.go — TestSpawn_HandshakeVerified,

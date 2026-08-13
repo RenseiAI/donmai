@@ -42,19 +42,33 @@ type ToolDeliveryKind string
 // Tool delivery kinds identify exact native, injected, or unsupported boundaries.
 const (
 	// ToolDeliveryUnsupported denies requirements on an unavailable boundary.
-	ToolDeliveryUnsupported              ToolDeliveryKind = "unsupported"
-	ToolDeliveryStubOracle               ToolDeliveryKind = "stub_oracle"
-	ToolDeliveryClaudeCLIAllowDeny       ToolDeliveryKind = "claude_cli_allow_deny"
-	ToolDeliveryClaudeMCPConfig          ToolDeliveryKind = "claude_cli_mcp_config"
-	ToolDeliveryCodexApprovalBridge      ToolDeliveryKind = "codex_approval_bridge"
-	ToolDeliveryCodexAppServerMCP        ToolDeliveryKind = "codex_app_server_mcp"
-	ToolDeliveryCodexCLIMCPConfig        ToolDeliveryKind = "codex_cli_mcp_config"
-	ToolDeliveryGeminiNativeBoundary     ToolDeliveryKind = "gemini_in_box_native_boundary"
-	ToolDeliveryGeminiMCPBridge          ToolDeliveryKind = "gemini_in_box_mcp_bridge"
-	ToolDeliveryAmpMCPConfig             ToolDeliveryKind = "amp_cli_mcp_config"
-	ToolDeliveryOpenCodePermissionMap    ToolDeliveryKind = "opencode_permission_map"
-	ToolDeliveryOpenCodeProjectMCP       ToolDeliveryKind = "opencode_project_mcp_config"
-	ToolDeliveryPiInjectedBoundary       ToolDeliveryKind = "pi_handshake_policy_extension"
+	ToolDeliveryUnsupported           ToolDeliveryKind = "unsupported"
+	ToolDeliveryStubOracle            ToolDeliveryKind = "stub_oracle"
+	ToolDeliveryClaudeCLIAllowDeny    ToolDeliveryKind = "claude_cli_allow_deny"
+	ToolDeliveryClaudeMCPConfig       ToolDeliveryKind = "claude_cli_mcp_config"
+	ToolDeliveryCodexApprovalBridge   ToolDeliveryKind = "codex_approval_bridge"
+	ToolDeliveryCodexAppServerMCP     ToolDeliveryKind = "codex_app_server_mcp"
+	ToolDeliveryCodexCLIMCPConfig     ToolDeliveryKind = "codex_cli_mcp_config"
+	ToolDeliveryGeminiNativeBoundary  ToolDeliveryKind = "gemini_in_box_native_boundary"
+	ToolDeliveryGeminiMCPBridge       ToolDeliveryKind = "gemini_in_box_mcp_bridge"
+	ToolDeliveryAmpMCPConfig          ToolDeliveryKind = "amp_cli_mcp_config"
+	ToolDeliveryOpenCodePermissionMap ToolDeliveryKind = "opencode_permission_map"
+	ToolDeliveryOpenCodeProjectMCP    ToolDeliveryKind = "opencode_project_mcp_config"
+	ToolDeliveryPiInjectedBoundary    ToolDeliveryKind = "pi_handshake_policy_extension"
+	// ToolDeliveryPiAdditionalExtension is pi's tool_plugin channel: one or
+	// more Spec.AdditionalExtensions (ADR-2026-08-12 D1) materialized into
+	// the per-session state directory, digest-verified after materialization,
+	// and loaded by explicit `-e` path alongside — never displacing or
+	// reordering — the trust-boundary policy extension that
+	// ToolDeliveryPiInjectedBoundary names. The two are deliberately distinct
+	// values: PiInjectedBoundary names the ONE handshake-verified policy
+	// extension every pi session loads; PiAdditionalExtension names the
+	// caller-supplied, digest-verified extensions riding alongside it that
+	// register new tools (ADR-2026-08-06 D1.1: an injected pack's tools are
+	// native_tool_definition entries delivered as a materialized artifact
+	// selected by an explicit load path — no new channel name, just this
+	// harness's own answer on the existing tool_plugin channel).
+	ToolDeliveryPiAdditionalExtension    ToolDeliveryKind = "pi_additional_extension_registration"
 	ToolDeliveryStructuredProviderEvents ToolDeliveryKind = "structured_provider_events"
 	ToolDeliveryCoarsePTYEvents          ToolDeliveryKind = "coarse_pty_events"
 	ToolDeliveryStructuredEventReplay    ToolDeliveryKind = "structured_event_replay"
@@ -525,6 +539,16 @@ func validateLegacyToolInputs(spec Spec) (ToolLifecycleChannel, string) {
 			return ToolChannelMCPServer, "MCP server type must be stdio or http"
 		}
 	}
+
+	// AdditionalExtensions carries its own structural validator
+	// (ValidateExtensionDeliveries: id/digest/kind shape plus unique ids)
+	// because ExtensionDelivery is the exact harness adapter's materialization
+	// input, not a bag of strings — reuse it here rather than re-deriving the
+	// same rules, so a malformed batch denies at THIS shared gate, before any
+	// exact adapter's own materialization ever runs.
+	if err := ValidateExtensionDeliveries(spec.AdditionalExtensions); err != nil {
+		return ToolChannelToolPlugin, err.Error()
+	}
 	return "", ""
 }
 
@@ -555,6 +579,44 @@ func legacyToolRequirements(spec Spec, profile ToolLifecycleProfile) []toolRequi
 		// the attached server), an unapplicable name policy means zero MCP
 		// control and MUST stay a fatal denial.
 		out = append(out, toolRequirement{id: "mcp-tool-names", channel: ToolChannelMCPToolNames, required: profile.MCPDelivery == ToolDeliveryUnsupported, delivery: profile.MCPToolPolicyDelivery, digest: digestToolInput(spec.MCPToolNames)})
+	}
+	if len(spec.AdditionalExtensions) > 0 {
+		// AdditionalExtensions (ADR-2026-08-12 D1) is the seam a caller uses to
+		// deliver extra tool-registering extensions to a harness with a
+		// host-side extension API. It predates this compiler and was
+		// historically applied by the exact harness adapter with no plan/
+		// receipt entry at all — silently inert everywhere the seam is not
+		// implemented, silently effective on pi with no truthful record either
+		// way. Projecting it as a required tool_plugin entry closes both
+		// gaps the same way every other legacy field above does: a harness
+		// whose profile declares ToolPluginDelivery admits and receipts it: a
+		// harness whose profile does not now denies closed instead of quietly
+		// dropping a capability the caller was told it had (D1.2's fail-closed
+		// rule applied at the plan layer, not just inside pi's own
+		// materializer). Always required — D1.2: "every delivery this Wave-1
+		// seam accepts is treated as required regardless of [Required]'s
+		// value."
+		out = append(out, toolRequirement{id: "additional-extensions", channel: ToolChannelToolPlugin, required: true, delivery: profile.ToolPluginDelivery, digest: digestToolInput(additionalExtensionDigestInput(spec.AdditionalExtensions))})
+	}
+	return out
+}
+
+// additionalExtensionDigestInput reduces spec.AdditionalExtensions to
+// (id, kind, digest) triples before hashing for the receipt's input digest.
+// Each delivery's own Digest already commits to its exact on-disk bytes
+// (ExtensionDelivery.Digest, verified after materialization by the exact
+// harness adapter), so the plan/receipt layer never needs — and must not
+// carry — Source itself; per D8 item 6 secret-bearing or bulk content stays
+// out of plan/receipt evidence.
+func additionalExtensionDigestInput(deliveries []ExtensionDelivery) any {
+	type extensionDigestEntry struct {
+		ID     string                `json:"id"`
+		Kind   ExtensionDeliveryKind `json:"kind"`
+		Digest string                `json:"digest"`
+	}
+	out := make([]extensionDigestEntry, len(deliveries))
+	for i, d := range deliveries {
+		out[i] = extensionDigestEntry{ID: d.ID, Kind: d.Kind, Digest: d.Digest}
 	}
 	return out
 }
@@ -674,6 +736,7 @@ func isKnownToolDelivery(delivery ToolDeliveryKind) bool {
 		ToolDeliveryCodexCLIMCPConfig,
 		ToolDeliveryGeminiNativeBoundary, ToolDeliveryGeminiMCPBridge, ToolDeliveryAmpMCPConfig,
 		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryPiInjectedBoundary,
+		ToolDeliveryPiAdditionalExtension,
 		ToolDeliveryStructuredProviderEvents, ToolDeliveryCoarsePTYEvents, ToolDeliveryStructuredEventReplay,
 		ToolDeliveryTerminalCastReplay, ToolDeliveryHandleCleanup:
 		return true

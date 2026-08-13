@@ -41,13 +41,23 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true, // steer / follow_up
 			SupportsSessionResume:    true, // session file + cursor replay (get_entries since=<id>)
-			// SupportsToolPlugins is false: pi.registerTool exists on the real
-			// extension API, but no donmai code path calls it yet — the
-			// ToolLifecycle profile below already answers this truthfully
-			// (ToolPluginDelivery: Unsupported). This flag used to disagree
-			// with that answer; a registerTool follow-up wires real delivery
-			// and flips both back to true together.
-			SupportsToolPlugins:     false,
+			// SupportsToolPlugins is true: Spec.AdditionalExtensions
+			// (ADR-2026-08-12 D1) now routes through the generic
+			// tool-lifecycle plan (agent/tool_adaptation.go
+			// legacyToolRequirements, ToolChannelToolPlugin), and the
+			// headless ToolLifecycle profile below declares a real
+			// ToolPluginDelivery for it — a populated delivery list is
+			// admitted and receipted, never silently dropped, and the real
+			// pi.registerTool call is proven against the pinned binary
+			// (extension_delivery_real_binary_test.go). This flag used to
+			// disagree with a truthful ToolPluginDelivery: Unsupported below;
+			// both now agree. The interactive PTY profile still declares
+			// ToolPluginDelivery: Unsupported (no fixture proves tool
+			// registration through that lane yet — ADR-2026-08-06 D6:
+			// interactive evidence never inherits headless), so a caller
+			// that hands pi's PTY spawn mode an AdditionalExtensions list
+			// denies closed rather than silently loading it unevidenced.
+			SupportsToolPlugins:     true,
 			AcceptsMcpServerSpec:    false, // pi has no MCP by design; Spec.MCPServers is capability-gated-ignored
 			AcceptsAllowedToolsList: true,  // enforced by OUR policy extension, not by pi
 			EmitsSubagentEvents:     false,
@@ -106,8 +116,27 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		},
 		ToolLifecycle: []agent.ToolLifecycleProfile{
 			{
-				ID: "pi/headless/tool-lifecycle-v1", Mode: agent.PromptModeAutonomous,
-				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
+				// Bumped v1 → v2 (ADR-2026-08-12 D6 / D1.3a): loading a pack
+				// through Spec.AdditionalExtensions moves the declared
+				// surface this exact profile grants, which is precisely what
+				// the adapter version names — the family ABI (ContractABI
+				// above) and the binary pin do not move. A receipt pinned to
+				// "pi/headless/tool-lifecycle-v1" now denies at spawn rather
+				// than silently reusing a stale profile identity.
+				ID: "pi/headless/tool-lifecycle-v2", Mode: agent.PromptModeAutonomous,
+				// ToolPluginDelivery is real, not Unsupported: a populated
+				// Spec.AdditionalExtensions is materialized, digest-verified,
+				// and loaded via pi's `-e` extension API
+				// (materializeAdditionalExtensions in extension.go),
+				// registering real tools against the pinned binary
+				// (extension_delivery_real_binary_test.go
+				// TestRealBinary_AdditionalExtension_ToolRegistersAndHeadlessUIRefusesPromptly).
+				// Distinct delivery value from NativeToolPolicyDelivery/
+				// PermissionConfigDelivery below: those name the ONE
+				// handshake-verified policy extension every session loads;
+				// this names the caller-supplied extensions riding alongside
+				// it.
+				ToolPluginDelivery: agent.ToolDeliveryPiAdditionalExtension, MCPDelivery: agent.ToolDeliveryUnsupported,
 				NativeToolPolicyDelivery: agent.ToolDeliveryPiInjectedBoundary, PermissionConfigDelivery: agent.ToolDeliveryPiInjectedBoundary,
 				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
 				LifecycleDelivery: agent.ToolDeliveryStructuredProviderEvents, LifecycleFidelity: agent.EvidenceStructured, LifecycleEvents: events,
@@ -125,6 +154,13 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				// Declaring the injected-boundary GAP (Unsupported) rather than
 				// inheriting the headless profile's evidence is D6's exact
 				// requirement — interactive evidence never inherits headless.
+				// ToolPluginDelivery stays Unsupported for the same reason:
+				// materializeAdditionalExtensions runs in this lane too
+				// (interactive.go), but no real-binary fixture proves tool
+				// registration through it, so a caller handing this spawn
+				// mode an AdditionalExtensions list denies closed at the
+				// generic plan layer instead of loading unevidenced — the
+				// headless profile's flip does not carry over.
 				ID: "pi/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
 				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
 				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
@@ -145,10 +181,10 @@ func (p *Provider) Capabilities() agent.Capabilities {
 	return agent.Capabilities{
 		SupportsMessageInjection: true,
 		SupportsSessionResume:    true,
-		// SupportsToolPlugins is false — see the matching comment on
+		// SupportsToolPlugins is true — see the matching comment on
 		// Manifest().Caps; TestParity_ManifestAgreesWithCapabilities pins
 		// the two together.
-		SupportsToolPlugins: false,
+		SupportsToolPlugins: true,
 		// pi has NO permission system of its own — the donmai policy
 		// extension IS the permission config consumer, so the provider
 		// requires a structured policy to adjudicate against.

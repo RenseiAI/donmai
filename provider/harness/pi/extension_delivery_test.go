@@ -263,3 +263,91 @@ func TestSpawn_ValidAdditionalExtension_HandshakeStillVerifiesNormally(t *testin
 	}
 	drain(t, h)
 }
+
+// --- AdditionalExtensions routed through the generic tool-lifecycle plan
+// (ADR-2026-08-12 D6, ADR-2026-08-06 D1.1) ---
+//
+// The tests above prove the Go-side materialization/argv/trust mechanics.
+// These two prove the OTHER half: the SAME Spec.AdditionalExtensions list
+// also goes through agent.PrepareHarness/PrepareToolLifecycle — the generic,
+// cross-harness-compiled tool_plugin channel every other harness's tool/MCP/
+// policy Spec fields already use — before it ever reaches this package's own
+// materializer, so pi's Caps.SupportsToolPlugins:true is backed by a plan
+// that describes the delivery and a receipt that attests it, not just a
+// manifest literal.
+
+// TestSpawn_AdditionalExtensions_ProducesToolPluginReceiptEntry is the
+// positive fixture: a real (scripted) Spawn call carrying a well-formed
+// AdditionalExtensions list produces a ToolLifecycleReceipt naming
+// ToolChannelToolPlugin, admitted, with the ToolDeliveryPiAdditionalExtension
+// boundary the headless manifest profile declares — observed through
+// Spec.OnToolLifecycleAdapted, the same hook every harness's receipt rides.
+func TestSpawn_AdditionalExtensions_ProducesToolPluginReceiptEntry(t *testing.T) {
+	t.Parallel()
+	body := []byte("export default function activate(pi) {}\n")
+	var receipt agent.ToolLifecycleReceipt
+	spec := agent.Spec{
+		AdditionalExtensions: []agent.ExtensionDelivery{
+			{ID: "pack-1", Kind: agent.ExtensionDeliveryInline, Source: body, Basename: "pack.ts", Digest: sha256Hex(body), Required: true},
+		},
+		OnToolLifecycleAdapted: func(r agent.ToolLifecycleReceipt) error {
+			receipt = r
+			return nil
+		},
+	}
+	body2 := getStateResponse("ses_receipt") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "agent_settled"})
+	_, h, err := spawnScripted(t, spec, handshakeEvent("h1"), body2)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	drain(t, h)
+
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready; receipt=%+v", receipt.Decision, receipt)
+	}
+	var found bool
+	for _, entry := range receipt.Entries {
+		if entry.Channel != agent.ToolChannelToolPlugin {
+			continue
+		}
+		found = true
+		if entry.Outcome != agent.ToolOutcomeAdmitted {
+			t.Errorf("tool_plugin entry outcome = %q, want admitted", entry.Outcome)
+		}
+		if entry.Delivery != agent.ToolDeliveryPiAdditionalExtension {
+			t.Errorf("tool_plugin entry delivery = %q, want %q", entry.Delivery, agent.ToolDeliveryPiAdditionalExtension)
+		}
+	}
+	if !found {
+		t.Fatalf("receipt must name the tool_plugin channel; entries=%+v", receipt.Entries)
+	}
+}
+
+// TestSpawn_Interactive_AdditionalExtensionsDeniesBeforePTYWork is the
+// negative fixture: pi's interactive PTY profile still declares
+// ToolPluginDelivery: Unsupported (no fixture proves tool registration
+// through that lane), so a spec combining Spec.Interactive with a populated
+// AdditionalExtensions list must deny inside prepare() — before
+// spawnInteractive, before any PTY driver work — exactly as
+// TestSpawn_RequiredExtensionDeliveryDenialFailsBeforeProcessSpawn proves for
+// a digest failure on the headless lane.
+func TestSpawn_Interactive_AdditionalExtensionsDeniesBeforePTYWork(t *testing.T) {
+	t.Parallel()
+	p, err := New(Options{skipProcess: true, handshakeToken: testHandshakeToken})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	body := []byte("export default function activate(pi) {}\n")
+	spec := agent.Spec{
+		Cwd:         t.TempDir(),
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+		AdditionalExtensions: []agent.ExtensionDelivery{
+			{ID: "pack-1", Kind: agent.ExtensionDeliveryInline, Source: body, Basename: "pack.ts", Digest: sha256Hex(body), Required: true},
+		},
+	}
+	if _, err := p.Spawn(context.Background(), spec); err == nil {
+		t.Fatal("Spawn succeeded on the interactive lane with AdditionalExtensions set; want a fail-closed denial (interactive ToolPluginDelivery is Unsupported)")
+	}
+}
