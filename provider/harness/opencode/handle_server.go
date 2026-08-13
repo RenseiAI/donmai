@@ -22,6 +22,16 @@ import (
 //     SystemEvents (§5.2);
 //   - Inject posts a follow-up prompt (SupportsMessageInjection);
 //   - Stop aborts the turn, stops the SSE subscription, and tears down the child.
+//
+// Terminal handling distinguishes an ORDINARY completed/failed turn (a
+// ResultEvent mapped while the SSE stream is still open — Map() never emits
+// an ErrorEvent while the stream is alive) from a FATAL one (the stream
+// itself ending: a crashed child or a dropped feed, mapped to ErrorEvent).
+// An ordinary terminal does NOT release the owned child/config or stop the
+// SSE subscription — forward keeps pumping so a later Handle.Inject still
+// has a live server and session to land the follow-up prompt on; that
+// cleanup happens lazily, in doStop, once a caller actually calls Stop. A
+// FATAL terminal still tears everything down synchronously, same as before.
 
 // permPollInterval is how often the pump lists pending permissions while the
 // session is active. The v2 feed does not (in the pinned binary) carry a
@@ -62,6 +72,18 @@ type serverHandle struct {
 
 	cleanupReported atomic.Bool
 
+	// injectClosed signals "no live session left for Inject to land on".
+	// Closed BEFORE a fatal terminal event becomes observable on Events()
+	// (see finishWithCleanup) and at the top of doStop — never after. A
+	// channel SEND only happens-before the matching RECEIVE completes;
+	// nothing orders what the sender does NEXT against what the receiver
+	// does next, so a caller that reacts to a fatal event (or to Stop's own
+	// side effects) the instant it observes it on Events() must already find
+	// injectClosed closed, not race it. An ordinary completed/failed turn
+	// does NOT close this — Inject must keep working past it.
+	injectClosed     chan struct{}
+	injectClosedOnce sync.Once
+
 	shutdown chan struct{}
 	done     chan struct{} // closed when the forwarder exits
 
@@ -78,6 +100,7 @@ func newServerHandle(child *serveChild, client serverClient, sessionID string, s
 		logger:       logger,
 		spec:         spec,
 		events:       make(chan agent.Event, eventBufferSize),
+		injectClosed: make(chan struct{}),
 		shutdown:     make(chan struct{}),
 		done:         make(chan struct{}),
 		permInterval: permPollInterval,
@@ -112,9 +135,14 @@ func (h *serverHandle) Events() <-chan agent.Event { return h.events }
 // Inject posts a follow-up prompt onto the live session (opencode queues it via
 // its own admission model). Available because Lane B declares
 // SupportsMessageInjection.
+//
+// Gated on injectClosed, not done/shutdown: an ordinary completed/failed turn
+// (a soft terminal — see forward) closes neither of those, precisely so a
+// post-settle Inject like this one still has a live server and session to
+// post to. Only a fatal terminal or an explicit Stop closes injectClosed.
 func (h *serverHandle) Inject(ctx context.Context, text string) error {
 	select {
-	case <-h.done:
+	case <-h.injectClosed:
 		return fmt.Errorf("provider/opencode: Inject after session end: %w", agent.ErrUnsupported)
 	default:
 	}
@@ -129,6 +157,11 @@ func (h *serverHandle) Stop(ctx context.Context) error {
 }
 
 func (h *serverHandle) doStop(ctx context.Context) error {
+	// First thing, unconditionally: Stop always closes injectClosed,
+	// whichever path (this one or a fatal finishWithCleanup) gets there
+	// first — see the field's doc comment for the ordering argument.
+	h.signalInjectClosed()
+
 	h.lifecycleMu.Lock()
 	h.stopping.Store(true)
 	h.lifecycleMu.Unlock()
@@ -171,6 +204,16 @@ func (h *serverHandle) watchCtx(ctx context.Context) {
 }
 
 // forward consumes SSE frames, maps them, and enforces the terminal contract.
+//
+// A mapped terminal reached while the stream is still open (ok == true) is
+// always ORDINARY: Map() only reaches m.terminal=true from a completed or
+// failed TURN (ResultEvent) — it never emits an ErrorEvent while the stream
+// is alive. That case falls through to the plain emitAll below and the loop
+// keeps going: the owned child/config stay up and the SSE subscription stays
+// open, so a later Handle.Inject still has a live session to post the
+// follow-up prompt to. Only a genuinely FATAL end — the stream itself
+// closing (crash, dropped feed, or the child exiting once idle after an
+// earlier ordinary terminal) — calls finishWithCleanup and returns.
 func (h *serverHandle) forward(ch <-chan serverEvent) {
 	defer close(h.done)
 	for {
@@ -182,9 +225,11 @@ func (h *serverHandle) forward(ch <-chan serverEvent) {
 				if h.stopping.Load() {
 					return
 				}
-				// SSE stream ended. If we already emitted a terminal, this is
-				// the clean end. Otherwise the child crashed or the stream
-				// dropped — surface a terminal so the runner is not left hanging.
+				// SSE stream ended. If we already emitted an ordinary
+				// terminal, this is the clean end (terminalOnStreamEnd
+				// returns nil — see its doc). Otherwise the child crashed or
+				// the stream dropped — surface a fatal terminal so the
+				// runner is not left hanging.
 				h.finishWithCleanup(h.terminalOnStreamEnd())
 				return
 			}
@@ -192,24 +237,30 @@ func (h *serverHandle) forward(ch <-chan serverEvent) {
 				return
 			}
 			out := h.mapper.Map(ev)
-			if h.mapper.terminal {
-				h.finishWithCleanup(out)
-				return
-			}
 			h.emitAll(out)
 		}
 	}
 }
 
-// finishWithCleanup preserves the exactly-one-terminal contract: the owned
-// child/config is released before the mapped terminal is published. A cleanup
-// failure replaces that terminal with one bounded ErrorEvent.
+// finishWithCleanup handles a FATAL end: the SSE stream itself has closed, so
+// the session is genuinely over. The owned child/config is released and
+// Inject is closed off BEFORE the mapped terminal (if any) is published —
+// see injectClosed's doc comment for why that order, not the reverse, is
+// required. A cleanup failure replaces the terminal with one bounded
+// ErrorEvent rather than letting a caller believe secrets were scrubbed when
+// they were not.
+//
+// This is never called for an ORDINARY completed/failed turn observed while
+// the stream is open (forward's ok==true branch) — that path keeps the pump,
+// child, and config alive and defers cleanup to doStop, once a caller
+// actually calls Stop.
 func (h *serverHandle) finishWithCleanup(events []agent.Event) {
 	h.lifecycleMu.Lock()
 	defer h.lifecycleMu.Unlock()
 	if !h.stopping.CompareAndSwap(false, true) {
 		return
 	}
+	h.signalInjectClosed()
 	cleanupErr := h.releaseOwnedResource()
 	for _, ev := range events {
 		switch ev.Kind() {
@@ -228,6 +279,11 @@ func (h *serverHandle) finishWithCleanup(events []agent.Event) {
 		defer cancel()
 		_ = h.Stop(stopCtx)
 	}()
+}
+
+// signalInjectClosed closes injectClosed exactly once.
+func (h *serverHandle) signalInjectClosed() {
+	h.injectClosedOnce.Do(func() { close(h.injectClosed) })
 }
 
 func (h *serverHandle) releaseOwnedResource() error {
