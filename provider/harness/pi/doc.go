@@ -285,12 +285,16 @@
 // Unsupported). interactive_tool_policy_test.go carries the pi-package half:
 // interactiveToolPolicyEnv unit tests, a fake-pi Spawn fixture proving the
 // stamped list reaches the PTY child's env, and a SCRIPTED conformance
-// fixture (testdata/interactive-local-tool-policy-harness.mjs) that imports
-// the REAL production extensions/donmai-policy.ts under node — no `pi`
-// binary needed — and proves the stamped list reaches the extension's actual
-// tool_call gate (block on a disallowed tool, block on an allow-gated
-// unlisted tool, pass an allowed tool, register no handler at all when
-// nothing is stamped).
+// fixture (testdata/interactive-local-tool-policy-harness.mjs) that reads
+// the REAL production extensions/donmai-policy.ts, strips its (deliberately
+// narrow) TypeScript syntax down to plain JavaScript itself
+// (stripErasableTypeScript, verified against node's own --check before use —
+// a shape it cannot handle fails loudly, never a silent skip) so the fixture
+// never assumes a Node version with native `.ts` loading, then evaluates it
+// under node — no `pi` binary needed — and proves the stamped list reaches
+// the extension's actual tool_call gate (block on a disallowed tool, block
+// on an allow-gated unlisted tool, pass an allowed tool, register no handler
+// at all when nothing is stamped).
 //
 // # Scale hardening
 //
