@@ -248,6 +248,50 @@
 // headless profile's evidence (ADR-2026-08-06 D6). The A5 seam contract is
 // unchanged: one embedded file, one handshake, one adjudication channel.
 //
+// # Interactive allowed/disallowed-tools channel (local, no RPC)
+//
+// One exception to "the interactive profile only ever declares gaps" above:
+// NativeToolPolicyDelivery is REAL on the interactive profile
+// (agent.ToolDeliveryPiInteractiveLocalToolPolicy, manifest.go's
+// pi/interactive/tool-lifecycle-v2 — bumped from v1 per the seam ADR's
+// adapter-version rule, ADR-2026-08-12 D1.3a/D6). The SAME embedded extension
+// this lane loads also matches a stamped Spec.AllowedTools/DisallowedTools
+// list LOCALLY against every guarded tool_call, entirely in-process, with no
+// RPC and no handshake (extensions/donmai-policy.ts's !rpcMode branch).
+// interactive.go's interactiveChildEnv carries the stamped list onto
+// DONMAI_PI_ALLOWED_TOOLS/DONMAI_PI_DISALLOWED_TOOLS — a mechanism deliberately
+// distinct from ToolDeliveryPiInjectedBoundary, which still names only the
+// RPC-backed handshake+adjudication boundary headless uses and which the
+// interactive profile still does NOT claim. Scoped narrow on purpose:
+// PermissionConfigDelivery stays Unsupported, since the richer regex/
+// containment/default-decision engine (policy.go) still needs the Go round
+// trip this lane does not run.
+//
+// Also consumed here: Spec.ToolSurfaceRequired (agent/tool_adaptation.go), the
+// platform's optional-delivery wire flag. nil/true is unchanged default
+// behavior (an undeliverable allowed/disallowed-tools entry denies the whole
+// spawn); explicit false marks the entry optional, so an undeliverable
+// profile (any harness, any mode — not pi-specific) drops the entry with a
+// recorded, non-fatal receipt instead of denying. This does not change what
+// pi's interactive profile now delivers; it changes what happens on a
+// DIFFERENT profile that still declares Unsupported when the caller marked
+// the surface as a nice-to-have rather than load-bearing.
+//
+// Fixtures: agent/tool_adaptation_test.go
+// TestToolLifecyclePiInteractiveAllowedDisallowedToolsAdmitLocally (generic-
+// plan admission, positive) and
+// TestToolLifecycleOptionalToolSurfaceDropsWithReceiptInsteadOfDenying (the
+// wire flag, both values, on a harness whose profile still declares
+// Unsupported). interactive_tool_policy_test.go carries the pi-package half:
+// interactiveToolPolicyEnv unit tests, a fake-pi Spawn fixture proving the
+// stamped list reaches the PTY child's env, and a SCRIPTED conformance
+// fixture (testdata/interactive-local-tool-policy-harness.mjs) that imports
+// the REAL production extensions/donmai-policy.ts under node — no `pi`
+// binary needed — and proves the stamped list reaches the extension's actual
+// tool_call gate (block on a disallowed tool, block on an allow-gated
+// unlisted tool, pass an allowed tool, register no handler at all when
+// nothing is stamped).
+//
 // # Scale hardening
 //
 // Four properties beyond correctness matter once a fleet spawns many pi

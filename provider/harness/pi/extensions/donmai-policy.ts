@@ -31,6 +31,19 @@
 //     handler returns { block: true, reason } so pi blocks the tool and the
 //     model sees WHY.
 //
+//   - Interactive-lane local tool policy (allowed/disallowed-tools channel,
+//     agent.ToolDeliveryPiInteractiveLocalToolPolicy): the PTY lane runs no
+//     RPC round trip at all (see activate() below), so it cannot ask the Go
+//     side to adjudicate. It can still answer a stamped
+//     AllowedTools/DisallowedTools list, though — the list is carried onto
+//     the child env as DONMAI_PI_ALLOWED_TOOLS/DONMAI_PI_DISALLOWED_TOOLS
+//     (interactive.go's interactiveChildEnv) and matched entirely LOCALLY,
+//     in this process, against every guarded tool_call. This is narrower
+//     than the full policy engine on purpose: no safety-deny regexes, no
+//     path containment, no PermissionConfig regex/default-decision handling
+//     — those stay Unsupported on the interactive profile because they need
+//     the Go round trip this lane does not run.
+//
 //   - Provider pin: at load the factory registers a single "donmai" provider
 //     from env (baseUrl / api / key / model), so the session can only reach
 //     the resolved cell endpoint. The key is read from process.env at runtime
@@ -56,7 +69,8 @@ const KIND_HANDSHAKE = "handshake";
 const KIND_ADJUDICATE = "adjudicate";
 
 // Built-in tools this extension guards. Every one routes through the Go-side
-// policy engine before it may execute.
+// policy engine before it may execute (RPC mode) or the local matcher below
+// (interactive PTY mode, allowed/disallowed-tools channel only).
 const GUARDED_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
 // selfSHA256 hashes this extension's own on-disk source so the Go side can
@@ -68,6 +82,109 @@ function selfSHA256(): string {
   } catch {
     return "";
   }
+}
+
+// --- Interactive-lane local tool policy (allowed/disallowed-tools channel) ---
+//
+// A minimal, LOCAL port of policy.go's toolPattern grammar, deliberately
+// scoped to exactly the two Spec fields (AllowedTools/DisallowedTools) the
+// interactive profile's NativeToolPolicyDelivery now answers
+// (ToolDeliveryPiInteractiveLocalToolPolicy — manifest.go). Narrower than
+// policy.go's toolPattern.matches on purpose: a pattern name that is not one
+// of GUARDED_TOOLS never matches here (policy.go's "anyKind" wildcard for an
+// unrecognized name is a Go-side nuance this local, no-round-trip mechanism
+// does not replicate — the asymmetry is declared, not smoothed, per
+// ADR-2026-08-06 D6 / ADR-2026-08-12 D3.2's "declared, not smoothed" rule for
+// headless-vs-interactive evidence).
+const DONMAI_ALLOWED_TOOLS_ENV = "DONMAI_PI_ALLOWED_TOOLS";
+const DONMAI_DISALLOWED_TOOLS_ENV = "DONMAI_PI_DISALLOWED_TOOLS";
+
+interface LocalToolPattern {
+  raw: string;
+  name: string; // lowercased tool name, e.g. "bash"
+  constraint: string | null; // stripped of a trailing ":*"/"*"; null == no constraint
+}
+
+// parseLocalToolPatterns parses a JSON-encoded array of Claude-grammar tool
+// designators (e.g. ["Bash(git:*)", "Read"]) — the SAME strings
+// agent/tool_adaptation.go's toolDesignatorRe validates before this ever
+// runs. Malformed JSON or a non-array value yields no patterns (fail
+// CLOSED for DisallowedTools — nothing to match means nothing is blocked by
+// this local gate — and the same emptiness for AllowedTools simply means no
+// allow-gate is configured, matching parseToolPatterns' empty-list shape in
+// policy.go).
+function parseLocalToolPatterns(envValue: string | undefined): LocalToolPattern[] {
+  if (!envValue) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(envValue);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: LocalToolPattern[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== "string") continue;
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const match = /^([A-Za-z_][A-Za-z0-9_]*)(?:\((.*)\))?$/.exec(trimmed);
+    if (!match) continue;
+    let constraint: string | null = null;
+    if (match[2] !== undefined) {
+      constraint = match[2].replace(/:?\*$/, "");
+    }
+    out.push({ raw: trimmed, name: match[1].toLowerCase(), constraint });
+  }
+  return out;
+}
+
+// localToolPolicySubject mirrors policy.go's ToolCall.subject(): the bash
+// command text for bash, the raw path/file/filename input for file ops. This
+// never resolves the path against cwd (no Go round trip exists to do that
+// safely from this process), so a constraint here is a plain prefix check
+// against the tool's raw argument — resolved-path containment stays a
+// policy.go-only, RPC-mode-only property.
+function localToolPolicySubject(tool: string, input: Record<string, unknown> | undefined): string {
+  if (tool === "bash") return String(input?.command ?? "").trim();
+  return String(input?.path ?? input?.file ?? input?.filename ?? "");
+}
+
+function matchesLocalPattern(pattern: LocalToolPattern, tool: string, subject: string): boolean {
+  if (pattern.name !== tool) return false;
+  if (!pattern.constraint) return true;
+  return subject.startsWith(pattern.constraint);
+}
+
+// evaluateLocalToolPolicy is the interactive-lane (PTY, no RPC round trip)
+// answer on the allowed/disallowed-tools channel. Order mirrors policy.go's
+// Evaluate steps 3 and 5 (DisallowedTools first, then the AllowedTools
+// allow-gate), with every other step (safety-deny, containment,
+// PermissionConfig, network-bash default-deny) intentionally absent — those
+// channels stay Unsupported on the interactive profile. Exported for the
+// scripted conformance fixture (testdata/interactive-local-tool-policy-harness.mjs),
+// which imports this module directly and invokes it without a real pi
+// process.
+export function evaluateLocalToolPolicy(
+  allowed: LocalToolPattern[],
+  disallowed: LocalToolPattern[],
+  tool: string,
+  input: Record<string, unknown> | undefined,
+): { block: true; reason: string } | undefined {
+  const normalizedTool = tool.toLowerCase();
+  const subject = localToolPolicySubject(normalizedTool, input);
+
+  for (const pattern of disallowed) {
+    if (matchesLocalPattern(pattern, normalizedTool, subject)) {
+      return { block: true, reason: "tool call matches a disallowed-tools pattern: " + pattern.raw };
+    }
+  }
+  if (allowed.length > 0) {
+    const allowedMatch = allowed.some((pattern) => matchesLocalPattern(pattern, normalizedTool, subject));
+    if (!allowedMatch) {
+      return { block: true, reason: "no allow pattern matched and an allow-list is configured" };
+    }
+  }
+  return undefined;
 }
 
 export default function activate(pi: ExtensionAPI) {
@@ -124,9 +241,25 @@ export default function activate(pi: ExtensionAPI) {
     }
   }
 
-  // Interactive PTY mode: no handshake, no blocking adjudication (see above).
-  // Provider registration already ran, which is all this mode needs from us.
+  // Interactive PTY mode: no handshake, no RPC-backed blocking adjudication
+  // (see above) — but the allowed/disallowed-tools channel is still real
+  // here. A stamped list is matched LOCALLY, with no round trip, against
+  // every guarded tool_call (evaluateLocalToolPolicy above). The handler is
+  // registered only when at least one list is actually stamped, so a session
+  // with neither carries no local gate at all — same shape as RPC mode's own
+  // "nothing configured, nothing blocked" default.
   if (!rpcMode) {
+    const allowed = parseLocalToolPatterns(process.env[DONMAI_ALLOWED_TOOLS_ENV]);
+    const disallowed = parseLocalToolPatterns(process.env[DONMAI_DISALLOWED_TOOLS_ENV]);
+    if (allowed.length > 0 || disallowed.length > 0) {
+      pi.on("tool_call", (event: any) => {
+        const tool = String(event?.toolName ?? "").toLowerCase();
+        if (!GUARDED_TOOLS.has(tool)) return;
+        return evaluateLocalToolPolicy(allowed, disallowed, tool, event?.input ?? {});
+      });
+    }
+    // Provider registration already ran, which is everything else this mode
+    // needs from us — no handshake, no Go-side adjudication round trip.
     return;
   }
 
