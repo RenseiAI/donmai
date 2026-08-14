@@ -57,8 +57,23 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
+      # SECURITY (CREEP-class cache poisoning, CVE-2025-36852 pattern; see
+      # worker-image-pr.yml for the full finding): this action's sticky disk
+      # is scoped by `cache-key`, which neither this workflow nor
+      # worker-image-pr.yml used to set — both fell back to the same implicit
+      # default key, so the untrusted PR build and this release build shared
+      # one persistent layer cache. worker-image-pr.yml no longer touches a
+      # Blacksmith sticky disk at all, but any layers a PR run already wrote
+      # under that old implicit default key could still be sitting in it.
+      # Pin an explicit cache-key here that no prior run (PR or release) has
+      # ever used, so this build's cache is provably seeded only by trusted
+      # push/tag builds from this point forward — a one-time invalidation.
+      # To force another invalidation later (e.g. after a compromised build),
+      # bump the suffix (-v2, -v3, ...).
       - name: Setup Blacksmith Builder
         uses: useblacksmith/setup-docker-builder@33803e640bd9d674f2843a8c323aa2a7da478d23 # v2.0.0
+        with:
+          cache-key: donmai/worker-image-release-v1
 
       - name: Log in to GHCR
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
