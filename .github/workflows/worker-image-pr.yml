@@ -32,22 +32,36 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
-      # setup-docker-builder mounts a persistent buildkit state dir (a
-      # Blacksmith "sticky disk", keyed per Dockerfile) at /var/lib/buildkit and
-      # commits it back at end of job, so layers already persist across runs
-      # without any cache-from/cache-to. Blacksmith's own guidance: "Any
-      # external caching that was configured with cache-from and cache-to
-      # directives can now be removed."
-      - name: Setup Blacksmith Builder
-        uses: useblacksmith/setup-docker-builder@33803e640bd9d674f2843a8c323aa2a7da478d23 # v2.0.0
+      # SECURITY (CREEP-class cache poisoning, CVE-2025-36852 pattern):
+      # useblacksmith/setup-docker-builder mounts a persistent BuildKit state
+      # dir (a Blacksmith "sticky disk") at /var/lib/buildkit and commits it
+      # back at the end of every job. Confirmed against the pinned action's
+      # own action.yml/README (useblacksmith/setup-docker-builder@33803e6,
+      # tag v2.0.0): the sticky disk is scoped by an explicit `cache-key`
+      # input, NOT by git ref/trust level, and when `cache-key` is omitted
+      # (as both this workflow and worker-image.yml previously did) it falls
+      # back to an implicit default derived from the Dockerfile path — the
+      # SAME implicit key worker-image.yml (the release build, on push tags
+      # v*) also fell back to. That meant an untrusted PR build here and the
+      # trusted release build shared one persistent layer cache: a PR build
+      # could seed layers the release build would later reuse without ever
+      # rebuilding them. There is no input to disable the sticky disk on this
+      # action — persistence is the entire point of it — so PR builds no
+      # longer use it at all: plain, ephemeral docker/setup-buildx-action +
+      # docker/build-push-action below, no cache-from/cache-to, no state
+      # survives the job. worker-image.yml keeps the fast Blacksmith path but
+      # now pins its own explicit cache-key (see that file) so its cache can
+      # only ever have been seeded by trusted push/tag builds.
+      #
+      # This makes PR builds slower (no warm cache) than before. That's an
+      # accepted tradeoff: PR validation only needs to prove the image
+      # BUILDS, it does not need cache warmth, and it must never be able to
+      # influence what a release publishes.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      # The `type=gha` exporter that used to live here was pure overhead on top
-      # of that sticky disk: `exporting to GitHub Actions Cache` measured 247.7s
-      # of a 442s step in run 30196904421 — 56% of the job — re-uploading every
-      # layer of every stage (mode=max) over the network on each PR, to seed a
-      # cache the Blacksmith builder was not the one reading from.
       - name: Build worker image
-        uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: worker/Dockerfile

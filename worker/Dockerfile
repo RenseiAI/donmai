@@ -111,10 +111,25 @@ ENV GOTOOLCHAIN=local GOFLAGS=-mod=mod
 # the Gemini REST API directly with no external subprocess. The build stage
 # always compiles from source, so the latest provider/gemini code ships with
 # every image rebuild triggered by a release tag.
+#
+# SECURITY (CREEP-class cache poisoning, CVE-2025-36852 pattern): these two
+# versions are pinned deliberately, not just for reproducibility. An unpinned
+# `npm i -g pkg` has instruction text that never changes, so BuildKit's cache
+# key for this RUN layer never changes either — whatever got resolved on the
+# FIRST build (which, before the worker-image-pr.yml / worker-image.yml cache
+# split, could have been an untrusted PR build sharing the release's layer
+# cache) is what every later build would silently keep reusing forever, even
+# after a newer/patched package published upstream. Pinning folds the version
+# into the instruction text, so it's part of the cache key: bumping it here is
+# the supported way to force a real, verifiable re-fetch instead of a floating
+# `latest` a stale cached layer can quietly stand in for.
+#
+# To bump: `npm view @anthropic-ai/claude-code version` /
+# `npm view @openai/codex version`, then update the versions below.
 COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:22-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
-    && npm i -g @anthropic-ai/claude-code @openai/codex \
+    && npm i -g @anthropic-ai/claude-code@2.1.232 @openai/codex@0.147.0 \
     && npm cache clean --force
 
 # Baked code-survival TS reachability script + its pre-installed node_modules.
