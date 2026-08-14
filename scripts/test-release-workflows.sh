@@ -255,15 +255,33 @@ if ! grep -Eq '^[[:space:]]*uses: actions/checkout@[0-9a-f]{40}( |$)' "${pr_work
   fail 'PR worker workflow checkout action is not pinned to a commit SHA'
 fi
 
-for action in \
-  docker/setup-qemu-action \
-  useblacksmith/setup-docker-builder \
-  useblacksmith/build-push-action; do
+# CREEP isolation (CVE-2025-36852 class): the PR workflow must never touch the
+# persistent Blacksmith builder — its sticky-disk cache is cache-key-scoped,
+# not ref-scoped, so a pull_request build could seed layers the tag-triggered
+# release build silently reuses. PR builds use plain, non-persistent buildx.
+if grep -Eq '^[[:space:]]*uses:[[:space:]]*useblacksmith/' "${pr_workflow}"; then
+  fail 'PR worker workflow must not use the persistent Blacksmith builder (CREEP isolation)'
+fi
+for action in docker/setup-buildx-action docker/build-push-action; do
+  pr_ref=$(grep -Eo "${action}@[0-9a-f]{40}" "${pr_workflow}")
+  [[ -n "${pr_ref}" ]] || fail "PR worker workflow does not pin ${action}"
+done
+
+# Actions shared by both workflows still pin identical SHAs.
+for action in docker/setup-qemu-action; do
   release_ref=$(grep -Eo "${action}@[0-9a-f]{40}" "${worker_workflow}")
   pr_ref=$(grep -Eo "${action}@[0-9a-f]{40}" "${pr_workflow}")
   [[ -n "${release_ref}" ]] || fail "release worker workflow does not pin ${action}"
   [[ "${pr_ref}" == "${release_ref}" ]] || fail "PR worker workflow does not reuse ${release_ref}"
 done
+
+# The release workflow keeps its pinned persistent builder and, post-isolation,
+# an explicit cache-key so its cache lineage starts from trusted builds only.
+for action in useblacksmith/setup-docker-builder useblacksmith/build-push-action; do
+  release_ref=$(grep -Eo "${action}@[0-9a-f]{40}" "${worker_workflow}")
+  [[ -n "${release_ref}" ]] || fail "release worker workflow does not pin ${action}"
+done
+grep -Eq '^[[:space:]]+cache-key:' "${worker_workflow}" || fail 'release worker workflow does not pin an explicit sticky-disk cache-key'
 
 # The E2B build wrapper must pass the versioned target on every build and add
 # the rolling default only when requested by an automatic tag push.
