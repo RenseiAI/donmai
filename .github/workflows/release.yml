@@ -25,7 +25,185 @@ permissions:
   attestations: write
 
 jobs:
+  # W0(release-gate): before this job existed, release.yml ran GoReleaser
+  # only — nothing between a `v*` tag push and a published Homebrew cask
+  # ever ran a test or a smoke, so a broken pi RPC/extension protocol (the
+  # exact regression donmai#215 had to fix by hand, after it had already
+  # shipped) could ride a tag straight to `brew upgrade donmai` undetected.
+  # This job runs the donmai-smokes suite — the SAME suite
+  # .github/workflows/test.yml already runs on every PR/push/nightly —
+  # against the EXACT tagged ref about to release (never against main), and
+  # `release` below `needs:` it: a red harness-smoke blocks the publish.
+  harness-smoke:
+    name: harness-smoke (donmai-smokes @ main, tag under test)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # The tagged ref under test, checked out the same way the release job
+      # below resolves it (namespace-qualified on workflow_dispatch so a
+      # same-name branch cannot win ref resolution — mirrors "Checkout
+      # release tag" further down).
+      - name: Checkout donmai (tag under test)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          path: donmai
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      # donmai-smokes is the harness, pinned to main (it is OSS-public and
+      # has no release train of its own) — mirrors test.yml's two-repo
+      # layout, just with the roles of "primary checkout" and "sibling under
+      # test" swapped: here donmai-smokes is fixed and the tagged donmai ref
+      # is the thing being proven.
+      - name: Checkout donmai-smokes (harness, @main)
+        uses: actions/checkout@v7
+        with:
+          repository: RenseiAI/donmai-smokes
+          ref: main
+          fetch-depth: 1
+          path: donmai-smokes
+
+      - name: Record donmai ref under test
+        working-directory: donmai
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          subject="$(git log -1 --pretty=%s)"
+          {
+            echo "### donmai under test (release-gate, tagged build)"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| SHA | \`${sha}\` |"
+            echo "| subject | ${subject} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "DONMAI_SHA_UNDER_TEST=${sha}" >> "$GITHUB_ENV"
+          echo "donmai under test: ${sha} — ${subject}"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: donmai-smokes/go.mod
+          cache: true
+          cache-dependency-path: donmai-smokes/go.mod
+
+      # `pi` (step20) and `opencode` (step18) are both `#!/usr/bin/env node`
+      # scripts their respective harness/*_install.go helpers install
+      # on-demand via npm when not already on PATH — node here is what keeps
+      # step20's real-binary tests from DeclineLive-ing on a runner that
+      # otherwise has no node at all (see test.yml for the full rationale).
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Pre-build donmai binary (fail fast on a broken tagged build)
+        working-directory: donmai
+        run: |
+          set -euo pipefail
+          if ! GOWORK= go build -o "${RUNNER_TEMP}/donmai-prebuild" ./cmd/donmai; then
+            echo "::error::donmai@${DONMAI_SHA_UNDER_TEST} (the tag under test) failed to build — release blocked before the smoke suite even ran."
+            exit 1
+          fi
+          echo "donmai@${DONMAI_SHA_UNDER_TEST} build OK"
+
+      - name: go vet (donmai-smokes)
+        working-directory: donmai-smokes
+        run: go vet ./...
+
+      # GOWORK=off matches donmai-smokes' own gate (`make test`) and
+      # test.yml. -v is piped to a log file so the guard steps below can
+      # assert specific canaries actually reported PASS rather than SKIP —
+      # `go test` exits 0 for both, so exit status alone cannot tell a real
+      # regression from a lane that quietly stopped running.
+      - name: go test (donmai-smokes, full suite incl. step20 pi lane)
+        working-directory: donmai-smokes
+        run: |
+          set -o pipefail
+          GOWORK=off go test -race -v ./... -timeout 20m 2>&1 | tee "${RUNNER_TEMP}/gotest.log"
+
+      - name: Test outcome tally (pass / fail / skip)
+        if: always()
+        working-directory: donmai-smokes
+        run: |
+          set -uo pipefail
+          LOG="${RUNNER_TEMP}/gotest.log"
+          if [ ! -f "$LOG" ]; then
+            echo "no gotest.log (suite did not run) — nothing to tally"
+            exit 0
+          fi
+          pass=$(grep -cE '^\s*--- PASS: ' "$LOG" || true)
+          fail=$(grep -cE '^\s*--- FAIL: ' "$LOG" || true)
+          skip=$(grep -cE '^\s*--- SKIP: ' "$LOG" || true)
+          {
+            echo "### Test outcomes (harness-smoke) — includes subtests"
+            echo
+            echo "| PASS | FAIL | SKIP |"
+            echo "| ---: | ---: | ---: |"
+            echo "| ${pass} | ${fail} | ${skip} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$skip" -gt 0 ]; then
+            {
+              echo
+              echo "<details><summary>${skip} skipped test(s)</summary>"
+              echo
+              echo '```'
+              grep -E '^\s*--- SKIP: ' "$LOG" | sed -E 's/^[[:space:]]*--- SKIP: //' | sort
+              echo '```'
+              echo
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "outcomes: PASS=${pass} FAIL=${fail} SKIP=${skip}"
+          grep -E '^\s*--- SKIP: ' "$LOG" || true
+
+      # Same daemon-lifecycle canary test.yml gates on: this suite's whole
+      # reason for existing is to run the live daemon, so a SKIP here means
+      # the release-gate suite proved nothing even though `go test` exited 0.
+      - name: Guard — daemon-lifecycle smoke must actually execute
+        working-directory: donmai-smokes
+        run: |
+          LOG="${RUNNER_TEMP}/gotest.log"
+          if grep -Eq '^\s*--- SKIP: TestAfDaemonLifecycle\b' "$LOG"; then
+            echo "::error::TestAfDaemonLifecycle SKIPPED — the live-daemon lifecycle smoke did not run against donmai@${DONMAI_SHA_UNDER_TEST:-unknown} (the tag under test). Release blocked."
+            exit 1
+          fi
+          if ! grep -Eq '^\s*--- PASS: TestAfDaemonLifecycle\b' "$LOG"; then
+            echo "::error::TestAfDaemonLifecycle did not report PASS — daemon-lifecycle coverage did not execute against donmai@${DONMAI_SHA_UNDER_TEST:-unknown}. Release blocked."
+            exit 1
+          fi
+          echo "Gate-liveness OK: daemon-lifecycle canary executed (PASS observed, no SKIP)."
+
+      # The load-bearing addition for this Wave: the pi harness real-binary
+      # lane (step20) is the coverage that would have caught donmai#215's
+      # protocol gap BEFORE a tag shipped rather than after. It sits behind
+      # four independent skip paths (see test.yml's identical guard for the
+      # full list) — a silent SKIP on any of them must block the release,
+      # not just get logged.
+      - name: Guard — pi harness real-binary lane must actually execute
+        working-directory: donmai-smokes
+        run: |
+          LOG="${RUNNER_TEMP}/gotest.log"
+          fail=0
+          for name in TestPiHarnessSmoke_RealBinary_HandshakeCompletes \
+                      TestPiHarnessSmoke_RealBinary_Teardown \
+                      TestPiHarnessSmoke_RealBinary_CompletedTurn; do
+            if grep -Eq "^\s*--- SKIP: ${name}\b" "$LOG"; then
+              echo "::error::${name} SKIPPED against donmai@${DONMAI_SHA_UNDER_TEST:-unknown} (the tag under test) — the pi harness real-binary lane did not run. This is the exact silent-skip shape that let a broken pi protocol ship undetected before. Release blocked."
+              fail=1
+            elif ! grep -Eq "^\s*--- PASS: ${name}\b" "$LOG"; then
+              echo "::error::${name} did not report PASS against donmai@${DONMAI_SHA_UNDER_TEST:-unknown} — pi harness real-binary coverage did not execute. Release blocked."
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Gate-liveness OK: pi harness real-binary lane executed against the tag under test (PASS observed for all 3 canaries, no SKIP)."
+
   release:
+    needs: harness-smoke
     # macOS runner is required for codesign + xcrun notarytool.
     # Cross-compile to linux/amd64 + linux/arm64 still works from darwin via
     # CGO_ENABLED=0 (set in .goreleaser.yaml).
