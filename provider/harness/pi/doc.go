@@ -114,11 +114,13 @@
 // — that row proves real registerTool delivery against the pinned binary;
 // this row proves the SAME AdditionalExtensions list is admitted and
 // receipted through the generic cross-harness-compiled plan/receipt path
-// before it ever reaches pi's own materializer, and denies closed on a
-// harness/mode whose profile does not declare the channel (interactive PTY
-// stays Unsupported — no fixture proves tool registration through that lane
-// yet, so it declares the gap per D6 rather than inheriting headless
-// evidence). Generic-path fixtures:
+// before it ever reaches pi's own materializer, and — on a harness/mode whose
+// profile does not declare the channel — denies closed when the batch carries
+// any required delivery, or drops an all-advisory batch with a receipt and
+// strips it from the adapted Spec (ExtensionDelivery.Required decides;
+// interactive PTY stays Unsupported — no fixture proves tool registration
+// through that lane yet, so it declares the gap per D6 rather than inheriting
+// headless evidence). Generic-path fixtures:
 // agent/tool_adaptation_test.go —
 // TestToolLifecyclePiAdditionalExtensionsRouteThroughGenericToolPluginChannel
 // (positive: headless admits + receipts; negative: interactive denies by

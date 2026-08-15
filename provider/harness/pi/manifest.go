@@ -55,8 +55,10 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// ToolPluginDelivery: Unsupported (no fixture proves tool
 			// registration through that lane yet — ADR-2026-08-06 D6:
 			// interactive evidence never inherits headless), so a caller
-			// that hands pi's PTY spawn mode an AdditionalExtensions list
-			// denies closed rather than silently loading it unevidenced.
+			// that hands pi's PTY spawn mode a required AdditionalExtensions
+			// delivery denies closed, and an all-advisory batch is dropped
+			// with a receipt at the generic plan layer — never silently
+			// loaded unevidenced either way.
 			SupportsToolPlugins:     true,
 			AcceptsMcpServerSpec:    false, // pi has no MCP by design; Spec.MCPServers is capability-gated-ignored
 			AcceptsAllowedToolsList: true,  // enforced by OUR policy extension, not by pi
@@ -157,10 +159,14 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				// ToolPluginDelivery stays Unsupported for the same reason:
 				// materializeAdditionalExtensions runs in this lane too
 				// (interactive.go), but no real-binary fixture proves tool
-				// registration through it, so a caller handing this spawn
-				// mode an AdditionalExtensions list denies closed at the
-				// generic plan layer instead of loading unevidenced — the
-				// headless profile's flip does not carry over.
+				// registration through it, so the generic plan layer answers
+				// per the batch's declared posture instead of loading
+				// unevidenced: a batch carrying any required delivery denies
+				// closed, and an all-advisory batch is dropped with a
+				// receipt and stripped from the adapted Spec
+				// (dropDeniedAdvisoryExtensions) before this lane's
+				// materializer ever sees it — the headless profile's flip
+				// does not carry over.
 				//
 				// NativeToolPolicyDelivery is REAL, though, and for a different
 				// reason than the injected-boundary claim above stays a gap. The

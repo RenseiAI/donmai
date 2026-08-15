@@ -469,7 +469,7 @@ func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLife
 	}
 
 	receipt.Decision = "ready"
-	return spec, receipt, nil
+	return dropDeniedAdvisoryExtensions(spec, receipt.Entries), receipt, nil
 }
 
 // toolDesignatorRe matches the tool-designator permission grammar:
@@ -620,18 +620,68 @@ func legacyToolRequirements(spec Spec, profile ToolLifecycleProfile) []toolRequi
 		// historically applied by the exact harness adapter with no plan/
 		// receipt entry at all — silently inert everywhere the seam is not
 		// implemented, silently effective on pi with no truthful record either
-		// way. Projecting it as a required tool_plugin entry closes both
-		// gaps the same way every other legacy field above does: a harness
-		// whose profile declares ToolPluginDelivery admits and receipts it: a
-		// harness whose profile does not now denies closed instead of quietly
-		// dropping a capability the caller was told it had (D1.2's fail-closed
-		// rule applied at the plan layer, not just inside pi's own
-		// materializer). Always required — D1.2: "every delivery this Wave-1
-		// seam accepts is treated as required regardless of [Required]'s
-		// value."
-		out = append(out, toolRequirement{id: "additional-extensions", channel: ToolChannelToolPlugin, required: true, delivery: profile.ToolPluginDelivery, digest: digestToolInput(additionalExtensionDigestInput(spec.AdditionalExtensions))})
+		// way. Projecting it as a tool_plugin entry closes both gaps the same
+		// way every other legacy field above does: a harness whose profile
+		// declares ToolPluginDelivery admits and receipts it; one whose
+		// profile does not answers per the batch's declared posture. The
+		// entry's required flag derives from the deliveries themselves
+		// (ExtensionDelivery.Required): a batch carrying ANY load-bearing
+		// delivery is required and denies closed where the channel is
+		// undeliverable — D1.2's fail-closed rule ("a delivery whose
+		// capability was granted is required, and fails closed") applied at
+		// the plan layer, not just inside pi's own materializer — while an
+		// all-advisory batch (every Required false) projects a non-required
+		// entry that takes the standard optional-undeliverable lane in the
+		// requirement loop: recorded on the receipt (Outcome: denied,
+		// Required: false), dropped from the adapted Spec
+		// (dropDeniedAdvisoryExtensions), and the spawn proceeds
+		// degraded-but-honest without it.
+		out = append(out, toolRequirement{id: additionalExtensionsEntryID, channel: ToolChannelToolPlugin, required: anyExtensionDeliveryRequired(spec.AdditionalExtensions), delivery: profile.ToolPluginDelivery, digest: digestToolInput(additionalExtensionDigestInput(spec.AdditionalExtensions))})
 	}
 	return out
+}
+
+// additionalExtensionsEntryID is the plan/receipt entry id under which a
+// populated Spec.AdditionalExtensions batch is projected onto the tool_plugin
+// channel. Shared between the compiler (legacyToolRequirements) and the
+// receipt-keyed drop (dropDeniedAdvisoryExtensions) so the two can never
+// disagree about which entry they describe.
+const additionalExtensionsEntryID = "additional-extensions"
+
+// anyExtensionDeliveryRequired reports whether any delivery in the batch is
+// load-bearing (ExtensionDelivery.Required). One required delivery makes the
+// whole additional-extensions entry required: the plan projects the batch as
+// a single tool_plugin entry, and a profile that cannot deliver the channel
+// cannot deliver any subset of the batch either.
+func anyExtensionDeliveryRequired(deliveries []ExtensionDelivery) bool {
+	for _, delivery := range deliveries {
+		if delivery.Required {
+			return true
+		}
+	}
+	return false
+}
+
+// dropDeniedAdvisoryExtensions clears Spec.AdditionalExtensions when the
+// compiled entries record the batch's entry as denied-but-optional — the
+// optional-undeliverable outcome the requirement loop emits for an
+// all-advisory batch on a profile whose tool_plugin channel is Unsupported.
+// The receipt stays the truthful record of what was requested and refused
+// (its entry and InputDigest are untouched); the SPEC drop is what keeps that
+// record consistent downstream: the exact harness adapter materializes
+// spec.AdditionalExtensions without re-consulting the plan (pi's interactive
+// lane does so unconditionally), so a delivery the plan refused must never
+// still be riding the Spec the compiler returns. Keyed on the receipt entries
+// rather than re-derived from the profile so ApplyPreparedHarness reproduces
+// the exact same drop from the host-persisted receipt.
+func dropDeniedAdvisoryExtensions(spec Spec, entries []ToolLifecycleEntry) Spec {
+	for _, entry := range entries {
+		if entry.ID == additionalExtensionsEntryID && entry.Channel == ToolChannelToolPlugin && !entry.Required && entry.Outcome == ToolOutcomeDenied {
+			spec.AdditionalExtensions = nil
+			return spec
+		}
+	}
+	return spec
 }
 
 // additionalExtensionDigestInput reduces spec.AdditionalExtensions to

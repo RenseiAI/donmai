@@ -89,12 +89,19 @@ type ExtensionDelivery struct {
 
 	// Required marks the delivery load-bearing: per D1.2, a required
 	// delivery that cannot be materialized, verified, or loaded denies spawn
-	// closed, before credential delivery, with no warn-and-strip path. Every
-	// delivery this Wave-1 seam accepts is treated as required regardless of
-	// this field's value — there is no admission system yet that grants an
-	// OPTIONAL delivery a graceful-downgrade path — so Required is carried
-	// for forward compatibility and self-documentation rather than branched
-	// on today.
+	// closed, before credential delivery, with no warn-and-strip path. The
+	// tool-lifecycle plan compiler derives the additional-extensions entry's
+	// required flag from this field (legacyToolRequirements in
+	// tool_adaptation.go): a batch carrying ANY required delivery denies the
+	// spawn closed on a profile whose tool_plugin channel is Unsupported,
+	// while an all-advisory batch (every Required false) is dropped with a
+	// receipt instead — the standard optional-undeliverable entry (Outcome:
+	// denied, Required: false), the deliveries stripped from the adapted
+	// Spec, and the spawn proceeding degraded-but-honest without them.
+	// Advisory means droppable-when-undeliverable, never loadable-unverified:
+	// once a delivery IS attached on a deliverable profile, the exact harness
+	// adapter's materialization and digest verification still fail closed
+	// regardless of this field.
 	Required bool `json:"required,omitempty"`
 }
 

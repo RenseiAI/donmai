@@ -55,7 +55,11 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// Materialize + digest-verify spec.AdditionalExtensions the SAME way the
 	// headless lane does (ADR-2026-08-12 D1 is host-agnostic across spawn
 	// modes): a required delivery that cannot be materialized or verified
-	// denies spawn closed, before the child ever starts.
+	// denies spawn closed, before the child ever starts. In practice this
+	// lane's profile declares ToolPluginDelivery: Unsupported, so the plan
+	// compiler already refused (required batch) or dropped-and-stripped
+	// (all-advisory batch) any deliveries before prepare() returned — the
+	// list here is empty and this call is the belt-and-suspenders half.
 	extraPaths, err := materializeAdditionalExtensions(layout, spec.AdditionalExtensions)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
