@@ -142,7 +142,7 @@ func TestUpdateRuntimeCredentials_LeavesSessionMCPBearerIntact(t *testing.T) {
 		McpAuthTokenExpiresAt: sessionMCPExpiryFixture,
 	})
 
-	store.UpdateRuntimeCredentials("worker_2", "fresh-worker-bearer")
+	store.UpdateRuntimeCredentials("worker_1", "worker_2", "fresh-worker-bearer")
 
 	got, ok := store.Get("sess_1")
 	if !ok {

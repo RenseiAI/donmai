@@ -6,6 +6,26 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Fixes
+
+- **A runtime-credential refresh no longer overwrites the sessions of other
+  worker identities.** One daemon process can serve several worker identities
+  — a host admitted to more than one organisation holds a registration per
+  organisation, each refreshing its runtime token on its own schedule while
+  every identity's sessions share the daemon's one session-detail store. The
+  refresh swept that store unconditionally, so one identity's routine refresh
+  stamped its own worker id and bearer onto every other identity's sessions;
+  those children then presented the wrong identity on each subsequent platform
+  call and were rejected for the rest of their lives, while the refreshing
+  identity's own sessions looked healthy. The refresh is now scoped to the
+  identity being refreshed, and `Daemon.UpdateSessionRuntimeCredentials`
+  exports the same scoped update so an embedding binary can fan a
+  re-registered identity's credentials to exactly its own sessions.
+
+---
+
 ## v0.57.12 — 2026-08-11
 
 ### Fixes

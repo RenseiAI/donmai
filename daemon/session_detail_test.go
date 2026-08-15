@@ -79,7 +79,9 @@ func TestSessionDetailStore_UpdateRuntimeCredentials(t *testing.T) {
 	s.Set(&SessionDetail{SessionID: "sess-1", WorkerID: "wkr_old", AuthToken: "old-token"})
 	s.Set(&SessionDetail{SessionID: "sess-2", WorkerID: "wkr_old", AuthToken: "old-token"})
 
-	s.UpdateRuntimeCredentials("wkr_new", "fresh-token")
+	if updated := s.UpdateRuntimeCredentials("wkr_old", "wkr_new", "fresh-token"); updated != 2 {
+		t.Fatalf("UpdateRuntimeCredentials updated %d details, want 2", updated)
+	}
 
 	for _, id := range []string{"sess-1", "sess-2"} {
 		got, ok := s.Get(id)
@@ -89,6 +91,162 @@ func TestSessionDetailStore_UpdateRuntimeCredentials(t *testing.T) {
 		if got.WorkerID != "wkr_new" || got.AuthToken != "fresh-token" {
 			t.Fatalf("%s credentials = (%q, %q), want (wkr_new, fresh-token)", id, got.WorkerID, got.AuthToken)
 		}
+	}
+}
+
+// TestSessionDetailStore_UpdateRuntimeCredentials_IsWorkerScoped pins the
+// scope boundary a credential refresh must never cross.
+//
+// One daemon process can serve SEVERAL worker identities: a host admitted to
+// more than one organisation holds a registration per organisation, each
+// refreshes its runtime token on its own schedule, and every identity's
+// sessions share this one store. The sweep used to be unconditional, so one
+// identity's routine refresh overwrote the others' sessions with its own
+// worker id and bearer — those children then presented the wrong identity on
+// every subsequent platform call and were rejected for the rest of their
+// lives, while the refreshing identity's own sessions looked perfectly fine.
+//
+// The fixture is therefore two attributed identities plus one unattributed
+// detail, and every case asserts the FULL end state of all four rows: a scope
+// bug shows up as collateral damage on rows the call had no business touching,
+// which an assertion that only checks the intended rows cannot see.
+func TestSessionDetailStore_UpdateRuntimeCredentials_IsWorkerScoped(t *testing.T) {
+	t.Parallel()
+
+	type creds struct {
+		workerID  string
+		authToken string
+	}
+
+	// The seeded state, and therefore the baseline every unaffected row must
+	// still hold after the call under test.
+	seed := map[string]creds{
+		"sess-a1":     {workerID: "wkr_a", authToken: "token-a"},
+		"sess-a2":     {workerID: "wkr_a", authToken: "token-a"},
+		"sess-b1":     {workerID: "wkr_b", authToken: "token-b"},
+		"sess-orphan": {workerID: "", authToken: "token-orphan"},
+	}
+
+	tests := []struct {
+		name         string
+		prevWorkerID string
+		workerID     string
+		authToken    string
+		wantUpdated  int
+		// changed lists only the rows expected to move; every row absent from
+		// it must still equal its seeded value.
+		changed map[string]creds
+	}{
+		{
+			name:         "in-place refresh touches only its own identity",
+			prevWorkerID: "wkr_a",
+			workerID:     "wkr_a",
+			authToken:    "fresh-a",
+			wantUpdated:  2,
+			changed: map[string]creds{
+				"sess-a1": {workerID: "wkr_a", authToken: "fresh-a"},
+				"sess-a2": {workerID: "wkr_a", authToken: "fresh-a"},
+			},
+		},
+		{
+			name:         "re-registration moves its own sessions to the new identity",
+			prevWorkerID: "wkr_a",
+			workerID:     "wkr_a_reregistered",
+			authToken:    "fresh-a",
+			wantUpdated:  2,
+			changed: map[string]creds{
+				"sess-a1": {workerID: "wkr_a_reregistered", authToken: "fresh-a"},
+				"sess-a2": {workerID: "wkr_a_reregistered", authToken: "fresh-a"},
+			},
+		},
+		{
+			name:         "the other identity refreshes independently",
+			prevWorkerID: "wkr_b",
+			workerID:     "wkr_b",
+			authToken:    "fresh-b",
+			wantUpdated:  1,
+			changed: map[string]creds{
+				"sess-b1": {workerID: "wkr_b", authToken: "fresh-b"},
+			},
+		},
+		{
+			name:         "an unscoped call is refused rather than fanned out",
+			prevWorkerID: "",
+			workerID:     "wkr_a",
+			authToken:    "fresh-a",
+			wantUpdated:  0,
+		},
+		{
+			name:         "an unattributed detail is never adopted by a refresh",
+			prevWorkerID: "wkr_unknown",
+			workerID:     "wkr_unknown",
+			authToken:    "fresh-unknown",
+			wantUpdated:  0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newSessionDetailStore()
+			for id, c := range seed {
+				s.Set(&SessionDetail{SessionID: id, WorkerID: c.workerID, AuthToken: c.authToken})
+			}
+
+			got := s.UpdateRuntimeCredentials(tc.prevWorkerID, tc.workerID, tc.authToken)
+			if got != tc.wantUpdated {
+				t.Errorf("UpdateRuntimeCredentials updated %d details, want %d", got, tc.wantUpdated)
+			}
+
+			for id, base := range seed {
+				want := base
+				if c, ok := tc.changed[id]; ok {
+					want = c
+				}
+				detail, ok := s.Get(id)
+				if !ok {
+					t.Fatalf("%s: detail vanished", id)
+				}
+				if detail.WorkerID != want.workerID || detail.AuthToken != want.authToken {
+					t.Errorf("%s credentials = (%q, %q), want (%q, %q)",
+						id, detail.WorkerID, detail.AuthToken, want.workerID, want.authToken)
+				}
+			}
+		})
+	}
+}
+
+// TestDaemonUpdateSessionRuntimeCredentials covers the exported seam an
+// embedding binary drives from its own per-identity re-registration path, for
+// the worker identities the daemon does not own itself.
+func TestDaemonUpdateSessionRuntimeCredentials(t *testing.T) {
+	t.Parallel()
+
+	d := New(Options{})
+	d.sessionDetails.Set(&SessionDetail{SessionID: "sess-own", WorkerID: "wkr_own", AuthToken: "token-own"})
+	d.sessionDetails.Set(&SessionDetail{SessionID: "sess-guest", WorkerID: "wkr_guest", AuthToken: "token-guest"})
+
+	if got := d.UpdateSessionRuntimeCredentials("wkr_guest", "wkr_guest_2", "fresh-guest"); got != 1 {
+		t.Fatalf("UpdateSessionRuntimeCredentials updated %d details, want 1", got)
+	}
+
+	guest, ok := d.SessionDetail("sess-guest")
+	if !ok {
+		t.Fatal("guest detail vanished")
+	}
+	if guest.WorkerID != "wkr_guest_2" || guest.AuthToken != "fresh-guest" {
+		t.Errorf("guest credentials = (%q, %q), want (wkr_guest_2, fresh-guest)",
+			guest.WorkerID, guest.AuthToken)
+	}
+
+	own, ok := d.SessionDetail("sess-own")
+	if !ok {
+		t.Fatal("own detail vanished")
+	}
+	if own.WorkerID != "wkr_own" || own.AuthToken != "token-own" {
+		t.Errorf("the daemon's own session was modified by another identity's refresh: (%q, %q)",
+			own.WorkerID, own.AuthToken)
 	}
 }
 
