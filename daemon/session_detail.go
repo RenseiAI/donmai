@@ -512,18 +512,41 @@ func (s *sessionDetailStore) Get(id string) (*SessionDetail, bool) {
 	return detail, ok
 }
 
-// UpdateRuntimeCredentials refreshes the worker credentials exposed to every
-// active child process via /api/daemon/sessions/<id>. The daemon calls this
-// after preserving workerId through a runtime-token refresh so long-running
-// children do not keep using an expired bearer token.
-func (s *sessionDetailStore) UpdateRuntimeCredentials(workerID, authToken string) {
-	if workerID == "" && authToken == "" {
-		return
+// UpdateRuntimeCredentials refreshes the worker credentials exposed to the
+// active child processes of ONE worker identity via /api/daemon/sessions/<id>.
+// The daemon calls this after a runtime-token refresh so long-running children
+// do not keep presenting an expired bearer token.
+//
+// The update is SCOPED to prevWorkerID: only details whose WorkerID matches it
+// are touched, and that scope is the whole point of this signature. A single
+// daemon process can serve SEVERAL worker identities at once — a host admitted
+// to more than one organisation registers once per organisation, and an
+// embedding binary drives a credential refresher per identity while every
+// identity's sessions land in this one store. An unscoped sweep lets identity
+// A's hourly refresh stamp A's bearer onto identity B's sessions; B's children
+// then present the wrong identity's token on every subsequent platform call
+// and are correctly rejected for the rest of their lives.
+//
+// prevWorkerID is the identity the sessions were claimed under, which is not
+// necessarily the identity they end up on: a refresh that had to fall back to
+// a full re-registration returns a NEW workerID, and re-stamping those rows
+// onto it is exactly how a re-registered identity keeps its own children
+// alive. When the refresh preserved the identity, prevWorkerID == workerID and
+// only the token moves.
+//
+// An empty prevWorkerID updates nothing, and a detail stored without a
+// WorkerID is never adopted by any refresh: nothing attributes it to the
+// refreshing identity, and guessing is the defect this scope exists to
+// prevent. Reports how many details were updated.
+func (s *sessionDetailStore) UpdateRuntimeCredentials(prevWorkerID, workerID, authToken string) int {
+	if prevWorkerID == "" || (workerID == "" && authToken == "") {
+		return 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	updated := 0
 	for _, d := range s.details {
-		if d == nil {
+		if d == nil || d.WorkerID != prevWorkerID {
 			continue
 		}
 		if workerID != "" {
@@ -532,7 +555,9 @@ func (s *sessionDetailStore) UpdateRuntimeCredentials(workerID, authToken string
 		if authToken != "" {
 			d.AuthToken = authToken
 		}
+		updated++
 	}
+	return updated
 }
 
 // Delete removes the detail for the given session id (idempotent).

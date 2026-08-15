@@ -860,12 +860,22 @@ func (d *Daemon) Start(ctx context.Context) error {
 			WorkerID:     regResp.WorkerID,
 			RuntimeJWT:   regResp.RuntimeToken,
 			OnRefreshed: func(result *RefreshTokenResult) {
+				// Capture the identity being superseded under the same lock that
+				// installs its replacement: it is the scope key for the session
+				// re-stamp below, and reading it afterwards would race a
+				// concurrent refresh into stamping the wrong generation.
 				d.mu.Lock()
+				prevWorkerID := d.workerID
 				d.workerID = result.WorkerID
 				d.jwt = result.RuntimeToken
 				d.mu.Unlock()
+				// Only the sessions claimed under THIS registration's identity.
+				// A process serving several worker identities keeps each one's
+				// children on their own bearer — see
+				// sessionDetailStore.UpdateRuntimeCredentials for what an
+				// unscoped sweep does to the identities this one does not own.
 				if d.sessionDetails != nil {
-					d.sessionDetails.UpdateRuntimeCredentials(result.WorkerID, result.RuntimeToken)
+					d.sessionDetails.UpdateRuntimeCredentials(prevWorkerID, result.WorkerID, result.RuntimeToken)
 				}
 			},
 		})
@@ -1770,6 +1780,34 @@ func (d *Daemon) SessionDetail(sessionID string) (*SessionDetail, bool) {
 		return nil, false
 	}
 	return d.sessionDetails.Get(sessionID)
+}
+
+// UpdateSessionRuntimeCredentials re-stamps the runtime credentials of the
+// stored session details attributed to prevWorkerID, and reports how many it
+// updated.
+//
+// This is the seam for an embedding binary that runs MORE than one worker
+// identity on a single daemon process. A host admitted to several
+// organisations holds a registration per organisation; each refreshes its own
+// runtime token on its own schedule, while all of their sessions share this
+// daemon's one session-detail store (they arrive through AcceptWorkWithDetail
+// carrying their own WorkerID and AuthToken). Wire this into the per-identity
+// re-registration path so a refresh reaches exactly that identity's children:
+// pass the worker id its sessions were claimed under as prevWorkerID and the
+// identity the refresh settled on as workerID. They are equal whenever the
+// refresh preserved the identity; they differ when it fell back to a full
+// re-registration, and passing both is what moves those sessions onto the new
+// identity instead of orphaning them on a retired one.
+//
+// The daemon's own registration is already wired this way internally — this
+// method exists for the identities the daemon does not own. Calling it for the
+// daemon's own identity is unnecessary and would double-stamp a refresh the
+// daemon has already applied.
+func (d *Daemon) UpdateSessionRuntimeCredentials(prevWorkerID, workerID, authToken string) int {
+	if d.sessionDetails == nil {
+		return 0
+	}
+	return d.sessionDetails.UpdateRuntimeCredentials(prevWorkerID, workerID, authToken)
 }
 
 // Update triggers a manual auto-update check.
