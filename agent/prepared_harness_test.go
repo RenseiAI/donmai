@@ -71,3 +71,63 @@ func TestPreparedHarnessIsSoleCallbackFreeProviderAuthority(t *testing.T) {
 		t.Fatal("authority-changing child mutation was accepted")
 	}
 }
+
+// TestPreparedHarnessDropsDeniedAdvisoryExtensionsOnApply pins the
+// host/child consistency of the advisory-extensions drop: a host that
+// compiles an all-advisory AdditionalExtensions batch against a profile whose
+// tool_plugin channel is Unsupported persists a "ready" plan whose receipt
+// records the drop (Outcome: denied, Required: false), and the child-side
+// application of that SAME plan strips the deliveries from the adapted Spec —
+// the exact adapter never sees a delivery the host-persisted receipt refused,
+// on either the direct or the prepared-harness lane.
+func TestPreparedHarnessDropsDeniedAdvisoryExtensionsOnApply(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	source := agent.Spec{
+		PromptMode: agent.PromptModeAutonomous,
+		Autonomous: true,
+		Model:      "gpt-test",
+		PromptPlan: &agent.PromptPlan{
+			ContractVersion:  agent.PromptContractVersion,
+			BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+			UserPrompt:       agent.PromptContent{ID: "actual-user-task", Text: "inspect the actual input", Required: true},
+		},
+		AdditionalExtensions: []agent.ExtensionDelivery{advisoryExtensionDelivery("pack-1")},
+	}
+	const operationalDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var materializations []agent.HarnessMaterialization
+	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+	}
+	plan, err := agent.CompilePreparedHarness(source, manifest, operationalDigest, nil, materializations)
+	if err != nil {
+		t.Fatalf("an all-advisory batch must compile, got %v", err)
+	}
+	if plan.ToolLifecycleReceipt.Decision != "ready" {
+		t.Fatalf("tool receipt decision = %q, want ready", plan.ToolLifecycleReceipt.Decision)
+	}
+	var found bool
+	for _, entry := range plan.ToolLifecycleReceipt.Entries {
+		if entry.ID != "additional-extensions" {
+			continue
+		}
+		found = true
+		if entry.Outcome != agent.ToolOutcomeDenied || entry.Required {
+			t.Fatalf("entry = %+v, want denied-but-non-required", entry)
+		}
+	}
+	if !found {
+		t.Fatalf("host plan must record the additional-extensions drop; entries=%+v", plan.ToolLifecycleReceipt.Entries)
+	}
+
+	materialized := source
+	materialized.Cwd = "/actual/worktree"
+	materialized.PreparedHarness = plan
+	adapted, err := agent.PrepareHarness(materialized, manifest)
+	if err != nil {
+		t.Fatalf("provider PrepareHarness application: %v", err)
+	}
+	if len(adapted.AdditionalExtensions) != 0 {
+		t.Fatalf("dropped deliveries must be stripped on the prepared-harness lane too, got %d riding", len(adapted.AdditionalExtensions))
+	}
+}

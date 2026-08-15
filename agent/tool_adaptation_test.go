@@ -765,7 +765,7 @@ func TestToolLifecyclePiAdditionalExtensionsRouteThroughGenericToolPluginChannel
 			t.Errorf("tool_plugin entry delivery = %q, want %q", entry.Delivery, agent.ToolDeliveryPiAdditionalExtension)
 		}
 		if !entry.Required {
-			t.Errorf("tool_plugin entry must be required (D1.2: every accepted delivery is required)")
+			t.Errorf("tool_plugin entry must be required (the fixture stamps Required: true; the entry's flag derives from the deliveries)")
 		}
 	}
 	if !found {
@@ -801,9 +801,10 @@ func TestToolLifecyclePiAdditionalExtensionsDenyOnInteractiveProfile(t *testing.
 // TestToolLifecycleAdditionalExtensionsDenyOnHarnessWithoutTheSeam is the
 // per-D5.5 negative half: there is still no cross-harness "supports
 // extensions" boolean. A caller that hands codex — a harness with no
-// host-side extension API at all — a populated AdditionalExtensions list
+// host-side extension API at all — a required AdditionalExtensions delivery
 // must deny by name at this generic layer, not fall through to a harness
-// that has nothing to attach the field to.
+// that has nothing to attach the field to. The error-text shape is pinned:
+// downstream operators recognize undeliverable-required failures by it.
 func TestToolLifecycleAdditionalExtensionsDenyOnHarnessWithoutTheSeam(t *testing.T) {
 	t.Parallel()
 	manifest := (&codex.Provider{}).Manifest()
@@ -813,8 +814,160 @@ func TestToolLifecycleAdditionalExtensionsDenyOnHarnessWithoutTheSeam(t *testing
 	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != agent.ToolChannelToolPlugin {
 		t.Fatalf("error = %v, want a typed tool_plugin denial (codex has no additional-extension seam)", err)
 	}
+	if want := `cannot apply required entry "additional-extensions"`; !strings.Contains(err.Error(), want) {
+		t.Fatalf("error text = %q, want it to contain %q", err.Error(), want)
+	}
 	if receipt.Decision != "denied" {
 		t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+	}
+}
+
+// advisoryExtensionDelivery is extensionDelivery with Required: false — the
+// advisory posture: a nice-to-have capability surface a session should start
+// without, degraded-but-honest, rather than be denied over, when the exact
+// profile cannot deliver the tool_plugin channel.
+func advisoryExtensionDelivery(id string) agent.ExtensionDelivery {
+	d := extensionDelivery(id)
+	d.Required = false
+	return d
+}
+
+// TestToolLifecycleAdvisoryAdditionalExtensionsDropWithReceiptWhereUndeliverable
+// is the advisory lane: an all-advisory batch (every ExtensionDelivery.Required
+// false) on a profile whose tool_plugin channel is Unsupported must NOT refuse
+// the spawn. It takes the same optional-undeliverable shape as
+// TestToolLifecycleMCPToolNamesUndeliverableIsRecordedNotFatal — a recorded
+// entry (Outcome: denied, Required: false) on a "ready" receipt — and the
+// deliveries are stripped from the adapted Spec so no exact adapter ever
+// materializes a delivery the plan refused (pi's interactive lane materializes
+// spec.AdditionalExtensions without re-consulting the plan).
+func TestToolLifecycleAdvisoryAdditionalExtensionsDropWithReceiptWhereUndeliverable(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		manifest agent.HarnessManifest
+		mode     agent.PromptSessionMode
+		spec     agent.Spec
+	}{
+		// codex has no host-side extension API in any mode.
+		{"codex headless", (&codex.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.Spec{
+			Autonomous:           true,
+			AdditionalExtensions: []agent.ExtensionDelivery{advisoryExtensionDelivery("pack-1")},
+		}},
+		// pi's interactive PTY profile declares the tool_plugin gap even
+		// though its headless profile delivers — the per-mode split of
+		// TestToolLifecyclePiAdditionalExtensionsDenyOnInteractiveProfile,
+		// now non-fatal for an advisory batch.
+		{"pi interactive", (&pi.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.Spec{
+			Interactive:          &agent.InteractiveSpec{},
+			AdditionalExtensions: []agent.ExtensionDelivery{advisoryExtensionDelivery("pack-1")},
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adapted, receipt, err := agent.AdaptToolLifecycle(tc.spec, mustProfile(t, tc.manifest, tc.mode))
+			if err != nil {
+				t.Fatalf("an all-advisory batch must not refuse the spawn, got %v", err)
+			}
+			if receipt.Decision != "ready" {
+				t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+			}
+			var found bool
+			for _, entry := range receipt.Entries {
+				if entry.ID != "additional-extensions" {
+					continue
+				}
+				found = true
+				if entry.Channel != agent.ToolChannelToolPlugin {
+					t.Errorf("entry channel = %q, want %q", entry.Channel, agent.ToolChannelToolPlugin)
+				}
+				if entry.Outcome != agent.ToolOutcomeDenied {
+					t.Errorf("entry outcome = %q, want denied-but-recorded", entry.Outcome)
+				}
+				if entry.Required {
+					t.Errorf("entry must be non-required for an all-advisory batch")
+				}
+				if entry.DenialCode != agent.ToolDenialDeliveryUnsupported {
+					t.Errorf("entry denial code = %q, want %q", entry.DenialCode, agent.ToolDenialDeliveryUnsupported)
+				}
+			}
+			if !found {
+				t.Fatalf("receipt must still record the additional-extensions entry; entries=%+v", receipt.Entries)
+			}
+			if len(adapted.AdditionalExtensions) != 0 {
+				t.Fatalf("dropped deliveries must be stripped from the adapted Spec, got %d riding", len(adapted.AdditionalExtensions))
+			}
+		})
+	}
+}
+
+// TestToolLifecycleMixedRequiredAndAdvisoryExtensionsDenyWhereUndeliverable
+// pins the batch posture: one required delivery makes the whole
+// additional-extensions entry required — the plan projects the batch as a
+// single tool_plugin entry, so an advisory rider never launders a required
+// delivery through the drop lane. Same typed denial and error-text shape as
+// an all-required batch.
+func TestToolLifecycleMixedRequiredAndAdvisoryExtensionsDenyWhereUndeliverable(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	spec := agent.Spec{
+		Autonomous: true,
+		AdditionalExtensions: []agent.ExtensionDelivery{
+			extensionDelivery("pack-required"),
+			advisoryExtensionDelivery("pack-advisory"),
+		},
+	}
+	_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	var adaptationErr *agent.ToolAdaptationError
+	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != agent.ToolChannelToolPlugin {
+		t.Fatalf("error = %v, want a typed tool_plugin denial (one required delivery makes the batch required)", err)
+	}
+	if want := `cannot apply required entry "additional-extensions"`; !strings.Contains(err.Error(), want) {
+		t.Fatalf("error text = %q, want it to contain %q", err.Error(), want)
+	}
+	if receipt.Decision != "denied" {
+		t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+	}
+}
+
+// TestToolLifecycleAdvisoryAdditionalExtensionsRideWhereDeliverable proves
+// the advisory flag changes nothing on a profile that DOES deliver the
+// channel: an all-advisory batch against pi's headless profile is admitted
+// and receipted exactly like a required one — Required: false recorded
+// truthfully on the entry — and the deliveries stay on the adapted Spec for
+// the exact adapter to materialize.
+func TestToolLifecycleAdvisoryAdditionalExtensionsRideWhereDeliverable(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	spec := agent.Spec{Autonomous: true, AdditionalExtensions: []agent.ExtensionDelivery{advisoryExtensionDelivery("pack-1")}}
+	adapted, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeAutonomous))
+	if err != nil {
+		t.Fatalf("AdaptToolLifecycle: %v", err)
+	}
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+	}
+	var found bool
+	for _, entry := range receipt.Entries {
+		if entry.Channel != agent.ToolChannelToolPlugin {
+			continue
+		}
+		found = true
+		if entry.Outcome != agent.ToolOutcomeAdmitted {
+			t.Errorf("tool_plugin entry outcome = %q, want admitted", entry.Outcome)
+		}
+		if entry.Delivery != agent.ToolDeliveryPiAdditionalExtension {
+			t.Errorf("tool_plugin entry delivery = %q, want %q", entry.Delivery, agent.ToolDeliveryPiAdditionalExtension)
+		}
+		if entry.Required {
+			t.Errorf("tool_plugin entry must record Required: false for an all-advisory batch")
+		}
+	}
+	if !found {
+		t.Fatalf("receipt must name the tool_plugin channel; entries=%+v", receipt.Entries)
+	}
+	if len(adapted.AdditionalExtensions) != 1 {
+		t.Fatalf("admitted deliveries must stay on the adapted Spec, got %d", len(adapted.AdditionalExtensions))
 	}
 }
 
