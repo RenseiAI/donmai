@@ -6,6 +6,24 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.62.0 — 2026-08-15
+
+### Fixes
+
+- **Advisory extension deliveries no longer fail spawns on harnesses that
+  cannot load them.** A `Spec.AdditionalExtensions` batch where every
+  `ExtensionDelivery.Required` is false now projects a non-required
+  tool-lifecycle entry: on a harness profile whose `tool_plugin` channel is
+  unsupported, the batch is recorded on the receipt (`Outcome: denied`,
+  `Required: false`), stripped from the adapted Spec, and the spawn proceeds
+  degraded-but-honest instead of being refused with `cannot apply required
+  entry "additional-extensions"`. A batch carrying any load-bearing
+  (`Required: true`) delivery still denies closed exactly as before — the
+  fail-closed rule for granted capabilities applies unchanged.
+  `ApplyPreparedHarness` reproduces the identical receipt-keyed drop on the
+  child side, so host and worker can never disagree about what was dropped.
+  (#348)
+
 ## v0.61.0 — 2026-08-15
 
 ### Features
