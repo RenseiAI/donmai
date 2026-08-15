@@ -6,7 +6,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
-## [Unreleased]
+## v0.61.0 — 2026-08-15
+
+### Features
+
+- **`Daemon.UpdateSessionRuntimeCredentials(prevWorkerID, workerID, authToken)`
+  exposes the scoped session-credential update to embedding binaries.** A
+  binary that runs more than one worker identity on a single daemon process
+  owns re-registration for the identities the daemon itself does not hold, and
+  had no way to reach those identities' stored session details. The new method
+  re-stamps exactly the sessions attributed to `prevWorkerID` and reports how
+  many it updated; passing both the superseded and the settled worker id is
+  what carries sessions onto a new identity when a refresh falls back to a full
+  re-registration instead of orphaning them on the retired one. The daemon's
+  own registration is already wired to the same scoped update internally.
 
 ### Fixes
 
@@ -20,9 +33,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   those children then presented the wrong identity on each subsequent platform
   call and were rejected for the rest of their lives, while the refreshing
   identity's own sessions looked healthy. The refresh is now scoped to the
-  identity being refreshed, and `Daemon.UpdateSessionRuntimeCredentials`
-  exports the same scoped update so an embedding binary can fan a
-  re-registered identity's credentials to exactly its own sessions.
+  identity being refreshed.
+
+### Chores
+
+- **A red harness smoke now blocks the release publish.** `release.yml` ran
+  GoReleaser with nothing between a `v*` tag push and a published Homebrew
+  cask, so a broken harness protocol could ride a tag straight to
+  `brew upgrade donmai`. A `harness-smoke` job the release job `needs:` checks
+  out the exact tagged ref, builds the binary from it, and runs the full
+  donmai-smokes suite; guard steps assert the daemon-lifecycle and pi
+  real-binary lanes actually report PASS rather than quietly SKIP.
+
+- **Worker-image PR builds are isolated from the release layer cache.** Both
+  the untrusted `pull_request` build and the trusted tag build shared one
+  persistent BuildKit sticky disk under the same implicit cache key, so a PR
+  build could seed layers the release build would silently reuse. PR builds now
+  use an ephemeral builder that keeps no state, the release build is pinned to
+  its own never-before-used cache key, and `worker/Dockerfile` pins its npm
+  globals to exact versions so the resolved version is part of the cache key.
 
 ---
 
