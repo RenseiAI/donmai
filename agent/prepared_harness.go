@@ -110,6 +110,13 @@ func ApplyPreparedHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 	if err != nil || !equalJSON(toolReceipt, plan.ToolLifecycleReceipt) {
 		return spec, errors.New("agent: tool/lifecycle application differs from host adaptation receipt")
 	}
+	// The recompute above ran on the redacted normalized copy, so its adapted
+	// Spec cannot be returned — re-apply the receipt-recorded drop of a
+	// denied-but-optional additional-extensions batch to the real Spec here,
+	// or the exact adapter would materialize deliveries the host-persisted
+	// receipt refused (the recompute matching byte-for-byte proves the drop
+	// decision is the same one the host made).
+	adapted = dropDeniedAdvisoryExtensions(adapted, plan.ToolLifecycleReceipt.Entries)
 	adapted.PromptReceipt = copyPromptReceipt(&plan.PromptReceipt)
 	adapted.ToolLifecycleReceipt = copyToolReceipt(&plan.ToolLifecycleReceipt)
 	return adapted, nil
