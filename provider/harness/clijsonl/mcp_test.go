@@ -3,6 +3,7 @@ package clijsonl
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -92,6 +93,135 @@ func TestWriteMCPConfig_HappyPath(t *testing.T) {
 		if _, leaked := linear.Env[key]; leaked {
 			t.Errorf("serialized runner-only %s: %v", key, linear.Env)
 		}
+	}
+}
+
+func TestWriteMCPConfig_GatewayAuthorization(t *testing.T) {
+	t.Parallel()
+
+	servers := []agent.MCPServerConfig{{
+		Name: "donmai-platform",
+		Type: "http",
+		URL:  "https://example.com/api/mcp/session",
+		Headers: map[string]string{
+			"Authorization": "Bearer spawn-token",
+		},
+	}}
+
+	tests := []struct {
+		name     string
+		env      map[string]string
+		wantBody string
+	}{
+		{
+			name: "token file absent preserves static config bytes",
+			wantBody: `{
+  "mcpServers": {
+    "donmai-platform": {
+      "type": "http",
+      "url": "https://example.com/api/mcp/session",
+      "headers": {
+        "Authorization": "Bearer spawn-token"
+      }
+    }
+  }
+}`,
+		},
+		{
+			name: "token file present emits dynamic helper without baked bearer",
+			env:  map[string]string{mcpGatewayFileEnv: "/run/session/mcp-token"},
+			wantBody: `{
+  "mcpServers": {
+    "donmai-platform": {
+      "type": "http",
+      "url": "https://example.com/api/mcp/session",
+      "headersHelper": "token=$(cat -- \"$MCP_GATEWAY_TOKEN_FILE\") || exit 1; printf '{\"Authorization\":\"Bearer %s\"}\\n' \"$token\""
+    }
+  }
+}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path, err := writeMCPConfigWithEnv(servers, tc.env)
+			if err != nil {
+				t.Fatalf("writeMCPConfigWithEnv: %v", err)
+			}
+			t.Cleanup(func() { _ = removeMCPConfig(path) })
+
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read tmpfile: %v", err)
+			}
+			if got := string(body); got != tc.wantBody {
+				t.Fatalf("config bytes mismatch:\n got: %s\nwant: %s", got, tc.wantBody)
+			}
+		})
+	}
+}
+
+func TestWriteMCPConfig_GatewayHeadersHelperReadsLatestToken(t *testing.T) {
+	t.Parallel()
+
+	path, err := writeMCPConfigWithEnv([]agent.MCPServerConfig{{
+		Name:    "donmai-platform",
+		Type:    "http",
+		URL:     "https://example.com/api/mcp/session",
+		Headers: map[string]string{"Authorization": "Bearer spawn-token"},
+	}}, map[string]string{mcpGatewayFileEnv: "/path/is/not/serialized"})
+	if err != nil {
+		t.Fatalf("writeMCPConfigWithEnv: %v", err)
+	}
+	t.Cleanup(func() { _ = removeMCPConfig(path) })
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read tmpfile: %v", err)
+	}
+	var cfg mcpConfigFile
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		t.Fatalf("decode tmpfile: %v", err)
+	}
+	helper := cfg.MCPServers["donmai-platform"].HeadersHelper
+	if helper != mcpGatewayHeadersHelper {
+		t.Fatalf("gateway headersHelper = %q, want %q", helper, mcpGatewayHeadersHelper)
+	}
+
+	tokenPath := filepath.Join(t.TempDir(), "current-token")
+	tests := []struct {
+		name  string
+		token string
+	}{
+		{name: "initial bearer", token: "first-token"},
+		{name: "atomically refreshed bearer", token: "second-token"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			nextPath := tokenPath + ".next"
+			if err := os.WriteFile(nextPath, []byte(tc.token), 0o600); err != nil {
+				t.Fatalf("write next token: %v", err)
+			}
+			if err := os.Rename(nextPath, tokenPath); err != nil {
+				t.Fatalf("replace token: %v", err)
+			}
+
+			cmd := exec.Command("sh", "-c", mcpGatewayHeadersHelper)
+			cmd.Env = append(os.Environ(), mcpGatewayFileEnv+"="+tokenPath)
+			output, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("run headersHelper: %v", err)
+			}
+			var headers map[string]string
+			if err := json.Unmarshal(output, &headers); err != nil {
+				t.Fatalf("decode helper output %q: %v", output, err)
+			}
+			if got, want := headers["Authorization"], "Bearer "+tc.token; got != want {
+				t.Fatalf("Authorization = %q, want %q", got, want)
+			}
+		})
 	}
 }
 

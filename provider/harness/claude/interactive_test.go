@@ -344,6 +344,7 @@ func TestSpawn_Interactive_RoutesThroughPTYNotHeadlessJSONL(t *testing.T) {
 func TestSpawn_Interactive_MCPConfigIsDeliveredAndCleanedOnChildExit(t *testing.T) {
 	t.Parallel()
 	workdir := t.TempDir()
+	tokenPath := filepath.Join(workdir, "live-token")
 	p := newFakeInteractiveProvider(t, `
 set -e
 while (($#)); do
@@ -359,9 +360,10 @@ done
 	h, err := p.Spawn(context.Background(), agent.Spec{
 		Prompt: "hello",
 		Cwd:    workdir,
+		Env:    map[string]string{testMCPGatewayFileEnv: tokenPath},
 		MCPServers: []agent.MCPServerConfig{{
-			Name: "platform", Type: "http", URL: "https://platform.invalid/mcp",
-			Headers: map[string]string{"Authorization": "Bearer test-token"},
+			Name: "donmai-platform", Type: "http", URL: "https://example.com/api/mcp/session",
+			Headers: map[string]string{"Authorization": "Bearer spawn-token"},
 		}},
 		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
 	})
@@ -392,9 +394,5 @@ exited:
 	if err != nil {
 		t.Fatalf("read copied MCP config: %v", err)
 	}
-	for _, want := range []string{"platform", "https://platform.invalid/mcp", "Bearer test-token"} {
-		if !strings.Contains(string(seen), want) {
-			t.Fatalf("interactive MCP config omitted %q: %s", want, seen)
-		}
-	}
+	assertLiveGatewayConfig(t, seen, tokenPath)
 }
