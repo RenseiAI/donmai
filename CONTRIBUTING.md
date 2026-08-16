@@ -39,7 +39,7 @@ wins. Align the local docs or open an ADR to amend the corpus.
 
 Prerequisites:
 
-- Go 1.25.12+; `go.mod` is the canonical toolchain floor
+- Go 1.26.6+; `go.mod` is the canonical toolchain floor
 - `make`
 - `git`
 - `gofumpt`
