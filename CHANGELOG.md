@@ -22,6 +22,24 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.64.0 — 2026-08-16
+
+### Features
+
+- **The gateway MCP auth header can follow a live token file.** When the
+  session environment carries `MCP_GATEWAY_TOKEN_FILE`, the CLI-harness MCP
+  config resolves the gateway `Authorization` header from that file at use
+  time instead of baking the spawn-time bearer forever; absent the variable,
+  the config is byte-identical to before. A control-plane daemon that
+  refreshes the token file can now keep a session's MCP surface alive for
+  the session's whole life (#353).
+
+### Chores
+
+- Raise the Go toolchain floor to 1.26.6 — six reachable standard-library
+  vulnerabilities fixed; every independent pin site (go.mod, release
+  dry-run, both worker image stages) moves together (#352).
+
 ## v0.63.0 — 2026-08-16
 
 ### Fixes
