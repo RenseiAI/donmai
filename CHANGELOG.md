@@ -6,6 +6,21 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.63.0 — 2026-08-16
+
+### Fixes
+
+- **A control-plane `contextWindow` on the resolved profile now reaches the
+  pi extension instead of being silently clamped to the built-in default.**
+  The resolved-profile wire type gains an additive `contextWindow` field;
+  the dispatch bridge injects it into `ProviderConfig["contextWindow"]`
+  (explicit provider config wins, a model-profile `context` supersedes
+  both); the pi provider exports it to the extension environment as
+  `DONMAI_PI_CONTEXT_WINDOW` for both the headless and interactive lanes;
+  and the embedded policy extension reads it — falling back to its previous
+  hardcoded 200000 only when unset. A 1M-context model driven through pi
+  now runs at its native window. (#350)
+
 ## v0.62.0 — 2026-08-15
 
 ### Fixes
