@@ -45,10 +45,10 @@
 //     the Go round trip this lane does not run.
 //
 //   - Provider pin: at load the factory registers a single "donmai" provider
-//     from env (baseUrl / api / key / model), so the session can only reach
-//     the resolved cell endpoint. The key is read from process.env at runtime
-//     and never written to disk or inlined in this source (so the source SHA
-//     stays stable and verifiable).
+//     from env (baseUrl / api / key / model, plus an optional context-window
+//     size), so the session can only reach the resolved cell endpoint. The
+//     key is read from process.env at runtime and never written to disk or
+//     inlined in this source (so the source SHA stays stable and verifiable).
 //
 // This file is intentionally dependency-free (node builtins + a type-only
 // import) and brand-neutral.
@@ -216,6 +216,15 @@ export default function activate(pi: ExtensionAPI) {
   const api = process.env.DONMAI_PI_API ?? "openai-completions";
   const model = process.env.DONMAI_PI_MODEL ?? "";
   const apiKey = process.env.DONMAI_PI_KEY ?? "";
+  // Context-window pin: the harness exports the resolved profile's
+  // context-window size (tokens) as DONMAI_PI_CONTEXT_WINDOW when the
+  // dispatch carried one (extension.go providerPinEnv). A missing or invalid
+  // value falls back to the historical 200000 default, so an unpinned
+  // session keeps prior behaviour while a pinned 1M-context model is no
+  // longer silently clamped to it.
+  const contextWindowEnv = Number(process.env.DONMAI_PI_CONTEXT_WINDOW ?? "");
+  const contextWindow =
+    Number.isInteger(contextWindowEnv) && contextWindowEnv > 0 ? contextWindowEnv : 200000;
   if (baseUrl && model) {
     try {
       pi.registerProvider("donmai", {
@@ -229,7 +238,7 @@ export default function activate(pi: ExtensionAPI) {
             reasoning: true,
             input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 200000,
+            contextWindow,
             maxTokens: 16384,
           },
         ],
