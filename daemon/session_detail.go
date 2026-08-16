@@ -331,6 +331,20 @@ type SessionResolvedProfile struct {
 	CredentialID   string         `json:"credentialId,omitempty"`
 	ProviderConfig map[string]any `json:"providerConfig,omitempty"`
 
+	// ContextWindow is the context-window size in tokens the control plane
+	// resolved for this dispatch (e.g. 1_000_000 for a 1M-context model),
+	// stamped as a top-level resolvedProfile field. The json name matches
+	// agent.ModelDesc.ContextWindow; the field is deliberately NOT named
+	// Context — that token means prompt/mention/parent context on the
+	// adjacent wire types. Forwarded opaquely; the daemon does not interpret
+	// it. detailToQueuedWork bridges it into the runner profile's
+	// ProviderConfig under the same "contextWindow" key
+	// runner.ResolvedModelProfile.ToResolvedProfile produces, so providers
+	// read one key regardless of which wire field carried the value.
+	// Additive + omitempty: absent (zero) on every legacy dispatch, which
+	// preserves the model-default behaviour.
+	ContextWindow int `json:"contextWindow,omitempty"`
+
 	// Endpoint is the complete secret-free serving/auth projection selected at
 	// admission. Receipt-bearing work must carry it explicitly; the runner does
 	// not reconstruct an endpoint identity from ambient CLI or host defaults.

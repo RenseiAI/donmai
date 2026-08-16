@@ -94,7 +94,7 @@ func TestProviderPinEnv(t *testing.T) {
 		Host:     agent.HostDirect,
 		Env:      map[string]string{"ANTHROPIC_API_KEY": "sk-super-secret-canary"},
 	}
-	env := providerPinEnv(ep, "claude-x")
+	env := providerPinEnv(agent.Spec{Endpoint: ep, Model: "claude-x"})
 	joined := strings.Join(env, "\n")
 	if strings.Contains(joined, "sk-super-secret-canary") {
 		t.Errorf("provider-pin env leaked the API key: %q", joined)
@@ -107,6 +107,60 @@ func TestProviderPinEnv(t *testing.T) {
 	}
 	if !containsEnv(env, piModelEnvVar, "claude-x") {
 		t.Errorf("pin env missing model: %v", env)
+	}
+}
+
+// TestProviderPinEnvContextWindow pins the context-window half of the pin:
+// a positive ProviderConfig["contextWindow"] (whatever numeric type the JSON
+// decode produced) rides piContextWindowEnvVar to the child extension, and a
+// missing/zero/invalid value leaves the var UNSET so the extension keeps its
+// built-in default — the pin never invents a value the dispatch did not carry.
+func TestProviderPinEnvContextWindow(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		pc   map[string]any
+		want string // "" => piContextWindowEnvVar must be absent
+	}{
+		{name: "int value exported", pc: map[string]any{"contextWindow": 1_000_000}, want: "1000000"},
+		{name: "float64 from JSON decode exported", pc: map[string]any{"contextWindow": float64(1_000_000)}, want: "1000000"},
+		{name: "absent config leaves env unset", pc: nil, want: ""},
+		{name: "zero leaves env unset", pc: map[string]any{"contextWindow": 0}, want: ""},
+		{name: "negative leaves env unset", pc: map[string]any{"contextWindow": -1}, want: ""},
+		{name: "non-numeric leaves env unset", pc: map[string]any{"contextWindow": "1000000"}, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := providerPinEnv(agent.Spec{Model: "claude-x", ProviderConfig: tc.pc})
+			if tc.want != "" {
+				if !containsEnv(env, piContextWindowEnvVar, tc.want) {
+					t.Errorf("pin env missing %s=%s: %v", piContextWindowEnvVar, tc.want, env)
+				}
+				return
+			}
+			for _, e := range env {
+				if strings.HasPrefix(e, piContextWindowEnvVar+"=") {
+					t.Errorf("pin env must not carry %s for config %v: %v", piContextWindowEnvVar, tc.pc, env)
+				}
+			}
+		})
+	}
+}
+
+// TestExtensionReadsContextWindowEnv pins the Go↔extension env contract by
+// name: the embedded policy extension's source must read the exact variable
+// providerPinEnv exports (there is no TS test harness for the embedded
+// extension — this is the Go-side contract check), and the old hardcoded
+// descriptor value must not survive as a literal.
+func TestExtensionReadsContextWindowEnv(t *testing.T) {
+	t.Parallel()
+	src := string(extensionSource())
+	if !strings.Contains(src, piContextWindowEnvVar) {
+		t.Errorf("embedded extension does not read %s", piContextWindowEnvVar)
+	}
+	if strings.Contains(src, "contextWindow: 200000") {
+		t.Errorf("embedded extension still hardcodes the descriptor contextWindow")
 	}
 }
 
