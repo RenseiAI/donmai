@@ -170,7 +170,7 @@ func composeChildEnv(spec agent.Spec, layout sessionLayout, token string) []stri
 		piCodingAgentSessionDirEnvVar+"="+layout.root,
 	)
 	out = append(out, offlinePostureEnv(spec)...)
-	out = append(out, providerPinEnv(spec.Endpoint, spec.Model)...)
+	out = append(out, providerPinEnv(spec)...)
 	if token != "" {
 		out = append(out, piHandshakeEnvVar+"="+token)
 	}

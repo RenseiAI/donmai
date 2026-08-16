@@ -47,11 +47,15 @@ const (
 
 	// Provider-pin env vars the child extension reads to register the single
 	// "donmai" provider (extensions/donmai-policy.ts). The API key rides
-	// PiKeyEnvVar; these carry the non-secret routing pin.
-	piBaseURLEnvVar   = "DONMAI_PI_BASE_URL"
-	piAPIEnvVar       = "DONMAI_PI_API"
-	piModelEnvVar     = "DONMAI_PI_MODEL"
-	piHandshakeEnvVar = "DONMAI_PI_HANDSHAKE"
+	// PiKeyEnvVar; these carry the non-secret routing pin. The context-window
+	// pin is conditional: set only when the resolved profile carries a
+	// positive ProviderConfig["contextWindow"], so an unpinned session keeps
+	// the extension's built-in default.
+	piBaseURLEnvVar       = "DONMAI_PI_BASE_URL"
+	piAPIEnvVar           = "DONMAI_PI_API"
+	piModelEnvVar         = "DONMAI_PI_MODEL"
+	piContextWindowEnvVar = "DONMAI_PI_CONTEXT_WINDOW"
+	piHandshakeEnvVar     = "DONMAI_PI_HANDSHAKE"
 
 	// injectedExtensionsDir holds materialized agent.ExtensionDelivery
 	// (Kind == ExtensionDeliveryInline) artifacts, one level under piStateDir
@@ -401,7 +405,16 @@ func writeViaCache(digest string, content []byte, destPath string, perm os.FileM
 // NOT here — it rides PiKeyEnvVar (applyEndpoint mirrors the resolved cell key
 // onto it). Under a gateway cell the baseURL is the local gateway binding, so
 // pi inherits the whole mesh through one pin.
-func providerPinEnv(ep *agent.EndpointBinding, model string) []string {
+//
+// The context-window pin (piContextWindowEnvVar) is appended only when the
+// resolved profile carries a positive ProviderConfig["contextWindow"] — the
+// key the dispatch bridge produces for both the resolvedProfile and
+// modelProfile wire shapes. Without it the extension keeps its built-in
+// default, so a control plane that resolved a 1M-context model is no longer
+// silently clamped to that default.
+func providerPinEnv(spec agent.Spec) []string {
+	ep := spec.Endpoint
+	model := spec.Model
 	baseURL := ""
 	api := "openai-completions"
 	if ep != nil {
@@ -411,10 +424,32 @@ func providerPinEnv(ep *agent.EndpointBinding, model string) []string {
 			model = ep.Model
 		}
 	}
-	return []string{
+	out := []string{
 		piBaseURLEnvVar + "=" + baseURL,
 		piAPIEnvVar + "=" + api,
 		piModelEnvVar + "=" + model,
+	}
+	if cw := contextWindowFromSpec(spec); cw > 0 {
+		out = append(out, piContextWindowEnvVar+"="+strconv.Itoa(cw))
+	}
+	return out
+}
+
+// contextWindowFromSpec reads the resolved context-window size (tokens) from
+// Spec.ProviderConfig["contextWindow"]. JSON decoding yields float64 for
+// numbers, so int/int64/float64 are all accepted (the gemini harness's
+// intFromProviderConfig idiom). Missing or non-positive returns 0: the caller
+// omits the pin and the extension falls back to its default.
+func contextWindowFromSpec(spec agent.Spec) int {
+	switch v := spec.ProviderConfig["contextWindow"].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 0
 	}
 }
 

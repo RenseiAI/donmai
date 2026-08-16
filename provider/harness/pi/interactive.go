@@ -183,7 +183,7 @@ func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]strin
 			env[kv[:i]] = kv[i+1:]
 		}
 	}
-	for _, kv := range providerPinEnv(spec.Endpoint, spec.Model) {
+	for _, kv := range providerPinEnv(spec) {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			env[kv[:i]] = kv[i+1:]
 		}

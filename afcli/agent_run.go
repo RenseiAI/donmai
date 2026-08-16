@@ -1065,6 +1065,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			if d.ResolvedProfile.ProviderConfig != nil {
 				qw.ResolvedProfile.ProviderConfig = d.ResolvedProfile.ProviderConfig
 			}
+			qw.ResolvedProfile.ProviderConfig = providerConfigWithContextWindow(
+				qw.ResolvedProfile.ProviderConfig, d.ResolvedProfile.ContextWindow)
 			endpoint, err := detailEndpointBinding(d.ResolvedProfile.Endpoint)
 			if err != nil {
 				return runner.QueuedWork{}, err
@@ -1077,17 +1079,43 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			return runner.QueuedWork{}, err
 		}
 		qw.ResolvedProfile = runner.ResolvedProfile{
-			Harness:        d.ResolvedProfile.Harness,
-			Provider:       agent.ProviderName(d.ResolvedProfile.Provider),
-			Runner:         d.ResolvedProfile.Runner,
-			Model:          d.ResolvedProfile.Model,
-			Effort:         agent.EffortLevel(d.ResolvedProfile.Effort),
-			CredentialID:   d.ResolvedProfile.CredentialID,
-			ProviderConfig: d.ResolvedProfile.ProviderConfig,
-			Endpoint:       endpoint,
+			Harness:      d.ResolvedProfile.Harness,
+			Provider:     agent.ProviderName(d.ResolvedProfile.Provider),
+			Runner:       d.ResolvedProfile.Runner,
+			Model:        d.ResolvedProfile.Model,
+			Effort:       agent.EffortLevel(d.ResolvedProfile.Effort),
+			CredentialID: d.ResolvedProfile.CredentialID,
+			ProviderConfig: providerConfigWithContextWindow(
+				d.ResolvedProfile.ProviderConfig, d.ResolvedProfile.ContextWindow),
+			Endpoint: endpoint,
 		}
 	}
 	return qw, nil
+}
+
+// providerConfigWithContextWindow bridges the resolvedProfile's top-level
+// contextWindow field (daemon.SessionResolvedProfile.ContextWindow) into the
+// ProviderConfig map under the same "contextWindow" key
+// runner.ResolvedModelProfile.ToResolvedProfile produces, so every downstream
+// consumer (runner Spec translation → provider harnesses) reads one key
+// regardless of which wire field carried the value. An explicit
+// providerConfig.contextWindow wins — the top-level field only fills the key
+// when it is absent. Zero/negative (absent on every legacy dispatch) is a
+// no-op. Never mutates the input map: detailToQueuedWork is a pure
+// translation over the daemon's wire shape.
+func providerConfigWithContextWindow(pc map[string]any, contextWindow int) map[string]any {
+	if contextWindow <= 0 {
+		return pc
+	}
+	if _, ok := pc["contextWindow"]; ok {
+		return pc
+	}
+	out := make(map[string]any, len(pc)+1)
+	for k, v := range pc {
+		out[k] = v
+	}
+	out["contextWindow"] = contextWindow
+	return out
 }
 
 // detailEndpointBinding converts the daemon's wire-safe SessionEndpointBinding
