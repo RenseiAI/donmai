@@ -32,7 +32,7 @@
 # emitted binary is byte-for-byte the arch we asked for, with no emulator in
 # the loop. Emulating this stage cost ~178s for the linux/arm64 leg versus
 # ~22s native (measured, worker-image-pr run 30196904421).
-FROM --platform=$BUILDPLATFORM golang:1.25.12-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.6-bookworm AS build
 ARG DONMAI_VERSION=dev
 ARG TARGETOS
 ARG TARGETARCH
@@ -51,7 +51,7 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # cross-compiling `build` stage above, which is always $BUILDPLATFORM. This
 # stage runs no commands; buildkit only pulls layers and COPYs out of it, so
 # naming it for $TARGETPLATFORM costs no emulation.
-FROM golang:1.25.12-bookworm AS gotoolchain
+FROM golang:1.26.6-bookworm AS gotoolchain
 
 # --- ts-morph deps stage: pre-install the code-survival TS reachability deps ---
 # RW4 reachability runs a baked ts-morph node script as a subprocess. Pre-install
@@ -84,7 +84,7 @@ RUN apt-get update \
         ca-certificates git curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Go toolchain for RW4 Go reachability (matches the build stage's 1.25).
+# Go toolchain for RW4 Go reachability (matches the build stage's 1.26).
 # Sourced from the target-arch `gotoolchain` stage, NOT from `build`: `build`
 # cross-compiles from $BUILDPLATFORM and its /usr/local/go is the builder's
 # arch, which would be unrunnable inside a foreign-arch runtime image.
