@@ -29,13 +29,16 @@ type ConfigFile struct {
 //
 // stdio shape: { "type": "stdio", "command": "...", "args": [...], "env": {...} }
 // http shape:  { "type": "http", "url": "...", "headers": {...} }
+// Claude's config-file adapter may additionally set headersHelper after this
+// shared shape is built. It stays empty for every other adapter.
 type Server struct {
-	Type    string            `json:"type"`
-	Command string            `json:"command,omitempty"`
-	Args    []string          `json:"args,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	URL     string            `json:"url,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
+	Type          string            `json:"type"`
+	Command       string            `json:"command,omitempty"`
+	Args          []string          `json:"args,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`
+	URL           string            `json:"url,omitempty"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	HeadersHelper string            `json:"headersHelper,omitempty"`
 }
 
 // StdioServer is the legacy name of Server; kept as a type alias so

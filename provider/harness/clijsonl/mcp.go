@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/mcp"
@@ -19,6 +20,7 @@ import (
 //	  "mcpServers": {
 //	    "<name>": { "type": "stdio", "command": "...", "args": [...], "env": {...} }
 //	    "<name>": { "type": "http",  "url": "...",     "headers": {...} }
+//	    "<name>": { "type": "http",  "url": "...",     "headersHelper": "..." }
 //	  }
 //	}
 //
@@ -26,6 +28,17 @@ import (
 // (the `mcpServers` Object.fromEntries block) and the Claude CLI
 // `--mcp-config` documentation.
 type mcpConfigFile = mcp.ConfigFile
+
+const (
+	mcpGatewayFileEnv = "MCP_GATEWAY_TOKEN_FILE"
+
+	// Claude runs headersHelper through a shell and requires a JSON object of
+	// string headers on stdout. Keep the path in the environment rather than
+	// interpolating it into this command so spaces and shell metacharacters in
+	// the path cannot change the command. A failed read must fail the helper;
+	// emitting an empty bearer would hide the credential-delivery error.
+	mcpGatewayHeadersHelper = `token=$(cat -- "$MCP_GATEWAY_TOKEN_FILE") || exit 1; printf '{"Authorization":"Bearer %s"}\n' "$token"`
+)
 
 // writeMCPConfig serializes Spec.MCPServers to a JSON tmpfile and
 // returns its absolute path. Returns "" with nil error when the spec
@@ -39,6 +52,15 @@ type mcpConfigFile = mcp.ConfigFile
 // transports; the entry's Type field discriminates. Empty Type defaults
 // to "stdio" for back-compat with the legacy shape.
 func writeMCPConfig(servers []agent.MCPServerConfig) (path string, err error) {
+	return writeMCPConfigWithEnv(servers, nil)
+}
+
+// writeMCPConfigWithEnv builds the Claude CLI config with the exact static
+// shape writeMCPConfig has always emitted, except when the runner-provided
+// gateway token-file variable is non-empty. In that case the leading reserved
+// gateway entry uses Claude's headersHelper command so each connection reads
+// the current bearer from the atomically replaced file.
+func writeMCPConfigWithEnv(servers []agent.MCPServerConfig, env map[string]string) (path string, err error) {
 	if len(servers) == 0 {
 		return "", nil
 	}
@@ -47,6 +69,7 @@ func writeMCPConfig(servers []agent.MCPServerConfig) (path string, err error) {
 	if err != nil {
 		return "", fmt.Errorf("provider/claude: build MCP config: %w", err)
 	}
+	preferLiveGatewayHeader(&cfg, servers, env)
 
 	body, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -83,6 +106,49 @@ func writeMCPConfig(servers []agent.MCPServerConfig) (path string, err error) {
 	return abs, nil
 }
 
+// preferLiveGatewayHeader changes only the runner-authored gateway entry. The
+// runner guarantees that entry leads the MCP list; the remaining shape checks
+// keep a caller-supplied first server from being rewritten accidentally.
+func preferLiveGatewayHeader(cfg *mcp.ConfigFile, servers []agent.MCPServerConfig, env map[string]string) {
+	if cfg == nil || len(servers) == 0 || strings.TrimSpace(env[mcpGatewayFileEnv]) == "" {
+		return
+	}
+
+	gateway := servers[0]
+	if gateway.Type != "http" || !strings.HasSuffix(gateway.Name, "-platform") {
+		return
+	}
+
+	authorizationKey := ""
+	for key, value := range gateway.Headers {
+		if strings.EqualFold(key, "Authorization") && strings.HasPrefix(value, "Bearer ") {
+			authorizationKey = key
+			break
+		}
+	}
+	if authorizationKey == "" {
+		return
+	}
+
+	entry, ok := cfg.MCPServers[gateway.Name]
+	if !ok || entry.Type != "http" {
+		return
+	}
+	if len(entry.Headers) == 1 {
+		entry.Headers = nil
+	} else {
+		headers := make(map[string]string, len(entry.Headers)-1)
+		for key, value := range entry.Headers {
+			if !strings.EqualFold(key, authorizationKey) {
+				headers[key] = value
+			}
+		}
+		entry.Headers = headers
+	}
+	entry.HeadersHelper = mcpGatewayHeadersHelper
+	cfg.MCPServers[gateway.Name] = entry
+}
+
 // removeMCPConfig deletes the tmpfile written by writeMCPConfig.
 // Idempotent: missing file returns nil. Empty path returns nil.
 func removeMCPConfig(path string) error {
@@ -101,6 +167,13 @@ func removeMCPConfig(path string) error {
 // of the written file, or "" with nil error when servers is empty.
 func WriteMCPConfig(servers []agent.MCPServerConfig) (string, error) {
 	return writeMCPConfig(servers)
+}
+
+// WriteMCPConfigWithEnv is the Claude-specific config writer. It enables the
+// schema-supported live gateway header when MCP_GATEWAY_TOKEN_FILE is present
+// in the exact environment the child receives.
+func WriteMCPConfigWithEnv(servers []agent.MCPServerConfig, env map[string]string) (string, error) {
+	return writeMCPConfigWithEnv(servers, env)
 }
 
 // RemoveMCPConfig is the exported wrapper for removeMCPConfig.

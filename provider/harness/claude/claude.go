@@ -167,7 +167,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // cleans up the MCP tmpfile and returns an error wrapping
 // agent.ErrSpawnFailed.
 func (p *Provider) spawn(ctx context.Context, spec agent.Spec, resumeSessionID string) (agent.Handle, error) {
-	mcpPath, err := clijsonl.WriteMCPConfig(spec.MCPServers)
+	mcpPath, err := clijsonl.WriteMCPConfigWithEnv(spec.MCPServers, spec.Env)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}

@@ -30,7 +30,7 @@ import (
 // through its JSONL headless-mode output, which the interactive REPL never
 // emits) and a single terminal ResultEvent when the CLI process exits.
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
-	mcpPath, err := clijsonl.WriteMCPConfig(spec.MCPServers)
+	mcpPath, err := clijsonl.WriteMCPConfigWithEnv(spec.MCPServers, spec.Env)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
