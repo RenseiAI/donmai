@@ -2,7 +2,7 @@
 
 > **Status: alpha.** APIs and command flags are stabilising. See [CHANGELOG.md](./CHANGELOG.md) for the change log and [RELEASING.md](./RELEASING.md) for the release process.
 
-`donmai` is the open-source CLI and terminal dashboard for Rensei agent fleets. It is the single binary for every OSS operator task: running the three-process stack locally, managing agents and sessions, querying issue trackers, and inspecting fleet health.
+`donmai` is the open-source CLI and terminal dashboard for local agent fleets. It is the single binary for every OSS operator task: running the three-process stack locally, managing agents and sessions, querying issue trackers, and inspecting fleet health.
 
 **Binary**: `donmai`
 **Module**: `github.com/RenseiAI/donmai`
@@ -44,7 +44,7 @@
 brew install RenseiAI/homebrew-tap/donmai
 ```
 
-### go install (requires Go 1.25+)
+### go install (requires Go 1.26.6+)
 
 ```bash
 go install github.com/RenseiAI/donmai/cmd/donmai@latest
@@ -91,16 +91,16 @@ donmai status
 donmai agent list
 
 # 5. Tail logs from the log analyzer
-donmai logs analyze --input ~/.rensei/logs/agent.log
+donmai logs analyze --input ~/.donmai/logs/agent.log
 ```
 
 ---
 
 ## Credentials in standalone mode (no daemon, no platform)
 
-When you run `donmai` outside of rensei-tui (standalone OSS mode), agents
-inherit credentials from the donmai process. There are two sources, in
-this order:
+When you run `donmai` standalone (OSS mode, outside any downstream
+embedder), agents inherit credentials from the donmai process. There are
+two sources, in this order:
 
   1. Existing environment variables in the donmai process
   2. .env.local at the root of the working directory

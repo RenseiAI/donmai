@@ -6,6 +6,22 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Chores
+
+- **Go 1.26.6 toolchain floor.** Raises `go.mod` — the canonical floor every
+  Go-using workflow reads via `go-version-file` — from 1.25.12 to 1.26.6, and
+  moves the three sites that pin a version independently of it (the
+  `release-dry-run` `GOTOOLCHAIN`, and the worker image's cross-compile `build`
+  and target-arch `gotoolchain` stages) in lock step so no build lane silently
+  stays on the old floor. Clears six stdlib vulnerabilities that reach called
+  code: GO-2026-6218 (`net/url`), GO-2026-6091 (`html/template`), GO-2026-6090
+  (`crypto/tls`), GO-2026-6089 (`net/http`), GO-2026-5972 (`encoding/asn1`),
+  and GO-2026-5026 (`net/http` via `x/net/idna`).
+
+---
+
 ## v0.63.0 — 2026-08-16
 
 ### Fixes

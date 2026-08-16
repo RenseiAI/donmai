@@ -113,4 +113,4 @@ verify-generated:
 # binaries, push a tag. Snapshot runs are version-only and never publish a cask
 # or alter GitHub's Latest release.
 release-dry-run:
-	GOWORK=off GOTOOLCHAIN=go1.25.12 GORELEASER_PUBLISH_HOMEBREW=false GORELEASER_MAKE_LATEST=false goreleaser release --snapshot --clean --skip=sign
+	GOWORK=off GOTOOLCHAIN=go1.26.6 GORELEASER_PUBLISH_HOMEBREW=false GORELEASER_MAKE_LATEST=false goreleaser release --snapshot --clean --skip=sign

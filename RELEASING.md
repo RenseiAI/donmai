@@ -41,7 +41,7 @@ version file to bump.
 ## Prerequisites
 
 - A clean, current `main` checkout.
-- Go 1.25.12 or newer. `go.mod` is the canonical toolchain floor used by CI,
+- Go 1.26.6 or newer. `go.mod` is the canonical toolchain floor used by CI,
   security scanning, E2B builds, and release builds.
 - GoReleaser v2.17.1 for local dry-runs. The release workflow pins this exact
   version because its verified phase order is part of the signing contract.
