@@ -8,19 +8,38 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-### Chores
-
-- **Go 1.26.6 toolchain floor.** Raises `go.mod` — the canonical floor every
-  Go-using workflow reads via `go-version-file` — from 1.25.12 to 1.26.6, and
-  moves the three sites that pin a version independently of it (the
-  `release-dry-run` `GOTOOLCHAIN`, and the worker image's cross-compile `build`
-  and target-arch `gotoolchain` stages) in lock step so no build lane silently
-  stays on the old floor. Clears six stdlib vulnerabilities that reach called
-  code: GO-2026-6218 (`net/url`), GO-2026-6091 (`html/template`), GO-2026-6090
-  (`crypto/tls`), GO-2026-6089 (`net/http`), GO-2026-5972 (`encoding/asn1`),
-  and GO-2026-5026 (`net/http` via `x/net/idna`).
-
 ---
+
+## v0.65.0 — 2026-08-17
+
+### Features
+
+- **Headless sandbox runs can request full network/metadata access via a new
+  wire field.** `QueuedWork` gains an optional `permissionProfile` field
+  (`"autonomous"` or `"workspace-write"`); absent, empty, or
+  `"workspace-write"` preserves the existing hardcoded sandbox behavior
+  byte-for-byte. `"autonomous"` resolves to the sandbox's existing
+  full-access tier, previously unreachable from the wire, letting headless
+  autonomous runs perform git network/metadata operations (fetch,
+  cherry-pick) without hitting an unanswerable sandbox-escalation review. An
+  unrecognized value is fail-safe: it logs a warning and falls back to
+  workspace-write rather than failing closed. The field also flows into the
+  admission receipt's exact-adaptation digest. (#355)
+
+### Fixes
+
+- **A relay restart no longer permanently silences an attached session.** The
+  interactive-attach protocol treats a relay's `ring-miss` control as a safe,
+  designed repair path — reset to a fresh snapshot and resume — but the
+  host-side attach client was instead classifying `ring-miss` (and an
+  internal degraded-lane rewind failure against its own retained ring) as a
+  fatal error, ending the host run and silencing viewing/driver-pen input for
+  the rest of the session after a single relay bounce. A new error type
+  reclassifies both call sites as reset-and-retry: the client drops its
+  resume position and re-attaches on a dedicated, slower backoff (default
+  ceiling 60s) separate from normal reconnect backoff. Genuinely fatal cases
+  (auth, stale epoch) are unchanged. Adds a test helper for simulating a
+  relay restart. (#356)
 
 ## v0.64.0 — 2026-08-16
 
