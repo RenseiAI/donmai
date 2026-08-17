@@ -149,6 +149,54 @@ func (r *room) startGenerationLocked(epoch int64) {
 	r.signalLocked()
 }
 
+// wipe resets ALL in-memory room state — ring, epoch/host binding, degraded-
+// lane ack, pen, presence — to a blank room, exactly as if the relay process
+// serving this room had just restarted (§13: "the ring and pen state are
+// relay-local; after a relay restart every viewer resume is a ring miss").
+// The room keeps its identity (same *room pointer, same RoomID/route) so a
+// caller's already-issued AttachURL keeps working — only the state a real
+// process restart would drop is cleared. It returns the hostCancel func of
+// whatever host leg was bound at the moment of the wipe (nil if none); the
+// caller invokes it AFTER unlocking (never under r.mu) to force that leg to
+// observe the drop and reconnect into the now-blank room, mirroring how
+// bindHost already cancels a superseded leg.
+func (r *room) wipe() (hostCancel context.CancelFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	hostCancel = r.hostCancel
+
+	r.ring = nil
+	r.ringBase = 0
+	r.head = 0
+
+	r.epoch = 0
+	r.epochSet = false
+
+	r.hostBound = false
+	r.hostJti = ""
+	r.hostCancel = nil
+	r.hostOut = nil
+
+	r.ended = false
+	r.exitSeq = 0
+
+	r.finalSnapshot = nil
+	r.lastSnapshotSeq = 0
+
+	r.hostAckSeq = 0
+	r.batchSeen = make(map[string]int64)
+
+	r.penHolder = ""
+	r.penUser = ""
+	r.penGen = 0
+	r.penSet = false
+
+	r.members = make(map[string]member)
+
+	r.signalLocked()
+	return hostCancel
+}
+
 // unbindHost releases the host binding if leg (identified by out) is still the
 // bound one (a superseded leg must not unbind its successor).
 func (r *room) unbindHost(out chan attachwire.Frame) {

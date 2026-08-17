@@ -179,6 +179,20 @@ func (s *StubRelay) HostAckSeq() int64 {
 // the input-trust test to deliver an UNSTAMPED Input from a hostile relay.
 func (s *StubRelay) SendToHost(f attachwire.Frame) { s.room.sendToHost(f) }
 
+// SimulateRestart wipes all in-memory room state (ring, epoch/host binding,
+// degraded-lane ack, pen, presence) and forcibly drops any currently-bound host
+// leg, exactly as a real relay process restart would: the listener stays up at
+// the SAME address/room route (a client's existing AttachURL keeps working),
+// but every byte of history is gone — precisely the §13 "relay restart" ring-
+// miss scenario the resume contract is designed around. The dropped leg
+// observes a connection failure (its context is cancelled) and reconnects
+// through RunHost's normal discipline into the now-blank room.
+func (s *StubRelay) SimulateRestart() {
+	if cancel := s.room.wipe(); cancel != nil {
+		cancel()
+	}
+}
+
 // ---- WSS lane ---------------------------------------------------------------
 
 func (s *StubRelay) handleWS(w http.ResponseWriter, r *http.Request) {

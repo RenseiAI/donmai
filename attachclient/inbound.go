@@ -17,6 +17,8 @@ import (
 //   - a *attachwire.FramingError (unknown/invalid payload, 0-dim Resize) → the
 //     caller closes the leg with an error control (code framing) then reconnects;
 //   - ErrEpochStale / *RelayStopError → terminal, RunHost stops;
+//   - *RelayRingMissError → RESET-AND-RETRY: never terminal (§13), the
+//     reconnect loop drops the local resume position and re-attaches fresh;
 //   - any other error → transient, the caller reconnects.
 //
 // It does NOT dedup Input — the WSS lane is exactly-once. The degraded lane's
@@ -118,14 +120,20 @@ func (h *host) handleControl(ctx context.Context, msg attachwire.ControlMessage)
 		return nil, nil
 
 	case attachwire.ControlError:
-		if m.Code == attachwire.CodeEpochStale {
+		switch {
+		case m.Code == attachwire.CodeEpochStale:
 			return nil, ErrEpochStale
-		}
-		if !m.Retryable {
+		case m.Code == attachwire.CodeRingMiss:
+			// §13: the relay lost its ring/room history (the designed relay-
+			// restart repair path is always safe) — RESET-AND-RETRY regardless
+			// of the wire's retryable bit, never RelayStopError.
+			return nil, &RelayRingMissError{Code: m.Code, Message: m.Message}
+		case !m.Retryable:
 			return nil, &RelayStopError{Code: m.Code, Message: m.Message}
+		default:
+			h.log.Warn("attachclient: retryable relay error control", "code", m.Code, "message", m.Message)
+			return nil, nil
 		}
-		h.log.Warn("attachclient: retryable relay error control", "code", m.Code, "message", m.Message)
-		return nil, nil
 
 	default:
 		// § 6.3: the host ignores any known control other than

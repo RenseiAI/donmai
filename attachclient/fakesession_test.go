@@ -32,6 +32,17 @@ type fakeSession struct {
 
 	inputs  [][]byte
 	resizes []attachwire.ResizePayload
+
+	// evictBelow simulates the real host's own bounded local ring having
+	// rotated past this seq (ptyhost's RingBytes eviction, § 13): a Subscribe
+	// for a positive fromSeq < evictBelow can no longer be served locally,
+	// mirroring the real agent.ErrRingMiss case. Zero (default) never evicts.
+	evictBelow uint64
+
+	// subscribeSeqs records every fromSeq argument RunHost has passed to
+	// Subscribe, in order — tests use it to prove a §13 ring-miss reset
+	// re-attaches with fromSeq 0 (no resume position), not the prior head.
+	subscribeSeqs []attachwire.HostSeq
 }
 
 type fakeSub struct {
@@ -190,9 +201,36 @@ func (fs *fakeSession) EmitMarker(label string) error {
 	return nil
 }
 
+// errFakeSessionEvicted mirrors agent.ErrRingMiss's shape without importing
+// agent (attachclient deliberately does not, see session.go): production code
+// only ever branches on Subscribe failing at all in this context, never on the
+// concrete error identity, so a plain sentinel here is a faithful stand-in.
+var errFakeSessionEvicted = errors.New("fakeSession: fromSeq evicted from local ring")
+
+// SetEvictBelow arms the simulated local-ring eviction boundary (see
+// evictBelow) for ring-miss tests.
+func (fs *fakeSession) SetEvictBelow(seq uint64) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.evictBelow = seq
+}
+
+// SubscribeSeqs returns every fromSeq RunHost has passed to Subscribe so far.
+func (fs *fakeSession) SubscribeSeqs() []attachwire.HostSeq {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	out := make([]attachwire.HostSeq, len(fs.subscribeSeqs))
+	copy(out, fs.subscribeSeqs)
+	return out
+}
+
 func (fs *fakeSession) Subscribe(fromSeq attachwire.HostSeq) (Subscription, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.subscribeSeqs = append(fs.subscribeSeqs, fromSeq)
+	if fromSeq > 0 && uint64(fromSeq) < fs.evictBelow {
+		return nil, errFakeSessionEvicted
+	}
 	sub := &fakeSub{fs: fs, ch: make(chan attachwire.Frame, 16384)}
 	for _, f := range fs.ring {
 		if uint64(f.Seq) > uint64(fromSeq) {
