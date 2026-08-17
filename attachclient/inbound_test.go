@@ -117,6 +117,21 @@ func TestHandleControlDispositions(t *testing.T) {
 	if _, err := h.handleControl(ctx, attachwire.ControlError{Code: attachwire.CodeInternal, Retryable: true}); err != nil {
 		t.Errorf("retryable control err = %v, want nil", err)
 	}
+	// error control: ring-miss → *RelayRingMissError, RESET-AND-RETRY, NEVER
+	// *RelayStopError — §13 makes this the designed relay-restart repair path,
+	// regardless of what the wire's retryable bit says.
+	for _, retryable := range []bool{false, true} {
+		_, err := h.handleControl(ctx, attachwire.ControlError{Code: attachwire.CodeRingMiss, Message: "ring evicted", Retryable: retryable})
+		if !isRelayRingMiss(err) {
+			t.Fatalf("ring-miss control (retryable=%v) err = %v, want *RelayRingMissError", retryable, err)
+		}
+		if isRelayStop(err) {
+			t.Errorf("ring-miss control (retryable=%v) classified as *RelayStopError — must never be terminal", retryable)
+		}
+		if err.Error() == "" {
+			t.Error("RelayRingMissError.Error() is empty")
+		}
+	}
 	// A known control not addressed to the host (§ 6.3) → ignored.
 	if _, err := h.handleControl(ctx, attachwire.Presence{Op: attachwire.PresenceList}); err != nil {
 		t.Errorf("presence control err = %v, want nil (ignored)", err)

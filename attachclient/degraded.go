@@ -177,8 +177,9 @@ func (h *host) httpClient() *http.Client {
 // the SSE leg (binding the host leg with the epoch CAS), streams the Session's
 // frames as POST batches, answers snapshot_request via the outOfSeq array, and
 // periodically probes WSS for upgrade-back. Returns errUpgraded when WSS is
-// reachable again, ErrEpochStale on a stale-epoch reject, a *RelayStopError on
-// an unrecoverable ring miss, or a transient error otherwise.
+// reachable again, ErrEpochStale on a stale-epoch reject, a *RelayRingMissError
+// when the relay (or our own retained ring) has lost history — RESET-AND-RETRY,
+// never terminal — or a transient error otherwise.
 func (h *host) runDegraded(ctx context.Context, tok string, cl hostClaims, exitDeadline time.Time) (attemptResult, error) {
 	var res attemptResult
 
@@ -279,13 +280,19 @@ func (h *host) runDegraded(ctx context.Context, tok string, cl hostClaims, exitD
 				lastAck = ack
 			case postRewind:
 				// 409: the relay wants firstSeq == ack+1. Re-Subscribe(ack) and
-				// resend from the ring (§ 14). A ring miss is unrecoverable here.
+				// resend from the ring (§ 14). If our OWN retained ring can't
+				// satisfy that ack either (e.g. the relay restarted and its ack
+				// regressed below what we still hold), we lost the frames just as
+				// surely as the relay did — that is a ring miss by definition, and
+				// §13 makes ring misses RESET-AND-RETRY, never terminal: abandon
+				// this attempt and let the top-level loop re-attach fresh (fromSeq
+				// 0, no resume position) rather than fail the session.
 				_ = sub.Close()
 				ns, err := h.cfg.Session.Subscribe(attachwire.HostSeq(ack)) //nolint:gosec // G115: ack is a non-negative host seq
 				if err != nil {
-					return res, &RelayStopError{
+					return res, &RelayRingMissError{
 						Code:    attachwire.CodeRingMiss,
-						Message: fmt.Sprintf("degraded rewind past ring at ack=%d: %v", ack, err),
+						Message: fmt.Sprintf("degraded rewind past local ring at ack=%d: %v", ack, err),
 					}
 				}
 				sub, lastAck, frames = ns, ack, ns.Frames()

@@ -12,6 +12,7 @@ import (
 const (
 	defaultBackoffFloor      = 250 * time.Millisecond
 	defaultBackoffCeiling    = 30 * time.Second
+	defaultRingMissCeiling   = 60 * time.Second
 	defaultFallbackAfterN    = 3
 	defaultFinalScreenWindow = 60 * time.Second
 	defaultUpgradeProbeEvery = 30 * time.Second
@@ -54,6 +55,17 @@ type HostConfig struct {
 	// success). Defaults 250ms / 30s.
 	BackoffMin time.Duration
 	BackoffMax time.Duration
+
+	// RingMissRetryCeiling bounds the reconnect backoff used after a §13
+	// ring-miss reset (the relay — or our own retained ring — lost history,
+	// most commonly a relay restart). It shares BackoffMin as its floor but
+	// deliberately gets its own, slower ceiling: unlike a transient dial/
+	// network failure, this loop NEVER gives up (see the ring-miss case in
+	// host.run) — it just settles into this steady cadence and keeps trying,
+	// because a relay restart is rare but multi-bounce windows happen, and the
+	// session should reacquire its view whenever the relay returns however
+	// late. Default 60s.
+	RingMissRetryCeiling time.Duration
 
 	// DisableDegraded turns off the § 14 degraded lane entirely (WSS-only). When
 	// false (default) the client falls back to the degraded lane after
@@ -108,6 +120,12 @@ func (c *HostConfig) withDefaults() error {
 		c.BackoffMax = defaultBackoffCeiling
 		if c.BackoffMax < c.BackoffMin {
 			c.BackoffMax = c.BackoffMin
+		}
+	}
+	if c.RingMissRetryCeiling < c.BackoffMin {
+		c.RingMissRetryCeiling = defaultRingMissCeiling
+		if c.RingMissRetryCeiling < c.BackoffMin {
+			c.RingMissRetryCeiling = c.BackoffMin
 		}
 	}
 	if c.FallbackAfterN <= 0 {
