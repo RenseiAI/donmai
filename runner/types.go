@@ -49,6 +49,25 @@ type QueuedWork struct {
 	// only the named legacy adapter may infer from Provider/Runner/defaults.
 	ResolvedProfile ResolvedProfile `json:"resolvedProfile,omitempty"`
 
+	// PermissionProfile is the platform-requested sandbox/approval posture for
+	// this session (translateSpec's resolveSandboxLevel is the sole consumer).
+	// Absent, empty, or PermissionProfileWorkspaceWrite all preserve the
+	// runner's pre-field hardcoded behavior byte-for-byte: every spawned
+	// agent.Spec carries agent.SandboxWorkspaceWrite regardless of this field.
+	// PermissionProfileAutonomous requests agent.SandboxFullAccess instead — a
+	// fully autonomous headless run has no approver present to answer the
+	// sandbox-escalation review agent.SandboxWorkspaceWrite raises for git
+	// operations that need repo network/metadata access (fetch,
+	// cherry-pick), so those operations auto-reject under the default
+	// posture. An unrecognized value is fail-safe, never fail-closed:
+	// translateSpec logs a warning and falls back to workspace-write rather
+	// than failing the spawn.
+	//
+	// Wire shape: "permissionProfile" (camelCase, omitempty). Mixed-version
+	// safe — an older platform that never emits this field gets the
+	// identical workspace-write behavior every prior release shipped.
+	PermissionProfile PermissionProfile `json:"permissionProfile,omitempty"`
+
 	// Branch is the working branch name the runner should use when
 	// provisioning the worktree. Empty falls back to "agent/<sessionID>".
 	Branch string `json:"branch,omitempty"`
@@ -141,6 +160,26 @@ func (q *QueuedWork) hasCapability(name string) bool {
 	}
 	return q.Capabilities[name]
 }
+
+// PermissionProfile is the platform-requested sandbox/approval posture for a
+// queued session. Two values are defined on the wire today; see
+// [PermissionProfileWorkspaceWrite] and [PermissionProfileAutonomous]. Any
+// other value (including one emitted by a platform newer than this runner)
+// resolves through translateSpec's fail-safe fallback in
+// resolveSandboxLevel (spec_translation.go): log a warning, use
+// PermissionProfileWorkspaceWrite.
+type PermissionProfile string
+
+const (
+	// PermissionProfileWorkspaceWrite is the runner's pre-field, hardcoded
+	// default posture — see QueuedWork.PermissionProfile for exactly which
+	// wire values resolve here.
+	PermissionProfileWorkspaceWrite PermissionProfile = "workspace-write"
+
+	// PermissionProfileAutonomous requests the full-access posture for a
+	// fully autonomous headless run — see QueuedWork.PermissionProfile.
+	PermissionProfileAutonomous PermissionProfile = "autonomous"
+)
 
 // ResolvedProfile names the profile knobs the platform resolved for
 // this session. Mirrors F.1.1 §4 ResolvedProfile shape.

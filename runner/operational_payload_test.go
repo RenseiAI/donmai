@@ -91,7 +91,8 @@ func TestOperationalPayloadArchitectureFixture(t *testing.T) {
 func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T) {
 	classifications := map[string]string{
 		"QueuedWork": "projected", "ResolvedProfile": "projected", "Branch": "projected", "TerminalWorkareaLease": "projected",
-		"AdmissionReceipt": "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
+		"PermissionProfile": "projected",
+		"AdmissionReceipt":  "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
 		"ExecutionRuntimeBinding": "execution-sidecar", "OperationalPayload": "execution-sidecar", "HostAdaptationReceipt": "execution-sidecar",
 		"WorkerID": "daemon-runtime", "AuthToken": "daemon-runtime", "PlatformURL": "daemon-runtime", "Capabilities": "daemon-runtime",
 		// The session-scoped MCP bearer and its advisory expiry are runtime
