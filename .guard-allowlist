@@ -54,3 +54,16 @@ CLOSED_TUI_REPO :: ^afcli/commands\.go :: rens[e]i-tui :: Embedders \(e\.g\. ren
 # would make the documentation false. Scoped to the two exact pre-existing
 # lines so a NEW unscoped hit still fails.
 CLOSED_TUI_REPO :: ^runner/README\.md :: rens[e]i-tui :: (importable by .rens[e]i-tui. without depending on the rest|rens[e]i-tui daemon \(F\.2\.8\))
+
+# runner/operational_payload_test.go: fullOperationalFixture()'s Branch field
+# uses a synthetic "agent/<tracker-id>"-shaped fixture value mirroring the real
+# Branch field's documented fallback shape (runner/types.go: falls back to
+# "agent/<sessionID>") — pre-existing and unrelated to the change that first
+# staged this file's other edits (a PermissionProfile classification entry
+# added to TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField's
+# map further down the file); --staged scans the whole file, not just the
+# diff. The fixture value also feeds TestOperationalPayloadArchitectureFixture's
+# hardcoded golden digest, so renaming it is a separate, unrelated change that
+# would require recomputing that digest. Scoped to the one exact pre-existing
+# line so a NEW unscoped hit still fails.
+TRACKER_ID_SLUG :: ^runner/operational_payload_test\.go :: r[e]n-2034 :: qw\.Branch = "agent/r[e]n-2034"
