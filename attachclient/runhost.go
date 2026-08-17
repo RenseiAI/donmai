@@ -13,9 +13,16 @@ import (
 // RunHost runs the host leg of one interactive PTY session. It BLOCKS until the
 // Session ends and the bounded post-Exit final-screen window (§ 12.2) elapses —
 // returning nil — or until ctx is cancelled — returning ctx's error — or until a
-// terminal condition (epoch-stale, a non-retryable relay error control, an
-// unrecoverable degraded-lane ring miss) — returning ErrEpochStale or a
-// *RelayStopError.
+// terminal condition (epoch-stale, or a non-retryable relay error control other
+// than ring-miss) — returning ErrEpochStale or a *RelayStopError.
+//
+// A ring miss — the relay (or the host's own retained ring) having lost history,
+// most commonly from a relay restart — is deliberately NOT terminal (§ 13: "ring
+// misses are always safe"). RunHost never returns for it: internally it resets
+// the local resume position and keeps re-attaching, backed off to a slow,
+// unbounded cadence (RingMissRetryCeiling) rather than giving up, so a session
+// reacquires its view whenever the relay returns however late. See the
+// isRelayRingMiss case in run.
 //
 // It dials OUT only (WSS, with degraded HTTPS fallback per § 14); it never opens
 // an inbound listener. Reconnect uses cancel-aware exponential backoff, reset on
@@ -74,6 +81,12 @@ func (h *host) now() time.Time {
 
 func (h *host) run(ctx context.Context) error {
 	bo := newBackoff(h.cfg.BackoffMin, h.cfg.BackoffMax)
+	// ringBo is the RESET-AND-RETRY cadence for §13 ring misses — deliberately
+	// separate from bo (which governs ordinary dial/network reconnects): it
+	// shares the same floor but a slower, dedicated ceiling, and repeated ring
+	// misses are never fatal (see the isRelayRingMiss case below), so this
+	// backoff is reset only on an attempt that does NOT itself ring-miss.
+	ringBo := newBackoff(h.cfg.BackoffMin, h.cfg.RingMissRetryCeiling)
 
 	var (
 		degraded     bool      // current carrier: false = WSS, true = degraded lane
@@ -138,6 +151,7 @@ func (h *host) run(ctx context.Context) error {
 
 		switch {
 		case rerr == nil:
+			ringBo.reset()
 			// Clean carrier end without a fully-served window: loop to serve the
 			// remaining window (or detect it elapsed at the top).
 			if !exitDeadline.IsZero() {
@@ -148,12 +162,30 @@ func (h *host) run(ctx context.Context) error {
 			return ErrEpochStale
 		case isRelayStop(rerr):
 			return rerr
+		case isRelayRingMiss(rerr):
+			// §13: the relay (or our own retained ring) lost history — the
+			// designed repair path, RESET-AND-RETRY, never terminal. Drop the
+			// local resume position so the next top-level attempt subscribes
+			// fresh from 0 (no resume_from) and back off on the dedicated,
+			// slower, never-exhausted ring-miss cadence — NOT bo, which stays
+			// reserved for ordinary dial/network failures. ringBo is reset only
+			// when a later attempt does not itself ring-miss, so a multi-bounce
+			// window (several restarts in a row) keeps deepening the backoff
+			// instead of hammering a relay that keeps coming back wiped.
+			h.log.Warn("attachclient: relay lost ring state — resetting for a fresh re-attach", "err", rerr)
+			h.hasStreamed = false
+			if err := sleepCtx(ctx, ringBo.next()); err != nil {
+				return err
+			}
+			continue
 		case errors.Is(rerr, errUpgraded):
+			ringBo.reset()
 			degraded = false
 			bo.reset()
 			consecFails = 0
 			continue
 		default:
+			ringBo.reset()
 			h.log.Debug("attachclient: carrier attempt ended", "degraded", degraded, "err", rerr)
 			if !degraded && h.maybeFallback(&degraded, &consecFails, bo) {
 				continue
@@ -194,6 +226,11 @@ func (h *host) maybeFallback(degraded *bool, consecFails *int, bo *backoff) bool
 //     frames go out. Resuming from the last seq handed to the dropped connection
 //     would re-send the gap the relay already truncated (WSS has no host-ack) —
 //     the spec forbids retransmit; the relay repairs via a resync Snapshot.
+//   - §13 ring-miss reset: run's isRelayRingMiss case sets hasStreamed back to
+//     false before the next attempt, so this resolves to fromSeq 0 exactly like
+//     initial attach — a fresh re-attach with NO resume position, letting the
+//     relay rebuild the room from a requested Snapshot instead of asking for a
+//     specific seq it (or we) no longer hold.
 func (h *host) subscribeFromSeq() (attachwire.HostSeq, error) {
 	if !h.hasStreamed {
 		return 0, nil
