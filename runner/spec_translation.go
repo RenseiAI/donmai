@@ -88,7 +88,7 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		Env:                in.Env,
 		Autonomous:         in.Autonomous,
 		SandboxEnabled:     true,
-		SandboxLevel:       agent.SandboxWorkspaceWrite,
+		SandboxLevel:       resolveSandboxLevel(qw, in.Logger),
 		AllowedTools:       allowedTools,
 		DisallowedTools:    disallowedTools,
 		MCPServers:         in.MCPServers,
@@ -167,6 +167,40 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	}
 
 	return spec
+}
+
+// resolveSandboxLevel maps QueuedWork.PermissionProfile onto the sandbox tier
+// forwarded to agent.Spec.SandboxLevel. Absent, empty, or the explicit
+// PermissionProfileWorkspaceWrite value all resolve to
+// agent.SandboxWorkspaceWrite — the byte-for-byte pre-field hardcoded default
+// every prior release shipped.
+//
+// PermissionProfileAutonomous resolves to agent.SandboxFullAccess. A fully
+// autonomous headless run has no approver present, and
+// agent.SandboxWorkspaceWrite raises a sandbox-escalation review for git
+// operations that need repo network/metadata access (fetch, cherry-pick) —
+// with nobody present to answer it, the harness auto-rejects the escalation
+// and the git operation fails. Full access removes the sandbox boundary the
+// escalation would otherwise come from.
+//
+// An unrecognized value is fail-safe, never fail-closed: it logs a warning
+// naming the bad value and falls back to workspace-write rather than failing
+// the spawn. logger nil-safe (mirrors logMCPGatewayBearerExpiry).
+func resolveSandboxLevel(qw QueuedWork, logger *slog.Logger) agent.SandboxLevel {
+	switch qw.PermissionProfile {
+	case "", PermissionProfileWorkspaceWrite:
+		return agent.SandboxWorkspaceWrite
+	case PermissionProfileAutonomous:
+		return agent.SandboxFullAccess
+	default:
+		if logger != nil {
+			logger.Warn("[runner] unrecognized permissionProfile; falling back to workspace-write",
+				"sessionId", qw.SessionID,
+				"permissionProfile", string(qw.PermissionProfile),
+			)
+		}
+		return agent.SandboxWorkspaceWrite
+	}
 }
 
 // defaultAllowedTools is the curated Bash + edit + read + grep

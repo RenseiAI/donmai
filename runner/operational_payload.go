@@ -26,6 +26,7 @@ type OperationalPayload struct {
 	ResolvedProfile       ResolvedProfile                `json:"resolvedProfile,omitempty"`
 	Branch                string                         `json:"branch,omitempty"`
 	TerminalWorkareaLease *workarea.TerminalLeaseRequest `json:"terminalWorkareaLease,omitempty"`
+	PermissionProfile     PermissionProfile              `json:"permissionProfile,omitempty"`
 }
 
 // ProjectOperationalPayload returns the exact admission-time payload shared by
@@ -37,6 +38,7 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		ResolvedProfile:       qw.ResolvedProfile,
 		Branch:                qw.Branch,
 		TerminalWorkareaLease: qw.TerminalWorkareaLease,
+		PermissionProfile:     qw.PermissionProfile,
 	}
 }
 
