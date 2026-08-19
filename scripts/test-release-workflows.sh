@@ -28,6 +28,45 @@ assert_no_line() {
   fi
 }
 
+assert_workflow_job_needs() {
+  local workflow_file=$1
+  local job_name=$2
+  local dependency=$3
+
+  ruby -ryaml - "${workflow_file}" "${job_name}" "${dependency}" <<'RUBY'
+workflow_file, job_name, dependency = ARGV
+
+begin
+  workflow = YAML.safe_load(
+    File.read(workflow_file),
+    permitted_classes: [],
+    permitted_symbols: [],
+    aliases: false
+  )
+rescue Psych::Exception, SystemCallError => error
+  abort "FAIL: cannot parse #{workflow_file}: #{error.message}"
+end
+
+jobs = workflow["jobs"]
+abort "FAIL: #{workflow_file} does not declare jobs" unless jobs.is_a?(Hash)
+abort "FAIL: #{workflow_file} does not declare jobs.#{dependency}" unless jobs.key?(dependency)
+
+job = jobs[job_name]
+abort "FAIL: #{workflow_file} does not declare jobs.#{job_name}" unless job.is_a?(Hash)
+
+needs = job["needs"]
+dependencies = needs.is_a?(String) ? [needs] : needs
+unless dependencies.is_a?(Array) && dependencies.all? { |item| item.is_a?(String) }
+  abort "FAIL: #{workflow_file} jobs.#{job_name}.needs must be a job name or list of job names"
+end
+unless dependencies.include?(dependency)
+  abort "FAIL: #{workflow_file} jobs.#{job_name}.needs does not include #{dependency}"
+end
+RUBY
+}
+
+assert_workflow_job_needs "${root_dir}/.github/workflows/release.yml" release harness-smoke
+
 valid_tags=(
   v0.0.0
   v1.2.3
