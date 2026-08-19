@@ -123,7 +123,7 @@ func decodeJSONArray(t *testing.T, s string) []any {
 func issueNodeJSON(id, identifier, title, stateName, teamID, teamKey, teamName string) string {
 	return fmt.Sprintf(`{
 "id":%q,"identifier":%q,"title":%q,
-"description":"desc","url":"https://linear.app/i/%s","priority":2,
+"description":"desc","url":"https://issues.example.com/i/%s","priority":2,
 "createdAt":"2025-01-01T00:00:00Z","updatedAt":"2025-01-02T00:00:00Z",
 "state":{"id":"state-1","name":%q},
 "team":{"id":%q,"key":%q,"name":%q},
@@ -760,21 +760,38 @@ func TestLinearRemoveRelation(t *testing.T) {
 
 func TestLinearListSubIssues(t *testing.T) {
 	parent := issueNodeJSON("parent-1", "ENG-1", "Parent", "In Progress", "team-1", "ENG", "Engineering")
-	child := issueNodeJSON("child-1", "ENG-10", "Child", "Backlog", "team-1", "ENG", "Engineering")
+	child1 := issueNodeJSON("child-1", "ENG-10", "First child", "Backlog", "team-1", "ENG", "Engineering")
+	child2 := issueNodeJSON("child-2", "ENG-11", "Second child", "Started", "team-1", "ENG", "Engineering")
 
-	var callCount int
+	var subIssueRequests int
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Query string `json:"query"`
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
 
-		if strings.Contains(req.Query, "GetIssue") && callCount == 0 {
-			callCount++
+		if strings.Contains(req.Query, "GetIssue") {
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, parent))
 			return
 		}
-		writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, child))
+		if !strings.Contains(req.Query, "ListSubIssues") {
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+		subIssueRequests++
+		if subIssueRequests == 1 {
+			if req.Variables["after"] != nil {
+				t.Fatalf("first page after = %#v, want nil", req.Variables["after"])
+			}
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s],"pageInfo":{"hasNextPage":true,"endCursor":"page-1"}}}`, child1))
+			return
+		}
+		if req.Variables["after"] != "page-1" {
+			t.Fatalf("second page after = %#v, want page-1", req.Variables["after"])
+		}
+		writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, child2))
 	})
 
 	out, err := runLinearCmd(t, "", "list-sub-issues", "ENG-1")
@@ -786,13 +803,20 @@ func TestLinearListSubIssues(t *testing.T) {
 	if result["parentIdentifier"] != "ENG-1" {
 		t.Errorf("parentIdentifier = %v, want ENG-1", result["parentIdentifier"])
 	}
-	if result["subIssueCount"] != float64(1) {
-		t.Errorf("subIssueCount = %v, want 1", result["subIssueCount"])
+	if result["subIssueCount"] != float64(2) {
+		t.Fatalf("subIssueCount = %v, want 2", result["subIssueCount"])
 	}
-	subs := result["subIssues"].([]any)
-	sub := subs[0].(map[string]any)
-	if sub["identifier"] != "ENG-10" {
-		t.Errorf("sub[0].identifier = %v, want ENG-10", sub["identifier"])
+	subs, ok := result["subIssues"].([]any)
+	if !ok || len(subs) != 2 {
+		t.Fatalf("subIssues = %#v, want 2 entries", result["subIssues"])
+	}
+	first := subs[0].(map[string]any)
+	second := subs[1].(map[string]any)
+	if first["identifier"] != "ENG-10" || second["identifier"] != "ENG-11" {
+		t.Errorf("sub-issue order = [%v %v], want [ENG-10 ENG-11]", first["identifier"], second["identifier"])
+	}
+	if subIssueRequests != 2 {
+		t.Errorf("ListSubIssues requests = %d, want 2", subIssueRequests)
 	}
 }
 
@@ -803,19 +827,32 @@ func TestLinearListSubIssueStatuses(t *testing.T) {
 	child1 := issueNodeJSON("child-1", "ENG-10", "Child Done", "Finished", "team-1", "ENG", "Engineering")
 	child2 := issueNodeJSON("child-2", "ENG-11", "Child Todo", "Backlog", "team-1", "ENG", "Engineering")
 
-	var callCount int
+	var subIssueRequests int
 	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Query string `json:"query"`
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
 
-		if strings.Contains(req.Query, "GetIssue") && callCount == 0 {
-			callCount++
+		if strings.Contains(req.Query, "GetIssue") {
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, parent))
 			return
 		}
-		writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s,%s]}}`, child1, child2))
+		if !strings.Contains(req.Query, "ListSubIssues") {
+			t.Fatalf("unexpected query: %s", req.Query)
+		}
+		subIssueRequests++
+		if subIssueRequests == 1 {
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s],"pageInfo":{"hasNextPage":true,"endCursor":"page-1"}}}`, child1))
+			return
+		}
+		if req.Variables["after"] != "page-1" {
+			t.Fatalf("second page after = %#v, want page-1", req.Variables["after"])
+		}
+		writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, child2))
 	})
 
 	out, err := runLinearCmd(t, "", "list-sub-issue-statuses", "ENG-1")
@@ -827,9 +864,18 @@ func TestLinearListSubIssueStatuses(t *testing.T) {
 	if result["allFinishedOrLater"] != false {
 		t.Errorf("allFinishedOrLater = %v, want false (one incomplete)", result["allFinishedOrLater"])
 	}
+	if result["subIssueCount"] != float64(2) {
+		t.Fatalf("subIssueCount = %v, want 2", result["subIssueCount"])
+	}
 	incomplete := result["incomplete"].([]any)
 	if len(incomplete) != 1 {
-		t.Errorf("incomplete count = %d, want 1", len(incomplete))
+		t.Fatalf("incomplete count = %d, want 1", len(incomplete))
+	}
+	if incomplete[0].(map[string]any)["identifier"] != "ENG-11" {
+		t.Errorf("incomplete identifier = %v, want ENG-11", incomplete[0].(map[string]any)["identifier"])
+	}
+	if subIssueRequests != 2 {
+		t.Errorf("ListSubIssues requests = %d, want 2", subIssueRequests)
 	}
 }
 
@@ -2733,7 +2779,7 @@ func TestLinearListSubIssuesParentIDPerSubIssue(t *testing.T) {
 	handler := &multiHandler{
 		responses: map[string]string{
 			"GetIssue":      fmt.Sprintf(`{"issue":%s}`, parentJSON),
-			"ListSubIssues": fmt.Sprintf(`{"issues":{"nodes":[%s]}}`, childJSON),
+			"ListSubIssues": fmt.Sprintf(`{"issues":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, childJSON),
 		},
 	}
 	setupLinearTest(t, handler.ServeHTTP)

@@ -1015,31 +1015,116 @@ func TestAddIssueLabelUsesAdditiveMutation(t *testing.T) {
 
 // --- ListSubIssues ---
 
-func TestListSubIssuesSuccess(t *testing.T) {
+func TestListSubIssuesPaginatesAndPreservesOrder(t *testing.T) {
 	t.Parallel()
-	nodes := []map[string]any{
-		{
-			"id":         "child-1",
-			"identifier": "ENG-10",
-			"title":      "Child issue",
-			"state":      map[string]any{"name": "In Progress"},
-			"project":    map[string]any{"name": "Proj"},
-			"parent":     map[string]any{"id": "parent-1"},
-		},
+
+	child := func(id, identifier string) issueNode {
+		return issueNode{
+			ID:         id,
+			Identifier: identifier,
+			Title:      "Child issue",
+			Parent: &struct {
+				ID string `json:"id"`
+			}{ID: "parent-1"},
+		}
 	}
-	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
-		writeGQLData(w, `{"issues":{"nodes":`+issueNodesJSON(nodes)+`}}`)
+	var requests []map[string]any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests = append(requests, req.Variables)
+		if !strings.Contains(req.Query, "$first: Int") || !strings.Contains(req.Query, "$after: String") ||
+			!strings.Contains(req.Query, "pageInfo { hasNextPage endCursor }") {
+			t.Fatalf("query does not request cursor pagination: %s", req.Query)
+		}
+		if len(requests) == 1 {
+			cursor := "page-1"
+			writeIssuePage(w, []issueNode{child("child-1", "ENG-10")}, true, &cursor)
+			return
+		}
+		writeIssuePage(w, []issueNode{child("child-2", "ENG-11")}, false, nil)
 	})
 
 	issues, err := c.ListSubIssues(context.Background(), "parent-1")
 	if err != nil {
 		t.Fatalf("ListSubIssues: %v", err)
 	}
-	if len(issues) != 1 {
-		t.Fatalf("got %d issues, want 1", len(issues))
+	if len(issues) != 2 {
+		t.Fatalf("got %d issues, want 2", len(issues))
 	}
-	if issues[0].ID != "child-1" || issues[0].ParentID != "parent-1" {
-		t.Errorf("unexpected child: %+v", issues[0])
+	if issues[0].ID != "child-1" || issues[1].ID != "child-2" {
+		t.Fatalf("child order = [%q %q], want [child-1 child-2]", issues[0].ID, issues[1].ID)
+	}
+	if issues[0].ParentID != "parent-1" || issues[1].ParentID != "parent-1" {
+		t.Errorf("unexpected parent IDs: [%q %q]", issues[0].ParentID, issues[1].ParentID)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(requests))
+	}
+	if requests[0]["parentId"] != "parent-1" || requests[0]["first"] != float64(250) || requests[0]["after"] != nil {
+		t.Fatalf("first request variables = %#v", requests[0])
+	}
+	if requests[1]["parentId"] != "parent-1" || requests[1]["first"] != float64(250) || requests[1]["after"] != "page-1" {
+		t.Fatalf("second request variables = %#v", requests[1])
+	}
+}
+
+func TestListSubIssuesFailsClosedOnMissingCursor(t *testing.T) {
+	t.Parallel()
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeGQLData(w, `{"issues":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":null}}}`)
+	})
+
+	issues, err := c.ListSubIssues(context.Background(), "parent-1")
+	if err == nil || !strings.Contains(err.Error(), "sub-issues hasNextPage without endCursor") {
+		t.Fatalf("ListSubIssues error = %v, want missing-cursor error", err)
+	}
+	if issues != nil {
+		t.Fatalf("returned partial issues: %#v", issues)
+	}
+}
+
+func TestListSubIssuesFailsClosedOnCursorCycle(t *testing.T) {
+	t.Parallel()
+	request := 0
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		request++
+		cursor := "page-1"
+		if request == 2 {
+			cursor = "page-2"
+		}
+		writeIssuePage(w, []issueNode{}, true, &cursor)
+	})
+
+	issues, err := c.ListSubIssues(context.Background(), "parent-1")
+	if err == nil || !strings.Contains(err.Error(), `sub-issues cursor cycle detected at "page-1"`) {
+		t.Fatalf("ListSubIssues error = %v, want cursor-cycle error", err)
+	}
+	if issues != nil {
+		t.Fatalf("returned partial issues: %#v", issues)
+	}
+}
+
+func TestListSubIssuesFailsLoudAtPageCap(t *testing.T) {
+	t.Parallel()
+	requests := 0
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		cursor := fmt.Sprintf("page-%d", requests)
+		writeIssuePage(w, []issueNode{}, true, &cursor)
+	})
+
+	issues, err := c.ListSubIssues(context.Background(), "parent-1")
+	if err == nil || !strings.Contains(err.Error(), "sub-issues: exceeded 100 pages") {
+		t.Fatalf("ListSubIssues error = %v, want page-cap error", err)
+	}
+	if issues != nil {
+		t.Fatalf("returned partial issues: %#v", issues)
+	}
+	if requests != 100 {
+		t.Fatalf("requests = %d, want 100", requests)
 	}
 }
 

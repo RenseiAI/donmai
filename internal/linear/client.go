@@ -60,9 +60,10 @@ const (
 }
 ` + issueFragment
 
-	queryListSubIssues = `query ListSubIssues($parentId: ID!) {
-  issues(filter: { parent: { id: { eq: $parentId } } }) {
+	queryListSubIssues = `query ListSubIssues($parentId: ID!, $first: Int, $after: String) {
+  issues(filter: { parent: { id: { eq: $parentId } } }, first: $first, after: $after) {
     nodes { ...IssueFields }
+    pageInfo { hasNextPage endCursor }
   }
 }
 ` + issueFragment
@@ -473,6 +474,7 @@ func (c *Client) ListIssuesByProject(ctx context.Context, projectName string, st
 const (
 	maxIssueListPageSize = 250
 	maxIssueListPages    = 100
+	maxSubIssueListPages = maxIssueListPages
 	// MaxIssueListLimit bounds automatic pagination to 100 Linear pages.
 	MaxIssueListLimit = maxIssueListPageSize * maxIssueListPages
 )
@@ -556,12 +558,50 @@ func (c *Client) ListIssues(ctx context.Context, filter map[string]any, limit in
 
 // ListSubIssues returns the direct children of the given parent issue ID.
 func (c *Client) ListSubIssues(ctx context.Context, parentID string) ([]Issue, error) {
-	vars := map[string]any{"parentId": parentID}
-	var data listIssuesData
-	if err := c.do(ctx, queryListSubIssues, vars, &data); err != nil {
-		return nil, err
+	var after *string
+	issues := make([]Issue, 0)
+	seenCursors := make(map[string]struct{})
+	for page := 0; page < maxSubIssueListPages; page++ {
+		vars := map[string]any{
+			"parentId": parentID,
+			"first":    maxIssueListPageSize,
+			"after":    after,
+		}
+		var data paginatedListIssuesData
+		if err := c.do(ctx, queryListSubIssues, vars, &data); err != nil {
+			return nil, err
+		}
+		if data.Issues == nil {
+			return nil, fmt.Errorf("sub-issues connection is missing")
+		}
+		if data.Issues.Nodes == nil {
+			return nil, fmt.Errorf("sub-issues nodes are missing")
+		}
+		if len(*data.Issues.Nodes) > maxIssueListPageSize {
+			return nil, fmt.Errorf("sub-issues returned %d nodes for page size %d", len(*data.Issues.Nodes), maxIssueListPageSize)
+		}
+
+		for i, node := range *data.Issues.Nodes {
+			if node.ID == "" {
+				return nil, fmt.Errorf("sub-issues node %d id is missing", i)
+			}
+			issues = append(issues, nodeToIssue(node))
+		}
+
+		next, complete, err := nextConnectionPage("sub-issues", data.Issues.PageInfo, after)
+		if err != nil {
+			return nil, err
+		}
+		if complete {
+			return issues, nil
+		}
+		if _, repeated := seenCursors[*next]; repeated {
+			return nil, fmt.Errorf("sub-issues cursor cycle detected at %q", *next)
+		}
+		seenCursors[*next] = struct{}{}
+		after = next
 	}
-	return nodesToIssues(data.Issues.Nodes), nil
+	return nil, fmt.Errorf("sub-issues: exceeded %d pages", maxSubIssueListPages)
 }
 
 // ListBacklogIssues returns the issues in the project whose workflow
