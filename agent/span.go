@@ -142,6 +142,7 @@ type DonmaiSpanExtensions struct {
 	// tenant model).
 	WorkspaceID string `json:"workspaceId"`
 	// SessionID is the agent session id this span belongs to.
+	// Legacy alias retained: equals SessionStorageID when that is set.
 	SessionID string `json:"sessionId"`
 	// WorkType is the work classification (e.g. "sdlc").
 	WorkType string `json:"workType,omitempty"`
@@ -157,6 +158,11 @@ type DonmaiSpanExtensions struct {
 	ContextHash string `json:"contextHash,omitempty"`
 	// ModelSnapshotID is the exact model-snapshot identifier used.
 	ModelSnapshotID string `json:"modelSnapshotId,omitempty"`
+	// REN-2649 trace-correlation join keys (correlation only). Omitted when
+	// absent; SessionID remains the legacy storage-id alias.
+	SessionStorageID string `json:"sessionStorageId,omitempty"`
+	SessionPublicID  string `json:"sessionPublicId,omitempty"`
+	TrackerSessionID string `json:"trackerSessionId,omitempty"`
 }
 
 // SpanCore is the field set common to every span variant. It is
