@@ -67,3 +67,15 @@ CLOSED_TUI_REPO :: ^runner/README\.md :: rens[e]i-tui :: (importable by .rens[e]
 # would require recomputing that digest. Scoped to the one exact pre-existing
 # line so a NEW unscoped hit still fails.
 TRACKER_ID_SLUG :: ^runner/operational_payload_test\.go :: r[e]n-2034 :: qw\.Branch = "agent/r[e]n-2034"
+
+# The Linear client and its command-level tests carry the concrete hosted
+# GraphQL proxy suffix frozen by the accepted OSS CLI proxy contract. These
+# references predate guard-b and are required to construct and verify the real
+# compatibility path; replacing them with prose or an invented route would
+# make the shipped client false. Curated when these files were first staged
+# after guard-b began scanning whole files. Each exemption is constrained to
+# the exact production assignment or its directly corresponding documentation
+# and assertions, so another hosted endpoint occurrence still fails.
+CLOSED_CLI_ENDPOINT :: ^internal/linear/client\.go :: /api/cl[i]/ :: (platform's /api/cl[i]/linear/graphql proxy where APIKey holds the|platform's /api/cl[i]/linear/graphql proxy under the caller's rsk_ token|BaseURL:[[:space:]]+base \+ "/api/cl[i]/linear/graphql")
+CLOSED_CLI_ENDPOINT :: ^internal/linear/client_test\.go :: /api/cl[i]/ :: c\.BaseURL != "https://platform\.example\.com/api/cl[i]/linear/graphql"
+CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/linear_test\.go :: /api/cl[i]/ :: (subcommand routes its GraphQL through `/api/cl[i]/linear/graphql`|subcommand proxies GraphQL through /api/cl[i]/linear/graphql|gotPath != "/api/cl[i]/linear/graphql"|t\.Errorf\("path = %q, want %q", gotPath, "/api/cl[i]/linear/graphql"\))
