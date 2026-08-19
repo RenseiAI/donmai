@@ -323,6 +323,19 @@ type QueuedWork struct {
 	// ignore the unknown field; old platforms simply never emit it (the runner
 	// tolerates its absence — nil = capability off).
 	CodeIntel *CodeIntelWork `json:"codeIntel,omitempty"`
+
+	// ── W3C trace-context correlation (REN-2649) ─────────────────────────
+	//
+	// Platform dispatch stamps these opaquely per
+	// src/lib/observability/trace-context.ts (DispatchTraceContextFields).
+	// They are correlation only: (org_id, session_id) remains the lifecycle
+	// authority; a trace id never authorizes a tenant/session transition.
+	// Older platforms omit them; older runners ignore them.
+	Traceparent      string `json:"traceparent,omitempty"`
+	Tracestate       string `json:"tracestate,omitempty"`
+	SessionStorageID string `json:"sessionStorageId,omitempty"`
+	SessionPublicID  string `json:"sessionPublicId,omitempty"`
+	TrackerSessionID string `json:"trackerSessionId,omitempty"`
 }
 
 // CodeIntelWork is the typed code-intelligence capability block on QueuedWork.
