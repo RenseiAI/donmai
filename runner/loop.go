@@ -805,14 +805,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			r.logger.Warn("span poster start failed; per-call tracing disabled", "err", startErr)
 		} else {
 			processor, processorErr := spanruntime.NewProcessor(spanruntime.ProcessorConfig{
-				SessionID:   qw.SessionID,
-				OrgID:       qw.OrganizationID,
-				WorkspaceID: qw.OrganizationID,
-				WorkType:    qw.WorkType,
-				System:      spanruntime.ProviderSystem(provider.Name()),
-				Model:       qw.ResolvedProfile.Model,
-				Sender:      spanPoster,
-				Now:         r.now,
+				SessionID:        qw.SessionID,
+				OrgID:            qw.OrganizationID,
+				WorkspaceID:      qw.OrganizationID,
+				WorkType:         qw.WorkType,
+				System:           spanruntime.ProviderSystem(provider.Name()),
+				Model:            qw.ResolvedProfile.Model,
+				Traceparent:      qw.Traceparent,
+				Tracestate:       qw.Tracestate,
+				SessionStorageID: qw.SessionStorageID,
+				SessionPublicID:  qw.SessionPublicID,
+				TrackerSessionID: qw.TrackerSessionID,
+				Sender:           spanPoster,
+				Now:              r.now,
 			})
 			if processorErr != nil {
 				r.logger.Warn("span processor construct failed; per-call tracing disabled", "err", processorErr)

@@ -10,6 +10,27 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.66.0 — 2026-08-20
+
+### Features
+
+- **W3C trace-context propagation through the dispatch pipeline.** `QueuedWork` now carries `traceparent`/`tracestate`/`sessionStorageId`/`sessionPublicId`/`trackerSessionId` from the platform's dispatch chokepoint through `PollWorkItem` → `SessionDetail` → `prompt.QueuedWork`; the runner's span processor reuses a valid incoming `traceparent` (strict 00- trace-id/parent-id validation, non-zero, lowercase) and emits the three session-id join keys as span attributes, joining a dispatch receipt, runner spans, activity rows, and the relay room in one trace. Older platforms omit the fields and older runners ignore them. (#355 follow-on)
+
+### Fixes
+
+- **MCP gateway bearer is seeded before spawn and the harness falls back when the live file is absent.** The pre-spawn rail injected `MCP_GATEWAY_TOKEN_FILE` with no seed and the harness removed the static `Authorization` header when the env was set, so every platform tool call ENOENT'd from spawn until the first refresh (~7h). `SessionSpec` now carries `mcpAuthToken`/`mcpAuthTokenExpiresAt` and the daemon atomically seeds the token file before env injection, starting the refresher from the real expiry; the `clijsonl` MCP config emits a `headersHelper` that tries the live file first and falls back to the baked spawn-time bearer when absent or empty.
+- **Worktree golangci-lint cache isolated per worktree.** Parallel lint runs no longer share one cache directory and poison each other; `go.work` trap documented. (#364)
+- **Linear sub-issue pagination.** Paginates beyond one upstream page while preserving order. (#359)
+
+### Chores
+
+- **Deps:** bump `go-git` security patch (#361).
+- **Lint:** enforce allowlist import boundaries with `depguard` (#363).
+- **Release:** harness-smoke gate required before publish (#360).
+- **Formatting:** `gofumpt` clean.
+
+---
+
 ## v0.65.0 — 2026-08-17
 
 ### Features

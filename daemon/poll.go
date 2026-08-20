@@ -250,6 +250,16 @@ type PollWorkItem struct {
 	// Forwarded opaquely as json.RawMessage so the strict decoder never
 	// drops it. Opaque forwarder only.
 	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
+
+	// ── W3C trace-context correlation (REN-2649) ─────────────────────────
+	//
+	// Additive platform-dispatch fields per
+	// src/lib/observability/trace-context.ts. Opaque forwarders only.
+	Traceparent      string `json:"traceparent,omitempty"`
+	Tracestate       string `json:"tracestate,omitempty"`
+	SessionStorageID string `json:"sessionStorageId,omitempty"`
+	SessionPublicID  string `json:"sessionPublicId,omitempty"`
+	TrackerSessionID string `json:"trackerSessionId,omitempty"`
 }
 
 // UnmarshalJSON captures the operational projection at the authenticated poll
@@ -1134,8 +1144,10 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		// top-level on the poll item; Company/Model/AuthMode/PlatformAllowed
 		// ride the resolved profile. Every field is absent on a pre-P3 item,
 		// so the spec stays byte-identical for the existing fields (identity).
-		WorkType: item.WorkType,
-		Mode:     item.Mode,
+		WorkType:              item.WorkType,
+		Mode:                  item.Mode,
+		McpAuthToken:          item.McpAuthToken,
+		McpAuthTokenExpiresAt: item.McpAuthTokenExpiresAt,
 	}
 	if matched != nil {
 		spec.ProjectName = matched.ID
@@ -1378,6 +1390,11 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		TerminalWorkareaLease:   item.TerminalWorkareaLease,
 		InterviewBudget:         item.InterviewBudget,
 		InterviewDefinition:     item.InterviewDefinition,
+		Traceparent:             item.Traceparent,
+		Tracestate:              item.Tracestate,
+		SessionStorageID:        item.SessionStorageID,
+		SessionPublicID:         item.SessionPublicID,
+		TrackerSessionID:        item.TrackerSessionID,
 	}
 	for _, opt := range opts {
 		opt(detail)
