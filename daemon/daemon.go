@@ -903,8 +903,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Region:                 cfg.Machine.Region,
 			// Item 8: per-beat CPU/mem load sample → last_cpu_pct/last_mem_pct.
 			// Best-effort stdlib probe; omits the load key when it can't sample.
-			GetLoad:      SampleLoad,
-			OnReregister: reregister,
+			GetLoad:        SampleLoad,
+			GetLoadAverage: SampleLoadAverage,
+			OnReregister:   reregister,
 			LogWarn: func(format string, args ...any) {
 				slog.Warn(fmt.Sprintf(format, args...))
 			},

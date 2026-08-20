@@ -306,6 +306,11 @@ type HeartbeatPayload struct {
 	// last_mem_pct (item 8). Pointer + omitempty so an absent sample is
 	// distinguishable from a genuine {cpu:0,memory:0}.
 	Load *heartbeatLoadFields `json:"load,omitempty"`
+
+	// LoadAverage carries Unix load averages (1/5/15 min) sampled once
+	// per beat. Best-effort: when unavailable the key is omitted entirely
+	// (GetLoadAverage returns ok=false), matching Load's contract.
+	LoadAverage *heartbeatLoadAverageFields `json:"loadAverage,omitempty"`
 }
 
 // ── Auto-update channel/schedule ───────────────────────────────────────────

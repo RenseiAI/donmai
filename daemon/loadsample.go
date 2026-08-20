@@ -222,6 +222,85 @@ func darwinCPUPct() (float64, bool) {
 	return clampPct(sum / float64(cores)), true
 }
 
+// SampleLoadAverage returns Unix load averages (1/5/15 min) as best-effort
+// floats. ok is true only when all three values were obtained — partial
+// samples are not sent, matching SampleLoad's contract of all-or-nothing.
+// A panic is recovered so a sampling failure can never abort a heartbeat.
+func SampleLoadAverage() (one, five, fifteen float64, ok bool) {
+	defer func() {
+		if recover() != nil {
+			one, five, fifteen, ok = 0, 0, 0, false
+		}
+	}()
+	switch runtime.GOOS {
+	case "linux", "darwin":
+		return sampleLoadAverage()
+	default:
+		return 0, 0, 0, false
+	}
+}
+
+func sampleLoadAverage() (one, five, fifteen float64, ok bool) {
+	// Prefer /proc/loadavg on Linux (cheapest, no cgo), fall back to
+	// syscall on Darwin. Both are instantaneous single-read probes.
+	if runtime.GOOS == "linux" {
+		if v, ok := linuxLoadAverage(); ok {
+			return v.one, v.five, v.fifteen, true
+		}
+	}
+	// Darwin (and Linux fallback) — try sysctl / getloadavg via shell.
+	// On systems where loadavg is unavailable, ok=false and heartbeat omits it.
+	return sysctlLoadAverage()
+}
+
+type loadTriple struct{ one, five, fifteen float64 }
+
+func linuxLoadAverage() (loadTriple, bool) {
+	raw, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return loadTriple{}, false
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) < 3 {
+		return loadTriple{}, false
+	}
+	one, err1 := strconv.ParseFloat(fields[0], 64)
+	five, err2 := strconv.ParseFloat(fields[1], 64)
+	fifteen, err3 := strconv.ParseFloat(fields[2], 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return loadTriple{}, false
+	}
+	if one < 0 || five < 0 || fifteen < 0 {
+		return loadTriple{}, false
+	}
+	return loadTriple{one: one, five: five, fifteen: fifteen}, true
+}
+
+func sysctlLoadAverage() (one, five, fifteen float64, ok bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	// `sysctl -n vm.loadavg` on Darwin; `cat /proc/loadavg` already tried on Linux.
+	out, err := exec.CommandContext(ctx, "sysctl", "-n", "vm.loadavg").Output()
+	if err != nil {
+		// Last resort: try reading the sysctl MIB via `sysctl` text, or fall back to
+		// proc path again on unexpected platform.
+		return 0, 0, 0, false
+	}
+	// Darwin vm.loadavg: "{ 1.23 0.98 0.87 }" or "1.23 0.98 0.87"
+	clean := strings.Trim(strings.TrimSpace(string(out)), "{} ")
+	fields := strings.Fields(clean)
+	if len(fields) < 3 {
+		return 0, 0, 0, false
+	}
+	one, err1 := strconv.ParseFloat(fields[0], 64)
+	five, err2 := strconv.ParseFloat(fields[1], 64)
+	fifteen, err3 := strconv.ParseFloat(fields[2], 64)
+	if err1 != nil || err2 != nil || err3 != nil || one < 0 || five < 0 || fifteen < 0 {
+		return 0, 0, 0, false
+	}
+	return one, five, fifteen, true
+}
+
 // clampPct bounds a percentage to [0,100].
 func clampPct(v float64) float64 {
 	if v < 0 {
