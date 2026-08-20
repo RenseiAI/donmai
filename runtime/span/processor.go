@@ -138,14 +138,14 @@ func NewProcessor(cfg ProcessorConfig) (*Processor, error) {
 	}
 	now := cfg.Now()
 	return &Processor{
-		cfg:                cfg,
-		traceID:            traceID,
-		rootSpanID:         rootID,
-		dispatchParentID:   dispatchParentID,
-		rootStart:          now,
-		turnStart:          now,
-		pendingTools:       make(map[string]pendingTool),
-		completedTools:     make(map[string]pendingTool),
+		cfg:              cfg,
+		traceID:          traceID,
+		rootSpanID:       rootID,
+		dispatchParentID: dispatchParentID,
+		rootStart:        now,
+		turnStart:        now,
+		pendingTools:     make(map[string]pendingTool),
+		completedTools:   make(map[string]pendingTool),
 	}, nil
 }
 

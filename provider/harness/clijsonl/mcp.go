@@ -32,13 +32,11 @@ type mcpConfigFile = mcp.ConfigFile
 const (
 	mcpGatewayFileEnv = "MCP_GATEWAY_TOKEN_FILE"
 
-	// Claude runs headersHelper through a shell and requires a JSON object of
-	// string headers on stdout. Keep the path in the environment rather than
-	// interpolating it into this command so spaces and shell metacharacters in
-	// the path cannot change the command. When the refresh rail has not yet
-	// seeded the file (or it is empty), fall back to the baked spawn-time
-	// bearer so the session never ENOENTs from spawn.
-	mcpGatewayHeadersHelper = `token=$(cat -- "$MCP_GATEWAY_TOKEN_FILE") || exit 1; printf '{"Authorization":"Bearer %s"}\n' "$token"`
+	// mcpGatewayHeadersHelper is the legacy non-fallback helper (retained for
+	// doc/compat; prefer mcpGatewayHeadersHelperWithFallback which never ENOENTs
+	// from spawn). Claude runs the helper through a shell and requires a JSON
+	// object of string headers on stdout.
+	mcpGatewayHeadersHelper = `token=$(cat -- "$MCP_GATEWAY_TOKEN_FILE") || exit 1; printf '{"Authorization":"Bearer %s"}\n' "$token"` //nolint:unused // retained for compat
 )
 
 // mcpGatewayHeadersHelperWithFallback returns a helper that tries the live file
