@@ -183,16 +183,31 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// top inside the worktree afterward — passing a non-existent
 	// branch to `git clone --branch` fails because the upstream
 	// reference does not yet exist.
+	// REN-2628 amend-existing-PR: when dispatch carries a base Ref, provision the
+	// worktree AT that ref and retain it as the working/push branch. Validation
+	// is strict (no empty, no ".." , no absolute) so a malformed ref cannot
+	// escape the worktree. Trimmed Ref empty preserves legacy behaviour exactly.
+	refBranch := ""
+	if ref := trimRef(qw.Ref); ref != "" {
+		if err := validateRef(ref); err != nil {
+			res.Status = "failed"
+			res.FailureMode = FailureWorktreeProvision
+			res.Error = err.Error()
+			return res, err
+		}
+		refBranch = ref
+	}
 	branch := qw.Branch
-	if branch == "" {
+	if refBranch != "" {
+		branch = refBranch
+	} else if branch == "" {
 		branch = "agent/" + qw.SessionID
 	}
 	wpath, err := r.wt.Provision(ctx, worktree.ProvisionSpec{
 		SessionID: qw.SessionID,
 		RepoURL:   qw.Repository,
-		// Branch left empty — clone the remote default. The agent
-		// branch is created post-clone via `git checkout -b`.
-		Strategy: worktree.StrategyClone,
+		Branch:    refBranch,
+		Strategy:  worktree.StrategyClone,
 	})
 	if err != nil {
 		res.Status = "failed"
@@ -203,13 +218,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	res.WorktreePath = wpath
 	r.logger.Debug("worktree provisioned", "sessionId", qw.SessionID, "path", wpath)
 
-	// Create the per-session work branch in the worktree. Best-effort:
-	// when the branch already exists (replay during recovery) `git
-	// checkout -b` returns non-zero; we surface a Debug log and
-	// continue so the agent still operates on the existing branch.
-	if _, gerr := runGit(ctx, wpath, gitIdentity{}, "checkout", "-b", branch); gerr != nil {
-		r.logger.Debug("create work branch failed (may already exist)",
-			"branch", branch, "err", gerr)
+	// Create the per-session work branch in the worktree (skipped when
+	// provisioning at an existing ref — that ref IS the working branch).
+	if refBranch == "" {
+		if _, gerr := runGit(ctx, wpath, gitIdentity{}, "checkout", "-b", branch); gerr != nil {
+			r.logger.Debug("create work branch failed (may already exist)",
+				"branch", branch, "err", gerr)
+		}
+	} else {
+		r.logger.Info("provisioned at existing ref branch", "branch", branch, "sessionId", qw.SessionID)
 	}
 
 	// 2a-bis. Materialize read-only sibling context repos named by
@@ -1110,13 +1127,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
+	// REN-2628 amend-existing-PR: on ref-bearing runs, skip gh pr create — the
+	// fix lands on the existing branch/PR, not a new one.
 	if !r.skipBackstop && !nonVCPassed && shouldBackstop(res, qw.WorkType) {
-		bsCtx, bsCancel := context.WithTimeout(context.Background(), 90*time.Second)
-		bsReport := r.runBackstop(bsCtx, qw, branch, res)
-		bsCancel()
-		res.BackstopReport = &bsReport
-		if bsReport.PRURL != "" && res.PullRequestURL == "" {
-			res.PullRequestURL = bsReport.PRURL
+		if trimRef(qw.Ref) != "" {
+			r.logger.Info("skipping backstop gh pr create on ref-bearing run", "branch", branch, "ref", qw.Ref)
+		} else {
+			bsCtx, bsCancel := context.WithTimeout(context.Background(), 90*time.Second)
+			bsReport := r.runBackstop(bsCtx, qw, branch, res)
+			bsCancel()
+			res.BackstopReport = &bsReport
+			if bsReport.PRURL != "" && res.PullRequestURL == "" {
+				res.PullRequestURL = bsReport.PRURL
+			}
 		}
 	}
 
@@ -1897,6 +1920,13 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	if qw.PlatformURL != "" {
 		envMap["DONMAI_API_URL"] = qw.PlatformURL
 	}
+	// REN-2628 auth half: expose GH_TOKEN only for ref-bearing runs so
+	// the agent can read the PR it was asked to fix. Least-privilege —
+	// absent Ref means no token in env, so gh 404 is the correct signal
+	// that this run has no PR-read scope.
+	if trimRef(qw.Ref) != "" && strings.TrimSpace(qw.AuthToken) != "" {
+		envMap["GH_TOKEN"] = strings.TrimSpace(qw.AuthToken)
+	}
 	if qw.AuthToken != "" {
 		envMap["WORKER_AUTH_TOKEN"] = qw.AuthToken
 	}
@@ -1933,6 +1963,21 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 // already pins that cell to human-controlled exactly when the work is
 // interactive or an interview — so the OR below is faithful to both lanes:
 // the cell decides when there is one, and Spec.Interactive decides otherwise.
+func trimRef(ref string) string { return strings.TrimSpace(ref) }
+
+func validateRef(ref string) error {
+	if ref == "" || strings.Contains(ref, "..") || strings.HasPrefix(ref, "/") || strings.Contains(ref, "\x00") {
+		return fmt.Errorf("invalid ref %q", ref)
+	}
+	// Allow typical branch/tag refs: alphanum + /._- . Be strict but not exotic.
+	for _, r := range ref {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '/' || r == '.' || r == '_' || r == '-') {
+			return fmt.Errorf("invalid ref %q: illegal character %q", ref, r)
+		}
+	}
+	return nil
+}
+
 func sessionPromptMode(qw QueuedWork, cell executioncell.ResolvedExecutionCell) agent.PromptSessionMode {
 	if cell.SessionMode == executioncell.SessionHumanControlled || qw.isInteractive() {
 		return agent.PromptModeHumanControlled
