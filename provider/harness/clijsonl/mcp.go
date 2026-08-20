@@ -35,10 +35,19 @@ const (
 	// Claude runs headersHelper through a shell and requires a JSON object of
 	// string headers on stdout. Keep the path in the environment rather than
 	// interpolating it into this command so spaces and shell metacharacters in
-	// the path cannot change the command. A failed read must fail the helper;
-	// emitting an empty bearer would hide the credential-delivery error.
+	// the path cannot change the command. When the refresh rail has not yet
+	// seeded the file (or it is empty), fall back to the baked spawn-time
+	// bearer so the session never ENOENTs from spawn.
 	mcpGatewayHeadersHelper = `token=$(cat -- "$MCP_GATEWAY_TOKEN_FILE") || exit 1; printf '{"Authorization":"Bearer %s"}\n' "$token"`
 )
+
+// mcpGatewayHeadersHelperWithFallback returns a helper that tries the live file
+// first and falls back to staticBearer when absent/empty. staticBearer is the
+// raw token (no "Bearer " prefix), single-quote escaped for sh.
+func mcpGatewayHeadersHelperWithFallback(staticBearer string) string {
+	esc := strings.ReplaceAll(staticBearer, "'", "'\\''")
+	return `token=$(cat -- "$MCP_GATEWAY_TOKEN_FILE" 2>/dev/null); if [ -z "$token" ]; then token='` + esc + `'; fi; printf '{"Authorization":"Bearer %s"}\n' "$token"`
+}
 
 // writeMCPConfig serializes Spec.MCPServers to a JSON tmpfile and
 // returns its absolute path. Returns "" with nil error when the spec
@@ -120,13 +129,15 @@ func preferLiveGatewayHeader(cfg *mcp.ConfigFile, servers []agent.MCPServerConfi
 	}
 
 	authorizationKey := ""
+	staticValue := ""
 	for key, value := range gateway.Headers {
 		if strings.EqualFold(key, "Authorization") && strings.HasPrefix(value, "Bearer ") {
 			authorizationKey = key
+			staticValue = strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
 			break
 		}
 	}
-	if authorizationKey == "" {
+	if authorizationKey == "" || strings.TrimSpace(staticValue) == "" {
 		return
 	}
 
@@ -145,7 +156,7 @@ func preferLiveGatewayHeader(cfg *mcp.ConfigFile, servers []agent.MCPServerConfi
 		}
 		entry.Headers = headers
 	}
-	entry.HeadersHelper = mcpGatewayHeadersHelper
+	entry.HeadersHelper = mcpGatewayHeadersHelperWithFallback(staticValue)
 	cfg.MCPServers[gateway.Name] = entry
 }
 
