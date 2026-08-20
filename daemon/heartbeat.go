@@ -63,6 +63,12 @@ type HeartbeatOptions struct {
 	// last_cpu_pct/last_mem_pct).
 	GetLoad func() (cpuPct, memPct float64, ok bool)
 
+	// GetLoadAverage returns Unix load averages (1/5/15 min). Same
+	// best-effort contract as GetLoad: ok=false omits the key. Wire it
+	// to SampleLoadAverage. Additive: absence preserves the Load-only
+	// beat byte-identical.
+	GetLoadAverage func() (one, five, fifteen float64, ok bool)
+
 	// GetAllowlist returns the daemon's current project allowlist entries
 	// (derived from cfg.Projects). Called every beat so a hot yaml reload
 	// (when that lands) or in-process mutation reflects in the next
@@ -326,6 +332,11 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 			payload.Load = &heartbeatLoadFields{CPU: cpu, Memory: mem}
 		}
 	}
+	if h.opts.GetLoadAverage != nil {
+		if one, five, fifteen, ok := h.opts.GetLoadAverage(); ok {
+			payload.LoadAverage = &heartbeatLoadAverageFields{One: one, Five: five, Fifteen: fifteen}
+		}
+	}
 
 	// Phase 2c: pull any ACKs we owe the platform from the buffer. Cleared
 	// only on a SUCCESSFUL POST below; a network failure leaves them
@@ -475,20 +486,27 @@ type heartbeatRequestBody struct {
 	// ActiveInteractiveCount is a *int so a nil (unreported) value drops the
 	// key via omitempty — an embedder that does not classify interactive
 	// occupancy must not send a misleading 0.
-	ActiveInteractiveCount *int                       `json:"activeInteractiveCount,omitempty"`
-	MaxSessions            int                        `json:"maxSessions,omitempty"`
-	Load                   *heartbeatLoadFields       `json:"load,omitempty"`
-	AllowlistHash          string                     `json:"allowlistHash,omitempty"`
-	Allowlist              []ProjectAllowlistEntry    `json:"allowlist,omitempty"`
-	EnabledProjectIDs      []string                   `json:"enabledProjectIds,omitempty"`
-	ProjectAdmissionMode   string                     `json:"projectAdmissionMode,omitempty"`
-	AppliedMutations       []string                   `json:"appliedMutations,omitempty"`
-	MutationFailures       []HeartbeatMutationFailure `json:"mutationFailures,omitempty"`
+	ActiveInteractiveCount *int                        `json:"activeInteractiveCount,omitempty"`
+	MaxSessions            int                         `json:"maxSessions,omitempty"`
+	Load                   *heartbeatLoadFields        `json:"load,omitempty"`
+	LoadAverage            *heartbeatLoadAverageFields `json:"loadAverage,omitempty"`
+	AllowlistHash          string                      `json:"allowlistHash,omitempty"`
+	Allowlist              []ProjectAllowlistEntry     `json:"allowlist,omitempty"`
+	EnabledProjectIDs      []string                    `json:"enabledProjectIds,omitempty"`
+	ProjectAdmissionMode   string                      `json:"projectAdmissionMode,omitempty"`
+	AppliedMutations       []string                    `json:"appliedMutations,omitempty"`
+	MutationFailures       []HeartbeatMutationFailure  `json:"mutationFailures,omitempty"`
 }
 
 type heartbeatLoadFields struct {
 	CPU    float64 `json:"cpu"`
 	Memory float64 `json:"memory"`
+}
+
+type heartbeatLoadAverageFields struct {
+	One     float64 `json:"one"`
+	Five    float64 `json:"five"`
+	Fifteen float64 `json:"fifteen"`
 }
 
 // HeartbeatMutationFailure is sent in the request body's mutationFailures[]
@@ -589,6 +607,7 @@ func (h *HeartbeatService) callEndpoint(
 		ActiveInteractiveCount: payload.ActiveInteractiveSessions,
 		MaxSessions:            payload.MaxSessions,
 		Load:                   payload.Load,
+		LoadAverage:            payload.LoadAverage,
 		AllowlistHash:          payload.AllowlistHash,
 		Allowlist:              payload.Allowlist,
 		EnabledProjectIDs:      payload.EnabledProjectIDs,
