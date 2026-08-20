@@ -192,4 +192,32 @@ for f in .env.local .env; do
   fi
 done
 
+# Per-worktree golangci-lint result cache isolation + GOWORK
+# guidance. golangci-lint's result cache is keyed by module path, not
+# worktree — without this, stale absolute paths from a sibling worktree
+# poison lint results until `golangci-lint cache clean`. The org go.work
+# lists only the primary clone, so sibling worktrees resolve the wrong
+# module set unless GOWORK=off. Create a per-worktree cache dir and seed
+# env hints so new worktrees never share a result cache.
+GOLANGCI_CACHE_DIR="$WT_PATH/.cache/golangci-lint"
+mkdir -p "$GOLANGCI_CACHE_DIR" 2>/dev/null || true
+if [ -f "$WT_PATH/.env.local" ]; then
+  if ! grep -q 'GOLANGCI_LINT_CACHE' "$WT_PATH/.env.local" 2>/dev/null; then
+    echo "GOLANGCI_LINT_CACHE=$GOLANGCI_CACHE_DIR" >> "$WT_PATH/.env.local"
+    err "Isolated GOLANGCI_LINT_CACHE=$GOLANGCI_CACHE_DIR — prevents cross-worktree lint poisoning"
+  fi
+fi
+if [ ! -f "$WT_PATH/.envrc" ]; then
+  cat > "$WT_PATH/.envrc" <<EOF
+# Per-worktree Go isolation (golangci-lint cache + go.work)
+# golangci-lint's result cache is keyed by module path, not worktree — without
+# this, stale absolute paths from a sibling worktree poison lint results.
+# The org go.work lists only the primary clone, so sibling worktrees resolve
+# the wrong module set unless GOWORK=off.
+export GOLANGCI_LINT_CACHE="$GOLANGCI_CACHE_DIR"
+export GOWORK=off
+EOF
+  err "Wrote per-worktree .envrc with GOLANGCI_LINT_CACHE + GOWORK=off"
+fi
+
 echo "$WT_PATH"
