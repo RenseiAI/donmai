@@ -25,3 +25,7 @@ __pycache__/
 **/.golangci-lint-cache/
 
 dist/
+
+# Harness session directory. Holds the session transcript, which includes the full
+# environment the agent was spawned with (live API keys). Never commit it.
+.pi/
