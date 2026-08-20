@@ -194,7 +194,7 @@ func TestWriteMCPConfig_GatewayHeadersHelperFallbackWhenFileAbsent(t *testing.T)
 
 	// Absent file must not ENOENT — fallback to baked bearer.
 	absentPath := filepath.Join(t.TempDir(), "no-such-token")
-	cmd := exec.Command("sh", "-c", helper)
+	cmd := exec.Command("sh", "-c", helper) // #nosec G204 -- helper is fixture under test, input controlled
 	cmd.Env = append(os.Environ(), mcpGatewayFileEnv+"="+absentPath)
 	out, err := cmd.Output()
 	if err != nil {
@@ -255,7 +255,7 @@ func TestWriteMCPConfig_GatewayHeadersHelperReadsLatestToken(t *testing.T) {
 				t.Fatalf("replace token: %v", err)
 			}
 
-			cmd := exec.Command("sh", "-c", helper)
+			cmd := exec.Command("sh", "-c", helper) // #nosec G204 -- helper is fixture under test, input controlled
 			cmd.Env = append(os.Environ(), mcpGatewayFileEnv+"="+tokenPath)
 			output, err := cmd.Output()
 			if err != nil {
