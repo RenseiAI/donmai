@@ -1146,6 +1146,8 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		// so the spec stays byte-identical for the existing fields (identity).
 		WorkType: item.WorkType,
 		Mode:     item.Mode,
+		McpAuthToken:          item.McpAuthToken,
+		McpAuthTokenExpiresAt: item.McpAuthTokenExpiresAt,
 	}
 	if matched != nil {
 		spec.ProjectName = matched.ID
