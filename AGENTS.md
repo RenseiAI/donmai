@@ -145,6 +145,11 @@ count, and a suite that quietly starts skipping protects nothing.
   after test runs that touch `daemon/`.
 - `GOWORK`: the org `go.work` ties sibling Go repos together; matrix generation
   and smokes intentionally run with `GOWORK=off` — don't "fix" that.
+- `golangci-lint` result cache is keyed by module path, not worktree — it serves stale
+  absolute paths from a DIFFERENT sibling worktree until `golangci-lint cache clean`.
+  Every parallel-worktree Go session risks phantom lint results; new worktrees get a
+  per-worktree `GOLANGCI_LINT_CACHE` from `scripts/create-worktree.sh` and should run with
+  `GOWORK=off` so the sibling resolves the right module set.
 - After a brew upgrade of the daemon-shipping binary, restart the service
   (`brew services restart donmai`, service `dev.donmai.daemon`) — a resident
   old daemon exec's a dead versioned Caskroom path.
