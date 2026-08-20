@@ -193,6 +193,15 @@ type SessionSpec struct {
 	// the platform stamps it explicitly; otherwise the embedder derives it
 	// from WorkType/Mode.
 	Workload string `json:"workload,omitempty"`
+
+	// McpAuthToken is the platform-minted per-session MCP gateway bearer.
+	// Carried opaquely so the embedder's pre-spawn rail can atomically seed
+	// the token file before env injection. Absent on pre-fix dispatches.
+	McpAuthToken string `json:"mcpAuthToken,omitempty"`
+
+	// McpAuthTokenExpiresAt is the RFC3339 expiry of McpAuthToken.
+	// Advisory; empty when McpAuthToken is absent.
+	McpAuthTokenExpiresAt string `json:"mcpAuthTokenExpiresAt,omitempty"`
 }
 
 // SessionResources is the optional resource request on a SessionSpec.

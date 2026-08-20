@@ -42,6 +42,15 @@ type ProcessorConfig struct {
 	System      string
 	Model       string
 
+	// REN-2649 incoming trace correlation (optional). When present the
+	// processor reuses the platform-minted trace ID and parents the session
+	// root to the dispatch parent ID; absent preserves locally minted trace.
+	Traceparent      string
+	Tracestate       string
+	SessionStorageID string
+	SessionPublicID  string
+	TrackerSessionID string
+
 	Sender      Sender
 	Now         func() time.Time
 	IDGenerator IDGenerator
@@ -65,10 +74,11 @@ type Processor struct {
 
 	cfg ProcessorConfig
 
-	traceID    string
-	rootSpanID string
-	rootStart  time.Time
-	turnStart  time.Time
+	traceID          string
+	rootSpanID       string
+	dispatchParentID string
+	rootStart        time.Time
+	turnStart        time.Time
 
 	activeLlmSpanID  string
 	activeLlmStart   time.Time
@@ -101,26 +111,41 @@ func NewProcessor(cfg ProcessorConfig) (*Processor, error) {
 	if cfg.IDGenerator == nil {
 		cfg.IDGenerator = randomHexID
 	}
-	traceID, err := cfg.IDGenerator(16)
-	if err != nil {
-		return nil, fmt.Errorf("runtime/span: generate trace id: %w", err)
+	// REN-2649: reuse incoming W3C traceparent when valid; otherwise mint.
+	var traceID, dispatchParentID string
+	if cfg.Traceparent != "" {
+		if tid, pid, ok := parseTraceparent(cfg.Traceparent); ok {
+			traceID = tid
+			dispatchParentID = pid
+		}
+	}
+	if traceID == "" {
+		var err error
+		traceID, err = cfg.IDGenerator(16)
+		if err != nil {
+			return nil, fmt.Errorf("runtime/span: generate trace id: %w", err)
+		}
+		if !validHexID(traceID, 16) {
+			return nil, errors.New("runtime/span: IDGenerator returned invalid hex id")
+		}
 	}
 	rootID, err := cfg.IDGenerator(8)
 	if err != nil {
 		return nil, fmt.Errorf("runtime/span: generate root span id: %w", err)
 	}
-	if !validHexID(traceID, 16) || !validHexID(rootID, 8) {
+	if !validHexID(rootID, 8) {
 		return nil, errors.New("runtime/span: IDGenerator returned invalid hex id")
 	}
 	now := cfg.Now()
 	return &Processor{
-		cfg:            cfg,
-		traceID:        traceID,
-		rootSpanID:     rootID,
-		rootStart:      now,
-		turnStart:      now,
-		pendingTools:   make(map[string]pendingTool),
-		completedTools: make(map[string]pendingTool),
+		cfg:              cfg,
+		traceID:          traceID,
+		rootSpanID:       rootID,
+		dispatchParentID: dispatchParentID,
+		rootStart:        now,
+		turnStart:        now,
+		pendingTools:     make(map[string]pendingTool),
+		completedTools:   make(map[string]pendingTool),
 	}, nil
 }
 
@@ -201,6 +226,7 @@ func (p *Processor) Finish(status, message string) {
 		SpanCore: agent.SpanCore{
 			TraceID:           p.traceID,
 			SpanID:            p.rootSpanID,
+			ParentSpanID:      p.dispatchParentID,
 			Kind:              agent.SpanKindAgent,
 			Name:              "agent session",
 			StartTimeUnixNano: unixNanoString(p.rootStart),
@@ -476,15 +502,22 @@ func (p *Processor) mustID(byteLen int) string {
 }
 
 func (p *Processor) extensions(promptHash, contextHash, modelSnapshotID string) agent.DonmaiSpanExtensions {
+	sessionStorageID := p.cfg.SessionStorageID
+	if sessionStorageID == "" {
+		sessionStorageID = p.cfg.SessionID
+	}
 	return agent.DonmaiSpanExtensions{
-		OrgID:           p.cfg.OrgID,
-		WorkspaceID:     p.cfg.WorkspaceID,
-		SessionID:       p.cfg.SessionID,
-		WorkType:        p.cfg.WorkType,
-		PoolID:          p.cfg.PoolID,
-		PromptHash:      promptHash,
-		ContextHash:     contextHash,
-		ModelSnapshotID: modelSnapshotID,
+		OrgID:            p.cfg.OrgID,
+		WorkspaceID:      p.cfg.WorkspaceID,
+		SessionID:        p.cfg.SessionID,
+		WorkType:         p.cfg.WorkType,
+		PoolID:           p.cfg.PoolID,
+		PromptHash:       promptHash,
+		ContextHash:      contextHash,
+		ModelSnapshotID:  modelSnapshotID,
+		SessionStorageID: sessionStorageID,
+		SessionPublicID:  p.cfg.SessionPublicID,
+		TrackerSessionID: p.cfg.TrackerSessionID,
 	}
 }
 
@@ -559,6 +592,30 @@ func validHexID(id string, byteLen int) bool {
 	}
 	_, err := hex.DecodeString(id)
 	return err == nil
+}
+
+func parseTraceparent(tp string) (traceID, parentID string, ok bool) {
+	parts := strings.Split(tp, "-")
+	if len(parts) != 4 {
+		return "", "", false
+	}
+	if parts[0] != "00" {
+		return "", "", false
+	}
+	if !validHexID(parts[1], 16) || !validHexID(parts[2], 8) {
+		return "", "", false
+	}
+	if parts[1] == strings.Repeat("0", 32) || parts[2] == strings.Repeat("0", 16) {
+		return "", "", false
+	}
+	if parts[3] != "01" && parts[3] != "00" {
+		return "", "", false
+	}
+	// Lowercase canonical.
+	if parts[1] != strings.ToLower(parts[1]) || parts[2] != strings.ToLower(parts[2]) {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
 }
 
 // ProviderSystem returns the best provider/system identifier available at the

@@ -299,6 +299,17 @@ type SessionDetail struct {
 	// does not advertise capabilities, or one with no adapters, keeps the prior
 	// behaviour. Forwarded opaquely; the daemon does not interpret the keys.
 	Capabilities map[string]bool `json:"capabilities,omitempty"`
+
+	// ── W3C trace-context correlation (REN-2649) ─────────────────────────
+	//
+	// Platform dispatch stamps these opaquely per
+	// src/lib/observability/trace-context.ts. Trace correlation only; never
+	// authorization. Opaque forwarders.
+	Traceparent      string `json:"traceparent,omitempty"`
+	Tracestate       string `json:"tracestate,omitempty"`
+	SessionStorageID string `json:"sessionStorageId,omitempty"`
+	SessionPublicID  string `json:"sessionPublicId,omitempty"`
+	TrackerSessionID string `json:"trackerSessionId,omitempty"`
 }
 
 // SessionResolvedProfile mirrors runner.ResolvedProfile but lives in
