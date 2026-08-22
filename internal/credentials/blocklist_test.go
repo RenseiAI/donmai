@@ -34,6 +34,26 @@ func TestIsBlocked_NonBlockedKeys(t *testing.T) {
 	}
 }
 
+// TestIsBlocked_PlatformOriginIsReserved pins the reservation half of the list:
+// the platform API origin is runner-owned (composed per session from that
+// session's QueuedWork and delivered on agent.Spec.Env), so a credential
+// snapshot must never be able to author it. Deleting the DONMAI_API_URL entry
+// from AgentEnvBlocklist turns this red.
+func TestIsBlocked_PlatformOriginIsReserved(t *testing.T) {
+	t.Parallel()
+	if !IsBlocked("DONMAI_API_URL") {
+		t.Error(`IsBlocked("DONMAI_API_URL") = false, want true (runner-owned, never credential-owned)`)
+	}
+	got := Filter([]string{
+		"PATH=/usr/bin",
+		"DONMAI_API_URL=https://agent.example.com;",
+	})
+	want := []string{"PATH=/usr/bin"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Filter() kept a snapshot-authored platform origin:\n  got:  %v\n  want: %v", got, want)
+	}
+}
+
 func TestIsBlocked_CaseSensitive(t *testing.T) {
 	t.Parallel()
 	if IsBlocked("rensei_daemon_jwt") {
@@ -132,6 +152,7 @@ func TestBlocklistContents(t *testing.T) {
 		"DONMAI_ORCHESTRATOR_URL",
 		"DONMAI_CREDENTIAL_CAPABILITY",
 		"CODE_INTEL_HOST_JWT_SECRET",
+		"DONMAI_API_URL",
 	}
 	got := append([]string{}, AgentEnvBlocklist...)
 	sort.Strings(got)
