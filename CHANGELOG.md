@@ -22,17 +22,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   carry their organization identity, host authority may be resolved per
   organization, and hosted callers can request one exact fence per organization
   without collapsing duplicate shim incarnations. Every covered session carries
-  shim id, process epoch, controller generation, and the last durably
-  carrier-forwarded output sequence. Partial retries reuse the original exact
-  request bytes. The legacy single-fence method remains available. (#376, #378)
+  process epoch, controller generation, and the last durably carrier-forwarded
+  output sequence, plus shim id when available; malformed quarantine may omit
+  the shim id. Partial retries reuse the original exact request bytes. The
+  legacy single-fence method remains available. (#376, #378)
 - **Adoption exposes fail-closed durable composition points.** A per-session
   preparation hook runs only after authenticated Hello supplies the exact
   shim/process/current-generation correlation; the shim must echo the exact
   proposed generation and extensions in Adopted. Optional per-session callbacks
   can rehydrate durable carriers, followed by one complete per-organization
-  adopted/quarantined/tombstoned batch. When the batch hook is configured,
-  non-empty expected and durable revisions are required before adoption is
-  reported complete. Nil hooks preserve standalone behavior. (#378)
+  adopted/quarantined/tombstoned batch. When `PrepareAdoptionBatch` is
+  configured it must return a non-empty expected revision; when
+  `OnAdoptionBatch` is configured it must return a non-empty durable receipt.
+  When both are configured both conditions hold before adoption is reported
+  complete. Nil hooks preserve standalone behavior. (#378)
 
 ### Fixes
 
