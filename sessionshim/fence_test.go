@@ -340,7 +340,7 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 	now := time.Unix(1_700_000_000, 0)
 	ids := []FencedSession{
 		{OrgID: "o", SessionID: "s3", LastForwardedSeq: 3},
-		{OrgID: "o", SessionID: "s1", ShimID: "shim", ProcessEpoch: 2, LastForwardedSeq: 2},
+		{OrgID: "o", SessionID: "s1", ShimID: "shim", ProcessEpoch: 2, ControllerGeneration: 5, LastForwardedSeq: 2},
 		{OrgID: "n", SessionID: "s2", LastForwardedSeq: 1},
 	}
 	var received FenceRequest
@@ -352,9 +352,9 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 	if err != nil {
 		t.Fatalf("RequestFence: %v", err)
 	}
-	want := []string{"o/s3//0/3", "o/s1/shim/2/2", "n/s2//0/1"}
+	want := []string{"o/s3//0/0/3", "o/s1/shim/2/5/2", "n/s2//0/0/1"}
 	for i, w := range want {
-		got := fmt.Sprintf("%s/%s/%d/%d", f.Sessions[i].Identity(), f.Sessions[i].ShimID, f.Sessions[i].ProcessEpoch, f.Sessions[i].LastForwardedSeq)
+		got := fmt.Sprintf("%s/%s/%d/%d/%d", f.Sessions[i].Identity(), f.Sessions[i].ShimID, f.Sessions[i].ProcessEpoch, f.Sessions[i].ControllerGeneration, f.Sessions[i].LastForwardedSeq)
 		if got != w {
 			t.Fatalf("Sessions[%d] = %s, want %s", i, got, w)
 		}
@@ -374,5 +374,8 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 	}
 	if !bytes.Contains(received.RequestBytes, []byte(`"processEpoch":0`)) {
 		t.Fatalf("request bytes omitted the zero-valued processEpoch correlation: %s", received.RequestBytes)
+	}
+	if !bytes.Contains(received.RequestBytes, []byte(`"controllerGeneration":5`)) {
+		t.Fatalf("request bytes omitted the per-session controller generation: %s", received.RequestBytes)
 	}
 }

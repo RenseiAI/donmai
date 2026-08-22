@@ -25,6 +25,15 @@ type AdoptOptions struct {
 	// value. Nil uses current+1, which is the ordinary path.
 	NextGeneration func(id Identity, current shimwire.Generation) shimwire.Generation
 
+	// Prepare is the optional per-identity composing hook run before the daemon
+	// sends Welcome and therefore before it acquires controller authority. It is
+	// where an embedder resolves a fresh carrier generation or any other generic
+	// Welcome extension that must be fixed for this adoption. A failure aborts
+	// the WHOLE startup pass: silently quarantining one otherwise-compatible shim
+	// would let the daemon advertise ready without rehydrating that session's
+	// external carrier (ADR-2026-08-17 §D4).
+	Prepare func(ctx context.Context, id Identity, current shimwire.Generation) (PreparedAdoption, error)
+
 	// ResumeFrom returns the first sequence this daemon still needs for a
 	// session — its durable last_forwarded_seq + 1. Nil resumes from the start of
 	// the stream, which is always SAFE (it can only over-replay, never
@@ -43,6 +52,24 @@ type AdoptOptions struct {
 	Logger *slog.Logger
 	Now    func() time.Time
 }
+
+// PreparedAdoption is the per-session portion of Welcome supplied by a
+// composing daemon. Both fields are optional; the zero value preserves the
+// standalone controller's current+1 generation and extension-free handshake.
+//
+// ControllerGeneration is resolved only after the verified Hello exposes the
+// shim's authoritative current generation. Zero preserves current+1. This
+// deliberately provides no scalar host generation: session-shim-v1 owns one
+// controller generation per shim.
+type PreparedAdoption struct {
+	ControllerGeneration shimwire.Generation
+	Extensions           shimwire.Extensions
+}
+
+// ErrAdoptionPreparation reports a composing dependency that failed before
+// controller authority was proposed. Callers fail startup closed rather than
+// converting it into an ordinary compatibility quarantine.
+var ErrAdoptionPreparation = errors.New("sessionshim: adoption preparation failed")
 
 func (o AdoptOptions) now() time.Time {
 	if o.Now != nil {
@@ -137,8 +164,23 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 	}
 	tombstoneByID := make(map[Identity]Tombstone, len(tombstones))
 	for _, t := range tombstones {
-		tombstoneByID[t.Identity()] = t
-		result.Tombstoned = append(result.Tombstoned, t)
+		if t.GroupReaped {
+			tombstoneByID[t.Identity()] = t
+			result.Tombstoned = append(result.Tombstoned, t)
+			continue
+		}
+		// A tombstone is terminal observation, but only GroupReaped is positive
+		// proof that capacity disappeared. Keep the exact shim/process incarnation
+		// visible and charged rather than treating a failed OS probe as free space.
+		result.Quarantined = append(result.Quarantined, QuarantinedSession{
+			OrgID:            t.OrgID,
+			SessionID:        t.SessionID,
+			ShimID:           t.ShimID,
+			ProcessEpoch:     t.ProcessEpoch,
+			Reason:           QuarantineGroupReapUnproven,
+			Detail:           "terminal tombstone did not prove harness process-group reap",
+			ConsumesCapacity: true,
+		})
 	}
 
 	// Duplicate detection runs over the WHOLE scan before any adoption, because
@@ -221,6 +263,10 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 
 		ctrl, adoptErr := dialForAdoption(ctx, rec, opts)
 		if adoptErr != nil {
+			if errors.Is(adoptErr, ErrAdoptionPreparation) {
+				result.Close()
+				return result, adoptErr
+			}
 			reason, detail := classifyAdoptionFailure(adoptErr)
 			result.Quarantined = append(result.Quarantined, NewQuarantinedSession(rec, reason, detail, now))
 			log.Warn("sessionshim: quarantined shim after failed adoption (not killed)",
@@ -259,6 +305,15 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 		next := opts.NextGeneration
 		copts.NextGeneration = func(current shimwire.Generation) shimwire.Generation {
 			return next(id, current)
+		}
+	}
+	if opts.Prepare != nil {
+		copts.PrepareAdoption = func(current shimwire.Generation) (PreparedAdoption, error) {
+			prepared, err := opts.Prepare(ctx, id, current)
+			if err != nil {
+				return PreparedAdoption{}, fmt.Errorf("%w for %s: %w", ErrAdoptionPreparation, id, err)
+			}
+			return prepared, nil
 		}
 	}
 	return Dial(ctx, rec, copts)

@@ -498,6 +498,88 @@ func TestRestartFenceRefusalIsSurfacedToTheCaller(t *testing.T) {
 	}
 }
 
+func TestGroupedRestartFencePartialAcknowledgementStillRefusesRestartSafely(t *testing.T) {
+	t.Parallel()
+
+	store := &exactFenceRecorder{failOrg: "org-beta"}
+	d := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			ExactFenceStore: store,
+			HostIDForOrg: func(_ context.Context, orgID string) (string, error) {
+				return "host-" + orgID, nil
+			},
+		},
+	})
+	seedShimState(d, []sessionshim.Identity{
+		{OrgID: "org-alpha", SessionID: "session-alpha"},
+		{OrgID: "org-beta", SessionID: "session-beta"},
+	}, nil)
+
+	fences, err := d.RequestSessionShimRestartFences(context.Background(), "fence-partial")
+	if !errors.Is(err, sessionshim.ErrFenceRequired) {
+		t.Fatalf("RequestSessionShimRestartFences = %+v, %v; want ErrFenceRequired", fences, err)
+	}
+	if len(fences) != 1 || len(fences[0].Sessions) != 1 || fences[0].Sessions[0].OrgID != "org-alpha" {
+		t.Fatalf("acknowledged prefix = %+v, want only org-alpha", fences)
+	}
+	if got := d.SessionShimReleaseDecision("org-alpha", "session-alpha", sessionshim.TerminalProof{}); got != sessionshim.ReleaseHeld {
+		t.Fatalf("acknowledged org release decision = %q, want held", got)
+	}
+	if got := d.SessionShimReleaseDecision("org-beta", "session-beta", sessionshim.TerminalProof{}); got != sessionshim.ReleaseReconcile {
+		t.Fatalf("unacknowledged org release decision = %q, want reconciliation refusal", got)
+	}
+}
+
+func TestLegacySingleRestartFencePreservesOneRequestAndControllerFallback(t *testing.T) {
+	t.Parallel()
+
+	store := &exactFenceRecorder{}
+	d := New(Options{
+		SkipRegistration: true,
+		SessionShim:      SessionShimConfig{ExactFenceStore: store},
+	})
+	d.mu.Lock()
+	d.workerID = "legacy-controller-id"
+	d.mu.Unlock()
+	seedShimState(d, []sessionshim.Identity{
+		{OrgID: "org-alpha", SessionID: "session-alpha"},
+		{OrgID: "org-beta", SessionID: "session-beta"},
+	}, nil)
+
+	fence, err := d.RequestSessionShimRestartFence(context.Background(), "fence-legacy-single")
+	if err != nil {
+		t.Fatalf("RequestSessionShimRestartFence: %v", err)
+	}
+	requests := store.snapshot()
+	if len(requests) != 1 || len(fence.Sessions) != 2 {
+		t.Fatalf("legacy single request = %d calls, fence %+v", len(requests), fence)
+	}
+	if requests[0].Fence.HostID != "legacy-controller-id" {
+		t.Fatalf("legacy host fallback = %q, want pre-field controller behavior", requests[0].Fence.HostID)
+	}
+}
+
+func TestGroupedRestartFenceRetainsDuplicateIdentityIncarnations(t *testing.T) {
+	t.Parallel()
+
+	d := New(Options{SkipRegistration: true})
+	seedShimState(d, nil, []sessionshim.QuarantinedSession{
+		{OrgID: "org-duplicate", SessionID: "session-duplicate", ShimID: "shim-a", ProcessEpoch: 1, ConsumesCapacity: true},
+		{OrgID: "org-duplicate", SessionID: "session-duplicate", ShimID: "shim-b", ProcessEpoch: 2, ConsumesCapacity: true},
+	})
+	fences, err := d.RequestSessionShimRestartFences(context.Background(), "fence-duplicates")
+	if err != nil {
+		t.Fatalf("RequestSessionShimRestartFences: %v", err)
+	}
+	if len(fences) != 1 || len(fences[0].Sessions) != 2 {
+		t.Fatalf("duplicate-identity fence = %+v, want both exact incarnations", fences)
+	}
+	if fences[0].Sessions[0].ShimID != "shim-a" || fences[0].Sessions[1].ShimID != "shim-b" {
+		t.Fatalf("duplicate identity was collapsed or reordered ambiguously: %+v", fences[0].Sessions)
+	}
+}
+
 type refusingFenceStore struct{}
 
 func (refusingFenceStore) Acknowledge(context.Context, sessionshim.Fence) (sessionshim.Fence, error) {
@@ -605,6 +687,59 @@ func TestTerminalProofOnlyAcceptsPositiveObservations(t *testing.T) {
 	}
 	if got := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof); got != sessionshim.ReleaseAllowed {
 		t.Fatalf("release with a proven tombstone = %q, want %q", got, sessionshim.ReleaseAllowed)
+	}
+}
+
+func TestStartupTombstoneCallbackDoesNotFabricateLiveAdoption(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	registry, err := sessionshim.NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	tombstone := sessionshim.Tombstone{
+		SchemaVersion:      sessionshim.RecordSchemaVersion,
+		OrgID:              "org-orphan",
+		SessionID:          "session-orphan",
+		ShimID:             "shim-orphan",
+		ProcessEpoch:       12,
+		GroupReaped:        true,
+		ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(tombstone); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	var received SessionShimTerminalEvidence
+	d := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			EnableAdoption: true,
+			RegistryDir:    dir,
+			HostIDForOrg: func(_ context.Context, orgID string) (string, error) {
+				return "host-" + orgID, nil
+			},
+			OnTerminalEvidence: func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+				received = evidence
+				return nil
+			},
+		},
+	})
+	if err := d.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("adoptSessionShims: %v", err)
+	}
+	if received.Identity != tombstone.Identity() || received.HostID != "host-org-orphan" ||
+		received.ShimID != tombstone.ShimID || received.ProcessEpoch != tombstone.ProcessEpoch {
+		t.Fatalf("startup terminal evidence = %+v", received)
+	}
+	if received.Adoption != nil || len(received.DurableAdoptionCorrelation) != 0 {
+		t.Fatalf("startup orphan tombstone fabricated live adoption: %+v", received)
+	}
+	if !d.SessionShimAdoptionComplete() {
+		t.Fatal("startup did not complete after durable tombstone handoff")
+	}
+	if _, err := registry.GetTombstone(tombstone.Identity()); err == nil {
+		t.Fatal("startup tombstone remained after durable terminal callback")
 	}
 }
 

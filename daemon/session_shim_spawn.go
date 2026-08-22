@@ -61,7 +61,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		return nil, nil
 	}
 	cfg := d.sessionShimConfig()
-	id := sessionshim.Identity{OrgID: cfg.orgID(), SessionID: spec.SessionID}
+	id := sessionshim.Identity{OrgID: cfg.orgIDForSession(spec), SessionID: spec.SessionID}
 	if err := id.Validate(); err != nil {
 		return nil, fmt.Errorf("session shim: %w", err)
 	}
@@ -100,19 +100,47 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		return nil, fmt.Errorf("session shim: %s: %w", id, err)
 	}
 
-	ctrl, err := sessionshim.Dial(ctx, rec, sessionshim.ControllerOptions{
+	var (
+		prepared       sessionshim.PreparedAdoption
+		preparedHostID string
+	)
+	controllerOpts := sessionshim.ControllerOptions{
 		ControllerID:     d.controllerID(),
 		ExpectedWorkarea: workarea,
 		DialTimeout:      cfg.launchTimeout(),
 		Logger:           slog.Default(),
-	})
+		PrepareAdoption: func(current shimwire.Generation) (sessionshim.PreparedAdoption, error) {
+			hostID, hostErr := d.sessionShimHostID(ctx, id.OrgID)
+			if hostErr != nil {
+				return sessionshim.PreparedAdoption{}, hostErr
+			}
+			resolved, prepareErr := d.prepareSessionShimAdoption(ctx, id, current)
+			if prepareErr != nil {
+				return sessionshim.PreparedAdoption{}, prepareErr
+			}
+			preparedHostID = hostID
+			prepared = resolved
+			return resolved, nil
+		},
+	}
+	ctrl, err := sessionshim.Dial(ctx, rec, controllerOpts)
 	if err != nil {
 		slog.Error("session shim: could not adopt the shim it just launched",
 			"session", id.String(), "error", err)
 		return nil, fmt.Errorf("session shim: adopt %s: %w", id, err)
 	}
+	evidence, err := d.sessionShimAdoptionEvidence(ctx, ctrl, prepared.Extensions, preparedHostID)
+	if err != nil {
+		_ = ctrl.Close()
+		return nil, fmt.Errorf("session shim: resolve adoption host %s: %w", id, err)
+	}
+	receipt, err := d.completeSessionShimAdoption(ctx, evidence)
+	if err != nil {
+		_ = ctrl.Close()
+		return nil, fmt.Errorf("session shim: durable adoption %s: %w", id, err)
+	}
 
-	handle := d.trackLaunchedShim(ctrl, spec, project, workarea)
+	handle := d.trackLaunchedShim(ctrl, spec, project, workarea, evidence, receipt)
 	slog.Info("session shim: launched and adopted an interactive session",
 		"session", id.String(), "shimId", ctrl.Hello().ShimID,
 		"generation", ctrl.Generation(), "harnessPid", ctrl.HarnessIdentity().PID)
@@ -201,7 +229,14 @@ func awaitShimRecord(ctx context.Context, registry *sessionshim.Registry, id ses
 
 // trackLaunchedShim records a newly adopted controller and starts consuming its
 // event stream.
-func (d *Daemon) trackLaunchedShim(ctrl *sessionshim.Controller, spec SessionSpec, project ProjectConfig, workarea string) SessionHandle {
+func (d *Daemon) trackLaunchedShim(
+	ctrl *sessionshim.Controller,
+	spec SessionSpec,
+	project ProjectConfig,
+	workarea string,
+	evidence SessionShimAdoptionEvidence,
+	receipt SessionShimAdoptionReceipt,
+) SessionHandle {
 	handle := SessionHandle{
 		SessionID:  spec.SessionID,
 		PID:        ctrl.HarnessIdentity().PID,
@@ -215,14 +250,20 @@ func (d *Daemon) trackLaunchedShim(ctrl *sessionshim.Controller, spec SessionSpe
 		Repository:   spec.Repository,
 	}
 	entry := adoptedShim{
-		controller: ctrl,
-		shimID:     ctrl.Hello().ShimID,
-		handle:     handle,
-		spec:       spec,
-		launched:   true,
+		controller:      ctrl,
+		shimID:          ctrl.Hello().ShimID,
+		handle:          handle,
+		spec:            spec,
+		launched:        true,
+		adoption:        evidence,
+		adoptionReceipt: cloneSessionShimAdoptionReceipt(receipt),
 	}
 	d.shims.mu.Lock()
 	d.shims.adopted[ctrl.Identity()] = entry
+	d.shims.correlations[shimIncarnationFor(evidence)] = sessionShimAdoptionCorrelation{
+		evidence: evidence,
+		receipt:  cloneSessionShimAdoptionReceipt(receipt),
+	}
 	d.shims.mu.Unlock()
 	// A shim-backed session is external to the direct-child registry, but it is
 	// still one accepted WorkerSpawner lifecycle. Emit Started only after the
@@ -422,6 +463,35 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 	d.shims.tombstoned = append(d.shims.tombstoned, tombstone)
 	d.shims.mu.Unlock()
 
+	hostID, hostErr := d.sessionShimHostID(context.Background(), id.OrgID)
+	if hostErr != nil {
+		slog.Warn("session shim: retain terminal tombstone after host identity resolution failed",
+			"session", id.String(), "error", hostErr)
+		return
+	}
+	adoption := entry.adoption
+	terminalEvidence := SessionShimTerminalEvidence{
+		Identity:                   id,
+		HostID:                     hostID,
+		ShimID:                     tombstone.ShimID,
+		ProcessEpoch:               tombstone.ProcessEpoch,
+		Adoption:                   &adoption,
+		DurableAdoptionCorrelation: append([]byte(nil), entry.adoptionReceipt.DurableCorrelation...),
+		Tombstone:                  tombstone,
+	}
+	if err := d.reportSessionShimTerminalEvidence(context.Background(), terminalEvidence); err != nil {
+		// The harness group is already gone, so capacity may be released, but the
+		// proof is retained on disk. A later startup retries the exact durable
+		// handoff before readiness; disposing it here would strand the external
+		// claim in reconciliation with no evidence left to replay.
+		slog.Warn("session shim: retain terminal tombstone after durable evidence refusal",
+			"session", id.String(), "error", err)
+		return
+	}
+	d.shims.mu.Lock()
+	delete(d.shims.correlations, shimIncarnationFor(entry.adoption))
+	d.shims.mu.Unlock()
+
 	verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, sessionshim.TerminalProof{Tombstone: &tombstone})
 	if verdict != sessionshim.ReleaseAllowed {
 		slog.Info("session shim: terminal outcome recorded but the claim is not releasable yet",
@@ -545,6 +615,34 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		if d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof) != sessionshim.ReleaseAllowed {
 			continue
 		}
+		key := shimIncarnation{identity: id, shimID: tombstone.ShimID, processEpoch: tombstone.ProcessEpoch}
+		d.shims.mu.RLock()
+		correlation, hasCorrelation := d.shims.correlations[key]
+		d.shims.mu.RUnlock()
+		hostID, hostErr := d.sessionShimHostID(context.Background(), id.OrgID)
+		if hostErr != nil {
+			slog.Warn("session shim: retain quarantined terminal proof after host identity resolution failed",
+				"session", id.String(), "error", hostErr)
+			continue
+		}
+		terminalEvidence := SessionShimTerminalEvidence{
+			Identity:     id,
+			HostID:       hostID,
+			ShimID:       tombstone.ShimID,
+			ProcessEpoch: tombstone.ProcessEpoch,
+			Tombstone:    tombstone,
+		}
+		if hasCorrelation {
+			adoption := correlation.evidence
+			terminalEvidence.Adoption = &adoption
+			terminalEvidence.DurableAdoptionCorrelation = append(
+				[]byte(nil), correlation.receipt.DurableCorrelation...)
+		}
+		if err := d.reportSessionShimTerminalEvidence(context.Background(), terminalEvidence); err != nil {
+			slog.Warn("session shim: retain quarantined terminal proof after durable evidence refusal",
+				"session", id.String(), "error", err)
+			continue
+		}
 
 		d.shims.mu.Lock()
 		removed := false
@@ -559,6 +657,7 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		d.shims.quarantined = kept
 		if removed {
 			delete(d.shims.forwarded, id)
+			delete(d.shims.correlations, key)
 			alreadyRecorded := false
 			for _, existing := range d.shims.tombstoned {
 				if existing.Identity() == id && existing.ShimID == tombstone.ShimID && existing.ProcessEpoch == tombstone.ProcessEpoch {
@@ -571,6 +670,12 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 			}
 		}
 		d.shims.mu.Unlock()
+		if removed {
+			if err := registry.RemoveTombstone(id); err != nil {
+				slog.Warn("session shim: dispose quarantined tombstone after durable terminal handoff",
+					"session", id.String(), "error", err)
+			}
+		}
 	}
 }
 
@@ -627,13 +732,25 @@ func (d *Daemon) stopSessionShimByID(sessionID string) (handled bool) {
 	if d.shims == nil {
 		return false
 	}
-	id := sessionshim.Identity{OrgID: d.sessionShimConfig().orgID(), SessionID: sessionID}
 	d.shims.mu.RLock()
-	_, ok := d.shims.adopted[id]
+	matches := make([]sessionshim.Identity, 0, 1)
+	for id := range d.shims.adopted {
+		if id.SessionID == sessionID {
+			matches = append(matches, id)
+		}
+	}
 	d.shims.mu.RUnlock()
-	if !ok {
+	if len(matches) == 0 {
 		return false
 	}
+	if len(matches) != 1 {
+		// The localhost API supplies only a session id. Do not collapse two
+		// tenant-scoped lifecycle identities or pick one by map order.
+		slog.Error("session shim: bare session id is ambiguous across organizations",
+			"sessionId", sessionID, "matches", len(matches))
+		return false
+	}
+	id := matches[0]
 	if err := d.StopAdoptedSessionShim(id.OrgID, id.SessionID, shimwire.StopOperator); err != nil {
 		slog.Error("session shim: stop", "session", id.String(), "error", err)
 		return false

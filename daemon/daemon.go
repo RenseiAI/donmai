@@ -1627,6 +1627,16 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				spec.SessionID,
 			)
 		}
+		if spec.OrganizationID != "" && detail.OrganizationID != "" && spec.OrganizationID != detail.OrganizationID {
+			return nil, fmt.Errorf(
+				"session detail organization %q does not match spec organization %q",
+				detail.OrganizationID,
+				spec.OrganizationID,
+			)
+		}
+		if spec.OrganizationID == "" {
+			spec.OrganizationID = detail.OrganizationID
+		}
 		if len(detail.AdmissionReceipt) > 0 {
 			// The narrow-only claim gate runs first: for a claim-bound
 			// admission it either validates an already-supplied ClaimReceipt

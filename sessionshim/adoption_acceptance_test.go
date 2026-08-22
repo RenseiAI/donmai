@@ -2,6 +2,7 @@ package sessionshim
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -707,6 +708,75 @@ func TestAdoptOnAnEmptyRegistryAdvertisesNothingOccupied(t *testing.T) {
 	}
 	if res.OccupiedSlots() != 0 || len(res.Adopted) != 0 || len(res.Quarantined) != 0 {
 		t.Fatalf("empty registry produced %+v", res)
+	}
+}
+
+func TestAdoptKeepsUnprovenTombstoneInVisibleCapacity(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	tombstone := Tombstone{
+		SchemaVersion:      RecordSchemaVersion,
+		OrgID:              "org-unproven",
+		SessionID:          "session-unproven",
+		ShimID:             "shim-unproven",
+		ProcessEpoch:       9,
+		GroupReaped:        false,
+		ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := reg.PutTombstone(tombstone); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	result, err := Adopt(context.Background(), AdoptOptions{Registry: reg, ControllerID: "daemon-1"})
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if len(result.Tombstoned) != 0 {
+		t.Fatalf("unproven tombstone entered positive terminal bucket: %+v", result.Tombstoned)
+	}
+	if len(result.Quarantined) != 1 || result.OccupiedSlots() != 1 {
+		t.Fatalf("unproven tombstone result = %+v, want one occupied quarantine", result)
+	}
+	q := result.Quarantined[0]
+	if q.Identity() != tombstone.Identity() || q.ShimID != tombstone.ShimID ||
+		q.ProcessEpoch != tombstone.ProcessEpoch || q.Reason != QuarantineGroupReapUnproven || !q.ConsumesCapacity {
+		t.Fatalf("unproven tombstone quarantine = %+v", q)
+	}
+}
+
+func TestPrepareAdoptionRunsAfterHelloAndFailureDoesNotAdvanceGeneration(t *testing.T) {
+	id := Identity{OrgID: "org-prepare", SessionID: "session-prepare"}
+	f := startShimHelper(t, id, 10_000)
+	initial := f.adoptAs(t, "controller-initial")
+	if len(initial.Adopted) != 1 || initial.Adopted[0].Generation() != 1 {
+		t.Fatalf("initial adoption = %+v, want generation 1", initial.Adopted)
+	}
+	initial.Close()
+	var current shimwire.Generation
+	_, err := Adopt(context.Background(), AdoptOptions{
+		Registry:     f.registry,
+		ControllerID: "controller-refused",
+		Prepare: func(_ context.Context, gotID Identity, gotCurrent shimwire.Generation) (PreparedAdoption, error) {
+			if gotID != id {
+				return PreparedAdoption{}, fmt.Errorf("identity = %s, want %s", gotID, id)
+			}
+			current = gotCurrent
+			return PreparedAdoption{}, fmt.Errorf("durable carrier epoch reservation failed")
+		},
+	})
+	if !errors.Is(err, ErrAdoptionPreparation) {
+		t.Fatalf("Adopt preparation error = %v, want ErrAdoptionPreparation", err)
+	}
+	if current != 1 {
+		t.Fatalf("verified Hello generation = %d, want live shim generation 1", current)
+	}
+
+	// The failed reservation happened before Welcome, so a normal retry commits
+	// generation 2. Generation 3 would prove the failed callback had already
+	// advanced controller authority.
+	result := f.adoptAs(t, "controller-retry")
+	if len(result.Adopted) != 1 || result.Adopted[0].Generation() != 2 {
+		t.Fatalf("retry adoption = %+v, want exact generation 2", result.Adopted)
 	}
 }
 

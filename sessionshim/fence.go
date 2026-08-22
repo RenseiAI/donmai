@@ -68,10 +68,11 @@ type Fence struct {
 // FencedSession is one identity covered by a fence, with its shim and carrier
 // correlation values. No correlation field is lifecycle identity (§D2).
 type FencedSession struct {
-	OrgID        string `json:"orgId"`
-	SessionID    string `json:"sessionId"`
-	ShimID       string `json:"shimId,omitempty"`
-	ProcessEpoch uint64 `json:"processEpoch"`
+	OrgID                string `json:"orgId"`
+	SessionID            string `json:"sessionId"`
+	ShimID               string `json:"shimId,omitempty"`
+	ProcessEpoch         uint64 `json:"processEpoch"`
+	ControllerGeneration uint64 `json:"controllerGeneration"`
 	// LastForwardedSeq is the highest shim-owned output sequence the daemon had
 	// durably handed to its carrier when it snapshotted this restart intent. Zero
 	// means no sequence has been durably forwarded; it is a real correlation
@@ -281,7 +282,13 @@ func sortedFencedSessions(in []FencedSession) []FencedSession {
 		if sorted[i].ShimID != sorted[j].ShimID {
 			return sorted[i].ShimID < sorted[j].ShimID
 		}
-		return sorted[i].ProcessEpoch < sorted[j].ProcessEpoch
+		if sorted[i].ProcessEpoch != sorted[j].ProcessEpoch {
+			return sorted[i].ProcessEpoch < sorted[j].ProcessEpoch
+		}
+		if sorted[i].ControllerGeneration != sorted[j].ControllerGeneration {
+			return sorted[i].ControllerGeneration < sorted[j].ControllerGeneration
+		}
+		return sorted[i].LastForwardedSeq < sorted[j].LastForwardedSeq
 	})
 	return sorted
 }

@@ -117,6 +117,12 @@ const interactiveRunMode = "interactive"
 // path.
 type SessionSpec struct {
 	SessionID string `json:"sessionId"`
+	// OrganizationID is the organization half of the canonical session
+	// lifecycle identity. It is additive because standalone and legacy dispatch
+	// paths have no organization boundary; those paths continue to use the
+	// SessionShimConfig fallback. A multi-organization spawner MUST populate it
+	// so two sessions are never relabelled under one ambient daemon identity.
+	OrganizationID string `json:"organizationId,omitempty"`
 	// ProjectID is the authoritative project-admission identity. New
 	// dispatchers must set it explicitly; repository-only dispatch remains
 	// supported for legacy OSS coordinators.
