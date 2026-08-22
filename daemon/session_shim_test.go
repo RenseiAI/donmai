@@ -392,21 +392,35 @@ func TestRestartFenceCoversAdoptedAndQuarantinedSessions(t *testing.T) {
 		SessionShim:      SessionShimConfig{RestartBudget: time.Minute},
 	})
 	seedShimState(d,
-		[]sessionshim.Identity{{OrgID: "o", SessionID: "adopted"}},
+		[]sessionshim.Identity{
+			{OrgID: "o", SessionID: "z-adopted"},
+			{OrgID: "o", SessionID: "a-adopted"},
+		},
 		[]sessionshim.QuarantinedSession{
 			{OrgID: "o", SessionID: "quarantined", ShimID: "shim-q", ProcessEpoch: 31, ConsumesCapacity: true},
 		},
 	)
+	d.shims.mu.Lock()
+	d.shims.forwarded[sessionshim.Identity{OrgID: "o", SessionID: "a-adopted"}] = 17
+	d.shims.forwarded[sessionshim.Identity{OrgID: "o", SessionID: "quarantined"}] = 29
+	d.shims.forwarded[sessionshim.Identity{OrgID: "o", SessionID: "z-adopted"}] = 41
+	d.shims.mu.Unlock()
 
 	fence, err := d.RequestSessionShimRestartFence(context.Background(), "fence-1")
 	if err != nil {
 		t.Fatalf("RequestSessionShimRestartFence: %v", err)
 	}
-	if !fence.Covers(sessionshim.Identity{OrgID: "o", SessionID: "adopted"}) {
-		t.Error("fence does not cover the adopted session")
+	if !fence.Covers(sessionshim.Identity{OrgID: "o", SessionID: "a-adopted"}) ||
+		!fence.Covers(sessionshim.Identity{OrgID: "o", SessionID: "z-adopted"}) {
+		t.Error("fence does not cover both adopted sessions")
 	}
 	if !fence.Covers(sessionshim.Identity{OrgID: "o", SessionID: "quarantined"}) {
 		t.Error("fence does not cover the quarantined session; its harness is still running")
+	}
+	wantOrder := []string{"a-adopted", "quarantined", "z-adopted"}
+	wantForwarded := []uint64{17, 29, 41}
+	if len(fence.Sessions) != len(wantOrder) {
+		t.Fatalf("covered session count = %d, want %d", len(fence.Sessions), len(wantOrder))
 	}
 	foundQuarantine := false
 	for _, covered := range fence.Sessions {
@@ -415,6 +429,12 @@ func TestRestartFenceCoversAdoptedAndQuarantinedSessions(t *testing.T) {
 			if covered.ShimID != "shim-q" || covered.ProcessEpoch != 31 {
 				t.Errorf("quarantined fence correlation = %+v, want shim-q/processEpoch 31", covered)
 			}
+		}
+	}
+	for i, covered := range fence.Sessions {
+		if covered.SessionID != wantOrder[i] || covered.LastForwardedSeq != wantForwarded[i] {
+			t.Errorf("fence Sessions[%d] = %s/seq=%d, want %s/seq=%d",
+				i, covered.SessionID, covered.LastForwardedSeq, wantOrder[i], wantForwarded[i])
 		}
 	}
 	if !foundQuarantine {
@@ -426,8 +446,9 @@ func TestRestartFenceCoversAdoptedAndQuarantinedSessions(t *testing.T) {
 	}
 	var wireFence struct {
 		Sessions []struct {
-			SessionID    string `json:"sessionId"`
-			ProcessEpoch uint64 `json:"processEpoch"`
+			SessionID        string `json:"sessionId"`
+			ProcessEpoch     uint64 `json:"processEpoch"`
+			LastForwardedSeq uint64 `json:"lastForwardedSeq"`
 		} `json:"sessions"`
 	}
 	if err := json.Unmarshal(rawFence, &wireFence); err != nil {
@@ -441,6 +462,12 @@ func TestRestartFenceCoversAdoptedAndQuarantinedSessions(t *testing.T) {
 	}
 	if !foundWireEpoch {
 		t.Fatalf("restart fence JSON omitted quarantined processEpoch: %s", rawFence)
+	}
+	for i, covered := range wireFence.Sessions {
+		if covered.SessionID != wantOrder[i] || covered.LastForwardedSeq != wantForwarded[i] {
+			t.Fatalf("restart fence JSON Sessions[%d] = %s/seq=%d, want %s/seq=%d: %s",
+				i, covered.SessionID, covered.LastForwardedSeq, wantOrder[i], wantForwarded[i], rawFence)
+		}
 	}
 	if fence.State != sessionshim.FenceHeld {
 		t.Errorf("fence state = %q, want %q", fence.State, sessionshim.FenceHeld)
@@ -473,8 +500,8 @@ func TestRestartFenceRefusalIsSurfacedToTheCaller(t *testing.T) {
 
 type refusingFenceStore struct{}
 
-func (refusingFenceStore) Acknowledge(context.Context, sessionshim.Fence) (sessionshim.Fence, error) {
-	return sessionshim.Fence{}, errors.New("no durable acknowledgement")
+func (refusingFenceStore) Acknowledge(context.Context, sessionshim.FenceRequest) (sessionshim.FenceAcknowledgement, error) {
+	return sessionshim.FenceAcknowledgement{}, errors.New("no durable acknowledgement")
 }
 
 func TestStopIsRefusedForSessionsThisDaemonDidNotAdopt(t *testing.T) {

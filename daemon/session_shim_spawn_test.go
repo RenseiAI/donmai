@@ -749,6 +749,62 @@ func TestForwardedSequenceIsRecordedNotAllocated(t *testing.T) {
 	}
 }
 
+// TestRestartFenceRetainsTheAdoptionResumeCursor pins the replacement-daemon
+// seam: before any new output arrives, the fence must still report the durable
+// last-forwarded sequence from which this controller resumed. Resetting it to
+// zero would make the composing store acknowledge a correlation older than the
+// carrier's durable state.
+func TestRestartFenceRetainsTheAdoptionResumeCursor(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	first := f.daemon
+
+	if _, err := first.spawner.AcceptWork(f.interactiveSpec("sess-resume-fence")); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity("sess-resume-fence")
+	f.exchange(t, id, "resume-fence")
+	waitFor(t, 20*time.Second, "the first daemon to record forwarded output", func() bool {
+		return first.SessionShimForwardedSeq(id.OrgID, id.SessionID) > 0
+	})
+	lastForwarded := first.SessionShimForwardedSeq(id.OrgID, id.SessionID)
+	first.ReleaseAdoptedSessionShims()
+
+	replacement := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			EnableAdoption: true,
+			OrgID:          f.orgID,
+			RegistryDir:    f.registry,
+			ResumeFrom: func(orgID, sessionID string) uint64 {
+				if orgID == id.OrgID && sessionID == id.SessionID {
+					return lastForwarded + 1
+				}
+				return 0
+			},
+			Orphan: sessionshim.OrphanPolicy{
+				Deadline:          2 * time.Second,
+				TerminationGrace:  500 * time.Millisecond,
+				PropagationMargin: 0,
+			},
+		},
+	})
+	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
+	if err := replacement.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("replacement adoptSessionShims: %v", err)
+	}
+
+	fence, err := replacement.RequestSessionShimRestartFence(context.Background(), "fence-resume")
+	if err != nil {
+		t.Fatalf("RequestSessionShimRestartFence: %v", err)
+	}
+	if len(fence.Sessions) != 1 {
+		t.Fatalf("fence sessions = %+v, want one resumed session", fence.Sessions)
+	}
+	if got := fence.Sessions[0].LastForwardedSeq; got != lastForwarded {
+		t.Fatalf("fence lastForwardedSeq = %d, want durable adoption cursor %d", got, lastForwarded)
+	}
+}
+
 // waitFor polls cond until it holds or the deadline passes.
 func waitFor(t *testing.T, within time.Duration, what string, cond func() bool) {
 	t.Helper()

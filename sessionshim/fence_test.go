@@ -1,7 +1,9 @@
 package sessionshim
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -145,6 +147,9 @@ func TestRequestFenceIsLocallySatisfiedWithoutAStore(t *testing.T) {
 	if f.State != FenceHeld || !f.Covers(Identity{OrgID: "o", SessionID: "s"}) {
 		t.Fatalf("locally satisfied fence = %+v", f)
 	}
+	if f.DurableRevision != "" {
+		t.Fatalf("nil-store fence durable revision = %q, want empty (local intent is not remote durability)", f.DurableRevision)
+	}
 	// The hold window must cover the restart budget AND the whole orphan bound —
 	// a fence sized to the restart alone expires when a slow restart needs it most.
 	wantHold := policy.RestartBudget + DefaultOrphanPolicy().TotalBound()
@@ -153,10 +158,17 @@ func TestRequestFenceIsLocallySatisfiedWithoutAStore(t *testing.T) {
 	}
 }
 
-type fenceStoreFunc func(context.Context, Fence) (Fence, error)
+type fenceStoreFunc func(context.Context, FenceRequest) (FenceAcknowledgement, error)
 
-func (f fenceStoreFunc) Acknowledge(ctx context.Context, fence Fence) (Fence, error) {
-	return f(ctx, fence)
+func (f fenceStoreFunc) Acknowledge(ctx context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+	return f(ctx, request)
+}
+
+func exactDurableAcknowledgement(request FenceRequest) FenceAcknowledgement {
+	return FenceAcknowledgement{
+		RequestBytes:    append([]byte(nil), request.RequestBytes...),
+		DurableRevision: "revision-1",
+	}
 }
 
 func TestRequestFenceRefusesPartialAcknowledgement(t *testing.T) {
@@ -170,9 +182,14 @@ func TestRequestFenceRefusesPartialAcknowledgement(t *testing.T) {
 		{OrgID: "o", SessionID: "s1"},
 		{OrgID: "o", SessionID: "s2"},
 	}
-	store := fenceStoreFunc(func(_ context.Context, f Fence) (Fence, error) {
-		f.Sessions = f.Sessions[:1] // drops s2
-		return f, nil
+	store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+		partial := request.Fence
+		partial.Sessions = partial.Sessions[:1] // drops s2
+		partialBytes, err := json.Marshal(partial)
+		if err != nil {
+			return FenceAcknowledgement{}, err
+		}
+		return FenceAcknowledgement{RequestBytes: partialBytes, DurableRevision: "revision-1"}, nil
 	})
 	_, err := RequestFence(context.Background(), store, "fence-1", "host-1", ids, FencePolicy{}, now)
 	if !errors.Is(err, ErrFenceRequired) {
@@ -180,16 +197,41 @@ func TestRequestFenceRefusesPartialAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestRequestFenceRefusesReorderedAcknowledgement(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	ids := []FencedSession{
+		{OrgID: "o", SessionID: "s1", ProcessEpoch: 1, LastForwardedSeq: 10},
+		{OrgID: "o", SessionID: "s2", ProcessEpoch: 2, LastForwardedSeq: 20},
+	}
+	store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+		reordered := request.Fence
+		reordered.Sessions = []FencedSession{request.Fence.Sessions[1], request.Fence.Sessions[0]}
+		reorderedBytes, err := json.Marshal(reordered)
+		if err != nil {
+			return FenceAcknowledgement{}, err
+		}
+		return FenceAcknowledgement{RequestBytes: reorderedBytes, DurableRevision: "revision-1"}, nil
+	})
+	_, err := RequestFence(context.Background(), store, "fence-1", "host-1", ids, FencePolicy{}, now)
+	if !errors.Is(err, ErrFenceRequired) {
+		t.Fatalf("RequestFence with reordered ack = %v, want ErrFenceRequired", err)
+	}
+}
+
 func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1_700_000_000, 0)
-	ids := []FencedSession{{OrgID: "o", SessionID: "s1", ShimID: "shim-1", ProcessEpoch: 7}}
+	ids := []FencedSession{{
+		OrgID: "o", SessionID: "s1", ShimID: "shim-1", ProcessEpoch: 7, LastForwardedSeq: 41,
+	}}
 
 	t.Run("store error", func(t *testing.T) {
 		t.Parallel()
-		store := fenceStoreFunc(func(context.Context, Fence) (Fence, error) {
-			return Fence{}, errors.New("control plane unreachable")
+		store := fenceStoreFunc(func(context.Context, FenceRequest) (FenceAcknowledgement, error) {
+			return FenceAcknowledgement{}, errors.New("control plane unreachable")
 		})
 		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 		if !errors.Is(err, ErrFenceRequired) {
@@ -199,9 +241,11 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 
 	t.Run("wrong fence id", func(t *testing.T) {
 		t.Parallel()
-		store := fenceStoreFunc(func(_ context.Context, f Fence) (Fence, error) {
-			f.FenceID = "someone-elses-fence"
-			return f, nil
+		store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+			changed := request.Fence
+			changed.FenceID = "someone-elses-fence"
+			changedBytes, err := json.Marshal(changed)
+			return FenceAcknowledgement{RequestBytes: changedBytes, DurableRevision: "revision-1"}, err
 		})
 		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 		if !errors.Is(err, ErrFenceRequired) {
@@ -211,13 +255,44 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 
 	t.Run("wrong process epoch", func(t *testing.T) {
 		t.Parallel()
-		store := fenceStoreFunc(func(_ context.Context, f Fence) (Fence, error) {
-			f.Sessions[0].ProcessEpoch++
-			return f, nil
+		store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+			changed := request.Fence
+			changed.Sessions = append([]FencedSession(nil), changed.Sessions...)
+			changed.Sessions[0].ProcessEpoch++
+			changedBytes, err := json.Marshal(changed)
+			return FenceAcknowledgement{RequestBytes: changedBytes, DurableRevision: "revision-1"}, err
 		})
 		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 		if !errors.Is(err, ErrFenceRequired) {
 			t.Fatalf("RequestFence with wrong process epoch = %v, want ErrFenceRequired", err)
+		}
+	})
+
+	t.Run("wrong last forwarded sequence", func(t *testing.T) {
+		t.Parallel()
+		store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+			changed := request.Fence
+			changed.Sessions = append([]FencedSession(nil), changed.Sessions...)
+			changed.Sessions[0].LastForwardedSeq++
+			changedBytes, err := json.Marshal(changed)
+			return FenceAcknowledgement{RequestBytes: changedBytes, DurableRevision: "revision-1"}, err
+		})
+		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
+		if !errors.Is(err, ErrFenceRequired) {
+			t.Fatalf("RequestFence with wrong forwarded sequence = %v, want ErrFenceRequired", err)
+		}
+	})
+
+	t.Run("missing durable revision", func(t *testing.T) {
+		t.Parallel()
+		store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+			ack := exactDurableAcknowledgement(request)
+			ack.DurableRevision = ""
+			return ack, nil
+		})
+		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
+		if !errors.Is(err, ErrFenceRequired) {
+			t.Fatalf("RequestFence with empty durable revision = %v, want ErrFenceRequired", err)
 		}
 	})
 
@@ -230,25 +305,45 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 	})
 }
 
-func TestRequestFenceSortsCoverageDeterministically(t *testing.T) {
+func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1_700_000_000, 0)
 	ids := []FencedSession{
-		{OrgID: "o", SessionID: "s3"},
-		{OrgID: "o", SessionID: "s1", ShimID: "shim", ProcessEpoch: 2},
-		{OrgID: "o", SessionID: "s1", ShimID: "shim", ProcessEpoch: 1},
-		{OrgID: "n", SessionID: "s2"},
+		{OrgID: "o", SessionID: "s3", LastForwardedSeq: 3},
+		{OrgID: "o", SessionID: "s1", ShimID: "shim", ProcessEpoch: 2, LastForwardedSeq: 2},
+		{OrgID: "n", SessionID: "s2", LastForwardedSeq: 1},
 	}
-	f, err := RequestFence(context.Background(), nil, "f1", "h1", ids, FencePolicy{}, now)
+	var received FenceRequest
+	store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+		received = request
+		return exactDurableAcknowledgement(request), nil
+	})
+	f, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 	if err != nil {
 		t.Fatalf("RequestFence: %v", err)
 	}
-	want := []string{"n/s2//0", "o/s1/shim/1", "o/s1/shim/2", "o/s3//0"}
+	want := []string{"o/s3//0/3", "o/s1/shim/2/2", "n/s2//0/1"}
 	for i, w := range want {
-		got := fmt.Sprintf("%s/%s/%d", f.Sessions[i].Identity(), f.Sessions[i].ShimID, f.Sessions[i].ProcessEpoch)
+		got := fmt.Sprintf("%s/%s/%d/%d", f.Sessions[i].Identity(), f.Sessions[i].ShimID, f.Sessions[i].ProcessEpoch, f.Sessions[i].LastForwardedSeq)
 		if got != w {
 			t.Fatalf("Sessions[%d] = %s, want %s", i, got, w)
 		}
+	}
+	if f.DurableRevision != "revision-1" {
+		t.Fatalf("durable revision = %q, want revision-1", f.DurableRevision)
+	}
+	requestBytes, err := json.Marshal(received.Fence)
+	if err != nil {
+		t.Fatalf("marshal received fence: %v", err)
+	}
+	if !bytes.Equal(received.RequestBytes, requestBytes) {
+		t.Fatalf("store request bytes differ from request fence:\nbytes=%s\nfence=%s", received.RequestBytes, requestBytes)
+	}
+	if bytes.Contains(received.RequestBytes, []byte(`"revision"`)) {
+		t.Fatalf("request bytes contain response-only durable revision: %s", received.RequestBytes)
+	}
+	if !bytes.Contains(received.RequestBytes, []byte(`"processEpoch":0`)) {
+		t.Fatalf("request bytes omitted the zero-valued processEpoch correlation: %s", received.RequestBytes)
 	}
 }

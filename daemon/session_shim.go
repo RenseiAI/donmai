@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -262,7 +263,14 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	d.shims.mu.Lock()
 	d.shims.registry = registry
 	for _, c := range result.Adopted {
-		d.shims.adopted[c.Identity()] = adoptedShim{controller: c, shimID: c.Hello().ShimID}
+		id := c.Identity()
+		d.shims.adopted[id] = adoptedShim{controller: c, shimID: c.Hello().ShimID}
+		if resumeFrom := c.ResumeFrom(); resumeFrom > 0 {
+			// ResumeFrom is exactly last_forwarded_seq + 1. Seed the replacement
+			// daemon's snapshot before its event consumer starts so an immediate
+			// second planned restart cannot regress the durable correlation to zero.
+			d.shims.forwarded[id] = resumeFrom - 1
+		}
 	}
 	d.shims.quarantined = result.QuarantinedProjection()
 	d.shims.tombstoned = append(d.shims.tombstoned, result.Tombstoned...)
@@ -378,6 +386,7 @@ func (d *Daemon) RequestSessionShimRestartFence(ctx context.Context, fenceID str
 		for id, entry := range d.shims.adopted {
 			coveredSession := sessionshim.FencedSession{
 				OrgID: id.OrgID, SessionID: id.SessionID, ShimID: entry.shimID,
+				LastForwardedSeq: d.shims.forwarded[id],
 			}
 			if entry.controller != nil {
 				coveredSession.ProcessEpoch = entry.controller.Hello().ProcessEpoch
@@ -385,12 +394,29 @@ func (d *Daemon) RequestSessionShimRestartFence(ctx context.Context, fenceID str
 			covered = append(covered, coveredSession)
 		}
 		for _, q := range d.shims.quarantined {
+			id := q.Identity()
 			covered = append(covered, sessionshim.FencedSession{
 				OrgID: q.OrgID, SessionID: q.SessionID, ShimID: q.ShimID, ProcessEpoch: q.ProcessEpoch,
+				LastForwardedSeq: d.shims.forwarded[id],
 			})
 		}
 		d.shims.mu.RUnlock()
 	}
+	// RequestFence preserves order byte-for-byte because the composing store's
+	// durable acknowledgement must echo the exact request. The daemon owns the
+	// snapshot order, so make it deterministic instead of leaking Go map order.
+	sort.Slice(covered, func(i, j int) bool {
+		if covered[i].OrgID != covered[j].OrgID {
+			return covered[i].OrgID < covered[j].OrgID
+		}
+		if covered[i].SessionID != covered[j].SessionID {
+			return covered[i].SessionID < covered[j].SessionID
+		}
+		if covered[i].ShimID != covered[j].ShimID {
+			return covered[i].ShimID < covered[j].ShimID
+		}
+		return covered[i].ProcessEpoch < covered[j].ProcessEpoch
+	})
 
 	policy := sessionshim.FencePolicy{RestartBudget: cfg.RestartBudget, Orphan: cfg.Orphan}
 	fence, err := sessionshim.RequestFence(ctx, cfg.FenceStore, fenceID, d.controllerID(), covered, policy, time.Now())
