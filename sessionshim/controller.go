@@ -63,6 +63,12 @@ type ControllerOptions struct {
 	// owns the generation, and a daemon that proposed from a stale local counter
 	// would fence itself out (§D4).
 	NextGeneration func(current shimwire.Generation) shimwire.Generation
+	// PrepareAdoption runs after Hello has been authenticated and verified but
+	// before Welcome proposes authority. It may durably reserve a carrier epoch
+	// bound to the shim's authoritative current generation and return the exact
+	// per-session generation/extensions to send. An error refuses adoption before
+	// generation changes.
+	PrepareAdoption func(evidence AdoptionPreparation) (PreparedAdoption, error)
 	// ResumeFrom is the first sequence this controller still needs, i.e. its
 	// durable last_forwarded_seq + 1. Zero means "from the start of the stream".
 	ResumeFrom uint64
@@ -96,13 +102,14 @@ func (o ControllerOptions) logger() *slog.Logger {
 // *ptyhost.Session. That is the §D1 ownership boundary made concrete: when this
 // object is garbage, the session is unaffected.
 type Controller struct {
-	id      Identity
-	conn    *net.UnixConn
-	w       *shimwire.Writer
-	r       *shimwire.Reader
-	gen     shimwire.Generation
-	hello   shimwire.Hello
-	adopted shimwire.Adopted
+	id           Identity
+	controllerID string
+	conn         *net.UnixConn
+	w            *shimwire.Writer
+	r            *shimwire.Reader
+	gen          shimwire.Generation
+	hello        shimwire.Hello
+	adopted      shimwire.Adopted
 	// resumeFrom is the exact durable cursor proposed in Welcome. Retaining it
 	// lets a replacement daemon preserve last_forwarded_seq before any newly
 	// replayed or live output advances its own bookkeeping.
@@ -171,15 +178,16 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	}
 
 	c := &Controller{
-		id:         rec.Identity(),
-		conn:       conn,
-		w:          shimwire.NewWriter(conn),
-		r:          shimwire.NewReader(conn),
-		resumeFrom: opts.ResumeFrom,
-		events:     make(chan ControllerEvent, 64),
-		logger:     opts.logger(),
-		done:       make(chan struct{}),
-		closing:    make(chan struct{}),
+		id:           rec.Identity(),
+		controllerID: opts.ControllerID,
+		conn:         conn,
+		w:            shimwire.NewWriter(conn),
+		r:            shimwire.NewReader(conn),
+		resumeFrom:   opts.ResumeFrom,
+		events:       make(chan ControllerEvent, 64),
+		logger:       opts.logger(),
+		done:         make(chan struct{}),
+		closing:      make(chan struct{}),
 	}
 	if err := c.handshake(rec, opts); err != nil {
 		_ = conn.Close()
@@ -228,6 +236,31 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	if opts.NextGeneration != nil {
 		proposed = opts.NextGeneration(hello.Generation)
 	}
+	extensions := opts.Extensions
+	if opts.PrepareAdoption != nil {
+		lastForwarded := uint64(0)
+		if opts.ResumeFrom > 0 {
+			lastForwarded = opts.ResumeFrom - 1
+		}
+		prepared, prepareErr := opts.PrepareAdoption(AdoptionPreparation{
+			Identity:                    c.id,
+			ControllerID:                opts.ControllerID,
+			ShimID:                      hello.ShimID,
+			ProcessEpoch:                hello.ProcessEpoch,
+			CurrentControllerGeneration: hello.Generation,
+			LastForwardedSeq:            lastForwarded,
+		})
+		if prepareErr != nil {
+			return prepareErr
+		}
+		if prepared.ControllerGeneration != 0 {
+			if opts.ProposedGeneration != 0 || opts.NextGeneration != nil {
+				return fmt.Errorf("%w: prepared and static controller generations are both configured", ErrAdoptionPreparation)
+			}
+			proposed = prepared.ControllerGeneration
+		}
+		extensions = prepared.Extensions
+	}
 	if proposed == 0 {
 		proposed = hello.Generation + 1
 	}
@@ -242,7 +275,7 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 		ControllerID:       opts.ControllerID,
 		ProposedGeneration: proposed,
 		ResumeFrom:         opts.ResumeFrom,
-		Extensions:         opts.Extensions,
+		Extensions:         extensions,
 	}
 	if err := writeTyped(c.w, shimwire.TypeWelcome, func() ([]byte, error) { return shimwire.EncodeWelcome(welcome) }); err != nil {
 		return err
@@ -269,11 +302,21 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	// Trust the COMMITTED generation, not the proposed one. They agree today, but
 	// the shim is authoritative and a controller that assumed its own proposal
 	// would fence itself out the moment they ever diverged.
-	if adopted.Generation < proposed {
-		return fmt.Errorf("%w: shim committed generation %d, below the proposed %d",
-			ErrAdoptionRefused, adopted.Generation, proposed)
+	if err := validateAdoptionCommit(adopted, proposed, extensions); err != nil {
+		return err
 	}
 	c.hello, c.adopted, c.gen = hello, adopted, adopted.Generation
+	return nil
+}
+
+func validateAdoptionCommit(adopted shimwire.Adopted, proposed shimwire.Generation, extensions shimwire.Extensions) error {
+	if adopted.Generation != proposed {
+		return fmt.Errorf("%w: shim committed generation %d, expected exactly %d",
+			ErrAdoptionRefused, adopted.Generation, proposed)
+	}
+	if !extensions.ExactEqual(adopted.Extensions) {
+		return fmt.Errorf("%w: shim extension acknowledgement differs from Welcome", ErrAdoptionRefused)
+	}
 	return nil
 }
 
@@ -340,6 +383,10 @@ func verifySocketIdentity(rec Record) error {
 
 // Identity returns the adopted session's lifecycle identity.
 func (c *Controller) Identity() Identity { return c.id }
+
+// ControllerID returns the exact diagnostic controller id sent in Welcome.
+// It is a process/registration correlation only, never the durable host id.
+func (c *Controller) ControllerID() string { return c.controllerID }
 
 // Generation returns the committed controller generation.
 func (c *Controller) Generation() shimwire.Generation { return c.gen }

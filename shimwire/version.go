@@ -1,6 +1,10 @@
 package shimwire
 
-import "fmt"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
 
 // Protocol identity and the version range this build speaks.
 const (
@@ -94,4 +98,20 @@ func (e Extensions) CheckRequired() error {
 func (e Extensions) Get(name string) (string, bool) {
 	v, ok := e.Values[name]
 	return v, ok
+}
+
+// ExactEqual compares the canonical JSON bytes of two extension maps. Object
+// key order is normalized by encoding/json, while required-list order and
+// absent-versus-present-empty fields remain exact. Adoption uses this to prove
+// the shim committed the precise carrier generation proposed in Welcome.
+func (e Extensions) ExactEqual(other Extensions) bool {
+	a, err := json.Marshal(e)
+	if err != nil {
+		return false
+	}
+	b, err := json.Marshal(other)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(a, b)
 }

@@ -25,6 +25,15 @@ type AdoptOptions struct {
 	// value. Nil uses current+1, which is the ordinary path.
 	NextGeneration func(id Identity, current shimwire.Generation) shimwire.Generation
 
+	// Prepare is the optional per-identity composing hook run before the daemon
+	// sends Welcome and therefore before it acquires controller authority. It is
+	// where an embedder resolves a fresh carrier generation or any other generic
+	// Welcome extension that must be fixed for this adoption. A failure aborts
+	// the WHOLE startup pass: silently quarantining one otherwise-compatible shim
+	// would let the daemon advertise ready without rehydrating that session's
+	// external carrier (ADR-2026-08-17 §D4).
+	Prepare func(ctx context.Context, evidence AdoptionPreparation) (PreparedAdoption, error)
+
 	// ResumeFrom returns the first sequence this daemon still needs for a
 	// session — its durable last_forwarded_seq + 1. Nil resumes from the start of
 	// the stream, which is always SAFE (it can only over-replay, never
@@ -43,6 +52,41 @@ type AdoptOptions struct {
 	Logger *slog.Logger
 	Now    func() time.Time
 }
+
+// AdoptionPreparation is the exact authenticated Hello correlation available
+// before Welcome proposes authority. A composing callback must use this shape
+// rather than looking up a shim by session identity and guessing which
+// incarnation it is preparing.
+type AdoptionPreparation struct {
+	Identity                    Identity
+	ControllerID                string
+	ShimID                      string
+	ProcessEpoch                uint64
+	CurrentControllerGeneration shimwire.Generation
+	LastForwardedSeq            uint64
+}
+
+// PreparedAdoption is the per-session portion of Welcome supplied by a
+// composing daemon. Both fields are optional; the zero value preserves the
+// standalone controller's current+1 generation and extension-free handshake.
+//
+// ControllerGeneration is resolved only after the verified Hello exposes the
+// shim's authoritative current generation. Zero preserves current+1. This
+// deliberately provides no scalar host generation: session-shim-v1 owns one
+// controller generation per shim.
+type PreparedAdoption struct {
+	ControllerGeneration shimwire.Generation
+	Extensions           shimwire.Extensions
+	// Correlation is opaque composing state prepared against the exact Hello
+	// above (for example a fence revision and expected adoption revision). Donmai
+	// never parses it; the daemon hands the bytes unchanged to OnAdoption.
+	Correlation []byte
+}
+
+// ErrAdoptionPreparation reports a composing dependency that failed before
+// controller authority was proposed. Callers fail startup closed rather than
+// converting it into an ordinary compatibility quarantine.
+var ErrAdoptionPreparation = errors.New("sessionshim: adoption preparation failed")
 
 func (o AdoptOptions) now() time.Time {
 	if o.Now != nil {
@@ -78,6 +122,20 @@ type AdoptionResult struct {
 	// signalled for these: a PID whose start identity no longer matches is a
 	// DIFFERENT process, and §D10 forbids signalling a reused pid.
 	Stale []Record
+}
+
+type terminalIncarnation struct {
+	identity     Identity
+	shimID       string
+	processEpoch uint64
+}
+
+func terminalIncarnationForTombstone(t Tombstone) terminalIncarnation {
+	return terminalIncarnation{identity: t.Identity(), shimID: t.ShimID, processEpoch: t.ProcessEpoch}
+}
+
+func terminalIncarnationForRecord(r Record) terminalIncarnation {
+	return terminalIncarnation{identity: r.Identity(), shimID: r.ShimID, processEpoch: r.ProcessEpoch}
 }
 
 // OccupiedSlots is the capacity a host must subtract before advertising.
@@ -135,10 +193,25 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 	if err != nil {
 		return result, err
 	}
-	tombstoneByID := make(map[Identity]Tombstone, len(tombstones))
+	tombstoneByIncarnation := make(map[terminalIncarnation]Tombstone, len(tombstones))
 	for _, t := range tombstones {
-		tombstoneByID[t.Identity()] = t
-		result.Tombstoned = append(result.Tombstoned, t)
+		if t.GroupReaped {
+			tombstoneByIncarnation[terminalIncarnationForTombstone(t)] = t
+			result.Tombstoned = append(result.Tombstoned, t)
+			continue
+		}
+		// A tombstone is terminal observation, but only GroupReaped is positive
+		// proof that capacity disappeared. Keep the exact shim/process incarnation
+		// visible and charged rather than treating a failed OS probe as free space.
+		result.Quarantined = append(result.Quarantined, QuarantinedSession{
+			OrgID:            t.OrgID,
+			SessionID:        t.SessionID,
+			ShimID:           t.ShimID,
+			ProcessEpoch:     t.ProcessEpoch,
+			Reason:           QuarantineGroupReapUnproven,
+			Detail:           "terminal tombstone did not prove harness process-group reap",
+			ConsumesCapacity: true,
+		})
 	}
 
 	// Duplicate detection runs over the WHOLE scan before any adoption, because
@@ -147,6 +220,13 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 	seen := make(map[Identity][]Record)
 	for _, e := range entries {
 		if e.Err != nil {
+			continue
+		}
+		if _, terminal := tombstoneByIncarnation[terminalIncarnationForRecord(e.Record)]; terminal {
+			// A crash may leave the exact live record beside its already-published
+			// positive tombstone. It is not a live duplicate and must not make a
+			// different surviving incarnation under the same lifecycle identity look
+			// ambiguous.
 			continue
 		}
 		id := e.Record.Identity()
@@ -168,7 +248,7 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 		rec := e.Record
 		id := rec.Identity()
 
-		if _, ok := tombstoneByID[id]; ok {
+		if _, ok := tombstoneByIncarnation[terminalIncarnationForRecord(rec)]; ok {
 			// The shim already proved its outcome. The live record is a crash
 			// artifact from between tombstone publication and record removal.
 			continue
@@ -221,6 +301,10 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 
 		ctrl, adoptErr := dialForAdoption(ctx, rec, opts)
 		if adoptErr != nil {
+			if errors.Is(adoptErr, ErrAdoptionPreparation) {
+				result.Close()
+				return result, adoptErr
+			}
 			reason, detail := classifyAdoptionFailure(adoptErr)
 			result.Quarantined = append(result.Quarantined, NewQuarantinedSession(rec, reason, detail, now))
 			log.Warn("sessionshim: quarantined shim after failed adoption (not killed)",
@@ -259,6 +343,15 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 		next := opts.NextGeneration
 		copts.NextGeneration = func(current shimwire.Generation) shimwire.Generation {
 			return next(id, current)
+		}
+	}
+	if opts.Prepare != nil {
+		copts.PrepareAdoption = func(evidence AdoptionPreparation) (PreparedAdoption, error) {
+			prepared, err := opts.Prepare(ctx, evidence)
+			if err != nil {
+				return PreparedAdoption{}, fmt.Errorf("%w for %s: %w", ErrAdoptionPreparation, evidence.Identity, err)
+			}
+			return prepared, nil
 		}
 	}
 	return Dial(ctx, rec, copts)
@@ -306,7 +399,14 @@ func sortResult(r *AdoptionResult) {
 	})
 	SortQuarantined(r.Quarantined)
 	sort.Slice(r.Tombstoned, func(i, j int) bool {
-		return r.Tombstoned[i].Identity().Key() < r.Tombstoned[j].Identity().Key()
+		left, right := r.Tombstoned[i], r.Tombstoned[j]
+		if left.Identity().Key() != right.Identity().Key() {
+			return left.Identity().Key() < right.Identity().Key()
+		}
+		if left.ShimID != right.ShimID {
+			return left.ShimID < right.ShimID
+		}
+		return left.ProcessEpoch < right.ProcessEpoch
 	})
 	sort.Slice(r.Stale, func(i, j int) bool {
 		return r.Stale[i].Identity().Key() < r.Stale[j].Identity().Key()

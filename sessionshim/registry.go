@@ -2,6 +2,8 @@ package sessionshim
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -26,6 +29,11 @@ const (
 // ErrRegistryUnsafe reports a registry directory or entry whose ownership or
 // mode violates the §D6 bounds.
 var ErrRegistryUnsafe = errors.New("sessionshim: unsafe registry permissions")
+
+// ErrTombstoneAmbiguous reports a legacy identity-only operation that matched
+// more than one shim/process incarnation. Singular callers fail closed rather
+// than deleting or returning an arbitrary proof.
+var ErrTombstoneAmbiguous = errors.New("sessionshim: multiple terminal incarnations match session identity")
 
 // Registry is the on-disk discovery surface: one bounded, secret-free record per
 // live shim, plus a terminal tombstone per shim that reaped its own harness.
@@ -91,23 +99,43 @@ func (r *Registry) Put(rec Record) error {
 	return r.publish(rec.Identity().RecordName(), data)
 }
 
-// PutTombstone durably publishes a terminal tombstone AND removes the live
-// discovery record for the same identity, in that order.
+// PutTombstone durably publishes a per-incarnation terminal tombstone AND
+// removes only the matching live discovery record, in that order.
 //
 // The order is the safe one: publishing the proof of death before withdrawing
 // the liveness claim means a daemon scanning concurrently can see both, or the
-// record alone — never neither. A crash between the two leaves a record and a
-// tombstone for the same identity, which the classifier reads as "terminal",
-// not as an ambiguity.
+// record alone — never neither. A crash between the two leaves an exact record
+// and tombstone correlation, while a different live incarnation under the same
+// lifecycle identity remains visible rather than being erased.
 func (r *Registry) PutTombstone(t Tombstone) error {
 	data, err := t.encode()
 	if err != nil {
 		return err
 	}
-	if err := r.publish(t.Identity().TombstoneName(), data); err != nil {
+	if err := r.publish(tombstoneIncarnationName(t), data); err != nil {
 		return err
 	}
-	return r.Remove(t.Identity())
+	// Keep the legacy identity-only alias while it is unambiguous so older v1
+	// readers can still consume a tombstone written by this release. Once a
+	// second incarnation exists, never overwrite the first alias: an old reader
+	// may then reconcile one proof and conservatively leave the other held, but it
+	// can never receive the wrong proof under an identity.
+	legacySafe, err := r.legacyTombstoneAliasSafe(t)
+	if err != nil {
+		return err
+	}
+	if legacySafe {
+		if err := r.publish(t.Identity().TombstoneName(), data); err != nil {
+			return err
+		}
+	}
+	return r.RemoveIncarnation(t.Identity(), t.ShimID, t.ProcessEpoch)
+}
+
+func tombstoneIncarnationName(t Tombstone) string {
+	correlation := t.Identity().Key() + "\x1f" + t.ShimID + "\x1f" + strconv.FormatUint(t.ProcessEpoch, 10)
+	sum := sha256.Sum256([]byte(correlation))
+	return hex.EncodeToString(sum[:]) + tombstoneSuffix
 }
 
 // Remove deletes the live discovery record for an identity. A missing record is
@@ -125,19 +153,82 @@ func (r *Registry) Remove(id Identity) error {
 	return nil
 }
 
-// RemoveTombstone deletes a tombstone. This is the audited-disposal path: it is
-// called only after a daemon has DURABLY reported the terminal outcome, because
-// the tombstone is the only remaining proof that the harness group was reaped.
-func (r *Registry) RemoveTombstone(id Identity) error {
+// RemoveIncarnation removes only discovery records whose decoded shim/process
+// correlation matches the expected incarnation. It is the terminal path's safe
+// alternative to legacy identity-only Remove when duplicate records coexist.
+func (r *Registry) RemoveIncarnation(id Identity, shimID string, processEpoch uint64) error {
+	entries, err := r.Scan()
+	if err != nil {
+		return err
+	}
 	root, err := r.openRoot()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = root.Close() }()
-	if err := root.Remove(id.TombstoneName()); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("sessionshim: remove tombstone: %w", err)
+	for _, entry := range entries {
+		if entry.Err != nil || entry.Record.Identity() != id || entry.Record.ShimID != shimID || entry.Record.ProcessEpoch != processEpoch {
+			continue
+		}
+		if err := root.Remove(entry.Name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("sessionshim: remove exact discovery record: %w", err)
+		}
 	}
 	return nil
+}
+
+// HasIncarnation reports whether an exact live discovery record remains.
+func (r *Registry) HasIncarnation(id Identity, shimID string, processEpoch uint64) (bool, error) {
+	entries, err := r.Scan()
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.Err == nil && entry.Record.Identity() == id && entry.Record.ShimID == shimID && entry.Record.ProcessEpoch == processEpoch {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// RemoveTombstone deletes a tombstone. This is the audited-disposal path: it is
+// called only after a daemon has DURABLY reported the terminal outcome, because
+// the tombstone is the only remaining proof that the harness group was reaped.
+func (r *Registry) RemoveTombstone(id Identity) error {
+	entries, err := r.tombstoneEntries()
+	if err != nil {
+		return err
+	}
+	var matched []tombstoneFile
+	unique := make(map[terminalIncarnation]struct{})
+	for _, entry := range entries {
+		if entry.tombstone.Identity() != id {
+			continue
+		}
+		matched = append(matched, entry)
+		unique[terminalIncarnationForTombstone(entry.tombstone)] = struct{}{}
+	}
+	if len(unique) > 1 {
+		return fmt.Errorf("%w: %s", ErrTombstoneAmbiguous, id)
+	}
+	return r.removeTombstoneFiles(matched)
+}
+
+// RemoveTombstoneIncarnation deletes every legacy/new filename that contains
+// the exact terminal correlation, leaving sibling incarnations untouched.
+func (r *Registry) RemoveTombstoneIncarnation(t Tombstone) error {
+	entries, err := r.tombstoneEntries()
+	if err != nil {
+		return err
+	}
+	want := terminalIncarnationForTombstone(t)
+	matched := make([]tombstoneFile, 0, 2)
+	for _, entry := range entries {
+		if terminalIncarnationForTombstone(entry.tombstone) == want {
+			matched = append(matched, entry)
+		}
+	}
+	return r.removeTombstoneFiles(matched)
 }
 
 // Get reads one discovery record by identity.
@@ -151,11 +242,41 @@ func (r *Registry) Get(id Identity) (Record, error) {
 
 // GetTombstone reads one tombstone by identity.
 func (r *Registry) GetTombstone(id Identity) (Tombstone, error) {
-	data, err := r.readEntry(id.TombstoneName())
+	entries, err := r.tombstoneEntries()
 	if err != nil {
 		return Tombstone{}, err
 	}
-	return decodeTombstone(data)
+	unique := make(map[terminalIncarnation]Tombstone)
+	for _, entry := range entries {
+		if entry.tombstone.Identity() == id {
+			unique[terminalIncarnationForTombstone(entry.tombstone)] = entry.tombstone
+		}
+	}
+	if len(unique) == 0 {
+		return Tombstone{}, fmt.Errorf("sessionshim: tombstone for %s: %w", id, fs.ErrNotExist)
+	}
+	if len(unique) > 1 {
+		return Tombstone{}, fmt.Errorf("%w: %s", ErrTombstoneAmbiguous, id)
+	}
+	for _, tombstone := range unique {
+		return tombstone, nil
+	}
+	return Tombstone{}, fmt.Errorf("sessionshim: tombstone for %s: %w", id, fs.ErrNotExist)
+}
+
+// GetTombstoneIncarnation returns one exact shim/process terminal proof.
+func (r *Registry) GetTombstoneIncarnation(id Identity, shimID string, processEpoch uint64) (Tombstone, error) {
+	want := terminalIncarnation{identity: id, shimID: shimID, processEpoch: processEpoch}
+	entries, err := r.tombstoneEntries()
+	if err != nil {
+		return Tombstone{}, err
+	}
+	for _, entry := range entries {
+		if terminalIncarnationForTombstone(entry.tombstone) == want {
+			return entry.tombstone, nil
+		}
+	}
+	return Tombstone{}, fmt.Errorf("sessionshim: exact tombstone for %s/%s/%d: %w", id, shimID, processEpoch, fs.ErrNotExist)
 }
 
 // ScanEntry is one raw registry entry as found on disk. Err is non-nil when the
@@ -199,6 +320,37 @@ func (r *Registry) Scan() ([]ScanEntry, error) {
 
 // ScanTombstones reads every tombstone in the registry, sorted by filename.
 func (r *Registry) ScanTombstones() ([]Tombstone, error) {
+	entries, err := r.tombstoneEntries()
+	if err != nil {
+		return nil, err
+	}
+	unique := make(map[terminalIncarnation]Tombstone, len(entries))
+	for _, entry := range entries {
+		unique[terminalIncarnationForTombstone(entry.tombstone)] = entry.tombstone
+	}
+	out := make([]Tombstone, 0, len(unique))
+	for _, tombstone := range unique {
+		out = append(out, tombstone)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := terminalIncarnationForTombstone(out[i]), terminalIncarnationForTombstone(out[j])
+		if a.identity.Key() != b.identity.Key() {
+			return a.identity.Key() < b.identity.Key()
+		}
+		if a.shimID != b.shimID {
+			return a.shimID < b.shimID
+		}
+		return a.processEpoch < b.processEpoch
+	})
+	return out, nil
+}
+
+type tombstoneFile struct {
+	name      string
+	tombstone Tombstone
+}
+
+func (r *Registry) tombstoneEntries() ([]tombstoneFile, error) {
 	if err := r.checkDirMode(); err != nil {
 		return nil, err
 	}
@@ -206,19 +358,55 @@ func (r *Registry) ScanTombstones() ([]Tombstone, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Tombstone, 0, len(names))
+	out := make([]tombstoneFile, 0, len(names))
 	for _, name := range names {
-		data, err := r.readEntry(name)
-		if err != nil {
+		data, readErr := r.readEntry(name)
+		if readErr != nil {
 			continue
 		}
-		t, err := decodeTombstone(data)
-		if err != nil {
+		tombstone, decodeErr := decodeTombstone(data)
+		if decodeErr != nil {
 			continue
 		}
-		out = append(out, t)
+		out = append(out, tombstoneFile{name: name, tombstone: tombstone})
 	}
 	return out, nil
+}
+
+func (r *Registry) legacyTombstoneAliasSafe(t Tombstone) (bool, error) {
+	names, err := r.entryNames(tombstoneSuffix)
+	if err != nil {
+		return false, err
+	}
+	want := terminalIncarnationForTombstone(t)
+	for _, name := range names {
+		data, readErr := r.readEntry(name)
+		if readErr != nil {
+			return false, nil
+		}
+		existing, decodeErr := decodeTombstone(data)
+		if decodeErr != nil {
+			return false, nil
+		}
+		if existing.Identity() == t.Identity() && terminalIncarnationForTombstone(existing) != want {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (r *Registry) removeTombstoneFiles(files []tombstoneFile) error {
+	root, err := r.openRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	for _, file := range files {
+		if err := root.Remove(file.name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("sessionshim: remove exact tombstone: %w", err)
+		}
+	}
+	return nil
 }
 
 // ---- internals -------------------------------------------------------------

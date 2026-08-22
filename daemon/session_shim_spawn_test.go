@@ -99,6 +99,31 @@ type shimEventRecorder struct {
 	gaps map[string]int
 }
 
+type exactFenceRecorder struct {
+	mu       sync.Mutex
+	requests []sessionshim.FenceRequest
+	failOrg  string
+}
+
+func (r *exactFenceRecorder) AcknowledgeExact(_ context.Context, request sessionshim.FenceRequest) (sessionshim.FenceAcknowledgement, error) {
+	r.mu.Lock()
+	r.requests = append(r.requests, request)
+	r.mu.Unlock()
+	if len(request.Fence.Sessions) > 0 && request.Fence.Sessions[0].OrgID == r.failOrg {
+		return sessionshim.FenceAcknowledgement{}, errors.New("organization fence unavailable")
+	}
+	return sessionshim.FenceAcknowledgement{
+		RequestBytes:    append([]byte(nil), request.RequestBytes...),
+		DurableRevision: "revision-" + request.Fence.Sessions[0].OrgID,
+	}, nil
+}
+
+func (r *exactFenceRecorder) snapshot() []sessionshim.FenceRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]sessionshim.FenceRequest(nil), r.requests...)
+}
+
 func newShimEventRecorder() *shimEventRecorder {
 	return &shimEventRecorder{
 		seen: map[string]*strings.Builder{},
@@ -284,6 +309,152 @@ func TestInteractiveSpawnLaunchesThroughAShimAndAdoptsIt(t *testing.T) {
 	}
 	if !entry.launched {
 		t.Error("the launched shim is not marked as launched by this daemon")
+	}
+}
+
+func TestInteractiveShimUsesPerSessionOrganizationAndGroupedExactFences(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	store := &exactFenceRecorder{}
+	d.opts.SessionShim.HostIDForOrg = func(_ context.Context, orgID string) (string, error) {
+		return "stable-host-" + orgID, nil
+	}
+	d.opts.SessionShim.ExactFenceStore = store
+
+	for _, tc := range []struct {
+		orgID, sessionID string
+	}{
+		{orgID: "org-alpha", sessionID: "sess-alpha"},
+		{orgID: "org-beta", sessionID: "sess-beta"},
+	} {
+		spec := f.interactiveSpec(tc.sessionID)
+		spec.OrganizationID = tc.orgID
+		if _, err := d.spawner.AcceptWork(spec); err != nil {
+			t.Fatalf("AcceptWork(%s): %v", tc.orgID, err)
+		}
+		if _, err := d.adoptedShimEntry(tc.orgID, tc.sessionID); err != nil {
+			t.Fatalf("per-session lifecycle identity %s/%s was not adopted: %v", tc.orgID, tc.sessionID, err)
+		}
+	}
+
+	// Prove the fence host does not come from the rotating worker/controller id.
+	d.mu.Lock()
+	d.workerID = "worker-controller-correlation"
+	d.mu.Unlock()
+	fences, err := d.RequestSessionShimRestartFences(context.Background(), "fence-shared-id")
+	if err != nil {
+		t.Fatalf("RequestSessionShimRestartFences: %v", err)
+	}
+	if len(fences) != 2 {
+		t.Fatalf("fences = %+v, want one per organization", fences)
+	}
+	requests := store.snapshot()
+	if len(requests) != 2 {
+		t.Fatalf("exact store requests = %d, want 2", len(requests))
+	}
+	for _, request := range requests {
+		if len(request.Fence.Sessions) != 1 {
+			t.Fatalf("cross-organization exact request = %+v, want one homogeneous session", request.Fence.Sessions)
+		}
+		covered := request.Fence.Sessions[0]
+		if request.Fence.HostID != "stable-host-"+covered.OrgID {
+			t.Errorf("fence hostId = %q, want per-org stable host authority for %s", request.Fence.HostID, covered.OrgID)
+		}
+		if covered.OrgID == "" || covered.ControllerGeneration == 0 {
+			t.Errorf("fence omitted per-session org/controller correlation: %+v", covered)
+		}
+		entry, err := d.adoptedShimEntry(covered.OrgID, covered.SessionID)
+		if err != nil {
+			t.Fatalf("adoptedShimEntry(%s): %v", covered.Identity(), err)
+		}
+		if covered.ControllerGeneration != uint64(entry.controller.Generation()) {
+			t.Errorf("fenced generation = %d, exact shim generation = %d", covered.ControllerGeneration, entry.controller.Generation())
+		}
+		if entry.adoption.ControllerID != "daemon" || entry.adoption.ControllerID == request.Fence.HostID {
+			t.Errorf("controller/host correlations collapsed or drifted: controller=%q host=%q",
+				entry.adoption.ControllerID, request.Fence.HostID)
+		}
+		for _, session := range request.Fence.Sessions {
+			if session.OrgID != covered.OrgID {
+				t.Fatalf("exact fence mixed organizations: %+v", request.Fence.Sessions)
+			}
+		}
+	}
+}
+
+func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.opts.SessionShim.HostID = "host-callback"
+	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+		if preparation.Identity.OrgID != "org-callback" || preparation.HostID != "host-callback" ||
+			preparation.ShimID == "" || preparation.ProcessEpoch == 0 {
+			return sessionshim.PreparedAdoption{}, fmt.Errorf("incomplete preparation evidence: %+v", preparation)
+		}
+		return sessionshim.PreparedAdoption{
+			ControllerGeneration: preparation.CurrentControllerGeneration + 7,
+			Extensions: shimwire.Extensions{
+				Values:   map[string]string{shimwire.ExtCarrierEpoch: "19"},
+				Required: []string{shimwire.ExtCarrierEpoch},
+			},
+			Correlation: []byte(`{"fenceRevision":"73","expectedAdoptionRevision":"81"}`),
+		}, nil
+	}
+	var adoption SessionShimAdoptionEvidence
+	d.opts.SessionShim.OnAdoption = func(_ context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+		adoption = evidence
+		return SessionShimAdoptionReceipt{DurableCorrelation: []byte(`{"fenceRevision":"73","adoptionRevision":"81"}`)}, nil
+	}
+	terminal := make(chan SessionShimTerminalEvidence, 1)
+	d.opts.SessionShim.OnTerminalEvidence = func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+		registry, err := sessionshim.NewRegistry(f.registry)
+		if err != nil {
+			return err
+		}
+		if _, err := registry.GetTombstone(evidence.Identity); err != nil {
+			return fmt.Errorf("terminal callback ran before tombstone publication: %w", err)
+		}
+		terminal <- evidence
+		return nil
+	}
+
+	spec := f.interactiveSpec("sess-callback")
+	spec.OrganizationID = "org-callback"
+	if _, err := d.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := sessionshim.Identity{OrgID: spec.OrganizationID, SessionID: spec.SessionID}
+	if adoption.Identity != id || adoption.HostID != "host-callback" {
+		t.Fatalf("adoption evidence identity/host = %+v", adoption)
+	}
+	if adoption.ControllerGeneration != 7 || adoption.ProcessEpoch == 0 || adoption.ShimID == "" {
+		t.Fatalf("adoption evidence omitted exact shim/process/controller correlation: %+v", adoption)
+	}
+	if got, ok := adoption.Extensions.Get(shimwire.ExtCarrierEpoch); !ok || got != "19" {
+		t.Fatalf("adoption carrier_epoch = %q/%v, want 19/true", got, ok)
+	}
+	if string(adoption.PreparedCorrelation) != `{"fenceRevision":"73","expectedAdoptionRevision":"81"}` {
+		t.Fatalf("prepared correlation changed before adoption: %s", adoption.PreparedCorrelation)
+	}
+	if !d.StopSession(spec.SessionID) {
+		t.Fatal("StopSession did not reach shim")
+	}
+
+	select {
+	case evidence := <-terminal:
+		if evidence.Identity != id || evidence.HostID != adoption.HostID || evidence.Adoption == nil ||
+			evidence.ShimID != adoption.ShimID || evidence.ProcessEpoch != adoption.ProcessEpoch ||
+			evidence.Adoption.ControllerGeneration != adoption.ControllerGeneration {
+			t.Fatalf("terminal correlation = %+v, want adoption %+v", evidence, adoption)
+		}
+		if string(evidence.DurableAdoptionCorrelation) != `{"fenceRevision":"73","adoptionRevision":"81"}` {
+			t.Fatalf("opaque durable adoption correlation changed: %s", evidence.DurableAdoptionCorrelation)
+		}
+		if !evidence.Tombstone.GroupReaped {
+			t.Fatal("terminal callback ran without positive process-group reap proof")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for terminal evidence callback")
 	}
 }
 
@@ -558,6 +729,13 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 		tombstone, err = registry.GetTombstone(id)
 		return err == nil
 	})
+	waitFor(t, 5*time.Second, "orphan tombstone publication to withdraw the live record", func() bool {
+		_, err := registry.Get(id)
+		return err != nil
+	})
+	if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
+		t.Fatalf("remove exact tombstone for wrong-epoch control: %v", err)
+	}
 	wrongEpoch := tombstone
 	wrongEpoch.ProcessEpoch++
 	if err := registry.PutTombstone(wrongEpoch); err != nil {
@@ -851,6 +1029,83 @@ func TestRestartFenceRetainsTheAdoptionResumeCursor(t *testing.T) {
 	if got := fence.Sessions[0].LastForwardedSeq; got != lastForwarded {
 		t.Fatalf("fence lastForwardedSeq = %d, want durable adoption cursor %d", got, lastForwarded)
 	}
+}
+
+func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	// Give two replacement attempts ample room before the shim-owned orphan
+	// deadline. The first is deliberately refused by the composing callback.
+	f.daemon.opts.SessionShim.Orphan.Deadline = 15 * time.Second
+	spec := f.interactiveSpec("sess-startup-callback")
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	f.daemon.ReleaseAdoptedSessionShims()
+
+	refusing := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			EnableAdoption: true,
+			RegistryDir:    f.registry,
+			HostID:         "host-startup",
+			OnAdoption: func(context.Context, SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+				return SessionShimAdoptionReceipt{}, errors.New("durable carrier unavailable")
+			},
+		},
+	})
+	refusing.config = &Config{Capacity: CapacityConfig{MaxConcurrentSessions: 4}}
+	refusing.setState(StateRunning)
+	err := refusing.adoptSessionShims(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "durable carrier unavailable") {
+		t.Fatalf("adoptSessionShims = %v, want durable carrier refusal", err)
+	}
+	if refusing.SessionShimAdoptionComplete() {
+		t.Fatal("adoption reads complete after durable carrier refusal")
+	}
+	if got := refusing.RegistrationStatus(); got != RegistrationDraining {
+		t.Fatalf("RegistrationStatus after callback refusal = %q, want draining", got)
+	}
+
+	replacement := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			EnableAdoption: true,
+			RegistryDir:    f.registry,
+			HostID:         "host-startup",
+			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+				return sessionshim.PreparedAdoption{Extensions: shimwire.Extensions{
+					Values: map[string]string{shimwire.ExtCarrierEpoch: "20"},
+				}, ControllerGeneration: preparation.CurrentControllerGeneration + 1}, nil
+			},
+			OnAdoption: func(_ context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+				if evidence.Identity != id {
+					return SessionShimAdoptionReceipt{}, fmt.Errorf("wrong identity %s", evidence.Identity)
+				}
+				return SessionShimAdoptionReceipt{DurableCorrelation: []byte("durable-startup")}, nil
+			},
+		},
+	})
+	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
+	if err := replacement.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("replacement adoptSessionShims: %v", err)
+	}
+	if !replacement.SessionShimAdoptionComplete() {
+		t.Fatal("adoption did not complete after durable carrier handoff")
+	}
+	entry, err := replacement.adoptedShimEntry(id.OrgID, id.SessionID)
+	if err != nil {
+		t.Fatalf("adoptedShimEntry: %v", err)
+	}
+	if got, _ := entry.adoption.Extensions.Get(shimwire.ExtCarrierEpoch); got != "20" {
+		t.Fatalf("replacement adoption carrier_epoch = %q, want 20", got)
+	}
+	if err := replacement.StopAdoptedSessionShim(id.OrgID, id.SessionID, shimwire.StopHostShutdown); err != nil {
+		t.Fatalf("StopAdoptedSessionShim: %v", err)
+	}
+	waitFor(t, 30*time.Second, "replacement terminal cleanup", func() bool {
+		return replacement.SessionShimOccupancy() == 0
+	})
 }
 
 // waitFor polls cond until it holds or the deadline passes.
