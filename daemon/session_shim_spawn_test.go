@@ -372,13 +372,17 @@ func TestStopAndTerminalCleanupAfterAdoption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
-	waitFor(t, 10*time.Second, "the tombstone to be disposed after the outcome was recorded", func() bool {
+	// Both halves, and in this order: the liveness claim is withdrawn first, then
+	// the proof is disposed. Asserting only that the tombstone is gone would pass
+	// against a registry still advertising a live shim for a session that ended.
+	waitFor(t, 15*time.Second, "the discovery record to be withdrawn", func() bool {
+		_, err := registry.Get(id)
+		return err != nil
+	})
+	waitFor(t, 15*time.Second, "the tombstone to be disposed after the outcome was recorded", func() bool {
 		_, err := registry.GetTombstone(id)
 		return err != nil
 	})
-	if _, err := registry.Get(id); err == nil {
-		t.Fatal("the live discovery record survived the terminal outcome")
-	}
 	if proof := d.SessionShimTerminalProof(id.OrgID, id.SessionID); !proof.Proves() {
 		t.Fatal("no terminal proof retained for a session this daemon watched end; the outcome would be unresolvable")
 	}

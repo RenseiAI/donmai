@@ -347,8 +347,19 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity) {
 			"session", id.String(), "verdict", verdict)
 		return
 	}
-	// Audited disposal: the outcome is durably recorded above, so the tombstone
-	// has done its job and may go.
+	// Withdraw the liveness claim BEFORE disposing the proof, and never the other
+	// way round. A shim publishes its tombstone and then removes its discovery
+	// record, so those two writes can be observed apart — and a crash between them
+	// leaves both on disk by design. Disposing the tombstone first would collapse
+	// "terminal, proven" into "a record whose process is gone", which §D10
+	// classifies as stale and leaves unresolved. Remove is idempotent, so the
+	// ordinary case where the shim already withdrew its own record costs nothing.
+	if err := registry.Remove(id); err != nil {
+		slog.Warn("session shim: withdraw discovery record", "session", id.String(), "error", err)
+		return
+	}
+	// Audited disposal: the outcome is durably recorded above and no liveness
+	// claim survives it, so the tombstone has done its job and may go.
 	if err := registry.RemoveTombstone(id); err != nil {
 		slog.Warn("session shim: dispose tombstone", "session", id.String(), "error", err)
 	}
