@@ -747,7 +747,7 @@ func (d *Daemon) stopSessionShimByID(sessionID string) (handled bool) {
 		// The localhost API supplies only a session id. Do not collapse two
 		// tenant-scoped lifecycle identities or pick one by map order.
 		slog.Error("session shim: bare session id is ambiguous across organizations",
-			"sessionId", sessionID, "matches", len(matches))
+			"matches", len(matches))
 		return false
 	}
 	id := matches[0]

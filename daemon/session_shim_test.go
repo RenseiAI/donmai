@@ -604,6 +604,22 @@ func TestStopIsRefusedForSessionsThisDaemonDidNotAdopt(t *testing.T) {
 	}
 }
 
+func TestBareSessionStopRefusesAmbiguousOrganizations(t *testing.T) {
+	t.Parallel()
+
+	d := New(Options{SkipRegistration: true})
+	seedShimState(d, []sessionshim.Identity{
+		{OrgID: "org-alpha", SessionID: "same-session"},
+		{OrgID: "org-beta", SessionID: "same-session"},
+	}, nil)
+	if d.stopSessionShimByID("same-session") {
+		t.Fatal("bare session stop selected one of two organization-scoped identities")
+	}
+	if got := len(d.AdoptedSessionShims()); got != 2 {
+		t.Fatalf("ambiguous stop changed adopted set length to %d, want 2", got)
+	}
+}
+
 func TestReleaseAdoptedShimsClearsControlWithoutClaimingTermination(t *testing.T) {
 	t.Parallel()
 
