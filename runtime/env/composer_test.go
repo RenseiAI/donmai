@@ -3,6 +3,7 @@ package env_test
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -306,5 +307,60 @@ func TestAgentEnvBlocklistMatchesLegacyTS(t *testing.T) {
 	if !reflect.DeepEqual(env.AgentEnvBlocklist, want) {
 		t.Fatalf("AgentEnvBlocklist drifted from legacy TS port:\n got: %v\nwant: %v",
 			env.AgentEnvBlocklist, want)
+	}
+}
+
+// TestRunnerOnlyRefusesTheSessionShimLaunchContract pins the boundary for
+// ADR-2026-08-17 §D1's launch contract at every input layer.
+//
+// The values carry no secret — a lifecycle identity, a registry directory,
+// four durations — but they ADDRESS the supervisor of the process that would
+// receive them. A harness child is a session's workload; handing it the path to
+// its own shim's registry gives a workload a handle on the boundary that owns
+// it, and an explicit Spec.Env entry must not be able to buy that back.
+func TestRunnerOnlyRefusesTheSessionShimLaunchContract(t *testing.T) {
+	t.Parallel()
+
+	shimKeys := []string{
+		"DONMAI_SESSION_SHIM",
+		"DONMAI_SESSION_SHIM_ORG_ID",
+		"DONMAI_SESSION_SHIM_SESSION_ID",
+		"DONMAI_SESSION_SHIM_REGISTRY_DIR",
+		"DONMAI_SESSION_SHIM_PROCESS_EPOCH",
+		"DONMAI_SESSION_SHIM_ORPHAN_DEADLINE_MS",
+		"DONMAI_SESSION_SHIM_TERMINATION_GRACE_MS",
+		"DONMAI_SESSION_SHIM_PROPAGATION_MARGIN_MS",
+		"DONMAI_SESSION_SHIM_EXTERNAL_RELEASE_MS",
+		// Matched by prefix, so a key added to the contract later is refused the
+		// moment it exists rather than the moment someone remembers to list it.
+		"DONMAI_SESSION_SHIM_SOMETHING_ADDED_LATER",
+	}
+	for _, key := range shimKeys {
+		if !env.IsRunnerOnly(key) {
+			t.Errorf("env.IsRunnerOnly(%q) = false, want true", key)
+		}
+	}
+	// Neighbouring daemon/session keys are ORDINARY worker environment and must
+	// keep reaching the child — over-broad matching here would silently break
+	// every harness that reads its own session id.
+	for _, key := range []string{"DONMAI_SESSION_ID", "DONMAI_WORKER_ID", "DONMAI_PROJECT_ID"} {
+		if env.IsRunnerOnly(key) {
+			t.Errorf("env.IsRunnerOnly(%q) = true; this is ordinary worker environment", key)
+		}
+	}
+
+	// The boundary holds through every layer, including an explicit override.
+	c := env.NewComposer()
+	got := c.Compose(
+		map[string]string{"DONMAI_SESSION_SHIM_REGISTRY_DIR": "/host/registry"},
+		agent.Spec{Env: map[string]string{"DONMAI_SESSION_SHIM": "1"}},
+	)
+	for _, entry := range got {
+		if strings.HasPrefix(entry, "DONMAI_SESSION_SHIM") {
+			t.Errorf("Compose leaked %q into the child environment", entry)
+		}
+	}
+	if kept := env.FilterRunnerOnly([]string{"DONMAI_SESSION_SHIM_ORG_ID=o", "PATH=/bin"}); len(kept) != 1 || kept[0] != "PATH=/bin" {
+		t.Errorf("FilterRunnerOnly = %v, want only PATH", kept)
 	}
 }

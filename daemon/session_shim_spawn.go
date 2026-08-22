@@ -1,0 +1,563 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"time"
+
+	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
+)
+
+// defaultShimLaunchTimeout bounds how long the daemon waits for a freshly
+// launched shim to publish its discovery record and complete a handshake.
+//
+// It is generous because the shim's first act is spawning a real harness under a
+// PTY on a possibly-loaded host, and it is BOUNDED because a launch that never
+// produces a record must fail the accept rather than hold a capacity slot for a
+// session that does not exist.
+const defaultShimLaunchTimeout = 30 * time.Second
+
+// shimRecordPollInterval is how often the launch path re-reads the registry
+// while waiting for the new shim's record.
+const shimRecordPollInterval = 25 * time.Millisecond
+
+// shimOwnsSession is the §D11 SELECTION rule: which sessions this daemon
+// launches under per-session shim ownership.
+//
+// Two conditions, both required. Ownership must be enabled — §D11 sequences
+// shipping the protocol (step 1) ahead of taking ownership of live terminals
+// (step 2), and an operator has to be able to roll the release out before it
+// changes who owns a PTY. And the session must be INTERACTIVE: the first
+// delivery is interactive-only, because that is the session class whose value is
+// destroyed by a daemon restart. A headless worker that dies with its daemon is
+// re-dispatched; a human's terminal is not.
+func (d *Daemon) shimOwnsSession(spec SessionSpec) bool {
+	if !d.sessionShimConfig().EnableOwnership {
+		return false
+	}
+	return spec.Mode == interactiveRunMode
+}
+
+// launchSessionShim is the spawner's shim launch path (SpawnerOptions.ShimSpawn).
+//
+// It returns (nil, nil) for a session this daemon does not own through a shim,
+// which is the signal the spawner reads as "use the ordinary direct-child
+// spawn". Returning an error fails the accept.
+//
+// The sequence is: launch a DETACHED worker carrying the launch contract, let go
+// of it entirely, then discover and adopt it over shimwire. The daemon never
+// holds the exec.Cmd, the PTY fd, or a *ptyhost.Session (§D1) — after this
+// function returns, everything it knows about the session travels over a socket
+// it can drop and re-dial.
+func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env []string) (*SessionHandle, error) {
+	if !d.shimOwnsSession(spec) {
+		return nil, nil
+	}
+	cfg := d.sessionShimConfig()
+	id := sessionshim.Identity{OrgID: cfg.orgID(), SessionID: spec.SessionID}
+	if err := id.Validate(); err != nil {
+		return nil, fmt.Errorf("session shim: %w", err)
+	}
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Orphan.Validate(); err != nil {
+		return nil, fmt.Errorf("session shim: %w", err)
+	}
+
+	workarea := d.sessionWorkareaPath(spec)
+	launch := sessionshim.Launch{
+		Identity:     id,
+		RegistryDir:  registry.Dir(),
+		Orphan:       cfg.Orphan,
+		ProcessEpoch: 1,
+	}
+
+	started, err := d.startShimProcess(spec, launch, env)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.launchTimeout())
+	defer cancel()
+
+	rec, err := awaitShimRecord(ctx, registry, id)
+	if err != nil {
+		// The shim never announced itself. Nothing is adopted and nothing is
+		// counted; the process is left alone rather than signalled, because a
+		// launch this daemon cannot identify is exactly the target §D10 forbids
+		// guessing at. Its own orphan deadline is the escape hatch.
+		slog.Error("session shim: launched worker never published a discovery record",
+			"session", id.String(), "pid", started, "error", err)
+		return nil, fmt.Errorf("session shim: %s: %w", id, err)
+	}
+
+	ctrl, err := sessionshim.Dial(ctx, rec, sessionshim.ControllerOptions{
+		ControllerID:     d.controllerID(),
+		ExpectedWorkarea: workarea,
+		DialTimeout:      cfg.launchTimeout(),
+		Logger:           slog.Default(),
+	})
+	if err != nil {
+		slog.Error("session shim: could not adopt the shim it just launched",
+			"session", id.String(), "error", err)
+		return nil, fmt.Errorf("session shim: adopt %s: %w", id, err)
+	}
+
+	handle := d.trackLaunchedShim(ctrl, spec, project, workarea)
+	slog.Info("session shim: launched and adopted an interactive session",
+		"session", id.String(), "shimId", ctrl.Hello().ShimID,
+		"generation", ctrl.Generation(), "harnessPid", ctrl.HarnessIdentity().PID)
+	return &handle, nil
+}
+
+// startShimProcess execs the worker as a detached shim and then RELEASES it.
+//
+// Release is the ownership move made concrete. os/exec would otherwise leave the
+// daemon as the process's parent and waiter, which is precisely the coupling
+// §D1 removes: a daemon that still had to reap this process could not be
+// replaced without ending it.
+func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, env []string) (int, error) {
+	command := d.shimCommand()
+	if len(command) == 0 {
+		return 0, errors.New("session shim: no worker command is configured to launch a shim with")
+	}
+	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec // G204: operator-configured worker command, same source as the direct-spawn path
+	configureShimProcess(cmd)
+	cmd.Env = append(append([]string(nil), env...), envPairs(launch.Env())...)
+
+	// A shim outlives this daemon, so it cannot inherit this daemon's stdio: a
+	// closed pipe after the daemon exits would hand the shim EPIPE on its own
+	// logging. It gets the null device and speaks over its socket instead.
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return 0, fmt.Errorf("session shim: open %s: %w", os.DevNull, err)
+	}
+	defer func() { _ = devNull.Close() }()
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = devNull, devNull, devNull
+
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("session shim: start %s: %w", spec.SessionID, err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Process.Release(); err != nil {
+		// Release failing leaves this daemon as the waiter, which contradicts the
+		// ownership boundary. Report it rather than proceeding as if the shim were
+		// independent — the launch is still usable, but the claim would not be true.
+		slog.Warn("session shim: could not release the launched process",
+			"session", spec.SessionID, "pid", pid, "error", err)
+	}
+	return pid, nil
+}
+
+// shimCommand is the argv used to launch a shim. It is the SAME worker command
+// the direct-spawn path uses: the shim is the worker process, told by its
+// environment to own its PTY instead of being owned (§D1 — "the shim process
+// contains the runner-side interactive driver and ptyhost.Session").
+func (d *Daemon) shimCommand() []string {
+	if d.spawner == nil {
+		return nil
+	}
+	return d.spawner.opts.WorkerCommand
+}
+
+// sessionWorkareaPath is the workarea this daemon believes a session runs in.
+// Adoption compares it against the shim's own self-report, so a shim running
+// somewhere else quarantines instead of being taken over (§D7).
+func (d *Daemon) sessionWorkareaPath(spec SessionSpec) string {
+	if d.spawner == nil || d.spawner.opts.WorktreeParentDir == "" {
+		return ""
+	}
+	return filepath.Join(d.spawner.opts.WorktreeParentDir, spec.SessionID)
+}
+
+// awaitShimRecord polls the registry until the launched shim publishes a valid
+// discovery record, or ctx expires.
+func awaitShimRecord(ctx context.Context, registry *sessionshim.Registry, id sessionshim.Identity) (sessionshim.Record, error) {
+	ticker := time.NewTicker(shimRecordPollInterval)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		rec, err := registry.Get(id)
+		if err == nil {
+			return rec, nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return sessionshim.Record{}, fmt.Errorf("waiting for discovery record: %w (last read: %v)", ctx.Err(), lastErr)
+		case <-ticker.C:
+		}
+	}
+}
+
+// trackLaunchedShim records a newly adopted controller and starts consuming its
+// event stream.
+func (d *Daemon) trackLaunchedShim(ctrl *sessionshim.Controller, spec SessionSpec, project ProjectConfig, workarea string) SessionHandle {
+	handle := SessionHandle{
+		SessionID:  spec.SessionID,
+		PID:        ctrl.HarnessIdentity().PID,
+		AcceptedAt: d.shimNow().UTC().Format(time.RFC3339),
+		State:      SessionRunning,
+		// The workarea doubles as the worktree path a local reader joins with
+		// .agent/…; it is the same <parent>/<sessionID> leaf the direct path
+		// publishes, so a reader cannot tell shim-backed sessions apart by shape.
+		WorktreePath: workarea,
+		ProjectName:  project.ID,
+		Repository:   spec.Repository,
+	}
+	entry := adoptedShim{controller: ctrl, shimID: ctrl.Hello().ShimID, handle: handle, launched: true}
+	d.shims.mu.Lock()
+	d.shims.adopted[ctrl.Identity()] = entry
+	d.shims.mu.Unlock()
+	d.consumeShimEvents(ctrl)
+	return handle
+}
+
+// consumeShimEvents drains one adopted session's stream in the background.
+//
+// This is the daemon's half of stop/input/OUTPUT after adoption. It exists as a
+// real consumer rather than a drop-on-the-floor because the shim's ring is
+// bounded: a controller that never reads and never acknowledges makes every
+// later adoption resume further back, and eventually forces the honest-but-
+// avoidable Gap that §D5 makes the shim declare.
+func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
+	d.shims.wg.Add(1)
+	go func() {
+		defer d.shims.wg.Done()
+		id := ctrl.Identity()
+		observe := d.sessionShimConfig().OnSessionEvent
+		var lastSeq uint64
+		for ev := range ctrl.Events() {
+			if observe != nil {
+				// Forward first, bookkeep second: a carrier must see output in the
+				// order the shim produced it, and acknowledging a sequence this
+				// daemon has not actually handed on would make the resume point a
+				// claim rather than a record.
+				observe(id, ev)
+			}
+			switch ev.Kind {
+			case sessionshim.EventOutput:
+				if ev.Seq > lastSeq {
+					lastSeq = ev.Seq
+					d.recordShimForwardedSeq(id, ev.Seq)
+				}
+			case sessionshim.EventGap:
+				// Surfaced, never smoothed over (§D5). A daemon that logged nothing
+				// here would be claiming contiguous output it does not possess.
+				slog.Warn("session shim: output gap declared by the shim",
+					"session", id.String(), "fromSeq", ev.Gap.FromSeq,
+					"toSeq", ev.Gap.ToSeq, "reason", ev.Gap.Reason)
+			case sessionshim.EventExit:
+				slog.Info("session shim: terminal observation received",
+					"session", id.String(), "exitCode", ev.Exit.ExitCode, "signal", ev.Exit.Signal)
+				d.finishAdoptedShim(id)
+			case sessionshim.EventError:
+				slog.Warn("session shim: error frame",
+					"session", id.String(), "code", ev.Err.Code, "detail", ev.Err.Detail)
+			case sessionshim.EventSnapshot:
+				// State after a gap or on request; the sequence it carries is the
+				// resume point a later adoption starts from.
+				if ev.Snapshot.AtSeq > lastSeq {
+					lastSeq = ev.Snapshot.AtSeq
+					d.recordShimForwardedSeq(id, ev.Snapshot.AtSeq)
+				}
+			}
+		}
+		// The stream ended. If no Exit arrived, this daemon simply lost its
+		// connection — the shim keeps the harness and starts its orphan clock. That
+		// is NOT a terminal outcome and must not be reported as one.
+		d.releaseShimIfLive(id)
+	}()
+}
+
+// recordShimForwardedSeq stores the highest sequence this daemon has forwarded
+// and acknowledges it to the shim, which is what a LATER adoption resumes from.
+func (d *Daemon) recordShimForwardedSeq(id sessionshim.Identity, seq uint64) {
+	d.shims.mu.Lock()
+	if d.shims.forwarded == nil {
+		d.shims.forwarded = make(map[sessionshim.Identity]uint64)
+	}
+	if seq > d.shims.forwarded[id] {
+		d.shims.forwarded[id] = seq
+	}
+	entry, ok := d.shims.adopted[id]
+	d.shims.mu.Unlock()
+	if ok && entry.controller != nil {
+		_ = entry.controller.Heartbeat(seq)
+	}
+}
+
+// SessionShimForwardedSeq reports the highest output sequence this daemon has
+// durably forwarded for a session — its resume position for a later adoption.
+func (d *Daemon) SessionShimForwardedSeq(orgID, sessionID string) uint64 {
+	if d.shims == nil {
+		return 0
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	return d.shims.forwarded[sessionshim.Identity{OrgID: orgID, SessionID: sessionID}]
+}
+
+// finishAdoptedShim is terminal cleanup after adoption (§D8/§D10).
+//
+// The order matters and is the conservative one: drop the live entry so capacity
+// is released, record the tombstone as the durable proof of what happened, and
+// only THEN dispose of it. Disposing first would destroy the one artifact that
+// can prove the harness group was reaped, turning a proven death back into an
+// unresolved one for anything that asks later.
+func (d *Daemon) finishAdoptedShim(id sessionshim.Identity) {
+	d.shims.mu.Lock()
+	entry, ok := d.shims.adopted[id]
+	delete(d.shims.adopted, id)
+	delete(d.shims.forwarded, id)
+	registry := d.shims.registry
+	d.shims.mu.Unlock()
+	if ok && entry.controller != nil {
+		_ = entry.controller.Close()
+	}
+	if registry == nil {
+		return
+	}
+	// The shim emits Exit and THEN durably publishes the tombstone, so an
+	// immediate read races the write. Poll briefly rather than concluding the
+	// proof is missing: treating an in-flight tombstone as absent would leave a
+	// session that provably ended parked in reconciliation forever.
+	tombstone, err := awaitTombstone(registry, id, tombstoneSettleWindow)
+	if err != nil {
+		slog.Warn("session shim: terminal observation without a durable tombstone",
+			"session", id.String(), "error", err)
+		return
+	}
+	d.shims.mu.Lock()
+	d.shims.tombstoned = append(d.shims.tombstoned, tombstone)
+	d.shims.mu.Unlock()
+
+	verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, sessionshim.TerminalProof{Tombstone: &tombstone})
+	if verdict != sessionshim.ReleaseAllowed {
+		slog.Info("session shim: terminal outcome recorded but the claim is not releasable yet",
+			"session", id.String(), "verdict", verdict)
+		return
+	}
+	// Withdraw the liveness claim BEFORE disposing the proof, and never the other
+	// way round. A shim publishes its tombstone and then removes its discovery
+	// record, so those two writes can be observed apart — and a crash between them
+	// leaves both on disk by design. Disposing the tombstone first would collapse
+	// "terminal, proven" into "a record whose process is gone", which §D10
+	// classifies as stale and leaves unresolved. Remove is idempotent, so the
+	// ordinary case where the shim already withdrew its own record costs nothing.
+	if err := registry.Remove(id); err != nil {
+		slog.Warn("session shim: withdraw discovery record", "session", id.String(), "error", err)
+		return
+	}
+	// Audited disposal: the outcome is durably recorded above and no liveness
+	// claim survives it, so the tombstone has done its job and may go.
+	if err := registry.RemoveTombstone(id); err != nil {
+		slog.Warn("session shim: dispose tombstone", "session", id.String(), "error", err)
+	}
+}
+
+// tombstoneSettleWindow bounds the wait for a shim's tombstone after its Exit
+// frame arrives. The shim writes it immediately afterwards (one Alive() probe
+// and one atomic publish), so this is a settle window, not a retry budget.
+const tombstoneSettleWindow = 5 * time.Second
+
+// awaitTombstone polls for the durable terminal proof a shim leaves behind.
+func awaitTombstone(registry *sessionshim.Registry, id sessionshim.Identity, within time.Duration) (sessionshim.Tombstone, error) {
+	deadline := time.Now().Add(within)
+	var lastErr error
+	for {
+		t, err := registry.GetTombstone(id)
+		if err == nil {
+			return t, nil
+		}
+		lastErr = err
+		if !time.Now().Before(deadline) {
+			return sessionshim.Tombstone{}, lastErr
+		}
+		time.Sleep(shimRecordPollInterval)
+	}
+}
+
+// releaseShimIfLive drops a controller whose stream ended without a terminal
+// observation. The session is NOT reported as ended: the shim still owns the
+// harness, and only a terminal receipt or tombstone closes the loop (§D10).
+func (d *Daemon) releaseShimIfLive(id sessionshim.Identity) {
+	d.shims.mu.Lock()
+	entry, ok := d.shims.adopted[id]
+	if ok {
+		delete(d.shims.adopted, id)
+	}
+	d.shims.mu.Unlock()
+	if ok && entry.controller != nil {
+		_ = entry.controller.Close()
+		slog.Info("session shim: controller connection ended without a terminal observation; the shim retains its harness",
+			"session", id.String())
+	}
+}
+
+// WriteAdoptedSessionShimInput sends attributed input bytes to one adopted
+// session under this daemon's generation.
+//
+// Refusing a session this daemon has not adopted is the same rule Stop follows:
+// quarantine grants no input authority (§D7), and reaching a quarantined shim by
+// another route is exactly the "kill instead of quarantine" behaviour the ADR
+// rejects, in a quieter form.
+func (d *Daemon) WriteAdoptedSessionShimInput(orgID, sessionID string, data []byte) error {
+	entry, err := d.adoptedShimEntry(orgID, sessionID)
+	if err != nil {
+		return err
+	}
+	return entry.controller.WriteInput(data)
+}
+
+// ResizeAdoptedSessionShim sends authoritative geometry under this daemon's
+// generation.
+func (d *Daemon) ResizeAdoptedSessionShim(orgID, sessionID string, cols, rows, pxWidth, pxHeight uint32) error {
+	entry, err := d.adoptedShimEntry(orgID, sessionID)
+	if err != nil {
+		return err
+	}
+	return entry.controller.Resize(cols, rows, pxWidth, pxHeight)
+}
+
+// adoptedShimEntry resolves one adopted session with a live controller.
+func (d *Daemon) adoptedShimEntry(orgID, sessionID string) (adoptedShim, error) {
+	if d.shims == nil {
+		return adoptedShim{}, errors.New("session shim: adoption is not configured")
+	}
+	id := sessionshim.Identity{OrgID: orgID, SessionID: sessionID}
+	d.shims.mu.RLock()
+	entry, ok := d.shims.adopted[id]
+	d.shims.mu.RUnlock()
+	if !ok {
+		return adoptedShim{}, fmt.Errorf("session shim: %s is not adopted by this daemon", id)
+	}
+	if entry.controller == nil {
+		return adoptedShim{}, fmt.Errorf("session shim: %s has no live controller connection", id)
+	}
+	return entry, nil
+}
+
+// stopSessionShimByID routes a plain session id — what the control API and the
+// spawner speak — to the generation-fenced Stop on an adopted shim.
+//
+// It reports whether the session was shim-owned at all, so the caller can fall
+// through to the direct-child path for everything else rather than having to
+// know which ownership model a session uses.
+func (d *Daemon) stopSessionShimByID(sessionID string) (handled bool) {
+	if d.shims == nil {
+		return false
+	}
+	id := sessionshim.Identity{OrgID: d.sessionShimConfig().orgID(), SessionID: sessionID}
+	d.shims.mu.RLock()
+	_, ok := d.shims.adopted[id]
+	d.shims.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	if err := d.StopAdoptedSessionShim(id.OrgID, id.SessionID, shimwire.StopOperator); err != nil {
+		slog.Error("session shim: stop", "session", id.String(), "error", err)
+		return false
+	}
+	return true
+}
+
+// sessionShimHandles projects every shim-backed session onto the same
+// SessionHandle shape the direct-spawn path publishes.
+//
+// Quarantined shims are included, and that is §D7 held to at the surface an
+// operator actually looks at: a quarantined shim is a running harness this
+// daemon cannot control, and a session list that omitted it would show an
+// occupied host as idle. Their state is "running" — because it is — with a PID
+// of 0, since this daemon never negotiated with them and does not know one.
+func (d *Daemon) sessionShimHandles() []SessionHandle {
+	if d.shims == nil {
+		return nil
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	out := make([]SessionHandle, 0, len(d.shims.adopted)+len(d.shims.quarantined))
+	for id, entry := range d.shims.adopted {
+		handle := entry.handle
+		if handle.SessionID == "" {
+			// Adopted at startup rather than launched here: this daemon has the
+			// identity and the shim's report, not the original spec.
+			handle = SessionHandle{SessionID: id.SessionID, State: SessionRunning}
+			if entry.controller != nil {
+				handle.PID = entry.controller.HarnessIdentity().PID
+				if started := entry.controller.Hello().ProcessStartedAt; started > 0 {
+					handle.AcceptedAt = time.Unix(0, started).UTC().Format(time.RFC3339)
+				}
+			}
+		}
+		out = append(out, handle)
+	}
+	for _, q := range d.shims.quarantined {
+		out = append(out, SessionHandle{
+			SessionID: q.SessionID,
+			State:     SessionRunning,
+		})
+	}
+	return out
+}
+
+// shimNow is the daemon's clock for shim bookkeeping, routed through the
+// spawner's injectable clock so shim-backed and direct handles are stamped from
+// the same source in tests.
+func (d *Daemon) shimNow() time.Time {
+	if d.spawner != nil && d.spawner.opts.Now != nil {
+		return d.spawner.opts.Now()
+	}
+	return time.Now()
+}
+
+// sessionShimRegistry opens the registry once and reuses it for the daemon's
+// lifetime, so the launch path and the startup adoption pass cannot end up
+// pointed at two different directories.
+func (d *Daemon) sessionShimRegistry() (*sessionshim.Registry, error) {
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	if d.shims.registry != nil {
+		return d.shims.registry, nil
+	}
+	registry, err := sessionshim.NewRegistry(d.sessionShimConfig().RegistryDir)
+	if err != nil {
+		return nil, fmt.Errorf("session shim: open registry: %w", err)
+	}
+	d.shims.registry = registry
+	return registry, nil
+}
+
+// envPairs renders an overlay map as KEY=VALUE entries, sorted so a spawn
+// environment is byte-stable across runs.
+func envPairs(overlay map[string]string) []string {
+	keys := make([]string, 0, len(overlay))
+	for k := range overlay {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+overlay[k])
+	}
+	return out
+}
+
+// waitShimConsumers joins every background event consumer. Tests use it to
+// observe a fully settled daemon; Stop uses it so a shutdown cannot race a
+// consumer that is still writing bookkeeping.
+func (d *Daemon) waitShimConsumers() {
+	if d.shims == nil {
+		return
+	}
+	d.shims.wg.Wait()
+}

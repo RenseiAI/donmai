@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // HeartbeatOptions configure a HeartbeatService.
@@ -40,6 +42,20 @@ type HeartbeatOptions struct {
 	// the legacy GetActiveInteractiveCount callback below. New embedders should use
 	// this paired callback so the two occupancy values come from the same instant.
 	GetActiveSessionCounts func() (active, activeInteractive int)
+
+	// GetQuarantinedSessions returns the bounded per-session-shim quarantine
+	// projection for this beat (ADR-2026-08-17 §D7).
+	//
+	// A quarantined shim is a live harness this daemon could not adopt. §D7
+	// requires it to be VISIBLE — in host diagnostics and in every heartbeat —
+	// and to count against capacity, precisely so it cannot become silent,
+	// unreachable load that a consumer keeps dispatching against.
+	//
+	// Optional and nil-safe: nil omits the key entirely, which is the honest
+	// shape for an embedder that does not run shim adoption at all. An EMPTY
+	// slice is also omitted, so a beat only carries the key when there is
+	// something quarantined to report.
+	GetQuarantinedSessions func() []sessionshim.QuarantinedSession
 
 	// GetActiveInteractiveCount is the legacy separately sampled interactive
 	// occupancy callback. It remains source-compatible with embedders that adopted
@@ -324,6 +340,15 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		h.mu.Unlock()
 	}
 
+	// §D7: quarantined shims ride every beat, not just the beat that discovered
+	// them. A consumer that learned about a quarantine once and then stopped
+	// hearing about it would reasonably conclude it had cleared.
+	if h.opts.GetQuarantinedSessions != nil {
+		if q := h.opts.GetQuarantinedSessions(); len(q) > 0 {
+			payload.QuarantinedSessions = q
+		}
+	}
+
 	// Item 8: sample per-beat CPU/mem load when a sampler is configured.
 	// ok=false leaves payload.Load nil so the wire body omits the key
 	// entirely (best-effort — a sampling miss must never fail a beat).
@@ -496,6 +521,9 @@ type heartbeatRequestBody struct {
 	ProjectAdmissionMode   string                      `json:"projectAdmissionMode,omitempty"`
 	AppliedMutations       []string                    `json:"appliedMutations,omitempty"`
 	MutationFailures       []HeartbeatMutationFailure  `json:"mutationFailures,omitempty"`
+	// QuarantinedSessions is the §D7 projection: every live per-session shim
+	// this daemon refused to adopt, each carrying consumesCapacity:true.
+	QuarantinedSessions []sessionshim.QuarantinedSession `json:"quarantinedSessions,omitempty"`
 }
 
 type heartbeatLoadFields struct {
@@ -614,6 +642,7 @@ func (h *HeartbeatService) callEndpoint(
 		ProjectAdmissionMode:   payload.ProjectAdmissionMode,
 		AppliedMutations:       ackApplied,
 		MutationFailures:       ackFailures,
+		QuarantinedSessions:    payload.QuarantinedSessions,
 	}
 	// NB: region is deliberately NOT sent on the heartbeat leg. The platform's
 	// heartbeat route parses no `region` key — region is a register-time-only

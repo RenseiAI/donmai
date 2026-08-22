@@ -97,6 +97,12 @@ type Options struct {
 	// periodic Refresh); the daemon only ever reads Current().
 	RulesetSnapshot *rulesetsnapshot.Client
 
+	// SessionShim configures per-session shim ownership and daemon adoption
+	// (ADR-2026-08-17). The zero value keeps adoption DISABLED, which is §D11
+	// step 1 of the ADR's own migration law — a daemon that never sets this
+	// behaves exactly as it did before shim ownership existed.
+	SessionShim SessionShimConfig
+
 	// EnableGateway starts the translating-gateway loopback host (the
 	// ModelEndpoint host kind "gateway", ADR-2026-07-24 / 08) alongside the
 	// daemon. Off by default: the gateway is experimental at M1 and is only
@@ -307,6 +313,12 @@ type Daemon struct {
 	poller    *PollService
 	spawner   *WorkerSpawner
 
+	// shims is the daemon's live view of per-session shim ownership: which
+	// shims it adopted at startup, which it quarantined, and the restart fence
+	// it holds. Non-nil from New onward so every accessor is lock-safe without a
+	// nil dance at each call site.
+	shims *sessionShimState
+
 	// gateway is the translating-gateway loopback host, started in Start when
 	// Options.EnableGateway is set and torn down in Stop. Nil when disabled.
 	// gatewayLedger is the cost-ledger path reported by /api/daemon/gateway.
@@ -408,6 +420,7 @@ func New(opts Options) *Daemon {
 		landingDone:    landingDone,
 		sessionDetails: newSessionDetailStore(),
 		routingTraces:  NewRoutingTraceStore(DefaultRoutingRingBufferSize),
+		shims:          newSessionShimState(),
 	}
 	if opts.RulesetSnapshot != nil {
 		snapshotClient := opts.RulesetSnapshot
@@ -624,11 +637,23 @@ func (d *Daemon) runtimeJWT() string {
 }
 
 // ActiveSessions returns a snapshot of in-flight session handles.
+//
+// It is the union of two disjoint populations: sessions this daemon spawned as
+// direct children, and per-session shims it launched, adopted, or quarantined
+// (ADR-2026-08-17 §D7). Both are real work running on this machine. Listing only
+// the direct children would make a freshly restarted daemon report an empty host
+// while every pre-restart terminal is still live — the same lie the capacity
+// path refuses to tell, told on the surface an operator actually reads.
 func (d *Daemon) ActiveSessions() []SessionHandle {
-	if d.spawner == nil {
-		return nil
+	var out []SessionHandle
+	if d.spawner != nil {
+		out = d.spawner.ActiveSessions()
 	}
-	return d.spawner.ActiveSessions()
+	shims := d.sessionShimHandles()
+	if len(shims) == 0 {
+		return out
+	}
+	return append(out, shims...)
 }
 
 // Spawner returns the daemon's WorkerSpawner so callers can subscribe to
@@ -648,6 +673,13 @@ func (d *Daemon) Spawner() *WorkerSpawner {
 // route for the deterministic per-session cancel path (Guard 3 hard out-of-band
 // leg).
 func (d *Daemon) StopSession(id string) bool {
+	// A shim-owned session is reached by a generation-fenced Stop over shimwire,
+	// never by signalling a process this daemon does not parent (§D4). Trying the
+	// shim path first also means a stale spawner entry for the same id could not
+	// win the race and terminate the wrong owner.
+	if d.stopSessionShimByID(id) {
+		return true
+	}
 	if d.spawner == nil {
 		return false
 	}
@@ -719,6 +751,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.capabilitySet = cs
 	slog.Info("daemon: detected substrate capabilities",
 		"count", len(cs.Capabilities()))
+
+	// §D4: adopt BEFORE advertising. Registration is the first thing that tells
+	// anything outside this host how much capacity is available, so every
+	// surviving per-session shim must be discovered and either adopted or
+	// quarantined — and counted — before this point. A daemon that registered
+	// first would advertise slots that surviving harnesses already occupy.
+	if err := d.adoptSessionShims(ctx); err != nil {
+		return err
+	}
 
 	var (
 		regResp *RegisterResponse
@@ -823,6 +864,18 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.StderrPrefixWriter == nil {
 		spawnerOpts.StderrPrefixWriter = newStderrSlogWriter()
 	}
+	// §D1/§D11: route interactive spawns through per-session shim ownership. The
+	// launcher itself decides which sessions qualify and returns (nil, nil) for
+	// the rest, so wiring it unconditionally changes nothing until an operator
+	// enables ownership. Embedders that supply their own launcher keep priority.
+	if spawnerOpts.ShimSpawn == nil {
+		spawnerOpts.ShimSpawn = d.launchSessionShim
+	}
+	// Admission must see shim-held slots too, or a restarted daemon would accept
+	// against cores its surviving shims are already using.
+	if spawnerOpts.ExternalOccupancy == nil {
+		spawnerOpts.ExternalOccupancy = d.SessionShimOccupancy
+	}
 	d.spawner = NewWorkerSpawner(spawnerOpts)
 	// Cleanup the per-session detail store when sessions end so
 	// stale auth tokens do not linger.
@@ -898,6 +951,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// interactive + legacy interview subset under one spawner lock so
 			// lifecycle changes cannot serialize values from different instants.
 			GetActiveSessionCounts: d.spawnerActiveSessionCounts,
+			// §D7: quarantined per-session shims are visible capacity. They ride
+			// every beat so a consumer can see occupied-but-unreachable load
+			// instead of inferring an idle host from an unchanged session count.
+			GetQuarantinedSessions: d.QuarantinedSessions,
 			GetMaxCount:            func() int { return d.maxConcurrentSessions() },
 			GetStatus:              d.RegistrationStatus,
 			Region:                 cfg.Machine.Region,
@@ -1222,6 +1279,13 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	if watcherStop != nil {
 		watcherStop()
 	}
+
+	// Release adopted per-session shims WITHOUT stopping them (§D1/§D10). This
+	// is the whole point of shim ownership: shutting the daemon down drops a
+	// socket, and each shim keeps its harness and starts its bounded orphan clock
+	// until the next daemon adopts. Stopping them here would make an ordinary
+	// restart destructive again, which is the defect the ADR exists to remove.
+	d.ReleaseAdoptedSessionShims()
 
 	// Tear the translating gateway down (releases its loopback listener and
 	// every session route). Best-effort, bounded by ctx.
@@ -1920,25 +1984,52 @@ func (d *Daemon) recordOSSRoutingDecision(sessionID string) {
 
 // ── internal helpers ──────────────────────────────────────────────────────
 
+// spawnerActiveCount is the unclassed occupancy total.
+//
+// It routes through the paired snapshot rather than reading the spawner alone so
+// it can never disagree with spawnerActiveSessionCounts about how full this host
+// is — two occupancy answers that drift apart is how a host advertises capacity
+// it does not have.
 func (d *Daemon) spawnerActiveCount() int {
-	if d.spawner == nil {
-		return 0
-	}
-	return d.spawner.ActiveCount()
+	active, _ := d.spawnerActiveSessionCounts()
+	return active
 }
 
 func (d *Daemon) spawnerActiveInteractiveCount() int {
-	if d.spawner == nil {
-		return 0
-	}
-	return d.spawner.ActiveInteractiveCount()
+	_, interactive := d.spawnerActiveSessionCounts()
+	return interactive
 }
 
+// spawnerActiveSessionCounts is the daemon's coherent occupancy snapshot.
+//
+// It is the sum of two DISJOINT populations: sessions this daemon spawned
+// directly, and per-session shims it adopted or quarantined at startup. Both
+// occupy real slots on this machine, and a shim's harness is running whether or
+// not this daemon has authority over it (§D7), so both must be reported.
+// Counting only the spawner's own children would advertise a restarted daemon as
+// idle while every pre-restart terminal is still live.
+//
+// Adopted shims are interactive by construction — the first delivery of shim
+// ownership is interactive-only (§D11) — so they count toward BOTH totals.
+// Quarantined shims count toward the unclassed total only: this daemon could not
+// negotiate with them, so classifying their run mode would be a guess.
 func (d *Daemon) spawnerActiveSessionCounts() (active, activeInteractive int) {
-	if d.spawner == nil {
+	if d.spawner != nil {
+		active, activeInteractive = d.spawner.ActiveSessionCounts()
+	}
+	adopted, quarantined := d.sessionShimCounts()
+	return active + adopted + quarantined, activeInteractive + adopted
+}
+
+// sessionShimCounts returns the adopted and quarantined shim populations
+// separately so the caller can decide how each contributes.
+func (d *Daemon) sessionShimCounts() (adopted, quarantined int) {
+	if d.shims == nil {
 		return 0, 0
 	}
-	return d.spawner.ActiveSessionCounts()
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	return len(d.shims.adopted), len(d.shims.quarantined)
 }
 
 // ActiveSessionCount returns the number of agent sessions currently running
@@ -1985,6 +2076,12 @@ func (d *Daemon) RegistrationStatus() RegistrationStatus {
 		cfg := d.Config()
 		if cfg == nil {
 			return RegistrationIdle
+		}
+		// §D4: readiness is withheld until the adoption pass has finished. Until
+		// then this daemon does not yet know what is occupied, and "idle" would be
+		// a claim it cannot support.
+		if !d.SessionShimAdoptionComplete() {
+			return RegistrationDraining
 		}
 		active := d.spawnerActiveCount()
 		if active >= cfg.Capacity.MaxConcurrentSessions {
