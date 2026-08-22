@@ -239,7 +239,7 @@ func TestHeartbeatCarriesTheQuarantineProjection(t *testing.T) {
 		GetStatus:       func() RegistrationStatus { return RegistrationIdle },
 		GetQuarantinedSessions: func() []sessionshim.QuarantinedSession {
 			return []sessionshim.QuarantinedSession{{
-				OrgID: "org-1", SessionID: "sess-1", ShimID: "shim-1",
+				OrgID: "org-1", SessionID: "sess-1", ShimID: "shim-1", ProcessEpoch: 23,
 				ProtocolMin: 9, ProtocolMax: 9,
 				Reason:     sessionshim.QuarantineProtocolMismatch,
 				AgeSeconds: 42, ConsumesCapacity: true,
@@ -269,6 +269,9 @@ func TestHeartbeatCarriesTheQuarantineProjection(t *testing.T) {
 	}
 	if got, _ := entry["sessionId"].(string); got != "sess-1" {
 		t.Errorf("quarantinedSessions[0].sessionId = %q, want sess-1", got)
+	}
+	if got, _ := entry["processEpoch"].(float64); got != 23 {
+		t.Errorf("quarantinedSessions[0].processEpoch = %v, want 23", entry["processEpoch"])
 	}
 	// The projection is bounded and secret-free by construction: it carries only
 	// identity, correlation, protocol range, reason, and age.
@@ -391,7 +394,7 @@ func TestRestartFenceCoversAdoptedAndQuarantinedSessions(t *testing.T) {
 	seedShimState(d,
 		[]sessionshim.Identity{{OrgID: "o", SessionID: "adopted"}},
 		[]sessionshim.QuarantinedSession{
-			{OrgID: "o", SessionID: "quarantined", ShimID: "shim-q", ConsumesCapacity: true},
+			{OrgID: "o", SessionID: "quarantined", ShimID: "shim-q", ProcessEpoch: 31, ConsumesCapacity: true},
 		},
 	)
 
@@ -404,6 +407,40 @@ func TestRestartFenceCoversAdoptedAndQuarantinedSessions(t *testing.T) {
 	}
 	if !fence.Covers(sessionshim.Identity{OrgID: "o", SessionID: "quarantined"}) {
 		t.Error("fence does not cover the quarantined session; its harness is still running")
+	}
+	foundQuarantine := false
+	for _, covered := range fence.Sessions {
+		if covered.SessionID == "quarantined" {
+			foundQuarantine = true
+			if covered.ShimID != "shim-q" || covered.ProcessEpoch != 31 {
+				t.Errorf("quarantined fence correlation = %+v, want shim-q/processEpoch 31", covered)
+			}
+		}
+	}
+	if !foundQuarantine {
+		t.Fatal("quarantined session missing from fence correlation set")
+	}
+	rawFence, err := json.Marshal(fence)
+	if err != nil {
+		t.Fatalf("marshal restart fence: %v", err)
+	}
+	var wireFence struct {
+		Sessions []struct {
+			SessionID    string `json:"sessionId"`
+			ProcessEpoch uint64 `json:"processEpoch"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal(rawFence, &wireFence); err != nil {
+		t.Fatalf("unmarshal restart fence wire: %v", err)
+	}
+	foundWireEpoch := false
+	for _, covered := range wireFence.Sessions {
+		if covered.SessionID == "quarantined" && covered.ProcessEpoch == 31 {
+			foundWireEpoch = true
+		}
+	}
+	if !foundWireEpoch {
+		t.Fatalf("restart fence JSON omitted quarantined processEpoch: %s", rawFence)
 	}
 	if fence.State != sessionshim.FenceHeld {
 		t.Errorf("fence state = %q, want %q", fence.State, sessionshim.FenceHeld)
@@ -478,6 +515,9 @@ func TestReleaseAdoptedShimsClearsControlWithoutClaimingTermination(t *testing.T
 
 	if len(d.AdoptedSessionShims()) != 0 {
 		t.Fatalf("adopted after release = %d, want 0", len(d.AdoptedSessionShims()))
+	}
+	if got := d.QuarantinedSessions(); len(got) != 0 {
+		t.Fatalf("intentional controller release manufactured quarantine: %+v", got)
 	}
 	if d.SessionShimAdoptionComplete() {
 		t.Fatal("adoption still reads complete after releasing every controller")

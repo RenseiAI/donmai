@@ -51,11 +51,13 @@ type Fence struct {
 	State FenceState `json:"state"`
 }
 
-// FencedSession is one identity covered by a fence, with its shim correlation id.
+// FencedSession is one identity covered by a fence, with its shim correlation
+// values. Neither correlation value is lifecycle identity (§D2).
 type FencedSession struct {
-	OrgID     string `json:"orgId"`
-	SessionID string `json:"sessionId"`
-	ShimID    string `json:"shimId,omitempty"`
+	OrgID        string `json:"orgId"`
+	SessionID    string `json:"sessionId"`
+	ShimID       string `json:"shimId,omitempty"`
+	ProcessEpoch uint64 `json:"processEpoch,omitempty"`
 }
 
 // Identity returns the covered session's lifecycle identity.
@@ -136,13 +138,8 @@ func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string,
 	if fenceID == "" {
 		return Fence{}, fmt.Errorf("%w: fence id is required", ErrFenceRequired)
 	}
-	sorted := append([]FencedSession(nil), ids...)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].OrgID != sorted[j].OrgID {
-			return sorted[i].OrgID < sorted[j].OrgID
-		}
-		return sorted[i].SessionID < sorted[j].SessionID
-	})
+	sorted := sortedFencedSessions(ids)
+	requested := append([]FencedSession(nil), sorted...)
 	f := Fence{
 		FenceID:           fenceID,
 		HostID:            hostID,
@@ -161,15 +158,37 @@ func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string,
 	if ack.FenceID != f.FenceID {
 		return Fence{}, fmt.Errorf("%w: acknowledgement names fence %q, requested %q", ErrFenceRequired, ack.FenceID, f.FenceID)
 	}
-	for _, want := range sorted {
-		if !ack.Covers(want.Identity()) {
+	ackSessions := sortedFencedSessions(ack.Sessions)
+	if len(ackSessions) != len(requested) {
+		return Fence{}, fmt.Errorf("%w: acknowledgement covers %d sessions, requested %d",
+			ErrFenceRequired, len(ackSessions), len(requested))
+	}
+	for i, want := range requested {
+		if ackSessions[i] != want {
 			return Fence{}, fmt.Errorf(
-				"%w: acknowledgement omits session %s — a partial acknowledgement leaves that session unprotected",
-				ErrFenceRequired, want.Identity(),
-			)
+				"%w: acknowledgement session %d correlation differs: got %+v, requested %+v",
+				ErrFenceRequired, i, ackSessions[i], want)
 		}
 	}
+	ack.Sessions = ackSessions
 	return ack, nil
+}
+
+func sortedFencedSessions(in []FencedSession) []FencedSession {
+	sorted := append([]FencedSession(nil), in...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].OrgID != sorted[j].OrgID {
+			return sorted[i].OrgID < sorted[j].OrgID
+		}
+		if sorted[i].SessionID != sorted[j].SessionID {
+			return sorted[i].SessionID < sorted[j].SessionID
+		}
+		if sorted[i].ShimID != sorted[j].ShimID {
+			return sorted[i].ShimID < sorted[j].ShimID
+		}
+		return sorted[i].ProcessEpoch < sorted[j].ProcessEpoch
+	})
+	return sorted
 }
 
 // TerminalProof is evidence that a session's workload actually ended.
