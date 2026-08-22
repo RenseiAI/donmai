@@ -64,7 +64,7 @@ func TestSpawner_TerminalListenerOwnsIDUntilSynchronousDeliveryCompletes(t *test
 	}
 }
 
-func TestDaemonUpdate_PropagatesIncompleteDrain(t *testing.T) {
+func TestDaemonUpdateRefusesUnsettledDirectReservation(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	spawner := NewWorkerSpawner(SpawnerOptions{
@@ -93,10 +93,11 @@ func TestDaemonUpdate_PropagatesIncompleteDrain(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("pre-spawn hook did not enter")
 	}
-	_, err := d.Update(context.Background())
-	var incomplete *DrainIncompleteError
-	if !errors.As(err, &incomplete) {
-		t.Fatalf("Update error = %v, want DrainIncompleteError", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := d.Update(ctx)
+	if !errors.Is(err, ErrRestartPreflightRefused) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Update error = %v, want restart-preflight deadline refusal", err)
 	}
 	close(release)
 	if err := <-acceptDone; err == nil {

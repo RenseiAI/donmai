@@ -23,6 +23,14 @@ var (
 	// a corrupted workarea archive). The wrapped error chain carries any
 	// reason string the server attached.
 	ErrBadRequest = errors.New("bad request")
+	// ErrRestartPreflightRefused is returned when the daemon could not durably
+	// prepare every authority scope for a planned restart. Callers must not invoke
+	// the service manager after this error.
+	ErrRestartPreflightRefused = errors.New("daemon restart preflight refused")
+	// ErrInvalidRestartPreflightResponse reports a 2xx response that is not the
+	// closed session-shim-restart-preflight-v1 permission schema. Unknown or
+	// malformed success is a refusal, never implied permission.
+	ErrInvalidRestartPreflightResponse = errors.New("invalid daemon restart preflight response")
 
 	// ErrUnimplemented is returned by client methods whose wire shape is
 	// canonical (the request/response types are stable) but whose
