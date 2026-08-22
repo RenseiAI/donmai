@@ -191,6 +191,14 @@ func (f *shimFixture) waitForPhase(t *testing.T, phase shimwire.Phase) Record {
 
 // adoptAs runs a full startup adoption pass as a named daemon generation.
 func (f *shimFixture) adoptAs(t *testing.T, controllerID string) AdoptionResult {
+	return f.adoptFrom(t, controllerID, 0)
+}
+
+// adoptFrom runs a full startup adoption pass with an exact durable resume
+// cursor. The controller must retain that cursor because it is the only
+// authoritative pre-existing last-forwarded correlation available before new
+// output advances the replacement daemon's in-memory bookkeeping.
+func (f *shimFixture) adoptFrom(t *testing.T, controllerID string, resumeFrom uint64) AdoptionResult {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -203,6 +211,7 @@ func (f *shimFixture) adoptAs(t *testing.T, controllerID string) AdoptionResult 
 			// the §D7 ambiguity, not a session to take over.
 			return f.workarea
 		},
+		ResumeFrom: func(Identity) uint64 { return resumeFrom },
 	})
 	if err != nil {
 		t.Fatalf("Adopt as %s: %v", controllerID, err)
@@ -293,12 +302,15 @@ func TestDaemonRestartPreservesLiveInteractiveSession(t *testing.T) {
 	}
 
 	// ---- daemon generation 2 -------------------------------------------------
-	res2 := f.adoptAs(t, "daemon-generation-2")
+	res2 := f.adoptFrom(t, "daemon-generation-2", seqBefore+1)
 	if len(res2.Adopted) != 1 {
 		t.Fatalf("post-restart adoption adopted %d shims, want 1 (quarantined=%d, stale=%d)",
 			len(res2.Adopted), len(res2.Quarantined), len(res2.Stale))
 	}
 	c2 := res2.Adopted[0]
+	if c2.ResumeFrom() != seqBefore+1 {
+		t.Fatalf("replacement controller resume cursor = %d, want %d", c2.ResumeFrom(), seqBefore+1)
+	}
 
 	// (a) UNCHANGED CHILD IDENTITY — the workload continued rather than being
 	//     restarted underneath a reused session id. This is the assertion the

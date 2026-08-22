@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -156,6 +157,9 @@ func newShimSpawnFixture(t *testing.T) *shimSpawnFixture {
 			RegistryDir:     dir + "/registry",
 			LaunchTimeout:   60 * time.Second,
 			OnSessionEvent:  events.record,
+			OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error {
+				return nil
+			},
 			Orphan: sessionshim.OrphanPolicy{
 				Deadline:          2 * time.Second,
 				TerminationGrace:  500 * time.Millisecond,
@@ -746,6 +750,106 @@ func TestForwardedSequenceIsRecordedNotAllocated(t *testing.T) {
 	})
 	if got := d.SessionShimForwardedSeq(id.OrgID, "not-a-session"); got != 0 {
 		t.Errorf("forwarded sequence for an unknown session = %d, want 0", got)
+	}
+}
+
+func TestForwardedSequenceRequiresDurableCarrier(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	// The ordinary event hook is intentionally still present: it is an observer,
+	// not proof that a composing carrier durably accepted the frame.
+	f.daemon.opts.SessionShim.OnSessionEventDurable = nil
+
+	spec := f.interactiveSpec("sess-observer-only")
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	seq := f.exchange(t, id, "observer-only")
+	if seq == 0 {
+		t.Fatal("observer did not receive output")
+	}
+	time.Sleep(250 * time.Millisecond)
+	if got := f.daemon.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != 0 {
+		t.Fatalf("observer-only forwarded sequence = %d, want durable cursor unchanged at 0", got)
+	}
+}
+
+func TestForwardedSequenceRejectsDurableCarrierError(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	f.daemon.opts.SessionShim.OnSessionEventDurable = func(sessionshim.Identity, sessionshim.ControllerEvent) error {
+		return errors.New("carrier unavailable")
+	}
+
+	spec := f.interactiveSpec("sess-carrier-error")
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	if err := f.daemon.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte("carrier-error\r")); err != nil {
+		t.Fatalf("WriteAdoptedSessionShimInput: %v", err)
+	}
+	waitFor(t, 5*time.Second, "the observer to receive the rejected frame", func() bool {
+		out, _ := f.events.output(id)
+		return strings.Contains(out, "carrier-error")
+	})
+	if got := f.daemon.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != 0 {
+		t.Fatalf("carrier-error forwarded sequence = %d, want durable cursor unchanged at 0", got)
+	}
+}
+
+// TestRestartFenceRetainsTheAdoptionResumeCursor pins the replacement-daemon
+// seam: before any new output arrives, the fence must still report the durable
+// last-forwarded sequence from which this controller resumed. Resetting it to
+// zero would make the composing store acknowledge a correlation older than the
+// carrier's durable state.
+func TestRestartFenceRetainsTheAdoptionResumeCursor(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	first := f.daemon
+
+	if _, err := first.spawner.AcceptWork(f.interactiveSpec("sess-resume-fence")); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity("sess-resume-fence")
+	f.exchange(t, id, "resume-fence")
+	waitFor(t, 20*time.Second, "the first daemon to record forwarded output", func() bool {
+		return first.SessionShimForwardedSeq(id.OrgID, id.SessionID) > 0
+	})
+	lastForwarded := first.SessionShimForwardedSeq(id.OrgID, id.SessionID)
+	first.ReleaseAdoptedSessionShims()
+
+	replacement := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			EnableAdoption: true,
+			OrgID:          f.orgID,
+			RegistryDir:    f.registry,
+			ResumeFrom: func(orgID, sessionID string) uint64 {
+				if orgID == id.OrgID && sessionID == id.SessionID {
+					return lastForwarded + 1
+				}
+				return 0
+			},
+			Orphan: sessionshim.OrphanPolicy{
+				Deadline:          2 * time.Second,
+				TerminationGrace:  500 * time.Millisecond,
+				PropagationMargin: 0,
+			},
+		},
+	})
+	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
+	if err := replacement.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("replacement adoptSessionShims: %v", err)
+	}
+
+	fence, err := replacement.RequestSessionShimRestartFence(context.Background(), "fence-resume")
+	if err != nil {
+		t.Fatalf("RequestSessionShimRestartFence: %v", err)
+	}
+	if len(fence.Sessions) != 1 {
+		t.Fatalf("fence sessions = %+v, want one resumed session", fence.Sessions)
+	}
+	if got := fence.Sessions[0].LastForwardedSeq; got != lastForwarded {
+		t.Fatalf("fence lastForwardedSeq = %d, want durable adoption cursor %d", got, lastForwarded)
 	}
 }
 
