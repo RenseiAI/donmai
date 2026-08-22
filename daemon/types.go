@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/runner/access"
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // Version is the daemon binary version reported in DaemonStatus and in
@@ -33,8 +34,8 @@ import (
 //
 // Now a `var` (was `const`) so the binary's main can override it via
 // `-ldflags "-X github.com/RenseiAI/donmai/daemon.Version=$VERSION"`
-// at build time, OR a downstream embedder (e.g. rensei-tui's daemon
-// run command) can pass its own version via `Options.Version` at
+// at build time, OR a downstream embedder (whose own daemon-run
+// command composes this package) can pass its own version via `Options.Version` at
 // daemon construction. The const form pinned the value to whatever
 // donmai's source had at vendor time, which left the
 // `rensei-daemon-run` HTTP /api/daemon/status endpoint reporting an
@@ -157,7 +158,8 @@ type SessionSpec struct {
 	// PollWorkItem / ResolvedProfile so the embedder's existing OnPreSpawn
 	// closure can read everything access.ResolveMachineCell needs (plus
 	// d.Config().ModelAccess) WITHOUT changing the OnPreSpawn signature.
-	// The daemon does NOT enforce — enforcement is the rensei-tui S3 gate.
+	// The daemon does NOT enforce — enforcement belongs to the composing
+	// embedder's machine-cell gate.
 	// All additive + omitempty; every field is absent on a pre-P3 work item
 	// (=> the gate sees a nil ceiling / identity and the SessionSpec is
 	// byte-identical for the existing fields).
@@ -269,6 +271,11 @@ type HeartbeatPayload struct {
 	MaxSessions               int    `json:"maxSessions"`
 	Region                    string `json:"region,omitempty"`
 	SentAt                    string `json:"sentAt"`
+
+	// QuarantinedSessions is the bounded per-session-shim quarantine projection
+	// (ADR-2026-08-17 §D7): live shims this daemon could not adopt, each marked
+	// consumesCapacity:true. Absent when nothing is quarantined.
+	QuarantinedSessions []sessionshim.QuarantinedSession `json:"quarantinedSessions,omitempty"`
 
 	// AllowlistHash is the SHA-256 of the daemon's current project
 	// allowlist (see allowlist_report.go). Sent on every beat so the
