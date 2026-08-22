@@ -1,6 +1,7 @@
 package sessionshim
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
@@ -387,5 +389,75 @@ func TestNewRegistryRequiresADirectory(t *testing.T) {
 
 	if _, err := NewRegistry(""); err == nil {
 		t.Fatal("NewRegistry(\"\") succeeded; the state-directory seam is required")
+	}
+}
+
+// TestTerminalWithdrawalCannotBeUndoneByAnOrphanRepublish pins the invariant a
+// full parallel -race run caught being violated.
+//
+// The reachable sequence is ordinary: a Stop reaps the harness while the
+// controller connection is dropping, and that connection's teardown arms the
+// orphan clock — which republishes the discovery record. If that republish can
+// land after the tombstone withdrew the record, the session reads as live and
+// terminal at once, and the resurrected record arms an orphan deadline for a
+// harness that is already gone.
+func TestTerminalWithdrawalCannotBeUndoneByAnOrphanRepublish(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	dir := shortTempDir(t)
+	reg, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	id := Identity{OrgID: "org-resurrect", SessionID: "sess-resurrect"}
+
+	sh, err := Start(Options{
+		Identity:     id,
+		Registry:     reg,
+		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", "sleep 30"}},
+		WorkareaPath: dir,
+		Orphan: OrphanPolicy{
+			Deadline:          time.Hour, // never fires on its own during this test
+			TerminationGrace:  500 * time.Millisecond,
+			PropagationMargin: 0,
+		},
+		ProcessEpoch: 1,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sh.Close() })
+
+	if _, err := reg.Get(id); err != nil {
+		t.Fatalf("no record published at start: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := sh.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	if _, err := reg.GetTombstone(id); err != nil {
+		t.Fatalf("no tombstone after Terminate: %v", err)
+	}
+	if _, err := reg.Get(id); err == nil {
+		t.Fatal("the live discovery record survived Terminate")
+	}
+
+	// This is what a dropping controller connection does. It must be a no-op now,
+	// not a resurrection — and it must not be a panic or an error either, because
+	// the teardown path has no way to know it lost the race.
+	sh.armOrphan()
+	if _, err := reg.Get(id); err == nil {
+		t.Fatal("arming the orphan clock after termination republished the discovery record")
+	}
+	// disarmOrphan republishes too, and reaches the same guard.
+	sh.disarmOrphan()
+	if _, err := reg.Get(id); err == nil {
+		t.Fatal("disarming the orphan clock after termination republished the discovery record")
+	}
+	if _, err := reg.GetTombstone(id); err != nil {
+		t.Fatalf("the tombstone was disturbed by a post-terminal republish: %v", err)
 	}
 }

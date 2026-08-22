@@ -90,6 +90,13 @@ type Shim struct {
 	socketDev  uint64
 	socketIno  uint64
 
+	// recordMu serializes every write to this session's registry entry against
+	// every other one. s.mu alone is not enough: it guards the fields, while the
+	// hazard is two DISK writes interleaving — a controller-loss republish and
+	// the terminal withdrawal racing each other can otherwise resurrect a
+	// liveness record for a harness that is provably gone.
+	recordMu sync.Mutex
+
 	mu    sync.Mutex
 	gen   shimwire.Generation
 	phase shimwire.Phase
@@ -374,7 +381,14 @@ func (s *Shim) finalizeTerminal() error {
 		GroupReaped:        reaped,
 		ObservedAtUnixNano: s.now().UnixNano(),
 	}
-	if err := s.registry.PutTombstone(t); err != nil {
+	// Under recordMu for the same reason publishRecordWithDeadline takes it: this
+	// is the write that withdraws the liveness claim, and a republish landing
+	// between its two halves would undo it. s.tombstoned is already set above, so
+	// any republish that queues behind this lock is refused rather than reordered.
+	s.recordMu.Lock()
+	err := s.registry.PutTombstone(t)
+	s.recordMu.Unlock()
+	if err != nil {
 		return fmt.Errorf("sessionshim: persist tombstone: %w", err)
 	}
 	close(s.done)
@@ -451,9 +465,21 @@ func (s *Shim) onOrphanDeadline() {
 func (s *Shim) publishRecord() error { return s.publishRecordWithDeadline(time.Time{}) }
 
 func (s *Shim) publishRecordWithDeadline(deadline time.Time) error {
+	s.recordMu.Lock()
+	defer s.recordMu.Unlock()
 	s.mu.Lock()
 	phase := s.phase
+	tombstoned := s.tombstoned
 	s.mu.Unlock()
+	// Once the terminal observation has withdrawn this session's liveness claim,
+	// nothing may put one back. The reachable path is ordinary: a Stop reaps the
+	// harness while the controller connection is dropping, and that connection's
+	// teardown arms the orphan clock, which republishes. Without this check the
+	// record returns AFTER the tombstone removed it, and the session reads as
+	// live and terminal at once.
+	if tombstoned {
+		return nil
+	}
 	rec := Record{
 		SchemaVersion:     RecordSchemaVersion,
 		OrgID:             s.id.OrgID,
