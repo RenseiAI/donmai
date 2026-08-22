@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
@@ -308,6 +309,16 @@ type sessionShimState struct {
 	// callback still receives the same opaque durable adoption receipt.
 	correlations  map[shimIncarnation]sessionShimAdoptionCorrelation
 	batchReceipts map[string]SessionShimAdoptionBatchReceipt
+	// restart is the one controller-local planned-restart authorization. It is
+	// deliberately memory-only: a replacement controller resolves adoption from
+	// authenticated live correlations and never inherits this old controller's
+	// stop permission. The separate audit file records state but is never read as
+	// recovery authority.
+	restart *restartPreparation
+	// restartStateWriter and restartID are package-private test seams. Production
+	// uses the atomic secret-free state writer and crypto/rand identifier.
+	restartStateWriter func(restartPreparationAudit) error
+	restartID          func() (string, error)
 	// wg joins the per-session event consumers so shutdown cannot race one that
 	// is still writing bookkeeping.
 	wg sync.WaitGroup
@@ -315,6 +326,9 @@ type sessionShimState struct {
 	// readiness read it: a daemon that has NOT finished adopting must not
 	// advertise, because it does not yet know what is occupied.
 	adoptionComplete bool
+	// adoptionCompletedAtUnixNano is the completion observation for the current
+	// controller's §D4 pass. Zero means adoption is disabled or did not complete.
+	adoptionCompletedAtUnixNano int64
 }
 
 func newSessionShimState() *sessionShimState {
@@ -601,6 +615,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		d.shims.batchReceipts[orgID] = receipt
 	}
 	d.shims.adoptionComplete = true
+	d.shims.adoptionCompletedAtUnixNano = time.Now().UTC().UnixNano()
 	d.shims.mu.Unlock()
 	for _, tombstone := range result.Tombstoned {
 		if removeErr := registry.RemoveTombstoneIncarnation(tombstone); removeErr != nil {
@@ -896,6 +911,84 @@ func (d *Daemon) SessionShimAdoptionComplete() bool {
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	return d.shims.adoptionComplete
+}
+
+// SessionShimDiagnostics returns the bounded secret-free ownership projection
+// shared by localhost status and doctor. Adopted correlations come from the
+// authenticated live Controller.Hello plus durable forwarded sequence; every
+// quarantined correlation is retained separately and capacity-charged.
+func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
+	cfg := d.sessionShimConfig()
+	status := afclient.DaemonSessionShimStatus{OwnershipMode: sessionShimOwnershipMode(cfg)}
+	if d.shims == nil {
+		status.AdoptionComplete = !cfg.EnableAdoption
+		return status
+	}
+	d.shims.mu.RLock()
+	status.AdoptionComplete = !cfg.EnableAdoption || d.shims.adoptionComplete
+	if d.shims.adoptionCompletedAtUnixNano > 0 {
+		status.AdoptionCompletedAt = time.Unix(0, d.shims.adoptionCompletedAtUnixNano).UTC().Format(time.RFC3339Nano)
+	}
+	status.Adopted = make([]afclient.DaemonSessionShimAdoptedCorrelation, 0, len(d.shims.adopted))
+	for id, entry := range d.shims.adopted {
+		correlation := afclient.DaemonSessionShimAdoptedCorrelation{
+			OrgID: id.OrgID, SessionID: id.SessionID, ShimID: entry.shimID,
+			LastForwardedSeq: d.shims.forwarded[id], ConsumesCapacity: true,
+			Source: "adopted",
+		}
+		if entry.launched {
+			correlation.Source = "launched"
+		}
+		if entry.controller != nil {
+			hello := entry.controller.Hello()
+			correlation.ShimID = hello.ShimID
+			correlation.ProcessEpoch = hello.ProcessEpoch
+			correlation.ControllerGeneration = uint64(entry.controller.Generation())
+			correlation.HarnessPID = hello.HarnessPID
+			correlation.HarnessStartedAt = hello.HarnessStartedAt
+			correlation.ProtocolMin = hello.Min
+			correlation.ProtocolMax = hello.Max
+			correlation.Phase = string(hello.Phase)
+		}
+		status.Adopted = append(status.Adopted, correlation)
+	}
+	status.Quarantined = append([]sessionshim.QuarantinedSession(nil), d.shims.quarantined...)
+	d.shims.mu.RUnlock()
+	for i := range status.Quarantined {
+		// Detail is display-only and may contain a local socket/workarea path from
+		// a comparison failure. Status/doctor need the closed reason and exact
+		// correlation, not an unbounded path-bearing error string.
+		status.Quarantined[i].Detail = ""
+	}
+	sort.Slice(status.Adopted, func(i, j int) bool {
+		a, b := status.Adopted[i], status.Adopted[j]
+		if a.OrgID != b.OrgID {
+			return a.OrgID < b.OrgID
+		}
+		if a.SessionID != b.SessionID {
+			return a.SessionID < b.SessionID
+		}
+		if a.ShimID != b.ShimID {
+			return a.ShimID < b.ShimID
+		}
+		return a.ProcessEpoch < b.ProcessEpoch
+	})
+	sessionshim.SortQuarantined(status.Quarantined)
+	status.OccupiedSlots = len(status.Adopted) + len(status.Quarantined)
+	return status
+}
+
+func sessionShimOwnershipMode(cfg SessionShimConfig) afclient.DaemonSessionShimOwnershipMode {
+	switch {
+	case cfg.EnableAdoption && cfg.EnableOwnership:
+		return afclient.DaemonSessionShimAdoptionAndOwnership
+	case cfg.EnableAdoption:
+		return afclient.DaemonSessionShimAdoptionOnly
+	case cfg.EnableOwnership:
+		return afclient.DaemonSessionShimOwnershipOnly
+	default:
+		return afclient.DaemonSessionShimDisabled
+	}
 }
 
 // SessionShimAdoptionBatchReceipt returns the durable host-level publication
@@ -1199,6 +1292,7 @@ func (d *Daemon) ReleaseAdoptedSessionShims() {
 	adopted := d.shims.adopted
 	d.shims.adopted = make(map[sessionshim.Identity]adoptedShim)
 	d.shims.adoptionComplete = false
+	d.shims.adoptionCompletedAtUnixNano = 0
 	d.shims.mu.Unlock()
 	for _, entry := range adopted {
 		if entry.controller != nil {

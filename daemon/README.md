@@ -174,6 +174,7 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `POST   /api/daemon/resume`            | Resume accepting work |
 | `POST   /api/daemon/stop`              | Graceful stop |
 | `POST   /api/daemon/drain`             | Drain in-flight work |
+| `POST   /api/daemon/restart/prepare`   | Enter draining and obtain the closed planned-restart permission response |
 | `POST   /api/daemon/update`            | Trigger manual update check |
 | `POST   /api/daemon/capacity`          | Update a config key (e.g. `capacity.poolMaxDiskGb`) |
 | `GET    /api/daemon/pool/stats`        | Workarea pool snapshot |
@@ -185,6 +186,28 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `GET    /api/daemon/heartbeat`         | Most-recent heartbeat payload |
 | `GET    /api/daemon/doctor`            | Aggregated health snapshot |
 | `GET    /healthz`                      | Liveness probe |
+
+`POST /api/daemon/restart/prepare` accepts no caller body or fence id. It
+returns `session-shim-restart-preflight-v1` with state `prepared` only after
+every non-empty authority scope durably acknowledges one immutable correlation
+snapshot, or `not_required` after the drained daemon proves the snapshot is
+empty. Any malformed/unknown success body, `409`, timeout, or transport failure
+is a refusal: the caller must not invoke the service manager. Partial retries
+reuse the daemon-minted preparation id and exact per-scope bytes. An explicit
+`POST /api/daemon/resume` durably abandons only this controller's local stop
+authorization before reopening admission; it never consumes external holds.
+
+`POST /api/daemon/update` crosses the same preflight synchronously before it
+reports that an update was initiated. Update success, failure, or absence leaves
+the daemon draining until that explicit resume path runs.
+
+Both `GET /api/daemon/status` and `GET /api/daemon/doctor` carry the same
+additive `sessionShim` diagnostic: configured ownership mode, adoption
+completion/time, occupied slots, every adopted shim/process/controller
+correlation sourced from its authenticated live Hello, durable forwarded
+sequence, and every quarantined capacity charge. The projection is deliberately
+secret-free: no paths, output bytes, prompts, host/controller ids, tokens,
+credentials, or opaque composing receipts are exposed.
 
 ## Auto-update signing
 

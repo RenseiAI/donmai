@@ -266,6 +266,7 @@ type lifecycleKind uint8
 
 const (
 	lifecycleStart lifecycleKind = iota + 1
+	lifecycleRestartPrepare
 	lifecycleUpdate
 	lifecycleDrain
 	lifecycleStop
@@ -373,6 +374,9 @@ type Daemon struct {
 	// it nil; tests use it to prove a completed incomplete attempt cannot race a
 	// later Stop attempt's terminal publication.
 	stopAttemptBeforeRelease func(error)
+	// runPreparedUpdate is a package-private test seam for the HTTP handoff from
+	// synchronous restart preparation into asynchronous update work.
+	runPreparedUpdate func(context.Context, AutoUpdateConfig, string) (*UpdateResult, error)
 
 	// Landing callbacks are independent of worker spawning, so they have their
 	// own admission, cancellation, and completion ownership. landingDone is the
@@ -1566,33 +1570,44 @@ func (d *Daemon) Pause() bool {
 	return true
 }
 
-// Resume re-enables accepting work after a completed manual pause or drain. A
-// terminal stop permanently fences admission, and an active drain retains its
-// lease, so Resume cannot reopen admission underneath it.
+// Resume re-enables accepting work after a completed manual pause or drain. It
+// is retained for source compatibility; callers that need the durable
+// restart-preparation abandonment error use ResumeContext.
 func (d *Daemon) Resume() bool {
+	return d.ResumeContext(context.Background()) == nil
+}
+
+// ResumeContext re-enables admission only after durably abandoning this
+// controller's local planned-stop authorization. External fence holds are not
+// consumed or deleted; a later restart takes a new snapshot and identity.
+func (d *Daemon) ResumeContext(ctx context.Context) error {
 	lease, ok := d.tryClaimLifecycle(lifecycleResume)
 	if !ok {
-		return false
+		return errors.New("cannot resume while another lifecycle operation is active")
 	}
 	defer d.releaseLifecycle(lease)
 
 	d.lifecycleMu.Lock()
 	if d.stopGen != nil || (d.State() != StatePaused && d.State() != StateDraining) {
+		state := d.State()
 		d.lifecycleMu.Unlock()
-		return false
+		return fmt.Errorf("cannot resume while daemon is %s", state)
 	}
 	spawner := d.spawner
 	d.lifecycleMu.Unlock()
+	if err := d.abandonRestartPreparation(ctx); err != nil {
+		return fmt.Errorf("abandon restart preparation: %w", err)
+	}
 	if spawner != nil {
 		spawner.Resume()
 	}
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
 	if !d.ownsLifecycleLocked(lease) || d.stopGen != nil || (d.State() != StatePaused && d.State() != StateDraining) {
-		return false
+		return errors.New("cannot resume because lifecycle ownership changed")
 	}
 	d.setState(StateRunning)
-	return true
+	return nil
 }
 
 // AcceptWork dispatches a session spec to the spawner.
@@ -1898,62 +1913,83 @@ func (d *Daemon) UpdateSessionRuntimeCredentials(prevWorkerID, workerID, authTok
 
 // Update triggers a manual auto-update check.
 //
-// Behavior: drain → fetch manifest → verify → swap → exit (3). If no update
-// is available the call is idempotent and the daemon transitions back to
-// running. If signature verification fails, the swap is aborted and an
-// error is returned. The caller (HTTP handler) typically returns the
-// outcome to the client and may then call Stop().
+// Behavior: restart preflight (which refuses uncovered direct-owned work) →
+// fetch manifest → verify → swap. Whether the update succeeds, fails, or finds
+// no new version, the daemon remains draining until explicit ResumeContext
+// durably abandons the controller-local stop authorization.
 func (d *Daemon) Update(ctx context.Context) (*UpdateResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	attempt, err := d.beginUpdate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return attempt.run(ctx)
+}
+
+// updateAttempt transfers the one lifecycle lease from synchronous restart
+// preparation into update execution. The HTTP handler may start run in a
+// goroutine without opening a gap in which Resume could abandon the permission
+// after the route already returned success.
+type updateAttempt struct {
+	daemon *Daemon
+	lease  *lifecycleLease
+}
+
+func (d *Daemon) beginUpdate(ctx context.Context) (*updateAttempt, error) {
 	lease, err := d.claimLifecycle(ctx, lifecycleUpdate)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		// Restore admission before publishing StateRunning, but only while this
-		// exact update generation still owns lifecycle advancement. Stop cannot
-		// race through this lease, and a failed/canceled update never leaves the
-		// spawner silently NACKing while status reports ready.
-		d.lifecycleMu.Lock()
-		shouldResume := d.ownsLifecycleLocked(lease) && d.stopGen == nil && d.State() == StateUpdating
-		spawner := d.spawner
-		d.lifecycleMu.Unlock()
-		if shouldResume && spawner != nil {
-			spawner.Resume()
-		}
-		d.lifecycleMu.Lock()
-		if shouldResume && d.ownsLifecycleLocked(lease) && d.stopGen == nil && d.State() == StateUpdating {
-			d.setState(StateRunning)
-		}
-		d.lifecycleMu.Unlock()
+	if _, err := d.prepareRestartWithLease(ctx, lease); err != nil {
 		d.releaseLifecycle(lease)
-	}()
-
+		return nil, fmt.Errorf("prepare restart before update: %w", err)
+	}
 	d.lifecycleMu.Lock()
-	if d.stopGen != nil || d.State() != StateRunning {
+	if !d.ownsLifecycleLocked(lease) || d.stopGen != nil || d.State() != StateDraining {
 		state := d.State()
 		d.lifecycleMu.Unlock()
+		d.releaseLifecycle(lease)
 		return nil, fmt.Errorf("cannot update — current state %q", state)
 	}
 	d.setState(StateUpdating)
-	spawner := d.spawner
 	d.lifecycleMu.Unlock()
+	return &updateAttempt{daemon: d, lease: lease}, nil
+}
 
+func (a *updateAttempt) finish() {
+	if a == nil || a.daemon == nil {
+		return
+	}
+	d := a.daemon
+	d.lifecycleMu.Lock()
+	if d.ownsLifecycleLocked(a.lease) && d.stopGen == nil && d.State() == StateUpdating {
+		d.setState(StateDraining)
+	}
+	d.lifecycleMu.Unlock()
+	d.releaseLifecycle(a.lease)
+}
+
+func (a *updateAttempt) run(ctx context.Context) (*UpdateResult, error) {
+	if a == nil || a.daemon == nil {
+		return nil, errors.New("update attempt is not initialized")
+	}
+	d := a.daemon
+	defer a.finish()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// A failed, unavailable, or completed self-update does not silently abandon
+	// the prepared stop authorization. finish leaves the daemon draining;
+	// external holds remain in force until explicit resume.
 	cfg := d.Config()
 	if cfg == nil {
 		return nil, errors.New("no config loaded")
 	}
-	if spawner != nil {
-		drainCtx, cancel := context.WithTimeout(ctx, d.drainTimeout())
-		err := spawner.DrainContext(drainCtx)
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("drain before update: %w", err)
-		}
+	if d.runPreparedUpdate != nil {
+		return d.runPreparedUpdate(ctx, cfg.AutoUpdate, d.EffectiveVersion())
 	}
-
 	updater := NewUpdater(UpdaterOptions{
 		CurrentVersion: d.EffectiveVersion(),
 		Config:         cfg.AutoUpdate,

@@ -126,6 +126,9 @@ func TestServer_Status(t *testing.T) {
 	if resp.Status != afclient.DaemonReady {
 		t.Errorf("Status = %q, want ready", resp.Status)
 	}
+	if resp.SessionShim.OwnershipMode != afclient.DaemonSessionShimDisabled || !resp.SessionShim.AdoptionComplete || resp.SessionShim.OccupiedSlots != 0 {
+		t.Errorf("default sessionShim status = %+v, want disabled/complete/empty", resp.SessionShim)
+	}
 	if len(resp.EnabledProjectIDs) != 1 || resp.EnabledProjectIDs[0] != "demo" {
 		t.Errorf("EnabledProjectIDs = %v, want [demo]", resp.EnabledProjectIDs)
 	}
@@ -172,11 +175,11 @@ func TestBuildProjectStatusRows_ReportsDriftAndRepositoryReadiness(t *testing.T)
 }
 
 // TestServer_Status_HostVersionOverride pins the Options.Version override
-// path: a downstream embedder (e.g. rensei-tui) that sets its own
+// path: a downstream embedder that sets its own
 // version string MUST see that string in /api/daemon/status, NOT the
 // donmai package's Version var. This is the wire that fixes
-// the May-2026 incident where `rensei host status` reported the
-// vendored "0.7.1" forever.
+// the incident where an embedded host status reported the vendored package
+// version forever.
 func TestServer_Status_HostVersionOverride(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := DefaultConfig()

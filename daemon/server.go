@@ -133,6 +133,7 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/resume", s.method(http.MethodPost, s.handleResume))
 	mux.HandleFunc("/api/daemon/stop", s.method(http.MethodPost, s.handleStop))
 	mux.HandleFunc("/api/daemon/drain", s.method(http.MethodPost, s.handleDrain))
+	mux.HandleFunc("/api/daemon/restart/prepare", s.method(http.MethodPost, s.handleRestartPrepare))
 	mux.HandleFunc("/api/daemon/update", s.method(http.MethodPost, s.handleUpdate))
 	mux.HandleFunc("/api/daemon/capacity", s.method(http.MethodPost, s.handleSetCapacity))
 	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet, s.handlePoolStats))
@@ -207,6 +208,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		AppliedProjectIDs:       appliedIDs,
 		ProjectAdmissionMode:    cfg.EffectiveProjectAdmissionMode(),
 		Projects:                buildProjectStatusRows(s.daemon, cfg, enabledProjectIDs, appliedIDs),
+		SessionShim:             s.daemon.SessionShimDiagnostics(),
 		Timestamp:               time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, &resp)
@@ -324,12 +326,33 @@ func (s *Server) handlePause(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "paused"})
 }
 
-func (s *Server) handleResume(w http.ResponseWriter, _ *http.Request) {
-	if !s.daemon.Resume() {
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
+	if err := s.daemon.ResumeContext(r.Context()); err != nil {
 		writeJSON(w, http.StatusConflict, &afclient.DaemonActionResponse{OK: false, Message: fmt.Sprintf("cannot resume while daemon is %s", s.daemon.State())})
 		return
 	}
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "resumed"})
+}
+
+func (s *Server) handleRestartPrepare(w http.ResponseWriter, r *http.Request) {
+	if body, err := io.ReadAll(io.LimitReader(r.Body, 1)); err != nil || len(body) != 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "restart preflight accepts no request body"})
+		return
+	}
+	result, err := s.daemon.PrepareRestart(r.Context())
+	if err != nil {
+		writeRestartPreflightRefusal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, &result)
+}
+
+func writeRestartPreflightRefusal(w http.ResponseWriter, err error) {
+	slog.Warn("daemon restart preflight refused; daemon remains draining", "err", err)
+	writeJSON(w, http.StatusConflict, &afclient.DaemonRestartPreflightRefusal{
+		Error: "daemon restart preflight refused",
+		Code:  afclient.DaemonRestartPreflightRefusalCode,
+	})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, _ *http.Request) {
@@ -421,11 +444,22 @@ func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: fmt.Sprintf("drained (timeout %s)", timeout)})
 }
 
-func (s *Server) handleUpdate(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	// The route crosses the durable preflight synchronously. A 2xx response may
+	// say "update initiated" only after the exact planned-stop authorization is
+	// already safe; an asynchronous preflight would let the caller race a swap or
+	// service-manager action ahead of durability.
+	attempt, err := s.daemon.beginUpdate(r.Context())
+	if err != nil {
+		writeRestartPreflightRefusal(w, err)
+		return
+	}
+	updateCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		_, _ = s.daemon.Update(ctx)
+		if _, err := attempt.run(updateCtx); err != nil {
+			slog.Warn("daemon update failed; daemon remains draining", "err", err)
+		}
 	}()
 	writeJSON(w, http.StatusOK, &afclient.DaemonActionResponse{OK: true, Message: "update initiated"})
 }
@@ -636,6 +670,7 @@ func (s *Server) handleDoctor(w http.ResponseWriter, _ *http.Request) {
 		"projectCount":    safeProjectsLen(cfg),
 		"orchestratorUrl": safeOrchestratorURL(cfg),
 		"heartbeat":       s.daemon.heartbeat != nil && s.daemon.heartbeat.IsRunning(),
+		"sessionShim":     s.daemon.SessionShimDiagnostics(),
 		"timestamp":       time.Now().UTC().Format(time.RFC3339),
 	}
 	writeJSON(w, http.StatusOK, report)

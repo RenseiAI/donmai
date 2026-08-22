@@ -1,17 +1,22 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
@@ -1163,5 +1168,76 @@ func TestAdmissionRefusesWorkAgainstShimHeldCapacity(t *testing.T) {
 	}
 	if _, err := s.AcceptWork(spec("s3")); err == nil {
 		t.Fatal("AcceptWork admitted a third session into a two-slot host")
+	}
+}
+
+func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	if err := d.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("initial adoption pass: %v", err)
+	}
+	d.config = DefaultConfig()
+	d.setState(StateRunning)
+	id := f.identity("diagnostic-live")
+	if _, err := d.AcceptWork(f.interactiveSpec(id.SessionID)); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	seq := f.exchange(t, id, "diagnostic-output")
+	d.shims.mu.Lock()
+	d.shims.quarantined = append(d.shims.quarantined, sessionshim.QuarantinedSession{
+		OrgID: "test-org", SessionID: "diagnostic-quarantine", ShimID: "shim-quarantine",
+		ProcessEpoch: 9, ProtocolMin: 1, ProtocolMax: 1,
+		Reason: sessionshim.QuarantineDuplicateIdentity, Detail: "socket /private/secret/path",
+		AgeSeconds: 3, ConsumesCapacity: true,
+	})
+	d.shims.mu.Unlock()
+
+	server := NewServer(d)
+	statusRecorder := httptest.NewRecorder()
+	server.handleStatus(statusRecorder, httptest.NewRequest("GET", "/api/daemon/status", nil))
+	var status afclient.DaemonStatusResponse
+	if err := json.NewDecoder(statusRecorder.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	diagnostic := status.SessionShim
+	if diagnostic.OwnershipMode != afclient.DaemonSessionShimAdoptionAndOwnership ||
+		!diagnostic.AdoptionComplete || diagnostic.AdoptionCompletedAt == "" || diagnostic.OccupiedSlots != 2 {
+		t.Fatalf("status sessionShim summary = %+v", diagnostic)
+	}
+	if len(diagnostic.Adopted) != 1 {
+		t.Fatalf("status adopted = %+v, want one", diagnostic.Adopted)
+	}
+	adopted := diagnostic.Adopted[0]
+	if adopted.OrgID != id.OrgID || adopted.SessionID != id.SessionID || adopted.ShimID == "" ||
+		adopted.ProcessEpoch == 0 || adopted.ControllerGeneration == 0 || adopted.LastForwardedSeq != seq ||
+		adopted.HarnessPID <= 0 || adopted.HarnessStartedAt <= 0 || adopted.ProtocolMin != 1 || adopted.ProtocolMax != 1 ||
+		adopted.Phase == "" || !adopted.ConsumesCapacity {
+		t.Fatalf("status adopted correlation = %+v", adopted)
+	}
+	if len(diagnostic.Quarantined) != 1 || diagnostic.Quarantined[0].ShimID != "shim-quarantine" ||
+		diagnostic.Quarantined[0].Detail != "" || !diagnostic.Quarantined[0].ConsumesCapacity {
+		t.Fatalf("status quarantine = %+v", diagnostic.Quarantined)
+	}
+	raw, err := json.Marshal(diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{`"hostId"`, `"controllerId"`, `"workarea"`, `"token"`, `"receipt"`, `"path"`, `"data"`} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("session-shim diagnostic contains forbidden field %s: %s", forbidden, raw)
+		}
+	}
+
+	doctorRecorder := httptest.NewRecorder()
+	server.handleDoctor(doctorRecorder, httptest.NewRequest("GET", "/api/daemon/doctor", nil))
+	var doctor struct {
+		SessionShim afclient.DaemonSessionShimStatus `json:"sessionShim"`
+	}
+	if err := json.NewDecoder(doctorRecorder.Body).Decode(&doctor); err != nil {
+		t.Fatalf("decode doctor: %v", err)
+	}
+	if !reflect.DeepEqual(doctor.SessionShim, diagnostic) {
+		t.Fatalf("doctor/status session-shim drift:\ndoctor=%+v\nstatus=%+v", doctor.SessionShim, diagnostic)
 	}
 }
