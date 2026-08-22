@@ -25,6 +25,7 @@ import (
 	"github.com/RenseiAI/donmai/runtime/state"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 	"github.com/RenseiAI/donmai/runtime/stepheartbeat"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -203,11 +204,24 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	} else if branch == "" {
 		branch = "agent/" + qw.SessionID
 	}
+	// Session-owned workarea namespace: the session owns
+	// <worktree-root>/<session-id>/ and the SELECTED repository is a leaf
+	// inside it, so this session's context/secondary repositories are its own
+	// leaves rather than global peers under the worktree root shared by
+	// unrelated sessions. wpath stays the repository worktree — the agent CWD,
+	// the mutable git authority, and the value res.WorktreePath has always
+	// carried. Headless and interactive runs share this code path, so both get
+	// the identical layout.
+	//
+	// An empty repository (project session with no repository resource) yields
+	// an empty leaf and keeps the retained flat layout.
+	repoLeaf := workarea.RepositoryLeaf(qw.Repository)
 	wpath, err := r.wt.Provision(ctx, worktree.ProvisionSpec{
-		SessionID: qw.SessionID,
-		RepoURL:   qw.Repository,
-		Branch:    refBranch,
-		Strategy:  worktree.StrategyClone,
+		SessionID:      qw.SessionID,
+		RepoURL:        qw.Repository,
+		Branch:         refBranch,
+		Strategy:       worktree.StrategyClone,
+		RepositoryLeaf: repoLeaf,
 	})
 	if err != nil {
 		res.Status = "failed"
@@ -215,8 +229,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		res.Error = err.Error()
 		return res, err
 	}
+	layout, layoutErr := r.wt.Layout(qw.SessionID)
+	if layoutErr != nil {
+		// Provision succeeded, so the manager tracks this session; a lookup
+		// failure here can only mean the flat/legacy shape. Fall back to it
+		// rather than failing a session that already has a worktree.
+		layout = workarea.Layout{Root: workarea.RootPath(wpath), Repository: workarea.RepositoryPath(wpath)}
+		r.logger.Warn("workarea layout lookup failed; assuming flat layout",
+			"sessionId", qw.SessionID, "path", wpath, "err", layoutErr)
+	}
 	res.WorktreePath = wpath
-	r.logger.Debug("worktree provisioned", "sessionId", qw.SessionID, "path", wpath)
+	res.WorkareaRoot = layout.Root.String()
+	r.logger.Debug("worktree provisioned", "sessionId", qw.SessionID, "path", wpath,
+		"workareaRoot", res.WorkareaRoot, "nested", layout.IsNested())
 
 	// Create the per-session work branch in the worktree (skipped when
 	// provisioning at an existing ref — that ref IS the working branch).
@@ -230,12 +255,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	// 2a-bis. Materialize read-only sibling context repos named by
-	// DONMAI_SIBLING_REPOS next to the session worktree so agents find
-	// their governing corpus at ../<name> as their repo AGENTS.md
-	// contracts promise (ADR-2026-07-07-sibling-context-repos). Never
-	// fatal: a failed sibling logs a warning and the session proceeds —
-	// agents fall back to cloning it themselves.
-	r.provisionSiblings(ctx, qw, wpath)
+	// DONMAI_SIBLING_REPOS inside this session's workarea root so agents
+	// find their governing corpus at ../<name> relative to the selected
+	// repository as their repo AGENTS.md contracts promise
+	// (ADR-2026-07-07-sibling-context-repos). Each is a leaf this session
+	// owns, so concurrent sessions naming the same context repo get distinct
+	// paths and cleanup of one never touches the other. Never fatal: a failed
+	// sibling logs a warning and the session proceeds — agents fall back to
+	// cloning it themselves.
+	r.provisionSiblings(ctx, qw, layout)
 
 	// 2b. Provision kit toolchain into the worktree (Seam 2 / 006).
 	//

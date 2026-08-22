@@ -599,10 +599,25 @@ type Result struct {
 	// Codex thread id) captured from InitEvent.
 	ProviderSessionID string `json:"providerSessionId,omitempty"`
 
-	// WorktreePath is the absolute path of the worktree the session
-	// ran in. Useful for debugging and for the
-	// PreserveWorktreeOnFailure path.
+	// WorktreePath is the absolute path of the SELECTED repository
+	// worktree the session ran in — the agent CWD. Useful for debugging
+	// and for the PreserveWorktreeOnFailure path.
+	//
+	// Semantics are deliberately unchanged by the session-owned workarea
+	// namespace: mixed-version readers that treat this as "the repository
+	// the agent worked in" stay correct. WorkareaRoot is the additive
+	// field that names the session-owned directory containing it.
 	WorktreePath string `json:"worktreePath,omitempty"`
+
+	// WorkareaRoot is the absolute path of the session-owned workarea root
+	// — the directory containing the selected repository worktree and this
+	// session's context/secondary repositories. Cleanup, terminal leases,
+	// archives and disk accounting own it atomically.
+	//
+	// Additive and omitempty: a pre-field reader ignores it, and against a
+	// retained flat workarea (where the repository clone IS the session
+	// directory) it equals WorktreePath.
+	WorkareaRoot string `json:"workareaRoot,omitempty"`
 
 	// PullRequestURL is the URL of the PR opened (by the agent or the
 	// backstop). Empty when no PR exists.

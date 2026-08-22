@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/interview"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // Compile-time assertion that WorkerSpawner satisfies the
@@ -876,13 +876,21 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		ProjectName: project.ID,
 		Repository:  spec.Repository,
 	}
-	// Publish the worktree path so GET /api/daemon/sessions is
-	// self-sufficient for a local reader (host-watch). The worker resolves
-	// the same <parent>/<sessionID> leaf; we mirror that here without
-	// spawning anything. Empty parent leaves WorktreePath empty (the reader
-	// falls back to a per-session detail call).
+	// Publish the workarea paths so GET /api/daemon/sessions is
+	// self-sufficient for a local reader (host-watch). The worker resolves the
+	// same session-owned root and repository leaf; we mirror that here without
+	// spawning anything. Empty parent leaves both empty (the reader falls back
+	// to a per-session detail call).
+	//
+	// DiscoverLayout keeps a retained FLAT workarea — one provisioned by a
+	// pre-nesting binary, where the repository clone IS <parent>/<sessionID> —
+	// discoverable across the upgrade: it prefers the on-disk shape and only
+	// falls back to the prospective nested path when nothing exists yet.
 	if s.opts.WorktreeParentDir != "" {
-		handle.WorktreePath = filepath.Join(s.opts.WorktreeParentDir, spec.SessionID)
+		layout, _ := workarea.DiscoverLayout(
+			s.opts.WorktreeParentDir, spec.SessionID, workarea.RepositoryLeaf(spec.Repository))
+		handle.WorktreePath = layout.Repository.String()
+		handle.WorkareaRoot = layout.Root.String()
 	}
 
 	ss := &spawnedSession{

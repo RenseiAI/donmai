@@ -5,30 +5,37 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // siblingReposEnv is the work-item env key naming the read-only context
-// repositories the runner materializes next to the session worktree
-// (ADR-2026-07-07-sibling-context-repos). Value: comma-separated
-// entries, each `<git-url>` or `<git-url>#<ref>`.
+// repositories the runner materializes inside the session workarea root
+// (ADR-2026-07-07-sibling-context-repos, as amended for session-owned
+// workarea namespaces). Value: comma-separated entries, each `<git-url>`
+// or `<git-url>#<ref>`.
 const siblingReposEnv = "DONMAI_SIBLING_REPOS"
 
-// siblingLocks serializes provisioning per target directory. Concurrent
-// sessions can share a parent directory (the worktree root), so two
-// runners racing on the same sibling must not clone into the same path
-// simultaneously. Keys are cleaned absolute target paths; values are
-// *sync.Mutex. Entries are never removed — the set of sibling repos a
-// host materializes is small and stable across a process lifetime.
+// siblingLocks serializes provisioning per target directory. Session-owned
+// roots already give every session its own leaf for a shared context repo,
+// so cross-session collisions cannot happen; the lock remains for the
+// retained flat layout, where two sessions still share the worktree root as
+// a parent. Keys are cleaned absolute target paths; values are *sync.Mutex.
+// Entries are never removed — the set of context repos a host materializes
+// is small and stable across a process lifetime.
 var siblingLocks sync.Map
 
 // provisionSiblings materializes the read-only context repos named by
-// DONMAI_SIBLING_REPOS as siblings of the session worktree, so agents
-// find their governing corpus at ../<name> exactly as repo AGENTS.md
-// contracts promise.
+// DONMAI_SIBLING_REPOS as per-session leaves inside the session workarea
+// root, so agents find their governing corpus at ../<name> relative to the
+// selected repository exactly as repo AGENTS.md contracts promise.
+//
+// Under the session-owned layout <worktree-root>/<session-id>/<repo-leaf>,
+// "../<name>" resolves to <worktree-root>/<session-id>/<name> — a leaf this
+// session owns, never a global peer shared with unrelated sessions.
 //
 // Env source: the daemon injects the work item's per-session env map
 // into the worker child's process env (worker_spawner composeEnv), and
@@ -39,36 +46,30 @@ var siblingLocks sync.Map
 //
 // Failure is never fatal: every skip or error logs a warning and the
 // session proceeds — agents fall back to cloning the repo themselves.
-func (r *Runner) provisionSiblings(ctx context.Context, qw QueuedWork, wpath string) {
+func (r *Runner) provisionSiblings(ctx context.Context, qw QueuedWork, layout workarea.Layout) {
 	_ = qw // no per-session env field on QueuedWork today; see doc comment.
 	spec := strings.TrimSpace(os.Getenv(siblingReposEnv))
 	if spec == "" {
 		return
 	}
-	provisionSiblingRepos(ctx, r.logger, spec, wpath)
+	provisionSiblingRepos(ctx, r.logger, spec, layout)
 }
 
 // provisionSiblingRepos clones or freshens each entry of spec into a
-// directory sibling to wpath. Pure worker for provisionSiblings; split
+// per-session leaf of layout.Root. Pure worker for provisionSiblings; split
 // out so tests can drive it without touching the process env.
-func provisionSiblingRepos(ctx context.Context, logger *slog.Logger, spec, wpath string) {
-	parent := filepath.Dir(wpath)
+func provisionSiblingRepos(ctx context.Context, logger *slog.Logger, spec string, layout workarea.Layout) {
 	for _, entry := range strings.Split(spec, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
 		}
 		url, ref, _ := strings.Cut(entry, "#")
-		name := siblingDirName(url)
-		if !safeSiblingName(name) {
-			logger.Warn("sibling repo skipped: unsafe directory name",
-				"entry", entry, "name", name)
-			continue
-		}
-		target := filepath.Join(parent, name)
-		if target == filepath.Clean(wpath) {
-			logger.Warn("sibling repo skipped: target collides with session worktree",
-				"entry", entry, "path", target)
+		name := workarea.RepositoryLeaf(url)
+		target, err := layout.SiblingPath(name)
+		if err != nil {
+			logger.Warn("sibling repo skipped: unusable directory name",
+				"entry", entry, "name", name, "err", err)
 			continue
 		}
 		if err := ensureSibling(ctx, logger, target, url, ref); err != nil {
@@ -81,26 +82,9 @@ func provisionSiblingRepos(ctx context.Context, logger *slog.Logger, spec, wpath
 	}
 }
 
-// siblingDirName derives the sibling directory name from a git URL: the
-// URL path basename with a trailing ".git" stripped (e.g.
-// "https://example.com/org/docs-corpus.git" → "docs-corpus").
-func siblingDirName(url string) string {
-	base := path.Base(strings.TrimRight(strings.TrimSpace(url), "/"))
-	return strings.TrimSuffix(base, ".git")
-}
-
-// safeSiblingName rejects names that would escape or clobber the parent
-// directory: empty, dot dirs, or anything carrying a path separator.
-func safeSiblingName(name string) bool {
-	if name == "" || name == "." || name == ".." {
-		return false
-	}
-	return !strings.ContainsAny(name, `/\`)
-}
-
 // ensureSibling makes target exist as a clone of url, serialized on a
-// per-target mutex so concurrent sessions sharing a parent directory
-// never clone the same sibling simultaneously.
+// per-target mutex so two goroutines never clone the same path
+// simultaneously.
 //
 // States handled:
 //   - absent → shallow clone (`git clone --depth 1`, plus
@@ -115,7 +99,7 @@ func ensureSibling(ctx context.Context, logger *slog.Logger, target, url, ref st
 	mu.Lock()
 	defer mu.Unlock()
 
-	//nolint:gosec // G703: target = worktree parent + safeSiblingName-validated basename (no separators, no dot dirs).
+	//nolint:gosec // G703: target = session workarea root + SafeRepositoryLeaf-validated basename (no separators, no dot dirs).
 	if fi, err := os.Stat(target); err == nil {
 		if !fi.IsDir() {
 			return fmt.Errorf("target exists and is not a directory")
@@ -133,12 +117,17 @@ func ensureSibling(ctx context.Context, logger *slog.Logger, target, url, ref st
 		return nil
 	}
 
+	parent := filepath.Dir(target)
+	//nolint:gosec // G703: parent is the session workarea root — target is that root joined with a SafeRepositoryLeaf-validated basename, so Dir cannot escape it.
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		return fmt.Errorf("mkdir workarea root: %w", err)
+	}
 	args := []string{"clone", "--depth", "1"}
 	if ref != "" {
 		args = append(args, "--branch", ref)
 	}
 	args = append(args, url, target)
-	if out, err := runGit(ctx, filepath.Dir(target), gitIdentity{}, args...); err != nil {
+	if out, err := runGit(ctx, parent, gitIdentity{}, args...); err != nil {
 		return fmt.Errorf("git clone: %w (output: %s)", err, out)
 	}
 	return nil

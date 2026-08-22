@@ -231,13 +231,25 @@ type SessionHandle struct {
 	AcceptedAt string       `json:"acceptedAt"`
 	State      SessionState `json:"state"`
 
-	// WorktreePath is the absolute on-disk path of the per-session
-	// worktree the spawned worker operates in
-	// (<WorktreeParentDir>/<sessionID>). A local reader joins this with
+	// WorktreePath is the absolute on-disk path of the SELECTED repository
+	// worktree the spawned worker operates in — the agent CWD
+	// (<WorktreeParentDir>/<sessionID>/<repo-leaf>, or the retained flat
+	// <WorktreeParentDir>/<sessionID>). A local reader joins this with
 	// state.AgentDirName to reach <path>/.agent/events.jsonl and
 	// <path>/.agent/state.json. Empty when the daemon cannot resolve the
 	// worktree parent (no state dir).
+	//
+	// The field's meaning — "the repository path the agent runs in" — is
+	// unchanged by the session-owned workarea namespace, so a mixed-version
+	// reader stays correct.
 	WorktreePath string `json:"worktreePath,omitempty"`
+
+	// WorkareaRoot is the absolute on-disk path of the session-owned
+	// workarea root (<WorktreeParentDir>/<sessionID>): the directory
+	// containing the selected repository worktree plus this session's
+	// context/secondary repositories. Additive + omitempty; equals
+	// WorktreePath for a retained flat workarea.
+	WorkareaRoot string `json:"workareaRoot,omitempty"`
 
 	// ProjectName is the allowlist-resolved project identifier
 	// (ProjectConfig.ID) this session was dispatched under. Mirrors

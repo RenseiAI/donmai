@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // makeSiblingOrigin creates a bare git repo named dirName (e.g.
@@ -54,73 +56,38 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// newSessionWorktree creates a parent dir plus a session worktree dir
-// inside it (the provisioned-clone layout) and returns both.
-func newSessionWorktree(t *testing.T) (parent, wpath string) {
+// newSessionLayout creates a worktree root plus the session-owned workarea
+// <worktree-root>/<sessionID>/<repo-leaf> and returns the worktree root and
+// the nested layout. This is the provisioned shape the runner hands to
+// provisionSiblings.
+func newSessionLayout(t *testing.T, sessionID string) (worktreeRoot string, layout workarea.Layout) {
 	t.Helper()
-	parent = t.TempDir()
-	wpath = filepath.Join(parent, "session-repo")
-	if err := os.MkdirAll(wpath, 0o750); err != nil {
+	worktreeRoot = t.TempDir()
+	layout, err := workarea.NewLayout(worktreeRoot, sessionID, "session-repo")
+	if err != nil {
 		t.Fatal(err)
 	}
-	return parent, wpath
-}
-
-func TestSiblingDirName(t *testing.T) {
-	tests := []struct {
-		url  string
-		want string
-	}{
-		{"https://github.com/Example/docs-corpus", "docs-corpus"},
-		{"https://github.com/Example/docs-corpus.git", "docs-corpus"},
-		{"git@github.com:Example/notes.git", "notes"},
-		{"file:///tmp/fixtures/repo.git", "repo"},
-		{"https://example.com/org/repo/", "repo"},
-		{"", "."}, // path.Base("") = "."; rejected by safeSiblingName.
-		{"..", ".."},
+	if err := os.MkdirAll(layout.Repository.String(), 0o750); err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		if got := siblingDirName(tt.url); got != tt.want {
-			t.Errorf("siblingDirName(%q) = %q; want %q", tt.url, got, tt.want)
-		}
-	}
-}
-
-func TestSafeSiblingName(t *testing.T) {
-	tests := []struct {
-		name string
-		want bool
-	}{
-		{"", false},
-		{".", false},
-		{"..", false},
-		{"a/b", false},
-		{`a\b`, false},
-		{"docs-corpus", true},
-		{"repo.name", true},
-	}
-	for _, tt := range tests {
-		if got := safeSiblingName(tt.name); got != tt.want {
-			t.Errorf("safeSiblingName(%q) = %v; want %v", tt.name, got, tt.want)
-		}
-	}
+	return worktreeRoot, layout
 }
 
 func TestProvisionSiblingRepos(t *testing.T) {
 	tests := []struct {
 		name string
-		// setup returns the env spec; it may pre-populate the parent dir.
-		setup func(t *testing.T, parent, wpath string) string
-		check func(t *testing.T, parent, wpath string)
+		// setup returns the env spec; it may pre-populate the session root.
+		setup func(t *testing.T, layout workarea.Layout) string
+		check func(t *testing.T, worktreeRoot string, layout workarea.Layout)
 	}{
 		{
-			name: "single URL clones shallow sibling next to worktree",
-			setup: func(t *testing.T, _, _ string) string {
+			name: "single URL clones shallow sibling inside the session root",
+			setup: func(t *testing.T, _ workarea.Layout) string {
 				url, _ := makeSiblingOrigin(t, "corpus.git")
 				return url
 			},
-			check: func(t *testing.T, parent, wpath string) {
-				sib := filepath.Join(parent, "corpus")
+			check: func(t *testing.T, worktreeRoot string, layout workarea.Layout) {
+				sib := filepath.Join(layout.Root.String(), "corpus")
 				if _, err := os.Stat(filepath.Join(sib, ".git")); err != nil {
 					t.Fatalf("sibling .git missing: %v", err)
 				}
@@ -130,22 +97,27 @@ func TestProvisionSiblingRepos(t *testing.T) {
 				if _, err := os.Stat(filepath.Join(sib, ".git", "shallow")); err != nil {
 					t.Errorf("clone is not shallow (.git/shallow absent): %v", err)
 				}
-				// NEXT TO the worktree, never inside it.
-				if _, err := os.Stat(filepath.Join(wpath, "corpus")); !os.IsNotExist(err) {
-					t.Errorf("sibling leaked inside the worktree: stat err = %v", err)
+				// NEXT TO the selected repository, never inside it.
+				if _, err := os.Stat(filepath.Join(layout.Repository.String(), "corpus")); !os.IsNotExist(err) {
+					t.Errorf("sibling leaked inside the repository worktree: stat err = %v", err)
+				}
+				// And never as a GLOBAL peer under the worktree root, where a
+				// second session would share it.
+				if _, err := os.Stat(filepath.Join(worktreeRoot, "corpus")); !os.IsNotExist(err) {
+					t.Errorf("sibling materialized as a global peer under the worktree root: stat err = %v", err)
 				}
 			},
 		},
 		{
 			name: "two URLs provision two siblings",
-			setup: func(t *testing.T, _, _ string) string {
+			setup: func(t *testing.T, _ workarea.Layout) string {
 				a, _ := makeSiblingOrigin(t, "corpus-a.git")
 				b, _ := makeSiblingOrigin(t, "corpus-b.git")
 				return a + ", " + b
 			},
-			check: func(t *testing.T, parent, _ string) {
+			check: func(t *testing.T, _ string, layout workarea.Layout) {
 				for _, name := range []string{"corpus-a", "corpus-b"} {
-					if _, err := os.Stat(filepath.Join(parent, name, ".git")); err != nil {
+					if _, err := os.Stat(filepath.Join(layout.Root.String(), name, ".git")); err != nil {
 						t.Errorf("sibling %s missing: %v", name, err)
 					}
 				}
@@ -153,14 +125,14 @@ func TestProvisionSiblingRepos(t *testing.T) {
 		},
 		{
 			name: "hash ref clones the named branch",
-			setup: func(t *testing.T, _, _ string) string {
+			setup: func(t *testing.T, _ workarea.Layout) string {
 				url, work := makeSiblingOrigin(t, "corpus.git")
 				checkout(t, work, "docs-v2")
 				pushSiblingCommit(t, work, url, "V2-MARKER.md")
 				return url + "#docs-v2"
 			},
-			check: func(t *testing.T, parent, _ string) {
-				marker := filepath.Join(parent, "corpus", "V2-MARKER.md")
+			check: func(t *testing.T, _ string, layout workarea.Layout) {
+				marker := filepath.Join(layout.Root.String(), "corpus", "V2-MARKER.md")
 				if _, err := os.Stat(marker); err != nil {
 					t.Errorf("branch marker missing (ref not honored): %v", err)
 				}
@@ -168,59 +140,62 @@ func TestProvisionSiblingRepos(t *testing.T) {
 		},
 		{
 			name: "clone failure is non-fatal and later entries still provision",
-			setup: func(t *testing.T, _, _ string) string {
+			setup: func(t *testing.T, _ workarea.Layout) string {
 				bad := "file://" + filepath.Join(t.TempDir(), "nonexistent.git")
 				good, _ := makeSiblingOrigin(t, "corpus.git")
 				return bad + "," + good
 			},
-			check: func(t *testing.T, parent, _ string) {
-				if _, err := os.Stat(filepath.Join(parent, "corpus", ".git")); err != nil {
+			check: func(t *testing.T, _ string, layout workarea.Layout) {
+				root := layout.Root.String()
+				if _, err := os.Stat(filepath.Join(root, "corpus", ".git")); err != nil {
 					t.Errorf("good sibling missing after earlier failure: %v", err)
 				}
-				if _, err := os.Stat(filepath.Join(parent, "nonexistent", ".git")); !os.IsNotExist(err) {
+				if _, err := os.Stat(filepath.Join(root, "nonexistent", ".git")); !os.IsNotExist(err) {
 					t.Errorf("failed clone left a .git behind: stat err = %v", err)
 				}
 			},
 		},
 		{
 			name: "unsafe names are skipped",
-			setup: func(_ *testing.T, _, _ string) string {
+			setup: func(_ *testing.T, _ workarea.Layout) string {
 				return "#branch-only, .., ., ,"
 			},
-			check: func(t *testing.T, parent, wpath string) {
-				entries, err := os.ReadDir(parent)
+			check: func(t *testing.T, _ string, layout workarea.Layout) {
+				entries, err := os.ReadDir(layout.Root.String())
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(entries) != 1 || entries[0].Name() != filepath.Base(wpath) {
-					t.Errorf("parent dir polluted: %v", entries)
+				want := filepath.Base(layout.Repository.String())
+				if len(entries) != 1 || entries[0].Name() != want {
+					t.Errorf("session root polluted: %v", entries)
 				}
 			},
 		},
 		{
-			name: "target colliding with session worktree is skipped",
-			setup: func(t *testing.T, _, wpath string) string {
-				url, _ := makeSiblingOrigin(t, filepath.Base(wpath)+".git")
+			name: "target colliding with the selected repository is skipped",
+			setup: func(t *testing.T, layout workarea.Layout) string {
+				url, _ := makeSiblingOrigin(t, filepath.Base(layout.Repository.String())+".git")
 				return url
 			},
-			check: func(t *testing.T, _, wpath string) {
-				if _, err := os.Stat(filepath.Join(wpath, ".git")); !os.IsNotExist(err) {
-					t.Errorf("worktree was clobbered by a sibling clone: stat err = %v", err)
+			check: func(t *testing.T, _ string, layout workarea.Layout) {
+				if _, err := os.Stat(filepath.Join(layout.Repository.String(), ".git")); !os.IsNotExist(err) {
+					t.Errorf("selected repository was clobbered by a sibling clone: stat err = %v", err)
 				}
 			},
 		},
 		{
 			name: "existing dir without .git is left untouched",
-			setup: func(t *testing.T, parent, _ string) string {
+			setup: func(t *testing.T, layout workarea.Layout) string {
 				url, _ := makeSiblingOrigin(t, "corpus.git")
-				writeFile(t, filepath.Join(parent, "corpus"), "keep.txt", "keep\n")
+				writeFile(t, filepath.Join(layout.Root.String(), "corpus"), "keep.txt", "keep\n")
 				return url
 			},
-			check: func(t *testing.T, parent, _ string) {
-				if _, err := os.Stat(filepath.Join(parent, "corpus", "keep.txt")); err != nil {
+			check: func(t *testing.T, _ string, layout workarea.Layout) {
+				root := layout.Root.String()
+				if _, err := os.Stat(filepath.Join(root, "corpus", "keep.txt")); err != nil {
 					t.Errorf("pre-existing content deleted: %v", err)
 				}
-				if _, err := os.Stat(filepath.Join(parent, "corpus", ".git")); !os.IsNotExist(err) {
+				if _, err := os.Stat(filepath.Join(root, "corpus", ".git")); !os.IsNotExist(err) {
 					t.Errorf("non-git dir was cloned into: stat err = %v", err)
 				}
 			},
@@ -228,36 +203,36 @@ func TestProvisionSiblingRepos(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			parent, wpath := newSessionWorktree(t)
-			spec := tt.setup(t, parent, wpath)
-			provisionSiblingRepos(context.Background(), discardLogger(), spec, wpath)
-			tt.check(t, parent, wpath)
+			worktreeRoot, layout := newSessionLayout(t, "sess-fixture")
+			spec := tt.setup(t, layout)
+			provisionSiblingRepos(context.Background(), discardLogger(), spec, layout)
+			tt.check(t, worktreeRoot, layout)
 		})
 	}
 }
 
 func TestProvisionSiblingReposFreshensExistingClone(t *testing.T) {
-	parent, wpath := newSessionWorktree(t)
+	_, layout := newSessionLayout(t, "sess-freshen")
 	url, work := makeSiblingOrigin(t, "corpus.git")
 
-	provisionSiblingRepos(context.Background(), discardLogger(), url, wpath)
-	marker := filepath.Join(parent, "corpus", "FRESH-MARKER.md")
+	provisionSiblingRepos(context.Background(), discardLogger(), url, layout)
+	marker := filepath.Join(layout.Root.String(), "corpus", "FRESH-MARKER.md")
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("marker present before origin advanced: stat err = %v", err)
 	}
 
 	pushSiblingCommit(t, work, url, "FRESH-MARKER.md")
-	provisionSiblingRepos(context.Background(), discardLogger(), url, wpath)
+	provisionSiblingRepos(context.Background(), discardLogger(), url, layout)
 	if _, err := os.Stat(marker); err != nil {
 		t.Errorf("existing sibling was not freshened: %v", err)
 	}
 }
 
 func TestProvisionSiblingReposFreshenFailureKeepsStaleCopy(t *testing.T) {
-	parent, wpath := newSessionWorktree(t)
+	_, layout := newSessionLayout(t, "sess-stale")
 	url, _ := makeSiblingOrigin(t, "corpus.git")
 
-	provisionSiblingRepos(context.Background(), discardLogger(), url, wpath)
+	provisionSiblingRepos(context.Background(), discardLogger(), url, layout)
 
 	// Remove the origin so the freshen pull fails; the stale sibling
 	// must survive untouched.
@@ -266,8 +241,8 @@ func TestProvisionSiblingReposFreshenFailureKeepsStaleCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	provisionSiblingRepos(context.Background(), discardLogger(), url, wpath)
-	if _, err := os.Stat(filepath.Join(parent, "corpus", "README.md")); err != nil {
+	provisionSiblingRepos(context.Background(), discardLogger(), url, layout)
+	if _, err := os.Stat(filepath.Join(layout.Root.String(), "corpus", "README.md")); err != nil {
 		t.Errorf("stale sibling copy lost after failed freshen: %v", err)
 	}
 }
@@ -276,51 +251,100 @@ func TestProvisionSiblingsReadsProcessEnv(t *testing.T) {
 	r := &Runner{logger: discardLogger()}
 
 	t.Run("unset env is a no-op", func(t *testing.T) {
-		parent, wpath := newSessionWorktree(t)
+		_, layout := newSessionLayout(t, "sess-env-unset")
 		t.Setenv(siblingReposEnv, "")
-		r.provisionSiblings(context.Background(), QueuedWork{}, wpath)
-		entries, err := os.ReadDir(parent)
+		r.provisionSiblings(context.Background(), QueuedWork{}, layout)
+		entries, err := os.ReadDir(layout.Root.String())
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(entries) != 1 {
-			t.Errorf("expected untouched parent dir, got %v", entries)
+			t.Errorf("expected untouched session root, got %v", entries)
 		}
 	})
 
 	t.Run("env value provisions siblings", func(t *testing.T) {
-		parent, wpath := newSessionWorktree(t)
+		_, layout := newSessionLayout(t, "sess-env-set")
 		url, _ := makeSiblingOrigin(t, "corpus.git")
 		t.Setenv(siblingReposEnv, url)
-		r.provisionSiblings(context.Background(), QueuedWork{}, wpath)
-		if _, err := os.Stat(filepath.Join(parent, "corpus", ".git")); err != nil {
+		r.provisionSiblings(context.Background(), QueuedWork{}, layout)
+		if _, err := os.Stat(filepath.Join(layout.Root.String(), "corpus", ".git")); err != nil {
 			t.Errorf("sibling missing: %v", err)
 		}
 	})
 }
 
-// TestProvisionSiblingReposConcurrentSessions drives two sessions that
-// share a parent dir at the same sibling spec concurrently. The
-// per-target mutex must serialize the clone/freshen; -race validates.
-func TestProvisionSiblingReposConcurrentSessions(t *testing.T) {
-	parent, wpathA := newSessionWorktree(t)
-	wpathB := filepath.Join(parent, "session-repo-b")
-	if err := os.MkdirAll(wpathB, 0o750); err != nil {
+// TestProvisionSiblingReposConcurrentSessionsGetDistinctPaths is the V16
+// control for the session-owned ownership boundary: two concurrent sessions sharing a
+// worktree root and naming the SAME secondary repo must each materialize it
+// inside their OWN session root, never as one global peer they share.
+//
+// RED without the nesting change: both sessions resolve
+// <worktree-root>/corpus, so the two roots hold no clone at all and the
+// per-session assertions fail.
+func TestProvisionSiblingReposConcurrentSessionsGetDistinctPaths(t *testing.T) {
+	worktreeRoot := t.TempDir()
+	url, _ := makeSiblingOrigin(t, "corpus.git")
+
+	layouts := make([]workarea.Layout, 0, 2)
+	for _, sessionID := range []string{"session-a", "session-b"} {
+		layout, err := workarea.NewLayout(worktreeRoot, sessionID, "session-repo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(layout.Repository.String(), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		layouts = append(layouts, layout)
+	}
+
+	var wg sync.WaitGroup
+	for _, layout := range layouts {
+		wg.Add(1)
+		go func(l workarea.Layout) {
+			defer wg.Done()
+			provisionSiblingRepos(context.Background(), discardLogger(), url, l)
+		}(layout)
+	}
+	wg.Wait()
+
+	seen := make(map[string]bool, len(layouts))
+	for _, layout := range layouts {
+		sib := filepath.Join(layout.Root.String(), "corpus")
+		if _, err := os.Stat(filepath.Join(sib, ".git")); err != nil {
+			t.Errorf("session %s has no session-owned sibling clone: %v", layout.Root, err)
+		}
+		if seen[sib] {
+			t.Errorf("two sessions resolved the same sibling path %s", sib)
+		}
+		seen[sib] = true
+	}
+	// The shared worktree root must hold only the two session roots.
+	if _, err := os.Stat(filepath.Join(worktreeRoot, "corpus")); !os.IsNotExist(err) {
+		t.Errorf("sibling materialized as a global peer shared across sessions: stat err = %v", err)
+	}
+}
+
+// TestProvisionSiblingReposFlatLayoutStillWorks pins that a retained FLAT
+// workarea — where the repository clone IS the session directory — still
+// materializes its context repos next to itself, so a session adopted from a
+// pre-nesting binary keeps finding its corpus at ../<name>.
+func TestProvisionSiblingReposFlatLayoutStillWorks(t *testing.T) {
+	worktreeRoot := t.TempDir()
+	layout, err := workarea.FlatLayout(worktreeRoot, "legacy-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(layout.Repository.String(), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	url, _ := makeSiblingOrigin(t, "corpus.git")
 
-	var wg sync.WaitGroup
-	for _, wp := range []string{wpathA, wpathB} {
-		wg.Add(1)
-		go func(wp string) {
-			defer wg.Done()
-			provisionSiblingRepos(context.Background(), discardLogger(), url, wp)
-		}(wp)
-	}
-	wg.Wait()
+	provisionSiblingRepos(context.Background(), discardLogger(), url, layout)
 
-	if _, err := os.Stat(filepath.Join(parent, "corpus", ".git")); err != nil {
-		t.Errorf("sibling missing after concurrent provisioning: %v", err)
+	// Flat root == flat repository, so ../corpus is the worktree root peer —
+	// the pre-nesting shape, unchanged.
+	if _, err := os.Stat(filepath.Join(worktreeRoot, "legacy-session", "corpus", ".git")); err != nil {
+		t.Errorf("flat-layout sibling missing: %v", err)
 	}
 }
