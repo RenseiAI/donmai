@@ -319,6 +319,7 @@ type sessionShimState struct {
 	// uses the atomic secret-free state writer and crypto/rand identifier.
 	restartStateWriter func(restartPreparationAudit) error
 	restartID          func() (string, error)
+	restartNow         func() time.Time
 	// wg joins the per-session event consumers so shutdown cannot race one that
 	// is still writing bookkeeping.
 	wg sync.WaitGroup

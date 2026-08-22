@@ -25,6 +25,25 @@ func (f restartExactStoreFunc) AcknowledgeExact(ctx context.Context, request ses
 	return f(ctx, request)
 }
 
+type echoLegacyRestartFenceStore struct{}
+
+func (echoLegacyRestartFenceStore) Acknowledge(_ context.Context, fence sessionshim.Fence) (sessionshim.Fence, error) {
+	return fence, nil
+}
+
+type normalizingLegacyRestartFenceStore struct{ now time.Time }
+
+func (s normalizingLegacyRestartFenceStore) Acknowledge(_ context.Context, fence sessionshim.Fence) (sessionshim.Fence, error) {
+	fence.Sessions = append([]sessionshim.FencedSession(nil), fence.Sessions...)
+	fence.HostID = "normalized-host"
+	fence.IssuedAtUnixNano = s.now.Add(time.Second).UnixNano()
+	fence.HoldUntilUnixNano = s.now.Add(10 * time.Minute).UnixNano()
+	for left, right := 0, len(fence.Sessions)-1; left < right; left, right = left+1, right-1 {
+		fence.Sessions[left], fence.Sessions[right] = fence.Sessions[right], fence.Sessions[left]
+	}
+	return fence, nil
+}
+
 func newRestartTestDaemon(t *testing.T, store sessionshim.ExactFenceStore, ids ...sessionshim.Identity) *Daemon {
 	t.Helper()
 	d := New(Options{
@@ -154,6 +173,267 @@ func TestRestartPreflightPartialRetryFreezesIdentitySnapshotAndBytes(t *testing.
 	}
 	if bytes.Contains(beta[1], []byte("org-gamma")) {
 		t.Fatalf("retry resampled late registry mutation: %s", beta[1])
+	}
+}
+
+func TestCachedPreparedPermissionRefusesExpiredFenceWithoutRemintOrResnapshot(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	now := base
+	var storeCalls atomic.Int32
+	store := restartExactStoreFunc(func(_ context.Context, request sessionshim.FenceRequest) (sessionshim.FenceAcknowledgement, error) {
+		storeCalls.Add(1)
+		return sessionshim.FenceAcknowledgement{
+			RequestBytes: append([]byte(nil), request.RequestBytes...), DurableRevision: "revision",
+		}, nil
+	})
+	d := newRestartTestDaemon(t, store, sessionshim.Identity{OrgID: "org", SessionID: "session"})
+	d.shims.restartNow = func() time.Time { return now }
+
+	first, err := d.PrepareRestart(context.Background())
+	if err != nil || first.State != afclient.DaemonRestartPrepared {
+		t.Fatalf("initial PrepareRestart = %+v, %v", first, err)
+	}
+	preparation := d.shims.restart
+	holdUntil := preparation.acked["org"].HoldUntilUnixNano
+	now = time.Unix(0, holdUntil+1)
+
+	second, err := d.PrepareRestart(context.Background())
+	if !errors.Is(err, ErrRestartPreflightRefused) || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired cached PrepareRestart = %+v, %v; want refusal", second, err)
+	}
+	if d.shims.restart != preparation || d.shims.restart.id != first.PreparationID || storeCalls.Load() != 1 {
+		t.Fatalf("expired replay reminted/resnapshotted: prep=%p/%p id=%q/%q calls=%d",
+			d.shims.restart, preparation, d.shims.restart.id, first.PreparationID, storeCalls.Load())
+	}
+	if d.State() != StateDraining || d.spawner.IsAccepting() {
+		t.Fatalf("expired replay state/admission = (%q,%v), want draining/false", d.State(), d.spawner.IsAccepting())
+	}
+}
+
+func TestInitialPreparedPermissionRevalidatesAfterPersistence(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	now := base
+	store := restartExactStoreFunc(func(_ context.Context, request sessionshim.FenceRequest) (sessionshim.FenceAcknowledgement, error) {
+		now = base.Add(24 * time.Hour)
+		return sessionshim.FenceAcknowledgement{
+			RequestBytes: append([]byte(nil), request.RequestBytes...), DurableRevision: "revision",
+		}, nil
+	})
+	d := newRestartTestDaemon(t, store, sessionshim.Identity{OrgID: "org", SessionID: "session"})
+	d.shims.restartNow = func() time.Time { return now }
+	var persisted []restartPreparationState
+	d.shims.restartStateWriter = func(record restartPreparationAudit) error {
+		persisted = append(persisted, record.State)
+		return nil
+	}
+
+	result, err := d.PrepareRestart(context.Background())
+	if !errors.Is(err, ErrRestartPreflightRefused) || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("slow initial PrepareRestart = %+v, %v; want post-persist expiry refusal", result, err)
+	}
+	if len(persisted) < 2 || persisted[len(persisted)-1] != restartPreparationPrepared {
+		t.Fatalf("audit states = %v, want final prepared persistence before validation", persisted)
+	}
+	if d.shims.restart.state == restartPreparationPrepared {
+		t.Fatal("expired initial acknowledgement published in-memory permission")
+	}
+}
+
+func TestCachedPreparedPermissionRefusesMissingOrChangedLocalFence(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Daemon)
+	}{
+		{"missing", func(d *Daemon) { delete(d.shims.fences, "org") }},
+		{"revision empty", func(d *Daemon) {
+			fence := d.shims.fences["org"]
+			fence.DurableRevision = ""
+			d.shims.fences["org"] = fence
+		}},
+		{"state changed", func(d *Daemon) {
+			fence := d.shims.fences["org"]
+			fence.State = sessionshim.FenceReconciliationRequired
+			d.shims.fences["org"] = fence
+		}},
+		{"coverage changed", func(d *Daemon) {
+			fence := d.shims.fences["org"]
+			fence.Sessions = append(fence.Sessions, sessionshim.FencedSession{OrgID: "org", SessionID: "late"})
+			d.shims.fences["org"] = fence
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := restartExactStoreFunc(func(_ context.Context, request sessionshim.FenceRequest) (sessionshim.FenceAcknowledgement, error) {
+				return sessionshim.FenceAcknowledgement{
+					RequestBytes: append([]byte(nil), request.RequestBytes...), DurableRevision: "revision",
+				}, nil
+			})
+			d := newRestartTestDaemon(t, store, sessionshim.Identity{OrgID: "org", SessionID: "session"})
+			first, err := d.PrepareRestart(context.Background())
+			if err != nil {
+				t.Fatalf("initial PrepareRestart: %v", err)
+			}
+			d.shims.mu.Lock()
+			tc.mutate(d)
+			d.shims.mu.Unlock()
+			second, err := d.PrepareRestart(context.Background())
+			if !errors.Is(err, ErrRestartPreflightRefused) {
+				t.Fatalf("changed cached PrepareRestart = %+v, %v; want refusal", second, err)
+			}
+			if d.shims.restart.id != first.PreparationID {
+				t.Fatalf("changed cached permission reminted %q -> %q", first.PreparationID, d.shims.restart.id)
+			}
+		})
+	}
+}
+
+func TestLegacyFenceStoreEmptyRevisionRemainsReplayCompatible(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	d := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			RegistryDir: t.TempDir(), FenceStore: echoLegacyRestartFenceStore{},
+			HostIDForOrg: func(_ context.Context, orgID string) (string, error) { return "host-" + orgID, nil },
+		},
+	})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{})
+	d.setState(StateRunning)
+	d.shims.restartNow = func() time.Time { return base }
+	d.shims.restartID = func() (string, error) { return "rp_legacy", nil }
+	d.shims.restartStateWriter = func(restartPreparationAudit) error { return nil }
+	seedShimState(d, []sessionshim.Identity{{OrgID: "org", SessionID: "session"}}, nil)
+
+	first, err := d.PrepareRestart(context.Background())
+	if err != nil || first.State != afclient.DaemonRestartPrepared {
+		t.Fatalf("legacy initial PrepareRestart = %+v, %v", first, err)
+	}
+	if revision := d.shims.restart.acked["org"].DurableRevision; revision != "" {
+		t.Fatalf("legacy callback revision = %q, want source-compatible empty", revision)
+	}
+	second, err := d.PrepareRestart(context.Background())
+	if err != nil || second != first {
+		t.Fatalf("legacy replay = %+v, %v; want %+v", second, err, first)
+	}
+}
+
+func TestLegacyNormalizingFenceStoreReplayRemainsCompatible(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	d := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			RegistryDir: t.TempDir(), FenceStore: normalizingLegacyRestartFenceStore{now: base},
+			HostIDForOrg: func(_ context.Context, orgID string) (string, error) { return "host-" + orgID, nil },
+		},
+	})
+	d.spawner = NewWorkerSpawner(SpawnerOptions{})
+	d.setState(StateRunning)
+	d.shims.restartNow = func() time.Time { return base }
+	d.shims.restartID = func() (string, error) { return "rp_normalized", nil }
+	d.shims.restartStateWriter = func(restartPreparationAudit) error { return nil }
+	seedShimState(d, []sessionshim.Identity{
+		{OrgID: "org", SessionID: "alpha"}, {OrgID: "org", SessionID: "beta"},
+	}, nil)
+
+	first, err := d.PrepareRestart(context.Background())
+	if err != nil {
+		t.Fatalf("normalizing legacy initial: %v", err)
+	}
+	ack := d.shims.restart.acked["org"]
+	if ack.HostID != "normalized-host" || ack.IssuedAtUnixNano == d.shims.restart.requests["org"].Fence.IssuedAtUnixNano || ack.DurableRevision != "" {
+		t.Fatalf("legacy normalization was not retained: %+v", ack)
+	}
+	second, err := d.PrepareRestart(context.Background())
+	if err != nil || second != first {
+		t.Fatalf("normalizing legacy replay = %+v, %v; want %+v", second, err, first)
+	}
+}
+
+func TestStandalonePreparedReplayAcceptsHeldIntentAndRefusesExpiry(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	now := base
+	d := newRestartTestDaemon(t, nil, sessionshim.Identity{OrgID: "local", SessionID: "session"})
+	d.shims.restartNow = func() time.Time { return now }
+
+	first, err := d.PrepareRestart(context.Background())
+	if err != nil || first.State != afclient.DaemonRestartPrepared {
+		t.Fatalf("standalone initial PrepareRestart = %+v, %v", first, err)
+	}
+	preparation := d.shims.restart
+	if preparation.authorityMode != restartAuthorityStandalone || preparation.acked["local"].DurableRevision != "" {
+		t.Fatalf("standalone authority/revision = %v/%q, want standalone/empty",
+			preparation.authorityMode, preparation.acked["local"].DurableRevision)
+	}
+	second, err := d.PrepareRestart(context.Background())
+	if err != nil || second != first {
+		t.Fatalf("held standalone replay = %+v, %v; want %+v", second, err, first)
+	}
+	now = time.Unix(0, preparation.acked["local"].HoldUntilUnixNano+1)
+	third, err := d.PrepareRestart(context.Background())
+	if !errors.Is(err, ErrRestartPreflightRefused) || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired standalone replay = %+v, %v; want refusal", third, err)
+	}
+	if d.shims.restart != preparation || d.shims.restart.id != first.PreparationID {
+		t.Fatal("expired standalone replay resnapshotted or reminted")
+	}
+}
+
+func TestCachedNotRequiredPermissionRevalidatesEmptyInvariant(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *Daemon)
+	}{
+		{
+			name: "direct session appears",
+			mutate: func(_ *testing.T, d *Daemon) {
+				d.spawner.mu.Lock()
+				d.spawner.sessions["late-direct"] = &spawnedSession{
+					handle: SessionHandle{SessionID: "late-direct"}, spec: SessionSpec{SessionID: "late-direct"},
+				}
+				d.spawner.mu.Unlock()
+			},
+		},
+		{
+			name: "shim correlation appears",
+			mutate: func(_ *testing.T, d *Daemon) {
+				d.shims.mu.Lock()
+				d.shims.quarantined = append(d.shims.quarantined, sessionshim.QuarantinedSession{
+					OrgID: "org", SessionID: "late-shim", ShimID: "shim-late", ProcessEpoch: 2,
+					Reason: sessionshim.QuarantineDuplicateIdentity, ConsumesCapacity: true,
+				})
+				d.shims.mu.Unlock()
+			},
+		},
+		{
+			name: "unclassified registry record appears",
+			mutate: func(t *testing.T, d *Daemon) {
+				t.Helper()
+				path := filepath.Join(d.sessionShimConfig().RegistryDir, "late.json")
+				if err := os.WriteFile(path, []byte(`{}`), sessionshim.RecordFileMode); err != nil {
+					t.Fatalf("write late registry record: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newRestartTestDaemon(t, nil)
+			first, err := d.PrepareRestart(context.Background())
+			if err != nil || first.State != afclient.DaemonRestartNotRequired {
+				t.Fatalf("initial not-required = %+v, %v", first, err)
+			}
+			preparation := d.shims.restart
+			tc.mutate(t, d)
+			second, err := d.PrepareRestart(context.Background())
+			if !errors.Is(err, ErrRestartPreflightRefused) {
+				t.Fatalf("changed not-required = %+v, %v; want refusal", second, err)
+			}
+			if d.shims.restart != preparation || d.shims.restart.id != first.PreparationID {
+				t.Fatalf("not-required replay reminted/resnapshotted: %+v", d.shims.restart)
+			}
+			if d.State() != StateDraining || d.spawner.IsAccepting() {
+				t.Fatalf("not-required refusal state/admission = (%q,%v)", d.State(), d.spawner.IsAccepting())
+			}
+		})
 	}
 }
 

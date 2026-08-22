@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
@@ -30,15 +32,24 @@ const (
 )
 
 type restartPreparation struct {
-	id        string
-	issuedAt  time.Time
-	state     restartPreparationState
-	scopeIDs  []string
-	covered   map[string][]sessionshim.FencedSession
-	requests  map[string]sessionshim.FenceRequest
-	acked     map[string]sessionshim.Fence
-	persisted bool
+	id            string
+	issuedAt      time.Time
+	state         restartPreparationState
+	scopeIDs      []string
+	covered       map[string][]sessionshim.FencedSession
+	requests      map[string]sessionshim.FenceRequest
+	acked         map[string]sessionshim.Fence
+	persisted     bool
+	authorityMode restartPreparationAuthorityMode
 }
+
+type restartPreparationAuthorityMode uint8
+
+const (
+	restartAuthorityStandalone restartPreparationAuthorityMode = iota
+	restartAuthorityLegacyStore
+	restartAuthorityExactStore
+)
 
 type restartPreparationAudit struct {
 	SchemaVersion int                     `json:"schemaVersion"`
@@ -104,7 +115,16 @@ func (d *Daemon) prepareRestartWithLease(ctx context.Context, lease *lifecycleLe
 	if err != nil {
 		return afclient.DaemonRestartPreflightResponse{}, err
 	}
-	if preparation.state == restartPreparationPrepared || preparation.state == restartPreparationNotRequired {
+	switch preparation.state {
+	case restartPreparationPrepared:
+		if err := d.validatePreparedRestartPermission(preparation, d.restartPreparationNow()); err != nil {
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("revalidate cached prepared authorization", err)
+		}
+		return restartPreparationResponse(preparation), nil
+	case restartPreparationNotRequired:
+		if err := d.validateNotRequiredRestartPermission(preparation); err != nil {
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("revalidate cached not-required authorization", err)
+		}
 		return restartPreparationResponse(preparation), nil
 	}
 	if !preparation.persisted {
@@ -116,6 +136,9 @@ func (d *Daemon) prepareRestartWithLease(ctx context.Context, lease *lifecycleLe
 	if len(preparation.scopeIDs) == 0 {
 		if err := d.persistRestartPreparation(preparation, restartPreparationNotRequired); err != nil {
 			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("persist not-required preparation", err)
+		}
+		if err := d.validateNotRequiredRestartPermission(preparation); err != nil {
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("validate not-required authorization after persistence", err)
 		}
 		preparation.state = restartPreparationNotRequired
 		return restartPreparationResponse(preparation), nil
@@ -140,6 +163,9 @@ func (d *Daemon) prepareRestartWithLease(ctx context.Context, lease *lifecycleLe
 	}
 	if err := d.persistRestartPreparation(preparation, restartPreparationPrepared); err != nil {
 		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("persist prepared authorization", err)
+	}
+	if err := d.validatePreparedRestartPermission(preparation, d.restartPreparationNow()); err != nil {
+		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("validate prepared authorization after persistence", err)
 	}
 	preparation.state = restartPreparationPrepared
 	return restartPreparationResponse(preparation), nil
@@ -172,13 +198,14 @@ func (d *Daemon) restartPreparationSnapshot() (*restartPreparation, error) {
 		return nil, restartPreflightCause("mint preparation identity", err)
 	}
 	preparation := &restartPreparation{
-		id:       id,
-		issuedAt: time.Now(),
-		state:    restartPreparationPreparing,
-		scopeIDs: scopeIDs,
-		covered:  byOrg,
-		requests: make(map[string]sessionshim.FenceRequest),
-		acked:    make(map[string]sessionshim.Fence),
+		id:            id,
+		issuedAt:      d.restartPreparationNow(),
+		state:         restartPreparationPreparing,
+		scopeIDs:      scopeIDs,
+		covered:       byOrg,
+		requests:      make(map[string]sessionshim.FenceRequest),
+		acked:         make(map[string]sessionshim.Fence),
+		authorityMode: d.restartPreparationAuthorityMode(),
 	}
 	d.shims.mu.Lock()
 	if existing := d.shims.restart; existing != nil && existing.state != restartPreparationAbandoned {
@@ -256,6 +283,105 @@ func (d *Daemon) acknowledgeRestartPreparationScope(ctx context.Context, prepara
 	return sessionshim.RequestFence(ctx, cfg.FenceStore, preparation.id, request.Fence.HostID, covered, policy, preparation.issuedAt)
 }
 
+func (d *Daemon) validatePreparedRestartPermission(preparation *restartPreparation, now time.Time) error {
+	if preparation == nil || len(preparation.scopeIDs) == 0 {
+		return errors.New("prepared authorization has no authority scopes")
+	}
+	if len(preparation.acked) != len(preparation.scopeIDs) {
+		return fmt.Errorf("prepared acknowledgement count is %d, want %d", len(preparation.acked), len(preparation.scopeIDs))
+	}
+	d.shims.mu.RLock()
+	currentFences := make(map[string]sessionshim.Fence, len(preparation.scopeIDs))
+	for _, orgID := range preparation.scopeIDs {
+		if fence, ok := d.shims.fences[orgID]; ok {
+			currentFences[orgID] = fence
+		}
+	}
+	d.shims.mu.RUnlock()
+	for _, orgID := range preparation.scopeIDs {
+		request, requestOK := preparation.requests[orgID]
+		ack, ackOK := preparation.acked[orgID]
+		current, currentOK := currentFences[orgID]
+		if !requestOK || !ackOK || !currentOK {
+			return fmt.Errorf("organization %q is missing frozen request or acknowledgement", orgID)
+		}
+		if ack.State != sessionshim.FenceHeld || current.State != sessionshim.FenceHeld {
+			return fmt.Errorf("organization %q fence state is no longer held", orgID)
+		}
+		if ack.HoldUntilUnixNano <= now.UnixNano() || current.HoldUntilUnixNano <= now.UnixNano() {
+			return fmt.Errorf("organization %q fence hold expired", orgID)
+		}
+		switch preparation.authorityMode {
+		case restartAuthorityExactStore:
+			expectedBytes, err := json.Marshal(request.Fence)
+			if err != nil || !bytes.Equal(expectedBytes, request.RequestBytes) {
+				return fmt.Errorf("organization %q frozen request bytes changed", orgID)
+			}
+			if !sameRestartFenceSemantic(ack, request.Fence) || !sameRestartFenceSemantic(current, ack) || current.DurableRevision != ack.DurableRevision {
+				return fmt.Errorf("organization %q exact acknowledgement changed after preparation", orgID)
+			}
+			if strings.TrimSpace(ack.DurableRevision) == "" || strings.TrimSpace(current.DurableRevision) == "" {
+				return fmt.Errorf("organization %q acknowledgement has no durable revision", orgID)
+			}
+		case restartAuthorityLegacyStore:
+			if ack.FenceID != request.Fence.FenceID || !sameFencedSessions(ack.Sessions, request.Fence.Sessions) ||
+				current.FenceID != ack.FenceID || !sameFencedSessions(current.Sessions, ack.Sessions) ||
+				current.DurableRevision != ack.DurableRevision {
+				return fmt.Errorf("organization %q legacy acknowledgement changed after preparation", orgID)
+			}
+		case restartAuthorityStandalone:
+			expectedBytes, err := json.Marshal(request.Fence)
+			if err != nil || !bytes.Equal(expectedBytes, request.RequestBytes) ||
+				!sameRestartFenceSemantic(ack, request.Fence) || !sameRestartFenceSemantic(current, ack) ||
+				ack.DurableRevision != "" || current.DurableRevision != "" {
+				return fmt.Errorf("organization %q standalone held intent changed after preparation", orgID)
+			}
+		default:
+			return fmt.Errorf("organization %q has unknown restart authority mode", orgID)
+		}
+	}
+	return nil
+}
+
+func sameRestartFenceSemantic(a, b sessionshim.Fence) bool {
+	return a.FenceID == b.FenceID && a.HostID == b.HostID &&
+		a.IssuedAtUnixNano == b.IssuedAtUnixNano && a.HoldUntilUnixNano == b.HoldUntilUnixNano &&
+		a.State == b.State && sameFencedSessions(a.Sessions, b.Sessions)
+}
+
+func (d *Daemon) restartPreparationAuthorityMode() restartPreparationAuthorityMode {
+	cfg := d.sessionShimConfig()
+	switch {
+	case cfg.ExactFenceStore != nil:
+		return restartAuthorityExactStore
+	case cfg.FenceStore != nil:
+		return restartAuthorityLegacyStore
+	default:
+		return restartAuthorityStandalone
+	}
+}
+
+func (d *Daemon) validateNotRequiredRestartPermission(preparation *restartPreparation) error {
+	if preparation == nil || len(preparation.scopeIDs) != 0 || len(preparation.acked) != 0 || len(preparation.requests) != 0 {
+		return errors.New("not-required authorization contains an authority scope")
+	}
+	covered := d.sessionShimFenceSnapshot()
+	if len(covered) != 0 {
+		return fmt.Errorf("not-required authorization no longer has an empty shim snapshot (%d correlations)", len(covered))
+	}
+	return d.verifyRestartRegistryCoverage(covered)
+}
+
+func (d *Daemon) restartPreparationNow() time.Time {
+	d.shims.mu.RLock()
+	now := d.shims.restartNow
+	d.shims.mu.RUnlock()
+	if now != nil {
+		return now()
+	}
+	return time.Now()
+}
+
 func restartPreparationResponse(preparation *restartPreparation) afclient.DaemonRestartPreflightResponse {
 	state := afclient.DaemonRestartPrepared
 	if preparation.state == restartPreparationNotRequired {
@@ -293,7 +419,7 @@ func (d *Daemon) persistRestartPreparation(preparation *restartPreparation, stat
 	record := restartPreparationAudit{
 		SchemaVersion: 1, Protocol: afclient.DaemonRestartPreflightProtocol,
 		PreparationID: preparation.id, State: state, ScopeCount: len(preparation.scopeIDs),
-		UpdatedAt: time.Now().UnixNano(),
+		UpdatedAt: d.restartPreparationNow().UnixNano(),
 	}
 	d.shims.mu.RLock()
 	write := d.shims.restartStateWriter
