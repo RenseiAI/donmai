@@ -8,6 +8,29 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.67.1 — 2026-08-22
+
+### Fixes
+
+- **Session-shim selection now happens before pre-spawn resource acquisition.**
+  Default-off and non-interactive sessions no longer invoke an embedder's
+  credential/resource hook once for the shim offer and again for the direct
+  fallback. A selected session with no launcher or no returned shim handle
+  fails closed instead of silently becoming a daemon-owned child. Custom
+  launchers retain their previous combined-decision behavior unless they opt
+  into the stable selector. (#374)
+- **Shim-owned sessions deliver an ordinary, exactly-once lifecycle.** A shim
+  launched by the daemon emits one start after controller publication and one
+  end only after the immutable shim exit observation, allowing existing
+  credential and session-detail cleanup listeners to release their resources.
+  Controller disconnect alone never fabricates a terminal event. (#374)
+- **Controller gaps stay capacity-visible until exact terminal proof.** An
+  unexpected controller-stream close moves the live shim into a deduplicated,
+  capacity-consuming quarantine. Only a group-reaped tombstone matching the
+  lifecycle identity, shim id, and process epoch removes that charge. The same
+  process-epoch correlation now rides quarantine/status/heartbeat and restart-
+  fence projections, and mismatched fence acknowledgements are refused. (#374)
+
 ## v0.67.0 — 2026-08-22
 
 ### Features
