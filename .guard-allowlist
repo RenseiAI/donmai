@@ -76,6 +76,32 @@ TRACKER_ID_SLUG :: ^runner/operational_payload_test\.go :: r[e]n-2034 :: qw\.Bra
 # after guard-b began scanning whole files. Each exemption is constrained to
 # the exact production assignment or its directly corresponding documentation
 # and assertions, so another hosted endpoint occurrence still fails.
-CLOSED_CLI_ENDPOINT :: ^internal/linear/client\.go :: /api/cl[i]/ :: (platform's /api/cl[i]/linear/graphql proxy where APIKey holds the|platform's /api/cl[i]/linear/graphql proxy under the caller's rsk_ token|BaseURL:[[:space:]]+base \+ "/api/cl[i]/linear/graphql")
+CLOSED_CLI_ENDPOINT :: ^internal/linear/client\.go :: /api/cl[i]/ :: (platform's /api/cl[i]/linear/graphql proxy where APIKey holds the|platform's /api/cl[i]/linear/graphql proxy under the caller's rsk_ token|BaseURL:[[:space:]]+origin \+ "/api/cl[i]/linear/graphql")
 CLOSED_CLI_ENDPOINT :: ^internal/linear/client_test\.go :: /api/cl[i]/ :: c\.BaseURL != "https://platform\.example\.com/api/cl[i]/linear/graphql"
 CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/linear_test\.go :: /api/cl[i]/ :: (subcommand routes its GraphQL through `/api/cl[i]/linear/graphql`|subcommand proxies GraphQL through /api/cl[i]/linear/graphql|gotPath != "/api/cl[i]/linear/graphql"|t\.Errorf\("path = %q, want %q", gotPath, "/api/cl[i]/linear/graphql"\))
+
+# afcli/linearcmd/linear.go: the auth-strategy header and the Path-1.5 comment
+# name the concrete hosted GraphQL proxy suffix frozen by the accepted OSS CLI
+# proxy contract — the same suffix already curated for internal/linear (above),
+# documented here at the resolution site that chooses it. Pre-existing and
+# unrelated to the change that first staged this file (an actionable
+# malformed-origin error added at the two NewProxiedClient call sites);
+# --staged scans the whole file, not just the diff. Rewriting the comments to
+# omit the real route would make the documentation false. Scoped to the three
+# exact pre-existing lines so a NEW unscoped hit still fails.
+CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/linear\.go :: /api/cl[i]/ :: (platform URL; proxy GraphQL through /api/cl[i]/linear/graphql under that|token\), GraphQL is proxied through the platform's /api/cl[i]/linear/graphql|// /api/cl[i]/linear/graphql proxy accepts this JWT as an additive auth)
+
+# internal/credentials/*: the canonical agent-env blocklist is a cross-repo
+# contract, and its package doc, generator note and drift-canary assertions
+# name the closed downstream repo that renders the matching baseline plus the
+# file inside it that must move in lock-step. That naming IS the sync
+# obligation — the whole point of the pinned shared digest is that a reader
+# knows which other repo to update, so replacing the name with prose would
+# make the contract unenforceable by a human. All pre-existing and unrelated
+# to the change that first staged these files (adding one reserved name to the
+# list, plus its regenerated artifact and pinned digest); --staged scans the
+# whole file, not just the diff. Scoped to the exact pre-existing lines so a
+# NEW unscoped hit still fails.
+CLOSED_TUI_REPO :: ^internal/credentials/blocklist\.go :: rens[e]i-tui :: (- rens[e]i-tui renders a Go baseline from the same var|normalization as rens[e]i-tui, so all three repos tie to one hash)
+CLOSED_TUI_REPO :: ^internal/credentials/blocklist_json_test\.go :: rens[e]i-tui :: (// rens[e]i-tui's generated baseline \(daemon/credentials/generated_blocklist\.go,|this constant is updated deliberately in the same commit — and rens[e]i-tui's|update this constant AND expect rens[e]i-tui/platform freshness checks)
+CLOSED_TUI_REPO :: ^internal/credentials/blocklist_test\.go :: rens[e]i-tui :: (// rens[e]i-tui's daemon/credentials/socket\.go hardcodes the same list and|AgentEnvBlocklist drifted \(sync with rens[e]i-tui daemon/credentials/socket\.go\))

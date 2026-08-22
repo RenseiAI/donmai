@@ -36,9 +36,21 @@ func TestNew_BinaryMissingReturnsProviderUnavailable(t *testing.T) {
 	}
 }
 
-func TestNew_HandshakeFailureReturnsProviderUnavailable(t *testing.T) {
-	// Build pipes where the "server" never responds. New() should
-	// time out on initialize and return ErrProviderUnavailable.
+// startTestProvider starts the app-server New now defers, for tests that drive
+// provider internals (client RPCs, MCP leases) instead of going through
+// Spawn/Resume. The deferral itself is covered by the Spawn-boundary tests.
+func startTestProvider(t *testing.T, p *Provider) {
+	t.Helper()
+	if err := p.ensureStarted(); err != nil {
+		t.Fatalf("ensureStarted: %v", err)
+	}
+}
+
+func TestSpawn_HandshakeFailureReturnsProviderUnavailable(t *testing.T) {
+	// Build pipes where the "server" never responds. New() no longer starts
+	// the app-server, so the first Spawn is where the initialize handshake
+	// times out — and it must still surface ErrProviderUnavailable (wrapped by
+	// ErrSpawnFailed) and leave no config boundary behind.
 	stdinR, stdinW := io.Pipe()
 	stdoutR, stdoutW := io.Pipe()
 	t.Cleanup(func() {
@@ -49,18 +61,25 @@ func TestNew_HandshakeFailureReturnsProviderUnavailable(t *testing.T) {
 	go func() { _, _ = io.Copy(io.Discard, stdinR) }()
 
 	tempRoot := t.TempDir()
-	_, err := New(Options{
+	p, err := New(Options{
 		skipProcess:      true,
 		stdinOverride:    stdinW,
 		stdoutOverride:   stdoutR,
 		HandshakeTimeout: 200 * time.Millisecond,
 		configTempDir:    tempRoot,
 	})
+	if err != nil {
+		t.Fatalf("New must defer the handshake, got %v", err)
+	}
+	_, err = p.Spawn(t.Context(), agent.Spec{Prompt: "x", Cwd: t.TempDir()})
 	if err == nil {
 		t.Fatalf("expected handshake error, got nil")
 	}
 	if !errors.Is(err, agent.ErrProviderUnavailable) {
 		t.Fatalf("expected ErrProviderUnavailable, got %v", err)
+	}
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("expected ErrSpawnFailed, got %v", err)
 	}
 	entries, readErr := os.ReadDir(tempRoot)
 	if readErr != nil {
@@ -686,6 +705,7 @@ func TestListActiveMCPServers_PaginatesReadyInventory(t *testing.T) {
 		_ = p.Shutdown(context.Background())
 		fs.close()
 	})
+	startTestProvider(t, p)
 	active, err := p.listActiveMCPServers(t.Context())
 	if err != nil {
 		t.Fatalf("listActiveMCPServers: %v", err)
@@ -876,6 +896,7 @@ func TestLiveCodex_IsolatedConfigReadWriteClearAndAmbientDigestUnchanged(t *test
 	if err != nil {
 		t.Fatalf("New(real isolated app-server): %v", err)
 	}
+	startTestProvider(t, p)
 	ownedHome := p.config.home
 	ownedConfig := p.config.configPath
 	if sameResolvedPath(ownedHome, ambientHome) {
@@ -1068,6 +1089,7 @@ func TestHandle_AppServerCrashReportsConfigDestructionFailure(t *testing.T) {
 		fs.close()
 		t.Fatalf("New: %v", err)
 	}
+	startTestProvider(t, p)
 	client := p.client
 	t.Cleanup(func() {
 		client.Stop(errors.New("test complete"))

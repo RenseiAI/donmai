@@ -13,4 +13,10 @@ var (
 	ErrServerError    = errors.New("server error")
 	ErrGraphQLError   = errors.New("graphql error")
 	ErrMutationFailed = errors.New("mutation failed")
+
+	// ErrInvalidPlatformURL marks a proxied-client origin that is not a bare,
+	// credential-free HTTP(S) origin. It fails the constructor, so no request
+	// is ever issued against a malformed or credential-bearing base URL.
+	// Errors wrapping it never quote the offending value.
+	ErrInvalidPlatformURL = errors.New("invalid platform base URL")
 )

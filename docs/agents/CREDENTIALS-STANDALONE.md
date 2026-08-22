@@ -24,6 +24,13 @@ same list on their side; the copies stay in sync manually until the module
 boundary permits a shared import — treat any blocklist edit as a cross-repo
 change and say so in your report.
 
+The list also carries *reservations*: names a credential source must not author
+because some other layer owns them. `DONMAI_API_URL` is one — the runner
+composes the canonical platform origin per session from that session's own
+queued work and delivers it on `agent.Spec.Env`. A snapshot-supplied copy has
+no session context to be right with, and a stale or malformed org-wide entry
+silently redirects every proxied CLI read in the box.
+
 Operators can pin the mode via `donmai host run --standalone-creds=<on|off|auto>`.
 Default `auto` selects `on` when `DONMAI_DAEMON_JWT` is unset (donmai is NOT
 being driven by an external credential socket) and `off` otherwise.

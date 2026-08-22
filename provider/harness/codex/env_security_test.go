@@ -17,6 +17,13 @@ func TestMergeEnv_StripsRunnerOnlyAttachControls(t *testing.T) {
 		"ATTACH_URL":        "wss://override.invalid/v1/rooms/room-1",
 		"CODEX_HOME":        "/untrusted/override",
 		"SAFE":              "kept",
+	}, map[string]string{
+		// The per-session layer is equally untrusted for runner-only controls:
+		// a Spec.Env entry must not smuggle an attach credential into the child.
+		"ATTACH_TOKEN": "session-secret",
+		"ATTACH_URL":   "wss://session.invalid/v1/rooms/room-2",
+		"CODEX_HOME":   "/session/override",
+		"SESSION_SAFE": "kept",
 	}, ownedHome)
 	joined := strings.Join(got, "\n")
 	if strings.Contains(joined, "ATTACH_") {
@@ -24,6 +31,9 @@ func TestMergeEnv_StripsRunnerOnlyAttachControls(t *testing.T) {
 	}
 	if !strings.Contains(joined, "SAFE=kept") {
 		t.Fatalf("safe override missing from codex environment: %v", got)
+	}
+	if !strings.Contains(joined, "SESSION_SAFE=kept") {
+		t.Fatalf("safe per-session entry missing from codex environment: %v", got)
 	}
 	var codexHomes []string
 	for _, entry := range got {

@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1822,9 +1823,13 @@ func TestLinearListUnblockedBacklogFailsClosedOnTruncatedRelationPage(t *testing
 // subcommand routes its GraphQL through `/api/cli/linear/graphql` with a
 // `Bearer <rsk_*>` auth header.
 func TestLinearProxyModeViaDataSource(t *testing.T) {
-	// No env vars — force the proxy path.
+	// No env vars — force the proxy path. WORKER_AUTH_TOKEN is cleared too:
+	// path 1.5 (in-box worker JWT) sits AHEAD of the DataSource path, so an
+	// ambient token on the developer's shell would silently route this
+	// assertion through the wrong tier.
 	t.Setenv("LINEAR_API_KEY", "")
 	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	t.Setenv("WORKER_AUTH_TOKEN", "")
 	setTestBaseURL("")
 	t.Cleanup(func() { setTestBaseURL("") })
 
@@ -1904,6 +1909,54 @@ func TestLinearWorkerAuthTokenProxyMode(t *testing.T) {
 	}
 }
 
+// TestLinearWorkerAuthTokenRejectsMalformedBaseURL is the fail-closed half of
+// the in-box tier: when the box was provisioned with a malformed platform
+// origin (here a trailing delimiter, the shape that broke a live headless
+// dispatch), the command must fail BEFORE any HTTP with an actionable,
+// value-free configuration error — not fail late and opaquely inside GraphQL.
+func TestLinearWorkerAuthTokenRejectsMalformedBaseURL(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "")
+	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	setTestBaseURL("")
+	t.Cleanup(func() { setTestBaseURL("") })
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ3b3JrZXIifQ.sig"
+	malformed := srv.URL + ";"
+	t.Setenv("WORKER_AUTH_TOKEN", jwt)
+	t.Setenv("DONMAI_API_URL", malformed)
+
+	root := New(nil, "donmai")
+	root.SilenceErrors = true
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	root.SetArgs([]string{"get-issue", "ENG-1"})
+	err := root.Execute()
+	if err == nil {
+		t.Fatalf("expected a configuration error for a malformed platform origin, got nil\nout: %s", buf.String())
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("malformed platform origin produced %d HTTP request(s); want 0", hits.Load())
+	}
+	message := err.Error()
+	if !strings.Contains(message, "DONMAI_API_URL") {
+		t.Errorf("error should name the env var that supplied the origin, got: %v", err)
+	}
+	if !strings.Contains(message, "trailing delimiter") {
+		t.Errorf("error should be actionable about the required origin shape, got: %v", err)
+	}
+	if strings.Contains(message, malformed) || strings.Contains(message, jwt) {
+		t.Errorf("error leaked the rejected origin or the worker token: %v", err)
+	}
+}
+
 // TestLinearWorkerAuthTokenRequiresBaseURL pins that WORKER_AUTH_TOKEN alone
 // (no DONMAI_API_URL / AGENTFACTORY_API_URL) does NOT activate the in-box tier
 // — it falls through to the no-credentials error rather than building a client
@@ -1964,9 +2017,11 @@ func TestLinearEnvWinsOverDataSource(t *testing.T) {
 }
 
 func TestLinearNoAPIKey(t *testing.T) {
-	// Remove both key env vars.
+	// Remove both key env vars, plus the in-box worker credentials that
+	// activate path 1.5 ahead of the no-credentials error.
 	t.Setenv("LINEAR_API_KEY", "")
 	t.Setenv("LINEAR_ACCESS_TOKEN", "")
+	t.Setenv("WORKER_AUTH_TOKEN", "")
 
 	// Ensure setTestBaseURL is also reset so no client gets built.
 	setTestBaseURL("")

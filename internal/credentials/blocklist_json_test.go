@@ -41,7 +41,7 @@ func TestBlocklistJSONParity(t *testing.T) {
 // blocklist-freshness CI (which regenerates from this repo) will require the
 // matching update there.
 func TestBlocklistDigestMatchesRenseiTUI(t *testing.T) {
-	const sharedDigest = "43a6ca3658b7ded046e4e50b8b79cd4bb55c20d6d395afe50181a6c9328abf44"
+	const sharedDigest = "0c086394c97af8dd762d4819e1bae126e25a8c03d90dc81bd38f2d97bc888498"
 	if got := BlocklistDigest(AgentEnvBlocklist); got != sharedDigest {
 		t.Errorf("canonical digest = %q; the pinned cross-repo shared digest = %q.\n"+
 			"AgentEnvBlocklist changed: update this constant AND expect rensei-tui/platform freshness checks to require their regenerated copies.",
