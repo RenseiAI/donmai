@@ -15,7 +15,7 @@ import (
 // to this value, so anything richer than an origin — userinfo, a path, a query,
 // a fragment, or a trailing delimiter — either redirects the request or smuggles
 // material into the composed URL. A production incident reached this code as
-// `https://agent.rensei.dev;`: an injected origin whose trailing delimiter made
+// `https://agent.example.com;`: an injected origin whose trailing delimiter made
 // every proxied read fail late and opaquely. Validation happens in the
 // constructor so a malformed origin fails closed BEFORE any HTTP is attempted
 // and before an Authorization header is ever built.

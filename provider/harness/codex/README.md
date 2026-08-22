@@ -54,6 +54,19 @@ Layer 3 is why the start is lazy: composing it at construction time is
 impossible, and an eagerly-started app-server would pin every session it
 serves to the ambient values of the process that built the registry.
 
+Because layer 3 is applied exactly once, one Provider serves exactly one
+session's environment. The layer applied at start is pinned, and a later
+`Spawn`/`Resume` whose `Spec.Env` materially differs — any key added,
+removed, or changed — is refused rather than silently handed the first
+session's `DONMAI_SESSION_ID` and `DONMAI_API_URL`. The refusal names the
+diverging keys and never quotes a value, because this is the layer the
+runner puts `WORKER_AUTH_TOKEN` and `GH_TOKEN` in. An identical layer is
+always accepted, so a session resuming its own thread is unaffected, and
+the interactive PTY spawn mode runs its own process and is outside the
+invariant entirely. `donmai agent run` builds one Provider per session,
+so this is a fail-closed guard for embedders that pool Providers, not a
+constraint on normal operation.
+
 ## Capability matrix (F.1.1 §3.2 lock)
 
 | Capability                              | v0.5.0 |

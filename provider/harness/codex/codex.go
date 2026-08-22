@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +42,15 @@ type Provider struct {
 	startMu      sync.Mutex
 	startErr     error
 	started      bool
+
+	// pinnedSessionEnv is the per-session environment layer that was frozen
+	// into the app-server child at start, and sessionEnvPinned records that a
+	// start happened at all (a nil layer is a real, distinct value: it means
+	// the child carries NO session layer). Both are guarded by startMu and
+	// exist so a later Spawn/Resume can be checked against what the running
+	// child actually received — see checkSessionEnvLocked.
+	pinnedSessionEnv map[string]string
+	sessionEnvPinned bool
 
 	// mcpMu serializes app-server-global config changes. mcpUsers counts
 	// live handles holding the current config digest: equal configs may share
@@ -192,6 +204,11 @@ func (p *Provider) ensureStarted() error {
 // by every session this Provider serves, so only the FIRST start applies an
 // overlay — the runner composes one canonical value per box, and a Provider is
 // never reused across boxes.
+//
+// That last sentence is an invariant, not a hope: a successful start PINS the
+// layer it applied, and ensureHeadlessReady refuses a later Spawn/Resume whose
+// layer materially differs rather than silently serving it the first session's
+// DONMAI_SESSION_ID and DONMAI_API_URL. See checkSessionEnvLocked.
 func (p *Provider) startLocked(sessionEnv map[string]string) error {
 	if p.startErr != nil {
 		return p.startErr
@@ -279,6 +296,12 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		return p.failStartLocked(fmt.Errorf("%w: codex initialized notification: %v", agent.ErrProviderUnavailable, err))
 	}
 	p.started = true
+	// Freeze the layer the child actually received. maps.Clone defends against
+	// a caller mutating its own Spec.Env map after the Spawn returns, which
+	// would otherwise make a later divergence check compare against a value the
+	// child never saw. A nil layer clones to nil and stays a distinct pin.
+	p.pinnedSessionEnv = maps.Clone(sessionEnv)
+	p.sessionEnvPinned = true
 	return nil
 }
 
@@ -428,6 +451,10 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 // child is started (startLocked). Callers MUST pass the prepared spec — the
 // overlay is the only thing that keeps an ambient DONMAI_API_URL from
 // outranking the runner's canonical platform origin inside the agent.
+//
+// The overlay only applies at start, so this is also where the one-session
+// invariant is enforced: a divergent later layer is refused BEFORE the host
+// auth link and before startLocked, so a denied spawn leaves no side effect.
 func (p *Provider) ensureHeadlessReady(spec agent.Spec) error {
 	p.startMu.Lock()
 	defer p.startMu.Unlock()
@@ -435,6 +462,9 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) error {
 	case <-p.shutdown:
 		return fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
 	default:
+	}
+	if err := p.checkSessionEnvLocked(spec.Env); err != nil {
+		return err
 	}
 	if p.hostAuthFile != "" {
 		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
@@ -846,6 +876,64 @@ func resolveCodexBinary(bin string) (string, error) {
 //  4. the Provider's owned CODEX_HOME, which no caller may override.
 func mergeEnv(extra, session map[string]string, codexHome string) []string {
 	return runtimeenv.ComposeChildEnv(os.Environ(), extra, session, map[string]string{"CODEX_HOME": codexHome})
+}
+
+// errSessionEnvConflict marks a headless Spawn/Resume whose per-session
+// environment layer materially differs from the layer already frozen into the
+// running app-server child.
+//
+// Layer 3 of mergeEnv is applied exactly once, at process start. Serving a
+// second, differently-composed session from the same child would hand it the
+// FIRST session's DONMAI_SESSION_ID and DONMAI_API_URL while every log line and
+// receipt claimed otherwise — a silent misroute, which is the same class of bug
+// as the ambient origin this provider now overlays away. One codex Provider is
+// built per `donmai agent run` process (afcli/agent_run.go), so in production
+// this never fires; it exists so an embedder that pools Providers across
+// sessions gets a loud failure instead of a wrong answer.
+var errSessionEnvConflict = errors.New("codex app-server is already bound to a different session environment")
+
+// checkSessionEnvLocked refuses a session whose environment layer the running
+// app-server child cannot actually be carrying. startMu must be held.
+//
+// Before any start there is nothing to conflict with, so the first caller
+// always passes and its layer becomes the pin. Equal layers pass forever after,
+// which is what keeps same-session Resume working: the runner recomposes an
+// identical Spec.Env from the same QueuedWork.
+func (p *Provider) checkSessionEnvLocked(sessionEnv map[string]string) error {
+	if !p.sessionEnvPinned {
+		return nil
+	}
+	diverged := divergentSessionEnvKeys(p.pinnedSessionEnv, sessionEnv)
+	if len(diverged) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %w: %s", agent.ErrSpawnFailed, errSessionEnvConflict, strings.Join(diverged, ", "))
+}
+
+// divergentSessionEnvKeys returns the sorted names of the keys that are added,
+// removed, or changed between the pinned layer and want. A nil and an empty map
+// are the same layer — both mean "no session env" — so a provider started
+// without one is not spuriously in conflict with a spec that carries an empty
+// map.
+//
+// It returns NAMES ONLY, never values. The caller renders these into an error
+// that reaches stderr, structured logs and session records, and this layer is
+// exactly where the runner puts WORKER_AUTH_TOKEN and GH_TOKEN. Naming the keys
+// is what makes the failure actionable; quoting them would make it a leak.
+func divergentSessionEnvKeys(pinned, want map[string]string) []string {
+	var keys []string
+	for key, pinnedValue := range pinned {
+		if wantValue, ok := want[key]; !ok || wantValue != pinnedValue {
+			keys = append(keys, key)
+		}
+	}
+	for key := range want {
+		if _, ok := pinned[key]; !ok {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func drainStderr(r io.ReadCloser) {

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -211,5 +213,215 @@ func TestResumeOverlaysSessionEnvOntoAppServerChild(t *testing.T) {
 	observed := readCodexEnvDump(t, dump)
 	if got := observed["DONMAI_API_URL"]; !reflect.DeepEqual(got, []string{codexCanonicalAPIURL}) {
 		t.Fatalf("resumed app-server child DONMAI_API_URL = %v, want exactly [%s]", got, codexCanonicalAPIURL)
+	}
+}
+
+// codexSecondSessionEnv is the layer a DIFFERENT session would compose in the
+// same box: a distinct session id, a distinct platform origin, and a bearer.
+// The bearer is present so the fail-closed test can prove the rejection names
+// keys without quoting any value it was handed.
+var codexSecondSessionEnv = map[string]string{
+	"DONMAI_API_URL":    "https://other-platform.example.com",
+	"DONMAI_SESSION_ID": "session-number-two",
+	"WORKER_AUTH_TOKEN": "rsk_second_session_bearer_do_not_echo",
+}
+
+// codexFirstSessionEnv is the layer the started app-server child is pinned to
+// by the Spawn in codexStartedProvider.
+var codexFirstSessionEnv = map[string]string{
+	"DONMAI_API_URL":    codexCanonicalAPIURL,
+	"DONMAI_SESSION_ID": "session-env-overlay",
+}
+
+// codexStartedProvider brings the deferred app-server up through a real
+// headless Spawn, so the returned Provider is pinned to codexFirstSessionEnv
+// exactly the way production pins it.
+func codexStartedProvider(t *testing.T) (*Provider, string) {
+	t.Helper()
+	p, dump := codexEnvProbe(t)
+	h, err := p.Spawn(t.Context(), agent.Spec{
+		Prompt: "first session",
+		Cwd:    t.TempDir(),
+		Env:    maps.Clone(codexFirstSessionEnv),
+	})
+	if err != nil {
+		t.Fatalf("first Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	return p, dump
+}
+
+// assertSessionEnvConflict pins the shape of the refusal: it is a spawn
+// failure, it is the session-env conflict specifically, it names the diverging
+// keys, and it quotes NO value from either layer.
+func assertSessionEnvConflict(t *testing.T, err error, wantKeys []string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("divergent session env was accepted, want a fail-closed error")
+	}
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("error %v does not wrap agent.ErrSpawnFailed", err)
+	}
+	if !errors.Is(err, errSessionEnvConflict) {
+		t.Fatalf("error %v does not wrap errSessionEnvConflict", err)
+	}
+	message := err.Error()
+	for _, key := range wantKeys {
+		if !strings.Contains(message, key) {
+			t.Fatalf("error %q does not name the diverging key %q", message, key)
+		}
+	}
+	for _, layer := range []map[string]string{codexFirstSessionEnv, codexSecondSessionEnv} {
+		for key, value := range layer {
+			if strings.Contains(message, value) {
+				t.Fatalf("error leaked the value of %s: %q", key, message)
+			}
+		}
+	}
+}
+
+// TestSpawnRefusesDivergentSessionEnvOnStartedAppServer pins the one-session
+// invariant the overlay depends on. mergeEnv's session layer is applied exactly
+// once, at process start, so a second session served by the same child would
+// silently run against the FIRST session's DONMAI_SESSION_ID and
+// DONMAI_API_URL. That must fail closed, not succeed with the wrong routing.
+//
+// RED proof: drop the checkSessionEnvLocked call from ensureHeadlessReady and
+// the second Spawn succeeds while the child's dump still reports session one's
+// values — exactly the silent misroute this refuses.
+func TestSpawnRefusesDivergentSessionEnvOnStartedAppServer(t *testing.T) {
+	p, dump := codexStartedProvider(t)
+
+	_, err := p.Spawn(t.Context(), agent.Spec{
+		Prompt: "second session",
+		Cwd:    t.TempDir(),
+		Env:    maps.Clone(codexSecondSessionEnv),
+	})
+	assertSessionEnvConflict(t, err, []string{"DONMAI_API_URL", "DONMAI_SESSION_ID", "WORKER_AUTH_TOKEN"})
+
+	// The refusal is what keeps the claim honest: the child is still the first
+	// session's child, and nothing about the second session reached it.
+	observed := readCodexEnvDump(t, dump)
+	if got := observed["DONMAI_SESSION_ID"]; !reflect.DeepEqual(got, []string{codexFirstSessionEnv["DONMAI_SESSION_ID"]}) {
+		t.Fatalf("app-server child DONMAI_SESSION_ID = %v, want the first session's id", got)
+	}
+}
+
+// TestResumeRefusesDivergentSessionEnvOnStartedAppServer pins the same refusal
+// on the resume entry point, which shares ensureHeadlessReady with Spawn.
+func TestResumeRefusesDivergentSessionEnvOnStartedAppServer(t *testing.T) {
+	p, _ := codexStartedProvider(t)
+
+	_, err := p.Resume(t.Context(), codexFakeAppServerThreadID, agent.Spec{
+		Prompt: "second session resume",
+		Cwd:    t.TempDir(),
+		Env:    maps.Clone(codexSecondSessionEnv),
+	})
+	assertSessionEnvConflict(t, err, []string{"DONMAI_API_URL", "DONMAI_SESSION_ID", "WORKER_AUTH_TOKEN"})
+}
+
+// TestResumeAcceptsIdenticalSessionEnv is the other half of the invariant: the
+// check must not break the case it exists to protect. A session reattaching to
+// its own thread recomposes an identical Spec.Env from the same QueuedWork, and
+// that layer IS what the child carries, so it is served.
+func TestResumeAcceptsIdenticalSessionEnv(t *testing.T) {
+	p, _ := codexStartedProvider(t)
+
+	h, err := p.Resume(t.Context(), codexFakeAppServerThreadID, agent.Spec{
+		Prompt: "same session resume",
+		Cwd:    t.TempDir(),
+		Env:    maps.Clone(codexFirstSessionEnv),
+	})
+	if err != nil {
+		t.Fatalf("Resume with the pinned session env: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+}
+
+// TestInteractiveSpawnIsOutsideTheSessionEnvInvariant pins the scope boundary.
+// The interactive spawn mode runs its own codex process under a PTY and never
+// touches the shared app-server, so the one-child invariant does not apply to
+// it and must not reject it. The spec below fails at the interactive path's own
+// first gate (duplicate MCP server names) — which is the point: it got there,
+// rather than being turned away by the headless env check.
+func TestInteractiveSpawnIsOutsideTheSessionEnvInvariant(t *testing.T) {
+	p, _ := codexStartedProvider(t)
+	if !p.Manifest().Caps.SupportsInteractivePTY {
+		t.Skip("codex no longer declares PTY transport; the interactive branch is unreachable")
+	}
+
+	_, err := p.Spawn(t.Context(), agent.Spec{
+		Prompt:      "interactive session",
+		Cwd:         t.TempDir(),
+		Env:         maps.Clone(codexSecondSessionEnv),
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+		MCPServers: []agent.MCPServerConfig{
+			{Name: "dupe", Type: "stdio", Command: "/bin/true"},
+			{Name: "dupe", Type: "stdio", Command: "/bin/true"},
+		},
+	})
+	if err == nil {
+		t.Fatal("duplicate MCP server names should have failed the interactive spawn")
+	}
+	if errors.Is(err, errSessionEnvConflict) {
+		t.Fatalf("interactive spawn was rejected by the headless session-env invariant: %v", err)
+	}
+}
+
+// TestDivergentSessionEnvKeys covers the comparison itself, including the two
+// shapes the integration tests cannot reach cheaply: a key present in only one
+// layer, and the nil/empty equivalence that keeps a Provider started without a
+// session layer from conflicting with a spec carrying an empty map.
+func TestDivergentSessionEnvKeys(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name          string
+		pinned, want  map[string]string
+		wantDivergent []string
+	}{
+		{name: "both nil", pinned: nil, want: nil},
+		{name: "nil and empty are the same layer", pinned: nil, want: map[string]string{}},
+		{name: "empty and nil are the same layer", pinned: map[string]string{}, want: nil},
+		{
+			name:   "identical layers",
+			pinned: map[string]string{"DONMAI_API_URL": "https://platform.example.com", "DONMAI_SESSION_ID": "s1"},
+			want:   map[string]string{"DONMAI_API_URL": "https://platform.example.com", "DONMAI_SESSION_ID": "s1"},
+		},
+		{
+			name:          "changed value",
+			pinned:        map[string]string{"DONMAI_API_URL": "https://platform.example.com"},
+			want:          map[string]string{"DONMAI_API_URL": "https://other-platform.example.com"},
+			wantDivergent: []string{"DONMAI_API_URL"},
+		},
+		{
+			name:          "key added by the later session",
+			pinned:        map[string]string{"DONMAI_SESSION_ID": "s1"},
+			want:          map[string]string{"DONMAI_SESSION_ID": "s1", "GH_TOKEN": "gh_second"},
+			wantDivergent: []string{"GH_TOKEN"},
+		},
+		{
+			name:          "key dropped by the later session",
+			pinned:        map[string]string{"DONMAI_SESSION_ID": "s1", "GH_TOKEN": "gh_first"},
+			want:          map[string]string{"DONMAI_SESSION_ID": "s1"},
+			wantDivergent: []string{"GH_TOKEN"},
+		},
+		{
+			name:          "reported sorted, added and changed together",
+			pinned:        map[string]string{"DONMAI_SESSION_ID": "s1", "ZED": "z"},
+			want:          map[string]string{"DONMAI_SESSION_ID": "s2", "ALPHA": "a", "ZED": "z"},
+			wantDivergent: []string{"ALPHA", "DONMAI_SESSION_ID"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := divergentSessionEnvKeys(tc.pinned, tc.want)
+			if len(got) == 0 && len(tc.wantDivergent) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, tc.wantDivergent) {
+				t.Fatalf("divergentSessionEnvKeys = %v, want %v", got, tc.wantDivergent)
+			}
+		})
 	}
 }

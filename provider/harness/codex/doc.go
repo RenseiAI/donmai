@@ -25,7 +25,11 @@
 // initialize handshake are deferred to the first headless Spawn/Resume so
 // the child environment can be composed from that session's Spec.Env; a
 // handshake failure there wraps agent.ErrProviderUnavailable in
-// agent.ErrSpawnFailed.
+// agent.ErrSpawnFailed. That session layer is applied exactly once, so the
+// Provider pins it and refuses a later Spawn/Resume whose Spec.Env
+// materially differs instead of serving it the first session's routing
+// values; an identical layer (a session resuming its own thread) is always
+// accepted, and the interactive PTY spawn mode is outside the invariant.
 //
 // # Capability matrix (locked in F.1.1 §3.2)
 //

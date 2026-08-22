@@ -43,10 +43,10 @@ func TestCanonicalProxyOrigin_RejectsMalformedOrigins(t *testing.T) {
 		{"whitespace only", "   "},
 		{"embedded space", "https://agent.example.com /x"},
 		{"crlf injection", "https://agent.example.com\r\nHost: evil.example.net"},
-		{"embedded tab", "https://agent\t.rensei.dev"},
+		{"embedded tab", "https://agent\t.example.com"},
 		{"port out of range", "https://agent.example.com:70000"},
 		{"non numeric port", "https://agent.example.com:https"},
-		{"empty label", "https://agent..rensei.dev"},
+		{"empty label", "https://agent..example.com"},
 		{"leading hyphen label", "https://-agent.example.com"},
 		{"no host", "https://"},
 	}
