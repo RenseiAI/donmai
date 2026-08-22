@@ -8,6 +8,26 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.67.0 — 2026-08-22
+
+### Features
+
+- **Per-session shim ownership and restart adoption foundation.** Interactive
+  sessions can be owned by a separate, versioned `session-shim-v1` process
+  while the daemon acts as a generation-fenced controller. The foundation
+  includes the bounded secret-free registry, adoption/quarantine accounting,
+  replay-gap honesty, terminal tombstones, orphan bounds, restart-fence seam,
+  daemon/worker production wiring, and post-adoption stop/input/resize/output
+  paths. Adoption and ownership remain default-off until the installed-service
+  restart smoke and composing-plane fence integration pass. (#372)
+- **Ref-bearing runs provision the requested existing branch.** A queued base
+  `Ref` is validated and checked out directly; the runner scopes `GH_TOKEN` to
+  ref-bearing runs and skips creating a duplicate pull request, allowing an
+  autonomous repair session to add commits to an existing review branch. (#368)
+- **Heartbeat load averages.** Daemon host telemetry now reports the one-,
+  five-, and fifteen-minute load averages alongside existing CPU and memory
+  samples. (#369)
+
 ### Fixes
 
 - **An ambient `DONMAI_API_URL` can no longer outrank the runner's canonical
@@ -20,6 +40,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   explicit layer above the inherited parent. `DONMAI_API_URL` is additionally
   reserved on the canonical agent-env blocklist, so a credential snapshot can
   never author the platform origin. (#370)
+
+### Chores
+
+- **Keep `session-root-v1` dormant until the full protocol is negotiated.** A
+  runner-level V16 control now prevents legacy work items from activating the
+  session-owned multi-repository layout before producer/executor negotiation,
+  the durable declaration record, refusal semantics, and enforceable read-only
+  authority exist. (#371)
 
 ### Operator-visible behaviour changes
 
