@@ -336,16 +336,10 @@ When a session appears wedged in the dashboard:
    platform's view (already terminal) usually indicates a missed
    `result.Post` — re-run `af host stats` to see whether the
    poller has retried.
-6. **Workarea state** — a session owns
-   `~/.rensei/worktrees/<sessionId>/`, which holds the selected
-   repository worktree at `<repo-leaf>/` (the agent CWD, published as
-   `worktreePath`) plus any read-only context repositories as sibling
-   leaves. `<repo-leaf>/.agent/` contains the per-session `state.json`
-   snapshot and the `events.jsonl` audit log. Look here when the agent
-   emitted no visible output but the session is marked failed. A
-   workarea retained from an older release may still be flat — the
-   repository clone directly at `<sessionId>/` — in which case
-   `.agent/` sits one level up.
+6. **Worktree state** — `~/.rensei/worktrees/<sessionId>/.agent/`
+   contains the per-session `state.json` snapshot and the
+   `events.jsonl` audit log. Look here when the agent emitted no
+   visible output but the session is marked failed.
 
 ## Failure modes the daemon classifies (high-level)
 

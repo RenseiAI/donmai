@@ -105,25 +105,3 @@ CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/linear\.go :: /api/cl[i]/ :: (platform U
 CLOSED_TUI_REPO :: ^internal/credentials/blocklist\.go :: rens[e]i-tui :: (- rens[e]i-tui renders a Go baseline from the same var|normalization as rens[e]i-tui, so all three repos tie to one hash)
 CLOSED_TUI_REPO :: ^internal/credentials/blocklist_json_test\.go :: rens[e]i-tui :: (// rens[e]i-tui's generated baseline \(daemon/credentials/generated_blocklist\.go,|this constant is updated deliberately in the same commit — and rens[e]i-tui's|update this constant AND expect rens[e]i-tui/platform freshness checks)
 CLOSED_TUI_REPO :: ^internal/credentials/blocklist_test\.go :: rens[e]i-tui :: (// rens[e]i-tui's daemon/credentials/socket\.go hardcodes the same list and|AgentEnvBlocklist drifted \(sync with rens[e]i-tui daemon/credentials/socket\.go\))
-
-# runner/loop.go: three doc comments name the tracker issue whose contract the
-# ref-bearing-provision branch, its gh-pr-create skip and its GH_TOKEN
-# exposure all implement — pre-existing and unrelated to the change that first
-# staged this file's other edits (the session-owned workarea layout threaded
-# through the provisioning step); --staged scans the whole file, not just the
-# diff. The three comments explain WHY three separate code paths must stay
-# coupled, so dropping the shared marker that ties them together would make
-# the coupling invisible to the next reader. Scoped to the three exact
-# pre-existing lines so a NEW unscoped hit still fails.
-TRACKER_ID :: ^runner/loop\.go :: R[E]N-2628 :: (R[E]N-2628 amend-existing-PR: when dispatch carries a base Ref|R[E]N-2628 amend-existing-PR: on ref-bearing runs, skip gh pr create|R[E]N-2628 auth half: expose GH_TOKEN only for ref-bearing runs)
-
-# daemon/types.go: the SessionHandle/SessionSpec doc comments name the closed
-# downstream TUI repo that embeds this package and owns the enforcement gate
-# the daemon deliberately does NOT enforce — both pre-existing and unrelated
-# to the change that first staged this file's other edits (an additive
-# workareaRoot field on SessionHandle); --staged scans the whole file, not
-# just the diff. Naming the real embedder IS the contract here: a reader who
-# does not know which repo enforces the gate cannot tell that the daemon's
-# non-enforcement is deliberate rather than a bug. Scoped to the two exact
-# pre-existing lines so a NEW unscoped hit still fails.
-CLOSED_TUI_REPO :: ^daemon/types\.go :: rens[e]i-tui :: (OR a downstream embedder \(e\.g\. rens[e]i-tui's daemon|enforcement is the rens[e]i-tui S3 gate)

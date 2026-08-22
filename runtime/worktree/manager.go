@@ -142,14 +142,8 @@ func defaultEnvRunner(ctx context.Context, extraEnv []string, name string, args 
 // ProvisionResult is the per-session bookkeeping the manager records.
 // Returned alongside the worktree path for callers that need both.
 type ProvisionResult struct {
-	// Path is the absolute repository worktree path on disk — the agent CWD
-	// and the only path carrying mutable git authority. Under the nested
-	// layout it sits inside WorkareaRoot; under the retained flat layout the
-	// two are equal.
+	// Path is the absolute worktree path on disk.
 	Path string
-	// WorkareaRoot is the absolute session-owned workarea root. Cleanup,
-	// terminal leases, archives and disk accounting own it atomically.
-	WorkareaRoot string
 	// WorkareaID is generated for this acquisition and is never reused merely
 	// because a later acquisition occupies the same filesystem path.
 	WorkareaID string
@@ -289,19 +283,8 @@ type ProvisionSpec struct {
 	// StrategyWorktreeAdd. Empty defaults to ParentDir/<repo-leaf>.
 	ParentRepoPath string
 	// LeafName overrides the directory name under ParentDir. Empty
-	// defaults to SessionID. It names the session-owned workarea ROOT, not
-	// the repository worktree.
+	// defaults to SessionID.
 	LeafName string
-	// RepositoryLeaf selects the session-owned nested layout: the repository
-	// is cloned to <ParentDir>/<LeafName>/<RepositoryLeaf> and the session
-	// root above it can hold sibling context/secondary repositories owned by
-	// this session alone.
-	//
-	// Empty preserves the retained FLAT layout (<ParentDir>/<LeafName> IS the
-	// repository), which keeps pre-nesting callers and already-provisioned
-	// workareas working unchanged. Derive the canonical value with
-	// workarea.RepositoryLeaf.
-	RepositoryLeaf string
 }
 
 // Provision creates a worktree for the session, retrying up to
@@ -329,24 +312,16 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	if leaf == "" {
 		leaf = spec.SessionID
 	}
-	layout, err := m.layoutFor(leaf, spec.RepositoryLeaf)
-	if err != nil {
-		return "", err
-	}
-	root := layout.Root.String()
-	dst := layout.Repository.String()
-	if filepath.Clean(root) == filepath.Clean(m.leases.Dir()) {
+	dst := filepath.Join(m.parentDir, leaf)
+	if filepath.Clean(dst) == filepath.Clean(m.leases.Dir()) {
 		return "", errors.New("runtime/worktree: destination conflicts with terminal lease state directory")
 	}
-	// Retention is asserted against the session-owned ROOT: a lease retains the
-	// whole workarea (selected repository plus this session's context repos),
-	// not one leaf inside it.
-	retained, err := m.retainedPath(root)
+	retained, err := m.retainedPath(dst)
 	if err != nil {
 		return "", fmt.Errorf("runtime/worktree: check terminal lease before provision: %w", err)
 	}
 	if retained {
-		return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, root)
+		return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, dst)
 	}
 
 	var lastErr error
@@ -375,7 +350,6 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			}
 			res := &ProvisionResult{
 				Path:           dst,
-				WorkareaRoot:   root,
 				WorkareaID:     workareaID,
 				Strategy:       spec.Strategy,
 				ParentRepoPath: parentRepoPath,
@@ -386,7 +360,6 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			m.mu.Unlock()
 			m.logger.Debug("worktree provisioned",
 				"sessionId", spec.SessionID, "path", dst,
-				"workareaRoot", root, "nested", layout.IsNested(),
 				"strategy", spec.Strategy.String(), "attempts", attempt)
 			return dst, nil
 		}
@@ -397,7 +370,7 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 		}
 		// Cleanup may proceed only when no durable terminal lease retains the
 		// exact destination. Lease-state read failures fail closed.
-		if cleanupErr := m.cleanupConflict(ctx, layout, spec); cleanupErr != nil {
+		if cleanupErr := m.cleanupConflict(ctx, dst, spec); cleanupErr != nil {
 			return "", cleanupErr
 		}
 
@@ -416,13 +389,9 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 		attempts, lastErr)
 }
 
-// Teardown removes the session's workarea ROOT — the selected repository plus
-// every context/secondary repository this session owns — in one operation. An
-// active or release-pending terminal lease defers teardown and retains the exact
-// root. Unknown sessions remain idempotent no-ops.
-//
-// Under the retained flat layout root and repository are the same path, so this
-// removes exactly what it always did.
+// Teardown removes the session's worktree. An active or release-pending
+// terminal lease defers teardown and retains the exact leaf. Unknown sessions
+// remain idempotent no-ops.
 func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 	unlock := m.lockSession(sessionID)
 	defer unlock()
@@ -433,7 +402,7 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 	if !ok {
 		return nil
 	}
-	retained, err := m.requestReleasePath(ctx, res.workareaRootOrPath())
+	retained, err := m.requestReleasePath(ctx, res.Path)
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: check terminal lease before teardown: %w", err)
 	}
@@ -467,29 +436,20 @@ func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.Acquir
 	if res == nil {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownSession, spec.SessionID)
 	}
-	// A terminal lease retains the session-owned ROOT. Retaining only the
-	// selected repository would leave the session's context repositories
-	// eligible for teardown while the retained workarea is still being read.
-	root := res.workareaRootOrPath()
 	if spec.WorkareaPath == "" {
-		spec.WorkareaPath = root
+		spec.WorkareaPath = res.Path
 	}
 	if spec.WorkareaID == "" {
 		spec.WorkareaID = res.WorkareaID
 	}
-	if spec.WorkareaPath != root || spec.WorkareaID != res.WorkareaID {
+	if spec.WorkareaPath != res.Path || spec.WorkareaID != res.WorkareaID {
 		return nil, fmt.Errorf("%w: terminal lease must retain the manager-owned workarea", workarea.ErrLeaseConflict)
 	}
-	metadata := make(map[string]string, len(spec.ReleaseMetadata)+3)
+	metadata := make(map[string]string, len(spec.ReleaseMetadata)+2)
 	for key, value := range spec.ReleaseMetadata {
 		metadata[key] = value
 	}
 	metadata["strategy"] = strconv.Itoa(int(res.Strategy))
-	if res.Path != root {
-		// Carried so a release driven by a later process (reaper, restart) can
-		// still detach the nested repository worktree before removing the root.
-		metadata["repositoryWorktreePath"] = res.Path
-	}
 	if spec.ReleaseDisposition == "" {
 		spec.ReleaseDisposition = "destroy"
 	}
@@ -589,7 +549,11 @@ func (m *Manager) releaseLeasedWorkarea(ctx context.Context, lease workarea.Term
 
 func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease workarea.TerminalLease) error {
 	if lease.ReleaseDisposition == "archive" {
-		m.forgetSessionAtRoot(lease.SessionID, lease.WorkareaPath)
+		m.mu.Lock()
+		if current := m.sessions[lease.SessionID]; current != nil && current.Path == lease.WorkareaPath {
+			delete(m.sessions, lease.SessionID)
+		}
+		m.mu.Unlock()
 		return nil
 	}
 	if lease.ReleaseDisposition != "destroy" {
@@ -599,40 +563,22 @@ func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease worka
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: decode leased release strategy: %w", err)
 	}
-	// A lease written by a pre-nesting binary carries no repository path; there
-	// the root IS the repository, which is exactly the flat semantics.
-	repositoryPath := lease.ReleaseMetadata["repositoryWorktreePath"]
-	if repositoryPath == "" {
-		repositoryPath = lease.WorkareaPath
-	}
 	res := ProvisionResult{
-		Path:           repositoryPath,
-		WorkareaRoot:   lease.WorkareaPath,
+		Path:           lease.WorkareaPath,
 		Strategy:       CloneStrategy(strategyValue),
 		ParentRepoPath: lease.ReleaseMetadata["parentRepoPath"],
 	}
 	if err := m.teardownResult(ctx, res); err != nil {
 		return err
 	}
-	m.forgetSessionAtRoot(lease.SessionID, lease.WorkareaPath)
+	m.mu.Lock()
+	if current := m.sessions[lease.SessionID]; current != nil && current.Path == lease.WorkareaPath {
+		delete(m.sessions, lease.SessionID)
+	}
+	m.mu.Unlock()
 	return nil
 }
 
-// forgetSessionAtRoot drops in-memory bookkeeping only when the session still
-// occupies the exact root the lease released, so a later acquisition that
-// reused the session id is never evicted by a stale release.
-func (m *Manager) forgetSessionAtRoot(sessionID, root string) {
-	m.mu.Lock()
-	if current := m.sessions[sessionID]; current != nil && current.workareaRootOrPath() == root {
-		delete(m.sessions, sessionID)
-	}
-	m.mu.Unlock()
-}
-
-// teardownResult detaches the repository worktree from its parent clone (when
-// the worktree-add strategy created one) and then removes the session-owned root
-// in a single RemoveAll, so the selected repository and every context repository
-// beneath it disappear together.
 func (m *Manager) teardownResult(ctx context.Context, res ProvisionResult) error {
 	if res.Strategy == StrategyWorktreeAdd && res.ParentRepoPath != "" {
 		out, err := m.runGit(ctx, "", "-C", res.ParentRepoPath, "worktree", "remove", "--force", res.Path)
@@ -646,9 +592,8 @@ func (m *Manager) teardownResult(ctx context.Context, res ProvisionResult) error
 			}
 		}
 	}
-	root := res.workareaRootOrPath()
-	if err := os.RemoveAll(root); err != nil {
-		return fmt.Errorf("runtime/worktree: remove %q: %w", root, err)
+	if err := os.RemoveAll(res.Path); err != nil {
+		return fmt.Errorf("runtime/worktree: remove %q: %w", res.Path, err)
 	}
 	return nil
 }
@@ -686,10 +631,8 @@ func (m *Manager) worktreeAlreadyRemoved(ctx context.Context, parentRepoPath, pa
 	return true, nil
 }
 
-// Path returns the selected repository worktree path (the agent CWD) for a
-// previously-provisioned session. Returns ErrUnknownSession when the session id
-// is not tracked. Semantics are unchanged from before the nested layout: this
-// is, and stays, the repository the session works in.
+// Path returns the worktree path for a previously-provisioned session.
+// Returns ErrUnknownSession when the session id is not tracked.
 func (m *Manager) Path(sessionID string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -698,49 +641,6 @@ func (m *Manager) Path(sessionID string) (string, error) {
 		return "", fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
 	}
 	return res.Path, nil
-}
-
-// Layout returns the typed session-owned workarea layout for a
-// previously-provisioned session: the root the session owns and the repository
-// worktree inside it. Returns ErrUnknownSession when the session id is not
-// tracked.
-func (m *Manager) Layout(sessionID string) (workarea.Layout, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	res, ok := m.sessions[sessionID]
-	if !ok {
-		return workarea.Layout{}, fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
-	}
-	return workarea.Layout{
-		Root:       workarea.RootPath(res.workareaRootOrPath()),
-		Repository: workarea.RepositoryPath(res.Path),
-	}, nil
-}
-
-// layoutFor builds the layout a Provision call targets. An empty repositoryLeaf
-// keeps the retained flat shape so pre-nesting callers are byte-identical.
-func (m *Manager) layoutFor(sessionLeaf, repositoryLeaf string) (workarea.Layout, error) {
-	if strings.TrimSpace(repositoryLeaf) == "" {
-		layout, err := workarea.FlatLayout(m.parentDir, sessionLeaf)
-		if err != nil {
-			return workarea.Layout{}, fmt.Errorf("runtime/worktree: resolve workarea layout: %w", err)
-		}
-		return layout, nil
-	}
-	layout, err := workarea.NewLayout(m.parentDir, sessionLeaf, repositoryLeaf)
-	if err != nil {
-		return workarea.Layout{}, fmt.Errorf("runtime/worktree: resolve workarea layout: %w", err)
-	}
-	return layout, nil
-}
-
-// workareaRootOrPath tolerates bookkeeping recovered from durable lease state
-// written by a pre-nesting binary, where only the (flat) path was recorded.
-func (r ProvisionResult) workareaRootOrPath() string {
-	if r.WorkareaRoot != "" {
-		return r.WorkareaRoot
-	}
-	return r.Path
 }
 
 // provisionOnce runs one git invocation per spec.Strategy.
@@ -863,27 +763,22 @@ func (m *Manager) requestReleasePath(ctx context.Context, path string) (bool, er
 	return m.leases.RequestReleasePath(ctx, path)
 }
 
-// cleanupConflict tries to remove a stale workarea left by a prior failed
+// cleanupConflict tries to remove a stale worktree entry left by a prior failed
 // Provision. It fails closed when lease state is unreadable and never removes a
 // terminal-leased exact workarea; ordinary stale cleanup remains best-effort.
-//
-// Cleanup is root-scoped: the whole session-owned workarea goes, so a half-built
-// nested layout (repository missing, context repos already cloned) cannot leave
-// orphan leaves behind for the next attempt to trip over.
-func (m *Manager) cleanupConflict(ctx context.Context, layout workarea.Layout, spec ProvisionSpec) error {
-	root := layout.Root.String()
-	retained, err := m.retainedPath(root)
+func (m *Manager) cleanupConflict(ctx context.Context, dst string, spec ProvisionSpec) error {
+	retained, err := m.retainedPath(dst)
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: check terminal lease before conflict cleanup: %w", err)
 	}
 	if retained {
-		return fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, root)
+		return fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, dst)
 	}
 	if spec.Strategy == StrategyWorktreeAdd && spec.ParentRepoPath != "" {
-		_, _ = m.runGit(ctx, "", "-C", spec.ParentRepoPath, "worktree", "remove", "--force", layout.Repository.String())
+		_, _ = m.runGit(ctx, "", "-C", spec.ParentRepoPath, "worktree", "remove", "--force", dst)
 	}
-	if _, err := os.Stat(root); err == nil {
-		_ = os.RemoveAll(root)
+	if _, err := os.Stat(dst); err == nil {
+		_ = os.RemoveAll(dst)
 	}
 	return nil
 }

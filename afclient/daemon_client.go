@@ -182,17 +182,9 @@ type DaemonSessionHandle struct {
 	AcceptedAt string `json:"acceptedAt"`
 	// State is the session lifecycle state (starting/running/...).
 	State string `json:"state"`
-	// WorktreePath is the absolute on-disk path of the SELECTED repository
-	// worktree for the session — the agent CWD
-	// (<parent>/<sessionID>/<repo-leaf>, or the retained flat
-	// <parent>/<sessionID>). Empty when the daemon cannot resolve it.
+	// WorktreePath is the absolute on-disk worktree path for the session
+	// (<parent>/<sessionID>). Empty when the daemon cannot resolve it.
 	WorktreePath string `json:"worktreePath,omitempty"`
-	// WorkareaRoot is the absolute on-disk path of the session-owned
-	// workarea root (<parent>/<sessionID>) containing the selected
-	// repository worktree and this session's context/secondary
-	// repositories. Additive + omitempty: absent against a pre-field daemon,
-	// and equal to WorktreePath for a retained flat workarea.
-	WorkareaRoot string `json:"workareaRoot,omitempty"`
 	// ProjectName is the allowlist-resolved project identifier.
 	ProjectName string `json:"projectName,omitempty"`
 	// Repository is the git URL (or owner/name slug) the session runs on.

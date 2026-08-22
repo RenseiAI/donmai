@@ -36,23 +36,8 @@ func TestSpawner_HandleEnrichment(t *testing.T) {
 	if h.SessionID != "sess-123" {
 		t.Errorf("sessionId: got %q", h.SessionID)
 	}
-	// Session-owned workarea namespace: the session owns <parent>/<sessionID>/ and the SELECTED
-	// repository is a leaf inside it. worktreePath keeps its meaning (the
-	// agent CWD / repository path) for mixed-version readers; workareaRoot is
-	// the additive field naming the session-owned root.
-	//
-	// RED without the nesting change: worktreePath is <parent>/sess-123 and
-	// workareaRoot is empty.
-	wantRoot := filepath.Join(parent, "sess-123")
-	wantRepo := filepath.Join(wantRoot, "web")
-	if h.WorktreePath != wantRepo {
-		t.Errorf("worktreePath: want %q, got %q", wantRepo, h.WorktreePath)
-	}
-	if h.WorkareaRoot != wantRoot {
-		t.Errorf("workareaRoot: want %q, got %q", wantRoot, h.WorkareaRoot)
-	}
-	if h.WorktreePath == h.WorkareaRoot {
-		t.Errorf("workareaRoot must not be overloaded as the repository path (both %q)", h.WorktreePath)
+	if got := filepath.Join(parent, "sess-123"); h.WorktreePath != got {
+		t.Errorf("worktreePath: want %q, got %q", got, h.WorktreePath)
 	}
 	if h.ProjectName != "acme" {
 		t.Errorf("projectName: want acme, got %q", h.ProjectName)
