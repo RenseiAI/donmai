@@ -500,8 +500,8 @@ func TestRestartFenceRefusalIsSurfacedToTheCaller(t *testing.T) {
 
 type refusingFenceStore struct{}
 
-func (refusingFenceStore) Acknowledge(context.Context, sessionshim.FenceRequest) (sessionshim.FenceAcknowledgement, error) {
-	return sessionshim.FenceAcknowledgement{}, errors.New("no durable acknowledgement")
+func (refusingFenceStore) Acknowledge(context.Context, sessionshim.Fence) (sessionshim.Fence, error) {
+	return sessionshim.Fence{}, errors.New("no durable acknowledgement")
 }
 
 func TestStopIsRefusedForSessionsThisDaemonDidNotAdopt(t *testing.T) {

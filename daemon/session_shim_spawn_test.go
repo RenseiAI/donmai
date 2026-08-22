@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -156,6 +157,9 @@ func newShimSpawnFixture(t *testing.T) *shimSpawnFixture {
 			RegistryDir:     dir + "/registry",
 			LaunchTimeout:   60 * time.Second,
 			OnSessionEvent:  events.record,
+			OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error {
+				return nil
+			},
 			Orphan: sessionshim.OrphanPolicy{
 				Deadline:          2 * time.Second,
 				TerminationGrace:  500 * time.Millisecond,
@@ -746,6 +750,48 @@ func TestForwardedSequenceIsRecordedNotAllocated(t *testing.T) {
 	})
 	if got := d.SessionShimForwardedSeq(id.OrgID, "not-a-session"); got != 0 {
 		t.Errorf("forwarded sequence for an unknown session = %d, want 0", got)
+	}
+}
+
+func TestForwardedSequenceRequiresDurableCarrier(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	// The ordinary event hook is intentionally still present: it is an observer,
+	// not proof that a composing carrier durably accepted the frame.
+	f.daemon.opts.SessionShim.OnSessionEventDurable = nil
+
+	spec := f.interactiveSpec("sess-observer-only")
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	seq := f.exchange(t, id, "observer-only")
+	if seq == 0 {
+		t.Fatal("observer did not receive output")
+	}
+	time.Sleep(250 * time.Millisecond)
+	if got := f.daemon.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != 0 {
+		t.Fatalf("observer-only forwarded sequence = %d, want durable cursor unchanged at 0", got)
+	}
+}
+
+func TestForwardedSequenceRejectsDurableCarrierError(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	f.daemon.opts.SessionShim.OnSessionEventDurable = func(sessionshim.Identity, sessionshim.ControllerEvent) error {
+		return errors.New("carrier unavailable")
+	}
+
+	spec := f.interactiveSpec("sess-carrier-error")
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	seq := f.exchange(t, id, "carrier-error")
+	if seq == 0 {
+		t.Fatal("observer did not receive output")
+	}
+	time.Sleep(250 * time.Millisecond)
+	if got := f.daemon.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != 0 {
+		t.Fatalf("carrier-error forwarded sequence = %d, want durable cursor unchanged at 0", got)
 	}
 }
 

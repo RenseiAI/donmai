@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -116,12 +117,22 @@ func (f Fence) Expired(now time.Time) bool {
 // that must run standalone. A nil FenceStore is a supported configuration —
 // RequestFence then returns a locally-satisfied fence.
 type FenceStore interface {
-	// Acknowledge durably persists the exact request bytes and returns a receipt.
-	// The receipt MUST echo RequestBytes byte-for-byte and carry a non-empty,
-	// store-issued durable revision. Changed, reordered, or partial bytes are a
-	// refusal. A local implementation must not manufacture this receipt; callers
-	// that need no remote fence use a nil FenceStore instead.
-	Acknowledge(ctx context.Context, request FenceRequest) (FenceAcknowledgement, error)
+	// Acknowledge durably persists the fence and returns the acknowledged record.
+	// This is the v0.67 public contract. Legacy stores retain semantic
+	// exact-session verification below; exact-byte durability is opt-in through
+	// ExactFenceStore so this interface remains source-compatible.
+	Acknowledge(ctx context.Context, f Fence) (Fence, error)
+}
+
+// ExactFenceStore is the additive composing-plane contract for hosted restart
+// fencing. The store receives the immutable request bytes produced by
+// RequestFence and must echo those bytes byte-for-byte together with a
+// non-empty, store-issued durable revision. A store that normalizes JSON,
+// reorders sessions, drops correlations, or returns a partial acknowledgement
+// is refused. It is intentionally separate from FenceStore: changing the
+// latter would break implementations compiled against the v0.67 API.
+type ExactFenceStore interface {
+	AcknowledgeExact(ctx context.Context, request FenceRequest) (FenceAcknowledgement, error)
 }
 
 // FenceRequest is the semantic restart intent plus its exact serialized bytes.
@@ -168,11 +179,12 @@ func (p FencePolicy) HoldWindow() time.Duration {
 // the intent without a remote acknowledgement, which is correct because there is
 // no remote reaper to fence against.
 //
-// With a store, the acknowledgement is VERIFIED to echo the exact ordered
-// request bytes and carry a durable revision before it is accepted. A store
-// that acknowledges a reordered or partial set has not agreed to the same
-// restart intent.
-func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string, ids []FencedSession, policy FencePolicy, now time.Time) (Fence, error) {
+// With an ExactFenceStore, the acknowledgement is VERIFIED to echo the exact
+// ordered request bytes and carry a durable revision before it is accepted. A
+// legacy FenceStore follows the v0.67 semantic identity/correlation check and
+// does not manufacture a durable revision. A store that acknowledges a partial
+// set has not agreed to protect the same restart intent.
+func RequestFence(ctx context.Context, store any, fenceID, hostID string, ids []FencedSession, policy FencePolicy, now time.Time) (Fence, error) {
 	if fenceID == "" {
 		return Fence{}, fmt.Errorf("%w: fence id is required", ErrFenceRequired)
 	}
@@ -192,7 +204,7 @@ func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string,
 	if err != nil {
 		return Fence{}, fmt.Errorf("%w: serialize exact request: %w", ErrFenceRequired, err)
 	}
-	ack, err := store.Acknowledge(ctx, FenceRequest{
+	request := FenceRequest{
 		Fence: Fence{
 			FenceID:           f.FenceID,
 			HostID:            f.HostID,
@@ -202,18 +214,65 @@ func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string,
 			State:             f.State,
 		},
 		RequestBytes: append([]byte(nil), requestBytes...),
-	})
+	}
+	if exact, ok := store.(ExactFenceStore); ok {
+		ack, err := exact.AcknowledgeExact(ctx, request)
+		if err != nil {
+			return Fence{}, fmt.Errorf("%w: %w", ErrFenceRequired, err)
+		}
+		if strings.TrimSpace(ack.DurableRevision) == "" {
+			return Fence{}, fmt.Errorf("%w: acknowledgement omitted durable revision", ErrFenceRequired)
+		}
+		if !bytes.Equal(ack.RequestBytes, requestBytes) {
+			return Fence{}, fmt.Errorf("%w: acknowledgement bytes differ from exact ordered request", ErrFenceRequired)
+		}
+		f.DurableRevision = ack.DurableRevision
+		return f, nil
+	}
+	legacy, ok := store.(FenceStore)
+	if !ok {
+		return Fence{}, fmt.Errorf("%w: store does not implement FenceStore or ExactFenceStore", ErrFenceRequired)
+	}
+	legacyFence := f
+	legacyFence.Sessions = sortedFencedSessions(f.Sessions)
+	ack, err := legacy.Acknowledge(ctx, legacyFence)
 	if err != nil {
 		return Fence{}, fmt.Errorf("%w: %w", ErrFenceRequired, err)
 	}
-	if strings.TrimSpace(ack.DurableRevision) == "" {
-		return Fence{}, fmt.Errorf("%w: acknowledgement omitted durable revision", ErrFenceRequired)
+	if ack.FenceID != f.FenceID {
+		return Fence{}, fmt.Errorf("%w: acknowledgement names fence %q, requested %q", ErrFenceRequired, ack.FenceID, f.FenceID)
 	}
-	if !bytes.Equal(ack.RequestBytes, requestBytes) {
-		return Fence{}, fmt.Errorf("%w: acknowledgement bytes differ from exact ordered request", ErrFenceRequired)
+	legacyRequested := legacyFence.Sessions
+	ackSessions := sortedFencedSessions(ack.Sessions)
+	if len(ackSessions) != len(legacyRequested) {
+		return Fence{}, fmt.Errorf("%w: acknowledgement covers %d sessions, requested %d", ErrFenceRequired, len(ackSessions), len(legacyRequested))
 	}
-	f.DurableRevision = ack.DurableRevision
-	return f, nil
+	for i, want := range legacyRequested {
+		if ackSessions[i] != want {
+			return Fence{}, fmt.Errorf(
+				"%w: acknowledgement session %d correlation differs: got %+v, requested %+v",
+				ErrFenceRequired, i, ackSessions[i], want)
+		}
+	}
+	ack.Sessions = ackSessions
+	return ack, nil
+}
+
+func sortedFencedSessions(in []FencedSession) []FencedSession {
+	sorted := append([]FencedSession(nil), in...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].OrgID != sorted[j].OrgID {
+			return sorted[i].OrgID < sorted[j].OrgID
+		}
+		if sorted[i].SessionID != sorted[j].SessionID {
+			return sorted[i].SessionID < sorted[j].SessionID
+		}
+		if sorted[i].ShimID != sorted[j].ShimID {
+			return sorted[i].ShimID < sorted[j].ShimID
+		}
+		return sorted[i].ProcessEpoch < sorted[j].ProcessEpoch
+	})
+	return sorted
 }
 
 // TerminalProof is evidence that a session's workload actually ended.

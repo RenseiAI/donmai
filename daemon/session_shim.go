@@ -67,9 +67,12 @@ type SessionShimConfig struct {
 	RestartBudget time.Duration
 
 	// FenceStore is the OPTIONAL composing-plane restart-fence persister (§D9).
-	// Nil is fully supported: a standalone daemon has no remote reaper to fence
-	// against and still gets the local bounded-orphan rule.
-	FenceStore sessionshim.FenceStore
+	// It accepts either the v0.67 sessionshim.FenceStore or the additive
+	// sessionshim.ExactFenceStore. Nil is fully supported: a standalone daemon
+	// has no remote reaper to fence against and still gets the local
+	// bounded-orphan rule. The broad field type preserves source compatibility
+	// for legacy stores while allowing hosted activation to opt into exact bytes.
+	FenceStore any
 
 	// ExpectedWorkarea returns the workarea this daemon believes a session
 	// belongs to, for the adoption-time workarea identity check. Nil skips only
@@ -90,6 +93,15 @@ type SessionShimConfig struct {
 	// indefinitely: a stalled consumer stops acknowledgements, which costs the
 	// next adoption an avoidable replay gap.
 	OnSessionEvent func(sessionshim.Identity, sessionshim.ControllerEvent)
+
+	// OnSessionEventDurable is the optional durable carrier handoff. Unlike
+	// OnSessionEvent, this callback is not an observer: a nil callback means no
+	// carrier durability is available, and a non-nil callback must return nil
+	// only after it has durably accepted the event. Output and snapshot sequence
+	// state advances, and the shim heartbeat acknowledgement is sent, only after
+	// that successful return. It MUST be bounded for the same reason as
+	// OnSessionEvent.
+	OnSessionEventDurable func(sessionshim.Identity, sessionshim.ControllerEvent) error
 
 	// ResumeFrom returns the first output sequence this daemon still needs for a
 	// session (its durable last_forwarded_seq + 1). Nil resumes from the start of

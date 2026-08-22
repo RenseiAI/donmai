@@ -158,10 +158,39 @@ func TestRequestFenceIsLocallySatisfiedWithoutAStore(t *testing.T) {
 	}
 }
 
-type fenceStoreFunc func(context.Context, FenceRequest) (FenceAcknowledgement, error)
+func TestRequestFencePreservesLegacyFenceStoreCompatibility(t *testing.T) {
+	t.Parallel()
 
-func (f fenceStoreFunc) Acknowledge(ctx context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+	now := time.Unix(1_700_000_000, 0)
+	ids := []FencedSession{
+		{OrgID: "o", SessionID: "z"},
+		{OrgID: "o", SessionID: "a"},
+	}
+	store := legacyFenceStoreFunc(func(_ context.Context, fence Fence) (Fence, error) {
+		if len(fence.Sessions) != 2 || fence.Sessions[0].SessionID != "a" || fence.Sessions[1].SessionID != "z" {
+			return Fence{}, errors.New("legacy store did not receive v0.67 sorted coverage")
+		}
+		return fence, nil
+	})
+	f, err := RequestFence(context.Background(), store, "fence-legacy", "host-1", ids, FencePolicy{}, now)
+	if err != nil {
+		t.Fatalf("RequestFence with legacy store: %v", err)
+	}
+	if f.DurableRevision != "" {
+		t.Fatalf("legacy fence durable revision = %q, want empty", f.DurableRevision)
+	}
+}
+
+type exactFenceStoreFunc func(context.Context, FenceRequest) (FenceAcknowledgement, error)
+
+func (f exactFenceStoreFunc) AcknowledgeExact(ctx context.Context, request FenceRequest) (FenceAcknowledgement, error) {
 	return f(ctx, request)
+}
+
+type legacyFenceStoreFunc func(context.Context, Fence) (Fence, error)
+
+func (f legacyFenceStoreFunc) Acknowledge(ctx context.Context, fence Fence) (Fence, error) {
+	return f(ctx, fence)
 }
 
 func exactDurableAcknowledgement(request FenceRequest) FenceAcknowledgement {
@@ -182,7 +211,7 @@ func TestRequestFenceRefusesPartialAcknowledgement(t *testing.T) {
 		{OrgID: "o", SessionID: "s1"},
 		{OrgID: "o", SessionID: "s2"},
 	}
-	store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+	store := exactFenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
 		partial := request.Fence
 		partial.Sessions = partial.Sessions[:1] // drops s2
 		partialBytes, err := json.Marshal(partial)
@@ -205,7 +234,7 @@ func TestRequestFenceRefusesReorderedAcknowledgement(t *testing.T) {
 		{OrgID: "o", SessionID: "s1", ProcessEpoch: 1, LastForwardedSeq: 10},
 		{OrgID: "o", SessionID: "s2", ProcessEpoch: 2, LastForwardedSeq: 20},
 	}
-	store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+	store := exactFenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
 		reordered := request.Fence
 		reordered.Sessions = []FencedSession{request.Fence.Sessions[1], request.Fence.Sessions[0]}
 		reorderedBytes, err := json.Marshal(reordered)
@@ -230,7 +259,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 
 	t.Run("store error", func(t *testing.T) {
 		t.Parallel()
-		store := fenceStoreFunc(func(context.Context, FenceRequest) (FenceAcknowledgement, error) {
+		store := exactFenceStoreFunc(func(context.Context, FenceRequest) (FenceAcknowledgement, error) {
 			return FenceAcknowledgement{}, errors.New("control plane unreachable")
 		})
 		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
@@ -241,7 +270,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 
 	t.Run("wrong fence id", func(t *testing.T) {
 		t.Parallel()
-		store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+		store := exactFenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
 			changed := request.Fence
 			changed.FenceID = "someone-elses-fence"
 			changedBytes, err := json.Marshal(changed)
@@ -255,7 +284,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 
 	t.Run("wrong process epoch", func(t *testing.T) {
 		t.Parallel()
-		store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+		store := exactFenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
 			changed := request.Fence
 			changed.Sessions = append([]FencedSession(nil), changed.Sessions...)
 			changed.Sessions[0].ProcessEpoch++
@@ -270,7 +299,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 
 	t.Run("wrong last forwarded sequence", func(t *testing.T) {
 		t.Parallel()
-		store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+		store := exactFenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
 			changed := request.Fence
 			changed.Sessions = append([]FencedSession(nil), changed.Sessions...)
 			changed.Sessions[0].LastForwardedSeq++
@@ -285,7 +314,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 
 	t.Run("missing durable revision", func(t *testing.T) {
 		t.Parallel()
-		store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+		store := exactFenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
 			ack := exactDurableAcknowledgement(request)
 			ack.DurableRevision = ""
 			return ack, nil
@@ -315,7 +344,7 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 		{OrgID: "n", SessionID: "s2", LastForwardedSeq: 1},
 	}
 	var received FenceRequest
-	store := fenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
+	store := exactFenceStoreFunc(func(_ context.Context, request FenceRequest) (FenceAcknowledgement, error) {
 		received = request
 		return exactDurableAcknowledgement(request), nil
 	})
