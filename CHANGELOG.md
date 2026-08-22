@@ -8,6 +8,29 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.0 — 2026-08-22
+
+### Features
+
+- **Restart fences can carry exact durable acknowledgements.** Composing
+  stores may opt into an additive exact-fence interface that receives one
+  immutable ordered request and must echo its bytes with a non-empty durable
+  revision. Reordered, partial, changed, or revision-less acknowledgements are
+  refused. The v0.67 fence-store interface and standalone nil-store behavior
+  remain available for existing embedders. (#376)
+- **Fence coverage includes durable per-session correlations.** Every covered
+  session carries its shim id, process epoch, and last durably carrier-forwarded
+  output sequence. Adoption retains its durable resume cursor so an immediate
+  later fence cannot regress the correlation to zero. (#376)
+
+### Fixes
+
+- **Observed output is no longer mistaken for durable carriage.** The existing
+  session-event callback remains observation-only. A separate acknowledged
+  carrier hook advances the forwarded cursor only after successful durable
+  handoff; a failed handoff closes controller authority before a later frame can
+  leap over the gap. (#376)
+
 ## v0.67.1 — 2026-08-22
 
 ### Fixes
