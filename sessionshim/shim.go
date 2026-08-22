@@ -614,6 +614,7 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		_ = sendError(w, shimwire.CodeInternal, "resume failed")
 		return err
 	}
+	adopted.Extensions = welcome.Extensions
 	ctrl.sub = sub
 
 	if err := writeTyped(w, shimwire.TypeAdopted, func() ([]byte, error) { return shimwire.EncodeAdopted(adopted) }); err != nil {

@@ -68,10 +68,11 @@ type Fence struct {
 // FencedSession is one identity covered by a fence, with its shim and carrier
 // correlation values. No correlation field is lifecycle identity (§D2).
 type FencedSession struct {
-	OrgID        string `json:"orgId"`
-	SessionID    string `json:"sessionId"`
-	ShimID       string `json:"shimId,omitempty"`
-	ProcessEpoch uint64 `json:"processEpoch"`
+	OrgID                string `json:"orgId"`
+	SessionID            string `json:"sessionId"`
+	ShimID               string `json:"shimId,omitempty"`
+	ProcessEpoch         uint64 `json:"processEpoch"`
+	ControllerGeneration uint64 `json:"controllerGeneration"`
 	// LastForwardedSeq is the highest shim-owned output sequence the daemon had
 	// durably handed to its carrier when it snapshotted this restart intent. Zero
 	// means no sequence has been durably forwarded; it is a real correlation
@@ -153,6 +154,14 @@ type FenceAcknowledgement struct {
 	DurableRevision string
 }
 
+// CloneFenceRequest returns a deep copy safe to retain across composing-store
+// calls that may mutate their input values.
+func CloneFenceRequest(request FenceRequest) FenceRequest {
+	request.Fence.Sessions = append([]FencedSession(nil), request.Fence.Sessions...)
+	request.RequestBytes = append([]byte(nil), request.RequestBytes...)
+	return request
+}
+
 // FencePolicy computes the hold window.
 //
 // HoldUntil covers the restart budget PLUS the entire orphan bound, because the
@@ -227,8 +236,20 @@ func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string,
 // Normalizing JSON or reconstructing the request in a composing store is a
 // refusal because it can change the durable intent.
 func RequestFenceExact(ctx context.Context, store ExactFenceStore, fenceID, hostID string, ids []FencedSession, policy FencePolicy, now time.Time) (Fence, error) {
+	request, err := NewExactFenceRequest(fenceID, hostID, ids, policy, now)
+	if err != nil {
+		return Fence{}, err
+	}
+	return AcknowledgeExactFence(ctx, store, request)
+}
+
+// NewExactFenceRequest constructs one immutable exact request without sending
+// it. A caller may retain and replay this object after a partial multi-scope
+// acknowledgement; re-sampling time or coverage under the same fence id would
+// violate the store's byte-idempotency contract.
+func NewExactFenceRequest(fenceID, hostID string, ids []FencedSession, policy FencePolicy, now time.Time) (FenceRequest, error) {
 	if fenceID == "" {
-		return Fence{}, fmt.Errorf("%w: fence id is required", ErrFenceRequired)
+		return FenceRequest{}, fmt.Errorf("%w: fence id is required", ErrFenceRequired)
 	}
 	f := Fence{
 		FenceID:           fenceID,
@@ -238,14 +259,11 @@ func RequestFenceExact(ctx context.Context, store ExactFenceStore, fenceID, host
 		HoldUntilUnixNano: now.Add(policy.HoldWindow()).UnixNano(),
 		State:             FenceHeld,
 	}
-	if store == nil {
-		return f, nil
-	}
 	requestBytes, err := json.Marshal(f)
 	if err != nil {
-		return Fence{}, fmt.Errorf("%w: serialize exact request: %w", ErrFenceRequired, err)
+		return FenceRequest{}, fmt.Errorf("%w: serialize exact request: %w", ErrFenceRequired, err)
 	}
-	ack, err := store.AcknowledgeExact(ctx, FenceRequest{
+	return FenceRequest{
 		Fence: Fence{
 			FenceID:           f.FenceID,
 			HostID:            f.HostID,
@@ -255,6 +273,33 @@ func RequestFenceExact(ctx context.Context, store ExactFenceStore, fenceID, host
 			State:             f.State,
 		},
 		RequestBytes: append([]byte(nil), requestBytes...),
+	}, nil
+}
+
+// AcknowledgeExactFence sends a previously frozen request and accepts only its
+// byte-identical durable acknowledgement.
+func AcknowledgeExactFence(ctx context.Context, store ExactFenceStore, request FenceRequest) (Fence, error) {
+	request = CloneFenceRequest(request)
+	expectedBytes, err := json.Marshal(request.Fence)
+	if err != nil {
+		return Fence{}, fmt.Errorf("%w: serialize retained exact request: %w", ErrFenceRequired, err)
+	}
+	if !bytes.Equal(request.RequestBytes, expectedBytes) {
+		return Fence{}, fmt.Errorf("%w: retained request bytes differ from semantic fence", ErrFenceRequired)
+	}
+	if store == nil {
+		return request.Fence, nil
+	}
+	ack, err := store.AcknowledgeExact(ctx, FenceRequest{
+		Fence: Fence{
+			FenceID:           request.Fence.FenceID,
+			HostID:            request.Fence.HostID,
+			Sessions:          append([]FencedSession(nil), request.Fence.Sessions...),
+			IssuedAtUnixNano:  request.Fence.IssuedAtUnixNano,
+			HoldUntilUnixNano: request.Fence.HoldUntilUnixNano,
+			State:             request.Fence.State,
+		},
+		RequestBytes: append([]byte(nil), request.RequestBytes...),
 	})
 	if err != nil {
 		return Fence{}, fmt.Errorf("%w: %w", ErrFenceRequired, err)
@@ -262,9 +307,10 @@ func RequestFenceExact(ctx context.Context, store ExactFenceStore, fenceID, host
 	if strings.TrimSpace(ack.DurableRevision) == "" {
 		return Fence{}, fmt.Errorf("%w: acknowledgement omitted durable revision", ErrFenceRequired)
 	}
-	if !bytes.Equal(ack.RequestBytes, requestBytes) {
+	if !bytes.Equal(ack.RequestBytes, request.RequestBytes) {
 		return Fence{}, fmt.Errorf("%w: acknowledgement bytes differ from exact ordered request", ErrFenceRequired)
 	}
+	f := request.Fence
 	f.DurableRevision = ack.DurableRevision
 	return f, nil
 }
@@ -281,7 +327,13 @@ func sortedFencedSessions(in []FencedSession) []FencedSession {
 		if sorted[i].ShimID != sorted[j].ShimID {
 			return sorted[i].ShimID < sorted[j].ShimID
 		}
-		return sorted[i].ProcessEpoch < sorted[j].ProcessEpoch
+		if sorted[i].ProcessEpoch != sorted[j].ProcessEpoch {
+			return sorted[i].ProcessEpoch < sorted[j].ProcessEpoch
+		}
+		if sorted[i].ControllerGeneration != sorted[j].ControllerGeneration {
+			return sorted[i].ControllerGeneration < sorted[j].ControllerGeneration
+		}
+		return sorted[i].LastForwardedSeq < sorted[j].LastForwardedSeq
 	})
 	return sorted
 }
@@ -298,6 +350,20 @@ type TerminalProof struct {
 	// Tombstone is a durable shim tombstone proving the harness process group
 	// was reaped. Only a tombstone with GroupReaped set is proof.
 	Tombstone *Tombstone
+	// Correlations are exact per-shim proofs used when one lifecycle identity has
+	// multiple fenced incarnations. Legacy scalar fields above remain valid for
+	// a fence with zero or one matching correlation.
+	Correlations []TerminalCorrelationProof
+}
+
+// TerminalCorrelationProof is positive evidence for one exact shim/process
+// incarnation. AdoptedReceipt and Tombstone have the same meaning as their
+// legacy scalar counterparts but cannot authorize a sibling correlation.
+type TerminalCorrelationProof struct {
+	ShimID         string
+	ProcessEpoch   uint64
+	AdoptedReceipt bool
+	Tombstone      *Tombstone
 }
 
 // Proves reports whether this evidence closes the lifecycle loop.
@@ -305,7 +371,40 @@ func (p TerminalProof) Proves() bool {
 	if p.AdoptedReceipt {
 		return true
 	}
-	return p.Tombstone != nil && p.Tombstone.GroupReaped
+	if p.Tombstone != nil && p.Tombstone.GroupReaped {
+		return true
+	}
+	for _, proof := range p.Correlations {
+		if proof.AdoptedReceipt || (proof.Tombstone != nil && proof.Tombstone.GroupReaped) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p TerminalProof) provesCorrelation(id Identity, fenced FencedSession) bool {
+	for _, proof := range p.Correlations {
+		if proof.ShimID != fenced.ShimID || proof.ProcessEpoch != fenced.ProcessEpoch {
+			continue
+		}
+		if proof.AdoptedReceipt {
+			return true
+		}
+		if proof.Tombstone != nil && proof.Tombstone.GroupReaped &&
+			proof.Tombstone.Identity() == id && proof.Tombstone.ShimID == fenced.ShimID &&
+			proof.Tombstone.ProcessEpoch == fenced.ProcessEpoch {
+			return true
+		}
+	}
+	return false
+}
+
+func (p TerminalProof) legacyProvesSingleCorrelation(id Identity, fenced FencedSession) bool {
+	if p.AdoptedReceipt {
+		return true
+	}
+	return p.Tombstone != nil && p.Tombstone.GroupReaped && p.Tombstone.Identity() == id &&
+		p.Tombstone.ShimID == fenced.ShimID && p.Tombstone.ProcessEpoch == fenced.ProcessEpoch
 }
 
 // ReleaseVerdict is the outcome of the single claim-release predicate.
@@ -340,10 +439,35 @@ const (
 //     that time passed, not that a harness stopped.
 //   - No proof, no fence       -> ReleaseReconcile, for the same reason.
 func ReleaseDecision(fence *Fence, id Identity, proof TerminalProof, now time.Time) ReleaseVerdict {
-	if proof.Proves() {
-		return ReleaseAllowed
+	if fence == nil || !fence.Covers(id) {
+		if proof.Proves() {
+			return ReleaseAllowed
+		}
+		return ReleaseReconcile
 	}
-	if fence != nil && fence.Covers(id) && !fence.Expired(now) && fence.State == FenceHeld {
+	covered := make([]FencedSession, 0, 1)
+	for _, session := range fence.Sessions {
+		if session.Identity() == id {
+			covered = append(covered, session)
+		}
+	}
+	if len(covered) <= 1 {
+		if len(covered) == 1 && (proof.legacyProvesSingleCorrelation(id, covered[0]) || proof.provesCorrelation(id, covered[0])) {
+			return ReleaseAllowed
+		}
+	} else {
+		allProven := true
+		for _, session := range covered {
+			if !proof.provesCorrelation(id, session) {
+				allProven = false
+				break
+			}
+		}
+		if allProven {
+			return ReleaseAllowed
+		}
+	}
+	if !fence.Expired(now) && fence.State == FenceHeld {
 		return ReleaseHeld
 	}
 	return ReleaseReconcile

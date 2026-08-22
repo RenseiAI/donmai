@@ -251,10 +251,9 @@ type PollWorkItem struct {
 	// drops it. Opaque forwarder only.
 	InterviewDefinition json.RawMessage `json:"interviewDefinition,omitempty"`
 
-	// ── W3C trace-context correlation (REN-2649) ─────────────────────────
+	// ── W3C trace-context correlation ────────────────────────────────────
 	//
-	// Additive platform-dispatch fields per
-	// src/lib/observability/trace-context.ts. Opaque forwarders only.
+	// Additive dispatch fields. Opaque forwarders only.
 	Traceparent      string `json:"traceparent,omitempty"`
 	Tracestate       string `json:"tracestate,omitempty"`
 	SessionStorageID string `json:"sessionStorageId,omitempty"`
@@ -1127,6 +1126,7 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 	credentialRequirements, harness, servingHost := pollItemCredentialMetadata(item)
 	spec := SessionSpec{
 		SessionID:              item.SessionID,
+		OrganizationID:         item.OrganizationID,
 		ProjectID:              item.ProjectID,
 		RepositoryID:           item.RepositoryID,
 		Repository:             repo,

@@ -91,7 +91,8 @@ const (
 	tombstoneSuffix = ".tombstone.json"
 )
 
-// TombstoneName is the on-disk terminal-tombstone filename for this identity.
+// TombstoneName is the legacy v1 identity-only tombstone alias. New writes also
+// use a per-incarnation filename; this alias remains readable while singular.
 func (id Identity) TombstoneName() string {
 	sum := sha256.Sum256([]byte(id.Key()))
 	return hex.EncodeToString(sum[:]) + tombstoneSuffix

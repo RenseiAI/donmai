@@ -35,8 +35,15 @@ func TestReleaseDecisionNeverReleasesOnExpiryAlone(t *testing.T) {
 		Sessions:          []FencedSession{{OrgID: "org-1", SessionID: "somebody-else"}},
 		HoldUntilUnixNano: now.Add(time.Minute).UnixNano(),
 	}
-	reapedTombstone := &Tombstone{GroupReaped: true}
-	unreapedTombstone := &Tombstone{GroupReaped: false}
+	reapedTombstone := &Tombstone{
+		OrgID: id.OrgID, SessionID: id.SessionID, ShimID: "shim-1", GroupReaped: true,
+	}
+	unreapedTombstone := &Tombstone{
+		OrgID: id.OrgID, SessionID: id.SessionID, ShimID: "shim-1", GroupReaped: false,
+	}
+	wrongTombstone := &Tombstone{
+		OrgID: id.OrgID, SessionID: "different-session", ShimID: "shim-1", GroupReaped: true,
+	}
 
 	cases := []struct {
 		name  string
@@ -76,6 +83,10 @@ func TestReleaseDecisionNeverReleasesOnExpiryAlone(t *testing.T) {
 			fence: &expired, proof: TerminalProof{Tombstone: unreapedTombstone}, want: ReleaseReconcile,
 		},
 		{
+			name:  "wrong tombstone cannot release sole fenced correlation",
+			fence: &held, proof: TerminalProof{Tombstone: wrongTombstone}, want: ReleaseHeld,
+		},
+		{
 			name: "already-reconciling fence no longer holds",
 			fence: &Fence{
 				FenceID: "f1", Sessions: covered, State: FenceReconciliationRequired,
@@ -92,6 +103,47 @@ func TestReleaseDecisionNeverReleasesOnExpiryAlone(t *testing.T) {
 				t.Fatalf("ReleaseDecision = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReleaseDecisionRequiresEveryDuplicateCorrelationProof(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	id := Identity{OrgID: "org-duplicate", SessionID: "session-duplicate"}
+	fence := Fence{
+		FenceID: "fence-duplicate",
+		State:   FenceHeld,
+		Sessions: []FencedSession{
+			{OrgID: id.OrgID, SessionID: id.SessionID, ShimID: "shim-a", ProcessEpoch: 1},
+			{OrgID: id.OrgID, SessionID: id.SessionID, ShimID: "shim-b", ProcessEpoch: 2},
+		},
+		HoldUntilUnixNano: now.Add(time.Minute).UnixNano(),
+	}
+	tombstoneA := Tombstone{
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-a", ProcessEpoch: 1, GroupReaped: true,
+	}
+	proof := TerminalProof{Correlations: []TerminalCorrelationProof{{
+		ShimID: "shim-a", ProcessEpoch: 1, Tombstone: &tombstoneA,
+	}}}
+	if got := ReleaseDecision(&fence, id, proof, now); got != ReleaseHeld {
+		t.Fatalf("one of two proofs under held fence = %q, want held", got)
+	}
+	expired := fence
+	expired.HoldUntilUnixNano = now.Add(-time.Second).UnixNano()
+	if got := ReleaseDecision(&expired, id, proof, now); got != ReleaseReconcile {
+		t.Fatalf("one of two proofs after expiry = %q, want reconciliation", got)
+	}
+	tombstoneB := Tombstone{
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-b", ProcessEpoch: 2, GroupReaped: true,
+	}
+	proof.Correlations = append(proof.Correlations, TerminalCorrelationProof{
+		ShimID: "shim-b", ProcessEpoch: 2, Tombstone: &tombstoneB,
+	})
+	if got := ReleaseDecision(&fence, id, proof, now); got != ReleaseAllowed {
+		t.Fatalf("both exact proofs = %q, want allowed", got)
 	}
 }
 
@@ -340,7 +392,7 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 	now := time.Unix(1_700_000_000, 0)
 	ids := []FencedSession{
 		{OrgID: "o", SessionID: "s3", LastForwardedSeq: 3},
-		{OrgID: "o", SessionID: "s1", ShimID: "shim", ProcessEpoch: 2, LastForwardedSeq: 2},
+		{OrgID: "o", SessionID: "s1", ShimID: "shim", ProcessEpoch: 2, ControllerGeneration: 5, LastForwardedSeq: 2},
 		{OrgID: "n", SessionID: "s2", LastForwardedSeq: 1},
 	}
 	var received FenceRequest
@@ -352,9 +404,9 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 	if err != nil {
 		t.Fatalf("RequestFence: %v", err)
 	}
-	want := []string{"o/s3//0/3", "o/s1/shim/2/2", "n/s2//0/1"}
+	want := []string{"o/s3//0/0/3", "o/s1/shim/2/5/2", "n/s2//0/0/1"}
 	for i, w := range want {
-		got := fmt.Sprintf("%s/%s/%d/%d", f.Sessions[i].Identity(), f.Sessions[i].ShimID, f.Sessions[i].ProcessEpoch, f.Sessions[i].LastForwardedSeq)
+		got := fmt.Sprintf("%s/%s/%d/%d/%d", f.Sessions[i].Identity(), f.Sessions[i].ShimID, f.Sessions[i].ProcessEpoch, f.Sessions[i].ControllerGeneration, f.Sessions[i].LastForwardedSeq)
 		if got != w {
 			t.Fatalf("Sessions[%d] = %s, want %s", i, got, w)
 		}
@@ -374,5 +426,8 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 	}
 	if !bytes.Contains(received.RequestBytes, []byte(`"processEpoch":0`)) {
 		t.Fatalf("request bytes omitted the zero-valued processEpoch correlation: %s", received.RequestBytes)
+	}
+	if !bytes.Contains(received.RequestBytes, []byte(`"controllerGeneration":5`)) {
+		t.Fatalf("request bytes omitted the per-session controller generation: %s", received.RequestBytes)
 	}
 }
