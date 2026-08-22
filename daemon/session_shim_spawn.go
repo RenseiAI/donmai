@@ -247,7 +247,9 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 	go func() {
 		defer d.shims.wg.Done()
 		id := ctrl.Identity()
-		observe := d.sessionShimConfig().OnSessionEvent
+		cfg := d.sessionShimConfig()
+		observe := cfg.OnSessionEvent
+		durable := cfg.OnSessionEventDurable
 		var lastSeq uint64
 		for ev := range ctrl.Events() {
 			if observe != nil {
@@ -261,7 +263,18 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 			case sessionshim.EventOutput:
 				if ev.Seq > lastSeq {
 					lastSeq = ev.Seq
-					d.recordShimForwardedSeq(id, ev.Seq)
+					if durable != nil {
+						if err := durable(id, ev); err != nil {
+							slog.Warn("session shim: durable carrier rejected output",
+								"session", id.String(), "seq", ev.Seq, "error", err)
+							// A later frame must never advance the cursor past this
+							// unacknowledged one. Close the controller and let the
+							// normal disconnect/quarantine path retain ownership.
+							_ = ctrl.Close()
+							return
+						}
+						d.recordShimForwardedSeq(id, ev.Seq)
+					}
 				}
 			case sessionshim.EventGap:
 				// Surfaced, never smoothed over (§D5). A daemon that logged nothing
@@ -281,7 +294,18 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 				// resume point a later adoption starts from.
 				if ev.Snapshot.AtSeq > lastSeq {
 					lastSeq = ev.Snapshot.AtSeq
-					d.recordShimForwardedSeq(id, ev.Snapshot.AtSeq)
+					if durable != nil {
+						if err := durable(id, ev); err != nil {
+							slog.Warn("session shim: durable carrier rejected snapshot",
+								"session", id.String(), "seq", ev.Snapshot.AtSeq, "error", err)
+							// A later frame must never advance the cursor past this
+							// unacknowledged snapshot. Close the controller and let the
+							// normal disconnect/quarantine path retain ownership.
+							_ = ctrl.Close()
+							return
+						}
+						d.recordShimForwardedSeq(id, ev.Snapshot.AtSeq)
+					}
 				}
 			}
 		}

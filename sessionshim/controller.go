@@ -96,17 +96,21 @@ func (o ControllerOptions) logger() *slog.Logger {
 // *ptyhost.Session. That is the §D1 ownership boundary made concrete: when this
 // object is garbage, the session is unaffected.
 type Controller struct {
-	id       Identity
-	conn     *net.UnixConn
-	w        *shimwire.Writer
-	r        *shimwire.Reader
-	gen      shimwire.Generation
-	hello    shimwire.Hello
-	adopted  shimwire.Adopted
-	events   chan ControllerEvent
-	logger   *slog.Logger
-	closeOne sync.Once
-	done     chan struct{}
+	id      Identity
+	conn    *net.UnixConn
+	w       *shimwire.Writer
+	r       *shimwire.Reader
+	gen     shimwire.Generation
+	hello   shimwire.Hello
+	adopted shimwire.Adopted
+	// resumeFrom is the exact durable cursor proposed in Welcome. Retaining it
+	// lets a replacement daemon preserve last_forwarded_seq before any newly
+	// replayed or live output advances its own bookkeeping.
+	resumeFrom uint64
+	events     chan ControllerEvent
+	logger     *slog.Logger
+	closeOne   sync.Once
+	done       chan struct{}
 	// closing is closed by Close BEFORE the connection is dropped, so a read
 	// loop parked on an event send has something to select on. Without it, a
 	// caller that stops consuming events and then closes would leave the loop
@@ -167,14 +171,15 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	}
 
 	c := &Controller{
-		id:      rec.Identity(),
-		conn:    conn,
-		w:       shimwire.NewWriter(conn),
-		r:       shimwire.NewReader(conn),
-		events:  make(chan ControllerEvent, 64),
-		logger:  opts.logger(),
-		done:    make(chan struct{}),
-		closing: make(chan struct{}),
+		id:         rec.Identity(),
+		conn:       conn,
+		w:          shimwire.NewWriter(conn),
+		r:          shimwire.NewReader(conn),
+		resumeFrom: opts.ResumeFrom,
+		events:     make(chan ControllerEvent, 64),
+		logger:     opts.logger(),
+		done:       make(chan struct{}),
+		closing:    make(chan struct{}),
 	}
 	if err := c.handshake(rec, opts); err != nil {
 		_ = conn.Close()
@@ -344,6 +349,11 @@ func (c *Controller) Hello() shimwire.Hello { return c.hello }
 
 // Adoption returns the replay disposition the shim committed to.
 func (c *Controller) Adoption() shimwire.Adopted { return c.adopted }
+
+// ResumeFrom returns the first sequence this controller requested during
+// adoption. When non-zero, ResumeFrom-1 is the composing carrier's exact
+// durable last-forwarded sequence at the adoption boundary.
+func (c *Controller) ResumeFrom() uint64 { return c.resumeFrom }
 
 // HarnessSurvived reports whether the shim's harness is still live. It is the
 // operative question after a restart: adoption succeeded AND the workload

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -67,8 +68,15 @@ type SessionShimConfig struct {
 
 	// FenceStore is the OPTIONAL composing-plane restart-fence persister (§D9).
 	// Nil is fully supported: a standalone daemon has no remote reaper to fence
-	// against and still gets the local bounded-orphan rule.
+	// against and still gets the local bounded-orphan rule. This field retains the
+	// v0.67 source contract; hosted activation uses ExactFenceStore below.
 	FenceStore sessionshim.FenceStore
+
+	// ExactFenceStore is the additive hosted restart-fence persister. When set,
+	// RequestSessionShimRestartFence uses the exact request-byte and durable
+	// revision contract. It is separate so the v0.67 FenceStore field remains
+	// source-compatible for OSS embedders.
+	ExactFenceStore sessionshim.ExactFenceStore
 
 	// ExpectedWorkarea returns the workarea this daemon believes a session
 	// belongs to, for the adoption-time workarea identity check. Nil skips only
@@ -89,6 +97,15 @@ type SessionShimConfig struct {
 	// indefinitely: a stalled consumer stops acknowledgements, which costs the
 	// next adoption an avoidable replay gap.
 	OnSessionEvent func(sessionshim.Identity, sessionshim.ControllerEvent)
+
+	// OnSessionEventDurable is the optional durable carrier handoff. Unlike
+	// OnSessionEvent, this callback is not an observer: a nil callback means no
+	// carrier durability is available, and a non-nil callback must return nil
+	// only after it has durably accepted the event. Output and snapshot sequence
+	// state advances, and the shim heartbeat acknowledgement is sent, only after
+	// that successful return. It MUST be bounded for the same reason as
+	// OnSessionEvent.
+	OnSessionEventDurable func(sessionshim.Identity, sessionshim.ControllerEvent) error
 
 	// ResumeFrom returns the first output sequence this daemon still needs for a
 	// session (its durable last_forwarded_seq + 1). Nil resumes from the start of
@@ -262,7 +279,14 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	d.shims.mu.Lock()
 	d.shims.registry = registry
 	for _, c := range result.Adopted {
-		d.shims.adopted[c.Identity()] = adoptedShim{controller: c, shimID: c.Hello().ShimID}
+		id := c.Identity()
+		d.shims.adopted[id] = adoptedShim{controller: c, shimID: c.Hello().ShimID}
+		if resumeFrom := c.ResumeFrom(); resumeFrom > 0 {
+			// ResumeFrom is exactly last_forwarded_seq + 1. Seed the replacement
+			// daemon's snapshot before its event consumer starts so an immediate
+			// second planned restart cannot regress the durable correlation to zero.
+			d.shims.forwarded[id] = resumeFrom - 1
+		}
 	}
 	d.shims.quarantined = result.QuarantinedProjection()
 	d.shims.tombstoned = append(d.shims.tombstoned, result.Tombstoned...)
@@ -378,6 +402,7 @@ func (d *Daemon) RequestSessionShimRestartFence(ctx context.Context, fenceID str
 		for id, entry := range d.shims.adopted {
 			coveredSession := sessionshim.FencedSession{
 				OrgID: id.OrgID, SessionID: id.SessionID, ShimID: entry.shimID,
+				LastForwardedSeq: d.shims.forwarded[id],
 			}
 			if entry.controller != nil {
 				coveredSession.ProcessEpoch = entry.controller.Hello().ProcessEpoch
@@ -385,15 +410,40 @@ func (d *Daemon) RequestSessionShimRestartFence(ctx context.Context, fenceID str
 			covered = append(covered, coveredSession)
 		}
 		for _, q := range d.shims.quarantined {
+			id := q.Identity()
 			covered = append(covered, sessionshim.FencedSession{
 				OrgID: q.OrgID, SessionID: q.SessionID, ShimID: q.ShimID, ProcessEpoch: q.ProcessEpoch,
+				LastForwardedSeq: d.shims.forwarded[id],
 			})
 		}
 		d.shims.mu.RUnlock()
 	}
+	// RequestFence preserves order byte-for-byte because the composing store's
+	// durable acknowledgement must echo the exact request. The daemon owns the
+	// snapshot order, so make it deterministic instead of leaking Go map order.
+	sort.Slice(covered, func(i, j int) bool {
+		if covered[i].OrgID != covered[j].OrgID {
+			return covered[i].OrgID < covered[j].OrgID
+		}
+		if covered[i].SessionID != covered[j].SessionID {
+			return covered[i].SessionID < covered[j].SessionID
+		}
+		if covered[i].ShimID != covered[j].ShimID {
+			return covered[i].ShimID < covered[j].ShimID
+		}
+		return covered[i].ProcessEpoch < covered[j].ProcessEpoch
+	})
 
 	policy := sessionshim.FencePolicy{RestartBudget: cfg.RestartBudget, Orphan: cfg.Orphan}
-	fence, err := sessionshim.RequestFence(ctx, cfg.FenceStore, fenceID, d.controllerID(), covered, policy, time.Now())
+	var (
+		fence sessionshim.Fence
+		err   error
+	)
+	if cfg.ExactFenceStore != nil {
+		fence, err = sessionshim.RequestFenceExact(ctx, cfg.ExactFenceStore, fenceID, d.controllerID(), covered, policy, time.Now())
+	} else {
+		fence, err = sessionshim.RequestFence(ctx, cfg.FenceStore, fenceID, d.controllerID(), covered, policy, time.Now())
+	}
 	if err != nil {
 		return sessionshim.Fence{}, err
 	}

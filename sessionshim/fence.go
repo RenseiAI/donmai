@@ -1,10 +1,13 @@
 package sessionshim
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -39,6 +42,12 @@ var ErrFenceRequired = errors.New("sessionshim: durable restart fence not acknow
 type Fence struct {
 	FenceID string `json:"fenceId"`
 	HostID  string `json:"hostId"`
+	// There is deliberately no fence-level controller generation here.
+	// session-shim-v1 owns one monotonic generation PER SHIM, while one fence may
+	// cover many adopted and quarantined shims. Taking a maximum, minimum, PID,
+	// or daemon-local counter would fabricate an authority the protocol does not
+	// define. A composing plane that requires one host-level generation must first
+	// define and persist that separate monotonic authority.
 
 	// Sessions is the enumerated set of adopted AND quarantined identities the
 	// restart must preserve. Quarantined sessions are included because their
@@ -49,15 +58,25 @@ type Fence struct {
 	HoldUntilUnixNano int64 `json:"holdUntil"`
 
 	State FenceState `json:"state"`
+
+	// DurableRevision is the composing store's non-empty persistence receipt.
+	// It is response-only: the exact request bytes omit it. An OSS-only daemon
+	// with no store leaves it empty because local intent is not remote durability.
+	DurableRevision string `json:"revision,omitempty"`
 }
 
-// FencedSession is one identity covered by a fence, with its shim correlation
-// values. Neither correlation value is lifecycle identity (§D2).
+// FencedSession is one identity covered by a fence, with its shim and carrier
+// correlation values. No correlation field is lifecycle identity (§D2).
 type FencedSession struct {
 	OrgID        string `json:"orgId"`
 	SessionID    string `json:"sessionId"`
 	ShimID       string `json:"shimId,omitempty"`
-	ProcessEpoch uint64 `json:"processEpoch,omitempty"`
+	ProcessEpoch uint64 `json:"processEpoch"`
+	// LastForwardedSeq is the highest shim-owned output sequence the daemon had
+	// durably handed to its carrier when it snapshotted this restart intent. Zero
+	// means no sequence has been durably forwarded; it is a real correlation
+	// value and therefore is never omitted from the wire.
+	LastForwardedSeq uint64 `json:"lastForwardedSeq"`
 }
 
 // Identity returns the covered session's lifecycle identity.
@@ -98,10 +117,40 @@ func (f Fence) Expired(now time.Time) bool {
 // that must run standalone. A nil FenceStore is a supported configuration —
 // RequestFence then returns a locally-satisfied fence.
 type FenceStore interface {
-	// Acknowledge durably persists the fence and returns the acknowledged
-	// record. The returned Sessions set MUST equal the requested set; a partial
-	// acknowledgement is a refusal.
+	// Acknowledge durably persists the fence and returns the acknowledged record.
+	// This is the v0.67 public contract. Legacy stores retain semantic
+	// exact-session verification below; exact-byte durability is opt-in through
+	// ExactFenceStore so this interface remains source-compatible.
 	Acknowledge(ctx context.Context, f Fence) (Fence, error)
+}
+
+// ExactFenceStore is the additive composing-plane contract for hosted restart
+// fencing. The store receives the immutable request bytes produced by
+// RequestFence and must echo those bytes byte-for-byte together with a
+// non-empty, store-issued durable revision. A store that normalizes JSON,
+// reorders sessions, drops correlations, or returns a partial acknowledgement
+// is refused. It is intentionally separate from FenceStore: changing the
+// latter would break implementations compiled against the v0.67 API.
+type ExactFenceStore interface {
+	AcknowledgeExact(ctx context.Context, request FenceRequest) (FenceAcknowledgement, error)
+}
+
+// FenceRequest is the semantic restart intent plus its exact serialized bytes.
+//
+// RequestFence constructs both from one immutable snapshot. Passing the bytes
+// to the composing store avoids a second encoder silently changing array order,
+// numeric representation, or correlation fields before durable persistence.
+type FenceRequest struct {
+	Fence        Fence
+	RequestBytes []byte
+}
+
+// FenceAcknowledgement is the minimum proof a composing store returns.
+// RequestBytes echo the exact bytes it durably accepted. DurableRevision is an
+// opaque, non-empty store revision suitable for later reconciliation.
+type FenceAcknowledgement struct {
+	RequestBytes    []byte
+	DurableRevision string
 }
 
 // FencePolicy computes the hold window.
@@ -124,26 +173,25 @@ func (p FencePolicy) HoldWindow() time.Duration {
 	return budget + p.Orphan.TotalBound()
 }
 
-// RequestFence obtains a durable, acknowledged fence covering exactly ids.
+// RequestFence obtains a durable, acknowledged fence covering exactly ids
+// using the v0.67 FenceStore contract.
 //
 // With a nil store the fence is locally satisfied: an OSS-only daemon records
 // the intent without a remote acknowledgement, which is correct because there is
 // no remote reaper to fence against.
 //
-// With a store, the acknowledgement is VERIFIED to cover the exact requested set
-// before it is accepted. A store that acknowledges a subset has not agreed to
-// protect the rest, and treating that as success is how a release path forgets
-// the fence for one session.
+// The acknowledgement is verified to cover the same semantic identity and
+// correlation set as the requested fence. It preserves the old source and
+// runtime contract for OSS embedders.
 func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string, ids []FencedSession, policy FencePolicy, now time.Time) (Fence, error) {
 	if fenceID == "" {
 		return Fence{}, fmt.Errorf("%w: fence id is required", ErrFenceRequired)
 	}
-	sorted := sortedFencedSessions(ids)
-	requested := append([]FencedSession(nil), sorted...)
+	requested := sortedFencedSessions(ids)
 	f := Fence{
 		FenceID:           fenceID,
 		HostID:            hostID,
-		Sessions:          sorted,
+		Sessions:          requested,
 		IssuedAtUnixNano:  now.UnixNano(),
 		HoldUntilUnixNano: now.Add(policy.HoldWindow()).UnixNano(),
 		State:             FenceHeld,
@@ -160,8 +208,7 @@ func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string,
 	}
 	ackSessions := sortedFencedSessions(ack.Sessions)
 	if len(ackSessions) != len(requested) {
-		return Fence{}, fmt.Errorf("%w: acknowledgement covers %d sessions, requested %d",
-			ErrFenceRequired, len(ackSessions), len(requested))
+		return Fence{}, fmt.Errorf("%w: acknowledgement covers %d sessions, requested %d", ErrFenceRequired, len(ackSessions), len(requested))
 	}
 	for i, want := range requested {
 		if ackSessions[i] != want {
@@ -172,6 +219,54 @@ func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string,
 	}
 	ack.Sessions = ackSessions
 	return ack, nil
+}
+
+// RequestFenceExact is the additive hosted restart-fence path. It preserves
+// the caller's ordered snapshot, sends the exact bytes from that one snapshot,
+// and accepts only a byte-for-byte echo with a non-empty durable revision.
+// Normalizing JSON or reconstructing the request in a composing store is a
+// refusal because it can change the durable intent.
+func RequestFenceExact(ctx context.Context, store ExactFenceStore, fenceID, hostID string, ids []FencedSession, policy FencePolicy, now time.Time) (Fence, error) {
+	if fenceID == "" {
+		return Fence{}, fmt.Errorf("%w: fence id is required", ErrFenceRequired)
+	}
+	f := Fence{
+		FenceID:           fenceID,
+		HostID:            hostID,
+		Sessions:          append([]FencedSession(nil), ids...),
+		IssuedAtUnixNano:  now.UnixNano(),
+		HoldUntilUnixNano: now.Add(policy.HoldWindow()).UnixNano(),
+		State:             FenceHeld,
+	}
+	if store == nil {
+		return f, nil
+	}
+	requestBytes, err := json.Marshal(f)
+	if err != nil {
+		return Fence{}, fmt.Errorf("%w: serialize exact request: %w", ErrFenceRequired, err)
+	}
+	ack, err := store.AcknowledgeExact(ctx, FenceRequest{
+		Fence: Fence{
+			FenceID:           f.FenceID,
+			HostID:            f.HostID,
+			Sessions:          append([]FencedSession(nil), f.Sessions...),
+			IssuedAtUnixNano:  f.IssuedAtUnixNano,
+			HoldUntilUnixNano: f.HoldUntilUnixNano,
+			State:             f.State,
+		},
+		RequestBytes: append([]byte(nil), requestBytes...),
+	})
+	if err != nil {
+		return Fence{}, fmt.Errorf("%w: %w", ErrFenceRequired, err)
+	}
+	if strings.TrimSpace(ack.DurableRevision) == "" {
+		return Fence{}, fmt.Errorf("%w: acknowledgement omitted durable revision", ErrFenceRequired)
+	}
+	if !bytes.Equal(ack.RequestBytes, requestBytes) {
+		return Fence{}, fmt.Errorf("%w: acknowledgement bytes differ from exact ordered request", ErrFenceRequired)
+	}
+	f.DurableRevision = ack.DurableRevision
+	return f, nil
 }
 
 func sortedFencedSessions(in []FencedSession) []FencedSession {
