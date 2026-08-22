@@ -2033,6 +2033,7 @@ func (d *Daemon) sessionShimCounts() (adopted, quarantined int) {
 	if d.shims == nil {
 		return 0, 0
 	}
+	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	return len(d.shims.adopted), len(d.shims.quarantined)

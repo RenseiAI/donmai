@@ -444,20 +444,108 @@ func awaitTombstone(registry *sessionshim.Registry, id sessionshim.Identity, wit
 	}
 }
 
-// releaseShimIfLive drops a controller whose stream ended without a terminal
-// observation. The session is NOT reported as ended: the shim still owns the
-// harness, and only a terminal receipt or tombstone closes the loop (§D10).
+// releaseShimIfLive withdraws authority from a controller whose stream ended
+// without a terminal observation and moves the exact live shim into visible,
+// capacity-consuming quarantine. The session is NOT reported as ended: only a
+// terminal receipt or matching tombstone closes the loop (§D7/§D10).
 func (d *Daemon) releaseShimIfLive(id sessionshim.Identity) {
+	now := d.shimNow()
 	d.shims.mu.Lock()
 	entry, ok := d.shims.adopted[id]
 	if ok {
 		delete(d.shims.adopted, id)
+		hello := entry.controller.Hello()
+		q := sessionshim.NewQuarantinedSession(sessionshim.Record{
+			OrgID:             id.OrgID,
+			SessionID:         id.SessionID,
+			ShimID:            entry.shimID,
+			ProtocolMin:       hello.Min,
+			ProtocolMax:       hello.Max,
+			Phase:             hello.Phase,
+			CreatedAtUnixNano: now.UnixNano(),
+		}, sessionshim.QuarantineSocketUnreachable,
+			"controller stream ended before a terminal observation", now)
+		d.upsertShimQuarantineLocked(q)
 	}
 	d.shims.mu.Unlock()
 	if ok && entry.controller != nil {
 		_ = entry.controller.Close()
 		slog.Info("session shim: controller connection ended without a terminal observation; the shim retains its harness",
 			"session", id.String())
+	}
+}
+
+// upsertShimQuarantineLocked adds one exact shim projection without allowing a
+// repeated disconnect observer to double-charge capacity. Lifecycle identity is
+// authoritative, while shim id distinguishes the D7 duplicate-identity case in
+// which two real survivors under one identity must both remain visible.
+// d.shims.mu must be held.
+func (d *Daemon) upsertShimQuarantineLocked(q sessionshim.QuarantinedSession) {
+	for i := range d.shims.quarantined {
+		current := d.shims.quarantined[i]
+		if current.Identity() == q.Identity() && current.ShimID == q.ShimID {
+			d.shims.quarantined[i] = q
+			sessionshim.SortQuarantined(d.shims.quarantined)
+			return
+		}
+	}
+	d.shims.quarantined = append(d.shims.quarantined, q)
+	sessionshim.SortQuarantined(d.shims.quarantined)
+}
+
+// reconcileQuarantinedTombstones withdraws capacity only when a durable
+// tombstone for the exact quarantined shim proves its harness group was reaped.
+// It is called by the occupancy/reporting surfaces that already run on every
+// admission and heartbeat, so reconciliation needs no unbounded background
+// goroutine and cannot delay intentional daemon shutdown.
+func (d *Daemon) reconcileQuarantinedTombstones() {
+	if d.shims == nil {
+		return
+	}
+	d.shims.mu.RLock()
+	registry := d.shims.registry
+	quarantined := append([]sessionshim.QuarantinedSession(nil), d.shims.quarantined...)
+	d.shims.mu.RUnlock()
+	if registry == nil || len(quarantined) == 0 {
+		return
+	}
+
+	for _, q := range quarantined {
+		id := q.Identity()
+		tombstone, err := registry.GetTombstone(id)
+		if err != nil || tombstone.ShimID != q.ShimID {
+			continue
+		}
+		proof := sessionshim.TerminalProof{Tombstone: &tombstone}
+		if d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof) != sessionshim.ReleaseAllowed {
+			continue
+		}
+
+		d.shims.mu.Lock()
+		removed := false
+		kept := d.shims.quarantined[:0]
+		for _, current := range d.shims.quarantined {
+			if current.Identity() == id && current.ShimID == tombstone.ShimID {
+				removed = true
+				continue
+			}
+			kept = append(kept, current)
+		}
+		d.shims.quarantined = kept
+		if removed {
+			delete(d.shims.forwarded, id)
+			alreadyRecorded := false
+			for _, existing := range d.shims.tombstoned {
+				if existing.Identity() == id && existing.ShimID == tombstone.ShimID {
+					alreadyRecorded = true
+					break
+				}
+			}
+			if !alreadyRecorded {
+				d.shims.tombstoned = append(d.shims.tombstoned, tombstone)
+			}
+		}
+		d.shims.mu.Unlock()
 	}
 }
 
@@ -540,6 +628,7 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 	if d.shims == nil {
 		return nil
 	}
+	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	out := make([]SessionHandle, 0, len(d.shims.adopted)+len(d.shims.quarantined))

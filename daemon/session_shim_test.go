@@ -479,6 +479,9 @@ func TestReleaseAdoptedShimsClearsControlWithoutClaimingTermination(t *testing.T
 	if len(d.AdoptedSessionShims()) != 0 {
 		t.Fatalf("adopted after release = %d, want 0", len(d.AdoptedSessionShims()))
 	}
+	if got := d.QuarantinedSessions(); len(got) != 0 {
+		t.Fatalf("intentional controller release manufactured quarantine: %+v", got)
+	}
 	if d.SessionShimAdoptionComplete() {
 		t.Fatal("adoption still reads complete after releasing every controller")
 	}

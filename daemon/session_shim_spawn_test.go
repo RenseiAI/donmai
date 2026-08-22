@@ -504,9 +504,36 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 	if err := entry.controller.Close(); err != nil {
 		t.Fatalf("close controller: %v", err)
 	}
-	waitFor(t, 5*time.Second, "controller gap classification", func() bool {
-		return d.SessionShimOccupancy() == 0
+	waitFor(t, 5*time.Second, "controller gap quarantine", func() bool {
+		return len(d.AdoptedSessionShims()) == 0 && len(d.QuarantinedSessions()) == 1
 	})
+	if got := d.SessionShimOccupancy(); got != 1 {
+		t.Fatalf("SessionShimOccupancy after controller disconnect = %d, want 1 while the harness remains live", got)
+	}
+	quarantined := d.QuarantinedSessions()
+	if len(quarantined) != 1 {
+		t.Fatalf("QuarantinedSessions after controller disconnect = %+v, want one visible survivor", quarantined)
+	}
+	q := quarantined[0]
+	if q.Identity() != id || q.ShimID != entry.shimID {
+		t.Errorf("quarantine identity = %s/%s, want exact %s/%s", q.Identity(), q.ShimID, id, entry.shimID)
+	}
+	if q.Reason != sessionshim.QuarantineSocketUnreachable || !q.ConsumesCapacity {
+		t.Errorf("quarantine = %+v, want socket_unreachable and consumesCapacity=true", q)
+	}
+	if q.Detail != "controller stream ended before a terminal observation" {
+		t.Errorf("quarantine detail = %q, want bounded controller-loss detail", q.Detail)
+	}
+	// Repeated projections must not duplicate the same quarantine or capacity
+	// charge while heartbeat/status readers race terminal reconciliation.
+	for range 32 {
+		if got := d.SessionShimOccupancy(); got != 1 {
+			t.Fatalf("repeated occupancy during controller gap = %d, want 1", got)
+		}
+		if got := len(d.QuarantinedSessions()); got != 1 {
+			t.Fatalf("repeated quarantine projection length = %d, want 1", got)
+		}
+	}
 	if got := endCalls.Load(); got != 0 {
 		t.Fatalf("SessionEventEnded calls after controller disconnect = %d, want 0", got)
 	}
@@ -523,6 +550,27 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 		_, err := registry.GetTombstone(id)
 		return err == nil
 	})
+	var reconcileReaders sync.WaitGroup
+	reconcileReaders.Add(32)
+	for range 32 {
+		go func() {
+			defer reconcileReaders.Done()
+			if got := d.SessionShimOccupancy(); got != 0 {
+				t.Errorf("concurrent reconciled occupancy = %d, want 0", got)
+			}
+			if got := len(d.QuarantinedSessions()); got != 0 {
+				t.Errorf("concurrent reconciled quarantine length = %d, want 0", got)
+			}
+		}()
+	}
+	reconcileReaders.Wait()
+	waitFor(t, 5*time.Second, "safe tombstone quarantine reconciliation", func() bool {
+		return d.SessionShimOccupancy() == 0 && len(d.QuarantinedSessions()) == 0
+	})
+	proof := d.SessionShimTerminalProof(id.OrgID, id.SessionID)
+	if !proof.Proves() {
+		t.Fatal("terminal tombstone was not retained as durable proof after quarantine reconciliation")
+	}
 	if got := endCalls.Load(); got != 0 {
 		t.Fatalf("SessionEventEnded calls after disconnected orphan completion = %d, want 0", got)
 	}

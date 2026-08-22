@@ -305,6 +305,7 @@ func (d *Daemon) SessionShimOccupancy() int {
 	if d.shims == nil {
 		return 0
 	}
+	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	return len(d.shims.adopted) + len(d.shims.quarantined)
@@ -333,6 +334,7 @@ func (d *Daemon) QuarantinedSessions() []sessionshim.QuarantinedSession {
 	if d.shims == nil {
 		return nil
 	}
+	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	if len(d.shims.quarantined) == 0 {
@@ -371,6 +373,7 @@ func (d *Daemon) RequestSessionShimRestartFence(ctx context.Context, fenceID str
 	var covered []sessionshim.FencedSession
 
 	if d.shims != nil {
+		d.reconcileQuarantinedTombstones()
 		d.shims.mu.RLock()
 		for id, entry := range d.shims.adopted {
 			covered = append(covered, sessionshim.FencedSession{
