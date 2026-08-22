@@ -8,6 +8,54 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.0 — 2026-08-22
+
+### Features
+
+- **Restart fences can carry exact durable acknowledgements.** Composing
+  stores may opt into an additive exact-fence interface that receives one
+  immutable ordered request and must echo its bytes with a non-empty durable
+  revision. Reordered, partial, changed, or revision-less acknowledgements are
+  refused. The v0.67 fence-store interface and standalone nil-store behavior
+  remain available for existing embedders. (#376)
+- **Fence and launch identity can be composed per organization.** Session specs
+  carry their organization identity, host authority may be resolved per
+  organization, and hosted callers can request one exact fence per organization
+  without collapsing duplicate shim incarnations. Every covered session carries
+  process epoch, controller generation, and the last durably carrier-forwarded
+  output sequence, plus shim id when available; malformed quarantine may omit
+  the shim id. Partial retries reuse the original exact request bytes. The
+  legacy single-fence method remains available. (#376, #378)
+- **Adoption exposes fail-closed durable composition points.** A per-session
+  preparation hook runs only after authenticated Hello supplies the exact
+  shim/process/current-generation correlation; the shim must echo the exact
+  proposed generation and extensions in Adopted. Optional per-session callbacks
+  can rehydrate durable carriers, followed by one complete per-organization
+  adopted/quarantined/tombstoned batch. When `PrepareAdoptionBatch` is
+  configured it must return a non-empty expected revision; when
+  `OnAdoptionBatch` is configured it must return a non-empty durable receipt.
+  When both are configured both conditions hold before adoption is reported
+  complete. Nil hooks preserve standalone behavior. (#378)
+
+### Fixes
+
+- **Observed output is no longer mistaken for durable carriage.** The existing
+  session-event callback remains observation-only. A separate acknowledged
+  carrier hook advances the forwarded cursor only after successful durable
+  handoff; a failed handoff closes controller authority before a later frame can
+  leap over the gap. (#376)
+- **Duplicate shim incarnations keep independent terminal proof.** Tombstones
+  are persisted by lifecycle identity, shim id, and process epoch while retaining
+  safe legacy reads when only one proof exists. A terminal incarnation no longer
+  hides a different live duplicate, and claim release requires positive proof
+  for every correlation covered by the fence. Tombstone publication must also
+  finish withdrawing the matching live record before proof disposal. (#378)
+- **Ambiguous control and restart paths fail closed.** A bare session stop that
+  matches multiple organization-scoped shims cannot fall through to a colliding
+  direct child; malformed unknown-organization quarantine cannot be relabelled
+  as controller-owned; and a tombstone for the wrong correlation cannot release
+  even a single covered session. (#378)
+
 ## v0.67.1 — 2026-08-22
 
 ### Fixes
