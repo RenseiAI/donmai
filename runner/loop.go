@@ -183,7 +183,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// top inside the worktree afterward — passing a non-existent
 	// branch to `git clone --branch` fails because the upstream
 	// reference does not yet exist.
-	// REN-2628 amend-existing-PR: when dispatch carries a base Ref, provision the
+	// Amend-existing-branch contract: when dispatch carries a base Ref, provision the
 	// worktree AT that ref and retain it as the working/push branch. Validation
 	// is strict (no empty, no ".." , no absolute) so a malformed ref cannot
 	// escape the worktree. Trimmed Ref empty preserves legacy behaviour exactly.
@@ -1127,7 +1127,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
-	// REN-2628 amend-existing-PR: on ref-bearing runs, skip gh pr create — the
+	// Amend-existing-branch contract: on ref-bearing runs, skip gh pr create — the
 	// fix lands on the existing branch/PR, not a new one.
 	if !r.skipBackstop && !nonVCPassed && shouldBackstop(res, qw.WorkType) {
 		if trimRef(qw.Ref) != "" {
@@ -1920,7 +1920,7 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	if qw.PlatformURL != "" {
 		envMap["DONMAI_API_URL"] = qw.PlatformURL
 	}
-	// REN-2628 auth half: expose GH_TOKEN only for ref-bearing runs so
+	// Ref-bearing credential scope: expose GH_TOKEN only for ref-bearing runs so
 	// the agent can read the PR it was asked to fix. Least-privilege —
 	// absent Ref means no token in env, so gh 404 is the correct signal
 	// that this run has no PR-read scope.
