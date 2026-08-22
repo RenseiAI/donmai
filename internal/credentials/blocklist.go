@@ -45,6 +45,16 @@ import "strings"
 //   - DONMAI_ORCHESTRATOR_URL      — orchestrator base URL (internal routing surface)
 //   - DONMAI_CREDENTIAL_CAPABILITY — per-session credential-socket capability
 //   - CODE_INTEL_HOST_JWT_SECRET   — code-intelligence warm-host HS256 JWT signing secret
+//   - DONMAI_API_URL               — platform API origin; runner-owned, not credential-owned
+//
+// DONMAI_API_URL is a reservation rather than a secret. The runner is its only
+// legitimate author: it composes the canonical platform origin for a session
+// from that session's own QueuedWork and delivers it on agent.Spec.Env. A
+// credential snapshot that also carried the name would race that value, and
+// the snapshot has no session context to be right with — a stale or malformed
+// org-wide entry then silently redirects every proxied CLI read in the box.
+// Blocking the name here makes "the runner owns the platform origin"
+// structural instead of a convention.
 var AgentEnvBlocklist = []string{
 	"DONMAI_DAEMON_JWT",
 	"DONMAI_DAEMON_API_KEY",
@@ -59,6 +69,7 @@ var AgentEnvBlocklist = []string{
 	"DONMAI_ORCHESTRATOR_URL",
 	"DONMAI_CREDENTIAL_CAPABILITY",
 	"CODE_INTEL_HOST_JWT_SECRET",
+	"DONMAI_API_URL",
 }
 
 // IsBlocked reports whether name is in AgentEnvBlocklist.

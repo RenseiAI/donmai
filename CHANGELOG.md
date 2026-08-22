@@ -8,6 +8,51 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **An ambient `DONMAI_API_URL` can no longer outrank the runner's canonical
+  platform origin.** The headless `codex app-server` child was started at
+  `Provider` construction, from the ambient `os.Environ`, before any session
+  existed — so a host- or credential-snapshot-injected origin beat the
+  runner-owned one for every session that `Provider` served. Process start and
+  the initialize handshake now defer to the first headless `Spawn`/`Resume`, and
+  the child environment is composed with that session's `Spec.Env` as an
+  explicit layer above the inherited parent. `DONMAI_API_URL` is additionally
+  reserved on the canonical agent-env blocklist, so a credential snapshot can
+  never author the platform origin. (#370)
+
+### Operator-visible behaviour changes
+
+- **Plaintext HTTP to a non-loopback platform origin is now rejected.**
+  `internal/linear.NewProxiedClient` validates and canonicalizes its origin in
+  the constructor, before any request is built: userinfo, a path, a query, a
+  fragment, a trailing delimiter, an empty or out-of-range port, and `http://`
+  against anything other than a loopback host all fail closed with
+  `ErrInvalidPlatformURL`. `http://127.0.0.1:3010` and friends still work — the
+  local `donmai host` loopback and test servers are unaffected — but an operator
+  who was pointing `donmai linear` at a **remote** origin over plaintext `http`
+  must switch it to `https`. The request carries a platform bearer, so that
+  origin was never safe to use unencrypted. The rejection names the *source*
+  that supplied the origin and never echoes the value, because an origin can
+  carry a bearer in its userinfo or query.
+- **Provider registry construction no longer spawns a `codex app-server`
+  process.** Daemon-startup provider introspection and any other registry build
+  now only probe for the `codex` binary; nothing is executed. A missing binary
+  is still `agent.ErrProviderUnavailable` at construction, so an uninstalled
+  codex is skipped exactly as before, but a *failing initialize handshake* now
+  surfaces later — at the first `Spawn`, as `agent.ErrSpawnFailed` wrapping
+  `agent.ErrProviderUnavailable` — instead of at registry build. Operators
+  reading startup logs to confirm codex health should read the first session's
+  spawn result instead.
+- **One `codex` Provider serves one session's environment.** The child's
+  environment layer is frozen at start, so a later `Spawn`/`Resume` whose
+  `Spec.Env` materially differs is refused with a value-free error naming the
+  diverging keys, rather than silently served the first session's
+  `DONMAI_SESSION_ID` and `DONMAI_API_URL`. `donmai agent run` builds one
+  Provider per session, so this does not fire in normal operation; it is a
+  fail-closed guard for embedders that pool Providers. Same-environment resume
+  and the interactive PTY spawn mode are unaffected.
+
 ---
 
 ## v0.66.0 — 2026-08-20

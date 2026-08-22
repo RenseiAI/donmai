@@ -30,6 +30,10 @@ export const AGENT_ENV_BLOCKLIST: readonly string[] = Object.freeze([
   'DONMAI_ORCHESTRATOR_URL',
   'DONMAI_CREDENTIAL_CAPABILITY',
   'CODE_INTEL_HOST_JWT_SECRET',
+  // Reservation, not a secret: the platform API origin is runner-owned (it is
+  // composed per session from that session's own work item and delivered on
+  // the agent spec's env), so a snapshot must never be able to author it.
+  'DONMAI_API_URL',
 ]);
 
 const BLOCKLIST_SET: ReadonlySet<string> = new Set(AGENT_ENV_BLOCKLIST);
