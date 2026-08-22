@@ -814,6 +814,9 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 		if err != nil {
 			return SessionShimAdoptionBatchReceipt{}, err
 		}
+		if len(expected) == 0 {
+			return SessionShimAdoptionBatchReceipt{}, errors.New("session shim: adoption batch preparation omitted expected durable revision")
+		}
 		batch.ExpectedRevision = append([]byte(nil), expected...)
 	}
 	callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
@@ -821,6 +824,9 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	receipt, err := cfg.OnAdoptionBatch(callbackCtx, cloneSessionShimAdoptionBatch(batch))
 	if err != nil {
 		return SessionShimAdoptionBatchReceipt{}, err
+	}
+	if len(receipt.DurableCorrelation) == 0 {
+		return SessionShimAdoptionBatchReceipt{}, errors.New("session shim: adoption batch callback omitted durable revision receipt")
 	}
 	receipt.DurableCorrelation = append([]byte(nil), receipt.DurableCorrelation...)
 	return receipt, nil

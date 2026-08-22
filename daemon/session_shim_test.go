@@ -971,6 +971,51 @@ func TestStartupReportsEveryDuplicateTombstoneIncarnation(t *testing.T) {
 	}
 }
 
+func TestAdoptionBatchRequiresExpectedAndDurableRevisionsBeforeReady(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		expected       []byte
+		durableReceipt []byte
+	}{
+		{name: "empty expected revision", durableReceipt: []byte("revision-8")},
+		{name: "empty durable receipt", expected: []byte("revision-7")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := New(Options{
+				SkipRegistration: true,
+				SessionShim: SessionShimConfig{
+					EnableAdoption:      true,
+					RegistryDir:         t.TempDir(),
+					HostID:              "host-batch-refusal",
+					AdoptionBatchOrgIDs: []string{"org-batch-refusal"},
+					PrepareAdoptionBatch: func(context.Context, string, string) ([]byte, error) {
+						return append([]byte(nil), tc.expected...), nil
+					},
+					OnAdoptionBatch: func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+						return SessionShimAdoptionBatchReceipt{
+							DurableCorrelation: append([]byte(nil), tc.durableReceipt...),
+						}, nil
+					},
+				},
+			})
+			err := d.adoptSessionShims(context.Background())
+			if err == nil {
+				t.Fatal("adoption completed without both expected and durable batch revisions")
+			}
+			if d.SessionShimAdoptionComplete() {
+				t.Fatal("adoptionComplete became true after empty batch revision")
+			}
+			if _, ok := d.SessionShimAdoptionBatchReceipt("org-batch-refusal"); ok {
+				t.Fatal("empty batch revision was retained as a durable receipt")
+			}
+		})
+	}
+}
+
 func TestSessionShimConfigDefaultsResolveThroughTheStateSeam(t *testing.T) {
 	t.Parallel()
 

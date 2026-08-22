@@ -399,7 +399,14 @@ func sortResult(r *AdoptionResult) {
 	})
 	SortQuarantined(r.Quarantined)
 	sort.Slice(r.Tombstoned, func(i, j int) bool {
-		return r.Tombstoned[i].Identity().Key() < r.Tombstoned[j].Identity().Key()
+		left, right := r.Tombstoned[i], r.Tombstoned[j]
+		if left.Identity().Key() != right.Identity().Key() {
+			return left.Identity().Key() < right.Identity().Key()
+		}
+		if left.ShimID != right.ShimID {
+			return left.ShimID < right.ShimID
+		}
+		return left.ProcessEpoch < right.ProcessEpoch
 	})
 	sort.Slice(r.Stale, func(i, j int) bool {
 		return r.Stale[i].Identity().Key() < r.Stale[j].Identity().Key()

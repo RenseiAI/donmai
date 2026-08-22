@@ -744,6 +744,24 @@ func TestAdoptKeepsUnprovenTombstoneInVisibleCapacity(t *testing.T) {
 	}
 }
 
+func TestSortResultOrdersDuplicateTombstonesByIncarnation(t *testing.T) {
+	t.Parallel()
+
+	result := AdoptionResult{Tombstoned: []Tombstone{
+		{OrgID: "org", SessionID: "session", ShimID: "shim-b", ProcessEpoch: 2},
+		{OrgID: "org", SessionID: "session", ShimID: "shim-a", ProcessEpoch: 2},
+		{OrgID: "org", SessionID: "session", ShimID: "shim-a", ProcessEpoch: 1},
+	}}
+	sortResult(&result)
+	want := []string{"shim-a/1", "shim-a/2", "shim-b/2"}
+	for i, tombstone := range result.Tombstoned {
+		got := fmt.Sprintf("%s/%d", tombstone.ShimID, tombstone.ProcessEpoch)
+		if got != want[i] {
+			t.Fatalf("Tombstoned[%d] = %s, want %s", i, got, want[i])
+		}
+	}
+}
+
 func TestAdoptDoesNotLetTerminalIncarnationHideLiveDuplicateIdentity(t *testing.T) {
 	id := Identity{OrgID: "org-mixed", SessionID: "session-mixed"}
 	f := startShimHelper(t, id, 10_000)
