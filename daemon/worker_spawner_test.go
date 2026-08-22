@@ -1903,6 +1903,65 @@ func TestSpawner_OnPreSpawn_Invoked(t *testing.T) {
 	}
 }
 
+func TestSpawner_ShimSelector_DirectFallbackRunsPreSpawnOnce(t *testing.T) {
+	var preSpawnCalls atomic.Int32
+	var shimSpawnCalls atomic.Int32
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		ShimOwns:              func(SessionSpec) bool { return false },
+		ShimSpawn: func(SessionSpec, ProjectConfig, []string) (*SessionHandle, error) {
+			shimSpawnCalls.Add(1)
+			return nil, nil
+		},
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			preSpawnCalls.Add(1)
+			return env, nil
+		},
+	})
+	ended := sessionEnds(s)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "direct-selected", Repository: "github.com/a/b"}); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	waitSessionEnd(t, ended)
+	if got := preSpawnCalls.Load(); got != 1 {
+		t.Fatalf("OnPreSpawn calls = %d, want 1 on direct selector path", got)
+	}
+	if got := shimSpawnCalls.Load(); got != 0 {
+		t.Fatalf("ShimSpawn calls = %d, want 0 when selector declined ownership", got)
+	}
+}
+
+func TestSpawner_ShimSelector_SelectedNilHandleFailsClosed(t *testing.T) {
+	var preSpawnCalls atomic.Int32
+	var abortCalls atomic.Int32
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		ShimOwns:              func(SessionSpec) bool { return true },
+		ShimSpawn:             func(SessionSpec, ProjectConfig, []string) (*SessionHandle, error) { return nil, nil },
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			preSpawnCalls.Add(1)
+			return env, nil
+		},
+		OnSpawnAborted: func(SessionSpec, error) { abortCalls.Add(1) },
+	})
+
+	_, err := s.AcceptWork(SessionSpec{SessionID: "shim-selected", Repository: "github.com/a/b"})
+	if err == nil || !strings.Contains(err.Error(), "selector chose ownership") {
+		t.Fatalf("AcceptWork error = %v, want selected nil-handle refusal", err)
+	}
+	if got := preSpawnCalls.Load(); got != 1 {
+		t.Errorf("OnPreSpawn calls = %d, want 1", got)
+	}
+	if got := abortCalls.Load(); got != 1 {
+		t.Errorf("OnSpawnAborted calls = %d, want 1", got)
+	}
+	if got := s.ActiveCount(); got != 0 {
+		t.Errorf("ActiveCount = %d, want 0 after selector invariant failure", got)
+	}
+}
+
 // TestSpawner_OnPreSpawn_SeesBaseEnv proves the hook receives the
 // post-merge env — i.e., BaseEnv entries are visible before the hook
 // runs, so callers can selectively override them.

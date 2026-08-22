@@ -864,11 +864,17 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.StderrPrefixWriter == nil {
 		spawnerOpts.StderrPrefixWriter = newStderrSlogWriter()
 	}
-	// §D1/§D11: route interactive spawns through per-session shim ownership. The
-	// launcher itself decides which sessions qualify and returns (nil, nil) for
-	// the rest, so wiring it unconditionally changes nothing until an operator
-	// enables ownership. Embedders that supply their own launcher keep priority.
+	// §D1/§D11: select shim ownership before the credential-bearing pre-spawn
+	// hook. Without this stable selector, a direct/default-off session first
+	// acquires credentials for the shim offer and then acquires them again on the
+	// direct fallback. The selector depends only on immutable daemon config and
+	// the accepted spec; the launcher remains the fail-closed ownership move.
+	// Embedders that supply their own launcher keep its original combined
+	// decision semantics unless they also opt into ShimOwns explicitly.
 	if spawnerOpts.ShimSpawn == nil {
+		if spawnerOpts.ShimOwns == nil {
+			spawnerOpts.ShimOwns = d.shimOwnsSession
+		}
 		spawnerOpts.ShimSpawn = d.launchSessionShim
 	}
 	// Admission must see shim-held slots too, or a restarted daemon would accept
