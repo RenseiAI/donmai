@@ -7,11 +7,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // DaemonConfig holds the minimal daemon connection config read from
@@ -78,8 +81,56 @@ type DaemonStatusResponse struct {
 
 	// Projects carries desired/applied/connection/repository state per project.
 	Projects []DaemonProjectStatus `json:"projects,omitempty"`
+	// SessionShim is the secret-free local ownership/adoption diagnostic. It is
+	// always present, including mode=disabled, so status and doctor never require
+	// callers to infer whether omission means unsupported or empty.
+	SessionShim DaemonSessionShimStatus `json:"sessionShim"`
 	// Timestamp is the RFC3339 time of this snapshot.
 	Timestamp string `json:"timestamp"`
+}
+
+// DaemonSessionShimOwnershipMode is the configured controller/ownership mode.
+type DaemonSessionShimOwnershipMode string
+
+const (
+	// DaemonSessionShimDisabled means neither adoption nor new shim ownership is enabled.
+	DaemonSessionShimDisabled DaemonSessionShimOwnershipMode = "disabled"
+	// DaemonSessionShimAdoptionOnly means startup adoption is enabled but new sessions stay direct-owned.
+	DaemonSessionShimAdoptionOnly DaemonSessionShimOwnershipMode = "adoption_only"
+	// DaemonSessionShimOwnershipOnly means new shim ownership is enabled without startup adoption.
+	DaemonSessionShimOwnershipOnly DaemonSessionShimOwnershipMode = "ownership_only"
+	// DaemonSessionShimAdoptionAndOwnership means both migration stages are enabled.
+	DaemonSessionShimAdoptionAndOwnership DaemonSessionShimOwnershipMode = "adoption_and_ownership"
+)
+
+// DaemonSessionShimAdoptedCorrelation is one live controller correlation. It
+// carries only bounded process/fencing diagnostics sourced from authenticated
+// shim Hello and daemon durability state; no path, credential, output, host id,
+// or opaque composing receipt belongs here.
+type DaemonSessionShimAdoptedCorrelation struct {
+	OrgID                string `json:"orgId"`
+	SessionID            string `json:"sessionId"`
+	ShimID               string `json:"shimId"`
+	ProcessEpoch         uint64 `json:"processEpoch,omitempty"`
+	ControllerGeneration uint64 `json:"controllerGeneration,omitempty"`
+	LastForwardedSeq     uint64 `json:"lastForwardedSeq"`
+	HarnessPID           int    `json:"harnessPid,omitempty"`
+	HarnessStartedAt     int64  `json:"harnessStartedAt,omitempty"`
+	ProtocolMin          uint32 `json:"protocolMin,omitempty"`
+	ProtocolMax          uint32 `json:"protocolMax,omitempty"`
+	Phase                string `json:"phase,omitempty"`
+	Source               string `json:"source"`
+	ConsumesCapacity     bool   `json:"consumesCapacity"`
+}
+
+// DaemonSessionShimStatus is shared byte-for-byte by status and doctor.
+type DaemonSessionShimStatus struct {
+	OwnershipMode       DaemonSessionShimOwnershipMode        `json:"ownershipMode"`
+	AdoptionComplete    bool                                  `json:"adoptionComplete"`
+	AdoptionCompletedAt string                                `json:"adoptionCompletedAt,omitempty"`
+	OccupiedSlots       int                                   `json:"occupiedSlots"`
+	Adopted             []DaemonSessionShimAdoptedCorrelation `json:"adopted,omitempty"`
+	Quarantined         []sessionshim.QuarantinedSession      `json:"quarantined,omitempty"`
 }
 
 // DaemonProjectStatus is one truthful host-project status row.
@@ -151,6 +202,59 @@ type DaemonActionResponse struct {
 	OK bool `json:"ok"`
 	// Message is a human-readable description of the outcome.
 	Message string `json:"message"`
+}
+
+// DaemonRestartPreflightProtocol is the closed localhost permission wire for a
+// planned service-manager restart.
+const DaemonRestartPreflightProtocol = "session-shim-restart-preflight-v1"
+
+// DaemonRestartPreflightState is the closed permission result registry.
+type DaemonRestartPreflightState string
+
+const (
+	// DaemonRestartPrepared means every non-empty authority scope durably
+	// acknowledged the daemon's one immutable restart snapshot.
+	DaemonRestartPrepared DaemonRestartPreflightState = "prepared"
+	// DaemonRestartNotRequired means the atomically drained daemon proved the
+	// frozen snapshot has no session-shim correlations to fence.
+	DaemonRestartNotRequired DaemonRestartPreflightState = "not_required"
+)
+
+// DaemonRestartPreflightResponse is the only 2xx permission shape accepted by
+// planned-restart callers. PreparationID is server-owned and opaque; callers
+// never provide a fence id or inspect per-scope receipts.
+type DaemonRestartPreflightResponse struct {
+	Protocol      string                      `json:"protocol"`
+	State         DaemonRestartPreflightState `json:"state"`
+	PreparationID string                      `json:"preparationId"`
+	ScopeCount    int                         `json:"scopeCount"`
+}
+
+// DaemonRestartPreflightRefusalCode is the closed typed 409 refusal code.
+const DaemonRestartPreflightRefusalCode = "restart_preflight_refused"
+
+// DaemonRestartPreflightRefusal is the daemon's typed non-permission body.
+type DaemonRestartPreflightRefusal struct {
+	Error string `json:"error"`
+	Code  string `json:"code"`
+}
+
+// DaemonRestartPreflightRefusalError preserves the typed refusal for callers
+// while remaining compatible with errors.Is checks for ErrConflict.
+type DaemonRestartPreflightRefusalError struct {
+	Code    string
+	Message string
+}
+
+func (e *DaemonRestartPreflightRefusalError) Error() string {
+	if e == nil || e.Message == "" {
+		return ErrRestartPreflightRefused.Error()
+	}
+	return ErrRestartPreflightRefused.Error() + ": " + e.Message
+}
+
+func (e *DaemonRestartPreflightRefusalError) Unwrap() []error {
+	return []error{ErrRestartPreflightRefused, ErrConflict}
 }
 
 // DaemonDrainRequest is the optional body for POST /api/daemon/drain.
@@ -377,6 +481,92 @@ func (c *DaemonClient) Update() (*DaemonActionResponse, error) {
 		return nil, fmt.Errorf("daemon update: %w", err)
 	}
 	return &resp, nil
+}
+
+// PrepareRestart asks the daemon to enter draining and durably prepare its one
+// immutable session-shim restart snapshot. Only a returned closed response is
+// permission to invoke the service manager.
+func (c *DaemonClient) PrepareRestart() (*DaemonRestartPreflightResponse, error) {
+	return c.prepareRestart(context.Background(), c.httpClient)
+}
+
+// PrepareRestartContext is PrepareRestart with caller-bounded transport wait.
+// The client's ordinary 10-second timeout is disabled in favor of ctx because
+// a multi-scope durable acknowledgement may legitimately take longer.
+func (c *DaemonClient) PrepareRestartContext(ctx context.Context) (*DaemonRestartPreflightResponse, error) {
+	httpClient := *c.httpClient
+	httpClient.Timeout = 0
+	return c.prepareRestart(ctx, &httpClient)
+}
+
+func (c *DaemonClient) prepareRestart(ctx context.Context, httpClient *http.Client) (*DaemonRestartPreflightResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/daemon/restart/prepare", http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("daemon restart prepare: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("daemon restart prepare: request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusConflict {
+		var refusal DaemonRestartPreflightRefusal
+		dec := json.NewDecoder(io.LimitReader(resp.Body, 8192))
+		dec.DisallowUnknownFields()
+		if decodeErr := dec.Decode(&refusal); decodeErr == nil && refusal.Code == DaemonRestartPreflightRefusalCode {
+			return nil, &DaemonRestartPreflightRefusalError{Code: refusal.Code, Message: refusal.Error}
+		}
+	}
+	if err := daemonStatusToError(resp, "/api/daemon/restart/prepare"); err != nil {
+		return nil, fmt.Errorf("daemon restart prepare: %w", err)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8193))
+	if err != nil {
+		return nil, fmt.Errorf("%w: read body: %v", ErrInvalidRestartPreflightResponse, err)
+	}
+	if len(raw) > 8192 {
+		return nil, fmt.Errorf("%w: body exceeds 8192 bytes", ErrInvalidRestartPreflightResponse)
+	}
+	var result DaemonRestartPreflightResponse
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&result); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidRestartPreflightResponse, err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("%w: trailing JSON value", ErrInvalidRestartPreflightResponse)
+		}
+		return nil, fmt.Errorf("%w: trailing data: %v", ErrInvalidRestartPreflightResponse, err)
+	}
+	if err := validateDaemonRestartPreflightResponse(result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func validateDaemonRestartPreflightResponse(result DaemonRestartPreflightResponse) error {
+	if result.Protocol != DaemonRestartPreflightProtocol {
+		return fmt.Errorf("%w: protocol %q", ErrInvalidRestartPreflightResponse, result.Protocol)
+	}
+	if strings.TrimSpace(result.PreparationID) == "" {
+		return fmt.Errorf("%w: preparationId is empty", ErrInvalidRestartPreflightResponse)
+	}
+	switch result.State {
+	case DaemonRestartPrepared:
+		if result.ScopeCount <= 0 {
+			return fmt.Errorf("%w: prepared scopeCount is %d", ErrInvalidRestartPreflightResponse, result.ScopeCount)
+		}
+	case DaemonRestartNotRequired:
+		if result.ScopeCount != 0 {
+			return fmt.Errorf("%w: not_required scopeCount is %d", ErrInvalidRestartPreflightResponse, result.ScopeCount)
+		}
+	default:
+		return fmt.Errorf("%w: state %q", ErrInvalidRestartPreflightResponse, result.State)
+	}
+	return nil
 }
 
 // GetPoolStats fetches the full workarea pool state, including per-member

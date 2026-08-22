@@ -426,6 +426,32 @@ func (s *WorkerSpawner) Pause() {
 	s.accepting = false
 }
 
+// pauseAndWaitSpawnReservations closes admission and waits until every claim
+// that crossed the old admission edge has either published its live owner or
+// aborted. A restart snapshot taken before this settles can omit a shim whose
+// launch is already in flight.
+func (s *WorkerSpawner) pauseAndWaitSpawnReservations(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.Pause()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		pending := len(s.spawnReservations)
+		s.mu.Unlock()
+		if pending == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // Resume restores accepting state.
 func (s *WorkerSpawner) Resume() {
 	s.mu.Lock()
