@@ -27,9 +27,32 @@ This mirrors the legacy TS
 Per F.0.1 §6 (item 2) and the F.2.4 dispatch brief: v0.5.0 ships
 **app-server only**. The legacy TS `codex exec` fallback was a band-aid
 for stale codex binaries; Wave 6 requires a known-good codex on PATH.
-If `codex` is missing or the JSON-RPC initialize handshake fails,
-`codex.New` returns `agent.ErrProviderUnavailable` so the runner fails
-fast before doing any worktree work.
+If `codex` is missing, `codex.New` returns `agent.ErrProviderUnavailable`
+so the runner fails fast before doing any worktree work.
+
+Process start and the JSON-RPC initialize handshake are deferred to the
+first headless `Spawn`/`Resume`; a handshake failure there surfaces as
+`agent.ErrSpawnFailed` wrapping `agent.ErrProviderUnavailable`. The
+deferral is what lets the child environment be composed from the
+session's own `Spec.Env` (see [Environment composition](#environment-composition))
+rather than from whatever the constructing process happened to inherit.
+
+## Environment composition
+
+The app-server child's environment is built once, at start, by
+`mergeEnv` → `runtime/env.ComposeChildEnv`, in this order (later wins):
+
+1. the inherited parent environment, minus runner-only attach controls
+   and the agent-auth blocklist;
+2. `Options.Env` — the construction-time layer (e.g. `OPENAI_API_KEY`);
+3. the spawning session's `Spec.Env` — the runner-owned per-session
+   layer, which is the canonical owner of session routing values such as
+   the platform API origin;
+4. the Provider's own `CODEX_HOME`, which no caller may override.
+
+Layer 3 is why the start is lazy: composing it at construction time is
+impossible, and an eagerly-started app-server would pin every session it
+serves to the ambient values of the process that built the registry.
 
 ## Capability matrix (F.1.1 §3.2 lock)
 

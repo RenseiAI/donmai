@@ -21,7 +21,11 @@
 // app-server only. The legacy `codex exec` band-aid covered stale codex
 // binaries; Wave 6 requires a known-good codex on PATH. If the binary is
 // missing, codex.New returns agent.ErrProviderUnavailable so the runner
-// fails fast before doing any worktree work.
+// fails fast before doing any worktree work. Process start and the
+// initialize handshake are deferred to the first headless Spawn/Resume so
+// the child environment can be composed from that session's Spec.Env; a
+// handshake failure there wraps agent.ErrProviderUnavailable in
+// agent.ErrSpawnFailed.
 //
 // # Capability matrix (locked in F.1.1 §3.2)
 //

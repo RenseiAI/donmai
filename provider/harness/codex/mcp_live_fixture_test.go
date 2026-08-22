@@ -12,12 +12,18 @@ import (
 
 const codexFakeMCPStdioEnv = "DONMAI_CODEX_FAKE_MCP_STDIO"
 
-// TestMain lets the package test binary double as a real stdio MCP server for
-// the live Codex app-server boundary test. The child path never runs tests and
-// writes protocol messages only to stdout.
+// TestMain lets the package test binary double as (a) a real stdio MCP server
+// for the live Codex app-server boundary test and (b) a fake `codex
+// app-server` for the per-session environment-overlay boundary test
+// (appserver_env_test.go). Both child paths never run tests and write protocol
+// messages only to stdout.
 func TestMain(m *testing.M) {
 	if os.Getenv(codexFakeMCPStdioEnv) == "1" {
 		runCodexFakeMCPStdio()
+		os.Exit(0)
+	}
+	if os.Getenv(codexFakeAppServerEnv) == "1" {
+		runCodexFakeAppServer()
 		os.Exit(0)
 	}
 	os.Exit(m.Run())

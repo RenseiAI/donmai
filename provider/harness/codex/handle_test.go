@@ -206,6 +206,14 @@ func newTestProvider(t *testing.T) (*Provider, *fakeServer) {
 		fs.close()
 		t.Fatalf("New: %v", err)
 	}
+	// New defers the app-server start so Spawn/Resume can overlay the
+	// per-session Spec.Env (see startLocked). Tests built on this helper reach
+	// for provider internals that need a live client, so start it here; the
+	// deferral itself is covered by the dedicated Spawn-boundary tests.
+	if err := p.ensureStarted(); err != nil {
+		fs.close()
+		t.Fatalf("ensureStarted: %v", err)
+	}
 	t.Cleanup(func() {
 		_ = p.Shutdown(context.Background())
 		fs.close()
