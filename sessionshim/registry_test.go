@@ -262,7 +262,7 @@ func TestPutTombstoneWithdrawsTheLiveRecord(t *testing.T) {
 	tomb := Tombstone{
 		SchemaVersion: RecordSchemaVersion,
 		OrgID:         id.OrgID, SessionID: id.SessionID,
-		ShimID: "shim-1", HarnessPID: 4242, HarnessStartedAt: 17,
+		ShimID: "shim-1", ProcessEpoch: 1, HarnessPID: 4242, HarnessStartedAt: 17,
 		ExitCode: 0, LastSeq: 12, GroupReaped: true,
 		ObservedAtUnixNano: time.Now().UnixNano(),
 	}
@@ -295,6 +295,51 @@ func TestPutTombstoneWithdrawsTheLiveRecord(t *testing.T) {
 	}
 	if len(tombs) != 1 {
 		t.Fatalf("ScanTombstones returned %d, want 1", len(tombs))
+	}
+}
+
+func TestTombstonesPersistPerIncarnationAndLegacyAPIsRefuseAmbiguity(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	first := Tombstone{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-a", ProcessEpoch: 1, GroupReaped: true,
+		ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	second := first
+	second.ShimID = "shim-b"
+	second.ProcessEpoch = 2
+	second.ObservedAtUnixNano++
+	if err := reg.PutTombstone(first); err != nil {
+		t.Fatalf("PutTombstone first: %v", err)
+	}
+	if err := reg.PutTombstone(second); err != nil {
+		t.Fatalf("PutTombstone second: %v", err)
+	}
+	tombstones, err := reg.ScanTombstones()
+	if err != nil {
+		t.Fatalf("ScanTombstones: %v", err)
+	}
+	if len(tombstones) != 2 || tombstones[0].ShimID != "shim-a" || tombstones[1].ShimID != "shim-b" {
+		t.Fatalf("per-incarnation tombstones = %+v, want both exact proofs", tombstones)
+	}
+	if _, err := reg.GetTombstone(id); !errors.Is(err, ErrTombstoneAmbiguous) {
+		t.Fatalf("legacy GetTombstone ambiguity = %v, want ErrTombstoneAmbiguous", err)
+	}
+	if err := reg.RemoveTombstone(id); !errors.Is(err, ErrTombstoneAmbiguous) {
+		t.Fatalf("legacy RemoveTombstone ambiguity = %v, want ErrTombstoneAmbiguous", err)
+	}
+	if got, err := reg.GetTombstoneIncarnation(id, second.ShimID, second.ProcessEpoch); err != nil || got.ShimID != second.ShimID {
+		t.Fatalf("GetTombstoneIncarnation second = %+v, %v", got, err)
+	}
+	if err := reg.RemoveTombstoneIncarnation(first); err != nil {
+		t.Fatalf("RemoveTombstoneIncarnation first: %v", err)
+	}
+	if got, err := reg.GetTombstone(id); err != nil || got.ShimID != second.ShimID {
+		t.Fatalf("legacy GetTombstone after exact removal = %+v, %v", got, err)
 	}
 }
 

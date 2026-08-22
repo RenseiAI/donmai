@@ -47,6 +47,11 @@ const (
 	// QuarantineAdoptionFailed: the handshake failed for a transport or protocol
 	// reason not covered above.
 	QuarantineAdoptionFailed QuarantineReason = "adoption_failed"
+	// QuarantineGroupReapUnproven: a terminal tombstone exists but could not
+	// prove the harness process group disappeared. The session remains visible
+	// capacity until exact positive evidence reconciles it; a tombstone-shaped
+	// file alone is not proof of death (§D10).
+	QuarantineGroupReapUnproven QuarantineReason = "group_reap_unproven"
 )
 
 // Known reports whether r is an assigned v1 quarantine reason.
@@ -54,7 +59,8 @@ func (r QuarantineReason) Known() bool {
 	switch r {
 	case QuarantineProtocolMismatch, QuarantineRecordMalformed, QuarantineDuplicateIdentity,
 		QuarantineIdentityMismatch, QuarantineUnauthenticated, QuarantinePhaseUnknown,
-		QuarantineGenerationNotAdvanced, QuarantineSocketUnreachable, QuarantineAdoptionFailed:
+		QuarantineGenerationNotAdvanced, QuarantineSocketUnreachable, QuarantineAdoptionFailed,
+		QuarantineGroupReapUnproven:
 		return true
 	default:
 		return false

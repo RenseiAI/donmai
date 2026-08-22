@@ -1112,6 +1112,21 @@ func TestPollItemToSessionSpec_DoesNotWarn(t *testing.T) {
 	}
 }
 
+func TestPollItemToSessionSpecCarriesOrganizationLifecycleIdentity(t *testing.T) {
+	t.Parallel()
+
+	item := PollWorkItem{
+		SessionID:      "session-org",
+		OrganizationID: "org-satellite",
+		ProjectID:      "project-satellite",
+		Repository:     "https://example.invalid/org/repo",
+	}
+	spec := PollItemToSessionSpec(item, nil)
+	if spec.OrganizationID != item.OrganizationID {
+		t.Fatalf("SessionSpec.OrganizationID = %q, want %q", spec.OrganizationID, item.OrganizationID)
+	}
+}
+
 // TestCallNackEndpoint_PostsExpectedShape pins the daemon's NACK
 // wire contract against the orchestrator's nack route validation:
 // POST /api/sessions/<id>/nack with `{ workerId, reason, work }`
