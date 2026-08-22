@@ -160,13 +160,21 @@ func newLinearClient(ds func() afclient.DataSource, bin string) (linear.Linear, 
 	// the same proxied-GraphQL path works in-box. NewProxiedClient sends the
 	// token as `Authorization: Bearer <token>`, which the JWT satisfies.
 	if baseURL, token, ok := workerAuthProxyCredentials(); ok {
-		return linear.NewProxiedClient(baseURL, token)
+		client, err := linear.NewProxiedClient(baseURL, token)
+		if err != nil {
+			return nil, proxyOriginError(err, "DONMAI_API_URL")
+		}
+		return client, nil
 	}
 
 	// Path 2: platform proxy (platform login session).
 	if ds != nil {
 		if baseURL, token, ok := afclient.CredentialsFromDataSource(ds()); ok {
-			return linear.NewProxiedClient(baseURL, token)
+			client, err := linear.NewProxiedClient(baseURL, token)
+			if err != nil {
+				return nil, proxyOriginError(err, "the stored platform base URL")
+			}
+			return client, nil
 		}
 	}
 
@@ -174,6 +182,24 @@ func newLinearClient(ds func() afclient.DataSource, bin string) (linear.Linear, 
 	return nil, cli.UserError(
 		"linear access requires either a LINEAR_API_KEY env var or a logged-in platform session",
 		"set the LINEAR_API_KEY env var, or run `"+bin+" auth add --user` then `"+bin+" project trackers connect-linear`",
+	)
+}
+
+// proxyOriginError turns a rejected proxy origin into an actionable operator
+// error naming the source that supplied it. A malformed origin is a
+// configuration fault, not a Linear fault, and the operator cannot fix it
+// without knowing which knob to turn.
+//
+// source is a NAME, never a value: the rejected origin can carry a bearer in
+// its userinfo or query, and this message reaches stderr, structured logs and
+// session records. linear.NewProxiedClient's own error is already value-free.
+func proxyOriginError(err error, source string) error {
+	if !errors.Is(err, linear.ErrInvalidPlatformURL) {
+		return err
+	}
+	return cli.UserError(
+		"the configured platform origin for the Linear proxy is not usable: "+err.Error(),
+		"fix the origin supplied by "+source+"; it must be a bare https origin such as https://platform.example.com — no credentials, path, query, fragment or trailing delimiter",
 	)
 }
 

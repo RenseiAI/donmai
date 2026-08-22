@@ -287,9 +287,16 @@ func NewClient(apiKey string) (*Client, error) {
 
 // NewProxiedClient constructs a Client that routes GraphQL through the
 // platform's /api/cli/linear/graphql proxy under the caller's rsk_ token.
-// platformBaseURL is the platform root (e.g. "https://platform.example.com");
+// platformBaseURL is the platform ORIGIN (e.g. "https://platform.example.com");
 // rskToken is the user's platform API key (Bearer-style). Returns
-// ErrInvalidAPIKey when either is empty.
+// ErrInvalidAPIKey when the token is empty.
+//
+// platformBaseURL is validated as a bare, credential-free HTTP(S) origin and
+// canonicalized (see canonicalProxyOrigin); anything else returns an error
+// wrapping ErrInvalidPlatformURL. That check is the constructor's job on
+// purpose: the origin arrives from operator/credential configuration, so it
+// must fail closed before any request is built and before the bearer token is
+// attached to one. The error text never echoes the rejected value.
 //
 // The returned client speaks the exact same GraphQL queries as a direct
 // Linear client — the proxy mirrors api.linear.app/graphql's envelope.
@@ -297,13 +304,12 @@ func NewProxiedClient(platformBaseURL, rskToken string) (*Client, error) {
 	if strings.TrimSpace(rskToken) == "" {
 		return nil, ErrInvalidAPIKey
 	}
-	if strings.TrimSpace(platformBaseURL) == "" {
-		return nil, fmt.Errorf("linear: platform base URL is required")
+	origin, err := canonicalProxyOrigin(platformBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("linear: %w", err)
 	}
-	// Strip trailing slash for clean URL composition.
-	base := strings.TrimRight(platformBaseURL, "/")
 	return &Client{
-		BaseURL:    base + "/api/cli/linear/graphql",
+		BaseURL:    origin + "/api/cli/linear/graphql",
 		APIKey:     rskToken,
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
 		ProxyMode:  true,

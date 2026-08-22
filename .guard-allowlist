@@ -76,6 +76,16 @@ TRACKER_ID_SLUG :: ^runner/operational_payload_test\.go :: r[e]n-2034 :: qw\.Bra
 # after guard-b began scanning whole files. Each exemption is constrained to
 # the exact production assignment or its directly corresponding documentation
 # and assertions, so another hosted endpoint occurrence still fails.
-CLOSED_CLI_ENDPOINT :: ^internal/linear/client\.go :: /api/cl[i]/ :: (platform's /api/cl[i]/linear/graphql proxy where APIKey holds the|platform's /api/cl[i]/linear/graphql proxy under the caller's rsk_ token|BaseURL:[[:space:]]+base \+ "/api/cl[i]/linear/graphql")
+CLOSED_CLI_ENDPOINT :: ^internal/linear/client\.go :: /api/cl[i]/ :: (platform's /api/cl[i]/linear/graphql proxy where APIKey holds the|platform's /api/cl[i]/linear/graphql proxy under the caller's rsk_ token|BaseURL:[[:space:]]+origin \+ "/api/cl[i]/linear/graphql")
 CLOSED_CLI_ENDPOINT :: ^internal/linear/client_test\.go :: /api/cl[i]/ :: c\.BaseURL != "https://platform\.example\.com/api/cl[i]/linear/graphql"
 CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/linear_test\.go :: /api/cl[i]/ :: (subcommand routes its GraphQL through `/api/cl[i]/linear/graphql`|subcommand proxies GraphQL through /api/cl[i]/linear/graphql|gotPath != "/api/cl[i]/linear/graphql"|t\.Errorf\("path = %q, want %q", gotPath, "/api/cl[i]/linear/graphql"\))
+# afcli/linearcmd/linear.go: the auth-strategy header and the Path-1.5 comment
+# name the concrete hosted GraphQL proxy suffix frozen by the accepted OSS CLI
+# proxy contract — the same suffix already curated for internal/linear (above),
+# documented here at the resolution site that chooses it. Pre-existing and
+# unrelated to the change that first staged this file (an actionable
+# malformed-origin error added at the two NewProxiedClient call sites);
+# --staged scans the whole file, not just the diff. Rewriting the comments to
+# omit the real route would make the documentation false. Scoped to the three
+# exact pre-existing lines so a NEW unscoped hit still fails.
+CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/linear\.go :: /api/cl[i]/ :: (platform URL; proxy GraphQL through /api/cl[i]/linear/graphql under that|token\), GraphQL is proxied through the platform's /api/cl[i]/linear/graphql|// /api/cl[i]/linear/graphql proxy accepts this JWT as an additive auth)
