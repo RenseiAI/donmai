@@ -2,6 +2,7 @@ package sessionshim
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -144,7 +145,7 @@ func TestQuarantineProjectionAlwaysConsumesCapacity(t *testing.T) {
 	// hide occupied capacity by passing false.
 	now := time.Unix(1_700_000_100, 0)
 	rec := Record{
-		OrgID: "org-1", SessionID: "sess-1", ShimID: "shim-1",
+		OrgID: "org-1", SessionID: "sess-1", ShimID: "shim-1", ProcessEpoch: 17,
 		ProtocolMin: 7, ProtocolMax: 9, Phase: shimwire.PhaseRunning,
 		CreatedAtUnixNano: now.Add(-90 * time.Second).UnixNano(),
 	}
@@ -166,6 +167,9 @@ func TestQuarantineProjectionAlwaysConsumesCapacity(t *testing.T) {
 		if q.ProtocolMin != 7 || q.ProtocolMax != 9 {
 			t.Errorf("reason %q lost the protocol range an operator needs to diagnose it", reason)
 		}
+		if q.ProcessEpoch != 17 {
+			t.Errorf("reason %q process epoch = %d, want 17", reason, q.ProcessEpoch)
+		}
 	}
 	if QuarantineReason("because").Known() {
 		t.Error("the quarantine-reason registry is not closed")
@@ -181,12 +185,13 @@ func TestSortQuarantinedIsStableAcrossSnapshots(t *testing.T) {
 		{OrgID: "o", SessionID: "s2", ShimID: "b"},
 		{OrgID: "n", SessionID: "s1", ShimID: "a"},
 		{OrgID: "o", SessionID: "s1", ShimID: "z"},
-		{OrgID: "o", SessionID: "s1", ShimID: "a"},
+		{OrgID: "o", SessionID: "s1", ShimID: "a", ProcessEpoch: 2},
+		{OrgID: "o", SessionID: "s1", ShimID: "a", ProcessEpoch: 1},
 	}
 	SortQuarantined(in)
-	want := []string{"n/s1/a", "o/s1/a", "o/s1/z", "o/s2/b"}
+	want := []string{"n/s1/a/0", "o/s1/a/1", "o/s1/a/2", "o/s1/z/0", "o/s2/b/0"}
 	for i, w := range want {
-		got := in[i].Identity().String() + "/" + in[i].ShimID
+		got := fmt.Sprintf("%s/%s/%d", in[i].Identity(), in[i].ShimID, in[i].ProcessEpoch)
 		if got != w {
 			t.Fatalf("sorted[%d] = %s, want %s", i, got, w)
 		}

@@ -72,9 +72,10 @@ type QuarantinedSession struct {
 	OrgID     string `json:"orgId"`
 	SessionID string `json:"sessionId"`
 
-	ShimID      string `json:"shimId,omitempty"`
-	ProtocolMin uint32 `json:"protocolMin,omitempty"`
-	ProtocolMax uint32 `json:"protocolMax,omitempty"`
+	ShimID       string `json:"shimId,omitempty"`
+	ProcessEpoch uint64 `json:"processEpoch,omitempty"`
+	ProtocolMin  uint32 `json:"protocolMin,omitempty"`
+	ProtocolMax  uint32 `json:"protocolMax,omitempty"`
 
 	Reason QuarantineReason `json:"reason"`
 	// Detail is display-only. It is never parsed and never carries a secret.
@@ -106,6 +107,7 @@ func NewQuarantinedSession(rec Record, reason QuarantineReason, detail string, n
 		OrgID:            rec.OrgID,
 		SessionID:        rec.SessionID,
 		ShimID:           rec.ShimID,
+		ProcessEpoch:     rec.ProcessEpoch,
 		ProtocolMin:      rec.ProtocolMin,
 		ProtocolMax:      rec.ProtocolMax,
 		Reason:           reason,
@@ -121,9 +123,10 @@ func NewQuarantinedSession(rec Record, reason QuarantineReason, detail string, n
 	return q
 }
 
-// SortQuarantined orders a projection deterministically (by identity, then shim
-// id) so host-status and heartbeat payloads are stable across beats and an
-// operator diffing two snapshots sees real changes rather than map ordering.
+// SortQuarantined orders a projection deterministically (by identity, shim id,
+// then process epoch) so host-status and heartbeat payloads are stable across
+// beats and an operator diffing two snapshots sees real changes rather than map
+// ordering.
 func SortQuarantined(in []QuarantinedSession) {
 	sort.Slice(in, func(i, j int) bool {
 		if in[i].OrgID != in[j].OrgID {
@@ -132,6 +135,9 @@ func SortQuarantined(in []QuarantinedSession) {
 		if in[i].SessionID != in[j].SessionID {
 			return in[i].SessionID < in[j].SessionID
 		}
-		return in[i].ShimID < in[j].ShimID
+		if in[i].ShimID != in[j].ShimID {
+			return in[i].ShimID < in[j].ShimID
+		}
+		return in[i].ProcessEpoch < in[j].ProcessEpoch
 	})
 }

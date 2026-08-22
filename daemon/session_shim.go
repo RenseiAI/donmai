@@ -116,10 +116,18 @@ type adoptedShim struct {
 	// daemon generation that is gone, and inventing project/repository fields
 	// from nothing would put guesses on an operator-facing surface.
 	handle SessionHandle
+	// spec is retained only for a shim this daemon launched. Its exact value is
+	// the lifecycle payload delivered to ordinary WorkerSpawner listeners; an
+	// adopted shim deliberately has no fabricated spec.
+	spec SessionSpec
 	// launched distinguishes "this daemon created it" from "this daemon adopted
 	// it after a restart" — a diagnostic distinction only (§D11: ownership mode
 	// is a diagnostic field, never a second lifecycle authority).
 	launched bool
+	// terminal serializes immutable Exit handling. The entry stays present while
+	// synchronous Ended listeners run, preserving capacity ownership until their
+	// generation-scoped cleanup is complete.
+	terminal bool
 }
 
 // sessionShimState is the daemon's live view of per-session shim ownership.
@@ -297,6 +305,7 @@ func (d *Daemon) SessionShimOccupancy() int {
 	if d.shims == nil {
 		return 0
 	}
+	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	return len(d.shims.adopted) + len(d.shims.quarantined)
@@ -325,6 +334,7 @@ func (d *Daemon) QuarantinedSessions() []sessionshim.QuarantinedSession {
 	if d.shims == nil {
 		return nil
 	}
+	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
 	if len(d.shims.quarantined) == 0 {
@@ -363,15 +373,20 @@ func (d *Daemon) RequestSessionShimRestartFence(ctx context.Context, fenceID str
 	var covered []sessionshim.FencedSession
 
 	if d.shims != nil {
+		d.reconcileQuarantinedTombstones()
 		d.shims.mu.RLock()
 		for id, entry := range d.shims.adopted {
-			covered = append(covered, sessionshim.FencedSession{
+			coveredSession := sessionshim.FencedSession{
 				OrgID: id.OrgID, SessionID: id.SessionID, ShimID: entry.shimID,
-			})
+			}
+			if entry.controller != nil {
+				coveredSession.ProcessEpoch = entry.controller.Hello().ProcessEpoch
+			}
+			covered = append(covered, coveredSession)
 		}
 		for _, q := range d.shims.quarantined {
 			covered = append(covered, sessionshim.FencedSession{
-				OrgID: q.OrgID, SessionID: q.SessionID, ShimID: q.ShimID,
+				OrgID: q.OrgID, SessionID: q.SessionID, ShimID: q.ShimID, ProcessEpoch: q.ProcessEpoch,
 			})
 		}
 		d.shims.mu.RUnlock()

@@ -104,15 +104,25 @@ type SpawnerOptions struct {
 	// Nil reads as zero, which is correct for an embedder with no shims.
 	ExternalOccupancy func() int
 
-	// ShimSpawn, when non-nil, is consulted for every accepted session BEFORE
-	// the ordinary direct-child spawn (ADR-2026-08-17 §D1/§D11).
+	// ShimOwns, when non-nil, is the stable ownership selector consulted before
+	// ShimSpawn or OnPreSpawn. False goes directly to the ordinary child path;
+	// true requires ShimSpawn to return a handle or error and may never silently
+	// fall through. The selector must depend only on immutable daemon config and
+	// the supplied spec so ownership cannot change between selection and launch.
 	//
-	// It returns a handle when the session was launched under per-session shim
-	// ownership, and (nil, nil) when it was not — which is the spawner's signal
-	// to fall through to the direct path. That three-way return, rather than a
-	// separate "is this shim-owned?" predicate, keeps the OWNERSHIP DECISION and
-	// the launch in one place: a spawner that asked first and launched second
-	// could have the answer change between the two calls.
+	// Nil preserves the original ShimSpawn contract for external embedders whose
+	// callback makes the combined decision. The built-in daemon always supplies
+	// this selector. Keeping selection ahead of OnPreSpawn is load-bearing:
+	// otherwise a direct fallback invokes credential/resource acquisition twice.
+	ShimOwns func(spec SessionSpec) bool
+
+	// ShimSpawn, when non-nil, is consulted for selected sessions BEFORE the
+	// ordinary direct-child spawn (ADR-2026-08-17 §D1/§D11).
+	//
+	// With ShimOwns nil it returns a handle when the session was launched under
+	// per-session shim ownership, and (nil, nil) when it was not. With ShimOwns
+	// non-nil, a selected launch returning (nil, nil) is an invariant violation
+	// and fails closed instead of downgrading to direct ownership.
 	//
 	// A non-nil error fails the accept, fail-closed. A session the daemon
 	// intended to launch under a shim must not silently become a
@@ -856,11 +866,33 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// §D1: shim ownership is decided before any daemon-owned process exists. Once
 	// the direct path has created a pipe or an exec.Cmd, the daemon is already
 	// the owner this design exists to stop it from being.
-	if handle, handled, err := s.spawnThroughShim(spec, project); handled || err != nil {
+	shimSelected := false
+	if s.opts.ShimOwns != nil {
+		shimSelected = s.opts.ShimOwns(spec)
+		if shimSelected && s.opts.ShimSpawn == nil {
+			return nil, errors.New("session shim selector chose ownership but no launcher is configured")
+		}
+	} else {
+		// Legacy embedders keep the combined-decision contract: a configured
+		// launcher is offered every session and may decline with (nil, nil).
+		shimSelected = s.opts.ShimSpawn != nil
+	}
+	if shimSelected {
+		handle, handled, err := s.spawnThroughShim(spec, project)
+		if s.opts.ShimOwns != nil && !handled && err == nil {
+			err = errors.New("session shim selector chose ownership but launcher returned no handle")
+			if s.opts.OnSpawnAborted != nil && s.opts.OnPreSpawn != nil {
+				s.opts.OnSpawnAborted(spec, err)
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
-		return handle, nil
+		if handled {
+			return handle, nil
+		}
+		// Legacy combined-decision callback declined ownership. Continue to
+		// the direct path exactly as before.
 	}
 
 	command := s.opts.WorkerCommand
