@@ -24,7 +24,12 @@ func peerUID(conn *net.UnixConn) (int, error) {
 		credEr error
 	)
 	if cerr := raw.Control(func(fd uintptr) {
-		xu, err := unix.GetsockoptXucred(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
+		if fd > uintptr(^uint(0)>>1) {
+			credEr = fmt.Errorf("socket descriptor %d exceeds int range", fd)
+			return
+		}
+		socketFD := int(fd) //nolint:gosec // G115: bounded by the int-range check above.
+		xu, err := unix.GetsockoptXucred(socketFD, unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
 		if err != nil {
 			credEr = err
 			return
