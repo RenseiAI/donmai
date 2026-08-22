@@ -35,8 +35,15 @@ func TestReleaseDecisionNeverReleasesOnExpiryAlone(t *testing.T) {
 		Sessions:          []FencedSession{{OrgID: "org-1", SessionID: "somebody-else"}},
 		HoldUntilUnixNano: now.Add(time.Minute).UnixNano(),
 	}
-	reapedTombstone := &Tombstone{GroupReaped: true}
-	unreapedTombstone := &Tombstone{GroupReaped: false}
+	reapedTombstone := &Tombstone{
+		OrgID: id.OrgID, SessionID: id.SessionID, ShimID: "shim-1", GroupReaped: true,
+	}
+	unreapedTombstone := &Tombstone{
+		OrgID: id.OrgID, SessionID: id.SessionID, ShimID: "shim-1", GroupReaped: false,
+	}
+	wrongTombstone := &Tombstone{
+		OrgID: id.OrgID, SessionID: "different-session", ShimID: "shim-1", GroupReaped: true,
+	}
 
 	cases := []struct {
 		name  string
@@ -76,6 +83,10 @@ func TestReleaseDecisionNeverReleasesOnExpiryAlone(t *testing.T) {
 			fence: &expired, proof: TerminalProof{Tombstone: unreapedTombstone}, want: ReleaseReconcile,
 		},
 		{
+			name:  "wrong tombstone cannot release sole fenced correlation",
+			fence: &held, proof: TerminalProof{Tombstone: wrongTombstone}, want: ReleaseHeld,
+		},
+		{
 			name: "already-reconciling fence no longer holds",
 			fence: &Fence{
 				FenceID: "f1", Sessions: covered, State: FenceReconciliationRequired,
@@ -92,6 +103,47 @@ func TestReleaseDecisionNeverReleasesOnExpiryAlone(t *testing.T) {
 				t.Fatalf("ReleaseDecision = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReleaseDecisionRequiresEveryDuplicateCorrelationProof(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	id := Identity{OrgID: "org-duplicate", SessionID: "session-duplicate"}
+	fence := Fence{
+		FenceID: "fence-duplicate",
+		State:   FenceHeld,
+		Sessions: []FencedSession{
+			{OrgID: id.OrgID, SessionID: id.SessionID, ShimID: "shim-a", ProcessEpoch: 1},
+			{OrgID: id.OrgID, SessionID: id.SessionID, ShimID: "shim-b", ProcessEpoch: 2},
+		},
+		HoldUntilUnixNano: now.Add(time.Minute).UnixNano(),
+	}
+	tombstoneA := Tombstone{
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-a", ProcessEpoch: 1, GroupReaped: true,
+	}
+	proof := TerminalProof{Correlations: []TerminalCorrelationProof{{
+		ShimID: "shim-a", ProcessEpoch: 1, Tombstone: &tombstoneA,
+	}}}
+	if got := ReleaseDecision(&fence, id, proof, now); got != ReleaseHeld {
+		t.Fatalf("one of two proofs under held fence = %q, want held", got)
+	}
+	expired := fence
+	expired.HoldUntilUnixNano = now.Add(-time.Second).UnixNano()
+	if got := ReleaseDecision(&expired, id, proof, now); got != ReleaseReconcile {
+		t.Fatalf("one of two proofs after expiry = %q, want reconciliation", got)
+	}
+	tombstoneB := Tombstone{
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-b", ProcessEpoch: 2, GroupReaped: true,
+	}
+	proof.Correlations = append(proof.Correlations, TerminalCorrelationProof{
+		ShimID: "shim-b", ProcessEpoch: 2, Tombstone: &tombstoneB,
+	})
+	if got := ReleaseDecision(&fence, id, proof, now); got != ReleaseAllowed {
+		t.Fatalf("both exact proofs = %q, want allowed", got)
 	}
 }
 

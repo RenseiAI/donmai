@@ -68,7 +68,7 @@ type ControllerOptions struct {
 	// bound to the shim's authoritative current generation and return the exact
 	// per-session generation/extensions to send. An error refuses adoption before
 	// generation changes.
-	PrepareAdoption func(current shimwire.Generation) (PreparedAdoption, error)
+	PrepareAdoption func(evidence AdoptionPreparation) (PreparedAdoption, error)
 	// ResumeFrom is the first sequence this controller still needs, i.e. its
 	// durable last_forwarded_seq + 1. Zero means "from the start of the stream".
 	ResumeFrom uint64
@@ -238,7 +238,18 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	}
 	extensions := opts.Extensions
 	if opts.PrepareAdoption != nil {
-		prepared, prepareErr := opts.PrepareAdoption(hello.Generation)
+		lastForwarded := uint64(0)
+		if opts.ResumeFrom > 0 {
+			lastForwarded = opts.ResumeFrom - 1
+		}
+		prepared, prepareErr := opts.PrepareAdoption(AdoptionPreparation{
+			Identity:                    c.id,
+			ControllerID:                opts.ControllerID,
+			ShimID:                      hello.ShimID,
+			ProcessEpoch:                hello.ProcessEpoch,
+			CurrentControllerGeneration: hello.Generation,
+			LastForwardedSeq:            lastForwarded,
+		})
 		if prepareErr != nil {
 			return prepareErr
 		}
@@ -291,11 +302,21 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	// Trust the COMMITTED generation, not the proposed one. They agree today, but
 	// the shim is authoritative and a controller that assumed its own proposal
 	// would fence itself out the moment they ever diverged.
-	if adopted.Generation < proposed {
-		return fmt.Errorf("%w: shim committed generation %d, below the proposed %d",
-			ErrAdoptionRefused, adopted.Generation, proposed)
+	if err := validateAdoptionCommit(adopted, proposed, extensions); err != nil {
+		return err
 	}
 	c.hello, c.adopted, c.gen = hello, adopted, adopted.Generation
+	return nil
+}
+
+func validateAdoptionCommit(adopted shimwire.Adopted, proposed shimwire.Generation, extensions shimwire.Extensions) error {
+	if adopted.Generation != proposed {
+		return fmt.Errorf("%w: shim committed generation %d, expected exactly %d",
+			ErrAdoptionRefused, adopted.Generation, proposed)
+	}
+	if !extensions.ExactEqual(adopted.Extensions) {
+		return fmt.Errorf("%w: shim extension acknowledgement differs from Welcome", ErrAdoptionRefused)
+	}
 	return nil
 }
 

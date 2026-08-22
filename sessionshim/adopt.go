@@ -32,7 +32,7 @@ type AdoptOptions struct {
 	// the WHOLE startup pass: silently quarantining one otherwise-compatible shim
 	// would let the daemon advertise ready without rehydrating that session's
 	// external carrier (ADR-2026-08-17 §D4).
-	Prepare func(ctx context.Context, id Identity, current shimwire.Generation) (PreparedAdoption, error)
+	Prepare func(ctx context.Context, evidence AdoptionPreparation) (PreparedAdoption, error)
 
 	// ResumeFrom returns the first sequence this daemon still needs for a
 	// session — its durable last_forwarded_seq + 1. Nil resumes from the start of
@@ -53,6 +53,19 @@ type AdoptOptions struct {
 	Now    func() time.Time
 }
 
+// AdoptionPreparation is the exact authenticated Hello correlation available
+// before Welcome proposes authority. A composing callback must use this shape
+// rather than looking up a shim by session identity and guessing which
+// incarnation it is preparing.
+type AdoptionPreparation struct {
+	Identity                    Identity
+	ControllerID                string
+	ShimID                      string
+	ProcessEpoch                uint64
+	CurrentControllerGeneration shimwire.Generation
+	LastForwardedSeq            uint64
+}
+
 // PreparedAdoption is the per-session portion of Welcome supplied by a
 // composing daemon. Both fields are optional; the zero value preserves the
 // standalone controller's current+1 generation and extension-free handshake.
@@ -64,6 +77,10 @@ type AdoptOptions struct {
 type PreparedAdoption struct {
 	ControllerGeneration shimwire.Generation
 	Extensions           shimwire.Extensions
+	// Correlation is opaque composing state prepared against the exact Hello
+	// above (for example a fence revision and expected adoption revision). Donmai
+	// never parses it; the daemon hands the bytes unchanged to OnAdoption.
+	Correlation []byte
 }
 
 // ErrAdoptionPreparation reports a composing dependency that failed before
@@ -105,6 +122,20 @@ type AdoptionResult struct {
 	// signalled for these: a PID whose start identity no longer matches is a
 	// DIFFERENT process, and §D10 forbids signalling a reused pid.
 	Stale []Record
+}
+
+type terminalIncarnation struct {
+	identity     Identity
+	shimID       string
+	processEpoch uint64
+}
+
+func terminalIncarnationForTombstone(t Tombstone) terminalIncarnation {
+	return terminalIncarnation{identity: t.Identity(), shimID: t.ShimID, processEpoch: t.ProcessEpoch}
+}
+
+func terminalIncarnationForRecord(r Record) terminalIncarnation {
+	return terminalIncarnation{identity: r.Identity(), shimID: r.ShimID, processEpoch: r.ProcessEpoch}
 }
 
 // OccupiedSlots is the capacity a host must subtract before advertising.
@@ -162,10 +193,10 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 	if err != nil {
 		return result, err
 	}
-	tombstoneByID := make(map[Identity]Tombstone, len(tombstones))
+	tombstoneByIncarnation := make(map[terminalIncarnation]Tombstone, len(tombstones))
 	for _, t := range tombstones {
 		if t.GroupReaped {
-			tombstoneByID[t.Identity()] = t
+			tombstoneByIncarnation[terminalIncarnationForTombstone(t)] = t
 			result.Tombstoned = append(result.Tombstoned, t)
 			continue
 		}
@@ -191,6 +222,13 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 		if e.Err != nil {
 			continue
 		}
+		if _, terminal := tombstoneByIncarnation[terminalIncarnationForRecord(e.Record)]; terminal {
+			// A crash may leave the exact live record beside its already-published
+			// positive tombstone. It is not a live duplicate and must not make a
+			// different surviving incarnation under the same lifecycle identity look
+			// ambiguous.
+			continue
+		}
 		id := e.Record.Identity()
 		seen[id] = append(seen[id], e.Record)
 	}
@@ -210,7 +248,7 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 		rec := e.Record
 		id := rec.Identity()
 
-		if _, ok := tombstoneByID[id]; ok {
+		if _, ok := tombstoneByIncarnation[terminalIncarnationForRecord(rec)]; ok {
 			// The shim already proved its outcome. The live record is a crash
 			// artifact from between tombstone publication and record removal.
 			continue
@@ -308,10 +346,10 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 		}
 	}
 	if opts.Prepare != nil {
-		copts.PrepareAdoption = func(current shimwire.Generation) (PreparedAdoption, error) {
-			prepared, err := opts.Prepare(ctx, id, current)
+		copts.PrepareAdoption = func(evidence AdoptionPreparation) (PreparedAdoption, error) {
+			prepared, err := opts.Prepare(ctx, evidence)
 			if err != nil {
-				return PreparedAdoption{}, fmt.Errorf("%w for %s: %w", ErrAdoptionPreparation, id, err)
+				return PreparedAdoption{}, fmt.Errorf("%w for %s: %w", ErrAdoptionPreparation, evidence.Identity, err)
 			}
 			return prepared, nil
 		}

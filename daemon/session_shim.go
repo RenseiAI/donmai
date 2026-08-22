@@ -27,7 +27,22 @@ type SessionShimAdoptionEvidence struct {
 	ControllerGeneration uint64
 	LastForwardedSeq     uint64
 	Extensions           shimwire.Extensions
+	PreparedCorrelation  []byte
 	ObservedAtUnixNano   int64
+}
+
+// SessionShimAdoptionPreparation is the post-Hello, pre-Welcome fact supplied
+// to a composing carrier reservation. HostID is already resolved for the
+// identity's organization; shim/process/generation values come only from the
+// authenticated live Hello.
+type SessionShimAdoptionPreparation struct {
+	Identity                    sessionshim.Identity
+	HostID                      string
+	ControllerID                string
+	ShimID                      string
+	ProcessEpoch                uint64
+	CurrentControllerGeneration shimwire.Generation
+	LastForwardedSeq            uint64
 }
 
 // SessionShimAdoptionReceipt is opaque durable correlation state returned by a
@@ -36,6 +51,31 @@ type SessionShimAdoptionEvidence struct {
 // implementation can carry its own fence and adoption revisions without
 // importing that control-plane schema into OSS.
 type SessionShimAdoptionReceipt struct {
+	DurableCorrelation []byte
+}
+
+// SessionShimAdoptionOutcome pairs one committed local adoption with the exact
+// durable per-session receipt returned by the composing callback.
+type SessionShimAdoptionOutcome struct {
+	Evidence SessionShimAdoptionEvidence
+	Receipt  SessionShimAdoptionReceipt
+}
+
+// SessionShimAdoptionBatch is one complete per-organization startup
+// publication. ExpectedRevision is opaque compare-and-swap state resolved just
+// before publication; all outcome slices are complete and deterministic.
+type SessionShimAdoptionBatch struct {
+	OrgID            string
+	HostID           string
+	ExpectedRevision []byte
+	Adopted          []SessionShimAdoptionOutcome
+	Quarantined      []sessionshim.QuarantinedSession
+	Tombstoned       []SessionShimTerminalEvidence
+}
+
+// SessionShimAdoptionBatchReceipt is the durable host-level revision retained
+// after a complete batch publication.
+type SessionShimAdoptionBatchReceipt struct {
 	DurableCorrelation []byte
 }
 
@@ -134,7 +174,7 @@ type SessionShimConfig struct {
 	// atomically resolves the exact next generation and generic carrier_epoch
 	// extension, allowing a durable carrier reservation to bind the two. An error
 	// aborts startup rather than producing a ready-but-unreachable session.
-	PrepareAdoption func(context.Context, sessionshim.Identity, shimwire.Generation) (sessionshim.PreparedAdoption, error)
+	PrepareAdoption func(context.Context, SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error)
 
 	// OnAdoption runs after the shim commits the new controller generation and
 	// before readiness/claim advertisement. It returns only after the composing
@@ -148,6 +188,19 @@ type SessionShimConfig struct {
 	// terminal fact before returning nil. Error retains the tombstone for exact,
 	// idempotent replay on a later reconciliation/startup pass.
 	OnTerminalEvidence func(context.Context, SessionShimTerminalEvidence) error
+
+	// AdoptionBatchOrgIDs enumerates organizations that require a complete host
+	// adoption publication even when no shim record exists for that scope.
+	AdoptionBatchOrgIDs []string
+
+	// PrepareAdoptionBatch resolves the opaque expected host revision used by
+	// the composing store's final per-org compare-and-swap.
+	PrepareAdoptionBatch func(context.Context, string, string) ([]byte, error)
+
+	// OnAdoptionBatch atomically publishes the complete adopted/quarantined/
+	// tombstoned outcome after every per-session durable callback and before
+	// adoptionComplete/Ready. Error fails startup closed.
+	OnAdoptionBatch func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error)
 
 	// CallbackTimeout bounds PrepareAdoption, OnAdoption, and
 	// OnTerminalEvidence. Zero uses the launch timeout/default.
@@ -239,20 +292,22 @@ type sessionShimAdoptionCorrelation struct {
 
 // sessionShimState is the daemon's live view of per-session shim ownership.
 type sessionShimState struct {
-	mu          sync.RWMutex
-	registry    *sessionshim.Registry
-	adopted     map[sessionshim.Identity]adoptedShim
-	quarantined []sessionshim.QuarantinedSession
-	tombstoned  []sessionshim.Tombstone
-	fence       *sessionshim.Fence
-	fences      map[string]sessionshim.Fence
+	mu            sync.RWMutex
+	registry      *sessionshim.Registry
+	adopted       map[sessionshim.Identity]adoptedShim
+	quarantined   []sessionshim.QuarantinedSession
+	tombstoned    []sessionshim.Tombstone
+	fence         *sessionshim.Fence
+	fences        map[string]sessionshim.Fence
+	fenceRequests map[string]sessionshim.FenceRequest
 	// forwarded is the highest output sequence this daemon durably forwarded per
 	// session — the resume point a LATER adoption asks the shim to replay from
 	// (§D5). The daemon records only this; it never allocates sequence.
 	forwarded map[sessionshim.Identity]uint64
 	// correlations survive a controller disconnect so the later exact tombstone
 	// callback still receives the same opaque durable adoption receipt.
-	correlations map[shimIncarnation]sessionShimAdoptionCorrelation
+	correlations  map[shimIncarnation]sessionShimAdoptionCorrelation
+	batchReceipts map[string]SessionShimAdoptionBatchReceipt
 	// wg joins the per-session event consumers so shutdown cannot race one that
 	// is still writing bookkeeping.
 	wg sync.WaitGroup
@@ -264,10 +319,12 @@ type sessionShimState struct {
 
 func newSessionShimState() *sessionShimState {
 	return &sessionShimState{
-		adopted:      make(map[sessionshim.Identity]adoptedShim),
-		forwarded:    make(map[sessionshim.Identity]uint64),
-		correlations: make(map[shimIncarnation]sessionShimAdoptionCorrelation),
-		fences:       make(map[string]sessionshim.Fence),
+		adopted:       make(map[sessionshim.Identity]adoptedShim),
+		forwarded:     make(map[sessionshim.Identity]uint64),
+		correlations:  make(map[shimIncarnation]sessionShimAdoptionCorrelation),
+		fences:        make(map[string]sessionshim.Fence),
+		fenceRequests: make(map[string]sessionshim.FenceRequest),
+		batchReceipts: make(map[string]SessionShimAdoptionBatchReceipt),
 	}
 }
 
@@ -368,17 +425,17 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	preparedByID := make(map[sessionshim.Identity]sessionshim.PreparedAdoption)
 	hostByID := make(map[sessionshim.Identity]string)
 	if cfg.PrepareAdoption != nil || cfg.HostIDForOrg != nil {
-		opts.Prepare = func(prepareCtx context.Context, id sessionshim.Identity, current shimwire.Generation) (sessionshim.PreparedAdoption, error) {
-			hostID, hostErr := d.sessionShimHostID(prepareCtx, id.OrgID)
+		opts.Prepare = func(prepareCtx context.Context, evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+			hostID, hostErr := d.sessionShimHostID(prepareCtx, evidence.Identity.OrgID)
 			if hostErr != nil {
 				return sessionshim.PreparedAdoption{}, hostErr
 			}
-			prepared, err := d.prepareSessionShimAdoption(prepareCtx, id, current)
+			prepared, err := d.prepareSessionShimAdoption(prepareCtx, hostID, evidence)
 			if err != nil {
 				return sessionshim.PreparedAdoption{}, err
 			}
-			hostByID[id] = hostID
-			preparedByID[id] = prepared
+			hostByID[evidence.Identity] = hostID
+			preparedByID[evidence.Identity] = prepared
 			return prepared, nil
 		}
 	}
@@ -420,7 +477,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	entries := make(map[sessionshim.Identity]adoptedShim, len(result.Adopted))
 	for _, c := range result.Adopted {
 		id := c.Identity()
-		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparedByID[id].Extensions, hostByID[id])
+		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparedByID[id], hostByID[id])
 		if evidenceErr != nil {
 			result.Close()
 			return fmt.Errorf("session shim: resolve adoption host for %s: %w", id, evidenceErr)
@@ -443,6 +500,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	// fenced claim remained needlessly unreconciled. Unproven tombstones were
 	// classified as capacity-consuming quarantine by sessionshim.Adopt and never
 	// enter this loop.
+	terminalOutcomes := make([]SessionShimTerminalEvidence, 0, len(result.Tombstoned))
 	for _, tombstone := range result.Tombstoned {
 		hostID, hostErr := d.sessionShimHostID(ctx, tombstone.OrgID)
 		if hostErr != nil {
@@ -459,6 +517,65 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		if callbackErr := d.reportSessionShimTerminalEvidence(ctx, evidence); callbackErr != nil {
 			result.Close()
 			return fmt.Errorf("session shim: durable terminal evidence for %s: %w", tombstone.Identity(), callbackErr)
+		}
+		terminalOutcomes = append(terminalOutcomes, evidence)
+	}
+
+	batchReceipts := make(map[string]SessionShimAdoptionBatchReceipt)
+	if cfg.OnAdoptionBatch != nil {
+		scopeSet := make(map[string]struct{})
+		for _, orgID := range cfg.AdoptionBatchOrgIDs {
+			scopeSet[orgID] = struct{}{}
+		}
+		for _, controller := range result.Adopted {
+			scopeSet[controller.Identity().OrgID] = struct{}{}
+		}
+		for _, quarantined := range result.Quarantined {
+			scopeSet[quarantined.OrgID] = struct{}{}
+		}
+		for _, terminal := range terminalOutcomes {
+			scopeSet[terminal.Identity.OrgID] = struct{}{}
+		}
+		if len(scopeSet) == 0 {
+			scopeSet[cfg.orgID()] = struct{}{}
+		}
+		scopeOrgIDs := make([]string, 0, len(scopeSet))
+		for orgID := range scopeSet {
+			scopeOrgIDs = append(scopeOrgIDs, orgID)
+		}
+		sort.Strings(scopeOrgIDs)
+		for _, orgID := range scopeOrgIDs {
+			hostID, hostErr := d.sessionShimHostID(ctx, orgID)
+			if hostErr != nil {
+				result.Close()
+				return fmt.Errorf("session shim: resolve adoption batch host for organization %q: %w", orgID, hostErr)
+			}
+			batch := SessionShimAdoptionBatch{OrgID: orgID, HostID: hostID}
+			for _, controller := range result.Adopted {
+				entry := entries[controller.Identity()]
+				if entry.adoption.Identity.OrgID == orgID {
+					batch.Adopted = append(batch.Adopted, SessionShimAdoptionOutcome{
+						Evidence: entry.adoption,
+						Receipt:  entry.adoptionReceipt,
+					})
+				}
+			}
+			for _, quarantined := range result.Quarantined {
+				if quarantined.OrgID == orgID {
+					batch.Quarantined = append(batch.Quarantined, quarantined)
+				}
+			}
+			for _, terminal := range terminalOutcomes {
+				if terminal.Identity.OrgID == orgID {
+					batch.Tombstoned = append(batch.Tombstoned, terminal)
+				}
+			}
+			receipt, batchErr := d.completeSessionShimAdoptionBatch(ctx, batch)
+			if batchErr != nil {
+				result.Close()
+				return fmt.Errorf("session shim: durable adoption batch for organization %q: %w", orgID, batchErr)
+			}
+			batchReceipts[orgID] = receipt
 		}
 	}
 
@@ -480,10 +597,13 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	}
 	d.shims.quarantined = result.QuarantinedProjection()
 	d.shims.tombstoned = append(d.shims.tombstoned, result.Tombstoned...)
+	for orgID, receipt := range batchReceipts {
+		d.shims.batchReceipts[orgID] = receipt
+	}
 	d.shims.adoptionComplete = true
 	d.shims.mu.Unlock()
 	for _, tombstone := range result.Tombstoned {
-		if removeErr := registry.RemoveTombstone(tombstone.Identity()); removeErr != nil {
+		if removeErr := registry.RemoveTombstoneIncarnation(tombstone); removeErr != nil {
 			slog.Warn("session shim: dispose startup tombstone after durable terminal handoff",
 				"session", tombstone.Identity().String(), "error", removeErr)
 		}
@@ -521,7 +641,10 @@ func (d *Daemon) controllerID() string {
 // hosted composition supplies one of the first two and never relabels a worker.
 func (d *Daemon) sessionShimHostID(ctx context.Context, orgID string) (string, error) {
 	cfg := d.sessionShimConfig()
-	if cfg.HostIDForOrg != nil && orgID != "" {
+	if cfg.HostIDForOrg != nil {
+		if err := (sessionshim.Identity{OrgID: orgID, SessionID: "scope"}).Validate(); err != nil {
+			return "", fmt.Errorf("session shim: invalid organization fence scope: %w", err)
+		}
 		callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 		defer cancel()
 		hostID, err := cfg.HostIDForOrg(callbackCtx, orgID)
@@ -554,6 +677,12 @@ func cloneSessionShimAdoptionReceipt(in SessionShimAdoptionReceipt) SessionShimA
 	return SessionShimAdoptionReceipt{DurableCorrelation: append([]byte(nil), in.DurableCorrelation...)}
 }
 
+func cloneSessionShimAdoptionEvidence(in SessionShimAdoptionEvidence) SessionShimAdoptionEvidence {
+	in.Extensions = cloneShimExtensions(in.Extensions)
+	in.PreparedCorrelation = append([]byte(nil), in.PreparedCorrelation...)
+	return in
+}
+
 func (d *Daemon) sessionShimCallbackContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()
@@ -561,25 +690,38 @@ func (d *Daemon) sessionShimCallbackContext(parent context.Context) (context.Con
 	return context.WithTimeout(parent, d.sessionShimConfig().callbackTimeout())
 }
 
-func (d *Daemon) prepareSessionShimAdoption(ctx context.Context, id sessionshim.Identity, current shimwire.Generation) (sessionshim.PreparedAdoption, error) {
+func (d *Daemon) prepareSessionShimAdoption(
+	ctx context.Context,
+	hostID string,
+	evidence sessionshim.AdoptionPreparation,
+) (sessionshim.PreparedAdoption, error) {
 	hook := d.sessionShimConfig().PrepareAdoption
 	if hook == nil {
 		return sessionshim.PreparedAdoption{}, nil
 	}
 	callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 	defer cancel()
-	prepared, err := hook(callbackCtx, id, current)
+	prepared, err := hook(callbackCtx, SessionShimAdoptionPreparation{
+		Identity:                    evidence.Identity,
+		HostID:                      hostID,
+		ControllerID:                evidence.ControllerID,
+		ShimID:                      evidence.ShimID,
+		ProcessEpoch:                evidence.ProcessEpoch,
+		CurrentControllerGeneration: evidence.CurrentControllerGeneration,
+		LastForwardedSeq:            evidence.LastForwardedSeq,
+	})
 	if err != nil {
 		return sessionshim.PreparedAdoption{}, err
 	}
 	prepared.Extensions = cloneShimExtensions(prepared.Extensions)
+	prepared.Correlation = append([]byte(nil), prepared.Correlation...)
 	return prepared, nil
 }
 
 func (d *Daemon) sessionShimAdoptionEvidence(
 	ctx context.Context,
 	ctrl *sessionshim.Controller,
-	extensions shimwire.Extensions,
+	prepared sessionshim.PreparedAdoption,
 	preparedHostID string,
 ) (SessionShimAdoptionEvidence, error) {
 	lastForwarded := uint64(0)
@@ -602,7 +744,8 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 		ProcessEpoch:         ctrl.Hello().ProcessEpoch,
 		ControllerGeneration: uint64(ctrl.Generation()),
 		LastForwardedSeq:     lastForwarded,
-		Extensions:           cloneShimExtensions(extensions),
+		Extensions:           cloneShimExtensions(ctrl.Adoption().Extensions),
+		PreparedCorrelation:  append([]byte(nil), prepared.Correlation...),
 		ObservedAtUnixNano:   d.shimNow().UnixNano(),
 	}, nil
 }
@@ -614,7 +757,7 @@ func (d *Daemon) completeSessionShimAdoption(ctx context.Context, evidence Sessi
 	}
 	callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 	defer cancel()
-	receipt, err := hook(callbackCtx, evidence)
+	receipt, err := hook(callbackCtx, cloneSessionShimAdoptionEvidence(evidence))
 	if err != nil {
 		return SessionShimAdoptionReceipt{}, err
 	}
@@ -630,14 +773,57 @@ func (d *Daemon) reportSessionShimTerminalEvidence(ctx context.Context, evidence
 		return nil
 	}
 	if evidence.Adoption != nil {
-		adoption := *evidence.Adoption
-		adoption.Extensions = cloneShimExtensions(adoption.Extensions)
+		adoption := cloneSessionShimAdoptionEvidence(*evidence.Adoption)
 		evidence.Adoption = &adoption
 	}
 	evidence.DurableAdoptionCorrelation = append([]byte(nil), evidence.DurableAdoptionCorrelation...)
 	callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 	defer cancel()
 	return hook(callbackCtx, evidence)
+}
+
+func cloneSessionShimAdoptionBatch(in SessionShimAdoptionBatch) SessionShimAdoptionBatch {
+	in.ExpectedRevision = append([]byte(nil), in.ExpectedRevision...)
+	in.Adopted = append([]SessionShimAdoptionOutcome(nil), in.Adopted...)
+	for i := range in.Adopted {
+		in.Adopted[i].Evidence = cloneSessionShimAdoptionEvidence(in.Adopted[i].Evidence)
+		in.Adopted[i].Receipt = cloneSessionShimAdoptionReceipt(in.Adopted[i].Receipt)
+	}
+	in.Quarantined = append([]sessionshim.QuarantinedSession(nil), in.Quarantined...)
+	in.Tombstoned = append([]SessionShimTerminalEvidence(nil), in.Tombstoned...)
+	for i := range in.Tombstoned {
+		if in.Tombstoned[i].Adoption != nil {
+			adoption := cloneSessionShimAdoptionEvidence(*in.Tombstoned[i].Adoption)
+			in.Tombstoned[i].Adoption = &adoption
+		}
+		in.Tombstoned[i].DurableAdoptionCorrelation = append(
+			[]byte(nil), in.Tombstoned[i].DurableAdoptionCorrelation...)
+	}
+	return in
+}
+
+func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+	cfg := d.sessionShimConfig()
+	if cfg.OnAdoptionBatch == nil {
+		return SessionShimAdoptionBatchReceipt{}, nil
+	}
+	if cfg.PrepareAdoptionBatch != nil {
+		callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
+		expected, err := cfg.PrepareAdoptionBatch(callbackCtx, batch.OrgID, batch.HostID)
+		cancel()
+		if err != nil {
+			return SessionShimAdoptionBatchReceipt{}, err
+		}
+		batch.ExpectedRevision = append([]byte(nil), expected...)
+	}
+	callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
+	defer cancel()
+	receipt, err := cfg.OnAdoptionBatch(callbackCtx, cloneSessionShimAdoptionBatch(batch))
+	if err != nil {
+		return SessionShimAdoptionBatchReceipt{}, err
+	}
+	receipt.DurableCorrelation = append([]byte(nil), receipt.DurableCorrelation...)
+	return receipt, nil
 }
 
 // SessionShimOccupancy returns how many capacity slots per-session shims hold.
@@ -706,6 +892,19 @@ func (d *Daemon) SessionShimAdoptionComplete() bool {
 	return d.shims.adoptionComplete
 }
 
+// SessionShimAdoptionBatchReceipt returns the durable host-level publication
+// receipt retained for heartbeat/status composition in one organization.
+func (d *Daemon) SessionShimAdoptionBatchReceipt(orgID string) (SessionShimAdoptionBatchReceipt, bool) {
+	if d.shims == nil {
+		return SessionShimAdoptionBatchReceipt{}, false
+	}
+	d.shims.mu.RLock()
+	receipt, ok := d.shims.batchReceipts[orgID]
+	d.shims.mu.RUnlock()
+	receipt.DurableCorrelation = append([]byte(nil), receipt.DurableCorrelation...)
+	return receipt, ok
+}
+
 // RequestSessionShimRestartFence obtains the durable, acknowledged restart fence
 // a PLANNED restart requires (§D9).
 //
@@ -756,6 +955,13 @@ func (d *Daemon) RequestSessionShimRestartFences(ctx context.Context, fenceID st
 	covered := d.sessionShimFenceSnapshot()
 	if len(covered) == 0 {
 		return nil, nil
+	}
+	if d.sessionShimConfig().HostIDForOrg != nil {
+		for _, session := range covered {
+			if err := (sessionshim.Identity{OrgID: session.OrgID, SessionID: "scope"}).Validate(); err != nil {
+				return nil, fmt.Errorf("%w: invalid organization fence scope: %w", sessionshim.ErrFenceRequired, err)
+			}
+		}
 	}
 	byOrg := make(map[string][]sessionshim.FencedSession)
 	for _, session := range covered {
@@ -845,7 +1051,30 @@ func (d *Daemon) requestSessionShimRestartFence(ctx context.Context, fenceID, or
 		fenceErr error
 	)
 	if cfg.ExactFenceStore != nil {
-		fence, fenceErr = sessionshim.RequestFenceExact(ctx, cfg.ExactFenceStore, fenceID, hostID, covered, policy, time.Now())
+		requestKey := orgID + "\x1f" + fenceID
+		d.shims.mu.Lock()
+		request, ok := d.shims.fenceRequests[requestKey]
+		d.shims.mu.Unlock()
+		if ok && (request.Fence.HostID != hostID || !sameFencedSessions(request.Fence.Sessions, covered)) {
+			return sessionshim.Fence{}, fmt.Errorf(
+				"%w: retained fence id no longer matches host or covered correlations",
+				sessionshim.ErrFenceRequired,
+			)
+		}
+		if !ok {
+			request, fenceErr = sessionshim.NewExactFenceRequest(fenceID, hostID, covered, policy, time.Now())
+			if fenceErr != nil {
+				return sessionshim.Fence{}, fenceErr
+			}
+			d.shims.mu.Lock()
+			if retained, exists := d.shims.fenceRequests[requestKey]; exists {
+				request = retained
+			} else {
+				d.shims.fenceRequests[requestKey] = sessionshim.CloneFenceRequest(request)
+			}
+			d.shims.mu.Unlock()
+		}
+		fence, fenceErr = sessionshim.AcknowledgeExactFence(ctx, cfg.ExactFenceStore, request)
 	} else {
 		fence, fenceErr = sessionshim.RequestFence(ctx, cfg.FenceStore, fenceID, hostID, covered, policy, time.Now())
 	}
@@ -853,6 +1082,18 @@ func (d *Daemon) requestSessionShimRestartFence(ctx context.Context, fenceID, or
 		return sessionshim.Fence{}, fenceErr
 	}
 	return fence, nil
+}
+
+func sameFencedSessions(a, b []sessionshim.FencedSession) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // SessionShimReleaseDecision is the SINGLE predicate every claim-release and
@@ -898,21 +1139,43 @@ func (d *Daemon) SessionShimTerminalProof(orgID, sessionID string) sessionshim.T
 	id := sessionshim.Identity{OrgID: orgID, SessionID: sessionID}
 	d.shims.mu.RLock()
 	registry := d.shims.registry
-	tombstones := d.shims.tombstoned
+	tombstones := append([]sessionshim.Tombstone(nil), d.shims.tombstoned...)
 	d.shims.mu.RUnlock()
 
-	for i := range tombstones {
-		if tombstones[i].Identity() == id {
-			t := tombstones[i]
-			return sessionshim.TerminalProof{Tombstone: &t}
-		}
-	}
 	if registry != nil {
-		if t, err := registry.GetTombstone(id); err == nil {
-			return sessionshim.TerminalProof{Tombstone: &t}
+		if durable, err := registry.ScanTombstones(); err == nil {
+			tombstones = append(tombstones, durable...)
 		}
 	}
-	return sessionshim.TerminalProof{}
+	type correlation struct {
+		shimID       string
+		processEpoch uint64
+	}
+	unique := make(map[correlation]sessionshim.Tombstone)
+	for _, tombstone := range tombstones {
+		if tombstone.Identity() != id || !tombstone.GroupReaped {
+			continue
+		}
+		key := correlation{shimID: tombstone.ShimID, processEpoch: tombstone.ProcessEpoch}
+		unique[key] = tombstone
+	}
+	proofTombstones := make([]sessionshim.Tombstone, 0, len(unique))
+	for _, tombstone := range unique {
+		proofTombstones = append(proofTombstones, tombstone)
+	}
+	proof := sessionshim.TerminalProof{}
+	for i := range proofTombstones {
+		tombstone := &proofTombstones[i]
+		proof.Correlations = append(proof.Correlations, sessionshim.TerminalCorrelationProof{
+			ShimID:       tombstone.ShimID,
+			ProcessEpoch: tombstone.ProcessEpoch,
+			Tombstone:    tombstone,
+		})
+	}
+	if len(proofTombstones) == 1 {
+		proof.Tombstone = &proofTombstones[0]
+	}
+	return proof
 }
 
 // ReleaseAdoptedSessionShims drops every adopted controller WITHOUT stopping any

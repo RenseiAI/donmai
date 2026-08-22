@@ -94,6 +94,9 @@ type Welcome struct {
 // daemon learns "you will get a gap" before any output arrives.
 type Adopted struct {
 	Generation Generation `json:"generation"`
+	// Extensions exactly echo Welcome.Extensions, proving the shim committed the
+	// carrier correlation paired with this controller generation.
+	Extensions Extensions `json:"extensions,omitempty"`
 	// Contiguous is true when the requested ResumeFrom is servable from the ring.
 	// False means a Gap + Snapshot precede live output.
 	Contiguous bool `json:"contiguous"`

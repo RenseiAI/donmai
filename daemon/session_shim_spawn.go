@@ -109,12 +109,12 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		ExpectedWorkarea: workarea,
 		DialTimeout:      cfg.launchTimeout(),
 		Logger:           slog.Default(),
-		PrepareAdoption: func(current shimwire.Generation) (sessionshim.PreparedAdoption, error) {
-			hostID, hostErr := d.sessionShimHostID(ctx, id.OrgID)
+		PrepareAdoption: func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+			hostID, hostErr := d.sessionShimHostID(ctx, evidence.Identity.OrgID)
 			if hostErr != nil {
 				return sessionshim.PreparedAdoption{}, hostErr
 			}
-			resolved, prepareErr := d.prepareSessionShimAdoption(ctx, id, current)
+			resolved, prepareErr := d.prepareSessionShimAdoption(ctx, hostID, evidence)
 			if prepareErr != nil {
 				return sessionshim.PreparedAdoption{}, prepareErr
 			}
@@ -129,7 +129,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 			"session", id.String(), "error", err)
 		return nil, fmt.Errorf("session shim: adopt %s: %w", id, err)
 	}
-	evidence, err := d.sessionShimAdoptionEvidence(ctx, ctrl, prepared.Extensions, preparedHostID)
+	evidence, err := d.sessionShimAdoptionEvidence(ctx, ctrl, prepared, preparedHostID)
 	if err != nil {
 		_ = ctrl.Close()
 		return nil, fmt.Errorf("session shim: resolve adoption host %s: %w", id, err)
@@ -453,7 +453,7 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 	// immediate read races the write. Poll briefly rather than concluding the
 	// proof is missing: treating an in-flight tombstone as absent would leave a
 	// session that provably ended parked in reconciliation forever.
-	tombstone, err := awaitTombstone(registry, id, tombstoneSettleWindow)
+	tombstone, err := awaitTombstone(registry, id, entry.shimID, entry.adoption.ProcessEpoch, tombstoneSettleWindow)
 	if err != nil {
 		slog.Warn("session shim: terminal observation without a durable tombstone",
 			"session", id.String(), "error", err)
@@ -492,7 +492,7 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 	delete(d.shims.correlations, shimIncarnationFor(entry.adoption))
 	d.shims.mu.Unlock()
 
-	verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, sessionshim.TerminalProof{Tombstone: &tombstone})
+	verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, d.SessionShimTerminalProof(id.OrgID, id.SessionID))
 	if verdict != sessionshim.ReleaseAllowed {
 		slog.Info("session shim: terminal outcome recorded but the claim is not releasable yet",
 			"session", id.String(), "verdict", verdict)
@@ -505,13 +505,13 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 	// "terminal, proven" into "a record whose process is gone", which §D10
 	// classifies as stale and leaves unresolved. Remove is idempotent, so the
 	// ordinary case where the shim already withdrew its own record costs nothing.
-	if err := registry.Remove(id); err != nil {
+	if err := registry.RemoveIncarnation(id, tombstone.ShimID, tombstone.ProcessEpoch); err != nil {
 		slog.Warn("session shim: withdraw discovery record", "session", id.String(), "error", err)
 		return
 	}
 	// Audited disposal: the outcome is durably recorded above and no liveness
 	// claim survives it, so the tombstone has done its job and may go.
-	if err := registry.RemoveTombstone(id); err != nil {
+	if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
 		slog.Warn("session shim: dispose tombstone", "session", id.String(), "error", err)
 	}
 }
@@ -522,15 +522,30 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 const tombstoneSettleWindow = 5 * time.Second
 
 // awaitTombstone polls for the durable terminal proof a shim leaves behind.
-func awaitTombstone(registry *sessionshim.Registry, id sessionshim.Identity, within time.Duration) (sessionshim.Tombstone, error) {
+func awaitTombstone(
+	registry *sessionshim.Registry,
+	id sessionshim.Identity,
+	shimID string,
+	processEpoch uint64,
+	within time.Duration,
+) (sessionshim.Tombstone, error) {
 	deadline := time.Now().Add(within)
 	var lastErr error
 	for {
-		t, err := registry.GetTombstone(id)
+		t, err := registry.GetTombstoneIncarnation(id, shimID, processEpoch)
 		if err == nil {
-			return t, nil
+			live, liveErr := registry.HasIncarnation(id, shimID, processEpoch)
+			if liveErr == nil && !live {
+				return t, nil
+			}
+			if liveErr != nil {
+				lastErr = liveErr
+			} else {
+				lastErr = errors.New("matching live discovery record has not been withdrawn")
+			}
+		} else {
+			lastErr = err
 		}
-		lastErr = err
 		if !time.Now().Before(deadline) {
 			return sessionshim.Tombstone{}, lastErr
 		}
@@ -607,11 +622,11 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 
 	for _, q := range quarantined {
 		id := q.Identity()
-		tombstone, err := registry.GetTombstone(id)
+		tombstone, err := registry.GetTombstoneIncarnation(id, q.ShimID, q.ProcessEpoch)
 		if err != nil || tombstone.ShimID != q.ShimID || tombstone.ProcessEpoch != q.ProcessEpoch {
 			continue
 		}
-		proof := sessionshim.TerminalProof{Tombstone: &tombstone}
+		proof := d.SessionShimTerminalProof(id.OrgID, id.SessionID)
 		if d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof) != sessionshim.ReleaseAllowed {
 			continue
 		}
@@ -671,7 +686,7 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		}
 		d.shims.mu.Unlock()
 		if removed {
-			if err := registry.RemoveTombstone(id); err != nil {
+			if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
 				slog.Warn("session shim: dispose quarantined tombstone after durable terminal handoff",
 					"session", id.String(), "error", err)
 			}
@@ -722,15 +737,23 @@ func (d *Daemon) adoptedShimEntry(orgID, sessionID string) (adoptedShim, error) 
 	return entry, nil
 }
 
+type sessionShimStopResult uint8
+
+const (
+	sessionShimStopNotFound sessionShimStopResult = iota
+	sessionShimStopHandled
+	sessionShimStopRefused
+)
+
 // stopSessionShimByID routes a plain session id — what the control API and the
 // spawner speak — to the generation-fenced Stop on an adopted shim.
 //
 // It reports whether the session was shim-owned at all, so the caller can fall
 // through to the direct-child path for everything else rather than having to
 // know which ownership model a session uses.
-func (d *Daemon) stopSessionShimByID(sessionID string) (handled bool) {
+func (d *Daemon) stopSessionShimByID(sessionID string) sessionShimStopResult {
 	if d.shims == nil {
-		return false
+		return sessionShimStopNotFound
 	}
 	d.shims.mu.RLock()
 	matches := make([]sessionshim.Identity, 0, 1)
@@ -741,21 +764,21 @@ func (d *Daemon) stopSessionShimByID(sessionID string) (handled bool) {
 	}
 	d.shims.mu.RUnlock()
 	if len(matches) == 0 {
-		return false
+		return sessionShimStopNotFound
 	}
 	if len(matches) != 1 {
 		// The localhost API supplies only a session id. Do not collapse two
 		// tenant-scoped lifecycle identities or pick one by map order.
 		slog.Error("session shim: bare session id is ambiguous across organizations",
 			"matches", len(matches))
-		return false
+		return sessionShimStopRefused
 	}
 	id := matches[0]
 	if err := d.StopAdoptedSessionShim(id.OrgID, id.SessionID, shimwire.StopOperator); err != nil {
 		slog.Error("session shim: stop", "session", id.String(), "error", err)
-		return false
+		return sessionShimStopRefused
 	}
-	return true
+	return sessionShimStopHandled
 }
 
 // sessionShimHandles projects every shim-backed session onto the same

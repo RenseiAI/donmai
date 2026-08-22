@@ -744,6 +744,43 @@ func TestAdoptKeepsUnprovenTombstoneInVisibleCapacity(t *testing.T) {
 	}
 }
 
+func TestAdoptDoesNotLetTerminalIncarnationHideLiveDuplicateIdentity(t *testing.T) {
+	id := Identity{OrgID: "org-mixed", SessionID: "session-mixed"}
+	f := startShimHelper(t, id, 10_000)
+	live := f.waitForRecord(t)
+	terminal := Tombstone{
+		SchemaVersion:      RecordSchemaVersion,
+		OrgID:              id.OrgID,
+		SessionID:          id.SessionID,
+		ShimID:             "different-terminal-shim",
+		ProcessEpoch:       live.ProcessEpoch,
+		GroupReaped:        true,
+		ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	data, err := terminal.encode()
+	if err != nil {
+		t.Fatalf("encode tombstone: %v", err)
+	}
+	// Publish the crash-coexistence shape directly. Registry.PutTombstone is the
+	// live shim's normal path and intentionally removes its own identity record;
+	// the case under test is an older terminal incarnation beside a different
+	// still-live record with the same lifecycle identity.
+	if err := f.registry.publish(id.TombstoneName(), data); err != nil {
+		t.Fatalf("publish terminal incarnation: %v", err)
+	}
+
+	result := f.adoptAs(t, "controller-mixed")
+	if len(result.Tombstoned) != 1 || result.Tombstoned[0].ShimID != terminal.ShimID {
+		t.Fatalf("terminal bucket = %+v, want exact older incarnation", result.Tombstoned)
+	}
+	if len(result.Adopted) != 1 || result.Adopted[0].Hello().ShimID != live.ShimID {
+		t.Fatalf("live duplicate identity was suppressed: adopted=%+v", result.Adopted)
+	}
+	if result.OccupiedSlots() != 1 {
+		t.Fatalf("occupied slots = %d, want live incarnation charged", result.OccupiedSlots())
+	}
+}
+
 func TestPrepareAdoptionRunsAfterHelloAndFailureDoesNotAdvanceGeneration(t *testing.T) {
 	id := Identity{OrgID: "org-prepare", SessionID: "session-prepare"}
 	f := startShimHelper(t, id, 10_000)
@@ -753,14 +790,19 @@ func TestPrepareAdoptionRunsAfterHelloAndFailureDoesNotAdvanceGeneration(t *test
 	}
 	initial.Close()
 	var current shimwire.Generation
+	var preparation AdoptionPreparation
 	_, err := Adopt(context.Background(), AdoptOptions{
 		Registry:     f.registry,
 		ControllerID: "controller-refused",
-		Prepare: func(_ context.Context, gotID Identity, gotCurrent shimwire.Generation) (PreparedAdoption, error) {
-			if gotID != id {
-				return PreparedAdoption{}, fmt.Errorf("identity = %s, want %s", gotID, id)
+		Prepare: func(_ context.Context, evidence AdoptionPreparation) (PreparedAdoption, error) {
+			preparation = evidence
+			current = evidence.CurrentControllerGeneration
+			if evidence.Identity != id {
+				return PreparedAdoption{}, fmt.Errorf("identity = %s, want %s", evidence.Identity, id)
 			}
-			current = gotCurrent
+			if evidence.ShimID == "" || evidence.ProcessEpoch != 1 || evidence.ControllerID != "controller-refused" {
+				return PreparedAdoption{}, fmt.Errorf("incomplete authenticated Hello correlation: %+v", evidence)
+			}
 			return PreparedAdoption{}, fmt.Errorf("durable carrier epoch reservation failed")
 		},
 	})
@@ -769,6 +811,9 @@ func TestPrepareAdoptionRunsAfterHelloAndFailureDoesNotAdvanceGeneration(t *test
 	}
 	if current != 1 {
 		t.Fatalf("verified Hello generation = %d, want live shim generation 1", current)
+	}
+	if preparation.ShimID == "" || preparation.ProcessEpoch != 1 || preparation.ControllerID != "controller-refused" {
+		t.Fatalf("prepare evidence omitted exact authenticated Hello correlation: %+v", preparation)
 	}
 
 	// The failed reservation happened before Welcome, so a normal retry commits

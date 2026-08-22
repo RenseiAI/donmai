@@ -668,17 +668,22 @@ func (d *Daemon) Spawner() *WorkerSpawner {
 // result acknowledges an exact generation still owned by this daemon, including
 // terminal or natural cleanup in progress; capacity is released asynchronously
 // only after process-group reaping and synchronous Ended delivery. False means
-// the spawner is uninitialised, the ID was never present, or its generation was
-// already released. Wired to the POST /api/daemon/sessions/<id>/stop control-API
-// route for the deterministic per-session cancel path (Guard 3 hard out-of-band
-// leg).
+// the spawner is uninitialised, the ID was never present, its generation was
+// already released, or a bare id ambiguously names more than one organization-
+// scoped shim identity. Ambiguity is a refusal and never falls through to a
+// colliding direct child. Wired to the POST /api/daemon/sessions/<id>/stop
+// control-API route for the deterministic per-session cancel path (Guard 3 hard
+// out-of-band leg).
 func (d *Daemon) StopSession(id string) bool {
 	// A shim-owned session is reached by a generation-fenced Stop over shimwire,
 	// never by signalling a process this daemon does not parent (§D4). Trying the
 	// shim path first also means a stale spawner entry for the same id could not
 	// win the race and terminate the wrong owner.
-	if d.stopSessionShimByID(id) {
+	switch d.stopSessionShimByID(id) {
+	case sessionShimStopHandled:
 		return true
+	case sessionShimStopRefused:
+		return false
 	}
 	if d.spawner == nil {
 		return false

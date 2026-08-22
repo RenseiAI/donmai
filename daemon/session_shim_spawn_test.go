@@ -386,13 +386,18 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 	f := newShimSpawnFixture(t)
 	d := f.daemon
 	d.opts.SessionShim.HostID = "host-callback"
-	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, _ sessionshim.Identity, current shimwire.Generation) (sessionshim.PreparedAdoption, error) {
+	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+		if preparation.Identity.OrgID != "org-callback" || preparation.HostID != "host-callback" ||
+			preparation.ShimID == "" || preparation.ProcessEpoch == 0 {
+			return sessionshim.PreparedAdoption{}, fmt.Errorf("incomplete preparation evidence: %+v", preparation)
+		}
 		return sessionshim.PreparedAdoption{
-			ControllerGeneration: current + 7,
+			ControllerGeneration: preparation.CurrentControllerGeneration + 7,
 			Extensions: shimwire.Extensions{
 				Values:   map[string]string{shimwire.ExtCarrierEpoch: "19"},
 				Required: []string{shimwire.ExtCarrierEpoch},
 			},
+			Correlation: []byte(`{"fenceRevision":"73","expectedAdoptionRevision":"81"}`),
 		}, nil
 	}
 	var adoption SessionShimAdoptionEvidence
@@ -427,6 +432,9 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 	}
 	if got, ok := adoption.Extensions.Get(shimwire.ExtCarrierEpoch); !ok || got != "19" {
 		t.Fatalf("adoption carrier_epoch = %q/%v, want 19/true", got, ok)
+	}
+	if string(adoption.PreparedCorrelation) != `{"fenceRevision":"73","expectedAdoptionRevision":"81"}` {
+		t.Fatalf("prepared correlation changed before adoption: %s", adoption.PreparedCorrelation)
 	}
 	if !d.StopSession(spec.SessionID) {
 		t.Fatal("StopSession did not reach shim")
@@ -721,6 +729,13 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 		tombstone, err = registry.GetTombstone(id)
 		return err == nil
 	})
+	waitFor(t, 5*time.Second, "orphan tombstone publication to withdraw the live record", func() bool {
+		_, err := registry.Get(id)
+		return err != nil
+	})
+	if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
+		t.Fatalf("remove exact tombstone for wrong-epoch control: %v", err)
+	}
 	wrongEpoch := tombstone
 	wrongEpoch.ProcessEpoch++
 	if err := registry.PutTombstone(wrongEpoch); err != nil {
@@ -1058,10 +1073,10 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 			EnableAdoption: true,
 			RegistryDir:    f.registry,
 			HostID:         "host-startup",
-			PrepareAdoption: func(_ context.Context, _ sessionshim.Identity, current shimwire.Generation) (sessionshim.PreparedAdoption, error) {
+			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 				return sessionshim.PreparedAdoption{Extensions: shimwire.Extensions{
 					Values: map[string]string{shimwire.ExtCarrierEpoch: "20"},
-				}, ControllerGeneration: current + 1}, nil
+				}, ControllerGeneration: preparation.CurrentControllerGeneration + 1}, nil
 			},
 			OnAdoption: func(_ context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
 				if evidence.Identity != id {
