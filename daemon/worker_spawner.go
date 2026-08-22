@@ -866,7 +866,17 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// §D1: shim ownership is decided before any daemon-owned process exists. Once
 	// the direct path has created a pipe or an exec.Cmd, the daemon is already
 	// the owner this design exists to stop it from being.
-	shimSelected := s.opts.ShimSpawn != nil && (s.opts.ShimOwns == nil || s.opts.ShimOwns(spec))
+	shimSelected := false
+	if s.opts.ShimOwns != nil {
+		shimSelected = s.opts.ShimOwns(spec)
+		if shimSelected && s.opts.ShimSpawn == nil {
+			return nil, errors.New("session shim selector chose ownership but no launcher is configured")
+		}
+	} else {
+		// Legacy embedders keep the combined-decision contract: a configured
+		// launcher is offered every session and may decline with (nil, nil).
+		shimSelected = s.opts.ShimSpawn != nil
+	}
 	if shimSelected {
 		handle, handled, err := s.spawnThroughShim(spec, project)
 		if s.opts.ShimOwns != nil && !handled && err == nil {

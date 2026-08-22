@@ -214,10 +214,23 @@ func (d *Daemon) trackLaunchedShim(ctrl *sessionshim.Controller, spec SessionSpe
 		ProjectName:  project.ID,
 		Repository:   spec.Repository,
 	}
-	entry := adoptedShim{controller: ctrl, shimID: ctrl.Hello().ShimID, handle: handle, launched: true}
+	entry := adoptedShim{
+		controller: ctrl,
+		shimID:     ctrl.Hello().ShimID,
+		handle:     handle,
+		spec:       spec,
+		launched:   true,
+	}
 	d.shims.mu.Lock()
 	d.shims.adopted[ctrl.Identity()] = entry
 	d.shims.mu.Unlock()
+	// A shim-backed session is external to the direct-child registry, but it is
+	// still one accepted WorkerSpawner lifecycle. Emit Started only after the
+	// controller and handle are published, and before starting the consumer, so
+	// an immediately available immutable Exit can never overtake it.
+	if d.spawner != nil {
+		d.spawner.emit(SessionEvent{Kind: SessionEventStarted, Handle: handle, Spec: spec})
+	}
 	d.consumeShimEvents(ctrl)
 	return handle
 }
@@ -259,7 +272,7 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 			case sessionshim.EventExit:
 				slog.Info("session shim: terminal observation received",
 					"session", id.String(), "exitCode", ev.Exit.ExitCode, "signal", ev.Exit.Signal)
-				d.finishAdoptedShim(id)
+				d.finishAdoptedShim(id, ev.Exit)
 			case sessionshim.EventError:
 				slog.Warn("session shim: error frame",
 					"session", id.String(), "code", ev.Err.Code, "detail", ev.Err.Detail)
@@ -314,14 +327,58 @@ func (d *Daemon) SessionShimForwardedSeq(orgID, sessionID string) uint64 {
 // only THEN dispose of it. Disposing first would destroy the one artifact that
 // can prove the harness group was reaped, turning a proven death back into an
 // unresolved one for anything that asks later.
-func (d *Daemon) finishAdoptedShim(id sessionshim.Identity) {
+func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMsg) {
 	d.shims.mu.Lock()
 	entry, ok := d.shims.adopted[id]
-	delete(d.shims.adopted, id)
-	delete(d.shims.forwarded, id)
+	if !ok || entry.terminal {
+		d.shims.mu.Unlock()
+		return
+	}
+	entry.terminal = true
+	d.shims.adopted[id] = entry
 	registry := d.shims.registry
 	d.shims.mu.Unlock()
-	if ok && entry.controller != nil {
+
+	// OnPreSpawn transferred cleanup ownership when this daemon launched the
+	// shim. Deliver the same ordinary lifecycle listeners as a direct child, but
+	// only for the immutable Exit frame. A controller disconnect never reaches
+	// this function and therefore never fabricates a terminal outcome.
+	if entry.launched && d.spawner != nil {
+		handle := entry.handle
+		var exitErr error
+		switch {
+		case exit.Signal != "":
+			handle.State = SessionTerminated
+			exitErr = fmt.Errorf("session shim exited after signal %s", exit.Signal)
+		case exit.ExitCode != 0:
+			handle.State = SessionFailed
+			exitErr = fmt.Errorf("session shim exited with code %d", exit.ExitCode)
+		default:
+			handle.State = SessionCompleted
+		}
+		d.spawner.emit(SessionEvent{
+			Kind:    SessionEventEnded,
+			Handle:  handle,
+			Spec:    entry.spec,
+			ExitErr: exitErr,
+		})
+	}
+
+	// Retain the exact generation through synchronous listener delivery. A
+	// replacement must never be deleted by a stale terminal consumer.
+	d.shims.mu.Lock()
+	current, stillOwned := d.shims.adopted[id]
+	if stillOwned && current.controller == entry.controller && current.terminal {
+		delete(d.shims.adopted, id)
+		delete(d.shims.forwarded, id)
+	} else {
+		stillOwned = false
+	}
+	d.shims.mu.Unlock()
+	if !stillOwned {
+		return
+	}
+	if entry.controller != nil {
 		_ = entry.controller.Close()
 	}
 	if registry == nil {

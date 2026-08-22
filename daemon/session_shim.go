@@ -116,10 +116,18 @@ type adoptedShim struct {
 	// daemon generation that is gone, and inventing project/repository fields
 	// from nothing would put guesses on an operator-facing surface.
 	handle SessionHandle
+	// spec is retained only for a shim this daemon launched. Its exact value is
+	// the lifecycle payload delivered to ordinary WorkerSpawner listeners; an
+	// adopted shim deliberately has no fabricated spec.
+	spec SessionSpec
 	// launched distinguishes "this daemon created it" from "this daemon adopted
 	// it after a restart" — a diagnostic distinction only (§D11: ownership mode
 	// is a diagnostic field, never a second lifecycle authority).
 	launched bool
+	// terminal serializes immutable Exit handling. The entry stays present while
+	// synchronous Ended listeners run, preserving capacity ownership until their
+	// generation-scoped cleanup is complete.
+	terminal bool
 }
 
 // sessionShimState is the daemon's live view of per-session shim ownership.

@@ -1962,6 +1962,40 @@ func TestSpawner_ShimSelector_SelectedNilHandleFailsClosed(t *testing.T) {
 	}
 }
 
+func TestSpawner_ShimSelector_SelectedWithoutLauncherFailsClosedBeforePreSpawn(t *testing.T) {
+	var preSpawnCalls atomic.Int32
+	var abortCalls atomic.Int32
+	var lifecycleCalls atomic.Int32
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "x", Repository: "github.com/a/b"}},
+		MaxConcurrentSessions: 1,
+		ShimOwns:              func(SessionSpec) bool { return true },
+		OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
+			preSpawnCalls.Add(1)
+			return env, nil
+		},
+		OnSpawnAborted: func(SessionSpec, error) { abortCalls.Add(1) },
+	})
+	s.On(func(SessionEvent) { lifecycleCalls.Add(1) })
+
+	_, err := s.AcceptWork(SessionSpec{SessionID: "shim-without-launcher", Repository: "github.com/a/b"})
+	if err == nil || !strings.Contains(err.Error(), "no launcher is configured") {
+		t.Fatalf("AcceptWork error = %v, want missing shim launcher refusal", err)
+	}
+	if got := preSpawnCalls.Load(); got != 0 {
+		t.Errorf("OnPreSpawn calls = %d, want 0 before missing-launcher refusal", got)
+	}
+	if got := abortCalls.Load(); got != 0 {
+		t.Errorf("OnSpawnAborted calls = %d, want 0 when OnPreSpawn never acquired resources", got)
+	}
+	if got := lifecycleCalls.Load(); got != 0 {
+		t.Errorf("lifecycle events = %d, want 0 for a session that never launched", got)
+	}
+	if got := s.ActiveCount(); got != 0 {
+		t.Errorf("ActiveCount = %d, want 0 after missing-launcher refusal", got)
+	}
+}
+
 // TestSpawner_OnPreSpawn_SeesBaseEnv proves the hook receives the
 // post-merge env — i.e., BaseEnv entries are visible before the hook
 // runs, so callers can selectively override them.

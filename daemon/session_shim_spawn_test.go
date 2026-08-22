@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -385,6 +386,145 @@ func TestStopAndTerminalCleanupAfterAdoption(t *testing.T) {
 	})
 	if proof := d.SessionShimTerminalProof(id.OrgID, id.SessionID); !proof.Proves() {
 		t.Fatal("no terminal proof retained for a session this daemon watched end; the outcome would be unresolvable")
+	}
+}
+
+func TestShimLaunchLifecycleTransfersPreSpawnCleanupExactlyOnce(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.spawner.opts.ShimOwns = d.shimOwnsSession
+
+	var preSpawnCalls atomic.Int32
+	var abortCalls atomic.Int32
+	var startCalls atomic.Int32
+	var endCalls atomic.Int32
+	var cleanupCalls atomic.Int32
+	var resourceOwned atomic.Bool
+	ended := make(chan SessionEvent, 2)
+	d.spawner.opts.OnPreSpawn = func(_ SessionSpec, env []string) ([]string, error) {
+		preSpawnCalls.Add(1)
+		if !resourceOwned.CompareAndSwap(false, true) {
+			t.Error("OnPreSpawn acquired an already-owned resource")
+		}
+		return env, nil
+	}
+	d.spawner.opts.OnSpawnAborted = func(SessionSpec, error) {
+		abortCalls.Add(1)
+		resourceOwned.Store(false)
+	}
+	d.spawner.On(func(ev SessionEvent) {
+		switch ev.Kind {
+		case SessionEventStarted:
+			startCalls.Add(1)
+		case SessionEventEnded:
+			endCalls.Add(1)
+			if !resourceOwned.CompareAndSwap(true, false) {
+				t.Error("SessionEventEnded did not receive OnPreSpawn resource ownership")
+			}
+			cleanupCalls.Add(1)
+			ended <- ev
+		}
+	})
+
+	spec := f.interactiveSpec("sess-lifecycle")
+	handle, err := d.spawner.AcceptWork(spec)
+	if err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	if got := preSpawnCalls.Load(); got != 1 {
+		t.Fatalf("OnPreSpawn calls after launch = %d, want 1", got)
+	}
+	if got := startCalls.Load(); got != 1 {
+		t.Fatalf("SessionEventStarted calls after launch = %d, want 1", got)
+	}
+	if got := abortCalls.Load(); got != 0 {
+		t.Fatalf("OnSpawnAborted calls after successful ownership transfer = %d, want 0", got)
+	}
+	if !d.StopSession(spec.SessionID) {
+		t.Fatal("StopSession did not route to the launched shim")
+	}
+
+	var terminal SessionEvent
+	select {
+	case terminal = <-ended:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for shim SessionEventEnded")
+	}
+	if terminal.Spec.SessionID != spec.SessionID {
+		t.Errorf("Ended spec session = %q, want %q", terminal.Spec.SessionID, spec.SessionID)
+	}
+	if terminal.Handle.SessionID != handle.SessionID || terminal.Handle.PID != handle.PID {
+		t.Errorf("Ended handle = %+v, want original lifecycle handle %+v", terminal.Handle, *handle)
+	}
+	if terminal.Handle.State != SessionTerminated {
+		t.Errorf("Ended state = %q, want %q after Stop", terminal.Handle.State, SessionTerminated)
+	}
+	waitFor(t, 15*time.Second, "terminal lifecycle release", func() bool {
+		return d.SessionShimOccupancy() == 0
+	})
+	if got := endCalls.Load(); got != 1 {
+		t.Errorf("SessionEventEnded calls = %d, want exactly 1", got)
+	}
+	if got := cleanupCalls.Load(); got != 1 {
+		t.Errorf("listener cleanup calls = %d, want exactly 1", got)
+	}
+	if resourceOwned.Load() {
+		t.Error("OnPreSpawn resource remained owned after terminal lifecycle delivery")
+	}
+	if got := abortCalls.Load(); got != 0 {
+		t.Errorf("OnSpawnAborted calls after terminal completion = %d, want 0", got)
+	}
+	select {
+	case duplicate := <-ended:
+		t.Fatalf("duplicate terminal lifecycle event: %+v", duplicate)
+	default:
+	}
+}
+
+func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.spawner.opts.ShimOwns = d.shimOwnsSession
+
+	var endCalls atomic.Int32
+	d.spawner.On(func(ev SessionEvent) {
+		if ev.Kind == SessionEventEnded {
+			endCalls.Add(1)
+		}
+	})
+	spec := f.interactiveSpec("sess-controller-gap")
+	if _, err := d.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	entry, err := d.adoptedShimEntry(id.OrgID, id.SessionID)
+	if err != nil {
+		t.Fatalf("adoptedShimEntry: %v", err)
+	}
+	if err := entry.controller.Close(); err != nil {
+		t.Fatalf("close controller: %v", err)
+	}
+	waitFor(t, 5*time.Second, "controller gap classification", func() bool {
+		return d.SessionShimOccupancy() == 0
+	})
+	if got := endCalls.Load(); got != 0 {
+		t.Fatalf("SessionEventEnded calls after controller disconnect = %d, want 0", got)
+	}
+
+	// Let the shim-owned orphan rule reap the harness so the helper process does
+	// not outlive the test. A tombstone is durable proof, but this disconnected
+	// daemon did not receive the immutable Exit frame and still must not invent an
+	// Ended event.
+	registry, err := sessionshim.NewRegistry(f.registry)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	waitFor(t, 10*time.Second, "orphan tombstone after controller gap", func() bool {
+		_, err := registry.GetTombstone(id)
+		return err == nil
+	})
+	if got := endCalls.Load(); got != 0 {
+		t.Fatalf("SessionEventEnded calls after disconnected orphan completion = %d, want 0", got)
 	}
 }
 
