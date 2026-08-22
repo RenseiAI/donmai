@@ -619,6 +619,34 @@ func (s *Session) removeSub(sub *subscription) {
 	s.mu.Unlock()
 }
 
+// PID reports the harness child's process id, or 0 before the child exists.
+//
+// The host is otherwise deliberately transport-free and does not surface process
+// details, but a PID paired with the OS-reported start time is the only way an
+// out-of-process owner can later PROVE the process group it reaped was the one
+// it started — and proving that, rather than assuming it, is what separates a
+// terminal observation from a guess (ADR-2026-08-17 §D2/§D10). It is read-only:
+// nothing here lets a caller signal the child, which remains Stop's job.
+func (s *Session) PID() int {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return 0
+	}
+	return s.cmd.Process.Pid
+}
+
+// FirstBufferedSeq is the oldest host sequence still replayable from the ring,
+// or 0 when nothing is buffered.
+//
+// It is the lower bound of the replay window, and an out-of-process owner needs
+// it to answer "can I still serve this resume position?" BEFORE promising
+// contiguous replay — which is what lets a gap be declared honestly instead of
+// discovered halfway through (§D5).
+func (s *Session) FirstBufferedSeq() attachwire.HostSeq {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ring.firstSeq()
+}
+
 // Done is closed after the child has exited AND the master has been drained to
 // EOF with every pending Output emitted (§12.2).
 func (s *Session) Done() <-chan struct{} { return s.done }

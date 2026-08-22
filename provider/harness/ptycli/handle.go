@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/ptyhost"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // stopGrace bounds how long watchCtx waits for a graceful exit after ctx is
@@ -26,6 +29,11 @@ const stopGrace = 5 * time.Second
 type Handle struct {
 	sess   *ptyhost.Session
 	events chan agent.Event
+
+	// shim is non-nil when this process OWNS the session on behalf of a
+	// replaceable controller (ADR-2026-08-17 §D1). The handle still drives the
+	// same *ptyhost.Session either way — what changes is who may outlive whom.
+	shim *sessionshim.Shim
 
 	closeOnce   sync.Once
 	cleanupOnce sync.Once
@@ -91,7 +99,7 @@ func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec ag
 		NoticeDelivery: manifest.Caps.NoticeDelivery,
 	}
 
-	sess, err := ptyhost.Spawn(pspec)
+	sess, shim, err := spawnSession(pspec, spec.Cwd)
 	if err != nil {
 		spawnErr := fmt.Errorf("%w: interactive pty spawn: %v", agent.ErrSpawnFailed, err)
 		if cleanup != nil {
@@ -104,6 +112,7 @@ func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec ag
 
 	h := &Handle{
 		sess: sess,
+		shim: shim,
 		// Buffered for exactly the two events this driver ever emits
 		// (InitEvent, terminal ResultEvent) so sendEvent never blocks on a
 		// slow/absent consumer.
@@ -126,8 +135,62 @@ func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec ag
 // run waits for the PTY child to exit, maps its terminal Exit payload onto a
 // single ResultEvent, and closes the events channel. It is the sole owner of
 // both the terminal event and the channel close.
+// spawnSession starts the PTY, under shim ownership when this process was
+// launched with the §D1 launch contract in its environment.
+//
+// Absent the contract this is byte-for-byte the previous behaviour — a bare
+// ptyhost.Spawn — which is what makes §D11's staged rollout real rather than
+// nominal: a worker binary that ships the shim code but is never launched with
+// the contract behaves exactly as it did before.
+func spawnSession(pspec ptyhost.Spec, workarea string) (*ptyhost.Session, *sessionshim.Shim, error) {
+	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
+	if errors.Is(err, sessionshim.ErrNoLaunch) {
+		sess, spawnErr := ptyhost.Spawn(pspec)
+		return sess, nil, spawnErr
+	}
+	if err != nil {
+		// The controller told this process to be a shim and the instruction was
+		// unusable. Falling back to direct ownership would leave the controller
+		// waiting to adopt a shim that will never exist while a terminal it
+		// believes is durable quietly is not, so this fails closed.
+		return nil, nil, fmt.Errorf("session shim launch: %w", err)
+	}
+	shim, err := sessionshim.StartFromEnv(launch, pspec, workarea)
+	if err != nil {
+		return nil, nil, fmt.Errorf("session shim start: %w", err)
+	}
+	slog.Info("interactive pty: session is shim-owned",
+		"session", launch.Identity.String(), "shimId", shim.ShimID(), "socket", shim.SocketPath())
+	return shim.Session(), shim, nil
+}
+
+// shimFinalizeGrace bounds the wait for the shim's own terminal finalization
+// after the harness exits. It is short because the work is one Alive() probe and
+// one atomic tombstone write; it is bounded because a runner must not hang on it.
+const shimFinalizeGrace = 10 * time.Second
+
+// awaitShimTerminal lets the shim persist its terminal observation before this
+// process goes away.
+//
+// Without it the runner could exit first and take the shim's tombstone-writing
+// goroutine with it, leaving a session whose harness is provably gone with no
+// durable proof of that — which under §D10 is not "ended" but "unresolved", and
+// keeps a claim quarantined for something that already finished.
+func (h *Handle) awaitShimTerminal() {
+	if h.shim == nil {
+		return
+	}
+	select {
+	case <-h.shim.Done():
+	case <-time.After(shimFinalizeGrace):
+		slog.Warn("interactive pty: shim did not finalize its terminal observation within the grace window",
+			"session", h.shim.Identity().String())
+	}
+}
+
 func (h *Handle) run() {
 	<-h.sess.Done()
+	h.awaitShimTerminal()
 	exit, _ := h.sess.Exit()
 	result := buildResult(exit)
 	if err := h.cleanup(); err != nil {

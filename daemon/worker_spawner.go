@@ -93,6 +93,32 @@ type SpawnerOptions struct {
 	// A nil hook is a no-op.
 	OnSpawnAborted func(spec SessionSpec, err error)
 
+	// ExternalOccupancy reports capacity slots held on this host by sessions the
+	// spawner does not parent — per-session shims it launched, adopted, or
+	// quarantined (ADR-2026-08-17 §D7).
+	//
+	// Admission has to see them, not just the heartbeat. A shim-owned session
+	// never enters this spawner's own registry by design, so a host that advertised
+	// its occupancy honestly and then admitted against its direct-child count
+	// alone would still double-book itself — accepting work it has no core to run.
+	// Nil reads as zero, which is correct for an embedder with no shims.
+	ExternalOccupancy func() int
+
+	// ShimSpawn, when non-nil, is consulted for every accepted session BEFORE
+	// the ordinary direct-child spawn (ADR-2026-08-17 §D1/§D11).
+	//
+	// It returns a handle when the session was launched under per-session shim
+	// ownership, and (nil, nil) when it was not — which is the spawner's signal
+	// to fall through to the direct path. That three-way return, rather than a
+	// separate "is this shim-owned?" predicate, keeps the OWNERSHIP DECISION and
+	// the launch in one place: a spawner that asked first and launched second
+	// could have the answer change between the two calls.
+	//
+	// A non-nil error fails the accept, fail-closed. A session the daemon
+	// intended to launch under a shim must not silently become a
+	// daemon-parented child that dies with the next upgrade.
+	ShimSpawn func(spec SessionSpec, project ProjectConfig, env []string) (*SessionHandle, error)
+
 	// WorktreeParentDir is the directory under which the spawned worker
 	// creates each per-session worktree (<WorktreeParentDir>/<sessionID>).
 	// It MUST match the parent the worker resolves (the worker uses
@@ -588,7 +614,7 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("session %q is already being started", spec.SessionID)
 	}
-	if active, capacity := len(s.sessions)+len(s.spawnReservations), s.opts.MaxConcurrentSessions; active >= capacity {
+	if active, capacity := len(s.sessions)+len(s.spawnReservations)+s.externalOccupancy(), s.opts.MaxConcurrentSessions; active >= capacity {
 		s.mu.Unlock()
 		// Snapshot the counts BEFORE unlocking — formatting them after
 		// release races with spawn.func1's delete on s.sessions when an
@@ -615,6 +641,62 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 	s.mu.Unlock()
 
 	return s.spawn(spec, project)
+}
+
+// externalOccupancy is the slot count held by sessions this spawner does not
+// parent. Zero when no reporter is wired.
+func (s *WorkerSpawner) externalOccupancy() int {
+	if s.opts.ExternalOccupancy == nil {
+		return 0
+	}
+	if n := s.opts.ExternalOccupancy(); n > 0 {
+		return n
+	}
+	return 0
+}
+
+// spawnThroughShim offers the session to the shim launch path.
+//
+// handled=false means this session is not shim-owned and the caller continues
+// with the direct spawn. handled=true means ownership moved to a shim and the
+// spawner keeps NO process bookkeeping for it — no exec.Cmd, no pipes, no
+// reaper entry — because every one of those would be a second owner of a session
+// whose whole point is having exactly one (§D1).
+func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfig) (*SessionHandle, bool, error) {
+	if s.opts.ShimSpawn == nil {
+		return nil, false, nil
+	}
+	env := composeEnv(s.opts.BaseEnv, spec.Env, map[string]string{
+		"DONMAI_SESSION_ID":    spec.SessionID,
+		"DONMAI_REPOSITORY":    spec.Repository,
+		"DONMAI_REPOSITORY_ID": spec.RepositoryID,
+		"DONMAI_REF":           spec.Ref,
+		"DONMAI_PROJECT_ID":    project.ID,
+	})
+	// OnPreSpawn is the credential rail, and a shim-backed session needs it for
+	// exactly the same reason a direct one does: the harness cannot start without
+	// the credentials the hook resolves. Skipping it for shim sessions would make
+	// shim ownership silently downgrade the security posture of the spawn.
+	if s.opts.OnPreSpawn != nil {
+		next, hookErr := s.opts.OnPreSpawn(spec, env)
+		if hookErr != nil {
+			return nil, true, fmt.Errorf("pre-spawn hook: %w", hookErr)
+		}
+		if next != nil {
+			env = next
+		}
+	}
+	handle, err := s.opts.ShimSpawn(spec, *project, env)
+	if err != nil {
+		if s.opts.OnSpawnAborted != nil && s.opts.OnPreSpawn != nil {
+			s.opts.OnSpawnAborted(spec, err)
+		}
+		return nil, true, err
+	}
+	if handle == nil {
+		return nil, false, nil
+	}
+	return handle, true, nil
 }
 
 func (s *WorkerSpawner) resolveProjectForSpecLocked(spec SessionSpec) (*ProjectConfig, error) {
@@ -770,6 +852,16 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		delete(s.spawnReservations, spec.SessionID)
 		s.mu.Unlock()
 	}()
+
+	// §D1: shim ownership is decided before any daemon-owned process exists. Once
+	// the direct path has created a pipe or an exec.Cmd, the daemon is already
+	// the owner this design exists to stop it from being.
+	if handle, handled, err := s.spawnThroughShim(spec, project); handled || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return handle, nil
+	}
 
 	command := s.opts.WorkerCommand
 	if len(command) == 0 {

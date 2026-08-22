@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/runner/access"
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // Version is the daemon binary version reported in DaemonStatus and in
@@ -270,6 +271,11 @@ type HeartbeatPayload struct {
 	MaxSessions               int    `json:"maxSessions"`
 	Region                    string `json:"region,omitempty"`
 	SentAt                    string `json:"sentAt"`
+
+	// QuarantinedSessions is the bounded per-session-shim quarantine projection
+	// (ADR-2026-08-17 §D7): live shims this daemon could not adopt, each marked
+	// consumesCapacity:true. Absent when nothing is quarantined.
+	QuarantinedSessions []sessionshim.QuarantinedSession `json:"quarantinedSessions,omitempty"`
 
 	// AllowlistHash is the SHA-256 of the daemon's current project
 	// allowlist (see allowlist_report.go). Sent on every beat so the
