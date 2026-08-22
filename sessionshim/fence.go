@@ -173,22 +173,21 @@ func (p FencePolicy) HoldWindow() time.Duration {
 	return budget + p.Orphan.TotalBound()
 }
 
-// RequestFence obtains a durable, acknowledged fence covering exactly ids.
+// RequestFence obtains a durable, acknowledged fence covering exactly ids
+// using the v0.67 FenceStore contract.
 //
 // With a nil store the fence is locally satisfied: an OSS-only daemon records
 // the intent without a remote acknowledgement, which is correct because there is
 // no remote reaper to fence against.
 //
-// With an ExactFenceStore, the acknowledgement is VERIFIED to echo the exact
-// ordered request bytes and carry a durable revision before it is accepted. A
-// legacy FenceStore follows the v0.67 semantic identity/correlation check and
-// does not manufacture a durable revision. A store that acknowledges a partial
-// set has not agreed to protect the same restart intent.
-func RequestFence(ctx context.Context, store any, fenceID, hostID string, ids []FencedSession, policy FencePolicy, now time.Time) (Fence, error) {
+// The acknowledgement is verified to cover the same semantic identity and
+// correlation set as the requested fence. It preserves the old source and
+// runtime contract for OSS embedders.
+func RequestFence(ctx context.Context, store FenceStore, fenceID, hostID string, ids []FencedSession, policy FencePolicy, now time.Time) (Fence, error) {
 	if fenceID == "" {
 		return Fence{}, fmt.Errorf("%w: fence id is required", ErrFenceRequired)
 	}
-	requested := append([]FencedSession(nil), ids...)
+	requested := sortedFencedSessions(ids)
 	f := Fence{
 		FenceID:           fenceID,
 		HostID:            hostID,
@@ -200,11 +199,53 @@ func RequestFence(ctx context.Context, store any, fenceID, hostID string, ids []
 	if store == nil {
 		return f, nil
 	}
+	ack, err := store.Acknowledge(ctx, f)
+	if err != nil {
+		return Fence{}, fmt.Errorf("%w: %w", ErrFenceRequired, err)
+	}
+	if ack.FenceID != f.FenceID {
+		return Fence{}, fmt.Errorf("%w: acknowledgement names fence %q, requested %q", ErrFenceRequired, ack.FenceID, f.FenceID)
+	}
+	ackSessions := sortedFencedSessions(ack.Sessions)
+	if len(ackSessions) != len(requested) {
+		return Fence{}, fmt.Errorf("%w: acknowledgement covers %d sessions, requested %d", ErrFenceRequired, len(ackSessions), len(requested))
+	}
+	for i, want := range requested {
+		if ackSessions[i] != want {
+			return Fence{}, fmt.Errorf(
+				"%w: acknowledgement session %d correlation differs: got %+v, requested %+v",
+				ErrFenceRequired, i, ackSessions[i], want)
+		}
+	}
+	ack.Sessions = ackSessions
+	return ack, nil
+}
+
+// RequestFenceExact is the additive hosted restart-fence path. It preserves
+// the caller's ordered snapshot, sends the exact bytes from that one snapshot,
+// and accepts only a byte-for-byte echo with a non-empty durable revision.
+// Normalizing JSON or reconstructing the request in a composing store is a
+// refusal because it can change the durable intent.
+func RequestFenceExact(ctx context.Context, store ExactFenceStore, fenceID, hostID string, ids []FencedSession, policy FencePolicy, now time.Time) (Fence, error) {
+	if fenceID == "" {
+		return Fence{}, fmt.Errorf("%w: fence id is required", ErrFenceRequired)
+	}
+	f := Fence{
+		FenceID:           fenceID,
+		HostID:            hostID,
+		Sessions:          append([]FencedSession(nil), ids...),
+		IssuedAtUnixNano:  now.UnixNano(),
+		HoldUntilUnixNano: now.Add(policy.HoldWindow()).UnixNano(),
+		State:             FenceHeld,
+	}
+	if store == nil {
+		return f, nil
+	}
 	requestBytes, err := json.Marshal(f)
 	if err != nil {
 		return Fence{}, fmt.Errorf("%w: serialize exact request: %w", ErrFenceRequired, err)
 	}
-	request := FenceRequest{
+	ack, err := store.AcknowledgeExact(ctx, FenceRequest{
 		Fence: Fence{
 			FenceID:           f.FenceID,
 			HostID:            f.HostID,
@@ -214,48 +255,18 @@ func RequestFence(ctx context.Context, store any, fenceID, hostID string, ids []
 			State:             f.State,
 		},
 		RequestBytes: append([]byte(nil), requestBytes...),
-	}
-	if exact, ok := store.(ExactFenceStore); ok {
-		ack, err := exact.AcknowledgeExact(ctx, request)
-		if err != nil {
-			return Fence{}, fmt.Errorf("%w: %w", ErrFenceRequired, err)
-		}
-		if strings.TrimSpace(ack.DurableRevision) == "" {
-			return Fence{}, fmt.Errorf("%w: acknowledgement omitted durable revision", ErrFenceRequired)
-		}
-		if !bytes.Equal(ack.RequestBytes, requestBytes) {
-			return Fence{}, fmt.Errorf("%w: acknowledgement bytes differ from exact ordered request", ErrFenceRequired)
-		}
-		f.DurableRevision = ack.DurableRevision
-		return f, nil
-	}
-	legacy, ok := store.(FenceStore)
-	if !ok {
-		return Fence{}, fmt.Errorf("%w: store does not implement FenceStore or ExactFenceStore", ErrFenceRequired)
-	}
-	legacyFence := f
-	legacyFence.Sessions = sortedFencedSessions(f.Sessions)
-	ack, err := legacy.Acknowledge(ctx, legacyFence)
+	})
 	if err != nil {
 		return Fence{}, fmt.Errorf("%w: %w", ErrFenceRequired, err)
 	}
-	if ack.FenceID != f.FenceID {
-		return Fence{}, fmt.Errorf("%w: acknowledgement names fence %q, requested %q", ErrFenceRequired, ack.FenceID, f.FenceID)
+	if strings.TrimSpace(ack.DurableRevision) == "" {
+		return Fence{}, fmt.Errorf("%w: acknowledgement omitted durable revision", ErrFenceRequired)
 	}
-	legacyRequested := legacyFence.Sessions
-	ackSessions := sortedFencedSessions(ack.Sessions)
-	if len(ackSessions) != len(legacyRequested) {
-		return Fence{}, fmt.Errorf("%w: acknowledgement covers %d sessions, requested %d", ErrFenceRequired, len(ackSessions), len(legacyRequested))
+	if !bytes.Equal(ack.RequestBytes, requestBytes) {
+		return Fence{}, fmt.Errorf("%w: acknowledgement bytes differ from exact ordered request", ErrFenceRequired)
 	}
-	for i, want := range legacyRequested {
-		if ackSessions[i] != want {
-			return Fence{}, fmt.Errorf(
-				"%w: acknowledgement session %d correlation differs: got %+v, requested %+v",
-				ErrFenceRequired, i, ackSessions[i], want)
-		}
-	}
-	ack.Sessions = ackSessions
-	return ack, nil
+	f.DurableRevision = ack.DurableRevision
+	return f, nil
 }
 
 func sortedFencedSessions(in []FencedSession) []FencedSession {

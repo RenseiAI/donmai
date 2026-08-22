@@ -67,12 +67,16 @@ type SessionShimConfig struct {
 	RestartBudget time.Duration
 
 	// FenceStore is the OPTIONAL composing-plane restart-fence persister (§D9).
-	// It accepts either the v0.67 sessionshim.FenceStore or the additive
-	// sessionshim.ExactFenceStore. Nil is fully supported: a standalone daemon
-	// has no remote reaper to fence against and still gets the local
-	// bounded-orphan rule. The broad field type preserves source compatibility
-	// for legacy stores while allowing hosted activation to opt into exact bytes.
-	FenceStore any
+	// Nil is fully supported: a standalone daemon has no remote reaper to fence
+	// against and still gets the local bounded-orphan rule. This field retains the
+	// v0.67 source contract; hosted activation uses ExactFenceStore below.
+	FenceStore sessionshim.FenceStore
+
+	// ExactFenceStore is the additive hosted restart-fence persister. When set,
+	// RequestSessionShimRestartFence uses the exact request-byte and durable
+	// revision contract. It is separate so the v0.67 FenceStore field remains
+	// source-compatible for OSS embedders.
+	ExactFenceStore sessionshim.ExactFenceStore
 
 	// ExpectedWorkarea returns the workarea this daemon believes a session
 	// belongs to, for the adoption-time workarea identity check. Nil skips only
@@ -431,7 +435,15 @@ func (d *Daemon) RequestSessionShimRestartFence(ctx context.Context, fenceID str
 	})
 
 	policy := sessionshim.FencePolicy{RestartBudget: cfg.RestartBudget, Orphan: cfg.Orphan}
-	fence, err := sessionshim.RequestFence(ctx, cfg.FenceStore, fenceID, d.controllerID(), covered, policy, time.Now())
+	var (
+		fence sessionshim.Fence
+		err   error
+	)
+	if cfg.ExactFenceStore != nil {
+		fence, err = sessionshim.RequestFenceExact(ctx, cfg.ExactFenceStore, fenceID, d.controllerID(), covered, policy, time.Now())
+	} else {
+		fence, err = sessionshim.RequestFence(ctx, cfg.FenceStore, fenceID, d.controllerID(), covered, policy, time.Now())
+	}
 	if err != nil {
 		return sessionshim.Fence{}, err
 	}

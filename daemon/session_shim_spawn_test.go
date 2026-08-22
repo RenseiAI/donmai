@@ -785,11 +785,13 @@ func TestForwardedSequenceRejectsDurableCarrierError(t *testing.T) {
 		t.Fatalf("AcceptWork: %v", err)
 	}
 	id := f.identity(spec.SessionID)
-	seq := f.exchange(t, id, "carrier-error")
-	if seq == 0 {
-		t.Fatal("observer did not receive output")
+	if err := f.daemon.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte("carrier-error\r")); err != nil {
+		t.Fatalf("WriteAdoptedSessionShimInput: %v", err)
 	}
-	time.Sleep(250 * time.Millisecond)
+	waitFor(t, 5*time.Second, "the observer to receive the rejected frame", func() bool {
+		out, _ := f.events.output(id)
+		return strings.Contains(out, "carrier-error")
+	})
 	if got := f.daemon.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != 0 {
 		t.Fatalf("carrier-error forwarded sequence = %d, want durable cursor unchanged at 0", got)
 	}

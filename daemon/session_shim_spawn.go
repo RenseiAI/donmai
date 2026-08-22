@@ -267,7 +267,11 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 						if err := durable(id, ev); err != nil {
 							slog.Warn("session shim: durable carrier rejected output",
 								"session", id.String(), "seq", ev.Seq, "error", err)
-							continue
+							// A later frame must never advance the cursor past this
+							// unacknowledged one. Close the controller and let the
+							// normal disconnect/quarantine path retain ownership.
+							_ = ctrl.Close()
+							return
 						}
 						d.recordShimForwardedSeq(id, ev.Seq)
 					}
@@ -294,7 +298,11 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 						if err := durable(id, ev); err != nil {
 							slog.Warn("session shim: durable carrier rejected snapshot",
 								"session", id.String(), "seq", ev.Snapshot.AtSeq, "error", err)
-							continue
+							// A later frame must never advance the cursor past this
+							// unacknowledged snapshot. Close the controller and let the
+							// normal disconnect/quarantine path retain ownership.
+							_ = ctrl.Close()
+							return
 						}
 						d.recordShimForwardedSeq(id, ev.Snapshot.AtSeq)
 					}

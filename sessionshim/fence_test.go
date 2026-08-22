@@ -220,7 +220,7 @@ func TestRequestFenceRefusesPartialAcknowledgement(t *testing.T) {
 		}
 		return FenceAcknowledgement{RequestBytes: partialBytes, DurableRevision: "revision-1"}, nil
 	})
-	_, err := RequestFence(context.Background(), store, "fence-1", "host-1", ids, FencePolicy{}, now)
+	_, err := RequestFenceExact(context.Background(), store, "fence-1", "host-1", ids, FencePolicy{}, now)
 	if !errors.Is(err, ErrFenceRequired) {
 		t.Fatalf("RequestFence with partial ack = %v, want ErrFenceRequired", err)
 	}
@@ -243,7 +243,7 @@ func TestRequestFenceRefusesReorderedAcknowledgement(t *testing.T) {
 		}
 		return FenceAcknowledgement{RequestBytes: reorderedBytes, DurableRevision: "revision-1"}, nil
 	})
-	_, err := RequestFence(context.Background(), store, "fence-1", "host-1", ids, FencePolicy{}, now)
+	_, err := RequestFenceExact(context.Background(), store, "fence-1", "host-1", ids, FencePolicy{}, now)
 	if !errors.Is(err, ErrFenceRequired) {
 		t.Fatalf("RequestFence with reordered ack = %v, want ErrFenceRequired", err)
 	}
@@ -262,7 +262,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 		store := exactFenceStoreFunc(func(context.Context, FenceRequest) (FenceAcknowledgement, error) {
 			return FenceAcknowledgement{}, errors.New("control plane unreachable")
 		})
-		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
+		_, err := RequestFenceExact(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 		if !errors.Is(err, ErrFenceRequired) {
 			t.Fatalf("RequestFence = %v, want ErrFenceRequired (the caller must refuse the restart)", err)
 		}
@@ -276,7 +276,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 			changedBytes, err := json.Marshal(changed)
 			return FenceAcknowledgement{RequestBytes: changedBytes, DurableRevision: "revision-1"}, err
 		})
-		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
+		_, err := RequestFenceExact(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 		if !errors.Is(err, ErrFenceRequired) {
 			t.Fatalf("RequestFence = %v, want ErrFenceRequired", err)
 		}
@@ -291,7 +291,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 			changedBytes, err := json.Marshal(changed)
 			return FenceAcknowledgement{RequestBytes: changedBytes, DurableRevision: "revision-1"}, err
 		})
-		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
+		_, err := RequestFenceExact(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 		if !errors.Is(err, ErrFenceRequired) {
 			t.Fatalf("RequestFence with wrong process epoch = %v, want ErrFenceRequired", err)
 		}
@@ -306,7 +306,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 			changedBytes, err := json.Marshal(changed)
 			return FenceAcknowledgement{RequestBytes: changedBytes, DurableRevision: "revision-1"}, err
 		})
-		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
+		_, err := RequestFenceExact(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 		if !errors.Is(err, ErrFenceRequired) {
 			t.Fatalf("RequestFence with wrong forwarded sequence = %v, want ErrFenceRequired", err)
 		}
@@ -319,7 +319,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 			ack.DurableRevision = ""
 			return ack, nil
 		})
-		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
+		_, err := RequestFenceExact(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 		if !errors.Is(err, ErrFenceRequired) {
 			t.Fatalf("RequestFence with empty durable revision = %v, want ErrFenceRequired", err)
 		}
@@ -348,7 +348,7 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 		received = request
 		return exactDurableAcknowledgement(request), nil
 	})
-	f, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
+	f, err := RequestFenceExact(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
 	if err != nil {
 		t.Fatalf("RequestFence: %v", err)
 	}
