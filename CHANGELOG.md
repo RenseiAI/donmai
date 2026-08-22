@@ -18,10 +18,21 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   revision. Reordered, partial, changed, or revision-less acknowledgements are
   refused. The v0.67 fence-store interface and standalone nil-store behavior
   remain available for existing embedders. (#376)
-- **Fence coverage includes durable per-session correlations.** Every covered
-  session carries its shim id, process epoch, and last durably carrier-forwarded
-  output sequence. Adoption retains its durable resume cursor so an immediate
-  later fence cannot regress the correlation to zero. (#376)
+- **Fence and launch identity can be composed per organization.** Session specs
+  carry their organization identity, host authority may be resolved per
+  organization, and hosted callers can request one exact fence per organization
+  without collapsing duplicate shim incarnations. Every covered session carries
+  shim id, process epoch, controller generation, and the last durably
+  carrier-forwarded output sequence. Partial retries reuse the original exact
+  request bytes. The legacy single-fence method remains available. (#376, #378)
+- **Adoption exposes fail-closed durable composition points.** A per-session
+  preparation hook runs only after authenticated Hello supplies the exact
+  shim/process/current-generation correlation; the shim must echo the exact
+  proposed generation and extensions in Adopted. Optional per-session callbacks
+  can rehydrate durable carriers, followed by one complete per-organization
+  adopted/quarantined/tombstoned batch. When the batch hook is configured,
+  non-empty expected and durable revisions are required before adoption is
+  reported complete. Nil hooks preserve standalone behavior. (#378)
 
 ### Fixes
 
@@ -30,6 +41,17 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   carrier hook advances the forwarded cursor only after successful durable
   handoff; a failed handoff closes controller authority before a later frame can
   leap over the gap. (#376)
+- **Duplicate shim incarnations keep independent terminal proof.** Tombstones
+  are persisted by lifecycle identity, shim id, and process epoch while retaining
+  safe legacy reads when only one proof exists. A terminal incarnation no longer
+  hides a different live duplicate, and claim release requires positive proof
+  for every correlation covered by the fence. Tombstone publication must also
+  finish withdrawing the matching live record before proof disposal. (#378)
+- **Ambiguous control and restart paths fail closed.** A bare session stop that
+  matches multiple organization-scoped shims cannot fall through to a colliding
+  direct child; malformed unknown-organization quarantine cannot be relabelled
+  as controller-owned; and a tombstone for the wrong correlation cannot release
+  even a single covered session. (#378)
 
 ## v0.67.1 — 2026-08-22
 
