@@ -8,6 +8,18 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
+// sessionShimEnvPrefix is the shared prefix of the session-shim launch contract
+// (ADR-2026-08-17 §D1 — sessionshim.EnvKeys).
+//
+// A prefix rather than an enumerated list, and the key constants are NOT
+// imported from sessionshim: that package reaches ptyhost, which reaches this
+// one, so importing it here would close an import cycle. Matching on the prefix
+// also means a key added to the contract later is runner-only the moment it
+// exists rather than the moment someone remembers to list it here.
+// sessionshim's own suite asserts every key it defines is refused by
+// IsRunnerOnly, so the two halves cannot drift apart silently.
+const sessionShimEnvPrefix = "DONMAI_SESSION_SHIM"
+
 // AgentEnvBlocklist is the set of environment variable names that must
 // never propagate from the daemon's host environment into an agent
 // provider subprocess.
@@ -55,12 +67,20 @@ var AgentEnvBlocklist = []string{
 // children, or model-invoked tool subprocesses. Unlike AgentEnvBlocklist, this
 // boundary applies to every input layer: an explicit Spec.Env entry cannot
 // override it.
+//
+// The session-shim launch contract (ADR-2026-08-17 §D1) belongs here for the
+// same reason the attach controls do. Those values carry no secret — a
+// lifecycle identity, a registry directory, four durations — but they address
+// the SUPERVISOR of the process that would receive them. A harness child that
+// inherited them and re-execed anything shim-aware would be pointed at its own
+// session's registry, and a workload has no business reaching the boundary that
+// owns it.
 func IsRunnerOnly(key string) bool {
 	switch key {
 	case "ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL":
 		return true
 	default:
-		return false
+		return strings.HasPrefix(key, sessionShimEnvPrefix)
 	}
 }
 
