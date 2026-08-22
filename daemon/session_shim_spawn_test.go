@@ -515,8 +515,10 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 		t.Fatalf("QuarantinedSessions after controller disconnect = %+v, want one visible survivor", quarantined)
 	}
 	q := quarantined[0]
-	if q.Identity() != id || q.ShimID != entry.shimID {
-		t.Errorf("quarantine identity = %s/%s, want exact %s/%s", q.Identity(), q.ShimID, id, entry.shimID)
+	processEpoch := entry.controller.Hello().ProcessEpoch
+	if q.Identity() != id || q.ShimID != entry.shimID || q.ProcessEpoch != processEpoch {
+		t.Errorf("quarantine correlation = %s/%s/%d, want exact %s/%s/%d",
+			q.Identity(), q.ShimID, q.ProcessEpoch, id, entry.shimID, processEpoch)
 	}
 	if q.Reason != sessionshim.QuarantineSocketUnreachable || !q.ConsumesCapacity {
 		t.Errorf("quarantine = %+v, want socket_unreachable and consumesCapacity=true", q)
@@ -546,10 +548,26 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
+	var tombstone sessionshim.Tombstone
 	waitFor(t, 10*time.Second, "orphan tombstone after controller gap", func() bool {
-		_, err := registry.GetTombstone(id)
+		var err error
+		tombstone, err = registry.GetTombstone(id)
 		return err == nil
 	})
+	wrongEpoch := tombstone
+	wrongEpoch.ProcessEpoch++
+	if err := registry.PutTombstone(wrongEpoch); err != nil {
+		t.Fatalf("publish wrong-epoch tombstone control: %v", err)
+	}
+	if got := d.SessionShimOccupancy(); got != 1 {
+		t.Fatalf("occupancy with wrong-epoch tombstone = %d, want 1", got)
+	}
+	if got := len(d.QuarantinedSessions()); got != 1 {
+		t.Fatalf("wrong-epoch tombstone removed quarantine; projection length = %d, want 1", got)
+	}
+	if err := registry.PutTombstone(tombstone); err != nil {
+		t.Fatalf("restore exact tombstone: %v", err)
+	}
 	var reconcileReaders sync.WaitGroup
 	reconcileReaders.Add(32)
 	for range 32 {

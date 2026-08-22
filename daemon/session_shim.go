@@ -376,13 +376,17 @@ func (d *Daemon) RequestSessionShimRestartFence(ctx context.Context, fenceID str
 		d.reconcileQuarantinedTombstones()
 		d.shims.mu.RLock()
 		for id, entry := range d.shims.adopted {
-			covered = append(covered, sessionshim.FencedSession{
+			coveredSession := sessionshim.FencedSession{
 				OrgID: id.OrgID, SessionID: id.SessionID, ShimID: entry.shimID,
-			})
+			}
+			if entry.controller != nil {
+				coveredSession.ProcessEpoch = entry.controller.Hello().ProcessEpoch
+			}
+			covered = append(covered, coveredSession)
 		}
 		for _, q := range d.shims.quarantined {
 			covered = append(covered, sessionshim.FencedSession{
-				OrgID: q.OrgID, SessionID: q.SessionID, ShimID: q.ShimID,
+				OrgID: q.OrgID, SessionID: q.SessionID, ShimID: q.ShimID, ProcessEpoch: q.ProcessEpoch,
 			})
 		}
 		d.shims.mu.RUnlock()

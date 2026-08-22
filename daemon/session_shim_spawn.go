@@ -459,6 +459,7 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity) {
 			OrgID:             id.OrgID,
 			SessionID:         id.SessionID,
 			ShimID:            entry.shimID,
+			ProcessEpoch:      hello.ProcessEpoch,
 			ProtocolMin:       hello.Min,
 			ProtocolMax:       hello.Max,
 			Phase:             hello.Phase,
@@ -483,7 +484,7 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity) {
 func (d *Daemon) upsertShimQuarantineLocked(q sessionshim.QuarantinedSession) {
 	for i := range d.shims.quarantined {
 		current := d.shims.quarantined[i]
-		if current.Identity() == q.Identity() && current.ShimID == q.ShimID {
+		if current.Identity() == q.Identity() && current.ShimID == q.ShimID && current.ProcessEpoch == q.ProcessEpoch {
 			d.shims.quarantined[i] = q
 			sessionshim.SortQuarantined(d.shims.quarantined)
 			return
@@ -513,7 +514,7 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 	for _, q := range quarantined {
 		id := q.Identity()
 		tombstone, err := registry.GetTombstone(id)
-		if err != nil || tombstone.ShimID != q.ShimID {
+		if err != nil || tombstone.ShimID != q.ShimID || tombstone.ProcessEpoch != q.ProcessEpoch {
 			continue
 		}
 		proof := sessionshim.TerminalProof{Tombstone: &tombstone}
@@ -525,7 +526,7 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		removed := false
 		kept := d.shims.quarantined[:0]
 		for _, current := range d.shims.quarantined {
-			if current.Identity() == id && current.ShimID == tombstone.ShimID {
+			if current.Identity() == id && current.ShimID == tombstone.ShimID && current.ProcessEpoch == tombstone.ProcessEpoch {
 				removed = true
 				continue
 			}
@@ -536,7 +537,7 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 			delete(d.shims.forwarded, id)
 			alreadyRecorded := false
 			for _, existing := range d.shims.tombstoned {
-				if existing.Identity() == id && existing.ShimID == tombstone.ShimID {
+				if existing.Identity() == id && existing.ShimID == tombstone.ShimID && existing.ProcessEpoch == tombstone.ProcessEpoch {
 					alreadyRecorded = true
 					break
 				}

@@ -3,6 +3,7 @@ package sessionshim
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -183,7 +184,7 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1_700_000_000, 0)
-	ids := []FencedSession{{OrgID: "o", SessionID: "s1"}}
+	ids := []FencedSession{{OrgID: "o", SessionID: "s1", ShimID: "shim-1", ProcessEpoch: 7}}
 
 	t.Run("store error", func(t *testing.T) {
 		t.Parallel()
@@ -208,6 +209,18 @@ func TestRequestFenceRefusesMismatchedOrFailedAcknowledgement(t *testing.T) {
 		}
 	})
 
+	t.Run("wrong process epoch", func(t *testing.T) {
+		t.Parallel()
+		store := fenceStoreFunc(func(_ context.Context, f Fence) (Fence, error) {
+			f.Sessions[0].ProcessEpoch++
+			return f, nil
+		})
+		_, err := RequestFence(context.Background(), store, "f1", "h1", ids, FencePolicy{}, now)
+		if !errors.Is(err, ErrFenceRequired) {
+			t.Fatalf("RequestFence with wrong process epoch = %v, want ErrFenceRequired", err)
+		}
+	})
+
 	t.Run("missing fence id", func(t *testing.T) {
 		t.Parallel()
 		_, err := RequestFence(context.Background(), nil, "", "h1", ids, FencePolicy{}, now)
@@ -223,16 +236,18 @@ func TestRequestFenceSortsCoverageDeterministically(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	ids := []FencedSession{
 		{OrgID: "o", SessionID: "s3"},
-		{OrgID: "o", SessionID: "s1"},
+		{OrgID: "o", SessionID: "s1", ShimID: "shim", ProcessEpoch: 2},
+		{OrgID: "o", SessionID: "s1", ShimID: "shim", ProcessEpoch: 1},
 		{OrgID: "n", SessionID: "s2"},
 	}
 	f, err := RequestFence(context.Background(), nil, "f1", "h1", ids, FencePolicy{}, now)
 	if err != nil {
 		t.Fatalf("RequestFence: %v", err)
 	}
-	want := []string{"n/s2", "o/s1", "o/s3"}
+	want := []string{"n/s2//0", "o/s1/shim/1", "o/s1/shim/2", "o/s3//0"}
 	for i, w := range want {
-		if got := f.Sessions[i].Identity().String(); got != w {
+		got := fmt.Sprintf("%s/%s/%d", f.Sessions[i].Identity(), f.Sessions[i].ShimID, f.Sessions[i].ProcessEpoch)
+		if got != w {
 			t.Fatalf("Sessions[%d] = %s, want %s", i, got, w)
 		}
 	}
