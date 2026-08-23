@@ -73,6 +73,38 @@ func TestActionableIndexRebuildsBeforeAdmission(t *testing.T) {
 	}
 }
 
+func TestActionableIndexRecoveryRemovesStaleReleasedMarker(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := NewLeaseStore(StoreOptions{Dir: filepath.Join(root, "leases")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.Acquire(context.Background(), internalAcquireSpec(root, 91))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.State = LeaseReleased
+	if err := store.saveUnlocked(*lease); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash in which the authoritative released record reached disk
+	// but the derived marker deletion did not.
+	if err := store.writeActionableMarker(lease.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewLeaseStore(StoreOptions{Dir: store.Dir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained, err := reopened.Retained(lease.WorkareaID); err != nil || retained {
+		t.Fatalf("released stale-marker workarea retained=%v err=%v", retained, err)
+	}
+	if _, err := os.Stat(reopened.actionablePath(lease.LeaseID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale actionable marker survived recovery: %v", err)
+	}
+}
+
 func TestReconcileClearsOnlyGuardForExactDurableLease(t *testing.T) {
 	t.Parallel()
 

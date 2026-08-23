@@ -23,14 +23,139 @@ package codex
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
+
+func TestIntegration_RealCodexRepositoryAuthorityNegativeAttempts(t *testing.T) {
+	if os.Getenv("DONMAI_CODEX_WORKAREA_AUTHORITY_INTEGRATION") != "1" {
+		t.Skip("set DONMAI_CODEX_WORKAREA_AUTHORITY_INTEGRATION=1 to run the real executor authority proof")
+	}
+	if _, err := exec.LookPath("codex"); err != nil {
+		t.Skip("codex binary not on PATH")
+	}
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatalf("UserCacheDir: %v", err)
+	}
+	root, err := os.MkdirTemp(cacheDir, "donmai-workarea-authority-")
+	if err != nil {
+		t.Fatalf("MkdirTemp authority root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	mutable := filepath.Join(root, "mutable")
+	readOnly := filepath.Join(root, "context")
+	if err := os.MkdirAll(mutable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(readOnly, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(readOnly, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("locked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	remount := "mount -u -w " + strconv.Quote(readOnly)
+	if runtime.GOOS == "linux" {
+		remount = "mount -o remount,rw " + strconv.Quote(readOnly)
+	}
+	script := fmt.Sprintf(`set +e
+printf mutable-control > %[1]s/control
+(printf forbidden > %[2]s/write-attempt); printf '%%s' "$?" > %[1]s/write.status
+(mv %[2]s/sentinel %[2]s/renamed); printf '%%s' "$?" > %[1]s/rename.status
+(rm -f %[2]s/sentinel); printf '%%s' "$?" > %[1]s/remove.status
+(chmod 0777 %[2]s/sentinel); printf '%%s' "$?" > %[1]s/chmod.status
+(%[3]s); printf '%%s' "$?" > %[1]s/remount.status
+exit 0`, strconv.Quote(mutable), strconv.Quote(readOnly), remount)
+
+	provider, err := New(Options{Cwd: mutable, HandshakeTimeout: 30 * time.Second, HostSessionAuth: true})
+	if err != nil {
+		t.Fatalf("New host-session provider: %v", err)
+	}
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	handle, err := provider.Spawn(ctx, agent.Spec{
+		Prompt: "Run exactly this shell script once with the shell tool, do not alter it, do not retry any failed operation, then report done:\n\n" + script,
+		Cwd:    mutable, Autonomous: true, SandboxEnabled: true, SandboxLevel: agent.SandboxWorkspaceWrite,
+		Model: "gpt-5.6-terra", Effort: agent.EffortLow,
+		RepositoryAuthority: &agent.RepositoryAuthorityPolicy{
+			Protocol: "session-root-v1", WorkareaRoot: root, SelectedPath: mutable,
+			MutablePaths: []string{mutable}, ReadOnlyPaths: []string{readOnly}, Enforcement: "isolated-read-only-v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = handle.Stop(context.Background()) }()
+	var terminalProviderError *agent.ErrorEvent
+	for {
+		select {
+		case event, ok := <-handle.Events():
+			if !ok {
+				t.Fatal("events closed before result")
+			}
+			switch value := event.(type) {
+			case agent.ResultEvent:
+				if !value.Success {
+					t.Fatalf("executor result failed: %+v", value)
+				}
+				goto verify
+			case agent.ErrorEvent:
+				if value.Code != "mcp_cleanup_failed" {
+					t.Fatalf("executor error: %+v", value)
+				}
+				terminalProviderError = &value
+				goto verify
+			}
+		case <-ctx.Done():
+			t.Fatalf("authority proof timed out: %v", ctx.Err())
+		}
+	}
+
+verify:
+	if body, err := os.ReadFile(filepath.Join(mutable, "control")); err != nil || string(body) != "mutable-control" {
+		t.Fatalf("mutable control = %q, %v", body, err)
+	}
+	for _, operation := range []string{"write", "rename", "remove", "chmod", "remount"} {
+		body, err := os.ReadFile(filepath.Join(mutable, operation+".status"))
+		if err != nil {
+			t.Fatalf("%s status: %v", operation, err)
+		}
+		if strings.TrimSpace(string(body)) == "0" {
+			t.Fatalf("%s attempt unexpectedly succeeded", operation)
+		}
+	}
+	if body, err := os.ReadFile(sentinel); err != nil || string(body) != "locked" {
+		t.Fatalf("read-only sentinel changed: %q, %v", body, err)
+	}
+	if _, err := os.Stat(filepath.Join(readOnly, "write-attempt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("write-attempt exists or stat failed unexpectedly: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(readOnly, "renamed")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("renamed target exists or stat failed unexpectedly: %v", err)
+	}
+	info, err := os.Stat(sentinel)
+	if err != nil {
+		t.Fatalf("stat sentinel mode: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("sentinel mode = %v; want 0600", info.Mode())
+	}
+	if terminalProviderError != nil {
+		t.Fatalf("authority attempts were enforced, but provider cleanup failed: %+v", *terminalProviderError)
+	}
+}
 
 func TestIntegration_RealCodexAppServer_SmokeLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("codex"); err != nil {

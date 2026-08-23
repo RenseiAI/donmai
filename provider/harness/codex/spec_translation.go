@@ -64,13 +64,17 @@ func resolveSandboxMode(spec agent.Spec) string {
 // turn/start sandbox object. Mirrors resolveSandboxPolicy in the
 // legacy TS.
 func resolveSandboxPolicy(spec agent.Spec) map[string]any {
+	writableRoots := []string{spec.Cwd}
+	if spec.RepositoryAuthority != nil {
+		writableRoots = append([]string(nil), spec.RepositoryAuthority.MutablePaths...)
+	}
 	switch spec.SandboxLevel {
 	case agent.SandboxReadOnly:
 		return map[string]any{"type": "readOnly", "networkAccess": true}
 	case agent.SandboxWorkspaceWrite:
 		return map[string]any{
 			"type":          "workspaceWrite",
-			"writableRoots": []string{spec.Cwd},
+			"writableRoots": writableRoots,
 			"networkAccess": true,
 		}
 	case agent.SandboxFullAccess:
@@ -79,7 +83,7 @@ func resolveSandboxPolicy(spec agent.Spec) map[string]any {
 	if spec.SandboxEnabled {
 		return map[string]any{
 			"type":          "workspaceWrite",
-			"writableRoots": []string{spec.Cwd},
+			"writableRoots": writableRoots,
 			"networkAccess": true,
 		}
 	}

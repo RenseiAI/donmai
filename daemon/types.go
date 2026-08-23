@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/runner/access"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -133,6 +134,9 @@ type SessionSpec struct {
 	// RepositoryID is the stable selected repository-resource identity.
 	RepositoryID string `json:"repositoryId,omitempty"`
 	Repository   string `json:"repository"`
+	// RepositoryDeclaration is the additive exact-protocol carrier. Nil is the
+	// legacy default-primary singular path.
+	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
 	// RequiresRepository distinguishes repository-free work from work that
 	// must select a repository resource or configured primary.
 	RequiresRepository bool              `json:"requiresRepository,omitempty"`
@@ -249,6 +253,10 @@ type SessionHandle struct {
 	// <path>/.agent/state.json. Empty when the daemon cannot resolve the
 	// worktree parent (no state dir).
 	WorktreePath string `json:"worktreePath,omitempty"`
+
+	// WorkareaRoot is the additive session-owned lifecycle root. WorktreePath
+	// remains the selected repository CWD for mixed-version readers.
+	WorkareaRoot string `json:"workareaRoot,omitempty"`
 
 	// ProjectName is the allowlist-resolved project identifier
 	// (ProjectConfig.ID) this session was dispatched under. Mirrors

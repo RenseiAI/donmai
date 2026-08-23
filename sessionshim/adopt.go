@@ -47,6 +47,9 @@ type AdoptOptions struct {
 	// the daemon-side half of the workarea check; the record-vs-shim half always
 	// runs.
 	ExpectedWorkarea func(id Identity) string
+	// ExpectedWorkareaRoot optionally cross-checks the additive secret-free
+	// discovery record field. An old record without it remains adoptable.
+	ExpectedWorkareaRoot func(id Identity) string
 
 	// DialTimeout bounds one shim handshake.
 	DialTimeout time.Duration
@@ -395,6 +398,10 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 	if opts.ExpectedWorkarea != nil {
 		expected = opts.ExpectedWorkarea(id)
 	}
+	expectedRoot := ""
+	if opts.ExpectedWorkareaRoot != nil {
+		expectedRoot = opts.ExpectedWorkareaRoot(id)
+	}
 
 	copts := ControllerOptions{
 		ControllerID:               opts.ControllerID,
@@ -403,6 +410,7 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 		ResumeExternallyConfigured: opts.ResumeFrom != nil,
 		DurableAckGeneration:       durableAckGeneration,
 		ExpectedWorkarea:           expected,
+		ExpectedWorkareaRoot:       expectedRoot,
 		DialTimeout:                opts.DialTimeout,
 		Logger:                     opts.Logger,
 		ProtocolMin:                opts.ProtocolMin,

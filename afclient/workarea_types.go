@@ -46,6 +46,12 @@ type WorkareaSummary struct {
 	Status     WorkareaPoolStatus `json:"status"`
 	Ref        string             `json:"ref,omitempty"`
 	Repository string             `json:"repository,omitempty"`
+	// WorkareaRoot is the additive session-owned lifecycle root.
+	WorkareaRoot string `json:"workareaRoot,omitempty"`
+	// RepositoryWorktreePath is the selected repository CWD. Legacy Path and
+	// worktreePath spellings retain this meaning.
+	RepositoryWorktreePath string               `json:"repositoryWorktreePath,omitempty"`
+	Repositories           []WorkareaRepository `json:"repositories,omitempty"`
 
 	// Archive-only fields. Populated when Kind == WorkareaKindArchived.
 	CreatedAt      *time.Time `json:"createdAt,omitempty"`
@@ -63,28 +69,42 @@ type WorkareaSummary struct {
 // GET /api/daemon/workareas/<id> (inspect endpoint). Fields match the
 // Workarea interface in 003-workarea-provider.md.
 type Workarea struct {
-	ID                 string             `json:"id"`
-	Kind               WorkareaKind       `json:"kind"`
-	ProviderID         string             `json:"providerId"`
-	SessionID          string             `json:"sessionId,omitempty"`
-	ProjectID          string             `json:"projectId,omitempty"`
-	Status             WorkareaPoolStatus `json:"status"`
-	Path               string             `json:"path,omitempty"`
-	Ref                string             `json:"ref,omitempty"`
-	Repository         string             `json:"repository,omitempty"`
-	CleanStateChecksum string             `json:"cleanStateChecksum,omitempty"`
-	Toolchain          map[string]string  `json:"toolchain,omitempty"`
-	Mode               string             `json:"mode,omitempty"`        // "exclusive" | "shared"
-	AcquirePath        string             `json:"acquirePath,omitempty"` // "pool-warm" | "pool-fresh" | "cold"
-	AcquiredAt         *time.Time         `json:"acquiredAt,omitempty"`
-	ReleasedAt         *time.Time         `json:"releasedAt,omitempty"`
-	ArchiveLocation    string             `json:"archiveLocation,omitempty"`
-	OwnerSession       string             `json:"ownerSession,omitempty"`
+	ID                     string               `json:"id"`
+	Kind                   WorkareaKind         `json:"kind"`
+	ProviderID             string               `json:"providerId"`
+	SessionID              string               `json:"sessionId,omitempty"`
+	ProjectID              string               `json:"projectId,omitempty"`
+	Status                 WorkareaPoolStatus   `json:"status"`
+	Path                   string               `json:"path,omitempty"`
+	WorkareaRoot           string               `json:"workareaRoot,omitempty"`
+	RepositoryWorktreePath string               `json:"repositoryWorktreePath,omitempty"`
+	Repositories           []WorkareaRepository `json:"repositories,omitempty"`
+	Ref                    string               `json:"ref,omitempty"`
+	Repository             string               `json:"repository,omitempty"`
+	CleanStateChecksum     string               `json:"cleanStateChecksum,omitempty"`
+	Toolchain              map[string]string    `json:"toolchain,omitempty"`
+	Mode                   string               `json:"mode,omitempty"`        // "exclusive" | "shared"
+	AcquirePath            string               `json:"acquirePath,omitempty"` // "pool-warm" | "pool-fresh" | "cold"
+	AcquiredAt             *time.Time           `json:"acquiredAt,omitempty"`
+	ReleasedAt             *time.Time           `json:"releasedAt,omitempty"`
+	ArchiveLocation        string               `json:"archiveLocation,omitempty"`
+	OwnerSession           string               `json:"ownerSession,omitempty"`
 
 	// Manifest is the captured per-archive manifest for archived
 	// workareas (kind = "archived"). Free-form JSON keyed by archive
 	// version; consumers display rather than enforce shape.
 	Manifest map[string]any `json:"manifest,omitempty"`
+}
+
+// WorkareaRepository is the secret-free per-leaf operator projection.
+type WorkareaRepository struct {
+	Name         string `json:"name"`
+	Leaf         string `json:"leaf"`
+	Path         string `json:"path,omitempty"`
+	Role         string `json:"role"`
+	Authority    string `json:"authority"`
+	RequestedRef string `json:"requestedRef,omitempty"`
+	ResolvedRef  string `json:"resolvedRef,omitempty"`
 }
 
 // ListWorkareasResponse matches GET /api/daemon/workareas. Per ADR D4a,

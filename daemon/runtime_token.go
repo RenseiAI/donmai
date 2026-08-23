@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // RuntimeTokenRefreshEndpoint is the probed orchestrator endpoint the daemon
@@ -592,7 +594,14 @@ func callRefreshEndpoint(
 	}
 	url := strings.TrimRight(opts.OrchestratorURL, "/") +
 		"/api/workers/" + workerID + "/refresh-token"
-	bodyBytes, err := json.Marshal(opts.SessionShim)
+	refreshAttestation := struct {
+		SessionShimHostAttestation
+		WorkareaExecutors []workarea.ExecutorCapabilityAttestation `json:"workareaExecutors,omitempty"`
+	}{
+		SessionShimHostAttestation: cloneSessionShimHostAttestation(opts.SessionShim),
+		WorkareaExecutors:          append([]workarea.ExecutorCapabilityAttestation(nil), opts.WorkareaExecutors...),
+	}
+	bodyBytes, err := json.Marshal(refreshAttestation)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}

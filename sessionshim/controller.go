@@ -99,6 +99,8 @@ type ControllerOptions struct {
 	// ExpectedWorkarea, when non-empty, is compared against the shim's
 	// self-reported workarea. A mismatch refuses adoption.
 	ExpectedWorkarea string
+	// ExpectedWorkareaRoot cross-checks the optional discovery record root.
+	ExpectedWorkareaRoot string
 	// Extensions are optional negotiated extensions offered to the shim.
 	Extensions shimwire.Extensions
 	// ProtocolMin/ProtocolMax optionally narrow this controller's supported
@@ -163,6 +165,7 @@ type Controller struct {
 	gen                shimwire.Generation
 	selected           uint32
 	hello              shimwire.Hello
+	workareaRoot       string
 	helloAuthenticated bool
 	adopted            shimwire.Adopted
 	// resumeFrom is the exact durable cursor proposed in Welcome. Retaining it
@@ -298,6 +301,7 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 		w:             shimwire.NewWriter(conn),
 		r:             shimwire.NewReader(conn),
 		resumeFrom:    opts.ResumeFrom,
+		workareaRoot:  rec.WorkareaRoot,
 		events:        make(chan ControllerEvent, 64),
 		logger:        opts.logger(),
 		done:          make(chan struct{}),
@@ -343,7 +347,7 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	if err != nil {
 		return err
 	}
-	if err := verifyHello(hello, rec, opts.ExpectedWorkarea); err != nil {
+	if err := verifyHello(hello, rec, opts.ExpectedWorkarea, opts.ExpectedWorkareaRoot); err != nil {
 		return err
 	}
 	c.hello, c.helloAuthenticated = hello, true
@@ -485,7 +489,7 @@ func validateAdoptionCommit(adopted shimwire.Adopted, proposed shimwire.Generati
 }
 
 // verifyHello checks that the live peer is the shim the record described.
-func verifyHello(h shimwire.Hello, rec Record, expectedWorkarea string) error {
+func verifyHello(h shimwire.Hello, rec Record, expectedWorkarea, expectedWorkareaRoot string) error {
 	if h.Protocol != shimwire.ProtocolName {
 		return fmt.Errorf("%w: hello names protocol %q", shimwire.ErrVersionMismatch, h.Protocol)
 	}
@@ -512,6 +516,10 @@ func verifyHello(h shimwire.Hello, rec Record, expectedWorkarea string) error {
 	if expectedWorkarea != "" && h.WorkareaPath != expectedWorkarea {
 		return fmt.Errorf("%w: shim reports workarea %q, this daemon expects %q",
 			ErrAdoptionRefused, h.WorkareaPath, expectedWorkarea)
+	}
+	if expectedWorkareaRoot != "" && rec.WorkareaRoot != "" && rec.WorkareaRoot != expectedWorkareaRoot {
+		return fmt.Errorf("%w: discovery record workarea root %q, this daemon expects %q",
+			ErrAdoptionRefused, rec.WorkareaRoot, expectedWorkareaRoot)
 	}
 	return nil
 }
@@ -568,6 +576,10 @@ func (c *Controller) SupportsFullHostFrames() bool { return c.selected >= shimwi
 
 // Hello returns the shim's opening self-report.
 func (c *Controller) Hello() shimwire.Hello { return c.hello }
+
+// WorkareaRoot returns the optional secret-free discovery-record root. Empty
+// means the adopted record predates session-root-v1.
+func (c *Controller) WorkareaRoot() string { return c.workareaRoot }
 
 // Adoption returns the replay disposition the shim committed to.
 func (c *Controller) Adoption() shimwire.Adopted { return c.adopted }

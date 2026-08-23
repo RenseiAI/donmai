@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/RenseiAI/donmai/shimwire"
@@ -67,6 +69,9 @@ type Record struct {
 	// WorkareaPath is the workarea the harness runs against; compared at
 	// adoption against the session's own expectation.
 	WorkareaPath string `json:"workareaPath,omitempty"`
+	// WorkareaRoot is the optional session-owned lifecycle root. It is a
+	// secret-free integrity cross-check; old records omit it and remain valid.
+	WorkareaRoot string `json:"workarea_root,omitempty"`
 
 	CreatedAtUnixNano      int64 `json:"createdAt"`
 	OrphanDeadlineUnixNano int64 `json:"orphanDeadlineAt,omitempty"`
@@ -119,6 +124,15 @@ func (r Record) Validate() error {
 	}
 	if r.CreatedAtUnixNano <= 0 {
 		return fmt.Errorf("%w: createdAt is missing", ErrRecordInvalid)
+	}
+	if r.WorkareaRoot != "" {
+		if !filepath.IsAbs(r.WorkareaRoot) || !filepath.IsAbs(r.WorkareaPath) {
+			return fmt.Errorf("%w: workarea root/path must be absolute", ErrRecordInvalid)
+		}
+		rel, err := filepath.Rel(filepath.Clean(r.WorkareaRoot), filepath.Clean(r.WorkareaPath))
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("%w: workareaPath is outside workareaRoot", ErrRecordInvalid)
+		}
 	}
 	return nil
 }

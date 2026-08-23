@@ -179,7 +179,7 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `POST   /api/daemon/capacity`          | Update a config key (e.g. `capacity.poolMaxDiskGb`) |
 | `GET    /api/daemon/pool/stats`        | Workarea pool snapshot |
 | `POST   /api/daemon/pool/evict`        | Evict pool members |
-| `GET    /api/daemon/sessions`          | List active session handles (incl. `worktreePath`/`projectName`/`repository` enrichment) |
+| `GET    /api/daemon/sessions`          | List active session handles (incl. selected-repository `worktreePath`, additive `workareaRoot`, project, and repository enrichment) |
 | `POST   /api/daemon/sessions`          | Accept a session (test entrypoint) |
 | `GET    /api/daemon/sessions/<id>`     | **F.2.8** — per-session detail for the spawned worker |
 | `POST   /api/daemon/sessions/<id>/stop`| Per-session kill: terminate one session + free its slot (200 on stop, 404 if unknown). Siblings unaffected — the HOL-isolation cancel path |

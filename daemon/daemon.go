@@ -19,6 +19,7 @@ import (
 	internaldaemon "github.com/RenseiAI/donmai/internal/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/rulesetsnapshot"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // LandingWorkType is the poll WorkType wire value for a landing-run trigger:
@@ -234,6 +235,13 @@ type ProviderRegistry interface {
 	// of agent.Capabilities so the wire shape on /api/daemon/providers
 	// matches the contract.
 	Capabilities(name string) (caps map[string]any, ok bool)
+}
+
+// WorkareaCapabilityProvider is the optional exact-executor registration
+// surface. Registries that do not implement it advertise no session-root-v1
+// capability and remain valid for singular legacy work.
+type WorkareaCapabilityProvider interface {
+	WorkareaExecutorCapabilities() []workarea.ExecutorCapabilityAttestation
 }
 
 // ExecutionPreflightProvider is optionally implemented by ProviderRegistry.
@@ -803,6 +811,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 			provides[i] = ProvideCapability{Kind: string(c.Kind)}
 		}
 		regCaps := effectiveRegistrationCapabilities(d.opts.RegistrationCapabilities)
+		var workareaExecutors []workarea.ExecutorCapabilityAttestation
+		if provider, ok := d.opts.ProviderRegistry.(WorkareaCapabilityProvider); ok {
+			workareaExecutors = provider.WorkareaExecutorCapabilities()
+		}
 		regOpts = RegistrationOptions{
 			OrchestratorURL:   cfg.Orchestrator.URL,
 			RegistrationToken: token,
@@ -830,6 +842,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			HostInfo:            GatherHostInfo(d.EffectiveVersion(), d.StartedAt()),
 			ValidateCredentials: d.validateControllerCredentials,
 			SessionShim:         d.SessionShimHostAttestation(),
+			WorkareaExecutors:   workareaExecutors,
 			AuthOnly:            d.sessionShimAttestationValue.enabled(),
 		}
 	}

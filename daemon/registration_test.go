@@ -15,7 +15,39 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
+
+func TestRegisterCarriesExactWorkareaExecutorAttestation(t *testing.T) {
+	var captured RegisterRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(RegisterResponse{
+			WorkerID: "worker-exact", RuntimeToken: "runtime-exact", HeartbeatInterval: 30_000, PollInterval: 5_000,
+		})
+	}))
+	defer server.Close()
+	attestation := workarea.ExecutorCapabilityAttestation{
+		HarnessID: "codex", AdapterVersion: "codex-adapter/v9", ManifestDigest: "sha256:fixture", SessionModes: []string{"autonomous"},
+		ExecutorWorkareaCapabilities: workarea.ExecutorWorkareaCapabilities{
+			MultiRepositoryWorkareaProtocols: []workarea.Protocol{workarea.ProtocolSessionRootV1},
+			RepositoryAuthorityEnforcement:   workarea.RepositoryAuthorityIsolatedReadOnlyV1,
+		},
+	}
+	if _, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL: server.URL, RegistrationToken: "rsp_live_fixture", Hostname: "host",
+		JWTPath: filepath.Join(t.TempDir(), "daemon.jwt"), HTTPClient: server.Client(),
+		WorkareaExecutors: []workarea.ExecutorCapabilityAttestation{attestation},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured.WorkareaExecutors) != 1 || !reflect.DeepEqual(captured.WorkareaExecutors[0], attestation) {
+		t.Fatalf("workareaExecutors = %#v, want %#v", captured.WorkareaExecutors, attestation)
+	}
+}
 
 func TestRegister_StubPath_NoToken(t *testing.T) {
 	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")

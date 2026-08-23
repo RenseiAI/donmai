@@ -22,6 +22,10 @@ import (
 type QueuedWork struct {
 	prompt.QueuedWork
 
+	// RepositoryDeclaration is emitted only after exact session-root-v1
+	// negotiation. Nil preserves the legacy singular flat worktree path.
+	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
+
 	// AdmissionReceipt is the platform-produced, immutable execution-cell
 	// admission evidence. The daemon forwards it opaquely; the runner's closed
 	// decoder validates it before selecting a harness. Keeping the raw bytes at

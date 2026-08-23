@@ -303,16 +303,20 @@ func (s *Server) lookupActiveByID(id string) (afclient.Workarea, bool) {
 			continue
 		}
 		return afclient.Workarea{
-			ID:         member.ID,
-			Kind:       afclient.WorkareaKindActive,
-			ProviderID: member.ProviderID,
-			SessionID:  member.SessionID,
-			ProjectID:  member.ProjectID,
-			Status:     member.Status,
-			Ref:        member.Ref,
-			Repository: member.Repository,
-			AcquiredAt: member.AcquiredAt,
-			ReleasedAt: member.ReleasedAt,
+			ID:                     member.ID,
+			Kind:                   afclient.WorkareaKindActive,
+			ProviderID:             member.ProviderID,
+			SessionID:              member.SessionID,
+			ProjectID:              member.ProjectID,
+			Status:                 member.Status,
+			Ref:                    member.Ref,
+			Repository:             member.Repository,
+			Path:                   member.RepositoryWorktreePath,
+			WorkareaRoot:           member.WorkareaRoot,
+			RepositoryWorktreePath: member.RepositoryWorktreePath,
+			Repositories:           append([]afclient.WorkareaRepository(nil), member.Repositories...),
+			AcquiredAt:             member.AcquiredAt,
+			ReleasedAt:             member.ReleasedAt,
 		}, true
 	}
 	return afclient.Workarea{}, false

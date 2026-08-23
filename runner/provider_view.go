@@ -8,11 +8,14 @@
 package runner
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // ProviderView wraps a *Registry and satisfies daemon.ProviderRegistry.
@@ -84,6 +87,9 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if admission == nil || admission.selection.Provider == nil {
 		return encode(fmt.Errorf("host adaptation requires explicit receipt admission"))
 	}
+	if _, _, err := resolveRepositoryWorkarea(qw, admission.selection.Provider); err != nil {
+		return encode(err)
+	}
 	plan, _, err := compilePreparedHarness(qw, admission.selection)
 	if plan != nil {
 		receipt.Plan = plan
@@ -153,4 +159,65 @@ func (v *ProviderView) Capabilities(name string) (map[string]any, bool) {
 		m = map[string]any{}
 	}
 	return m, true
+}
+
+// WorkareaExecutorCapabilities returns exact harness-scoped attestations for
+// registration. Only positive protocol declarations are emitted; zero-value
+// harnesses remain registrable for the legacy singular path without being
+// mistaken for session-root-v1 executors.
+func (v *ProviderView) WorkareaExecutorCapabilities() []workarea.ExecutorCapabilityAttestation {
+	if v == nil || v.reg == nil {
+		return nil
+	}
+	var attestations []workarea.ExecutorCapabilityAttestation
+	for _, name := range v.reg.Names() {
+		provider, err := v.reg.Resolve(name)
+		if err != nil {
+			continue
+		}
+		harness, ok := provider.(agent.HarnessProvider)
+		if !ok {
+			continue
+		}
+		manifest := harness.Manifest()
+		if len(manifest.Caps.MultiRepositoryWorkareaProtocols) == 0 {
+			continue
+		}
+		protocols := make([]workarea.Protocol, 0, len(manifest.Caps.MultiRepositoryWorkareaProtocols))
+		for _, protocol := range manifest.Caps.MultiRepositoryWorkareaProtocols {
+			protocols = append(protocols, workarea.Protocol(protocol))
+		}
+		modeSet := make(map[string]struct{}, len(manifest.PromptDelivery))
+		for _, profile := range manifest.PromptDelivery {
+			if profile.Mode != "" {
+				modeSet[string(profile.Mode)] = struct{}{}
+			}
+		}
+		modes := make([]string, 0, len(modeSet))
+		for mode := range modeSet {
+			modes = append(modes, mode)
+		}
+		sort.Strings(modes)
+		manifestBytes, err := json.Marshal(manifest)
+		if err != nil {
+			continue
+		}
+		manifestDigest := fmt.Sprintf("sha256:%x", sha256.Sum256(manifestBytes))
+		attestations = append(attestations, workarea.ExecutorCapabilityAttestation{
+			HarnessID: string(manifest.Name), AdapterVersion: manifest.ContractABI,
+			ManifestDigest: manifestDigest, SessionModes: modes,
+			SupportsReadOnlySelectedCWD: manifest.Caps.SupportsReadOnlySelectedCWD,
+			ExecutorWorkareaCapabilities: workarea.ExecutorWorkareaCapabilities{
+				MultiRepositoryWorkareaProtocols: protocols,
+				RepositoryAuthorityEnforcement:   workarea.RepositoryAuthorityEnforcement(manifest.Caps.RepositoryAuthorityEnforcement),
+			},
+		})
+	}
+	sort.Slice(attestations, func(i, j int) bool {
+		if attestations[i].HarnessID != attestations[j].HarnessID {
+			return attestations[i].HarnessID < attestations[j].HarnessID
+		}
+		return attestations[i].AdapterVersion < attestations[j].AdapterVersion
+	})
+	return attestations
 }

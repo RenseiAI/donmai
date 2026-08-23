@@ -23,10 +23,11 @@ import (
 type OperationalPayload struct {
 	prompt.QueuedWork
 
-	ResolvedProfile       ResolvedProfile                `json:"resolvedProfile,omitempty"`
-	Branch                string                         `json:"branch,omitempty"`
-	TerminalWorkareaLease *workarea.TerminalLeaseRequest `json:"terminalWorkareaLease,omitempty"`
-	PermissionProfile     PermissionProfile              `json:"permissionProfile,omitempty"`
+	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
+	ResolvedProfile       ResolvedProfile                   `json:"resolvedProfile,omitempty"`
+	Branch                string                            `json:"branch,omitempty"`
+	TerminalWorkareaLease *workarea.TerminalLeaseRequest    `json:"terminalWorkareaLease,omitempty"`
+	PermissionProfile     PermissionProfile                 `json:"permissionProfile,omitempty"`
 }
 
 // ProjectOperationalPayload returns the exact admission-time payload shared by
@@ -35,6 +36,7 @@ type OperationalPayload struct {
 func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 	return OperationalPayload{
 		QueuedWork:            qw.QueuedWork,
+		RepositoryDeclaration: qw.RepositoryDeclaration,
 		ResolvedProfile:       qw.ResolvedProfile,
 		Branch:                qw.Branch,
 		TerminalWorkareaLease: qw.TerminalWorkareaLease,

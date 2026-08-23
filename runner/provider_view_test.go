@@ -7,14 +7,16 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // fakeProvider is a minimal agent.Provider implementation for testing
 // runner.ProviderView. Mirrors the stub provider's surface but without
 // pulling the real provider/stub package into the runner test deps.
 type fakeProvider struct {
-	name agent.ProviderName
-	caps agent.Capabilities
+	name     agent.ProviderName
+	caps     agent.Capabilities
+	manifest agent.HarnessManifest
 }
 
 func (f *fakeProvider) Name() agent.ProviderName         { return f.name }
@@ -27,6 +29,7 @@ func (f *fakeProvider) Resume(_ context.Context, _ string, _ agent.Spec) (agent.
 	return nil, agent.ErrUnsupported
 }
 func (f *fakeProvider) Shutdown(_ context.Context) error { return nil }
+func (f *fakeProvider) Manifest() agent.HarnessManifest  { return f.manifest }
 
 func TestProviderView_Names_EmptyRegistry(t *testing.T) {
 	view := runner.NewProviderView(runner.NewRegistry())
@@ -107,5 +110,34 @@ func TestProviderView_NilSafe(t *testing.T) {
 	}
 	if _, ok := view.Capabilities("anything"); ok {
 		t.Errorf("nil view Capabilities() ok=true, want false")
+	}
+}
+
+func TestProviderViewWorkareaCapabilitiesStayExactHarnessScoped(t *testing.T) {
+	reg := runner.NewRegistry()
+	legacy := &fakeProvider{name: agent.ProviderClaude, manifest: agent.HarnessManifest{
+		Name: agent.HarnessClaudeCode, ContractABI: "claude-adapter/v7",
+	}}
+	exact := &fakeProvider{name: agent.ProviderCodex, manifest: agent.HarnessManifest{
+		Name: agent.HarnessCodex, ContractABI: "codex-adapter/v9",
+		Caps: agent.HarnessCaps{
+			MultiRepositoryWorkareaProtocols: []string{string(workarea.ProtocolSessionRootV1)},
+			RepositoryAuthorityEnforcement:   string(workarea.RepositoryAuthorityIsolatedReadOnlyV1),
+		},
+		PromptDelivery: []agent.PromptDeliveryProfile{{Mode: agent.PromptModeAutonomous}, {Mode: agent.PromptModeHumanControlled}},
+	}}
+	for _, provider := range []agent.Provider{legacy, exact} {
+		if err := reg.Register(provider); err != nil {
+			t.Fatal(err)
+		}
+	}
+	attestations := runner.NewProviderView(reg).WorkareaExecutorCapabilities()
+	if len(attestations) != 1 {
+		t.Fatalf("attestations = %#v, want only exact executor", attestations)
+	}
+	got := attestations[0]
+	if got.HarnessID != string(agent.HarnessCodex) || got.AdapterVersion != "codex-adapter/v9" ||
+		got.ManifestDigest == "" || got.RepositoryAuthorityEnforcement != workarea.RepositoryAuthorityIsolatedReadOnlyV1 || len(got.SessionModes) != 2 {
+		t.Fatalf("attestation = %#v", got)
 	}
 }

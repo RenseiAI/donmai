@@ -962,6 +962,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		ExecutionRuntimeBinding: bytes.Clone(d.ExecutionRuntimeBinding),
 		OperationalPayload:      bytes.Clone(d.OperationalPayload),
 		HostAdaptationReceipt:   bytes.Clone(d.HostAdaptationReceipt),
+		RepositoryDeclaration:   d.RepositoryDeclaration,
 		QueuedWork: prompt.QueuedWork{
 			SessionID:            d.SessionID,
 			IssueID:              d.IssueID,
@@ -1018,6 +1019,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		qw.ExecutionRuntimeBinding = bytes.Clone(d.ExecutionRuntimeBinding)
 		qw.OperationalPayload = bytes.Clone(d.OperationalPayload)
 		qw.HostAdaptationReceipt = bytes.Clone(d.HostAdaptationReceipt)
+		qw.RepositoryDeclaration = d.RepositoryDeclaration
 		qw.WorkerID, qw.AuthToken, qw.PlatformURL = d.WorkerID, d.AuthToken, d.PlatformURL
 		// Restored beside the worker credentials for the same reason they are:
 		// the detail is authoritative for runtime credentials, so whatever the

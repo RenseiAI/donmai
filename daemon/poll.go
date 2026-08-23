@@ -59,18 +59,19 @@ type PollWorkItem struct {
 	// from raw poll JSON before typed mirrors can erase present-empty state.
 	OperationalPayload json.RawMessage `json:"operationalPayload,omitempty"`
 
-	ProjectID          string            `json:"projectId,omitempty"`
-	RepositoryID       string            `json:"repositoryId,omitempty"`
-	ProjectName        string            `json:"projectName,omitempty"`
-	Repository         string            `json:"repository,omitempty"`
-	RequiresRepository bool              `json:"requiresRepository,omitempty"`
-	Ref                string            `json:"ref,omitempty"`
-	Priority           int               `json:"priority,omitempty"`
-	Env                map[string]string `json:"env,omitempty"`
-	MaxDuration        int               `json:"maxDurationSeconds,omitempty"`
-	Resources          *SessionResources `json:"resources,omitempty"`
-	QueuedAt           int64             `json:"queuedAt,omitempty"`
-	ProjectScope       string            `json:"projectScope,omitempty"`
+	ProjectID             string                            `json:"projectId,omitempty"`
+	RepositoryID          string                            `json:"repositoryId,omitempty"`
+	ProjectName           string                            `json:"projectName,omitempty"`
+	Repository            string                            `json:"repository,omitempty"`
+	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
+	RequiresRepository    bool                              `json:"requiresRepository,omitempty"`
+	Ref                   string                            `json:"ref,omitempty"`
+	Priority              int                               `json:"priority,omitempty"`
+	Env                   map[string]string                 `json:"env,omitempty"`
+	MaxDuration           int                               `json:"maxDurationSeconds,omitempty"`
+	Resources             *SessionResources                 `json:"resources,omitempty"`
+	QueuedAt              int64                             `json:"queuedAt,omitempty"`
+	ProjectScope          string                            `json:"projectScope,omitempty"`
 
 	// F.2.8 — enriched fields the platform may send so the
 	// `donmai agent run` worker has the runner context it needs without
@@ -1130,6 +1131,7 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		ProjectID:              item.ProjectID,
 		RepositoryID:           item.RepositoryID,
 		Repository:             repo,
+		RepositoryDeclaration:  item.RepositoryDeclaration,
 		RequiresRepository:     item.RequiresRepository,
 		Ref:                    item.Ref,
 		Resources:              item.Resources,
@@ -1353,6 +1355,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		RepositoryID:            item.RepositoryID,
 		OrganizationID:          item.OrganizationID,
 		Repository:              repo,
+		RepositoryDeclaration:   item.RepositoryDeclaration,
 		Ref:                     item.Ref,
 		WorkType:                item.WorkType,
 		PromptContext:           item.PromptContext,

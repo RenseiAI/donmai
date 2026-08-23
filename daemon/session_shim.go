@@ -407,6 +407,9 @@ type SessionShimConfig struct {
 	// belongs to, for the adoption-time workarea identity check. Nil skips only
 	// the daemon-side half; the record-versus-live-shim half always runs.
 	ExpectedWorkarea func(orgID, sessionID string) string
+	// ExpectedWorkareaRoot cross-checks the optional session-owned root in new
+	// records. Old records without it remain adoptable.
+	ExpectedWorkareaRoot func(orgID, sessionID string) string
 
 	// OnSessionEvent, when set, receives EVERY event from every adopted session:
 	// output frames carrying the shim-allocated sequence, declared gaps,
@@ -707,6 +710,12 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	if cfg.ExpectedWorkarea != nil {
 		expected := cfg.ExpectedWorkarea
 		opts.ExpectedWorkarea = func(id sessionshim.Identity) string {
+			return expected(id.OrgID, id.SessionID)
+		}
+	}
+	if cfg.ExpectedWorkareaRoot != nil {
+		expected := cfg.ExpectedWorkareaRoot
+		opts.ExpectedWorkareaRoot = func(id sessionshim.Identity) string {
 			return expected(id.OrgID, id.SessionID)
 		}
 	}

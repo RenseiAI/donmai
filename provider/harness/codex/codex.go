@@ -19,6 +19,13 @@ import (
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
+// mcpConfigCleanupTimeout bounds the terminal empty-config write/readback.
+// Tool-using turns can leave app-server work queued briefly after the terminal
+// notification; two seconds produced false cleanup poison on the real executor
+// even though the same request completed immediately afterward. Five seconds
+// remains bounded beneath the ordinary RPC timeout while covering that drain.
+const mcpConfigCleanupTimeout = 5 * time.Second
+
 // Provider is the agent.Provider implementation backed by a long-lived
 // `codex app-server` subprocess. One Provider instance owns one
 // subprocess; sessions multiplex via JSON-RPC `thread/start` calls.
@@ -543,7 +550,7 @@ func (p *Provider) acquireMCPConfig(ctx context.Context, mcpConfig map[string]an
 					}
 					return
 				}
-				cleanupCtx, cancel := context.WithTimeout(context.Background(), min(p.opts.RPCTimeout, 2*time.Second))
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), min(p.opts.RPCTimeout, mcpConfigCleanupTimeout))
 				err := p.applyMCPConfig(cleanupCtx, map[string]any{}, cwd, true)
 				cancel()
 				if err != nil {

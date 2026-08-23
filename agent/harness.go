@@ -83,6 +83,18 @@ type HarnessCaps struct {
 	// helper.
 	SupportsInteractivePTY bool `json:"interactivePty"`
 
+	// MultiRepositoryWorkareaProtocols is the exact workarea protocol set this
+	// harness/executor binding has proved. Missing means [] and cannot activate a
+	// versioned repository declaration.
+	MultiRepositoryWorkareaProtocols []string `json:"multiRepositoryWorkareaProtocols,omitempty"`
+	// RepositoryAuthorityEnforcement is the executor-owned filesystem boundary.
+	// Missing is exactly none. A harness may declare isolated-read-only-v1 only
+	// after real write/rename/remove/chmod/remount negative proof.
+	RepositoryAuthorityEnforcement string `json:"repositoryAuthorityEnforcement,omitempty"`
+	// SupportsReadOnlySelectedCWD means the interactive executor can run from a
+	// selected read-only repository without implicitly granting its CWD write.
+	SupportsReadOnlySelectedCWD bool `json:"supportsReadOnlySelectedCwd,omitempty"`
+
 	// NoticeDelivery declares the mechanism — if any — by which a message
 	// can be delivered INTO an already-running session on this harness.
 	// It is a DECLARATION, never an assumption: see the NoticeDelivery type
@@ -144,6 +156,36 @@ func (e *SpecAdmissionError) Error() string {
 // are validated separately by their receipted adapters, where explicit caller
 // downgrade policies can be applied and recorded.
 func ValidateSpecCapabilities(spec Spec, manifest HarnessManifest) error {
+	if policy := spec.RepositoryAuthority; policy != nil {
+		protocolSupported := false
+		for _, protocol := range manifest.Caps.MultiRepositoryWorkareaProtocols {
+			if protocol == policy.Protocol {
+				protocolSupported = true
+				break
+			}
+		}
+		if !protocolSupported || manifest.Caps.RepositoryAuthorityEnforcement != policy.Enforcement {
+			return &SpecAdmissionError{
+				Code:   SpecDenialCapabilityUnsupported,
+				Field:  "repositoryAuthority",
+				Detail: "the exact selected harness does not attest the requested workarea protocol and repository authority enforcement",
+			}
+		}
+		if policy.SelectedPath == "" || policy.SelectedPath != spec.Cwd || policy.WorkareaRoot == "" || len(policy.ReadOnlyPaths) == 0 {
+			return &SpecAdmissionError{
+				Code:   SpecDenialCapabilityUnsupported,
+				Field:  "repositoryAuthority",
+				Detail: "the repository authority policy is incomplete or does not bind the harness CWD",
+			}
+		}
+		if spec.SandboxLevel != SandboxWorkspaceWrite {
+			return &SpecAdmissionError{
+				Code:   SpecDenialCapabilityUnsupported,
+				Field:  "sandboxLevel",
+				Detail: "isolated read-only repository authority requires workspace-write with only the selected CWD writable",
+			}
+		}
+	}
 	if spec.Effort != "" && !manifest.Caps.SupportsReasoningEffort {
 		return &SpecAdmissionError{
 			Code:   SpecDenialCapabilityUnsupported,

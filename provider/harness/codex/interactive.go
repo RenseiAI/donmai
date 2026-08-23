@@ -145,6 +145,9 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	if err != nil {
 		return interactiveLaunch{}, err
 	}
+	if spec.RepositoryAuthority != nil && hooks != codexHooksOff {
+		return interactiveLaunch{}, codexMCPApplicationError("repository authority enforcement requires workspace hooks disabled because hooks execute outside the sandbox")
+	}
 	approvals, err := codexApprovalsPolicy(getenv)
 	if err != nil {
 		return interactiveLaunch{}, err
@@ -155,6 +158,17 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	}
 	args = append(args, trustArgs...)
 	args = append(args, interactiveApprovalArgs(approvals)...)
+	if spec.RepositoryAuthority != nil {
+		// Last-writer-wins over an operator's interactive approval seed: the
+		// selected repository remains the sole writable root even when the
+		// attended posture would otherwise choose danger-full-access.
+		args = append(args, "--config", "sandbox_mode="+tomlBasicString("workspace-write"))
+		for _, mutablePath := range spec.RepositoryAuthority.MutablePaths {
+			if mutablePath != "" && mutablePath != spec.Cwd {
+				args = append(args, "--add-dir", mutablePath)
+			}
+		}
+	}
 	if model := strings.TrimSpace(spec.Model); model != "" {
 		args = append(args, "--config", "model="+tomlBasicString(model))
 	}
