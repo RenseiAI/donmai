@@ -1,6 +1,7 @@
 package sessionshim
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
@@ -27,6 +29,10 @@ const (
 	EventGap EventKind = "gap"
 	// EventSnapshot carries terminal state, typically right after a gap.
 	EventSnapshot EventKind = "snapshot"
+	// EventSnapshotFrame carries the exact interactive-attach frame bytes emitted
+	// by a selected-v2 authoritative emit request. It is delivered only when the
+	// shim reports in_stream=true.
+	EventSnapshotFrame EventKind = "snapshot_frame"
 	// EventExit is the immutable terminal observation.
 	EventExit EventKind = "exit"
 	// EventError is a closed code with display-only detail.
@@ -40,6 +46,8 @@ type ControllerEvent struct {
 	Seq     uint64
 	RelTime uint64
 	Data    []byte
+	// FrameBytes is a complete encoded interactive-attach frame.
+	FrameBytes []byte
 
 	Gap      shimwire.GapMsg
 	Snapshot shimwire.SnapshotMsg
@@ -102,14 +110,16 @@ func (o ControllerOptions) logger() *slog.Logger {
 // *ptyhost.Session. That is the §D1 ownership boundary made concrete: when this
 // object is garbage, the session is unaffected.
 type Controller struct {
-	id           Identity
-	controllerID string
-	conn         *net.UnixConn
-	w            *shimwire.Writer
-	r            *shimwire.Reader
-	gen          shimwire.Generation
-	hello        shimwire.Hello
-	adopted      shimwire.Adopted
+	id                 Identity
+	controllerID       string
+	conn               *net.UnixConn
+	w                  *shimwire.Writer
+	r                  *shimwire.Reader
+	gen                shimwire.Generation
+	selected           uint32
+	hello              shimwire.Hello
+	helloAuthenticated bool
+	adopted            shimwire.Adopted
 	// resumeFrom is the exact durable cursor proposed in Welcome. Retaining it
 	// lets a replacement daemon preserve last_forwarded_seq before any newly
 	// replayed or live output advances its own bookkeeping.
@@ -125,10 +135,43 @@ type Controller struct {
 	// would otherwise unwind it is never observed, because the loop is not in
 	// Read at that moment.
 	closing chan struct{}
+	exitMu  sync.RWMutex
+	exit    *shimwire.ExitMsg
+
+	snapshotMu     sync.Mutex
+	nextSnapshotID uint64
+	snapshotCalls  map[uint64]*snapshotCall
 }
+
+type snapshotCall struct {
+	request         shimwire.SnapshotRequest
+	result          *shimwire.SnapshotResult
+	err             error
+	sent            bool
+	streamDelivered bool
+	done            chan struct{}
+}
+
+const controllerSnapshotRetryLedgerLimit = 1024
 
 // ErrAdoptionRefused reports a handshake the shim or this daemon declined.
 var ErrAdoptionRefused = errors.New("sessionshim: adoption refused")
+
+type authenticatedHelloError struct {
+	generation shimwire.Generation
+	err        error
+}
+
+func (e *authenticatedHelloError) Error() string { return e.err.Error() }
+func (e *authenticatedHelloError) Unwrap() error { return e.err }
+
+func authenticatedHelloGeneration(err error) (shimwire.Generation, bool) {
+	var evidence *authenticatedHelloError
+	if !errors.As(err, &evidence) {
+		return 0, false
+	}
+	return evidence.generation, true
+}
 
 // Dial connects to a shim described by rec and completes Hello → Welcome →
 // Adopted.
@@ -178,19 +221,23 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	}
 
 	c := &Controller{
-		id:           rec.Identity(),
-		controllerID: opts.ControllerID,
-		conn:         conn,
-		w:            shimwire.NewWriter(conn),
-		r:            shimwire.NewReader(conn),
-		resumeFrom:   opts.ResumeFrom,
-		events:       make(chan ControllerEvent, 64),
-		logger:       opts.logger(),
-		done:         make(chan struct{}),
-		closing:      make(chan struct{}),
+		id:            rec.Identity(),
+		controllerID:  opts.ControllerID,
+		conn:          conn,
+		w:             shimwire.NewWriter(conn),
+		r:             shimwire.NewReader(conn),
+		resumeFrom:    opts.ResumeFrom,
+		events:        make(chan ControllerEvent, 64),
+		logger:        opts.logger(),
+		done:          make(chan struct{}),
+		closing:       make(chan struct{}),
+		snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	if err := c.handshake(rec, opts); err != nil {
 		_ = conn.Close()
+		if c.helloAuthenticated {
+			return nil, &authenticatedHelloError{generation: c.hello.Generation, err: err}
+		}
 		return nil, err
 	}
 	// Clear the handshake deadline: a live session is idle for long stretches by
@@ -224,6 +271,7 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	if err := verifyHello(hello, rec, opts.ExpectedWorkarea); err != nil {
 		return err
 	}
+	c.hello, c.helloAuthenticated = hello, true
 	if err := hello.Extensions.CheckRequired(); err != nil {
 		return err
 	}
@@ -249,6 +297,7 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 			ProcessEpoch:                hello.ProcessEpoch,
 			CurrentControllerGeneration: hello.Generation,
 			LastForwardedSeq:            lastForwarded,
+			SelectedVersion:             selected,
 		})
 		if prepareErr != nil {
 			return prepareErr
@@ -305,7 +354,7 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	if err := validateAdoptionCommit(adopted, proposed, extensions); err != nil {
 		return err
 	}
-	c.hello, c.adopted, c.gen = hello, adopted, adopted.Generation
+	c.adopted, c.gen, c.selected = adopted, adopted.Generation, selected
 	return nil
 }
 
@@ -391,6 +440,13 @@ func (c *Controller) ControllerID() string { return c.controllerID }
 // Generation returns the committed controller generation.
 func (c *Controller) Generation() shimwire.Generation { return c.gen }
 
+// SelectedVersion returns the local-wire version committed by the handshake.
+func (c *Controller) SelectedVersion() uint32 { return c.selected }
+
+// SupportsAuthoritativeSnapshot reports whether fresh inspect/emit proxying is
+// available. Selected v1 remains adoptable but intentionally returns false.
+func (c *Controller) SupportsAuthoritativeSnapshot() bool { return c.selected >= shimwire.V2 }
+
 // Hello returns the shim's opening self-report.
 func (c *Controller) Hello() shimwire.Hello { return c.hello }
 
@@ -455,6 +511,97 @@ func (c *Controller) Heartbeat(ackedSeq uint64) error {
 	})
 }
 
+// InspectSnapshot returns exact shim-owned encoded screen bytes and atSeq
+// without allocating a host output sequence.
+func (c *Controller) InspectSnapshot(ctx context.Context) (shimwire.SnapshotResult, error) {
+	return c.SnapshotWithID(ctx, c.allocateSnapshotRequestID(), shimwire.SnapshotInspect)
+}
+
+// EmitSnapshot asks the shim-owned PTY host to emit exactly one Snapshot frame.
+// The result contains the complete encoded interactive-attach frame and its
+// in-stream disposition.
+func (c *Controller) EmitSnapshot(ctx context.Context) (shimwire.SnapshotResult, error) {
+	return c.SnapshotWithID(ctx, c.allocateSnapshotRequestID(), shimwire.SnapshotEmit)
+}
+
+// SnapshotWithID exposes exact retry semantics for a connection-local id. An
+// exact retry shares/returns the first immutable result; changing mode under an
+// existing id is refused before another wire request can be emitted.
+func (c *Controller) SnapshotWithID(ctx context.Context, requestID uint64, mode shimwire.SnapshotMode) (shimwire.SnapshotResult, error) {
+	if !c.SupportsAuthoritativeSnapshot() {
+		return shimwire.SnapshotResult{}, fmt.Errorf("sessionshim: %w: selected local-wire v%d has no authoritative snapshot proxy", shimwire.ErrVersionMismatch, c.selected)
+	}
+	req := shimwire.SnapshotRequest{RequestID: requestID, Generation: c.gen, Mode: mode}
+	body, err := shimwire.EncodeSnapshotRequest(req)
+	if err != nil {
+		return shimwire.SnapshotResult{}, err
+	}
+	c.snapshotMu.Lock()
+	call := c.snapshotCalls[requestID]
+	if call != nil && call.request != req {
+		c.snapshotMu.Unlock()
+		return shimwire.SnapshotResult{}, fmt.Errorf("sessionshim: %w: changed replay for request id %d", shimwire.ErrSnapshotMismatch, requestID)
+	}
+	if call == nil {
+		if len(c.snapshotCalls) >= controllerSnapshotRetryLedgerLimit {
+			c.snapshotMu.Unlock()
+			return shimwire.SnapshotResult{}, fmt.Errorf("sessionshim: %w: controller retry ledger is full", shimwire.ErrSnapshotRefused)
+		}
+		call = &snapshotCall{request: req, done: make(chan struct{})}
+		c.snapshotCalls[requestID] = call
+	}
+	if call.result != nil {
+		result := cloneSnapshotResult(*call.result)
+		err := call.err
+		c.snapshotMu.Unlock()
+		return result, err
+	}
+	if !call.sent {
+		call.sent = true
+		if err := c.w.WriteVersion(c.selected, shimwire.TypeSnapshotRequest, body); err != nil {
+			call.err = err
+			close(call.done)
+		}
+	}
+	done := call.done
+	c.snapshotMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-done:
+		c.snapshotMu.Lock()
+		defer c.snapshotMu.Unlock()
+		if call.result == nil {
+			return shimwire.SnapshotResult{}, call.err
+		}
+		return cloneSnapshotResult(*call.result), call.err
+	case <-ctx.Done():
+		return shimwire.SnapshotResult{}, fmt.Errorf("sessionshim: snapshot request %d: %w", requestID, ctx.Err())
+	case <-c.done:
+		return shimwire.SnapshotResult{}, io.EOF
+	}
+}
+
+func (c *Controller) allocateSnapshotRequestID() uint64 {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	for {
+		c.nextSnapshotID++
+		if c.nextSnapshotID == 0 {
+			c.nextSnapshotID++
+		}
+		if _, exists := c.snapshotCalls[c.nextSnapshotID]; !exists {
+			return c.nextSnapshotID
+		}
+	}
+}
+
+func cloneSnapshotResult(in shimwire.SnapshotResult) shimwire.SnapshotResult {
+	in.Bytes = append([]byte(nil), in.Bytes...)
+	return in
+}
+
 // Close drops the controller connection WITHOUT stopping the session. This is
 // what a daemon shutdown does: the shim keeps the harness and starts its bounded
 // orphan clock.
@@ -470,9 +617,26 @@ func (c *Controller) readLoop() {
 	defer close(c.done)
 	defer close(c.events)
 	for {
-		msg, err := c.r.Read()
+		msg, err := c.r.ReadVersion(c.selected)
 		if err != nil {
+			c.failSnapshotCalls(err)
 			return
+		}
+		if msg.Type == shimwire.TypeSnapshotResult {
+			ev, emit, resultErr := c.acceptSnapshotResult(msg.Body)
+			if resultErr != nil {
+				c.failSnapshotCalls(resultErr)
+				_ = c.Close()
+				return
+			}
+			if emit {
+				select {
+				case c.events <- ev:
+				case <-c.closing:
+					return
+				}
+			}
+			continue
 		}
 		ev, ok := decodeEvent(msg)
 		if !ok {
@@ -485,10 +649,138 @@ func (c *Controller) readLoop() {
 			c.logger.Warn("sessionshim: replay gap declared by shim",
 				"session", c.id.String(), "fromSeq", ev.Gap.FromSeq, "toSeq", ev.Gap.ToSeq, "reason", ev.Gap.Reason)
 		}
+		if ev.Kind == EventExit {
+			if err := c.observeExit(ev.Exit); err != nil {
+				c.failSnapshotCalls(err)
+				_ = c.Close()
+				return
+			}
+		}
 		select {
 		case c.events <- ev:
 		case <-c.closing:
 			return
+		}
+	}
+}
+
+func (c *Controller) acceptSnapshotResult(body []byte) (ControllerEvent, bool, error) {
+	result, err := shimwire.DecodeSnapshotResult(body)
+	if err != nil {
+		return ControllerEvent{}, false, err
+	}
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	call := c.snapshotCalls[result.RequestID]
+	if call == nil || call.request.Generation != result.Generation || call.request.Mode != result.Mode {
+		return ControllerEvent{}, false, fmt.Errorf("sessionshim: %w: result id=%d generation=%d mode=%s", shimwire.ErrSnapshotMismatch, result.RequestID, result.Generation, result.Mode)
+	}
+	if err := validateSnapshotResult(result, c.observedExit()); err != nil {
+		return ControllerEvent{}, false, err
+	}
+	if call.result != nil {
+		if !snapshotResultsEqual(*call.result, result) {
+			return ControllerEvent{}, false, fmt.Errorf("sessionshim: %w: changed result for request id %d", shimwire.ErrSnapshotMismatch, result.RequestID)
+		}
+		return ControllerEvent{}, false, nil
+	}
+	stored := cloneSnapshotResult(result)
+	call.result = &stored
+	if result.Code != "" {
+		call.err = fmt.Errorf("sessionshim: %w: %s", shimwire.ErrSnapshotRefused, result.Code)
+	}
+	close(call.done)
+	if result.Mode == shimwire.SnapshotEmit && result.InStream && !call.streamDelivered {
+		call.streamDelivered = true
+		return ControllerEvent{Kind: EventSnapshotFrame, Seq: result.AtSeq + 1, FrameBytes: append([]byte(nil), result.Bytes...)}, true, nil
+	}
+	return ControllerEvent{}, false, nil
+}
+
+func validateSnapshotResult(result shimwire.SnapshotResult, observedExit *shimwire.ExitMsg) error {
+	if result.Code != "" {
+		return nil
+	}
+	if result.Mode == shimwire.SnapshotInspect {
+		if result.InStream || len(result.Bytes) == 0 {
+			return fmt.Errorf("sessionshim: %w: invalid inspect disposition", shimwire.ErrSnapshotMismatch)
+		}
+		if _, err := attachwire.DecodeScreen(result.Bytes); err != nil {
+			return fmt.Errorf("sessionshim: %w: inspect screen: %v", shimwire.ErrSnapshotMismatch, err)
+		}
+		return nil
+	}
+	frame, err := attachwire.DecodeFrame(result.Bytes)
+	if err != nil || frame.Type != attachwire.TypeSnapshot {
+		return fmt.Errorf("sessionshim: %w: emit frame is not an encoded Snapshot", shimwire.ErrSnapshotMismatch)
+	}
+	env, err := attachwire.DecodeSnapshotEnvelope(frame.Payload)
+	if err != nil || env.AtSeq != result.AtSeq {
+		return fmt.Errorf("sessionshim: %w: emit atSeq differs from frame", shimwire.ErrSnapshotMismatch)
+	}
+	if env.SnapFormat != attachwire.SnapFormatScreen {
+		return fmt.Errorf("sessionshim: %w: emit snapshot format %d is not screen", shimwire.ErrSnapshotMismatch, env.SnapFormat)
+	}
+	if _, err := attachwire.DecodeScreen(env.Snap); err != nil {
+		return fmt.Errorf("sessionshim: %w: emit screen: %v", shimwire.ErrSnapshotMismatch, err)
+	}
+	if result.InStream {
+		if observedExit != nil {
+			return fmt.Errorf("sessionshim: %w: live emit arrived after Exit", shimwire.ErrSnapshotMismatch)
+		}
+		if frame.Seq == 0 || frame.Seq != result.AtSeq+1 {
+			return fmt.Errorf("sessionshim: %w: live emit sequence disposition invalid", shimwire.ErrSnapshotMismatch)
+		}
+	} else {
+		if observedExit == nil {
+			return fmt.Errorf("sessionshim: %w: direct emit arrived before Exit", shimwire.ErrSnapshotMismatch)
+		}
+		if frame.Seq != attachwire.PostExitSnapshotSeq || frame.RelTime != 0 {
+			return fmt.Errorf("sessionshim: %w: direct emit is not post-Exit sequence/rel-time zero", shimwire.ErrSnapshotMismatch)
+		}
+		if result.AtSeq != observedExit.Seq || env.AtSeq != observedExit.Seq {
+			return fmt.Errorf("sessionshim: %w: direct emit atSeq does not equal observed Exit seq", shimwire.ErrSnapshotMismatch)
+		}
+	}
+	return nil
+}
+
+func (c *Controller) observeExit(exit shimwire.ExitMsg) error {
+	c.exitMu.Lock()
+	defer c.exitMu.Unlock()
+	if c.exit == nil {
+		observed := exit
+		c.exit = &observed
+		return nil
+	}
+	if *c.exit != exit {
+		return fmt.Errorf("sessionshim: %w: changed immutable Exit observation", shimwire.ErrSnapshotMismatch)
+	}
+	return nil
+}
+
+func (c *Controller) observedExit() *shimwire.ExitMsg {
+	c.exitMu.RLock()
+	defer c.exitMu.RUnlock()
+	if c.exit == nil {
+		return nil
+	}
+	observed := *c.exit
+	return &observed
+}
+
+func snapshotResultsEqual(a, b shimwire.SnapshotResult) bool {
+	return a.RequestID == b.RequestID && a.Generation == b.Generation && a.Mode == b.Mode &&
+		a.Code == b.Code && a.AtSeq == b.AtSeq && a.InStream == b.InStream && bytes.Equal(a.Bytes, b.Bytes)
+}
+
+func (c *Controller) failSnapshotCalls(err error) {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	for _, call := range c.snapshotCalls {
+		if call.result == nil && call.err == nil {
+			call.err = err
+			close(call.done)
 		}
 	}
 }

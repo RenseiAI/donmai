@@ -44,9 +44,13 @@ func NewWriter(w io.Writer) *Writer { return &Writer{w: w} }
 // refused locally rather than emitted for the peer to reject, so an oversized
 // message is a bug at its source.
 func (x *Writer) Write(t MessageType, body []byte) error {
-	if !t.Known() {
+	if !t.AllowedIn(V1) {
 		return fmt.Errorf("shimwire: write: %w: unknown message type 0x%s", ErrMalformed, hexByte(byte(t)))
 	}
+	return x.writeAssigned(t, body)
+}
+
+func (x *Writer) writeAssigned(t MessageType, body []byte) error {
 	total := 1 + len(body)
 	if total > MaxMessageBytes {
 		return fmt.Errorf("shimwire: write %s: %w: %d bytes", t, ErrMessageTooLarge, total)
@@ -70,6 +74,14 @@ func (x *Writer) Write(t MessageType, body []byte) error {
 // WriteMessage is the Message-shaped form of Write.
 func (x *Writer) WriteMessage(m Message) error { return x.Write(m.Type, m.Body) }
 
+// WriteVersion emits only a type legal in the selected closed vocabulary.
+func (x *Writer) WriteVersion(version uint32, t MessageType, body []byte) error {
+	if !t.AllowedIn(version) {
+		return fmt.Errorf("shimwire: write %s: %w: type is not legal in selected v%d", t, ErrMalformed, version)
+	}
+	return x.writeAssigned(t, body)
+}
+
 // Reader deserialises messages from a stream. Unlike Writer it is NOT safe for
 // concurrent use — a protocol stream has exactly one reader by construction.
 type Reader struct {
@@ -86,6 +98,10 @@ func NewReader(r io.Reader) *Reader {
 // verbatim so a caller can distinguish "the peer closed" (an ordinary
 // controller-loss event) from "the peer sent garbage" (a quarantine trigger).
 func (x *Reader) Read() (Message, error) {
+	return x.readVersion(V1)
+}
+
+func (x *Reader) readVersion(version uint32) (Message, error) {
 	if _, err := io.ReadFull(x.r, x.hdr[:]); err != nil {
 		if errors.Is(err, io.EOF) {
 			return Message{}, io.EOF
@@ -105,8 +121,14 @@ func (x *Reader) Read() (Message, error) {
 		return Message{}, fmt.Errorf("shimwire: read body: %w", err)
 	}
 	t := MessageType(buf[0])
-	if !t.Known() {
+	if !t.AllowedIn(version) {
 		return Message{}, fmt.Errorf("shimwire: read: %w: unknown message type 0x%s", ErrMalformed, hexByte(buf[0]))
 	}
 	return Message{Type: t, Body: buf[1:]}, nil
+}
+
+// ReadVersion reads one message and refuses a type outside the selected closed
+// vocabulary. Handshake callers use Read until a version has been selected.
+func (x *Reader) ReadVersion(version uint32) (Message, error) {
+	return x.readVersion(version)
 }

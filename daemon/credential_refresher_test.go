@@ -3,12 +3,39 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestCredentialRefresher_ValidationRefusalIsAtomicAndVisible(t *testing.T) {
+	t.Parallel()
+	srv := reregisterServer(t, "controller-exact", "after.jwt")
+	defer srv.Close()
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.ValidateRefresh = func(result *RefreshTokenResult) error {
+		if result.WorkerID == "controller-exact" {
+			return errors.New("worker registration id aliases controller id")
+		}
+		return nil
+	}
+	r := NewCredentialRefresher(opts)
+	lane := &recordingLane{}
+	r.Attach(lane)
+	_, _, setsBefore := lane.current()
+	if _, err := r.Refresh(context.Background(), "worker-not-found"); err == nil {
+		t.Fatal("aliasing refresh succeeded; want visible validation error")
+	}
+	if id, jwt := r.Current(); id != "wkr_before" || jwt != "before.jwt" {
+		t.Fatalf("refresher changed after refusal: (%q,%q)", id, jwt)
+	}
+	if id, jwt, sets := lane.current(); id != "wkr_before" || jwt != "before.jwt" || sets != setsBefore {
+		t.Fatalf("lane changed after refusal: (%q,%q,%d), want old credentials and %d sets", id, jwt, sets, setsBefore)
+	}
+}
 
 // recordingLane is a CredentialLane that remembers every credential set it was
 // handed, so a test can assert both WHAT it ended on and that it was told at

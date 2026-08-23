@@ -106,21 +106,26 @@ const (
 // DaemonSessionShimAdoptedCorrelation is one live controller correlation. It
 // carries only bounded process/fencing diagnostics sourced from authenticated
 // shim Hello and daemon durability state; no path, credential, output, host id,
-// or opaque composing receipt belongs here.
+// token, or opaque composing receipt belongs here. The non-secret process-scoped
+// controller id is included as immutable correlation evidence.
 type DaemonSessionShimAdoptedCorrelation struct {
-	OrgID                string `json:"orgId"`
-	SessionID            string `json:"sessionId"`
-	ShimID               string `json:"shimId"`
-	ProcessEpoch         uint64 `json:"processEpoch,omitempty"`
-	ControllerGeneration uint64 `json:"controllerGeneration,omitempty"`
-	LastForwardedSeq     uint64 `json:"lastForwardedSeq"`
-	HarnessPID           int    `json:"harnessPid,omitempty"`
-	HarnessStartedAt     int64  `json:"harnessStartedAt,omitempty"`
-	ProtocolMin          uint32 `json:"protocolMin,omitempty"`
-	ProtocolMax          uint32 `json:"protocolMax,omitempty"`
-	Phase                string `json:"phase,omitempty"`
-	Source               string `json:"source"`
-	ConsumesCapacity     bool   `json:"consumesCapacity"`
+	OrgID                  string `json:"orgId"`
+	SessionID              string `json:"sessionId"`
+	ShimID                 string `json:"shimId"`
+	ProcessEpoch           uint64 `json:"processEpoch,omitempty"`
+	ControllerGeneration   uint64 `json:"controllerGeneration,omitempty"`
+	LastForwardedSeq       uint64 `json:"lastForwardedSeq"`
+	HarnessPID             int    `json:"harnessPid,omitempty"`
+	HarnessStartedAt       int64  `json:"harnessStartedAt,omitempty"`
+	ProtocolMin            uint32 `json:"protocolMin,omitempty"`
+	ProtocolMax            uint32 `json:"protocolMax,omitempty"`
+	Phase                  string `json:"phase,omitempty"`
+	Source                 string `json:"source"`
+	ConsumesCapacity       bool   `json:"consumesCapacity"`
+	ControllerID           string `json:"controllerId,omitempty"`
+	ProtocolVersion        uint32 `json:"protocolVersion,omitempty"`
+	AuthoritativeSnapshot  bool   `json:"authoritativeSnapshot"`
+	CarrierIncompatibility string `json:"carrierIncompatibility,omitempty"`
 }
 
 // DaemonSessionShimStatus is shared byte-for-byte by status and doctor.
@@ -131,6 +136,7 @@ type DaemonSessionShimStatus struct {
 	OccupiedSlots       int                                   `json:"occupiedSlots"`
 	Adopted             []DaemonSessionShimAdoptedCorrelation `json:"adopted,omitempty"`
 	Quarantined         []sessionshim.QuarantinedSession      `json:"quarantined,omitempty"`
+	ControllerID        string                                `json:"controllerId,omitempty"`
 }
 
 // DaemonProjectStatus is one truthful host-project status row.

@@ -8,6 +8,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **Proposed v0.68.2 session-shim v2 boundary.** A daemon now resolves one
+  high-entropy, process-scoped controller id at construction (or accepts an
+  explicit non-alias override), and selected local-wire v2 proxies fresh
+  shim-owned PTY snapshot inspection and emission with exact request
+  correlation and interactive-attach frame bytes. The stable family retains
+  selected-v1 adoption; carriers that require fresh snapshots receive typed
+  incompatibility evidence while the older shim remains capacity-charged.
+
 ## v0.68.1 — 2026-08-22
 
 ### Features

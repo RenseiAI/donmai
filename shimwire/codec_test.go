@@ -207,3 +207,26 @@ func TestMessageTypeKnownRejectsReservedValues(t *testing.T) {
 		t.Error("TypeError.Known() = false; 0x0C is the last assigned v1 type")
 	}
 }
+
+func TestSelectedVersionClosesV1ButAdmitsV2SnapshotMessages(t *testing.T) {
+	t.Parallel()
+	for _, mt := range []MessageType{TypeSnapshotRequest, TypeSnapshotResult} {
+		if mt.Known() || mt.AllowedIn(V1) || !mt.AllowedIn(V2) {
+			t.Fatalf("%s vocabulary: Known=%v v1=%v v2=%v", mt, mt.Known(), mt.AllowedIn(V1), mt.AllowedIn(V2))
+		}
+		var buf bytes.Buffer
+		if err := NewWriter(&buf).Write(mt, nil); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("plain v1 Write(%s) = %v, want ErrMalformed", mt, err)
+		}
+		if err := NewWriter(&buf).WriteVersion(V2, mt, []byte{1}); err != nil {
+			t.Fatalf("v2 WriteVersion(%s): %v", mt, err)
+		}
+		if _, err := NewReader(bytes.NewReader(buf.Bytes())).Read(); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("plain v1 Read(%s) = %v, want ErrMalformed", mt, err)
+		}
+		msg, err := NewReader(bytes.NewReader(buf.Bytes())).ReadVersion(V2)
+		if err != nil || msg.Type != mt {
+			t.Fatalf("v2 ReadVersion(%s) = (%+v,%v)", mt, msg, err)
+		}
+	}
+}

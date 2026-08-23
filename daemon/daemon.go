@@ -303,6 +303,10 @@ type Daemon struct {
 	workerID  string
 	jwt       string
 	startedAt time.Time
+	// controllerID is resolved exactly once in New. It is immutable for this
+	// process and independent of registration and credential refresh state.
+	controllerIDValue string
+	controllerIDErr   error
 
 	// capabilitySet holds the substrate capabilities detected at startup.
 	// It is populated before registration so the provides[] array can be
@@ -426,6 +430,7 @@ func New(opts Options) *Daemon {
 		routingTraces:  NewRoutingTraceStore(DefaultRoutingRingBufferSize),
 		shims:          newSessionShimState(),
 	}
+	d.controllerIDValue, d.controllerIDErr = resolveControllerID(opts.SessionShim)
 	if opts.RulesetSnapshot != nil {
 		snapshotClient := opts.RulesetSnapshot
 		d.routingTraces.SetSnapshotStatusFunc(func() (afclient.RulesetSnapshotStatus, bool) {
@@ -716,6 +721,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if d.controllerIDErr != nil {
+		return d.controllerIDErr
+	}
 	lease, err := d.claimLifecycle(ctx, lifecycleStart)
 	if err != nil {
 		return err
@@ -813,7 +821,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// the platform populates the worker_hosts host-info columns. All
 			// fields degrade to empty on an unsupported platform; gathering
 			// never crashes registration.
-			HostInfo: GatherHostInfo(d.EffectiveVersion(), d.StartedAt()),
+			HostInfo:            GatherHostInfo(d.EffectiveVersion(), d.StartedAt()),
+			ValidateCredentials: d.validateControllerCredentials,
 		}
 		var err error
 		regResp, err = Register(ctx, regOpts)
@@ -927,6 +936,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Registration: regOpts,
 			WorkerID:     regResp.WorkerID,
 			RuntimeJWT:   regResp.RuntimeToken,
+			ValidateRefresh: func(result *RefreshTokenResult) error {
+				return d.validateControllerCredentials(result.WorkerID, result.RuntimeToken)
+			},
 			OnRefreshed: func(result *RefreshTokenResult) {
 				// Capture the identity being superseded under the same lock that
 				// installs its replacement: it is the scope key for the session
