@@ -53,10 +53,8 @@ func main() {
 					if err := controller.Heartbeat(event.Seq); err != nil {
 						die(err)
 					}
-					// Released selected-v2 Heartbeat is write-only. Give the new shim a
-					// bounded opportunity to persist its additive sidecar before this old
-					// process closes the socket.
-					time.Sleep(100 * time.Millisecond)
+					// Released selected-v2 Heartbeat is write-only. A new shim must keep
+					// that exact behavior and create no v3-only ACK sidecar.
 					fmt.Printf("PINNED-REVERSE-OVERLAP PASS old=%s selected=2 v2_bytes=exact\n", os.Args[5])
 					return
 				}

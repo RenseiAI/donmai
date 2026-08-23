@@ -73,12 +73,13 @@ run_reverse_overlap() {
     sleep 0.025
   done
   "$old_binary" "$registry" "org-reverse-$suffix" "session-reverse-$suffix" "$workarea" "$released_sha"
-  if [[ -z "$(find "$registry" -name '*.ack' -print -quit)" ]]; then
-    echo "new shim did not publish the durable ACK sidecar" >&2
+  if [[ -n "$(find "$registry" -name '*.ack' -print -quit)" ]]; then
+    echo "selected-v2 overlap unexpectedly published a v3-only ACK sidecar" >&2
     exit 1
   fi
-  # A second controller built entirely from released v0.68.2 must ignore the
-  # unrecognized non-.json sidecar, scan the frozen Record, and adopt normally.
+  # A released v0.68.2 scanner ignores unknown non-.json entries. This corrupt
+  # sidecar-shaped sentinel also proves the reverse-overlap scan remains frozen.
+  printf '%s' 'corrupt-v3-only-sidecar' > "$registry/overlap-corrupt.ack"
   "$old_binary" "$registry" "org-reverse-$suffix" "session-reverse-$suffix" "$workarea" "$released_sha"
 }
 
