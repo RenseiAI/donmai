@@ -1397,9 +1397,27 @@ func TestSpawner_StopSession_ReleasesSlotOnlyAfterTerminalReap(t *testing.T) {
 		MaxConcurrentSessions: 1,
 		WorkerCommand:         []string{"sleep", "30"},
 	})
-	ended := sessionEnds(s)
+	listenerEntered := make(chan struct{})
+	listenerReturn := make(chan struct{})
+	var listenerEnteredOnce sync.Once
+	var listenerReturnOnce sync.Once
+	unblockListener := func() {
+		listenerReturnOnce.Do(func() { close(listenerReturn) })
+	}
+	t.Cleanup(unblockListener)
+	s.On(func(event SessionEvent) {
+		if event.Kind != SessionEventEnded || event.Handle.SessionID != "victim" {
+			return
+		}
+		listenerEnteredOnce.Do(func() { close(listenerEntered) })
+		<-listenerReturn
+	})
 	if _, err := s.AcceptWork(SessionSpec{SessionID: "victim", Repository: "github.com/a/b"}); err != nil {
 		t.Fatalf("accept: %v", err)
+	}
+	released, ok := s.sessionRelease("victim")
+	if !ok {
+		t.Fatal("victim release signal missing after admission")
 	}
 	if s.ActiveCount() != 1 {
 		t.Fatalf("ActiveCount after accept = %d, want 1", s.ActiveCount())
@@ -1416,12 +1434,22 @@ func TestSpawner_StopSession_ReleasesSlotOnlyAfterTerminalReap(t *testing.T) {
 	if s.ActiveCount() != 1 {
 		t.Fatalf("ActiveCount after StopSession = %d, want active terminal owner", s.ActiveCount())
 	}
-	if _, err := s.AcceptWork(SessionSpec{SessionID: "victim", Repository: "github.com/a/b"}); err == nil {
-		t.Fatal("same ID admitted before terminal reap")
+	waitSpawnerSignal(t, listenerEntered, "terminal listener entry")
+	if s.ActiveCount() != 1 {
+		t.Fatalf("ActiveCount during terminal listener = %d, want retained terminal owner", s.ActiveCount())
 	}
-	waitSessionEnd(t, ended)
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "victim", Repository: "github.com/a/b"}); err == nil {
+		t.Fatal("same ID admitted while terminal listener was still running")
+	}
+	if _, err := s.AcceptWork(SessionSpec{SessionID: "next", Repository: "github.com/a/b"}); err == nil {
+		t.Fatal("capacity slot released while terminal listener was still running")
+	}
 
-	// Slot is free only after the synchronous terminal listener path returns.
+	unblockListener()
+	waitSpawnerSignal(t, released, "post-listener session release")
+
+	// Slot is free only after the synchronous terminal listener returns and the
+	// exact generation's released signal closes.
 	if _, err := s.AcceptWork(SessionSpec{SessionID: "next", Repository: "github.com/a/b"}); err != nil {
 		t.Fatalf("accept after terminal reap: %v", err)
 	}
