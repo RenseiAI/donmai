@@ -812,7 +812,8 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 	}
 	q := quarantined[0]
 	processEpoch := entry.controller.Hello().ProcessEpoch
-	if q.Identity() != id || q.ShimID != entry.shimID || q.ProcessEpoch != processEpoch {
+	if q.Identity() != id || q.ShimID != entry.shimID || q.ProcessEpoch != processEpoch ||
+		q.ControllerGeneration != uint64(entry.controller.Generation()) {
 		t.Errorf("quarantine correlation = %s/%s/%d, want exact %s/%s/%d",
 			q.Identity(), q.ShimID, q.ProcessEpoch, id, entry.shimID, processEpoch)
 	}
@@ -1312,7 +1313,7 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 	d.shims.mu.Lock()
 	d.shims.quarantined = append(d.shims.quarantined, sessionshim.QuarantinedSession{
 		OrgID: "test-org", SessionID: "diagnostic-quarantine", ShimID: "shim-quarantine",
-		ProcessEpoch: 9, ProtocolMin: 1, ProtocolMax: 1,
+		ProcessEpoch: 9, ControllerGeneration: 11, ProtocolMin: 1, ProtocolMax: 1,
 		Reason: sessionshim.QuarantineDuplicateIdentity, Detail: "socket /private/secret/path",
 		AgeSeconds: 3, ConsumesCapacity: true,
 	})
@@ -1342,6 +1343,7 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 		t.Fatalf("status adopted correlation = %+v", adopted)
 	}
 	if len(diagnostic.Quarantined) != 1 || diagnostic.Quarantined[0].ShimID != "shim-quarantine" ||
+		diagnostic.Quarantined[0].ControllerGeneration != 11 ||
 		diagnostic.Quarantined[0].Detail != "" || !diagnostic.Quarantined[0].ConsumesCapacity {
 		t.Fatalf("status quarantine = %+v", diagnostic.Quarantined)
 	}

@@ -19,6 +19,34 @@ import (
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
+func TestQuarantineCloneAndIncarnationEqualityPreserveGeneration(t *testing.T) {
+	t.Parallel()
+	original := SessionShimAdoptionBatch{Quarantined: []sessionshim.QuarantinedSession{{
+		OrgID: "org", SessionID: "session", ShimID: "shim", ProcessEpoch: 3,
+		ControllerGeneration: 7, ConsumesCapacity: true,
+	}}}
+	cloned := cloneSessionShimAdoptionBatch(original)
+	if len(cloned.Quarantined) != 1 || cloned.Quarantined[0].ControllerGeneration != 7 {
+		t.Fatalf("cloned quarantine = %+v, want generation 7", cloned.Quarantined)
+	}
+	cloned.Quarantined[0].ControllerGeneration = 8
+	if original.Quarantined[0].ControllerGeneration != 7 {
+		t.Fatal("mutating cloned quarantine changed original generation")
+	}
+
+	d := New(Options{SkipRegistration: true})
+	d.shims.mu.Lock()
+	d.upsertShimQuarantineLocked(original.Quarantined[0])
+	newer := original.Quarantined[0]
+	newer.ControllerGeneration = 9
+	d.upsertShimQuarantineLocked(newer)
+	d.shims.mu.Unlock()
+	got := d.QuarantinedSessions()
+	if len(got) != 1 || got[0].ControllerGeneration != 9 {
+		t.Fatalf("same-incarnation generation upsert = %+v, want one row at generation 9", got)
+	}
+}
+
 func TestControllerIDResolvedOnceGeneratedOrExactOverrideAndRefusesAliases(t *testing.T) {
 	t.Parallel()
 	a := New(Options{SkipRegistration: true})
@@ -309,7 +337,8 @@ func TestHeartbeatCarriesTheQuarantineProjection(t *testing.T) {
 		GetQuarantinedSessions: func() []sessionshim.QuarantinedSession {
 			return []sessionshim.QuarantinedSession{{
 				OrgID: "org-1", SessionID: "sess-1", ShimID: "shim-1", ProcessEpoch: 23,
-				ProtocolMin: 9, ProtocolMax: 9,
+				ControllerGeneration: 29,
+				ProtocolMin:          9, ProtocolMax: 9,
 				Reason:     sessionshim.QuarantineProtocolMismatch,
 				AgeSeconds: 42, ConsumesCapacity: true,
 			}}
@@ -341,6 +370,9 @@ func TestHeartbeatCarriesTheQuarantineProjection(t *testing.T) {
 	}
 	if got, _ := entry["processEpoch"].(float64); got != 23 {
 		t.Errorf("quarantinedSessions[0].processEpoch = %v, want 23", entry["processEpoch"])
+	}
+	if got, _ := entry["controllerGeneration"].(float64); got != 29 {
+		t.Errorf("quarantinedSessions[0].controllerGeneration = %v, want 29", entry["controllerGeneration"])
 	}
 	// The projection is bounded and secret-free by construction: it carries only
 	// identity, correlation, protocol range, reason, and age.
@@ -466,7 +498,7 @@ func TestRestartFenceCoversAdoptedAndQuarantinedSessions(t *testing.T) {
 			{OrgID: "o", SessionID: "a-adopted"},
 		},
 		[]sessionshim.QuarantinedSession{
-			{OrgID: "o", SessionID: "quarantined", ShimID: "shim-q", ProcessEpoch: 31, ConsumesCapacity: true},
+			{OrgID: "o", SessionID: "quarantined", ShimID: "shim-q", ProcessEpoch: 31, ControllerGeneration: 37, ConsumesCapacity: true},
 		},
 	)
 	d.shims.mu.Lock()
@@ -495,8 +527,8 @@ func TestRestartFenceCoversAdoptedAndQuarantinedSessions(t *testing.T) {
 	for _, covered := range fence.Sessions {
 		if covered.SessionID == "quarantined" {
 			foundQuarantine = true
-			if covered.ShimID != "shim-q" || covered.ProcessEpoch != 31 {
-				t.Errorf("quarantined fence correlation = %+v, want shim-q/processEpoch 31", covered)
+			if covered.ShimID != "shim-q" || covered.ProcessEpoch != 31 || covered.ControllerGeneration != 37 {
+				t.Errorf("quarantined fence correlation = %+v, want shim-q/processEpoch 31/generation 37", covered)
 			}
 		}
 	}
@@ -515,22 +547,23 @@ func TestRestartFenceCoversAdoptedAndQuarantinedSessions(t *testing.T) {
 	}
 	var wireFence struct {
 		Sessions []struct {
-			SessionID        string `json:"sessionId"`
-			ProcessEpoch     uint64 `json:"processEpoch"`
-			LastForwardedSeq uint64 `json:"lastForwardedSeq"`
+			SessionID            string `json:"sessionId"`
+			ProcessEpoch         uint64 `json:"processEpoch"`
+			ControllerGeneration uint64 `json:"controllerGeneration"`
+			LastForwardedSeq     uint64 `json:"lastForwardedSeq"`
 		} `json:"sessions"`
 	}
 	if err := json.Unmarshal(rawFence, &wireFence); err != nil {
 		t.Fatalf("unmarshal restart fence wire: %v", err)
 	}
-	foundWireEpoch := false
+	foundWireCorrelation := false
 	for _, covered := range wireFence.Sessions {
-		if covered.SessionID == "quarantined" && covered.ProcessEpoch == 31 {
-			foundWireEpoch = true
+		if covered.SessionID == "quarantined" && covered.ProcessEpoch == 31 && covered.ControllerGeneration == 37 {
+			foundWireCorrelation = true
 		}
 	}
-	if !foundWireEpoch {
-		t.Fatalf("restart fence JSON omitted quarantined processEpoch: %s", rawFence)
+	if !foundWireCorrelation {
+		t.Fatalf("restart fence JSON omitted quarantined processEpoch/controllerGeneration: %s", rawFence)
 	}
 	for i, covered := range wireFence.Sessions {
 		if covered.SessionID != wantOrder[i] || covered.LastForwardedSeq != wantForwarded[i] {

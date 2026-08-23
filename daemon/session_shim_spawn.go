@@ -635,6 +635,7 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity) {
 			CreatedAtUnixNano: now.UnixNano(),
 		}, sessionshim.QuarantineSocketUnreachable,
 			"controller stream ended before a terminal observation", now)
+		q.ControllerGeneration = uint64(entry.controller.Generation())
 		d.upsertShimQuarantineLocked(q)
 	}
 	d.shims.mu.Unlock()

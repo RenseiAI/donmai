@@ -702,7 +702,8 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 						batch.Quarantined = append(batch.Quarantined, sessionshim.QuarantinedSession{
 							OrgID: entry.adoption.Identity.OrgID, SessionID: entry.adoption.Identity.SessionID,
 							ShimID: hello.ShimID, ProcessEpoch: hello.ProcessEpoch,
-							ProtocolMin: hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
+							ControllerGeneration: entry.adoption.ControllerGeneration,
+							ProtocolMin:          hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
 							Reason:           sessionshim.QuarantineAuthoritativeSnapshotUnsupported,
 							ConsumesCapacity: true,
 						})
@@ -1347,7 +1348,8 @@ func (d *Daemon) sessionShimFenceSnapshot() []sessionshim.FencedSession {
 		id := q.Identity()
 		covered = append(covered, sessionshim.FencedSession{
 			OrgID: q.OrgID, SessionID: q.SessionID, ShimID: q.ShimID, ProcessEpoch: q.ProcessEpoch,
-			LastForwardedSeq: d.shims.forwarded[id],
+			ControllerGeneration: q.ControllerGeneration,
+			LastForwardedSeq:     d.shims.forwarded[id],
 		})
 	}
 	d.shims.mu.RUnlock()

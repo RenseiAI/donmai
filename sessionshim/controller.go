@@ -110,15 +110,16 @@ func (o ControllerOptions) logger() *slog.Logger {
 // *ptyhost.Session. That is the §D1 ownership boundary made concrete: when this
 // object is garbage, the session is unaffected.
 type Controller struct {
-	id           Identity
-	controllerID string
-	conn         *net.UnixConn
-	w            *shimwire.Writer
-	r            *shimwire.Reader
-	gen          shimwire.Generation
-	selected     uint32
-	hello        shimwire.Hello
-	adopted      shimwire.Adopted
+	id                 Identity
+	controllerID       string
+	conn               *net.UnixConn
+	w                  *shimwire.Writer
+	r                  *shimwire.Reader
+	gen                shimwire.Generation
+	selected           uint32
+	hello              shimwire.Hello
+	helloAuthenticated bool
+	adopted            shimwire.Adopted
 	// resumeFrom is the exact durable cursor proposed in Welcome. Retaining it
 	// lets a replacement daemon preserve last_forwarded_seq before any newly
 	// replayed or live output advances its own bookkeeping.
@@ -134,6 +135,8 @@ type Controller struct {
 	// would otherwise unwind it is never observed, because the loop is not in
 	// Read at that moment.
 	closing chan struct{}
+	exitMu  sync.RWMutex
+	exit    *shimwire.ExitMsg
 
 	snapshotMu     sync.Mutex
 	nextSnapshotID uint64
@@ -153,6 +156,22 @@ const controllerSnapshotRetryLedgerLimit = 1024
 
 // ErrAdoptionRefused reports a handshake the shim or this daemon declined.
 var ErrAdoptionRefused = errors.New("sessionshim: adoption refused")
+
+type authenticatedHelloError struct {
+	generation shimwire.Generation
+	err        error
+}
+
+func (e *authenticatedHelloError) Error() string { return e.err.Error() }
+func (e *authenticatedHelloError) Unwrap() error { return e.err }
+
+func authenticatedHelloGeneration(err error) (shimwire.Generation, bool) {
+	var evidence *authenticatedHelloError
+	if !errors.As(err, &evidence) {
+		return 0, false
+	}
+	return evidence.generation, true
+}
 
 // Dial connects to a shim described by rec and completes Hello → Welcome →
 // Adopted.
@@ -216,6 +235,9 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	}
 	if err := c.handshake(rec, opts); err != nil {
 		_ = conn.Close()
+		if c.helloAuthenticated {
+			return nil, &authenticatedHelloError{generation: c.hello.Generation, err: err}
+		}
 		return nil, err
 	}
 	// Clear the handshake deadline: a live session is idle for long stretches by
@@ -249,6 +271,7 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	if err := verifyHello(hello, rec, opts.ExpectedWorkarea); err != nil {
 		return err
 	}
+	c.hello, c.helloAuthenticated = hello, true
 	if err := hello.Extensions.CheckRequired(); err != nil {
 		return err
 	}
@@ -331,7 +354,7 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	if err := validateAdoptionCommit(adopted, proposed, extensions); err != nil {
 		return err
 	}
-	c.hello, c.adopted, c.gen, c.selected = hello, adopted, adopted.Generation, selected
+	c.adopted, c.gen, c.selected = adopted, adopted.Generation, selected
 	return nil
 }
 
@@ -626,6 +649,13 @@ func (c *Controller) readLoop() {
 			c.logger.Warn("sessionshim: replay gap declared by shim",
 				"session", c.id.String(), "fromSeq", ev.Gap.FromSeq, "toSeq", ev.Gap.ToSeq, "reason", ev.Gap.Reason)
 		}
+		if ev.Kind == EventExit {
+			if err := c.observeExit(ev.Exit); err != nil {
+				c.failSnapshotCalls(err)
+				_ = c.Close()
+				return
+			}
+		}
 		select {
 		case c.events <- ev:
 		case <-c.closing:
@@ -645,7 +675,7 @@ func (c *Controller) acceptSnapshotResult(body []byte) (ControllerEvent, bool, e
 	if call == nil || call.request.Generation != result.Generation || call.request.Mode != result.Mode {
 		return ControllerEvent{}, false, fmt.Errorf("sessionshim: %w: result id=%d generation=%d mode=%s", shimwire.ErrSnapshotMismatch, result.RequestID, result.Generation, result.Mode)
 	}
-	if err := validateSnapshotResult(result); err != nil {
+	if err := validateSnapshotResult(result, c.observedExit()); err != nil {
 		return ControllerEvent{}, false, err
 	}
 	if call.result != nil {
@@ -667,7 +697,7 @@ func (c *Controller) acceptSnapshotResult(body []byte) (ControllerEvent, bool, e
 	return ControllerEvent{}, false, nil
 }
 
-func validateSnapshotResult(result shimwire.SnapshotResult) error {
+func validateSnapshotResult(result shimwire.SnapshotResult, observedExit *shimwire.ExitMsg) error {
 	if result.Code != "" {
 		return nil
 	}
@@ -688,14 +718,55 @@ func validateSnapshotResult(result shimwire.SnapshotResult) error {
 	if err != nil || env.AtSeq != result.AtSeq {
 		return fmt.Errorf("sessionshim: %w: emit atSeq differs from frame", shimwire.ErrSnapshotMismatch)
 	}
+	if env.SnapFormat != attachwire.SnapFormatScreen {
+		return fmt.Errorf("sessionshim: %w: emit snapshot format %d is not screen", shimwire.ErrSnapshotMismatch, env.SnapFormat)
+	}
+	if _, err := attachwire.DecodeScreen(env.Snap); err != nil {
+		return fmt.Errorf("sessionshim: %w: emit screen: %v", shimwire.ErrSnapshotMismatch, err)
+	}
 	if result.InStream {
+		if observedExit != nil {
+			return fmt.Errorf("sessionshim: %w: live emit arrived after Exit", shimwire.ErrSnapshotMismatch)
+		}
 		if frame.Seq == 0 || frame.Seq != result.AtSeq+1 {
 			return fmt.Errorf("sessionshim: %w: live emit sequence disposition invalid", shimwire.ErrSnapshotMismatch)
 		}
-	} else if frame.Seq != attachwire.PostExitSnapshotSeq {
-		return fmt.Errorf("sessionshim: %w: direct emit is not post-Exit sequence zero", shimwire.ErrSnapshotMismatch)
+	} else {
+		if observedExit == nil {
+			return fmt.Errorf("sessionshim: %w: direct emit arrived before Exit", shimwire.ErrSnapshotMismatch)
+		}
+		if frame.Seq != attachwire.PostExitSnapshotSeq || frame.RelTime != 0 {
+			return fmt.Errorf("sessionshim: %w: direct emit is not post-Exit sequence/rel-time zero", shimwire.ErrSnapshotMismatch)
+		}
+		if result.AtSeq != observedExit.Seq || env.AtSeq != observedExit.Seq {
+			return fmt.Errorf("sessionshim: %w: direct emit atSeq does not equal observed Exit seq", shimwire.ErrSnapshotMismatch)
+		}
 	}
 	return nil
+}
+
+func (c *Controller) observeExit(exit shimwire.ExitMsg) error {
+	c.exitMu.Lock()
+	defer c.exitMu.Unlock()
+	if c.exit == nil {
+		observed := exit
+		c.exit = &observed
+		return nil
+	}
+	if *c.exit != exit {
+		return fmt.Errorf("sessionshim: %w: changed immutable Exit observation", shimwire.ErrSnapshotMismatch)
+	}
+	return nil
+}
+
+func (c *Controller) observedExit() *shimwire.ExitMsg {
+	c.exitMu.RLock()
+	defer c.exitMu.RUnlock()
+	if c.exit == nil {
+		return nil
+	}
+	observed := *c.exit
+	return &observed
 }
 
 func snapshotResultsEqual(a, b shimwire.SnapshotResult) bool {

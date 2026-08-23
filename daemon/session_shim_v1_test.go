@@ -133,7 +133,8 @@ func TestSelectedV1StaysLocallyAdoptedButPublishesCarrierQuarantine(t *testing.T
 	}
 	q := batch.Quarantined[0]
 	if q.Reason != sessionshim.QuarantineAuthoritativeSnapshotUnsupported || !q.ConsumesCapacity ||
-		q.ProtocolMin != 1 || q.ProtocolMax != 1 || q.Phase != shimwire.PhaseRunning || q.Detail != "" {
+		q.ControllerGeneration != 5 || q.ProtocolMin != 1 || q.ProtocolMax != 1 ||
+		q.Phase != shimwire.PhaseRunning || q.Detail != "" {
 		t.Fatalf("v1 carrier quarantine = %+v", q)
 	}
 	if d.SessionShimOccupancy() != 1 || len(d.AdoptedSessionShims()) != 1 || len(d.QuarantinedSessions()) != 0 {

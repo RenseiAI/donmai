@@ -821,7 +821,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// the platform populates the worker_hosts host-info columns. All
 			// fields degrade to empty on an unsupported platform; gathering
 			// never crashes registration.
-			HostInfo: GatherHostInfo(d.EffectiveVersion(), d.StartedAt()),
+			HostInfo:            GatherHostInfo(d.EffectiveVersion(), d.StartedAt()),
+			ValidateCredentials: d.validateControllerCredentials,
 		}
 		var err error
 		regResp, err = Register(ctx, regOpts)
@@ -832,9 +833,6 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.workerID = regResp.WorkerID
 		d.jwt = regResp.RuntimeToken
 		d.mu.Unlock()
-		if err := d.validateControllerAlias(regResp.WorkerID, "worker registration id"); err != nil {
-			return err
-		}
 	}
 
 	// Spawner — built before heartbeat/poll so the poll loop has a target for
@@ -939,7 +937,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			WorkerID:     regResp.WorkerID,
 			RuntimeJWT:   regResp.RuntimeToken,
 			ValidateRefresh: func(result *RefreshTokenResult) error {
-				return d.validateControllerAlias(result.WorkerID, "worker registration id")
+				return d.validateControllerCredentials(result.WorkerID, result.RuntimeToken)
 			},
 			OnRefreshed: func(result *RefreshTokenResult) {
 				// Capture the identity being superseded under the same lock that
