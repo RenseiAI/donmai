@@ -243,7 +243,11 @@ func TestSelectedV2IgnoresCorruptDurableAckSidecar(t *testing.T) {
 		t.Fatal(err)
 	}
 	ackPath := registry.Dir() + "/" + durableAckName(id, record.ShimID, record.ProcessEpoch)
-	if err := os.WriteFile(ackPath, []byte("not-json"), 0o644); err != nil {
+	if err := os.WriteFile(ackPath, []byte("not-json"), RecordFileMode); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:gosec // Deliberately widen the corrupt v3-only sidecar; selected v2 must ignore it.
+	if err := os.Chmod(ackPath, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	result, err := Adopt(context.Background(), AdoptOptions{Registry: registry, ControllerID: "controller-v2-corrupt-ack"})
@@ -277,6 +281,7 @@ func TestSelectedV3RefusesNonExactAckModesAndAheadGeneration(t *testing.T) {
 		{
 			name: "directory mode",
 			mutate: func(fixture *inProcessV3Fixture, _ Record, _ string) {
+				//nolint:gosec // Deliberately make the directory non-exact for the refusal control.
 				if err := os.Chmod(fixture.shim.registry.Dir(), 0o500); err != nil {
 					t.Fatal(err)
 				}
