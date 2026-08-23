@@ -145,7 +145,7 @@ const (
 	queryListProjects = `query ListProjects($filter: ProjectFilter, $after: String) {
 	  projects(filter: $filter, first: 25, after: $after) {
 	    nodes {
-	      id name state
+	      id name slugId state
 	      teams(first: 100) {
 	        nodes { id key name }
 	        pageInfo { hasNextPage endCursor }
@@ -968,7 +968,11 @@ func catalogProject(node *projectNode, index int, selectedTeamKey string) (Proje
 	if selectedTeamKey != "" && len(teamKeys) == 0 {
 		return Project{}, fmt.Errorf("project %q is missing selected team %q", id, selectedTeamKey)
 	}
-	return Project{ID: id, Name: name, State: state, TeamKeys: teamKeys}, nil
+	project := Project{ID: id, Name: name, State: state, TeamKeys: teamKeys}
+	if node.SlugID != nil {
+		project.SlugID = strings.TrimSpace(*node.SlugID)
+	}
+	return project, nil
 }
 
 // ListTeams returns every accessible team. The result is paginated so callers
@@ -1115,22 +1119,31 @@ func (c *Client) GetTeamByName(ctx context.Context, nameOrKeyOrID string) (*Team
 	return &team, nil
 }
 
-// GetProjectByName returns the project with the given name
-// (case-insensitive). It is a thin wrapper over GetProjectByNameInTeam
-// with no team disambiguation.
-func (c *Client) GetProjectByName(ctx context.Context, name string) (*Project, error) {
-	return c.GetProjectByNameInTeam(ctx, name, "")
+// GetProjectByName resolves a project by display name or slug
+// (case-insensitive), or by canonical UUID. It is a thin wrapper over
+// GetProjectByNameInTeam with no team disambiguation.
+func (c *Client) GetProjectByName(ctx context.Context, ref string) (*Project, error) {
+	return c.GetProjectByNameInTeam(ctx, ref, "")
 }
 
-// GetProjectByNameInTeam returns the project with the given name
-// (case-insensitive), optionally scoped to a team to disambiguate
-// same-named projects across teams. teamID may be a team UUID or a
-// team key/name (resolved to an id first); empty disables the team
-// filter and the resolver behaves like GetProjectByName.
-func (c *Client) GetProjectByNameInTeam(ctx context.Context, name, teamID string) (*Project, error) {
-	filter := map[string]any{
-		"name": map[string]any{"eqIgnoreCase": name},
+// GetProjectByNameInTeam resolves a project reference, optionally scoped to a
+// team to disambiguate workspace-wide duplicate names. teamID may be a team
+// UUID or a team key/name (resolved to an id first); empty disables the team
+// filter. More than one exact name/slug match fails loud rather than selecting
+// an arbitrary project.
+func (c *Client) GetProjectByNameInTeam(ctx context.Context, ref, teamID string) (*Project, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return nil, fmt.Errorf("%w: project reference is empty", ErrNotFound)
 	}
+	or := []map[string]any{
+		{"name": map[string]any{"eqIgnoreCase": ref}},
+		{"slugId": map[string]any{"eqIgnoreCase": ref}},
+	}
+	if looksLikeID(ref) {
+		or = append(or, map[string]any{"id": map[string]any{"eq": ref}})
+	}
+	filter := map[string]any{"or": or}
 	if teamID != "" {
 		resolvedTeamID := teamID
 		// A key/name (non-UUID) must be resolved to an id before it can
@@ -1161,7 +1174,10 @@ func (c *Client) GetProjectByNameInTeam(ctx context.Context, name, teamID string
 		return nil, fmt.Errorf("incomplete projects response: projects nodes are missing")
 	}
 	if len(*data.Projects.Nodes) == 0 {
-		return nil, fmt.Errorf("%w: project %q", ErrNotFound, name)
+		return nil, fmt.Errorf("%w: project %q", ErrNotFound, ref)
+	}
+	if len(*data.Projects.Nodes) > 1 || (data.Projects.PageInfo != nil && data.Projects.PageInfo.HasNextPage != nil && *data.Projects.PageInfo.HasNextPage) {
+		return nil, fmt.Errorf("project %q is ambiguous within the selected team; use its unique slug or UUID", ref)
 	}
 	n := (*data.Projects.Nodes)[0]
 	if n == nil {
@@ -1175,7 +1191,11 @@ func (c *Client) GetProjectByNameInTeam(ctx context.Context, name, teamID string
 	if err != nil {
 		return nil, fmt.Errorf("incomplete projects response: %w", err)
 	}
-	return &Project{ID: id, Name: projectName}, nil
+	project := &Project{ID: id, Name: projectName}
+	if n.SlugID != nil {
+		project.SlugID = strings.TrimSpace(*n.SlugID)
+	}
+	return project, nil
 }
 
 // GetUserByNameOrEmail returns the user matching the given name or email.
@@ -1259,6 +1279,9 @@ func (c *Client) UpdateIssue(ctx context.Context, id string, input UpdateIssueIn
 	}
 	if input.StateID != "" {
 		inp["stateId"] = input.StateID
+	}
+	if input.ProjectID != "" {
+		inp["projectId"] = input.ProjectID
 	}
 	if input.LabelIDs != nil {
 		inp["labelIds"] = input.LabelIDs
