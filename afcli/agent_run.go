@@ -1026,15 +1026,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID {
 			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
 		}
-		if d.Repository != admitted.Repository {
-			if admitted.Repository != "" || admitted.ProjectName == "" || d.ProjectName != admitted.ProjectName || d.Repository == "" || admitted.RepositoryDeclaration != nil {
-				return runner.QueuedWork{}, errors.New("operational payload repository differs from compatibility mirror without an exact legacy project-name resolution")
-			}
-			// Legacy project-name-only dispatch resolves its clone URL against the
-			// daemon allowlist after the immutable operational payload was frozen.
-			// Preserve that host-local resolution only through the exact project-name
-			// equality above; the receipted payload bytes and their digest stay intact.
-			admitted.Repository = d.Repository
+		if err := applyResolvedRepositoryCompatibility(d, &admitted); err != nil {
+			return runner.QueuedWork{}, err
 		}
 		qw = admitted
 		qw.AdmissionReceipt = bytes.Clone(d.AdmissionReceipt)
@@ -1121,6 +1114,50 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		}
 	}
 	return qw, nil
+}
+
+func applyResolvedRepositoryCompatibility(d *daemon.SessionDetail, admitted *runner.QueuedWork) error {
+	if d.Repository == admitted.Repository {
+		return nil
+	}
+	deny := func() error {
+		return errors.New("operational payload repository differs from compatibility mirror without an exact authoritative project/resource resolution")
+	}
+	if admitted.Repository != "" || d.Repository == "" || admitted.RepositoryDeclaration != nil {
+		return deny()
+	}
+	var identity struct {
+		ProjectID          string `json:"projectId,omitempty"`
+		RepositoryID       string `json:"repositoryId,omitempty"`
+		ProjectName        string `json:"projectName,omitempty"`
+		Repository         string `json:"repository,omitempty"`
+		RequiresRepository bool   `json:"requiresRepository,omitempty"`
+	}
+	if err := json.Unmarshal(d.OperationalPayload, &identity); err != nil || identity.Repository != admitted.Repository {
+		return deny()
+	}
+	authorized := false
+	switch {
+	case identity.ProjectID == "" && identity.RepositoryID == "" && !identity.RequiresRepository:
+		// Legacy project-name-only dispatch. Its exact project selector must
+		// survive unchanged across the immutable payload and daemon mirror.
+		authorized = identity.ProjectName != "" && identity.ProjectName == admitted.ProjectName && identity.ProjectName == d.ProjectName
+	case identity.ProjectID != "" && identity.RepositoryID != "":
+		// Explicit repository-resource dispatch. Both authoritative identities
+		// must equal the daemon's allowlist resolution keys.
+		authorized = identity.ProjectID == d.ProjectID && identity.RepositoryID == d.RepositoryID
+	case identity.ProjectID != "" && identity.RepositoryID == "" && identity.RequiresRepository:
+		// Project-primary dispatch. Absence of a repository id is significant:
+		// neither the payload nor compatibility mirror may invent one.
+		authorized = identity.ProjectID == d.ProjectID && d.RepositoryID == ""
+	}
+	if !authorized {
+		return deny()
+	}
+	// Preserve the host-local allowlist result without changing the receipted
+	// operational payload bytes or their digest.
+	admitted.Repository = d.Repository
+	return nil
 }
 
 // providerConfigWithContextWindow bridges the resolvedProfile's top-level
