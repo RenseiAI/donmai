@@ -98,7 +98,7 @@ func TestSpawnerHandlePublishesNestedRootAndSelectedRepositoryCWD(t *testing.T) 
 	if err := workarea.WriteDeclaration(t.Context(), workarea.RootPath(handle.WorkareaRoot), record); err != nil {
 		t.Fatal(err)
 	}
-	workareas := spawner.ActiveWorkareas()
+	workareas := spawner.ActiveWorkareasV1()
 	if len(workareas) != 1 || workareas[0].WorkareaRoot != handle.WorkareaRoot || workareas[0].RepositoryWorktreePath != handle.WorktreePath || workareas[0].SizeBytes < int64(len("mutable")+len("context")) {
 		t.Fatalf("active workarea root projection = %#v", workareas)
 	}

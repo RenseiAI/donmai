@@ -46,19 +46,10 @@ type WorkareaSummary struct {
 	Status     WorkareaPoolStatus `json:"status"`
 	Ref        string             `json:"ref,omitempty"`
 	Repository string             `json:"repository,omitempty"`
-	// WorkareaRoot is the additive session-owned lifecycle root.
-	WorkareaRoot string `json:"workareaRoot,omitempty"`
-	// RepositoryWorktreePath is the selected repository CWD. Legacy Path and
-	// worktreePath spellings retain this meaning.
-	RepositoryWorktreePath string               `json:"repositoryWorktreePath,omitempty"`
-	Repositories           []WorkareaRepository `json:"repositories,omitempty"`
-
-	// SizeBytes is fail-closed physical storage for either a live root or an
-	// archive. Older daemons populated it only for archives.
-	SizeBytes int64 `json:"sizeBytes,omitempty"`
 
 	// Archive-only fields. Populated when Kind == WorkareaKindArchived.
 	CreatedAt      *time.Time `json:"createdAt,omitempty"`
+	SizeBytes      int64      `json:"sizeBytes,omitempty"`
 	SourceProvider string     `json:"sourceProvider,omitempty"`
 	Disposition    string     `json:"disposition,omitempty"`
 
@@ -72,6 +63,78 @@ type WorkareaSummary struct {
 // GET /api/daemon/workareas/<id> (inspect endpoint). Fields match the
 // Workarea interface in 003-workarea-provider.md.
 type Workarea struct {
+	ID                 string             `json:"id"`
+	Kind               WorkareaKind       `json:"kind"`
+	ProviderID         string             `json:"providerId"`
+	SessionID          string             `json:"sessionId,omitempty"`
+	ProjectID          string             `json:"projectId,omitempty"`
+	Status             WorkareaPoolStatus `json:"status"`
+	Path               string             `json:"path,omitempty"`
+	Ref                string             `json:"ref,omitempty"`
+	Repository         string             `json:"repository,omitempty"`
+	CleanStateChecksum string             `json:"cleanStateChecksum,omitempty"`
+	Toolchain          map[string]string  `json:"toolchain,omitempty"`
+	Mode               string             `json:"mode,omitempty"`        // "exclusive" | "shared"
+	AcquirePath        string             `json:"acquirePath,omitempty"` // "pool-warm" | "pool-fresh" | "cold"
+	AcquiredAt         *time.Time         `json:"acquiredAt,omitempty"`
+	ReleasedAt         *time.Time         `json:"releasedAt,omitempty"`
+	ArchiveLocation    string             `json:"archiveLocation,omitempty"`
+	OwnerSession       string             `json:"ownerSession,omitempty"`
+
+	// Manifest is the captured per-archive manifest for archived
+	// workareas (kind = "archived"). Free-form JSON keyed by archive
+	// version; consumers display rather than enforce shape.
+	Manifest map[string]any `json:"manifest,omitempty"`
+}
+
+// WorkareaSummaryV1 is the additive session-root-v1 list projection. The
+// original WorkareaSummary layout remains frozen for source compatibility with
+// downstream unkeyed literals; new consumers opt into this versioned type.
+type WorkareaSummaryV1 struct {
+	ID                     string               `json:"id"`
+	Kind                   WorkareaKind         `json:"kind"`
+	ProviderID             string               `json:"providerId"`
+	SessionID              string               `json:"sessionId,omitempty"`
+	ProjectID              string               `json:"projectId,omitempty"`
+	Status                 WorkareaPoolStatus   `json:"status"`
+	Ref                    string               `json:"ref,omitempty"`
+	Repository             string               `json:"repository,omitempty"`
+	WorkareaRoot           string               `json:"workareaRoot,omitempty"`
+	RepositoryWorktreePath string               `json:"repositoryWorktreePath,omitempty"`
+	Repositories           []WorkareaRepository `json:"repositories,omitempty"`
+	CreatedAt              *time.Time           `json:"createdAt,omitempty"`
+	SizeBytes              int64                `json:"sizeBytes,omitempty"`
+	SourceProvider         string               `json:"sourceProvider,omitempty"`
+	Disposition            string               `json:"disposition,omitempty"`
+	AcquiredAt             *time.Time           `json:"acquiredAt,omitempty"`
+	ReleasedAt             *time.Time           `json:"releasedAt,omitempty"`
+	AgeSeconds             int64                `json:"ageSeconds,omitempty"`
+}
+
+// Legacy projects the versioned summary onto the frozen public shape.
+func (w WorkareaSummaryV1) Legacy() WorkareaSummary {
+	return WorkareaSummary{
+		ID: w.ID, Kind: w.Kind, ProviderID: w.ProviderID, SessionID: w.SessionID,
+		ProjectID: w.ProjectID, Status: w.Status, Ref: w.Ref, Repository: w.Repository,
+		CreatedAt: w.CreatedAt, SizeBytes: w.SizeBytes, SourceProvider: w.SourceProvider,
+		Disposition: w.Disposition, AcquiredAt: w.AcquiredAt, ReleasedAt: w.ReleasedAt,
+		AgeSeconds: w.AgeSeconds,
+	}
+}
+
+// UpgradeWorkareaSummaryV1 lifts one legacy summary into the additive shape.
+func UpgradeWorkareaSummaryV1(w WorkareaSummary) WorkareaSummaryV1 {
+	return WorkareaSummaryV1{
+		ID: w.ID, Kind: w.Kind, ProviderID: w.ProviderID, SessionID: w.SessionID,
+		ProjectID: w.ProjectID, Status: w.Status, Ref: w.Ref, Repository: w.Repository,
+		CreatedAt: w.CreatedAt, SizeBytes: w.SizeBytes, SourceProvider: w.SourceProvider,
+		Disposition: w.Disposition, AcquiredAt: w.AcquiredAt, ReleasedAt: w.ReleasedAt,
+		AgeSeconds: w.AgeSeconds,
+	}
+}
+
+// WorkareaV1 is the additive session-root-v1 inspect/restore projection.
+type WorkareaV1 struct {
 	ID                     string               `json:"id"`
 	Kind                   WorkareaKind         `json:"kind"`
 	ProviderID             string               `json:"providerId"`
@@ -86,17 +149,37 @@ type Workarea struct {
 	Repository             string               `json:"repository,omitempty"`
 	CleanStateChecksum     string               `json:"cleanStateChecksum,omitempty"`
 	Toolchain              map[string]string    `json:"toolchain,omitempty"`
-	Mode                   string               `json:"mode,omitempty"`        // "exclusive" | "shared"
-	AcquirePath            string               `json:"acquirePath,omitempty"` // "pool-warm" | "pool-fresh" | "cold"
+	Mode                   string               `json:"mode,omitempty"`
+	AcquirePath            string               `json:"acquirePath,omitempty"`
 	AcquiredAt             *time.Time           `json:"acquiredAt,omitempty"`
 	ReleasedAt             *time.Time           `json:"releasedAt,omitempty"`
 	ArchiveLocation        string               `json:"archiveLocation,omitempty"`
 	OwnerSession           string               `json:"ownerSession,omitempty"`
+	Manifest               map[string]any       `json:"manifest,omitempty"`
+}
 
-	// Manifest is the captured per-archive manifest for archived
-	// workareas (kind = "archived"). Free-form JSON keyed by archive
-	// version; consumers display rather than enforce shape.
-	Manifest map[string]any `json:"manifest,omitempty"`
+// Legacy projects the versioned workarea onto the frozen public shape.
+func (w WorkareaV1) Legacy() Workarea {
+	return Workarea{
+		ID: w.ID, Kind: w.Kind, ProviderID: w.ProviderID, SessionID: w.SessionID,
+		ProjectID: w.ProjectID, Status: w.Status, Path: w.Path, Ref: w.Ref,
+		Repository: w.Repository, CleanStateChecksum: w.CleanStateChecksum,
+		Toolchain: w.Toolchain, Mode: w.Mode, AcquirePath: w.AcquirePath,
+		AcquiredAt: w.AcquiredAt, ReleasedAt: w.ReleasedAt,
+		ArchiveLocation: w.ArchiveLocation, OwnerSession: w.OwnerSession, Manifest: w.Manifest,
+	}
+}
+
+// UpgradeWorkareaV1 lifts one legacy workarea into the additive shape.
+func UpgradeWorkareaV1(w Workarea) WorkareaV1 {
+	return WorkareaV1{
+		ID: w.ID, Kind: w.Kind, ProviderID: w.ProviderID, SessionID: w.SessionID,
+		ProjectID: w.ProjectID, Status: w.Status, Path: w.Path, Ref: w.Ref,
+		Repository: w.Repository, CleanStateChecksum: w.CleanStateChecksum,
+		Toolchain: w.Toolchain, Mode: w.Mode, AcquirePath: w.AcquirePath,
+		AcquiredAt: w.AcquiredAt, ReleasedAt: w.ReleasedAt,
+		ArchiveLocation: w.ArchiveLocation, OwnerSession: w.OwnerSession, Manifest: w.Manifest,
+	}
 }
 
 // WorkareaRepository is the secret-free per-leaf operator projection.
@@ -120,10 +203,22 @@ type ListWorkareasResponse struct {
 	Archived []WorkareaSummary `json:"archived"`
 }
 
+// ListWorkareasV1Response carries additive session-root-v1 metadata while the
+// original response type remains source-compatible.
+type ListWorkareasV1Response struct {
+	Active   []WorkareaSummaryV1 `json:"active"`
+	Archived []WorkareaSummaryV1 `json:"archived"`
+}
+
 // WorkareaEnvelope wraps a single Workarea returned by
 // GET /api/daemon/workareas/<id>.
 type WorkareaEnvelope struct {
 	Workarea Workarea `json:"workarea"`
+}
+
+// WorkareaV1Envelope is the versioned inspect response.
+type WorkareaV1Envelope struct {
+	Workarea WorkareaV1 `json:"workarea"`
 }
 
 // WorkareaRestoreRequest is the body for
@@ -143,6 +238,11 @@ type WorkareaRestoreRequest struct {
 // from the archive id (archives are immutable per ADR D4a).
 type WorkareaRestoreResult struct {
 	Workarea Workarea `json:"workarea"`
+}
+
+// WorkareaRestoreV1Result is the versioned restore response.
+type WorkareaRestoreV1Result struct {
+	Workarea WorkareaV1 `json:"workarea"`
 }
 
 // WorkareaDiffStatus is the per-entry change classification.

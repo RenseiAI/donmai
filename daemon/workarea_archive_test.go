@@ -780,7 +780,7 @@ func TestWorkareaArchiveRegistryArchivesAndRestoresWholeDeclaredRoot(t *testing.
 	if archivedSource == nil || archivedHardlink == nil || !os.SameFile(archivedSource, archivedHardlink) {
 		t.Fatal("archive did not preserve hardlink identity")
 	}
-	archived, err := registry.Get("wa_archive_root")
+	archived, err := registry.GetV1("wa_archive_root")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,7 +818,7 @@ func TestWorkareaArchiveRegistryArchivesAndRestoresWholeDeclaredRoot(t *testing.
 	if err := os.WriteFile(manifestPath, validBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	restored, _, err := registry.Restore("wa_archive_root", afclient.WorkareaRestoreRequest{IntoSessionID: "archive-session"})
+	restored, _, err := registry.RestoreV1("wa_archive_root", afclient.WorkareaRestoreRequest{IntoSessionID: "archive-session"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -889,7 +889,7 @@ func TestWorkareaArchiveRegistryPreservesLegacyFlatArchiveCompatibility(t *testi
 	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
 		t.Fatalf("idempotent legacy archive retry: %v", err)
 	}
-	restored, _, err := registry.Restore("wa_flat_archive", afclient.WorkareaRestoreRequest{IntoSessionID: "legacy-restored"})
+	restored, _, err := registry.RestoreV1("wa_flat_archive", afclient.WorkareaRestoreRequest{IntoSessionID: "legacy-restored"})
 	if err != nil {
 		t.Fatal(err)
 	}

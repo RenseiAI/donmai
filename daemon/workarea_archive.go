@@ -140,11 +140,23 @@ type ActiveWorkareaProvider interface {
 	ActiveWorkareas() []afclient.WorkareaSummary
 }
 
+// ActiveWorkareaProviderV1 exposes additive session-root-v1 layout metadata.
+// The original interface remains valid for existing embedders.
+type ActiveWorkareaProviderV1 interface {
+	ActiveWorkareasV1() []afclient.WorkareaSummaryV1
+}
+
 // StrictActiveWorkareaProvider is the additive fail-closed accounting surface.
 // Production providers implement it; the legacy interface remains source
 // compatible for embedders whose projections cannot fail.
 type StrictActiveWorkareaProvider interface {
 	ActiveWorkareasStrict() ([]afclient.WorkareaSummary, error)
+}
+
+// StrictActiveWorkareaProviderV1 is the fail-closed versioned projection used
+// by production accounting.
+type StrictActiveWorkareaProviderV1 interface {
+	ActiveWorkareasStrictV1() ([]afclient.WorkareaSummaryV1, error)
 }
 
 // PoolCapacityGuard tells Restore whether a fresh pool member can be
@@ -409,52 +421,88 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 // empty root is NOT an error — the response is just (empty active +
 // empty archived).
 func (r *WorkareaArchiveRegistry) List() (active, archived []afclient.WorkareaSummary, err error) {
+	activeV1, archivedV1, err := r.ListV1()
+	if err != nil {
+		return nil, nil, err
+	}
+	active = make([]afclient.WorkareaSummary, len(activeV1))
+	for index := range activeV1 {
+		active[index] = activeV1[index].Legacy()
+	}
+	archived = make([]afclient.WorkareaSummary, len(archivedV1))
+	for index := range archivedV1 {
+		archived[index] = archivedV1[index].Legacy()
+	}
+	return active, archived, nil
+}
+
+// ListV1 returns additive session-root-v1 layout metadata.
+func (r *WorkareaArchiveRegistry) ListV1() (active, archived []afclient.WorkareaSummaryV1, err error) {
 	if r.activeProvider != nil {
-		active, err = r.activeWorkareas()
+		active, err = r.activeWorkareasV1()
 		if err != nil {
 			return nil, nil, err
 		}
 	}
-	archived, err = r.listArchives()
+	archived, err = r.listArchivesV1()
 	if err != nil {
 		return active, nil, err
 	}
 	return active, archived, nil
 }
 
-func (r *WorkareaArchiveRegistry) activeWorkareas() ([]afclient.WorkareaSummary, error) {
+func (r *WorkareaArchiveRegistry) activeWorkareasV1() ([]afclient.WorkareaSummaryV1, error) {
 	if r.activeProvider == nil {
 		return nil, nil
 	}
-	if strict, ok := r.activeProvider.(StrictActiveWorkareaProvider); ok {
-		return strict.ActiveWorkareasStrict()
+	if strict, ok := r.activeProvider.(StrictActiveWorkareaProviderV1); ok {
+		return strict.ActiveWorkareasStrictV1()
 	}
-	return r.activeProvider.ActiveWorkareas(), nil
+	if provider, ok := r.activeProvider.(ActiveWorkareaProviderV1); ok {
+		return provider.ActiveWorkareasV1(), nil
+	}
+	if strict, ok := r.activeProvider.(StrictActiveWorkareaProvider); ok {
+		legacy, err := strict.ActiveWorkareasStrict()
+		if err != nil {
+			return nil, err
+		}
+		versioned := make([]afclient.WorkareaSummaryV1, len(legacy))
+		for index := range legacy {
+			versioned[index] = afclient.UpgradeWorkareaSummaryV1(legacy[index])
+		}
+		return versioned, nil
+	}
+	legacy := r.activeProvider.ActiveWorkareas()
+	versioned := make([]afclient.WorkareaSummaryV1, len(legacy))
+	for index := range legacy {
+		versioned[index] = afclient.UpgradeWorkareaSummaryV1(legacy[index])
+	}
+	return versioned, nil
 }
 
 // listArchives scans the archive root non-recursively for direct
 // children that contain a readable manifest.json. Subdirectories without
 // a manifest are skipped (not errored) so future-proofing scratch
 // directories don't break the listing.
-func (r *WorkareaArchiveRegistry) listArchives() ([]afclient.WorkareaSummary, error) {
+func (r *WorkareaArchiveRegistry) listArchivesV1() ([]afclient.WorkareaSummaryV1, error) {
 	entries, err := os.ReadDir(r.root)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return []afclient.WorkareaSummary{}, nil
+			return []afclient.WorkareaSummaryV1{}, nil
 		}
 		return nil, fmt.Errorf("read archive root %q: %w", r.root, err)
 	}
-	out := make([]afclient.WorkareaSummary, 0, len(entries))
+	out := make([]afclient.WorkareaSummaryV1, 0, len(entries))
 	for _, ent := range entries {
 		if !ent.IsDir() {
 			continue
 		}
-		summary, ok, err := r.summaryFor(ent.Name())
+		summary, ok, err := r.summaryForV1(ent.Name())
 		if err != nil {
 			// Corrupted manifest: surface as an entry with the disposition
 			// flag so operators can see + clean up, rather than dropping
 			// the row silently.
-			out = append(out, afclient.WorkareaSummary{
+			out = append(out, afclient.WorkareaSummaryV1{
 				ID:          ent.Name(),
 				Kind:        afclient.WorkareaKindArchived,
 				Status:      afclient.WorkareaStatusArchived,
@@ -475,6 +523,16 @@ func (r *WorkareaArchiveRegistry) listArchives() ([]afclient.WorkareaSummary, er
 // Kind field is set to WorkareaKindArchived. Returns ErrArchiveNotFound
 // when the id is absent.
 func (r *WorkareaArchiveRegistry) Get(id string) (*afclient.Workarea, error) {
+	versioned, err := r.GetV1(id)
+	if err != nil {
+		return nil, err
+	}
+	legacy := versioned.Legacy()
+	return &legacy, nil
+}
+
+// GetV1 returns additive session-root-v1 layout metadata.
+func (r *WorkareaArchiveRegistry) GetV1(id string) (*afclient.WorkareaV1, error) {
 	if err := requireValidArchiveID("get archive", id); err != nil {
 		return nil, err
 	}
@@ -482,7 +540,7 @@ func (r *WorkareaArchiveRegistry) Get(id string) (*afclient.Workarea, error) {
 	if err != nil {
 		return nil, err
 	}
-	wa := manifestToWorkarea(id, manifest, r.treeDir(id))
+	wa := manifestToWorkareaV1(id, manifest, r.treeDir(id))
 	return &wa, nil
 }
 
@@ -619,6 +677,19 @@ func (r *WorkareaArchiveRegistry) Restore(
 	archiveID string,
 	req afclient.WorkareaRestoreRequest,
 ) (*afclient.Workarea, time.Duration, error) {
+	versioned, retryAfter, err := r.RestoreV1(archiveID, req)
+	if err != nil {
+		return nil, retryAfter, err
+	}
+	legacy := versioned.Legacy()
+	return &legacy, retryAfter, nil
+}
+
+// RestoreV1 restores an archive with additive session-root-v1 metadata.
+func (r *WorkareaArchiveRegistry) RestoreV1(
+	archiveID string,
+	req afclient.WorkareaRestoreRequest,
+) (*afclient.WorkareaV1, time.Duration, error) {
 	if err := requireValidArchiveID("restore", archiveID); err != nil {
 		return nil, 0, err
 	}
@@ -721,7 +792,7 @@ func (r *WorkareaArchiveRegistry) Restore(
 		_ = os.WriteFile(sidecarPath, data, 0o600) //nolint:gosec
 	}
 
-	wa := manifestToWorkarea(archiveID, manifest, dest)
+	wa := manifestToWorkareaV1(archiveID, manifest, dest)
 	wa.ID = newID
 	wa.Kind = afclient.WorkareaKindActive
 	wa.Status = afclient.WorkareaStatusReady
@@ -736,7 +807,7 @@ func (r *WorkareaArchiveRegistry) Restore(
 	return &wa, 0, nil
 }
 
-func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, manifest *archiveManifest) (*afclient.Workarea, error) {
+func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, manifest *archiveManifest) (*afclient.WorkareaV1, error) {
 	if manifest.AcquisitionID == "" || manifest.WorkareaID == "" || manifest.SessionID == "" || manifest.StoreID == "" || manifest.TreeDigest == "" {
 		return nil, fmt.Errorf("restore: incomplete session-root archive identity: %w", ErrArchiveCorrupted)
 	}
@@ -794,7 +865,7 @@ func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, ma
 	}); err != nil {
 		return nil, fmt.Errorf("restore: re-enter acquisition authority: %w", err)
 	}
-	wa := manifestToWorkarea(archiveID, manifest, restored.FinalRoot)
+	wa := manifestToWorkareaV1(archiveID, manifest, restored.FinalRoot)
 	wa.ID = manifest.WorkareaID
 	wa.Kind = afclient.WorkareaKindActive
 	wa.Status = afclient.WorkareaStatusReady
@@ -857,21 +928,21 @@ func (r *WorkareaArchiveRegistry) restoredDir() string {
 // summaryFor reads an archive's manifest and returns the wire-level
 // summary. Returns (zero, false, nil) when the directory exists but
 // lacks a manifest — that's a normal "skip me" signal, not an error.
-func (r *WorkareaArchiveRegistry) summaryFor(id string) (afclient.WorkareaSummary, bool, error) {
+func (r *WorkareaArchiveRegistry) summaryForV1(id string) (afclient.WorkareaSummaryV1, bool, error) {
 	manifestPath := filepath.Join(r.archiveDir(id), "manifest.json")
 	info, err := os.Stat(manifestPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return afclient.WorkareaSummary{}, false, nil
+			return afclient.WorkareaSummaryV1{}, false, nil
 		}
-		return afclient.WorkareaSummary{}, false, fmt.Errorf("stat manifest: %w", err)
+		return afclient.WorkareaSummaryV1{}, false, fmt.Errorf("stat manifest: %w", err)
 	}
 	if info.IsDir() {
-		return afclient.WorkareaSummary{}, false, fmt.Errorf("manifest is a directory: %w", ErrArchiveCorrupted)
+		return afclient.WorkareaSummaryV1{}, false, fmt.Errorf("manifest is a directory: %w", ErrArchiveCorrupted)
 	}
 	manifest, err := r.readManifest(id)
 	if err != nil {
-		return afclient.WorkareaSummary{}, false, err
+		return afclient.WorkareaSummaryV1{}, false, err
 	}
 	created, _ := parseRFC3339(manifest.CreatedAt)
 	repositoryPath := ""
@@ -887,7 +958,7 @@ func (r *WorkareaArchiveRegistry) summaryFor(id string) (afclient.WorkareaSummar
 			repositories[index].Path = filepath.Join(workareaRoot, repositories[index].Leaf)
 		}
 	}
-	return afclient.WorkareaSummary{
+	return afclient.WorkareaSummaryV1{
 		ID:             firstNonEmptyStr(manifest.ID, id),
 		Kind:           afclient.WorkareaKindArchived,
 		ProviderID:     manifest.ProviderID,
@@ -1416,7 +1487,7 @@ func parseRFC3339(s string) (*time.Time, bool) {
 
 // manifestToWorkarea builds the wire-level Workarea record for an
 // archive. The base path is the archive's tree root.
-func manifestToWorkarea(id string, m *archiveManifest, treePath string) afclient.Workarea {
+func manifestToWorkareaV1(id string, m *archiveManifest, treePath string) afclient.WorkareaV1 {
 	var manifestExtra map[string]any
 	if m.Extra != nil {
 		manifestExtra = m.Extra
@@ -1436,7 +1507,7 @@ func manifestToWorkarea(id string, m *archiveManifest, treePath string) afclient
 			repositories[index].Path = filepath.Join(treePath, repositories[index].Leaf)
 		}
 	}
-	return afclient.Workarea{
+	return afclient.WorkareaV1{
 		ID:                     firstNonEmptyStr(m.ID, id),
 		Kind:                   afclient.WorkareaKindArchived,
 		ProviderID:             m.ProviderID,

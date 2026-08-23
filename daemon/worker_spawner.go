@@ -385,16 +385,26 @@ func (s *WorkerSpawner) ActiveSessions() []SessionHandle {
 //
 // Output is sorted by SessionID for deterministic test assertions.
 func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
-	out, err := s.ActiveWorkareasStrict()
+	versioned := s.ActiveWorkareasV1()
+	out := make([]afclient.WorkareaSummary, len(versioned))
+	for index := range versioned {
+		out[index] = versioned[index].Legacy()
+	}
+	return out
+}
+
+// ActiveWorkareasV1 returns additive session-root-v1 layout metadata.
+func (s *WorkerSpawner) ActiveWorkareasV1() []afclient.WorkareaSummaryV1 {
+	out, err := s.ActiveWorkareasStrictV1()
 	if err == nil {
 		return out
 	}
 	// Source compatibility for legacy embedders that consumed this errorless
 	// projection before physical accounting existed. The daemon registry uses
-	// ActiveWorkareasStrict and never takes this fallback.
+	// ActiveWorkareasStrictV1 and never takes this fallback.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out = make([]afclient.WorkareaSummary, 0, len(s.sessions))
+	out = make([]afclient.WorkareaSummaryV1, 0, len(s.sessions))
 	for _, session := range s.sessions {
 		project := s.findProjectForSpecLocked(session.spec)
 		if session.spec.ProjectID == "" {
@@ -404,7 +414,7 @@ func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
 		if project != nil {
 			projectID = project.ID
 		}
-		summary := afclient.WorkareaSummary{
+		summary := afclient.WorkareaSummaryV1{
 			ID: session.spec.SessionID, Kind: afclient.WorkareaKindActive, Status: afclient.WorkareaStatusReady,
 			Repository: session.spec.Repository, Ref: session.spec.Ref, SessionID: session.spec.SessionID, ProjectID: projectID,
 			WorkareaRoot: session.handle.WorkareaRoot, RepositoryWorktreePath: session.handle.WorktreePath,
@@ -418,11 +428,24 @@ func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
 	return out
 }
 
-// ActiveWorkareasStrict projects complete root ownership and fails closed when
-// any live root cannot be declared or physically accounted. Shared participants
-// collapse onto their one declaration WorkareaID so one allocation is charged
-// once.
+// ActiveWorkareasStrict preserves the original source-compatible projection.
 func (s *WorkerSpawner) ActiveWorkareasStrict() ([]afclient.WorkareaSummary, error) {
+	versioned, err := s.ActiveWorkareasStrictV1()
+	if err != nil {
+		return nil, err
+	}
+	legacy := make([]afclient.WorkareaSummary, len(versioned))
+	for index := range versioned {
+		legacy[index] = versioned[index].Legacy()
+	}
+	return legacy, nil
+}
+
+// ActiveWorkareasStrictV1 projects complete root ownership and fails closed
+// when any live root cannot be declared or physically accounted. Shared
+// participants collapse onto their one declaration WorkareaID so one allocation
+// is charged once.
+func (s *WorkerSpawner) ActiveWorkareasStrictV1() ([]afclient.WorkareaSummaryV1, error) {
 	s.mu.Lock()
 	type snapshot struct {
 		handle    SessionHandle
@@ -443,7 +466,7 @@ func (s *WorkerSpawner) ActiveWorkareasStrict() ([]afclient.WorkareaSummary, err
 	}
 	s.mu.Unlock()
 
-	out := make([]afclient.WorkareaSummary, 0, len(snapshots))
+	out := make([]afclient.WorkareaSummaryV1, 0, len(snapshots))
 	seenRoots := make(map[string]struct{})
 	for _, item := range snapshots {
 		root := item.handle.WorkareaRoot
@@ -457,7 +480,7 @@ func (s *WorkerSpawner) ActiveWorkareasStrict() ([]afclient.WorkareaSummary, err
 		if err != nil {
 			return nil, fmt.Errorf("daemon: pin active workarea %q: %w", item.spec.SessionID, err)
 		}
-		summary := afclient.WorkareaSummary{
+		summary := afclient.WorkareaSummaryV1{
 			ID:                     item.spec.SessionID,
 			Kind:                   afclient.WorkareaKindActive,
 			Status:                 afclient.WorkareaStatusReady,

@@ -1026,6 +1026,16 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID {
 			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
 		}
+		if d.Repository != admitted.Repository {
+			if admitted.Repository != "" || admitted.ProjectName == "" || d.ProjectName != admitted.ProjectName || d.Repository == "" || admitted.RepositoryDeclaration != nil {
+				return runner.QueuedWork{}, errors.New("operational payload repository differs from compatibility mirror without an exact legacy project-name resolution")
+			}
+			// Legacy project-name-only dispatch resolves its clone URL against the
+			// daemon allowlist after the immutable operational payload was frozen.
+			// Preserve that host-local resolution only through the exact project-name
+			// equality above; the receipted payload bytes and their digest stay intact.
+			admitted.Repository = d.Repository
+		}
 		qw = admitted
 		qw.AdmissionReceipt = bytes.Clone(d.AdmissionReceipt)
 		qw.ClaimReceipt = bytes.Clone(d.ClaimReceipt)

@@ -552,6 +552,15 @@ func TestHandleWorkareas_List_IncludesSpawnerLivePool(t *testing.T) {
 	if len(body.Archived) != 1 || body.Archived[0].ID != "wa-archived" {
 		t.Errorf("Archived[]: want one entry id=wa-archived, got %+v", body.Archived)
 	}
+	versionedResponse, err := http.Get(hsrv.URL + "/api/daemon/workareas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var versioned afclient.ListWorkareasV1Response
+	decodeBody(t, versionedResponse, &versioned)
+	if len(versioned.Active) != 1 || versioned.Active[0].WorkareaRoot == "" || versioned.Active[0].RepositoryWorktreePath == "" {
+		t.Fatalf("versioned active layout = %+v", versioned.Active)
+	}
 
 	// The live-pool entry's id should be addressable via the per-id
 	// inspect endpoint — the lookupActiveByID short-circuit in
