@@ -46,6 +46,9 @@ version file to bump.
 - GoReleaser v2.17.1 for local dry-runs. The release workflow pins this exact
   version because its verified phase order is part of the signing contract.
 - GitHub CLI authenticated to `RenseiAI/donmai`.
+- A tag-signing key configured for Git (`user.signingkey` and the matching
+  `gpg.format`), with its public key registered as a GitHub signing key.
+  Release tags must be signed, not merely annotated.
 - Repository release secrets:
   - `HOMEBREW_TAP_GITHUB_TOKEN`, with write access to
     `RenseiAI/homebrew-tap`.
@@ -100,20 +103,93 @@ prerelease identifiers such as `-rc.1`. Numeric identifiers cannot contain
 leading zeroes. Build metadata, arbitrary suffixes, trailing dots, mutable
 labels such as `latest`, and branch names are rejected.
 
+### Tag authority and immutability
+
+Every publisher performs a read-only GitHub preflight before any build. It
+requires two independent active repository rulesets for `refs/tags/v*`:
+
+- a creation-only ruleset with one `OrganizationAdmin` `always` bypass; and
+- a no-bypass ruleset containing only deletion, update, and non-fast-forward
+  protection.
+
+The split is load-bearing. The creation bypass identifies who may create a
+release tag, while the second ruleset ensures nobody, including an
+administrator, can later delete or retarget it. An authorized repository
+administrator can apply the reviewed payloads once:
+
+```bash
+gh api --method POST repos/RenseiAI/donmai/rulesets \
+  --header 'Accept: application/vnd.github+json' \
+  --header 'X-GitHub-Api-Version: 2022-11-28' \
+  --input - <<'JSON'
+{
+  "name": "Protect release tag immutability (v*)",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {"include": ["refs/tags/v*"], "exclude": []}
+  },
+  "rules": [
+    {"type": "deletion"},
+    {"type": "update"},
+    {"type": "non_fast_forward"}
+  ]
+}
+JSON
+
+gh api --method POST repos/RenseiAI/donmai/rulesets \
+  --header 'Accept: application/vnd.github+json' \
+  --header 'X-GitHub-Api-Version: 2022-11-28' \
+  --input - <<'JSON'
+{
+  "name": "Authorize release tag creation (v*)",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": null,
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "ref_name": {"include": ["refs/tags/v*"], "exclude": []}
+  },
+  "rules": [{"type": "creation"}]
+}
+JSON
+```
+
+Read back the full server-normalized rules, including bypass actors, without
+changing them:
+
+```bash
+gh api --paginate 'repos/RenseiAI/donmai/rulesets?per_page=100' \
+  --jq '.[] | select(.target == "tag") | .id' |
+while read -r ruleset_id; do
+  gh api "repos/RenseiAI/donmai/rulesets/${ruleset_id}" \
+    --jq '{id,name,source_type,source,target,enforcement,conditions,bypass_actors,rules}'
+done
+```
+
 Always create the tag at an explicit commit SHA, never from an implicit branch
 ref:
 
 ```bash
 tag=vX.Y.Z
 release_sha="$(git rev-parse HEAD)"
-git tag -a "$tag" "$release_sha" -m "$tag"
+git tag -s "$tag" "$release_sha" -m "$tag"
+git tag -v "$tag"
 git show --no-patch --decorate "$tag^{commit}"
 git push origin "refs/tags/$tag"
 ```
 
-The tag push starts the release, worker-image, and E2B workflows. The release
-workflow verifies that its checkout is the commit referenced by the release
-tag. GoReleaser also sends that exact commit through
+The tag push starts the release, worker-image, and E2B workflows. Before any
+build, each workflow verifies both rulesets and GitHub's cryptographic
+verification of the annotated tag object. The release workflow then verifies
+that its checkout is the commit referenced by the release tag. GoReleaser also
+sends that exact commit through
 `release.target_commitish`; it never asks GitHub to target the moving default
 branch. The shared verifier exposes both prerelease status and the rolling-alias
 policy to every publisher. Automatic stable tags advance rolling aliases;
@@ -137,11 +213,13 @@ The `--ref` value selects the workflow definition. Each workflow's required
 `tag` input selects a namespace-qualified, detached checkout of
 `refs/tags/vX.Y.Z`, so a same-name branch cannot win ref resolution. The current
 workflow's verifier, signing script, E2B wrapper, and GoReleaser policy are
-staged outside the workspace before that tag checkout, allowing retries of tags
-that predate the hardening. Before signing, building, or publishing, the shared
-verifier enforces the release-tag grammar, proves detached `HEAD`, and proves
-that `HEAD` equals the tag's peeled commit. The verified tag is exported as
-`GORELEASER_CURRENT_TAG` and is also the only source for published image,
+staged outside the workspace before that tag checkout, allowing retries of
+signed tags that carry older release automation. Before signing, building, or
+publishing, the authority preflight re-reads both rulesets and the signed tag
+from GitHub. The shared checkout verifier then enforces the release-tag grammar,
+proves detached `HEAD`, proves that the tag object contains a signature, and
+proves that `HEAD` equals the tag's peeled commit. The verified tag is exported
+as `GORELEASER_CURRENT_TAG` and is also the only source for published image,
 template, and embedded binary versions.
 
 A manual binary retry sets GoReleaser's supported `release.make_latest` policy
@@ -392,6 +470,9 @@ Run on at least one supported macOS host and one Linux environment:
   published; otherwise issue a new patch version.
 - **Worker image or E2B build failed independently:** rerun its workflow for the
   same existing tag. Do not move the tag to pick up unrelated fixes.
+- **An unsigned or lightweight tag was created:** do not delete, replace, or
+  retarget it. Preserve that evidence, fix the release preparation on `main`,
+  and publish the next patch version as a new signed tag.
 
 For a hotfix, branch from the affected tag, apply the minimal fix, merge the fix
 back to `main`, and release the next normal patch version such as `v0.53.1`.
