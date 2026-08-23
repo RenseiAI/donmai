@@ -21,6 +21,27 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required"
 }
 
+resolve_absolute_executable() {
+  local name=$1
+  local candidate
+  local candidate_dir
+  local candidate_name
+
+  # `type -P` performs a PATH-only lookup, ignoring same-name aliases,
+  # functions, and builtins. Canonicalize the containing directory so Git gets
+  # an absolute file path rather than a bare command name or relative PATH hit.
+  candidate=$(builtin type -P "${name}" 2>/dev/null) || return 1
+  [[ -n "${candidate}" ]] || return 1
+  candidate_dir=${candidate%/*}
+  candidate_name=${candidate##*/}
+  [[ "${candidate_dir}" != "${candidate}" ]] || candidate_dir='.'
+  [[ -n "${candidate_dir}" ]] || candidate_dir='/'
+  candidate_dir=$(builtin cd "${candidate_dir}" && builtin pwd -P) || return 1
+  candidate="${candidate_dir}/${candidate_name}"
+  [[ "${candidate}" == /* && -f "${candidate}" && -r "${candidate}" && -x "${candidate}" ]] || return 1
+  printf '%s\n' "${candidate}"
+}
+
 # Print one canonical OpenSSH public key (type + base64 body, no comment).
 # Reject newlines before parsing so a config value cannot add an allowed-signers
 # entry when the canonical key is written to the temporary trust file.
@@ -37,7 +58,7 @@ canonicalize_public_key() {
   [[ "${key_type}" =~ ^[A-Za-z0-9@._+-]+$ ]] || return 1
   [[ "${key_body}" =~ ^[A-Za-z0-9+/=]+$ ]] || return 1
   printf '%s %s\n' "${key_type}" "${key_body}" |
-    ssh-keygen -lf - -E sha256 >/dev/null 2>&1 || return 1
+    "${ssh_keygen_program}" -lf - -E sha256 >/dev/null 2>&1 || return 1
   printf '%s %s\n' "${key_type}" "${key_body}"
 }
 
@@ -90,7 +111,7 @@ resolve_configured_public_key() {
       return
     fi
   fi
-  candidate=$(ssh-keygen -y -f "${key_path}" </dev/null 2>/dev/null) ||
+  candidate=$("${ssh_keygen_program}" -y -f "${key_path}" </dev/null 2>/dev/null) ||
     die 'could not derive a public key from user.signingkey; provide a readable public key or .pub sidecar'
   canonicalize_public_key "${candidate}" ||
     die 'ssh-keygen returned an invalid public key for user.signingkey'
@@ -101,7 +122,7 @@ public_key_fingerprint() {
   local output
   local fingerprint
 
-  output=$(printf '%s\n' "${public_key}" | ssh-keygen -lf - -E sha256 2>/dev/null) || return 1
+  output=$(printf '%s\n' "${public_key}" | "${ssh_keygen_program}" -lf - -E sha256 2>/dev/null) || return 1
   fingerprint=$(awk 'NR == 1 { print $2 }' <<<"${output}")
   [[ "${fingerprint}" == SHA256:* ]] || return 1
   printf '%s\n' "${fingerprint}"
@@ -124,9 +145,17 @@ verify_local_tag() {
   trap 'rm -rf "${verification_temp_dir}"' EXIT
   printf '%s %s\n' "${login}" "${public_key}" >"${allowed_signers}"
 
-  if ! git -c gpg.format=ssh \
-    -c gpg.ssh.allowedSignersFile="${allowed_signers}" \
-    verify-tag "refs/tags/${tag}" >/dev/null 2>&1; then
+  if ! (
+    # GIT_CONFIG_COUNT/KEY_n/VALUE_n and GIT_CONFIG_PARAMETERS are Git's
+    # command-scope config injection mechanisms. Without COUNT the KEY/VALUE
+    # variables are inert; removing PARAMETERS prevents a caller from
+    # appending another command-scope verifier after these exact -c values.
+    unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS
+    git -c gpg.format=ssh \
+      -c gpg.ssh.allowedSignersFile="${allowed_signers}" \
+      -c gpg.ssh.program="${ssh_keygen_program}" \
+      verify-tag "refs/tags/${tag}" >/dev/null 2>&1
+  ); then
     die "refs/tags/${tag} is not signed by the registered configured SSH key"
   fi
   printf 'release-signing-key: tag GREEN: refs/tags/%s is trusted for GitHub account %s\n' \
@@ -146,7 +175,8 @@ esac
 require_command git
 require_command gh
 require_command jq
-require_command ssh-keygen
+ssh_keygen_program=$(resolve_absolute_executable ssh-keygen) ||
+  die 'ssh-keygen must resolve through PATH to an absolute readable executable regular-file path'
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
   die 'run this preflight inside the release repository'

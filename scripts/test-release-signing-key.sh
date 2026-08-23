@@ -156,10 +156,48 @@ run_subject "${fixture_data}/release-keys.json" --verify-tag v1.2.3 >"${verified
 assert_contains 'release-signing-key: tag GREEN: refs/tags/v1.2.3 is trusted for GitHub account release-test' "${verified_output}"
 
 git -C "${fixture_repo}" -c user.signingkey="${fixture_data}/other-key" tag -s v1.2.4 -m v1.2.4 HEAD
-if run_subject "${fixture_data}/release-keys.json" --verify-tag v1.2.4 >"${temp_dir}/wrong-tag-output" 2>"${temp_dir}/wrong-tag-error"; then
-  fail 'tag signed by a different key was accepted'
+fake_ssh_keygen="${fixture_bin}/fake-ssh-keygen"
+cat >"${fake_ssh_keygen}" <<'FAKE_SSH_KEYGEN'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$*" >>"${FAKE_SSH_KEYGEN_LOG:?}"
+case " $* " in
+  *' -Y find-principals '*) printf 'release-test\n' ;;
+  *' -Y verify '*) printf 'Good "git" signature for release-test with ED25519 key SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n' ;;
+  *) exit 1 ;;
+esac
+FAKE_SSH_KEYGEN
+chmod 0755 "${fake_ssh_keygen}"
+git -C "${fixture_repo}" config gpg.ssh.program "${fake_ssh_keygen}"
+
+# Both repository config and Git's environment-level command config try to
+# replace OpenSSH verification. The subject must ignore both, pin the absolute
+# ssh-keygen executable it resolved itself, and preserve correct-signature
+# acceptance while rejecting a tag signed by another key.
+correct_malicious_log="${temp_dir}/correct-malicious-verifier.log"
+correct_malicious_output="${temp_dir}/correct-malicious-output"
+GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=gpg.ssh.program \
+  GIT_CONFIG_VALUE_0="${fake_ssh_keygen}" \
+  GIT_CONFIG_PARAMETERS="'gpg.ssh.program'='${fake_ssh_keygen}'" \
+  FAKE_SSH_KEYGEN_LOG="${correct_malicious_log}" \
+  run_subject "${fixture_data}/release-keys.json" --verify-tag v1.2.3 >"${correct_malicious_output}"
+assert_contains 'release-signing-key: tag GREEN: refs/tags/v1.2.3 is trusted for GitHub account release-test' "${correct_malicious_output}"
+[[ ! -e "${correct_malicious_log}" ]] || fail 'ambient gpg.ssh.program executed during correct-signer verification'
+
+wrong_malicious_log="${temp_dir}/wrong-malicious-verifier.log"
+if GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=gpg.ssh.program \
+  GIT_CONFIG_VALUE_0="${fake_ssh_keygen}" \
+  GIT_CONFIG_PARAMETERS="'gpg.ssh.program'='${fake_ssh_keygen}'" \
+  FAKE_SSH_KEYGEN_LOG="${wrong_malicious_log}" \
+  run_subject "${fixture_data}/release-keys.json" --verify-tag v1.2.4 >"${temp_dir}/wrong-tag-output" 2>"${temp_dir}/wrong-tag-error"; then
+  fail 'ambient gpg.ssh.program bypassed wrong-signer rejection'
 fi
 assert_contains 'is not signed by the registered configured SSH key' "${temp_dir}/wrong-tag-error"
+[[ ! -e "${wrong_malicious_log}" ]] || fail 'ambient gpg.ssh.program executed during wrong-signer verification'
+printf 'release signing-key ambient verifier isolation: PASS\n'
 
 preflight_line=$(grep -nF './scripts/verify-release-signing-key.sh' "${root_dir}/RELEASING.md" | sed -n '1s/:.*//p')
 tag_line=$(grep -nF "git tag -s \"\$tag\"" "${root_dir}/RELEASING.md" | sed -n '1s/:.*//p')
