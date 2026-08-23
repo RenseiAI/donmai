@@ -15,10 +15,10 @@ func copySparseData(source, destination *os.File, size int64) error {
 	if size == 0 {
 		return destination.Truncate(0)
 	}
-	if source.Fd() > math.MaxInt || destination.Fd() > math.MaxInt {
-		return errors.New("archive copy file descriptor out of range")
+	sourceFD, err := archiveFileDescriptor(source.Fd())
+	if err != nil {
+		return err
 	}
-	sourceFD := int(source.Fd())
 	position := int64(0)
 	for position < size {
 		data, err := unix.Seek(sourceFD, position, unix.SEEK_DATA)
@@ -50,4 +50,11 @@ func copySparseData(source, destination *os.File, size int64) error {
 		position = hole
 	}
 	return destination.Truncate(size)
+}
+
+func archiveFileDescriptor(fd uintptr) (int, error) {
+	if fd > math.MaxInt {
+		return 0, errors.New("archive copy file descriptor out of range")
+	}
+	return int(fd), nil
 }
