@@ -16,6 +16,17 @@ import (
 	"time"
 )
 
+// pollTestSlogMu serializes the process-global slog default while tests in
+// this file replace it to inspect warning output. Daemon integration tests
+// also use it while a heartbeat may emit through the default logger.
+var pollTestSlogMu sync.Mutex
+
+func lockPollTestSlog(t *testing.T) {
+	t.Helper()
+	pollTestSlogMu.Lock()
+	t.Cleanup(pollTestSlogMu.Unlock)
+}
+
 // TestPollService_DispatchesWork covers the happy path: poll endpoint returns
 // a single work item and the OnWork handler is invoked once with the matching
 // session id.
@@ -372,12 +383,14 @@ func TestPollResponse_DecodesLiveWireShape(t *testing.T) {
 // spawner's AcceptWork path. Uses a stub spawner command so the spawned
 // "session" exits immediately.
 func TestPollService_DaemonIntegration(t *testing.T) {
+	lockPollTestSlog(t)
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 
 	var (
 		hits        atomic.Int32
 		registerHit atomic.Int32
 	)
+	heartbeatComplete := make(chan struct{})
 	mux := http.NewServeMux()
 	//nolint:gosec // synthetic test response
 	mux.HandleFunc("/api/workers/register", func(w http.ResponseWriter, _ *http.Request) {
@@ -403,6 +416,7 @@ func TestPollService_DaemonIntegration(t *testing.T) {
 	})
 	mux.HandleFunc("/api/workers/wkr_int/heartbeat", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
+		close(heartbeatComplete)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -452,12 +466,18 @@ func TestPollService_DaemonIntegration(t *testing.T) {
 	if registerHit.Load() < 1 {
 		t.Errorf("register endpoint never hit; got %d", registerHit.Load())
 	}
+	select {
+	case <-heartbeatComplete:
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat endpoint never completed")
+	}
 }
 
 // withCapturedSlog redirects slog's default logger to an in-memory buffer
 // for the duration of the test, returning the buffer and a restore func.
 func withCapturedSlog(t *testing.T) (*bytes.Buffer, func()) {
 	t.Helper()
+	lockPollTestSlog(t)
 	buf := &bytes.Buffer{}
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
