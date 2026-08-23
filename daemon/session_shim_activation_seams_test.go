@@ -255,10 +255,12 @@ func TestSupportedSessionShimAttestationRequiresCanonicalCompleteCapabilities(t 
 	for name, mutate := range map[string]func(*SessionShimHostAttestation){
 		"max below v3": func(attestation *SessionShimHostAttestation) { attestation.ProtocolMax = shimwire.V2 },
 		"prior four-token set": func(attestation *SessionShimHostAttestation) {
-			attestation.Capabilities = append(
-				append([]string(nil), attestation.Capabilities[:2]...),
-				attestation.Capabilities[3:]...,
-			)
+			attestation.Capabilities = []string{
+				SessionShimCapabilityAuthoritativeSnapshotV2,
+				SessionShimCapabilityCarrierEpochPrepareCommit,
+				SessionShimCapabilityFullHostFrameV3,
+				SessionShimCapabilityInteractiveAttachV2,
+			}
 		},
 		"missing capability": func(attestation *SessionShimHostAttestation) {
 			attestation.Capabilities = attestation.Capabilities[:len(attestation.Capabilities)-1]
