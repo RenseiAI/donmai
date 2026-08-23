@@ -194,13 +194,25 @@ be visible, while actor field omission is recorded as the reason the
 administrator audit remains required.
 
 Always create the tag at an explicit commit SHA, never from an implicit branch
-ref:
+ref. Before creating it, run the read-only signing-key preflight. It resolves
+the active `github.com` account, derives the public key from Git's exact
+`user.signingkey` setting (a public/private key path or a `key::` literal), and
+compares its SHA-256 fingerprint with that account's public SSH signing keys.
+It prints only the account login and fingerprint, never private-key bytes. A
+GitHub authentication/readback error, a non-SSH Git format, an unreadable key,
+or an unregistered fingerprint is a hard stop before a tag exists remotely.
+
+After creating the local tag, run the same helper in verification mode. It
+builds a one-key temporary `gpg.ssh.allowedSignersFile` and verifies the tag
+through Git, so local SSH verification is deterministic even when the operator
+has no global allowed-signers file (or has an unrelated one):
 
 ```bash
 tag=vX.Y.Z
 release_sha="$(git rev-parse HEAD)"
+./scripts/verify-release-signing-key.sh
 git tag -s "$tag" "$release_sha" -m "$tag"
-git tag -v "$tag"
+./scripts/verify-release-signing-key.sh --verify-tag "$tag"
 git show --no-patch --decorate "$tag^{commit}"
 git push origin "refs/tags/$tag"
 ```
