@@ -271,7 +271,13 @@ assert_workflow_job_needs "${root_dir}/.github/workflows/release.yml" harness-sm
 assert_workflow_job_needs "${root_dir}/.github/workflows/worker-image.yml" build-and-push release-authority
 assert_workflow_job_needs "${root_dir}/.github/workflows/e2b-template.yml" build-template release-authority
 
+ci_workflow="${root_dir}/.github/workflows/ci.yml"
+grep -Fq 'release-authority-visibility:' "${ci_workflow}" || fail 'CI does not host the same-token authority visibility control'
+grep -Fq "verify-release-authority.sh --check-actor-visibility \"\${GITHUB_REPOSITORY}\"" "${ci_workflow}" || fail 'CI visibility control does not use the shared verifier'
+grep -Fq "GH_TOKEN: \${{ github.token }}" "${ci_workflow}" || fail 'CI visibility control does not use the same least-privilege github.token'
+
 grep -Fq "git tag -s \"\$tag\" \"\$release_sha\" -m \"\$tag\"" "${root_dir}/RELEASING.md" || fail 'release docs do not require a signed tag'
+grep -Fq -- '--audit-policy RenseiAI/donmai' "${root_dir}/RELEASING.md" || fail 'release docs omit the administrator policy audit'
 if grep -Fq "git tag -a \"\$tag\"" "${root_dir}/RELEASING.md"; then
   fail 'release docs still instruct operators to create an unsigned annotated tag'
 fi

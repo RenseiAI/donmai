@@ -105,17 +105,24 @@ labels such as `latest`, and branch names are rejected.
 
 ### Tag authority and immutability
 
-Every publisher performs a read-only GitHub preflight before any build. It
-requires two independent active repository rulesets for `refs/tags/v*`:
+Every publisher performs a read-only GitHub preflight before any build. Its
+least-privilege `github.token` requires exactly two independent active
+repository rulesets for `refs/tags/v*`, with exact include/exclude scopes and
+rule types:
 
 - a creation-only ruleset with one `OrganizationAdmin` `always` bypass; and
 - a no-bypass ruleset containing only deletion, update, and non-fast-forward
   protection.
 
-The split is load-bearing. The creation bypass identifies who may create a
-release tag, while the second ruleset ensures nobody, including an
-administrator, can later delete or retarget it. An authorized repository
-administrator can apply the reviewed payloads once:
+The split is load-bearing. GitHub can omit bypass actors from a
+`contents:read` workflow response, so the publisher enforces structural policy
+without treating an omitted actor field as an empty actor list. An
+administrator-visible audit separately proves that the creation bypass
+identifies who may create a release tag and that nobody can bypass the second
+ruleset to delete or retarget it. Do not add a privileged Actions secret to
+bridge those evidence tiers.
+
+An authorized repository administrator can apply the reviewed payloads once:
 
 ```bash
 gh api --method POST repos/RenseiAI/donmai/rulesets \
@@ -171,7 +178,18 @@ while read -r ruleset_id; do
   gh api "repos/RenseiAI/donmai/rulesets/${ruleset_id}" \
     --jq '{id,name,source_type,source,target,enforcement,conditions,bypass_actors,rules}'
 done
+
+GH_TOKEN="$(gh auth token)" \
+  ./scripts/verify-release-authority.sh --audit-policy RenseiAI/donmai
 ```
+
+The audit must report exact no-bypass immutability and a sole
+`OrganizationAdmin(always)` creation actor. The transient local `GH_TOKEN`
+above must read `current_user_can_bypass=always` for creation and `never` for
+immutability. Never copy that administrator token into an Actions secret. CI
+also performs a read-only same-token visibility control: structural fields must
+be visible, while actor field omission is recorded as the reason the
+administrator audit remains required.
 
 Always create the tag at an explicit commit SHA, never from an implicit branch
 ref:
@@ -186,10 +204,11 @@ git push origin "refs/tags/$tag"
 ```
 
 The tag push starts the release, worker-image, and E2B workflows. Before any
-build, each workflow verifies both rulesets and GitHub's cryptographic
-verification of the annotated tag object. The release workflow then verifies
-that its checkout is the commit referenced by the release tag. GoReleaser also
-sends that exact commit through
+build, each workflow verifies both rulesets' exact structural shape and
+GitHub's cryptographic verification of the annotated tag object. The prior
+administrator audit is the authority proof for actor policy. The release
+workflow then verifies that its checkout is the commit referenced by the
+release tag. GoReleaser also sends that exact commit through
 `release.target_commitish`; it never asks GitHub to target the moving default
 branch. The shared verifier exposes both prerelease status and the rolling-alias
 policy to every publisher. Automatic stable tags advance rolling aliases;
