@@ -519,6 +519,7 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 		descriptionFile string
 		state           string
 		status          string
+		project         string
 		labels          string
 		parentID        string
 		priority        int
@@ -563,6 +564,20 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 			input := linear.UpdateIssueInput{
 				Title:       title,
 				Description: desc,
+			}
+
+			// Optional project mutation. This local flag deliberately shadows any
+			// embedder's global project-context flag for this subcommand: callers
+			// asked to move this existing Linear issue, not select host CLI context.
+			if cmd.Flags().Changed("project") {
+				if strings.TrimSpace(project) == "" {
+					return fmt.Errorf("--project requires a Linear project name, slug, or UUID")
+				}
+				proj, err := client.GetProjectByNameInTeam(ctx, project, issue.Team.ID)
+				if err != nil {
+					return fmt.Errorf("resolve destination project for issue team %s: %w", issue.Team.Key, err)
+				}
+				input.ProjectID = proj.ID
 			}
 
 			// Optional state (resolved from either --status or --state)
@@ -618,6 +633,7 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				"identifier": updated.Identifier,
 				"title":      updated.Title,
 				"status":     updated.State.Name,
+				"project":    updated.Project.Name,
 				"url":        updated.URL,
 			})
 		},
@@ -628,6 +644,7 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 	cmd.Flags().StringVar(&descriptionFile, "description-file", "", "Path to file containing description")
 	cmd.Flags().StringVar(&status, "status", "", "New state name — contract-canonical alias for --state (e.g. 'Cancelled')")
 	cmd.Flags().StringVar(&state, "state", "", "New state name (alias for --status; e.g. 'Finished')")
+	cmd.Flags().StringVar(&project, "project", "", "Move issue to a Linear project name, slug, or UUID (mutation, not CLI context)")
 	cmd.Flags().StringVar(&labels, "labels", "", "Comma-separated label names")
 	cmd.Flags().StringVar(&parentID, "parentId", "", "New parent issue ID ('null' to clear)")
 	cmd.Flags().IntVar(&priority, "priority", 0, "Issue priority: 0=no priority, 1=urgent, 2=high, 3=medium, 4=low")

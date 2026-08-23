@@ -172,7 +172,7 @@ func TestGetTeamByName_ResolvesByUUID(t *testing.T) {
 
 func TestGetProjectByName_NoTeamScope(t *testing.T) {
 	t.Parallel()
-	c, rec := captureClient(t, `{"projects":{"nodes":[{"id":"proj-1","name":"Platform"}]}}`)
+	c, rec := captureClient(t, `{"projects":{"nodes":[{"id":"proj-1","name":"Platform","slugId":"platform-slug"}]}}`)
 
 	proj, err := c.GetProjectByName(context.Background(), "Platform")
 	if err != nil {
@@ -181,9 +181,16 @@ func TestGetProjectByName_NoTeamScope(t *testing.T) {
 	if proj.ID != "proj-1" {
 		t.Errorf("proj.ID = %q; want proj-1", proj.ID)
 	}
+	if proj.SlugID != "platform-slug" {
+		t.Errorf("proj.SlugID = %q; want platform-slug", proj.SlugID)
+	}
 	filter, _ := rec.variables["filter"].(map[string]any)
 	if _, has := filter["accessibleTeams"]; has {
 		t.Errorf("no-team-scope query must not include accessibleTeams: %#v", filter)
+	}
+	or, ok := nestedOr(rec)
+	if !ok || !orHasStringPredicate(or, "name", "Platform") || !orHasStringPredicate(or, "slugId", "Platform") {
+		t.Errorf("project resolver filter must match name and slug: %#v", filter)
 	}
 }
 
@@ -208,6 +215,35 @@ func TestGetProjectByNameInTeam_ScopesByTeamUUID(t *testing.T) {
 	id, _ := some["id"].(map[string]any)
 	if id["eq"] != teamUUID {
 		t.Errorf("accessibleTeams.some.id.eq = %v; want %q", id["eq"], teamUUID)
+	}
+}
+
+func TestGetProjectByNameInTeam_RejectsAmbiguousMatch(t *testing.T) {
+	t.Parallel()
+	const teamUUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	c, _ := captureClient(t, `{"projects":{"nodes":[{"id":"proj-1","name":"Same","slugId":"one"},{"id":"proj-2","name":"Same","slugId":"two"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+
+	_, err := c.GetProjectByNameInTeam(context.Background(), "Same", teamUUID)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("error = %v, want ambiguous-project rejection", err)
+	}
+}
+
+func TestGetProjectByNameInTeam_UUIDAddsIDPredicate(t *testing.T) {
+	t.Parallel()
+	const projectUUID = "11111111-2222-3333-4444-555555555555"
+	c, rec := captureClient(t, `{"projects":{"nodes":[{"id":"`+projectUUID+`","name":"Platform","slugId":"platform"}]}}`)
+
+	project, err := c.GetProjectByNameInTeam(context.Background(), projectUUID, "")
+	if err != nil {
+		t.Fatalf("GetProjectByNameInTeam(uuid): %v", err)
+	}
+	if project.ID != projectUUID {
+		t.Fatalf("project.ID = %q, want %q", project.ID, projectUUID)
+	}
+	or, ok := nestedOr(rec)
+	if !ok || !orHasIDPredicate(or, projectUUID) {
+		t.Fatalf("filter.or missing UUID predicate: %#v", rec.variables)
 	}
 }
 
@@ -250,11 +286,35 @@ func orHasIDPredicate(or []any, wantEq string) bool {
 	return false
 }
 
+func orHasStringPredicate(or []any, field, wantEq string) bool {
+	for _, clause := range or {
+		m, _ := clause.(map[string]any)
+		comparison, ok := m[field].(map[string]any)
+		if ok && comparison["eqIgnoreCase"] == wantEq {
+			return true
+		}
+	}
+	return false
+}
+
 // --- UpdateIssue priority / estimate (C3) ---
 
 // issueUpdateResponseJSON returns a minimal issueUpdate GraphQL response.
 func issueUpdateResponseJSON() string {
 	return `{"issueUpdate":{"success":true,"issue":{"id":"issue-1","identifier":"ENG-1","title":"T","state":{"name":"Backlog"},"team":{"id":"t1","key":"ENG","name":"Engineering"},"labels":{"nodes":[]}}}}`
+}
+
+func TestUpdateIssue_ProjectIDSentToLinear(t *testing.T) {
+	t.Parallel()
+	c, rec := captureClient(t, issueUpdateResponseJSON())
+
+	if _, err := c.UpdateIssue(context.Background(), "issue-1", UpdateIssueInput{ProjectID: "proj-dest"}); err != nil {
+		t.Fatalf("UpdateIssue: %v", err)
+	}
+	input, _ := rec.variables["input"].(map[string]any)
+	if len(input) != 1 || input["projectId"] != "proj-dest" {
+		t.Fatalf("input = %#v, want only projectId=proj-dest", input)
+	}
 }
 
 func TestUpdateIssue_PrioritySentToLinear(t *testing.T) {
