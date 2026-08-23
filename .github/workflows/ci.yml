@@ -10,6 +10,9 @@ on:
   # PR stalls until the queue's 30-minute check timeout.
   merge_group:
 
+permissions:
+  contents: read
+
 jobs:
   # The closed-source content guard (self-test, vendor-drift check, and the
   # commit/squash-message scans) lives in its own workflow now:
