@@ -3,6 +3,7 @@ set -euo pipefail
 
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 verify_script="${root_dir}/scripts/verify-release-tag.sh"
+authority_script="${root_dir}/scripts/verify-release-authority.sh"
 e2b_script="${root_dir}/scripts/build-e2b-template.cjs"
 temp_dir=$(mktemp -d)
 trap 'rm -rf "${temp_dir}"' EXIT
@@ -107,16 +108,21 @@ fixture_repo="${temp_dir}/repo"
 git init -q "${fixture_repo}"
 git -C "${fixture_repo}" config user.name 'Release Test'
 git -C "${fixture_repo}" config user.email 'release-test@example.com'
+ssh-keygen -q -t ed25519 -N '' -f "${temp_dir}/release-signing-key"
+git -C "${fixture_repo}" config gpg.format ssh
+git -C "${fixture_repo}" config user.signingkey "${temp_dir}/release-signing-key"
 printf 'first\n' > "${fixture_repo}/fixture.txt"
 git -C "${fixture_repo}" add fixture.txt
 git -C "${fixture_repo}" commit -q -m first
 first_commit=$(git -C "${fixture_repo}" rev-parse HEAD)
-git -C "${fixture_repo}" tag -a v1.2.3 -m v1.2.3 "${first_commit}"
+git -C "${fixture_repo}" tag -s v1.2.3 -m v1.2.3 "${first_commit}"
 printf 'second\n' >> "${fixture_repo}/fixture.txt"
 git -C "${fixture_repo}" commit -q -am second
 second_commit=$(git -C "${fixture_repo}" rev-parse HEAD)
-git -C "${fixture_repo}" tag -a v1.2.4 -m v1.2.4 "${second_commit}"
-git -C "${fixture_repo}" tag -a v1.2.5-rc.1 -m v1.2.5-rc.1 "${second_commit}"
+git -C "${fixture_repo}" tag -s v1.2.4 -m v1.2.4 "${second_commit}"
+git -C "${fixture_repo}" tag -s v1.2.5-rc.1 -m v1.2.5-rc.1 "${second_commit}"
+git -C "${fixture_repo}" -c tag.gpgSign=false tag -a v1.2.6 -m v1.2.6 "${second_commit}"
+git -C "${fixture_repo}" -c tag.gpgSign=false tag v1.2.7 "${second_commit}"
 git -C "${fixture_repo}" branch v1.2.3 "${second_commit}"
 
 # An automatic publication of the current stable tag advances all rolling
@@ -234,13 +240,47 @@ if (
 fi
 grep -Fq 'does not match v1.2.3' "${temp_dir}/mismatch-error" || fail 'tag mismatch did not report the mismatched tag'
 
+# Annotated-but-unsigned and lightweight tags are not release identities even
+# when they point at the checked-out commit.
+for bad_tag in v1.2.6 v1.2.7; do
+  git -C "${fixture_repo}" checkout -q --detach "refs/tags/${bad_tag}"
+  if (
+    cd "${fixture_repo}"
+    "${verify_script}" --verify "${bad_tag}" workflow_dispatch "${temp_dir}/${bad_tag}-output" "${temp_dir}/${bad_tag}-env"
+  ) 2> "${temp_dir}/${bad_tag}-error"; then
+    fail "unsigned release tag was accepted: ${bad_tag}"
+  fi
+done
+grep -Fq 'annotated but unsigned' "${temp_dir}/v1.2.6-error" || fail 'unsigned annotated tag rejection was not explicit'
+grep -Fq 'lightweight tag' "${temp_dir}/v1.2.7-error" || fail 'lightweight tag rejection was not explicit'
+
+[[ -x "${authority_script}" ]] || fail 'shared release-authority verifier is missing or not executable'
+"${authority_script}" --self-test
+
 # Workflow fixtures keep namespace-qualified dispatch checkouts and share one verifier.
 for workflow in release.yml e2b-template.yml worker-image.yml; do
   workflow_path="${root_dir}/.github/workflows/${workflow}"
   grep -Fq "format('refs/tags/{0}', inputs.tag)" "${workflow_path}" || fail "${workflow} does not namespace manual tags"
   grep -Fq 'Checkout release automation' "${workflow_path}" || fail "${workflow} does not preserve current automation for older retries"
   grep -Fq 'RUNNER_TEMP}/verify-release-tag.sh" --verify' "${workflow_path}" || fail "${workflow} bypasses the staged shared release verifier"
+  grep -Fq 'scripts/verify-release-authority.sh' "${workflow_path}" || fail "${workflow} does not stage the authority verifier from the current workflow"
+  grep -Fq "verify-release-authority.sh \"\${GITHUB_REPOSITORY}\" \"\${RELEASE_TAG}\"" "${workflow_path}" || fail "${workflow} does not verify live tag authority"
 done
+
+assert_workflow_job_needs "${root_dir}/.github/workflows/release.yml" harness-smoke release-authority
+assert_workflow_job_needs "${root_dir}/.github/workflows/worker-image.yml" build-and-push release-authority
+assert_workflow_job_needs "${root_dir}/.github/workflows/e2b-template.yml" build-template release-authority
+
+ci_workflow="${root_dir}/.github/workflows/ci.yml"
+grep -Fq 'release-authority-visibility:' "${ci_workflow}" || fail 'CI does not host the same-token authority visibility control'
+grep -Fq "verify-release-authority.sh --check-actor-visibility \"\${GITHUB_REPOSITORY}\"" "${ci_workflow}" || fail 'CI visibility control does not use the shared verifier'
+grep -Fq "GH_TOKEN: \${{ github.token }}" "${ci_workflow}" || fail 'CI visibility control does not use the same least-privilege github.token'
+
+grep -Fq "git tag -s \"\$tag\" \"\$release_sha\" -m \"\$tag\"" "${root_dir}/RELEASING.md" || fail 'release docs do not require a signed tag'
+grep -Fq -- '--audit-policy RenseiAI/donmai' "${root_dir}/RELEASING.md" || fail 'release docs omit the administrator policy audit'
+if grep -Fq "git tag -a \"\$tag\"" "${root_dir}/RELEASING.md"; then
+  fail 'release docs still instruct operators to create an unsigned annotated tag'
+fi
 
 grep -Fq 'GORELEASER_CURRENT_TAG' "${verify_script}" || fail 'verified tag is not exported to GoReleaser'
 grep -Fq 'is_prerelease=' "${verify_script}" || fail 'common verifier does not expose prerelease status'
