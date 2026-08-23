@@ -296,6 +296,10 @@ type DaemonSessionHandle struct {
 	// WorktreePath is the absolute on-disk worktree path for the session
 	// (<parent>/<sessionID>). Empty when the daemon cannot resolve it.
 	WorktreePath string `json:"worktreePath,omitempty"`
+	// WorkareaRoot is the additive session-owned lifecycle root. It may be
+	// absent against an older daemon and equals WorktreePath for retained flat
+	// workareas.
+	WorkareaRoot string `json:"workareaRoot,omitempty"`
 	// ProjectName is the allowlist-resolved project identifier.
 	ProjectName string `json:"projectName,omitempty"`
 	// Repository is the git URL (or owner/name slug) the session runs on.

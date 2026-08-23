@@ -99,7 +99,11 @@ func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec ag
 		NoticeDelivery: manifest.Caps.NoticeDelivery,
 	}
 
-	sess, shim, err := spawnSession(pspec, spec.Cwd)
+	workareaRoot := ""
+	if spec.RepositoryAuthority != nil {
+		workareaRoot = spec.RepositoryAuthority.WorkareaRoot
+	}
+	sess, shim, err := spawnSession(pspec, spec.Cwd, workareaRoot)
 	if err != nil {
 		spawnErr := fmt.Errorf("%w: interactive pty spawn: %v", agent.ErrSpawnFailed, err)
 		if cleanup != nil {
@@ -142,7 +146,11 @@ func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec ag
 // ptyhost.Spawn — which is what makes §D11's staged rollout real rather than
 // nominal: a worker binary that ships the shim code but is never launched with
 // the contract behaves exactly as it did before.
-func spawnSession(pspec ptyhost.Spec, workarea string) (*ptyhost.Session, *sessionshim.Shim, error) {
+func spawnSession(pspec ptyhost.Spec, workarea string, roots ...string) (*ptyhost.Session, *sessionshim.Shim, error) {
+	workareaRoot := ""
+	if len(roots) > 0 {
+		workareaRoot = roots[0]
+	}
 	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
 	if errors.Is(err, sessionshim.ErrNoLaunch) {
 		sess, spawnErr := ptyhost.Spawn(pspec)
@@ -155,7 +163,7 @@ func spawnSession(pspec ptyhost.Spec, workarea string) (*ptyhost.Session, *sessi
 		// believes is durable quietly is not, so this fails closed.
 		return nil, nil, fmt.Errorf("session shim launch: %w", err)
 	}
-	shim, err := sessionshim.StartFromEnv(launch, pspec, workarea)
+	shim, err := sessionshim.StartFromEnvWithRoot(launch, pspec, workarea, workareaRoot)
 	if err != nil {
 		return nil, nil, fmt.Errorf("session shim start: %w", err)
 	}

@@ -24,7 +24,11 @@ import (
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/prompt"
+	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
+	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // quietLogger returns a slog.Logger that drops all output. Used by
@@ -101,6 +105,197 @@ func TestOperationalPayloadRawPollThroughRealDetailHTTPIsLossless(t *testing.T) 
 	}
 	if len(digests) == 2 && digests[0] == digests[1] {
 		t.Fatalf("omitted and recursively present-empty poll fixtures produced one digest: %q", digests[0])
+	}
+}
+
+func TestProjectNameOnlyPollPreservesResolvedRepositoryThroughRunnerClone(t *testing.T) {
+	runResolvedRepositoryCloneFixture(t, `{
+		"sessionId":"legacy-project-only",
+		"projectName":"legacy-project",
+		"workType":"acceptance",
+		"body":"legacy project-only clone",
+		"resolvedProfile":{"provider":"stub"}
+	}`, func(repository string) []daemon.ProjectConfig {
+		return []daemon.ProjectConfig{{ID: "legacy-project", Repository: repository}}
+	})
+}
+
+func TestRepositoryResourcePollPreservesResolvedRepositoryThroughRunnerClone(t *testing.T) {
+	runResolvedRepositoryCloneFixture(t, `{
+		"sessionId":"repository-resource",
+		"projectId":"project-a",
+		"repositoryId":"resource-a",
+		"workType":"acceptance",
+		"body":"explicit repository-resource clone",
+		"resolvedProfile":{"provider":"stub"}
+	}`, func(repository string) []daemon.ProjectConfig {
+		return []daemon.ProjectConfig{{ID: "project-a", RepositoryID: "resource-a", Repository: repository}}
+	})
+}
+
+func TestPrimaryRepositoryPollPreservesResolvedRepositoryThroughRunnerClone(t *testing.T) {
+	runResolvedRepositoryCloneFixture(t, `{
+		"sessionId":"primary-repository",
+		"projectId":"project-a",
+		"requiresRepository":true,
+		"workType":"acceptance",
+		"body":"primary repository clone",
+		"resolvedProfile":{"provider":"stub"}
+	}`, func(repository string) []daemon.ProjectConfig {
+		return []daemon.ProjectConfig{{ID: "project-a", Primary: true, Repository: repository}}
+	})
+}
+
+func runResolvedRepositoryCloneFixture(t *testing.T, raw string, projects func(string) []daemon.ProjectConfig) {
+	t.Helper()
+	repository := makeSpecDecoratorBareRepo(t)
+	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"refreshed":true,"ok":true}`))
+	}))
+	t.Cleanup(platform.Close)
+
+	var item daemon.PollWorkItem
+	if err := json.Unmarshal([]byte(raw), &item); err != nil {
+		t.Fatal(err)
+	}
+	producerDigest, err := executioncell.DigestOperationalPayload(item.OperationalPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail := daemon.PollItemToSessionDetail(item, projects(repository), platform.URL, "token", "worker-1")
+	detailServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(detail) //nolint:gosec // fixed test-only credentials
+	}))
+	t.Cleanup(detailServer.Close)
+	fetched, err := fetchSessionDetail(t.Context(), detailServer.Client(), detailServer.URL, item.SessionID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := detailToQueuedWork(fetched)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumerDigest, err := runner.DigestOperationalPayload(queued)
+	if err != nil || consumerDigest != producerDigest {
+		t.Fatalf("operational payload digest after repository resolution = %q, %v; want %q", consumerDigest, err, producerDigest)
+	}
+
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: platform.URL, WorkerID: "worker-1", AuthToken: "token",
+		HTTPClient: platform.Client(), BaseDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := runner.NewRegistry()
+	provider, err := providerstub.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	run, err := runner.New(runner.Options{
+		Registry: registry, WorktreeManager: manager, Poster: poster,
+		HTTPClient: platform.Client(), SkipBackstop: true, SkipSteering: true,
+		SkipPostSession: true, PreserveWorktreeAlways: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	res, err := run.Run(ctx, queued)
+	if err != nil {
+		t.Fatalf("authoritative repository runner clone: %v", err)
+	}
+	command := exec.Command("git", "-C", res.WorktreePath, "remote", "get-url", "origin") //nolint:gosec // fixed git binary and test-owned worktree
+	origin, err := command.Output()
+	if err != nil || strings.TrimSpace(string(origin)) != repository {
+		t.Fatalf("runner clone source = %q, %v; want %q", origin, err, repository)
+	}
+}
+
+func TestOperationalPayloadRepositoryCompatibilityRequiresExactLegacyProjectName(t *testing.T) {
+	payload := json.RawMessage(`{"sessionId":"legacy","projectName":"project"}`)
+	tests := []struct {
+		name   string
+		detail daemon.SessionDetail
+	}{
+		{
+			name: "project mismatch",
+			detail: daemon.SessionDetail{
+				SessionID: "legacy", ProjectName: "other-project", Repository: "https://example.test/repo.git",
+				OperationalPayload: payload,
+			},
+		},
+		{
+			name: "receipted repository replacement",
+			detail: daemon.SessionDetail{
+				SessionID: "legacy", ProjectName: "project", Repository: "https://example.test/replacement.git",
+				OperationalPayload: json.RawMessage(`{"sessionId":"legacy","projectName":"project","repository":"https://example.test/original.git"}`),
+			},
+		},
+		{
+			name: "explicit resource mismatch",
+			detail: daemon.SessionDetail{
+				SessionID: "resource", ProjectID: "project-a", RepositoryID: "resource-b", Repository: "https://example.test/repo.git",
+				OperationalPayload: json.RawMessage(`{"sessionId":"resource","projectId":"project-a","repositoryId":"resource-a"}`),
+			},
+		},
+		{
+			name: "explicit resource cross project",
+			detail: daemon.SessionDetail{
+				SessionID: "resource", ProjectID: "project-b", RepositoryID: "resource-a", Repository: "https://example.test/repo.git",
+				OperationalPayload: json.RawMessage(`{"sessionId":"resource","projectId":"project-a","repositoryId":"resource-a"}`),
+			},
+		},
+		{
+			name: "primary resource cross project",
+			detail: daemon.SessionDetail{
+				SessionID: "primary", ProjectID: "project-b", Repository: "https://example.test/repo.git",
+				OperationalPayload: json.RawMessage(`{"sessionId":"primary","projectId":"project-a","requiresRepository":true}`),
+			},
+		},
+		{
+			name: "primary resource mirror invents repository id",
+			detail: daemon.SessionDetail{
+				SessionID: "primary", ProjectID: "project-a", RepositoryID: "resource-a", Repository: "https://example.test/repo.git",
+				OperationalPayload: json.RawMessage(`{"sessionId":"primary","projectId":"project-a","requiresRepository":true}`),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := detailToQueuedWork(&test.detail); err == nil || !strings.Contains(err.Error(), "exact authoritative project/resource resolution") {
+				t.Fatalf("repository compatibility error = %v", err)
+			}
+		})
+	}
+	declaration := &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{{
+			Source: workarea.RepositorySource{Repository: "https://example.test/repo.git"}, Name: "repo",
+			Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+		}},
+	}
+	versionedPayload, err := json.Marshal(map[string]any{
+		"sessionId": "versioned", "projectName": "project", "repositoryDeclaration": declaration,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	versioned := daemon.SessionDetail{
+		SessionID: "versioned", ProjectName: "project", Repository: "https://example.test/repo.git",
+		RepositoryDeclaration: declaration, OperationalPayload: versionedPayload,
+	}
+	if _, err := detailToQueuedWork(&versioned); err == nil || !strings.Contains(err.Error(), "exact authoritative project/resource resolution") {
+		t.Fatalf("versioned repository compatibility error = %v", err)
 	}
 }
 

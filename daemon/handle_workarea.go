@@ -38,7 +38,7 @@ const workareaRoutePrefix = "/api/daemon/workareas"
 
 // handleWorkareasRoot dispatches the LIST endpoint.
 //
-//	GET /api/daemon/workareas → 200 ListWorkareasResponse
+//	GET /api/daemon/workareas → 200 ListWorkareasV1Response
 func (s *Server) handleWorkareasRoot(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -46,24 +46,24 @@ func (s *Server) handleWorkareasRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	reg := s.daemon.workareaArchiveRegistry()
 	if reg == nil {
-		writeJSON(w, http.StatusOK, &afclient.ListWorkareasResponse{
-			Active:   []afclient.WorkareaSummary{},
-			Archived: []afclient.WorkareaSummary{},
+		writeJSON(w, http.StatusOK, &afclient.ListWorkareasV1Response{
+			Active:   []afclient.WorkareaSummaryV1{},
+			Archived: []afclient.WorkareaSummaryV1{},
 		})
 		return
 	}
-	active, archived, err := reg.List()
+	active, archived, err := reg.ListV1()
 	if err != nil {
 		http.Error(w, "list workareas: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if active == nil {
-		active = []afclient.WorkareaSummary{}
+		active = []afclient.WorkareaSummaryV1{}
 	}
 	if archived == nil {
-		archived = []afclient.WorkareaSummary{}
+		archived = []afclient.WorkareaSummaryV1{}
 	}
-	writeJSON(w, http.StatusOK, &afclient.ListWorkareasResponse{
+	writeJSON(w, http.StatusOK, &afclient.ListWorkareasV1Response{
 		Active:   active,
 		Archived: archived,
 	})
@@ -113,11 +113,14 @@ func (s *Server) serveWorkareaInspect(w http.ResponseWriter, r *http.Request, id
 	}
 	// Active pool member lookup first — if the daemon has a
 	// PoolStatsProvider we walk its members for an id match.
-	if active, ok := s.lookupActiveByID(id); ok {
-		writeJSON(w, http.StatusOK, &afclient.WorkareaEnvelope{Workarea: active})
+	if active, ok, err := s.lookupActiveByID(id); err != nil {
+		http.Error(w, "inspect active workarea: "+err.Error(), http.StatusInternalServerError)
+		return
+	} else if ok {
+		writeJSON(w, http.StatusOK, &afclient.WorkareaV1Envelope{Workarea: active})
 		return
 	}
-	wa, err := reg.Get(id)
+	wa, err := reg.GetV1(id)
 	if err != nil {
 		if errors.Is(err, ErrArchiveNotFound) {
 			http.NotFound(w, r)
@@ -130,7 +133,7 @@ func (s *Server) serveWorkareaInspect(w http.ResponseWriter, r *http.Request, id
 		http.Error(w, "inspect workarea: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, &afclient.WorkareaEnvelope{Workarea: *wa})
+	writeJSON(w, http.StatusOK, &afclient.WorkareaV1Envelope{Workarea: *wa})
 }
 
 // serveWorkareaRestore handles POST /api/daemon/workareas/<archiveID>/restore.
@@ -152,7 +155,7 @@ func (s *Server) serveWorkareaRestore(w http.ResponseWriter, r *http.Request, ar
 			return
 		}
 	}
-	wa, retryAfter, err := reg.Restore(archiveID, req)
+	wa, retryAfter, err := reg.RestoreV1(archiveID, req)
 	if err != nil {
 		switch {
 		case errors.Is(err, afclient.ErrConflict):
@@ -171,7 +174,7 @@ func (s *Server) serveWorkareaRestore(w http.ResponseWriter, r *http.Request, ar
 		}
 		return
 	}
-	writeJSON(w, http.StatusCreated, &afclient.WorkareaRestoreResult{Workarea: *wa})
+	writeJSON(w, http.StatusCreated, &afclient.WorkareaRestoreV1Result{Workarea: *wa})
 }
 
 // serveWorkareaDiff handles GET /api/daemon/workareas/<idA>/diff/<idB>.
@@ -293,29 +296,37 @@ func (s *Server) serveDiffNDJSON(w http.ResponseWriter, reg *WorkareaArchiveRegi
 // lookupActiveByID returns the active pool member matching id, if the
 // daemon has a registered ActiveWorkareaProvider that exposes one.
 // (The registry's List uses the same provider.)
-func (s *Server) lookupActiveByID(id string) (afclient.Workarea, bool) {
+func (s *Server) lookupActiveByID(id string) (afclient.WorkareaV1, bool, error) {
 	reg := s.daemon.workareaArchiveRegistry()
 	if reg == nil || reg.activeProvider == nil {
-		return afclient.Workarea{}, false
+		return afclient.WorkareaV1{}, false, nil
 	}
-	for _, member := range reg.activeProvider.ActiveWorkareas() {
+	members, err := reg.activeWorkareasV1()
+	if err != nil {
+		return afclient.WorkareaV1{}, false, err
+	}
+	for _, member := range members {
 		if member.ID != id {
 			continue
 		}
-		return afclient.Workarea{
-			ID:         member.ID,
-			Kind:       afclient.WorkareaKindActive,
-			ProviderID: member.ProviderID,
-			SessionID:  member.SessionID,
-			ProjectID:  member.ProjectID,
-			Status:     member.Status,
-			Ref:        member.Ref,
-			Repository: member.Repository,
-			AcquiredAt: member.AcquiredAt,
-			ReleasedAt: member.ReleasedAt,
-		}, true
+		return afclient.WorkareaV1{
+			ID:                     member.ID,
+			Kind:                   afclient.WorkareaKindActive,
+			ProviderID:             member.ProviderID,
+			SessionID:              member.SessionID,
+			ProjectID:              member.ProjectID,
+			Status:                 member.Status,
+			Ref:                    member.Ref,
+			Repository:             member.Repository,
+			Path:                   member.RepositoryWorktreePath,
+			WorkareaRoot:           member.WorkareaRoot,
+			RepositoryWorktreePath: member.RepositoryWorktreePath,
+			Repositories:           append([]afclient.WorkareaRepository(nil), member.Repositories...),
+			AcquiredAt:             member.AcquiredAt,
+			ReleasedAt:             member.ReleasedAt,
+		}, true, nil
 	}
-	return afclient.Workarea{}, false
+	return afclient.WorkareaV1{}, false, nil
 }
 
 // diffStreamingThreshold reads daemon.yaml's workarea.diffStreamingThreshold
@@ -352,6 +363,7 @@ func (d *Daemon) workareaArchiveRegistry() *WorkareaArchiveRegistry {
 	opts := WorkareaArchiveOptions{Root: root}
 	if d.spawner != nil {
 		opts.ActiveProvider = d.spawner
+		opts.WorktreeParent = d.spawner.opts.WorktreeParentDir
 	}
 	d.workareaArchive = NewWorkareaArchiveRegistry(opts)
 	return d.workareaArchive

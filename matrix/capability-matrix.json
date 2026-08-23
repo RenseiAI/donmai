@@ -314,6 +314,10 @@
         "toolPermissionFormat": "codex",
         "streamingTransport": "none",
         "interactivePty": true,
+        "multiRepositoryWorkareaProtocols": [
+          "session-root-v1"
+        ],
+        "repositoryAuthorityEnforcement": "isolated-read-only-v1",
         "noticeDelivery": "mcp-rpc",
         "drives": [
           "openai-chat",

@@ -79,6 +79,14 @@ type SessionDetail struct {
 	// operate on.
 	Repository string `json:"repository,omitempty"`
 
+	// RepositoryDeclaration is forwarded after producer negotiation; the exact
+	// runner/executor validates it again before provisioning.
+	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
+	WorkareaMode          string                            `json:"workareaMode,omitempty"`
+	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
+	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
+	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
+
 	// Ref is the base branch / ref to check out from.
 	Ref string `json:"ref,omitempty"`
 
@@ -300,7 +308,7 @@ type SessionDetail struct {
 	// behaviour. Forwarded opaquely; the daemon does not interpret the keys.
 	Capabilities map[string]bool `json:"capabilities,omitempty"`
 
-	// ── W3C trace-context correlation (REN-2649) ─────────────────────────
+	// ── W3C trace-context correlation ────────────────────────────────────
 	//
 	// Platform dispatch stamps these opaquely per
 	// src/lib/observability/trace-context.ts. Trace correlation only; never

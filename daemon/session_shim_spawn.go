@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -107,7 +106,11 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		return nil, fmt.Errorf("session shim: %w", err)
 	}
 
-	workarea := d.sessionWorkareaPath(spec)
+	layout, err := sessionWorkareaLayout(d.spawner.opts.WorktreeParentDir, spec)
+	if err != nil {
+		return nil, err
+	}
+	workarea := layout.Repository.String()
 	launch := sessionshim.Launch{
 		Identity:     id,
 		RegistryDir:  registry.Dir(),
@@ -141,6 +144,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	controllerOpts := sessionshim.ControllerOptions{
 		ControllerID:          d.controllerID(),
 		ExpectedWorkarea:      workarea,
+		ExpectedWorkareaRoot:  layout.Root.String(),
 		DialTimeout:           cfg.launchTimeout(),
 		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimAttestationValue.enabled(),
 		Logger:                slog.Default(),
@@ -207,7 +211,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	}
 	d.shims.mu.Unlock()
 
-	handle := d.trackLaunchedShim(ctrl, spec, project, workarea, evidence, receipt, false)
+	handle := d.trackLaunchedShim(ctrl, spec, project, workarea, layout.Root.String(), evidence, receipt, false)
 	gate.finish(true)
 	if cfg.OnAdoptionPublished != nil {
 		d.shims.mu.RLock()
@@ -284,16 +288,6 @@ func (d *Daemon) shimCommand() []string {
 	return d.spawner.opts.WorkerCommand
 }
 
-// sessionWorkareaPath is the workarea this daemon believes a session runs in.
-// Adoption compares it against the shim's own self-report, so a shim running
-// somewhere else quarantines instead of being taken over (§D7).
-func (d *Daemon) sessionWorkareaPath(spec SessionSpec) string {
-	if d.spawner == nil || d.spawner.opts.WorktreeParentDir == "" {
-		return ""
-	}
-	return filepath.Join(d.spawner.opts.WorktreeParentDir, spec.SessionID)
-}
-
 // awaitShimRecord polls the registry until the launched shim publishes a valid
 // discovery record, or ctx expires.
 func awaitShimRecord(ctx context.Context, registry *sessionshim.Registry, id sessionshim.Identity) (sessionshim.Record, error) {
@@ -321,6 +315,7 @@ func (d *Daemon) trackLaunchedShim(
 	spec SessionSpec,
 	project ProjectConfig,
 	workarea string,
+	workareaRoot string,
 	evidence SessionShimAdoptionEvidence,
 	receipt SessionShimAdoptionReceipt,
 	startConsumer bool,
@@ -334,6 +329,7 @@ func (d *Daemon) trackLaunchedShim(
 		// .agent/…; it is the same <parent>/<sessionID> leaf the direct path
 		// publishes, so a reader cannot tell shim-backed sessions apart by shape.
 		WorktreePath: workarea,
+		WorkareaRoot: workareaRoot,
 		ProjectName:  project.ID,
 		Repository:   spec.Repository,
 	}
@@ -1004,6 +1000,11 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 			handle = SessionHandle{SessionID: id.SessionID, State: SessionRunning}
 			if entry.controller != nil {
 				handle.PID = entry.controller.HarnessIdentity().PID
+				handle.WorktreePath = entry.controller.Hello().WorkareaPath
+				handle.WorkareaRoot = entry.controller.WorkareaRoot()
+				if handle.WorkareaRoot == "" {
+					handle.WorkareaRoot = handle.WorktreePath
+				}
 				if started := entry.controller.Hello().ProcessStartedAt; started > 0 {
 					handle.AcceptedAt = time.Unix(0, started).UTC().Format(time.RFC3339)
 				}

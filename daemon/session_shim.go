@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -407,6 +409,9 @@ type SessionShimConfig struct {
 	// belongs to, for the adoption-time workarea identity check. Nil skips only
 	// the daemon-side half; the record-versus-live-shim half always runs.
 	ExpectedWorkarea func(orgID, sessionID string) string
+	// ExpectedWorkareaRoot cross-checks the optional session-owned root in new
+	// records. Old records without it remain adoptable.
+	ExpectedWorkareaRoot func(orgID, sessionID string) string
 
 	// OnSessionEvent, when set, receives EVERY event from every adopted session:
 	// output frames carrying the shim-allocated sequence, declared gaps,
@@ -710,6 +715,33 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			return expected(id.OrgID, id.SessionID)
 		}
 	}
+	if cfg.ExpectedWorkareaRoot != nil {
+		expected := cfg.ExpectedWorkareaRoot
+		opts.ExpectedWorkareaRoot = func(id sessionshim.Identity) string {
+			return expected(id.OrgID, id.SessionID)
+		}
+	}
+	if cfg.ExpectedWorkarea == nil && cfg.ExpectedWorkareaRoot == nil {
+		worktreeParent := d.opts.SpawnerOptions.WorktreeParentDir
+		if worktreeParent == "" {
+			worktreeParent = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
+		}
+		acquisitions, found, storeErr := workarea.OpenExistingAcquisitionStore(worktreeParent, nil)
+		if storeErr != nil {
+			return fmt.Errorf("session shim: open workarea adoption journal: %w", storeErr)
+		}
+		if found {
+			readyWorkareas, readyErr := acquisitions.ReadyRecords()
+			if readyErr != nil {
+				return fmt.Errorf("session shim: read workarea adoption journal: %w", readyErr)
+			}
+			if len(readyWorkareas) > 0 {
+				opts.ExpectedWorkareaLayout = func(id sessionshim.Identity) (string, string, error) {
+					return resolveExpectedAdoptionWorkarea(acquisitions, worktreeParent, id.SessionID)
+				}
+			}
+		}
+	}
 
 	result, err := sessionshim.Adopt(ctx, opts)
 	if err != nil {
@@ -921,6 +953,46 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		"stale", len(result.Stale),
 		"occupiedSlots", result.OccupiedSlots())
 	return nil
+}
+
+func resolveExpectedAdoptionWorkarea(acquisitions *workarea.AcquisitionStore, parent, sessionID string) (string, string, error) {
+	record, err := acquisitions.RecordForSessionID(sessionID)
+	if err == nil {
+		if record.State != workarea.AcquisitionReady {
+			return "", "", fmt.Errorf("workarea acquisition is not ready")
+		}
+		declaration, readErr := workarea.ReadDeclaration(workarea.RootPath(record.FinalRoot))
+		if readErr != nil {
+			return "", "", readErr
+		}
+		selectedRepository := declaration.SelectedRepository
+		if sessionID != record.SessionID {
+			selectedRepository = ""
+			for _, participant := range record.Participants {
+				if participant.SessionID == sessionID {
+					selectedRepository = participant.SelectedRepository
+					break
+				}
+			}
+		}
+		for _, repository := range declaration.Repositories {
+			if repository.Name == selectedRepository {
+				return filepath.Join(record.FinalRoot, repository.Leaf), record.FinalRoot, nil
+			}
+		}
+		return "", "", fmt.Errorf("selected repository is absent from the declaration")
+	}
+	if !errors.Is(err, workarea.ErrAcquisitionNotFound) {
+		return "", "", err
+	}
+	layout, found, err := workarea.DiscoverLayout(parent, sessionID, "")
+	if err != nil {
+		return "", "", err
+	}
+	if !found {
+		return "", "", fmt.Errorf("no retained workarea for session %q", sessionID)
+	}
+	return layout.Repository.String(), layout.Root.String(), nil
 }
 
 func (d *Daemon) acquireSessionShimRecoveryReceipts(

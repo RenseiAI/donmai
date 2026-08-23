@@ -1,12 +1,12 @@
 # `runtime/worktree/`
 
-Per-session git worktree provisioning + teardown for the agent runner.
+Per-session git repository provisioning and root-scoped teardown for the agent runner.
 
 ## What it does
 
 ```go
 m, _ := worktree.NewManager(worktree.Options{
-    ParentDir:       "/var/lib/rensei/wt",
+    ParentDir:       "/var/lib/donmai/wt",
     OwnershipProber: afclient.GetSessionOwnership,
 })
 path, err := m.Provision(ctx, worktree.ProvisionSpec{
@@ -18,6 +18,18 @@ path, err := m.Provision(ctx, worktree.ProvisionSpec{
 // ... agent runs in `path` ...
 m.Teardown(ctx, "sess-123")
 ```
+
+With no `RepositoryDeclaration`, this keeps the released flat layout and
+`path` is `<parent>/<session-id>`. A negotiated `session-root-v1` declaration
+materializes a fresh session-owned root containing one leaf per declared
+repository. `Provision` and `Path` still return the selected repository CWD;
+`Layout` separately exposes the lifecycle root. Cleanup, terminal leases,
+archive disposition, and disk reporting bind the root.
+
+The versioned path requires an exact executor attestation. A declaration with
+any `read-only` leaf additionally requires `isolated-read-only-v1`; an absent
+protocol list is `[]` and absent enforcement is `none`. Unsupported peers keep
+the flat singular path and never receive a declaration.
 
 ## Strategies
 
@@ -34,6 +46,8 @@ m.Teardown(ctx, "sess-123")
 ## Tests
 
 - `manager_test.go` — unit tests with stub `CommandRunner` (no real git). Covers happy path, retry-then-succeed, lost-ownership, non-retriable, exhausted retries, ctx-cancel, both strategies.
+- `nested_layout_test.go` — declaration selection, concurrent root isolation,
+  root-bound cleanup and leases, retained-flat coexistence, and generation identity.
 - `integration_test.go` (build tag `runtime_integration`) — bare-repo fixture exercises real `git clone` against a temp repo.
 
 ## Failure modes
@@ -45,8 +59,13 @@ m.Teardown(ctx, "sess-123")
 | Repo URL invalid | Non-retriable; fail-fast on first attempt. |
 | ctx cancelled during retry wait | `ctx.Err()` propagated. |
 | Teardown on unknown session | No-op (idempotent). |
+| Declaration on an unattested executor | Typed refusal before filesystem mutation. |
+| Duplicate or unsafe repository leaf | Typed declaration refusal; never auto-renamed. |
+| Retained flat workarea plus new multi-repository work | Fresh encoded root beside the flat workarea; the flat directory is not moved or extended. |
 
 ## Source
 
-- `manager.go` — `Manager`, `Provision`, `Teardown`, `Path`.
+- `manager.go` — `Manager`, `Provision`, `Teardown`, `Path`, `Layout`, and root-bound lease release.
+- `../workarea/declaration.go` — the closed declaration/filter grammar and atomic secret-free record.
+- `../workarea/layout.go` — typed root/CWD layout plus declared and legacy-flat discovery.
 - Legacy reference: `../../../donmai-libraries/packages/core/src/workarea/git-worktree.ts` + `../../../donmai-libraries/packages/cli/src/lib/worker-runner.ts:884-1000`.

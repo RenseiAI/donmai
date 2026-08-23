@@ -53,6 +53,46 @@ func TestDaemonClient_ListWorkareas_HappyPath(t *testing.T) {
 	}
 }
 
+func TestDaemonClient_WorkareaV1MethodsDecodeAdditiveLayout(t *testing.T) {
+	root := "/tmp/workarea-root"
+	selected := root + "/primary"
+	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/daemon/workareas" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(afclient.ListWorkareasV1Response{Active: []afclient.WorkareaSummaryV1{{
+				ID: "wa-v1", Kind: afclient.WorkareaKindActive, Status: afclient.WorkareaStatusReady,
+				WorkareaRoot: root, RepositoryWorktreePath: selected,
+			}}})
+		case r.URL.Path == "/api/daemon/workareas/wa-v1" && r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(afclient.WorkareaV1Envelope{Workarea: afclient.WorkareaV1{
+				ID: "wa-v1", Kind: afclient.WorkareaKindActive, Status: afclient.WorkareaStatusReady,
+				Path: selected, WorkareaRoot: root, RepositoryWorktreePath: selected,
+			}})
+		case r.URL.Path == "/api/daemon/workareas/wa-v1/restore" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(afclient.WorkareaRestoreV1Result{Workarea: afclient.WorkareaV1{
+				ID: "wa-v1", Kind: afclient.WorkareaKindActive, Status: afclient.WorkareaStatusReady,
+				Path: selected, WorkareaRoot: root, RepositoryWorktreePath: selected,
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	listed, err := client.ListWorkareasV1()
+	if err != nil || len(listed.Active) != 1 || listed.Active[0].WorkareaRoot != root {
+		t.Fatalf("ListWorkareasV1 = %+v, %v", listed, err)
+	}
+	inspected, err := client.GetWorkareaV1("wa-v1")
+	if err != nil || inspected.Workarea.RepositoryWorktreePath != selected {
+		t.Fatalf("GetWorkareaV1 = %+v, %v", inspected, err)
+	}
+	restored, err := client.RestoreWorkareaV1("wa-v1", afclient.WorkareaRestoreRequest{})
+	if err != nil || restored.Workarea.WorkareaRoot != root {
+		t.Fatalf("RestoreWorkareaV1 = %+v, %v", restored, err)
+	}
+}
+
 func TestDaemonClient_ListWorkareas_ServerError(t *testing.T) {
 	client, _ := newWorkareaTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)

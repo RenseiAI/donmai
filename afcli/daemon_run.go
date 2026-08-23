@@ -137,14 +137,14 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			}
 
 			// Standalone-creds wiring (Lane K). When `af` is running
-			// outside of rensei-tui (no daemon credential pipeline,
+			// outside of a credential-managing controller (no daemon credential pipeline,
 			// no platform session), agents inherit credentials from
 			// the af process per the precedence:
 			//   1. existing process env
 			//   2. ${gitRoot}/.env.local (parsed once at startup)
 			//
 			// Auto-detect mode: absence of DONMAI_DAEMON_JWT means we
-			// are NOT being driven by rensei-tui's credential socket
+			// are NOT being driven by an external credential socket
 			// and should seed env from the local source. Operators
 			// can pin the mode via --standalone-creds=on|off.
 			errOut := cmd.ErrOrStderr()
@@ -164,7 +164,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 				)
 			} else if localSource != nil {
 				// Diagnostic-only: load but don't seed. The daemon's
-				// own credential pipeline (rensei-tui driven) owns
+				// own externally driven credential pipeline owns
 				// agent env in this mode.
 				slog.Debug(
 					"standalone creds disabled — LocalSource loaded read-only",
@@ -191,9 +191,21 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// Reconcile terminal authorities before the daemon admits work. Receiver
 			// endpoints are resolved from the separate registry on every replay;
 			// no bearer is persisted by this public implementation.
+			archiveRoot := ""
+			if daemonConfig, configErr := daemon.LoadConfig(configPath); configErr == nil {
+				archiveRoot = daemonConfig.Workarea.ArchiveRoot
+			}
+			worktreeParent := statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
+			archiveRegistry := daemon.NewWorkareaArchiveRegistry(daemon.WorkareaArchiveOptions{Root: archiveRoot, WorktreeParent: worktreeParent})
 			leaseManager, err := worktree.NewManager(worktree.Options{
-				ParentDir: statepath.Resolve("worktrees", "/tmp/.donmai/worktrees"),
+				ParentDir: worktreeParent,
 				Logger:    slog.Default(),
+				ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) error {
+					return archiveRegistry.ArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{
+						AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID, SessionID: spec.SessionID,
+						WorkareaRoot: spec.WorkareaRoot, SelectedPath: spec.SelectedPath,
+					})
+				},
 			})
 			if err != nil {
 				return fmt.Errorf("terminal lease recovery authority: %w", err)

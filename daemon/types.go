@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/runner/access"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -115,6 +116,8 @@ const (
 // session. It is distinct from the "interview" turn-taking mode.
 const interactiveRunMode = "interactive"
 
+const worktreeModeShared = "shared"
+
 // SessionSpec is an inbound work specification dispatched by the orchestrator.
 // Subset of SandboxSpec from 004 relevant to the daemon's session-dispatch
 // path.
@@ -133,6 +136,13 @@ type SessionSpec struct {
 	// RepositoryID is the stable selected repository-resource identity.
 	RepositoryID string `json:"repositoryId,omitempty"`
 	Repository   string `json:"repository"`
+	// RepositoryDeclaration is the additive exact-protocol carrier. Nil is the
+	// legacy default-primary singular path.
+	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
+	WorkareaMode          string                            `json:"workareaMode,omitempty"`
+	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
+	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
+	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
 	// RequiresRepository distinguishes repository-free work from work that
 	// must select a repository resource or configured primary.
 	RequiresRepository bool              `json:"requiresRepository,omitempty"`
@@ -249,6 +259,10 @@ type SessionHandle struct {
 	// <path>/.agent/state.json. Empty when the daemon cannot resolve the
 	// worktree parent (no state dir).
 	WorktreePath string `json:"worktreePath,omitempty"`
+
+	// WorkareaRoot is the additive session-owned lifecycle root. WorktreePath
+	// remains the selected repository CWD for mixed-version readers.
+	WorkareaRoot string `json:"workareaRoot,omitempty"`
 
 	// ProjectName is the allowlist-resolved project identifier
 	// (ProjectConfig.ID) this session was dispatched under. Mirrors

@@ -30,6 +30,16 @@ func (c *DaemonClient) ListWorkareas() (*ListWorkareasResponse, error) {
 	return &resp, nil
 }
 
+// ListWorkareasV1 fetches the additive session-root-v1 projection. Existing
+// callers may keep using ListWorkareas and its frozen source-compatible types.
+func (c *DaemonClient) ListWorkareasV1() (*ListWorkareasV1Response, error) {
+	var resp ListWorkareasV1Response
+	if err := c.get("/api/daemon/workareas", &resp); err != nil {
+		return nil, fmt.Errorf("list workareas v1: %w", err)
+	}
+	return &resp, nil
+}
+
 // GetWorkarea fetches a single workarea by id from
 // GET /api/daemon/workareas/<id>. The id may be either an active pool
 // member id or an archive id; the response Workarea.Kind disambiguates.
@@ -41,6 +51,18 @@ func (c *DaemonClient) GetWorkarea(id string) (*WorkareaEnvelope, error) {
 	var resp WorkareaEnvelope
 	if err := c.get("/api/daemon/workareas/"+id, &resp); err != nil {
 		return nil, fmt.Errorf("get workarea: %w", err)
+	}
+	return &resp, nil
+}
+
+// GetWorkareaV1 fetches the additive session-root-v1 inspect projection.
+func (c *DaemonClient) GetWorkareaV1(id string) (*WorkareaV1Envelope, error) {
+	if id == "" {
+		return nil, fmt.Errorf("get workarea v1: id is required")
+	}
+	var resp WorkareaV1Envelope
+	if err := c.get("/api/daemon/workareas/"+id, &resp); err != nil {
+		return nil, fmt.Errorf("get workarea v1: %w", err)
 	}
 	return &resp, nil
 }
@@ -61,6 +83,19 @@ func (c *DaemonClient) RestoreWorkarea(archiveID string, req WorkareaRestoreRequ
 	var resp WorkareaRestoreResult
 	if err := c.post("/api/daemon/workareas/"+archiveID+"/restore", req, &resp); err != nil {
 		return nil, fmt.Errorf("restore workarea: %w", err)
+	}
+	return &resp, nil
+}
+
+// RestoreWorkareaV1 restores an archive and decodes additive session-root-v1
+// layout metadata.
+func (c *DaemonClient) RestoreWorkareaV1(archiveID string, req WorkareaRestoreRequest) (*WorkareaRestoreV1Result, error) {
+	if archiveID == "" {
+		return nil, fmt.Errorf("restore workarea v1: archiveID is required")
+	}
+	var resp WorkareaRestoreV1Result
+	if err := c.post("/api/daemon/workareas/"+archiveID+"/restore", req, &resp); err != nil {
+		return nil, fmt.Errorf("restore workarea v1: %w", err)
 	}
 	return &resp, nil
 }
