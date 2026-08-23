@@ -33,6 +33,34 @@ func TestControllerProtocolRangeRequiresExplicitFullFrameConsumption(t *testing.
 	}
 }
 
+func TestVerifyHelloRequiresExactNestedRootButAllowsDegenerateLegacyOmission(t *testing.T) {
+	hello := shimwire.Hello{
+		Protocol: shimwire.ProtocolName, OrgID: "org", SessionID: "session", ShimID: "shim",
+		PID: 42, ProcessStartedAt: 99, Phase: shimwire.PhaseRunning, WorkareaPath: "/work/root/repo",
+	}
+	record := Record{
+		OrgID: "org", SessionID: "session", ShimID: "shim", PID: 42, ProcessStartedAt: 99,
+		WorkareaPath: "/work/root/repo",
+	}
+	if err := verifyHello(hello, record, "/work/root/repo", "/work/root"); !errors.Is(err, ErrAdoptionRefused) {
+		t.Fatalf("nested missing-root verification = %v", err)
+	}
+	record.WorkareaRoot = "/work/root"
+	if err := verifyHello(hello, record, "/work/root/repo", "/work/root"); err != nil {
+		t.Fatalf("exact nested root refused: %v", err)
+	}
+	record.WorkareaRoot = "/work/other"
+	if err := verifyHello(hello, record, "/work/root/repo", "/work/root"); !errors.Is(err, ErrAdoptionRefused) {
+		t.Fatalf("wrong nested root verification = %v", err)
+	}
+	record.WorkareaRoot = ""
+	hello.WorkareaPath = "/work/legacy"
+	record.WorkareaPath = "/work/legacy"
+	if err := verifyHello(hello, record, "/work/legacy", "/work/legacy"); err != nil {
+		t.Fatalf("degenerate legacy omission refused: %v", err)
+	}
+}
+
 func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
 	clientConn, shimConn := net.Pipe()
 	defer clientConn.Close() //nolint:errcheck

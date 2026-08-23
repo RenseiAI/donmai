@@ -43,6 +43,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // ManifestFileName is the worktree-relative path (under .agent/) the agent
@@ -119,7 +120,21 @@ const manifestSchema = `{
     "summary": { "type": "string" },
     "blockedReason": { "type": "string" },
     "pullRequestUrl": { "type": "string" },
-    "commitSha": { "type": "string" }
+    "commitSha": { "type": "string" },
+    "repositories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "verdict": { "type": "string", "enum": ["passed", "failed", "blocked"] },
+          "summary": { "type": "string" },
+          "pullRequestUrl": { "type": "string" },
+          "commitSha": { "type": "string" }
+        }
+      }
+    }
   }
 }`
 
@@ -177,6 +192,9 @@ func ParseManifest(worktreePath string) (*TurnManifest, error) {
 	// unrecognised verdict into the resolution order.
 	if _, ok := validVerdicts[m.Verdict]; !ok {
 		return nil, fmt.Errorf("runner: turn-result manifest verdict %q is not one of passed/failed/blocked", m.Verdict)
+	}
+	if err := validateManifestRepositories(manifestRepositoryEntries(&m)); err != nil {
+		return nil, err
 	}
 
 	return &m, nil
@@ -238,8 +256,37 @@ func ParseInlineManifest(finalMessage string) (*TurnManifest, error) {
 	if _, ok := validVerdicts[m.Verdict]; !ok {
 		return nil, ErrNoInlineManifest
 	}
+	if err := validateManifestRepositories(manifestRepositoryEntries(&m)); err != nil {
+		return nil, ErrNoInlineManifest
+	}
 
 	return &m, nil
+}
+
+func validateManifestRepositories(repositories []agent.TurnManifestRepository) error {
+	seen := make(map[string]struct{}, len(repositories))
+	for _, repository := range repositories {
+		if repository.Name == "" {
+			return errors.New("runner: turn-result repository name is empty")
+		}
+		if _, duplicate := seen[repository.Name]; duplicate {
+			return fmt.Errorf("runner: turn-result repository %q is duplicated", repository.Name)
+		}
+		seen[repository.Name] = struct{}{}
+		if repository.Verdict != "" {
+			if _, ok := validVerdicts[repository.Verdict]; !ok {
+				return fmt.Errorf("runner: turn-result repository %q verdict %q is invalid", repository.Name, repository.Verdict)
+			}
+		}
+	}
+	return nil
+}
+
+func manifestRepositoryEntries(manifest *TurnManifest) []agent.TurnManifestRepository {
+	if manifest == nil || manifest.Repositories == nil {
+		return nil
+	}
+	return *manifest.Repositories
 }
 
 // extractBalancedJSONObject returns the FIRST balanced `{ … }` object in s,
@@ -371,6 +418,11 @@ func (r *Runner) applyTurnManifest(worktreePath string, qw QueuedWork, res *Resu
 			"hasPR", m.PullRequestURL != "",
 		)
 	}
+	if err := validateManifestDeclaration(qw, m); err != nil {
+		r.logger.Warn("turn-result manifest repository projection unusable; falling back to marker scrape",
+			"sessionId", qw.SessionID, "err", err)
+		return
+	}
 
 	// Carry the validated manifest VERBATIM on the envelope so the poster can
 	// post the structured object to the platform's applyTurnManifest route
@@ -410,4 +462,45 @@ func (r *Runner) applyTurnManifest(worktreePath string, qw QueuedWork, res *Resu
 	if m.CommitSHA != "" && res.CommitSHA == "" {
 		res.CommitSHA = m.CommitSHA
 	}
+}
+
+func validateManifestDeclaration(qw QueuedWork, manifest *TurnManifest) error {
+	if qw.RepositoryDeclaration == nil {
+		if len(manifestRepositoryEntries(manifest)) != 0 {
+			return errors.New("runner: per-repository turn result requires a negotiated repository declaration")
+		}
+		return nil
+	}
+	declaration, err := qw.RepositoryDeclaration.Normalize()
+	if err != nil {
+		return err
+	}
+	mutable := make(map[string]struct{})
+	for _, repository := range declaration.Repositories {
+		if repository.Authority == workarea.RepositoryMutable {
+			mutable[repository.Name] = struct{}{}
+		}
+	}
+	repositoryResults := manifestRepositoryEntries(manifest)
+	if len(repositoryResults) == 0 {
+		if len(mutable) == 1 {
+			if _, selectedIsMutable := mutable[declaration.Selected.Name]; selectedIsMutable {
+				return nil
+			}
+		}
+		return errors.New("runner: scalar turn result cannot represent every mutable repository in this declaration")
+	}
+	seen := make(map[string]struct{}, len(repositoryResults))
+	for _, repository := range repositoryResults {
+		if _, isMutable := mutable[repository.Name]; !isMutable {
+			return fmt.Errorf("runner: turn-result repository %q is undeclared or read-only", repository.Name)
+		}
+		seen[repository.Name] = struct{}{}
+	}
+	for name := range mutable {
+		if _, present := seen[name]; !present {
+			return fmt.Errorf("runner: turn-result omitted mutable repository %q", name)
+		}
+	}
+	return nil
 }

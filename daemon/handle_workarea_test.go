@@ -476,6 +476,7 @@ func TestHandleWorkareas_ConcurrentDiffAndRestore(t *testing.T) {
 // in Active[] (in addition to any on-disk archives).
 func TestHandleWorkareas_List_IncludesSpawnerLivePool(t *testing.T) {
 	root := t.TempDir()
+	worktreeRoot := t.TempDir()
 	writeFixtureArchive(t, root, fixtureArchive{id: "wa-archived"})
 
 	d := New(Options{HTTPHost: "127.0.0.1", HTTPPort: 0})
@@ -494,6 +495,7 @@ func TestHandleWorkareas_List_IncludesSpawnerLivePool(t *testing.T) {
 		}},
 		MaxConcurrentSessions: 2,
 		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+		WorktreeParentDir:     worktreeRoot,
 	})
 	d.spawner = spawner
 	t.Cleanup(func() { _ = spawner.Drain(time.Second) })
@@ -504,6 +506,9 @@ func TestHandleWorkareas_List_IncludesSpawnerLivePool(t *testing.T) {
 		Ref:        "feat/y",
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(worktreeRoot, "sess-live-1"), 0o750); err != nil {
+		t.Fatal(err)
 	}
 
 	srv := &Server{daemon: d}
@@ -546,6 +551,15 @@ func TestHandleWorkareas_List_IncludesSpawnerLivePool(t *testing.T) {
 	// On-disk archive must still surface in Archived[].
 	if len(body.Archived) != 1 || body.Archived[0].ID != "wa-archived" {
 		t.Errorf("Archived[]: want one entry id=wa-archived, got %+v", body.Archived)
+	}
+	versionedResponse, err := http.Get(hsrv.URL + "/api/daemon/workareas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var versioned afclient.ListWorkareasV1Response
+	decodeBody(t, versionedResponse, &versioned)
+	if len(versioned.Active) != 1 || versioned.Active[0].WorkareaRoot == "" || versioned.Active[0].RepositoryWorktreePath == "" {
+		t.Fatalf("versioned active layout = %+v", versioned.Active)
 	}
 
 	// The live-pool entry's id should be addressable via the per-id

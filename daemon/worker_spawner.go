@@ -15,6 +15,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/interview"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // Compile-time assertion that WorkerSpawner satisfies the
@@ -384,39 +385,165 @@ func (s *WorkerSpawner) ActiveSessions() []SessionHandle {
 //
 // Output is sorted by SessionID for deterministic test assertions.
 func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
+	versioned := s.ActiveWorkareasV1()
+	out := make([]afclient.WorkareaSummary, len(versioned))
+	for index := range versioned {
+		out[index] = versioned[index].Legacy()
+	}
+	return out
+}
+
+// ActiveWorkareasV1 returns additive session-root-v1 layout metadata.
+func (s *WorkerSpawner) ActiveWorkareasV1() []afclient.WorkareaSummaryV1 {
+	out, err := s.ActiveWorkareasStrictV1()
+	if err == nil {
+		return out
+	}
+	// Source compatibility for legacy embedders that consumed this errorless
+	// projection before physical accounting existed. The daemon registry uses
+	// ActiveWorkareasStrictV1 and never takes this fallback.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]afclient.WorkareaSummary, 0, len(s.sessions))
-	for _, ss := range s.sessions {
-		summary := afclient.WorkareaSummary{
-			ID:         ss.spec.SessionID,
-			Kind:       afclient.WorkareaKindActive,
-			Status:     afclient.WorkareaStatusReady,
-			Repository: ss.spec.Repository,
-			Ref:        ss.spec.Ref,
-			SessionID:  ss.spec.SessionID,
+	out = make([]afclient.WorkareaSummaryV1, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		project := s.findProjectForSpecLocked(session.spec)
+		if session.spec.ProjectID == "" {
+			project = s.findProjectLocked(session.spec.Repository)
 		}
+		projectID := session.spec.ProjectID
+		if project != nil {
+			projectID = project.ID
+		}
+		summary := afclient.WorkareaSummaryV1{
+			ID: session.spec.SessionID, Kind: afclient.WorkareaKindActive, Status: afclient.WorkareaStatusReady,
+			Repository: session.spec.Repository, Ref: session.spec.Ref, SessionID: session.spec.SessionID, ProjectID: projectID,
+			WorkareaRoot: session.handle.WorkareaRoot, RepositoryWorktreePath: session.handle.WorktreePath,
+		}
+		if timestamp, parseErr := time.Parse(time.RFC3339, session.handle.AcceptedAt); parseErr == nil {
+			summary.AcquiredAt = &timestamp
+		}
+		out = append(out, summary)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SessionID < out[j].SessionID })
+	return out
+}
+
+// ActiveWorkareasStrict preserves the original source-compatible projection.
+func (s *WorkerSpawner) ActiveWorkareasStrict() ([]afclient.WorkareaSummary, error) {
+	versioned, err := s.ActiveWorkareasStrictV1()
+	if err != nil {
+		return nil, err
+	}
+	legacy := make([]afclient.WorkareaSummary, len(versioned))
+	for index := range versioned {
+		legacy[index] = versioned[index].Legacy()
+	}
+	return legacy, nil
+}
+
+// ActiveWorkareasStrictV1 projects complete root ownership and fails closed
+// when any live root cannot be declared or physically accounted. Shared
+// participants collapse onto their one declaration WorkareaID so one allocation
+// is charged once.
+func (s *WorkerSpawner) ActiveWorkareasStrictV1() ([]afclient.WorkareaSummaryV1, error) {
+	s.mu.Lock()
+	type snapshot struct {
+		handle    SessionHandle
+		spec      SessionSpec
+		projectID string
+	}
+	snapshots := make([]snapshot, 0, len(s.sessions))
+	for _, ss := range s.sessions {
 		project := s.findProjectForSpecLocked(ss.spec)
 		if ss.spec.ProjectID == "" {
 			project = s.findProjectLocked(ss.spec.Repository)
 		}
+		projectID := ss.spec.ProjectID
 		if project != nil {
-			summary.ProjectID = project.ID
-		} else {
-			summary.ProjectID = ss.spec.ProjectID
+			projectID = project.ID
 		}
+		snapshots = append(snapshots, snapshot{handle: ss.handle, spec: ss.spec, projectID: projectID})
+	}
+	s.mu.Unlock()
+
+	out := make([]afclient.WorkareaSummaryV1, 0, len(snapshots))
+	seenRoots := make(map[string]struct{})
+	for _, item := range snapshots {
+		root := item.handle.WorkareaRoot
+		if root == "" {
+			root = item.handle.WorktreePath
+		}
+		if root == "" || item.handle.WorktreePath == "" {
+			return nil, fmt.Errorf("daemon: active session %q has no accountable workarea path", item.spec.SessionID)
+		}
+		rootHandle, err := workarea.OpenRootExact(workarea.RootPath(root), workarea.FileIdentity{})
+		if err != nil {
+			return nil, fmt.Errorf("daemon: pin active workarea %q: %w", item.spec.SessionID, err)
+		}
+		summary := afclient.WorkareaSummaryV1{
+			ID:                     item.spec.SessionID,
+			Kind:                   afclient.WorkareaKindActive,
+			Status:                 afclient.WorkareaStatusReady,
+			Repository:             item.spec.Repository,
+			Ref:                    item.spec.Ref,
+			SessionID:              item.spec.SessionID,
+			ProjectID:              item.projectID,
+			WorkareaRoot:           root,
+			RepositoryWorktreePath: item.handle.WorktreePath,
+		}
+		groupKey := "legacy:" + filepath.Clean(root)
+		if filepath.Clean(root) != filepath.Clean(item.handle.WorktreePath) {
+			record, err := workarea.ReadDeclarationRoot(rootHandle)
+			if err != nil {
+				_ = rootHandle.Close()
+				return nil, fmt.Errorf("daemon: read active workarea declaration for %q: %w", item.spec.SessionID, err)
+			}
+			if err := workarea.ValidateDeclaredRootHandle(rootHandle, record); err != nil {
+				_ = rootHandle.Close()
+				return nil, fmt.Errorf("daemon: validate active workarea declaration for %q: %w", item.spec.SessionID, err)
+			}
+			groupKey = "nested:" + record.WorkareaID
+			summary.ID = record.WorkareaID
+			summary.SessionID = record.SessionID
+			selectedMatched := false
+			for _, repository := range record.Repositories {
+				path := filepath.Join(root, repository.Leaf)
+				selectedMatched = selectedMatched || filepath.Clean(path) == filepath.Clean(item.handle.WorktreePath)
+				summary.Repositories = append(summary.Repositories, afclient.WorkareaRepository{
+					Name: repository.Name, Leaf: repository.Leaf, Path: path,
+					Role: string(repository.Role), Authority: string(repository.Authority),
+					RequestedRef: repository.RequestedRef, ResolvedRef: repository.ResolvedRef,
+					SourceDigest: repository.SourceDigest, SparsePaths: append([]string(nil), repository.SparsePaths...),
+				})
+			}
+			if !selectedMatched {
+				_ = rootHandle.Close()
+				return nil, fmt.Errorf("daemon: selected repository path for %q is not the declared selection", item.spec.SessionID)
+			}
+		}
+		if _, duplicate := seenRoots[groupKey]; duplicate {
+			_ = rootHandle.Close()
+			continue
+		}
+		seenRoots[groupKey] = struct{}{}
+		usage, err := workarea.PhysicalUsageRoot(rootHandle)
+		_ = rootHandle.Close()
+		if err != nil {
+			return nil, fmt.Errorf("daemon: account active workarea %q: %w", item.spec.SessionID, err)
+		}
+		summary.SizeBytes = usage
 		// handle.AcceptedAt is RFC3339 today; surface it on the wire as
 		// AcquiredAt (the active-only "session admitted to pool" stamp).
 		// Parse failures yield nil — better than a zero-time pointer
 		// that JSON-encodes as "0001-01-01T00:00:00Z".
-		if ts, err := time.Parse(time.RFC3339, ss.handle.AcceptedAt); err == nil {
+		if ts, err := time.Parse(time.RFC3339, item.handle.AcceptedAt); err == nil {
 			t := ts
 			summary.AcquiredAt = &t
 		}
 		out = append(out, summary)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SessionID < out[j].SessionID })
-	return out
+	return out, nil
 }
 
 // Pause stops accepting new work but leaves running sessions alive.
@@ -888,6 +1015,10 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		delete(s.spawnReservations, spec.SessionID)
 		s.mu.Unlock()
 	}()
+	layout, err := sessionWorkareaLayout(s.opts.WorktreeParentDir, spec)
+	if err != nil {
+		return nil, err
+	}
 
 	// §D1: shim ownership is decided before any daemon-owned process exists. Once
 	// the direct path has created a pipe or an exec.Cmd, the daemon is already
@@ -1032,7 +1163,8 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	// spawning anything. Empty parent leaves WorktreePath empty (the reader
 	// falls back to a per-session detail call).
 	if s.opts.WorktreeParentDir != "" {
-		handle.WorktreePath = filepath.Join(s.opts.WorktreeParentDir, spec.SessionID)
+		handle.WorktreePath = layout.Repository.String()
+		handle.WorkareaRoot = layout.Root.String()
 	}
 
 	ss := &spawnedSession{
@@ -1251,6 +1383,50 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	}()
 
 	return &handle, nil
+}
+
+func sessionWorkareaLayout(parentDir string, spec SessionSpec) (workarea.Layout, error) {
+	if parentDir == "" {
+		return workarea.Layout{}, nil
+	}
+	if spec.WorkareaMode == worktreeModeShared {
+		if spec.ParentWorkareaID == "" || spec.RepositoryDeclaration == nil {
+			return workarea.Layout{}, errors.New("daemon: shared workarea requires parentWorkareaId and repositoryDeclaration")
+		}
+		store, err := workarea.NewAcquisitionStore(parentDir, nil)
+		if err != nil {
+			return workarea.Layout{}, err
+		}
+		record, err := store.RecordForWorkareaID(spec.ParentWorkareaID)
+		if err != nil {
+			return workarea.Layout{}, err
+		}
+		declaration, err := workarea.ReadDeclaration(workarea.RootPath(record.FinalRoot))
+		if err != nil {
+			return workarea.Layout{}, err
+		}
+		selected, err := declaration.ResolveOne(spec.RepositoryFilter)
+		if err != nil {
+			return workarea.Layout{}, err
+		}
+		return workarea.Layout{
+			Root:       workarea.RootPath(record.FinalRoot),
+			Repository: workarea.RepositoryPath(filepath.Join(record.FinalRoot, selected.Leaf)),
+		}, nil
+	}
+	selectedLeaf := ""
+	if spec.RepositoryDeclaration != nil {
+		normalized, err := spec.RepositoryDeclaration.Normalize()
+		if err != nil {
+			return workarea.Layout{}, err
+		}
+		if err := normalized.ValidatePrimarySource(workarea.RepositorySource{Repository: spec.Repository, Ref: spec.Ref}); err != nil {
+			return workarea.Layout{}, err
+		}
+		selectedLeaf = normalized.Selected.Leaf
+	}
+	layout, _, err := workarea.DiscoverLayout(parentDir, spec.SessionID, selectedLeaf)
+	return layout, err
 }
 
 // StopSession requests cooperative termination for one session without releasing

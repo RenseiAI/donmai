@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // RegistrationOptions configure a single Register call.
@@ -90,6 +92,11 @@ type RegistrationOptions struct {
 	// legacy request/cache contract. When Supported is true, a matching typed
 	// server receipt is required before credentials may be returned or cached.
 	SessionShim SessionShimHostAttestation
+
+	// WorkareaExecutors is the exact harness/adapter-scoped capability set.
+	// Nil/empty preserves legacy registration and means no positive protocol
+	// or repository-authority attestation.
+	WorkareaExecutors []workarea.ExecutorCapabilityAttestation
 
 	// AuthOnly suppresses registration-time capacity publication during hosted
 	// recovery. It is valid only with a supported SessionShim attestation; the
@@ -197,6 +204,10 @@ type RegisterRequest struct {
 	// SessionShimHostAttestation is embedded so its additive keys stay flat on
 	// the registration wire. The zero value emits no keys.
 	SessionShimHostAttestation
+
+	// WorkareaExecutors keeps protocol/enforcement attestations bound to the
+	// exact executor instead of widening them into a host-level bool.
+	WorkareaExecutors []workarea.ExecutorCapabilityAttestation `json:"workareaExecutors,omitempty"`
 }
 
 // ProjectAllowlistEntry is the wire shape for a single allowlisted project
@@ -458,6 +469,7 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		ProjectAdmissionMode:       normalizeProjectAdmissionMode(opts.ProjectAdmissionMode),
 		HostInfo:                   opts.HostInfo,
 		SessionShimHostAttestation: cloneSessionShimHostAttestation(opts.SessionShim),
+		WorkareaExecutors:          append([]workarea.ExecutorCapabilityAttestation(nil), opts.WorkareaExecutors...),
 	}
 	if req.MachineID == "" {
 		// The stable machine identity, NOT the hostname. Falling back to the

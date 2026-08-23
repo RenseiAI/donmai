@@ -11,6 +11,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // writeManifestFile writes raw to <dir>/.agent/turn-result.json, creating the
@@ -538,4 +539,47 @@ func TestManifestTypeAlias(_ *testing.T) {
 	m := TurnManifest{SchemaVersion: 1, Verdict: "passed"}
 	sink := func(agent.TurnManifest) {}
 	sink(m) // compiles iff TurnManifest IS agent.TurnManifest
+}
+
+func TestParseManifestPerRepositoryMembers(t *testing.T) {
+	dir := t.TempDir()
+	writeManifestFile(t, dir, `{"schemaVersion":1,"verdict":"passed","repositories":[{"name":"primary","verdict":"passed","commitSha":"abc"}]}`)
+	manifest, err := ParseManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := manifestRepositoryEntries(manifest)
+	if len(entries) != 1 || entries[0].Name != "primary" || entries[0].CommitSHA != "abc" {
+		t.Fatalf("repository results = %#v", entries)
+	}
+
+	duplicateDir := t.TempDir()
+	writeManifestFile(t, duplicateDir, `{"schemaVersion":1,"verdict":"passed","repositories":[{"name":"primary"},{"name":"primary"}]}`)
+	if _, err := ParseManifest(duplicateDir); err == nil {
+		t.Fatal("duplicate per-repository result was accepted")
+	}
+}
+
+func TestManifestDeclarationExcludesReadOnlyAndRequiresEveryMutableRepository(t *testing.T) {
+	declaration := &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: "https://example.test/primary.git"}, Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: "https://example.test/secondary.git"}, Role: workarea.RepositoryRoleSecondary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: "https://example.test/context.git"}, Role: workarea.RepositoryRoleContext, Authority: workarea.RepositoryReadOnly},
+		},
+	}
+	qw := QueuedWork{RepositoryDeclaration: declaration}
+	readOnlyEntries := []agent.TurnManifestRepository{{Name: "context", CommitSHA: "forbidden"}}
+	if err := validateManifestDeclaration(qw, &TurnManifest{Repositories: &readOnlyEntries}); err == nil {
+		t.Fatal("read-only repository entered completion contract")
+	}
+	missingEntries := []agent.TurnManifestRepository{{Name: "primary"}}
+	if err := validateManifestDeclaration(qw, &TurnManifest{Repositories: &missingEntries}); err == nil {
+		t.Fatal("omitted mutable secondary repository was accepted")
+	}
+	completeEntries := []agent.TurnManifestRepository{{Name: "primary"}, {Name: "secondary"}}
+	if err := validateManifestDeclaration(qw, &TurnManifest{Repositories: &completeEntries}); err != nil {
+		t.Fatalf("complete mutable set: %v", err)
+	}
 }

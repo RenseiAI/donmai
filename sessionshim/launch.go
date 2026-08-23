@@ -186,6 +186,12 @@ func parseUint(v, key string) (uint64, error) {
 // from the same env block the controller wrote would make that check compare a
 // value against itself.
 func StartFromEnv(l Launch, spec ptyhost.Spec, workareaPath string) (*Shim, error) {
+	return StartFromEnvWithRoot(l, spec, workareaPath, "")
+}
+
+// StartFromEnvWithRoot is the additive session-root-v1 launch path. The legacy
+// helper above keeps old call sites and discovery bytes unchanged.
+func StartFromEnvWithRoot(l Launch, spec ptyhost.Spec, workareaPath, workareaRoot string) (*Shim, error) {
 	registry, err := NewRegistry(l.RegistryDir)
 	if err != nil {
 		return nil, err
@@ -195,6 +201,7 @@ func StartFromEnv(l Launch, spec ptyhost.Spec, workareaPath string) (*Shim, erro
 		Registry:     registry,
 		Spec:         spec,
 		WorkareaPath: workareaPath,
+		WorkareaRoot: workareaRoot,
 		Orphan:       l.Orphan,
 		ProcessEpoch: l.ProcessEpoch,
 	})

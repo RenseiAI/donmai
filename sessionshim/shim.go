@@ -36,6 +36,9 @@ type Options struct {
 	// verified at adoption, so a shim cannot be adopted into a workarea other
 	// than the one it is actually running in.
 	WorkareaPath string
+	// WorkareaRoot is the optional session-owned lifecycle root. Empty preserves
+	// the released discovery-record bytes for legacy flat workareas.
+	WorkareaRoot string
 
 	// Orphan bounds the controller-loss rule. A zero policy uses
 	// DefaultOrphanPolicy.
@@ -85,13 +88,14 @@ type Shim struct {
 	now      func() time.Time
 	orphan   OrphanPolicy
 
-	shimID      string
-	epoch       uint64
-	self        ProcessIdentity
-	harness     ProcessIdentity
-	workarea    string
-	protocolMin uint32
-	protocolMax uint32
+	shimID       string
+	epoch        uint64
+	self         ProcessIdentity
+	harness      ProcessIdentity
+	workarea     string
+	workareaRoot string
+	protocolMin  uint32
+	protocolMax  uint32
 
 	socketPath string
 	socketDev  uint64
@@ -329,27 +333,28 @@ func Start(opts Options) (*Shim, error) {
 	}
 
 	s := &Shim{
-		id:          opts.Identity,
-		registry:    opts.Registry,
-		sess:        sess,
-		ln:          ln,
-		logger:      opts.logger(),
-		now:         opts.now(),
-		orphan:      orphan,
-		shimID:      shimID,
-		epoch:       opts.ProcessEpoch,
-		self:        self,
-		harness:     ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
-		workarea:    opts.WorkareaPath,
-		protocolMin: protocolMin,
-		protocolMax: protocolMax,
-		socketPath:  socketPath,
-		socketDev:   dev,
-		socketIno:   ino,
-		phase:       shimwire.PhaseRunning,
-		done:        make(chan struct{}),
-		acceptDone:  make(chan struct{}),
-		ackNotify:   make(chan struct{}),
+		id:           opts.Identity,
+		registry:     opts.Registry,
+		sess:         sess,
+		ln:           ln,
+		logger:       opts.logger(),
+		now:          opts.now(),
+		orphan:       orphan,
+		shimID:       shimID,
+		epoch:        opts.ProcessEpoch,
+		self:         self,
+		harness:      ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
+		workarea:     opts.WorkareaPath,
+		workareaRoot: opts.WorkareaRoot,
+		protocolMin:  protocolMin,
+		protocolMax:  protocolMax,
+		socketPath:   socketPath,
+		socketDev:    dev,
+		socketIno:    ino,
+		phase:        shimwire.PhaseRunning,
+		done:         make(chan struct{}),
+		acceptDone:   make(chan struct{}),
+		ackNotify:    make(chan struct{}),
 	}
 
 	if err := s.publishRecord(); err != nil {
@@ -640,6 +645,7 @@ func (s *Shim) publishRecordWithDeadline(deadline time.Time) error {
 		ProtocolMax:       s.protocolMax,
 		Phase:             phase,
 		WorkareaPath:      s.workarea,
+		WorkareaRoot:      s.workareaRoot,
 		CreatedAtUnixNano: s.now().UnixNano(),
 	}
 	if !deadline.IsZero() {

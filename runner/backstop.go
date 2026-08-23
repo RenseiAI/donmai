@@ -11,6 +11,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/gitexec"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // ============================================================================
@@ -380,6 +381,83 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		report.PRCreated = true
 	}
 	return report
+}
+
+func (r *Runner) runDeclaredBackstops(
+	ctx context.Context,
+	qw QueuedWork,
+	branch string,
+	res *Result,
+	declaration workarea.NormalizedDeclaration,
+	repositoryPaths map[string]string,
+) agent.BackstopReport {
+	aggregate := agent.BackstopReport{}
+	manifestByName := make(map[string]agent.TurnManifestRepository)
+	if res.Manifest != nil {
+		for _, repository := range manifestRepositoryEntries(res.Manifest) {
+			manifestByName[repository.Name] = repository
+		}
+	}
+	for _, repository := range declaration.Repositories {
+		if repository.Authority != workarea.RepositoryMutable {
+			continue
+		}
+		repositoryResult := *res
+		repositoryResult.WorktreePath = repositoryPaths[repository.Name]
+		repositoryResult.BackstopReport = nil
+		repositoryResult.PullRequestURL = manifestByName[repository.Name].PullRequestURL
+		if repository.Name == declaration.Selected.Name && repositoryResult.PullRequestURL == "" {
+			repositoryResult.PullRequestURL = res.PullRequestURL
+		}
+		report := agent.BackstopReport{PRURL: repositoryResult.PullRequestURL}
+		if shouldBackstop(&repositoryResult, qw.WorkType) {
+			report = r.runBackstop(ctx, qw, branch, &repositoryResult)
+		}
+		aggregate.Repositories = append(aggregate.Repositories, agent.RepositoryBackstopReport{Name: repository.Name, Report: report})
+		aggregate.Triggered = aggregate.Triggered || report.Triggered
+		aggregate.Pushed = aggregate.Pushed || report.Pushed
+		aggregate.PRCreated = aggregate.PRCreated || report.PRCreated
+		aggregate.UnfilledFields = append(aggregate.UnfilledFields, report.UnfilledFields...)
+		if report.Diagnostics != "" {
+			if aggregate.Diagnostics != "" {
+				aggregate.Diagnostics += "; "
+			}
+			aggregate.Diagnostics += repository.Name + ": " + report.Diagnostics
+		}
+		if repository.Name == declaration.Selected.Name && report.PRURL != "" {
+			aggregate.PRURL = report.PRURL
+			if res.PullRequestURL == "" {
+				res.PullRequestURL = report.PRURL
+			}
+		}
+	}
+	return aggregate
+}
+
+func missingMutablePullRequests(res *Result, declaration workarea.NormalizedDeclaration) []string {
+	known := make(map[string]string)
+	if res != nil && res.Manifest != nil {
+		for _, repository := range manifestRepositoryEntries(res.Manifest) {
+			known[repository.Name] = repository.PullRequestURL
+		}
+	}
+	if res != nil && res.BackstopReport != nil {
+		for _, repository := range res.BackstopReport.Repositories {
+			if repository.Report.PRURL != "" {
+				known[repository.Name] = repository.Report.PRURL
+			}
+		}
+	}
+	if res != nil && res.PullRequestURL != "" {
+		known[declaration.Selected.Name] = res.PullRequestURL
+	}
+	var missing []string
+	for _, repository := range declaration.Repositories {
+		if repository.Authority == workarea.RepositoryMutable && known[repository.Name] == "" {
+			missing = append(missing, repository.Name)
+		}
+	}
+	return missing
 }
 
 // gitIdentity carries the GIT_AUTHOR_*/GIT_COMMITTER_* values the

@@ -35,6 +35,7 @@ func TestSpecFieldCoverage(t *testing.T) {
 		"Autonomous",
 		"SandboxEnabled",
 		"SandboxLevel",
+		"RepositoryAuthority",
 		"MCPServers",
 		"Model",
 		"Effort",

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -278,7 +279,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if wtParent == "" {
 		wtParent = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 	}
-	wm, err := worktree.NewManager(worktree.Options{ParentDir: wtParent, Logger: logger})
+	wm, err := worktree.NewManager(worktree.Options{ParentDir: wtParent, Logger: logger, RestoreSessionID: sessionID})
 	if err != nil {
 		return preflightErr(fmt.Sprintf("worktree manager: %v", err))
 	}
@@ -962,6 +963,11 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		ExecutionRuntimeBinding: bytes.Clone(d.ExecutionRuntimeBinding),
 		OperationalPayload:      bytes.Clone(d.OperationalPayload),
 		HostAdaptationReceipt:   bytes.Clone(d.HostAdaptationReceipt),
+		RepositoryDeclaration:   d.RepositoryDeclaration,
+		WorkareaMode:            d.WorkareaMode,
+		ParentWorkareaID:        d.ParentWorkareaID,
+		RepositoryFilter:        d.RepositoryFilter,
+		CacheSeedID:             d.CacheSeedID,
 		QueuedWork: prompt.QueuedWork{
 			SessionID:            d.SessionID,
 			IssueID:              d.IssueID,
@@ -1009,9 +1015,21 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		Capabilities:          d.Capabilities,
 	}
 	if len(d.OperationalPayload) > 0 {
-		// Restore the source projection after the compatibility mirror. This is
-		// the lossless path for recursively present-empty collections.
-		_ = json.Unmarshal(d.OperationalPayload, &qw)
+		// Decode into a zero value: absent receipted fields must stay absent rather
+		// than inheriting an unreceipted compatibility mirror.
+		var admitted runner.QueuedWork
+		if err := json.Unmarshal(d.OperationalPayload, &admitted); err != nil {
+			return runner.QueuedWork{}, fmt.Errorf("operational payload: %w", err)
+		}
+		if !reflect.DeepEqual(d.RepositoryDeclaration, admitted.RepositoryDeclaration) ||
+			d.WorkareaMode != admitted.WorkareaMode || d.ParentWorkareaID != admitted.ParentWorkareaID ||
+			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID {
+			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
+		}
+		if err := applyResolvedRepositoryCompatibility(d, &admitted); err != nil {
+			return runner.QueuedWork{}, err
+		}
+		qw = admitted
 		qw.AdmissionReceipt = bytes.Clone(d.AdmissionReceipt)
 		qw.ClaimReceipt = bytes.Clone(d.ClaimReceipt)
 		qw.EffectiveCell = bytes.Clone(d.EffectiveCell)
@@ -1096,6 +1114,50 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		}
 	}
 	return qw, nil
+}
+
+func applyResolvedRepositoryCompatibility(d *daemon.SessionDetail, admitted *runner.QueuedWork) error {
+	if d.Repository == admitted.Repository {
+		return nil
+	}
+	deny := func() error {
+		return errors.New("operational payload repository differs from compatibility mirror without an exact authoritative project/resource resolution")
+	}
+	if admitted.Repository != "" || d.Repository == "" || admitted.RepositoryDeclaration != nil {
+		return deny()
+	}
+	var identity struct {
+		ProjectID          string `json:"projectId,omitempty"`
+		RepositoryID       string `json:"repositoryId,omitempty"`
+		ProjectName        string `json:"projectName,omitempty"`
+		Repository         string `json:"repository,omitempty"`
+		RequiresRepository bool   `json:"requiresRepository,omitempty"`
+	}
+	if err := json.Unmarshal(d.OperationalPayload, &identity); err != nil || identity.Repository != admitted.Repository {
+		return deny()
+	}
+	authorized := false
+	switch {
+	case identity.ProjectID == "" && identity.RepositoryID == "" && !identity.RequiresRepository:
+		// Legacy project-name-only dispatch. Its exact project selector must
+		// survive unchanged across the immutable payload and daemon mirror.
+		authorized = identity.ProjectName != "" && identity.ProjectName == admitted.ProjectName && identity.ProjectName == d.ProjectName
+	case identity.ProjectID != "" && identity.RepositoryID != "":
+		// Explicit repository-resource dispatch. Both authoritative identities
+		// must equal the daemon's allowlist resolution keys.
+		authorized = identity.ProjectID == d.ProjectID && identity.RepositoryID == d.RepositoryID
+	case identity.ProjectID != "" && identity.RepositoryID == "" && identity.RequiresRepository:
+		// Project-primary dispatch. Absence of a repository id is significant:
+		// neither the payload nor compatibility mirror may invent one.
+		authorized = identity.ProjectID == d.ProjectID && d.RepositoryID == ""
+	}
+	if !authorized {
+		return deny()
+	}
+	// Preserve the host-local allowlist result without changing the receipted
+	// operational payload bytes or their digest.
+	admitted.Repository = d.Repository
+	return nil
 }
 
 // providerConfigWithContextWindow bridges the resolvedProfile's top-level

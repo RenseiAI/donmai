@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,13 @@ const MaxSpawnRetries = 3
 // SpawnRetryDelay is the wait between Provision attempts. Mirrors
 // SPAWN_RETRY_DELAY_MS in the legacy TS.
 const SpawnRetryDelay = 15 * time.Second
+
+const (
+	// ModeExclusive creates and owns one session root.
+	ModeExclusive = "exclusive"
+	// ModeShared joins a durable parent root without acquiring ownership.
+	ModeShared = "shared"
+)
 
 // CloneStrategy selects the underlying git operation Provision uses
 // to materialize a worktree directory.
@@ -70,6 +78,10 @@ var (
 	// ErrNoParentDir is returned by Provision when the manager has no
 	// ParentDir configured and the strategy needs one.
 	ErrNoParentDir = errors.New("runtime/worktree: no parent directory configured")
+
+	// ErrWorkareaRootOccupied refuses an undeclared or retained root rather
+	// than deleting filesystem state the current acquisition does not own.
+	ErrWorkareaRootOccupied = errors.New("runtime/worktree: workarea root already exists")
 )
 
 // OwnershipProber is the runner-supplied callback Provision uses to
@@ -142,11 +154,25 @@ func defaultEnvRunner(ctx context.Context, extraEnv []string, name string, args 
 // ProvisionResult is the per-session bookkeeping the manager records.
 // Returned alongside the worktree path for callers that need both.
 type ProvisionResult struct {
-	// Path is the absolute worktree path on disk.
+	// Path is the selected repository worktree path and harness CWD.
 	Path string
+	// WorkareaRoot is the session-owned lifecycle root. It equals Path only for
+	// a retained legacy flat workarea.
+	WorkareaRoot string
 	// WorkareaID is generated for this acquisition and is never reused merely
 	// because a later acquisition occupies the same filesystem path.
 	WorkareaID string
+	// AcquisitionID is the durable nested-generation cleanup authority.
+	AcquisitionID string
+	// Mode is exclusive for the owner and shared for a participant.
+	Mode string
+	// OwnerSessionID names the root lifecycle owner.
+	OwnerSessionID string
+	// CacheSeedID is correlation only; it never becomes session identity.
+	CacheSeedID string
+	// Repositories maps normalized declared names to their repository paths.
+	// Legacy flat workareas contain only the selected repository when known.
+	Repositories map[string]string
 	// Strategy is the strategy that succeeded.
 	Strategy CloneStrategy
 	// ParentRepoPath is the parent clone used by StrategyWorktreeAdd.
@@ -161,18 +187,41 @@ type ProvisionResult struct {
 // Concurrency: the Manager serializes Provision/Teardown for the
 // same session id but allows different sessions to run in parallel.
 type Manager struct {
-	parentDir string
-	logger    *slog.Logger
-	prober    OwnershipProber
-	runner    CommandRunner
-	envRunner EnvCommandRunner
-	gitAuth   GitAuth
-	delay     time.Duration
-	leases    *workarea.LeaseStore
+	parentDir        string
+	logger           *slog.Logger
+	prober           OwnershipProber
+	runner           CommandRunner
+	envRunner        EnvCommandRunner
+	gitAuth          GitAuth
+	delay            time.Duration
+	leases           *workarea.LeaseStore
+	acquisitions     *workarea.AcquisitionStore
+	seeds            *workarea.SeedStore
+	provisionHook    ProvisionHook
+	archiveRoot      ArchiveRootFunc
+	restoreSessionID string
+	authorityMu      sync.Mutex
+	now              func() time.Time
+	lifecycleHook    func(string)
 
 	mu           sync.Mutex
 	sessions     map[string]*ProvisionResult
 	sessionLocks map[string]*sync.Mutex
+}
+
+// ProvisionHook is a test/fault-injection seam at durable crash boundaries.
+type ProvisionHook func(stage string, acquisition workarea.AcquisitionRecord) error
+
+// ArchiveRootFunc captures one complete session-owned root before disposal.
+type ArchiveRootFunc func(context.Context, ArchiveRootSpec) error
+
+// ArchiveRootSpec is the provider-neutral whole-root archive input.
+type ArchiveRootSpec struct {
+	AcquisitionID string
+	WorkareaID    string
+	SessionID     string
+	WorkareaRoot  string
+	SelectedPath  string
 }
 
 // Options configures NewManager. ParentDir is required.
@@ -205,6 +254,19 @@ type Options struct {
 	// LeaseStore overrides the crash-recoverable terminal lease store. Nil
 	// creates one beside ParentDir.
 	LeaseStore *workarea.LeaseStore
+	// AcquisitionStore overrides the durable nested-generation authority.
+	AcquisitionStore *workarea.AcquisitionStore
+	// SeedStore overrides the reusable cache-seed authority.
+	SeedStore *workarea.SeedStore
+	// ProvisionHook injects deterministic crash boundaries in tests.
+	ProvisionHook ProvisionHook
+	// ArchiveRoot must succeed before an archive disposition may release a root.
+	ArchiveRoot ArchiveRootFunc
+	// RestoreSessionID limits restart bookkeeping to one owner or participant.
+	// Empty is the daemon-wide recovery view.
+	RestoreSessionID string
+	// LifecycleHook is a deterministic V16 seam inside the cross-process root transaction.
+	LifecycleHook func(stage string)
 }
 
 // NewManager returns a Manager configured by opts.
@@ -235,6 +297,16 @@ func NewManager(opts Options) (*Manager, error) {
 	if err := os.MkdirAll(abs, 0o750); err != nil {
 		return nil, fmt.Errorf("runtime/worktree: mkdir ParentDir: %w", err)
 	}
+	acquisitions := opts.AcquisitionStore
+	if acquisitions == nil {
+		acquisitions, _, err = workarea.OpenExistingAcquisitionStore(abs, opts.Now)
+		if err != nil {
+			return nil, fmt.Errorf("runtime/worktree: acquisition store: %w", err)
+		}
+	}
+	// D7.7 recovery order is acquisition/quarantine journal, then leases,
+	// then declarations (restoreReadyAcquisitions below). A lease must never
+	// classify a root whose acquisition identity has not reconciled yet.
 	leases := opts.LeaseStore
 	if leases == nil {
 		leases, err = workarea.NewLeaseStore(workarea.StoreOptions{
@@ -245,24 +317,200 @@ func NewManager(opts Options) (*Manager, error) {
 			return nil, fmt.Errorf("runtime/worktree: terminal lease store: %w", err)
 		}
 	}
-	return &Manager{
-		parentDir:    abs,
-		logger:       logger,
-		prober:       opts.OwnershipProber,
-		runner:       runner,
-		envRunner:    envRunner,
-		gitAuth:      opts.GitAuth,
-		delay:        delay,
-		leases:       leases,
-		sessions:     make(map[string]*ProvisionResult),
-		sessionLocks: make(map[string]*sync.Mutex),
+	seeds := opts.SeedStore
+	if seeds == nil {
+		seeds, _, err = workarea.OpenExistingSeedStore(abs, opts.Now)
+		if err != nil {
+			return nil, fmt.Errorf("runtime/worktree: cache seed store: %w", err)
+		}
+	}
+	manager := &Manager{
+		parentDir:        abs,
+		logger:           logger,
+		prober:           opts.OwnershipProber,
+		runner:           runner,
+		envRunner:        envRunner,
+		gitAuth:          opts.GitAuth,
+		delay:            delay,
+		leases:           leases,
+		acquisitions:     acquisitions,
+		seeds:            seeds,
+		provisionHook:    opts.ProvisionHook,
+		archiveRoot:      opts.ArchiveRoot,
+		restoreSessionID: opts.RestoreSessionID,
+		now:              opts.Now,
+		lifecycleHook:    opts.LifecycleHook,
+		sessions:         make(map[string]*ProvisionResult),
+		sessionLocks:     make(map[string]*sync.Mutex),
+	}
+	if acquisitions != nil {
+		if err := manager.restoreReadyAcquisitions(); err != nil {
+			return nil, err
+		}
+	}
+	return manager, nil
+}
+
+func (m *Manager) restoreReadyAcquisitions() error {
+	records, err := m.acquisitions.ReadyRecords()
+	if err != nil {
+		return fmt.Errorf("runtime/worktree: restore acquisitions: %w", err)
+	}
+	for _, record := range records {
+		declaration, err := m.authorizedDeclaration(record)
+		if err != nil {
+			return err
+		}
+		if !record.OwnerReleased && (m.restoreSessionID == "" || m.restoreSessionID == record.SessionID) {
+			owner, err := provisionResultForSession(record, declaration, record.SessionID)
+			if err != nil {
+				return err
+			}
+			m.sessions[record.SessionID] = &owner
+		}
+		for _, participant := range record.Participants {
+			if m.restoreSessionID != "" && m.restoreSessionID != participant.SessionID {
+				continue
+			}
+			result, err := provisionResultForSession(record, declaration, participant.SessionID)
+			if err != nil {
+				return err
+			}
+			m.sessions[participant.SessionID] = &result
+		}
+	}
+	return nil
+}
+
+func (m *Manager) authorizedDeclaration(record workarea.AcquisitionRecord) (workarea.DeclarationRecord, error) {
+	authorized, err := m.acquisitions.AuthorizeRoot(record.AcquisitionID, workarea.RootPath(record.FinalRoot))
+	if err != nil {
+		return workarea.DeclarationRecord{}, err
+	}
+	root, err := workarea.OpenRootExact(workarea.RootPath(authorized.FinalRoot), authorized.RootIdentity)
+	if err != nil {
+		return workarea.DeclarationRecord{}, err
+	}
+	defer func() { _ = root.Close() }()
+	declaration, err := workarea.ReadDeclarationRoot(root)
+	if err != nil {
+		return workarea.DeclarationRecord{}, err
+	}
+	if err := workarea.ValidateDeclaredRootHandle(root, declaration); err != nil {
+		return workarea.DeclarationRecord{}, err
+	}
+	return declaration, nil
+}
+
+func provisionResultForSession(record workarea.AcquisitionRecord, declaration workarea.DeclarationRecord, sessionID string) (ProvisionResult, error) {
+	paths := declarationRepositoryPaths(record.FinalRoot, declaration)
+	selectedRepository := declaration.SelectedRepository
+	mode := ModeExclusive
+	if sessionID != record.SessionID {
+		mode = ModeShared
+		selectedRepository = ""
+		for _, participant := range record.Participants {
+			if participant.SessionID == sessionID {
+				selectedRepository = participant.SelectedRepository
+				break
+			}
+		}
+		if selectedRepository == "" {
+			return ProvisionResult{}, fmt.Errorf("runtime/worktree: session %q is not a durable participant", sessionID)
+		}
+	}
+	selectedPath := paths[selectedRepository]
+	if selectedPath == "" {
+		return ProvisionResult{}, fmt.Errorf("runtime/worktree: restore session %q selected an undeclared repository", sessionID)
+	}
+	return ProvisionResult{
+		Path: selectedPath, WorkareaRoot: record.FinalRoot, WorkareaID: record.WorkareaID,
+		AcquisitionID: record.AcquisitionID, Mode: mode, OwnerSessionID: record.SessionID,
+		CacheSeedID: record.CacheSeedID, Repositories: paths, Strategy: StrategyClone,
 	}, nil
+}
+
+func (m *Manager) restoredSessionResult(sessionID string) (*ProvisionResult, bool, error) {
+	m.authorityMu.Lock()
+	acquisitions := m.acquisitions
+	m.authorityMu.Unlock()
+	if acquisitions == nil {
+		return nil, false, nil
+	}
+	record, err := acquisitions.RecordForSessionID(sessionID)
+	if errors.Is(err, workarea.ErrAcquisitionNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	// Only an archive-bound generation can appear after this already-running
+	// manager removed its in-memory session. Ordinary ready generations remain
+	// governed by normal admission ownership and are never silently adopted.
+	if record.State != workarea.AcquisitionReady || record.ArchiveID == "" || record.ArchiveDigest == "" {
+		return nil, false, nil
+	}
+	declaration, err := m.authorizedDeclaration(record)
+	if err != nil {
+		return nil, false, err
+	}
+	result, err := provisionResultForSession(record, declaration, sessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	return &result, true, nil
 }
 
 // ParentDir returns the absolute path of the manager's parent
 // directory.
 func (m *Manager) ParentDir() string {
 	return m.parentDir
+}
+
+// CacheSeedRecord returns the separate seed identity and physical charge.
+func (m *Manager) CacheSeedRecord(seedID string) (workarea.SeedRecord, error) {
+	seeds, err := m.seedStore()
+	if err != nil {
+		return workarea.SeedRecord{}, err
+	}
+	return seeds.Record(seedID)
+}
+
+// AcquisitionRecord returns the durable generation identities for one workarea.
+func (m *Manager) AcquisitionRecord(workareaID string) (workarea.AcquisitionRecord, error) {
+	acquisitions, err := m.acquisitionStore()
+	if err != nil {
+		return workarea.AcquisitionRecord{}, err
+	}
+	return acquisitions.RecordForWorkareaID(workareaID)
+}
+
+func (m *Manager) acquisitionStore() (*workarea.AcquisitionStore, error) {
+	m.authorityMu.Lock()
+	defer m.authorityMu.Unlock()
+	if m.acquisitions != nil {
+		return m.acquisitions, nil
+	}
+	store, err := workarea.NewAcquisitionStore(m.parentDir, m.now)
+	if err != nil {
+		return nil, err
+	}
+	m.acquisitions = store
+	return store, nil
+}
+
+func (m *Manager) seedStore() (*workarea.SeedStore, error) {
+	m.authorityMu.Lock()
+	defer m.authorityMu.Unlock()
+	if m.seeds != nil {
+		return m.seeds, nil
+	}
+	store, err := workarea.NewSeedStore(m.parentDir, m.now)
+	if err != nil {
+		return nil, err
+	}
+	m.seeds = store
+	return store, nil
 }
 
 // ProvisionSpec is one Provision call's input.
@@ -285,6 +533,28 @@ type ProvisionSpec struct {
 	// LeafName overrides the directory name under ParentDir. Empty
 	// defaults to SessionID.
 	LeafName string
+	// SourceRef is the requested legacy singular source ref. It is compared
+	// byte-for-byte with the declaration's primary source when a versioned
+	// declaration is present.
+	SourceRef string
+	// RepositoryDeclaration activates session-root-v1 only when the exact
+	// bound executor capabilities below positively attest it. Nil preserves
+	// the shipped flat layout byte-for-byte.
+	RepositoryDeclaration *workarea.RepositoryDeclarationV1
+	// ExecutorCapabilities is the exact claim-time attestation for this
+	// provision. Absence is []/none and cannot activate session-root-v1.
+	ExecutorCapabilities workarea.ExecutorWorkareaCapabilities
+	// SparsePaths are relative repository paths materialized by git sparse
+	// checkout. Empty keeps the existing full clone.
+	SparsePaths []string
+	// Mode is exclusive (default) or shared. Shared requires ParentWorkareaID.
+	Mode string
+	// ParentWorkareaID durably joins the exact owner root in shared mode.
+	ParentWorkareaID string
+	// RepositoryFilter lets a shared participant select another declared leaf.
+	RepositoryFilter *workarea.RepositoryFilter
+	// CacheSeedID records reusable seed provenance without reusing session identity.
+	CacheSeedID string
 }
 
 // Provision creates a worktree for the session, retrying up to
@@ -299,6 +569,55 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	}
 	unlock := m.lockSession(spec.SessionID)
 	defer unlock()
+	mode := spec.Mode
+	if mode == "" {
+		mode = ModeExclusive
+	}
+	m.mu.Lock()
+	existing := m.sessions[spec.SessionID]
+	m.mu.Unlock()
+	if existing != nil {
+		retained, err := m.retainedPath(existing.workareaRootOrPath())
+		if err != nil {
+			return "", fmt.Errorf("runtime/worktree: check terminal lease before re-entry: %w", err)
+		}
+		if retained {
+			return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, existing.workareaRootOrPath())
+		}
+		return m.reenterProvision(spec, mode, *existing)
+	}
+	if spec.RepositoryDeclaration != nil {
+		restored, found, err := m.restoredSessionResult(spec.SessionID)
+		if err != nil {
+			return "", fmt.Errorf("runtime/worktree: resolve restored session generation: %w", err)
+		}
+		if found {
+			retained, err := m.retainedPath(restored.workareaRootOrPath())
+			if err != nil {
+				return "", fmt.Errorf("runtime/worktree: check terminal lease before restored re-entry: %w", err)
+			}
+			if retained {
+				return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, restored.workareaRootOrPath())
+			}
+			path, err := m.reenterProvision(spec, mode, *restored)
+			if err != nil {
+				return "", err
+			}
+			m.mu.Lock()
+			m.sessions[spec.SessionID] = restored
+			m.mu.Unlock()
+			return path, nil
+		}
+	}
+	if mode == ModeShared {
+		return m.provisionShared(ctx, spec)
+	}
+	if mode != ModeExclusive {
+		return "", fmt.Errorf("runtime/worktree: unsupported provision mode %q", mode)
+	}
+	if spec.ParentWorkareaID != "" || spec.RepositoryFilter != nil {
+		return "", errors.New("runtime/worktree: parent workarea selection is valid only in shared mode")
+	}
 	parentRepoPath := spec.ParentRepoPath
 	if parentRepoPath != "" {
 		var err error
@@ -312,19 +631,27 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	if leaf == "" {
 		leaf = spec.SessionID
 	}
-	dst := filepath.Join(m.parentDir, leaf)
-	if filepath.Clean(dst) == filepath.Clean(m.leases.Dir()) {
+	layout, declaration, err := m.provisionLayout(leaf, spec)
+	if err != nil {
+		return "", err
+	}
+	root := layout.Root.String()
+	dst := layout.Repository.String()
+	if filepath.Clean(root) == filepath.Clean(m.leases.Dir()) {
 		return "", errors.New("runtime/worktree: destination conflicts with terminal lease state directory")
 	}
-	retained, err := m.retainedPath(dst)
+	retained, err := m.retainedPath(root)
 	if err != nil {
 		return "", fmt.Errorf("runtime/worktree: check terminal lease before provision: %w", err)
 	}
 	if retained {
-		return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, dst)
+		return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, root)
+	}
+	workareaID, err := workarea.NewWorkareaID()
+	if err != nil {
+		return "", err
 	}
 
-	var lastErr error
 	var attempts int
 	for attempt := 1; attempt <= MaxSpawnRetries; attempt++ {
 		attempts = attempt
@@ -342,56 +669,237 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			}
 		}
 
-		err := m.provisionOnce(ctx, dst, spec)
+		repositories, acquisition, err := m.provisionLayoutOnce(ctx, layout, declaration, workareaID, spec)
 		if err == nil {
-			workareaID, identityErr := workarea.NewWorkareaID()
-			if identityErr != nil {
-				return "", identityErr
-			}
 			res := &ProvisionResult{
-				Path:           dst,
-				WorkareaID:     workareaID,
-				Strategy:       spec.Strategy,
-				ParentRepoPath: parentRepoPath,
-				Attempts:       attempts,
+				Path: dst, WorkareaRoot: root, WorkareaID: workareaID,
+				Mode: ModeExclusive, OwnerSessionID: spec.SessionID, CacheSeedID: spec.CacheSeedID,
+				Repositories: repositories, Strategy: spec.Strategy,
+				ParentRepoPath: parentRepoPath, Attempts: attempts,
+			}
+			if acquisition.AcquisitionID != "" {
+				res.AcquisitionID = acquisition.AcquisitionID
+				res.WorkareaRoot = acquisition.FinalRoot
+				res.WorkareaID = acquisition.WorkareaID
+				res.CacheSeedID = acquisition.CacheSeedID
+				res.Path = filepath.Join(acquisition.FinalRoot, acquisition.SelectedLeaf)
 			}
 			m.mu.Lock()
 			m.sessions[spec.SessionID] = res
 			m.mu.Unlock()
 			m.logger.Debug("worktree provisioned",
-				"sessionId", spec.SessionID, "path", dst,
+				"sessionId", spec.SessionID, "path", res.Path, "workareaRoot", res.WorkareaRoot,
+				"nested", layout.IsNested(),
 				"strategy", spec.Strategy.String(), "attempts", attempt)
-			return dst, nil
+			return res.Path, nil
 		}
-		lastErr = err
-
+		if errors.Is(err, ErrWorkareaRootOccupied) {
+			return "", err
+		}
 		if !isRetriable(err) {
 			return "", err
 		}
 		// Cleanup may proceed only when no durable terminal lease retains the
 		// exact destination. Lease-state read failures fail closed.
-		if cleanupErr := m.cleanupConflict(ctx, dst, spec); cleanupErr != nil {
-			return "", cleanupErr
-		}
-
-		if attempt < MaxSpawnRetries {
-			m.logger.Warn("worktree provision failed; retrying",
-				"sessionId", spec.SessionID, "attempt", attempt,
-				"max", MaxSpawnRetries, "err", err)
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(m.delay):
+		if !layout.IsNested() {
+			if cleanupErr := m.cleanupConflict(ctx, layout, spec); cleanupErr != nil {
+				return "", cleanupErr
 			}
 		}
+		if attempt == MaxSpawnRetries {
+			return "", fmt.Errorf("runtime/worktree: provisioning failed after %d attempts: %w", attempt, err)
+		}
+
+		m.logger.Warn("worktree provision failed; retrying",
+			"sessionId", spec.SessionID, "attempt", attempt,
+			"max", MaxSpawnRetries, "err", err)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(m.delay):
+		}
 	}
-	return "", fmt.Errorf("runtime/worktree: provisioning failed after %d attempts: %w",
-		attempts, lastErr)
+	return "", fmt.Errorf("runtime/worktree: provisioning failed after %d attempts", attempts)
 }
 
-// Teardown removes the session's worktree. An active or release-pending
-// terminal lease defers teardown and retains the exact leaf. Unknown sessions
-// remain idempotent no-ops.
+func (m *Manager) reenterProvision(spec ProvisionSpec, mode string, existing ProvisionResult) (string, error) {
+	if existing.AcquisitionID == "" || existing.Mode != mode || spec.RepositoryDeclaration == nil || spec.CacheSeedID != existing.CacheSeedID {
+		return "", fmt.Errorf("runtime/worktree: existing session generation does not match provision request")
+	}
+	normalized, err := spec.RepositoryDeclaration.Normalize()
+	if err != nil {
+		return "", err
+	}
+	if err := normalized.ValidatePrimarySource(workarea.RepositorySource{Repository: spec.RepoURL, Ref: spec.SourceRef}); err != nil {
+		return "", err
+	}
+	if err := spec.ExecutorCapabilities.ValidateFor(normalized); err != nil {
+		return "", err
+	}
+	if mode == ModeShared && !repositoryFiltersEqual(spec.RepositoryDeclaration.Select, spec.RepositoryFilter) {
+		return "", fmt.Errorf("runtime/worktree: shared declaration and repository filter disagree")
+	}
+	if mode == ModeExclusive && (spec.RepositoryFilter != nil || spec.ParentWorkareaID != "") {
+		return "", fmt.Errorf("runtime/worktree: exclusive re-entry cannot carry shared selection")
+	}
+	acquisitions, err := m.acquisitionStore()
+	if err != nil {
+		return "", err
+	}
+	record, err := acquisitions.RecordForWorkareaID(existing.WorkareaID)
+	if err != nil {
+		return "", err
+	}
+	if record.State != workarea.AcquisitionReady || record.AcquisitionID != existing.AcquisitionID || record.FinalRoot != existing.WorkareaRoot {
+		return "", fmt.Errorf("runtime/worktree: existing session generation is not ready")
+	}
+	declaration, err := m.authorizedDeclaration(record)
+	if err != nil {
+		return "", err
+	}
+	if err := declarationMatchesNormalized(declaration, normalized); err != nil {
+		return "", err
+	}
+	selected, err := declaration.ResolveOne(spec.RepositoryFilter)
+	selectedLeaf := selected.Leaf
+	if mode == ModeExclusive {
+		selectedLeaf = normalized.Selected.Leaf
+		err = nil
+	} else if spec.ParentWorkareaID != record.WorkareaID {
+		return "", fmt.Errorf("runtime/worktree: shared re-entry parent mismatch")
+	}
+	if err != nil {
+		return "", err
+	}
+	if filepath.Clean(filepath.Join(record.FinalRoot, selectedLeaf)) != filepath.Clean(existing.Path) {
+		return "", fmt.Errorf("runtime/worktree: existing selected repository mismatch")
+	}
+	return existing.Path, nil
+}
+
+func (m *Manager) provisionShared(ctx context.Context, spec ProvisionSpec) (string, error) {
+	if spec.ParentWorkareaID == "" {
+		return "", errors.New("runtime/worktree: shared mode requires ParentWorkareaID")
+	}
+	if spec.RepositoryDeclaration == nil {
+		return "", errors.New("runtime/worktree: shared mode requires the versioned parent declaration")
+	}
+	normalized, err := spec.RepositoryDeclaration.Normalize()
+	if err != nil {
+		return "", err
+	}
+	if err := normalized.ValidatePrimarySource(workarea.RepositorySource{Repository: spec.RepoURL, Ref: spec.SourceRef}); err != nil {
+		return "", err
+	}
+	if err := spec.ExecutorCapabilities.ValidateFor(normalized); err != nil {
+		return "", err
+	}
+	if !repositoryFiltersEqual(spec.RepositoryDeclaration.Select, spec.RepositoryFilter) {
+		return "", fmt.Errorf("runtime/worktree: shared declaration and repository filter disagree")
+	}
+	acquisitions, err := m.acquisitionStore()
+	if err != nil {
+		return "", err
+	}
+	var record workarea.AcquisitionRecord
+	var paths map[string]string
+	selectedPath := ""
+	if err := acquisitions.WithRootTransaction(ctx, spec.ParentWorkareaID, func() error {
+		var err error
+		record, err = acquisitions.RecordForWorkareaID(spec.ParentWorkareaID)
+		if err != nil {
+			return err
+		}
+		if record.State != workarea.AcquisitionReady || record.OwnerReleased {
+			return errors.New("runtime/worktree: shared parent is not available")
+		}
+		retained, err := m.retainedPath(record.FinalRoot)
+		if err != nil {
+			return fmt.Errorf("runtime/worktree: check shared parent lease: %w", err)
+		}
+		if retained {
+			return fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, record.FinalRoot)
+		}
+		if m.lifecycleHook != nil {
+			m.lifecycleHook("join-before-commit")
+		}
+		declaration, err := m.authorizedDeclaration(record)
+		if err != nil {
+			return err
+		}
+		if err := declarationMatchesNormalized(declaration, normalized); err != nil {
+			return err
+		}
+		selected, err := declaration.ResolveOne(spec.RepositoryFilter)
+		if err != nil {
+			return err
+		}
+		if normalized.Selected.Name != selected.Name {
+			return fmt.Errorf("runtime/worktree: shared declaration selection differs from durable filter resolution")
+		}
+		record, err = acquisitions.JoinShared(spec.ParentWorkareaID, spec.SessionID, selected.Name)
+		if err != nil {
+			return err
+		}
+		paths = declarationRepositoryPaths(record.FinalRoot, declaration)
+		selectedPath = paths[selected.Name]
+		if selectedPath == "" {
+			return errors.New("runtime/worktree: shared selection did not resolve inside parent root")
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	m.mu.Lock()
+	m.sessions[spec.SessionID] = &ProvisionResult{
+		Path: selectedPath, WorkareaRoot: record.FinalRoot, WorkareaID: record.WorkareaID,
+		AcquisitionID: record.AcquisitionID, Mode: ModeShared, OwnerSessionID: record.SessionID,
+		CacheSeedID: record.CacheSeedID, Repositories: paths, Strategy: StrategyClone, Attempts: 1,
+	}
+	m.mu.Unlock()
+	m.logger.Debug("shared workarea participant joined", "sessionId", spec.SessionID, "ownerSessionId", record.SessionID, "workareaRoot", record.FinalRoot)
+	return selectedPath, nil
+}
+
+func declarationMatchesNormalized(record workarea.DeclarationRecord, normalized workarea.NormalizedDeclaration) error {
+	if record.Protocol != normalized.Protocol || len(record.Repositories) != len(normalized.Repositories) {
+		return errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
+	}
+	byName := make(map[string]workarea.NormalizedRepository, len(normalized.Repositories))
+	for _, repository := range normalized.Repositories {
+		byName[repository.Name] = repository
+	}
+	for _, repository := range record.Repositories {
+		bound, ok := byName[repository.Name]
+		sourceDigest, err := workarea.RepositorySourceDigest(bound.Source.Repository)
+		if !ok || err != nil || bound.Leaf != repository.Leaf || bound.Role != repository.Role || bound.Authority != repository.Authority || bound.Source.Ref != repository.RequestedRef || sourceDigest != repository.SourceDigest || !slices.Equal(bound.Source.Paths, repository.SparsePaths) {
+			return errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
+		}
+	}
+	return nil
+}
+
+func repositoryFiltersEqual(left, right *workarea.RepositoryFilter) bool {
+	effective := func(filter *workarea.RepositoryFilter) workarea.RepositoryFilter {
+		if filter == nil {
+			return workarea.RepositoryFilter{Kind: workarea.RepositoryFilterPrimary}
+		}
+		return *filter
+	}
+	return effective(left) == effective(right)
+}
+
+func declarationRepositoryPaths(root string, declaration workarea.DeclarationRecord) map[string]string {
+	paths := make(map[string]string, len(declaration.Repositories))
+	for _, repository := range declaration.Repositories {
+		paths[repository.Name] = filepath.Join(root, repository.Leaf)
+	}
+	return paths
+}
+
+// Teardown removes the session-owned root and every declared leaf. An active or
+// release-pending terminal lease retains that exact root. Unknown sessions are
+// idempotent no-ops.
 func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 	unlock := m.lockSession(sessionID)
 	defer unlock()
@@ -402,7 +910,26 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 	if !ok {
 		return nil
 	}
-	retained, err := m.requestReleasePath(ctx, res.Path)
+	if res.AcquisitionID != "" {
+		acquisitions, err := m.acquisitionStore()
+		if err != nil {
+			return err
+		}
+		return acquisitions.WithRootTransaction(ctx, res.WorkareaID, func() error {
+			retained, err := m.requestReleasePath(ctx, res.workareaRootOrPath())
+			if err != nil {
+				return fmt.Errorf("runtime/worktree: check terminal lease before teardown: %w", err)
+			}
+			if retained {
+				return nil
+			}
+			if m.lifecycleHook != nil {
+				m.lifecycleHook("teardown-before-disposition")
+			}
+			return m.releaseNestedSessionLocked(acquisitions, *res, sessionID)
+		})
+	}
+	retained, err := m.requestReleasePath(ctx, res.workareaRootOrPath())
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: check terminal lease before teardown: %w", err)
 	}
@@ -423,6 +950,32 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+func (m *Manager) releaseNestedSessionLocked(acquisitions *workarea.AcquisitionStore, res ProvisionResult, sessionID string) error {
+	releaseRoot := false
+	var err error
+	if res.Mode == ModeShared {
+		releaseRoot, err = acquisitions.LeaveShared(res.WorkareaID, sessionID)
+	} else {
+		releaseRoot, err = acquisitions.RequestOwnerRelease(res.WorkareaID)
+	}
+	if err != nil {
+		return err
+	}
+	if releaseRoot {
+		if err := acquisitions.RemovePublishedRoot(res.AcquisitionID); err != nil {
+			return err
+		}
+		m.forgetSessionsAtRoot(res.WorkareaRoot)
+		return nil
+	}
+	m.mu.Lock()
+	if current := m.sessions[sessionID]; current != nil && current.AcquisitionID == res.AcquisitionID {
+		delete(m.sessions, sessionID)
+	}
+	m.mu.Unlock()
+	return nil
+}
+
 // AcquireTerminalLease persists a provider-neutral lease for a workarea already
 // owned by the session. WorkareaID is an opaque acquisition-scoped identity; the
 // exact local path remains only in durable local state.
@@ -437,19 +990,27 @@ func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.Acquir
 		return nil, fmt.Errorf("%w: %s", ErrUnknownSession, spec.SessionID)
 	}
 	if spec.WorkareaPath == "" {
-		spec.WorkareaPath = res.Path
+		spec.WorkareaPath = res.workareaRootOrPath()
 	}
 	if spec.WorkareaID == "" {
 		spec.WorkareaID = res.WorkareaID
 	}
-	if spec.WorkareaPath != res.Path || spec.WorkareaID != res.WorkareaID {
+	if spec.WorkareaPath != res.workareaRootOrPath() || spec.WorkareaID != res.WorkareaID {
 		return nil, fmt.Errorf("%w: terminal lease must retain the manager-owned workarea", workarea.ErrLeaseConflict)
 	}
-	metadata := make(map[string]string, len(spec.ReleaseMetadata)+2)
+	metadata := make(map[string]string, len(spec.ReleaseMetadata)+3)
 	for key, value := range spec.ReleaseMetadata {
 		metadata[key] = value
 	}
 	metadata["strategy"] = strconv.Itoa(int(res.Strategy))
+	if res.AcquisitionID != "" {
+		metadata["acquisitionID"] = res.AcquisitionID
+		metadata["ownerSessionID"] = res.OwnerSessionID
+		metadata["cacheSeedID"] = res.CacheSeedID
+	}
+	if res.Path != res.workareaRootOrPath() {
+		metadata["repositoryWorktreePath"] = res.Path
+	}
 	if spec.ReleaseDisposition == "" {
 		spec.ReleaseDisposition = "destroy"
 	}
@@ -457,6 +1018,33 @@ func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.Acquir
 		metadata["parentRepoPath"] = res.ParentRepoPath
 	}
 	spec.ReleaseMetadata = metadata
+	if res.AcquisitionID != "" {
+		acquisitions, err := m.acquisitionStore()
+		if err != nil {
+			return nil, err
+		}
+		var lease *workarea.TerminalLease
+		if err := acquisitions.WithRootTransaction(ctx, res.WorkareaID, func() error {
+			record, err := acquisitions.RecordForWorkareaID(res.WorkareaID)
+			if err != nil {
+				return err
+			}
+			if record.State != workarea.AcquisitionReady || res.Mode != ModeExclusive || record.OwnerReleased || len(record.Participants) != 0 {
+				return fmt.Errorf("%w: a shared root cannot enter a terminal lease", workarea.ErrLeaseConflict)
+			}
+			if _, err := acquisitions.AuthorizeRoot(record.AcquisitionID, workarea.RootPath(record.FinalRoot)); err != nil {
+				return err
+			}
+			if m.lifecycleHook != nil {
+				m.lifecycleHook("lease-before-commit")
+			}
+			lease, err = m.leases.Acquire(ctx, spec)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+		return lease, nil
+	}
 	return m.leases.Acquire(ctx, spec)
 }
 
@@ -534,8 +1122,24 @@ func (m *Manager) RunTerminalLeaseReaper(ctx context.Context, opts workarea.Reap
 // CleanupTerminalQuarantines destroys quarantined leaves only; it never applies
 // an ordinary return-to-pool or archive disposition.
 func (m *Manager) CleanupTerminalQuarantines(ctx context.Context, opts workarea.SchedulerOptions) (int, error) {
-	return m.leases.CleanupQuarantines(ctx, opts, func(_ context.Context, item workarea.TerminalWorkareaQuarantine) error {
-		return os.RemoveAll(item.WorkareaPath)
+	return m.leases.CleanupQuarantines(ctx, opts, func(cleanupCtx context.Context, item workarea.TerminalWorkareaQuarantine) error {
+		declaration, declarationErr := workarea.ReadDeclaration(workarea.RootPath(item.WorkareaPath))
+		if declarationErr == nil {
+			if declaration.AcquisitionID == "" {
+				return errors.New("runtime/worktree: declared quarantine root has no acquisition cleanup authority")
+			}
+			acquisitions, err := m.acquisitionStore()
+			if err != nil {
+				return err
+			}
+			return acquisitions.WithRootTransaction(cleanupCtx, declaration.WorkareaID, func() error {
+				if _, err := acquisitions.AuthorizeRoot(declaration.AcquisitionID, workarea.RootPath(item.WorkareaPath)); err != nil {
+					return err
+				}
+				return acquisitions.RemovePublishedRoot(declaration.AcquisitionID)
+			})
+		}
+		return fmt.Errorf("runtime/worktree: quarantine root ownership is unproved; deletion refused: %w", declarationErr)
 	})
 }
 
@@ -544,42 +1148,84 @@ func (m *Manager) releaseLeasedWorkarea(ctx context.Context, lease workarea.Term
 	// does not hold its per-result/workarea locks during provider disposition.
 	// Avoid the manager's session lock so independent teardown can proceed while
 	// durable lease state keeps this exact path unavailable.
-	return m.releaseLeasedWorkareaUnlocked(ctx, lease)
+	if lease.ReleaseMetadata["acquisitionID"] == "" {
+		return m.releaseLeasedWorkareaUnlocked(ctx, lease)
+	}
+	acquisitions, err := m.acquisitionStore()
+	if err != nil {
+		return err
+	}
+	return acquisitions.WithRootTransaction(ctx, lease.WorkareaID, func() error {
+		return m.releaseLeasedWorkareaUnlocked(ctx, lease)
+	})
 }
 
 func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease workarea.TerminalLease) error {
-	if lease.ReleaseDisposition == "archive" {
-		m.mu.Lock()
-		if current := m.sessions[lease.SessionID]; current != nil && current.Path == lease.WorkareaPath {
-			delete(m.sessions, lease.SessionID)
-		}
-		m.mu.Unlock()
-		return nil
+	repositoryPath := lease.ReleaseMetadata["repositoryWorktreePath"]
+	if repositoryPath == "" {
+		repositoryPath = lease.WorkareaPath
 	}
-	if lease.ReleaseDisposition != "destroy" {
+	res := ProvisionResult{
+		Path: repositoryPath, WorkareaRoot: lease.WorkareaPath, WorkareaID: lease.WorkareaID,
+		AcquisitionID: lease.ReleaseMetadata["acquisitionID"], OwnerSessionID: lease.ReleaseMetadata["ownerSessionID"],
+		CacheSeedID: lease.ReleaseMetadata["cacheSeedID"], Mode: ModeExclusive,
+	}
+	if lease.ReleaseDisposition == "archive" {
+		if m.archiveRoot == nil {
+			return errors.New("runtime/worktree: archive disposition has no whole-root archive provider")
+		}
+		if err := m.archiveRoot(ctx, ArchiveRootSpec{
+			AcquisitionID: res.AcquisitionID, WorkareaID: lease.WorkareaID, SessionID: lease.SessionID,
+			WorkareaRoot: lease.WorkareaPath, SelectedPath: repositoryPath,
+		}); err != nil {
+			return fmt.Errorf("runtime/worktree: archive whole workarea root: %w", err)
+		}
+	}
+	if lease.ReleaseDisposition != "destroy" && lease.ReleaseDisposition != "archive" && lease.ReleaseDisposition != "return-to-pool" {
 		return fmt.Errorf("runtime/worktree: unsupported leased release disposition %q", lease.ReleaseDisposition)
 	}
 	strategyValue, err := strconv.Atoi(lease.ReleaseMetadata["strategy"])
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: decode leased release strategy: %w", err)
 	}
-	res := ProvisionResult{
-		Path:           lease.WorkareaPath,
-		Strategy:       CloneStrategy(strategyValue),
-		ParentRepoPath: lease.ReleaseMetadata["parentRepoPath"],
-	}
+	res.Strategy = CloneStrategy(strategyValue)
+	res.ParentRepoPath = lease.ReleaseMetadata["parentRepoPath"]
 	if err := m.teardownResult(ctx, res); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	if current := m.sessions[lease.SessionID]; current != nil && current.Path == lease.WorkareaPath {
-		delete(m.sessions, lease.SessionID)
-	}
-	m.mu.Unlock()
+	m.forgetSessionAtRoot(lease.SessionID, lease.WorkareaPath)
 	return nil
 }
 
+func (m *Manager) forgetSessionAtRoot(sessionID, root string) {
+	m.mu.Lock()
+	if current := m.sessions[sessionID]; current != nil && current.workareaRootOrPath() == root {
+		delete(m.sessions, sessionID)
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) forgetSessionsAtRoot(root string) {
+	m.mu.Lock()
+	for sessionID, current := range m.sessions {
+		if current != nil && current.workareaRootOrPath() == root {
+			delete(m.sessions, sessionID)
+		}
+	}
+	m.mu.Unlock()
+}
+
 func (m *Manager) teardownResult(ctx context.Context, res ProvisionResult) error {
+	if res.AcquisitionID != "" {
+		acquisitions, err := m.acquisitionStore()
+		if err != nil {
+			return err
+		}
+		return acquisitions.RemovePublishedRoot(res.AcquisitionID)
+	}
+	if filepath.Clean(res.workareaRootOrPath()) != filepath.Clean(res.Path) {
+		return errors.New("runtime/worktree: nested root has no acquisition cleanup authority")
+	}
 	if res.Strategy == StrategyWorktreeAdd && res.ParentRepoPath != "" {
 		out, err := m.runGit(ctx, "", "-C", res.ParentRepoPath, "worktree", "remove", "--force", res.Path)
 		if err != nil {
@@ -592,8 +1238,9 @@ func (m *Manager) teardownResult(ctx context.Context, res ProvisionResult) error
 			}
 		}
 	}
-	if err := os.RemoveAll(res.Path); err != nil {
-		return fmt.Errorf("runtime/worktree: remove %q: %w", res.Path, err)
+	root := res.workareaRootOrPath()
+	if err := os.RemoveAll(root); err != nil {
+		return fmt.Errorf("runtime/worktree: remove %q: %w", root, err)
 	}
 	return nil
 }
@@ -643,8 +1290,204 @@ func (m *Manager) Path(sessionID string) (string, error) {
 	return res.Path, nil
 }
 
+// Layout returns the distinct lifecycle root and selected repository CWD.
+func (m *Manager) Layout(sessionID string) (workarea.Layout, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res, ok := m.sessions[sessionID]
+	if !ok {
+		return workarea.Layout{}, fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
+	}
+	return workarea.Layout{Root: workarea.RootPath(res.workareaRootOrPath()), Repository: workarea.RepositoryPath(res.Path)}, nil
+}
+
+// RepositoryPaths returns a copy of the declaration name -> path map.
+func (m *Manager) RepositoryPaths(sessionID string) (map[string]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res, ok := m.sessions[sessionID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
+	}
+	paths := make(map[string]string, len(res.Repositories))
+	for name, repositoryPath := range res.Repositories {
+		paths[name] = repositoryPath
+	}
+	return paths, nil
+}
+
+func (r ProvisionResult) workareaRootOrPath() string {
+	if r.WorkareaRoot != "" {
+		return r.WorkareaRoot
+	}
+	return r.Path
+}
+
+func (m *Manager) provisionLayout(sessionLeaf string, spec ProvisionSpec) (workarea.Layout, *workarea.NormalizedDeclaration, error) {
+	if spec.RepositoryDeclaration == nil {
+		if filepath.Clean(filepath.Join(m.parentDir, sessionLeaf)) == filepath.Clean(m.leases.Dir()) {
+			return workarea.Layout{}, nil, errors.New("runtime/worktree: destination conflicts with terminal lease state directory")
+		}
+		layout, err := workarea.FlatLayout(m.parentDir, sessionLeaf)
+		if err != nil {
+			return workarea.Layout{}, nil, fmt.Errorf("runtime/worktree: resolve legacy layout: %w", err)
+		}
+		return layout, nil, nil
+	}
+	if spec.Strategy != StrategyClone {
+		return workarea.Layout{}, nil, errors.New("runtime/worktree: session-root-v1 currently requires clone strategy")
+	}
+	normalized, err := spec.RepositoryDeclaration.Normalize()
+	if err != nil {
+		return workarea.Layout{}, nil, err
+	}
+	if err := normalized.ValidatePrimarySource(workarea.RepositorySource{Repository: spec.RepoURL, Ref: spec.SourceRef}); err != nil {
+		return workarea.Layout{}, nil, err
+	}
+	if err := spec.ExecutorCapabilities.ValidateFor(normalized); err != nil {
+		return workarea.Layout{}, nil, err
+	}
+	layout, err := workarea.NewLayout(m.parentDir, sessionLeaf, normalized.Selected.Leaf)
+	if err != nil {
+		return workarea.Layout{}, nil, err
+	}
+	return layout, &normalized, nil
+}
+
+func (m *Manager) provisionLayoutOnce(
+	ctx context.Context,
+	layout workarea.Layout,
+	declaration *workarea.NormalizedDeclaration,
+	workareaID string,
+	spec ProvisionSpec,
+) (paths map[string]string, acquisition workarea.AcquisitionRecord, resultErr error) {
+	if declaration == nil {
+		if err := m.provisionOnce(ctx, layout.Repository.String(), spec); err != nil {
+			return nil, workarea.AcquisitionRecord{}, err
+		}
+		paths = make(map[string]string, 1)
+		if leaf, err := workarea.RepositoryLeaf(spec.RepoURL); err == nil {
+			paths[leaf] = layout.Repository.String()
+		}
+		return paths, workarea.AcquisitionRecord{}, nil
+	}
+	seedPaths := map[string]string(nil)
+	if spec.CacheSeedID != "" {
+		seeds, seedErr := m.seedStore()
+		if seedErr != nil {
+			return nil, workarea.AcquisitionRecord{}, seedErr
+		}
+		_, resolvedSeedPaths, seedErr := seeds.Ensure(ctx, spec.CacheSeedID, *declaration, func(ctx context.Context, repository workarea.NormalizedRepository, destination string) error {
+			return m.provisionOnce(ctx, destination, ProvisionSpec{
+				SessionID: spec.SessionID, RepoURL: repository.Source.Repository,
+				Branch: repository.Source.Ref, Strategy: StrategyClone,
+				SparsePaths: append([]string(nil), repository.Source.Paths...),
+			})
+		})
+		if seedErr != nil {
+			return nil, workarea.AcquisitionRecord{}, seedErr
+		}
+		seedPaths = resolvedSeedPaths
+	}
+	acquisitions, err := m.acquisitionStore()
+	if err != nil {
+		return nil, workarea.AcquisitionRecord{}, err
+	}
+	claim, err := acquisitions.Begin(
+		spec.SessionID, workareaID, layout.Root, declaration.Selected.Leaf, spec.CacheSeedID,
+	)
+	if err != nil {
+		if errors.Is(err, workarea.ErrAcquisitionRootOccupied) {
+			return nil, workarea.AcquisitionRecord{}, fmt.Errorf("%w: %s", ErrWorkareaRootOccupied, layout.Root.String())
+		}
+		return nil, workarea.AcquisitionRecord{}, err
+	}
+	committed := false
+	preserveForRecovery := false
+	defer func() {
+		if committed || preserveForRecovery {
+			return
+		}
+		if abortErr := acquisitions.Abort(claim.Record.AcquisitionID); abortErr != nil && resultErr == nil {
+			resultErr = abortErr
+		}
+	}()
+	crashBoundary := func(stage string) error {
+		if m.provisionHook == nil {
+			return nil
+		}
+		if err := m.provisionHook(stage, claim.Record); err != nil {
+			preserveForRecovery = true
+			if abandonErr := acquisitions.Abandon(claim.Record.AcquisitionID); abandonErr != nil {
+				return errors.Join(err, abandonErr)
+			}
+			return err
+		}
+		return nil
+	}
+	if err := crashBoundary("root-created"); err != nil {
+		return nil, workarea.AcquisitionRecord{}, err
+	}
+	stagingLayout := workarea.Layout{Root: claim.StagingRoot}
+	selectedPath, err := stagingLayout.RepositoryPathFor(declaration.Selected.Leaf)
+	if err != nil {
+		return nil, workarea.AcquisitionRecord{}, err
+	}
+	stagingLayout.Repository = selectedPath
+
+	paths = make(map[string]string, len(declaration.Repositories))
+	resolvedRefs := make(map[string]string, len(declaration.Repositories))
+	for index, repository := range declaration.Repositories {
+		repositoryPath, err := stagingLayout.RepositoryPathFor(repository.Leaf)
+		if err != nil {
+			return nil, workarea.AcquisitionRecord{}, err
+		}
+		repositorySpec := ProvisionSpec{
+			SessionID:   spec.SessionID,
+			RepoURL:     repository.Source.Repository,
+			Branch:      repository.Source.Ref,
+			Strategy:    StrategyClone,
+			SparsePaths: append([]string(nil), repository.Source.Paths...),
+		}
+		if err := m.provisionOnceWithReference(ctx, repositoryPath.String(), repositorySpec, seedPaths[repository.Name]); err != nil {
+			return nil, workarea.AcquisitionRecord{}, fmt.Errorf("runtime/worktree: provision declared repository %q: %w", repository.Name, err)
+		}
+		paths[repository.Name] = filepath.Join(layout.Root.String(), repository.Leaf)
+		out, err := m.runGit(ctx, "", "-C", repositoryPath.String(), "rev-parse", "HEAD")
+		if err != nil {
+			return nil, workarea.AcquisitionRecord{}, fmt.Errorf("runtime/worktree: resolve declared repository %q ref: %w (%s)", repository.Name, err, strings.TrimSpace(string(out)))
+		}
+		resolvedRefs[repository.Name] = strings.TrimSpace(string(out))
+		if index == 0 {
+			if err := crashBoundary("mid-clone"); err != nil {
+				return nil, workarea.AcquisitionRecord{}, err
+			}
+		}
+	}
+	if err := crashBoundary("pre-record"); err != nil {
+		return nil, workarea.AcquisitionRecord{}, err
+	}
+	record := workarea.NewDeclarationRecord(spec.SessionID, workareaID, *declaration, resolvedRefs, claim.Record.AcquisitionID)
+	if err := workarea.WriteDeclaration(ctx, claim.StagingRoot, record); err != nil {
+		return nil, workarea.AcquisitionRecord{}, err
+	}
+	acquisition, err = acquisitions.Commit(claim.Record.AcquisitionID)
+	if err != nil {
+		if errors.Is(err, workarea.ErrAcquisitionRootOccupied) {
+			return nil, workarea.AcquisitionRecord{}, fmt.Errorf("%w: %s", ErrWorkareaRootOccupied, layout.Root.String())
+		}
+		return nil, workarea.AcquisitionRecord{}, err
+	}
+	committed = true
+	return paths, acquisition, nil
+}
+
 // provisionOnce runs one git invocation per spec.Strategy.
 func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionSpec) error {
+	return m.provisionOnceWithReference(ctx, dst, spec, "")
+}
+
+func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, spec ProvisionSpec, referencePath string) error {
 	if _, err := os.Stat(dst); err == nil {
 		// Path exists. For StrategyWorktreeAdd this is a conflict;
 		// for StrategyClone too. Either way, surface as conflict.
@@ -670,6 +1513,12 @@ func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionS
 			}
 		}
 		args := []string{"clone"}
+		if referencePath != "" {
+			args = append(args, "--reference", referencePath, "--dissociate")
+		}
+		if len(spec.SparsePaths) > 0 {
+			args = append(args, "--filter=blob:none", "--sparse")
+		}
 		if spec.Branch != "" {
 			args = append(args, "--branch", spec.Branch)
 		}
@@ -677,6 +1526,14 @@ func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionS
 		out, err := m.runGit(ctx, spec.RepoURL, args...)
 		if err != nil {
 			return fmt.Errorf("git clone: %w (%s)", err, strings.TrimSpace(string(out)))
+		}
+		if len(spec.SparsePaths) > 0 {
+			sparseArgs := []string{"-C", dst, "sparse-checkout", "set", "--"}
+			sparseArgs = append(sparseArgs, spec.SparsePaths...)
+			out, err := m.runGit(ctx, "", sparseArgs...)
+			if err != nil {
+				return fmt.Errorf("git sparse-checkout: %w (%s)", err, strings.TrimSpace(string(out)))
+			}
 		}
 		return nil
 	case StrategyWorktreeAdd:
@@ -763,22 +1620,23 @@ func (m *Manager) requestReleasePath(ctx context.Context, path string) (bool, er
 	return m.leases.RequestReleasePath(ctx, path)
 }
 
-// cleanupConflict tries to remove a stale worktree entry left by a prior failed
-// Provision. It fails closed when lease state is unreadable and never removes a
-// terminal-leased exact workarea; ordinary stale cleanup remains best-effort.
-func (m *Manager) cleanupConflict(ctx context.Context, dst string, spec ProvisionSpec) error {
-	retained, err := m.retainedPath(dst)
+// cleanupConflict removes only the root the current failed acquisition created.
+// Callers never invoke it for ErrWorkareaRootOccupied, so pre-existing state is
+// refused rather than reclaimed by inference.
+func (m *Manager) cleanupConflict(ctx context.Context, layout workarea.Layout, spec ProvisionSpec) error {
+	root := layout.Root.String()
+	retained, err := m.retainedPath(root)
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: check terminal lease before conflict cleanup: %w", err)
 	}
 	if retained {
-		return fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, dst)
+		return fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, root)
 	}
 	if spec.Strategy == StrategyWorktreeAdd && spec.ParentRepoPath != "" {
-		_, _ = m.runGit(ctx, "", "-C", spec.ParentRepoPath, "worktree", "remove", "--force", dst)
+		_, _ = m.runGit(ctx, "", "-C", spec.ParentRepoPath, "worktree", "remove", "--force", layout.Repository.String())
 	}
-	if _, err := os.Stat(dst); err == nil {
-		_ = os.RemoveAll(dst)
+	if _, err := os.Stat(root); err == nil {
+		_ = os.RemoveAll(root)
 	}
 	return nil
 }

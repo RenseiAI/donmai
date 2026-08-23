@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // fixtureArchive lays out a minimal archive directory under root/<id>/
@@ -630,6 +632,32 @@ func TestWorkareaArchiveRegistry_Restore_CorruptedArchive(t *testing.T) {
 	}
 }
 
+func TestWorkareaArchiveRegistry_RestorePreservesSymlinkWithoutFollowing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks unreliable on Windows CI")
+	}
+	root := t.TempDir()
+	external := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(external, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureArchive(t, root, fixtureArchive{
+		id: "wa-symlink-restore", tree: map[string]string{"link": "symlink:" + external},
+	})
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	restored, _, err := registry.Restore("wa-symlink-restore", afclient.WorkareaRestoreRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := os.Readlink(filepath.Join(restored.Path, "link"))
+	if err != nil || target != external {
+		t.Fatalf("restored symlink target = %q, %v; want %q", target, err, external)
+	}
+	if body, err := os.ReadFile(external); err != nil || string(body) != "outside" {
+		t.Fatalf("restore followed or changed external target: %q, %v", body, err)
+	}
+}
+
 // ── Concurrency: restore + diff under load ────────────────────────────────
 
 func TestWorkareaArchiveRegistry_ConcurrentRestoreAndDiff(t *testing.T) {
@@ -664,6 +692,267 @@ func TestWorkareaArchiveRegistry_ConcurrentRestoreAndDiff(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestWorkareaArchiveRegistryArchivesAndRestoresWholeDeclaredRoot(t *testing.T) {
+	archiveRoot := t.TempDir()
+	worktreeParent := t.TempDir()
+	sourceRoot := filepath.Join(worktreeParent, "session-root")
+	declaration := workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: "https://example.test/web.git", Ref: "main"}, Name: "web", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: "https://example.test/docs.git", Ref: "main"}, Name: "docs", Role: workarea.RepositoryRoleContext, Authority: workarea.RepositoryReadOnly},
+		},
+		Select: &workarea.RepositoryFilter{Kind: workarea.RepositoryFilterNamed, Name: "docs"},
+	}
+	normalized, err := declaration.Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisitions, err := workarea.NewAcquisitionStore(worktreeParent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisition, err := acquisitions.Begin("archive-session", "wa_archive_root", workarea.RootPath(sourceRoot), "docs", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for leaf, body := range map[string]string{"web/source.txt": "mutable", "docs/context.txt": "readonly"} {
+		path := filepath.Join(acquisition.StagingRoot.String(), leaf)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sparse := filepath.Join(acquisition.StagingRoot.String(), "web", "sparse.bin")
+	sparseFile, err := os.OpenFile(sparse, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sparseFile.Seek(64<<20, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sparseFile.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sparseFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(acquisition.StagingRoot.String(), "web", "source.txt"), filepath.Join(acquisition.StagingRoot.String(), "docs", "source-hardlink.txt")); err != nil {
+		t.Fatal(err)
+	}
+	record := workarea.NewDeclarationRecord(
+		"archive-session", "wa_archive_root", normalized,
+		map[string]string{"web": "aaa", "docs": "bbb"}, acquisition.Record.AcquisitionID,
+	)
+	if err := workarea.WriteDeclaration(t.Context(), acquisition.StagingRoot, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquisitions.Commit(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, AcquisitionStore: acquisitions})
+	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		AcquisitionID: acquisition.Record.AcquisitionID, WorkareaID: "wa_archive_root", SessionID: "archive-session",
+		WorkareaRoot: sourceRoot, SelectedPath: filepath.Join(sourceRoot, "docs"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, archivedPath := range []string{
+		filepath.Join(archiveRoot, "wa_archive_root", "tree", ".workarea", "declaration.json"),
+		filepath.Join(archiveRoot, "wa_archive_root", "tree", "web", "source.txt"),
+		filepath.Join(archiveRoot, "wa_archive_root", "tree", "docs", "context.txt"),
+	} {
+		if _, err := os.Stat(archivedPath); err != nil {
+			t.Fatalf("whole-root archive missing %q: %v", archivedPath, err)
+		}
+	}
+	archivedTree := workarea.RootPath(filepath.Join(archiveRoot, "wa_archive_root", "tree"))
+	archiveUsage, err := workarea.PhysicalUsage(archivedTree)
+	if err != nil || archiveUsage >= 64<<20 {
+		t.Fatalf("archive densified sparse allocation: usage=%d err=%v", archiveUsage, err)
+	}
+	archivedSource, _ := os.Stat(filepath.Join(archivedTree.String(), "web", "source.txt"))
+	archivedHardlink, _ := os.Stat(filepath.Join(archivedTree.String(), "docs", "source-hardlink.txt"))
+	if archivedSource == nil || archivedHardlink == nil || !os.SameFile(archivedSource, archivedHardlink) {
+		t.Fatal("archive did not preserve hardlink identity")
+	}
+	archived, err := registry.GetV1("wa_archive_root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archived.WorkareaRoot == "" || archived.Path != archived.RepositoryWorktreePath || filepath.Base(archived.Path) != "docs" || len(archived.Repositories) != 2 {
+		t.Fatalf("archived root projection = %+v", archived)
+	}
+	if err := acquisitions.RemovePublishedRoot(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	liveManager, err := worktree.NewManager(worktree.Options{ParentDir: worktreeParent, RestoreSessionID: "archive-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(archiveRoot, "wa_archive_root", "manifest.json")
+	manifestBody, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest archiveManifest
+	if err := json.Unmarshal(manifestBody, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	originalDigest := manifest.TreeDigest
+	manifest.OriginalRoot = filepath.Join(t.TempDir(), "manifest-controlled-root")
+	manifest.TreeDigest = "sha256:mutated"
+	mutatedBody, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, mutatedBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := registry.Restore("wa_archive_root", afclient.WorkareaRestoreRequest{IntoSessionID: "archive-session"}); !errors.Is(err, ErrArchiveCorrupted) {
+		t.Fatalf("mutable archive digest was trusted: %v", err)
+	}
+	manifest.TreeDigest = originalDigest
+	validBody, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, validBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restored, _, err := registry.RestoreV1("wa_archive_root", afclient.WorkareaRestoreRequest{IntoSessionID: "archive-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.WorkareaRoot == "" || restored.Path != restored.RepositoryWorktreePath || filepath.Base(restored.Path) != "docs" || len(restored.Repositories) != 2 {
+		t.Fatalf("restored root projection = %+v", restored)
+	}
+	if restored.WorkareaRoot != sourceRoot || restored.WorkareaRoot == manifest.OriginalRoot {
+		t.Fatalf("restore trusted mutable OriginalRoot: restored=%q manifest=%q", restored.WorkareaRoot, manifest.OriginalRoot)
+	}
+	for _, restoredPath := range []string{
+		filepath.Join(restored.WorkareaRoot, ".workarea", "declaration.json"),
+		filepath.Join(restored.WorkareaRoot, "web", "source.txt"),
+		filepath.Join(restored.WorkareaRoot, "docs", "context.txt"),
+	} {
+		if _, err := os.Stat(restoredPath); err != nil {
+			t.Fatalf("whole-root restore missing %q: %v", restoredPath, err)
+		}
+	}
+	restoredSource, _ := os.Stat(filepath.Join(restored.WorkareaRoot, "web", "source.txt"))
+	restoredHardlink, _ := os.Stat(filepath.Join(restored.WorkareaRoot, "docs", "source-hardlink.txt"))
+	if restoredSource == nil || restoredHardlink == nil || !os.SameFile(restoredSource, restoredHardlink) {
+		t.Fatal("restore did not preserve hardlink identity")
+	}
+	restoredUsage, err := workarea.PhysicalUsage(workarea.RootPath(restored.WorkareaRoot))
+	if err != nil || restoredUsage >= 64<<20 {
+		t.Fatalf("restore densified sparse allocation: usage=%d err=%v", restoredUsage, err)
+	}
+	reentrySpec := worktree.ProvisionSpec{
+		SessionID: "archive-session", RepoURL: "https://example.test/web.git", SourceRef: "main",
+		Strategy: worktree.StrategyClone, RepositoryDeclaration: &declaration,
+		ExecutorCapabilities: workarea.ExecutorWorkareaCapabilities{
+			MultiRepositoryWorkareaProtocols: []workarea.Protocol{workarea.ProtocolSessionRootV1},
+			RepositoryAuthorityEnforcement:   workarea.RepositoryAuthorityIsolatedReadOnlyV1,
+		},
+	}
+	liveReenteredPath, err := liveManager.Provision(t.Context(), reentrySpec)
+	if err != nil || liveReenteredPath != filepath.Join(sourceRoot, "docs") {
+		t.Fatalf("live manager restored Provision re-entry = %q, %v", liveReenteredPath, err)
+	}
+	restartedManager, err := worktree.NewManager(worktree.Options{ParentDir: worktreeParent, RestoreSessionID: "archive-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedLayout, err := restartedManager.Layout("archive-session")
+	if err != nil || restartedLayout.Root.String() != sourceRoot || filepath.Base(restartedLayout.Repository.String()) != "docs" {
+		t.Fatalf("restored acquisition adoption = %+v, %v", restartedLayout, err)
+	}
+	reenteredPath, err := restartedManager.Provision(t.Context(), reentrySpec)
+	if err != nil || reenteredPath != restartedLayout.Repository.String() {
+		t.Fatalf("restored Provision re-entry = %q, %v", reenteredPath, err)
+	}
+}
+
+func TestWorkareaArchiveRegistryPreservesLegacyFlatArchiveCompatibility(t *testing.T) {
+	archiveRoot := t.TempDir()
+	flat := filepath.Join(t.TempDir(), "legacy")
+	if err := os.MkdirAll(filepath.Join(flat, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(flat, "file"), []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot})
+	spec := WorkareaRootArchiveSpec{WorkareaID: "wa_flat_archive", SessionID: "legacy-session", WorkareaRoot: flat, SelectedPath: flat}
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatalf("idempotent legacy archive retry: %v", err)
+	}
+	restored, _, err := registry.RestoreV1("wa_flat_archive", afclient.WorkareaRestoreRequest{IntoSessionID: "legacy-restored"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.WorkareaRoot == "" || restored.WorkareaRoot != restored.Path || restored.RepositoryWorktreePath != restored.Path || restored.SessionID != "legacy-restored" {
+		t.Fatalf("legacy restored projection = %+v", restored)
+	}
+	if body, err := os.ReadFile(filepath.Join(restored.Path, "file")); err != nil || string(body) != "legacy" {
+		t.Fatalf("legacy restored file = %q, %v", body, err)
+	}
+}
+
+func TestWorkareaArchiveRegistryRefusesSourceRootSwapAfterAuthorization(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	acquisitions, err := workarea.NewAcquisitionStore(parent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaration, err := (workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{{
+			Source: workarea.RepositorySource{Repository: "repo", Ref: "main"}, Name: "repo",
+			Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+		}},
+	}).Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisition, err := acquisitions.Begin("swap-session", "wa_swap", workarea.RootPath(root), "repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(acquisition.StagingRoot.String(), "repo"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := workarea.WriteDeclaration(t.Context(), acquisition.StagingRoot, workarea.NewDeclarationRecord("swap-session", "wa_swap", declaration, nil, acquisition.Record.AcquisitionID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquisitions.Commit(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	moved := root + "-moved"
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{
+		Root: t.TempDir(), AcquisitionStore: acquisitions,
+		ArchiveHook: func(stage string) error {
+			if stage != "after-authorize" {
+				return nil
+			}
+			if err := os.Rename(root, moved); err != nil {
+				return err
+			}
+			return os.Mkdir(root, 0o700)
+		},
+	})
+	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		AcquisitionID: acquisition.Record.AcquisitionID, WorkareaID: "wa_swap", SessionID: "swap-session",
+		WorkareaRoot: root, SelectedPath: filepath.Join(root, "repo"),
+	}); err == nil {
+		t.Fatal("archive accepted a replacement root after authorization")
+	}
+	if _, err := os.Stat(filepath.Join(moved, ".workarea", "declaration.json")); err != nil {
+		t.Fatalf("authorized original root was damaged: %v", err)
+	}
 }
 
 // ── walkArchiveTree direct coverage ────────────────────────────────────────

@@ -202,7 +202,17 @@ func TestRunOutboxReplaysByteIdenticallyAfterManagerRestart(t *testing.T) {
 func TestRequestedLeaseSurvivesPreserveAlwaysAndArchivesOnRelease(t *testing.T) {
 	bareRepo := makeBareRepo(t)
 	wtParent := t.TempDir()
-	manager, err := worktree.NewManager(worktree.Options{ParentDir: wtParent})
+	var archived atomic.Bool
+	manager, err := worktree.NewManager(worktree.Options{
+		ParentDir: wtParent,
+		ArchiveRoot: func(_ context.Context, spec worktree.ArchiveRootSpec) error {
+			if _, err := os.Stat(spec.WorkareaRoot); err != nil {
+				return err
+			}
+			archived.Store(true)
+			return nil
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,8 +251,11 @@ func TestRequestedLeaseSurvivesPreserveAlwaysAndArchivesOnRelease(t *testing.T) 
 	if _, err := manager.ReapExpiredTerminalLeases(context.Background(), 1, time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(lease.WorkareaPath); err != nil {
-		t.Fatalf("archived preserved leaf missing: %v", err)
+	if !archived.Load() {
+		t.Fatal("archive provider was not called")
+	}
+	if _, err := os.Stat(lease.WorkareaPath); !os.IsNotExist(err) {
+		t.Fatalf("archived source generation still exists: %v", err)
 	}
 }
 

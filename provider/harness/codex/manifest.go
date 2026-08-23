@@ -31,18 +31,20 @@ func (*Provider) Manifest() agent.HarnessManifest {
 		Family:      agent.FamilyHarness,
 		ContractABI: "harness/v2",
 		Caps: agent.HarnessCaps{
-			SupportsMessageInjection: false,
-			SupportsSessionResume:    true,
-			SupportsToolPlugins:      true,
-			AcceptsMcpServerSpec:     true,
-			AcceptsAllowedToolsList:  false,
-			EmitsSubagentEvents:      false,
-			SupportsReasoningEffort:  true,
-			SupportsOneShot:          true,
-			NativeJSONMode:           true, // turn/start outputSchema (app-server v2; see turnStartParams)
-			ToolPermissionFormat:     "codex",
-			StreamingTransport:       "none", // app-server JSON-RPC, not SSE/ndjson over the wire surface
-			SupportsInteractivePTY:   true,
+			SupportsMessageInjection:         false,
+			SupportsSessionResume:            true,
+			SupportsToolPlugins:              true,
+			AcceptsMcpServerSpec:             true,
+			AcceptsAllowedToolsList:          false,
+			EmitsSubagentEvents:              false,
+			SupportsReasoningEffort:          true,
+			SupportsOneShot:                  true,
+			NativeJSONMode:                   true, // turn/start outputSchema (app-server v2; see turnStartParams)
+			ToolPermissionFormat:             "codex",
+			StreamingTransport:               "none", // app-server JSON-RPC, not SSE/ndjson over the wire surface
+			SupportsInteractivePTY:           true,
+			MultiRepositoryWorkareaProtocols: []string{"session-root-v1"},
+			RepositoryAuthorityEnforcement:   "isolated-read-only-v1",
 			// `codex app-server` (and its `codex mcp-server` sibling) is a
 			// JSON-RPC control surface over a live session, so a message is a
 			// method call rather than a keystroke. Handle.Inject deliberately

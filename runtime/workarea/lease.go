@@ -1464,12 +1464,19 @@ func (s *LeaseStore) saveUnlocked(lease TerminalLease) error {
 		} else if err != nil {
 			return fmt.Errorf("runtime/workarea: stat actionable marker: %w", err)
 		}
-	} else if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("runtime/workarea: remove actionable marker: %w", err)
-	} else if err == nil {
-		if err := syncDir(s.actionable); err != nil {
-			return err
+	} else {
+		if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("runtime/workarea: remove actionable marker: %w", err)
 		}
+		// The released lease record was atomically written and fsynced above;
+		// actionable markers are a derived acceleration index rebuilt from those
+		// records before admission on every open. A crash before this directory
+		// entry reaches disk can only retain a stale marker, which recovery removes
+		// after reading the authoritative Released state. Fsyncing the same
+		// directory once per completed member serialized an otherwise concurrent
+		// release batch and let bookkeeping exceed the provider-attempt bound under
+		// load without adding durability authority. No directory fsync is needed
+		// for deletion of this derived entry.
 	}
 	return nil
 }

@@ -235,6 +235,18 @@ const (
 	SandboxFullAccess     SandboxLevel = "full-access"
 )
 
+// RepositoryAuthorityPolicy is the runner-authored, secret-free executor
+// binding for one session-root-v1 workarea. It is not caller-authorable by a
+// harness and never contains repository URLs or credentials.
+type RepositoryAuthorityPolicy struct {
+	Protocol      string   `json:"protocol"`
+	WorkareaRoot  string   `json:"workareaRoot"`
+	SelectedPath  string   `json:"selectedPath"`
+	MutablePaths  []string `json:"mutablePaths,omitempty"`
+	ReadOnlyPaths []string `json:"readOnlyPaths,omitempty"`
+	Enforcement   string   `json:"enforcement"`
+}
+
 // EffortLevel mirrors EffortLevel from
 // ../donmai-libraries/packages/core/src/providers/index.ts. Providers map
 // this to their native reasoning-effort knob:
@@ -352,6 +364,11 @@ type Spec struct {
 	// SandboxLevel overrides the sandbox tier when SandboxEnabled is
 	// true. Maps to provider-native policies.
 	SandboxLevel SandboxLevel `json:"sandboxLevel,omitempty"`
+
+	// RepositoryAuthority is the executor-owned per-repository filesystem
+	// policy. Nil is the legacy singular-worktree path. Providers that do not
+	// positively attest the named protocol/enforcement are denied before spawn.
+	RepositoryAuthority *RepositoryAuthorityPolicy `json:"repositoryAuthority,omitempty"`
 
 	// AllowedTools is the list of tool-call patterns auto-allowed
 	// without prompting (Claude permission-pattern format
@@ -604,6 +621,11 @@ type Result struct {
 	// PreserveWorktreeOnFailure path.
 	WorktreePath string `json:"worktreePath,omitempty"`
 
+	// WorkareaRoot is the additive session-owned lifecycle root. It equals
+	// WorktreePath only for a retained legacy flat workarea; WorktreePath keeps
+	// carrying the selected repository CWD for old readers.
+	WorkareaRoot string `json:"workareaRoot,omitempty"`
+
 	// PullRequestURL is the URL of the PR opened (by the agent or the
 	// backstop). Empty when no PR exists.
 	PullRequestURL string `json:"pullRequestUrl,omitempty"`
@@ -690,6 +712,20 @@ type TurnManifest struct {
 	// CommitSHA is the head commit sha of the work branch when the agent knows
 	// it. Optional — advisory; the runner's post-backstop capture wins.
 	CommitSHA string `json:"commitSha,omitempty"`
+
+	// Repositories optionally carries the agent-owned outcome per declared
+	// repository. Absent retains schemaVersion 1 semantics: scalar artifacts
+	// apply to the selected repository.
+	Repositories *[]TurnManifestRepository `json:"repositories,omitempty"`
+}
+
+// TurnManifestRepository is one per-repository additive manifest member.
+type TurnManifestRepository struct {
+	Name           string `json:"name"`
+	Verdict        string `json:"verdict,omitempty"`
+	Summary        string `json:"summary,omitempty"`
+	PullRequestURL string `json:"pullRequestUrl,omitempty"`
+	CommitSHA      string `json:"commitSha,omitempty"`
 }
 
 // BackstopReport captures what the post-session backstop did, if
@@ -715,6 +751,17 @@ type BackstopReport struct {
 
 	// Diagnostics is human-readable text describing what happened.
 	Diagnostics string `json:"diagnostics,omitempty"`
+
+	// Repositories is the additive per-mutable-repository backstop projection.
+	// Empty retains the legacy singular report semantics.
+	Repositories []RepositoryBackstopReport `json:"repositories,omitempty"`
+}
+
+// RepositoryBackstopReport binds one backstop result to its declared
+// repository without changing the legacy top-level report fields.
+type RepositoryBackstopReport struct {
+	Name   string         `json:"name"`
+	Report BackstopReport `json:"report"`
 }
 
 // QualityReport captures the test/typecheck/lint deltas vs the
