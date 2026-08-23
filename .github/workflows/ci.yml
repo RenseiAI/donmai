@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           # The required cross-version shim gate verifies and archives the exact
-          # released v0.68.1 tag/commit; a shallow PR checkout cannot prove it.
+          # released v0.68.2 tag/commit; a shallow PR checkout cannot prove it.
           fetch-depth: 0
 
       - name: Set up Go
@@ -43,8 +43,10 @@ jobs:
       - name: Build
         run: make build
 
-      - name: Pinned v0.68.1 shim overlap
+      - name: Pinned released shim overlap (v1 + v2)
         run: make test-shim-overlap
+      - name: Frozen attach-v1 v0.68.2 artifact bytes
+        run: make test-attach-v1-compat
 
       # Build-tag-gated `_test.go` files are excluded from `go build ./...` and
       # `go test ./...` entirely — not run, not compiled, not syntax-checked —

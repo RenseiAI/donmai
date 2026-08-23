@@ -36,6 +36,10 @@ var (
 
 	// ErrSnapshotMismatch reports request/result correlation disagreement.
 	ErrSnapshotMismatch = errors.New("shimwire: snapshot request/result mismatch")
+
+	// ErrDuplicateHostFrame reports two local observations for one selected-v3
+	// host sequence or a live result that tries to carry the raw frame again.
+	ErrDuplicateHostFrame = errors.New("shimwire: duplicate host frame")
 )
 
 // ErrorCode is the closed set of codes carried by an Error message. The detail

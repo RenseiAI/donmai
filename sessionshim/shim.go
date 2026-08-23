@@ -44,6 +44,11 @@ type Options struct {
 	// ProcessEpoch is the monotonic per-session value for this shim incarnation.
 	ProcessEpoch uint64
 
+	// ProtocolMin/ProtocolMax optionally narrow this shim's supported range.
+	// Zero/zero uses the build range; immutable overlap fixtures use max 2.
+	ProtocolMin uint32
+	ProtocolMax uint32
+
 	Logger *slog.Logger
 
 	// Now lets tests drive deterministic timestamps.
@@ -80,11 +85,13 @@ type Shim struct {
 	now      func() time.Time
 	orphan   OrphanPolicy
 
-	shimID   string
-	epoch    uint64
-	self     ProcessIdentity
-	harness  ProcessIdentity
-	workarea string
+	shimID      string
+	epoch       uint64
+	self        ProcessIdentity
+	harness     ProcessIdentity
+	workarea    string
+	protocolMin uint32
+	protocolMax uint32
 
 	socketPath string
 	socketDev  uint64
@@ -96,6 +103,14 @@ type Shim struct {
 	// the terminal withdrawal racing each other can otherwise resurrect a
 	// liveness record for a harness that is provably gone.
 	recordMu sync.Mutex
+	// handshakeMu serializes Hello-time output barriers. Two same-UID controller
+	// dials cannot each freeze a different LastSeq and then race Welcome commits.
+	handshakeMu sync.Mutex
+	// ackedSeq is protected by recordMu because advancing it and publishing its
+	// sidecar are one durability transition.
+	ackedSeq          uint64
+	terminalPublished bool
+	ackNotify         chan struct{}
 
 	mu    sync.Mutex
 	gen   shimwire.Generation
@@ -121,8 +136,22 @@ type controllerConn struct {
 	snapshotLedger map[uint64]*snapshotLedgerEntry
 	emissionMu     sync.Mutex
 	emissionBySeq  map[uint64]*snapshotLedgerEntry
+	pumpDone       chan struct{}
+	barrierMu      sync.Mutex
+	outputBarrier  *ptyhost.OutputBarrier
+	barrierTimer   *time.Timer
+	barrierState   uint8
 	closeOnce      sync.Once
 }
+
+const (
+	outputBarrierNone uint8 = iota
+	outputBarrierPending
+	outputBarrierConsumed
+	outputBarrierFailed
+)
+
+const adoptionOutputBarrierTimeout = 30 * time.Second
 
 const snapshotRetryLedgerLimit = 1024
 
@@ -135,11 +164,75 @@ type snapshotLedgerEntry struct {
 
 func (c *controllerConn) close() {
 	c.closeOnce.Do(func() {
+		c.failOutputBarrier()
 		if c.sub != nil {
 			_ = c.sub.Close()
 		}
 		_ = c.conn.Close()
 	})
+}
+
+func (c *controllerConn) installOutputBarrier(barrier *ptyhost.OutputBarrier) {
+	if barrier == nil {
+		return
+	}
+	c.barrierMu.Lock()
+	c.outputBarrier = barrier
+	c.barrierState = outputBarrierPending
+	c.barrierTimer = time.AfterFunc(adoptionOutputBarrierTimeout, func() {
+		c.barrierMu.Lock()
+		if c.barrierState != outputBarrierPending || c.outputBarrier == nil {
+			c.barrierMu.Unlock()
+			return
+		}
+		pending := c.outputBarrier
+		c.outputBarrier = nil
+		c.barrierState = outputBarrierFailed
+		c.barrierTimer = nil
+		c.barrierMu.Unlock()
+		pending.Release()
+		_ = c.conn.Close()
+	})
+	c.barrierMu.Unlock()
+}
+
+func (c *controllerConn) failOutputBarrier() {
+	c.barrierMu.Lock()
+	if c.barrierTimer != nil {
+		c.barrierTimer.Stop()
+		c.barrierTimer = nil
+	}
+	pending := c.outputBarrier
+	c.outputBarrier = nil
+	if c.barrierState == outputBarrierPending {
+		c.barrierState = outputBarrierFailed
+	}
+	c.barrierMu.Unlock()
+	if pending != nil {
+		pending.Release()
+	}
+}
+
+func (c *controllerConn) emitSnapshot(sess *ptyhost.Session) (attachwire.Frame, bool, error) {
+	c.barrierMu.Lock()
+	switch c.barrierState {
+	case outputBarrierPending:
+		barrier := c.outputBarrier
+		c.outputBarrier = nil
+		c.barrierState = outputBarrierConsumed
+		if c.barrierTimer != nil {
+			c.barrierTimer.Stop()
+			c.barrierTimer = nil
+		}
+		c.barrierMu.Unlock()
+		return barrier.EmitSnapshot()
+	case outputBarrierFailed:
+		c.barrierMu.Unlock()
+		return attachwire.Frame{}, false, errors.New("sessionshim: adoption output barrier expired")
+	default:
+		c.barrierMu.Unlock()
+		return sess.EmitSnapshot()
+	}
 }
 
 // ErrShimUnsupported reports a platform on which shim adoption cannot be safely
@@ -164,6 +257,13 @@ func Start(opts Options) (*Shim, error) {
 	}
 	if opts.Registry == nil {
 		return nil, errors.New("sessionshim: Start requires a Registry")
+	}
+	protocolMin, protocolMax := opts.ProtocolMin, opts.ProtocolMax
+	if protocolMin == 0 && protocolMax == 0 {
+		protocolMin, protocolMax = shimwire.ProtocolMin, shimwire.ProtocolMax
+	}
+	if protocolMin == 0 || protocolMax < protocolMin || protocolMax > shimwire.ProtocolMax {
+		return nil, fmt.Errorf("sessionshim: invalid shim protocol range [%d,%d]", protocolMin, protocolMax)
 	}
 	orphan := opts.Orphan
 	if orphan.Deadline == 0 {
@@ -229,24 +329,27 @@ func Start(opts Options) (*Shim, error) {
 	}
 
 	s := &Shim{
-		id:         opts.Identity,
-		registry:   opts.Registry,
-		sess:       sess,
-		ln:         ln,
-		logger:     opts.logger(),
-		now:        opts.now(),
-		orphan:     orphan,
-		shimID:     shimID,
-		epoch:      opts.ProcessEpoch,
-		self:       self,
-		harness:    ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
-		workarea:   opts.WorkareaPath,
-		socketPath: socketPath,
-		socketDev:  dev,
-		socketIno:  ino,
-		phase:      shimwire.PhaseRunning,
-		done:       make(chan struct{}),
-		acceptDone: make(chan struct{}),
+		id:          opts.Identity,
+		registry:    opts.Registry,
+		sess:        sess,
+		ln:          ln,
+		logger:      opts.logger(),
+		now:         opts.now(),
+		orphan:      orphan,
+		shimID:      shimID,
+		epoch:       opts.ProcessEpoch,
+		self:        self,
+		harness:     ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
+		workarea:    opts.WorkareaPath,
+		protocolMin: protocolMin,
+		protocolMax: protocolMax,
+		socketPath:  socketPath,
+		socketDev:   dev,
+		socketIno:   ino,
+		phase:       shimwire.PhaseRunning,
+		done:        make(chan struct{}),
+		acceptDone:  make(chan struct{}),
+		ackNotify:   make(chan struct{}),
 	}
 
 	if err := s.publishRecord(); err != nil {
@@ -372,7 +475,33 @@ func (s *Shim) finalizeTerminal() error {
 	ctrl := s.ctrl
 	s.mu.Unlock()
 
-	if ctrl != nil {
+	if ctrl != nil && ctrl.selected >= shimwire.V3 && ctrl.pumpDone != nil {
+		// In v3 the one raw Exit HostFrame is the terminal observation. Session
+		// Done closes the subscription after publishing Exit. Give the pump a
+		// bounded flush opportunity, then close a stalled controller so terminal
+		// proof cannot deadlock behind socket backpressure.
+		flushBound := s.orphan.TerminationGrace
+		if flushBound <= 0 || flushBound > 5*time.Second {
+			flushBound = 5 * time.Second
+		}
+		timer := time.NewTimer(flushBound)
+		select {
+		case <-ctrl.pumpDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			ctrl.close()
+			s.logger.Warn("sessionshim: selected-v3 controller stalled before terminal frame flush",
+				"session", s.id.String())
+		}
+		// Socket write completion is not the carrier durability boundary. Give the
+		// exact selected-v3 persistence receipt the same bounded opportunity before
+		// replacing replayable state with the terminal proof.
+		s.waitForDurableAck(uint64(lastSeq), flushBound)
+	}
+
+	if ctrl != nil && ctrl.selected < shimwire.V3 {
 		// Best-effort: the controller may already be gone, which is exactly the
 		// case the tombstone exists for.
 		_ = writeTyped(ctrl.w, shimwire.TypeExit, func() ([]byte, error) {
@@ -400,6 +529,9 @@ func (s *Shim) finalizeTerminal() error {
 	// any republish that queues behind this lock is refused rather than reordered.
 	s.recordMu.Lock()
 	err := s.registry.PutTombstone(t)
+	if err == nil {
+		s.terminalPublished = true
+	}
 	s.recordMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("sessionshim: persist tombstone: %w", err)
@@ -504,8 +636,8 @@ func (s *Shim) publishRecordWithDeadline(deadline time.Time) error {
 		SocketPath:        s.socketPath,
 		SocketDevice:      s.socketDev,
 		SocketInode:       s.socketIno,
-		ProtocolMin:       shimwire.ProtocolMin,
-		ProtocolMax:       shimwire.ProtocolMax,
+		ProtocolMin:       s.protocolMin,
+		ProtocolMax:       s.protocolMax,
 		Phase:             phase,
 		WorkareaPath:      s.workarea,
 		CreatedAtUnixNano: s.now().UnixNano(),
@@ -556,10 +688,30 @@ func (s *Shim) serveController(conn *net.UnixConn) {
 // handshake performs Hello → Welcome → Adopted and, on success, hands the
 // connection to the live loops.
 func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Reader) error {
+	s.handshakeMu.Lock()
+	defer s.handshakeMu.Unlock()
+
+	var (
+		outputBarrier *ptyhost.OutputBarrier
+		frozenLast    attachwire.HostSeq
+	)
+	if s.protocolMax >= shimwire.V3 {
+		outputBarrier, frozenLast = s.sess.BeginOutputBarrier()
+		_ = conn.SetDeadline(time.Now().Add(adoptionOutputBarrierTimeout))
+		defer func() {
+			if outputBarrier != nil {
+				outputBarrier.Release()
+			}
+		}()
+	}
 	hello, err := s.buildHello()
 	if err != nil {
 		_ = sendError(w, shimwire.CodeInternal, "shim state unavailable")
 		return err
+	}
+	if outputBarrier != nil && hello.LastSeq != uint64(frozenLast) {
+		_ = sendError(w, shimwire.CodeInternal, "adoption output boundary changed")
+		return errors.New("sessionshim: adoption output boundary changed while building Hello")
 	}
 	if err := writeTyped(w, shimwire.TypeHello, func() ([]byte, error) { return shimwire.EncodeHello(hello) }); err != nil {
 		return err
@@ -582,14 +734,21 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		_ = sendError(w, shimwire.CodeVersionMismatch, "protocol name mismatch")
 		return fmt.Errorf("sessionshim: %w: welcome names protocol %q", shimwire.ErrVersionMismatch, welcome.Protocol)
 	}
-	if welcome.Selected < shimwire.ProtocolMin || welcome.Selected > shimwire.ProtocolMax {
+	if welcome.Selected < s.protocolMin || welcome.Selected > s.protocolMax {
 		_ = sendError(w, shimwire.CodeVersionMismatch, "selected version outside this shim's range")
 		return fmt.Errorf("sessionshim: %w: selected %d outside [%d,%d]",
-			shimwire.ErrVersionMismatch, welcome.Selected, shimwire.ProtocolMin, shimwire.ProtocolMax)
+			shimwire.ErrVersionMismatch, welcome.Selected, s.protocolMin, s.protocolMax)
 	}
 	if err := welcome.Extensions.CheckRequired(); err != nil {
 		_ = sendError(w, shimwire.CodeExtensionRequired, "required extension unsupported")
 		return err
+	}
+	_, proofBoundCarrier := welcome.Extensions.Values[shimwire.ExtCarrierEpoch]
+	if welcome.Selected < shimwire.V3 || !proofBoundCarrier {
+		if outputBarrier != nil {
+			outputBarrier.Release()
+			outputBarrier = nil
+		}
 	}
 
 	// The SHIM is authoritative for the generation: the daemon proposes and this
@@ -599,10 +758,12 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	// until a daemon adopts it and durably reports the terminal outcome, so
 	// refusing here would strand the one artifact that can close the lifecycle
 	// loop. The retained Exit frame rides the ordinary replay path below.
+	s.recordMu.Lock()
 	s.mu.Lock()
 	if welcome.ProposedGeneration <= s.gen {
 		current := s.gen
 		s.mu.Unlock()
+		s.recordMu.Unlock()
 		_ = sendError(w, shimwire.CodeStaleGeneration,
 			fmt.Sprintf("proposed generation %d does not advance current %d", welcome.ProposedGeneration, current))
 		return fmt.Errorf("sessionshim: %w: proposed %d, current %d",
@@ -614,9 +775,15 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		conn: conn, w: w, selected: welcome.Selected,
 		snapshotLedger: make(map[uint64]*snapshotLedgerEntry),
 		emissionBySeq:  make(map[uint64]*snapshotLedgerEntry),
+		pumpDone:       make(chan struct{}),
+	}
+	if outputBarrier != nil {
+		ctrl.installOutputBarrier(outputBarrier)
+		outputBarrier = nil
 	}
 	s.ctrl = ctrl
 	s.mu.Unlock()
+	s.recordMu.Unlock()
 
 	// §D4: the old controller's socket is closed the moment a new generation
 	// commits. A file lock would not be enough — an old daemon can hold an open
@@ -626,7 +793,7 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	}
 	s.disarmOrphan()
 
-	adopted, sub, gap, snap, err := s.resume(welcome.ResumeFrom)
+	adopted, sub, gap, snap, rawSnapshot, err := s.resume(welcome.ResumeFrom, ctrl.selected)
 	if err != nil {
 		_ = sendError(w, shimwire.CodeInternal, "resume failed")
 		return err
@@ -638,6 +805,7 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		ctrl.close()
 		return err
 	}
+	_ = conn.SetDeadline(time.Time{})
 	// Gap BEFORE Snapshot, always in that order: the daemon learns what it lost
 	// before it is handed the state that replaces it. Reversing them would let a
 	// carrier render the snapshot as if it were continuous.
@@ -649,6 +817,12 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	}
 	if snap != nil {
 		if err := writeTyped(w, shimwire.TypeSnapshot, func() ([]byte, error) { return shimwire.EncodeSnapshot(*snap) }); err != nil {
+			ctrl.close()
+			return err
+		}
+	}
+	if rawSnapshot != nil {
+		if err := writeHostFrame(ctrl, 0, *rawSnapshot); err != nil {
 			ctrl.close()
 			return err
 		}
@@ -669,8 +843,8 @@ func (s *Shim) buildHello() (shimwire.Hello, error) {
 	s.mu.Unlock()
 	return shimwire.Hello{
 		Protocol:         shimwire.ProtocolName,
-		Min:              shimwire.ProtocolMin,
-		Max:              shimwire.ProtocolMax,
+		Min:              s.protocolMin,
+		Max:              s.protocolMax,
 		OrgID:            s.id.OrgID,
 		SessionID:        s.id.SessionID,
 		ShimID:           s.shimID,
@@ -698,7 +872,7 @@ func (s *Shim) buildHello() (shimwire.Hello, error) {
 //     does NOT rewind its sequence to match a controller's disagreeing durable
 //     state; the sequence is the shim's, and renumbering it would be the exact
 //     fabricated continuity the ADR forbids.
-func (s *Shim) resume(resumeFrom uint64) (shimwire.Adopted, agent.InteractiveSubscription, *shimwire.GapMsg, *shimwire.SnapshotMsg, error) {
+func (s *Shim) resume(resumeFrom uint64, selected uint32) (shimwire.Adopted, agent.InteractiveSubscription, *shimwire.GapMsg, *shimwire.SnapshotMsg, *attachwire.Frame, error) {
 	if resumeFrom == 0 {
 		resumeFrom = uint64(attachwire.HostSeqStart)
 	}
@@ -716,10 +890,20 @@ func (s *Shim) resume(resumeFrom uint64) (shimwire.Adopted, agent.InteractiveSub
 			ReplayFrom: resumeFrom,
 			ReplayTo:   uint64(lastSeq),
 			Phase:      phase,
-		}, sub, nil, nil, nil
+		}, sub, nil, nil, nil, nil
 	}
 	if !errors.Is(err, agent.ErrRingMiss) {
-		return shimwire.Adopted{}, nil, nil, nil, fmt.Errorf("sessionshim: subscribe: %w", err)
+		return shimwire.Adopted{}, nil, nil, nil, nil, fmt.Errorf("sessionshim: subscribe: %w", err)
+	}
+	_, beforeRecoverySeq, _ := s.sess.Snapshot()
+	if selected >= shimwire.V3 && resumeFrom > uint64(beforeRecoverySeq)+1 {
+		// A durable cursor ahead of this shim's real sequence is a disagreement,
+		// not a missing range. In v3 the recovery Snapshot itself carries the exact
+		// host sequence, so pretending it followed the ahead cursor would create an
+		// impossible Gap -> HostFrame ordering. Selected v1/v2 retain their released
+		// semantic recovery behavior.
+		return shimwire.Adopted{}, nil, nil, nil, nil,
+			fmt.Errorf("sessionshim: selected-v3 resume %d is ahead of host sequence %d", resumeFrom, beforeRecoverySeq)
 	}
 
 	// Ring miss. EmitSnapshot allocates the next sequence atomically under the
@@ -727,11 +911,11 @@ func (s *Shim) resume(resumeFrom uint64) (shimwire.Adopted, agent.InteractiveSub
 	// which makes the gap range exact rather than approximate.
 	frame, inStream, err := s.sess.EmitSnapshot()
 	if err != nil {
-		return shimwire.Adopted{}, nil, nil, nil, fmt.Errorf("sessionshim: emit snapshot: %w", err)
+		return shimwire.Adopted{}, nil, nil, nil, nil, fmt.Errorf("sessionshim: emit snapshot: %w", err)
 	}
 	env, err := attachwire.DecodeSnapshotEnvelope(frame.Payload)
 	if err != nil {
-		return shimwire.Adopted{}, nil, nil, nil, fmt.Errorf("sessionshim: decode snapshot envelope: %w", err)
+		return shimwire.Adopted{}, nil, nil, nil, nil, fmt.Errorf("sessionshim: decode snapshot envelope: %w", err)
 	}
 
 	reason := shimwire.GapRingEvicted
@@ -748,6 +932,13 @@ func (s *Shim) resume(resumeFrom uint64) (shimwire.Adopted, agent.InteractiveSub
 	}
 	gap := &shimwire.GapMsg{FromSeq: resumeFrom, ToSeq: gapTo, Reason: reason}
 	snap := &shimwire.SnapshotMsg{AtSeq: env.AtSeq, Screen: env.Snap}
+	var rawSnapshot *attachwire.Frame
+	if selected >= shimwire.V3 {
+		copyFrame := frame
+		copyFrame.Payload = append([]byte(nil), frame.Payload...)
+		rawSnapshot = &copyFrame
+		snap = nil
+	}
 
 	// Continue live AFTER the snapshot frame. When the snapshot rode the stream
 	// (inStream), subscribing at its own seq skips redelivering it.
@@ -757,7 +948,7 @@ func (s *Shim) resume(resumeFrom uint64) (shimwire.Adopted, agent.InteractiveSub
 	}
 	sub, err = s.sess.Subscribe(from)
 	if err != nil && !errors.Is(err, agent.ErrRingMiss) {
-		return shimwire.Adopted{}, nil, nil, nil, fmt.Errorf("sessionshim: subscribe after gap: %w", err)
+		return shimwire.Adopted{}, nil, nil, nil, nil, fmt.Errorf("sessionshim: subscribe after gap: %w", err)
 	}
 
 	s.mu.Lock()
@@ -769,7 +960,7 @@ func (s *Shim) resume(resumeFrom uint64) (shimwire.Adopted, agent.InteractiveSub
 		ReplayFrom: env.AtSeq + 1,
 		ReplayTo:   uint64(lastSeq),
 		Phase:      phase,
-	}, sub, gap, snap, nil
+	}, sub, gap, snap, rawSnapshot, nil
 }
 
 // pumpOutput forwards host-produced frames to one controller.
@@ -778,6 +969,7 @@ func (s *Shim) resume(resumeFrom uint64) (shimwire.Adopted, agent.InteractiveSub
 // or anywhere downstream: the shim is the sole allocator (§D5), so a daemon that
 // restarts resumes into the same namespace rather than starting a new one.
 func (s *Shim) pumpOutput(ctrl *controllerConn) {
+	defer close(ctrl.pumpDone)
 	if ctrl.sub == nil {
 		return
 	}
@@ -786,6 +978,31 @@ func (s *Shim) pumpOutput(ctrl *controllerConn) {
 			return // superseded by a newer generation
 		}
 		var err error
+		if ctrl.selected >= shimwire.V3 {
+			requestID := uint64(0)
+			var entry *snapshotLedgerEntry
+			if frame.Type == attachwire.TypeSnapshot {
+				ctrl.emissionMu.Lock()
+				entry = ctrl.emissionBySeq[frame.Seq]
+				if entry != nil {
+					delete(ctrl.emissionBySeq, frame.Seq)
+					requestID = entry.request.RequestID
+				}
+				ctrl.emissionMu.Unlock()
+			}
+			if entry != nil {
+				entry.writeErr = writeHostFrameSnapshotPair(ctrl, requestID, frame, entry.result)
+				close(entry.delivered)
+				err = entry.writeErr
+			} else {
+				err = writeHostFrame(ctrl, requestID, frame)
+			}
+			if err != nil {
+				ctrl.close()
+				return
+			}
+			continue
+		}
 		switch frame.Type {
 		case attachwire.TypeOutput:
 			out := attachwire.DecodeOutput(frame.Payload)
@@ -840,6 +1057,34 @@ func (s *Shim) pumpOutput(ctrl *controllerConn) {
 	// the socket until readControl observes the controller dropping it. An
 	// unexpected subscription loss cannot grant authority or terminalize the
 	// session; the generation-fenced control loop remains the safer owner.
+}
+
+func writeHostFrame(ctrl *controllerConn, requestID uint64, frame attachwire.Frame) error {
+	body, err := shimwire.EncodeHostFrame(shimwire.HostFrame{RequestID: requestID, FrameBytes: frame.Encode()})
+	if err != nil {
+		return err
+	}
+	return ctrl.w.WriteVersion(ctrl.selected, shimwire.TypeHostFrame, body)
+}
+
+func writeHostFrameSnapshotPair(
+	ctrl *controllerConn,
+	requestID uint64,
+	frame attachwire.Frame,
+	result shimwire.SnapshotResult,
+) error {
+	hostBody, err := shimwire.EncodeHostFrame(shimwire.HostFrame{RequestID: requestID, FrameBytes: frame.Encode()})
+	if err != nil {
+		return err
+	}
+	resultBody, err := shimwire.EncodeSnapshotResult(result)
+	if err != nil {
+		return err
+	}
+	return ctrl.w.WriteVersionBatch(ctrl.selected,
+		shimwire.Message{Type: shimwire.TypeHostFrame, Body: hostBody},
+		shimwire.Message{Type: shimwire.TypeSnapshotResult, Body: resultBody},
+	)
 }
 
 // readControl consumes controller-originated frames, enforcing the generation
@@ -917,14 +1162,11 @@ func (s *Shim) dispatch(ctrl *controllerConn, msg shimwire.Message) error {
 			}
 		}()
 	case shimwire.TypeHeartbeat:
-		// Heartbeat is read-only liveness plus an acknowledgement; it carries no
-		// authority and therefore needs no fence.
-		if _, err := shimwire.DecodeHeartbeat(msg.Body); err != nil {
+		heartbeat, err := shimwire.DecodeHeartbeat(msg.Body)
+		if err != nil {
 			return sendError(ctrl.w, shimwire.CodeMalformed, "heartbeat did not decode")
 		}
-		return writeTyped(ctrl.w, shimwire.TypeHeartbeat, func() ([]byte, error) {
-			return shimwire.EncodeHeartbeat(shimwire.HeartbeatMsg{Generation: s.Generation(), Phase: s.Phase()})
-		})
+		return s.persistHeartbeatAck(ctrl, heartbeat)
 	case shimwire.TypeError:
 		return nil // display-only from the controller; nothing to act on
 	case shimwire.TypeSnapshotRequest:
@@ -936,6 +1178,91 @@ func (s *Shim) dispatch(ctrl *controllerConn, msg shimwire.Message) error {
 		return sendError(ctrl.w, shimwire.CodeMalformed, "message type is not controller-originated")
 	}
 	return nil
+}
+
+func (s *Shim) persistHeartbeatAck(ctrl *controllerConn, heartbeat shimwire.HeartbeatMsg) error {
+	if ctrl.selected < shimwire.V3 {
+		// Selected v1/v2 retain their released behavior byte-for-byte. In
+		// particular, they neither inspect nor create the v3-only .ack sidecar.
+		if heartbeat.Generation == 0 || !s.authorized(heartbeat.Generation) {
+			return sendError(ctrl.w, shimwire.CodeStaleGeneration, "heartbeat rejected: stale controller generation")
+		}
+		return writeTyped(ctrl.w, shimwire.TypeHeartbeat, func() ([]byte, error) {
+			return shimwire.EncodeHeartbeat(shimwire.HeartbeatMsg{Generation: s.Generation(), Phase: s.Phase()})
+		})
+	}
+	s.recordMu.Lock()
+	if s.terminalPublished {
+		s.recordMu.Unlock()
+		return sendError(ctrl.w, shimwire.CodeExited, "heartbeat rejected: terminal proof is published")
+	}
+	s.mu.Lock()
+	if heartbeat.Generation == 0 || heartbeat.Generation != s.gen || s.ctrl != ctrl {
+		s.mu.Unlock()
+		s.recordMu.Unlock()
+		return sendError(ctrl.w, shimwire.CodeStaleGeneration, "heartbeat rejected: stale controller generation")
+	}
+	generation, phase := s.gen, s.phase
+	currentAck := s.ackedSeq
+	s.mu.Unlock()
+
+	_, lastSeq, snapshotErr := s.sess.Snapshot()
+	if snapshotErr != nil {
+		s.recordMu.Unlock()
+		return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat could not sample host sequence")
+	}
+	switch {
+	case heartbeat.AckedSeq < currentAck:
+		s.recordMu.Unlock()
+		return sendError(ctrl.w, shimwire.CodeMalformed, "heartbeat acknowledgement regressed")
+	case heartbeat.AckedSeq > uint64(lastSeq):
+		s.recordMu.Unlock()
+		return sendError(ctrl.w, shimwire.CodeMalformed, "heartbeat acknowledgement is ahead of host sequence")
+	case heartbeat.AckedSeq > currentAck:
+		ack := durableAckCursor{
+			SchemaVersion: durableAckSchemaVersion,
+			OrgID:         s.id.OrgID, SessionID: s.id.SessionID, ShimID: s.shimID, ProcessEpoch: s.epoch,
+			ControllerGeneration: generation, AckedSeq: heartbeat.AckedSeq,
+		}
+		if err := s.registry.putDurableAck(ack); err != nil {
+			s.recordMu.Unlock()
+			return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat acknowledgement was not persisted")
+		}
+		s.ackedSeq = heartbeat.AckedSeq
+		currentAck = heartbeat.AckedSeq
+		close(s.ackNotify)
+		s.ackNotify = make(chan struct{})
+	}
+	s.recordMu.Unlock()
+
+	// Selected v3 makes persistence synchronous: the daemon cannot advance its
+	// own cursor until this exact fsync-backed receipt arrives.
+	reply := shimwire.HeartbeatMsg{Generation: generation, Phase: phase, AckedSeq: currentAck}
+	return writeTyped(ctrl.w, shimwire.TypeHeartbeat, func() ([]byte, error) {
+		return shimwire.EncodeHeartbeat(reply)
+	})
+}
+
+func (s *Shim) waitForDurableAck(sequence uint64, bound time.Duration) {
+	if sequence == 0 || bound <= 0 {
+		return
+	}
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	for {
+		s.recordMu.Lock()
+		if s.ackedSeq >= sequence {
+			s.recordMu.Unlock()
+			return
+		}
+		notify := s.ackNotify
+		s.recordMu.Unlock()
+		select {
+		case <-notify:
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 func (s *Shim) dispatchSnapshotRequest(ctrl *controllerConn, body []byte) error {
@@ -981,7 +1308,7 @@ func (s *Shim) dispatchSnapshotRequest(ctrl *controllerConn, body []byte) error 
 		// host publishes while EmitSnapshot holds its own sequence lock; the pump
 		// cannot observe and forward that frame before this request owns its seq.
 		ctrl.emissionMu.Lock()
-		frame, inStream, emitErr := s.sess.EmitSnapshot()
+		frame, inStream, emitErr := ctrl.emitSnapshot(s.sess)
 		if emitErr != nil {
 			ctrl.emissionMu.Unlock()
 			entry.result = refusedSnapshotResult(req, shimwire.CodeInternal)
@@ -995,7 +1322,10 @@ func (s *Shim) dispatchSnapshotRequest(ctrl *controllerConn, body []byte) error 
 		}
 		entry.result = shimwire.SnapshotResult{
 			RequestID: req.RequestID, Generation: req.Generation, Mode: req.Mode,
-			AtSeq: env.AtSeq, InStream: inStream, Bytes: frame.Encode(),
+			AtSeq: env.AtSeq, InStream: inStream,
+		}
+		if ctrl.selected < shimwire.V3 || !inStream {
+			entry.result.Bytes = frame.Encode()
 		}
 		if inStream {
 			ctrl.emissionBySeq[frame.Seq] = entry

@@ -16,7 +16,7 @@ import (
 func TestV2AuthoritativeSnapshotProxyExactRetryOrderingAndPostExit(t *testing.T) {
 	id := Identity{OrgID: "org-snapshot-v2", SessionID: "session-snapshot-v2"}
 	f := startShimHelper(t, id, 0)
-	result := f.adoptAs(t, "controller-snapshot-v2")
+	result := f.adoptAsMax(t, "controller-snapshot-v2", shimwire.V2)
 	if len(result.Adopted) != 1 {
 		t.Fatalf("adopted = %d, want 1", len(result.Adopted))
 	}

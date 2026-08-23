@@ -129,7 +129,10 @@ func (r *Registry) PutTombstone(t Tombstone) error {
 			return err
 		}
 	}
-	return r.RemoveIncarnation(t.Identity(), t.ShimID, t.ProcessEpoch)
+	if err := r.RemoveIncarnation(t.Identity(), t.ShimID, t.ProcessEpoch); err != nil {
+		return err
+	}
+	return r.removeDurableAck(t.Identity(), t.ShimID, t.ProcessEpoch)
 }
 
 func tombstoneIncarnationName(t Tombstone) string {

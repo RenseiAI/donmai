@@ -3,13 +3,164 @@ package sessionshim
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/shimwire"
 )
+
+func TestControllerProtocolRangeRequiresExplicitFullFrameConsumption(t *testing.T) {
+	t.Parallel()
+	protocolMin, protocolMax, err := (ControllerOptions{}).protocolRange()
+	if err != nil || protocolMin != shimwire.V1 || protocolMax != shimwire.V2 {
+		t.Fatalf("zero-value controller range = [%d,%d], %v; want released [1,2]", protocolMin, protocolMax, err)
+	}
+	protocolMin, protocolMax, err = (ControllerOptions{RequireFullHostFrames: true}).protocolRange()
+	if err != nil || protocolMin != shimwire.V1 || protocolMax != shimwire.V3 {
+		t.Fatalf("full-frame controller range = [%d,%d], %v; want [1,3]", protocolMin, protocolMax, err)
+	}
+	if _, _, err := (ControllerOptions{ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V3}).protocolRange(); err == nil {
+		t.Fatal("controller advertised max 3 without declaring full HostFrame consumption")
+	}
+	if _, _, err := (ControllerOptions{
+		ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V2, RequireFullHostFrames: true,
+	}).protocolRange(); err == nil {
+		t.Fatal("controller declared full HostFrame consumption while capped below v3")
+	}
+}
+
+func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
+	clientConn, shimConn := net.Pipe()
+	defer clientConn.Close() //nolint:errcheck
+	controller := &Controller{
+		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
+		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
+		events: make(chan ControllerEvent, 64), eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),
+		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
+	}
+	go controller.dispatchEvents()
+	go controller.readLoop()
+	peerDone := make(chan error, 1)
+	burstWritten := make(chan struct{})
+	allowReceipt := make(chan struct{})
+	go func() {
+		defer shimConn.Close() //nolint:errcheck
+		reader, writer := shimwire.NewReader(shimConn), shimwire.NewWriter(shimConn)
+		message, err := reader.ReadVersion(shimwire.V3)
+		if err != nil || message.Type != shimwire.TypeHeartbeat {
+			peerDone <- fmt.Errorf("heartbeat request = %s, %v", message.Type, err)
+			return
+		}
+		heartbeat, err := shimwire.DecodeHeartbeat(message.Body)
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		const burst = 80 // deliberately greater than the public 64-event buffer
+		for sequence := uint64(1); sequence <= burst; sequence++ {
+			frame := attachwire.Frame{Type: attachwire.TypeOutput, Seq: sequence, Payload: []byte{byte(sequence)}}
+			body, encodeErr := shimwire.EncodeHostFrame(shimwire.HostFrame{FrameBytes: frame.Encode()})
+			if encodeErr != nil {
+				peerDone <- encodeErr
+				return
+			}
+			if err := writer.WriteVersion(shimwire.V3, shimwire.TypeHostFrame, body); err != nil {
+				peerDone <- err
+				return
+			}
+		}
+		close(burstWritten)
+		<-allowReceipt
+		receipt, _ := shimwire.EncodeHeartbeat(shimwire.HeartbeatMsg{
+			Generation: heartbeat.Generation, AckedSeq: heartbeat.AckedSeq, Phase: shimwire.PhaseRunning,
+		})
+		peerDone <- writer.WriteVersion(shimwire.V3, shimwire.TypeHeartbeat, receipt)
+	}()
+
+	heartbeatDone := make(chan error, 1)
+	go func() { heartbeatDone <- controller.Heartbeat(0) }()
+	<-burstWritten
+	select {
+	case err := <-heartbeatDone:
+		t.Fatalf("Heartbeat returned before its persistence receipt: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowReceipt)
+	select {
+	case err := <-heartbeatDone:
+		if err != nil {
+			t.Fatalf("Heartbeat: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Heartbeat deadlocked behind the full public event buffer")
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatal(err)
+	}
+	var sequences []uint64
+	for event := range controller.Events() {
+		sequences = append(sequences, event.Seq)
+	}
+	if len(sequences) != 80 {
+		t.Fatalf("priority queue delivered %d events, want 80", len(sequences))
+	}
+	for index, sequence := range sequences {
+		if sequence != uint64(index+1) {
+			t.Fatalf("priority queue sequence[%d] = %d, want %d", index, sequence, index+1)
+		}
+	}
+}
+
+func TestSelectedV3RejectsHeartbeatInterposedInsideLiveSnapshotPair(t *testing.T) {
+	clientConn, shimConn := net.Pipe()
+	defer clientConn.Close() //nolint:errcheck
+	call := &snapshotCall{
+		request: shimwire.SnapshotRequest{RequestID: 77, Generation: 7, Mode: shimwire.SnapshotEmit},
+		done:    make(chan struct{}),
+	}
+	controller := &Controller{
+		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
+		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
+		events: make(chan ControllerEvent, 64), eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),
+		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: map[uint64]*snapshotCall{77: call},
+	}
+	go controller.dispatchEvents()
+	go controller.readLoop()
+	frame := attachwire.Frame{
+		Type: attachwire.TypeSnapshot, Seq: 1,
+		Payload: (attachwire.SnapshotEnvelope{
+			AtSeq: 0, SnapFormat: attachwire.SnapFormatScreen, Snap: []byte{1},
+		}).Encode(),
+	}
+	body, err := shimwire.EncodeHostFrame(shimwire.HostFrame{RequestID: 77, FrameBytes: frame.Encode()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := shimwire.NewWriter(shimConn)
+	if err := writer.WriteVersion(shimwire.V3, shimwire.TypeHostFrame, body); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, _ := shimwire.EncodeHeartbeat(shimwire.HeartbeatMsg{Generation: 7, AckedSeq: 0, Phase: shimwire.PhaseRunning})
+	if err := writer.WriteVersion(shimwire.V3, shimwire.TypeHeartbeat, heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-controller.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("interposed Heartbeat did not terminate the malformed pair")
+	}
+	if !errors.Is(call.err, shimwire.ErrSnapshotMismatch) {
+		t.Fatalf("interposed Heartbeat snapshot error = %v", call.err)
+	}
+	if event, ok := <-controller.Events(); ok {
+		t.Fatalf("partial requested HostFrame escaped before its result: %+v", event)
+	}
+	_ = shimConn.Close()
+}
 
 func TestValidateAdoptionCommitRequiresExactGenerationAndExtensions(t *testing.T) {
 	t.Parallel()

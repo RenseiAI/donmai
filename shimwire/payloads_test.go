@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"github.com/RenseiAI/donmai/attachwire"
 )
 
 func TestControlBodiesRoundTrip(t *testing.T) {
@@ -91,6 +93,59 @@ func TestControlBodiesRoundTrip(t *testing.T) {
 			t.Fatalf("resize round trip = %+v, %v", got, err)
 		}
 	})
+}
+
+func TestV3HostFramePreservesExactCanonicalBytesForEveryHostType(t *testing.T) {
+	t.Parallel()
+	resize, err := (attachwire.ResizePayload{Cols: 120, Rows: 40, PxWidth: 1200, PxHeight: 800}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := []attachwire.Frame{
+		{Type: attachwire.TypeOutput, Seq: 1, RelTime: 2, Payload: []byte{0x00, 0xff, '\r', '\n'}},
+		{Type: attachwire.TypeResize, Seq: 2, RelTime: 3, Payload: resize},
+		{Type: attachwire.TypeMarker, Seq: 3, RelTime: 4, Payload: (attachwire.MarkerPayload{Label: "mark"}).Encode()},
+		{Type: attachwire.TypeSnapshot, Seq: 4, RelTime: 5, Payload: (attachwire.SnapshotEnvelope{AtSeq: 3, SnapFormat: attachwire.SnapFormatScreen, Snap: []byte{1, 2, 3}}).Encode()},
+		{Type: attachwire.TypeExit, Seq: 5, RelTime: 6, Payload: attachwire.NewNormalExit(0).Encode()},
+	}
+	for _, frame := range frames {
+		frame := frame
+		t.Run(frame.Type.String(), func(t *testing.T) {
+			t.Parallel()
+			requestID := uint64(0)
+			if frame.Type == attachwire.TypeSnapshot {
+				requestID = 77
+			}
+			want := HostFrame{RequestID: requestID, FrameBytes: frame.Encode()}
+			body, err := EncodeHostFrame(want)
+			if err != nil {
+				t.Fatalf("EncodeHostFrame: %v", err)
+			}
+			got, err := DecodeHostFrame(body)
+			if err != nil || got.RequestID != want.RequestID || !bytes.Equal(got.FrameBytes, want.FrameBytes) {
+				t.Fatalf("HostFrame round trip = (%+v,%v)", got, err)
+			}
+		})
+	}
+}
+
+func TestV3HostFrameRejectsIllegalTypeSequenceRequestAndEncoding(t *testing.T) {
+	t.Parallel()
+	valid := attachwire.Frame{Type: attachwire.TypeOutput, Seq: 1, Payload: []byte("x")}.Encode()
+	cases := []HostFrame{
+		{FrameBytes: attachwire.Frame{Type: attachwire.TypeOutput, Seq: 0, Payload: []byte("x")}.Encode()},
+		{RequestID: 9, FrameBytes: valid},
+		{FrameBytes: attachwire.Frame{Type: attachwire.TypeInput, Seq: 1, Payload: []byte{1}}.Encode()},
+		{FrameBytes: []byte{byte(attachwire.TypeOutput), 0x81, 0x00, 0x00, 'x'}},
+	}
+	for _, hostFrame := range cases {
+		if _, err := EncodeHostFrame(hostFrame); !errors.Is(err, ErrMalformed) {
+			t.Errorf("EncodeHostFrame(%+v) = %v, want ErrMalformed", hostFrame, err)
+		}
+	}
+	if _, err := DecodeHostFrame(make([]byte, hostFrameHeaderLen)); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("DecodeHostFrame(empty) = %v, want ErrMalformed", err)
+	}
 }
 
 func TestStrictDecodeRejectsUnknownFields(t *testing.T) {

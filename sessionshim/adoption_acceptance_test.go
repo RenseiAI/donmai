@@ -192,7 +192,11 @@ func (f *shimFixture) waitForPhase(t *testing.T, phase shimwire.Phase) Record {
 
 // adoptAs runs a full startup adoption pass as a named daemon generation.
 func (f *shimFixture) adoptAs(t *testing.T, controllerID string) AdoptionResult {
-	return f.adoptFrom(t, controllerID, 0)
+	return f.adoptFromMax(t, controllerID, 0, 0)
+}
+
+func (f *shimFixture) adoptAsMax(t *testing.T, controllerID string, protocolMax uint32) AdoptionResult {
+	return f.adoptFromMax(t, controllerID, 0, protocolMax)
 }
 
 // adoptFrom runs a full startup adoption pass with an exact durable resume
@@ -200,6 +204,10 @@ func (f *shimFixture) adoptAs(t *testing.T, controllerID string) AdoptionResult 
 // authoritative pre-existing last-forwarded correlation available before new
 // output advances the replacement daemon's in-memory bookkeeping.
 func (f *shimFixture) adoptFrom(t *testing.T, controllerID string, resumeFrom uint64) AdoptionResult {
+	return f.adoptFromMax(t, controllerID, resumeFrom, 0)
+}
+
+func (f *shimFixture) adoptFromMax(t *testing.T, controllerID string, resumeFrom uint64, protocolMax uint32) AdoptionResult {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -213,6 +221,13 @@ func (f *shimFixture) adoptFrom(t *testing.T, controllerID string, resumeFrom ui
 			return f.workarea
 		},
 		ResumeFrom: func(Identity) uint64 { return resumeFrom },
+		ProtocolMin: func() uint32 {
+			if protocolMax == 0 {
+				return 0
+			}
+			return shimwire.V1
+		}(),
+		ProtocolMax: protocolMax,
 	})
 	if err != nil {
 		t.Fatalf("Adopt as %s: %v", controllerID, err)
@@ -238,7 +253,7 @@ func exchange(t *testing.T, c *Controller, token string) uint64 {
 			if !ok {
 				t.Fatalf("controller stream closed before %q; saw: %q", want, seen.String())
 			}
-			if ev.Kind != EventOutput {
+			if ev.Kind != EventOutput && ev.Kind != EventHostFrame {
 				continue
 			}
 			if ev.Seq > maxSeq {
