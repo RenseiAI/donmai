@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test test-tagged lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
+.PHONY: build run run-mock run-status run-status-mock test test-tagged test-shim-overlap lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -55,6 +55,11 @@ test:
 # linked worktree the org go.work does not enumerate.
 test-tagged:
 	GOWORK=off go vet -tags "f28_integration,runner_integration,runtime_integration,integration,codex_integration,stophookspike,pi_scale_load" ./...
+
+# Builds the shim side from the released v0.68.1 source commit in an isolated
+# temporary module, then drives it with this checkout's controller.
+test-shim-overlap:
+	bash scripts/test-session-shim-v1-overlap.sh
 
 lint:
 	golangci-lint run

@@ -117,6 +117,52 @@ func TestStrictDecodeRejectsTrailingBytes(t *testing.T) {
 	}
 }
 
+func TestStrictDecodeProvesEOFAfterFirstDocument(t *testing.T) {
+	t.Parallel()
+	for _, body := range [][]byte{
+		[]byte(`{"generation":1}{"generation":2}`),
+		[]byte("{\"generation\":1}\n[]"),
+		[]byte("{\"generation\":1}\x00"),
+	} {
+		if _, err := DecodeAdopted(body); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("DecodeAdopted(%q) = %v, want ErrMalformed", body, err)
+		}
+	}
+	if _, err := DecodeAdopted([]byte("{\"generation\":1}\n\t")); err != nil {
+		t.Fatalf("trailing whitespace should be legal: %v", err)
+	}
+}
+
+func TestV2SnapshotBodiesPreserveEveryByteAndValidateCorrelation(t *testing.T) {
+	t.Parallel()
+	all := make([]byte, 256)
+	for i := range all {
+		all[i] = byte(i)
+	}
+	req := SnapshotRequest{RequestID: 9, Generation: 17, Mode: SnapshotEmit}
+	body, err := EncodeSnapshotRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := DecodeSnapshotRequest(body); err != nil || got != req {
+		t.Fatalf("request round trip = (%+v,%v), want %+v", got, err, req)
+	}
+	result := SnapshotResult{RequestID: 9, Generation: 17, Mode: SnapshotEmit, AtSeq: 41, InStream: true, Bytes: all}
+	body, err = EncodeSnapshotResult(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeSnapshotResult(body)
+	if err != nil || got.RequestID != result.RequestID || got.Generation != result.Generation || got.Mode != result.Mode || got.AtSeq != result.AtSeq || !got.InStream || !bytes.Equal(got.Bytes, all) {
+		t.Fatalf("result round trip = (%+v,%v)", got, err)
+	}
+	for _, bad := range []SnapshotRequest{{Generation: 1, Mode: SnapshotInspect}, {RequestID: 1, Mode: SnapshotInspect}, {RequestID: 1, Generation: 1, Mode: 99}} {
+		if _, err := EncodeSnapshotRequest(bad); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("EncodeSnapshotRequest(%+v) = %v, want ErrMalformed", bad, err)
+		}
+	}
+}
+
 func TestGapDecodeRejectsUnknownReasonAndInvertedRange(t *testing.T) {
 	t.Parallel()
 

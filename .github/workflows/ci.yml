@@ -30,6 +30,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The required cross-version shim gate verifies and archives the exact
+          # released v0.68.1 tag/commit; a shallow PR checkout cannot prove it.
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -38,6 +42,9 @@ jobs:
 
       - name: Build
         run: make build
+
+      - name: Pinned v0.68.1 shim overlap
+        run: make test-shim-overlap
 
       # Build-tag-gated `_test.go` files are excluded from `go build ./...` and
       # `go test ./...` entirely — not run, not compiled, not syntax-checked —

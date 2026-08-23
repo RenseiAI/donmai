@@ -11,12 +11,78 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
 )
+
+func TestControllerIDResolvedOnceGeneratedOrExactOverrideAndRefusesAliases(t *testing.T) {
+	t.Parallel()
+	a := New(Options{SkipRegistration: true})
+	b := New(Options{SkipRegistration: true})
+	if a.ControllerID() == "" || b.ControllerID() == "" || a.ControllerID() == b.ControllerID() {
+		t.Fatalf("generated controller ids = %q / %q, want non-empty distinct process correlations", a.ControllerID(), b.ControllerID())
+	}
+	if !strings.HasPrefix(a.ControllerID(), "ctl_") || len(a.ControllerID()) != len("ctl_")+64 {
+		t.Fatalf("generated controller id %q is not a 256-bit opaque value", a.ControllerID())
+	}
+	before := a.ControllerID()
+	a.mu.Lock()
+	a.workerID = "worker-rotated"
+	a.jwt = "not-a-real-token"
+	a.mu.Unlock()
+	if a.ControllerID() != before {
+		t.Fatalf("controller id changed across runtime credential mutation: %q -> %q", before, a.ControllerID())
+	}
+
+	const override = "controller-exact-override"
+	overridden := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{ControllerID: override, HostID: "stable-host"}})
+	if overridden.ControllerID() != override || overridden.controllerIDErr != nil {
+		t.Fatalf("override = %q err=%v, want exact %q", overridden.ControllerID(), overridden.controllerIDErr, override)
+	}
+	for name, cfg := range map[string]SessionShimConfig{
+		"literal":     {ControllerID: "daemon"},
+		"stable host": {ControllerID: "same", HostID: "same"},
+		"whitespace":  {ControllerID: "   "},
+		"padded":      {ControllerID: " controller "},
+	} {
+		bad := New(Options{SkipRegistration: true, SessionShim: cfg})
+		if bad.controllerIDErr == nil {
+			t.Errorf("%s alias was accepted as controller id", name)
+		}
+	}
+	if err := overridden.validateControllerAlias(override, "worker registration id"); err == nil {
+		t.Fatal("worker-registration alias was accepted")
+	}
+	standaloneHost, err := a.sessionShimHostID(context.Background(), "local")
+	if err != nil || standaloneHost != "" {
+		t.Fatalf("standalone host identity = %q, %v; want empty with no correlation fallback", standaloneHost, err)
+	}
+}
+
+func TestAuthoritativeSnapshotCarrierConfigFailsClosedBeforeAdoption(t *testing.T) {
+	t.Parallel()
+	for name, cfg := range map[string]SessionShimConfig{
+		"no callbacks": {RequireAuthoritativeSnapshot: true},
+		"no durable stream": {
+			RequireAuthoritativeSnapshot: true,
+			OnAdoption: func(context.Context, SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+				return SessionShimAdoptionReceipt{}, nil
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			d := New(Options{SkipRegistration: true, SessionShim: cfg})
+			if err := d.adoptSessionShims(context.Background()); !errors.Is(err, ErrSessionShimCarrierConfig) {
+				t.Fatalf("adoptSessionShims = %v, want ErrSessionShimCarrierConfig", err)
+			}
+		})
+	}
+}
 
 func TestSessionShimAdoptionIsDisabledByDefault(t *testing.T) {
 	t.Parallel()
@@ -619,7 +685,7 @@ func TestGroupedRestartFenceRefusesUnknownOrganizationBeforeStore(t *testing.T) 
 	}
 }
 
-func TestLegacySingleRestartFencePreservesOneRequestAndControllerFallback(t *testing.T) {
+func TestComposingRestartFenceRefusesControllerAsStableHostFallback(t *testing.T) {
 	t.Parallel()
 
 	store := &exactFenceRecorder{}
@@ -635,16 +701,13 @@ func TestLegacySingleRestartFencePreservesOneRequestAndControllerFallback(t *tes
 		{OrgID: "org-beta", SessionID: "session-beta"},
 	}, nil)
 
-	fence, err := d.RequestSessionShimRestartFence(context.Background(), "fence-legacy-single")
-	if err != nil {
-		t.Fatalf("RequestSessionShimRestartFence: %v", err)
+	fence, err := d.RequestSessionShimRestartFence(context.Background(), "fence-no-host-alias")
+	if !errors.Is(err, sessionshim.ErrFenceRequired) {
+		t.Fatalf("RequestSessionShimRestartFence = %+v, %v; want ErrFenceRequired", fence, err)
 	}
 	requests := store.snapshot()
-	if len(requests) != 1 || len(fence.Sessions) != 2 {
-		t.Fatalf("legacy single request = %d calls, fence %+v", len(requests), fence)
-	}
-	if requests[0].Fence.HostID != "legacy-controller-id" {
-		t.Fatalf("legacy host fallback = %q, want pre-field controller behavior", requests[0].Fence.HostID)
+	if len(requests) != 0 {
+		t.Fatalf("store received %d requests despite missing stable host identity", len(requests))
 	}
 }
 

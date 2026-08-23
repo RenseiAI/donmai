@@ -12,15 +12,18 @@ const (
 	// a mis-dialled socket fails closed rather than being decoded as garbage.
 	ProtocolName = "session-shim-v1"
 
-	// V1 is the first (and currently only) selectable protocol version.
+	// V1 is the frozen first selectable protocol version.
 	V1 uint32 = 1
+	// V2 adds request-correlated authoritative snapshot inspect/emit while
+	// retaining every v1 message and the stable protocol-family token.
+	V2 uint32 = 2
 
 	// ProtocolMin / ProtocolMax is the range THIS build advertises. A protocol
 	// bump widens Max and only ever raises Min after an overlap window at least
 	// as long as the maximum supported session duration (ADR-2026-08-17 §D3) —
 	// raising Min is a separate migration decision, not a release detail.
 	ProtocolMin = V1
-	ProtocolMax = V1
+	ProtocolMax = V2
 )
 
 // Negotiate selects the highest version both peers speak.

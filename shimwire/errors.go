@@ -30,6 +30,12 @@ var (
 	// at all. Read-only inspection may omit it; input, resize, stop, terminal
 	// acknowledgement, and tombstone disposal may not.
 	ErrGenerationRequired = errors.New("shimwire: controller generation required for mutating frame")
+
+	// ErrSnapshotRefused reports a closed v2 authoritative-snapshot refusal.
+	ErrSnapshotRefused = errors.New("shimwire: authoritative snapshot refused")
+
+	// ErrSnapshotMismatch reports request/result correlation disagreement.
+	ErrSnapshotMismatch = errors.New("shimwire: snapshot request/result mismatch")
 )
 
 // ErrorCode is the closed set of codes carried by an Error message. The detail
@@ -49,6 +55,10 @@ const (
 	CodePhaseUnknown       ErrorCode = "phase_unknown"
 	CodeExited             ErrorCode = "exited"
 	CodeInternal           ErrorCode = "internal"
+	CodeDuplicateChanged   ErrorCode = "duplicate_changed"
+	CodeRequestLedgerFull  ErrorCode = "request_ledger_full"
+	CodeRequestMismatch    ErrorCode = "request_mismatch"
+	CodeTimeout            ErrorCode = "timeout"
 )
 
 // Known reports whether c is an assigned v1 code. An unknown code from a peer

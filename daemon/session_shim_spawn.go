@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -23,6 +24,32 @@ import (
 // produces a record must fail the accept rather than hold a capacity slot for a
 // session that does not exist.
 const defaultShimLaunchTimeout = 30 * time.Second
+
+type shimAdoptionGate struct {
+	done      chan struct{}
+	once      sync.Once
+	committed bool
+}
+
+func newShimAdoptionGate() *shimAdoptionGate { return &shimAdoptionGate{done: make(chan struct{})} }
+
+func (g *shimAdoptionGate) finish(committed bool) {
+	if g == nil {
+		return
+	}
+	g.once.Do(func() {
+		g.committed = committed
+		close(g.done)
+	})
+}
+
+func (g *shimAdoptionGate) await() bool {
+	if g == nil {
+		return true
+	}
+	<-g.done
+	return g.committed
+}
 
 // shimRecordPollInterval is how often the launch path re-reads the registry
 // while waiting for the new shim's record.
@@ -61,6 +88,9 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		return nil, nil
 	}
 	cfg := d.sessionShimConfig()
+	if err := cfg.validateSnapshotCarrier(); err != nil {
+		return nil, err
+	}
 	id := sessionshim.Identity{OrgID: cfg.orgIDForSession(spec), SessionID: spec.SessionID}
 	if err := id.Validate(); err != nil {
 		return nil, fmt.Errorf("session shim: %w", err)
@@ -134,13 +164,21 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		_ = ctrl.Close()
 		return nil, fmt.Errorf("session shim: resolve adoption host %s: %w", id, err)
 	}
+	gate := newShimAdoptionGate()
+	d.consumeShimEventsGated(ctrl, gate)
 	receipt, err := d.completeSessionShimAdoption(ctx, evidence)
+	evidence.SnapshotProxy.deactivate()
 	if err != nil {
+		gate.finish(false)
 		_ = ctrl.Close()
 		return nil, fmt.Errorf("session shim: durable adoption %s: %w", id, err)
 	}
+	// SnapshotProxy exists only for the synchronous carrier takeover callback.
+	// Published daemon state uses the stable lookup APIs instead.
+	evidence.SnapshotProxy = nil
 
-	handle := d.trackLaunchedShim(ctrl, spec, project, workarea, evidence, receipt)
+	handle := d.trackLaunchedShim(ctrl, spec, project, workarea, evidence, receipt, false)
+	gate.finish(true)
 	slog.Info("session shim: launched and adopted an interactive session",
 		"session", id.String(), "shimId", ctrl.Hello().ShimID,
 		"generation", ctrl.Generation(), "harnessPid", ctrl.HarnessIdentity().PID)
@@ -236,6 +274,7 @@ func (d *Daemon) trackLaunchedShim(
 	workarea string,
 	evidence SessionShimAdoptionEvidence,
 	receipt SessionShimAdoptionReceipt,
+	startConsumer bool,
 ) SessionHandle {
 	handle := SessionHandle{
 		SessionID:  spec.SessionID,
@@ -272,7 +311,9 @@ func (d *Daemon) trackLaunchedShim(
 	if d.spawner != nil {
 		d.spawner.emit(SessionEvent{Kind: SessionEventStarted, Handle: handle, Spec: spec})
 	}
-	d.consumeShimEvents(ctrl)
+	if startConsumer {
+		d.consumeShimEvents(ctrl)
+	}
 	return handle
 }
 
@@ -284,6 +325,10 @@ func (d *Daemon) trackLaunchedShim(
 // later adoption resume further back, and eventually forces the honest-but-
 // avoidable Gap that §D5 makes the shim declare.
 func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
+	d.consumeShimEventsGated(ctrl, nil)
+}
+
+func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shimAdoptionGate) {
 	d.shims.wg.Add(1)
 	go func() {
 		defer d.shims.wg.Done()
@@ -314,7 +359,7 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 							_ = ctrl.Close()
 							return
 						}
-						d.recordShimForwardedSeq(id, ev.Seq)
+						d.recordShimForwardedSeqForController(id, ctrl, ev.Seq)
 					}
 				}
 			case sessionshim.EventGap:
@@ -326,6 +371,9 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 			case sessionshim.EventExit:
 				slog.Info("session shim: terminal observation received",
 					"session", id.String(), "exitCode", ev.Exit.ExitCode, "signal", ev.Exit.Signal)
+				if !gate.await() {
+					return
+				}
 				d.finishAdoptedShim(id, ev.Exit)
 			case sessionshim.EventError:
 				slog.Warn("session shim: error frame",
@@ -345,7 +393,20 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 							_ = ctrl.Close()
 							return
 						}
-						d.recordShimForwardedSeq(id, ev.Snapshot.AtSeq)
+						d.recordShimForwardedSeqForController(id, ctrl, ev.Snapshot.AtSeq)
+					}
+				}
+			case sessionshim.EventSnapshotFrame:
+				if ev.Seq > lastSeq {
+					lastSeq = ev.Seq
+					if durable != nil {
+						if err := durable(id, ev); err != nil {
+							slog.Warn("session shim: durable carrier rejected emitted snapshot",
+								"session", id.String(), "seq", ev.Seq, "error", err)
+							_ = ctrl.Close()
+							return
+						}
+						d.recordShimForwardedSeqForController(id, ctrl, ev.Seq)
 					}
 				}
 			}
@@ -353,13 +414,13 @@ func (d *Daemon) consumeShimEvents(ctrl *sessionshim.Controller) {
 		// The stream ended. If no Exit arrived, this daemon simply lost its
 		// connection — the shim keeps the harness and starts its orphan clock. That
 		// is NOT a terminal outcome and must not be reported as one.
-		d.releaseShimIfLive(id)
+		if gate.await() {
+			d.releaseShimIfLive(id)
+		}
 	}()
 }
 
-// recordShimForwardedSeq stores the highest sequence this daemon has forwarded
-// and acknowledges it to the shim, which is what a LATER adoption resumes from.
-func (d *Daemon) recordShimForwardedSeq(id sessionshim.Identity, seq uint64) {
+func (d *Daemon) recordShimForwardedSeqForController(id sessionshim.Identity, ctrl *sessionshim.Controller, seq uint64) {
 	d.shims.mu.Lock()
 	if d.shims.forwarded == nil {
 		d.shims.forwarded = make(map[sessionshim.Identity]uint64)
@@ -367,10 +428,9 @@ func (d *Daemon) recordShimForwardedSeq(id sessionshim.Identity, seq uint64) {
 	if seq > d.shims.forwarded[id] {
 		d.shims.forwarded[id] = seq
 	}
-	entry, ok := d.shims.adopted[id]
 	d.shims.mu.Unlock()
-	if ok && entry.controller != nil {
-		_ = entry.controller.Heartbeat(seq)
+	if ctrl != nil {
+		_ = ctrl.Heartbeat(seq)
 	}
 }
 

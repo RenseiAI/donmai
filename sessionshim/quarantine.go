@@ -10,8 +10,10 @@ import (
 // QuarantineReason is the closed set of reasons a survivor was refused adoption
 // (ADR-2026-08-17 §D7).
 //
-// Every reason here means the SAME two things: no authority is granted, and the
-// shim is not killed. The distinction between them is diagnostic — an operator
+// Every local-adoption reason here means the same two things: no controller
+// authority is granted, and the shim is not killed. The external-carrier-only
+// reason is the deliberate exception: local controller ownership is conserved
+// while a capability-dependent carrier is refused. The distinction is diagnostic — an operator
 // needs to know whether a shim is unreachable because of a protocol gap or
 // because two records claim the same session, and those call for different
 // responses.
@@ -52,6 +54,9 @@ const (
 	// capacity until exact positive evidence reconciles it; a tombstone-shaped
 	// file alone is not proof of death (§D10).
 	QuarantineGroupReapUnproven QuarantineReason = "group_reap_unproven"
+	// QuarantineAuthoritativeSnapshotUnsupported is a composing-carrier outcome,
+	// not a local ownership refusal. Selected v1 remains locally adopted.
+	QuarantineAuthoritativeSnapshotUnsupported QuarantineReason = "authoritative_snapshot_unsupported"
 )
 
 // Known reports whether r is an assigned v1 quarantine reason.
@@ -60,7 +65,7 @@ func (r QuarantineReason) Known() bool {
 	case QuarantineProtocolMismatch, QuarantineRecordMalformed, QuarantineDuplicateIdentity,
 		QuarantineIdentityMismatch, QuarantineUnauthenticated, QuarantinePhaseUnknown,
 		QuarantineGenerationNotAdvanced, QuarantineSocketUnreachable, QuarantineAdoptionFailed,
-		QuarantineGroupReapUnproven:
+		QuarantineGroupReapUnproven, QuarantineAuthoritativeSnapshotUnsupported:
 		return true
 	default:
 		return false

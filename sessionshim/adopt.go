@@ -64,6 +64,7 @@ type AdoptionPreparation struct {
 	ProcessEpoch                uint64
 	CurrentControllerGeneration shimwire.Generation
 	LastForwardedSeq            uint64
+	SelectedVersion             uint32
 }
 
 // PreparedAdoption is the per-session portion of Welcome supplied by a
