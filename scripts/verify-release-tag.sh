@@ -27,6 +27,8 @@ verify_release_tag() {
   local output_file=$3
   local env_file=$4
   local branch_ref
+  local tag_type
+  local tag_object
   local tag_commit
   local head_commit
   local is_prerelease
@@ -70,6 +72,21 @@ verify_release_tag() {
 
   if ! git show-ref --verify --quiet "refs/tags/${tag}"; then
     printf 'Release ref must be an existing tag: %s\n' "${tag}" >&2
+    return 1
+  fi
+
+  tag_type=$(git cat-file -t "refs/tags/${tag}")
+  if [[ "${tag_type}" != tag ]]; then
+    printf 'Release ref %s is a lightweight tag; release tags must be annotated and signed\n' "${tag}" >&2
+    return 1
+  fi
+
+  tag_object=$(git cat-file -p "refs/tags/${tag}")
+  # The earlier GitHub authority preflight cryptographically verifies this
+  # object. This local check keeps the detached checkout fail-closed if the
+  # staged and checked-out repository state disagree.
+  if ! grep -qE '^-----BEGIN (PGP|SSH) SIGNATURE-----$' <<<"${tag_object}"; then
+    printf 'Release ref %s is annotated but unsigned; create it with git tag -s\n' "${tag}" >&2
     return 1
   fi
 

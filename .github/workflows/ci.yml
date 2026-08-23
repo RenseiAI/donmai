@@ -14,6 +14,22 @@ permissions:
   contents: read
 
 jobs:
+  release-authority-visibility:
+    name: release-authority visibility (read-only)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prove structural ruleset visibility with github.token
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/verify-release-authority.sh --check-actor-visibility "${GITHUB_REPOSITORY}"
+
   # The closed-source content guard (self-test, vendor-drift check, and the
   # commit/squash-message scans) lives in its own workflow now:
   # .github/workflows/guard-b.yml — it needs PR `edited`/`ready_for_review`

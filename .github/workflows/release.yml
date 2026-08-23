@@ -25,6 +25,25 @@ permissions:
   attestations: write
 
 jobs:
+  release-authority:
+    name: release-authority (signed tag + two rulesets)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout release automation
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify live release authority
+        run: ./scripts/verify-release-authority.sh "${GITHUB_REPOSITORY}" "${RELEASE_TAG}"
+
   # W0(release-gate): before this job existed, release.yml ran GoReleaser
   # only — nothing between a `v*` tag push and a published Homebrew cask
   # ever ran a test or a smoke, so a broken pi RPC/extension protocol (the
@@ -35,6 +54,7 @@ jobs:
   # against the EXACT tagged ref about to release (never against main), and
   # `release` below `needs:` it: a red harness-smoke blocks the publish.
   harness-smoke:
+    needs: release-authority
     name: harness-smoke (donmai-smokes @ main, tag under test)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
