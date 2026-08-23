@@ -116,7 +116,9 @@ rule types:
 
 The split is load-bearing. GitHub can omit bypass actors from a
 `contents:read` workflow response, so the publisher enforces structural policy
-without treating an omitted actor field as an empty actor list. An
+without treating an omitted actor field as an empty actor list. If GitHub does
+return actor fields, the publisher also rejects any visible actor broader than
+the exact policy and requires its workflow identity to have no bypass. An
 administrator-visible audit separately proves that the creation bypass
 identifies who may create a release tag and that nobody can bypass the second
 ruleset to delete or retarget it. Do not add a privileged Actions secret to

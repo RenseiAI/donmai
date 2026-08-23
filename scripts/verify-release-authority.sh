@@ -36,8 +36,24 @@ structural_counts() {
       and .conditions.ref_name.include == ["refs/tags/v*"]
       and .conditions.ref_name.exclude == [];
     def rule_types: [(.rules // [])[]?.type] | sort;
-    def immutable: scoped and rule_types == ["deletion", "non_fast_forward", "update"];
-    def creation: scoped and rule_types == ["creation"];
+    def immutable:
+      scoped
+      and rule_types == ["deletion", "non_fast_forward", "update"]
+      and ((has("bypass_actors") | not) or .bypass_actors == [])
+      and ((has("current_user_can_bypass") | not) or .current_user_can_bypass == "never");
+    def creation:
+      scoped
+      and rule_types == ["creation"]
+      and (
+        (has("bypass_actors") | not)
+        or (
+          ((.bypass_actors // []) | length) == 1
+          and .bypass_actors[0].actor_type == "OrganizationAdmin"
+          and .bypass_actors[0].bypass_mode == "always"
+          and (.bypass_actors[0].actor_id // null) == null
+        )
+      )
+      and ((has("current_user_can_bypass") | not) or .current_user_can_bypass == "never");
     {
       scoped: ([.[] | select(scoped)] | length),
       immutability: ([.[] | select(immutable)] | length),
@@ -251,6 +267,7 @@ self_test() {
   local audit_creation
   local audit_immutability
   local audit_rulesets
+  local workflow_visible_rulesets
   local valid_ref
   local valid_object
   local pass=0
@@ -262,6 +279,7 @@ self_test() {
   audit_creation=$(jq -c '. + {bypass_actors:[{actor_id:null,actor_type:"OrganizationAdmin",bypass_mode:"always"}],current_user_can_bypass:"always"}' <<<"${structural_creation}")
   audit_immutability=$(jq -c '. + {bypass_actors:[],current_user_can_bypass:"never"}' <<<"${structural_immutability}")
   audit_rulesets=$(jq -cn --argjson creation "${audit_creation}" --argjson immutability "${audit_immutability}" '[ $creation, $immutability ]')
+  workflow_visible_rulesets=$(jq '.[0].current_user_can_bypass="never"' <<<"${audit_rulesets}")
   valid_ref='{"ref":"refs/tags/v1.2.3","object":{"type":"tag","sha":"tag-object-sha"}}'
   valid_object='{"sha":"tag-object-sha","tag":"v1.2.3","object":{"type":"commit","sha":"commit-sha"},"verification":{"verified":true,"reason":"valid"}}'
 
@@ -320,8 +338,24 @@ self_test() {
     "${valid_ref}" "${valid_object}"
   expect_red 'extra scoped ruleset' "$(jq '. + [.[1]]' <<<"${structural_rulesets}")" "${valid_ref}" "${valid_object}"
   expect_red 'evaluate-only creation rule' "$(jq '.[0].enforcement="evaluate"' <<<"${structural_rulesets}")" "${valid_ref}" "${valid_object}"
-  expect_pass 'structural mode ignores unavailable actor policy' \
-    "$(jq '.[0].bypass_actors=[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]' <<<"${structural_rulesets}")" \
+  expect_pass 'visible exact actor policy for workflow identity' "${workflow_visible_rulesets}" "${valid_ref}" "${valid_object}"
+  expect_pass 'visible exact actor policy with alternate rule order' \
+    "$(jq '.[1].rules |= reverse' <<<"${workflow_visible_rulesets}")" \
+    "${valid_ref}" "${valid_object}"
+  expect_red 'visible wrong creation actor' \
+    "$(jq '.[0].bypass_actors=[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]' <<<"${workflow_visible_rulesets}")" \
+    "${valid_ref}" "${valid_object}"
+  expect_red 'visible extra creation actor' \
+    "$(jq '.[0].bypass_actors += [{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]' <<<"${workflow_visible_rulesets}")" \
+    "${valid_ref}" "${valid_object}"
+  expect_red 'visible immutability bypass' \
+    "$(jq '.[1].bypass_actors=[{"actor_id":null,"actor_type":"OrganizationAdmin","bypass_mode":"always"}]' <<<"${workflow_visible_rulesets}")" \
+    "${valid_ref}" "${valid_object}"
+  expect_red 'visible immutability current user bypass' \
+    "$(jq '.[1].current_user_can_bypass="always"' <<<"${workflow_visible_rulesets}")" \
+    "${valid_ref}" "${valid_object}"
+  expect_red 'visible creation current user bypass' \
+    "$(jq '.[0].current_user_can_bypass="always"' <<<"${workflow_visible_rulesets}")" \
     "${valid_ref}" "${valid_object}"
   expect_audit_pass 'exact two-ruleset policy' "${audit_rulesets}"
   expect_audit_pass 'exact rule sets in alternate order' \
