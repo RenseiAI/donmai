@@ -965,14 +965,25 @@ func openDeclarationRoot(root RootPath) (*os.Root, error) {
 	if !filepath.IsAbs(root.String()) {
 		return nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root is not absolute")
 	}
-	pathIdentity, err := os.Lstat(root.String())
+	cleanRoot := filepath.Clean(root.String())
+	parentPath, rootLeaf := filepath.Dir(cleanRoot), filepath.Base(cleanRoot)
+	if rootLeaf == "" || rootLeaf == "." || rootLeaf == ".." || strings.ContainsAny(rootLeaf, `/\`) {
+		return nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root leaf is unsafe")
+	}
+	parentRoot, err := os.OpenRoot(parentPath)
+	if err != nil {
+		return nil, fmt.Errorf("runtime/workarea: open declaration parent: %w", err)
+	}
+	defer func() { _ = parentRoot.Close() }()
+	pathIdentity, err := parentRoot.Lstat(rootLeaf)
 	if err != nil {
 		return nil, fmt.Errorf("runtime/workarea: inspect declaration root: %w", err)
 	}
 	if !pathIdentity.IsDir() || pathIdentity.Mode()&os.ModeSymlink != 0 {
 		return nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root is not a real directory")
 	}
-	rootHandle, err := os.OpenRoot(root.String())
+	callDeclarationRaceHook("root-after-stat")
+	rootHandle, err := parentRoot.OpenRoot(rootLeaf)
 	if err != nil {
 		return nil, fmt.Errorf("runtime/workarea: open declaration root: %w", err)
 	}

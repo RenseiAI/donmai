@@ -227,6 +227,35 @@ func TestDeclarationRootedIORefusesSymlinkAndSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := NewDeclarationRecord("session", "wa_rooted", normalized, nil)
+	t.Run("root-directory-swap", func(t *testing.T) {
+		root := RootPath(filepath.Join(t.TempDir(), "root"))
+		if err := os.Mkdir(root.String(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteDeclaration(context.Background(), root, record); err != nil {
+			t.Fatal(err)
+		}
+		moved := root.String() + "-old"
+		declarationRaceHook = func(stage string) {
+			if stage != "root-after-stat" {
+				return
+			}
+			if err := os.Rename(root.String(), moved); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(root.String(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Cleanup(func() { declarationRaceHook = nil })
+		if _, err := ReadDeclaration(root); err == nil || !strings.Contains(err.Error(), "identity changed") {
+			t.Fatalf("root swap error = %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(moved, DeclarationDirName, DeclarationFileName)); err != nil {
+			t.Fatalf("authorized original declaration was damaged: %v", err)
+		}
+	})
+
 	t.Run("metadata-symlink", func(t *testing.T) {
 		root := RootPath(filepath.Join(t.TempDir(), "root"))
 		external := t.TempDir()

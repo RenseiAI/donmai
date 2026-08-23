@@ -174,6 +174,14 @@ func acquisitionTestDeclaration(t *testing.T) NormalizedDeclaration {
 	return normalized
 }
 
+func TestOpenExistingAcquisitionStoreKeepsMissingLegacyParentDormant(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-worktree-parent")
+	store, found, err := OpenExistingAcquisitionStore(missing, nil)
+	if err != nil || found || store != nil {
+		t.Fatalf("missing legacy parent = (%v, %v, %v), want (nil, false, nil)", store, found, err)
+	}
+}
+
 func TestAcquisitionStoreEnforcesCrossProcessSessionUniqueness(t *testing.T) {
 	parent := t.TempDir()
 	first, err := NewAcquisitionStore(parent, nil)

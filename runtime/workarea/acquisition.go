@@ -200,6 +200,9 @@ func openAcquisitionStore(parent string, now func() time.Time, create bool) (*Ac
 		now = time.Now
 	}
 	parentRoot, err := os.OpenRoot(abs)
+	if errors.Is(err, fs.ErrNotExist) && !create {
+		return nil, false, nil
+	}
 	if err != nil {
 		return nil, false, fmt.Errorf("runtime/workarea: open acquisition parent: %w", err)
 	}
