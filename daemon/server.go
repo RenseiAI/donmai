@@ -703,6 +703,8 @@ func mapState(s State) afclient.DaemonStatus {
 	switch s {
 	case StateRunning:
 		return afclient.DaemonReady
+	case StateStarting, StateRecovering:
+		return afclient.DaemonDraining
 	case StatePaused:
 		return afclient.DaemonPaused
 	case StateDraining:

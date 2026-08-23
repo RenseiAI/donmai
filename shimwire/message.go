@@ -6,7 +6,7 @@ package shimwire
 type MessageType uint8
 
 // The v1-frozen registry occupies 0x01–0x0C. Selected v1 treats every later
-// value as reserved; selected v2 assigns the two values declared below.
+// value as reserved; selected v2 and v3 assign the values declared below.
 const (
 	TypeHello     MessageType = 0x01 // shim  -> daemon: range, identity, phase, bounds
 	TypeWelcome   MessageType = 0x02 // daemon -> shim: selected version, proposed generation
@@ -24,6 +24,9 @@ const (
 	// v2-only. These values remain illegal under selected v1.
 	TypeSnapshotRequest MessageType = 0x0D // daemon -> shim: correlated authoritative request
 	TypeSnapshotResult  MessageType = 0x0E // shim -> daemon: exact result or closed refusal
+
+	// v3-only. This value remains illegal under selected v1 and v2.
+	TypeHostFrame MessageType = 0x0F // shim -> daemon: request id + exact encoded attach frame
 )
 
 // Known reports whether t is assigned in the frozen v1 vocabulary. It remains
@@ -34,9 +37,12 @@ func (t MessageType) Known() bool { return t >= TypeHello && t <= TypeError }
 // vocabulary. A v2-capable peer selected at v1 therefore cannot send a v2 type.
 func (t MessageType) AllowedIn(version uint32) bool {
 	if t >= TypeHello && t <= TypeError {
-		return version == V1 || version == V2
+		return version == V1 || version == V2 || version == V3
 	}
-	return version == V2 && (t == TypeSnapshotRequest || t == TypeSnapshotResult)
+	if t == TypeSnapshotRequest || t == TypeSnapshotResult {
+		return version == V2 || version == V3
+	}
+	return version == V3 && t == TypeHostFrame
 }
 
 // Mutating reports whether t carries controller authority and therefore MUST
@@ -85,6 +91,8 @@ func (t MessageType) String() string {
 		return "SnapshotRequest"
 	case TypeSnapshotResult:
 		return "SnapshotResult"
+	case TypeHostFrame:
+		return "HostFrame"
 	default:
 		return "Unknown(0x" + hexByte(byte(t)) + ")"
 	}

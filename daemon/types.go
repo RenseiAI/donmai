@@ -76,10 +76,13 @@ type State string
 const (
 	StateStopped  State = "stopped"
 	StateStarting State = "starting"
-	StateRunning  State = "running"
-	StatePaused   State = "paused"
-	StateDraining State = "draining"
-	StateUpdating State = "updating"
+	// StateRecovering is the auth-only/adoption/activation phase. No heartbeat,
+	// spawner admission, capacity publication, poll, or claim runs in this state.
+	StateRecovering State = "recovering"
+	StateRunning    State = "running"
+	StatePaused     State = "paused"
+	StateDraining   State = "draining"
+	StateUpdating   State = "updating"
 )
 
 // RegistrationStatus is the worker-status string sent to the orchestrator in
@@ -282,6 +285,10 @@ type HeartbeatPayload struct {
 	// (ADR-2026-08-17 §D7): live shims this daemon could not adopt, each marked
 	// consumesCapacity:true. Absent when nothing is quarantined.
 	QuarantinedSessions []sessionshim.QuarantinedSession `json:"quarantinedSessions,omitempty"`
+
+	// SessionShim is the coherent non-secret adoption/activation projection for
+	// externally composed recovery. Nil preserves the legacy heartbeat bytes.
+	SessionShim *SessionShimHeartbeatProjection `json:"sessionShim,omitempty"`
 
 	// AllowlistHash is the SHA-256 of the daemon's current project
 	// allowlist (see allowlist_report.go). Sent on every beat so the

@@ -93,13 +93,26 @@ func TestControllerIDResolvedOnceGeneratedOrExactOverrideAndRefusesAliases(t *te
 
 func TestAuthoritativeSnapshotCarrierConfigFailsClosedBeforeAdoption(t *testing.T) {
 	t.Parallel()
+	adopt := func(context.Context, SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+		return SessionShimAdoptionReceipt{}, nil
+	}
+	batch := func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		return SessionShimAdoptionBatchReceipt{}, nil
+	}
+	published := func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+		return nil, nil
+	}
 	for name, cfg := range map[string]SessionShimConfig{
 		"no callbacks": {RequireAuthoritativeSnapshot: true},
-		"no durable stream": {
+		"no exact attestation": {
 			RequireAuthoritativeSnapshot: true,
-			OnAdoption: func(context.Context, SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
-				return SessionShimAdoptionReceipt{}, nil
-			},
+			OnAdoption:                   adopt, OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil },
+			OnAdoptionBatch: batch, OnAdoptionPublished: published,
+		},
+		"no durable stream": {
+			EnableAdoption: true, RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+			AttestationCapabilities: RequiredSessionShimHostCapabilities(),
+			OnAdoption:              adopt, OnAdoptionBatch: batch, OnAdoptionPublished: published,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

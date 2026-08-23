@@ -8,6 +8,36 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.3 — 2026-08-23
+
+### Features
+
+- **Selected-v3 recovery binds a local ACK floor to carrier-owned proof.** The
+  shim fsyncs an incarnation-bound mode-`0600` acknowledgement sidecar before
+  confirming durable Heartbeat progress. Cold preparation exposes exact
+  `LocalResumeFrom` and authenticated `LastHostSeq`; a proof-resolved
+  `PreparedAdoption.ResumeFrom` may raise but never regress that local floor.
+  Selected v2 ignores the sidecar completely, including corrupt bytes. (#383)
+- **Attach v2 carries exact durable-carrier proof correlation.** Its strict host
+  claim parser now requires stable store authority, proof revision/digest,
+  distinct carrier boundary N and resolved boundary/last host K, reservation
+  request identity/digest, and the reserved candidate epoch. The closed gap
+  vocabulary adds proof-only `controller_unforwarded` while the existing helper
+  retains `ring_evicted` as its source-compatible default. (#383)
+
+### Fixes
+
+- **Pre-active recovery cannot replay ordinary frames or lose the Hello tail.**
+  Selected-v3 proof preparation holds the PTY host sequence allocator at K.
+  The mandatory Snapshot is allocated atomically as K+1 before queued Output,
+  Resize, Marker, or Exit can advance. When K>N, attach v2 accepts only Gap
+  N+1..K followed by Snapshot K+1/atSeq K; K=N accepts no invented gap. (#383)
+- **Pending and active carrier reconnects retain different truthful cursors.**
+  A receipt-stored reconnect retains pre-stage AckSeq N plus its exact optional
+  gap and staged Snapshot, without requesting another Snapshot. An active
+  reconnect may validate current persisted AckSeq L after ordinary progress
+  without freezing at the original proof boundary. (#383)
+
 ## v0.68.2 — 2026-08-23
 
 ### Features

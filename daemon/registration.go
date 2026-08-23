@@ -85,6 +85,17 @@ type RegistrationOptions struct {
 	// safeguard rather than the fix.
 	MinReregisterInterval time.Duration
 
+	// SessionShim is the optional, non-secret process attestation presented on
+	// registration and every runtime-token refresh. Its zero value preserves the
+	// legacy request/cache contract. When Supported is true, a matching typed
+	// server receipt is required before credentials may be returned or cached.
+	SessionShim SessionShimHostAttestation
+
+	// AuthOnly suppresses registration-time capacity publication during hosted
+	// recovery. It is valid only with a supported SessionShim attestation; the
+	// first exact post-activation heartbeat publishes the real maxSessions.
+	AuthOnly bool
+
 	// ValidateCredentials runs after a cache/network/stub response is decoded
 	// but before it is cached or returned. It is comparison/validation only and
 	// must never treat decoded token claims as authentication authority.
@@ -182,6 +193,10 @@ type RegisterRequest struct {
 	// predating the field, which the platform must read as "enumerated" so an
 	// old daemon never widens by upgrade.
 	ProjectAdmissionMode string `json:"projectAdmissionMode,omitempty"`
+
+	// SessionShimHostAttestation is embedded so its additive keys stay flat on
+	// the registration wire. The zero value emits no keys.
+	SessionShimHostAttestation
 }
 
 // ProjectAllowlistEntry is the wire shape for a single allowlisted project
@@ -211,11 +226,12 @@ type ProvideCapability struct {
 // Field names mirror the wire shape; helper methods provide seconds-based
 // accessors used by the heartbeat scheduler.
 type RegisterResponse struct {
-	WorkerID              string `json:"workerId"`
-	HeartbeatInterval     int    `json:"heartbeatInterval"` // ms
-	PollInterval          int    `json:"pollInterval"`      // ms
-	RuntimeToken          string `json:"runtimeToken"`
-	RuntimeTokenExpiresAt string `json:"runtimeTokenExpiresAt,omitempty"`
+	WorkerID              string                        `json:"workerId"`
+	HeartbeatInterval     int                           `json:"heartbeatInterval"` // ms
+	PollInterval          int                           `json:"pollInterval"`      // ms
+	RuntimeToken          string                        `json:"runtimeToken"`
+	RuntimeTokenExpiresAt string                        `json:"runtimeTokenExpiresAt,omitempty"`
+	SessionShim           *SessionShimCredentialReceipt `json:"sessionShim,omitempty"`
 }
 
 // HeartbeatIntervalSeconds returns the heartbeat cadence in seconds (rounded
@@ -243,12 +259,13 @@ const RegisterEndpoint = "/api/workers/register"
 // CachedJWT is the on-disk cache entry. We persist this between daemon runs
 // so re-registration is skipped while the runtime token is fresh.
 type CachedJWT struct {
-	WorkerID              string `json:"workerId"`
-	RuntimeToken          string `json:"runtimeToken"`
-	HeartbeatInterval     int    `json:"heartbeatInterval"` // ms
-	PollInterval          int    `json:"pollInterval"`      // ms
-	RuntimeTokenExpiresAt string `json:"runtimeTokenExpiresAt,omitempty"`
-	CachedAt              string `json:"cachedAt"`
+	WorkerID              string                        `json:"workerId"`
+	RuntimeToken          string                        `json:"runtimeToken"`
+	HeartbeatInterval     int                           `json:"heartbeatInterval"` // ms
+	PollInterval          int                           `json:"pollInterval"`      // ms
+	RuntimeTokenExpiresAt string                        `json:"runtimeTokenExpiresAt,omitempty"`
+	CachedAt              string                        `json:"cachedAt"`
+	SessionShim           *SessionShimCredentialReceipt `json:"sessionShim,omitempty"`
 
 	// Legacy fields retained so old cache files written by older daemons
 	// still load successfully. Newer writes only populate the canonical
@@ -301,6 +318,7 @@ func SaveCachedJWT(jwtPath string, resp *RegisterResponse, now time.Time) error 
 		PollInterval:          resp.PollInterval,
 		RuntimeTokenExpiresAt: resp.RuntimeTokenExpiresAt,
 		CachedAt:              now.UTC().Format(time.RFC3339),
+		SessionShim:           cloneSessionShimCredentialReceipt(resp.SessionShim),
 	}
 	data, err := json.MarshalIndent(entry, "", "  ")
 	if err != nil {
@@ -378,6 +396,12 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if err := opts.SessionShim.validate(); err != nil {
+		return nil, err
+	}
+	if opts.AuthOnly && !opts.SessionShim.enabled() {
+		return nil, errors.New("auth-only registration requires session shim attestation")
+	}
 
 	// Decide real-vs-stub up front so the JWT cache can be validated against
 	// the daemon's *current* config before it is trusted. Computing useStub
@@ -390,14 +414,20 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		strings.HasPrefix(opts.OrchestratorURL, "file://") ||
 		!looksLikeRegistrationToken(opts.RegistrationToken)
 
-	if !opts.ForceReregister {
-		if cached, _ := LoadCachedJWT(opts.JWTPath); cached != nil && cachedMatchesMode(cached, useStub) {
+	// Hosted recovery always performs the authoritative auth-only round trip.
+	// A cache cannot prove its adoption revision is still current merely because
+	// its bearer has not expired. Refresher lanes may still use the cache as a
+	// candidate, but only after callRefreshEndpoint re-presents it to authority.
+	if !opts.ForceReregister && !opts.SessionShim.enabled() {
+		if cached, _ := LoadCachedJWT(opts.JWTPath); cached != nil &&
+			cachedMatchesMode(cached, useStub) && cachedMatchesSessionShim(cached, opts.SessionShim) {
 			resp := &RegisterResponse{
 				WorkerID:              cached.WorkerID,
 				RuntimeToken:          cached.RuntimeToken,
 				HeartbeatInterval:     cached.HeartbeatInterval,
 				PollInterval:          cached.PollInterval,
 				RuntimeTokenExpiresAt: cached.RuntimeTokenExpiresAt,
+				SessionShim:           cloneSessionShimCredentialReceipt(cached.SessionShim),
 			}
 			if err := validateRegistrationCredentials(opts, resp); err != nil {
 				return nil, err
@@ -406,24 +436,28 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		}
 	}
 
-	// Capacity is derived from MaxAgents. Platform requires capacity > 0.
+	// Capacity is derived from MaxAgents except during D12 auth-only recovery,
+	// where publishing a claimable slot before adoption would be false.
 	capacity := opts.MaxAgents
-	if capacity <= 0 {
+	if opts.AuthOnly {
+		capacity = 0
+	} else if capacity <= 0 {
 		capacity = 1
 	}
 	req := RegisterRequest{
-		MachineID:               opts.MachineID,
-		Hostname:                opts.Hostname,
-		Capacity:                capacity,
-		Version:                 opts.Version,
-		Region:                  opts.Region,
-		Provides:                opts.Provides,
-		Capabilities:            opts.Capabilities,
-		DaemonProjects:          opts.DaemonProjects,
-		ProjectIDs:              normalizeProjectIDs(opts.ProjectIDs),
-		ProjectAdmissionVersion: opts.ProjectAdmissionVersion,
-		ProjectAdmissionMode:    normalizeProjectAdmissionMode(opts.ProjectAdmissionMode),
-		HostInfo:                opts.HostInfo,
+		MachineID:                  opts.MachineID,
+		Hostname:                   opts.Hostname,
+		Capacity:                   capacity,
+		Version:                    opts.Version,
+		Region:                     opts.Region,
+		Provides:                   opts.Provides,
+		Capabilities:               opts.Capabilities,
+		DaemonProjects:             opts.DaemonProjects,
+		ProjectIDs:                 normalizeProjectIDs(opts.ProjectIDs),
+		ProjectAdmissionVersion:    opts.ProjectAdmissionVersion,
+		ProjectAdmissionMode:       normalizeProjectAdmissionMode(opts.ProjectAdmissionMode),
+		HostInfo:                   opts.HostInfo,
+		SessionShimHostAttestation: cloneSessionShimHostAttestation(opts.SessionShim),
 	}
 	if req.MachineID == "" {
 		// The stable machine identity, NOT the hostname. Falling back to the
@@ -458,11 +492,16 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 }
 
 func validateRegistrationCredentials(opts RegistrationOptions, resp *RegisterResponse) error {
-	if opts.ValidateCredentials == nil || resp == nil {
+	if resp == nil {
 		return nil
 	}
-	if err := opts.ValidateCredentials(resp.WorkerID, resp.RuntimeToken); err != nil {
-		return fmt.Errorf("validate registration credentials: %w", err)
+	if opts.ValidateCredentials != nil {
+		if err := opts.ValidateCredentials(resp.WorkerID, resp.RuntimeToken); err != nil {
+			return fmt.Errorf("validate registration credentials: %w", err)
+		}
+	}
+	if err := validateSessionShimCredentialReceipt(opts.SessionShim, resp.SessionShim, resp.WorkerID); err != nil {
+		return fmt.Errorf("validate registration session shim receipt: %w", err)
 	}
 	return nil
 }
@@ -493,6 +532,13 @@ func cachedMatchesMode(cached *CachedJWT, useStub bool) bool {
 	cachedIsStub := isStubRuntimeToken(cached.RuntimeToken) ||
 		strings.HasSuffix(cached.WorkerID, "-stub")
 	return cachedIsStub == useStub
+}
+
+func cachedMatchesSessionShim(cached *CachedJWT, attestation SessionShimHostAttestation) bool {
+	if !attestation.enabled() {
+		return true
+	}
+	return validateSessionShimCredentialReceipt(attestation, cached.SessionShim, cached.WorkerID) == nil
 }
 
 // callRegisterEndpoint calls the real platform endpoint.

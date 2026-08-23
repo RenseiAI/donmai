@@ -57,6 +57,10 @@ func (x *Writer) writeAssigned(t MessageType, body []byte) error {
 	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
+	return x.writeAssignedLocked(t, body, total)
+}
+
+func (x *Writer) writeAssignedLocked(t MessageType, body []byte, total int) error {
 	//nolint:gosec // G115: total is bounded by MaxMessageBytes (1 MiB) three lines above
 	binary.BigEndian.PutUint32(x.hdr[0:lengthPrefixLen], uint32(total))
 	x.hdr[lengthPrefixLen] = byte(t)
@@ -80,6 +84,30 @@ func (x *Writer) WriteVersion(version uint32, t MessageType, body []byte) error 
 		return fmt.Errorf("shimwire: write %s: %w: type is not legal in selected v%d", t, ErrMalformed, version)
 	}
 	return x.writeAssigned(t, body)
+}
+
+// WriteVersionBatch validates every message first, then writes the complete
+// batch under one stream lock. Selected-v3 uses this to make the live
+// HostFrame/SnapshotResult pair adjacent to every other shim write.
+func (x *Writer) WriteVersionBatch(version uint32, messages ...Message) error {
+	totals := make([]int, len(messages))
+	for i, message := range messages {
+		if !message.Type.AllowedIn(version) {
+			return fmt.Errorf("shimwire: write %s: %w: type is not legal in selected v%d", message.Type, ErrMalformed, version)
+		}
+		totals[i] = 1 + len(message.Body)
+		if totals[i] > MaxMessageBytes {
+			return fmt.Errorf("shimwire: write %s: %w: %d bytes", message.Type, ErrMessageTooLarge, totals[i])
+		}
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	for i, message := range messages {
+		if err := x.writeAssignedLocked(message.Type, message.Body, totals[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Reader deserialises messages from a stream. Unlike Writer it is NOT safe for
