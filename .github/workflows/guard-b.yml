@@ -44,6 +44,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   guard-b:
     runs-on: blacksmith-4vcpu-ubuntu-2404
