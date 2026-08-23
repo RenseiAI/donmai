@@ -319,7 +319,7 @@ All subcommands output JSON.
 ```bash
 donmai linear get-issue <id>
 donmai linear create-issue --title "..." --team "..."
-donmai linear update-issue <id> [--state "..."]
+donmai linear update-issue <id> [--project "<name|slug|uuid>"] [--status "..."]
 donmai linear list-issues [--project "..."] [--status "..."]
 donmai linear create-comment <issue-id> --body "..."
 donmai linear list-comments <issue-id>

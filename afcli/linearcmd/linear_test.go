@@ -119,6 +119,19 @@ func decodeJSONArray(t *testing.T, s string) []any {
 	return out
 }
 
+func projectFilterEqIgnoreCase(variables map[string]any, field string) string {
+	filter, _ := variables["filter"].(map[string]any)
+	or, _ := filter["or"].([]any)
+	for _, clause := range or {
+		entry, _ := clause.(map[string]any)
+		comparison, _ := entry[field].(map[string]any)
+		if value, ok := comparison["eqIgnoreCase"].(string); ok {
+			return value
+		}
+	}
+	return ""
+}
+
 // ─── canned GraphQL response fixtures ────────────────────────────────────────
 
 func issueNodeJSON(id, identifier, title, stateName, teamID, teamKey, teamName string) string {
@@ -492,6 +505,145 @@ func TestLinearUpdateIssue(t *testing.T) {
 	result := decodeJSON(t, out)
 	if result["status"] != "Finished" {
 		t.Errorf("status = %v, want Finished", result["status"])
+	}
+}
+
+func TestLinearUpdateIssue_ProjectOnlyResolvesSlugAndMutatesOnce(t *testing.T) {
+	original := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "ENG", "Engineering")
+	updated := strings.Replace(original, `"name":"TestProject"`, `"name":"Destination"`, 1)
+	var updateCalls atomic.Int32
+	var updateInput map[string]any
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, original))
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-dest","name":"Destination","slugId":"destination-slug"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "UpdateIssue"):
+			updateCalls.Add(1)
+			updateInput, _ = req.Variables["input"].(map[string]any)
+			writeLinearGQLData(w, fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, updated))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--project", "destination-slug")
+	if err != nil {
+		t.Fatalf("update-issue --project failed: %v\nout: %s", err, out)
+	}
+	if got := updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateIssue calls = %d, want 1", got)
+	}
+	if len(updateInput) != 1 || updateInput["projectId"] != "proj-dest" {
+		t.Fatalf("mutation input = %#v, want only projectId=proj-dest", updateInput)
+	}
+	result := decodeJSON(t, out)
+	if result["project"] != "Destination" {
+		t.Errorf("project = %v, want Destination", result["project"])
+	}
+}
+
+func TestLinearUpdateIssue_ProjectAndStatusAreOneMutation(t *testing.T) {
+	original := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "ENG", "Engineering")
+	updated := strings.Replace(original, `"name":"Backlog"`, `"name":"Finished"`, 1)
+	updated = strings.Replace(updated, `"name":"TestProject"`, `"name":"Destination"`, 1)
+	var updateCalls atomic.Int32
+	var updateInput map[string]any
+
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case strings.Contains(req.Query, "GetIssue"):
+			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, original))
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-dest","name":"Destination","slugId":"destination-slug"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+		case strings.Contains(req.Query, "ListWorkflowStates"):
+			writeLinearGQLData(w, `{"workflowStates":{"nodes":[{"id":"state-done","name":"Finished","type":"completed"}]}}`)
+		case strings.Contains(req.Query, "UpdateIssue"):
+			updateCalls.Add(1)
+			updateInput, _ = req.Variables["input"].(map[string]any)
+			writeLinearGQLData(w, fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, updated))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--project", "Destination", "--status", "Finished")
+	if err != nil {
+		t.Fatalf("update-issue project+status failed: %v\nout: %s", err, out)
+	}
+	if got := updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateIssue calls = %d, want 1", got)
+	}
+	if len(updateInput) != 2 || updateInput["projectId"] != "proj-dest" || updateInput["stateId"] != "state-done" {
+		t.Fatalf("mutation input = %#v, want projectId+stateId only", updateInput)
+	}
+	result := decodeJSON(t, out)
+	if result["project"] != "Destination" || result["status"] != "Finished" {
+		t.Fatalf("result = %#v, want Destination/Finished", result)
+	}
+}
+
+func TestLinearUpdateIssue_ProjectResolutionFailureDoesNotMutate(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		projects   string
+		wantErr    string
+		projectRef string
+	}{
+		{name: "unknown", projects: `{"projects":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, wantErr: "not found", projectRef: "missing"},
+		{name: "ambiguous", projects: `{"projects":{"nodes":[{"id":"p1","name":"Same","slugId":"one"},{"id":"p2","name":"Same","slugId":"two"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, wantErr: "ambiguous", projectRef: "Same"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "ENG", "Engineering")
+			var updateCalls atomic.Int32
+			setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Query string `json:"query"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				switch {
+				case strings.Contains(req.Query, "GetIssue"):
+					writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, original))
+				case strings.Contains(req.Query, "ListProjects"):
+					writeLinearGQLData(w, tc.projects)
+				case strings.Contains(req.Query, "UpdateIssue"):
+					updateCalls.Add(1)
+					writeLinearGQLData(w, `{"issueUpdate":{"success":true,"issue":null}}`)
+				default:
+					writeLinearGQLData(w, `{}`)
+				}
+			})
+
+			out, err := runLinearCmd(t, "", "update-issue", "ENG-1", "--project", tc.projectRef, "--status", "Finished")
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), tc.wantErr) {
+				t.Fatalf("error = %v, want %q (out: %q)", err, tc.wantErr, out)
+			}
+			if got := updateCalls.Load(); got != 0 {
+				t.Fatalf("UpdateIssue calls after resolution failure = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestLinearUpdateIssue_ProjectHelpNamesMutation(t *testing.T) {
+	out, err := runLinearCmd(t, "", "update-issue", "--help")
+	if err != nil {
+		t.Fatalf("update-issue --help: %v", err)
+	}
+	if !strings.Contains(out, "Move issue to a Linear project name, slug, or UUID (mutation, not CLI context)") {
+		t.Fatalf("help does not distinguish project mutation from CLI context:\n%s", out)
 	}
 }
 
@@ -2882,11 +3034,7 @@ func TestLinearListBacklogIssuesEnvDefaults(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "ListProjects"):
 			// Capture the name filter to confirm env var was used.
-			if f, ok := req.Variables["filter"].(map[string]any); ok {
-				if n, ok := f["name"].(map[string]any); ok {
-					sawProjectFilter, _ = n["eqIgnoreCase"].(string)
-				}
-			}
+			sawProjectFilter = projectFilterEqIgnoreCase(req.Variables, "name")
 			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-env","name":"EnvProject"}]}}`)
 		case strings.Contains(req.Query, "ListBacklogIssues"):
 			writeLinearGQLData(w, `{"issues":{"nodes":[]}}`)
@@ -2930,11 +3078,7 @@ func TestLinearListUnblockedBacklogEnvDefaults(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch {
 		case strings.Contains(req.Query, "ListProjects"):
-			if f, ok := req.Variables["filter"].(map[string]any); ok {
-				if n, ok := f["name"].(map[string]any); ok {
-					sawProjectFilter, _ = n["eqIgnoreCase"].(string)
-				}
-			}
+			sawProjectFilter = projectFilterEqIgnoreCase(req.Variables, "name")
 			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-env2","name":"EnvProject2"}]}}`)
 		case strings.Contains(req.Query, "ListBacklogIssues"):
 			writeLinearGQLData(w, `{"issues":{"nodes":[]}}`)

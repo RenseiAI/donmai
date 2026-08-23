@@ -76,6 +76,7 @@ type WorkflowState struct {
 type Project struct {
 	ID       string   `json:"id"`
 	Name     string   `json:"name"`
+	SlugID   string   `json:"slugId,omitempty"`
 	State    string   `json:"state"`
 	TeamKeys []string `json:"teamKeys"`
 }
@@ -104,6 +105,7 @@ type UpdateIssueInput struct {
 	Title       string   `json:"title,omitempty"`
 	Description string   `json:"description,omitempty"`
 	StateID     string   `json:"stateId,omitempty"`
+	ProjectID   string   `json:"projectId,omitempty"`
 	LabelIDs    []string `json:"labelIds,omitempty"`
 	ParentID    *string  `json:"parentId,omitempty"` // pointer so null can be sent
 	AssigneeID  string   `json:"assigneeId,omitempty"`
@@ -218,10 +220,11 @@ type teamNode struct {
 
 // projectNode is the JSON structure for a project.
 type projectNode struct {
-	ID    *string         `json:"id"`
-	Name  *string         `json:"name"`
-	State *string         `json:"state"`
-	Teams *teamConnection `json:"teams"`
+	ID     *string         `json:"id"`
+	Name   *string         `json:"name"`
+	SlugID *string         `json:"slugId"`
+	State  *string         `json:"state"`
+	Teams  *teamConnection `json:"teams"`
 }
 
 // ─── GraphQL response data shapes ────────────────────────────────────────────
