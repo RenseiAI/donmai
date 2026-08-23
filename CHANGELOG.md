@@ -8,6 +8,31 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.4 — 2026-08-23
+
+### Features
+
+- **Linear issues can move between projects without replacement records.** The
+  update command resolves a destination project by name, slug, or UUID within
+  the issue team, composes project and status in one mutation, and reports the
+  resulting project while preserving every unspecified issue field. (#387)
+
+### Fixes
+
+- **Release tags now require authorized creation, immutable refs, and verified
+  signatures.** All binary, worker-image, and E2B publishers fail before build
+  unless separate creation and no-bypass immutability rulesets are active and
+  GitHub verifies the annotated tag signature at the exact commit. (#388)
+
+### Chores
+
+- **Parallel poll tests no longer race on process-global log capture.** The
+  daemon test fixture serializes its temporary default logger and restores the
+  prior logger after each control. (#385)
+- **GitHub workflows declare least-privilege permissions.** Workflow and job
+  token grants are explicit for code scanning, publishing, and read-only
+  verification lanes. (#386)
+
 ## v0.68.3 — 2026-08-23
 
 ### Features
