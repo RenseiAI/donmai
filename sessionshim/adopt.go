@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"sort"
 	"time"
@@ -35,9 +36,10 @@ type AdoptOptions struct {
 	Prepare func(ctx context.Context, evidence AdoptionPreparation) (PreparedAdoption, error)
 
 	// ResumeFrom returns the first sequence this daemon still needs for a
-	// session — its durable last_forwarded_seq + 1. Nil resumes from the start of
-	// the stream, which is always SAFE (it can only over-replay, never
-	// under-replay) but produces more redundant output.
+	// session — its durable last_forwarded_seq + 1. Nil uses this shim
+	// incarnation's fsync-backed ACK sidecar + 1 when present, otherwise the
+	// start of the stream. A supplied callback may advance beyond the sidecar but
+	// cannot regress it silently.
 	ResumeFrom func(id Identity) uint64
 
 	// ExpectedWorkarea returns the workarea this daemon believes a session
@@ -48,6 +50,12 @@ type AdoptOptions struct {
 
 	// DialTimeout bounds one shim handshake.
 	DialTimeout time.Duration
+	// ProtocolMin/ProtocolMax optionally narrow the adopting controller range.
+	ProtocolMin uint32
+	ProtocolMax uint32
+	// RequireFullHostFrames explicitly opts every newly adopted controller into
+	// selected-v3 raw HostFrame consumption when the peer also supports v3.
+	RequireFullHostFrames bool
 
 	Logger *slog.Logger
 	Now    func() time.Time
@@ -329,8 +337,26 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Controller, error) {
 	id := rec.Identity()
 	resume := uint64(0)
+	durableAck, ackErr := opts.Registry.getDurableAck(rec)
+	hasDurableAck := ackErr == nil
+	if ackErr != nil && !errors.Is(ackErr, fs.ErrNotExist) {
+		return nil, fmt.Errorf("sessionshim: load durable acknowledgement for %s: %w", id, ackErr)
+	}
 	if opts.ResumeFrom != nil {
 		resume = opts.ResumeFrom(id)
+		externalAck := uint64(0)
+		if resume > 0 {
+			externalAck = resume - 1
+		}
+		if hasDurableAck && externalAck < durableAck.AckedSeq {
+			return nil, fmt.Errorf("%w for %s: external cursor %d regresses shim-persisted acknowledgement %d",
+				ErrAdoptionPreparation, id, externalAck, durableAck.AckedSeq)
+		}
+	} else if hasDurableAck {
+		if durableAck.AckedSeq == ^uint64(0) {
+			return nil, fmt.Errorf("sessionshim: durable acknowledgement for %s cannot advance past uint64 max", id)
+		}
+		resume = durableAck.AckedSeq + 1
 	}
 	expected := ""
 	if opts.ExpectedWorkarea != nil {
@@ -338,11 +364,14 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 	}
 
 	copts := ControllerOptions{
-		ControllerID:     opts.ControllerID,
-		ResumeFrom:       resume,
-		ExpectedWorkarea: expected,
-		DialTimeout:      opts.DialTimeout,
-		Logger:           opts.Logger,
+		ControllerID:          opts.ControllerID,
+		ResumeFrom:            resume,
+		ExpectedWorkarea:      expected,
+		DialTimeout:           opts.DialTimeout,
+		Logger:                opts.Logger,
+		ProtocolMin:           opts.ProtocolMin,
+		ProtocolMax:           opts.ProtocolMax,
+		RequireFullHostFrames: opts.RequireFullHostFrames,
 	}
 	if opts.NextGeneration != nil {
 		next := opts.NextGeneration

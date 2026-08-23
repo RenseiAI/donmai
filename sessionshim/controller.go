@@ -33,6 +33,9 @@ const (
 	// by a selected-v2 authoritative emit request. It is delivered only when the
 	// shim reports in_stream=true.
 	EventSnapshotFrame EventKind = "snapshot_frame"
+	// EventHostFrame is the sole selected-v3 observation for one complete exact
+	// sequence-bearing interactive-attach host frame.
+	EventHostFrame EventKind = "host_frame"
 	// EventExit is the immutable terminal observation.
 	EventExit EventKind = "exit"
 	// EventError is a closed code with display-only detail.
@@ -46,6 +49,10 @@ type ControllerEvent struct {
 	Seq     uint64
 	RelTime uint64
 	Data    []byte
+	// RequestID is non-zero only for the selected-v3 live Snapshot emitted by
+	// that connection-local request.
+	RequestID uint64
+	FrameType attachwire.EventType
 	// FrameBytes is a complete encoded interactive-attach frame.
 	FrameBytes []byte
 
@@ -85,9 +92,38 @@ type ControllerOptions struct {
 	ExpectedWorkarea string
 	// Extensions are optional negotiated extensions offered to the shim.
 	Extensions shimwire.Extensions
+	// ProtocolMin/ProtocolMax optionally narrow this controller's supported
+	// range. Zero/zero preserves the released selected-v2 controller behavior.
+	// A caller prepared to consume the complete raw selected-v3 event rail must
+	// also set RequireFullHostFrames; that opts zero/zero into the build range.
+	ProtocolMin uint32
+	ProtocolMax uint32
+	// RequireFullHostFrames declares that this controller consumes HostFrame as
+	// the sole selected-v3 host-sequence authority. It enables max 3; it does not
+	// reject a released max-2 shim, which must still be adopted conservatively.
+	RequireFullHostFrames bool
 	// DialTimeout bounds the connect + handshake. Zero uses 5s.
 	DialTimeout time.Duration
 	Logger      *slog.Logger
+}
+
+func (o ControllerOptions) protocolRange() (uint32, uint32, error) {
+	if o.ProtocolMin == 0 && o.ProtocolMax == 0 {
+		if o.RequireFullHostFrames {
+			return shimwire.ProtocolMin, shimwire.ProtocolMax, nil
+		}
+		return shimwire.ProtocolMin, shimwire.V2, nil
+	}
+	if o.ProtocolMin == 0 || o.ProtocolMax < o.ProtocolMin || o.ProtocolMax > shimwire.ProtocolMax {
+		return 0, 0, fmt.Errorf("sessionshim: invalid controller protocol range [%d,%d]", o.ProtocolMin, o.ProtocolMax)
+	}
+	if o.ProtocolMax >= shimwire.V3 && !o.RequireFullHostFrames {
+		return 0, 0, errors.New("sessionshim: controller max 3 requires full HostFrame consumption")
+	}
+	if o.RequireFullHostFrames && o.ProtocolMax < shimwire.V3 {
+		return 0, 0, errors.New("sessionshim: full HostFrame consumption requires controller max at least 3")
+	}
+	return o.ProtocolMin, o.ProtocolMax, nil
 }
 
 func (o ControllerOptions) dialTimeout() time.Duration {
@@ -125,6 +161,10 @@ type Controller struct {
 	// replayed or live output advances its own bookkeeping.
 	resumeFrom uint64
 	events     chan ControllerEvent
+	// eventQueue is selected-v3-only. It lets the socket reader reach a
+	// synchronous Heartbeat persistence receipt even when the public event buffer
+	// is full, while retaining an explicit fail-closed memory bound.
+	eventQueue chan ControllerEvent
 	logger     *slog.Logger
 	closeOne   sync.Once
 	done       chan struct{}
@@ -141,6 +181,19 @@ type Controller struct {
 	snapshotMu     sync.Mutex
 	nextSnapshotID uint64
 	snapshotCalls  map[uint64]*snapshotCall
+
+	heartbeatCallMu sync.Mutex
+	heartbeatMu     sync.Mutex
+	heartbeatCall   *heartbeatCall
+}
+
+type heartbeatCall struct {
+	expected shimwire.HeartbeatMsg
+	done     chan heartbeatResult
+}
+
+type heartbeatResult struct {
+	err error
 }
 
 type snapshotCall struct {
@@ -152,7 +205,16 @@ type snapshotCall struct {
 	done            chan struct{}
 }
 
-const controllerSnapshotRetryLedgerLimit = 1024
+type snapshotCompletion struct {
+	call   *snapshotCall
+	result shimwire.SnapshotResult
+	err    error
+}
+
+const (
+	controllerSnapshotRetryLedgerLimit = 1024
+	selectedV3EventQueueLimit          = 128
+)
 
 // ErrAdoptionRefused reports a handshake the shim or this daemon declined.
 var ErrAdoptionRefused = errors.New("sessionshim: adoption refused")
@@ -245,6 +307,10 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	// down exactly the sessions this whole mechanism exists to preserve.
 	_ = conn.SetDeadline(time.Time{})
 
+	if c.selected >= shimwire.V3 {
+		c.eventQueue = make(chan ControllerEvent, selectedV3EventQueueLimit)
+		go c.dispatchEvents()
+	}
 	go c.readLoop()
 	return c, nil
 }
@@ -275,7 +341,11 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	if err := hello.Extensions.CheckRequired(); err != nil {
 		return err
 	}
-	selected, err := shimwire.Negotiate(hello.Min, hello.Max, shimwire.ProtocolMin, shimwire.ProtocolMax)
+	localMin, localMax, err := opts.protocolRange()
+	if err != nil {
+		return err
+	}
+	selected, err := shimwire.Negotiate(hello.Min, hello.Max, localMin, localMax)
 	if err != nil {
 		return err
 	}
@@ -447,6 +517,10 @@ func (c *Controller) SelectedVersion() uint32 { return c.selected }
 // available. Selected v1 remains adoptable but intentionally returns false.
 func (c *Controller) SupportsAuthoritativeSnapshot() bool { return c.selected >= shimwire.V2 }
 
+// SupportsFullHostFrames reports whether the selected local wire supplies one
+// exact complete attach-frame event for every host sequence.
+func (c *Controller) SupportsFullHostFrames() bool { return c.selected >= shimwire.V3 }
+
 // Hello returns the shim's opening self-report.
 func (c *Controller) Hello() shimwire.Hello { return c.hello }
 
@@ -504,11 +578,55 @@ func (c *Controller) Stop(reason shimwire.StopReason) error {
 // Heartbeat sends liveness plus the highest sequence this controller has durably
 // forwarded. That acknowledgement is what a LATER adoption resumes from, so a
 // controller that never heartbeats will simply be replayed more after a restart —
-// never less.
+// never less. Selected v3 returns only after the shim echoes an exact
+// fsync-backed persistence receipt; selected v1/v2 retain their released
+// write-only behavior.
 func (c *Controller) Heartbeat(ackedSeq uint64) error {
-	return writeTyped(c.w, shimwire.TypeHeartbeat, func() ([]byte, error) {
-		return shimwire.EncodeHeartbeat(shimwire.HeartbeatMsg{Generation: c.gen, AckedSeq: ackedSeq})
-	})
+	heartbeat := shimwire.HeartbeatMsg{Generation: c.gen, AckedSeq: ackedSeq}
+	if c.selected < shimwire.V3 {
+		return writeTyped(c.w, shimwire.TypeHeartbeat, func() ([]byte, error) {
+			return shimwire.EncodeHeartbeat(heartbeat)
+		})
+	}
+	c.heartbeatCallMu.Lock()
+	defer c.heartbeatCallMu.Unlock()
+	body, err := shimwire.EncodeHeartbeat(heartbeat)
+	if err != nil {
+		return err
+	}
+	call := &heartbeatCall{expected: heartbeat, done: make(chan heartbeatResult, 1)}
+	c.heartbeatMu.Lock()
+	if c.heartbeatCall != nil {
+		c.heartbeatMu.Unlock()
+		return errors.New("sessionshim: selected-v3 heartbeat already pending")
+	}
+	c.heartbeatCall = call
+	c.heartbeatMu.Unlock()
+	if err := c.w.WriteVersion(c.selected, shimwire.TypeHeartbeat, body); err != nil {
+		c.clearHeartbeatCall(call)
+		return err
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case result := <-call.done:
+		return result.err
+	case <-timer.C:
+		c.clearHeartbeatCall(call)
+		_ = c.Close()
+		return errors.New("sessionshim: selected-v3 heartbeat persistence receipt timed out")
+	case <-c.done:
+		c.clearHeartbeatCall(call)
+		return io.EOF
+	}
+}
+
+func (c *Controller) clearHeartbeatCall(call *heartbeatCall) {
+	c.heartbeatMu.Lock()
+	if c.heartbeatCall == call {
+		c.heartbeatCall = nil
+	}
+	c.heartbeatMu.Unlock()
 }
 
 // InspectSnapshot returns exact shim-owned encoded screen bytes and atSeq
@@ -518,8 +636,9 @@ func (c *Controller) InspectSnapshot(ctx context.Context) (shimwire.SnapshotResu
 }
 
 // EmitSnapshot asks the shim-owned PTY host to emit exactly one Snapshot frame.
-// The result contains the complete encoded interactive-attach frame and its
-// in-stream disposition.
+// Selected v2 returns the complete live frame in the result. Selected v3
+// delivers it once through EventHostFrame and returns correlation-only empty
+// result bytes for the in-stream disposition.
 func (c *Controller) EmitSnapshot(ctx context.Context) (shimwire.SnapshotResult, error) {
 	return c.SnapshotWithID(ctx, c.allocateSnapshotRequestID(), shimwire.SnapshotEmit)
 }
@@ -608,34 +727,100 @@ func cloneSnapshotResult(in shimwire.SnapshotResult) shimwire.SnapshotResult {
 func (c *Controller) Close() error {
 	c.closeOne.Do(func() {
 		close(c.closing)
-		_ = c.conn.Close()
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
 	})
 	return nil
 }
 
 func (c *Controller) readLoop() {
 	defer close(c.done)
-	defer close(c.events)
+	if c.selected >= shimwire.V3 {
+		defer close(c.eventQueue)
+	} else {
+		defer close(c.events)
+	}
+	stream := hostFrameStreamState{expectedFirst: c.adopted.ReplayFrom}
+	var pendingRequested *ControllerEvent
 	for {
 		msg, err := c.r.ReadVersion(c.selected)
 		if err != nil {
 			c.failSnapshotCalls(err)
 			return
 		}
+		if pendingRequested != nil && msg.Type != shimwire.TypeSnapshotResult {
+			c.failSnapshotCalls(shimwire.ErrSnapshotMismatch)
+			_ = c.Close()
+			return
+		}
+		if c.selected >= shimwire.V3 && msg.Type == shimwire.TypeHeartbeat {
+			receipt, decodeErr := shimwire.DecodeHeartbeat(msg.Body)
+			if decodeErr != nil {
+				c.failHeartbeatCall(decodeErr)
+				_ = c.Close()
+				return
+			}
+			if receiptErr := c.acceptHeartbeatReceipt(receipt); receiptErr != nil {
+				_ = c.Close()
+				return
+			}
+			continue
+		}
+		if c.selected >= shimwire.V3 && msg.Type == shimwire.TypeError && c.failHeartbeatFromError(msg.Body) {
+			_ = c.Close()
+			return
+		}
+		if c.selected >= shimwire.V3 {
+			switch msg.Type {
+			case shimwire.TypeHostFrame:
+				ev, decodeErr := decodeHostFrameEvent(msg.Body)
+				if decodeErr != nil || pendingRequested != nil || stream.exited {
+					c.failSnapshotCalls(shimwire.ErrDuplicateHostFrame)
+					_ = c.Close()
+					return
+				}
+				if ev.RequestID != 0 {
+					pendingRequested = &ev
+					continue
+				}
+				if err := c.publishHostFrameEvent(ev, &stream); err != nil {
+					c.failSnapshotCalls(err)
+					_ = c.Close()
+					return
+				}
+				continue
+			case shimwire.TypeOutput, shimwire.TypeSnapshot, shimwire.TypeExit:
+				c.failSnapshotCalls(shimwire.ErrDuplicateHostFrame)
+				_ = c.Close()
+				return
+			}
+		}
 		if msg.Type == shimwire.TypeSnapshotResult {
-			ev, emit, resultErr := c.acceptSnapshotResult(msg.Body)
+			ev, emit, completion, resultErr := c.acceptSnapshotResult(msg.Body, pendingRequested)
+			pendingRequested = nil
 			if resultErr != nil {
 				c.failSnapshotCalls(resultErr)
 				_ = c.Close()
 				return
 			}
 			if emit {
-				select {
-				case c.events <- ev:
-				case <-c.closing:
-					return
+				if c.selected >= shimwire.V3 {
+					if err := c.publishHostFrameEvent(ev, &stream); err != nil {
+						c.completeSnapshotCall(completion, err)
+						c.failSnapshotCalls(err)
+						_ = c.Close()
+						return
+					}
+				} else {
+					if err := c.publishEvent(ev); err != nil {
+						c.failSnapshotCalls(err)
+						_ = c.Close()
+						return
+					}
 				}
 			}
+			c.completeSnapshotCall(completion, nil)
 			continue
 		}
 		ev, ok := decodeEvent(msg)
@@ -643,6 +828,20 @@ func (c *Controller) readLoop() {
 			continue
 		}
 		if ev.Kind == EventGap {
+			if c.selected >= shimwire.V3 {
+				expectedFrom := c.resumeFrom
+				if expectedFrom == 0 {
+					expectedFrom = uint64(attachwire.HostSeqStart)
+				}
+				if stream.seen || stream.gap != nil || ev.Gap.FromSeq != expectedFrom ||
+					ev.Gap.ToSeq == ^uint64(0) || ev.Gap.ToSeq+1 != c.adopted.ReplayFrom {
+					c.failSnapshotCalls(shimwire.ErrDuplicateHostFrame)
+					_ = c.Close()
+					return
+				}
+				gap := ev.Gap
+				stream.gap = &gap
+			}
 			// A gap that is never logged is a gap nobody can audit. §D5 makes the
 			// shim declare it explicitly; the least a controller can do is not be
 			// the layer that swallows it.
@@ -656,52 +855,240 @@ func (c *Controller) readLoop() {
 				return
 			}
 		}
+		if err := c.publishEvent(ev); err != nil {
+			c.failSnapshotCalls(err)
+			_ = c.Close()
+			return
+		}
+	}
+}
+
+func (c *Controller) acceptHeartbeatReceipt(receipt shimwire.HeartbeatMsg) error {
+	c.heartbeatMu.Lock()
+	call := c.heartbeatCall
+	if call == nil {
+		c.heartbeatMu.Unlock()
+		return errors.New("sessionshim: unsolicited selected-v3 heartbeat receipt")
+	}
+	c.heartbeatCall = nil
+	c.heartbeatMu.Unlock()
+	if receipt.Generation != call.expected.Generation || receipt.AckedSeq != call.expected.AckedSeq || !receipt.Phase.Known() {
+		err := errors.New("sessionshim: selected-v3 heartbeat receipt changed generation, cursor, or phase")
+		call.done <- heartbeatResult{err: err}
+		return err
+	}
+	call.done <- heartbeatResult{}
+	return nil
+}
+
+func (c *Controller) failHeartbeatFromError(body []byte) bool {
+	c.heartbeatMu.Lock()
+	call := c.heartbeatCall
+	if call == nil {
+		c.heartbeatMu.Unlock()
+		return false
+	}
+	c.heartbeatCall = nil
+	c.heartbeatMu.Unlock()
+	message, err := shimwire.DecodeError(body)
+	if err != nil {
+		call.done <- heartbeatResult{err: err}
+	} else {
+		call.done <- heartbeatResult{err: fmt.Errorf("sessionshim: selected-v3 heartbeat refused: %s", message.Code)}
+	}
+	return true
+}
+
+func (c *Controller) failHeartbeatCall(err error) {
+	c.heartbeatMu.Lock()
+	call := c.heartbeatCall
+	if call != nil {
+		c.heartbeatCall = nil
+	}
+	c.heartbeatMu.Unlock()
+	if call != nil {
+		call.done <- heartbeatResult{err: err}
+	}
+}
+
+type hostFrameStreamState struct {
+	seen          bool
+	last          uint64
+	exited        bool
+	gap           *shimwire.GapMsg
+	expectedFirst uint64
+}
+
+func (c *Controller) publishHostFrameEvent(ev ControllerEvent, stream *hostFrameStreamState) error {
+	if ev.Kind != EventHostFrame || ev.Seq == 0 || stream.exited {
+		return shimwire.ErrDuplicateHostFrame
+	}
+	switch {
+	case stream.gap != nil:
+		if ev.FrameType != attachwire.TypeSnapshot || ev.Seq != stream.gap.ToSeq+1 {
+			return fmt.Errorf("sessionshim: %w: Gap is not followed by its exact recovery Snapshot", shimwire.ErrSnapshotMismatch)
+		}
+		stream.gap = nil
+	case !stream.seen && stream.expectedFirst != 0 && ev.Seq != stream.expectedFirst:
+		return fmt.Errorf("sessionshim: %w: first HostFrame sequence %d, want %d",
+			shimwire.ErrSnapshotMismatch, ev.Seq, stream.expectedFirst)
+	case stream.seen && ev.Seq != stream.last+1:
+		return fmt.Errorf("sessionshim: %w: HostFrame sequence %d follows %d", shimwire.ErrSnapshotMismatch, ev.Seq, stream.last)
+	}
+	stream.seen, stream.last = true, ev.Seq
+	if ev.FrameType == attachwire.TypeExit {
+		if err := c.observeExit(ev.Exit); err != nil {
+			return err
+		}
+		stream.exited = true
+	}
+	return c.publishEvent(ev)
+}
+
+func (c *Controller) publishEvent(event ControllerEvent) error {
+	if c.selected >= shimwire.V3 {
 		select {
-		case c.events <- ev:
+		case c.eventQueue <- event:
+			return nil
+		case <-c.closing:
+			return io.EOF
+		default:
+			return errors.New("sessionshim: selected-v3 priority event queue exceeded its bound")
+		}
+	}
+	select {
+	case c.events <- event:
+		return nil
+	case <-c.closing:
+		return io.EOF
+	}
+}
+
+func (c *Controller) dispatchEvents() {
+	defer close(c.events)
+	for event := range c.eventQueue {
+		select {
+		case c.events <- event:
 		case <-c.closing:
 			return
 		}
 	}
 }
 
-func (c *Controller) acceptSnapshotResult(body []byte) (ControllerEvent, bool, error) {
+func decodeHostFrameEvent(body []byte) (ControllerEvent, error) {
+	hostFrame, err := shimwire.DecodeHostFrame(body)
+	if err != nil {
+		return ControllerEvent{}, err
+	}
+	frame, err := attachwire.DecodeFrame(hostFrame.FrameBytes)
+	if err != nil {
+		return ControllerEvent{}, err
+	}
+	event := ControllerEvent{
+		Kind: EventHostFrame, RequestID: hostFrame.RequestID,
+		FrameType: frame.Type, Seq: frame.Seq, RelTime: frame.RelTime,
+		FrameBytes: append([]byte(nil), hostFrame.FrameBytes...),
+	}
+	switch frame.Type {
+	case attachwire.TypeOutput:
+		event.Data = append([]byte(nil), attachwire.DecodeOutput(frame.Payload).Data...)
+	case attachwire.TypeSnapshot:
+		envelope, err := attachwire.DecodeSnapshotEnvelope(frame.Payload)
+		if err != nil {
+			return ControllerEvent{}, err
+		}
+		event.Snapshot = shimwire.SnapshotMsg{AtSeq: envelope.AtSeq, Screen: append([]byte(nil), envelope.Snap...)}
+	case attachwire.TypeExit:
+		exit, err := attachwire.DecodeExit(frame.Payload)
+		if err != nil {
+			return ControllerEvent{}, err
+		}
+		event.Exit = shimwire.ExitMsg{Seq: frame.Seq, ExitCode: exit.ExitCode, Signal: exit.Signal}
+	}
+	return event, nil
+}
+
+func (c *Controller) acceptSnapshotResult(
+	body []byte,
+	pending *ControllerEvent,
+) (ControllerEvent, bool, *snapshotCompletion, error) {
 	result, err := shimwire.DecodeSnapshotResult(body)
 	if err != nil {
-		return ControllerEvent{}, false, err
+		return ControllerEvent{}, false, nil, err
 	}
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
 	call := c.snapshotCalls[result.RequestID]
 	if call == nil || call.request.Generation != result.Generation || call.request.Mode != result.Mode {
-		return ControllerEvent{}, false, fmt.Errorf("sessionshim: %w: result id=%d generation=%d mode=%s", shimwire.ErrSnapshotMismatch, result.RequestID, result.Generation, result.Mode)
-	}
-	if err := validateSnapshotResult(result, c.observedExit()); err != nil {
-		return ControllerEvent{}, false, err
+		return ControllerEvent{}, false, nil, fmt.Errorf("sessionshim: %w: result id=%d generation=%d mode=%s", shimwire.ErrSnapshotMismatch, result.RequestID, result.Generation, result.Mode)
 	}
 	if call.result != nil {
-		if !snapshotResultsEqual(*call.result, result) {
-			return ControllerEvent{}, false, fmt.Errorf("sessionshim: %w: changed result for request id %d", shimwire.ErrSnapshotMismatch, result.RequestID)
+		if pending != nil {
+			return ControllerEvent{}, false, nil, shimwire.ErrDuplicateHostFrame
 		}
-		return ControllerEvent{}, false, nil
+		if !snapshotResultsEqual(*call.result, result) {
+			return ControllerEvent{}, false, nil, fmt.Errorf("sessionshim: %w: changed result for request id %d", shimwire.ErrSnapshotMismatch, result.RequestID)
+		}
+		return ControllerEvent{}, false, nil, nil
+	}
+	if err := validateSnapshotResult(result, c.observedExit(), c.selected, pending); err != nil {
+		return ControllerEvent{}, false, nil, err
 	}
 	stored := cloneSnapshotResult(result)
-	call.result = &stored
+	var callErr error
 	if result.Code != "" {
-		call.err = fmt.Errorf("sessionshim: %w: %s", shimwire.ErrSnapshotRefused, result.Code)
+		callErr = fmt.Errorf("sessionshim: %w: %s", shimwire.ErrSnapshotRefused, result.Code)
 	}
-	close(call.done)
 	if result.Mode == shimwire.SnapshotEmit && result.InStream && !call.streamDelivered {
 		call.streamDelivered = true
-		return ControllerEvent{Kind: EventSnapshotFrame, Seq: result.AtSeq + 1, FrameBytes: append([]byte(nil), result.Bytes...)}, true, nil
+		if c.selected >= shimwire.V3 {
+			if pending == nil {
+				return ControllerEvent{}, false, nil, shimwire.ErrSnapshotMismatch
+			}
+			return *pending, true, &snapshotCompletion{call: call, result: stored, err: callErr}, nil
+		}
+		call.result = &stored
+		call.err = callErr
+		close(call.done)
+		return ControllerEvent{Kind: EventSnapshotFrame, Seq: result.AtSeq + 1, FrameBytes: append([]byte(nil), result.Bytes...)}, true, nil, nil
 	}
-	return ControllerEvent{}, false, nil
+	call.result = &stored
+	call.err = callErr
+	close(call.done)
+	return ControllerEvent{}, false, nil, nil
 }
 
-func validateSnapshotResult(result shimwire.SnapshotResult, observedExit *shimwire.ExitMsg) error {
+func (c *Controller) completeSnapshotCall(completion *snapshotCompletion, publishErr error) {
+	if completion == nil {
+		return
+	}
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	if completion.call.result != nil || completion.call.err != nil {
+		return
+	}
+	if publishErr != nil {
+		completion.call.err = publishErr
+		close(completion.call.done)
+		return
+	}
+	stored := cloneSnapshotResult(completion.result)
+	completion.call.result = &stored
+	completion.call.err = completion.err
+	close(completion.call.done)
+}
+
+func validateSnapshotResult(result shimwire.SnapshotResult, observedExit *shimwire.ExitMsg, selected uint32, pending *ControllerEvent) error {
 	if result.Code != "" {
+		if pending != nil {
+			return shimwire.ErrDuplicateHostFrame
+		}
 		return nil
 	}
 	if result.Mode == shimwire.SnapshotInspect {
+		if pending != nil {
+			return shimwire.ErrDuplicateHostFrame
+		}
 		if result.InStream || len(result.Bytes) == 0 {
 			return fmt.Errorf("sessionshim: %w: invalid inspect disposition", shimwire.ErrSnapshotMismatch)
 		}
@@ -709,6 +1096,33 @@ func validateSnapshotResult(result shimwire.SnapshotResult, observedExit *shimwi
 			return fmt.Errorf("sessionshim: %w: inspect screen: %v", shimwire.ErrSnapshotMismatch, err)
 		}
 		return nil
+	}
+	if selected >= shimwire.V3 && result.InStream {
+		if pending == nil || pending.Kind != EventHostFrame || pending.FrameType != attachwire.TypeSnapshot ||
+			pending.RequestID != result.RequestID || pending.Seq != result.AtSeq+1 || len(result.Bytes) != 0 {
+			return fmt.Errorf("sessionshim: %w: v3 live emit pair differs", shimwire.ErrSnapshotMismatch)
+		}
+		frame, err := attachwire.DecodeFrame(pending.FrameBytes)
+		if err != nil {
+			return fmt.Errorf("sessionshim: %w: v3 live Snapshot frame", shimwire.ErrSnapshotMismatch)
+		}
+		envelope, err := attachwire.DecodeSnapshotEnvelope(frame.Payload)
+		if err != nil || envelope.AtSeq != result.AtSeq {
+			return fmt.Errorf("sessionshim: %w: v3 live Snapshot atSeq differs", shimwire.ErrSnapshotMismatch)
+		}
+		if envelope.SnapFormat != attachwire.SnapFormatScreen {
+			return fmt.Errorf("sessionshim: %w: v3 live Snapshot format differs", shimwire.ErrSnapshotMismatch)
+		}
+		if _, err := attachwire.DecodeScreen(envelope.Snap); err != nil {
+			return fmt.Errorf("sessionshim: %w: v3 live Snapshot screen", shimwire.ErrSnapshotMismatch)
+		}
+		if observedExit != nil {
+			return fmt.Errorf("sessionshim: %w: live emit arrived after Exit", shimwire.ErrSnapshotMismatch)
+		}
+		return nil
+	}
+	if pending != nil {
+		return shimwire.ErrDuplicateHostFrame
 	}
 	frame, err := attachwire.DecodeFrame(result.Bytes)
 	if err != nil || frame.Type != attachwire.TypeSnapshot {

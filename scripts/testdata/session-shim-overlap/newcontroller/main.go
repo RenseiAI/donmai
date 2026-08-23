@@ -29,8 +29,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	result, err := sessionshim.Adopt(ctx, sessionshim.AdoptOptions{
-		Registry: registry, ControllerID: "v0682-controller",
-		ExpectedWorkarea: func(sessionshim.Identity) string { return os.Args[4] },
+		Registry: registry, ControllerID: "v0683-full-frame-controller",
+		ExpectedWorkarea:      func(sessionshim.Identity) string { return os.Args[4] },
+		RequireFullHostFrames: true,
 	})
 	if err != nil {
 		die(err)
@@ -58,6 +59,9 @@ func main() {
 		}
 		if snapshot, err := controller.InspectSnapshot(ctx); err != nil || len(snapshot.Bytes) == 0 {
 			die(fmt.Errorf("v2 snapshot=%+v err=%v", snapshot, err))
+		}
+		if controller.SupportsFullHostFrames() {
+			die(errors.New("released max-2 shim selected v3 full-frame rail"))
 		}
 	}
 	if err := controller.WriteInput([]byte("released-overlap\r")); err != nil {

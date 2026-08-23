@@ -153,6 +153,55 @@ func TestWriterIsSafeForConcurrentUse(t *testing.T) {
 	}
 }
 
+func TestV3WriterBatchKeepsHostFrameResultPairsAdjacent(t *testing.T) {
+	t.Parallel()
+	const pairs = 64
+	var buf bytes.Buffer
+	var sinkMu sync.Mutex
+	w := NewWriter(writerFunc(func(p []byte) (int, error) {
+		sinkMu.Lock()
+		defer sinkMu.Unlock()
+		return buf.Write(p)
+	}))
+	var wg sync.WaitGroup
+	for i := byte(0); i < pairs; i++ {
+		wg.Add(2)
+		go func(id byte) {
+			defer wg.Done()
+			if err := w.WriteVersionBatch(V3,
+				Message{Type: TypeHostFrame, Body: []byte{id}},
+				Message{Type: TypeSnapshotResult, Body: []byte{id}},
+			); err != nil {
+				t.Errorf("WriteVersionBatch: %v", err)
+			}
+		}(i)
+		go func(id byte) {
+			defer wg.Done()
+			if err := w.WriteVersion(V3, TypeHeartbeat, []byte{id}); err != nil {
+				t.Errorf("WriteVersion heartbeat: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	r := NewReader(bytes.NewReader(buf.Bytes()))
+	for {
+		message, err := r.ReadVersion(V3)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if message.Type != TypeHostFrame {
+			continue
+		}
+		result, err := r.ReadVersion(V3)
+		if err != nil || result.Type != TypeSnapshotResult || !bytes.Equal(result.Body, message.Body) {
+			t.Fatalf("HostFrame pair interleaved: host=%v result=%v err=%v", message, result, err)
+		}
+	}
+}
+
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
@@ -208,11 +257,11 @@ func TestMessageTypeKnownRejectsReservedValues(t *testing.T) {
 	}
 }
 
-func TestSelectedVersionClosesV1ButAdmitsV2SnapshotMessages(t *testing.T) {
+func TestSelectedVersionsKeepV1V2ClosedAndAdmitV3HostFrame(t *testing.T) {
 	t.Parallel()
 	for _, mt := range []MessageType{TypeSnapshotRequest, TypeSnapshotResult} {
-		if mt.Known() || mt.AllowedIn(V1) || !mt.AllowedIn(V2) {
-			t.Fatalf("%s vocabulary: Known=%v v1=%v v2=%v", mt, mt.Known(), mt.AllowedIn(V1), mt.AllowedIn(V2))
+		if mt.Known() || mt.AllowedIn(V1) || !mt.AllowedIn(V2) || !mt.AllowedIn(V3) {
+			t.Fatalf("%s vocabulary: Known=%v v1=%v v2=%v v3=%v", mt, mt.Known(), mt.AllowedIn(V1), mt.AllowedIn(V2), mt.AllowedIn(V3))
 		}
 		var buf bytes.Buffer
 		if err := NewWriter(&buf).Write(mt, nil); !errors.Is(err, ErrMalformed) {
@@ -228,5 +277,16 @@ func TestSelectedVersionClosesV1ButAdmitsV2SnapshotMessages(t *testing.T) {
 		if err != nil || msg.Type != mt {
 			t.Fatalf("v2 ReadVersion(%s) = (%+v,%v)", mt, msg, err)
 		}
+	}
+	if TypeHostFrame.Known() || TypeHostFrame.AllowedIn(V1) || TypeHostFrame.AllowedIn(V2) || !TypeHostFrame.AllowedIn(V3) {
+		t.Fatalf("HostFrame vocabulary: Known=%v v1=%v v2=%v v3=%v",
+			TypeHostFrame.Known(), TypeHostFrame.AllowedIn(V1), TypeHostFrame.AllowedIn(V2), TypeHostFrame.AllowedIn(V3))
+	}
+	var buf bytes.Buffer
+	if err := NewWriter(&buf).WriteVersion(V3, TypeHostFrame, []byte{1}); err != nil {
+		t.Fatalf("v3 WriteVersion(HostFrame): %v", err)
+	}
+	if _, err := NewReader(bytes.NewReader(buf.Bytes())).ReadVersion(V2); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("selected v2 accepted HostFrame: %v", err)
 	}
 }

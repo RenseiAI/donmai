@@ -66,16 +66,19 @@ func TestThisBuildAdvertisesASaneRange(t *testing.T) {
 	}
 }
 
-func TestStableFamilyAdvertisesV1V2AndSelectsHighestOverlap(t *testing.T) {
+func TestStableFamilyAdvertisesV1ThroughV3AndSelectsHighestOverlap(t *testing.T) {
 	t.Parallel()
-	if ProtocolName != "session-shim-v1" || ProtocolMin != V1 || ProtocolMax != V2 {
-		t.Fatalf("family/range = %q [%d,%d], want stable token [1,2]", ProtocolName, ProtocolMin, ProtocolMax)
+	if ProtocolName != "session-shim-v1" || ProtocolMin != V1 || ProtocolMax != V3 {
+		t.Fatalf("family/range = %q [%d,%d], want stable token [1,3]", ProtocolName, ProtocolMin, ProtocolMax)
 	}
 	if got, err := Negotiate(V1, V1, ProtocolMin, ProtocolMax); err != nil || got != V1 {
 		t.Fatalf("old-shim overlap = (%d,%v), want selected v1", got, err)
 	}
 	if got, err := Negotiate(V1, V2, ProtocolMin, ProtocolMax); err != nil || got != V2 {
-		t.Fatalf("new overlap = (%d,%v), want selected v2", got, err)
+		t.Fatalf("released max-2 overlap = (%d,%v), want selected v2", got, err)
+	}
+	if got, err := Negotiate(V1, V3, ProtocolMin, ProtocolMax); err != nil || got != V3 {
+		t.Fatalf("v3 overlap = (%d,%v), want selected v3", got, err)
 	}
 }
 

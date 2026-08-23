@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -91,6 +92,9 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	if err := cfg.validateSnapshotCarrier(); err != nil {
 		return nil, err
 	}
+	if d.sessionShimAttestationErr != nil {
+		return nil, d.sessionShimAttestationErr
+	}
 	id := sessionshim.Identity{OrgID: cfg.orgIDForSession(spec), SessionID: spec.SessionID}
 	if err := id.Validate(); err != nil {
 		return nil, fmt.Errorf("session shim: %w", err)
@@ -135,10 +139,11 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		preparedHostID string
 	)
 	controllerOpts := sessionshim.ControllerOptions{
-		ControllerID:     d.controllerID(),
-		ExpectedWorkarea: workarea,
-		DialTimeout:      cfg.launchTimeout(),
-		Logger:           slog.Default(),
+		ControllerID:          d.controllerID(),
+		ExpectedWorkarea:      workarea,
+		DialTimeout:           cfg.launchTimeout(),
+		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimAttestationValue.enabled(),
+		Logger:                slog.Default(),
 		PrepareAdoption: func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 			hostID, hostErr := d.sessionShimHostID(ctx, evidence.Identity.OrgID)
 			if hostErr != nil {
@@ -380,6 +385,8 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 		cfg := d.sessionShimConfig()
 		observe := cfg.OnSessionEvent
 		durable := cfg.OnSessionEventDurable
+		fullHostFrames := ctrl.SupportsFullHostFrames()
+		legacyDurability := !cfg.RequireAuthoritativeSnapshot
 		var lastSeq uint64
 		for ev := range ctrl.Events() {
 			if observe != nil {
@@ -393,7 +400,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 			case sessionshim.EventOutput:
 				if ev.Seq > lastSeq {
 					lastSeq = ev.Seq
-					if durable != nil {
+					if durable != nil && legacyDurability {
 						if err := durable(id, ev); err != nil {
 							slog.Warn("session shim: durable carrier rejected output",
 								"session", id.String(), "seq", ev.Seq, "error", err)
@@ -403,7 +410,12 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							_ = ctrl.Close()
 							return
 						}
-						d.recordShimForwardedSeqForController(id, ctrl, ev.Seq)
+						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
+							slog.Warn("session shim: durable output acknowledgement was not persisted",
+								"session", id.String(), "seq", ev.Seq, "error", err)
+							_ = ctrl.Close()
+							return
+						}
 					}
 				}
 			case sessionshim.EventGap:
@@ -412,6 +424,60 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 				slog.Warn("session shim: output gap declared by the shim",
 					"session", id.String(), "fromSeq", ev.Gap.FromSeq,
 					"toSeq", ev.Gap.ToSeq, "reason", ev.Gap.Reason)
+				if fullHostFrames && durable != nil {
+					if err := durable(id, ev); err != nil {
+						slog.Warn("session shim: durable carrier rejected output gap",
+							"session", id.String(), "fromSeq", ev.Gap.FromSeq,
+							"toSeq", ev.Gap.ToSeq, "error", err)
+						_ = ctrl.Close()
+						return
+					}
+				}
+			case sessionshim.EventHostFrame:
+				if ev.Seq == 0 || ev.Seq <= lastSeq {
+					_ = ctrl.Close()
+					return
+				}
+				lastSeq = ev.Seq
+				if d.isStagedSessionShimSnapshot(id, ev) {
+					if durable == nil {
+						_ = ctrl.Close()
+						return
+					}
+					if err := durable(id, ev); err != nil {
+						slog.Warn("session shim: durable carrier rejected staged Snapshot",
+							"session", id.String(), "seq", ev.Seq, "error", err)
+						_ = ctrl.Close()
+						return
+					}
+					activationGate, retained := d.retainStagedSessionShimSnapshot(id, ev)
+					if !retained || !activationGate.await() {
+						return
+					}
+					continue
+				}
+				if durable != nil {
+					if err := durable(id, ev); err != nil {
+						slog.Warn("session shim: durable carrier rejected host frame",
+							"session", id.String(), "seq", ev.Seq, "type", ev.FrameType, "error", err)
+						_ = ctrl.Close()
+						return
+					}
+					if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
+						slog.Warn("session shim: durable HostFrame acknowledgement was not persisted",
+							"session", id.String(), "seq", ev.Seq, "error", err)
+						_ = ctrl.Close()
+						return
+					}
+				}
+				if ev.FrameType == attachwire.TypeExit {
+					slog.Info("session shim: terminal observation received",
+						"session", id.String(), "exitCode", ev.Exit.ExitCode, "signal", ev.Exit.Signal)
+					if !gate.await() {
+						return
+					}
+					d.finishAdoptedShim(id, ev.Exit)
+				}
 			case sessionshim.EventExit:
 				slog.Info("session shim: terminal observation received",
 					"session", id.String(), "exitCode", ev.Exit.ExitCode, "signal", ev.Exit.Signal)
@@ -427,7 +493,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 				// resume point a later adoption starts from.
 				if ev.Snapshot.AtSeq > lastSeq {
 					lastSeq = ev.Snapshot.AtSeq
-					if durable != nil {
+					if durable != nil && legacyDurability {
 						if err := durable(id, ev); err != nil {
 							slog.Warn("session shim: durable carrier rejected snapshot",
 								"session", id.String(), "seq", ev.Snapshot.AtSeq, "error", err)
@@ -437,30 +503,32 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							_ = ctrl.Close()
 							return
 						}
-						d.recordShimForwardedSeqForController(id, ctrl, ev.Snapshot.AtSeq)
+						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Snapshot.AtSeq); err != nil {
+							slog.Warn("session shim: durable Snapshot acknowledgement was not persisted",
+								"session", id.String(), "seq", ev.Snapshot.AtSeq, "error", err)
+							_ = ctrl.Close()
+							return
+						}
 					}
 				}
 			case sessionshim.EventSnapshotFrame:
-				if activationGate, staged := d.retainStagedSessionShimSnapshot(id, ev); staged {
-					// The exact frame is retained locally but deliberately not handed to
-					// the ordinary durable callback and not acknowledged to the shim.
-					// OnAdoption stores it as the candidate Snapshot; carrier_active
-					// resolves it after local publication, then releases this gate.
-					if !activationGate.await() {
-						return
-					}
-					continue
-				}
+				// Selected-v2 only. Hosted full-frame composition never stages this
+				// semantic event; selected v3 stages its one exact EventHostFrame.
 				if ev.Seq > lastSeq {
 					lastSeq = ev.Seq
-					if durable != nil {
+					if durable != nil && legacyDurability {
 						if err := durable(id, ev); err != nil {
 							slog.Warn("session shim: durable carrier rejected emitted snapshot",
 								"session", id.String(), "seq", ev.Seq, "error", err)
 							_ = ctrl.Close()
 							return
 						}
-						d.recordShimForwardedSeqForController(id, ctrl, ev.Seq)
+						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
+							slog.Warn("session shim: durable emitted Snapshot acknowledgement was not persisted",
+								"session", id.String(), "seq", ev.Seq, "error", err)
+							_ = ctrl.Close()
+							return
+						}
 					}
 				}
 			}
@@ -474,7 +542,22 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 	}()
 }
 
-func (d *Daemon) recordShimForwardedSeqForController(id sessionshim.Identity, ctrl *sessionshim.Controller, seq uint64) {
+type sessionShimCursorAcknowledger interface {
+	SupportsFullHostFrames() bool
+	Heartbeat(uint64) error
+}
+
+func (d *Daemon) recordShimForwardedSeqForController(
+	id sessionshim.Identity,
+	ctrl sessionShimCursorAcknowledger,
+	seq uint64,
+) error {
+	fullHostFrames := ctrl != nil && ctrl.SupportsFullHostFrames()
+	if fullHostFrames {
+		if err := ctrl.Heartbeat(seq); err != nil {
+			return err
+		}
+	}
 	d.shims.mu.Lock()
 	if d.shims.forwarded == nil {
 		d.shims.forwarded = make(map[sessionshim.Identity]uint64)
@@ -483,9 +566,10 @@ func (d *Daemon) recordShimForwardedSeqForController(id sessionshim.Identity, ct
 		d.shims.forwarded[id] = seq
 	}
 	d.shims.mu.Unlock()
-	if ctrl != nil {
+	if ctrl != nil && !fullHostFrames {
 		_ = ctrl.Heartbeat(seq)
 	}
+	return nil
 }
 
 // SessionShimForwardedSeq reports the highest output sequence this daemon has

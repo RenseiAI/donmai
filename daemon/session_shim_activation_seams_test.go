@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -23,8 +24,8 @@ import (
 func activationTestAttestation() SessionShimHostAttestation {
 	return SessionShimHostAttestation{
 		Supported: true, ControllerID: "controller-activation-test",
-		ProtocolMin: 1, ProtocolMax: 2,
-		Capabilities: []string{"carrier-activation", "durable-host-ack", "snapshot-proxy"},
+		ProtocolMin: shimwire.ProtocolMin, ProtocolMax: shimwire.ProtocolMax,
+		Capabilities: RequiredSessionShimHostCapabilities(),
 	}
 }
 
@@ -45,7 +46,9 @@ func assertFlatSessionShimAttestation(t *testing.T, raw []byte, att SessionShimH
 	want := map[string]any{
 		"sessionShimSupported": true, "sessionShimControllerId": att.ControllerID,
 		"sessionShimProtocolMin": float64(att.ProtocolMin), "sessionShimProtocolMax": float64(att.ProtocolMax),
-		"sessionShimCapabilities": []any{att.Capabilities[0], att.Capabilities[1], att.Capabilities[2]},
+		"sessionShimCapabilities": []any{
+			att.Capabilities[0], att.Capabilities[1], att.Capabilities[2], att.Capabilities[3],
+		},
 	}
 	for key, value := range want {
 		if !reflect.DeepEqual(body[key], value) {
@@ -246,6 +249,36 @@ func TestSupportedSessionShimAttestationRequiresCanonicalCompleteCapabilities(t 
 		if err := attestation.validate(); err == nil {
 			t.Errorf("%s capability set was accepted", name)
 		}
+	}
+	for name, mutate := range map[string]func(*SessionShimHostAttestation){
+		"max below v3": func(attestation *SessionShimHostAttestation) { attestation.ProtocolMax = shimwire.V2 },
+		"missing capability": func(attestation *SessionShimHostAttestation) {
+			attestation.Capabilities = attestation.Capabilities[:len(attestation.Capabilities)-1]
+		},
+		"unknown capability": func(attestation *SessionShimHostAttestation) {
+			attestation.Capabilities[len(attestation.Capabilities)-1] = "unknown_host_capability"
+		},
+	} {
+		attestation := activationTestAttestation()
+		mutate(&attestation)
+		if err := attestation.validate(); err == nil {
+			t.Errorf("%s attestation was accepted", name)
+		}
+	}
+}
+
+func TestFutureProtocolMaxRequiresAndAcceptsOnlyItsExactReceiptEcho(t *testing.T) {
+	attestation := activationTestAttestation()
+	attestation.ProtocolMax = shimwire.V3 + 1
+	receipt := activationTestCredentialReceipt(
+		attestation, SessionShimCredentialStateRecovering, "stable-host", "revision",
+	)
+	if err := validateSessionShimCredentialReceipt(attestation, receipt, "worker"); err != nil {
+		t.Fatalf("future max exact echo: %v", err)
+	}
+	receipt.ProtocolMax = shimwire.V3
+	if err := validateSessionShimCredentialReceipt(attestation, receipt, "worker"); err == nil {
+		t.Fatal("future max attestation accepted a downgraded receipt echo")
 	}
 }
 
@@ -450,7 +483,9 @@ func TestCarrierActivationExactSetAndAckResolvePendingSnapshot(t *testing.T) {
 		Identity: id, CarrierCompatible: true,
 		Extensions: shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "7"}},
 	}}
-	d.shims.pendingSnapshots[id] = sessionshim.ControllerEvent{Kind: sessionshim.EventSnapshotFrame, Seq: 12}
+	d.shims.pendingSnapshots[id] = sessionshim.ControllerEvent{
+		Kind: sessionshim.EventHostFrame, FrameType: attachwire.TypeSnapshot, RequestID: 99, Seq: 12,
+	}
 	d.shims.activationGates[id] = newShimAdoptionGate()
 	entries := map[sessionshim.Identity]adoptedShim{id: d.shims.adopted[id]}
 
@@ -484,6 +519,50 @@ func TestCarrierActivationExactSetAndAckResolvePendingSnapshot(t *testing.T) {
 	}
 	if !d.SessionShimCarrierActivationComplete() {
 		t.Fatal("carrierActivationComplete remained false after exact complete set")
+	}
+}
+
+type gatedSessionShimCursorAck struct {
+	started chan uint64
+	release chan struct{}
+}
+
+func (*gatedSessionShimCursorAck) SupportsFullHostFrames() bool { return true }
+
+func (g *gatedSessionShimCursorAck) Heartbeat(sequence uint64) error {
+	g.started <- sequence
+	<-g.release
+	return nil
+}
+
+func TestForwardedCursorWaitsForExactShimPersistenceReceipt(t *testing.T) {
+	d := New(Options{SkipRegistration: true})
+	id := sessionshim.Identity{OrgID: "org-ack-gate", SessionID: "session-ack-gate"}
+	ack := &gatedSessionShimCursorAck{started: make(chan uint64, 1), release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() { done <- d.recordShimForwardedSeqForController(id, ack, 42) }()
+	select {
+	case sequence := <-ack.started:
+		if sequence != 42 {
+			t.Fatalf("persistence request sequence = %d, want 42", sequence)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cursor persistence was not requested")
+	}
+	if got := d.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != 0 {
+		t.Fatalf("forwarded cursor advanced before persistence receipt = %d", got)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("cursor update returned before persistence receipt: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(ack.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := d.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != 42 {
+		t.Fatalf("forwarded cursor after persistence receipt = %d, want 42", got)
 	}
 }
 

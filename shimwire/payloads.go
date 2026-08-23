@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/RenseiAI/donmai/attachwire"
 )
 
 // Generation is the monotonic controller-fencing number (§D4). The SHIM is
@@ -167,6 +169,97 @@ type SnapshotResult struct {
 	AtSeq      uint64
 	InStream   bool
 	Bytes      []byte
+}
+
+// HostFrame is the selected-v3 exact observation. RequestID is zero for
+// ordinary/replayed frames and non-zero only for the live Snapshot emitted by
+// that connection-local SnapshotRequest. FrameBytes are the complete canonical
+// interactive-attach frame bytes.
+type HostFrame struct {
+	RequestID  uint64
+	FrameBytes []byte
+}
+
+const hostFrameHeaderLen = 8
+
+// MaxHostFrameBytes is the largest exact attach frame that fits below the
+// existing shimwire message ceiling after the type byte and v3 request header.
+const MaxHostFrameBytes = MaxMessageBytes - 1 - hostFrameHeaderLen
+
+// EncodeHostFrame validates and preserves one exact canonical attach frame.
+func EncodeHostFrame(hostFrame HostFrame) ([]byte, error) {
+	if err := validateHostFrame(hostFrame); err != nil {
+		return nil, err
+	}
+	body := make([]byte, hostFrameHeaderLen+len(hostFrame.FrameBytes))
+	binary.BigEndian.PutUint64(body[:hostFrameHeaderLen], hostFrame.RequestID)
+	copy(body[hostFrameHeaderLen:], hostFrame.FrameBytes)
+	return body, nil
+}
+
+// DecodeHostFrame strictly decodes and independently owns one v3 observation.
+func DecodeHostFrame(body []byte) (HostFrame, error) {
+	if len(body) <= hostFrameHeaderLen {
+		return HostFrame{}, fmt.Errorf("shimwire: %w: HostFrame body %d bytes, need > %d", ErrMalformed, len(body), hostFrameHeaderLen)
+	}
+	hostFrame := HostFrame{
+		RequestID:  binary.BigEndian.Uint64(body[:hostFrameHeaderLen]),
+		FrameBytes: append([]byte(nil), body[hostFrameHeaderLen:]...),
+	}
+	if err := validateHostFrame(hostFrame); err != nil {
+		return HostFrame{}, err
+	}
+	return hostFrame, nil
+}
+
+func validateHostFrame(hostFrame HostFrame) error {
+	if len(hostFrame.FrameBytes) == 0 {
+		return fmt.Errorf("shimwire: %w: HostFrame has no frame bytes", ErrMalformed)
+	}
+	if len(hostFrame.FrameBytes) > MaxHostFrameBytes {
+		return fmt.Errorf("shimwire: %w: HostFrame has %d frame bytes", ErrMessageTooLarge, len(hostFrame.FrameBytes))
+	}
+	frame, err := attachwire.DecodeFrame(hostFrame.FrameBytes)
+	if err != nil || !bytes.Equal(frame.Encode(), hostFrame.FrameBytes) {
+		return fmt.Errorf("shimwire: %w: HostFrame is not one canonical attach frame", ErrMalformed)
+	}
+	if frame.Seq == 0 {
+		return fmt.Errorf("shimwire: %w: HostFrame sequence must be positive", ErrMalformed)
+	}
+	switch frame.Type {
+	case attachwire.TypeOutput:
+		if hostFrame.RequestID != 0 {
+			return fmt.Errorf("shimwire: %w: non-Snapshot HostFrame carries request id", ErrMalformed)
+		}
+	case attachwire.TypeResize:
+		if hostFrame.RequestID != 0 {
+			return fmt.Errorf("shimwire: %w: non-Snapshot HostFrame carries request id", ErrMalformed)
+		}
+		if _, err := attachwire.DecodeResize(frame.Payload); err != nil {
+			return fmt.Errorf("shimwire: %w: invalid applied Resize HostFrame", ErrMalformed)
+		}
+	case attachwire.TypeMarker:
+		if hostFrame.RequestID != 0 {
+			return fmt.Errorf("shimwire: %w: non-Snapshot HostFrame carries request id", ErrMalformed)
+		}
+		if _, err := attachwire.DecodeMarker(frame.Payload); err != nil {
+			return fmt.Errorf("shimwire: %w: invalid Marker HostFrame", ErrMalformed)
+		}
+	case attachwire.TypeSnapshot:
+		if _, err := attachwire.DecodeSnapshotEnvelope(frame.Payload); err != nil {
+			return fmt.Errorf("shimwire: %w: invalid Snapshot HostFrame", ErrMalformed)
+		}
+	case attachwire.TypeExit:
+		if hostFrame.RequestID != 0 {
+			return fmt.Errorf("shimwire: %w: non-Snapshot HostFrame carries request id", ErrMalformed)
+		}
+		if _, err := attachwire.DecodeExit(frame.Payload); err != nil {
+			return fmt.Errorf("shimwire: %w: invalid Exit HostFrame", ErrMalformed)
+		}
+	default:
+		return fmt.Errorf("shimwire: %w: attach type %s is not a host-sequence observation", ErrMalformed, frame.Type)
+	}
+	return nil
 }
 
 const (

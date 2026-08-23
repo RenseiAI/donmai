@@ -61,6 +61,15 @@ func v2ControlFromFrame(frame attachwire.Frame) (attachwire.ControlMessage, erro
 	return attachwirev2.DecodeControl(payload)
 }
 
+func v2ResumeSnapshot(sequence uint64) attachwire.Frame {
+	return attachwire.Frame{
+		Type: attachwire.TypeSnapshot, Seq: sequence,
+		Payload: (attachwire.SnapshotEnvelope{
+			AtSeq: sequence - 1, SnapFormat: attachwire.SnapFormatScreen, Snap: []byte{1, 2, 3},
+		}).Encode(),
+	}
+}
+
 func TestV2CandidateActivationAndDurableAckOrdering(t *testing.T) {
 	outputSeen := make(chan struct{})
 	allowOutputAck := make(chan struct{})
@@ -106,6 +115,10 @@ func TestV2CandidateActivationAndDurableAckOrdering(t *testing.T) {
 			serverErr <- fmt.Errorf("activation frame = %T/%v/%v", message, err, controlErr)
 			return
 		}
+		// Keep the first activation in flight long enough for the second caller to
+		// join it. An implementation that emits once per caller queues a duplicate
+		// here, which the next exact raw-frame assertion rejects.
+		time.Sleep(50 * time.Millisecond)
 		active, _ := attachwirev2.BuildControlFrame(attachwirev2.CarrierActive{PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 5})
 		if err := conn.Write(ctx, websocket.MessageBinary, active.Encode()); err != nil {
 			serverErr <- err
@@ -180,8 +193,25 @@ func TestV2CandidateActivationAndDurableAckOrdering(t *testing.T) {
 	if err := candidate.SendRawFrameDurable(ctx, output.Encode()); err == nil {
 		t.Fatal("durable event succeeded before carrier_active")
 	}
-	if ack, err := candidate.Activate(ctx); err != nil || ack != 5 {
-		t.Fatalf("Activate = %d, %v; want ack 5", ack, err)
+	type activationResult struct {
+		ack uint64
+		err error
+	}
+	activationStart := make(chan struct{})
+	activationDone := make(chan activationResult, 2)
+	for range 2 {
+		go func() {
+			<-activationStart
+			ack, activateErr := candidate.Activate(ctx)
+			activationDone <- activationResult{ack: ack, err: activateErr}
+		}()
+	}
+	close(activationStart)
+	for range 2 {
+		result := <-activationDone
+		if result.err != nil || result.ack != 5 {
+			t.Fatalf("concurrent Activate = %d, %v; want shared ack 5", result.ack, result.err)
+		}
 	}
 	durableDone := make(chan error, 1)
 	go func() { durableDone <- candidate.OnSessionEventDurable(ctx, output.Encode()) }()
@@ -219,6 +249,9 @@ func TestV2CandidateActivationAndDurableAckOrdering(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("relay did not receive first unacknowledged frame")
 	}
+	if err := candidate.DeclareHostGap(ctx, 10, 11); err == nil {
+		t.Fatal("host gap overtook an unacknowledged exact frame")
+	}
 	changedRetry := retryOutput
 	changedRetry.Payload = []byte("changed")
 	if err := candidate.SendRawFrameDurable(ctx, changedRetry.Encode()); err == nil {
@@ -242,6 +275,263 @@ func TestV2HostAckCannotAdvanceBeyondSentContiguousFrames(t *testing.T) {
 	}
 	if candidate.ackSeq != 6 {
 		t.Fatalf("future host_ack mutated cursor to %d", candidate.ackSeq)
+	}
+}
+
+func TestV2ActiveResumeAcceptsImmediateExactCarrierActiveWithoutSnapshot(t *testing.T) {
+	serverErr := make(chan error, 1)
+	framesSent := make(chan struct{})
+	inputSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		frame, _, err := readV2TestFrame(ctx, conn)
+		message, controlErr := v2ControlFromFrame(frame)
+		if err != nil || controlErr != nil || message.ControlType() != attachwire.CtrlSubscribe {
+			serverErr <- fmt.Errorf("active resume first frame = %T/%v/%v", message, err, controlErr)
+			return
+		}
+		active, _ := attachwirev2.BuildControlFrame(attachwirev2.CarrierActive{
+			PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+		})
+		if err := conn.Write(ctx, websocket.MessageBinary, active.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		input := attachwire.Frame{Type: attachwire.TypeInput, Payload: (attachwire.InputPayload{
+			InputSeq: 1, UserID: []byte("viewer"), Data: []byte("queued-before-local-publication"),
+		}).Encode()}
+		if err := conn.Write(ctx, websocket.MessageBinary, input.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		close(framesSent)
+		quietCtx, quietCancel := context.WithTimeout(ctx, 150*time.Millisecond)
+		defer quietCancel()
+		if _, _, err := readV2TestFrame(quietCtx, conn); err == nil {
+			serverErr <- errors.New("active resume emitted an unexpected Snapshot or carrier_activate")
+			return
+		}
+		serverErr <- nil
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
+		AttachURL:   strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) { return v2TestToken(t, nil), nil },
+		ResumeDisposition: &V2ResumeDisposition{
+			State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+		},
+		OnInput: func(context.Context, attachwire.InputPayload) error {
+			inputSeen <- struct{}{}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer candidate.Close() //nolint:errcheck
+	if _, err := candidate.WaitMandatorySnapshotRequest(ctx); err == nil {
+		t.Fatal("active resume waited for a duplicate mandatory Snapshot")
+	}
+	<-framesSent
+	select {
+	case <-inputSeen:
+		t.Fatal("queued active-resume Input crossed before local publication")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if ack, err := candidate.Activate(ctx); err != nil || ack != 12 {
+		t.Fatalf("active resume = %d, %v", ack, err)
+	}
+	select {
+	case <-inputSeen:
+	case <-ctx.Done():
+		t.Fatal("queued active-resume Input did not drain after local publication")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV2ActiveResumeKeepsAuthorityClosedUntilLocalPublication(t *testing.T) {
+	var inputCalls int
+	candidate := &V2HostCandidate{
+		cfg: V2HostConfig{OnInput: func(context.Context, attachwire.InputPayload) error {
+			inputCalls++
+			return nil
+		}},
+		claims: v2HostClaims{Epoch: 3, CarrierEpoch: 9}, ackSeq: 12, highestSent: 12,
+		resumeDisposition: &V2ResumeDisposition{State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12},
+		notify:            make(chan struct{}), closedCh: make(chan struct{}), localActiveCh: make(chan struct{}),
+	}
+	if err := candidate.acceptCarrierActive(attachwirev2.CarrierActive{
+		PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !candidate.remoteActive || candidate.active {
+		t.Fatalf("remote/local activation = %v/%v, want true/false", candidate.remoteActive, candidate.active)
+	}
+	ackVersion := candidate.ackVersion
+	input := attachwire.Frame{Type: attachwire.TypeInput, Payload: (attachwire.InputPayload{
+		InputSeq: 1, UserID: []byte("viewer"), Data: []byte("blocked"),
+	}).Encode()}
+	inputDone := make(chan error, 1)
+	go func() { inputDone <- candidate.handleV2Inbound(context.Background(), input) }()
+	select {
+	case err := <-inputDone:
+		t.Fatalf("active-resume Input did not wait for local publication: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if inputCalls != 0 || candidate.ackVersion != ackVersion {
+		t.Fatalf("pre-publication Input effects = callbacks:%d ackVersion:%d->%d", inputCalls, ackVersion, candidate.ackVersion)
+	}
+	if ack, err := candidate.Activate(context.Background()); err != nil || ack != 12 {
+		t.Fatalf("local publication release = %d, %v", ack, err)
+	}
+	if err := <-inputDone; err != nil || inputCalls != 1 {
+		t.Fatalf("post-publication Input = calls:%d err:%v", inputCalls, err)
+	}
+}
+
+func TestV2ReceiptStoredResumeActivatesExactPendingSnapshotWithoutResend(t *testing.T) {
+	snapshot := v2ResumeSnapshot(12)
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		frame, _, err := readV2TestFrame(ctx, conn)
+		message, controlErr := v2ControlFromFrame(frame)
+		if err != nil || controlErr != nil || message.ControlType() != attachwire.CtrlSubscribe {
+			serverErr <- fmt.Errorf("pending resume first frame = %T/%v/%v", message, err, controlErr)
+			return
+		}
+		frame, _, err = readV2TestFrame(ctx, conn)
+		message, controlErr = v2ControlFromFrame(frame)
+		if err != nil || controlErr != nil || message.ControlType() != attachwirev2.CtrlCarrierActivate {
+			serverErr <- fmt.Errorf("pending resume emitted duplicate Snapshot before activation: %s/%T/%v/%v", frame.Type, message, err, controlErr)
+			return
+		}
+		active, _ := attachwirev2.BuildControlFrame(attachwirev2.CarrierActive{
+			PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+		})
+		if err := conn.Write(ctx, websocket.MessageBinary, active.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
+		AttachURL:   strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) { return v2TestToken(t, nil), nil },
+		ResumeDisposition: &V2ResumeDisposition{
+			State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10,
+			CandidateSnapshotSeq: 12, CandidateSnapshot: snapshot.Encode(),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer candidate.Close() //nolint:errcheck
+	if _, err := candidate.WaitMandatorySnapshotRequest(ctx); err == nil {
+		t.Fatal("receipt-stored resume waited for a duplicate mandatory Snapshot")
+	}
+	if err := candidate.SendCandidateSnapshot(ctx, snapshot.Encode()); err == nil {
+		t.Fatal("receipt-stored resume resent its staged Snapshot")
+	}
+	if ack, err := candidate.Activate(ctx); err != nil || ack != 12 {
+		t.Fatalf("receipt-stored resume = %d, %v", ack, err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV2ResumeDispositionRejectsMismatchedFrameCarrierAndAck(t *testing.T) {
+	snapshot := v2ResumeSnapshot(12)
+	base := V2HostConfig{
+		AttachURL: "ws://example.invalid/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) {
+			return "unused", nil
+		},
+		ResumeDisposition: &V2ResumeDisposition{
+			State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10,
+			CandidateSnapshotSeq: 12, CandidateSnapshot: snapshot.Encode(),
+		},
+	}
+	for name, mutate := range map[string]func(*V2HostConfig){
+		"frame sequence": func(config *V2HostConfig) {
+			config.ResumeDisposition.CandidateSnapshotSeq++
+		},
+		"frame correlation": func(config *V2HostConfig) {
+			changed := v2ResumeSnapshot(12)
+			envelope, _ := attachwire.DecodeSnapshotEnvelope(changed.Payload)
+			envelope.AtSeq--
+			changed.Payload = envelope.Encode()
+			config.ResumeDisposition.CandidateSnapshot = changed.Encode()
+		},
+		"ack cursor": func(config *V2HostConfig) { config.DurableHighWater = 9 },
+	} {
+		config := base
+		resume := cloneV2ResumeDisposition(*base.ResumeDisposition)
+		config.ResumeDisposition = &resume
+		mutate(&config)
+		if err := config.withDefaults(); err == nil {
+			t.Errorf("%s mismatch was accepted", name)
+		}
+	}
+	wrongCarrier := base
+	resume := cloneV2ResumeDisposition(*base.ResumeDisposition)
+	resume.PTYEpoch++
+	wrongCarrier.ResumeDisposition = &resume
+	wrongCarrier.TokenSource = func(context.Context) (string, error) { return v2TestToken(t, nil), nil }
+	if _, err := DialV2HostCandidate(context.Background(), wrongCarrier); err == nil {
+		t.Fatal("resume disposition from another authenticated PTY/carrier was accepted")
+	}
+
+	active := &V2HostCandidate{
+		claims: v2HostClaims{Epoch: 3, CarrierEpoch: 9}, ackSeq: 12, highestSent: 12,
+		resumeDisposition: &V2ResumeDisposition{State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12},
+		notify:            make(chan struct{}), closedCh: make(chan struct{}),
+	}
+	if err := active.acceptCarrierActive(attachwirev2.CarrierActive{PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 11}); err == nil || active.active {
+		t.Fatal("active resume accepted a changed journal high-water")
+	}
+	pending := &V2HostCandidate{
+		claims: v2HostClaims{Epoch: 3, CarrierEpoch: 9}, ackSeq: 10, highestSent: 12,
+		candidateSent: true, pendingSeq: 12, pendingRaw: snapshot.Encode(),
+		resumeDisposition: &V2ResumeDisposition{
+			State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10, CandidateSnapshotSeq: 12,
+		},
+		notify: make(chan struct{}), closedCh: make(chan struct{}),
+	}
+	if err := pending.acceptCarrierActive(attachwirev2.CarrierActive{PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10}); err == nil || pending.active {
+		t.Fatal("receipt-stored resume accepted an ack that did not cover its staged Snapshot")
+	}
+	duplicateRequest, err := attachwirev2.BuildControlFrame(attachwire.SnapshotRequest{Reason: attachwire.ReasonResync})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pending.handleV2Inbound(context.Background(), duplicateRequest); err == nil {
+		t.Fatal("receipt-stored resume accepted a duplicate mandatory Snapshot request")
 	}
 }
 

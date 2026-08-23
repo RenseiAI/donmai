@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
@@ -86,10 +87,11 @@ func (p *SessionShimSnapshotProxy) Emit(ctx context.Context) (shimwire.SnapshotR
 		return result, err
 	}
 	if staged {
-		// D14's one staged exception: OnAdoption stores result.Bytes and its
-		// strict receipt while the ordered event consumer remains blocked on the
-		// not-yet-permitted host_ack. Waiting for the forwarded cursor here would
-		// make local publication depend on activation and deadlock the protocol.
+		// D14's one staged exception: OnSessionEventDurable stores the paired raw
+		// HostFrame and its strict receipt while the ordered event consumer remains
+		// blocked on the not-yet-permitted host_ack. The selected-v3 result is
+		// correlation-only and carries no duplicate bytes. Waiting for the forwarded
+		// cursor here would make local publication depend on activation and deadlock.
 		want := result.AtSeq + 1
 		if err := p.daemon.waitStagedSessionShimSnapshot(ctx, p.identity, want); err != nil {
 			p.daemon.cancelStagedSessionShimSnapshot(p.identity)
@@ -136,6 +138,9 @@ const (
 	// SessionShimCarrierAuthoritativeSnapshotV2Required reports selected v1's
 	// typed external-carrier refusal while retaining local controller ownership.
 	SessionShimCarrierAuthoritativeSnapshotV2Required SessionShimCarrierIncompatibility = "authoritative_snapshot_unsupported"
+	// SessionShimCarrierDurableHostFrameV3Required reports selected v2's typed
+	// external-carrier refusal while retaining ownership and snapshot authority.
+	SessionShimCarrierDurableHostFrameV3Required SessionShimCarrierIncompatibility = "durable_host_frame_unsupported"
 )
 
 // SessionShimAdoptionPreparation is the post-Hello, pre-Welcome fact supplied
@@ -280,7 +285,8 @@ type SessionShimConfig struct {
 
 	// AttestationCapabilities is the caller-declared, non-secret capability set.
 	// It is sorted and frozen once in New; duplicates and empty names are refused.
-	// The architecture intentionally does not assign provider-specific names.
+	// Hosted activation requires the exact closed set returned by
+	// RequiredSessionShimHostCapabilities.
 	AttestationCapabilities []string
 
 	// AcquireRecoveryScopes performs auth-only acquisition for served scopes in
@@ -290,8 +296,10 @@ type SessionShimConfig struct {
 	AcquireRecoveryScopes func(context.Context, SessionShimHostAttestation) ([]SessionShimScopeCredentialReceipt, error)
 
 	// RequireAuthoritativeSnapshot declares that the composing external attach
-	// carrier needs fresh inspect/emit proxying. Selected v1 is still adopted and
-	// capacity-charged, but the carrier callback is not activated.
+	// carrier needs fresh inspect/emit proxying and the selected-v3 raw HostFrame
+	// rail. It also requires the exact hosted credential attestation. Selected v1
+	// and v2 are still adopted and capacity-charged, but their carrier callbacks
+	// are not activated.
 	RequireAuthoritativeSnapshot bool
 
 	// OrgID is the organization half of the lifecycle identity (§D2). A
@@ -420,9 +428,10 @@ type SessionShimConfig struct {
 	// OnSessionEvent.
 	OnSessionEventDurable func(sessionshim.Identity, sessionshim.ControllerEvent) error
 
-	// ResumeFrom returns the first output sequence this daemon still needs for a
-	// session (its durable last_forwarded_seq + 1). Nil resumes from the start of
-	// the stream, which can only over-replay, never under-replay.
+	// ResumeFrom returns the first output sequence the composing durable store
+	// still needs (its last_forwarded_seq + 1). Nil delegates to the shim's
+	// fsync-backed ACK sidecar, or the start of the stream when none exists. An
+	// explicit callback may advance but cannot regress that sidecar silently.
 	ResumeFrom func(orgID, sessionID string) uint64
 }
 
@@ -435,6 +444,9 @@ func (c SessionShimConfig) requiresStableHostIdentity() bool {
 func (c SessionShimConfig) validateSnapshotCarrier() error {
 	if !c.RequireAuthoritativeSnapshot {
 		return nil
+	}
+	if !c.RequireCredentialAttestation {
+		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs the exact hosted credential attestation", ErrSessionShimCarrierConfig)
 	}
 	if c.OnAdoption == nil || c.OnSessionEventDurable == nil || c.OnAdoptionBatch == nil || c.OnAdoptionPublished == nil {
 		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs OnAdoption, OnSessionEventDurable, OnAdoptionBatch, and OnAdoptionPublished", ErrSessionShimCarrierConfig)
@@ -628,6 +640,9 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	if err := cfg.validateSnapshotCarrier(); err != nil {
 		return err
 	}
+	if d.sessionShimAttestationErr != nil {
+		return d.sessionShimAttestationErr
+	}
 
 	// The §D8 inequality is validated at STARTUP, before any session is admitted.
 	// A configuration whose orphan bound can outlast an external release
@@ -654,9 +669,10 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	}
 
 	opts := sessionshim.AdoptOptions{
-		Registry:     registry,
-		ControllerID: d.controllerID(),
-		Logger:       slog.Default(),
+		Registry:              registry,
+		ControllerID:          d.controllerID(),
+		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimAttestationValue.enabled(),
+		Logger:                slog.Default(),
 	}
 	preparedByID := make(map[sessionshim.Identity]sessionshim.PreparedAdoption)
 	hostByID := make(map[sessionshim.Identity]string)
@@ -679,13 +695,6 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		resume := cfg.ResumeFrom
 		opts.ResumeFrom = func(id sessionshim.Identity) uint64 {
 			return resume(id.OrgID, id.SessionID)
-		}
-	} else {
-		// With no durable store configured, resume from what THIS process has
-		// forwarded — zero on a cold start, which replays from the beginning of
-		// the ring. Over-replay is always safe; under-replay is not (§D5).
-		opts.ResumeFrom = func(id sessionshim.Identity) uint64 {
-			return d.SessionShimForwardedSeq(id.OrgID, id.SessionID)
 		}
 	}
 	if cfg.ExpectedWorkarea != nil {
@@ -823,7 +832,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 							ShimID: hello.ShimID, ProcessEpoch: hello.ProcessEpoch,
 							ControllerGeneration: entry.adoption.ControllerGeneration,
 							ProtocolMin:          hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
-							Reason:           sessionshim.QuarantineAuthoritativeSnapshotUnsupported,
+							Reason:           sessionShimCarrierQuarantineReason(entry.adoption.CarrierIncompatibility),
 							ConsumesCapacity: true,
 						})
 					}
@@ -1116,7 +1125,7 @@ func (d *Daemon) prepareSessionShimAdoption(
 	hostID string,
 	evidence sessionshim.AdoptionPreparation,
 ) (sessionshim.PreparedAdoption, error) {
-	if d.sessionShimConfig().RequireAuthoritativeSnapshot && evidence.SelectedVersion < shimwire.V2 {
+	if d.sessionShimConfig().RequireAuthoritativeSnapshot && evidence.SelectedVersion < shimwire.V3 {
 		return sessionshim.PreparedAdoption{}, nil
 	}
 	hook := d.sessionShimConfig().PrepareAdoption
@@ -1161,25 +1170,21 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 			return SessionShimAdoptionEvidence{}, err
 		}
 	}
+	carrierCompatible, carrierIncompatibility := sessionShimCarrierCompatibility(d.sessionShimConfig(), ctrl)
 	return SessionShimAdoptionEvidence{
-		Identity:             ctrl.Identity(),
-		HostID:               hostID,
-		ControllerID:         ctrl.ControllerID(),
-		ShimID:               ctrl.Hello().ShimID,
-		ProcessEpoch:         ctrl.Hello().ProcessEpoch,
-		ControllerGeneration: uint64(ctrl.Generation()),
-		LastForwardedSeq:     lastForwarded,
-		Extensions:           cloneShimExtensions(ctrl.Adoption().Extensions),
-		PreparedCorrelation:  append([]byte(nil), prepared.Correlation...),
-		ObservedAtUnixNano:   d.shimNow().UnixNano(),
-		ProtocolVersion:      ctrl.SelectedVersion(),
-		CarrierCompatible:    !d.sessionShimConfig().RequireAuthoritativeSnapshot || ctrl.SupportsAuthoritativeSnapshot(),
-		CarrierIncompatibility: func() SessionShimCarrierIncompatibility {
-			if d.sessionShimConfig().RequireAuthoritativeSnapshot && !ctrl.SupportsAuthoritativeSnapshot() {
-				return SessionShimCarrierAuthoritativeSnapshotV2Required
-			}
-			return SessionShimCarrierCompatible
-		}(),
+		Identity:               ctrl.Identity(),
+		HostID:                 hostID,
+		ControllerID:           ctrl.ControllerID(),
+		ShimID:                 ctrl.Hello().ShimID,
+		ProcessEpoch:           ctrl.Hello().ProcessEpoch,
+		ControllerGeneration:   uint64(ctrl.Generation()),
+		LastForwardedSeq:       lastForwarded,
+		Extensions:             cloneShimExtensions(ctrl.Adoption().Extensions),
+		PreparedCorrelation:    append([]byte(nil), prepared.Correlation...),
+		ObservedAtUnixNano:     d.shimNow().UnixNano(),
+		ProtocolVersion:        ctrl.SelectedVersion(),
+		CarrierCompatible:      carrierCompatible,
+		CarrierIncompatibility: carrierIncompatibility,
 		SnapshotProxy: func() *SessionShimSnapshotProxy {
 			if ctrl.SupportsAuthoritativeSnapshot() {
 				proxy := &SessionShimSnapshotProxy{controller: ctrl, daemon: d, identity: ctrl.Identity()}
@@ -1189,6 +1194,26 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 			return nil
 		}(),
 	}, nil
+}
+
+func sessionShimCarrierCompatibility(cfg SessionShimConfig, ctrl *sessionshim.Controller) (bool, SessionShimCarrierIncompatibility) {
+	if !cfg.RequireAuthoritativeSnapshot {
+		return true, SessionShimCarrierCompatible
+	}
+	if !ctrl.SupportsAuthoritativeSnapshot() {
+		return false, SessionShimCarrierAuthoritativeSnapshotV2Required
+	}
+	if !ctrl.SupportsFullHostFrames() {
+		return false, SessionShimCarrierDurableHostFrameV3Required
+	}
+	return true, SessionShimCarrierCompatible
+}
+
+func sessionShimCarrierQuarantineReason(incompatibility SessionShimCarrierIncompatibility) sessionshim.QuarantineReason {
+	if incompatibility == SessionShimCarrierDurableHostFrameV3Required {
+		return sessionshim.QuarantineDurableHostFrameUnsupported
+	}
+	return sessionshim.QuarantineAuthoritativeSnapshotUnsupported
 }
 
 func (d *Daemon) completeSessionShimAdoption(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
@@ -1305,7 +1330,7 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 				ShimID: entry.shimID, ProcessEpoch: hello.ProcessEpoch,
 				ControllerGeneration: entry.adoption.ControllerGeneration,
 				ProtocolMin:          hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
-				Reason: sessionshim.QuarantineAuthoritativeSnapshotUnsupported, ConsumesCapacity: true,
+				Reason: sessionShimCarrierQuarantineReason(entry.adoption.CarrierIncompatibility), ConsumesCapacity: true,
 			})
 		}
 	}
@@ -1332,7 +1357,7 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 			OrgID: evidence.Identity.OrgID, SessionID: evidence.Identity.SessionID,
 			ShimID: evidence.ShimID, ProcessEpoch: evidence.ProcessEpoch,
 			ControllerGeneration: evidence.ControllerGeneration,
-			Reason:               sessionshim.QuarantineAuthoritativeSnapshotUnsupported, ConsumesCapacity: true,
+			Reason:               sessionShimCarrierQuarantineReason(evidence.CarrierIncompatibility), ConsumesCapacity: true,
 		})
 	}
 	sort.Slice(batch.Adopted, func(i, j int) bool {
@@ -1536,7 +1561,8 @@ func (d *Daemon) failPendingSessionShimActivations() {
 func (d *Daemon) retainStagedSessionShimSnapshot(id sessionshim.Identity, event sessionshim.ControllerEvent) (*shimAdoptionGate, bool) {
 	d.shims.mu.Lock()
 	defer d.shims.mu.Unlock()
-	if !d.shims.stagingSnapshots[id] || event.Kind != sessionshim.EventSnapshotFrame {
+	if !d.shims.stagingSnapshots[id] || event.Kind != sessionshim.EventHostFrame ||
+		event.FrameType != attachwire.TypeSnapshot || event.RequestID == 0 {
 		return nil, false
 	}
 	delete(d.shims.stagingSnapshots, id)
@@ -1547,6 +1573,13 @@ func (d *Daemon) retainStagedSessionShimSnapshot(id sessionshim.Identity, event 
 	return d.shims.activationGates[id], true
 }
 
+func (d *Daemon) isStagedSessionShimSnapshot(id sessionshim.Identity, event sessionshim.ControllerEvent) bool {
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	return d.shims.stagingSnapshots[id] && event.Kind == sessionshim.EventHostFrame &&
+		event.FrameType == attachwire.TypeSnapshot && event.RequestID != 0
+}
+
 func (d *Daemon) waitStagedSessionShimSnapshot(ctx context.Context, id sessionshim.Identity, sequence uint64) error {
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
@@ -1555,7 +1588,8 @@ func (d *Daemon) waitStagedSessionShimSnapshot(ctx context.Context, id sessionsh
 		event, ok := d.shims.pendingSnapshots[id]
 		d.shims.mu.RUnlock()
 		if ok {
-			if event.Kind != sessionshim.EventSnapshotFrame || event.Seq != sequence {
+			if event.Kind != sessionshim.EventHostFrame || event.FrameType != attachwire.TypeSnapshot ||
+				event.RequestID == 0 || event.Seq != sequence {
 				return errors.New("session shim: staged mandatory Snapshot does not match the emitting result")
 			}
 			return nil
@@ -1675,7 +1709,8 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 		}
 		event, ok := d.shims.pendingSnapshots[id]
 		entry, adopted := d.shims.adopted[id]
-		if !ok || !adopted || event.Kind != sessionshim.EventSnapshotFrame || activation.AckSeq != event.Seq {
+		if !ok || !adopted || event.Kind != sessionshim.EventHostFrame ||
+			event.FrameType != attachwire.TypeSnapshot || event.RequestID == 0 || activation.AckSeq != event.Seq {
 			d.shims.mu.Unlock()
 			return fmt.Errorf("session shim: carrier_active ack did not exactly resolve the staged Snapshot for %s", id)
 		}
@@ -1687,13 +1722,29 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 		d.shims.mu.Unlock()
 		return errors.New("session shim: carrier activation left a staged Snapshot unresolved")
 	}
+	d.shims.mu.Unlock()
 	for _, snapshot := range resolved {
+		var acknowledger sessionShimCursorAcknowledger
+		if snapshot.ctrl != nil {
+			acknowledger = snapshot.ctrl
+		}
+		if err := d.recordShimForwardedSeqForController(snapshot.id, acknowledger, snapshot.event.Seq); err != nil {
+			return fmt.Errorf("session shim: persist staged Snapshot acknowledgement for %s: %w", snapshot.id, err)
+		}
+	}
+	d.shims.mu.Lock()
+	for _, snapshot := range resolved {
+		current, pending := d.shims.pendingSnapshots[snapshot.id]
+		if !pending || current.Seq != snapshot.event.Seq || current.RequestID != snapshot.event.RequestID ||
+			d.shims.activationGates[snapshot.id] != snapshot.gate {
+			d.shims.mu.Unlock()
+			return fmt.Errorf("session shim: staged Snapshot changed while persisting acknowledgement for %s", snapshot.id)
+		}
 		delete(d.shims.pendingSnapshots, snapshot.id)
 		delete(d.shims.activationGates, snapshot.id)
 	}
 	d.shims.mu.Unlock()
 	for _, snapshot := range resolved {
-		d.recordShimForwardedSeqForController(snapshot.id, snapshot.ctrl, snapshot.event.Seq)
 		snapshot.gate.finish(true)
 	}
 	d.shims.mu.Lock()
@@ -1825,7 +1876,7 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 			OrgID: id.OrgID, SessionID: id.SessionID, ShimID: entry.shimID,
 			ProcessEpoch: hello.ProcessEpoch, ControllerGeneration: strconv.FormatUint(entry.adoption.ControllerGeneration, 10),
 			ProtocolMin: hello.Min, ProtocolMax: hello.Max,
-			Reason: string(sessionshim.QuarantineAuthoritativeSnapshotUnsupported), ConsumesCapacity: true,
+			Reason: string(sessionShimCarrierQuarantineReason(entry.adoption.CarrierIncompatibility)), ConsumesCapacity: true,
 		})
 	}
 	d.shims.mu.RUnlock()
@@ -1877,8 +1928,8 @@ func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 			correlation.ProtocolMax = hello.Max
 			correlation.ProtocolVersion = entry.controller.SelectedVersion()
 			correlation.AuthoritativeSnapshot = entry.controller.SupportsAuthoritativeSnapshot()
-			if cfg.RequireAuthoritativeSnapshot && !entry.controller.SupportsAuthoritativeSnapshot() {
-				correlation.CarrierIncompatibility = string(SessionShimCarrierAuthoritativeSnapshotV2Required)
+			if cfg.RequireAuthoritativeSnapshot && !entry.adoption.CarrierCompatible {
+				correlation.CarrierIncompatibility = string(entry.adoption.CarrierIncompatibility)
 			}
 			correlation.Phase = string(hello.Phase)
 		}

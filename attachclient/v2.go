@@ -34,6 +34,12 @@ type V2HostConfig struct {
 	// the safe over-replay default.
 	DurableHighWater uint64
 
+	// ResumeDisposition is explicit caller-retained evidence for reconnecting the
+	// same authenticated carrier epoch after a client/relay process restart.
+	// Nil is the normal fresh-candidate posture. A non-nil value never weakens the
+	// fresh path: it is validated exactly and suppresses a duplicate Snapshot.
+	ResumeDisposition *V2ResumeDisposition
+
 	// Authority callbacks are invoked only after carrier_active. Before that,
 	// Input/Resize/Kill are refused locally even if a non-conforming relay sends
 	// them. SnapshotRequest is separate because exactly one mandatory resync is
@@ -42,6 +48,39 @@ type V2HostConfig struct {
 	OnResize          func(context.Context, attachwire.ResizePayload) error
 	OnKill            func(context.Context, attachwire.Kill) error
 	OnSnapshotRequest func(context.Context, attachwire.SnapshotRequest) error
+}
+
+// V2ResumeState is the closed durable carrier-reload posture.
+type V2ResumeState string
+
+const (
+	// V2ResumeReceiptStored resumes a pre-active candidate whose exact mandatory
+	// Snapshot and frozen receipt already exist durably at the relay.
+	V2ResumeReceiptStored V2ResumeState = "receipt_stored"
+	// V2ResumeActive resumes an already-active equal carrier at journal high-water.
+	V2ResumeActive V2ResumeState = "active"
+)
+
+// V2ResumeDisposition carries only the exact non-secret evidence needed to
+// reconnect the already-prepared equal carrier inside the current composing
+// daemon without generating another mandatory Snapshot. It is not replacement-
+// daemon adoption authority: a replacement controller id/generation performs a
+// fresh prepare and the ordinary mandatory-Snapshot path.
+//
+// For receipt_stored, AckSeq is the pre-staged daemon/shim cursor while
+// CandidateSnapshotSeq and CandidateSnapshot identify the already-journaled
+// raw Snapshot. A persisted host_gap may make CandidateSnapshotSeq > AckSeq+1.
+// The Relay-private request UUID is deliberately absent because the ratified
+// host wire never exposes it; Relay binds that correlation internally. PTYEpoch
+// and CarrierEpoch must exactly equal the authenticated token claims in both
+// states. For active, candidate-specific fields are absent.
+type V2ResumeDisposition struct {
+	State                V2ResumeState
+	PTYEpoch             uint64
+	CarrierEpoch         uint64
+	AckSeq               uint64
+	CandidateSnapshotSeq uint64
+	CandidateSnapshot    []byte
 }
 
 func (c *V2HostConfig) withDefaults() error {
@@ -66,7 +105,52 @@ func (c *V2HostConfig) withDefaults() error {
 	if c.Now == nil {
 		c.Now = time.Now
 	}
+	if c.ResumeDisposition != nil {
+		resume := cloneV2ResumeDisposition(*c.ResumeDisposition)
+		if err := validateV2ResumeDisposition(resume); err != nil {
+			return err
+		}
+		if c.DurableHighWater != 0 && c.DurableHighWater != resume.AckSeq {
+			return errors.New("attachclient: v2 resume acknowledged cursor conflicts with DurableHighWater")
+		}
+		c.DurableHighWater = resume.AckSeq
+		c.ResumeDisposition = &resume
+	}
 	return nil
+}
+
+func cloneV2ResumeDisposition(in V2ResumeDisposition) V2ResumeDisposition {
+	in.CandidateSnapshot = append([]byte(nil), in.CandidateSnapshot...)
+	return in
+}
+
+func validateV2ResumeDisposition(resume V2ResumeDisposition) error {
+	if resume.CarrierEpoch == 0 {
+		return errors.New("attachclient: v2 resume carrier epoch is required")
+	}
+	switch resume.State {
+	case V2ResumeActive:
+		if resume.AckSeq == 0 || resume.CandidateSnapshotSeq != 0 || len(resume.CandidateSnapshot) != 0 {
+			return errors.New("attachclient: active v2 resume disposition is not exact")
+		}
+		return nil
+	case V2ResumeReceiptStored:
+		if resume.CandidateSnapshotSeq <= resume.AckSeq || len(resume.CandidateSnapshot) == 0 {
+			return errors.New("attachclient: receipt-stored v2 resume disposition is incomplete")
+		}
+		frame, err := attachwire.DecodeFrame(resume.CandidateSnapshot)
+		if err != nil || !bytes.Equal(frame.Encode(), resume.CandidateSnapshot) ||
+			frame.Type != attachwire.TypeSnapshot || frame.Seq != resume.CandidateSnapshotSeq {
+			return errors.New("attachclient: receipt-stored v2 resume Snapshot is not exact")
+		}
+		envelope, err := attachwire.DecodeSnapshotEnvelope(frame.Payload)
+		if err != nil || envelope.AtSeq != frame.Seq-1 {
+			return errors.New("attachclient: receipt-stored v2 resume Snapshot correlation is not exact")
+		}
+		return nil
+	default:
+		return errors.New("attachclient: unknown v2 resume disposition")
+	}
 }
 
 // V2HostCandidate is one authenticated exact v2 leg. Its methods are safe for
@@ -76,14 +160,26 @@ type V2HostCandidate struct {
 	claims v2HostClaims
 	conn   *websocket.Conn
 
-	writeMu    sync.Mutex
-	durableMu  sync.Mutex
-	mu         sync.Mutex
-	closed     bool
-	err        error
-	active     bool
-	ackSeq     uint64
-	ackVersion uint64
+	writeMu   sync.Mutex
+	durableMu sync.Mutex
+	mu        sync.Mutex
+	closed    bool
+	err       error
+	// remoteActive is the exact carrier_active evidence. active is the separate
+	// composing-daemon local-publication release and gates authority callbacks.
+	remoteActive bool
+	active       bool
+	// One shared activation flight makes concurrent callers observe one wire
+	// request and one immutable completion. The first local call is also the
+	// publication release; remote evidence alone never opens authority callbacks.
+	activationStarted bool
+	activationDone    chan struct{}
+	activationAck     uint64
+	activationErr     error
+	localActiveCh     chan struct{}
+	localActiveOnce   sync.Once
+	ackSeq            uint64
+	ackVersion        uint64
 	// highestSent is the highest sequence-bearing raw frame written on this leg.
 	highestSent         uint64
 	gapTo               uint64
@@ -92,6 +188,7 @@ type V2HostCandidate struct {
 	snapshotRequestSeen bool
 	pendingSeq          uint64
 	pendingRaw          []byte
+	resumeDisposition   *V2ResumeDisposition
 	notify              chan struct{}
 	closedCh            chan struct{}
 
@@ -114,6 +211,10 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 	if err != nil {
 		return nil, err
 	}
+	if cfg.ResumeDisposition != nil &&
+		(cfg.ResumeDisposition.PTYEpoch != claims.Epoch || cfg.ResumeDisposition.CarrierEpoch != claims.CarrierEpoch) {
+		return nil, errors.New("attachclient: v2 resume disposition does not match the authenticated carrier")
+	}
 	dialCtx, cancelDial := context.WithTimeout(ctx, cfg.DialTimeout)
 	conn, _, err := websocket.Dial(dialCtx, cfg.AttachURL, &websocket.DialOptions{
 		HTTPClient:   cfg.HTTPClient,
@@ -134,7 +235,21 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 	candidate := &V2HostCandidate{
 		cfg: cfg, claims: claims, conn: conn, notify: make(chan struct{}),
 		closedCh: make(chan struct{}), ackSeq: cfg.DurableHighWater, highestSent: cfg.DurableHighWater,
-		snapshotRequests: make(chan attachwire.SnapshotRequest, 1), cancel: cancel,
+		snapshotRequests: make(chan attachwire.SnapshotRequest, 1), localActiveCh: make(chan struct{}), cancel: cancel,
+	}
+	if cfg.ResumeDisposition != nil {
+		resume := cloneV2ResumeDisposition(*cfg.ResumeDisposition)
+		candidate.resumeDisposition = &resume
+		switch resume.State {
+		case V2ResumeReceiptStored:
+			candidate.candidateSent = true
+			candidate.snapshotRequestSeen = true
+			candidate.highestSent = resume.CandidateSnapshotSeq
+			candidate.pendingSeq = resume.CandidateSnapshotSeq
+			candidate.pendingRaw = append([]byte(nil), resume.CandidateSnapshot...)
+		case V2ResumeActive:
+			candidate.highestSent = resume.AckSeq
+		}
 	}
 	subscribe, err := attachwirev2.BuildControlFrame(attachwire.Subscribe{
 		SessionID: claims.SessionID, AsRole: attachwire.RoleHost,
@@ -163,6 +278,12 @@ func int64Pointer(value uint64) *int64 {
 // WaitMandatorySnapshotRequest returns the one pre-active resync request. A
 // second request before activation is a terminal protocol error.
 func (c *V2HostCandidate) WaitMandatorySnapshotRequest(ctx context.Context) (attachwire.SnapshotRequest, error) {
+	c.mu.Lock()
+	resuming := c.resumeDisposition != nil
+	c.mu.Unlock()
+	if resuming {
+		return attachwire.SnapshotRequest{}, errors.New("attachclient: resumed v2 carrier must not request another mandatory Snapshot")
+	}
 	select {
 	case request := <-c.snapshotRequests:
 		if request.Reason != attachwire.ReasonResync {
@@ -188,7 +309,7 @@ func (c *V2HostCandidate) SendCandidateSnapshot(ctx context.Context, raw []byte)
 		return errors.New("attachclient: v2 candidate requires an exact sequence-bearing Snapshot frame")
 	}
 	c.mu.Lock()
-	if c.closed || c.active || c.candidateSent || !c.snapshotRequestSeen {
+	if c.closed || c.resumeDisposition != nil || c.active || c.candidateSent || !c.snapshotRequestSeen {
 		c.mu.Unlock()
 		return errors.New("attachclient: v2 candidate Snapshot is late, duplicate, or unavailable")
 	}
@@ -223,7 +344,7 @@ func (c *V2HostCandidate) DeclareHostGap(ctx context.Context, fromSeq, toSeq uin
 		return errors.New("attachclient: invalid v2 host gap")
 	}
 	c.mu.Lock()
-	if c.closed || c.gapPending || fromSeq != c.ackSeq+1 {
+	if c.closed || c.resumeDisposition != nil || c.pendingSeq != 0 || c.gapPending || fromSeq != c.ackSeq+1 {
 		c.mu.Unlock()
 		return errors.New("attachclient: v2 host gap does not begin at the contiguous durable cursor")
 	}
@@ -250,41 +371,76 @@ func (c *V2HostCandidate) DeclareHostGap(ctx context.Context, fromSeq, toSeq uin
 // resolves the pre-active Snapshot when it covers that sequence.
 func (c *V2HostCandidate) Activate(ctx context.Context) (uint64, error) {
 	c.mu.Lock()
-	if c.closed || !c.candidateSent {
+	resumeActive := c.resumeDisposition != nil && c.resumeDisposition.State == V2ResumeActive
+	if c.active {
+		ack := c.ackSeq
+		c.mu.Unlock()
+		return ack, nil
+	}
+	if c.closed || (!resumeActive && !c.candidateSent) {
 		c.mu.Unlock()
 		return 0, errors.New("attachclient: carrier_activate requires the mandatory candidate Snapshot")
 	}
+	first := !c.activationStarted
+	if first {
+		c.activationStarted = true
+		c.activationDone = make(chan struct{})
+		if c.remoteActive {
+			c.completeActivationLocked(nil)
+		}
+	}
+	done := c.activationDone
 	c.mu.Unlock()
-	control, err := attachwirev2.BuildControlFrame(attachwirev2.CarrierActivate{
-		PTYEpoch:     attachwirev2.DecimalUint64(c.claims.Epoch),
-		CarrierEpoch: attachwirev2.DecimalUint64(c.claims.CarrierEpoch),
-	})
-	if err != nil {
-		return 0, err
+	if first && !resumeActive {
+		control, err := attachwirev2.BuildControlFrame(attachwirev2.CarrierActivate{
+			PTYEpoch:     attachwirev2.DecimalUint64(c.claims.Epoch),
+			CarrierEpoch: attachwirev2.DecimalUint64(c.claims.CarrierEpoch),
+		})
+		if err != nil {
+			c.completeActivation(err)
+			return 0, err
+		}
+		if err := c.writeRaw(ctx, control.Encode()); err != nil {
+			activationErr := fmt.Errorf("attachclient: carrier_activate: %w", err)
+			c.completeActivation(activationErr)
+			return 0, activationErr
+		}
 	}
-	if err := c.writeRaw(ctx, control.Encode()); err != nil {
-		return 0, fmt.Errorf("attachclient: carrier_activate: %w", err)
-	}
-	for {
+	select {
+	case <-done:
 		c.mu.Lock()
-		if c.active {
-			ack := c.ackSeq
-			c.mu.Unlock()
-			return ack, nil
-		}
-		if c.closed {
-			err := c.err
-			c.mu.Unlock()
-			return 0, terminalV2Error(err)
-		}
-		notify := c.notify
+		ack, err := c.activationAck, c.activationErr
 		c.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-notify:
-		}
+		return ack, err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-c.done():
+		return 0, c.terminalError()
 	}
+}
+
+func (c *V2HostCandidate) completeActivation(err error) {
+	c.mu.Lock()
+	c.completeActivationLocked(err)
+	c.mu.Unlock()
+}
+
+func (c *V2HostCandidate) completeActivationLocked(err error) {
+	if !c.activationStarted || c.activationErr != nil || c.active {
+		return
+	}
+	if err != nil {
+		c.activationErr = err
+		close(c.activationDone)
+		return
+	}
+	if !c.remoteActive {
+		return
+	}
+	c.active = true
+	c.activationAck = c.ackSeq
+	c.localActiveOnce.Do(func() { close(c.localActiveCh) })
+	close(c.activationDone)
 }
 
 // SendRawFrameDurable writes exact source bytes and returns nil only after the
@@ -400,7 +556,21 @@ func (c *V2HostCandidate) handleV2Inbound(ctx context.Context, frame attachwire.
 		case attachwire.SnapshotRequest:
 			c.mu.Lock()
 			active := c.active
+			resumeActive := c.resumeDisposition != nil && c.resumeDisposition.State == V2ResumeActive
+			waitForPublication := !active && c.remoteActive && (c.activationStarted || resumeActive)
+			c.mu.Unlock()
+			if waitForPublication {
+				if err := c.waitForLocalAuthority(ctx); err != nil {
+					return err
+				}
+				active = true
+			}
+			c.mu.Lock()
 			if !active {
+				if c.resumeDisposition != nil {
+					c.mu.Unlock()
+					return errors.New("attachclient: resumed v2 carrier received a duplicate mandatory Snapshot request")
+				}
 				if c.snapshotRequestSeen {
 					c.mu.Unlock()
 					return errors.New("attachclient: v2 candidate received more than one mandatory Snapshot request")
@@ -425,8 +595,8 @@ func (c *V2HostCandidate) handleV2Inbound(ctx context.Context, frame attachwire.
 		case attachwirev2.HostAck:
 			return c.acceptHostAck(typed)
 		case attachwire.Kill:
-			if !c.isActive() {
-				return errors.New("attachclient: v2 candidate received Kill before carrier_active")
+			if err := c.waitForLocalAuthority(ctx); err != nil {
+				return err
 			}
 			if c.cfg.OnKill != nil {
 				return c.cfg.OnKill(ctx, typed)
@@ -438,8 +608,8 @@ func (c *V2HostCandidate) handleV2Inbound(ctx context.Context, frame attachwire.
 			return nil
 		}
 	}
-	if !c.isActive() {
-		return errors.New("attachclient: v2 candidate received an authority-bearing frame before carrier_active")
+	if err := c.waitForLocalAuthority(ctx); err != nil {
+		return err
 	}
 	switch frame.Type {
 	case attachwire.TypeInput:
@@ -469,16 +639,31 @@ func (c *V2HostCandidate) acceptCarrierActive(message attachwirev2.CarrierActive
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ack := uint64(message.AckSeq)
-	if !c.candidateSent || ack != c.highestSent || (c.active && ack < c.ackSeq) {
+	expectedAck := c.highestSent
+	canActivate := c.candidateSent
+	allowBeforeLocalRequest := false
+	if c.resumeDisposition != nil {
+		switch c.resumeDisposition.State {
+		case V2ResumeActive:
+			canActivate = true
+			allowBeforeLocalRequest = true
+			expectedAck = c.resumeDisposition.AckSeq
+		case V2ResumeReceiptStored:
+			expectedAck = c.resumeDisposition.CandidateSnapshotSeq
+		}
+	}
+	if !canActivate || (!allowBeforeLocalRequest && !c.activationStarted) ||
+		ack != expectedAck || (c.remoteActive && ack != c.ackSeq) {
 		return errors.New("attachclient: carrier_active cursor is outside the exact sent stream")
 	}
-	c.active = true
+	c.remoteActive = true
 	c.ackSeq = ack
 	c.ackVersion++
 	if c.pendingSeq != 0 && ack >= c.pendingSeq {
 		c.pendingSeq = 0
 		c.pendingRaw = nil
 	}
+	c.completeActivationLocked(nil)
 	c.signalLocked()
 	return nil
 }
@@ -503,10 +688,28 @@ func (c *V2HostCandidate) acceptHostAck(message attachwirev2.HostAck) error {
 	return nil
 }
 
-func (c *V2HostCandidate) isActive() bool {
+func (c *V2HostCandidate) waitForLocalAuthority(ctx context.Context) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.active
+	if c.active {
+		c.mu.Unlock()
+		return nil
+	}
+	resumeActive := c.resumeDisposition != nil && c.resumeDisposition.State == V2ResumeActive
+	allowed := c.remoteActive && (c.activationStarted || resumeActive)
+	localActive := c.localActiveCh
+	closed := c.closedCh
+	c.mu.Unlock()
+	if !allowed || localActive == nil {
+		return errors.New("attachclient: v2 candidate received authority before local publication")
+	}
+	select {
+	case <-localActive:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-closed:
+		return c.terminalError()
+	}
 }
 
 func (c *V2HostCandidate) writeRaw(ctx context.Context, raw []byte) error {
@@ -525,6 +728,7 @@ func (c *V2HostCandidate) fail(err error) {
 	if !c.closed {
 		c.closed = true
 		c.err = err
+		c.completeActivationLocked(terminalV2Error(err))
 		close(c.closedCh)
 		c.signalLocked()
 	}

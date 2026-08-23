@@ -22,6 +22,27 @@ type SessionShimHostAttestation struct {
 	Capabilities []string `json:"sessionShimCapabilities,omitempty"`
 }
 
+// The closed hosted session-shim capability vocabulary. The canonical tuple is
+// the lexical complete set returned by RequiredSessionShimHostCapabilities.
+const (
+	SessionShimCapabilityAuthoritativeSnapshotV2   = "authoritative_snapshot_v2"
+	SessionShimCapabilityCarrierEpochPrepareCommit = "carrier_epoch_prepare_commit"
+	SessionShimCapabilityFullHostFrameV3           = "full_host_frame_v3"
+	SessionShimCapabilityInteractiveAttachV2       = "interactive_attach_v2"
+)
+
+var requiredSessionShimHostCapabilities = []string{
+	SessionShimCapabilityAuthoritativeSnapshotV2,
+	SessionShimCapabilityCarrierEpochPrepareCommit,
+	SessionShimCapabilityFullHostFrameV3,
+	SessionShimCapabilityInteractiveAttachV2,
+}
+
+// RequiredSessionShimHostCapabilities returns the canonical closed hosted set.
+func RequiredSessionShimHostCapabilities() []string {
+	return append([]string(nil), requiredSessionShimHostCapabilities...)
+}
+
 // SessionShimCredentialReceipt is the exact non-secret authority receipt a
 // registration or refresh response must return before its credential can be
 // installed or cached for hosted session-shim recovery.
@@ -150,11 +171,14 @@ func (a SessionShimHostAttestation) validate() error {
 	if a.ControllerID == "" || strings.TrimSpace(a.ControllerID) != a.ControllerID {
 		return errors.New("session shim attestation: controller id is required without surrounding whitespace")
 	}
-	if a.ProtocolMin == 0 || a.ProtocolMax < a.ProtocolMin {
+	if a.ProtocolMin != 1 || a.ProtocolMax < 3 || a.ProtocolMax < a.ProtocolMin {
 		return fmt.Errorf("session shim attestation: invalid protocol range [%d,%d]", a.ProtocolMin, a.ProtocolMax)
 	}
 	if !canonicalStringSet(a.Capabilities) {
 		return errors.New("session shim attestation: capabilities must be sorted, duplicate-free, and non-empty values")
+	}
+	if !equalStrings(a.Capabilities, requiredSessionShimHostCapabilities) {
+		return errors.New("session shim attestation: capabilities must be the exact closed hosted set")
 	}
 	return nil
 }
@@ -262,4 +286,16 @@ func canonicalizeStringSet(values []string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

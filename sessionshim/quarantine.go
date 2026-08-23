@@ -57,6 +57,9 @@ const (
 	// QuarantineAuthoritativeSnapshotUnsupported is a composing-carrier outcome,
 	// not a local ownership refusal. Selected v1 remains locally adopted.
 	QuarantineAuthoritativeSnapshotUnsupported QuarantineReason = "authoritative_snapshot_unsupported"
+	// QuarantineDurableHostFrameUnsupported is selected-v2 ownership/snapshot
+	// conservation without the exact full host-frame rail required by D14.
+	QuarantineDurableHostFrameUnsupported QuarantineReason = "durable_host_frame_unsupported"
 )
 
 // Known reports whether r is an assigned v1 quarantine reason.
@@ -65,7 +68,8 @@ func (r QuarantineReason) Known() bool {
 	case QuarantineProtocolMismatch, QuarantineRecordMalformed, QuarantineDuplicateIdentity,
 		QuarantineIdentityMismatch, QuarantineUnauthenticated, QuarantinePhaseUnknown,
 		QuarantineGenerationNotAdvanced, QuarantineSocketUnreachable, QuarantineAdoptionFailed,
-		QuarantineGroupReapUnproven, QuarantineAuthoritativeSnapshotUnsupported:
+		QuarantineGroupReapUnproven, QuarantineAuthoritativeSnapshotUnsupported,
+		QuarantineDurableHostFrameUnsupported:
 		return true
 	default:
 		return false

@@ -28,6 +28,7 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 	d := f.daemon
 	d.opts.SessionShim.HostID = "host-takeover-snapshot"
 	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	enableHostedFullHostFramesForTest(t, d, "test-org")
 	d.opts.SessionShim.CallbackTimeout = 500 * time.Millisecond
 	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 		return sessionshim.PreparedAdoption{
@@ -36,9 +37,11 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 		}, nil
 	}
 	var emitted shimwire.SnapshotResult
+	var staged sessionshim.ControllerEvent
+	var stagedMu sync.Mutex
 	var retainedProxy *SessionShimSnapshotProxy
 	d.opts.SessionShim.OnAdoption = func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
-		if evidence.SnapshotProxy == nil || !evidence.CarrierCompatible || evidence.ProtocolVersion != shimwire.V2 {
+		if evidence.SnapshotProxy == nil || !evidence.CarrierCompatible || evidence.ProtocolVersion != shimwire.V3 {
 			return SessionShimAdoptionReceipt{}, fmt.Errorf("snapshot capability missing during adoption: %+v", evidence)
 		}
 		retainedProxy = evidence.SnapshotProxy
@@ -49,7 +52,14 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 		}
 		return SessionShimAdoptionReceipt{DurableCorrelation: []byte("carrier-takeover-complete")}, nil
 	}
-	d.opts.SessionShim.OnSessionEventDurable = func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil }
+	d.opts.SessionShim.OnSessionEventDurable = func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
+		if event.Kind == sessionshim.EventHostFrame && event.FrameType == attachwire.TypeSnapshot && event.RequestID != 0 {
+			stagedMu.Lock()
+			staged = event
+			stagedMu.Unlock()
+		}
+		return nil
+	}
 	d.opts.SessionShim.OnAdoptionBatch = func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 		return SessionShimAdoptionBatchReceipt{
 			DurableCorrelation: []byte("snapshot-batch"), AdoptionRevision: "snapshot-revision",
@@ -59,8 +69,11 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 		if _, err := d.adoptedShimEntry(f.orgID, "takeover-snapshot"); err != nil {
 			return nil, fmt.Errorf("activation ran before local publication: %w", err)
 		}
+		stagedMu.Lock()
+		ackSeq := staged.Seq
+		stagedMu.Unlock()
 		return []SessionShimCarrierActivationReceipt{{
-			Activation: publication.Carriers[0], AckSeq: emitted.AtSeq + 1,
+			Activation: publication.Carriers[0], AckSeq: ackSeq,
 		}}, nil
 	}
 
@@ -68,8 +81,12 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 	if _, err := d.spawner.AcceptWork(spec); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
 	}
-	frame, err := attachwire.DecodeFrame(emitted.Bytes)
-	if err != nil || frame.Type != attachwire.TypeSnapshot || !emitted.InStream {
+	stagedMu.Lock()
+	stagedEvent := staged
+	stagedMu.Unlock()
+	frame, err := attachwire.DecodeFrame(stagedEvent.FrameBytes)
+	if err != nil || frame.Type != attachwire.TypeSnapshot || !emitted.InStream || len(emitted.Bytes) != 0 ||
+		stagedEvent.Seq != emitted.AtSeq+1 || stagedEvent.RequestID == 0 {
 		t.Fatalf("callback emit = frame %+v result %+v err=%v", frame, emitted, err)
 	}
 	entry, err := d.adoptedShimEntry(f.orgID, spec.SessionID)
@@ -90,6 +107,10 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 
 func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *testing.T) {
 	f := newShimSpawnFixture(t)
+	// This fixture deliberately leaves the first controller without a durable
+	// callback so no ACK sidecar trims the >64-frame replay the replacement is
+	// meant to drain.
+	f.daemon.opts.SessionShim.OnSessionEventDurable = nil
 	spec := f.interactiveSpec("takeover-large-replay")
 	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
 		t.Fatal(err)
@@ -103,6 +124,7 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 	var durableCount int
 	var durableSeq uint64
 	var emitted shimwire.SnapshotResult
+	var staged sessionshim.ControllerEvent
 	var durableMu sync.Mutex
 	var activationObservedForwarded uint64
 	var replacement *Daemon
@@ -111,6 +133,8 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 		SessionShim: SessionShimConfig{
 			EnableAdoption: true, RegistryDir: f.registry,
 			HostID: "host-large-replay", RequireAuthoritativeSnapshot: true,
+			RequireCredentialAttestation: true,
+			AttestationCapabilities:      RequiredSessionShimHostCapabilities(),
 			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 				return sessionshim.PreparedAdoption{
 					ControllerGeneration: preparation.CurrentControllerGeneration + 1,
@@ -120,12 +144,19 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 			OnSessionEventDurable: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
 				durableMu.Lock()
 				defer durableMu.Unlock()
-				if event.Kind == sessionshim.EventOutput || event.Kind == sessionshim.EventSnapshotFrame {
+				if event.Kind == sessionshim.EventHostFrame {
 					if event.Seq <= durableSeq {
 						return fmt.Errorf("durable stream reordered: %d after %d", event.Seq, durableSeq)
 					}
+					frame, err := attachwire.DecodeFrame(event.FrameBytes)
+					if err != nil || frame.Seq != event.Seq || !bytes.Equal(frame.Encode(), event.FrameBytes) {
+						return fmt.Errorf("durable stream lost exact frame %d: %v", event.Seq, err)
+					}
 					durableSeq = event.Seq
 					durableCount++
+					if event.FrameType == attachwire.TypeSnapshot && event.RequestID != 0 {
+						staged = event
+					}
 				}
 				return nil
 			},
@@ -137,7 +168,7 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 				}
 				durableMu.Lock()
 				defer durableMu.Unlock()
-				if durableCount <= 64 || durableSeq != emitted.AtSeq {
+				if durableCount <= 64 || durableSeq != emitted.AtSeq+1 || staged.Seq != emitted.AtSeq+1 {
 					return SessionShimAdoptionReceipt{}, fmt.Errorf("replay/staged split = count=%d seq=%d snapshot=%d", durableCount, durableSeq, emitted.AtSeq+1)
 				}
 				return SessionShimAdoptionReceipt{DurableCorrelation: []byte("large-replay-complete")}, nil
@@ -155,13 +186,17 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 			},
 		},
 	})
+	enableHostedFullHostFramesForTest(t, replacement, "test-org")
 	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := replacement.adoptSessionShims(ctx); err != nil {
 		t.Fatalf("replacement adoption with >64 replay frames: %v", err)
 	}
-	if len(emitted.Bytes) == 0 || !emitted.InStream {
+	durableMu.Lock()
+	stagedEvent := staged
+	durableMu.Unlock()
+	if len(emitted.Bytes) != 0 || !emitted.InStream || len(stagedEvent.FrameBytes) == 0 || stagedEvent.Seq != emitted.AtSeq+1 {
 		t.Fatalf("takeover emitted snapshot = %+v", emitted)
 	}
 	if activationObservedForwarded >= emitted.AtSeq+1 {
@@ -319,6 +354,31 @@ func (r *shimEventRecorder) output(id sessionshim.Identity) (string, uint64) {
 		return b.String(), r.seq[key]
 	}
 	return "", r.seq[key]
+}
+
+func enableHostedFullHostFramesForTest(t *testing.T, d *Daemon, scopes ...string) {
+	t.Helper()
+	d.opts.SessionShim.RequireCredentialAttestation = true
+	d.opts.SessionShim.AttestationCapabilities = RequiredSessionShimHostCapabilities()
+	d.sessionShimAttestationValue, d.sessionShimAttestationErr = resolveSessionShimHostAttestation(
+		d.opts.SessionShim,
+		d.controllerID(),
+	)
+	if d.sessionShimAttestationErr != nil {
+		t.Fatalf("resolve hosted full-frame attestation: %v", d.sessionShimAttestationErr)
+	}
+	if len(scopes) == 0 {
+		scopes = []string{d.sessionShimConfig().orgID()}
+	}
+	receipts := make([]SessionShimScopeCredentialReceipt, 0, len(scopes))
+	for _, scope := range scopes {
+		receipts = append(receipts, SessionShimScopeCredentialReceipt{
+			Scope: scope, WorkerHostID: d.sessionShimConfig().HostID, AdoptionRevision: "test-recovery-revision",
+		})
+	}
+	if err := d.retainSessionShimCredentialReceipts(receipts); err != nil {
+		t.Fatalf("retain hosted full-frame receipt: %v", err)
+	}
 }
 
 func newShimSpawnFixture(t *testing.T) *shimSpawnFixture {
@@ -548,6 +608,7 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 	d := f.daemon
 	d.opts.SessionShim.HostID = "host-callback"
 	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	enableHostedFullHostFramesForTest(t, d, "org-callback")
 	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 		if preparation.Identity.OrgID != "org-callback" || preparation.HostID != "host-callback" ||
 			preparation.ShimID == "" || preparation.ProcessEpoch == 0 {
@@ -564,6 +625,7 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 	}
 	var adoption SessionShimAdoptionEvidence
 	var emitted shimwire.SnapshotResult
+	var durableExit atomic.Bool
 	d.opts.SessionShim.OnAdoption = func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
 		adoption = evidence
 		var err error
@@ -573,7 +635,16 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 		}
 		return SessionShimAdoptionReceipt{DurableCorrelation: []byte(`{"fenceRevision":"73","adoptionRevision":"81"}`)}, nil
 	}
-	d.opts.SessionShim.OnSessionEventDurable = func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil }
+	d.opts.SessionShim.OnSessionEventDurable = func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
+		if event.Kind == sessionshim.EventHostFrame && event.FrameType == attachwire.TypeExit {
+			frame, err := attachwire.DecodeFrame(event.FrameBytes)
+			if err != nil || frame.Seq != event.Seq || !bytes.Equal(frame.Encode(), event.FrameBytes) {
+				return fmt.Errorf("terminal HostFrame lost exact bytes: %v", err)
+			}
+			durableExit.Store(true)
+		}
+		return nil
+	}
 	d.opts.SessionShim.OnAdoptionBatch = func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 		return SessionShimAdoptionBatchReceipt{
 			DurableCorrelation: []byte("callback-batch"), AdoptionRevision: "callback-revision",
@@ -586,6 +657,9 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 	}
 	terminal := make(chan SessionShimTerminalEvidence, 1)
 	d.opts.SessionShim.OnTerminalEvidence = func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+		if !durableExit.Load() {
+			return errors.New("terminal proof overtook durable Exit HostFrame")
+		}
 		registry, err := sessionshim.NewRegistry(f.registry)
 		if err != nil {
 			return err
@@ -1259,6 +1333,8 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 			RegistryDir:                  f.registry,
 			HostID:                       "host-startup",
 			RequireAuthoritativeSnapshot: true,
+			RequireCredentialAttestation: true,
+			AttestationCapabilities:      RequiredSessionShimHostCapabilities(),
 			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 				return sessionshim.PreparedAdoption{Extensions: shimwire.Extensions{
 					Values: map[string]string{shimwire.ExtCarrierEpoch: "20"},
@@ -1297,6 +1373,7 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 			},
 		},
 	})
+	enableHostedFullHostFramesForTest(t, replacement, "test-org")
 	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
 	if err := replacement.adoptSessionShims(context.Background()); err != nil {
 		t.Fatalf("replacement adoptSessionShims: %v", err)
@@ -1417,7 +1494,7 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 	adopted := diagnostic.Adopted[0]
 	if adopted.OrgID != id.OrgID || adopted.SessionID != id.SessionID || adopted.ShimID == "" ||
 		adopted.ProcessEpoch == 0 || adopted.ControllerGeneration == 0 || adopted.LastForwardedSeq != seq ||
-		adopted.HarnessPID <= 0 || adopted.HarnessStartedAt <= 0 || adopted.ProtocolMin != 1 || adopted.ProtocolMax != 2 ||
+		adopted.HarnessPID <= 0 || adopted.HarnessStartedAt <= 0 || adopted.ProtocolMin != 1 || adopted.ProtocolMax != 3 ||
 		adopted.ProtocolVersion != 2 || !adopted.AuthoritativeSnapshot || adopted.ControllerID != d.ControllerID() ||
 		adopted.Phase == "" || !adopted.ConsumesCapacity || diagnostic.ControllerID != d.ControllerID() {
 		t.Fatalf("status adopted correlation = %+v", adopted)
