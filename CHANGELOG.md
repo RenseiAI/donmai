@@ -8,6 +8,43 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.1 — 2026-08-22
+
+### Features
+
+- **Planned restarts have one daemon-owned permission edge.** The localhost
+  control API now exposes a no-body restart preflight that enters draining,
+  closes admission, settles in-progress launches, refuses uncovered
+  direct-owned sessions, and freezes one server-identified correlation snapshot
+  across partial retries. Only the closed `prepared` or `not_required` response
+  permits a service-manager action; callers never supply a fence or preparation
+  id. A matching public client method lets embedding binaries consume the same
+  fail-closed contract. (#379)
+- **Session-shim state is visible without exposing session content.** Status and
+  doctor now report ownership mode, adoption completion and time, occupied
+  slots, adopted shim/process/controller correlations, durable forwarded
+  sequence, and every quarantined capacity charge. Paths, quarantine detail,
+  output, prompts, credentials, tokens, host/controller ids, and opaque
+  composing receipts are excluded. (#379)
+
+### Fixes
+
+- **Restart permission cannot outlive its durable hold.** Every initial or
+  cached permission revalidates the complete frozen scope set immediately before
+  success. Exact stores retain byte-exact requests and a non-empty immutable
+  revision; legacy stores keep their source-compatible semantic acknowledgement
+  and optional revision; standalone daemons keep a revision-less local held
+  intent. Missing, changed, reconciled, or expired authority refuses the restart
+  without resnapshotting, reminting, or consuming an external hold. (#379)
+- **Updates cannot race or bypass restart preparation.** The update endpoint
+  transfers one lifecycle lease from synchronous preflight into update
+  initiation, so resume cannot abandon authorization in between. A failed,
+  unavailable, or no-op update remains draining until explicit resume durably
+  abandons only the controller-local stop authorization; external holds remain
+  intact. The bounded local audit marker contains no fence, cursor, host
+  authority, session correlation, or credential material and is never used as
+  recovery authority by a replacement controller. (#379)
+
 ## v0.68.0 — 2026-08-22
 
 ### Features
