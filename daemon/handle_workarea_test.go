@@ -476,6 +476,7 @@ func TestHandleWorkareas_ConcurrentDiffAndRestore(t *testing.T) {
 // in Active[] (in addition to any on-disk archives).
 func TestHandleWorkareas_List_IncludesSpawnerLivePool(t *testing.T) {
 	root := t.TempDir()
+	worktreeRoot := t.TempDir()
 	writeFixtureArchive(t, root, fixtureArchive{id: "wa-archived"})
 
 	d := New(Options{HTTPHost: "127.0.0.1", HTTPPort: 0})
@@ -494,6 +495,7 @@ func TestHandleWorkareas_List_IncludesSpawnerLivePool(t *testing.T) {
 		}},
 		MaxConcurrentSessions: 2,
 		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 30"},
+		WorktreeParentDir:     worktreeRoot,
 	})
 	d.spawner = spawner
 	t.Cleanup(func() { _ = spawner.Drain(time.Second) })
@@ -504,6 +506,9 @@ func TestHandleWorkareas_List_IncludesSpawnerLivePool(t *testing.T) {
 		Ref:        "feat/y",
 	}); err != nil {
 		t.Fatalf("AcceptWork: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(worktreeRoot, "sess-live-1"), 0o750); err != nil {
+		t.Fatal(err)
 	}
 
 	srv := &Server{daemon: d}

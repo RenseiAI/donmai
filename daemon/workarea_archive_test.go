@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 // fixtureArchive lays out a minimal archive directory under root/<id>/
@@ -664,6 +666,130 @@ func TestWorkareaArchiveRegistry_ConcurrentRestoreAndDiff(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestWorkareaArchiveRegistryArchivesAndRestoresWholeDeclaredRoot(t *testing.T) {
+	archiveRoot := t.TempDir()
+	worktreeParent := t.TempDir()
+	sourceRoot := filepath.Join(worktreeParent, "session-root")
+	declaration := workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: "https://example.test/web.git", Ref: "main"}, Name: "web", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: "https://example.test/docs.git", Ref: "main"}, Name: "docs", Role: workarea.RepositoryRoleContext, Authority: workarea.RepositoryReadOnly},
+		},
+		Select: &workarea.RepositoryFilter{Kind: workarea.RepositoryFilterNamed, Name: "docs"},
+	}
+	normalized, err := declaration.Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisitions, err := workarea.NewAcquisitionStore(worktreeParent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisition, err := acquisitions.Begin("archive-session", "wa_archive_root", workarea.RootPath(sourceRoot), "docs", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for leaf, body := range map[string]string{"web/source.txt": "mutable", "docs/context.txt": "readonly"} {
+		path := filepath.Join(acquisition.StagingRoot.String(), leaf)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := workarea.NewDeclarationRecord(
+		"archive-session", "wa_archive_root", normalized,
+		map[string]string{"web": "aaa", "docs": "bbb"}, acquisition.Record.AcquisitionID,
+	)
+	if err := workarea.WriteDeclaration(t.Context(), acquisition.StagingRoot, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquisitions.Commit(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot})
+	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		AcquisitionID: acquisition.Record.AcquisitionID, WorkareaID: "wa_archive_root", SessionID: "archive-session",
+		WorkareaRoot: sourceRoot, SelectedPath: filepath.Join(sourceRoot, "docs"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, archivedPath := range []string{
+		filepath.Join(archiveRoot, "wa_archive_root", "tree", ".workarea", "declaration.json"),
+		filepath.Join(archiveRoot, "wa_archive_root", "tree", "web", "source.txt"),
+		filepath.Join(archiveRoot, "wa_archive_root", "tree", "docs", "context.txt"),
+	} {
+		if _, err := os.Stat(archivedPath); err != nil {
+			t.Fatalf("whole-root archive missing %q: %v", archivedPath, err)
+		}
+	}
+	archived, err := registry.Get("wa_archive_root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archived.WorkareaRoot == "" || archived.Path != archived.RepositoryWorktreePath || filepath.Base(archived.Path) != "docs" || len(archived.Repositories) != 2 {
+		t.Fatalf("archived root projection = %+v", archived)
+	}
+	if err := acquisitions.RemovePublishedRoot(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	restored, _, err := registry.Restore("wa_archive_root", afclient.WorkareaRestoreRequest{IntoSessionID: "archive-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.WorkareaRoot == "" || restored.Path != restored.RepositoryWorktreePath || filepath.Base(restored.Path) != "docs" || len(restored.Repositories) != 2 {
+		t.Fatalf("restored root projection = %+v", restored)
+	}
+	for _, restoredPath := range []string{
+		filepath.Join(restored.WorkareaRoot, ".workarea", "declaration.json"),
+		filepath.Join(restored.WorkareaRoot, "web", "source.txt"),
+		filepath.Join(restored.WorkareaRoot, "docs", "context.txt"),
+	} {
+		if _, err := os.Stat(restoredPath); err != nil {
+			t.Fatalf("whole-root restore missing %q: %v", restoredPath, err)
+		}
+	}
+	restartedManager, err := worktree.NewManager(worktree.Options{ParentDir: worktreeParent, RestoreSessionID: "archive-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedLayout, err := restartedManager.Layout("archive-session")
+	if err != nil || restartedLayout.Root.String() != sourceRoot || filepath.Base(restartedLayout.Repository.String()) != "docs" {
+		t.Fatalf("restored acquisition adoption = %+v, %v", restartedLayout, err)
+	}
+}
+
+func TestWorkareaArchiveRegistryPreservesLegacyFlatArchiveCompatibility(t *testing.T) {
+	archiveRoot := t.TempDir()
+	flat := filepath.Join(t.TempDir(), "legacy")
+	if err := os.MkdirAll(filepath.Join(flat, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(flat, "file"), []byte("legacy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot})
+	spec := WorkareaRootArchiveSpec{WorkareaID: "wa_flat_archive", SessionID: "legacy-session", WorkareaRoot: flat, SelectedPath: flat}
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.ArchiveRoot(t.Context(), spec); err != nil {
+		t.Fatalf("idempotent legacy archive retry: %v", err)
+	}
+	restored, _, err := registry.Restore("wa_flat_archive", afclient.WorkareaRestoreRequest{IntoSessionID: "legacy-restored"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.WorkareaRoot == "" || restored.WorkareaRoot != restored.Path || restored.RepositoryWorktreePath != restored.Path || restored.SessionID != "legacy-restored" {
+		t.Fatalf("legacy restored projection = %+v", restored)
+	}
+	if body, err := os.ReadFile(filepath.Join(restored.Path, "file")); err != nil || string(body) != "legacy" {
+		t.Fatalf("legacy restored file = %q, %v", body, err)
+	}
 }
 
 // ── walkArchiveTree direct coverage ────────────────────────────────────────

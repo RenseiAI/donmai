@@ -24,6 +24,10 @@ type OperationalPayload struct {
 	prompt.QueuedWork
 
 	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
+	WorkareaMode          string                            `json:"workareaMode,omitempty"`
+	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
+	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
+	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
 	ResolvedProfile       ResolvedProfile                   `json:"resolvedProfile,omitempty"`
 	Branch                string                            `json:"branch,omitempty"`
 	TerminalWorkareaLease *workarea.TerminalLeaseRequest    `json:"terminalWorkareaLease,omitempty"`
@@ -37,6 +41,10 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 	return OperationalPayload{
 		QueuedWork:            qw.QueuedWork,
 		RepositoryDeclaration: qw.RepositoryDeclaration,
+		WorkareaMode:          qw.WorkareaMode,
+		ParentWorkareaID:      qw.ParentWorkareaID,
+		RepositoryFilter:      qw.RepositoryFilter,
+		CacheSeedID:           qw.CacheSeedID,
 		ResolvedProfile:       qw.ResolvedProfile,
 		Branch:                qw.Branch,
 		TerminalWorkareaLease: qw.TerminalWorkareaLease,

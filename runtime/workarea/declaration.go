@@ -3,6 +3,8 @@ package workarea
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +33,8 @@ const (
 	MaxRepositoryLeafBytes = 128
 	maxDeclarationBytes    = 1 << 20
 )
+
+var declarationRaceHook func(string)
 
 // Protocol identifies one exact provisioner/executor contract.
 type Protocol string
@@ -521,6 +525,7 @@ type DeclarationRepositoryRecord struct {
 // restart adoption. Directory listings never substitute for this record.
 type DeclarationRecord struct {
 	SchemaVersion      string                        `json:"schemaVersion"`
+	AcquisitionID      string                        `json:"acquisitionId,omitempty"`
 	Protocol           Protocol                      `json:"protocol"`
 	SessionID          string                        `json:"sessionId"`
 	WorkareaID         string                        `json:"workareaId"`
@@ -530,12 +535,15 @@ type DeclarationRecord struct {
 
 // NewDeclarationRecord builds the secret-free durable projection. Resolved
 // refs are keyed by normalized repository name; absent means not yet resolved.
-func NewDeclarationRecord(sessionID, workareaID string, declaration NormalizedDeclaration, resolvedRefs map[string]string) DeclarationRecord {
+func NewDeclarationRecord(sessionID, workareaID string, declaration NormalizedDeclaration, resolvedRefs map[string]string, acquisitionIDs ...string) DeclarationRecord {
 	record := DeclarationRecord{
 		SchemaVersion: DeclarationRecordSchemaV1,
 		Protocol:      declaration.Protocol, SessionID: sessionID, WorkareaID: workareaID,
 		SelectedRepository: declaration.Selected.Name,
 		Repositories:       make([]DeclarationRepositoryRecord, 0, len(declaration.Repositories)),
+	}
+	if len(acquisitionIDs) > 0 {
+		record.AcquisitionID = acquisitionIDs[0]
 	}
 	for _, repository := range declaration.Repositories {
 		record.Repositories = append(record.Repositories, DeclarationRepositoryRecord{
@@ -552,6 +560,9 @@ func NewDeclarationRecord(sessionID, workareaID string, declaration NormalizedDe
 func (r DeclarationRecord) Validate() error {
 	if r.SchemaVersion != DeclarationRecordSchemaV1 || r.Protocol != ProtocolSessionRootV1 || r.SessionID == "" || r.WorkareaID == "" || len(r.Repositories) == 0 {
 		return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, r.SelectedRepository, "record header is incomplete or unsupported")
+	}
+	if r.AcquisitionID != "" && !strings.HasPrefix(r.AcquisitionID, "wac_") {
+		return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, r.SelectedRepository, "record acquisition identity is invalid")
 	}
 	selected := false
 	primary := 0
@@ -584,6 +595,92 @@ func (r DeclarationRecord) Validate() error {
 	return nil
 }
 
+// ResolveOne resolves an exact selected repository from the durable declaration
+// without consulting the filesystem. Explicit zero and multi-match filters fail
+// with the same typed D4 reasons as the ephemeral provision carrier.
+func (r DeclarationRecord) ResolveOne(filter *RepositoryFilter) (DeclarationRepositoryRecord, error) {
+	if err := r.Validate(); err != nil {
+		return DeclarationRepositoryRecord{}, err
+	}
+	effective := RepositoryFilter{Kind: RepositoryFilterPrimary}
+	if filter != nil {
+		effective = *filter
+	}
+	matches := make([]DeclarationRepositoryRecord, 0, len(r.Repositories))
+	switch effective.Kind {
+	case RepositoryFilterPrimary:
+		if effective.Name != "" || effective.Role != "" {
+			return DeclarationRepositoryRecord{}, repositoryError(ReasonRepositoryDeclarationInvalid, RuleFilterDeclared, "", "primary filter carries unrelated fields")
+		}
+		for _, repository := range r.Repositories {
+			if repository.Role == RepositoryRolePrimary {
+				matches = append(matches, repository)
+			}
+		}
+	case RepositoryFilterNamed:
+		if effective.Name == "" || effective.Role != "" {
+			return DeclarationRepositoryRecord{}, repositoryError(ReasonRepositoryDeclarationInvalid, RuleFilterDeclared, effective.Name, "named filter requires only name")
+		}
+		for _, repository := range r.Repositories {
+			if repository.Name == effective.Name {
+				matches = append(matches, repository)
+			}
+		}
+		if len(matches) == 0 {
+			return DeclarationRepositoryRecord{}, repositoryError(ReasonRepositoryUndeclared, RuleFilterDeclared, effective.Name, "named repository is not declared")
+		}
+	case RepositoryFilterRole:
+		if effective.Name != "" || !knownRole(effective.Role) {
+			return DeclarationRepositoryRecord{}, repositoryError(ReasonRepositoryDeclarationInvalid, RuleFilterNonEmpty, effective.Name, "role filter requires one known role")
+		}
+		for _, repository := range r.Repositories {
+			if repository.Role == effective.Role {
+				matches = append(matches, repository)
+			}
+		}
+	case RepositoryFilterAll:
+		if effective.Name != "" || effective.Role != "" {
+			return DeclarationRepositoryRecord{}, repositoryError(ReasonRepositoryDeclarationInvalid, RuleFilterNonEmpty, "", "all filter carries unrelated fields")
+		}
+		matches = append(matches, r.Repositories...)
+	default:
+		return DeclarationRepositoryRecord{}, repositoryError(ReasonRepositoryDeclarationInvalid, RuleFilterDeclared, "", "unknown repository filter kind")
+	}
+	if len(matches) == 0 {
+		return DeclarationRepositoryRecord{}, repositoryError(ReasonRepositoryFilterZeroMatch, RuleFilterNonEmpty, "", "repository filter matched zero declarations")
+	}
+	if len(matches) != 1 {
+		return DeclarationRepositoryRecord{}, repositoryError(ReasonRepositoryFilterAmbiguous, RuleFilterSingle, "", fmt.Sprintf("repository filter matched %d declarations", len(matches)))
+	}
+	return matches[0], nil
+}
+
+// ValidateDeclaredRoot proves every declared repository is one real direct
+// child of the exact root descriptor. Directory listings never add members.
+func ValidateDeclaredRoot(root RootPath, record DeclarationRecord) error {
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	rootHandle, err := openDeclarationRoot(root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rootHandle.Close() }()
+	for _, repository := range record.Repositories {
+		if err := ValidateRepositoryLeaf(repository.Leaf); err != nil {
+			return err
+		}
+		info, err := rootHandle.Lstat(repository.Leaf)
+		if err != nil {
+			return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "declared repository is absent")
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "declared repository is not a real directory")
+		}
+	}
+	return nil
+}
+
 // DeclarationPath returns the exact durable record path.
 func DeclarationPath(root RootPath) string {
 	return filepath.Join(root.String(), DeclarationDirName, DeclarationFileName)
@@ -598,62 +695,59 @@ func WriteDeclaration(_ context.Context, root RootPath, record DeclarationRecord
 	if err := record.Validate(); err != nil {
 		return err
 	}
-	rootInfo, err := os.Lstat(root.String())
+	rootHandle, metadataRoot, metadataIdentity, err := openDeclarationRoots(root, true)
 	if err != nil {
-		return fmt.Errorf("runtime/workarea: inspect declaration root: %w", err)
-	}
-	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
-		return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, record.SelectedRepository, "workarea root is not a real directory")
-	}
-	rootHandle, err := os.OpenRoot(root.String())
-	if err != nil {
-		return fmt.Errorf("runtime/workarea: open declaration root: %w", err)
+		return err
 	}
 	defer func() { _ = rootHandle.Close() }()
+	defer func() { _ = metadataRoot.Close() }()
 	body, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("runtime/workarea: encode declaration record: %w", err)
 	}
-	metadataDir := filepath.Join(root.String(), DeclarationDirName)
-	if err := rootHandle.MkdirAll(DeclarationDirName, 0o700); err != nil {
-		return fmt.Errorf("runtime/workarea: create declaration directory: %w", err)
-	}
-	metadataInfo, err := rootHandle.Lstat(DeclarationDirName)
+	tempName, err := declarationTempName()
 	if err != nil {
-		return fmt.Errorf("runtime/workarea: inspect declaration directory: %w", err)
+		return err
 	}
-	if !metadataInfo.IsDir() || metadataInfo.Mode()&os.ModeSymlink != 0 || metadataInfo.Mode().Perm() != 0o700 {
-		return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, record.SelectedRepository, "declaration directory is not a real directory")
-	}
-	tmp, err := os.CreateTemp(metadataDir, ".declaration-*.tmp")
+	tmp, err := metadataRoot.OpenFile(tempName, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("runtime/workarea: create declaration temp file: %w", err)
 	}
-	tmpPath := tmp.Name()
 	committed := false
 	defer func() {
 		_ = tmp.Close()
 		if !committed {
-			_ = os.Remove(tmpPath)
+			_ = metadataRoot.Remove(tempName)
 		}
 	}()
-	if err := tmp.Chmod(0o600); err != nil {
-		return fmt.Errorf("runtime/workarea: secure declaration temp file: %w", err)
-	}
 	if _, err := tmp.Write(body); err != nil {
 		return fmt.Errorf("runtime/workarea: write declaration: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		return fmt.Errorf("runtime/workarea: fsync declaration: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("runtime/workarea: close declaration: %w", err)
+	tempIdentity, err := tmp.Stat()
+	if err != nil {
+		return fmt.Errorf("runtime/workarea: stat declaration temp file: %w", err)
 	}
-	finalPath := DeclarationPath(root)
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("runtime/workarea: close declaration temp file: %w", err)
+	}
+	callDeclarationRaceHook("write-before-publish")
+	if err := metadataRoot.Rename(tempName, DeclarationFileName); err != nil {
 		return fmt.Errorf("runtime/workarea: publish declaration: %w", err)
 	}
-	dir, err := rootHandle.Open(DeclarationDirName)
+	publishedIdentity, err := metadataRoot.Lstat(DeclarationFileName)
+	if err != nil {
+		return fmt.Errorf("runtime/workarea: stat published declaration: %w", err)
+	}
+	if publishedIdentity.Mode()&os.ModeSymlink != 0 || !os.SameFile(tempIdentity, publishedIdentity) {
+		return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, record.SelectedRepository, "published declaration identity changed")
+	}
+	if err := assertDeclarationMetadataIdentity(rootHandle, metadataIdentity); err != nil {
+		return err
+	}
+	dir, err := metadataRoot.Open(".")
 	if err != nil {
 		return fmt.Errorf("runtime/workarea: open declaration directory for fsync: %w", err)
 	}
@@ -664,36 +758,86 @@ func WriteDeclaration(_ context.Context, root RootPath, record DeclarationRecord
 	if err := dir.Close(); err != nil {
 		return fmt.Errorf("runtime/workarea: close declaration directory: %w", err)
 	}
+	rootDir, err := rootHandle.Open(".")
+	if err != nil {
+		return fmt.Errorf("runtime/workarea: open workarea root for fsync: %w", err)
+	}
+	if err := rootDir.Sync(); err != nil {
+		_ = rootDir.Close()
+		return fmt.Errorf("runtime/workarea: fsync workarea root: %w", err)
+	}
+	if err := rootDir.Close(); err != nil {
+		return fmt.Errorf("runtime/workarea: close workarea root: %w", err)
+	}
+	if err := assertDeclarationMetadataIdentity(rootHandle, metadataIdentity); err != nil {
+		return err
+	}
+	finalIdentity, err := metadataRoot.Lstat(DeclarationFileName)
+	if err != nil {
+		return fmt.Errorf("runtime/workarea: final declaration identity check: %w", err)
+	}
+	if !os.SameFile(tempIdentity, finalIdentity) {
+		return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, record.SelectedRepository, "declaration identity changed after publication")
+	}
 	committed = true
 	return nil
 }
 
 // ReadDeclaration loads the closed, bounded durable record.
 func ReadDeclaration(root RootPath) (DeclarationRecord, error) {
-	declarationPath := DeclarationPath(root)
-	info, err := os.Lstat(declarationPath)
+	rootHandle, err := openDeclarationRoot(root)
+	if err != nil {
+		return DeclarationRecord{}, err
+	}
+	defer func() { _ = rootHandle.Close() }()
+	return readDeclarationFromRoot(rootHandle)
+}
+
+func readDeclarationFromRoot(rootHandle *os.Root) (DeclarationRecord, error) {
+	metadataRoot, metadataIdentity, err := openDeclarationMetadataRoot(rootHandle, false)
+	if err != nil {
+		return DeclarationRecord{}, err
+	}
+	defer func() { _ = metadataRoot.Close() }()
+	pathIdentity, err := metadataRoot.Lstat(DeclarationFileName)
 	if err != nil {
 		return DeclarationRecord{}, fmt.Errorf("runtime/workarea: inspect declaration: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+	if !pathIdentity.Mode().IsRegular() || pathIdentity.Mode()&os.ModeSymlink != 0 || pathIdentity.Mode().Perm()&0o077 != 0 {
 		return DeclarationRecord{}, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "declaration file type or mode is unsafe")
 	}
-	rootHandle, err := os.OpenRoot(root.String())
-	if err != nil {
-		return DeclarationRecord{}, fmt.Errorf("runtime/workarea: open declaration root: %w", err)
-	}
-	defer func() { _ = rootHandle.Close() }()
-	file, err := rootHandle.Open(filepath.Join(DeclarationDirName, DeclarationFileName))
+	callDeclarationRaceHook("read-after-stat")
+	file, err := metadataRoot.Open(DeclarationFileName)
 	if err != nil {
 		return DeclarationRecord{}, fmt.Errorf("runtime/workarea: open declaration: %w", err)
 	}
 	defer func() { _ = file.Close() }()
+	openedIdentity, err := file.Stat()
+	if err != nil {
+		return DeclarationRecord{}, fmt.Errorf("runtime/workarea: stat opened declaration: %w", err)
+	}
+	if !os.SameFile(pathIdentity, openedIdentity) {
+		return DeclarationRecord{}, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "declaration identity changed between stat and open")
+	}
+	if err := assertDeclarationMetadataIdentity(rootHandle, metadataIdentity); err != nil {
+		return DeclarationRecord{}, err
+	}
 	body, err := io.ReadAll(io.LimitReader(file, maxDeclarationBytes+1))
 	if err != nil {
 		return DeclarationRecord{}, fmt.Errorf("runtime/workarea: read declaration: %w", err)
 	}
 	if len(body) > maxDeclarationBytes {
 		return DeclarationRecord{}, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "declaration exceeds size bound")
+	}
+	currentIdentity, err := metadataRoot.Lstat(DeclarationFileName)
+	if err != nil {
+		return DeclarationRecord{}, fmt.Errorf("runtime/workarea: final declaration identity check: %w", err)
+	}
+	if !os.SameFile(openedIdentity, currentIdentity) {
+		return DeclarationRecord{}, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "declaration identity changed during read")
+	}
+	if err := assertDeclarationMetadataIdentity(rootHandle, metadataIdentity); err != nil {
+		return DeclarationRecord{}, err
 	}
 	var record DeclarationRecord
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -708,6 +852,106 @@ func ReadDeclaration(root RootPath) (DeclarationRecord, error) {
 		return DeclarationRecord{}, err
 	}
 	return record, nil
+}
+
+func openDeclarationRoots(root RootPath, create bool) (*os.Root, *os.Root, os.FileInfo, error) {
+	rootHandle, err := openDeclarationRoot(root)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	closeRoot := true
+	defer func() {
+		if closeRoot {
+			_ = rootHandle.Close()
+		}
+	}()
+	metadataRoot, openedIdentity, err := openDeclarationMetadataRoot(rootHandle, create)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	closeRoot = false
+	return rootHandle, metadataRoot, openedIdentity, nil
+}
+
+func openDeclarationRoot(root RootPath) (*os.Root, error) {
+	if !filepath.IsAbs(root.String()) {
+		return nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root is not absolute")
+	}
+	pathIdentity, err := os.Lstat(root.String())
+	if err != nil {
+		return nil, fmt.Errorf("runtime/workarea: inspect declaration root: %w", err)
+	}
+	if !pathIdentity.IsDir() || pathIdentity.Mode()&os.ModeSymlink != 0 {
+		return nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root is not a real directory")
+	}
+	rootHandle, err := os.OpenRoot(root.String())
+	if err != nil {
+		return nil, fmt.Errorf("runtime/workarea: open declaration root: %w", err)
+	}
+	openedIdentity, err := rootHandle.Stat(".")
+	if err != nil {
+		_ = rootHandle.Close()
+		return nil, fmt.Errorf("runtime/workarea: stat opened declaration root: %w", err)
+	}
+	if !os.SameFile(pathIdentity, openedIdentity) {
+		_ = rootHandle.Close()
+		return nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root identity changed while opening")
+	}
+	return rootHandle, nil
+}
+
+func openDeclarationMetadataRoot(rootHandle *os.Root, create bool) (*os.Root, os.FileInfo, error) {
+	if create {
+		if err := rootHandle.MkdirAll(DeclarationDirName, 0o700); err != nil {
+			return nil, nil, fmt.Errorf("runtime/workarea: create declaration directory: %w", err)
+		}
+	}
+	pathIdentity, err := rootHandle.Lstat(DeclarationDirName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("runtime/workarea: inspect declaration directory: %w", err)
+	}
+	if !pathIdentity.IsDir() || pathIdentity.Mode()&os.ModeSymlink != 0 || pathIdentity.Mode().Perm() != 0o700 {
+		return nil, nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "declaration directory type or mode is unsafe")
+	}
+	metadataRoot, err := rootHandle.OpenRoot(DeclarationDirName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("runtime/workarea: open declaration directory: %w", err)
+	}
+	openedIdentity, err := metadataRoot.Stat(".")
+	if err != nil {
+		_ = metadataRoot.Close()
+		return nil, nil, fmt.Errorf("runtime/workarea: stat declaration directory: %w", err)
+	}
+	if !os.SameFile(pathIdentity, openedIdentity) {
+		_ = metadataRoot.Close()
+		return nil, nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "declaration directory identity changed while opening")
+	}
+	return metadataRoot, openedIdentity, nil
+}
+
+func assertDeclarationMetadataIdentity(root *os.Root, expected os.FileInfo) error {
+	current, err := root.Lstat(DeclarationDirName)
+	if err != nil {
+		return fmt.Errorf("runtime/workarea: recheck declaration directory: %w", err)
+	}
+	if current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, expected) {
+		return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "declaration directory identity changed")
+	}
+	return nil
+}
+
+func declarationTempName() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", fmt.Errorf("runtime/workarea: random declaration temp name: %w", err)
+	}
+	return ".declaration-" + hex.EncodeToString(random[:]) + ".tmp", nil
+}
+
+func callDeclarationRaceHook(stage string) {
+	if declarationRaceHook != nil {
+		declarationRaceHook(stage)
+	}
 }
 
 func ensureJSONEOF(decoder *json.Decoder) error {

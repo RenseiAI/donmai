@@ -50,6 +50,9 @@ type AdoptOptions struct {
 	// ExpectedWorkareaRoot optionally cross-checks the additive secret-free
 	// discovery record field. An old record without it remains adoptable.
 	ExpectedWorkareaRoot func(id Identity) string
+	// ExpectedWorkareaLayout is the fail-closed resolver used by root-aware
+	// adoption. When set it supersedes the two legacy string-only callbacks.
+	ExpectedWorkareaLayout func(id Identity) (workareaPath, workareaRoot string, err error)
 
 	// DialTimeout bounds one shim handshake.
 	DialTimeout time.Duration
@@ -394,13 +397,20 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 	} else if selected >= shimwire.V3 {
 		resume = localResumeFrom
 	}
-	expected := ""
-	if opts.ExpectedWorkarea != nil {
-		expected = opts.ExpectedWorkarea(id)
-	}
-	expectedRoot := ""
-	if opts.ExpectedWorkareaRoot != nil {
-		expectedRoot = opts.ExpectedWorkareaRoot(id)
+	expected, expectedRoot := "", ""
+	if opts.ExpectedWorkareaLayout != nil {
+		var resolveErr error
+		expected, expectedRoot, resolveErr = opts.ExpectedWorkareaLayout(id)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("%w for %s: resolve expected workarea: %w", ErrAdoptionRefused, id, resolveErr)
+		}
+	} else {
+		if opts.ExpectedWorkarea != nil {
+			expected = opts.ExpectedWorkarea(id)
+		}
+		if opts.ExpectedWorkareaRoot != nil {
+			expectedRoot = opts.ExpectedWorkareaRoot(id)
+		}
 	}
 
 	copts := ControllerOptions{

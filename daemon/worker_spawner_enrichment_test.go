@@ -90,6 +90,14 @@ func TestSpawnerHandlePublishesNestedRootAndSelectedRepositoryCWD(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
+	normalized, err := declaration.Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := workarea.NewDeclarationRecord("nested-session", "wa_nested_test", normalized, map[string]string{"web": "a", "docs": "b"})
+	if err := workarea.WriteDeclaration(t.Context(), workarea.RootPath(handle.WorkareaRoot), record); err != nil {
+		t.Fatal(err)
+	}
 	workareas := spawner.ActiveWorkareas()
 	if len(workareas) != 1 || workareas[0].WorkareaRoot != handle.WorkareaRoot || workareas[0].RepositoryWorktreePath != handle.WorktreePath || workareas[0].SizeBytes < int64(len("mutable")+len("context")) {
 		t.Fatalf("active workarea root projection = %#v", workareas)

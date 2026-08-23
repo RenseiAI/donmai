@@ -91,6 +91,7 @@ func TestOperationalPayloadArchitectureFixture(t *testing.T) {
 func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T) {
 	classifications := map[string]string{
 		"QueuedWork": "projected", "RepositoryDeclaration": "projected", "ResolvedProfile": "projected", "Branch": "projected", "TerminalWorkareaLease": "projected",
+		"WorkareaMode": "projected", "ParentWorkareaID": "projected", "RepositoryFilter": "projected", "CacheSeedID": "projected",
 		"PermissionProfile": "projected",
 		"AdmissionReceipt":  "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
 		"ExecutionRuntimeBinding": "execution-sidecar", "OperationalPayload": "execution-sidecar", "HostAdaptationReceipt": "execution-sidecar",

@@ -113,7 +113,10 @@ func (s *Server) serveWorkareaInspect(w http.ResponseWriter, r *http.Request, id
 	}
 	// Active pool member lookup first — if the daemon has a
 	// PoolStatsProvider we walk its members for an id match.
-	if active, ok := s.lookupActiveByID(id); ok {
+	if active, ok, err := s.lookupActiveByID(id); err != nil {
+		http.Error(w, "inspect active workarea: "+err.Error(), http.StatusInternalServerError)
+		return
+	} else if ok {
 		writeJSON(w, http.StatusOK, &afclient.WorkareaEnvelope{Workarea: active})
 		return
 	}
@@ -293,12 +296,16 @@ func (s *Server) serveDiffNDJSON(w http.ResponseWriter, reg *WorkareaArchiveRegi
 // lookupActiveByID returns the active pool member matching id, if the
 // daemon has a registered ActiveWorkareaProvider that exposes one.
 // (The registry's List uses the same provider.)
-func (s *Server) lookupActiveByID(id string) (afclient.Workarea, bool) {
+func (s *Server) lookupActiveByID(id string) (afclient.Workarea, bool, error) {
 	reg := s.daemon.workareaArchiveRegistry()
 	if reg == nil || reg.activeProvider == nil {
-		return afclient.Workarea{}, false
+		return afclient.Workarea{}, false, nil
 	}
-	for _, member := range reg.activeProvider.ActiveWorkareas() {
+	members, err := reg.activeWorkareas()
+	if err != nil {
+		return afclient.Workarea{}, false, err
+	}
+	for _, member := range members {
 		if member.ID != id {
 			continue
 		}
@@ -317,9 +324,9 @@ func (s *Server) lookupActiveByID(id string) (afclient.Workarea, bool) {
 			Repositories:           append([]afclient.WorkareaRepository(nil), member.Repositories...),
 			AcquiredAt:             member.AcquiredAt,
 			ReleasedAt:             member.ReleasedAt,
-		}, true
+		}, true, nil
 	}
-	return afclient.Workarea{}, false
+	return afclient.Workarea{}, false, nil
 }
 
 // diffStreamingThreshold reads daemon.yaml's workarea.diffStreamingThreshold

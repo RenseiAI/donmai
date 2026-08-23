@@ -278,7 +278,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if wtParent == "" {
 		wtParent = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 	}
-	wm, err := worktree.NewManager(worktree.Options{ParentDir: wtParent, Logger: logger})
+	wm, err := worktree.NewManager(worktree.Options{ParentDir: wtParent, Logger: logger, RestoreSessionID: sessionID})
 	if err != nil {
 		return preflightErr(fmt.Sprintf("worktree manager: %v", err))
 	}
@@ -963,6 +963,10 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		OperationalPayload:      bytes.Clone(d.OperationalPayload),
 		HostAdaptationReceipt:   bytes.Clone(d.HostAdaptationReceipt),
 		RepositoryDeclaration:   d.RepositoryDeclaration,
+		WorkareaMode:            d.WorkareaMode,
+		ParentWorkareaID:        d.ParentWorkareaID,
+		RepositoryFilter:        d.RepositoryFilter,
+		CacheSeedID:             d.CacheSeedID,
 		QueuedWork: prompt.QueuedWork{
 			SessionID:            d.SessionID,
 			IssueID:              d.IssueID,
@@ -1020,6 +1024,10 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		qw.OperationalPayload = bytes.Clone(d.OperationalPayload)
 		qw.HostAdaptationReceipt = bytes.Clone(d.HostAdaptationReceipt)
 		qw.RepositoryDeclaration = d.RepositoryDeclaration
+		qw.WorkareaMode = d.WorkareaMode
+		qw.ParentWorkareaID = d.ParentWorkareaID
+		qw.RepositoryFilter = d.RepositoryFilter
+		qw.CacheSeedID = d.CacheSeedID
 		qw.WorkerID, qw.AuthToken, qw.PlatformURL = d.WorkerID, d.AuthToken, d.PlatformURL
 		// Restored beside the worker credentials for the same reason they are:
 		// the detail is authoritative for runtime credentials, so whatever the

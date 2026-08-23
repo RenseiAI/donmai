@@ -220,3 +220,121 @@ func TestDiscoverLayoutReadsDeclarationAndRetainsLegacyFlat(t *testing.T) {
 		t.Fatalf("flat DiscoverLayout = (%#v, %v, %v), want (%#v, true, nil)", discovered, found, err, flat)
 	}
 }
+
+func TestDeclarationRootedIORefusesSymlinkAndSwap(t *testing.T) {
+	normalized, err := testDeclaration().Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := NewDeclarationRecord("session", "wa_rooted", normalized, nil)
+	t.Run("metadata-symlink", func(t *testing.T) {
+		root := RootPath(filepath.Join(t.TempDir(), "root"))
+		external := t.TempDir()
+		if err := os.Mkdir(root.String(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(external, filepath.Join(root.String(), DeclarationDirName)); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteDeclaration(context.Background(), root, record); err == nil {
+			t.Fatal("WriteDeclaration followed a metadata symlink")
+		}
+		if _, err := os.Stat(filepath.Join(external, DeclarationFileName)); !os.IsNotExist(err) {
+			t.Fatalf("external declaration was created: %v", err)
+		}
+	})
+
+	t.Run("metadata-directory-swap", func(t *testing.T) {
+		root := RootPath(filepath.Join(t.TempDir(), "root"))
+		if err := os.Mkdir(root.String(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		declarationRaceHook = func(stage string) {
+			if stage != "write-before-publish" {
+				return
+			}
+			metadata := filepath.Join(root.String(), DeclarationDirName)
+			if err := os.Rename(metadata, metadata+"-old"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(metadata, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Cleanup(func() { declarationRaceHook = nil })
+		if err := WriteDeclaration(context.Background(), root, record); err == nil || !strings.Contains(err.Error(), "identity changed") {
+			t.Fatalf("WriteDeclaration swap error = %v", err)
+		}
+		if _, err := os.Stat(DeclarationPath(root)); !os.IsNotExist(err) {
+			t.Fatalf("replacement metadata received declaration: %v", err)
+		}
+	})
+
+	t.Run("declaration-file-swap", func(t *testing.T) {
+		root := RootPath(filepath.Join(t.TempDir(), "root"))
+		if err := os.Mkdir(root.String(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteDeclaration(context.Background(), root, record); err != nil {
+			t.Fatal(err)
+		}
+		replacement := record
+		replacement.SessionID = "replacement"
+		replacementBody, err := json.Marshal(replacement)
+		if err != nil {
+			t.Fatal(err)
+		}
+		declarationRaceHook = func(stage string) {
+			if stage != "read-after-stat" {
+				return
+			}
+			path := DeclarationPath(root)
+			if err := os.Rename(path, path+".old"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, replacementBody, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Cleanup(func() { declarationRaceHook = nil })
+		if _, err := ReadDeclaration(root); err == nil || !strings.Contains(err.Error(), "identity changed") {
+			t.Fatalf("ReadDeclaration swap error = %v", err)
+		}
+	})
+}
+
+func TestDiscoverLayoutDoesNotFollowUserControlledSymlinks(t *testing.T) {
+	parent := t.TempDir()
+	external := t.TempDir()
+	if err := os.Mkdir(filepath.Join(external, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(parent, "legacy-link")); err != nil {
+		t.Fatal(err)
+	}
+	layout, found, err := DiscoverLayout(parent, "legacy-link", "primary")
+	if err != nil || found || filepath.Clean(layout.Root.String()) == filepath.Clean(filepath.Join(parent, "legacy-link")) {
+		t.Fatalf("symlink legacy discovery = (%+v, %v, %v)", layout, found, err)
+	}
+
+	normalized, err := testDeclaration().Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested, err := NewLayout(parent, "nested-link", normalized.Selected.Leaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nested.Root.String(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, nested.Repository.String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteDeclaration(context.Background(), nested.Root, NewDeclarationRecord("nested-link", "wa_nested_link", normalized, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := DiscoverLayout(parent, "nested-link", normalized.Selected.Leaf); err == nil {
+		t.Fatal("nested discovery accepted a symlinked declared repository")
+	}
+}

@@ -82,6 +82,10 @@ type SessionDetail struct {
 	// RepositoryDeclaration is forwarded after producer negotiation; the exact
 	// runner/executor validates it again before provisioning.
 	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
+	WorkareaMode          string                            `json:"workareaMode,omitempty"`
+	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
+	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
+	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
 
 	// Ref is the base branch / ref to check out from.
 	Ref string `json:"ref,omitempty"`

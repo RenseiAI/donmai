@@ -91,6 +91,11 @@ func DiscoverLayout(parentDir, sessionID, prospectiveLeaf string) (Layout, bool,
 		prospective.Root = root
 	}
 	if record, readErr := ReadDeclaration(prospective.Root); readErr == nil {
+		rootHandle, openErr := openDeclarationRoot(prospective.Root)
+		if openErr != nil {
+			return Layout{}, false, openErr
+		}
+		defer func() { _ = rootHandle.Close() }()
 		for _, repository := range record.Repositories {
 			if repository.Name != record.SelectedRepository {
 				continue
@@ -99,7 +104,8 @@ func DiscoverLayout(parentDir, sessionID, prospectiveLeaf string) (Layout, bool,
 			if pathErr != nil {
 				return Layout{}, false, pathErr
 			}
-			if !isDirectory(path.String()) {
+			info, statErr := rootHandle.Lstat(repository.Leaf)
+			if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 				return Layout{}, false, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "declared selected repository is absent")
 			}
 			return Layout{Root: prospective.Root, Repository: path}, true, nil
@@ -108,7 +114,7 @@ func DiscoverLayout(parentDir, sessionID, prospectiveLeaf string) (Layout, bool,
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return Layout{}, false, readErr
 	}
-	if isGitRepository(flat.Repository.String()) {
+	if isGitRepositoryAt(parentDir, sessionID) {
 		return flat, true, nil
 	}
 	if prospectiveLeaf == "" {
@@ -159,12 +165,29 @@ func pathWithin(root, candidate string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func isDirectory(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
-}
-
-func isGitRepository(path string) bool {
-	_, err := os.Stat(filepath.Join(path, ".git"))
-	return err == nil
+func isGitRepositoryAt(parentDir, sessionLeaf string) bool {
+	parent, err := filepath.Abs(parentDir)
+	if err != nil {
+		return false
+	}
+	parentRoot, err := os.OpenRoot(parent)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = parentRoot.Close() }()
+	leafInfo, err := parentRoot.Lstat(sessionLeaf)
+	if err != nil || !leafInfo.IsDir() || leafInfo.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	flatRoot, err := parentRoot.OpenRoot(sessionLeaf)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = flatRoot.Close() }()
+	openedInfo, err := flatRoot.Stat(".")
+	if err != nil || !os.SameFile(leafInfo, openedInfo) {
+		return false
+	}
+	gitInfo, err := flatRoot.Lstat(".git")
+	return err == nil && gitInfo.Mode()&os.ModeSymlink == 0
 }

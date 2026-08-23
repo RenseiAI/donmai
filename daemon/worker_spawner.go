@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -386,6 +385,44 @@ func (s *WorkerSpawner) ActiveSessions() []SessionHandle {
 //
 // Output is sorted by SessionID for deterministic test assertions.
 func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
+	out, err := s.ActiveWorkareasStrict()
+	if err == nil {
+		return out
+	}
+	// Source compatibility for legacy embedders that consumed this errorless
+	// projection before physical accounting existed. The daemon registry uses
+	// ActiveWorkareasStrict and never takes this fallback.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out = make([]afclient.WorkareaSummary, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		project := s.findProjectForSpecLocked(session.spec)
+		if session.spec.ProjectID == "" {
+			project = s.findProjectLocked(session.spec.Repository)
+		}
+		projectID := session.spec.ProjectID
+		if project != nil {
+			projectID = project.ID
+		}
+		summary := afclient.WorkareaSummary{
+			ID: session.spec.SessionID, Kind: afclient.WorkareaKindActive, Status: afclient.WorkareaStatusReady,
+			Repository: session.spec.Repository, Ref: session.spec.Ref, SessionID: session.spec.SessionID, ProjectID: projectID,
+			WorkareaRoot: session.handle.WorkareaRoot, RepositoryWorktreePath: session.handle.WorktreePath,
+		}
+		if timestamp, parseErr := time.Parse(time.RFC3339, session.handle.AcceptedAt); parseErr == nil {
+			summary.AcquiredAt = &timestamp
+		}
+		out = append(out, summary)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SessionID < out[j].SessionID })
+	return out
+}
+
+// ActiveWorkareasStrict projects complete root ownership and fails closed when
+// any live root cannot be declared or physically accounted. Shared participants
+// collapse onto their one declaration WorkareaID so one allocation is charged
+// once.
+func (s *WorkerSpawner) ActiveWorkareasStrict() ([]afclient.WorkareaSummary, error) {
 	s.mu.Lock()
 	type snapshot struct {
 		handle    SessionHandle
@@ -407,7 +444,15 @@ func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
 	s.mu.Unlock()
 
 	out := make([]afclient.WorkareaSummary, 0, len(snapshots))
+	seenRoots := make(map[string]struct{})
 	for _, item := range snapshots {
+		root := item.handle.WorkareaRoot
+		if root == "" {
+			root = item.handle.WorktreePath
+		}
+		if root == "" || item.handle.WorktreePath == "" {
+			return nil, fmt.Errorf("daemon: active session %q has no accountable workarea path", item.spec.SessionID)
+		}
 		summary := afclient.WorkareaSummary{
 			ID:                     item.spec.SessionID,
 			Kind:                   afclient.WorkareaKindActive,
@@ -416,22 +461,44 @@ func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
 			Ref:                    item.spec.Ref,
 			SessionID:              item.spec.SessionID,
 			ProjectID:              item.projectID,
-			WorkareaRoot:           item.handle.WorkareaRoot,
+			WorkareaRoot:           root,
 			RepositoryWorktreePath: item.handle.WorktreePath,
 		}
-		if item.handle.WorkareaRoot != "" {
-			summary.SizeBytes = workareaRootSize(item.handle.WorkareaRoot)
-			if record, err := workarea.ReadDeclaration(workarea.RootPath(item.handle.WorkareaRoot)); err == nil {
-				for _, repository := range record.Repositories {
-					summary.Repositories = append(summary.Repositories, afclient.WorkareaRepository{
-						Name: repository.Name, Leaf: repository.Leaf,
-						Path: filepath.Join(item.handle.WorkareaRoot, repository.Leaf),
-						Role: string(repository.Role), Authority: string(repository.Authority),
-						RequestedRef: repository.RequestedRef, ResolvedRef: repository.ResolvedRef,
-					})
-				}
+		groupKey := "legacy:" + filepath.Clean(root)
+		if filepath.Clean(root) != filepath.Clean(item.handle.WorktreePath) {
+			record, err := workarea.ReadDeclaration(workarea.RootPath(root))
+			if err != nil {
+				return nil, fmt.Errorf("daemon: read active workarea declaration for %q: %w", item.spec.SessionID, err)
+			}
+			if err := workarea.ValidateDeclaredRoot(workarea.RootPath(root), record); err != nil {
+				return nil, fmt.Errorf("daemon: validate active workarea declaration for %q: %w", item.spec.SessionID, err)
+			}
+			groupKey = "nested:" + record.WorkareaID
+			summary.ID = record.WorkareaID
+			summary.SessionID = record.SessionID
+			selectedMatched := false
+			for _, repository := range record.Repositories {
+				path := filepath.Join(root, repository.Leaf)
+				selectedMatched = selectedMatched || filepath.Clean(path) == filepath.Clean(item.handle.WorktreePath)
+				summary.Repositories = append(summary.Repositories, afclient.WorkareaRepository{
+					Name: repository.Name, Leaf: repository.Leaf, Path: path,
+					Role: string(repository.Role), Authority: string(repository.Authority),
+					RequestedRef: repository.RequestedRef, ResolvedRef: repository.ResolvedRef,
+				})
+			}
+			if !selectedMatched {
+				return nil, fmt.Errorf("daemon: selected repository path for %q is not the declared selection", item.spec.SessionID)
 			}
 		}
+		if _, duplicate := seenRoots[groupKey]; duplicate {
+			continue
+		}
+		seenRoots[groupKey] = struct{}{}
+		usage, err := workarea.PhysicalUsage(workarea.RootPath(root))
+		if err != nil {
+			return nil, fmt.Errorf("daemon: account active workarea %q: %w", item.spec.SessionID, err)
+		}
+		summary.SizeBytes = usage
 		// handle.AcceptedAt is RFC3339 today; surface it on the wire as
 		// AcquiredAt (the active-only "session admitted to pool" stamp).
 		// Parse failures yield nil — better than a zero-time pointer
@@ -443,25 +510,7 @@ func (s *WorkerSpawner) ActiveWorkareas() []afclient.WorkareaSummary {
 		out = append(out, summary)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SessionID < out[j].SessionID })
-	return out
-}
-
-func workareaRootSize(root string) int64 {
-	if root == "" {
-		return 0
-	}
-	var size int64
-	_ = filepath.WalkDir(root, func(_ string, entry fs.DirEntry, err error) error {
-		if err != nil || entry.IsDir() {
-			return nil
-		}
-		info, infoErr := entry.Info()
-		if infoErr == nil {
-			size += info.Size()
-		}
-		return nil
-	})
-	return size
+	return out, nil
 }
 
 // Pause stops accepting new work but leaves running sessions alive.
@@ -1306,6 +1355,31 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 func sessionWorkareaLayout(parentDir string, spec SessionSpec) (workarea.Layout, error) {
 	if parentDir == "" {
 		return workarea.Layout{}, nil
+	}
+	if spec.WorkareaMode == worktreeModeShared {
+		if spec.ParentWorkareaID == "" || spec.RepositoryDeclaration == nil {
+			return workarea.Layout{}, errors.New("daemon: shared workarea requires parentWorkareaId and repositoryDeclaration")
+		}
+		store, err := workarea.NewAcquisitionStore(parentDir, nil)
+		if err != nil {
+			return workarea.Layout{}, err
+		}
+		record, err := store.RecordForWorkareaID(spec.ParentWorkareaID)
+		if err != nil {
+			return workarea.Layout{}, err
+		}
+		declaration, err := workarea.ReadDeclaration(workarea.RootPath(record.FinalRoot))
+		if err != nil {
+			return workarea.Layout{}, err
+		}
+		selected, err := declaration.ResolveOne(spec.RepositoryFilter)
+		if err != nil {
+			return workarea.Layout{}, err
+		}
+		return workarea.Layout{
+			Root:       workarea.RootPath(record.FinalRoot),
+			Repository: workarea.RepositoryPath(filepath.Join(record.FinalRoot, selected.Leaf)),
+		}, nil
 	}
 	selectedLeaf := ""
 	if spec.RepositoryDeclaration != nil {

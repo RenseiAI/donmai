@@ -25,6 +25,10 @@ type QueuedWork struct {
 	// RepositoryDeclaration is emitted only after exact session-root-v1
 	// negotiation. Nil preserves the legacy singular flat worktree path.
 	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
+	WorkareaMode          string                            `json:"workareaMode,omitempty"`
+	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
+	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
+	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
 
 	// AdmissionReceipt is the platform-produced, immutable execution-cell
 	// admission evidence. The daemon forwards it opaquely; the runner's closed

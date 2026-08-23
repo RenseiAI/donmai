@@ -217,6 +217,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		Strategy:              worktree.StrategyClone,
 		RepositoryDeclaration: qw.RepositoryDeclaration,
 		ExecutorCapabilities:  executorWorkareaCapabilities,
+		Mode:                  qw.WorkareaMode,
+		ParentWorkareaID:      qw.ParentWorkareaID,
+		RepositoryFilter:      qw.RepositoryFilter,
+		CacheSeedID:           qw.CacheSeedID,
 	})
 	if err != nil {
 		res.Status = "failed"

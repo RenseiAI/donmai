@@ -24,6 +24,7 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -40,6 +41,12 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/runtime/workarea"
+)
+
+const (
+	workareaArchiveSchemaV1     = "donmai.workarea-archive.v1"
+	workareaArchiveLegacyFlatV1 = "donmai.workarea-archive.legacy-flat-v1"
 )
 
 // defaultArchiveDir resolves the default archive root, ~/.donmai/workareas.
@@ -66,22 +73,38 @@ var (
 // emitted to clients is afclient.WorkareaSummary / Workarea — this is the
 // internal carrier.
 type archiveManifest struct {
-	ID             string            `json:"id"`
-	SessionID      string            `json:"sessionId,omitempty"`
-	ProjectID      string            `json:"projectId,omitempty"`
-	ProviderID     string            `json:"providerId,omitempty"`
-	SourceProvider string            `json:"sourceProvider,omitempty"`
-	Disposition    string            `json:"disposition,omitempty"`
-	CreatedAt      string            `json:"createdAt,omitempty"`
-	SizeBytes      int64             `json:"sizeBytes,omitempty"`
-	Repository     string            `json:"repository,omitempty"`
-	Ref            string            `json:"ref,omitempty"`
-	Capabilities   []string          `json:"capabilities,omitempty"`
-	Toolchain      map[string]string `json:"toolchain,omitempty"`
+	SchemaVersion  string                        `json:"schemaVersion,omitempty"`
+	ID             string                        `json:"id"`
+	AcquisitionID  string                        `json:"acquisitionId,omitempty"`
+	WorkareaID     string                        `json:"workareaId,omitempty"`
+	SessionID      string                        `json:"sessionId,omitempty"`
+	OriginalRoot   string                        `json:"originalRoot,omitempty"`
+	SelectedLeaf   string                        `json:"selectedLeaf,omitempty"`
+	Repositories   []afclient.WorkareaRepository `json:"repositories,omitempty"`
+	ProjectID      string                        `json:"projectId,omitempty"`
+	ProviderID     string                        `json:"providerId,omitempty"`
+	SourceProvider string                        `json:"sourceProvider,omitempty"`
+	Disposition    string                        `json:"disposition,omitempty"`
+	CreatedAt      string                        `json:"createdAt,omitempty"`
+	SizeBytes      int64                         `json:"sizeBytes,omitempty"`
+	Repository     string                        `json:"repository,omitempty"`
+	Ref            string                        `json:"ref,omitempty"`
+	Capabilities   []string                      `json:"capabilities,omitempty"`
+	Toolchain      map[string]string             `json:"toolchain,omitempty"`
 	// Extra holds any fields not declared above so consumers can render
 	// them without the registry needing to evolve the manifest schema in
 	// lockstep with archive producers.
 	Extra map[string]any `json:"-"`
+}
+
+// WorkareaRootArchiveSpec is the secret-free whole-root capture input used by
+// the terminal release authority.
+type WorkareaRootArchiveSpec struct {
+	AcquisitionID string
+	WorkareaID    string
+	SessionID     string
+	WorkareaRoot  string
+	SelectedPath  string
 }
 
 // WorkareaArchiveRegistry is the on-disk archive index. Construct via
@@ -107,6 +130,13 @@ type WorkareaArchiveRegistry struct {
 // members) is a perfectly valid, non-error response.
 type ActiveWorkareaProvider interface {
 	ActiveWorkareas() []afclient.WorkareaSummary
+}
+
+// StrictActiveWorkareaProvider is the additive fail-closed accounting surface.
+// Production providers implement it; the legacy interface remains source
+// compatible for embedders whose projections cannot fail.
+type StrictActiveWorkareaProvider interface {
+	ActiveWorkareasStrict() ([]afclient.WorkareaSummary, error)
 }
 
 // PoolCapacityGuard tells Restore whether a fresh pool member can be
@@ -151,6 +181,144 @@ func NewWorkareaArchiveRegistry(opts WorkareaArchiveOptions) *WorkareaArchiveReg
 // for tests and operators surfacing the path.
 func (r *WorkareaArchiveRegistry) Root() string { return r.root }
 
+// ArchiveRoot atomically captures a complete session generation, including its
+// declaration record and every declared leaf. A successful byte-identical retry
+// is idempotent; an identity collision fails closed.
+func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec WorkareaRootArchiveSpec) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if spec.WorkareaID == "" || spec.SessionID == "" || !validArchiveID(spec.WorkareaID) {
+		return fmt.Errorf("archive root: invalid workarea identity")
+	}
+	root := workarea.RootPath(spec.WorkareaRoot)
+	if !filepath.IsAbs(root.String()) || !filepath.IsAbs(spec.SelectedPath) {
+		return fmt.Errorf("archive root: absolute root and selected path are required")
+	}
+	rootInfo, err := os.Lstat(root.String())
+	if err != nil {
+		return fmt.Errorf("archive root: inspect source root: %w", err)
+	}
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("archive root: source root is not a real directory")
+	}
+	nested := filepath.Clean(root.String()) != filepath.Clean(spec.SelectedPath)
+	schemaVersion := workareaArchiveLegacyFlatV1
+	if nested {
+		schemaVersion = workareaArchiveSchemaV1
+	}
+	manifest := archiveManifest{
+		SchemaVersion: schemaVersion, ID: spec.WorkareaID,
+		AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID,
+		SessionID: spec.SessionID, OriginalRoot: root.String(), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Disposition: "archive", SourceProvider: "local",
+	}
+	if nested {
+		declaration, err := workarea.ReadDeclaration(root)
+		if err != nil {
+			return fmt.Errorf("archive root: read declaration: %w", err)
+		}
+		if err := workarea.ValidateDeclaredRoot(root, declaration); err != nil {
+			return fmt.Errorf("archive root: validate declaration: %w", err)
+		}
+		if declaration.WorkareaID != spec.WorkareaID || declaration.SessionID != spec.SessionID || declaration.AcquisitionID == "" || declaration.AcquisitionID != spec.AcquisitionID {
+			return fmt.Errorf("archive root: declaration identity mismatch")
+		}
+		for _, repository := range declaration.Repositories {
+			manifest.Repositories = append(manifest.Repositories, afclient.WorkareaRepository{
+				Name: repository.Name, Leaf: repository.Leaf, Role: string(repository.Role),
+				Authority: string(repository.Authority), RequestedRef: repository.RequestedRef, ResolvedRef: repository.ResolvedRef,
+			})
+			if repository.Name == declaration.SelectedRepository {
+				manifest.SelectedLeaf = repository.Leaf
+			}
+		}
+		if manifest.SelectedLeaf == "" || filepath.Clean(filepath.Join(root.String(), manifest.SelectedLeaf)) != filepath.Clean(spec.SelectedPath) {
+			return fmt.Errorf("archive root: selected repository path mismatch")
+		}
+	}
+	manifest.SizeBytes, err = workarea.PhysicalUsage(root)
+	if err != nil {
+		return fmt.Errorf("archive root: physical accounting: %w", err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := os.MkdirAll(r.root, 0o700); err != nil {
+		return fmt.Errorf("archive root: create archive registry: %w", err)
+	}
+	final := r.archiveDir(spec.WorkareaID)
+	if _, err := os.Lstat(final); err == nil {
+		existing, readErr := r.readManifest(spec.WorkareaID)
+		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID {
+			archivedRoot := workarea.RootPath(r.treeDir(spec.WorkareaID))
+			if existing.SchemaVersion == workareaArchiveLegacyFlatV1 && spec.AcquisitionID == "" && existing.SelectedLeaf == "" {
+				if info, treeErr := os.Lstat(archivedRoot.String()); treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+					return nil
+				}
+			}
+			archivedDeclaration, declarationErr := workarea.ReadDeclaration(archivedRoot)
+			if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && workarea.ValidateDeclaredRoot(archivedRoot, archivedDeclaration) == nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("archive root: identity collision: %w", ErrArchiveExists)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("archive root: inspect archive destination: %w", err)
+	}
+	stage, err := os.MkdirTemp(r.root, ".archive-"+spec.WorkareaID+"-")
+	if err != nil {
+		return fmt.Errorf("archive root: create stage: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := copyTree(root.String(), filepath.Join(stage, "tree")); err != nil {
+		return fmt.Errorf("archive root: copy complete tree: %w", err)
+	}
+	body, err := json.Marshal(&manifest)
+	if err != nil {
+		return fmt.Errorf("archive root: encode manifest: %w", err)
+	}
+	stageRoot, err := os.OpenRoot(stage)
+	if err != nil {
+		return fmt.Errorf("archive root: open archive stage: %w", err)
+	}
+	defer func() { _ = stageRoot.Close() }()
+	manifestFile, err := stageRoot.OpenFile("manifest.json", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("archive root: create manifest: %w", err)
+	}
+	if _, err := manifestFile.Write(body); err != nil {
+		_ = manifestFile.Close()
+		return fmt.Errorf("archive root: write manifest: %w", err)
+	}
+	if err := manifestFile.Sync(); err != nil {
+		_ = manifestFile.Close()
+		return fmt.Errorf("archive root: sync manifest: %w", err)
+	}
+	if err := manifestFile.Close(); err != nil {
+		return fmt.Errorf("archive root: close manifest: %w", err)
+	}
+	if err := syncArchiveTree(stage); err != nil {
+		return err
+	}
+	if err := os.Rename(stage, final); err != nil {
+		return fmt.Errorf("archive root: publish archive: %w", err)
+	}
+	if err := archiveSyncDir(r.root); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
 // List walks the archive root and returns the union of on-disk archives
 // (ordered deterministically by id) and the active pool members
 // reported by the configured ActiveWorkareaProvider, if any. Missing-or-
@@ -158,13 +326,26 @@ func (r *WorkareaArchiveRegistry) Root() string { return r.root }
 // empty archived).
 func (r *WorkareaArchiveRegistry) List() (active, archived []afclient.WorkareaSummary, err error) {
 	if r.activeProvider != nil {
-		active = r.activeProvider.ActiveWorkareas()
+		active, err = r.activeWorkareas()
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	archived, err = r.listArchives()
 	if err != nil {
 		return active, nil, err
 	}
 	return active, archived, nil
+}
+
+func (r *WorkareaArchiveRegistry) activeWorkareas() ([]afclient.WorkareaSummary, error) {
+	if r.activeProvider == nil {
+		return nil, nil
+	}
+	if strict, ok := r.activeProvider.(StrictActiveWorkareaProvider); ok {
+		return strict.ActiveWorkareasStrict()
+	}
+	return r.activeProvider.ActiveWorkareas(), nil
 }
 
 // listArchives scans the archive root non-recursively for direct
@@ -217,7 +398,7 @@ func (r *WorkareaArchiveRegistry) Get(id string) (*afclient.Workarea, error) {
 	if err != nil {
 		return nil, err
 	}
-	wa := manifestToWorkarea(id, manifest, r.archiveDir(id))
+	wa := manifestToWorkarea(id, manifest, r.treeDir(id))
 	return &wa, nil
 }
 
@@ -377,6 +558,13 @@ func (r *WorkareaArchiveRegistry) Restore(
 			return nil, retryAfter, fmt.Errorf("restore: %w (%s)", afclient.ErrUnavailable, gerr.Error())
 		}
 	}
+	if manifest.SchemaVersion == workareaArchiveSchemaV1 {
+		if req.IntoSessionID != "" && req.IntoSessionID != manifest.SessionID {
+			return nil, 0, fmt.Errorf("restore: session-root archive is bound to session %q: %w", manifest.SessionID, afclient.ErrConflict)
+		}
+		workarea, err := r.restoreSessionRootArchive(archiveID, manifest)
+		return workarea, 0, err
+	}
 
 	// Treat IntoSessionID conflict as same-id-already-restored — the
 	// registry-side check is best-effort: the daemon's pool is the
@@ -445,11 +633,10 @@ func (r *WorkareaArchiveRegistry) Restore(
 		_ = os.WriteFile(sidecarPath, data, 0o600) //nolint:gosec
 	}
 
-	wa := manifestToWorkarea(archiveID, manifest, srcTree)
+	wa := manifestToWorkarea(archiveID, manifest, dest)
 	wa.ID = newID
 	wa.Kind = afclient.WorkareaKindActive
 	wa.Status = afclient.WorkareaStatusReady
-	wa.Path = dest
 	wa.AcquiredAt = nil
 	if req.IntoSessionID != "" {
 		wa.SessionID = req.IntoSessionID
@@ -459,6 +646,61 @@ func (r *WorkareaArchiveRegistry) Restore(
 	wa.AcquiredAt = &now2
 
 	return &wa, 0, nil
+}
+
+func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, manifest *archiveManifest) (*afclient.Workarea, error) {
+	if manifest.AcquisitionID == "" || manifest.WorkareaID == "" || manifest.SessionID == "" || !filepath.IsAbs(manifest.OriginalRoot) {
+		return nil, fmt.Errorf("restore: incomplete session-root archive identity: %w", ErrArchiveCorrupted)
+	}
+	parent := filepath.Dir(manifest.OriginalRoot)
+	acquisitions, err := workarea.NewAcquisitionStore(parent, nil)
+	if err != nil {
+		return nil, fmt.Errorf("restore: open acquisition authority: %w", err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, err := os.Lstat(manifest.OriginalRoot); err == nil {
+		return nil, fmt.Errorf("restore: original root is occupied: %w", afclient.ErrConflict)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("restore: inspect original root: %w", err)
+	}
+	stage, err := os.MkdirTemp(parent, ".workarea-restore-")
+	if err != nil {
+		return nil, fmt.Errorf("restore: create atomic root stage: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+	if err := copyTree(r.treeDir(archiveID), stage); err != nil {
+		return nil, fmt.Errorf("restore: copy whole root: %w: %w", err, ErrArchiveCorrupted)
+	}
+	if err := syncArchiveTree(stage); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(stage, manifest.OriginalRoot); err != nil {
+		return nil, fmt.Errorf("restore: publish original root: %w", err)
+	}
+	if err := archiveSyncDir(parent); err != nil {
+		return nil, err
+	}
+	committed = true
+	if _, err := acquisitions.AdoptRestoredRoot(
+		manifest.AcquisitionID, manifest.WorkareaID, manifest.SessionID, workarea.RootPath(manifest.OriginalRoot),
+	); err != nil {
+		return nil, fmt.Errorf("restore: re-enter acquisition authority: %w", err)
+	}
+	wa := manifestToWorkarea(archiveID, manifest, manifest.OriginalRoot)
+	wa.ID = manifest.WorkareaID
+	wa.Kind = afclient.WorkareaKindActive
+	wa.Status = afclient.WorkareaStatusReady
+	wa.SessionID = manifest.SessionID
+	wa.ArchiveLocation = r.archiveDir(archiveID)
+	now := time.Now().UTC()
+	wa.AcquiredAt = &now
+	return &wa, nil
 }
 
 // validArchiveID reports whether id is a safe single-component archive id:
@@ -530,6 +772,19 @@ func (r *WorkareaArchiveRegistry) summaryFor(id string) (afclient.WorkareaSummar
 		return afclient.WorkareaSummary{}, false, err
 	}
 	created, _ := parseRFC3339(manifest.CreatedAt)
+	repositoryPath := ""
+	workareaRoot := ""
+	repositories := append([]afclient.WorkareaRepository(nil), manifest.Repositories...)
+	if manifest.SchemaVersion == workareaArchiveSchemaV1 || manifest.SchemaVersion == workareaArchiveLegacyFlatV1 {
+		workareaRoot = r.treeDir(id)
+		repositoryPath = workareaRoot
+		if manifest.SelectedLeaf != "" {
+			repositoryPath = filepath.Join(workareaRoot, manifest.SelectedLeaf)
+		}
+		for index := range repositories {
+			repositories[index].Path = filepath.Join(workareaRoot, repositories[index].Leaf)
+		}
+	}
 	return afclient.WorkareaSummary{
 		ID:             firstNonEmptyStr(manifest.ID, id),
 		Kind:           afclient.WorkareaKindArchived,
@@ -543,6 +798,8 @@ func (r *WorkareaArchiveRegistry) summaryFor(id string) (afclient.WorkareaSummar
 		SizeBytes:      manifest.SizeBytes,
 		SourceProvider: manifest.SourceProvider,
 		Disposition:    manifest.Disposition,
+		WorkareaRoot:   workareaRoot, RepositoryWorktreePath: repositoryPath,
+		Repositories: repositories,
 	}, true, nil
 }
 
@@ -829,7 +1086,10 @@ func copyTree(src, dst string) error {
 			// symlink TOCTOU traversal is informational here.
 			return os.Symlink(linkTarget, target) //nolint:gosec
 		case d.IsDir():
-			return os.MkdirAll(target, 0o750) //nolint:gosec
+			if err := os.MkdirAll(target, info.Mode().Perm()); err != nil { //nolint:gosec
+				return err
+			}
+			return os.Chmod(target, info.Mode().Perm()) //nolint:gosec
 		default:
 			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil { //nolint:gosec
 				return err
@@ -853,7 +1113,55 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		_ = out.Close()
 		return err
 	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
 	return out.Close()
+}
+
+func syncArchiveTree(root string) error {
+	var directories []string
+	// root is an archive stage freshly minted by ArchiveRoot or a restored tree
+	// copied from a validated archive id; it is never a request path.
+	if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error { //nolint:gosec
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			directories = append(directories, path)
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("archive root: enumerate directories for sync: %w", err)
+	}
+	sort.Slice(directories, func(i, j int) bool { return len(directories[i]) > len(directories[j]) })
+	for _, directory := range directories {
+		if err := archiveSyncDir(directory); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func archiveSyncDir(path string) error {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return fmt.Errorf("archive root: open directory root for sync: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	directory, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("archive root: open directory for sync: %w", err)
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return fmt.Errorf("archive root: sync directory: %w", err)
+	}
+	if err := directory.Close(); err != nil {
+		return fmt.Errorf("archive root: close synced directory: %w", err)
+	}
+	return nil
 }
 
 func parseRFC3339(s string) (*time.Time, bool) {
@@ -874,18 +1182,36 @@ func manifestToWorkarea(id string, m *archiveManifest, treePath string) afclient
 	if m.Extra != nil {
 		manifestExtra = m.Extra
 	}
+	path := treePath
+	workareaRoot := ""
+	repositoryPath := ""
+	repositories := append([]afclient.WorkareaRepository(nil), m.Repositories...)
+	if m.SchemaVersion == workareaArchiveSchemaV1 || m.SchemaVersion == workareaArchiveLegacyFlatV1 {
+		workareaRoot = treePath
+		repositoryPath = treePath
+		if m.SelectedLeaf != "" {
+			repositoryPath = filepath.Join(treePath, m.SelectedLeaf)
+		}
+		path = repositoryPath
+		for index := range repositories {
+			repositories[index].Path = filepath.Join(treePath, repositories[index].Leaf)
+		}
+	}
 	return afclient.Workarea{
-		ID:              firstNonEmptyStr(m.ID, id),
-		Kind:            afclient.WorkareaKindArchived,
-		ProviderID:      m.ProviderID,
-		SessionID:       m.SessionID,
-		ProjectID:       m.ProjectID,
-		Status:          afclient.WorkareaStatusArchived,
-		Path:            treePath,
-		Ref:             m.Ref,
-		Repository:      m.Repository,
-		Toolchain:       m.Toolchain,
-		ArchiveLocation: filepath.Dir(treePath),
-		Manifest:        manifestExtra,
+		ID:                     firstNonEmptyStr(m.ID, id),
+		Kind:                   afclient.WorkareaKindArchived,
+		ProviderID:             m.ProviderID,
+		SessionID:              m.SessionID,
+		ProjectID:              m.ProjectID,
+		Status:                 afclient.WorkareaStatusArchived,
+		Path:                   path,
+		WorkareaRoot:           workareaRoot,
+		RepositoryWorktreePath: repositoryPath,
+		Repositories:           repositories,
+		Ref:                    m.Ref,
+		Repository:             m.Repository,
+		Toolchain:              m.Toolchain,
+		ArchiveLocation:        filepath.Dir(treePath),
+		Manifest:               manifestExtra,
 	}
 }

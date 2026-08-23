@@ -53,9 +53,12 @@ type WorkareaSummary struct {
 	RepositoryWorktreePath string               `json:"repositoryWorktreePath,omitempty"`
 	Repositories           []WorkareaRepository `json:"repositories,omitempty"`
 
+	// SizeBytes is fail-closed physical storage for either a live root or an
+	// archive. Older daemons populated it only for archives.
+	SizeBytes int64 `json:"sizeBytes,omitempty"`
+
 	// Archive-only fields. Populated when Kind == WorkareaKindArchived.
 	CreatedAt      *time.Time `json:"createdAt,omitempty"`
-	SizeBytes      int64      `json:"sizeBytes,omitempty"`
 	SourceProvider string     `json:"sourceProvider,omitempty"`
 	Disposition    string     `json:"disposition,omitempty"`
 

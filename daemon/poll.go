@@ -64,6 +64,10 @@ type PollWorkItem struct {
 	ProjectName           string                            `json:"projectName,omitempty"`
 	Repository            string                            `json:"repository,omitempty"`
 	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`
+	WorkareaMode          string                            `json:"workareaMode,omitempty"`
+	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
+	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
+	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
 	RequiresRepository    bool                              `json:"requiresRepository,omitempty"`
 	Ref                   string                            `json:"ref,omitempty"`
 	Priority              int                               `json:"priority,omitempty"`
@@ -1132,6 +1136,10 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		RepositoryID:           item.RepositoryID,
 		Repository:             repo,
 		RepositoryDeclaration:  item.RepositoryDeclaration,
+		WorkareaMode:           item.WorkareaMode,
+		ParentWorkareaID:       item.ParentWorkareaID,
+		RepositoryFilter:       item.RepositoryFilter,
+		CacheSeedID:            item.CacheSeedID,
 		RequiresRepository:     item.RequiresRepository,
 		Ref:                    item.Ref,
 		Resources:              item.Resources,
@@ -1356,6 +1364,10 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		OrganizationID:          item.OrganizationID,
 		Repository:              repo,
 		RepositoryDeclaration:   item.RepositoryDeclaration,
+		WorkareaMode:            item.WorkareaMode,
+		ParentWorkareaID:        item.ParentWorkareaID,
+		RepositoryFilter:        item.RepositoryFilter,
+		CacheSeedID:             item.CacheSeedID,
 		Ref:                     item.Ref,
 		WorkType:                item.WorkType,
 		PromptContext:           item.PromptContext,

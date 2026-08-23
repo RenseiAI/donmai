@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -517,9 +518,19 @@ func verifyHello(h shimwire.Hello, rec Record, expectedWorkarea, expectedWorkare
 		return fmt.Errorf("%w: shim reports workarea %q, this daemon expects %q",
 			ErrAdoptionRefused, h.WorkareaPath, expectedWorkarea)
 	}
-	if expectedWorkareaRoot != "" && rec.WorkareaRoot != "" && rec.WorkareaRoot != expectedWorkareaRoot {
-		return fmt.Errorf("%w: discovery record workarea root %q, this daemon expects %q",
-			ErrAdoptionRefused, rec.WorkareaRoot, expectedWorkareaRoot)
+	if expectedWorkareaRoot != "" {
+		nested := filepath.Clean(expectedWorkareaRoot) != filepath.Clean(expectedWorkarea)
+		if nested && rec.WorkareaRoot == "" {
+			return fmt.Errorf("%w: nested discovery record omitted required workarea root %q",
+				ErrAdoptionRefused, expectedWorkareaRoot)
+		}
+		if rec.WorkareaRoot != "" && filepath.Clean(rec.WorkareaRoot) != filepath.Clean(expectedWorkareaRoot) {
+			return fmt.Errorf("%w: discovery record workarea root %q, this daemon expects %q",
+				ErrAdoptionRefused, rec.WorkareaRoot, expectedWorkareaRoot)
+		}
+		if !nested && rec.WorkareaRoot == "" && filepath.Clean(h.WorkareaPath) != filepath.Clean(expectedWorkareaRoot) {
+			return fmt.Errorf("%w: legacy flat record does not identify the expected root", ErrAdoptionRefused)
+		}
 	}
 	return nil
 }
