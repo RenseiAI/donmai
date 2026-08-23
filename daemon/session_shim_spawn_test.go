@@ -23,6 +23,11 @@ import (
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
+func proofResolvedResume(preparation SessionShimAdoptionPreparation) *uint64 {
+	resume := preparation.LastHostSeq + 1
+	return &resume
+}
+
 func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T) {
 	f := newShimSpawnFixture(t)
 	d := f.daemon
@@ -34,6 +39,7 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 		return sessionshim.PreparedAdoption{
 			ControllerGeneration: preparation.CurrentControllerGeneration + 1,
 			Extensions:           shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "19"}},
+			ResumeFrom:           proofResolvedResume(preparation),
 		}, nil
 	}
 	var emitted shimwire.SnapshotResult
@@ -105,11 +111,11 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 	}
 }
 
-func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *testing.T) {
+func TestOnAdoptionSnapshotDoesNotReplayOrdinaryFramesBeforeActivation(t *testing.T) {
 	f := newShimSpawnFixture(t)
-	// This fixture deliberately leaves the first controller without a durable
-	// callback so no ACK sidecar trims the >64-frame replay the replacement is
-	// meant to drain.
+	// Leave the first controller without a durable callback so Hello reports a
+	// large live tail. Proof-bound preparation resolves ResumeFrom at that tail;
+	// none of the older ordinary frames may cross the non-active candidate.
 	f.daemon.opts.SessionShim.OnSessionEventDurable = nil
 	spec := f.interactiveSpec("takeover-large-replay")
 	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
@@ -139,6 +145,7 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 				return sessionshim.PreparedAdoption{
 					ControllerGeneration: preparation.CurrentControllerGeneration + 1,
 					Extensions:           shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "23"}},
+					ResumeFrom:           proofResolvedResume(preparation),
 				}, nil
 			},
 			OnSessionEventDurable: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
@@ -168,8 +175,8 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 				}
 				durableMu.Lock()
 				defer durableMu.Unlock()
-				if durableCount <= 64 || durableSeq != emitted.AtSeq+1 || staged.Seq != emitted.AtSeq+1 {
-					return SessionShimAdoptionReceipt{}, fmt.Errorf("replay/staged split = count=%d seq=%d snapshot=%d", durableCount, durableSeq, emitted.AtSeq+1)
+				if durableCount != 1 || durableSeq != emitted.AtSeq+1 || staged.Seq != emitted.AtSeq+1 {
+					return SessionShimAdoptionReceipt{}, fmt.Errorf("pre-active stream = count=%d seq=%d snapshot=%d", durableCount, durableSeq, emitted.AtSeq+1)
 				}
 				return SessionShimAdoptionReceipt{DurableCorrelation: []byte("large-replay-complete")}, nil
 			},
@@ -616,6 +623,7 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 		}
 		return sessionshim.PreparedAdoption{
 			ControllerGeneration: preparation.CurrentControllerGeneration + 7,
+			ResumeFrom:           proofResolvedResume(preparation),
 			Extensions: shimwire.Extensions{
 				Values:   map[string]string{shimwire.ExtCarrierEpoch: "19"},
 				Required: []string{shimwire.ExtCarrierEpoch},
@@ -1338,7 +1346,8 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 				return sessionshim.PreparedAdoption{Extensions: shimwire.Extensions{
 					Values: map[string]string{shimwire.ExtCarrierEpoch: "20"},
-				}, ControllerGeneration: preparation.CurrentControllerGeneration + 1}, nil
+				}, ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+					ResumeFrom: proofResolvedResume(preparation)}, nil
 			},
 			OnAdoption: func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
 				if evidence.Identity != id {

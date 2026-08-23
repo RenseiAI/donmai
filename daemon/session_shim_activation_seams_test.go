@@ -43,12 +43,14 @@ func assertFlatSessionShimAttestation(t *testing.T, raw []byte, att SessionShimH
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("decode request: %v (raw=%s)", err, raw)
 	}
+	wantCaps := make([]any, len(att.Capabilities))
+	for i := range att.Capabilities {
+		wantCaps[i] = att.Capabilities[i]
+	}
 	want := map[string]any{
 		"sessionShimSupported": true, "sessionShimControllerId": att.ControllerID,
 		"sessionShimProtocolMin": float64(att.ProtocolMin), "sessionShimProtocolMax": float64(att.ProtocolMax),
-		"sessionShimCapabilities": []any{
-			att.Capabilities[0], att.Capabilities[1], att.Capabilities[2], att.Capabilities[3],
-		},
+		"sessionShimCapabilities": wantCaps,
 	}
 	for key, value := range want {
 		if !reflect.DeepEqual(body[key], value) {
@@ -252,6 +254,12 @@ func TestSupportedSessionShimAttestationRequiresCanonicalCompleteCapabilities(t 
 	}
 	for name, mutate := range map[string]func(*SessionShimHostAttestation){
 		"max below v3": func(attestation *SessionShimHostAttestation) { attestation.ProtocolMax = shimwire.V2 },
+		"prior four-token set": func(attestation *SessionShimHostAttestation) {
+			attestation.Capabilities = append(
+				append([]string(nil), attestation.Capabilities[:2]...),
+				attestation.Capabilities[3:]...,
+			)
+		},
 		"missing capability": func(attestation *SessionShimHostAttestation) {
 			attestation.Capabilities = attestation.Capabilities[:len(attestation.Capabilities)-1]
 		},

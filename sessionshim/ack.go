@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"strconv"
 
 	"github.com/RenseiAI/donmai/shimwire"
@@ -97,7 +98,11 @@ func (r *Registry) putDurableAck(ack durableAckCursor) error {
 }
 
 func (r *Registry) getDurableAck(rec Record) (durableAckCursor, error) {
-	raw, err := r.readEntry(durableAckName(rec.Identity(), rec.ShimID, rec.ProcessEpoch))
+	name := durableAckName(rec.Identity(), rec.ShimID, rec.ProcessEpoch)
+	if err := r.checkDurableAckModes(name); err != nil {
+		return durableAckCursor{}, err
+	}
+	raw, err := r.readEntry(name)
 	if err != nil {
 		return durableAckCursor{}, err
 	}
@@ -109,6 +114,39 @@ func (r *Registry) getDurableAck(rec Record) (durableAckCursor, error) {
 		return durableAckCursor{}, errors.New("sessionshim: durable ack does not match the live shim incarnation")
 	}
 	return ack, nil
+}
+
+func (r *Registry) checkDurableAckModes(name string) error {
+	dirInfo, err := os.Stat(r.dir)
+	if err != nil {
+		return fmt.Errorf("sessionshim: stat durable ack directory: %w", err)
+	}
+	if !dirInfo.IsDir() || dirInfo.Mode().Perm() != RegistryDirMode {
+		return fmt.Errorf("%w: durable ack directory mode %#o, want exactly %#o",
+			ErrRegistryUnsafe, dirInfo.Mode().Perm(), RegistryDirMode)
+	}
+	if err := checkOwnedBySelf(dirInfo, r.dir); err != nil {
+		return err
+	}
+	root, err := r.openRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	f, err := root.Open(name)
+	if err != nil {
+		return fmt.Errorf("sessionshim: open durable ack: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("sessionshim: stat durable ack: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != RecordFileMode {
+		return fmt.Errorf("%w: durable ack %s mode %#o, want exactly %#o",
+			ErrRegistryUnsafe, name, info.Mode().Perm(), RecordFileMode)
+	}
+	return checkOwnedBySelf(info, name)
 }
 
 func (r *Registry) removeDurableAck(id Identity, shimID string, processEpoch uint64) error {

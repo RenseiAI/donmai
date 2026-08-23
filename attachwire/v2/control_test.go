@@ -53,6 +53,7 @@ func TestV2ControlVocabularyRoundTripsCanonicalStrings(t *testing.T) {
 	t.Parallel()
 	messages := []attachwire.ControlMessage{
 		HostGap{FromSeq: 7, ToSeq: 9, Reason: GapRingEvicted},
+		HostGap{FromSeq: 10, ToSeq: 12, Reason: GapControllerUnforwarded},
 		CarrierActivate{PTYEpoch: 4, CarrierEpoch: 8},
 		CarrierActive{PTYEpoch: 4, CarrierEpoch: 8, AckSeq: 10},
 		HostAck{PTYEpoch: 4, CarrierEpoch: 8, AckSeq: 11},
@@ -93,6 +94,7 @@ func TestV2ClosedControlsRejectUnknownDuplicateAndNumericFields(t *testing.T) {
 		[]byte(`{"type":"host_ack","ptyEpoch":"1","carrierEpoch":"2","ackSeq":"3","extra":true}`),
 		[]byte(`{"type":"host_ack","ptyEpoch":"1","carrierEpoch":"2","ackSeq":"3","ackSeq":"3"}`),
 		[]byte(`{"type":"host_gap","fromSeq":"01","toSeq":"2","reason":"ring_evicted"}`),
+		[]byte(`{"type":"host_gap","fromSeq":"1","toSeq":"2","reason":"unknown"}`),
 	}
 	for _, raw := range cases {
 		if _, err := DecodeControl(raw); !errors.Is(err, ErrMalformedControl) {

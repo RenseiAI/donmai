@@ -27,6 +27,7 @@ type SessionShimHostAttestation struct {
 const (
 	SessionShimCapabilityAuthoritativeSnapshotV2   = "authoritative_snapshot_v2"
 	SessionShimCapabilityCarrierEpochPrepareCommit = "carrier_epoch_prepare_commit"
+	SessionShimCapabilityDurableCarrierProofV1     = "durable_carrier_proof_v1"
 	SessionShimCapabilityFullHostFrameV3           = "full_host_frame_v3"
 	SessionShimCapabilityInteractiveAttachV2       = "interactive_attach_v2"
 )
@@ -34,6 +35,7 @@ const (
 var requiredSessionShimHostCapabilities = []string{
 	SessionShimCapabilityAuthoritativeSnapshotV2,
 	SessionShimCapabilityCarrierEpochPrepareCommit,
+	SessionShimCapabilityDurableCarrierProofV1,
 	SessionShimCapabilityFullHostFrameV3,
 	SessionShimCapabilityInteractiveAttachV2,
 }

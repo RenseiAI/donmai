@@ -71,6 +71,14 @@ type Session struct {
 	// Written only from onOutput, immediately after the VT is fed.
 	altActive atomic.Bool
 
+	// sequenceBarrier is the selected-v3 adoption output barrier. Every path
+	// that allocates a positive host sequence takes the read side. A replacement
+	// controller takes the write side before sampling Hello.LastSeq and either
+	// releases it or allocates the mandatory recovery Snapshot while still
+	// holding it. PTY reads may block in their bounded Go/kernel buffers, but no
+	// Output/Resize/Marker/Snapshot/Exit sequence can overtake that boundary.
+	sequenceBarrier sync.RWMutex
+
 	// mu guards all sequence/ring/subscription/VT/recorder state below. The VT
 	// is fed only from run() and snapshotted only under mu, so feeding and
 	// snapshots are consistent (§12 single-feeder discipline).
@@ -177,6 +185,8 @@ func (s *Session) run() {
 // onOutput feeds one read chunk to the VT (which may synthesize query answers to
 // the master) then publishes it as Output frame(s), split to maxOutputFrame.
 func (s *Session) onOutput(data []byte) {
+	s.sequenceBarrier.RLock()
+	defer s.sequenceBarrier.RUnlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.exited {
@@ -207,6 +217,7 @@ func (s *Session) finalize() {
 		waitErr := s.cmd.Wait()
 		exitPayload := exitPayloadFrom(waitErr)
 
+		s.sequenceBarrier.RLock()
 		s.mu.Lock()
 		s.exited = true
 		s.exitPayload = exitPayload
@@ -227,6 +238,7 @@ func (s *Session) finalize() {
 			subs = append(subs, sub)
 		}
 		s.mu.Unlock()
+		s.sequenceBarrier.RUnlock()
 
 		// Close subscriptions only after the Exit frame has been delivered.
 		for _, sub := range subs {
@@ -465,6 +477,8 @@ func (s *Session) Resize(cols, rows, pxWidth, pxHeight uint32) error {
 		return err // FramingError (§8: cols==0 || rows==0)
 	}
 
+	s.sequenceBarrier.RLock()
+	defer s.sequenceBarrier.RUnlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.exited {
@@ -540,8 +554,14 @@ func (s *Session) setWinsizeLocked(cols, rows, pxW, pxH uint16) error {
 // subscription (inStream == true). After Exit it returns a seq==0 frame with
 // atSeq == the Exit seq and inStream == false (§12.2 out-of-namespace).
 func (s *Session) EmitSnapshot() (attachwire.Frame, bool, error) {
+	s.sequenceBarrier.RLock()
+	defer s.sequenceBarrier.RUnlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.emitSnapshotLocked()
+}
+
+func (s *Session) emitSnapshotLocked() (attachwire.Frame, bool, error) {
 	scr := s.buildScreenLocked()
 	snapBytes, err := scr.Encode()
 	if err != nil {
@@ -582,6 +602,8 @@ func (s *Session) EmitSnapshot() (attachwire.Frame, bool, error) {
 // EmitMarker appends a seq-bearing Marker frame (§3.1) to the stream and the
 // recording. Returns an error after Exit (§12.2).
 func (s *Session) EmitMarker(label string) error {
+	s.sequenceBarrier.RLock()
+	defer s.sequenceBarrier.RUnlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.exited {
@@ -591,6 +613,60 @@ func (s *Session) EmitMarker(label string) error {
 	s.publishLocked(f)
 	s.rec.marker(f.RelTime, label)
 	return nil
+}
+
+// OutputBarrier freezes positive host-sequence allocation at one exact live
+// boundary. It is intentionally narrow: snapshots/reads/subscriptions remain
+// available, while every sequence allocator blocks until Release or
+// EmitSnapshot. The latter allocates the mandatory Snapshot atomically as the
+// first successor before releasing queued PTY output.
+type OutputBarrier struct {
+	session *Session
+	once    sync.Once
+}
+
+// BeginOutputBarrier freezes sequence allocation and returns the exact current
+// LastSeq. Callers must eventually Release or EmitSnapshot.
+func (s *Session) BeginOutputBarrier() (*OutputBarrier, attachwire.HostSeq) {
+	s.sequenceBarrier.Lock()
+	s.mu.Lock()
+	last := s.lastSeqLocked()
+	s.mu.Unlock()
+	return &OutputBarrier{session: s}, last
+}
+
+// Release ends the barrier without allocating a frame. It is idempotent.
+func (b *OutputBarrier) Release() {
+	if b == nil || b.session == nil {
+		return
+	}
+	b.once.Do(func() { b.session.sequenceBarrier.Unlock() })
+}
+
+// EmitSnapshot allocates the mandatory recovery Snapshot as the exact first
+// successor to the frozen boundary, then releases queued output. Calling it
+// after the barrier was already released is a typed error.
+func (b *OutputBarrier) EmitSnapshot() (attachwire.Frame, bool, error) {
+	if b == nil || b.session == nil {
+		return attachwire.Frame{}, false, errors.New("ptyhost: output barrier is unavailable")
+	}
+	var (
+		frame    attachwire.Frame
+		inStream bool
+		err      error
+		emitted  bool
+	)
+	b.once.Do(func() {
+		emitted = true
+		b.session.mu.Lock()
+		frame, inStream, err = b.session.emitSnapshotLocked()
+		b.session.mu.Unlock()
+		b.session.sequenceBarrier.Unlock()
+	})
+	if !emitted {
+		return attachwire.Frame{}, false, errors.New("ptyhost: output barrier is already released")
+	}
+	return frame, inStream, err
 }
 
 // Subscribe returns a live feed of host-produced seq-bearing frames starting at

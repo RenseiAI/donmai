@@ -71,8 +71,17 @@ type AdoptionPreparation struct {
 	ShimID                      string
 	ProcessEpoch                uint64
 	CurrentControllerGeneration shimwire.Generation
-	LastForwardedSeq            uint64
-	SelectedVersion             uint32
+	// LocalResumeFrom is the normalized successor of the selected-v3 shim ACK
+	// sidecar, or 1 when no sidecar exists. It is local comparison evidence,
+	// never an external carrier cursor.
+	LocalResumeFrom uint64
+	// LastHostSeq is the authenticated Hello.LastSeq frozen by selected-v3
+	// adoption preparation.
+	LastHostSeq uint64
+	// LastForwardedSeq is retained as a deprecated source-compatible alias for
+	// LocalResumeFrom-1. It is not durable-carrier proof authority.
+	LastForwardedSeq uint64
+	SelectedVersion  uint32
 }
 
 // PreparedAdoption is the per-session portion of Welcome supplied by a
@@ -90,6 +99,10 @@ type PreparedAdoption struct {
 	// above (for example a fence revision and expected adoption revision). Donmai
 	// never parses it; the daemon hands the bytes unchanged to OnAdoption.
 	Correlation []byte
+	// ResumeFrom is the proof-resolved first requested sequence. Nil preserves
+	// the local/standalone floor. A non-nil value may raise but never regress
+	// LocalResumeFrom and may not exceed authenticated LastHostSeq+1.
+	ResumeFrom *uint64
 }
 
 // ErrAdoptionPreparation reports a composing dependency that failed before
@@ -336,27 +349,47 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 
 func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Controller, error) {
 	id := rec.Identity()
-	resume := uint64(0)
-	durableAck, ackErr := opts.Registry.getDurableAck(rec)
-	hasDurableAck := ackErr == nil
-	if ackErr != nil && !errors.Is(ackErr, fs.ErrNotExist) {
-		return nil, fmt.Errorf("sessionshim: load durable acknowledgement for %s: %w", id, ackErr)
+	probe := ControllerOptions{
+		ProtocolMin: opts.ProtocolMin, ProtocolMax: opts.ProtocolMax,
+		RequireFullHostFrames: opts.RequireFullHostFrames,
 	}
+	localMin, localMax, rangeErr := probe.protocolRange()
+	if rangeErr != nil {
+		return nil, rangeErr
+	}
+	selected, selectErr := shimwire.Negotiate(rec.ProtocolMin, rec.ProtocolMax, localMin, localMax)
+	if selectErr != nil {
+		return nil, selectErr
+	}
+	localResumeFrom := uint64(1)
+	var durableAckGeneration shimwire.Generation
+	if selected >= shimwire.V3 {
+		durableAck, ackErr := opts.Registry.getDurableAck(rec)
+		hasDurableAck := ackErr == nil
+		if ackErr != nil && !errors.Is(ackErr, fs.ErrNotExist) {
+			return nil, fmt.Errorf("sessionshim: load durable acknowledgement for %s: %w", id, ackErr)
+		}
+		if hasDurableAck {
+			if durableAck.AckedSeq == ^uint64(0) {
+				return nil, fmt.Errorf("sessionshim: durable acknowledgement for %s cannot advance past uint64 max", id)
+			}
+			localResumeFrom = durableAck.AckedSeq + 1
+			durableAckGeneration = durableAck.ControllerGeneration
+		}
+	}
+	resume := uint64(0)
 	if opts.ResumeFrom != nil {
 		resume = opts.ResumeFrom(id)
-		externalAck := uint64(0)
-		if resume > 0 {
-			externalAck = resume - 1
+		effectiveResume := resume
+		if effectiveResume == 0 {
+			effectiveResume = 1
 		}
-		if hasDurableAck && externalAck < durableAck.AckedSeq {
-			return nil, fmt.Errorf("%w for %s: external cursor %d regresses shim-persisted acknowledgement %d",
-				ErrAdoptionPreparation, id, externalAck, durableAck.AckedSeq)
+		if selected >= shimwire.V3 && effectiveResume < localResumeFrom {
+			return nil, fmt.Errorf("%w for %s: external resume %d regresses shim local floor %d",
+				ErrAdoptionPreparation, id, effectiveResume, localResumeFrom)
 		}
-	} else if hasDurableAck {
-		if durableAck.AckedSeq == ^uint64(0) {
-			return nil, fmt.Errorf("sessionshim: durable acknowledgement for %s cannot advance past uint64 max", id)
-		}
-		resume = durableAck.AckedSeq + 1
+	} else if selected >= shimwire.V3 {
+		resume = localResumeFrom
 	}
 	expected := ""
 	if opts.ExpectedWorkarea != nil {
@@ -364,14 +397,17 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 	}
 
 	copts := ControllerOptions{
-		ControllerID:          opts.ControllerID,
-		ResumeFrom:            resume,
-		ExpectedWorkarea:      expected,
-		DialTimeout:           opts.DialTimeout,
-		Logger:                opts.Logger,
-		ProtocolMin:           opts.ProtocolMin,
-		ProtocolMax:           opts.ProtocolMax,
-		RequireFullHostFrames: opts.RequireFullHostFrames,
+		ControllerID:               opts.ControllerID,
+		ResumeFrom:                 resume,
+		LocalResumeFrom:            localResumeFrom,
+		ResumeExternallyConfigured: opts.ResumeFrom != nil,
+		DurableAckGeneration:       durableAckGeneration,
+		ExpectedWorkarea:           expected,
+		DialTimeout:                opts.DialTimeout,
+		Logger:                     opts.Logger,
+		ProtocolMin:                opts.ProtocolMin,
+		ProtocolMax:                opts.ProtocolMax,
+		RequireFullHostFrames:      opts.RequireFullHostFrames,
 	}
 	if opts.NextGeneration != nil {
 		next := opts.NextGeneration

@@ -69,7 +69,9 @@ const (
 //
 // For receipt_stored, AckSeq is the pre-staged daemon/shim cursor while
 // CandidateSnapshotSeq and CandidateSnapshot identify the already-journaled
-// raw Snapshot. A persisted host_gap may make CandidateSnapshotSeq > AckSeq+1.
+// raw Snapshot. GapFromSeq/GapToSeq/GapReason are either all zero or the exact
+// proof-bound controller_unforwarded N+1..K transition immediately before that
+// Snapshot.
 // The Relay-private request UUID is deliberately absent because the ratified
 // host wire never exposes it; Relay binds that correlation internally. PTYEpoch
 // and CarrierEpoch must exactly equal the authenticated token claims in both
@@ -81,6 +83,9 @@ type V2ResumeDisposition struct {
 	AckSeq               uint64
 	CandidateSnapshotSeq uint64
 	CandidateSnapshot    []byte
+	GapFromSeq           uint64
+	GapToSeq             uint64
+	GapReason            attachwirev2.GapReason
 }
 
 func (c *V2HostConfig) withDefaults() error {
@@ -130,7 +135,8 @@ func validateV2ResumeDisposition(resume V2ResumeDisposition) error {
 	}
 	switch resume.State {
 	case V2ResumeActive:
-		if resume.AckSeq == 0 || resume.CandidateSnapshotSeq != 0 || len(resume.CandidateSnapshot) != 0 {
+		if resume.AckSeq == 0 || resume.CandidateSnapshotSeq != 0 || len(resume.CandidateSnapshot) != 0 ||
+			resume.GapFromSeq != 0 || resume.GapToSeq != 0 || resume.GapReason != "" {
 			return errors.New("attachclient: active v2 resume disposition is not exact")
 		}
 		return nil
@@ -146,6 +152,13 @@ func validateV2ResumeDisposition(resume V2ResumeDisposition) error {
 		envelope, err := attachwire.DecodeSnapshotEnvelope(frame.Payload)
 		if err != nil || envelope.AtSeq != frame.Seq-1 {
 			return errors.New("attachclient: receipt-stored v2 resume Snapshot correlation is not exact")
+		}
+		gapAbsent := resume.GapFromSeq == 0 && resume.GapToSeq == 0 && resume.GapReason == ""
+		gapExact := resume.GapFromSeq == resume.AckSeq+1 &&
+			resume.GapToSeq == resume.CandidateSnapshotSeq-1 &&
+			resume.GapReason == attachwirev2.GapControllerUnforwarded
+		if !gapAbsent && !gapExact {
+			return errors.New("attachclient: receipt-stored v2 resume gap is not exact")
 		}
 		return nil
 	default:
@@ -183,6 +196,7 @@ type V2HostCandidate struct {
 	// highestSent is the highest sequence-bearing raw frame written on this leg.
 	highestSent         uint64
 	gapTo               uint64
+	gapReason           attachwirev2.GapReason
 	gapPending          bool
 	candidateSent       bool
 	snapshotRequestSeen bool
@@ -209,6 +223,9 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 	}
 	claims, err := parseV2HostClaims(token, cfg.Now())
 	if err != nil {
+		return nil, err
+	}
+	if err := validateV2ProofDisposition(claims, cfg); err != nil {
 		return nil, err
 	}
 	if cfg.ResumeDisposition != nil &&
@@ -267,6 +284,37 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 	return candidate, nil
 }
 
+func validateV2ProofDisposition(claims v2HostClaims, cfg V2HostConfig) error {
+	if cfg.ResumeDisposition == nil {
+		if cfg.DurableHighWater != claims.CarrierBoundary {
+			return errors.New("attachclient: v2 durable high-water does not match signed carrier boundary")
+		}
+		return nil
+	}
+	resume := *cfg.ResumeDisposition
+	switch resume.State {
+	case V2ResumeReceiptStored:
+		if resume.AckSeq != claims.CarrierBoundary ||
+			resume.CandidateSnapshotSeq != claims.ResolvedBoundary+1 {
+			return errors.New("attachclient: receipt-stored resume does not match signed proof boundaries")
+		}
+		if claims.ResolvedBoundary == claims.CarrierBoundary {
+			if resume.GapFromSeq != 0 || resume.GapToSeq != 0 || resume.GapReason != "" {
+				return errors.New("attachclient: receipt-stored resume invented a proof gap")
+			}
+		} else if resume.GapFromSeq != claims.CarrierBoundary+1 ||
+			resume.GapToSeq != claims.ResolvedBoundary ||
+			resume.GapReason != attachwirev2.GapControllerUnforwarded {
+			return errors.New("attachclient: receipt-stored resume proof gap does not match signed boundaries")
+		}
+	case V2ResumeActive:
+		if resume.AckSeq < claims.ResolvedBoundary+1 {
+			return errors.New("attachclient: active resume regresses the activated proof transition")
+		}
+	}
+	return nil
+}
+
 func int64Pointer(value uint64) *int64 {
 	if value > uint64(^uint64(0)>>1) {
 		return nil
@@ -308,10 +356,23 @@ func (c *V2HostCandidate) SendCandidateSnapshot(ctx context.Context, raw []byte)
 	if err != nil || frame.Type != attachwire.TypeSnapshot || frame.Seq == 0 {
 		return errors.New("attachclient: v2 candidate requires an exact sequence-bearing Snapshot frame")
 	}
+	envelope, err := attachwire.DecodeSnapshotEnvelope(frame.Payload)
+	if err != nil || frame.Seq != c.claims.ResolvedBoundary+1 || envelope.AtSeq != c.claims.ResolvedBoundary {
+		return errors.New("attachclient: v2 candidate Snapshot does not match signed resolved boundary")
+	}
 	c.mu.Lock()
 	if c.closed || c.resumeDisposition != nil || c.active || c.candidateSent || !c.snapshotRequestSeen {
 		c.mu.Unlock()
 		return errors.New("attachclient: v2 candidate Snapshot is late, duplicate, or unavailable")
+	}
+	if c.claims.ResolvedBoundary > c.claims.CarrierBoundary &&
+		(!c.gapPending || c.gapReason != attachwirev2.GapControllerUnforwarded) {
+		c.mu.Unlock()
+		return errors.New("attachclient: v2 candidate omitted the proof-bound controller gap")
+	}
+	if c.claims.ResolvedBoundary == c.claims.CarrierBoundary && c.gapPending {
+		c.mu.Unlock()
+		return errors.New("attachclient: v2 candidate invented a proof-bound gap")
 	}
 	if c.gapPending {
 		if frame.Seq != c.gapTo+1 {
@@ -329,6 +390,7 @@ func (c *V2HostCandidate) SendCandidateSnapshot(ctx context.Context, raw []byte)
 	c.highestSent = frame.Seq
 	c.candidateSent = true
 	c.gapPending = false
+	c.gapReason = ""
 	c.pendingSeq = frame.Seq
 	c.pendingRaw = append([]byte(nil), raw...)
 	c.mu.Unlock()
@@ -338,9 +400,21 @@ func (c *V2HostCandidate) SendCandidateSnapshot(ctx context.Context, raw []byte)
 // DeclareHostGap sends the exact replay-gap disposition. The following durable
 // send must be the authoritative Snapshot at toSeq+1.
 func (c *V2HostCandidate) DeclareHostGap(ctx context.Context, fromSeq, toSeq uint64) error {
+	return c.DeclareHostGapWithReason(ctx, fromSeq, toSeq, attachwirev2.GapRingEvicted)
+}
+
+// DeclareHostGapWithReason sends one exact gap from the closed v2 reason set.
+// controller_unforwarded is accepted only for the signed proof-bound N+1..K
+// transition; ordinary callers retain DeclareHostGap's ring_evicted default.
+func (c *V2HostCandidate) DeclareHostGapWithReason(
+	ctx context.Context,
+	fromSeq, toSeq uint64,
+	reason attachwirev2.GapReason,
+) error {
 	c.durableMu.Lock()
 	defer c.durableMu.Unlock()
-	if fromSeq == 0 || toSeq < fromSeq {
+	if fromSeq == 0 || toSeq < fromSeq ||
+		(reason != attachwirev2.GapRingEvicted && reason != attachwirev2.GapControllerUnforwarded) {
 		return errors.New("attachclient: invalid v2 host gap")
 	}
 	c.mu.Lock()
@@ -348,9 +422,20 @@ func (c *V2HostCandidate) DeclareHostGap(ctx context.Context, fromSeq, toSeq uin
 		c.mu.Unlock()
 		return errors.New("attachclient: v2 host gap does not begin at the contiguous durable cursor")
 	}
+	if !c.active {
+		if reason != attachwirev2.GapControllerUnforwarded || !c.snapshotRequestSeen ||
+			fromSeq != c.claims.CarrierBoundary+1 || toSeq != c.claims.ResolvedBoundary ||
+			c.claims.ResolvedBoundary <= c.claims.CarrierBoundary {
+			c.mu.Unlock()
+			return errors.New("attachclient: pre-active gap does not match signed controller_unforwarded proof boundaries")
+		}
+	} else if reason == attachwirev2.GapControllerUnforwarded {
+		c.mu.Unlock()
+		return errors.New("attachclient: controller_unforwarded gap is not legal after activation")
+	}
 	control, err := attachwirev2.BuildControlFrame(attachwirev2.HostGap{
 		FromSeq: attachwirev2.DecimalUint64(fromSeq), ToSeq: attachwirev2.DecimalUint64(toSeq),
-		Reason: attachwirev2.GapRingEvicted,
+		Reason: reason,
 	})
 	if err != nil {
 		c.mu.Unlock()
@@ -362,6 +447,7 @@ func (c *V2HostCandidate) DeclareHostGap(ctx context.Context, fromSeq, toSeq uin
 	}
 	c.gapPending = true
 	c.gapTo = toSeq
+	c.gapReason = reason
 	c.mu.Unlock()
 	return nil
 }
@@ -486,6 +572,7 @@ func (c *V2HostCandidate) SendRawFrameDurable(ctx context.Context, raw []byte) e
 		c.pendingSeq = frame.Seq
 		c.pendingRaw = append([]byte(nil), raw...)
 		c.gapPending = false
+		c.gapReason = ""
 	}
 	c.mu.Unlock()
 	return c.waitForAck(ctx, frame.Seq, ackVersion)

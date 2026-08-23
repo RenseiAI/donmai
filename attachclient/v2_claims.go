@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,16 +16,25 @@ import (
 )
 
 type v2HostClaims struct {
-	SessionID    string `json:"sessionId"`
-	RoomID       string `json:"roomId"`
-	Role         string `json:"role"`
-	Epoch        uint64 `json:"epoch"`
-	CarrierEpoch uint64 `json:"carrier_epoch"`
-	Protocol     string `json:"protocol"`
-	OrgID        string `json:"orgId"`
-	IssuedAt     int64  `json:"iat"`
-	ExpiresAt    int64  `json:"exp"`
-	Audience     string `json:"aud"`
+	SessionID                     string `json:"sessionId"`
+	RoomID                        string `json:"roomId"`
+	Role                          string `json:"role"`
+	Epoch                         uint64 `json:"epoch"`
+	CarrierEpoch                  uint64 `json:"carrier_epoch"`
+	Protocol                      string `json:"protocol"`
+	OrgID                         string `json:"orgId"`
+	IssuedAt                      int64  `json:"iat"`
+	ExpiresAt                     int64  `json:"exp"`
+	Audience                      string `json:"aud"`
+	StoreAuthorityID              string `json:"-"`
+	ProofRevision                 uint64 `json:"-"`
+	ProofDigest                   string `json:"-"`
+	CarrierBoundary               uint64 `json:"-"`
+	ResolvedBoundary              uint64 `json:"-"`
+	LastHostSeq                   uint64 `json:"-"`
+	ReservationRequestID          string `json:"-"`
+	ReservationRequestDigest      string `json:"-"`
+	ReservedCandidateCarrierEpoch uint64 `json:"-"`
 	// Secret/correlation fields are decoded only for strict shape validation and
 	// never retained in this result, logs, errors, or diagnostics.
 }
@@ -64,7 +74,11 @@ func parseV2HostClaims(token string, now time.Time) (v2HostClaims, error) {
 	}
 	wantFields := []string{
 		"sessionId", "roomId", "role", "epoch", "carrier_epoch",
-		"handoff_nonce", "prepared_correlation_digest", "protocol", "orgId",
+		"handoff_nonce", "prepared_correlation_digest",
+		"store_authority_id", "proof_revision", "proof_digest",
+		"carrier_boundary", "resolved_boundary", "last_host_seq",
+		"reservation_request_id", "reservation_request_digest",
+		"reserved_candidate_carrier_epoch", "protocol", "orgId",
 		"iat", "exp", "aud", "jti",
 	}
 	if len(fields) != len(wantFields) {
@@ -98,7 +112,63 @@ func parseV2HostClaims(token string, now time.Time) (v2HostClaims, error) {
 		!canonicalUUID.MatchString(jti) {
 		return v2HostClaims{}, fmt.Errorf("attachclient: invalid v2 host credential correlation claims")
 	}
+	var storeAuthority, proofDigest, requestID, requestDigest string
+	if json.Unmarshal(fields["store_authority_id"], &storeAuthority) != nil ||
+		json.Unmarshal(fields["proof_digest"], &proofDigest) != nil ||
+		json.Unmarshal(fields["reservation_request_id"], &requestID) != nil ||
+		json.Unmarshal(fields["reservation_request_digest"], &requestDigest) != nil ||
+		storeAuthority == "" || len(storeAuthority) > 256 || strings.TrimSpace(storeAuthority) != storeAuthority ||
+		!canonicalUUID.MatchString(requestID) || !canonicalSHA256(proofDigest) || !canonicalSHA256(requestDigest) {
+		return v2HostClaims{}, fmt.Errorf("attachclient: invalid v2 host credential proof identity claims")
+	}
+	proofRevision, err := parseCanonicalUintClaim(fields["proof_revision"], true)
+	if err != nil {
+		return v2HostClaims{}, fmt.Errorf("attachclient: invalid v2 host credential proof revision")
+	}
+	carrierBoundary, err := parseCanonicalUintClaim(fields["carrier_boundary"], false)
+	if err != nil {
+		return v2HostClaims{}, fmt.Errorf("attachclient: invalid v2 host credential carrier boundary")
+	}
+	resolvedBoundary, err := parseCanonicalUintClaim(fields["resolved_boundary"], false)
+	if err != nil {
+		return v2HostClaims{}, fmt.Errorf("attachclient: invalid v2 host credential resolved boundary")
+	}
+	lastHostSeq, err := parseCanonicalUintClaim(fields["last_host_seq"], false)
+	if err != nil {
+		return v2HostClaims{}, fmt.Errorf("attachclient: invalid v2 host credential last host sequence")
+	}
+	reservedEpoch, err := parseCanonicalUintClaim(fields["reserved_candidate_carrier_epoch"], true)
+	if err != nil || reservedEpoch != claims.CarrierEpoch || resolvedBoundary != lastHostSeq ||
+		resolvedBoundary < carrierBoundary || resolvedBoundary == ^uint64(0) {
+		return v2HostClaims{}, fmt.Errorf("attachclient: invalid v2 host credential proof boundary claims")
+	}
+	claims.StoreAuthorityID = storeAuthority
+	claims.ProofRevision = proofRevision
+	claims.ProofDigest = proofDigest
+	claims.CarrierBoundary = carrierBoundary
+	claims.ResolvedBoundary = resolvedBoundary
+	claims.LastHostSeq = lastHostSeq
+	claims.ReservationRequestID = requestID
+	claims.ReservationRequestDigest = requestDigest
+	claims.ReservedCandidateCarrierEpoch = reservedEpoch
 	return claims, nil
+}
+
+func parseCanonicalUintClaim(raw json.RawMessage, positive bool) (uint64, error) {
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return 0, fmt.Errorf("claim is not a decimal string")
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || strconv.FormatUint(parsed, 10) != value || (positive && parsed == 0) {
+		return 0, fmt.Errorf("claim is not canonical uint64")
+	}
+	return parsed, nil
+}
+
+func canonicalSHA256(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(value) == 64 && len(decoded) == 32 && strings.ToLower(value) == value
 }
 
 func strictClaimsObject(data []byte) (map[string]json.RawMessage, error) {

@@ -23,14 +23,23 @@ func v2TestToken(t *testing.T, mutate func(map[string]any)) string {
 	claims := map[string]any{
 		"sessionId": "session-v2", "roomId": "session-v2", "role": "host",
 		"epoch": 3, "carrier_epoch": 9,
-		"handoff_nonce":               base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
-		"prepared_correlation_digest": strings.Repeat("a", 64),
-		"protocol":                    attachwirev2.ProtocolVersion,
-		"orgId":                       "org-v2",
-		"iat":                         time.Now().Add(-time.Minute).Unix(),
-		"exp":                         time.Now().Add(time.Hour).Unix(),
-		"aud":                         "relay",
-		"jti":                         "123e4567-e89b-42d3-a456-426614174000",
+		"handoff_nonce":                    base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+		"prepared_correlation_digest":      strings.Repeat("a", 64),
+		"store_authority_id":               "store-v2-test",
+		"proof_revision":                   "1",
+		"proof_digest":                     strings.Repeat("b", 64),
+		"carrier_boundary":                 "4",
+		"resolved_boundary":                "4",
+		"last_host_seq":                    "4",
+		"reservation_request_id":           "223e4567-e89b-42d3-a456-426614174000",
+		"reservation_request_digest":       strings.Repeat("c", 64),
+		"reserved_candidate_carrier_epoch": "9",
+		"protocol":                         attachwirev2.ProtocolVersion,
+		"orgId":                            "org-v2",
+		"iat":                              time.Now().Add(-time.Minute).Unix(),
+		"exp":                              time.Now().Add(time.Hour).Unix(),
+		"aud":                              "relay",
+		"jti":                              "123e4567-e89b-42d3-a456-426614174000",
 	}
 	if mutate != nil {
 		mutate(claims)
@@ -75,7 +84,7 @@ func TestV2CandidateActivationAndDurableAckOrdering(t *testing.T) {
 	allowOutputAck := make(chan struct{})
 	retryFirstSeen := make(chan struct{})
 	serverErr := make(chan error, 1)
-	candidateSnapshot := attachwire.Frame{Type: attachwire.TypeSnapshot, Seq: 5, Payload: []byte{0, 1, 2, 0xff}}
+	candidateSnapshot := v2ResumeSnapshot(5)
 	output := attachwire.Frame{Type: attachwire.TypeOutput, Seq: 6, Payload: []byte{0, 0xff, '\r', '\n'}}
 	recoverySnapshot := attachwire.Frame{Type: attachwire.TypeSnapshot, Seq: 9, Payload: []byte{9, 0, 0xff}}
 	retryOutput := attachwire.Frame{Type: attachwire.TypeOutput, Seq: 10, Payload: []byte("retry-exact")}
@@ -440,11 +449,18 @@ func TestV2ReceiptStoredResumeActivatesExactPendingSnapshotWithoutResend(t *test
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
-		AttachURL:   strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
-		TokenSource: func(context.Context) (string, error) { return v2TestToken(t, nil), nil },
+		AttachURL: strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) {
+			return v2TestToken(t, func(claims map[string]any) {
+				claims["carrier_boundary"] = "10"
+				claims["resolved_boundary"] = "11"
+				claims["last_host_seq"] = "11"
+			}), nil
+		},
 		ResumeDisposition: &V2ResumeDisposition{
 			State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10,
 			CandidateSnapshotSeq: 12, CandidateSnapshot: snapshot.Encode(),
+			GapFromSeq: 11, GapToSeq: 11, GapReason: attachwirev2.GapControllerUnforwarded,
 		},
 	})
 	if err != nil {
@@ -545,11 +561,91 @@ func TestV2HostClaimsAreExactAndIndependentFromV1(t *testing.T) {
 		func(claims map[string]any) { claims["userId"] = "not-host-only" },
 		func(claims map[string]any) { delete(claims, "carrier_epoch") },
 		func(claims map[string]any) { claims["carrier_epoch"] = 0 },
+		func(claims map[string]any) { delete(claims, "proof_digest") },
+		func(claims map[string]any) { claims["proof_revision"] = 1 },
+		func(claims map[string]any) { claims["proof_revision"] = "0" },
+		func(claims map[string]any) { claims["carrier_boundary"] = "5" },
+		func(claims map[string]any) { claims["resolved_boundary"] = "5" },
+		func(claims map[string]any) { claims["last_host_seq"] = "5" },
+		func(claims map[string]any) { claims["reserved_candidate_carrier_epoch"] = "10" },
+		func(claims map[string]any) { claims["reservation_request_digest"] = strings.Repeat("A", 64) },
 	}
 	for _, mutate := range cases {
 		if _, err := parseV2HostClaims(v2TestToken(t, mutate), now); err == nil {
 			t.Fatal("invalid v2 claim set was accepted")
 		}
+	}
+}
+
+func TestV2ProofBoundControllerGapPrecedesExactResolvedSnapshot(t *testing.T) {
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, _, err := readV2TestFrame(ctx, conn); err != nil {
+			serverErr <- err
+			return
+		}
+		request, _ := attachwirev2.BuildControlFrame(attachwire.SnapshotRequest{Reason: attachwire.ReasonResync})
+		if err := conn.Write(ctx, websocket.MessageBinary, request.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		gapFrame, _, err := readV2TestFrame(ctx, conn)
+		gapMessage, gapErr := v2ControlFromFrame(gapFrame)
+		gap, ok := gapMessage.(attachwirev2.HostGap)
+		if err != nil || gapErr != nil || !ok || gap.FromSeq != 5 || gap.ToSeq != 6 ||
+			gap.Reason != attachwirev2.GapControllerUnforwarded {
+			serverErr <- fmt.Errorf("proof gap = %#v, %v, %v", gapMessage, err, gapErr)
+			return
+		}
+		_, raw, err := readV2TestFrame(ctx, conn)
+		frame, decodeErr := attachwire.DecodeFrame(raw)
+		envelope, envelopeErr := attachwire.DecodeSnapshotEnvelope(frame.Payload)
+		if err != nil || decodeErr != nil || envelopeErr != nil || frame.Seq != 7 || envelope.AtSeq != 6 {
+			serverErr <- fmt.Errorf("proof Snapshot = %+v/%+v, %v/%v/%v", frame, envelope, err, decodeErr, envelopeErr)
+			return
+		}
+		serverErr <- nil
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
+		AttachURL: strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) {
+			return v2TestToken(t, func(claims map[string]any) {
+				claims["resolved_boundary"] = "6"
+				claims["last_host_seq"] = "6"
+			}), nil
+		},
+		DurableHighWater: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer candidate.Close() //nolint:errcheck
+	if _, err := candidate.WaitMandatorySnapshotRequest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := candidate.DeclareHostGap(ctx, 5, 6); err == nil {
+		t.Fatal("pre-active proof recovery accepted ring_evicted in place of controller_unforwarded")
+	}
+	if err := candidate.DeclareHostGapWithReason(ctx, 5, 6, attachwirev2.GapControllerUnforwarded); err != nil {
+		t.Fatal(err)
+	}
+	if err := candidate.SendCandidateSnapshot(ctx, v2ResumeSnapshot(7).Encode()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
 	}
 }
 

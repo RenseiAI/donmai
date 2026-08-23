@@ -87,6 +87,15 @@ type ControllerOptions struct {
 	// ResumeFrom is the first sequence this controller still needs, i.e. its
 	// durable last_forwarded_seq + 1. Zero means "from the start of the stream".
 	ResumeFrom uint64
+	// LocalResumeFrom is the normalized selected-v3 shim-side floor exposed to
+	// PrepareAdoption. Zero normalizes to 1 for direct standalone Dial callers.
+	LocalResumeFrom uint64
+	// ResumeExternallyConfigured distinguishes an AdoptOptions.ResumeFrom
+	// callback from the local sidecar floor carried in ResumeFrom.
+	ResumeExternallyConfigured bool
+	// DurableAckGeneration is the generation persisted beside LocalResumeFrom.
+	// It must not be ahead of authenticated Hello.Generation.
+	DurableAckGeneration shimwire.Generation
 	// ExpectedWorkarea, when non-empty, is compared against the shim's
 	// self-reported workarea. A mismatch refuses adoption.
 	ExpectedWorkarea string
@@ -349,23 +358,37 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 	if err != nil {
 		return err
 	}
+	localResumeFrom := opts.LocalResumeFrom
+	if localResumeFrom == 0 {
+		localResumeFrom = 1
+	}
+	if selected >= shimwire.V3 {
+		if opts.DurableAckGeneration > hello.Generation {
+			return fmt.Errorf("%w: durable acknowledgement generation %d is ahead of Hello generation %d",
+				ErrAdoptionPreparation, opts.DurableAckGeneration, hello.Generation)
+		}
+		if hello.LastSeq != ^uint64(0) && localResumeFrom > hello.LastSeq+1 {
+			return fmt.Errorf("%w: local resume %d is ahead of Hello LastSeq %d",
+				ErrAdoptionPreparation, localResumeFrom, hello.LastSeq)
+		}
+	}
 
 	proposed := opts.ProposedGeneration
 	if opts.NextGeneration != nil {
 		proposed = opts.NextGeneration(hello.Generation)
 	}
 	extensions := opts.Extensions
+	preparedResumeProvided := false
 	if opts.PrepareAdoption != nil {
-		lastForwarded := uint64(0)
-		if opts.ResumeFrom > 0 {
-			lastForwarded = opts.ResumeFrom - 1
-		}
+		lastForwarded := localResumeFrom - 1
 		prepared, prepareErr := opts.PrepareAdoption(AdoptionPreparation{
 			Identity:                    c.id,
 			ControllerID:                opts.ControllerID,
 			ShimID:                      hello.ShimID,
 			ProcessEpoch:                hello.ProcessEpoch,
 			CurrentControllerGeneration: hello.Generation,
+			LocalResumeFrom:             localResumeFrom,
+			LastHostSeq:                 hello.LastSeq,
 			LastForwardedSeq:            lastForwarded,
 			SelectedVersion:             selected,
 		})
@@ -379,6 +402,27 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 			proposed = prepared.ControllerGeneration
 		}
 		extensions = prepared.Extensions
+		if prepared.ResumeFrom != nil {
+			preparedResumeProvided = true
+			staticResumeConfigured := opts.ResumeExternallyConfigured ||
+				(opts.LocalResumeFrom == 0 && opts.ResumeFrom != 0)
+			if staticResumeConfigured {
+				return fmt.Errorf("%w: static and proof-resolved resume cursors are both configured", ErrAdoptionPreparation)
+			}
+			resolved := *prepared.ResumeFrom
+			if resolved < localResumeFrom {
+				return fmt.Errorf("%w: prepared resume %d regresses local floor %d",
+					ErrAdoptionPreparation, resolved, localResumeFrom)
+			}
+			if hello.LastSeq == ^uint64(0) || resolved > hello.LastSeq+1 {
+				return fmt.Errorf("%w: prepared resume %d is ahead of Hello LastSeq %d",
+					ErrAdoptionPreparation, resolved, hello.LastSeq)
+			}
+			opts.ResumeFrom = resolved
+		}
+	}
+	if _, proofBoundCarrier := extensions.Values[shimwire.ExtCarrierEpoch]; selected >= shimwire.V3 && proofBoundCarrier && !preparedResumeProvided {
+		return fmt.Errorf("%w: selected-v3 carrier preparation omitted proof-resolved ResumeFrom", ErrAdoptionPreparation)
 	}
 	if proposed == 0 {
 		proposed = hello.Generation + 1
@@ -396,6 +440,7 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 		ResumeFrom:         opts.ResumeFrom,
 		Extensions:         extensions,
 	}
+	c.resumeFrom = opts.ResumeFrom
 	if err := writeTyped(c.w, shimwire.TypeWelcome, func() ([]byte, error) { return shimwire.EncodeWelcome(welcome) }); err != nil {
 		return err
 	}

@@ -154,8 +154,12 @@ type SessionShimAdoptionPreparation struct {
 	ShimID                      string
 	ProcessEpoch                uint64
 	CurrentControllerGeneration shimwire.Generation
-	LastForwardedSeq            uint64
-	SelectedVersion             uint32
+	LocalResumeFrom             uint64
+	LastHostSeq                 uint64
+	// LastForwardedSeq is a deprecated alias for LocalResumeFrom-1. It is not
+	// external carrier proof authority.
+	LastForwardedSeq uint64
+	SelectedVersion  uint32
 }
 
 // SessionShimAdoptionReceipt is opaque durable correlation state returned by a
@@ -448,8 +452,11 @@ func (c SessionShimConfig) validateSnapshotCarrier() error {
 	if !c.RequireCredentialAttestation {
 		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs the exact hosted credential attestation", ErrSessionShimCarrierConfig)
 	}
-	if c.OnAdoption == nil || c.OnSessionEventDurable == nil || c.OnAdoptionBatch == nil || c.OnAdoptionPublished == nil {
-		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs OnAdoption, OnSessionEventDurable, OnAdoptionBatch, and OnAdoptionPublished", ErrSessionShimCarrierConfig)
+	if c.PrepareAdoption == nil || c.OnAdoption == nil || c.OnSessionEventDurable == nil || c.OnAdoptionBatch == nil || c.OnAdoptionPublished == nil {
+		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs PrepareAdoption, OnAdoption, OnSessionEventDurable, OnAdoptionBatch, and OnAdoptionPublished", ErrSessionShimCarrierConfig)
+	}
+	if c.ResumeFrom != nil {
+		return fmt.Errorf("%w: proof-resolving PrepareAdoption and free-standing ResumeFrom cannot both be configured", ErrSessionShimCarrierConfig)
 	}
 	return nil
 }
@@ -1141,14 +1148,23 @@ func (d *Daemon) prepareSessionShimAdoption(
 		ShimID:                      evidence.ShimID,
 		ProcessEpoch:                evidence.ProcessEpoch,
 		CurrentControllerGeneration: evidence.CurrentControllerGeneration,
+		LocalResumeFrom:             evidence.LocalResumeFrom,
+		LastHostSeq:                 evidence.LastHostSeq,
 		LastForwardedSeq:            evidence.LastForwardedSeq,
 		SelectedVersion:             evidence.SelectedVersion,
 	})
 	if err != nil {
 		return sessionshim.PreparedAdoption{}, err
 	}
+	if d.sessionShimConfig().RequireAuthoritativeSnapshot && prepared.ResumeFrom == nil {
+		return sessionshim.PreparedAdoption{}, fmt.Errorf("%w: proof-bound carrier preparation omitted ResumeFrom", ErrSessionShimCarrierConfig)
+	}
 	prepared.Extensions = cloneShimExtensions(prepared.Extensions)
 	prepared.Correlation = append([]byte(nil), prepared.Correlation...)
+	if prepared.ResumeFrom != nil {
+		resume := *prepared.ResumeFrom
+		prepared.ResumeFrom = &resume
+	}
 	return prepared, nil
 }
 

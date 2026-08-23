@@ -22,10 +22,13 @@ const (
 
 // V2-only typed error codes.
 const (
-	CodeCarrierNotActive       attachwire.ErrorCode = "carrier-not-active"
-	CodeCarrierActivationOrder attachwire.ErrorCode = "carrier-activation-order"
-	CodeHostDurability         attachwire.ErrorCode = "host-durability-unavailable"
-	CodeHostFrameConflict      attachwire.ErrorCode = "host-frame-conflict"
+	CodeCarrierNotActive        attachwire.ErrorCode = "carrier-not-active"
+	CodeCarrierActivationOrder  attachwire.ErrorCode = "carrier-activation-order"
+	CodeCarrierProofUnavailable attachwire.ErrorCode = "carrier-proof-unavailable"
+	CodeCarrierProofDrift       attachwire.ErrorCode = "carrier-proof-drift"
+	CodeCarrierCursorRegression attachwire.ErrorCode = "carrier-cursor-regression"
+	CodeHostDurability          attachwire.ErrorCode = "host-durability-unavailable"
+	CodeHostFrameConflict       attachwire.ErrorCode = "host-frame-conflict"
 )
 
 var (
@@ -65,8 +68,12 @@ func (v *DecimalUint64) UnmarshalJSON(data []byte) error {
 // GapReason is the closed host replay-gap reason set.
 type GapReason string
 
-// GapRingEvicted is the only v2 host-gap disposition.
-const GapRingEvicted GapReason = "ring_evicted"
+const (
+	// GapRingEvicted is the source-compatible ordinary replay-gap disposition.
+	GapRingEvicted GapReason = "ring_evicted"
+	// GapControllerUnforwarded is reserved to proof-bound N+1..K recovery.
+	GapControllerUnforwarded GapReason = "controller_unforwarded"
+)
 
 // HostGap declares the exact unavailable shimwire range before its recovery
 // Snapshot. It is outside the host sequence namespace.
@@ -216,7 +223,8 @@ func validateV2Control(message attachwire.ControlMessage) error {
 	}
 	switch typed := message.(type) {
 	case HostGap:
-		if typed.FromSeq == 0 || typed.ToSeq < typed.FromSeq || typed.Reason != GapRingEvicted {
+		if typed.FromSeq == 0 || typed.ToSeq < typed.FromSeq ||
+			(typed.Reason != GapRingEvicted && typed.Reason != GapControllerUnforwarded) {
 			return fmt.Errorf("%w: invalid host_gap", ErrMalformedControl)
 		}
 	case CarrierActivate:

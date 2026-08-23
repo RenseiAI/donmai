@@ -216,3 +216,200 @@ func TestSelectedV2HeartbeatRemainsWriteOnlyForReleasedBehavior(t *testing.T) {
 		t.Fatalf("selected-v2 Heartbeat changed nonblocking behavior: %v", err)
 	}
 }
+
+func TestSelectedV2IgnoresCorruptDurableAckSidecar(t *testing.T) {
+	dir := shortTempDir(t)
+	registry, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Identity{OrgID: "org-v2-corrupt-ack", SessionID: "session-v2-corrupt-ack"}
+	shim, err := Start(Options{
+		Identity: id, Registry: registry, ProcessEpoch: 1,
+		ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V2,
+		Spec: ptyhost.Spec{Command: []string{"/bin/sh", "-c", "sleep 30"}}, Orphan: DefaultOrphanPolicy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+		_ = shim.Close()
+	})
+	record, err := registry.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackPath := registry.Dir() + "/" + durableAckName(id, record.ShimID, record.ProcessEpoch)
+	if err := os.WriteFile(ackPath, []byte("not-json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Adopt(context.Background(), AdoptOptions{Registry: registry, ControllerID: "controller-v2-corrupt-ack"})
+	if err != nil || len(result.Adopted) != 1 {
+		t.Fatalf("selected-v2 adoption with corrupt sidecar = %+v, %v", result, err)
+	}
+	t.Cleanup(result.Close)
+	if err := result.Adopted[0].Heartbeat(9); err != nil {
+		t.Fatalf("selected-v2 Heartbeat inspected corrupt sidecar: %v", err)
+	}
+	raw, err := os.ReadFile(ackPath)
+	if err != nil || string(raw) != "not-json" {
+		t.Fatalf("selected-v2 changed ignored sidecar = %q, %v", raw, err)
+	}
+}
+
+func TestSelectedV3RefusesNonExactAckModesAndAheadGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		globalFail bool
+		mutate     func(*inProcessV3Fixture, Record, string)
+	}{
+		{
+			name: "file mode",
+			mutate: func(_ *inProcessV3Fixture, _ Record, path string) {
+				if err := os.Chmod(path, 0o400); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "directory mode",
+			mutate: func(fixture *inProcessV3Fixture, _ Record, _ string) {
+				if err := os.Chmod(fixture.shim.registry.Dir(), 0o500); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(fixture.shim.registry.Dir(), RegistryDirMode) })
+			},
+		},
+		{
+			name:       "generation ahead of Hello",
+			globalFail: true,
+			mutate: func(fixture *inProcessV3Fixture, record Record, _ string) {
+				if err := fixture.shim.registry.putDurableAck(durableAckCursor{
+					SchemaVersion: durableAckSchemaVersion,
+					OrgID:         record.OrgID, SessionID: record.SessionID, ShimID: record.ShimID, ProcessEpoch: record.ProcessEpoch,
+					ControllerGeneration: fixture.controller.Generation() + 1, AckedSeq: 1,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := startInProcessV3Fixture(t, 0)
+			acked := emitAndPersistV3Ack(t, fixture, "refuse-"+tc.name)
+			record, err := fixture.shim.registry.Get(fixture.shim.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := fixture.shim.registry.Dir() + "/" + durableAckName(fixture.shim.id, record.ShimID, record.ProcessEpoch)
+			fixture.result.Close()
+			select {
+			case <-fixture.controller.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("first controller did not close")
+			}
+			tc.mutate(fixture, record, path)
+			result, err := Adopt(context.Background(), AdoptOptions{
+				Registry: fixture.shim.registry, ControllerID: "controller-v3-invalid-sidecar", RequireFullHostFrames: true,
+			})
+			result.Close()
+			if tc.globalFail {
+				if !errors.Is(err, ErrAdoptionPreparation) || len(result.Adopted) != 0 {
+					t.Fatalf("selected-v3 invalid sidecar ack=%d result=%+v err=%v", acked, result, err)
+				}
+				return
+			}
+			if err != nil || len(result.Adopted) != 0 || len(result.Quarantined) != 1 {
+				t.Fatalf("selected-v3 invalid sidecar ack=%d result=%+v err=%v", acked, result, err)
+			}
+		})
+	}
+}
+
+func TestSelectedV3ProofResumeFreezesHelloTailUntilMandatorySnapshot(t *testing.T) {
+	fixture := startInProcessV3Fixture(t, 0)
+	acked := emitAndPersistV3Ack(t, fixture, "proof-floor")
+	if err := fixture.shim.Session().EmitMarker("unforwarded-one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.shim.Session().EmitMarker("unforwarded-two"); err != nil {
+		t.Fatal(err)
+	}
+	_, helloTail, err := fixture.shim.Session().Snapshot()
+	if err != nil || uint64(helloTail) <= acked {
+		t.Fatalf("proof fixture tail = %d, ack = %d, err=%v", helloTail, acked, err)
+	}
+	fixture.result.Close()
+	select {
+	case <-fixture.controller.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("first controller did not close")
+	}
+
+	var preparation AdoptionPreparation
+	replacement, err := Adopt(context.Background(), AdoptOptions{
+		Registry: fixture.shim.registry, ControllerID: "controller-v3-proof-replacement", RequireFullHostFrames: true,
+		Prepare: func(_ context.Context, evidence AdoptionPreparation) (PreparedAdoption, error) {
+			preparation = evidence
+			resume := evidence.LastHostSeq + 1
+			return PreparedAdoption{
+				ResumeFrom: &resume,
+				Extensions: shimwire.Extensions{
+					Values: map[string]string{shimwire.ExtCarrierEpoch: "41"}, Required: []string{shimwire.ExtCarrierEpoch},
+				},
+			}, nil
+		},
+	})
+	if err != nil || len(replacement.Adopted) != 1 {
+		t.Fatalf("proof replacement = %+v, %v", replacement, err)
+	}
+	t.Cleanup(replacement.Close)
+	if preparation.LocalResumeFrom != acked+1 || preparation.LastForwardedSeq != acked ||
+		preparation.LastHostSeq != uint64(helloTail) {
+		t.Fatalf("proof preparation = %+v, want local=%d tail=%d", preparation, acked+1, helloTail)
+	}
+	controller := replacement.Adopted[0]
+	if controller.ResumeFrom() != uint64(helloTail)+1 {
+		t.Fatalf("proof ResumeFrom = %d, want %d", controller.ResumeFrom(), helloTail+1)
+	}
+
+	markerDone := make(chan error, 1)
+	go func() { markerDone <- fixture.shim.Session().EmitMarker("queued-behind-proof-barrier") }()
+	select {
+	case err := <-markerDone:
+		t.Fatalf("marker crossed Hello output barrier before mandatory Snapshot: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := controller.EmitSnapshot(ctx)
+	if err != nil || !result.InStream || len(result.Bytes) != 0 || result.AtSeq != uint64(helloTail) {
+		t.Fatalf("mandatory proof Snapshot = %+v, %v", result, err)
+	}
+	if err := <-markerDone; err != nil {
+		t.Fatal(err)
+	}
+
+	var seen []ControllerEvent
+	deadline := time.After(5 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case event := <-controller.Events():
+			if event.Kind == EventGap {
+				t.Fatalf("proof-resolved K+1 resume emitted local replay gap: %+v", event)
+			}
+			if event.Kind == EventHostFrame {
+				seen = append(seen, event)
+			}
+		case <-deadline:
+			t.Fatalf("proof barrier events = %+v", seen)
+		}
+	}
+	if seen[0].FrameType != attachwire.TypeSnapshot || seen[0].Seq != uint64(helloTail)+1 ||
+		seen[1].FrameType != attachwire.TypeMarker || seen[1].Seq <= seen[0].Seq {
+		t.Fatalf("proof barrier ordering = %+v", seen)
+	}
+}
